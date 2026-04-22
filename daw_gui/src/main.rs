@@ -78,6 +78,7 @@ async fn handshake(mut server: NamedPipeServer, expected: ChildKind) -> Result<C
 
 fn run_gui() -> Result<()> {
     Application::new(|cx| {
+        cx.set_default_font(&["HackGen Console NF"]);
         AppData::default().build(cx);
         register_shortcuts(cx);
 
@@ -133,6 +134,14 @@ fn build_menu_bar(cx: &mut Context) {
                 Divider::new(cx);
                 menu_item(cx, "Save", "Ctrl+S", AppEvent::Save);
                 menu_item(cx, "Save As...", "Ctrl+Shift+S", AppEvent::SaveAs);
+            },
+        );
+        Submenu::new(
+            cx,
+            |cx| Label::new(cx, "Track"),
+            |cx| {
+                menu_item(cx, "Add Vocal Track", "", AppEvent::AddVocalTrack);
+                menu_item(cx, "Remove Last Track", "", AppEvent::RemoveLastTrack);
             },
         );
     });

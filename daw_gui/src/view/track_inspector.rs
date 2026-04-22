@@ -7,7 +7,8 @@ impl TrackInspectorView {
         Self.build(cx, |cx| {
             Label::new(cx, "Track Inspector")
                 .padding(Pixels(12.0))
-                .font_size(16.0);
+                .font_size(16.0)
+                .color(Color::rgb(220, 220, 220));
         })
         .background_color(Color::rgb(40, 40, 44))
     }

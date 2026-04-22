@@ -18,7 +18,8 @@ impl StatusBarView {
                 }),
             )
             .padding_left(Pixels(8.0))
-            .padding_right(Pixels(8.0));
+            .padding_right(Pixels(8.0))
+            .color(Color::rgb(200, 200, 200));
         })
         .background_color(Color::rgb(28, 28, 32))
     }

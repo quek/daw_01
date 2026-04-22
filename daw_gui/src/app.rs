@@ -1,12 +1,49 @@
 use std::path::{Path, PathBuf};
 
-use common::model::Song;
+use common::model::{Clip, InstrumentSource, Note, NoteEvent, Row, Song, Track};
 use vizia::prelude::*;
 
 #[derive(Lens, Default)]
 pub struct AppData {
     pub song: Song,
     pub file_path: Option<PathBuf>,
+}
+
+fn demo_clip() -> Clip {
+    let note = |key, lyric: &str| Row {
+        note: Some(NoteEvent::On(Note {
+            key,
+            velocity: 100,
+        })),
+        lyric: Some(lyric.into()),
+        ..Default::default()
+    };
+    let mut rows = vec![
+        note(60, "こ"),
+        Row::default(),
+        note(62, "ん"),
+        Row::default(),
+        note(64, "に"),
+        Row::default(),
+        note(65, "ち"),
+        Row::default(),
+        note(67, "は"),
+        Row::default(),
+        Row {
+            note: Some(NoteEvent::Off),
+            ..Default::default()
+        },
+    ];
+    while rows.len() < 16 {
+        rows.push(Row::default());
+    }
+    Clip {
+        name: "こんにちは".into(),
+        start_beat: 0.0,
+        length_beats: 4.0,
+        rows_per_beat: 4,
+        rows,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -17,6 +54,8 @@ pub enum AppEvent {
     SaveAs,
     Play,
     Stop,
+    AddVocalTrack,
+    RemoveLastTrack,
 }
 
 impl Model for AppData {
@@ -33,6 +72,8 @@ impl Model for AppData {
             AppEvent::SaveAs => self.action_save_as(),
             AppEvent::Play => tracing::info!("play (not yet implemented)"),
             AppEvent::Stop => tracing::info!("stop (not yet implemented)"),
+            AppEvent::AddVocalTrack => self.action_add_vocal_track(),
+            AppEvent::RemoveLastTrack => self.action_remove_last_track(),
         });
     }
 }
@@ -80,6 +121,29 @@ impl AppData {
         };
         if self.save_to(&path) {
             self.file_path = Some(path);
+        }
+    }
+
+    fn action_add_vocal_track(&mut self) {
+        let index = self.song.tracks.len() + 1;
+        let track = Track {
+            name: format!("Track {index}"),
+            source: InstrumentSource::Vocal {
+                speaker_id: 3,
+                style_name: "ノーマル".into(),
+            },
+            fx_chain: vec![],
+            volume: 1.0,
+            pan: 0.0,
+            clips: vec![demo_clip()],
+        };
+        self.song.tracks.push(track);
+        tracing::info!(index, "added vocal track");
+    }
+
+    fn action_remove_last_track(&mut self) {
+        if let Some(track) = self.song.tracks.pop() {
+            tracing::info!(name = %track.name, "removed last track");
         }
     }
 

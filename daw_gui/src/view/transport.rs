@@ -13,12 +13,15 @@ impl TransportView {
                     .on_press(|ex| ex.emit(AppEvent::Play));
                 Button::new(cx, |cx| Label::new(cx, "⏹ Stop"))
                     .on_press(|ex| ex.emit(AppEvent::Stop));
-                Label::new(cx, "0:00 / 64 beats").padding_left(Pixels(16.0));
+                Label::new(cx, "0:00 / 64 beats")
+                    .padding_left(Pixels(16.0))
+                    .color(Color::rgb(220, 220, 220));
                 Label::new(
                     cx,
                     AppData::song.map(|s: &Song| format!("BPM {}", s.bpm)),
                 )
-                .padding_left(Pixels(16.0));
+                .padding_left(Pixels(16.0))
+                .color(Color::rgb(220, 220, 220));
             })
             .gap(Pixels(8.0))
             .padding(Pixels(6.0))
