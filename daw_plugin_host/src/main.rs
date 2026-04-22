@@ -30,19 +30,30 @@ async fn main() -> Result<()> {
     let session = common::client::read_session(&mut pipe).await?;
     tracing::info!(?session, "audio session received");
 
-    let candidates = match scan::scan_system_clap_directory() {
-        Ok(list) => list,
-        Err(e) => {
-            tracing::error!(error = ?e, "failed to scan CLAP directory");
-            Vec::new()
+    let plugin = if let Some(path) = std::env::var_os("DAW_CLAP_PATH") {
+        let path = std::path::PathBuf::from(path);
+        tracing::info!(path = %path.display(), "DAW_CLAP_PATH override");
+        match Plugin::load(&path) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::error!(error = ?e, path = %path.display(), "failed to load override plugin");
+                None
+            }
         }
+    } else {
+        let candidates = match scan::scan_system_clap_directory() {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::error!(error = ?e, "failed to scan CLAP directory");
+                Vec::new()
+            }
+        };
+        tracing::info!(count = candidates.len(), "CLAP plugins discovered");
+        for p in &candidates {
+            tracing::info!(path = %p.display(), "CLAP plugin found");
+        }
+        pick_plugin(&candidates)
     };
-    tracing::info!(count = candidates.len(), "CLAP plugins discovered");
-    for p in &candidates {
-        tracing::info!(path = %p.display(), "CLAP plugin found");
-    }
-
-    let plugin = pick_plugin(&candidates);
 
     let audio_handle = match plugin {
         Some(mut p) => match p.activate(
