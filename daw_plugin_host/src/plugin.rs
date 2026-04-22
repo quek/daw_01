@@ -29,7 +29,13 @@ pub struct Plugin {
 unsafe impl Send for Plugin {}
 
 impl Plugin {
-    pub fn load(path: &Path) -> Result<Self> {
+    /// Tries to load a plugin from `path`. Scans all descriptors in the file and
+    /// instantiates the first one for which `matches(features)` returns true.
+    /// Returns `Ok(None)` if no descriptor matches (library is unloaded cleanly).
+    pub fn load_matching<F>(path: &Path, matches: F) -> Result<Option<Self>>
+    where
+        F: Fn(&[String]) -> bool,
+    {
         let library = unsafe { Library::new(path) }
             .with_context(|| format!("failed to load CLAP library at {}", path.display()))?;
 
@@ -79,22 +85,38 @@ impl Plugin {
             .context("factory.create_plugin is null")?;
 
         let count = unsafe { get_count(factory_ptr) };
-        tracing::info!(count, "plugins in factory");
+        tracing::info!(path = %path.display(), count, "plugins in factory");
 
+        let mut selected: Option<u32> = None;
         for i in 0..count {
             let desc_ptr = unsafe { get_desc(factory_ptr, i) };
             if desc_ptr.is_null() {
                 continue;
             }
-            log_descriptor(i, unsafe { &*desc_ptr });
+            let desc = unsafe { &*desc_ptr };
+            log_descriptor(i, desc);
+            if selected.is_none() {
+                let features = read_feature_list(desc.features);
+                if matches(&features) {
+                    selected = Some(i);
+                }
+            }
         }
-        anyhow::ensure!(count > 0, "factory exposes no plugins");
 
-        let first_desc_ptr = unsafe { get_desc(factory_ptr, 0) };
-        anyhow::ensure!(!first_desc_ptr.is_null(), "first descriptor is null");
-        let first_desc = unsafe { &*first_desc_ptr };
-        let plugin_id = first_desc.id;
-        let name = c_str_to_string(first_desc.name);
+        let Some(index) = selected else {
+            // No descriptor matched — unload cleanly and report no match.
+            if let Some(deinit) = entry.deinit {
+                unsafe { deinit() };
+            }
+            drop(library);
+            return Ok(None);
+        };
+
+        let desc_ptr = unsafe { get_desc(factory_ptr, index) };
+        anyhow::ensure!(!desc_ptr.is_null(), "selected descriptor became null");
+        let desc = unsafe { &*desc_ptr };
+        let plugin_id = desc.id;
+        let name = c_str_to_string(desc.name);
 
         let host = Host::new();
         let host_ptr: *const clap_host = &host.clap;
@@ -107,22 +129,33 @@ impl Plugin {
             unsafe { plugin_init(plugin_ptr) },
             "clap_plugin.init returned false"
         );
-        tracing::info!(%name, "plugin initialized");
+        tracing::info!(%name, index, "plugin initialized");
 
         let get_ext = unsafe { (*plugin_ptr).get_extension }
             .context("clap_plugin::get_extension is null")?;
         log_audio_ports(plugin_ptr, get_ext);
         log_note_ports(plugin_ptr, get_ext);
 
-        Ok(Self {
+        Ok(Some(Self {
             _library: library,
             entry: entry_ptr,
             plugin: plugin_ptr,
             _host: host,
             name,
             path: path.to_path_buf(),
-        })
+        }))
     }
+
+    /// Loads the first plugin in the file (any type).
+    pub fn load(path: &Path) -> Result<Self> {
+        Self::load_matching(path, |_| true)?
+            .ok_or_else(|| anyhow::anyhow!("no plugins in {}", path.display()))
+    }
+}
+
+/// Returns true when the plugin declares the CLAP `instrument` feature.
+pub fn is_instrument_features(features: &[String]) -> bool {
+    features.iter().any(|f| f == "instrument")
 }
 
 impl Drop for Plugin {

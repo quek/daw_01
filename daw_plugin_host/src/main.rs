@@ -31,28 +31,41 @@ async fn main() -> Result<()> {
         tracing::info!(path = %p.display(), "CLAP plugin found");
     }
 
-    let _plugin = match candidates.first() {
-        Some(first) => match plugin::Plugin::load(first) {
-            Ok(p) => {
-                tracing::info!(path = %first.display(), "plugin loaded");
-                Some(p)
-            }
-            Err(e) => {
-                tracing::error!(error = ?e, path = %first.display(), "failed to load plugin");
-                None
-            }
-        },
-        None => {
-            tracing::warn!("no CLAP plugins found");
-            None
-        }
-    };
+    let _plugin = pick_plugin(&candidates);
 
     tracing::info!("awaiting shutdown");
     wait_for_pipe_close(pipe).await;
     tracing::info!("daw_plugin_host exiting");
     Ok(())
     // `_plugin` drops here → destroy / deinit / Library unload
+}
+
+fn pick_plugin(candidates: &[std::path::PathBuf]) -> Option<plugin::Plugin> {
+    // Pass 1: prefer instruments so we can actually play notes.
+    for path in candidates {
+        match plugin::Plugin::load_matching(path, plugin::is_instrument_features) {
+            Ok(Some(p)) => {
+                tracing::info!(path = %path.display(), "loaded instrument plugin");
+                return Some(p);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = ?e, path = %path.display(), "plugin scan failed"),
+        }
+    }
+    // Pass 2: fallback to the first loadable plugin of any kind.
+    for path in candidates {
+        match plugin::Plugin::load(path) {
+            Ok(p) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "no instrument found; loaded first plugin as fallback"
+                );
+                return Some(p);
+            }
+            Err(e) => tracing::warn!(error = ?e, path = %path.display(), "fallback load failed"),
+        }
+    }
+    None
 }
 
 async fn wait_for_pipe_close(mut pipe: NamedPipeClient) {
