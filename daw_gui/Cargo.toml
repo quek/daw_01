@@ -1,0 +1,7 @@
+[package]
+name = "daw_gui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+common = { path = "../common" }
