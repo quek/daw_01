@@ -4,8 +4,12 @@ mod subprocess;
 mod view;
 
 use anyhow::{Context as _, Result};
+use common::audio_bridge::{
+    AudioBridgeHandle, CHANNELS, MAX_FRAMES, SAMPLE_RATE, ready_sem_id, request_sem_id, shmem_id,
+};
 use common::pipe::pipe_path;
-use common::protocol::{ChildKind, ChildToMain, MainToChild};
+use common::protocol::{AudioSession, ChildKind, ChildToMain, MainToChild};
+use common::win_sem::Semaphore;
 use common::wire::{read_msg, write_msg};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::process::Child;
@@ -24,8 +28,36 @@ fn main() -> Result<()> {
     let job = JobHandle::new()?;
     let rt = Runtime::new().context("failed to create tokio runtime")?;
 
-    let (audio_child, plugin_child, audio_server, plugin_server) =
+    // Build the audio session names and create shmem / semaphores up front so
+    // they exist before the children try to open them.
+    let pid = std::process::id();
+    let session = AudioSession {
+        shmem_id: shmem_id(pid),
+        request_sem_id: request_sem_id(pid),
+        ready_sem_id: ready_sem_id(pid),
+        sample_rate: SAMPLE_RATE,
+        max_frames: MAX_FRAMES,
+        channels: CHANNELS as u16,
+    };
+    let _bridge = AudioBridgeHandle::create(&session.shmem_id)
+        .context("failed to create audio shmem")?;
+    let _request_sem = Semaphore::create(&session.request_sem_id, 0, 2)
+        .context("failed to create request semaphore")?;
+    let _ready_sem = Semaphore::create(&session.ready_sem_id, 0, 2)
+        .context("failed to create ready semaphore")?;
+    tracing::info!(?session, "created audio session handles");
+
+    let (audio_child, plugin_child, mut audio_server, mut plugin_server) =
         rt.block_on(spawn_and_handshake(&job))?;
+
+    // Send the session descriptor to both children before any other commands.
+    rt.block_on(async {
+        write_msg(&mut audio_server, &MainToChild::Session(session.clone())).await?;
+        write_msg(&mut plugin_server, &MainToChild::Session(session.clone())).await?;
+        anyhow::Ok(())
+    })
+    .context("failed to send audio session")?;
+
     // Keep plugin_server alive for the session so daw_plugin_host stays running.
     // Further messages to plugin_host will be wired up in a later step.
     let _plugin_server = plugin_server;

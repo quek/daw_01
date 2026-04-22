@@ -2,12 +2,17 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use clap_sys::audio_buffer::clap_audio_buffer;
 use clap_sys::entry::clap_plugin_entry;
-use clap_sys::ext::audio_ports::{CLAP_EXT_AUDIO_PORTS, clap_plugin_audio_ports};
+use clap_sys::events::{clap_event_header, clap_input_events, clap_output_events};
+use clap_sys::ext::audio_ports::{
+    CLAP_EXT_AUDIO_PORTS, clap_audio_port_info, clap_plugin_audio_ports,
+};
 use clap_sys::ext::note_ports::{CLAP_EXT_NOTE_PORTS, clap_plugin_note_ports};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
 use clap_sys::host::clap_host;
 use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
+use clap_sys::process::clap_process;
 use clap_sys::version::clap_version_is_compatible;
 use libloading::{Library, Symbol};
 
@@ -23,6 +28,11 @@ pub struct Plugin {
     _host: Box<Host>,
     name: String,
     path: PathBuf,
+    active: bool,
+    processing: bool,
+    output_channels: u32,
+    output_buffers: Vec<Vec<f32>>,
+    output_ptrs: Vec<*mut f32>,
 }
 
 // The plugin holds raw pointers but ownership is exclusive within the struct.
@@ -135,6 +145,8 @@ impl Plugin {
             .context("clap_plugin::get_extension is null")?;
         log_audio_ports(plugin_ptr, get_ext);
         log_note_ports(plugin_ptr, get_ext);
+        let output_channels = query_output_channel_count(plugin_ptr, get_ext);
+        tracing::info!(output_channels, "plugin output channel count");
 
         Ok(Some(Self {
             _library: library,
@@ -143,7 +155,106 @@ impl Plugin {
             _host: host,
             name,
             path: path.to_path_buf(),
+            active: false,
+            processing: false,
+            output_channels,
+            output_buffers: Vec::new(),
+            output_ptrs: Vec::new(),
         }))
+    }
+
+    pub fn activate(&mut self, sample_rate: f64, min_frames: u32, max_frames: u32) -> Result<()> {
+        anyhow::ensure!(!self.active, "plugin already active");
+        let activate = unsafe { (*self.plugin).activate }.context("plugin.activate is null")?;
+        anyhow::ensure!(
+            unsafe { activate(self.plugin, sample_rate, min_frames, max_frames) },
+            "plugin.activate returned false"
+        );
+        self.active = true;
+        self.output_buffers = (0..self.output_channels as usize)
+            .map(|_| vec![0.0f32; max_frames as usize])
+            .collect();
+        self.output_ptrs = vec![std::ptr::null_mut(); self.output_channels as usize];
+        tracing::info!(sample_rate, max_frames, "plugin activated");
+        Ok(())
+    }
+
+    pub fn start_processing(&mut self) -> Result<()> {
+        anyhow::ensure!(self.active, "plugin not active");
+        anyhow::ensure!(!self.processing, "plugin already processing");
+        let start = unsafe { (*self.plugin).start_processing }
+            .context("plugin.start_processing is null")?;
+        anyhow::ensure!(
+            unsafe { start(self.plugin) },
+            "plugin.start_processing returned false"
+        );
+        self.processing = true;
+        Ok(())
+    }
+
+    pub fn stop_processing(&mut self) {
+        if !self.processing {
+            return;
+        }
+        if let Some(stop) = unsafe { (*self.plugin).stop_processing } {
+            unsafe { stop(self.plugin) };
+        }
+        self.processing = false;
+    }
+
+    pub fn deactivate(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(deact) = unsafe { (*self.plugin).deactivate } {
+            unsafe { deact(self.plugin) };
+        }
+        self.active = false;
+        self.output_buffers.clear();
+        self.output_ptrs.clear();
+    }
+
+    /// Calls the plugin's process() with empty events and returns the status.
+    /// Must be called on the audio thread only, between start_processing and
+    /// stop_processing. Fills `output_buffers` (planar) with the rendered audio.
+    pub fn process(&mut self, frames: u32) -> Result<i32> {
+        anyhow::ensure!(self.processing, "plugin not processing");
+        // Refresh channel pointers (buffers are pre-allocated; this is O(channels)
+        // and does not allocate).
+        for i in 0..self.output_buffers.len() {
+            self.output_ptrs[i] = self.output_buffers[i].as_mut_ptr();
+        }
+        let audio_out = clap_audio_buffer {
+            data32: self.output_ptrs.as_mut_ptr(),
+            data64: std::ptr::null_mut(),
+            channel_count: self.output_channels,
+            latency: 0,
+            constant_mask: 0,
+        };
+
+        let in_events = EMPTY_INPUT_EVENTS;
+        let out_events = EMPTY_OUTPUT_EVENTS;
+
+        let mut audio_out_mut = audio_out;
+        let process_ctx = clap_process {
+            steady_time: -1,
+            frames_count: frames,
+            transport: std::ptr::null(),
+            audio_inputs: std::ptr::null(),
+            audio_outputs: &mut audio_out_mut,
+            audio_inputs_count: 0,
+            audio_outputs_count: 1,
+            in_events: &in_events,
+            out_events: &out_events,
+        };
+
+        let process = unsafe { (*self.plugin).process }.context("plugin.process is null")?;
+        let status = unsafe { process(self.plugin, &process_ctx) };
+        Ok(status)
+    }
+
+    pub fn output_buffer(&self, channel: usize) -> Option<&[f32]> {
+        self.output_buffers.get(channel).map(Vec::as_slice)
     }
 
     /// Loads the first plugin in the file (any type).
@@ -151,6 +262,52 @@ impl Plugin {
         Self::load_matching(path, |_| true)?
             .ok_or_else(|| anyhow::anyhow!("no plugins in {}", path.display()))
     }
+}
+
+// Static virtual tables for empty event lists. The function pointers are
+// trivial and the ctx pointer is unused, so these are safe to share globally.
+const EMPTY_INPUT_EVENTS: clap_input_events = clap_input_events {
+    ctx: std::ptr::null_mut(),
+    size: Some(empty_in_size),
+    get: Some(empty_in_get),
+};
+
+const EMPTY_OUTPUT_EVENTS: clap_output_events = clap_output_events {
+    ctx: std::ptr::null_mut(),
+    try_push: Some(empty_out_try_push),
+};
+
+unsafe extern "C" fn empty_in_size(_list: *const clap_input_events) -> u32 {
+    0
+}
+unsafe extern "C" fn empty_in_get(
+    _list: *const clap_input_events,
+    _index: u32,
+) -> *const clap_event_header {
+    std::ptr::null()
+}
+unsafe extern "C" fn empty_out_try_push(
+    _list: *const clap_output_events,
+    _event: *const clap_event_header,
+) -> bool {
+    true
+}
+
+fn query_output_channel_count(plugin: *const clap_plugin, get_ext: GetExtFn) -> u32 {
+    let ext_ptr =
+        unsafe { get_ext(plugin, CLAP_EXT_AUDIO_PORTS.as_ptr()) } as *const clap_plugin_audio_ports;
+    if ext_ptr.is_null() {
+        return 2;
+    }
+    let Some(get) = (unsafe { &*ext_ptr }).get else {
+        return 2;
+    };
+    let mut info = std::mem::MaybeUninit::<clap_audio_port_info>::zeroed();
+    let ok = unsafe { get(plugin, 0, false, info.as_mut_ptr()) };
+    if !ok {
+        return 2;
+    }
+    unsafe { info.assume_init() }.channel_count
 }
 
 /// Returns true when the plugin declares the CLAP `instrument` feature.

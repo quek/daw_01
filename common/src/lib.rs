@@ -1,3 +1,4 @@
+pub mod audio_bridge;
 pub mod logging;
 pub mod model;
 pub mod project;
@@ -8,3 +9,5 @@ pub mod wire;
 pub mod client;
 #[cfg(windows)]
 pub mod pipe;
+#[cfg(windows)]
+pub mod win_sem;

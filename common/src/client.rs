@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 
-use crate::protocol::{ChildKind, ChildToMain, MainToChild};
+use crate::protocol::{AudioSession, ChildKind, ChildToMain, MainToChild};
 use crate::wire::{read_msg, write_msg};
 
 /// Opens the named pipe, performs the handshake, and returns the open
@@ -26,4 +26,15 @@ pub async fn perform_handshake(pipe_name: &str, kind: ChildKind) -> Result<Named
     );
     tracing::info!(?ack, "received from parent");
     Ok(client)
+}
+
+/// Reads the next message and expects it to be `MainToChild::Session`.
+pub async fn read_session(client: &mut NamedPipeClient) -> Result<AudioSession> {
+    match read_msg::<_, MainToChild>(client).await? {
+        MainToChild::Session(s) => {
+            tracing::info!(?s, "received audio session");
+            Ok(s)
+        }
+        other => anyhow::bail!("expected Session, got {:?}", other),
+    }
 }

@@ -21,10 +21,21 @@ pub enum ChildToMain {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct AudioSession {
+    pub shmem_id: String,
+    pub request_sem_id: String,
+    pub ready_sem_id: String,
+    pub sample_rate: u32,
+    pub max_frames: u32,
+    pub channels: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum MainToChild {
     Ack,
     Play,
     Stop,
+    Session(AudioSession),
 }
 
 #[cfg(test)]
