@@ -8,3 +8,6 @@ common = { path = "../common" }
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

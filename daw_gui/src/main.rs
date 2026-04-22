@@ -1,3 +1,4 @@
+mod job;
 mod subprocess;
 
 use anyhow::{Context, Result};
@@ -6,10 +7,14 @@ use common::protocol::{ChildKind, ChildToMain, MainToChild};
 use common::wire::{read_msg, write_msg};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
+use crate::job::JobHandle;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     common::logging::init_tracing();
     tracing::info!("daw_gui starting");
+
+    let job = JobHandle::new()?;
 
     let pid = std::process::id();
     let audio_pipe = pipe_path(pid, ChildKind::Audio);
@@ -25,7 +30,9 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to create pipe {plugin_pipe}"))?;
 
     let mut audio_child = subprocess::spawn_sibling("daw_audio", [&audio_pipe])?;
+    job.assign(&audio_child)?;
     let mut plugin_child = subprocess::spawn_sibling("daw_plugin_host", [&plugin_pipe])?;
+    job.assign(&plugin_child)?;
 
     let (audio_hello, plugin_hello) = tokio::try_join!(
         handshake(audio_server, ChildKind::Audio),
