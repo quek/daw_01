@@ -14,6 +14,13 @@ pub struct AppData {
     /// Cached textual rendering of the tracker grid. Recomputed whenever
     /// `song`, `cursor_row`, or `cursor_track` change via `refresh_tracker_text`.
     pub tracker_text: String,
+    /// Template note used when placing into an empty cell (sing_like_coding
+    /// style). Updated whenever the user edits a NoteOn cell.
+    pub last_note: Note,
+    /// Tracks whether playback is currently active so PlayToggle can flip.
+    /// Flipped only by explicit user Play/Stop; auto-stop in plugin_host is
+    /// not yet mirrored back here.
+    pub is_playing: bool,
     #[lens(ignore)]
     pub audio_tx: Option<UnboundedSender<MainToChild>>,
     #[lens(ignore)]
@@ -33,6 +40,11 @@ impl AppData {
             cursor_row: 0,
             cursor_track: 0,
             tracker_text,
+            last_note: Note {
+                key: 60,
+                velocity: 100,
+            },
+            is_playing: false,
             audio_tx: Some(audio_tx),
             plugin_tx: Some(plugin_tx),
         }
@@ -55,12 +67,17 @@ pub enum AppEvent {
     SaveAs,
     Play,
     Stop,
+    PlayToggle,
     AddVocalTrack,
     RemoveLastTrack,
     CursorLeft,
     CursorRight,
     CursorUp,
     CursorDown,
+    NoteOff,
+    NoteClear,
+    TransposeSemi(i8),
+    TransposeOctave(i8),
 }
 
 impl Model for AppData {
@@ -84,15 +101,19 @@ impl Model for AppData {
                     dirty = false;
                 }
                 AppEvent::Play => {
-                    // Push the current Song to plugin_host so it can schedule events.
-                    self.send_plugin(MainToChild::LoadSong(self.song.clone()));
-                    self.send_audio(MainToChild::Play);
-                    self.send_plugin(MainToChild::Play);
+                    self.play();
                     dirty = false;
                 }
                 AppEvent::Stop => {
-                    self.send_audio(MainToChild::Stop);
-                    self.send_plugin(MainToChild::Stop);
+                    self.stop();
+                    dirty = false;
+                }
+                AppEvent::PlayToggle => {
+                    if self.is_playing {
+                        self.stop();
+                    } else {
+                        self.play();
+                    }
                     dirty = false;
                 }
                 AppEvent::AddVocalTrack => self.action_add_vocal_track(),
@@ -101,6 +122,10 @@ impl Model for AppData {
                 AppEvent::CursorRight => self.move_cursor_track(1),
                 AppEvent::CursorUp => self.move_cursor_row(-1),
                 AppEvent::CursorDown => self.move_cursor_row(1),
+                AppEvent::NoteOff => self.edit_cell(|row| row.note = Some(NoteEvent::Off)),
+                AppEvent::NoteClear => self.edit_cell(|row| row.note = None),
+                AppEvent::TransposeSemi(d) => self.apply_transpose(*d as i16),
+                AppEvent::TransposeOctave(d) => self.apply_transpose(*d as i16 * 12),
             }
             if dirty {
                 self.refresh_tracker_text();
@@ -217,6 +242,59 @@ impl AppData {
             .unwrap_or(0) as i64;
         let next = (self.cursor_row as i64 + delta as i64).clamp(0, max.max(0));
         self.cursor_row = next as u32;
+    }
+
+    fn play(&mut self) {
+        self.send_plugin(MainToChild::LoadSong(self.song.clone()));
+        self.send_audio(MainToChild::Play);
+        self.send_plugin(MainToChild::Play);
+        self.is_playing = true;
+    }
+
+    fn stop(&mut self) {
+        self.send_audio(MainToChild::Stop);
+        self.send_plugin(MainToChild::Stop);
+        self.is_playing = false;
+    }
+
+    fn edit_cell<F: FnOnce(&mut Row)>(&mut self, f: F) {
+        let Some(track) = self.song.tracks.get_mut(self.cursor_track as usize) else {
+            tracing::warn!("no track at cursor");
+            return;
+        };
+        let Some(clip) = track.clips.first_mut() else {
+            tracing::warn!("no clip on track");
+            return;
+        };
+        while clip.rows.len() <= self.cursor_row as usize {
+            clip.rows.push(Row::default());
+        }
+        f(&mut clip.rows[self.cursor_row as usize]);
+    }
+
+    /// sing_like_coding 流: 空セルなら last_note をそのまま配置、既存 NoteOn なら
+    /// key に delta を加算して last_note を更新。NoteOff には効果なし。
+    fn apply_transpose(&mut self, delta: i16) {
+        let last_note = self.last_note;
+        let mut updated_note: Option<Note> = None;
+        self.edit_cell(|row| match &row.note {
+            None | Some(NoteEvent::Off) => {
+                // Empty cell or Off row: place last_note as-is (overwrites Off).
+                row.note = Some(NoteEvent::On(last_note));
+            }
+            Some(NoteEvent::On(n)) => {
+                let new_key = (i16::from(n.key) + delta).clamp(0, 127) as u8;
+                let new_note = Note {
+                    key: new_key,
+                    velocity: n.velocity,
+                };
+                row.note = Some(NoteEvent::On(new_note));
+                updated_note = Some(new_note);
+            }
+        });
+        if let Some(n) = updated_note {
+            self.last_note = n;
+        }
     }
 
     fn clamp_cursor(&mut self) {

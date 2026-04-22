@@ -195,6 +195,42 @@ fn register_shortcuts(cx: &mut Context) {
             KeyChord::new(Modifiers::empty(), Code::KeyL),
             KeymapEntry::new(AppEvent::CursorRight, |cx| cx.emit(AppEvent::CursorRight)),
         ),
+        (
+            KeyChord::new(Modifiers::empty(), Code::Space),
+            KeymapEntry::new(AppEvent::PlayToggle, |cx| cx.emit(AppEvent::PlayToggle)),
+        ),
+        (
+            KeyChord::new(Modifiers::empty(), Code::KeyN),
+            KeymapEntry::new(AppEvent::NoteOff, |cx| cx.emit(AppEvent::NoteOff)),
+        ),
+        (
+            KeyChord::new(Modifiers::empty(), Code::Delete),
+            KeymapEntry::new(AppEvent::NoteClear, |cx| cx.emit(AppEvent::NoteClear)),
+        ),
+        (
+            KeyChord::new(Modifiers::CTRL, Code::KeyJ),
+            KeymapEntry::new(AppEvent::TransposeSemi(-1), |cx| {
+                cx.emit(AppEvent::TransposeSemi(-1))
+            }),
+        ),
+        (
+            KeyChord::new(Modifiers::CTRL, Code::KeyK),
+            KeymapEntry::new(AppEvent::TransposeSemi(1), |cx| {
+                cx.emit(AppEvent::TransposeSemi(1))
+            }),
+        ),
+        (
+            KeyChord::new(Modifiers::CTRL, Code::KeyH),
+            KeymapEntry::new(AppEvent::TransposeOctave(-1), |cx| {
+                cx.emit(AppEvent::TransposeOctave(-1))
+            }),
+        ),
+        (
+            KeyChord::new(Modifiers::CTRL, Code::KeyL),
+            KeymapEntry::new(AppEvent::TransposeOctave(1), |cx| {
+                cx.emit(AppEvent::TransposeOctave(1))
+            }),
+        ),
     ])
     .build(cx);
 }
