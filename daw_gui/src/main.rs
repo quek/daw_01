@@ -2,7 +2,10 @@ mod app;
 mod job;
 mod subprocess;
 
-use anyhow::{Context, Result};
+use std::path::PathBuf;
+
+use anyhow::{Context as _, Result};
+use common::model::Song;
 use common::pipe::pipe_path;
 use common::protocol::{ChildKind, ChildToMain, MainToChild};
 use common::wire::{read_msg, write_msg};
@@ -11,6 +14,7 @@ use tokio::process::Child;
 use tokio::runtime::Runtime;
 use vizia::prelude::*;
 
+use crate::app::{AppData, AppEvent};
 use crate::job::JobHandle;
 
 fn main() -> Result<()> {
@@ -20,8 +24,6 @@ fn main() -> Result<()> {
     let job = JobHandle::new()?;
     let rt = Runtime::new().context("failed to create tokio runtime")?;
 
-    // Children are held for the lifetime of `main`; dropping them (or `job`) triggers
-    // Job Object cleanup via JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE when we exit.
     let _children = rt.block_on(spawn_and_handshake(&job))?;
     tracing::info!("opening main window");
 
@@ -77,14 +79,85 @@ async fn handshake(mut server: NamedPipeServer, expected: ChildKind) -> Result<C
 
 fn run_gui() -> Result<()> {
     Application::new(|cx| {
-        app::AppData.build(cx);
+        AppData::default().build(cx);
+        register_shortcuts(cx);
+
         VStack::new(cx, |cx| {
-            Label::new(cx, "daw_01").font_size(32.0);
-        })
-        .alignment(Alignment::Center);
+            build_menu_bar(cx);
+            build_status(cx);
+        });
     })
     .title("daw_01")
     .inner_size((1280, 800))
     .run()
     .map_err(|e| anyhow::anyhow!("Vizia application error: {e:?}"))
+}
+
+fn register_shortcuts(cx: &mut Context) {
+    Keymap::from(vec![
+        (
+            KeyChord::new(Modifiers::CTRL, Code::KeyN),
+            KeymapEntry::new(AppEvent::New, |cx| cx.emit(AppEvent::New)),
+        ),
+        (
+            KeyChord::new(Modifiers::CTRL, Code::KeyO),
+            KeymapEntry::new(AppEvent::Open, |cx| cx.emit(AppEvent::Open)),
+        ),
+        (
+            KeyChord::new(Modifiers::CTRL, Code::KeyS),
+            KeymapEntry::new(AppEvent::Save, |cx| cx.emit(AppEvent::Save)),
+        ),
+        (
+            KeyChord::new(Modifiers::CTRL | Modifiers::SHIFT, Code::KeyS),
+            KeymapEntry::new(AppEvent::SaveAs, |cx| cx.emit(AppEvent::SaveAs)),
+        ),
+    ])
+    .build(cx);
+}
+
+fn build_menu_bar(cx: &mut Context) {
+    MenuBar::new(cx, |cx| {
+        Submenu::new(
+            cx,
+            |cx| Label::new(cx, "File"),
+            |cx| {
+                menu_item(cx, "New", "Ctrl+N", AppEvent::New);
+                menu_item(cx, "Open...", "Ctrl+O", AppEvent::Open);
+                Divider::new(cx);
+                menu_item(cx, "Save", "Ctrl+S", AppEvent::Save);
+                menu_item(cx, "Save As...", "Ctrl+Shift+S", AppEvent::SaveAs);
+            },
+        );
+    });
+}
+
+fn menu_item(cx: &mut Context, label: &'static str, shortcut: &'static str, event: AppEvent) {
+    MenuButton::new(
+        cx,
+        move |cx| cx.emit(event),
+        move |cx| {
+            HStack::new(cx, |cx| {
+                Label::new(cx, label);
+                Label::new(cx, shortcut).class("shortcut");
+            })
+            .gap(Stretch(1.0))
+        },
+    );
+}
+
+fn build_status(cx: &mut Context) {
+    VStack::new(cx, |cx| {
+        Label::new(
+            cx,
+            AppData::file_path.map(|p: &Option<PathBuf>| {
+                p.as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(untitled)".to_string())
+            }),
+        )
+        .font_size(20.0);
+        Label::new(cx, AppData::song.map(|s: &Song| format!("BPM {}", s.bpm)));
+    })
+    .alignment(Alignment::Center)
+    .padding(Pixels(16.0));
 }
