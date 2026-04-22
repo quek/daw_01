@@ -9,6 +9,11 @@ use vizia::prelude::*;
 pub struct AppData {
     pub song: Song,
     pub file_path: Option<PathBuf>,
+    pub cursor_row: u32,
+    pub cursor_track: u32,
+    /// Cached textual rendering of the tracker grid. Recomputed whenever
+    /// `song`, `cursor_row`, or `cursor_track` change via `refresh_tracker_text`.
+    pub tracker_text: String,
     #[lens(ignore)]
     pub audio_tx: Option<UnboundedSender<MainToChild>>,
     #[lens(ignore)]
@@ -20,12 +25,25 @@ impl AppData {
         audio_tx: UnboundedSender<MainToChild>,
         plugin_tx: UnboundedSender<MainToChild>,
     ) -> Self {
+        let song = Song::default();
+        let tracker_text = crate::view::arrangement::render_tracker_text(&song, 0, 0);
         Self {
-            song: Song::default(),
+            song,
             file_path: None,
+            cursor_row: 0,
+            cursor_track: 0,
+            tracker_text,
             audio_tx: Some(audio_tx),
             plugin_tx: Some(plugin_tx),
         }
+    }
+
+    fn refresh_tracker_text(&mut self) {
+        self.tracker_text = crate::view::arrangement::render_tracker_text(
+            &self.song,
+            self.cursor_row,
+            self.cursor_track,
+        );
     }
 }
 
@@ -39,6 +57,10 @@ pub enum AppEvent {
     Stop,
     AddVocalTrack,
     RemoveLastTrack,
+    CursorLeft,
+    CursorRight,
+    CursorUp,
+    CursorDown,
 }
 
 impl Model for AppData {
@@ -48,23 +70,41 @@ impl Model for AppData {
                 tracing::info!("window close requested");
             }
         });
-        event.map(|app_event, _| match app_event {
-            AppEvent::New => self.action_new(),
-            AppEvent::Open => self.action_open(),
-            AppEvent::Save => self.action_save(),
-            AppEvent::SaveAs => self.action_save_as(),
-            AppEvent::Play => {
-                // Push the current Song to plugin_host so it can schedule events.
-                self.send_plugin(MainToChild::LoadSong(self.song.clone()));
-                self.send_audio(MainToChild::Play);
-                self.send_plugin(MainToChild::Play);
+        event.map(|app_event, _| {
+            let mut dirty = true;
+            match app_event {
+                AppEvent::New => self.action_new(),
+                AppEvent::Open => self.action_open(),
+                AppEvent::Save => {
+                    self.action_save();
+                    dirty = false;
+                }
+                AppEvent::SaveAs => {
+                    self.action_save_as();
+                    dirty = false;
+                }
+                AppEvent::Play => {
+                    // Push the current Song to plugin_host so it can schedule events.
+                    self.send_plugin(MainToChild::LoadSong(self.song.clone()));
+                    self.send_audio(MainToChild::Play);
+                    self.send_plugin(MainToChild::Play);
+                    dirty = false;
+                }
+                AppEvent::Stop => {
+                    self.send_audio(MainToChild::Stop);
+                    self.send_plugin(MainToChild::Stop);
+                    dirty = false;
+                }
+                AppEvent::AddVocalTrack => self.action_add_vocal_track(),
+                AppEvent::RemoveLastTrack => self.action_remove_last_track(),
+                AppEvent::CursorLeft => self.move_cursor_track(-1),
+                AppEvent::CursorRight => self.move_cursor_track(1),
+                AppEvent::CursorUp => self.move_cursor_row(-1),
+                AppEvent::CursorDown => self.move_cursor_row(1),
             }
-            AppEvent::Stop => {
-                self.send_audio(MainToChild::Stop);
-                self.send_plugin(MainToChild::Stop);
+            if dirty {
+                self.refresh_tracker_text();
             }
-            AppEvent::AddVocalTrack => self.action_add_vocal_track(),
-            AppEvent::RemoveLastTrack => self.action_remove_last_track(),
         });
     }
 }
@@ -158,6 +198,38 @@ impl AppData {
         if let Some(track) = self.song.tracks.pop() {
             tracing::info!(name = %track.name, "removed last track");
         }
+        self.clamp_cursor();
+    }
+
+    fn move_cursor_track(&mut self, delta: i32) {
+        let max = self.song.tracks.len().saturating_sub(1) as i64;
+        let next = (self.cursor_track as i64 + delta as i64).clamp(0, max.max(0));
+        self.cursor_track = next as u32;
+    }
+
+    fn move_cursor_row(&mut self, delta: i32) {
+        let max = self
+            .song
+            .tracks
+            .get(self.cursor_track as usize)
+            .and_then(|t| t.clips.first())
+            .map(|c| c.rows.len().saturating_sub(1))
+            .unwrap_or(0) as i64;
+        let next = (self.cursor_row as i64 + delta as i64).clamp(0, max.max(0));
+        self.cursor_row = next as u32;
+    }
+
+    fn clamp_cursor(&mut self) {
+        let track_max = self.song.tracks.len().saturating_sub(1) as u32;
+        self.cursor_track = self.cursor_track.min(track_max);
+        let row_max = self
+            .song
+            .tracks
+            .get(self.cursor_track as usize)
+            .and_then(|t| t.clips.first())
+            .map(|c| c.rows.len().saturating_sub(1))
+            .unwrap_or(0) as u32;
+        self.cursor_row = self.cursor_row.min(row_max);
     }
 
     fn save_to(&self, path: &Path) -> bool {

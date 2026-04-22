@@ -179,6 +179,22 @@ fn register_shortcuts(cx: &mut Context) {
             KeyChord::new(Modifiers::CTRL | Modifiers::SHIFT, Code::KeyS),
             KeymapEntry::new(AppEvent::SaveAs, |cx| cx.emit(AppEvent::SaveAs)),
         ),
+        (
+            KeyChord::new(Modifiers::empty(), Code::KeyH),
+            KeymapEntry::new(AppEvent::CursorLeft, |cx| cx.emit(AppEvent::CursorLeft)),
+        ),
+        (
+            KeyChord::new(Modifiers::empty(), Code::KeyJ),
+            KeymapEntry::new(AppEvent::CursorDown, |cx| cx.emit(AppEvent::CursorDown)),
+        ),
+        (
+            KeyChord::new(Modifiers::empty(), Code::KeyK),
+            KeymapEntry::new(AppEvent::CursorUp, |cx| cx.emit(AppEvent::CursorUp)),
+        ),
+        (
+            KeyChord::new(Modifiers::empty(), Code::KeyL),
+            KeymapEntry::new(AppEvent::CursorRight, |cx| cx.emit(AppEvent::CursorRight)),
+        ),
     ])
     .build(cx);
 }

@@ -9,10 +9,10 @@ pub struct ArrangementView;
 impl ArrangementView {
     pub fn new(cx: &mut Context) -> Handle<'_, Self> {
         Self.build(cx, |cx| {
-            Label::new(cx, AppData::song.map(render_tracker_text))
+            Label::new(cx, AppData::tracker_text)
                 .padding(Pixels(8.0))
                 .font_size(13.0)
-                .font_family(vec![FamilyOwned::Named("HackGen Console NF".to_string())])
+                .font_family(vec![FamilyOwned::Named("HackGen Console NF".into())])
                 .color(Color::rgb(220, 220, 220));
         })
         .background_color(Color::rgb(32, 32, 36))
@@ -41,7 +41,7 @@ fn pad_to_width(s: &str, target: usize) -> String {
     }
 }
 
-fn render_tracker_text(song: &Song) -> String {
+pub fn render_tracker_text(song: &Song, cursor_row: u32, cursor_track: u32) -> String {
     if song.tracks.is_empty() {
         return "No tracks.\nTrack > Add Vocal Track to begin.".to_string();
     }
@@ -56,36 +56,47 @@ fn render_tracker_text(song: &Song) -> String {
 
     let mut out = String::new();
 
-    // Track header
-    out.push_str("## ");
-    for track in &song.tracks {
+    // Track header: active track gets ▶ marker, others a space filler.
+    out.push_str("##  ");
+    for (track_idx, track) in song.tracks.iter().enumerate() {
         let clip_name = track
             .clips
             .first()
             .map(|c| c.name.as_str())
             .unwrap_or("(no clip)");
-        out.push_str(&format!("| {}: {:<12} ", track.name, clip_name));
+        let marker = if track_idx as u32 == cursor_track {
+            "▶"
+        } else {
+            " "
+        };
+        out.push_str(&format!("|{marker}{}: {:<12} ", track.name, clip_name));
     }
     out.push('\n');
 
     // Column labels
-    out.push_str("   ");
+    out.push_str("    ");
     for _ in &song.tracks {
         out.push_str(&format!("| {CELL_HEADER}  "));
     }
     out.push('\n');
 
-    // Rows
+    // Rows: cursor row gets `>` prefix and the cursor cell is wrapped in `[…]`.
     for row_idx in 0..visible_rows {
-        out.push_str(&format!("{row_idx:02X} "));
-        for track in &song.tracks {
+        let is_cursor_row = row_idx as u32 == cursor_row;
+        let prefix = if is_cursor_row { '>' } else { ' ' };
+        out.push_str(&format!("{prefix}{row_idx:02X} "));
+        for (track_idx, track) in song.tracks.iter().enumerate() {
             let cell = track
                 .clips
                 .first()
                 .and_then(|c| c.rows.get(row_idx))
                 .map(format_row)
                 .unwrap_or_else(empty_cell);
-            out.push_str(&format!("| {cell}  "));
+            if is_cursor_row && track_idx as u32 == cursor_track {
+                out.push_str(&format!("|[{cell}] "));
+            } else {
+                out.push_str(&format!("| {cell}  "));
+            }
         }
         out.push('\n');
     }
@@ -193,7 +204,7 @@ mod tests {
     fn render_tracker_text_empty_song() {
         let song = Song::default();
         assert_eq!(
-            render_tracker_text(&song),
+            render_tracker_text(&song, 0, 0),
             "No tracks.\nTrack > Add Vocal Track to begin."
         );
     }
