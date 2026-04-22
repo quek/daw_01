@@ -3,6 +3,8 @@ mod job;
 mod subprocess;
 mod view;
 
+use std::path::PathBuf;
+
 use anyhow::{Context as _, Result};
 use common::audio_bridge::{
     AudioBridgeHandle, CHANNELS, MAX_FRAMES, SAMPLE_RATE, ready_sem_id, request_sem_id, shmem_id,
@@ -65,8 +67,21 @@ fn main() -> Result<()> {
     rt.spawn(send_loop(audio_server, audio_rx));
     rt.spawn(send_loop(plugin_server, plugin_rx));
 
+    // Pick an initial CLAP plugin and send it to plugin_host so the user does
+    // not have to browse manually on every launch. Failure here is non-fatal:
+    // the user can still pick one from the Track Inspector afterwards.
+    let clap_plugin_path: Option<PathBuf> = common::clap_scan::default_plugin_path();
+    if let Some(path) = clap_plugin_path.clone() {
+        tracing::info!(path = %path.display(), "initial CLAP plugin selected");
+        if let Err(e) = plugin_tx.send(MainToChild::SetClapPlugin(path)) {
+            tracing::error!(error = ?e, "failed to enqueue initial SetClapPlugin");
+        }
+    } else {
+        tracing::info!("no default CLAP plugin found; user must pick one manually");
+    }
+
     tracing::info!("opening main window");
-    run_gui(audio_tx, plugin_tx)?;
+    run_gui(audio_tx, plugin_tx, clap_plugin_path)?;
     tracing::info!("daw_gui exiting");
     Ok(())
 }
@@ -136,10 +151,16 @@ async fn send_loop(mut pipe: NamedPipeServer, mut rx: UnboundedReceiver<MainToCh
 fn run_gui(
     audio_tx: UnboundedSender<MainToChild>,
     plugin_tx: UnboundedSender<MainToChild>,
+    clap_plugin_path: Option<PathBuf>,
 ) -> Result<()> {
     Application::new(move |cx| {
         cx.set_default_font(&["HackGen Console NF"]);
-        AppData::new(audio_tx.clone(), plugin_tx.clone()).build(cx);
+        AppData::new(
+            audio_tx.clone(),
+            plugin_tx.clone(),
+            clap_plugin_path.clone(),
+        )
+        .build(cx);
         register_shortcuts(cx);
 
         VStack::new(cx, |cx| {

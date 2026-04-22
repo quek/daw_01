@@ -37,6 +37,7 @@ pub enum MainToChild {
     Stop,
     Session(AudioSession),
     LoadSong(crate::model::Song),
+    SetClapPlugin(std::path::PathBuf),
 }
 
 #[cfg(test)]

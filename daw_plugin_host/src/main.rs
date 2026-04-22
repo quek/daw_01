@@ -1,22 +1,21 @@
 mod clap_host;
 mod plugin;
-mod scan;
 
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::JoinHandle;
 
 use anyhow::{Context, Result};
+use arc_swap::ArcSwapOption;
 use common::audio_bridge::{AudioBridgeHandle, CHANNELS};
+use common::model::{NoteEvent, Song};
 use common::protocol::{AudioSession, ChildKind, MainToChild};
 use common::win_sem::Semaphore;
 use common::wire::read_msg;
 use tokio::net::windows::named_pipe::NamedPipeClient;
 
 use crate::plugin::{NoteTransition, Plugin, TimedNoteEvent};
-
-use arc_swap::ArcSwapOption;
-use common::model::{NoteEvent, Song};
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,58 +48,19 @@ async fn main() -> Result<()> {
     let session = common::client::read_session(&mut pipe).await?;
     tracing::info!(?session, "audio session received");
 
-    let plugin = if let Some(path) = std::env::var_os("DAW_CLAP_PATH") {
-        let path = std::path::PathBuf::from(path);
-        tracing::info!(path = %path.display(), "DAW_CLAP_PATH override");
-        match Plugin::load(&path) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                tracing::error!(error = ?e, path = %path.display(), "failed to load override plugin");
-                None
-            }
-        }
-    } else {
-        let candidates = match scan::scan_system_clap_directory() {
-            Ok(list) => list,
-            Err(e) => {
-                tracing::error!(error = ?e, "failed to scan CLAP directory");
-                Vec::new()
-            }
-        };
-        tracing::info!(count = candidates.len(), "CLAP plugins discovered");
-        for p in &candidates {
-            tracing::info!(path = %p.display(), "CLAP plugin found");
-        }
-        pick_plugin(&candidates)
-    };
-
-    let playback_state =
-        Arc::new(std::sync::atomic::AtomicU8::new(PlaybackCommand::Stop as u8));
+    let playback_state = Arc::new(AtomicU8::new(PlaybackCommand::Stop as u8));
     let song_store: Arc<ArcSwapOption<Song>> = Arc::new(ArcSwapOption::from(None));
-
-    let audio_handle = match plugin {
-        Some(mut p) => match p.activate(
-            session.sample_rate as f64,
-            64,
-            session.max_frames,
-        ) {
-            Ok(()) => spawn_audio_thread(
-                p,
-                &session,
-                Arc::clone(&playback_state),
-                Arc::clone(&song_store),
-            )
-            .ok(),
-            Err(e) => {
-                tracing::error!(error = ?e, "plugin activate failed");
-                None
-            }
-        },
-        None => None,
-    };
+    let mut audio_handle: Option<AudioHandle> = None;
 
     tracing::info!("awaiting shutdown");
-    recv_loop(pipe, playback_state, song_store).await;
+    recv_loop(
+        pipe,
+        &session,
+        Arc::clone(&playback_state),
+        Arc::clone(&song_store),
+        &mut audio_handle,
+    )
+    .await;
     tracing::info!("daw_plugin_host shutting down");
 
     if let Some(h) = audio_handle {
@@ -109,32 +69,6 @@ async fn main() -> Result<()> {
 
     tracing::info!("daw_plugin_host exiting");
     Ok(())
-}
-
-fn pick_plugin(candidates: &[std::path::PathBuf]) -> Option<Plugin> {
-    for path in candidates {
-        match Plugin::load_matching(path, plugin::is_instrument_features) {
-            Ok(Some(p)) => {
-                tracing::info!(path = %path.display(), "loaded instrument plugin");
-                return Some(p);
-            }
-            Ok(None) => {}
-            Err(e) => tracing::warn!(error = ?e, path = %path.display(), "plugin scan failed"),
-        }
-    }
-    for path in candidates {
-        match Plugin::load(path) {
-            Ok(p) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    "no instrument found; loaded first plugin as fallback"
-                );
-                return Some(p);
-            }
-            Err(e) => tracing::warn!(error = ?e, path = %path.display(), "fallback load failed"),
-        }
-    }
-    None
 }
 
 /// RAII handle for the audio thread. `shutdown()` joins the thread and
@@ -166,10 +100,27 @@ impl AudioHandle {
     }
 }
 
+fn load_and_spawn(
+    path: &std::path::Path,
+    session: &AudioSession,
+    playback_state: Arc<AtomicU8>,
+    song_store: Arc<ArcSwapOption<Song>>,
+) -> Result<AudioHandle> {
+    let mut plugin = Plugin::load(path).context("failed to load plugin")?;
+    plugin
+        .activate(
+            f64::from(session.sample_rate),
+            64,
+            session.max_frames,
+        )
+        .context("plugin.activate failed")?;
+    spawn_audio_thread(plugin, session, playback_state, song_store)
+}
+
 fn spawn_audio_thread(
     mut plugin: Plugin,
     session: &AudioSession,
-    playback_state: Arc<std::sync::atomic::AtomicU8>,
+    playback_state: Arc<AtomicU8>,
     song_store: Arc<ArcSwapOption<Song>>,
 ) -> Result<AudioHandle> {
     let bridge = Arc::new(
@@ -223,7 +174,7 @@ fn run_audio(
     request_sem: Arc<Semaphore>,
     ready_sem: Arc<Semaphore>,
     shutdown: Arc<AtomicBool>,
-    playback_state: Arc<std::sync::atomic::AtomicU8>,
+    playback_state: Arc<AtomicU8>,
     song_store: Arc<ArcSwapOption<Song>>,
     sample_rate: u32,
 ) -> Result<Plugin> {
@@ -340,8 +291,10 @@ fn run_audio(
 
 async fn recv_loop(
     mut pipe: NamedPipeClient,
-    playback_state: Arc<std::sync::atomic::AtomicU8>,
+    session: &AudioSession,
+    playback_state: Arc<AtomicU8>,
     song_store: Arc<ArcSwapOption<Song>>,
+    audio_handle: &mut Option<AudioHandle>,
 ) {
     loop {
         match read_msg::<_, MainToChild>(&mut pipe).await {
@@ -361,6 +314,16 @@ async fn recv_loop(
                 );
                 song_store.store(Some(Arc::new(song)));
             }
+            Ok(MainToChild::SetClapPlugin(path)) => {
+                tracing::info!(path = %path.display(), "received SetClapPlugin");
+                swap_plugin(
+                    &path,
+                    session,
+                    Arc::clone(&playback_state),
+                    Arc::clone(&song_store),
+                    audio_handle,
+                );
+            }
             Ok(msg) => {
                 tracing::info!(?msg, "received (no handler)");
             }
@@ -368,6 +331,32 @@ async fn recv_loop(
                 tracing::info!(error = ?e, "pipe ended");
                 break;
             }
+        }
+    }
+}
+
+fn swap_plugin(
+    path: &Path,
+    session: &AudioSession,
+    playback_state: Arc<AtomicU8>,
+    song_store: Arc<ArcSwapOption<Song>>,
+    audio_handle: &mut Option<AudioHandle>,
+) {
+    // Bring playback to Stop so the new plugin starts from a clean state.
+    playback_state.store(PlaybackCommand::Stop as u8, Ordering::Release);
+
+    // Stop and clean up the existing plugin on the main thread.
+    if let Some(h) = audio_handle.take() {
+        h.shutdown();
+    }
+
+    match load_and_spawn(path, session, playback_state, song_store) {
+        Ok(h) => {
+            *audio_handle = Some(h);
+            tracing::info!(path = %path.display(), "plugin swapped in");
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, path = %path.display(), "failed to load plugin");
         }
     }
 }

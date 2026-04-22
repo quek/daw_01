@@ -21,6 +21,11 @@ pub struct AppData {
     /// Flipped only by explicit user Play/Stop; auto-stop in plugin_host is
     /// not yet mirrored back here.
     pub is_playing: bool,
+    /// Path of the currently loaded CLAP plugin. `None` until the user picks
+    /// one and the initial scan didn't find a candidate.
+    pub clap_plugin_path: Option<PathBuf>,
+    /// Cached display label ("<file-stem>" or "(no plugin)") for the inspector.
+    pub clap_plugin_label: String,
     #[lens(ignore)]
     pub audio_tx: Option<UnboundedSender<MainToChild>>,
     #[lens(ignore)]
@@ -31,9 +36,11 @@ impl AppData {
     pub fn new(
         audio_tx: UnboundedSender<MainToChild>,
         plugin_tx: UnboundedSender<MainToChild>,
+        clap_plugin_path: Option<PathBuf>,
     ) -> Self {
         let song = Song::default();
         let tracker_text = crate::view::arrangement::render_tracker_text(&song, 0, 0);
+        let clap_plugin_label = plugin_label(clap_plugin_path.as_deref());
         Self {
             song,
             file_path: None,
@@ -45,6 +52,8 @@ impl AppData {
                 velocity: 100,
             },
             is_playing: false,
+            clap_plugin_path,
+            clap_plugin_label,
             audio_tx: Some(audio_tx),
             plugin_tx: Some(plugin_tx),
         }
@@ -78,6 +87,7 @@ pub enum AppEvent {
     NoteClear,
     TransposeSemi(i8),
     TransposeOctave(i8),
+    ChangeClapPlugin,
 }
 
 impl Model for AppData {
@@ -126,6 +136,10 @@ impl Model for AppData {
                 AppEvent::NoteClear => self.edit_cell(|row| row.note = None),
                 AppEvent::TransposeSemi(d) => self.apply_transpose(*d as i16),
                 AppEvent::TransposeOctave(d) => self.apply_transpose(*d as i16 * 12),
+                AppEvent::ChangeClapPlugin => {
+                    self.action_change_clap_plugin();
+                    dirty = false;
+                }
             }
             if dirty {
                 self.refresh_tracker_text();
@@ -200,6 +214,25 @@ impl AppData {
         if self.save_to(&path) {
             self.file_path = Some(path);
         }
+    }
+
+    fn action_change_clap_plugin(&mut self) {
+        let mut dialog = rfd::FileDialog::new().add_filter("CLAP plugin", &["clap"]);
+        // Start the browse dialog in the system CLAP directory when possible.
+        let start_dir = std::env::var_os("COMMONPROGRAMFILES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Common Files"))
+            .join("CLAP");
+        if start_dir.is_dir() {
+            dialog = dialog.set_directory(start_dir);
+        }
+        let Some(path) = dialog.pick_file() else {
+            return;
+        };
+        tracing::info!(path = %path.display(), "user picked CLAP plugin");
+        self.send_plugin(MainToChild::SetClapPlugin(path.clone()));
+        self.clap_plugin_label = plugin_label(Some(&path));
+        self.clap_plugin_path = Some(path);
     }
 
     fn action_add_vocal_track(&mut self) {
@@ -321,6 +354,16 @@ impl AppData {
                 false
             }
         }
+    }
+}
+
+fn plugin_label(path: Option<&Path>) -> String {
+    match path {
+        Some(p) => p
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.display().to_string()),
+        None => "(no plugin)".into(),
     }
 }
 

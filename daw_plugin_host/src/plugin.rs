@@ -371,11 +371,6 @@ fn query_output_channel_count(plugin: *const clap_plugin, get_ext: GetExtFn) -> 
     unsafe { info.assume_init() }.channel_count
 }
 
-/// Returns true when the plugin declares the CLAP `instrument` feature.
-pub fn is_instrument_features(features: &[String]) -> bool {
-    features.iter().any(|f| f == "instrument")
-}
-
 impl Drop for Plugin {
     fn drop(&mut self) {
         unsafe {

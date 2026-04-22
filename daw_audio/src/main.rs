@@ -93,6 +93,9 @@ async fn recv_loop(mut pipe: NamedPipeClient, state: Arc<AtomicU8>) {
             Ok(MainToChild::LoadSong(_)) => {
                 // Song state lives in daw_plugin_host; daw_audio does not use it.
             }
+            Ok(MainToChild::SetClapPlugin(_)) => {
+                // CLAP plugin lifecycle is handled by daw_plugin_host.
+            }
             Err(e) => {
                 tracing::info!(error = ?e, "receive loop ending");
                 break;
