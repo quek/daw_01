@@ -26,7 +26,9 @@ fn main() -> Result<()> {
 
     let (audio_child, plugin_child, audio_server, plugin_server) =
         rt.block_on(spawn_and_handshake(&job))?;
-    drop(plugin_server); // plugin host does not yet receive further messages
+    // Keep plugin_server alive for the session so daw_plugin_host stays running.
+    // Further messages to plugin_host will be wired up in a later step.
+    let _plugin_server = plugin_server;
     let _children = (audio_child, plugin_child);
 
     let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel::<MainToChild>();
