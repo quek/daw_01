@@ -1,4 +1,5 @@
 pub mod logging;
+pub mod model;
 pub mod protocol;
 pub mod wire;
 
