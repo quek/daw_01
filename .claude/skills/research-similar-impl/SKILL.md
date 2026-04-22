@@ -80,6 +80,27 @@ sing_like_coding (`F:\dev\sing_like_coding`) に類似実装がある場合、�
 - `windows` crate の COM メソッド引数型
 - `vizia` の内部 API（View trait、Event 処理、Context メソッド）
 
+#### ⚠️ バージョン整合性の確認（最優先）
+
+`/tmp/<crate>` の clone は **GitHub main ブランチ**。crates.io で公開されている stable 版と
+API が違うことがある。**main だけ見てレポートすると誤った設計判断になる**。
+
+**Vizia がまさにこの罠**:
+- crates.io `vizia = "0.3.0"` = **Lens ベース**（`#[derive(Lens)]`, `Binding`, `AppData::song.map(...)`)
+- GitHub main = **Signal ベースに移行中**（`Signal::new`, `ReadSignal`, `WriteSignal`）
+- 初回実装で Signal 前提のコードを書いたところ全部 compile error で書き直した実績あり
+
+対策手順:
+1. `F:\dev\daw_01\Cargo.lock` で実際に solver が選んだバージョンを確認
+2. `~/.cargo/registry/src/index.crates.io-*/<crate>-<version>/` の実ファイルを必ず Read / Grep
+3. `/tmp/<crate>` の情報と食い違ったら **crates.io 側（実際にビルドされる方）を信じる**
+4. Agent に指示するときは「crates.io の `<crate> = \"X.Y.Z\"` を基準に調査」と明示
+
+他の既知差:
+- `windows` crate は 0.58 / 0.61 で HANDLE が `isize` → `*mut c_void` に変更
+- `tokio` の `net::windows::named_pipe` は 1.x 前提
+- `bincode` 2.x は `Encode`/`Decode` に刷新（1.x とは別 API）
+
 ### 6. レポート出力
 
 [report-template.md](report-template.md) の形式で日本語でまとめる。

@@ -12,6 +12,25 @@
 
 全プロジェクトを調査する必要はない。機能に最も関連するものを優先する。
 
+## ⚠️ crates.io 版と GitHub main で API が違う場合
+
+`/tmp/<crate>` にクローンされるのは **GitHub main**（未リリース版）。daw_01 が実際に
+使うのは `Cargo.lock` で solver が選んだ crates.io 版。両者で API が違うなら、
+**crates.io 側を基準に実装する**。
+
+既知の乖離:
+- **Vizia 0.3.0 (crates.io) = Lens ベース**（`#[derive(Lens)]`, `Binding`, `Lens::map`、`Data` trait 必要）
+  **Vizia main = Signal ベースに移行中**（`Signal::new`, `ReadSignal`, `WriteSignal`）
+  → Song 型を Lens で bind するときに `Data` 未実装でコンパイル不能になる。解決策は
+  `AppData.tracker_text: String` のような派生文字列を保持して Lens 化する
+
+- `windows` crate は 0.58 → 0.61 で `HANDLE` 型が `isize` → `*mut c_void` に変更
+
+- `bincode` 2.x は 1.x とは別 API（`Encode`/`Decode` derive）。IPC 型に
+  `#[derive(bincode::Encode, bincode::Decode)]` が必要
+
+Agent に調査を依頼するときは「crates.io の `<crate> = \"X.Y.Z\"` 基準で」と明記。
+
 # 自プロジェクト（前作）
 
 | プロジェクト | パス | 参考ポイント |

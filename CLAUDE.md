@@ -22,6 +22,26 @@ cargo test --workspace
 cargo clippy --workspace -- -D warnings
 ```
 
+### ビルドと検証の区別（重要）
+
+- `cargo clippy` / `cargo check` / `cargo test` は**実行バイナリを生成しない** or 生成してもテストビルドのみ。
+  手動で `./target/debug/daw_gui.exe` を走らせる前に、必ず `cargo build` を明示する
+- 子プロセス（daw_audio / daw_plugin_host）の挙動を変えたときは、子プロセスのバイナリも再生成が必要。
+  `cargo build -p <crate>` または `cargo build --workspace`
+- `cargo run -p daw_gui` は dependency crate も自動ビルドしてくれるが、既に起動中のプロセスのバイナリは上書きされない場合がある（Windows の ERROR 5）。必要なら先に全プロセスを終了
+
+### IPC 境界で送る型
+
+- `MainToChild` / `ChildToMain` 等の protocol 型、およびそれが保持する内側の型すべてに
+  `#[derive(bincode::Encode, bincode::Decode)]` が必要
+- Song / Track / Clip / Row 等のモデル型も protocol 経由で渡す場合は bincode derive を追加する
+
+### GUI デバッグ
+
+- UI のキーバインド・イベントは可視フィードバックが無いと動いたか判別不能
+- 迷ったら `AppData::event` 冒頭に `tracing::info!(?app_event, "received")` を仕込んでログで確認
+- 確認後は削除するか、debug feature で囲う（`[debug-gui]` skill 参照）
+
 ## 応答・コミット
 
 - 応答は日本語
@@ -78,6 +98,7 @@ cargo clippy --workspace -- -D warnings
 - **実データから始める**: コードパス推論より実データ観察が速い
 - **フルサイクルで検証する**: 個別関数が正しくても、パイプライン全体が壊れていれば無意味
 - **上流→下流の順で調査する**: UI/コマンド → Model → IPC → Plugin Host → プラグイン本体
+- **UI イベントは常時ログ無し**: GUI のキーバインド・ボタンクリックは、何も起きないとき「キー拾えてない」「emit されてない」「handler が間違い」の 3 層で切り分ける必要がある。`tracing::info!` を各層に仕込む
 
 ## 参照プロジェクト
 

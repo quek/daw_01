@@ -34,6 +34,12 @@ $ARGUMENTS を実装する。
 
 **推測で実装するな。** まず正しい振る舞いを調査してから実装する。
 
+**前作 sing_like_coding はプロト品質**: RT パス（`process()` 内）での `Vec::new` / `Box::new`、`unwrap` / `panic!` の粗さ、ハードコード定数などを鵜呑みにしない。
+構造（プロセス分割、IPC の形、イベントの流れ）は参考にできるが、**実装は best practice で組み直す**。特に:
+- RT セーフなバッファ確保（activate 時に事前確保、process では再利用のみ）
+- `Option<unsafe extern "C" fn>` は `unwrap` せず `ok_or_else` で null チェック
+- CLAP / FFI エラーは `anyhow::Context` で意味のあるメッセージを付ける
+
 以下のいずれかに該当する場合、`/research-similar-impl` スキルを呼び出して
 類似プロダクト（clap-host, clack, nih-plug, Meadowlark 等）の実装を調査する:
 
@@ -132,6 +138,25 @@ cargo test --workspace
 
 **新規テスト・既存テスト全てが通ること**を確認する。
 失敗するテストがあれば実装を修正する。
+
+#### 実機検証前の再ビルド（必須）
+
+**`cargo clippy` / `cargo check` / `cargo test` は実行バイナリを生成しない、
+または test 用 exe しか作らない**。`./target/debug/daw_gui.exe` で手動検証する前に、
+必ず `cargo build` を明示する:
+
+```bash
+cargo build -p daw_gui            # daw_gui だけを更新した場合
+cargo build --workspace           # 子プロセス側も含めて全て再生成
+```
+
+特に **子プロセス（daw_audio / daw_plugin_host）のコードを変更したときは、
+子プロセスのバイナリも再ビルド**が必要。忘れると「コードは直したのに挙動が
+変わらない」という混乱が起きる（このプロジェクトで繰り返し起きている）。
+
+Windows のビルドで `os error 5: アクセスが拒否されました` が出る場合、
+対象バイナリが既に起動中。`tasklist | grep daw_` で確認し、`taskkill //F //PID <pid>`
+で落としてから再ビルドする。
 
 ### 7. リファクタリング（必要に応じて）
 
