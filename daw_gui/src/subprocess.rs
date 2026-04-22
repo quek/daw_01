@@ -1,13 +1,19 @@
 use std::env;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
 
 use anyhow::{Context, Result};
+use tokio::process::{Child, Command};
 
-pub fn spawn_sibling(name: &str) -> Result<Child> {
+pub fn spawn_sibling<I, S>(name: &str, args: I) -> Result<Child>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let path = resolve_sibling_binary(name)?;
     tracing::info!(binary = %path.display(), "spawning child process");
     Command::new(&path)
+        .args(args)
         .spawn()
         .with_context(|| format!("failed to spawn {}", path.display()))
 }
@@ -31,7 +37,6 @@ fn binary_path_with_ext(dir: &Path, name: &str, exe_ext: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
 
     #[test]
     fn appends_extension_when_non_empty() {

@@ -8,5 +8,7 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1"
+bincode = { version = "2", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

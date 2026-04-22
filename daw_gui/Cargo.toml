@@ -6,4 +6,5 @@ edition.workspace = true
 [dependencies]
 common = { path = "../common" }
 anyhow.workspace = true
+tokio.workspace = true
 tracing.workspace = true
