@@ -1,11 +1,9 @@
 mod app;
 mod job;
 mod subprocess;
-
-use std::path::PathBuf;
+mod view;
 
 use anyhow::{Context as _, Result};
-use common::model::Song;
 use common::pipe::pipe_path;
 use common::protocol::{ChildKind, ChildToMain, MainToChild};
 use common::wire::{read_msg, write_msg};
@@ -16,6 +14,7 @@ use vizia::prelude::*;
 
 use crate::app::{AppData, AppEvent};
 use crate::job::JobHandle;
+use crate::view::{ArrangementView, StatusBarView, TrackInspectorView, TransportView};
 
 fn main() -> Result<()> {
     common::logging::init_tracing();
@@ -84,7 +83,15 @@ fn run_gui() -> Result<()> {
 
         VStack::new(cx, |cx| {
             build_menu_bar(cx);
-            build_status(cx);
+            TransportView::new(cx).height(Pixels(44.0));
+
+            HStack::new(cx, |cx| {
+                TrackInspectorView::new(cx).width(Pixels(220.0));
+                ArrangementView::new(cx).width(Stretch(1.0));
+            })
+            .height(Stretch(1.0));
+
+            StatusBarView::new(cx).height(Pixels(26.0));
         });
     })
     .title("daw_01")
@@ -143,21 +150,4 @@ fn menu_item(cx: &mut Context, label: &'static str, shortcut: &'static str, even
             .gap(Stretch(1.0))
         },
     );
-}
-
-fn build_status(cx: &mut Context) {
-    VStack::new(cx, |cx| {
-        Label::new(
-            cx,
-            AppData::file_path.map(|p: &Option<PathBuf>| {
-                p.as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "(untitled)".to_string())
-            }),
-        )
-        .font_size(20.0);
-        Label::new(cx, AppData::song.map(|s: &Song| format!("BPM {}", s.bpm)));
-    })
-    .alignment(Alignment::Center)
-    .padding(Pixels(16.0));
 }

@@ -15,6 +15,8 @@ pub enum AppEvent {
     Open,
     Save,
     SaveAs,
+    Play,
+    Stop,
 }
 
 impl Model for AppData {
@@ -29,6 +31,8 @@ impl Model for AppData {
             AppEvent::Open => self.action_open(),
             AppEvent::Save => self.action_save(),
             AppEvent::SaveAs => self.action_save_as(),
+            AppEvent::Play => tracing::info!("play (not yet implemented)"),
+            AppEvent::Stop => tracing::info!("stop (not yet implemented)"),
         });
     }
 }
