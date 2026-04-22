@@ -5,3 +5,8 @@ members = ["common", "daw_gui", "daw_audio", "daw_plugin_host"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+
+[workspace.dependencies]
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
