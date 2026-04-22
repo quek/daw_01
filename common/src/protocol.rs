@@ -30,12 +30,13 @@ pub struct AudioSession {
     pub channels: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub enum MainToChild {
     Ack,
     Play,
     Stop,
     Session(AudioSession),
+    LoadSong(crate::model::Song),
 }
 
 #[cfg(test)]

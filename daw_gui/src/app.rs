@@ -54,6 +54,8 @@ impl Model for AppData {
             AppEvent::Save => self.action_save(),
             AppEvent::SaveAs => self.action_save_as(),
             AppEvent::Play => {
+                // Push the current Song to plugin_host so it can schedule events.
+                self.send_plugin(MainToChild::LoadSong(self.song.clone()));
                 self.send_audio(MainToChild::Play);
                 self.send_plugin(MainToChild::Play);
             }

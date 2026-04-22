@@ -26,6 +26,14 @@ pub enum NoteTransition {
     Off { key: u8 },
 }
 
+/// A note transition scheduled at a specific frame offset within the next
+/// process() buffer.
+#[derive(Debug, Clone, Copy)]
+pub struct TimedNoteEvent {
+    pub time: u32,
+    pub event: NoteTransition,
+}
+
 use crate::clap_host::Host;
 
 /// Loaded CLAP plugin instance. Holds every resource alive until dropped; the
@@ -172,7 +180,7 @@ impl Plugin {
             output_channels,
             output_buffers: Vec::new(),
             output_ptrs: Vec::new(),
-            pending_events: Vec::with_capacity(8),
+            pending_events: Vec::with_capacity(64),
         }))
     }
 
@@ -227,17 +235,18 @@ impl Plugin {
         self.output_ptrs.clear();
     }
 
-    /// Calls the plugin's process() with an optional single note event and
-    /// returns the status. Must be called on the audio thread only. Fills
+    /// Calls the plugin's process() with zero or more timed note events.
+    /// Must be called on the audio thread only. Events must be sorted by
+    /// ascending `time` as required by the CLAP specification. Fills
     /// `output_buffers` (planar) with the rendered audio.
-    pub fn process(&mut self, frames: u32, note: Option<NoteTransition>) -> Result<i32> {
+    pub fn process(&mut self, frames: u32, events: &[TimedNoteEvent]) -> Result<i32> {
         anyhow::ensure!(self.processing, "plugin not processing");
 
-        // Prepare input event buffer. pending_events has cap 8, so push cannot
-        // allocate as long as we stay within the budget.
         self.pending_events.clear();
-        if let Some(transition) = note {
-            self.pending_events.push(encode_note(transition));
+        for ev in events {
+            let mut e = encode_note(ev.event);
+            e.header.time = ev.time;
+            self.pending_events.push(e);
         }
 
         // Refresh output channel pointers (buffers are pre-allocated).

@@ -8,6 +8,7 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1"
+arc-swap = "1"
 bincode = { version = "2", features = ["derive"] }
 clap-sys = "0.5"
 cpal = "0.15"

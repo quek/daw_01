@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 pub const CURRENT_VERSION: u32 = 1;
@@ -10,7 +11,7 @@ pub struct ProjectFile {
     pub song: Song,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Song {
     pub bpm: f32,
     pub time_sig: (u8, u8),
@@ -30,7 +31,7 @@ impl Default for Song {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Track {
     pub name: String,
     pub source: InstrumentSource,
@@ -42,7 +43,7 @@ pub struct Track {
     pub clips: Vec<Clip>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub enum InstrumentSource {
     Vocal { speaker_id: u32, style_name: String },
     Clap { path: PathBuf, plugin_id: String },
@@ -50,13 +51,13 @@ pub enum InstrumentSource {
     BuiltinSynth,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub struct PluginInstance {
     pub path: PathBuf,
     pub plugin_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Clip {
     pub name: String,
     pub start_beat: f64,
@@ -66,7 +67,7 @@ pub struct Clip {
     pub rows: Vec<Row>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub struct Row {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<NoteEvent>,
@@ -78,19 +79,19 @@ pub struct Row {
     pub lyric: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub enum NoteEvent {
     On(Note),
     Off,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub struct Note {
     pub key: u8,
     pub velocity: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub struct FxCommand {
     pub cmd: u8,
     pub value: u8,

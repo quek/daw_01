@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 common = { path = "../common" }
 anyhow.workspace = true
+arc-swap.workspace = true
 clap-sys.workspace = true
 libloading.workspace = true
 tokio.workspace = true
