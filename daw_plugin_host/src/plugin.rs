@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap_sys::audio_buffer::clap_audio_buffer;
 use clap_sys::entry::clap_plugin_entry;
-use clap_sys::events::{clap_event_header, clap_input_events, clap_output_events};
+use clap_sys::events::{
+    CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_OFF, CLAP_EVENT_NOTE_ON, clap_event_header,
+    clap_event_note, clap_input_events, clap_output_events,
+};
 use clap_sys::ext::audio_ports::{
     CLAP_EXT_AUDIO_PORTS, clap_audio_port_info, clap_plugin_audio_ports,
 };
@@ -15,6 +18,13 @@ use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
 use clap_sys::process::clap_process;
 use clap_sys::version::clap_version_is_compatible;
 use libloading::{Library, Symbol};
+
+/// A single transition to inject into the next process() call.
+#[derive(Debug, Clone, Copy)]
+pub enum NoteTransition {
+    On { key: u8, velocity: f64 },
+    Off { key: u8 },
+}
 
 use crate::clap_host::Host;
 
@@ -33,6 +43,8 @@ pub struct Plugin {
     output_channels: u32,
     output_buffers: Vec<Vec<f32>>,
     output_ptrs: Vec<*mut f32>,
+    /// Pre-allocated input event buffer; filled by process() per call.
+    pending_events: Vec<clap_event_note>,
 }
 
 // The plugin holds raw pointers but ownership is exclusive within the struct.
@@ -160,6 +172,7 @@ impl Plugin {
             output_channels,
             output_buffers: Vec::new(),
             output_ptrs: Vec::new(),
+            pending_events: Vec::with_capacity(8),
         }))
     }
 
@@ -214,17 +227,24 @@ impl Plugin {
         self.output_ptrs.clear();
     }
 
-    /// Calls the plugin's process() with empty events and returns the status.
-    /// Must be called on the audio thread only, between start_processing and
-    /// stop_processing. Fills `output_buffers` (planar) with the rendered audio.
-    pub fn process(&mut self, frames: u32) -> Result<i32> {
+    /// Calls the plugin's process() with an optional single note event and
+    /// returns the status. Must be called on the audio thread only. Fills
+    /// `output_buffers` (planar) with the rendered audio.
+    pub fn process(&mut self, frames: u32, note: Option<NoteTransition>) -> Result<i32> {
         anyhow::ensure!(self.processing, "plugin not processing");
-        // Refresh channel pointers (buffers are pre-allocated; this is O(channels)
-        // and does not allocate).
+
+        // Prepare input event buffer. pending_events has cap 8, so push cannot
+        // allocate as long as we stay within the budget.
+        self.pending_events.clear();
+        if let Some(transition) = note {
+            self.pending_events.push(encode_note(transition));
+        }
+
+        // Refresh output channel pointers (buffers are pre-allocated).
         for i in 0..self.output_buffers.len() {
             self.output_ptrs[i] = self.output_buffers[i].as_mut_ptr();
         }
-        let audio_out = clap_audio_buffer {
+        let mut audio_out = clap_audio_buffer {
             data32: self.output_ptrs.as_mut_ptr(),
             data64: std::ptr::null_mut(),
             channel_count: self.output_channels,
@@ -232,16 +252,19 @@ impl Plugin {
             constant_mask: 0,
         };
 
-        let in_events = EMPTY_INPUT_EVENTS;
+        let in_events = clap_input_events {
+            ctx: std::ptr::from_ref(&self.pending_events) as *mut c_void,
+            size: Some(in_events_size),
+            get: Some(in_events_get),
+        };
         let out_events = EMPTY_OUTPUT_EVENTS;
 
-        let mut audio_out_mut = audio_out;
         let process_ctx = clap_process {
             steady_time: -1,
             frames_count: frames,
             transport: std::ptr::null(),
             audio_inputs: std::ptr::null(),
-            audio_outputs: &mut audio_out_mut,
+            audio_outputs: &mut audio_out,
             audio_inputs_count: 0,
             audio_outputs_count: 1,
             in_events: &in_events,
@@ -264,33 +287,62 @@ impl Plugin {
     }
 }
 
-// Static virtual tables for empty event lists. The function pointers are
-// trivial and the ctx pointer is unused, so these are safe to share globally.
-const EMPTY_INPUT_EVENTS: clap_input_events = clap_input_events {
-    ctx: std::ptr::null_mut(),
-    size: Some(empty_in_size),
-    get: Some(empty_in_get),
-};
-
+// Static output-event vtable. We drop whatever the plugin sends back for now.
 const EMPTY_OUTPUT_EVENTS: clap_output_events = clap_output_events {
     ctx: std::ptr::null_mut(),
     try_push: Some(empty_out_try_push),
 };
 
-unsafe extern "C" fn empty_in_size(_list: *const clap_input_events) -> u32 {
-    0
-}
-unsafe extern "C" fn empty_in_get(
-    _list: *const clap_input_events,
-    _index: u32,
-) -> *const clap_event_header {
-    std::ptr::null()
-}
 unsafe extern "C" fn empty_out_try_push(
     _list: *const clap_output_events,
     _event: *const clap_event_header,
 ) -> bool {
     true
+}
+
+/// `ctx` of the in_events vtable points to `&Vec<clap_event_note>`.
+unsafe extern "C" fn in_events_size(list: *const clap_input_events) -> u32 {
+    let ctx = unsafe { (*list).ctx } as *const Vec<clap_event_note>;
+    if ctx.is_null() {
+        return 0;
+    }
+    unsafe { (*ctx).len() as u32 }
+}
+
+unsafe extern "C" fn in_events_get(
+    list: *const clap_input_events,
+    index: u32,
+) -> *const clap_event_header {
+    let ctx = unsafe { (*list).ctx } as *const Vec<clap_event_note>;
+    if ctx.is_null() {
+        return std::ptr::null();
+    }
+    let events = unsafe { &*ctx };
+    let Some(ev) = events.get(index as usize) else {
+        return std::ptr::null();
+    };
+    std::ptr::from_ref(&ev.header)
+}
+
+fn encode_note(transition: NoteTransition) -> clap_event_note {
+    let (type_, key, velocity) = match transition {
+        NoteTransition::On { key, velocity } => (CLAP_EVENT_NOTE_ON, key, velocity),
+        NoteTransition::Off { key } => (CLAP_EVENT_NOTE_OFF, key, 0.0),
+    };
+    clap_event_note {
+        header: clap_event_header {
+            size: std::mem::size_of::<clap_event_note>() as u32,
+            time: 0,
+            space_id: CLAP_CORE_EVENT_SPACE_ID,
+            type_,
+            flags: 0,
+        },
+        note_id: -1,
+        port_index: 0,
+        channel: 0,
+        key: key as i16,
+        velocity,
+    }
 }
 
 fn query_output_channel_count(plugin: *const clap_plugin, get_ext: GetExtFn) -> u32 {

@@ -11,14 +11,20 @@ pub struct AppData {
     pub file_path: Option<PathBuf>,
     #[lens(ignore)]
     pub audio_tx: Option<UnboundedSender<MainToChild>>,
+    #[lens(ignore)]
+    pub plugin_tx: Option<UnboundedSender<MainToChild>>,
 }
 
 impl AppData {
-    pub fn new(audio_tx: UnboundedSender<MainToChild>) -> Self {
+    pub fn new(
+        audio_tx: UnboundedSender<MainToChild>,
+        plugin_tx: UnboundedSender<MainToChild>,
+    ) -> Self {
         Self {
             song: Song::default(),
             file_path: None,
             audio_tx: Some(audio_tx),
+            plugin_tx: Some(plugin_tx),
         }
     }
 }
@@ -47,8 +53,14 @@ impl Model for AppData {
             AppEvent::Open => self.action_open(),
             AppEvent::Save => self.action_save(),
             AppEvent::SaveAs => self.action_save_as(),
-            AppEvent::Play => self.send_audio(MainToChild::Play),
-            AppEvent::Stop => self.send_audio(MainToChild::Stop),
+            AppEvent::Play => {
+                self.send_audio(MainToChild::Play);
+                self.send_plugin(MainToChild::Play);
+            }
+            AppEvent::Stop => {
+                self.send_audio(MainToChild::Stop);
+                self.send_plugin(MainToChild::Stop);
+            }
             AppEvent::AddVocalTrack => self.action_add_vocal_track(),
             AppEvent::RemoveLastTrack => self.action_remove_last_track(),
         });
@@ -64,6 +76,17 @@ impl AppData {
         };
         if let Err(e) = tx.send(msg) {
             tracing::error!(error = %e, "failed to enqueue audio command");
+        }
+    }
+
+    fn send_plugin(&self, msg: MainToChild) {
+        tracing::info!(?msg, "sending to plugin_host");
+        let Some(tx) = self.plugin_tx.as_ref() else {
+            tracing::warn!("plugin sender is not configured");
+            return;
+        };
+        if let Err(e) = tx.send(msg) {
+            tracing::error!(error = %e, "failed to enqueue plugin command");
         }
     }
 

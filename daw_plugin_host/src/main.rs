@@ -13,7 +13,26 @@ use common::win_sem::Semaphore;
 use common::wire::read_msg;
 use tokio::net::windows::named_pipe::NamedPipeClient;
 
-use crate::plugin::Plugin;
+use crate::plugin::{NoteTransition, Plugin};
+
+const DEMO_NOTE_KEY: u8 = 60;
+const DEMO_NOTE_VELOCITY: f64 = 0.8;
+
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NoteCommand {
+    Off = 0,
+    On = 1,
+}
+
+impl NoteCommand {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::On,
+            _ => Self::Off,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,13 +74,15 @@ async fn main() -> Result<()> {
         pick_plugin(&candidates)
     };
 
+    let note_state = Arc::new(std::sync::atomic::AtomicU8::new(NoteCommand::Off as u8));
+
     let audio_handle = match plugin {
         Some(mut p) => match p.activate(
             session.sample_rate as f64,
             64,
             session.max_frames,
         ) {
-            Ok(()) => spawn_audio_thread(p, &session).ok(),
+            Ok(()) => spawn_audio_thread(p, &session, Arc::clone(&note_state)).ok(),
             Err(e) => {
                 tracing::error!(error = ?e, "plugin activate failed");
                 None
@@ -71,7 +92,7 @@ async fn main() -> Result<()> {
     };
 
     tracing::info!("awaiting shutdown");
-    wait_for_pipe_close(pipe).await;
+    recv_loop(pipe, note_state).await;
     tracing::info!("daw_plugin_host shutting down");
 
     if let Some(h) = audio_handle {
@@ -137,7 +158,11 @@ impl AudioHandle {
     }
 }
 
-fn spawn_audio_thread(mut plugin: Plugin, session: &AudioSession) -> Result<AudioHandle> {
+fn spawn_audio_thread(
+    mut plugin: Plugin,
+    session: &AudioSession,
+    note_state: Arc<std::sync::atomic::AtomicU8>,
+) -> Result<AudioHandle> {
     let bridge = Arc::new(
         AudioBridgeHandle::open(&session.shmem_id).context("failed to open audio shmem")?,
     );
@@ -160,7 +185,9 @@ fn spawn_audio_thread(mut plugin: Plugin, session: &AudioSession) -> Result<Audi
 
     let handle = std::thread::Builder::new()
         .name("clap-audio".into())
-        .spawn(move || run_audio(plugin, th_bridge, th_req, th_ready, th_shutdown))
+        .spawn(move || {
+            run_audio(plugin, th_bridge, th_req, th_ready, th_shutdown, note_state)
+        })
         .context("failed to spawn audio thread")?;
 
     Ok(AudioHandle {
@@ -176,8 +203,10 @@ fn run_audio(
     request_sem: Arc<Semaphore>,
     ready_sem: Arc<Semaphore>,
     shutdown: Arc<AtomicBool>,
+    note_state: Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<Plugin> {
     let out_channels = CHANNELS as usize;
+    let mut current_note = NoteCommand::Off;
     tracing::info!("audio thread running");
     loop {
         match request_sem.wait_timeout_ms(100) {
@@ -197,8 +226,25 @@ fn run_audio(
             break;
         }
 
+        let desired = NoteCommand::from_u8(note_state.load(Ordering::Acquire));
+        let transition = if desired != current_note {
+            let t = match desired {
+                NoteCommand::On => NoteTransition::On {
+                    key: DEMO_NOTE_KEY,
+                    velocity: DEMO_NOTE_VELOCITY,
+                },
+                NoteCommand::Off => NoteTransition::Off {
+                    key: DEMO_NOTE_KEY,
+                },
+            };
+            current_note = desired;
+            Some(t)
+        } else {
+            None
+        };
+
         let frames = bridge.frames_requested();
-        if let Err(e) = plugin.process(frames) {
+        if let Err(e) = plugin.process(frames, transition) {
             tracing::error!(error = ?e, "plugin.process failed");
             break;
         }
@@ -235,11 +281,19 @@ fn run_audio(
     Ok(plugin)
 }
 
-async fn wait_for_pipe_close(mut pipe: NamedPipeClient) {
+async fn recv_loop(mut pipe: NamedPipeClient, note_state: Arc<std::sync::atomic::AtomicU8>) {
     loop {
         match read_msg::<_, MainToChild>(&mut pipe).await {
+            Ok(MainToChild::Play) => {
+                tracing::info!("received Play → NoteOn");
+                note_state.store(NoteCommand::On as u8, Ordering::Release);
+            }
+            Ok(MainToChild::Stop) => {
+                tracing::info!("received Stop → NoteOff");
+                note_state.store(NoteCommand::Off as u8, Ordering::Release);
+            }
             Ok(msg) => {
-                tracing::info!(?msg, "received (ignored by plugin host for now)");
+                tracing::info!(?msg, "received (no handler)");
             }
             Err(e) => {
                 tracing::info!(error = ?e, "pipe ended");

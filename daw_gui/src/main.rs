@@ -58,16 +58,15 @@ fn main() -> Result<()> {
     })
     .context("failed to send audio session")?;
 
-    // Keep plugin_server alive for the session so daw_plugin_host stays running.
-    // Further messages to plugin_host will be wired up in a later step.
-    let _plugin_server = plugin_server;
     let _children = (audio_child, plugin_child);
 
     let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel::<MainToChild>();
+    let (plugin_tx, plugin_rx) = tokio::sync::mpsc::unbounded_channel::<MainToChild>();
     rt.spawn(send_loop(audio_server, audio_rx));
+    rt.spawn(send_loop(plugin_server, plugin_rx));
 
     tracing::info!("opening main window");
-    run_gui(audio_tx)?;
+    run_gui(audio_tx, plugin_tx)?;
     tracing::info!("daw_gui exiting");
     Ok(())
 }
@@ -134,10 +133,13 @@ async fn send_loop(mut pipe: NamedPipeServer, mut rx: UnboundedReceiver<MainToCh
     tracing::info!("send loop ended");
 }
 
-fn run_gui(audio_tx: UnboundedSender<MainToChild>) -> Result<()> {
+fn run_gui(
+    audio_tx: UnboundedSender<MainToChild>,
+    plugin_tx: UnboundedSender<MainToChild>,
+) -> Result<()> {
     Application::new(move |cx| {
         cx.set_default_font(&["HackGen Console NF"]);
-        AppData::new(audio_tx.clone()).build(cx);
+        AppData::new(audio_tx.clone(), plugin_tx.clone()).build(cx);
         register_shortcuts(cx);
 
         VStack::new(cx, |cx| {
