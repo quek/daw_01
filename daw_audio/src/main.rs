@@ -11,6 +11,7 @@ async fn main() -> Result<()> {
         .context("expected pipe name as first argument")?;
 
     common::client::perform_handshake(&pipe_name, ChildKind::Audio).await?;
-    tracing::info!("daw_audio handshake complete");
+    tracing::info!("daw_audio handshake complete, awaiting shutdown");
+    std::future::pending::<()>().await;
     Ok(())
 }

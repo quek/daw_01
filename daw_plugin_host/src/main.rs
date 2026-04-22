@@ -11,6 +11,7 @@ async fn main() -> Result<()> {
         .context("expected pipe name as first argument")?;
 
     common::client::perform_handshake(&pipe_name, ChildKind::PluginHost).await?;
-    tracing::info!("daw_plugin_host handshake complete");
+    tracing::info!("daw_plugin_host handshake complete, awaiting shutdown");
+    std::future::pending::<()>().await;
     Ok(())
 }
