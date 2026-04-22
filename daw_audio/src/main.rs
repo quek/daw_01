@@ -1,6 +1,27 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use anyhow::{Context, Result};
-use common::protocol::ChildKind;
+use common::protocol::{ChildKind, MainToChild};
+use common::wire::read_msg;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use tokio::net::windows::named_pipe::NamedPipeClient;
+
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum PlayState {
+    Silence = 0,
+    TestTone = 1,
+}
+
+impl PlayState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::TestTone,
+            _ => Self::Silence,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -11,19 +32,48 @@ async fn main() -> Result<()> {
         .nth(1)
         .context("expected pipe name as first argument")?;
 
-    common::client::perform_handshake(&pipe_name, ChildKind::Audio).await?;
+    let pipe = common::client::perform_handshake(&pipe_name, ChildKind::Audio).await?;
     tracing::info!("daw_audio handshake complete");
 
-    let _stream = start_output_stream().context("failed to start audio stream")?;
-    tracing::info!("audio stream running; awaiting shutdown");
+    let initial = if std::env::var_os("DAW_AUDIO_TEST_TONE").is_some() {
+        PlayState::TestTone
+    } else {
+        PlayState::Silence
+    };
+    let play_state = Arc::new(AtomicU8::new(initial as u8));
 
-    std::future::pending::<()>().await;
+    let _stream = start_output_stream(Arc::clone(&play_state))
+        .context("failed to start audio stream")?;
+    tracing::info!("audio stream running");
+
+    recv_loop(pipe, play_state).await;
+    tracing::info!("daw_audio exiting");
     Ok(())
 }
 
-fn start_output_stream() -> Result<cpal::Stream> {
-    let test_tone = std::env::var_os("DAW_AUDIO_TEST_TONE").is_some();
+async fn recv_loop(mut pipe: NamedPipeClient, state: Arc<AtomicU8>) {
+    loop {
+        match read_msg::<_, MainToChild>(&mut pipe).await {
+            Ok(MainToChild::Play) => {
+                tracing::info!("received Play");
+                state.store(PlayState::TestTone as u8, Ordering::Relaxed);
+            }
+            Ok(MainToChild::Stop) => {
+                tracing::info!("received Stop");
+                state.store(PlayState::Silence as u8, Ordering::Relaxed);
+            }
+            Ok(MainToChild::Ack) => {
+                tracing::warn!("unexpected Ack outside of handshake");
+            }
+            Err(e) => {
+                tracing::info!(error = ?e, "receive loop ending");
+                break;
+            }
+        }
+    }
+}
 
+fn start_output_stream(play_state: Arc<AtomicU8>) -> Result<cpal::Stream> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
@@ -42,7 +92,6 @@ fn start_output_stream() -> Result<cpal::Stream> {
         sample_rate,
         channels,
         ?sample_format,
-        test_tone,
         "opening output stream"
     );
 
@@ -51,38 +100,17 @@ fn start_output_stream() -> Result<cpal::Stream> {
     }
 
     let config: cpal::StreamConfig = supported.into();
-
-    let stream = if test_tone {
-        build_test_tone_stream(&device, &config, sample_rate, channels)?
-    } else {
-        build_silence_stream(&device, &config)?
-    };
-
+    let stream = build_stream(&device, &config, sample_rate, channels, play_state)?;
     stream.play().context("failed to start stream")?;
     Ok(stream)
 }
 
-fn build_silence_stream(device: &cpal::Device, config: &cpal::StreamConfig) -> Result<cpal::Stream> {
-    let stream = device
-        .build_output_stream(
-            config,
-            |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                for sample in data.iter_mut() {
-                    *sample = 0.0;
-                }
-            },
-            |err| tracing::error!(?err, "audio stream error"),
-            None,
-        )
-        .context("failed to build silence stream")?;
-    Ok(stream)
-}
-
-fn build_test_tone_stream(
+fn build_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     sample_rate: u32,
     channels: u16,
+    play_state: Arc<AtomicU8>,
 ) -> Result<cpal::Stream> {
     use std::f32::consts::TAU;
     let freq_hz: f32 = 440.0;
@@ -95,20 +123,30 @@ fn build_test_tone_stream(
         .build_output_stream(
             config,
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                for frame in data.chunks_mut(channels) {
-                    let sample = phase.sin() * amplitude;
-                    for s in frame.iter_mut() {
-                        *s = sample;
+                let state = PlayState::from_u8(play_state.load(Ordering::Relaxed));
+                match state {
+                    PlayState::Silence => {
+                        for s in data.iter_mut() {
+                            *s = 0.0;
+                        }
                     }
-                    phase += phase_inc;
-                    if phase >= TAU {
-                        phase -= TAU;
+                    PlayState::TestTone => {
+                        for frame in data.chunks_mut(channels) {
+                            let sample = phase.sin() * amplitude;
+                            for s in frame.iter_mut() {
+                                *s = sample;
+                            }
+                            phase += phase_inc;
+                            if phase >= TAU {
+                                phase -= TAU;
+                            }
+                        }
                     }
                 }
             },
             |err| tracing::error!(?err, "audio stream error"),
             None,
         )
-        .context("failed to build test tone stream")?;
+        .context("failed to build output stream")?;
     Ok(stream)
 }

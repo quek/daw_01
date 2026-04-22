@@ -1,48 +1,25 @@
 use std::path::{Path, PathBuf};
 
 use common::model::{Clip, InstrumentSource, Note, NoteEvent, Row, Song, Track};
+use common::protocol::MainToChild;
+use tokio::sync::mpsc::UnboundedSender;
 use vizia::prelude::*;
 
-#[derive(Lens, Default)]
+#[derive(Lens)]
 pub struct AppData {
     pub song: Song,
     pub file_path: Option<PathBuf>,
+    #[lens(ignore)]
+    pub audio_tx: Option<UnboundedSender<MainToChild>>,
 }
 
-fn demo_clip() -> Clip {
-    let note = |key, lyric: &str| Row {
-        note: Some(NoteEvent::On(Note {
-            key,
-            velocity: 100,
-        })),
-        lyric: Some(lyric.into()),
-        ..Default::default()
-    };
-    let mut rows = vec![
-        note(60, "こ"),
-        Row::default(),
-        note(62, "ん"),
-        Row::default(),
-        note(64, "に"),
-        Row::default(),
-        note(65, "ち"),
-        Row::default(),
-        note(67, "は"),
-        Row::default(),
-        Row {
-            note: Some(NoteEvent::Off),
-            ..Default::default()
-        },
-    ];
-    while rows.len() < 16 {
-        rows.push(Row::default());
-    }
-    Clip {
-        name: "こんにちは".into(),
-        start_beat: 0.0,
-        length_beats: 4.0,
-        rows_per_beat: 4,
-        rows,
+impl AppData {
+    pub fn new(audio_tx: UnboundedSender<MainToChild>) -> Self {
+        Self {
+            song: Song::default(),
+            file_path: None,
+            audio_tx: Some(audio_tx),
+        }
     }
 }
 
@@ -70,8 +47,8 @@ impl Model for AppData {
             AppEvent::Open => self.action_open(),
             AppEvent::Save => self.action_save(),
             AppEvent::SaveAs => self.action_save_as(),
-            AppEvent::Play => tracing::info!("play (not yet implemented)"),
-            AppEvent::Stop => tracing::info!("stop (not yet implemented)"),
+            AppEvent::Play => self.send_audio(MainToChild::Play),
+            AppEvent::Stop => self.send_audio(MainToChild::Stop),
             AppEvent::AddVocalTrack => self.action_add_vocal_track(),
             AppEvent::RemoveLastTrack => self.action_remove_last_track(),
         });
@@ -79,6 +56,17 @@ impl Model for AppData {
 }
 
 impl AppData {
+    fn send_audio(&self, msg: MainToChild) {
+        tracing::info!(?msg, "sending to audio");
+        let Some(tx) = self.audio_tx.as_ref() else {
+            tracing::warn!("audio sender is not configured");
+            return;
+        };
+        if let Err(e) = tx.send(msg) {
+            tracing::error!(error = %e, "failed to enqueue audio command");
+        }
+    }
+
     fn action_new(&mut self) {
         self.song = Song::default();
         self.file_path = None;
@@ -158,5 +146,42 @@ impl AppData {
                 false
             }
         }
+    }
+}
+
+fn demo_clip() -> Clip {
+    let note = |key, lyric: &str| Row {
+        note: Some(NoteEvent::On(Note {
+            key,
+            velocity: 100,
+        })),
+        lyric: Some(lyric.into()),
+        ..Default::default()
+    };
+    let mut rows = vec![
+        note(60, "こ"),
+        Row::default(),
+        note(62, "ん"),
+        Row::default(),
+        note(64, "に"),
+        Row::default(),
+        note(65, "ち"),
+        Row::default(),
+        note(67, "は"),
+        Row::default(),
+        Row {
+            note: Some(NoteEvent::Off),
+            ..Default::default()
+        },
+    ];
+    while rows.len() < 16 {
+        rows.push(Row::default());
+    }
+    Clip {
+        name: "こんにちは".into(),
+        start_beat: 0.0,
+        length_beats: 4.0,
+        rows_per_beat: 4,
+        rows,
     }
 }

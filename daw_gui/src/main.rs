@@ -10,6 +10,7 @@ use common::wire::{read_msg, write_msg};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::process::Child;
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use vizia::prelude::*;
 
 use crate::app::{AppData, AppEvent};
@@ -23,15 +24,23 @@ fn main() -> Result<()> {
     let job = JobHandle::new()?;
     let rt = Runtime::new().context("failed to create tokio runtime")?;
 
-    let _children = rt.block_on(spawn_and_handshake(&job))?;
-    tracing::info!("opening main window");
+    let (audio_child, plugin_child, audio_server, plugin_server) =
+        rt.block_on(spawn_and_handshake(&job))?;
+    drop(plugin_server); // plugin host does not yet receive further messages
+    let _children = (audio_child, plugin_child);
 
-    run_gui()?;
+    let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel::<MainToChild>();
+    rt.spawn(send_loop(audio_server, audio_rx));
+
+    tracing::info!("opening main window");
+    run_gui(audio_tx)?;
     tracing::info!("daw_gui exiting");
     Ok(())
 }
 
-async fn spawn_and_handshake(job: &JobHandle) -> Result<(Child, Child)> {
+async fn spawn_and_handshake(
+    job: &JobHandle,
+) -> Result<(Child, Child, NamedPipeServer, NamedPipeServer)> {
     let pid = std::process::id();
     let audio_pipe = pipe_path(pid, ChildKind::Audio);
     let plugin_pipe = pipe_path(pid, ChildKind::PluginHost);
@@ -50,17 +59,22 @@ async fn spawn_and_handshake(job: &JobHandle) -> Result<(Child, Child)> {
     let plugin_child = subprocess::spawn_sibling("daw_plugin_host", [&plugin_pipe])?;
     job.assign(&plugin_child)?;
 
-    let (audio_hello, plugin_hello) = tokio::try_join!(
+    let (audio_result, plugin_result) = tokio::try_join!(
         handshake(audio_server, ChildKind::Audio),
         handshake(plugin_server, ChildKind::PluginHost),
     )?;
+    let (audio_hello, audio_server) = audio_result;
+    let (plugin_hello, plugin_server) = plugin_result;
     tracing::info!(?audio_hello, "audio handshake complete");
     tracing::info!(?plugin_hello, "plugin_host handshake complete");
 
-    Ok((audio_child, plugin_child))
+    Ok((audio_child, plugin_child, audio_server, plugin_server))
 }
 
-async fn handshake(mut server: NamedPipeServer, expected: ChildKind) -> Result<ChildToMain> {
+async fn handshake(
+    mut server: NamedPipeServer,
+    expected: ChildKind,
+) -> Result<(ChildToMain, NamedPipeServer)> {
     server.connect().await.context("failed to accept client")?;
     let hello: ChildToMain = read_msg(&mut server).await?;
     let kind = match &hello {
@@ -73,13 +87,23 @@ async fn handshake(mut server: NamedPipeServer, expected: ChildKind) -> Result<C
         kind
     );
     write_msg(&mut server, &MainToChild::Ack).await?;
-    Ok(hello)
+    Ok((hello, server))
 }
 
-fn run_gui() -> Result<()> {
-    Application::new(|cx| {
+async fn send_loop(mut pipe: NamedPipeServer, mut rx: UnboundedReceiver<MainToChild>) {
+    while let Some(msg) = rx.recv().await {
+        if let Err(e) = write_msg(&mut pipe, &msg).await {
+            tracing::error!(error = ?e, ?msg, "failed to send message to child");
+            break;
+        }
+    }
+    tracing::info!("send loop ended");
+}
+
+fn run_gui(audio_tx: UnboundedSender<MainToChild>) -> Result<()> {
+    Application::new(move |cx| {
         cx.set_default_font(&["HackGen Console NF"]);
-        AppData::default().build(cx);
+        AppData::new(audio_tx.clone()).build(cx);
         register_shortcuts(cx);
 
         VStack::new(cx, |cx| {

@@ -23,6 +23,8 @@ pub enum ChildToMain {
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum MainToChild {
     Ack,
+    Play,
+    Stop,
 }
 
 #[cfg(test)]
@@ -58,5 +60,11 @@ mod tests {
     fn main_to_child_ack_roundtrip() {
         let msg = MainToChild::Ack;
         assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn main_to_child_play_stop_roundtrip() {
+        assert_eq!(roundtrip(&MainToChild::Play), MainToChild::Play);
+        assert_eq!(roundtrip(&MainToChild::Stop), MainToChild::Stop);
     }
 }
