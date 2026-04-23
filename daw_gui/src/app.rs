@@ -1,9 +1,21 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use common::model::{Clip, InstrumentSource, Note, NoteEvent, Row, Song, Track};
+use common::plugin_db::PluginDatabase;
 use common::protocol::MainToChild;
 use tokio::sync::mpsc::UnboundedSender;
 use vizia::prelude::*;
+
+/// Lightweight lens-friendly copy of a plugin database entry. Carries only
+/// what the picker list needs to render and select; path lookup happens
+/// via `plugin_db.find_by_id` when the user picks.
+#[derive(Debug, Clone, PartialEq, Eq, Data)]
+pub struct PluginPickEntry {
+    pub id: String,
+    pub name: String,
+    pub vendor: String,
+}
 
 #[derive(Lens)]
 pub struct AppData {
@@ -46,11 +58,29 @@ pub struct AppData {
     /// single Lens.
     pub peak_l_norm: f32,
     pub peak_r_norm: f32,
-    /// Path of the currently loaded CLAP plugin. `None` until the user picks
-    /// one and the initial scan didn't find a candidate.
+    /// Stable CLAP descriptor ID of the loaded plugin (e.g. `com.vital.Vital`).
+    /// Persisted in `.daw`; the authoritative copy is
+    /// `song.clap_plugin_id` (we mirror it here for Lens binding).
+    pub clap_plugin_id: Option<String>,
+    /// Path of the currently loaded CLAP plugin (derived from the database
+    /// at runtime; not persisted). Kept for diagnostic logging.
     pub clap_plugin_path: Option<PathBuf>,
-    /// Cached display label ("<file-stem>" or "(no plugin)") for the inspector.
+    /// Cached display label ("<name>" or "(no plugin)") for the inspector.
     pub clap_plugin_label: String,
+    /// Plugin database (path + id lookup). Shared, read-mostly. `None`
+    /// before the initial scan finishes.
+    #[lens(ignore)]
+    pub plugin_db: Option<Arc<PluginDatabase>>,
+    /// Lens-visible copy of the database entries for the plugin-picker UI.
+    /// Derived once from `plugin_db` at construction time.
+    pub plugin_picker_entries: Vec<PluginPickEntry>,
+    /// Whether the plugin-picker overlay is visible.
+    pub is_plugin_picker_open: bool,
+    /// When non-`None`, a save is in flight waiting for the plugin state
+    /// reply; once `ChildToMain::PluginState` arrives the data is written
+    /// to this path.
+    #[lens(ignore)]
+    pub pending_save_path: Option<PathBuf>,
     /// Whether the plugin's GUI window is currently open. Flips on button
     /// press / IPC callbacks.
     pub is_gui_open: bool,
@@ -71,11 +101,28 @@ impl AppData {
         audio_tx: UnboundedSender<MainToChild>,
         plugin_tx: UnboundedSender<MainToChild>,
         clap_plugin_path: Option<PathBuf>,
+        plugin_db: Option<Arc<PluginDatabase>>,
     ) -> Self {
         let song = Song::default();
         let tracker_header = crate::view::arrangement::render_tracker_header(&song, 0);
         let tracker_rows = crate::view::arrangement::render_tracker_rows(&song, 0, 0);
         let clap_plugin_label = plugin_label(clap_plugin_path.as_deref());
+        let plugin_picker_entries = plugin_db
+            .as_ref()
+            .map(|db| {
+                let mut v: Vec<PluginPickEntry> = db
+                    .entries
+                    .iter()
+                    .map(|e| PluginPickEntry {
+                        id: e.id.clone(),
+                        name: if e.name.is_empty() { e.id.clone() } else { e.name.clone() },
+                        vendor: e.vendor.clone(),
+                    })
+                    .collect();
+                v.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                v
+            })
+            .unwrap_or_default();
         Self {
             song,
             file_path: None,
@@ -95,8 +142,13 @@ impl AppData {
             peak_r_display: 0.0,
             peak_l_norm: 0.0,
             peak_r_norm: 0.0,
+            clap_plugin_id: None,
             clap_plugin_path,
             clap_plugin_label,
+            plugin_db,
+            plugin_picker_entries,
+            is_plugin_picker_open: false,
+            pending_save_path: None,
             is_gui_open: false,
             audio_tx: Some(audio_tx),
             plugin_tx: Some(plugin_tx),
@@ -116,7 +168,7 @@ impl AppData {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AppEvent {
     New,
     Open,
@@ -135,7 +187,12 @@ pub enum AppEvent {
     NoteClear,
     TransposeSemi(i8),
     TransposeOctave(i8),
-    ChangeClapPlugin,
+    /// Open the plugin picker overlay (DB-backed selection).
+    OpenPluginPicker,
+    /// Close the picker without changing selection.
+    ClosePluginPicker,
+    /// User picked a plugin from the picker; carries its stable id.
+    SelectPluginFromDb(String),
     ToggleLoop,
     /// Master gain change from the fader. Carried as `f32::to_bits` because
     /// `f32` doesn't implement `Eq`/`Hash` and `AppEvent` needs both for the
@@ -155,6 +212,12 @@ pub enum AppEvent {
     GuiRequestResizeFromChild { width: u32, height: u32 },
     /// Plugin signalled its GUI was closed (host-callback `closed`).
     GuiClosedFromChild,
+    /// Plugin-host confirmed a successful load and reported the ID/name of
+    /// the descriptor that actually came up.
+    PluginLoadedFromChild { id: String, name: String },
+    /// Reply to `RequestPluginState`. Payload is `None` when the plugin
+    /// does not implement the state extension.
+    PluginStateReceived(Option<Vec<u8>>),
 }
 
 impl Model for AppData {
@@ -203,8 +266,16 @@ impl Model for AppData {
                 AppEvent::NoteClear => self.edit_cell(|row| row.note = None),
                 AppEvent::TransposeSemi(d) => self.apply_transpose(*d as i16),
                 AppEvent::TransposeOctave(d) => self.apply_transpose(*d as i16 * 12),
-                AppEvent::ChangeClapPlugin => {
-                    self.action_change_clap_plugin();
+                AppEvent::OpenPluginPicker => {
+                    self.is_plugin_picker_open = true;
+                    dirty = false;
+                }
+                AppEvent::ClosePluginPicker => {
+                    self.is_plugin_picker_open = false;
+                    dirty = false;
+                }
+                AppEvent::SelectPluginFromDb(id) => {
+                    self.select_plugin_from_db(id.clone());
                     dirty = false;
                 }
                 AppEvent::ToggleLoop => {
@@ -237,6 +308,14 @@ impl Model for AppData {
                 }
                 AppEvent::GuiClosedFromChild => {
                     self.on_gui_closed();
+                    dirty = false;
+                }
+                AppEvent::PluginLoadedFromChild { id, name } => {
+                    self.on_plugin_loaded_from_child(id.clone(), name.clone());
+                    dirty = false;
+                }
+                AppEvent::PluginStateReceived(state) => {
+                    self.on_plugin_state_from_child(state.clone());
                     dirty = false;
                 }
             }
@@ -286,6 +365,10 @@ impl AppData {
         match common::project::load(&path) {
             Ok(song) => {
                 tracing::info!(path = %path.display(), "loaded project");
+                // Resolve persisted plugin id → path via the database, then
+                // send SetClapPlugin with initial_state so the plugin comes
+                // back up with the same settings.
+                self.restore_plugin_from_song(&song);
                 self.song = song;
                 self.file_path = Some(path);
             }
@@ -295,9 +378,45 @@ impl AppData {
         }
     }
 
+    /// Looks up the persisted plugin id in the database, sends
+    /// `SetClapPlugin` with the restored state, and updates the local
+    /// mirrors. Silently skips when the id is missing from the DB so the
+    /// project can still open (user can pick a plugin manually).
+    fn restore_plugin_from_song(&mut self, song: &Song) {
+        let Some(id) = song.clap_plugin_id.as_deref() else {
+            tracing::info!("project has no CLAP plugin id; nothing to restore");
+            self.clap_plugin_id = None;
+            self.clap_plugin_path = None;
+            self.clap_plugin_label = plugin_label(None);
+            return;
+        };
+        let Some(db) = self.plugin_db.as_deref() else {
+            tracing::warn!(id, "plugin database not loaded yet; cannot resolve id");
+            return;
+        };
+        let Some(entry) = db.find_by_id(id) else {
+            tracing::error!(id, "plugin id not in database (plugin not installed?)");
+            return;
+        };
+        tracing::info!(
+            id,
+            path = %entry.path.display(),
+            has_state = song.clap_plugin_state.is_some(),
+            "restoring CLAP plugin from project"
+        );
+        self.send_plugin(MainToChild::SetClapPlugin {
+            path: entry.path.clone(),
+            plugin_id: entry.id.clone(),
+            initial_state: song.clap_plugin_state.clone(),
+        });
+        self.clap_plugin_id = Some(entry.id.clone());
+        self.clap_plugin_path = Some(entry.path.clone());
+        self.clap_plugin_label = plugin_label_from_entry(entry);
+    }
+
     fn action_save(&mut self) {
         if let Some(path) = self.file_path.clone() {
-            self.save_to(&path);
+            self.begin_save(path);
         } else {
             self.action_save_as();
         }
@@ -310,6 +429,26 @@ impl AppData {
         else {
             return;
         };
+        self.begin_save(path);
+    }
+
+    /// Kicks off the two-step save: request plugin state asynchronously and
+    /// stash the target path. `on_plugin_state_from_child` finishes the save
+    /// when the reply arrives.
+    fn begin_save(&mut self, path: PathBuf) {
+        if self.clap_plugin_id.is_some() {
+            self.pending_save_path = Some(path);
+            self.send_plugin(MainToChild::RequestPluginState);
+        } else {
+            // No plugin loaded: write immediately without a state round-trip.
+            self.finish_save(path, None);
+        }
+    }
+
+    fn finish_save(&mut self, path: PathBuf, plugin_state: Option<Vec<u8>>) {
+        // Snapshot current plugin id/state into the song before serializing.
+        self.song.clap_plugin_id = self.clap_plugin_id.clone();
+        self.song.clap_plugin_state = plugin_state;
         if self.save_to(&path) {
             self.file_path = Some(path);
         }
@@ -398,6 +537,27 @@ impl AppData {
         self.is_gui_open = false;
     }
 
+    /// plugin_host reported that a SetClapPlugin succeeded. Sync the id and
+    /// display label with reality.
+    fn on_plugin_loaded_from_child(&mut self, id: String, name: String) {
+        tracing::info!(id = %id, name = %name, "plugin_host confirmed plugin loaded");
+        self.clap_plugin_label = if name.is_empty() { id.clone() } else { name };
+        self.clap_plugin_id = Some(id);
+    }
+
+    /// `ChildToMain::PluginState` reply. When a save was pending, finalize
+    /// it; otherwise the reply is unsolicited and ignored.
+    fn on_plugin_state_from_child(&mut self, state: Option<Vec<u8>>) {
+        tracing::info!(
+            has_state = state.is_some(),
+            pending = self.pending_save_path.is_some(),
+            "plugin state reply received"
+        );
+        if let Some(path) = self.pending_save_path.take() {
+            self.finish_save(path, state);
+        }
+    }
+
     /// Process a periodic UI tick that carries the latest `playhead_samples`
     /// and raw L/R peak amplitudes published to shmem by daw_audio and
     /// daw_plugin_host.
@@ -458,23 +618,32 @@ impl AppData {
         self.send_audio(MainToChild::SetMasterGain(clamped));
     }
 
-    fn action_change_clap_plugin(&mut self) {
-        let mut dialog = rfd::FileDialog::new().add_filter("CLAP plugin", &["clap"]);
-        // Start the browse dialog in the system CLAP directory when possible.
-        let start_dir = std::env::var_os("COMMONPROGRAMFILES")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Common Files"))
-            .join("CLAP");
-        if start_dir.is_dir() {
-            dialog = dialog.set_directory(start_dir);
-        }
-        let Some(path) = dialog.pick_file() else {
+    /// User picked a plugin from the DB-backed picker overlay. Resolves the
+    /// path from the database and swaps in the plugin (no state to restore:
+    /// this is an explicit "new plugin" flow).
+    fn select_plugin_from_db(&mut self, id: String) {
+        self.is_plugin_picker_open = false;
+        let Some(db) = self.plugin_db.as_deref() else {
+            tracing::warn!(id, "plugin_db not available");
             return;
         };
-        tracing::info!(path = %path.display(), "user picked CLAP plugin");
-        self.send_plugin(MainToChild::SetClapPlugin(path.clone()));
-        self.clap_plugin_label = plugin_label(Some(&path));
+        let Some(entry) = db.find_by_id(&id) else {
+            tracing::error!(id, "picked plugin id not in database (stale picker?)");
+            return;
+        };
+        let path = entry.path.clone();
+        tracing::info!(id = %entry.id, path = %path.display(), "user picked plugin");
+        self.send_plugin(MainToChild::SetClapPlugin {
+            path: path.clone(),
+            plugin_id: entry.id.clone(),
+            initial_state: None,
+        });
+        self.clap_plugin_label = plugin_label_from_entry(entry);
         self.clap_plugin_path = Some(path);
+        self.clap_plugin_id = Some(entry.id.clone());
+        // Starting fresh — drop any persisted state from a previous plugin.
+        self.song.clap_plugin_id = Some(entry.id.clone());
+        self.song.clap_plugin_state = None;
     }
 
     fn action_add_vocal_track(&mut self) {
@@ -606,6 +775,14 @@ fn plugin_label(path: Option<&Path>) -> String {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| p.display().to_string()),
         None => "(no plugin)".into(),
+    }
+}
+
+fn plugin_label_from_entry(entry: &common::plugin_db::PluginEntry) -> String {
+    if entry.name.is_empty() {
+        entry.id.clone()
+    } else {
+        entry.name.clone()
     }
 }
 

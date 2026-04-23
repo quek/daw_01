@@ -15,6 +15,8 @@ use clap_sys::ext::gui::{
     CLAP_EXT_GUI, CLAP_WINDOW_API_WIN32, clap_plugin_gui, clap_window, clap_window_handle,
 };
 use clap_sys::ext::note_ports::{CLAP_EXT_NOTE_PORTS, clap_plugin_note_ports};
+use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
+use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
 use clap_sys::host::clap_host;
 use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
@@ -47,6 +49,8 @@ pub struct Plugin {
     entry: *const clap_plugin_entry,
     plugin: *const clap_plugin,
     _host: Box<Host>,
+    /// Stable `clap_plugin_descriptor.id` of the loaded descriptor.
+    id: String,
     name: String,
     path: PathBuf,
     active: bool,
@@ -62,20 +66,25 @@ pub struct Plugin {
     /// Whether `gui.create` has been called successfully and `gui.destroy`
     /// has not yet been called. Used by Drop to tear down cleanly.
     gui_created: bool,
+    /// `clap_plugin_state` vtable pointer. `None` when the plugin does not
+    /// implement the state extension (project save/load will skip it).
+    state_ext: Option<*const clap_plugin_state>,
 }
 
 // The plugin holds raw pointers but ownership is exclusive within the struct.
 unsafe impl Send for Plugin {}
 
 impl Plugin {
-    /// Tries to load a plugin from `path`. Scans all descriptors in the file and
-    /// instantiates the first one for which `matches(features)` returns true.
+    /// Tries to load a plugin from `path`. Scans all descriptors in the file
+    /// and instantiates the first one matching `target_id` when provided, or
+    /// otherwise the first one for which `matches(features)` returns true.
     /// Returns `Ok(None)` if no descriptor matches (library is unloaded cleanly).
     ///
     /// `callbacks` wires host-side CLAP GUI events (resize / close) back to
     /// the caller.
     pub fn load_matching<F>(
         path: &Path,
+        target_id: Option<&str>,
         matches: F,
         callbacks: HostCallbacks,
     ) -> Result<Option<Self>>
@@ -141,7 +150,16 @@ impl Plugin {
             }
             let desc = unsafe { &*desc_ptr };
             log_descriptor(i, desc);
-            if selected.is_none() {
+            if selected.is_some() {
+                continue;
+            }
+            if let Some(want) = target_id {
+                // Exact ID match takes precedence over feature matching when
+                // the caller asks for a specific descriptor (project-load path).
+                if c_str_to_string(desc.id) == want {
+                    selected = Some(i);
+                }
+            } else {
                 let features = read_feature_list(desc.features);
                 if matches(&features) {
                     selected = Some(i);
@@ -162,6 +180,7 @@ impl Plugin {
         anyhow::ensure!(!desc_ptr.is_null(), "selected descriptor became null");
         let desc = unsafe { &*desc_ptr };
         let plugin_id = desc.id;
+        let id = c_str_to_string(plugin_id);
         let name = c_str_to_string(desc.name);
 
         let host = Host::new(callbacks);
@@ -189,11 +208,22 @@ impl Plugin {
         let gui_ext = if gui_ptr.is_null() { None } else { Some(gui_ptr) };
         tracing::info!(has_gui = gui_ext.is_some(), "plugin gui extension");
 
+        // Look up optional clap.state extension for project save / restore.
+        let state_ptr = unsafe { get_ext(plugin_ptr, CLAP_EXT_STATE.as_ptr()) }
+            as *const clap_plugin_state;
+        let state_ext = if state_ptr.is_null() {
+            None
+        } else {
+            Some(state_ptr)
+        };
+        tracing::info!(has_state = state_ext.is_some(), "plugin state extension");
+
         Ok(Some(Self {
             _library: library,
             entry: entry_ptr,
             plugin: plugin_ptr,
             _host: host,
+            id,
             name,
             path: path.to_path_buf(),
             active: false,
@@ -204,7 +234,12 @@ impl Plugin {
             pending_events: Vec::with_capacity(64),
             gui_ext,
             gui_created: false,
+            state_ext,
         }))
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     pub fn name(&self) -> &str {
@@ -445,11 +480,131 @@ impl Plugin {
         self.output_buffers.get(channel).map(Vec::as_slice)
     }
 
-    /// Loads the first plugin in the file (any type).
-    pub fn load(path: &Path, callbacks: HostCallbacks) -> Result<Self> {
-        Self::load_matching(path, |_| true, callbacks)?
-            .ok_or_else(|| anyhow::anyhow!("no plugins in {}", path.display()))
+    /// Loads a plugin in the file. If `target_id` is non-empty, selects that
+    /// specific descriptor; otherwise loads the first descriptor in the file.
+    pub fn load(path: &Path, target_id: &str, callbacks: HostCallbacks) -> Result<Self> {
+        let opt_id = if target_id.is_empty() {
+            None
+        } else {
+            Some(target_id)
+        };
+        Self::load_matching(path, opt_id, |_| true, callbacks)?.ok_or_else(|| {
+            if target_id.is_empty() {
+                anyhow::anyhow!("no plugins in {}", path.display())
+            } else {
+                anyhow::anyhow!("plugin id '{}' not found in {}", target_id, path.display())
+            }
+        })
     }
+
+    // --- State extension wrappers ----------------------------------------
+
+    /// Serializes the plugin's internal state via `clap_plugin_state.save`.
+    /// Returns `Ok(None)` if the plugin does not implement the state
+    /// extension. Runs on the CLAP main-thread.
+    pub fn state_save(&self) -> Result<Option<Vec<u8>>> {
+        let Some(state) = self.state_ext else {
+            return Ok(None);
+        };
+        let state = unsafe { &*state };
+        let Some(save) = state.save else {
+            return Ok(None);
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        let stream = clap_ostream {
+            ctx: std::ptr::from_mut(&mut buf) as *mut c_void,
+            write: Some(stream_write),
+        };
+        let ok = unsafe { save(self.plugin, &stream) };
+        anyhow::ensure!(ok, "plugin_state.save returned false");
+        Ok(Some(buf))
+    }
+
+    /// Restores previously captured state via `clap_plugin_state.load`. No-op
+    /// when the extension is missing (returns `Ok(())` silently so project
+    /// loads tolerate plugin upgrades that dropped state support).
+    pub fn state_load(&self, data: &[u8]) -> Result<()> {
+        let Some(state) = self.state_ext else {
+            tracing::warn!("plugin has no state extension; skipping state restore");
+            return Ok(());
+        };
+        let state = unsafe { &*state };
+        let Some(load) = state.load else {
+            tracing::warn!("plugin_state.load is null; skipping state restore");
+            return Ok(());
+        };
+        let mut cursor = StateCursor { data, pos: 0 };
+        let stream = clap_istream {
+            ctx: std::ptr::from_mut(&mut cursor) as *mut c_void,
+            read: Some(stream_read),
+        };
+        let ok = unsafe { load(self.plugin, &stream) };
+        anyhow::ensure!(ok, "plugin_state.load returned false");
+        Ok(())
+    }
+}
+
+/// Read-only cursor over a `&[u8]` used by the istream callback below.
+struct StateCursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+/// `clap_ostream.write`: write up to `size` bytes from `buffer` into the
+/// `Vec<u8>` referenced by `ctx`. Returns number of bytes written, or -1 on
+/// error. We never fail to grow a `Vec`, so return the full size.
+unsafe extern "C" fn stream_write(
+    stream: *const clap_ostream,
+    buffer: *const c_void,
+    size: u64,
+) -> i64 {
+    if stream.is_null() || buffer.is_null() {
+        return -1;
+    }
+    let ctx = unsafe { (*stream).ctx } as *mut Vec<u8>;
+    if ctx.is_null() {
+        return -1;
+    }
+    let Ok(n) = usize::try_from(size) else {
+        return -1;
+    };
+    let slice = unsafe { std::slice::from_raw_parts(buffer as *const u8, n) };
+    unsafe { (*ctx).extend_from_slice(slice) };
+    n as i64
+}
+
+/// `clap_istream.read`: copy up to `size` bytes from the cursor into the
+/// plugin's buffer. Returns number actually read (0 on EOF) or -1 on error.
+unsafe extern "C" fn stream_read(
+    stream: *const clap_istream,
+    buffer: *mut c_void,
+    size: u64,
+) -> i64 {
+    if stream.is_null() || buffer.is_null() {
+        return -1;
+    }
+    let ctx = unsafe { (*stream).ctx } as *mut StateCursor<'_>;
+    if ctx.is_null() {
+        return -1;
+    }
+    let Ok(want) = usize::try_from(size) else {
+        return -1;
+    };
+    let cursor = unsafe { &mut *ctx };
+    let remaining = cursor.data.len().saturating_sub(cursor.pos);
+    let n = want.min(remaining);
+    if n == 0 {
+        return 0;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            cursor.data.as_ptr().add(cursor.pos),
+            buffer as *mut u8,
+            n,
+        )
+    };
+    cursor.pos += n;
+    n as i64
 }
 
 // Static output-event vtable. We drop whatever the plugin sends back for now.

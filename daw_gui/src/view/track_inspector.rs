@@ -23,7 +23,7 @@ impl TrackInspectorView {
                     .color(Color::rgb(220, 220, 220));
 
                 Button::new(cx, |cx| Label::new(cx, "Change Plugin..."))
-                    .on_press(|ex| ex.emit(AppEvent::ChangeClapPlugin))
+                    .on_press(|ex| ex.emit(AppEvent::OpenPluginPicker))
                     .padding_top(Pixels(6.0));
 
                 // Plugin editor GUI toggle. Label reflects current state via

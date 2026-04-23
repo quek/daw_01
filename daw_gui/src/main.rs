@@ -23,7 +23,9 @@ use vizia::prelude::*;
 
 use crate::app::{AppData, AppEvent};
 use crate::job::JobHandle;
-use crate::view::{ArrangementView, StatusBarView, TrackInspectorView, TransportView};
+use crate::view::{
+    ArrangementView, PluginPickerView, StatusBarView, TrackInspectorView, TransportView,
+};
 
 fn main() -> Result<()> {
     common::logging::init_tracing();
@@ -75,13 +77,21 @@ fn main() -> Result<()> {
     rt.spawn(send_loop(audio_server, audio_rx));
     rt.spawn(plugin_pipe_loop(plugin_server, plugin_rx, incoming_tx));
 
+    // Build (or reuse cached) plugin database. Scanning can be slow on first
+    // launch; subsequent launches read %LOCALAPPDATA%\daw_01\plugin_database.json.
+    let plugin_db = load_or_build_plugin_db();
+
     // Pick an initial CLAP plugin and send it to plugin_host so the user does
     // not have to browse manually on every launch. Failure here is non-fatal:
     // the user can still pick one from the Track Inspector afterwards.
     let clap_plugin_path: Option<PathBuf> = common::clap_scan::default_plugin_path();
     if let Some(path) = clap_plugin_path.clone() {
         tracing::info!(path = %path.display(), "initial CLAP plugin selected");
-        if let Err(e) = plugin_tx.send(MainToChild::SetClapPlugin(path)) {
+        if let Err(e) = plugin_tx.send(MainToChild::SetClapPlugin {
+            path,
+            plugin_id: String::new(),
+            initial_state: None,
+        }) {
             tracing::error!(error = ?e, "failed to enqueue initial SetClapPlugin");
         }
     } else {
@@ -93,6 +103,7 @@ fn main() -> Result<()> {
         audio_tx,
         plugin_tx,
         clap_plugin_path,
+        plugin_db,
         Arc::clone(&bridge),
         incoming_rx,
     )?;
@@ -205,6 +216,7 @@ fn run_gui(
     audio_tx: UnboundedSender<MainToChild>,
     plugin_tx: UnboundedSender<MainToChild>,
     clap_plugin_path: Option<PathBuf>,
+    plugin_db: Option<Arc<common::plugin_db::PluginDatabase>>,
     bridge: Arc<AudioBridgeHandle>,
     incoming_rx: UnboundedReceiver<ChildToMain>,
 ) -> Result<()> {
@@ -222,6 +234,7 @@ fn run_gui(
             audio_tx.clone(),
             plugin_tx.clone(),
             clap_plugin_path.clone(),
+            plugin_db.clone(),
         )
         .build(cx);
         register_shortcuts(cx);
@@ -242,6 +255,14 @@ fn run_gui(
 
             StatusBarView::new(cx).height(Pixels(26.0));
         });
+
+        // Modal plugin-picker overlay. Shown only when requested, sits on
+        // top of the main layout via PositionType::Absolute.
+        Binding::new(cx, AppData::is_plugin_picker_open, |cx, open| {
+            if open.get(cx) {
+                PluginPickerView::new(cx);
+            }
+        });
     })
     .title("daw_01")
     .inner_size((1280, 800))
@@ -257,6 +278,17 @@ fn run_gui(
 const TRACKER_CSS: &str = r#"
 list.tracker-list list-item {
     height: 17px;
+}
+
+/* Plugin-picker list: dark rows that match the overlay theme. Without this,
+   Vizia's default list-item height and colour bleed through and make the
+   labels unreadable on a near-white default background. */
+list.plugin-picker-list list-item {
+    height: 30px;
+    background-color: rgb(30, 30, 34);
+}
+list.plugin-picker-list list-item:hover {
+    background-color: rgb(70, 70, 78);
 }
 "#;
 
@@ -277,6 +309,10 @@ fn spawn_incoming_bridge(cx: &mut Context, mut rx: UnboundedReceiver<ChildToMain
                     Some(AppEvent::GuiRequestResizeFromChild { width, height })
                 }
                 ChildToMain::GuiClosed => Some(AppEvent::GuiClosedFromChild),
+                ChildToMain::PluginLoaded { id, name } => {
+                    Some(AppEvent::PluginLoadedFromChild { id, name })
+                }
+                ChildToMain::PluginState(s) => Some(AppEvent::PluginStateReceived(s)),
                 ChildToMain::Hello { .. } => None,
             };
             if let Some(event) = event
@@ -287,6 +323,49 @@ fn spawn_incoming_bridge(cx: &mut Context, mut rx: UnboundedReceiver<ChildToMain
         }
         tracing::info!("incoming bridge exited");
     });
+}
+
+/// Load the cached plugin database from disk, or run a fresh scan and
+/// cache the result. Errors on either path are logged — we fall back to an
+/// empty `Option::None` so the UI still boots.
+fn load_or_build_plugin_db() -> Option<Arc<common::plugin_db::PluginDatabase>> {
+    use common::plugin_db::{default_cache_path, scan_system, PluginDatabase};
+    if let Some(cache) = default_cache_path() {
+        match PluginDatabase::load_from_file(&cache) {
+            Ok(Some(db)) => {
+                tracing::info!(
+                    count = db.entries.len(),
+                    path = %cache.display(),
+                    "loaded cached plugin database"
+                );
+                return Some(Arc::new(db));
+            }
+            Ok(None) => {
+                tracing::info!(path = %cache.display(), "no cache, scanning…");
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "failed to load cache, scanning");
+            }
+        }
+        match scan_system() {
+            Ok(db) => {
+                if let Err(e) = db.save_to_file(&cache) {
+                    tracing::warn!(error = ?e, "failed to write plugin cache");
+                } else {
+                    tracing::info!(
+                        count = db.entries.len(),
+                        path = %cache.display(),
+                        "wrote plugin database cache"
+                    );
+                }
+                return Some(Arc::new(db));
+            }
+            Err(e) => {
+                tracing::error!(error = ?e, "plugin scan failed");
+            }
+        }
+    }
+    None
 }
 
 /// Polls the shared-memory playhead and L/R peaks at ~30 Hz and dispatches
@@ -414,7 +493,7 @@ fn build_menu_bar(cx: &mut Context) {
 fn menu_item(cx: &mut Context, label: &'static str, shortcut: &'static str, event: AppEvent) {
     MenuButton::new(
         cx,
-        move |cx| cx.emit(event),
+        move |cx| cx.emit(event.clone()),
         move |cx| {
             HStack::new(cx, |cx| {
                 Label::new(cx, label);

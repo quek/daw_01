@@ -5,6 +5,37 @@ use serde::{Deserialize, Serialize};
 
 pub const CURRENT_VERSION: u32 = 1;
 
+/// Serde adapter for `Option<Vec<u8>>` that writes binary data as base64 in
+/// JSON (and other human-readable formats). Bincode bypasses this and uses
+/// native length-prefixed bytes via the `Encode`/`Decode` derives.
+pub mod base64_opt {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        bytes: &Option<Vec<u8>>,
+        ser: S,
+    ) -> Result<S::Ok, S::Error> {
+        match bytes {
+            Some(b) => ser.serialize_some(&STANDARD.encode(b)),
+            None => ser.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        de: D,
+    ) -> Result<Option<Vec<u8>>, D::Error> {
+        let s: Option<String> = Option::deserialize(de)?;
+        match s {
+            Some(s) => STANDARD
+                .decode(s.as_bytes())
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectFile {
     pub version: u32,
@@ -18,6 +49,21 @@ pub struct Song {
     pub length_beats: f64,
     #[serde(default)]
     pub tracks: Vec<Track>,
+    /// Stable CLAP plugin identifier (`clap_plugin_descriptor.id`) for the
+    /// currently loaded instrument. `None` = no plugin selected. Persisting
+    /// the ID instead of the path makes projects portable across machines
+    /// where the `.clap` lives at different locations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clap_plugin_id: Option<String>,
+    /// Opaque binary state the plugin writes via `clap_plugin_state.save`.
+    /// Restored via `clap_plugin_state.load` on project open. Encoded as
+    /// base64 in JSON (see `base64_opt`), kept as raw bytes in bincode.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "base64_opt"
+    )]
+    pub clap_plugin_state: Option<Vec<u8>>,
 }
 
 impl Default for Song {
@@ -27,6 +73,8 @@ impl Default for Song {
             time_sig: (4, 4),
             length_beats: 64.0,
             tracks: Vec::new(),
+            clap_plugin_id: None,
+            clap_plugin_state: None,
         }
     }
 }

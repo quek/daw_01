@@ -37,6 +37,18 @@ pub enum ChildToMain {
     /// Plugin-initiated close (window X button handled by the plugin, or
     /// `clap_host_gui.closed`). daw_gui should drop its embed HWND.
     GuiClosed,
+    /// Emitted right after a successful `SetClapPlugin`. Lets daw_gui
+    /// capture the stable plugin ID (and display name) of what actually
+    /// loaded — the request carries an optional ID but the host is the
+    /// source of truth.
+    PluginLoaded {
+        id: String,
+        name: String,
+    },
+    /// Reply to `MainToChild::RequestPluginState`. `None` means the plugin
+    /// does not implement the `clap.state` extension, or there is no
+    /// plugin loaded.
+    PluginState(Option<Vec<u8>>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -56,9 +68,21 @@ pub enum MainToChild {
     Stop,
     Session(AudioSession),
     LoadSong(crate::model::Song),
-    SetClapPlugin(std::path::PathBuf),
+    /// Load a CLAP plugin and optionally restore its state. `plugin_id`
+    /// empty means "use the first descriptor in the file" (backward
+    /// compatibility for ad-hoc file-dialog selection); non-empty selects
+    /// the specific descriptor by ID. `initial_state`, when `Some`, is
+    /// applied via `clap_plugin_state.load` right after activate.
+    SetClapPlugin {
+        path: std::path::PathBuf,
+        plugin_id: String,
+        initial_state: Option<Vec<u8>>,
+    },
     SetLoop(bool),
     SetMasterGain(f32),
+    /// Ask the plugin_host to capture the current plugin state. Reply is
+    /// delivered as `ChildToMain::PluginState`.
+    RequestPluginState,
     /// Request the plugin to create + embed + show its GUI as a child of the
     /// given Win32 HWND (serialized as `u64` since HWND isn't directly
     /// `Encode`-able). daw_plugin_host replies with `ChildToMain::GuiOpened`.

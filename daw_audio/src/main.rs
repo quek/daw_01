@@ -102,8 +102,9 @@ async fn recv_loop(
             Ok(MainToChild::LoadSong(_)) => {
                 // Song state lives in daw_plugin_host; daw_audio does not use it.
             }
-            Ok(MainToChild::SetClapPlugin(_)) => {
-                // CLAP plugin lifecycle is handled by daw_plugin_host.
+            Ok(MainToChild::SetClapPlugin { .. })
+            | Ok(MainToChild::RequestPluginState) => {
+                // CLAP plugin lifecycle / state is handled by daw_plugin_host.
             }
             Ok(MainToChild::SetLoop(_)) => {
                 // Loop state lives in daw_plugin_host; daw_audio does not use it.

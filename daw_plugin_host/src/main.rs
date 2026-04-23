@@ -54,6 +54,8 @@ pub enum PluginEvent {
     GuiOpened { width: u32, height: u32 },
     GuiRequestResize { width: u32, height: u32 },
     GuiClosed,
+    PluginLoaded { id: String, name: String },
+    PluginState(Option<Vec<u8>>),
 }
 
 impl From<PluginEvent> for ChildToMain {
@@ -64,17 +66,28 @@ impl From<PluginEvent> for ChildToMain {
                 ChildToMain::GuiRequestResize { width, height }
             }
             PluginEvent::GuiClosed => ChildToMain::GuiClosed,
+            PluginEvent::PluginLoaded { id, name } => ChildToMain::PluginLoaded { id, name },
+            PluginEvent::PluginState(s) => ChildToMain::PluginState(s),
         }
     }
 }
 
 /// Commands processed serially on the plugin-main thread.
 enum PluginCommand {
-    SetClap(PathBuf),
+    SetClap {
+        path: PathBuf,
+        /// Stable CLAP id; empty string means "first descriptor in the file"
+        /// (backward-compatible ad-hoc load).
+        plugin_id: String,
+        /// Optional initial state to restore right after activate via
+        /// `clap_plugin_state.load`.
+        initial_state: Option<Vec<u8>>,
+    },
     LoadSong(Song),
     Play,
     Stop,
     SetLoop(bool),
+    RequestState,
     OpenGuiEmbedded { host_hwnd: u64 },
     CloseGui,
     ResizeGui { width: u32, height: u32 },
@@ -235,14 +248,21 @@ fn plugin_main_loop(
                     tracing::info!("plugin-main thread exiting");
                     return;
                 }
-                PluginCommand::SetClap(path) => swap_plugin(
+                PluginCommand::SetClap {
+                    path,
+                    plugin_id,
+                    initial_state,
+                } => swap_plugin(
                     &path,
+                    &plugin_id,
+                    initial_state.as_deref(),
                     &session,
                     Arc::clone(&playback_state),
                     Arc::clone(&song_store),
                     Arc::clone(&loop_state),
                     make_callbacks(),
                     &mut audio_handle,
+                    &evt_tx,
                 ),
                 PluginCommand::LoadSong(song) => {
                     tracing::info!(bpm = song.bpm, tracks = song.tracks.len(), "LoadSong");
@@ -256,6 +276,19 @@ fn plugin_main_loop(
                 }
                 PluginCommand::SetLoop(on) => {
                     loop_state.store(on, Ordering::Release);
+                }
+                PluginCommand::RequestState => {
+                    let state = match audio_handle.as_mut() {
+                        Some(h) => match h.plugin_mut().state_save() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!(error = ?e, "state_save failed");
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    let _ = evt_tx.send(PluginEvent::PluginState(state));
                 }
                 PluginCommand::OpenGuiEmbedded { host_hwnd } => {
                     match open_gui(&mut audio_handle, host_hwnd) {
@@ -450,9 +483,26 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             );
             plugin.send(PluginCommand::LoadSong(song));
         }
-        MainToChild::SetClapPlugin(path) => {
-            tracing::info!(path = %path.display(), "received SetClapPlugin");
-            plugin.send(PluginCommand::SetClap(path));
+        MainToChild::SetClapPlugin {
+            path,
+            plugin_id,
+            initial_state,
+        } => {
+            tracing::info!(
+                path = %path.display(),
+                id = %plugin_id,
+                has_state = initial_state.is_some(),
+                "received SetClapPlugin"
+            );
+            plugin.send(PluginCommand::SetClap {
+                path,
+                plugin_id,
+                initial_state,
+            });
+        }
+        MainToChild::RequestPluginState => {
+            tracing::info!("received RequestPluginState");
+            plugin.send(PluginCommand::RequestState);
         }
         MainToChild::SetLoop(on) => {
             tracing::info!(on, "received SetLoop");
@@ -518,18 +568,27 @@ impl AudioHandle {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_and_spawn(
     path: &Path,
+    plugin_id: &str,
+    initial_state: Option<&[u8]>,
     session: &AudioSession,
     playback_state: Arc<AtomicU8>,
     song_store: Arc<ArcSwapOption<Song>>,
     loop_state: Arc<AtomicBool>,
     callbacks: HostCallbacks,
 ) -> Result<AudioHandle> {
-    let mut plugin = Plugin::load(path, callbacks).context("failed to load plugin")?;
+    let mut plugin = Plugin::load(path, plugin_id, callbacks).context("failed to load plugin")?;
     plugin
         .activate(f64::from(session.sample_rate), 64, session.max_frames)
         .context("plugin.activate failed")?;
+    // Apply any persisted state before processing starts.
+    if let Some(bytes) = initial_state
+        && let Err(e) = plugin.state_load(bytes)
+    {
+        tracing::error!(error = ?e, "failed to restore plugin state (continuing)");
+    }
     spawn_audio_thread(Box::new(plugin), session, playback_state, song_store, loop_state)
 }
 
@@ -734,12 +793,15 @@ fn run_audio(
 #[allow(clippy::too_many_arguments)]
 fn swap_plugin(
     path: &Path,
+    plugin_id: &str,
+    initial_state: Option<&[u8]>,
     session: &AudioSession,
     playback_state: Arc<AtomicU8>,
     song_store: Arc<ArcSwapOption<Song>>,
     loop_state: Arc<AtomicBool>,
     callbacks: HostCallbacks,
     audio_handle: &mut Option<AudioHandle>,
+    evt_tx: &tmpsc::UnboundedSender<PluginEvent>,
 ) {
     playback_state.store(PlaybackCommand::Stop as u8, Ordering::Release);
 
@@ -749,15 +811,25 @@ fn swap_plugin(
 
     match load_and_spawn(
         path,
+        plugin_id,
+        initial_state,
         session,
         playback_state,
         song_store,
         loop_state,
         callbacks,
     ) {
-        Ok(h) => {
+        Ok(mut h) => {
+            // Report the actually loaded plugin id + name so daw_gui can
+            // bind the correct descriptor (vs the one requested).
+            let loaded_id = h.plugin_mut().id().to_string();
+            let loaded_name = h.plugin_mut().name().to_string();
             *audio_handle = Some(h);
-            tracing::info!(path = %path.display(), "plugin swapped in");
+            tracing::info!(path = %path.display(), id = %loaded_id, "plugin swapped in");
+            let _ = evt_tx.send(PluginEvent::PluginLoaded {
+                id: loaded_id,
+                name: loaded_name,
+            });
         }
         Err(e) => {
             tracing::error!(error = ?e, path = %path.display(), "failed to load plugin");
