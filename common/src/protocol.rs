@@ -127,6 +127,10 @@ pub enum MainToChild {
         from: PluginSlot,
         to: PluginSlot,
     },
+    /// Drop the entire chain for `track` (every MIDI FX / Instrument / FX
+    /// slot), tearing down each plugin's GUI first. Sent when the user
+    /// removes a whole track so the audio thread stops rendering it.
+    RemoveTrack { track: u32 },
     /// Ask the plugin_host to capture state for one slot. Reply is
     /// `ChildToMain::SlotPluginState`.
     RequestSlotState {

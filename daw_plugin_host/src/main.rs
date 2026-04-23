@@ -125,6 +125,9 @@ enum PluginCommand {
         from: PluginSlot,
         to: PluginSlot,
     },
+    RemoveTrack {
+        track: u32,
+    },
     LoadSong(Song),
     Play,
     Stop,
@@ -370,6 +373,31 @@ fn plugin_main_loop(
                         |t| {
                             if let Some(chain) = t.chains.get_mut(&track) {
                                 move_plugin(chain, from, to);
+                            }
+                        },
+                    );
+                }
+                PluginCommand::RemoveTrack { track } => {
+                    let _ = tracks.mutate(
+                        &session,
+                        &playback_state,
+                        &song_store,
+                        &loop_state,
+                        |t| {
+                            // Destroy every plugin's GUI before dropping
+                            // the chain so the CLAP gui lifecycle (destroy
+                            // must precede plugin destroy) is honoured.
+                            if let Some(mut chain) = t.chains.remove(&track) {
+                                for mfx in &mut chain.midi_fx_chain {
+                                    mfx.gui_destroy();
+                                }
+                                if let Some(inst) = chain.instrument.as_mut() {
+                                    inst.gui_destroy();
+                                }
+                                for fx in &mut chain.fx_chain {
+                                    fx.gui_destroy();
+                                }
+                                // Plugins drop here, on plugin-main.
                             }
                         },
                     );
@@ -767,6 +795,10 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
         MainToChild::MoveSlot { track, from, to } => {
             tracing::info!(track, ?from, ?to, "received MoveSlot");
             plugin.send(PluginCommand::MoveSlot { track, from, to });
+        }
+        MainToChild::RemoveTrack { track } => {
+            tracing::info!(track, "received RemoveTrack");
+            plugin.send(PluginCommand::RemoveTrack { track });
         }
         MainToChild::RequestSlotState { track, slot } => {
             tracing::info!(track, ?slot, "received RequestSlotState");

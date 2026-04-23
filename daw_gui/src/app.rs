@@ -1077,10 +1077,30 @@ impl AppData {
     }
 
     fn action_remove_last_track(&mut self) {
-        if let Some(track) = self.song.tracks.pop() {
-            tracing::info!(name = %track.name, "removed last track");
+        if self.song.tracks.is_empty() {
+            return;
         }
+        let removed_idx = (self.song.tracks.len() - 1) as u32;
+        if let Some(track) = self.song.tracks.pop() {
+            tracing::info!(
+                index = removed_idx,
+                name = %track.name,
+                "removed last track"
+            );
+        }
+        // Close any plugin editor windows that belong to this track before
+        // the host tears down its chain — Drop on PluginHostWindow destroys
+        // the HWND.
+        #[cfg(windows)]
+        {
+            self.plugin_host_windows
+                .retain(|&(t, _), _| t != removed_idx);
+        }
+        // Notify plugin_host so it drops the whole chain; otherwise its
+        // audio thread keeps rendering the removed track.
+        self.send_plugin(MainToChild::RemoveTrack { track: removed_idx });
         self.clamp_cursor();
+        self.refresh_inspector_chain();
     }
 
     fn move_cursor_track(&mut self, delta: i32) {
