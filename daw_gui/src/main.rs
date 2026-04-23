@@ -304,13 +304,15 @@ fn spawn_incoming_bridge(cx: &mut Context, mut rx: UnboundedReceiver<ChildToMain
     cx.spawn(move |proxy| {
         while let Some(msg) = rx.blocking_recv() {
             let event = match msg {
-                ChildToMain::SlotGuiOpened { width, height, .. } => {
-                    Some(AppEvent::GuiOpenedFromChild { width, height })
+                ChildToMain::SlotGuiOpened { track, slot, width, height } => {
+                    Some(AppEvent::GuiOpenedFromChild { track, slot, width, height })
                 }
-                ChildToMain::SlotGuiRequestResize { width, height, .. } => {
-                    Some(AppEvent::GuiRequestResizeFromChild { width, height })
+                ChildToMain::SlotGuiRequestResize { track, slot, width, height } => {
+                    Some(AppEvent::GuiRequestResizeFromChild { track, slot, width, height })
                 }
-                ChildToMain::SlotGuiClosed { .. } => Some(AppEvent::GuiClosedFromChild),
+                ChildToMain::SlotGuiClosed { track, slot } => {
+                    Some(AppEvent::GuiClosedFromChild { track, slot })
+                }
                 ChildToMain::SlotPluginLoaded { track, slot, id, name } => {
                     Some(AppEvent::SlotPluginLoadedFromChild { track, slot, id, name })
                 }

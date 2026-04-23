@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -119,23 +120,21 @@ pub struct AppData {
     /// mirror for UI display; primary storage is `song.tracks[0]`.
     pub instrument_label: String,
     /// When non-`None`, a save is in flight waiting for the plugin state
-    /// reply; once `ChildToMain::PluginState` arrives the data is written
-    /// to this path.
+    /// reply; once `AllStatesReceived` arrives the data is written to this
+    /// path.
     #[lens(ignore)]
     pub pending_save_path: Option<PathBuf>,
-    /// Whether the plugin's GUI window is currently open. Flips on button
-    /// press / IPC callbacks.
-    pub is_gui_open: bool,
     #[lens(ignore)]
     pub audio_tx: Option<UnboundedSender<MainToChild>>,
     #[lens(ignore)]
     pub plugin_tx: Option<UnboundedSender<MainToChild>>,
-    /// Live handle to the host-owned container window while a plugin GUI is
-    /// embedded. Kept in AppData so it outlives any one event handler and
-    /// is destroyed deterministically when we close the GUI.
+    /// Live host-owned container windows per loaded plugin GUI, keyed by
+    /// (track, slot). Each entry is one open editor; multiple editors can
+    /// be visible simultaneously.
     #[cfg(windows)]
     #[lens(ignore)]
-    pub plugin_host_window: Option<crate::view::plugin_embed::PluginHostWindow>,
+    pub plugin_host_windows:
+        HashMap<(u32, PluginSlot), crate::view::plugin_embed::PluginHostWindow>,
 }
 
 impl AppData {
@@ -193,11 +192,10 @@ impl AppData {
             track0_chain: Vec::new(),
             instrument_label: "(no instrument)".to_string(),
             pending_save_path: None,
-            is_gui_open: false,
             audio_tx: Some(audio_tx),
             plugin_tx: Some(plugin_tx),
             #[cfg(windows)]
-            plugin_host_window: None,
+            plugin_host_windows: HashMap::new(),
         }
     }
 
@@ -251,16 +249,24 @@ pub enum AppEvent {
     /// Eq/Hash. `u64::MAX` playhead is the "not playing" sentinel published
     /// by plugin_host.
     Tick(u64, u32, u32),
-    /// User clicked the "Open / Close Plugin GUI" toggle in the inspector.
-    #[allow(dead_code)]
-    TogglePluginGui,
     /// Plugin confirmed that its GUI has been embedded at `width × height`.
-    /// Forwarded by the `ChildToMain` receiver loop from daw_plugin_host.
-    GuiOpenedFromChild { width: u32, height: u32 },
+    /// Forwarded by the `ChildToMain` receiver loop from daw_plugin_host;
+    /// the (track, slot) addresses which open container window is the target.
+    GuiOpenedFromChild {
+        track: u32,
+        slot: PluginSlot,
+        width: u32,
+        height: u32,
+    },
     /// Plugin requested a resize via `clap_host_gui.request_resize`.
-    GuiRequestResizeFromChild { width: u32, height: u32 },
+    GuiRequestResizeFromChild {
+        track: u32,
+        slot: PluginSlot,
+        width: u32,
+        height: u32,
+    },
     /// Plugin signalled its GUI was closed (host-callback `closed`).
-    GuiClosedFromChild,
+    GuiClosedFromChild { track: u32, slot: PluginSlot },
     /// Plugin-host confirmed a successful load and reported the ID/name of
     /// the descriptor that actually came up. Routed to the (track, slot)
     /// that issued the `SetSlotPlugin` so the right model entry is updated.
@@ -366,20 +372,26 @@ impl Model for AppData {
                     );
                     dirty = false;
                 }
-                AppEvent::TogglePluginGui => {
-                    self.toggle_plugin_gui();
+                AppEvent::GuiOpenedFromChild {
+                    track,
+                    slot,
+                    width,
+                    height,
+                } => {
+                    self.on_gui_opened(*track, *slot, *width, *height);
                     dirty = false;
                 }
-                AppEvent::GuiOpenedFromChild { width, height } => {
-                    self.on_gui_opened(*width, *height);
+                AppEvent::GuiRequestResizeFromChild {
+                    track,
+                    slot,
+                    width,
+                    height,
+                } => {
+                    self.on_gui_request_resize(*track, *slot, *width, *height);
                     dirty = false;
                 }
-                AppEvent::GuiRequestResizeFromChild { width, height } => {
-                    self.on_gui_request_resize(*width, *height);
-                    dirty = false;
-                }
-                AppEvent::GuiClosedFromChild => {
-                    self.on_gui_closed();
+                AppEvent::GuiClosedFromChild { track, slot } => {
+                    self.on_gui_closed(*track, *slot);
                     dirty = false;
                 }
                 AppEvent::SlotPluginLoadedFromChild {
@@ -583,94 +595,56 @@ impl AppData {
         self.send_plugin(MainToChild::SetLoop(self.is_looping));
     }
 
-    /// Toggle the plugin editor window. Opening allocates a host-owned Win32
-    /// container (`PluginHostWindow`), sends its HWND to daw_plugin_host, and
-    /// relies on `ChildToMain::GuiOpened` to confirm. Closing sends
-    /// `CloseGui`; the `GuiClosedFromChild` callback finalizes Drop.
+    /// Handler for `ChildToMain::SlotGuiOpened`: plugin confirmed embed, so
+    /// resize our container's client area to match its preferred size.
     #[cfg(windows)]
-    fn toggle_plugin_gui(&mut self) {
-        if self.is_gui_open {
-            // Close flow: send IPC, wait for GuiClosedFromChild to tear down.
-            self.send_plugin(MainToChild::CloseSlotGui {
-                track: 0,
-                slot: common::protocol::PluginSlot::Instrument,
-            });
-            return;
-        }
-        match crate::view::plugin_embed::PluginHostWindow::create(
-            800,
-            600,
-            &format!("Plugin — {}", self.instrument_label),
-        ) {
-            Ok(win) => {
-                let hwnd = win.hwnd_u64();
-                self.plugin_host_window = Some(win);
-                tracing::info!(hwnd, "created plugin host window, requesting embed");
-                self.send_plugin(MainToChild::OpenSlotGuiEmbedded {
-                    track: 0,
-                    slot: common::protocol::PluginSlot::Instrument,
-                    host_hwnd: hwnd,
-                });
-                self.is_gui_open = true;
-            }
-            Err(e) => {
-                tracing::error!(error = ?e, "failed to create plugin host window");
-            }
-        }
-    }
-
-    #[cfg(not(windows))]
-    fn toggle_plugin_gui(&mut self) {
-        tracing::warn!("plugin GUI embedding is only implemented on Windows");
-    }
-
-    /// Handler for `ChildToMain::GuiOpened`: resize our container so the
-    /// client area matches the plugin's preferred size, avoiding the
-    /// clipped-UI problem.
-    #[cfg(windows)]
-    fn on_gui_opened(&mut self, width: u32, height: u32) {
-        tracing::info!(width, height, "plugin GUI opened");
-        if let Some(win) = &self.plugin_host_window {
+    fn on_gui_opened(&mut self, track: u32, slot: PluginSlot, width: u32, height: u32) {
+        tracing::info!(track, ?slot, width, height, "plugin GUI opened");
+        if let Some(win) = self.plugin_host_windows.get(&(track, slot)) {
             win.set_client_size(width, height);
         }
     }
 
     #[cfg(not(windows))]
-    fn on_gui_opened(&mut self, _width: u32, _height: u32) {}
+    fn on_gui_opened(&mut self, _track: u32, _slot: PluginSlot, _width: u32, _height: u32) {}
 
-    /// Handler for `ChildToMain::GuiRequestResize`: plugin wants to grow /
-    /// shrink. Resize our container first, then echo `ResizeGui` back so the
-    /// plugin-main thread calls `plugin.gui.set_size(w, h)` on its end.
+    /// Handler for `ChildToMain::SlotGuiRequestResize`: plugin asked to
+    /// resize. Update our container first, then echo `ResizeSlotGui` back
+    /// so the plugin-main thread runs `gui.set_size(w, h)`.
     #[cfg(windows)]
-    fn on_gui_request_resize(&mut self, width: u32, height: u32) {
-        tracing::info!(width, height, "plugin requested GUI resize");
-        if let Some(win) = &self.plugin_host_window {
+    fn on_gui_request_resize(&mut self, track: u32, slot: PluginSlot, width: u32, height: u32) {
+        tracing::info!(track, ?slot, width, height, "plugin requested GUI resize");
+        if let Some(win) = self.plugin_host_windows.get(&(track, slot)) {
             win.set_client_size(width, height);
         }
         self.send_plugin(MainToChild::ResizeSlotGui {
-            track: 0,
-            slot: common::protocol::PluginSlot::Instrument,
+            track,
+            slot,
             width,
             height,
         });
     }
 
     #[cfg(not(windows))]
-    fn on_gui_request_resize(&mut self, _width: u32, _height: u32) {}
+    fn on_gui_request_resize(
+        &mut self,
+        _track: u32,
+        _slot: PluginSlot,
+        _width: u32,
+        _height: u32,
+    ) {
+    }
 
-    /// Handler for `ChildToMain::GuiClosed`: plugin confirms tear-down, drop
-    /// our container so Drop destroys the HWND.
+    /// Handler for `ChildToMain::SlotGuiClosed`: plugin confirms tear-down,
+    /// drop our container so Drop destroys the HWND.
     #[cfg(windows)]
-    fn on_gui_closed(&mut self) {
-        tracing::info!("plugin GUI closed (from child)");
-        self.plugin_host_window = None;
-        self.is_gui_open = false;
+    fn on_gui_closed(&mut self, track: u32, slot: PluginSlot) {
+        tracing::info!(track, ?slot, "plugin GUI closed (from child)");
+        self.plugin_host_windows.remove(&(track, slot));
     }
 
     #[cfg(not(windows))]
-    fn on_gui_closed(&mut self) {
-        self.is_gui_open = false;
-    }
+    fn on_gui_closed(&mut self, _track: u32, _slot: PluginSlot) {}
 
     /// plugin_host reported that a `SetSlotPlugin` succeeded. Updates the
     /// (track, slot) target with the actual id/name reported by the host so
@@ -735,29 +709,26 @@ impl AppData {
         }
     }
 
-    /// Converts a Track-Inspector row's (slot_kind, slot_index) pair into
-    /// the protocol slot enum, routing the `ToggleSlotGui` press.
+    /// Opens or closes the GUI for the given chain slot. Open state lives in
+    /// `plugin_host_windows`: presence = open, absence = closed. Multiple
+    /// slots can be open at once, each with its own top-level container.
     fn toggle_slot_gui(&mut self, slot_kind: u8, slot_index: u32) {
         let slot = match slot_kind {
             0 => PluginSlot::MidiFx(slot_index),
             1 => PluginSlot::Instrument,
             _ => PluginSlot::Fx(slot_index),
         };
-        // Reuse the existing single-window lifecycle: toggle_plugin_gui
-        // opens/closes the container by inspecting `is_gui_open`. It
-        // currently addresses `(track=0, slot=Instrument)` at the IPC
-        // layer; we forward the real slot so the plugin_host tears the
-        // right plugin's GUI up/down.
+        let track = 0u32; // MVP: Track Inspector only addresses track 0.
         #[cfg(windows)]
         {
-            if self.is_gui_open {
-                self.send_plugin(MainToChild::CloseSlotGui { track: 0, slot });
+            if self.plugin_host_windows.contains_key(&(track, slot)) {
+                self.send_plugin(MainToChild::CloseSlotGui { track, slot });
                 return;
             }
             let label = self
                 .song
                 .tracks
-                .first()
+                .get(track as usize)
                 .and_then(|t| self.slot_ref_name(t, slot))
                 .unwrap_or_else(|| "(unknown)".into());
             match crate::view::plugin_embed::PluginHostWindow::create(
@@ -767,20 +738,19 @@ impl AppData {
             ) {
                 Ok(win) => {
                     let hwnd = win.hwnd_u64();
-                    self.plugin_host_window = Some(win);
+                    self.plugin_host_windows.insert((track, slot), win);
                     self.send_plugin(MainToChild::OpenSlotGuiEmbedded {
-                        track: 0,
+                        track,
                         slot,
                         host_hwnd: hwnd,
                     });
-                    self.is_gui_open = true;
                 }
                 Err(e) => tracing::error!(error = ?e, ?slot, "failed to create container"),
             }
         }
         #[cfg(not(windows))]
         {
-            let _ = (slot, slot_kind, slot_index);
+            let _ = (track, slot, slot_kind, slot_index);
         }
     }
 
@@ -871,17 +841,21 @@ impl AppData {
 
         // --- Plugin GUI ✕-button bridge ----------------------------------
         // Runs on the Vizia main thread so it can safely send IPC. Converts
-        // the async WNDPROC signal into our synchronous close flow.
+        // the async WNDPROC signal into our synchronous close flow. Each
+        // container polls independently so multi-GUI sessions close the
+        // right editor.
         #[cfg(windows)]
-        if self.is_gui_open
-            && let Some(win) = &self.plugin_host_window
-            && win.take_close_request()
         {
-            tracing::info!("plugin host window ✕ clicked; forwarding to CloseGui");
-            self.send_plugin(MainToChild::CloseSlotGui {
-                track: 0,
-                slot: common::protocol::PluginSlot::Instrument,
-            });
+            let mut to_close: Vec<(u32, PluginSlot)> = Vec::new();
+            for (&(track, slot), win) in &self.plugin_host_windows {
+                if win.take_close_request() {
+                    to_close.push((track, slot));
+                }
+            }
+            for (track, slot) in to_close {
+                tracing::info!(track, ?slot, "plugin host window ✕ clicked; forwarding to CloseSlotGui");
+                self.send_plugin(MainToChild::CloseSlotGui { track, slot });
+            }
         }
 
         // --- Peak meter --------------------------------------------------

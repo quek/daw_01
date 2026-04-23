@@ -246,8 +246,12 @@ impl Plugin {
             output_channels,
             output_buffers: Vec::new(),
             output_ptrs: Vec::new(),
-            pending_events: Vec::with_capacity(64),
-            collected_out_notes: Vec::with_capacity(64),
+            // Capacity sized so 64 events from the song plus arpeggio /
+            // MIDI FX expansion (up to ~4 stages * 64) never trigger an
+            // allocation in the audio thread. Plugins exceeding this just
+            // re-alloc; we log on the audio side if it happens.
+            pending_events: Vec::with_capacity(256),
+            collected_out_notes: Vec::with_capacity(256),
             gui_ext,
             gui_created: false,
             state_ext,
@@ -421,12 +425,13 @@ impl Plugin {
         self.output_channels
     }
 
-    /// Returns note events collected from the last `process()` call (for
-    /// MIDI FX → next plugin routing). Reserved for Phase B MIDI chain
-    /// routing; currently unused at the call site.
-    #[allow(dead_code)]
-    pub fn take_out_notes(&mut self) -> Vec<TimedNoteEvent> {
-        std::mem::take(&mut self.collected_out_notes)
+    /// Drain note events collected during the previous `process()` into
+    /// `out`, preserving the plugin's pre-allocated capacity. RT-safe:
+    /// `Vec::append` moves elements and leaves `self.collected_out_notes`
+    /// empty with its capacity intact (unlike `mem::take`, which would
+    /// replace the buffer with a freshly-allocated empty one).
+    pub fn drain_out_notes_into(&mut self, out: &mut Vec<TimedNoteEvent>) {
+        out.append(&mut self.collected_out_notes);
     }
 
     pub fn start_processing(&mut self) -> Result<()> {
