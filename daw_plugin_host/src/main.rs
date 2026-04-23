@@ -1191,8 +1191,11 @@ fn run_audio(
         if let Some(inst_ptr) = tr.instrument.as_ref()
             && let Err(e) = unsafe { &mut *inst_ptr.0 }.start_processing()
         {
+            // Don't bail the whole audio thread — other tracks may still
+            // have working instruments, and the failed plugin's later
+            // `process()` call will simply return its own error and the
+            // track stays silent.
             tracing::error!(error = ?e, track = tr.track_id, "instrument.start_processing failed");
-            return;
         }
         for fx_ptr in &tr.fx_chain {
             if let Err(e) = unsafe { &mut *fx_ptr.0 }.start_processing() {
@@ -1204,6 +1207,12 @@ fn run_audio(
     let out_channels = CHANNELS as usize;
     let mut playing = false;
     let mut playhead: u64 = 0;
+    #[cfg(debug_assertions)]
+    let mut frames_since_log: u64 = 0;
+    #[cfg(debug_assertions)]
+    let log_interval_frames: u64 = sample_rate as u64;
+    #[cfg(debug_assertions)]
+    let mut track_event_count: HashMap<u32, u32> = HashMap::new();
     tracing::info!("audio thread running");
 
     loop {
@@ -1303,6 +1312,13 @@ fn run_audio(
             track_r[..n].fill(0.0);
             if let Some(inst_ptr) = tr.instrument.as_ref() {
                 let inst = unsafe { &mut *inst_ptr.0 };
+                #[cfg(debug_assertions)]
+                {
+                    let events_this_buf = midi_bus_a.len() as u32;
+                    if events_this_buf > 0 {
+                        *track_event_count.entry(tr.track_id).or_insert(0) += events_this_buf;
+                    }
+                }
                 if let Err(e) = inst.process(frames, &midi_bus_a, &[]) {
                     tracing::error!(error = ?e, track = tr.track_id, "instrument.process failed");
                     continue;
@@ -1337,6 +1353,28 @@ fn run_audio(
             for i in 0..n {
                 master_l[i] += track_l[i];
                 master_r[i] += track_r[i];
+            }
+        }
+
+        // Once per ~second, log master peak + per-track event totals so
+        // "Play clicked but no sound" can be diagnosed from the log alone.
+        // Debug-assert-gated so release builds stay RT-clean.
+        #[cfg(debug_assertions)]
+        if playing {
+            frames_since_log += frames as u64;
+            if frames_since_log >= log_interval_frames {
+                let master_peak: f32 = master_l[..n]
+                    .iter()
+                    .chain(master_r[..n].iter())
+                    .fold(0.0f32, |acc, v| acc.max(v.abs()));
+                tracing::info!(
+                    master_peak,
+                    playhead,
+                    events = ?track_event_count,
+                    "audio heartbeat"
+                );
+                frames_since_log = 0;
+                track_event_count.clear();
             }
         }
 

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use common::model::{Clip, InstrumentSource, Note, NoteEvent, Row, Song, Track};
 use common::plugin_db::PluginDatabase;
@@ -20,6 +20,10 @@ pub struct PluginPickEntry {
     /// Features from the CLAP descriptor — used by the picker's filter
     /// bar to show only instrument/audio-effect/note-effect plugins.
     pub features: Vec<String>,
+    /// Short label ("CLAP" / "VST3") rendered as a badge in the picker row.
+    /// Kept as a `String` (not `PluginFormat`) so Vizia's `Data` derive
+    /// works without a foreign-type `impl Data` on `PluginFormat`.
+    pub format_label: String,
 }
 
 /// A single slot on the visible track's chain, used by the Track Inspector
@@ -140,6 +144,19 @@ pub struct AppData {
     #[lens(ignore)]
     pub plugin_host_windows:
         HashMap<(u32, PluginSlot), crate::view::plugin_embed::PluginHostWindow>,
+
+    /// Drop-off slot for a background plugin-database rescan. The worker
+    /// thread scans, persists the result to the on-disk cache, stashes the
+    /// fresh `PluginDatabase` here, and then emits
+    /// `AppEvent::PluginDbRescanCompleted` so the UI thread picks it up.
+    /// Kept out of any lens — the UI reacts to rescan via the event, not
+    /// by observing this field.
+    #[lens(ignore)]
+    pub rescan_result: Arc<Mutex<Option<PluginDatabase>>>,
+    /// True while a rescan is in flight; lens-visible so the picker can
+    /// show a "Rescanning..." label instead of letting the user hammer the
+    /// button.
+    pub is_rescanning: bool,
 }
 
 impl AppData {
@@ -164,6 +181,7 @@ impl AppData {
                         name: if e.name.is_empty() { e.id.clone() } else { e.name.clone() },
                         vendor: e.vendor.clone(),
                         features: e.features.clone(),
+                        format_label: e.format.as_str().to_string(),
                     })
                     .collect();
                 v.sort_by_key(|e| e.name.to_lowercase());
@@ -202,6 +220,8 @@ impl AppData {
             plugin_tx: Some(plugin_tx),
             #[cfg(windows)]
             plugin_host_windows: HashMap::new(),
+            rescan_result: Arc::new(Mutex::new(None)),
+            is_rescanning: false,
         }
     }
 
@@ -286,10 +306,18 @@ pub enum AppEvent {
     /// plugin's serialized state (or `None` if the plugin doesn't implement
     /// the state extension). Triggers `finish_save` when a save is pending.
     AllStatesReceived(Vec<SlotState>),
+    /// User asked for a full plugin re-scan (CLAP + VST3). The scan itself
+    /// runs on a background thread; when it finishes,
+    /// `PluginDbRescanCompleted` is posted.
+    RescanPluginDb,
+    /// Background rescan finished. The new `PluginDatabase` lives in
+    /// `AppData::rescan_result`; this event carries no payload because
+    /// `AppEvent` needs `Eq + Hash` and `PluginDatabase` does not.
+    PluginDbRescanCompleted,
 }
 
 impl Model for AppData {
-    fn event(&mut self, _cx: &mut EventContext, event: &mut Event) {
+    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
         event.map(|window_event, _| {
             if let WindowEvent::WindowClose = window_event {
                 tracing::info!("window close requested");
@@ -342,6 +370,14 @@ impl Model for AppData {
                 }
                 AppEvent::ClosePluginPicker => {
                     self.is_plugin_picker_open = false;
+                    dirty = false;
+                }
+                AppEvent::RescanPluginDb => {
+                    self.begin_rescan(cx);
+                    dirty = false;
+                }
+                AppEvent::PluginDbRescanCompleted => {
+                    self.finish_rescan();
                     dirty = false;
                 }
                 AppEvent::SelectPluginFromDb(id) => {
@@ -1049,6 +1085,89 @@ impl AppData {
             });
         }
         self.inspector_chain = out;
+    }
+
+    /// Kick off a background plugin rescan. Safe to call twice — if a
+    /// scan is already running, the second request is ignored so the
+    /// worker stays single-threaded (no race on `rescan_result`).
+    fn begin_rescan(&mut self, cx: &mut EventContext) {
+        if self.is_rescanning {
+            tracing::info!("plugin rescan already in flight; ignoring");
+            return;
+        }
+        self.is_rescanning = true;
+        let slot = Arc::clone(&self.rescan_result);
+        cx.spawn(move |proxy| {
+            tracing::info!("plugin_db rescan starting");
+            match common::plugin_db::scan_system() {
+                Ok(db) => {
+                    tracing::info!(
+                        count = db.entries.len(),
+                        "plugin_db rescan completed"
+                    );
+                    if let Some(cache) = common::plugin_db::default_cache_path()
+                        && let Err(e) = db.save_to_file(&cache)
+                    {
+                        tracing::warn!(
+                            error = ?e,
+                            path = %cache.display(),
+                            "failed to persist rescanned plugin_db"
+                        );
+                    }
+                    if let Ok(mut guard) = slot.lock() {
+                        *guard = Some(db);
+                    }
+                    let _ = proxy.emit(AppEvent::PluginDbRescanCompleted);
+                }
+                Err(e) => {
+                    tracing::error!(error = ?e, "plugin rescan failed");
+                    // Still post completion so the UI clears its
+                    // "rescanning" state; the result slot stays empty, so
+                    // `finish_rescan` treats it as a no-op.
+                    let _ = proxy.emit(AppEvent::PluginDbRescanCompleted);
+                }
+            }
+        });
+    }
+
+    /// Pull the freshly-scanned database out of `rescan_result` and swap
+    /// it in. Called from the UI thread via `PluginDbRescanCompleted`.
+    fn finish_rescan(&mut self) {
+        self.is_rescanning = false;
+        let Some(new_db) = self.rescan_result.lock().ok().and_then(|mut g| g.take()) else {
+            return;
+        };
+        let new_db = Arc::new(new_db);
+        tracing::info!(count = new_db.entries.len(), "applied rescanned plugin_db");
+        self.plugin_db = Some(new_db);
+        self.rebuild_picker_entries();
+        self.refresh_picker_visible();
+    }
+
+    /// Rebuild the flat `plugin_picker_entries` list from `plugin_db`.
+    /// Called after a rescan to keep the picker in sync with the new DB.
+    fn rebuild_picker_entries(&mut self) {
+        let Some(db) = self.plugin_db.as_ref() else {
+            self.plugin_picker_entries.clear();
+            return;
+        };
+        let mut v: Vec<PluginPickEntry> = db
+            .entries
+            .iter()
+            .map(|e| PluginPickEntry {
+                id: e.id.clone(),
+                name: if e.name.is_empty() {
+                    e.id.clone()
+                } else {
+                    e.name.clone()
+                },
+                vendor: e.vendor.clone(),
+                features: e.features.clone(),
+                format_label: e.format.as_str().to_string(),
+            })
+            .collect();
+        v.sort_by_key(|e| e.name.to_lowercase());
+        self.plugin_picker_entries = v;
     }
 
     /// Rebuild `plugin_picker_visible` from `plugin_picker_entries` using

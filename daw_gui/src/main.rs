@@ -81,25 +81,13 @@ fn main() -> Result<()> {
     // launch; subsequent launches read %LOCALAPPDATA%\daw_01\plugin_database.json.
     let plugin_db = load_or_build_plugin_db();
 
-    // Pick an initial CLAP plugin and send it to plugin_host so the user does
-    // not have to browse manually on every launch. Failure here is non-fatal:
-    // the user can still pick one from the Track Inspector afterwards.
-    let clap_plugin_path: Option<PathBuf> = common::clap_scan::default_plugin_path();
-    if let Some(path) = clap_plugin_path.clone() {
-        tracing::info!(path = %path.display(), "initial CLAP plugin selected");
-        if let Err(e) = plugin_tx.send(MainToChild::SetSlotPlugin {
-            track: 0,
-            slot: common::protocol::PluginSlot::Instrument,
-            format: common::plugin_format::PluginFormat::Clap,
-            path,
-            plugin_id: String::new(),
-            initial_state: None,
-        }) {
-            tracing::error!(error = ?e, "failed to enqueue initial SetSlotPlugin");
-        }
-    } else {
-        tracing::info!("no default CLAP plugin found; user must pick one manually");
-    }
+    // No automatic plugin load: the previous version picked the first CLAP
+    // under `%COMMONPROGRAMFILES%\CLAP` and applied it to Track 1, which
+    // also force-created a Track 1 via the `on_plugin_loaded_from_child`
+    // path. That made the very first "+ Vocal Track" click look like it
+    // added *two* tracks (Track 1 from the auto-load + the new Track 2).
+    // Users must now pick plugins explicitly via the Track Inspector.
+    let clap_plugin_path: Option<PathBuf> = None;
 
     tracing::info!("opening main window");
     run_gui(

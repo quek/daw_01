@@ -28,14 +28,15 @@ use vst3::{
     ComPtr, ComWrapper, Interface,
     Steinberg::{
         FUnknown, IBStream, IPlugView, IPlugViewTrait, IPluginBaseTrait, IPluginFactory,
-        IPluginFactoryTrait, PClassInfo, TUID, ViewRect, kPlatformTypeHWND, kResultOk,
-        kResultTrue,
+        IPluginFactoryTrait, PClassInfo, TUID, ViewRect, kNotImplemented, kPlatformTypeHWND,
+        kResultOk, kResultTrue,
         Vst::{
             AudioBusBuffers, AudioBusBuffers__type0, BusDirections_, Event, Event__type0,
             Event_, IAudioProcessor, IAudioProcessorTrait, IComponent, IComponentTrait,
             IEditController, IEditControllerTrait, IEventList, MediaTypes_, NoteOffEvent,
-            NoteOnEvent, ProcessData, ProcessModes_, ProcessSetup, SpeakerArr,
-            SpeakerArrangement, SymbolicSampleSizes_,
+            NoteOnEvent, ProcessContext, ProcessContext_::StatesAndFlags_, ProcessData,
+            ProcessModes_, ProcessSetup, SpeakerArr, SpeakerArrangement,
+            SymbolicSampleSizes_,
         },
     },
 };
@@ -96,6 +97,11 @@ pub struct Vst3Plugin {
     /// callback).
     in_event_list: ComWrapper<Vst3InEventList>,
     out_event_list: ComWrapper<Vst3OutEventList>,
+    /// Transport / timing block the plugin reads via `ProcessData.processContext`.
+    /// Several instruments (SynthMaster 3, some Arturia products) stay silent
+    /// when this pointer is null because they gate their voice allocator on
+    /// `kPlaying`. Updated in `process()` with the current playhead.
+    process_context: ProcessContext,
 
     // --- GUI state -----------------------------------------------------
     view: Option<ComPtr<IPlugView>>,
@@ -294,6 +300,7 @@ impl Vst3Plugin {
             collected_out_notes: Vec::with_capacity(256),
             in_event_list: ComWrapper::new(Vst3InEventList::new()),
             out_event_list: ComWrapper::new(Vst3OutEventList::new()),
+            process_context: unsafe { std::mem::zeroed() },
             view: None,
             plug_frame,
             gui_attached: std::cell::Cell::new(false),
@@ -449,7 +456,19 @@ impl LoadedPlugin for Vst3Plugin {
             res
         );
 
-        // 5. Allocate planar buffers for process().
+        // 5. Allocate planar buffers for process() and prime the transport
+        // block so the very first `process()` already sees `kPlaying` —
+        // some plugins (SynthMaster 3 among them) refuse to output anything
+        // when `processContext` is null or `state` doesn't include
+        // `kPlaying`.
+        self.process_context.state = (StatesAndFlags_::kPlaying
+            | StatesAndFlags_::kTempoValid
+            | StatesAndFlags_::kTimeSigValid) as u32;
+        self.process_context.sampleRate = sample_rate;
+        self.process_context.tempo = 120.0;
+        self.process_context.timeSigNumerator = 4;
+        self.process_context.timeSigDenominator = 4;
+
         self.max_frames = max_frames;
         self.sample_rate = sample_rate;
         self.input_buffers = (0..self.input_channels as usize)
@@ -481,8 +500,12 @@ impl LoadedPlugin for Vst3Plugin {
         anyhow::ensure!(self.active, "VST3 plugin not active");
         anyhow::ensure!(!self.processing, "VST3 plugin already processing");
         let res = unsafe { self.audio.setProcessing(1) };
+        // VST3 spec treats `setProcessing` as optional — some plugins (e.g.
+        // SynthMaster 3) return `kNotImplemented` instead of accepting the
+        // state change. Those plugins are always ready to process; treat
+        // `kNotImplemented` the same as `kResultOk`.
         anyhow::ensure!(
-            res == kResultOk,
+            res == kResultOk || res == kNotImplemented,
             "IAudioProcessor::setProcessing(1) -> {:#x}",
             res
         );
@@ -569,6 +592,15 @@ impl LoadedPlugin for Vst3Plugin {
             },
         };
 
+        // Advance the transport block. `projectTimeSamples` is left
+        // free-running (+= frames each call) until the host plumbs a real
+        // playhead through — most plugins only need the `kPlaying` flag
+        // plus a monotonically-increasing counter.
+        self.process_context.projectTimeSamples = self
+            .process_context
+            .projectTimeSamples
+            .saturating_add(frames as i64);
+
         let mut data = ProcessData {
             processMode: ProcessModes_::kRealtime,
             symbolicSampleSize: SymbolicSampleSizes_::kSample32,
@@ -592,9 +624,17 @@ impl LoadedPlugin for Vst3Plugin {
             // is needed after process().
             inputEvents: in_list_ptr.as_ptr(),
             outputEvents: out_list_ptr.as_ptr(),
-            processContext: std::ptr::null_mut(),
+            processContext: &mut self.process_context,
         };
         let status = unsafe { self.audio.process(&mut data) };
+        #[cfg(debug_assertions)]
+        if status != kResultOk {
+            tracing::warn!(
+                plugin = %self.name,
+                status = format!("{status:#x}"),
+                "VST3 process returned non-OK"
+            );
+        }
 
         // Drain collected events before the ComPtrs drop (order doesn't
         // strictly matter, but keeps the reader's mental model simple).
