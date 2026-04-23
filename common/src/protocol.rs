@@ -77,7 +77,7 @@ pub enum ChildToMain {
 }
 
 /// Single entry in the `AllPluginStates` reply.
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct SlotState {
     pub track: u32,
     pub slot: PluginSlot,

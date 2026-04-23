@@ -303,10 +303,6 @@ list.plugin-picker-list list-item:hover {
 fn spawn_incoming_bridge(cx: &mut Context, mut rx: UnboundedReceiver<ChildToMain>) {
     cx.spawn(move |proxy| {
         while let Some(msg) = rx.blocking_recv() {
-            // Phase A: AppEvents still carry the legacy "single plugin"
-            // shape; per-slot routing lands when the UI is extended. All
-            // slot-addressed ChildToMain variants are projected onto the
-            // existing AppEvents, with (track, slot) discarded for now.
             let event = match msg {
                 ChildToMain::SlotGuiOpened { width, height, .. } => {
                     Some(AppEvent::GuiOpenedFromChild { width, height })
@@ -315,18 +311,15 @@ fn spawn_incoming_bridge(cx: &mut Context, mut rx: UnboundedReceiver<ChildToMain
                     Some(AppEvent::GuiRequestResizeFromChild { width, height })
                 }
                 ChildToMain::SlotGuiClosed { .. } => Some(AppEvent::GuiClosedFromChild),
-                ChildToMain::SlotPluginLoaded { id, name, .. } => {
-                    Some(AppEvent::PluginLoadedFromChild { id, name })
+                ChildToMain::SlotPluginLoaded { track, slot, id, name } => {
+                    Some(AppEvent::SlotPluginLoadedFromChild { track, slot, id, name })
                 }
-                ChildToMain::SlotPluginState { data, .. } => {
-                    Some(AppEvent::PluginStateReceived(data))
-                }
+                // Single-slot state replies are unused by the current save
+                // flow (the picker / GUI never request a single state).
+                // Drop them rather than fabricating a synthetic event.
+                ChildToMain::SlotPluginState { .. } => None,
                 ChildToMain::AllPluginStates { entries } => {
-                    // MVP: expect 0 or 1 entry (single implicit slot).
-                    // Propagate as PluginStateReceived so the save flow
-                    // finalises. Multi-slot aggregation comes in Phase B.
-                    let data = entries.into_iter().next().and_then(|e| e.data);
-                    Some(AppEvent::PluginStateReceived(data))
+                    Some(AppEvent::AllStatesReceived(entries))
                 }
                 ChildToMain::Hello { .. } => None,
             };

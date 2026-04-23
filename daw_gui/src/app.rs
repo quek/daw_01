@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use common::model::{Clip, InstrumentSource, Note, NoteEvent, Row, Song, Track};
 use common::plugin_db::PluginDatabase;
-use common::protocol::{MainToChild, PluginSlot};
+use common::protocol::{MainToChild, PluginSlot, SlotState};
 use tokio::sync::mpsc::UnboundedSender;
 use vizia::prelude::*;
 
@@ -262,11 +262,18 @@ pub enum AppEvent {
     /// Plugin signalled its GUI was closed (host-callback `closed`).
     GuiClosedFromChild,
     /// Plugin-host confirmed a successful load and reported the ID/name of
-    /// the descriptor that actually came up.
-    PluginLoadedFromChild { id: String, name: String },
-    /// Reply to `RequestPluginState`. Payload is `None` when the plugin
-    /// does not implement the state extension.
-    PluginStateReceived(Option<Vec<u8>>),
+    /// the descriptor that actually came up. Routed to the (track, slot)
+    /// that issued the `SetSlotPlugin` so the right model entry is updated.
+    SlotPluginLoadedFromChild {
+        track: u32,
+        slot: PluginSlot,
+        id: String,
+        name: String,
+    },
+    /// Reply to `RequestAllStates`. Each entry pairs a (track, slot) with the
+    /// plugin's serialized state (or `None` if the plugin doesn't implement
+    /// the state extension). Triggers `finish_save` when a save is pending.
+    AllStatesReceived(Vec<SlotState>),
 }
 
 impl Model for AppData {
@@ -375,12 +382,17 @@ impl Model for AppData {
                     self.on_gui_closed();
                     dirty = false;
                 }
-                AppEvent::PluginLoadedFromChild { id, name } => {
-                    self.on_plugin_loaded_from_child(id.clone(), name.clone());
+                AppEvent::SlotPluginLoadedFromChild {
+                    track,
+                    slot,
+                    id,
+                    name,
+                } => {
+                    self.on_plugin_loaded_from_child(*track, *slot, id.clone(), name.clone());
                     dirty = false;
                 }
-                AppEvent::PluginStateReceived(state) => {
-                    self.on_plugin_state_from_child(state.clone());
+                AppEvent::AllStatesReceived(entries) => {
+                    self.on_all_states_from_child(entries.clone());
                     dirty = false;
                 }
             }
@@ -443,45 +455,59 @@ impl AppData {
         }
     }
 
-    /// Looks up the persisted plugin id on track 0 in the database, sends
-    /// `SetClapPlugin` with the restored state, and updates the local
-    /// mirrors. Silently skips when the id is missing from the DB so the
-    /// project can still open (user can pick a plugin manually).
+    /// Resolves every plugin id on track 0 (MIDI FX → Instrument → FX) via
+    /// the database and re-sends them with their persisted state. Order
+    /// matters because plugin_host installs FX into the next free index, so
+    /// chain-order replay reproduces the original slot indices.
     ///
-    /// NOTE: MVP wires the "active" plugin to `tracks[0].instrument`.
-    /// Multi-track support is coming in a follow-up.
+    /// NOTE: MVP touches track 0 only — multi-track restore lands when the
+    /// per-track Chain map exists in plugin_host.
     fn restore_plugin_from_song(&mut self, song: &Song) {
-        let Some(inst) = song
-            .tracks
-            .first()
-            .and_then(|t| t.instrument.as_ref())
-        else {
-            tracing::info!("project has no CLAP plugin on track 0; nothing to restore");
+        let Some(track) = song.tracks.first() else {
             self.instrument_label = "(no instrument)".into();
             return;
         };
-        let Some(db) = self.plugin_db.as_deref() else {
-            tracing::warn!(id = %inst.plugin_id, "plugin database not loaded; cannot resolve id");
+        let Some(db) = self.plugin_db.clone() else {
+            tracing::warn!("plugin database not loaded; cannot resolve plugin ids");
             return;
         };
-        let Some(entry) = db.find_by_id(&inst.plugin_id) else {
-            tracing::error!(id = %inst.plugin_id, "plugin id not in database");
-            return;
-        };
-        tracing::info!(
-            id = %entry.id,
-            path = %entry.path.display(),
-            has_state = inst.state.is_some(),
-            "restoring CLAP plugin from project"
-        );
-        self.send_plugin(MainToChild::SetSlotPlugin {
-            track: 0,
-            slot: common::protocol::PluginSlot::Instrument,
-            path: entry.path.clone(),
-            plugin_id: entry.id.clone(),
-            initial_state: inst.state.clone(),
-        });
-        self.instrument_label = plugin_label_from_entry(entry);
+        // Snapshot all (slot, instance) pairs first so we can mutate self
+        // while iterating.
+        let mut to_send: Vec<(PluginSlot, common::model::PluginInstance)> = Vec::new();
+        for (i, p) in track.midi_fx_chain.iter().enumerate() {
+            to_send.push((PluginSlot::MidiFx(i as u32), p.clone()));
+        }
+        if let Some(inst) = track.instrument.as_ref() {
+            to_send.push((PluginSlot::Instrument, inst.clone()));
+        } else {
+            self.instrument_label = "(no instrument)".into();
+        }
+        for (i, p) in track.fx_chain.iter().enumerate() {
+            to_send.push((PluginSlot::Fx(i as u32), p.clone()));
+        }
+        for (slot, inst) in to_send {
+            let Some(entry) = db.find_by_id(&inst.plugin_id) else {
+                tracing::error!(id = %inst.plugin_id, ?slot, "plugin id not in database");
+                continue;
+            };
+            tracing::info!(
+                id = %entry.id,
+                path = %entry.path.display(),
+                ?slot,
+                has_state = inst.state.is_some(),
+                "restoring plugin from project"
+            );
+            self.send_plugin(MainToChild::SetSlotPlugin {
+                track: 0,
+                slot,
+                path: entry.path.clone(),
+                plugin_id: entry.id.clone(),
+                initial_state: inst.state.clone(),
+            });
+            if matches!(slot, PluginSlot::Instrument) {
+                self.instrument_label = plugin_label_from_entry(entry);
+            }
+        }
     }
 
     fn action_save(&mut self) {
@@ -502,32 +528,49 @@ impl AppData {
         self.begin_save(path);
     }
 
-    /// Kicks off the two-step save: request plugin state asynchronously and
-    /// stash the target path. `on_plugin_state_from_child` finishes the save
+    /// Kicks off the two-step save: request plugin states asynchronously and
+    /// stash the target path. `on_all_states_from_child` finishes the save
     /// when the reply arrives.
     fn begin_save(&mut self, path: PathBuf) {
-        let has_plugin = self
-            .song
-            .tracks
-            .first()
-            .is_some_and(|t| t.instrument.is_some() || !t.fx_chain.is_empty());
+        let has_plugin = self.song.tracks.first().is_some_and(|t| {
+            t.instrument.is_some() || !t.fx_chain.is_empty() || !t.midi_fx_chain.is_empty()
+        });
         if has_plugin {
             self.pending_save_path = Some(path);
             self.send_plugin(MainToChild::RequestAllStates);
         } else {
             // No plugin loaded: write immediately without a state round-trip.
-            self.finish_save(path, None);
+            self.finish_save(path, Vec::new());
         }
     }
 
-    fn finish_save(&mut self, path: PathBuf, plugin_state: Option<Vec<u8>>) {
-        // Apply the captured state to track[0].instrument (MVP plugin slot).
-        // Phase B chain states will distribute across instrument + fx_chain
-        // via the `AllPluginStates` reply once we wire per-slot mapping.
-        if let Some(track) = self.song.tracks.get_mut(0)
-            && let Some(inst) = track.instrument.as_mut()
-        {
-            inst.state = plugin_state;
+    /// Distributes the captured `SlotState` entries across the model's
+    /// instrument / fx / midi-fx slots, then writes the project file. Slots
+    /// whose plugin was unloaded between request and reply are silently
+    /// skipped (the state has nowhere to live).
+    fn finish_save(&mut self, path: PathBuf, states: Vec<SlotState>) {
+        for s in states {
+            let Some(track) = self.song.tracks.get_mut(s.track as usize) else {
+                tracing::warn!(track = s.track, ?s.slot, "save: track not found in model");
+                continue;
+            };
+            match s.slot {
+                PluginSlot::Instrument => {
+                    if let Some(inst) = track.instrument.as_mut() {
+                        inst.state = s.data;
+                    }
+                }
+                PluginSlot::Fx(i) => {
+                    if let Some(p) = track.fx_chain.get_mut(i as usize) {
+                        p.state = s.data;
+                    }
+                }
+                PluginSlot::MidiFx(i) => {
+                    if let Some(p) = track.midi_fx_chain.get_mut(i as usize) {
+                        p.state = s.data;
+                    }
+                }
+            }
         }
         if self.save_to(&path) {
             self.file_path = Some(path);
@@ -629,26 +672,67 @@ impl AppData {
         self.is_gui_open = false;
     }
 
-    /// plugin_host reported that a SetClapPlugin succeeded. Sync the id and
-    /// display label with reality.
-    fn on_plugin_loaded_from_child(&mut self, id: String, name: String) {
-        tracing::info!(id = %id, name = %name, "plugin_host confirmed plugin loaded");
-        // MVP: every loaded plugin lands on track[0].instrument; Phase B
-        // will route by `slot` once ChildToMain carries that through.
+    /// plugin_host reported that a `SetSlotPlugin` succeeded. Updates the
+    /// (track, slot) target with the actual id/name reported by the host so
+    /// the model and Inspector reflect what is really loaded.
+    fn on_plugin_loaded_from_child(
+        &mut self,
+        track: u32,
+        slot: PluginSlot,
+        id: String,
+        name: String,
+    ) {
+        tracing::info!(track, ?slot, %id, %name, "plugin_host confirmed plugin loaded");
         let label = if name.is_empty() { id.clone() } else { name };
-        self.instrument_label = label;
-        if let Some(track) = self.song.tracks.get_mut(0) {
-            // Preserve existing state (a load in-flight may have state).
-            let state = track
-                .instrument
-                .as_ref()
-                .and_then(|i| i.state.clone());
-            track.instrument = Some(common::model::PluginInstance {
-                plugin_id: id,
-                state,
-            });
+        let track_idx = track as usize;
+        self.ensure_first_track();
+        let Some(t) = self.song.tracks.get_mut(track_idx) else {
+            tracing::warn!(track, "plugin loaded for missing track");
+            return;
+        };
+        match slot {
+            PluginSlot::Instrument => {
+                // Preserve any state that was attached optimistically; the
+                // load itself may have come with `initial_state`.
+                let state = t.instrument.as_ref().and_then(|i| i.state.clone());
+                t.instrument = Some(common::model::PluginInstance {
+                    plugin_id: id,
+                    state,
+                });
+                if track_idx == 0 {
+                    self.instrument_label = label;
+                }
+            }
+            PluginSlot::Fx(i) => {
+                let i = i as usize;
+                let existing_state = t.fx_chain.get(i).and_then(|p| p.state.clone());
+                let inst = common::model::PluginInstance {
+                    plugin_id: id,
+                    state: existing_state,
+                };
+                if i < t.fx_chain.len() {
+                    t.fx_chain[i] = inst;
+                } else {
+                    t.fx_chain.push(inst);
+                }
+            }
+            PluginSlot::MidiFx(i) => {
+                let i = i as usize;
+                let existing_state = t.midi_fx_chain.get(i).and_then(|p| p.state.clone());
+                let inst = common::model::PluginInstance {
+                    plugin_id: id,
+                    state: existing_state,
+                };
+                if i < t.midi_fx_chain.len() {
+                    t.midi_fx_chain[i] = inst;
+                } else {
+                    t.midi_fx_chain.push(inst);
+                }
+            }
         }
-        self.refresh_track0_chain();
+        if track_idx == 0 {
+            self.refresh_track0_chain();
+        }
     }
 
     /// Converts a Track-Inspector row's (slot_kind, slot_index) pair into
@@ -745,17 +829,19 @@ impl AppData {
         self.refresh_track0_chain();
     }
 
-    /// `ChildToMain::PluginState` reply. When a save was pending, finalize
-    /// it; otherwise the reply is unsolicited and ignored.
-    fn on_plugin_state_from_child(&mut self, state: Option<Vec<u8>>) {
+    /// `ChildToMain::AllPluginStates` reply. Each entry is dispatched to its
+    /// own (track, slot) inside the model before the project file is written.
+    /// Unsolicited replies (no pending save) are ignored silently.
+    fn on_all_states_from_child(&mut self, states: Vec<SlotState>) {
         tracing::info!(
-            has_state = state.is_some(),
+            count = states.len(),
             pending = self.pending_save_path.is_some(),
-            "plugin state reply received"
+            "all plugin states reply received"
         );
-        if let Some(path) = self.pending_save_path.take() {
-            self.finish_save(path, state);
-        }
+        let Some(path) = self.pending_save_path.take() else {
+            return;
+        };
+        self.finish_save(path, states);
     }
 
     /// Process a periodic UI tick that carries the latest `playhead_samples`
