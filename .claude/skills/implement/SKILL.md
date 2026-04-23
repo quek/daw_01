@@ -40,6 +40,26 @@ $ARGUMENTS を実装する。
 - `Option<unsafe extern "C" fn>` は `unwrap` せず `ok_or_else` で null チェック
 - CLAP / FFI エラーは `anyhow::Context` で意味のあるメッセージを付ける
 
+**CLAP 拡張を新規ホスト側に追加するときのチェックリスト:**
+
+1. `clap-sys` に該当する `clap_plugin_*` / `clap_host_*` struct と定数 (`CLAP_EXT_*`) がある
+   ことを確認（`~/.cargo/registry/src/.../clap-sys-*/src/ext/` を grep）
+2. プラグイン側拡張 (`clap_plugin_gui` 等) は、`plugin.get_extension(CLAP_EXT_*)` で取得。
+   戻りが null のプラグインもあるので `Option<*const _>` で保持
+3. ホスト側拡張 (`clap_host_gui` 等) は `Host::new()` で struct を埋め、`Host::get_extension`
+   callback から `&host.clap_gui as *const _ as *const c_void` を返す。呼び出し時に
+   `host_data` から `&Host` を復元して callback を dispatch
+4. CLAP spec の `gui.h` 等ヘッダに書かれた **呼び出し順序を厳守**（順序変更や省略で挙動が
+   壊れるプラグインがある）。特に GUI は `create → set_scale → can_resize → get_size →
+   set_parent → show` が正典
+5. すべての拡張メソッドの `[main-thread]` / `[audio-thread]` / `[any]` アノテーションを
+   確認。`@[main-thread]` は daw_plugin_host の **plugin-main std::thread** で直列化する
+6. プラグインからの callback（`clap_host_gui.request_resize` 等）は **任意のスレッド** から
+   呼ばれる可能性がある。Rust 側の送信端は `Send + Sync`（`Arc<dyn Fn + Send + Sync>` や
+   `tokio::sync::mpsc::UnboundedSender` 等）で設計する
+7. 戻り値が bool のメソッドは「`false` = エラー」とは限らない。CLAP spec の文言と実際の
+   プラグインの挙動を見て判断。`show` のように `false` でも動いている例あり (VCV Rack)
+
 以下のいずれかに該当する場合、`/research-similar-impl` スキルを呼び出して
 類似プロダクト（clap-host, clack, nih-plug, Meadowlark 等）の実装を調査する:
 

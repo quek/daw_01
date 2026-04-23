@@ -24,6 +24,13 @@
   → Song 型を Lens で bind するときに `Data` 未実装でコンパイル不能になる。解決策は
   `AppData.tracker_text: String` のような派生文字列を保持して Lens 化する
 
+- **Vizia 0.3.0 の API 細部差異** (main とも違うので公式 docs を信じすぎない):
+  - `Slider::on_changing` ではなく `on_change`
+  - `Alignment::Bottom` は存在しない。`BottomCenter` / `BottomLeft` / `BottomRight`
+  - `List` のデフォルト CSS は `list-item { height: 30px }`。per-row フラット表示したい場合は
+    `cx.add_stylesheet("list.foo list-item { height: 17px; }")` で上書き
+  - `cx.spawn(|proxy| ...)` は std::thread を使うので内部で tokio の時間系 API は使えない
+
 - `windows` crate は 0.58 → 0.61 で `HANDLE` 型が `isize` → `*mut c_void` に変更
 
 - `bincode` 2.x は 1.x とは別 API（`Encode`/`Decode` derive）。IPC 型に
@@ -63,7 +70,7 @@ Agent に調査を依頼するときは「crates.io の `<crate> = \"X.Y.Z\"` �
 | パラメータ | `clap_plugin_params` (`count`, `get_info`, `get_value`, `text_to_value`, `value_to_text`, `flush`) |
 | オートメーション | `clap_event_param_value`, `clap_event_param_mod` (input events) |
 | MIDI I/O | `clap_event_note`, `clap_event_midi`, `clap_event_midi_sysex` |
-| プラグイン GUI | `clap_plugin_gui` (`create`, `set_parent`, `set_size`, `show`, `hide`, `destroy`) |
+| プラグイン GUI | `clap_plugin_gui` (`create`, `set_parent`, `set_size`, `show`, `hide`, `destroy`) — spec は `/tmp/clap/include/clap/ext/gui.h` の先頭コメントに「初期化順序」が図解されている。`clap_host_gui` (`request_resize`, `closed`) も忘れずに実装 |
 | スレッドチェック | `clap_host_thread_check` (main thread / audio thread の判定) |
 | ウィンドウ埋め込み | `SetParent`, `SetWindowLongPtrW(GWL_STYLE)`, `raw-window-handle` |
 | 低レイテンシ I/O | `cpal::Stream`, WASAPI exclusive mode |

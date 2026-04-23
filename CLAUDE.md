@@ -42,6 +42,49 @@ cargo clippy --workspace -- -D warnings
 - 迷ったら `AppData::event` 冒頭に `tracing::info!(?app_event, "received")` を仕込んでログで確認
 - 確認後は削除するか、debug feature で囲う（`[debug-gui]` skill 参照）
 
+### Vizia 0.3 の既知の罠（実ビルドでハマった項目）
+
+- メソッド名: `Slider::on_changing` ではなく `on_change`。callback は `(ex, value)` で emit
+- `Alignment::Bottom` は存在しない。`BottomCenter` / `BottomLeft` / `BottomRight` のいずれか
+- `List` のデフォルトテーマが `list list-item { height: 30px }` を指定しているため、
+  per-row ラベルに空白が入る。`cx.add_stylesheet(&'static str)` でインライン CSS オーバーライド。
+  ただし `height: auto` にすると Skia の `matrix.invert().unwrap()` で panic する
+  （`draw.rs:35` 付近）ので、必ず固定 Pixel にする
+- `#[derive(Data)]` が無い型（今回の `Song` 等）は `Binding` に渡せない。事前レンダリングした
+  `String` や `Vec<String>` を Lens で bind する
+- `cx.spawn(|proxy| ...)` は **std::thread** を回すので `tokio::time::sleep` などは使えない。
+  `std::thread::sleep` + `proxy.emit(...)` でやる。`ContextProxy::emit` は UI が閉じられると
+  `Err` を返すのでそれで抜ける
+
+### AppEvent に f32 を乗せる罠
+
+`Keymap` API が `Hash + Eq` を要求するため、`#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]`
+を付けた `AppEvent` に `f32` を含めるとコンパイルエラー。`u32` (`f32::to_bits`) で運んで
+受信側で `f32::from_bits` で戻すパターンを踏襲する（`SetMasterGain`, `Tick(_, peak_l, peak_r)` 参照）。
+
+### 子プロセスとクロスプロセス HWND（Windows）
+
+- `HWND` は `windows` crate で `HWND(*mut c_void)`。IPC 越しに渡すには `u64` にキャストして bincode
+- CLAP プラグインウィンドウを daw_gui に埋め込むとき、daw_gui が所有する top-level HWND を作り、
+  `daw_plugin_host` へ `u64` で送る → `clap_plugin_gui.set_parent` でプラグインが子ウィンドウ化
+- WNDPROC は `extern "system" fn` で Rust 状態にアクセスできないので、`GWLP_USERDATA` に
+  `Arc<AtomicBool>` 等を leak で貼り付け、Drop で `Arc::from_raw` して回収する
+- プラグインのウィンドウメッセージは **作ったスレッドのキュー** に入る。daw_plugin_host は
+  `#[tokio::main]` 側とは別に **専用 std::thread「plugin-main」** を立て、そこで
+  `GetMessageW` ポンプを回す。同じスレッドで CLAP の `@[main-thread]` 呼び出しも直列化する
+
+### CLAP GUI 仕様の落とし穴
+
+- `clap_plugin_gui.set_size` は「前回セッションで保存したサイズを復元」用。**初回 open では
+  呼ばない**（`get_size` の戻り値をコンテナ側に反映するだけ）。これで VCV Rack 等が
+  `gui.show` を拒否するケースを防げる
+- `gui.show` が `false` を返しても、`create` + `set_parent` が成功していれば GUI は実際に
+  動いているケースがある（VCV Rack）。ログ警告に留め、即 destroy しない
+- `set_parent` と `show` の間に `PeekMessage` + `DispatchMessageW` でポンプを 1 回回すと、
+  プラグインが内部で `PostMessage` した初期化メッセージが処理され、show が通るケースがある
+- ホスト側 `clap_host_gui` は `host_data` に `&mut Host` のポインタを仕込み、
+  callback 内で復元する（`Box<Host>` は heap 固定なのでポインタが安定）
+
 ## 応答・コミット
 
 - 応答は日本語

@@ -364,6 +364,88 @@ ready_sem.release()
 - `samples_per_row = sample_rate * 60 / bpm / rows_per_beat` で行 → サンプル変換
 - clip 終端 (`start_beat + length_beats`) を越えたら自動停止 + 残留ノートを off
 
+### daw_plugin_host のスレッド構成
+
+CLAP `@[main-thread]` 要件 + Windows メッセージポンプ + tokio IPC を共存させるため、
+明示的に 3 種類のスレッドに分ける:
+
+```
+tokio main thread (IPC)       plugin-main std::thread        clap-audio std::thread
+  ├ recv pipe                   ├ CLAP lifecycle              ├ plugin.process() loop
+  ├ send ChildToMain              (load/activate/destroy)       (audio thread 専用)
+  └ select! 多重化              ├ CLAP GUI (create/show/...) 
+                                ├ Win32 メッセージポンプ
+                                │  (GetMessageW で待機)
+                                └ コマンド受信
+                                   (mpsc + PostThreadMessageW)
+```
+
+- **plugin-main** は `std::thread::spawn` で起動。`GetCurrentThreadId` を起動時に親に返す。
+  tokio 側からコマンドを送るときは `mpsc::Sender` に push → `PostThreadMessageW(tid, WM_COMMAND_WAKE)`
+  で `GetMessageW` を叩き起こす
+- すべての CLAP ポインタ操作（init/load/activate/gui/destroy）はこのスレッドで直列化
+- audio thread は Plugin を `Box<Plugin>` + 生ポインタで共有（main から GUI を触る間も
+  audio が process() を回せるよう、CLAP 仕様の状態分離を信じる）
+- tokio runtime は IPC のみ。`tokio::select!` で MainToChild read と ChildToMain write を
+  1 本のパイプ上で多重化し、専用 send task を持たない
+
+### 双方向 IPC プロトコル
+
+- `MainToChild`: DAW → Plugin host（再生 / ロード / GUI 操作指示）
+- `ChildToMain`: Plugin host → DAW（ハンドシェイクの Hello と、プラグイン GUI コールバック
+  `GuiOpened` / `GuiRequestResize` / `GuiClosed`）
+- daw_gui 側は `tokio::sync::mpsc::UnboundedReceiver<ChildToMain>` を `run_gui` に渡し、
+  `cx.spawn` で `blocking_recv` ループを回して AppEvent に変換
+- daw_plugin_host 側は `clap_host_gui.request_resize` / `closed` 等の CLAP コールバックが
+  任意のスレッドから呼ばれても `tmpsc::UnboundedSender` へ push できるよう、`Arc<dyn Fn + Send + Sync>`
+  で callback クロージャを保持
+
+### CLAP GUI (Embedded)
+
+`daw_gui/src/view/plugin_embed.rs` + `daw_plugin_host/src/plugin.rs` の `gui_*` メソッド。
+
+フロー:
+```
+[daw_gui]                                    [daw_plugin_host: plugin-main]
+user press "Open Plugin GUI"                 
+  → PluginHostWindow::create()                          
+    (native Win32 top-level WS_OVERLAPPEDWINDOW)
+  → MainToChild::OpenGuiEmbedded { host_hwnd: u64 } ──▶ recv_loop → PluginCommand::OpenGuiEmbedded
+                                                        │
+                                                        ▼
+                                              plugin.gui_create_embedded()
+                                              plugin.gui_set_scale(1.0)
+                                              plugin.gui_can_resize()
+                                              plugin.gui_get_size()
+                                              plugin.gui_set_parent_hwnd(host_hwnd)
+                                              pump_pending_messages()
+                                              plugin.gui_show()
+                                              ▼
+on_gui_opened(w,h) ◀── ChildToMain::GuiOpened { width, height }
+  → container.set_client_size(w,h)
+
+(plugin 内部で resize 必要時)
+                                              host.request_resize(w,h) called by plugin
+                                              ▼
+on_gui_request_resize(w,h) ◀── ChildToMain::GuiRequestResize
+  → container.set_client_size(w,h)
+  → MainToChild::ResizeGui { w, h } ──────▶ plugin.gui_set_size(w,h)
+
+(✕ ボタン)
+WNDPROC WM_CLOSE → hide + close_requested flag
+  → 30Hz tick が flag を検知
+  → MainToChild::CloseGui ────────────────▶ plugin.gui_hide + plugin.gui_destroy
+                                              ChildToMain::GuiClosed
+on_gui_closed ◀─────────────────────────────
+  → container を Drop（DestroyWindow）
+```
+
+注意点:
+- `gui.set_size` は「前回セッション復元時のみ」呼ぶ（CLAP spec）。初回 open では `get_size` だけ
+- `gui.show` が `false` を返しても create + set_parent が成功していれば GUI は動いている可能性あり
+  (VCV Rack)。即 destroy せず警告ログのみ
+- `set_parent` と `show` の間に `PeekMessage` ポンプを挟むとプラグインの遅延初期化が進む
+
 ## GUI (Vizia)
 
 ### レイアウト (daw_gui/src/main.rs)
