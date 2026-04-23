@@ -21,6 +21,9 @@ pub struct AppData {
     /// Flipped only by explicit user Play/Stop; auto-stop in plugin_host is
     /// not yet mirrored back here.
     pub is_playing: bool,
+    /// Loop the current clip when it reaches the end instead of auto-stopping.
+    /// Session-only state; not persisted to `.daw`.
+    pub is_looping: bool,
     /// Path of the currently loaded CLAP plugin. `None` until the user picks
     /// one and the initial scan didn't find a candidate.
     pub clap_plugin_path: Option<PathBuf>,
@@ -52,6 +55,7 @@ impl AppData {
                 velocity: 100,
             },
             is_playing: false,
+            is_looping: false,
             clap_plugin_path,
             clap_plugin_label,
             audio_tx: Some(audio_tx),
@@ -88,6 +92,7 @@ pub enum AppEvent {
     TransposeSemi(i8),
     TransposeOctave(i8),
     ChangeClapPlugin,
+    ToggleLoop,
 }
 
 impl Model for AppData {
@@ -138,6 +143,10 @@ impl Model for AppData {
                 AppEvent::TransposeOctave(d) => self.apply_transpose(*d as i16 * 12),
                 AppEvent::ChangeClapPlugin => {
                     self.action_change_clap_plugin();
+                    dirty = false;
+                }
+                AppEvent::ToggleLoop => {
+                    self.toggle_loop();
                     dirty = false;
                 }
             }
@@ -214,6 +223,12 @@ impl AppData {
         if self.save_to(&path) {
             self.file_path = Some(path);
         }
+    }
+
+    fn toggle_loop(&mut self) {
+        self.is_looping = !self.is_looping;
+        tracing::info!(on = self.is_looping, "loop toggled");
+        self.send_plugin(MainToChild::SetLoop(self.is_looping));
     }
 
     fn action_change_clap_plugin(&mut self) {

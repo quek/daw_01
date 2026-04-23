@@ -221,6 +221,10 @@ fn register_shortcuts(cx: &mut Context) {
             KeymapEntry::new(AppEvent::PlayToggle, |cx| cx.emit(AppEvent::PlayToggle)),
         ),
         (
+            KeyChord::new(Modifiers::empty(), Code::KeyP),
+            KeymapEntry::new(AppEvent::ToggleLoop, |cx| cx.emit(AppEvent::ToggleLoop)),
+        ),
+        (
             KeyChord::new(Modifiers::empty(), Code::KeyN),
             KeymapEntry::new(AppEvent::NoteOff, |cx| cx.emit(AppEvent::NoteOff)),
         ),

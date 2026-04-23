@@ -50,6 +50,7 @@ async fn main() -> Result<()> {
 
     let playback_state = Arc::new(AtomicU8::new(PlaybackCommand::Stop as u8));
     let song_store: Arc<ArcSwapOption<Song>> = Arc::new(ArcSwapOption::from(None));
+    let loop_state = Arc::new(AtomicBool::new(false));
     let mut audio_handle: Option<AudioHandle> = None;
 
     tracing::info!("awaiting shutdown");
@@ -58,6 +59,7 @@ async fn main() -> Result<()> {
         &session,
         Arc::clone(&playback_state),
         Arc::clone(&song_store),
+        Arc::clone(&loop_state),
         &mut audio_handle,
     )
     .await;
@@ -105,6 +107,7 @@ fn load_and_spawn(
     session: &AudioSession,
     playback_state: Arc<AtomicU8>,
     song_store: Arc<ArcSwapOption<Song>>,
+    loop_state: Arc<AtomicBool>,
 ) -> Result<AudioHandle> {
     let mut plugin = Plugin::load(path).context("failed to load plugin")?;
     plugin
@@ -114,7 +117,7 @@ fn load_and_spawn(
             session.max_frames,
         )
         .context("plugin.activate failed")?;
-    spawn_audio_thread(plugin, session, playback_state, song_store)
+    spawn_audio_thread(plugin, session, playback_state, song_store, loop_state)
 }
 
 fn spawn_audio_thread(
@@ -122,6 +125,7 @@ fn spawn_audio_thread(
     session: &AudioSession,
     playback_state: Arc<AtomicU8>,
     song_store: Arc<ArcSwapOption<Song>>,
+    loop_state: Arc<AtomicBool>,
 ) -> Result<AudioHandle> {
     let bridge = Arc::new(
         AudioBridgeHandle::open(&session.shmem_id).context("failed to open audio shmem")?,
@@ -155,6 +159,7 @@ fn spawn_audio_thread(
                 th_shutdown,
                 playback_state,
                 song_store,
+                loop_state,
                 th_sample_rate,
             )
         })
@@ -176,6 +181,7 @@ fn run_audio(
     shutdown: Arc<AtomicBool>,
     playback_state: Arc<AtomicU8>,
     song_store: Arc<ArcSwapOption<Song>>,
+    loop_state: Arc<AtomicBool>,
     sample_rate: u32,
 ) -> Result<Plugin> {
     let out_channels = CHANNELS as usize;
@@ -227,8 +233,10 @@ fn run_audio(
 
         if playing {
             scheduled.clear();
+            let snapshot = song_store.load();
+            let song_ref = snapshot.as_deref();
             collect_events_for_buffer(
-                song_store.load().as_deref(),
+                song_ref,
                 sample_rate,
                 playhead,
                 frames,
@@ -236,9 +244,10 @@ fn run_audio(
                 &mut active_notes,
             );
             playhead += frames as u64;
-            if song_ended(song_store.load().as_deref(), sample_rate, playhead) {
-                // Auto-stop and emit remaining note-offs at buffer end.
-                playing = false;
+            if song_ended(song_ref, sample_rate, playhead) {
+                // Buffer reached end-of-clip. Emit note-offs for sounding keys
+                // at the end of this buffer, then either wrap playhead back to
+                // the clip start (loop) or stop playback.
                 for &key in &active_notes {
                     scheduled.push(TimedNoteEvent {
                         time: frames.saturating_sub(1),
@@ -246,8 +255,20 @@ fn run_audio(
                     });
                 }
                 active_notes.clear();
-                playback_state.store(PlaybackCommand::Stop as u8, Ordering::Release);
-                tracing::info!("playback reached end of clip, auto-stopping");
+
+                let wrap_to = if loop_state.load(Ordering::Acquire) {
+                    clip_bounds_samples(song_ref, sample_rate).map(|(start, _)| start)
+                } else {
+                    None
+                };
+                if let Some(start) = wrap_to {
+                    playhead = start;
+                    tracing::debug!(playhead = start, "looped back to clip start");
+                } else {
+                    playing = false;
+                    playback_state.store(PlaybackCommand::Stop as u8, Ordering::Release);
+                    tracing::info!("playback reached end of clip, auto-stopping");
+                }
             }
         }
 
@@ -289,11 +310,13 @@ fn run_audio(
     Ok(plugin)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn recv_loop(
     mut pipe: NamedPipeClient,
     session: &AudioSession,
     playback_state: Arc<AtomicU8>,
     song_store: Arc<ArcSwapOption<Song>>,
+    loop_state: Arc<AtomicBool>,
     audio_handle: &mut Option<AudioHandle>,
 ) {
     loop {
@@ -321,8 +344,13 @@ async fn recv_loop(
                     session,
                     Arc::clone(&playback_state),
                     Arc::clone(&song_store),
+                    Arc::clone(&loop_state),
                     audio_handle,
                 );
+            }
+            Ok(MainToChild::SetLoop(on)) => {
+                tracing::info!(on, "received SetLoop");
+                loop_state.store(on, Ordering::Release);
             }
             Ok(msg) => {
                 tracing::info!(?msg, "received (no handler)");
@@ -340,6 +368,7 @@ fn swap_plugin(
     session: &AudioSession,
     playback_state: Arc<AtomicU8>,
     song_store: Arc<ArcSwapOption<Song>>,
+    loop_state: Arc<AtomicBool>,
     audio_handle: &mut Option<AudioHandle>,
 ) {
     // Bring playback to Stop so the new plugin starts from a clean state.
@@ -350,7 +379,7 @@ fn swap_plugin(
         h.shutdown();
     }
 
-    match load_and_spawn(path, session, playback_state, song_store) {
+    match load_and_spawn(path, session, playback_state, song_store, loop_state) {
         Ok(h) => {
             *audio_handle = Some(h);
             tracing::info!(path = %path.display(), "plugin swapped in");
@@ -431,16 +460,122 @@ fn collect_events_for_buffer(
     }
 }
 
-fn song_ended(song: Option<&Song>, sample_rate: u32, playhead: u64) -> bool {
-    let Some(song) = song else { return false };
-    let Some(track) = song.tracks.first() else {
-        return false;
-    };
-    let Some(clip) = track.clips.first() else {
-        return false;
-    };
+/// Returns `(clip_start_samples, clip_end_samples)` for the MVP playback
+/// target (track 0 / clip 0), or `None` if there is nothing playable:
+/// no song, empty track list, missing clip, `bpm <= 0`, or zero-length clip.
+/// The `None` case means "do not loop, do not play": downstream code should
+/// treat it as end-of-song.
+fn clip_bounds_samples(song: Option<&Song>, sample_rate: u32) -> Option<(u64, u64)> {
+    let song = song?;
+    let track = song.tracks.first()?;
+    let clip = track.clips.first()?;
+    if song.bpm <= 0.0 || clip.length_beats <= 0.0 {
+        return None;
+    }
     let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(song.bpm);
-    let clip_start_samples = (clip.start_beat * samples_per_beat).max(0.0) as u64;
-    let clip_length_samples = (clip.length_beats * samples_per_beat) as u64;
-    playhead >= clip_start_samples + clip_length_samples
+    let start = (clip.start_beat * samples_per_beat).max(0.0) as u64;
+    let length = (clip.length_beats * samples_per_beat) as u64;
+    if length == 0 {
+        return None;
+    }
+    Some((start, start + length))
+}
+
+fn song_ended(song: Option<&Song>, sample_rate: u32, playhead: u64) -> bool {
+    match clip_bounds_samples(song, sample_rate) {
+        Some((_, end)) => playhead >= end,
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::model::{Clip, InstrumentSource, Track};
+
+    fn song_with_clip(bpm: f32, start_beat: f64, length_beats: f64) -> Song {
+        Song {
+            bpm,
+            tracks: vec![Track {
+                name: "T".into(),
+                source: InstrumentSource::BuiltinSynth,
+                fx_chain: vec![],
+                volume: 1.0,
+                pan: 0.0,
+                clips: vec![Clip {
+                    name: "C".into(),
+                    start_beat,
+                    length_beats,
+                    rows_per_beat: 4,
+                    rows: vec![],
+                }],
+            }],
+            ..Song::default()
+        }
+    }
+
+    #[test]
+    fn clip_bounds_none_for_no_song() {
+        assert_eq!(clip_bounds_samples(None, 48000), None);
+    }
+
+    #[test]
+    fn clip_bounds_none_for_empty_tracks() {
+        let song = Song::default();
+        assert_eq!(clip_bounds_samples(Some(&song), 48000), None);
+    }
+
+    #[test]
+    fn clip_bounds_none_for_zero_bpm() {
+        let song = song_with_clip(0.0, 0.0, 4.0);
+        assert_eq!(clip_bounds_samples(Some(&song), 48000), None);
+    }
+
+    #[test]
+    fn clip_bounds_none_for_zero_length_clip() {
+        let song = song_with_clip(120.0, 0.0, 0.0);
+        assert_eq!(clip_bounds_samples(Some(&song), 48000), None);
+    }
+
+    #[test]
+    fn clip_bounds_standard_clip() {
+        // 120 BPM, 48 kHz: 1 beat = 24000 samples; 4 beats = 96000 samples.
+        let song = song_with_clip(120.0, 0.0, 4.0);
+        assert_eq!(
+            clip_bounds_samples(Some(&song), 48000),
+            Some((0, 96_000))
+        );
+    }
+
+    #[test]
+    fn clip_bounds_with_offset() {
+        // Start at beat 2 → 48000 samples in; length 4 beats → end at 144000.
+        let song = song_with_clip(120.0, 2.0, 4.0);
+        assert_eq!(
+            clip_bounds_samples(Some(&song), 48000),
+            Some((48_000, 144_000))
+        );
+    }
+
+    #[test]
+    fn song_ended_never_triggers_with_no_song() {
+        assert!(!song_ended(None, 48000, 0));
+        assert!(!song_ended(None, 48000, u64::MAX));
+    }
+
+    #[test]
+    fn song_ended_after_clip_end() {
+        let song = song_with_clip(120.0, 0.0, 4.0);
+        assert!(!song_ended(Some(&song), 48000, 95_999));
+        assert!(song_ended(Some(&song), 48000, 96_000));
+        assert!(song_ended(Some(&song), 48000, 96_001));
+    }
+
+    #[test]
+    fn song_ended_treats_zero_length_as_not_ended() {
+        // With no valid bounds we can't "end"; recv_loop should simply not
+        // enter playback mode, but the audio thread must not flip to stop.
+        let song = song_with_clip(120.0, 0.0, 0.0);
+        assert!(!song_ended(Some(&song), 48000, 1_000_000));
+    }
 }

@@ -424,10 +424,11 @@ state 変更時に `refresh_tracker_text()` で文字列化し、それを Lens 
 - [x] CLAP: Plugin Host で instrument プラグイン scan / load / activate / process
 - [x] Song データ駆動の再生（Track 0 / Clip 0、モノフォニック）
 - [x] プロジェクト保存・読込 (`.daw` JSON アトミック書き込み)
+- [x] プラグイン選択 GUI (Track Inspector, ホットスワップ対応)
+- [x] ループ再生 (`P` キー / Transport ボタン、clip 範囲をシームレス wrap)
 - [ ] オートセーブ + 起動時復元プロンプト
 - [ ] VOICEVOX: 歌詞入力 → sing 合成 → WAV キャッシュ → 再生
 - [ ] WAV 書き出し
-- [ ] プラグイン選択 GUI (Track Inspector)
 - [ ] velocity / lyric / FX 列の編集
 
 ### M2 以降

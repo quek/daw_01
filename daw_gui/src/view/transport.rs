@@ -13,6 +13,24 @@ impl TransportView {
                     .on_press(|ex| ex.emit(AppEvent::Play));
                 Button::new(cx, |cx| Label::new(cx, "⏹ Stop"))
                     .on_press(|ex| ex.emit(AppEvent::Stop));
+                // Loop toggle — highlighted when ON. The label itself swaps
+                // between ON/OFF so the current state is obvious even before
+                // the user learns the colour cue.
+                Button::new(cx, |cx| {
+                    Label::new(
+                        cx,
+                        AppData::is_looping
+                            .map(|on: &bool| if *on { "🔁 Loop ON" } else { "🔁 Loop" }),
+                    )
+                })
+                .on_press(|ex| ex.emit(AppEvent::ToggleLoop))
+                .background_color(AppData::is_looping.map(|on: &bool| {
+                    if *on {
+                        Color::rgb(80, 140, 90)
+                    } else {
+                        Color::rgb(60, 60, 64)
+                    }
+                }));
                 Label::new(cx, "0:00 / 64 beats")
                     .padding_left(Pixels(16.0))
                     .color(Color::rgb(220, 220, 220));

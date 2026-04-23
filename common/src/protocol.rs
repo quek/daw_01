@@ -38,6 +38,7 @@ pub enum MainToChild {
     Session(AudioSession),
     LoadSong(crate::model::Song),
     SetClapPlugin(std::path::PathBuf),
+    SetLoop(bool),
 }
 
 #[cfg(test)]
