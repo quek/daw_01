@@ -8,20 +8,28 @@ pub const MAX_FRAMES: u32 = 1024;
 pub const CHANNELS: u32 = 2;
 pub const SAMPLE_BUFFER_LEN: usize = (MAX_FRAMES * CHANNELS) as usize;
 
-/// Shared memory layout between daw_plugin_host (writer) and daw_audio (reader).
+/// Shared memory layout between daw_plugin_host (writer), daw_audio (reader +
+/// meter writer) and daw_gui (polling reader).
 /// daw_audio populates `frames_requested` then signals the request semaphore;
 /// daw_plugin_host fills `samples` (interleaved stereo) then signals the ready
 /// semaphore.
 ///
 /// `playhead_samples` is published by daw_plugin_host at the end of every
 /// buffer so daw_gui can poll it (once per UI tick) for playhead-row
-/// highlighting. It is not part of the ready-semaphore handshake — readers
-/// must tolerate seeing any value.
+/// highlighting.
+///
+/// `peak_l` / `peak_r` are the most recent per-block peaks (linear
+/// amplitude, stored as `f32::to_bits`) written by daw_audio after applying
+/// master gain, so daw_gui can draw a level meter. All three auxiliary
+/// fields are lock-free Acquire/Release atomics — readers tolerate any
+/// value they happen to observe.
 #[repr(C)]
 pub struct AudioBridge {
     pub frames_requested: AtomicU32,
     _pad: u32,
     pub playhead_samples: AtomicU64,
+    pub peak_l: AtomicU32,
+    pub peak_r: AtomicU32,
     pub samples: [f32; SAMPLE_BUFFER_LEN],
 }
 
@@ -91,6 +99,21 @@ impl AudioBridgeHandle {
 
     pub fn playhead_samples(&self) -> u64 {
         self.bridge().playhead_samples.load(Ordering::Acquire)
+    }
+
+    pub fn set_peaks(&self, l: f32, r: f32) {
+        self.bridge()
+            .peak_l
+            .store(l.to_bits(), Ordering::Release);
+        self.bridge()
+            .peak_r
+            .store(r.to_bits(), Ordering::Release);
+    }
+
+    pub fn peaks(&self) -> (f32, f32) {
+        let l = f32::from_bits(self.bridge().peak_l.load(Ordering::Acquire));
+        let r = f32::from_bits(self.bridge().peak_r.load(Ordering::Acquire));
+        (l, r)
     }
 }
 

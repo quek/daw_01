@@ -33,6 +33,19 @@ pub struct AppData {
     /// happening (sentinel `u64::MAX` published by plugin_host, or no clip).
     /// Used by ArrangementView to highlight the sounding row.
     pub playhead_row: Option<u32>,
+    /// Master output gain applied inside daw_audio (linear, 0.0..=1.0).
+    /// Session state; not persisted to `.daw`.
+    pub master_gain: f32,
+    /// Smoothed peak levels (linear, 0.0..=1.0) for the left/right meter.
+    /// Updated on every UI tick using `common::meter::update_peak` so the
+    /// meter snaps up instantly and falls exponentially.
+    pub peak_l_display: f32,
+    pub peak_r_display: f32,
+    /// Same peaks converted to `[0, 1]` for the meter-fill height binding.
+    /// Recomputed together with `peak_*_display` so the view only needs a
+    /// single Lens.
+    pub peak_l_norm: f32,
+    pub peak_r_norm: f32,
     /// Path of the currently loaded CLAP plugin. `None` until the user picks
     /// one and the initial scan didn't find a candidate.
     pub clap_plugin_path: Option<PathBuf>,
@@ -68,6 +81,11 @@ impl AppData {
             is_playing: false,
             is_looping: false,
             playhead_row: None,
+            master_gain: 1.0,
+            peak_l_display: 0.0,
+            peak_r_display: 0.0,
+            peak_l_norm: 0.0,
+            peak_r_norm: 0.0,
             clap_plugin_path,
             clap_plugin_label,
             audio_tx: Some(audio_tx),
@@ -107,9 +125,15 @@ pub enum AppEvent {
     TransposeOctave(i8),
     ChangeClapPlugin,
     ToggleLoop,
-    /// Periodic UI tick carrying the latest `playhead_samples` from shmem.
-    /// `u64::MAX` is the "not playing" sentinel published by plugin_host.
-    Tick(u64),
+    /// Master gain change from the fader. Carried as `f32::to_bits` because
+    /// `f32` doesn't implement `Eq`/`Hash` and `AppEvent` needs both for the
+    /// Keymap API.
+    SetMasterGain(u32),
+    /// Periodic UI tick carrying the latest `(playhead_samples, peak_l, peak_r)`
+    /// from shmem. Peaks are f32::to_bits so the event can still derive
+    /// Eq/Hash. `u64::MAX` playhead is the "not playing" sentinel published
+    /// by plugin_host.
+    Tick(u64, u32, u32),
 }
 
 impl Model for AppData {
@@ -166,8 +190,16 @@ impl Model for AppData {
                     self.toggle_loop();
                     dirty = false;
                 }
-                AppEvent::Tick(playhead_samples) => {
-                    self.on_tick(*playhead_samples);
+                AppEvent::SetMasterGain(bits) => {
+                    self.set_master_gain(f32::from_bits(*bits));
+                    dirty = false;
+                }
+                AppEvent::Tick(playhead_samples, peak_l_bits, peak_r_bits) => {
+                    self.on_tick(
+                        *playhead_samples,
+                        f32::from_bits(*peak_l_bits),
+                        f32::from_bits(*peak_r_bits),
+                    );
                     dirty = false;
                 }
             }
@@ -253,13 +285,18 @@ impl AppData {
     }
 
     /// Process a periodic UI tick that carries the latest `playhead_samples`
-    /// published by plugin_host in shared memory. Updates `playhead_row` so
-    /// ArrangementView can highlight the sounding row.
+    /// and raw L/R peak amplitudes published to shmem by daw_audio and
+    /// daw_plugin_host.
     ///
-    /// `u64::MAX` is the sentinel meaning "not playing" — in that case the
-    /// highlight is cleared.
-    fn on_tick(&mut self, playhead_samples: u64) {
-        let next = if playhead_samples == u64::MAX {
+    /// Updates:
+    /// - `playhead_row`: tracker-row highlight (None when not playing).
+    /// - `peak_{l,r}_display`: fast-attack / exponential-release peak tracker.
+    /// - `peak_{l,r}_norm`: dB-space normalized fill for the meter bar.
+    ///
+    /// `playhead_samples == u64::MAX` is the sentinel meaning "not playing".
+    fn on_tick(&mut self, playhead_samples: u64, peak_l_raw: f32, peak_r_raw: f32) {
+        // --- Playhead row highlight --------------------------------------
+        let next_row = if playhead_samples == u64::MAX {
             None
         } else {
             common::timing::playhead_to_row(
@@ -268,9 +305,31 @@ impl AppData {
                 playhead_samples,
             )
         };
-        if next != self.playhead_row {
-            self.playhead_row = next;
+        if next_row != self.playhead_row {
+            self.playhead_row = next_row;
         }
+
+        // --- Peak meter --------------------------------------------------
+        // At 30 Hz, 0.85 per-tick decay ≈ -24 dB/s release (fairly standard).
+        const RELEASE: f32 = 0.85;
+        self.peak_l_display =
+            common::meter::update_peak(self.peak_l_display, peak_l_raw, RELEASE);
+        self.peak_r_display =
+            common::meter::update_peak(self.peak_r_display, peak_r_raw, RELEASE);
+        self.peak_l_norm = common::meter::db_to_norm(common::meter::linear_to_db(
+            self.peak_l_display,
+        ));
+        self.peak_r_norm = common::meter::db_to_norm(common::meter::linear_to_db(
+            self.peak_r_display,
+        ));
+    }
+
+    /// Applies a master-gain change from the slider: clamp to [0,1], update
+    /// local state, and forward to daw_audio over the control pipe.
+    fn set_master_gain(&mut self, gain: f32) {
+        let clamped = gain.clamp(0.0, 1.0);
+        self.master_gain = clamped;
+        self.send_audio(MainToChild::SetMasterGain(clamped));
     }
 
     fn action_change_clap_plugin(&mut self) {

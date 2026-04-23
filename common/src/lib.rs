@@ -1,6 +1,7 @@
 pub mod audio_bridge;
 pub mod clap_scan;
 pub mod logging;
+pub mod meter;
 pub mod model;
 pub mod project;
 pub mod protocol;

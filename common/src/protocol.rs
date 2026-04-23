@@ -39,6 +39,7 @@ pub enum MainToChild {
     LoadSong(crate::model::Song),
     SetClapPlugin(std::path::PathBuf),
     SetLoop(bool),
+    SetMasterGain(f32),
 }
 
 #[cfg(test)]

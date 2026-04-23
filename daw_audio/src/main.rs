@@ -1,8 +1,9 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use anyhow::{Context, Result};
 use common::audio_bridge::{AudioBridgeHandle, CHANNELS, MAX_FRAMES};
+use common::meter::compute_block_peak;
 use common::protocol::{ChildKind, MainToChild};
 use common::win_sem::Semaphore;
 use common::wire::read_msg;
@@ -58,22 +59,30 @@ async fn main() -> Result<()> {
         PlayState::Silence
     };
     let play_state = Arc::new(AtomicU8::new(initial as u8));
+    // Master gain is stored as f32 bits in an AtomicU32 so the CPAL callback
+    // can load it with a single relaxed atomic op. Default 1.0 (0 dB).
+    let master_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
 
     let _stream = start_output_stream(
         Arc::clone(&play_state),
         Arc::clone(&bridge),
         Arc::clone(&request_sem),
         Arc::clone(&ready_sem),
+        Arc::clone(&master_gain),
     )
     .context("failed to start audio stream")?;
     tracing::info!("audio stream running");
 
-    recv_loop(pipe, play_state).await;
+    recv_loop(pipe, play_state, master_gain).await;
     tracing::info!("daw_audio exiting");
     Ok(())
 }
 
-async fn recv_loop(mut pipe: NamedPipeClient, state: Arc<AtomicU8>) {
+async fn recv_loop(
+    mut pipe: NamedPipeClient,
+    state: Arc<AtomicU8>,
+    master_gain: Arc<AtomicU32>,
+) {
     loop {
         match read_msg::<_, MainToChild>(&mut pipe).await {
             Ok(MainToChild::Play) => {
@@ -99,6 +108,11 @@ async fn recv_loop(mut pipe: NamedPipeClient, state: Arc<AtomicU8>) {
             Ok(MainToChild::SetLoop(_)) => {
                 // Loop state lives in daw_plugin_host; daw_audio does not use it.
             }
+            Ok(MainToChild::SetMasterGain(g)) => {
+                let clamped = g.clamp(0.0, 1.0);
+                tracing::info!(gain = clamped, "received SetMasterGain");
+                master_gain.store(clamped.to_bits(), Ordering::Relaxed);
+            }
             Err(e) => {
                 tracing::info!(error = ?e, "receive loop ending");
                 break;
@@ -112,6 +126,7 @@ fn start_output_stream(
     bridge: Arc<AudioBridgeHandle>,
     request_sem: Arc<Semaphore>,
     ready_sem: Arc<Semaphore>,
+    master_gain: Arc<AtomicU32>,
 ) -> Result<cpal::Stream> {
     let host = cpal::default_host();
     let device = host
@@ -148,6 +163,7 @@ fn start_output_stream(
         bridge,
         request_sem,
         ready_sem,
+        master_gain,
     )?;
     stream.play().context("failed to start stream")?;
     Ok(stream)
@@ -163,6 +179,7 @@ fn build_stream(
     bridge: Arc<AudioBridgeHandle>,
     request_sem: Arc<Semaphore>,
     ready_sem: Arc<Semaphore>,
+    master_gain: Arc<AtomicU32>,
 ) -> Result<cpal::Stream> {
     use std::f32::consts::TAU;
     let freq_hz: f32 = 440.0;
@@ -177,6 +194,8 @@ fn build_stream(
             config,
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                 let state = PlayState::from_u8(play_state.load(Ordering::Relaxed));
+                let gain = f32::from_bits(master_gain.load(Ordering::Relaxed));
+
                 match state {
                     PlayState::Silence => {
                         for s in data.iter_mut() {
@@ -185,7 +204,7 @@ fn build_stream(
                     }
                     PlayState::TestTone => {
                         for frame in data.chunks_mut(channels_usize) {
-                            let sample = phase.sin() * amplitude;
+                            let sample = phase.sin() * amplitude * gain;
                             for s in frame.iter_mut() {
                                 *s = sample;
                             }
@@ -202,15 +221,17 @@ fn build_stream(
                             for s in data.iter_mut() {
                                 *s = 0.0;
                             }
+                            bridge.set_peaks(0.0, 0.0);
                             return;
                         }
-                        // Copy interleaved stereo from shmem into the CPAL buffer,
-                        // expanding to `channels_usize` if the device has more than 2.
+                        // Copy interleaved stereo from shmem into the CPAL buffer
+                        // while multiplying by master gain. Expand to
+                        // `channels_usize` if the device has more than 2.
                         unsafe {
                             let src = bridge.samples_ptr();
                             for i in 0..frames {
-                                let l = *src.add(i * bridge_channels);
-                                let r = *src.add(i * bridge_channels + 1);
+                                let l = *src.add(i * bridge_channels) * gain;
+                                let r = *src.add(i * bridge_channels + 1) * gain;
                                 let out = data.as_mut_ptr().add(i * channels_usize);
                                 *out = l;
                                 if channels_usize > 1 {
@@ -227,10 +248,65 @@ fn build_stream(
                         }
                     }
                 }
+
+                // Compute and publish per-block peaks on the post-gain signal.
+                // Slicing by `channels_usize` keeps us correct for mono/N-ch
+                // devices; we meter the first two lanes.
+                let (peak_l, peak_r) = block_peaks_stereo(data, channels_usize);
+                bridge.set_peaks(peak_l, peak_r);
             },
             |err| tracing::error!(?err, "audio stream error"),
             None,
         )
         .context("failed to build output stream")?;
     Ok(stream)
+}
+
+/// Scan interleaved `data` (stride = `channels`) for the per-channel peak of
+/// the first two channels. RT-safe: a single pass, no allocation.
+fn block_peaks_stereo(data: &[f32], channels: usize) -> (f32, f32) {
+    if channels == 0 || data.is_empty() {
+        return (0.0, 0.0);
+    }
+    if channels == 1 {
+        let m = compute_block_peak(data);
+        return (m, m);
+    }
+    let mut pl = 0.0_f32;
+    let mut pr = 0.0_f32;
+    for frame in data.chunks_exact(channels) {
+        let l = frame[0].abs();
+        let r = frame[1].abs();
+        if l > pl {
+            pl = l;
+        }
+        if r > pr {
+            pr = r;
+        }
+    }
+    (pl, pr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_peaks_stereo_empty_is_zero() {
+        assert_eq!(block_peaks_stereo(&[], 2), (0.0, 0.0));
+    }
+
+    #[test]
+    fn block_peaks_stereo_mono_duplicates() {
+        // Mono device: both meters show the single channel's peak.
+        let data = [0.1, -0.5, 0.3];
+        assert_eq!(block_peaks_stereo(&data, 1), (0.5, 0.5));
+    }
+
+    #[test]
+    fn block_peaks_stereo_interleaved_picks_per_channel_max() {
+        // frames: (0.1,-0.4) (-0.2,0.3) (0.05,-0.5)
+        let data = [0.1, -0.4, -0.2, 0.3, 0.05, -0.5];
+        assert_eq!(block_peaks_stereo(&data, 2), (0.2, 0.5));
+    }
 }

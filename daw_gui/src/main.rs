@@ -204,15 +204,20 @@ list.tracker-list list-item {
 }
 "#;
 
-/// Polls the shared-memory playhead at ~30 Hz and dispatches `AppEvent::Tick`
-/// so `AppData::on_tick` can update the playhead-row highlight. The worker
-/// exits when the UI is closed and `proxy.emit` returns an error.
+/// Polls the shared-memory playhead and L/R peaks at ~30 Hz and dispatches
+/// `AppEvent::Tick` so `AppData::on_tick` can update the playhead-row
+/// highlight and the master meter. The worker exits when the UI is closed
+/// and `proxy.emit` returns an error.
 fn spawn_playhead_poller(cx: &mut Context, bridge: Arc<AudioBridgeHandle>) {
     cx.spawn(move |proxy| {
         loop {
             std::thread::sleep(Duration::from_millis(33));
             let samples = bridge.playhead_samples();
-            if proxy.emit(AppEvent::Tick(samples)).is_err() {
+            let (peak_l, peak_r) = bridge.peaks();
+            if proxy
+                .emit(AppEvent::Tick(samples, peak_l.to_bits(), peak_r.to_bits()))
+                .is_err()
+            {
                 break;
             }
         }
