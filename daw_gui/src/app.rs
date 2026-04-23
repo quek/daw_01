@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use common::model::{Clip, InstrumentSource, Note, NoteEvent, Row, Song, Track};
 use common::plugin_db::PluginDatabase;
+use common::plugin_format::PluginFormat;
 use common::protocol::{MainToChild, PluginSlot, SlotState};
 use tokio::sync::mpsc::UnboundedSender;
 use vizia::prelude::*;
@@ -518,6 +519,7 @@ impl AppData {
             self.send_plugin(MainToChild::SetSlotPlugin {
                 track,
                 slot,
+                format: entry.format,
                 path: entry.path.clone(),
                 plugin_id: entry.id.clone(),
                 initial_state: inst.state.clone(),
@@ -670,10 +672,16 @@ impl AppData {
         match slot {
             PluginSlot::Instrument => {
                 // Preserve any state that was attached optimistically; the
-                // load itself may have come with `initial_state`.
-                let state = t.instrument.as_ref().and_then(|i| i.state.clone());
+                // load itself may have come with `initial_state`. Format is
+                // also carried over from the optimistic entry.
+                let (state, format) = t
+                    .instrument
+                    .as_ref()
+                    .map(|i| (i.state.clone(), i.format))
+                    .unwrap_or((None, PluginFormat::Clap));
                 t.instrument = Some(common::model::PluginInstance {
                     plugin_id: id,
+                    format,
                     state,
                 });
                 if track == self.cursor_track {
@@ -682,9 +690,14 @@ impl AppData {
             }
             PluginSlot::Fx(i) => {
                 let i = i as usize;
-                let existing_state = t.fx_chain.get(i).and_then(|p| p.state.clone());
+                let (existing_state, format) = t
+                    .fx_chain
+                    .get(i)
+                    .map(|p| (p.state.clone(), p.format))
+                    .unwrap_or((None, PluginFormat::Clap));
                 let inst = common::model::PluginInstance {
                     plugin_id: id,
+                    format,
                     state: existing_state,
                 };
                 if i < t.fx_chain.len() {
@@ -695,9 +708,14 @@ impl AppData {
             }
             PluginSlot::MidiFx(i) => {
                 let i = i as usize;
-                let existing_state = t.midi_fx_chain.get(i).and_then(|p| p.state.clone());
+                let (existing_state, format) = t
+                    .midi_fx_chain
+                    .get(i)
+                    .map(|p| (p.state.clone(), p.format))
+                    .unwrap_or((None, PluginFormat::Clap));
                 let inst = common::model::PluginInstance {
                     plugin_id: id,
+                    format,
                     state: existing_state,
                 };
                 if i < t.midi_fx_chain.len() {
@@ -911,6 +929,7 @@ impl AppData {
         let path = entry.path.clone();
         let entry_label = plugin_label_from_entry(entry);
         let entry_id = entry.id.clone();
+        let entry_format = entry.format;
         self.ensure_first_track();
         let track_idx = self.cursor_track;
         // Pick the destination slot based on what the user was adding,
@@ -948,6 +967,7 @@ impl AppData {
         self.send_plugin(MainToChild::SetSlotPlugin {
             track: track_idx,
             slot: dest_slot,
+            format: entry_format,
             path,
             plugin_id: entry_id.clone(),
             initial_state: None,
@@ -957,18 +977,22 @@ impl AppData {
         if let Some(track) = self.song.tracks.get_mut(track_idx as usize) {
             match dest_slot {
                 PluginSlot::Instrument => {
-                    track.instrument =
-                        Some(common::model::PluginInstance::new(entry_id.clone()));
+                    track.instrument = Some(common::model::PluginInstance::new(
+                        entry_id.clone(),
+                        entry_format,
+                    ));
                 }
                 PluginSlot::Fx(_) => {
-                    track
-                        .fx_chain
-                        .push(common::model::PluginInstance::new(entry_id.clone()));
+                    track.fx_chain.push(common::model::PluginInstance::new(
+                        entry_id.clone(),
+                        entry_format,
+                    ));
                 }
                 PluginSlot::MidiFx(_) => {
-                    track
-                        .midi_fx_chain
-                        .push(common::model::PluginInstance::new(entry_id.clone()));
+                    track.midi_fx_chain.push(common::model::PluginInstance::new(
+                        entry_id.clone(),
+                        entry_format,
+                    ));
                 }
             }
         }

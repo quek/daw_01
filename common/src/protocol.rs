@@ -1,5 +1,7 @@
 use bincode::{Decode, Encode};
 
+use crate::plugin_format::PluginFormat;
+
 /// Addresses a single plugin slot inside a track. A track has:
 /// - MIDI FX chain: `MidiFx(0)`, `MidiFx(1)`, ...
 /// - one Instrument slot: `Instrument`
@@ -104,13 +106,15 @@ pub enum MainToChild {
     SetLoop(bool),
     SetMasterGain(f32),
     // --- Per-track plugin slot management -----------------------------
-    /// Load / replace the plugin in `(track, slot)`. Empty `plugin_id`
-    /// picks the first descriptor in `path`; non-empty selects by id.
-    /// `initial_state`, when `Some`, is applied via
-    /// `clap_plugin_state.load` right after activate.
+    /// Load / replace the plugin in `(track, slot)`. `format` routes the
+    /// request to the CLAP or VST3 backend. Empty `plugin_id` picks the
+    /// first descriptor in `path`; non-empty selects by id (CLAP stable id
+    /// or VST3 FUID as hex). `initial_state`, when `Some`, is applied via
+    /// the backend's state-restore entry right after activate.
     SetSlotPlugin {
         track: u32,
         slot: PluginSlot,
+        format: PluginFormat,
         path: std::path::PathBuf,
         plugin_id: String,
         initial_state: Option<Vec<u8>>,

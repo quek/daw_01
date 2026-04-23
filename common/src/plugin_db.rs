@@ -20,11 +20,18 @@ use clap_sys::version::clap_version_is_compatible;
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
 
+use crate::plugin_format::PluginFormat;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginEntry {
-    /// Stable plugin identifier from `clap_plugin_descriptor.id`
-    /// (e.g. `com.vcvrack.rack`). This is what projects persist.
+    /// Stable plugin identifier. For CLAP this is
+    /// `clap_plugin_descriptor.id` (e.g. `com.vcvrack.rack`). For VST3 it
+    /// is the class UUID rendered as 32 hex chars (no dashes).
     pub id: String,
+    /// Which backend hosts this plugin. Defaults to CLAP so pre-VST3
+    /// caches upgrade cleanly.
+    #[serde(default)]
+    pub format: PluginFormat,
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vendor: String,
@@ -32,10 +39,12 @@ pub struct PluginEntry {
     pub version: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
-    /// Absolute path to the `.clap` file.
+    /// Absolute path to the plugin binary: a `.clap` file or, for VST3, the
+    /// `.vst3` bundle directory (or legacy single DLL).
     pub path: PathBuf,
-    /// Index within the `.clap`'s factory. A single `.clap` can host
-    /// multiple descriptors (e.g. VCV Rack's `rack` / `rack.fx` / `rack.generator`).
+    /// Index within the factory. A single `.clap`/`.vst3` can host multiple
+    /// descriptors (e.g. VCV Rack's `rack` / `rack.fx` / `rack.generator`,
+    /// or a VST3 vendor shipping several classes in one DLL).
     pub descriptor_index: u32,
 }
 
@@ -91,27 +100,73 @@ pub fn default_cache_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|p| p.join("daw_01").join("plugin_database.json"))
 }
 
-/// Scan every `.clap` under the system CLAP directory and enumerate all
-/// descriptors. Errors for individual files are logged and skipped so a
-/// single broken plugin doesn't block the whole database.
+/// Scan every `.clap` under the system CLAP directory plus every `.vst3`
+/// bundle/DLL under the system VST3 directory, enumerating descriptors
+/// where cheap (CLAP) and falling back to file-name metadata otherwise
+/// (VST3 — scanning a VST3 bundle means loading the DLL + instantiating a
+/// component, which we defer to load-time to keep startup fast).
+///
+/// Errors for individual files are logged and skipped so a single broken
+/// plugin doesn't block the whole database.
 pub fn scan_system() -> Result<PluginDatabase> {
-    let paths = crate::clap_scan::scan_system_clap_directory()?;
     let mut entries = Vec::new();
-    for path in paths {
-        match scan_one_file(&path) {
-            Ok(descs) => {
-                tracing::info!(
-                    path = %path.display(),
-                    count = descs.len(),
-                    "scanned plugin file"
-                );
-                entries.extend(descs);
-            }
-            Err(e) => {
-                tracing::warn!(error = ?e, path = %path.display(), "scan failed, skipping");
+
+    // --- CLAP branch: full descriptor enumeration (cheap).
+    match crate::clap_scan::scan_system_clap_directory() {
+        Ok(paths) => {
+            for path in paths {
+                match scan_one_file(&path) {
+                    Ok(descs) => {
+                        tracing::info!(
+                            path = %path.display(),
+                            count = descs.len(),
+                            "scanned CLAP file"
+                        );
+                        entries.extend(descs);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = ?e, path = %path.display(), "CLAP scan failed, skipping");
+                    }
+                }
             }
         }
+        Err(e) => {
+            tracing::warn!(error = ?e, "CLAP directory enumeration failed");
+        }
     }
+
+    // --- VST3 branch: bundle/file discovery only. Loading each .vst3 for
+    // class-info would add seconds per plugin; we rely on daw_plugin_host's
+    // backend to pick the first Audio Module Class when an empty / non-UUID
+    // id reaches it.
+    match crate::vst3_scan::scan_system_vst3_directory() {
+        Ok(vst3_entries) => {
+            for ent in vst3_entries {
+                let stem = ent
+                    .bundle_path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "vst3 plugin".into());
+                entries.push(PluginEntry {
+                    id: stem.clone(),
+                    format: PluginFormat::Vst3,
+                    name: stem,
+                    vendor: String::new(),
+                    version: String::new(),
+                    // Default to instrument category so the picker lists
+                    // VST3s under an instrument filter; the user can pick
+                    // any VST3 for any slot regardless.
+                    features: vec!["instrument".into()],
+                    path: ent.bundle_path,
+                    descriptor_index: 0,
+                });
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, "VST3 directory enumeration failed");
+        }
+    }
+
     Ok(PluginDatabase {
         entries,
         scanned_at: Some(now_secs()),
@@ -201,6 +256,7 @@ fn scan_one_file(path: &Path) -> Result<Vec<PluginEntry>> {
         }
         out.push(PluginEntry {
             id,
+            format: PluginFormat::Clap,
             name: cstr_to_string(desc.name),
             vendor: cstr_to_string(desc.vendor),
             version: cstr_to_string(desc.version),
@@ -252,6 +308,7 @@ mod tests {
         let db = PluginDatabase {
             entries: vec![PluginEntry {
                 id: "com.example.foo".into(),
+                format: PluginFormat::Clap,
                 name: "Foo".into(),
                 vendor: "Example".into(),
                 version: "1.0".into(),
@@ -280,6 +337,7 @@ mod tests {
         let db = PluginDatabase {
             entries: vec![PluginEntry {
                 id: "com.test.x".into(),
+                format: PluginFormat::Clap,
                 name: "X".into(),
                 vendor: String::new(),
                 version: "0.1.0".into(),

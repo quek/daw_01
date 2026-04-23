@@ -1,35 +1,15 @@
 use std::ffi::{CStr, c_char, c_void};
-use std::sync::Arc;
 
 use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_host_gui};
 use clap_sys::host::clap_host;
 use clap_sys::version::CLAP_VERSION;
 
+use crate::plugin_instance::HostCallbacks;
+
 const NAME: &CStr = c"daw_01";
 const VENDOR: &CStr = c"daw_01";
 const URL: &CStr = c"";
 const VERSION: &CStr = c"0.1.0";
-
-/// Callbacks the host exposes to CLAP plugins. These are triggered by the
-/// plugin itself (resize requests, close notifications) and may fire on
-/// *any* thread the plugin chooses — implementers must be `Send + Sync` and
-/// should not block.
-pub struct HostCallbacks {
-    pub on_request_resize: Arc<dyn Fn(u32, u32) + Send + Sync>,
-    pub on_closed: Arc<dyn Fn() + Send + Sync>,
-}
-
-impl HostCallbacks {
-    /// Returns a no-op callback set for scanning / tests where we don't need
-    /// to relay GUI events.
-    #[allow(dead_code)]
-    pub fn noop() -> Self {
-        Self {
-            on_request_resize: Arc::new(|_, _| {}),
-            on_closed: Arc::new(|| {}),
-        }
-    }
-}
 
 /// CLAP host impl. Pinned via `Box<Host>` so the raw `host_data` pointer the
 /// plugin holds remains valid for the plugin's lifetime.

@@ -22,29 +22,16 @@ use clap_sys::host::clap_host;
 use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
 use clap_sys::process::clap_process;
 use clap_sys::version::clap_version_is_compatible;
+use common::plugin_format::PluginFormat;
 use libloading::{Library, Symbol};
 
-/// A single transition to inject into the next process() call.
-#[derive(Debug, Clone, Copy)]
-pub enum NoteTransition {
-    On { key: u8, velocity: f64 },
-    Off { key: u8 },
-}
-
-/// A note transition scheduled at a specific frame offset within the next
-/// process() buffer.
-#[derive(Debug, Clone, Copy)]
-pub struct TimedNoteEvent {
-    pub time: u32,
-    pub event: NoteTransition,
-}
-
-use crate::clap_host::{Host, HostCallbacks};
+use crate::clap_host::Host;
+use crate::plugin_instance::{HostCallbacks, LoadedPlugin, NoteTransition, TimedNoteEvent};
 
 /// Loaded CLAP plugin instance. Holds every resource alive until dropped; the
 /// drop order (custom cleanup → fields → Library) ensures `destroy` / `deinit`
 /// run before the DLL is unloaded.
-pub struct Plugin {
+pub struct ClapPlugin {
     _library: Library,
     entry: *const clap_plugin_entry,
     plugin: *const clap_plugin,
@@ -79,9 +66,9 @@ pub struct Plugin {
 }
 
 // The plugin holds raw pointers but ownership is exclusive within the struct.
-unsafe impl Send for Plugin {}
+unsafe impl Send for ClapPlugin {}
 
-impl Plugin {
+impl ClapPlugin {
     /// Tries to load a plugin from `path`. Scans all descriptors in the file
     /// and instantiates the first one matching `target_id` when provided, or
     /// otherwise the first one for which `matches(features)` returns true.
@@ -836,7 +823,7 @@ fn query_port_channel_count(
     unsafe { info.assume_init() }.channel_count
 }
 
-impl Drop for Plugin {
+impl Drop for ClapPlugin {
     fn drop(&mut self) {
         // Tear down GUI resources first so plugin.destroy sees a clean state.
         self.gui_destroy();
@@ -923,4 +910,99 @@ fn log_note_ports(plugin: *const clap_plugin, get_ext: GetExtFn) {
     let inputs = unsafe { count_fn(plugin, true) };
     let outputs = unsafe { count_fn(plugin, false) };
     tracing::info!(inputs, outputs, "note-ports");
+}
+
+impl LoadedPlugin for ClapPlugin {
+    fn id(&self) -> &str {
+        self.id()
+    }
+
+    fn name(&self) -> &str {
+        self.name()
+    }
+
+    fn format(&self) -> PluginFormat {
+        PluginFormat::Clap
+    }
+
+    fn activate(&mut self, sample_rate: f64, min_frames: u32, max_frames: u32) -> Result<()> {
+        self.activate(sample_rate, min_frames, max_frames)
+    }
+
+    fn deactivate(&mut self) {
+        self.deactivate();
+    }
+
+    fn start_processing(&mut self) -> Result<()> {
+        self.start_processing()
+    }
+
+    fn stop_processing(&mut self) {
+        self.stop_processing();
+    }
+
+    fn process(
+        &mut self,
+        frames: u32,
+        events: &[TimedNoteEvent],
+        input_audio: &[&[f32]],
+    ) -> Result<i32> {
+        self.process(frames, events, input_audio)
+    }
+
+    fn output_buffer(&self, channel: usize) -> Option<&[f32]> {
+        self.output_buffer(channel)
+    }
+
+    fn drain_out_notes_into(&mut self, out: &mut Vec<TimedNoteEvent>) {
+        self.drain_out_notes_into(out);
+    }
+
+    fn state_save(&self) -> Result<Option<Vec<u8>>> {
+        self.state_save()
+    }
+
+    fn state_load(&self, data: &[u8]) -> Result<()> {
+        self.state_load(data)
+    }
+
+    fn gui_is_embed_supported(&self) -> bool {
+        self.gui_is_embed_supported()
+    }
+
+    fn gui_create_embedded(&mut self) -> Result<()> {
+        self.gui_create_embedded()
+    }
+
+    fn gui_get_size(&self) -> Option<(u32, u32)> {
+        self.gui_get_size()
+    }
+
+    fn gui_set_scale(&self, scale: f64) -> Result<bool> {
+        self.gui_set_scale(scale)
+    }
+
+    fn gui_can_resize(&self) -> bool {
+        self.gui_can_resize()
+    }
+
+    fn gui_set_parent_hwnd(&self, hwnd: u64) -> Result<()> {
+        self.gui_set_parent_hwnd(hwnd)
+    }
+
+    fn gui_show(&self) -> Result<bool> {
+        self.gui_show()
+    }
+
+    fn gui_hide(&self) -> Result<()> {
+        self.gui_hide()
+    }
+
+    fn gui_set_size(&self, width: u32, height: u32) -> Result<()> {
+        self.gui_set_size(width, height)
+    }
+
+    fn gui_destroy(&mut self) {
+        self.gui_destroy();
+    }
 }

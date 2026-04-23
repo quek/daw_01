@@ -4,9 +4,11 @@ pub mod logging;
 pub mod meter;
 pub mod model;
 pub mod plugin_db;
+pub mod plugin_format;
 pub mod project;
 pub mod protocol;
 pub mod timing;
+pub mod vst3_scan;
 pub mod wire;
 
 #[cfg(windows)]

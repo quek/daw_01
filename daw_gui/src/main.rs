@@ -90,6 +90,7 @@ fn main() -> Result<()> {
         if let Err(e) = plugin_tx.send(MainToChild::SetSlotPlugin {
             track: 0,
             slot: common::protocol::PluginSlot::Instrument,
+            format: common::plugin_format::PluginFormat::Clap,
             path,
             plugin_id: String::new(),
             initial_state: None,

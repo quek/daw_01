@@ -1,5 +1,10 @@
 mod clap_host;
-mod plugin;
+mod clap_plugin;
+mod plugin_instance;
+mod vst3_events;
+mod vst3_host;
+mod vst3_plugin;
+mod vst3_stream;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,6 +17,7 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwapOption;
 use common::audio_bridge::{AudioBridgeHandle, CHANNELS};
 use common::model::{NoteEvent, Song};
+use common::plugin_format::PluginFormat;
 use common::protocol::{AudioSession, ChildKind, ChildToMain, MainToChild, PluginSlot, SlotState};
 use common::timing::{song_bounds_samples, song_ended};
 use common::win_sem::Semaphore;
@@ -25,8 +31,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, WM_APP,
 };
 
-use crate::clap_host::HostCallbacks;
-use crate::plugin::{NoteTransition, Plugin, TimedNoteEvent};
+use crate::plugin_instance::{
+    HostCallbacks, LoadedPlugin, NoteTransition, TimedNoteEvent, load_plugin,
+};
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -112,6 +119,7 @@ enum PluginCommand {
     SetSlotPlugin {
         track: u32,
         slot: PluginSlot,
+        format: PluginFormat,
         path: PathBuf,
         plugin_id: String,
         initial_state: Option<Vec<u8>>,
@@ -310,6 +318,7 @@ fn plugin_main_loop(
                 PluginCommand::SetSlotPlugin {
                     track,
                     slot,
+                    format,
                     path,
                     plugin_id,
                     initial_state,
@@ -319,7 +328,7 @@ fn plugin_main_loop(
                     // playback_state — the user's Play/Stop choice should
                     // survive a chain edit.
                     let callbacks = make_callbacks(track, slot);
-                    match Plugin::load(&path, &plugin_id, callbacks) {
+                    match load_plugin(format, &path, &plugin_id, callbacks) {
                         Ok(plugin) => {
                             if let Some(bytes) = initial_state
                                 && let Err(e) = plugin.state_load(&bytes)
@@ -347,7 +356,7 @@ fn plugin_main_loop(
                             }
                         }
                         Err(e) => {
-                            tracing::error!(error = ?e, path = %path.display(), "load failed");
+                            tracing::error!(error = ?e, ?format, path = %path.display(), "load failed");
                         }
                     }
                 }
@@ -486,7 +495,7 @@ fn plugin_main_loop(
 
 /// Place `plugin` into the slot, replacing any previous occupant. Audio
 /// thread is stopped by the caller (via `TracksHandle::mutate`).
-fn install_plugin(chain: &mut Chain, slot: PluginSlot, plugin: Plugin) {
+fn install_plugin(chain: &mut Chain, slot: PluginSlot, plugin: Box<dyn LoadedPlugin>) {
     match slot {
         PluginSlot::Instrument => {
             if let Some(mut old) = chain.instrument.replace(plugin) {
@@ -768,6 +777,7 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
         MainToChild::SetSlotPlugin {
             track,
             slot,
+            format,
             path,
             plugin_id,
             initial_state,
@@ -775,6 +785,7 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             tracing::info!(
                 track,
                 ?slot,
+                ?format,
                 path = %path.display(),
                 id = %plugin_id,
                 has_state = initial_state.is_some(),
@@ -783,6 +794,7 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             plugin.send(PluginCommand::SetSlotPlugin {
                 track,
                 slot,
+                format,
                 path,
                 plugin_id,
                 initial_state,
@@ -847,39 +859,50 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
 // --- Chain + audio thread ------------------------------------------------
 
 /// Wraps a raw pointer so it can be moved into the audio thread closure.
-/// The CLAP spec partitions plugin state between main-thread and audio-thread,
-/// so simultaneous main-thread GUI calls and audio-thread `process()` calls
-/// touch disjoint fields (this assumes plugins conform to the spec).
-struct PluginPtr(*mut Plugin);
+/// Both CLAP and VST3 partition their APIs between main-thread and
+/// audio-thread, so simultaneous main-thread GUI calls and audio-thread
+/// `process()` calls touch disjoint fields (this assumes plugins conform
+/// to the spec). The pointer is a trait-object fat pointer (data +
+/// vtable) so the audio thread can call `LoadedPlugin` methods against
+/// whichever backend — CLAP or VST3 — is behind the slot.
+struct PluginPtr(*mut (dyn LoadedPlugin + 'static));
 unsafe impl Send for PluginPtr {}
 
 /// Per-track signal chain owned on the plugin-main thread. The audio thread
 /// receives raw pointer snapshots at spawn time (see [`AudioRouting`]).
 ///
-/// `Plugin` is stored by value; self-referential pointers inside it (the
-/// host's `clap_host` address passed to `create_plugin`) live in the
-/// `Box<Host>` it owns, so moving the `Plugin` between `Vec` reallocations is
-/// safe. The audio thread's raw pointers are always refreshed during
-/// `start_audio`.
+/// Each slot holds a `Box<dyn LoadedPlugin>` so CLAP (`ClapPlugin`) and
+/// VST3 (`Vst3Plugin`) implementations can coexist on the same chain.
+/// Boxing keeps the plugin pinned on the heap so raw pointers snapshotted
+/// into the audio thread remain valid across `Vec` reallocations.
 #[derive(Default)]
 struct Chain {
     /// Note-effect plugins executed before the instrument (e.g. arpeggiators).
     /// Events flow left-to-right, with each plugin's emitted notes feeding
     /// the next.
-    midi_fx_chain: Vec<Plugin>,
+    midi_fx_chain: Vec<Box<dyn LoadedPlugin>>,
     /// Instrument slot (note→audio). `None` = no instrument loaded on the
     /// track; audio thread produces silence at the instrument stage.
-    instrument: Option<Plugin>,
+    instrument: Option<Box<dyn LoadedPlugin>>,
     /// Audio effects applied in order after the instrument.
-    fx_chain: Vec<Plugin>,
+    fx_chain: Vec<Box<dyn LoadedPlugin>>,
 }
 
 impl Chain {
-    fn plugin_at_mut(&mut self, slot: PluginSlot) -> Option<&mut Plugin> {
+    fn plugin_at_mut(&mut self, slot: PluginSlot) -> Option<&mut (dyn LoadedPlugin + '_)> {
         match slot {
-            PluginSlot::MidiFx(i) => self.midi_fx_chain.get_mut(i as usize),
-            PluginSlot::Instrument => self.instrument.as_mut(),
-            PluginSlot::Fx(i) => self.fx_chain.get_mut(i as usize),
+            PluginSlot::MidiFx(i) => self
+                .midi_fx_chain
+                .get_mut(i as usize)
+                .map(|b| &mut **b as &mut dyn LoadedPlugin),
+            PluginSlot::Instrument => self
+                .instrument
+                .as_mut()
+                .map(|b| &mut **b as &mut dyn LoadedPlugin),
+            PluginSlot::Fx(i) => self
+                .fx_chain
+                .get_mut(i as usize)
+                .map(|b| &mut **b as &mut dyn LoadedPlugin),
         }
     }
 }
@@ -896,7 +919,11 @@ impl Tracks {
         self.chains.entry(track).or_default()
     }
 
-    fn plugin_at_mut(&mut self, track: u32, slot: PluginSlot) -> Option<&mut Plugin> {
+    fn plugin_at_mut(
+        &mut self,
+        track: u32,
+        slot: PluginSlot,
+    ) -> Option<&mut (dyn LoadedPlugin + '_)> {
         self.chains.get_mut(&track).and_then(|c| c.plugin_at_mut(slot))
     }
 }
@@ -938,7 +965,11 @@ impl TracksHandle {
         }
     }
 
-    fn plugin_at_mut(&mut self, track: u32, slot: PluginSlot) -> Option<&mut Plugin> {
+    fn plugin_at_mut(
+        &mut self,
+        track: u32,
+        slot: PluginSlot,
+    ) -> Option<&mut (dyn LoadedPlugin + '_)> {
         self.tracks.plugin_at_mut(track, slot)
     }
 
@@ -1013,19 +1044,21 @@ impl TracksHandle {
         // the master bus commutatively.
         let mut tracks_routing: Vec<TrackRouting> = Vec::with_capacity(self.tracks.chains.len());
         for (track_id, chain) in self.tracks.chains.iter_mut() {
+            // &raw mut **b gives the *dyn LoadedPlugin* fat pointer behind
+            // the Box (data + vtable), NOT a pointer to the Box struct.
             let midi_fx_chain: Vec<PluginPtr> = chain
                 .midi_fx_chain
                 .iter_mut()
-                .map(|p| PluginPtr(&raw mut *p))
+                .map(|p| PluginPtr(&raw mut **p))
                 .collect();
             let instrument = chain
                 .instrument
                 .as_mut()
-                .map(|p| PluginPtr(&raw mut *p));
+                .map(|p| PluginPtr(&raw mut **p));
             let fx_chain: Vec<PluginPtr> = chain
                 .fx_chain
                 .iter_mut()
-                .map(|p| PluginPtr(&raw mut *p))
+                .map(|p| PluginPtr(&raw mut **p))
                 .collect();
             tracks_routing.push(TrackRouting {
                 track_id: *track_id,

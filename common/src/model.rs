@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
+use crate::plugin_format::PluginFormat;
+
 pub const CURRENT_VERSION: u32 = 1;
 
 /// Serde adapter for `Option<Vec<u8>>` that writes binary data as base64 in
@@ -117,13 +119,19 @@ impl Default for Track {
     }
 }
 
-/// Reference to a CLAP plugin loaded on a track, with the state blob the
-/// plugin itself produced via `clap_plugin_state.save`. Paths are NOT
-/// stored — the plugin-id is resolved to a path through
-/// `plugin_db::PluginDatabase` at load time, keeping projects portable.
+/// Reference to a plugin loaded on a track, with the opaque state blob the
+/// plugin itself produced (CLAP `clap_plugin_state.save` or VST3
+/// `IComponent::getState`). Paths are NOT stored — `(format, plugin_id)`
+/// is resolved through `plugin_db::PluginDatabase` at load time, keeping
+/// projects portable across machines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub struct PluginInstance {
+    /// CLAP stable id (reverse-DNS) or VST3 class UUID rendered as hex.
     pub plugin_id: String,
+    /// Which backend created this plugin. Defaults to CLAP for projects
+    /// saved before VST3 support existed.
+    #[serde(default)]
+    pub format: PluginFormat,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -133,9 +141,10 @@ pub struct PluginInstance {
 }
 
 impl PluginInstance {
-    pub fn new(plugin_id: String) -> Self {
+    pub fn new(plugin_id: String, format: PluginFormat) -> Self {
         Self {
             plugin_id,
+            format,
             state: None,
         }
     }

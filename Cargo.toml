@@ -12,6 +12,7 @@ arc-swap = "1"
 base64 = "0.22"
 bincode = { version = "2", features = ["derive"] }
 clap-sys = "0.5"
+com-scrape-types = "0.1"
 dirs = "5"
 cpal = "0.15"
 libloading = "0.8"
@@ -25,4 +26,5 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-uti
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 vizia = "0.3"
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+vst3 = "0.3"
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Com", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }

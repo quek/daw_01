@@ -8,9 +8,11 @@ common = { path = "../common" }
 anyhow.workspace = true
 arc-swap.workspace = true
 clap-sys.workspace = true
+com-scrape-types.workspace = true
 libloading.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+vst3.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
