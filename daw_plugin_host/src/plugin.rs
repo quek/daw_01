@@ -55,11 +55,18 @@ pub struct Plugin {
     path: PathBuf,
     active: bool,
     processing: bool,
+    input_channels: u32,
+    input_buffers: Vec<Vec<f32>>,
+    input_ptrs: Vec<*mut f32>,
     output_channels: u32,
     output_buffers: Vec<Vec<f32>>,
     output_ptrs: Vec<*mut f32>,
     /// Pre-allocated input event buffer; filled by process() per call.
     pending_events: Vec<clap_event_note>,
+    /// Notes emitted by the plugin during the previous `process()` call.
+    /// Populated by the `out_events.try_push` callback and drained by the
+    /// caller (e.g. MIDI FX chain) before the next process().
+    collected_out_notes: Vec<TimedNoteEvent>,
     /// `clap_plugin_gui` vtable pointer, looked up once after init.
     /// `None` means the plugin does not declare the gui extension.
     gui_ext: Option<*const clap_plugin_gui>,
@@ -200,8 +207,13 @@ impl Plugin {
             .context("clap_plugin::get_extension is null")?;
         log_audio_ports(plugin_ptr, get_ext);
         log_note_ports(plugin_ptr, get_ext);
+        let input_channels = query_port_channel_count(plugin_ptr, get_ext, true);
         let output_channels = query_output_channel_count(plugin_ptr, get_ext);
-        tracing::info!(output_channels, "plugin output channel count");
+        tracing::info!(
+            input_channels,
+            output_channels,
+            "plugin audio channel count"
+        );
 
         // Look up optional clap.gui extension; missing → embedded GUI not supported.
         let gui_ptr = unsafe { get_ext(plugin_ptr, CLAP_EXT_GUI.as_ptr()) } as *const clap_plugin_gui;
@@ -228,10 +240,14 @@ impl Plugin {
             path: path.to_path_buf(),
             active: false,
             processing: false,
+            input_channels,
+            input_buffers: Vec::new(),
+            input_ptrs: Vec::new(),
             output_channels,
             output_buffers: Vec::new(),
             output_ptrs: Vec::new(),
             pending_events: Vec::with_capacity(64),
+            collected_out_notes: Vec::with_capacity(64),
             gui_ext,
             gui_created: false,
             state_ext,
@@ -383,12 +399,34 @@ impl Plugin {
             "plugin.activate returned false"
         );
         self.active = true;
+        self.input_buffers = (0..self.input_channels as usize)
+            .map(|_| vec![0.0f32; max_frames as usize])
+            .collect();
+        self.input_ptrs = vec![std::ptr::null_mut(); self.input_channels as usize];
         self.output_buffers = (0..self.output_channels as usize)
             .map(|_| vec![0.0f32; max_frames as usize])
             .collect();
         self.output_ptrs = vec![std::ptr::null_mut(); self.output_channels as usize];
         tracing::info!(sample_rate, max_frames, "plugin activated");
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn input_channels(&self) -> u32 {
+        self.input_channels
+    }
+
+    #[allow(dead_code)]
+    pub fn output_channels(&self) -> u32 {
+        self.output_channels
+    }
+
+    /// Returns note events collected from the last `process()` call (for
+    /// MIDI FX → next plugin routing). Reserved for Phase B MIDI chain
+    /// routing; currently unused at the call site.
+    #[allow(dead_code)]
+    pub fn take_out_notes(&mut self) -> Vec<TimedNoteEvent> {
+        std::mem::take(&mut self.collected_out_notes)
     }
 
     pub fn start_processing(&mut self) -> Result<()> {
@@ -426,11 +464,24 @@ impl Plugin {
         self.output_ptrs.clear();
     }
 
-    /// Calls the plugin's process() with zero or more timed note events.
-    /// Must be called on the audio thread only. Events must be sorted by
-    /// ascending `time` as required by the CLAP specification. Fills
-    /// `output_buffers` (planar) with the rendered audio.
-    pub fn process(&mut self, frames: u32, events: &[TimedNoteEvent]) -> Result<i32> {
+    /// Calls the plugin's process() with optional input audio and zero or
+    /// more timed note events. Must be called on the audio thread only.
+    /// Events must be sorted by ascending `time` (CLAP requirement).
+    ///
+    /// `input_audio[c]` feeds channel `c` of the plugin's first input port.
+    /// Channels beyond `self.input_channels` are ignored; channels the
+    /// plugin expects but weren't provided are filled with silence.
+    /// Pass an empty slice when processing an instrument (no audio input).
+    ///
+    /// Fills `output_buffers` (planar) with the rendered audio. Any note
+    /// events the plugin emits via `out_events.try_push` are collected into
+    /// `self.collected_out_notes` (drained with `take_out_notes`).
+    pub fn process(
+        &mut self,
+        frames: u32,
+        events: &[TimedNoteEvent],
+        input_audio: &[&[f32]],
+    ) -> Result<i32> {
         anyhow::ensure!(self.processing, "plugin not processing");
 
         self.pending_events.clear();
@@ -439,11 +490,41 @@ impl Plugin {
             e.header.time = ev.time;
             self.pending_events.push(e);
         }
+        self.collected_out_notes.clear();
 
+        // Copy caller-provided audio into our pre-allocated input buffers.
+        // Channels not supplied by the caller are zeroed so the plugin
+        // doesn't see stale data.
+        let n = frames as usize;
+        for (ch, buf) in self.input_buffers.iter_mut().enumerate() {
+            let buf_len = buf.len();
+            let cap = n.min(buf_len);
+            if ch < input_audio.len() {
+                let src = input_audio[ch];
+                let copy_n = cap.min(src.len());
+                buf[..copy_n].copy_from_slice(&src[..copy_n]);
+                if copy_n < cap {
+                    buf[copy_n..cap].fill(0.0);
+                }
+            } else {
+                buf[..cap].fill(0.0);
+            }
+        }
+        for i in 0..self.input_buffers.len() {
+            self.input_ptrs[i] = self.input_buffers[i].as_mut_ptr();
+        }
         // Refresh output channel pointers (buffers are pre-allocated).
         for i in 0..self.output_buffers.len() {
             self.output_ptrs[i] = self.output_buffers[i].as_mut_ptr();
         }
+
+        let audio_in = clap_audio_buffer {
+            data32: self.input_ptrs.as_mut_ptr(),
+            data64: std::ptr::null_mut(),
+            channel_count: self.input_channels,
+            latency: 0,
+            constant_mask: 0,
+        };
         let mut audio_out = clap_audio_buffer {
             data32: self.output_ptrs.as_mut_ptr(),
             data64: std::ptr::null_mut(),
@@ -457,16 +538,30 @@ impl Plugin {
             size: Some(in_events_size),
             get: Some(in_events_get),
         };
-        let out_events = EMPTY_OUTPUT_EVENTS;
+        let out_events = clap_output_events {
+            ctx: std::ptr::from_mut(&mut self.collected_out_notes) as *mut c_void,
+            try_push: Some(collect_out_note_try_push),
+        };
+
+        let (audio_inputs, audio_inputs_count) = if self.input_channels == 0 {
+            (std::ptr::null(), 0)
+        } else {
+            (&raw const audio_in, 1)
+        };
+        let (audio_outputs, audio_outputs_count) = if self.output_channels == 0 {
+            (std::ptr::null_mut(), 0)
+        } else {
+            (&raw mut audio_out, 1)
+        };
 
         let process_ctx = clap_process {
             steady_time: -1,
             frames_count: frames,
             transport: std::ptr::null(),
-            audio_inputs: std::ptr::null(),
-            audio_outputs: &mut audio_out,
-            audio_inputs_count: 0,
-            audio_outputs_count: 1,
+            audio_inputs,
+            audio_outputs,
+            audio_inputs_count,
+            audio_outputs_count,
             in_events: &in_events,
             out_events: &out_events,
         };
@@ -607,16 +702,48 @@ unsafe extern "C" fn stream_read(
     n as i64
 }
 
-// Static output-event vtable. We drop whatever the plugin sends back for now.
-const EMPTY_OUTPUT_EVENTS: clap_output_events = clap_output_events {
-    ctx: std::ptr::null_mut(),
-    try_push: Some(empty_out_try_push),
-};
-
-unsafe extern "C" fn empty_out_try_push(
-    _list: *const clap_output_events,
-    _event: *const clap_event_header,
+/// `try_push` callback for the MIDI FX chain. `ctx` is a
+/// `*mut Vec<TimedNoteEvent>`; we decode `NOTE_ON`/`NOTE_OFF` events and
+/// append them for the next plugin to consume. Unknown types are accepted
+/// (return `true`) but not recorded.
+unsafe extern "C" fn collect_out_note_try_push(
+    list: *const clap_output_events,
+    event: *const clap_event_header,
 ) -> bool {
+    if list.is_null() || event.is_null() {
+        return false;
+    }
+    let ctx = unsafe { (*list).ctx } as *mut Vec<TimedNoteEvent>;
+    if ctx.is_null() {
+        return true;
+    }
+    let header = unsafe { &*event };
+    if header.space_id != CLAP_CORE_EVENT_SPACE_ID {
+        return true;
+    }
+    let transition = match header.type_ {
+        t if t == CLAP_EVENT_NOTE_ON => {
+            let note = unsafe { &*(event as *const clap_event_note) };
+            Some(NoteTransition::On {
+                key: note.key.clamp(0, 127) as u8,
+                velocity: note.velocity,
+            })
+        }
+        t if t == CLAP_EVENT_NOTE_OFF => {
+            let note = unsafe { &*(event as *const clap_event_note) };
+            Some(NoteTransition::Off {
+                key: note.key.clamp(0, 127) as u8,
+            })
+        }
+        _ => None,
+    };
+    if let Some(transition) = transition {
+        let out = unsafe { &mut *ctx };
+        out.push(TimedNoteEvent {
+            time: header.time,
+            event: transition,
+        });
+    }
     true
 }
 
@@ -666,18 +793,40 @@ fn encode_note(transition: NoteTransition) -> clap_event_note {
 }
 
 fn query_output_channel_count(plugin: *const clap_plugin, get_ext: GetExtFn) -> u32 {
+    query_port_channel_count(plugin, get_ext, false)
+}
+
+/// Queries the plugin's first audio port in the given direction. `is_input`
+/// selects input vs output ports. Returns `0` when the plugin declares no
+/// port of that direction (e.g. instrument with no audio input, or pure
+/// note effect with no audio output), so the audio thread can skip routing.
+fn query_port_channel_count(
+    plugin: *const clap_plugin,
+    get_ext: GetExtFn,
+    is_input: bool,
+) -> u32 {
     let ext_ptr =
         unsafe { get_ext(plugin, CLAP_EXT_AUDIO_PORTS.as_ptr()) } as *const clap_plugin_audio_ports;
     if ext_ptr.is_null() {
-        return 2;
+        // Extension missing entirely — assume stereo output, no input.
+        return if is_input { 0 } else { 2 };
     }
-    let Some(get) = (unsafe { &*ext_ptr }).get else {
-        return 2;
+    let ext = unsafe { &*ext_ptr };
+    let count_fn = match ext.count {
+        Some(f) => f,
+        None => return if is_input { 0 } else { 2 },
+    };
+    let port_count = unsafe { count_fn(plugin, is_input) };
+    if port_count == 0 {
+        return 0;
+    }
+    let Some(get) = ext.get else {
+        return if is_input { 0 } else { 2 };
     };
     let mut info = std::mem::MaybeUninit::<clap_audio_port_info>::zeroed();
-    let ok = unsafe { get(plugin, 0, false, info.as_mut_ptr()) };
+    let ok = unsafe { get(plugin, 0, is_input, info.as_mut_ptr()) };
     if !ok {
-        return 2;
+        return if is_input { 0 } else { 2 };
     }
     unsafe { info.assume_init() }.channel_count
 }

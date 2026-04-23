@@ -31,7 +31,7 @@ impl PluginPickerView {
                 .height(Pixels(40.0));
 
                 ScrollView::new(cx, |cx| {
-                    List::new(cx, AppData::plugin_picker_entries, |cx, _idx, item| {
+                    List::new(cx, AppData::plugin_picker_visible, |cx, _idx, item| {
                         // Each row: button labelled "Name — Vendor". We set
                         // the button background explicitly so the Vizia
                         // default light theme doesn't wash out the labels.

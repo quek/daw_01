@@ -1,7 +1,7 @@
 mod clap_host;
 mod plugin;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
@@ -47,76 +47,95 @@ impl PlaybackCommand {
 /// loop after a command has been pushed into the mpsc queue.
 const WM_COMMAND_WAKE: u32 = WM_APP + 1;
 
-/// Events pushed from the plugin-main thread (or its CLAP callbacks) to the
-/// IPC sender so they can be relayed to daw_gui as `ChildToMain`.
-///
-/// MVP: all events are tagged with `(track=0, slot=Instrument)` since
-/// plugin_host currently hosts a single implicit plugin. Per-track
-/// addressing lands in a follow-up commit.
+/// Slot-addressed events pushed from the plugin-main thread (or its CLAP
+/// callbacks) to the IPC sender. MVP: track is always 0 until the GUI adds
+/// track-addressing; protocol is already shaped for it.
 #[derive(Debug, Clone)]
 pub enum PluginEvent {
-    GuiOpened { width: u32, height: u32 },
-    GuiRequestResize { width: u32, height: u32 },
-    GuiClosed,
-    PluginLoaded { id: String, name: String },
-    PluginState(Option<Vec<u8>>),
+    SlotGuiOpened {
+        slot: common::protocol::PluginSlot,
+        width: u32,
+        height: u32,
+    },
+    SlotGuiRequestResize {
+        slot: common::protocol::PluginSlot,
+        width: u32,
+        height: u32,
+    },
+    SlotGuiClosed {
+        slot: common::protocol::PluginSlot,
+    },
+    SlotPluginLoaded {
+        slot: common::protocol::PluginSlot,
+        id: String,
+        name: String,
+    },
+    SlotPluginState {
+        slot: common::protocol::PluginSlot,
+        data: Option<Vec<u8>>,
+    },
+    AllPluginStates {
+        entries: Vec<common::protocol::SlotState>,
+    },
 }
 
 impl From<PluginEvent> for ChildToMain {
     fn from(e: PluginEvent) -> Self {
-        // TODO: route per-track once plugin_host keeps per-track chains.
         let track = 0;
-        let slot = common::protocol::PluginSlot::Instrument;
         match e {
-            PluginEvent::GuiOpened { width, height } => ChildToMain::SlotGuiOpened {
-                track,
-                slot,
-                width,
-                height,
-            },
-            PluginEvent::GuiRequestResize { width, height } => {
-                ChildToMain::SlotGuiRequestResize {
-                    track,
-                    slot,
-                    width,
-                    height,
-                }
+            PluginEvent::SlotGuiOpened { slot, width, height } => {
+                ChildToMain::SlotGuiOpened { track, slot, width, height }
             }
-            PluginEvent::GuiClosed => ChildToMain::SlotGuiClosed { track, slot },
-            PluginEvent::PluginLoaded { id, name } => ChildToMain::SlotPluginLoaded {
-                track,
-                slot,
-                id,
-                name,
-            },
-            PluginEvent::PluginState(data) => ChildToMain::SlotPluginState {
-                track,
-                slot,
-                data,
-            },
+            PluginEvent::SlotGuiRequestResize { slot, width, height } => {
+                ChildToMain::SlotGuiRequestResize { track, slot, width, height }
+            }
+            PluginEvent::SlotGuiClosed { slot } => ChildToMain::SlotGuiClosed { track, slot },
+            PluginEvent::SlotPluginLoaded { slot, id, name } => {
+                ChildToMain::SlotPluginLoaded { track, slot, id, name }
+            }
+            PluginEvent::SlotPluginState { slot, data } => {
+                ChildToMain::SlotPluginState { track, slot, data }
+            }
+            PluginEvent::AllPluginStates { entries } => ChildToMain::AllPluginStates { entries },
         }
     }
 }
 
 /// Commands processed serially on the plugin-main thread.
 enum PluginCommand {
-    SetClap {
+    SetSlotPlugin {
+        slot: common::protocol::PluginSlot,
         path: PathBuf,
-        /// Stable CLAP id; empty string means "first descriptor in the file"
-        /// (backward-compatible ad-hoc load).
         plugin_id: String,
-        /// Optional initial state to restore right after activate via
-        /// `clap_plugin_state.load`.
         initial_state: Option<Vec<u8>>,
+    },
+    RemoveSlotPlugin {
+        slot: common::protocol::PluginSlot,
+    },
+    MoveSlot {
+        from: common::protocol::PluginSlot,
+        to: common::protocol::PluginSlot,
     },
     LoadSong(Song),
     Play,
     Stop,
     SetLoop(bool),
-    RequestState,
-    OpenGuiEmbedded { host_hwnd: u64 },
-    CloseGui,
-    ResizeGui { width: u32, height: u32 },
+    RequestSlotState {
+        slot: common::protocol::PluginSlot,
+    },
+    RequestAllStates,
+    OpenSlotGui {
+        slot: common::protocol::PluginSlot,
+        host_hwnd: u64,
+    },
+    CloseSlotGui {
+        slot: common::protocol::PluginSlot,
+    },
+    ResizeSlotGui {
+        slot: common::protocol::PluginSlot,
+        width: u32,
+        height: u32,
+    },
     Shutdown,
 }
 
@@ -229,16 +248,17 @@ fn plugin_main_loop(
     let playback_state = Arc::new(AtomicU8::new(PlaybackCommand::Stop as u8));
     let song_store: Arc<ArcSwapOption<Song>> = Arc::new(ArcSwapOption::from(None));
     let loop_state = Arc::new(AtomicBool::new(false));
-    let mut audio_handle: Option<AudioHandle> = None;
+    let mut chain = ChainHandle::new();
 
-    // Build the host-side GUI callbacks once; they capture a clone of the
-    // outbound event sender so the plugin's call-backs translate directly
-    // into `ChildToMain` messages to daw_gui.
-    let make_callbacks = || HostCallbacks {
+    // Per-slot host callbacks: each loaded plugin captures its slot so the
+    // async CLAP callback (request_resize / closed) can stamp the event
+    // with the correct slot before reaching daw_gui.
+    let make_callbacks = |slot: common::protocol::PluginSlot| HostCallbacks {
         on_request_resize: {
             let tx = evt_tx.clone();
             Arc::new(move |w, h| {
-                let _ = tx.send(PluginEvent::GuiRequestResize {
+                let _ = tx.send(PluginEvent::SlotGuiRequestResize {
+                    slot,
                     width: w,
                     height: h,
                 });
@@ -247,7 +267,7 @@ fn plugin_main_loop(
         on_closed: {
             let tx = evt_tx.clone();
             Arc::new(move || {
-                let _ = tx.send(PluginEvent::GuiClosed);
+                let _ = tx.send(PluginEvent::SlotGuiClosed { slot });
             })
         },
     };
@@ -260,36 +280,77 @@ fn plugin_main_loop(
                 Ok(c) => c,
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    if let Some(h) = audio_handle.take() {
-                        h.shutdown();
-                    }
+                    chain.shutdown();
                     return;
                 }
             };
             match cmd {
                 PluginCommand::Shutdown => {
-                    if let Some(h) = audio_handle.take() {
-                        h.shutdown();
-                    }
+                    chain.shutdown();
                     tracing::info!("plugin-main thread exiting");
                     return;
                 }
-                PluginCommand::SetClap {
+                PluginCommand::SetSlotPlugin {
+                    slot,
                     path,
                     plugin_id,
                     initial_state,
-                } => swap_plugin(
-                    &path,
-                    &plugin_id,
-                    initial_state.as_deref(),
-                    &session,
-                    Arc::clone(&playback_state),
-                    Arc::clone(&song_store),
-                    Arc::clone(&loop_state),
-                    make_callbacks(),
-                    &mut audio_handle,
-                    &evt_tx,
-                ),
+                } => {
+                    playback_state.store(PlaybackCommand::Stop as u8, Ordering::Release);
+                    let callbacks = make_callbacks(slot);
+                    match Plugin::load(&path, &plugin_id, callbacks) {
+                        Ok(plugin) => {
+                            if let Some(bytes) = initial_state
+                                && let Err(e) = plugin.state_load(&bytes)
+                            {
+                                tracing::error!(error = ?e, "state_load failed");
+                            }
+                            let loaded_id = plugin.id().to_string();
+                            let loaded_name = plugin.name().to_string();
+                            let result = chain.mutate_chain(
+                                &session,
+                                &playback_state,
+                                &song_store,
+                                &loop_state,
+                                |c| install_plugin(c, slot, plugin),
+                            );
+                            if let Err(e) = result {
+                                tracing::error!(error = ?e, ?slot, "failed to install plugin");
+                            } else {
+                                let _ = evt_tx.send(PluginEvent::SlotPluginLoaded {
+                                    slot,
+                                    id: loaded_id,
+                                    name: loaded_name,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(error = ?e, path = %path.display(), "load failed");
+                        }
+                    }
+                }
+                PluginCommand::RemoveSlotPlugin { slot } => {
+                    let _ = chain.mutate_chain(
+                        &session,
+                        &playback_state,
+                        &song_store,
+                        &loop_state,
+                        |c| {
+                            remove_plugin(c, slot);
+                        },
+                    );
+                }
+                PluginCommand::MoveSlot { from, to } => {
+                    let _ = chain.mutate_chain(
+                        &session,
+                        &playback_state,
+                        &song_store,
+                        &loop_state,
+                        |c| {
+                            move_plugin(c, from, to);
+                        },
+                    );
+                }
                 PluginCommand::LoadSong(song) => {
                     tracing::info!(bpm = song.bpm, tracks = song.tracks.len(), "LoadSong");
                     song_store.store(Some(Arc::new(song)));
@@ -303,9 +364,9 @@ fn plugin_main_loop(
                 PluginCommand::SetLoop(on) => {
                     loop_state.store(on, Ordering::Release);
                 }
-                PluginCommand::RequestState => {
-                    let state = match audio_handle.as_mut() {
-                        Some(h) => match h.plugin_mut().state_save() {
+                PluginCommand::RequestSlotState { slot } => {
+                    let data = match chain.plugin_at_mut(slot) {
+                        Some(plugin) => match plugin.state_save() {
                             Ok(s) => s,
                             Err(e) => {
                                 tracing::error!(error = ?e, "state_save failed");
@@ -314,40 +375,41 @@ fn plugin_main_loop(
                         },
                         None => None,
                     };
-                    let _ = evt_tx.send(PluginEvent::PluginState(state));
+                    let _ = evt_tx.send(PluginEvent::SlotPluginState { slot, data });
                 }
-                PluginCommand::OpenGuiEmbedded { host_hwnd } => {
-                    match open_gui(&mut audio_handle, host_hwnd) {
+                PluginCommand::RequestAllStates => {
+                    let entries = collect_all_states(&mut chain);
+                    let _ = evt_tx.send(PluginEvent::AllPluginStates { entries });
+                }
+                PluginCommand::OpenSlotGui { slot, host_hwnd } => {
+                    match open_gui(&mut chain, slot, host_hwnd) {
                         Ok(Some((w, h))) => {
-                            let _ = evt_tx.send(PluginEvent::GuiOpened {
+                            let _ = evt_tx.send(PluginEvent::SlotGuiOpened {
+                                slot,
                                 width: w,
                                 height: h,
                             });
                         }
                         Ok(None) => {
-                            tracing::warn!("plugin has no GUI or no plugin loaded; ignored");
-                            // Tell daw_gui to reset the "GUI is open" UI state.
-                            let _ = evt_tx.send(PluginEvent::GuiClosed);
+                            let _ = evt_tx.send(PluginEvent::SlotGuiClosed { slot });
                         }
                         Err(e) => {
-                            tracing::error!(error = ?e, "failed to open plugin GUI");
-                            // Roll back any partial create() so the next
-                            // attempt starts clean, and notify daw_gui.
-                            close_gui(&mut audio_handle);
-                            let _ = evt_tx.send(PluginEvent::GuiClosed);
+                            tracing::error!(error = ?e, ?slot, "failed to open GUI");
+                            close_gui(&mut chain, slot);
+                            let _ = evt_tx.send(PluginEvent::SlotGuiClosed { slot });
                         }
                     }
                 }
-                PluginCommand::CloseGui => {
-                    close_gui(&mut audio_handle);
-                    // Always ack: daw_gui may be in the "open" state locally
-                    // even when the plugin-host side never successfully
-                    // created a GUI (e.g. after the ✕ button hid the
-                    // container window, or after a failed show).
-                    let _ = evt_tx.send(PluginEvent::GuiClosed);
+                PluginCommand::CloseSlotGui { slot } => {
+                    close_gui(&mut chain, slot);
+                    let _ = evt_tx.send(PluginEvent::SlotGuiClosed { slot });
                 }
-                PluginCommand::ResizeGui { width, height } => {
-                    resize_gui(&mut audio_handle, width, height);
+                PluginCommand::ResizeSlotGui {
+                    slot,
+                    width,
+                    height,
+                } => {
+                    resize_gui(&mut chain, slot, width, height);
                 }
             }
         }
@@ -365,20 +427,108 @@ fn plugin_main_loop(
         }
     }
 
-    if let Some(h) = audio_handle.take() {
-        h.shutdown();
-    }
+    chain.shutdown();
     tracing::info!("plugin-main thread exiting (WM_QUIT)");
 }
 
+/// Place `plugin` into the slot, replacing any previous occupant. Audio
+/// thread is stopped by the caller (via `mutate_chain`).
+fn install_plugin(chain: &mut Chain, slot: common::protocol::PluginSlot, plugin: Plugin) {
+    use common::protocol::PluginSlot;
+    match slot {
+        PluginSlot::Instrument => {
+            if let Some(mut old) = chain.instrument.replace(plugin) {
+                old.gui_destroy();
+            }
+        }
+        PluginSlot::Fx(i) => {
+            let i = i as usize;
+            if i < chain.fx_chain.len() {
+                if let Some(old) = chain.fx_chain.get_mut(i) {
+                    old.gui_destroy();
+                }
+                chain.fx_chain[i] = plugin;
+            } else {
+                // Append — users add to the tail.
+                chain.fx_chain.push(plugin);
+            }
+        }
+        PluginSlot::MidiFx(_) => {
+            tracing::warn!("MIDI FX chain not wired in audio thread yet; ignored");
+        }
+    }
+}
+
+fn remove_plugin(chain: &mut Chain, slot: common::protocol::PluginSlot) {
+    use common::protocol::PluginSlot;
+    match slot {
+        PluginSlot::Instrument => {
+            if let Some(mut old) = chain.instrument.take() {
+                old.gui_destroy();
+            }
+        }
+        PluginSlot::Fx(i) => {
+            let i = i as usize;
+            if i < chain.fx_chain.len() {
+                let mut old = chain.fx_chain.remove(i);
+                old.gui_destroy();
+            }
+        }
+        PluginSlot::MidiFx(_) => {}
+    }
+}
+
+fn move_plugin(
+    chain: &mut Chain,
+    from: common::protocol::PluginSlot,
+    to: common::protocol::PluginSlot,
+) {
+    use common::protocol::PluginSlot;
+    // Only Fx↔Fx reorder is supported for MVP.
+    if let (PluginSlot::Fx(a), PluginSlot::Fx(b)) = (from, to) {
+        let a = a as usize;
+        let b = b as usize;
+        if a < chain.fx_chain.len() && b < chain.fx_chain.len() && a != b {
+            let plugin = chain.fx_chain.remove(a);
+            chain.fx_chain.insert(b, plugin);
+        }
+    }
+}
+
+fn collect_all_states(chain: &mut ChainHandle) -> Vec<common::protocol::SlotState> {
+    use common::protocol::{PluginSlot, SlotState};
+    let mut out = Vec::new();
+    if let Some(plugin) = chain.plugin_at_mut(PluginSlot::Instrument) {
+        let data = plugin.state_save().ok().flatten();
+        out.push(SlotState {
+            track: 0,
+            slot: PluginSlot::Instrument,
+            data,
+        });
+    }
+    let fx_count = chain.chain.fx_chain.len();
+    for i in 0..fx_count {
+        let slot = PluginSlot::Fx(i as u32);
+        if let Some(plugin) = chain.plugin_at_mut(slot) {
+            let data = plugin.state_save().ok().flatten();
+            out.push(SlotState {
+                track: 0,
+                slot,
+                data,
+            });
+        }
+    }
+    out
+}
+
 fn open_gui(
-    audio_handle: &mut Option<AudioHandle>,
+    chain: &mut ChainHandle,
+    slot: common::protocol::PluginSlot,
     host_hwnd: u64,
 ) -> Result<Option<(u32, u32)>> {
-    let Some(h) = audio_handle else {
+    let Some(plugin) = chain.plugin_at_mut(slot) else {
         return Ok(None);
     };
-    let plugin = h.plugin_mut();
     if !plugin.gui_is_embed_supported() {
         tracing::warn!(plugin = %plugin.name(), "plugin does not support embedded win32 gui");
         return Ok(None);
@@ -446,18 +596,21 @@ fn pump_pending_messages() {
     }
 }
 
-fn close_gui(audio_handle: &mut Option<AudioHandle>) {
-    let Some(h) = audio_handle else { return };
-    let plugin = h.plugin_mut();
+fn close_gui(chain: &mut ChainHandle, slot: common::protocol::PluginSlot) {
+    let Some(plugin) = chain.plugin_at_mut(slot) else { return };
     let _ = plugin.gui_hide();
     plugin.gui_destroy();
 }
 
-fn resize_gui(audio_handle: &mut Option<AudioHandle>, width: u32, height: u32) {
-    let Some(h) = audio_handle else { return };
-    let plugin = h.plugin_mut();
+fn resize_gui(
+    chain: &mut ChainHandle,
+    slot: common::protocol::PluginSlot,
+    width: u32,
+    height: u32,
+) {
+    let Some(plugin) = chain.plugin_at_mut(slot) else { return };
     if let Err(e) = plugin.gui_set_size(width, height) {
-        tracing::warn!(error = ?e, width, height, "gui.set_size failed");
+        tracing::warn!(error = ?e, width, height, ?slot, "gui.set_size failed");
     }
 }
 
@@ -509,9 +662,6 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             );
             plugin.send(PluginCommand::LoadSong(song));
         }
-        // Phase A MVP: plugin_host hosts exactly ONE plugin and treats
-        // every (track, slot) as if it addressed the single slot. Per-track
-        // routing comes in Phase B.
         MainToChild::SetSlotPlugin {
             track,
             slot,
@@ -527,27 +677,28 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
                 has_state = initial_state.is_some(),
                 "received SetSlotPlugin"
             );
-            plugin.send(PluginCommand::SetClap {
+            plugin.send(PluginCommand::SetSlotPlugin {
+                slot,
                 path,
                 plugin_id,
                 initial_state,
             });
         }
         MainToChild::RemoveSlotPlugin { track, slot } => {
-            tracing::info!(track, ?slot, "received RemoveSlotPlugin (MVP no-op)");
+            tracing::info!(track, ?slot, "received RemoveSlotPlugin");
+            plugin.send(PluginCommand::RemoveSlotPlugin { slot });
         }
         MainToChild::MoveSlot { track, from, to } => {
-            tracing::info!(track, ?from, ?to, "received MoveSlot (MVP no-op)");
+            tracing::info!(track, ?from, ?to, "received MoveSlot");
+            plugin.send(PluginCommand::MoveSlot { from, to });
         }
         MainToChild::RequestSlotState { track, slot } => {
             tracing::info!(track, ?slot, "received RequestSlotState");
-            plugin.send(PluginCommand::RequestState);
+            plugin.send(PluginCommand::RequestSlotState { slot });
         }
         MainToChild::RequestAllStates => {
             tracing::info!("received RequestAllStates");
-            // Phase A: forward as a single-slot state request; the reply
-            // wraps one entry for track 0 / Instrument.
-            plugin.send(PluginCommand::RequestState);
+            plugin.send(PluginCommand::RequestAllStates);
         }
         MainToChild::SetLoop(on) => {
             tracing::info!(on, "received SetLoop");
@@ -559,11 +710,11 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             host_hwnd,
         } => {
             tracing::info!(track, ?slot, host_hwnd, "received OpenSlotGuiEmbedded");
-            plugin.send(PluginCommand::OpenGuiEmbedded { host_hwnd });
+            plugin.send(PluginCommand::OpenSlotGui { slot, host_hwnd });
         }
         MainToChild::CloseSlotGui { track, slot } => {
             tracing::info!(track, ?slot, "received CloseSlotGui");
-            plugin.send(PluginCommand::CloseGui);
+            plugin.send(PluginCommand::CloseSlotGui { slot });
         }
         MainToChild::ResizeSlotGui {
             track,
@@ -572,7 +723,11 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             height,
         } => {
             tracing::info!(track, ?slot, width, height, "received ResizeSlotGui");
-            plugin.send(PluginCommand::ResizeGui { width, height });
+            plugin.send(PluginCommand::ResizeSlotGui {
+                slot,
+                width,
+                height,
+            });
         }
         other => {
             tracing::info!(?other, "received (no handler)");
@@ -580,129 +735,212 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
     }
 }
 
-// --- AudioHandle: main-thread-owned Plugin, raw ptr for audio thread -----
+// --- Chain + audio thread ------------------------------------------------
 
-/// Wraps a raw `*mut Plugin` so it can be sent into the audio thread closure.
+/// Wraps a raw pointer so it can be moved into the audio thread closure.
 /// The CLAP spec partitions plugin state between main-thread and audio-thread,
 /// so simultaneous main-thread GUI calls and audio-thread `process()` calls
 /// touch disjoint fields (this assumes plugins conform to the spec).
 struct PluginPtr(*mut Plugin);
 unsafe impl Send for PluginPtr {}
 
-/// RAII handle for the audio thread. `shutdown()` joins the thread and
-/// deactivates the plugin on the main thread before it is dropped.
-struct AudioHandle {
+/// Per-track signal chain owned on the plugin-main thread. The audio thread
+/// receives raw pointer snapshots at spawn time (see [`AudioRouting`]).
+///
+/// `Plugin` is stored by value; self-referential pointers inside it (the
+/// host's `clap_host` address passed to `create_plugin`) live in the `Box<Host>`
+/// it owns, so moving the `Plugin` between `Vec` reallocations is safe. The
+/// audio thread's raw pointers are always refreshed during `start_audio`.
+#[derive(Default)]
+struct Chain {
+    /// Instrument slot (note→audio). `None` = no instrument loaded on the
+    /// track; audio thread produces silence at the instrument stage.
+    instrument: Option<Plugin>,
+    /// Audio effects applied in order after the instrument.
+    fx_chain: Vec<Plugin>,
+}
+
+impl Chain {
+    fn plugin_at_mut(&mut self, slot: common::protocol::PluginSlot) -> Option<&mut Plugin> {
+        use common::protocol::PluginSlot;
+        match slot {
+            PluginSlot::Instrument => self.instrument.as_mut(),
+            PluginSlot::Fx(i) => self.fx_chain.get_mut(i as usize),
+            PluginSlot::MidiFx(_) => None, // Phase B: audio routing only covers FX
+        }
+    }
+}
+
+/// Plain-pointer snapshot of the chain handed to the audio thread. Valid as
+/// long as the chain is not mutated (which first triggers an audio-thread
+/// stop + restart on the main side).
+struct AudioRouting {
+    instrument: Option<PluginPtr>,
+    fx_chain: Vec<PluginPtr>,
+}
+
+/// RAII owner for a track's signal chain plus its audio thread. Any chain
+/// mutation (set/remove/move a slot) goes through the helper methods which
+/// stop + restart the audio thread so the raw pointers stay valid.
+struct ChainHandle {
+    chain: Chain,
+    audio: Option<AudioThread>,
+}
+
+struct AudioThread {
     handle: Option<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
     request_sem: Arc<Semaphore>,
-    /// Plugin owned on the main (plugin-main) thread; a raw `*mut Plugin`
-    /// is shared with the audio thread for `process()` only.
-    plugin: Box<Plugin>,
 }
 
-impl AudioHandle {
-    fn plugin_mut(&mut self) -> &mut Plugin {
-        &mut self.plugin
+impl ChainHandle {
+    fn new() -> Self {
+        Self {
+            chain: Chain::default(),
+            audio: None,
+        }
+    }
+
+    fn plugin_at_mut(&mut self, slot: common::protocol::PluginSlot) -> Option<&mut Plugin> {
+        self.chain.plugin_at_mut(slot)
+    }
+
+    /// Stop the audio thread, run `f` to mutate the chain on the main
+    /// thread, and restart the audio thread with the new routing.
+    fn mutate_chain<F>(
+        &mut self,
+        session: &AudioSession,
+        playback_state: &Arc<AtomicU8>,
+        song_store: &Arc<ArcSwapOption<Song>>,
+        loop_state: &Arc<AtomicBool>,
+        f: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut Chain),
+    {
+        self.stop_audio();
+        f(&mut self.chain);
+        self.start_audio(session, playback_state, song_store, loop_state)
+    }
+
+    fn stop_audio(&mut self) {
+        let Some(mut at) = self.audio.take() else {
+            return;
+        };
+        at.shutdown.store(true, Ordering::Release);
+        let _ = at.request_sem.release();
+        if let Some(handle) = at.handle.take()
+            && handle.join().is_err()
+        {
+            tracing::error!("audio thread panicked");
+        }
+        // Safe to touch plugins again now that the audio thread has exited.
+        if let Some(inst) = self.chain.instrument.as_mut() {
+            inst.deactivate();
+        }
+        for fx in &mut self.chain.fx_chain {
+            fx.deactivate();
+        }
+    }
+
+    fn start_audio(
+        &mut self,
+        session: &AudioSession,
+        playback_state: &Arc<AtomicU8>,
+        song_store: &Arc<ArcSwapOption<Song>>,
+        loop_state: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        // (Re-)activate every plugin — the previous stop_audio deactivated
+        // them to keep the main-thread invariant clean.
+        for plugin in self
+            .chain
+            .instrument
+            .iter_mut()
+            .chain(self.chain.fx_chain.iter_mut())
+        {
+            plugin
+                .activate(f64::from(session.sample_rate), 64, session.max_frames)
+                .context("plugin.activate failed")?;
+        }
+
+        let routing = AudioRouting {
+            instrument: self
+                .chain
+                .instrument
+                .as_mut()
+                .map(|p| PluginPtr(&raw mut *p)),
+            fx_chain: self
+                .chain
+                .fx_chain
+                .iter_mut()
+                .map(|p| PluginPtr(&raw mut *p))
+                .collect(),
+        };
+
+        let bridge = Arc::new(
+            AudioBridgeHandle::open(&session.shmem_id)
+                .context("failed to open audio shmem")?,
+        );
+        let request_sem = Arc::new(
+            Semaphore::open(&session.request_sem_id)
+                .context("failed to open request semaphore")?,
+        );
+        let ready_sem = Arc::new(
+            Semaphore::open(&session.ready_sem_id)
+                .context("failed to open ready semaphore")?,
+        );
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let th_bridge = Arc::clone(&bridge);
+        let th_req = Arc::clone(&request_sem);
+        let th_ready = Arc::clone(&ready_sem);
+        let th_shutdown = Arc::clone(&shutdown);
+        let th_playback = Arc::clone(playback_state);
+        let th_song = Arc::clone(song_store);
+        let th_loop = Arc::clone(loop_state);
+        let th_sample_rate = session.sample_rate;
+
+        let handle = std::thread::Builder::new()
+            .name("clap-audio".into())
+            .spawn(move || {
+                run_audio(
+                    routing,
+                    th_bridge,
+                    th_req,
+                    th_ready,
+                    th_shutdown,
+                    th_playback,
+                    th_song,
+                    th_loop,
+                    th_sample_rate,
+                );
+            })
+            .context("failed to spawn audio thread")?;
+
+        self.audio = Some(AudioThread {
+            handle: Some(handle),
+            shutdown,
+            request_sem,
+        });
+        Ok(())
     }
 
     fn shutdown(mut self) {
-        self.shutdown.store(true, Ordering::Release);
-        let _ = self.request_sem.release();
-
-        if let Some(handle) = self.handle.take() {
-            match handle.join() {
-                Ok(()) => {}
-                Err(_) => tracing::error!("audio thread panicked"),
-            }
+        self.stop_audio();
+        // Drop plugins on the main thread after stopping audio.
+        if let Some(mut inst) = self.chain.instrument.take() {
+            inst.gui_destroy();
         }
-        // Audio thread has exited; tear down plugin on this (main) thread.
-        self.plugin.gui_destroy();
-        self.plugin.deactivate();
-        // drop(self.plugin) runs on this thread
+        for fx in &mut self.chain.fx_chain {
+            fx.gui_destroy();
+        }
+        // Box<Plugin>s drop here, running `Plugin::drop` on the main thread.
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn load_and_spawn(
-    path: &Path,
-    plugin_id: &str,
-    initial_state: Option<&[u8]>,
-    session: &AudioSession,
-    playback_state: Arc<AtomicU8>,
-    song_store: Arc<ArcSwapOption<Song>>,
-    loop_state: Arc<AtomicBool>,
-    callbacks: HostCallbacks,
-) -> Result<AudioHandle> {
-    let mut plugin = Plugin::load(path, plugin_id, callbacks).context("failed to load plugin")?;
-    plugin
-        .activate(f64::from(session.sample_rate), 64, session.max_frames)
-        .context("plugin.activate failed")?;
-    // Apply any persisted state before processing starts.
-    if let Some(bytes) = initial_state
-        && let Err(e) = plugin.state_load(bytes)
-    {
-        tracing::error!(error = ?e, "failed to restore plugin state (continuing)");
-    }
-    spawn_audio_thread(Box::new(plugin), session, playback_state, song_store, loop_state)
-}
-
-fn spawn_audio_thread(
-    mut plugin: Box<Plugin>,
-    session: &AudioSession,
-    playback_state: Arc<AtomicU8>,
-    song_store: Arc<ArcSwapOption<Song>>,
-    loop_state: Arc<AtomicBool>,
-) -> Result<AudioHandle> {
-    let bridge = Arc::new(
-        AudioBridgeHandle::open(&session.shmem_id).context("failed to open audio shmem")?,
-    );
-    let request_sem = Arc::new(
-        Semaphore::open(&session.request_sem_id).context("failed to open request semaphore")?,
-    );
-    let ready_sem = Arc::new(
-        Semaphore::open(&session.ready_sem_id).context("failed to open ready semaphore")?,
-    );
-    let shutdown = Arc::new(AtomicBool::new(false));
-
-    // Stable raw pointer to the heap allocation. Valid as long as `plugin`
-    // Box (held in the returned AudioHandle) lives, which we guarantee by
-    // joining the audio thread before dropping the AudioHandle.
-    let plugin_ptr = PluginPtr(&mut *plugin as *mut Plugin);
-
-    let th_bridge = Arc::clone(&bridge);
-    let th_req = Arc::clone(&request_sem);
-    let th_ready = Arc::clone(&ready_sem);
-    let th_shutdown = Arc::clone(&shutdown);
-    let th_sample_rate = session.sample_rate;
-
-    let handle = std::thread::Builder::new()
-        .name("clap-audio".into())
-        .spawn(move || {
-            run_audio(
-                plugin_ptr,
-                th_bridge,
-                th_req,
-                th_ready,
-                th_shutdown,
-                playback_state,
-                song_store,
-                loop_state,
-                th_sample_rate,
-            );
-        })
-        .context("failed to spawn audio thread")?;
-
-    Ok(AudioHandle {
-        handle: Some(handle),
-        shutdown,
-        request_sem,
-        plugin,
-    })
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_audio(
-    plugin_ptr: PluginPtr,
+    routing: AudioRouting,
     bridge: Arc<AudioBridgeHandle>,
     request_sem: Arc<Semaphore>,
     ready_sem: Arc<Semaphore>,
@@ -712,14 +950,31 @@ fn run_audio(
     loop_state: Arc<AtomicBool>,
     sample_rate: u32,
 ) {
-    // SAFETY: the main thread guarantees the Plugin Box outlives this thread
-    // via `AudioHandle::shutdown()`.
-    let plugin: &mut Plugin = unsafe { &mut *plugin_ptr.0 };
+    // SAFETY: the main thread guarantees every Plugin Box outlives this
+    // thread via `ChainHandle::stop_audio()`.
+    let fx_ptrs: Vec<*mut Plugin> = routing.fx_chain.iter().map(|p| p.0).collect();
 
-    if let Err(e) = plugin.start_processing() {
-        tracing::error!(error = ?e, "plugin.start_processing failed");
-        return;
+    if let Some(inst_ptr) = routing.instrument.as_ref() {
+        let inst = unsafe { &mut *inst_ptr.0 };
+        if let Err(e) = inst.start_processing() {
+            tracing::error!(error = ?e, "instrument.start_processing failed");
+            return;
+        }
     }
+    for fx_ptr in &fx_ptrs {
+        let fx = unsafe { &mut **fx_ptr };
+        if let Err(e) = fx.start_processing() {
+            tracing::error!(error = ?e, "fx.start_processing failed");
+        }
+    }
+
+    // Pre-allocated ping-pong buffers for the FX chain. Each chain step
+    // writes into the next plugin's input; we avoid borrow-checker fights
+    // between successive plugins by first copying the previous output into
+    // `bus_*`, then passing `&bus_*` as the FX's input audio.
+    let max_frames = common::audio_bridge::MAX_FRAMES as usize;
+    let mut bus_l: Vec<f32> = vec![0.0; max_frames];
+    let mut bus_r: Vec<f32> = vec![0.0; max_frames];
 
     let out_channels = CHANNELS as usize;
     let mut playing = false;
@@ -806,32 +1061,58 @@ fn run_audio(
             }
         }
 
-        if let Err(e) = plugin.process(frames, &scheduled) {
-            tracing::error!(error = ?e, "plugin.process failed");
-            break;
+        // --- Chain processing ------------------------------------------
+        // 1. Instrument: produces audio from note events; no audio input.
+        let n = frames as usize;
+        let mut have_audio = false;
+        if let Some(inst_ptr) = routing.instrument.as_ref() {
+            let inst = unsafe { &mut *inst_ptr.0 };
+            if let Err(e) = inst.process(frames, &scheduled, &[]) {
+                tracing::error!(error = ?e, "instrument.process failed");
+                break;
+            }
+            if let Some(l) = inst.output_buffer(0) {
+                bus_l[..n].copy_from_slice(&l[..n]);
+                have_audio = true;
+            }
+            let right = inst.output_buffer(1).or(inst.output_buffer(0));
+            if let Some(r) = right {
+                bus_r[..n].copy_from_slice(&r[..n]);
+            }
+        }
+        if !have_audio {
+            bus_l[..n].fill(0.0);
+            bus_r[..n].fill(0.0);
         }
         scheduled.clear();
+
+        // 2. FX chain: each effect reads bus_* and writes new audio. We
+        //    reborrow via raw pointer to sidestep the borrow checker for
+        //    the read-then-copy-back pattern.
+        for fx_ptr in &fx_ptrs {
+            let fx = unsafe { &mut **fx_ptr };
+            let input_channels = [&bus_l[..n], &bus_r[..n]];
+            if let Err(e) = fx.process(frames, &[], &input_channels) {
+                tracing::error!(error = ?e, "fx.process failed");
+                break;
+            }
+            if let Some(l) = fx.output_buffer(0) {
+                bus_l[..n].copy_from_slice(&l[..n]);
+            }
+            if let Some(r) = fx.output_buffer(1).or(fx.output_buffer(0)) {
+                bus_r[..n].copy_from_slice(&r[..n]);
+            }
+        }
 
         let published = if playing { playhead } else { u64::MAX };
         bridge.set_playhead_samples(published);
 
-        let n = frames as usize;
-        let left = plugin.output_buffer(0);
-        let right = plugin.output_buffer(1).or(left);
+        // 3. Copy final bus to shmem (interleaved stereo).
         unsafe {
             let dst = bridge.samples_ptr();
-            match (left, right) {
-                (Some(l), Some(r)) => {
-                    for i in 0..n {
-                        *dst.add(i * out_channels) = l[i];
-                        *dst.add(i * out_channels + 1) = r[i];
-                    }
-                }
-                _ => {
-                    for i in 0..n * out_channels {
-                        *dst.add(i) = 0.0;
-                    }
-                }
+            for i in 0..n {
+                *dst.add(i * out_channels) = bus_l[i];
+                *dst.add(i * out_channels + 1) = bus_r[i];
             }
         }
 
@@ -840,55 +1121,16 @@ fn run_audio(
             break;
         }
     }
-    plugin.stop_processing();
+
+    // Stop every plugin before returning; main thread's deactivate will
+    // follow once it joins this thread.
+    if let Some(inst_ptr) = routing.instrument.as_ref() {
+        unsafe { &mut *inst_ptr.0 }.stop_processing();
+    }
+    for fx_ptr in &fx_ptrs {
+        unsafe { &mut **fx_ptr }.stop_processing();
+    }
     tracing::info!("audio thread exiting");
-}
-
-#[allow(clippy::too_many_arguments)]
-fn swap_plugin(
-    path: &Path,
-    plugin_id: &str,
-    initial_state: Option<&[u8]>,
-    session: &AudioSession,
-    playback_state: Arc<AtomicU8>,
-    song_store: Arc<ArcSwapOption<Song>>,
-    loop_state: Arc<AtomicBool>,
-    callbacks: HostCallbacks,
-    audio_handle: &mut Option<AudioHandle>,
-    evt_tx: &tmpsc::UnboundedSender<PluginEvent>,
-) {
-    playback_state.store(PlaybackCommand::Stop as u8, Ordering::Release);
-
-    if let Some(h) = audio_handle.take() {
-        h.shutdown();
-    }
-
-    match load_and_spawn(
-        path,
-        plugin_id,
-        initial_state,
-        session,
-        playback_state,
-        song_store,
-        loop_state,
-        callbacks,
-    ) {
-        Ok(mut h) => {
-            // Report the actually loaded plugin id + name so daw_gui can
-            // bind the correct descriptor (vs the one requested).
-            let loaded_id = h.plugin_mut().id().to_string();
-            let loaded_name = h.plugin_mut().name().to_string();
-            *audio_handle = Some(h);
-            tracing::info!(path = %path.display(), id = %loaded_id, "plugin swapped in");
-            let _ = evt_tx.send(PluginEvent::PluginLoaded {
-                id: loaded_id,
-                name: loaded_name,
-            });
-        }
-        Err(e) => {
-            tracing::error!(error = ?e, path = %path.display(), "failed to load plugin");
-        }
-    }
 }
 
 fn collect_events_for_buffer(
