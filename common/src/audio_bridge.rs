@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use shared_memory::{Shmem, ShmemConf};
@@ -12,10 +12,16 @@ pub const SAMPLE_BUFFER_LEN: usize = (MAX_FRAMES * CHANNELS) as usize;
 /// daw_audio populates `frames_requested` then signals the request semaphore;
 /// daw_plugin_host fills `samples` (interleaved stereo) then signals the ready
 /// semaphore.
+///
+/// `playhead_samples` is published by daw_plugin_host at the end of every
+/// buffer so daw_gui can poll it (once per UI tick) for playhead-row
+/// highlighting. It is not part of the ready-semaphore handshake — readers
+/// must tolerate seeing any value.
 #[repr(C)]
 pub struct AudioBridge {
     pub frames_requested: AtomicU32,
     _pad: u32,
+    pub playhead_samples: AtomicU64,
     pub samples: [f32; SAMPLE_BUFFER_LEN],
 }
 
@@ -37,7 +43,11 @@ impl AudioBridgeHandle {
             .with_context(|| format!("failed to create shmem {os_id}"))?;
         // Zero-initialize so the AtomicU32 starts at 0 and samples are silent.
         unsafe { std::ptr::write_bytes(shmem.as_ptr(), 0, AudioBridge::SIZE) };
-        Ok(Self { shmem })
+        let handle = Self { shmem };
+        // Publish the "not playing" sentinel before any reader polls, so the
+        // GUI highlight is off until plugin_host announces a real playhead.
+        handle.set_playhead_samples(u64::MAX);
+        Ok(handle)
     }
 
     pub fn open(os_id: &str) -> Result<Self> {
@@ -73,6 +83,14 @@ impl AudioBridgeHandle {
 
     pub fn frames_requested(&self) -> u32 {
         self.bridge().frames_requested.load(Ordering::Acquire)
+    }
+
+    pub fn set_playhead_samples(&self, n: u64) {
+        self.bridge().playhead_samples.store(n, Ordering::Release);
+    }
+
+    pub fn playhead_samples(&self) -> u64 {
+        self.bridge().playhead_samples.load(Ordering::Acquire)
     }
 }
 

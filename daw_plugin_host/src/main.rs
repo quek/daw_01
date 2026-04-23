@@ -11,6 +11,7 @@ use arc_swap::ArcSwapOption;
 use common::audio_bridge::{AudioBridgeHandle, CHANNELS};
 use common::model::{NoteEvent, Song};
 use common::protocol::{AudioSession, ChildKind, MainToChild};
+use common::timing::{clip_bounds_samples, song_ended};
 use common::win_sem::Semaphore;
 use common::wire::read_msg;
 use tokio::net::windows::named_pipe::NamedPipeClient;
@@ -278,6 +279,12 @@ fn run_audio(
         }
         scheduled.clear();
 
+        // Publish playhead to the GUI (one atomic store per buffer, RT-safe).
+        // `u64::MAX` is the "not playing" sentinel so the GUI can disable the
+        // playhead highlight without polling is_playing separately.
+        let published = if playing { playhead } else { u64::MAX };
+        bridge.set_playhead_samples(published);
+
         // Copy planar plugin output (take first 2 channels) to interleaved shmem.
         let n = frames as usize;
         let left = plugin.output_buffer(0);
@@ -460,122 +467,3 @@ fn collect_events_for_buffer(
     }
 }
 
-/// Returns `(clip_start_samples, clip_end_samples)` for the MVP playback
-/// target (track 0 / clip 0), or `None` if there is nothing playable:
-/// no song, empty track list, missing clip, `bpm <= 0`, or zero-length clip.
-/// The `None` case means "do not loop, do not play": downstream code should
-/// treat it as end-of-song.
-fn clip_bounds_samples(song: Option<&Song>, sample_rate: u32) -> Option<(u64, u64)> {
-    let song = song?;
-    let track = song.tracks.first()?;
-    let clip = track.clips.first()?;
-    if song.bpm <= 0.0 || clip.length_beats <= 0.0 {
-        return None;
-    }
-    let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(song.bpm);
-    let start = (clip.start_beat * samples_per_beat).max(0.0) as u64;
-    let length = (clip.length_beats * samples_per_beat) as u64;
-    if length == 0 {
-        return None;
-    }
-    Some((start, start + length))
-}
-
-fn song_ended(song: Option<&Song>, sample_rate: u32, playhead: u64) -> bool {
-    match clip_bounds_samples(song, sample_rate) {
-        Some((_, end)) => playhead >= end,
-        None => false,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use common::model::{Clip, InstrumentSource, Track};
-
-    fn song_with_clip(bpm: f32, start_beat: f64, length_beats: f64) -> Song {
-        Song {
-            bpm,
-            tracks: vec![Track {
-                name: "T".into(),
-                source: InstrumentSource::BuiltinSynth,
-                fx_chain: vec![],
-                volume: 1.0,
-                pan: 0.0,
-                clips: vec![Clip {
-                    name: "C".into(),
-                    start_beat,
-                    length_beats,
-                    rows_per_beat: 4,
-                    rows: vec![],
-                }],
-            }],
-            ..Song::default()
-        }
-    }
-
-    #[test]
-    fn clip_bounds_none_for_no_song() {
-        assert_eq!(clip_bounds_samples(None, 48000), None);
-    }
-
-    #[test]
-    fn clip_bounds_none_for_empty_tracks() {
-        let song = Song::default();
-        assert_eq!(clip_bounds_samples(Some(&song), 48000), None);
-    }
-
-    #[test]
-    fn clip_bounds_none_for_zero_bpm() {
-        let song = song_with_clip(0.0, 0.0, 4.0);
-        assert_eq!(clip_bounds_samples(Some(&song), 48000), None);
-    }
-
-    #[test]
-    fn clip_bounds_none_for_zero_length_clip() {
-        let song = song_with_clip(120.0, 0.0, 0.0);
-        assert_eq!(clip_bounds_samples(Some(&song), 48000), None);
-    }
-
-    #[test]
-    fn clip_bounds_standard_clip() {
-        // 120 BPM, 48 kHz: 1 beat = 24000 samples; 4 beats = 96000 samples.
-        let song = song_with_clip(120.0, 0.0, 4.0);
-        assert_eq!(
-            clip_bounds_samples(Some(&song), 48000),
-            Some((0, 96_000))
-        );
-    }
-
-    #[test]
-    fn clip_bounds_with_offset() {
-        // Start at beat 2 → 48000 samples in; length 4 beats → end at 144000.
-        let song = song_with_clip(120.0, 2.0, 4.0);
-        assert_eq!(
-            clip_bounds_samples(Some(&song), 48000),
-            Some((48_000, 144_000))
-        );
-    }
-
-    #[test]
-    fn song_ended_never_triggers_with_no_song() {
-        assert!(!song_ended(None, 48000, 0));
-        assert!(!song_ended(None, 48000, u64::MAX));
-    }
-
-    #[test]
-    fn song_ended_after_clip_end() {
-        let song = song_with_clip(120.0, 0.0, 4.0);
-        assert!(!song_ended(Some(&song), 48000, 95_999));
-        assert!(song_ended(Some(&song), 48000, 96_000));
-        assert!(song_ended(Some(&song), 48000, 96_001));
-    }
-
-    #[test]
-    fn song_ended_treats_zero_length_as_not_ended() {
-        // With no valid bounds we can't "end"; recv_loop should simply not
-        // enter playback mode, but the audio thread must not flip to stop.
-        let song = song_with_clip(120.0, 0.0, 0.0);
-        assert!(!song_ended(Some(&song), 48000, 1_000_000));
-    }
-}

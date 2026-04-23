@@ -11,9 +11,14 @@ pub struct AppData {
     pub file_path: Option<PathBuf>,
     pub cursor_row: u32,
     pub cursor_track: u32,
-    /// Cached textual rendering of the tracker grid. Recomputed whenever
-    /// `song`, `cursor_row`, or `cursor_track` change via `refresh_tracker_text`.
-    pub tracker_text: String,
+    /// Cached header (track names + column labels) for the tracker grid.
+    /// Single Label at the top of ArrangementView; recomputed on `song` or
+    /// `cursor_track` change.
+    pub tracker_header: String,
+    /// Cached per-row rendering of the tracker grid. Each entry is one row
+    /// of the grid. Refreshed on `song`, `cursor_row`, or `cursor_track`
+    /// change so cursor indicators (`>`, `[…]`) stay in sync.
+    pub tracker_rows: Vec<String>,
     /// Template note used when placing into an empty cell (sing_like_coding
     /// style). Updated whenever the user edits a NoteOn cell.
     pub last_note: Note,
@@ -24,6 +29,10 @@ pub struct AppData {
     /// Loop the current clip when it reaches the end instead of auto-stopping.
     /// Session-only state; not persisted to `.daw`.
     pub is_looping: bool,
+    /// Tracker row currently being played back. `None` when no playback is
+    /// happening (sentinel `u64::MAX` published by plugin_host, or no clip).
+    /// Used by ArrangementView to highlight the sounding row.
+    pub playhead_row: Option<u32>,
     /// Path of the currently loaded CLAP plugin. `None` until the user picks
     /// one and the initial scan didn't find a candidate.
     pub clap_plugin_path: Option<PathBuf>,
@@ -42,20 +51,23 @@ impl AppData {
         clap_plugin_path: Option<PathBuf>,
     ) -> Self {
         let song = Song::default();
-        let tracker_text = crate::view::arrangement::render_tracker_text(&song, 0, 0);
+        let tracker_header = crate::view::arrangement::render_tracker_header(&song, 0);
+        let tracker_rows = crate::view::arrangement::render_tracker_rows(&song, 0, 0);
         let clap_plugin_label = plugin_label(clap_plugin_path.as_deref());
         Self {
             song,
             file_path: None,
             cursor_row: 0,
             cursor_track: 0,
-            tracker_text,
+            tracker_header,
+            tracker_rows,
             last_note: Note {
                 key: 60,
                 velocity: 100,
             },
             is_playing: false,
             is_looping: false,
+            playhead_row: None,
             clap_plugin_path,
             clap_plugin_label,
             audio_tx: Some(audio_tx),
@@ -64,7 +76,9 @@ impl AppData {
     }
 
     fn refresh_tracker_text(&mut self) {
-        self.tracker_text = crate::view::arrangement::render_tracker_text(
+        self.tracker_header =
+            crate::view::arrangement::render_tracker_header(&self.song, self.cursor_track);
+        self.tracker_rows = crate::view::arrangement::render_tracker_rows(
             &self.song,
             self.cursor_row,
             self.cursor_track,
@@ -93,6 +107,9 @@ pub enum AppEvent {
     TransposeOctave(i8),
     ChangeClapPlugin,
     ToggleLoop,
+    /// Periodic UI tick carrying the latest `playhead_samples` from shmem.
+    /// `u64::MAX` is the "not playing" sentinel published by plugin_host.
+    Tick(u64),
 }
 
 impl Model for AppData {
@@ -147,6 +164,10 @@ impl Model for AppData {
                 }
                 AppEvent::ToggleLoop => {
                     self.toggle_loop();
+                    dirty = false;
+                }
+                AppEvent::Tick(playhead_samples) => {
+                    self.on_tick(*playhead_samples);
                     dirty = false;
                 }
             }
@@ -229,6 +250,27 @@ impl AppData {
         self.is_looping = !self.is_looping;
         tracing::info!(on = self.is_looping, "loop toggled");
         self.send_plugin(MainToChild::SetLoop(self.is_looping));
+    }
+
+    /// Process a periodic UI tick that carries the latest `playhead_samples`
+    /// published by plugin_host in shared memory. Updates `playhead_row` so
+    /// ArrangementView can highlight the sounding row.
+    ///
+    /// `u64::MAX` is the sentinel meaning "not playing" — in that case the
+    /// highlight is cleared.
+    fn on_tick(&mut self, playhead_samples: u64) {
+        let next = if playhead_samples == u64::MAX {
+            None
+        } else {
+            common::timing::playhead_to_row(
+                Some(&self.song),
+                common::audio_bridge::SAMPLE_RATE,
+                playhead_samples,
+            )
+        };
+        if next != self.playhead_row {
+            self.playhead_row = next;
+        }
     }
 
     fn action_change_clap_plugin(&mut self) {

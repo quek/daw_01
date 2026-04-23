@@ -9,11 +9,39 @@ pub struct ArrangementView;
 impl ArrangementView {
     pub fn new(cx: &mut Context) -> Handle<'_, Self> {
         Self.build(cx, |cx| {
-            Label::new(cx, AppData::tracker_text)
-                .padding(Pixels(8.0))
-                .font_size(13.0)
-                .font_family(vec![FamilyOwned::Named("HackGen Console NF".into())])
-                .color(Color::rgb(220, 220, 220));
+            VStack::new(cx, |cx| {
+                // Two-line header: track names and column labels.
+                Label::new(cx, AppData::tracker_header)
+                    .font_family(vec![FamilyOwned::Named("HackGen Console NF".into())])
+                    .font_size(13.0)
+                    .color(Color::rgb(220, 220, 220))
+                    .padding_bottom(Pixels(2.0));
+
+                // One Label per row; background color binds to playhead_row so
+                // the sounding row lights up without re-rendering the grid.
+                //
+                // Fixed row height keeps rows flush (default `auto` height
+                // leaves ~1 line of gap between items). `height = font_size +
+                // small padding` gives a tight tracker look.
+                List::new(cx, AppData::tracker_rows, |cx, row_idx, item| {
+                    Label::new(cx, item)
+                        .font_family(vec![FamilyOwned::Named("HackGen Console NF".into())])
+                        .font_size(13.0)
+                        .height(Pixels(17.0))
+                        .color(Color::rgb(220, 220, 220))
+                        .background_color(AppData::playhead_row.map(move |p: &Option<u32>| {
+                            if *p == Some(row_idx as u32) {
+                                Color::rgb(40, 80, 50)
+                            } else {
+                                Color::rgba(0, 0, 0, 0)
+                            }
+                        }));
+                })
+                .class("tracker-list")
+                .gap(Pixels(0.0));
+            })
+            .padding(Pixels(8.0))
+            .gap(Pixels(0.0));
         })
         .background_color(Color::rgb(32, 32, 36))
     }
@@ -41,22 +69,15 @@ fn pad_to_width(s: &str, target: usize) -> String {
     }
 }
 
-pub fn render_tracker_text(song: &Song, cursor_row: u32, cursor_track: u32) -> String {
+/// Renders the fixed two-line header shown above the tracker grid: one line
+/// with track names / clip names (with a `▶` marker on the cursor track) and
+/// one line with the per-column labels (NOT / VOL / FX / LYR).
+pub fn render_tracker_header(song: &Song, cursor_track: u32) -> String {
     if song.tracks.is_empty() {
         return "No tracks.\nTrack > Add Vocal Track to begin.".to_string();
     }
-    let visible_rows = song
-        .tracks
-        .iter()
-        .flat_map(|t| t.clips.first())
-        .map(|c| c.rows.len())
-        .max()
-        .unwrap_or(16)
-        .max(16);
-
     let mut out = String::new();
 
-    // Track header: active track gets ▶ marker, others a space filler.
     out.push_str("##  ");
     for (track_idx, track) in song.tracks.iter().enumerate() {
         let clip_name = track
@@ -73,18 +94,34 @@ pub fn render_tracker_text(song: &Song, cursor_row: u32, cursor_track: u32) -> S
     }
     out.push('\n');
 
-    // Column labels
     out.push_str("    ");
     for _ in &song.tracks {
         out.push_str(&format!("| {CELL_HEADER}  "));
     }
-    out.push('\n');
+    out
+}
 
-    // Rows: cursor row gets `>` prefix and the cursor cell is wrapped in `[…]`.
+/// Renders one string per row of the tracker grid. The cursor row gets a `>`
+/// prefix and the cursor cell is wrapped in `[…]`. Returns an empty vec when
+/// there are no tracks (the header carries the "No tracks." message).
+pub fn render_tracker_rows(song: &Song, cursor_row: u32, cursor_track: u32) -> Vec<String> {
+    if song.tracks.is_empty() {
+        return Vec::new();
+    }
+    let visible_rows = song
+        .tracks
+        .iter()
+        .flat_map(|t| t.clips.first())
+        .map(|c| c.rows.len())
+        .max()
+        .unwrap_or(16)
+        .max(16);
+
+    let mut rows = Vec::with_capacity(visible_rows);
     for row_idx in 0..visible_rows {
         let is_cursor_row = row_idx as u32 == cursor_row;
         let prefix = if is_cursor_row { '>' } else { ' ' };
-        out.push_str(&format!("{prefix}{row_idx:02X} "));
+        let mut line = format!("{prefix}{row_idx:02X} ");
         for (track_idx, track) in song.tracks.iter().enumerate() {
             let cell = track
                 .clips
@@ -93,15 +130,14 @@ pub fn render_tracker_text(song: &Song, cursor_row: u32, cursor_track: u32) -> S
                 .map(format_row)
                 .unwrap_or_else(empty_cell);
             if is_cursor_row && track_idx as u32 == cursor_track {
-                out.push_str(&format!("|[{cell}] "));
+                line.push_str(&format!("|[{cell}] "));
             } else {
-                out.push_str(&format!("| {cell}  "));
+                line.push_str(&format!("| {cell}  "));
             }
         }
-        out.push('\n');
+        rows.push(line);
     }
-
-    out
+    rows
 }
 
 fn format_row(row: &Row) -> String {
@@ -201,11 +237,17 @@ mod tests {
     }
 
     #[test]
-    fn render_tracker_text_empty_song() {
+    fn render_tracker_header_empty_song() {
         let song = Song::default();
         assert_eq!(
-            render_tracker_text(&song, 0, 0),
+            render_tracker_header(&song, 0),
             "No tracks.\nTrack > Add Vocal Track to begin."
         );
+    }
+
+    #[test]
+    fn render_tracker_rows_empty_song() {
+        let song = Song::default();
+        assert_eq!(render_tracker_rows(&song, 0, 0), Vec::<String>::new());
     }
 }

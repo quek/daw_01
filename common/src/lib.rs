@@ -4,6 +4,7 @@ pub mod logging;
 pub mod model;
 pub mod project;
 pub mod protocol;
+pub mod timing;
 pub mod wire;
 
 #[cfg(windows)]

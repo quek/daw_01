@@ -4,6 +4,8 @@ mod subprocess;
 mod view;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use common::audio_bridge::{
@@ -41,8 +43,10 @@ fn main() -> Result<()> {
         max_frames: MAX_FRAMES,
         channels: CHANNELS as u16,
     };
-    let _bridge = AudioBridgeHandle::create(&session.shmem_id)
-        .context("failed to create audio shmem")?;
+    let bridge = Arc::new(
+        AudioBridgeHandle::create(&session.shmem_id)
+            .context("failed to create audio shmem")?,
+    );
     let _request_sem = Semaphore::create(&session.request_sem_id, 0, 2)
         .context("failed to create request semaphore")?;
     let _ready_sem = Semaphore::create(&session.ready_sem_id, 0, 2)
@@ -81,8 +85,9 @@ fn main() -> Result<()> {
     }
 
     tracing::info!("opening main window");
-    run_gui(audio_tx, plugin_tx, clap_plugin_path)?;
+    run_gui(audio_tx, plugin_tx, clap_plugin_path, Arc::clone(&bridge))?;
     tracing::info!("daw_gui exiting");
+    drop(bridge);
     Ok(())
 }
 
@@ -152,9 +157,14 @@ fn run_gui(
     audio_tx: UnboundedSender<MainToChild>,
     plugin_tx: UnboundedSender<MainToChild>,
     clap_plugin_path: Option<PathBuf>,
+    bridge: Arc<AudioBridgeHandle>,
 ) -> Result<()> {
     Application::new(move |cx| {
         cx.set_default_font(&["HackGen Console NF"]);
+        // Default theme gives `list list-item { height: 30px; }` which leaves
+        // a visible gap between tracker rows. Override for our tracker list
+        // so each row sizes to its Label.
+        let _ = cx.add_stylesheet(TRACKER_CSS);
         AppData::new(
             audio_tx.clone(),
             plugin_tx.clone(),
@@ -162,6 +172,7 @@ fn run_gui(
         )
         .build(cx);
         register_shortcuts(cx);
+        spawn_playhead_poller(cx, Arc::clone(&bridge));
 
         VStack::new(cx, |cx| {
             build_menu_bar(cx);
@@ -180,6 +191,32 @@ fn run_gui(
     .inner_size((1280, 800))
     .run()
     .map_err(|e| anyhow::anyhow!("Vizia application error: {e:?}"))
+}
+
+/// Overrides the default `list list-item { height: 30px }` so tracker rows are
+/// flush. We keep a fixed pixel height rather than `auto` because Vizia's
+/// draw path builds a transform per entity and panics on a zero-sized rect
+/// (`matrix.invert().unwrap()`), which `auto` can produce for empty
+/// ListItems.
+const TRACKER_CSS: &str = r#"
+list.tracker-list list-item {
+    height: 17px;
+}
+"#;
+
+/// Polls the shared-memory playhead at ~30 Hz and dispatches `AppEvent::Tick`
+/// so `AppData::on_tick` can update the playhead-row highlight. The worker
+/// exits when the UI is closed and `proxy.emit` returns an error.
+fn spawn_playhead_poller(cx: &mut Context, bridge: Arc<AudioBridgeHandle>) {
+    cx.spawn(move |proxy| {
+        loop {
+            std::thread::sleep(Duration::from_millis(33));
+            let samples = bridge.playhead_samples();
+            if proxy.emit(AppEvent::Tick(samples)).is_err() {
+                break;
+            }
+        }
+    });
 }
 
 fn register_shortcuts(cx: &mut Context) {
