@@ -1,5 +1,7 @@
 use std::ffi::{CStr, c_char, c_void};
+use std::sync::Arc;
 
+use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_host_gui};
 use clap_sys::host::clap_host;
 use clap_sys::version::CLAP_VERSION;
 
@@ -8,13 +10,42 @@ const VENDOR: &CStr = c"daw_01";
 const URL: &CStr = c"";
 const VERSION: &CStr = c"0.1.0";
 
+/// Callbacks the host exposes to CLAP plugins. These are triggered by the
+/// plugin itself (resize requests, close notifications) and may fire on
+/// *any* thread the plugin chooses — implementers must be `Send + Sync` and
+/// should not block.
+pub struct HostCallbacks {
+    pub on_request_resize: Arc<dyn Fn(u32, u32) + Send + Sync>,
+    pub on_closed: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl HostCallbacks {
+    /// Returns a no-op callback set for scanning / tests where we don't need
+    /// to relay GUI events.
+    #[allow(dead_code)]
+    pub fn noop() -> Self {
+        Self {
+            on_request_resize: Arc::new(|_, _| {}),
+            on_closed: Arc::new(|| {}),
+        }
+    }
+}
+
+/// CLAP host impl. Pinned via `Box<Host>` so the raw `host_data` pointer the
+/// plugin holds remains valid for the plugin's lifetime.
+#[repr(C)]
 pub struct Host {
+    /// Must be first so that a `*const clap_host` pointer into this struct
+    /// aliases a `*const Host` — we rely on this for the `host_data` trick
+    /// below. `#[repr(C)]` makes the offset deterministic.
     pub clap: clap_host,
+    pub clap_gui: clap_host_gui,
+    pub callbacks: HostCallbacks,
 }
 
 impl Host {
-    pub fn new() -> Box<Self> {
-        Box::new(Self {
+    pub fn new(callbacks: HostCallbacks) -> Box<Self> {
+        let mut host = Box::new(Self {
             clap: clap_host {
                 clap_version: CLAP_VERSION,
                 host_data: std::ptr::null_mut(),
@@ -27,14 +58,56 @@ impl Host {
                 request_process: Some(request_process),
                 request_callback: Some(request_callback),
             },
-        })
+            clap_gui: clap_host_gui {
+                resize_hints_changed: Some(gui_resize_hints_changed),
+                request_resize: Some(gui_request_resize),
+                request_show: Some(gui_request_show),
+                request_hide: Some(gui_request_hide),
+                closed: Some(gui_closed),
+            },
+            callbacks,
+        });
+        // Point host_data at the Box's heap allocation so the extension
+        // callbacks can recover `&Host` from `*const clap_host`.
+        host.clap.host_data = std::ptr::from_mut(&mut *host) as *mut c_void;
+        host
+    }
+
+    /// Recovers `&Host` from a CLAP callback's `*const clap_host`. Returns
+    /// `None` if the pointer or host_data is null (defensive, shouldn't
+    /// happen in practice).
+    ///
+    /// # Safety
+    /// `host` must be a pointer previously returned from `Host::new` (i.e.
+    /// the `&self.clap` field of a live `Box<Host>`).
+    unsafe fn from_clap<'a>(host: *const clap_host) -> Option<&'a Self> {
+        if host.is_null() {
+            return None;
+        }
+        let data = unsafe { (*host).host_data };
+        if data.is_null() {
+            return None;
+        }
+        Some(unsafe { &*(data as *const Self) })
     }
 }
 
+// --- clap_host entries ----------------------------------------------------
+
 unsafe extern "C" fn get_extension(
-    _host: *const clap_host,
-    _id: *const c_char,
+    host: *const clap_host,
+    id: *const c_char,
 ) -> *const c_void {
+    let Some(this) = (unsafe { Host::from_clap(host) }) else {
+        return std::ptr::null();
+    };
+    if id.is_null() {
+        return std::ptr::null();
+    }
+    let id_cstr = unsafe { CStr::from_ptr(id) };
+    if id_cstr == CLAP_EXT_GUI {
+        return std::ptr::from_ref(&this.clap_gui) as *const c_void;
+    }
     std::ptr::null()
 }
 
@@ -48,4 +121,43 @@ unsafe extern "C" fn request_process(_host: *const clap_host) {
 
 unsafe extern "C" fn request_callback(_host: *const clap_host) {
     tracing::info!("host callback: request_callback");
+}
+
+// --- clap_host_gui entries ------------------------------------------------
+
+unsafe extern "C" fn gui_resize_hints_changed(_host: *const clap_host) {
+    tracing::info!("host callback: resize_hints_changed");
+}
+
+unsafe extern "C" fn gui_request_resize(
+    host: *const clap_host,
+    width: u32,
+    height: u32,
+) -> bool {
+    let Some(this) = (unsafe { Host::from_clap(host) }) else {
+        return false;
+    };
+    (this.callbacks.on_request_resize)(width, height);
+    // We accept the hint; the actual resize is scheduled asynchronously via
+    // daw_gui → pipe → plugin-main → `plugin.gui.set_size()`. Returning
+    // `true` tells the plugin it doesn't need to call `set_size` itself.
+    true
+}
+
+unsafe extern "C" fn gui_request_show(_host: *const clap_host) -> bool {
+    // Plugin is asking the host to bring the GUI to front. MVP: ignore.
+    false
+}
+
+unsafe extern "C" fn gui_request_hide(_host: *const clap_host) -> bool {
+    // Plugin is asking the host to hide the GUI. MVP: ignore.
+    false
+}
+
+unsafe extern "C" fn gui_closed(host: *const clap_host, was_destroyed: bool) {
+    tracing::info!(was_destroyed, "host callback: gui closed");
+    let Some(this) = (unsafe { Host::from_clap(host) }) else {
+        return;
+    };
+    (this.callbacks.on_closed)();
 }

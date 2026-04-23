@@ -426,6 +426,9 @@ state 変更時に `refresh_tracker_text()` で文字列化し、それを Lens 
 - [x] プロジェクト保存・読込 (`.daw` JSON アトミック書き込み)
 - [x] プラグイン選択 GUI (Track Inspector, ホットスワップ対応)
 - [x] ループ再生 (`P` キー / Transport ボタン、clip 範囲をシームレス wrap)
+- [x] CLAP プラグイン GUI エディタ (embedded, Win32 host-owned container)
+- [x] マスターフェーダー + L/R ピークメーター (Transport 右端)
+- [x] 再生位置ハイライト (Tracker View)
 - [ ] オートセーブ + 起動時復元プロンプト
 - [ ] VOICEVOX: 歌詞入力 → sing 合成 → WAV キャッシュ → 再生
 - [ ] WAV 書き出し

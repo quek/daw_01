@@ -68,8 +68,12 @@ fn main() -> Result<()> {
 
     let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel::<MainToChild>();
     let (plugin_tx, plugin_rx) = tokio::sync::mpsc::unbounded_channel::<MainToChild>();
+    // Incoming `ChildToMain` from plugin_host (GUI callbacks etc). The
+    // receiver is handed to `run_gui` which spawns a blocking bridge on a
+    // Vizia `cx.spawn` worker to deliver the messages as AppEvents.
+    let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel::<ChildToMain>();
     rt.spawn(send_loop(audio_server, audio_rx));
-    rt.spawn(send_loop(plugin_server, plugin_rx));
+    rt.spawn(plugin_pipe_loop(plugin_server, plugin_rx, incoming_tx));
 
     // Pick an initial CLAP plugin and send it to plugin_host so the user does
     // not have to browse manually on every launch. Failure here is non-fatal:
@@ -85,7 +89,13 @@ fn main() -> Result<()> {
     }
 
     tracing::info!("opening main window");
-    run_gui(audio_tx, plugin_tx, clap_plugin_path, Arc::clone(&bridge))?;
+    run_gui(
+        audio_tx,
+        plugin_tx,
+        clap_plugin_path,
+        Arc::clone(&bridge),
+        incoming_rx,
+    )?;
     tracing::info!("daw_gui exiting");
     drop(bridge);
     Ok(())
@@ -132,6 +142,7 @@ async fn handshake(
     let hello: ChildToMain = read_msg(&mut server).await?;
     let kind = match &hello {
         ChildToMain::Hello { kind, .. } => *kind,
+        other => anyhow::bail!("expected Hello from child, got {:?}", other),
     };
     anyhow::ensure!(
         kind == expected,
@@ -153,12 +164,54 @@ async fn send_loop(mut pipe: NamedPipeServer, mut rx: UnboundedReceiver<MainToCh
     tracing::info!("send loop ended");
 }
 
+/// Bidirectional pipe loop for daw_plugin_host. Multiplexes outgoing
+/// `MainToChild` commands and incoming `ChildToMain` callbacks on the same
+/// pipe using `tokio::select!`, so there is no contention and no need to
+/// clone the pipe handle.
+async fn plugin_pipe_loop(
+    mut pipe: NamedPipeServer,
+    mut rx: UnboundedReceiver<MainToChild>,
+    incoming_tx: tokio::sync::mpsc::UnboundedSender<ChildToMain>,
+) {
+    loop {
+        tokio::select! {
+            msg = read_msg::<_, ChildToMain>(&mut pipe) => {
+                match msg {
+                    Ok(m) => {
+                        if incoming_tx.send(m).is_err() {
+                            tracing::info!("incoming receiver dropped; pipe loop exiting");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::info!(error = ?e, "plugin_host pipe closed");
+                        break;
+                    }
+                }
+            }
+            Some(msg) = rx.recv() => {
+                if let Err(e) = write_msg(&mut pipe, &msg).await {
+                    tracing::error!(error = ?e, ?msg, "failed to send message to plugin_host");
+                    break;
+                }
+            }
+            else => break,
+        }
+    }
+    tracing::info!("plugin pipe loop ended");
+}
+
 fn run_gui(
     audio_tx: UnboundedSender<MainToChild>,
     plugin_tx: UnboundedSender<MainToChild>,
     clap_plugin_path: Option<PathBuf>,
     bridge: Arc<AudioBridgeHandle>,
+    incoming_rx: UnboundedReceiver<ChildToMain>,
 ) -> Result<()> {
+    // `incoming_rx` must move into the cx.spawn closure exactly once; wrap
+    // in Option so the outer `Application::new` closure (FnMut) can consume
+    // it on first call.
+    let mut incoming_rx_slot = Some(incoming_rx);
     Application::new(move |cx| {
         cx.set_default_font(&["HackGen Console NF"]);
         // Default theme gives `list list-item { height: 30px; }` which leaves
@@ -173,6 +226,9 @@ fn run_gui(
         .build(cx);
         register_shortcuts(cx);
         spawn_playhead_poller(cx, Arc::clone(&bridge));
+        if let Some(rx) = incoming_rx_slot.take() {
+            spawn_incoming_bridge(cx, rx);
+        }
 
         VStack::new(cx, |cx| {
             build_menu_bar(cx);
@@ -203,6 +259,35 @@ list.tracker-list list-item {
     height: 17px;
 }
 "#;
+
+/// Bridges the tokio `ChildToMain` receiver to Vizia AppEvents. Runs on a
+/// Vizia-spawned background thread (`cx.spawn`), consuming one message at a
+/// time via `blocking_recv` and posting the matching `AppEvent`.
+///
+/// Exits when the receiver channel closes (plugin_host pipe died) or when
+/// `proxy.emit` fails (UI dropped).
+fn spawn_incoming_bridge(cx: &mut Context, mut rx: UnboundedReceiver<ChildToMain>) {
+    cx.spawn(move |proxy| {
+        while let Some(msg) = rx.blocking_recv() {
+            let event = match msg {
+                ChildToMain::GuiOpened { width, height } => {
+                    Some(AppEvent::GuiOpenedFromChild { width, height })
+                }
+                ChildToMain::GuiRequestResize { width, height } => {
+                    Some(AppEvent::GuiRequestResizeFromChild { width, height })
+                }
+                ChildToMain::GuiClosed => Some(AppEvent::GuiClosedFromChild),
+                ChildToMain::Hello { .. } => None,
+            };
+            if let Some(event) = event
+                && proxy.emit(event).is_err()
+            {
+                break;
+            }
+        }
+        tracing::info!("incoming bridge exited");
+    });
+}
 
 /// Polls the shared-memory playhead and L/R peaks at ~30 Hz and dispatches
 /// `AppEvent::Tick` so `AppData::on_tick` can update the playhead-row

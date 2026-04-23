@@ -11,3 +11,6 @@ clap-sys.workspace = true
 libloading.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

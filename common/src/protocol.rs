@@ -17,7 +17,26 @@ impl ChildKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum ChildToMain {
-    Hello { kind: ChildKind, pid: u32 },
+    Hello {
+        kind: ChildKind,
+        pid: u32,
+    },
+    /// Sent after `create` + `show` succeeds. Carries the initial size the
+    /// plugin wants for its embedded window so daw_gui can resize the host
+    /// container.
+    GuiOpened {
+        width: u32,
+        height: u32,
+    },
+    /// Plugin-initiated resize via `clap_host_gui.request_resize`. daw_gui
+    /// should resize the container and ack with `MainToChild::ResizeGui`.
+    GuiRequestResize {
+        width: u32,
+        height: u32,
+    },
+    /// Plugin-initiated close (window X button handled by the plugin, or
+    /// `clap_host_gui.closed`). daw_gui should drop its embed HWND.
+    GuiClosed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -40,6 +59,21 @@ pub enum MainToChild {
     SetClapPlugin(std::path::PathBuf),
     SetLoop(bool),
     SetMasterGain(f32),
+    /// Request the plugin to create + embed + show its GUI as a child of the
+    /// given Win32 HWND (serialized as `u64` since HWND isn't directly
+    /// `Encode`-able). daw_plugin_host replies with `ChildToMain::GuiOpened`.
+    OpenGuiEmbedded {
+        host_hwnd: u64,
+    },
+    /// Tear down the plugin GUI (hide + destroy).
+    CloseGui,
+    /// Tell the plugin "the container was resized to W×H, update your UI".
+    /// Sent after daw_gui resizes the host container in response to
+    /// `GuiRequestResize` or a user drag.
+    ResizeGui {
+        width: u32,
+        height: u32,
+    },
 }
 
 #[cfg(test)]

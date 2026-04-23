@@ -113,6 +113,11 @@ async fn recv_loop(
                 tracing::info!(gain = clamped, "received SetMasterGain");
                 master_gain.store(clamped.to_bits(), Ordering::Relaxed);
             }
+            Ok(MainToChild::OpenGuiEmbedded { .. })
+            | Ok(MainToChild::CloseGui)
+            | Ok(MainToChild::ResizeGui { .. }) => {
+                // Plugin GUI lifecycle is handled by daw_plugin_host.
+            }
             Err(e) => {
                 tracing::info!(error = ?e, "receive loop ending");
                 break;

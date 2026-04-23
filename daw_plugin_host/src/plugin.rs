@@ -11,6 +11,9 @@ use clap_sys::events::{
 use clap_sys::ext::audio_ports::{
     CLAP_EXT_AUDIO_PORTS, clap_audio_port_info, clap_plugin_audio_ports,
 };
+use clap_sys::ext::gui::{
+    CLAP_EXT_GUI, CLAP_WINDOW_API_WIN32, clap_plugin_gui, clap_window, clap_window_handle,
+};
 use clap_sys::ext::note_ports::{CLAP_EXT_NOTE_PORTS, clap_plugin_note_ports};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
 use clap_sys::host::clap_host;
@@ -34,7 +37,7 @@ pub struct TimedNoteEvent {
     pub event: NoteTransition,
 }
 
-use crate::clap_host::Host;
+use crate::clap_host::{Host, HostCallbacks};
 
 /// Loaded CLAP plugin instance. Holds every resource alive until dropped; the
 /// drop order (custom cleanup → fields → Library) ensures `destroy` / `deinit`
@@ -53,6 +56,12 @@ pub struct Plugin {
     output_ptrs: Vec<*mut f32>,
     /// Pre-allocated input event buffer; filled by process() per call.
     pending_events: Vec<clap_event_note>,
+    /// `clap_plugin_gui` vtable pointer, looked up once after init.
+    /// `None` means the plugin does not declare the gui extension.
+    gui_ext: Option<*const clap_plugin_gui>,
+    /// Whether `gui.create` has been called successfully and `gui.destroy`
+    /// has not yet been called. Used by Drop to tear down cleanly.
+    gui_created: bool,
 }
 
 // The plugin holds raw pointers but ownership is exclusive within the struct.
@@ -62,7 +71,14 @@ impl Plugin {
     /// Tries to load a plugin from `path`. Scans all descriptors in the file and
     /// instantiates the first one for which `matches(features)` returns true.
     /// Returns `Ok(None)` if no descriptor matches (library is unloaded cleanly).
-    pub fn load_matching<F>(path: &Path, matches: F) -> Result<Option<Self>>
+    ///
+    /// `callbacks` wires host-side CLAP GUI events (resize / close) back to
+    /// the caller.
+    pub fn load_matching<F>(
+        path: &Path,
+        matches: F,
+        callbacks: HostCallbacks,
+    ) -> Result<Option<Self>>
     where
         F: Fn(&[String]) -> bool,
     {
@@ -148,7 +164,7 @@ impl Plugin {
         let plugin_id = desc.id;
         let name = c_str_to_string(desc.name);
 
-        let host = Host::new();
+        let host = Host::new(callbacks);
         let host_ptr: *const clap_host = &host.clap;
 
         let plugin_ptr = unsafe { create(factory_ptr, host_ptr, plugin_id) };
@@ -168,6 +184,11 @@ impl Plugin {
         let output_channels = query_output_channel_count(plugin_ptr, get_ext);
         tracing::info!(output_channels, "plugin output channel count");
 
+        // Look up optional clap.gui extension; missing → embedded GUI not supported.
+        let gui_ptr = unsafe { get_ext(plugin_ptr, CLAP_EXT_GUI.as_ptr()) } as *const clap_plugin_gui;
+        let gui_ext = if gui_ptr.is_null() { None } else { Some(gui_ptr) };
+        tracing::info!(has_gui = gui_ext.is_some(), "plugin gui extension");
+
         Ok(Some(Self {
             _library: library,
             entry: entry_ptr,
@@ -181,7 +202,142 @@ impl Plugin {
             output_buffers: Vec::new(),
             output_ptrs: Vec::new(),
             pending_events: Vec::with_capacity(64),
+            gui_ext,
+            gui_created: false,
         }))
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    // --- GUI extension wrappers ------------------------------------------
+
+    /// Returns true when the plugin advertises the `clap.gui` extension and
+    /// supports embedded (non-floating) Win32 windows.
+    pub fn gui_is_embed_supported(&self) -> bool {
+        let Some(gui) = self.gui_ext.and_then(|p| unsafe { p.as_ref() }) else {
+            return false;
+        };
+        let Some(f) = gui.is_api_supported else { return false };
+        unsafe { f(self.plugin, CLAP_WINDOW_API_WIN32.as_ptr(), false) }
+    }
+
+    /// Create the plugin's embedded (Win32) GUI resources. Idempotent: calling
+    /// twice returns success without a second `create`.
+    pub fn gui_create_embedded(&mut self) -> Result<()> {
+        if self.gui_created {
+            return Ok(());
+        }
+        let gui = self.gui_ref().context("plugin has no gui extension")?;
+        let create = gui.create.context("gui.create is null")?;
+        anyhow::ensure!(
+            unsafe { create(self.plugin, CLAP_WINDOW_API_WIN32.as_ptr(), false) },
+            "gui.create returned false"
+        );
+        self.gui_created = true;
+        Ok(())
+    }
+
+    /// Returns the plugin's preferred initial size, or `None` if the call
+    /// fails. Must be called between `create` and `set_parent`/`show`.
+    pub fn gui_get_size(&self) -> Option<(u32, u32)> {
+        let gui = self.gui_ref()?;
+        let f = gui.get_size?;
+        let mut w = 0u32;
+        let mut h = 0u32;
+        if unsafe { f(self.plugin, &mut w, &mut h) } {
+            Some((w, h))
+        } else {
+            None
+        }
+    }
+
+    /// Tells the plugin the host-side scaling factor. Returning `false` is
+    /// allowed (plugin preferred to compute its own scale); propagate only
+    /// hard errors (extension missing / function pointer null).
+    pub fn gui_set_scale(&self, scale: f64) -> Result<bool> {
+        let gui = self.gui_ref().context("plugin has no gui extension")?;
+        let Some(f) = gui.set_scale else {
+            // Optional entry; treat missing as "plugin ignored the scale".
+            return Ok(false);
+        };
+        Ok(unsafe { f(self.plugin, scale) })
+    }
+
+    /// Returns true if the plugin supports mouse-drag resize. `false` when
+    /// the extension is missing or the plugin reports non-resizable.
+    pub fn gui_can_resize(&self) -> bool {
+        let Some(gui) = self.gui_ref() else { return false };
+        let Some(f) = gui.can_resize else { return false };
+        unsafe { f(self.plugin) }
+    }
+
+    /// Embed into the given host Win32 HWND (passed as a raw `u64` pointer).
+    pub fn gui_set_parent_hwnd(&self, hwnd: u64) -> Result<()> {
+        let gui = self.gui_ref().context("plugin has no gui extension")?;
+        let f = gui.set_parent.context("gui.set_parent is null")?;
+        let window = clap_window {
+            api: CLAP_WINDOW_API_WIN32.as_ptr(),
+            specific: clap_window_handle {
+                win32: hwnd as *mut c_void,
+            },
+        };
+        anyhow::ensure!(
+            unsafe { f(self.plugin, &window) },
+            "gui.set_parent returned false"
+        );
+        Ok(())
+    }
+
+    /// Calls `gui.show`. Returns `Ok(true)` if the plugin reports success,
+    /// `Ok(false)` if the plugin returns false (some plugins — e.g. VCV
+    /// Rack 2 — return false even after successfully showing, as a no-op
+    /// sentinel). Only returns `Err` if the function pointer is missing.
+    pub fn gui_show(&self) -> Result<bool> {
+        let gui = self.gui_ref().context("plugin has no gui extension")?;
+        let f = gui.show.context("gui.show is null")?;
+        Ok(unsafe { f(self.plugin) })
+    }
+
+    pub fn gui_hide(&self) -> Result<()> {
+        // Plugins reject hide() calls when create() hasn't happened (or was
+        // already rolled back by the plugin on a failed show). Skip silently.
+        if !self.gui_created {
+            return Ok(());
+        }
+        let gui = self.gui_ref().context("plugin has no gui extension")?;
+        let f = gui.hide.context("gui.hide is null")?;
+        anyhow::ensure!(unsafe { f(self.plugin) }, "gui.hide returned false");
+        Ok(())
+    }
+
+    pub fn gui_set_size(&self, width: u32, height: u32) -> Result<()> {
+        let gui = self.gui_ref().context("plugin has no gui extension")?;
+        let f = gui.set_size.context("gui.set_size is null")?;
+        anyhow::ensure!(
+            unsafe { f(self.plugin, width, height) },
+            "gui.set_size returned false"
+        );
+        Ok(())
+    }
+
+    /// Tear down the GUI. Safe to call even if `gui_create_embedded` was not
+    /// called (no-op in that case). Idempotent.
+    pub fn gui_destroy(&mut self) {
+        if !self.gui_created {
+            return;
+        }
+        if let Some(gui) = self.gui_ref()
+            && let Some(f) = gui.destroy
+        {
+            unsafe { f(self.plugin) };
+        }
+        self.gui_created = false;
+    }
+
+    fn gui_ref(&self) -> Option<&clap_plugin_gui> {
+        self.gui_ext.and_then(|p| unsafe { p.as_ref() })
     }
 
     pub fn activate(&mut self, sample_rate: f64, min_frames: u32, max_frames: u32) -> Result<()> {
@@ -290,8 +446,8 @@ impl Plugin {
     }
 
     /// Loads the first plugin in the file (any type).
-    pub fn load(path: &Path) -> Result<Self> {
-        Self::load_matching(path, |_| true)?
+    pub fn load(path: &Path, callbacks: HostCallbacks) -> Result<Self> {
+        Self::load_matching(path, |_| true, callbacks)?
             .ok_or_else(|| anyhow::anyhow!("no plugins in {}", path.display()))
     }
 }
@@ -373,6 +529,8 @@ fn query_output_channel_count(plugin: *const clap_plugin, get_ext: GetExtFn) -> 
 
 impl Drop for Plugin {
     fn drop(&mut self) {
+        // Tear down GUI resources first so plugin.destroy sees a clean state.
+        self.gui_destroy();
         unsafe {
             if let Some(destroy) = (*self.plugin).destroy {
                 destroy(self.plugin);

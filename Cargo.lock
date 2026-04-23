@@ -988,6 +988,7 @@ dependencies = [
  "libloading",
  "tokio",
  "tracing",
+ "windows 0.61.3",
 ]
 
 [[package]]

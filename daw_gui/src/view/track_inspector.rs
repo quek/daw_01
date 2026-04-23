@@ -25,6 +25,24 @@ impl TrackInspectorView {
                 Button::new(cx, |cx| Label::new(cx, "Change Plugin..."))
                     .on_press(|ex| ex.emit(AppEvent::ChangeClapPlugin))
                     .padding_top(Pixels(6.0));
+
+                // Plugin editor GUI toggle. Label reflects current state via
+                // the `is_gui_open` Lens so users know whether a press will
+                // open or close.
+                Button::new(cx, |cx| {
+                    Label::new(
+                        cx,
+                        AppData::is_gui_open.map(|on: &bool| {
+                            if *on {
+                                "Close Plugin GUI"
+                            } else {
+                                "Open Plugin GUI"
+                            }
+                        }),
+                    )
+                })
+                .on_press(|ex| ex.emit(AppEvent::TogglePluginGui))
+                .padding_top(Pixels(6.0));
             })
             .padding(Pixels(12.0))
             .gap(Pixels(2.0))

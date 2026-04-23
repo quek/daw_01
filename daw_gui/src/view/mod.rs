@@ -1,4 +1,6 @@
 pub mod arrangement;
+#[cfg(windows)]
+pub mod plugin_embed;
 pub mod status_bar;
 pub mod track_inspector;
 pub mod transport;

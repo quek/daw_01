@@ -51,10 +51,19 @@ pub struct AppData {
     pub clap_plugin_path: Option<PathBuf>,
     /// Cached display label ("<file-stem>" or "(no plugin)") for the inspector.
     pub clap_plugin_label: String,
+    /// Whether the plugin's GUI window is currently open. Flips on button
+    /// press / IPC callbacks.
+    pub is_gui_open: bool,
     #[lens(ignore)]
     pub audio_tx: Option<UnboundedSender<MainToChild>>,
     #[lens(ignore)]
     pub plugin_tx: Option<UnboundedSender<MainToChild>>,
+    /// Live handle to the host-owned container window while a plugin GUI is
+    /// embedded. Kept in AppData so it outlives any one event handler and
+    /// is destroyed deterministically when we close the GUI.
+    #[cfg(windows)]
+    #[lens(ignore)]
+    pub plugin_host_window: Option<crate::view::plugin_embed::PluginHostWindow>,
 }
 
 impl AppData {
@@ -88,8 +97,11 @@ impl AppData {
             peak_r_norm: 0.0,
             clap_plugin_path,
             clap_plugin_label,
+            is_gui_open: false,
             audio_tx: Some(audio_tx),
             plugin_tx: Some(plugin_tx),
+            #[cfg(windows)]
+            plugin_host_window: None,
         }
     }
 
@@ -134,6 +146,15 @@ pub enum AppEvent {
     /// Eq/Hash. `u64::MAX` playhead is the "not playing" sentinel published
     /// by plugin_host.
     Tick(u64, u32, u32),
+    /// User clicked the "Open / Close Plugin GUI" toggle in the inspector.
+    TogglePluginGui,
+    /// Plugin confirmed that its GUI has been embedded at `width × height`.
+    /// Forwarded by the `ChildToMain` receiver loop from daw_plugin_host.
+    GuiOpenedFromChild { width: u32, height: u32 },
+    /// Plugin requested a resize via `clap_host_gui.request_resize`.
+    GuiRequestResizeFromChild { width: u32, height: u32 },
+    /// Plugin signalled its GUI was closed (host-callback `closed`).
+    GuiClosedFromChild,
 }
 
 impl Model for AppData {
@@ -200,6 +221,22 @@ impl Model for AppData {
                         f32::from_bits(*peak_l_bits),
                         f32::from_bits(*peak_r_bits),
                     );
+                    dirty = false;
+                }
+                AppEvent::TogglePluginGui => {
+                    self.toggle_plugin_gui();
+                    dirty = false;
+                }
+                AppEvent::GuiOpenedFromChild { width, height } => {
+                    self.on_gui_opened(*width, *height);
+                    dirty = false;
+                }
+                AppEvent::GuiRequestResizeFromChild { width, height } => {
+                    self.on_gui_request_resize(*width, *height);
+                    dirty = false;
+                }
+                AppEvent::GuiClosedFromChild => {
+                    self.on_gui_closed();
                     dirty = false;
                 }
             }
@@ -284,6 +321,83 @@ impl AppData {
         self.send_plugin(MainToChild::SetLoop(self.is_looping));
     }
 
+    /// Toggle the plugin editor window. Opening allocates a host-owned Win32
+    /// container (`PluginHostWindow`), sends its HWND to daw_plugin_host, and
+    /// relies on `ChildToMain::GuiOpened` to confirm. Closing sends
+    /// `CloseGui`; the `GuiClosedFromChild` callback finalizes Drop.
+    #[cfg(windows)]
+    fn toggle_plugin_gui(&mut self) {
+        if self.is_gui_open {
+            // Close flow: send IPC, wait for GuiClosedFromChild to tear down.
+            self.send_plugin(MainToChild::CloseGui);
+            return;
+        }
+        match crate::view::plugin_embed::PluginHostWindow::create(
+            800,
+            600,
+            &format!("Plugin — {}", self.clap_plugin_label),
+        ) {
+            Ok(win) => {
+                let hwnd = win.hwnd_u64();
+                self.plugin_host_window = Some(win);
+                tracing::info!(hwnd, "created plugin host window, requesting embed");
+                self.send_plugin(MainToChild::OpenGuiEmbedded { host_hwnd: hwnd });
+                self.is_gui_open = true;
+            }
+            Err(e) => {
+                tracing::error!(error = ?e, "failed to create plugin host window");
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn toggle_plugin_gui(&mut self) {
+        tracing::warn!("plugin GUI embedding is only implemented on Windows");
+    }
+
+    /// Handler for `ChildToMain::GuiOpened`: resize our container so the
+    /// client area matches the plugin's preferred size, avoiding the
+    /// clipped-UI problem.
+    #[cfg(windows)]
+    fn on_gui_opened(&mut self, width: u32, height: u32) {
+        tracing::info!(width, height, "plugin GUI opened");
+        if let Some(win) = &self.plugin_host_window {
+            win.set_client_size(width, height);
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn on_gui_opened(&mut self, _width: u32, _height: u32) {}
+
+    /// Handler for `ChildToMain::GuiRequestResize`: plugin wants to grow /
+    /// shrink. Resize our container first, then echo `ResizeGui` back so the
+    /// plugin-main thread calls `plugin.gui.set_size(w, h)` on its end.
+    #[cfg(windows)]
+    fn on_gui_request_resize(&mut self, width: u32, height: u32) {
+        tracing::info!(width, height, "plugin requested GUI resize");
+        if let Some(win) = &self.plugin_host_window {
+            win.set_client_size(width, height);
+        }
+        self.send_plugin(MainToChild::ResizeGui { width, height });
+    }
+
+    #[cfg(not(windows))]
+    fn on_gui_request_resize(&mut self, _width: u32, _height: u32) {}
+
+    /// Handler for `ChildToMain::GuiClosed`: plugin confirms tear-down, drop
+    /// our container so Drop destroys the HWND.
+    #[cfg(windows)]
+    fn on_gui_closed(&mut self) {
+        tracing::info!("plugin GUI closed (from child)");
+        self.plugin_host_window = None;
+        self.is_gui_open = false;
+    }
+
+    #[cfg(not(windows))]
+    fn on_gui_closed(&mut self) {
+        self.is_gui_open = false;
+    }
+
     /// Process a periodic UI tick that carries the latest `playhead_samples`
     /// and raw L/R peak amplitudes published to shmem by daw_audio and
     /// daw_plugin_host.
@@ -307,6 +421,18 @@ impl AppData {
         };
         if next_row != self.playhead_row {
             self.playhead_row = next_row;
+        }
+
+        // --- Plugin GUI ✕-button bridge ----------------------------------
+        // Runs on the Vizia main thread so it can safely send IPC. Converts
+        // the async WNDPROC signal into our synchronous close flow.
+        #[cfg(windows)]
+        if self.is_gui_open
+            && let Some(win) = &self.plugin_host_window
+            && win.take_close_request()
+        {
+            tracing::info!("plugin host window ✕ clicked; forwarding to CloseGui");
+            self.send_plugin(MainToChild::CloseGui);
         }
 
         // --- Peak meter --------------------------------------------------
