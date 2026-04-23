@@ -20,18 +20,35 @@ use crate::vst3_plugin::decode_event;
 
 // --- Input list (host -> plugin) -------------------------------------------
 
+/// Reusable input event list: the host-side `Vst3Plugin` owns a single
+/// `ComWrapper<Vst3InEventList>` for its lifetime and calls `set_events`
+/// before every `process()` to refill the backing buffer. Using
+/// `UnsafeCell` (rather than `RefCell` or a lock) avoids runtime cost in
+/// the audio thread.
 pub struct Vst3InEventList {
-    events: Vec<Event>,
+    events: UnsafeCell<Vec<Event>>,
 }
 
+// SAFETY: only the audio thread touches this during `process()`; the
+// plugin-main thread only calls `set_events` before starting the audio
+// thread (via the audio-thread-stop/start dance in `TracksHandle::mutate`).
 unsafe impl Send for Vst3InEventList {}
 unsafe impl Sync for Vst3InEventList {}
 
 impl Vst3InEventList {
-    pub fn new(events: &[Event]) -> Self {
+    pub fn new() -> Self {
         Self {
-            events: events.to_vec(),
+            events: UnsafeCell::new(Vec::with_capacity(256)),
         }
+    }
+
+    /// Copies `src` into the internal buffer, replacing its previous
+    /// contents. Capacity is retained across calls so this allocates only
+    /// when `src` exceeds the high-water mark.
+    pub fn set_events(&self, src: &[Event]) {
+        let events = unsafe { &mut *self.events.get() };
+        events.clear();
+        events.extend_from_slice(src);
     }
 }
 
@@ -41,14 +58,16 @@ impl Class for Vst3InEventList {
 
 impl IEventListTrait for Vst3InEventList {
     unsafe fn getEventCount(&self) -> i32 {
-        self.events.len() as i32
+        let events = &*self.events.get();
+        events.len() as i32
     }
 
     unsafe fn getEvent(&self, index: i32, e: *mut Event) -> tresult {
         if e.is_null() || index < 0 {
             return kInvalidArgument;
         }
-        let Some(src) = self.events.get(index as usize) else {
+        let events = &*self.events.get();
+        let Some(src) = events.get(index as usize) else {
             return kInvalidArgument;
         };
         *e = *src;

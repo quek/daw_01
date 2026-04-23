@@ -780,6 +780,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "vst3",
  "windows 0.61.3",
 ]
 

@@ -90,6 +90,13 @@ pub struct Vst3Plugin {
     /// Events the plugin emitted during the previous `process()`.
     collected_out_notes: Vec<TimedNoteEvent>,
 
+    /// Reusable IEventList instances fed to the plugin on every
+    /// `process()`. Owned here so the audio thread never allocates a new
+    /// `ComWrapper` per buffer (which would heap-allocate inside the RT
+    /// callback).
+    in_event_list: ComWrapper<Vst3InEventList>,
+    out_event_list: ComWrapper<Vst3OutEventList>,
+
     // --- GUI state -----------------------------------------------------
     view: Option<ComPtr<IPlugView>>,
     /// Plug-frame used to relay resize requests back to daw_gui.
@@ -285,6 +292,8 @@ impl Vst3Plugin {
             sample_rate: 0.0,
             in_event_buffer: Vec::with_capacity(256),
             collected_out_notes: Vec::with_capacity(256),
+            in_event_list: ComWrapper::new(Vst3InEventList::new()),
+            out_event_list: ComWrapper::new(Vst3OutEventList::new()),
             view: None,
             plug_frame,
             gui_attached: std::cell::Cell::new(false),
@@ -522,20 +531,25 @@ impl LoadedPlugin for Vst3Plugin {
             self.output_ptrs[i] = self.output_buffers[i].as_mut_ptr();
         }
 
-        // --- Build Event buffer.
+        // --- Build Event buffer and hand it to the reusable input list.
+        // No per-process allocation: both `in_event_buffer` and
+        // `Vst3InEventList` keep their capacity across calls.
         self.in_event_buffer.clear();
         for te in events {
             self.in_event_buffer.push(encode_event(te));
         }
+        self.in_event_list.set_events(&self.in_event_buffer);
         self.collected_out_notes.clear();
 
-        // --- Set up IEventList wrappers.
-        let in_list = ComWrapper::new(Vst3InEventList::new(&self.in_event_buffer));
-        let in_list_ptr = in_list
+        // `to_com_ptr` only bumps the Arc strong count + addRef; no heap
+        // allocation. The ComPtrs' Drop at end-of-scope balances the
+        // addRef with a release, keeping the ComWrapper's own ref.
+        let in_list_ptr = self
+            .in_event_list
             .to_com_ptr::<IEventList>()
             .context("Vst3InEventList has no IEventList")?;
-        let out_list = ComWrapper::new(Vst3OutEventList::new());
-        let out_list_ptr = out_list
+        let out_list_ptr = self
+            .out_event_list
             .to_com_ptr::<IEventList>()
             .context("Vst3OutEventList has no IEventList")?;
 
@@ -573,21 +587,18 @@ impl LoadedPlugin for Vst3Plugin {
             },
             inputParameterChanges: std::ptr::null_mut(),
             outputParameterChanges: std::ptr::null_mut(),
-            inputEvents: in_list_ptr.into_raw(),
-            outputEvents: out_list_ptr.into_raw(),
+            // as_ptr keeps shared ownership with the ComPtrs above; they
+            // release on scope exit, so nothing leaks and no extra release
+            // is needed after process().
+            inputEvents: in_list_ptr.as_ptr(),
+            outputEvents: out_list_ptr.as_ptr(),
             processContext: std::ptr::null_mut(),
         };
         let status = unsafe { self.audio.process(&mut data) };
 
-        // Release the event list ComPtrs we leaked into ProcessData fields
-        // so their reference counts drop back to the wrappers only.
-        unsafe {
-            let _ = ComPtr::<IEventList>::from_raw(data.inputEvents);
-            let _ = ComPtr::<IEventList>::from_raw(data.outputEvents);
-        }
-
-        // Drain collected events.
-        out_list.drain_into(&mut self.collected_out_notes);
+        // Drain collected events before the ComPtrs drop (order doesn't
+        // strictly matter, but keeps the reader's mental model simple).
+        self.out_event_list.drain_into(&mut self.collected_out_notes);
 
         Ok(status)
     }

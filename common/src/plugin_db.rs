@@ -135,30 +135,23 @@ pub fn scan_system() -> Result<PluginDatabase> {
         }
     }
 
-    // --- VST3 branch: bundle/file discovery only. Loading each .vst3 for
-    // class-info would add seconds per plugin; we rely on daw_plugin_host's
-    // backend to pick the first Audio Module Class when an empty / non-UUID
-    // id reaches it.
-    match crate::vst3_scan::scan_system_vst3_directory() {
-        Ok(vst3_entries) => {
-            for ent in vst3_entries {
-                let stem = ent
-                    .bundle_path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "vst3 plugin".into());
+    // --- VST3 branch: load each .vst3 briefly to enumerate its factory so
+    // the picker sees each Audio Module Class as its own entry (matching
+    // the CLAP behaviour). Per-plugin load cost is tens of ms, amortised
+    // by the on-disk cache at `default_cache_path()`.
+    match crate::vst3_scan::scan_vst3_classes() {
+        Ok(classes) => {
+            for c in classes {
+                let features = c.features();
                 entries.push(PluginEntry {
-                    id: stem.clone(),
+                    id: c.cid_hex,
                     format: PluginFormat::Vst3,
-                    name: stem,
-                    vendor: String::new(),
-                    version: String::new(),
-                    // Default to instrument category so the picker lists
-                    // VST3s under an instrument filter; the user can pick
-                    // any VST3 for any slot regardless.
-                    features: vec!["instrument".into()],
-                    path: ent.bundle_path,
-                    descriptor_index: 0,
+                    name: c.name,
+                    vendor: c.vendor,
+                    version: c.version,
+                    features,
+                    path: c.bundle_path,
+                    descriptor_index: c.descriptor_index,
                 });
             }
         }

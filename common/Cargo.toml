@@ -16,6 +16,7 @@ shared_memory.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+vst3.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
