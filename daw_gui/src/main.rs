@@ -250,7 +250,7 @@ fn run_gui(
             TransportView::new(cx).height(Pixels(44.0));
 
             HStack::new(cx, |cx| {
-                TrackInspectorView::new(cx).width(Pixels(220.0));
+                TrackInspectorView::new(cx).width(Pixels(280.0));
                 ArrangementView::new(cx).width(Stretch(1.0));
             })
             .height(Stretch(1.0));

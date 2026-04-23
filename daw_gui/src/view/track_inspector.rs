@@ -23,11 +23,15 @@ impl TrackInspectorView {
                 List::new(cx, AppData::inspector_chain, |cx, _idx, entry| {
                     HStack::new(cx, |cx| {
                         Label::new(cx, entry.map(|e| e.section_label.clone()))
-                            .width(Pixels(72.0))
+                            .width(Pixels(56.0))
                             .font_size(10.0)
                             .color(Color::rgb(150, 150, 180));
+                        // Single-line plugin-name cell — long names like
+                        // "VCV Rack 2" previously wrapped and got clipped by
+                        // the fixed row height.
                         Label::new(cx, entry.map(|e| e.plugin_name.clone()))
                             .width(Stretch(1.0))
+                            .text_wrap(false)
                             .color(Color::rgb(220, 220, 220));
                         Button::new(cx, |cx| Label::new(cx, "GUI"))
                             .on_press(move |ex| {

@@ -311,7 +311,10 @@ fn plugin_main_loop(
                     plugin_id,
                     initial_state,
                 } => {
-                    playback_state.store(PlaybackCommand::Stop as u8, Ordering::Release);
+                    // Note: tracks.mutate stops and restarts the audio
+                    // thread to swap in the new plugin. We do NOT touch
+                    // playback_state — the user's Play/Stop choice should
+                    // survive a chain edit.
                     let callbacks = make_callbacks(track, slot);
                     match Plugin::load(&path, &plugin_id, callbacks) {
                         Ok(plugin) => {
