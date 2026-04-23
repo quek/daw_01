@@ -8,7 +8,7 @@ impl TrackInspectorView {
     pub fn new(cx: &mut Context) -> Handle<'_, Self> {
         Self.build(cx, |cx| {
             VStack::new(cx, |cx| {
-                Label::new(cx, "Track 1")
+                Label::new(cx, AppData::selected_track_label)
                     .font_size(16.0)
                     .color(Color::rgb(220, 220, 220));
 
@@ -20,7 +20,7 @@ impl TrackInspectorView {
                     .font_size(12.0)
                     .color(Color::rgb(160, 160, 160));
 
-                List::new(cx, AppData::track0_chain, |cx, _idx, entry| {
+                List::new(cx, AppData::inspector_chain, |cx, _idx, entry| {
                     HStack::new(cx, |cx| {
                         Label::new(cx, entry.map(|e| e.section_label.clone()))
                             .width(Pixels(72.0))

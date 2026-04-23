@@ -13,7 +13,7 @@ use arc_swap::ArcSwapOption;
 use common::audio_bridge::{AudioBridgeHandle, CHANNELS};
 use common::model::{NoteEvent, Song};
 use common::protocol::{AudioSession, ChildKind, ChildToMain, MainToChild, PluginSlot, SlotState};
-use common::timing::{clip_bounds_samples, song_ended};
+use common::timing::{song_bounds_samples, song_ended};
 use common::win_sem::Semaphore;
 use common::wire::{read_msg, write_msg};
 use tokio::net::windows::named_pipe::NamedPipeClient;
@@ -1284,7 +1284,7 @@ fn run_audio(
                     st.active_notes.clear();
                 }
                 let wrap_to = if loop_state.load(Ordering::Acquire) {
-                    clip_bounds_samples(song_ref, sample_rate).map(|(start, _)| start)
+                    song_bounds_samples(song_ref, sample_rate).map(|(start, _)| start)
                 } else {
                     None
                 };

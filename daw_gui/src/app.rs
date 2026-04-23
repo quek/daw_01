@@ -112,12 +112,16 @@ pub struct AppData {
     /// What the user is adding when they open the picker — drives the
     /// picker's feature filter and the destination slot for the selection.
     pub plugin_picker_target: PickerTarget,
-    /// Chain entries for the visible track (currently track 0). Rebuilt
-    /// whenever the track's instrument/fx_chain changes so the Track
-    /// Inspector list updates automatically.
-    pub track0_chain: Vec<ChainEntry>,
-    /// Name of the currently loaded instrument, or empty. Convenience
-    /// mirror for UI display; primary storage is `song.tracks[0]`.
+    /// Chain entries for the track the Inspector is currently viewing
+    /// (driven by `cursor_track`). Rebuilt whenever that track's
+    /// instrument / fx / midi-fx chain changes, or the cursor moves.
+    pub inspector_chain: Vec<ChainEntry>,
+    /// Display label for the selected track (e.g. "Track 1") shown in the
+    /// Inspector heading. Refreshed alongside `inspector_chain`.
+    pub selected_track_label: String,
+    /// Name of the loaded instrument on the selected track, or a placeholder.
+    /// Convenience mirror for UI display; primary storage is
+    /// `song.tracks[cursor_track].instrument`.
     pub instrument_label: String,
     /// When non-`None`, a save is in flight waiting for the plugin state
     /// reply; once `AllStatesReceived` arrives the data is written to this
@@ -189,7 +193,8 @@ impl AppData {
             plugin_picker_visible: Vec::new(),
             is_plugin_picker_open: false,
             plugin_picker_target: PickerTarget::Instrument,
-            track0_chain: Vec::new(),
+            inspector_chain: Vec::new(),
+            selected_track_label: "Track 1".to_string(),
             instrument_label: "(no instrument)".to_string(),
             pending_save_path: None,
             audio_tx: Some(audio_tx),
@@ -441,6 +446,8 @@ impl AppData {
     fn action_new(&mut self) {
         self.song = Song::default();
         self.file_path = None;
+        self.cursor_track = 0;
+        self.refresh_inspector_chain();
         tracing::info!("new project");
     }
 
@@ -454,12 +461,14 @@ impl AppData {
         match common::project::load(&path) {
             Ok(song) => {
                 tracing::info!(path = %path.display(), "loaded project");
-                // Resolve persisted plugin id → path via the database, then
-                // send SetClapPlugin with initial_state so the plugin comes
-                // back up with the same settings.
+                // Resolve persisted plugin ids → paths via the database, then
+                // send SetSlotPlugin with initial_state for every plugin on
+                // every track so they come back with the same settings.
                 self.restore_plugin_from_song(&song);
                 self.song = song;
                 self.file_path = Some(path);
+                self.cursor_track = 0;
+                self.refresh_inspector_chain();
             }
             Err(e) => {
                 tracing::error!(error = ?e, path = %path.display(), "failed to load project")
@@ -467,58 +476,52 @@ impl AppData {
         }
     }
 
-    /// Resolves every plugin id on track 0 (MIDI FX → Instrument → FX) via
-    /// the database and re-sends them with their persisted state. Order
-    /// matters because plugin_host installs FX into the next free index, so
-    /// chain-order replay reproduces the original slot indices.
-    ///
-    /// NOTE: MVP touches track 0 only — multi-track restore lands when the
-    /// per-track Chain map exists in plugin_host.
+    /// Resolves every plugin id on every track (MIDI FX → Instrument → FX)
+    /// via the database and re-sends them with their persisted state.
+    /// Chain-order replay matters because plugin_host installs FX / MIDI FX
+    /// into the next free index on each track, so we must replay in the
+    /// same order the entries were saved in.
     fn restore_plugin_from_song(&mut self, song: &Song) {
-        let Some(track) = song.tracks.first() else {
-            self.instrument_label = "(no instrument)".into();
-            return;
-        };
         let Some(db) = self.plugin_db.clone() else {
             tracing::warn!("plugin database not loaded; cannot resolve plugin ids");
             return;
         };
-        // Snapshot all (slot, instance) pairs first so we can mutate self
-        // while iterating.
-        let mut to_send: Vec<(PluginSlot, common::model::PluginInstance)> = Vec::new();
-        for (i, p) in track.midi_fx_chain.iter().enumerate() {
-            to_send.push((PluginSlot::MidiFx(i as u32), p.clone()));
+        // Snapshot every (track, slot, instance) triple so we can mutate
+        // self while iterating. Track order comes from the song's Vec which
+        // already matches the user's arrangement.
+        let mut to_send: Vec<(u32, PluginSlot, common::model::PluginInstance)> = Vec::new();
+        for (track_idx, track) in song.tracks.iter().enumerate() {
+            let t = track_idx as u32;
+            for (i, p) in track.midi_fx_chain.iter().enumerate() {
+                to_send.push((t, PluginSlot::MidiFx(i as u32), p.clone()));
+            }
+            if let Some(inst) = track.instrument.as_ref() {
+                to_send.push((t, PluginSlot::Instrument, inst.clone()));
+            }
+            for (i, p) in track.fx_chain.iter().enumerate() {
+                to_send.push((t, PluginSlot::Fx(i as u32), p.clone()));
+            }
         }
-        if let Some(inst) = track.instrument.as_ref() {
-            to_send.push((PluginSlot::Instrument, inst.clone()));
-        } else {
-            self.instrument_label = "(no instrument)".into();
-        }
-        for (i, p) in track.fx_chain.iter().enumerate() {
-            to_send.push((PluginSlot::Fx(i as u32), p.clone()));
-        }
-        for (slot, inst) in to_send {
+        for (track, slot, inst) in to_send {
             let Some(entry) = db.find_by_id(&inst.plugin_id) else {
-                tracing::error!(id = %inst.plugin_id, ?slot, "plugin id not in database");
+                tracing::error!(id = %inst.plugin_id, track, ?slot, "plugin id not in database");
                 continue;
             };
             tracing::info!(
+                track,
+                ?slot,
                 id = %entry.id,
                 path = %entry.path.display(),
-                ?slot,
                 has_state = inst.state.is_some(),
                 "restoring plugin from project"
             );
             self.send_plugin(MainToChild::SetSlotPlugin {
-                track: 0,
+                track,
                 slot,
                 path: entry.path.clone(),
                 plugin_id: entry.id.clone(),
                 initial_state: inst.state.clone(),
             });
-            if matches!(slot, PluginSlot::Instrument) {
-                self.instrument_label = plugin_label_from_entry(entry);
-            }
         }
     }
 
@@ -673,7 +676,7 @@ impl AppData {
                     plugin_id: id,
                     state,
                 });
-                if track_idx == 0 {
+                if track == self.cursor_track {
                     self.instrument_label = label;
                 }
             }
@@ -704,8 +707,10 @@ impl AppData {
                 }
             }
         }
-        if track_idx == 0 {
-            self.refresh_track0_chain();
+        // Refresh the Inspector only when the loaded slot belongs to the
+        // track the user is currently viewing.
+        if track == self.cursor_track {
+            self.refresh_inspector_chain();
         }
     }
 
@@ -718,7 +723,9 @@ impl AppData {
             1 => PluginSlot::Instrument,
             _ => PluginSlot::Fx(slot_index),
         };
-        let track = 0u32; // MVP: Track Inspector only addresses track 0.
+        // The Inspector operates on the selected track. Match plugin_host's
+        // addressing by sending the same `cursor_track` through IPC.
+        let track = self.cursor_track;
         #[cfg(windows)]
         {
             if self.plugin_host_windows.contains_key(&(track, slot)) {
@@ -767,16 +774,19 @@ impl AppData {
         Some(self.resolve_name(id))
     }
 
-    /// Remove the plugin at the given chain slot.
+    /// Remove the plugin at the given chain slot on the currently selected
+    /// track. Sends `RemoveSlotPlugin` to the host and mirrors the change in
+    /// the model so the Inspector refreshes immediately.
     fn remove_slot(&mut self, slot_kind: u8, slot_index: u32) {
         let slot = match slot_kind {
             0 => PluginSlot::MidiFx(slot_index),
             1 => PluginSlot::Instrument,
             _ => PluginSlot::Fx(slot_index),
         };
-        tracing::info!(?slot, "removing plugin slot");
-        self.send_plugin(MainToChild::RemoveSlotPlugin { track: 0, slot });
-        if let Some(track) = self.song.tracks.get_mut(0) {
+        let track_idx = self.cursor_track;
+        tracing::info!(track = track_idx, ?slot, "removing plugin slot");
+        self.send_plugin(MainToChild::RemoveSlotPlugin { track: track_idx, slot });
+        if let Some(track) = self.song.tracks.get_mut(track_idx as usize) {
             match slot {
                 PluginSlot::Instrument => {
                     track.instrument = None;
@@ -796,7 +806,7 @@ impl AppData {
                 }
             }
         }
-        self.refresh_track0_chain();
+        self.refresh_inspector_chain();
     }
 
     /// `ChildToMain::AllPluginStates` reply. Each entry is dispatched to its
@@ -831,6 +841,7 @@ impl AppData {
         } else {
             common::timing::playhead_to_row(
                 Some(&self.song),
+                self.cursor_track,
                 common::audio_bridge::SAMPLE_RATE,
                 playhead_samples,
             )
@@ -882,8 +893,9 @@ impl AppData {
     }
 
     /// User picked a plugin from the DB-backed picker overlay. Resolves the
-    /// path from the database and swaps in the plugin (no state to restore:
-    /// this is an explicit "new plugin" flow).
+    /// path from the database and adds the plugin to the currently selected
+    /// track's chain (no state to restore: this is an explicit "new plugin"
+    /// flow).
     fn select_plugin_from_db(&mut self, id: String) {
         self.is_plugin_picker_open = false;
         // Pull everything we need out of the DB before starting mutations
@@ -899,7 +911,11 @@ impl AppData {
         let path = entry.path.clone();
         let entry_label = plugin_label_from_entry(entry);
         let entry_id = entry.id.clone();
-        // Pick the destination slot based on what the user was adding.
+        self.ensure_first_track();
+        let track_idx = self.cursor_track;
+        // Pick the destination slot based on what the user was adding,
+        // using the selected track's current chain lengths for FX / MIDI FX
+        // append positions.
         let target = self.plugin_picker_target;
         let dest_slot = match target {
             PickerTarget::Instrument => PluginSlot::Instrument,
@@ -907,7 +923,7 @@ impl AppData {
                 let next = self
                     .song
                     .tracks
-                    .first()
+                    .get(track_idx as usize)
                     .map(|t| t.fx_chain.len() as u32)
                     .unwrap_or(0);
                 PluginSlot::Fx(next)
@@ -916,15 +932,21 @@ impl AppData {
                 let next = self
                     .song
                     .tracks
-                    .first()
+                    .get(track_idx as usize)
                     .map(|t| t.midi_fx_chain.len() as u32)
                     .unwrap_or(0);
                 PluginSlot::MidiFx(next)
             }
         };
-        tracing::info!(id = %entry_id, ?dest_slot, path = %path.display(), "user picked plugin");
+        tracing::info!(
+            track = track_idx,
+            id = %entry_id,
+            ?dest_slot,
+            path = %path.display(),
+            "user picked plugin"
+        );
         self.send_plugin(MainToChild::SetSlotPlugin {
-            track: 0,
+            track: track_idx,
             slot: dest_slot,
             path,
             plugin_id: entry_id.clone(),
@@ -932,8 +954,7 @@ impl AppData {
         });
         // Update song model optimistically; the final id/name lands via the
         // `SlotPluginLoaded` callback from plugin_host.
-        self.ensure_first_track();
-        if let Some(track) = self.song.tracks.get_mut(0) {
+        if let Some(track) = self.song.tracks.get_mut(track_idx as usize) {
             match dest_slot {
                 PluginSlot::Instrument => {
                     track.instrument =
@@ -954,17 +975,30 @@ impl AppData {
         if matches!(dest_slot, PluginSlot::Instrument) {
             self.instrument_label = entry_label;
         }
-        self.refresh_track0_chain();
+        self.refresh_inspector_chain();
     }
 
-    /// Rebuild `track0_chain` from `song.tracks[0]`. Called after any
-    /// instrument/fx_chain/midi_fx_chain mutation so the Track Inspector
-    /// list updates.
-    fn refresh_track0_chain(&mut self) {
+    /// Rebuild `inspector_chain`, `selected_track_label`, and
+    /// `instrument_label` from the track at `cursor_track`. Called after any
+    /// chain mutation on that track, or when the cursor moves to a
+    /// different track.
+    fn refresh_inspector_chain(&mut self) {
         let mut out: Vec<ChainEntry> = Vec::new();
-        let Some(track) = self.song.tracks.first() else {
-            self.track0_chain = out;
+        let track_idx = self.cursor_track as usize;
+        let Some(track) = self.song.tracks.get(track_idx) else {
+            self.inspector_chain = out;
+            self.selected_track_label = format!("Track {}", self.cursor_track + 1);
+            self.instrument_label = "(no instrument)".into();
             return;
+        };
+        self.selected_track_label = if track.name.is_empty() {
+            format!("Track {}", self.cursor_track + 1)
+        } else {
+            track.name.clone()
+        };
+        self.instrument_label = match track.instrument.as_ref() {
+            Some(inst) => self.resolve_name(&inst.plugin_id),
+            None => "(no instrument)".into(),
         };
         for (i, p) in track.midi_fx_chain.iter().enumerate() {
             out.push(ChainEntry {
@@ -990,7 +1024,7 @@ impl AppData {
                 plugin_name: self.resolve_name(&p.plugin_id),
             });
         }
-        self.track0_chain = out;
+        self.inspector_chain = out;
     }
 
     /// Rebuild `plugin_picker_visible` from `plugin_picker_entries` using
@@ -1052,7 +1086,12 @@ impl AppData {
     fn move_cursor_track(&mut self, delta: i32) {
         let max = self.song.tracks.len().saturating_sub(1) as i64;
         let next = (self.cursor_track as i64 + delta as i64).clamp(0, max.max(0));
-        self.cursor_track = next as u32;
+        if next as u32 != self.cursor_track {
+            self.cursor_track = next as u32;
+            // Selected-track change → Inspector must show the new track's
+            // chain and labels.
+            self.refresh_inspector_chain();
+        }
     }
 
     fn move_cursor_row(&mut self, delta: i32) {
