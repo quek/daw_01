@@ -49,6 +49,10 @@ const WM_COMMAND_WAKE: u32 = WM_APP + 1;
 
 /// Events pushed from the plugin-main thread (or its CLAP callbacks) to the
 /// IPC sender so they can be relayed to daw_gui as `ChildToMain`.
+///
+/// MVP: all events are tagged with `(track=0, slot=Instrument)` since
+/// plugin_host currently hosts a single implicit plugin. Per-track
+/// addressing lands in a follow-up commit.
 #[derive(Debug, Clone)]
 pub enum PluginEvent {
     GuiOpened { width: u32, height: u32 },
@@ -60,14 +64,36 @@ pub enum PluginEvent {
 
 impl From<PluginEvent> for ChildToMain {
     fn from(e: PluginEvent) -> Self {
+        // TODO: route per-track once plugin_host keeps per-track chains.
+        let track = 0;
+        let slot = common::protocol::PluginSlot::Instrument;
         match e {
-            PluginEvent::GuiOpened { width, height } => ChildToMain::GuiOpened { width, height },
+            PluginEvent::GuiOpened { width, height } => ChildToMain::SlotGuiOpened {
+                track,
+                slot,
+                width,
+                height,
+            },
             PluginEvent::GuiRequestResize { width, height } => {
-                ChildToMain::GuiRequestResize { width, height }
+                ChildToMain::SlotGuiRequestResize {
+                    track,
+                    slot,
+                    width,
+                    height,
+                }
             }
-            PluginEvent::GuiClosed => ChildToMain::GuiClosed,
-            PluginEvent::PluginLoaded { id, name } => ChildToMain::PluginLoaded { id, name },
-            PluginEvent::PluginState(s) => ChildToMain::PluginState(s),
+            PluginEvent::GuiClosed => ChildToMain::SlotGuiClosed { track, slot },
+            PluginEvent::PluginLoaded { id, name } => ChildToMain::SlotPluginLoaded {
+                track,
+                slot,
+                id,
+                name,
+            },
+            PluginEvent::PluginState(data) => ChildToMain::SlotPluginState {
+                track,
+                slot,
+                data,
+            },
         }
     }
 }
@@ -483,16 +509,23 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             );
             plugin.send(PluginCommand::LoadSong(song));
         }
-        MainToChild::SetClapPlugin {
+        // Phase A MVP: plugin_host hosts exactly ONE plugin and treats
+        // every (track, slot) as if it addressed the single slot. Per-track
+        // routing comes in Phase B.
+        MainToChild::SetSlotPlugin {
+            track,
+            slot,
             path,
             plugin_id,
             initial_state,
         } => {
             tracing::info!(
+                track,
+                ?slot,
                 path = %path.display(),
                 id = %plugin_id,
                 has_state = initial_state.is_some(),
-                "received SetClapPlugin"
+                "received SetSlotPlugin"
             );
             plugin.send(PluginCommand::SetClap {
                 path,
@@ -500,24 +533,45 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
                 initial_state,
             });
         }
-        MainToChild::RequestPluginState => {
-            tracing::info!("received RequestPluginState");
+        MainToChild::RemoveSlotPlugin { track, slot } => {
+            tracing::info!(track, ?slot, "received RemoveSlotPlugin (MVP no-op)");
+        }
+        MainToChild::MoveSlot { track, from, to } => {
+            tracing::info!(track, ?from, ?to, "received MoveSlot (MVP no-op)");
+        }
+        MainToChild::RequestSlotState { track, slot } => {
+            tracing::info!(track, ?slot, "received RequestSlotState");
+            plugin.send(PluginCommand::RequestState);
+        }
+        MainToChild::RequestAllStates => {
+            tracing::info!("received RequestAllStates");
+            // Phase A: forward as a single-slot state request; the reply
+            // wraps one entry for track 0 / Instrument.
             plugin.send(PluginCommand::RequestState);
         }
         MainToChild::SetLoop(on) => {
             tracing::info!(on, "received SetLoop");
             plugin.send(PluginCommand::SetLoop(on));
         }
-        MainToChild::OpenGuiEmbedded { host_hwnd } => {
-            tracing::info!(host_hwnd, "received OpenGuiEmbedded");
+        MainToChild::OpenSlotGuiEmbedded {
+            track,
+            slot,
+            host_hwnd,
+        } => {
+            tracing::info!(track, ?slot, host_hwnd, "received OpenSlotGuiEmbedded");
             plugin.send(PluginCommand::OpenGuiEmbedded { host_hwnd });
         }
-        MainToChild::CloseGui => {
-            tracing::info!("received CloseGui");
+        MainToChild::CloseSlotGui { track, slot } => {
+            tracing::info!(track, ?slot, "received CloseSlotGui");
             plugin.send(PluginCommand::CloseGui);
         }
-        MainToChild::ResizeGui { width, height } => {
-            tracing::info!(width, height, "received ResizeGui");
+        MainToChild::ResizeSlotGui {
+            track,
+            slot,
+            width,
+            height,
+        } => {
+            tracing::info!(track, ?slot, width, height, "received ResizeSlotGui");
             plugin.send(PluginCommand::ResizeGui { width, height });
         }
         other => {

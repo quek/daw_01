@@ -88,9 +88,6 @@ mod tests {
             tracks: vec![Track {
                 name: "T".into(),
                 source: InstrumentSource::BuiltinSynth,
-                fx_chain: vec![],
-                volume: 1.0,
-                pan: 0.0,
                 clips: vec![Clip {
                     name: "C".into(),
                     start_beat,
@@ -98,6 +95,7 @@ mod tests {
                     rows_per_beat: 4,
                     rows: vec![Row::default(); row_count],
                 }],
+                ..Track::default()
             }],
             ..Song::default()
         }

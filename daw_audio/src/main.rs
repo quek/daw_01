@@ -102,8 +102,11 @@ async fn recv_loop(
             Ok(MainToChild::LoadSong(_)) => {
                 // Song state lives in daw_plugin_host; daw_audio does not use it.
             }
-            Ok(MainToChild::SetClapPlugin { .. })
-            | Ok(MainToChild::RequestPluginState) => {
+            Ok(MainToChild::SetSlotPlugin { .. })
+            | Ok(MainToChild::RemoveSlotPlugin { .. })
+            | Ok(MainToChild::MoveSlot { .. })
+            | Ok(MainToChild::RequestSlotState { .. })
+            | Ok(MainToChild::RequestAllStates) => {
                 // CLAP plugin lifecycle / state is handled by daw_plugin_host.
             }
             Ok(MainToChild::SetLoop(_)) => {
@@ -114,9 +117,9 @@ async fn recv_loop(
                 tracing::info!(gain = clamped, "received SetMasterGain");
                 master_gain.store(clamped.to_bits(), Ordering::Relaxed);
             }
-            Ok(MainToChild::OpenGuiEmbedded { .. })
-            | Ok(MainToChild::CloseGui)
-            | Ok(MainToChild::ResizeGui { .. }) => {
+            Ok(MainToChild::OpenSlotGuiEmbedded { .. })
+            | Ok(MainToChild::CloseSlotGui { .. })
+            | Ok(MainToChild::ResizeSlotGui { .. }) => {
                 // Plugin GUI lifecycle is handled by daw_plugin_host.
             }
             Err(e) => {

@@ -119,7 +119,7 @@ impl AppData {
                         vendor: e.vendor.clone(),
                     })
                     .collect();
-                v.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                v.sort_by_key(|e| e.name.to_lowercase());
                 v
             })
             .unwrap_or_default();
@@ -378,36 +378,45 @@ impl AppData {
         }
     }
 
-    /// Looks up the persisted plugin id in the database, sends
+    /// Looks up the persisted plugin id on track 0 in the database, sends
     /// `SetClapPlugin` with the restored state, and updates the local
     /// mirrors. Silently skips when the id is missing from the DB so the
     /// project can still open (user can pick a plugin manually).
+    ///
+    /// NOTE: MVP wires the "active" plugin to `tracks[0].instrument`.
+    /// Multi-track support is coming in a follow-up.
     fn restore_plugin_from_song(&mut self, song: &Song) {
-        let Some(id) = song.clap_plugin_id.as_deref() else {
-            tracing::info!("project has no CLAP plugin id; nothing to restore");
+        let Some(inst) = song
+            .tracks
+            .first()
+            .and_then(|t| t.instrument.as_ref())
+        else {
+            tracing::info!("project has no CLAP plugin on track 0; nothing to restore");
             self.clap_plugin_id = None;
             self.clap_plugin_path = None;
             self.clap_plugin_label = plugin_label(None);
             return;
         };
         let Some(db) = self.plugin_db.as_deref() else {
-            tracing::warn!(id, "plugin database not loaded yet; cannot resolve id");
+            tracing::warn!(id = %inst.plugin_id, "plugin database not loaded; cannot resolve id");
             return;
         };
-        let Some(entry) = db.find_by_id(id) else {
-            tracing::error!(id, "plugin id not in database (plugin not installed?)");
+        let Some(entry) = db.find_by_id(&inst.plugin_id) else {
+            tracing::error!(id = %inst.plugin_id, "plugin id not in database");
             return;
         };
         tracing::info!(
-            id,
+            id = %entry.id,
             path = %entry.path.display(),
-            has_state = song.clap_plugin_state.is_some(),
+            has_state = inst.state.is_some(),
             "restoring CLAP plugin from project"
         );
-        self.send_plugin(MainToChild::SetClapPlugin {
+        self.send_plugin(MainToChild::SetSlotPlugin {
+            track: 0,
+            slot: common::protocol::PluginSlot::Instrument,
             path: entry.path.clone(),
             plugin_id: entry.id.clone(),
-            initial_state: song.clap_plugin_state.clone(),
+            initial_state: inst.state.clone(),
         });
         self.clap_plugin_id = Some(entry.id.clone());
         self.clap_plugin_path = Some(entry.path.clone());
@@ -438,7 +447,7 @@ impl AppData {
     fn begin_save(&mut self, path: PathBuf) {
         if self.clap_plugin_id.is_some() {
             self.pending_save_path = Some(path);
-            self.send_plugin(MainToChild::RequestPluginState);
+            self.send_plugin(MainToChild::RequestAllStates);
         } else {
             // No plugin loaded: write immediately without a state round-trip.
             self.finish_save(path, None);
@@ -446,9 +455,17 @@ impl AppData {
     }
 
     fn finish_save(&mut self, path: PathBuf, plugin_state: Option<Vec<u8>>) {
-        // Snapshot current plugin id/state into the song before serializing.
-        self.song.clap_plugin_id = self.clap_plugin_id.clone();
-        self.song.clap_plugin_state = plugin_state;
+        // Snapshot plugin id/state into Track[0].instrument (MVP single-plugin
+        // binding) before serializing. When there is no track yet, there's
+        // nothing to persist.
+        if let (Some(id), Some(track)) =
+            (self.clap_plugin_id.clone(), self.song.tracks.get_mut(0))
+        {
+            track.instrument = Some(common::model::PluginInstance {
+                plugin_id: id,
+                state: plugin_state,
+            });
+        }
         if self.save_to(&path) {
             self.file_path = Some(path);
         }
@@ -468,7 +485,10 @@ impl AppData {
     fn toggle_plugin_gui(&mut self) {
         if self.is_gui_open {
             // Close flow: send IPC, wait for GuiClosedFromChild to tear down.
-            self.send_plugin(MainToChild::CloseGui);
+            self.send_plugin(MainToChild::CloseSlotGui {
+                track: 0,
+                slot: common::protocol::PluginSlot::Instrument,
+            });
             return;
         }
         match crate::view::plugin_embed::PluginHostWindow::create(
@@ -480,7 +500,11 @@ impl AppData {
                 let hwnd = win.hwnd_u64();
                 self.plugin_host_window = Some(win);
                 tracing::info!(hwnd, "created plugin host window, requesting embed");
-                self.send_plugin(MainToChild::OpenGuiEmbedded { host_hwnd: hwnd });
+                self.send_plugin(MainToChild::OpenSlotGuiEmbedded {
+                    track: 0,
+                    slot: common::protocol::PluginSlot::Instrument,
+                    host_hwnd: hwnd,
+                });
                 self.is_gui_open = true;
             }
             Err(e) => {
@@ -517,7 +541,12 @@ impl AppData {
         if let Some(win) = &self.plugin_host_window {
             win.set_client_size(width, height);
         }
-        self.send_plugin(MainToChild::ResizeGui { width, height });
+        self.send_plugin(MainToChild::ResizeSlotGui {
+            track: 0,
+            slot: common::protocol::PluginSlot::Instrument,
+            width,
+            height,
+        });
     }
 
     #[cfg(not(windows))]
@@ -592,7 +621,10 @@ impl AppData {
             && win.take_close_request()
         {
             tracing::info!("plugin host window ✕ clicked; forwarding to CloseGui");
-            self.send_plugin(MainToChild::CloseGui);
+            self.send_plugin(MainToChild::CloseSlotGui {
+                track: 0,
+                slot: common::protocol::PluginSlot::Instrument,
+            });
         }
 
         // --- Peak meter --------------------------------------------------
@@ -633,7 +665,9 @@ impl AppData {
         };
         let path = entry.path.clone();
         tracing::info!(id = %entry.id, path = %path.display(), "user picked plugin");
-        self.send_plugin(MainToChild::SetClapPlugin {
+        self.send_plugin(MainToChild::SetSlotPlugin {
+            track: 0,
+            slot: common::protocol::PluginSlot::Instrument,
             path: path.clone(),
             plugin_id: entry.id.clone(),
             initial_state: None,
@@ -642,8 +676,9 @@ impl AppData {
         self.clap_plugin_path = Some(path);
         self.clap_plugin_id = Some(entry.id.clone());
         // Starting fresh — drop any persisted state from a previous plugin.
-        self.song.clap_plugin_id = Some(entry.id.clone());
-        self.song.clap_plugin_state = None;
+        if let Some(track) = self.song.tracks.get_mut(0) {
+            track.instrument = Some(common::model::PluginInstance::new(entry.id.clone()));
+        }
     }
 
     fn action_add_vocal_track(&mut self) {
@@ -654,10 +689,8 @@ impl AppData {
                 speaker_id: 3,
                 style_name: "ノーマル".into(),
             },
-            fx_chain: vec![],
-            volume: 1.0,
-            pan: 0.0,
             clips: vec![demo_clip()],
+            ..Track::default()
         };
         self.song.tracks.push(track);
         tracing::info!(index, "added vocal track");

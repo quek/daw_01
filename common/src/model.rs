@@ -49,21 +49,6 @@ pub struct Song {
     pub length_beats: f64,
     #[serde(default)]
     pub tracks: Vec<Track>,
-    /// Stable CLAP plugin identifier (`clap_plugin_descriptor.id`) for the
-    /// currently loaded instrument. `None` = no plugin selected. Persisting
-    /// the ID instead of the path makes projects portable across machines
-    /// where the `.clap` lives at different locations.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clap_plugin_id: Option<String>,
-    /// Opaque binary state the plugin writes via `clap_plugin_state.save`.
-    /// Restored via `clap_plugin_state.load` on project open. Encoded as
-    /// base64 in JSON (see `base64_opt`), kept as raw bytes in bincode.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "base64_opt"
-    )]
-    pub clap_plugin_state: Option<Vec<u8>>,
 }
 
 impl Default for Song {
@@ -73,36 +58,87 @@ impl Default for Song {
             time_sig: (4, 4),
             length_beats: 64.0,
             tracks: Vec::new(),
-            clap_plugin_id: None,
-            clap_plugin_state: None,
         }
     }
 }
 
+/// A track owns a full CLAP signal chain in three sections:
+///
+/// 1. `midi_fx_chain` — note-effect plugins (arpeggiator / quantizer / ...)
+///    processed in order, piping out_events into the next plugin's in_events.
+/// 2. `instrument` — the note→audio plugin (receives the MIDI FX output).
+///    `None` when the track has no instrument yet.
+/// 3. `fx_chain` — audio-effect plugins (compressor / reverb / ...) applied
+///    to the instrument's audio output in order.
+///
+/// Clips on the track feed the MIDI FX chain at the top of the buffer. The
+/// final audio is mixed into the master bus.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Track {
     pub name: String,
-    pub source: InstrumentSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instrument: Option<PluginInstance>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub midi_fx_chain: Vec<PluginInstance>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fx_chain: Vec<PluginInstance>,
     pub volume: f32,
     pub pan: f32,
+    /// Future use: VOICEVOX speaker / style etc. Kept distinct from the
+    /// `instrument` slot because it selects a rendering backend, not a CLAP
+    /// plugin.
+    #[serde(default)]
+    pub source: InstrumentSource,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clips: Vec<Clip>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub enum InstrumentSource {
+    #[default]
+    None,
     Vocal { speaker_id: u32, style_name: String },
-    Clap { path: PathBuf, plugin_id: String },
     Vst3 { path: PathBuf },
     BuiltinSynth,
 }
 
+impl Default for Track {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            instrument: None,
+            midi_fx_chain: Vec::new(),
+            fx_chain: Vec::new(),
+            volume: 1.0,
+            pan: 0.0,
+            source: InstrumentSource::None,
+            clips: Vec::new(),
+        }
+    }
+}
+
+/// Reference to a CLAP plugin loaded on a track, with the state blob the
+/// plugin itself produced via `clap_plugin_state.save`. Paths are NOT
+/// stored — the plugin-id is resolved to a path through
+/// `plugin_db::PluginDatabase` at load time, keeping projects portable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub struct PluginInstance {
-    pub path: PathBuf,
     pub plugin_id: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "base64_opt"
+    )]
+    pub state: Option<Vec<u8>>,
+}
+
+impl PluginInstance {
+    pub fn new(plugin_id: String) -> Self {
+        Self {
+            plugin_id,
+            state: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
@@ -218,9 +254,6 @@ mod tests {
                     speaker_id: 3,
                     style_name: "ノーマル".into(),
                 },
-                fx_chain: vec![],
-                volume: 1.0,
-                pan: 0.0,
                 clips: vec![Clip {
                     name: "こんにちは".into(),
                     start_beat: 0.0,
@@ -242,6 +275,7 @@ mod tests {
                         },
                     ],
                 }],
+                ..Track::default()
             }],
             ..Song::default()
         };

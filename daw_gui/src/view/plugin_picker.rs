@@ -37,10 +37,10 @@ impl PluginPickerView {
                         // default light theme doesn't wash out the labels.
                         Button::new(cx, |cx| {
                             HStack::new(cx, |cx| {
-                                Label::new(cx, item.clone().map(|e| e.name.clone()))
+                                Label::new(cx, item.map(|e| e.name.clone()))
                                     .color(Color::rgb(230, 230, 230));
                                 Element::new(cx).width(Stretch(1.0));
-                                Label::new(cx, item.clone().map(|e| e.vendor.clone()))
+                                Label::new(cx, item.map(|e| e.vendor.clone()))
                                     .color(Color::rgb(170, 170, 170))
                                     .font_size(11.0);
                             })

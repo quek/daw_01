@@ -85,9 +85,6 @@ mod tests {
                     speaker_id: 3,
                     style_name: "ノーマル".into(),
                 },
-                fx_chain: vec![],
-                volume: 1.0,
-                pan: 0.0,
                 clips: vec![Clip {
                     name: "こんにちは".into(),
                     start_beat: 0.0,
@@ -109,6 +106,7 @@ mod tests {
                         },
                     ],
                 }],
+                ..Track::default()
             }],
             ..Song::default()
         };

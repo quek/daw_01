@@ -1,5 +1,19 @@
 use bincode::{Decode, Encode};
 
+/// Addresses a single plugin slot inside a track. A track has:
+/// - MIDI FX chain: `MidiFx(0)`, `MidiFx(1)`, ...
+/// - one Instrument slot: `Instrument`
+/// - audio FX chain: `Fx(0)`, `Fx(1)`, ...
+///
+/// Indices within `MidiFx` / `Fx` are stable while the chain is unchanged;
+/// explicit `MoveSlot` messages rewrite them after a reorder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
+pub enum PluginSlot {
+    MidiFx(u32),
+    Instrument,
+    Fx(u32),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub enum ChildKind {
     Audio,
@@ -21,34 +35,53 @@ pub enum ChildToMain {
         kind: ChildKind,
         pid: u32,
     },
-    /// Sent after `create` + `show` succeeds. Carries the initial size the
-    /// plugin wants for its embedded window so daw_gui can resize the host
-    /// container.
-    GuiOpened {
-        width: u32,
-        height: u32,
-    },
-    /// Plugin-initiated resize via `clap_host_gui.request_resize`. daw_gui
-    /// should resize the container and ack with `MainToChild::ResizeGui`.
-    GuiRequestResize {
-        width: u32,
-        height: u32,
-    },
-    /// Plugin-initiated close (window X button handled by the plugin, or
-    /// `clap_host_gui.closed`). daw_gui should drop its embed HWND.
-    GuiClosed,
-    /// Emitted right after a successful `SetClapPlugin`. Lets daw_gui
-    /// capture the stable plugin ID (and display name) of what actually
-    /// loaded — the request carries an optional ID but the host is the
-    /// source of truth.
-    PluginLoaded {
+    /// Plugin-host confirmed `SetSlotPlugin` and reported the stable id /
+    /// display name of the descriptor that actually loaded.
+    SlotPluginLoaded {
+        track: u32,
+        slot: PluginSlot,
         id: String,
         name: String,
     },
-    /// Reply to `MainToChild::RequestPluginState`. `None` means the plugin
-    /// does not implement the `clap.state` extension, or there is no
-    /// plugin loaded.
-    PluginState(Option<Vec<u8>>),
+    /// Reply to `RequestSlotState`. `None` = plugin unavailable or state
+    /// extension missing.
+    SlotPluginState {
+        track: u32,
+        slot: PluginSlot,
+        data: Option<Vec<u8>>,
+    },
+    /// Reply to `RequestAllStates`: one entry per slot that had a plugin
+    /// loaded at request time. Makes project save a single round-trip.
+    AllPluginStates {
+        entries: Vec<SlotState>,
+    },
+    /// GUI opened at the requested size.
+    SlotGuiOpened {
+        track: u32,
+        slot: PluginSlot,
+        width: u32,
+        height: u32,
+    },
+    /// Plugin-initiated resize via `clap_host_gui.request_resize`.
+    SlotGuiRequestResize {
+        track: u32,
+        slot: PluginSlot,
+        width: u32,
+        height: u32,
+    },
+    /// Plugin-initiated close (X button handled by plugin, or `closed`).
+    SlotGuiClosed {
+        track: u32,
+        slot: PluginSlot,
+    },
+}
+
+/// Single entry in the `AllPluginStates` reply.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct SlotState {
+    pub track: u32,
+    pub slot: PluginSlot,
+    pub data: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -68,33 +101,55 @@ pub enum MainToChild {
     Stop,
     Session(AudioSession),
     LoadSong(crate::model::Song),
-    /// Load a CLAP plugin and optionally restore its state. `plugin_id`
-    /// empty means "use the first descriptor in the file" (backward
-    /// compatibility for ad-hoc file-dialog selection); non-empty selects
-    /// the specific descriptor by ID. `initial_state`, when `Some`, is
-    /// applied via `clap_plugin_state.load` right after activate.
-    SetClapPlugin {
+    SetLoop(bool),
+    SetMasterGain(f32),
+    // --- Per-track plugin slot management -----------------------------
+    /// Load / replace the plugin in `(track, slot)`. Empty `plugin_id`
+    /// picks the first descriptor in `path`; non-empty selects by id.
+    /// `initial_state`, when `Some`, is applied via
+    /// `clap_plugin_state.load` right after activate.
+    SetSlotPlugin {
+        track: u32,
+        slot: PluginSlot,
         path: std::path::PathBuf,
         plugin_id: String,
         initial_state: Option<Vec<u8>>,
     },
-    SetLoop(bool),
-    SetMasterGain(f32),
-    /// Ask the plugin_host to capture the current plugin state. Reply is
-    /// delivered as `ChildToMain::PluginState`.
-    RequestPluginState,
-    /// Request the plugin to create + embed + show its GUI as a child of the
-    /// given Win32 HWND (serialized as `u64` since HWND isn't directly
-    /// `Encode`-able). daw_plugin_host replies with `ChildToMain::GuiOpened`.
-    OpenGuiEmbedded {
+    /// Remove the plugin at `(track, slot)` if any.
+    RemoveSlotPlugin {
+        track: u32,
+        slot: PluginSlot,
+    },
+    /// Reorder: move the plugin at `(track, from)` to `(track, to)`. Only
+    /// valid within the same section (`MidiFx → MidiFx`, `Fx → Fx`).
+    MoveSlot {
+        track: u32,
+        from: PluginSlot,
+        to: PluginSlot,
+    },
+    /// Ask the plugin_host to capture state for one slot. Reply is
+    /// `ChildToMain::SlotPluginState`.
+    RequestSlotState {
+        track: u32,
+        slot: PluginSlot,
+    },
+    /// Ask the plugin_host to capture state for every slot at once.
+    /// Reply is `ChildToMain::AllPluginStates` containing one entry per
+    /// loaded plugin. Used for project save.
+    RequestAllStates,
+    // --- GUI management ----------------------------------------------
+    OpenSlotGuiEmbedded {
+        track: u32,
+        slot: PluginSlot,
         host_hwnd: u64,
     },
-    /// Tear down the plugin GUI (hide + destroy).
-    CloseGui,
-    /// Tell the plugin "the container was resized to W×H, update your UI".
-    /// Sent after daw_gui resizes the host container in response to
-    /// `GuiRequestResize` or a user drag.
-    ResizeGui {
+    CloseSlotGui {
+        track: u32,
+        slot: PluginSlot,
+    },
+    ResizeSlotGui {
+        track: u32,
+        slot: PluginSlot,
         width: u32,
         height: u32,
     },

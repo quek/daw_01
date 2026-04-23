@@ -87,12 +87,14 @@ fn main() -> Result<()> {
     let clap_plugin_path: Option<PathBuf> = common::clap_scan::default_plugin_path();
     if let Some(path) = clap_plugin_path.clone() {
         tracing::info!(path = %path.display(), "initial CLAP plugin selected");
-        if let Err(e) = plugin_tx.send(MainToChild::SetClapPlugin {
+        if let Err(e) = plugin_tx.send(MainToChild::SetSlotPlugin {
+            track: 0,
+            slot: common::protocol::PluginSlot::Instrument,
             path,
             plugin_id: String::new(),
             initial_state: None,
         }) {
-            tracing::error!(error = ?e, "failed to enqueue initial SetClapPlugin");
+            tracing::error!(error = ?e, "failed to enqueue initial SetSlotPlugin");
         }
     } else {
         tracing::info!("no default CLAP plugin found; user must pick one manually");
@@ -301,18 +303,31 @@ list.plugin-picker-list list-item:hover {
 fn spawn_incoming_bridge(cx: &mut Context, mut rx: UnboundedReceiver<ChildToMain>) {
     cx.spawn(move |proxy| {
         while let Some(msg) = rx.blocking_recv() {
+            // Phase A: AppEvents still carry the legacy "single plugin"
+            // shape; per-slot routing lands when the UI is extended. All
+            // slot-addressed ChildToMain variants are projected onto the
+            // existing AppEvents, with (track, slot) discarded for now.
             let event = match msg {
-                ChildToMain::GuiOpened { width, height } => {
+                ChildToMain::SlotGuiOpened { width, height, .. } => {
                     Some(AppEvent::GuiOpenedFromChild { width, height })
                 }
-                ChildToMain::GuiRequestResize { width, height } => {
+                ChildToMain::SlotGuiRequestResize { width, height, .. } => {
                     Some(AppEvent::GuiRequestResizeFromChild { width, height })
                 }
-                ChildToMain::GuiClosed => Some(AppEvent::GuiClosedFromChild),
-                ChildToMain::PluginLoaded { id, name } => {
+                ChildToMain::SlotGuiClosed { .. } => Some(AppEvent::GuiClosedFromChild),
+                ChildToMain::SlotPluginLoaded { id, name, .. } => {
                     Some(AppEvent::PluginLoadedFromChild { id, name })
                 }
-                ChildToMain::PluginState(s) => Some(AppEvent::PluginStateReceived(s)),
+                ChildToMain::SlotPluginState { data, .. } => {
+                    Some(AppEvent::PluginStateReceived(data))
+                }
+                ChildToMain::AllPluginStates { entries } => {
+                    // MVP: expect 0 or 1 entry (single implicit slot).
+                    // Propagate as PluginStateReceived so the save flow
+                    // finalises. Multi-slot aggregation comes in Phase B.
+                    let data = entries.into_iter().next().and_then(|e| e.data);
+                    Some(AppEvent::PluginStateReceived(data))
+                }
                 ChildToMain::Hello { .. } => None,
             };
             if let Some(event) = event
