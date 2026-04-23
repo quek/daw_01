@@ -1,5 +1,5 @@
 use common::model::{FxCommand, Note, NoteEvent, Row, Song};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use vizia::prelude::*;
 
 use crate::app::AppData;
@@ -53,11 +53,23 @@ impl View for ArrangementView {
     }
 }
 
+/// Columns inside each track cell are laid out as
+/// `<NOT:3> <VOL:3> <FX:3> <LYR:3>` with single-space separators, for a
+/// total display width of 15 before the surrounding separators.
 const CELL_HEADER: &str = "NOT VOL FX  LYR";
-const LYRIC_WIDTH: usize = 2;
+/// Display width of `CELL_HEADER` (and of each data row's cell payload).
+const CELL_WIDTH: usize = 15;
+/// Display width reserved for the lyric sub-column. CJK moras are 2 cells,
+/// ASCII placeholders 1 — both get padded to this width.
+const LYRIC_WIDTH: usize = 3;
+/// Display width of each track cell *including* its leading separator style
+/// (either `" "` / `"  "` for non-cursor or `"["` / `"] "` for cursor).
+/// Chosen so every shape — `| {cell}  `, `|[{cell}] `, and the track-header
+/// cell — occupies the same number of cells after the `|`.
+const TRACK_HEADER_WIDTH: usize = CELL_WIDTH + 3;
 
 fn empty_cell() -> String {
-    format!("--- -- --- {}", pad_to_width("-", LYRIC_WIDTH))
+    format_row(&Row::default())
 }
 
 fn pad_to_width(s: &str, target: usize) -> String {
@@ -69,8 +81,37 @@ fn pad_to_width(s: &str, target: usize) -> String {
     }
 }
 
+/// Pad with trailing spaces, or truncate on a character boundary so the
+/// result's display width is exactly `target`. Used to clamp variable-width
+/// header content (track name + clip name, possibly CJK) to a fixed cell.
+fn pad_or_truncate_display(s: &str, target: usize) -> String {
+    let w = s.width();
+    if w == target {
+        return s.to_string();
+    }
+    if w < target {
+        return format!("{s}{}", " ".repeat(target - w));
+    }
+    // Truncate: accumulate chars while display width stays <= target.
+    let mut acc = 0;
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if acc + cw > target {
+            break;
+        }
+        out.push(ch);
+        acc += cw;
+    }
+    while acc < target {
+        out.push(' ');
+        acc += 1;
+    }
+    out
+}
+
 /// Renders the fixed two-line header shown above the tracker grid: one line
-/// with track names / clip names (with a `▶` marker on the cursor track) and
+/// with track names / clip names (with a `>` marker on the cursor track) and
 /// one line with the per-column labels (NOT / VOL / FX / LYR).
 pub fn render_tracker_header(song: &Song, cursor_track: u32) -> String {
     if song.tracks.is_empty() {
@@ -86,16 +127,21 @@ pub fn render_tracker_header(song: &Song, cursor_track: u32) -> String {
             .map(|c| c.name.as_str())
             .unwrap_or("(no clip)");
         let marker = if track_idx as u32 == cursor_track {
-            "▶"
+            '>'
         } else {
-            " "
+            ' '
         };
-        out.push_str(&format!("|{marker}{}: {:<12} ", track.name, clip_name));
+        out.push('|');
+        let content = format!("{marker}{}: {}", track.name, clip_name);
+        out.push_str(&pad_or_truncate_display(&content, TRACK_HEADER_WIDTH));
     }
     out.push('\n');
 
     out.push_str("    ");
     for _ in &song.tracks {
+        // Header row 2 has the same `| <cell>  ` shape as non-cursor data
+        // rows, which keeps column bars in the two header lines aligned
+        // with the data rows below (both are TRACK_HEADER_WIDTH after `|`).
         out.push_str(&format!("| {CELL_HEADER}  "));
     }
     out
@@ -130,8 +176,10 @@ pub fn render_tracker_rows(song: &Song, cursor_row: u32, cursor_track: u32) -> V
                 .map(format_row)
                 .unwrap_or_else(empty_cell);
             if is_cursor_row && track_idx as u32 == cursor_track {
+                // `|[ cell ] ` → `|` + 17-wide content: `[` + 15 cell + `]` + ` `.
                 line.push_str(&format!("|[{cell}] "));
             } else {
+                // `|  cell   ` → `|` + 18-wide content: ` ` + 15 cell + `  `.
                 line.push_str(&format!("| {cell}  "));
             }
         }
@@ -157,7 +205,9 @@ fn format_row(row: &Row) -> String {
         .unwrap_or_else(|| "---".to_string());
     let lyric_raw = row.lyric.as_deref().unwrap_or("-");
     let lyric = pad_to_width(lyric_raw, LYRIC_WIDTH);
-    format!("{note} {vol} {fx} {lyric}")
+    // `{vol:<3}` pads hex (2 chars) with a trailing space so the VOL column
+    // occupies 3 cells; NOT / FX / LYR are already 3 cells wide.
+    format!("{note} {vol:<3} {fx} {lyric}")
 }
 
 fn format_note(key: u8) -> String {
@@ -185,8 +235,8 @@ mod tests {
 
     #[test]
     fn format_row_empty() {
-        // lyric "-" pad to width 2 → "- "
-        assert_eq!(format_row(&Row::default()), "--- -- --- - ");
+        // 15 display chars: "--- " + "--  " + "--- " + "-  "
+        assert_eq!(format_row(&Row::default()), "--- --  --- -  ");
     }
 
     #[test]
@@ -199,8 +249,9 @@ mod tests {
             lyric: Some("こ".into()),
             ..Default::default()
         };
-        // lyric "こ" has display width 2, no pad
-        assert_eq!(format_row(&row), "C-4 -- --- こ");
+        // "こ" has display width 2 → padded with one trailing space to
+        // reach LYRIC_WIDTH=3.
+        assert_eq!(format_row(&row), "C-4 --  --- こ ");
     }
 
     #[test]
@@ -209,7 +260,7 @@ mod tests {
             note: Some(NoteEvent::Off),
             ..Default::default()
         };
-        assert_eq!(format_row(&row), "OFF -- --- - ");
+        assert_eq!(format_row(&row), "OFF --  --- -  ");
     }
 
     #[test]
@@ -222,7 +273,38 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(format_row(&row), "--- 40 A04 - ");
+        assert_eq!(format_row(&row), "--- 40  A04 -  ");
+    }
+
+    #[test]
+    fn format_row_cell_width_is_15() {
+        for row in [
+            Row::default(),
+            Row {
+                note: Some(NoteEvent::On(Note {
+                    key: 60,
+                    velocity: 100,
+                })),
+                lyric: Some("こ".into()),
+                ..Default::default()
+            },
+            Row {
+                volume: Some(0x40),
+                fx: vec![FxCommand {
+                    cmd: 0xA,
+                    value: 0x04,
+                }],
+                lyric: Some("-".into()),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(format_row(&row).width(), CELL_WIDTH, "row={row:?}");
+        }
+    }
+
+    #[test]
+    fn cell_header_width_is_15() {
+        assert_eq!(CELL_HEADER.width(), CELL_WIDTH);
     }
 
     #[test]
@@ -234,6 +316,23 @@ mod tests {
     #[test]
     fn pad_to_width_japanese_already_fits() {
         assert_eq!(pad_to_width("こ", 2), "こ");
+    }
+
+    #[test]
+    fn pad_or_truncate_display_pads_short() {
+        assert_eq!(pad_or_truncate_display("AB", 5), "AB   ");
+    }
+
+    #[test]
+    fn pad_or_truncate_display_truncates_long() {
+        // "あいうえお" is 10 display cells; target 7 truncates to "あいう "
+        // (3 wide chars = 6 cells, plus 1 space = 7 cells).
+        assert_eq!(pad_or_truncate_display("あいうえお", 7), "あいう ");
+    }
+
+    #[test]
+    fn pad_or_truncate_display_exact_fit() {
+        assert_eq!(pad_or_truncate_display("hello", 5), "hello");
     }
 
     #[test]
