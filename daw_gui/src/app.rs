@@ -12,6 +12,37 @@ use vizia::prelude::*;
 /// Lightweight lens-friendly copy of a plugin database entry. Carries only
 /// what the picker list needs to render and select; path lookup happens
 /// via `plugin_db.find_by_id` when the user picks.
+/// Per-track mixer strip row bound to the new MixerStripsView. Rebuilt
+/// from `song.tracks` whenever the track list or a mixer parameter
+/// changes; the `peak_*_norm` fields are refreshed on every UI tick
+/// from the shmem-published post-fader peaks.
+#[derive(Debug, Clone, PartialEq, Data)]
+pub struct TrackMixEntry {
+    pub index: u32,
+    pub name: String,
+    pub volume: f32,
+    pub pan: f32,
+    pub muted: bool,
+    pub solo: bool,
+    pub peak_l_norm: f32,
+    pub peak_r_norm: f32,
+}
+
+impl Default for TrackMixEntry {
+    fn default() -> Self {
+        Self {
+            index: u32::MAX,
+            name: String::new(),
+            volume: 1.0,
+            pan: 0.0,
+            muted: false,
+            solo: false,
+            peak_l_norm: 0.0,
+            peak_r_norm: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Data)]
 pub struct PluginPickEntry {
     pub id: String,
@@ -145,6 +176,17 @@ pub struct AppData {
     pub plugin_host_windows:
         HashMap<(u32, PluginSlot), crate::view::plugin_embed::PluginHostWindow>,
 
+    /// Renoise-style mixer strip row: one entry per song track, rebuilt
+    /// on song mutation and refreshed on every UI tick with post-fader
+    /// peaks from the shmem bridge.
+    pub track_mix: Vec<TrackMixEntry>,
+    /// Raw linear-amplitude peak already decayed with the mixer's
+    /// release curve; parallel array to `song.tracks`. Kept out of the
+    /// lens-visible struct so decay state isn't exposed to the UI —
+    /// it's baked into `track_mix[i].peak_*_norm` each tick.
+    #[lens(ignore)]
+    pub track_peak_display: Vec<(f32, f32)>,
+
     /// Drop-off slot for a background plugin-database rescan. The worker
     /// thread scans, persists the result to the on-disk cache, stashes the
     /// fresh `PluginDatabase` here, and then emits
@@ -167,9 +209,17 @@ impl AppData {
         _clap_plugin_path: Option<PathBuf>,
         plugin_db: Option<Arc<PluginDatabase>>,
     ) -> Self {
+        // Mixer view shows a permanent master strip even when the user
+        // has added zero tracks; that keeps Vizia's `List` draw path off
+        // its zero-item panic path.
         let song = Song::default();
         let tracker_header = crate::view::arrangement::render_tracker_header(&song, 0);
         let tracker_rows = crate::view::arrangement::render_tracker_rows(&song, 0, 0);
+        // Pre-compute anything that borrows `song` so the Self literal
+        // below can move it in field-declaration order without tripping
+        // the borrow checker.
+        let initial_mix = initial_track_mix(&song);
+        let initial_peak_display = vec![(0.0, 0.0); song.tracks.len()];
         let plugin_picker_entries = plugin_db
             .as_ref()
             .map(|db| {
@@ -220,6 +270,8 @@ impl AppData {
             plugin_tx: Some(plugin_tx),
             #[cfg(windows)]
             plugin_host_windows: HashMap::new(),
+            track_mix: initial_mix,
+            track_peak_display: initial_peak_display,
             rescan_result: Arc::new(Mutex::new(None)),
             is_rescanning: false,
         }
@@ -314,6 +366,15 @@ pub enum AppEvent {
     /// `AppData::rescan_result`; this event carries no payload because
     /// `AppEvent` needs `Eq + Hash` and `PluginDatabase` does not.
     PluginDbRescanCompleted,
+    /// Mixer strip slider drag / button toggle.
+    SetTrackVolume { track: u32, bits: u32 },
+    SetTrackPan { track: u32, bits: u32 },
+    ToggleTrackMute(u32),
+    ToggleTrackSolo(u32),
+    /// Per-track post-fader peaks sampled from the shmem bridge on the UI
+    /// poll thread. Carries `f32::to_bits` pairs so the event stays
+    /// `Eq + Hash`.
+    TrackPeaksTick(Vec<(u32, u32)>),
 }
 
 impl Model for AppData {
@@ -449,6 +510,26 @@ impl Model for AppData {
                     self.on_all_states_from_child(entries.clone());
                     dirty = false;
                 }
+                AppEvent::SetTrackVolume { track, bits } => {
+                    self.set_track_volume(*track, f32::from_bits(*bits));
+                    dirty = false;
+                }
+                AppEvent::SetTrackPan { track, bits } => {
+                    self.set_track_pan(*track, f32::from_bits(*bits));
+                    dirty = false;
+                }
+                AppEvent::ToggleTrackMute(track) => {
+                    self.toggle_track_mute(*track);
+                    dirty = false;
+                }
+                AppEvent::ToggleTrackSolo(track) => {
+                    self.toggle_track_solo(*track);
+                    dirty = false;
+                }
+                AppEvent::TrackPeaksTick(peaks) => {
+                    self.on_track_peaks_tick(peaks);
+                    dirty = false;
+                }
             }
             if dirty {
                 self.refresh_tracker_text();
@@ -485,6 +566,7 @@ impl AppData {
         self.file_path = None;
         self.cursor_track = 0;
         self.refresh_inspector_chain();
+        self.rebuild_track_mix();
         tracing::info!("new project");
     }
 
@@ -506,6 +588,7 @@ impl AppData {
                 self.file_path = Some(path);
                 self.cursor_track = 0;
                 self.refresh_inspector_chain();
+                self.rebuild_track_mix();
             }
             Err(e) => {
                 tracing::error!(error = ?e, path = %path.display(), "failed to load project")
@@ -1144,6 +1227,119 @@ impl AppData {
         self.refresh_picker_visible();
     }
 
+    /// Apply a volume fader change. Updates the model, the lens-visible
+    /// mixer row, and forwards to plugin_host so the audio thread picks
+    /// up the new value on its next buffer.
+    fn set_track_volume(&mut self, track: u32, volume: f32) {
+        let v = volume.clamp(0.0, 1.0);
+        if let Some(t) = self.song.tracks.get_mut(track as usize) {
+            t.volume = v;
+        }
+        if let Some(entry) = self.track_mix.iter_mut().find(|e| e.index == track) {
+            entry.volume = v;
+        }
+        self.send_plugin(MainToChild::SetTrackVolume { track, volume: v });
+    }
+
+    fn set_track_pan(&mut self, track: u32, pan: f32) {
+        let p = pan.clamp(-1.0, 1.0);
+        if let Some(t) = self.song.tracks.get_mut(track as usize) {
+            t.pan = p;
+        }
+        if let Some(entry) = self.track_mix.iter_mut().find(|e| e.index == track) {
+            entry.pan = p;
+        }
+        self.send_plugin(MainToChild::SetTrackPan { track, pan: p });
+    }
+
+    fn toggle_track_mute(&mut self, track: u32) {
+        let Some(t) = self.song.tracks.get_mut(track as usize) else {
+            return;
+        };
+        t.muted = !t.muted;
+        let muted = t.muted;
+        if let Some(entry) = self.track_mix.iter_mut().find(|e| e.index == track) {
+            entry.muted = muted;
+        }
+        self.send_plugin(MainToChild::SetTrackMuted { track, muted });
+    }
+
+    fn toggle_track_solo(&mut self, track: u32) {
+        let Some(t) = self.song.tracks.get_mut(track as usize) else {
+            return;
+        };
+        t.solo = !t.solo;
+        let solo = t.solo;
+        if let Some(entry) = self.track_mix.iter_mut().find(|e| e.index == track) {
+            entry.solo = solo;
+        }
+        self.send_plugin(MainToChild::SetTrackSolo { track, solo });
+    }
+
+    /// Per-tick post-fader peak integration. Runs the same
+    /// fast-attack/slow-release curve the master meter uses, then maps
+    /// linear → dB → 0..1 for the lens-visible entries.
+    fn on_track_peaks_tick(&mut self, peaks: &[(u32, u32)]) {
+        const RELEASE: f32 = 0.85;
+        let n = self.song.tracks.len();
+        if self.track_peak_display.len() != n {
+            self.track_peak_display.resize(n, (0.0, 0.0));
+        }
+        for (i, display) in self.track_peak_display.iter_mut().enumerate() {
+            let (l_bits, r_bits) = peaks.get(i).copied().unwrap_or((0u32, 0u32));
+            let l = f32::from_bits(l_bits);
+            let r = f32::from_bits(r_bits);
+            display.0 = common::meter::update_peak(display.0, l, RELEASE);
+            display.1 = common::meter::update_peak(display.1, r, RELEASE);
+        }
+        // Iterate by index to avoid overlapping borrows. We route through
+        // `as_slice()` so `get(usize)` picks the `[T]` inherent method
+        // rather than the blanket `vizia::Res::get(&impl DataContext)`
+        // Vizia adds to any `Vec<T>` in scope.
+        let display = self.track_peak_display.as_slice();
+        let updates: Vec<(usize, f32, f32)> = (0..self.track_mix.len())
+            .map(|i| {
+                let (l, r) = display.get(i).copied().unwrap_or((0.0, 0.0));
+                (i, l, r)
+            })
+            .collect();
+        for (i, l, r) in updates {
+            if let Some(entry) = self.track_mix.get_mut(i) {
+                entry.peak_l_norm = common::meter::db_to_norm(common::meter::linear_to_db(l));
+                entry.peak_r_norm = common::meter::db_to_norm(common::meter::linear_to_db(r));
+            }
+        }
+    }
+
+    /// Rebuild `track_mix` from `song.tracks`. Call whenever the number or
+    /// order of tracks (or any of their mixer fields via undo/LoadSong)
+    /// changes. Peak fields start at zero and are refreshed by the next
+    /// tick.
+    fn rebuild_track_mix(&mut self) {
+        self.track_mix = self
+            .song
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| TrackMixEntry {
+                index: i as u32,
+                name: if t.name.is_empty() {
+                    format!("Track {}", i + 1)
+                } else {
+                    t.name.clone()
+                },
+                volume: t.volume,
+                pan: t.pan,
+                muted: t.muted,
+                solo: t.solo,
+                peak_l_norm: 0.0,
+                peak_r_norm: 0.0,
+            })
+            .collect();
+        self.track_peak_display
+            .resize(self.song.tracks.len(), (0.0, 0.0));
+    }
+
     /// Rebuild the flat `plugin_picker_entries` list from `plugin_db`.
     /// Called after a rescan to keep the picker in sync with the new DB.
     fn rebuild_picker_entries(&mut self) {
@@ -1201,6 +1397,7 @@ impl AppData {
                 clips: vec![demo_clip()],
                 ..Track::default()
             });
+            self.rebuild_track_mix();
         }
     }
 
@@ -1216,6 +1413,7 @@ impl AppData {
             ..Track::default()
         };
         self.song.tracks.push(track);
+        self.rebuild_track_mix();
         tracing::info!(index, "added vocal track");
     }
 
@@ -1244,6 +1442,7 @@ impl AppData {
         self.send_plugin(MainToChild::RemoveTrack { track: removed_idx });
         self.clamp_cursor();
         self.refresh_inspector_chain();
+        self.rebuild_track_mix();
     }
 
     fn move_cursor_track(&mut self, delta: i32) {
@@ -1358,6 +1557,30 @@ fn plugin_label(path: Option<&Path>) -> String {
             .unwrap_or_else(|| p.display().to_string()),
         None => "(no plugin)".into(),
     }
+}
+
+/// Freestanding variant of `AppData::rebuild_track_mix` usable from
+/// `AppData::new` before `self` exists. Populates the lens-visible mixer
+/// rows from a `Song` with zeroed peak meters.
+fn initial_track_mix(song: &Song) -> Vec<TrackMixEntry> {
+    song.tracks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| TrackMixEntry {
+            index: i as u32,
+            name: if t.name.is_empty() {
+                format!("Track {}", i + 1)
+            } else {
+                t.name.clone()
+            },
+            volume: t.volume,
+            pan: t.pan,
+            muted: t.muted,
+            solo: t.solo,
+            peak_l_norm: 0.0,
+            peak_r_norm: 0.0,
+        })
+        .collect()
 }
 
 fn plugin_label_from_entry(entry: &common::plugin_db::PluginEntry) -> String {

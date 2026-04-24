@@ -24,7 +24,8 @@ use vizia::prelude::*;
 use crate::app::{AppData, AppEvent};
 use crate::job::JobHandle;
 use crate::view::{
-    ArrangementView, PluginPickerView, StatusBarView, TrackInspectorView, TransportView,
+    ArrangementView, MixerStripsView, PluginPickerView, StatusBarView, TrackInspectorView,
+    TransportView,
 };
 
 fn main() -> Result<()> {
@@ -240,7 +241,14 @@ fn run_gui(
 
             HStack::new(cx, |cx| {
                 TrackInspectorView::new(cx).width(Pixels(280.0));
-                ArrangementView::new(cx).width(Stretch(1.0));
+                // Arrangement on top, Renoise-style mixer strips pinned
+                // under it. Arrangement gets the remaining stretch so the
+                // tracker grows with the window.
+                VStack::new(cx, |cx| {
+                    ArrangementView::new(cx).height(Stretch(1.0));
+                    MixerStripsView::new(cx).height(Pixels(170.0));
+                })
+                .width(Stretch(1.0));
             })
             .height(Stretch(1.0));
 
@@ -280,6 +288,18 @@ list.plugin-picker-list list-item {
 }
 list.plugin-picker-list list-item:hover {
     background-color: rgb(70, 70, 78);
+}
+
+/* Renoise-style mixer strip row. Strip items are laid out horizontally via
+   `layout-type: row` on the list. Fixed pixel dimensions avoid the same
+   `matrix.invert().unwrap()` panic the tracker list works around. */
+list.mixer-strips {
+    layout-type: row;
+}
+list.mixer-strips list-item {
+    width: 140px;
+    height: 150px;
+    background-color: rgb(38, 38, 42);
 }
 "#;
 
@@ -373,12 +393,28 @@ fn load_or_build_plugin_db() -> Option<Arc<common::plugin_db::PluginDatabase>> {
 /// and `proxy.emit` returns an error.
 fn spawn_playhead_poller(cx: &mut Context, bridge: Arc<AudioBridgeHandle>) {
     cx.spawn(move |proxy| {
+        // Scratch buffer reused across ticks so we don't allocate one
+        // Vec per 33 ms poll.
+        let mut peaks_buf: Vec<(f32, f32)> = Vec::with_capacity(common::audio_bridge::MAX_TRACKS);
         loop {
             std::thread::sleep(Duration::from_millis(33));
             let samples = bridge.playhead_samples();
             let (peak_l, peak_r) = bridge.peaks();
             if proxy
                 .emit(AppEvent::Tick(samples, peak_l.to_bits(), peak_r.to_bits()))
+                .is_err()
+            {
+                break;
+            }
+            // Per-track post-fader peaks. Emitted as a separate event so
+            // the base Tick's Eq/Hash derive stays trivial.
+            bridge.track_peaks(&mut peaks_buf);
+            let track_peaks: Vec<(u32, u32)> = peaks_buf
+                .iter()
+                .map(|&(l, r)| (l.to_bits(), r.to_bits()))
+                .collect();
+            if proxy
+                .emit(AppEvent::TrackPeaksTick(track_peaks))
                 .is_err()
             {
                 break;

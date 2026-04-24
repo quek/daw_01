@@ -7,6 +7,10 @@ pub const SAMPLE_RATE: u32 = 48000;
 pub const MAX_FRAMES: u32 = 1024;
 pub const CHANNELS: u32 = 2;
 pub const SAMPLE_BUFFER_LEN: usize = (MAX_FRAMES * CHANNELS) as usize;
+/// Hard cap for the per-track peak meter ring in shmem. Tracks beyond this
+/// index are still processed, they just don't publish a meter. 32 matches
+/// Renoise's default Mixer column count.
+pub const MAX_TRACKS: usize = 32;
 
 /// Shared memory layout between daw_plugin_host (writer), daw_audio (reader +
 /// meter writer) and daw_gui (polling reader).
@@ -30,6 +34,10 @@ pub struct AudioBridge {
     pub playhead_samples: AtomicU64,
     pub peak_l: AtomicU32,
     pub peak_r: AtomicU32,
+    /// Per-track post-fader peaks, `[track][0=L, 1=R]`, as `f32::to_bits`.
+    /// Written by daw_plugin_host after summing each track into the master
+    /// bus; read by daw_gui on its UI tick.
+    pub track_peaks: [[AtomicU32; 2]; MAX_TRACKS],
     pub samples: [f32; SAMPLE_BUFFER_LEN],
 }
 
@@ -114,6 +122,38 @@ impl AudioBridgeHandle {
         let l = f32::from_bits(self.bridge().peak_l.load(Ordering::Acquire));
         let r = f32::from_bits(self.bridge().peak_r.load(Ordering::Acquire));
         (l, r)
+    }
+
+    /// Publishes one track's post-fader peak pair. Out-of-range track
+    /// indices (beyond `MAX_TRACKS`) are silently dropped — the track is
+    /// still mixed, it just doesn't get a meter.
+    pub fn set_track_peak(&self, track: usize, l: f32, r: f32) {
+        let Some(slot) = self.bridge().track_peaks.get(track) else {
+            return;
+        };
+        slot[0].store(l.to_bits(), Ordering::Release);
+        slot[1].store(r.to_bits(), Ordering::Release);
+    }
+
+    pub fn track_peak(&self, track: usize) -> (f32, f32) {
+        let Some(slot) = self.bridge().track_peaks.get(track) else {
+            return (0.0, 0.0);
+        };
+        let l = f32::from_bits(slot[0].load(Ordering::Acquire));
+        let r = f32::from_bits(slot[1].load(Ordering::Acquire));
+        (l, r)
+    }
+
+    /// Fills `out` with `(L, R)` peaks for tracks 0..`out.len()`.
+    /// Out-of-range tracks are reported as `(0.0, 0.0)`.
+    pub fn track_peaks(&self, out: &mut Vec<(f32, f32)>) {
+        out.clear();
+        for i in 0..MAX_TRACKS {
+            let slot = &self.bridge().track_peaks[i];
+            let l = f32::from_bits(slot[0].load(Ordering::Acquire));
+            let r = f32::from_bits(slot[1].load(Ordering::Acquire));
+            out.push((l, r));
+        }
     }
 }
 

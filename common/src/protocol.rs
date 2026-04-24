@@ -105,6 +105,13 @@ pub enum MainToChild {
     LoadSong(crate::model::Song),
     SetLoop(bool),
     SetMasterGain(f32),
+    /// Per-track mixer parameter changes. plugin_host applies each to the
+    /// matching audio-thread-visible `TrackAudioParams` atomic without
+    /// stopping the audio thread.
+    SetTrackVolume { track: u32, volume: f32 },
+    SetTrackPan { track: u32, pan: f32 },
+    SetTrackMuted { track: u32, muted: bool },
+    SetTrackSolo { track: u32, solo: bool },
     // --- Per-track plugin slot management -----------------------------
     /// Load / replace the plugin in `(track, slot)`. `format` routes the
     /// request to the CLAP or VST3 backend. Empty `plugin_id` picks the

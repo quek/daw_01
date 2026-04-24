@@ -160,7 +160,77 @@ enum PluginCommand {
         width: u32,
         height: u32,
     },
+    /// Per-track mixer atomics. Applied immediately on the plugin-main
+    /// thread without stopping the audio thread (the audio thread reads
+    /// the atomic through the shared `Arc<TrackAudioParams>`).
+    SetTrackVolume {
+        track: u32,
+        volume: f32,
+    },
+    SetTrackPan {
+        track: u32,
+        pan: f32,
+    },
+    SetTrackMuted {
+        track: u32,
+        muted: bool,
+    },
+    SetTrackSolo {
+        track: u32,
+        solo: bool,
+    },
     Shutdown,
+}
+
+/// Atomics shared between the plugin-main thread (writer, on IPC commands
+/// and `LoadSong`) and the audio thread (reader, every buffer). `volume`
+/// and `pan` are bit-packed `f32` so the enclosing struct can stay
+/// `Send + Sync` without a mutex.
+struct TrackAudioParams {
+    volume: std::sync::atomic::AtomicU32,
+    pan: std::sync::atomic::AtomicU32,
+    muted: std::sync::atomic::AtomicBool,
+    solo: std::sync::atomic::AtomicBool,
+}
+
+impl TrackAudioParams {
+    fn new(volume: f32, pan: f32, muted: bool, solo: bool) -> Self {
+        Self {
+            volume: std::sync::atomic::AtomicU32::new(volume.to_bits()),
+            pan: std::sync::atomic::AtomicU32::new(pan.to_bits()),
+            muted: std::sync::atomic::AtomicBool::new(muted),
+            solo: std::sync::atomic::AtomicBool::new(solo),
+        }
+    }
+
+    fn volume(&self) -> f32 {
+        f32::from_bits(self.volume.load(Ordering::Acquire))
+    }
+
+    fn pan(&self) -> f32 {
+        f32::from_bits(self.pan.load(Ordering::Acquire))
+    }
+
+    fn muted(&self) -> bool {
+        self.muted.load(Ordering::Acquire)
+    }
+
+    fn solo(&self) -> bool {
+        self.solo.load(Ordering::Acquire)
+    }
+
+    fn set_volume(&self, v: f32) {
+        self.volume.store(v.to_bits(), Ordering::Release);
+    }
+    fn set_pan(&self, v: f32) {
+        self.pan.store(v.to_bits(), Ordering::Release);
+    }
+    fn set_muted(&self, v: bool) {
+        self.muted.store(v, Ordering::Release);
+    }
+    fn set_solo(&self, v: bool) {
+        self.solo.store(v, Ordering::Release);
+    }
 }
 
 #[tokio::main]
@@ -413,7 +483,32 @@ fn plugin_main_loop(
                 }
                 PluginCommand::LoadSong(song) => {
                     tracing::info!(bpm = song.bpm, tracks = song.tracks.len(), "LoadSong");
+                    // Sync each track's mixer atomics with the model the
+                    // GUI just sent us. New tracks get their params
+                    // created on demand; existing ones have their atomics
+                    // updated in place so the audio thread picks the new
+                    // values up on its next buffer without a restart.
+                    for (i, track) in song.tracks.iter().enumerate() {
+                        let idx = i as u32;
+                        let params = tracks.tracks.ensure_params(idx);
+                        params.set_volume(track.volume);
+                        params.set_pan(track.pan);
+                        params.set_muted(track.muted);
+                        params.set_solo(track.solo);
+                    }
                     song_store.store(Some(Arc::new(song)));
+                }
+                PluginCommand::SetTrackVolume { track, volume } => {
+                    tracks.tracks.ensure_params(track).set_volume(volume);
+                }
+                PluginCommand::SetTrackPan { track, pan } => {
+                    tracks.tracks.ensure_params(track).set_pan(pan);
+                }
+                PluginCommand::SetTrackMuted { track, muted } => {
+                    tracks.tracks.ensure_params(track).set_muted(muted);
+                }
+                PluginCommand::SetTrackSolo { track, solo } => {
+                    tracks.tracks.ensure_params(track).set_solo(solo);
                 }
                 PluginCommand::Play => {
                     playback_state.store(PlaybackCommand::Play as u8, Ordering::Release);
@@ -824,6 +919,18 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             tracing::info!(on, "received SetLoop");
             plugin.send(PluginCommand::SetLoop(on));
         }
+        MainToChild::SetTrackVolume { track, volume } => {
+            plugin.send(PluginCommand::SetTrackVolume { track, volume });
+        }
+        MainToChild::SetTrackPan { track, pan } => {
+            plugin.send(PluginCommand::SetTrackPan { track, pan });
+        }
+        MainToChild::SetTrackMuted { track, muted } => {
+            plugin.send(PluginCommand::SetTrackMuted { track, muted });
+        }
+        MainToChild::SetTrackSolo { track, solo } => {
+            plugin.send(PluginCommand::SetTrackSolo { track, solo });
+        }
         MainToChild::OpenSlotGuiEmbedded {
             track,
             slot,
@@ -912,11 +1019,23 @@ impl Chain {
 #[derive(Default)]
 struct Tracks {
     chains: HashMap<u32, Chain>,
+    /// Mixer atomics per track (volume/pan/mute/solo). Kept alive by this
+    /// `Arc` on the plugin-main thread and snapshotted into each
+    /// `TrackRouting` at `start_audio` time, so the audio thread never
+    /// takes a lock.
+    params: HashMap<u32, Arc<TrackAudioParams>>,
 }
 
 impl Tracks {
     fn ensure_track(&mut self, track: u32) -> &mut Chain {
         self.chains.entry(track).or_default()
+    }
+
+    fn ensure_params(&mut self, track: u32) -> Arc<TrackAudioParams> {
+        self.params
+            .entry(track)
+            .or_insert_with(|| Arc::new(TrackAudioParams::new(1.0, 0.0, false, false)))
+            .clone()
     }
 
     fn plugin_at_mut(
@@ -931,8 +1050,13 @@ impl Tracks {
 /// Plain-pointer snapshot of one track's chain handed to the audio thread.
 /// Valid as long as the chain is not mutated (which first triggers an
 /// audio-thread stop + restart on the main side).
+///
+/// `params` is shared (Arc) with the plugin-main thread: SetTrackXxx
+/// commands write the atomics inside while this snapshot is live, so
+/// the audio thread sees the new values on its next buffer.
 struct TrackRouting {
     track_id: u32,
+    params: Arc<TrackAudioParams>,
     midi_fx_chain: Vec<PluginPtr>,
     instrument: Option<PluginPtr>,
     fx_chain: Vec<PluginPtr>,
@@ -1060,8 +1184,15 @@ impl TracksHandle {
                 .iter_mut()
                 .map(|p| PluginPtr(&raw mut **p))
                 .collect();
+            let params = self
+                .tracks
+                .params
+                .entry(*track_id)
+                .or_insert_with(|| Arc::new(TrackAudioParams::new(1.0, 0.0, false, false)))
+                .clone();
             tracks_routing.push(TrackRouting {
                 track_id: *track_id,
+                params,
                 midi_fx_chain,
                 instrument,
                 fx_chain,
@@ -1263,6 +1394,11 @@ fn run_audio(
         let snapshot = song_store.load();
         let song_ref = snapshot.as_deref();
 
+        // Evaluate the global solo rule once per buffer. If any track is
+        // soloed, non-solo tracks get silenced — same semantics as every
+        // classic mixer.
+        let any_solo = routing.tracks.iter().any(|tr| tr.params.solo());
+
         for tr in &routing.tracks {
             // Build this track's MIDI event bus: pending offs first (so they
             // fire at frame 0 after Stop / clip-end), then any events from
@@ -1349,10 +1485,37 @@ fn run_audio(
                 }
             }
 
-            // Sum this track into the master bus.
-            for i in 0..n {
-                master_l[i] += track_l[i];
-                master_r[i] += track_r[i];
+            // Apply the mixer strip (volume / pan / mute / solo) and sum
+            // the track into the master bus. Post-fader peaks are what we
+            // publish to the shmem meter, matching Renoise's behaviour.
+            let volume = tr.params.volume();
+            let pan = tr.params.pan().clamp(-1.0, 1.0);
+            let muted = tr.params.muted();
+            let solo = tr.params.solo();
+            let effective_mute = muted || (any_solo && !solo);
+            if effective_mute {
+                bridge.set_track_peak(tr.track_id as usize, 0.0, 0.0);
+            } else {
+                // Equal-power pan: pan=-1 → L only, pan=0 → both at -3 dB,
+                // pan=+1 → R only.
+                let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+                let gain_l = angle.cos() * volume;
+                let gain_r = angle.sin() * volume;
+                let mut peak_l = 0.0_f32;
+                let mut peak_r = 0.0_f32;
+                for i in 0..n {
+                    let l = track_l[i] * gain_l;
+                    let r = track_r[i] * gain_r;
+                    if l.abs() > peak_l {
+                        peak_l = l.abs();
+                    }
+                    if r.abs() > peak_r {
+                        peak_r = r.abs();
+                    }
+                    master_l[i] += l;
+                    master_r[i] += r;
+                }
+                bridge.set_track_peak(tr.track_id as usize, peak_l, peak_r);
             }
         }
 

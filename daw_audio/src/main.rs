@@ -113,6 +113,12 @@ async fn recv_loop(
             Ok(MainToChild::SetLoop(_)) => {
                 // Loop state lives in daw_plugin_host; daw_audio does not use it.
             }
+            Ok(MainToChild::SetTrackVolume { .. })
+            | Ok(MainToChild::SetTrackPan { .. })
+            | Ok(MainToChild::SetTrackMuted { .. })
+            | Ok(MainToChild::SetTrackSolo { .. }) => {
+                // Per-track mixer params live in daw_plugin_host's audio thread.
+            }
             Ok(MainToChild::SetMasterGain(g)) => {
                 let clamped = g.clamp(0.0, 1.0);
                 tracing::info!(gain = clamped, "received SetMasterGain");

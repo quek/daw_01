@@ -86,6 +86,14 @@ pub struct Track {
     pub fx_chain: Vec<PluginInstance>,
     pub volume: f32,
     pub pan: f32,
+    /// Track silenced by the user. Additive with the global solo rule (see
+    /// `solo` below): `effective_mute = muted || (any_solo_on && !solo)`.
+    #[serde(default)]
+    pub muted: bool,
+    /// When any track has `solo == true`, tracks that don't are silenced
+    /// for the duration of playback (classic mixer-strip behaviour).
+    #[serde(default)]
+    pub solo: bool,
     /// Future use: VOICEVOX speaker / style etc. Kept distinct from the
     /// `instrument` slot because it selects a rendering backend, not a CLAP
     /// plugin.
@@ -113,6 +121,8 @@ impl Default for Track {
             fx_chain: Vec::new(),
             volume: 1.0,
             pan: 0.0,
+            muted: false,
+            solo: false,
             source: InstrumentSource::None,
             clips: Vec::new(),
         }

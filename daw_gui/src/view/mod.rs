@@ -1,4 +1,5 @@
 pub mod arrangement;
+pub mod mixer_strips;
 #[cfg(windows)]
 pub mod plugin_embed;
 pub mod plugin_picker;
@@ -7,6 +8,7 @@ pub mod track_inspector;
 pub mod transport;
 
 pub use arrangement::ArrangementView;
+pub use mixer_strips::MixerStripsView;
 pub use plugin_picker::PluginPickerView;
 pub use status_bar::StatusBarView;
 pub use track_inspector::TrackInspectorView;
