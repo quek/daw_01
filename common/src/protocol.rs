@@ -108,6 +108,17 @@ pub enum MainToChild {
     /// Per-track mixer parameter changes. plugin_host applies each to the
     /// matching audio-thread-visible `TrackAudioParams` atomic without
     /// stopping the audio thread.
+    /// Pre-rendered vocal audio for a single clip on a track. `samples`
+    /// is mono f32, `sample_rate` matches `AudioSession::sample_rate` (or
+    /// is resampled by the host). `clip_start_samples` is the absolute
+    /// sample offset within the song where this clip begins.
+    SetVocalAudio {
+        track: u32,
+        clip: u32,
+        clip_start_samples: u64,
+        sample_rate: u32,
+        samples: Vec<f32>,
+    },
     SetTrackVolume { track: u32, volume: f32 },
     SetTrackPan { track: u32, pan: f32 },
     SetTrackMuted { track: u32, muted: bool },

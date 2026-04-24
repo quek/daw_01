@@ -113,6 +113,9 @@ async fn recv_loop(
             Ok(MainToChild::SetLoop(_)) => {
                 // Loop state lives in daw_plugin_host; daw_audio does not use it.
             }
+            Ok(MainToChild::SetVocalAudio { .. }) => {
+                // Vocal audio lives in daw_plugin_host's audio thread.
+            }
             Ok(MainToChild::SetTrackVolume { .. })
             | Ok(MainToChild::SetTrackPan { .. })
             | Ok(MainToChild::SetTrackMuted { .. })

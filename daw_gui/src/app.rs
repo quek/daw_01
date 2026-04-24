@@ -187,6 +187,11 @@ pub struct AppData {
     #[lens(ignore)]
     pub track_peak_display: Vec<(f32, f32)>,
 
+    /// Drop-off slot for background VOICEVOX synthesis results. Worker
+    /// thread writes here, then emits `VocalSynthCompleted`.
+    #[lens(ignore)]
+    pub synth_result: Arc<Mutex<Vec<common::voicevox::SynthResult>>>,
+
     /// Drop-off slot for a background plugin-database rescan. The worker
     /// thread scans, persists the result to the on-disk cache, stashes the
     /// fresh `PluginDatabase` here, and then emits
@@ -199,6 +204,9 @@ pub struct AppData {
     /// show a "Rescanning..." label instead of letting the user hammer the
     /// button.
     pub is_rescanning: bool,
+    /// Status message shown in the status bar. Updated by synthesis /
+    /// rescan / errors to give the user feedback on background tasks.
+    pub status_message: String,
 }
 
 impl AppData {
@@ -272,8 +280,10 @@ impl AppData {
             plugin_host_windows: HashMap::new(),
             track_mix: initial_mix,
             track_peak_display: initial_peak_display,
+            synth_result: Arc::new(Mutex::new(Vec::new())),
             rescan_result: Arc::new(Mutex::new(None)),
             is_rescanning: false,
+            status_message: String::new(),
         }
     }
 
@@ -375,6 +385,12 @@ pub enum AppEvent {
     /// poll thread. Carries `f32::to_bits` pairs so the event stays
     /// `Eq + Hash`.
     TrackPeaksTick(Vec<(u32, u32)>),
+    /// Synthesize all vocal clips on all vocal tracks via VOICEVOX.
+    /// Triggered by the `v` shortcut key. Runs on a background thread;
+    /// completion posts `VocalSynthCompleted`.
+    SynthesizeVocal,
+    /// Background vocal synth finished. Results are in `synth_result`.
+    VocalSynthCompleted,
 }
 
 impl Model for AppData {
@@ -528,6 +544,15 @@ impl Model for AppData {
                 }
                 AppEvent::TrackPeaksTick(peaks) => {
                     self.on_track_peaks_tick(peaks);
+                    dirty = false;
+                }
+                AppEvent::SynthesizeVocal => {
+                    self.status_message = "VOICEVOX 合成中...".to_string();
+                    self.begin_vocal_synth(cx);
+                    dirty = false;
+                }
+                AppEvent::VocalSynthCompleted => {
+                    self.finish_vocal_synth();
                     dirty = false;
                 }
             }
@@ -1170,6 +1195,76 @@ impl AppData {
         self.inspector_chain = out;
     }
 
+    /// Synthesize all vocal tracks in the background. Results are
+    /// delivered via `VocalSynthCompleted` → `finish_vocal_synth`.
+    fn begin_vocal_synth(&self, cx: &mut EventContext) {
+        let song = self.song.clone();
+        let slot = Arc::clone(&self.synth_result);
+        cx.spawn(move |proxy| {
+            tracing::info!("VOICEVOX synthesis starting");
+            let results = common::voicevox::synthesize_song(
+            &song,
+            common::voicevox::DEFAULT_SINGER_ID,
+            common::voicevox::DEFAULT_SINGER_ID,
+        );
+            tracing::info!(count = results.len(), "VOICEVOX synthesis finished");
+            if let Ok(mut guard) = slot.lock() {
+                *guard = results;
+            }
+            let _ = proxy.emit(AppEvent::VocalSynthCompleted);
+        });
+    }
+
+    /// Take synthesis results and forward the rendered audio to
+    /// plugin_host via IPC so the audio thread can mix it in.
+    fn finish_vocal_synth(&mut self) {
+        let results: Vec<common::voicevox::SynthResult> = self
+            .synth_result
+            .lock()
+            .ok()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default();
+
+        if results.is_empty() {
+            tracing::warn!("vocal synth produced no results");
+            self.status_message = "合成結果なし（Vocal トラックがないか VOICEVOX が応答しません）".to_string();
+            return;
+        }
+
+        self.status_message = format!("合成完了 — {} クリップ。Play で再生", results.len());
+
+        for r in &results {
+            // Compute the absolute sample offset for the clip's start
+            // beat. This is where the audio thread should begin playing
+            // the rendered buffer.
+            let clip_start_beat = self
+                .song
+                .tracks
+                .get(r.track as usize)
+                .and_then(|t| t.clips.get(r.clip as usize))
+                .map(|c| c.start_beat)
+                .unwrap_or(0.0);
+            let samples_per_beat =
+                common::audio_bridge::SAMPLE_RATE as f64 * 60.0 / self.song.bpm as f64;
+            let clip_start_samples = (clip_start_beat * samples_per_beat).max(0.0) as u64;
+
+            tracing::info!(
+                track = r.track,
+                clip = r.clip,
+                len = r.samples.len(),
+                clip_start_samples,
+                "sending vocal audio to plugin_host"
+            );
+            self.send_plugin(MainToChild::SetVocalAudio {
+                track: r.track,
+                clip: r.clip,
+                clip_start_samples,
+                sample_rate: r.sample_rate,
+                samples: r.samples.clone(),
+            });
+        }
+    }
+
     /// Kick off a background plugin rescan. Safe to call twice — if a
     /// scan is already running, the second request is ignored so the
     /// worker stays single-threaded (no race on `rescan_result`).
@@ -1406,7 +1501,7 @@ impl AppData {
         let track = Track {
             name: format!("Track {index}"),
             source: InstrumentSource::Vocal {
-                speaker_id: 3,
+                speaker_id: common::voicevox::DEFAULT_SINGER_ID,
                 style_name: "ノーマル".into(),
             },
             clips: vec![demo_clip()],
@@ -1609,7 +1704,7 @@ fn demo_clip() -> Clip {
         Row::default(),
         note(65, "ち"),
         Row::default(),
-        note(67, "は"),
+        note(67, "わ"),
         Row::default(),
         Row {
             note: Some(NoteEvent::Off),
@@ -1620,7 +1715,7 @@ fn demo_clip() -> Clip {
         rows.push(Row::default());
     }
     Clip {
-        name: "こんにちは".into(),
+        name: "こんにちわ".into(),
         start_beat: 0.0,
         length_beats: 4.0,
         rows_per_beat: 4,

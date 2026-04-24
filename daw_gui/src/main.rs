@@ -497,6 +497,12 @@ fn register_shortcuts(cx: &mut Context) {
                 cx.emit(AppEvent::TransposeOctave(1))
             }),
         ),
+        (
+            KeyChord::new(Modifiers::empty(), Code::KeyV),
+            KeymapEntry::new(AppEvent::SynthesizeVocal, |cx| {
+                cx.emit(AppEvent::SynthesizeVocal)
+            }),
+        ),
     ])
     .build(cx);
 }

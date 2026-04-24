@@ -179,6 +179,11 @@ enum PluginCommand {
         track: u32,
         solo: bool,
     },
+    SetVocalAudio {
+        track: u32,
+        clip_start_samples: u64,
+        samples: Vec<f32>,
+    },
     Shutdown,
 }
 
@@ -510,8 +515,41 @@ fn plugin_main_loop(
                 PluginCommand::SetTrackSolo { track, solo } => {
                     tracks.tracks.ensure_params(track).set_solo(solo);
                 }
+                PluginCommand::SetVocalAudio {
+                    track,
+                    clip_start_samples,
+                    samples,
+                } => {
+                    // Hot-swap: the audio thread holds an Arc clone of
+                    // the ArcSwapOption and will see the new value on
+                    // its very next buffer — no restart needed.
+                    let swap = tracks
+                        .tracks
+                        .vocal
+                        .entry(track)
+                        .or_insert_with(|| Arc::new(ArcSwapOption::empty()));
+                    swap.store(Some(Arc::new(VocalAudio {
+                        clip_start_samples,
+                        samples,
+                    })));
+                    tracing::info!(track, clip_start_samples, "vocal audio hot-swapped");
+                }
                 PluginCommand::Play => {
                     playback_state.store(PlaybackCommand::Play as u8, Ordering::Release);
+                    // Start the audio thread if it isn't running yet.
+                    // This handles the pure-vocal workflow where no
+                    // plugin was ever installed (so `mutate` was never
+                    // called and `start_audio` was never triggered).
+                    if tracks.audio.is_none()
+                        && let Err(e) = tracks.start_audio(
+                            &session,
+                            &playback_state,
+                            &song_store,
+                            &loop_state,
+                        )
+                    {
+                        tracing::error!(error = ?e, "failed to start audio thread on Play");
+                    }
                 }
                 PluginCommand::Stop => {
                     playback_state.store(PlaybackCommand::Stop as u8, Ordering::Release);
@@ -931,6 +969,26 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
         MainToChild::SetTrackSolo { track, solo } => {
             plugin.send(PluginCommand::SetTrackSolo { track, solo });
         }
+        MainToChild::SetVocalAudio {
+            track,
+            clip,
+            clip_start_samples,
+            sample_rate: _,
+            samples,
+        } => {
+            tracing::info!(
+                track,
+                clip,
+                clip_start_samples,
+                len = samples.len(),
+                "received SetVocalAudio"
+            );
+            plugin.send(PluginCommand::SetVocalAudio {
+                track,
+                clip_start_samples,
+                samples,
+            });
+        }
         MainToChild::OpenSlotGuiEmbedded {
             track,
             slot,
@@ -1014,6 +1072,19 @@ impl Chain {
     }
 }
 
+/// Pre-rendered vocal audio for a track. Shared between the plugin-main
+/// thread (writer) and the audio thread (reader) via `ArcSwapOption` so
+/// new synthesis results are picked up on the next buffer without
+/// restarting the audio thread.
+#[derive(Default, Clone)]
+struct VocalAudio {
+    /// Absolute sample position in the song where playback of `samples`
+    /// should begin.
+    clip_start_samples: u64,
+    /// Mono f32 samples.
+    samples: Vec<f32>,
+}
+
 /// All tracks with loaded plugins. Lazily-populated: `ensure_track` creates
 /// an empty chain on first access so a Track with no plugins isn't stored.
 #[derive(Default)]
@@ -1024,6 +1095,9 @@ struct Tracks {
     /// `TrackRouting` at `start_audio` time, so the audio thread never
     /// takes a lock.
     params: HashMap<u32, Arc<TrackAudioParams>>,
+    /// Pre-rendered vocal audio per track. Updated via `ArcSwapOption`
+    /// so the audio thread sees new data immediately (no restart needed).
+    vocal: HashMap<u32, Arc<ArcSwapOption<VocalAudio>>>,
 }
 
 impl Tracks {
@@ -1057,6 +1131,7 @@ impl Tracks {
 struct TrackRouting {
     track_id: u32,
     params: Arc<TrackAudioParams>,
+    vocal: Arc<ArcSwapOption<VocalAudio>>,
     midi_fx_chain: Vec<PluginPtr>,
     instrument: Option<PluginPtr>,
     fx_chain: Vec<PluginPtr>,
@@ -1190,14 +1265,43 @@ impl TracksHandle {
                 .entry(*track_id)
                 .or_insert_with(|| Arc::new(TrackAudioParams::new(1.0, 0.0, false, false)))
                 .clone();
+            let vocal = self
+                .tracks
+                .vocal
+                .entry(*track_id)
+                .or_insert_with(|| Arc::new(ArcSwapOption::empty()))
+                .clone();
             tracks_routing.push(TrackRouting {
                 track_id: *track_id,
                 params,
+                vocal,
                 midi_fx_chain,
                 instrument,
                 fx_chain,
             });
         }
+        // Include tracks that have vocal audio but no plugin chain —
+        // otherwise the audio thread won't see them and the vocal
+        // samples never reach the master bus.
+        for (track_id, vocal_swap) in &self.tracks.vocal {
+            if !self.tracks.chains.contains_key(track_id) {
+                let params = self
+                    .tracks
+                    .params
+                    .entry(*track_id)
+                    .or_insert_with(|| Arc::new(TrackAudioParams::new(1.0, 0.0, false, false)))
+                    .clone();
+                tracks_routing.push(TrackRouting {
+                    track_id: *track_id,
+                    params,
+                    vocal: vocal_swap.clone(),
+                    midi_fx_chain: Vec::new(),
+                    instrument: None,
+                    fx_chain: Vec::new(),
+                });
+            }
+        }
+
         let routing = AudioRouting {
             tracks: tracks_routing,
         };
@@ -1443,9 +1547,35 @@ fn run_audio(
             }
 
             // Instrument: consumes the (possibly-FX'd) MIDI bus and writes
-            // audio into track_{l,r}. Silent when no instrument loaded.
+            // audio into track_{l,r}. For vocal tracks without a plugin
+            // instrument, pre-rendered VOICEVOX audio is copied in
+            // instead. Completely empty tracks produce silence.
             track_l[..n].fill(0.0);
             track_r[..n].fill(0.0);
+
+            // Vocal audio path: if this track has pre-rendered samples
+            // and no plugin instrument, play those samples at the right
+            // position relative to the playhead.
+            if tr.instrument.is_none() && playing {
+                let vocal_guard = tr.vocal.load();
+                if let Some(vocal) = vocal_guard.as_deref()
+                    && !vocal.samples.is_empty()
+                {
+                    let buf_start = playhead;
+                    for i in 0..n {
+                        let abs_sample = buf_start + i as u64;
+                        if abs_sample >= vocal.clip_start_samples {
+                            let idx = (abs_sample - vocal.clip_start_samples) as usize;
+                            if idx < vocal.samples.len() {
+                                let s = vocal.samples[idx];
+                                track_l[i] = s;
+                                track_r[i] = s;
+                            }
+                        }
+                    }
+                }
+            }
+
             if let Some(inst_ptr) = tr.instrument.as_ref() {
                 let inst = unsafe { &mut *inst_ptr.0 };
                 #[cfg(debug_assertions)]
