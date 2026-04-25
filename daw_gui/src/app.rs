@@ -276,6 +276,10 @@ pub struct AppData {
     /// entry by the target position.
     #[lens(ignore)]
     pub note_clipboard: Vec<Note>,
+
+    /// True while the keybindings cheat-sheet overlay is visible. F1 or
+    /// `?` toggles it; Esc / clicking outside closes it.
+    pub is_help_open: bool,
 }
 
 impl AppData {
@@ -369,6 +373,7 @@ impl AppData {
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             note_clipboard: Vec::new(),
+            is_help_open: false,
         }
     }
 
@@ -692,6 +697,10 @@ pub enum AppEvent {
     CommitRenameTrack,
     /// Esc key — discard the in-progress edit.
     CancelRenameTrack,
+    /// Toggle the keybindings cheat-sheet overlay.
+    ToggleHelp,
+    /// Force-close the help overlay (Esc).
+    CloseHelp,
 
     // -------- Bottom panel -------------------------------------------------
     SelectBottomPanel(u8),
@@ -915,6 +924,14 @@ impl Model for AppData {
                 AppEvent::CancelRenameTrack => {
                     self.track_rename_idx = None;
                     self.track_rename_text.clear();
+                    dirty = false;
+                }
+                AppEvent::ToggleHelp => {
+                    self.is_help_open = !self.is_help_open;
+                    dirty = false;
+                }
+                AppEvent::CloseHelp => {
+                    self.is_help_open = false;
                     dirty = false;
                 }
                 AppEvent::SelectBottomPanel(p) => {

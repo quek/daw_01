@@ -242,6 +242,13 @@ fn run_gui(
                 PluginPickerView::new(cx);
             }
         });
+
+        // Help / keybindings cheat-sheet.
+        Binding::new(cx, AppData::is_help_open, |cx, open| {
+            if open.get(cx) {
+                build_help_overlay(cx);
+            }
+        });
     })
     .title("daw_01")
     .inner_size((1280, 800))
@@ -425,8 +432,93 @@ fn register_shortcuts(cx: &mut Context) {
                 cx.emit(AppEvent::DeleteSelectedClip);
             }),
         ),
+        // Help / cheat-sheet: F1 toggles, `?` (Shift+/) toggles, Esc closes.
+        (
+            KeyChord::new(Modifiers::empty(), Code::F1),
+            KeymapEntry::new(AppEvent::ToggleHelp, |cx| {
+                cx.emit(AppEvent::ToggleHelp)
+            }),
+        ),
+        (
+            KeyChord::new(Modifiers::SHIFT, Code::Slash),
+            KeymapEntry::new(AppEvent::ToggleHelp, |cx| {
+                cx.emit(AppEvent::ToggleHelp)
+            }),
+        ),
+        (
+            KeyChord::new(Modifiers::empty(), Code::Escape),
+            KeymapEntry::new(AppEvent::CloseHelp, |cx| cx.emit(AppEvent::CloseHelp)),
+        ),
     ])
     .build(cx);
+}
+
+/// Floating overlay that lists every keyboard shortcut. Two columns
+/// (`shortcut` / `description`); each row is a single Label so layout
+/// stays simple and the overlay never panics on empty content.
+const HELP_SHORTCUTS: &[(&str, &str)] = &[
+    ("Space", "再生 / 停止"),
+    ("P", "ループ ON/OFF"),
+    ("V", "VOICEVOX 合成"),
+    ("Ctrl+Z", "Undo"),
+    ("Ctrl+Shift+Z / Ctrl+Y", "Redo"),
+    ("Ctrl+C", "選択ノートをコピー"),
+    ("Ctrl+V", "コピーしたノートを貼り付け"),
+    ("Delete", "選択ノート / クリップを削除"),
+    ("Ctrl+N", "新規プロジェクト"),
+    ("Ctrl+O", "プロジェクトを開く"),
+    ("Ctrl+S", "保存"),
+    ("Ctrl+Shift+S", "名前を付けて保存"),
+    ("Ctrl+E", "WAV 書き出し"),
+    ("F1 / ?", "このヘルプを開閉"),
+    ("Esc", "ヘルプを閉じる / 編集中をキャンセル"),
+    ("クリップをダブルクリック", "ピアノロールに開く"),
+    ("空白をダブルクリック", "新規クリップ / ノート"),
+    ("Shift+クリック", "選択に追加"),
+    ("空白でドラッグ", "矩形範囲選択"),
+    ("クリップ右端ドラッグ", "リサイズ"),
+    ("ホイール", "横スクロール (アレンジ) / 縦スクロール (ピアノロール)"),
+    ("Ctrl+ホイール", "ズーム"),
+    ("Shift+ホイール", "横スクロール (ピアノロール)"),
+];
+
+fn build_help_overlay(cx: &mut Context) {
+    VStack::new(cx, |cx| {
+        VStack::new(cx, |cx| {
+            Label::new(cx, "Keyboard Shortcuts")
+                .font_size(16.0)
+                .color(Color::rgb(230, 230, 230))
+                .padding_bottom(Pixels(8.0));
+            for (chord, desc) in HELP_SHORTCUTS {
+                HStack::new(cx, |cx| {
+                    Label::new(cx, *chord)
+                        .font_size(12.0)
+                        .color(Color::rgb(180, 200, 240))
+                        .width(Pixels(220.0));
+                    Label::new(cx, *desc)
+                        .font_size(12.0)
+                        .color(Color::rgb(220, 220, 220))
+                        .width(Stretch(1.0));
+                })
+                .height(Pixels(20.0));
+            }
+            HStack::new(cx, |cx| {
+                Element::new(cx).width(Stretch(1.0));
+                Button::new(cx, |cx| Label::new(cx, "Close (Esc)").font_size(11.0))
+                    .on_press(|ex| ex.emit(AppEvent::CloseHelp));
+            })
+            .padding_top(Pixels(12.0));
+        })
+        .padding(Pixels(20.0))
+        .gap(Pixels(2.0))
+        .background_color(Color::rgb(36, 36, 40))
+        .width(Pixels(560.0));
+    })
+    .position_type(PositionType::Absolute)
+    .alignment(Alignment::Center)
+    .width(Stretch(1.0))
+    .height(Stretch(1.0))
+    .background_color(Color::rgba(0, 0, 0, 140));
 }
 
 /// CSS overrides for the Lists we ship. The defaults' `height: 30px` on
