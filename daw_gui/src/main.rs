@@ -396,6 +396,16 @@ fn register_shortcuts(cx: &mut Context) {
             KeymapEntry::new(AppEvent::Redo, |cx| cx.emit(AppEvent::Redo)),
         ),
         (
+            KeyChord::new(Modifiers::CTRL, Code::KeyC),
+            KeymapEntry::new(AppEvent::CopySelectedNotes, |cx| {
+                cx.emit(AppEvent::CopySelectedNotes)
+            }),
+        ),
+        (
+            KeyChord::new(Modifiers::CTRL, Code::KeyV),
+            KeymapEntry::new(AppEvent::PasteNotes, |cx| cx.emit(AppEvent::PasteNotes)),
+        ),
+        (
             KeyChord::new(Modifiers::empty(), Code::KeyP),
             KeymapEntry::new(AppEvent::ToggleLoop, |cx| cx.emit(AppEvent::ToggleLoop)),
         ),
@@ -461,6 +471,34 @@ fn build_menu_bar(cx: &mut Context) {
             |cx| {
                 menu_item(cx, "Undo", "Ctrl+Z", AppEvent::Undo);
                 menu_item(cx, "Redo", "Ctrl+Shift+Z", AppEvent::Redo);
+                Divider::new(cx);
+                menu_item(cx, "Copy Notes", "Ctrl+C", AppEvent::CopySelectedNotes);
+                menu_item(cx, "Paste Notes", "Ctrl+V", AppEvent::PasteNotes);
+                Divider::new(cx);
+                menu_item(
+                    cx,
+                    "Quantize 1/4",
+                    "",
+                    AppEvent::QuantizeSelectedNotes(1),
+                );
+                menu_item(
+                    cx,
+                    "Quantize 1/8",
+                    "",
+                    AppEvent::QuantizeSelectedNotes(2),
+                );
+                menu_item(
+                    cx,
+                    "Quantize 1/16",
+                    "",
+                    AppEvent::QuantizeSelectedNotes(4),
+                );
+                menu_item(
+                    cx,
+                    "Quantize 1/32",
+                    "",
+                    AppEvent::QuantizeSelectedNotes(8),
+                );
             },
         );
         Submenu::new(

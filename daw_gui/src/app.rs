@@ -269,6 +269,12 @@ pub struct AppData {
     pub undo_stack: VecDeque<Song>,
     #[lens(ignore)]
     pub redo_stack: VecDeque<Song>,
+
+    /// Note clipboard. Notes are stored with `start_beat` already
+    /// normalised so the earliest note is at 0 — paste then offsets every
+    /// entry by the target position.
+    #[lens(ignore)]
+    pub note_clipboard: Vec<Note>,
 }
 
 impl AppData {
@@ -361,6 +367,7 @@ impl AppData {
             track_rename_text: String::new(),
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
+            note_clipboard: Vec::new(),
         }
     }
 
@@ -429,9 +436,102 @@ impl AppData {
                 | AppEvent::ResizeNote { .. }
                 | AppEvent::DeleteSelectedNotes
                 | AppEvent::SetSelectedNoteLyric(_)
+                | AppEvent::PasteNotes
+                | AppEvent::QuantizeSelectedNotes(_)
                 | AppEvent::SelectPluginFromDb(_)
                 | AppEvent::RemoveSlot { .. }
         )
+    }
+
+    fn copy_selected_notes(&mut self) {
+        let Some(r) = self.selected_clip else { return };
+        let Some(track) = self.song.tracks.get(r.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get(r.clip as usize) else {
+            return;
+        };
+        if self.selected_notes.is_empty() {
+            return;
+        }
+        let mut copied: Vec<Note> = self
+            .selected_notes
+            .iter()
+            .filter_map(|i| clip.notes.get(*i as usize).cloned())
+            .collect();
+        // Normalise so the earliest selected note sits at beat 0; paste
+        // then re-offsets every entry by the destination position.
+        let earliest = copied
+            .iter()
+            .map(|n| n.start_beat)
+            .fold(f64::INFINITY, f64::min);
+        if earliest.is_finite() {
+            for n in &mut copied {
+                n.start_beat -= earliest;
+            }
+        }
+        self.note_clipboard = copied;
+        self.status_message = format!("コピー: {} ノート", self.note_clipboard.len());
+    }
+
+    fn paste_notes(&mut self) {
+        if self.note_clipboard.is_empty() {
+            return;
+        }
+        let Some(r) = self.selected_clip else {
+            self.status_message =
+                "貼り付け先のクリップが選択されていません".to_string();
+            return;
+        };
+        // Anchor at the playhead beat (relative to clip), or beat 0 when
+        // not playing.
+        let anchor = if let Some(playhead) = self.playhead_beat {
+            let clip_start = self
+                .song
+                .tracks
+                .get(r.track as usize)
+                .and_then(|t| t.clips.get(r.clip as usize))
+                .map(|c| c.start_beat)
+                .unwrap_or(0.0);
+            (playhead as f64 - clip_start).max(0.0)
+        } else {
+            0.0
+        };
+        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(r.clip as usize) else {
+            return;
+        };
+        let mut new_indices = Vec::with_capacity(self.note_clipboard.len());
+        for src in &self.note_clipboard {
+            let mut n = src.clone();
+            n.start_beat += anchor;
+            new_indices.push(clip.notes.len() as u32);
+            clip.notes.push(n);
+        }
+        self.selected_notes = new_indices;
+        self.sync_song_to_plugin_host();
+        self.status_message = format!("貼り付け: {} ノート", self.note_clipboard.len());
+    }
+
+    fn quantize_selected_notes(&mut self, div: u8) {
+        let Some(r) = self.selected_clip else { return };
+        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(r.clip as usize) else {
+            return;
+        };
+        let div = div.max(1) as f64;
+        // Snap to nearest `1/div`-beat grid.
+        let snap = |b: f64| (b * div).round() / div;
+        for &i in &self.selected_notes {
+            if let Some(n) = clip.notes.get_mut(i as usize) {
+                n.start_beat = snap(n.start_beat).max(0.0);
+            }
+        }
+        self.sync_song_to_plugin_host();
     }
 
     /// Recompute every cached lens-visible snapshot (`track_headers`,
@@ -547,6 +647,15 @@ pub enum AppEvent {
     /// starting a multi-frame drag (clip / note move) so the whole drag
     /// collapses into a single undo step.
     PushUndoSnapshot,
+    /// Copy currently selected notes onto the clipboard (positions
+    /// normalised so the earliest note sits at beat 0).
+    CopySelectedNotes,
+    /// Paste clipboard notes into the selected clip, offset by either
+    /// the playhead position or the start of the clip if no playhead.
+    PasteNotes,
+    /// Quantize selected notes' `start_beat` to the nearest `1/div`-beat
+    /// grid. `div=4` means 1/4 beat = 16th-note grid.
+    QuantizeSelectedNotes(u8),
     AddVocalTrack,
     AddInstrumentTrack,
     RemoveLastTrack,
@@ -755,6 +864,14 @@ impl Model for AppData {
                 AppEvent::PushUndoSnapshot => {
                     self.push_undo_snapshot();
                     dirty = false;
+                }
+                AppEvent::CopySelectedNotes => {
+                    self.copy_selected_notes();
+                    dirty = false;
+                }
+                AppEvent::PasteNotes => self.paste_notes(),
+                AppEvent::QuantizeSelectedNotes(div) => {
+                    self.quantize_selected_notes(*div);
                 }
                 AppEvent::AddVocalTrack => self.action_add_vocal_track(),
                 AppEvent::AddInstrumentTrack => self.action_add_instrument_track(),
