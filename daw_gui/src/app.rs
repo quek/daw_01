@@ -195,6 +195,11 @@ pub struct AppData {
     pub pianoroll_top_pitch: u8,
     /// Beat at the left edge of the piano roll.
     pub pianoroll_scroll_beat: f32,
+    /// Mirror of `Song::loop_start_beat` / `loop_end_beat` as f32 lenses
+    /// so the arrangement view can render the loop band without a
+    /// custom Lens over `Song`. Refreshed by `refresh_caches`.
+    pub loop_start_beat: f32,
+    pub loop_end_beat: f32,
 
     // -------- Cached lens-bound snapshots -----------------------------------
     /// Per-track header strip on the left of the arrangement view.
@@ -336,6 +341,8 @@ impl AppData {
             pianoroll_zoom_y: 14.0,
             pianoroll_top_pitch: 84, // C6
             pianoroll_scroll_beat: 0.0,
+            loop_start_beat: 0.0,
+            loop_end_beat: 0.0,
             track_headers: Vec::new(),
             track_count,
             clip_boxes: Vec::new(),
@@ -560,6 +567,8 @@ impl AppData {
     /// `song` + selection state.
     fn refresh_caches(&mut self) {
         self.track_count = self.song.tracks.len() as u32;
+        self.loop_start_beat = self.song.loop_start_beat as f32;
+        self.loop_end_beat = self.song.loop_end_beat as f32;
         self.track_headers = self
             .song
             .tracks
@@ -822,6 +831,11 @@ pub enum AppEvent {
     SetPianoRollZoomX(u32),
     /// Update piano roll vertical zoom (px/semitone).
     SetPianoRollZoomY(u32),
+    /// Set the user-defined playback loop region. `start` and `end` are
+    /// `f64::to_bits` of the beat positions; pass `start == end` (e.g.
+    /// both zero) to clear the user range and fall back to the song
+    /// content envelope.
+    SetLoopRange { start_bits: u64, end_bits: u64 },
 
     // -------- Mixer -------------------------------------------------------
     SetTrackVolume {
@@ -1048,6 +1062,13 @@ impl Model for AppData {
                     self.pianoroll_zoom_y = f32::from_bits(*bits).clamp(6.0, 40.0);
                     dirty = false;
                 }
+                AppEvent::SetLoopRange {
+                    start_bits,
+                    end_bits,
+                } => self.set_loop_range(
+                    from_f64_bits(*start_bits),
+                    from_f64_bits(*end_bits),
+                ),
                 AppEvent::SelectPluginFromDb(id) => {
                     self.select_plugin_from_db(id.clone());
                     dirty = false;
@@ -1370,6 +1391,19 @@ impl AppData {
     fn toggle_loop(&mut self) {
         self.is_looping = !self.is_looping;
         self.send_plugin(MainToChild::SetLoop(self.is_looping));
+    }
+
+    fn set_loop_range(&mut self, start: f64, end: f64) {
+        // Normalise: a degenerate range (end <= start) clears the user
+        // region so the engine falls back to song-bounds looping.
+        let (start, end) = if end > start {
+            (start.max(0.0), end.max(0.0))
+        } else {
+            (0.0, 0.0)
+        };
+        self.song.loop_start_beat = start;
+        self.song.loop_end_beat = end;
+        self.sync_song_to_plugin_host();
     }
 
     // -------- Track operations ---------------------------------------------

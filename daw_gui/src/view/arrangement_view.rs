@@ -241,8 +241,17 @@ where
 // Custom canvas
 // ---------------------------------------------------------------------------
 
+/// Visual styling for the user-defined loop region drawn on the ruler.
+const COLOR_LOOP_BAND: Color = Color::rgba(80, 200, 230, 80);
+const COLOR_LOOP_EDGE: Color = Color::rgb(80, 200, 230);
+
 #[derive(Clone, Debug)]
 enum DragKind {
+    /// Drag started on the ruler. The user is painting a new loop region
+    /// from `start_beat` to wherever the cursor is now (clamped >= start).
+    LoopRange {
+        start_beat: f64,
+    },
     /// Move every entry by the same beat-delta. The snapshot pins the
     /// original start_beat per clip so re-renders mid-drag don't drift
     /// against an already-moved model.
@@ -283,6 +292,8 @@ impl ArrangementCanvas {
         .bind(AppData::arrange_zoom_x, |mut handle, _| handle.needs_redraw())
         .bind(AppData::arrange_scroll_beat, |mut handle, _| handle.needs_redraw())
         .bind(AppData::playhead_beat, |mut handle, _| handle.needs_redraw())
+        .bind(AppData::loop_start_beat, |mut handle, _| handle.needs_redraw())
+        .bind(AppData::loop_end_beat, |mut handle, _| handle.needs_redraw())
     }
 
     /// Convert a canvas-relative `(x, y)` into the logical `(beat, track)`
@@ -335,6 +346,37 @@ impl View for ArrangementCanvas {
             rect(bounds.x, bounds.y, bounds.w, RULER_HEIGHT),
             &fill_paint(COLOR_RULER_BG),
         );
+
+        // Loop region band: a colored strip on the ruler showing the
+        // current user-defined loop bounds. When start == end (cleared)
+        // nothing is drawn, and the engine falls back to song bounds.
+        let loop_start = AppData::loop_start_beat.get(cx);
+        let loop_end = AppData::loop_end_beat.get(cx);
+        if loop_end > loop_start {
+            let lx = bounds.x + (loop_start - scroll_beat) * zoom;
+            let lw = (loop_end - loop_start) * zoom;
+            let visible_x = lx.max(bounds.x);
+            let visible_right = (lx + lw).min(bounds.x + bounds.w);
+            let visible_w = visible_right - visible_x;
+            if visible_w > 0.0 {
+                canvas.draw_rect(
+                    rect(visible_x, bounds.y, visible_w, RULER_HEIGHT),
+                    &fill_paint(COLOR_LOOP_BAND),
+                );
+                let edge_paint = stroke_paint(COLOR_LOOP_EDGE, 1.5);
+                let mut p = vg::Path::new();
+                if lx >= bounds.x && lx <= bounds.x + bounds.w {
+                    p.move_to((lx, bounds.y));
+                    p.line_to((lx, bounds.y + RULER_HEIGHT));
+                }
+                let rx = lx + lw;
+                if rx >= bounds.x && rx <= bounds.x + bounds.w {
+                    p.move_to((rx, bounds.y));
+                    p.line_to((rx, bounds.y + RULER_HEIGHT));
+                }
+                canvas.draw_path(&p, &edge_paint);
+            }
+        }
 
         // Vertical bar lines every 4 beats. Start from the first bar that
         // is at or before the visible left edge so the grid stays aligned
@@ -429,6 +471,24 @@ impl View for ArrangementCanvas {
                 let scroll_beat = AppData::arrange_scroll_beat.get(cx);
                 let clip_boxes: Vec<ClipBox> = AppData::clip_boxes.get(cx);
                 let shift = cx.modifiers().shift();
+                // Ruler row → drag-to-set loop region. Snap origin to a
+                // whole beat so user-painted ranges align with bars.
+                if (0.0..RULER_HEIGHT).contains(&my) {
+                    let beat_at_mouse =
+                        ((mx / zoom) + scroll_beat).max(0.0) as f64;
+                    let snapped = beat_at_mouse.floor();
+                    self.drag = Some(DragKind::LoopRange {
+                        start_beat: snapped,
+                    });
+                    self.drag_origin_x = mx;
+                    cx.emit(AppEvent::SetLoopRange {
+                        start_bits: snapped.to_bits(),
+                        end_bits: snapped.to_bits(),
+                    });
+                    cx.capture();
+                    meta.consume();
+                    return;
+                }
                 let Some((beat, track)) =
                     Self::coord_to_beat_track(mx, my, zoom, scroll_beat)
                 else {
@@ -511,6 +571,21 @@ impl View for ArrangementCanvas {
                 let dx = mx - self.drag_origin_x;
                 let dbeat = (dx / zoom) as f64;
                 match kind {
+                    DragKind::LoopRange { start_beat } => {
+                        let cur_beat = ((mx / zoom)
+                            + AppData::arrange_scroll_beat.get(cx))
+                            .max(0.0) as f64;
+                        let snapped_cur = cur_beat.round();
+                        let (s, e) = if snapped_cur > start_beat {
+                            (start_beat, snapped_cur)
+                        } else {
+                            (snapped_cur, start_beat)
+                        };
+                        cx.emit(AppEvent::SetLoopRange {
+                            start_bits: s.to_bits(),
+                            end_bits: e.to_bits(),
+                        });
+                    }
                     DragKind::MoveClips { snapshots } => {
                         let entries: Vec<(ClipRef, u64)> = snapshots
                             .iter()
@@ -583,6 +658,17 @@ impl View for ArrangementCanvas {
                 let scroll_beat = AppData::arrange_scroll_beat.get(cx);
                 let clip_boxes: Vec<ClipBox> = AppData::clip_boxes.get(cx);
                 let track_count = AppData::track_count.get(cx);
+                // Double-click on the ruler clears any active loop range
+                // — Bitwig users expect a "remove loop" gesture without
+                // hunting for a menu item.
+                if (0.0..RULER_HEIGHT).contains(&my) {
+                    cx.emit(AppEvent::SetLoopRange {
+                        start_bits: 0f64.to_bits(),
+                        end_bits: 0f64.to_bits(),
+                    });
+                    meta.consume();
+                    return;
+                }
                 let Some((beat, track)) =
                     Self::coord_to_beat_track(mx, my, zoom, scroll_beat)
                 else {

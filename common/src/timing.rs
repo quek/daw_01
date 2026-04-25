@@ -60,6 +60,23 @@ pub fn playhead_to_beat(song: Option<&Song>, sample_rate: u32, playhead: u64) ->
     Some(playhead as f64 / samples_per_beat)
 }
 
+/// Returns the sample range the audio engine should treat as the active
+/// playback loop. Prefers the user-defined `Song::loop_*_beat` range when
+/// it is non-empty; otherwise falls back to the full song-content
+/// envelope from [`song_bounds_samples`].
+pub fn effective_loop_bounds(song: Option<&Song>, sample_rate: u32) -> Option<(u64, u64)> {
+    let song_ref = song?;
+    if song_ref.bpm > 0.0 && song_ref.loop_end_beat > song_ref.loop_start_beat {
+        let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(song_ref.bpm);
+        let start = (song_ref.loop_start_beat * samples_per_beat).max(0.0) as u64;
+        let end = (song_ref.loop_end_beat * samples_per_beat).max(0.0) as u64;
+        if end > start {
+            return Some((start, end));
+        }
+    }
+    song_bounds_samples(song, sample_rate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

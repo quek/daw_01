@@ -54,6 +54,14 @@ pub struct Song {
     pub length_beats: f64,
     #[serde(default)]
     pub tracks: Vec<Track>,
+    /// User-defined playback loop region (beats). When `loop_end_beat <=
+    /// loop_start_beat` (e.g. both zero — the default for new / older
+    /// projects), the engine falls back to looping over the full song
+    /// content envelope.
+    #[serde(default)]
+    pub loop_start_beat: f64,
+    #[serde(default)]
+    pub loop_end_beat: f64,
 }
 
 impl Default for Song {
@@ -63,6 +71,8 @@ impl Default for Song {
             time_sig: (4, 4),
             length_beats: 64.0,
             tracks: Vec::new(),
+            loop_start_beat: 0.0,
+            loop_end_beat: 0.0,
         }
     }
 }

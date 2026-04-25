@@ -19,7 +19,7 @@ use common::audio_bridge::{AudioBridgeHandle, CHANNELS};
 use common::model::Song;
 use common::plugin_format::PluginFormat;
 use common::protocol::{AudioSession, ChildKind, ChildToMain, MainToChild, PluginSlot, SlotState};
-use common::timing::{song_bounds_samples, song_ended};
+use common::timing::{effective_loop_bounds, song_ended};
 use common::win_sem::Semaphore;
 use common::wire::{read_msg, write_msg};
 use tokio::net::windows::named_pipe::NamedPipeClient;
@@ -1792,7 +1792,22 @@ fn run_audio(
 
         if playing {
             playhead += frames as u64;
-            if song_ended(song_ref, sample_rate, playhead) {
+            // Auto-stop / loop wrap. When looping is enabled we honour the
+            // user's `Song::loop_*_beat` range (falling back to the full
+            // song bounds when the user hasn't set one); when looping is
+            // disabled we stop at song end.
+            let looping = loop_state.load(Ordering::Acquire);
+            let active_end = if looping {
+                effective_loop_bounds(song_ref, sample_rate).map(|(_, e)| e)
+            } else {
+                None
+            };
+            let reached_end = if let Some(end) = active_end {
+                playhead >= end
+            } else {
+                song_ended(song_ref, sample_rate, playhead)
+            };
+            if reached_end {
                 // Queue offs so the next buffer drains active notes cleanly
                 // even if playback stops.
                 for st in track_state.values_mut() {
@@ -1801,8 +1816,8 @@ fn run_audio(
                     }
                     st.active_notes.clear();
                 }
-                let wrap_to = if loop_state.load(Ordering::Acquire) {
-                    song_bounds_samples(song_ref, sample_rate).map(|(start, _)| start)
+                let wrap_to = if looping {
+                    effective_loop_bounds(song_ref, sample_rate).map(|(start, _)| start)
                 } else {
                     None
                 };
