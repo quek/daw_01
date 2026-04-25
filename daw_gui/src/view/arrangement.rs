@@ -113,14 +113,23 @@ fn pad_or_truncate_display(s: &str, target: usize) -> String {
 /// Renders the fixed two-line header shown above the tracker grid: one line
 /// with track names / clip names (with a `>` marker on the cursor track) and
 /// one line with the per-column labels (NOT / VOL / FX / LYR).
-pub fn render_tracker_header(song: &Song, cursor_track: u32) -> String {
+pub fn render_tracker_header(
+    song: &Song,
+    cursor_track: u32,
+    vis_start: u32,
+    vis_count: u32,
+) -> String {
     if song.tracks.is_empty() {
         return "No tracks.\nTrack > Add Vocal Track to begin.".to_string();
     }
+    let vis_end = (vis_start + vis_count) as usize;
     let mut out = String::new();
 
     out.push_str("##  ");
     for (track_idx, track) in song.tracks.iter().enumerate() {
+        if track_idx < vis_start as usize || track_idx >= vis_end {
+            continue;
+        }
         let clip_name = track
             .clips
             .first()
@@ -138,10 +147,10 @@ pub fn render_tracker_header(song: &Song, cursor_track: u32) -> String {
     out.push('\n');
 
     out.push_str("    ");
-    for _ in &song.tracks {
-        // Header row 2 has the same `| <cell>  ` shape as non-cursor data
-        // rows, which keeps column bars in the two header lines aligned
-        // with the data rows below (both are TRACK_HEADER_WIDTH after `|`).
+    for track_idx in 0..song.tracks.len() {
+        if track_idx < vis_start as usize || track_idx >= vis_end {
+            continue;
+        }
         out.push_str(&format!("| {CELL_HEADER}  "));
     }
     out
@@ -150,10 +159,17 @@ pub fn render_tracker_header(song: &Song, cursor_track: u32) -> String {
 /// Renders one string per row of the tracker grid. The cursor row gets a `>`
 /// prefix and the cursor cell is wrapped in `[…]`. Returns an empty vec when
 /// there are no tracks (the header carries the "No tracks." message).
-pub fn render_tracker_rows(song: &Song, cursor_row: u32, cursor_track: u32) -> Vec<String> {
+pub fn render_tracker_rows(
+    song: &Song,
+    cursor_row: u32,
+    cursor_track: u32,
+    vis_start: u32,
+    vis_count: u32,
+) -> Vec<String> {
     if song.tracks.is_empty() {
         return Vec::new();
     }
+    let vis_end = (vis_start + vis_count) as usize;
     let visible_rows = song
         .tracks
         .iter()
@@ -169,6 +185,9 @@ pub fn render_tracker_rows(song: &Song, cursor_row: u32, cursor_track: u32) -> V
         let prefix = if is_cursor_row { '>' } else { ' ' };
         let mut line = format!("{prefix}{row_idx:02X} ");
         for (track_idx, track) in song.tracks.iter().enumerate() {
+            if track_idx < vis_start as usize || track_idx >= vis_end {
+                continue;
+            }
             let cell = track
                 .clips
                 .first()
@@ -339,7 +358,7 @@ mod tests {
     fn render_tracker_header_empty_song() {
         let song = Song::default();
         assert_eq!(
-            render_tracker_header(&song, 0),
+            render_tracker_header(&song, 0, 0, 32),
             "No tracks.\nTrack > Add Vocal Track to begin."
         );
     }
@@ -347,6 +366,6 @@ mod tests {
     #[test]
     fn render_tracker_rows_empty_song() {
         let song = Song::default();
-        assert_eq!(render_tracker_rows(&song, 0, 0), Vec::<String>::new());
+        assert_eq!(render_tracker_rows(&song, 0, 0, 0, 32), Vec::<String>::new());
     }
 }

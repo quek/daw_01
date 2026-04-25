@@ -27,8 +27,13 @@ pub struct MixerStripsView;
 /// Width of one mixer strip (matches the tracker column width in the
 /// arrangement view closely enough to feel aligned without being locked
 /// together in code).
-const STRIP_WIDTH: f32 = 120.0;
+/// Width tuned to match the tracker column (19 monospace chars at
+/// HackGen Console NF 13 px). Fine-tune if the font or size changes.
+const STRIP_WIDTH: f32 = 136.0;
 const STRIP_HEIGHT: f32 = 220.0;
+/// Horizontal spacer matching the tracker's row-number column
+/// (`"##  "` = 4 chars) + the Arrangement padding (8 px).
+const ROW_NUM_SPACER: f32 = 36.0;
 const FADER_HEIGHT: f32 = 100.0;
 const FADER_WIDTH: f32 = 18.0;
 const METER_WIDTH: f32 = 5.0;
@@ -81,6 +86,11 @@ impl MixerStripsView {
                 // are hidden via `display: None`.
                 ScrollView::new(cx, |cx| {
                     HStack::new(cx, |cx| {
+                        // Left spacer aligns strip 0 with tracker
+                        // column 0 (skipping the row-number column).
+                        Element::new(cx)
+                            .width(Pixels(ROW_NUM_SPACER))
+                            .height(Stretch(1.0));
                         for i in 0..MAX_STRIPS {
                             let entry_lens = AppData::track_mix.map(move |v: &Vec<TrackMixEntry>| {
                                 v.get(i).cloned().unwrap_or_default()
@@ -92,8 +102,8 @@ impl MixerStripsView {
                             // leaves a 0-sized entity in the draw pass and
                             // triggers Vizia's `matrix.invert().unwrap()`
                             // panic (draw.rs:35).
-                            let vis_lens = AppData::track_mix.map(move |v: &Vec<TrackMixEntry>| {
-                                if i < v.len() {
+                            let vis_lens = AppData::mixer_visible_range.map(move |&(start, end): &(u32, u32)| {
+                                if (i as u32) >= start && (i as u32) < end {
                                     Visibility::Visible
                                 } else {
                                     Visibility::Hidden

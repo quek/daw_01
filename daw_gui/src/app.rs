@@ -209,6 +209,16 @@ pub struct AppData {
     pub status_message: String,
     /// True while the lyric inline editor is open. Bound by the overlay
     /// `Binding` that shows/hides the `Textbox`.
+    /// First visible track index in the tracker + mixer view. Adjusted
+    /// automatically when the cursor moves beyond the visible window.
+    pub visible_track_start: u32,
+    /// Number of tracks that fit side-by-side in the arrangement area.
+    /// MVP: fixed at 6; a future version should derive this from the
+    /// actual pixel width of the arrangement panel.
+    pub visible_track_count: u32,
+    /// `(start, end)` range of visible track indices, used by the mixer
+    /// strip visibility lens. Updated alongside `visible_track_start`.
+    pub mixer_visible_range: (u32, u32),
     pub lyric_editing: bool,
     /// Current text in the lyric editor `Textbox`.
     pub lyric_edit_text: String,
@@ -226,8 +236,10 @@ impl AppData {
         // has added zero tracks; that keeps Vizia's `List` draw path off
         // its zero-item panic path.
         let song = Song::default();
-        let tracker_header = crate::view::arrangement::render_tracker_header(&song, 0);
-        let tracker_rows = crate::view::arrangement::render_tracker_rows(&song, 0, 0);
+        let tracker_header =
+            crate::view::arrangement::render_tracker_header(&song, 0, 0, 6);
+        let tracker_rows =
+            crate::view::arrangement::render_tracker_rows(&song, 0, 0, 0, 6);
         // Pre-compute anything that borrows `song` so the Self literal
         // below can move it in field-declaration order without tripping
         // the borrow checker.
@@ -289,18 +301,27 @@ impl AppData {
             rescan_result: Arc::new(Mutex::new(None)),
             is_rescanning: false,
             status_message: String::new(),
+            visible_track_start: 0,
+            visible_track_count: 6,
+            mixer_visible_range: (0, 6),
             lyric_editing: false,
             lyric_edit_text: String::new(),
         }
     }
 
     fn refresh_tracker_text(&mut self) {
-        self.tracker_header =
-            crate::view::arrangement::render_tracker_header(&self.song, self.cursor_track);
+        self.tracker_header = crate::view::arrangement::render_tracker_header(
+            &self.song,
+            self.cursor_track,
+            self.visible_track_start,
+            self.visible_track_count,
+        );
         self.tracker_rows = crate::view::arrangement::render_tracker_rows(
             &self.song,
             self.cursor_row,
             self.cursor_track,
+            self.visible_track_start,
+            self.visible_track_count,
         );
     }
 }
@@ -1686,10 +1707,27 @@ impl AppData {
         let next = (self.cursor_track as i64 + delta as i64).clamp(0, max.max(0));
         if next as u32 != self.cursor_track {
             self.cursor_track = next as u32;
+            self.ensure_cursor_visible();
             // Selected-track change → Inspector must show the new track's
             // chain and labels.
             self.refresh_inspector_chain();
         }
+    }
+
+    /// Adjust `visible_track_start` so `cursor_track` is within the
+    /// visible window. Called after every cursor-track change.
+    fn ensure_cursor_visible(&mut self) {
+        let ct = self.cursor_track;
+        let count = self.visible_track_count;
+        if ct < self.visible_track_start {
+            self.visible_track_start = ct;
+        } else if ct >= self.visible_track_start + count {
+            self.visible_track_start = ct - count + 1;
+        }
+        self.mixer_visible_range = (
+            self.visible_track_start,
+            self.visible_track_start + count,
+        );
     }
 
     fn move_cursor_row(&mut self, delta: i32) {

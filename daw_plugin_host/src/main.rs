@@ -1862,7 +1862,7 @@ fn export_wav_offline(
             }
         }
     }
-    for (_, vocal_swap) in &tracks.tracks.vocal {
+    for vocal_swap in tracks.tracks.vocal.values() {
         let guard = vocal_swap.load();
         if let Some(v) = guard.as_deref() {
             let end = v.clip_start_samples + v.samples.len() as u64;
