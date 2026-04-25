@@ -485,6 +485,7 @@ impl View for ArrangementCanvas {
                         start_bits: snapped.to_bits(),
                         end_bits: snapped.to_bits(),
                     });
+                    cx.emit(AppEvent::BeginDrag);
                     cx.capture();
                     meta.consume();
                     return;
@@ -543,6 +544,7 @@ impl View for ArrangementCanvas {
                         }
                         Some(DragKind::MoveClips { snapshots })
                     };
+                    cx.emit(AppEvent::BeginDrag);
                     cx.capture();
                     meta.consume();
                 } else if my >= RULER_HEIGHT {
@@ -558,6 +560,7 @@ impl View for ArrangementCanvas {
                         cur_x: mx,
                         cur_y: my,
                     });
+                    cx.emit(AppEvent::BeginDrag);
                     cx.capture();
                     meta.consume();
                 }
@@ -649,6 +652,7 @@ impl View for ArrangementCanvas {
                 }
                 self.drag = None;
                 cx.release();
+                cx.emit(AppEvent::EndDrag);
             }
             WindowEvent::MouseDoubleClick(MouseButton::Left) => {
                 let bounds = cx.bounds();

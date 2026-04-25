@@ -302,6 +302,15 @@ pub struct AppData {
     /// autosave timer to space writes 60 seconds apart.
     #[lens(ignore)]
     pub last_autosave: std::time::Instant,
+
+    /// `true` while a clip or note is being dragged with the mouse held
+    /// down. While set, `sync_song_to_plugin_host` defers the LoadSong
+    /// IPC — the plugin host doesn't need a fresh snapshot 60× per
+    /// second to keep playback consistent. The final state ships once on
+    /// `EndDrag` (i.e. MouseUp) so timing-sensitive features like loop
+    /// playback see the post-drag song.
+    #[lens(ignore)]
+    pub is_dragging: bool,
 }
 
 impl AppData {
@@ -402,6 +411,7 @@ impl AppData {
             recent_paths_display: load_recent_files_display(),
             is_dirty: false,
             last_autosave: std::time::Instant::now(),
+            is_dragging: false,
         }
     }
 
@@ -745,6 +755,13 @@ pub enum AppEvent {
     /// `<file_path>.autosave.daw` when the song is dirty and a path is
     /// known; otherwise a no-op.
     AutosaveTick,
+    /// Mouse drag started in arrangement / piano roll. Sets
+    /// `is_dragging` so the LoadSong IPC is deferred to the matching
+    /// `EndDrag` rather than fired per mouse-move frame.
+    BeginDrag,
+    /// Mouse drag finished. Flushes one final LoadSong with the
+    /// committed state.
+    EndDrag,
 
     // -------- Bottom panel -------------------------------------------------
     SelectBottomPanel(u8),
@@ -992,6 +1009,15 @@ impl Model for AppData {
                 }
                 AppEvent::AutosaveTick => {
                     self.maybe_autosave();
+                    dirty = false;
+                }
+                AppEvent::BeginDrag => {
+                    self.is_dragging = true;
+                    dirty = false;
+                }
+                AppEvent::EndDrag => {
+                    self.is_dragging = false;
+                    self.send_plugin(MainToChild::LoadSong(self.song.clone()));
                     dirty = false;
                 }
                 AppEvent::SelectBottomPanel(p) => {
@@ -1253,8 +1279,15 @@ impl AppData {
     /// Push the current song to plugin_host so live edits (note add /
     /// move / clip drag etc.) are heard immediately during playback,
     /// and mark the project as dirty so the autosave timer knows to fire.
+    ///
+    /// During a drag the LoadSong IPC is suppressed — sending a full
+    /// song snapshot 60× per second is wasted bandwidth, and `EndDrag`
+    /// flushes the final committed state.
     fn sync_song_to_plugin_host(&mut self) {
         self.is_dirty = true;
+        if self.is_dragging {
+            return;
+        }
         self.send_plugin(MainToChild::LoadSong(self.song.clone()));
     }
 

@@ -378,6 +378,7 @@ impl View for PianoRollCanvas {
                         }
                         Some(NoteDrag::Move { snapshots })
                     };
+                    cx.emit(AppEvent::BeginDrag);
                     cx.capture();
                     meta.consume();
                 } else {
@@ -392,6 +393,7 @@ impl View for PianoRollCanvas {
                         cur_x: canvas_x,
                         cur_y: my,
                     });
+                    cx.emit(AppEvent::BeginDrag);
                     cx.capture();
                     meta.consume();
                 }
@@ -524,6 +526,7 @@ impl View for PianoRollCanvas {
                 }
                 self.drag = None;
                 cx.release();
+                cx.emit(AppEvent::EndDrag);
             }
             WindowEvent::MouseScroll(_, dy) => {
                 let mods = cx.modifiers();
@@ -697,6 +700,7 @@ impl View for VelocityLane {
             WindowEvent::MouseUp(MouseButton::Left) if self.drag.is_some() => {
                 self.drag = None;
                 cx.release();
+                cx.emit(AppEvent::EndDrag);
             }
             _ => {}
         });
