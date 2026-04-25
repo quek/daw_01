@@ -7,6 +7,7 @@ pub mod plugin_db;
 pub mod plugin_format;
 pub mod project;
 pub mod protocol;
+pub mod recent;
 pub mod timing;
 pub mod voicevox;
 pub mod vst3_scan;

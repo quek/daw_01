@@ -210,6 +210,7 @@ fn run_gui(
         .build(cx);
         register_shortcuts(cx);
         spawn_playhead_poller(cx, Arc::clone(&bridge));
+        spawn_autosave_timer(cx);
         if let Some(rx) = incoming_rx_slot.take() {
             spawn_incoming_bridge(cx, rx);
         }
@@ -332,6 +333,20 @@ fn load_or_build_plugin_db() -> Option<Arc<common::plugin_db::PluginDatabase>> {
         }
     }
     None
+}
+
+/// Fires `AppEvent::AutosaveTick` every 30 seconds. The handler decides
+/// whether the song is dirty enough to actually write to disk; this loop
+/// just provides the cadence.
+fn spawn_autosave_timer(cx: &mut Context) {
+    cx.spawn(move |proxy| {
+        loop {
+            std::thread::sleep(Duration::from_secs(30));
+            if proxy.emit(AppEvent::AutosaveTick).is_err() {
+                break;
+            }
+        }
+    });
 }
 
 fn spawn_playhead_poller(cx: &mut Context, bridge: Arc<AudioBridgeHandle>) {
@@ -552,6 +567,33 @@ fn build_menu_bar(cx: &mut Context) {
             |cx| {
                 menu_item(cx, "New", "Ctrl+N", AppEvent::New);
                 menu_item(cx, "Open...", "Ctrl+O", AppEvent::Open);
+                Submenu::new(
+                    cx,
+                    |cx| Label::new(cx, "Open Recent"),
+                    |cx| {
+                        // Each entry rebuilds when AppData::recent_paths_display
+                        // changes (Save / Open mutates the list).
+                        List::new(
+                            cx,
+                            AppData::recent_paths_display,
+                            |cx, _idx, item| {
+                                MenuButton::new(
+                                    cx,
+                                    move |ex| {
+                                        let s = item.get(ex);
+                                        ex.emit(AppEvent::OpenRecent(s.into()));
+                                    },
+                                    move |cx| {
+                                        Label::new(
+                                            cx,
+                                            item.map(|s: &String| s.clone()),
+                                        )
+                                    },
+                                );
+                            },
+                        );
+                    },
+                );
                 Divider::new(cx);
                 menu_item(cx, "Save", "Ctrl+S", AppEvent::Save);
                 menu_item(cx, "Save As...", "Ctrl+Shift+S", AppEvent::SaveAs);

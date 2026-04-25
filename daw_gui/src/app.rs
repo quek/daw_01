@@ -285,6 +285,23 @@ pub struct AppData {
     /// True while the keybindings cheat-sheet overlay is visible. F1 or
     /// `?` toggles it; Esc / clicking outside closes it.
     pub is_help_open: bool,
+
+    /// "Open Recent" entries persisted to LocalAppData. The lens-visible
+    /// `recent_paths_display` mirrors `recent_files.paths` as plain
+    /// strings so the menu can render them via `Vec<String>`.
+    #[lens(ignore)]
+    pub recent_files: common::recent::RecentFiles,
+    pub recent_paths_display: Vec<String>,
+
+    /// True after any song-mutating edit, false right after the song is
+    /// successfully saved / loaded / replaced. Drives the periodic
+    /// autosave check so a clean idle session doesn't keep rewriting an
+    /// `.autosave.daw` file.
+    pub is_dirty: bool,
+    /// Last instant we wrote `<file_path>.autosave.daw`. Used by the
+    /// autosave timer to space writes 60 seconds apart.
+    #[lens(ignore)]
+    pub last_autosave: std::time::Instant,
 }
 
 impl AppData {
@@ -381,6 +398,10 @@ impl AppData {
             redo_stack: VecDeque::new(),
             note_clipboard: Vec::new(),
             is_help_open: false,
+            recent_files: load_recent_files(),
+            recent_paths_display: load_recent_files_display(),
+            is_dirty: false,
+            last_autosave: std::time::Instant::now(),
         }
     }
 
@@ -717,6 +738,13 @@ pub enum AppEvent {
     ToggleHelp,
     /// Force-close the help overlay (Esc).
     CloseHelp,
+    /// Open a project from the recent-files list. The path is the
+    /// absolute disk path stored when the user last loaded / saved it.
+    OpenRecent(PathBuf),
+    /// Periodic autosave tick fired by the GUI's timer thread. Triggers
+    /// `<file_path>.autosave.daw` when the song is dirty and a path is
+    /// known; otherwise a no-op.
+    AutosaveTick,
 
     // -------- Bottom panel -------------------------------------------------
     SelectBottomPanel(u8),
@@ -956,6 +984,14 @@ impl Model for AppData {
                 }
                 AppEvent::CloseHelp => {
                     self.is_help_open = false;
+                    dirty = false;
+                }
+                AppEvent::OpenRecent(path) => {
+                    self.action_open_path(path.clone());
+                    dirty = false;
+                }
+                AppEvent::AutosaveTick => {
+                    self.maybe_autosave();
                     dirty = false;
                 }
                 AppEvent::SelectBottomPanel(p) => {
@@ -1215,11 +1251,10 @@ impl AppData {
     }
 
     /// Push the current song to plugin_host so live edits (note add /
-    /// move / clip drag etc.) are heard immediately during playback.
-    /// `Play` already does this on each press, but pressing Play once and
-    /// then editing for a while wouldn't refresh the audio thread's view
-    /// of the song without this hook.
-    fn sync_song_to_plugin_host(&self) {
+    /// move / clip drag etc.) are heard immediately during playback,
+    /// and mark the project as dirty so the autosave timer knows to fire.
+    fn sync_song_to_plugin_host(&mut self) {
+        self.is_dirty = true;
         self.send_plugin(MainToChild::LoadSong(self.song.clone()));
     }
 
@@ -1244,22 +1279,86 @@ impl AppData {
         else {
             return;
         };
+        self.action_open_path(path);
+    }
+
+    /// Shared implementation for the File→Open dialog and the recent-
+    /// files menu. Loads the project, primes plugin chains, and bumps
+    /// `path` to the front of the recent list.
+    fn action_open_path(&mut self, path: PathBuf) {
         match common::project::load(&path) {
             Ok(song) => {
                 tracing::info!(path = %path.display(), "loaded project");
                 self.restore_plugin_from_song(&song);
                 self.song = song;
-                self.file_path = Some(path);
+                self.file_path = Some(path.clone());
                 self.selected_track = 0;
                 self.selected_clip = None;
                 self.selected_notes.clear();
                 self.refresh_inspector_chain();
                 self.rebuild_track_mix();
                 self.sync_song_to_plugin_host();
+                self.is_dirty = false;
+                self.push_recent(path);
             }
             Err(e) => {
                 tracing::error!(error = ?e, path = %path.display(), "failed to load project");
                 self.status_message = format!("Open 失敗: {e:#}");
+            }
+        }
+    }
+
+    fn push_recent(&mut self, path: PathBuf) {
+        self.recent_files.push(path);
+        self.recent_paths_display = self
+            .recent_files
+            .paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        if let Some(disk) = common::recent::default_path()
+            && let Err(e) = common::recent::save(&disk, &self.recent_files)
+        {
+            tracing::warn!(
+                error = ?e,
+                path = %disk.display(),
+                "failed to persist recent files"
+            );
+        }
+    }
+
+    /// Periodic autosave hook. Writes `<file_path>.autosave.daw` when the
+    /// song is dirty and we have a known on-disk location; rate-limited
+    /// to once every 60 seconds so big drag operations don't hammer the
+    /// disk.
+    fn maybe_autosave(&mut self) {
+        if !self.is_dirty {
+            return;
+        }
+        let Some(orig) = self.file_path.clone() else {
+            return;
+        };
+        if self.last_autosave.elapsed() < std::time::Duration::from_secs(60) {
+            return;
+        }
+        let mut autosave_path = orig.clone();
+        let mut name = autosave_path
+            .file_name()
+            .map(|s| s.to_os_string())
+            .unwrap_or_default();
+        name.push(".autosave.daw");
+        autosave_path.set_file_name(name);
+        match common::project::save(&autosave_path, &self.song) {
+            Ok(()) => {
+                tracing::info!(path = %autosave_path.display(), "autosaved");
+                self.last_autosave = std::time::Instant::now();
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    path = %autosave_path.display(),
+                    "autosave failed"
+                );
             }
         }
     }
@@ -1359,10 +1458,12 @@ impl AppData {
         }
     }
 
-    fn save_to(&self, path: &Path) -> bool {
+    fn save_to(&mut self, path: &Path) -> bool {
         match common::project::save(path, &self.song) {
             Ok(()) => {
                 tracing::info!(path = %path.display(), "saved project");
+                self.is_dirty = false;
+                self.push_recent(path.to_path_buf());
                 true
             }
             Err(e) => {
@@ -2518,6 +2619,30 @@ impl AppData {
 // ---------------------------------------------------------------------------
 // Free standing helpers
 // ---------------------------------------------------------------------------
+
+/// Load the persisted "Open Recent" list from LocalAppData. Failures are
+/// logged at debug — the menu just shows up empty when the file is
+/// missing or corrupt, which is the expected first-launch behaviour.
+fn load_recent_files() -> common::recent::RecentFiles {
+    let Some(path) = common::recent::default_path() else {
+        return Default::default();
+    };
+    match common::recent::load(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = ?e, path = %path.display(), "no recent.json");
+            Default::default()
+        }
+    }
+}
+
+fn load_recent_files_display() -> Vec<String> {
+    load_recent_files()
+        .paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect()
+}
 
 fn initial_track_mix(song: &Song) -> Vec<TrackMixEntry> {
     song.tracks
