@@ -50,6 +50,11 @@ fn rect(x: f32, y: f32, w: f32, h: f32) -> vg::Rect {
     vg::Rect::new(x, y, x + w, y + h)
 }
 
+/// Vertical pixels reserved for the velocity lane below the main piano
+/// roll. Matches Bitwig's compact default — wide enough to grab a bar
+/// edge without crowding the note grid.
+const VELOCITY_LANE_HEIGHT: f32 = 80.0;
+
 pub struct PianoRollView;
 
 impl PianoRollView {
@@ -64,9 +69,14 @@ impl PianoRollView {
                         .width(Stretch(1.0))
                         .height(Stretch(1.0));
                 } else {
-                    PianoRollCanvas::new(cx)
-                        .width(Stretch(1.0))
-                        .height(Stretch(1.0));
+                    VStack::new(cx, |cx| {
+                        PianoRollCanvas::new(cx)
+                            .width(Stretch(1.0))
+                            .height(Stretch(1.0));
+                        VelocityLane::new(cx)
+                            .width(Stretch(1.0))
+                            .height(Pixels(VELOCITY_LANE_HEIGHT));
+                    });
                 }
             });
         })
@@ -546,3 +556,150 @@ impl View for PianoRollCanvas {
         });
     }
 }
+
+// ---------------------------------------------------------------------------
+// Velocity lane
+// ---------------------------------------------------------------------------
+
+const COLOR_VEL_BG: Color = Color::rgb(34, 34, 38);
+const COLOR_VEL_BAR: Color = Color::rgb(170, 200, 110);
+const COLOR_VEL_BAR_SELECTED: Color = Color::rgb(220, 240, 180);
+const VEL_BAR_WIDTH: f32 = 6.0;
+const VEL_HIT_TOLERANCE_PX: f32 = 4.0;
+
+#[derive(Clone, Copy, Debug)]
+struct VelocityDrag {
+    note_idx: u32,
+    drag_origin_y: f32,
+    original_velocity: u8,
+}
+
+/// Bar-graph editor for note velocities. Each note in the selected clip
+/// has a vertical bar at its `start_beat`; the bar height is its
+/// velocity (0..=127). Clicking on a bar starts a vertical drag — moving
+/// up raises velocity, down lowers it.
+pub struct VelocityLane {
+    drag: Option<VelocityDrag>,
+}
+
+impl VelocityLane {
+    pub fn new(cx: &mut Context) -> Handle<'_, Self> {
+        Self { drag: None }
+            .build(cx, |_cx| {})
+            .bind(AppData::note_boxes, |mut h, _| h.needs_redraw())
+            .bind(AppData::pianoroll_zoom_x, |mut h, _| h.needs_redraw())
+            .bind(AppData::pianoroll_scroll_beat, |mut h, _| h.needs_redraw())
+    }
+
+    fn hit_bar(
+        notes: &[NoteBox],
+        canvas_x: f32,
+        scroll_beat: f32,
+        zoom_x: f32,
+    ) -> Option<&NoteBox> {
+        notes
+            .iter()
+            .map(|n| {
+                let bar_x = (n.start_beat - scroll_beat) * zoom_x;
+                (n, (bar_x - canvas_x).abs())
+            })
+            .filter(|(_, d)| *d <= VEL_HIT_TOLERANCE_PX + VEL_BAR_WIDTH * 0.5)
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(n, _)| n)
+    }
+}
+
+impl View for VelocityLane {
+    fn element(&self) -> Option<&'static str> {
+        Some("velocity-lane")
+    }
+
+    fn draw(&self, cx: &mut DrawContext, canvas: &Canvas) {
+        let bounds = cx.bounds();
+        let scroll_beat = AppData::pianoroll_scroll_beat.get(cx);
+        let zoom_x = AppData::pianoroll_zoom_x.get(cx);
+        let notes: Vec<NoteBox> = AppData::note_boxes.get(cx);
+
+        canvas.draw_rect(
+            rect(bounds.x, bounds.y, bounds.w, bounds.h),
+            &fill_paint(COLOR_VEL_BG),
+        );
+
+        let canvas_x0 = bounds.x + KEYBOARD_WIDTH;
+        let canvas_w = bounds.w - KEYBOARD_WIDTH;
+
+        // Baseline along the bottom edge.
+        let mut p = vg::Path::new();
+        p.move_to((canvas_x0, bounds.y + bounds.h - 1.0));
+        p.line_to((canvas_x0 + canvas_w, bounds.y + bounds.h - 1.0));
+        canvas.draw_path(&p, &stroke_paint(COLOR_GRID, 1.0));
+
+        for n in &notes {
+            let bar_center =
+                canvas_x0 + (n.start_beat - scroll_beat) * zoom_x;
+            let bar_x = bar_center - VEL_BAR_WIDTH * 0.5;
+            if bar_x + VEL_BAR_WIDTH < canvas_x0 || bar_x > canvas_x0 + canvas_w {
+                continue;
+            }
+            let usable_h = (bounds.h - 2.0).max(1.0);
+            let bar_h = usable_h * (n.velocity as f32 / 127.0).clamp(0.0, 1.0);
+            let bar_y = bounds.y + bounds.h - bar_h;
+            let color = if n.selected {
+                COLOR_VEL_BAR_SELECTED
+            } else {
+                COLOR_VEL_BAR
+            };
+            canvas.draw_rect(rect(bar_x, bar_y, VEL_BAR_WIDTH, bar_h), &fill_paint(color));
+        }
+    }
+
+    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
+        event.map(|window_event, meta| match window_event {
+            WindowEvent::MouseDown(MouseButton::Left) => {
+                let bounds = cx.bounds();
+                let mx = cx.mouse().cursor_x - bounds.x;
+                let my = cx.mouse().cursor_y - bounds.y;
+                if mx < KEYBOARD_WIDTH {
+                    return;
+                }
+                let canvas_x = mx - KEYBOARD_WIDTH;
+                let zoom_x = AppData::pianoroll_zoom_x.get(cx);
+                let scroll_beat = AppData::pianoroll_scroll_beat.get(cx);
+                let notes: Vec<NoteBox> = AppData::note_boxes.get(cx);
+                let Some(hit) = Self::hit_bar(&notes, canvas_x, scroll_beat, zoom_x)
+                else {
+                    return;
+                };
+                cx.emit(AppEvent::PushUndoSnapshot);
+                self.drag = Some(VelocityDrag {
+                    note_idx: hit.note,
+                    drag_origin_y: my,
+                    original_velocity: hit.velocity,
+                });
+                cx.capture();
+                meta.consume();
+            }
+            WindowEvent::MouseMove(_, _) => {
+                let Some(drag) = self.drag else { return };
+                let bounds = cx.bounds();
+                let my = cx.mouse().cursor_y - bounds.y;
+                let dy = drag.drag_origin_y - my;
+                // Full-height drag covers the velocity range; smaller
+                // moves give finer control.
+                let usable_h = (bounds.h - 2.0).max(1.0);
+                let delta = (dy / usable_h * 127.0).round() as i32;
+                let new_vel = (drag.original_velocity as i32 + delta).clamp(0, 127) as u8;
+                cx.emit(AppEvent::SetNoteVelocity {
+                    note: drag.note_idx,
+                    velocity: new_vel,
+                });
+            }
+            WindowEvent::MouseUp(MouseButton::Left) if self.drag.is_some() => {
+                self.drag = None;
+                cx.release();
+            }
+            _ => {}
+        });
+    }
+}
+

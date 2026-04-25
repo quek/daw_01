@@ -130,6 +130,7 @@ pub struct NoteBox {
     pub start_beat: f32,
     pub duration_beats: f32,
     pub pitch: u8,
+    pub velocity: u8,
     pub lyric: String,
     pub selected: bool,
 }
@@ -515,6 +516,21 @@ impl AppData {
         self.status_message = format!("貼り付け: {} ノート", self.note_clipboard.len());
     }
 
+    fn set_note_velocity(&mut self, note_idx: u32, velocity: u8) {
+        let Some(r) = self.selected_clip else { return };
+        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(r.clip as usize) else {
+            return;
+        };
+        let Some(note) = clip.notes.get_mut(note_idx as usize) else {
+            return;
+        };
+        note.velocity = velocity;
+        self.sync_song_to_plugin_host();
+    }
+
     fn quantize_selected_notes(&mut self, div: u8) {
         let Some(r) = self.selected_clip else { return };
         let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
@@ -600,6 +616,7 @@ impl AppData {
                             start_beat: n.start_beat as f32,
                             duration_beats: n.duration_beats as f32,
                             pitch: n.pitch,
+                            velocity: n.velocity,
                             lyric: n.lyric.clone().unwrap_or_default(),
                             selected: selected_notes.contains(&(i as u32)),
                         })
@@ -656,6 +673,12 @@ pub enum AppEvent {
     /// Quantize selected notes' `start_beat` to the nearest `1/div`-beat
     /// grid. `div=4` means 1/4 beat = 16th-note grid.
     QuantizeSelectedNotes(u8),
+    /// Set the velocity of one note (0..=127). Emitted by the velocity
+    /// lane while the user drags a bar.
+    SetNoteVelocity {
+        note: u32,
+        velocity: u8,
+    },
     AddVocalTrack,
     AddInstrumentTrack,
     RemoveLastTrack,
@@ -872,6 +895,9 @@ impl Model for AppData {
                 AppEvent::PasteNotes => self.paste_notes(),
                 AppEvent::QuantizeSelectedNotes(div) => {
                     self.quantize_selected_notes(*div);
+                }
+                AppEvent::SetNoteVelocity { note, velocity } => {
+                    self.set_note_velocity(*note, *velocity);
                 }
                 AppEvent::AddVocalTrack => self.action_add_vocal_track(),
                 AppEvent::AddInstrumentTrack => self.action_add_instrument_track(),
