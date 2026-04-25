@@ -1847,19 +1847,47 @@ fn export_wav_offline(
     let sr = session.sample_rate;
     let max_frames = session.max_frames;
     let bpm = song.bpm;
+    let samples_per_beat = sr as f64 * 60.0 / bpm as f64;
 
-    // Song length in samples.
-    let beats = song.length_beats;
-    let song_samples = (beats * sr as f64 * 60.0 / bpm as f64) as u64;
-    // Maximum tail: 10 seconds.
+    // Find the actual end of content: last clip end or last vocal sample,
+    // whichever is later. Using song.length_beats alone would render
+    // minutes of silence when the song length is much longer than the
+    // clips in it.
+    let mut content_end: u64 = 0;
+    for track in &song.tracks {
+        for clip in &track.clips {
+            let end = ((clip.start_beat + clip.length_beats) * samples_per_beat) as u64;
+            if end > content_end {
+                content_end = end;
+            }
+        }
+    }
+    for (_, vocal_swap) in &tracks.tracks.vocal {
+        let guard = vocal_swap.load();
+        if let Some(v) = guard.as_deref() {
+            let end = v.clip_start_samples + v.samples.len() as u64;
+            if end > content_end {
+                content_end = end;
+            }
+        }
+    }
+    // Fall back to song length if no clips/vocals at all.
+    if content_end == 0 {
+        content_end = (song.length_beats * samples_per_beat) as u64;
+    }
+
+    // Maximum tail: 10 seconds after content ends.
     let max_tail = sr as u64 * 10;
-    let total_max = song_samples + max_tail;
-    // Silence threshold for tail cutoff (−80 dB ≈ 0.0001 linear).
-    let silence_thresh: f32 = 0.0001;
-    let silence_cutoff_samples = sr as u64; // 1 second of silence → stop.
+    let total_max = content_end + max_tail;
+    // Silence threshold for tail cutoff (−60 dB ≈ 0.001 linear).
+    // Some plugins emit tiny residual noise even with no input, so the
+    // original −80 dB threshold never triggered.
+    let silence_thresh: f32 = 0.001;
+    // Half a second of continuous silence → stop rendering the tail.
+    let silence_cutoff_samples = sr as u64 / 2;
 
     tracing::info!(
-        song_samples,
+        content_end,
         max_tail,
         path = %path.display(),
         "starting offline WAV export"
@@ -1916,7 +1944,7 @@ fn export_wav_offline(
             let notes = active_notes.entry(*track_id).or_default();
 
             // Collect MIDI events for this buffer.
-            if playhead < song_samples {
+            if playhead < content_end {
                 collect_events_for_buffer(
                     Some(song),
                     *track_id,
@@ -2029,8 +2057,8 @@ fn export_wav_offline(
 
         playhead += frames as u64;
 
-        // Tail silence detection (only after song body is done).
-        if playhead > song_samples {
+        // Tail silence detection (only after content is done).
+        if playhead > content_end {
             if peak < silence_thresh {
                 silence_counter += frames as u64;
                 if silence_counter >= silence_cutoff_samples {
