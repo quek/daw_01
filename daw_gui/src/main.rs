@@ -352,6 +352,9 @@ fn spawn_incoming_bridge(cx: &mut Context, mut rx: UnboundedReceiver<ChildToMain
                 ChildToMain::SlotGuiClosed { track, slot } => {
                     Some(AppEvent::GuiClosedFromChild { track, slot })
                 }
+                ChildToMain::ExportWavComplete { error } => {
+                    Some(AppEvent::ExportWavComplete { error })
+                }
                 ChildToMain::SlotPluginLoaded { track, slot, id, name } => {
                     Some(AppEvent::SlotPluginLoadedFromChild { track, slot, id, name })
                 }
@@ -482,6 +485,10 @@ fn register_shortcuts(cx: &mut Context) {
             KeyChord::new(Modifiers::CTRL | Modifiers::SHIFT, Code::KeyS),
             KeymapEntry::new(AppEvent::SaveAs, |cx| cx.emit(AppEvent::SaveAs)),
         ),
+        (
+            KeyChord::new(Modifiers::CTRL, Code::KeyE),
+            KeymapEntry::new(AppEvent::ExportWav, |cx| cx.emit(AppEvent::ExportWav)),
+        ),
         // Unmodified letter/space keys must be gated by `lyric_editing`
         // so the Textbox receives them during lyric input.
         (
@@ -583,6 +590,8 @@ fn build_menu_bar(cx: &mut Context) {
                 Divider::new(cx);
                 menu_item(cx, "Save", "Ctrl+S", AppEvent::Save);
                 menu_item(cx, "Save As...", "Ctrl+Shift+S", AppEvent::SaveAs);
+                Divider::new(cx);
+                menu_item(cx, "Export WAV...", "Ctrl+E", AppEvent::ExportWav);
             },
         );
         Submenu::new(

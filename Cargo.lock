@@ -1009,6 +1009,7 @@ dependencies = [
  "clap-sys",
  "com-scrape-types",
  "common",
+ "hound",
  "libloading",
  "tokio",
  "tracing",

@@ -89,6 +89,9 @@ pub enum PluginEvent {
     AllPluginStates {
         entries: Vec<SlotState>,
     },
+    ExportWavComplete {
+        error: Option<String>,
+    },
 }
 
 impl From<PluginEvent> for ChildToMain {
@@ -110,6 +113,9 @@ impl From<PluginEvent> for ChildToMain {
                 ChildToMain::SlotPluginState { track, slot, data }
             }
             PluginEvent::AllPluginStates { entries } => ChildToMain::AllPluginStates { entries },
+            PluginEvent::ExportWavComplete { error } => {
+                ChildToMain::ExportWavComplete { error }
+            }
         }
     }
 }
@@ -183,6 +189,9 @@ enum PluginCommand {
         track: u32,
         clip_start_samples: u64,
         samples: Vec<f32>,
+    },
+    ExportWav {
+        path: std::path::PathBuf,
     },
     Shutdown,
 }
@@ -514,6 +523,19 @@ fn plugin_main_loop(
                 }
                 PluginCommand::SetTrackSolo { track, solo } => {
                     tracks.tracks.ensure_params(track).set_solo(solo);
+                }
+                PluginCommand::ExportWav { path } => {
+                    let error = export_wav_offline(
+                        &mut tracks,
+                        &session,
+                        &playback_state,
+                        &song_store,
+                        &loop_state,
+                        &path,
+                    );
+                    let _ = evt_tx.send(PluginEvent::ExportWavComplete {
+                        error: error.err().map(|e| format!("{e:#}")),
+                    });
                 }
                 PluginCommand::SetVocalAudio {
                     track,
@@ -968,6 +990,10 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
         }
         MainToChild::SetTrackSolo { track, solo } => {
             plugin.send(PluginCommand::SetTrackSolo { track, solo });
+        }
+        MainToChild::ExportWav { path } => {
+            tracing::info!(path = %path.display(), "received ExportWav");
+            plugin.send(PluginCommand::ExportWav { path });
         }
         MainToChild::SetVocalAudio {
             track,
@@ -1794,4 +1820,247 @@ fn collect_events_for_buffer(
             }
         }
     }
+}
+
+/// Offline-render the entire song to a stereo WAV file. Runs on the
+/// plugin-main thread with the audio thread stopped. After rendering,
+/// the audio thread is restarted so live playback resumes cleanly.
+///
+/// Tail detection: after the last song sample, rendering continues for
+/// up to 10 seconds. If the master peak stays below −80 dB for 1 full
+/// second, the tail is considered finished and rendering stops early.
+fn export_wav_offline(
+    tracks: &mut TracksHandle,
+    session: &AudioSession,
+    playback_state: &Arc<AtomicU8>,
+    song_store: &Arc<ArcSwapOption<Song>>,
+    loop_state: &Arc<AtomicBool>,
+    path: &std::path::Path,
+) -> anyhow::Result<()> {
+    use hound::{SampleFormat, WavSpec, WavWriter};
+
+    let snapshot = song_store.load();
+    let song = snapshot
+        .as_deref()
+        .context("no song loaded for export")?;
+
+    let sr = session.sample_rate;
+    let max_frames = session.max_frames;
+    let bpm = song.bpm;
+
+    // Song length in samples.
+    let beats = song.length_beats;
+    let song_samples = (beats * sr as f64 * 60.0 / bpm as f64) as u64;
+    // Maximum tail: 10 seconds.
+    let max_tail = sr as u64 * 10;
+    let total_max = song_samples + max_tail;
+    // Silence threshold for tail cutoff (−80 dB ≈ 0.0001 linear).
+    let silence_thresh: f32 = 0.0001;
+    let silence_cutoff_samples = sr as u64; // 1 second of silence → stop.
+
+    tracing::info!(
+        song_samples,
+        max_tail,
+        path = %path.display(),
+        "starting offline WAV export"
+    );
+
+    // Stop the live audio thread so we own all the plugins.
+    tracks.stop_audio();
+
+    // Re-activate + start_processing every plugin for the offline run.
+    for chain in tracks.tracks.chains.values_mut() {
+        for plugin in chain
+            .midi_fx_chain
+            .iter_mut()
+            .chain(chain.instrument.iter_mut())
+            .chain(chain.fx_chain.iter_mut())
+        {
+            let _ = plugin.activate(f64::from(sr), 64, max_frames);
+            let _ = plugin.start_processing();
+        }
+    }
+
+    // Open the WAV writer.
+    let spec = WavSpec {
+        channels: 2,
+        sample_rate: sr,
+        bits_per_sample: 32,
+        sample_format: SampleFormat::Float,
+    };
+    let mut writer = WavWriter::create(path, spec)
+        .with_context(|| format!("failed to create WAV {}", path.display()))?;
+
+    // Scratch buffers.
+    let n = max_frames as usize;
+    let mut master_l = vec![0.0f32; n];
+    let mut master_r = vec![0.0f32; n];
+    let mut track_l = vec![0.0f32; n];
+    let mut track_r = vec![0.0f32; n];
+    let mut midi_bus_a: Vec<TimedNoteEvent> = Vec::with_capacity(256);
+    let mut midi_bus_b: Vec<TimedNoteEvent> = Vec::with_capacity(256);
+    let mut active_notes: HashMap<u32, Vec<u8>> = HashMap::new();
+
+    let mut playhead: u64 = 0;
+    let mut silence_counter: u64 = 0;
+
+    while playhead < total_max {
+        let frames = max_frames.min((total_max - playhead) as u32);
+        let buf_n = frames as usize;
+        master_l[..buf_n].fill(0.0);
+        master_r[..buf_n].fill(0.0);
+
+        // Process each track.
+        for (track_id, chain) in tracks.tracks.chains.iter_mut() {
+            midi_bus_a.clear();
+            let notes = active_notes.entry(*track_id).or_default();
+
+            // Collect MIDI events for this buffer.
+            if playhead < song_samples {
+                collect_events_for_buffer(
+                    Some(song),
+                    *track_id,
+                    sr,
+                    playhead,
+                    frames,
+                    &mut midi_bus_a,
+                    notes,
+                );
+            }
+
+            // MIDI FX chain.
+            for mfx in &mut chain.midi_fx_chain {
+                let _ = mfx.process(frames, &midi_bus_a, &[]);
+                midi_bus_b.clear();
+                mfx.drain_out_notes_into(&mut midi_bus_b);
+                midi_bus_b.sort_by_key(|e| e.time);
+                std::mem::swap(&mut midi_bus_a, &mut midi_bus_b);
+            }
+
+            // Instrument.
+            track_l[..buf_n].fill(0.0);
+            track_r[..buf_n].fill(0.0);
+            if let Some(inst) = chain.instrument.as_mut() {
+                let _ = inst.process(frames, &midi_bus_a, &[]);
+                if let Some(l) = inst.output_buffer(0) {
+                    track_l[..buf_n].copy_from_slice(&l[..buf_n]);
+                }
+                if let Some(r) = inst.output_buffer(1).or(inst.output_buffer(0)) {
+                    track_r[..buf_n].copy_from_slice(&r[..buf_n]);
+                }
+            }
+
+            // FX chain.
+            for fx in &mut chain.fx_chain {
+                let input = [&track_l[..buf_n], &track_r[..buf_n]];
+                let _ = fx.process(frames, &[], &input);
+                if let Some(l) = fx.output_buffer(0) {
+                    track_l[..buf_n].copy_from_slice(&l[..buf_n]);
+                }
+                if let Some(r) = fx.output_buffer(1).or(fx.output_buffer(0)) {
+                    track_r[..buf_n].copy_from_slice(&r[..buf_n]);
+                }
+            }
+
+            // Apply volume/pan and sum into master.
+            let params = tracks
+                .tracks
+                .params
+                .get(track_id)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(TrackAudioParams::new(1.0, 0.0, false, false)));
+            let volume = params.volume();
+            let pan = params.pan().clamp(-1.0, 1.0);
+            let muted = params.muted();
+            if !muted {
+                let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+                let gain_l = angle.cos() * volume;
+                let gain_r = angle.sin() * volume;
+                for i in 0..buf_n {
+                    master_l[i] += track_l[i] * gain_l;
+                    master_r[i] += track_r[i] * gain_r;
+                }
+            }
+        }
+
+        // Vocal tracks (no chain).
+        for (track_id, vocal_swap) in &tracks.tracks.vocal {
+            if tracks.tracks.chains.contains_key(track_id) {
+                continue; // already processed above
+            }
+            let vocal_guard = vocal_swap.load();
+            if let Some(vocal) = vocal_guard.as_deref()
+                && !vocal.samples.is_empty()
+            {
+                let params = tracks
+                    .tracks
+                    .params
+                    .get(track_id)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(TrackAudioParams::new(1.0, 0.0, false, false)));
+                let volume = params.volume();
+                let pan = params.pan().clamp(-1.0, 1.0);
+                if !params.muted() {
+                    let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+                    let gain_l = angle.cos() * volume;
+                    let gain_r = angle.sin() * volume;
+                    for i in 0..buf_n {
+                        let abs = playhead + i as u64;
+                        if abs >= vocal.clip_start_samples {
+                            let idx = (abs - vocal.clip_start_samples) as usize;
+                            if idx < vocal.samples.len() {
+                                let s = vocal.samples[idx];
+                                master_l[i] += s * gain_l;
+                                master_r[i] += s * gain_r;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Write interleaved stereo samples.
+        let mut peak: f32 = 0.0;
+        for i in 0..buf_n {
+            writer.write_sample(master_l[i])?;
+            writer.write_sample(master_r[i])?;
+            peak = peak.max(master_l[i].abs()).max(master_r[i].abs());
+        }
+
+        playhead += frames as u64;
+
+        // Tail silence detection (only after song body is done).
+        if playhead > song_samples {
+            if peak < silence_thresh {
+                silence_counter += frames as u64;
+                if silence_counter >= silence_cutoff_samples {
+                    tracing::info!(playhead, "tail silence detected, stopping export");
+                    break;
+                }
+            } else {
+                silence_counter = 0;
+            }
+        }
+    }
+
+    writer.finalize().context("failed to finalize WAV")?;
+
+    // Stop processing + deactivate all plugins.
+    for chain in tracks.tracks.chains.values_mut() {
+        for plugin in chain
+            .midi_fx_chain
+            .iter_mut()
+            .chain(chain.instrument.iter_mut())
+            .chain(chain.fx_chain.iter_mut())
+        {
+            plugin.stop_processing();
+            plugin.deactivate();
+        }
+    }
+
+    // Restart the live audio thread.
+    let _ = tracks.start_audio(session, playback_state, song_store, loop_state);
+
+    tracing::info!(path = %path.display(), playhead, "WAV export finished");
+    Ok(())
 }

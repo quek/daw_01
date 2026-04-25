@@ -398,6 +398,11 @@ pub enum AppEvent {
     SynthesizeVocal,
     /// Background vocal synth finished. Results are in `synth_result`.
     VocalSynthCompleted,
+    /// Export the entire song to a WAV file. Triggered by Ctrl+E or
+    /// the File menu.
+    ExportWav,
+    /// plugin_host finished the WAV export.
+    ExportWavComplete { error: Option<String> },
     /// `i` key: open the inline lyric editor for the current row.
     StartLyricEdit,
     /// Textbox on_edit callback.
@@ -580,6 +585,18 @@ impl Model for AppData {
                 }
                 AppEvent::TrackPeaksTick(peaks) => {
                     self.on_track_peaks_tick(peaks);
+                    dirty = false;
+                }
+                AppEvent::ExportWav => {
+                    self.action_export_wav();
+                    dirty = false;
+                }
+                AppEvent::ExportWavComplete { error } => {
+                    if let Some(e) = error {
+                        self.status_message = format!("WAV 書き出し失敗: {e}");
+                    } else {
+                        self.status_message = "WAV 書き出し完了".to_string();
+                    }
                     dirty = false;
                 }
                 AppEvent::SynthesizeVocal => {
@@ -1241,6 +1258,19 @@ impl AppData {
             });
         }
         self.inspector_chain = out;
+    }
+
+    fn action_export_wav(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("WAV", &["wav"])
+            .save_file()
+        else {
+            return;
+        };
+        self.status_message = "WAV 書き出し中...".to_string();
+        // Send the song + path to plugin_host for offline render.
+        self.send_plugin(MainToChild::LoadSong(self.song.clone()));
+        self.send_plugin(MainToChild::ExportWav { path });
     }
 
     /// Open the lyric editor for the current cursor row, pre-filling
