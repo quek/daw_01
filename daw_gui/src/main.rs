@@ -384,6 +384,18 @@ fn register_shortcuts(cx: &mut Context) {
             KeymapEntry::new(AppEvent::PlayToggle, |cx| cx.emit(AppEvent::PlayToggle)),
         ),
         (
+            KeyChord::new(Modifiers::CTRL, Code::KeyZ),
+            KeymapEntry::new(AppEvent::Undo, |cx| cx.emit(AppEvent::Undo)),
+        ),
+        (
+            KeyChord::new(Modifiers::CTRL | Modifiers::SHIFT, Code::KeyZ),
+            KeymapEntry::new(AppEvent::Redo, |cx| cx.emit(AppEvent::Redo)),
+        ),
+        (
+            KeyChord::new(Modifiers::CTRL, Code::KeyY),
+            KeymapEntry::new(AppEvent::Redo, |cx| cx.emit(AppEvent::Redo)),
+        ),
+        (
             KeyChord::new(Modifiers::empty(), Code::KeyP),
             KeymapEntry::new(AppEvent::ToggleLoop, |cx| cx.emit(AppEvent::ToggleLoop)),
         ),
@@ -441,6 +453,14 @@ fn build_menu_bar(cx: &mut Context) {
                 menu_item(cx, "Save As...", "Ctrl+Shift+S", AppEvent::SaveAs);
                 Divider::new(cx);
                 menu_item(cx, "Export WAV...", "Ctrl+E", AppEvent::ExportWav);
+            },
+        );
+        Submenu::new(
+            cx,
+            |cx| Label::new(cx, "Edit"),
+            |cx| {
+                menu_item(cx, "Undo", "Ctrl+Z", AppEvent::Undo);
+                menu_item(cx, "Redo", "Ctrl+Shift+Z", AppEvent::Redo);
             },
         );
         Submenu::new(

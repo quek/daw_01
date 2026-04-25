@@ -397,6 +397,9 @@ impl View for ArrangementCanvas {
                         (c.start_beat + c.length_beats - scroll_beat) * zoom;
                     let from_right = right_edge_px - mx;
                     self.drag_origin_x = mx;
+                    // Snapshot pre-drag state so Ctrl+Z rewinds the whole
+                    // drag, not just the last per-frame `SetClipPositions`.
+                    cx.emit(AppEvent::PushUndoSnapshot);
                     self.drag = if from_right < RESIZE_HANDLE_PX {
                         Some(DragKind::ResizeClip {
                             clip: target,

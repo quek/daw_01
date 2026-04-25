@@ -344,6 +344,7 @@ impl View for PianoRollCanvas {
                     let from_right = right_px - canvas_x;
                     self.drag_origin_x = canvas_x;
                     self.drag_origin_y = my;
+                    cx.emit(AppEvent::PushUndoSnapshot);
                     self.drag = if from_right < NOTE_RESIZE_HANDLE_PX {
                         Some(NoteDrag::Resize {
                             note_idx: hit.note,

@@ -13,9 +13,14 @@
 //! Each view tracks the in-progress drag locally and only emits a single
 //! commit event (`MoveClip`, `MoveNote`, etc.) on `MouseUp`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+/// Maximum number of undo snapshots kept in memory. Each snapshot is a
+/// full `Song` clone, so the practical ceiling is bounded by song size
+/// rather than this constant; 200 covers a long editing session.
+const UNDO_LIMIT: usize = 200;
 
 use common::model::{Clip, InstrumentSource, Note, Song, Track};
 use common::plugin_db::PluginDatabase;
@@ -256,6 +261,14 @@ pub struct AppData {
     /// bound to `track_rename_text` instead of the regular click button.
     pub track_rename_idx: Option<u32>,
     pub track_rename_text: String,
+
+    /// Undo / redo history. Each entry is a full `Song` snapshot taken
+    /// just before the corresponding edit; popping pushes the current
+    /// song onto the opposite stack for symmetric back-and-forth.
+    #[lens(ignore)]
+    pub undo_stack: VecDeque<Song>,
+    #[lens(ignore)]
+    pub redo_stack: VecDeque<Song>,
 }
 
 impl AppData {
@@ -346,7 +359,79 @@ impl AppData {
             status_message: String::new(),
             track_rename_idx: None,
             track_rename_text: String::new(),
+            undo_stack: VecDeque::new(),
+            redo_stack: VecDeque::new(),
         }
+    }
+
+    /// Record the current `song` onto the undo stack. Drops the redo
+    /// stack — Bitwig's behaviour: any new edit invalidates the redo
+    /// branch the user could have replayed otherwise.
+    fn push_undo_snapshot(&mut self) {
+        if self.undo_stack.len() >= UNDO_LIMIT {
+            self.undo_stack.pop_front();
+        }
+        self.undo_stack.push_back(self.song.clone());
+        self.redo_stack.clear();
+    }
+
+    fn undo(&mut self) {
+        let Some(prev) = self.undo_stack.pop_back() else {
+            return;
+        };
+        self.redo_stack.push_back(std::mem::replace(&mut self.song, prev));
+        self.after_undo_redo();
+    }
+
+    fn redo(&mut self) {
+        let Some(next) = self.redo_stack.pop_back() else {
+            return;
+        };
+        self.undo_stack.push_back(std::mem::replace(&mut self.song, next));
+        self.after_undo_redo();
+    }
+
+    fn after_undo_redo(&mut self) {
+        // Selection might point at a clip / note that no longer exists;
+        // clamp to safe defaults rather than try to migrate.
+        self.selected_clip = None;
+        self.selected_clips.clear();
+        self.selected_notes.clear();
+        self.track_rename_idx = None;
+        self.track_rename_text.clear();
+        let track_max = self.song.tracks.len().saturating_sub(1) as u32;
+        if self.song.tracks.is_empty() {
+            self.selected_track = 0;
+        } else if self.selected_track > track_max {
+            self.selected_track = track_max;
+        }
+        self.refresh_inspector_chain();
+        self.rebuild_track_mix();
+        self.sync_song_to_plugin_host();
+    }
+
+    /// Returns true when the given event is a discrete song-mutation that
+    /// should record a single undo snapshot. Drag operations (which fire
+    /// an event per mouse-move) are excluded — the view emits a separate
+    /// `PushUndoSnapshot` once at MouseDown to capture pre-drag state.
+    fn is_undoable(event: &AppEvent) -> bool {
+        matches!(
+            event,
+            AppEvent::New
+                | AppEvent::AddVocalTrack
+                | AppEvent::AddInstrumentTrack
+                | AppEvent::RemoveLastTrack
+                | AppEvent::CommitRenameTrack
+                | AppEvent::CreateClip { .. }
+                | AppEvent::ResizeClip { .. }
+                | AppEvent::DeleteSelectedClip
+                | AppEvent::AddNote { .. }
+                | AppEvent::ResizeNote { .. }
+                | AppEvent::DeleteSelectedNotes
+                | AppEvent::SetSelectedNoteLyric(_)
+                | AppEvent::SelectPluginFromDb(_)
+                | AppEvent::RemoveSlot { .. }
+        )
     }
 
     /// Recompute every cached lens-visible snapshot (`track_headers`,
@@ -456,6 +541,12 @@ pub enum AppEvent {
     Stop,
     PlayToggle,
     ToggleLoop,
+    Undo,
+    Redo,
+    /// Take an undo snapshot of the current song. Used by views before
+    /// starting a multi-frame drag (clip / note move) so the whole drag
+    /// collapses into a single undo step.
+    PushUndoSnapshot,
     AddVocalTrack,
     AddInstrumentTrack,
     RemoveLastTrack,
@@ -621,6 +712,13 @@ impl Model for AppData {
             // replies leave it false to avoid pointless re-renders.
             let mut dirty = true;
 
+            // One snapshot per discrete edit. Drag-driven events skip
+            // this and rely on the view's MouseDown-time
+            // `PushUndoSnapshot` so the full drag is a single undo step.
+            if Self::is_undoable(app_event) {
+                self.push_undo_snapshot();
+            }
+
             match app_event {
                 AppEvent::New => self.action_new(),
                 AppEvent::Open => self.action_open(),
@@ -650,6 +748,12 @@ impl Model for AppData {
                 }
                 AppEvent::ToggleLoop => {
                     self.toggle_loop();
+                    dirty = false;
+                }
+                AppEvent::Undo => self.undo(),
+                AppEvent::Redo => self.redo(),
+                AppEvent::PushUndoSnapshot => {
+                    self.push_undo_snapshot();
                     dirty = false;
                 }
                 AppEvent::AddVocalTrack => self.action_add_vocal_track(),
