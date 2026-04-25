@@ -97,14 +97,22 @@ pub struct AppData {
     pub file_path: Option<PathBuf>,
     pub cursor_row: u32,
     pub cursor_track: u32,
-    /// Cached header (track names + column labels) for the tracker grid.
-    /// Single Label at the top of ArrangementView; recomputed on `song` or
-    /// `cursor_track` change.
-    pub tracker_header: String,
-    /// Cached per-row rendering of the tracker grid. Each entry is one row
-    /// of the grid. Refreshed on `song`, `cursor_row`, or `cursor_track`
-    /// change so cursor indicators (`>`, `[…]`) stay in sync.
-    pub tracker_rows: Vec<String>,
+    /// Cached per-track header strings (track name + clip name with cursor
+    /// marker), one per slot in the visible window. Bound by the unified
+    /// tracker-mixer view's per-track header label.
+    pub visible_track_headers: Vec<String>,
+    /// Cached per-cell text shaped as `[slot][row]`. Each inner Vec is the
+    /// rows for one visible slot; cursor cell is wrapped in `[…]`.
+    pub visible_tracker_cells: Vec<Vec<String>>,
+    /// Row-number labels (`"  00"`, `"  01"`, …, with a `>` on the cursor
+    /// row). Length equals the current visible row count; bound by the
+    /// row-number column on the left of the unified view.
+    pub row_numbers: Vec<String>,
+    /// Slice of `track_mix` corresponding to the visible window. Slot `i`
+    /// is `track_mix[visible_track_start + i]` when in range, otherwise a
+    /// default entry; this lets each per-track widget bind to a fixed
+    /// slot index without composing multiple Lenses.
+    pub visible_track_mix: Vec<TrackMixEntry>,
     /// Template note used when placing into an empty cell (sing_like_coding
     /// style). Updated whenever the user edits a NoteOn cell.
     pub last_note: Note,
@@ -236,15 +244,18 @@ impl AppData {
         // has added zero tracks; that keeps Vizia's `List` draw path off
         // its zero-item panic path.
         let song = Song::default();
-        let tracker_header =
-            crate::view::arrangement::render_tracker_header(&song, 0, 0, 6);
-        let tracker_rows =
-            crate::view::arrangement::render_tracker_rows(&song, 0, 0, 0, 6);
+        let visible_track_headers =
+            crate::view::arrangement::render_visible_track_headers(&song, 0, 0, 6);
+        let visible_tracker_cells =
+            crate::view::arrangement::render_visible_tracker_cells(&song, 0, 0, 0, 6);
+        let row_count = crate::view::arrangement::visible_row_count(&song);
+        let row_numbers = crate::view::arrangement::render_row_numbers(row_count, 0);
         // Pre-compute anything that borrows `song` so the Self literal
         // below can move it in field-declaration order without tripping
         // the borrow checker.
         let initial_mix = initial_track_mix(&song);
         let initial_peak_display = vec![(0.0, 0.0); song.tracks.len()];
+        let visible_track_mix = build_visible_track_mix(&initial_mix, 0, 6);
         let plugin_picker_entries = plugin_db
             .as_ref()
             .map(|db| {
@@ -268,8 +279,10 @@ impl AppData {
             file_path: None,
             cursor_row: 0,
             cursor_track: 0,
-            tracker_header,
-            tracker_rows,
+            visible_track_headers,
+            visible_tracker_cells,
+            row_numbers,
+            visible_track_mix,
             last_note: Note {
                 key: 60,
                 velocity: 100,
@@ -310,20 +323,49 @@ impl AppData {
     }
 
     fn refresh_tracker_text(&mut self) {
-        self.tracker_header = crate::view::arrangement::render_tracker_header(
+        self.visible_track_headers = crate::view::arrangement::render_visible_track_headers(
             &self.song,
             self.cursor_track,
             self.visible_track_start,
             self.visible_track_count,
         );
-        self.tracker_rows = crate::view::arrangement::render_tracker_rows(
+        self.visible_tracker_cells = crate::view::arrangement::render_visible_tracker_cells(
             &self.song,
             self.cursor_row,
             self.cursor_track,
             self.visible_track_start,
             self.visible_track_count,
         );
+        let row_count = crate::view::arrangement::visible_row_count(&self.song);
+        self.row_numbers =
+            crate::view::arrangement::render_row_numbers(row_count, self.cursor_row);
+        self.refresh_visible_track_mix();
     }
+
+    /// Build the visible-window slice of `track_mix`. Slot `i` is filled
+    /// with `track_mix[visible_track_start + i]` when in range, otherwise
+    /// a default entry whose `index = u32::MAX` so accidental events
+    /// against an empty slot are easy to spot in logs.
+    fn refresh_visible_track_mix(&mut self) {
+        self.visible_track_mix = build_visible_track_mix(
+            &self.track_mix,
+            self.visible_track_start,
+            self.visible_track_count,
+        );
+    }
+}
+
+fn build_visible_track_mix(
+    full: &[TrackMixEntry],
+    start: u32,
+    count: u32,
+) -> Vec<TrackMixEntry> {
+    (0..count as usize)
+        .map(|slot| {
+            let idx = start as usize + slot;
+            full.get(idx).cloned().unwrap_or_default()
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1566,6 +1608,10 @@ impl AppData {
                 entry.peak_r_norm = common::meter::db_to_norm(common::meter::linear_to_db(r));
             }
         }
+        // Rebuild the visible-window slice so the Lens-bound meter bars
+        // pick up the fresh peaks. Vizia diffs per-field, so unchanged
+        // entries (name/volume/pan/etc.) won't trigger redraws.
+        self.refresh_visible_track_mix();
     }
 
     /// Rebuild `track_mix` from `song.tracks`. Call whenever the number or
@@ -1595,6 +1641,7 @@ impl AppData {
             .collect();
         self.track_peak_display
             .resize(self.song.tracks.len(), (0.0, 0.0));
+        self.refresh_visible_track_mix();
     }
 
     /// Rebuild the flat `plugin_picker_entries` list from `plugin_db`.

@@ -24,8 +24,7 @@ use vizia::prelude::*;
 use crate::app::{AppData, AppEvent};
 use crate::job::JobHandle;
 use crate::view::{
-    ArrangementView, MixerStripsView, PluginPickerView, StatusBarView, TrackInspectorView,
-    TransportView,
+    PluginPickerView, StatusBarView, TrackInspectorView, TrackerMixerView, TransportView,
 };
 
 fn main() -> Result<()> {
@@ -241,14 +240,12 @@ fn run_gui(
 
             HStack::new(cx, |cx| {
                 TrackInspectorView::new(cx).width(Pixels(280.0));
-                // Arrangement on top, Renoise-style mixer strips pinned
-                // under it. Arrangement gets the remaining stretch so the
-                // tracker grows with the window.
-                VStack::new(cx, |cx| {
-                    ArrangementView::new(cx).height(Stretch(1.0));
-                    MixerStripsView::new(cx).height(Pixels(170.0));
-                })
-                .width(Stretch(1.0));
+                // Unified tracker + mixer: each track is one VStack
+                // containing its tracker rows on top and its mixer strip
+                // on the bottom (see `view::tracker_mixer`).
+                TrackerMixerView::new(cx)
+                    .width(Stretch(1.0))
+                    .height(Stretch(1.0));
             })
             .height(Stretch(1.0));
 
