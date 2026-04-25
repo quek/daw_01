@@ -160,12 +160,15 @@ pub struct AppData {
     /// `song.tracks` (clamped on track removal). Rebuilt from the
     /// arrangement view's "selected track header" interaction.
     pub selected_track: u32,
-    /// Currently selected clip. `None` means "no clip selected" — the piano
-    /// roll then shows an empty placeholder.
+    /// Most recently clicked clip — drives the piano roll's contents and
+    /// any "primary" indicator. `None` means no clip is selected.
     pub selected_clip: Option<ClipRef>,
+    /// Full selection set. Always contains `selected_clip` as its last
+    /// entry when non-empty. Bulk operations (delete / drag-move) iterate
+    /// this instead of the primary alone.
+    pub selected_clips: Vec<ClipRef>,
     /// Notes selected within `selected_clip`. Indices into the clip's
-    /// `notes` vector. Multi-select isn't wired up in v1 but the field is
-    /// a `Vec` so it's ready for it.
+    /// `notes` vector.
     pub selected_notes: Vec<u32>,
 
     // -------- View state ----------------------------------------------------
@@ -300,6 +303,7 @@ impl AppData {
             file_path: None,
             selected_track: 0,
             selected_clip: None,
+            selected_clips: Vec::new(),
             selected_notes: Vec::new(),
             bottom_panel: 0,
             arrange_zoom_x: ARRANGE_PX_PER_BEAT,
@@ -367,27 +371,30 @@ impl AppData {
                 selected: i as u32 == self.selected_track,
             })
             .collect();
-        let selected_clip = self.selected_clip;
+        let selected_clips = self.selected_clips.clone();
         self.clip_boxes = self
             .song
             .tracks
             .iter()
             .enumerate()
             .flat_map(|(t_idx, t)| {
+                let selected_clips = selected_clips.clone();
                 t.clips
                     .iter()
                     .enumerate()
-                    .map(move |(c_idx, c)| ClipBox {
-                        track: t_idx as u32,
-                        clip: c_idx as u32,
-                        name: c.name.clone(),
-                        start_beat: c.start_beat as f32,
-                        length_beats: c.length_beats as f32,
-                        selected: selected_clip
-                            == Some(ClipRef {
-                                track: t_idx as u32,
-                                clip: c_idx as u32,
-                            }),
+                    .map(move |(c_idx, c)| {
+                        let r = ClipRef {
+                            track: t_idx as u32,
+                            clip: c_idx as u32,
+                        };
+                        ClipBox {
+                            track: t_idx as u32,
+                            clip: c_idx as u32,
+                            name: c.name.clone(),
+                            start_beat: c.start_beat as f32,
+                            length_beats: c.length_beats as f32,
+                            selected: selected_clips.contains(&r),
+                        }
                     })
             })
             .collect();
@@ -467,18 +474,25 @@ pub enum AppEvent {
     SelectBottomPanel(u8),
 
     // -------- Arrangement / clip operations -------------------------------
-    SelectClip(ClipRef),
-    ClearSelection,
-    /// `start_beat_bits` = `f64::to_bits` of the new clip start.
-    MoveClip {
+    /// Select a clip. `additive` extends the existing selection (Shift+click);
+    /// otherwise the prior selection is replaced.
+    SelectClip {
         target: ClipRef,
-        start_beat_bits: u64,
+        additive: bool,
     },
+    /// Replace the current clip selection with the given set. Used by
+    /// marquee box-select on the arrangement.
+    SetClipSelection(Vec<ClipRef>),
+    ClearSelection,
     /// `length_bits` = `f64::to_bits` of the new clip length.
     ResizeClip {
         target: ClipRef,
         length_bits: u64,
     },
+    /// Bulk move of every entry: `(ClipRef, new_start_beat_bits)`. Used
+    /// when the user drags one clip with several selected — every clip in
+    /// the selection slides by the same delta.
+    SetClipPositions(Vec<(ClipRef, u64)>),
     /// Create a new empty clip on `track` starting at `start_beat`. Length
     /// defaults to `DEFAULT_CLIP_LENGTH`.
     CreateClip {
@@ -500,13 +514,11 @@ pub enum AppEvent {
         duration_bits: u64,
         pitch: u8,
     },
-    MoveNote {
-        track: u32,
-        clip: u32,
-        note: u32,
-        start_beat_bits: u64,
-        pitch: u8,
-    },
+    /// Bulk move every entry: `(note_idx, new_start_beat_bits, new_pitch)`.
+    /// Used when the user drags one note with several selected.
+    SetNotePositions(Vec<(u32, u64, u8)>),
+    /// Replace the note selection set. Used by piano roll marquee.
+    SetNoteSelection(Vec<u32>),
     ResizeNote {
         track: u32,
         clip: u32,
@@ -662,21 +674,24 @@ impl Model for AppData {
                     self.bottom_panel = *p;
                     dirty = false;
                 }
-                AppEvent::SelectClip(target) => self.select_clip(Some(*target)),
+                AppEvent::SelectClip { target, additive } => {
+                    self.select_clip(*target, *additive);
+                }
+                AppEvent::SetClipSelection(targets) => {
+                    self.set_clip_selection(targets.clone());
+                }
                 AppEvent::ClearSelection => {
                     self.selected_clip = None;
+                    self.selected_clips.clear();
                     self.selected_notes.clear();
-                }
-                AppEvent::MoveClip {
-                    target,
-                    start_beat_bits,
-                } => {
-                    self.move_clip(*target, from_f64_bits(*start_beat_bits));
                 }
                 AppEvent::ResizeClip {
                     target,
                     length_bits,
                 } => self.resize_clip(*target, from_f64_bits(*length_bits)),
+                AppEvent::SetClipPositions(entries) => {
+                    self.set_clip_positions(entries);
+                }
                 AppEvent::CreateClip {
                     track,
                     start_beat_bits,
@@ -701,25 +716,18 @@ impl Model for AppData {
                         *pitch,
                     );
                 }
-                AppEvent::MoveNote {
-                    track,
-                    clip,
-                    note,
-                    start_beat_bits,
-                    pitch,
-                } => self.move_note(
-                    *track,
-                    *clip,
-                    *note,
-                    from_f64_bits(*start_beat_bits),
-                    *pitch,
-                ),
                 AppEvent::ResizeNote {
                     track,
                     clip,
                     note,
                     duration_bits,
                 } => self.resize_note(*track, *clip, *note, from_f64_bits(*duration_bits)),
+                AppEvent::SetNotePositions(entries) => {
+                    self.set_note_positions(entries);
+                }
+                AppEvent::SetNoteSelection(targets) => {
+                    self.selected_notes = targets.clone();
+                }
                 AppEvent::DeleteSelectedNotes => self.delete_selected_notes(),
                 AppEvent::SetSelectedNoteLyric(text) => {
                     self.set_selected_note_lyric(text.clone());
@@ -1200,10 +1208,12 @@ impl AppData {
         } else if self.selected_track > new_max {
             self.selected_track = new_max;
         }
+        self.selected_clips
+            .retain(|c| c.track != removed_idx);
         if let Some(r) = self.selected_clip
             && r.track == removed_idx
         {
-            self.selected_clip = None;
+            self.selected_clip = self.selected_clips.last().copied();
             self.selected_notes.clear();
         }
         self.refresh_inspector_chain();
@@ -1213,23 +1223,43 @@ impl AppData {
 
     // -------- Clip operations ----------------------------------------------
 
-    fn select_clip(&mut self, target: Option<ClipRef>) {
-        self.selected_clip = target;
+    fn select_clip(&mut self, target: ClipRef, additive: bool) {
+        if additive {
+            // Toggle behaviour: clicking an already-selected clip removes
+            // it from the set. Bitwig does the same for Shift-click.
+            if let Some(pos) = self.selected_clips.iter().position(|c| *c == target) {
+                self.selected_clips.remove(pos);
+            } else {
+                self.selected_clips.push(target);
+            }
+        } else {
+            self.selected_clips = vec![target];
+        }
+        self.selected_clip = self.selected_clips.last().copied();
         self.selected_notes.clear();
-        if let Some(r) = target {
+        if let Some(r) = self.selected_clip {
             self.select_track(r.track);
         }
     }
 
-    fn move_clip(&mut self, target: ClipRef, new_start_beat: f64) {
-        let new_start_beat = new_start_beat.max(0.0);
-        let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
-            return;
-        };
-        let Some(clip) = track.clips.get_mut(target.clip as usize) else {
-            return;
-        };
-        clip.start_beat = new_start_beat;
+    fn set_clip_selection(&mut self, targets: Vec<ClipRef>) {
+        self.selected_clip = targets.last().copied();
+        self.selected_clips = targets;
+        self.selected_notes.clear();
+        if let Some(r) = self.selected_clip {
+            self.select_track(r.track);
+        }
+    }
+
+    fn set_clip_positions(&mut self, entries: &[(ClipRef, u64)]) {
+        for (target, bits) in entries {
+            let new_start = from_f64_bits(*bits).max(0.0);
+            if let Some(track) = self.song.tracks.get_mut(target.track as usize)
+                && let Some(clip) = track.clips.get_mut(target.clip as usize)
+            {
+                clip.start_beat = new_start;
+            }
+        }
         self.sync_song_to_plugin_host();
     }
 
@@ -1260,26 +1290,40 @@ impl AppData {
         };
         let new_idx = track.clips.len() as u32;
         track.clips.push(new_clip);
-        self.selected_clip = Some(ClipRef {
+        let r = ClipRef {
             track: track_idx,
             clip: new_idx,
-        });
+        };
+        self.selected_clip = Some(r);
+        self.selected_clips = vec![r];
         self.selected_notes.clear();
         self.select_track(track_idx);
         self.sync_song_to_plugin_host();
     }
 
     fn delete_selected_clip(&mut self) {
-        let Some(r) = self.selected_clip.take() else {
+        let mut targets: Vec<ClipRef> = std::mem::take(&mut self.selected_clips);
+        if targets.is_empty() {
             return;
-        };
-        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
-            return;
-        };
-        if (r.clip as usize) < track.clips.len() {
-            track.clips.remove(r.clip as usize);
         }
+        // Sort by (track ASC, clip DESC) so within each track the higher
+        // indices are removed first — that keeps the lower ones valid.
+        targets.sort_by(|a, b| {
+            a.track
+                .cmp(&b.track)
+                .then(b.clip.cmp(&a.clip))
+        });
+        for target in targets {
+            if let Some(track) = self.song.tracks.get_mut(target.track as usize)
+                && (target.clip as usize) < track.clips.len()
+            {
+                track.clips.remove(target.clip as usize);
+            }
+        }
+        self.selected_clip = None;
         self.selected_notes.clear();
+        // Indices may have shifted — drop any stale primary; user has to
+        // click again to re-pick a clip.
         self.sync_song_to_plugin_host();
     }
 
@@ -1318,34 +1362,34 @@ impl AppData {
             velocity: 100,
             lyric: None,
         });
-        self.selected_clip = Some(ClipRef {
+        let r = ClipRef {
             track: track_idx,
             clip: clip_idx,
-        });
+        };
+        self.selected_clip = Some(r);
+        if !self.selected_clips.contains(&r) {
+            self.selected_clips = vec![r];
+        }
         self.selected_notes = vec![new_idx];
         self.sync_song_to_plugin_host();
     }
 
-    fn move_note(
-        &mut self,
-        track_idx: u32,
-        clip_idx: u32,
-        note_idx: u32,
-        new_start_beat: f64,
-        new_pitch: u8,
-    ) {
-        let new_start_beat = new_start_beat.max(0.0);
-        let Some(track) = self.song.tracks.get_mut(track_idx as usize) else {
+
+    fn set_note_positions(&mut self, entries: &[(u32, u64, u8)]) {
+        let Some(r) = self.selected_clip else { return };
+        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
             return;
         };
-        let Some(clip) = track.clips.get_mut(clip_idx as usize) else {
+        let Some(clip) = track.clips.get_mut(r.clip as usize) else {
             return;
         };
-        let Some(note) = clip.notes.get_mut(note_idx as usize) else {
-            return;
-        };
-        note.start_beat = new_start_beat;
-        note.pitch = new_pitch;
+        for &(idx, bits, pitch) in entries {
+            let Some(note) = clip.notes.get_mut(idx as usize) else {
+                continue;
+            };
+            note.start_beat = from_f64_bits(bits).max(0.0);
+            note.pitch = pitch;
+        }
         self.sync_song_to_plugin_host();
     }
 

@@ -79,16 +79,20 @@ impl View for PianoRollView {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum NoteDrag {
     Move {
-        note_idx: u32,
-        original_start_beat: f64,
-        original_pitch: u8,
+        snapshots: Vec<(u32, f64, u8)>, // (note_idx, original_start_beat, original_pitch)
     },
     Resize {
         note_idx: u32,
         original_duration: f64,
+    },
+    Marquee {
+        origin_x: f32,
+        origin_y: f32,
+        cur_x: f32,
+        cur_y: f32,
     },
 }
 
@@ -319,6 +323,7 @@ impl View for PianoRollCanvas {
                 let zoom_y = AppData::pianoroll_zoom_y.get(cx);
                 let scroll_beat = AppData::pianoroll_scroll_beat.get(cx);
                 let top_pitch = AppData::pianoroll_top_pitch.get(cx);
+                let shift = cx.modifiers().shift();
                 let Some((beat, pitch)) = Self::coord_to_beat_pitch(
                     canvas_x, my, zoom_x, zoom_y, scroll_beat, top_pitch,
                 ) else {
@@ -328,8 +333,12 @@ impl View for PianoRollCanvas {
                 if let Some(hit) = Self::hit_note(&notes, beat, pitch) {
                     cx.emit(AppEvent::SelectNote {
                         note: hit.note,
-                        additive: false,
+                        additive: shift,
                     });
+                    if shift {
+                        meta.consume();
+                        return;
+                    }
                     let right_px =
                         (hit.start_beat + hit.duration_beats - scroll_beat) * zoom_x;
                     let from_right = right_px - canvas_x;
@@ -341,16 +350,39 @@ impl View for PianoRollCanvas {
                             original_duration: hit.duration_beats as f64,
                         })
                     } else {
-                        Some(NoteDrag::Move {
-                            note_idx: hit.note,
-                            original_start_beat: hit.start_beat as f64,
-                            original_pitch: hit.pitch,
-                        })
+                        // Snapshot every selected note plus the freshly
+                        // clicked one (which SelectNote above just made
+                        // primary, replacing prior selection if no shift).
+                        let mut snapshots: Vec<(u32, f64, u8)> = notes
+                            .iter()
+                            .filter(|n| n.selected)
+                            .map(|n| (n.note, n.start_beat as f64, n.pitch))
+                            .collect();
+                        if !snapshots.iter().any(|(idx, _, _)| *idx == hit.note) {
+                            snapshots.push((
+                                hit.note,
+                                hit.start_beat as f64,
+                                hit.pitch,
+                            ));
+                        }
+                        Some(NoteDrag::Move { snapshots })
                     };
                     cx.capture();
                     meta.consume();
                 } else {
-                    cx.emit(AppEvent::ClearNoteSelection);
+                    if !shift {
+                        cx.emit(AppEvent::ClearNoteSelection);
+                    }
+                    self.drag_origin_x = canvas_x;
+                    self.drag_origin_y = my;
+                    self.drag = Some(NoteDrag::Marquee {
+                        origin_x: canvas_x,
+                        origin_y: my,
+                        cur_x: canvas_x,
+                        cur_y: my,
+                    });
+                    cx.capture();
+                    meta.consume();
                 }
             }
             WindowEvent::MouseDoubleClick(MouseButton::Left) => {
@@ -390,7 +422,7 @@ impl View for PianoRollCanvas {
                 meta.consume();
             }
             WindowEvent::MouseMove(_, _) => {
-                let Some(kind) = self.drag else { return };
+                let Some(kind) = self.drag.clone() else { return };
                 let Some(target): Option<ClipRef> =
                     AppData::selected_clip.get(cx)
                 else {
@@ -403,29 +435,23 @@ impl View for PianoRollCanvas {
                 let zoom_x = AppData::pianoroll_zoom_x.get(cx);
                 let zoom_y = AppData::pianoroll_zoom_y.get(cx);
                 let dx = canvas_x - self.drag_origin_x;
-                // Scroll changes during a drag would warp the note — but
-                // since the drag originated against the same scroll, the
-                // delta cancels out without an explicit subtraction.
                 let dbeat = (dx / zoom_x) as f64;
                 match kind {
-                    NoteDrag::Move {
-                        note_idx,
-                        original_start_beat,
-                        original_pitch,
-                    } => {
-                        let new_start = (original_start_beat + dbeat).max(0.0);
+                    NoteDrag::Move { snapshots } => {
                         let dy = my - self.drag_origin_y;
                         let drow = (dy / zoom_y).round() as i32;
-                        let new_pitch = (original_pitch as i32)
-                            .saturating_sub(drow)
-                            .clamp(0, 127) as u8;
-                        cx.emit(AppEvent::MoveNote {
-                            track: target.track,
-                            clip: target.clip,
-                            note: note_idx,
-                            start_beat_bits: new_start.to_bits(),
-                            pitch: new_pitch,
-                        });
+                        let entries: Vec<(u32, u64, u8)> = snapshots
+                            .iter()
+                            .map(|(idx, beat, pitch)| {
+                                let new_start = (beat + dbeat).max(0.0);
+                                let new_pitch = (*pitch as i32)
+                                    .saturating_sub(drow)
+                                    .clamp(0, 127)
+                                    as u8;
+                                (*idx, new_start.to_bits(), new_pitch)
+                            })
+                            .collect();
+                        cx.emit(AppEvent::SetNotePositions(entries));
                     }
                     NoteDrag::Resize {
                         note_idx,
@@ -439,9 +465,52 @@ impl View for PianoRollCanvas {
                             duration_bits: new_dur.to_bits(),
                         });
                     }
+                    NoteDrag::Marquee { origin_x, origin_y, .. } => {
+                        self.drag = Some(NoteDrag::Marquee {
+                            origin_x,
+                            origin_y,
+                            cur_x: canvas_x,
+                            cur_y: my,
+                        });
+                    }
                 }
             }
             WindowEvent::MouseUp(MouseButton::Left) if self.drag.is_some() => {
+                if let Some(NoteDrag::Marquee {
+                    origin_x,
+                    origin_y,
+                    cur_x,
+                    cur_y,
+                }) = self.drag.clone()
+                {
+                    let zoom_x = AppData::pianoroll_zoom_x.get(cx);
+                    let zoom_y = AppData::pianoroll_zoom_y.get(cx);
+                    let scroll_beat = AppData::pianoroll_scroll_beat.get(cx);
+                    let top_pitch = AppData::pianoroll_top_pitch.get(cx);
+                    let notes: Vec<NoteBox> = AppData::note_boxes.get(cx);
+                    let x0 = origin_x.min(cur_x);
+                    let x1 = origin_x.max(cur_x);
+                    let y0 = origin_y.min(cur_y);
+                    let y1 = origin_y.max(cur_y);
+                    let beat0 = (x0 / zoom_x + scroll_beat).max(0.0);
+                    let beat1 = (x1 / zoom_x + scroll_beat).max(0.0);
+                    let row0 = (y0 / zoom_y) as i32;
+                    let row1 = (y1 / zoom_y) as i32;
+                    let pitch_high = top_pitch as i32 - row0;
+                    let pitch_low = top_pitch as i32 - row1;
+                    let hits: Vec<u32> = notes
+                        .iter()
+                        .filter(|n| {
+                            let p = n.pitch as i32;
+                            p >= pitch_low
+                                && p <= pitch_high
+                                && n.start_beat <= beat1
+                                && n.start_beat + n.duration_beats >= beat0
+                        })
+                        .map(|n| n.note)
+                        .collect();
+                    cx.emit(AppEvent::SetNoteSelection(hits));
+                }
                 self.drag = None;
                 cx.release();
             }

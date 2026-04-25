@@ -186,15 +186,24 @@ where
 // Custom canvas
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum DragKind {
-    MoveClip {
-        clip: ClipRef,
-        original_start_beat: f64,
+    /// Move every entry by the same beat-delta. The snapshot pins the
+    /// original start_beat per clip so re-renders mid-drag don't drift
+    /// against an already-moved model.
+    MoveClips {
+        snapshots: Vec<(ClipRef, f64)>,
     },
     ResizeClip {
         clip: ClipRef,
         original_length_beats: f64,
+    },
+    /// Box-select. `origin_*` is canvas-relative.
+    Marquee {
+        origin_x: f32,
+        origin_y: f32,
+        cur_x: f32,
+        cur_y: f32,
     },
 }
 
@@ -364,6 +373,7 @@ impl View for ArrangementCanvas {
                 let zoom = AppData::arrange_zoom_x.get(cx);
                 let scroll_beat = AppData::arrange_scroll_beat.get(cx);
                 let clip_boxes: Vec<ClipBox> = AppData::clip_boxes.get(cx);
+                let shift = cx.modifiers().shift();
                 let Some((beat, track)) =
                     Self::coord_to_beat_track(mx, my, zoom, scroll_beat)
                 else {
@@ -374,7 +384,15 @@ impl View for ArrangementCanvas {
                         track: c.track,
                         clip: c.clip,
                     };
-                    cx.emit(AppEvent::SelectClip(target));
+                    cx.emit(AppEvent::SelectClip {
+                        target,
+                        additive: shift,
+                    });
+                    // Shift+click toggles selection — no drag.
+                    if shift {
+                        meta.consume();
+                        return;
+                    }
                     let right_edge_px =
                         (c.start_beat + c.length_beats - scroll_beat) * zoom;
                     let from_right = right_edge_px - mx;
@@ -385,34 +403,62 @@ impl View for ArrangementCanvas {
                             original_length_beats: c.length_beats as f64,
                         })
                     } else {
-                        Some(DragKind::MoveClip {
-                            clip: target,
-                            original_start_beat: c.start_beat as f64,
-                        })
+                        // Snapshot every selected clip's start_beat so the
+                        // group slides together. If the clicked clip
+                        // wasn't in the prior selection, SelectClip above
+                        // replaced selection with `[target]` already, so
+                        // reading the cached clip_boxes' selected flag
+                        // would lag — explicitly include `target` plus the
+                        // others that were already selected.
+                        let mut snapshots: Vec<(ClipRef, f64)> = clip_boxes
+                            .iter()
+                            .filter(|c| c.selected)
+                            .map(|c| {
+                                (
+                                    ClipRef { track: c.track, clip: c.clip },
+                                    c.start_beat as f64,
+                                )
+                            })
+                            .collect();
+                        if !snapshots.iter().any(|(r, _)| *r == target) {
+                            snapshots.push((target, c.start_beat as f64));
+                        }
+                        Some(DragKind::MoveClips { snapshots })
                     };
                     cx.capture();
                     meta.consume();
                 } else if my >= RULER_HEIGHT {
-                    cx.emit(AppEvent::ClearSelection);
+                    // Empty lane — start a marquee unless the click is in
+                    // the ruler. If not Shift, the in-progress selection
+                    // stays cleared on MouseUp without box dragging too.
+                    if !shift {
+                        cx.emit(AppEvent::ClearSelection);
+                    }
+                    self.drag = Some(DragKind::Marquee {
+                        origin_x: mx,
+                        origin_y: my,
+                        cur_x: mx,
+                        cur_y: my,
+                    });
+                    cx.capture();
+                    meta.consume();
                 }
             }
             WindowEvent::MouseMove(_, _) => {
-                let Some(kind) = self.drag else { return };
+                let Some(kind) = self.drag.clone() else { return };
                 let bounds = cx.bounds();
                 let mx = cx.mouse().cursor_x - bounds.x;
+                let my = cx.mouse().cursor_y - bounds.y;
                 let zoom = AppData::arrange_zoom_x.get(cx);
                 let dx = mx - self.drag_origin_x;
                 let dbeat = (dx / zoom) as f64;
                 match kind {
-                    DragKind::MoveClip {
-                        clip,
-                        original_start_beat,
-                    } => {
-                        let new_start = (original_start_beat + dbeat).max(0.0);
-                        cx.emit(AppEvent::MoveClip {
-                            target: clip,
-                            start_beat_bits: new_start.to_bits(),
-                        });
+                    DragKind::MoveClips { snapshots } => {
+                        let entries: Vec<(ClipRef, u64)> = snapshots
+                            .iter()
+                            .map(|(r, s)| (*r, (s + dbeat).max(0.0).to_bits()))
+                            .collect();
+                        cx.emit(AppEvent::SetClipPositions(entries));
                     }
                     DragKind::ResizeClip {
                         clip,
@@ -424,9 +470,50 @@ impl View for ArrangementCanvas {
                             length_bits: new_len.to_bits(),
                         });
                     }
+                    DragKind::Marquee { origin_x, origin_y, .. } => {
+                        // Track latest cursor for redraw + on-MouseUp commit.
+                        self.drag = Some(DragKind::Marquee {
+                            origin_x,
+                            origin_y,
+                            cur_x: mx,
+                            cur_y: my,
+                        });
+                    }
                 }
             }
             WindowEvent::MouseUp(MouseButton::Left) if self.drag.is_some() => {
+                if let Some(DragKind::Marquee {
+                    origin_x,
+                    origin_y,
+                    cur_x,
+                    cur_y,
+                }) = self.drag.clone()
+                {
+                    let zoom = AppData::arrange_zoom_x.get(cx);
+                    let scroll_beat = AppData::arrange_scroll_beat.get(cx);
+                    let clip_boxes: Vec<ClipBox> = AppData::clip_boxes.get(cx);
+                    let x0 = origin_x.min(cur_x);
+                    let x1 = origin_x.max(cur_x);
+                    let y0 = origin_y.min(cur_y);
+                    let y1 = origin_y.max(cur_y);
+                    let beat0 = (x0 / zoom + scroll_beat).max(0.0);
+                    let beat1 = (x1 / zoom + scroll_beat).max(0.0);
+                    let track0 =
+                        ((y0 - RULER_HEIGHT).max(0.0) / ARRANGE_TRACK_HEIGHT) as u32;
+                    let track1 =
+                        ((y1 - RULER_HEIGHT).max(0.0) / ARRANGE_TRACK_HEIGHT) as u32;
+                    let hits: Vec<ClipRef> = clip_boxes
+                        .iter()
+                        .filter(|c| {
+                            c.track >= track0
+                                && c.track <= track1
+                                && c.start_beat <= beat1
+                                && c.start_beat + c.length_beats >= beat0
+                        })
+                        .map(|c| ClipRef { track: c.track, clip: c.clip })
+                        .collect();
+                    cx.emit(AppEvent::SetClipSelection(hits));
+                }
                 self.drag = None;
                 cx.release();
             }
@@ -449,10 +536,13 @@ impl View for ArrangementCanvas {
                 // Bitwig: double-click on a clip opens the piano roll for
                 // it. Double-click on empty lane creates a new clip.
                 if let Some(c) = Self::hit_clip(&clip_boxes, beat, track) {
-                    cx.emit(AppEvent::SelectClip(ClipRef {
-                        track: c.track,
-                        clip: c.clip,
-                    }));
+                    cx.emit(AppEvent::SelectClip {
+                        target: ClipRef {
+                            track: c.track,
+                            clip: c.clip,
+                        },
+                        additive: false,
+                    });
                     cx.emit(AppEvent::SelectBottomPanel(1));
                     meta.consume();
                     return;
