@@ -277,7 +277,8 @@ fn run_gui(
                             .on_submit(|cx, _, _| cx.emit(AppEvent::SubmitLyricEdit))
                             .on_cancel(|cx| cx.emit(AppEvent::CancelLyricEdit))
                             .width(Pixels(300.0))
-                            .height(Pixels(28.0));
+                            .height(Pixels(28.0))
+                            .focused(true);
                     })
                     .padding(Pixels(16.0))
                     .gap(Pixels(8.0))
@@ -452,8 +453,19 @@ fn spawn_playhead_poller(cx: &mut Context, bridge: Arc<AudioBridgeHandle>) {
     });
 }
 
+/// Emit an AppEvent only when the lyric editor is not active. This
+/// prevents keymap shortcuts from stealing keyboard input that should
+/// go to the Textbox (e.g. `h`, `j`, `k`, `l`, `v`, `i`).
+fn emit_unless_editing(cx: &mut EventContext, event: AppEvent) {
+    if !AppData::lyric_editing.get(cx) {
+        cx.emit(event);
+    }
+}
+
 fn register_shortcuts(cx: &mut Context) {
     Keymap::from(vec![
+        // Ctrl-modified shortcuts are safe during lyric editing because
+        // the Textbox won't produce printable characters with Ctrl held.
         (
             KeyChord::new(Modifiers::CTRL, Code::KeyN),
             KeymapEntry::new(AppEvent::New, |cx| cx.emit(AppEvent::New)),
@@ -470,37 +482,55 @@ fn register_shortcuts(cx: &mut Context) {
             KeyChord::new(Modifiers::CTRL | Modifiers::SHIFT, Code::KeyS),
             KeymapEntry::new(AppEvent::SaveAs, |cx| cx.emit(AppEvent::SaveAs)),
         ),
+        // Unmodified letter/space keys must be gated by `lyric_editing`
+        // so the Textbox receives them during lyric input.
         (
             KeyChord::new(Modifiers::empty(), Code::KeyH),
-            KeymapEntry::new(AppEvent::CursorLeft, |cx| cx.emit(AppEvent::CursorLeft)),
+            KeymapEntry::new(AppEvent::CursorLeft, |cx| {
+                emit_unless_editing(cx, AppEvent::CursorLeft)
+            }),
         ),
         (
             KeyChord::new(Modifiers::empty(), Code::KeyJ),
-            KeymapEntry::new(AppEvent::CursorDown, |cx| cx.emit(AppEvent::CursorDown)),
+            KeymapEntry::new(AppEvent::CursorDown, |cx| {
+                emit_unless_editing(cx, AppEvent::CursorDown)
+            }),
         ),
         (
             KeyChord::new(Modifiers::empty(), Code::KeyK),
-            KeymapEntry::new(AppEvent::CursorUp, |cx| cx.emit(AppEvent::CursorUp)),
+            KeymapEntry::new(AppEvent::CursorUp, |cx| {
+                emit_unless_editing(cx, AppEvent::CursorUp)
+            }),
         ),
         (
             KeyChord::new(Modifiers::empty(), Code::KeyL),
-            KeymapEntry::new(AppEvent::CursorRight, |cx| cx.emit(AppEvent::CursorRight)),
+            KeymapEntry::new(AppEvent::CursorRight, |cx| {
+                emit_unless_editing(cx, AppEvent::CursorRight)
+            }),
         ),
         (
             KeyChord::new(Modifiers::empty(), Code::Space),
-            KeymapEntry::new(AppEvent::PlayToggle, |cx| cx.emit(AppEvent::PlayToggle)),
+            KeymapEntry::new(AppEvent::PlayToggle, |cx| {
+                emit_unless_editing(cx, AppEvent::PlayToggle)
+            }),
         ),
         (
             KeyChord::new(Modifiers::empty(), Code::KeyP),
-            KeymapEntry::new(AppEvent::ToggleLoop, |cx| cx.emit(AppEvent::ToggleLoop)),
+            KeymapEntry::new(AppEvent::ToggleLoop, |cx| {
+                emit_unless_editing(cx, AppEvent::ToggleLoop)
+            }),
         ),
         (
             KeyChord::new(Modifiers::empty(), Code::KeyN),
-            KeymapEntry::new(AppEvent::NoteOff, |cx| cx.emit(AppEvent::NoteOff)),
+            KeymapEntry::new(AppEvent::NoteOff, |cx| {
+                emit_unless_editing(cx, AppEvent::NoteOff)
+            }),
         ),
         (
             KeyChord::new(Modifiers::empty(), Code::Delete),
-            KeymapEntry::new(AppEvent::NoteClear, |cx| cx.emit(AppEvent::NoteClear)),
+            KeymapEntry::new(AppEvent::NoteClear, |cx| {
+                emit_unless_editing(cx, AppEvent::NoteClear)
+            }),
         ),
         (
             KeyChord::new(Modifiers::CTRL, Code::KeyJ),
@@ -529,13 +559,13 @@ fn register_shortcuts(cx: &mut Context) {
         (
             KeyChord::new(Modifiers::empty(), Code::KeyV),
             KeymapEntry::new(AppEvent::SynthesizeVocal, |cx| {
-                cx.emit(AppEvent::SynthesizeVocal)
+                emit_unless_editing(cx, AppEvent::SynthesizeVocal)
             }),
         ),
         (
             KeyChord::new(Modifiers::empty(), Code::KeyI),
             KeymapEntry::new(AppEvent::StartLyricEdit, |cx| {
-                cx.emit(AppEvent::StartLyricEdit)
+                emit_unless_editing(cx, AppEvent::StartLyricEdit)
             }),
         ),
     ])

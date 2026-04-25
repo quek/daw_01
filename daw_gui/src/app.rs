@@ -417,6 +417,27 @@ impl Model for AppData {
         });
         event.map(|app_event, _| {
             let mut dirty = true;
+
+            // While the lyric editor is open, only process lyric-related
+            // events. All other keymap shortcuts (h/j/k/l cursor, Play,
+            // etc.) are blocked so they don't move the cursor or trigger
+            // actions behind the modal.
+            if self.lyric_editing {
+                match app_event {
+                    AppEvent::LyricEditChanged(text) => {
+                        self.lyric_edit_text = text.clone();
+                    }
+                    AppEvent::SubmitLyricEdit => {
+                        self.submit_lyric_edit();
+                    }
+                    AppEvent::CancelLyricEdit => {
+                        self.lyric_editing = false;
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
             match app_event {
                 AppEvent::New => self.action_new(),
                 AppEvent::Open => self.action_open(),
@@ -574,15 +595,12 @@ impl Model for AppData {
                     self.start_lyric_edit();
                     dirty = false;
                 }
-                AppEvent::LyricEditChanged(text) => {
-                    self.lyric_edit_text = text.clone();
-                    dirty = false;
-                }
-                AppEvent::SubmitLyricEdit => {
-                    self.submit_lyric_edit();
-                }
-                AppEvent::CancelLyricEdit => {
-                    self.lyric_editing = false;
+                // LyricEditChanged / SubmitLyricEdit / CancelLyricEdit
+                // are handled in the early-return block above when
+                // lyric_editing is true.
+                AppEvent::LyricEditChanged(_)
+                | AppEvent::SubmitLyricEdit
+                | AppEvent::CancelLyricEdit => {
                     dirty = false;
                 }
             }
@@ -1256,6 +1274,8 @@ impl AppData {
             let text = self.lyric_edit_text.trim().to_string();
             clip.rows[row_idx].lyric = if text.is_empty() { None } else { Some(text) };
         }
+        // Refresh tracker display so the lyric appears immediately.
+        self.refresh_tracker_text();
         // Advance cursor and keep editing the next row.
         self.move_cursor_row(1);
         self.start_lyric_edit();
