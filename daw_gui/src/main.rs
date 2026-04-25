@@ -1,5 +1,6 @@
 mod app;
 mod job;
+mod midi;
 mod subprocess;
 mod view;
 
@@ -211,6 +212,7 @@ fn run_gui(
         register_shortcuts(cx);
         spawn_playhead_poller(cx, Arc::clone(&bridge));
         spawn_autosave_timer(cx);
+        spawn_midi_input(cx);
         if let Some(rx) = incoming_rx_slot.take() {
             spawn_incoming_bridge(cx, rx);
         }
@@ -333,6 +335,35 @@ fn load_or_build_plugin_db() -> Option<Arc<common::plugin_db::PluginDatabase>> {
         }
     }
     None
+}
+
+/// Open the first available MIDI input port (if any) on a dedicated
+/// background thread. The connection lives until the thread exits or
+/// the closure dropping the handle, so we leak the handle into a
+/// `OnceCell`-style holder using `Box::leak` — simpler than threading
+/// the handle back into AppData given midir's callback runs on its own
+/// thread that doesn't share AppData ownership.
+fn spawn_midi_input(cx: &mut Context) {
+    cx.spawn(move |proxy| {
+        let proxy_for_midi = proxy.clone();
+        match crate::midi::open_default_input(proxy_for_midi) {
+            Ok(Some(handle)) => {
+                let name = handle.port_name.clone();
+                // Keep the connection alive for the lifetime of the
+                // process. Dropping `handle` would close the port.
+                Box::leak(Box::new(handle));
+                let _ = proxy.clone().emit(AppEvent::MidiInputOpened(Some(name)));
+            }
+            Ok(None) => {
+                tracing::info!("no MIDI input ports available");
+                let _ = proxy.clone().emit(AppEvent::MidiInputOpened(None));
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "failed to open MIDI input");
+                let _ = proxy.clone().emit(AppEvent::MidiInputOpened(None));
+            }
+        }
+    });
 }
 
 /// Fires `AppEvent::AutosaveTick` every 30 seconds. The handler decides
@@ -497,6 +528,7 @@ const HELP_SHORTCUTS: &[(&str, &str)] = &[
     ("Shift+ホイール", "横スクロール (ピアノロール)"),
     ("ルーラを横ドラッグ", "ループ範囲を設定"),
     ("ルーラをダブルクリック", "ループ範囲を解除"),
+    ("MIDI 入力 (鍵盤)", "選択クリップへ step input でノート追加"),
 ];
 
 fn build_help_overlay(cx: &mut Context) {

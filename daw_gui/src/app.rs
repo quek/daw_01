@@ -311,6 +311,20 @@ pub struct AppData {
     /// playback see the post-drag song.
     #[lens(ignore)]
     pub is_dragging: bool,
+
+    /// Display label for the active MIDI input device — empty when no
+    /// device is connected. The actual `MidiInputConnection` is leaked
+    /// from the GUI's startup spawn (see `spawn_midi_input`) so the
+    /// callback thread keeps running for the life of the process.
+    pub midi_input_label: String,
+
+    /// Step-input cursor: the next beat (relative to the selected clip
+    /// origin) where an incoming MIDI NoteOn drops a note. Reset to 0
+    /// whenever the user picks a different clip.
+    pub step_cursor_beat: f64,
+    /// How far the step cursor advances per dropped note (1/4 beat ≈
+    /// a sixteenth note at 4/4 — matches piano-roll click default).
+    pub step_size_beats: f64,
 }
 
 impl AppData {
@@ -412,6 +426,9 @@ impl AppData {
             is_dirty: false,
             last_autosave: std::time::Instant::now(),
             is_dragging: false,
+            midi_input_label: String::new(),
+            step_cursor_beat: 0.0,
+            step_size_beats: DEFAULT_NOTE_DURATION,
         }
     }
 
@@ -762,6 +779,18 @@ pub enum AppEvent {
     /// Mouse drag finished. Flushes one final LoadSong with the
     /// committed state.
     EndDrag,
+    /// MIDI NoteOn observed on the active input port. Treated as
+    /// step-input: drops a new note in the selected clip at
+    /// `step_cursor_beat` and advances the cursor by `step_size_beats`.
+    MidiNoteOn { pitch: u8, velocity: u8 },
+    /// MIDI NoteOff — currently a no-op in step-input mode (note duration
+    /// is fixed by the step grid). Reserved for future record-input
+    /// modes that capture true on/off times.
+    MidiNoteOff { pitch: u8 },
+    /// Background thread reports the MIDI input that was opened on
+    /// startup (or when the user re-scans devices). `None` clears the
+    /// connection; `Some(name)` populates the device label.
+    MidiInputOpened(Option<String>),
 
     // -------- Bottom panel -------------------------------------------------
     SelectBottomPanel(u8),
@@ -1018,6 +1047,24 @@ impl Model for AppData {
                 AppEvent::EndDrag => {
                     self.is_dragging = false;
                     self.send_plugin(MainToChild::LoadSong(self.song.clone()));
+                    dirty = false;
+                }
+                AppEvent::MidiNoteOn { pitch, velocity } => {
+                    self.handle_midi_note_on(*pitch, *velocity);
+                }
+                AppEvent::MidiNoteOff { pitch: _ } => {
+                    // Step-input doesn't track note ends — durations are
+                    // fixed by `step_size_beats`.
+                    dirty = false;
+                }
+                AppEvent::MidiInputOpened(name) => {
+                    self.midi_input_label = name.clone().unwrap_or_default();
+                    if name.is_some() {
+                        self.status_message = format!(
+                            "MIDI 入力: {}",
+                            self.midi_input_label
+                        );
+                    }
                     dirty = false;
                 }
                 AppEvent::SelectBottomPanel(p) => {
@@ -1739,6 +1786,38 @@ impl AppData {
 
     // -------- Clip operations ----------------------------------------------
 
+    /// Handle a MIDI NoteOn from the active input port. Step-input mode:
+    /// drops a fresh note in the selected clip at `step_cursor_beat`,
+    /// then advances the cursor by `step_size_beats`. When no clip is
+    /// selected the event is ignored (no fallback target).
+    fn handle_midi_note_on(&mut self, pitch: u8, velocity: u8) {
+        let Some(target) = self.selected_clip else {
+            return;
+        };
+        let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(target.clip as usize) else {
+            return;
+        };
+        // Wrap the cursor when it walks past the end of the clip so a
+        // user can keep playing without having to manually reset.
+        if self.step_cursor_beat >= clip.length_beats {
+            self.step_cursor_beat = 0.0;
+        }
+        let new_idx = clip.notes.len() as u32;
+        clip.notes.push(common::model::Note {
+            start_beat: self.step_cursor_beat,
+            duration_beats: self.step_size_beats,
+            pitch,
+            velocity,
+            lyric: None,
+        });
+        self.selected_notes = vec![new_idx];
+        self.step_cursor_beat += self.step_size_beats;
+        self.sync_song_to_plugin_host();
+    }
+
     fn select_clip(&mut self, target: ClipRef, additive: bool) {
         if additive {
             // Toggle behaviour: clicking an already-selected clip removes
@@ -1753,6 +1832,10 @@ impl AppData {
         }
         self.selected_clip = self.selected_clips.last().copied();
         self.selected_notes.clear();
+        // Picking a different clip resets the step-input cursor so MIDI
+        // notes start at beat 0 of the new clip rather than wherever
+        // the previous one left off.
+        self.step_cursor_beat = 0.0;
         if let Some(r) = self.selected_clip {
             self.select_track(r.track);
         }
@@ -1762,6 +1845,7 @@ impl AppData {
         self.selected_clip = targets.last().copied();
         self.selected_clips = targets;
         self.selected_notes.clear();
+        self.step_cursor_beat = 0.0;
         if let Some(r) = self.selected_clip {
             self.select_track(r.track);
         }

@@ -17,6 +17,7 @@ dirs = "5"
 hound = "3"
 cpal = "0.15"
 libloading = "0.8"
+midir = "0.10"
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
