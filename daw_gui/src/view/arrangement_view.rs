@@ -102,6 +102,19 @@ fn track_header_row<L>(cx: &mut Context, item: L)
 where
     L: Lens<Target = TrackHeader> + Send + Sync,
 {
+    VStack::new(cx, |cx| {
+        track_header_top_row(cx, item);
+        track_header_bottom_row(cx, item);
+    })
+    .padding(Pixels(2.0))
+    .gap(Pixels(2.0))
+    .height(Pixels(ARRANGE_TRACK_HEIGHT));
+}
+
+fn track_header_top_row<L>(cx: &mut Context, item: L)
+where
+    L: Lens<Target = TrackHeader> + Send + Sync,
+{
     HStack::new(cx, |cx| {
         // Either a click-to-select Button (default) or a Textbox (when
         // this row is in rename mode). The branch flips inside a Binding
@@ -176,10 +189,52 @@ where
             .width(Pixels(20.0))
             .height(Pixels(20.0));
     })
-    .padding(Pixels(2.0))
     .gap(Pixels(2.0))
     .alignment(Alignment::Center)
-    .height(Pixels(ARRANGE_TRACK_HEIGHT));
+    .height(Pixels(24.0));
+}
+
+/// Reorder + delete buttons on the second row of the track header.
+fn track_header_bottom_row<L>(cx: &mut Context, item: L)
+where
+    L: Lens<Target = TrackHeader> + Send + Sync,
+{
+    HStack::new(cx, |cx| {
+        let up_item = item;
+        Button::new(cx, |cx| Label::new(cx, "▲").font_size(10.0))
+            .on_press(move |ex| {
+                let h = up_item.get(ex);
+                ex.emit(AppEvent::MoveTrackUp(h.index));
+            })
+            .background_color(Color::rgb(55, 55, 60))
+            .width(Pixels(22.0))
+            .height(Pixels(18.0));
+
+        let down_item = item;
+        Button::new(cx, |cx| Label::new(cx, "▼").font_size(10.0))
+            .on_press(move |ex| {
+                let h = down_item.get(ex);
+                ex.emit(AppEvent::MoveTrackDown(h.index));
+            })
+            .background_color(Color::rgb(55, 55, 60))
+            .width(Pixels(22.0))
+            .height(Pixels(18.0));
+
+        Element::new(cx).width(Stretch(1.0));
+
+        let del_item = item;
+        Button::new(cx, |cx| Label::new(cx, "✕").font_size(10.0))
+            .on_press(move |ex| {
+                let h = del_item.get(ex);
+                ex.emit(AppEvent::DeleteTrack(h.index));
+            })
+            .background_color(Color::rgb(80, 50, 50))
+            .width(Pixels(22.0))
+            .height(Pixels(18.0));
+    })
+    .gap(Pixels(2.0))
+    .alignment(Alignment::Center)
+    .height(Pixels(18.0));
 }
 
 // ---------------------------------------------------------------------------

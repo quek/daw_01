@@ -163,6 +163,10 @@ pub enum MainToChild {
     /// slot), tearing down each plugin's GUI first. Sent when the user
     /// removes a whole track so the audio thread stops rendering it.
     RemoveTrack { track: u32 },
+    /// Reorder the chains map: swap the plugin chains / mixer params /
+    /// vocal audio between `a` and `b`. The audio thread sees the new
+    /// arrangement on the next buffer.
+    SwapTracks { a: u32, b: u32 },
     /// Ask the plugin_host to capture state for one slot. Reply is
     /// `ChildToMain::SlotPluginState`.
     RequestSlotState {

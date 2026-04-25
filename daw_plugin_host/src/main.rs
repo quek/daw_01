@@ -142,6 +142,10 @@ enum PluginCommand {
     RemoveTrack {
         track: u32,
     },
+    SwapTracks {
+        a: u32,
+        b: u32,
+    },
     LoadSong(Song),
     Play,
     Stop,
@@ -492,6 +496,24 @@ fn plugin_main_loop(
                                 }
                                 // Plugins drop here, on plugin-main.
                             }
+                            // The GUI just removed `track` from
+                            // `song.tracks`, shifting every higher track
+                            // down by 1. Mirror that on our chain map so
+                            // chain keys keep matching the song indices.
+                            t.params.remove(&track);
+                            t.vocal.remove(&track);
+                            t.shift_after_remove(track);
+                        },
+                    );
+                }
+                PluginCommand::SwapTracks { a, b } => {
+                    let _ = tracks.mutate(
+                        &session,
+                        &playback_state,
+                        &song_store,
+                        &loop_state,
+                        |t| {
+                            t.swap_indices(a, b);
                         },
                     );
                 }
@@ -967,6 +989,10 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             tracing::info!(track, "received RemoveTrack");
             plugin.send(PluginCommand::RemoveTrack { track });
         }
+        MainToChild::SwapTracks { a, b } => {
+            tracing::info!(a, b, "received SwapTracks");
+            plugin.send(PluginCommand::SwapTracks { a, b });
+        }
         MainToChild::RequestSlotState { track, slot } => {
             tracing::info!(track, ?slot, "received RequestSlotState");
             plugin.send(PluginCommand::RequestSlotState { track, slot });
@@ -1144,6 +1170,73 @@ impl Tracks {
         slot: PluginSlot,
     ) -> Option<&mut (dyn LoadedPlugin + '_)> {
         self.chains.get_mut(&track).and_then(|c| c.plugin_at_mut(slot))
+    }
+
+    /// After removing the chain at `removed`, shift every entry with a
+    /// higher key down by one so the keys stay aligned with the song's
+    /// `tracks` Vec. Mirrors the reindexing the GUI already performed
+    /// when it called `song.tracks.remove(removed)`.
+    fn shift_after_remove(&mut self, removed: u32) {
+        let mut keys: Vec<u32> = self
+            .chains
+            .keys()
+            .copied()
+            .chain(self.params.keys().copied())
+            .chain(self.vocal.keys().copied())
+            .filter(|&k| k > removed)
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        for k in keys {
+            if let Some(c) = self.chains.remove(&k) {
+                self.chains.insert(k - 1, c);
+            }
+            if let Some(p) = self.params.remove(&k) {
+                self.params.insert(k - 1, p);
+            }
+            if let Some(v) = self.vocal.remove(&k) {
+                self.vocal.insert(k - 1, v);
+            }
+        }
+    }
+
+    /// Swap the entries at `a` and `b` across chains / params / vocal,
+    /// preserving plugin state. No-op when either side is missing.
+    fn swap_indices(&mut self, a: u32, b: u32) {
+        if a == b {
+            return;
+        }
+        if let (Some(ca), Some(cb)) = (self.chains.remove(&a), self.chains.remove(&b)) {
+            self.chains.insert(a, cb);
+            self.chains.insert(b, ca);
+        } else {
+            // One side missing — move the present one to the other index.
+            if let Some(c) = self.chains.remove(&a) {
+                self.chains.insert(b, c);
+            } else if let Some(c) = self.chains.remove(&b) {
+                self.chains.insert(a, c);
+            }
+        }
+        if let (Some(pa), Some(pb)) = (self.params.remove(&a), self.params.remove(&b)) {
+            self.params.insert(a, pb);
+            self.params.insert(b, pa);
+        } else {
+            if let Some(p) = self.params.remove(&a) {
+                self.params.insert(b, p);
+            } else if let Some(p) = self.params.remove(&b) {
+                self.params.insert(a, p);
+            }
+        }
+        if let (Some(va), Some(vb)) = (self.vocal.remove(&a), self.vocal.remove(&b)) {
+            self.vocal.insert(a, vb);
+            self.vocal.insert(b, va);
+        } else {
+            if let Some(v) = self.vocal.remove(&a) {
+                self.vocal.insert(b, v);
+            } else if let Some(v) = self.vocal.remove(&b) {
+                self.vocal.insert(a, v);
+            }
+        }
     }
 }
 

@@ -687,6 +687,13 @@ pub enum AppEvent {
     AddVocalTrack,
     AddInstrumentTrack,
     RemoveLastTrack,
+    /// Remove an arbitrary track by index. Existing plugin chains on
+    /// later tracks shift down by one to keep the index space contiguous.
+    DeleteTrack(u32),
+    /// Swap a track with its neighbour above (no-op when already at top).
+    MoveTrackUp(u32),
+    /// Swap a track with its neighbour below (no-op at bottom).
+    MoveTrackDown(u32),
     SelectTrack(u32),
     /// Open the inline rename editor for the given track. Empties out any
     /// previously open editor first.
@@ -911,6 +918,9 @@ impl Model for AppData {
                 AppEvent::AddVocalTrack => self.action_add_vocal_track(),
                 AppEvent::AddInstrumentTrack => self.action_add_instrument_track(),
                 AppEvent::RemoveLastTrack => self.action_remove_last_track(),
+                AppEvent::DeleteTrack(idx) => self.delete_track(*idx),
+                AppEvent::MoveTrackUp(idx) => self.swap_tracks(*idx, idx.saturating_sub(1)),
+                AppEvent::MoveTrackDown(idx) => self.swap_tracks(*idx, *idx + 1),
                 AppEvent::SelectTrack(idx) => self.select_track(*idx),
                 AppEvent::BeginRenameTrack(idx) => {
                     self.begin_rename_track(*idx);
@@ -1363,6 +1373,80 @@ impl AppData {
     }
 
     // -------- Track operations ---------------------------------------------
+
+    fn delete_track(&mut self, idx: u32) {
+        if idx as usize >= self.song.tracks.len() {
+            return;
+        }
+        // Stash the snapshot for undo before mutating.
+        self.push_undo_snapshot();
+        // Close any open plugin GUIs for the doomed track first so
+        // PluginHostWindow drops on the GUI thread (not after RemoveTrack
+        // races back over IPC).
+        #[cfg(windows)]
+        {
+            self.plugin_host_windows.retain(|&(t, _), _| t != idx);
+        }
+        self.song.tracks.remove(idx as usize);
+        self.send_plugin(MainToChild::RemoveTrack { track: idx });
+        // Selection / clip-selection cleanup. Anything that pointed past
+        // the deleted track shifts down by one.
+        if let Some(r) = self.selected_clip {
+            if r.track == idx {
+                self.selected_clip = None;
+                self.selected_notes.clear();
+            } else if r.track > idx {
+                self.selected_clip = Some(ClipRef {
+                    track: r.track - 1,
+                    clip: r.clip,
+                });
+            }
+        }
+        if self.selected_track == idx {
+            self.selected_track = idx.saturating_sub(1);
+        } else if self.selected_track > idx {
+            self.selected_track -= 1;
+        }
+        let max = self.song.tracks.len().saturating_sub(1) as u32;
+        self.selected_track = self.selected_track.min(max);
+        self.refresh_inspector_chain();
+        self.rebuild_track_mix();
+        self.sync_song_to_plugin_host();
+    }
+
+    fn swap_tracks(&mut self, a: u32, b: u32) {
+        if a == b {
+            return;
+        }
+        let n = self.song.tracks.len() as u32;
+        if a >= n || b >= n {
+            return;
+        }
+        self.push_undo_snapshot();
+        self.song.tracks.swap(a as usize, b as usize);
+        self.send_plugin(MainToChild::SwapTracks { a, b });
+        // Track-relative selection state follows the move.
+        if let Some(r) = self.selected_clip {
+            self.selected_clip = Some(ClipRef {
+                track: if r.track == a {
+                    b
+                } else if r.track == b {
+                    a
+                } else {
+                    r.track
+                },
+                clip: r.clip,
+            });
+        }
+        if self.selected_track == a {
+            self.selected_track = b;
+        } else if self.selected_track == b {
+            self.selected_track = a;
+        }
+        self.refresh_inspector_chain();
+        self.rebuild_track_mix();
+        self.sync_song_to_plugin_host();
+    }
 
     fn select_track(&mut self, idx: u32) {
         if idx >= self.song.tracks.len() as u32 {
