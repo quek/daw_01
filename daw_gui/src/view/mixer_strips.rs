@@ -22,8 +22,12 @@ use crate::app::{AppData, AppEvent, TrackMixEntry};
 /// tracker column in `view::tracker_mixer` so the two stay aligned in
 /// pixel space.
 pub(super) const STRIP_WIDTH: f32 = 136.0;
-/// Total height of one strip (label + M/S + pan row + fader/meter).
-pub(super) const STRIP_HEIGHT: f32 = 220.0;
+/// Total height of one strip — chosen to match the actual strip content
+/// (label 14 + M/S/Pan row 24 + fader/meter 100 + 2×gap 2 + 2×padding 4)
+/// so the strip wrapper has no trailing empty space below the meters.
+/// `master_strip` is laid out to the same height by mirroring the user
+/// strip's row heights as spacers.
+pub(super) const STRIP_HEIGHT: f32 = 150.0;
 pub(super) const FADER_HEIGHT: f32 = 100.0;
 pub(super) const FADER_WIDTH: f32 = 18.0;
 pub(super) const METER_WIDTH: f32 = 5.0;
@@ -164,19 +168,15 @@ pub(super) fn master_strip(cx: &mut Context) {
         Label::new(cx, "MASTER")
             .color(Color::rgb(230, 230, 230))
             .font_size(12.0)
-            .height(Pixels(16.0));
-        // Spacer row where the M/S buttons sit on user strips, so the
-        // fader + meter line up vertically across every strip. Width
-        // must be explicit — Vizia's Auto width on a content-less
-        // Element yields 0 and triggers `matrix.invert().unwrap()` in
-        // the draw pass.
-        Element::new(cx)
-            .width(Stretch(1.0))
-            .height(Pixels(22.0));
-        // Matching spacer for the pan slider row.
-        Element::new(cx)
-            .width(Stretch(1.0))
+            // Matches the user-strip track-name label so the master fader
+            // ends up at the same Y as user faders.
             .height(Pixels(14.0));
+        // Spacer matching the user strip's combined M/S/Pan row (24 px).
+        // Master has no mute/solo/pan, but the row stays so the fader
+        // baseline lines up with user strips.
+        Element::new(cx)
+            .width(Stretch(1.0))
+            .height(Pixels(24.0));
         // Master fader (vertical) + stereo meter, same dB scale.
         HStack::new(cx, |cx| {
             Slider::new(cx, AppData::master_gain.map(|g: &f32| amp_to_fader(*g)))
