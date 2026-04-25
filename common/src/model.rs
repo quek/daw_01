@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::plugin_format::PluginFormat;
 
-pub const CURRENT_VERSION: u32 = 1;
+/// Bumped from `1` when the row-based clip model was replaced by free-time
+/// notes. Older `.daw` files cannot be loaded; this is acceptable while
+/// the project is still in M1 / pre-release.
+pub const CURRENT_VERSION: u32 = 2;
 
 /// Serde adapter for `Option<Vec<u8>>` that writes binary data as base64 in
 /// JSON (and other human-readable formats). Bincode bypasses this and uses
@@ -160,44 +163,31 @@ impl PluginInstance {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+/// A clip is a free-time container of notes positioned along the song
+/// timeline. `start_beat` and `length_beats` define where the clip lives;
+/// `notes` holds the notes within the clip in arbitrary order — readers
+/// that care about time order must sort by `Note::start_beat` themselves.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Clip {
     pub name: String,
     pub start_beat: f64,
     pub length_beats: f64,
-    pub rows_per_beat: u16,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rows: Vec<Row>,
+    pub notes: Vec<Note>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
-pub struct Row {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note: Option<NoteEvent>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub volume: Option<u8>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fx: Vec<FxCommand>,
+/// A free-time note inside a clip. `start_beat` is relative to the clip
+/// start; `duration_beats` is the note length. `pitch` is a MIDI key
+/// (0..=127), `velocity` is 0..=127. `lyric` is attached for VOICEVOX
+/// singing synthesis and is `None` for purely instrumental tracks.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct Note {
+    pub start_beat: f64,
+    pub duration_beats: f64,
+    pub pitch: u8,
+    pub velocity: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lyric: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
-pub enum NoteEvent {
-    On(Note),
-    Off,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
-pub struct Note {
-    pub key: u8,
-    pub velocity: u8,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
-pub struct FxCommand {
-    pub cmd: u8,
-    pub value: u8,
 }
 
 #[cfg(test)]
@@ -228,40 +218,29 @@ mod tests {
     }
 
     #[test]
-    fn empty_row_serializes_as_empty_object() {
-        assert_eq!(serde_json::to_string(&Row::default()).unwrap(), "{}");
+    fn empty_note_serializes_as_minimal_object() {
+        // velocity 0 / pitch 0 / start 0 / duration 0 — lyric None is
+        // skipped via `skip_serializing_if`, the rest are required fields.
+        assert_eq!(
+            serde_json::to_string(&Note::default()).unwrap(),
+            r#"{"start_beat":0.0,"duration_beats":0.0,"pitch":0,"velocity":0}"#
+        );
     }
 
     #[test]
-    fn note_serializes_compactly() {
+    fn note_with_lyric_serializes_compactly() {
         let note = Note {
-            key: 60,
+            start_beat: 0.5,
+            duration_beats: 1.0,
+            pitch: 60,
             velocity: 100,
+            lyric: Some("こ".into()),
         };
         assert_eq!(
             serde_json::to_string(&note).unwrap(),
-            r#"{"key":60,"velocity":100}"#
+            r#"{"start_beat":0.5,"duration_beats":1.0,"pitch":60,"velocity":100,"lyric":"こ"}"#
         );
-    }
-
-    #[test]
-    fn note_event_on_roundtrip() {
-        let event = NoteEvent::On(Note {
-            key: 60,
-            velocity: 100,
-        });
-        assert_eq!(
-            serde_json::to_string(&event).unwrap(),
-            r#"{"On":{"key":60,"velocity":100}}"#
-        );
-        assert_eq!(json_roundtrip(&event), event);
-    }
-
-    #[test]
-    fn note_event_off_roundtrip() {
-        let event = NoteEvent::Off;
-        assert_eq!(serde_json::to_string(&event).unwrap(), r#""Off""#);
-        assert_eq!(json_roundtrip(&event), event);
+        assert_eq!(json_roundtrip(&note), note);
     }
 
     #[test]
@@ -277,20 +256,20 @@ mod tests {
                     name: "こんにちは".into(),
                     start_beat: 0.0,
                     length_beats: 16.0,
-                    rows_per_beat: 4,
-                    rows: vec![
-                        Row {
-                            note: Some(NoteEvent::On(Note {
-                                key: 60,
-                                velocity: 100,
-                            })),
+                    notes: vec![
+                        Note {
+                            start_beat: 0.0,
+                            duration_beats: 1.0,
+                            pitch: 60,
+                            velocity: 100,
                             lyric: Some("こ".into()),
-                            ..Default::default()
                         },
-                        Row::default(),
-                        Row {
-                            note: Some(NoteEvent::Off),
-                            ..Default::default()
+                        Note {
+                            start_beat: 1.5,
+                            duration_beats: 0.5,
+                            pitch: 62,
+                            velocity: 100,
+                            lyric: Some("ん".into()),
                         },
                     ],
                 }],
@@ -299,5 +278,12 @@ mod tests {
             ..Song::default()
         };
         assert_eq!(json_roundtrip(&song), song);
+    }
+
+    #[test]
+    fn current_version_is_two() {
+        // Bumped when row-based clips were replaced by free-time notes.
+        // Pinning the constant in a test catches accidental rollback.
+        assert_eq!(CURRENT_VERSION, 2);
     }
 }

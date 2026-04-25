@@ -24,7 +24,8 @@ use vizia::prelude::*;
 use crate::app::{AppData, AppEvent};
 use crate::job::JobHandle;
 use crate::view::{
-    PluginPickerView, StatusBarView, TrackInspectorView, TrackerMixerView, TransportView,
+    ArrangementView, BottomPanelView, PluginPickerView, StatusBarView, TrackInspectorView,
+    TransportView,
 };
 
 fn main() -> Result<()> {
@@ -34,8 +35,6 @@ fn main() -> Result<()> {
     let job = JobHandle::new()?;
     let rt = Runtime::new().context("failed to create tokio runtime")?;
 
-    // Build the audio session names and create shmem / semaphores up front so
-    // they exist before the children try to open them.
     let pid = std::process::id();
     let session = AudioSession {
         shmem_id: shmem_id(pid),
@@ -58,7 +57,6 @@ fn main() -> Result<()> {
     let (audio_child, plugin_child, mut audio_server, mut plugin_server) =
         rt.block_on(spawn_and_handshake(&job))?;
 
-    // Send the session descriptor to both children before any other commands.
     rt.block_on(async {
         write_msg(&mut audio_server, &MainToChild::Session(session.clone())).await?;
         write_msg(&mut plugin_server, &MainToChild::Session(session.clone())).await?;
@@ -70,23 +68,12 @@ fn main() -> Result<()> {
 
     let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel::<MainToChild>();
     let (plugin_tx, plugin_rx) = tokio::sync::mpsc::unbounded_channel::<MainToChild>();
-    // Incoming `ChildToMain` from plugin_host (GUI callbacks etc). The
-    // receiver is handed to `run_gui` which spawns a blocking bridge on a
-    // Vizia `cx.spawn` worker to deliver the messages as AppEvents.
     let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel::<ChildToMain>();
     rt.spawn(send_loop(audio_server, audio_rx));
     rt.spawn(plugin_pipe_loop(plugin_server, plugin_rx, incoming_tx));
 
-    // Build (or reuse cached) plugin database. Scanning can be slow on first
-    // launch; subsequent launches read %LOCALAPPDATA%\daw_01\plugin_database.json.
     let plugin_db = load_or_build_plugin_db();
 
-    // No automatic plugin load: the previous version picked the first CLAP
-    // under `%COMMONPROGRAMFILES%\CLAP` and applied it to Track 1, which
-    // also force-created a Track 1 via the `on_plugin_loaded_from_child`
-    // path. That made the very first "+ Vocal Track" click look like it
-    // added *two* tracks (Track 1 from the auto-load + the new Track 2).
-    // Users must now pick plugins explicitly via the Track Inspector.
     let clap_plugin_path: Option<PathBuf> = None;
 
     tracing::info!("opening main window");
@@ -166,10 +153,6 @@ async fn send_loop(mut pipe: NamedPipeServer, mut rx: UnboundedReceiver<MainToCh
     tracing::info!("send loop ended");
 }
 
-/// Bidirectional pipe loop for daw_plugin_host. Multiplexes outgoing
-/// `MainToChild` commands and incoming `ChildToMain` callbacks on the same
-/// pipe using `tokio::select!`, so there is no contention and no need to
-/// clone the pipe handle.
 async fn plugin_pipe_loop(
     mut pipe: NamedPipeServer,
     mut rx: UnboundedReceiver<MainToChild>,
@@ -211,16 +194,13 @@ fn run_gui(
     bridge: Arc<AudioBridgeHandle>,
     incoming_rx: UnboundedReceiver<ChildToMain>,
 ) -> Result<()> {
-    // `incoming_rx` must move into the cx.spawn closure exactly once; wrap
-    // in Option so the outer `Application::new` closure (FnMut) can consume
-    // it on first call.
     let mut incoming_rx_slot = Some(incoming_rx);
     Application::new(move |cx| {
         cx.set_default_font(&["HackGen Console NF"]);
-        // Default theme gives `list list-item { height: 30px; }` which leaves
-        // a visible gap between tracker rows. Override for our tracker list
-        // so each row sizes to its Label.
-        let _ = cx.add_stylesheet(TRACKER_CSS);
+        // Vizia 0.3's default `list list-item { height: 30px }` clips
+        // tall rows (e.g. mixer strips) and triggers a Skia matrix-invert
+        // panic on auto-sized list items. Override the lists we use.
+        let _ = cx.add_stylesheet(LIST_CSS);
         AppData::new(
             audio_tx.clone(),
             plugin_tx.clone(),
@@ -234,59 +214,32 @@ fn run_gui(
             spawn_incoming_bridge(cx, rx);
         }
 
+        // Top-level layout:
+        //   transport (top)
+        //   ┌── inspector (left, fixed) ── arrangement (stretch) ──┐
+        //   bottom panel (mixer or piano roll)
+        //   status bar
         VStack::new(cx, |cx| {
             build_menu_bar(cx);
             TransportView::new(cx).height(Pixels(44.0));
 
             HStack::new(cx, |cx| {
                 TrackInspectorView::new(cx).width(Pixels(280.0));
-                // Unified tracker + mixer: each track is one VStack
-                // containing its tracker rows on top and its mixer strip
-                // on the bottom (see `view::tracker_mixer`).
-                TrackerMixerView::new(cx)
+                ArrangementView::new(cx)
                     .width(Stretch(1.0))
                     .height(Stretch(1.0));
             })
             .height(Stretch(1.0));
 
+            BottomPanelView::new(cx);
+
             StatusBarView::new(cx).height(Pixels(26.0));
         });
 
-        // Modal plugin-picker overlay. Shown only when requested, sits on
-        // top of the main layout via PositionType::Absolute.
+        // Modal plugin-picker overlay.
         Binding::new(cx, AppData::is_plugin_picker_open, |cx, open| {
             if open.get(cx) {
                 PluginPickerView::new(cx);
-            }
-        });
-
-        // Inline lyric editor overlay. `i` opens it, Enter commits +
-        // advances, Esc closes.
-        Binding::new(cx, AppData::lyric_editing, |cx, editing| {
-            if editing.get(cx) {
-                VStack::new(cx, |cx| {
-                    VStack::new(cx, |cx| {
-                        Label::new(cx, "歌詞入力 (Enter=確定+次行, Esc=閉じる)")
-                            .color(Color::rgb(220, 220, 220))
-                            .font_size(13.0);
-                        Textbox::new(cx, AppData::lyric_edit_text)
-                            .on_edit(|cx, text| cx.emit(AppEvent::LyricEditChanged(text)))
-                            .on_submit(|cx, _, _| cx.emit(AppEvent::SubmitLyricEdit))
-                            .on_cancel(|cx| cx.emit(AppEvent::CancelLyricEdit))
-                            .width(Pixels(300.0))
-                            .height(Pixels(28.0))
-                            .focused(true);
-                    })
-                    .padding(Pixels(16.0))
-                    .gap(Pixels(8.0))
-                    .background_color(Color::rgb(40, 40, 44))
-                    .width(Pixels(340.0));
-                })
-                .position_type(PositionType::Absolute)
-                .alignment(Alignment::Center)
-                .width(Stretch(1.0))
-                .height(Stretch(1.0))
-                .background_color(Color::rgba(0, 0, 0, 120));
             }
         });
     })
@@ -296,46 +249,9 @@ fn run_gui(
     .map_err(|e| anyhow::anyhow!("Vizia application error: {e:?}"))
 }
 
-/// Overrides the default `list list-item { height: 30px }` so tracker rows are
-/// flush. We keep a fixed pixel height rather than `auto` because Vizia's
-/// draw path builds a transform per entity and panics on a zero-sized rect
-/// (`matrix.invert().unwrap()`), which `auto` can produce for empty
-/// ListItems.
-const TRACKER_CSS: &str = r#"
-list.tracker-list list-item {
-    height: 17px;
-}
-
-/* Plugin-picker list: dark rows that match the overlay theme. Without this,
-   Vizia's default list-item height and colour bleed through and make the
-   labels unreadable on a near-white default background. */
-list.plugin-picker-list list-item {
-    height: 30px;
-    background-color: rgb(30, 30, 34);
-}
-list.plugin-picker-list list-item:hover {
-    background-color: rgb(70, 70, 78);
-}
-
-/* Renoise-style mixer strip row. Strip items are laid out horizontally via
-   `layout-type: row` on the list. Fixed pixel dimensions avoid the same
-   `matrix.invert().unwrap()` panic the tracker list works around. */
-list.mixer-strips {
-    layout-type: row;
-}
-list.mixer-strips list-item {
-    width: 140px;
-    height: 150px;
-    background-color: rgb(38, 38, 42);
-}
-"#;
-
 /// Bridges the tokio `ChildToMain` receiver to Vizia AppEvents. Runs on a
 /// Vizia-spawned background thread (`cx.spawn`), consuming one message at a
 /// time via `blocking_recv` and posting the matching `AppEvent`.
-///
-/// Exits when the receiver channel closes (plugin_host pipe died) or when
-/// `proxy.emit` fails (UI dropped).
 fn spawn_incoming_bridge(cx: &mut Context, mut rx: UnboundedReceiver<ChildToMain>) {
     cx.spawn(move |proxy| {
         while let Some(msg) = rx.blocking_recv() {
@@ -355,9 +271,6 @@ fn spawn_incoming_bridge(cx: &mut Context, mut rx: UnboundedReceiver<ChildToMain
                 ChildToMain::SlotPluginLoaded { track, slot, id, name } => {
                     Some(AppEvent::SlotPluginLoadedFromChild { track, slot, id, name })
                 }
-                // Single-slot state replies are unused by the current save
-                // flow (the picker / GUI never request a single state).
-                // Drop them rather than fabricating a synthetic event.
                 ChildToMain::SlotPluginState { .. } => None,
                 ChildToMain::AllPluginStates { entries } => {
                     Some(AppEvent::AllStatesReceived(entries))
@@ -374,9 +287,6 @@ fn spawn_incoming_bridge(cx: &mut Context, mut rx: UnboundedReceiver<ChildToMain
     });
 }
 
-/// Load the cached plugin database from disk, or run a fresh scan and
-/// cache the result. Errors on either path are logged — we fall back to an
-/// empty `Option::None` so the UI still boots.
 fn load_or_build_plugin_db() -> Option<Arc<common::plugin_db::PluginDatabase>> {
     use common::plugin_db::{default_cache_path, scan_system, PluginDatabase};
     if let Some(cache) = default_cache_path() {
@@ -417,14 +327,8 @@ fn load_or_build_plugin_db() -> Option<Arc<common::plugin_db::PluginDatabase>> {
     None
 }
 
-/// Polls the shared-memory playhead and L/R peaks at ~30 Hz and dispatches
-/// `AppEvent::Tick` so `AppData::on_tick` can update the playhead-row
-/// highlight and the master meter. The worker exits when the UI is closed
-/// and `proxy.emit` returns an error.
 fn spawn_playhead_poller(cx: &mut Context, bridge: Arc<AudioBridgeHandle>) {
     cx.spawn(move |proxy| {
-        // Scratch buffer reused across ticks so we don't allocate one
-        // Vec per 33 ms poll.
         let mut peaks_buf: Vec<(f32, f32)> = Vec::with_capacity(common::audio_bridge::MAX_TRACKS);
         loop {
             std::thread::sleep(Duration::from_millis(33));
@@ -436,8 +340,6 @@ fn spawn_playhead_poller(cx: &mut Context, bridge: Arc<AudioBridgeHandle>) {
             {
                 break;
             }
-            // Per-track post-fader peaks. Emitted as a separate event so
-            // the base Tick's Eq/Hash derive stays trivial.
             bridge.track_peaks(&mut peaks_buf);
             let track_peaks: Vec<(u32, u32)> = peaks_buf
                 .iter()
@@ -453,19 +355,10 @@ fn spawn_playhead_poller(cx: &mut Context, bridge: Arc<AudioBridgeHandle>) {
     });
 }
 
-/// Emit an AppEvent only when the lyric editor is not active. This
-/// prevents keymap shortcuts from stealing keyboard input that should
-/// go to the Textbox (e.g. `h`, `j`, `k`, `l`, `v`, `i`).
-fn emit_unless_editing(cx: &mut EventContext, event: AppEvent) {
-    if !AppData::lyric_editing.get(cx) {
-        cx.emit(event);
-    }
-}
-
+/// Bitwig-style accelerators. Mouse drives clip / note editing; the
+/// keyboard handles transport, save, and `Delete` for the active selection.
 fn register_shortcuts(cx: &mut Context) {
     Keymap::from(vec![
-        // Ctrl-modified shortcuts are safe during lyric editing because
-        // the Textbox won't produce printable characters with Ctrl held.
         (
             KeyChord::new(Modifiers::CTRL, Code::KeyN),
             KeymapEntry::new(AppEvent::New, |cx| cx.emit(AppEvent::New)),
@@ -486,95 +379,54 @@ fn register_shortcuts(cx: &mut Context) {
             KeyChord::new(Modifiers::CTRL, Code::KeyE),
             KeymapEntry::new(AppEvent::ExportWav, |cx| cx.emit(AppEvent::ExportWav)),
         ),
-        // Unmodified letter/space keys must be gated by `lyric_editing`
-        // so the Textbox receives them during lyric input.
-        (
-            KeyChord::new(Modifiers::empty(), Code::KeyH),
-            KeymapEntry::new(AppEvent::CursorLeft, |cx| {
-                emit_unless_editing(cx, AppEvent::CursorLeft)
-            }),
-        ),
-        (
-            KeyChord::new(Modifiers::empty(), Code::KeyJ),
-            KeymapEntry::new(AppEvent::CursorDown, |cx| {
-                emit_unless_editing(cx, AppEvent::CursorDown)
-            }),
-        ),
-        (
-            KeyChord::new(Modifiers::empty(), Code::KeyK),
-            KeymapEntry::new(AppEvent::CursorUp, |cx| {
-                emit_unless_editing(cx, AppEvent::CursorUp)
-            }),
-        ),
-        (
-            KeyChord::new(Modifiers::empty(), Code::KeyL),
-            KeymapEntry::new(AppEvent::CursorRight, |cx| {
-                emit_unless_editing(cx, AppEvent::CursorRight)
-            }),
-        ),
         (
             KeyChord::new(Modifiers::empty(), Code::Space),
-            KeymapEntry::new(AppEvent::PlayToggle, |cx| {
-                emit_unless_editing(cx, AppEvent::PlayToggle)
-            }),
+            KeymapEntry::new(AppEvent::PlayToggle, |cx| cx.emit(AppEvent::PlayToggle)),
         ),
         (
             KeyChord::new(Modifiers::empty(), Code::KeyP),
-            KeymapEntry::new(AppEvent::ToggleLoop, |cx| {
-                emit_unless_editing(cx, AppEvent::ToggleLoop)
-            }),
-        ),
-        (
-            KeyChord::new(Modifiers::empty(), Code::KeyN),
-            KeymapEntry::new(AppEvent::NoteOff, |cx| {
-                emit_unless_editing(cx, AppEvent::NoteOff)
-            }),
-        ),
-        (
-            KeyChord::new(Modifiers::empty(), Code::Delete),
-            KeymapEntry::new(AppEvent::NoteClear, |cx| {
-                emit_unless_editing(cx, AppEvent::NoteClear)
-            }),
-        ),
-        (
-            KeyChord::new(Modifiers::CTRL, Code::KeyJ),
-            KeymapEntry::new(AppEvent::TransposeSemi(-1), |cx| {
-                cx.emit(AppEvent::TransposeSemi(-1))
-            }),
-        ),
-        (
-            KeyChord::new(Modifiers::CTRL, Code::KeyK),
-            KeymapEntry::new(AppEvent::TransposeSemi(1), |cx| {
-                cx.emit(AppEvent::TransposeSemi(1))
-            }),
-        ),
-        (
-            KeyChord::new(Modifiers::CTRL, Code::KeyH),
-            KeymapEntry::new(AppEvent::TransposeOctave(-1), |cx| {
-                cx.emit(AppEvent::TransposeOctave(-1))
-            }),
-        ),
-        (
-            KeyChord::new(Modifiers::CTRL, Code::KeyL),
-            KeymapEntry::new(AppEvent::TransposeOctave(1), |cx| {
-                cx.emit(AppEvent::TransposeOctave(1))
-            }),
+            KeymapEntry::new(AppEvent::ToggleLoop, |cx| cx.emit(AppEvent::ToggleLoop)),
         ),
         (
             KeyChord::new(Modifiers::empty(), Code::KeyV),
             KeymapEntry::new(AppEvent::SynthesizeVocal, |cx| {
-                emit_unless_editing(cx, AppEvent::SynthesizeVocal)
+                cx.emit(AppEvent::SynthesizeVocal)
             }),
         ),
+        // Delete: prioritise note selection (piano roll context); fall back
+        // to clip selection (arrangement context). Both events are no-ops
+        // when their target is empty so the order is safe.
         (
-            KeyChord::new(Modifiers::empty(), Code::KeyI),
-            KeymapEntry::new(AppEvent::StartLyricEdit, |cx| {
-                emit_unless_editing(cx, AppEvent::StartLyricEdit)
+            KeyChord::new(Modifiers::empty(), Code::Delete),
+            KeymapEntry::new(AppEvent::DeleteSelectedNotes, |cx| {
+                cx.emit(AppEvent::DeleteSelectedNotes);
+                cx.emit(AppEvent::DeleteSelectedClip);
             }),
         ),
     ])
     .build(cx);
 }
+
+/// CSS overrides for the Lists we ship. The defaults' `height: 30px` on
+/// `list-item` (and absence of `layout-type: row` on the mixer strip list)
+/// cause clipped rows and Skia matrix-invert panics when the inner
+/// content's preferred size doesn't match.
+const LIST_CSS: &str = r#"
+list.track-headers-list list-item {
+    height: 56px;
+    width: 1s;
+}
+list.chain-list list-item {
+    height: 28px;
+}
+list.plugin-picker-list list-item {
+    height: 30px;
+    background-color: rgb(30, 30, 34);
+}
+list.plugin-picker-list list-item:hover {
+    background-color: rgb(70, 70, 78);
+}
+"#;
 
 fn build_menu_bar(cx: &mut Context) {
     MenuBar::new(cx, |cx| {
@@ -596,6 +448,7 @@ fn build_menu_bar(cx: &mut Context) {
             |cx| Label::new(cx, "Track"),
             |cx| {
                 menu_item(cx, "Add Vocal Track", "", AppEvent::AddVocalTrack);
+                menu_item(cx, "Add Instrument Track", "", AppEvent::AddInstrumentTrack);
                 menu_item(cx, "Remove Last Track", "", AppEvent::RemoveLastTrack);
             },
         );

@@ -21,16 +21,16 @@ use crate::app::{AppData, AppEvent, TrackMixEntry};
 /// Width of one mixer strip. Also drives the width of the corresponding
 /// tracker column in `view::tracker_mixer` so the two stay aligned in
 /// pixel space.
-pub(super) const STRIP_WIDTH: f32 = 136.0;
+pub const STRIP_WIDTH: f32 = 136.0;
 /// Total height of one strip — chosen to match the actual strip content
 /// (label 14 + M/S/Pan row 24 + fader/meter 100 + 2×gap 2 + 2×padding 4)
 /// so the strip wrapper has no trailing empty space below the meters.
 /// `master_strip` is laid out to the same height by mirroring the user
 /// strip's row heights as spacers.
-pub(super) const STRIP_HEIGHT: f32 = 150.0;
-pub(super) const FADER_HEIGHT: f32 = 100.0;
-pub(super) const FADER_WIDTH: f32 = 18.0;
-pub(super) const METER_WIDTH: f32 = 5.0;
+pub const STRIP_HEIGHT: f32 = 150.0;
+pub const FADER_HEIGHT: f32 = 100.0;
+pub const FADER_WIDTH: f32 = 18.0;
+pub const METER_WIDTH: f32 = 5.0;
 
 // dB range shared by fader and meter for visual alignment.
 const DB_MIN: f32 = -80.0;
@@ -65,7 +65,7 @@ fn amp_to_meter_norm(amp: f32) -> f32 {
     ((db - DB_MIN) / DB_RANGE).clamp(0.0, 1.0)
 }
 
-pub(super) fn strip<L>(cx: &mut Context, entry: L)
+pub fn strip<L>(cx: &mut Context, entry: L)
 where
     L: Lens<Target = TrackMixEntry> + Send + Sync,
 {
@@ -163,7 +163,7 @@ where
 /// the user strips, master has no mute/solo or pan — those concepts
 /// don't make sense for the final output bus. Lens targets come from
 /// `AppData` directly (no `TrackMixEntry` indirection).
-pub(super) fn master_strip(cx: &mut Context) {
+pub fn master_strip(cx: &mut Context) {
     VStack::new(cx, |cx| {
         Label::new(cx, "MASTER")
             .color(Color::rgb(230, 230, 230))

@@ -33,10 +33,10 @@ use vst3::{
         Vst::{
             AudioBusBuffers, AudioBusBuffers__type0, BusDirections_, Event, Event__type0,
             Event_, IAudioProcessor, IAudioProcessorTrait, IComponent, IComponentTrait,
-            IEditController, IEditControllerTrait, IEventList, MediaTypes_, NoteOffEvent,
-            NoteOnEvent, ProcessContext, ProcessContext_::StatesAndFlags_, ProcessData,
-            ProcessModes_, ProcessSetup, SpeakerArr, SpeakerArrangement,
-            SymbolicSampleSizes_,
+            IConnectionPoint, IConnectionPointTrait, IEditController, IEditControllerTrait,
+            IEventList, MediaTypes_, NoteOffEvent, NoteOnEvent, ProcessContext,
+            ProcessContext_::StatesAndFlags_, ProcessData, ProcessModes_, ProcessSetup,
+            SpeakerArr, SpeakerArrangement, SymbolicSampleSizes_,
         },
     },
 };
@@ -257,6 +257,24 @@ impl Vst3Plugin {
             tracing::warn!(res = format!("{set_res:#x}"), "setComponentHandler non-OK (continuing)");
         }
 
+        // For plugins with a separate IEditController (BioTek 2 etc.) the
+        // controller is a fresh COM object that doesn't yet know about the
+        // component's state. Two host-side hooks tie them together — without
+        // these, controllers may refuse to create their editor view (CLAP-
+        // style "no editor" return) or simply mirror stale defaults:
+        //
+        //   1. `IConnectionPoint::connect` — bidirectional message bus used
+        //      by some SDKs to keep parameter values in sync.
+        //   2. `IComponent::getState` → `IEditController::setComponentState`
+        //      — primes the controller's parameters from the component.
+        //
+        // Both calls are best-effort. Plugins that don't implement them, or
+        // that signal `kNotImplemented`, just fall through.
+        if controller_separate {
+            connect_component_and_controller(&component, &controller);
+            transfer_component_state(&component, &controller);
+        }
+
         // Query audio bus counts for activate()-time buffer allocation.
         let in_bus_count = unsafe {
             component.getBusCount(
@@ -305,6 +323,82 @@ impl Vst3Plugin {
             plug_frame,
             gui_attached: std::cell::Cell::new(false),
         })
+    }
+}
+
+/// Connect the component's and controller's `IConnectionPoint` interfaces
+/// in both directions. Best-effort: plugins that don't implement
+/// `IConnectionPoint` (the interface is optional in the VST3 spec) are
+/// silently skipped. The pair stays usable without the connection — only
+/// inter-object messaging breaks, which most hosts don't rely on.
+fn connect_component_and_controller(
+    component: &ComPtr<IComponent>,
+    controller: &ComPtr<IEditController>,
+) {
+    let Some(comp_cp) = component.cast::<IConnectionPoint>() else {
+        tracing::debug!("component does not implement IConnectionPoint; skipping connect");
+        return;
+    };
+    let Some(ctrl_cp) = controller.cast::<IConnectionPoint>() else {
+        tracing::debug!("controller does not implement IConnectionPoint; skipping connect");
+        return;
+    };
+    let r1 = unsafe { comp_cp.connect(ctrl_cp.as_ptr()) };
+    let r2 = unsafe { ctrl_cp.connect(comp_cp.as_ptr()) };
+    if r1 != kResultOk || r2 != kResultOk {
+        tracing::warn!(
+            comp_to_ctrl = format!("{r1:#x}"),
+            ctrl_to_comp = format!("{r2:#x}"),
+            "IConnectionPoint::connect non-OK (continuing)"
+        );
+    } else {
+        tracing::debug!("VST3 component <-> controller connection points wired");
+    }
+}
+
+/// Stream the component's serialized state into the controller via
+/// `IEditController::setComponentState`. Required by Steinberg's spec for
+/// plugins with separate controllers — without it some plugins refuse to
+/// produce an editor view because they have no parameter snapshot to
+/// render. Best-effort: failures are logged, not propagated.
+fn transfer_component_state(
+    component: &ComPtr<IComponent>,
+    controller: &ComPtr<IEditController>,
+) {
+    let write = ComWrapper::new(Vst3WriteStream::new());
+    let Some(write_ibstream) = write.to_com_ptr::<IBStream>() else {
+        tracing::warn!("Vst3WriteStream has no IBStream; cannot transfer component state");
+        return;
+    };
+    let write_raw = write_ibstream.into_raw();
+    let get_res = unsafe { component.getState(write_raw) };
+    let _ = unsafe { ComPtr::<IBStream>::from_raw(write_raw) };
+    if get_res != kResultOk {
+        tracing::debug!(
+            res = format!("{get_res:#x}"),
+            "IComponent::getState non-OK; skipping setComponentState"
+        );
+        return;
+    }
+    let bytes = write.take_buffer();
+    let read = ComWrapper::new(Vst3ReadStream::new(&bytes));
+    let Some(read_ibstream) = read.to_com_ptr::<IBStream>() else {
+        tracing::warn!("Vst3ReadStream has no IBStream; cannot transfer component state");
+        return;
+    };
+    let read_raw = read_ibstream.into_raw();
+    let set_res = unsafe { controller.setComponentState(read_raw) };
+    let _ = unsafe { ComPtr::<IBStream>::from_raw(read_raw) };
+    if set_res != kResultOk && set_res != kNotImplemented {
+        tracing::warn!(
+            res = format!("{set_res:#x}"),
+            "IEditController::setComponentState non-OK (continuing)"
+        );
+    } else {
+        tracing::debug!(
+            bytes = bytes.len(),
+            "VST3 controller primed with component state"
+        );
     }
 }
 
@@ -682,13 +776,29 @@ impl LoadedPlugin for Vst3Plugin {
         // Create view to probe platform support, then release.
         let view_raw = unsafe { self.controller.createView(c"editor".as_ptr()) };
         if view_raw.is_null() {
+            tracing::warn!(
+                plugin = %self.name,
+                "VST3 createView returned null — plugin reports no editor"
+            );
             return false;
         }
         let Some(view) = (unsafe { ComPtr::<IPlugView>::from_raw(view_raw) }) else {
+            tracing::warn!(
+                plugin = %self.name,
+                "VST3 createView returned a non-null pointer that ComPtr rejected"
+            );
             return false;
         };
         let res = unsafe { view.isPlatformTypeSupported(kPlatformTypeHWND) };
-        res == kResultTrue || res == kResultOk
+        let supported = res == kResultTrue || res == kResultOk;
+        if !supported {
+            tracing::warn!(
+                plugin = %self.name,
+                "isPlatformTypeSupported(HWND) returned {:#x}",
+                res
+            );
+        }
+        supported
     }
 
     fn gui_create_embedded(&mut self) -> Result<()> {

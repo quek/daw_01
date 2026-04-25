@@ -49,7 +49,16 @@ pub fn load(path: impl AsRef<Path>) -> Result<Song> {
             CURRENT_VERSION
         );
     }
-    // TODO: migrate when project.version < CURRENT_VERSION
+    if project.version < CURRENT_VERSION {
+        anyhow::bail!(
+            "project file {} uses legacy version {}; the row-based format \
+             was retired in version {}. Re-create the project in the \
+             current free-time-note format.",
+            path.display(),
+            project.version,
+            CURRENT_VERSION
+        );
+    }
     Ok(project.song)
 }
 
@@ -62,7 +71,7 @@ fn tmp_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Clip, InstrumentSource, Note, NoteEvent, Row, Track};
+    use crate::model::{Clip, InstrumentSource, Note, Track};
     use tempfile::tempdir;
 
     #[test]
@@ -89,20 +98,20 @@ mod tests {
                     name: "こんにちは".into(),
                     start_beat: 0.0,
                     length_beats: 16.0,
-                    rows_per_beat: 4,
-                    rows: vec![
-                        Row {
-                            note: Some(NoteEvent::On(Note {
-                                key: 60,
-                                velocity: 100,
-                            })),
+                    notes: vec![
+                        Note {
+                            start_beat: 0.0,
+                            duration_beats: 1.0,
+                            pitch: 60,
+                            velocity: 100,
                             lyric: Some("こ".into()),
-                            ..Default::default()
                         },
-                        Row::default(),
-                        Row {
-                            note: Some(NoteEvent::Off),
-                            ..Default::default()
+                        Note {
+                            start_beat: 1.0,
+                            duration_beats: 0.5,
+                            pitch: 62,
+                            velocity: 100,
+                            lyric: Some("ん".into()),
                         },
                     ],
                 }],
@@ -149,6 +158,20 @@ mod tests {
 
         let err = load(&path).unwrap_err().to_string();
         assert!(err.contains("newer"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn load_rejects_legacy_row_based_version() {
+        // Version 1 was the row-based format; we no longer support it.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("old.daw");
+        fs::write(
+            &path,
+            r#"{"version":1,"song":{"bpm":120.0,"time_sig":[4,4],"length_beats":64.0}}"#,
+        )
+        .unwrap();
+        let err = load(&path).unwrap_err().to_string();
+        assert!(err.contains("legacy"), "unexpected error: {err}");
     }
 
     #[test]

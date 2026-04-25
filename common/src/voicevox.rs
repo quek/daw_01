@@ -12,7 +12,7 @@ use std::io::Cursor;
 
 use anyhow::{Context, Result};
 
-use crate::model::{Clip, NoteEvent, Song};
+use crate::model::{Clip, Note, Song};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -37,8 +37,8 @@ const REST_FRAMES: u32 = 10;
 // ---------------------------------------------------------------------------
 
 /// Synthesize every vocal clip on every vocal track in `song`, returning
-/// `(track_index, clip_index, mono_f32_samples, sample_rate)` tuples.
-/// Non-vocal tracks and tracks whose `source` is `None` are skipped.
+/// one `SynthResult` per clip processed (success or failure). Non-vocal
+/// tracks are skipped.
 ///
 /// `singer_id` is the VOICEVOX style id for sing mode (e.g. 6000).
 /// `speaker_id` is the VOICEVOX style id for talk mode.
@@ -65,8 +65,11 @@ pub fn synthesize_song(
         let _ = model_speaker;
 
         for (clip_idx, clip) in track.clips.iter().enumerate() {
-            let has_notes = clip.rows.iter().any(|r| matches!(r.note, Some(NoteEvent::On(_))));
-            let wav_bytes = if has_notes {
+            // A clip with at least one note that has any pitch goes into
+            // sing mode; otherwise we fall back to talk mode using
+            // whatever lyrics are attached (used for spoken intros, etc.).
+            let has_pitched_notes = clip.notes.iter().any(|n| n.pitch > 0);
+            let wav_bytes = if has_pitched_notes {
                 match synthesize_sing_clip(&client, clip, song.bpm, singer_id) {
                     Ok(b) => b,
                     Err(e) => {
@@ -83,11 +86,16 @@ pub fn synthesize_song(
                     }
                 }
             } else {
-                // Talk mode: concatenate all lyrics in the clip.
-                let text: String = clip
-                    .rows
+                // Talk mode: concatenate lyrics in time order.
+                let mut sorted: Vec<&Note> = clip.notes.iter().collect();
+                sorted.sort_by(|a, b| {
+                    a.start_beat
+                        .partial_cmp(&b.start_beat)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let text: String = sorted
                     .iter()
-                    .filter_map(|r| r.lyric.as_deref())
+                    .filter_map(|n| n.lyric.as_deref())
                     .collect::<Vec<_>>()
                     .join("");
                 if text.is_empty() {
@@ -266,67 +274,36 @@ fn synthesize_talk(
 // Query builder (sing)
 // ---------------------------------------------------------------------------
 
+/// Builds the JSON body for `POST /sing_frame_audio_query`.
+///
+/// Notes are converted to a flat sequence of `{key, frame_length, lyric}`
+/// entries with `key=null` rests inserted between any two notes that don't
+/// touch. The first note's `start_beat` becomes `frame 0` of the query —
+/// VOICEVOX renders relative to the first non-rest entry, not relative to
+/// the song timeline, so anything before the first note is ignored.
 fn build_sing_query(clip: &Clip, bpm: f32) -> String {
     let mut parts: Vec<String> = Vec::new();
 
-    // Leading rest
+    // Leading rest (gives the synth a moment of silence for the attack).
     parts.push(format!(
         r#"{{"id":"rest_start","key":null,"frame_length":{},"lyric":""}}"#,
         REST_FRAMES
     ));
 
-    let samples_per_beat = 60.0 / bpm as f64;
-    let samples_per_row = samples_per_beat / clip.rows_per_beat.max(1) as f64;
+    // Sort notes by start_beat — `Clip.notes` is unordered by contract,
+    // and this builder requires monotonic timing.
+    let mut sorted: Vec<&Note> = clip
+        .notes
+        .iter()
+        .filter(|n| n.duration_beats > 0.0 && n.pitch > 0)
+        .collect();
+    sorted.sort_by(|a, b| {
+        a.start_beat
+            .partial_cmp(&b.start_beat)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
-    // Collect (row_index, Note, lyric) for NoteOn rows.
-    struct NoteSpan {
-        start_row: usize,
-        end_row: usize,
-        key: u8,
-        lyric: String,
-    }
-    let mut spans: Vec<NoteSpan> = Vec::new();
-    let mut current: Option<(usize, u8, String)> = None;
-
-    for (i, row) in clip.rows.iter().enumerate() {
-        match &row.note {
-            Some(NoteEvent::On(n)) => {
-                if let Some((start, key, lyric)) = current.take() {
-                    spans.push(NoteSpan {
-                        start_row: start,
-                        end_row: i,
-                        key,
-                        lyric,
-                    });
-                }
-                let lyric = row.lyric.clone().unwrap_or_else(|| "ら".into());
-                current = Some((i, n.key, lyric));
-            }
-            Some(NoteEvent::Off) => {
-                if let Some((start, key, lyric)) = current.take() {
-                    spans.push(NoteSpan {
-                        start_row: start,
-                        end_row: i,
-                        key,
-                        lyric,
-                    });
-                }
-            }
-            None => {}
-        }
-    }
-    // Close any open note at the end of the clip.
-    if let Some((start, key, lyric)) = current.take() {
-        spans.push(NoteSpan {
-            start_row: start,
-            end_row: clip.rows.len(),
-            key,
-            lyric,
-        });
-    }
-
-    if spans.is_empty() {
-        // No notes → return minimal query
+    if sorted.is_empty() {
         parts.push(format!(
             r#"{{"id":"rest_end","key":null,"frame_length":{},"lyric":""}}"#,
             REST_FRAMES
@@ -334,16 +311,18 @@ fn build_sing_query(clip: &Clip, bpm: f32) -> String {
         return format!(r#"{{"notes":[{}]}}"#, parts.join(","));
     }
 
-    let base_row = spans[0].start_row;
+    let seconds_per_beat = 60.0 / f64::from(bpm);
+    let base_beat = sorted[0].start_beat;
     let mut prev_end_frame: i64 = 0;
 
-    for (i, span) in spans.iter().enumerate() {
-        let start_sec = (span.start_row - base_row) as f64 * samples_per_row;
-        let end_sec = (span.end_row - base_row) as f64 * samples_per_row;
+    for (i, note) in sorted.iter().enumerate() {
+        let start_sec = (note.start_beat - base_beat) * seconds_per_beat;
+        let end_sec =
+            (note.start_beat + note.duration_beats - base_beat) * seconds_per_beat;
         let start_frame = seconds_to_frames(start_sec);
         let end_frame = seconds_to_frames(end_sec);
 
-        // Gap (rest) between previous note and this one
+        // Gap between previous note's end and this note's start → rest.
         if i > 0 {
             let gap = start_frame - prev_end_frame;
             if gap > 0 {
@@ -355,14 +334,11 @@ fn build_sing_query(clip: &Clip, bpm: f32) -> String {
         }
 
         let note_frames = (end_frame - start_frame).max(1);
-        // Escape the lyric for JSON
-        let escaped = span
-            .lyric
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"");
+        let lyric = note.lyric.as_deref().unwrap_or("ら");
+        let escaped = lyric.replace('\\', "\\\\").replace('"', "\\\"");
         parts.push(format!(
             r#"{{"id":"note{}","key":{},"frame_length":{},"lyric":"{}"}}"#,
-            i, span.key, note_frames, escaped
+            i, note.pitch, note_frames, escaped
         ));
 
         prev_end_frame = end_frame;
@@ -427,7 +403,6 @@ pub fn decode_wav_to_f32(data: &[u8]) -> Result<(Vec<f32>, u32)> {
 /// Finds the `"outputSamplingRate":<number>` substring in `json` so it can
 /// be replaced. Returns the full match including the key name.
 fn find_sample_rate_field(json: &str) -> String {
-    // Simple substring search — no full JSON parse needed.
     if let Some(start) = json.find("\"outputSamplingRate\":") {
         let after_key = start + "\"outputSamplingRate\":".len();
         let end = json[after_key..]
@@ -455,4 +430,180 @@ fn urlencoding_encode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn parse_query(json: &str) -> Vec<(Option<i64>, i64, String)> {
+        let v: Value = serde_json::from_str(json).expect("query is not valid JSON");
+        v["notes"]
+            .as_array()
+            .expect("notes is not an array")
+            .iter()
+            .map(|n| {
+                let key = n["key"].as_i64();
+                let frame = n["frame_length"].as_i64().unwrap_or(0);
+                let lyric = n["lyric"].as_str().unwrap_or("").to_string();
+                (key, frame, lyric)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_clip_yields_two_rests() {
+        let clip = Clip {
+            name: "c".into(),
+            start_beat: 0.0,
+            length_beats: 4.0,
+            notes: Vec::new(),
+        };
+        let q = build_sing_query(&clip, 120.0);
+        let entries = parse_query(&q);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| e.0.is_none()));
+    }
+
+    #[test]
+    fn single_note_emits_rest_note_rest() {
+        let clip = Clip {
+            name: "c".into(),
+            start_beat: 0.0,
+            length_beats: 4.0,
+            notes: vec![Note {
+                start_beat: 0.0,
+                duration_beats: 1.0,
+                pitch: 60,
+                velocity: 100,
+                lyric: Some("ら".into()),
+            }],
+        };
+        let q = build_sing_query(&clip, 120.0);
+        let entries = parse_query(&q);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].0, None);
+        assert_eq!(entries[1].0, Some(60));
+        assert_eq!(entries[1].2, "ら");
+        assert_eq!(entries[2].0, None);
+    }
+
+    #[test]
+    fn gap_between_notes_emits_rest_in_between() {
+        let clip = Clip {
+            name: "c".into(),
+            start_beat: 0.0,
+            length_beats: 8.0,
+            notes: vec![
+                Note {
+                    start_beat: 0.0,
+                    duration_beats: 1.0,
+                    pitch: 60,
+                    velocity: 100,
+                    lyric: Some("こ".into()),
+                },
+                Note {
+                    start_beat: 2.0,
+                    duration_beats: 1.0,
+                    pitch: 62,
+                    velocity: 100,
+                    lyric: Some("ん".into()),
+                },
+            ],
+        };
+        let q = build_sing_query(&clip, 120.0);
+        let entries = parse_query(&q);
+        // rest_start, note0, gap_rest, note1, rest_end
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[1].0, Some(60));
+        assert_eq!(entries[2].0, None);
+        assert!(
+            entries[2].1 > 0,
+            "gap rest must have non-zero frame_length"
+        );
+        assert_eq!(entries[3].0, Some(62));
+    }
+
+    #[test]
+    fn touching_notes_emit_no_extra_rest() {
+        // Notes that end exactly where the next one starts shouldn't get
+        // a 0-frame rest stuffed between them.
+        let clip = Clip {
+            name: "c".into(),
+            start_beat: 0.0,
+            length_beats: 8.0,
+            notes: vec![
+                Note {
+                    start_beat: 0.0,
+                    duration_beats: 1.0,
+                    pitch: 60,
+                    velocity: 100,
+                    lyric: Some("こ".into()),
+                },
+                Note {
+                    start_beat: 1.0,
+                    duration_beats: 1.0,
+                    pitch: 62,
+                    velocity: 100,
+                    lyric: Some("ん".into()),
+                },
+            ],
+        };
+        let q = build_sing_query(&clip, 120.0);
+        let entries = parse_query(&q);
+        // rest_start, note0, note1, rest_end — no rest between notes.
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[1].0, Some(60));
+        assert_eq!(entries[2].0, Some(62));
+    }
+
+    #[test]
+    fn lyric_with_quotes_is_escaped() {
+        let clip = Clip {
+            name: "c".into(),
+            start_beat: 0.0,
+            length_beats: 4.0,
+            notes: vec![Note {
+                start_beat: 0.0,
+                duration_beats: 1.0,
+                pitch: 60,
+                velocity: 100,
+                lyric: Some("\"a\"".into()),
+            }],
+        };
+        let q = build_sing_query(&clip, 120.0);
+        // Must remain valid JSON despite embedded quotes.
+        let _: Value = serde_json::from_str(&q).expect("invalid JSON output");
+    }
+
+    #[test]
+    fn unsorted_notes_are_sorted_before_emitting() {
+        let clip = Clip {
+            name: "c".into(),
+            start_beat: 0.0,
+            length_beats: 8.0,
+            notes: vec![
+                Note {
+                    start_beat: 2.0,
+                    duration_beats: 1.0,
+                    pitch: 64,
+                    velocity: 100,
+                    lyric: Some("に".into()),
+                },
+                Note {
+                    start_beat: 0.0,
+                    duration_beats: 1.0,
+                    pitch: 60,
+                    velocity: 100,
+                    lyric: Some("こ".into()),
+                },
+            ],
+        };
+        let q = build_sing_query(&clip, 120.0);
+        let entries = parse_query(&q);
+        // After sort: rest, note(60,こ), gap_rest, note(64,に), rest
+        assert_eq!(entries[1].0, Some(60));
+        assert_eq!(entries[3].0, Some(64));
+    }
 }

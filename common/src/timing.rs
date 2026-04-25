@@ -1,5 +1,5 @@
-//! Sample / beat / row conversion helpers shared by `daw_plugin_host`
-//! (audio thread) and `daw_gui` (playhead-row highlight).
+//! Sample / beat conversion helpers shared by `daw_plugin_host`
+//! (audio thread) and `daw_gui` (playhead rendering).
 
 use crate::model::Song;
 
@@ -49,69 +49,23 @@ pub fn song_ended(song: Option<&Song>, sample_rate: u32, playhead: u64) -> bool 
     }
 }
 
-/// Maps an absolute playhead (samples from song 0) to the tracker row index
-/// within the specified track's clip 0. Returns `None` when:
-/// - there is no playable clip on that track,
-/// - `rows_per_beat == 0`,
-/// - `playhead` is before the clip start, or
-/// - `playhead` is past the clip's last row.
-///
-/// The computed row is clamped to `[0, rows.len())` when the clip has a row
-/// buffer; otherwise the raw index is returned (capped by the clip length).
-pub fn playhead_to_row(
-    song: Option<&Song>,
-    track_idx: u32,
-    sample_rate: u32,
-    playhead: u64,
-) -> Option<u32> {
+/// Converts a sample-domain playhead to a beat-domain position. `None` when
+/// the song has no BPM defined.
+pub fn playhead_to_beat(song: Option<&Song>, sample_rate: u32, playhead: u64) -> Option<f64> {
     let song = song?;
     if song.bpm <= 0.0 {
         return None;
     }
-    let track = song.tracks.get(track_idx as usize)?;
-    let clip = track.clips.first()?;
-    if clip.rows_per_beat == 0 || clip.length_beats <= 0.0 {
-        return None;
-    }
     let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(song.bpm);
-    let start = (clip.start_beat * samples_per_beat).max(0.0) as u64;
-    let length = (clip.length_beats * samples_per_beat) as u64;
-    if length == 0 {
-        return None;
-    }
-    let end = start + length;
-    if playhead < start || playhead >= end {
-        return None;
-    }
-    let samples_per_row = samples_per_beat / f64::from(clip.rows_per_beat);
-    if samples_per_row <= 0.0 {
-        return None;
-    }
-    let offset = (playhead - start) as f64;
-    let row = (offset / samples_per_row).floor() as u32;
-    if !clip.rows.is_empty() {
-        let max = (clip.rows.len() as u32).saturating_sub(1);
-        Some(row.min(max))
-    } else {
-        Some(row)
-    }
+    Some(playhead as f64 / samples_per_beat)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Clip, InstrumentSource, Row, Track};
+    use crate::model::{Clip, InstrumentSource, Track};
 
     fn song_with_clip(bpm: f32, start_beat: f64, length_beats: f64) -> Song {
-        song_with_clip_rows(bpm, start_beat, length_beats, 0)
-    }
-
-    fn song_with_clip_rows(
-        bpm: f32,
-        start_beat: f64,
-        length_beats: f64,
-        row_count: usize,
-    ) -> Song {
         Song {
             bpm,
             tracks: vec![Track {
@@ -121,8 +75,7 @@ mod tests {
                     name: "C".into(),
                     start_beat,
                     length_beats,
-                    rows_per_beat: 4,
-                    rows: vec![Row::default(); row_count],
+                    notes: Vec::new(),
                 }],
                 ..Track::default()
             }],
@@ -182,8 +135,7 @@ mod tests {
                         name: "A0".into(),
                         start_beat: 0.0,
                         length_beats: 4.0,
-                        rows_per_beat: 4,
-                        rows: Vec::new(),
+                        notes: Vec::new(),
                     }],
                     ..Track::default()
                 },
@@ -193,8 +145,7 @@ mod tests {
                         name: "B0".into(),
                         start_beat: 6.0,
                         length_beats: 2.0,
-                        rows_per_beat: 4,
-                        rows: Vec::new(),
+                        notes: Vec::new(),
                     }],
                     ..Track::default()
                 },
@@ -225,56 +176,18 @@ mod tests {
     }
 
     #[test]
-    fn playhead_to_row_none_when_no_song() {
-        assert_eq!(playhead_to_row(None, 0, 48000, 0), None);
+    fn playhead_to_beat_basic() {
+        let song = song_with_clip(120.0, 0.0, 4.0);
+        // 120 BPM, 48 kHz: samples_per_beat = 24000.
+        assert_eq!(playhead_to_beat(Some(&song), 48000, 0), Some(0.0));
+        assert_eq!(playhead_to_beat(Some(&song), 48000, 24_000), Some(1.0));
+        assert_eq!(playhead_to_beat(Some(&song), 48000, 96_000), Some(4.0));
     }
 
     #[test]
-    fn playhead_to_row_none_when_track_missing() {
-        let song = song_with_clip_rows(120.0, 0.0, 4.0, 16);
-        assert_eq!(playhead_to_row(Some(&song), 5, 48000, 0), None);
-    }
-
-    #[test]
-    fn playhead_to_row_none_when_clip_missing() {
-        assert_eq!(playhead_to_row(Some(&Song::default()), 0, 48000, 0), None);
-    }
-
-    #[test]
-    fn playhead_to_row_zero_at_clip_start() {
-        // 120 BPM, rows_per_beat 4: samples_per_row = 6000.
-        let song = song_with_clip_rows(120.0, 0.0, 4.0, 16);
-        assert_eq!(playhead_to_row(Some(&song), 0, 48000, 0), Some(0));
-    }
-
-    #[test]
-    fn playhead_to_row_advances_with_samples() {
-        let song = song_with_clip_rows(120.0, 0.0, 4.0, 16);
-        // samples_per_row = 48000*60/120/4 = 6000
-        assert_eq!(playhead_to_row(Some(&song), 0, 48000, 5_999), Some(0));
-        assert_eq!(playhead_to_row(Some(&song), 0, 48000, 6_000), Some(1));
-        assert_eq!(playhead_to_row(Some(&song), 0, 48000, 12_000), Some(2));
-        assert_eq!(playhead_to_row(Some(&song), 0, 48000, 90_000), Some(15));
-    }
-
-    #[test]
-    fn playhead_to_row_none_before_clip_start() {
-        let song = song_with_clip_rows(120.0, 2.0, 4.0, 16);
-        assert_eq!(playhead_to_row(Some(&song), 0, 48000, 0), None);
-        assert_eq!(playhead_to_row(Some(&song), 0, 48000, 47_999), None);
-        assert_eq!(playhead_to_row(Some(&song), 0, 48000, 48_000), Some(0));
-    }
-
-    #[test]
-    fn playhead_to_row_none_past_clip_end() {
-        let song = song_with_clip_rows(120.0, 0.0, 4.0, 16);
-        assert_eq!(playhead_to_row(Some(&song), 0, 48000, 96_000), None);
-        assert_eq!(playhead_to_row(Some(&song), 0, 48000, 200_000), None);
-    }
-
-    #[test]
-    fn playhead_to_row_clamps_to_available_rows() {
-        let song = song_with_clip_rows(120.0, 0.0, 4.0, 8);
-        assert_eq!(playhead_to_row(Some(&song), 0, 48000, 60_000), Some(7));
+    fn playhead_to_beat_none_for_invalid_song() {
+        assert_eq!(playhead_to_beat(None, 48000, 0), None);
+        let song = song_with_clip(0.0, 0.0, 4.0);
+        assert_eq!(playhead_to_beat(Some(&song), 48000, 0), None);
     }
 }

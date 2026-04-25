@@ -1,21 +1,33 @@
+//! Bitwig-style DAW GUI state.
+//!
+//! The app state has three top-level pieces:
+//!   1. The **song** — a tree of `Track → Clip → Note`. Mutated by every
+//!      edit; pushed to `daw_plugin_host` on `Play`.
+//!   2. **Selection state** — what track / clip / notes the user has
+//!      currently picked. Drives the inspector, the piano roll's
+//!      contents, and the lyric panel.
+//!   3. **View state** — zoom, scroll, playhead, peak meters. Lens-bound
+//!      so views can render without taking a callback through `cx`.
+//!
+//! Drag interactions live inside the views (arrangement / piano roll).
+//! Each view tracks the in-progress drag locally and only emits a single
+//! commit event (`MoveClip`, `MoveNote`, etc.) on `MouseUp`.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use common::model::{Clip, InstrumentSource, Note, NoteEvent, Row, Song, Track};
+use common::model::{Clip, InstrumentSource, Note, Song, Track};
 use common::plugin_db::PluginDatabase;
 use common::plugin_format::PluginFormat;
 use common::protocol::{MainToChild, PluginSlot, SlotState};
 use tokio::sync::mpsc::UnboundedSender;
 use vizia::prelude::*;
 
-/// Lightweight lens-friendly copy of a plugin database entry. Carries only
-/// what the picker list needs to render and select; path lookup happens
-/// via `plugin_db.find_by_id` when the user picks.
-/// Per-track mixer strip row bound to the new MixerStripsView. Rebuilt
-/// from `song.tracks` whenever the track list or a mixer parameter
-/// changes; the `peak_*_norm` fields are refreshed on every UI tick
-/// from the shmem-published post-fader peaks.
+/// Per-track mixer strip row bound to the bottom-panel mixer view.
+/// Rebuilt from `song.tracks` whenever the track list or a mixer parameter
+/// changes; the `peak_*_norm` fields are refreshed on every UI tick from
+/// the shmem-published post-fader peaks.
 #[derive(Debug, Clone, PartialEq, Data)]
 pub struct TrackMixEntry {
     pub index: u32,
@@ -48,20 +60,11 @@ pub struct PluginPickEntry {
     pub id: String,
     pub name: String,
     pub vendor: String,
-    /// Features from the CLAP descriptor — used by the picker's filter
-    /// bar to show only instrument/audio-effect/note-effect plugins.
     pub features: Vec<String>,
-    /// Short label ("CLAP" / "VST3") rendered as a badge in the picker row.
-    /// Kept as a `String` (not `PluginFormat`) so Vizia's `Data` derive
-    /// works without a foreign-type `impl Data` on `PluginFormat`.
     pub format_label: String,
 }
 
-/// A single slot on the visible track's chain, used by the Track Inspector
-/// list view. Rebuilt from `song.tracks[0]` whenever the chain changes.
-///
-/// `slot_kind` / `slot_index` reproduce `PluginSlot` in Data-safe primitive
-/// form: 0 = MidiFx(idx), 1 = Instrument, 2 = Fx(idx).
+/// A single slot on the inspected track's chain.
 #[derive(Debug, Clone, PartialEq, Eq, Data)]
 pub struct ChainEntry {
     pub slot_kind: u8,
@@ -81,8 +84,6 @@ impl ChainEntry {
     }
 }
 
-/// Kind of slot the Plugin Picker is currently adding to. Drives the
-/// feature filter and the destination slot when the user picks a plugin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Data)]
 pub enum PickerTarget {
     Instrument,
@@ -91,145 +92,153 @@ pub enum PickerTarget {
     MidiFx,
 }
 
+/// Drop-target for the inspector + piano roll.
+///
+/// `Track`-only is selected by clicking a track header; `(Track, Clip)` is
+/// selected by clicking a clip in the arrangement view, which also drives
+/// the piano roll's contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Data, Default)]
+pub struct ClipRef {
+    pub track: u32,
+    pub clip: u32,
+}
+
+/// Render-friendly snapshot of one clip on the timeline. Rebuilt whenever
+/// the song changes; the arrangement view binds to the `Vec<ClipBox>` lens
+/// and renders each entry as a coloured rectangle.
+#[derive(Debug, Clone, PartialEq, Data)]
+pub struct ClipBox {
+    pub track: u32,
+    pub clip: u32,
+    pub name: String,
+    pub start_beat: f32,
+    pub length_beats: f32,
+    pub selected: bool,
+}
+
+/// Render-friendly snapshot of one note inside the currently selected clip.
+/// Rebuilt whenever the clip's note list or selection changes; the piano
+/// roll binds to the `Vec<NoteBox>` lens.
+#[derive(Debug, Clone, PartialEq, Data)]
+pub struct NoteBox {
+    pub note: u32,
+    pub start_beat: f32,
+    pub duration_beats: f32,
+    pub pitch: u8,
+    pub lyric: String,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Data)]
+pub struct TrackHeader {
+    pub index: u32,
+    pub name: String,
+    pub muted: bool,
+    pub solo: bool,
+    pub selected: bool,
+}
+
+/// Width of the arrangement view at 1× zoom expressed in pixels per beat.
+/// Mirrors Meadowlark's `POINTS_PER_BEAT = 100.0`.
+pub const ARRANGE_PX_PER_BEAT: f32 = 24.0;
+/// Vertical pixels per arrangement track row.
+pub const ARRANGE_TRACK_HEIGHT: f32 = 56.0;
+/// Default note duration (in beats) when the user double-clicks empty
+/// piano-roll space to place a new note. 1/4 beat = 1/16 note at 4/4.
+pub const DEFAULT_NOTE_DURATION: f64 = 0.25;
+/// Default clip length (in beats) when the user double-clicks empty
+/// arrangement space to create a new clip.
+pub const DEFAULT_CLIP_LENGTH: f64 = 4.0;
+
 #[derive(Lens)]
 pub struct AppData {
     pub song: Song,
     pub file_path: Option<PathBuf>,
-    pub cursor_row: u32,
-    pub cursor_track: u32,
-    /// Cached per-track header strings (track name + clip name with cursor
-    /// marker), one per slot in the visible window. Bound by the unified
-    /// tracker-mixer view's per-track header label.
-    pub visible_track_headers: Vec<String>,
-    /// Cached per-cell text shaped as `[slot][row]`. Each inner Vec is the
-    /// rows for one visible slot; cursor cell is wrapped in `[…]`.
-    pub visible_tracker_cells: Vec<Vec<String>>,
-    /// Row-number labels (`"  00"`, `"  01"`, …, with a `>` on the cursor
-    /// row). Length equals the current visible row count; bound by the
-    /// row-number column on the left of the unified view.
-    pub row_numbers: Vec<String>,
-    /// Slice of `track_mix` corresponding to the visible window. Slot `i`
-    /// is `track_mix[visible_track_start + i]` when in range, otherwise a
-    /// default entry; this lets each per-track widget bind to a fixed
-    /// slot index without composing multiple Lenses.
-    pub visible_track_mix: Vec<TrackMixEntry>,
-    /// Template note used when placing into an empty cell (sing_like_coding
-    /// style). Updated whenever the user edits a NoteOn cell.
-    pub last_note: Note,
-    /// Tracks whether playback is currently active so PlayToggle can flip.
-    /// Flipped only by explicit user Play/Stop; auto-stop in plugin_host is
-    /// not yet mirrored back here.
+
+    // -------- Selection -----------------------------------------------------
+    /// Track that the inspector + plugin picker target. Always valid against
+    /// `song.tracks` (clamped on track removal). Rebuilt from the
+    /// arrangement view's "selected track header" interaction.
+    pub selected_track: u32,
+    /// Currently selected clip. `None` means "no clip selected" — the piano
+    /// roll then shows an empty placeholder.
+    pub selected_clip: Option<ClipRef>,
+    /// Notes selected within `selected_clip`. Indices into the clip's
+    /// `notes` vector. Multi-select isn't wired up in v1 but the field is
+    /// a `Vec` so it's ready for it.
+    pub selected_notes: Vec<u32>,
+
+    // -------- View state ----------------------------------------------------
+    /// Bottom panel selector: `0 = Mixer`, `1 = Piano Roll`. Bound to a
+    /// `TabView` selected_index lens.
+    pub bottom_panel: u8,
+    /// Horizontal zoom on the arrangement view (px / beat).
+    pub arrange_zoom_x: f32,
+    /// Horizontal zoom on the piano roll (px / beat).
+    pub pianoroll_zoom_x: f32,
+    /// Vertical zoom on the piano roll (px / semitone).
+    pub pianoroll_zoom_y: f32,
+
+    // -------- Cached lens-bound snapshots -----------------------------------
+    /// Per-track header strip on the left of the arrangement view.
+    pub track_headers: Vec<TrackHeader>,
+    /// Mirror of `song.tracks.len()` for slot-visibility lenses.
+    pub track_count: u32,
+    /// All clips in the song, flattened for the arrangement view.
+    pub clip_boxes: Vec<ClipBox>,
+    /// Notes in `selected_clip` (empty if no clip selected).
+    pub note_boxes: Vec<NoteBox>,
+    /// Lyric of the first selected note, or empty when nothing is selected.
+    /// The lyric panel binds an editable Textbox to this.
+    pub selected_lyric: String,
+
+    // -------- Playback / metering ------------------------------------------
     pub is_playing: bool,
-    /// Loop the current clip when it reaches the end instead of auto-stopping.
-    /// Session-only state; not persisted to `.daw`.
     pub is_looping: bool,
-    /// Tracker row currently being played back. `None` when no playback is
-    /// happening (sentinel `u64::MAX` published by plugin_host, or no clip).
-    /// Used by ArrangementView to highlight the sounding row.
-    pub playhead_row: Option<u32>,
-    /// Master output gain applied inside daw_audio (linear, 0.0..=1.0).
-    /// Session state; not persisted to `.daw`.
+    /// Current playhead in beats (relative to song origin). `None` when the
+    /// audio thread published the "not playing" sentinel.
+    pub playhead_beat: Option<f32>,
     pub master_gain: f32,
-    /// Smoothed peak levels (linear, 0.0..=1.0) for the left/right meter.
-    /// Updated on every UI tick using `common::meter::update_peak` so the
-    /// meter snaps up instantly and falls exponentially.
     pub peak_l_display: f32,
     pub peak_r_display: f32,
-    /// Same peaks converted to `[0, 1]` for the meter-fill height binding.
-    /// Recomputed together with `peak_*_display` so the view only needs a
-    /// single Lens.
     pub peak_l_norm: f32,
     pub peak_r_norm: f32,
-    /// Plugin database (path + id lookup). Shared, read-mostly. `None`
-    /// before the initial scan finishes.
+
+    // -------- Plugin database / picker -------------------------------------
     #[lens(ignore)]
     pub plugin_db: Option<Arc<PluginDatabase>>,
-    /// Lens-visible copy of the database entries for the plugin-picker UI.
-    /// Derived once from `plugin_db` at construction time.
     pub plugin_picker_entries: Vec<PluginPickEntry>,
-    /// Subset of `plugin_picker_entries` filtered by the current
-    /// `plugin_picker_target` feature; rebuilt when the picker opens so
-    /// `+ Add Instrument` only shows instruments, etc.
     pub plugin_picker_visible: Vec<PluginPickEntry>,
-    /// Whether the plugin-picker overlay is visible.
     pub is_plugin_picker_open: bool,
-    /// What the user is adding when they open the picker — drives the
-    /// picker's feature filter and the destination slot for the selection.
     pub plugin_picker_target: PickerTarget,
-    /// Chain entries for the track the Inspector is currently viewing
-    /// (driven by `cursor_track`). Rebuilt whenever that track's
-    /// instrument / fx / midi-fx chain changes, or the cursor moves.
     pub inspector_chain: Vec<ChainEntry>,
-    /// Display label for the selected track (e.g. "Track 1") shown in the
-    /// Inspector heading. Refreshed alongside `inspector_chain`.
     pub selected_track_label: String,
-    /// Name of the loaded instrument on the selected track, or a placeholder.
-    /// Convenience mirror for UI display; primary storage is
-    /// `song.tracks[cursor_track].instrument`.
     pub instrument_label: String,
-    /// When non-`None`, a save is in flight waiting for the plugin state
-    /// reply; once `AllStatesReceived` arrives the data is written to this
-    /// path.
+
+    // -------- Save flow / IPC ----------------------------------------------
     #[lens(ignore)]
     pub pending_save_path: Option<PathBuf>,
     #[lens(ignore)]
     pub audio_tx: Option<UnboundedSender<MainToChild>>,
     #[lens(ignore)]
     pub plugin_tx: Option<UnboundedSender<MainToChild>>,
-    /// Live host-owned container windows per loaded plugin GUI, keyed by
-    /// (track, slot). Each entry is one open editor; multiple editors can
-    /// be visible simultaneously.
     #[cfg(windows)]
     #[lens(ignore)]
     pub plugin_host_windows:
         HashMap<(u32, PluginSlot), crate::view::plugin_embed::PluginHostWindow>,
 
-    /// Renoise-style mixer strip row: one entry per song track, rebuilt
-    /// on song mutation and refreshed on every UI tick with post-fader
-    /// peaks from the shmem bridge.
+    // -------- Mixer ---------------------------------------------------------
     pub track_mix: Vec<TrackMixEntry>,
-    /// Raw linear-amplitude peak already decayed with the mixer's
-    /// release curve; parallel array to `song.tracks`. Kept out of the
-    /// lens-visible struct so decay state isn't exposed to the UI —
-    /// it's baked into `track_mix[i].peak_*_norm` each tick.
     #[lens(ignore)]
     pub track_peak_display: Vec<(f32, f32)>,
 
-    /// Drop-off slot for background VOICEVOX synthesis results. Worker
-    /// thread writes here, then emits `VocalSynthCompleted`.
+    // -------- Background workers -------------------------------------------
     #[lens(ignore)]
     pub synth_result: Arc<Mutex<Vec<common::voicevox::SynthResult>>>,
-
-    /// Drop-off slot for a background plugin-database rescan. The worker
-    /// thread scans, persists the result to the on-disk cache, stashes the
-    /// fresh `PluginDatabase` here, and then emits
-    /// `AppEvent::PluginDbRescanCompleted` so the UI thread picks it up.
-    /// Kept out of any lens — the UI reacts to rescan via the event, not
-    /// by observing this field.
     #[lens(ignore)]
     pub rescan_result: Arc<Mutex<Option<PluginDatabase>>>,
-    /// True while a rescan is in flight; lens-visible so the picker can
-    /// show a "Rescanning..." label instead of letting the user hammer the
-    /// button.
     pub is_rescanning: bool,
-    /// Status message shown in the status bar. Updated by synthesis /
-    /// rescan / errors to give the user feedback on background tasks.
     pub status_message: String,
-    /// True while the lyric inline editor is open. Bound by the overlay
-    /// `Binding` that shows/hides the `Textbox`.
-    /// First visible track index in the tracker + mixer view. Adjusted
-    /// automatically when the cursor moves beyond the visible window.
-    pub visible_track_start: u32,
-    /// Number of tracks that fit side-by-side in the arrangement area.
-    /// MVP: fixed at 6; a future version should derive this from the
-    /// actual pixel width of the arrangement panel.
-    pub visible_track_count: u32,
-    /// `(start, end)` range of visible track indices, used by the mixer
-    /// strip visibility lens. Updated alongside `visible_track_start`.
-    pub mixer_visible_range: (u32, u32),
-    pub lyric_editing: bool,
-    /// Current text in the lyric editor `Textbox`.
-    pub lyric_edit_text: String,
 }
 
 impl AppData {
@@ -240,22 +249,20 @@ impl AppData {
         _clap_plugin_path: Option<PathBuf>,
         plugin_db: Option<Arc<PluginDatabase>>,
     ) -> Self {
-        // Mixer view shows a permanent master strip even when the user
-        // has added zero tracks; that keeps Vizia's `List` draw path off
-        // its zero-item panic path.
-        let song = Song::default();
-        let visible_track_headers =
-            crate::view::arrangement::render_visible_track_headers(&song, 0, 0, 6);
-        let visible_tracker_cells =
-            crate::view::arrangement::render_visible_tracker_cells(&song, 0, 0, 0, 6);
-        let row_count = crate::view::arrangement::visible_row_count(&song);
-        let row_numbers = crate::view::arrangement::render_row_numbers(row_count, 0);
-        // Pre-compute anything that borrows `song` so the Self literal
-        // below can move it in field-declaration order without tripping
-        // the borrow checker.
+        // Start with a single empty instrument track so the arrangement
+        // and mixer never go through the 0→N transition (Vizia's morphorm
+        // layout can produce non-invertible matrices when a list flips
+        // from empty to non-empty mid-frame; CLAUDE.md draw.rs:35 panic).
+        let song = Song {
+            tracks: vec![Track {
+                name: "Track 1".into(),
+                ..Track::default()
+            }],
+            ..Song::default()
+        };
+        let track_count = song.tracks.len() as u32;
         let initial_mix = initial_track_mix(&song);
         let initial_peak_display = vec![(0.0, 0.0); song.tracks.len()];
-        let visible_track_mix = build_visible_track_mix(&initial_mix, 0, 6);
         let plugin_picker_entries = plugin_db
             .as_ref()
             .map(|db| {
@@ -277,19 +284,21 @@ impl AppData {
         Self {
             song,
             file_path: None,
-            cursor_row: 0,
-            cursor_track: 0,
-            visible_track_headers,
-            visible_tracker_cells,
-            row_numbers,
-            visible_track_mix,
-            last_note: Note {
-                key: 60,
-                velocity: 100,
-            },
+            selected_track: 0,
+            selected_clip: None,
+            selected_notes: Vec::new(),
+            bottom_panel: 0,
+            arrange_zoom_x: ARRANGE_PX_PER_BEAT,
+            pianoroll_zoom_x: 64.0,
+            pianoroll_zoom_y: 10.0,
+            track_headers: Vec::new(),
+            track_count,
+            clip_boxes: Vec::new(),
+            note_boxes: Vec::new(),
+            selected_lyric: String::new(),
             is_playing: false,
             is_looping: false,
-            playhead_row: None,
+            playhead_beat: None,
             master_gain: 1.0,
             peak_l_display: 0.0,
             peak_r_display: 0.0,
@@ -314,62 +323,105 @@ impl AppData {
             rescan_result: Arc::new(Mutex::new(None)),
             is_rescanning: false,
             status_message: String::new(),
-            visible_track_start: 0,
-            visible_track_count: 6,
-            mixer_visible_range: (0, 6),
-            lyric_editing: false,
-            lyric_edit_text: String::new(),
         }
     }
 
-    fn refresh_tracker_text(&mut self) {
-        self.visible_track_headers = crate::view::arrangement::render_visible_track_headers(
-            &self.song,
-            self.cursor_track,
-            self.visible_track_start,
-            self.visible_track_count,
-        );
-        self.visible_tracker_cells = crate::view::arrangement::render_visible_tracker_cells(
-            &self.song,
-            self.cursor_row,
-            self.cursor_track,
-            self.visible_track_start,
-            self.visible_track_count,
-        );
-        let row_count = crate::view::arrangement::visible_row_count(&self.song);
-        self.row_numbers =
-            crate::view::arrangement::render_row_numbers(row_count, self.cursor_row);
-        self.refresh_visible_track_mix();
-    }
-
-    /// Build the visible-window slice of `track_mix`. Slot `i` is filled
-    /// with `track_mix[visible_track_start + i]` when in range, otherwise
-    /// a default entry whose `index = u32::MAX` so accidental events
-    /// against an empty slot are easy to spot in logs.
-    fn refresh_visible_track_mix(&mut self) {
-        self.visible_track_mix = build_visible_track_mix(
-            &self.track_mix,
-            self.visible_track_start,
-            self.visible_track_count,
-        );
+    /// Recompute every cached lens-visible snapshot (`track_headers`,
+    /// `clip_boxes`, `note_boxes`, `selected_lyric`, `track_count`) from
+    /// `song` + selection state.
+    fn refresh_caches(&mut self) {
+        self.track_count = self.song.tracks.len() as u32;
+        self.track_headers = self
+            .song
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| TrackHeader {
+                index: i as u32,
+                name: if t.name.is_empty() {
+                    format!("Track {}", i + 1)
+                } else {
+                    t.name.clone()
+                },
+                muted: t.muted,
+                solo: t.solo,
+                selected: i as u32 == self.selected_track,
+            })
+            .collect();
+        let selected_clip = self.selected_clip;
+        self.clip_boxes = self
+            .song
+            .tracks
+            .iter()
+            .enumerate()
+            .flat_map(|(t_idx, t)| {
+                t.clips
+                    .iter()
+                    .enumerate()
+                    .map(move |(c_idx, c)| ClipBox {
+                        track: t_idx as u32,
+                        clip: c_idx as u32,
+                        name: c.name.clone(),
+                        start_beat: c.start_beat as f32,
+                        length_beats: c.length_beats as f32,
+                        selected: selected_clip
+                            == Some(ClipRef {
+                                track: t_idx as u32,
+                                clip: c_idx as u32,
+                            }),
+                    })
+            })
+            .collect();
+        // Notes for the currently selected clip.
+        let selected_notes = &self.selected_notes;
+        self.note_boxes = match self.selected_clip {
+            Some(ClipRef { track, clip }) => self
+                .song
+                .tracks
+                .get(track as usize)
+                .and_then(|t| t.clips.get(clip as usize))
+                .map(|c| {
+                    c.notes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| NoteBox {
+                            note: i as u32,
+                            start_beat: n.start_beat as f32,
+                            duration_beats: n.duration_beats as f32,
+                            pitch: n.pitch,
+                            lyric: n.lyric.clone().unwrap_or_default(),
+                            selected: selected_notes.contains(&(i as u32)),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        self.selected_lyric = self
+            .selected_notes
+            .first()
+            .copied()
+            .and_then(|n_idx| {
+                let r = self.selected_clip?;
+                let track = self.song.tracks.get(r.track as usize)?;
+                let clip = track.clips.get(r.clip as usize)?;
+                let note = clip.notes.get(n_idx as usize)?;
+                Some(note.lyric.clone().unwrap_or_default())
+            })
+            .unwrap_or_default();
     }
 }
 
-fn build_visible_track_mix(
-    full: &[TrackMixEntry],
-    start: u32,
-    count: u32,
-) -> Vec<TrackMixEntry> {
-    (0..count as usize)
-        .map(|slot| {
-            let idx = start as usize + slot;
-            full.get(idx).cloned().unwrap_or_default()
-        })
-        .collect()
+/// Unpack an `f64` carried inside an `AppEvent` variant. AppEvent needs
+/// `Eq + Hash`, which f64 lacks; senders use `f64::to_bits` and the
+/// handler reads them back through here.
+fn from_f64_bits(b: u64) -> f64 {
+    f64::from_bits(b)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AppEvent {
+    // -------- File / playback ---------------------------------------------
     New,
     Open,
     Save,
@@ -377,103 +429,129 @@ pub enum AppEvent {
     Play,
     Stop,
     PlayToggle,
-    AddVocalTrack,
-    RemoveLastTrack,
-    CursorLeft,
-    CursorRight,
-    CursorUp,
-    CursorDown,
-    NoteOff,
-    NoteClear,
-    TransposeSemi(i8),
-    TransposeOctave(i8),
-    /// Open the plugin picker overlay targeting a specific slot kind.
-    OpenPluginPickerFor(PickerTarget),
-    /// Close the picker without changing selection.
-    ClosePluginPicker,
-    /// User picked a plugin from the picker; carries its stable id.
-    SelectPluginFromDb(String),
-    /// Toggle GUI for a specific chain slot (from a row's [GUI] button).
-    ToggleSlotGui { slot_kind: u8, slot_index: u32 },
-    /// Remove the plugin at a given chain slot.
-    RemoveSlot { slot_kind: u8, slot_index: u32 },
     ToggleLoop,
-    /// Master gain change from the fader. Carried as `f32::to_bits` because
-    /// `f32` doesn't implement `Eq`/`Hash` and `AppEvent` needs both for the
-    /// Keymap API.
+    AddVocalTrack,
+    AddInstrumentTrack,
+    RemoveLastTrack,
+    SelectTrack(u32),
+
+    // -------- Bottom panel -------------------------------------------------
+    SelectBottomPanel(u8),
+
+    // -------- Arrangement / clip operations -------------------------------
+    SelectClip(ClipRef),
+    ClearSelection,
+    /// `start_beat_bits` = `f64::to_bits` of the new clip start.
+    MoveClip {
+        target: ClipRef,
+        start_beat_bits: u64,
+    },
+    /// `length_bits` = `f64::to_bits` of the new clip length.
+    ResizeClip {
+        target: ClipRef,
+        length_bits: u64,
+    },
+    /// Create a new empty clip on `track` starting at `start_beat`. Length
+    /// defaults to `DEFAULT_CLIP_LENGTH`.
+    CreateClip {
+        track: u32,
+        start_beat_bits: u64,
+    },
+    DeleteSelectedClip,
+
+    // -------- Piano roll / note operations --------------------------------
+    SelectNote {
+        note: u32,
+        additive: bool,
+    },
+    ClearNoteSelection,
+    AddNote {
+        track: u32,
+        clip: u32,
+        start_beat_bits: u64,
+        duration_bits: u64,
+        pitch: u8,
+    },
+    MoveNote {
+        track: u32,
+        clip: u32,
+        note: u32,
+        start_beat_bits: u64,
+        pitch: u8,
+    },
+    ResizeNote {
+        track: u32,
+        clip: u32,
+        note: u32,
+        duration_bits: u64,
+    },
+    DeleteSelectedNotes,
+    SetSelectedNoteLyric(String),
+
+    // -------- Plugin picker / chain ---------------------------------------
+    OpenPluginPickerFor(PickerTarget),
+    ClosePluginPicker,
+    SelectPluginFromDb(String),
+    ToggleSlotGui {
+        slot_kind: u8,
+        slot_index: u32,
+    },
+    RemoveSlot {
+        slot_kind: u8,
+        slot_index: u32,
+    },
     SetMasterGain(u32),
-    /// Periodic UI tick carrying the latest `(playhead_samples, peak_l, peak_r)`
-    /// from shmem. Peaks are f32::to_bits so the event can still derive
-    /// Eq/Hash. `u64::MAX` playhead is the "not playing" sentinel published
-    /// by plugin_host.
+
+    // -------- IPC events from plugin_host ---------------------------------
     Tick(u64, u32, u32),
-    /// Plugin confirmed that its GUI has been embedded at `width × height`.
-    /// Forwarded by the `ChildToMain` receiver loop from daw_plugin_host;
-    /// the (track, slot) addresses which open container window is the target.
     GuiOpenedFromChild {
         track: u32,
         slot: PluginSlot,
         width: u32,
         height: u32,
     },
-    /// Plugin requested a resize via `clap_host_gui.request_resize`.
     GuiRequestResizeFromChild {
         track: u32,
         slot: PluginSlot,
         width: u32,
         height: u32,
     },
-    /// Plugin signalled its GUI was closed (host-callback `closed`).
-    GuiClosedFromChild { track: u32, slot: PluginSlot },
-    /// Plugin-host confirmed a successful load and reported the ID/name of
-    /// the descriptor that actually came up. Routed to the (track, slot)
-    /// that issued the `SetSlotPlugin` so the right model entry is updated.
+    GuiClosedFromChild {
+        track: u32,
+        slot: PluginSlot,
+    },
     SlotPluginLoadedFromChild {
         track: u32,
         slot: PluginSlot,
         id: String,
         name: String,
     },
-    /// Reply to `RequestAllStates`. Each entry pairs a (track, slot) with the
-    /// plugin's serialized state (or `None` if the plugin doesn't implement
-    /// the state extension). Triggers `finish_save` when a save is pending.
     AllStatesReceived(Vec<SlotState>),
-    /// User asked for a full plugin re-scan (CLAP + VST3). The scan itself
-    /// runs on a background thread; when it finishes,
-    /// `PluginDbRescanCompleted` is posted.
     RescanPluginDb,
-    /// Background rescan finished. The new `PluginDatabase` lives in
-    /// `AppData::rescan_result`; this event carries no payload because
-    /// `AppEvent` needs `Eq + Hash` and `PluginDatabase` does not.
     PluginDbRescanCompleted,
-    /// Mixer strip slider drag / button toggle.
-    SetTrackVolume { track: u32, bits: u32 },
-    SetTrackPan { track: u32, bits: u32 },
+
+    // -------- Mixer -------------------------------------------------------
+    SetTrackVolume {
+        track: u32,
+        bits: u32,
+    },
+    SetTrackPan {
+        track: u32,
+        bits: u32,
+    },
     ToggleTrackMute(u32),
     ToggleTrackSolo(u32),
-    /// Per-track post-fader peaks sampled from the shmem bridge on the UI
-    /// poll thread. Carries `f32::to_bits` pairs so the event stays
-    /// `Eq + Hash`.
     TrackPeaksTick(Vec<(u32, u32)>),
-    /// Synthesize all vocal clips on all vocal tracks via VOICEVOX.
-    /// Triggered by the `v` shortcut key. Runs on a background thread;
-    /// completion posts `VocalSynthCompleted`.
+
+    // -------- VOICEVOX ----------------------------------------------------
     SynthesizeVocal,
-    /// Background vocal synth finished. Results are in `synth_result`.
     VocalSynthCompleted,
-    /// Export the entire song to a WAV file. Triggered by Ctrl+E or
-    /// the File menu.
+
+    // -------- Export ------------------------------------------------------
     ExportWav,
-    /// plugin_host finished the WAV export.
-    ExportWavComplete { error: Option<String> },
-    /// `i` key: open the inline lyric editor for the current row.
-    StartLyricEdit,
-    /// Textbox on_edit callback.
-    LyricEditChanged(String),
-    /// Enter in the lyric editor: commit current text, move to next row.
-    SubmitLyricEdit,
-    /// Esc in the lyric editor: discard and close.
-    CancelLyricEdit,
+    ExportWavComplete {
+        error: Option<String>,
+    },
 }
 
 impl Model for AppData {
@@ -484,27 +562,10 @@ impl Model for AppData {
             }
         });
         event.map(|app_event, _| {
+            // `dirty` decides whether `refresh_caches` runs at the end of
+            // the handler. Most edits set it true; pure metering / IPC
+            // replies leave it false to avoid pointless re-renders.
             let mut dirty = true;
-
-            // While the lyric editor is open, only process lyric-related
-            // events. All other keymap shortcuts (h/j/k/l cursor, Play,
-            // etc.) are blocked so they don't move the cursor or trigger
-            // actions behind the modal.
-            if self.lyric_editing {
-                match app_event {
-                    AppEvent::LyricEditChanged(text) => {
-                        self.lyric_edit_text = text.clone();
-                    }
-                    AppEvent::SubmitLyricEdit => {
-                        self.submit_lyric_edit();
-                    }
-                    AppEvent::CancelLyricEdit => {
-                        self.lyric_editing = false;
-                    }
-                    _ => {}
-                }
-                return;
-            }
 
             match app_event {
                 AppEvent::New => self.action_new(),
@@ -533,16 +594,80 @@ impl Model for AppData {
                     }
                     dirty = false;
                 }
+                AppEvent::ToggleLoop => {
+                    self.toggle_loop();
+                    dirty = false;
+                }
                 AppEvent::AddVocalTrack => self.action_add_vocal_track(),
+                AppEvent::AddInstrumentTrack => self.action_add_instrument_track(),
                 AppEvent::RemoveLastTrack => self.action_remove_last_track(),
-                AppEvent::CursorLeft => self.move_cursor_track(-1),
-                AppEvent::CursorRight => self.move_cursor_track(1),
-                AppEvent::CursorUp => self.move_cursor_row(-1),
-                AppEvent::CursorDown => self.move_cursor_row(1),
-                AppEvent::NoteOff => self.edit_cell(|row| row.note = Some(NoteEvent::Off)),
-                AppEvent::NoteClear => self.edit_cell(|row| row.note = None),
-                AppEvent::TransposeSemi(d) => self.apply_transpose(*d as i16),
-                AppEvent::TransposeOctave(d) => self.apply_transpose(*d as i16 * 12),
+                AppEvent::SelectTrack(idx) => self.select_track(*idx),
+                AppEvent::SelectBottomPanel(p) => {
+                    self.bottom_panel = *p;
+                    dirty = false;
+                }
+                AppEvent::SelectClip(target) => self.select_clip(Some(*target)),
+                AppEvent::ClearSelection => {
+                    self.selected_clip = None;
+                    self.selected_notes.clear();
+                }
+                AppEvent::MoveClip {
+                    target,
+                    start_beat_bits,
+                } => {
+                    self.move_clip(*target, from_f64_bits(*start_beat_bits));
+                }
+                AppEvent::ResizeClip {
+                    target,
+                    length_bits,
+                } => self.resize_clip(*target, from_f64_bits(*length_bits)),
+                AppEvent::CreateClip {
+                    track,
+                    start_beat_bits,
+                } => self.create_clip(*track, from_f64_bits(*start_beat_bits)),
+                AppEvent::DeleteSelectedClip => self.delete_selected_clip(),
+                AppEvent::SelectNote { note, additive } => {
+                    self.select_note(*note, *additive);
+                }
+                AppEvent::ClearNoteSelection => self.selected_notes.clear(),
+                AppEvent::AddNote {
+                    track,
+                    clip,
+                    start_beat_bits,
+                    duration_bits,
+                    pitch,
+                } => {
+                    self.add_note(
+                        *track,
+                        *clip,
+                        from_f64_bits(*start_beat_bits),
+                        from_f64_bits(*duration_bits),
+                        *pitch,
+                    );
+                }
+                AppEvent::MoveNote {
+                    track,
+                    clip,
+                    note,
+                    start_beat_bits,
+                    pitch,
+                } => self.move_note(
+                    *track,
+                    *clip,
+                    *note,
+                    from_f64_bits(*start_beat_bits),
+                    *pitch,
+                ),
+                AppEvent::ResizeNote {
+                    track,
+                    clip,
+                    note,
+                    duration_bits,
+                } => self.resize_note(*track, *clip, *note, from_f64_bits(*duration_bits)),
+                AppEvent::DeleteSelectedNotes => self.delete_selected_notes(),
+                AppEvent::SetSelectedNoteLyric(text) => {
+                    self.set_selected_note_lyric(text.clone());
+                }
                 AppEvent::OpenPluginPickerFor(target) => {
                     self.plugin_picker_target = *target;
                     self.refresh_picker_visible();
@@ -577,10 +702,6 @@ impl Model for AppData {
                     slot_index,
                 } => {
                     self.remove_slot(*slot_kind, *slot_index);
-                    dirty = false;
-                }
-                AppEvent::ToggleLoop => {
-                    self.toggle_loop();
                     dirty = false;
                 }
                 AppEvent::SetMasterGain(bits) => {
@@ -623,7 +744,12 @@ impl Model for AppData {
                     id,
                     name,
                 } => {
-                    self.on_plugin_loaded_from_child(*track, *slot, id.clone(), name.clone());
+                    self.on_plugin_loaded_from_child(
+                        *track,
+                        *slot,
+                        id.clone(),
+                        name.clone(),
+                    );
                     dirty = false;
                 }
                 AppEvent::AllStatesReceived(entries) => {
@@ -671,27 +797,18 @@ impl Model for AppData {
                     self.finish_vocal_synth();
                     dirty = false;
                 }
-                AppEvent::StartLyricEdit => {
-                    self.start_lyric_edit();
-                    dirty = false;
-                }
-                // LyricEditChanged / SubmitLyricEdit / CancelLyricEdit
-                // are handled in the early-return block above when
-                // lyric_editing is true.
-                AppEvent::LyricEditChanged(_)
-                | AppEvent::SubmitLyricEdit
-                | AppEvent::CancelLyricEdit => {
-                    dirty = false;
-                }
             }
+
             if dirty {
-                self.refresh_tracker_text();
+                self.refresh_caches();
             }
         });
     }
 }
 
 impl AppData {
+    // -------- IPC -----------------------------------------------------------
+
     fn send_audio(&self, msg: MainToChild) {
         tracing::info!(?msg, "sending to audio");
         let Some(tx) = self.audio_tx.as_ref() else {
@@ -714,12 +831,26 @@ impl AppData {
         }
     }
 
+    /// Push the current song to plugin_host so live edits (note add /
+    /// move / clip drag etc.) are heard immediately during playback.
+    /// `Play` already does this on each press, but pressing Play once and
+    /// then editing for a while wouldn't refresh the audio thread's view
+    /// of the song without this hook.
+    fn sync_song_to_plugin_host(&self) {
+        self.send_plugin(MainToChild::LoadSong(self.song.clone()));
+    }
+
+    // -------- File ----------------------------------------------------------
+
     fn action_new(&mut self) {
         self.song = Song::default();
         self.file_path = None;
-        self.cursor_track = 0;
+        self.selected_track = 0;
+        self.selected_clip = None;
+        self.selected_notes.clear();
         self.refresh_inspector_chain();
         self.rebuild_track_mix();
+        self.sync_song_to_plugin_host();
         tracing::info!("new project");
     }
 
@@ -733,35 +864,30 @@ impl AppData {
         match common::project::load(&path) {
             Ok(song) => {
                 tracing::info!(path = %path.display(), "loaded project");
-                // Resolve persisted plugin ids → paths via the database, then
-                // send SetSlotPlugin with initial_state for every plugin on
-                // every track so they come back with the same settings.
                 self.restore_plugin_from_song(&song);
                 self.song = song;
                 self.file_path = Some(path);
-                self.cursor_track = 0;
+                self.selected_track = 0;
+                self.selected_clip = None;
+                self.selected_notes.clear();
                 self.refresh_inspector_chain();
                 self.rebuild_track_mix();
+                self.sync_song_to_plugin_host();
             }
             Err(e) => {
-                tracing::error!(error = ?e, path = %path.display(), "failed to load project")
+                tracing::error!(error = ?e, path = %path.display(), "failed to load project");
+                self.status_message = format!("Open 失敗: {e:#}");
             }
         }
     }
 
     /// Resolves every plugin id on every track (MIDI FX → Instrument → FX)
     /// via the database and re-sends them with their persisted state.
-    /// Chain-order replay matters because plugin_host installs FX / MIDI FX
-    /// into the next free index on each track, so we must replay in the
-    /// same order the entries were saved in.
     fn restore_plugin_from_song(&mut self, song: &Song) {
         let Some(db) = self.plugin_db.clone() else {
             tracing::warn!("plugin database not loaded; cannot resolve plugin ids");
             return;
         };
-        // Snapshot every (track, slot, instance) triple so we can mutate
-        // self while iterating. Track order comes from the song's Vec which
-        // already matches the user's arrangement.
         let mut to_send: Vec<(u32, PluginSlot, common::model::PluginInstance)> = Vec::new();
         for (track_idx, track) in song.tracks.iter().enumerate() {
             let t = track_idx as u32;
@@ -780,14 +906,6 @@ impl AppData {
                 tracing::error!(id = %inst.plugin_id, track, ?slot, "plugin id not in database");
                 continue;
             };
-            tracing::info!(
-                track,
-                ?slot,
-                id = %entry.id,
-                path = %entry.path.display(),
-                has_state = inst.state.is_some(),
-                "restoring plugin from project"
-            );
             self.send_plugin(MainToChild::SetSlotPlugin {
                 track,
                 slot,
@@ -817,26 +935,18 @@ impl AppData {
         self.begin_save(path);
     }
 
-    /// Kicks off the two-step save: request plugin states asynchronously and
-    /// stash the target path. `on_all_states_from_child` finishes the save
-    /// when the reply arrives.
     fn begin_save(&mut self, path: PathBuf) {
-        let has_plugin = self.song.tracks.first().is_some_and(|t| {
+        let has_plugin = self.song.tracks.iter().any(|t| {
             t.instrument.is_some() || !t.fx_chain.is_empty() || !t.midi_fx_chain.is_empty()
         });
         if has_plugin {
             self.pending_save_path = Some(path);
             self.send_plugin(MainToChild::RequestAllStates);
         } else {
-            // No plugin loaded: write immediately without a state round-trip.
             self.finish_save(path, Vec::new());
         }
     }
 
-    /// Distributes the captured `SlotState` entries across the model's
-    /// instrument / fx / midi-fx slots, then writes the project file. Slots
-    /// whose plugin was unloaded between request and reply are silently
-    /// skipped (the state has nowhere to live).
     fn finish_save(&mut self, path: PathBuf, states: Vec<SlotState>) {
         for s in states {
             let Some(track) = self.song.tracks.get_mut(s.track as usize) else {
@@ -866,17 +976,337 @@ impl AppData {
         }
     }
 
+    fn save_to(&self, path: &Path) -> bool {
+        match common::project::save(path, &self.song) {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "saved project");
+                true
+            }
+            Err(e) => {
+                tracing::error!(error = ?e, path = %path.display(), "failed to save project");
+                false
+            }
+        }
+    }
+
+    // -------- Playback -----------------------------------------------------
+
+    fn play(&mut self) {
+        self.send_plugin(MainToChild::LoadSong(self.song.clone()));
+        self.send_audio(MainToChild::Play);
+        self.send_plugin(MainToChild::Play);
+        self.is_playing = true;
+    }
+
+    fn stop(&mut self) {
+        self.send_audio(MainToChild::Stop);
+        self.send_plugin(MainToChild::Stop);
+        self.is_playing = false;
+        self.playhead_beat = None;
+    }
+
     fn toggle_loop(&mut self) {
         self.is_looping = !self.is_looping;
-        tracing::info!(on = self.is_looping, "loop toggled");
         self.send_plugin(MainToChild::SetLoop(self.is_looping));
     }
 
-    /// Handler for `ChildToMain::SlotGuiOpened`: plugin confirmed embed, so
-    /// resize our container's client area to match its preferred size.
+    // -------- Track operations ---------------------------------------------
+
+    fn select_track(&mut self, idx: u32) {
+        if idx >= self.song.tracks.len() as u32 {
+            return;
+        }
+        if self.selected_track != idx {
+            self.selected_track = idx;
+            self.refresh_inspector_chain();
+        }
+    }
+
+    fn ensure_first_track(&mut self) {
+        if self.song.tracks.is_empty() {
+            self.song.tracks.push(Track {
+                name: "Track 1".into(),
+                ..Track::default()
+            });
+            self.rebuild_track_mix();
+        }
+    }
+
+    fn action_add_vocal_track(&mut self) {
+        let index = self.song.tracks.len() + 1;
+        let track = Track {
+            name: format!("Track {index}"),
+            source: InstrumentSource::Vocal {
+                speaker_id: common::voicevox::DEFAULT_SINGER_ID,
+                style_name: "ノーマル".into(),
+            },
+            clips: vec![demo_clip()],
+            ..Track::default()
+        };
+        self.song.tracks.push(track);
+        self.rebuild_track_mix();
+        self.sync_song_to_plugin_host();
+        tracing::info!(index, "added vocal track");
+    }
+
+    fn action_add_instrument_track(&mut self) {
+        let index = self.song.tracks.len() + 1;
+        let track = Track {
+            name: format!("Track {index}"),
+            source: InstrumentSource::None,
+            clips: Vec::new(),
+            ..Track::default()
+        };
+        self.song.tracks.push(track);
+        self.rebuild_track_mix();
+        self.sync_song_to_plugin_host();
+        tracing::info!(index, "added instrument track");
+    }
+
+    fn action_remove_last_track(&mut self) {
+        if self.song.tracks.is_empty() {
+            return;
+        }
+        let removed_idx = (self.song.tracks.len() - 1) as u32;
+        if let Some(track) = self.song.tracks.pop() {
+            tracing::info!(
+                index = removed_idx,
+                name = %track.name,
+                "removed last track"
+            );
+        }
+        // Close any plugin editor windows that belong to this track before
+        // the host tears down its chain.
+        #[cfg(windows)]
+        {
+            self.plugin_host_windows
+                .retain(|&(t, _), _| t != removed_idx);
+        }
+        self.send_plugin(MainToChild::RemoveTrack { track: removed_idx });
+        // Clamp selection to remaining tracks.
+        let new_max = self.song.tracks.len().saturating_sub(1) as u32;
+        if self.song.tracks.is_empty() {
+            self.selected_track = 0;
+        } else if self.selected_track > new_max {
+            self.selected_track = new_max;
+        }
+        if let Some(r) = self.selected_clip
+            && r.track == removed_idx
+        {
+            self.selected_clip = None;
+            self.selected_notes.clear();
+        }
+        self.refresh_inspector_chain();
+        self.rebuild_track_mix();
+        self.sync_song_to_plugin_host();
+    }
+
+    // -------- Clip operations ----------------------------------------------
+
+    fn select_clip(&mut self, target: Option<ClipRef>) {
+        self.selected_clip = target;
+        self.selected_notes.clear();
+        if let Some(r) = target {
+            self.select_track(r.track);
+        }
+    }
+
+    fn move_clip(&mut self, target: ClipRef, new_start_beat: f64) {
+        let new_start_beat = new_start_beat.max(0.0);
+        let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(target.clip as usize) else {
+            return;
+        };
+        clip.start_beat = new_start_beat;
+        self.sync_song_to_plugin_host();
+    }
+
+    fn resize_clip(&mut self, target: ClipRef, new_length_beats: f64) {
+        // Don't shrink to zero — Bitwig keeps a minimum of one bar; we use
+        // 1/16 as a softer floor so VOICEVOX clips can be tight.
+        let new_length_beats = new_length_beats.max(0.0625);
+        let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(target.clip as usize) else {
+            return;
+        };
+        clip.length_beats = new_length_beats;
+        self.sync_song_to_plugin_host();
+    }
+
+    fn create_clip(&mut self, track_idx: u32, start_beat: f64) {
+        let start_beat = start_beat.max(0.0);
+        let Some(track) = self.song.tracks.get_mut(track_idx as usize) else {
+            return;
+        };
+        let new_clip = Clip {
+            name: format!("Clip {}", track.clips.len() + 1),
+            start_beat,
+            length_beats: DEFAULT_CLIP_LENGTH,
+            notes: Vec::new(),
+        };
+        let new_idx = track.clips.len() as u32;
+        track.clips.push(new_clip);
+        self.selected_clip = Some(ClipRef {
+            track: track_idx,
+            clip: new_idx,
+        });
+        self.selected_notes.clear();
+        self.select_track(track_idx);
+        self.sync_song_to_plugin_host();
+    }
+
+    fn delete_selected_clip(&mut self) {
+        let Some(r) = self.selected_clip.take() else {
+            return;
+        };
+        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
+            return;
+        };
+        if (r.clip as usize) < track.clips.len() {
+            track.clips.remove(r.clip as usize);
+        }
+        self.selected_notes.clear();
+        self.sync_song_to_plugin_host();
+    }
+
+    // -------- Note operations ----------------------------------------------
+
+    fn select_note(&mut self, note: u32, additive: bool) {
+        if !additive {
+            self.selected_notes.clear();
+        }
+        if !self.selected_notes.contains(&note) {
+            self.selected_notes.push(note);
+        }
+    }
+
+    fn add_note(
+        &mut self,
+        track_idx: u32,
+        clip_idx: u32,
+        start_beat: f64,
+        duration: f64,
+        pitch: u8,
+    ) {
+        let start_beat = start_beat.max(0.0);
+        let duration = duration.max(0.0625);
+        let Some(track) = self.song.tracks.get_mut(track_idx as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(clip_idx as usize) else {
+            return;
+        };
+        let new_idx = clip.notes.len() as u32;
+        clip.notes.push(Note {
+            start_beat,
+            duration_beats: duration,
+            pitch,
+            velocity: 100,
+            lyric: None,
+        });
+        self.selected_clip = Some(ClipRef {
+            track: track_idx,
+            clip: clip_idx,
+        });
+        self.selected_notes = vec![new_idx];
+        self.sync_song_to_plugin_host();
+    }
+
+    fn move_note(
+        &mut self,
+        track_idx: u32,
+        clip_idx: u32,
+        note_idx: u32,
+        new_start_beat: f64,
+        new_pitch: u8,
+    ) {
+        let new_start_beat = new_start_beat.max(0.0);
+        let Some(track) = self.song.tracks.get_mut(track_idx as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(clip_idx as usize) else {
+            return;
+        };
+        let Some(note) = clip.notes.get_mut(note_idx as usize) else {
+            return;
+        };
+        note.start_beat = new_start_beat;
+        note.pitch = new_pitch;
+        self.sync_song_to_plugin_host();
+    }
+
+    fn resize_note(
+        &mut self,
+        track_idx: u32,
+        clip_idx: u32,
+        note_idx: u32,
+        new_duration: f64,
+    ) {
+        let new_duration = new_duration.max(0.0625);
+        let Some(track) = self.song.tracks.get_mut(track_idx as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(clip_idx as usize) else {
+            return;
+        };
+        let Some(note) = clip.notes.get_mut(note_idx as usize) else {
+            return;
+        };
+        note.duration_beats = new_duration;
+        self.sync_song_to_plugin_host();
+    }
+
+    fn delete_selected_notes(&mut self) {
+        let Some(r) = self.selected_clip else { return };
+        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(r.clip as usize) else {
+            return;
+        };
+        // Sort indices descending so each removal stays valid.
+        let mut indices = self.selected_notes.clone();
+        indices.sort_unstable_by(|a, b| b.cmp(a));
+        for i in indices {
+            let i = i as usize;
+            if i < clip.notes.len() {
+                clip.notes.remove(i);
+            }
+        }
+        self.selected_notes.clear();
+        self.sync_song_to_plugin_host();
+    }
+
+    fn set_selected_note_lyric(&mut self, lyric: String) {
+        let Some(r) = self.selected_clip else { return };
+        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(r.clip as usize) else {
+            return;
+        };
+        let trimmed = lyric.trim();
+        let value = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+        for &i in &self.selected_notes {
+            if let Some(n) = clip.notes.get_mut(i as usize) {
+                n.lyric = value.clone();
+            }
+        }
+        self.sync_song_to_plugin_host();
+    }
+
+    // -------- Plugin GUI bridge --------------------------------------------
+
     #[cfg(windows)]
     fn on_gui_opened(&mut self, track: u32, slot: PluginSlot, width: u32, height: u32) {
-        tracing::info!(track, ?slot, width, height, "plugin GUI opened");
         if let Some(win) = self.plugin_host_windows.get(&(track, slot)) {
             win.set_client_size(width, height);
         }
@@ -885,12 +1315,14 @@ impl AppData {
     #[cfg(not(windows))]
     fn on_gui_opened(&mut self, _track: u32, _slot: PluginSlot, _width: u32, _height: u32) {}
 
-    /// Handler for `ChildToMain::SlotGuiRequestResize`: plugin asked to
-    /// resize. Update our container first, then echo `ResizeSlotGui` back
-    /// so the plugin-main thread runs `gui.set_size(w, h)`.
     #[cfg(windows)]
-    fn on_gui_request_resize(&mut self, track: u32, slot: PluginSlot, width: u32, height: u32) {
-        tracing::info!(track, ?slot, width, height, "plugin requested GUI resize");
+    fn on_gui_request_resize(
+        &mut self,
+        track: u32,
+        slot: PluginSlot,
+        width: u32,
+        height: u32,
+    ) {
         if let Some(win) = self.plugin_host_windows.get(&(track, slot)) {
             win.set_client_size(width, height);
         }
@@ -912,20 +1344,14 @@ impl AppData {
     ) {
     }
 
-    /// Handler for `ChildToMain::SlotGuiClosed`: plugin confirms tear-down,
-    /// drop our container so Drop destroys the HWND.
     #[cfg(windows)]
     fn on_gui_closed(&mut self, track: u32, slot: PluginSlot) {
-        tracing::info!(track, ?slot, "plugin GUI closed (from child)");
         self.plugin_host_windows.remove(&(track, slot));
     }
 
     #[cfg(not(windows))]
     fn on_gui_closed(&mut self, _track: u32, _slot: PluginSlot) {}
 
-    /// plugin_host reported that a `SetSlotPlugin` succeeded. Updates the
-    /// (track, slot) target with the actual id/name reported by the host so
-    /// the model and Inspector reflect what is really loaded.
     fn on_plugin_loaded_from_child(
         &mut self,
         track: u32,
@@ -933,19 +1359,14 @@ impl AppData {
         id: String,
         name: String,
     ) {
-        tracing::info!(track, ?slot, %id, %name, "plugin_host confirmed plugin loaded");
         let label = if name.is_empty() { id.clone() } else { name };
         let track_idx = track as usize;
         self.ensure_first_track();
         let Some(t) = self.song.tracks.get_mut(track_idx) else {
-            tracing::warn!(track, "plugin loaded for missing track");
             return;
         };
         match slot {
             PluginSlot::Instrument => {
-                // Preserve any state that was attached optimistically; the
-                // load itself may have come with `initial_state`. Format is
-                // also carried over from the optimistic entry.
                 let (state, format) = t
                     .instrument
                     .as_ref()
@@ -956,7 +1377,7 @@ impl AppData {
                     format,
                     state,
                 });
-                if track == self.cursor_track {
+                if track == self.selected_track {
                     self.instrument_label = label;
                 }
             }
@@ -997,25 +1418,18 @@ impl AppData {
                 }
             }
         }
-        // Refresh the Inspector only when the loaded slot belongs to the
-        // track the user is currently viewing.
-        if track == self.cursor_track {
+        if track == self.selected_track {
             self.refresh_inspector_chain();
         }
     }
 
-    /// Opens or closes the GUI for the given chain slot. Open state lives in
-    /// `plugin_host_windows`: presence = open, absence = closed. Multiple
-    /// slots can be open at once, each with its own top-level container.
     fn toggle_slot_gui(&mut self, slot_kind: u8, slot_index: u32) {
         let slot = match slot_kind {
             0 => PluginSlot::MidiFx(slot_index),
             1 => PluginSlot::Instrument,
             _ => PluginSlot::Fx(slot_index),
         };
-        // The Inspector operates on the selected track. Match plugin_host's
-        // addressing by sending the same `cursor_track` through IPC.
-        let track = self.cursor_track;
+        let track = self.selected_track;
         #[cfg(windows)]
         {
             if self.plugin_host_windows.contains_key(&(track, slot)) {
@@ -1064,17 +1478,13 @@ impl AppData {
         Some(self.resolve_name(id))
     }
 
-    /// Remove the plugin at the given chain slot on the currently selected
-    /// track. Sends `RemoveSlotPlugin` to the host and mirrors the change in
-    /// the model so the Inspector refreshes immediately.
     fn remove_slot(&mut self, slot_kind: u8, slot_index: u32) {
         let slot = match slot_kind {
             0 => PluginSlot::MidiFx(slot_index),
             1 => PluginSlot::Instrument,
             _ => PluginSlot::Fx(slot_index),
         };
-        let track_idx = self.cursor_track;
-        tracing::info!(track = track_idx, ?slot, "removing plugin slot");
+        let track_idx = self.selected_track;
         self.send_plugin(MainToChild::RemoveSlotPlugin { track: track_idx, slot });
         if let Some(track) = self.song.tracks.get_mut(track_idx as usize) {
             match slot {
@@ -1099,52 +1509,32 @@ impl AppData {
         self.refresh_inspector_chain();
     }
 
-    /// `ChildToMain::AllPluginStates` reply. Each entry is dispatched to its
-    /// own (track, slot) inside the model before the project file is written.
-    /// Unsolicited replies (no pending save) are ignored silently.
     fn on_all_states_from_child(&mut self, states: Vec<SlotState>) {
-        tracing::info!(
-            count = states.len(),
-            pending = self.pending_save_path.is_some(),
-            "all plugin states reply received"
-        );
         let Some(path) = self.pending_save_path.take() else {
             return;
         };
         self.finish_save(path, states);
     }
 
-    /// Process a periodic UI tick that carries the latest `playhead_samples`
-    /// and raw L/R peak amplitudes published to shmem by daw_audio and
-    /// daw_plugin_host.
-    ///
-    /// Updates:
-    /// - `playhead_row`: tracker-row highlight (None when not playing).
-    /// - `peak_{l,r}_display`: fast-attack / exponential-release peak tracker.
-    /// - `peak_{l,r}_norm`: dB-space normalized fill for the meter bar.
-    ///
-    /// `playhead_samples == u64::MAX` is the sentinel meaning "not playing".
+    // -------- Tick / metering ----------------------------------------------
+
     fn on_tick(&mut self, playhead_samples: u64, peak_l_raw: f32, peak_r_raw: f32) {
-        // --- Playhead row highlight --------------------------------------
-        let next_row = if playhead_samples == u64::MAX {
+        // Playhead in beats for the arrangement view's red line.
+        let next_beat = if playhead_samples == u64::MAX {
             None
         } else {
-            common::timing::playhead_to_row(
+            common::timing::playhead_to_beat(
                 Some(&self.song),
-                self.cursor_track,
                 common::audio_bridge::SAMPLE_RATE,
                 playhead_samples,
             )
+            .map(|b| b as f32)
         };
-        if next_row != self.playhead_row {
-            self.playhead_row = next_row;
+        if next_beat != self.playhead_beat {
+            self.playhead_beat = next_beat;
         }
 
-        // --- Plugin GUI ✕-button bridge ----------------------------------
-        // Runs on the Vizia main thread so it can safely send IPC. Converts
-        // the async WNDPROC signal into our synchronous close flow. Each
-        // container polls independently so multi-GUI sessions close the
-        // right editor.
+        // ✕-button bridge for embedded plugin windows.
         #[cfg(windows)]
         {
             let mut to_close: Vec<(u32, PluginSlot)> = Vec::new();
@@ -1154,13 +1544,12 @@ impl AppData {
                 }
             }
             for (track, slot) in to_close {
-                tracing::info!(track, ?slot, "plugin host window ✕ clicked; forwarding to CloseSlotGui");
                 self.send_plugin(MainToChild::CloseSlotGui { track, slot });
             }
         }
 
-        // --- Peak meter --------------------------------------------------
-        // At 30 Hz, 0.85 per-tick decay ≈ -24 dB/s release (fairly standard).
+        // Peak meter — fast attack, exponential release. 0.85/tick at 30 Hz
+        // is roughly -24 dB/s.
         const RELEASE: f32 = 0.85;
         self.peak_l_display =
             common::meter::update_peak(self.peak_l_display, peak_l_raw, RELEASE);
@@ -1174,28 +1563,22 @@ impl AppData {
         ));
     }
 
-    /// Applies a master-gain change from the slider: clamp to [0,1], update
-    /// local state, and forward to daw_audio over the control pipe.
     fn set_master_gain(&mut self, gain: f32) {
         let clamped = gain.clamp(0.0, 1.0);
         self.master_gain = clamped;
         self.send_audio(MainToChild::SetMasterGain(clamped));
     }
 
-    /// User picked a plugin from the DB-backed picker overlay. Resolves the
-    /// path from the database and adds the plugin to the currently selected
-    /// track's chain (no state to restore: this is an explicit "new plugin"
-    /// flow).
+    // -------- Plugin picker -----------------------------------------------
+
     fn select_plugin_from_db(&mut self, id: String) {
         self.is_plugin_picker_open = false;
-        // Pull everything we need out of the DB before starting mutations
-        // (self.plugin_db is an Arc, so we work with a cloned snapshot).
         let Some(db) = self.plugin_db.clone() else {
             tracing::warn!(id, "plugin_db not available");
             return;
         };
         let Some(entry) = db.find_by_id(&id) else {
-            tracing::error!(id, "picked plugin id not in database (stale picker?)");
+            tracing::error!(id, "picked plugin id not in database");
             return;
         };
         let path = entry.path.clone();
@@ -1203,10 +1586,7 @@ impl AppData {
         let entry_id = entry.id.clone();
         let entry_format = entry.format;
         self.ensure_first_track();
-        let track_idx = self.cursor_track;
-        // Pick the destination slot based on what the user was adding,
-        // using the selected track's current chain lengths for FX / MIDI FX
-        // append positions.
+        let track_idx = self.selected_track;
         let target = self.plugin_picker_target;
         let dest_slot = match target {
             PickerTarget::Instrument => PluginSlot::Instrument,
@@ -1229,13 +1609,6 @@ impl AppData {
                 PluginSlot::MidiFx(next)
             }
         };
-        tracing::info!(
-            track = track_idx,
-            id = %entry_id,
-            ?dest_slot,
-            path = %path.display(),
-            "user picked plugin"
-        );
         self.send_plugin(MainToChild::SetSlotPlugin {
             track: track_idx,
             slot: dest_slot,
@@ -1244,8 +1617,6 @@ impl AppData {
             plugin_id: entry_id.clone(),
             initial_state: None,
         });
-        // Update song model optimistically; the final id/name lands via the
-        // `SlotPluginLoaded` callback from plugin_host.
         if let Some(track) = self.song.tracks.get_mut(track_idx as usize) {
             match dest_slot {
                 PluginSlot::Instrument => {
@@ -1274,21 +1645,17 @@ impl AppData {
         self.refresh_inspector_chain();
     }
 
-    /// Rebuild `inspector_chain`, `selected_track_label`, and
-    /// `instrument_label` from the track at `cursor_track`. Called after any
-    /// chain mutation on that track, or when the cursor moves to a
-    /// different track.
     fn refresh_inspector_chain(&mut self) {
         let mut out: Vec<ChainEntry> = Vec::new();
-        let track_idx = self.cursor_track as usize;
+        let track_idx = self.selected_track as usize;
         let Some(track) = self.song.tracks.get(track_idx) else {
             self.inspector_chain = out;
-            self.selected_track_label = format!("Track {}", self.cursor_track + 1);
+            self.selected_track_label = format!("Track {}", self.selected_track + 1);
             self.instrument_label = "(no instrument)".into();
             return;
         };
         self.selected_track_label = if track.name.is_empty() {
-            format!("Track {}", self.cursor_track + 1)
+            format!("Track {}", self.selected_track + 1)
         } else {
             track.name.clone()
         };
@@ -1323,70 +1690,17 @@ impl AppData {
         self.inspector_chain = out;
     }
 
-    fn action_export_wav(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("WAV", &["wav"])
-            .save_file()
-        else {
-            return;
-        };
-        self.status_message = "WAV 書き出し中...".to_string();
-        // Send the song + path to plugin_host for offline render.
-        self.send_plugin(MainToChild::LoadSong(self.song.clone()));
-        self.send_plugin(MainToChild::ExportWav { path });
-    }
+    // -------- VOICEVOX -----------------------------------------------------
 
-    /// Open the lyric editor for the current cursor row, pre-filling
-    /// the textbox with any existing lyric.
-    fn start_lyric_edit(&mut self) {
-        let track_idx = self.cursor_track as usize;
-        let row_idx = self.cursor_row as usize;
-        let existing = self
-            .song
-            .tracks
-            .get(track_idx)
-            .and_then(|t| t.clips.first())
-            .and_then(|c| c.rows.get(row_idx))
-            .and_then(|r| r.lyric.clone())
-            .unwrap_or_default();
-        self.lyric_edit_text = existing;
-        self.lyric_editing = true;
-    }
-
-    /// Commit the lyric editor text to the current row, advance the
-    /// cursor, and keep editing (Enter = next row).
-    fn submit_lyric_edit(&mut self) {
-        let track_idx = self.cursor_track as usize;
-        let row_idx = self.cursor_row as usize;
-        if let Some(track) = self.song.tracks.get_mut(track_idx)
-            && let Some(clip) = track.clips.first_mut()
-        {
-            while clip.rows.len() <= row_idx {
-                clip.rows.push(Row::default());
-            }
-            let text = self.lyric_edit_text.trim().to_string();
-            clip.rows[row_idx].lyric = if text.is_empty() { None } else { Some(text) };
-        }
-        // Refresh tracker display so the lyric appears immediately.
-        self.refresh_tracker_text();
-        // Advance cursor and keep editing the next row.
-        self.move_cursor_row(1);
-        self.start_lyric_edit();
-    }
-
-    /// Synthesize all vocal tracks in the background. Results are
-    /// delivered via `VocalSynthCompleted` → `finish_vocal_synth`.
     fn begin_vocal_synth(&self, cx: &mut EventContext) {
         let song = self.song.clone();
         let slot = Arc::clone(&self.synth_result);
         cx.spawn(move |proxy| {
-            tracing::info!("VOICEVOX synthesis starting");
             let results = common::voicevox::synthesize_song(
-            &song,
-            common::voicevox::DEFAULT_SINGER_ID,
-            common::voicevox::DEFAULT_SINGER_ID,
-        );
-            tracing::info!(count = results.len(), "VOICEVOX synthesis finished");
+                &song,
+                common::voicevox::DEFAULT_SINGER_ID,
+                common::voicevox::DEFAULT_SINGER_ID,
+            );
             if let Ok(mut guard) = slot.lock() {
                 *guard = results;
             }
@@ -1394,8 +1708,6 @@ impl AppData {
         });
     }
 
-    /// Take synthesis results and forward the rendered audio to
-    /// plugin_host via IPC so the audio thread can mix it in.
     fn finish_vocal_synth(&mut self) {
         let results: Vec<common::voicevox::SynthResult> = self
             .synth_result
@@ -1405,28 +1717,25 @@ impl AppData {
             .unwrap_or_default();
 
         if results.is_empty() {
-            tracing::warn!("vocal synth produced no results");
-            // Pull last error from the synth result slot (errors are
-            // appended as empty-samples entries with an error field).
             let errors: Vec<String> = self
                 .synth_result
                 .lock()
                 .ok()
                 .map(|g| g.iter().filter_map(|r| r.error.clone()).collect())
                 .unwrap_or_default();
-            if errors.is_empty() {
-                self.status_message =
-                    "合成結果なし（Vocal トラックがないか VOICEVOX が応答しません）".to_string();
+            self.status_message = if errors.is_empty() {
+                "合成結果なし（Vocal トラックがないか VOICEVOX が応答しません）".to_string()
             } else {
-                self.status_message = format!("合成エラー: {}", errors.join("; "));
-            }
+                format!("合成エラー: {}", errors.join("; "))
+            };
             return;
         }
 
         let ok_results: Vec<_> = results.iter().filter(|r| r.error.is_none()).collect();
         let err_count = results.len() - ok_results.len();
         if err_count > 0 {
-            let first_err = results.iter().find_map(|r| r.error.as_deref()).unwrap_or("不明");
+            let first_err =
+                results.iter().find_map(|r| r.error.as_deref()).unwrap_or("不明");
             self.status_message = format!(
                 "合成: {} 成功, {} 失敗 ({})",
                 ok_results.len(),
@@ -1434,13 +1743,11 @@ impl AppData {
                 first_err
             );
         } else {
-            self.status_message = format!("合成完了 — {} クリップ。Play で再生", ok_results.len());
+            self.status_message =
+                format!("合成完了 — {} クリップ。Play で再生", ok_results.len());
         }
 
         for r in &ok_results {
-            // Compute the absolute sample offset for the clip's start
-            // beat. This is where the audio thread should begin playing
-            // the rendered buffer.
             let clip_start_beat = self
                 .song
                 .tracks
@@ -1452,13 +1759,6 @@ impl AppData {
                 common::audio_bridge::SAMPLE_RATE as f64 * 60.0 / self.song.bpm as f64;
             let clip_start_samples = (clip_start_beat * samples_per_beat).max(0.0) as u64;
 
-            tracing::info!(
-                track = r.track,
-                clip = r.clip,
-                len = r.samples.len(),
-                clip_start_samples,
-                "sending vocal audio to plugin_host"
-            );
             self.send_plugin(MainToChild::SetVocalAudio {
                 track: r.track,
                 clip: r.clip,
@@ -1469,66 +1769,50 @@ impl AppData {
         }
     }
 
-    /// Kick off a background plugin rescan. Safe to call twice — if a
-    /// scan is already running, the second request is ignored so the
-    /// worker stays single-threaded (no race on `rescan_result`).
+    // -------- Plugin DB rescan --------------------------------------------
+
     fn begin_rescan(&mut self, cx: &mut EventContext) {
         if self.is_rescanning {
-            tracing::info!("plugin rescan already in flight; ignoring");
             return;
         }
         self.is_rescanning = true;
         let slot = Arc::clone(&self.rescan_result);
-        cx.spawn(move |proxy| {
-            tracing::info!("plugin_db rescan starting");
-            match common::plugin_db::scan_system() {
-                Ok(db) => {
-                    tracing::info!(
-                        count = db.entries.len(),
-                        "plugin_db rescan completed"
+        cx.spawn(move |proxy| match common::plugin_db::scan_system() {
+            Ok(db) => {
+                if let Some(cache) = common::plugin_db::default_cache_path()
+                    && let Err(e) = db.save_to_file(&cache)
+                {
+                    tracing::warn!(
+                        error = ?e,
+                        path = %cache.display(),
+                        "failed to persist rescanned plugin_db"
                     );
-                    if let Some(cache) = common::plugin_db::default_cache_path()
-                        && let Err(e) = db.save_to_file(&cache)
-                    {
-                        tracing::warn!(
-                            error = ?e,
-                            path = %cache.display(),
-                            "failed to persist rescanned plugin_db"
-                        );
-                    }
-                    if let Ok(mut guard) = slot.lock() {
-                        *guard = Some(db);
-                    }
-                    let _ = proxy.emit(AppEvent::PluginDbRescanCompleted);
                 }
-                Err(e) => {
-                    tracing::error!(error = ?e, "plugin rescan failed");
-                    // Still post completion so the UI clears its
-                    // "rescanning" state; the result slot stays empty, so
-                    // `finish_rescan` treats it as a no-op.
-                    let _ = proxy.emit(AppEvent::PluginDbRescanCompleted);
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Some(db);
                 }
+                let _ = proxy.emit(AppEvent::PluginDbRescanCompleted);
+            }
+            Err(e) => {
+                tracing::error!(error = ?e, "plugin rescan failed");
+                let _ = proxy.emit(AppEvent::PluginDbRescanCompleted);
             }
         });
     }
 
-    /// Pull the freshly-scanned database out of `rescan_result` and swap
-    /// it in. Called from the UI thread via `PluginDbRescanCompleted`.
     fn finish_rescan(&mut self) {
         self.is_rescanning = false;
         let Some(new_db) = self.rescan_result.lock().ok().and_then(|mut g| g.take()) else {
             return;
         };
         let new_db = Arc::new(new_db);
-        tracing::info!(count = new_db.entries.len(), "applied rescanned plugin_db");
         self.plugin_db = Some(new_db);
         self.rebuild_picker_entries();
         self.refresh_picker_visible();
     }
 
-    /// Apply a volume fader change. Updates the model, the lens-visible
-    /// mixer row, and forwards to plugin_host so the audio thread picks
-    /// up the new value on its next buffer.
+    // -------- Mixer --------------------------------------------------------
+
     fn set_track_volume(&mut self, track: u32, volume: f32) {
         let v = volume.clamp(0.0, 1.0);
         if let Some(t) = self.song.tracks.get_mut(track as usize) {
@@ -1575,9 +1859,6 @@ impl AppData {
         self.send_plugin(MainToChild::SetTrackSolo { track, solo });
     }
 
-    /// Per-tick post-fader peak integration. Runs the same
-    /// fast-attack/slow-release curve the master meter uses, then maps
-    /// linear → dB → 0..1 for the lens-visible entries.
     fn on_track_peaks_tick(&mut self, peaks: &[(u32, u32)]) {
         const RELEASE: f32 = 0.85;
         let n = self.song.tracks.len();
@@ -1591,10 +1872,6 @@ impl AppData {
             display.0 = common::meter::update_peak(display.0, l, RELEASE);
             display.1 = common::meter::update_peak(display.1, r, RELEASE);
         }
-        // Iterate by index to avoid overlapping borrows. We route through
-        // `as_slice()` so `get(usize)` picks the `[T]` inherent method
-        // rather than the blanket `vizia::Res::get(&impl DataContext)`
-        // Vizia adds to any `Vec<T>` in scope.
         let display = self.track_peak_display.as_slice();
         let updates: Vec<(usize, f32, f32)> = (0..self.track_mix.len())
             .map(|i| {
@@ -1604,20 +1881,14 @@ impl AppData {
             .collect();
         for (i, l, r) in updates {
             if let Some(entry) = self.track_mix.get_mut(i) {
-                entry.peak_l_norm = common::meter::db_to_norm(common::meter::linear_to_db(l));
-                entry.peak_r_norm = common::meter::db_to_norm(common::meter::linear_to_db(r));
+                entry.peak_l_norm =
+                    common::meter::db_to_norm(common::meter::linear_to_db(l));
+                entry.peak_r_norm =
+                    common::meter::db_to_norm(common::meter::linear_to_db(r));
             }
         }
-        // Rebuild the visible-window slice so the Lens-bound meter bars
-        // pick up the fresh peaks. Vizia diffs per-field, so unchanged
-        // entries (name/volume/pan/etc.) won't trigger redraws.
-        self.refresh_visible_track_mix();
     }
 
-    /// Rebuild `track_mix` from `song.tracks`. Call whenever the number or
-    /// order of tracks (or any of their mixer fields via undo/LoadSong)
-    /// changes. Peak fields start at zero and are refreshed by the next
-    /// tick.
     fn rebuild_track_mix(&mut self) {
         self.track_mix = self
             .song
@@ -1641,11 +1912,8 @@ impl AppData {
             .collect();
         self.track_peak_display
             .resize(self.song.tracks.len(), (0.0, 0.0));
-        self.refresh_visible_track_mix();
     }
 
-    /// Rebuild the flat `plugin_picker_entries` list from `plugin_db`.
-    /// Called after a rescan to keep the picker in sync with the new DB.
     fn rebuild_picker_entries(&mut self) {
         let Some(db) = self.plugin_db.as_ref() else {
             self.plugin_picker_entries.clear();
@@ -1670,8 +1938,6 @@ impl AppData {
         self.plugin_picker_entries = v;
     }
 
-    /// Rebuild `plugin_picker_visible` from `plugin_picker_entries` using
-    /// the current `plugin_picker_target` feature as the filter key.
     fn refresh_picker_visible(&mut self) {
         let feature_key: &str = match self.plugin_picker_target {
             PickerTarget::Instrument => "instrument",
@@ -1690,199 +1956,33 @@ impl AppData {
         self.plugin_db
             .as_deref()
             .and_then(|db| db.find_by_id(plugin_id))
-            .map(|e| if e.name.is_empty() { plugin_id.to_string() } else { e.name.clone() })
+            .map(|e| {
+                if e.name.is_empty() {
+                    plugin_id.to_string()
+                } else {
+                    e.name.clone()
+                }
+            })
             .unwrap_or_else(|| plugin_id.to_string())
     }
 
-    fn ensure_first_track(&mut self) {
-        if self.song.tracks.is_empty() {
-            self.song.tracks.push(Track {
-                name: "Track 1".into(),
-                clips: vec![demo_clip()],
-                ..Track::default()
-            });
-            self.rebuild_track_mix();
-        }
-    }
-
-    fn action_add_vocal_track(&mut self) {
-        let index = self.song.tracks.len() + 1;
-        let track = Track {
-            name: format!("Track {index}"),
-            source: InstrumentSource::Vocal {
-                speaker_id: common::voicevox::DEFAULT_SINGER_ID,
-                style_name: "ノーマル".into(),
-            },
-            clips: vec![demo_clip()],
-            ..Track::default()
-        };
-        self.song.tracks.push(track);
-        self.rebuild_track_mix();
-        tracing::info!(index, "added vocal track");
-    }
-
-    fn action_remove_last_track(&mut self) {
-        if self.song.tracks.is_empty() {
+    fn action_export_wav(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("WAV", &["wav"])
+            .save_file()
+        else {
             return;
-        }
-        let removed_idx = (self.song.tracks.len() - 1) as u32;
-        if let Some(track) = self.song.tracks.pop() {
-            tracing::info!(
-                index = removed_idx,
-                name = %track.name,
-                "removed last track"
-            );
-        }
-        // Close any plugin editor windows that belong to this track before
-        // the host tears down its chain — Drop on PluginHostWindow destroys
-        // the HWND.
-        #[cfg(windows)]
-        {
-            self.plugin_host_windows
-                .retain(|&(t, _), _| t != removed_idx);
-        }
-        // Notify plugin_host so it drops the whole chain; otherwise its
-        // audio thread keeps rendering the removed track.
-        self.send_plugin(MainToChild::RemoveTrack { track: removed_idx });
-        self.clamp_cursor();
-        self.refresh_inspector_chain();
-        self.rebuild_track_mix();
-    }
-
-    fn move_cursor_track(&mut self, delta: i32) {
-        let max = self.song.tracks.len().saturating_sub(1) as i64;
-        let next = (self.cursor_track as i64 + delta as i64).clamp(0, max.max(0));
-        if next as u32 != self.cursor_track {
-            self.cursor_track = next as u32;
-            self.ensure_cursor_visible();
-            // Selected-track change → Inspector must show the new track's
-            // chain and labels.
-            self.refresh_inspector_chain();
-        }
-    }
-
-    /// Adjust `visible_track_start` so `cursor_track` is within the
-    /// visible window. Called after every cursor-track change.
-    fn ensure_cursor_visible(&mut self) {
-        let ct = self.cursor_track;
-        let count = self.visible_track_count;
-        if ct < self.visible_track_start {
-            self.visible_track_start = ct;
-        } else if ct >= self.visible_track_start + count {
-            self.visible_track_start = ct - count + 1;
-        }
-        self.mixer_visible_range = (
-            self.visible_track_start,
-            self.visible_track_start + count,
-        );
-    }
-
-    fn move_cursor_row(&mut self, delta: i32) {
-        let max = self
-            .song
-            .tracks
-            .get(self.cursor_track as usize)
-            .and_then(|t| t.clips.first())
-            .map(|c| c.rows.len().saturating_sub(1))
-            .unwrap_or(0) as i64;
-        let next = (self.cursor_row as i64 + delta as i64).clamp(0, max.max(0));
-        self.cursor_row = next as u32;
-    }
-
-    fn play(&mut self) {
+        };
+        self.status_message = "WAV 書き出し中...".to_string();
         self.send_plugin(MainToChild::LoadSong(self.song.clone()));
-        self.send_audio(MainToChild::Play);
-        self.send_plugin(MainToChild::Play);
-        self.is_playing = true;
-    }
-
-    fn stop(&mut self) {
-        self.send_audio(MainToChild::Stop);
-        self.send_plugin(MainToChild::Stop);
-        self.is_playing = false;
-    }
-
-    fn edit_cell<F: FnOnce(&mut Row)>(&mut self, f: F) {
-        let Some(track) = self.song.tracks.get_mut(self.cursor_track as usize) else {
-            tracing::warn!("no track at cursor");
-            return;
-        };
-        let Some(clip) = track.clips.first_mut() else {
-            tracing::warn!("no clip on track");
-            return;
-        };
-        while clip.rows.len() <= self.cursor_row as usize {
-            clip.rows.push(Row::default());
-        }
-        f(&mut clip.rows[self.cursor_row as usize]);
-    }
-
-    /// sing_like_coding 流: 空セルなら last_note をそのまま配置、既存 NoteOn なら
-    /// key に delta を加算して last_note を更新。NoteOff には効果なし。
-    fn apply_transpose(&mut self, delta: i16) {
-        let last_note = self.last_note;
-        let mut updated_note: Option<Note> = None;
-        self.edit_cell(|row| match &row.note {
-            None | Some(NoteEvent::Off) => {
-                // Empty cell or Off row: place last_note as-is (overwrites Off).
-                row.note = Some(NoteEvent::On(last_note));
-            }
-            Some(NoteEvent::On(n)) => {
-                let new_key = (i16::from(n.key) + delta).clamp(0, 127) as u8;
-                let new_note = Note {
-                    key: new_key,
-                    velocity: n.velocity,
-                };
-                row.note = Some(NoteEvent::On(new_note));
-                updated_note = Some(new_note);
-            }
-        });
-        if let Some(n) = updated_note {
-            self.last_note = n;
-        }
-    }
-
-    fn clamp_cursor(&mut self) {
-        let track_max = self.song.tracks.len().saturating_sub(1) as u32;
-        self.cursor_track = self.cursor_track.min(track_max);
-        let row_max = self
-            .song
-            .tracks
-            .get(self.cursor_track as usize)
-            .and_then(|t| t.clips.first())
-            .map(|c| c.rows.len().saturating_sub(1))
-            .unwrap_or(0) as u32;
-        self.cursor_row = self.cursor_row.min(row_max);
-    }
-
-    fn save_to(&self, path: &Path) -> bool {
-        match common::project::save(path, &self.song) {
-            Ok(()) => {
-                tracing::info!(path = %path.display(), "saved project");
-                true
-            }
-            Err(e) => {
-                tracing::error!(error = ?e, path = %path.display(), "failed to save project");
-                false
-            }
-        }
+        self.send_plugin(MainToChild::ExportWav { path });
     }
 }
 
-#[allow(dead_code)]
-fn plugin_label(path: Option<&Path>) -> String {
-    match path {
-        Some(p) => p
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| p.display().to_string()),
-        None => "(no plugin)".into(),
-    }
-}
+// ---------------------------------------------------------------------------
+// Free standing helpers
+// ---------------------------------------------------------------------------
 
-/// Freestanding variant of `AppData::rebuild_track_mix` usable from
-/// `AppData::new` before `self` exists. Populates the lens-visible mixer
-/// rows from a `Song` with zeroed peak meters.
 fn initial_track_mix(song: &Song) -> Vec<TrackMixEntry> {
     song.tracks
         .iter()
@@ -1912,39 +2012,24 @@ fn plugin_label_from_entry(entry: &common::plugin_db::PluginEntry) -> String {
     }
 }
 
+/// Demo clip preset used by `Add Vocal Track`. Five-note "こんにちは" line
+/// at quarter-note spacing in the C major scale.
 fn demo_clip() -> Clip {
-    let note = |key, lyric: &str| Row {
-        note: Some(NoteEvent::On(Note {
-            key,
+    let lyrics = ["こ", "ん", "に", "ち", "わ"];
+    let pitches = [60u8, 62, 64, 65, 67];
+    let notes = (0..5)
+        .map(|i| Note {
+            start_beat: i as f64 * 0.5,
+            duration_beats: 0.5,
+            pitch: pitches[i],
             velocity: 100,
-        })),
-        lyric: Some(lyric.into()),
-        ..Default::default()
-    };
-    let mut rows = vec![
-        note(60, "こ"),
-        Row::default(),
-        note(62, "ん"),
-        Row::default(),
-        note(64, "に"),
-        Row::default(),
-        note(65, "ち"),
-        Row::default(),
-        note(67, "わ"),
-        Row::default(),
-        Row {
-            note: Some(NoteEvent::Off),
-            ..Default::default()
-        },
-    ];
-    while rows.len() < 16 {
-        rows.push(Row::default());
-    }
+            lyric: Some(lyrics[i].into()),
+        })
+        .collect();
     Clip {
         name: "こんにちわ".into(),
         start_beat: 0.0,
         length_beats: 4.0,
-        rows_per_beat: 4,
-        rows,
+        notes,
     }
 }

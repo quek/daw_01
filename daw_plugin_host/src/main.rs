@@ -16,7 +16,7 @@ use std::thread::JoinHandle;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwapOption;
 use common::audio_bridge::{AudioBridgeHandle, CHANNELS};
-use common::model::{NoteEvent, Song};
+use common::model::Song;
 use common::plugin_format::PluginFormat;
 use common::protocol::{AudioSession, ChildKind, ChildToMain, MainToChild, PluginSlot, SlotState};
 use common::timing::{song_bounds_samples, song_ended};
@@ -1758,6 +1758,15 @@ fn run_audio(
     tracing::info!("audio thread exiting");
 }
 
+/// Walk every clip on `track` and emit `NoteOn` / `NoteOff` events that fall
+/// inside the half-open buffer `[playhead, playhead + frames)`. Notes are
+/// free-time: each `Note` carries `start_beat` and `duration_beats` relative
+/// to its containing clip, so the same note may straddle multiple buffers
+/// (its `On` lands in one and its `Off` in a later one).
+///
+/// `active_notes` is the audio thread's running set of pitches currently
+/// sounding for this track. The caller maintains it across buffers so it
+/// can flush stuck notes on Stop / loop wrap.
 fn collect_events_for_buffer(
     song: Option<&Song>,
     track_idx: u32,
@@ -1771,55 +1780,81 @@ fn collect_events_for_buffer(
     let Some(track) = song.tracks.get(track_idx as usize) else {
         return;
     };
-    let Some(clip) = track.clips.first() else {
-        return;
-    };
-    if clip.rows_per_beat == 0 || song.bpm <= 0.0 {
+    if song.bpm <= 0.0 {
         return;
     }
 
     let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(song.bpm);
-    let samples_per_row = samples_per_beat / f64::from(clip.rows_per_beat);
-    let clip_start_samples = (clip.start_beat * samples_per_beat).max(0.0) as u64;
-
     let buf_end = playhead + u64::from(frames);
 
-    for (i, row) in clip.rows.iter().enumerate() {
-        let row_sample = clip_start_samples + (i as f64 * samples_per_row) as u64;
-        if row_sample < playhead || row_sample >= buf_end {
+    for clip in &track.clips {
+        if clip.length_beats <= 0.0 {
             continue;
         }
-        let Some(note) = &row.note else { continue };
-        let time = (row_sample - playhead) as u32;
-        match note {
-            NoteEvent::On(n) => {
-                for &key in active_notes.iter() {
-                    out.push(TimedNoteEvent {
-                        time,
-                        event: NoteTransition::Off { key },
-                    });
-                }
-                active_notes.clear();
+        let clip_start_samples = (clip.start_beat * samples_per_beat).max(0.0) as u64;
+        let clip_end_samples =
+            clip_start_samples + (clip.length_beats * samples_per_beat) as u64;
+        // Skip clips entirely outside this buffer (saves the per-note loop).
+        if clip_end_samples <= playhead || clip_start_samples >= buf_end {
+            continue;
+        }
+
+        for note in &clip.notes {
+            if note.duration_beats <= 0.0 {
+                continue;
+            }
+            // Skip notes whose On is outside the clip — otherwise we could
+            // emit On but lose Off to clamping, leaving a stuck note.
+            if note.start_beat < 0.0 || note.start_beat >= clip.length_beats {
+                continue;
+            }
+            let on_offset = (note.start_beat * samples_per_beat).max(0.0) as u64;
+            let raw_off_offset =
+                ((note.start_beat + note.duration_beats) * samples_per_beat).max(0.0) as u64;
+            let on_sample = clip_start_samples + on_offset;
+            // Notes that extend past the clip end are clamped — the clip is
+            // the visible boundary the user drew on the timeline.
+            let off_sample = (clip_start_samples + raw_off_offset).min(clip_end_samples);
+
+            if on_sample >= playhead && on_sample < buf_end {
                 out.push(TimedNoteEvent {
-                    time,
+                    time: (on_sample - playhead) as u32,
                     event: NoteTransition::On {
-                        key: n.key,
-                        velocity: f64::from(n.velocity) / 127.0,
+                        key: note.pitch,
+                        velocity: f64::from(note.velocity) / 127.0,
                     },
                 });
-                active_notes.push(n.key);
+                active_notes.push(note.pitch);
             }
-            NoteEvent::Off => {
-                for &key in active_notes.iter() {
-                    out.push(TimedNoteEvent {
-                        time,
-                        event: NoteTransition::Off { key },
-                    });
+            if off_sample > on_sample
+                && off_sample >= playhead
+                && off_sample < buf_end
+            {
+                out.push(TimedNoteEvent {
+                    time: (off_sample - playhead) as u32,
+                    event: NoteTransition::Off { key: note.pitch },
+                });
+                if let Some(pos) = active_notes.iter().position(|&k| k == note.pitch) {
+                    active_notes.swap_remove(pos);
                 }
-                active_notes.clear();
             }
         }
     }
+
+    // Sort by time so MIDI FX get monotonic input; at equal times, Off must
+    // come before On so a re-attack of the same pitch doesn't drop because
+    // the synth saw On→Off at the same frame.
+    //
+    // `sort_unstable_by_key` is in-place (pdqsort) — RT-safe. Stability
+    // doesn't matter for our key tuple because Off and On at the same
+    // time always differ in `priority`.
+    out.sort_unstable_by_key(|e| {
+        let priority: u8 = match e.event {
+            NoteTransition::Off { .. } => 0,
+            NoteTransition::On { .. } => 1,
+        };
+        (e.time, priority)
+    });
 }
 
 /// Offline-render the entire song to a stereo WAV file. Runs on the
@@ -2091,4 +2126,234 @@ fn export_wav_offline(
 
     tracing::info!(path = %path.display(), playhead, "WAV export finished");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::model::{Clip, Note, Track};
+
+    fn one_note_song(start_beat: f64, duration_beats: f64, pitch: u8) -> Song {
+        Song {
+            bpm: 120.0,
+            tracks: vec![Track {
+                name: "T".into(),
+                clips: vec![Clip {
+                    name: "C".into(),
+                    start_beat: 0.0,
+                    length_beats: 8.0,
+                    notes: vec![Note {
+                        start_beat,
+                        duration_beats,
+                        pitch,
+                        velocity: 100,
+                        lyric: None,
+                    }],
+                }],
+                ..Track::default()
+            }],
+            ..Song::default()
+        }
+    }
+
+    /// 120 BPM, 48 kHz: samples_per_beat = 24000.
+    const SR: u32 = 48000;
+    const SPB: u64 = 24_000;
+
+    #[test]
+    fn note_starting_at_buffer_zero_emits_on_at_time_zero() {
+        let song = one_note_song(0.0, 1.0, 60);
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect_events_for_buffer(Some(&song), 0, SR, 0, 1024, &mut out, &mut active);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].time, 0);
+        assert!(matches!(
+            out[0].event,
+            NoteTransition::On { key: 60, .. }
+        ));
+        assert_eq!(active, vec![60]);
+    }
+
+    #[test]
+    fn note_off_emitted_in_buffer_containing_end() {
+        let song = one_note_song(0.0, 1.0, 60);
+        let mut out = Vec::new();
+        let mut active = vec![60u8]; // simulate prior buffer started this note
+        // Buffer covering the off sample (1 beat = 24000 samples).
+        collect_events_for_buffer(
+            Some(&song),
+            0,
+            SR,
+            SPB - 100,
+            200,
+            &mut out,
+            &mut active,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].event, NoteTransition::Off { key: 60 }));
+        assert!(active.is_empty(), "active set must drop the off note");
+    }
+
+    #[test]
+    fn note_entirely_inside_buffer_emits_on_then_off() {
+        // Note start_beat=0, duration=0.01 → ends at 240 samples.
+        let song = one_note_song(0.0, 0.01, 60);
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect_events_for_buffer(Some(&song), 0, SR, 0, 1024, &mut out, &mut active);
+        assert_eq!(out.len(), 2);
+        // Off must come strictly before On at the same time… but here they
+        // differ in time, so just check (On, Off) order by time.
+        assert!(matches!(out[0].event, NoteTransition::On { key: 60, .. }));
+        assert!(matches!(out[1].event, NoteTransition::Off { key: 60 }));
+        assert!(out[0].time < out[1].time);
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn chord_emits_two_ons_at_same_time() {
+        let mut song = one_note_song(0.0, 1.0, 60);
+        if let Some(clip) = song.tracks[0].clips.first_mut() {
+            clip.notes.push(Note {
+                start_beat: 0.0,
+                duration_beats: 1.0,
+                pitch: 64,
+                velocity: 100,
+                lyric: None,
+            });
+        }
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect_events_for_buffer(Some(&song), 0, SR, 0, 1024, &mut out, &mut active);
+        assert_eq!(out.len(), 2);
+        for e in &out {
+            assert_eq!(e.time, 0);
+            assert!(matches!(e.event, NoteTransition::On { .. }));
+        }
+        // Both pitches must end up in active_notes regardless of order.
+        active.sort_unstable();
+        assert_eq!(active, vec![60, 64]);
+    }
+
+    #[test]
+    fn no_song_returns_empty() {
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect_events_for_buffer(None, 0, SR, 0, 1024, &mut out, &mut active);
+        assert!(out.is_empty());
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn note_outside_buffer_emits_nothing() {
+        let song = one_note_song(2.0, 1.0, 60);
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        // Buffer for samples 0..1000 — entirely before the note.
+        collect_events_for_buffer(Some(&song), 0, SR, 0, 1000, &mut out, &mut active);
+        assert!(out.is_empty());
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn note_extending_past_clip_end_is_clamped() {
+        // Clip is 8 beats long; note starts at 7 with duration 4 → would
+        // extend to beat 11. Off must land at clip end (beat 8).
+        let mut song = one_note_song(7.0, 4.0, 60);
+        song.tracks[0].clips[0].length_beats = 8.0;
+        // Buffer covering beat 8 (= 192_000 samples). One sample window.
+        let playhead = 8 * SPB - 100;
+        let frames = 200u32;
+        let mut out = Vec::new();
+        let mut active = vec![60u8];
+        collect_events_for_buffer(
+            Some(&song),
+            0,
+            SR,
+            playhead,
+            frames,
+            &mut out,
+            &mut active,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].event, NoteTransition::Off { key: 60 }));
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn note_past_clip_end_is_skipped_entirely() {
+        // Note starts past clip.length_beats — must not produce On (which
+        // would be stuck, since Off would be clamped to <= On_sample).
+        let mut song = one_note_song(10.0, 1.0, 60);
+        song.tracks[0].clips[0].length_beats = 4.0;
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        // Buffer covering the bogus note's start sample.
+        collect_events_for_buffer(
+            Some(&song),
+            0,
+            SR,
+            10 * SPB - 100,
+            200,
+            &mut out,
+            &mut active,
+        );
+        assert!(out.is_empty());
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn output_is_sorted_with_off_before_on_at_same_time() {
+        // Two notes, same pitch: A ends at beat 1, B starts at beat 1.
+        // Both events fall inside the same buffer; Off must be emitted
+        // before On so the synth doesn't drop the new attack.
+        let song = Song {
+            bpm: 120.0,
+            tracks: vec![Track {
+                name: "T".into(),
+                clips: vec![Clip {
+                    name: "C".into(),
+                    start_beat: 0.0,
+                    length_beats: 4.0,
+                    notes: vec![
+                        Note {
+                            start_beat: 0.0,
+                            duration_beats: 1.0,
+                            pitch: 60,
+                            velocity: 100,
+                            lyric: None,
+                        },
+                        Note {
+                            start_beat: 1.0,
+                            duration_beats: 1.0,
+                            pitch: 60,
+                            velocity: 100,
+                            lyric: None,
+                        },
+                    ],
+                }],
+                ..Track::default()
+            }],
+            ..Song::default()
+        };
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect_events_for_buffer(
+            Some(&song),
+            0,
+            SR,
+            0,
+            (2 * SPB) as u32,
+            &mut out,
+            &mut active,
+        );
+        // Expect: On(t=0), Off(t=24000), On(t=24000).
+        assert_eq!(out.len(), 3);
+        assert!(matches!(out[0].event, NoteTransition::On { .. }));
+        assert_eq!(out[0].time, 0);
+        assert!(matches!(out[1].event, NoteTransition::Off { .. }));
+        assert!(matches!(out[2].event, NoteTransition::On { .. }));
+        assert_eq!(out[1].time, out[2].time);
+    }
 }
