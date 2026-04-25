@@ -9,9 +9,7 @@
 use vizia::prelude::*;
 use vizia::vg;
 
-use crate::app::{
-    AppData, AppEvent, ClipRef, DEFAULT_NOTE_DURATION, NoteBox,
-};
+use crate::app::{AppData, AppEvent, ClipRef, DEFAULT_NOTE_DURATION, NoteBox};
 
 const COLOR_BG: Color = Color::rgb(28, 28, 32);
 const COLOR_GRID: Color = Color::rgb(48, 48, 56);
@@ -25,11 +23,6 @@ const COLOR_KEYBOARD_BG: Color = Color::rgb(40, 40, 44);
 const COLOR_WHITE_KEY: Color = Color::rgb(220, 220, 220);
 const COLOR_BLACK_KEY: Color = Color::rgb(40, 40, 44);
 
-/// Bottom MIDI pitch shown. C3 = 48.
-const VISIBLE_PITCH_LOW: u8 = 48;
-const VISIBLE_PITCH_COUNT: u8 = 36;
-const VISIBLE_PITCH_HIGH: u8 = VISIBLE_PITCH_LOW + VISIBLE_PITCH_COUNT - 1;
-const SEMITONES_TO_DRAW: u32 = VISIBLE_PITCH_COUNT as u32;
 const KEYBOARD_WIDTH: f32 = 48.0;
 const NOTE_RESIZE_HANDLE_PX: f32 = 4.0;
 
@@ -118,6 +111,10 @@ impl PianoRollCanvas {
         .bind(AppData::note_boxes, |mut handle, _| handle.needs_redraw())
         .bind(AppData::pianoroll_zoom_x, |mut handle, _| handle.needs_redraw())
         .bind(AppData::pianoroll_zoom_y, |mut handle, _| handle.needs_redraw())
+        .bind(AppData::pianoroll_scroll_beat, |mut handle, _| {
+            handle.needs_redraw()
+        })
+        .bind(AppData::pianoroll_top_pitch, |mut handle, _| handle.needs_redraw())
     }
 
     fn coord_to_beat_pitch(
@@ -125,14 +122,19 @@ impl PianoRollCanvas {
         y: f32,
         zoom_x: f32,
         zoom_y: f32,
+        scroll_beat: f32,
+        top_pitch: u8,
     ) -> Option<(f64, u8)> {
-        let beat = (canvas_x / zoom_x).max(0.0) as f64;
+        let beat = ((canvas_x / zoom_x).max(0.0) + scroll_beat) as f64;
         let row = (y / zoom_y).floor();
-        if row < 0.0 || row >= SEMITONES_TO_DRAW as f32 {
+        if row < 0.0 {
             return None;
         }
-        let pitch = VISIBLE_PITCH_HIGH.saturating_sub(row as u8);
-        Some((beat, pitch))
+        let pitch_i32 = top_pitch as i32 - row as i32;
+        if !(0..=127).contains(&pitch_i32) {
+            return None;
+        }
+        Some((beat, pitch_i32 as u8))
     }
 
     fn hit_note(notes: &[NoteBox], beat: f64, pitch: u8) -> Option<&NoteBox> {
@@ -157,6 +159,8 @@ impl View for PianoRollCanvas {
         let bounds = cx.bounds();
         let zoom_x: f32 = AppData::pianoroll_zoom_x.get(cx);
         let zoom_y: f32 = AppData::pianoroll_zoom_y.get(cx);
+        let scroll_beat: f32 = AppData::pianoroll_scroll_beat.get(cx);
+        let top_pitch: u8 = AppData::pianoroll_top_pitch.get(cx);
         let notes: Vec<NoteBox> = AppData::note_boxes.get(cx);
 
         // Background.
@@ -174,9 +178,19 @@ impl View for PianoRollCanvas {
         text_paint.set_color(skia_rgba(Color::rgb(60, 60, 60)));
         text_paint.set_anti_alias(true);
         let font = vg::Font::default();
-        for i in 0..SEMITONES_TO_DRAW {
-            let pitch = VISIBLE_PITCH_HIGH - i as u8;
+        // Number of semitone rows that fit in the visible bounds, plus
+        // one extra row to cover partial rows at the bottom edge.
+        let visible_rows = ((bounds.h / zoom_y) as u32) + 1;
+        for i in 0..=visible_rows {
+            let pitch_i = top_pitch as i32 - i as i32;
+            if pitch_i < 0 {
+                break;
+            }
+            let pitch = pitch_i as u8;
             let y = bounds.y + (i as f32) * zoom_y;
+            if y > bounds.y + bounds.h {
+                break;
+            }
             let key_color = if is_black_key(pitch) {
                 COLOR_BLACK_KEY
             } else {
@@ -201,8 +215,12 @@ impl View for PianoRollCanvas {
         let canvas_w = bounds.w - KEYBOARD_WIDTH;
 
         // Black-key lanes.
-        for i in 0..SEMITONES_TO_DRAW {
-            let pitch = VISIBLE_PITCH_HIGH - i as u8;
+        for i in 0..=visible_rows {
+            let pitch_i = top_pitch as i32 - i as i32;
+            if pitch_i < 0 {
+                break;
+            }
+            let pitch = pitch_i as u8;
             if !is_black_key(pitch) {
                 continue;
             }
@@ -215,7 +233,7 @@ impl View for PianoRollCanvas {
 
         // Horizontal grid lines (one per pitch).
         let grid_paint = stroke_paint(COLOR_GRID, 1.0);
-        for i in 0..=SEMITONES_TO_DRAW {
+        for i in 0..=visible_rows {
             let y = bounds.y + (i as f32) * zoom_y;
             if y > bounds.y + bounds.h {
                 break;
@@ -226,14 +244,21 @@ impl View for PianoRollCanvas {
             canvas.draw_path(&p, &grid_paint);
         }
 
-        // Vertical beat / bar lines.
-        let max_beats = ((canvas_w / zoom_x) as u32) + 1;
-        for beat in 0..=max_beats {
-            let x = canvas_x0 + (beat as f32) * zoom_x;
+        // Vertical beat / bar lines. Start from the first whole beat at
+        // or before the visible left edge so the grid doesn't drift when
+        // scrolled.
+        let first_beat = scroll_beat.floor() as i32;
+        let visible_beats = (canvas_w / zoom_x) as i32 + 1;
+        for offset in 0..=visible_beats {
+            let beat = first_beat + offset;
+            if beat < 0 {
+                continue;
+            }
+            let x = canvas_x0 + (beat as f32 - scroll_beat) * zoom_x;
             if x > canvas_x0 + canvas_w {
                 break;
             }
-            let stroke = if beat % 4 == 0 { 1.5 } else { 0.5 };
+            let stroke = if (beat as u32).is_multiple_of(4) { 1.5 } else { 0.5 };
             let mut p = vg::Path::new();
             p.move_to((x, bounds.y));
             p.line_to((x, bounds.y + bounds.h));
@@ -246,12 +271,16 @@ impl View for PianoRollCanvas {
         note_text_paint.set_color(skia_rgba(COLOR_NOTE_TEXT));
         note_text_paint.set_anti_alias(true);
         for n in &notes {
-            if n.pitch < VISIBLE_PITCH_LOW || n.pitch > VISIBLE_PITCH_HIGH {
+            let row_i = top_pitch as i32 - n.pitch as i32;
+            if row_i < 0 {
                 continue;
             }
-            let row = (VISIBLE_PITCH_HIGH - n.pitch) as f32;
-            let x = canvas_x0 + n.start_beat * zoom_x;
+            let row = row_i as f32;
+            let x = canvas_x0 + (n.start_beat - scroll_beat) * zoom_x;
             let y = bounds.y + row * zoom_y;
+            if y > bounds.y + bounds.h {
+                continue;
+            }
             let w = (n.duration_beats * zoom_x).max(2.0);
             let h = (zoom_y - 1.0).max(2.0);
             if x + w < canvas_x0 || x > canvas_x0 + canvas_w {
@@ -288,9 +317,11 @@ impl View for PianoRollCanvas {
                 let canvas_x = mx - KEYBOARD_WIDTH;
                 let zoom_x = AppData::pianoroll_zoom_x.get(cx);
                 let zoom_y = AppData::pianoroll_zoom_y.get(cx);
-                let Some((beat, pitch)) =
-                    Self::coord_to_beat_pitch(canvas_x, my, zoom_x, zoom_y)
-                else {
+                let scroll_beat = AppData::pianoroll_scroll_beat.get(cx);
+                let top_pitch = AppData::pianoroll_top_pitch.get(cx);
+                let Some((beat, pitch)) = Self::coord_to_beat_pitch(
+                    canvas_x, my, zoom_x, zoom_y, scroll_beat, top_pitch,
+                ) else {
                     return;
                 };
                 let notes: Vec<NoteBox> = AppData::note_boxes.get(cx);
@@ -299,7 +330,8 @@ impl View for PianoRollCanvas {
                         note: hit.note,
                         additive: false,
                     });
-                    let right_px = (hit.start_beat + hit.duration_beats) * zoom_x;
+                    let right_px =
+                        (hit.start_beat + hit.duration_beats - scroll_beat) * zoom_x;
                     let from_right = right_px - canvas_x;
                     self.drag_origin_x = canvas_x;
                     self.drag_origin_y = my;
@@ -331,9 +363,11 @@ impl View for PianoRollCanvas {
                 let canvas_x = mx - KEYBOARD_WIDTH;
                 let zoom_x = AppData::pianoroll_zoom_x.get(cx);
                 let zoom_y = AppData::pianoroll_zoom_y.get(cx);
-                let Some((beat, pitch)) =
-                    Self::coord_to_beat_pitch(canvas_x, my, zoom_x, zoom_y)
-                else {
+                let scroll_beat = AppData::pianoroll_scroll_beat.get(cx);
+                let top_pitch = AppData::pianoroll_top_pitch.get(cx);
+                let Some((beat, pitch)) = Self::coord_to_beat_pitch(
+                    canvas_x, my, zoom_x, zoom_y, scroll_beat, top_pitch,
+                ) else {
                     return;
                 };
                 let notes: Vec<NoteBox> = AppData::note_boxes.get(cx);
@@ -369,6 +403,9 @@ impl View for PianoRollCanvas {
                 let zoom_x = AppData::pianoroll_zoom_x.get(cx);
                 let zoom_y = AppData::pianoroll_zoom_y.get(cx);
                 let dx = canvas_x - self.drag_origin_x;
+                // Scroll changes during a drag would warp the note — but
+                // since the drag originated against the same scroll, the
+                // delta cancels out without an explicit subtraction.
                 let dbeat = (dx / zoom_x) as f64;
                 match kind {
                     NoteDrag::Move {
@@ -407,6 +444,33 @@ impl View for PianoRollCanvas {
             WindowEvent::MouseUp(MouseButton::Left) if self.drag.is_some() => {
                 self.drag = None;
                 cx.release();
+            }
+            WindowEvent::MouseScroll(_, dy) => {
+                let mods = cx.modifiers();
+                if mods.ctrl() && mods.shift() {
+                    // Vertical (pitch) zoom.
+                    let z = AppData::pianoroll_zoom_y.get(cx);
+                    let new_z = (z * 1.15_f32.powf(*dy)).clamp(6.0, 40.0);
+                    cx.emit(AppEvent::SetPianoRollZoomY(new_z.to_bits()));
+                } else if mods.ctrl() {
+                    // Horizontal (time) zoom.
+                    let z = AppData::pianoroll_zoom_x.get(cx);
+                    let new_z = (z * 1.15_f32.powf(*dy)).clamp(8.0, 400.0);
+                    cx.emit(AppEvent::SetPianoRollZoomX(new_z.to_bits()));
+                } else if mods.shift() {
+                    // Horizontal scroll.
+                    let s = AppData::pianoroll_scroll_beat.get(cx);
+                    let new_s = (s - dy * 1.0).max(0.0);
+                    cx.emit(AppEvent::SetPianoRollScrollX(new_s.to_bits()));
+                } else {
+                    // Vertical scroll — wheel-up moves view up (top pitch
+                    // increases, you see higher notes).
+                    let top = AppData::pianoroll_top_pitch.get(cx) as i32;
+                    let step = if *dy > 0.0 { 2 } else { -2 };
+                    let new_top = (top + step).clamp(11, 127) as u8;
+                    cx.emit(AppEvent::SetPianoRollTopPitch(new_top));
+                }
+                meta.consume();
             }
             _ => {}
         });

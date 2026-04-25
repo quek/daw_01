@@ -174,10 +174,18 @@ pub struct AppData {
     pub bottom_panel: u8,
     /// Horizontal zoom on the arrangement view (px / beat).
     pub arrange_zoom_x: f32,
+    /// Beat at the left edge of the arrangement view. Mouse wheel +
+    /// Shift+wheel pan this; Ctrl+wheel zooms `arrange_zoom_x` instead.
+    pub arrange_scroll_beat: f32,
     /// Horizontal zoom on the piano roll (px / beat).
     pub pianoroll_zoom_x: f32,
     /// Vertical zoom on the piano roll (px / semitone).
     pub pianoroll_zoom_y: f32,
+    /// MIDI pitch shown at the top edge of the piano roll. Decreasing
+    /// scrolls down (towards lower pitches).
+    pub pianoroll_top_pitch: u8,
+    /// Beat at the left edge of the piano roll.
+    pub pianoroll_scroll_beat: f32,
 
     // -------- Cached lens-bound snapshots -----------------------------------
     /// Per-track header strip on the left of the arrangement view.
@@ -239,6 +247,12 @@ pub struct AppData {
     pub rescan_result: Arc<Mutex<Option<PluginDatabase>>>,
     pub is_rescanning: bool,
     pub status_message: String,
+
+    /// Inline rename state. `Some(track_idx)` means the track header for
+    /// that track is currently in edit mode and should render a Textbox
+    /// bound to `track_rename_text` instead of the regular click button.
+    pub track_rename_idx: Option<u32>,
+    pub track_rename_text: String,
 }
 
 impl AppData {
@@ -289,8 +303,11 @@ impl AppData {
             selected_notes: Vec::new(),
             bottom_panel: 0,
             arrange_zoom_x: ARRANGE_PX_PER_BEAT,
+            arrange_scroll_beat: 0.0,
             pianoroll_zoom_x: 64.0,
-            pianoroll_zoom_y: 10.0,
+            pianoroll_zoom_y: 14.0,
+            pianoroll_top_pitch: 84, // C6
+            pianoroll_scroll_beat: 0.0,
             track_headers: Vec::new(),
             track_count,
             clip_boxes: Vec::new(),
@@ -323,6 +340,8 @@ impl AppData {
             rescan_result: Arc::new(Mutex::new(None)),
             is_rescanning: false,
             status_message: String::new(),
+            track_rename_idx: None,
+            track_rename_text: String::new(),
         }
     }
 
@@ -434,6 +453,15 @@ pub enum AppEvent {
     AddInstrumentTrack,
     RemoveLastTrack,
     SelectTrack(u32),
+    /// Open the inline rename editor for the given track. Empties out any
+    /// previously open editor first.
+    BeginRenameTrack(u32),
+    /// Textbox `on_edit` callback while renaming.
+    RenameTrackChanged(String),
+    /// Enter key — apply the new name to the song model.
+    CommitRenameTrack,
+    /// Esc key — discard the in-progress edit.
+    CancelRenameTrack,
 
     // -------- Bottom panel -------------------------------------------------
     SelectBottomPanel(u8),
@@ -530,6 +558,20 @@ pub enum AppEvent {
     RescanPluginDb,
     PluginDbRescanCompleted,
 
+    // -------- Scroll / zoom -----------------------------------------------
+    /// Update arrangement scroll (beat at left edge). Bits = `f32::to_bits`.
+    SetArrangeScroll(u32),
+    /// Update arrangement horizontal zoom (px/beat). Bits = `f32::to_bits`.
+    SetArrangeZoom(u32),
+    /// Update piano roll horizontal scroll (beat at left edge).
+    SetPianoRollScrollX(u32),
+    /// Update piano roll top pitch (highest pitch shown at top).
+    SetPianoRollTopPitch(u8),
+    /// Update piano roll horizontal zoom (px/beat).
+    SetPianoRollZoomX(u32),
+    /// Update piano roll vertical zoom (px/semitone).
+    SetPianoRollZoomY(u32),
+
     // -------- Mixer -------------------------------------------------------
     SetTrackVolume {
         track: u32,
@@ -602,6 +644,20 @@ impl Model for AppData {
                 AppEvent::AddInstrumentTrack => self.action_add_instrument_track(),
                 AppEvent::RemoveLastTrack => self.action_remove_last_track(),
                 AppEvent::SelectTrack(idx) => self.select_track(*idx),
+                AppEvent::BeginRenameTrack(idx) => {
+                    self.begin_rename_track(*idx);
+                    dirty = false;
+                }
+                AppEvent::RenameTrackChanged(text) => {
+                    self.track_rename_text = text.clone();
+                    dirty = false;
+                }
+                AppEvent::CommitRenameTrack => self.commit_rename_track(),
+                AppEvent::CancelRenameTrack => {
+                    self.track_rename_idx = None;
+                    self.track_rename_text.clear();
+                    dirty = false;
+                }
                 AppEvent::SelectBottomPanel(p) => {
                     self.bottom_panel = *p;
                     dirty = false;
@@ -684,6 +740,30 @@ impl Model for AppData {
                 }
                 AppEvent::PluginDbRescanCompleted => {
                     self.finish_rescan();
+                    dirty = false;
+                }
+                AppEvent::SetArrangeScroll(bits) => {
+                    self.arrange_scroll_beat = f32::from_bits(*bits).max(0.0);
+                    dirty = false;
+                }
+                AppEvent::SetArrangeZoom(bits) => {
+                    self.arrange_zoom_x = f32::from_bits(*bits).clamp(2.0, 400.0);
+                    dirty = false;
+                }
+                AppEvent::SetPianoRollScrollX(bits) => {
+                    self.pianoroll_scroll_beat = f32::from_bits(*bits).max(0.0);
+                    dirty = false;
+                }
+                AppEvent::SetPianoRollTopPitch(p) => {
+                    self.pianoroll_top_pitch = (*p).clamp(11, 127);
+                    dirty = false;
+                }
+                AppEvent::SetPianoRollZoomX(bits) => {
+                    self.pianoroll_zoom_x = f32::from_bits(*bits).clamp(8.0, 400.0);
+                    dirty = false;
+                }
+                AppEvent::SetPianoRollZoomY(bits) => {
+                    self.pianoroll_zoom_y = f32::from_bits(*bits).clamp(6.0, 40.0);
                     dirty = false;
                 }
                 AppEvent::SelectPluginFromDb(id) => {
@@ -1020,6 +1100,36 @@ impl AppData {
             self.selected_track = idx;
             self.refresh_inspector_chain();
         }
+    }
+
+    fn begin_rename_track(&mut self, idx: u32) {
+        let Some(track) = self.song.tracks.get(idx as usize) else {
+            return;
+        };
+        self.track_rename_text = track.name.clone();
+        self.track_rename_idx = Some(idx);
+    }
+
+    fn commit_rename_track(&mut self) {
+        let Some(idx) = self.track_rename_idx.take() else {
+            return;
+        };
+        let new_name = self.track_rename_text.trim().to_string();
+        self.track_rename_text.clear();
+        if new_name.is_empty() {
+            // An empty name is meaningless — treat as cancel.
+            return;
+        }
+        if let Some(track) = self.song.tracks.get_mut(idx as usize) {
+            track.name = new_name.clone();
+        }
+        if let Some(entry) = self.track_mix.iter_mut().find(|e| e.index == idx) {
+            entry.name = new_name;
+        }
+        if idx == self.selected_track {
+            self.refresh_inspector_chain();
+        }
+        self.sync_song_to_plugin_host();
     }
 
     fn ensure_first_track(&mut self) {

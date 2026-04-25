@@ -103,23 +103,46 @@ where
     L: Lens<Target = TrackHeader> + Send + Sync,
 {
     HStack::new(cx, |cx| {
-        let click_item = item;
-        Button::new(cx, |cx| {
-            Label::new(cx, item.map(|h| h.name.clone())).font_size(11.0)
-        })
-        .on_press(move |ex| {
-            let h = click_item.get(ex);
-            ex.emit(AppEvent::SelectTrack(h.index));
-        })
-        .background_color(item.map(|h| {
-            if h.selected {
-                Color::rgb(70, 90, 120)
+        // Either a click-to-select Button (default) or a Textbox (when
+        // this row is in rename mode). The branch flips inside a Binding
+        // so toggling rename only rebuilds the name cell, not the full
+        // header row.
+        Binding::new(cx, AppData::track_rename_idx, move |cx, rename_idx| {
+            let editing_idx: Option<u32> = rename_idx.get(cx);
+            let this_idx: u32 = item.get(cx).index;
+            if editing_idx == Some(this_idx) {
+                Textbox::new(cx, AppData::track_rename_text)
+                    .on_edit(|ex, text| ex.emit(AppEvent::RenameTrackChanged(text)))
+                    .on_submit(|ex, _, _| ex.emit(AppEvent::CommitRenameTrack))
+                    .on_cancel(|ex| ex.emit(AppEvent::CancelRenameTrack))
+                    .width(Stretch(1.0))
+                    .height(Pixels(24.0))
+                    .focused(true);
             } else {
-                Color::rgb(48, 48, 52)
+                let click_item = item;
+                let dbl_item = item;
+                Button::new(cx, |cx| {
+                    Label::new(cx, item.map(|h| h.name.clone())).font_size(11.0)
+                })
+                .on_press(move |ex| {
+                    let h = click_item.get(ex);
+                    ex.emit(AppEvent::SelectTrack(h.index));
+                })
+                .on_double_click(move |ex, _| {
+                    let h = dbl_item.get(ex);
+                    ex.emit(AppEvent::BeginRenameTrack(h.index));
+                })
+                .background_color(item.map(|h| {
+                    if h.selected {
+                        Color::rgb(70, 90, 120)
+                    } else {
+                        Color::rgb(48, 48, 52)
+                    }
+                }))
+                .width(Stretch(1.0))
+                .height(Pixels(24.0));
             }
-        }))
-        .width(Stretch(1.0))
-        .height(Pixels(24.0));
+        });
 
         let mute_item = item;
         Button::new(cx, |cx| Label::new(cx, "M").font_size(10.0))
@@ -194,24 +217,32 @@ impl ArrangementCanvas {
         .bind(AppData::clip_boxes, |mut handle, _| handle.needs_redraw())
         .bind(AppData::track_count, |mut handle, _| handle.needs_redraw())
         .bind(AppData::arrange_zoom_x, |mut handle, _| handle.needs_redraw())
+        .bind(AppData::arrange_scroll_beat, |mut handle, _| handle.needs_redraw())
         .bind(AppData::playhead_beat, |mut handle, _| handle.needs_redraw())
     }
 
-    fn hit_clip(
-        clip_boxes: &[ClipBox],
+    /// Convert a canvas-relative `(x, y)` into the logical `(beat, track)`
+    /// the timeline rules see. Includes the active scroll offset so a
+    /// scrolled view hits the right clip.
+    fn coord_to_beat_track(
         mx: f32,
         my: f32,
         zoom: f32,
-    ) -> Option<&ClipBox> {
+        scroll_beat: f32,
+    ) -> Option<(f64, u32)> {
         if my < RULER_HEIGHT {
             return None;
         }
-        let beat = mx / zoom;
+        let beat = mx / zoom + scroll_beat;
         let track = ((my - RULER_HEIGHT) / ARRANGE_TRACK_HEIGHT) as u32;
+        Some((beat as f64, track))
+    }
+
+    fn hit_clip(clip_boxes: &[ClipBox], beat: f64, track: u32) -> Option<&ClipBox> {
         clip_boxes.iter().find(|c| {
             c.track == track
-                && beat >= c.start_beat
-                && beat <= c.start_beat + c.length_beats
+                && (beat as f32) >= c.start_beat
+                && (beat as f32) <= c.start_beat + c.length_beats
         })
     }
 }
@@ -224,6 +255,7 @@ impl View for ArrangementCanvas {
     fn draw(&self, cx: &mut DrawContext, canvas: &Canvas) {
         let bounds = cx.bounds();
         let zoom: f32 = AppData::arrange_zoom_x.get(cx);
+        let scroll_beat: f32 = AppData::arrange_scroll_beat.get(cx);
         let track_count: u32 = AppData::track_count.get(cx);
         let clip_boxes: Vec<ClipBox> = AppData::clip_boxes.get(cx);
         let playhead: Option<f32> = AppData::playhead_beat.get(cx);
@@ -240,13 +272,20 @@ impl View for ArrangementCanvas {
             &fill_paint(COLOR_RULER_BG),
         );
 
-        // Vertical bar lines (every 4 beats, capped at MAX_BEATS).
+        // Vertical bar lines every 4 beats. Start from the first bar that
+        // is at or before the visible left edge so the grid stays aligned
+        // even when scrolled.
         let bar_paint = stroke_paint(COLOR_BAR_LINE, 1.0);
-        let max_beat_x = bounds.w.min(MAX_BEATS * zoom);
         let beats_per_bar = 4u32;
-        let bar_count = ((max_beat_x / zoom) as u32 / beats_per_bar) + 1;
-        for bar in 0..=bar_count {
-            let x = bounds.x + (bar * beats_per_bar) as f32 * zoom;
+        let first_bar = ((scroll_beat as i32) / beats_per_bar as i32).max(0);
+        let visible_beats = bounds.w / zoom;
+        let last_bar = ((scroll_beat + visible_beats) as u32 / beats_per_bar) + 1;
+        for bar in first_bar..=(last_bar as i32) {
+            let beat = (bar * beats_per_bar as i32) as f32;
+            let x = bounds.x + (beat - scroll_beat) * zoom;
+            if x < bounds.x - 1.0 {
+                continue;
+            }
             if x > bounds.x + bounds.w {
                 break;
             }
@@ -276,7 +315,7 @@ impl View for ArrangementCanvas {
         text_paint.set_anti_alias(true);
         let font = vg::Font::default();
         for c in &clip_boxes {
-            let x = bounds.x + c.start_beat * zoom;
+            let x = bounds.x + (c.start_beat - scroll_beat) * zoom;
             let y = bounds.y + RULER_HEIGHT + (c.track as f32) * ARRANGE_TRACK_HEIGHT;
             let w = (c.length_beats * zoom).max(2.0);
             let h = ARRANGE_TRACK_HEIGHT - 4.0;
@@ -303,7 +342,7 @@ impl View for ArrangementCanvas {
 
         // Playhead vertical line.
         if let Some(beat) = playhead {
-            let x = bounds.x + beat * zoom;
+            let x = bounds.x + (beat - scroll_beat) * zoom;
             if x >= bounds.x && x <= bounds.x + bounds.w {
                 let mut path = vg::Path::new();
                 path.move_to((x, bounds.y));
@@ -313,6 +352,7 @@ impl View for ArrangementCanvas {
                 canvas.draw_path(&path, &p);
             }
         }
+        let _ = MAX_BEATS; // kept as a doc-tying constant; not used at draw time
     }
 
     fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
@@ -322,14 +362,21 @@ impl View for ArrangementCanvas {
                 let mx = cx.mouse().cursor_x - bounds.x;
                 let my = cx.mouse().cursor_y - bounds.y;
                 let zoom = AppData::arrange_zoom_x.get(cx);
+                let scroll_beat = AppData::arrange_scroll_beat.get(cx);
                 let clip_boxes: Vec<ClipBox> = AppData::clip_boxes.get(cx);
-                if let Some(c) = Self::hit_clip(&clip_boxes, mx, my, zoom) {
+                let Some((beat, track)) =
+                    Self::coord_to_beat_track(mx, my, zoom, scroll_beat)
+                else {
+                    return;
+                };
+                if let Some(c) = Self::hit_clip(&clip_boxes, beat, track) {
                     let target = ClipRef {
                         track: c.track,
                         clip: c.clip,
                     };
                     cx.emit(AppEvent::SelectClip(target));
-                    let right_edge_px = (c.start_beat + c.length_beats) * zoom;
+                    let right_edge_px =
+                        (c.start_beat + c.length_beats - scroll_beat) * zoom;
                     let from_right = right_edge_px - mx;
                     self.drag_origin_x = mx;
                     self.drag = if from_right < RESIZE_HANDLE_PX {
@@ -388,18 +435,20 @@ impl View for ArrangementCanvas {
                 let mx = cx.mouse().cursor_x - bounds.x;
                 let my = cx.mouse().cursor_y - bounds.y;
                 let zoom = AppData::arrange_zoom_x.get(cx);
+                let scroll_beat = AppData::arrange_scroll_beat.get(cx);
                 let clip_boxes: Vec<ClipBox> = AppData::clip_boxes.get(cx);
                 let track_count = AppData::track_count.get(cx);
-                if my < RULER_HEIGHT {
+                let Some((beat, track)) =
+                    Self::coord_to_beat_track(mx, my, zoom, scroll_beat)
+                else {
                     return;
-                }
-                let track = ((my - RULER_HEIGHT) / ARRANGE_TRACK_HEIGHT) as u32;
+                };
                 if track >= track_count {
                     return;
                 }
                 // Bitwig: double-click on a clip opens the piano roll for
                 // it. Double-click on empty lane creates a new clip.
-                if let Some(c) = Self::hit_clip(&clip_boxes, mx, my, zoom) {
+                if let Some(c) = Self::hit_clip(&clip_boxes, beat, track) {
                     cx.emit(AppEvent::SelectClip(ClipRef {
                         track: c.track,
                         clip: c.clip,
@@ -409,12 +458,31 @@ impl View for ArrangementCanvas {
                     return;
                 }
                 // Snap to nearest beat.
-                let snapped = (mx / zoom).max(0.0).floor() as f64;
+                let snapped = beat.floor().max(0.0);
                 cx.emit(AppEvent::CreateClip {
                     track,
                     start_beat_bits: snapped.to_bits(),
                 });
                 cx.emit(AppEvent::SelectBottomPanel(1));
+                meta.consume();
+            }
+            WindowEvent::MouseScroll(_, dy) => {
+                let mods = cx.modifiers();
+                if mods.ctrl() {
+                    // Zoom on Ctrl+wheel — exponential so each notch is a
+                    // perceptually equal step.
+                    let zoom = AppData::arrange_zoom_x.get(cx);
+                    let factor = 1.15_f32.powf(*dy);
+                    let new_zoom = (zoom * factor).clamp(2.0, 400.0);
+                    cx.emit(AppEvent::SetArrangeZoom(new_zoom.to_bits()));
+                } else {
+                    // Scroll on plain wheel — sign matches Bitwig: wheel-up
+                    // scrolls left (towards earlier beats).
+                    let scroll = AppData::arrange_scroll_beat.get(cx);
+                    let speed = 1.0_f32; // beats per notch
+                    let new_scroll = (scroll - dy * speed).max(0.0);
+                    cx.emit(AppEvent::SetArrangeScroll(new_scroll.to_bits()));
+                }
                 meta.consume();
             }
             _ => {}
