@@ -207,6 +207,11 @@ pub struct AppData {
     /// Status message shown in the status bar. Updated by synthesis /
     /// rescan / errors to give the user feedback on background tasks.
     pub status_message: String,
+    /// True while the lyric inline editor is open. Bound by the overlay
+    /// `Binding` that shows/hides the `Textbox`.
+    pub lyric_editing: bool,
+    /// Current text in the lyric editor `Textbox`.
+    pub lyric_edit_text: String,
 }
 
 impl AppData {
@@ -284,6 +289,8 @@ impl AppData {
             rescan_result: Arc::new(Mutex::new(None)),
             is_rescanning: false,
             status_message: String::new(),
+            lyric_editing: false,
+            lyric_edit_text: String::new(),
         }
     }
 
@@ -391,6 +398,14 @@ pub enum AppEvent {
     SynthesizeVocal,
     /// Background vocal synth finished. Results are in `synth_result`.
     VocalSynthCompleted,
+    /// `i` key: open the inline lyric editor for the current row.
+    StartLyricEdit,
+    /// Textbox on_edit callback.
+    LyricEditChanged(String),
+    /// Enter in the lyric editor: commit current text, move to next row.
+    SubmitLyricEdit,
+    /// Esc in the lyric editor: discard and close.
+    CancelLyricEdit,
 }
 
 impl Model for AppData {
@@ -553,6 +568,21 @@ impl Model for AppData {
                 }
                 AppEvent::VocalSynthCompleted => {
                     self.finish_vocal_synth();
+                    dirty = false;
+                }
+                AppEvent::StartLyricEdit => {
+                    self.start_lyric_edit();
+                    dirty = false;
+                }
+                AppEvent::LyricEditChanged(text) => {
+                    self.lyric_edit_text = text.clone();
+                    dirty = false;
+                }
+                AppEvent::SubmitLyricEdit => {
+                    self.submit_lyric_edit();
+                }
+                AppEvent::CancelLyricEdit => {
+                    self.lyric_editing = false;
                     dirty = false;
                 }
             }
@@ -1195,6 +1225,42 @@ impl AppData {
         self.inspector_chain = out;
     }
 
+    /// Open the lyric editor for the current cursor row, pre-filling
+    /// the textbox with any existing lyric.
+    fn start_lyric_edit(&mut self) {
+        let track_idx = self.cursor_track as usize;
+        let row_idx = self.cursor_row as usize;
+        let existing = self
+            .song
+            .tracks
+            .get(track_idx)
+            .and_then(|t| t.clips.first())
+            .and_then(|c| c.rows.get(row_idx))
+            .and_then(|r| r.lyric.clone())
+            .unwrap_or_default();
+        self.lyric_edit_text = existing;
+        self.lyric_editing = true;
+    }
+
+    /// Commit the lyric editor text to the current row, advance the
+    /// cursor, and keep editing (Enter = next row).
+    fn submit_lyric_edit(&mut self) {
+        let track_idx = self.cursor_track as usize;
+        let row_idx = self.cursor_row as usize;
+        if let Some(track) = self.song.tracks.get_mut(track_idx)
+            && let Some(clip) = track.clips.first_mut()
+        {
+            while clip.rows.len() <= row_idx {
+                clip.rows.push(Row::default());
+            }
+            let text = self.lyric_edit_text.trim().to_string();
+            clip.rows[row_idx].lyric = if text.is_empty() { None } else { Some(text) };
+        }
+        // Advance cursor and keep editing the next row.
+        self.move_cursor_row(1);
+        self.start_lyric_edit();
+    }
+
     /// Synthesize all vocal tracks in the background. Results are
     /// delivered via `VocalSynthCompleted` → `finish_vocal_synth`.
     fn begin_vocal_synth(&self, cx: &mut EventContext) {
@@ -1227,13 +1293,38 @@ impl AppData {
 
         if results.is_empty() {
             tracing::warn!("vocal synth produced no results");
-            self.status_message = "合成結果なし（Vocal トラックがないか VOICEVOX が応答しません）".to_string();
+            // Pull last error from the synth result slot (errors are
+            // appended as empty-samples entries with an error field).
+            let errors: Vec<String> = self
+                .synth_result
+                .lock()
+                .ok()
+                .map(|g| g.iter().filter_map(|r| r.error.clone()).collect())
+                .unwrap_or_default();
+            if errors.is_empty() {
+                self.status_message =
+                    "合成結果なし（Vocal トラックがないか VOICEVOX が応答しません）".to_string();
+            } else {
+                self.status_message = format!("合成エラー: {}", errors.join("; "));
+            }
             return;
         }
 
-        self.status_message = format!("合成完了 — {} クリップ。Play で再生", results.len());
+        let ok_results: Vec<_> = results.iter().filter(|r| r.error.is_none()).collect();
+        let err_count = results.len() - ok_results.len();
+        if err_count > 0 {
+            let first_err = results.iter().find_map(|r| r.error.as_deref()).unwrap_or("不明");
+            self.status_message = format!(
+                "合成: {} 成功, {} 失敗 ({})",
+                ok_results.len(),
+                err_count,
+                first_err
+            );
+        } else {
+            self.status_message = format!("合成完了 — {} クリップ。Play で再生", ok_results.len());
+        }
 
-        for r in &results {
+        for r in &ok_results {
             // Compute the absolute sample offset for the clip's start
             // beat. This is where the audio thread should begin playing
             // the rendered buffer.

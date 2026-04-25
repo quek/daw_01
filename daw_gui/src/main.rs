@@ -262,6 +262,35 @@ fn run_gui(
                 PluginPickerView::new(cx);
             }
         });
+
+        // Inline lyric editor overlay. `i` opens it, Enter commits +
+        // advances, Esc closes.
+        Binding::new(cx, AppData::lyric_editing, |cx, editing| {
+            if editing.get(cx) {
+                VStack::new(cx, |cx| {
+                    VStack::new(cx, |cx| {
+                        Label::new(cx, "歌詞入力 (Enter=確定+次行, Esc=閉じる)")
+                            .color(Color::rgb(220, 220, 220))
+                            .font_size(13.0);
+                        Textbox::new(cx, AppData::lyric_edit_text)
+                            .on_edit(|cx, text| cx.emit(AppEvent::LyricEditChanged(text)))
+                            .on_submit(|cx, _, _| cx.emit(AppEvent::SubmitLyricEdit))
+                            .on_cancel(|cx| cx.emit(AppEvent::CancelLyricEdit))
+                            .width(Pixels(300.0))
+                            .height(Pixels(28.0));
+                    })
+                    .padding(Pixels(16.0))
+                    .gap(Pixels(8.0))
+                    .background_color(Color::rgb(40, 40, 44))
+                    .width(Pixels(340.0));
+                })
+                .position_type(PositionType::Absolute)
+                .alignment(Alignment::Center)
+                .width(Stretch(1.0))
+                .height(Stretch(1.0))
+                .background_color(Color::rgba(0, 0, 0, 120));
+            }
+        });
     })
     .title("daw_01")
     .inner_size((1280, 800))
@@ -501,6 +530,12 @@ fn register_shortcuts(cx: &mut Context) {
             KeyChord::new(Modifiers::empty(), Code::KeyV),
             KeymapEntry::new(AppEvent::SynthesizeVocal, |cx| {
                 cx.emit(AppEvent::SynthesizeVocal)
+            }),
+        ),
+        (
+            KeyChord::new(Modifiers::empty(), Code::KeyI),
+            KeymapEntry::new(AppEvent::StartLyricEdit, |cx| {
+                cx.emit(AppEvent::StartLyricEdit)
             }),
         ),
     ])

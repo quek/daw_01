@@ -70,12 +70,15 @@ pub fn synthesize_song(
                 match synthesize_sing_clip(&client, clip, song.bpm, singer_id) {
                     Ok(b) => b,
                     Err(e) => {
-                        tracing::error!(
-                            error = ?e,
-                            track = track_idx,
-                            clip = clip_idx,
-                            "sing synthesis failed"
-                        );
+                        let msg = format!("{e:#}");
+                        tracing::error!(error = ?e, track = track_idx, clip = clip_idx, "sing synthesis failed");
+                        results.push(SynthResult {
+                            track: track_idx as u32,
+                            clip: clip_idx as u32,
+                            samples: Vec::new(),
+                            sample_rate: 0,
+                            error: Some(msg),
+                        });
                         continue;
                     }
                 }
@@ -94,12 +97,15 @@ pub fn synthesize_song(
                 match synthesize_talk(&client, &text, sid) {
                     Ok(b) => b,
                     Err(e) => {
-                        tracing::error!(
-                            error = ?e,
-                            track = track_idx,
-                            clip = clip_idx,
-                            "talk synthesis failed"
-                        );
+                        let msg = format!("{e:#}");
+                        tracing::error!(error = ?e, track = track_idx, clip = clip_idx, "talk synthesis failed");
+                        results.push(SynthResult {
+                            track: track_idx as u32,
+                            clip: clip_idx as u32,
+                            samples: Vec::new(),
+                            sample_rate: 0,
+                            error: Some(msg),
+                        });
                         continue;
                     }
                 }
@@ -112,10 +118,19 @@ pub fn synthesize_song(
                         clip: clip_idx as u32,
                         samples,
                         sample_rate: sr,
+                        error: None,
                     });
                 }
                 Err(e) => {
+                    let msg = format!("{e:#}");
                     tracing::error!(error = ?e, track = track_idx, clip = clip_idx, "WAV decode failed");
+                    results.push(SynthResult {
+                        track: track_idx as u32,
+                        clip: clip_idx as u32,
+                        samples: Vec::new(),
+                        sample_rate: 0,
+                        error: Some(msg),
+                    });
                 }
             }
         }
@@ -128,9 +143,11 @@ pub fn synthesize_song(
 pub struct SynthResult {
     pub track: u32,
     pub clip: u32,
-    /// Mono f32 samples, −1..+1.
+    /// Mono f32 samples, −1..+1. Empty when `error` is `Some`.
     pub samples: Vec<f32>,
     pub sample_rate: u32,
+    /// Non-None when synthesis failed for this clip.
+    pub error: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
