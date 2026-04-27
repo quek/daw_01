@@ -2,17 +2,19 @@ use std::path::PathBuf;
 
 use vizia::prelude::*;
 
-use crate::app::AppData;
-
 pub struct StatusBarView;
 
 impl StatusBarView {
-    pub fn new(cx: &mut Context) -> Handle<'_, Self> {
-        Self.build(cx, |cx| {
-            HStack::new(cx, |cx| {
+    pub fn new(
+        cx: &mut Context,
+        file_path: Signal<Option<PathBuf>>,
+        status_message: Signal<String>,
+    ) -> Handle<'_, Self> {
+        Self.build(cx, move |cx| {
+            HStack::new(cx, move |cx| {
                 Label::new(
                     cx,
-                    AppData::file_path.map(|p: &Option<PathBuf>| {
+                    file_path.map(|p: &Option<PathBuf>| {
                         p.as_ref()
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|| "(untitled)".to_string())
@@ -24,7 +26,7 @@ impl StatusBarView {
 
                 // Right-aligned status message for background tasks
                 // (synthesis, rescan, etc.).
-                Label::new(cx, AppData::status_message)
+                Label::new(cx, status_message)
                     .color(Color::rgb(180, 220, 180));
             })
             .padding_left(Pixels(8.0))

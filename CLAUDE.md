@@ -42,25 +42,46 @@ cargo clippy --workspace -- -D warnings
 - 迷ったら `AppData::event` 冒頭に `tracing::info!(?app_event, "received")` を仕込んでログで確認
 - 確認後は削除するか、debug feature で囲う（`[debug-gui]` skill 参照）
 
-### Vizia 0.3 の既知の罠（実ビルドでハマった項目）
+### Vizia 0.4 の既知の罠（実ビルドでハマった項目）
 
-- メソッド名: `Slider::on_changing` ではなく `on_change`。callback は `(ex, value)` で emit
+- **Lens は廃止**: `#[derive(Lens)]` / `#[derive(Data)]` は 0.4 で消失。reactive な状態は
+  `Signal<T>` / `Memo<T>` で持つ。AppData は `pub field: Signal<T>` を直接フィールドに置き、
+  `app.field` で `Signal<T>: Copy` を取り出して View に渡す
+- **`AppData::field` 静的アクセスは廃止**: View は引数で必要な Signal を受け取る。`main.rs` で
+  `let app: &AppData = AppData::new(...).build(cx);` から `let song = app.song;` 等で各 Signal
+  を捕捉してから View 構築 / move closure に渡す
+- `Binding::new(cx, signal, |cx| { ... })` の closure は **1 引数 (`|cx|`)**。bind したい
+  Signal は外側でキャプチャして closure 内で `signal.get()` する
+- Custom View `Handle::bind(signal, |mut handle| { ... })` の closure も **1 引数** (`|mut handle|`)
+  に縮約。0.3 の `|mut handle, _|` 2 引数形は廃止
+- Custom View の `fn draw(&self, cx: &mut DrawContext, canvas: &Canvas)` は `canvas: &Canvas`
+  (immutable)。skia drawing API は interior mutability で動くのでそのまま `canvas.draw_rect(...)` 等使える
+- `vg::Path::new()` は immutable。drawing 用は `vg::PathBuilder::new()` を作って `move_to` /
+  `line_to` で組み立て、`let path = path.detach();` で `Path` に変換してから `canvas.draw_path(&path, ...)`
+- `List::new(cx, signal_of_vec, |cx, idx, item| { ... })` の `item` は `Signal<T>`
+  （0.3 では `Lens<Target=T>`）。`item.get()` は引数なし、`item.map(|t| ...)` はそのまま
+- `cx.set_default_font(&[...])` は 0.4 で公開 API から消えた。フォント指定は CSS で
+  `body { font-family: "..." }` のように行う
+- on_press の closure は `Send + Sync` 必須。Signal/Memo を generic 引数で受ける View 関数は
+  trait bound に `+ Send + Sync` を含める (`mixer_strips::strip<S>` 参照)
+- メソッド名: `Slider::on_change` callback は `(ex, value: f32)` で emit (0.3 と同じ)
 - `Alignment::Bottom` は存在しない。`BottomCenter` / `BottomLeft` / `BottomRight` のいずれか
 - `List` のデフォルトテーマが `list list-item { height: 30px }` を指定しているため、
   per-row ラベルに空白が入る。`cx.add_stylesheet(&'static str)` でインライン CSS オーバーライド。
-  ただし `height: auto` にすると Skia の `matrix.invert().unwrap()` で panic する
-  （`draw.rs:35` 付近）ので、必ず固定 Pixel にする
-- `#[derive(Data)]` が無い型（今回の `Song` 等）は `Binding` に渡せない。事前レンダリングした
-  `String` や `Vec<String>` を Lens で bind する
+  ただし `height: auto` にすると Skia の `matrix.invert().unwrap()` で panic するので、必ず固定 Pixel
 - `cx.spawn(|proxy| ...)` は **std::thread** を回すので `tokio::time::sleep` などは使えない。
   `std::thread::sleep` + `proxy.emit(...)` でやる。`ContextProxy::emit` は UI が閉じられると
   `Err` を返すのでそれで抜ける
+- f64 を `Signal<f64>` に直接入れる場合、NaN で `PartialEq` が常に false → set 毎に依存 Memo が
+  再評価される懸念。位置情報は `Signal<Vec<NoteBox>>` のように Vec ごと replace する戦略を維持
 
-### AppEvent に f32 を乗せる罠
+### Keymap の Action trait bound 緩和
 
-`Keymap` API が `Hash + Eq` を要求するため、`#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]`
-を付けた `AppEvent` に `f32` を含めるとコンパイルエラー。`u32` (`f32::to_bits`) で運んで
-受信側で `f32::from_bits` で戻すパターンを踏襲する（`SetMasterGain`, `Tick(_, peak_l, peak_r)` 参照）。
+0.3 では `Keymap` の Action 型に `Hash + Eq` が要求され、`f32` を含む `AppEvent` は
+`#[derive(Hash, Eq)]` できなかったため `to_bits/from_bits` で `u32` 運搬していた。
+0.4 では Action は `'static + Clone + PartialEq + Send + Sync` のみで OK になり、`AppEvent` は
+`#[derive(Debug, Clone, PartialEq)]` で十分。`f32` / `f64` を直接 variant に持てる。
+旧 bits 運搬パターン (`SetMasterGain(u32)` / `Tick(u64, u32, u32)` 等) は全廃。
 
 ### 子プロセスとクロスプロセス HWND（Windows）
 

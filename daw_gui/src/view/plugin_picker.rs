@@ -1,36 +1,33 @@
 //! Modal plugin picker overlay. Displays every entry from the plugin
 //! database as a clickable row; selecting one emits
 //! `AppEvent::SelectPluginFromDb` which swaps in the corresponding plugin.
-//!
-//! Rendered as a self-directed overlay on top of the main window so it can
-//! sit above the Arrangement / Inspector panels without disturbing their
-//! layout.
 
 use vizia::prelude::*;
 
-use crate::app::{AppData, AppEvent};
+use crate::app::{AppEvent, PluginPickEntry};
+
+#[derive(Copy, Clone)]
+pub struct PluginPickerSignals {
+    pub plugin_picker_visible: Signal<Vec<PluginPickEntry>>,
+    pub is_rescanning: Signal<bool>,
+}
 
 pub struct PluginPickerView;
 
 impl PluginPickerView {
-    pub fn new(cx: &mut Context) -> Handle<'_, Self> {
-        Self.build(cx, |cx| {
-            VStack::new(cx, |cx| {
+    pub fn new(cx: &mut Context, sig: PluginPickerSignals) -> Handle<'_, Self> {
+        Self.build(cx, move |cx| {
+            VStack::new(cx, move |cx| {
                 // Title row: "Select Plugin" + Rescan + close buttons.
-                HStack::new(cx, |cx| {
+                HStack::new(cx, move |cx| {
                     Label::new(cx, "Select Plugin")
                         .font_size(16.0)
                         .color(Color::rgb(230, 230, 230));
-                    // Elastic spacer
                     Element::new(cx).width(Stretch(1.0));
-                    // Rescan button flips the label to "Rescanning..." while a
-                    // worker is walking the CLAP + VST3 directories; the
-                    // `AppEvent` handler filters out duplicate presses so the
-                    // spinner can't spawn a second scan.
-                    Button::new(cx, |cx| {
+                    Button::new(cx, move |cx| {
                         Label::new(
                             cx,
-                            AppData::is_rescanning.map(|r| {
+                            sig.is_rescanning.map(|r: &bool| {
                                 if *r { "Rescanning..." } else { "Rescan" }.to_string()
                             }),
                         )
@@ -47,21 +44,16 @@ impl PluginPickerView {
                 .gap(Pixels(6.0))
                 .height(Pixels(40.0));
 
-                ScrollView::new(cx, |cx| {
-                    List::new(cx, AppData::plugin_picker_visible, |cx, _idx, item| {
-                        // Each row: button labelled "Name — Vendor". We set
-                        // the button background explicitly so the Vizia
-                        // default light theme doesn't wash out the labels.
-                        Button::new(cx, |cx| {
-                            HStack::new(cx, |cx| {
+                ScrollView::new(cx, move |cx| {
+                    List::new(cx, sig.plugin_picker_visible, |cx, _idx, item| {
+                        Button::new(cx, move |cx| {
+                            HStack::new(cx, move |cx| {
                                 Label::new(cx, item.map(|e| e.name.clone()))
                                     .color(Color::rgb(230, 230, 230));
                                 Element::new(cx).width(Stretch(1.0));
                                 Label::new(cx, item.map(|e| e.vendor.clone()))
                                     .color(Color::rgb(170, 170, 170))
                                     .font_size(11.0);
-                                // Format badge (CLAP / VST3) at the end of
-                                // the row, fixed-width so badges align.
                                 Label::new(cx, item.map(|e| e.format_label.clone()))
                                     .color(Color::rgb(140, 180, 220))
                                     .font_size(10.0)
@@ -72,8 +64,7 @@ impl PluginPickerView {
                             .padding(Pixels(4.0))
                         })
                         .on_press(move |ex| {
-                            // Recover the id at press-time via a lens read:
-                            let id = item.get(ex).id.clone();
+                            let id = item.get().id.clone();
                             ex.emit(AppEvent::SelectPluginFromDb(id));
                         })
                         .background_color(Color::rgb(55, 55, 60))
@@ -91,8 +82,6 @@ impl PluginPickerView {
             .background_color(Color::rgb(40, 40, 44))
             .padding(Pixels(8.0));
         })
-        // Self-directed positioning puts us absolute on top of the parent
-        // (the Application root in main.rs).
         .position_type(PositionType::Absolute)
         .alignment(Alignment::Center)
         .width(Stretch(1.0))

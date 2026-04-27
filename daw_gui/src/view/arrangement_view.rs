@@ -1,24 +1,18 @@
 //! Arrangement view: track headers on the left, timeline canvas on the
 //! right. Each clip is a rectangle the user can drag (move) or grab the
 //! right edge of (resize). Empty-area double-click creates a new clip.
-//!
-//! The view is split in two pieces wired into one HStack from `main.rs`:
-//!   - `TrackHeadersView`  — list of mute/solo/select rows, fixed width.
-//!   - `ArrangementCanvas` — custom Vizia `View` that owns drag state and
-//!     draws clip rectangles + the playhead via `vizia::vg`.
+
+use std::cell::RefCell;
 
 use vizia::prelude::*;
 use vizia::vg;
 
-use crate::app::{
-    ARRANGE_TRACK_HEIGHT, AppData, AppEvent, ClipBox, ClipRef, TrackHeader,
-};
+use crate::app::{ARRANGE_TRACK_HEIGHT, AppEvent, ClipBox, ClipRef, TrackHeader};
 
 const TRACK_HEADER_WIDTH: f32 = 160.0;
 const RESIZE_HANDLE_PX: f32 = 6.0;
 const RULER_HEIGHT: f32 = 20.0;
-/// Maximum song length (in beats) the canvas tries to render. Anything
-/// past this just isn't drawn — fine for v1 since songs are short.
+/// Maximum song length (in beats) the canvas tries to render.
 const MAX_BEATS: f32 = 256.0;
 
 const COLOR_BG: Color = Color::rgb(28, 28, 32);
@@ -31,8 +25,6 @@ const COLOR_CLIP_BORDER: Color = Color::rgb(20, 20, 28);
 const COLOR_CLIP_TEXT: Color = Color::rgb(240, 240, 240);
 const COLOR_RULER_BG: Color = Color::rgb(36, 36, 40);
 
-/// Convert vizia's `Color` into the skia color used by Paint. `vizia::vg`
-/// is just a re-export of `skia_safe`, so `vg::Color` is `skia_safe::Color`.
 fn skia_rgba(c: Color) -> vg::Color {
     vg::Color::from_argb(c.a(), c.r(), c.g(), c.b())
 }
@@ -57,14 +49,28 @@ fn rect(x: f32, y: f32, w: f32, h: f32) -> vg::Rect {
     vg::Rect::new(x, y, x + w, y + h)
 }
 
+#[derive(Copy, Clone)]
+pub struct ArrangementSignals {
+    pub track_headers: Signal<Vec<TrackHeader>>,
+    pub track_rename_idx: Signal<Option<u32>>,
+    pub track_rename_text: Signal<String>,
+    pub clip_boxes: Signal<Vec<ClipBox>>,
+    pub track_count: Signal<u32>,
+    pub arrange_zoom_x: Signal<f32>,
+    pub arrange_scroll_beat: Signal<f32>,
+    pub playhead_beat: Signal<Option<f32>>,
+    pub loop_start_beat: Signal<f32>,
+    pub loop_end_beat: Signal<f32>,
+}
+
 pub struct ArrangementView;
 
 impl ArrangementView {
-    pub fn new(cx: &mut Context) -> Handle<'_, Self> {
-        Self.build(cx, |cx| {
-            HStack::new(cx, |cx| {
-                build_track_headers(cx);
-                ArrangementCanvas::new(cx)
+    pub fn new(cx: &mut Context, sig: ArrangementSignals) -> Handle<'_, Self> {
+        Self.build(cx, move |cx| {
+            HStack::new(cx, move |cx| {
+                build_track_headers(cx, sig);
+                ArrangementCanvas::new(cx, sig)
                     .width(Stretch(1.0))
                     .height(Stretch(1.0));
             });
@@ -82,14 +88,14 @@ impl View for ArrangementView {
 // Track headers panel
 // ---------------------------------------------------------------------------
 
-fn build_track_headers(cx: &mut Context) {
-    VStack::new(cx, |cx| {
+fn build_track_headers(cx: &mut Context, sig: ArrangementSignals) {
+    VStack::new(cx, move |cx| {
         Element::new(cx)
             .width(Stretch(1.0))
             .height(Pixels(RULER_HEIGHT))
             .background_color(Color::rgb(36, 36, 40));
-        List::new(cx, AppData::track_headers, |cx, _idx, item| {
-            track_header_row(cx, item);
+        List::new(cx, sig.track_headers, move |cx, _idx, item| {
+            track_header_row(cx, item, sig);
         })
         .class("track-headers-list")
         .width(Stretch(1.0));
@@ -98,12 +104,9 @@ fn build_track_headers(cx: &mut Context) {
     .background_color(Color::rgb(40, 40, 44));
 }
 
-fn track_header_row<L>(cx: &mut Context, item: L)
-where
-    L: Lens<Target = TrackHeader> + Send + Sync,
-{
-    VStack::new(cx, |cx| {
-        track_header_top_row(cx, item);
+fn track_header_row(cx: &mut Context, item: Signal<TrackHeader>, sig: ArrangementSignals) {
+    VStack::new(cx, move |cx| {
+        track_header_top_row(cx, item, sig);
         track_header_bottom_row(cx, item);
     })
     .padding(Pixels(2.0))
@@ -111,20 +114,16 @@ where
     .height(Pixels(ARRANGE_TRACK_HEIGHT));
 }
 
-fn track_header_top_row<L>(cx: &mut Context, item: L)
-where
-    L: Lens<Target = TrackHeader> + Send + Sync,
-{
-    HStack::new(cx, |cx| {
+fn track_header_top_row(cx: &mut Context, item: Signal<TrackHeader>, sig: ArrangementSignals) {
+    HStack::new(cx, move |cx| {
         // Either a click-to-select Button (default) or a Textbox (when
         // this row is in rename mode). The branch flips inside a Binding
-        // so toggling rename only rebuilds the name cell, not the full
-        // header row.
-        Binding::new(cx, AppData::track_rename_idx, move |cx, rename_idx| {
-            let editing_idx: Option<u32> = rename_idx.get(cx);
-            let this_idx: u32 = item.get(cx).index;
+        // so toggling rename only rebuilds the name cell.
+        Binding::new(cx, sig.track_rename_idx, move |cx| {
+            let editing_idx = sig.track_rename_idx.get();
+            let this_idx: u32 = item.get().index;
             if editing_idx == Some(this_idx) {
-                Textbox::new(cx, AppData::track_rename_text)
+                Textbox::new(cx, sig.track_rename_text)
                     .on_edit(|ex, text| ex.emit(AppEvent::RenameTrackChanged(text)))
                     .on_submit(|ex, _, _| ex.emit(AppEvent::CommitRenameTrack))
                     .on_cancel(|ex| ex.emit(AppEvent::CancelRenameTrack))
@@ -132,17 +131,15 @@ where
                     .height(Pixels(24.0))
                     .focused(true);
             } else {
-                let click_item = item;
-                let dbl_item = item;
-                Button::new(cx, |cx| {
+                Button::new(cx, move |cx| {
                     Label::new(cx, item.map(|h| h.name.clone())).font_size(11.0)
                 })
                 .on_press(move |ex| {
-                    let h = click_item.get(ex);
+                    let h = item.get();
                     ex.emit(AppEvent::SelectTrack(h.index));
                 })
                 .on_double_click(move |ex, _| {
-                    let h = dbl_item.get(ex);
+                    let h = item.get();
                     ex.emit(AppEvent::BeginRenameTrack(h.index));
                 })
                 .background_color(item.map(|h| {
@@ -157,10 +154,9 @@ where
             }
         });
 
-        let mute_item = item;
         Button::new(cx, |cx| Label::new(cx, "M").font_size(10.0))
             .on_press(move |ex| {
-                let h = mute_item.get(ex);
+                let h = item.get();
                 ex.emit(AppEvent::ToggleTrackMute(h.index));
             })
             .background_color(item.map(|h| {
@@ -173,10 +169,9 @@ where
             .width(Pixels(20.0))
             .height(Pixels(20.0));
 
-        let solo_item = item;
         Button::new(cx, |cx| Label::new(cx, "S").font_size(10.0))
             .on_press(move |ex| {
-                let h = solo_item.get(ex);
+                let h = item.get();
                 ex.emit(AppEvent::ToggleTrackSolo(h.index));
             })
             .background_color(item.map(|h| {
@@ -194,26 +189,20 @@ where
     .height(Pixels(24.0));
 }
 
-/// Reorder + delete buttons on the second row of the track header.
-fn track_header_bottom_row<L>(cx: &mut Context, item: L)
-where
-    L: Lens<Target = TrackHeader> + Send + Sync,
-{
-    HStack::new(cx, |cx| {
-        let up_item = item;
+fn track_header_bottom_row(cx: &mut Context, item: Signal<TrackHeader>) {
+    HStack::new(cx, move |cx| {
         Button::new(cx, |cx| Label::new(cx, "▲").font_size(10.0))
             .on_press(move |ex| {
-                let h = up_item.get(ex);
+                let h = item.get();
                 ex.emit(AppEvent::MoveTrackUp(h.index));
             })
             .background_color(Color::rgb(55, 55, 60))
             .width(Pixels(22.0))
             .height(Pixels(18.0));
 
-        let down_item = item;
         Button::new(cx, |cx| Label::new(cx, "▼").font_size(10.0))
             .on_press(move |ex| {
-                let h = down_item.get(ex);
+                let h = item.get();
                 ex.emit(AppEvent::MoveTrackDown(h.index));
             })
             .background_color(Color::rgb(55, 55, 60))
@@ -222,10 +211,9 @@ where
 
         Element::new(cx).width(Stretch(1.0));
 
-        let del_item = item;
         Button::new(cx, |cx| Label::new(cx, "✕").font_size(10.0))
             .on_press(move |ex| {
-                let h = del_item.get(ex);
+                let h = item.get();
                 ex.emit(AppEvent::DeleteTrack(h.index));
             })
             .background_color(Color::rgb(80, 50, 50))
@@ -241,20 +229,14 @@ where
 // Custom canvas
 // ---------------------------------------------------------------------------
 
-/// Visual styling for the user-defined loop region drawn on the ruler.
 const COLOR_LOOP_BAND: Color = Color::rgba(80, 200, 230, 80);
 const COLOR_LOOP_EDGE: Color = Color::rgb(80, 200, 230);
 
 #[derive(Clone, Debug)]
 enum DragKind {
-    /// Drag started on the ruler. The user is painting a new loop region
-    /// from `start_beat` to wherever the cursor is now (clamped >= start).
     LoopRange {
         start_beat: f64,
     },
-    /// Move every entry by the same beat-delta. The snapshot pins the
-    /// original start_beat per clip so re-renders mid-drag don't drift
-    /// against an already-moved model.
     MoveClips {
         snapshots: Vec<(ClipRef, f64)>,
     },
@@ -262,7 +244,6 @@ enum DragKind {
         clip: ClipRef,
         original_length_beats: f64,
     },
-    /// Box-select. `origin_*` is canvas-relative.
     Marquee {
         origin_x: f32,
         origin_y: f32,
@@ -272,33 +253,28 @@ enum DragKind {
 }
 
 pub struct ArrangementCanvas {
-    drag: Option<DragKind>,
-    drag_origin_x: f32,
+    drag: RefCell<Option<DragKind>>,
+    drag_origin_x: RefCell<f32>,
+    sig: ArrangementSignals,
 }
 
 impl ArrangementCanvas {
-    pub fn new(cx: &mut Context) -> Handle<'_, Self> {
-        // Vizia 0.3 doesn't auto-redraw a custom View when the lenses it
-        // reads inside `draw` change — it only invalidates on layout /
-        // style updates. We bind the lenses we read so a model edit
-        // (clip add / move, playhead tick, etc.) marks the view dirty.
+    pub fn new(cx: &mut Context, sig: ArrangementSignals) -> Handle<'_, Self> {
         Self {
-            drag: None,
-            drag_origin_x: 0.0,
+            drag: RefCell::new(None),
+            drag_origin_x: RefCell::new(0.0),
+            sig,
         }
         .build(cx, |_cx| {})
-        .bind(AppData::clip_boxes, |mut handle, _| handle.needs_redraw())
-        .bind(AppData::track_count, |mut handle, _| handle.needs_redraw())
-        .bind(AppData::arrange_zoom_x, |mut handle, _| handle.needs_redraw())
-        .bind(AppData::arrange_scroll_beat, |mut handle, _| handle.needs_redraw())
-        .bind(AppData::playhead_beat, |mut handle, _| handle.needs_redraw())
-        .bind(AppData::loop_start_beat, |mut handle, _| handle.needs_redraw())
-        .bind(AppData::loop_end_beat, |mut handle, _| handle.needs_redraw())
+        .bind(sig.clip_boxes, |mut handle| handle.needs_redraw())
+        .bind(sig.track_count, |mut handle| handle.needs_redraw())
+        .bind(sig.arrange_zoom_x, |mut handle| handle.needs_redraw())
+        .bind(sig.arrange_scroll_beat, |mut handle| handle.needs_redraw())
+        .bind(sig.playhead_beat, |mut handle| handle.needs_redraw())
+        .bind(sig.loop_start_beat, |mut handle| handle.needs_redraw())
+        .bind(sig.loop_end_beat, |mut handle| handle.needs_redraw())
     }
 
-    /// Convert a canvas-relative `(x, y)` into the logical `(beat, track)`
-    /// the timeline rules see. Includes the active scroll offset so a
-    /// scrolled view hits the right clip.
     fn coord_to_beat_track(
         mx: f32,
         my: f32,
@@ -313,12 +289,15 @@ impl ArrangementCanvas {
         Some((beat as f64, track))
     }
 
-    fn hit_clip(clip_boxes: &[ClipBox], beat: f64, track: u32) -> Option<&ClipBox> {
-        clip_boxes.iter().find(|c| {
-            c.track == track
-                && (beat as f32) >= c.start_beat
-                && (beat as f32) <= c.start_beat + c.length_beats
-        })
+    fn hit_clip(clip_boxes: &[ClipBox], beat: f64, track: u32) -> Option<ClipBox> {
+        clip_boxes
+            .iter()
+            .find(|c| {
+                c.track == track
+                    && (beat as f32) >= c.start_beat
+                    && (beat as f32) <= c.start_beat + c.length_beats
+            })
+            .cloned()
     }
 }
 
@@ -329,29 +308,24 @@ impl View for ArrangementCanvas {
 
     fn draw(&self, cx: &mut DrawContext, canvas: &Canvas) {
         let bounds = cx.bounds();
-        let zoom: f32 = AppData::arrange_zoom_x.get(cx);
-        let scroll_beat: f32 = AppData::arrange_scroll_beat.get(cx);
-        let track_count: u32 = AppData::track_count.get(cx);
-        let clip_boxes: Vec<ClipBox> = AppData::clip_boxes.get(cx);
-        let playhead: Option<f32> = AppData::playhead_beat.get(cx);
+        let zoom = self.sig.arrange_zoom_x.get_untracked();
+        let scroll_beat = self.sig.arrange_scroll_beat.get_untracked();
+        let track_count = self.sig.track_count.get_untracked();
+        let clip_boxes = self.sig.clip_boxes.get_untracked();
+        let playhead = self.sig.playhead_beat.get_untracked();
 
-        // Background.
         canvas.draw_rect(
             rect(bounds.x, bounds.y, bounds.w, bounds.h),
             &fill_paint(COLOR_BG),
         );
 
-        // Ruler strip at the top.
         canvas.draw_rect(
             rect(bounds.x, bounds.y, bounds.w, RULER_HEIGHT),
             &fill_paint(COLOR_RULER_BG),
         );
 
-        // Loop region band: a colored strip on the ruler showing the
-        // current user-defined loop bounds. When start == end (cleared)
-        // nothing is drawn, and the engine falls back to song bounds.
-        let loop_start = AppData::loop_start_beat.get(cx);
-        let loop_end = AppData::loop_end_beat.get(cx);
+        let loop_start = self.sig.loop_start_beat.get_untracked();
+        let loop_end = self.sig.loop_end_beat.get_untracked();
         if loop_end > loop_start {
             let lx = bounds.x + (loop_start - scroll_beat) * zoom;
             let lw = (loop_end - loop_start) * zoom;
@@ -364,7 +338,7 @@ impl View for ArrangementCanvas {
                     &fill_paint(COLOR_LOOP_BAND),
                 );
                 let edge_paint = stroke_paint(COLOR_LOOP_EDGE, 1.5);
-                let mut p = vg::Path::new();
+                let mut p = vg::PathBuilder::new();
                 if lx >= bounds.x && lx <= bounds.x + bounds.w {
                     p.move_to((lx, bounds.y));
                     p.line_to((lx, bounds.y + RULER_HEIGHT));
@@ -374,13 +348,11 @@ impl View for ArrangementCanvas {
                     p.move_to((rx, bounds.y));
                     p.line_to((rx, bounds.y + RULER_HEIGHT));
                 }
+                let p = p.detach();
                 canvas.draw_path(&p, &edge_paint);
             }
         }
 
-        // Vertical bar lines every 4 beats. Start from the first bar that
-        // is at or before the visible left edge so the grid stays aligned
-        // even when scrolled.
         let bar_paint = stroke_paint(COLOR_BAR_LINE, 1.0);
         let beats_per_bar = 4u32;
         let first_bar = ((scroll_beat as i32) / beats_per_bar as i32).max(0);
@@ -395,26 +367,26 @@ impl View for ArrangementCanvas {
             if x > bounds.x + bounds.w {
                 break;
             }
-            let mut p = vg::Path::new();
+            let mut p = vg::PathBuilder::new();
             p.move_to((x, bounds.y));
             p.line_to((x, bounds.y + bounds.h));
+            let p = p.detach();
             canvas.draw_path(&p, &bar_paint);
         }
 
-        // Horizontal track lane separators.
         let lane_paint = stroke_paint(COLOR_LANE_LINE, 1.0);
         for i in 0..=track_count {
             let y = bounds.y + RULER_HEIGHT + (i as f32) * ARRANGE_TRACK_HEIGHT;
             if y > bounds.y + bounds.h {
                 break;
             }
-            let mut p = vg::Path::new();
+            let mut p = vg::PathBuilder::new();
             p.move_to((bounds.x, y));
             p.line_to((bounds.x + bounds.w, y));
+            let p = p.detach();
             canvas.draw_path(&p, &lane_paint);
         }
 
-        // Clip rectangles.
         let border_paint = stroke_paint(COLOR_CLIP_BORDER, 1.0);
         let mut text_paint = vg::Paint::default();
         text_paint.set_color(skia_rgba(COLOR_CLIP_TEXT));
@@ -446,44 +418,43 @@ impl View for ArrangementCanvas {
             }
         }
 
-        // Playhead vertical line.
         if let Some(beat) = playhead {
             let x = bounds.x + (beat - scroll_beat) * zoom;
             if x >= bounds.x && x <= bounds.x + bounds.w {
-                let mut path = vg::Path::new();
+                let mut path = vg::PathBuilder::new();
                 path.move_to((x, bounds.y));
                 path.line_to((x, bounds.y + bounds.h));
+                let path = path.detach();
                 let mut p = stroke_paint(COLOR_PLAYHEAD, 1.5);
                 p.set_anti_alias(true);
                 canvas.draw_path(&path, &p);
             }
         }
-        let _ = MAX_BEATS; // kept as a doc-tying constant; not used at draw time
+        let _ = MAX_BEATS;
     }
 
     fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
+        let sig = self.sig;
         event.map(|window_event, meta| match window_event {
             WindowEvent::MouseDown(MouseButton::Left) => {
                 let bounds = cx.bounds();
                 let mx = cx.mouse().cursor_x - bounds.x;
                 let my = cx.mouse().cursor_y - bounds.y;
-                let zoom = AppData::arrange_zoom_x.get(cx);
-                let scroll_beat = AppData::arrange_scroll_beat.get(cx);
-                let clip_boxes: Vec<ClipBox> = AppData::clip_boxes.get(cx);
+                let zoom = sig.arrange_zoom_x.get_untracked();
+                let scroll_beat = sig.arrange_scroll_beat.get_untracked();
+                let clip_boxes = sig.clip_boxes.get_untracked();
                 let shift = cx.modifiers().shift();
-                // Ruler row → drag-to-set loop region. Snap origin to a
-                // whole beat so user-painted ranges align with bars.
                 if (0.0..RULER_HEIGHT).contains(&my) {
                     let beat_at_mouse =
                         ((mx / zoom) + scroll_beat).max(0.0) as f64;
                     let snapped = beat_at_mouse.floor();
-                    self.drag = Some(DragKind::LoopRange {
+                    *self.drag.borrow_mut() = Some(DragKind::LoopRange {
                         start_beat: snapped,
                     });
-                    self.drag_origin_x = mx;
+                    *self.drag_origin_x.borrow_mut() = mx;
                     cx.emit(AppEvent::SetLoopRange {
-                        start_bits: snapped.to_bits(),
-                        end_bits: snapped.to_bits(),
+                        start: snapped,
+                        end: snapped,
                     });
                     cx.emit(AppEvent::BeginDrag);
                     cx.capture();
@@ -504,7 +475,6 @@ impl View for ArrangementCanvas {
                         target,
                         additive: shift,
                     });
-                    // Shift+click toggles selection — no drag.
                     if shift {
                         meta.consume();
                         return;
@@ -512,29 +482,23 @@ impl View for ArrangementCanvas {
                     let right_edge_px =
                         (c.start_beat + c.length_beats - scroll_beat) * zoom;
                     let from_right = right_edge_px - mx;
-                    self.drag_origin_x = mx;
-                    // Snapshot pre-drag state so Ctrl+Z rewinds the whole
-                    // drag, not just the last per-frame `SetClipPositions`.
+                    *self.drag_origin_x.borrow_mut() = mx;
                     cx.emit(AppEvent::PushUndoSnapshot);
-                    self.drag = if from_right < RESIZE_HANDLE_PX {
+                    *self.drag.borrow_mut() = if from_right < RESIZE_HANDLE_PX {
                         Some(DragKind::ResizeClip {
                             clip: target,
                             original_length_beats: c.length_beats as f64,
                         })
                     } else {
-                        // Snapshot every selected clip's start_beat so the
-                        // group slides together. If the clicked clip
-                        // wasn't in the prior selection, SelectClip above
-                        // replaced selection with `[target]` already, so
-                        // reading the cached clip_boxes' selected flag
-                        // would lag — explicitly include `target` plus the
-                        // others that were already selected.
                         let mut snapshots: Vec<(ClipRef, f64)> = clip_boxes
                             .iter()
                             .filter(|c| c.selected)
                             .map(|c| {
                                 (
-                                    ClipRef { track: c.track, clip: c.clip },
+                                    ClipRef {
+                                        track: c.track,
+                                        clip: c.clip,
+                                    },
                                     c.start_beat as f64,
                                 )
                             })
@@ -548,13 +512,10 @@ impl View for ArrangementCanvas {
                     cx.capture();
                     meta.consume();
                 } else if my >= RULER_HEIGHT {
-                    // Empty lane — start a marquee unless the click is in
-                    // the ruler. If not Shift, the in-progress selection
-                    // stays cleared on MouseUp without box dragging too.
                     if !shift {
                         cx.emit(AppEvent::ClearSelection);
                     }
-                    self.drag = Some(DragKind::Marquee {
+                    *self.drag.borrow_mut() = Some(DragKind::Marquee {
                         origin_x: mx,
                         origin_y: my,
                         cur_x: mx,
@@ -566,17 +527,20 @@ impl View for ArrangementCanvas {
                 }
             }
             WindowEvent::MouseMove(_, _) => {
-                let Some(kind) = self.drag.clone() else { return };
+                let kind = match self.drag.borrow().clone() {
+                    Some(k) => k,
+                    None => return,
+                };
                 let bounds = cx.bounds();
                 let mx = cx.mouse().cursor_x - bounds.x;
                 let my = cx.mouse().cursor_y - bounds.y;
-                let zoom = AppData::arrange_zoom_x.get(cx);
-                let dx = mx - self.drag_origin_x;
+                let zoom = sig.arrange_zoom_x.get_untracked();
+                let dx = mx - *self.drag_origin_x.borrow();
                 let dbeat = (dx / zoom) as f64;
                 match kind {
                     DragKind::LoopRange { start_beat } => {
                         let cur_beat = ((mx / zoom)
-                            + AppData::arrange_scroll_beat.get(cx))
+                            + sig.arrange_scroll_beat.get_untracked())
                             .max(0.0) as f64;
                         let snapped_cur = cur_beat.round();
                         let (s, e) = if snapped_cur > start_beat {
@@ -584,15 +548,12 @@ impl View for ArrangementCanvas {
                         } else {
                             (snapped_cur, start_beat)
                         };
-                        cx.emit(AppEvent::SetLoopRange {
-                            start_bits: s.to_bits(),
-                            end_bits: e.to_bits(),
-                        });
+                        cx.emit(AppEvent::SetLoopRange { start: s, end: e });
                     }
                     DragKind::MoveClips { snapshots } => {
-                        let entries: Vec<(ClipRef, u64)> = snapshots
+                        let entries: Vec<(ClipRef, f64)> = snapshots
                             .iter()
-                            .map(|(r, s)| (*r, (s + dbeat).max(0.0).to_bits()))
+                            .map(|(r, s)| (*r, (s + dbeat).max(0.0)))
                             .collect();
                         cx.emit(AppEvent::SetClipPositions(entries));
                     }
@@ -603,12 +564,13 @@ impl View for ArrangementCanvas {
                         let new_len = (original_length_beats + dbeat).max(0.25);
                         cx.emit(AppEvent::ResizeClip {
                             target: clip,
-                            length_bits: new_len.to_bits(),
+                            length: new_len,
                         });
                     }
-                    DragKind::Marquee { origin_x, origin_y, .. } => {
-                        // Track latest cursor for redraw + on-MouseUp commit.
-                        self.drag = Some(DragKind::Marquee {
+                    DragKind::Marquee {
+                        origin_x, origin_y, ..
+                    } => {
+                        *self.drag.borrow_mut() = Some(DragKind::Marquee {
                             origin_x,
                             origin_y,
                             cur_x: mx,
@@ -617,27 +579,26 @@ impl View for ArrangementCanvas {
                     }
                 }
             }
-            WindowEvent::MouseUp(MouseButton::Left) if self.drag.is_some() => {
+            WindowEvent::MouseUp(MouseButton::Left) if self.drag.borrow().is_some() => {
+                let drag = self.drag.borrow_mut().take();
                 if let Some(DragKind::Marquee {
                     origin_x,
                     origin_y,
                     cur_x,
                     cur_y,
-                }) = self.drag.clone()
+                }) = drag
                 {
-                    let zoom = AppData::arrange_zoom_x.get(cx);
-                    let scroll_beat = AppData::arrange_scroll_beat.get(cx);
-                    let clip_boxes: Vec<ClipBox> = AppData::clip_boxes.get(cx);
+                    let zoom = sig.arrange_zoom_x.get_untracked();
+                    let scroll_beat = sig.arrange_scroll_beat.get_untracked();
+                    let clip_boxes = sig.clip_boxes.get_untracked();
                     let x0 = origin_x.min(cur_x);
                     let x1 = origin_x.max(cur_x);
                     let y0 = origin_y.min(cur_y);
                     let y1 = origin_y.max(cur_y);
                     let beat0 = (x0 / zoom + scroll_beat).max(0.0);
                     let beat1 = (x1 / zoom + scroll_beat).max(0.0);
-                    let track0 =
-                        ((y0 - RULER_HEIGHT).max(0.0) / ARRANGE_TRACK_HEIGHT) as u32;
-                    let track1 =
-                        ((y1 - RULER_HEIGHT).max(0.0) / ARRANGE_TRACK_HEIGHT) as u32;
+                    let track0 = ((y0 - RULER_HEIGHT).max(0.0) / ARRANGE_TRACK_HEIGHT) as u32;
+                    let track1 = ((y1 - RULER_HEIGHT).max(0.0) / ARRANGE_TRACK_HEIGHT) as u32;
                     let hits: Vec<ClipRef> = clip_boxes
                         .iter()
                         .filter(|c| {
@@ -646,11 +607,13 @@ impl View for ArrangementCanvas {
                                 && c.start_beat <= beat1
                                 && c.start_beat + c.length_beats >= beat0
                         })
-                        .map(|c| ClipRef { track: c.track, clip: c.clip })
+                        .map(|c| ClipRef {
+                            track: c.track,
+                            clip: c.clip,
+                        })
                         .collect();
                     cx.emit(AppEvent::SetClipSelection(hits));
                 }
-                self.drag = None;
                 cx.release();
                 cx.emit(AppEvent::EndDrag);
             }
@@ -658,17 +621,14 @@ impl View for ArrangementCanvas {
                 let bounds = cx.bounds();
                 let mx = cx.mouse().cursor_x - bounds.x;
                 let my = cx.mouse().cursor_y - bounds.y;
-                let zoom = AppData::arrange_zoom_x.get(cx);
-                let scroll_beat = AppData::arrange_scroll_beat.get(cx);
-                let clip_boxes: Vec<ClipBox> = AppData::clip_boxes.get(cx);
-                let track_count = AppData::track_count.get(cx);
-                // Double-click on the ruler clears any active loop range
-                // — Bitwig users expect a "remove loop" gesture without
-                // hunting for a menu item.
+                let zoom = sig.arrange_zoom_x.get_untracked();
+                let scroll_beat = sig.arrange_scroll_beat.get_untracked();
+                let clip_boxes = sig.clip_boxes.get_untracked();
+                let track_count = sig.track_count.get_untracked();
                 if (0.0..RULER_HEIGHT).contains(&my) {
                     cx.emit(AppEvent::SetLoopRange {
-                        start_bits: 0f64.to_bits(),
-                        end_bits: 0f64.to_bits(),
+                        start: 0.0,
+                        end: 0.0,
                     });
                     meta.consume();
                     return;
@@ -681,8 +641,6 @@ impl View for ArrangementCanvas {
                 if track >= track_count {
                     return;
                 }
-                // Bitwig: double-click on a clip opens the piano roll for
-                // it. Double-click on empty lane creates a new clip.
                 if let Some(c) = Self::hit_clip(&clip_boxes, beat, track) {
                     cx.emit(AppEvent::SelectClip {
                         target: ClipRef {
@@ -695,11 +653,10 @@ impl View for ArrangementCanvas {
                     meta.consume();
                     return;
                 }
-                // Snap to nearest beat.
                 let snapped = beat.floor().max(0.0);
                 cx.emit(AppEvent::CreateClip {
                     track,
-                    start_beat_bits: snapped.to_bits(),
+                    start_beat: snapped,
                 });
                 cx.emit(AppEvent::SelectBottomPanel(1));
                 meta.consume();
@@ -707,19 +664,15 @@ impl View for ArrangementCanvas {
             WindowEvent::MouseScroll(_, dy) => {
                 let mods = cx.modifiers();
                 if mods.ctrl() {
-                    // Zoom on Ctrl+wheel — exponential so each notch is a
-                    // perceptually equal step.
-                    let zoom = AppData::arrange_zoom_x.get(cx);
+                    let zoom = sig.arrange_zoom_x.get_untracked();
                     let factor = 1.15_f32.powf(*dy);
                     let new_zoom = (zoom * factor).clamp(2.0, 400.0);
-                    cx.emit(AppEvent::SetArrangeZoom(new_zoom.to_bits()));
+                    cx.emit(AppEvent::SetArrangeZoom(new_zoom));
                 } else {
-                    // Scroll on plain wheel — sign matches Bitwig: wheel-up
-                    // scrolls left (towards earlier beats).
-                    let scroll = AppData::arrange_scroll_beat.get(cx);
-                    let speed = 1.0_f32; // beats per notch
+                    let scroll = sig.arrange_scroll_beat.get_untracked();
+                    let speed = 1.0_f32;
                     let new_scroll = (scroll - dy * speed).max(0.0);
-                    cx.emit(AppEvent::SetArrangeScroll(new_scroll.to_bits()));
+                    cx.emit(AppEvent::SetArrangeScroll(new_scroll));
                 }
                 meta.consume();
             }

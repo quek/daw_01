@@ -1,14 +1,20 @@
 use vizia::prelude::*;
 
-use crate::app::{AppData, AppEvent, PickerTarget};
+use crate::app::{AppEvent, ChainEntry, PickerTarget};
+
+#[derive(Copy, Clone)]
+pub struct TrackInspectorSignals {
+    pub selected_track_label: Signal<String>,
+    pub inspector_chain: Signal<Vec<ChainEntry>>,
+}
 
 pub struct TrackInspectorView;
 
 impl TrackInspectorView {
-    pub fn new(cx: &mut Context) -> Handle<'_, Self> {
-        Self.build(cx, |cx| {
-            VStack::new(cx, |cx| {
-                Label::new(cx, AppData::selected_track_label)
+    pub fn new(cx: &mut Context, sig: TrackInspectorSignals) -> Handle<'_, Self> {
+        Self.build(cx, move |cx| {
+            VStack::new(cx, move |cx| {
+                Label::new(cx, sig.selected_track_label)
                     .font_size(16.0)
                     .color(Color::rgb(220, 220, 220));
 
@@ -20,22 +26,19 @@ impl TrackInspectorView {
                     .font_size(12.0)
                     .color(Color::rgb(160, 160, 160));
 
-                List::new(cx, AppData::inspector_chain, |cx, _idx, entry| {
-                    HStack::new(cx, |cx| {
+                List::new(cx, sig.inspector_chain, |cx, _idx, entry| {
+                    HStack::new(cx, move |cx| {
                         Label::new(cx, entry.map(|e| e.section_label.clone()))
                             .width(Pixels(56.0))
                             .font_size(10.0)
                             .color(Color::rgb(150, 150, 180));
-                        // Single-line plugin-name cell — long names like
-                        // "VCV Rack 2" previously wrapped and got clipped by
-                        // the fixed row height.
                         Label::new(cx, entry.map(|e| e.plugin_name.clone()))
                             .width(Stretch(1.0))
                             .text_wrap(false)
                             .color(Color::rgb(220, 220, 220));
                         Button::new(cx, |cx| Label::new(cx, "GUI"))
                             .on_press(move |ex| {
-                                let e = entry.get(ex);
+                                let e = entry.get();
                                 ex.emit(AppEvent::ToggleSlotGui {
                                     slot_kind: e.slot_kind,
                                     slot_index: e.slot_index,
@@ -45,7 +48,7 @@ impl TrackInspectorView {
                             .background_color(Color::rgb(55, 55, 60));
                         Button::new(cx, |cx| Label::new(cx, "×"))
                             .on_press(move |ex| {
-                                let e = entry.get(ex);
+                                let e = entry.get();
                                 ex.emit(AppEvent::RemoveSlot {
                                     slot_kind: e.slot_kind,
                                     slot_index: e.slot_index,
@@ -62,8 +65,7 @@ impl TrackInspectorView {
                 .class("chain-list")
                 .gap(Pixels(2.0));
 
-                // Add-plugin buttons, one per CLAP section. Each opens the
-                // Plugin Picker with the matching `PickerTarget`.
+                // Add-plugin buttons.
                 HStack::new(cx, |cx| {
                     Button::new(cx, |cx| Label::new(cx, "+ Instrument"))
                         .on_press(|ex| {

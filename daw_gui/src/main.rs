@@ -24,10 +24,15 @@ use vizia::prelude::*;
 
 use crate::app::{AppData, AppEvent};
 use crate::job::JobHandle;
-use crate::view::{
-    ArrangementView, BottomPanelView, PluginPickerView, StatusBarView, TrackInspectorView,
-    TransportView,
-};
+use crate::view::arrangement_view::{ArrangementSignals, ArrangementView};
+use crate::view::bottom_panel::{BottomPanelSignals, BottomPanelView};
+use crate::view::lyric_panel::LyricPanelSignals;
+use crate::view::mixer_strips::MasterStripSignals;
+use crate::view::piano_roll_view::PianoRollSignals;
+use crate::view::plugin_picker::{PluginPickerSignals, PluginPickerView};
+use crate::view::status_bar::StatusBarView;
+use crate::view::track_inspector::{TrackInspectorSignals, TrackInspectorView};
+use crate::view::transport::{TransportSignals, TransportView};
 
 fn main() -> Result<()> {
     common::logging::init_tracing();
@@ -197,18 +202,109 @@ fn run_gui(
 ) -> Result<()> {
     let mut incoming_rx_slot = Some(incoming_rx);
     Application::new(move |cx| {
-        cx.set_default_font(&["HackGen Console NF"]);
-        // Vizia 0.3's default `list list-item { height: 30px }` clips
-        // tall rows (e.g. mixer strips) and triggers a Skia matrix-invert
-        // panic on auto-sized list items. Override the lists we use.
+        // List default `height: 30px` clips tall rows (e.g. mixer strips)
+        // and triggers a Skia matrix-invert panic on auto-sized list items.
+        // Override the lists we use.
         let _ = cx.add_stylesheet(LIST_CSS);
-        AppData::new(
+
+        let app: &AppData = AppData::new(
             audio_tx.clone(),
             plugin_tx.clone(),
             clap_plugin_path.clone(),
             plugin_db.clone(),
         )
         .build(cx);
+
+        // Capture all Signal handles (Copy) up-front so we can hand them
+        // to view constructors and move them into Binding closures.
+        let song = app.song;
+        let file_path = app.file_path;
+        let selected_track_label = app.selected_track_label;
+        let inspector_chain = app.inspector_chain;
+        let track_headers = app.track_headers;
+        let track_rename_idx = app.track_rename_idx;
+        let track_rename_text = app.track_rename_text;
+        let clip_boxes = app.clip_boxes;
+        let track_count = app.track_count;
+        let arrange_zoom_x = app.arrange_zoom_x;
+        let arrange_scroll_beat = app.arrange_scroll_beat;
+        let playhead_beat = app.playhead_beat;
+        let loop_start_beat = app.loop_start_beat;
+        let loop_end_beat = app.loop_end_beat;
+        let bottom_panel = app.bottom_panel;
+        let track_mix = app.track_mix;
+        let master_gain = app.master_gain;
+        let peak_l_norm = app.peak_l_norm;
+        let peak_r_norm = app.peak_r_norm;
+        let is_looping = app.is_looping;
+        let selected_clip = app.selected_clip;
+        let note_boxes = app.note_boxes;
+        let pianoroll_zoom_x = app.pianoroll_zoom_x;
+        let pianoroll_zoom_y = app.pianoroll_zoom_y;
+        let pianoroll_scroll_beat = app.pianoroll_scroll_beat;
+        let pianoroll_top_pitch = app.pianoroll_top_pitch;
+        let selected_notes = app.selected_notes;
+        let selected_lyric = app.selected_lyric;
+        let plugin_picker_visible = app.plugin_picker_visible;
+        let is_rescanning = app.is_rescanning;
+        let is_plugin_picker_open = app.is_plugin_picker_open;
+        let is_help_open = app.is_help_open;
+        let recent_paths_display = app.recent_paths_display;
+        let status_message = app.status_message;
+
+        let transport_sig = TransportSignals {
+            song,
+            is_looping,
+            master_gain,
+            peak_l_norm,
+            peak_r_norm,
+        };
+        let arrangement_sig = ArrangementSignals {
+            track_headers,
+            track_rename_idx,
+            track_rename_text,
+            clip_boxes,
+            track_count,
+            arrange_zoom_x,
+            arrange_scroll_beat,
+            playhead_beat,
+            loop_start_beat,
+            loop_end_beat,
+        };
+        let inspector_sig = TrackInspectorSignals {
+            selected_track_label,
+            inspector_chain,
+        };
+        let master_sig = MasterStripSignals {
+            master_gain,
+            peak_l_norm,
+            peak_r_norm,
+        };
+        let piano_roll_sig = PianoRollSignals {
+            selected_clip,
+            note_boxes,
+            pianoroll_zoom_x,
+            pianoroll_zoom_y,
+            pianoroll_scroll_beat,
+            pianoroll_top_pitch,
+        };
+        let lyric_sig = LyricPanelSignals {
+            selected_notes,
+            selected_lyric,
+        };
+        let bottom_sig = BottomPanelSignals {
+            bottom_panel,
+            track_mix,
+            track_count,
+            master: master_sig,
+            piano_roll: piano_roll_sig,
+            lyric: lyric_sig,
+        };
+        let plugin_picker_sig = PluginPickerSignals {
+            plugin_picker_visible,
+            is_rescanning,
+        };
+
         register_shortcuts(cx);
         spawn_playhead_poller(cx, Arc::clone(&bridge));
         spawn_autosave_timer(cx);
@@ -217,38 +313,33 @@ fn run_gui(
             spawn_incoming_bridge(cx, rx);
         }
 
-        // Top-level layout:
-        //   transport (top)
-        //   ┌── inspector (left, fixed) ── arrangement (stretch) ──┐
-        //   bottom panel (mixer or piano roll)
-        //   status bar
-        VStack::new(cx, |cx| {
-            build_menu_bar(cx);
-            TransportView::new(cx).height(Pixels(44.0));
+        VStack::new(cx, move |cx| {
+            build_menu_bar(cx, recent_paths_display);
+            TransportView::new(cx, transport_sig).height(Pixels(44.0));
 
-            HStack::new(cx, |cx| {
-                TrackInspectorView::new(cx).width(Pixels(280.0));
-                ArrangementView::new(cx)
+            HStack::new(cx, move |cx| {
+                TrackInspectorView::new(cx, inspector_sig).width(Pixels(280.0));
+                ArrangementView::new(cx, arrangement_sig)
                     .width(Stretch(1.0))
                     .height(Stretch(1.0));
             })
             .height(Stretch(1.0));
 
-            BottomPanelView::new(cx);
+            BottomPanelView::new(cx, bottom_sig);
 
-            StatusBarView::new(cx).height(Pixels(26.0));
+            StatusBarView::new(cx, file_path, status_message).height(Pixels(26.0));
         });
 
         // Modal plugin-picker overlay.
-        Binding::new(cx, AppData::is_plugin_picker_open, |cx, open| {
-            if open.get(cx) {
-                PluginPickerView::new(cx);
+        Binding::new(cx, is_plugin_picker_open, move |cx| {
+            if is_plugin_picker_open.get() {
+                PluginPickerView::new(cx, plugin_picker_sig);
             }
         });
 
         // Help / keybindings cheat-sheet.
-        Binding::new(cx, AppData::is_help_open, |cx, open| {
-            if open.get(cx) {
+        Binding::new(cx, is_help_open, move |cx| {
+            if is_help_open.get() {
                 build_help_overlay(cx);
             }
         });
@@ -388,18 +479,14 @@ fn spawn_playhead_poller(cx: &mut Context, bridge: Arc<AudioBridgeHandle>) {
             let samples = bridge.playhead_samples();
             let (peak_l, peak_r) = bridge.peaks();
             if proxy
-                .emit(AppEvent::Tick(samples, peak_l.to_bits(), peak_r.to_bits()))
+                .emit(AppEvent::Tick { samples, peak_l, peak_r })
                 .is_err()
             {
                 break;
             }
             bridge.track_peaks(&mut peaks_buf);
-            let track_peaks: Vec<(u32, u32)> = peaks_buf
-                .iter()
-                .map(|&(l, r)| (l.to_bits(), r.to_bits()))
-                .collect();
             if proxy
-                .emit(AppEvent::TrackPeaksTick(track_peaks))
+                .emit(AppEvent::TrackPeaksTick(peaks_buf.clone()))
                 .is_err()
             {
                 break;
@@ -591,28 +678,28 @@ list.plugin-picker-list list-item:hover {
 }
 "#;
 
-fn build_menu_bar(cx: &mut Context) {
-    MenuBar::new(cx, |cx| {
+fn build_menu_bar(cx: &mut Context, recent_paths_display: Signal<Vec<String>>) {
+    MenuBar::new(cx, move |cx| {
         Submenu::new(
             cx,
             |cx| Label::new(cx, "File"),
-            |cx| {
+            move |cx| {
                 menu_item(cx, "New", "Ctrl+N", AppEvent::New);
                 menu_item(cx, "Open...", "Ctrl+O", AppEvent::Open);
                 Submenu::new(
                     cx,
                     |cx| Label::new(cx, "Open Recent"),
-                    |cx| {
-                        // Each entry rebuilds when AppData::recent_paths_display
+                    move |cx| {
+                        // Each entry rebuilds when recent_paths_display
                         // changes (Save / Open mutates the list).
                         List::new(
                             cx,
-                            AppData::recent_paths_display,
+                            recent_paths_display,
                             |cx, _idx, item| {
                                 MenuButton::new(
                                     cx,
                                     move |ex| {
-                                        let s = item.get(ex);
+                                        let s = item.get();
                                         ex.emit(AppEvent::OpenRecent(s.into()));
                                     },
                                     move |cx| {

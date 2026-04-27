@@ -3,24 +3,31 @@
 
 use vizia::prelude::*;
 
-use crate::app::{AppData, AppEvent};
+use crate::app::AppEvent;
+
+#[derive(Copy, Clone)]
+pub struct LyricPanelSignals {
+    pub selected_notes: Signal<Vec<u32>>,
+    pub selected_lyric: Signal<String>,
+}
 
 pub struct LyricPanel;
 
 impl LyricPanel {
-    pub fn new(cx: &mut Context) -> Handle<'_, Self> {
-        Self.build(cx, |cx| {
-            VStack::new(cx, |cx| {
+    pub fn new(cx: &mut Context, sig: LyricPanelSignals) -> Handle<'_, Self> {
+        Self.build(cx, move |cx| {
+            VStack::new(cx, move |cx| {
                 Label::new(cx, "Lyric")
                     .font_size(13.0)
                     .color(Color::rgb(180, 180, 180));
-                Binding::new(cx, AppData::selected_notes, |cx, sel| {
-                    if sel.get(cx).is_empty() {
+                Binding::new(cx, sig.selected_notes, move |cx| {
+                    let empty = sig.selected_notes.with(|v| v.is_empty());
+                    if empty {
                         Label::new(cx, "(ノート未選択)")
                             .color(Color::rgb(120, 120, 120))
                             .font_size(12.0);
                     } else {
-                        Textbox::new(cx, AppData::selected_lyric)
+                        Textbox::new(cx, sig.selected_lyric)
                             .on_edit(|ex, t| {
                                 ex.emit(AppEvent::SetSelectedNoteLyric(t));
                             })
