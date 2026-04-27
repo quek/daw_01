@@ -128,6 +128,7 @@ where
             // the dB scale (-80..+6 dB).
             Slider::new(cx, entry.map(|e| amp_to_fader(e.volume)))
                 .range(0.0..1.0)
+                .vertical(true)
                 .on_change(move |ex, fader_pos| {
                     let amp = fader_to_amp(fader_pos);
                     let idx = entry.get().index;
@@ -166,6 +167,7 @@ pub fn master_strip(cx: &mut Context, sig: MasterStripSignals) {
         HStack::new(cx, move |cx| {
             Slider::new(cx, sig.master_gain.map(|g: &f32| amp_to_fader(*g)))
                 .range(0.0..1.0)
+                .vertical(true)
                 .on_change(|ex, fader_pos| {
                     let amp = fader_to_amp(fader_pos);
                     ex.emit(AppEvent::SetMasterGain(amp));
