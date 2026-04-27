@@ -8,7 +8,7 @@ use crate::app::AppEvent;
 #[derive(Copy, Clone)]
 pub struct LyricPanelSignals {
     pub selected_notes: Signal<Vec<u32>>,
-    pub selected_lyric: Signal<String>,
+    pub selected_lyric: Memo<String>,
 }
 
 pub struct LyricPanel;

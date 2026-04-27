@@ -25,8 +25,8 @@ const TAB_BG_ACTIVE: Color = Color::rgb(60, 80, 110);
 #[derive(Copy, Clone)]
 pub struct BottomPanelSignals {
     pub bottom_panel: Signal<u8>,
-    pub track_mix: Signal<Vec<TrackMixEntry>>,
-    pub track_count: Signal<u32>,
+    pub track_mix: Memo<Vec<TrackMixEntry>>,
+    pub track_count: Memo<u32>,
     pub master: MasterStripSignals,
     pub piano_roll: PianoRollSignals,
     pub lyric: LyricPanelSignals,
@@ -82,8 +82,8 @@ fn tab_button(cx: &mut Context, label: &'static str, value: u8, bottom_panel: Si
 
 fn build_mixer_panel(
     cx: &mut Context,
-    track_mix: Signal<Vec<TrackMixEntry>>,
-    track_count: Signal<u32>,
+    track_mix: Memo<Vec<TrackMixEntry>>,
+    track_count: Memo<u32>,
     master: MasterStripSignals,
 ) {
     HStack::new(cx, move |cx| {
@@ -110,8 +110,8 @@ fn build_mixer_panel(
 fn build_mixer_slot(
     cx: &mut Context,
     slot: usize,
-    track_mix: Signal<Vec<TrackMixEntry>>,
-    track_count: Signal<u32>,
+    track_mix: Memo<Vec<TrackMixEntry>>,
+    track_count: Memo<u32>,
 ) {
     let entry_memo = track_mix.map(move |v: &Vec<TrackMixEntry>| {
         if slot < v.len() {

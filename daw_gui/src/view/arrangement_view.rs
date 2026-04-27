@@ -51,16 +51,16 @@ fn rect(x: f32, y: f32, w: f32, h: f32) -> vg::Rect {
 
 #[derive(Copy, Clone)]
 pub struct ArrangementSignals {
-    pub track_headers: Signal<Vec<TrackHeader>>,
+    pub track_headers: Memo<Vec<TrackHeader>>,
     pub track_rename_idx: Signal<Option<u32>>,
     pub track_rename_text: Signal<String>,
-    pub clip_boxes: Signal<Vec<ClipBox>>,
-    pub track_count: Signal<u32>,
+    pub clip_boxes: Memo<Vec<ClipBox>>,
+    pub track_count: Memo<u32>,
     pub arrange_zoom_x: Signal<f32>,
     pub arrange_scroll_beat: Signal<f32>,
     pub playhead_beat: Signal<Option<f32>>,
-    pub loop_start_beat: Signal<f32>,
-    pub loop_end_beat: Signal<f32>,
+    pub loop_start_beat: Memo<f32>,
+    pub loop_end_beat: Memo<f32>,
 }
 
 pub struct ArrangementView;

@@ -217,7 +217,7 @@ fn run_gui(
 
         // Capture all Signal handles (Copy) up-front so we can hand them
         // to view constructors and move them into Binding closures.
-        let song = app.song;
+        let bpm = app.bpm;
         let file_path = app.file_path;
         let selected_track_label = app.selected_track_label;
         let inspector_chain = app.inspector_chain;
@@ -253,7 +253,7 @@ fn run_gui(
         let status_message = app.status_message;
 
         let transport_sig = TransportSignals {
-            song,
+            bpm,
             is_looping,
             master_gain,
             peak_l_norm,

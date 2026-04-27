@@ -190,24 +190,27 @@ pub struct AppData {
     pub pianoroll_top_pitch: Signal<u8>,
     /// Beat at the left edge of the piano roll.
     pub pianoroll_scroll_beat: Signal<f32>,
-    /// Mirror of `Song::loop_start_beat` / `loop_end_beat` as `f32` so the
-    /// arrangement view can render the loop band without binding to `Song`.
-    /// Refreshed by `refresh_caches`.
-    pub loop_start_beat: Signal<f32>,
-    pub loop_end_beat: Signal<f32>,
+    /// Loop band start/end as `f32`, derived from `song.loop_*_beat` so the
+    /// arrangement view can render without binding to `Song` directly.
+    pub loop_start_beat: Memo<f32>,
+    pub loop_end_beat: Memo<f32>,
 
-    // -------- Cached signal-bound snapshots --------------------------------
+    /// `song.bpm` projected as a Memo so the transport view can render
+    /// without binding to the entire `Song`.
+    pub bpm: Memo<f32>,
+
+    // -------- Reactive snapshots derived from `song` + selection ----------
     /// Per-track header strip on the left of the arrangement view.
-    pub track_headers: Signal<Vec<TrackHeader>>,
+    pub track_headers: Memo<Vec<TrackHeader>>,
     /// Mirror of `song.tracks.len()` for slot-visibility derivations.
-    pub track_count: Signal<u32>,
+    pub track_count: Memo<u32>,
     /// All clips in the song, flattened for the arrangement view.
-    pub clip_boxes: Signal<Vec<ClipBox>>,
+    pub clip_boxes: Memo<Vec<ClipBox>>,
     /// Notes in `selected_clip` (empty if no clip selected).
-    pub note_boxes: Signal<Vec<NoteBox>>,
+    pub note_boxes: Memo<Vec<NoteBox>>,
     /// Lyric of the first selected note, or empty when nothing is selected.
     /// The lyric panel binds an editable Textbox to this.
-    pub selected_lyric: Signal<String>,
+    pub selected_lyric: Memo<String>,
 
     // -------- Playback / metering ------------------------------------------
     pub is_playing: Signal<bool>,
@@ -227,9 +230,8 @@ pub struct AppData {
     pub plugin_picker_visible: Signal<Vec<PluginPickEntry>>,
     pub is_plugin_picker_open: Signal<bool>,
     pub plugin_picker_target: Signal<PickerTarget>,
-    pub inspector_chain: Signal<Vec<ChainEntry>>,
-    pub selected_track_label: Signal<String>,
-    pub instrument_label: Signal<String>,
+    pub inspector_chain: Memo<Vec<ChainEntry>>,
+    pub selected_track_label: Memo<String>,
 
     // -------- Save flow / IPC ----------------------------------------------
     pub pending_save_path: Option<PathBuf>,
@@ -240,7 +242,7 @@ pub struct AppData {
         HashMap<(u32, PluginSlot), crate::view::plugin_embed::PluginHostWindow>,
 
     // -------- Mixer ---------------------------------------------------------
-    pub track_mix: Signal<Vec<TrackMixEntry>>,
+    pub track_mix: Memo<Vec<TrackMixEntry>>,
     pub track_peak_display: Signal<Vec<(f32, f32)>>,
 
     // -------- Background workers -------------------------------------------
@@ -303,16 +305,14 @@ impl AppData {
         // and mixer never go through the 0→N transition (Vizia's morphorm
         // layout can produce non-invertible matrices when a list flips
         // from empty to non-empty mid-frame; CLAUDE.md draw.rs:35 panic).
-        let song = Song {
+        let song_data = Song {
             tracks: vec![Track {
                 name: "Track 1".into(),
                 ..Track::default()
             }],
             ..Song::default()
         };
-        let track_count = song.tracks.len() as u32;
-        let initial_mix = initial_track_mix(&song);
-        let initial_peak_display = vec![(0.0, 0.0); song.tracks.len()];
+        let initial_peak_display = vec![(0.0, 0.0); song_data.tracks.len()];
         let plugin_picker_entries = plugin_db
             .as_ref()
             .map(|db| {
@@ -331,13 +331,200 @@ impl AppData {
                 v
             })
             .unwrap_or_default();
+
+        // Reactive state — create the upstream Signals first so the
+        // derived Memos can capture them. `Signal<T>: Copy`, so the moves
+        // into Memo closures don't prevent us from also placing the
+        // Signals in the returned `Self`.
+        let song = Signal::new(song_data);
+        let selected_track: Signal<u32> = Signal::new(0);
+        let selected_clip: Signal<Option<ClipRef>> = Signal::new(None);
+        let selected_clips: Signal<Vec<ClipRef>> = Signal::new(Vec::new());
+        let selected_notes: Signal<Vec<u32>> = Signal::new(Vec::new());
+        let track_peak_display: Signal<Vec<(f32, f32)>> = Signal::new(initial_peak_display);
+
+        // Scalar projections.
+        let bpm = song.map(|s: &Song| s.bpm);
+        let track_count = song.map(|s: &Song| s.tracks.len() as u32);
+        let loop_start_beat = song.map(|s: &Song| s.loop_start_beat as f32);
+        let loop_end_beat = song.map(|s: &Song| s.loop_end_beat as f32);
+
+        // Vec snapshots for Lists / Canvas binds.
+        let track_headers = Memo::new(move |_| {
+            let s = song.get();
+            let sel = selected_track.get();
+            s.tracks
+                .iter()
+                .enumerate()
+                .map(|(i, t)| TrackHeader {
+                    index: i as u32,
+                    name: if t.name.is_empty() {
+                        format!("Track {}", i + 1)
+                    } else {
+                        t.name.clone()
+                    },
+                    muted: t.muted,
+                    solo: t.solo,
+                    selected: i as u32 == sel,
+                })
+                .collect()
+        });
+
+        let clip_boxes = Memo::new(move |_| {
+            let s = song.get();
+            let selected = selected_clips.get();
+            s.tracks
+                .iter()
+                .enumerate()
+                .flat_map(|(t_idx, t)| {
+                    let selected = selected.clone();
+                    t.clips.iter().enumerate().map(move |(c_idx, c)| {
+                        let r = ClipRef {
+                            track: t_idx as u32,
+                            clip: c_idx as u32,
+                        };
+                        ClipBox {
+                            track: t_idx as u32,
+                            clip: c_idx as u32,
+                            name: c.name.clone(),
+                            start_beat: c.start_beat as f32,
+                            length_beats: c.length_beats as f32,
+                            selected: selected.contains(&r),
+                        }
+                    })
+                })
+                .collect()
+        });
+
+        let note_boxes = Memo::new(move |_| {
+            let s = song.get();
+            let clip_ref = selected_clip.get();
+            let selected = selected_notes.get();
+            match clip_ref {
+                Some(ClipRef { track, clip }) => s
+                    .tracks
+                    .get(track as usize)
+                    .and_then(|t| t.clips.get(clip as usize))
+                    .map(|c| {
+                        c.notes
+                            .iter()
+                            .enumerate()
+                            .map(|(i, n)| NoteBox {
+                                note: i as u32,
+                                start_beat: n.start_beat as f32,
+                                duration_beats: n.duration_beats as f32,
+                                pitch: n.pitch,
+                                velocity: n.velocity,
+                                lyric: n.lyric.clone().unwrap_or_default(),
+                                selected: selected.contains(&(i as u32)),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            }
+        });
+
+        let track_mix = Memo::new(move |_| {
+            let s = song.get();
+            let peaks = track_peak_display.get();
+            s.tracks
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let (l, r) = peaks.get(i).copied().unwrap_or((0.0, 0.0));
+                    TrackMixEntry {
+                        index: i as u32,
+                        name: if t.name.is_empty() {
+                            format!("Track {}", i + 1)
+                        } else {
+                            t.name.clone()
+                        },
+                        volume: t.volume,
+                        pan: t.pan,
+                        muted: t.muted,
+                        solo: t.solo,
+                        peak_l_norm: common::meter::db_to_norm(common::meter::linear_to_db(l)),
+                        peak_r_norm: common::meter::db_to_norm(common::meter::linear_to_db(r)),
+                    }
+                })
+                .collect()
+        });
+
+        let selected_lyric = Memo::new(move |_| {
+            let song = song.get();
+            let clip = selected_clip.get();
+            let notes = selected_notes.get();
+            notes
+                .first()
+                .copied()
+                .and_then(|n_idx| {
+                    let r = clip?;
+                    let track = song.tracks.get(r.track as usize)?;
+                    let clip = track.clips.get(r.clip as usize)?;
+                    let note = clip.notes.get(n_idx as usize)?;
+                    Some(note.lyric.clone().unwrap_or_default())
+                })
+                .unwrap_or_default()
+        });
+
+        let selected_track_label = Memo::new(move |_| {
+            let s = song.get();
+            let sel = selected_track.get();
+            s.tracks
+                .get(sel as usize)
+                .map(|t| {
+                    if t.name.is_empty() {
+                        format!("Track {}", sel + 1)
+                    } else {
+                        t.name.clone()
+                    }
+                })
+                .unwrap_or_else(|| format!("Track {}", sel + 1))
+        });
+
+        let plugin_db_for_chain = plugin_db.clone();
+        let inspector_chain = Memo::new(move |_| {
+            let s = song.get();
+            let sel = selected_track.get();
+            let Some(track) = s.tracks.get(sel as usize) else {
+                return Vec::new();
+            };
+            let mut chain: Vec<ChainEntry> = Vec::new();
+            for (i, p) in track.midi_fx_chain.iter().enumerate() {
+                chain.push(ChainEntry {
+                    slot_kind: 0,
+                    slot_index: i as u32,
+                    section_label: "MIDI FX".into(),
+                    plugin_name: resolve_plugin_name(&plugin_db_for_chain, &p.plugin_id),
+                });
+            }
+            if let Some(inst) = track.instrument.as_ref() {
+                chain.push(ChainEntry {
+                    slot_kind: 1,
+                    slot_index: 0,
+                    section_label: "Instrument".into(),
+                    plugin_name: resolve_plugin_name(&plugin_db_for_chain, &inst.plugin_id),
+                });
+            }
+            for (i, p) in track.fx_chain.iter().enumerate() {
+                chain.push(ChainEntry {
+                    slot_kind: 2,
+                    slot_index: i as u32,
+                    section_label: "FX".into(),
+                    plugin_name: resolve_plugin_name(&plugin_db_for_chain, &p.plugin_id),
+                });
+            }
+            chain
+        });
+
         Self {
-            song: Signal::new(song),
+            song,
             file_path: Signal::new(None),
-            selected_track: Signal::new(0),
-            selected_clip: Signal::new(None),
-            selected_clips: Signal::new(Vec::new()),
-            selected_notes: Signal::new(Vec::new()),
+            selected_track,
+            selected_clip,
+            selected_clips,
+            selected_notes,
             bottom_panel: Signal::new(0),
             arrange_zoom_x: Signal::new(ARRANGE_PX_PER_BEAT),
             arrange_scroll_beat: Signal::new(0.0),
@@ -345,13 +532,14 @@ impl AppData {
             pianoroll_zoom_y: Signal::new(14.0),
             pianoroll_top_pitch: Signal::new(84), // C6
             pianoroll_scroll_beat: Signal::new(0.0),
-            loop_start_beat: Signal::new(0.0),
-            loop_end_beat: Signal::new(0.0),
-            track_headers: Signal::new(Vec::new()),
-            track_count: Signal::new(track_count),
-            clip_boxes: Signal::new(Vec::new()),
-            note_boxes: Signal::new(Vec::new()),
-            selected_lyric: Signal::new(String::new()),
+            loop_start_beat,
+            loop_end_beat,
+            bpm,
+            track_headers,
+            track_count,
+            clip_boxes,
+            note_boxes,
+            selected_lyric,
             is_playing: Signal::new(false),
             is_looping: Signal::new(false),
             playhead_beat: Signal::new(None),
@@ -365,16 +553,15 @@ impl AppData {
             plugin_picker_visible: Signal::new(Vec::new()),
             is_plugin_picker_open: Signal::new(false),
             plugin_picker_target: Signal::new(PickerTarget::Instrument),
-            inspector_chain: Signal::new(Vec::new()),
-            selected_track_label: Signal::new("Track 1".to_string()),
-            instrument_label: Signal::new("(no instrument)".to_string()),
+            inspector_chain,
+            selected_track_label,
             pending_save_path: None,
             audio_tx: Some(audio_tx),
             plugin_tx: Some(plugin_tx),
             #[cfg(windows)]
             plugin_host_windows: HashMap::new(),
-            track_mix: Signal::new(initial_mix),
-            track_peak_display: Signal::new(initial_peak_display),
+            track_mix,
+            track_peak_display,
             synth_result: Arc::new(Mutex::new(Vec::new())),
             rescan_result: Arc::new(Mutex::new(None)),
             is_rescanning: Signal::new(false),
@@ -443,8 +630,7 @@ impl AppData {
         } else if self.selected_track.get_untracked() > track_max {
             self.selected_track.set(track_max);
         }
-        self.refresh_inspector_chain();
-        self.rebuild_track_mix();
+        self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
     }
 
@@ -603,107 +789,14 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
-    /// Recompute every cached signal-visible snapshot (`track_headers`,
-    /// `clip_boxes`, `note_boxes`, `selected_lyric`, `track_count`) from
-    /// `song` + selection state.
-    fn refresh_caches(&mut self) {
-        let selected_track = self.selected_track.get_untracked();
-        let selected_clip = self.selected_clip.get_untracked();
-        let selected_clips = self.selected_clips.get_untracked();
-        let selected_notes = self.selected_notes.get_untracked();
-
-        let (track_count, loop_start, loop_end, track_headers, clip_boxes, note_boxes, lyric) =
-            self.song.with_untracked(|s| {
-                let track_headers: Vec<TrackHeader> = s
-                    .tracks
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| TrackHeader {
-                        index: i as u32,
-                        name: if t.name.is_empty() {
-                            format!("Track {}", i + 1)
-                        } else {
-                            t.name.clone()
-                        },
-                        muted: t.muted,
-                        solo: t.solo,
-                        selected: i as u32 == selected_track,
-                    })
-                    .collect();
-                let clip_boxes: Vec<ClipBox> = s
-                    .tracks
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(t_idx, t)| {
-                        let selected_clips = selected_clips.clone();
-                        t.clips.iter().enumerate().map(move |(c_idx, c)| {
-                            let r = ClipRef {
-                                track: t_idx as u32,
-                                clip: c_idx as u32,
-                            };
-                            ClipBox {
-                                track: t_idx as u32,
-                                clip: c_idx as u32,
-                                name: c.name.clone(),
-                                start_beat: c.start_beat as f32,
-                                length_beats: c.length_beats as f32,
-                                selected: selected_clips.contains(&r),
-                            }
-                        })
-                    })
-                    .collect();
-                let note_boxes: Vec<NoteBox> = match selected_clip {
-                    Some(ClipRef { track, clip }) => s
-                        .tracks
-                        .get(track as usize)
-                        .and_then(|t| t.clips.get(clip as usize))
-                        .map(|c| {
-                            c.notes
-                                .iter()
-                                .enumerate()
-                                .map(|(i, n)| NoteBox {
-                                    note: i as u32,
-                                    start_beat: n.start_beat as f32,
-                                    duration_beats: n.duration_beats as f32,
-                                    pitch: n.pitch,
-                                    velocity: n.velocity,
-                                    lyric: n.lyric.clone().unwrap_or_default(),
-                                    selected: selected_notes.contains(&(i as u32)),
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    None => Vec::new(),
-                };
-                let lyric: String = selected_notes
-                    .first()
-                    .copied()
-                    .and_then(|n_idx| {
-                        let r = selected_clip?;
-                        let track = s.tracks.get(r.track as usize)?;
-                        let clip = track.clips.get(r.clip as usize)?;
-                        let note = clip.notes.get(n_idx as usize)?;
-                        Some(note.lyric.clone().unwrap_or_default())
-                    })
-                    .unwrap_or_default();
-                (
-                    s.tracks.len() as u32,
-                    s.loop_start_beat as f32,
-                    s.loop_end_beat as f32,
-                    track_headers,
-                    clip_boxes,
-                    note_boxes,
-                    lyric,
-                )
-            });
-
-        self.track_count.set(track_count);
-        self.loop_start_beat.set(loop_start);
-        self.loop_end_beat.set(loop_end);
-        self.track_headers.set(track_headers);
-        self.clip_boxes.set(clip_boxes);
-        self.note_boxes.set(note_boxes);
-        self.selected_lyric.set(lyric);
+    /// Resize `track_peak_display` so its length matches `song.tracks`.
+    /// Called whenever a track is added/removed; `track_mix` Memo will
+    /// pick up the new length via its dependency on `track_peak_display`
+    /// (and on `song`).
+    fn resize_track_peak_display(&mut self) {
+        let n = self.song.with_untracked(|s| s.tracks.len());
+        self.track_peak_display
+            .update(|disp| disp.resize(n, (0.0, 0.0)));
     }
 }
 
@@ -940,11 +1033,6 @@ impl Model for AppData {
             }
         });
         event.map(|app_event, _| {
-            // `dirty` decides whether `refresh_caches` runs at the end of
-            // the handler. Most edits set it true; pure metering / IPC
-            // replies leave it false to avoid pointless re-renders.
-            let mut dirty = true;
-
             // One snapshot per discrete edit. Drag-driven events skip
             // this and rely on the view's MouseDown-time
             // `PushUndoSnapshot` so the full drag is a single undo step.
@@ -957,19 +1045,15 @@ impl Model for AppData {
                 AppEvent::Open => self.action_open(),
                 AppEvent::Save => {
                     self.action_save();
-                    dirty = false;
                 }
                 AppEvent::SaveAs => {
                     self.action_save_as();
-                    dirty = false;
                 }
                 AppEvent::Play => {
                     self.play();
-                    dirty = false;
                 }
                 AppEvent::Stop => {
                     self.stop();
-                    dirty = false;
                 }
                 AppEvent::PlayToggle => {
                     if self.is_playing.get_untracked() {
@@ -977,21 +1061,17 @@ impl Model for AppData {
                     } else {
                         self.play();
                     }
-                    dirty = false;
                 }
                 AppEvent::ToggleLoop => {
                     self.toggle_loop();
-                    dirty = false;
                 }
                 AppEvent::Undo => self.undo(),
                 AppEvent::Redo => self.redo(),
                 AppEvent::PushUndoSnapshot => {
                     self.push_undo_snapshot();
-                    dirty = false;
                 }
                 AppEvent::CopySelectedNotes => {
                     self.copy_selected_notes();
-                    dirty = false;
                 }
                 AppEvent::PasteNotes => self.paste_notes(),
                 AppEvent::QuantizeSelectedNotes(div) => {
@@ -1009,43 +1089,34 @@ impl Model for AppData {
                 AppEvent::SelectTrack(idx) => self.select_track(*idx),
                 AppEvent::BeginRenameTrack(idx) => {
                     self.begin_rename_track(*idx);
-                    dirty = false;
                 }
                 AppEvent::RenameTrackChanged(text) => {
                     self.track_rename_text.set(text.clone());
-                    dirty = false;
                 }
                 AppEvent::CommitRenameTrack => self.commit_rename_track(),
                 AppEvent::CancelRenameTrack => {
                     self.track_rename_idx.set(None);
                     self.track_rename_text.set(String::new());
-                    dirty = false;
                 }
                 AppEvent::ToggleHelp => {
                     self.is_help_open.update(|b| *b = !*b);
-                    dirty = false;
                 }
                 AppEvent::CloseHelp => {
                     self.is_help_open.set(false);
-                    dirty = false;
                 }
                 AppEvent::OpenRecent(path) => {
                     self.action_open_path(path.clone());
-                    dirty = false;
                 }
                 AppEvent::AutosaveTick => {
                     self.maybe_autosave();
-                    dirty = false;
                 }
                 AppEvent::BeginDrag => {
                     self.is_dragging.set(true);
-                    dirty = false;
                 }
                 AppEvent::EndDrag => {
                     self.is_dragging.set(false);
                     let song = self.song.get_untracked();
                     self.send_plugin(MainToChild::LoadSong(song));
-                    dirty = false;
                 }
                 AppEvent::MidiNoteOn { pitch, velocity } => {
                     self.handle_midi_note_on(*pitch, *velocity);
@@ -1053,7 +1124,6 @@ impl Model for AppData {
                 AppEvent::MidiNoteOff { pitch: _ } => {
                     // Step-input doesn't track note ends — durations are
                     // fixed by `step_size_beats`.
-                    dirty = false;
                 }
                 AppEvent::MidiInputOpened(name) => {
                     let label = name.clone().unwrap_or_default();
@@ -1061,11 +1131,9 @@ impl Model for AppData {
                     if name.is_some() {
                         self.status_message.set(format!("MIDI 入力: {label}"));
                     }
-                    dirty = false;
                 }
                 AppEvent::SelectBottomPanel(p) => {
                     self.bottom_panel.set(*p);
-                    dirty = false;
                 }
                 AppEvent::SelectClip { target, additive } => {
                     self.select_clip(*target, *additive);
@@ -1118,72 +1186,57 @@ impl Model for AppData {
                     self.plugin_picker_target.set(*target);
                     self.refresh_picker_visible();
                     self.is_plugin_picker_open.set(true);
-                    dirty = false;
                 }
                 AppEvent::ClosePluginPicker => {
                     self.is_plugin_picker_open.set(false);
-                    dirty = false;
                 }
                 AppEvent::RescanPluginDb => {
                     self.begin_rescan(cx);
-                    dirty = false;
                 }
                 AppEvent::PluginDbRescanCompleted => {
                     self.finish_rescan();
-                    dirty = false;
                 }
                 AppEvent::SetArrangeScroll(scroll) => {
                     self.arrange_scroll_beat.set(scroll.max(0.0));
-                    dirty = false;
                 }
                 AppEvent::SetArrangeZoom(zoom) => {
                     self.arrange_zoom_x.set(zoom.clamp(2.0, 400.0));
-                    dirty = false;
                 }
                 AppEvent::SetPianoRollScrollX(scroll) => {
                     self.pianoroll_scroll_beat.set(scroll.max(0.0));
-                    dirty = false;
                 }
                 AppEvent::SetPianoRollTopPitch(p) => {
                     self.pianoroll_top_pitch.set((*p).clamp(11, 127));
-                    dirty = false;
                 }
                 AppEvent::SetPianoRollZoomX(zoom) => {
                     self.pianoroll_zoom_x.set(zoom.clamp(8.0, 400.0));
-                    dirty = false;
                 }
                 AppEvent::SetPianoRollZoomY(zoom) => {
                     self.pianoroll_zoom_y.set(zoom.clamp(6.0, 40.0));
-                    dirty = false;
                 }
                 AppEvent::SetLoopRange { start, end } => {
                     self.set_loop_range(*start, *end);
                 }
                 AppEvent::SelectPluginFromDb(id) => {
                     self.select_plugin_from_db(id.clone());
-                    dirty = false;
                 }
                 AppEvent::ToggleSlotGui {
                     slot_kind,
                     slot_index,
                 } => {
                     self.toggle_slot_gui(*slot_kind, *slot_index);
-                    dirty = false;
                 }
                 AppEvent::RemoveSlot {
                     slot_kind,
                     slot_index,
                 } => {
                     self.remove_slot(*slot_kind, *slot_index);
-                    dirty = false;
                 }
                 AppEvent::SetMasterGain(amp) => {
                     self.set_master_gain(*amp);
-                    dirty = false;
                 }
                 AppEvent::Tick { samples, peak_l, peak_r } => {
                     self.on_tick(*samples, *peak_l, *peak_r);
-                    dirty = false;
                 }
                 AppEvent::GuiOpenedFromChild {
                     track,
@@ -1192,7 +1245,6 @@ impl Model for AppData {
                     height,
                 } => {
                     self.on_gui_opened(*track, *slot, *width, *height);
-                    dirty = false;
                 }
                 AppEvent::GuiRequestResizeFromChild {
                     track,
@@ -1201,11 +1253,9 @@ impl Model for AppData {
                     height,
                 } => {
                     self.on_gui_request_resize(*track, *slot, *width, *height);
-                    dirty = false;
                 }
                 AppEvent::GuiClosedFromChild { track, slot } => {
                     self.on_gui_closed(*track, *slot);
-                    dirty = false;
                 }
                 AppEvent::SlotPluginLoadedFromChild {
                     track,
@@ -1219,35 +1269,27 @@ impl Model for AppData {
                         id.clone(),
                         name.clone(),
                     );
-                    dirty = false;
                 }
                 AppEvent::AllStatesReceived(entries) => {
                     self.on_all_states_from_child(entries.clone());
-                    dirty = false;
                 }
                 AppEvent::SetTrackVolume { track, amp } => {
                     self.set_track_volume(*track, *amp);
-                    dirty = false;
                 }
                 AppEvent::SetTrackPan { track, pan } => {
                     self.set_track_pan(*track, *pan);
-                    dirty = false;
                 }
                 AppEvent::ToggleTrackMute(track) => {
                     self.toggle_track_mute(*track);
-                    dirty = false;
                 }
                 AppEvent::ToggleTrackSolo(track) => {
                     self.toggle_track_solo(*track);
-                    dirty = false;
                 }
                 AppEvent::TrackPeaksTick(peaks) => {
                     self.on_track_peaks_tick(peaks);
-                    dirty = false;
                 }
                 AppEvent::ExportWav => {
                     self.action_export_wav();
-                    dirty = false;
                 }
                 AppEvent::ExportWavComplete { error } => {
                     if let Some(e) = error {
@@ -1255,22 +1297,16 @@ impl Model for AppData {
                     } else {
                         self.status_message.set("WAV 書き出し完了".to_string());
                     }
-                    dirty = false;
                 }
                 AppEvent::SynthesizeVocal => {
                     self.status_message.set("VOICEVOX 合成中...".to_string());
                     self.begin_vocal_synth(cx);
-                    dirty = false;
                 }
                 AppEvent::VocalSynthCompleted => {
                     self.finish_vocal_synth();
-                    dirty = false;
                 }
             }
 
-            if dirty {
-                self.refresh_caches();
-            }
         });
     }
 }
@@ -1324,8 +1360,7 @@ impl AppData {
         self.selected_track.set(0);
         self.selected_clip.set(None);
         self.selected_notes.update(|v| v.clear());
-        self.refresh_inspector_chain();
-        self.rebuild_track_mix();
+        self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
         tracing::info!("new project");
     }
@@ -1353,8 +1388,7 @@ impl AppData {
                 self.selected_track.set(0);
                 self.selected_clip.set(None);
                 self.selected_notes.update(|v| v.clear());
-                self.refresh_inspector_chain();
-                self.rebuild_track_mix();
+                self.resize_track_peak_display();
                 self.sync_song_to_plugin_host();
                 self.is_dirty.set(false);
                 self.push_recent(path);
@@ -1625,8 +1659,7 @@ impl AppData {
             .song
             .with_untracked(|s| s.tracks.len().saturating_sub(1) as u32);
         self.selected_track.set(new_track.min(max));
-        self.refresh_inspector_chain();
-        self.rebuild_track_mix();
+        self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
     }
 
@@ -1662,8 +1695,7 @@ impl AppData {
         } else if cur == b {
             self.selected_track.set(a);
         }
-        self.refresh_inspector_chain();
-        self.rebuild_track_mix();
+        self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
     }
 
@@ -1674,7 +1706,6 @@ impl AppData {
         }
         if self.selected_track.get_untracked() != idx {
             self.selected_track.set(idx);
-            self.refresh_inspector_chain();
         }
     }
 
@@ -1704,17 +1735,9 @@ impl AppData {
         }
         self.song.update(|s| {
             if let Some(track) = s.tracks.get_mut(idx as usize) {
-                track.name = new_name.clone();
+                track.name = new_name;
             }
         });
-        let mut mix = self.track_mix.get_untracked();
-        if let Some(entry) = mix.iter_mut().find(|e| e.index == idx) {
-            entry.name = new_name;
-        }
-        self.track_mix.set(mix);
-        if idx == self.selected_track.get_untracked() {
-            self.refresh_inspector_chain();
-        }
         self.sync_song_to_plugin_host();
     }
 
@@ -1727,7 +1750,7 @@ impl AppData {
                     ..Track::default()
                 });
             });
-            self.rebuild_track_mix();
+            self.resize_track_peak_display();
         }
     }
 
@@ -1743,7 +1766,7 @@ impl AppData {
             ..Track::default()
         };
         self.song.update(|s| s.tracks.push(track));
-        self.rebuild_track_mix();
+        self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
         tracing::info!(index, "added vocal track");
     }
@@ -1757,7 +1780,7 @@ impl AppData {
             ..Track::default()
         };
         self.song.update(|s| s.tracks.push(track));
-        self.rebuild_track_mix();
+        self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
         tracing::info!(index, "added instrument track");
     }
@@ -1803,8 +1826,7 @@ impl AppData {
             self.selected_clip.set(last);
             self.selected_notes.update(|v| v.clear());
         }
-        self.refresh_inspector_chain();
-        self.rebuild_track_mix();
+        self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
     }
 
@@ -2171,9 +2193,8 @@ impl AppData {
         track: u32,
         slot: PluginSlot,
         id: String,
-        name: String,
+        _name: String,
     ) {
-        let label = if name.is_empty() { id.clone() } else { name };
         let track_idx = track as usize;
         self.ensure_first_track();
         self.song.update(|s| {
@@ -2231,12 +2252,6 @@ impl AppData {
                 }
             }
         });
-        if track == self.selected_track.get_untracked() {
-            if matches!(slot, PluginSlot::Instrument) {
-                self.instrument_label.set(label);
-            }
-            self.refresh_inspector_chain();
-        }
     }
 
     fn toggle_slot_gui(&mut self, slot_kind: u8, slot_index: u32) {
@@ -2307,14 +2322,10 @@ impl AppData {
             track: track_idx,
             slot,
         });
-        let mut clear_instrument_label = false;
         self.song.update(|s| {
             if let Some(track) = s.tracks.get_mut(track_idx as usize) {
                 match slot {
-                    PluginSlot::Instrument => {
-                        track.instrument = None;
-                        clear_instrument_label = true;
-                    }
+                    PluginSlot::Instrument => track.instrument = None,
                     PluginSlot::Fx(i) => {
                         let i = i as usize;
                         if i < track.fx_chain.len() {
@@ -2330,10 +2341,6 @@ impl AppData {
                 }
             }
         });
-        if clear_instrument_label {
-            self.instrument_label.set("(no instrument)".into());
-        }
-        self.refresh_inspector_chain();
     }
 
     fn on_all_states_from_child(&mut self, states: Vec<SlotState>) {
@@ -2409,7 +2416,6 @@ impl AppData {
             return;
         };
         let path = entry.path.clone();
-        let entry_label = plugin_label_from_entry(entry);
         let entry_id = entry.id.clone();
         let entry_format = entry.format;
         self.ensure_first_track();
@@ -2466,70 +2472,6 @@ impl AppData {
                 }
             }
         });
-        if matches!(dest_slot, PluginSlot::Instrument) {
-            self.instrument_label.set(entry_label);
-        }
-        self.refresh_inspector_chain();
-    }
-
-    fn refresh_inspector_chain(&mut self) {
-        let selected = self.selected_track.get_untracked();
-        struct Snapshot {
-            track_label: String,
-            instrument_label: String,
-            chain_ids: Vec<(u8, u32, &'static str, String)>,
-        }
-        let snapshot = self.song.with_untracked(|s| {
-            let track = s.tracks.get(selected as usize)?;
-            let mut chain_ids: Vec<(u8, u32, &'static str, String)> = Vec::new();
-            for (i, p) in track.midi_fx_chain.iter().enumerate() {
-                chain_ids.push((0, i as u32, "MIDI FX", p.plugin_id.clone()));
-            }
-            if let Some(inst) = track.instrument.as_ref() {
-                chain_ids.push((1, 0, "Instrument", inst.plugin_id.clone()));
-            }
-            for (i, p) in track.fx_chain.iter().enumerate() {
-                chain_ids.push((2, i as u32, "FX", p.plugin_id.clone()));
-            }
-            let track_label = if track.name.is_empty() {
-                format!("Track {}", selected + 1)
-            } else {
-                track.name.clone()
-            };
-            let instrument_label = match track.instrument.as_ref() {
-                Some(inst) => inst.plugin_id.clone(),
-                None => String::new(),
-            };
-            Some(Snapshot {
-                track_label,
-                instrument_label,
-                chain_ids,
-            })
-        });
-        let Some(snapshot) = snapshot else {
-            self.inspector_chain.set(Vec::new());
-            self.selected_track_label
-                .set(format!("Track {}", selected + 1));
-            self.instrument_label.set("(no instrument)".into());
-            return;
-        };
-        self.selected_track_label.set(snapshot.track_label);
-        self.instrument_label.set(if snapshot.instrument_label.is_empty() {
-            "(no instrument)".into()
-        } else {
-            self.resolve_name(&snapshot.instrument_label)
-        });
-        let chain: Vec<ChainEntry> = snapshot
-            .chain_ids
-            .into_iter()
-            .map(|(kind, idx, section, id)| ChainEntry {
-                slot_kind: kind,
-                slot_index: idx,
-                section_label: section.into(),
-                plugin_name: self.resolve_name(&id),
-            })
-            .collect();
-        self.inspector_chain.set(chain);
     }
 
     // -------- VOICEVOX -----------------------------------------------------
@@ -2665,11 +2607,6 @@ impl AppData {
                 t.volume = v;
             }
         });
-        self.track_mix.update(|mix| {
-            if let Some(entry) = mix.iter_mut().find(|e| e.index == track) {
-                entry.volume = v;
-            }
-        });
         self.send_plugin(MainToChild::SetTrackVolume { track, volume: v });
     }
 
@@ -2678,11 +2615,6 @@ impl AppData {
         self.song.update(|s| {
             if let Some(t) = s.tracks.get_mut(track as usize) {
                 t.pan = p;
-            }
-        });
-        self.track_mix.update(|mix| {
-            if let Some(entry) = mix.iter_mut().find(|e| e.index == track) {
-                entry.pan = p;
             }
         });
         self.send_plugin(MainToChild::SetTrackPan { track, pan: p });
@@ -2697,11 +2629,6 @@ impl AppData {
         let Some(Some(muted)) = muted else {
             return;
         };
-        self.track_mix.update(|mix| {
-            if let Some(entry) = mix.iter_mut().find(|e| e.index == track) {
-                entry.muted = muted;
-            }
-        });
         self.send_plugin(MainToChild::SetTrackMuted { track, muted });
     }
 
@@ -2714,66 +2641,22 @@ impl AppData {
         let Some(Some(solo)) = solo else {
             return;
         };
-        self.track_mix.update(|mix| {
-            if let Some(entry) = mix.iter_mut().find(|e| e.index == track) {
-                entry.solo = solo;
-            }
-        });
         self.send_plugin(MainToChild::SetTrackSolo { track, solo });
     }
 
     fn on_track_peaks_tick(&mut self, peaks: &[(f32, f32)]) {
         const RELEASE: f32 = 0.85;
         let n = self.song.with_untracked(|s| s.tracks.len());
-        let display = self
-            .track_peak_display
-            .try_update(|disp| {
-                if disp.len() != n {
-                    disp.resize(n, (0.0, 0.0));
-                }
-                for (i, d) in disp.iter_mut().enumerate() {
-                    let (l, r) = peaks.get(i).copied().unwrap_or((0.0, 0.0));
-                    d.0 = common::meter::update_peak(d.0, l, RELEASE);
-                    d.1 = common::meter::update_peak(d.1, r, RELEASE);
-                }
-                disp.clone()
-            })
-            .unwrap_or_default();
-        self.track_mix.update(|mix| {
-            for (i, entry) in mix.iter_mut().enumerate() {
-                let (l, r) = display.get(i).copied().unwrap_or((0.0, 0.0));
-                entry.peak_l_norm = common::meter::db_to_norm(common::meter::linear_to_db(l));
-                entry.peak_r_norm = common::meter::db_to_norm(common::meter::linear_to_db(r));
+        self.track_peak_display.update(|disp| {
+            if disp.len() != n {
+                disp.resize(n, (0.0, 0.0));
+            }
+            for (i, d) in disp.iter_mut().enumerate() {
+                let (l, r) = peaks.get(i).copied().unwrap_or((0.0, 0.0));
+                d.0 = common::meter::update_peak(d.0, l, RELEASE);
+                d.1 = common::meter::update_peak(d.1, r, RELEASE);
             }
         });
-    }
-
-    fn rebuild_track_mix(&mut self) {
-        let (mix, n) = self.song.with_untracked(|s| {
-            let mix: Vec<TrackMixEntry> = s
-                .tracks
-                .iter()
-                .enumerate()
-                .map(|(i, t)| TrackMixEntry {
-                    index: i as u32,
-                    name: if t.name.is_empty() {
-                        format!("Track {}", i + 1)
-                    } else {
-                        t.name.clone()
-                    },
-                    volume: t.volume,
-                    pan: t.pan,
-                    muted: t.muted,
-                    solo: t.solo,
-                    peak_l_norm: 0.0,
-                    peak_r_norm: 0.0,
-                })
-                .collect();
-            (mix, s.tracks.len())
-        });
-        self.track_mix.set(mix);
-        self.track_peak_display
-            .update(|disp| disp.resize(n, (0.0, 0.0)));
     }
 
     fn rebuild_picker_entries(&mut self) {
@@ -2872,33 +2755,20 @@ fn load_recent_files_display() -> Vec<String> {
         .collect()
 }
 
-fn initial_track_mix(song: &Song) -> Vec<TrackMixEntry> {
-    song.tracks
-        .iter()
-        .enumerate()
-        .map(|(i, t)| TrackMixEntry {
-            index: i as u32,
-            name: if t.name.is_empty() {
-                format!("Track {}", i + 1)
+/// Free-standing variant of `AppData::resolve_name`, usable inside
+/// `Memo::new` closures (which can't borrow `&self`).
+fn resolve_plugin_name(plugin_db: &Option<Arc<PluginDatabase>>, plugin_id: &str) -> String {
+    plugin_db
+        .as_deref()
+        .and_then(|db| db.find_by_id(plugin_id))
+        .map(|e| {
+            if e.name.is_empty() {
+                plugin_id.to_string()
             } else {
-                t.name.clone()
-            },
-            volume: t.volume,
-            pan: t.pan,
-            muted: t.muted,
-            solo: t.solo,
-            peak_l_norm: 0.0,
-            peak_r_norm: 0.0,
+                e.name.clone()
+            }
         })
-        .collect()
-}
-
-fn plugin_label_from_entry(entry: &common::plugin_db::PluginEntry) -> String {
-    if entry.name.is_empty() {
-        entry.id.clone()
-    } else {
-        entry.name.clone()
-    }
+        .unwrap_or_else(|| plugin_id.to_string())
 }
 
 /// Demo clip preset used by `Add Vocal Track`. Five-note "こんにちは" line

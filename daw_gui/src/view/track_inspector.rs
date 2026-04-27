@@ -4,8 +4,8 @@ use crate::app::{AppEvent, ChainEntry, PickerTarget};
 
 #[derive(Copy, Clone)]
 pub struct TrackInspectorSignals {
-    pub selected_track_label: Signal<String>,
-    pub inspector_chain: Signal<Vec<ChainEntry>>,
+    pub selected_track_label: Memo<String>,
+    pub inspector_chain: Memo<Vec<ChainEntry>>,
 }
 
 pub struct TrackInspectorView;

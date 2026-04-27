@@ -1,11 +1,10 @@
-use common::model::Song;
 use vizia::prelude::*;
 
 use crate::app::AppEvent;
 
 #[derive(Copy, Clone)]
 pub struct TransportSignals {
-    pub song: Signal<Song>,
+    pub bpm: Memo<f32>,
     pub is_looping: Signal<bool>,
     pub master_gain: Signal<f32>,
     pub peak_l_norm: Signal<f32>,
@@ -43,7 +42,7 @@ impl TransportView {
                 Label::new(cx, "0:00 / 64 beats")
                     .padding_left(Pixels(16.0))
                     .color(Color::rgb(220, 220, 220));
-                Label::new(cx, sig.song.map(|s: &Song| format!("BPM {}", s.bpm)))
+                Label::new(cx, sig.bpm.map(|bpm: &f32| format!("BPM {}", bpm)))
                     .padding_left(Pixels(16.0))
                     .color(Color::rgb(220, 220, 220));
 

@@ -51,7 +51,7 @@ const VELOCITY_LANE_HEIGHT: f32 = 80.0;
 #[derive(Copy, Clone)]
 pub struct PianoRollSignals {
     pub selected_clip: Signal<Option<ClipRef>>,
-    pub note_boxes: Signal<Vec<NoteBox>>,
+    pub note_boxes: Memo<Vec<NoteBox>>,
     pub pianoroll_zoom_x: Signal<f32>,
     pub pianoroll_zoom_y: Signal<f32>,
     pub pianoroll_scroll_beat: Signal<f32>,
