@@ -33,7 +33,7 @@ use vizia::prelude::*;
 /// Rebuilt from `song.tracks` whenever the track list or a mixer parameter
 /// changes; the `peak_*_norm` fields are refreshed on every UI tick from
 /// the shmem-published post-fader peaks.
-#[derive(Debug, Clone, PartialEq, Data)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TrackMixEntry {
     pub index: u32,
     pub name: String,
@@ -60,7 +60,7 @@ impl Default for TrackMixEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Data)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginPickEntry {
     pub id: String,
     pub name: String,
@@ -70,7 +70,7 @@ pub struct PluginPickEntry {
 }
 
 /// A single slot on the inspected track's chain.
-#[derive(Debug, Clone, PartialEq, Eq, Data)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainEntry {
     pub slot_kind: u8,
     pub slot_index: u32,
@@ -89,7 +89,7 @@ impl ChainEntry {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Data)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PickerTarget {
     Instrument,
     Fx,
@@ -102,7 +102,7 @@ pub enum PickerTarget {
 /// `Track`-only is selected by clicking a track header; `(Track, Clip)` is
 /// selected by clicking a clip in the arrangement view, which also drives
 /// the piano roll's contents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Data, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ClipRef {
     pub track: u32,
     pub clip: u32,
@@ -111,7 +111,7 @@ pub struct ClipRef {
 /// Render-friendly snapshot of one clip on the timeline. Rebuilt whenever
 /// the song changes; the arrangement view binds to the `Vec<ClipBox>` lens
 /// and renders each entry as a coloured rectangle.
-#[derive(Debug, Clone, PartialEq, Data)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ClipBox {
     pub track: u32,
     pub clip: u32,
@@ -124,7 +124,7 @@ pub struct ClipBox {
 /// Render-friendly snapshot of one note inside the currently selected clip.
 /// Rebuilt whenever the clip's note list or selection changes; the piano
 /// roll binds to the `Vec<NoteBox>` lens.
-#[derive(Debug, Clone, PartialEq, Data)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NoteBox {
     pub note: u32,
     pub start_beat: f32,
@@ -135,7 +135,7 @@ pub struct NoteBox {
     pub selected: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Data)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TrackHeader {
     pub index: u32,
     pub name: String,
@@ -156,7 +156,6 @@ pub const DEFAULT_NOTE_DURATION: f64 = 0.25;
 /// arrangement space to create a new clip.
 pub const DEFAULT_CLIP_LENGTH: f64 = 4.0;
 
-#[derive(Lens)]
 pub struct AppData {
     pub song: Song,
     pub file_path: Option<PathBuf>,
@@ -227,7 +226,6 @@ pub struct AppData {
     pub peak_r_norm: f32,
 
     // -------- Plugin database / picker -------------------------------------
-    #[lens(ignore)]
     pub plugin_db: Option<Arc<PluginDatabase>>,
     pub plugin_picker_entries: Vec<PluginPickEntry>,
     pub plugin_picker_visible: Vec<PluginPickEntry>,
@@ -238,26 +236,19 @@ pub struct AppData {
     pub instrument_label: String,
 
     // -------- Save flow / IPC ----------------------------------------------
-    #[lens(ignore)]
     pub pending_save_path: Option<PathBuf>,
-    #[lens(ignore)]
     pub audio_tx: Option<UnboundedSender<MainToChild>>,
-    #[lens(ignore)]
     pub plugin_tx: Option<UnboundedSender<MainToChild>>,
     #[cfg(windows)]
-    #[lens(ignore)]
     pub plugin_host_windows:
         HashMap<(u32, PluginSlot), crate::view::plugin_embed::PluginHostWindow>,
 
     // -------- Mixer ---------------------------------------------------------
     pub track_mix: Vec<TrackMixEntry>,
-    #[lens(ignore)]
     pub track_peak_display: Vec<(f32, f32)>,
 
     // -------- Background workers -------------------------------------------
-    #[lens(ignore)]
     pub synth_result: Arc<Mutex<Vec<common::voicevox::SynthResult>>>,
-    #[lens(ignore)]
     pub rescan_result: Arc<Mutex<Option<PluginDatabase>>>,
     pub is_rescanning: bool,
     pub status_message: String,
@@ -271,15 +262,12 @@ pub struct AppData {
     /// Undo / redo history. Each entry is a full `Song` snapshot taken
     /// just before the corresponding edit; popping pushes the current
     /// song onto the opposite stack for symmetric back-and-forth.
-    #[lens(ignore)]
     pub undo_stack: VecDeque<Song>,
-    #[lens(ignore)]
     pub redo_stack: VecDeque<Song>,
 
     /// Note clipboard. Notes are stored with `start_beat` already
     /// normalised so the earliest note is at 0 — paste then offsets every
     /// entry by the target position.
-    #[lens(ignore)]
     pub note_clipboard: Vec<Note>,
 
     /// True while the keybindings cheat-sheet overlay is visible. F1 or
@@ -289,7 +277,6 @@ pub struct AppData {
     /// "Open Recent" entries persisted to LocalAppData. The lens-visible
     /// `recent_paths_display` mirrors `recent_files.paths` as plain
     /// strings so the menu can render them via `Vec<String>`.
-    #[lens(ignore)]
     pub recent_files: common::recent::RecentFiles,
     pub recent_paths_display: Vec<String>,
 
@@ -300,7 +287,6 @@ pub struct AppData {
     pub is_dirty: bool,
     /// Last instant we wrote `<file_path>.autosave.daw`. Used by the
     /// autosave timer to space writes 60 seconds apart.
-    #[lens(ignore)]
     pub last_autosave: std::time::Instant,
 
     /// `true` while a clip or note is being dragged with the mouse held
@@ -309,7 +295,6 @@ pub struct AppData {
     /// second to keep playback consistent. The final state ships once on
     /// `EndDrag` (i.e. MouseUp) so timing-sensitive features like loop
     /// playback see the post-drag song.
-    #[lens(ignore)]
     pub is_dragging: bool,
 
     /// Display label for the active MIDI input device — empty when no
