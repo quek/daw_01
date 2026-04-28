@@ -392,14 +392,20 @@ impl View for ArrangementCanvas {
         text_paint.set_color(skia_rgba(COLOR_CLIP_TEXT));
         text_paint.set_anti_alias(true);
         let font = vg::Font::default();
+        // clip_boxes は (track, clip) 昇順ソート (Memo の compute 順)。
+        // Y がビューポートを超えた時点で残り全部不可視なので break。
+        let visible_y_bottom = bounds.y + bounds.h;
         for c in &clip_boxes {
-            let x = bounds.x + (c.start_beat - scroll_beat) * zoom;
             let y = bounds.y + RULER_HEIGHT + (c.track as f32) * ARRANGE_TRACK_HEIGHT;
+            if y > visible_y_bottom {
+                break;
+            }
+            let x = bounds.x + (c.start_beat - scroll_beat) * zoom;
             let w = (c.length_beats * zoom).max(2.0);
-            let h = ARRANGE_TRACK_HEIGHT - 4.0;
             if x + w < bounds.x || x > bounds.x + bounds.w {
                 continue;
             }
+            let h = ARRANGE_TRACK_HEIGHT - 4.0;
             let body_color = if c.selected {
                 COLOR_CLIP_SELECTED
             } else {
