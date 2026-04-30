@@ -1,0 +1,17 @@
+//! レンダラ — wgpu の上に組む自前パイプライン群。
+//!
+//! 提供:
+//! - `Renderer`: wgpu デバイス・キュー・サーフェス・パイプラインを束ねた高レベル入口
+//! - `pipelines::rect`: instanced 角丸矩形パイプライン (ボタン・ノブ・ノート等)
+//! - `pipelines::quad`: textured quad (アイコン・サムネ)
+//! - `pipelines::line`: line strip (波形・メータ・グリッド)
+//! - `pipelines::glyph`: glyphon 統合 (テキスト)
+//!
+//! シーンは内部的に DisplayList として保持し、フレーム終端でバッチ描画する。
+
+pub mod device;
+pub mod scene;
+pub mod pipelines;
+
+pub use device::*;
+pub use scene::*;

@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+Thumbs.db
+
+# Claude Code per-user (共有設定 .claude/settings.json は track 可)
+.claude/settings.local.json
+
