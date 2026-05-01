@@ -405,10 +405,38 @@ F:\dev\gui_01\
 
 ### M4 (内部 scenegraph + 差分検出) — 旧 M3
 
+**Phase 9 進捗 (2026-05-01)** — glyphon Buffer キャッシュ:
+
+| 成果物 | 状態 | コミット |
+|---|---|---|
+| `GlyphPipeline` 内に `HashMap<u64, CachedBuffer>` を導入 | ✅ | (本コミット) |
+| `(text, font_size, line_height)` を `DefaultHasher` で u64 ハッシュ化 → cache key | ✅ | (本コミット) |
+| 同一キーは `Buffer` を再利用、新規キーのみ `Buffer::new` + shaping | ✅ | (本コミット) |
+| 5 秒 (300 frame @ 60fps) 未使用 entry の eviction | ✅ | (本コミット) |
+| `buffer_key` の単体テスト 4 本: 同一入力 / text 違い / font_size 違い / line_height 違い | ✅ | (本コミット) |
+| 実機検証: mixer の表示・操作に regression なし | ✅ | (本コミット) |
+
+**M4 の残作業 (Phase 10-12 で対応)**:
+- `slotmap` 導入 + `Scenegraph` 型定義 + 1M FNV-1a 衝突テスト → Phase 10
+- `Ui::with_widget_node(wid, input_hash, draw_fn)` API + 各 widget に適用 → Phase 11
+- "1000 widget で draw call 増えない" bench 検証 → Phase 11
+- 波形 LOD ピラミッドを scenegraph 配下に統合 (input_hash に generation 組込) → Phase 12
+
+**設計判断**:
+- **Phase 9 を最初に**: `slotmap` 基盤を先に作っても適用前は busywork。glyphon キャッシュは renderer 内部に閉じて measurable な改善を出せるので最初に成果が出る
+- **キャッシュキーに 3 要素全部**: text のみだと metrics 切替で古い Buffer が再利用される懸念。`(text, font_size, line_height)` で identity を作るのが安全
+- **Eviction は時間ベース (5 秒)**: LRU や size-bound より単純。text_input のランダム入力にも対応
+- **borrow パターン**: `glyphon::Buffer` を `Clone` させずに、cache 更新 (mutable borrow) → TextArea 構築 (immutable borrow into cache) → text_renderer.prepare の順で安全に通す
+- **Scene / GlyphArea の API は不変**: 既存 callers / widgets / examples は無変更で恩恵を受ける
+
+---
+
+**M4 元仕様 (plan.md 当初)**:
+
 - 内部 scenegraph (`SlotMap<NodeId, SceneNode>`)
 - input hash による差分検出 → 静的 UI の draw call 削減を計測
 - 1000 ウィジェット級ミキサーで「変化していない部分の draw call が出ない」ことを確認
-- glyphon の Buffer キャッシュ統合 (現状は毎フレーム作り直し)
+- glyphon の Buffer キャッシュ統合 (現状は毎フレーム作り直し): ✅ Phase 9 で完了
 - input hash 衝突テスト: ランダムなウィジェット入力 1M 件で衝突 0
 - 波形ウィジェットの LOD ピラミッドは **M2 の構造のまま scenegraph 配下に再配置** (input_hash に generation を組み込む)
 
@@ -772,3 +800,4 @@ ui.heavy("track_0_clips", |hctx| {
 - 2026-05-01: **M3 Phase 6** — `examples/mixer` を 3 ch から 8 ch に拡張、LayoutPass の最初の実用例として `Padding::axis(20, 0)` + `Gap::xy(16, 0)` で 8 列の row、各列内で `Gap::all(6)` の column flex を組む。`taffy::prelude::{FlexDirection, NodeId}` を `daw_ui_core` から re-export して、利用側が taffy を直接依存に入れずに済むようにした。手動 rect 計算 (`fader_left + i * (fader_w + 16.0)`) が消え、列レイアウトは LayoutPass 1 箇所で済む。ウィンドウ縦サイズ 600 → 660、ストリップ原点 y 240 → 280 で左側 button 群との視覚衝突を解消、ストリップヘッダを Phase 4d の操作 (Ctrl+drag / dbl-click) を含む 1 本にまとめた。`MixerModel` 配列を `[T; 8]` に拡張、初期値はリセットの動作確認しやすいよう各 ch で異なる値に。LayoutPass の利用で見えた ergonomics 課題 (NodeId → Rect の HashMap 引き / origin offset の手動足し算) は別タスクで API 改善するか判断。
 - 2026-05-01: **M3 Phase 7** — `LayoutPass` ergonomics 改善。`compute` シグネチャを戻り値なしに変えて内部 `HashMap<NodeId, Rect>` に格納、`rect(node) -> Rect` で O(1) 引きできるようにした。`compute_at(root, w, h, origin)` を追加して screen 座標オフセットを内部で適用、利用側の `to_screen` クロージャと `into_iter().collect::<HashMap<_,_>>()` の boilerplate を library 内側に閉じ込める。breaking change だが zero external callers + Phase 6 で 1 caller (mixer) のみなので影響極小。mixer から `std::collections::HashMap` import が消え、build_ui のチャンネルストリップ部分が約 10 行短くなった。テスト 1 本追加 (`compute_at_applies_origin_offset`) で 33 unit + 1 trybuild、既存 6 layout テストは `rects()` ヘルパ経由から `p.rect(node)` 直呼びに簡素化。実機検証で Phase 6 と同一表示 (regression なし) を確認。
 - 2026-05-01: **M3 Phase 8** — fader / knob 視覚 polish。fader thumb を 24×12 角丸+border から 28×10 flat バー (border 無し) に、knob を Ableton 流の「円本体 + 300° 可動範囲弧 (回転側 cyan / 非回転側 暗グレー の 2 色) + 中心→外円インジケータ線 (白、太め)」にデザイン変更。弧の polygon 近似を 2° step に細分化してコーナーアーティファクト解消。試行錯誤の途中 (影/tick/sweep arc fill 案、bipolar default_value 起点 arc 案、外側 rest tick 案) は最終形のみ commit。実機 Ableton との細部詰め (配色、質感) は別タスクとして残す。感度カーブ (非線形マッピング) は別タスク。
+- 2026-05-01: **M4 Phase 9** — glyphon Buffer キャッシュ。`GlyphPipeline` 内に `HashMap<u64, CachedBuffer>` を導入し、`(text, font_size, line_height)` の `DefaultHasher` ハッシュをキーとして `Buffer` を再利用。同一 text の繰り返し描画 (mixer の ch label 等) で `Buffer::new` + shaping を回避し、毎フレーム N 回 → 0〜1 回 (新規時のみ) に削減。5 秒 (300 frame) 未使用 entry は eviction。`Scene` / `GlyphArea` の API は不変、widgets / examples は無変更で恩恵を受ける。`buffer_key` の単体テスト 4 本追加 (renderer crate 初の単体テスト群)。M4 の最初のサブ phase、scenegraph 本体は Phase 10 以降で。

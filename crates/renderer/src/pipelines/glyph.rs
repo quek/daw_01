@@ -1,7 +1,13 @@
 //! glyphon 統合 — テキスト描画パイプライン。
 //!
-//! M1 では毎フレーム `Buffer` を作り直すシンプル構成。
-//! 性能最適化 (Buffer の hash キャッシュ) は M3 の scenegraph 化と一緒にやる。
+//! Buffer は (text, font_size, line_height) の hash キーで `cache` に保持し、
+//! 毎フレームの再生成 (`Buffer::new` + shaping) を回避する。同一 text の繰り返し
+//! 描画 (mixer の ch label 等) で大幅にコスト削減。N フレーム未使用 entry は
+//! eviction (約 5 秒 @ 60fps)。
+
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use daw_ui_platform::PhysicalSize;
 use glyphon::{
@@ -16,7 +22,26 @@ use wgpu::MultisampleState;
 /// fallback (システムデフォルト) に倒れる。
 const DEFAULT_FONT_FAMILY: &str = "HackGen Console NF";
 
+/// この値より長く未使用の cache entry は eviction される (約 5 秒 @ 60fps)。
+const EVICT_AFTER_FRAMES: u64 = 300;
+
 use crate::scene::GlyphArea;
+
+/// (text, font_size, line_height) を hash した cache key。
+fn buffer_key(area: &GlyphArea) -> u64 {
+    let mut h = DefaultHasher::new();
+    area.text.hash(&mut h);
+    // f32 はそのまま hash 不可なので bit 表現で。
+    area.font_size.to_bits().hash(&mut h);
+    area.line_height.to_bits().hash(&mut h);
+    h.finish()
+}
+
+/// cache に保持する `Buffer` と、最後に使われたフレーム番号。
+struct CachedBuffer {
+    buffer: Buffer,
+    last_seen_frame: u64,
+}
 
 pub struct GlyphPipeline {
     font_system: FontSystem,
@@ -24,8 +49,10 @@ pub struct GlyphPipeline {
     viewport: Viewport,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
-    /// prepare で構築した Buffer 群。render 後 clear。
-    buffers: Vec<Buffer>,
+    /// 同一 (text, font_size, line_height) の Buffer を再利用する cache。
+    cache: HashMap<u64, CachedBuffer>,
+    /// `prepare` が呼ばれた回数。eviction 判定に使う。
+    frame_counter: u64,
 }
 
 impl GlyphPipeline {
@@ -48,7 +75,8 @@ impl GlyphPipeline {
             viewport,
             atlas,
             text_renderer,
-            buffers: Vec::new(),
+            cache: HashMap::new(),
+            frame_counter: 0,
         }
     }
 
@@ -59,7 +87,7 @@ impl GlyphPipeline {
         glyph_areas: &[GlyphArea],
         screen: PhysicalSize,
     ) {
-        self.buffers.clear();
+        self.frame_counter += 1;
         self.viewport.update(
             queue,
             Resolution { width: screen.width, height: screen.height },
@@ -76,31 +104,41 @@ impl GlyphPipeline {
                 std::iter::empty::<TextArea<'_>>(),
                 &mut self.swash_cache,
             );
+            // eviction は空フレームでも進めて、長時間 idle で残骸を残さない。
+            let frame = self.frame_counter;
+            self.cache.retain(|_, e| frame.saturating_sub(e.last_seen_frame) < EVICT_AFTER_FRAMES);
             return;
         }
 
-        // 1) 各 GlyphArea 毎に Buffer を構築 (Vec に保持して借用元にする)
-        for area in glyph_areas {
-            let metrics = Metrics::new(area.font_size, area.line_height);
-            let mut buffer = Buffer::new(&mut self.font_system, metrics);
-            buffer.set_size(
-                &mut self.font_system,
-                Some(screen.width as f32),
-                Some(screen.height as f32),
-            );
-            let attrs = Attrs::new().family(Family::Name(DEFAULT_FONT_FAMILY));
-            buffer.set_text(&mut self.font_system, &area.text, &attrs, Shaping::Advanced, None);
-            buffer.shape_until_scroll(&mut self.font_system, false);
-            self.buffers.push(buffer);
+        // 1) 各 GlyphArea のキーを計算 (2 度目の lookup を避けるため Vec に保存)。
+        let keys: Vec<u64> = glyph_areas.iter().map(buffer_key).collect();
+
+        // 2) cache に entry が無ければ新規作成、あれば last_seen_frame だけ更新。
+        //    text 自体は key の一部なので、key 一致 = text 一致 → set_text 不要。
+        for (area, &key) in glyph_areas.iter().zip(keys.iter()) {
+            if !self.cache.contains_key(&key) {
+                let metrics = Metrics::new(area.font_size, area.line_height);
+                let mut buffer = Buffer::new(&mut self.font_system, metrics);
+                buffer.set_size(
+                    &mut self.font_system,
+                    Some(screen.width as f32),
+                    Some(screen.height as f32),
+                );
+                let attrs = Attrs::new().family(Family::Name(DEFAULT_FONT_FAMILY));
+                buffer.set_text(&mut self.font_system, &area.text, &attrs, Shaping::Advanced, None);
+                buffer.shape_until_scroll(&mut self.font_system, false);
+                self.cache.insert(key, CachedBuffer { buffer, last_seen_frame: self.frame_counter });
+            } else if let Some(entry) = self.cache.get_mut(&key) {
+                entry.last_seen_frame = self.frame_counter;
+            }
         }
 
-        // 2) TextArea は &Buffer を借りるので、buffers Vec が安定したあとに作る
-        let text_areas: Vec<TextArea<'_>> = self
-            .buffers
+        // 3) TextArea は &Buffer を借りるので、cache 更新後に immutable borrow で構築。
+        let text_areas: Vec<TextArea<'_>> = glyph_areas
             .iter()
-            .zip(glyph_areas.iter())
-            .map(|(buffer, area)| TextArea {
-                buffer,
+            .zip(keys.iter())
+            .map(|(area, &key)| TextArea {
+                buffer: &self.cache[&key].buffer,
                 left: area.left,
                 top: area.top,
                 scale: 1.0,
@@ -131,11 +169,70 @@ impl GlyphPipeline {
         ) {
             eprintln!("glyph prepare error: {e:?}");
         }
+
+        // 4) 古い entry の eviction。EVICT_AFTER_FRAMES より長く使われていない entry は捨てる。
+        let frame = self.frame_counter;
+        self.cache.retain(|_, e| frame.saturating_sub(e.last_seen_frame) < EVICT_AFTER_FRAMES);
     }
 
     pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
         if let Err(e) = self.text_renderer.render(&self.atlas, &self.viewport, pass) {
             eprintln!("glyph render error: {e:?}");
         }
+    }
+
+    /// テスト / デバッグ用: 現在 cache に保持されている entry の数。
+    #[cfg(any(test, debug_assertions))]
+    pub fn cache_size(&self) -> usize {
+        self.cache.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! `buffer_key` の単純な動作確認 (異なる入力で異なるキー / 同じ入力で同じキー)。
+    //! `prepare` の挙動はwgpu インスタンスが必要なので renderer crate 内では直接テスト
+    //! できない。代わりに mixer / waveform_validation の実機検証で regression を見る。
+
+    use super::*;
+    use crate::scene::Color;
+
+    fn area(text: &str, fs: f32, lh: f32) -> GlyphArea {
+        GlyphArea {
+            text: text.to_string(),
+            left: 0.0,
+            top: 0.0,
+            font_size: fs,
+            line_height: lh,
+            color: Color::rgb(1.0, 1.0, 1.0),
+        }
+    }
+
+    #[test]
+    fn buffer_key_same_input_same_key() {
+        let a = area("hello", 14.0, 18.0);
+        let b = area("hello", 14.0, 18.0);
+        assert_eq!(buffer_key(&a), buffer_key(&b));
+    }
+
+    #[test]
+    fn buffer_key_text_diff() {
+        let a = area("hello", 14.0, 18.0);
+        let b = area("world", 14.0, 18.0);
+        assert_ne!(buffer_key(&a), buffer_key(&b));
+    }
+
+    #[test]
+    fn buffer_key_font_size_diff() {
+        let a = area("same", 14.0, 18.0);
+        let b = area("same", 16.0, 18.0);
+        assert_ne!(buffer_key(&a), buffer_key(&b));
+    }
+
+    #[test]
+    fn buffer_key_line_height_diff() {
+        let a = area("same", 14.0, 18.0);
+        let b = area("same", 14.0, 20.0);
+        assert_ne!(buffer_key(&a), buffer_key(&b));
     }
 }
