@@ -26,6 +26,7 @@ pub use scenegraph::{CachedCommands, SceneNode, Scenegraph, hash_inputs};
 pub use ui::{Ui, UiHost};
 pub use widgets::checkbox::CheckboxResponse;
 pub use widgets::fader::FaderResponse;
+pub use widgets::heavy::HeavyCtx;
 pub use widgets::knob::KnobResponse;
 pub use widgets::text_input::TextInputResponse;
 pub use widgets::waveform::{

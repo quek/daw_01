@@ -309,6 +309,23 @@ impl App {
                     );
                 }
 
+                // M5 Phase 13: heavy() 動作確認デモ。viewport_key = m.count に
+                // することで、count 変化時のみ draw_fn が走り (cache miss)、
+                // 他のフレームでは前フレームの描画コマンドを再利用 (cache hit)。
+                // 視覚としては左下に「Heavy demo: count = N」の薄いラベル 1 行。
+                ui.heavy("heavy_demo", |hctx| {
+                    let viewport_key = m.count;
+                    hctx.cached(viewport_key, |hctx| {
+                        hctx.label_at(
+                            "heavy_demo_label",
+                            &format!("Heavy demo: count = {} (cached)", m.count),
+                            20.0,
+                            screen.height as f32 - 28.0,
+                            12.0,
+                            Color::rgb(0.55, 0.65, 0.78),
+                        );
+                    });
+                });
             },
         );
 

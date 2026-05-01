@@ -6,6 +6,7 @@
 pub mod button;
 pub mod checkbox;
 pub mod fader;
+pub mod heavy;
 pub mod knob;
 pub mod label;
 pub mod text_input;

@@ -524,18 +524,76 @@ cached が ~1.9x 高速。1000 widgets で frame あたり ~148 µs (= 148 ns/wi
 
 ### M5 (heavy() + 巨大ビュー + 詳細波形モード)
 
-- `ui.heavy("...", |hctx| ...)` 脱出口
-  - `HeavyCtx::cached(viewport_key, draw_fn)`: ViewportKey が前フレームと同じなら GPU バッファ再利用
-  - ヒットテストは毎フレーム実施 (キャッシュと独立)
-- 波形ウィジェット **詳細モード**: SamplePolyline + サンプル点マーカー
+**Phase 分割** (Phase 13 着手時に確定、approved plan 由来):
+
+| Phase | 内容 | サイズ | blocker |
+|---|---|---|---|
+| **13** | `Ui::heavy` + `HeavyCtx` + `cached()` + 微小デモ | 小 | なし |
+| **14** | examples/piano_roll (100k notes、heavy 実用第 1 弾) + bench | 中 | Phase 13 |
+| **15** | 波形 SamplePolyline + Auto + Interleaved unit test | 中 | なし |
+| **16** | マーカー (rect 角丸円) + RmsBars + examples/sample_editor | 中 | Phase 15 |
+| **17** | examples/arrangement (10×50 = 500 widgets を heavy 化) + bench | 中 | Phase 13, 16 |
+
+オートメーションカーブ (ベジエ → CPU flatten → line) は当初 Phase 18 として M5 に
+入れていたが、heavy / 詳細波形 の主目標を区切りやすくするため **M5.5** (M5 完了後すぐの
+別 milestone) にスライド (下記参照)。
+
+**Phase 13 進捗 (2026-05-01)** — heavy() API 基盤:
+
+| 成果物 | 状態 | コミット |
+|---|---|---|
+| `crates/ui/src/widgets/heavy.rs`: `HeavyCtx<'b, 'a, M>` + `Ui::heavy` + `HeavyCtx::cached` | ✅ | (本コミット) |
+| HeavyCtx delegate: `pointer / screen / push_edit / push_rect / push_text / push_lines / waveform / label_at / button_at` | ✅ | (本コミット) |
+| `crates/ui/tests/ui/pass/heavy.rs`: trybuild (no-Clone 制約 + viewport_key Hash 制約) | ✅ | (本コミット) |
+| 単体テスト 4 本 (cache hit / miss / ヒットテスト経路 / eviction) | ✅ | (本コミット) |
+| `examples/mixer` に heavy_demo ブロック (count を viewport_key に) | ✅ | (本コミット) |
+| `lib.rs` から `HeavyCtx` を re-export | ✅ | (本コミット) |
+
+**設計判断**:
+- **`with_widget_node` の薄いラッパで実装**: M4 Phase 11 で「描画コマンドキャッシュ +
+  hash 一致判定」が完成しているため、heavy() 用に新キャッシュ機構を作らず、`HeavyCtx::cached`
+  は `with_widget_node(child_wid, hash_inputs(viewport_key), ...)` を呼ぶだけの薄いラッパに
+  した (`feedback_use_new_abstractions` 適合、新規 cache 機構ゼロ)。
+- **viewport_key は explicit Hash 渡し**: `(timeline_range, zoom_level, generations_hash)`
+  のような tuple をアプリ側が組む。Clone / Default / PartialEq を要求しない (no-Clone 不変条件)。
+- **HeavyCtx の delegate 範囲は最小限**: `pointer / screen / push_* / push_edit / waveform /
+  label_at / button_at` のみ公開。fader / knob / checkbox / text_input は heavy 用途で
+  必要になった時点で追加する (KISS)。`push_rect / push_text / push_lines` は HeavyCtx 経由で
+  `pub` (脱出口の意味)、通常 widget からは `pub(crate)` のまま。
+- **ヒットテストは `cached()` の外側で毎フレーム実行**: waveform widget と同じパターン。
+  cached() の内側は viewport_key 一致時に skip されるので、ヒットテスト・動的 overlay
+  (cursor / 選択範囲) は外で行うのが正しい。
+- **既存 widget の heavy 内呼び出しは二段キャッシュ**: `hctx.waveform(...)` を cached() の中で
+  呼ぶと、外側 cache hit で内側 widget の `with_widget_node` も skip される。外側 miss なら
+  内側も呼ばれて各々 input_hash で個別判定。
+- **mixer の `#[allow(clippy::too_many_lines, clippy::needless_range_loop)]`**: heavy_demo
+  block 追加で 209 lines になり、元の 8 ch ループの index アクセスも警告対象に。build_ui の
+  関数分割は別タスクへ。
+
+**残作業 (M5 残、Phase 14-17)**:
+- Phase 14: examples/piano_roll (100k notes、heavy 実用 + bench)
+- Phase 15: 波形 SamplePolyline + Auto + Interleaved unit test
+- Phase 16: マーカー (rect 角丸円) + RmsBars + examples/sample_editor
+- Phase 17: examples/arrangement (10×50 = 500 widgets を heavy 化) + bench
+
+**M5 元仕様** (Phase 14 以降の DoD ガイド):
+- `ui.heavy("...", |hctx| ...)` 脱出口 ✅ (Phase 13 で完成)
+- 波形 **詳細モード** (SamplePolyline + サンプル点マーカー、Phase 15-16):
   - 1 サンプル/ピクセル以下にズームしたとき自動切替 (`WaveformRenderMode::Auto`)
-  - 円形マーカーは rect パイプラインを SDF circle に拡張 (or 別 instance shader)
-  - 編集マーカー (loop start/end / cue points) を `waveform_marker()` 描画支援関数で
-- 波形ウィジェット **RMS モード**: ±RMS バー塗りつぶし (rect 流用)
-- 波形ウィジェット **任意 N チャンネル / Interleaved 入力** 対応
-- examples/sample_editor: 1 サンプルファイルをロード → 全表示・ズーム・選択範囲ハイライト・カーソル
-- examples/piano_roll: 100k notes をスクロール 120fps、heavy() の使い方サンプル
-- オートメーションカーブ: ベジエ → CPU flatten → line strip パイプライン
+  - 円形マーカーは **rect 角丸円** (4 隅 radius = 幅/2、knob と同パターン) を採用予定。
+    視認性で問題があれば line マーカー or SDF circle 専用 shader に切替を検討
+- 波形 **RmsBars**: ±RMS バー塗りつぶし (rect 流用、Phase 16)
+- 波形 **Interleaved 入力**: peak_in_raw で実装済み、unit test 追加のみ (Phase 15)
+- examples/sample_editor: 1 サンプル (generated) + ズーム + 選択範囲 + カーソル (Phase 16)
+- examples/piano_roll: 100k notes + scroll + zoom + クリック、heavy 実用 (Phase 14)
+- examples/arrangement: 10 トラック × 50 クリップ = 500 widgets を heavy 化 (Phase 17)
+
+### M5.5 (オートメーションカーブ — M5 完了後すぐの別 milestone)
+
+- ベジエ (cubic) → CPU flatten (適応分割で max segment 長 ≤ 2px) → LineSegment vec → push_lines
+- `crates/ui/src/widgets/automation.rs` で `Ui::automation_curve(id, rect, &points, style)` API
+- mixer (or 専用 example) で 1 本のオートメーションカーブ表示 + ノードドラッグで点編集
+- no-Clone trybuild 拡張
 
 ### M6 (Phase 2)
 
@@ -886,3 +944,5 @@ ui.heavy("track_0_clips", |hctx| {
 - 2026-05-01: **M4 Phase 10** — Scenegraph 基盤 + WidgetId 1M 衝突テスト。`crates/ui/src/scenegraph.rs` に `Scenegraph` (`HashMap<WidgetId, SceneNode>` 内蔵) と `SceneNode { input_hash: u64 }` 型を新設、API は `unchanged` / `record` / `retain` / `len` / `is_empty`。元 plan の `SlotMap<NodeId, SceneNode>` は `WidgetId` が安定キーなので不要と判断、`slotmap` 依存追加を回避 (Cargo.toml 不変)。`UiHost` に `scenegraph: Scenegraph` フィールドを追加 (Phase 10 では宣言のみ、Phase 11 で widget から書き込み)。`tests/widget_id_collision.rs` で 1000 parents × 1000 children = 1M unique IDs の衝突 0 を担保。Scenegraph 単体テスト 5 本 + 衝突テスト 1 本で計 6 本追加。Phase 11 で `Ui::with_widget_node` API + 各 widget 適用に進む。
 - 2026-05-01: **M4 Phase 11** — `Ui::with_widget_node` API + 6 widget 適用 + 描画コマンドキャッシュ。`SceneNode` を `{ input_hash, commands: CachedCommands }` に拡張、`CachedCommands { rects, glyph_areas, line_batches }` で per-widget の描画コマンドを保持。`Ui::with_widget_node(wid, input_hash, draw_fn)` API を追加: hash 一致なら draw_fn をスキップして前フレームの commands を scene に append、不一致なら draw_fn を実行して scene 末尾差分を新規 commands として記録。`UiHost::frame` 末尾で `scenegraph.retain(&seen_widgets)` で動的に出現/消滅する widget を扱う。6 widget (button / label / checkbox / fader / knob / text_input) を全て wrap、各 widget が `hash_inputs((b"<種別>", rect.x.to_bits(), ..., 状態フラグ))` で input_hash 計算。判別タグ (`b"fader"` 等) で異種 widget 間の偶然の hash 衝突を防ぐ。waveform は LOD generation の特殊処理が必要なので Phase 12 で。with_widget_node 単体テスト 3 本 + scenegraph 追加テスト 2 本 = 5 本追加 (合計 48 unit/test)、clippy 増分 0、mixer 実機で表示・操作に regression なし。
 - 2026-05-01: **M4 Phase 12 — milestone 完了** — 波形 widget の `with_widget_node` 適用 + 1000 widget bench。`ChannelLayout` / `WaveformRenderMode` に `Hash` derive 追加 (input_hash で使用)、`Ui::waveform` を with_widget_node で wrap (input_hash に generation / valid_len / sample_rate / view / style / rect を組込、ヒットテストはクロージャ外で毎フレーム実行)。Rust 標準 Hash の tuple 上限 (12 要素) 回避のため hash_inputs に nested tuple を渡す形。`crates/ui/benches/scenegraph_cache.rs` 新規 bench で 1000 buttons の cached vs no-cache を比較、cached 165 µs vs no-cache 313 µs で 1.9x 高速 (148 ns/widget の CPU prepare コスト削減)。waveform_validation で 128 widgets の波形描画 + drag scroll / wheel zoom / Space REC に regression なし。M4 milestone 全項目達成、次は M5 (heavy() + 巨大ビュー + 詳細波形モード) へ。
+- 2026-05-01: **chore(clippy)** — Rust 1.95 系の新 clippy ルールで噴出した 30+ 件の警告を解消し `cargo clippy --workspace --tests -- -D warnings` を再び通すための前提整備。`ignored_unit_patterns` (ui.rs テスト内 `|_, ui|` を `|(), ui|` に 17 件)、`uninlined_format_args` (layout / fader / knob テストの `format!("{}", x)` を `"{x}"` に 7 件)、`borrow_as_ptr` (winit_backend の `&mut pt` を `&raw mut pt`)、`match_wildcard_for_single_variants` (device.rs に wgpu 29 系 `CurrentSurfaceTexture::Validation` を明示)、`collapsible_if` / `match_same_arms` / `default_trait_access` × 4 / `cast_possible_wrap` (`screen.{w,h}.try_into().unwrap_or(i32::MAX)`) / `iter_last_double_ended` (filter().last() → rfind()) / `inline_always` (waveform hot path 用 `#[inline(always)]` に `#[allow]` 併記) / `needless_range_loop` (waveform / mixer の index アクセス) / `too_many_lines` (text_input / waveform_validation / mixer の build_ui 系大関数に `#[allow]`、関数分割は別タスク) / `missing #[must_use]` (id.rs::child)。機能変更なし、Phase 13 とは独立の chore commit として分離。
+- 2026-05-01: **M5 Phase 13** — heavy() API 基盤。`Ui::heavy(id, |hctx|)` + `HeavyCtx<'b, 'a, M>` + `cached(viewport_key, draw_fn)` を `crates/ui/src/widgets/heavy.rs` に新設。`HeavyCtx::cached` は M4 Phase 11 の `with_widget_node(child_wid, hash_inputs(viewport_key), ...)` を呼ぶだけの薄いラッパで、新キャッシュ機構ゼロ (`feedback_use_new_abstractions` 適合)。HeavyCtx は `pointer / screen / push_edit / push_rect / push_text / push_lines / waveform / label_at / button_at` を delegate (最小範囲、KISS)、`push_*` は heavy 内では `pub` (脱出口の意味、通常 widget からは引き続き `pub(crate)`)。ヒットテスト・動的 overlay は cached() の外で毎フレーム実行のパターン (waveform widget と同型)。viewport_key は explicit Hash 渡し (Clone 不要)、no-Clone 不変条件維持。`examples/mixer` に heavy_demo ブロック (m.count を viewport_key に、cache hit/miss を実機目視確認用) を 1 つ仕込み。trybuild (`tests/ui/pass/heavy.rs`、no-Clone + viewport_key Hash 制約) と単体テスト 4 本 (cache hit / miss / ヒットテスト経路 / eviction) で動作担保、合計 50 unit/test pass。clippy 増分 0、`cargo run --bin mixer` で表示・操作に regression なし。次は Phase 14 (examples/piano_roll、heavy() 実用第 1 弾)。
