@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use daw_ui_core::{Edit, InputAccumulator, UiHost};
 use daw_ui_platform::{AppEvent, AppHost, PhysicalSize, WindowBackend, winit_backend};
-use daw_ui_core::{CheckboxResponse, FaderResponse, KnobResponse};
+use daw_ui_core::{CheckboxResponse, FaderResponse, KnobResponse, TextInputResponse};
 use daw_ui_renderer::{Color, Rect, RectCommand, Renderer, Scene};
 use winit::window::WindowAttributes;
 
@@ -52,6 +52,8 @@ struct App {
     model: MixerModel,
     scene: Scene,
     input: InputAccumulator,
+    /// 直近に OS ウィンドウへ反映した title。Model.title と差分を見て set_title を呼ぶ。
+    last_window_title: String,
     /// 起動からの経過フレーム数 (デバッグ用)。
     frames: u64,
 }
@@ -63,8 +65,9 @@ impl App {
         let model = MixerModel::new();
         let scene = Scene::new();
         let input = InputAccumulator::new();
+        let last_window_title = model.title.clone();
         // タイトルを反映
-        window.set_title(&model.title);
+        window.set_title(&last_window_title);
         Self {
             window,
             renderer,
@@ -72,6 +75,7 @@ impl App {
             model,
             scene,
             input,
+            last_window_title,
             frames: 0,
         }
     }
@@ -120,7 +124,15 @@ impl App {
             pointer,
             keyboard,
             |m, ui| {
-                ui.label("title", &m.title);
+                // タイトル編集 (M3 Phase 4b: text_input)。
+                ui.label("title_lbl", "タイトル (クリックで編集):");
+                let _: TextInputResponse = ui.text_input("title_edit", &m.title, |new| {
+                    Edit::mutate(move |m: &mut MixerModel| {
+                        m.title = new;
+                        m.last_action = "タイトル変更".to_string();
+                    })
+                });
+
                 ui.label("count", &format!("クリック回数: {}", m.count));
                 ui.label("status", &m.last_action);
 
@@ -306,8 +318,13 @@ impl AppHost for App {
         if let Err(e) = self.renderer.render(&self.scene) {
             eprintln!("render error: {e}");
         }
-        // edits が出たら次フレームで適用後 Model のラベルを描き直す。
-        if had_edits {
+        // model.title が変わっていれば OS のウィンドウタイトルを追従させる。
+        if self.model.title != self.last_window_title {
+            self.window.set_title(&self.model.title);
+            self.last_window_title = self.model.title.clone();
+        }
+        // edits や focus 変化が出たら次フレームで適用後 Model / focus 状態を描き直す。
+        if had_edits || self.ui.focus_changed_in_last_frame() {
             self.window.request_redraw();
         }
         // bench 中は連続再描画

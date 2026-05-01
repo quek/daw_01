@@ -1,13 +1,14 @@
 //! ウィジェット実装。
 //! M1: label / button。
 //! M2: waveform (波形表示、line strip パイプラインを使う)。
-//! M3: fader (垂直スライダ) / knob (回転ノブ) / checkbox (bool toggle)。
+//! M3: fader / knob / checkbox / text_input。
 
 pub mod button;
 pub mod checkbox;
 pub mod fader;
 pub mod knob;
 pub mod label;
+pub mod text_input;
 pub mod waveform;
 
 use std::any::Any;

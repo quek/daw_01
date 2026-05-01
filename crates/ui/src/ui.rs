@@ -27,6 +27,10 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// クリックがフォーカス可能な widget でない場所に当たったら `None` にクリアされる
     /// (`frame` の終わりに次フレームへ commit)。
     focused: Option<WidgetId>,
+    /// 直前の `frame()` 呼び出しでフォーカスが変化したか。
+    /// アプリ側は `had_edits` と同様、これが `true` なら「次フレームで新しい
+    /// focus 状態に基づいた再描画」を行うため `request_redraw` を呼ぶこと。
+    focus_changed_in_last_frame: bool,
     _m: PhantomData<fn(&mut M)>,
 }
 
@@ -35,8 +39,16 @@ impl<M: ?Sized + 'static> UiHost<M> {
         Self {
             state: HashMap::new(),
             focused: None,
+            focus_changed_in_last_frame: false,
             _m: PhantomData,
         }
+    }
+
+    /// 直前の `frame()` 呼び出しでフォーカスが変化したか。
+    /// アプリの on_render はこれが true のとき `request_redraw` を呼ぶことで、
+    /// blur や focus 取得が画面に追いつくように。
+    pub fn focus_changed_in_last_frame(&self) -> bool {
+        self.focus_changed_in_last_frame
     }
 
     /// 1 フレーム分の UI を構築。返り値は発生したエディットのリスト。
@@ -79,11 +91,13 @@ impl<M: ?Sized + 'static> UiHost<M> {
         // - 誰かが set_focus / clear_focus を呼んでいたら pending_focus がそのまま反映。
         // - そうでないとき、このフレームでクリック (release) があったら blur 扱いで
         //   focused = None にする (= フォーカス可能でない場所がクリックされた)。
+        let prev_focused = self.focused;
         if ui.focus_changed_this_frame {
             self.focused = ui.pending_focus;
         } else if pointer.primary_just_released && self.focused.is_some() {
             self.focused = None;
         }
+        self.focus_changed_in_last_frame = self.focused != prev_focused;
         edits
     }
 
@@ -155,31 +169,37 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         self.edits.push(edit);
     }
 
-    /// このフレーム開始時点で `wid` がキーボードフォーカスを持っていたか。
-    /// (同フレーム内の `set_focus` の効果は反映されない — 次フレームから有効。)
+    /// `wid` が現在キーボードフォーカスを持っているか。
+    ///
+    /// 同フレーム内で `set_focus` が呼ばれた場合の効果も反映する (= 描画用に
+    /// 「クリックと同時にフォーカス枠を出す」ような遅延の無い見た目を作る)。
     pub fn is_focused(&self, wid: WidgetId) -> bool {
-        self.focused == Some(wid)
+        self.pending_focus == Some(wid)
     }
 
-    /// `wid` をキーボードフォーカスに設定する (次フレームから有効)。
-    /// クリックされたばかりの widget が「フォーカスを取った」と宣言する用途。
+    /// `wid` をキーボードフォーカスに設定する。
+    /// `is_focused` には即時反映され、次フレーム以降のキー入力配信もこの widget に向く。
     pub fn set_focus(&mut self, wid: WidgetId) {
         self.pending_focus = Some(wid);
         self.focus_changed_this_frame = true;
     }
 
-    /// 自身がフォーカスを持っているならクリアする (次フレームから有効)。
+    /// 自身がフォーカスを持っているならクリアする。
     /// 持っていないときは no-op (他 widget のフォーカスを誤って消さない)。
     pub fn clear_focus_if_focused(&mut self, wid: WidgetId) {
-        if self.focused == Some(wid) {
+        if self.pending_focus == Some(wid) {
             self.pending_focus = None;
             self.focus_changed_this_frame = true;
         }
     }
 
     /// `wid` がフォーカスを持っているならフレームに溜まったキー入力を取り出す。
-    /// 取り出すと内部 buffer は空になるので、フレーム内で 1 回だけ呼ぶこと
-    /// (= フォーカスを持つ widget だけが消費する想定)。
+    ///
+    /// チェック対象は **フレーム開始時の focus** (`self.focused`)。これによって、
+    /// 「同フレームに click でフォーカスを取った直後に、その widget が直前まで
+    /// 流れていたキー入力を遡って消費してしまう」事故を防ぐ
+    /// (= 例: 何かを打鍵中に間違えて click した場合、打鍵は古い focus に流すのが正解)。
+    /// 取り出すと内部 buffer は空になるので、フレーム内で 1 回だけ呼ぶこと。
     pub fn take_keyboard_events_if_focused(&mut self, wid: WidgetId) -> Vec<KeyEvent> {
         if self.focused == Some(wid) {
             std::mem::take(self.keyboard_events)
@@ -402,7 +422,8 @@ mod tests {
         );
     }
 
-    /// `Ui::set_focus` で設定したフォーカスが次フレームで有効になることを確認する。
+    /// `Ui::set_focus` の効果が同フレームで `is_focused` に反映されること、
+    /// および次フレームでも維持されることを確認する。
     #[test]
     fn focus_set_persists_to_next_frame() {
         let mut host: UiHost<()> = UiHost::new();
@@ -410,11 +431,11 @@ mod tests {
         let screen = PhysicalSize { width: 200, height: 100 };
         let id = WidgetId::ROOT.child("focus-target");
 
-        // Frame 1: set_focus を呼ぶ。同フレームでは is_focused は false (フレーム開始時の値を見る)。
+        // Frame 1: set_focus を呼ぶと **同フレーム内で** is_focused = true になる。
         host.frame(&(), &mut scene, screen, PointerFrame::default(), Vec::new(), |_, ui| {
             assert!(!ui.is_focused(id));
             ui.set_focus(id);
-            assert!(!ui.is_focused(id), "is_focused は同フレームでは反映されない");
+            assert!(ui.is_focused(id), "set_focus 後は同フレームで is_focused = true");
         });
         assert_eq!(host.focused_widget(), Some(id));
 
@@ -481,6 +502,72 @@ mod tests {
             ui.set_focus(id);
         });
         assert_eq!(host.focused_widget(), Some(id), "再 set_focus でフォーカス維持");
+    }
+
+    /// text_input をクリックでフォーカスを取り、キー入力で text を編集できることを担保する。
+    /// click → focus → 'A' 入力 → モデルが "A" になる、という流れを通しで検証。
+    #[test]
+    fn text_input_click_focus_then_typing_modifies_text() {
+        use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
+
+        struct Doc {
+            text: String,
+        }
+
+        let mut host: UiHost<Doc> = UiHost::new();
+        let mut scene = Scene::new();
+        let mut model = Doc { text: String::new() };
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 200.0, h: 28.0 };
+
+        // Frame 1: click で focus を取る (まだ text は空)。
+        let click = PointerFrame {
+            pos: Some((50.0, 14.0)),
+            primary_just_pressed: true,
+            primary_just_released: true,
+            primary_pressed: false,
+        };
+        let edits = host.frame(&model, &mut scene, screen, click, Vec::new(), |_, ui| {
+            ui.text_input_at("ti", rect, "", |new| {
+                Edit::mutate(|m: &mut Doc| m.text = new)
+            });
+        });
+        for e in edits { e.apply(&mut model); }
+        assert_eq!(model.text, "");
+
+        // Frame 2: 'A' のキー入力を流す (focus されているので消費される)。
+        let keys = vec![KeyEvent {
+            state: ElementState::Pressed,
+            text: Some("A".to_string()),
+            physical_key: PhysicalKey::Other(0x41),
+        }];
+        let edits = host.frame(
+            &model, &mut scene, screen, PointerFrame::default(), keys,
+            |m, ui| {
+                ui.text_input_at("ti", rect, &m.text, |new| {
+                    Edit::mutate(|m: &mut Doc| m.text = new)
+                });
+            },
+        );
+        for e in edits { e.apply(&mut model); }
+        assert_eq!(model.text, "A");
+
+        // Frame 3: Backspace で 1 文字消える。
+        let keys = vec![KeyEvent {
+            state: ElementState::Pressed,
+            text: None,
+            physical_key: PhysicalKey::Backspace,
+        }];
+        let edits = host.frame(
+            &model, &mut scene, screen, PointerFrame::default(), keys,
+            |m, ui| {
+                ui.text_input_at("ti", rect, &m.text, |new| {
+                    Edit::mutate(|m: &mut Doc| m.text = new)
+                });
+            },
+        );
+        for e in edits { e.apply(&mut model); }
+        assert_eq!(model.text, "");
     }
 
     /// キー入力イベントは focused widget だけに届き、他の widget には空が返る。

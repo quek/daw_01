@@ -17,6 +17,7 @@ struct Model {
     history: Vec<u32>,
     volume: f32,
     mute: bool,
+    title: String,
 }
 
 fn main() {
@@ -28,6 +29,7 @@ fn main() {
         history: Vec::new(),
         volume: 0.5,
         mute: false,
+        title: String::from("untitled"),
     };
 
     let edits = host.frame(
@@ -74,6 +76,16 @@ fn main() {
             );
             let _ = ui.checkbox("mute2", m.mute, "Mute", |new| {
                 Edit::mutate(move |m: &mut Model| m.mute = new)
+            });
+            // text_input (M3 Phase 4b): non-Clone Model でコンパイルする。
+            let _ = ui.text_input_at(
+                "title",
+                Rect { x: 0.0, y: 0.0, w: 200.0, h: 28.0 },
+                &m.title,
+                |new| Edit::mutate(move |m: &mut Model| m.title = new),
+            );
+            let _ = ui.text_input("title2", &m.title, |new| {
+                Edit::mutate(move |m: &mut Model| m.title = new)
             });
         },
     );

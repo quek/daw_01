@@ -25,6 +25,7 @@ pub use ui::{Ui, UiHost};
 pub use widgets::checkbox::CheckboxResponse;
 pub use widgets::fader::FaderResponse;
 pub use widgets::knob::KnobResponse;
+pub use widgets::text_input::TextInputResponse;
 pub use widgets::waveform::{
     ChannelLayout, SampleSlices, WaveformHit, WaveformRenderMode, WaveformResponse,
     WaveformSource, WaveformStyle, WaveformView,

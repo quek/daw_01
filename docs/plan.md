@@ -237,17 +237,31 @@ F:\dev\gui_01\
 
 | 成果物 | 状態 | コミット |
 |---|---|---|
-| `InputAccumulator` が `KeyEvent` を蓄積、`take_keyboard_events()` で取り出し | ✅ | (本コミット) |
-| `UiHost::focused: Option<WidgetId>` でキーボードフォーカスを保持、`focused_widget()` で参照 | ✅ | (本コミット) |
-| `Ui::is_focused` / `set_focus` / `clear_focus_if_focused` / `take_keyboard_events_if_focused` | ✅ | (本コミット) |
-| `UiHost::frame` シグネチャに `keyboard: Vec<KeyEvent>` 追加 | ✅ | (本コミット) |
-| クリック発生時に誰も `set_focus` を呼ばなければ blur (= フォーカス可能でない場所のクリック) | ✅ | (本コミット) |
-| 単体テスト 4 本: フォーカス維持 / blur / 再 set_focus / キーは focused だけに届く | ✅ | (本コミット) |
+| `InputAccumulator` が `KeyEvent` を蓄積、`take_keyboard_events()` で取り出し | ✅ | 6549cd8 |
+| `UiHost::focused: Option<WidgetId>` でキーボードフォーカスを保持、`focused_widget()` で参照 | ✅ | 6549cd8 |
+| `Ui::is_focused` / `set_focus` / `clear_focus_if_focused` / `take_keyboard_events_if_focused` | ✅ | 6549cd8 |
+| `UiHost::frame` シグネチャに `keyboard: Vec<KeyEvent>` 追加 | ✅ | 6549cd8 |
+| クリック発生時に誰も `set_focus` を呼ばなければ blur (= フォーカス可能でない場所のクリック) | ✅ | 6549cd8 |
+| 単体テスト 4 本: フォーカス維持 / blur / 再 set_focus / キーは focused だけに届く | ✅ | 6549cd8 |
 
-**残作業 (Phase 4b 以降)**:
+**Phase 4b 進捗 (2026-05-01)** — text_input (ASCII):
 
-- `Ui::text_input` (ASCII 編集: cursor / backspace / arrow / Enter, 数字編集向けにも使える)
-- IME 統合 (Phase 4c): `AppEvent::ImePreedit` / `ImeCommit` を focused widget へ流す、`WindowBackend::set_ime_position` を winit の `set_ime_cursor_area` で実装、preedit 表示
+| 成果物 | 状態 | コミット |
+|---|---|---|
+| `Ui::text_input_at` / `Ui::text_input` (ASCII 編集: char 挿入 / Backspace / 矢印 / Enter / Escape) | ✅ | (本コミット) |
+| `TextInputState`: armed-state click + cursor_byte (UTF-8 char 境界対応) | ✅ | (本コミット) |
+| 描画: 枠 + テキスト + cursor 縦線 (line strip)。focused 時は枠線色を強調 | ✅ | (本コミット) |
+| クリック内側で focus 取得 + cursor 末尾へ。**外側 press で自己 blur** (即時に枠線解除) | ✅ | (本コミット) |
+| `Ui::is_focused` を `pending_focus` ベースに変更 (set_focus 同フレームで即時反映) | ✅ | (本コミット) |
+| `UiHost::focus_changed_in_last_frame()` getter を追加。アプリは had_edits と同様 request_redraw する | ✅ | (本コミット) |
+| `examples/mixer` に title 編集 text_input。OS ウィンドウタイトルも `last_window_title` 差分で追従 | ✅ | (本コミット) |
+| `trybuild` / 単体テスト 1 本 (click → focus → typing で text 変化) | ✅ | (本コミット) |
+
+**残作業 (Phase 4c)**:
+
+- IME 統合: `AppEvent::ImePreedit` / `ImeCommit` を focused widget へ流す
+- `WindowBackend::set_ime_position` を winit `set_ime_cursor_area` で実装、preedit 表示
+- text_input の preedit 描画 (下線 + テンポラリ表示) と committed text の差分 apply
 - キーボード focus トラッキング (`UiHost` に focused widget) + `AppEvent::Keyboard` を focused widget へルーティング
 - IME 候補位置の `WindowBackend::set_ime_position()` 実装 (winit `set_ime_cursor_area` を使う)
 - `LayoutPass` 拡張: padding / gap / fixed size / proportional growth
@@ -621,3 +635,4 @@ ui.heavy("track_0_clips", |hctx| {
 - 2026-05-01: **M3 Phase 2** — knob (円形ノブ、line strip でインジケータ、上下ドラッグで値編集)。fader と同じドラッグパターン + 既存 rect (4 隅角丸 = 円) と line strip パイプラインの組み合わせで実装、新パイプライン不要。`examples/mixer` で 3 ch pan ノブとして動作確認。
 - 2026-05-01: **M3 Phase 3** — checkbox (bool toggle、button と同じ armed-state モデル、line strip で V 字チェックマーク)。`examples/mixer` で 3 ch mute トグルとして動作確認。
 - 2026-05-01: **M3 Phase 4a** — keyboard / focus 基盤。`InputAccumulator` が KeyEvent 蓄積、`UiHost::focused` でキーボードフォーカス保持、`Ui::set_focus` / `clear_focus_if_focused` / `is_focused` / `take_keyboard_events_if_focused`。クリックで誰も `set_focus` しなければ blur。`UiHost::frame` シグネチャに `keyboard: Vec<KeyEvent>` 追加 (既存 callers 全部追従)。単体テスト 4 本追加。これで text_input (4b) を載せる土台が揃った。
+- 2026-05-01: **M3 Phase 4b** — text_input (ASCII 編集)。char 挿入 / Backspace / Arrow / Enter / Escape をサポート。`is_focused` を `pending_focus` チェックに変更して set_focus が同フレームで即時反映、widget は外側 press で自己 blur することで枠線切替の lag を 0 に。`UiHost::focus_changed_in_last_frame()` getter を追加し、アプリ側は had_edits と同様に request_redraw を呼べる。`examples/mixer` で title 編集 + OS ウィンドウタイトル追従を実装。単体テスト 1 本追加 (click → focus → typing で text 変化)。IME (Phase 4c) は次。
