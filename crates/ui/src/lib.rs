@@ -23,6 +23,7 @@ pub use input::{InputAccumulator, PointerFrame};
 pub use layout::LayoutPass;
 pub use ui::{Ui, UiHost};
 pub use widgets::fader::FaderResponse;
+pub use widgets::knob::KnobResponse;
 pub use widgets::waveform::{
     ChannelLayout, SampleSlices, WaveformHit, WaveformRenderMode, WaveformResponse,
     WaveformSource, WaveformStyle, WaveformView,

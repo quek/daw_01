@@ -51,6 +51,16 @@ fn main() {
             let _ = ui.fader("vol2", m.volume, |v| {
                 Edit::mutate(move |m: &mut Model| m.volume = v)
             });
+            // knob (M3): 同様に non-Clone Model でコンパイルする。
+            let _ = ui.knob_at(
+                "pan",
+                Rect { x: 0.0, y: 0.0, w: 64.0, h: 64.0 },
+                m.volume,
+                |v| Edit::mutate(move |m: &mut Model| m.volume = v),
+            );
+            let _ = ui.knob("pan2", m.volume, |v| {
+                Edit::mutate(move |m: &mut Model| m.volume = v)
+            });
         },
     );
 

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use daw_ui_core::{Edit, InputAccumulator, UiHost};
 use daw_ui_platform::{AppEvent, AppHost, PhysicalSize, WindowBackend, winit_backend};
-use daw_ui_core::FaderResponse;
+use daw_ui_core::{FaderResponse, KnobResponse};
 use daw_ui_renderer::{Color, Rect, RectCommand, Renderer, Scene};
 use winit::window::WindowAttributes;
 
@@ -25,6 +25,8 @@ struct MixerModel {
     last_action: String,
     /// M3 動作確認用: 3 ch のフェーダ値 (0..1)。
     faders: [f32; 3],
+    /// M3 動作確認用: 3 ch の pan ノブ値 (0..1, 0.5 = center)。
+    pans: [f32; 3],
 }
 
 impl MixerModel {
@@ -35,6 +37,7 @@ impl MixerModel {
             bench_active: false,
             last_action: "起動しました".to_string(),
             faders: [0.5, 0.7, 0.3],
+            pans: [0.5, 0.4, 0.6],
         }
     }
 }
@@ -159,6 +162,16 @@ impl App {
                     14.0,
                     Color::rgb(0.85, 0.88, 0.92),
                 );
+                let knob_size = 56.0;
+                let knob_top = fader_top + fader_h + 28.0;
+                ui.label_at(
+                    "knob_label",
+                    "M3: pan ノブ (0.5 = center)",
+                    fader_left,
+                    knob_top - 22.0,
+                    14.0,
+                    Color::rgb(0.85, 0.88, 0.92),
+                );
                 for i in 0..3 {
                     let rect = Rect {
                         x: fader_left + i as f32 * (fader_w + 16.0),
@@ -181,6 +194,48 @@ impl App {
                         rect.y + rect.h + 6.0,
                         12.0,
                         if resp.dragging {
+                            Color::rgb(0.95, 0.97, 1.0)
+                        } else {
+                            Color::rgb(0.65, 0.68, 0.72)
+                        },
+                    );
+
+                    // pan knob (fader と同じ列、下に配置)
+                    let knob_rect = Rect {
+                        x: rect.x + (fader_w - knob_size) * 0.5,
+                        y: knob_top,
+                        w: knob_size,
+                        h: knob_size,
+                    };
+                    let kresp: KnobResponse =
+                        ui.knob_at(("ch_pan", i), knob_rect, m.pans[i], move |v| {
+                            Edit::mutate(move |m: &mut MixerModel| {
+                                m.pans[i] = v;
+                                let lr = (v - 0.5) * 2.0; // -1..1
+                                m.last_action = if lr.abs() < 0.02 {
+                                    format!("ch{} pan = C", i + 1)
+                                } else if lr < 0.0 {
+                                    format!("ch{} pan = L{:.0}", i + 1, lr.abs() * 100.0)
+                                } else {
+                                    format!("ch{} pan = R{:.0}", i + 1, lr * 100.0)
+                                };
+                            })
+                        });
+                    let lr = (kresp.displayed_value - 0.5) * 2.0;
+                    let pan_label = if lr.abs() < 0.02 {
+                        "C".to_string()
+                    } else if lr < 0.0 {
+                        format!("L{:.0}", lr.abs() * 100.0)
+                    } else {
+                        format!("R{:.0}", lr * 100.0)
+                    };
+                    ui.label_at(
+                        ("pan_label", i),
+                        &pan_label,
+                        knob_rect.x,
+                        knob_rect.y + knob_rect.h + 4.0,
+                        12.0,
+                        if kresp.dragging {
                             Color::rgb(0.95, 0.97, 1.0)
                         } else {
                             Color::rgb(0.65, 0.68, 0.72)
