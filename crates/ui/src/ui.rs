@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use daw_ui_platform::PhysicalSize;
+use daw_ui_platform::{KeyEvent, PhysicalSize};
 use daw_ui_renderer::{Color, GlyphArea, LineBatch, Rect, RectCommand, Scene};
 
 use crate::edit::Edit;
@@ -23,6 +23,10 @@ use crate::widgets::WidgetState;
 /// アプリが 1 つ持つ UI ホスト。フレーム間で UI 内部状態を保持する。
 pub struct UiHost<M: ?Sized + 'static> {
     state: HashMap<WidgetId, Box<dyn WidgetState>>,
+    /// キーボードフォーカスを持つウィジェット (`text_input` 等)。
+    /// クリックがフォーカス可能な widget でない場所に当たったら `None` にクリアされる
+    /// (`frame` の終わりに次フレームへ commit)。
+    focused: Option<WidgetId>,
     _m: PhantomData<fn(&mut M)>,
 }
 
@@ -30,6 +34,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
     pub fn new() -> Self {
         Self {
             state: HashMap::new(),
+            focused: None,
             _m: PhantomData,
         }
     }
@@ -37,31 +42,54 @@ impl<M: ?Sized + 'static> UiHost<M> {
     /// 1 フレーム分の UI を構築。返り値は発生したエディットのリスト。
     ///
     /// `f` は `(model, &mut Ui)` を受け取り、ウィジェットを呼び出して UI を組む。
+    /// `keyboard` はこのフレーム内に発生したキー入力イベント (順序保持)。
+    /// フォーカスを持つ widget がいれば `Ui::take_keyboard_events_if_focused` で消費する。
     pub fn frame<F>(
         &mut self,
         model: &M,
         scene: &mut Scene,
         screen: PhysicalSize,
         pointer: PointerFrame,
+        keyboard: Vec<KeyEvent>,
         f: F,
     ) -> Vec<Edit<M>>
     where
         F: for<'a> FnOnce(&'a M, &mut Ui<'a, M>),
     {
         let mut edits: Vec<Edit<M>> = Vec::new();
+        let mut keyboard_events = keyboard;
         let cursor = Rect::new(0.0, 0.0, screen.width as f32, screen.height as f32);
+        let focused_at_start = self.focused;
         let mut ui = Ui {
             state: &mut self.state,
             scene,
             edits: &mut edits,
             pointer,
+            keyboard_events: &mut keyboard_events,
             cursor,
             screen,
             next_y: 0.0,
+            focused: focused_at_start,
+            pending_focus: focused_at_start,
+            focus_changed_this_frame: false,
             _m: PhantomData,
         };
         f(model, &mut ui);
+        // フォーカスの commit:
+        // - 誰かが set_focus / clear_focus を呼んでいたら pending_focus がそのまま反映。
+        // - そうでないとき、このフレームでクリック (release) があったら blur 扱いで
+        //   focused = None にする (= フォーカス可能でない場所がクリックされた)。
+        if ui.focus_changed_this_frame {
+            self.focused = ui.pending_focus;
+        } else if pointer.primary_just_released && self.focused.is_some() {
+            self.focused = None;
+        }
         edits
+    }
+
+    /// 現在キーボードフォーカスを持つ widget の ID。
+    pub fn focused_widget(&self) -> Option<WidgetId> {
+        self.focused
     }
 }
 
@@ -76,17 +104,25 @@ impl<M: ?Sized + 'static> Default for UiHost<M> {
 /// `'a` は `&'a M` 借用と同じ寿命。`Edit<M>` は `'static` (M1) なので Ui のライフタイムから
 /// 切り離せる。
 pub struct Ui<'a, M: ?Sized + 'static> {
-    // M2 以降のドラッグ/スクロール/フォーカス状態保持で使う。
-    #[allow(dead_code)]
     state: &'a mut HashMap<WidgetId, Box<dyn WidgetState>>,
     scene: &'a mut Scene,
     edits: &'a mut Vec<Edit<M>>,
     pub(crate) pointer: PointerFrame,
+    /// このフレーム分のキー入力イベント (フォーカスを持つ widget が消費する)。
+    keyboard_events: &'a mut Vec<KeyEvent>,
     /// 現在の利用可能領域 (シンプルな vstack 用)。
     pub(crate) cursor: Rect,
     pub(crate) screen: PhysicalSize,
     /// vstack 内で次に積むウィジェットの y 位置。
     pub(crate) next_y: f32,
+    /// このフレーム開始時点でキーボードフォーカスを持つ widget。
+    focused: Option<WidgetId>,
+    /// このフレーム内で widget が `set_focus` / `clear_focus` を呼んだ結果。
+    /// frame 終了時に `UiHost::focused` に commit される。
+    pending_focus: Option<WidgetId>,
+    /// このフレーム内で誰かがフォーカスを操作したか。
+    /// クリック発生時にこれが `false` なら blur (= フォーカス可能でない場所がクリックされた)。
+    focus_changed_this_frame: bool,
     _m: PhantomData<&'a M>,
 }
 
@@ -117,6 +153,39 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 内部: ウィジェットがエディットを積む。
     pub(crate) fn push_edit(&mut self, edit: Edit<M>) {
         self.edits.push(edit);
+    }
+
+    /// このフレーム開始時点で `wid` がキーボードフォーカスを持っていたか。
+    /// (同フレーム内の `set_focus` の効果は反映されない — 次フレームから有効。)
+    pub fn is_focused(&self, wid: WidgetId) -> bool {
+        self.focused == Some(wid)
+    }
+
+    /// `wid` をキーボードフォーカスに設定する (次フレームから有効)。
+    /// クリックされたばかりの widget が「フォーカスを取った」と宣言する用途。
+    pub fn set_focus(&mut self, wid: WidgetId) {
+        self.pending_focus = Some(wid);
+        self.focus_changed_this_frame = true;
+    }
+
+    /// 自身がフォーカスを持っているならクリアする (次フレームから有効)。
+    /// 持っていないときは no-op (他 widget のフォーカスを誤って消さない)。
+    pub fn clear_focus_if_focused(&mut self, wid: WidgetId) {
+        if self.focused == Some(wid) {
+            self.pending_focus = None;
+            self.focus_changed_this_frame = true;
+        }
+    }
+
+    /// `wid` がフォーカスを持っているならフレームに溜まったキー入力を取り出す。
+    /// 取り出すと内部 buffer は空になるので、フレーム内で 1 回だけ呼ぶこと
+    /// (= フォーカスを持つ widget だけが消費する想定)。
+    pub fn take_keyboard_events_if_focused(&mut self, wid: WidgetId) -> Vec<KeyEvent> {
+        if self.focused == Some(wid) {
+            std::mem::take(self.keyboard_events)
+        } else {
+            Vec::new()
+        }
     }
 
     /// 内部: WidgetId に紐付く永続状態を取得 or 初期化。
@@ -184,7 +253,7 @@ mod tests {
         let screen = PhysicalSize { width: 400, height: 300 };
 
         // フレーム 1: state を初期化して 1 回インクリメント。
-        host.frame(&model, &mut scene, screen, PointerFrame::default(), |_, ui| {
+        host.frame(&model, &mut scene, screen, PointerFrame::default(), Vec::new(), |_, ui| {
             let id = WidgetId::ROOT.child("ws-roundtrip");
             let state: &mut MyState = ui.widget_state(id);
             assert_eq!(state.count, 0);
@@ -192,14 +261,14 @@ mod tests {
         });
 
         // フレーム 2: 同じ id で同じ型を取り直すと値が保持されている。
-        host.frame(&model, &mut scene, screen, PointerFrame::default(), |_, ui| {
+        host.frame(&model, &mut scene, screen, PointerFrame::default(), Vec::new(), |_, ui| {
             let id = WidgetId::ROOT.child("ws-roundtrip");
             let state: &mut MyState = ui.widget_state(id);
             assert_eq!(state.count, 1);
             state.count += 1;
         });
 
-        host.frame(&model, &mut scene, screen, PointerFrame::default(), |_, ui| {
+        host.frame(&model, &mut scene, screen, PointerFrame::default(), Vec::new(), |_, ui| {
             let id = WidgetId::ROOT.child("ws-roundtrip");
             let state: &mut MyState = ui.widget_state(id);
             assert_eq!(state.count, 2);
@@ -229,7 +298,7 @@ mod tests {
             primary_just_released: false,
             primary_pressed: false,
         };
-        let edits = host.frame(&model, &mut scene, screen, pointer_hover, |_, ui| {
+        let edits = host.frame(&model, &mut scene, screen, pointer_hover, Vec::new(), |_, ui| {
             ui.button_at("test", "click me", rect, || {
                 Edit::mutate(|m: &mut Counter| m.count += 1)
             });
@@ -246,7 +315,7 @@ mod tests {
             primary_just_released: true,
             primary_pressed: false,
         };
-        let edits = host.frame(&model, &mut scene, screen, pointer_click, |_, ui| {
+        let edits = host.frame(&model, &mut scene, screen, pointer_click, Vec::new(), |_, ui| {
             ui.button_at("test", "click me", rect, || {
                 Edit::mutate(|m: &mut Counter| m.count += 1)
             });
@@ -279,7 +348,7 @@ mod tests {
                       model: &Counter,
                       pointer: PointerFrame|
          -> Vec<Edit<Counter>> {
-            host.frame(model, scene, screen, pointer, |_, ui| {
+            host.frame(model, scene, screen, pointer, Vec::new(), |_, ui| {
                 ui.button_at("test", "click me", rect, || {
                     Edit::mutate(|m: &mut Counter| m.count += 1)
                 });
@@ -331,5 +400,122 @@ mod tests {
             model.count, 1,
             "release フレームで click 発火するべき (press_started_inside が保持されている)"
         );
+    }
+
+    /// `Ui::set_focus` で設定したフォーカスが次フレームで有効になることを確認する。
+    #[test]
+    fn focus_set_persists_to_next_frame() {
+        let mut host: UiHost<()> = UiHost::new();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let id = WidgetId::ROOT.child("focus-target");
+
+        // Frame 1: set_focus を呼ぶ。同フレームでは is_focused は false (フレーム開始時の値を見る)。
+        host.frame(&(), &mut scene, screen, PointerFrame::default(), Vec::new(), |_, ui| {
+            assert!(!ui.is_focused(id));
+            ui.set_focus(id);
+            assert!(!ui.is_focused(id), "is_focused は同フレームでは反映されない");
+        });
+        assert_eq!(host.focused_widget(), Some(id));
+
+        // Frame 2: 何もしないが focus は維持。
+        host.frame(&(), &mut scene, screen, PointerFrame::default(), Vec::new(), |_, ui| {
+            assert!(ui.is_focused(id));
+        });
+        assert_eq!(host.focused_widget(), Some(id));
+    }
+
+    /// フォーカスを取った widget の上でクリックされても、その widget が `set_focus` を
+    /// 呼び続ける限りフォーカスは保たれる。クリック先が誰も `set_focus` を呼ばない
+    /// (= フォーカス可能でない場所) ならフォーカスはクリアされる。
+    #[test]
+    fn click_outside_clears_focus_when_no_widget_claims() {
+        let mut host: UiHost<()> = UiHost::new();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let id = WidgetId::ROOT.child("focus-target");
+
+        // Frame 1: フォーカスを取る。
+        host.frame(&(), &mut scene, screen, PointerFrame::default(), Vec::new(), |_, ui| {
+            ui.set_focus(id);
+        });
+        assert_eq!(host.focused_widget(), Some(id));
+
+        // Frame 2: クリック発生 (just_released=true) で誰も set_focus を呼ばない → blur。
+        let click = PointerFrame {
+            pos: Some((50.0, 50.0)),
+            primary_just_pressed: false,
+            primary_just_released: true,
+            primary_pressed: false,
+        };
+        host.frame(&(), &mut scene, screen, click, Vec::new(), |_, _ui| {
+            // 誰も set_focus / clear_focus を呼ばない。
+        });
+        assert_eq!(
+            host.focused_widget(),
+            None,
+            "誰もフォーカスを取り直さなかったので blur される"
+        );
+    }
+
+    /// 同フレームで set_focus を呼んでいればクリックがあってもフォーカスは保たれる。
+    #[test]
+    fn focus_kept_when_widget_re_claims_on_click() {
+        let mut host: UiHost<()> = UiHost::new();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let id = WidgetId::ROOT.child("focus-target");
+
+        host.frame(&(), &mut scene, screen, PointerFrame::default(), Vec::new(), |_, ui| {
+            ui.set_focus(id);
+        });
+        assert_eq!(host.focused_widget(), Some(id));
+
+        let click = PointerFrame {
+            pos: Some((50.0, 50.0)),
+            primary_just_released: true,
+            ..PointerFrame::default()
+        };
+        host.frame(&(), &mut scene, screen, click, Vec::new(), |_, ui| {
+            // クリックフレームで widget が再度 set_focus を呼ぶ (text_input が再クリックされたケース)。
+            ui.set_focus(id);
+        });
+        assert_eq!(host.focused_widget(), Some(id), "再 set_focus でフォーカス維持");
+    }
+
+    /// キー入力イベントは focused widget だけに届き、他の widget には空が返る。
+    #[test]
+    fn keyboard_events_delivered_only_to_focused() {
+        use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
+
+        let mut host: UiHost<()> = UiHost::new();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let id_a = WidgetId::ROOT.child("a");
+        let id_b = WidgetId::ROOT.child("b");
+
+        // a にフォーカスを置く。
+        host.frame(&(), &mut scene, screen, PointerFrame::default(), Vec::new(), |_, ui| {
+            ui.set_focus(id_a);
+        });
+
+        // 次フレーム: キー入力を流す。a は受け取れる、b は受け取れない。
+        let keys = vec![KeyEvent {
+            state: ElementState::Pressed,
+            text: Some("x".to_string()),
+            physical_key: PhysicalKey::Other(0),
+        }];
+        host.frame(&(), &mut scene, screen, PointerFrame::default(), keys, |_, ui| {
+            // b で先に呼んでも空 (フォーカスが a)。
+            let b_keys = ui.take_keyboard_events_if_focused(id_b);
+            assert_eq!(b_keys.len(), 0);
+            // a が呼ぶと届く。
+            let a_keys = ui.take_keyboard_events_if_focused(id_a);
+            assert_eq!(a_keys.len(), 1);
+            assert_eq!(a_keys[0].text.as_deref(), Some("x"));
+            // 二度目に a が呼んでも空 (内部 buffer が drain 済み)。
+            let a_keys2 = ui.take_keyboard_events_if_focused(id_a);
+            assert_eq!(a_keys2.len(), 0);
+        });
     }
 }

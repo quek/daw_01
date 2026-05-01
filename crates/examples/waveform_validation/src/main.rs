@@ -242,6 +242,7 @@ impl App {
         self.scene.clear();
         let screen = self.renderer.size();
         let pointer = self.input.take_frame();
+        let keyboard = self.input.take_keyboard_events();
 
         // 1. drag panning (grid 全域がドラッグ対象)
         let area = waveform_area(screen);
@@ -285,6 +286,7 @@ impl App {
             &mut self.scene,
             screen,
             pointer,
+            keyboard,
             |m, ui| {
                 // タイトル + view 情報
                 ui.label_at(

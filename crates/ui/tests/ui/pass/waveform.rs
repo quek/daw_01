@@ -44,6 +44,7 @@ fn main() {
         &mut scene,
         screen,
         PointerFrame::default(),
+        Vec::new(),
         |m, ui| {
             // Mono: 1ch スライスを直接借用
             let _ = ui.waveform(

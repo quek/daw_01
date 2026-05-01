@@ -227,15 +227,27 @@ F:\dev\gui_01\
 
 | 成果物 | 状態 | コミット |
 |---|---|---|
-| `Ui::checkbox_at` / `Ui::checkbox` (bool toggle、armed-state click) | ✅ | (本コミット) |
-| `CheckboxState`: button と同じ `press_started_inside` モデル | ✅ | (本コミット) |
-| 視覚: 16px 角丸枠 + チェック時の V 字 (line strip) + ラベル | ✅ | (本コミット) |
-| `examples/mixer` に 3 ch mute checkbox を追加 | ✅ | (本コミット) |
-| `trybuild`: `Ui::checkbox` / `Ui::checkbox_at` が non-Clone Model でコンパイル | ✅ | (本コミット) |
+| `Ui::checkbox_at` / `Ui::checkbox` (bool toggle、armed-state click) | ✅ | af223ca |
+| `CheckboxState`: button と同じ `press_started_inside` モデル | ✅ | af223ca |
+| 視覚: 16px 角丸枠 + チェック時の V 字 (line strip) + ラベル | ✅ | af223ca |
+| `examples/mixer` に 3 ch mute checkbox を追加 | ✅ | af223ca |
+| `trybuild`: `Ui::checkbox` / `Ui::checkbox_at` が non-Clone Model でコンパイル | ✅ | af223ca |
 
-**残作業 (Phase 4 以降)**:
+**Phase 4a 進捗 (2026-05-01)** — focus / keyboard 基盤:
 
-- `Ui::text_input` (ASCII + 日本語 IME 込み)
+| 成果物 | 状態 | コミット |
+|---|---|---|
+| `InputAccumulator` が `KeyEvent` を蓄積、`take_keyboard_events()` で取り出し | ✅ | (本コミット) |
+| `UiHost::focused: Option<WidgetId>` でキーボードフォーカスを保持、`focused_widget()` で参照 | ✅ | (本コミット) |
+| `Ui::is_focused` / `set_focus` / `clear_focus_if_focused` / `take_keyboard_events_if_focused` | ✅ | (本コミット) |
+| `UiHost::frame` シグネチャに `keyboard: Vec<KeyEvent>` 追加 | ✅ | (本コミット) |
+| クリック発生時に誰も `set_focus` を呼ばなければ blur (= フォーカス可能でない場所のクリック) | ✅ | (本コミット) |
+| 単体テスト 4 本: フォーカス維持 / blur / 再 set_focus / キーは focused だけに届く | ✅ | (本コミット) |
+
+**残作業 (Phase 4b 以降)**:
+
+- `Ui::text_input` (ASCII 編集: cursor / backspace / arrow / Enter, 数字編集向けにも使える)
+- IME 統合 (Phase 4c): `AppEvent::ImePreedit` / `ImeCommit` を focused widget へ流す、`WindowBackend::set_ime_position` を winit の `set_ime_cursor_area` で実装、preedit 表示
 - キーボード focus トラッキング (`UiHost` に focused widget) + `AppEvent::Keyboard` を focused widget へルーティング
 - IME 候補位置の `WindowBackend::set_ime_position()` 実装 (winit `set_ime_cursor_area` を使う)
 - `LayoutPass` 拡張: padding / gap / fixed size / proportional growth
@@ -608,3 +620,4 @@ ui.heavy("track_0_clips", |hctx| {
 - 2026-05-01: **M3 Phase 1** — fader (垂直スライダ、つまみ限定ドラッグ) + button armed-state モデル + Windows focus-click cur_pos workaround + edit 後の追加 redraw パターン確立。実機検証で「ホバー直後の click が反応しない」「フォーカス取得クリックで反応しない」「fader を rect 全域でドラッグ可能」「fader 感度が rect.h 基準で上端に届かない」をユーザ報告から逐次修正。
 - 2026-05-01: **M3 Phase 2** — knob (円形ノブ、line strip でインジケータ、上下ドラッグで値編集)。fader と同じドラッグパターン + 既存 rect (4 隅角丸 = 円) と line strip パイプラインの組み合わせで実装、新パイプライン不要。`examples/mixer` で 3 ch pan ノブとして動作確認。
 - 2026-05-01: **M3 Phase 3** — checkbox (bool toggle、button と同じ armed-state モデル、line strip で V 字チェックマーク)。`examples/mixer` で 3 ch mute トグルとして動作確認。
+- 2026-05-01: **M3 Phase 4a** — keyboard / focus 基盤。`InputAccumulator` が KeyEvent 蓄積、`UiHost::focused` でキーボードフォーカス保持、`Ui::set_focus` / `clear_focus_if_focused` / `is_focused` / `take_keyboard_events_if_focused`。クリックで誰も `set_focus` しなければ blur。`UiHost::frame` シグネチャに `keyboard: Vec<KeyEvent>` 追加 (既存 callers 全部追従)。単体テスト 4 本追加。これで text_input (4b) を載せる土台が揃った。

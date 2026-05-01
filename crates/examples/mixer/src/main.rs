@@ -85,6 +85,7 @@ impl App {
         self.scene.clear();
         let screen = self.renderer.size();
         let pointer = self.input.take_frame();
+        let keyboard = self.input.take_keyboard_events();
 
         // 1 万矩形ベンチ: bench_active なら 100x100 グリッドを背景に積む
         if self.model.bench_active {
@@ -117,6 +118,7 @@ impl App {
             &mut self.scene,
             screen,
             pointer,
+            keyboard,
             |m, ui| {
                 ui.label("title", &m.title);
                 ui.label("count", &format!("クリック回数: {}", m.count));

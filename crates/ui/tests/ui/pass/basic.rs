@@ -35,6 +35,7 @@ fn main() {
         &mut scene,
         PhysicalSize { width: 800, height: 600 },
         PointerFrame::default(),
+        Vec::new(),
         |m, ui| {
             ui.label("title", &m.label);
             ui.button("inc", "increment", || {
