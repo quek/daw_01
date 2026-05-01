@@ -21,3 +21,7 @@ trybuild = "1"
 [[bench]]
 name = "waveform"
 harness = false
+
+[[bench]]
+name = "scenegraph_cache"
+harness = false

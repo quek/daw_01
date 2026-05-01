@@ -15,6 +15,7 @@ use std::hash::Hash;
 use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect};
 
 use crate::id::WidgetId;
+use crate::scenegraph::hash_inputs;
 use crate::ui::{Ui, hovered, pressed_inside};
 
 // ============================================================
@@ -93,7 +94,7 @@ impl Default for WaveformView {
 }
 
 /// チャンネルレイアウト。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChannelLayout {
     /// チャンネルを縦に並べる (デフォルト)。
     Stack,
@@ -104,7 +105,7 @@ pub enum ChannelLayout {
 }
 
 /// 描画モード。M2 では `PeakLines` のみ実装、他は M5 で完成させる。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WaveformRenderMode {
     /// pixel あたり 1 本の縦線 (min..max)。クリップ表示の標準。
     PeakLines,
@@ -664,21 +665,47 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     ) -> WaveformResponse {
         let wid = WidgetId::ROOT.child((b"waveform", &id));
 
-        // 1. キャッシュ: 必要なら LOD ピラミッドを再構築 (借用は短いスコープに閉じる)。
-        let segments = {
-            let pyramid: &mut WaveformPyramid = self.widget_state(wid);
-            pyramid.ensure_built(&source);
-            build_peak_segments(pyramid, &source, rect, view, style)
-        };
+        // M4 Phase 12: input_hash 一致なら LOD ピラミッドの再構築 + 描画を全部スキップ。
+        // generation 変化が主な invalidation トリガ (= LOD pyramid の fingerprint と整合)。
+        // 注: Rust の `Hash` 実装は tuple 要素 12 個まで。ネスト tuple で回避。
+        let input_hash = hash_inputs((
+            b"waveform",
+            (rect.x.to_bits(), rect.y.to_bits(), rect.w.to_bits(), rect.h.to_bits()),
+            (source.generation, source.valid_len as u64, source.sample_rate),
+            (view.start_sample, view.len_samples, view.vertical_gain.to_bits()),
+            style.line_width_px.to_bits(),
+            (
+                style.fg.r.to_bits(),
+                style.fg.g.to_bits(),
+                style.fg.b.to_bits(),
+                style.fg.a.to_bits(),
+            ),
+            (
+                style.fg_clipped.r.to_bits(),
+                style.fg_clipped.g.to_bits(),
+                style.fg_clipped.b.to_bits(),
+                style.fg_clipped.a.to_bits(),
+            ),
+            style.channel_layout,
+            style.render_mode,
+        ));
 
-        // 2. 描画コマンドを scene に積む。
-        if !segments.is_empty() {
-            self.push_lines(LineBatch {
-                segments,
-                line_width_px: style.line_width_px.max(1.0),
-                clip_rect: Some(rect),
-            });
-        }
+        // pyramid は wid 経由の widget_state で持つので、closure 内で取り直す。
+        // source / view / style は closure 内で borrow / Copy。
+        self.with_widget_node(wid, input_hash, |ui| {
+            let segments = {
+                let pyramid: &mut WaveformPyramid = ui.widget_state(wid);
+                pyramid.ensure_built(&source);
+                build_peak_segments(pyramid, &source, rect, view, style)
+            };
+            if !segments.is_empty() {
+                ui.push_lines(LineBatch {
+                    segments,
+                    line_width_px: style.line_width_px.max(1.0),
+                    clip_rect: Some(rect),
+                });
+            }
+        });
 
         // 3. ヒットテスト。
         let pointer = self.pointer;

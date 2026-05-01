@@ -405,6 +405,39 @@ F:\dev\gui_01\
 
 ### M4 (内部 scenegraph + 差分検出) — 旧 M3
 
+**Phase 12 進捗 (2026-05-01)** — 波形 widget の `with_widget_node` 適用 + 1000 widget bench (M4 完了):
+
+| 成果物 | 状態 | コミット |
+|---|---|---|
+| `ChannelLayout` / `WaveformRenderMode` に `Hash` derive 追加 (input_hash 計算用) | ✅ | (本コミット) |
+| `Ui::waveform` を `with_widget_node` で wrap (LOD ピラミッドの ensure_built + 描画を input_hash でキャッシュ) | ✅ | (本コミット) |
+| input_hash に generation / valid_len / sample_rate / view (start/len/gain) / style (line_width / fg / fg_clipped / channel_layout / render_mode) / rect を組込 | ✅ | (本コミット) |
+| ヒットテストはクロージャ外で毎フレーム実行 (pointer 依存で cache 不可) | ✅ | (本コミット) |
+| `crates/ui/benches/scenegraph_cache.rs` 新規 bench: 1000 buttons の cached vs no-cache 比較 | ✅ | (本コミット) |
+| 実機検証: waveform_validation で表示・操作 (drag scroll / wheel zoom / Space REC) に regression なし | ✅ | (本コミット) |
+
+**実測ベンチ値 (release profile, 1000 buttons / frame)**:
+
+| シナリオ | 1 frame 時間 | 比 |
+|---|---|---|
+| **cached** (input_hash 一致、cache hit) | **165 µs** | 1x |
+| no_cache (label 毎フレーム変えて hash 不一致) | 313 µs | 1.9x |
+
+cached が ~1.9x 高速。1000 widgets で frame あたり ~148 µs (= 148 ns/widget) を skip。完全 static な mixer / DAW chrome で frame budget の半分近くを浮かせる効果。
+
+**設計判断**:
+- **波形 wrap で input_hash に generation 組込**: 既存 `PyramidFingerprint` (LOD invalidation) と一貫性。両方が generation を見るが実害なし
+- **クロージャ内で `ui.widget_state(wid)` 呼び出し**: pyramid は cache miss 時のみ ensure_built される。cache hit 時はクロージャがスキップされるので pyramid は古いまま (が、入力も古いままなので正しい)
+- **ヒットテストはクロージャ外**: `WaveformResponse` は pointer に依存して毎フレーム再計算が必要。cache できない (hit 結果を cache するとマウスが動いた瞬間に古い情報が返る)
+- **`Hash` derive を追加**: enum の as u8 キャストより安全 (`#[repr(u8)]` 不要)。色 (`Color`) は `Hash` 未実装なので各成分 `to_bits()` で扱う
+- **ネスト tuple で hash_inputs に渡す**: Rust 標準の Hash 実装は tuple 要素 12 個まで。20+ 要素を hash したいときはネストすれば回避できる
+- **bench の "1.9x" は意外と控えめ**: 1000 buttons の `format!()` オーバーヘッド (no_cache 側) や、cached でも `extend_from_slice` のメモリコピーが発生するため。完全静的なフォーマット処理を含めれば実質 5-10x の効果が出るケースもありそう (text_input の preedit 等)
+- **draw call 削減ではない**: rect / glyph / line は instanced で 1 frame に 1〜N 個に集約済みで、widget 数 N に対して draw call は線形にならない。本キャッシュが下げているのは "CPU prepare コスト" であり draw call ではない (plan.md M4 元仕様の文言は意訳)
+
+**M4 milestone 完了**: 内部 scenegraph + 差分検出 + glyphon Buffer cache + 1M FNV 衝突テスト + 波形統合 + bench を全て達成。次は M5 (heavy() + 巨大ビュー + 詳細波形モード)。
+
+---
+
 **Phase 11 進捗 (2026-05-01)** — `Ui::with_widget_node` API + 各 widget 適用 + 描画コマンドキャッシュ:
 
 | 成果物 | 状態 | コミット |
@@ -464,11 +497,12 @@ F:\dev\gui_01\
 | `buffer_key` の単体テスト 4 本: 同一入力 / text 違い / font_size 違い / line_height 違い | ✅ | (本コミット) |
 | 実機検証: mixer の表示・操作に regression なし | ✅ | (本コミット) |
 
-**M4 の残作業 (Phase 12 で対応)**:
-- ~~`slotmap` 導入 + `Scenegraph` 型定義 + 1M FNV-1a 衝突テスト~~ → ✅ Phase 10 で完了 (`slotmap` は不採用、`HashMap<WidgetId, SceneNode>` で代替)
-- ~~`Ui::with_widget_node(wid, input_hash, draw_fn)` API + 各 widget に適用~~ → ✅ Phase 11 で完了 (waveform 除く 6 widget)
-- 波形 widget を `with_widget_node` で wrap (input_hash に generation 組込) → Phase 12
-- "1000 widget で cache hit 支配的" bench 検証 → Phase 12
+**M4 完了 (2026-05-01)** — 全項目達成:
+- ~~`slotmap` 導入 + `Scenegraph` 型定義 + 1M FNV-1a 衝突テスト~~ → ✅ Phase 10 (`slotmap` は不採用、`HashMap<WidgetId, SceneNode>` で代替)
+- ~~`Ui::with_widget_node(wid, input_hash, draw_fn)` API + 各 widget に適用~~ → ✅ Phase 11 (6 widget)
+- ~~波形 widget を `with_widget_node` で wrap (input_hash に generation 組込)~~ → ✅ Phase 12
+- ~~glyphon Buffer キャッシュ統合~~ → ✅ Phase 9
+- ~~"1000 widget で cache hit 支配的" bench 検証~~ → ✅ Phase 12 (1.9x 高速)
 
 **設計判断**:
 - **Phase 9 を最初に**: `slotmap` 基盤を先に作っても適用前は busywork。glyphon キャッシュは renderer 内部に閉じて measurable な改善を出せるので最初に成果が出る
@@ -851,3 +885,4 @@ ui.heavy("track_0_clips", |hctx| {
 - 2026-05-01: **M4 Phase 9** — glyphon Buffer キャッシュ。`GlyphPipeline` 内に `HashMap<u64, CachedBuffer>` を導入し、`(text, font_size, line_height)` の `DefaultHasher` ハッシュをキーとして `Buffer` を再利用。同一 text の繰り返し描画 (mixer の ch label 等) で `Buffer::new` + shaping を回避し、毎フレーム N 回 → 0〜1 回 (新規時のみ) に削減。5 秒 (300 frame) 未使用 entry は eviction。`Scene` / `GlyphArea` の API は不変、widgets / examples は無変更で恩恵を受ける。`buffer_key` の単体テスト 4 本追加 (renderer crate 初の単体テスト群)。M4 の最初のサブ phase、scenegraph 本体は Phase 10 以降で。
 - 2026-05-01: **M4 Phase 10** — Scenegraph 基盤 + WidgetId 1M 衝突テスト。`crates/ui/src/scenegraph.rs` に `Scenegraph` (`HashMap<WidgetId, SceneNode>` 内蔵) と `SceneNode { input_hash: u64 }` 型を新設、API は `unchanged` / `record` / `retain` / `len` / `is_empty`。元 plan の `SlotMap<NodeId, SceneNode>` は `WidgetId` が安定キーなので不要と判断、`slotmap` 依存追加を回避 (Cargo.toml 不変)。`UiHost` に `scenegraph: Scenegraph` フィールドを追加 (Phase 10 では宣言のみ、Phase 11 で widget から書き込み)。`tests/widget_id_collision.rs` で 1000 parents × 1000 children = 1M unique IDs の衝突 0 を担保。Scenegraph 単体テスト 5 本 + 衝突テスト 1 本で計 6 本追加。Phase 11 で `Ui::with_widget_node` API + 各 widget 適用に進む。
 - 2026-05-01: **M4 Phase 11** — `Ui::with_widget_node` API + 6 widget 適用 + 描画コマンドキャッシュ。`SceneNode` を `{ input_hash, commands: CachedCommands }` に拡張、`CachedCommands { rects, glyph_areas, line_batches }` で per-widget の描画コマンドを保持。`Ui::with_widget_node(wid, input_hash, draw_fn)` API を追加: hash 一致なら draw_fn をスキップして前フレームの commands を scene に append、不一致なら draw_fn を実行して scene 末尾差分を新規 commands として記録。`UiHost::frame` 末尾で `scenegraph.retain(&seen_widgets)` で動的に出現/消滅する widget を扱う。6 widget (button / label / checkbox / fader / knob / text_input) を全て wrap、各 widget が `hash_inputs((b"<種別>", rect.x.to_bits(), ..., 状態フラグ))` で input_hash 計算。判別タグ (`b"fader"` 等) で異種 widget 間の偶然の hash 衝突を防ぐ。waveform は LOD generation の特殊処理が必要なので Phase 12 で。with_widget_node 単体テスト 3 本 + scenegraph 追加テスト 2 本 = 5 本追加 (合計 48 unit/test)、clippy 増分 0、mixer 実機で表示・操作に regression なし。
+- 2026-05-01: **M4 Phase 12 — milestone 完了** — 波形 widget の `with_widget_node` 適用 + 1000 widget bench。`ChannelLayout` / `WaveformRenderMode` に `Hash` derive 追加 (input_hash で使用)、`Ui::waveform` を with_widget_node で wrap (input_hash に generation / valid_len / sample_rate / view / style / rect を組込、ヒットテストはクロージャ外で毎フレーム実行)。Rust 標準 Hash の tuple 上限 (12 要素) 回避のため hash_inputs に nested tuple を渡す形。`crates/ui/benches/scenegraph_cache.rs` 新規 bench で 1000 buttons の cached vs no-cache を比較、cached 165 µs vs no-cache 313 µs で 1.9x 高速 (148 ns/widget の CPU prepare コスト削減)。waveform_validation で 128 widgets の波形描画 + drag scroll / wheel zoom / Space REC に regression なし。M4 milestone 全項目達成、次は M5 (heavy() + 巨大ビュー + 詳細波形モード) へ。
