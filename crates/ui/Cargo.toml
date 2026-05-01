@@ -16,6 +16,7 @@ taffy = "0.10.1"
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false }
+trybuild = "1"
 
 [[bench]]
 name = "waveform"
