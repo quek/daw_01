@@ -17,11 +17,11 @@ use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
-use crate::ui::{Ui, hovered, lerp_color};
+use crate::ui::{Ui, hovered};
 
 const TRACK_PAD: f32 = 8.0;
-const THUMB_W: f32 = 24.0;
-const THUMB_H: f32 = 12.0;
+const THUMB_W: f32 = 28.0;
+const THUMB_H: f32 = 10.0;
 
 /// ダブルクリック判定の時間しきい値 (ms)。
 const DOUBLE_CLICK_MS: u128 = 300;
@@ -257,23 +257,20 @@ fn draw_fader<M: ?Sized + 'static>(
         });
     }
 
-    // thumb (つまみ単独で hover/press 判定する)
-    let base = Color::rgb(0.62, 0.66, 0.74);
-    let hover = Color::rgb(0.78, 0.82, 0.90);
+    // thumb: flat な水平バー (border / shadow なし、Ableton 系ミニマル)
+    let base = Color::rgb(0.78, 0.82, 0.90);
     let press = Color::rgb(0.95, 0.97, 1.00);
-    let thumb_fill = if dragging {
+    let thumb_fill = if dragging || hovered(thumb, pointer) {
         press
-    } else if hovered(thumb, pointer) {
-        lerp_color(base, hover, 0.85)
     } else {
         base
     };
     ui.push_rect(RectCommand {
         rect: thumb,
         fill: thumb_fill,
-        border: Color::rgb(0.30, 0.32, 0.36),
-        border_width: 1.0,
-        radius: [3.0; 4],
+        border: Color::TRANSPARENT,
+        border_width: 0.0,
+        radius: [1.0; 4],
     });
 }
 

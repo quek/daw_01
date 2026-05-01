@@ -257,6 +257,30 @@ F:\dev\gui_01\
 | `examples/mixer` に title 編集 text_input。OS ウィンドウタイトルも `last_window_title` 差分で追従 | ✅ | (本コミット) |
 | `trybuild` / 単体テスト 1 本 (click → focus → typing で text 変化) | ✅ | (本コミット) |
 
+**Phase 8 進捗 (2026-05-01)** — fader / knob 視覚 polish (Ableton 風):
+
+| 成果物 | 状態 | コミット |
+|---|---|---|
+| fader thumb を 24×12 角丸 + border から **28×10 flat バー** (border 無し、極小角丸) に | ✅ | (本コミット) |
+| knob を **Ableton 流デザイン** に redesign: 円本体 + 円周上 300° の可動範囲弧 + 中心→外円のインジケータ線 | ✅ | (本コミット) |
+| 可動範囲弧を **2 色** で描画 (回転側 = cyan アクセント、非回転側 = 暗グレー) | ✅ | (本コミット) |
+| インジケータ線を中心 (`cx, cy`) → 外円 (`r`) で描画、白色 width 4.0 で視認性確保 | ✅ | (本コミット) |
+| 弧の polygon 近似を 5° → 2° step に細分化 (60 → 150 segments)、コーナーアーティファクト解消 | ✅ | (本コミット) |
+
+**TODO (M3 残作業として残す)**:
+- **Ableton Live により近づける視覚 polish**: 現状は構造的には近いが、配色・微調整 (border の視認性、非回転側弧と body 色の差、knob 全体の質感) で実機 Ableton の見た目とは差がある。後フェーズで実機並べて細部詰める
+
+**設計判断**:
+- **試行錯誤の経緯**: 当初は Phase 8 として「影 / tick marks / sweep arc fill」を入れたが視覚的にゴチャついた → 影 / tick 全削除して「フラット (Ableton 流)」へ方針転換 → fader thumb が薄すぎて掴めない / pan 中央が L100 に見える等 UX 課題 → bipolar (default_value 起点) arc + 外側 rest tick を経由 → 最終的に「中心インジケータ線 + 円周 2 色弧」の Ableton 流に落ち着く。各イテレーションは commit せず内部試行 (本コミットでは最終形のみ)
+- **2 色弧の意味**: 回転側 (start → value) = "consumed range" cyan、非回転側 (value → end) = "remaining range" 暗グレー。ユーザが「現在どれくらい振れているか」を可動範囲全体に対する割合で視認できる
+- **インジケータを中心起点に**: 単に外円の点を示すだけでなく、knob 全体の rotation を強く感じさせるため (Ableton も同様の構造)
+- **fader thumb 28×10**: 当初の 28×4 (Ableton の極小バーを意識) は **掴めない** UX 課題 → 28×10 で掴みやすさと flat 感のバランス
+- **Phase 8 の元プランから外したもの**:
+  - **感度カーブ** (線形 → 非線形マッピング): UX 設計判断が大きいので別タスクへ。現状は線形のまま
+  - **影 / tick marks / sweep arc fill** (元 Phase 8 案): 試行で視覚ゴチャツキを確認、フラット方針へ転換
+
+---
+
 **Phase 7 進捗 (2026-05-01)** — `LayoutPass` ergonomics 改善 (`rect()` + `compute_at()`):
 
 | 成果物 | 状態 | コミット |
@@ -358,7 +382,9 @@ F:\dev\gui_01\
 
 - `LayoutPass` 拡張: padding / gap / fixed size / proportional growth: ✅ Phase 5 で完了 (上記表参照)
 - `examples/mixer` を 8ch (8 fader + 8 pan knob + 8 mute checkbox) に拡張: ✅ Phase 6 で完了 (上記表参照)
-- 微調整: fader / knob の感度カーブ、見た目 (背景パネル、影、目盛り)
+- 微調整: fader / knob の見た目: ✅ Phase 8 で完了 (Ableton 流の 2 色弧 + 中心インジケータ、fader thumb 28×10)
+- **fader / knob を Ableton Live により近づける**: Phase 8 で構造的には近づいたが、配色・微調整は引き続き残作業。実機 Ableton と並べて細部詰める
+- 微調整 (継続): fader / knob の感度カーブ (線形 → 非線形マッピング)、まだ未着手
 - **text_input polish**: cursor / preedit 下線 / IME 候補位置の pixel-perfect 化。
   現状は `HackGen Console NF` 固定幅前提の近似 (ASCII=7 / CJK=14)。`cosmic-text` の
   `Buffer::layout_runs()` で実 measure を行い、preedit を別色 (yellow) で描き直すこと、
@@ -745,3 +771,4 @@ ui.heavy("track_0_clips", |hctx| {
 - 2026-05-01: **M3 Phase 5** — `LayoutPass` 拡張。中立 `Padding { top, right, bottom, left }` / `Gap { x, y }` 型を導入、`LayoutPass::flex` シグネチャを `flex(direction, gap: Gap, padding: Padding, children)` に置換 (zero callers なので breaking OK)、`leaf_grow(grow: f32)` で `flex_basis: 0` + `flex_grow` による残余空間の比例分配をサポート。flex 親の size を `Dimension::auto` から `Dimension::percent(1.0) × percent(1.0)` に変えて、grow-only 子で構成しても親が利用可能領域を埋めるように修正 (auto だと fit-content = 0px に潰れる)。`Padding` / `Gap` を `crates/ui/src/lib.rs` から re-export。単体テスト 6 本追加 (column gap / per-side padding / per-axis gap / 2:1 grow / fixed + grow / padding shrinks grow area)。これで chrome layout の表現力が flex_grow / fixed / per-side padding まで揃った。残る M3 タスクは 8ch mixer 拡張、fader/knob 視覚 polish、text_input pixel-perfect (cosmic-text measure 統合)、i18n。
 - 2026-05-01: **M3 Phase 6** — `examples/mixer` を 3 ch から 8 ch に拡張、LayoutPass の最初の実用例として `Padding::axis(20, 0)` + `Gap::xy(16, 0)` で 8 列の row、各列内で `Gap::all(6)` の column flex を組む。`taffy::prelude::{FlexDirection, NodeId}` を `daw_ui_core` から re-export して、利用側が taffy を直接依存に入れずに済むようにした。手動 rect 計算 (`fader_left + i * (fader_w + 16.0)`) が消え、列レイアウトは LayoutPass 1 箇所で済む。ウィンドウ縦サイズ 600 → 660、ストリップ原点 y 240 → 280 で左側 button 群との視覚衝突を解消、ストリップヘッダを Phase 4d の操作 (Ctrl+drag / dbl-click) を含む 1 本にまとめた。`MixerModel` 配列を `[T; 8]` に拡張、初期値はリセットの動作確認しやすいよう各 ch で異なる値に。LayoutPass の利用で見えた ergonomics 課題 (NodeId → Rect の HashMap 引き / origin offset の手動足し算) は別タスクで API 改善するか判断。
 - 2026-05-01: **M3 Phase 7** — `LayoutPass` ergonomics 改善。`compute` シグネチャを戻り値なしに変えて内部 `HashMap<NodeId, Rect>` に格納、`rect(node) -> Rect` で O(1) 引きできるようにした。`compute_at(root, w, h, origin)` を追加して screen 座標オフセットを内部で適用、利用側の `to_screen` クロージャと `into_iter().collect::<HashMap<_,_>>()` の boilerplate を library 内側に閉じ込める。breaking change だが zero external callers + Phase 6 で 1 caller (mixer) のみなので影響極小。mixer から `std::collections::HashMap` import が消え、build_ui のチャンネルストリップ部分が約 10 行短くなった。テスト 1 本追加 (`compute_at_applies_origin_offset`) で 33 unit + 1 trybuild、既存 6 layout テストは `rects()` ヘルパ経由から `p.rect(node)` 直呼びに簡素化。実機検証で Phase 6 と同一表示 (regression なし) を確認。
+- 2026-05-01: **M3 Phase 8** — fader / knob 視覚 polish。fader thumb を 24×12 角丸+border から 28×10 flat バー (border 無し) に、knob を Ableton 流の「円本体 + 300° 可動範囲弧 (回転側 cyan / 非回転側 暗グレー の 2 色) + 中心→外円インジケータ線 (白、太め)」にデザイン変更。弧の polygon 近似を 2° step に細分化してコーナーアーティファクト解消。試行錯誤の途中 (影/tick/sweep arc fill 案、bipolar default_value 起点 arc 案、外側 rest tick 案) は最終形のみ commit。実機 Ableton との細部詰め (配色、質感) は別タスクとして残す。感度カーブ (非線形マッピング) は別タスク。

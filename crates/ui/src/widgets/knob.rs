@@ -196,9 +196,12 @@ fn draw_knob<M: ?Sized + 'static>(
     let r = (size * 0.5 - 2.0).max(2.0); // 2px の周囲余白
     let circle_rect = Rect { x: cx - r, y: cy - r, w: r * 2.0, h: r * 2.0 };
 
-    let base = Color::rgb(0.18, 0.20, 0.26);
-    let hover_c = Color::rgb(0.24, 0.27, 0.34);
-    let press_c = Color::rgb(0.32, 0.55, 0.85);
+    // Ableton 流: dark gray の円 + 円周上に cyan の arc。インジケータ線なし。
+    // arc は -150° (7時) から value_angle までを円周 (radius = r) 上に描画。
+    // 下の 60° (5時 → 7時 経由 6時) は 300° sweep 範囲外で arc は届かない (= "切れている")。
+    let base = Color::rgb(0.22, 0.24, 0.28);
+    let hover_c = Color::rgb(0.28, 0.30, 0.34);
+    let press_c = Color::rgb(0.32, 0.40, 0.52);
     let bg_fill = if dragging {
         press_c
     } else if hovered(rect, pointer) {
@@ -210,26 +213,76 @@ fn draw_knob<M: ?Sized + 'static>(
     ui.push_rect(RectCommand {
         rect: circle_rect,
         fill: bg_fill,
-        border: Color::rgb(0.35, 0.38, 0.45),
-        border_width: 1.5,
+        border: Color::rgb(0.40, 0.43, 0.47),
+        border_width: 1.0,
         radius: [r; 4],
     });
 
-    // インジケータ: 中心から円周に向けて伸びる線 (現在値の角度)。
-    // 角度: value=0 → -150° (7 時)、value=0.5 → 0° (12 時)、value=1 → +150° (5 時)。
-    let angle = (value - 0.5) * (5.0 * PI / 3.0);
-    let dx = angle.sin();
-    let dy = -angle.cos();
-    let inner_r = r * 0.30;
-    let outer_r = r * 0.85;
+    // 角度: value=0 → -150° (7時)、value=0.5 → 0° (12時)、value=1 → +150° (5時)。
+    let value_angle = (value - 0.5) * (5.0 * PI / 3.0);
+    let start_angle = -150.0_f32 * PI / 180.0;
+    let end_angle = 150.0_f32 * PI / 180.0;
+
+    // 可動範囲の弧を 2 色で描く (300° 全部表示):
+    // - 回転側 (start → value): cyan = 既に動いた範囲
+    // - 非回転側 (value → end): 暗グレー = 残りの可動範囲
+    // 6時付近の 60° (5時 → 7時) は範囲外なので空白 = "弧が切れて見える"。
+    // 角度ステップを 2° に下げて polygon 近似のコーナーアーティファクトを目立たなく。
+    // 300° / 2° = 150 segments per knob、毎フレーム計算でも軽量。
+    let step = 2.0_f32 * PI / 180.0;
+    let arc_radius = r;
+    let active_color = Color::rgb(0.42, 0.85, 0.95);
+    let inactive_color = Color::rgb(0.32, 0.34, 0.38);
+
+    let mut active: Vec<LineSegment> = Vec::new();
+    let mut a0 = start_angle;
+    while a0 < value_angle {
+        let a1 = (a0 + step).min(value_angle);
+        active.push(LineSegment {
+            a: [cx + a0.sin() * arc_radius, cy - a0.cos() * arc_radius],
+            b: [cx + a1.sin() * arc_radius, cy - a1.cos() * arc_radius],
+            color: active_color,
+        });
+        a0 = a1;
+    }
+    if !active.is_empty() {
+        ui.push_lines(LineBatch {
+            segments: active,
+            line_width_px: 4.0,
+            clip_rect: None,
+        });
+    }
+
+    let mut inactive: Vec<LineSegment> = Vec::new();
+    let mut a0 = value_angle;
+    while a0 < end_angle {
+        let a1 = (a0 + step).min(end_angle);
+        inactive.push(LineSegment {
+            a: [cx + a0.sin() * arc_radius, cy - a0.cos() * arc_radius],
+            b: [cx + a1.sin() * arc_radius, cy - a1.cos() * arc_radius],
+            color: inactive_color,
+        });
+        a0 = a1;
+    }
+    if !inactive.is_empty() {
+        ui.push_lines(LineBatch {
+            segments: inactive,
+            line_width_px: 4.0,
+            clip_rect: None,
+        });
+    }
+
+    // インジケータ: 中心から外円まで伸びる白い太線。値角度を指す。
+    let dx = value_angle.sin();
+    let dy = -value_angle.cos();
     let indicator = LineSegment {
-        a: [cx + dx * inner_r, cy + dy * inner_r],
-        b: [cx + dx * outer_r, cy + dy * outer_r],
-        color: Color::rgb(0.95, 0.97, 1.0),
+        a: [cx, cy],
+        b: [cx + dx * r, cy + dy * r],
+        color: Color::rgb(0.95, 0.97, 1.00),
     };
     ui.push_lines(LineBatch {
         segments: vec![indicator],
-        line_width_px: 2.5,
+        line_width_px: 4.0,
         clip_rect: None,
     });
 }
