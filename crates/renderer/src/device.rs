@@ -149,14 +149,22 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
                 match self.surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(t)
                     | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-                    other => return Err(RenderError::SurfaceUnavailable(format!("{other:?}"))),
+                    other @ (wgpu::CurrentSurfaceTexture::Outdated
+                    | wgpu::CurrentSurfaceTexture::Lost
+                    | wgpu::CurrentSurfaceTexture::Timeout
+                    | wgpu::CurrentSurfaceTexture::Occluded
+                    | wgpu::CurrentSurfaceTexture::Validation) => {
+                        return Err(RenderError::SurfaceUnavailable(format!("{other:?}")));
+                    }
                 }
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
                 // フレームスキップ。エラーではない
                 return Ok(());
             }
-            other => return Err(RenderError::SurfaceUnavailable(format!("{other:?}"))),
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(RenderError::SurfaceUnavailable("validation error".to_string()));
+            }
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
 

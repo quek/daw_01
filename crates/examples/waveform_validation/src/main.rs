@@ -238,6 +238,7 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn build_ui(&mut self) {
         self.scene.clear();
         let screen = self.renderer.size();

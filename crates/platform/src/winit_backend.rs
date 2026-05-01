@@ -210,10 +210,10 @@ impl<H: AppHost, F: FnOnce(WinitWindow) -> H> ApplicationHandler for WinitRunner
                 self.last_tick = now;
                 host.on_event(AppEvent::Tick(dt));
                 let request_more = host.on_render();
-                if request_more {
-                    if let Some(w) = self.window.as_ref() {
-                        w.request_redraw();
-                    }
+                if request_more
+                    && let Some(w) = self.window.as_ref()
+                {
+                    w.request_redraw();
                 }
             }
             _ => {}
@@ -280,10 +280,10 @@ fn query_cursor_pos_in_window(window: &Window) -> Option<PhysicalPosition> {
         _ => return None,
     };
     let mut pt = POINT { x: 0, y: 0 };
-    if unsafe { GetCursorPos(&mut pt) } == 0 {
+    if unsafe { GetCursorPos(&raw mut pt) } == 0 {
         return None;
     }
-    if unsafe { ScreenToClient(hwnd, &mut pt) } == 0 {
+    if unsafe { ScreenToClient(hwnd, &raw mut pt) } == 0 {
         return None;
     }
     Some(PhysicalPosition { x: f64::from(pt.x), y: f64::from(pt.y) })
@@ -296,14 +296,13 @@ fn query_cursor_pos_in_window(_window: &Window) -> Option<PhysicalPosition> {
 
 fn map_cursor(c: CursorIcon) -> WinitCursor {
     match c {
-        CursorIcon::Default => WinitCursor::Default,
+        // Hidden は visibility 制御だが winit の API は別経路なので Default で代用 (M1)
+        CursorIcon::Default | CursorIcon::Hidden => WinitCursor::Default,
         CursorIcon::Pointer => WinitCursor::Pointer,
         CursorIcon::Text => WinitCursor::Text,
         CursorIcon::Crosshair => WinitCursor::Crosshair,
         CursorIcon::EwResize => WinitCursor::EwResize,
         CursorIcon::NsResize => WinitCursor::NsResize,
         CursorIcon::Move => WinitCursor::Move,
-        // Hidden は visibility 制御だが winit の API は別経路なので Default で代用 (M1)
-        CursorIcon::Hidden => WinitCursor::Default,
     }
 }

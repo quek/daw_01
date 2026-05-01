@@ -13,6 +13,7 @@ impl WidgetId {
     pub const ROOT: Self = Self(0xC0FFEE);
 
     /// 親 ID と任意のハッシュ可能な seed から子 ID を作る。
+    #[must_use]
     pub fn child<H: Hash>(self, seed: H) -> Self {
         let mut hasher = ahash_lite::AHasher::new_with_seed(self.0);
         seed.hash(&mut hasher);

@@ -269,7 +269,7 @@ mod tests {
         p.compute(root, 200.0, 200.0);
         // main axis 間隔は y で 8
         let dy = p.rect(b).y - (p.rect(a).y + p.rect(a).h);
-        assert!((dy - 8.0).abs() < 0.5, "main axis gap (y): {}", dy);
+        assert!((dy - 8.0).abs() < 0.5, "main axis gap (y): {dy}");
         // cross axis 99 は同じ列の子なので無関係 (両者とも x=0 で並ぶ)
         assert!(
             (p.rect(a).x - p.rect(b).x).abs() < 0.5,

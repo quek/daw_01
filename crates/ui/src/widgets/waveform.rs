@@ -379,6 +379,8 @@ fn extend_level_1(
     for ch in 0..channels {
         let col = &mut level.per_channel[ch];
         col.resize(new_ppc, MinMaxPair::ZERO);
+        // index アクセスは samples / ch も併用するため enumerate に書き換えづらい (hot path)。
+        #[allow(clippy::needless_range_loop)]
         for p in recompute_start..new_ppc {
             let s_start = p * DECIMATION;
             let s_end = ((p + 1) * DECIMATION).min(new_valid_len);
@@ -401,6 +403,8 @@ fn extend_level_from_prev(level: &mut MinMaxLevel, prev: &MinMaxLevel, channels:
         let prev_ch = &prev.per_channel[ch];
         let col = &mut level.per_channel[ch];
         col.resize(new_ppc, MinMaxPair::ZERO);
+        // index アクセスは prev_ch にも掛かるため enumerate に書き換えづらい (hot path)。
+        #[allow(clippy::needless_range_loop)]
         for p in recompute_start..new_ppc {
             let p_start = p * DECIMATION;
             let p_end = ((p + 1) * DECIMATION).min(prev_ch.len());
@@ -411,6 +415,7 @@ fn extend_level_from_prev(level: &mut MinMaxLevel, prev: &MinMaxLevel, channels:
 
 /// `[MinMaxPair]` から min/max を畳み込む。空なら `MinMaxPair::ZERO`。
 /// peak_in_view の毎ピクセル hot path で呼ばれるので `#[inline(always)]`。
+#[allow(clippy::inline_always)]
 #[inline(always)]
 fn fold_pairs(pairs: &[MinMaxPair]) -> MinMaxPair {
     if pairs.is_empty() {
@@ -560,8 +565,7 @@ fn build_peak_segments(
     let chosen_level: Option<&MinMaxLevel> = pyramid
         .levels
         .iter()
-        .filter(|l| (l.decimation as usize) <= span_int)
-        .last();
+        .rfind(|l| (l.decimation as usize) <= span_int);
 
     // ピーク線
     for (slot, &ch) in ch_iter.iter().enumerate() {
@@ -614,6 +618,7 @@ fn build_peak_segments(
 
 /// 事前に選択済みレベル (`col` + `decim`) を使って 1 ピクセル分の min/max を取る。
 /// レベル未選択 (= samples_per_pixel が小さすぎる) のときは生サンプルを走査する。
+#[allow(clippy::inline_always)]
 #[inline(always)]
 fn peak_in_view_cached(
     col: Option<&[MinMaxPair]>,

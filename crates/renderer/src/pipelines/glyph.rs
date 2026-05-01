@@ -145,8 +145,8 @@ impl GlyphPipeline {
                 bounds: TextBounds {
                     left: 0,
                     top: 0,
-                    right: screen.width as i32,
-                    bottom: screen.height as i32,
+                    right: screen.width.try_into().unwrap_or(i32::MAX),
+                    bottom: screen.height.try_into().unwrap_or(i32::MAX),
                 },
                 default_color: GlyphColor::rgba(
                     (area.color.r * 255.0).clamp(0.0, 255.0) as u8,

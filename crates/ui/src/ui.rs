@@ -522,7 +522,7 @@ mod tests {
         let id = WidgetId::ROOT.child("focus-target");
 
         // Frame 1: set_focus を呼ぶと **同フレーム内で** is_focused = true になる。
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             assert!(!ui.is_focused(id));
             ui.set_focus(id);
             assert!(ui.is_focused(id), "set_focus 後は同フレームで is_focused = true");
@@ -530,7 +530,7 @@ mod tests {
         assert_eq!(host.focused_widget(), Some(id));
 
         // Frame 2: 何もしないが focus は維持。
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             assert!(ui.is_focused(id));
         });
         assert_eq!(host.focused_widget(), Some(id));
@@ -547,7 +547,7 @@ mod tests {
         let id = WidgetId::ROOT.child("focus-target");
 
         // Frame 1: フォーカスを取る。
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.set_focus(id);
         });
         assert_eq!(host.focused_widget(), Some(id));
@@ -558,7 +558,7 @@ mod tests {
             primary_just_released: true,
             ..PointerFrame::default()
         };
-        host.frame(&(), &mut scene, screen, FrameInput { pointer: click, ..Default::default() }, |_, _ui| {
+        host.frame(&(), &mut scene, screen, FrameInput { pointer: click, ..Default::default() }, |(), _ui| {
             // 誰も set_focus / clear_focus を呼ばない。
         });
         assert_eq!(
@@ -576,7 +576,7 @@ mod tests {
         let screen = PhysicalSize { width: 200, height: 100 };
         let id = WidgetId::ROOT.child("focus-target");
 
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.set_focus(id);
         });
         assert_eq!(host.focused_widget(), Some(id));
@@ -586,7 +586,7 @@ mod tests {
             primary_just_released: true,
             ..PointerFrame::default()
         };
-        host.frame(&(), &mut scene, screen, FrameInput { pointer: click, ..Default::default() }, |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput { pointer: click, ..Default::default() }, |(), ui| {
             // クリックフレームで widget が再度 set_focus を呼ぶ (text_input が再クリックされたケース)。
             ui.set_focus(id);
         });
@@ -746,7 +746,7 @@ mod tests {
         let id_a = WidgetId::ROOT.child("a");
         let id_b = WidgetId::ROOT.child("b");
 
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.set_focus(id_a);
         });
 
@@ -756,7 +756,7 @@ mod tests {
             &mut scene,
             screen,
             FrameInput { ime, ..Default::default() },
-            |_, ui| {
+            |(), ui| {
                 let b_ime = ui.take_ime_events_if_focused(id_b);
                 assert_eq!(b_ime.len(), 0);
                 let a_ime = ui.take_ime_events_if_focused(id_a);
@@ -779,7 +779,7 @@ mod tests {
         let id_b = WidgetId::ROOT.child("b");
 
         // a にフォーカスを置く。
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.set_focus(id_a);
         });
 
@@ -789,7 +789,7 @@ mod tests {
             text: Some("x".to_string()),
             physical_key: PhysicalKey::Other(0),
         }];
-        host.frame(&(), &mut scene, screen, FrameInput { keyboard: keys, ..Default::default() }, |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput { keyboard: keys, ..Default::default() }, |(), ui| {
             // b で先に呼んでも空 (フォーカスが a)。
             let b_keys = ui.take_keyboard_events_if_focused(id_b);
             assert_eq!(b_keys.len(), 0);
@@ -815,7 +815,7 @@ mod tests {
 
         // Frame 1: cache miss → draw_fn 実行、scene に rect が積まれる。
         let calls_1 = std::cell::Cell::new(0_u32);
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.with_widget_node(id, 0xCAFE, |ui| {
                 calls_1.set(calls_1.get() + 1);
                 ui.push_rect(RectCommand {
@@ -833,7 +833,7 @@ mod tests {
         // Frame 2: 同じ wid + 同じ hash → cache hit、draw_fn は実行されない。
         scene.clear();
         let calls_2 = std::cell::Cell::new(0_u32);
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.with_widget_node(id, 0xCAFE, |ui| {
                 calls_2.set(calls_2.get() + 1);
                 ui.push_rect(RectCommand {
@@ -860,7 +860,7 @@ mod tests {
         let id = WidgetId::ROOT.child("miss-test");
 
         let calls_1 = std::cell::Cell::new(0_u32);
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.with_widget_node(id, 0xAAAA, |ui| {
                 calls_1.set(calls_1.get() + 1);
                 ui.push_rect(RectCommand {
@@ -876,7 +876,7 @@ mod tests {
         // Frame 2: 異なる hash → cache miss、draw_fn が再実行される。
         scene.clear();
         let calls_2 = std::cell::Cell::new(0_u32);
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.with_widget_node(id, 0xBBBB, |ui| {
                 calls_2.set(calls_2.get() + 1);
                 ui.push_rect(RectCommand {
@@ -903,7 +903,7 @@ mod tests {
         let id_b = WidgetId::ROOT.child("evict-b");
 
         // Frame 1: a と b 両方を wrap → scenegraph に 2 entry。
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.with_widget_node(id_a, 1, |_| {});
             ui.with_widget_node(id_b, 2, |_| {});
         });
@@ -911,7 +911,7 @@ mod tests {
         // Frame 2: a だけ wrap → b は seen に入らないので eviction、a は残る。
         // 同 hash で再呼び出し → cache hit、draw_fn 実行されない。
         let a_calls = std::cell::Cell::new(0_u32);
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.with_widget_node(id_a, 1, |_| {
                 a_calls.set(a_calls.get() + 1);
             });
@@ -920,7 +920,7 @@ mod tests {
 
         // Frame 3: b を再 wrap → 一度 eviction されているので cache miss、draw_fn が走る。
         let b_calls = std::cell::Cell::new(0_u32);
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.with_widget_node(id_b, 2, |_| {
                 b_calls.set(b_calls.get() + 1);
             });

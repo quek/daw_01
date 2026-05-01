@@ -42,6 +42,7 @@ pub struct TextInputResponse {
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 矩形指定で 1 行 text_input を描画 + キー入力処理。
     /// 編集が起きたら `on_change(new_text)` を Edit 列に積む。
+    #[allow(clippy::too_many_lines)]
     pub fn text_input_at<F>(
         &mut self,
         id: impl Hash,

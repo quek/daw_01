@@ -500,14 +500,13 @@ mod tests {
         for e in edits { e.apply(&mut model_c); }
         let fine_delta = model_c.value - 0.5;
 
-        assert!(normal_delta > 0.0, "通常 drag は値が上がる (got {})", normal_delta);
-        assert!(fine_delta > 0.0, "Ctrl+drag は値が上がる (got {})", fine_delta);
+        assert!(normal_delta > 0.0, "通常 drag は値が上がる (got {normal_delta})");
+        assert!(fine_delta > 0.0, "Ctrl+drag は値が上がる (got {fine_delta})");
         // fine ≈ normal * 0.1
         let ratio = fine_delta / normal_delta;
         assert!(
             (ratio - 0.1).abs() < 1e-3,
-            "Ctrl+drag は 1/10 感度 (ratio={}, normal={}, fine={})",
-            ratio, normal_delta, fine_delta,
+            "Ctrl+drag は 1/10 感度 (ratio={ratio}, normal={normal_delta}, fine={fine_delta})",
         );
     }
 
@@ -555,8 +554,7 @@ mod tests {
         let expected = after_normal + (after_normal - 0.5) * 0.1;
         assert!(
             (after_fine - expected).abs() < 1e-4,
-            "再 anchor + 1/10 感度: expected={}, got={}",
-            expected, after_fine,
+            "再 anchor + 1/10 感度: expected={expected}, got={after_fine}",
         );
     }
 

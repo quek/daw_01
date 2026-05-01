@@ -89,6 +89,7 @@ impl App {
     /// 描画し直す必要がある (immediate-mode + Edit queue の常で、edits は
     /// 描画クロージャ後に apply されるので、この関数の `render` までの間に
     /// scene へ積まれているラベル文字列は 1 フレーム古い値になっている)。
+    #[allow(clippy::too_many_lines, clippy::needless_range_loop)]
     fn build_ui(&mut self) -> bool {
         self.scene.clear();
         let screen = self.renderer.size();
@@ -307,6 +308,7 @@ impl App {
                         },
                     );
                 }
+
             },
         );
 
