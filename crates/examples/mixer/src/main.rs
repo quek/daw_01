@@ -7,7 +7,6 @@
 //! - ボタンを taffy 経由でレイアウトしてヒットテストできる
 //! - Edit がアプリ側 Model を変更する (ライブラリは Model を Clone しない)
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use daw_ui_core::{Edit, FlexDirection, Gap, InputAccumulator, LayoutPass, NodeId, Padding, UiHost};
@@ -219,25 +218,21 @@ impl App {
                     &col_nodes,
                 );
 
-                // 計算 → NodeId → Rect の HashMap で引けるようにする。
-                let layouts: HashMap<NodeId, Rect> = layout
-                    .compute(root, strip_avail_w, strip_avail_h)
-                    .into_iter()
-                    .collect();
-                let to_screen = |r: Rect| Rect {
-                    x: r.x + strip_origin_x,
-                    y: r.y + strip_origin_y,
-                    w: r.w,
-                    h: r.h,
-                };
+                // 計算 + screen 座標オフセットを 1 度に。各 widget の rect は layout.rect(node)。
+                layout.compute_at(
+                    root,
+                    strip_avail_w,
+                    strip_avail_h,
+                    (strip_origin_x, strip_origin_y),
+                );
 
                 for i in 0..8 {
                     let (fader_n, pct_n, knob_n, pan_n, mute_n) = sub_nodes[i];
-                    let fader_rect = to_screen(layouts[&fader_n]);
-                    let pct_rect   = to_screen(layouts[&pct_n]);
-                    let knob_rect  = to_screen(layouts[&knob_n]);
-                    let pan_rect   = to_screen(layouts[&pan_n]);
-                    let mute_rect  = to_screen(layouts[&mute_n]);
+                    let fader_rect = layout.rect(fader_n);
+                    let pct_rect   = layout.rect(pct_n);
+                    let knob_rect  = layout.rect(knob_n);
+                    let pan_rect   = layout.rect(pan_n);
+                    let mute_rect  = layout.rect(mute_n);
 
                     let resp: FaderResponse =
                         ui.fader_at(("ch_fader", i), fader_rect, m.faders[i], 0.0, move |v| {

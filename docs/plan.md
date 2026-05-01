@@ -257,6 +257,27 @@ F:\dev\gui_01\
 | `examples/mixer` に title 編集 text_input。OS ウィンドウタイトルも `last_window_title` 差分で追従 | ✅ | (本コミット) |
 | `trybuild` / 単体テスト 1 本 (click → focus → typing で text 変化) | ✅ | (本コミット) |
 
+**Phase 7 進捗 (2026-05-01)** — `LayoutPass` ergonomics 改善 (`rect()` + `compute_at()`):
+
+| 成果物 | 状態 | コミット |
+|---|---|---|
+| `LayoutPass` 内部に `rects: HashMap<NodeId, Rect>` を保持 | ✅ | (本コミット) |
+| `compute(root, w, h)` シグネチャ変更 (戻り値削除、内部 HashMap に格納) | ✅ | (本コミット) |
+| `compute_at(root, w, h, origin: (f32, f32))` 追加 (origin オフセット適用) | ✅ | (本コミット) |
+| `rect(node) -> Rect` 追加 (O(1) 引き、未 compute なら panic) | ✅ | (本コミット) |
+| 既存 6 テストを `p.rect(node)` スタイルに更新、`rects()` ヘルパ廃止 | ✅ | (本コミット) |
+| 単体テスト 1 本追加: `compute_at_applies_origin_offset` | ✅ | (本コミット) |
+| mixer から `HashMap` import + `to_screen` クロージャ削除、`compute_at` + `rect` 利用 | ✅ | (本コミット) |
+| 実機検証: 8 ch レイアウトが Phase 6 と同一表示 (regression なし) | ✅ | (本コミット) |
+
+**設計判断**:
+- **`compute` の戻り値を捨てて `rect()` にする**: zero external callers + Phase 6 で 1 caller (mixer) のみなので breaking change のコスト極小。HashMap collect の boilerplate を library 内側に閉じ込めるのが KISS
+- **未 compute の node に `rect()` を呼ぶとパニック**: silent な default rect (0×0) より早期発見しやすい。`Option` を返す案は呼び出し側の `unwrap` を増やすだけ
+- **`compute_at` を別メソッドに**: 大半のユースケースは origin = (0, 0) なので、よく使う方は引数なしで呼べる方が良い (`compute` は薄いラッパで `compute_at(root, w, h, (0.0, 0.0))` を呼ぶ)
+- **`origin: (f32, f32)`** で十分。将来 `Rect` 渡しが欲しくなったら追加検討
+
+---
+
 **Phase 6 進捗 (2026-05-01)** — `examples/mixer` を 8 ch に拡張、LayoutPass の最初の実用例:
 
 | 成果物 | 状態 | コミット |
@@ -269,12 +290,10 @@ F:\dev\gui_01\
 | ウィンドウ高さ 600 → 660、`strip_origin_y` 240 → 280 で左側 buttons との視覚衝突を解消 | ✅ | (本コミット) |
 | 実機検証: 8 ch 列が等間隔で並ぶ、各 ch で Ctrl+drag / dbl-click が独立動作 | ✅ | (本コミット) |
 
-**LayoutPass を実用例で使ったことで判明した ergonomics 課題** (M3 内では別タスク化、まずは「使ってみる」段階):
+**LayoutPass を実用例で使ったことで判明した ergonomics 課題** (Phase 7 で対応済み):
 
-- `NodeId → Rect` の HashMap collect が必要 (各 widget の rect を引くため)。`LayoutPass::rect(node) -> Rect` のような後付け API があると簡単になりそう
-- `compute(root, w, h)` の戻りは原点 (0, 0) 起点。screen 座標に置く際は `to_screen` クロージャで足し算する必要がある。`compute_at(root, w, h, origin)` のような変種があると一行で済む
-
-これらは利用例が増えてから判断する。
+- ~~`NodeId → Rect` の HashMap collect が必要~~ → ✅ Phase 7 で `LayoutPass::rect(node) -> Rect` を追加
+- ~~`compute` の戻りは原点 (0, 0) 起点。screen 座標に置く際は `to_screen` クロージャで足し算が必要~~ → ✅ Phase 7 で `compute_at(root, w, h, origin)` を追加
 
 ---
 
@@ -725,3 +744,4 @@ ui.heavy("track_0_clips", |hctx| {
 - 2026-05-01: **M3 Phase 4d** — fader / knob のダブルクリック・リセット + Ctrl + ドラッグ高精度モード。中立 `Modifiers` 型 + `AppEvent::ModifiersChanged` を platform crate に追加し、`winit_backend` が `WindowEvent::ModifiersChanged` を変換して emit、`PointerFrame.modifiers` まで配線。`Ui::fader_at` / `fader` / `knob_at` / `knob` に `default_value: f32` 引数を追加、state を `DragAnchor { pointer_y, value, ctrl } + last_click: Option<ClickRecord>` に拡張。300ms × 5px 以内の 2 回目 press で `default_value` リセット、Ctrl+drag で `dv *= 0.1`、mid-drag で Ctrl on/off したときは anchor を再構築して値 jump を防ぐ。例 (mixer) の呼び出しと trybuild の pass を新シグネチャに追従、単体テスト 12 本追加 (fader 6 + knob 6: double-click / 閾値超過 / 距離超過 / Ctrl 1/10 感度 / mid-drag toggle / triple-click)。これで M3 の値編集 UX が DAW として成立するレベルまで揃った。
 - 2026-05-01: **M3 Phase 5** — `LayoutPass` 拡張。中立 `Padding { top, right, bottom, left }` / `Gap { x, y }` 型を導入、`LayoutPass::flex` シグネチャを `flex(direction, gap: Gap, padding: Padding, children)` に置換 (zero callers なので breaking OK)、`leaf_grow(grow: f32)` で `flex_basis: 0` + `flex_grow` による残余空間の比例分配をサポート。flex 親の size を `Dimension::auto` から `Dimension::percent(1.0) × percent(1.0)` に変えて、grow-only 子で構成しても親が利用可能領域を埋めるように修正 (auto だと fit-content = 0px に潰れる)。`Padding` / `Gap` を `crates/ui/src/lib.rs` から re-export。単体テスト 6 本追加 (column gap / per-side padding / per-axis gap / 2:1 grow / fixed + grow / padding shrinks grow area)。これで chrome layout の表現力が flex_grow / fixed / per-side padding まで揃った。残る M3 タスクは 8ch mixer 拡張、fader/knob 視覚 polish、text_input pixel-perfect (cosmic-text measure 統合)、i18n。
 - 2026-05-01: **M3 Phase 6** — `examples/mixer` を 3 ch から 8 ch に拡張、LayoutPass の最初の実用例として `Padding::axis(20, 0)` + `Gap::xy(16, 0)` で 8 列の row、各列内で `Gap::all(6)` の column flex を組む。`taffy::prelude::{FlexDirection, NodeId}` を `daw_ui_core` から re-export して、利用側が taffy を直接依存に入れずに済むようにした。手動 rect 計算 (`fader_left + i * (fader_w + 16.0)`) が消え、列レイアウトは LayoutPass 1 箇所で済む。ウィンドウ縦サイズ 600 → 660、ストリップ原点 y 240 → 280 で左側 button 群との視覚衝突を解消、ストリップヘッダを Phase 4d の操作 (Ctrl+drag / dbl-click) を含む 1 本にまとめた。`MixerModel` 配列を `[T; 8]` に拡張、初期値はリセットの動作確認しやすいよう各 ch で異なる値に。LayoutPass の利用で見えた ergonomics 課題 (NodeId → Rect の HashMap 引き / origin offset の手動足し算) は別タスクで API 改善するか判断。
+- 2026-05-01: **M3 Phase 7** — `LayoutPass` ergonomics 改善。`compute` シグネチャを戻り値なしに変えて内部 `HashMap<NodeId, Rect>` に格納、`rect(node) -> Rect` で O(1) 引きできるようにした。`compute_at(root, w, h, origin)` を追加して screen 座標オフセットを内部で適用、利用側の `to_screen` クロージャと `into_iter().collect::<HashMap<_,_>>()` の boilerplate を library 内側に閉じ込める。breaking change だが zero external callers + Phase 6 で 1 caller (mixer) のみなので影響極小。mixer から `std::collections::HashMap` import が消え、build_ui のチャンネルストリップ部分が約 10 行短くなった。テスト 1 本追加 (`compute_at_applies_origin_offset`) で 33 unit + 1 trybuild、既存 6 layout テストは `rects()` ヘルパ経由から `p.rect(node)` 直呼びに簡素化。実機検証で Phase 6 と同一表示 (regression なし) を確認。
