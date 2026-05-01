@@ -5,6 +5,7 @@ members = [
     "crates/renderer",
     "crates/ui",
     "crates/examples/mixer",
+    "crates/examples/waveform_validation",
 ]
 
 [workspace.package]

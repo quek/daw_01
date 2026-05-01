@@ -1,7 +1,10 @@
-//! ウィジェット実装。M1 では label / button のみ。
+//! ウィジェット実装。
+//! M1: label / button。
+//! M2: waveform (波形表示、line strip パイプラインを使う)。
 
 pub mod button;
 pub mod label;
+pub mod waveform;
 
 use std::any::Any;
 

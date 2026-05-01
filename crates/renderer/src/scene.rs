@@ -89,12 +89,34 @@ pub struct GlyphArea {
     pub color: Color,
 }
 
+/// 線分 1 本分。物理ピクセル単位。
+#[derive(Debug, Clone, Copy)]
+pub struct LineSegment {
+    /// 始点 (物理ピクセル)
+    pub a: [f32; 2],
+    /// 終点 (物理ピクセル)
+    pub b: [f32; 2],
+    pub color: Color,
+}
+
+/// 線分の集まり 1 バッチ分。同じ `line_width_px` と `clip_rect` を共有する。
+///
+/// 1 ウィジェット = 1 バッチが基本想定 (波形ウィジェットの clip rect で縁を切る)。
+#[derive(Debug, Clone, Default)]
+pub struct LineBatch {
+    pub segments: Vec<LineSegment>,
+    pub line_width_px: f32,
+    /// `Some` ならこの矩形外を scissor で切り捨てる。
+    pub clip_rect: Option<Rect>,
+}
+
 /// 1 フレームの全描画コマンド。
 #[derive(Debug)]
 pub struct Scene {
     pub clear_color: wgpu::Color,
     pub rects: Vec<RectCommand>,
     pub glyph_areas: Vec<GlyphArea>,
+    pub line_batches: Vec<LineBatch>,
 }
 
 impl Scene {
@@ -103,12 +125,14 @@ impl Scene {
             clear_color: wgpu::Color { r: 0.05, g: 0.05, b: 0.06, a: 1.0 },
             rects: Vec::new(),
             glyph_areas: Vec::new(),
+            line_batches: Vec::new(),
         }
     }
 
     pub fn clear(&mut self) {
         self.rects.clear();
         self.glyph_areas.clear();
+        self.line_batches.clear();
     }
 
     pub fn push_rect(&mut self, cmd: RectCommand) {
@@ -117,6 +141,10 @@ impl Scene {
 
     pub fn push_text(&mut self, area: GlyphArea) {
         self.glyph_areas.push(area);
+    }
+
+    pub fn push_lines(&mut self, batch: LineBatch) {
+        self.line_batches.push(batch);
     }
 }
 

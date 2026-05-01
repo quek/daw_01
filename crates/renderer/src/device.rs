@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use daw_ui_platform::{PhysicalSize, WindowBackend};
 
-use crate::pipelines::{glyph::GlyphPipeline, rect::RectPipeline};
+use crate::pipelines::{glyph::GlyphPipeline, line::LinePipeline, rect::RectPipeline};
 use crate::scene::Scene;
 
 /// 描画器本体。アプリ層が1つ持ち、フレーム毎に `render(&Scene)` を呼ぶ。
@@ -24,6 +24,7 @@ pub struct Renderer<W: WindowBackend + Send + Sync + 'static> {
     device: wgpu::Device,
     queue: wgpu::Queue,
     rect: RectPipeline,
+    line: LinePipeline,
     glyph: GlyphPipeline,
     /// 現在の物理ピクセルサイズ。
     size: PhysicalSize,
@@ -89,6 +90,7 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
         surface.configure(&device, &config);
 
         let rect = RectPipeline::new(&device, format);
+        let line = LinePipeline::new(&device, format);
         let glyph = GlyphPipeline::new(&device, &queue, format);
 
         Ok(Self {
@@ -97,6 +99,7 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
             device,
             queue,
             rect,
+            line,
             glyph,
             size,
             _window: window,
@@ -159,6 +162,7 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
 
         // 2. パイプライン側の頂点/インスタンスバッファを準備
         self.rect.prepare(&self.device, &self.queue, &scene.rects, self.size);
+        self.line.prepare(&self.device, &self.queue, &scene.line_batches, self.size);
         self.glyph.prepare(
             &self.device,
             &self.queue,
@@ -189,6 +193,7 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
             });
 
             self.rect.render(&mut pass);
+            self.line.render(&mut pass, self.size);
             self.glyph.render(&mut pass);
         }
 

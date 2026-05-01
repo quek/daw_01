@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand, Scene};
+use daw_ui_renderer::{Color, GlyphArea, LineBatch, Rect, RectCommand, Scene};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
@@ -109,23 +109,32 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         self.scene.push_text(area);
     }
 
+    /// 内部: ウィジェットが線分バッチを積む (波形・メータ・グリッド)。
+    pub(crate) fn push_lines(&mut self, batch: LineBatch) {
+        self.scene.push_lines(batch);
+    }
+
     /// 内部: ウィジェットがエディットを積む。
     pub(crate) fn push_edit(&mut self, edit: Edit<M>) {
         self.edits.push(edit);
     }
 
     /// 内部: WidgetId に紐付く永続状態を取得 or 初期化。
-    /// (M2 以降の fader/knob のドラッグ状態保存で使う)
-    #[allow(dead_code)]
+    /// (M2 で waveform の LOD ピラミッドキャッシュに、M3 以降は fader/knob のドラッグ状態に使う)
     pub(crate) fn widget_state<S: WidgetState + Default + 'static>(
         &mut self,
         id: WidgetId,
     ) -> &mut S {
-        let state = self
+        let entry = self
             .state
             .entry(id)
             .or_insert_with(|| Box::new(S::default()));
-        state
+        // `Box<dyn WidgetState>` 自体が `T: Any + Send + Sync` の blanket impl で
+        // `WidgetState` を実装してしまうため、`entry.as_any_mut()` は **Box 外側** の
+        // 実装を呼んでしまう (TypeId が Box<dyn WidgetState> になり downcast が必ず失敗)。
+        // 明示的に `**entry` で dyn WidgetState まで deref してから vtable 経由で呼ぶ。
+        let dyn_ws: &mut dyn WidgetState = &mut **entry;
+        dyn_ws
             .as_any_mut()
             .downcast_mut::<S>()
             .expect("WidgetState 型不一致")
@@ -157,5 +166,49 @@ pub(crate) fn lerp_color(a: Color, b: Color, t: f32) -> Color {
         g: a.g + (b.g - a.g) * t,
         b: a.b + (b.b - a.b) * t,
         a: a.a + (b.a - a.a) * t,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `widget_state` で書き戻した値が次フレームでも同型として読み取れる
+    /// (`Box<dyn WidgetState>` 自体への blanket impl が `as_any_mut` を奪わないことの回帰防止)。
+    #[test]
+    fn widget_state_round_trip_no_downcast_panic() {
+        #[derive(Debug, Default)]
+        struct MyState {
+            count: u32,
+        }
+
+        struct Model;
+
+        let mut host: UiHost<Model> = UiHost::new();
+        let mut scene = Scene::new();
+        let model = Model;
+        let screen = PhysicalSize { width: 400, height: 300 };
+
+        // フレーム 1: state を初期化して 1 回インクリメント。
+        host.frame(&model, &mut scene, screen, PointerFrame::default(), |_, ui| {
+            let id = WidgetId::ROOT.child("ws-roundtrip");
+            let state: &mut MyState = ui.widget_state(id);
+            assert_eq!(state.count, 0);
+            state.count += 1;
+        });
+
+        // フレーム 2: 同じ id で同じ型を取り直すと値が保持されている。
+        host.frame(&model, &mut scene, screen, PointerFrame::default(), |_, ui| {
+            let id = WidgetId::ROOT.child("ws-roundtrip");
+            let state: &mut MyState = ui.widget_state(id);
+            assert_eq!(state.count, 1);
+            state.count += 1;
+        });
+
+        host.frame(&model, &mut scene, screen, PointerFrame::default(), |_, ui| {
+            let id = WidgetId::ROOT.child("ws-roundtrip");
+            let state: &mut MyState = ui.widget_state(id);
+            assert_eq!(state.count, 2);
+        });
     }
 }

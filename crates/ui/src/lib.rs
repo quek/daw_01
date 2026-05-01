@@ -22,3 +22,7 @@ pub use id::WidgetId;
 pub use input::{InputAccumulator, PointerFrame};
 pub use layout::LayoutPass;
 pub use ui::{Ui, UiHost};
+pub use widgets::waveform::{
+    ChannelLayout, SampleSlices, WaveformHit, WaveformRenderMode, WaveformResponse,
+    WaveformSource, WaveformStyle, WaveformView,
+};
