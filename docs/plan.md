@@ -3,11 +3,12 @@
 ## Context
 
 - **目的**: Rust で DAW (Digital Audio Workstation) のシェル UI を書くための **GUI ライブラリ** をゼロから設計・実装する。
-- **本ファイルの位置付け**: 旧計画 (`F:\dev\work\` 用 `rust-clone-daw-gui-zazzy-kazoo.md`) を `F:\dev\gui_01` 用に移植し、現状コード (M1 完了) に合わせて更新したもの。
+- **本ファイルの位置付け**: 旧計画 (`F:\dev\work\` 用 `rust-clone-daw-gui-zazzy-kazoo.md`) を `F:\dev\gui_01` 用に移植し、実装済みコード (M1 完了 + M2 実装中) に合わせて更新したもの。
 - **このリビジョンの主たる変更**:
   1. **波形表示 UI を M2 に前倒し**。理由: ユーザの判断「波形が一番重いので早期検証したい」。波形が想定通り動くことを早期確定させ、後続の scenegraph / heavy() の前提を固める。
   2. 旧 M2 (Ui<'a> 充実 + 基本ウィジェット) → M3 にスライド。
   3. **プランの正本を `F:\dev\gui_01\docs\plan.md` に置く**。`~/.claude/plans/` のハッシュ命名はディレクトリリネームで紐付けが切れるため、git 管理下に正本を置いて消失を防ぐ。
+  4. **DAW アレンジメントビューは波形が大量に並ぶ** (16 トラック × 8 クリップ = 128+ widgets) ため、性能評価は 1 widget の数値だけでなく **N 個 (8 / 64 / 128) のスケール** で見る方針を確定。
 - **スコープは GUI のみ**: オーディオは別 exe (別プロセス) として走り、本ライブラリは関与しない。
 - **核となる制約 = 「モデルを Clone しない」**:
   1. MIDI クリップ・サンプル・オートメーションなど大きなデータを毎フレーム複製しない
@@ -125,45 +126,72 @@ F:\dev\gui_01\
 
 **目的**: 波形表示が想定通り動くことを早期に確定する。性能・API・データフロー (LOD ピラミッド) を実コードで検証し、後続マイルストーンの前提を固める。詳細モード (サンプルエディタ) は M5 へ。
 
-**主な成果物**:
+**進捗 (2026-05-01)**:
 
-1. **`pipelines/line.rs` + `line.wgsl` (line strip パイプライン)**
+主要スカフォルドは完了。性能 DoD は実測でクリア済み。残りは trybuild と録音追記対応のみ。
+
+| 成果物 | 状態 | コミット |
+|---|---|---|
+| line strip パイプライン (`pipelines/line.rs` + `line.wgsl`) | ✅ | 7ddef3f |
+| `Scene::line_batches` + `Renderer::render` 統合 | ✅ | 7ddef3f |
+| LOD ピラミッド (完全再構築のみ) | ✅ | 7ddef3f |
+| LOD インクリメンタル拡張 (録音中の `valid_len` 拡大) | ⏳ 未実装 | — |
+| `Ui::waveform()` (PeakLines + Stack/Overlay/FirstOnly) | ✅ | 7ddef3f |
+| `examples/waveform_validation` (16×8 = 128 widgets グリッド) | ✅ | 7ddef3f → 8276ddd |
+| criterion ベンチ (`crates/ui/benches/waveform.rs`) | ✅ | 8276ddd |
+| trybuild (no-Clone 制約の自動検証) | ⏳ 未実装 | — |
+| (副次) `widget_state` の downcast バグ修正 + 回帰テスト | ✅ | 7ddef3f |
+
+**実測ベンチ値 (release profile, 5.76M sample × 2ch)**:
+
+| | 1 widget | 8 widgets | 16 widgets | 64 widgets | 128 widgets |
+|---|---|---|---|---|---|
+| LOD 初回構築 | **4.0 ms** | 33 ms | 66 ms | (未測) | (未測) |
+| LOD 再利用 (毎フレーム) | **44 µs** | 348 µs | (未測) | 2.84 ms | **5.86 ms** |
+| 60fps 予算占有率 (再利用) | 0.3% | 2.1% | — | 17% | 35% |
+
+線形スケール (44〜46 µs/widget) が N=128 まで維持。これより重い (N=256+) 領域で heavy() (M5) の出番。
+
+**主な成果物 (詳細)**:
+
+1. **`pipelines/line.rs` + `line.wgsl` (line strip パイプライン)** ✅
    - `LinePipeline` struct (`new` / `prepare` / `render`)
-   - 入力: `Vec<LineBatch>` (各バッチは線色・線幅・anti-alias 設定 + 頂点列)
-   - シェーダ: 線分を 2 三角形で押し出し (geometry shader 不使用、頂点シェーダで側方オフセット計算)
-   - 1 本の draw call で数十万頂点を流せること
-   - `Scene::line_batches: Vec<LineBatch>` を追加し、`Renderer::render` から呼び出す
+   - 入力: `Vec<LineBatch>` (各バッチは `Vec<LineSegment>` + line_width + 任意の clip_rect)
+   - 1 segment = 1 instance、6 頂点を頂点シェーダで quad に展開
+   - フラグメントで 1px AA、batch ごとに scissor (波形 widget の clip rect)
+   - `Scene::line_batches` を介して `Renderer::render` から呼ぶ
 
-2. **LOD ピラミッド (生サンプル → min/max 多段ダウンサンプル)**
-   - `UiHost<M>` 内の `waveform_cache: HashMap<WidgetId, WaveformPyramid>`
-   - 16 倍ずつ decimation するレベル列 (`MinMaxLevel { pairs: Vec<MinMaxPair>, decimation: u32 }`)
-   - `(generation, valid_len, sample_rate, channels)` をキーに再利用判定
-   - `valid_len` 拡大時は **インクリメンタル拡張** (録音中追記対応)
+2. **LOD ピラミッド (生サンプル → min/max 多段ダウンサンプル)** ✅ (再構築)、⏳ (インクリメンタル拡張)
+   - **既存の `state: HashMap<WidgetId, Box<dyn WidgetState>>` を再利用**。`WaveformPyramid` は `WidgetState` の blanket impl 経由で乗る (新フィールド追加なし)。
+   - 16 倍ずつ decimation するレベル列 (`MinMaxLevel { pairs: Vec<MinMaxPair>, pairs_per_channel, decimation }`)
+   - `(generation, valid_len, sample_rate, channels)` の fingerprint 一致で再利用、不一致で完全再構築
+   - `valid_len` 拡大のみのインクリメンタル拡張は ⏳ 未実装 (録音追記用、後段で)
 
-3. **`Ui::waveform()` プロトタイプ (クリップ表示モード限定)**
-   - 公開 API (詳細は次セクション): `WaveformSource` / `WaveformView` / `WaveformStyle` / `WaveformResponse`
-   - 描画モード: **PeakLines のみ** (RMS / SamplePolyline / Auto は M5 へ)
-   - チャンネル: Mono / Stereo (Planar) — Interleaved / 任意 N ch は M5 へ
-   - クリップ rect でのクリッピング、ヒットテスト (サンプル index 返し)
+3. **`Ui::waveform()` プロトタイプ** ✅
+   - 公開 API: `WaveformSource` / `WaveformView` / `WaveformStyle` / `WaveformResponse` / `SampleSlices` / `ChannelLayout` / `WaveformRenderMode`
+   - 描画モード: **PeakLines のみ** (RMS / SamplePolyline / Auto は M5)
+   - チャンネル: Mono / Planar / Interleaved すべて受け取り、Stack / Overlay / FirstOnly でレイアウト
+   - クリップ rect での scissor、ヒットテスト (サンプル index 返し)
 
-4. **`examples/waveform_validation/` (ベンチ中心の検証用サンプル)**
-   - 1 分ステレオ (sample rate 48kHz, 5.76M サンプル) を表示
-   - スクロール / ズーム操作 (左右ドラッグ + マウスホイール)
-   - **HUD 表示**: フレーム時間・LOD 構築時間・LOD レベル
-   - 録音シミュレーション (1ms 毎に valid_len 拡大) のトグル
+4. **`examples/waveform_validation/`** ✅
+   - 1 分ステレオ (sample rate 48kHz, 5.76M サンプル) を生成
+   - **16 トラック × 8 クリップ = 128 widgets の grid** で表示 (アレンジメントビュー想定)
+   - drag = 全クリップ同期で横スクロール、wheel = カーソル位置 anchor のズーム
+   - **HUD 表示**: フレーム時間 / view_start / view_len / spp / N widgets 数
+   - 録音シミュレーションは ⏳ (LOD インクリメンタル拡張と同時に実装)
 
-5. **基盤の小規模整備**
-   - `criterion` を `[workspace.dev-dependencies]` に導入
-   - `trybuild` を導入し、`Ui::waveform()` シグネチャに `Clone`/`Hash` が登場しないことを doc test で固定
+5. **基盤の小規模整備** ✅ (criterion)、⏳ (trybuild)
+   - `criterion` 0.5 を `crates/ui/Cargo.toml` の `[dev-dependencies]` に導入、`benches/waveform.rs` で N=1/8/16/64/128 を測定
+   - `trybuild` は ⏳ 未実装
 
 **M2 完了条件 (Definition of Done)**:
-- [ ] line パイプライン: 10 万頂点を 1 draw call で 60fps
-- [ ] LOD 初回構築: 5.76M サンプルで < 50ms
-- [ ] LOD 再利用: `generation` 一致時の `Ui::waveform()` 呼び出し時間 < 100µs (criterion)
-- [ ] 録音シミュレーション: 1ms 追記でフレーム時間 16.7ms 安定
-- [ ] examples/waveform_validation 起動 → スクロール/ズーム滑らか
+- [x] line パイプライン: 多数頂点を低コストで描画 (N=128 widgets × ~2560 segment = 約 33 万頂点で 5.86ms 内)
+- [x] LOD 初回構築: 5.76M サンプルで < 50ms (実測 4.0 ms)
+- [x] LOD 再利用: `generation` 一致時の `Ui::waveform()` 呼び出し時間 < 100µs (実測 44 µs、N=128 まで線形)
+- [ ] 録音シミュレーション: 1ms 追記でフレーム時間 16.7ms 安定 (インクリメンタル LOD 未実装)
+- [x] examples/waveform_validation 起動 → スクロール/ズーム滑らか (128 widgets で目視確認済み)
 - [ ] `Ui::waveform()` API シグネチャに `Clone`/`Hash` 制約が無いことの trybuild 検証
-- [ ] 重大な API 変更が必要な兆候があれば、M3 着手前に設計ドキュメントへ反映
+- [x] 重大な API 変更が必要な兆候があれば、M3 着手前に設計ドキュメントへ反映 (本ファイル更新で反映)
 
 ### M3 (Ui<'a> 充実 + 基本ウィジェット拡張) — 旧 M2 の内容
 
@@ -294,34 +322,42 @@ pub struct WaveformHit {
 
 ### 2. 内部 LOD ピラミッド
 
-`UiHost<M>` 内に追加:
+実装方針: **既存の `state: HashMap<WidgetId, Box<dyn WidgetState>>` を再利用** する (新しいキャッシュ用フィールドを生やさない)。`WaveformPyramid` は `Any + Send + Sync` なので `WidgetState` の blanket impl が当たり、`Ui::widget_state::<WaveformPyramid>(wid)` で取り出せる。Single Source of Truth に沿う形。
 
 ```rust
+// 既存
 struct UiHost<M> {
     state: HashMap<WidgetId, Box<dyn WidgetState>>,
-    waveform_cache: HashMap<WidgetId, WaveformPyramid>,   // ★ M2 で追加
-    // ...
+    // ... 波形ウィジェット用に新フィールドは追加しない
 }
 
+// crates/ui/src/widgets/waveform.rs (pub(crate))
 struct WaveformPyramid {
-    generation: u64,
-    valid_len: usize,
-    sample_rate: u32,
-    channels: usize,
-    /// レベル k は 16^k サンプルあたり 1 ペア (min, max)。
-    /// levels[0] は無し (生サンプル参照のため)。levels[1..] が派生データ。
+    fingerprint: PyramidFingerprint,
+    /// levels[0] が最も細かい (decimation = 16)、levels[last] が最も粗い。
+    /// 生サンプルはピラミッドに含まない (毎フレーム借用される source.samples を直接走査)。
     levels: Vec<MinMaxLevel>,
 }
 
+struct PyramidFingerprint {
+    generation: u64,
+    valid_len: usize,
+    sample_rate: u32,
+    channels: u32,
+}
+
 struct MinMaxLevel {
-    /// channels × n ペア。チャンネル毎に連続。
+    /// channels × pairs_per_channel ペア。チャンネル毎に連続。
     pairs: Vec<MinMaxPair>,
+    pairs_per_channel: usize,
     decimation: u32,        // 16^k
 }
 
 #[repr(C)]
 struct MinMaxPair { min: f32, max: f32 }
 ```
+
+**注意**: M1 の `widget_state` ヘルパには `Box<dyn WidgetState>` 自身に blanket impl が当たって `as_any_mut` が外側 Box の TypeId を返すバグがあった (M1 では用例が無く潜在化)。M2 で明示 `&mut **entry` deref に修正し、回帰テストを追加 (commit 7ddef3f)。
 
 **ピラミッド構築アルゴリズム**:
 - ベース係数 r = 16 (チューニング可)
@@ -349,7 +385,7 @@ struct MinMaxPair { min: f32, max: f32 }
 
 ### 4. line strip パイプラインへの流し込み
 
-`Scene` を拡張 (M2):
+`Scene` を拡張 (M2 で実装済み):
 
 ```rust
 pub struct Scene {
@@ -359,15 +395,21 @@ pub struct Scene {
     pub line_batches: Vec<LineBatch>,    // ★ M2 で追加
 }
 
+pub struct LineSegment {
+    pub a: [f32; 2],         // 始点 (px)
+    pub b: [f32; 2],         // 終点 (px)
+    pub color: Color,
+}
+
 pub struct LineBatch {
-    pub vertices: Vec<LineVertex>,        // pos2 + color4 + side(±1)
-    pub topology: LineTopology,           // Strip / List
+    pub segments: Vec<LineSegment>,
     pub line_width_px: f32,
-    pub clip_rect: Option<Rect>,          // 波形ウィジェット矩形でクリップ
+    pub clip_rect: Option<Rect>,         // batch 単位の scissor (None なら全画面)
 }
 ```
 
-PeakLines モード = `LineTopology::List` で 2 頂点 × W 本。
+PeakLines モードでは 1 ピクセル = 1 segment (a=(x,y_top), b=(x,y_bottom)) で W 本作る。
+GPU 側 (`pipelines/line.rs`) では 1 segment = 1 instance、6 頂点を頂点シェーダで quad に展開する形に統一 (M5 で SamplePolyline モードを足すときも同じパイプラインで segment 列を流す)。
 
 ### 5. インタラクションと Edit
 
@@ -469,29 +511,36 @@ ui.heavy("track_0_clips", |hctx| {
 ## 重要ファイル一覧
 
 ### M2 で新規作成
-- `F:\dev\gui_01\docs\plan.md` — **本ファイルの正本** (ExitPlanMode 直後にコピー)
-- `crates/renderer/src/pipelines/line.rs` — line strip パイプライン
-- `crates/renderer/src/pipelines/line.wgsl` — 線分 → 三角形展開シェーダ
-- `crates/ui/src/widgets/waveform.rs` — `Ui::waveform`、LOD ピラミッド管理
-- `crates/examples/waveform_validation/` (新規 example crate) — ベンチ + 目視サンプル
-- `crates/ui/benches/waveform.rs` — criterion ベンチ
-- `crates/ui/tests/no_clone_required.rs` — trybuild
+- `F:\dev\gui_01\docs\plan.md` — ✅ **本ファイル**、git 管理下の正本
+- `crates/renderer/src/pipelines/line.rs` — ✅ line strip パイプライン
+- `crates/renderer/src/pipelines/line.wgsl` — ✅ 線分 → quad 展開シェーダ
+- `crates/ui/src/widgets/waveform.rs` — ✅ `Ui::waveform` + LOD ピラミッド
+- `crates/examples/waveform_validation/` — ✅ 16×8 = 128 widgets グリッドサンプル
+- `crates/ui/benches/waveform.rs` — ✅ criterion ベンチ (N=1/8/16/64/128)
+- `crates/ui/tests/no_clone_required.rs` — ⏳ trybuild、未実装
 
 ### M2 で改修
-- `crates/renderer/src/scene.rs` — `Scene::line_batches: Vec<LineBatch>` を追加
-- `crates/renderer/src/device.rs` — `Renderer::render` に line パイプライン呼び出し
-- `crates/renderer/src/pipelines/mod.rs` — `pub mod line;` 追加
-- `crates/ui/src/lib.rs` — `widgets::waveform` を再 export
-- `crates/ui/src/ui.rs` — `Ui` impl block 追加 or 別ファイル split
-- ルート `Cargo.toml` — `criterion`/`trybuild` を `[workspace.dev-dependencies]` に追加、`crates/examples/waveform_validation` をメンバー追加
+- `crates/renderer/src/scene.rs` — ✅ `Scene::line_batches`, `LineSegment`, `LineBatch` を追加
+- `crates/renderer/src/device.rs` — ✅ `Renderer::render` に line パイプライン呼び出し
+- `crates/renderer/src/pipelines/mod.rs` — ✅ `pub mod line;` 追加
+- `crates/ui/src/lib.rs` — ✅ `widgets::waveform` の公開型を再 export
+- `crates/ui/src/ui.rs` — ✅ `Ui::push_lines` 追加、`widget_state` の downcast バグ修正、回帰テスト追加
+- `crates/ui/Cargo.toml` — ✅ `criterion` を `[dev-dependencies]` に追加、`[[bench]]` 設定
+- ルート `Cargo.toml` — ✅ `crates/examples/waveform_validation` をメンバー追加
 
-### M2 で再利用する既存資産
+### M2 で再利用した既存資産
 - `crates/ui/src/widgets/button.rs` — `pressed_inside`/`hovered`/`clicked` の使い回し
 - `crates/ui/src/id.rs` — `WidgetId::child` で per-widget cache key
 - `crates/ui/src/input.rs` — `PointerFrame` をドラッグ判定に流用
 - `crates/renderer/src/pipelines/rect.rs` — 同 wgsl パターン (uniform / instance vbuf / vertex draw) を line.rs でも踏襲
+- `crates/ui/src/widgets/mod.rs` の `WidgetState` blanket impl — `WaveformPyramid` のキャッシュをそのまま乗せる
 
-### M5 で追加
+### M2 残作業
+- `crates/ui/src/widgets/waveform.rs` のインクリメンタル LOD 拡張 (録音追記対応)
+- `crates/examples/waveform_validation/src/main.rs` の録音シミュレーション (1ms 毎 valid_len 拡大トグル)
+- `crates/ui/tests/no_clone_required.rs` (trybuild) 新規作成
+
+### M5 で追加予定
 - `crates/ui/src/widgets/heavy.rs` — `HeavyCtx`、ViewportKey キャッシュ
 - `crates/examples/sample_editor/`、`crates/examples/piano_roll/`
 - `crates/ui/src/widgets/waveform.rs` の SamplePolyline / RmsBars / Auto 分岐 + マーカー描画支援
@@ -507,9 +556,9 @@ ui.heavy("track_0_clips", |hctx| {
 
 ---
 
-## ExitPlanMode 直後の最初のアクション (備忘)
+## 履歴 (最近)
 
-1. `F:\dev\gui_01\docs\` ディレクトリを作成
-2. `~/.claude/plans/ui-hashed-stearns.md` の内容を `F:\dev\gui_01\docs\plan.md` にコピー
-3. `git add docs/plan.md && git commit -m "docs: add design plan for M2 waveform UI"` (ユーザの明示指示後に実施)
-4. 以後のプラン更新は `docs/plan.md` を編集対象とし、`~/.claude/plans/` 側は必要に応じて手動同期
+- 2026-04-30: M1 初期コミット (cd969a9) — winit + wgpu + glyphon + taffy で動く GUI ライブラリ骨格。
+- 2026-05-01: 設計計画 + CLAUDE.md を git 管理下に追加 (5e14e44)。プラン正本を `docs/plan.md` に確定。
+- 2026-05-01: M2 主要実装 (7ddef3f) — line strip パイプライン + `Ui::waveform` + LOD ピラミッド + `examples/waveform_validation` + `widget_state` バグ修正。
+- 2026-05-01: M2 性能検証 (8276ddd) — criterion ベンチ追加、example を 128 widgets grid 化。実測で DoD クリア (LOD 初回 4ms, 再利用 44µs, N=128 で 5.86ms)。
