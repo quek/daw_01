@@ -143,6 +143,16 @@ impl<H: AppHost, F: FnOnce(WinitWindow) -> H> ApplicationHandler for WinitRunner
             WindowEvent::CursorEntered { .. } => host.on_event(AppEvent::PointerEntered),
             WindowEvent::CursorLeft { .. } => host.on_event(AppEvent::PointerLeft),
             WindowEvent::MouseInput { state, button, .. } => {
+                // Windows 対策: フォーカス取得を伴うクリック (例: Alt-Tab で戻った直後)
+                // では `WM_MOUSEMOVE` が発火せず `CursorMoved` が来ないため、OS に
+                // カーソル位置を問い合わせて synthetic `PointerMoved` を先に流す。
+                // これがないとクリック位置が不明 (`cur_pos = None`) のまま widget に
+                // 流れて、ボタン等の hit-test が空振りする。
+                if let Some(window) = self.window.as_ref()
+                    && let Some(pos) = query_cursor_pos_in_window(&window.inner)
+                {
+                    host.on_event(AppEvent::PointerMoved(pos));
+                }
                 host.on_event(AppEvent::PointerInput {
                     button: map_button(button),
                     state: map_state(state),
@@ -218,6 +228,40 @@ fn map_phys_key(k: WinitPhysKey) -> PhysicalKey {
         WinitPhysKey::Code(c) => PhysicalKey::Other(c as u32),
         WinitPhysKey::Unidentified(_) => PhysicalKey::Other(0),
     }
+}
+
+/// OS にカーソル位置を問い合わせて、ウィンドウ局所座標 (物理ピクセル) で返す。
+///
+/// **Windows のみ実装**: フォーカス取得を伴うクリックでは `WM_MOUSEMOVE` が
+/// 来ない場合があり、winit の `cur_pos` が `None` のまま `MouseInput` が届くため、
+/// `MouseInput` 直前に `GetCursorPos` で位置を補う必要がある。
+/// 他プラットフォームは `None` を返す (該当の問題が同じ形で出るかは未検証)。
+#[cfg(target_os = "windows")]
+fn query_cursor_pos_in_window(window: &Window) -> Option<PhysicalPosition> {
+    use std::ffi::c_void;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Foundation::{HWND, POINT};
+    use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let handle = window.window_handle().ok()?;
+    let hwnd: HWND = match handle.as_raw() {
+        RawWindowHandle::Win32(h) => h.hwnd.get() as *mut c_void,
+        _ => return None,
+    };
+    let mut pt = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut pt) } == 0 {
+        return None;
+    }
+    if unsafe { ScreenToClient(hwnd, &mut pt) } == 0 {
+        return None;
+    }
+    Some(PhysicalPosition { x: f64::from(pt.x), y: f64::from(pt.y) })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn query_cursor_pos_in_window(_window: &Window) -> Option<PhysicalPosition> {
+    None
 }
 
 fn map_cursor(c: CursorIcon) -> WinitCursor {

@@ -141,12 +141,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     }
 }
 
-/// クリック判定用ヘルパ — 矩形に対するヒットテスト + just_released なら true。
-pub(crate) fn clicked(rect: Rect, pointer: PointerFrame) -> bool {
-    let Some((px, py)) = pointer.pos else { return false };
-    pointer.primary_just_released && rect.contains(px, py)
-}
-
 /// 視覚フィードバック用 — 押下中(矩形内 & primary_pressed)なら true。
 pub(crate) fn pressed_inside(rect: Rect, pointer: PointerFrame) -> bool {
     let Some((px, py)) = pointer.pos else { return false };
@@ -210,5 +204,132 @@ mod tests {
             let state: &mut MyState = ui.widget_state(id);
             assert_eq!(state.count, 2);
         });
+    }
+
+    /// 「hover フレームを描画 → 次フレームで同フレーム内 press + release」で
+    /// click が 1 回目から発火することを担保する。ユーザ報告:
+    /// 「ボタンにマウスを乗せた直後の最初のクリックでアクションが反応しない」
+    /// の回帰防止。
+    #[test]
+    fn button_click_fires_on_first_hover_then_click() {
+        struct Counter {
+            count: u32,
+        }
+
+        let mut host: UiHost<Counter> = UiHost::new();
+        let mut scene = Scene::new();
+        let mut model = Counter { count: 0 };
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 32.0 };
+
+        // Frame 1: cursor をボタン上にホバー (まだクリック無し)。
+        let pointer_hover = PointerFrame {
+            pos: Some((50.0, 16.0)),
+            primary_just_pressed: false,
+            primary_just_released: false,
+            primary_pressed: false,
+        };
+        let edits = host.frame(&model, &mut scene, screen, pointer_hover, |_, ui| {
+            ui.button_at("test", "click me", rect, || {
+                Edit::mutate(|m: &mut Counter| m.count += 1)
+            });
+        });
+        for e in edits {
+            e.apply(&mut model);
+        }
+        assert_eq!(model.count, 0, "hover フレームでは click は出ない");
+
+        // Frame 2: 同フレーム内で press + release (高速クリック相当)。
+        let pointer_click = PointerFrame {
+            pos: Some((50.0, 16.0)),
+            primary_just_pressed: true,
+            primary_just_released: true,
+            primary_pressed: false,
+        };
+        let edits = host.frame(&model, &mut scene, screen, pointer_click, |_, ui| {
+            ui.button_at("test", "click me", rect, || {
+                Edit::mutate(|m: &mut Counter| m.count += 1)
+            });
+        });
+        for e in edits {
+            e.apply(&mut model);
+        }
+        assert_eq!(
+            model.count, 1,
+            "hover 直後の最初のクリックで click が発火するべき"
+        );
+    }
+
+    /// press と release が別フレームに分かれて届くケース (winit が press と release で
+    /// それぞれ別の redraw を発火するパターン) で、`press_started_inside` がフレーム間で
+    /// ちゃんと保持されて release フレームで click 発火することを担保する。
+    #[test]
+    fn button_click_fires_when_press_and_release_in_separate_frames() {
+        struct Counter {
+            count: u32,
+        }
+
+        let mut host: UiHost<Counter> = UiHost::new();
+        let mut scene = Scene::new();
+        let mut model = Counter { count: 0 };
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 32.0 };
+        let render = |host: &mut UiHost<Counter>,
+                      scene: &mut Scene,
+                      model: &Counter,
+                      pointer: PointerFrame|
+         -> Vec<Edit<Counter>> {
+            host.frame(model, scene, screen, pointer, |_, ui| {
+                ui.button_at("test", "click me", rect, || {
+                    Edit::mutate(|m: &mut Counter| m.count += 1)
+                });
+            })
+        };
+
+        // Frame 1: hover.
+        let edits = render(
+            &mut host,
+            &mut scene,
+            &model,
+            PointerFrame {
+                pos: Some((50.0, 16.0)),
+                ..PointerFrame::default()
+            },
+        );
+        for e in edits { e.apply(&mut model); }
+        assert_eq!(model.count, 0);
+
+        // Frame 2: press フレーム (まだ release していない、ボタン押下中)。
+        let edits = render(
+            &mut host,
+            &mut scene,
+            &model,
+            PointerFrame {
+                pos: Some((50.0, 16.0)),
+                primary_just_pressed: true,
+                primary_just_released: false,
+                primary_pressed: true,
+            },
+        );
+        for e in edits { e.apply(&mut model); }
+        assert_eq!(model.count, 0, "press フレームでは click は出ない");
+
+        // Frame 3: release フレーム。
+        let edits = render(
+            &mut host,
+            &mut scene,
+            &model,
+            PointerFrame {
+                pos: Some((50.0, 16.0)),
+                primary_just_pressed: false,
+                primary_just_released: true,
+                primary_pressed: false,
+            },
+        );
+        for e in edits { e.apply(&mut model); }
+        assert_eq!(
+            model.count, 1,
+            "release フレームで click 発火するべき (press_started_inside が保持されている)"
+        );
     }
 }

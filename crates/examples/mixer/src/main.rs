@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use daw_ui_core::{Edit, InputAccumulator, UiHost};
 use daw_ui_platform::{AppEvent, AppHost, PhysicalSize, WindowBackend, winit_backend};
+use daw_ui_core::FaderResponse;
 use daw_ui_renderer::{Color, Rect, RectCommand, Renderer, Scene};
 use winit::window::WindowAttributes;
 
@@ -22,15 +23,18 @@ struct MixerModel {
     bench_active: bool,
     /// メッセージ。
     last_action: String,
+    /// M3 動作確認用: 3 ch のフェーダ値 (0..1)。
+    faders: [f32; 3],
 }
 
 impl MixerModel {
     fn new() -> Self {
         Self {
-            title: "daw-ui ミキサー (M1 動作確認)".to_string(),
+            title: "daw-ui ミキサー (M1+M3 動作確認)".to_string(),
             count: 0,
             bench_active: false,
             last_action: "起動しました".to_string(),
+            faders: [0.5, 0.7, 0.3],
         }
     }
 }
@@ -66,7 +70,12 @@ impl App {
         }
     }
 
-    fn build_ui(&mut self) {
+    /// `Ui::frame` で edits が出たかどうかを返す。出たなら呼び出し側で
+    /// 直後に redraw を要求して、適用後の Model でもう 1 度ラベル等を
+    /// 描画し直す必要がある (immediate-mode + Edit queue の常で、edits は
+    /// 描画クロージャ後に apply されるので、この関数の `render` までの間に
+    /// scene へ積まれているラベル文字列は 1 フレーム古い値になっている)。
+    fn build_ui(&mut self) -> bool {
         self.scene.clear();
         let screen = self.renderer.size();
         let pointer = self.input.take_frame();
@@ -136,12 +145,56 @@ impl App {
                         };
                     })
                 });
+
+                // 3ch フェーダ (M3 動作確認)。
+                let fader_w = 60.0;
+                let fader_h = 200.0;
+                let fader_top = 240.0;
+                let fader_left = 320.0;
+                ui.label_at(
+                    "fader_label",
+                    "M3: フェーダ (上下ドラッグ)",
+                    fader_left,
+                    fader_top - 28.0,
+                    14.0,
+                    Color::rgb(0.85, 0.88, 0.92),
+                );
+                for i in 0..3 {
+                    let rect = Rect {
+                        x: fader_left + i as f32 * (fader_w + 16.0),
+                        y: fader_top,
+                        w: fader_w,
+                        h: fader_h,
+                    };
+                    let resp: FaderResponse =
+                        ui.fader_at(("ch_fader", i), rect, m.faders[i], move |v| {
+                            Edit::mutate(move |m: &mut MixerModel| {
+                                m.faders[i] = v;
+                                m.last_action = format!("ch{} fader = {v:.2}", i + 1);
+                            })
+                        });
+                    let percent = (resp.displayed_value * 100.0).round() as i32;
+                    ui.label_at(
+                        ("fader_pct", i),
+                        &format!("ch{}\n{percent}%", i + 1),
+                        rect.x,
+                        rect.y + rect.h + 6.0,
+                        12.0,
+                        if resp.dragging {
+                            Color::rgb(0.95, 0.97, 1.0)
+                        } else {
+                            Color::rgb(0.65, 0.68, 0.72)
+                        },
+                    );
+                }
             },
         );
 
+        let had_edits = !edits.is_empty();
         for e in edits {
             e.apply(&mut self.model);
         }
+        had_edits
     }
 }
 
@@ -165,9 +218,13 @@ impl AppHost for App {
 
     fn on_render(&mut self) -> bool {
         self.frames = self.frames.wrapping_add(1);
-        self.build_ui();
+        let had_edits = self.build_ui();
         if let Err(e) = self.renderer.render(&self.scene) {
             eprintln!("render error: {e}");
+        }
+        // edits が出たら次フレームで適用後 Model のラベルを描き直す。
+        if had_edits {
+            self.window.request_redraw();
         }
         // bench 中は連続再描画
         self.model.bench_active

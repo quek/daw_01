@@ -200,13 +200,29 @@ F:\dev\gui_01\
 
 ### M3 (Ui<'a> 充実 + 基本ウィジェット拡張) — 旧 M2 の内容
 
-- `Ui::fader` / `Ui::knob` / `Ui::checkbox` / `Ui::text_input` (ASCII + 日本語 IME)
-- ドラッグ状態管理: `UiHost.state: HashMap<WidgetId, Box<dyn WidgetState>>` の実利用 (focus / drag start pos / scroll offset)
-- キーボード入力のウィジェット組み込み (`AppEvent::Keyboard` → focused widget)
-- IME 候補位置の `WindowBackend::set_ime_position()` 実装 (winit 側)
+**Phase 1 進捗 (2026-05-01)** — fader + 入力周りバグ修正:
+
+| 成果物 | 状態 | コミット |
+|---|---|---|
+| `Ui::fader_at` / `Ui::fader` (垂直スライダ、ドラッグで値編集) | ✅ | (本コミット) |
+| `FaderState`: `state` HashMap 経由のドラッグ状態保持 | ✅ | (本コミット) |
+| `examples/mixer` に 3 ch fader 追加 (drag → Edit → apply 確認) | ✅ | (本コミット) |
+| `trybuild`: `Ui::fader` / `Ui::fader_at` が non-Clone Model でコンパイル | ✅ | (本コミット) |
+| Button モデルを armed-state (`press_started_inside`) に再設計 | ✅ | (本コミット) |
+| Windows フォーカス取得クリックで cur_pos が None のまま MouseInput が届く問題 | ✅ 解消 | (本コミット) |
+| Edit apply 後のラベル staleness 問題 (had_edits → request_redraw) | ✅ 解消 | (本コミット) |
+| 単体テスト: button click が hover 直後 / press-release 別フレームで両方発火 | ✅ | (本コミット) |
+
+**残作業 (Phase 2 以降)**:
+
+- `Ui::knob` (回転ノブ、上下ドラッグで値編集)
+- `Ui::checkbox` (bool toggle)
+- `Ui::text_input` (ASCII + 日本語 IME 込み)
+- キーボード focus トラッキング (`UiHost` に focused widget) + `AppEvent::Keyboard` を focused widget へルーティング
+- IME 候補位置の `WindowBackend::set_ime_position()` 実装 (winit `set_ime_cursor_area` を使う)
 - `LayoutPass` 拡張: padding / gap / fixed size / proportional growth
-- examples/mixer 拡張: 8ch ミキサーが GUI Model だけで動く (フェーダドラッグ → Edit → apply)
-- **trybuild 検証**: ユーザ Model に `Clone`/`PartialEq`/`Hash`/`Default` を実装していないコードがコンパイル成功することを固定 (回帰防止)
+- `examples/mixer` を 8ch (8 fader + 8 pan knob + 8 mute checkbox) に拡張
+- **trybuild 検証拡張**: knob / checkbox / text_input も non-Clone Model でコンパイルすることを固定
 
 ### M4 (内部 scenegraph + 差分検出) — 旧 M3
 
@@ -566,3 +582,4 @@ ui.heavy("track_0_clips", |hctx| {
 - 2026-05-01: ドキュメント整理 (b8e320c) — `docs/plan.md` を実状に合わせて更新、README の参照を最新化。
 - 2026-05-01: trybuild 導入 (3c251c3) — no-Clone 制約 (ユーザ Model に Clone/PartialEq/Hash/Default を要求しない) の回帰防止を CI 固定。
 - 2026-05-01: **M2 完成** — インクリメンタル LOD 拡張 + REC シミュレーション。`MinMaxLevel` を per-channel `Vec<Vec>` に refactor (末尾 push 効率化)、`extend_to` で cascading boundary recompute + push、Space キー REC で実機検証可能に。indirection 増で 44→61 µs/widget の軽い regression を許容して incremental の利得を取る。M2 DoD 全項目クリア。
+- 2026-05-01: **M3 Phase 1** — fader (垂直スライダ、つまみ限定ドラッグ) + button armed-state モデル + Windows focus-click cur_pos workaround + edit 後の追加 redraw パターン確立。実機検証で「ホバー直後の click が反応しない」「フォーカス取得クリックで反応しない」「fader を rect 全域でドラッグ可能」「fader 感度が rect.h 基準で上端に届かない」をユーザ報告から逐次修正。

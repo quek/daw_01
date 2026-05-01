@@ -1,13 +1,29 @@
 //! `button` ウィジェット — クリックされると `Edit<M>` を発行する。
+//!
+//! クリック判定: **press 開始位置を記憶**するモデル。
+//! - press inside → `press_started_inside = true` を記憶
+//! - release inside かつ `press_started_inside` → click 発火
+//! - press outside で始まったクリックは release が内側でも発火しない
+//! - press 中に外れて戻ってきても、release が内側なら click 発火 (Windows 標準挙動)
+//!
+//! これで「press inside → 少しドリフト → release inside」を取りこぼさない。
 
 use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
-use crate::ui::{Ui, clicked, hovered, lerp_color, pressed_inside};
+use crate::ui::{Ui, lerp_color};
+
+/// button の永続状態。
+#[derive(Debug, Default)]
+pub(crate) struct ButtonState {
+    /// 直近の primary press がこのボタン内から始まったか。
+    /// release 時の click 判定に使う。release で false にリセット。
+    press_started_inside: bool,
+}
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
-    /// 矩形指定でボタンを描画+ヒットテスト。クリック時 `on_click()` の返り値を Edit 列に積む。
+    /// 矩形指定でボタンを描画+ヒットテスト。click 時 `on_click()` を Edit 列に積む。
     pub fn button_at(
         &mut self,
         id: impl std::hash::Hash,
@@ -15,16 +31,34 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         rect: Rect,
         on_click: impl FnOnce() -> Edit<M>,
     ) {
-        let _wid = WidgetId::ROOT.child((b"button", &id));
+        let wid = WidgetId::ROOT.child((b"button", &id));
+        let pointer = self.pointer;
+        let inside = pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
+
+        // press 開始位置の記録と click 判定。
+        let (visual_pressed, click) = {
+            let state: &mut ButtonState = self.widget_state(wid);
+            if pointer.primary_just_pressed {
+                state.press_started_inside = inside;
+            }
+            let started = state.press_started_inside;
+            // 視覚: 「このボタンで押下が始まり、今もボタン内にホールド中」のときだけ pressed 表示。
+            let visual_pressed = started && inside && pointer.primary_pressed;
+            // click: release inside かつこのボタンで press が始まっていた。
+            let click = pointer.primary_just_released && started && inside;
+            if pointer.primary_just_released {
+                state.press_started_inside = false;
+            }
+            (visual_pressed, click)
+        };
 
         let base = Color::rgb(0.18, 0.20, 0.26);
         let hover = Color::rgb(0.24, 0.27, 0.34);
         let press = Color::rgb(0.32, 0.55, 0.85);
 
-        let pointer = self.pointer;
-        let fill = if pressed_inside(rect, pointer) {
+        let fill = if visual_pressed {
             press
-        } else if hovered(rect, pointer) {
+        } else if inside {
             lerp_color(base, hover, 0.85)
         } else {
             base
@@ -54,7 +88,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             color: Color::rgb(0.95, 0.95, 0.97),
         });
 
-        if clicked(rect, pointer) {
+        if click {
             let edit = on_click();
             self.push_edit(edit);
         }

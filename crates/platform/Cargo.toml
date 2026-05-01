@@ -12,3 +12,12 @@ workspace = true
 [dependencies]
 raw-window-handle = "0.6.2"
 winit = "0.30.13"
+
+# Windows 限定: フォーカス取得直後のクリックで cursor 位置が不明になる問題を
+# GetCursorPos / ScreenToClient で補うために使う (winit_backend.rs 参照)。
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }

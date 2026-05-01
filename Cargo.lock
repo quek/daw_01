@@ -507,6 +507,7 @@ name = "daw-ui-platform"
 version = "0.1.0"
 dependencies = [
  "raw-window-handle",
+ "windows-sys 0.59.0",
  "winit",
 ]
 
