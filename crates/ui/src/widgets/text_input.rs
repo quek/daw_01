@@ -15,6 +15,7 @@ use daw_ui_renderer::{Color, GlyphArea, LineBatch, LineSegment, Rect, RectComman
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
+use crate::input::ImeEvent;
 use crate::ui::Ui;
 
 /// text_input の永続状態。
@@ -24,6 +25,9 @@ pub(crate) struct TextInputState {
     press_started_inside: bool,
     /// cursor の byte 位置。char 境界に揃っていることを保証する。
     cursor_byte: usize,
+    /// IME 変換中の preedit テキスト。空文字列なら preedit 中ではない。
+    /// model.text には反映されず、描画のときに cursor 位置に挿入表示する。
+    preedit: String,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -79,18 +83,38 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         let was_focused = self.is_focused(wid);
 
-        // フォーカス中ならキー入力を処理。
+        // フォーカス中の入力処理 (IME → 通常キー の順)。
+        // 同じ working buffer に積んで、最後にまとめて Edit を 1 つだけ発行する。
         let mut new_text: Option<String> = None;
         let mut committed = false;
         let mut escape_pressed = false;
         if was_focused {
+            let ime_events = self.take_ime_events_if_focused(wid);
             let key_events = self.take_keyboard_events_if_focused(wid);
-            if !key_events.is_empty() {
+            if !ime_events.is_empty() || !key_events.is_empty() {
                 let state: &mut TextInputState = self.widget_state(wid);
                 let mut working = text.to_string();
                 let mut cursor = state.cursor_byte.min(working.len());
                 let mut changed = false;
 
+                // IME 先: preedit は state にだけ反映、commit は working に挿入。
+                for ev in ime_events {
+                    match ev {
+                        ImeEvent::Preedit { text: pre, .. } => {
+                            state.preedit = pre;
+                        }
+                        ImeEvent::Commit(committed_text) => {
+                            state.preedit.clear();
+                            if !committed_text.is_empty() {
+                                working.insert_str(cursor, &committed_text);
+                                cursor += committed_text.len();
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+
+                // 通常キー (preedit 中は KeyEvent::text の文字挿入は IME に取られる想定で空が多い)。
                 for ev in key_events {
                     if !matches!(ev.state, ElementState::Pressed) {
                         continue;
@@ -98,7 +122,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     match ev.physical_key {
                         PhysicalKey::Backspace => {
                             if cursor > 0 {
-                                // char 境界まで戻す。
                                 let mut prev = cursor - 1;
                                 while prev > 0 && !working.is_char_boundary(prev) {
                                     prev -= 1;
@@ -130,12 +153,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                             committed = true;
                         }
                         PhysicalKey::Escape => {
-                            // フォーカスを外す処理は state 借用を抜けてから行う。
                             escape_pressed = true;
                         }
                         _ => {
-                            // 文字入力。`KeyEvent::text` を信用する (IME 経由含むが、
-                            // Phase 4c 前なので preedit は来ない想定)。
                             if let Some(input_text) = &ev.text {
                                 let filtered: String =
                                     input_text.chars().filter(|c| !c.is_control()).collect();
@@ -152,7 +172,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 if changed {
                     new_text = Some(working.clone());
                 }
-                // working はキー処理で大きさが変わっている可能性があるので最新長でクランプ。
                 state.cursor_byte = cursor.min(working.len());
             }
         }
@@ -160,15 +179,39 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.clear_focus_if_focused(wid);
         }
 
-        // 描画用 cursor: state を改変せずに「入力 text の長さ」でクランプするだけ
-        // (state に保存した cursor は editing 中の post-edit 位置なので上書きしない)。
-        let cursor_byte_for_draw = {
+        // 描画用 cursor + preedit を state から取り出す。
+        let (cursor_byte_for_draw, preedit_for_draw) = {
             let state: &mut TextInputState = self.widget_state(wid);
-            state.cursor_byte.min(text.len())
+            (state.cursor_byte.min(text.len()), state.preedit.clone())
         };
 
         // 描画。
-        draw_text_input(self, rect, text, was_focused, cursor_byte_for_draw);
+        draw_text_input(
+            self,
+            rect,
+            text,
+            was_focused,
+            cursor_byte_for_draw,
+            &preedit_for_draw,
+        );
+
+        // フォーカス中なら IME 候補ウィンドウ位置を要求する (cursor 直下)。
+        if was_focused {
+            let pad_x = 8.0;
+            let prefix = text.get(..cursor_byte_for_draw).unwrap_or("");
+            let cursor_x = rect.x
+                + pad_x
+                + approx_text_width(prefix)
+                + approx_text_width(&preedit_for_draw);
+            let cursor_y_top = rect.y + 4.0;
+            let cursor_h = (rect.h - 8.0).max(1.0);
+            self.request_ime(Rect {
+                x: cursor_x,
+                y: cursor_y_top,
+                w: 1.0,
+                h: cursor_h,
+            });
+        }
 
         if let Some(t) = new_text {
             let edit = on_change(t);
@@ -202,8 +245,24 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     }
 }
 
-/// ASCII 等幅近似の文字幅 (px)。Phase 4c で glyphon の measure に置き換える予定。
-const APPROX_CHAR_W: f32 = 8.0;
+/// 等幅フォント (HackGen Console NF) の ASCII 文字幅 (= font_size / 2 = 14 / 2 = 7)。
+const APPROX_CHAR_W: f32 = 7.0;
+/// 等幅フォントの CJK 文字幅 (= font_size = 14、ASCII の 2 倍)。
+const APPROX_CJK_W: f32 = 14.0;
+
+/// 文字列の概算ピクセル幅。ASCII は 8px、それ以外は 16px で計算する。
+/// (preedit や cursor の x 位置を求めるのに使う暫定実装)
+fn approx_text_width(text: &str) -> f32 {
+    text.chars()
+        .map(|c| {
+            if c.is_ascii() {
+                APPROX_CHAR_W
+            } else {
+                APPROX_CJK_W
+            }
+        })
+        .sum()
+}
 
 fn draw_text_input<M: ?Sized + 'static>(
     ui: &mut Ui<'_, M>,
@@ -211,6 +270,7 @@ fn draw_text_input<M: ?Sized + 'static>(
     text: &str,
     focused: bool,
     cursor_byte: usize,
+    preedit: &str,
 ) {
     // 背景。
     let bg_fill = Color::rgb(0.08, 0.09, 0.11);
@@ -227,15 +287,33 @@ fn draw_text_input<M: ?Sized + 'static>(
         radius: [3.0; 4],
     });
 
-    // テキスト。
+    // テキスト + preedit。preedit は cursor 位置に挿入して表示する。
     let pad_x = 8.0;
     let font_size = 14.0;
     let line_h = font_size * 1.2;
     let tx = rect.x + pad_x;
     let ty = rect.y + (rect.h - line_h) * 0.5;
-    if !text.is_empty() {
+
+    // テキスト全体 (prefix + preedit + suffix) を 1 つの GlyphArea で描画する。
+    // glyphon の自動レイアウトに任せれば、フォントの実 advance に基づいて正確に並ぶ
+    // (proportional でも monospace でも OK)。preedit の色分けは GlyphArea が単色なので
+    // 諦め、代わりに下線で区別する。色分け復活には cosmic-text の Buffer::layout_runs()
+    // で実 measure が必要 (ui crate が renderer の FontSystem に access する経路を整備
+    // するフェーズで対応予定)。
+    let prefix = text.get(..cursor_byte).unwrap_or("");
+    let suffix = text.get(cursor_byte..).unwrap_or("");
+    let combined = if preedit.is_empty() {
+        text.to_string()
+    } else {
+        let mut s = String::with_capacity(text.len() + preedit.len());
+        s.push_str(prefix);
+        s.push_str(preedit);
+        s.push_str(suffix);
+        s
+    };
+    if !combined.is_empty() {
         ui.push_text(GlyphArea {
-            text: text.to_string(),
+            text: combined,
             left: tx,
             top: ty,
             font_size,
@@ -244,13 +322,26 @@ fn draw_text_input<M: ?Sized + 'static>(
         });
     }
 
-    // カーソル (フォーカス中のみ)。ASCII 近似。
+    // preedit の下線 (位置は概算 — HackGen Console NF の半角=7 / 全角=14 で計算)。
+    let prefix_w = approx_text_width(prefix);
+    let preedit_w = approx_text_width(preedit);
+    if !preedit.is_empty() {
+        let pre_x = tx + prefix_w;
+        let underline_y = rect.y + rect.h - 4.0;
+        ui.push_lines(LineBatch {
+            segments: vec![LineSegment {
+                a: [pre_x, underline_y],
+                b: [pre_x + preedit_w, underline_y],
+                color: Color::rgb(0.95, 0.85, 0.55),
+            }],
+            line_width_px: 1.5,
+            clip_rect: Some(rect),
+        });
+    }
+
+    // カーソル (フォーカス中のみ、preedit があれば末尾)。
     if focused {
-        // cursor_byte までの文字数を char 単位で数える (ASCII 近似だが日本語混在でも byte/char で
-        // ある程度の位置感は出る)。
-        let prefix = text.get(..cursor_byte).unwrap_or("");
-        let chars_before = prefix.chars().count() as f32;
-        let cursor_x = tx + chars_before * APPROX_CHAR_W;
+        let cursor_x = tx + prefix_w + preedit_w;
         let cursor_y = rect.y + 4.0;
         let cursor_h = (rect.h - 8.0).max(1.0);
         ui.push_lines(LineBatch {

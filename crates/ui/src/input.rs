@@ -14,6 +14,23 @@ pub struct PointerFrame {
     pub primary_pressed: bool,
 }
 
+/// IME (input method editor) のイベント。focused widget が処理する。
+#[derive(Debug, Clone)]
+pub enum ImeEvent {
+    /// 変換中の preedit テキスト (画面に下線付きで表示)。`cursor` は preedit 内の選択範囲。
+    Preedit { text: String, cursor: Option<(usize, usize)> },
+    /// 確定テキスト。focused widget は cursor 位置にこの文字列を挿入する。
+    Commit(String),
+}
+
+/// 1 フレーム分の入力一式。`UiHost::frame` に渡す。
+#[derive(Debug, Default)]
+pub struct FrameInput {
+    pub pointer: PointerFrame,
+    pub keyboard: Vec<KeyEvent>,
+    pub ime: Vec<ImeEvent>,
+}
+
 /// 連続フレームをまたいで保持する入力状態。
 #[derive(Debug, Default)]
 pub struct InputAccumulator {
@@ -22,6 +39,7 @@ pub struct InputAccumulator {
     pending_just_pressed: bool,
     pending_just_released: bool,
     pending_keys: Vec<KeyEvent>,
+    pending_ime: Vec<ImeEvent>,
 }
 
 impl InputAccumulator {
@@ -56,6 +74,15 @@ impl InputAccumulator {
                 // フレーム間蓄積。order を保つために push 順で並べる。
                 self.pending_keys.push(key.clone());
             }
+            AppEvent::ImePreedit { text, cursor } => {
+                self.pending_ime.push(ImeEvent::Preedit {
+                    text: text.clone(),
+                    cursor: *cursor,
+                });
+            }
+            AppEvent::ImeCommit(text) => {
+                self.pending_ime.push(ImeEvent::Commit(text.clone()));
+            }
             _ => {}
         }
     }
@@ -77,5 +104,19 @@ impl InputAccumulator {
     /// 取り出すと内部のバッファは空になる (フレーム間で持ち越さない)。
     pub fn take_keyboard_events(&mut self) -> Vec<KeyEvent> {
         std::mem::take(&mut self.pending_keys)
+    }
+
+    /// このフレーム分の蓄積された IME イベントを取り出す。
+    pub fn take_ime_events(&mut self) -> Vec<ImeEvent> {
+        std::mem::take(&mut self.pending_ime)
+    }
+
+    /// pointer / keyboard / ime をまとめて取り出す。`UiHost::frame` への引数として渡す。
+    pub fn take_input(&mut self) -> FrameInput {
+        FrameInput {
+            pointer: self.take_frame(),
+            keyboard: self.take_keyboard_events(),
+            ime: self.take_ime_events(),
+        }
     }
 }

@@ -17,7 +17,7 @@ use daw_ui_renderer::{Color, GlyphArea, LineBatch, Rect, RectCommand, Scene};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
-use crate::input::PointerFrame;
+use crate::input::{FrameInput, ImeEvent, PointerFrame};
 use crate::widgets::WidgetState;
 
 /// アプリが 1 つ持つ UI ホスト。フレーム間で UI 内部状態を保持する。
@@ -31,6 +31,10 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// アプリ側は `had_edits` と同様、これが `true` なら「次フレームで新しい
     /// focus 状態に基づいた再描画」を行うため `request_redraw` を呼ぶこと。
     focus_changed_in_last_frame: bool,
+    /// 直前の `frame()` で `Ui::request_ime` が呼ばれたときの cursor 領域。
+    /// アプリは on_render の終わりにこの値を見て winit の `set_ime_cursor_area` /
+    /// `set_ime_allowed` を呼ぶ。`None` のフレームでは IME を無効化する。
+    last_ime_request: Option<Rect>,
     _m: PhantomData<fn(&mut M)>,
 }
 
@@ -40,6 +44,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             state: HashMap::new(),
             focused: None,
             focus_changed_in_last_frame: false,
+            last_ime_request: None,
             _m: PhantomData,
         }
     }
@@ -51,25 +56,32 @@ impl<M: ?Sized + 'static> UiHost<M> {
         self.focus_changed_in_last_frame
     }
 
+    /// 直前の `frame()` で focused widget が要求した IME 候補ウィンドウ位置 (Rect)。
+    /// `Some` ならアプリは `WindowBackend::set_ime_allowed(true)` +
+    /// `set_ime_cursor_area(rect)` を呼ぶ。`None` なら IME を無効化する。
+    pub fn ime_request(&self) -> Option<Rect> {
+        self.last_ime_request
+    }
+
     /// 1 フレーム分の UI を構築。返り値は発生したエディットのリスト。
     ///
     /// `f` は `(model, &mut Ui)` を受け取り、ウィジェットを呼び出して UI を組む。
-    /// `keyboard` はこのフレーム内に発生したキー入力イベント (順序保持)。
-    /// フォーカスを持つ widget がいれば `Ui::take_keyboard_events_if_focused` で消費する。
+    /// `input` の `keyboard` / `ime` イベントは focused widget が消費する想定。
     pub fn frame<F>(
         &mut self,
         model: &M,
         scene: &mut Scene,
         screen: PhysicalSize,
-        pointer: PointerFrame,
-        keyboard: Vec<KeyEvent>,
+        input: FrameInput,
         f: F,
     ) -> Vec<Edit<M>>
     where
         F: for<'a> FnOnce(&'a M, &mut Ui<'a, M>),
     {
         let mut edits: Vec<Edit<M>> = Vec::new();
+        let FrameInput { pointer, keyboard, ime } = input;
         let mut keyboard_events = keyboard;
+        let mut ime_events = ime;
         let cursor = Rect::new(0.0, 0.0, screen.width as f32, screen.height as f32);
         let focused_at_start = self.focused;
         let mut ui = Ui {
@@ -78,12 +90,14 @@ impl<M: ?Sized + 'static> UiHost<M> {
             edits: &mut edits,
             pointer,
             keyboard_events: &mut keyboard_events,
+            ime_events: &mut ime_events,
             cursor,
             screen,
             next_y: 0.0,
             focused: focused_at_start,
             pending_focus: focused_at_start,
             focus_changed_this_frame: false,
+            ime_request: None,
             _m: PhantomData,
         };
         f(model, &mut ui);
@@ -98,6 +112,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
             self.focused = None;
         }
         self.focus_changed_in_last_frame = self.focused != prev_focused;
+        // IME request の commit (フレーム内に request_ime が呼ばれていれば Some)。
+        self.last_ime_request = ui.ime_request;
         edits
     }
 
@@ -124,6 +140,8 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     pub(crate) pointer: PointerFrame,
     /// このフレーム分のキー入力イベント (フォーカスを持つ widget が消費する)。
     keyboard_events: &'a mut Vec<KeyEvent>,
+    /// このフレーム分の IME イベント (フォーカスを持つ widget が消費する)。
+    ime_events: &'a mut Vec<ImeEvent>,
     /// 現在の利用可能領域 (シンプルな vstack 用)。
     pub(crate) cursor: Rect,
     pub(crate) screen: PhysicalSize,
@@ -137,6 +155,10 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// このフレーム内で誰かがフォーカスを操作したか。
     /// クリック発生時にこれが `false` なら blur (= フォーカス可能でない場所がクリックされた)。
     focus_changed_this_frame: bool,
+    /// このフレーム内で `Ui::request_ime` で要求された IME 候補ウィンドウ位置 (Rect)。
+    /// 同フレーム内に複数 widget が呼んだ場合は最後の呼び出しが勝つ
+    /// (typical: focused widget だけが呼ぶ想定)。
+    ime_request: Option<Rect>,
     _m: PhantomData<&'a M>,
 }
 
@@ -208,6 +230,23 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
     }
 
+    /// `wid` がフォーカスを持っているならフレームに溜まった IME イベントを取り出す。
+    /// `take_keyboard_events_if_focused` と同じく、フレーム開始時 focus でチェックする。
+    pub fn take_ime_events_if_focused(&mut self, wid: WidgetId) -> Vec<ImeEvent> {
+        if self.focused == Some(wid) {
+            std::mem::take(self.ime_events)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// IME 候補ウィンドウを表示するべき領域 (cursor 直下) を要求する。
+    /// 通常は focused text_input が自分の cursor 位置周辺の rect を渡す。
+    /// アプリは `UiHost::ime_request()` でこの値を取得し、`set_ime_cursor_area` を呼ぶ。
+    pub fn request_ime(&mut self, cursor_area: Rect) {
+        self.ime_request = Some(cursor_area);
+    }
+
     /// 内部: WidgetId に紐付く永続状態を取得 or 初期化。
     /// (M2 で waveform の LOD ピラミッドキャッシュに、M3 以降は fader/knob のドラッグ状態に使う)
     pub(crate) fn widget_state<S: WidgetState + Default + 'static>(
@@ -273,7 +312,7 @@ mod tests {
         let screen = PhysicalSize { width: 400, height: 300 };
 
         // フレーム 1: state を初期化して 1 回インクリメント。
-        host.frame(&model, &mut scene, screen, PointerFrame::default(), Vec::new(), |_, ui| {
+        host.frame(&model, &mut scene, screen, FrameInput::default(), |_, ui| {
             let id = WidgetId::ROOT.child("ws-roundtrip");
             let state: &mut MyState = ui.widget_state(id);
             assert_eq!(state.count, 0);
@@ -281,14 +320,14 @@ mod tests {
         });
 
         // フレーム 2: 同じ id で同じ型を取り直すと値が保持されている。
-        host.frame(&model, &mut scene, screen, PointerFrame::default(), Vec::new(), |_, ui| {
+        host.frame(&model, &mut scene, screen, FrameInput::default(), |_, ui| {
             let id = WidgetId::ROOT.child("ws-roundtrip");
             let state: &mut MyState = ui.widget_state(id);
             assert_eq!(state.count, 1);
             state.count += 1;
         });
 
-        host.frame(&model, &mut scene, screen, PointerFrame::default(), Vec::new(), |_, ui| {
+        host.frame(&model, &mut scene, screen, FrameInput::default(), |_, ui| {
             let id = WidgetId::ROOT.child("ws-roundtrip");
             let state: &mut MyState = ui.widget_state(id);
             assert_eq!(state.count, 2);
@@ -318,7 +357,7 @@ mod tests {
             primary_just_released: false,
             primary_pressed: false,
         };
-        let edits = host.frame(&model, &mut scene, screen, pointer_hover, Vec::new(), |_, ui| {
+        let edits = host.frame(&model, &mut scene, screen, FrameInput { pointer: pointer_hover, ..Default::default() }, |_, ui| {
             ui.button_at("test", "click me", rect, || {
                 Edit::mutate(|m: &mut Counter| m.count += 1)
             });
@@ -335,7 +374,7 @@ mod tests {
             primary_just_released: true,
             primary_pressed: false,
         };
-        let edits = host.frame(&model, &mut scene, screen, pointer_click, Vec::new(), |_, ui| {
+        let edits = host.frame(&model, &mut scene, screen, FrameInput { pointer: pointer_click, ..Default::default() }, |_, ui| {
             ui.button_at("test", "click me", rect, || {
                 Edit::mutate(|m: &mut Counter| m.count += 1)
             });
@@ -368,7 +407,7 @@ mod tests {
                       model: &Counter,
                       pointer: PointerFrame|
          -> Vec<Edit<Counter>> {
-            host.frame(model, scene, screen, pointer, Vec::new(), |_, ui| {
+            host.frame(model, scene, screen, FrameInput { pointer, ..Default::default() }, |_, ui| {
                 ui.button_at("test", "click me", rect, || {
                     Edit::mutate(|m: &mut Counter| m.count += 1)
                 });
@@ -432,7 +471,7 @@ mod tests {
         let id = WidgetId::ROOT.child("focus-target");
 
         // Frame 1: set_focus を呼ぶと **同フレーム内で** is_focused = true になる。
-        host.frame(&(), &mut scene, screen, PointerFrame::default(), Vec::new(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
             assert!(!ui.is_focused(id));
             ui.set_focus(id);
             assert!(ui.is_focused(id), "set_focus 後は同フレームで is_focused = true");
@@ -440,7 +479,7 @@ mod tests {
         assert_eq!(host.focused_widget(), Some(id));
 
         // Frame 2: 何もしないが focus は維持。
-        host.frame(&(), &mut scene, screen, PointerFrame::default(), Vec::new(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
             assert!(ui.is_focused(id));
         });
         assert_eq!(host.focused_widget(), Some(id));
@@ -457,7 +496,7 @@ mod tests {
         let id = WidgetId::ROOT.child("focus-target");
 
         // Frame 1: フォーカスを取る。
-        host.frame(&(), &mut scene, screen, PointerFrame::default(), Vec::new(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
             ui.set_focus(id);
         });
         assert_eq!(host.focused_widget(), Some(id));
@@ -469,7 +508,7 @@ mod tests {
             primary_just_released: true,
             primary_pressed: false,
         };
-        host.frame(&(), &mut scene, screen, click, Vec::new(), |_, _ui| {
+        host.frame(&(), &mut scene, screen, FrameInput { pointer: click, ..Default::default() }, |_, _ui| {
             // 誰も set_focus / clear_focus を呼ばない。
         });
         assert_eq!(
@@ -487,7 +526,7 @@ mod tests {
         let screen = PhysicalSize { width: 200, height: 100 };
         let id = WidgetId::ROOT.child("focus-target");
 
-        host.frame(&(), &mut scene, screen, PointerFrame::default(), Vec::new(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
             ui.set_focus(id);
         });
         assert_eq!(host.focused_widget(), Some(id));
@@ -497,7 +536,7 @@ mod tests {
             primary_just_released: true,
             ..PointerFrame::default()
         };
-        host.frame(&(), &mut scene, screen, click, Vec::new(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput { pointer: click, ..Default::default() }, |_, ui| {
             // クリックフレームで widget が再度 set_focus を呼ぶ (text_input が再クリックされたケース)。
             ui.set_focus(id);
         });
@@ -527,7 +566,7 @@ mod tests {
             primary_just_released: true,
             primary_pressed: false,
         };
-        let edits = host.frame(&model, &mut scene, screen, click, Vec::new(), |_, ui| {
+        let edits = host.frame(&model, &mut scene, screen, FrameInput { pointer: click, ..Default::default() }, |_, ui| {
             ui.text_input_at("ti", rect, "", |new| {
                 Edit::mutate(|m: &mut Doc| m.text = new)
             });
@@ -542,7 +581,7 @@ mod tests {
             physical_key: PhysicalKey::Other(0x41),
         }];
         let edits = host.frame(
-            &model, &mut scene, screen, PointerFrame::default(), keys,
+            &model, &mut scene, screen, FrameInput { keyboard: keys, ..Default::default() },
             |m, ui| {
                 ui.text_input_at("ti", rect, &m.text, |new| {
                     Edit::mutate(|m: &mut Doc| m.text = new)
@@ -559,7 +598,7 @@ mod tests {
             physical_key: PhysicalKey::Backspace,
         }];
         let edits = host.frame(
-            &model, &mut scene, screen, PointerFrame::default(), keys,
+            &model, &mut scene, screen, FrameInput { keyboard: keys, ..Default::default() },
             |m, ui| {
                 ui.text_input_at("ti", rect, &m.text, |new| {
                     Edit::mutate(|m: &mut Doc| m.text = new)
@@ -568,6 +607,114 @@ mod tests {
         );
         for e in edits { e.apply(&mut model); }
         assert_eq!(model.text, "");
+    }
+
+    /// IME preedit イベントは focused text_input に届き、state.preedit に反映される
+    /// (model の text には反映されない)。Commit イベントは cursor 位置に挿入し
+    /// preedit をクリアして Edit を発行する。
+    #[test]
+    fn text_input_ime_preedit_then_commit() {
+        use crate::input::ImeEvent;
+        use daw_ui_platform::PhysicalSize as PS;
+
+        struct Doc {
+            text: String,
+        }
+
+        let mut host: UiHost<Doc> = UiHost::new();
+        let mut scene = Scene::new();
+        let mut model = Doc { text: String::new() };
+        let screen = PS { width: 200, height: 100 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 200.0, h: 28.0 };
+
+        // Frame 1: click で focus 取得。
+        let click = PointerFrame {
+            pos: Some((50.0, 14.0)),
+            primary_just_pressed: true,
+            primary_just_released: true,
+            primary_pressed: false,
+        };
+        let edits = host.frame(
+            &model,
+            &mut scene,
+            screen,
+            FrameInput { pointer: click, ..Default::default() },
+            |_, ui| {
+                ui.text_input_at("ti", rect, "", |new| {
+                    Edit::mutate(|m: &mut Doc| m.text = new)
+                });
+            },
+        );
+        for e in edits { e.apply(&mut model); }
+        assert_eq!(model.text, "");
+
+        // Frame 2: preedit 「あ」が来る。model は変わらず、内部 state にだけ反映。
+        let edits = host.frame(
+            &model,
+            &mut scene,
+            screen,
+            FrameInput {
+                ime: vec![ImeEvent::Preedit { text: "あ".to_string(), cursor: None }],
+                ..Default::default()
+            },
+            |m, ui| {
+                ui.text_input_at("ti", rect, &m.text, |new| {
+                    Edit::mutate(|m: &mut Doc| m.text = new)
+                });
+            },
+        );
+        for e in edits { e.apply(&mut model); }
+        assert_eq!(model.text, "", "preedit 中は model に反映しない");
+
+        // Frame 3: commit 「あ」が来る。model に確定挿入され、preedit はクリア。
+        let edits = host.frame(
+            &model,
+            &mut scene,
+            screen,
+            FrameInput {
+                ime: vec![ImeEvent::Commit("あ".to_string())],
+                ..Default::default()
+            },
+            |m, ui| {
+                ui.text_input_at("ti", rect, &m.text, |new| {
+                    Edit::mutate(|m: &mut Doc| m.text = new)
+                });
+            },
+        );
+        for e in edits { e.apply(&mut model); }
+        assert_eq!(model.text, "あ", "commit で model.text に挿入される");
+    }
+
+    /// IME イベントは focused widget にだけ届き、focused でない widget は空を受け取る。
+    #[test]
+    fn ime_events_delivered_only_to_focused() {
+        use crate::input::ImeEvent;
+
+        let mut host: UiHost<()> = UiHost::new();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let id_a = WidgetId::ROOT.child("a");
+        let id_b = WidgetId::ROOT.child("b");
+
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+            ui.set_focus(id_a);
+        });
+
+        let ime = vec![ImeEvent::Commit("z".to_string())];
+        host.frame(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput { ime, ..Default::default() },
+            |_, ui| {
+                let b_ime = ui.take_ime_events_if_focused(id_b);
+                assert_eq!(b_ime.len(), 0);
+                let a_ime = ui.take_ime_events_if_focused(id_a);
+                assert_eq!(a_ime.len(), 1);
+                let a_ime2 = ui.take_ime_events_if_focused(id_a);
+                assert_eq!(a_ime2.len(), 0, "drain 後は空");
+            },
+        );
     }
 
     /// キー入力イベントは focused widget だけに届き、他の widget には空が返る。
@@ -582,7 +729,7 @@ mod tests {
         let id_b = WidgetId::ROOT.child("b");
 
         // a にフォーカスを置く。
-        host.frame(&(), &mut scene, screen, PointerFrame::default(), Vec::new(), |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
             ui.set_focus(id_a);
         });
 
@@ -592,7 +739,7 @@ mod tests {
             text: Some("x".to_string()),
             physical_key: PhysicalKey::Other(0),
         }];
-        host.frame(&(), &mut scene, screen, PointerFrame::default(), keys, |_, ui| {
+        host.frame(&(), &mut scene, screen, FrameInput { keyboard: keys, ..Default::default() }, |_, ui| {
             // b で先に呼んでも空 (フォーカスが a)。
             let b_keys = ui.take_keyboard_events_if_focused(id_b);
             assert_eq!(b_keys.len(), 0);

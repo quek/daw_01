@@ -36,8 +36,7 @@ fn main() {
         &model,
         &mut scene,
         PhysicalSize { width: 800, height: 600 },
-        PointerFrame::default(),
-        Vec::new(),
+        daw_ui_core::FrameInput::default(),
         |m, ui| {
             ui.label("title", &m.label);
             ui.button("inc", "increment", || {

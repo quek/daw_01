@@ -8,7 +8,7 @@ use raw_window_handle::{
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition as WinitPhysPos, PhysicalSize as WinitPhysSize};
-use winit::event::{ElementState as WinitElemState, MouseButton as WinitMouseBtn, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState as WinitElemState, Ime as WinitIme, MouseButton as WinitMouseBtn, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey as WinitPhysKey};
 use winit::window::{CursorIcon as WinitCursor, Window, WindowAttributes, WindowId};
@@ -61,8 +61,18 @@ impl WindowBackend for WinitWindow {
         self.inner.set_cursor(map_cursor(cursor));
     }
 
-    fn set_ime_position(&self, _x: f64, _y: f64) {
-        // M1 では no-op。後で Cursor area を winit::Window::set_ime_cursor_area で設定する。
+    fn set_ime_allowed(&self, allowed: bool) {
+        self.inner.set_ime_allowed(allowed);
+    }
+
+    fn set_ime_cursor_area(&self, x: f64, y: f64, w: f64, h: f64) {
+        use winit::dpi::PhysicalPosition as WinitPos;
+        use winit::dpi::PhysicalSize as WinitSize;
+        // 物理ピクセルで指定 (winit が IME に渡してくれる)。
+        self.inner.set_ime_cursor_area(
+            WinitPos::new(x, y),
+            WinitSize::new(w.max(1.0), h.max(1.0)),
+        );
     }
 
     fn set_title(&self, title: &str) {
@@ -166,6 +176,17 @@ impl<H: AppHost, F: FnOnce(WinitWindow) -> H> ApplicationHandler for WinitRunner
                 host.on_event(AppEvent::Scroll(d));
             }
             WindowEvent::Focused(f) => host.on_event(AppEvent::Focus(f)),
+            WindowEvent::Ime(ime) => match ime {
+                WinitIme::Preedit(text, cursor) => {
+                    host.on_event(AppEvent::ImePreedit { text, cursor });
+                }
+                WinitIme::Commit(text) => {
+                    host.on_event(AppEvent::ImeCommit(text));
+                }
+                // Enabled / Disabled は set_ime_allowed の応答でしかなく、ライブラリでは
+                // 状態遷移を別途管理しているのでここで利用者に通知する必要はない。
+                WinitIme::Enabled | WinitIme::Disabled => {}
+            },
             WindowEvent::KeyboardInput { event, .. } => {
                 let key = KeyEvent {
                     state: map_state(event.state),

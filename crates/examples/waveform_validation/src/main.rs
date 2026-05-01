@@ -241,8 +241,9 @@ impl App {
     fn build_ui(&mut self) {
         self.scene.clear();
         let screen = self.renderer.size();
-        let pointer = self.input.take_frame();
-        let keyboard = self.input.take_keyboard_events();
+        let input = self.input.take_input();
+        // pointer 値はドラッグ判定で使うので残すが、他は input にまとめる。
+        let pointer = input.pointer;
 
         // 1. drag panning (grid 全域がドラッグ対象)
         let area = waveform_area(screen);
@@ -285,8 +286,7 @@ impl App {
             &self.model,
             &mut self.scene,
             screen,
-            pointer,
-            keyboard,
+            input,
             |m, ui| {
                 // タイトル + view 情報
                 ui.label_at(

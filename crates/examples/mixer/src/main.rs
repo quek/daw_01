@@ -54,6 +54,9 @@ struct App {
     input: InputAccumulator,
     /// 直近に OS ウィンドウへ反映した title。Model.title と差分を見て set_title を呼ぶ。
     last_window_title: String,
+    /// 直前フレームで IME を有効化していたか。`UiHost::ime_request()` の Some/None
+    /// 切替で OS への `set_ime_allowed` を最小限に呼ぶための差分管理。
+    ime_enabled: bool,
     /// 起動からの経過フレーム数 (デバッグ用)。
     frames: u64,
 }
@@ -76,6 +79,7 @@ impl App {
             scene,
             input,
             last_window_title,
+            ime_enabled: false,
             frames: 0,
         }
     }
@@ -88,8 +92,7 @@ impl App {
     fn build_ui(&mut self) -> bool {
         self.scene.clear();
         let screen = self.renderer.size();
-        let pointer = self.input.take_frame();
-        let keyboard = self.input.take_keyboard_events();
+        let input = self.input.take_input();
 
         // 1 万矩形ベンチ: bench_active なら 100x100 グリッドを背景に積む
         if self.model.bench_active {
@@ -121,8 +124,7 @@ impl App {
             &self.model,
             &mut self.scene,
             screen,
-            pointer,
-            keyboard,
+            input,
             |m, ui| {
                 // タイトル編集 (M3 Phase 4b: text_input)。
                 ui.label("title_lbl", "タイトル (クリックで編集):");
@@ -305,7 +307,9 @@ impl AppHost for App {
             AppEvent::PointerMoved(_)
             | AppEvent::PointerInput { .. }
             | AppEvent::Scroll(_)
-            | AppEvent::Keyboard(_) => {
+            | AppEvent::Keyboard(_)
+            | AppEvent::ImePreedit { .. }
+            | AppEvent::ImeCommit(_) => {
                 self.window.request_redraw();
             }
             _ => {}
@@ -322,6 +326,29 @@ impl AppHost for App {
         if self.model.title != self.last_window_title {
             self.window.set_title(&self.model.title);
             self.last_window_title = self.model.title.clone();
+        }
+        // IME 有効/無効と候補ウィンドウ位置を差分で OS に伝える。
+        match (self.ime_enabled, self.ui.ime_request()) {
+            (false, Some(area)) => {
+                self.window.set_ime_allowed(true);
+                self.window.set_ime_cursor_area(
+                    f64::from(area.x), f64::from(area.y),
+                    f64::from(area.w), f64::from(area.h),
+                );
+                self.ime_enabled = true;
+            }
+            (true, Some(area)) => {
+                // 位置だけ追従。
+                self.window.set_ime_cursor_area(
+                    f64::from(area.x), f64::from(area.y),
+                    f64::from(area.w), f64::from(area.h),
+                );
+            }
+            (true, None) => {
+                self.window.set_ime_allowed(false);
+                self.ime_enabled = false;
+            }
+            (false, None) => {}
         }
         // edits や focus 変化が出たら次フレームで適用後 Model / focus 状態を描き直す。
         if had_edits || self.ui.focus_changed_in_last_frame() {

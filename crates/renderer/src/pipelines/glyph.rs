@@ -5,10 +5,16 @@
 
 use daw_ui_platform::PhysicalSize;
 use glyphon::{
-    Attrs, Buffer, Cache, Color as GlyphColor, FontSystem, Metrics, Resolution, Shaping,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    Attrs, Buffer, Cache, Color as GlyphColor, Family, FontSystem, Metrics, Resolution,
+    Shaping, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use wgpu::MultisampleState;
+
+/// 既定で使うフォント family。固定幅 (CJK は ASCII の 2 倍) なので、
+/// `text_input` などの cursor / 下線位置を ASCII=font_size/2、CJK=font_size の
+/// 単純な近似で正しく出せる。インストールされていない環境では glyphon の
+/// fallback (システムデフォルト) に倒れる。
+const DEFAULT_FONT_FAMILY: &str = "HackGen Console NF";
 
 use crate::scene::GlyphArea;
 
@@ -82,7 +88,8 @@ impl GlyphPipeline {
                 Some(screen.width as f32),
                 Some(screen.height as f32),
             );
-            buffer.set_text(&mut self.font_system, &area.text, &Attrs::new(), Shaping::Advanced, None);
+            let attrs = Attrs::new().family(Family::Name(DEFAULT_FONT_FAMILY));
+            buffer.set_text(&mut self.font_system, &area.text, &attrs, Shaping::Advanced, None);
             buffer.shape_until_scroll(&mut self.font_system, false);
             self.buffers.push(buffer);
         }

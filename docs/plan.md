@@ -257,21 +257,43 @@ F:\dev\gui_01\
 | `examples/mixer` に title 編集 text_input。OS ウィンドウタイトルも `last_window_title` 差分で追従 | ✅ | (本コミット) |
 | `trybuild` / 単体テスト 1 本 (click → focus → typing で text 変化) | ✅ | (本コミット) |
 
-**残作業 (Phase 4c)**:
+**Phase 4c 進捗 (2026-05-01)** — IME 統合:
 
-- IME 統合: `AppEvent::ImePreedit` / `ImeCommit` を focused widget へ流す
-- `WindowBackend::set_ime_position` を winit `set_ime_cursor_area` で実装、preedit 表示
-- text_input の preedit 描画 (下線 + テンポラリ表示) と committed text の差分 apply
-- キーボード focus トラッキング (`UiHost` に focused widget) + `AppEvent::Keyboard` を focused widget へルーティング
-- IME 候補位置の `WindowBackend::set_ime_position()` 実装 (winit `set_ime_cursor_area` を使う)
+| 成果物 | 状態 | コミット |
+|---|---|---|
+| `AppEvent::ImePreedit` / `ImeCommit` を `InputAccumulator` で蓄積、`ImeEvent` enum で UI 層へ | ✅ | (本コミット) |
+| `FrameInput { pointer, keyboard, ime }` で UI 入力を一括化 (`InputAccumulator::take_input()`) | ✅ | (本コミット) |
+| `Ui::take_ime_events_if_focused` / `Ui::request_ime` で focused widget が IME 候補位置を要求 | ✅ | (本コミット) |
+| `UiHost::ime_request()` getter で App が候補位置を取得 | ✅ | (本コミット) |
+| `WindowBackend::set_ime_allowed` / `set_ime_cursor_area` を winit_backend で実装 | ✅ | (本コミット) |
+| `winit::WindowEvent::Ime` → `AppEvent::ImePreedit` / `ImeCommit` のマッピング | ✅ | (本コミット) |
+| `text_input` が preedit を `state.preedit` に保持 + 描画、commit で working に挿入 | ✅ | (本コミット) |
+| `text_input` が cursor 位置を `request_ime` で渡し、IME 候補ウィンドウが追従 | ✅ | (本コミット) |
+| mixer App が `ime_request` の Some/None 切替を `set_ime_allowed` 差分で OS に伝達 | ✅ | (本コミット) |
+| 単体テスト追加 (ime_events_delivered_only_to_focused / text_input_ime_preedit_then_commit) | ✅ | (本コミット) |
+
+**残作業 (M3 残)**:
+
 - `LayoutPass` 拡張: padding / gap / fixed size / proportional growth
 - `examples/mixer` を 8ch (8 fader + 8 pan knob + 8 mute checkbox) に拡張
-- **trybuild 検証拡張**: checkbox / text_input も non-Clone Model でコンパイルすることを固定
 - 微調整: fader / knob の感度カーブ、見た目 (背景パネル、影、目盛り)
+- **text_input polish**: cursor / preedit 下線 / IME 候補位置の pixel-perfect 化。
+  現状は `HackGen Console NF` 固定幅前提の近似 (ASCII=7 / CJK=14)。`cosmic-text` の
+  `Buffer::layout_runs()` で実 measure を行い、preedit を別色 (yellow) で描き直すこと、
+  proportional フォントでも正しく動かすこと、を別フェーズで対応する。
+  ui crate から renderer の `FontSystem` にアクセスする経路を整える必要がある (Arc 共有 /
+  measure trait 公開 / 別 FontSystem を持つ、のいずれか)。
 - **DAW 標準の値編集挙動 (fader / knob 共通)**:
   - **ダブルクリックでデフォルト値に戻る**: `fader_at` / `knob_at` に `default_value: f32` を追加。state に `last_click_time` を持たせ、~300ms × 数 px 以内の 2 回目クリックを検出 → `on_change(default_value)` 発行。
   - **Ctrl + ドラッグで高精度 (感度 1/10)**: `InputAccumulator` を拡張し modifier state (Ctrl/Shift/Alt) を track、`PointerFrame` に modifier フィールドを足す。fader/knob の drag 計算で `if pointer.ctrl { dv *= 0.1 }` で抑制。
   - 将来 text_input の数値編集 (ドラッグで増減) や knob のホイール調整にも同じ modifier 機構が乗る。
+- **`rtry` のまぜ書き入力対応**: `rtry` (別プロジェクト) のまぜ書き (mazegaki) 入力プロトコル
+  に合わせた API を text_input に足す。preedit 区切りや候補編集の細かい制御が必要に
+  なる見込み。`rtry` 側の入力プロトコルが固まってから設計。
+- **GetText i18n 対応**: label / button / text_input 等の文字列を翻訳するための仕組み。
+  `tr!("...")` 風マクロ + catalog 引きの API を別途設計。アプリ側 (例えば mixer) で
+  ロケール切替を実演する。実装はサードパーティ crate (`gettext-rs` / `fluent` 等) との
+  統合検討から。
 
 ### M4 (内部 scenegraph + 差分検出) — 旧 M3
 
@@ -635,4 +657,5 @@ ui.heavy("track_0_clips", |hctx| {
 - 2026-05-01: **M3 Phase 2** — knob (円形ノブ、line strip でインジケータ、上下ドラッグで値編集)。fader と同じドラッグパターン + 既存 rect (4 隅角丸 = 円) と line strip パイプラインの組み合わせで実装、新パイプライン不要。`examples/mixer` で 3 ch pan ノブとして動作確認。
 - 2026-05-01: **M3 Phase 3** — checkbox (bool toggle、button と同じ armed-state モデル、line strip で V 字チェックマーク)。`examples/mixer` で 3 ch mute トグルとして動作確認。
 - 2026-05-01: **M3 Phase 4a** — keyboard / focus 基盤。`InputAccumulator` が KeyEvent 蓄積、`UiHost::focused` でキーボードフォーカス保持、`Ui::set_focus` / `clear_focus_if_focused` / `is_focused` / `take_keyboard_events_if_focused`。クリックで誰も `set_focus` しなければ blur。`UiHost::frame` シグネチャに `keyboard: Vec<KeyEvent>` 追加 (既存 callers 全部追従)。単体テスト 4 本追加。これで text_input (4b) を載せる土台が揃った。
-- 2026-05-01: **M3 Phase 4b** — text_input (ASCII 編集)。char 挿入 / Backspace / Arrow / Enter / Escape をサポート。`is_focused` を `pending_focus` チェックに変更して set_focus が同フレームで即時反映、widget は外側 press で自己 blur することで枠線切替の lag を 0 に。`UiHost::focus_changed_in_last_frame()` getter を追加し、アプリ側は had_edits と同様に request_redraw を呼べる。`examples/mixer` で title 編集 + OS ウィンドウタイトル追従を実装。単体テスト 1 本追加 (click → focus → typing で text 変化)。IME (Phase 4c) は次。
+- 2026-05-01: **M3 Phase 4b** — text_input (ASCII 編集)。Ui::text_input_at / text_input、TextInputState (cursor_byte + armed-state click)、char 挿入 / Backspace / 矢印 / Enter / Escape。is_focused を pending_focus ベースに変更して same-frame の click→focus を即時反映、外側 press で widget が自己 blur することで枠線解除も即時。UiHost に focus_changed_in_last_frame() を追加してアプリ側の追加 redraw 用。mixer の title を編集可能化 + OS タイトル追従 (last_window_title 差分)。単体テスト追加。
+- 2026-05-01: **M3 Phase 4c** — IME 統合 (基本)。InputAccumulator が ImePreedit / ImeCommit を蓄積、FrameInput で pointer/keyboard/ime をまとめて Ui::frame へ。Ui::take_ime_events_if_focused + Ui::request_ime、UiHost::ime_request()。WindowBackend::set_ime_allowed / set_ime_cursor_area を winit_backend で実装、winit の WindowEvent::Ime → AppEvent::ImePreedit/ImeCommit マッピングも winit_backend 側で完了。text_input が preedit を state に保持して描画 + cursor 位置で IME 候補ウィンドウを要求。mixer App は ime_request の Some/None 切替で OS への set_ime_allowed を差分で呼ぶ。単体テスト 2 本追加 (IME-only-to-focused / preedit-then-commit)。フォントを **HackGen Console NF (固定幅)** に切り替え、全テキスト (prefix + preedit + suffix) を 1 つの GlyphArea で描画して並びを正確化。pixel-perfect な cursor / 下線 / IME 候補位置と preedit 色分け復活は cosmic-text の measure 統合 (別フェーズ) で対応予定。`rtry` のまぜ書き入力対応 / GetText i18n 対応も TODO に明記。これで M3 の入力周り (focus / 通常キー / IME 基本) は機能しており、残りは LayoutPass 拡張・8ch mixer 拡張・上記 polish。

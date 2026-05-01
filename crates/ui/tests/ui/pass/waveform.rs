@@ -43,8 +43,7 @@ fn main() {
         &model,
         &mut scene,
         screen,
-        PointerFrame::default(),
-        Vec::new(),
+        daw_ui_core::FrameInput::default(),
         |m, ui| {
             // Mono: 1ch スライスを直接借用
             let _ = ui.waveform(

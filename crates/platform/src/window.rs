@@ -41,8 +41,13 @@ pub trait WindowBackend: HasWindowHandle + HasDisplayHandle {
     /// マウスカーソル形状を変更。
     fn set_cursor(&self, cursor: CursorIcon);
 
-    /// IME 候補ウィンドウの位置をヒント。M1 では no-op 実装で良い。
-    fn set_ime_position(&self, x: f64, y: f64);
+    /// IME (input method editor) を有効化/無効化する。
+    /// text_input が focus を取ったとき `true`、focus を失ったとき `false` を呼ぶ想定。
+    fn set_ime_allowed(&self, allowed: bool);
+
+    /// IME 候補ウィンドウを表示すべき領域 (物理ピクセル) を OS にヒントする。
+    /// 一般には text_input の cursor 直下の小さな rect を渡す。
+    fn set_ime_cursor_area(&self, x: f64, y: f64, w: f64, h: f64);
 
     /// ウィンドウタイトル更新。
     fn set_title(&self, title: &str);
