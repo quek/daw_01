@@ -1,26 +1,40 @@
-//! 内部 scenegraph データ構造 (M4 Phase 10 で導入)。
+//! 内部 scenegraph データ構造 (M4 Phase 10-11)。
 //!
-//! Phase 11 以降で `Ui::with_widget_node` API から書き込まれ、widget の
-//! visual inputs を hash した値の前フレーム比較に使う。一致時は描画スキップ可。
+//! Phase 10: `Scenegraph` / `SceneNode` / `record` / `unchanged` の API を導入。
+//! Phase 11: `SceneNode` に描画コマンドキャッシュを乗せ、`get_cached` で取り出せるように。
+//! Phase 11: `Ui::with_widget_node(wid, input_hash, draw_fn)` API がこれを利用する。
 //!
-//! Phase 10 では型と HashMap 操作 API のみ。各 widget からの利用は Phase 11 で追加。
+//! `slotmap::SlotMap<NodeId, SceneNode>` の代わりに `HashMap<WidgetId, _>` を使う。
+//! `WidgetId` 自体が `Eq + Hash` を備えた安定キーなので世代管理が不要。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+use daw_ui_renderer::{GlyphArea, LineBatch, RectCommand};
 
 use crate::id::WidgetId;
 
-/// per-widget の前フレーム情報。Phase 11 以降で描画コマンド列を追加する想定。
-#[derive(Debug, Clone, Copy)]
+/// per-widget の前フレーム描画コマンド。`Ui::with_widget_node` がキャッシュ命中時に
+/// scene へ append する素材。
+#[derive(Debug, Clone, Default)]
+pub struct CachedCommands {
+    pub rects: Vec<RectCommand>,
+    pub glyph_areas: Vec<GlyphArea>,
+    pub line_batches: Vec<LineBatch>,
+}
+
+/// per-widget の前フレーム情報。input_hash 一致 = 描画変化なし = `commands` を再利用可。
+#[derive(Debug, Clone)]
 pub struct SceneNode {
     /// widget の visual inputs を hash した値。
-    /// 前フレームの hash と一致 = 描画内容が同一 = キャッシュ再利用可。
     pub input_hash: u64,
+    /// 前フレームに記録した描画コマンド。
+    pub commands: CachedCommands,
 }
 
 /// widget ID をキーに前フレームの per-widget 状態を保持する。
-///
-/// `slotmap::SlotMap<NodeId, SceneNode>` の代わりに `HashMap<WidgetId, _>` を使う。
-/// `WidgetId` 自体が `Eq + Hash` を備えた安定キーなので世代管理が不要。
 #[derive(Debug, Default)]
 pub struct Scenegraph {
     nodes: HashMap<WidgetId, SceneNode>,
@@ -36,13 +50,21 @@ impl Scenegraph {
         self.nodes.get(&wid).is_some_and(|n| n.input_hash == hash)
     }
 
-    /// 今フレームの hash を記録 (次フレームで `unchanged` が一致を返せるように)。
-    pub fn record(&mut self, wid: WidgetId, hash: u64) {
-        self.nodes.insert(wid, SceneNode { input_hash: hash });
+    /// hash 一致時の cached commands を返す。一致しないか未登録なら None。
+    pub fn get_cached(&self, wid: WidgetId, input_hash: u64) -> Option<&CachedCommands> {
+        self.nodes
+            .get(&wid)
+            .filter(|n| n.input_hash == input_hash)
+            .map(|n| &n.commands)
+    }
+
+    /// 今フレームの hash と描画コマンドを記録 (次フレームで `unchanged` / `get_cached` が使う)。
+    pub fn record(&mut self, wid: WidgetId, input_hash: u64, commands: CachedCommands) {
+        self.nodes.insert(wid, SceneNode { input_hash, commands });
     }
 
     /// このフレームで `seen` に含まれない widget を eviction。
-    /// Phase 11 で `Ui::frame` 末尾から呼ぶ。
+    /// `Ui::frame` 末尾から呼ぶ。
     pub fn retain(&mut self, seen: &HashSet<WidgetId>) {
         self.nodes.retain(|wid, _| seen.contains(wid));
     }
@@ -54,6 +76,15 @@ impl Scenegraph {
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
+}
+
+/// 任意の `Hash` 入力を `u64` ハッシュにする共通ヘルパ。各 widget の
+/// `input_hash` 計算で使う。`(b"fader", rect.x.to_bits(), ...)` のような tuple を
+/// 渡す形を想定。
+pub fn hash_inputs<T: Hash>(inputs: T) -> u64 {
+    let mut h = DefaultHasher::new();
+    inputs.hash(&mut h);
+    h.finish()
 }
 
 #[cfg(test)]
@@ -68,7 +99,7 @@ mod tests {
     fn record_then_unchanged_returns_true_for_same_hash() {
         let mut sg = Scenegraph::new();
         let id = wid(1);
-        sg.record(id, 0xABCD);
+        sg.record(id, 0xABCD, CachedCommands::default());
         assert!(sg.unchanged(id, 0xABCD));
     }
 
@@ -76,7 +107,7 @@ mod tests {
     fn unchanged_returns_false_for_different_hash() {
         let mut sg = Scenegraph::new();
         let id = wid(1);
-        sg.record(id, 0xABCD);
+        sg.record(id, 0xABCD, CachedCommands::default());
         assert!(!sg.unchanged(id, 0xBEEF));
     }
 
@@ -90,8 +121,8 @@ mod tests {
     fn record_overwrites_existing() {
         let mut sg = Scenegraph::new();
         let id = wid(1);
-        sg.record(id, 0xAAAA);
-        sg.record(id, 0xBBBB);
+        sg.record(id, 0xAAAA, CachedCommands::default());
+        sg.record(id, 0xBBBB, CachedCommands::default());
         assert!(sg.unchanged(id, 0xBBBB));
         assert!(!sg.unchanged(id, 0xAAAA));
         assert_eq!(sg.len(), 1);
@@ -103,9 +134,9 @@ mod tests {
         let a = wid(1);
         let b = wid(2);
         let c = wid(3);
-        sg.record(a, 0);
-        sg.record(b, 0);
-        sg.record(c, 0);
+        sg.record(a, 0, CachedCommands::default());
+        sg.record(b, 0, CachedCommands::default());
+        sg.record(c, 0, CachedCommands::default());
         assert_eq!(sg.len(), 3);
 
         let mut seen = HashSet::new();
@@ -117,5 +148,24 @@ mod tests {
         assert!(sg.unchanged(a, 0));
         assert!(!sg.unchanged(b, 0));
         assert!(sg.unchanged(c, 0));
+    }
+
+    #[test]
+    fn get_cached_returns_commands_when_hash_matches() {
+        let mut sg = Scenegraph::new();
+        let id = wid(1);
+        let cmds = CachedCommands::default();
+        sg.record(id, 0xABCD, cmds.clone());
+        assert!(sg.get_cached(id, 0xABCD).is_some());
+        assert!(sg.get_cached(id, 0xBEEF).is_none());
+    }
+
+    #[test]
+    fn hash_inputs_is_deterministic() {
+        let a = hash_inputs((b"fader", 1u32, 2.5f32.to_bits(), true));
+        let b = hash_inputs((b"fader", 1u32, 2.5f32.to_bits(), true));
+        assert_eq!(a, b);
+        let c = hash_inputs((b"fader", 1u32, 2.5f32.to_bits(), false));
+        assert_ne!(a, c);
     }
 }

@@ -17,6 +17,7 @@ use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
+use crate::scenegraph::hash_inputs;
 use crate::ui::{Ui, hovered};
 
 const TRACK_PAD: f32 = 8.0;
@@ -171,8 +172,23 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             value
         };
 
-        // 描画。track + thumb。
-        draw_fader(self, rect, displayed_value, drag_anchor.is_some(), pointer);
+        // 描画。track + thumb。M4 Phase 11: with_widget_node で input_hash キャッシュ。
+        let dragging = drag_anchor.is_some();
+        let (_, thumb_hover_rect) = fader_geometry(rect, displayed_value);
+        let hovered_thumb = pointer.pos.is_some_and(|(px, py)| thumb_hover_rect.contains(px, py));
+        let input_hash = hash_inputs((
+            b"fader",
+            rect.x.to_bits(),
+            rect.y.to_bits(),
+            rect.w.to_bits(),
+            rect.h.to_bits(),
+            displayed_value.to_bits(),
+            dragging,
+            hovered_thumb,
+        ));
+        self.with_widget_node(wid, input_hash, |ui| {
+            draw_fader(ui, rect, displayed_value, dragging, pointer);
+        });
 
         // 値が変わっていれば Edit を発行。
         if (displayed_value - value).abs() > f32::EPSILON {

@@ -16,6 +16,7 @@ use daw_ui_renderer::{Color, GlyphArea, LineBatch, LineSegment, Rect, RectComman
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::input::ImeEvent;
+use crate::scenegraph::hash_inputs;
 use crate::ui::Ui;
 
 /// text_input の永続状態。
@@ -185,15 +186,30 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             (state.cursor_byte.min(text.len()), state.preedit.clone())
         };
 
-        // 描画。
-        draw_text_input(
-            self,
-            rect,
+        // 描画。M4 Phase 11: with_widget_node で input_hash キャッシュ。
+        // text / cursor / preedit / focused が同じなら描画スキップ可。
+        let input_hash = hash_inputs((
+            b"text_input",
+            rect.x.to_bits(),
+            rect.y.to_bits(),
+            rect.w.to_bits(),
+            rect.h.to_bits(),
             text,
+            cursor_byte_for_draw as u64,
+            preedit_for_draw.as_str(),
             was_focused,
-            cursor_byte_for_draw,
-            &preedit_for_draw,
-        );
+        ));
+        let preedit_str = preedit_for_draw.clone();
+        self.with_widget_node(wid, input_hash, |ui| {
+            draw_text_input(
+                ui,
+                rect,
+                text,
+                was_focused,
+                cursor_byte_for_draw,
+                &preedit_str,
+            );
+        });
 
         // フォーカス中なら IME 候補ウィンドウ位置を要求する (cursor 直下)。
         if was_focused {

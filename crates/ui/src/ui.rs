@@ -9,7 +9,7 @@
 //! for e in edits { e.apply(&mut model); }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
 use daw_ui_platform::{KeyEvent, PhysicalSize};
@@ -18,7 +18,7 @@ use daw_ui_renderer::{Color, GlyphArea, LineBatch, Rect, RectCommand, Scene};
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::input::{FrameInput, ImeEvent, PointerFrame};
-use crate::scenegraph::Scenegraph;
+use crate::scenegraph::{CachedCommands, Scenegraph};
 use crate::widgets::WidgetState;
 
 /// アプリが 1 つ持つ UI ホスト。フレーム間で UI 内部状態を保持する。
@@ -90,6 +90,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
         let mut ime_events = ime;
         let cursor = Rect::new(0.0, 0.0, screen.width as f32, screen.height as f32);
         let focused_at_start = self.focused;
+        let mut seen_widgets: HashSet<WidgetId> = HashSet::new();
         let mut ui = Ui {
             state: &mut self.state,
             scene,
@@ -104,6 +105,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
             pending_focus: focused_at_start,
             focus_changed_this_frame: false,
             ime_request: None,
+            scenegraph: &mut self.scenegraph,
+            seen_widgets: &mut seen_widgets,
             _m: PhantomData,
         };
         f(model, &mut ui);
@@ -120,6 +123,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
         self.focus_changed_in_last_frame = self.focused != prev_focused;
         // IME request の commit (フレーム内に request_ime が呼ばれていれば Some)。
         self.last_ime_request = ui.ime_request;
+        // M4 Phase 11: 今フレームに登場しなかった widget を scenegraph から eviction。
+        self.scenegraph.retain(&seen_widgets);
         edits
     }
 
@@ -165,6 +170,11 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// 同フレーム内に複数 widget が呼んだ場合は最後の呼び出しが勝つ
     /// (typical: focused widget だけが呼ぶ想定)。
     ime_request: Option<Rect>,
+    /// M4 Phase 11: per-widget の描画コマンドキャッシュ (UiHost が所有、frame 越しに保持)。
+    scenegraph: &'a mut Scenegraph,
+    /// M4 Phase 11: このフレームで `with_widget_node` 経由で描画された widget の集合。
+    /// frame 末尾で `scenegraph.retain(&seen_widgets)` を呼んで未登場 widget を eviction。
+    seen_widgets: &'a mut HashSet<WidgetId>,
     _m: PhantomData<&'a M>,
 }
 
@@ -195,6 +205,42 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 内部: ウィジェットがエディットを積む。
     pub(crate) fn push_edit(&mut self, edit: Edit<M>) {
         self.edits.push(edit);
+    }
+
+    /// M4 Phase 11: per-widget の描画を input_hash でキャッシュ付き実行する。
+    ///
+    /// `input_hash` が前フレームと一致 → `draw_fn` を実行せず、前フレームに記録した
+    /// 描画コマンドを scene へ append する。不一致 → `draw_fn` を実行して、scene 末尾の
+    /// 差分を新規 commands として記録する。
+    ///
+    /// `draw_fn` 内では `push_rect / push_text / push_lines` のみ呼ぶこと
+    /// (state 更新・Edit 発行は外側で完結させる)。
+    pub fn with_widget_node<F>(&mut self, wid: WidgetId, input_hash: u64, draw_fn: F)
+    where
+        F: FnOnce(&mut Self),
+    {
+        // フレーム末尾の eviction で「今フレームに登場した widget」として保持する。
+        self.seen_widgets.insert(wid);
+
+        // hash 一致 → cached commands を scene に append、draw_fn は実行しない。
+        if let Some(cached) = self.scenegraph.get_cached(wid, input_hash) {
+            self.scene.rects.extend_from_slice(&cached.rects);
+            self.scene.glyph_areas.extend(cached.glyph_areas.iter().cloned());
+            self.scene.line_batches.extend(cached.line_batches.iter().cloned());
+            return;
+        }
+
+        // miss → draw_fn を実行して scene 末尾の差分を新規 commands として記録。
+        let r0 = self.scene.rects.len();
+        let g0 = self.scene.glyph_areas.len();
+        let l0 = self.scene.line_batches.len();
+        draw_fn(self);
+        let commands = CachedCommands {
+            rects: self.scene.rects[r0..].to_vec(),
+            glyph_areas: self.scene.glyph_areas[g0..].to_vec(),
+            line_batches: self.scene.line_batches[l0..].to_vec(),
+        };
+        self.scenegraph.record(wid, input_hash, commands);
     }
 
     /// `wid` が現在キーボードフォーカスを持っているか。
@@ -755,5 +801,130 @@ mod tests {
             let a_keys2 = ui.take_keyboard_events_if_focused(id_a);
             assert_eq!(a_keys2.len(), 0);
         });
+    }
+
+    /// M4 Phase 11: 同じ wid + input_hash で 2 回呼ぶと、2 回目は draw_fn が実行されない
+    /// (キャッシュ命中で前フレームの commands が scene に append される)。
+    #[test]
+    fn with_widget_node_hit_skips_draw_fn() {
+        let mut host: UiHost<()> = UiHost::new();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let id = WidgetId::ROOT.child("cache-test");
+        let test_rect = Rect { x: 10.0, y: 20.0, w: 30.0, h: 40.0 };
+
+        // Frame 1: cache miss → draw_fn 実行、scene に rect が積まれる。
+        let calls_1 = std::cell::Cell::new(0_u32);
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+            ui.with_widget_node(id, 0xCAFE, |ui| {
+                calls_1.set(calls_1.get() + 1);
+                ui.push_rect(RectCommand {
+                    rect: test_rect,
+                    fill: Color::rgb(1.0, 0.0, 0.0),
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [0.0; 4],
+                });
+            });
+        });
+        assert_eq!(calls_1.get(), 1, "1 回目は draw_fn が実行される");
+        assert_eq!(scene.rects.len(), 1);
+
+        // Frame 2: 同じ wid + 同じ hash → cache hit、draw_fn は実行されない。
+        scene.clear();
+        let calls_2 = std::cell::Cell::new(0_u32);
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+            ui.with_widget_node(id, 0xCAFE, |ui| {
+                calls_2.set(calls_2.get() + 1);
+                ui.push_rect(RectCommand {
+                    rect: test_rect,
+                    fill: Color::rgb(1.0, 0.0, 0.0),
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [0.0; 4],
+                });
+            });
+        });
+        assert_eq!(calls_2.get(), 0, "2 回目は cache hit で draw_fn が実行されない");
+        // scene には cache 経由で同じ rect が積まれている。
+        assert_eq!(scene.rects.len(), 1);
+        assert_eq!(scene.rects[0].rect, test_rect);
+    }
+
+    /// M4 Phase 11: hash が変わると cache miss、draw_fn が再実行される。
+    #[test]
+    fn with_widget_node_miss_runs_draw_fn() {
+        let mut host: UiHost<()> = UiHost::new();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let id = WidgetId::ROOT.child("miss-test");
+
+        let calls_1 = std::cell::Cell::new(0_u32);
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+            ui.with_widget_node(id, 0xAAAA, |ui| {
+                calls_1.set(calls_1.get() + 1);
+                ui.push_rect(RectCommand {
+                    rect: Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 },
+                    fill: Color::rgb(1.0, 0.0, 0.0),
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [0.0; 4],
+                });
+            });
+        });
+
+        // Frame 2: 異なる hash → cache miss、draw_fn が再実行される。
+        scene.clear();
+        let calls_2 = std::cell::Cell::new(0_u32);
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+            ui.with_widget_node(id, 0xBBBB, |ui| {
+                calls_2.set(calls_2.get() + 1);
+                ui.push_rect(RectCommand {
+                    rect: Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 },
+                    fill: Color::rgb(0.0, 1.0, 0.0),
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [0.0; 4],
+                });
+            });
+        });
+        assert_eq!(calls_1.get(), 1);
+        assert_eq!(calls_2.get(), 1, "hash 変化で draw_fn が再実行される");
+    }
+
+    /// M4 Phase 11: 前フレームに登場した widget が次フレームで呼ばれなければ
+    /// scenegraph から eviction される。
+    #[test]
+    fn scenegraph_evicts_unseen_widgets() {
+        let mut host: UiHost<()> = UiHost::new();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let id_a = WidgetId::ROOT.child("evict-a");
+        let id_b = WidgetId::ROOT.child("evict-b");
+
+        // Frame 1: a と b 両方を wrap → scenegraph に 2 entry。
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+            ui.with_widget_node(id_a, 1, |_| {});
+            ui.with_widget_node(id_b, 2, |_| {});
+        });
+
+        // Frame 2: a だけ wrap → b は seen に入らないので eviction、a は残る。
+        // 同 hash で再呼び出し → cache hit、draw_fn 実行されない。
+        let a_calls = std::cell::Cell::new(0_u32);
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+            ui.with_widget_node(id_a, 1, |_| {
+                a_calls.set(a_calls.get() + 1);
+            });
+        });
+        assert_eq!(a_calls.get(), 0, "a は cache hit で draw_fn 不実行");
+
+        // Frame 3: b を再 wrap → 一度 eviction されているので cache miss、draw_fn が走る。
+        let b_calls = std::cell::Cell::new(0_u32);
+        host.frame(&(), &mut scene, screen, FrameInput::default(), |_, ui| {
+            ui.with_widget_node(id_b, 2, |_| {
+                b_calls.set(b_calls.get() + 1);
+            });
+        });
+        assert_eq!(b_calls.get(), 1, "b は eviction されたので cache miss、draw_fn が再実行");
     }
 }

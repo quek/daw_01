@@ -22,7 +22,7 @@ pub use edit::Edit;
 pub use id::WidgetId;
 pub use input::{FrameInput, ImeEvent, InputAccumulator, PointerFrame};
 pub use layout::{FlexDirection, Gap, LayoutPass, NodeId, Padding};
-pub use scenegraph::{SceneNode, Scenegraph};
+pub use scenegraph::{CachedCommands, SceneNode, Scenegraph, hash_inputs};
 pub use ui::{Ui, UiHost};
 pub use widgets::checkbox::CheckboxResponse;
 pub use widgets::fader::FaderResponse;

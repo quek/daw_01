@@ -12,6 +12,7 @@ use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
+use crate::scenegraph::hash_inputs;
 use crate::ui::{Ui, lerp_color};
 
 /// button の永続状態。
@@ -52,40 +53,54 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             (visual_pressed, click)
         };
 
-        let base = Color::rgb(0.18, 0.20, 0.26);
-        let hover = Color::rgb(0.24, 0.27, 0.34);
-        let press = Color::rgb(0.32, 0.55, 0.85);
+        // M4 Phase 11: 描画を with_widget_node で input_hash キャッシュ。
+        // input_hash の入力は visual に影響する: rect / text / inside / visual_pressed。
+        let input_hash = hash_inputs((
+            b"button",
+            rect.x.to_bits(),
+            rect.y.to_bits(),
+            rect.w.to_bits(),
+            rect.h.to_bits(),
+            text,
+            inside,
+            visual_pressed,
+        ));
+        self.with_widget_node(wid, input_hash, |ui| {
+            let base = Color::rgb(0.18, 0.20, 0.26);
+            let hover = Color::rgb(0.24, 0.27, 0.34);
+            let press = Color::rgb(0.32, 0.55, 0.85);
 
-        let fill = if visual_pressed {
-            press
-        } else if inside {
-            lerp_color(base, hover, 0.85)
-        } else {
-            base
-        };
+            let fill = if visual_pressed {
+                press
+            } else if inside {
+                lerp_color(base, hover, 0.85)
+            } else {
+                base
+            };
 
-        self.push_rect(RectCommand {
-            rect,
-            fill,
-            border: Color::rgb(0.35, 0.38, 0.45),
-            border_width: 1.0,
-            radius: [6.0; 4],
-        });
+            ui.push_rect(RectCommand {
+                rect,
+                fill,
+                border: Color::rgb(0.35, 0.38, 0.45),
+                border_width: 1.0,
+                radius: [6.0; 4],
+            });
 
-        // テキストを矩形中央付近に
-        let font_size = 16.0;
-        let line_h = font_size * 1.2;
-        // 簡易: ASCII 文字幅を 9px 仮定。日本語は適当に配置 (M1)。
-        let approx_w = (text.chars().count() as f32) * 9.0;
-        let tx = rect.x + (rect.w - approx_w).max(0.0) * 0.5;
-        let ty = rect.y + (rect.h - line_h).max(0.0) * 0.5;
-        self.push_text(GlyphArea {
-            text: text.to_string(),
-            left: tx,
-            top: ty,
-            font_size,
-            line_height: line_h,
-            color: Color::rgb(0.95, 0.95, 0.97),
+            // テキストを矩形中央付近に
+            let font_size = 16.0;
+            let line_h = font_size * 1.2;
+            // 簡易: ASCII 文字幅を 9px 仮定。日本語は適当に配置 (M1)。
+            let approx_w = (text.chars().count() as f32) * 9.0;
+            let tx = rect.x + (rect.w - approx_w).max(0.0) * 0.5;
+            let ty = rect.y + (rect.h - line_h).max(0.0) * 0.5;
+            ui.push_text(GlyphArea {
+                text: text.to_string(),
+                left: tx,
+                top: ty,
+                font_size,
+                line_height: line_h,
+                color: Color::rgb(0.95, 0.95, 0.97),
+            });
         });
 
         if click {

@@ -405,6 +405,34 @@ F:\dev\gui_01\
 
 ### M4 (内部 scenegraph + 差分検出) — 旧 M3
 
+**Phase 11 進捗 (2026-05-01)** — `Ui::with_widget_node` API + 各 widget 適用 + 描画コマンドキャッシュ:
+
+| 成果物 | 状態 | コミット |
+|---|---|---|
+| `SceneNode` を `{ input_hash, commands: CachedCommands }` に拡張 | ✅ | (本コミット) |
+| `CachedCommands { rects, glyph_areas, line_batches }` 型を新設 | ✅ | (本コミット) |
+| `Scenegraph::record(wid, hash, commands)` シグネチャに変更 + `get_cached` 追加 | ✅ | (本コミット) |
+| `hash_inputs<T: Hash>(t) -> u64` 共通ヘルパ追加 | ✅ | (本コミット) |
+| `Ui::with_widget_node(wid, input_hash, draw_fn)` API 追加 | ✅ | (本コミット) |
+| `Ui` に `scenegraph: &mut Scenegraph` + `seen_widgets: &mut HashSet<WidgetId>` field | ✅ | (本コミット) |
+| `UiHost::frame` 末尾で `scenegraph.retain(&seen_widgets)` で eviction | ✅ | (本コミット) |
+| 6 widget (button / label / checkbox / fader / knob / text_input) を `with_widget_node` で wrap | ✅ | (本コミット) |
+| 単体テスト 5 本追加: `with_widget_node_hit_skips_draw_fn` / `_miss_runs_draw_fn` / `scenegraph_evicts_unseen_widgets` / `get_cached_returns_commands_when_hash_matches` / `hash_inputs_is_deterministic` | ✅ | (本コミット) |
+| 実機検証: mixer の表示・操作に regression なし、cache 命中で push がスキップされる | ✅ | (本コミット) |
+
+**設計判断**:
+- **draw_fn closure 経由で wrap**: 各 widget は state 計算と draw 計算が同関数だが、draw 部分は既に `draw_fader` / `draw_knob` 等の独立関数に切り出されているので with_widget_node でラップしやすい
+- **Vec をクローンして cache**: `RectCommand` / `GlyphArea` / `LineBatch` はすべて `Clone`、cache hit 時に `extend` で scene に append。`LineBatch` は `Vec<LineSegment>` を持つので `extend_from_slice` でなく `iter().cloned()` 経由
+- **判別タグを hash 入力に含める** (`b"fader"` / `b"knob"` 等): 異なる widget 種別が偶然同じパラメータを持っても hash 衝突しないよう defensive
+- **eviction を frame 末尾に**: widget が「再度 wrap される」と seen に入る、wrap されなかったら次フレームで消える。動的に出現/消滅する widget も自然に扱える
+- **waveform は wrap せず**: LOD ピラミッドの generation を input_hash に組み込む特殊処理が必要 → Phase 12 で対応
+
+**M4 の残作業 (Phase 12)**:
+- 波形 widget を `with_widget_node` で wrap (input_hash に generation を組み込む)
+- 1000 widget で「変化していないフレームで cache hit が支配的」を bench / 計測
+
+---
+
 **Phase 10 進捗 (2026-05-01)** — Scenegraph 基盤 + WidgetId 1M 衝突テスト:
 
 | 成果物 | 状態 | コミット |
@@ -436,11 +464,11 @@ F:\dev\gui_01\
 | `buffer_key` の単体テスト 4 本: 同一入力 / text 違い / font_size 違い / line_height 違い | ✅ | (本コミット) |
 | 実機検証: mixer の表示・操作に regression なし | ✅ | (本コミット) |
 
-**M4 の残作業 (Phase 11-12 で対応)**:
+**M4 の残作業 (Phase 12 で対応)**:
 - ~~`slotmap` 導入 + `Scenegraph` 型定義 + 1M FNV-1a 衝突テスト~~ → ✅ Phase 10 で完了 (`slotmap` は不採用、`HashMap<WidgetId, SceneNode>` で代替)
-- `Ui::with_widget_node(wid, input_hash, draw_fn)` API + 各 widget に適用 → Phase 11
-- "1000 widget で draw call 増えない" bench 検証 → Phase 11
-- 波形 LOD ピラミッドを scenegraph 配下に統合 (input_hash に generation 組込) → Phase 12
+- ~~`Ui::with_widget_node(wid, input_hash, draw_fn)` API + 各 widget に適用~~ → ✅ Phase 11 で完了 (waveform 除く 6 widget)
+- 波形 widget を `with_widget_node` で wrap (input_hash に generation 組込) → Phase 12
+- "1000 widget で cache hit 支配的" bench 検証 → Phase 12
 
 **設計判断**:
 - **Phase 9 を最初に**: `slotmap` 基盤を先に作っても適用前は busywork。glyphon キャッシュは renderer 内部に閉じて measurable な改善を出せるので最初に成果が出る
@@ -822,3 +850,4 @@ ui.heavy("track_0_clips", |hctx| {
 - 2026-05-01: **M3 Phase 8** — fader / knob 視覚 polish。fader thumb を 24×12 角丸+border から 28×10 flat バー (border 無し) に、knob を Ableton 流の「円本体 + 300° 可動範囲弧 (回転側 cyan / 非回転側 暗グレー の 2 色) + 中心→外円インジケータ線 (白、太め)」にデザイン変更。弧の polygon 近似を 2° step に細分化してコーナーアーティファクト解消。試行錯誤の途中 (影/tick/sweep arc fill 案、bipolar default_value 起点 arc 案、外側 rest tick 案) は最終形のみ commit。実機 Ableton との細部詰め (配色、質感) は別タスクとして残す。感度カーブ (非線形マッピング) は別タスク。
 - 2026-05-01: **M4 Phase 9** — glyphon Buffer キャッシュ。`GlyphPipeline` 内に `HashMap<u64, CachedBuffer>` を導入し、`(text, font_size, line_height)` の `DefaultHasher` ハッシュをキーとして `Buffer` を再利用。同一 text の繰り返し描画 (mixer の ch label 等) で `Buffer::new` + shaping を回避し、毎フレーム N 回 → 0〜1 回 (新規時のみ) に削減。5 秒 (300 frame) 未使用 entry は eviction。`Scene` / `GlyphArea` の API は不変、widgets / examples は無変更で恩恵を受ける。`buffer_key` の単体テスト 4 本追加 (renderer crate 初の単体テスト群)。M4 の最初のサブ phase、scenegraph 本体は Phase 10 以降で。
 - 2026-05-01: **M4 Phase 10** — Scenegraph 基盤 + WidgetId 1M 衝突テスト。`crates/ui/src/scenegraph.rs` に `Scenegraph` (`HashMap<WidgetId, SceneNode>` 内蔵) と `SceneNode { input_hash: u64 }` 型を新設、API は `unchanged` / `record` / `retain` / `len` / `is_empty`。元 plan の `SlotMap<NodeId, SceneNode>` は `WidgetId` が安定キーなので不要と判断、`slotmap` 依存追加を回避 (Cargo.toml 不変)。`UiHost` に `scenegraph: Scenegraph` フィールドを追加 (Phase 10 では宣言のみ、Phase 11 で widget から書き込み)。`tests/widget_id_collision.rs` で 1000 parents × 1000 children = 1M unique IDs の衝突 0 を担保。Scenegraph 単体テスト 5 本 + 衝突テスト 1 本で計 6 本追加。Phase 11 で `Ui::with_widget_node` API + 各 widget 適用に進む。
+- 2026-05-01: **M4 Phase 11** — `Ui::with_widget_node` API + 6 widget 適用 + 描画コマンドキャッシュ。`SceneNode` を `{ input_hash, commands: CachedCommands }` に拡張、`CachedCommands { rects, glyph_areas, line_batches }` で per-widget の描画コマンドを保持。`Ui::with_widget_node(wid, input_hash, draw_fn)` API を追加: hash 一致なら draw_fn をスキップして前フレームの commands を scene に append、不一致なら draw_fn を実行して scene 末尾差分を新規 commands として記録。`UiHost::frame` 末尾で `scenegraph.retain(&seen_widgets)` で動的に出現/消滅する widget を扱う。6 widget (button / label / checkbox / fader / knob / text_input) を全て wrap、各 widget が `hash_inputs((b"<種別>", rect.x.to_bits(), ..., 状態フラグ))` で input_hash 計算。判別タグ (`b"fader"` 等) で異種 widget 間の偶然の hash 衝突を防ぐ。waveform は LOD generation の特殊処理が必要なので Phase 12 で。with_widget_node 単体テスト 3 本 + scenegraph 追加テスト 2 本 = 5 本追加 (合計 48 unit/test)、clippy 増分 0、mixer 実機で表示・操作に regression なし。

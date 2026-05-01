@@ -16,6 +16,7 @@ use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
+use crate::scenegraph::hash_inputs;
 use crate::ui::{Ui, hovered, lerp_color};
 
 /// ダブルクリック判定の時間しきい値 (ms)。
@@ -141,8 +142,23 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             value
         };
 
-        // 3. 描画。
-        draw_knob(self, rect, displayed_value, drag_anchor.is_some(), pointer);
+        // 3. 描画。M4 Phase 11: with_widget_node で input_hash キャッシュ。
+        let dragging = drag_anchor.is_some();
+        let hovered_rect = pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
+        let input_hash = hash_inputs((
+            b"knob",
+            rect.x.to_bits(),
+            rect.y.to_bits(),
+            rect.w.to_bits(),
+            rect.h.to_bits(),
+            displayed_value.to_bits(),
+            default_value.to_bits(),
+            dragging,
+            hovered_rect,
+        ));
+        self.with_widget_node(wid, input_hash, |ui| {
+            draw_knob(ui, rect, displayed_value, dragging, pointer);
+        });
 
         // 4. 値が変わっていれば Edit を発行。
         if (displayed_value - value).abs() > f32::EPSILON {

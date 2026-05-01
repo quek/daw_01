@@ -9,6 +9,7 @@ use daw_ui_renderer::{Color, GlyphArea, LineBatch, LineSegment, Rect, RectComman
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
+use crate::scenegraph::hash_inputs;
 use crate::ui::{Ui, lerp_color};
 
 /// checkbox の永続状態 (button と同形式)。
@@ -62,8 +63,21 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             (visual_pressed, click)
         };
 
-        // 描画。
-        draw_checkbox(self, rect, checked, label, inside, visual_pressed);
+        // 描画。M4 Phase 11: with_widget_node で input_hash キャッシュ。
+        let input_hash = hash_inputs((
+            b"checkbox",
+            rect.x.to_bits(),
+            rect.y.to_bits(),
+            rect.w.to_bits(),
+            rect.h.to_bits(),
+            checked,
+            label,
+            inside,
+            visual_pressed,
+        ));
+        self.with_widget_node(wid, input_hash, |ui| {
+            draw_checkbox(ui, rect, checked, label, inside, visual_pressed);
+        });
 
         if click {
             let edit = on_toggle(!checked);
