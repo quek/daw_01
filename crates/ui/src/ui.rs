@@ -18,6 +18,7 @@ use daw_ui_renderer::{Color, GlyphArea, LineBatch, Rect, RectCommand, Scene};
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::input::{FrameInput, ImeEvent, PointerFrame};
+use crate::scenegraph::Scenegraph;
 use crate::widgets::WidgetState;
 
 /// アプリが 1 つ持つ UI ホスト。フレーム間で UI 内部状態を保持する。
@@ -35,6 +36,10 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// アプリは on_render の終わりにこの値を見て winit の `set_ime_cursor_area` /
     /// `set_ime_allowed` を呼ぶ。`None` のフレームでは IME を無効化する。
     last_ime_request: Option<Rect>,
+    /// M4 Phase 10 で追加: 内部 scenegraph (per-widget input_hash の前フレーム履歴)。
+    /// Phase 11 で `Ui::with_widget_node` API から書き込まれる。Phase 10 では宣言のみ。
+    #[allow(dead_code)]
+    scenegraph: Scenegraph,
     _m: PhantomData<fn(&mut M)>,
 }
 
@@ -45,6 +50,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             focused: None,
             focus_changed_in_last_frame: false,
             last_ime_request: None,
+            scenegraph: Scenegraph::new(),
             _m: PhantomData,
         }
     }

@@ -405,6 +405,26 @@ F:\dev\gui_01\
 
 ### M4 (内部 scenegraph + 差分検出) — 旧 M3
 
+**Phase 10 進捗 (2026-05-01)** — Scenegraph 基盤 + WidgetId 1M 衝突テスト:
+
+| 成果物 | 状態 | コミット |
+|---|---|---|
+| `crates/ui/src/scenegraph.rs` 新規: `Scenegraph` (`HashMap<WidgetId, SceneNode>` 内蔵) と `SceneNode { input_hash: u64 }` | ✅ | (本コミット) |
+| `Scenegraph::{new, unchanged, record, retain, len, is_empty}` API | ✅ | (本コミット) |
+| `UiHost` に `scenegraph: Scenegraph` フィールド追加 (Phase 11 で widget から書き込まれる) | ✅ | (本コミット) |
+| `lib.rs` から `Scenegraph` / `SceneNode` を re-export | ✅ | (本コミット) |
+| Scenegraph 単体テスト 5 本: record / unchanged 一致 / 不一致 / overwrite / retain による eviction | ✅ | (本コミット) |
+| WidgetId 1M 衝突テスト (`tests/widget_id_collision.rs`) — 1000 parents × 1000 children = 1M unique IDs | ✅ | (本コミット) |
+
+**設計判断**:
+- **`slotmap` 不採用**: 元 plan は `SlotMap<NodeId, SceneNode>` を想定したが、`WidgetId` 自体が安定キー (`Eq + Hash` 既備) で世代管理が不要 → `HashMap<WidgetId, SceneNode>` で十分。外部 deps 追加を回避 (`Cargo.toml` 不変)
+- **Phase 10 は型定義のみ**: 各 widget への適用 (Phase 11) を分離することで API レビュー余地を残す。仮に Phase 11 で API が変わっても本コミットの差分は小さい
+- **1M テストは sequential seed**: `rand` crate を入れない。FNV-1a の品質確認は uniform-ish な入力でも十分 (悪意ある衝突攻撃は本ライブラリの脅威モデルに含まれない)
+- **`SceneNode` は最小**: Phase 11 で `commands: Vec<DrawCommand>` を追加する想定で、今は `input_hash` のみ
+- **Eviction API は宣言のみ**: `retain(&seen)` を Phase 10 で定義しておくが、Phase 11 で widget が `seen` を埋めるようになって初めて意味がある
+
+---
+
 **Phase 9 進捗 (2026-05-01)** — glyphon Buffer キャッシュ:
 
 | 成果物 | 状態 | コミット |
@@ -416,8 +436,8 @@ F:\dev\gui_01\
 | `buffer_key` の単体テスト 4 本: 同一入力 / text 違い / font_size 違い / line_height 違い | ✅ | (本コミット) |
 | 実機検証: mixer の表示・操作に regression なし | ✅ | (本コミット) |
 
-**M4 の残作業 (Phase 10-12 で対応)**:
-- `slotmap` 導入 + `Scenegraph` 型定義 + 1M FNV-1a 衝突テスト → Phase 10
+**M4 の残作業 (Phase 11-12 で対応)**:
+- ~~`slotmap` 導入 + `Scenegraph` 型定義 + 1M FNV-1a 衝突テスト~~ → ✅ Phase 10 で完了 (`slotmap` は不採用、`HashMap<WidgetId, SceneNode>` で代替)
 - `Ui::with_widget_node(wid, input_hash, draw_fn)` API + 各 widget に適用 → Phase 11
 - "1000 widget で draw call 増えない" bench 検証 → Phase 11
 - 波形 LOD ピラミッドを scenegraph 配下に統合 (input_hash に generation 組込) → Phase 12
@@ -801,3 +821,4 @@ ui.heavy("track_0_clips", |hctx| {
 - 2026-05-01: **M3 Phase 7** — `LayoutPass` ergonomics 改善。`compute` シグネチャを戻り値なしに変えて内部 `HashMap<NodeId, Rect>` に格納、`rect(node) -> Rect` で O(1) 引きできるようにした。`compute_at(root, w, h, origin)` を追加して screen 座標オフセットを内部で適用、利用側の `to_screen` クロージャと `into_iter().collect::<HashMap<_,_>>()` の boilerplate を library 内側に閉じ込める。breaking change だが zero external callers + Phase 6 で 1 caller (mixer) のみなので影響極小。mixer から `std::collections::HashMap` import が消え、build_ui のチャンネルストリップ部分が約 10 行短くなった。テスト 1 本追加 (`compute_at_applies_origin_offset`) で 33 unit + 1 trybuild、既存 6 layout テストは `rects()` ヘルパ経由から `p.rect(node)` 直呼びに簡素化。実機検証で Phase 6 と同一表示 (regression なし) を確認。
 - 2026-05-01: **M3 Phase 8** — fader / knob 視覚 polish。fader thumb を 24×12 角丸+border から 28×10 flat バー (border 無し) に、knob を Ableton 流の「円本体 + 300° 可動範囲弧 (回転側 cyan / 非回転側 暗グレー の 2 色) + 中心→外円インジケータ線 (白、太め)」にデザイン変更。弧の polygon 近似を 2° step に細分化してコーナーアーティファクト解消。試行錯誤の途中 (影/tick/sweep arc fill 案、bipolar default_value 起点 arc 案、外側 rest tick 案) は最終形のみ commit。実機 Ableton との細部詰め (配色、質感) は別タスクとして残す。感度カーブ (非線形マッピング) は別タスク。
 - 2026-05-01: **M4 Phase 9** — glyphon Buffer キャッシュ。`GlyphPipeline` 内に `HashMap<u64, CachedBuffer>` を導入し、`(text, font_size, line_height)` の `DefaultHasher` ハッシュをキーとして `Buffer` を再利用。同一 text の繰り返し描画 (mixer の ch label 等) で `Buffer::new` + shaping を回避し、毎フレーム N 回 → 0〜1 回 (新規時のみ) に削減。5 秒 (300 frame) 未使用 entry は eviction。`Scene` / `GlyphArea` の API は不変、widgets / examples は無変更で恩恵を受ける。`buffer_key` の単体テスト 4 本追加 (renderer crate 初の単体テスト群)。M4 の最初のサブ phase、scenegraph 本体は Phase 10 以降で。
+- 2026-05-01: **M4 Phase 10** — Scenegraph 基盤 + WidgetId 1M 衝突テスト。`crates/ui/src/scenegraph.rs` に `Scenegraph` (`HashMap<WidgetId, SceneNode>` 内蔵) と `SceneNode { input_hash: u64 }` 型を新設、API は `unchanged` / `record` / `retain` / `len` / `is_empty`。元 plan の `SlotMap<NodeId, SceneNode>` は `WidgetId` が安定キーなので不要と判断、`slotmap` 依存追加を回避 (Cargo.toml 不変)。`UiHost` に `scenegraph: Scenegraph` フィールドを追加 (Phase 10 では宣言のみ、Phase 11 で widget から書き込み)。`tests/widget_id_collision.rs` で 1000 parents × 1000 children = 1M unique IDs の衝突 0 を担保。Scenegraph 単体テスト 5 本 + 衝突テスト 1 本で計 6 本追加。Phase 11 で `Ui::with_widget_node` API + 各 widget 適用に進む。

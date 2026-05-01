@@ -14,6 +14,7 @@ pub mod edit;
 pub mod id;
 pub mod input;
 pub mod layout;
+pub mod scenegraph;
 pub mod ui;
 pub mod widgets;
 
@@ -21,6 +22,7 @@ pub use edit::Edit;
 pub use id::WidgetId;
 pub use input::{FrameInput, ImeEvent, InputAccumulator, PointerFrame};
 pub use layout::{FlexDirection, Gap, LayoutPass, NodeId, Padding};
+pub use scenegraph::{SceneNode, Scenegraph};
 pub use ui::{Ui, UiHost};
 pub use widgets::checkbox::CheckboxResponse;
 pub use widgets::fader::FaderResponse;
