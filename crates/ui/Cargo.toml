@@ -13,3 +13,10 @@ workspace = true
 daw-ui-platform.workspace = true
 daw-ui-renderer.workspace = true
 taffy = "0.10.1"
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "waveform"
+harness = false

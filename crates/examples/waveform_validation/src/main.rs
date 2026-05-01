@@ -1,14 +1,14 @@
-//! examples/waveform_validation — M2 波形 UI 早期検証サンプル。
+//! examples/waveform_validation — M2 波形 UI 早期検証サンプル (アレンジメントビュー想定)。
 //!
 //! 確認項目:
 //! - line strip パイプラインで PeakLines が描ける (1px 縦線群)
 //! - 1 分ステレオ (sample_rate 48kHz, 5.76M サンプル) で LOD が機能する
-//! - 60fps スクロール / ズームが滑らか
+//! - **多数 (16 トラック × 8 クリップ = 128 widgets) を同時表示して 60fps**
 //! - `generation` 一致時の `Ui::waveform()` 呼び出しコストが小さい (HUD でフレーム時間を観察)
 //!
 //! 操作:
-//! - 左ドラッグ: 横スクロール
-//! - マウスホイール: ズーム (カーソル位置を中心)
+//! - 左ドラッグ: 横スクロール (全クリップ同期)
+//! - マウスホイール: ズーム (カーソル位置を中心、全クリップ同期)
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -26,6 +26,12 @@ use winit::window::WindowAttributes;
 const SAMPLE_RATE: u32 = 48_000;
 const SECONDS: f32 = 60.0;
 const CHANNELS: usize = 2;
+
+/// アレンジメントビュー想定の grid サイズ。`TRACKS × CLIPS_PER_TRACK` 個の波形を
+/// 同時表示する。`128` は典型的に重い DAW プロジェクト相当 (16 ch × 8 clips/ch)。
+const TRACKS: usize = 16;
+const CLIPS_PER_TRACK: usize = 8;
+const N_WIDGETS: usize = TRACKS * CLIPS_PER_TRACK;
 
 /// アプリ「GUI Model」。`Clone` は実装しない (no-Clone 不変条件)。
 struct WaveformAppModel {
@@ -128,13 +134,29 @@ fn generate_test_samples(seconds: f32, sample_rate: u32, channels: usize) -> Vec
     planes
 }
 
-fn waveform_rect(screen: PhysicalSize) -> Rect {
-    let pad_x = 16.0;
+/// 波形 grid 全体の領域。
+fn waveform_area(screen: PhysicalSize) -> Rect {
+    let pad_x = 8.0;
     let header_h = 88.0;
     let footer_h = 56.0;
     let w = (screen.width as f32 - pad_x * 2.0).max(100.0);
     let h = (screen.height as f32 - header_h - footer_h).max(100.0);
     Rect { x: pad_x, y: header_h, w, h }
+}
+
+/// `i` 番目のクリップ (0..N_WIDGETS) の rect を返す。grid の (col, row) 配置。
+fn clip_rect(area: Rect, i: usize) -> Rect {
+    let col = i % CLIPS_PER_TRACK;
+    let row = i / CLIPS_PER_TRACK;
+    let cell_w = area.w / CLIPS_PER_TRACK as f32;
+    let cell_h = area.h / TRACKS as f32;
+    Rect {
+        x: area.x + col as f32 * cell_w,
+        y: area.y + row as f32 * cell_h,
+        // 1px のギャップでセル境界が見えるように
+        w: (cell_w - 1.0).max(1.0),
+        h: (cell_h - 1.0).max(1.0),
+    }
 }
 
 struct App {
@@ -178,11 +200,11 @@ impl App {
         let screen = self.renderer.size();
         let pointer = self.input.take_frame();
 
-        // 1. drag panning (現フレームの mouse 位置を反映)
-        let wave_rect = waveform_rect(screen);
+        // 1. drag panning (grid 全域がドラッグ対象)
+        let area = waveform_area(screen);
         if pointer.primary_just_pressed
             && let Some((px, py)) = pointer.pos
-            && wave_rect.contains(px, py)
+            && area.contains(px, py)
         {
             self.drag_anchor = Some((px, self.model.view_start));
         }
@@ -192,19 +214,23 @@ impl App {
         if let (Some((anchor_x, anchor_view_start)), Some((px, _))) =
             (self.drag_anchor, pointer.pos)
         {
-            // anchor からの dx を使って view_start を再計算 (累積誤差を防ぐ)
+            // 各クリップは width = area.w / CLIPS_PER_TRACK の中で view_len を表示する。
+            // ドラッグの感覚を 1 クリップ幅基準にする (細かい操作も効くように)。
             self.model.view_start = anchor_view_start;
-            self.model.pan_pixels(px - anchor_x, wave_rect.w);
+            let cell_w = area.w / CLIPS_PER_TRACK as f32;
+            self.model.pan_pixels(px - anchor_x, cell_w);
         }
 
         // 2. ズーム適用 (cur_mouse を anchor に)
         if self.pending_zoom_dy.abs() > 0.0 {
+            // grid 内での anchor 位置はクリップ内 x の比率を使う。
             let anchor_frac = if let Some((mx, _)) = self.cur_mouse {
-                ((mx - wave_rect.x) / wave_rect.w).clamp(0.0, 1.0)
+                let cell_w = area.w / CLIPS_PER_TRACK as f32;
+                let local = (mx - area.x).rem_euclid(cell_w);
+                (local / cell_w).clamp(0.0, 1.0)
             } else {
                 0.5
             };
-            // wheel up (dy > 0) → 拡大 (factor < 1)
             let factor = (-self.pending_zoom_dy * 0.15).exp();
             self.model.zoom_at(factor, anchor_frac);
             self.pending_zoom_dy = 0.0;
@@ -220,26 +246,27 @@ impl App {
                 // タイトル + view 情報
                 ui.label_at(
                     "title",
-                    "daw-ui waveform validation — M2 (line strip + LOD pyramid)",
+                    "daw-ui waveform validation — M2 (16 tracks × 8 clips = 128 widgets)",
                     16.0,
                     16.0,
                     18.0,
                     Color::rgb(0.95, 0.95, 0.97),
                 );
                 let info = format!(
-                    "frame {:>5.2} ms │ start {:>7} │ len {:>7} │ spp {:>7.1} │ total {} samples ({:.1}s × {} ch @ {}Hz)",
+                    "frame {:>5.2} ms │ start {:>7} │ len {:>7} │ spp {:>6.1} │ {} widgets │ total {:.1}s × {} ch @ {}Hz",
                     m.last_frame_ms,
                     m.view_start,
                     m.view_len,
-                    m.view_len as f64 / f64::from(wave_rect.w),
-                    m.total_frames(),
+                    m.view_len as f64 / f64::from(area.w),
+                    N_WIDGETS,
                     m.total_frames() as f32 / SAMPLE_RATE as f32,
                     m.samples.len(),
                     SAMPLE_RATE,
                 );
                 ui.label_at("info", &info, 16.0, 44.0, 13.0, Color::rgb(0.75, 0.78, 0.82));
 
-                // 波形本体
+                // 波形 grid: 各クリップは「同じ source の少しずらした view」を表示。
+                // pyramid キャッシュは widget_id 単位で個別 → 128 個のキャッシュが state に乗る。
                 let planes: Vec<&[f32]> = m.samples.iter().map(Vec::as_slice).collect();
                 let source = WaveformSource {
                     samples: SampleSlices::Planar(&planes),
@@ -247,27 +274,37 @@ impl App {
                     generation: m.generation,
                     sample_rate: SAMPLE_RATE,
                 };
-                let view = WaveformView {
-                    start_sample: m.view_start,
-                    len_samples: m.view_len,
-                    vertical_gain: m.vertical_gain,
-                };
                 let style = WaveformStyle {
                     fg: Color::rgb(0.55, 0.78, 0.95),
                     fg_clipped: Color::rgb(0.95, 0.45, 0.40),
                     fill: None,
-                    baseline: Some(Color::rgba(1.0, 1.0, 1.0, 0.10)),
-                    channel_layout: ChannelLayout::Stack,
+                    baseline: Some(Color::rgba(1.0, 1.0, 1.0, 0.08)),
+                    channel_layout: ChannelLayout::Overlay,
                     render_mode: WaveformRenderMode::PeakLines,
                     line_width_px: 1.0,
                 };
-                let _resp = ui.waveform("main", wave_rect, source, view, style);
+                // 各クリップが少し違うサンプル位置を表示するシフト量。view 全体に対して
+                // 1/CLIPS_PER_TRACK の幅をずらすと、横方向にスライドするような視覚効果。
+                let shift_per_clip = m.view_len / CLIPS_PER_TRACK as u64;
+                let max_start = m.total_frames().saturating_sub(m.view_len);
+                for i in 0..N_WIDGETS {
+                    let rect = clip_rect(area, i);
+                    let view = WaveformView {
+                        start_sample: m
+                            .view_start
+                            .saturating_add(shift_per_clip * (i as u64))
+                            .min(max_start),
+                        len_samples: m.view_len,
+                        vertical_gain: m.vertical_gain,
+                    };
+                    let _resp = ui.waveform(("clip", i), rect, source, view, style);
+                }
 
                 // フッタ: 操作説明 + 状態
                 let footer_y = (screen.height as f32 - 44.0).max(0.0);
                 ui.label_at(
                     "footer1",
-                    "Drag = 横スクロール │ Wheel = ズーム",
+                    "Drag = 横スクロール (全クリップ同期) │ Wheel = ズーム",
                     16.0,
                     footer_y,
                     13.0,
