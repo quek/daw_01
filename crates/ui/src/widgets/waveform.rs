@@ -183,24 +183,22 @@ struct MinMaxPair {
 
 impl MinMaxPair {
     const ZERO: Self = Self { min: 0.0, max: 0.0 };
-
-    fn extend(&mut self, other: Self) {
-        if other.min < self.min {
-            self.min = other.min;
-        }
-        if other.max > self.max {
-            self.max = other.max;
-        }
-    }
 }
 
 #[derive(Debug, Default)]
 struct MinMaxLevel {
-    /// channels × pairs_per_channel 個のペア。チャンネル順に連続。
-    pairs: Vec<MinMaxPair>,
-    pairs_per_channel: usize,
+    /// チャンネル別のペア列。`per_channel[ch][p]` で 1 ペアにアクセス。
+    /// 録音追記時に末尾 push を効かせるため、flat ではなく per-channel にしている。
+    /// 全チャンネルで `len()` は同一の前提。
+    per_channel: Vec<Vec<MinMaxPair>>,
     /// 1 ペアが元サンプル何個分か (16, 256, 4096, ...)。
     decimation: u32,
+}
+
+impl MinMaxLevel {
+    fn pairs_per_channel(&self) -> usize {
+        self.per_channel.first().map_or(0, Vec::len)
+    }
 }
 
 /// 1 波形ウィジェット分のキャッシュ。`UiHost.state` に置かれる。
@@ -215,7 +213,13 @@ pub(crate) struct WaveformPyramid {
 }
 
 impl WaveformPyramid {
-    /// `fingerprint` が変わっていれば全レベルを再構築する。
+    /// 必要なら LOD を再構築 or インクリメンタル拡張する。
+    ///
+    /// 3 通りのケースを区別する:
+    /// 1. fingerprint 完全一致 → 何もしない (ピラミッド再利用)
+    /// 2. `valid_len` のみ増えた (それ以外は同じ) → **インクリメンタル拡張** (録音追記対応)
+    /// 3. それ以外 (generation 変化、サイズレート変化、チャンネル数変化、`valid_len` 縮小)
+    ///    → 完全再構築
     fn ensure_built(&mut self, src: &WaveformSource<'_>) {
         let channels = src.samples.channels();
         let valid_len = clamp_valid_len(src);
@@ -229,9 +233,55 @@ impl WaveformPyramid {
         if self.fingerprint == new_fp && !self.levels.is_empty() {
             return;
         }
-        // M2: 完全再構築のみ。インクリメンタル拡張 (録音中追記) は後段。
-        self.levels = build_pyramid(&src.samples, valid_len, channels);
+
+        let can_incremental = !self.levels.is_empty()
+            && self.fingerprint.generation == new_fp.generation
+            && self.fingerprint.sample_rate == new_fp.sample_rate
+            && self.fingerprint.channels == new_fp.channels
+            && self.fingerprint.valid_len < valid_len;
+
+        if can_incremental {
+            self.extend_to(&src.samples, channels, valid_len);
+        } else {
+            self.levels = build_pyramid(&src.samples, valid_len, channels);
+        }
         self.fingerprint = new_fp;
+    }
+
+    /// 既存のピラミッドを `new_valid_len` まで拡張する。
+    /// 各レベルで「old 末尾の (部分的に埋まっていた) 1 ペアを再計算 + 新ペアを末尾追加」する。
+    /// 追加コストは概ね追加サンプル数に比例 (1ms 録音追記なら数十ペアのみ更新)。
+    fn extend_to(
+        &mut self,
+        samples: &SampleSlices<'_>,
+        channels: usize,
+        new_valid_len: usize,
+    ) {
+        if self.levels.is_empty() {
+            self.levels = build_pyramid(samples, new_valid_len, channels);
+            return;
+        }
+        // Level 1: 生サンプルから extend
+        extend_level_1(&mut self.levels[0], samples, channels, new_valid_len);
+        // Level 2..N: cascading で前レベルから extend
+        for i in 1..self.levels.len() {
+            let (prev_slice, this_slice) = self.levels.split_at_mut(i);
+            let prev = &prev_slice[i - 1];
+            let this = &mut this_slice[0];
+            extend_level_from_prev(this, prev, channels);
+        }
+        // 必要なら新しい (より粗い) レベルを追加
+        while self
+            .levels
+            .last()
+            .is_some_and(|l| l.pairs_per_channel() > PYRAMID_COARSE_THRESHOLD)
+        {
+            let new_level = {
+                let prev = self.levels.last().expect("checked Some above");
+                build_level_from_prev(prev, channels)
+            };
+            self.levels.push(new_level);
+        }
     }
 }
 
@@ -260,56 +310,128 @@ fn build_pyramid(
 
     // Level 1: 生サンプル → 16:1
     let l1_ppc = valid_len.div_ceil(DECIMATION);
-    let mut l1 = vec![MinMaxPair::ZERO; channels * l1_ppc];
+    let mut l1_per_channel: Vec<Vec<MinMaxPair>> = Vec::with_capacity(channels);
     for ch in 0..channels {
-        let offset = ch * l1_ppc;
-        for p in 0..l1_ppc {
+        let mut col = vec![MinMaxPair::ZERO; l1_ppc];
+        for (p, slot) in col.iter_mut().enumerate().take(l1_ppc) {
             let s_start = p * DECIMATION;
             let s_end = ((p + 1) * DECIMATION).min(valid_len);
-            l1[offset + p] = peak_in_raw(samples, ch, s_start, s_end);
+            *slot = peak_in_raw(samples, ch, s_start, s_end);
         }
+        l1_per_channel.push(col);
     }
     levels.push(MinMaxLevel {
-        pairs: l1,
-        pairs_per_channel: l1_ppc,
+        per_channel: l1_per_channel,
         decimation: DECIMATION as u32,
     });
 
-    // 上位レベル: 前レベルの 16 ペアごとに min/max を取り直す。
-    while levels.last().is_some_and(|l| l.pairs_per_channel > PYRAMID_COARSE_THRESHOLD) {
-        let prev = levels.last().expect("just checked Some");
-        let prev_ppc = prev.pairs_per_channel;
-        let next_ppc = prev_ppc.div_ceil(DECIMATION);
-        let next_decimation = prev.decimation.saturating_mul(DECIMATION as u32);
-        let mut next_pairs = vec![MinMaxPair::ZERO; channels * next_ppc];
-
-        for ch in 0..channels {
-            let prev_offset = ch * prev_ppc;
-            let next_offset = ch * next_ppc;
-            for p in 0..next_ppc {
-                let p_start = p * DECIMATION;
-                let p_end = ((p + 1) * DECIMATION).min(prev_ppc);
-                let mut acc = MinMaxPair { min: f32::INFINITY, max: f32::NEG_INFINITY };
-                for i in p_start..p_end {
-                    acc.extend(prev.pairs[prev_offset + i]);
-                }
-                if !acc.min.is_finite() {
-                    acc.min = 0.0;
-                }
-                if !acc.max.is_finite() {
-                    acc.max = 0.0;
-                }
-                next_pairs[next_offset + p] = acc;
-            }
-        }
-        levels.push(MinMaxLevel {
-            pairs: next_pairs,
-            pairs_per_channel: next_ppc,
-            decimation: next_decimation,
-        });
+    // 上位レベル: 前レベルから build_level_from_prev で順次積む。
+    while levels
+        .last()
+        .is_some_and(|l| l.pairs_per_channel() > PYRAMID_COARSE_THRESHOLD)
+    {
+        let new_level = {
+            let prev = levels.last().expect("just checked Some");
+            build_level_from_prev(prev, channels)
+        };
+        levels.push(new_level);
     }
 
     levels
+}
+
+/// 1 つのレベルを前レベルから新規構築する。完全再構築のみで使う (extend では使わない)。
+fn build_level_from_prev(prev: &MinMaxLevel, channels: usize) -> MinMaxLevel {
+    let prev_ppc = prev.pairs_per_channel();
+    let next_ppc = prev_ppc.div_ceil(DECIMATION);
+    let next_decimation = prev.decimation.saturating_mul(DECIMATION as u32);
+
+    let mut per_channel: Vec<Vec<MinMaxPair>> = Vec::with_capacity(channels);
+    for ch in 0..channels {
+        let prev_ch = &prev.per_channel[ch];
+        let mut this_ch = vec![MinMaxPair::ZERO; next_ppc];
+        for (p, slot) in this_ch.iter_mut().enumerate().take(next_ppc) {
+            let p_start = p * DECIMATION;
+            let p_end = ((p + 1) * DECIMATION).min(prev_ch.len());
+            *slot = fold_pairs(&prev_ch[p_start..p_end]);
+        }
+        per_channel.push(this_ch);
+    }
+    MinMaxLevel { per_channel, decimation: next_decimation }
+}
+
+/// Level 1 を `new_valid_len` まで拡張する。古い末尾ペア (部分埋まりだったもの) を
+/// 再計算し、新規ペアを末尾に追加する。
+fn extend_level_1(
+    level: &mut MinMaxLevel,
+    samples: &SampleSlices<'_>,
+    channels: usize,
+    new_valid_len: usize,
+) {
+    let new_ppc = new_valid_len.div_ceil(DECIMATION);
+    let old_ppc = level.pairs_per_channel();
+    // 古い末尾ペア (部分埋まりの可能性) から再計算する。
+    let recompute_start = old_ppc.saturating_sub(1);
+    if level.per_channel.len() < channels {
+        level.per_channel.resize_with(channels, Vec::new);
+    }
+    for ch in 0..channels {
+        let col = &mut level.per_channel[ch];
+        col.resize(new_ppc, MinMaxPair::ZERO);
+        for p in recompute_start..new_ppc {
+            let s_start = p * DECIMATION;
+            let s_end = ((p + 1) * DECIMATION).min(new_valid_len);
+            col[p] = peak_in_raw(samples, ch, s_start, s_end);
+        }
+    }
+}
+
+/// Level k (k>=2) を前レベルから拡張する。前レベルが extend 済みである前提。
+fn extend_level_from_prev(level: &mut MinMaxLevel, prev: &MinMaxLevel, channels: usize) {
+    let prev_ppc = prev.pairs_per_channel();
+    let new_ppc = prev_ppc.div_ceil(DECIMATION);
+    let old_ppc = level.pairs_per_channel();
+    // 古い末尾ペア (前レベル境界が変わったので再計算が必要) から。
+    let recompute_start = old_ppc.saturating_sub(1);
+    if level.per_channel.len() < channels {
+        level.per_channel.resize_with(channels, Vec::new);
+    }
+    for ch in 0..channels {
+        let prev_ch = &prev.per_channel[ch];
+        let col = &mut level.per_channel[ch];
+        col.resize(new_ppc, MinMaxPair::ZERO);
+        for p in recompute_start..new_ppc {
+            let p_start = p * DECIMATION;
+            let p_end = ((p + 1) * DECIMATION).min(prev_ch.len());
+            col[p] = fold_pairs(&prev_ch[p_start..p_end]);
+        }
+    }
+}
+
+/// `[MinMaxPair]` から min/max を畳み込む。空なら `MinMaxPair::ZERO`。
+/// peak_in_view の毎ピクセル hot path で呼ばれるので `#[inline(always)]`。
+#[inline(always)]
+fn fold_pairs(pairs: &[MinMaxPair]) -> MinMaxPair {
+    if pairs.is_empty() {
+        return MinMaxPair::ZERO;
+    }
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    for p in pairs {
+        if p.min < mn {
+            mn = p.min;
+        }
+        if p.max > mx {
+            mx = p.max;
+        }
+    }
+    if !mn.is_finite() {
+        mn = 0.0;
+    }
+    if !mx.is_finite() {
+        mx = 0.0;
+    }
+    MinMaxPair { min: mn, max: mx }
 }
 
 /// 生サンプルから `[start, end)` の min/max を取る。enum variant ごとに hot loop を分ける。
@@ -376,57 +498,6 @@ fn peak_in_raw(samples: &SampleSlices<'_>, ch: usize, start: usize, end: usize) 
     MinMaxPair { min: mn, max: mx }
 }
 
-/// `[sample_start, sample_end)` 範囲の min/max をピラミッド (or 生サンプル) から取る。
-fn peak_in_view(
-    pyramid: &WaveformPyramid,
-    samples: &SampleSlices<'_>,
-    valid_len: usize,
-    ch: usize,
-    sample_start: f64,
-    sample_end: f64,
-) -> MinMaxPair {
-    let s_start = sample_start.max(0.0) as usize;
-    let s_end = (sample_end.max(0.0) as usize).min(valid_len);
-    if s_end <= s_start {
-        return MinMaxPair::ZERO;
-    }
-    let span = s_end - s_start;
-
-    // 使うレベル: decimation <= span な最大レベル (= 1 ペア以上は走査できる粒度)
-    let mut chosen: Option<&MinMaxLevel> = None;
-    for lvl in &pyramid.levels {
-        if (lvl.decimation as usize) <= span {
-            chosen = Some(lvl);
-        } else {
-            break;
-        }
-    }
-
-    if let Some(lvl) = chosen {
-        let decim = lvl.decimation as usize;
-        let p_start = s_start / decim;
-        let p_end = s_end.div_ceil(decim).min(lvl.pairs_per_channel);
-        if p_end <= p_start {
-            return MinMaxPair::ZERO;
-        }
-        let offset = ch * lvl.pairs_per_channel;
-        let mut acc = MinMaxPair { min: f32::INFINITY, max: f32::NEG_INFINITY };
-        for p in p_start..p_end {
-            acc.extend(lvl.pairs[offset + p]);
-        }
-        if !acc.min.is_finite() {
-            acc.min = 0.0;
-        }
-        if !acc.max.is_finite() {
-            acc.max = 0.0;
-        }
-        acc
-    } else {
-        // 1 ピクセル < 16 サンプル: 生サンプルで走査
-        peak_in_raw(samples, ch, s_start, s_end)
-    }
-}
-
 /// 1 フレーム分の波形セグメントを構築する。
 ///
 /// `&Ui` を借りないので、ピラミッドへの `&mut` 借用と独立に scene へ push できる。
@@ -482,6 +553,15 @@ fn build_peak_segments(
         }
     }
 
+    // 描画レベルを widget 単位で 1 回だけ選ぶ (samples_per_pixel は widget 内で
+    // ほぼ一定なので、毎ピクセル走査するのは無駄)。
+    let span_int = samples_per_pixel as usize;
+    let chosen_level: Option<&MinMaxLevel> = pyramid
+        .levels
+        .iter()
+        .filter(|l| (l.decimation as usize) <= span_int)
+        .last();
+
     // ピーク線
     for (slot, &ch) in ch_iter.iter().enumerate() {
         let ch_top = rect.y
@@ -491,11 +571,22 @@ fn build_peak_segments(
             };
         let ch_mid = ch_top + per_ch_h * 0.5;
         let ch_half = per_ch_h * 0.5;
+        // チャンネル別の per_channel スライス参照を hoist。
+        let cached_col: Option<&[MinMaxPair]> =
+            chosen_level.and_then(|l| l.per_channel.get(ch).map(Vec::as_slice));
 
         for px in 0..pixel_count {
             let p_start = view_start + (px as f64) * samples_per_pixel;
             let p_end = view_start + (px as f64 + 1.0) * samples_per_pixel;
-            let pair = peak_in_view(pyramid, samples, valid_len, ch, p_start, p_end);
+            let pair = peak_in_view_cached(
+                cached_col,
+                chosen_level.map(|l| l.decimation as usize),
+                samples,
+                valid_len,
+                ch,
+                p_start,
+                p_end,
+            );
 
             let clipped = pair.min < -1.0 || pair.max > 1.0;
             let color = if clipped { style.fg_clipped } else { style.fg };
@@ -518,6 +609,35 @@ fn build_peak_segments(
     }
 
     segments
+}
+
+/// 事前に選択済みレベル (`col` + `decim`) を使って 1 ピクセル分の min/max を取る。
+/// レベル未選択 (= samples_per_pixel が小さすぎる) のときは生サンプルを走査する。
+#[inline(always)]
+fn peak_in_view_cached(
+    col: Option<&[MinMaxPair]>,
+    decim: Option<usize>,
+    samples: &SampleSlices<'_>,
+    valid_len: usize,
+    ch: usize,
+    sample_start: f64,
+    sample_end: f64,
+) -> MinMaxPair {
+    let s_start = sample_start.max(0.0) as usize;
+    let s_end = (sample_end.max(0.0) as usize).min(valid_len);
+    if s_end <= s_start {
+        return MinMaxPair::ZERO;
+    }
+    if let (Some(col), Some(decim)) = (col, decim) {
+        let p_start = s_start / decim;
+        let p_end = s_end.div_ceil(decim).min(col.len());
+        if p_end <= p_start {
+            return MinMaxPair::ZERO;
+        }
+        fold_pairs(&col[p_start..p_end])
+    } else {
+        peak_in_raw(samples, ch, s_start, s_end)
+    }
 }
 
 // ============================================================
@@ -602,5 +722,171 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 決定論的なテスト用サンプルを作る (sin 重ね合わせ、値域 [-1, 1])。
+    fn deterministic_samples(n: usize, ch_seed: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let f1 = (i as f32 * 0.0017 + ch_seed as f32 * 0.137).sin();
+                let f2 = (i as f32 * 0.0083).sin() * 0.4;
+                (f1 + f2).clamp(-1.0, 1.0)
+            })
+            .collect()
+    }
+
+    fn build_full(samples: &SampleSlices<'_>, valid_len: usize) -> WaveformPyramid {
+        let mut p = WaveformPyramid::default();
+        p.ensure_built(&WaveformSource {
+            samples: *samples,
+            valid_len,
+            generation: 1,
+            sample_rate: 48_000,
+        });
+        p
+    }
+
+    fn assert_pyramid_eq(reference: &WaveformPyramid, actual: &WaveformPyramid) {
+        assert_eq!(
+            reference.levels.len(),
+            actual.levels.len(),
+            "level count mismatch (ref={}, actual={})",
+            reference.levels.len(),
+            actual.levels.len(),
+        );
+        for (lvl_idx, (r_lvl, a_lvl)) in reference.levels.iter().zip(&actual.levels).enumerate() {
+            assert_eq!(
+                r_lvl.decimation, a_lvl.decimation,
+                "level {lvl_idx} decimation mismatch",
+            );
+            assert_eq!(
+                r_lvl.per_channel.len(),
+                a_lvl.per_channel.len(),
+                "level {lvl_idx} channel count mismatch",
+            );
+            for (ch, (r_col, a_col)) in r_lvl
+                .per_channel
+                .iter()
+                .zip(&a_lvl.per_channel)
+                .enumerate()
+            {
+                assert_eq!(
+                    r_col.len(),
+                    a_col.len(),
+                    "level {lvl_idx} ch {ch} ppc mismatch (ref={}, actual={})",
+                    r_col.len(),
+                    a_col.len(),
+                );
+                for (p, (r_pair, a_pair)) in r_col.iter().zip(a_col).enumerate() {
+                    assert_eq!(
+                        r_pair.min, a_pair.min,
+                        "level {lvl_idx} ch {ch} pair {p} min mismatch (ref={}, actual={})",
+                        r_pair.min, a_pair.min,
+                    );
+                    assert_eq!(
+                        r_pair.max, a_pair.max,
+                        "level {lvl_idx} ch {ch} pair {p} max mismatch (ref={}, actual={})",
+                        r_pair.max, a_pair.max,
+                    );
+                }
+            }
+        }
+    }
+
+    /// 多段階インクリメンタル拡張で得られる pyramid が、最終 valid_len で完全再構築した
+    /// pyramid と pair 単位で完全一致すること。境界ペアの再計算が正しく行われることの保証。
+    #[test]
+    fn incremental_extension_matches_full_rebuild() {
+        let l = deterministic_samples(50_000, 0);
+        let r = deterministic_samples(50_000, 1);
+        let planes: [&[f32]; 2] = [&l, &r];
+        let samples = SampleSlices::Planar(&planes);
+
+        // 16/256 ペア境界をまたぐ valid_len で段階的に extend する。
+        let stages = [
+            17,      // < 16 → l1_ppc=2 で空に近い
+            512,     // l1_ppc=32, l2_ppc=2
+            5_000,   // l1_ppc=313, l2_ppc=20
+            10_000,  // l1_ppc=625, l2_ppc=40
+            17_001,  // 中途半端な境界
+            32_001,  // ほぼ 2 のべき
+            49_999,  // 末尾境界 (1 サンプル足りない)
+            50_000,  // 末尾完全一致
+        ];
+
+        let mut incremental = WaveformPyramid::default();
+        for &vl in &stages {
+            incremental.ensure_built(&WaveformSource {
+                samples,
+                valid_len: vl,
+                generation: 1,
+                sample_rate: 48_000,
+            });
+        }
+
+        let reference = build_full(&samples, 50_000);
+        assert_pyramid_eq(&reference, &incremental);
+    }
+
+    /// `valid_len` 縮小は完全再構築 (インクリメンタル拡張は使わない) されること。
+    #[test]
+    fn shrinking_valid_len_triggers_full_rebuild() {
+        let l = deterministic_samples(10_000, 0);
+        let r = deterministic_samples(10_000, 1);
+        let planes: [&[f32]; 2] = [&l, &r];
+        let samples = SampleSlices::Planar(&planes);
+
+        let mut p = WaveformPyramid::default();
+        p.ensure_built(&WaveformSource {
+            samples,
+            valid_len: 10_000,
+            generation: 1,
+            sample_rate: 48_000,
+        });
+        // 縮小
+        p.ensure_built(&WaveformSource {
+            samples,
+            valid_len: 5_000,
+            generation: 1,
+            sample_rate: 48_000,
+        });
+
+        let reference = build_full(&samples, 5_000);
+        assert_pyramid_eq(&reference, &p);
+    }
+
+    /// `generation` 変化は完全再構築されること (たとえ valid_len が増えていても)。
+    #[test]
+    fn generation_change_triggers_full_rebuild() {
+        let l1 = deterministic_samples(10_000, 0);
+        let r1 = deterministic_samples(10_000, 1);
+        let planes1: [&[f32]; 2] = [&l1, &r1];
+
+        // 別データ (内容が違う)
+        let l2 = deterministic_samples(20_000, 7);
+        let r2 = deterministic_samples(20_000, 11);
+        let planes2: [&[f32]; 2] = [&l2, &r2];
+
+        let mut p = WaveformPyramid::default();
+        p.ensure_built(&WaveformSource {
+            samples: SampleSlices::Planar(&planes1),
+            valid_len: 10_000,
+            generation: 1,
+            sample_rate: 48_000,
+        });
+        p.ensure_built(&WaveformSource {
+            samples: SampleSlices::Planar(&planes2),
+            valid_len: 20_000,
+            generation: 2, // 異なる generation
+            sample_rate: 48_000,
+        });
+
+        let reference = build_full(&SampleSlices::Planar(&planes2), 20_000);
+        assert_pyramid_eq(&reference, &p);
     }
 }

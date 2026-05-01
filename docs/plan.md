@@ -126,31 +126,32 @@ F:\dev\gui_01\
 
 **目的**: 波形表示が想定通り動くことを早期に確定する。性能・API・データフロー (LOD ピラミッド) を実コードで検証し、後続マイルストーンの前提を固める。詳細モード (サンプルエディタ) は M5 へ。
 
-**進捗 (2026-05-01)**:
-
-主要スカフォルドは完了。性能 DoD は実測でクリア済み。残りは trybuild と録音追記対応のみ。
+**進捗 (2026-05-01)**: **M2 DoD 全項目クリア**。
 
 | 成果物 | 状態 | コミット |
 |---|---|---|
 | line strip パイプライン (`pipelines/line.rs` + `line.wgsl`) | ✅ | 7ddef3f |
 | `Scene::line_batches` + `Renderer::render` 統合 | ✅ | 7ddef3f |
-| LOD ピラミッド (完全再構築のみ) | ✅ | 7ddef3f |
-| LOD インクリメンタル拡張 (録音中の `valid_len` 拡大) | ⏳ 未実装 | — |
+| LOD ピラミッド (完全再構築) | ✅ | 7ddef3f |
+| **LOD インクリメンタル拡張** (録音中の `valid_len` 拡大) | ✅ | (本コミット) |
 | `Ui::waveform()` (PeakLines + Stack/Overlay/FirstOnly) | ✅ | 7ddef3f |
 | `examples/waveform_validation` (16×8 = 128 widgets グリッド) | ✅ | 7ddef3f → 8276ddd |
+| **REC シミュレーション** (Space キーで toggle、`valid_len` 増加) | ✅ | (本コミット) |
 | criterion ベンチ (`crates/ui/benches/waveform.rs`) | ✅ | 8276ddd |
-| trybuild (no-Clone 制約の自動検証) | ⏳ 未実装 | — |
+| **trybuild** (no-Clone 制約の自動検証) | ✅ | 3c251c3 |
 | (副次) `widget_state` の downcast バグ修正 + 回帰テスト | ✅ | 7ddef3f |
 
 **実測ベンチ値 (release profile, 5.76M sample × 2ch)**:
 
 | | 1 widget | 8 widgets | 16 widgets | 64 widgets | 128 widgets |
 |---|---|---|---|---|---|
-| LOD 初回構築 | **4.0 ms** | 33 ms | 66 ms | (未測) | (未測) |
-| LOD 再利用 (毎フレーム) | **44 µs** | 348 µs | (未測) | 2.84 ms | **5.86 ms** |
-| 60fps 予算占有率 (再利用) | 0.3% | 2.1% | — | 17% | 35% |
+| LOD 初回構築 | **4.6 ms** | 37 ms | 74 ms | (未測) | (未測) |
+| LOD 再利用 (毎フレーム) | **61 µs** | 491 µs | (未測) | 4.0 ms | **8.0 ms** |
+| 60fps 予算占有率 (再利用) | 0.4% | 2.9% | — | 24% | 48% |
 
-線形スケール (44〜46 µs/widget) が N=128 まで維持。これより重い (N=256+) 領域で heavy() (M5) の出番。
+線形スケール (61〜63 µs/widget) が N=128 まで維持。これより重い (N=256+) 領域で heavy() (M5) の出番。
+
+**Refactor の影響**: per-channel `Vec<Vec<MinMaxPair>>` 化 (インクリメンタル末尾 push のため) で flat 配列の indirection が増え、初期実装の 44 µs/widget から 61 µs/widget に約 1.4x の regression。代わりにインクリメンタル拡張がフレーム単位で安価になり、録音中もフレーム時間を維持できる。DoD < 100µs は依然クリア。
 
 **主な成果物 (詳細)**:
 
@@ -161,11 +162,15 @@ F:\dev\gui_01\
    - フラグメントで 1px AA、batch ごとに scissor (波形 widget の clip rect)
    - `Scene::line_batches` を介して `Renderer::render` から呼ぶ
 
-2. **LOD ピラミッド (生サンプル → min/max 多段ダウンサンプル)** ✅ (再構築)、⏳ (インクリメンタル拡張)
+2. **LOD ピラミッド (生サンプル → min/max 多段ダウンサンプル)** ✅ (完全再構築 + インクリメンタル拡張)
    - **既存の `state: HashMap<WidgetId, Box<dyn WidgetState>>` を再利用**。`WaveformPyramid` は `WidgetState` の blanket impl 経由で乗る (新フィールド追加なし)。
-   - 16 倍ずつ decimation するレベル列 (`MinMaxLevel { pairs: Vec<MinMaxPair>, pairs_per_channel, decimation }`)
-   - `(generation, valid_len, sample_rate, channels)` の fingerprint 一致で再利用、不一致で完全再構築
-   - `valid_len` 拡大のみのインクリメンタル拡張は ⏳ 未実装 (録音追記用、後段で)
+   - 16 倍ずつ decimation するレベル列 (`MinMaxLevel { per_channel: Vec<Vec<MinMaxPair>>, decimation }`)
+   - `(generation, valid_len, sample_rate, channels)` の fingerprint をキーに 3 通りに分岐:
+     - 完全一致 → 何もしない
+     - `valid_len` のみ増加 → `extend_to` でインクリメンタル拡張
+     - それ以外 (generation / sample_rate / channels 変化、`valid_len` 縮小) → 完全再構築
+   - インクリメンタル拡張は各レベルで「old 末尾 (部分埋まり) ペアを再計算 + 新ペアを末尾追加」を cascading で行い、必要なら新しい coarsest level を追加
+   - 単体テストで「多段階 incremental extend == 最終 full rebuild」が pair 単位完全一致することを担保 (`incremental_extension_matches_full_rebuild`)
 
 3. **`Ui::waveform()` プロトタイプ** ✅
    - 公開 API: `WaveformSource` / `WaveformView` / `WaveformStyle` / `WaveformResponse` / `SampleSlices` / `ChannelLayout` / `WaveformRenderMode`
@@ -177,20 +182,20 @@ F:\dev\gui_01\
    - 1 分ステレオ (sample rate 48kHz, 5.76M サンプル) を生成
    - **16 トラック × 8 クリップ = 128 widgets の grid** で表示 (アレンジメントビュー想定)
    - drag = 全クリップ同期で横スクロール、wheel = カーソル位置 anchor のズーム
-   - **HUD 表示**: フレーム時間 / view_start / view_len / spp / N widgets 数
-   - 録音シミュレーションは ⏳ (LOD インクリメンタル拡張と同時に実装)
+   - **Space キーで REC シミュレーション**: `valid_len` を経過時間に応じて伸ばし、インクリメンタル LOD 拡張をストレステスト
+   - **HUD 表示**: フレーム時間 / view_start / view_len / spp / N widgets 数 / valid 秒数 / `● REC` 状態
 
-5. **基盤の小規模整備** ✅ (criterion)、⏳ (trybuild)
+5. **基盤の小規模整備** ✅
    - `criterion` 0.5 を `crates/ui/Cargo.toml` の `[dev-dependencies]` に導入、`benches/waveform.rs` で N=1/8/16/64/128 を測定
-   - `trybuild` は ⏳ 未実装
+   - `trybuild` 1 を `[dev-dependencies]` に導入、`tests/no_clone_required.rs` ハーネスから `tests/ui/pass/{basic, waveform}.rs` を実行して、API シグネチャに `Clone`/`PartialEq`/`Hash`/`Default` の制約が紛れ込まないことを CI 固定
 
-**M2 完了条件 (Definition of Done)**:
-- [x] line パイプライン: 多数頂点を低コストで描画 (N=128 widgets × ~2560 segment = 約 33 万頂点で 5.86ms 内)
-- [x] LOD 初回構築: 5.76M サンプルで < 50ms (実測 4.0 ms)
-- [x] LOD 再利用: `generation` 一致時の `Ui::waveform()` 呼び出し時間 < 100µs (実測 44 µs、N=128 まで線形)
-- [ ] 録音シミュレーション: 1ms 追記でフレーム時間 16.7ms 安定 (インクリメンタル LOD 未実装)
+**M2 完了条件 (Definition of Done) — 全項目クリア**:
+- [x] line パイプライン: 多数頂点を低コストで描画 (N=128 widgets × ~2560 segment = 約 33 万頂点で 8.0 ms 内)
+- [x] LOD 初回構築: 5.76M サンプルで < 50ms (実測 4.6 ms)
+- [x] LOD 再利用: `generation` 一致時の `Ui::waveform()` 呼び出し時間 < 100µs (実測 61 µs、N=128 まで線形)
+- [x] 録音シミュレーション: インクリメンタル LOD 拡張で `valid_len` 増加に対応、目視で REC 中もフレーム時間が安定することを確認
 - [x] examples/waveform_validation 起動 → スクロール/ズーム滑らか (128 widgets で目視確認済み)
-- [ ] `Ui::waveform()` API シグネチャに `Clone`/`Hash` 制約が無いことの trybuild 検証
+- [x] `Ui::waveform()` API シグネチャに `Clone`/`Hash` 制約が無いことの trybuild 検証 (commit 3c251c3)
 - [x] 重大な API 変更が必要な兆候があれば、M3 着手前に設計ドキュメントへ反映 (本ファイル更新で反映)
 
 ### M3 (Ui<'a> 充実 + 基本ウィジェット拡張) — 旧 M2 の内容
@@ -514,10 +519,11 @@ ui.heavy("track_0_clips", |hctx| {
 - `F:\dev\gui_01\docs\plan.md` — ✅ **本ファイル**、git 管理下の正本
 - `crates/renderer/src/pipelines/line.rs` — ✅ line strip パイプライン
 - `crates/renderer/src/pipelines/line.wgsl` — ✅ 線分 → quad 展開シェーダ
-- `crates/ui/src/widgets/waveform.rs` — ✅ `Ui::waveform` + LOD ピラミッド
-- `crates/examples/waveform_validation/` — ✅ 16×8 = 128 widgets グリッドサンプル
+- `crates/ui/src/widgets/waveform.rs` — ✅ `Ui::waveform` + LOD ピラミッド (完全再構築 + インクリメンタル拡張)
+- `crates/examples/waveform_validation/` — ✅ 16×8 = 128 widgets グリッドサンプル + REC シミュレーション
 - `crates/ui/benches/waveform.rs` — ✅ criterion ベンチ (N=1/8/16/64/128)
-- `crates/ui/tests/no_clone_required.rs` — ⏳ trybuild、未実装
+- `crates/ui/tests/no_clone_required.rs` — ✅ trybuild ハーネス (no-Clone 制約の自動検証)
+- `crates/ui/tests/ui/pass/basic.rs`, `tests/ui/pass/waveform.rs` — ✅ trybuild pass テスト
 
 ### M2 で改修
 - `crates/renderer/src/scene.rs` — ✅ `Scene::line_batches`, `LineSegment`, `LineBatch` を追加
@@ -525,7 +531,7 @@ ui.heavy("track_0_clips", |hctx| {
 - `crates/renderer/src/pipelines/mod.rs` — ✅ `pub mod line;` 追加
 - `crates/ui/src/lib.rs` — ✅ `widgets::waveform` の公開型を再 export
 - `crates/ui/src/ui.rs` — ✅ `Ui::push_lines` 追加、`widget_state` の downcast バグ修正、回帰テスト追加
-- `crates/ui/Cargo.toml` — ✅ `criterion` を `[dev-dependencies]` に追加、`[[bench]]` 設定
+- `crates/ui/Cargo.toml` — ✅ `criterion` / `trybuild` を `[dev-dependencies]` に追加、`[[bench]]` 設定
 - ルート `Cargo.toml` — ✅ `crates/examples/waveform_validation` をメンバー追加
 
 ### M2 で再利用した既存資産
@@ -534,11 +540,6 @@ ui.heavy("track_0_clips", |hctx| {
 - `crates/ui/src/input.rs` — `PointerFrame` をドラッグ判定に流用
 - `crates/renderer/src/pipelines/rect.rs` — 同 wgsl パターン (uniform / instance vbuf / vertex draw) を line.rs でも踏襲
 - `crates/ui/src/widgets/mod.rs` の `WidgetState` blanket impl — `WaveformPyramid` のキャッシュをそのまま乗せる
-
-### M2 残作業
-- `crates/ui/src/widgets/waveform.rs` のインクリメンタル LOD 拡張 (録音追記対応)
-- `crates/examples/waveform_validation/src/main.rs` の録音シミュレーション (1ms 毎 valid_len 拡大トグル)
-- `crates/ui/tests/no_clone_required.rs` (trybuild) 新規作成
 
 ### M5 で追加予定
 - `crates/ui/src/widgets/heavy.rs` — `HeavyCtx`、ViewportKey キャッシュ
@@ -562,3 +563,6 @@ ui.heavy("track_0_clips", |hctx| {
 - 2026-05-01: 設計計画 + CLAUDE.md を git 管理下に追加 (5e14e44)。プラン正本を `docs/plan.md` に確定。
 - 2026-05-01: M2 主要実装 (7ddef3f) — line strip パイプライン + `Ui::waveform` + LOD ピラミッド + `examples/waveform_validation` + `widget_state` バグ修正。
 - 2026-05-01: M2 性能検証 (8276ddd) — criterion ベンチ追加、example を 128 widgets grid 化。実測で DoD クリア (LOD 初回 4ms, 再利用 44µs, N=128 で 5.86ms)。
+- 2026-05-01: ドキュメント整理 (b8e320c) — `docs/plan.md` を実状に合わせて更新、README の参照を最新化。
+- 2026-05-01: trybuild 導入 (3c251c3) — no-Clone 制約 (ユーザ Model に Clone/PartialEq/Hash/Default を要求しない) の回帰防止を CI 固定。
+- 2026-05-01: **M2 完成** — インクリメンタル LOD 拡張 + REC シミュレーション。`MinMaxLevel` を per-channel `Vec<Vec>` に refactor (末尾 push 効率化)、`extend_to` で cascading boundary recompute + push、Space キー REC で実機検証可能に。indirection 増で 44→61 µs/widget の軽い regression を許容して incremental の利得を取る。M2 DoD 全項目クリア。

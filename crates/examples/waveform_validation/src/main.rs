@@ -9,6 +9,8 @@
 //! 操作:
 //! - 左ドラッグ: 横スクロール (全クリップ同期)
 //! - マウスホイール: ズーム (カーソル位置を中心、全クリップ同期)
+//! - Space: REC シミュレーションのトグル (valid_len を実時間で伸ばし、
+//!   インクリメンタル LOD 拡張をストレステスト)
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -18,7 +20,8 @@ use daw_ui_core::{
     WaveformSource, WaveformStyle, WaveformView,
 };
 use daw_ui_platform::{
-    AppEvent, AppHost, PhysicalSize, ScrollDelta, WindowBackend, winit_backend,
+    AppEvent, AppHost, ElementState, PhysicalKey, PhysicalSize, ScrollDelta,
+    WindowBackend, winit_backend,
 };
 use daw_ui_renderer::{Color, Rect, Renderer, Scene};
 use winit::window::WindowAttributes;
@@ -37,9 +40,9 @@ const N_WIDGETS: usize = TRACKS * CLIPS_PER_TRACK;
 struct WaveformAppModel {
     /// Planar layout: `samples[ch][frame]`。
     samples: Vec<Vec<f32>>,
-    /// 有効長 (frame 数)。
+    /// 有効長 (frame 数)。録音中は時間で増える。
     valid_len: usize,
-    /// 内容変更時にインクリメント。M2 検証では生成は 1 回なので 0 固定。
+    /// 内容変更時にインクリメント。REC start 時に bump → ピラミッド完全再構築をトリガ。
     generation: u64,
 
     /// 表示開始 sample index。
@@ -49,9 +52,13 @@ struct WaveformAppModel {
     /// 縦ゲイン。
     vertical_gain: f32,
 
+    /// REC シミュレーション中かどうか。
+    recording: bool,
+    /// REC 中の現在位置 (sample index)。
+    rec_pos: u64,
+
     /// HUD 用: 最後のフレーム時間 (ms)。
     last_frame_ms: f32,
-    /// HUD 用: ピラミッド再構築フラグ (generation 変化時 true、観察用)。
     last_action: String,
 }
 
@@ -66,13 +73,45 @@ impl WaveformAppModel {
             view_start: 0,
             view_len: total_frames as u64,
             vertical_gain: 1.0,
+            recording: false,
+            rec_pos: 0,
             last_frame_ms: 0.0,
-            last_action: "起動 (Drag = 横スクロール、Wheel = ズーム)".to_string(),
+            last_action: "起動 (Drag = 横スクロール / Wheel = ズーム / Space = REC)"
+                .to_string(),
         }
     }
 
     fn total_frames(&self) -> u64 {
         self.samples.first().map_or(0, |p| p.len() as u64)
+    }
+
+    /// REC のトグル。OFF → ON のとき generation を bump して完全再構築を起こし、
+    /// 以降の `valid_len` 拡大はインクリメンタル拡張で処理させる。
+    fn toggle_recording(&mut self) {
+        if self.recording {
+            self.recording = false;
+            self.last_action = format!("REC 停止 (rec_pos={})", self.rec_pos);
+        } else {
+            self.recording = true;
+            self.rec_pos = 0;
+            self.valid_len = 0;
+            self.generation = self.generation.wrapping_add(1);
+            self.last_action = "REC 開始 (Space で停止)".to_string();
+        }
+    }
+
+    /// 経過時間 `dt_secs` 分だけ `rec_pos` / `valid_len` を進める。
+    fn tick_recording(&mut self, dt_secs: f32) {
+        if !self.recording {
+            return;
+        }
+        let advance = (f64::from(SAMPLE_RATE) * f64::from(dt_secs)) as u64;
+        self.rec_pos = (self.rec_pos + advance).min(self.total_frames());
+        self.valid_len = self.rec_pos as usize;
+        if self.rec_pos >= self.total_frames() {
+            self.recording = false;
+            self.last_action = "REC 完了 (audio buffer 末尾到達)".to_string();
+        }
     }
 
     /// 表示範囲を `dx_pixels` だけずらす (drag panning)。
@@ -174,6 +213,9 @@ struct App {
     /// 現在のマウス位置 (zoom anchor 用に on_event で追従)
     cur_mouse: Option<(f32, f32)>,
 
+    /// REC 中の前フレーム時刻 (経過 dt 計算用)
+    rec_last_tick: Option<Instant>,
+
     last_frame_start: Option<Instant>,
 }
 
@@ -191,6 +233,7 @@ impl App {
             pending_zoom_dy: 0.0,
             drag_anchor: None,
             cur_mouse: None,
+            rec_last_tick: None,
             last_frame_start: None,
         }
     }
@@ -252,18 +295,31 @@ impl App {
                     18.0,
                     Color::rgb(0.95, 0.95, 0.97),
                 );
+                let rec_tag = if m.recording {
+                    format!(
+                        "● REC {:.2}s",
+                        m.rec_pos as f32 / SAMPLE_RATE as f32,
+                    )
+                } else {
+                    "PAUSED".to_string()
+                };
                 let info = format!(
-                    "frame {:>5.2} ms │ start {:>7} │ len {:>7} │ spp {:>6.1} │ {} widgets │ total {:.1}s × {} ch @ {}Hz",
+                    "frame {:>5.2} ms │ start {:>7} │ len {:>7} │ spp {:>6.1} │ {} widgets │ valid {:.2}s / {:.2}s │ {}",
                     m.last_frame_ms,
                     m.view_start,
                     m.view_len,
                     m.view_len as f64 / f64::from(area.w),
                     N_WIDGETS,
+                    m.valid_len as f32 / SAMPLE_RATE as f32,
                     m.total_frames() as f32 / SAMPLE_RATE as f32,
-                    m.samples.len(),
-                    SAMPLE_RATE,
+                    rec_tag,
                 );
-                ui.label_at("info", &info, 16.0, 44.0, 13.0, Color::rgb(0.75, 0.78, 0.82));
+                let info_color = if m.recording {
+                    Color::rgb(0.95, 0.50, 0.45)
+                } else {
+                    Color::rgb(0.75, 0.78, 0.82)
+                };
+                ui.label_at("info", &info, 16.0, 44.0, 13.0, info_color);
 
                 // 波形 grid: 各クリップは「同じ source の少しずらした view」を表示。
                 // pyramid キャッシュは widget_id 単位で個別 → 128 個のキャッシュが state に乗る。
@@ -304,7 +360,7 @@ impl App {
                 let footer_y = (screen.height as f32 - 44.0).max(0.0);
                 ui.label_at(
                     "footer1",
-                    "Drag = 横スクロール (全クリップ同期) │ Wheel = ズーム",
+                    "Drag = 横スクロール (全クリップ同期) │ Wheel = ズーム │ Space = REC トグル",
                     16.0,
                     footer_y,
                     13.0,
@@ -345,6 +401,15 @@ impl AppHost for App {
             self.pending_zoom_dy += dy;
         }
 
+        // Space で REC トグル
+        if let AppEvent::Keyboard(key) = &ev
+            && key.state == ElementState::Pressed
+            && key.physical_key == PhysicalKey::Space
+        {
+            self.model.toggle_recording();
+            self.rec_last_tick = None;
+        }
+
         self.input.ingest(&ev);
         match ev {
             AppEvent::Resized(size) => {
@@ -362,7 +427,19 @@ impl AppHost for App {
     }
 
     fn on_render(&mut self) -> bool {
-        self.last_frame_start = Some(Instant::now());
+        let now = Instant::now();
+        // REC 中: 経過 dt で valid_len を伸ばす (インクリメンタル LOD 拡張をテスト)
+        if self.model.recording {
+            if let Some(prev) = self.rec_last_tick {
+                let dt = now.duration_since(prev).as_secs_f32();
+                self.model.tick_recording(dt);
+            }
+            self.rec_last_tick = Some(now);
+        } else {
+            self.rec_last_tick = None;
+        }
+
+        self.last_frame_start = Some(now);
         self.build_ui();
         if let Err(e) = self.renderer.render(&self.scene) {
             eprintln!("render error: {e}");
@@ -370,8 +447,8 @@ impl AppHost for App {
         if let Some(t) = self.last_frame_start.take() {
             self.model.last_frame_ms = t.elapsed().as_secs_f32() * 1000.0;
         }
-        // drag 中は連続再描画 (mouse 移動だけでは redraw されないことがあるため)
-        self.drag_anchor.is_some()
+        // drag / REC 中は連続再描画
+        self.drag_anchor.is_some() || self.model.recording
     }
 }
 
