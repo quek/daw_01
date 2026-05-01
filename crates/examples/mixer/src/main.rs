@@ -199,7 +199,7 @@ impl App {
                         h: fader_h,
                     };
                     let resp: FaderResponse =
-                        ui.fader_at(("ch_fader", i), rect, m.faders[i], move |v| {
+                        ui.fader_at(("ch_fader", i), rect, m.faders[i], 0.0, move |v| {
                             Edit::mutate(move |m: &mut MixerModel| {
                                 m.faders[i] = v;
                                 m.last_action = format!("ch{} fader = {v:.2}", i + 1);
@@ -227,7 +227,7 @@ impl App {
                         h: knob_size,
                     };
                     let kresp: KnobResponse =
-                        ui.knob_at(("ch_pan", i), knob_rect, m.pans[i], move |v| {
+                        ui.knob_at(("ch_pan", i), knob_rect, m.pans[i], 0.5, move |v| {
                             Edit::mutate(move |m: &mut MixerModel| {
                                 m.pans[i] = v;
                                 let lr = (v - 0.5) * 2.0; // -1..1

@@ -14,7 +14,7 @@ use winit::keyboard::{KeyCode, PhysicalKey as WinitPhysKey};
 use winit::window::{CursorIcon as WinitCursor, Window, WindowAttributes, WindowId};
 
 use crate::event::{
-    AppEvent, ElementState, KeyEvent, MouseButton, PhysicalKey, PhysicalPosition,
+    AppEvent, ElementState, KeyEvent, Modifiers, MouseButton, PhysicalKey, PhysicalPosition,
     PhysicalSize, ScrollDelta,
 };
 use crate::window::{AppHost, CursorIcon, WindowBackend};
@@ -176,6 +176,15 @@ impl<H: AppHost, F: FnOnce(WinitWindow) -> H> ApplicationHandler for WinitRunner
                 host.on_event(AppEvent::Scroll(d));
             }
             WindowEvent::Focused(f) => host.on_event(AppEvent::Focus(f)),
+            WindowEvent::ModifiersChanged(mods) => {
+                let st = mods.state();
+                host.on_event(AppEvent::ModifiersChanged(Modifiers {
+                    ctrl: st.control_key(),
+                    shift: st.shift_key(),
+                    alt: st.alt_key(),
+                    logo: st.super_key(),
+                }));
+            }
             WindowEvent::Ime(ime) => match ime {
                 WinitIme::Preedit(text, cursor) => {
                     host.on_event(AppEvent::ImePreedit { text, cursor });

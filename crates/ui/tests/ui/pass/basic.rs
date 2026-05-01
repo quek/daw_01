@@ -46,13 +46,15 @@ fn main() {
                 })
             });
             // fader (M3): 矩形指定 + vstack 版の両方が non-Clone Model でコンパイルする。
+            // default_value (4 番目の引数) はダブルクリックリセット用 (M3 Phase 4d)。
             let _ = ui.fader_at(
                 "vol",
                 Rect { x: 0.0, y: 0.0, w: 32.0, h: 120.0 },
                 m.volume,
+                0.0,
                 |v| Edit::mutate(move |m: &mut Model| m.volume = v),
             );
-            let _ = ui.fader("vol2", m.volume, |v| {
+            let _ = ui.fader("vol2", m.volume, 0.0, |v| {
                 Edit::mutate(move |m: &mut Model| m.volume = v)
             });
             // knob (M3): 同様に non-Clone Model でコンパイルする。
@@ -60,9 +62,10 @@ fn main() {
                 "pan",
                 Rect { x: 0.0, y: 0.0, w: 64.0, h: 64.0 },
                 m.volume,
+                0.5,
                 |v| Edit::mutate(move |m: &mut Model| m.volume = v),
             );
-            let _ = ui.knob("pan2", m.volume, |v| {
+            let _ = ui.knob("pan2", m.volume, 0.5, |v| {
                 Edit::mutate(move |m: &mut Model| m.volume = v)
             });
             // checkbox (M3): non-Clone Model でコンパイルする。

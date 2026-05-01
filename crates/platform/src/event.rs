@@ -32,6 +32,21 @@ pub enum ElementState {
     Released,
 }
 
+/// キーボード修飾キーの状態 (winit 非依存の中立型)。
+///
+/// 4 フラグは `Ctrl/Shift/Alt/Logo` の canonical な組合せ (winit / NSEvent /
+/// XKB と同形)。`clippy::struct_excessive_bools` はこの種の "正規 4 つ並び" を
+/// 否定する意図ではないので allow する。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct Modifiers {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    /// Win / Cmd キー。
+    pub logo: bool,
+}
+
 /// キー入力 (M1 では最低限。論理キー名は後で拡張)。
 #[derive(Debug, Clone)]
 pub struct KeyEvent {
@@ -87,6 +102,9 @@ pub enum AppEvent {
     Scroll(ScrollDelta),
     /// キー入力。
     Keyboard(KeyEvent),
+    /// キーボード修飾キー (Ctrl/Shift/Alt/Logo) の状態が変わった。
+    /// `MouseInput` イベントより先に届く前提で、`InputAccumulator` が単独で track する。
+    ModifiersChanged(Modifiers),
     /// IME プリエディット (将来用、M1 では未使用)。
     ImePreedit { text: String, cursor: Option<(usize, usize)> },
     /// IME 確定。

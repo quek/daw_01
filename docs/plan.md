@@ -257,6 +257,27 @@ F:\dev\gui_01\
 | `examples/mixer` に title 編集 text_input。OS ウィンドウタイトルも `last_window_title` 差分で追従 | ✅ | (本コミット) |
 | `trybuild` / 単体テスト 1 本 (click → focus → typing で text 変化) | ✅ | (本コミット) |
 
+**Phase 4d 進捗 (2026-05-01)** — fader / knob のダブルクリック・リセット + Ctrl + ドラッグ高精度モード:
+
+| 成果物 | 状態 | コミット |
+|---|---|---|
+| 中立 `Modifiers` 型 + `AppEvent::ModifiersChanged` を `crates/platform/src/event.rs` に追加 | ✅ | (本コミット) |
+| `winit_backend` で `WindowEvent::ModifiersChanged` を中立 `Modifiers` に変換して emit | ✅ | (本コミット) |
+| `PointerFrame.modifiers` + `InputAccumulator.modifiers` で widget まで modifier 状態を配線 | ✅ | (本コミット) |
+| `Ui::fader_at` / `fader` / `knob_at` / `knob` に `default_value: f32` を追加 (新シグネチャ) | ✅ | (本コミット) |
+| `FaderState` / `KnobState` に `last_click: Option<ClickRecord>` + 新 `DragAnchor { pointer_y, value, ctrl }` | ✅ | (本コミット) |
+| ダブルクリック判定: 300ms × 5px 以内の 2 回目 press → `default_value` リセット (drag は始めない) | ✅ | (本コミット) |
+| Ctrl + drag: anchor の ctrl 状態に応じて `dv *= 0.1`、mid-drag toggle で再 anchor (jump 防止) | ✅ | (本コミット) |
+| `examples/mixer` の呼び出しを新シグネチャに追従 (fader default=0.0 / knob default=0.5) | ✅ | (本コミット) |
+| `trybuild` (`tests/ui/pass/basic.rs`) を新シグネチャに追従、no-Clone 制約は維持 | ✅ | (本コミット) |
+| 単体テスト 12 本追加 (fader 6 + knob 6): 双方とも double-click / 閾値超過 / 距離超過 / Ctrl 1/10 / mid-drag toggle / triple-click | ✅ | (本コミット) |
+
+**設計判断のポイント**:
+- **Mid-drag ctrl toggle 時の再 anchor**: plan.md 旧版の sketch (`if pointer.ctrl { dv *= 0.1 }`) を cumulative-from-anchor の delta にそのまま乗じると、ctrl on/off 瞬間に押下からの全体 delta がスケール変わって値 jump する。anchor を `(現在 py, 現在 value, 現在 ctrl)` に張り直すことで return-to-press-position の cumulative 性質を保ったまま境界で滑らかに切り替わる。
+- **Double-click 後は drag に入らない**: Live / Logic / Pro Tools 標準。リセットと drag の意図が混ざるのを防ぐ。state.last_click も同時に消すことで 3 連 click の 3 回目を新しい drag 開始扱いにする。
+- **時刻ソース**: widget 内で直接 `Instant::now()` を呼ぶ。300ms 程度の精度で十分、`Ui::frame_time()` 配線は M4 (scenegraph) と一緒にやる方が筋が良い (今は不要)。
+- **`KeyEvent` への modifier 追加は今回スコープ外**: text_input の Ctrl+C/V などは別フェーズで対応。
+
 **Phase 4c 進捗 (2026-05-01)** — IME 統合:
 
 | 成果物 | 状態 | コミット |
@@ -283,10 +304,10 @@ F:\dev\gui_01\
   proportional フォントでも正しく動かすこと、を別フェーズで対応する。
   ui crate から renderer の `FontSystem` にアクセスする経路を整える必要がある (Arc 共有 /
   measure trait 公開 / 別 FontSystem を持つ、のいずれか)。
-- **DAW 標準の値編集挙動 (fader / knob 共通)**:
-  - **ダブルクリックでデフォルト値に戻る**: `fader_at` / `knob_at` に `default_value: f32` を追加。state に `last_click_time` を持たせ、~300ms × 数 px 以内の 2 回目クリックを検出 → `on_change(default_value)` 発行。
-  - **Ctrl + ドラッグで高精度 (感度 1/10)**: `InputAccumulator` を拡張し modifier state (Ctrl/Shift/Alt) を track、`PointerFrame` に modifier フィールドを足す。fader/knob の drag 計算で `if pointer.ctrl { dv *= 0.1 }` で抑制。
-  - 将来 text_input の数値編集 (ドラッグで増減) や knob のホイール調整にも同じ modifier 機構が乗る。
+- **DAW 標準の値編集挙動 (fader / knob 共通)**: ✅ Phase 4d で完了 (上記表参照)
+- **将来の発展**: text_input の数値編集 (ドラッグで増減) や knob のホイール調整に
+  同じ modifier 機構 (`pointer.modifiers.ctrl`) を載せる。`KeyEvent` への modifier
+  追加 (Ctrl+C/V など) は別フェーズ。
 - **`rtry` のまぜ書き入力対応**: `rtry` (別プロジェクト) のまぜ書き (mazegaki) 入力プロトコル
   に合わせた API を text_input に足す。preedit 区切りや候補編集の細かい制御が必要に
   なる見込み。`rtry` 側の入力プロトコルが固まってから設計。
@@ -659,3 +680,4 @@ ui.heavy("track_0_clips", |hctx| {
 - 2026-05-01: **M3 Phase 4a** — keyboard / focus 基盤。`InputAccumulator` が KeyEvent 蓄積、`UiHost::focused` でキーボードフォーカス保持、`Ui::set_focus` / `clear_focus_if_focused` / `is_focused` / `take_keyboard_events_if_focused`。クリックで誰も `set_focus` しなければ blur。`UiHost::frame` シグネチャに `keyboard: Vec<KeyEvent>` 追加 (既存 callers 全部追従)。単体テスト 4 本追加。これで text_input (4b) を載せる土台が揃った。
 - 2026-05-01: **M3 Phase 4b** — text_input (ASCII 編集)。Ui::text_input_at / text_input、TextInputState (cursor_byte + armed-state click)、char 挿入 / Backspace / 矢印 / Enter / Escape。is_focused を pending_focus ベースに変更して same-frame の click→focus を即時反映、外側 press で widget が自己 blur することで枠線解除も即時。UiHost に focus_changed_in_last_frame() を追加してアプリ側の追加 redraw 用。mixer の title を編集可能化 + OS タイトル追従 (last_window_title 差分)。単体テスト追加。
 - 2026-05-01: **M3 Phase 4c** — IME 統合 (基本)。InputAccumulator が ImePreedit / ImeCommit を蓄積、FrameInput で pointer/keyboard/ime をまとめて Ui::frame へ。Ui::take_ime_events_if_focused + Ui::request_ime、UiHost::ime_request()。WindowBackend::set_ime_allowed / set_ime_cursor_area を winit_backend で実装、winit の WindowEvent::Ime → AppEvent::ImePreedit/ImeCommit マッピングも winit_backend 側で完了。text_input が preedit を state に保持して描画 + cursor 位置で IME 候補ウィンドウを要求。mixer App は ime_request の Some/None 切替で OS への set_ime_allowed を差分で呼ぶ。単体テスト 2 本追加 (IME-only-to-focused / preedit-then-commit)。フォントを **HackGen Console NF (固定幅)** に切り替え、全テキスト (prefix + preedit + suffix) を 1 つの GlyphArea で描画して並びを正確化。pixel-perfect な cursor / 下線 / IME 候補位置と preedit 色分け復活は cosmic-text の measure 統合 (別フェーズ) で対応予定。`rtry` のまぜ書き入力対応 / GetText i18n 対応も TODO に明記。これで M3 の入力周り (focus / 通常キー / IME 基本) は機能しており、残りは LayoutPass 拡張・8ch mixer 拡張・上記 polish。
+- 2026-05-01: **M3 Phase 4d** — fader / knob のダブルクリック・リセット + Ctrl + ドラッグ高精度モード。中立 `Modifiers` 型 + `AppEvent::ModifiersChanged` を platform crate に追加し、`winit_backend` が `WindowEvent::ModifiersChanged` を変換して emit、`PointerFrame.modifiers` まで配線。`Ui::fader_at` / `fader` / `knob_at` / `knob` に `default_value: f32` 引数を追加、state を `DragAnchor { pointer_y, value, ctrl } + last_click: Option<ClickRecord>` に拡張。300ms × 5px 以内の 2 回目 press で `default_value` リセット、Ctrl+drag で `dv *= 0.1`、mid-drag で Ctrl on/off したときは anchor を再構築して値 jump を防ぐ。例 (mixer) の呼び出しと trybuild の pass を新シグネチャに追従、単体テスト 12 本追加 (fader 6 + knob 6: double-click / 閾値超過 / 距離超過 / Ctrl 1/10 感度 / mid-drag toggle / triple-click)。これで M3 の値編集 UX が DAW として成立するレベルまで揃った。

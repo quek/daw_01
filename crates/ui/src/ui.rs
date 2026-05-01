@@ -353,9 +353,7 @@ mod tests {
         // Frame 1: cursor をボタン上にホバー (まだクリック無し)。
         let pointer_hover = PointerFrame {
             pos: Some((50.0, 16.0)),
-            primary_just_pressed: false,
-            primary_just_released: false,
-            primary_pressed: false,
+            ..PointerFrame::default()
         };
         let edits = host.frame(&model, &mut scene, screen, FrameInput { pointer: pointer_hover, ..Default::default() }, |_, ui| {
             ui.button_at("test", "click me", rect, || {
@@ -372,7 +370,7 @@ mod tests {
             pos: Some((50.0, 16.0)),
             primary_just_pressed: true,
             primary_just_released: true,
-            primary_pressed: false,
+            ..PointerFrame::default()
         };
         let edits = host.frame(&model, &mut scene, screen, FrameInput { pointer: pointer_click, ..Default::default() }, |_, ui| {
             ui.button_at("test", "click me", rect, || {
@@ -437,6 +435,7 @@ mod tests {
                 primary_just_pressed: true,
                 primary_just_released: false,
                 primary_pressed: true,
+                ..PointerFrame::default()
             },
         );
         for e in edits { e.apply(&mut model); }
@@ -451,7 +450,7 @@ mod tests {
                 pos: Some((50.0, 16.0)),
                 primary_just_pressed: false,
                 primary_just_released: true,
-                primary_pressed: false,
+                ..PointerFrame::default()
             },
         );
         for e in edits { e.apply(&mut model); }
@@ -504,9 +503,8 @@ mod tests {
         // Frame 2: クリック発生 (just_released=true) で誰も set_focus を呼ばない → blur。
         let click = PointerFrame {
             pos: Some((50.0, 50.0)),
-            primary_just_pressed: false,
             primary_just_released: true,
-            primary_pressed: false,
+            ..PointerFrame::default()
         };
         host.frame(&(), &mut scene, screen, FrameInput { pointer: click, ..Default::default() }, |_, _ui| {
             // 誰も set_focus / clear_focus を呼ばない。
@@ -564,7 +562,7 @@ mod tests {
             pos: Some((50.0, 14.0)),
             primary_just_pressed: true,
             primary_just_released: true,
-            primary_pressed: false,
+            ..PointerFrame::default()
         };
         let edits = host.frame(&model, &mut scene, screen, FrameInput { pointer: click, ..Default::default() }, |_, ui| {
             ui.text_input_at("ti", rect, "", |new| {
@@ -632,7 +630,7 @@ mod tests {
             pos: Some((50.0, 14.0)),
             primary_just_pressed: true,
             primary_just_released: true,
-            primary_pressed: false,
+            ..PointerFrame::default()
         };
         let edits = host.frame(
             &model,

@@ -1,6 +1,6 @@
 //! 入力状態 — `AppEvent` を蓄積してフレーム毎に Ui に渡す形にする。
 
-use daw_ui_platform::{AppEvent, ElementState, KeyEvent, MouseButton, PhysicalPosition};
+use daw_ui_platform::{AppEvent, ElementState, KeyEvent, Modifiers, MouseButton, PhysicalPosition};
 
 /// 1 フレーム分のポインタ入力スナップショット。
 #[derive(Debug, Clone, Copy, Default)]
@@ -12,6 +12,8 @@ pub struct PointerFrame {
     pub primary_just_released: bool,
     /// 現在押下中。
     pub primary_pressed: bool,
+    /// 現在の修飾キー状態 (Ctrl / Shift / Alt / Logo)。Ctrl+drag による高精度モードなどに使う。
+    pub modifiers: Modifiers,
 }
 
 /// IME (input method editor) のイベント。focused widget が処理する。
@@ -40,6 +42,9 @@ pub struct InputAccumulator {
     pending_just_released: bool,
     pending_keys: Vec<KeyEvent>,
     pending_ime: Vec<ImeEvent>,
+    /// 直近の `AppEvent::ModifiersChanged` で受け取った修飾キー状態。
+    /// フレームをまたいで持続する (next ModifiersChanged まで現状維持)。
+    modifiers: Modifiers,
 }
 
 impl InputAccumulator {
@@ -83,6 +88,9 @@ impl InputAccumulator {
             AppEvent::ImeCommit(text) => {
                 self.pending_ime.push(ImeEvent::Commit(text.clone()));
             }
+            AppEvent::ModifiersChanged(m) => {
+                self.modifiers = *m;
+            }
             _ => {}
         }
     }
@@ -94,6 +102,7 @@ impl InputAccumulator {
             primary_just_pressed: self.pending_just_pressed,
             primary_just_released: self.pending_just_released,
             primary_pressed: self.primary_pressed,
+            modifiers: self.modifiers,
         };
         self.pending_just_pressed = false;
         self.pending_just_released = false;
