@@ -257,6 +257,27 @@ F:\dev\gui_01\
 | `examples/mixer` に title 編集 text_input。OS ウィンドウタイトルも `last_window_title` 差分で追従 | ✅ | (本コミット) |
 | `trybuild` / 単体テスト 1 本 (click → focus → typing で text 変化) | ✅ | (本コミット) |
 
+**Phase 6 進捗 (2026-05-01)** — `examples/mixer` を 8 ch に拡張、LayoutPass の最初の実用例:
+
+| 成果物 | 状態 | コミット |
+|---|---|---|
+| `MixerModel` の `[T; 3]` を `[T; 8]` に拡張 (faders / pans / mutes) + 初期値 | ✅ | (本コミット) |
+| `build_ui` のチャンネルストリップを LayoutPass に置換 (row(8) × column(fader/pct/knob/pan/mute)) | ✅ | (本コミット) |
+| `Padding::axis(20, 0)` + `Gap::xy(16, 0)` で外周と列間距離、`Gap::all(6)` で列内 widget 間距離 | ✅ | (本コミット) |
+| `daw_ui_core` から `FlexDirection` / `NodeId` を re-export (`taffy::prelude` 経由) | ✅ | (本コミット) |
+| ストリップヘッダラベルを 1 本に統合: "M3: 8ch チャンネルストリップ — drag / Ctrl+drag (1/10) / dbl-click でリセット" | ✅ | (本コミット) |
+| ウィンドウ高さ 600 → 660、`strip_origin_y` 240 → 280 で左側 buttons との視覚衝突を解消 | ✅ | (本コミット) |
+| 実機検証: 8 ch 列が等間隔で並ぶ、各 ch で Ctrl+drag / dbl-click が独立動作 | ✅ | (本コミット) |
+
+**LayoutPass を実用例で使ったことで判明した ergonomics 課題** (M3 内では別タスク化、まずは「使ってみる」段階):
+
+- `NodeId → Rect` の HashMap collect が必要 (各 widget の rect を引くため)。`LayoutPass::rect(node) -> Rect` のような後付け API があると簡単になりそう
+- `compute(root, w, h)` の戻りは原点 (0, 0) 起点。screen 座標に置く際は `to_screen` クロージャで足し算する必要がある。`compute_at(root, w, h, origin)` のような変種があると一行で済む
+
+これらは利用例が増えてから判断する。
+
+---
+
 **Phase 5 進捗 (2026-05-01)** — `LayoutPass` 拡張 (per-side padding / per-axis gap / fixed + flex_grow):
 
 | 成果物 | 状態 | コミット |
@@ -317,7 +338,7 @@ F:\dev\gui_01\
 **残作業 (M3 残)**:
 
 - `LayoutPass` 拡張: padding / gap / fixed size / proportional growth: ✅ Phase 5 で完了 (上記表参照)
-- `examples/mixer` を 8ch (8 fader + 8 pan knob + 8 mute checkbox) に拡張
+- `examples/mixer` を 8ch (8 fader + 8 pan knob + 8 mute checkbox) に拡張: ✅ Phase 6 で完了 (上記表参照)
 - 微調整: fader / knob の感度カーブ、見た目 (背景パネル、影、目盛り)
 - **text_input polish**: cursor / preedit 下線 / IME 候補位置の pixel-perfect 化。
   現状は `HackGen Console NF` 固定幅前提の近似 (ASCII=7 / CJK=14)。`cosmic-text` の
@@ -703,3 +724,4 @@ ui.heavy("track_0_clips", |hctx| {
 - 2026-05-01: **M3 Phase 4c** — IME 統合 (基本)。InputAccumulator が ImePreedit / ImeCommit を蓄積、FrameInput で pointer/keyboard/ime をまとめて Ui::frame へ。Ui::take_ime_events_if_focused + Ui::request_ime、UiHost::ime_request()。WindowBackend::set_ime_allowed / set_ime_cursor_area を winit_backend で実装、winit の WindowEvent::Ime → AppEvent::ImePreedit/ImeCommit マッピングも winit_backend 側で完了。text_input が preedit を state に保持して描画 + cursor 位置で IME 候補ウィンドウを要求。mixer App は ime_request の Some/None 切替で OS への set_ime_allowed を差分で呼ぶ。単体テスト 2 本追加 (IME-only-to-focused / preedit-then-commit)。フォントを **HackGen Console NF (固定幅)** に切り替え、全テキスト (prefix + preedit + suffix) を 1 つの GlyphArea で描画して並びを正確化。pixel-perfect な cursor / 下線 / IME 候補位置と preedit 色分け復活は cosmic-text の measure 統合 (別フェーズ) で対応予定。`rtry` のまぜ書き入力対応 / GetText i18n 対応も TODO に明記。これで M3 の入力周り (focus / 通常キー / IME 基本) は機能しており、残りは LayoutPass 拡張・8ch mixer 拡張・上記 polish。
 - 2026-05-01: **M3 Phase 4d** — fader / knob のダブルクリック・リセット + Ctrl + ドラッグ高精度モード。中立 `Modifiers` 型 + `AppEvent::ModifiersChanged` を platform crate に追加し、`winit_backend` が `WindowEvent::ModifiersChanged` を変換して emit、`PointerFrame.modifiers` まで配線。`Ui::fader_at` / `fader` / `knob_at` / `knob` に `default_value: f32` 引数を追加、state を `DragAnchor { pointer_y, value, ctrl } + last_click: Option<ClickRecord>` に拡張。300ms × 5px 以内の 2 回目 press で `default_value` リセット、Ctrl+drag で `dv *= 0.1`、mid-drag で Ctrl on/off したときは anchor を再構築して値 jump を防ぐ。例 (mixer) の呼び出しと trybuild の pass を新シグネチャに追従、単体テスト 12 本追加 (fader 6 + knob 6: double-click / 閾値超過 / 距離超過 / Ctrl 1/10 感度 / mid-drag toggle / triple-click)。これで M3 の値編集 UX が DAW として成立するレベルまで揃った。
 - 2026-05-01: **M3 Phase 5** — `LayoutPass` 拡張。中立 `Padding { top, right, bottom, left }` / `Gap { x, y }` 型を導入、`LayoutPass::flex` シグネチャを `flex(direction, gap: Gap, padding: Padding, children)` に置換 (zero callers なので breaking OK)、`leaf_grow(grow: f32)` で `flex_basis: 0` + `flex_grow` による残余空間の比例分配をサポート。flex 親の size を `Dimension::auto` から `Dimension::percent(1.0) × percent(1.0)` に変えて、grow-only 子で構成しても親が利用可能領域を埋めるように修正 (auto だと fit-content = 0px に潰れる)。`Padding` / `Gap` を `crates/ui/src/lib.rs` から re-export。単体テスト 6 本追加 (column gap / per-side padding / per-axis gap / 2:1 grow / fixed + grow / padding shrinks grow area)。これで chrome layout の表現力が flex_grow / fixed / per-side padding まで揃った。残る M3 タスクは 8ch mixer 拡張、fader/knob 視覚 polish、text_input pixel-perfect (cosmic-text measure 統合)、i18n。
+- 2026-05-01: **M3 Phase 6** — `examples/mixer` を 3 ch から 8 ch に拡張、LayoutPass の最初の実用例として `Padding::axis(20, 0)` + `Gap::xy(16, 0)` で 8 列の row、各列内で `Gap::all(6)` の column flex を組む。`taffy::prelude::{FlexDirection, NodeId}` を `daw_ui_core` から re-export して、利用側が taffy を直接依存に入れずに済むようにした。手動 rect 計算 (`fader_left + i * (fader_w + 16.0)`) が消え、列レイアウトは LayoutPass 1 箇所で済む。ウィンドウ縦サイズ 600 → 660、ストリップ原点 y 240 → 280 で左側 button 群との視覚衝突を解消、ストリップヘッダを Phase 4d の操作 (Ctrl+drag / dbl-click) を含む 1 本にまとめた。`MixerModel` 配列を `[T; 8]` に拡張、初期値はリセットの動作確認しやすいよう各 ch で異なる値に。LayoutPass の利用で見えた ergonomics 課題 (NodeId → Rect の HashMap 引き / origin offset の手動足し算) は別タスクで API 改善するか判断。

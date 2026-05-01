@@ -12,6 +12,12 @@
 use taffy::prelude::*;
 // daw_ui_renderer::Rect は名前衝突するので関数本体でフルパス参照する
 
+// taffy の `FlexDirection` / `NodeId` は `LayoutPass` の API シグネチャに登場するため、
+// 利用側 (mixer 等) が taffy を直接依存に入れずに済むよう、ここで再エクスポートする。
+// これらは "実装詳細を露出している" と解釈もできるが、`FlexDirection` は典型的な flex 概念
+// で wrapping しても情報量が増えないため pragmatic に taffy のものをそのまま使う。
+pub use taffy::prelude::{FlexDirection, NodeId};
+
 /// flex 親の per-side padding (px)。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Padding {

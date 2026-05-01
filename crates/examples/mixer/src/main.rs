@@ -7,11 +7,12 @@
 //! - ボタンを taffy 経由でレイアウトしてヒットテストできる
 //! - Edit がアプリ側 Model を変更する (ライブラリは Model を Clone しない)
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use daw_ui_core::{Edit, InputAccumulator, UiHost};
+use daw_ui_core::{Edit, FlexDirection, Gap, InputAccumulator, LayoutPass, NodeId, Padding, UiHost};
 use daw_ui_platform::{AppEvent, AppHost, PhysicalSize, WindowBackend, winit_backend};
-use daw_ui_core::{CheckboxResponse, FaderResponse, KnobResponse, TextInputResponse};
+use daw_ui_core::{FaderResponse, KnobResponse, TextInputResponse};
 use daw_ui_renderer::{Color, Rect, RectCommand, Renderer, Scene};
 use winit::window::WindowAttributes;
 
@@ -23,24 +24,24 @@ struct MixerModel {
     bench_active: bool,
     /// メッセージ。
     last_action: String,
-    /// M3 動作確認用: 3 ch のフェーダ値 (0..1)。
-    faders: [f32; 3],
-    /// M3 動作確認用: 3 ch の pan ノブ値 (0..1, 0.5 = center)。
-    pans: [f32; 3],
-    /// M3 動作確認用: 3 ch の mute フラグ。
-    mutes: [bool; 3],
+    /// M3 動作確認用: 8 ch のフェーダ値 (0..1, ダブルクリックで 0.0)。
+    faders: [f32; 8],
+    /// M3 動作確認用: 8 ch の pan ノブ値 (0..1, 0.5 = center, ダブルクリックで 0.5)。
+    pans: [f32; 8],
+    /// M3 動作確認用: 8 ch の mute フラグ。
+    mutes: [bool; 8],
 }
 
 impl MixerModel {
     fn new() -> Self {
         Self {
-            title: "daw-ui ミキサー (M1+M3 動作確認)".to_string(),
+            title: "daw-ui ミキサー (M3 8ch)".to_string(),
             count: 0,
             bench_active: false,
             last_action: "起動しました".to_string(),
-            faders: [0.5, 0.7, 0.3],
-            pans: [0.5, 0.4, 0.6],
-            mutes: [false, false, false],
+            faders: [0.50, 0.70, 0.30, 0.60, 0.40, 0.80, 0.20, 0.55],
+            pans: [0.50, 0.40, 0.60, 0.55, 0.30, 0.70, 0.50, 0.45],
+            mutes: [false; 8],
         }
     }
 }
@@ -168,38 +169,78 @@ impl App {
                     })
                 });
 
-                // 3ch フェーダ (M3 動作確認)。
-                let fader_w = 60.0;
-                let fader_h = 200.0;
-                let fader_top = 240.0;
-                let fader_left = 320.0;
+                // 8 ch チャンネルストリップ。LayoutPass で row(8 col) × column(fader/pct/knob/pan/mute)
+                // を組む (M3 Phase 5 で拡張した Padding/Gap を実用)。
+                //
+                // 各 ch column の高さ合計:
+                //   fader 200 + gap 6 + pct 26 + gap 6 + knob 56 + gap 6 + pan 16 + gap 6 + mute 24 = 346
+                // mixer_root 幅合計:
+                //   pad_left 20 + 8×60 + 7×16 + pad_right 20 = 632
+                // 左側 (title/count/status/3 buttons) は convenience method の cursor+next_y で
+                // full-width に縦積みされる。strip header はそれを下回る位置に置き、
+                // 視覚衝突を避ける (左側 3 buttons は y ≈ 154-226、bench ボタン下端 226)。
+                let strip_origin_x = 320.0;
+                let strip_origin_y = 280.0;
+                let strip_avail_w = 632.0_f32;
+                let strip_avail_h = 346.0_f32;
+
                 ui.label_at(
-                    "fader_label",
-                    "M3: フェーダ (上下ドラッグ)",
-                    fader_left,
-                    fader_top - 28.0,
+                    "strip_label",
+                    "M3: 8ch チャンネルストリップ — drag / Ctrl+drag (1/10) / dbl-click でリセット",
+                    strip_origin_x,
+                    strip_origin_y - 28.0,
                     14.0,
                     Color::rgb(0.85, 0.88, 0.92),
                 );
-                let knob_size = 56.0;
-                let knob_top = fader_top + fader_h + 28.0;
-                ui.label_at(
-                    "knob_label",
-                    "M3: pan ノブ (0.5 = center)",
-                    fader_left,
-                    knob_top - 22.0,
-                    14.0,
-                    Color::rgb(0.85, 0.88, 0.92),
+
+                // LayoutPass で各 ch のサブノードと列ノードを作る。
+                let mut layout = LayoutPass::new();
+                let mut sub_nodes: Vec<(NodeId, NodeId, NodeId, NodeId, NodeId)> =
+                    Vec::with_capacity(8);
+                let mut col_nodes: Vec<NodeId> = Vec::with_capacity(8);
+                for _ in 0..8 {
+                    let fader_n = layout.leaf(60.0, 200.0);
+                    let pct_n   = layout.leaf(60.0, 26.0);
+                    let knob_n  = layout.leaf(60.0, 56.0);
+                    let pan_n   = layout.leaf(60.0, 16.0);
+                    let mute_n  = layout.leaf(60.0, 24.0);
+                    sub_nodes.push((fader_n, pct_n, knob_n, pan_n, mute_n));
+                    col_nodes.push(layout.flex(
+                        FlexDirection::Column,
+                        Gap::all(6.0),
+                        Padding::ZERO,
+                        &[fader_n, pct_n, knob_n, pan_n, mute_n],
+                    ));
+                }
+                let root = layout.flex(
+                    FlexDirection::Row,
+                    Gap::xy(16.0, 0.0),
+                    Padding::axis(20.0, 0.0),
+                    &col_nodes,
                 );
-                for i in 0..3 {
-                    let rect = Rect {
-                        x: fader_left + i as f32 * (fader_w + 16.0),
-                        y: fader_top,
-                        w: fader_w,
-                        h: fader_h,
-                    };
+
+                // 計算 → NodeId → Rect の HashMap で引けるようにする。
+                let layouts: HashMap<NodeId, Rect> = layout
+                    .compute(root, strip_avail_w, strip_avail_h)
+                    .into_iter()
+                    .collect();
+                let to_screen = |r: Rect| Rect {
+                    x: r.x + strip_origin_x,
+                    y: r.y + strip_origin_y,
+                    w: r.w,
+                    h: r.h,
+                };
+
+                for i in 0..8 {
+                    let (fader_n, pct_n, knob_n, pan_n, mute_n) = sub_nodes[i];
+                    let fader_rect = to_screen(layouts[&fader_n]);
+                    let pct_rect   = to_screen(layouts[&pct_n]);
+                    let knob_rect  = to_screen(layouts[&knob_n]);
+                    let pan_rect   = to_screen(layouts[&pan_n]);
+                    let mute_rect  = to_screen(layouts[&mute_n]);
+
                     let resp: FaderResponse =
-                        ui.fader_at(("ch_fader", i), rect, m.faders[i], 0.0, move |v| {
+                        ui.fader_at(("ch_fader", i), fader_rect, m.faders[i], 0.0, move |v| {
                             Edit::mutate(move |m: &mut MixerModel| {
                                 m.faders[i] = v;
                                 m.last_action = format!("ch{} fader = {v:.2}", i + 1);
@@ -209,8 +250,8 @@ impl App {
                     ui.label_at(
                         ("fader_pct", i),
                         &format!("ch{}\n{percent}%", i + 1),
-                        rect.x,
-                        rect.y + rect.h + 6.0,
+                        pct_rect.x,
+                        pct_rect.y,
                         12.0,
                         if resp.dragging {
                             Color::rgb(0.95, 0.97, 1.0)
@@ -219,13 +260,6 @@ impl App {
                         },
                     );
 
-                    // pan knob (fader と同じ列、下に配置)
-                    let knob_rect = Rect {
-                        x: rect.x + (fader_w - knob_size) * 0.5,
-                        y: knob_top,
-                        w: knob_size,
-                        h: knob_size,
-                    };
                     let kresp: KnobResponse =
                         ui.knob_at(("ch_pan", i), knob_rect, m.pans[i], 0.5, move |v| {
                             Edit::mutate(move |m: &mut MixerModel| {
@@ -251,8 +285,8 @@ impl App {
                     ui.label_at(
                         ("pan_label", i),
                         &pan_label,
-                        knob_rect.x,
-                        knob_rect.y + knob_rect.h + 4.0,
+                        pan_rect.x,
+                        pan_rect.y,
                         12.0,
                         if kresp.dragging {
                             Color::rgb(0.95, 0.97, 1.0)
@@ -261,16 +295,9 @@ impl App {
                         },
                     );
 
-                    // mute checkbox (knob のさらに下)
-                    let cb_rect = Rect {
-                        x: rect.x,
-                        y: knob_rect.y + knob_rect.h + 26.0,
-                        w: fader_w,
-                        h: 24.0,
-                    };
-                    let _cresp: CheckboxResponse = ui.checkbox_at(
+                    let _ = ui.checkbox_at(
                         ("ch_mute", i),
-                        cb_rect,
+                        mute_rect,
                         m.mutes[i],
                         "Mute",
                         move |new| {
@@ -361,8 +388,8 @@ impl AppHost for App {
 
 fn main() {
     let attrs = WindowAttributes::default()
-        .with_title("daw-ui mixer (M1)")
-        .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0));
+        .with_title("daw-ui mixer (M3 8ch)")
+        .with_inner_size(winit::dpi::LogicalSize::new(960.0, 660.0));
     if let Err(e) = winit_backend::run_app(attrs, |window| App::new(Arc::new(window))) {
         eprintln!("event loop error: {e}");
     }
