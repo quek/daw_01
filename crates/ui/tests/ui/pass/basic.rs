@@ -16,6 +16,7 @@ struct Model {
     label: String,
     history: Vec<u32>,
     volume: f32,
+    mute: bool,
 }
 
 fn main() {
@@ -26,6 +27,7 @@ fn main() {
         label: String::from("hi"),
         history: Vec::new(),
         volume: 0.5,
+        mute: false,
     };
 
     let edits = host.frame(
@@ -60,6 +62,17 @@ fn main() {
             );
             let _ = ui.knob("pan2", m.volume, |v| {
                 Edit::mutate(move |m: &mut Model| m.volume = v)
+            });
+            // checkbox (M3): non-Clone Model でコンパイルする。
+            let _ = ui.checkbox_at(
+                "mute",
+                Rect { x: 0.0, y: 0.0, w: 100.0, h: 24.0 },
+                m.mute,
+                "Mute",
+                |new| Edit::mutate(move |m: &mut Model| m.mute = new),
+            );
+            let _ = ui.checkbox("mute2", m.mute, "Mute", |new| {
+                Edit::mutate(move |m: &mut Model| m.mute = new)
             });
         },
     );

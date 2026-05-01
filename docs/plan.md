@@ -217,15 +217,24 @@ F:\dev\gui_01\
 
 | 成果物 | 状態 | コミット |
 |---|---|---|
-| `Ui::knob_at` / `Ui::knob` (円形ノブ、7 時 → 12 時 → 5 時の 300° スイープ、上下ドラッグで値編集) | ✅ | (本コミット) |
-| `KnobState`: state HashMap 経由のドラッグ状態保持 | ✅ | (本コミット) |
-| インジケータは line strip パイプラインで描画 (LineSegment 1 本) | ✅ | (本コミット) |
-| `examples/mixer` に 3 ch pan knob を追加 (L/C/R ラベル含む) | ✅ | (本コミット) |
-| `trybuild`: `Ui::knob` / `Ui::knob_at` が non-Clone Model でコンパイル | ✅ | (本コミット) |
+| `Ui::knob_at` / `Ui::knob` (円形ノブ、7 時 → 12 時 → 5 時の 300° スイープ、上下ドラッグで値編集) | ✅ | 56cfeec |
+| `KnobState`: state HashMap 経由のドラッグ状態保持 | ✅ | 56cfeec |
+| インジケータは line strip パイプラインで描画 (LineSegment 1 本) | ✅ | 56cfeec |
+| `examples/mixer` に 3 ch pan knob を追加 (L/C/R ラベル含む) | ✅ | 56cfeec |
+| `trybuild`: `Ui::knob` / `Ui::knob_at` が non-Clone Model でコンパイル | ✅ | 56cfeec |
 
-**残作業 (Phase 3 以降)**:
+**Phase 3 進捗 (2026-05-01)** — checkbox:
 
-- `Ui::checkbox` (bool toggle)
+| 成果物 | 状態 | コミット |
+|---|---|---|
+| `Ui::checkbox_at` / `Ui::checkbox` (bool toggle、armed-state click) | ✅ | (本コミット) |
+| `CheckboxState`: button と同じ `press_started_inside` モデル | ✅ | (本コミット) |
+| 視覚: 16px 角丸枠 + チェック時の V 字 (line strip) + ラベル | ✅ | (本コミット) |
+| `examples/mixer` に 3 ch mute checkbox を追加 | ✅ | (本コミット) |
+| `trybuild`: `Ui::checkbox` / `Ui::checkbox_at` が non-Clone Model でコンパイル | ✅ | (本コミット) |
+
+**残作業 (Phase 4 以降)**:
+
 - `Ui::text_input` (ASCII + 日本語 IME 込み)
 - キーボード focus トラッキング (`UiHost` に focused widget) + `AppEvent::Keyboard` を focused widget へルーティング
 - IME 候補位置の `WindowBackend::set_ime_position()` 実装 (winit `set_ime_cursor_area` を使う)
@@ -233,6 +242,10 @@ F:\dev\gui_01\
 - `examples/mixer` を 8ch (8 fader + 8 pan knob + 8 mute checkbox) に拡張
 - **trybuild 検証拡張**: checkbox / text_input も non-Clone Model でコンパイルすることを固定
 - 微調整: fader / knob の感度カーブ、見た目 (背景パネル、影、目盛り)
+- **DAW 標準の値編集挙動 (fader / knob 共通)**:
+  - **ダブルクリックでデフォルト値に戻る**: `fader_at` / `knob_at` に `default_value: f32` を追加。state に `last_click_time` を持たせ、~300ms × 数 px 以内の 2 回目クリックを検出 → `on_change(default_value)` 発行。
+  - **Ctrl + ドラッグで高精度 (感度 1/10)**: `InputAccumulator` を拡張し modifier state (Ctrl/Shift/Alt) を track、`PointerFrame` に modifier フィールドを足す。fader/knob の drag 計算で `if pointer.ctrl { dv *= 0.1 }` で抑制。
+  - 将来 text_input の数値編集 (ドラッグで増減) や knob のホイール調整にも同じ modifier 機構が乗る。
 
 ### M4 (内部 scenegraph + 差分検出) — 旧 M3
 
@@ -594,3 +607,4 @@ ui.heavy("track_0_clips", |hctx| {
 - 2026-05-01: **M2 完成** — インクリメンタル LOD 拡張 + REC シミュレーション。`MinMaxLevel` を per-channel `Vec<Vec>` に refactor (末尾 push 効率化)、`extend_to` で cascading boundary recompute + push、Space キー REC で実機検証可能に。indirection 増で 44→61 µs/widget の軽い regression を許容して incremental の利得を取る。M2 DoD 全項目クリア。
 - 2026-05-01: **M3 Phase 1** — fader (垂直スライダ、つまみ限定ドラッグ) + button armed-state モデル + Windows focus-click cur_pos workaround + edit 後の追加 redraw パターン確立。実機検証で「ホバー直後の click が反応しない」「フォーカス取得クリックで反応しない」「fader を rect 全域でドラッグ可能」「fader 感度が rect.h 基準で上端に届かない」をユーザ報告から逐次修正。
 - 2026-05-01: **M3 Phase 2** — knob (円形ノブ、line strip でインジケータ、上下ドラッグで値編集)。fader と同じドラッグパターン + 既存 rect (4 隅角丸 = 円) と line strip パイプラインの組み合わせで実装、新パイプライン不要。`examples/mixer` で 3 ch pan ノブとして動作確認。
+- 2026-05-01: **M3 Phase 3** — checkbox (bool toggle、button と同じ armed-state モデル、line strip で V 字チェックマーク)。`examples/mixer` で 3 ch mute トグルとして動作確認。

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use daw_ui_core::{Edit, InputAccumulator, UiHost};
 use daw_ui_platform::{AppEvent, AppHost, PhysicalSize, WindowBackend, winit_backend};
-use daw_ui_core::{FaderResponse, KnobResponse};
+use daw_ui_core::{CheckboxResponse, FaderResponse, KnobResponse};
 use daw_ui_renderer::{Color, Rect, RectCommand, Renderer, Scene};
 use winit::window::WindowAttributes;
 
@@ -27,6 +27,8 @@ struct MixerModel {
     faders: [f32; 3],
     /// M3 動作確認用: 3 ch の pan ノブ値 (0..1, 0.5 = center)。
     pans: [f32; 3],
+    /// M3 動作確認用: 3 ch の mute フラグ。
+    mutes: [bool; 3],
 }
 
 impl MixerModel {
@@ -38,6 +40,7 @@ impl MixerModel {
             last_action: "起動しました".to_string(),
             faders: [0.5, 0.7, 0.3],
             pans: [0.5, 0.4, 0.6],
+            mutes: [false, false, false],
         }
     }
 }
@@ -239,6 +242,30 @@ impl App {
                             Color::rgb(0.95, 0.97, 1.0)
                         } else {
                             Color::rgb(0.65, 0.68, 0.72)
+                        },
+                    );
+
+                    // mute checkbox (knob のさらに下)
+                    let cb_rect = Rect {
+                        x: rect.x,
+                        y: knob_rect.y + knob_rect.h + 26.0,
+                        w: fader_w,
+                        h: 24.0,
+                    };
+                    let _cresp: CheckboxResponse = ui.checkbox_at(
+                        ("ch_mute", i),
+                        cb_rect,
+                        m.mutes[i],
+                        "Mute",
+                        move |new| {
+                            Edit::mutate(move |m: &mut MixerModel| {
+                                m.mutes[i] = new;
+                                m.last_action = format!(
+                                    "ch{} mute = {}",
+                                    i + 1,
+                                    if new { "ON" } else { "OFF" }
+                                );
+                            })
                         },
                     );
                 }

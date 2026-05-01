@@ -22,6 +22,7 @@ pub use id::WidgetId;
 pub use input::{InputAccumulator, PointerFrame};
 pub use layout::LayoutPass;
 pub use ui::{Ui, UiHost};
+pub use widgets::checkbox::CheckboxResponse;
 pub use widgets::fader::FaderResponse;
 pub use widgets::knob::KnobResponse;
 pub use widgets::waveform::{

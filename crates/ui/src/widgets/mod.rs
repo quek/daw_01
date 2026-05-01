@@ -1,9 +1,10 @@
 //! ウィジェット実装。
 //! M1: label / button。
 //! M2: waveform (波形表示、line strip パイプラインを使う)。
-//! M3: fader (垂直スライダ) / knob (回転ノブ)、いずれもドラッグで値編集。
+//! M3: fader (垂直スライダ) / knob (回転ノブ) / checkbox (bool toggle)。
 
 pub mod button;
+pub mod checkbox;
 pub mod fader;
 pub mod knob;
 pub mod label;
