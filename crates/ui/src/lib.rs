@@ -20,7 +20,7 @@ pub mod widgets;
 pub use edit::Edit;
 pub use id::WidgetId;
 pub use input::{FrameInput, ImeEvent, InputAccumulator, PointerFrame};
-pub use layout::LayoutPass;
+pub use layout::{Gap, LayoutPass, Padding};
 pub use ui::{Ui, UiHost};
 pub use widgets::checkbox::CheckboxResponse;
 pub use widgets::fader::FaderResponse;
