@@ -6,6 +6,7 @@
 pub mod automation;
 pub mod button;
 pub mod checkbox;
+pub mod drag_rect;
 pub mod dropdown;
 pub mod fader;
 pub mod heavy;

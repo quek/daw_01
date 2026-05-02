@@ -10,20 +10,31 @@
 //! - メッセージ型は導入しない (Edit は enum + `Box<dyn FnOnce>`)
 //! - derive マクロは禁止 (Lens 不要、ユーザは手書きクロージャでアクセサを書く)
 
+pub mod clipboard;
+pub mod dialog;
 pub mod edit;
+pub mod history;
 pub mod id;
 pub mod input;
 pub mod layout;
 pub mod popup;
 pub mod scenegraph;
+pub mod shortcut;
 pub mod time;
 pub mod ui;
 pub mod viewport;
 pub mod widgets;
 
+#[cfg(feature = "clipboard")]
+pub use clipboard::ArboardClipboard;
+pub use clipboard::{ClipboardProvider, NoopClipboard};
+pub use dialog::{DialogResult, FileDialogFilter};
 pub use edit::Edit;
+pub use history::{HistoryEntry, HistoryStack};
 pub use id::WidgetId;
-pub use input::{FrameInput, ImeEvent, InputAccumulator, PointerFrame};
+pub use shortcut::{Shortcut, ShortcutMap};
+pub use input::{DroppedFiles, FrameInput, ImeEvent, InputAccumulator, PointerFrame};
+pub use widgets::drag_rect::DragRect;
 pub use layout::{FlexDirection, Gap, LayoutPass, NodeId, Padding};
 pub use scenegraph::{CachedCommands, SceneNode, Scenegraph, hash_inputs};
 pub use time::{TimeDisplay, TimeMapping};

@@ -278,6 +278,16 @@ impl App {
             screen,
             input,
             |m, ui| {
+                // M8 Phase 30: shortcut undo/redo。trim/fade は audio buffer copy のコストが
+                // 大きいので M9 送り (docs/plan.md M9 で snapshot 戦略を再検討)。
+                // 代わりに「Reset Zoom」だけ undoable Edit を発行する demo として使う (下の button)。
+                if ui.take_shortcut("undo") {
+                    ui.request_undo();
+                }
+                if ui.take_shortcut("redo") {
+                    ui.request_redo();
+                }
+
                 // --- HUD ---
                 ui.label_at(
                     "title",

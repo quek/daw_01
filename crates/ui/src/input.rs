@@ -1,9 +1,21 @@
 //! 入力状態 — `AppEvent` を蓄積してフレーム毎に Ui に渡す形にする。
 
+use std::path::PathBuf;
+
 use daw_ui_platform::{AppEvent, ElementState, KeyEvent, Modifiers, MouseButton, PhysicalPosition, ScrollDelta};
 
 /// マウスホイール 1 line を何 px に換算するか (Windows / Linux / macOS で慣用される値)。
 const LINE_HEIGHT_PX: f32 = 40.0;
+
+/// M8 Phase 32: OS から drop された file 群と drop 直前の cursor 座標。
+///
+/// `PointerFrame` は `Copy` を維持するため、`Vec<PathBuf>` を含むこちらは別 field
+/// (`FrameInput::file_drop` / `Ui::file_drop`) として扱う。
+#[derive(Debug, Clone, Default)]
+pub struct DroppedFiles {
+    pub paths: Vec<PathBuf>,
+    pub position: (f32, f32),
+}
 
 /// 1 フレーム分のポインタ入力スナップショット。
 ///
@@ -46,6 +58,12 @@ pub struct FrameInput {
     pub pointer: PointerFrame,
     pub keyboard: Vec<KeyEvent>,
     pub ime: Vec<ImeEvent>,
+    /// M8 Phase 32: このフレームで OS から drop された file 群 (None = drop なし)。
+    /// `Ui::take_file_drop_in_rect(rect)` で widget が消費する。
+    pub file_drop: Option<DroppedFiles>,
+    /// M8 Phase 32: 現在 hover 中の file 一覧 (None = hover なし)。
+    /// drop target highlight に使う。consume されない (read-only)。
+    pub file_hover: Option<Vec<PathBuf>>,
 }
 
 /// 連続フレームをまたいで保持する入力状態。
@@ -69,6 +87,12 @@ pub struct InputAccumulator {
     modifiers: Modifiers,
     /// このフレーム内に蓄積されたスクロール量 (物理 px、`take_frame` で reset)。
     accumulated_scroll: (f32, f32),
+    /// M8 Phase 32: このフレームに drop された file 群 (`take_input` で `FrameInput::file_drop` に
+    /// 移される)。winit は file を 1 つずつ通知するのでここで蓄積。
+    pending_file_drops: Vec<PathBuf>,
+    /// M8 Phase 32: 現在 hover 中の file 一覧 (フレーム間で持続)。
+    /// `FileHovered` で push、`FileHoverCancelled` / `FileDropped` でクリア。
+    hovering_files: Vec<PathBuf>,
 }
 
 impl InputAccumulator {
@@ -137,6 +161,16 @@ impl InputAccumulator {
             AppEvent::ModifiersChanged(m) => {
                 self.modifiers = *m;
             }
+            AppEvent::FileHovered(path) => {
+                self.hovering_files.push(path.clone());
+            }
+            AppEvent::FileHoverCancelled => {
+                self.hovering_files.clear();
+            }
+            AppEvent::FileDropped(path) => {
+                self.pending_file_drops.push(path.clone());
+                self.hovering_files.clear();
+            }
             _ => {}
         }
     }
@@ -172,12 +206,29 @@ impl InputAccumulator {
         std::mem::take(&mut self.pending_ime)
     }
 
-    /// pointer / keyboard / ime をまとめて取り出す。`UiHost::frame` への引数として渡す。
+    /// pointer / keyboard / ime / file drop をまとめて取り出す。`UiHost::frame` への引数として渡す。
     pub fn take_input(&mut self) -> FrameInput {
+        let pointer = self.take_frame();
+        let file_drop = if self.pending_file_drops.is_empty() {
+            None
+        } else {
+            let position = pointer.pos.unwrap_or((0.0, 0.0));
+            Some(DroppedFiles {
+                paths: std::mem::take(&mut self.pending_file_drops),
+                position,
+            })
+        };
+        let file_hover = if self.hovering_files.is_empty() {
+            None
+        } else {
+            Some(self.hovering_files.clone())
+        };
         FrameInput {
-            pointer: self.take_frame(),
+            pointer,
             keyboard: self.take_keyboard_events(),
             ime: self.take_ime_events(),
+            file_drop,
+            file_hover,
         }
     }
 }

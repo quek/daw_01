@@ -32,6 +32,8 @@ pub(crate) struct KnobState {
     drag_anchor: Option<DragAnchor>,
     /// 直近のクリック (ダブルクリック判定用)。
     last_click: Option<ClickRecord>,
+    /// M8 Phase 29: drag 開始時の値 (release frame で undoable Edit の inverse に使う)。
+    drag_initial_value: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -60,7 +62,11 @@ pub struct KnobResponse {
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 矩形指定で knob を描画 + ドラッグ。値変化時に `on_change(new_value)` を Edit 列に積む。
     ///
+    /// **M8 Phase 29**: drag 中は Mutate Edit (history 非対象)、drag 終端で `label` 付き
+    /// Undoable Edit を発行する DAW 標準動作。`on_change` は `Fn + Clone + Send + Sync + 'static`。
+    ///
     /// `default_value` は rect のダブルクリック時にリセットされる値 (例: pan の中央 0.5)。
+    /// `label` は undoable history パネルでの表示文字列 ("knob" / "pan" 等)。
     ///
     /// 操作:
     /// - rect 全体をドラッグで値編集 (rect.h 分 = 0→1)
@@ -72,10 +78,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         rect: Rect,
         value: f32,
         default_value: f32,
+        label: &'static str,
         on_change: F,
     ) -> KnobResponse
     where
-        F: FnOnce(f32) -> Edit<M>,
+        F: Fn(f32) -> Edit<M> + Clone + Send + Sync + 'static,
     {
         let wid = WidgetId::ROOT.child((b"knob", &id));
         let pointer = self.pointer;
@@ -84,7 +91,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         // 1. 押下処理 + 2. mid-drag ctrl toggle 再 anchor + 3. release 解除
         let mut reset_fired = false;
-        let drag_anchor = {
+        let (drag_anchor, release_initial_value) = {
             let state: &mut KnobState = self.widget_state(wid);
 
             if pointer.primary_just_pressed
@@ -100,6 +107,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 if is_double {
                     state.last_click = None;
                     state.drag_anchor = None;
+                    state.drag_initial_value = None;
                     reset_fired = true;
                 } else {
                     state.last_click = Some(ClickRecord { when: now, pos: (px, py) });
@@ -108,6 +116,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         value,
                         ctrl: pointer.modifiers.ctrl,
                     });
+                    // M8 Phase 29: drag 開始時の値を保存
+                    state.drag_initial_value = Some(value);
                 }
             }
 
@@ -123,11 +133,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 });
             }
 
+            // M8 Phase 29: release frame で初期値を取り出す。
+            let release_initial_value = if pointer.primary_just_released {
+                state.drag_initial_value.take()
+            } else {
+                None
+            };
+
             if pointer.primary_just_released {
                 state.drag_anchor = None;
             }
 
-            state.drag_anchor
+            (state.drag_anchor, release_initial_value)
         };
 
         // 2. 表示値: リセット > drag > 入力値。
@@ -160,9 +177,24 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             draw_knob(ui, rect, displayed_value, dragging, pointer);
         });
 
-        // 4. 値が変わっていれば Edit を発行。
-        if (displayed_value - value).abs() > f32::EPSILON {
+        // 4. M8 Phase 29: drag 中 / drag 終端 / undoable Edit。
+        let suppress_mutate_on_release = release_initial_value.is_some();
+        if !suppress_mutate_on_release && (displayed_value - value).abs() > f32::EPSILON {
             let edit = on_change(displayed_value);
+            self.push_edit(edit);
+        }
+
+        if let Some(start_value) = release_initial_value
+            && (start_value - displayed_value).abs() > f32::EPSILON
+        {
+            let on_change_fwd = on_change.clone();
+            let on_change_inv = on_change;
+            let end = displayed_value;
+            let edit = Edit::with_inverse(
+                label,
+                move |m: &mut M| on_change_fwd(end).apply(m),
+                move |m: &mut M| on_change_inv(start_value).apply(m),
+            );
             self.push_edit(edit);
         }
 
@@ -179,10 +211,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         id: impl Hash,
         value: f32,
         default_value: f32,
+        label: &'static str,
         on_change: F,
     ) -> KnobResponse
     where
-        F: FnOnce(f32) -> Edit<M>,
+        F: Fn(f32) -> Edit<M> + Clone + Send + Sync + 'static,
     {
         let pad = 8.0;
         let size = 64.0;
@@ -192,7 +225,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             w: size,
             h: size,
         };
-        let resp = self.knob_at(id, rect, value, default_value, on_change);
+        let resp = self.knob_at(id, rect, value, default_value, label, on_change);
         self.next_y += size + pad;
         resp
     }
@@ -348,7 +381,7 @@ mod tests {
             screen,
             FrameInput { pointer, ..Default::default() },
             |_, ui| {
-                ui.knob_at("test", rect, value, default_value, |v| {
+                ui.knob_at("test", rect, value, default_value, "knob", |v| {
                     Edit::mutate(move |m: &mut PanModel| m.value = v)
                 });
             },

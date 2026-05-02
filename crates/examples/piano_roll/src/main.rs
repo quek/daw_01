@@ -369,6 +369,15 @@ impl App {
             screen,
             input,
             |m, ui| {
+                // M8 Phase 30: shortcut undo/redo (note 編集自体は M10 で本実装、ここは
+                // shortcut layer が動くことを示す demo のみ)。
+                if ui.take_shortcut("undo") {
+                    ui.request_undo();
+                }
+                if ui.take_shortcut("redo") {
+                    ui.request_redo();
+                }
+
                 // === HUD (heavy() の外、毎フレーム値が変わるため) ===
                 ui.label_at(
                     "title",

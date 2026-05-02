@@ -9,10 +9,21 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["dialog", "clipboard"]
+# M8 Phase 34: native file dialog (rfd 経由)。
+# Linux で gtk/portal の挙動が脆い場合は無効化可能。
+dialog = ["dep:rfd"]
+# M8 Phase 31: OS clipboard 統合 (arboard 経由)。
+# CI / 無 GUI 環境向けに無効化可能 (NoopClipboard だけ残る)。
+clipboard = ["dep:arboard"]
+
 [dependencies]
 daw-ui-platform.workspace = true
 daw-ui-renderer.workspace = true
 taffy = "0.10.1"
+rfd = { version = "0.15", optional = true }
+arboard = { version = "3", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false }

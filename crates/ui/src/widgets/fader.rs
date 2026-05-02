@@ -37,6 +37,8 @@ pub(crate) struct FaderState {
     drag_anchor: Option<DragAnchor>,
     /// 直近のクリック (ダブルクリック判定用)。
     last_click: Option<ClickRecord>,
+    /// M8 Phase 29: drag 開始時の値 (release frame で undoable Edit の inverse に使う)。
+    drag_initial_value: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -81,25 +83,35 @@ pub struct FaderResponse {
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 矩形指定で垂直 fader を描画 + ドラッグ + ヒットテスト。
-    /// 値が変わったときだけ `on_change(new_value)` を呼んで `Edit<M>` を Edit 列に積む。
+    ///
+    /// 値が変わったとき `on_change(new_value)` を呼んで `Edit<M>` を発行する。
+    /// **M8 Phase 29**: drag 中の各フレームでは Mutate Edit を発行 (history に乗らない)、
+    /// drag 終端でのみ Undoable Edit (start_value → end_value、label 付き) を 1 度だけ発行する。
+    /// これにより undo/redo は drag 単位の意味のあるステップで巻き戻る (DAW 標準動作)。
+    ///
+    /// `on_change` は `Fn + Clone + Send + Sync + 'static` を要求 (= `move |v| Edit::mutate(...)` の
+    /// 形で書く、capture は Copy 型のみが原則)。
     ///
     /// `value` は `0.0..=1.0` 想定 (範囲外は内部でクランプ)。
     /// `default_value` は thumb のダブルクリック時にリセットされる値 (例: 0.0 = 無音、1.0 = ユニティ)。
+    /// `label` は undoable history パネルでの表示文字列 ("fader" / "volume" 等)。
     ///
     /// 操作:
     /// - thumb をドラッグで値編集 (track 1 本分 = 0→1)
     /// - thumb をダブルクリック (~300ms / 5px 以内) で `default_value` に戻る
     /// - Ctrl + ドラッグで感度 1/10
+    #[allow(clippy::too_many_lines)]
     pub fn fader_at<F>(
         &mut self,
         id: impl Hash,
         rect: Rect,
         value: f32,
         default_value: f32,
+        label: &'static str,
         on_change: F,
     ) -> FaderResponse
     where
-        F: FnOnce(f32) -> Edit<M>,
+        F: Fn(f32) -> Edit<M> + Clone + Send + Sync + 'static,
     {
         let wid = WidgetId::ROOT.child((b"fader", &id));
         let pointer = self.pointer;
@@ -109,7 +121,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         // 1. 押下処理 + 2. mid-drag ctrl toggle 再 anchor + 3. release 解除
         let mut reset_fired = false;
-        let drag_anchor = {
+        let (drag_anchor, release_initial_value) = {
             let state: &mut FaderState = self.widget_state(wid);
 
             // 押下: ダブルクリック判定 → リセット 又は drag 開始 (thumb 内のみ)
@@ -127,6 +139,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     // リセット。drag は始めない。3 連クリック誤動作防止のため last_click も消す。
                     state.last_click = None;
                     state.drag_anchor = None;
+                    state.drag_initial_value = None;
                     reset_fired = true;
                 } else {
                     state.last_click = Some(ClickRecord { when: now, pos: (px, py) });
@@ -135,6 +148,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         value,
                         ctrl: pointer.modifiers.ctrl,
                     });
+                    // M8 Phase 29: drag 開始時の値を保存 (release frame で inverse に使う)
+                    state.drag_initial_value = Some(value);
                 }
             }
 
@@ -153,11 +168,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 });
             }
 
+            // M8 Phase 29: release frame で初期値を取り出す。
+            let release_initial_value = if pointer.primary_just_released {
+                state.drag_initial_value.take()
+            } else {
+                None
+            };
+
             if pointer.primary_just_released {
                 state.drag_anchor = None;
             }
 
-            state.drag_anchor
+            (state.drag_anchor, release_initial_value)
         };
 
         // 表示値を計算 (リセット > drag > 入力値の優先)
@@ -190,9 +212,27 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             draw_fader(ui, rect, displayed_value, dragging, pointer);
         });
 
-        // 値が変わっていれば Edit を発行。
-        if (displayed_value - value).abs() > f32::EPSILON {
+        // M8 Phase 29: drag 終端では Mutate を抑制 (Undoable Edit が forward を再実行するため
+        // model 値が二重更新されないようにする)。release_initial_value が Some なら drag 終端。
+        let suppress_mutate_on_release = release_initial_value.is_some();
+        if !suppress_mutate_on_release && (displayed_value - value).abs() > f32::EPSILON {
             let edit = on_change(displayed_value);
+            self.push_edit(edit);
+        }
+
+        // M8 Phase 29: drag 終端で Undoable Edit を発行 (start_value → end_value)。
+        // 値変化が無ければ no-op (= 押下しただけで動かさず release した場合は history を汚さない)。
+        if let Some(start_value) = release_initial_value
+            && (start_value - displayed_value).abs() > f32::EPSILON
+        {
+            let on_change_fwd = on_change.clone();
+            let on_change_inv = on_change;
+            let end = displayed_value;
+            let edit = Edit::with_inverse(
+                label,
+                move |m: &mut M| on_change_fwd(end).apply(m),
+                move |m: &mut M| on_change_inv(start_value).apply(m),
+            );
             self.push_edit(edit);
         }
 
@@ -210,10 +250,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         id: impl Hash,
         value: f32,
         default_value: f32,
+        label: &'static str,
         on_change: F,
     ) -> FaderResponse
     where
-        F: FnOnce(f32) -> Edit<M>,
+        F: Fn(f32) -> Edit<M> + Clone + Send + Sync + 'static,
     {
         let pad = 8.0;
         let h = 120.0;
@@ -223,7 +264,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             w: 32.0,
             h,
         };
-        let resp = self.fader_at(id, rect, value, default_value, on_change);
+        let resp = self.fader_at(id, rect, value, default_value, label, on_change);
         self.next_y += h + pad;
         resp
     }
@@ -348,7 +389,7 @@ mod tests {
             screen,
             FrameInput { pointer, ..Default::default() },
             |_, ui| {
-                ui.fader_at("test", rect, value, default_value, |v| {
+                ui.fader_at("test", rect, value, default_value, "fader", |v| {
                     Edit::mutate(move |m: &mut VolModel| m.value = v)
                 });
             },

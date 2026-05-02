@@ -228,6 +228,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 w: 1.0,
                 h: cursor_h,
             });
+            // M8 Phase 30: typing 中フラグを立てて、修飾なし shortcut の global 発動を抑制可能に。
+            self.set_typing_focus(true);
         }
 
         if let Some(t) = new_text {

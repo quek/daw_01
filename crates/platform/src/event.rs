@@ -1,5 +1,6 @@
 //! 中立イベント型。winit / baseview のどちらでも、外部プラットフォーム層がここに変換する。
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// 物理ピクセル単位のサイズ。
@@ -37,7 +38,7 @@ pub enum ElementState {
 /// 4 フラグは `Ctrl/Shift/Alt/Logo` の canonical な組合せ (winit / NSEvent /
 /// XKB と同形)。`clippy::struct_excessive_bools` はこの種の "正規 4 つ並び" を
 /// 否定する意図ではないので allow する。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Modifiers {
     pub ctrl: bool,
@@ -45,6 +46,27 @@ pub struct Modifiers {
     pub alt: bool,
     /// Win / Cmd キー。
     pub logo: bool,
+}
+
+impl Modifiers {
+    /// すべての修飾キーが押されていない状態 (`Modifiers::default()` と同等の const 構築)。
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self { ctrl: false, shift: false, alt: false, logo: false }
+    }
+
+    /// すべての修飾キーが false なら true。
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        !self.ctrl && !self.shift && !self.alt && !self.logo
+    }
+
+    /// `target` と完全一致するか (M8 Phase 30 shortcut マッチ用)。
+    /// `Eq` で同等だが、意図が伝わるよう専用メソッドを切る。
+    #[must_use]
+    pub fn matches(self, target: Modifiers) -> bool {
+        self == target
+    }
 }
 
 /// キー入力 (M1 では最低限。論理キー名は後で拡張)。
@@ -57,7 +79,11 @@ pub struct KeyEvent {
     pub physical_key: PhysicalKey,
 }
 
-/// 物理キー (M1 ではよく使うものだけ)。後で網羅する。
+/// 物理キー。
+///
+/// M1: 制御キー / arrow / Other(u32) のみ。
+/// M8 Phase 30: shortcut 解釈のため `Char(char)` (Latin alphabet 大文字)、`Digit(u8)`、
+/// `F(u8)`、`Delete / Home / End / PageUp / PageDown / Insert` を追加。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PhysicalKey {
     Escape,
@@ -65,10 +91,22 @@ pub enum PhysicalKey {
     Space,
     Tab,
     Backspace,
+    Delete,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Insert,
     ArrowUp,
     ArrowDown,
     ArrowLeft,
     ArrowRight,
+    /// アルファベットキー (大文字に正規化、'A'..='Z')。
+    Char(char),
+    /// 数字キー (上段の Digit0..=Digit9、テンキーは含まない)。
+    Digit(u8),
+    /// ファンクションキー (F1..=F24)。
+    F(u8),
     Other(u32),
 }
 
@@ -117,4 +155,15 @@ pub enum AppEvent {
     Tick(Duration),
     /// ウィンドウクローズ要求。
     CloseRequested,
+    /// M8 Phase 32: OS から file が hover に入った (drop 候補表示用)。
+    /// 連続して同じ window 内で複数回 hover されると累積的に積まれる。winit は file を 1 つずつ
+    /// 通知してくる仕様だが、`InputAccumulator` 側でフレーム単位にまとめる。
+    FileHovered(PathBuf),
+    /// M8 Phase 32: hover が cancel された (ドラッグ中に枠外に出た / Esc 等)。
+    /// hover 累積はクリアする。
+    FileHoverCancelled,
+    /// M8 Phase 32: OS から file がドロップされた。
+    /// winit は drop 時の cursor 位置を提供しないため、`InputAccumulator` が直近 hover の
+    /// 最終 cursor 位置を覚えて同梱する (= 「audio file を timeline の N 小節目にドロップ」UX)。
+    FileDropped(PathBuf),
 }

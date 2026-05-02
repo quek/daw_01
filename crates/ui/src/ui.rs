@@ -11,16 +11,22 @@
 
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
+use std::path::PathBuf;
 
 use daw_ui_platform::{KeyEvent, PhysicalSize};
-use daw_ui_renderer::{Color, GlyphArea, LineBatch, Rect, RectCommand, Scene};
+use daw_ui_renderer::{Color, GlyphArea, LineBatch, LineSegment, Rect, RectCommand, Scene};
 
+use crate::clipboard::ClipboardProvider;
+use crate::dialog::{DialogKind, DialogRequest, DialogResult, FileDialogFilter};
 use crate::edit::Edit;
+use crate::history::{HistoryEntry, HistoryStack};
 use crate::id::WidgetId;
-use crate::input::{FrameInput, ImeEvent, PointerFrame};
+use crate::input::{DroppedFiles, FrameInput, ImeEvent, PointerFrame};
 use crate::popup::PopupOpenState;
 use crate::scenegraph::{CachedCommands, Scenegraph};
+use crate::shortcut::ShortcutMap;
 use crate::widgets::WidgetState;
+use crate::widgets::drag_rect::{DragRect, DragRectState};
 
 /// アプリが 1 つ持つ UI ホスト。フレーム間で UI 内部状態を保持する。
 ///
@@ -34,6 +40,10 @@ use crate::widgets::WidgetState;
 /// focus が変わったフレームでは **自動で `request_redraw` を呼ぶ** ため、利用者は
 /// boilerplate (`for e in edits { e.apply(...) }` や `had_edits` 判定) を書く必要が
 /// 一切ない。
+/// `focus_changed_in_last_frame` / `redraw_requested_in_last_frame` / M8 の
+/// `transient_undo_requested` / `transient_redo_requested` がそれぞれ独立した
+/// 「frame 内で 1 度だけ書かれる」フラグで意味的に正交、state machine 化のメリットなし。
+#[allow(clippy::struct_excessive_bools)]
 pub struct UiHost<M: ?Sized + 'static> {
     state: HashMap<WidgetId, Box<dyn WidgetState>>,
     /// キーボードフォーカスを持つウィジェット (`text_input` 等)。
@@ -60,6 +70,25 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// M7 後の改善: widget が `Ui::request_redraw()` を呼んだ場合の累積フラグ。
     /// `frame()` の最後で `redraw_request` 呼び出し条件に含まれる。
     redraw_requested_in_last_frame: bool,
+    /// M8 Phase 29: undo / redo stack。
+    history: HistoryStack<M>,
+    /// M8 Phase 30: shortcut 登録テーブル。
+    shortcut_map: ShortcutMap,
+    /// M8 Phase 31: OS clipboard provider (None なら set/get は no-op)。
+    clipboard: Option<Box<dyn ClipboardProvider>>,
+    /// M8 Phase 34: 前フレームに完了した dialog 結果 (次フレームで `Ui::take_dialog_result` で取り出される)。
+    pending_dialog_results: HashMap<&'static str, DialogResult>,
+    /// M8 Phase 30: 前フレームに登場した focusable widget の (id, rect) 一覧。
+    /// Tab / arrow nav の対象決定用。
+    last_focusable: Vec<(WidgetId, Rect)>,
+    /// M8: `frame_to_edits` で Ui が書いた transient な request 群。`frame` の後半で読まれる。
+    /// `frame_to_edits` 単独で low-level に使う場合は `take_frame_outputs()` で取り出せる。
+    transient_undo_requested: bool,
+    transient_redo_requested: bool,
+    transient_clipboard_writes: Vec<String>,
+    transient_clipboard_writes_bytes: Vec<(&'static str, Vec<u8>)>,
+    transient_dialog_requests: Vec<DialogRequest>,
+    transient_consumed_dialog_results: HashSet<&'static str>,
     _m: PhantomData<fn(&mut M)>,
 }
 
@@ -76,8 +105,67 @@ impl<M: ?Sized + 'static> UiHost<M> {
             redraw_request: Box::new(redraw_request),
             open_popups: HashMap::new(),
             redraw_requested_in_last_frame: false,
+            history: HistoryStack::default(),
+            shortcut_map: ShortcutMap::with_default_bindings(),
+            clipboard: None,
+            pending_dialog_results: HashMap::new(),
+            last_focusable: Vec::new(),
+            transient_undo_requested: false,
+            transient_redo_requested: false,
+            transient_clipboard_writes: Vec::new(),
+            transient_clipboard_writes_bytes: Vec::new(),
+            transient_dialog_requests: Vec::new(),
+            transient_consumed_dialog_results: HashSet::new(),
             _m: PhantomData,
         }
+    }
+
+    /// M8 Phase 29: history stack の容量を変更 (default 100 step、0 で無効化)。
+    #[must_use]
+    pub fn with_history_capacity(mut self, n: usize) -> Self {
+        self.history.set_capacity(n);
+        self
+    }
+
+    /// M8 Phase 30: shortcut map を完全に置き換える (preference の serialize/deserialize 用)。
+    #[must_use]
+    pub fn with_shortcut_map(mut self, map: ShortcutMap) -> Self {
+        self.shortcut_map = map;
+        self
+    }
+
+    /// M8 Phase 31: OS clipboard provider を設定。
+    /// winit backend では `daw_ui_platform::ArboardClipboard::new()` を渡す
+    /// (feature `clipboard` 有効時)。test では未設定のままで Ui 側 set/get は no-op になる。
+    #[must_use]
+    pub fn with_clipboard<C: ClipboardProvider + 'static>(mut self, provider: C) -> Self {
+        self.clipboard = Some(Box::new(provider));
+        self
+    }
+
+    /// M8 Phase 29: history stack への参照 (`undo_label` / `can_undo` 等の query 用)。
+    pub fn history(&self) -> &HistoryStack<M> {
+        &self.history
+    }
+
+    /// M8 Phase 29: history stack への mutable 参照 (project 切替時に clear 等)。
+    pub fn history_mut(&mut self) -> &mut HistoryStack<M> {
+        &mut self.history
+    }
+
+    /// M8 Phase 30: shortcut map への参照 (preference の serialize 用)。
+    pub fn shortcut_map(&self) -> &ShortcutMap {
+        &self.shortcut_map
+    }
+
+    /// M8 Phase 30: shortcut map への mutable 参照 (実行時 rebind 用)。
+    pub fn shortcut_map_mut(&mut self) -> &mut ShortcutMap {
+        &mut self.shortcut_map
+    }
+
+    /// M8 Phase 31: clipboard provider が設定されていれば true。
+    pub fn clipboard_available(&self) -> bool {
+        self.clipboard.is_some()
     }
 
     /// `WindowBackend` を持つ window から、自動的に `request_redraw` を呼ぶ UiHost を
@@ -123,8 +211,10 @@ impl<M: ?Sized + 'static> UiHost<M> {
     /// `f` は `(&model, &mut Ui)` を受け取り、ウィジェットを呼び出して UI を組む。
     /// 内部動作:
     /// 1. scene を積みつつ edits を収集 (build クロージャは古い model 値で 1 度だけ実行)
-    /// 2. 収集した edits を `&mut model` に apply
-    /// 3. edits があった / focus が変わった場合は `redraw_request` を呼ぶ
+    /// 2. **M8**: undo/redo 要求があれば `HistoryStack` に対して実行
+    /// 3. 収集した edits を `&mut model` に apply (`Undoable` は forward + history.push)
+    /// 4. **M8**: clipboard write / file dialog 同期実行 / dialog 結果クリーンアップ
+    /// 5. edits / undo / redo / focus 変化があった場合は `redraw_request` を呼ぶ
     ///    → 次フレームで apply 後の値で再描画される (immediate-mode + Edit queue の必然対処)
     pub fn frame<F>(
         &mut self,
@@ -138,13 +228,68 @@ impl<M: ?Sized + 'static> UiHost<M> {
     {
         let edits = self.frame_to_edits(&*model, scene, screen, input, f);
         let had_edits = !edits.is_empty();
-        for e in edits {
-            e.apply(model);
+
+        // M8 Phase 29: undo / redo (edits apply の前に行う = 「undo を要求したフレームでは
+        // 同フレームの edits は通常通り反映、その後の undo step で巻き戻す」のは紛らわしい
+        // ので、**undo → edits apply** の順)。
+        // つまり「Undo は前フレームまでに積まれた entry を巻き戻し、新規 edits は前進的に積む」。
+        let undo_req = self.transient_undo_requested;
+        let redo_req = self.transient_redo_requested;
+        if undo_req {
+            let _ = self.history.undo(model);
         }
-        // 自動 redraw の発火条件: edits / focus 変化 / widget からの request_redraw
+        if redo_req {
+            let _ = self.history.redo(model);
+        }
+
+        // edits apply。Undoable は forward を実行 + (forward, inverse, label) を history へ push。
+        for e in edits {
+            match e {
+                Edit::Mutate(f) => f(model),
+                Edit::Undoable { forward, inverse, label } => {
+                    forward(model);
+                    self.history
+                        .push(HistoryEntry::new(forward, inverse, label));
+                }
+            }
+        }
+
+        // M8 Phase 31: clipboard write (frame 末尾で provider に書き込み)。
+        if let Some(c) = self.clipboard.as_mut() {
+            for s in self.transient_clipboard_writes.drain(..) {
+                c.set_text(s);
+            }
+            for (mime, bytes) in self.transient_clipboard_writes_bytes.drain(..) {
+                c.set_bytes(mime, bytes);
+            }
+        } else {
+            // provider 無しなら捨てる
+            self.transient_clipboard_writes.clear();
+            self.transient_clipboard_writes_bytes.clear();
+        }
+
+        // M8 Phase 34: file dialog 同期実行。結果は次フレームで `take_dialog_result` から取り出される。
+        let dialog_runs = !self.transient_dialog_requests.is_empty();
+        let requests = std::mem::take(&mut self.transient_dialog_requests);
+        for req in requests {
+            let result = run_dialog_sync(&req);
+            self.pending_dialog_results.insert(req.name, result);
+        }
+
+        // 消費済 dialog 結果は pending_dialog_results から削除。
+        for name in self.transient_consumed_dialog_results.drain() {
+            self.pending_dialog_results.remove(name);
+        }
+
+        // 自動 redraw の発火条件: edits / undo / redo / focus 変化 / widget からの request_redraw
+        // / dialog 実行 (新結果が出た) / 残っている dialog 結果 (widget が次フレームで取り出す)。
         if had_edits
+            || undo_req
+            || redo_req
             || self.focus_changed_in_last_frame
             || self.redraw_requested_in_last_frame
+            || dialog_runs
+            || !self.pending_dialog_results.is_empty()
         {
             (self.redraw_request)();
         }
@@ -156,6 +301,10 @@ impl<M: ?Sized + 'static> UiHost<M> {
     ///
     /// 注: この API では **自動 `request_redraw` は呼ばれない**。利用者が edits 検出時に
     /// 手動で `WindowBackend::request_redraw` を呼ぶ責任を負う。
+    /// undo/redo / clipboard write / dialog 同期実行など `Edit` 以外の副作用は `UiHost` の
+    /// transient フィールドに格納され、`take_frame_outputs()` で取り出すか、`frame()` で
+    /// 自動処理される。
+    #[allow(clippy::too_many_lines)]
     pub fn frame_to_edits<F>(
         &mut self,
         model: &M,
@@ -168,13 +317,53 @@ impl<M: ?Sized + 'static> UiHost<M> {
         F: for<'a> FnOnce(&'a M, &mut Ui<'a, M>),
     {
         let mut edits: Vec<Edit<M>> = Vec::new();
-        let FrameInput { pointer, keyboard, ime } = input;
+        let FrameInput { pointer, keyboard, ime, file_drop, file_hover } = input;
         let mut keyboard_events = keyboard;
         let mut ime_events = ime;
+
+        // M8 Phase 30: shortcut layer (frame 頭)。keyboard_events を `shortcut_map.matches` で
+        // 走査、マッチした events を取り除いて name を `pending_shortcuts` に積む。
+        // text_input が後で `take_keyboard_events_if_focused` で取るのは shortcut 後の残り。
+        let modifiers = pointer.modifiers;
+        let mut pending_shortcuts: Vec<&'static str> = Vec::new();
+        keyboard_events.retain(|ev| {
+            if let Some(name) = self.shortcut_map.matches(ev, modifiers) {
+                pending_shortcuts.push(name);
+                false
+            } else {
+                true
+            }
+        });
+
+        // M8 Phase 31: clipboard paste — paste shortcut がマッチしていれば provider から read。
+        // 1 フレーム内で paste と他の shortcut が同時に発生しても、paste の取り出しは 1 度限り。
+        let pending_clipboard_paste: Option<String> = if pending_shortcuts.contains(&"paste") {
+            self.clipboard.as_mut().and_then(|c| c.get_text())
+        } else {
+            None
+        };
+
+        // M8 Phase 29: history の現状をスナップショットして Ui に渡す (`can_undo` 等の query 用)。
+        let history_can_undo = self.history.can_undo();
+        let history_can_redo = self.history.can_redo();
+        let history_undo_label = self.history.undo_label();
+        let history_redo_label = self.history.redo_label();
+
+        // transient outputs (`frame()` 後半で読まれる) を frame 頭でクリア。
+        self.transient_undo_requested = false;
+        self.transient_redo_requested = false;
+        self.transient_clipboard_writes.clear();
+        self.transient_clipboard_writes_bytes.clear();
+        self.transient_dialog_requests.clear();
+        self.transient_consumed_dialog_results.clear();
+
         let cursor = Rect::new(0.0, 0.0, screen.width as f32, screen.height as f32);
         let focused_at_start = self.focused;
         let mut seen_widgets: HashSet<WidgetId> = HashSet::new();
         let mut redraw_requested = false;
+        let mut typing_focus = false;
+        let mut focus_order: Vec<(WidgetId, Rect)> = Vec::new();
+
         let mut ui = Ui {
             state: &mut self.state,
             scene,
@@ -198,9 +387,60 @@ impl<M: ?Sized + 'static> UiHost<M> {
             popup_lines: Vec::new(),
             drawing_in_popup: false,
             redraw_requested: &mut redraw_requested,
+            file_drop,
+            file_hover,
+            pending_shortcuts: &mut pending_shortcuts,
+            typing_focus: &mut typing_focus,
+            shortcut_map: &self.shortcut_map,
+            pending_undo: &mut self.transient_undo_requested,
+            pending_redo: &mut self.transient_redo_requested,
+            history_can_undo,
+            history_can_redo,
+            history_undo_label,
+            history_redo_label,
+            pending_clipboard_paste,
+            pending_clipboard_writes: &mut self.transient_clipboard_writes,
+            pending_clipboard_paste_bytes: HashMap::new(),
+            pending_clipboard_writes_bytes: &mut self.transient_clipboard_writes_bytes,
+            pending_dialog_requests: &mut self.transient_dialog_requests,
+            consumed_dialog_results: &mut self.transient_consumed_dialog_results,
+            dialog_results: &self.pending_dialog_results,
+            focus_order: &mut focus_order,
             _m: PhantomData,
         };
         f(model, &mut ui);
+
+        // M8 Phase 30: Tab / arrow focus traversal。
+        // pending_shortcuts に "tab_next" 等が残っていれば (= widget が consume 済でなければ)、
+        // focus_order (このフレームに登録された focusable 一覧) から次の wid を選んで set_focus。
+        let focus_order_snapshot: Vec<(WidgetId, Rect)> = ui.focus_order.clone();
+        if !focus_order_snapshot.is_empty() {
+            let tab_next = ui.take_shortcut("tab_next");
+            let tab_prev = ui.take_shortcut("tab_prev");
+            let focus_up = ui.take_shortcut("focus_up");
+            let focus_down = ui.take_shortcut("focus_down");
+            let focus_left = ui.take_shortcut("focus_left");
+            let focus_right = ui.take_shortcut("focus_right");
+
+            let current = ui.focused;
+            let next_wid: Option<WidgetId> = if tab_next || tab_prev {
+                tab_navigate(&focus_order_snapshot, current, tab_next)
+            } else if focus_up {
+                arrow_navigate(&focus_order_snapshot, current, FocusDirection::Up)
+            } else if focus_down {
+                arrow_navigate(&focus_order_snapshot, current, FocusDirection::Down)
+            } else if focus_left {
+                arrow_navigate(&focus_order_snapshot, current, FocusDirection::Left)
+            } else if focus_right {
+                arrow_navigate(&focus_order_snapshot, current, FocusDirection::Right)
+            } else {
+                None
+            };
+            if let Some(wid) = next_wid {
+                ui.set_focus(wid);
+            }
+        }
+
         // M7 Phase 25: popup の deferred buffer を取り出して、ui の borrow が外れたあと
         // base scene 末尾に append (z-order = 最前面) する。
         let popup_rects = std::mem::take(&mut ui.popup_rects);
@@ -230,6 +470,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
         scene.popup_line_batches.extend(popup_lines);
         // M4 Phase 11: 今フレームに登場しなかった widget を scenegraph から eviction。
         self.scenegraph.retain(&seen_widgets);
+        // M8 Phase 30: 次フレーム用に focusable 一覧を保存。
+        self.last_focusable = focus_order_snapshot;
         edits
     }
 }
@@ -244,6 +486,12 @@ impl<M: ?Sized + 'static> Default for UiHost<M> {
 ///
 /// `'a` は `&'a M` 借用と同じ寿命。`Edit<M>` は `'static` (M1) なので Ui のライフタイムから
 /// 切り離せる。
+///
+/// M8 で transient bool 群 (typing_focus / pending_undo / pending_redo / history_can_undo /
+/// history_can_redo + 既存の focus_changed_this_frame / drawing_in_popup) が増えたが、
+/// それぞれが「frame 内で 1 度だけ書かれる / 読まれる」フラグで意味が独立しているため、
+/// `clippy::struct_excessive_bools` を allow する (state machine 化はオーバーヘッド過大)。
+#[allow(clippy::struct_excessive_bools)]
 pub struct Ui<'a, M: ?Sized + 'static> {
     state: &'a mut HashMap<WidgetId, Box<dyn WidgetState>>,
     scene: &'a mut Scene,
@@ -291,6 +539,43 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// `UiHost::frame` の末尾で `redraw_requested_in_last_frame` に commit され、
     /// 次のフレーム redraw の発火条件に含まれる。
     redraw_requested: &'a mut bool,
+    /// M8 Phase 32: このフレームに OS から drop された file 群。
+    /// `Ui::take_file_drop_in_rect(rect)` で widget が consume すると None に書き換わる。
+    pub(crate) file_drop: Option<DroppedFiles>,
+    /// M8 Phase 32: 現在 hover 中の file 一覧 (read-only、`is_file_hovering_in_rect` で参照)。
+    pub(crate) file_hover: Option<Vec<PathBuf>>,
+    // ---- M8 Phase 30 shortcut ----
+    /// frame 頭で `shortcut_map.matches` した name 一覧。`take_shortcut(name)` で 1 度だけ消費。
+    pub(crate) pending_shortcuts: &'a mut Vec<&'static str>,
+    /// text_input 等が focus 中に呼ぶ。修飾なし shortcut の判定で使う (現状は記録のみ、
+    /// shortcut layer 自体は frame 頭で済ませる KISS 設計)。
+    pub(crate) typing_focus: &'a mut bool,
+    /// shortcut display_for などの query 用 (mutable は UiHost::shortcut_map_mut 経由)。
+    pub(crate) shortcut_map: &'a ShortcutMap,
+    // ---- M8 Phase 29 history ----
+    pub(crate) pending_undo: &'a mut bool,
+    pub(crate) pending_redo: &'a mut bool,
+    pub(crate) history_can_undo: bool,
+    pub(crate) history_can_redo: bool,
+    pub(crate) history_undo_label: Option<&'static str>,
+    pub(crate) history_redo_label: Option<&'static str>,
+    // ---- M8 Phase 31 clipboard ----
+    /// frame 頭に paste shortcut が match していれば provider から read 済み。`take_clipboard_paste`
+    /// で widget が 1 度だけ取り出す。
+    pub(crate) pending_clipboard_paste: Option<String>,
+    /// `set_clipboard_text` で積まれる write リクエスト (frame 末尾に provider.set_text)。
+    pub(crate) pending_clipboard_writes: &'a mut Vec<String>,
+    /// MIME bytes の paste/write (M8 では skeleton 経由のみ、provider default は no-op)。
+    pub(crate) pending_clipboard_paste_bytes: HashMap<&'static str, Vec<u8>>,
+    pub(crate) pending_clipboard_writes_bytes: &'a mut Vec<(&'static str, Vec<u8>)>,
+    // ---- M8 Phase 34 dialog ----
+    pub(crate) pending_dialog_requests: &'a mut Vec<DialogRequest>,
+    pub(crate) consumed_dialog_results: &'a mut HashSet<&'static str>,
+    pub(crate) dialog_results: &'a HashMap<&'static str, DialogResult>,
+    // ---- M8 Phase 30 focus traversal ----
+    /// このフレームに `Ui::focusable(wid, rect)` で登録された一覧。
+    /// frame 末尾で UiHost に保存し、Tab / arrow nav の対象にする。
+    pub(crate) focus_order: &'a mut Vec<(WidgetId, Rect)>,
     _m: PhantomData<&'a M>,
 }
 
@@ -534,6 +819,293 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         *self.redraw_requested = true;
     }
 
+    // ============================================================
+    // M8 Phase 29: history (undo / redo)
+    // ============================================================
+
+    /// frame 末尾で UiHost に「undo してください」と要求 (実体は次の `UiHost::frame` 末尾で実行)。
+    /// 1 フレーム内に複数回呼ばれても 1 度として扱う (idempotent)。
+    pub fn request_undo(&mut self) {
+        *self.pending_undo = true;
+    }
+
+    /// frame 末尾で UiHost に「redo してください」と要求。
+    pub fn request_redo(&mut self) {
+        *self.pending_redo = true;
+    }
+
+    #[must_use]
+    pub fn can_undo(&self) -> bool {
+        self.history_can_undo
+    }
+
+    #[must_use]
+    pub fn can_redo(&self) -> bool {
+        self.history_can_redo
+    }
+
+    /// menu の "Undo (fader change)" 表記用のラベル取得。`None` なら undo stack が空。
+    #[must_use]
+    pub fn undo_label(&self) -> Option<&'static str> {
+        self.history_undo_label
+    }
+
+    #[must_use]
+    pub fn redo_label(&self) -> Option<&'static str> {
+        self.history_redo_label
+    }
+
+    // ============================================================
+    // M8 Phase 30: shortcut + focus traversal + focus ring
+    // ============================================================
+
+    /// このフレームに `name` で登録した shortcut が triggered されていれば true (consume)。
+    /// 同 name で 2 度目に呼ぶと false (= 1 度限り消費)。
+    pub fn take_shortcut(&mut self, name: &'static str) -> bool {
+        if let Some(idx) = self.pending_shortcuts.iter().position(|n| *n == name) {
+            self.pending_shortcuts.remove(idx);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// このフレームに該当 shortcut が triggered されているか (consume せず読み取りのみ)。
+    #[must_use]
+    pub fn has_shortcut(&self, name: &'static str) -> bool {
+        self.pending_shortcuts.contains(&name)
+    }
+
+    /// text_input 等の typing widget が focus 中に呼ぶ。修飾なし shortcut (Space 等) を
+    /// 抑制する目的だが、現状の実装は shortcut layer が frame 頭で済ませているため、
+    /// このフラグはまだ参照されていない (M9 で typing_focus を見て修飾なし shortcut を
+    /// 後から restore する path を追加予定)。
+    pub fn set_typing_focus(&mut self, typing: bool) {
+        *self.typing_focus = typing;
+    }
+
+    /// 自身を Tab / arrow focus traversal の対象として登録する。
+    /// 登場順で Tab next / Shift+Tab prev、arrow は方向別の最近傍移動。
+    pub fn focusable(&mut self, wid: WidgetId, rect: Rect) {
+        self.focus_order.push((wid, rect));
+    }
+
+    /// 現在 focus を持っているなら 1px の青系 ring を `rect` 周囲に描画する。
+    /// `wid` を渡し、self が focused かを内部で判定する想定だが、`is_focused` を呼んで
+    /// 利用者側で判定するスタイルでも動く (描画のみ行う、判定はしない)。
+    pub fn draw_focus_ring(&mut self, rect: Rect) {
+        let color = Color::rgb(0.55, 0.78, 0.95);
+        let segments = vec![
+            LineSegment { a: [rect.x, rect.y], b: [rect.x + rect.w, rect.y], color },
+            LineSegment {
+                a: [rect.x + rect.w, rect.y],
+                b: [rect.x + rect.w, rect.y + rect.h],
+                color,
+            },
+            LineSegment {
+                a: [rect.x + rect.w, rect.y + rect.h],
+                b: [rect.x, rect.y + rect.h],
+                color,
+            },
+            LineSegment { a: [rect.x, rect.y + rect.h], b: [rect.x, rect.y], color },
+        ];
+        self.push_lines(LineBatch { segments, line_width_px: 1.0, clip_rect: None });
+    }
+
+    /// `name` に登録された shortcut を表記文字列で返す ("Ctrl+Z" 等)。menu 右端の表示用。
+    #[must_use]
+    pub fn shortcut_for(&self, name: &'static str) -> Option<String> {
+        self.shortcut_map.display_for(name)
+    }
+
+    // ============================================================
+    // M8 Phase 31: clipboard
+    // ============================================================
+
+    /// このフレームに paste shortcut (Ctrl+V) が triggered されていれば OS clipboard から
+    /// 読み出した text を返す。同フレームに 2 度目の呼び出しは None。
+    /// clipboard provider 未設定時 / clipboard 操作失敗時は None。
+    pub fn take_clipboard_paste(&mut self) -> Option<String> {
+        self.pending_clipboard_paste.take()
+    }
+
+    /// 任意の文字列を OS clipboard に書き込む (frame 末尾で provider.set_text)。
+    /// 同 frame 内で複数回呼ぶと最後勝ち (= 直前の write は捨てられる)。
+    pub fn set_clipboard_text(&mut self, s: String) {
+        // 最後勝ちの semantics を維持するため、既存を clear して push。
+        self.pending_clipboard_writes.clear();
+        self.pending_clipboard_writes.push(s);
+    }
+
+    /// MIME bytes の paste を取り出す (M8 では skeleton、provider default は no-op)。
+    pub fn take_clipboard_paste_bytes(&mut self, mime: &'static str) -> Option<Vec<u8>> {
+        self.pending_clipboard_paste_bytes.remove(mime)
+    }
+
+    /// MIME bytes を clipboard に書き込む (M8 では skeleton)。
+    pub fn set_clipboard_bytes(&mut self, mime: &'static str, bytes: Vec<u8>) {
+        self.pending_clipboard_writes_bytes.push((mime, bytes));
+    }
+
+    // ============================================================
+    // M8 Phase 32: file drop
+    // ============================================================
+
+    /// `rect` 内に file がドロップされていれば paths を 1 度だけ取り出す。
+    /// 同 frame 内で複数 widget が呼んでも先勝ち。
+    pub fn take_file_drop_in_rect(&mut self, rect: Rect) -> Option<Vec<PathBuf>> {
+        let drop_pos = self.file_drop.as_ref()?.position;
+        if !rect.contains(drop_pos.0, drop_pos.1) {
+            return None;
+        }
+        let drop = self.file_drop.take()?;
+        Some(drop.paths)
+    }
+
+    /// `rect` 内に file が hover 中か (drop target highlight 用、consume せず)。
+    /// 判定は現在の pointer position に基づく (winit が hover 中も CursorMoved を送る)。
+    #[must_use]
+    pub fn is_file_hovering_in_rect(&self, rect: Rect) -> bool {
+        if self.file_hover.is_none() {
+            return false;
+        }
+        let Some((px, py)) = self.pointer.pos else { return false };
+        rect.contains(px, py)
+    }
+
+    /// このフレームに hover 中の file 一覧 (read-only、consume されない)。
+    #[must_use]
+    pub fn hovering_files(&self) -> Option<&[PathBuf]> {
+        self.file_hover.as_deref()
+    }
+
+    // ============================================================
+    // M8 Phase 33: multi-select (rect drag)
+    // ============================================================
+
+    /// `wid` で識別される drag-rect セッション。`bounds` 内で primary 押下 → drag 開始。
+    /// drag 中は library が半透明 cyan overlay (alpha 0.20 + 1px border) を **自動描画**。
+    /// release フレームで `finished=true` を 1 度だけ返してから state クリア。
+    pub fn take_drag_rect_in_rect(
+        &mut self,
+        wid: WidgetId,
+        bounds: Rect,
+    ) -> Option<DragRect> {
+        let pointer = self.pointer;
+        let modifiers = pointer.modifiers;
+
+        let (active, just_finished, snapshot_start, snapshot_mods) = {
+            let state: &mut DragRectState = self.widget_state(wid);
+
+            // 押下 in bounds → drag 開始
+            if pointer.primary_just_pressed
+                && let Some((px, py)) = pointer.pos
+                && bounds.contains(px, py)
+            {
+                state.drag_start = Some((px, py));
+                state.start_modifiers = modifiers;
+            }
+
+            let active = state.drag_start.is_some();
+            let just_finished = active && pointer.primary_just_released;
+            let start = state.drag_start;
+            let start_mods = state.start_modifiers;
+
+            // release で state クリア (次フレーム以降は active=false)
+            if pointer.primary_just_released {
+                state.drag_start = None;
+            }
+            (active, just_finished, start, start_mods)
+        };
+
+        if !active {
+            return None;
+        }
+        let start = snapshot_start?;
+        let end = pointer.pos.unwrap_or(start);
+
+        let drag = DragRect {
+            start,
+            end,
+            modifiers: snapshot_mods,
+            finished: just_finished,
+        };
+
+        // drag 中は半透明 cyan overlay を自動描画 (release frame でも 1 度描画する)。
+        let r = drag.rect();
+        let fill = Color { r: 0.32, g: 0.78, b: 0.95, a: 0.20 };
+        let border = Color { r: 0.32, g: 0.78, b: 0.95, a: 0.85 };
+        self.push_rect(RectCommand {
+            rect: r,
+            fill,
+            border,
+            border_width: 1.0,
+            radius: [0.0; 4],
+            clip_rect: Some(bounds),
+        });
+
+        Some(drag)
+    }
+
+    // ============================================================
+    // M8 Phase 34: file dialog
+    // ============================================================
+
+    /// open file dialog (single) を frame 末尾で出すよう要求。`name` は結果取得時のタグ。
+    pub fn request_open_file_dialog(
+        &mut self,
+        name: &'static str,
+        title: &str,
+        filters: &[FileDialogFilter],
+    ) {
+        self.pending_dialog_requests.push(DialogRequest {
+            name,
+            kind: DialogKind::OpenFile,
+            title: title.into(),
+            default_name: String::new(),
+            filters: filters.to_vec(),
+        });
+    }
+
+    pub fn request_open_files_dialog(
+        &mut self,
+        name: &'static str,
+        title: &str,
+        filters: &[FileDialogFilter],
+    ) {
+        self.pending_dialog_requests.push(DialogRequest {
+            name,
+            kind: DialogKind::OpenFiles,
+            title: title.into(),
+            default_name: String::new(),
+            filters: filters.to_vec(),
+        });
+    }
+
+    pub fn request_save_file_dialog(
+        &mut self,
+        name: &'static str,
+        title: &str,
+        default_name: &str,
+        filters: &[FileDialogFilter],
+    ) {
+        self.pending_dialog_requests.push(DialogRequest {
+            name,
+            kind: DialogKind::SaveFile,
+            title: title.into(),
+            default_name: default_name.into(),
+            filters: filters.to_vec(),
+        });
+    }
+
+    /// 直前フレームに完了した dialog 結果を取り出す (1 度 consume)。
+    /// 結果は次フレーム以降に届く (request 直後の同 frame では取り出せない)。
+    pub fn take_dialog_result(&mut self, name: &'static str) -> Option<DialogResult> {
+        let result = self.dialog_results.get(name)?.clone();
+        self.consumed_dialog_results.insert(name);
+        Some(result)
+    }
+
     /// pointer が `rect` 内にあるなら、このフレームに蓄積された scroll delta (px) を取り出して
     /// 内部 buffer を 0 に戻す。focus 不要 (scroll は pointer 位置で配信)。
     ///
@@ -630,6 +1202,121 @@ pub(crate) fn mix_clip_into_hash(input_hash: u64, clip: Option<Rect>) -> u64 {
         }
     }
     h.finish()
+}
+
+/// M8 Phase 30: focus traversal の方向 (`Ui::focusable` 登録の中から最近傍を選ぶ)。
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FocusDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// M8 Phase 30: Tab / Shift+Tab で次/前の focusable wid を選ぶ。
+/// `current=None` の場合、forward なら最初、prev なら最後を返す。
+pub(crate) fn tab_navigate(
+    order: &[(WidgetId, Rect)],
+    current: Option<WidgetId>,
+    forward: bool,
+) -> Option<WidgetId> {
+    if order.is_empty() {
+        return None;
+    }
+    let cur_idx = current.and_then(|c| order.iter().position(|(w, _)| *w == c));
+    let next_idx = match cur_idx {
+        Some(i) if forward => (i + 1) % order.len(),
+        Some(i) => (i + order.len() - 1) % order.len(),
+        None if forward => 0,
+        None => order.len() - 1,
+    };
+    Some(order[next_idx].0)
+}
+
+/// M8 Phase 30: arrow nav で `dir` 方向の最近傍 focusable を選ぶ。
+/// 距離は (主軸) + (副軸 × 2) のシンプルな metric。focus 範囲外 / 反対方向は除外。
+pub(crate) fn arrow_navigate(
+    order: &[(WidgetId, Rect)],
+    current: Option<WidgetId>,
+    dir: FocusDirection,
+) -> Option<WidgetId> {
+    if order.is_empty() {
+        return None;
+    }
+    let Some(current) = current else {
+        return Some(order[0].0);
+    };
+    let Some((cur_wid, cur_rect)) =
+        order.iter().find(|(w, _)| *w == current).copied()
+    else {
+        return Some(order[0].0);
+    };
+    let cx = cur_rect.x + cur_rect.w * 0.5;
+    let cy = cur_rect.y + cur_rect.h * 0.5;
+    let mut best: Option<(WidgetId, f32)> = None;
+    for (w, r) in order {
+        if *w == cur_wid {
+            continue;
+        }
+        let rx = r.x + r.w * 0.5;
+        let ry = r.y + r.h * 0.5;
+        let dx = rx - cx;
+        let dy = ry - cy;
+        let (primary, secondary) = match dir {
+            FocusDirection::Up => (-dy, dx.abs()),
+            FocusDirection::Down => (dy, dx.abs()),
+            FocusDirection::Left => (-dx, dy.abs()),
+            FocusDirection::Right => (dx, dy.abs()),
+        };
+        if primary <= 0.0 {
+            continue;
+        }
+        let metric = primary + secondary * 2.0;
+        match best {
+            Some((_, m)) if metric <= m => best = Some((*w, metric)),
+            None => best = Some((*w, metric)),
+            _ => {}
+        }
+    }
+    best.map(|(w, _)| w)
+}
+
+/// M8 Phase 34: rfd を **同期実行** して dialog を表示する。
+///
+/// feature `dialog` が無効化されている場合は常に `Cancelled` を返す (test 環境や rfd 互換性
+/// 問題に対する retreat path)。
+#[cfg(feature = "dialog")]
+fn run_dialog_sync(req: &DialogRequest) -> DialogResult {
+    let mut dialog = rfd::FileDialog::new().set_title(&req.title);
+    for filter in &req.filters {
+        dialog = dialog.add_filter(filter.name, filter.extensions);
+    }
+    match req.kind {
+        DialogKind::OpenFile => match dialog.pick_file() {
+            Some(p) => DialogResult::OpenFile(p),
+            None => DialogResult::Cancelled,
+        },
+        DialogKind::OpenFiles => match dialog.pick_files() {
+            Some(ps) => DialogResult::OpenFiles(ps),
+            None => DialogResult::Cancelled,
+        },
+        DialogKind::SaveFile => {
+            let dialog = if req.default_name.is_empty() {
+                dialog
+            } else {
+                dialog.set_file_name(&req.default_name)
+            };
+            match dialog.save_file() {
+                Some(p) => DialogResult::SaveFile(p),
+                None => DialogResult::Cancelled,
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "dialog"))]
+fn run_dialog_sync(_req: &DialogRequest) -> DialogResult {
+    DialogResult::Cancelled
 }
 
 /// 視覚フィードバック用 — 押下中(矩形内 & primary_pressed)なら true。

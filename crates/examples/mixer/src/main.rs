@@ -128,6 +128,16 @@ impl App {
             screen,
             input,
             |m, ui| {
+                // M8 Phase 30: keyboard shortcut。Ctrl+Z で undo、Ctrl+Shift+Z / Ctrl+Y で redo。
+                // fader / knob は drag 終端で Undoable Edit を発行するので、ここで request_undo
+                // するだけで前回の drag が巻き戻る。
+                if ui.take_shortcut("undo") {
+                    ui.request_undo();
+                }
+                if ui.take_shortcut("redo") {
+                    ui.request_redo();
+                }
+
                 // タイトル編集 (M3 Phase 4b: text_input)。
                 ui.label("title_lbl", "タイトル (クリックで編集):");
                 let _: TextInputResponse = ui.text_input("title_edit", &m.title, |new| {
@@ -237,7 +247,7 @@ impl App {
                     let mute_rect  = layout.rect(mute_n);
 
                     let resp: FaderResponse =
-                        ui.fader_at(("ch_fader", i), fader_rect, m.faders[i], 0.0, move |v| {
+                        ui.fader_at(("ch_fader", i), fader_rect, m.faders[i], 0.0, "fader", move |v| {
                             Edit::mutate(move |m: &mut MixerModel| {
                                 m.faders[i] = v;
                                 m.last_action = format!("ch{} fader = {v:.2}", i + 1);
@@ -258,7 +268,7 @@ impl App {
                     );
 
                     let kresp: KnobResponse =
-                        ui.knob_at(("ch_pan", i), knob_rect, m.pans[i], 0.5, move |v| {
+                        ui.knob_at(("ch_pan", i), knob_rect, m.pans[i], 0.5, "pan", move |v| {
                             Edit::mutate(move |m: &mut MixerModel| {
                                 m.pans[i] = v;
                                 let lr = (v - 0.5) * 2.0; // -1..1

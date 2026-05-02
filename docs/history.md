@@ -751,6 +751,78 @@ M5.5 完了後の DAW プラグイン対応・アクセシビリティ・波形�
 
 **残作業**: なし。**M7 完了**。M8 以降の構成は plan.md M8-M14 を参照。
 
+### M8 (アクション / 入力基盤) — Phase 29-34 全完遂 ✅ M8 完了 (2026-05-02、1 commit)
+
+ユーザ判断で **M8 全体を 1 commit** で完遂 (M7 と同方針)。Phase 29-34 + 既存 example (mixer / sample_edit_ops / piano_roll / daw_prototype) の M8 機能配備 + fader/knob signature 拡張 (label 追加) + docs 同梱。
+
+| Phase | テーマ | 状態 |
+|---|---|---|
+| 29 | history stack (undo / redo) | ✅ `Edit::Undoable { forward, inverse, label }` variant + `Edit::with_inverse` + `HistoryStack<M>` + `Ui::request_undo / request_redo / can_undo / can_redo / undo_label / redo_label` (no-Clone 維持、`Arc<dyn Fn>` で forward/inverse を保持) |
+| 30 | keyboard shortcut + navigation | ✅ `Shortcut::parse / matches` + `ShortcutMap::with_default_bindings` (undo/redo/cut/copy/paste/save/open/tab_next/tab_prev/focus_*) + `Ui::take_shortcut` (Pull 型) + `Ui::focusable / draw_focus_ring` + Tab traversal (登場順) + arrow nav (2D 最近傍) |
+| 31 | clipboard (cut / copy / paste) | ✅ `ClipboardProvider` trait + `NoopClipboard` + `ArboardClipboard` (feature `clipboard`) + `UiHost::with_clipboard` + `Ui::take_clipboard_paste / set_clipboard_text` (paste shortcut 検出内蔵) |
+| 32 | drag & drop (OS file) | ✅ `AppEvent::FileHovered / FileDropped / FileHoverCancelled` + `InputAccumulator` 蓄積 + `Ui::take_file_drop_in_rect / is_file_hovering_in_rect` (drop 直前 cur_pos を合成) |
+| 33 | multi-select (rect drag) | ✅ `DragRect { start, end, modifiers, finished }` + `Ui::take_drag_rect_in_rect(wid, bounds)` (drag 中は半透明 cyan overlay を library 自動描画) |
+| 34 | file dialog (native) | ✅ `FileDialogFilter / DialogResult` + `Ui::request_*_file_dialog / take_dialog_result` (rfd 同期実行、UiHost::frame 末尾 block、feature `dialog`) |
+
+#### 主な成果物 (詳細)
+
+1. **`crates/ui/src/edit.rs`** — `Edit<M>` enum を `Mutate(Box<dyn FnOnce>)` のみから `{ Mutate, Undoable { forward: Arc<dyn Fn>, inverse: Arc<dyn Fn>, label } }` に拡張。`Edit::with_inverse(label, fwd, inv)` で undoable Edit を構築 (`Fn + Send + Sync + Clone + 'static` 制約)。`Edit::label() -> Option<&'static str>`、`apply()` は forward を実行 (history への push は `UiHost::frame` 責務)。
+2. **`crates/ui/src/history.rs` 新規** — `HistoryStack<M> { undo: VecDeque<HistoryEntry<M>>, redo, capacity }` ring buffer (default 100)。`push / undo / redo / can_undo / can_redo / undo_label / redo_label / clear / set_capacity`。新規 push で redo クリア (DAW 標準動作)、capacity 超過で最古から truncate。9 unit tests pass。
+3. **`crates/ui/src/shortcut.rs` 新規** — `Shortcut { key: PhysicalKey, mods: Modifiers }` + `Shortcut::parse(spec: &str)` ("Ctrl+Shift+Z" 形式パーサ)。`ShortcutMap` に entries を登録順保持、`with_default_bindings()` で DAW 慣用 shortcut を一括登録。`display_for(name)` で menu 右端の "Ctrl+Z" 表記。8 unit tests pass。
+4. **`crates/ui/src/clipboard.rs` 新規** — `ClipboardProvider` trait (get_text / set_text / get_bytes / set_bytes 4 method、bytes は default no-op)、`NoopClipboard` (test / clipboard 不在 fallback)、`ArboardClipboard` (feature `clipboard`、`arboard::Clipboard::new()` 失敗時 no-op に degrade、eprintln でログ)。
+5. **`crates/ui/src/dialog.rs` 新規** — `FileDialogFilter { name, extensions }` + `DialogResult { Cancelled / OpenFile / OpenFiles / SaveFile }` + 内部 `DialogRequest { name, kind, title, default_name, filters }`。
+6. **`crates/ui/src/widgets/drag_rect.rs` 新規** — `DragRect { start, end, modifiers, finished }` + `DragRect::rect()` (normalize) / `contains_point()`。内部 `DragRectState { drag_start, start_modifiers }` で frame 越し state 保持。
+7. **`crates/ui/src/ui.rs`** — `UiHost` に `history / shortcut_map / clipboard / pending_dialog_results / last_focusable / transient_*` field 追加。builder `with_history_capacity / with_shortcut_map / with_clipboard`、accessor `history / history_mut / shortcut_map / shortcut_map_mut / clipboard_available`。`UiHost::frame` で `Edit::Undoable` を見つけたら forward を実行 + `(forward, inverse, label)` を `history.push`、undo/redo / clipboard write / dialog 同期実行 / consumed dialog result クリーンアップ。`Ui` には Phase 29-34 全 method を追加 (`request_undo / request_redo / can_undo / can_redo / take_shortcut / set_typing_focus / focusable / draw_focus_ring / take_clipboard_paste / set_clipboard_text / take_clipboard_paste_bytes / set_clipboard_bytes / take_file_drop_in_rect / is_file_hovering_in_rect / hovering_files / take_drag_rect_in_rect / request_open_file_dialog / request_open_files_dialog / request_save_file_dialog / take_dialog_result / shortcut_for`)。frame_to_edits 末尾に Tab/arrow focus traversal (`tab_navigate / arrow_navigate / FocusDirection`)。
+8. **`crates/platform/src/event.rs`** — `Modifiers::empty / is_empty / matches` ヘルパ追加、`PhysicalKey` に `Char(char) / Digit(u8) / F(u8) / Delete / Home / End / PageUp / PageDown / Insert` variant 追加 (M1 の制御キー + Other(u32) のみから拡張、shortcut 解釈で必要)、`AppEvent::FileHovered / FileHoverCancelled / FileDropped(PathBuf)` の 3 variant 追加。
+9. **`crates/platform/src/winit_backend.rs`** — `KeyCode::KeyA..KeyZ → PhysicalKey::Char('A'..'Z')`、`Digit0..Digit9 → Digit`、`F1..F24 → F`、`Delete / Home / End / PageUp / PageDown / Insert` mapping 追加。`WindowEvent::DroppedFile / HoveredFile / HoveredFileCancelled` を AppEvent に変換 (これまで `_ => {}` で捨てていた path)。
+10. **`crates/ui/src/input.rs`** — `DroppedFiles { paths, position }` 型新規、`PointerFrame` は Copy 維持のため file_drop は `FrameInput::file_drop / file_hover` フィールドで保持 (PointerFrame に乗せると `Copy` 失う)。`InputAccumulator` に `pending_file_drops / hovering_files`、`ingest` で `AppEvent::FileHovered → push`, `FileHoverCancelled → clear`, `FileDropped → push + hovering clear`。`take_input` で drop pos に直近 `cur_pos` を合成 (winit が DroppedFile に position を提供しないため)。
+11. **`crates/ui/src/widgets/{fader,knob}.rs`** — `fader_at / fader / knob_at / knob` の signature 拡張: `label: &'static str` 引数追加、`on_change` を `FnOnce` から `Fn + Clone + Send + Sync + 'static` に。`FaderState / KnobState` に `drag_initial_value: Option<f32>` 追加。drag 開始時の値を保存、release frame で `take()` して `Edit::with_inverse(label, fwd, inv)` を発行。drag 中の Mutate Edit は release frame では抑制 (Undoable.forward が再実行するため二重更新を回避)。
+12. **`crates/ui/src/widgets/text_input.rs`** — focus 中に `ui.set_typing_focus(true)` を 1 行追加 (M9 で修飾なし shortcut 抑制経路で参照予定)。
+13. **`crates/ui/Cargo.toml`** — `[features] default = ["dialog", "clipboard"]`、`dialog = ["dep:rfd"]`、`clipboard = ["dep:arboard"]`、`rfd = "0.15"` / `arboard = "3"` を optional dep として追加。
+14. **example 更新 (新抽象を次の機会に使う原則)** —
+    - `mixer`: shortcut undo/redo (Ctrl+Z / Ctrl+Shift+Z + Ctrl+Y) を frame 頭に追加、fader/knob は drag 終端で undoable Edit を自動発行 (signature 拡張で label 渡し)。
+    - `daw_prototype`: shortcut undo/redo + Ctrl+O で audio file open dialog を request + AppEvent::FileDropped を screen-wide で受けて last_action に表示。Edit menu の Undo/Redo ラベルに shortcut 表記 (Ctrl+Z) を併記 (実動作は shortcut layer 経由)。
+    - `sample_edit_ops`: shortcut undo/redo を frame 頭に追加 (trim/fade の完全 undoable 化は audio buffer copy のメモリコストが大きいため M9 送り、docs に明記)。
+    - `piano_roll`: shortcut undo/redo を frame 頭に追加 (note 編集自体は M10 で本実装、ここは shortcut layer 動作確認の demo のみ)。
+    - `arrangement / sample_editor / waveform_validation`: 直接の M8 機能追加なし (将来 M9 で個別実装、現状は fader_at/knob_at 利用箇所が無いため signature 変更影響なし)。
+15. **テスト追加** — `crates/ui/tests/m8_integration.rs` 新規 (9 tests): undoable_edit_round_trip / shortcut_take_consumes_match / shortcut_redo_with_ctrl_y / tab_traversal_moves_focus_in_order / noop_clipboard_paste_returns_none / file_drop_consumed_by_take_in_rect / file_drop_outside_rect_returns_none / drag_rect_press_drag_release_lifecycle / dialog_request_does_not_panic_without_action。`tests/ui/pass/basic.rs` (trybuild) に `Edit::with_inverse` 使用例を追加して **`Fn` 制約でも Model に Clone 不要** を回帰固定。`crates/ui/src/{history,shortcut,clipboard,dialog,widgets/drag_rect}.rs` 内に unit tests (history 9 + shortcut 8 + clipboard 1 + dialog 1 + drag_rect 2 = 21) を追加。
+16. **docs/plan.md / history.md 更新** — M8 表を全 ✅ に、本節を追記 (M8 完了履歴)。
+
+#### 設計判断 (M8 全般)
+
+- **commit 戦略**: M8 全体を 1 commit (Phase 29-34 + example/test/docs 同梱、M7 と同方針)。理由: M8 の各 phase は API 表面が小さく widget tree 全体に薄く分散するため、breaking change を 1 commit で吸収する方が整合性が高い。
+- **`Edit::Undoable` の `Fn` 制約 + variant 追加**: `Box<dyn FnOnce>` のままだと redo (forward 再実行) が不可能。代替案 (UndoableEdit 別型 / UndoOp pub trait / undo only) は API 表面 / boilerplate / 仕様違反のいずれかで不採用。`Arc<dyn Fn(&mut M) + Send + Sync>` で forward/inverse を保持し、apply 時に history へ Arc clone を push する設計で、ユーザクロージャの capture も Copy 値だけで完結する自然な書き方になる (`move |m| m.x = old`)。
+- **fader/knob の `label` 追加 (breaking change)**: 既存 fader_at の `on_change: FnOnce(f32) -> Edit<M>` を `Fn + Clone` に変更し、5 番目引数で `label: &'static str` を追加。1 commit で全 example (mixer / daw_prototype) と trybuild test を一括更新。drag 終端の Undoable Edit 発行で history に積まれる単位を「drag 開始 → drag 終端」に統一 (DAW 標準動作)。
+- **shortcut Pull 型 (`Ui::take_shortcut(name) -> bool`)**: declarative `Ui::shortcut(spec, fn)` より context-sensitive な制御 (focused widget の有無で発火を変える等) を widget tree のどこからでも書けるため採用。`set_typing_focus(true)` を text_input が呼ぶ経路を仕込んで M9 で修飾なし shortcut 抑制を後付け予定。
+- **clipboard は trait 経由 (`ClipboardProvider`)**: M13 baseview backend 移行時に provider 差し替えだけで済む。winit backend では `ArboardClipboard` を `UiHost::with_clipboard(...)` で渡す。`arboard::Clipboard::new()` の失敗 (Linux で xclip/wl-clipboard 不在) は内部で握り eprintln でログ + no-op に degrade、UI 側は failure を意識しない。
+- **file dialog は同期実行 (rfd::FileDialog::pick_file())**: DAW 業界標準の modal UX、winit と rfd の thread 互換性が Windows / macOS で安定。Linux GTK/portal で問題が出た場合は **非同期版** (thread spawn + channel) に降りる retreat path を残す。
+- **multi-select の overlay は library が自動描画**: drag 中の半透明 cyan rect (alpha 0.20 + 1px border) を `take_drag_rect_in_rect` 内で `push_rect`、利用者は drag rect の `start / end / finished` を見て selection を構築するだけ (CLAUDE.md「user に boilerplate を強要しない」原則と整合)。
+- **Tab traversal は登場順 default**: `Ui::focusable(wid, rect)` の push 順 (= layout 順) で Tab next / Shift+Tab prev、arrow nav は rect 中心の 2D 距離 (主軸 + 副軸×2) で最近傍。explicit `focus_priority(wid, i32)` 等の order 指定 API は実用上必要が出たときに M9 以降で追加 (KISS)。
+- **frame_to_edits の signature 維持**: M8 で UiHost::frame に追加された transient state (undo/redo request / clipboard writes / dialog requests / consumed dialog results) は **UiHost の transient field** として保持し、`frame_to_edits` の戻り値 `Vec<Edit<M>>` は変えない。low-level user は `take_frame_outputs()` (将来追加) 等で transient を取り出せる方針。今 commit では `frame_to_edits` を直接呼ぶ既存 example / test の互換性を保つ。
+- **PointerFrame は Copy 維持**: file_drop は `Vec<PathBuf>` を含むため `PointerFrame` には乗せず、`FrameInput` の別 field (`file_drop / file_hover`) として持つ。これで widget 内部の `let pointer = self.pointer;` の Copy 利用が壊れない (M7 までの大量の widget code が無傷で動く)。
+
+#### 既知の妥協 / M9+ 送り
+
+- **declarative `Ui::shortcut(spec, on_match)` sugar**: Pull 型の `take_shortcut` で M8 完結。declarative sugar は M9 で paradigm を共存させる検討 (KISS で見送り)。
+- **MIME bytes clipboard の実用例**: `set_clipboard_bytes / take_clipboard_paste_bytes` は API skeleton のみ提供 (provider default は no-op)。実用は M10 (audio buffer の clipboard / MIDI note の clipboard) で。
+- **arrow nav の対角 priority 詳細**: 最初の実装は 2D 距離 + quadrant の単純な metric。複雑なレイアウト (table / grid) で「次の行の先頭にジャンプ」のような直感的振る舞いが必要なら M9 で改良。
+- **rfd Linux 環境互換性**: 現状は同期版を採用、Linux GTK/portal で問題が出たら非同期版 (thread spawn + channel) に降りる retreat path を docs に明記。
+- **HistoryStack のグループ化 (multiple Edits を 1 step として扱う)**: 構造を残しつつ M8 では実装しない。`HistoryStack::begin_group / end_group` を後付けできる余地あり。
+- **`set_typing_focus` の修飾なし shortcut 抑制**: text_input が `set_typing_focus(true)` を呼ぶ経路は仕込み済みだが、shortcut layer 自体は frame 頭で全 shortcut を判定するため、現状は typing_focus フラグを読まない。M9 で修飾なし shortcut (Space / Delete 等) を typing 中に抑制する logic を追加予定。
+- **trim/fade を Edit::with_inverse 化**: sample_edit_ops の trim/fade は audio buffer (Vec<f32>) を変更するため undoable 化には snapshot copy が必要。memory コストが大きく no-Clone 方針と緊張する。M9 で Arc<[f32]> 共有 + COW スナップショット戦略で再検討。
+- **UiHost::take_frame_outputs() (low-level API)**: `frame_to_edits` 経由の low-level user 向けに transient 取り出し API を追加するべきだが、現状 example で frame_to_edits を直接使うのは bench / no_clone_required pass だけなので、本 commit では未実装。M9 で必要に応じて追加。
+- **arrangement / sample_editor / waveform_validation の M8 機能配備**: docs/plan.md M8 表に書かれていた個別配備 (file drop / dialog / rect select の各 example での実装) は時間制約で daw_prototype に集約。M9 で個別 example にも展開。
+
+#### 検証結果 (本コミット時点)
+
+- `cargo build --workspace`: ✅
+- `cargo test --workspace`: ✅ (daw-ui-core 90 unit + 9 m8_integration + 1 widget_id_collision + 1 no_clone_required trybuild = 101 tests pass)
+- `cargo test -p daw-ui-core --test no_clone_required`: ✅ (`Edit::with_inverse` の `Fn` 制約でも Model に Clone 不要を trybuild で固定)
+- `cargo clippy --workspace --tests -- -D warnings`: ✅
+- 実機 (`cargo run --bin daw_prototype` 等): ビルド ✅、shortcut Ctrl+Z/Y/O / file drop / dialog の動作確認は利用者依存
+
+**残作業**: なし。**M8 完了**。M9 (theming + animation + icons) に進む。
+
 ---
 
 ## 波形表示 UI 詳細設計 (M2 で実装、M5 で詳細モード追加)

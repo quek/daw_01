@@ -17,8 +17,9 @@
 use std::sync::Arc;
 
 use daw_ui_core::{
-    BarBeatGridStyle, Edit, FaderResponse, InputAccumulator, LevelMeterStyle, MeterBallistic,
-    Orientation, TimeMapping, TimeRulerStyle, UiHost, ViewportState1D,
+    BarBeatGridStyle, DialogResult, Edit, FaderResponse, FileDialogFilter, InputAccumulator,
+    LevelMeterStyle, MeterBallistic, Orientation, TimeMapping, TimeRulerStyle, UiHost,
+    ViewportState1D,
 };
 use daw_ui_platform::{AppEvent, AppHost, WindowBackend, winit_backend};
 use daw_ui_renderer::{Color, Rect, RectCommand, Renderer, Scene};
@@ -133,6 +134,48 @@ impl App {
                 // (実運用では audio thread から peak 取得時に request_redraw を呼ぶ)
                 ui.request_redraw();
 
+                // M8 Phase 30: shortcut layer。
+                // - Ctrl+Z で undo / Ctrl+Shift+Z / Ctrl+Y で redo
+                // - Ctrl+O で audio file open dialog
+                if ui.take_shortcut("undo") {
+                    ui.request_undo();
+                }
+                if ui.take_shortcut("redo") {
+                    ui.request_redo();
+                }
+                if ui.take_shortcut("open") {
+                    ui.request_open_file_dialog(
+                        "open_audio",
+                        "Open audio file",
+                        &[FileDialogFilter {
+                            name: "Audio",
+                            extensions: &["wav", "mp3", "flac", "ogg"],
+                        }],
+                    );
+                }
+                // 前フレームに完了した dialog 結果を取り出して last_action に表示。
+                if let Some(result) = ui.take_dialog_result("open_audio") {
+                    let action = match result {
+                        DialogResult::OpenFile(p) => format!("open: {}", p.display()),
+                        DialogResult::Cancelled => "open: cancelled".to_string(),
+                        _ => "open: unexpected".to_string(),
+                    };
+                    ui.push_edit(Edit::mutate(move |m: &mut DawModel| {
+                        m.last_action = action;
+                    }));
+                }
+                // M8 Phase 32: file drop を window 全体で受ける。drop された path を last_action に表示。
+                let screen_rect = Rect::new(0.0, 0.0, ui.screen().width as f32, ui.screen().height as f32);
+                if let Some(paths) = ui.take_file_drop_in_rect(screen_rect) {
+                    let action = format!(
+                        "drop: {}",
+                        paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "),
+                    );
+                    ui.push_edit(Edit::mutate(move |m: &mut DawModel| {
+                        m.last_action = action;
+                    }));
+                }
+
                 // ---- 1. menu_bar ----
                 ui.menu_bar(menu_rect, |menu| {
                     menu.menu("File", |sub| {
@@ -183,14 +226,17 @@ impl App {
                         });
                     });
                     menu.menu("Edit", |sub| {
-                        sub.item("Undo", || {
+                        // M8 Phase 29 + 30: shortcut Ctrl+Z / Ctrl+Shift+Z で undo/redo。
+                        // menu item は同 shortcut を発火する直接的経路がないため、ラベルで表記して
+                        // shortcut の存在を可視化する (本動作は shortcut layer で処理済み)。
+                        sub.item("Undo (Ctrl+Z)", || {
                             Edit::mutate(|m: &mut DawModel| {
-                                m.last_action = "Edit → Undo (M8 で本実装)".to_string();
+                                m.last_action = "Edit → Undo: Ctrl+Z で実行されます".to_string();
                             })
                         });
-                        sub.item("Redo", || {
+                        sub.item("Redo (Ctrl+Shift+Z)", || {
                             Edit::mutate(|m: &mut DawModel| {
-                                m.last_action = "Edit → Redo (M8 で本実装)".to_string();
+                                m.last_action = "Edit → Redo: Ctrl+Shift+Z (or Ctrl+Y) で実行されます".to_string();
                             })
                         });
                     });
@@ -330,7 +376,7 @@ fn drawmixer_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pane: Rec
         // fader
         let fader_rect = Rect { x: cx, y: body_top, w: fader_w, h: body_h };
         let cur = m.faders[ch];
-        let _resp: FaderResponse = ui.fader_at(("ch_fader", ch), fader_rect, cur, 0.7, move |v| {
+        let _resp: FaderResponse = ui.fader_at(("ch_fader", ch), fader_rect, cur, 0.7, "fader", move |v| {
             Edit::mutate(move |m: &mut DawModel| m.faders[ch] = v)
         });
 

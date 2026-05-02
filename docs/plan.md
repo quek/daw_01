@@ -135,23 +135,26 @@ DAW プロトタイプとして使える最低限のコア building block + DAW 
 
 ---
 
-### M8 (アクション / 入力基盤、未着手)
+### M8 (アクション / 入力基盤、✅ 完了)
 
-ユーザ操作を支える基盤機能の集約。undo/redo (history stack) はライブラリ責務 (no-Clone Edit に対する history) としてどう扱うか設計判断が必要。clipboard / drag&drop は OS 統合。keyboard shortcut は user-rebindable (preference 連携) を見越した設計。
+ユーザ操作を支える基盤機能の集約。undo/redo / shortcut / clipboard / drag&drop / multi-select / file dialog を **1 commit で完遂** (M7 と同方針)。詳細は [history.md](history.md) M8 節参照。
 
-| Phase | テーマ | 主な成果物 |
+| Phase | テーマ | 状態 |
 |---|---|---|
-| 29 | history stack (undo / redo) | `Edit::with_inverse(forward, inverse)` で undoable Edit を作る API、history は ring buffer、snapshot copy 不要 (no-Clone 維持) |
-| 30 | keyboard shortcut + navigation | `Ui::shortcut("Ctrl+Z", on_match)` + Tab / arrow で focus 移動 + focus ring 描画、preference で再マップ可能、global / context-sensitive 切替 |
-| 31 | clipboard (cut / copy / paste) | text / 任意 byte slice、OS clipboard 統合 (arboard 等)、focus widget が消費 |
-| 32 | drag & drop (OS file) | OS から audio file ドロップ、`AppEvent::FileDropped(path)`、focus widget が消費 |
-| 33 | multi-select (rect drag) | piano_roll の note 範囲選択 / arrangement の clip 範囲選択の共通基盤 |
-| 34 | file dialog (native) | open / save、rfd crate 統合、AppHost 経由 |
+| 29 | history stack (undo / redo) | ✅ `Edit::Undoable { forward, inverse, label }` variant + `Edit::with_inverse(label, fwd, inv)` + `HistoryStack<M>` (default 100 step ring buffer) + `Ui::request_undo / request_redo / can_undo / can_redo / undo_label / redo_label` (no-Clone 維持) |
+| 30 | keyboard shortcut + navigation | ✅ `Shortcut::parse("Ctrl+Shift+Z")` + `ShortcutMap::with_default_bindings()` + `Ui::take_shortcut(name)` (Pull 型) + `Ui::focusable(wid, rect)` + `Ui::draw_focus_ring(rect)` + Tab / Shift+Tab 登場順 traversal + arrow nav の 2D 最近傍 |
+| 31 | clipboard (cut / copy / paste) | ✅ `ClipboardProvider` trait + `NoopClipboard` + `ArboardClipboard` (feature `clipboard`) + `Ui::take_clipboard_paste / set_clipboard_text` (paste shortcut 検出内蔵、request/response paradigm) |
+| 32 | drag & drop (OS file) | ✅ `AppEvent::FileHovered / FileDropped / FileHoverCancelled` + `InputAccumulator` 蓄積 + `Ui::take_file_drop_in_rect / is_file_hovering_in_rect` (drop 直前の cur_pos を合成 position として配信) |
+| 33 | multi-select (rect drag) | ✅ `DragRect { start, end, modifiers, finished }` + `Ui::take_drag_rect_in_rect(wid, bounds)` (drag 中は半透明 cyan overlay を library 自動描画) |
+| 34 | file dialog (native) | ✅ `FileDialogFilter / DialogResult` + `Ui::request_open_file_dialog / request_open_files_dialog / request_save_file_dialog / take_dialog_result` (rfd 同期実行、UiHost::frame 末尾 block、modal UX、feature `dialog`) |
 
 **設計判断 (M8 全般)**:
-- **history stack の no-Clone 実装**: `Edit::with_inverse(forward, inverse)` で undoable Edit を作る、history は `Vec<(forward, inverse)>`、snapshot copy 不要
-- file dialog は rfd crate (winit 単体では native dialog なし)
-- shortcut system は parser (`"Ctrl+Shift+Z"` → key + modifier 構造) を入れる
+- **Edit::Undoable は `Fn` 制約 + variant 拡張**: `Box<dyn FnOnce>` では redo (forward 再実行) 不可のため `Arc<dyn Fn(&mut M) + Send + Sync>` を 2 本持つ。fader/knob drag のような頻度高い更新は既存 `Edit::Mutate` (FnOnce) で history に乗せず、drag 終端でのみ Undoable Edit を発行する DAW 標準動作 (fader/knob の `label: &'static str` 引数追加で既存 example も全更新)
+- **Shortcut は Pull 型 (`Ui::take_shortcut(name) -> bool`)**: declarative `Ui::shortcut(spec, fn)` より context-sensitive (focused widget の有無等) を制御しやすい。`set_typing_focus(true)` を text_input が呼ぶことで修飾なし shortcut の抑制経路を確保
+- **Clipboard は trait 経由 (`ClipboardProvider`)**: M13 baseview backend 移行時に provider を差し替えるだけで feature gate を引きずらない。winit backend では `ArboardClipboard::new()` を `UiHost::with_clipboard(...)` で渡す。失敗時は no-op に degrade (eprintln でログ)
+- **File dialog は同期 (rfd::FileDialog::pick_file)**: DAW 業界標準の modal UX (Logic / Cubase / Bitwig 同等)、winit と rfd の thread 互換性も Windows / macOS で問題なし。Linux GTK/portal で問題が出た場合は非同期版へ降りる retreat path を確保
+- **Multi-select の overlay は library が自動描画**: drag 中の半透明 cyan rect (alpha 0.20 + 1px border) を `take_drag_rect_in_rect` 内で `push_rect`、利用者の boilerplate ゼロ
+- **Tab traversal は登場順 default**: `Ui::focusable(wid, rect)` の push 順で Tab next / Shift+Tab prev、arrow nav は rect 中心の 2D 距離 (主軸 + 副軸×2) で最近傍。explicit `focus_priority` は M9 送り (KISS)
 
 ---
 
