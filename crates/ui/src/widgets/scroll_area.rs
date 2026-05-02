@@ -99,6 +99,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             None
         };
 
+        let scrolled = scroll.0.abs() > 1e-4 || scroll.1.abs() > 1e-4;
         let offset = {
             let state: &mut ScrollState = self.widget_state(wid);
             // wheel 適用 (winit 慣行: y > 0 = wheel up = view 上方向)。offset.y -= scroll.y
@@ -160,6 +161,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
             state.offset
         };
+
+        // wheel scroll / drag 中は次フレーム再描画を要求 (state 変化を視覚反映するため)
+        if scrolled {
+            self.request_redraw();
+        }
 
         // ---- 3. 内側を with_clip_rect で描画 ----
         // viewport rect は scrollbar 領域を除いた本体エリア (scrollbar との重なり禁止)。

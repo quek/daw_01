@@ -100,7 +100,12 @@ impl<'b, 'a, M: ?Sized + 'static> Drop for TabBuilder<'b, 'a, M> {
         if let Some(idx) = self.clicked {
             let n = self.next_index;
             let state: &mut TabState = self.ui.widget_state(self.state_wid);
-            state.selected = idx.min(n.saturating_sub(1));
+            let new_selected = idx.min(n.saturating_sub(1));
+            if state.selected != new_selected {
+                state.selected = new_selected;
+                // タブ切替で次フレームの再描画を要求 (state.selected は Edit ではないため)
+                self.ui.request_redraw();
+            }
         }
     }
 }

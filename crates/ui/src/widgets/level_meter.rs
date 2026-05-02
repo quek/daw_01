@@ -128,6 +128,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             (display, state.peak_hold)
         };
 
+        // M7 後改善: peak / peak_hold が active なら自動 redraw 要求
+        // (idle 時 = display も peak_hold もほぼ 0 なら redraw 不要、電力節約)。
+        if display_value > 1e-4 || peak_hold_value > 1e-4 {
+            self.request_redraw();
+        }
+
         // 2. 描画
         // 背景
         self.push_rect(RectCommand {

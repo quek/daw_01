@@ -51,8 +51,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let pointer = self.pointer;
 
         // state 取得 + drag 処理
+        let ratio_changed;
         let ratio = {
             let state: &mut SplitState = self.widget_state(wid);
+            let prev_ratio = state.ratio;
             // 初期化 (新規 widget は ratio = 0.0 default → default_ratio に置換)
             if state.ratio == 0.0 && state.drag_anchor.is_none() {
                 state.ratio = default_ratio.clamp(0.05, 0.95);
@@ -86,8 +88,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             if pointer.primary_just_released {
                 state.drag_anchor = None;
             }
+            ratio_changed = (state.ratio - prev_ratio).abs() > 1e-6;
             state.ratio
         };
+        if ratio_changed {
+            // drag で境界が動いたフレーム → 次フレーム再描画 (利用者が on_event で
+            // request_redraw を呼んでいなくても動くように、library 側でも要求)
+            self.request_redraw();
+        }
 
         // pane / handle rect 計算
         let (pane_a, pane_b, handle) = split_rects(rect, orientation, ratio);

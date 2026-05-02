@@ -129,6 +129,10 @@ impl App {
             screen,
             input,
             |m, ui| {
+                // sim_phase アニメ継続のため毎フレーム redraw を要求
+                // (実運用では audio thread から peak 取得時に request_redraw を呼ぶ)
+                ui.request_redraw();
+
                 // ---- 1. menu_bar ----
                 ui.menu_bar(menu_rect, |menu| {
                     menu.menu("File", |sub| {
@@ -521,12 +525,11 @@ impl AppHost for App {
         }
         // IME (text_input がない demo だが、念のため empty で disable)
         self.window.set_ime_allowed(false);
-        // true: 毎フレーム redraw を要求 (60fps 連続描画)。
-        // - level_meter のアニメーション (sim_phase で時間進行) を動かすため
-        // - tab_view の state.selected 更新 (widget_state は Edit ではないため auto-redraw 対象外) を即時反映するため
-        // 妥協: アイドル時も電力消費。本来は library 側で `Ui::request_redraw()` を提供して
-        // widget が必要なときに redraw を要求できるようにすべき → M8 で改善予定。
-        true
+        // false: 連続再描画は library 側 (level_meter / tab_view / scroll_area /
+        // split_view 等が `Ui::request_redraw()` を呼ぶ) と Edit / focus 変化の
+        // auto-redraw に任せる。アイドル時 (sim_phase 動かない / tab 切替なし) は
+        // 0fps で電力節約。
+        false
     }
 }
 

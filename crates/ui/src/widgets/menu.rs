@@ -202,11 +202,11 @@ impl<'b, 'a, M: ?Sized + 'static> MenuBarBuilder<'b, 'a, M> {
 
 /// 2 つの矩形を含む最小 rect (popup の anchor 計算用)。
 fn union_rect(a: Rect, b: Rect) -> Rect {
-    let x = a.x.min(b.x);
-    let y = a.y.min(b.y);
-    let r = (a.x + a.w).max(b.x + b.w);
-    let bo = (a.y + a.h).max(b.y + b.h);
-    Rect { x, y, w: r - x, h: bo - y }
+    let left = a.x.min(b.x);
+    let top = a.y.min(b.y);
+    let right = (a.x + a.w).max(b.x + b.w);
+    let bottom = (a.y + a.h).max(b.y + b.h);
+    Rect { x: left, y: top, w: right - left, h: bottom - top }
 }
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {

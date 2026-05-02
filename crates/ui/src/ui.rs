@@ -57,6 +57,9 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// ため rustc から "never read" と誤判定されるが、実際には popup_layer で読まれる。
     #[allow(dead_code)]
     open_popups: HashMap<WidgetId, PopupOpenState>,
+    /// M7 後の改善: widget が `Ui::request_redraw()` を呼んだ場合の累積フラグ。
+    /// `frame()` の最後で `redraw_request` 呼び出し条件に含まれる。
+    redraw_requested_in_last_frame: bool,
     _m: PhantomData<fn(&mut M)>,
 }
 
@@ -72,6 +75,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             scenegraph: Scenegraph::new(),
             redraw_request: Box::new(redraw_request),
             open_popups: HashMap::new(),
+            redraw_requested_in_last_frame: false,
             _m: PhantomData,
         }
     }
@@ -137,7 +141,11 @@ impl<M: ?Sized + 'static> UiHost<M> {
         for e in edits {
             e.apply(model);
         }
-        if had_edits || self.focus_changed_in_last_frame {
+        // 自動 redraw の発火条件: edits / focus 変化 / widget からの request_redraw
+        if had_edits
+            || self.focus_changed_in_last_frame
+            || self.redraw_requested_in_last_frame
+        {
             (self.redraw_request)();
         }
     }
@@ -166,6 +174,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
         let cursor = Rect::new(0.0, 0.0, screen.width as f32, screen.height as f32);
         let focused_at_start = self.focused;
         let mut seen_widgets: HashSet<WidgetId> = HashSet::new();
+        let mut redraw_requested = false;
         let mut ui = Ui {
             state: &mut self.state,
             scene,
@@ -188,6 +197,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             popup_glyphs: Vec::new(),
             popup_lines: Vec::new(),
             drawing_in_popup: false,
+            redraw_requested: &mut redraw_requested,
             _m: PhantomData,
         };
         f(model, &mut ui);
@@ -210,6 +220,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
         // IME request の commit (フレーム内に request_ime が呼ばれていれば Some)。
         self.last_ime_request = ui.ime_request;
         drop(ui);
+        // widget からの request_redraw 累積を commit (ui drop 後に local 変数を読む)。
+        self.redraw_requested_in_last_frame = redraw_requested;
         // ui が drop して scene の borrow が外れた後で、popup buffer を append する。
         scene.rects.extend(popup_rects);
         scene.glyph_areas.extend(popup_glyphs);
@@ -273,6 +285,10 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     popup_lines: Vec<LineBatch>,
     /// `popup_layer` 内で描画中フラグ。push_* が popup_buffer に積むかを切替える。
     drawing_in_popup: bool,
+    /// M7 後の改善: widget が `Ui::request_redraw()` を呼んだら true。
+    /// `UiHost::frame` の末尾で `redraw_requested_in_last_frame` に commit され、
+    /// 次のフレーム redraw の発火条件に含まれる。
+    redraw_requested: &'a mut bool,
     _m: PhantomData<&'a M>,
 }
 
@@ -502,6 +518,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     pub fn consume_pointer_click(&mut self) {
         self.pointer.primary_just_pressed = false;
         self.pointer.primary_just_released = false;
+    }
+
+    /// 次フレームの再描画を要求する (widget が「state が変化した」「アニメーション継続中」等で呼ぶ)。
+    /// `Edit` や focus 変化と独立に redraw を起こせる。例:
+    /// - `level_meter`: peak_hold が減衰中 / peak がアニメ中
+    /// - `tab_view`: state.selected が前フレームから変わった
+    /// - drag 中の split_view handle (drag delta は pointer event で来るのでこちらは redundant)
+    ///
+    /// `UiHost::frame` の末尾で `redraw_request` (= `WindowBackend::request_redraw`) を呼ぶ。
+    /// 1 フレーム内で複数回呼ばれても 1 度の redraw 要求として扱う (累積 OR)。
+    pub fn request_redraw(&mut self) {
+        *self.redraw_requested = true;
     }
 
     /// pointer が `rect` 内にあるなら、このフレームに蓄積された scroll delta (px) を取り出して
