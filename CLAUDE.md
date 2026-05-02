@@ -16,6 +16,8 @@ daw_audio/         -- Audio Engine プロセス (CPAL)
 daw_plugin_host/   -- Plugin Host プロセス (CLAP/VST3)
 ```
 
+gui_01 は隣の sibling、参照のみ可。実装変更は gui_01 session で。
+
 ## Development Workflow
 
 ```bash
