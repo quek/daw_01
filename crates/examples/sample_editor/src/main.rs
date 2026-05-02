@@ -189,9 +189,10 @@ impl App {
         let renderer = Renderer::new(window.clone()).expect("Renderer::new");
         window.set_title("daw-ui sample_editor (M5 Phase 16)");
         Self {
+            ui: UiHost::with_window(window.clone()),
+
             window,
             renderer,
-            ui: UiHost::new(),
             model: SampleEditorModel::new(),
             scene: Scene::new(),
             input: InputAccumulator::new(),
@@ -309,8 +310,8 @@ impl App {
             self.model.vertical_gain,
         );
 
-        let edits = self.ui.frame(
-            &self.model,
+        self.ui.frame(
+            &mut self.model,
             &mut self.scene,
             screen,
             input,
@@ -404,9 +405,6 @@ impl App {
             },
         );
 
-        for e in edits {
-            e.apply(&mut self.model);
-        }
     }
 }
 

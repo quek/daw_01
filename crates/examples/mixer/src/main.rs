@@ -64,7 +64,7 @@ struct App {
 impl App {
     fn new(window: Arc<winit_backend::WinitWindow>) -> Self {
         let renderer = Renderer::new(window.clone()).expect("Renderer::new");
-        let ui = UiHost::<MixerModel>::new();
+        let ui = UiHost::<MixerModel>::with_window(window.clone());
         let model = MixerModel::new();
         let scene = Scene::new();
         let input = InputAccumulator::new();
@@ -90,7 +90,7 @@ impl App {
     /// 描画クロージャ後に apply されるので、この関数の `render` までの間に
     /// scene へ積まれているラベル文字列は 1 フレーム古い値になっている)。
     #[allow(clippy::too_many_lines, clippy::needless_range_loop)]
-    fn build_ui(&mut self) -> bool {
+    fn build_ui(&mut self) {
         self.scene.clear();
         let screen = self.renderer.size();
         let input = self.input.take_input();
@@ -121,8 +121,8 @@ impl App {
             }
         }
 
-        let edits = self.ui.frame(
-            &self.model,
+        self.ui.frame(
+            &mut self.model,
             &mut self.scene,
             screen,
             input,
@@ -329,11 +329,6 @@ impl App {
             },
         );
 
-        let had_edits = !edits.is_empty();
-        for e in edits {
-            e.apply(&mut self.model);
-        }
-        had_edits
     }
 }
 
@@ -359,7 +354,7 @@ impl AppHost for App {
 
     fn on_render(&mut self) -> bool {
         self.frames = self.frames.wrapping_add(1);
-        let had_edits = self.build_ui();
+        self.build_ui();
         if let Err(e) = self.renderer.render(&self.scene) {
             eprintln!("render error: {e}");
         }
@@ -392,7 +387,7 @@ impl AppHost for App {
             (false, None) => {}
         }
         // edits や focus 変化が出たら次フレームで適用後 Model / focus 状態を描き直す。
-        if had_edits || self.ui.focus_changed_in_last_frame() {
+        if self.ui.focus_changed_in_last_frame() {
             self.window.request_redraw();
         }
         // bench 中は連続再描画

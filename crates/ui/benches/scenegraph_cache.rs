@@ -26,7 +26,7 @@ fn button_rect(i: usize) -> Rect {
 }
 
 fn render_buttons(host: &mut UiHost<()>, scene: &mut Scene, screen: PhysicalSize, label: &str) {
-    host.frame(&(), scene, screen, FrameInput::default(), |_, ui| {
+    host.frame_to_edits(&(), scene, screen, FrameInput::default(), |_, ui| {
         for i in 0..N_BUTTONS {
             ui.button_at(("btn", i), label, button_rect(i), || {
                 Edit::mutate(|_: &mut ()| {})
@@ -42,7 +42,7 @@ fn bench_static_1000_buttons(c: &mut Criterion) {
     c.bench_function("static_1000_buttons_cached", |b| {
         b.iter_batched_ref(
             || {
-                let mut host: UiHost<()> = UiHost::new();
+                let mut host: UiHost<()> = UiHost::no_redraw();
                 let mut scene = Scene::new();
                 // Warm-up: cache を populate する 1 フレーム
                 render_buttons(&mut host, &mut scene, screen, "x");
@@ -62,7 +62,7 @@ fn bench_static_1000_buttons(c: &mut Criterion) {
         let mut counter: u64 = 0;
         b.iter_batched_ref(
             || {
-                let host: UiHost<()> = UiHost::new();
+                let host: UiHost<()> = UiHost::no_redraw();
                 let scene = Scene::new();
                 (host, scene)
             },

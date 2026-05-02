@@ -2,7 +2,7 @@
 //!
 //! ユーザのアプリループ:
 //! ```ignore
-//! let edits = host.frame(&model, &mut scene, &input, |m, ui| {
+//! let edits = host.frame_to_edits(&model, &mut scene, &input, |m, ui| {
 //!     ui.label("title", "Mixer");
 //!     ui.button("mute", "Mute", || Edit::mutate(|m: &mut MixerModel| m.mute = !m.mute));
 //! });
@@ -22,42 +22,74 @@ use crate::scenegraph::{CachedCommands, Scenegraph};
 use crate::widgets::WidgetState;
 
 /// アプリが 1 つ持つ UI ホスト。フレーム間で UI 内部状態を保持する。
+///
+/// 通常は [`Self::with_window`] で構築する:
+/// ```ignore
+/// let window = Arc::new(winit_window);
+/// let mut ui: UiHost<MyModel> = UiHost::with_window(window.clone());
+/// ```
+///
+/// `frame()` は `&mut model` を取って **edits を内部で apply** し、Edit が出たフレーム /
+/// focus が変わったフレームでは **自動で `request_redraw` を呼ぶ** ため、利用者は
+/// boilerplate (`for e in edits { e.apply(...) }` や `had_edits` 判定) を書く必要が
+/// 一切ない。
 pub struct UiHost<M: ?Sized + 'static> {
     state: HashMap<WidgetId, Box<dyn WidgetState>>,
     /// キーボードフォーカスを持つウィジェット (`text_input` 等)。
-    /// クリックがフォーカス可能な widget でない場所に当たったら `None` にクリアされる
-    /// (`frame` の終わりに次フレームへ commit)。
     focused: Option<WidgetId>,
     /// 直前の `frame()` 呼び出しでフォーカスが変化したか。
-    /// アプリ側は `had_edits` と同様、これが `true` なら「次フレームで新しい
-    /// focus 状態に基づいた再描画」を行うため `request_redraw` を呼ぶこと。
+    /// `frame()` が自動で次フレーム redraw を要求するので、利用者がこの値を query する
+    /// 必要は **ない** (互換性のため公開しているだけ)。
     focus_changed_in_last_frame: bool,
     /// 直前の `frame()` で `Ui::request_ime` が呼ばれたときの cursor 領域。
     /// アプリは on_render の終わりにこの値を見て winit の `set_ime_cursor_area` /
     /// `set_ime_allowed` を呼ぶ。`None` のフレームでは IME を無効化する。
     last_ime_request: Option<Rect>,
     /// M4 Phase 10 で追加: 内部 scenegraph (per-widget input_hash の前フレーム履歴)。
-    /// Phase 11 で `Ui::with_widget_node` API から書き込まれる。Phase 10 では宣言のみ。
     #[allow(dead_code)]
     scenegraph: Scenegraph,
+    /// edits / focus 変化の検出時にライブラリが自動で呼ぶ closure。
+    /// 通常は `WindowBackend::request_redraw` をラップしたもの。
+    redraw_request: Box<dyn Fn() + Send + Sync>,
     _m: PhantomData<fn(&mut M)>,
 }
 
 impl<M: ?Sized + 'static> UiHost<M> {
-    pub fn new() -> Self {
+    /// 再描画リクエストを呼ぶ closure を直接渡して構築する low-level constructor。
+    /// 通常は [`Self::with_window`] を使う方が簡潔。
+    pub fn new(redraw_request: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             state: HashMap::new(),
             focused: None,
             focus_changed_in_last_frame: false,
             last_ime_request: None,
             scenegraph: Scenegraph::new(),
+            redraw_request: Box::new(redraw_request),
             _m: PhantomData,
         }
     }
 
+    /// `WindowBackend` を持つ window から、自動的に `request_redraw` を呼ぶ UiHost を
+    /// 構築する。**通常の example はこれを使う**:
+    /// ```ignore
+    /// let window = Arc::new(winit_window);
+    /// let ui = UiHost::with_window(window.clone());
+    /// ```
+    pub fn with_window<W>(window: std::sync::Arc<W>) -> Self
+    where
+        W: daw_ui_platform::WindowBackend + Send + Sync + 'static,
+    {
+        Self::new(move || window.request_redraw())
+    }
+
+    /// テスト / offscreen render 用、`request_redraw` を呼ばない UiHost を構築する。
+    pub fn no_redraw() -> Self {
+        Self::new(|| {})
+    }
+
     /// 直前の `frame()` 呼び出しでフォーカスが変化したか。
-    /// アプリの on_render はこれが true のとき `request_redraw` を呼ぶことで、
-    /// blur や focus 取得が画面に追いつくように。
+    /// `frame()` が自動で `redraw_request` を呼ぶので、利用者がこの値を query して
+    /// 再描画する必要は **ない** (互換性のため公開しているだけ)。
     pub fn focus_changed_in_last_frame(&self) -> bool {
         self.focus_changed_in_last_frame
     }
@@ -69,11 +101,47 @@ impl<M: ?Sized + 'static> UiHost<M> {
         self.last_ime_request
     }
 
-    /// 1 フレーム分の UI を構築。返り値は発生したエディットのリスト。
+    /// 現在キーボードフォーカスを持つ widget の ID。
+    pub fn focused_widget(&self) -> Option<WidgetId> {
+        self.focused
+    }
+
+    /// 1 フレーム分の UI を構築。**edits は内部で apply され、`request_redraw` も
+    /// 自動で呼ばれる**。利用者の boilerplate はゼロ。
     ///
-    /// `f` は `(model, &mut Ui)` を受け取り、ウィジェットを呼び出して UI を組む。
-    /// `input` の `keyboard` / `ime` イベントは focused widget が消費する想定。
+    /// `f` は `(&model, &mut Ui)` を受け取り、ウィジェットを呼び出して UI を組む。
+    /// 内部動作:
+    /// 1. scene を積みつつ edits を収集 (build クロージャは古い model 値で 1 度だけ実行)
+    /// 2. 収集した edits を `&mut model` に apply
+    /// 3. edits があった / focus が変わった場合は `redraw_request` を呼ぶ
+    ///    → 次フレームで apply 後の値で再描画される (immediate-mode + Edit queue の必然対処)
     pub fn frame<F>(
+        &mut self,
+        model: &mut M,
+        scene: &mut Scene,
+        screen: PhysicalSize,
+        input: FrameInput,
+        f: F,
+    ) where
+        F: for<'a> FnOnce(&'a M, &mut Ui<'a, M>),
+    {
+        let edits = self.frame_to_edits(&*model, scene, screen, input, f);
+        let had_edits = !edits.is_empty();
+        for e in edits {
+            e.apply(model);
+        }
+        if had_edits || self.focus_changed_in_last_frame {
+            (self.redraw_request)();
+        }
+    }
+
+    /// (Advanced) edits を返す low-level API。
+    /// `Edit<M>` の apply タイミングを自前で制御したい場合 (audio thread に送る、
+    /// batch apply、undo stack 等) のみ使用する。通常は [`Self::frame`] を使うこと。
+    ///
+    /// 注: この API では **自動 `request_redraw` は呼ばれない**。利用者が edits 検出時に
+    /// 手動で `WindowBackend::request_redraw` を呼ぶ責任を負う。
+    pub fn frame_to_edits<F>(
         &mut self,
         model: &M,
         scene: &mut Scene,
@@ -127,16 +195,11 @@ impl<M: ?Sized + 'static> UiHost<M> {
         self.scenegraph.retain(&seen_widgets);
         edits
     }
-
-    /// 現在キーボードフォーカスを持つ widget の ID。
-    pub fn focused_widget(&self) -> Option<WidgetId> {
-        self.focused
-    }
 }
 
 impl<M: ?Sized + 'static> Default for UiHost<M> {
     fn default() -> Self {
-        Self::new()
+        Self::no_redraw()
     }
 }
 
@@ -358,13 +421,13 @@ mod tests {
 
         struct Model;
 
-        let mut host: UiHost<Model> = UiHost::new();
+        let mut host: UiHost<Model> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let model = Model;
         let screen = PhysicalSize { width: 400, height: 300 };
 
         // フレーム 1: state を初期化して 1 回インクリメント。
-        host.frame(&model, &mut scene, screen, FrameInput::default(), |_, ui| {
+        host.frame_to_edits(&model, &mut scene, screen, FrameInput::default(), |_, ui| {
             let id = WidgetId::ROOT.child("ws-roundtrip");
             let state: &mut MyState = ui.widget_state(id);
             assert_eq!(state.count, 0);
@@ -372,14 +435,14 @@ mod tests {
         });
 
         // フレーム 2: 同じ id で同じ型を取り直すと値が保持されている。
-        host.frame(&model, &mut scene, screen, FrameInput::default(), |_, ui| {
+        host.frame_to_edits(&model, &mut scene, screen, FrameInput::default(), |_, ui| {
             let id = WidgetId::ROOT.child("ws-roundtrip");
             let state: &mut MyState = ui.widget_state(id);
             assert_eq!(state.count, 1);
             state.count += 1;
         });
 
-        host.frame(&model, &mut scene, screen, FrameInput::default(), |_, ui| {
+        host.frame_to_edits(&model, &mut scene, screen, FrameInput::default(), |_, ui| {
             let id = WidgetId::ROOT.child("ws-roundtrip");
             let state: &mut MyState = ui.widget_state(id);
             assert_eq!(state.count, 2);
@@ -396,7 +459,7 @@ mod tests {
             count: u32,
         }
 
-        let mut host: UiHost<Counter> = UiHost::new();
+        let mut host: UiHost<Counter> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let mut model = Counter { count: 0 };
         let screen = PhysicalSize { width: 200, height: 100 };
@@ -407,7 +470,7 @@ mod tests {
             pos: Some((50.0, 16.0)),
             ..PointerFrame::default()
         };
-        let edits = host.frame(&model, &mut scene, screen, FrameInput { pointer: pointer_hover, ..Default::default() }, |_, ui| {
+        let edits = host.frame_to_edits(&model, &mut scene, screen, FrameInput { pointer: pointer_hover, ..Default::default() }, |_, ui| {
             ui.button_at("test", "click me", rect, || {
                 Edit::mutate(|m: &mut Counter| m.count += 1)
             });
@@ -424,7 +487,7 @@ mod tests {
             primary_just_released: true,
             ..PointerFrame::default()
         };
-        let edits = host.frame(&model, &mut scene, screen, FrameInput { pointer: pointer_click, ..Default::default() }, |_, ui| {
+        let edits = host.frame_to_edits(&model, &mut scene, screen, FrameInput { pointer: pointer_click, ..Default::default() }, |_, ui| {
             ui.button_at("test", "click me", rect, || {
                 Edit::mutate(|m: &mut Counter| m.count += 1)
             });
@@ -447,7 +510,7 @@ mod tests {
             count: u32,
         }
 
-        let mut host: UiHost<Counter> = UiHost::new();
+        let mut host: UiHost<Counter> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let mut model = Counter { count: 0 };
         let screen = PhysicalSize { width: 200, height: 100 };
@@ -457,7 +520,7 @@ mod tests {
                       model: &Counter,
                       pointer: PointerFrame|
          -> Vec<Edit<Counter>> {
-            host.frame(model, scene, screen, FrameInput { pointer, ..Default::default() }, |_, ui| {
+            host.frame_to_edits(model, scene, screen, FrameInput { pointer, ..Default::default() }, |_, ui| {
                 ui.button_at("test", "click me", rect, || {
                     Edit::mutate(|m: &mut Counter| m.count += 1)
                 });
@@ -516,13 +579,13 @@ mod tests {
     /// および次フレームでも維持されることを確認する。
     #[test]
     fn focus_set_persists_to_next_frame() {
-        let mut host: UiHost<()> = UiHost::new();
+        let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 200, height: 100 };
         let id = WidgetId::ROOT.child("focus-target");
 
         // Frame 1: set_focus を呼ぶと **同フレーム内で** is_focused = true になる。
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             assert!(!ui.is_focused(id));
             ui.set_focus(id);
             assert!(ui.is_focused(id), "set_focus 後は同フレームで is_focused = true");
@@ -530,7 +593,7 @@ mod tests {
         assert_eq!(host.focused_widget(), Some(id));
 
         // Frame 2: 何もしないが focus は維持。
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             assert!(ui.is_focused(id));
         });
         assert_eq!(host.focused_widget(), Some(id));
@@ -541,13 +604,13 @@ mod tests {
     /// (= フォーカス可能でない場所) ならフォーカスはクリアされる。
     #[test]
     fn click_outside_clears_focus_when_no_widget_claims() {
-        let mut host: UiHost<()> = UiHost::new();
+        let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 200, height: 100 };
         let id = WidgetId::ROOT.child("focus-target");
 
         // Frame 1: フォーカスを取る。
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.set_focus(id);
         });
         assert_eq!(host.focused_widget(), Some(id));
@@ -558,7 +621,7 @@ mod tests {
             primary_just_released: true,
             ..PointerFrame::default()
         };
-        host.frame(&(), &mut scene, screen, FrameInput { pointer: click, ..Default::default() }, |(), _ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput { pointer: click, ..Default::default() }, |(), _ui| {
             // 誰も set_focus / clear_focus を呼ばない。
         });
         assert_eq!(
@@ -571,12 +634,12 @@ mod tests {
     /// 同フレームで set_focus を呼んでいればクリックがあってもフォーカスは保たれる。
     #[test]
     fn focus_kept_when_widget_re_claims_on_click() {
-        let mut host: UiHost<()> = UiHost::new();
+        let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 200, height: 100 };
         let id = WidgetId::ROOT.child("focus-target");
 
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.set_focus(id);
         });
         assert_eq!(host.focused_widget(), Some(id));
@@ -586,7 +649,7 @@ mod tests {
             primary_just_released: true,
             ..PointerFrame::default()
         };
-        host.frame(&(), &mut scene, screen, FrameInput { pointer: click, ..Default::default() }, |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput { pointer: click, ..Default::default() }, |(), ui| {
             // クリックフレームで widget が再度 set_focus を呼ぶ (text_input が再クリックされたケース)。
             ui.set_focus(id);
         });
@@ -603,7 +666,7 @@ mod tests {
             text: String,
         }
 
-        let mut host: UiHost<Doc> = UiHost::new();
+        let mut host: UiHost<Doc> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let mut model = Doc { text: String::new() };
         let screen = PhysicalSize { width: 200, height: 100 };
@@ -616,7 +679,7 @@ mod tests {
             primary_just_released: true,
             ..PointerFrame::default()
         };
-        let edits = host.frame(&model, &mut scene, screen, FrameInput { pointer: click, ..Default::default() }, |_, ui| {
+        let edits = host.frame_to_edits(&model, &mut scene, screen, FrameInput { pointer: click, ..Default::default() }, |_, ui| {
             ui.text_input_at("ti", rect, "", |new| {
                 Edit::mutate(|m: &mut Doc| m.text = new)
             });
@@ -630,7 +693,7 @@ mod tests {
             text: Some("A".to_string()),
             physical_key: PhysicalKey::Other(0x41),
         }];
-        let edits = host.frame(
+        let edits = host.frame_to_edits(
             &model, &mut scene, screen, FrameInput { keyboard: keys, ..Default::default() },
             |m, ui| {
                 ui.text_input_at("ti", rect, &m.text, |new| {
@@ -647,7 +710,7 @@ mod tests {
             text: None,
             physical_key: PhysicalKey::Backspace,
         }];
-        let edits = host.frame(
+        let edits = host.frame_to_edits(
             &model, &mut scene, screen, FrameInput { keyboard: keys, ..Default::default() },
             |m, ui| {
                 ui.text_input_at("ti", rect, &m.text, |new| {
@@ -671,7 +734,7 @@ mod tests {
             text: String,
         }
 
-        let mut host: UiHost<Doc> = UiHost::new();
+        let mut host: UiHost<Doc> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let mut model = Doc { text: String::new() };
         let screen = PS { width: 200, height: 100 };
@@ -684,7 +747,7 @@ mod tests {
             primary_just_released: true,
             ..PointerFrame::default()
         };
-        let edits = host.frame(
+        let edits = host.frame_to_edits(
             &model,
             &mut scene,
             screen,
@@ -699,7 +762,7 @@ mod tests {
         assert_eq!(model.text, "");
 
         // Frame 2: preedit 「あ」が来る。model は変わらず、内部 state にだけ反映。
-        let edits = host.frame(
+        let edits = host.frame_to_edits(
             &model,
             &mut scene,
             screen,
@@ -717,7 +780,7 @@ mod tests {
         assert_eq!(model.text, "", "preedit 中は model に反映しない");
 
         // Frame 3: commit 「あ」が来る。model に確定挿入され、preedit はクリア。
-        let edits = host.frame(
+        let edits = host.frame_to_edits(
             &model,
             &mut scene,
             screen,
@@ -740,18 +803,18 @@ mod tests {
     fn ime_events_delivered_only_to_focused() {
         use crate::input::ImeEvent;
 
-        let mut host: UiHost<()> = UiHost::new();
+        let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 200, height: 100 };
         let id_a = WidgetId::ROOT.child("a");
         let id_b = WidgetId::ROOT.child("b");
 
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.set_focus(id_a);
         });
 
         let ime = vec![ImeEvent::Commit("z".to_string())];
-        host.frame(
+        host.frame_to_edits(
             &(),
             &mut scene,
             screen,
@@ -772,14 +835,14 @@ mod tests {
     fn keyboard_events_delivered_only_to_focused() {
         use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
 
-        let mut host: UiHost<()> = UiHost::new();
+        let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 200, height: 100 };
         let id_a = WidgetId::ROOT.child("a");
         let id_b = WidgetId::ROOT.child("b");
 
         // a にフォーカスを置く。
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.set_focus(id_a);
         });
 
@@ -789,7 +852,7 @@ mod tests {
             text: Some("x".to_string()),
             physical_key: PhysicalKey::Other(0),
         }];
-        host.frame(&(), &mut scene, screen, FrameInput { keyboard: keys, ..Default::default() }, |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput { keyboard: keys, ..Default::default() }, |(), ui| {
             // b で先に呼んでも空 (フォーカスが a)。
             let b_keys = ui.take_keyboard_events_if_focused(id_b);
             assert_eq!(b_keys.len(), 0);
@@ -807,7 +870,7 @@ mod tests {
     /// (キャッシュ命中で前フレームの commands が scene に append される)。
     #[test]
     fn with_widget_node_hit_skips_draw_fn() {
-        let mut host: UiHost<()> = UiHost::new();
+        let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 200, height: 100 };
         let id = WidgetId::ROOT.child("cache-test");
@@ -815,7 +878,7 @@ mod tests {
 
         // Frame 1: cache miss → draw_fn 実行、scene に rect が積まれる。
         let calls_1 = std::cell::Cell::new(0_u32);
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.with_widget_node(id, 0xCAFE, |ui| {
                 calls_1.set(calls_1.get() + 1);
                 ui.push_rect(RectCommand {
@@ -833,7 +896,7 @@ mod tests {
         // Frame 2: 同じ wid + 同じ hash → cache hit、draw_fn は実行されない。
         scene.clear();
         let calls_2 = std::cell::Cell::new(0_u32);
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.with_widget_node(id, 0xCAFE, |ui| {
                 calls_2.set(calls_2.get() + 1);
                 ui.push_rect(RectCommand {
@@ -854,13 +917,13 @@ mod tests {
     /// M4 Phase 11: hash が変わると cache miss、draw_fn が再実行される。
     #[test]
     fn with_widget_node_miss_runs_draw_fn() {
-        let mut host: UiHost<()> = UiHost::new();
+        let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 200, height: 100 };
         let id = WidgetId::ROOT.child("miss-test");
 
         let calls_1 = std::cell::Cell::new(0_u32);
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.with_widget_node(id, 0xAAAA, |ui| {
                 calls_1.set(calls_1.get() + 1);
                 ui.push_rect(RectCommand {
@@ -876,7 +939,7 @@ mod tests {
         // Frame 2: 異なる hash → cache miss、draw_fn が再実行される。
         scene.clear();
         let calls_2 = std::cell::Cell::new(0_u32);
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.with_widget_node(id, 0xBBBB, |ui| {
                 calls_2.set(calls_2.get() + 1);
                 ui.push_rect(RectCommand {
@@ -896,14 +959,14 @@ mod tests {
     /// scenegraph から eviction される。
     #[test]
     fn scenegraph_evicts_unseen_widgets() {
-        let mut host: UiHost<()> = UiHost::new();
+        let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 200, height: 100 };
         let id_a = WidgetId::ROOT.child("evict-a");
         let id_b = WidgetId::ROOT.child("evict-b");
 
         // Frame 1: a と b 両方を wrap → scenegraph に 2 entry。
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.with_widget_node(id_a, 1, |_| {});
             ui.with_widget_node(id_b, 2, |_| {});
         });
@@ -911,7 +974,7 @@ mod tests {
         // Frame 2: a だけ wrap → b は seen に入らないので eviction、a は残る。
         // 同 hash で再呼び出し → cache hit、draw_fn 実行されない。
         let a_calls = std::cell::Cell::new(0_u32);
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.with_widget_node(id_a, 1, |_| {
                 a_calls.set(a_calls.get() + 1);
             });
@@ -920,7 +983,7 @@ mod tests {
 
         // Frame 3: b を再 wrap → 一度 eviction されているので cache miss、draw_fn が走る。
         let b_calls = std::cell::Cell::new(0_u32);
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.with_widget_node(id_b, 2, |_| {
                 b_calls.set(b_calls.get() + 1);
             });

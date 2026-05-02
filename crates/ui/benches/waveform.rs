@@ -51,7 +51,7 @@ fn render_n_waveforms(
     n: usize,
     generation: u64,
 ) {
-    let _edits = host.frame(&(), scene, SCREEN, daw_ui_core::FrameInput::default(), |_, ui| {
+    let _edits = host.frame_to_edits(&(), scene, SCREEN, daw_ui_core::FrameInput::default(), |_, ui| {
         let row_h = 80.0;
         for i in 0..n {
             let rect = Rect {

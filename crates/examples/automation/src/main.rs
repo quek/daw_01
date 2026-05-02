@@ -70,9 +70,10 @@ impl App {
         let renderer = Renderer::new(window.clone()).expect("Renderer::new");
         window.set_title("daw-ui automation (M5.5)");
         Self {
+            ui: UiHost::with_window(window.clone()),
+
             window,
             renderer,
-            ui: UiHost::new(),
             model: AutomationModel::new(),
             scene: Scene::new(),
             input: InputAccumulator::new(),
@@ -80,7 +81,7 @@ impl App {
         }
     }
 
-    fn build_ui(&mut self) -> bool {
+    fn build_ui(&mut self) {
         self.scene.clear();
         let screen = self.renderer.size();
         let area = curve_area(screen);
@@ -93,8 +94,8 @@ impl App {
             self.model.last_action,
         );
 
-        let edits = self.ui.frame(
-            &self.model,
+        self.ui.frame(
+            &mut self.model,
             &mut self.scene,
             screen,
             input,
@@ -142,11 +143,6 @@ impl App {
             },
         );
 
-        let had_edits = !edits.is_empty();
-        for e in edits {
-            e.apply(&mut self.model);
-        }
-        had_edits
     }
 }
 
@@ -172,15 +168,17 @@ impl AppHost for App {
     fn on_render(&mut self) -> bool {
         let now = Instant::now();
         self.last_frame_start = Some(now);
-        let had_edits = self.build_ui();
+        self.build_ui();
         if let Err(e) = self.renderer.render(&self.scene) {
             eprintln!("render error: {e}");
         }
         if let Some(t) = self.last_frame_start.take() {
             self.model.last_frame_ms = t.elapsed().as_secs_f32() * 1000.0;
         }
-        // edits が出たら次フレームで適用後 Model を描画
-        had_edits
+        // edits / focus 変化時の追加描画は UiHost::with_window が自動で request_redraw
+        // を呼ぶため、ここでは drag 等の連続再描画判定だけ書けばよい (automation は drag
+        // 中も Edit が連続発火するので、library 側の自動 redraw でカバーされる)。
+        false
     }
 }
 

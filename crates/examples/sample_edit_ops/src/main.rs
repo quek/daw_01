@@ -184,9 +184,10 @@ impl App {
         let renderer = Renderer::new(window.clone()).expect("Renderer::new");
         window.set_title("daw-ui sample_edit_ops (M6 Phase 21)");
         Self {
+            ui: UiHost::with_window(window.clone()),
+
             window,
             renderer,
-            ui: UiHost::new(),
             model: SampleEditOpsModel::new(),
             scene: Scene::new(),
             input: InputAccumulator::new(),
@@ -199,10 +200,24 @@ impl App {
         }
     }
 
-    fn apply_pending_input(&mut self, screen: PhysicalSize) {
+    /// 戻り値: このフレームで `Edit<M>` が発行された場合 `true` (= 次フレームで再描画必要)。
+    /// 理由: edits が出たフレームの scene は描画クロージャ後に apply されるため古い model
+    /// 値で積まれている。次フレームで apply 後の値で描き直す必要がある。
+    #[allow(clippy::too_many_lines)]
+    fn build_ui(&mut self) {
+        self.scene.clear();
+        let screen = self.renderer.size();
         let area = waveform_area(screen);
-        let pointer = self.input.take_frame();
+        let bar_y = toolbar_y(screen);
 
+        // 1 frame に 1 回だけ take_input する。`take_input` 内部で `take_frame` が呼ばれ
+        // `primary_just_pressed`/`just_released` がリセットされるため、ここで取った
+        // snapshot を drag/wheel 処理にも、Ui::frame (button click 検出含む) にも使い回す。
+        // (apply_pending_input で別途 take_frame すると button が click を検出できない)
+        let input = self.input.take_input();
+        let pointer = input.pointer;
+
+        // --- drag 開始 ---
         if pointer.primary_just_pressed
             && let Some((px, py)) = pointer.pos
             && area.contains(px, py)
@@ -217,6 +232,7 @@ impl App {
             }
         }
 
+        // --- drag 中 ---
         if let (Some((ax, ave_start, anchor_sample, _accum, kind)), Some((px, _))) =
             (self.drag_anchor, pointer.pos)
         {
@@ -238,6 +254,7 @@ impl App {
             }
         }
 
+        // --- drag 終了 (短い click なら pending_click 設定) ---
         if pointer.primary_just_released
             && let Some((_, _, _, accum_dx, kind)) = self.drag_anchor.take()
             && !kind
@@ -247,6 +264,7 @@ impl App {
             self.pending_click = Some(px);
         }
 
+        // --- wheel zoom ---
         if self.pending_zoom_dy.abs() > 0.0 {
             let factor = (-self.pending_zoom_dy * 0.15).exp();
             if self.cur_modifiers.ctrl {
@@ -262,16 +280,8 @@ impl App {
             }
             self.pending_zoom_dy = 0.0;
         }
-    }
 
-    #[allow(clippy::too_many_lines)]
-    fn build_ui(&mut self) {
-        self.scene.clear();
-        let screen = self.renderer.size();
-        let area = waveform_area(screen);
-        let bar_y = toolbar_y(screen);
-        let input = self.input.take_input();
-
+        // --- pending click 消費 (cursor 移動) ---
         if let Some(click_px) = self.pending_click.take() {
             let s = self.model.x_to_sample(click_px, area);
             self.model.cursor_sample = s;
@@ -292,8 +302,8 @@ impl App {
             self.model.vertical_gain,
         );
 
-        let edits = self.ui.frame(
-            &self.model,
+        self.ui.frame(
+            &mut self.model,
             &mut self.scene,
             screen,
             input,
@@ -479,9 +489,6 @@ impl App {
             },
         );
 
-        for e in edits {
-            e.apply(&mut self.model);
-        }
     }
 }
 
@@ -522,8 +529,6 @@ impl AppHost for App {
 
     fn on_render(&mut self) -> bool {
         let now = Instant::now();
-        let screen = self.renderer.size();
-        self.apply_pending_input(screen);
         self.last_frame_start = Some(now);
         self.build_ui();
         if let Err(e) = self.renderer.render(&self.scene) {
@@ -532,7 +537,8 @@ impl AppHost for App {
         if let Some(t) = self.last_frame_start.take() {
             self.model.last_frame_ms = t.elapsed().as_secs_f32() * 1000.0;
         }
-        // drag / wheel 中は連続再描画
+        // drag / wheel 中は連続再描画。had_edits 時も 1 frame 追加描画して
+        // apply 後の model で scene を積み直す (immediate-mode + Edit queue の必然)。
         self.drag_anchor.is_some() || self.pending_zoom_dy.abs() > 0.0
     }
 }

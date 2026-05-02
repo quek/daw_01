@@ -16,7 +16,7 @@ struct Model {
 }
 
 fn main() {
-    let mut host: UiHost<Model> = UiHost::new();
+    let mut host: UiHost<Model> = UiHost::no_redraw();
     let mut scene = Scene::new();
     let model = Model {
         points: vec![(0.0, 0.5), (0.25, 0.8), (0.5, 0.3), (0.75, 0.7), (1.0, 0.5)],
@@ -24,7 +24,7 @@ fn main() {
     let screen = PhysicalSize { width: 1280, height: 600 };
     let rect = Rect { x: 16.0, y: 56.0, w: 1248.0, h: 488.0 };
 
-    let _edits = host.frame(&model, &mut scene, screen, FrameInput::default(), |m, ui| {
+    let _edits = host.frame_to_edits(&model, &mut scene, screen, FrameInput::default(), |m, ui| {
         let _ = ui.automation_curve(
             "main",
             rect,

@@ -341,7 +341,7 @@ mod tests {
     ) -> Vec<Edit<PanModel>> {
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 200, height: 200 };
-        host.frame(
+        host.frame_to_edits(
             model,
             &mut scene,
             screen,
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn double_click_within_threshold_resets_to_default() {
-        let mut host: UiHost<PanModel> = UiHost::new();
+        let mut host: UiHost<PanModel> = UiHost::no_redraw();
         let mut model = PanModel { value: 0.8 };
         let rect = knob_rect();
         let c = knob_center();
@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn click_after_threshold_does_not_reset() {
-        let mut host: UiHost<PanModel> = UiHost::new();
+        let mut host: UiHost<PanModel> = UiHost::no_redraw();
         let mut model = PanModel { value: 0.8 };
         let rect = knob_rect();
         let c = knob_center();
@@ -431,7 +431,7 @@ mod tests {
 
     #[test]
     fn click_far_position_does_not_reset() {
-        let mut host: UiHost<PanModel> = UiHost::new();
+        let mut host: UiHost<PanModel> = UiHost::no_redraw();
         let mut model = PanModel { value: 0.8 };
         let rect = knob_rect();
         let c = knob_center();
@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn ctrl_drag_uses_one_tenth_sensitivity() {
-        let mut host_n: UiHost<PanModel> = UiHost::new();
+        let mut host_n: UiHost<PanModel> = UiHost::no_redraw();
         let mut model_n = PanModel { value: 0.5 };
         let rect = knob_rect();
         let c = knob_center();
@@ -469,7 +469,7 @@ mod tests {
         for e in edits { e.apply(&mut model_n); }
         let normal_delta = model_n.value - 0.5;
 
-        let mut host_c: UiHost<PanModel> = UiHost::new();
+        let mut host_c: UiHost<PanModel> = UiHost::no_redraw();
         let mut model_c = PanModel { value: 0.5 };
         let edits = run_frame(&mut host_c, &model_c, rect, model_c.value, 0.0, press_at(c, true));
         for e in edits { e.apply(&mut model_c); }
@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn mid_drag_ctrl_toggle_does_not_jump() {
-        let mut host: UiHost<PanModel> = UiHost::new();
+        let mut host: UiHost<PanModel> = UiHost::no_redraw();
         let mut model = PanModel { value: 0.5 };
         let rect = knob_rect();
         let c = knob_center();
@@ -525,7 +525,7 @@ mod tests {
 
     #[test]
     fn triple_click_does_not_reset_again() {
-        let mut host: UiHost<PanModel> = UiHost::new();
+        let mut host: UiHost<PanModel> = UiHost::no_redraw();
         let mut model = PanModel { value: 0.8 };
         let rect = knob_rect();
         let c = knob_center();

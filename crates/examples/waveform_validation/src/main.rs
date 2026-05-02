@@ -241,9 +241,10 @@ impl App {
         let renderer = Renderer::new(window.clone()).expect("Renderer::new");
         window.set_title("daw-ui waveform validation (M2)");
         Self {
+            ui: UiHost::with_window(window.clone()),
+
             window,
             renderer,
-            ui: UiHost::new(),
             model: WaveformAppModel::new(),
             scene: Scene::new(),
             input: InputAccumulator::new(),
@@ -323,8 +324,8 @@ impl App {
         }
 
         // 3. UI 構築
-        let edits = self.ui.frame(
-            &self.model,
+        self.ui.frame(
+            &mut self.model,
             &mut self.scene,
             screen,
             input,
@@ -421,9 +422,6 @@ impl App {
             },
         );
 
-        for e in edits {
-            e.apply(&mut self.model);
-        }
     }
 }
 

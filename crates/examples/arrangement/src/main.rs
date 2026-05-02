@@ -180,9 +180,10 @@ impl App {
         let renderer = Renderer::new(window.clone()).expect("Renderer::new");
         window.set_title("daw-ui arrangement (M5 Phase 17)");
         Self {
+            ui: UiHost::with_window(window.clone()),
+
             window,
             renderer,
-            ui: UiHost::new(),
             model: ArrangementModel::new(),
             scene: Scene::new(),
             input: InputAccumulator::new(),
@@ -293,8 +294,8 @@ impl App {
             if self.last_cache_hit { "HIT " } else { "MISS" },
         );
 
-        let edits = self.ui.frame(
-            &self.model,
+        self.ui.frame(
+            &mut self.model,
             &mut self.scene,
             screen,
             input,
@@ -383,9 +384,6 @@ impl App {
             },
         );
 
-        for e in edits {
-            e.apply(&mut self.model);
-        }
     }
 }
 

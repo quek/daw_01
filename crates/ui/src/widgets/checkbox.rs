@@ -20,7 +20,7 @@ pub(crate) struct CheckboxState {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CheckboxResponse {
-    /// クリックされたか (Edit<M> 発行と同じフレームで `true`)。
+    /// クリックされたか (`Edit<M>` 発行と同じフレームで `true`)。
     pub toggled: bool,
     pub hovered: bool,
 }

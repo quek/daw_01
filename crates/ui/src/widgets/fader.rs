@@ -338,7 +338,7 @@ mod tests {
     ) -> Vec<Edit<VolModel>> {
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 200, height: 200 };
-        host.frame(
+        host.frame_to_edits(
             model,
             &mut scene,
             screen,
@@ -381,7 +381,7 @@ mod tests {
     /// ダブルクリック (同位置 / ~50ms 内) で default_value に戻る。
     #[test]
     fn double_click_within_threshold_resets_to_default() {
-        let mut host: UiHost<VolModel> = UiHost::new();
+        let mut host: UiHost<VolModel> = UiHost::no_redraw();
         let mut model = VolModel { value: 0.7 };
         let rect = fader_rect();
         let thumb = thumb_center_at(model.value);
@@ -413,7 +413,7 @@ mod tests {
     /// しきい値超過 (~350ms 後) の 2 回目 press は drag 扱いで、リセットは起きない。
     #[test]
     fn click_after_threshold_does_not_reset() {
-        let mut host: UiHost<VolModel> = UiHost::new();
+        let mut host: UiHost<VolModel> = UiHost::no_redraw();
         let mut model = VolModel { value: 0.7 };
         let rect = fader_rect();
         let thumb = thumb_center_at(model.value);
@@ -443,7 +443,7 @@ mod tests {
     /// 同時間内でも 10px 以上離れていれば drag 扱いで、リセットは起きない。
     #[test]
     fn click_far_position_does_not_reset() {
-        let mut host: UiHost<VolModel> = UiHost::new();
+        let mut host: UiHost<VolModel> = UiHost::no_redraw();
         let mut model = VolModel { value: 0.7 };
         let rect = fader_rect();
         let thumb = thumb_center_at(model.value);
@@ -475,7 +475,7 @@ mod tests {
     #[test]
     fn ctrl_drag_uses_one_tenth_sensitivity() {
         // 通常 drag の値変化を測定
-        let mut host_n: UiHost<VolModel> = UiHost::new();
+        let mut host_n: UiHost<VolModel> = UiHost::no_redraw();
         let mut model_n = VolModel { value: 0.5 };
         let rect = fader_rect();
         let thumb = thumb_center_at(model_n.value);
@@ -490,7 +490,7 @@ mod tests {
         let normal_delta = model_n.value - 0.5;
 
         // Ctrl + drag の値変化を測定
-        let mut host_c: UiHost<VolModel> = UiHost::new();
+        let mut host_c: UiHost<VolModel> = UiHost::no_redraw();
         let mut model_c = VolModel { value: 0.5 };
         let edits = run_frame(&mut host_c, &model_c, rect, model_c.value, 0.0,
             press_at(thumb, true));
@@ -516,7 +516,7 @@ mod tests {
     /// - 再 anchor 有りなら 20px 通常 + 20px ×0.1 で「jump 無し + 終端値が中間」になる
     #[test]
     fn mid_drag_ctrl_toggle_does_not_jump() {
-        let mut host: UiHost<VolModel> = UiHost::new();
+        let mut host: UiHost<VolModel> = UiHost::no_redraw();
         let mut model = VolModel { value: 0.5 };
         let rect = fader_rect();
         let thumb = thumb_center_at(model.value);
@@ -564,7 +564,7 @@ mod tests {
     /// drag_anchor が None のままになり、続く move で値変化が起きない (はず)。
     #[test]
     fn triple_click_does_not_reset_again() {
-        let mut host: UiHost<VolModel> = UiHost::new();
+        let mut host: UiHost<VolModel> = UiHost::no_redraw();
         let mut model = VolModel { value: 0.7 };
         let rect = fader_rect();
         let thumb_07 = thumb_center_at(0.7);

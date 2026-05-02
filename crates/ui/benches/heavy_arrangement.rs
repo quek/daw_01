@@ -102,7 +102,7 @@ fn render_frame(
         line_width_px: 1.0,
     };
 
-    host.frame(&(), scene, screen, FrameInput::default(), |(), ui| {
+    host.frame_to_edits(&(), scene, screen, FrameInput::default(), |(), ui| {
         ui.heavy("arrangement", |hctx| {
             hctx.cached(viewport_key, |hctx| {
                 let shift = view_len / CLIPS_PER_TRACK as u64;
@@ -138,7 +138,7 @@ fn bench_arrangement(c: &mut Criterion) {
     c.bench_function("arrangement_cached_heavy_500w", |b| {
         b.iter_batched_ref(
             || {
-                let mut host: UiHost<()> = UiHost::new();
+                let mut host: UiHost<()> = UiHost::no_redraw();
                 let mut scene = Scene::new();
                 render_frame(&mut host, &mut scene, screen, &samples, fixed_view); // warm-up
                 scene.clear();

@@ -21,7 +21,7 @@ struct Model {
 }
 
 fn main() {
-    let mut host: UiHost<Model> = UiHost::new();
+    let mut host: UiHost<Model> = UiHost::no_redraw();
     let mut scene = Scene::new();
     let mut model = Model {
         counter: 0,
@@ -32,7 +32,7 @@ fn main() {
         title: String::from("untitled"),
     };
 
-    let edits = host.frame(
+    let edits = host.frame_to_edits(
         &model,
         &mut scene,
         PhysicalSize { width: 800, height: 600 },

@@ -203,9 +203,10 @@ impl App {
         window.set_title("daw-ui piano_roll (M5 Phase 14)");
         let notes = generate_notes(n_notes);
         Self {
+            ui: UiHost::with_window(window.clone()),
+
             window,
             renderer,
-            ui: UiHost::new(),
             model: PianoRollModel::new(notes),
             scene: Scene::new(),
             input: InputAccumulator::new(),
@@ -311,7 +312,7 @@ impl App {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn build_ui(&mut self) -> bool {
+    fn build_ui(&mut self) {
         self.scene.clear();
         let screen = self.renderer.size();
         let grid = grid_rect(screen);
@@ -361,8 +362,8 @@ impl App {
         let click_pos = self.pending_click.take();
         let selected_idx = self.model.selected_note_index;
 
-        let edits = self.ui.frame(
-            &self.model,
+        self.ui.frame(
+            &mut self.model,
             &mut self.scene,
             screen,
             input,
@@ -573,11 +574,6 @@ impl App {
             },
         );
 
-        let had_edits = !edits.is_empty();
-        for e in edits {
-            e.apply(&mut self.model);
-        }
-        had_edits
     }
 }
 
@@ -618,7 +614,7 @@ impl AppHost for App {
         // pointer 由来の drag/click/wheel を Model に反映 (build_ui の前)
         self.apply_pending_input(screen);
         self.last_frame_start = Some(now);
-        let had_edits = self.build_ui();
+        self.build_ui();
         if let Err(e) = self.renderer.render(&self.scene) {
             eprintln!("render error: {e}");
         }
@@ -626,7 +622,7 @@ impl AppHost for App {
             self.model.last_frame_ms = t.elapsed().as_secs_f32() * 1000.0;
         }
         // edits / drag / wheel が出ていれば連続描画
-        had_edits || self.drag_anchor.is_some() || self.pending_zoom_dy.abs() > 0.0
+        self.drag_anchor.is_some() || self.pending_zoom_dy.abs() > 0.0
     }
 }
 

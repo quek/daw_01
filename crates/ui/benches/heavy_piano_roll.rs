@@ -84,7 +84,7 @@ fn render_frame(
         grid.h.to_bits(),
         0u64, // notes_generation
     );
-    host.frame(&(), scene, screen, FrameInput::default(), |(), ui| {
+    host.frame_to_edits(&(), scene, screen, FrameInput::default(), |(), ui| {
         ui.heavy("piano_roll", |hctx| {
             let s_idx = notes.partition_point(|n| n.start_beat + n.len_beats < view_start);
             let e_idx = s_idx
@@ -167,7 +167,7 @@ fn bench_piano_roll(c: &mut Criterion) {
     c.bench_function("piano_roll_cached_viewport_100k", |b| {
         b.iter_batched_ref(
             || {
-                let mut host: UiHost<()> = UiHost::new();
+                let mut host: UiHost<()> = UiHost::no_redraw();
                 let mut scene = Scene::new();
                 // warm-up: cache を populate
                 render_frame(&mut host, &mut scene, screen, &notes, fixed_view);

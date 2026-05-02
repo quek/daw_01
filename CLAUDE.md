@@ -85,6 +85,12 @@ example を実機検証する前に必ず `cargo run --bin <name>` または `ca
 - 「KISS で見送る」と判断する場合は、なぜ今ここで使わないかを **明示的に書く**
 - 例: `LayoutPass` の Phase 5 で `Padding` / `Gap` / `flex_grow` を入れたら、Phase 6 (mixer 拡張) では使う
 
+### 理想とベストプラクティスを追求する (使う側に boilerplate を強要しない)
+- ユーザに同じ workaround を書かせる API は **設計欠陥のシグナル**。利用者全員が同じ boilerplate を書く状況になっていたら、ライブラリで吸収すべき
+- 改善のためなら **破壊的 API 変更を恐れない**。単一 workspace + Edition 2024 の利点を活かし、breaking change を入れたら全 example / test / docs を **1 commit で一括更新** する
+- 「audio thread に Edit を送るかも」のような **曖昧な future-proof のために現実の全ユーザに boilerplate を強要しない**。必要になってから別 method (`frame_to_edits` 等) を追加すれば十分
+- 妥協 (短期 workaround) で進めるしかない場面では、**なぜ短期で済むか / 根本対処の方針** を memory / docs に明示的に残す
+
 ## Debugging Methodology
 
 - **実データから始める**: コード推論より実データ観察が速い
@@ -120,8 +126,11 @@ example を実機検証する前に必ず `cargo run --bin <name>` または `ca
 - `Buffer::layout_runs()` で実 measure を取りたい場合、ui crate 側に `FontSystem` への参照経路 (Arc 共有 / measure trait 公開 / 別 FontSystem) が必要。現状 renderer に閉じている。proportional フォントの cursor / preedit pixel-perfect 化は M3 残作業。
 - 全テキスト (prefix + preedit + suffix) を **1 つの `GlyphArea`** で描画する方が並びの計算が安定する (HackGen Console NF などの固定幅前提なら ASCII=7 / CJK=14 で近似可能)。
 
-### immediate-mode + Edit queue の必然
-- `edits` が出たフレームの scene は **古い model 値** で積まれている (描画クロージャ後に apply されるため)。`on_render` で `had_edits` 検出時に `request_redraw` を 1 回追加で呼んで適用後の値で描き直す。`UiHost::focus_changed_in_last_frame()` も同じ理由で同パターン。
+### immediate-mode + Edit queue (M6 で UiHost が自動対処、利用者の boilerplate 不要)
+- 旧設計 (M5 まで): `edits` が出たフレームの scene は **古い model 値** で積まれている (描画クロージャ後に apply されるため)。利用者は `for e in edits { e.apply(&mut model) }` + `had_edits` 判定 + `window.request_redraw()` の boilerplate を全 example で書く必要があった (sample_edit_ops で漏れて発覚)。
+- M6 commit 以降: `UiHost::with_window(Arc<W>)` で構築 + `ui.frame(&mut model, ...)` で **apply 内蔵 + 自動 `request_redraw`**。利用者の boilerplate は **完全排除**。
+- audio thread 連携等の advanced 用途では `frame_to_edits(&model, ...) -> Vec<Edit<M>>` を使う (利用者が apply タイミングと request_redraw 制御)。
+- offscreen / headless test では `UiHost::no_redraw()` を使う。
 
 ### widget state の downcast
 - `state: HashMap<WidgetId, Box<dyn WidgetState>>` から型復元するとき、`Box<dyn WidgetState>` 自身に WidgetState の blanket impl が当たって外側 Box の TypeId を返すバグに注意。`&mut **entry` で明示的に deref してから `as_any_mut().downcast_mut::<S>()` する (M2 で修正、回帰テスト済)。

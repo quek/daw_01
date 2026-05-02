@@ -181,7 +181,7 @@ mod tests {
     /// cached 経由で同じコマンドが積まれる。
     #[test]
     fn heavy_cached_hit_skips_draw_fn() {
-        let mut host: UiHost<()> = UiHost::new();
+        let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 200, height: 100 };
         let test_rect = Rect { x: 10.0, y: 20.0, w: 30.0, h: 40.0 };
@@ -189,7 +189,7 @@ mod tests {
         let calls = Cell::new(0_u32);
 
         // Frame 1: cache miss → draw_fn 実行、rect が積まれる。
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.heavy("h1", |hctx| {
                 hctx.cached(0xAAAAu64, |hctx| {
                     calls.set(calls.get() + 1);
@@ -204,7 +204,7 @@ mod tests {
         // Frame 2: 同じ viewport_key → cache hit、draw_fn skip。scene には cached 経由で
         // 同じ rect が積まれる。
         scene.clear();
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.heavy("h1", |hctx| {
                 hctx.cached(0xAAAAu64, |hctx| {
                     calls.set(calls.get() + 1);
@@ -220,14 +220,14 @@ mod tests {
     /// viewport_key が変わると cache miss、draw_fn が再実行される。
     #[test]
     fn heavy_cached_miss_runs_draw_fn() {
-        let mut host: UiHost<()> = UiHost::new();
+        let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 200, height: 100 };
         let test_rect = Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 };
 
         let calls = Cell::new(0_u32);
 
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.heavy("h2", |hctx| {
                 hctx.cached(0xAAAAu64, |hctx| {
                     calls.set(calls.get() + 1);
@@ -238,7 +238,7 @@ mod tests {
         assert_eq!(calls.get(), 1);
 
         scene.clear();
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.heavy("h2", |hctx| {
                 // viewport_key を変える。
                 hctx.cached(0xBBBBu64, |hctx| {
@@ -255,7 +255,7 @@ mod tests {
     fn heavy_pointer_and_push_edit_outside_cached() {
         struct Counter { value: u32 }
 
-        let mut host: UiHost<Counter> = UiHost::new();
+        let mut host: UiHost<Counter> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let mut model = Counter { value: 0 };
         let screen = PhysicalSize { width: 200, height: 100 };
@@ -265,7 +265,7 @@ mod tests {
             primary_just_released: true,
             ..PointerFrame::default()
         };
-        let edits = host.frame(
+        let edits = host.frame_to_edits(
             &model,
             &mut scene,
             screen,
@@ -294,7 +294,7 @@ mod tests {
     /// (eviction が効いている)。
     #[test]
     fn heavy_evicts_when_not_called_for_a_frame() {
-        let mut host: UiHost<()> = UiHost::new();
+        let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 200, height: 100 };
         let test_rect = Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 };
@@ -302,7 +302,7 @@ mod tests {
         let calls = Cell::new(0_u32);
 
         // Frame 1: heavy ブロック登場 → cache 記録。
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.heavy("h4", |hctx| {
                 hctx.cached(0u64, |hctx| {
                     calls.set(calls.get() + 1);
@@ -314,12 +314,12 @@ mod tests {
 
         // Frame 2: heavy ブロックを呼ばない → eviction される。
         scene.clear();
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), _ui| {});
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), _ui| {});
 
         // Frame 3: heavy ブロックを再び呼ぶ → eviction されているので cache miss、
         // draw_fn が再実行される。
         scene.clear();
-        host.frame(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.heavy("h4", |hctx| {
                 hctx.cached(0u64, |hctx| {
                     calls.set(calls.get() + 1);

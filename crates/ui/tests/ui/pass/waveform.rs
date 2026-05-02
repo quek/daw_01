@@ -26,7 +26,7 @@ struct Model {
 }
 
 fn main() {
-    let mut host: UiHost<Model> = UiHost::new();
+    let mut host: UiHost<Model> = UiHost::no_redraw();
     let mut scene = Scene::new();
     let model = Model {
         mono: vec![0.0; 1024],
@@ -39,7 +39,7 @@ fn main() {
     let screen = PhysicalSize { width: 800, height: 600 };
     let rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 200.0 };
 
-    let _edits = host.frame(
+    let _edits = host.frame_to_edits(
         &model,
         &mut scene,
         screen,
