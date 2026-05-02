@@ -1,35 +1,40 @@
-//! Renoise-style mixer strip building blocks. The bottom-panel mixer
-//! composes a per-track strip via `strip()` plus a permanent
-//! `master_strip()` pinned on the right.
+//! Renoise 風 mixer strip。draw(...) を呼ぶと指定 area 内に N 本のチャンネル
+//! ストリップが横並びで描画される。
 //!
-//! Each strip shows:
-//!   - track name
-//!   - `M` (mute) / `S` (solo) toggle buttons
-//!   - horizontal pan knob
-//!   - vertical volume fader + twin L/R VU meter
-//!
-//! Strips read their state through a per-item `Memo<TrackMixEntry>`; the
-//! master reads its own Signals supplied by `MasterStripSignals`.
+//! 各 strip:
+//!   - トラック名
+//!   - M (mute) / S (solo) toggle
+//!   - Pan knob
+//!   - Volume fader (縦) + L/R peak meter
 
-use vizia::prelude::*;
-use vizia::views::Knob;
+use daw_ui_core::{Edit, Ui};
+use daw_ui_renderer::{Color, Rect, RectCommand};
 
-use crate::app::{AppEvent, TrackMixEntry};
+use crate::app::{AppData, AppEvent};
 
-/// Width of one mixer strip.
-pub const STRIP_WIDTH: f32 = 136.0;
-/// Total height of one strip.
-pub const STRIP_HEIGHT: f32 = 150.0;
-pub const FADER_HEIGHT: f32 = 100.0;
-pub const FADER_WIDTH: f32 = 18.0;
-pub const METER_WIDTH: f32 = 5.0;
+const STRIP_WIDTH: f32 = 80.0;
+const STRIP_GAP: f32 = 4.0;
+const TOP_LABEL_H: f32 = 18.0;
+const TOGGLE_H: f32 = 22.0;
+const KNOB_SIZE: f32 = 32.0;
+const FADER_W: f32 = 18.0;
+const METER_W: f32 = 4.0;
+const METER_GAP: f32 = 2.0;
 
-// dB range shared by fader and meter for visual alignment.
+const COLOR_BG: Color = Color { r: 0.13, g: 0.13, b: 0.15, a: 1.0 };
+const COLOR_STRIP_BG: Color = Color { r: 0.18, g: 0.18, b: 0.22, a: 1.0 };
+const COLOR_MASTER_BG: Color = Color { r: 0.22, g: 0.22, b: 0.28, a: 1.0 };
+const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
+const COLOR_TEXT_DIM: Color = Color { r: 0.65, g: 0.68, b: 0.72, a: 1.0 };
+const COLOR_METER_BG: Color = Color { r: 0.06, g: 0.06, b: 0.08, a: 1.0 };
+const COLOR_METER_OK: Color = Color { r: 0.31, g: 0.78, b: 0.47, a: 1.0 };
+const COLOR_METER_HOT: Color = Color { r: 0.90, g: 0.78, b: 0.31, a: 1.0 };
+const COLOR_METER_CLIP: Color = Color { r: 0.86, g: 0.27, b: 0.27, a: 1.0 };
+
 const DB_MIN: f32 = -80.0;
 const DB_MAX: f32 = 6.0;
-const DB_RANGE: f32 = DB_MAX - DB_MIN; // 86.0
+const DB_RANGE: f32 = DB_MAX - DB_MIN;
 
-/// Linear amplitude → fader position (0..1).
 fn amp_to_fader(amp: f32) -> f32 {
     if amp <= 0.0 {
         return 0.0;
@@ -38,7 +43,6 @@ fn amp_to_fader(amp: f32) -> f32 {
     ((db - DB_MIN) / DB_RANGE).clamp(0.0, 1.0)
 }
 
-/// Fader position (0..1) → linear amplitude.
 fn fader_to_amp(n: f32) -> f32 {
     let db = n * DB_RANGE + DB_MIN;
     if db <= DB_MIN {
@@ -48,167 +52,286 @@ fn fader_to_amp(n: f32) -> f32 {
     }
 }
 
-/// Linear peak amplitude → meter bar height (0..1) on the same dB scale.
-fn amp_to_meter_norm(amp: f32) -> f32 {
-    if amp <= 0.0 {
-        return 0.0;
+pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
+    // 背景
+    ui.heavy("mixer_bg", |hctx| {
+        hctx.cached((area.w.to_bits(), area.h.to_bits()), |hctx| {
+            hctx.push_rect(RectCommand {
+                rect: area,
+                fill: COLOR_BG,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: None,
+            });
+        });
+    });
+
+    let inner_pad = 8.0;
+    let strip_y = area.y + inner_pad;
+    let strip_h = area.h - inner_pad * 2.0;
+    let mut x = area.x + inner_pad;
+
+    // Per-track strips
+    let mix = app.track_mix();
+    for entry in &mix {
+        if x + STRIP_WIDTH > area.x + area.w - STRIP_WIDTH - STRIP_GAP * 2.0 {
+            // master strip 用に右端を空けておく。
+            break;
+        }
+        draw_strip(
+            ui,
+            entry.index as usize,
+            entry.name.as_str(),
+            entry.volume,
+            entry.pan,
+            entry.muted,
+            entry.solo,
+            entry.peak_l_norm,
+            entry.peak_r_norm,
+            Rect { x, y: strip_y, w: STRIP_WIDTH, h: strip_h },
+            COLOR_STRIP_BG,
+            entry.index,
+            false,
+        );
+        x += STRIP_WIDTH + STRIP_GAP;
     }
-    let db = 20.0 * amp.log10();
-    ((db - DB_MIN) / DB_RANGE).clamp(0.0, 1.0)
+
+    // Master strip (右端固定)
+    let master_x = area.x + area.w - inner_pad - STRIP_WIDTH;
+    draw_strip(
+        ui,
+        usize::MAX,
+        "MASTER",
+        app.master_gain,
+        0.0,
+        false,
+        false,
+        app.peak_l_norm,
+        app.peak_r_norm,
+        Rect { x: master_x, y: strip_y, w: STRIP_WIDTH, h: strip_h },
+        COLOR_MASTER_BG,
+        u32::MAX,
+        true,
+    );
 }
 
-#[derive(Copy, Clone)]
-pub struct MasterStripSignals {
-    pub master_gain: Signal<f32>,
-    pub peak_l_norm: Signal<f32>,
-    pub peak_r_norm: Signal<f32>,
-}
+#[allow(clippy::too_many_arguments)]
+fn draw_strip(
+    ui: &mut Ui<'_, AppData>,
+    layout_idx: usize,
+    name: &str,
+    volume: f32,
+    pan: f32,
+    muted: bool,
+    solo: bool,
+    peak_l_norm: f32,
+    peak_r_norm: f32,
+    rect: Rect,
+    bg: Color,
+    track_idx: u32,
+    is_master: bool,
+) {
+    // ストリップ背景
+    ui.heavy(("mixer_strip_bg", layout_idx), |hctx| {
+        hctx.cached((rect.w.to_bits(), rect.h.to_bits(), bg.r.to_bits()), |hctx| {
+            hctx.push_rect(RectCommand {
+                rect,
+                fill: bg,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [4.0; 4],
+                clip_rect: None,
+            });
+        });
+    });
 
-pub fn strip<S>(cx: &mut Context, entry: S)
-where
-    S: SignalGet<TrackMixEntry> + SignalWith<TrackMixEntry> + Copy + Send + Sync + 'static,
-{
-    VStack::new(cx, move |cx| {
-        // Track name
-        Label::new(cx, entry.map(|e| e.name.clone()))
-            .color(Color::rgb(220, 220, 220))
-            .font_size(11.0)
-            .height(Pixels(14.0));
+    let pad = 6.0;
+    let mut y = rect.y + pad;
 
-        // Mute / Solo + Pan knob row
-        HStack::new(cx, move |cx| {
-            Button::new(cx, |cx| Label::new(cx, "M").font_size(10.0))
-                .on_press(move |ex| {
-                    let idx = entry.get().index;
-                    ex.emit(AppEvent::ToggleTrackMute(idx));
+    // 名前
+    ui.label_at(
+        ("mixer_strip_name", layout_idx),
+        name,
+        rect.x + pad,
+        y,
+        11.0,
+        if is_master { COLOR_TEXT } else { COLOR_TEXT_DIM },
+    );
+    y += TOP_LABEL_H;
+
+    if !is_master {
+        // M / S トグル (ボタン2本)
+        let btn_w = (rect.w - pad * 2.0 - 4.0) * 0.5;
+        ui.button_at(
+            ("mixer_strip_mute", layout_idx),
+            "M",
+            Rect { x: rect.x + pad, y, w: btn_w, h: TOGGLE_H },
+            move || {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ToggleTrackMute(track_idx))
                 })
-                .background_color(entry.map(|e| {
-                    if e.muted {
-                        Color::rgb(200, 90, 70)
-                    } else {
-                        Color::rgb(55, 55, 60)
-                    }
-                }))
-                .width(Pixels(22.0))
-                .height(Pixels(20.0));
-
-            Button::new(cx, |cx| Label::new(cx, "S").font_size(10.0))
-                .on_press(move |ex| {
-                    let idx = entry.get().index;
-                    ex.emit(AppEvent::ToggleTrackSolo(idx));
+            },
+        );
+        ui.button_at(
+            ("mixer_strip_solo", layout_idx),
+            "S",
+            Rect { x: rect.x + pad + btn_w + 4.0, y, w: btn_w, h: TOGGLE_H },
+            move || {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ToggleTrackSolo(track_idx))
                 })
-                .background_color(entry.map(|e| {
-                    if e.solo {
-                        Color::rgb(230, 200, 80)
-                    } else {
-                        Color::rgb(55, 55, 60)
-                    }
-                }))
-                .width(Pixels(22.0))
-                .height(Pixels(20.0));
+            },
+        );
+        // ステータスを色帯で示す。
+        if muted {
+            ui.heavy(("mixer_strip_mute_hint", layout_idx), |hctx| {
+                hctx.cached(muted, |hctx| {
+                    hctx.push_rect(RectCommand {
+                        rect: Rect {
+                            x: rect.x + pad,
+                            y: y + TOGGLE_H - 2.0,
+                            w: btn_w,
+                            h: 2.0,
+                        },
+                        fill: COLOR_METER_CLIP,
+                        border: Color::TRANSPARENT,
+                        border_width: 0.0,
+                        radius: [0.0; 4],
+                        clip_rect: None,
+                    });
+                });
+            });
+        }
+        if solo {
+            ui.heavy(("mixer_strip_solo_hint", layout_idx), |hctx| {
+                hctx.cached(solo, |hctx| {
+                    hctx.push_rect(RectCommand {
+                        rect: Rect {
+                            x: rect.x + pad + btn_w + 4.0,
+                            y: y + TOGGLE_H - 2.0,
+                            w: btn_w,
+                            h: 2.0,
+                        },
+                        fill: COLOR_METER_HOT,
+                        border: Color::TRANSPARENT,
+                        border_width: 0.0,
+                        radius: [0.0; 4],
+                        clip_rect: None,
+                    });
+                });
+            });
+        }
+        y += TOGGLE_H + 6.0;
 
-            // Pan knob — centered at 0.0, normalized to 0..1 for the
-            // Knob widget. Default 0.5 = center.
-            Knob::new(cx, 0.5, entry.map(|e| (e.pan + 1.0) / 2.0), true)
-                .on_change(move |ex, normalized| {
-                    let pan = normalized * 2.0 - 1.0;
-                    let idx = entry.get().index;
-                    ex.emit(AppEvent::SetTrackPan { track: idx, pan });
+        // Pan knob (-1..1 → 0..1)
+        let knob_x = rect.x + (rect.w - KNOB_SIZE) * 0.5;
+        let knob_value = (pan + 1.0) * 0.5;
+        let track_idx_for_pan = track_idx;
+        ui.knob_at(
+            ("mixer_strip_pan", layout_idx),
+            Rect { x: knob_x, y, w: KNOB_SIZE, h: KNOB_SIZE },
+            knob_value,
+            0.5,
+            move |v| {
+                let pan = v * 2.0 - 1.0;
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetTrackPan {
+                        track: track_idx_for_pan,
+                        pan,
+                    })
                 })
-                .size(Pixels(22.0));
-        })
-        .gap(Pixels(2.0))
-        .height(Pixels(24.0))
-        .alignment(Alignment::Center);
+            },
+        );
+        y += KNOB_SIZE + 4.0;
+    }
 
-        // Vertical fader + stereo VU meter — all on the same dB scale.
-        HStack::new(cx, move |cx| {
-            // Volume fader: vertical (height > width triggers vertical
-            // mode in Vizia's Slider). Value is normalized to 0..1 on
-            // the dB scale (-80..+6 dB).
-            Slider::new(cx, entry.map(|e| amp_to_fader(e.volume)))
-                .range(0.0..1.0)
-                .vertical(true)
-                .on_change(move |ex, fader_pos| {
-                    let amp = fader_to_amp(fader_pos);
-                    let idx = entry.get().index;
-                    ex.emit(AppEvent::SetTrackVolume { track: idx, amp });
-                })
-                .width(Pixels(FADER_WIDTH))
-                .height(Pixels(FADER_HEIGHT));
+    // 縦 fader + L/R peak meter
+    let fader_top = y + 4.0;
+    let fader_bottom = rect.y + rect.h - pad - 12.0;
+    let fader_h = (fader_bottom - fader_top).max(20.0);
 
-            // L/R peak meters on the same dB scale as the fader.
-            meter_bar(cx, entry.map(|e| amp_to_meter_norm(e.peak_l_norm)));
-            meter_bar(cx, entry.map(|e| amp_to_meter_norm(e.peak_r_norm)));
-        })
-        .gap(Pixels(2.0))
-        .alignment(Alignment::Center)
-        .height(Pixels(FADER_HEIGHT));
-    })
-    .padding(Pixels(4.0))
-    .gap(Pixels(2.0));
-}
+    let group_w = FADER_W + (METER_W * 2.0 + METER_GAP * 2.0);
+    let group_x = rect.x + (rect.w - group_w) * 0.5;
 
-/// Permanent master mixer strip: label + master fader + stereo VU.
-/// Reads its state from the supplied Signals.
-pub fn master_strip(cx: &mut Context, sig: MasterStripSignals) {
-    VStack::new(cx, move |cx| {
-        Label::new(cx, "MASTER")
-            .color(Color::rgb(230, 230, 230))
-            .font_size(12.0)
-            // Matches the user-strip track-name label so the master fader
-            // ends up at the same Y as user faders.
-            .height(Pixels(14.0));
-        // Spacer matching the user strip's combined M/S/Pan row (24 px).
-        Element::new(cx)
-            .width(Stretch(1.0))
-            .height(Pixels(24.0));
-        // Master fader (vertical) + stereo meter, same dB scale.
-        HStack::new(cx, move |cx| {
-            Slider::new(cx, sig.master_gain.map(|g: &f32| amp_to_fader(*g)))
-                .range(0.0..1.0)
-                .vertical(true)
-                .on_change(|ex, fader_pos| {
-                    let amp = fader_to_amp(fader_pos);
-                    ex.emit(AppEvent::SetMasterGain(amp));
-                })
-                .width(Pixels(FADER_WIDTH))
-                .height(Pixels(FADER_HEIGHT));
-            meter_bar(cx, sig.peak_l_norm.map(|n: &f32| amp_to_meter_norm(*n)));
-            meter_bar(cx, sig.peak_r_norm.map(|n: &f32| amp_to_meter_norm(*n)));
-        })
-        .gap(Pixels(2.0))
-        .alignment(Alignment::Center)
-        .height(Pixels(FADER_HEIGHT));
-    })
-    .padding(Pixels(4.0))
-    .gap(Pixels(2.0))
-    .background_color(Color::rgb(44, 44, 48));
-}
-
-fn meter_bar<S>(cx: &mut Context, norm: S)
-where
-    S: SignalGet<f32> + SignalWith<f32> + Copy + 'static,
-{
-    VStack::new(cx, move |cx| {
-        Element::new(cx)
-            .width(Pixels(METER_WIDTH))
-            // Minimum 1 px so Vizia never draws a zero-sized entity.
-            .height(norm.map(|n: &f32| {
-                Pixels((FADER_HEIGHT * n.clamp(0.0, 1.0)).max(1.0))
-            }))
-            .background_color(norm.map(|n: &f32| {
-                if *n >= 0.999 {
-                    Color::rgb(220, 70, 70)
-                } else if *n > 0.9 {
-                    Color::rgb(230, 210, 80)
+    let fader_value = amp_to_fader(volume);
+    let track_idx_for_vol = track_idx;
+    let is_master_for_vol = is_master;
+    ui.fader_at(
+        ("mixer_strip_fader", layout_idx),
+        Rect { x: group_x, y: fader_top, w: FADER_W, h: fader_h },
+        fader_value,
+        amp_to_fader(1.0),
+        move |v| {
+            let amp = fader_to_amp(v);
+            Edit::mutate(move |app: &mut AppData| {
+                if is_master_for_vol {
+                    app.handle_event(AppEvent::SetMasterGain(amp));
                 } else {
-                    Color::rgb(80, 200, 120)
+                    app.handle_event(AppEvent::SetTrackVolume {
+                        track: track_idx_for_vol,
+                        amp,
+                    });
                 }
-            }));
-    })
-    .width(Pixels(METER_WIDTH))
-    .height(Pixels(FADER_HEIGHT))
-    .alignment(Alignment::BottomCenter)
-    .background_color(Color::rgb(20, 20, 20));
+            })
+        },
+    );
+
+    let mx = group_x + FADER_W + METER_GAP;
+    draw_meter(
+        ui,
+        ("mixer_meter_l", layout_idx),
+        Rect { x: mx, y: fader_top, w: METER_W, h: fader_h },
+        peak_l_norm,
+    );
+    draw_meter(
+        ui,
+        ("mixer_meter_r", layout_idx),
+        Rect {
+            x: mx + METER_W + METER_GAP,
+            y: fader_top,
+            w: METER_W,
+            h: fader_h,
+        },
+        peak_r_norm,
+    );
+}
+
+fn draw_meter(ui: &mut Ui<'_, AppData>, id: (&'static str, usize), rect: Rect, norm: f32) {
+    ui.heavy(id, |hctx| {
+        hctx.cached(norm.to_bits(), |hctx| {
+            hctx.push_rect(RectCommand {
+                rect,
+                fill: COLOR_METER_BG,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [1.0; 4],
+                clip_rect: None,
+            });
+            let lvl = norm.clamp(0.0, 1.0);
+            if lvl > 0.0 {
+                let fill_h = rect.h * lvl;
+                let color = if lvl >= 0.999 {
+                    COLOR_METER_CLIP
+                } else if lvl > 0.85 {
+                    COLOR_METER_HOT
+                } else {
+                    COLOR_METER_OK
+                };
+                hctx.push_rect(RectCommand {
+                    rect: Rect {
+                        x: rect.x,
+                        y: rect.y + (rect.h - fill_h),
+                        w: rect.w,
+                        h: fill_h,
+                    },
+                    fill: color,
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [1.0; 4],
+                    clip_rect: None,
+                });
+            }
+        });
+    });
 }

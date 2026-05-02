@@ -1,118 +1,201 @@
-use vizia::prelude::*;
+//! Transport bar (画面上端): BPM 表示 / Play / Stop / Loop / VOICEVOX 合成 /
+//! Add Track / Master fader / L-R peak meter。
 
-use crate::app::AppEvent;
+use daw_ui_core::{Edit, Ui};
+use daw_ui_renderer::{Color, Rect, RectCommand};
 
-#[derive(Copy, Clone)]
-pub struct TransportSignals {
-    pub bpm: Memo<f32>,
-    pub is_looping: Signal<bool>,
-    pub master_gain: Signal<f32>,
-    pub peak_l_norm: Signal<f32>,
-    pub peak_r_norm: Signal<f32>,
+use crate::app::{AppData, AppEvent};
+
+const BG: Color = Color { r: 0.16, g: 0.16, b: 0.20, a: 1.0 };
+const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
+const TEXT_DIM: Color = Color { r: 0.65, g: 0.68, b: 0.72, a: 1.0 };
+const METER_BG: Color = Color { r: 0.08, g: 0.08, b: 0.10, a: 1.0 };
+const METER_FILL: Color = Color { r: 0.55, g: 0.85, b: 0.55, a: 1.0 };
+const METER_HOT: Color = Color { r: 0.95, g: 0.45, b: 0.40, a: 1.0 };
+
+pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
+    // 背景
+    ui.heavy("transport_bg", |hctx| {
+        hctx.cached((area.w.to_bits(), area.h.to_bits()), |hctx| {
+            hctx.push_rect(RectCommand {
+                rect: area,
+                fill: BG,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: None,
+            });
+        });
+    });
+
+    let pad = 12.0;
+    let mut x = area.x + pad;
+    let cy = area.y + (area.h - 28.0) * 0.5;
+    let bh = 28.0;
+
+    // BPM 表示
+    ui.label_at(
+        "transport_bpm",
+        &format!("BPM {:.1}", app.bpm()),
+        x,
+        area.y + (area.h - 12.0) * 0.5,
+        12.0,
+        TEXT,
+    );
+    x += 76.0;
+
+    // Play/Stop
+    let play_w = 64.0;
+    ui.button_at(
+        "transport_play",
+        if app.is_playing { "Stop" } else { "Play" },
+        Rect { x, y: cy, w: play_w, h: bh },
+        || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::PlayToggle)),
+    );
+    x += play_w + 6.0;
+
+    // Loop toggle
+    let loop_w = 76.0;
+    ui.button_at(
+        "transport_loop",
+        if app.is_looping { "Loop ON" } else { "Loop OFF" },
+        Rect { x, y: cy, w: loop_w, h: bh },
+        || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ToggleLoop)),
+    );
+    x += loop_w + 6.0;
+
+    // VOICEVOX synth
+    let synth_w = 88.0;
+    ui.button_at(
+        "transport_synth",
+        "Synth (V)",
+        Rect { x, y: cy, w: synth_w, h: bh },
+        || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::SynthesizeVocal)),
+    );
+    x += synth_w + 6.0;
+
+    // Add Vocal Track
+    let add_w = 110.0;
+    ui.button_at(
+        "transport_add_vocal",
+        "+Vocal Track",
+        Rect { x, y: cy, w: add_w, h: bh },
+        || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::AddVocalTrack)),
+    );
+    x += add_w + 6.0;
+
+    // Add Instrument Track
+    let inst_w = 110.0;
+    ui.button_at(
+        "transport_add_inst",
+        "+Inst Track",
+        Rect { x, y: cy, w: inst_w, h: bh },
+        || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::AddInstrumentTrack)),
+    );
+    x += inst_w + 18.0;
+
+    // Playhead 位置 (text)
+    let playhead = app
+        .playhead_beat
+        .map(|b| format!("\u{25b6} {b:7.2}"))
+        .unwrap_or_else(|| "\u{25a0}   --".to_string());
+    ui.label_at(
+        "transport_playhead",
+        &playhead,
+        x,
+        area.y + (area.h - 12.0) * 0.5,
+        12.0,
+        TEXT,
+    );
+
+    // 右寄せ: master fader + L/R meter
+    let right_w = 220.0;
+    let right_x = area.x + area.w - right_w - pad;
+    let master_label_w = 56.0;
+    let fader_w = 120.0;
+    let meter_w = 22.0;
+
+    ui.label_at(
+        "transport_master_label",
+        "Master",
+        right_x,
+        area.y + (area.h - 12.0) * 0.5,
+        12.0,
+        TEXT_DIM,
+    );
+
+    let fader_rect = Rect {
+        x: right_x + master_label_w,
+        y: cy + 2.0,
+        w: fader_w,
+        h: bh - 4.0,
+    };
+    ui.fader_at(
+        "transport_master",
+        fader_rect,
+        app.master_gain,
+        1.0,
+        |v| Edit::mutate(move |app: &mut AppData| app.handle_event(AppEvent::SetMasterGain(v))),
+    );
+
+    let meters_x = right_x + master_label_w + fader_w + 6.0;
+    draw_peak_meter(
+        ui,
+        "transport_meter_l",
+        meters_x,
+        area.y + 6.0,
+        meter_w * 0.5 - 2.0,
+        area.h - 12.0,
+        app.peak_l_norm,
+    );
+    draw_peak_meter(
+        ui,
+        "transport_meter_r",
+        meters_x + meter_w * 0.5 + 2.0,
+        area.y + 6.0,
+        meter_w * 0.5 - 2.0,
+        area.h - 12.0,
+        app.peak_r_norm,
+    );
 }
 
-pub struct TransportView;
-
-impl TransportView {
-    pub fn new(cx: &mut Context, sig: TransportSignals) -> Handle<'_, Self> {
-        Self.build(cx, move |cx| {
-            HStack::new(cx, move |cx| {
-                Button::new(cx, |cx| Label::new(cx, "▶ Play"))
-                    .on_press(|ex| ex.emit(AppEvent::Play));
-                Button::new(cx, |cx| Label::new(cx, "⏹ Stop"))
-                    .on_press(|ex| ex.emit(AppEvent::Stop));
-                // Loop toggle — highlighted when ON. The label itself swaps
-                // between ON/OFF so the current state is obvious even before
-                // the user learns the colour cue.
-                Button::new(cx, move |cx| {
-                    Label::new(
-                        cx,
-                        sig.is_looping
-                            .map(|on: &bool| if *on { "🔁 Loop ON" } else { "🔁 Loop" }),
-                    )
-                })
-                .on_press(|ex| ex.emit(AppEvent::ToggleLoop))
-                .background_color(sig.is_looping.map(|on: &bool| {
-                    if *on {
-                        Color::rgb(80, 140, 90)
-                    } else {
-                        Color::rgb(60, 60, 64)
-                    }
-                }));
-                Label::new(cx, "0:00 / 64 beats")
-                    .padding_left(Pixels(16.0))
-                    .color(Color::rgb(220, 220, 220));
-                Label::new(cx, sig.bpm.map(|bpm: &f32| format!("BPM {}", bpm)))
-                    .padding_left(Pixels(16.0))
-                    .color(Color::rgb(220, 220, 220));
-
-                // Elastic spacer pushes the master strip to the right edge.
-                Element::new(cx).width(Stretch(1.0));
-
-                master_strip(cx, sig);
-            })
-            .gap(Pixels(8.0))
-            .padding(Pixels(6.0))
-            .alignment(Alignment::Left);
-        })
-        .background_color(Color::rgb(48, 48, 52))
-    }
-}
-
-impl View for TransportView {
-    fn element(&self) -> Option<&'static str> {
-        Some("transport")
-    }
-}
-
-const METER_HEIGHT: f32 = 28.0;
-const METER_WIDTH: f32 = 5.0;
-
-/// Master fader (horizontal slider) plus L/R peak meter. Emits
-/// `AppEvent::SetMasterGain(f32)` on slider drag; reads meter levels from
-/// the supplied peak signals.
-fn master_strip(cx: &mut Context, sig: TransportSignals) {
-    HStack::new(cx, move |cx| {
-        Label::new(cx, "MST")
-            .font_size(11.0)
-            .color(Color::rgb(180, 180, 180));
-
-        Slider::new(cx, sig.master_gain)
-            .range(0.0..1.0)
-            .on_change(|ex, value| ex.emit(AppEvent::SetMasterGain(value)))
-            .width(Pixels(120.0));
-
-        // Two thin vertical bars. The outer VStack has alignment = Bottom so
-        // the inner Element grows upward from the base when its height
-        // (signal-bound) increases.
-        meter_bar(cx, sig.peak_l_norm);
-        meter_bar(cx, sig.peak_r_norm);
-    })
-    .gap(Pixels(6.0))
-    .alignment(Alignment::Center);
-}
-
-fn meter_bar(cx: &mut Context, norm: Signal<f32>) {
-    VStack::new(cx, move |cx| {
-        Element::new(cx)
-            .width(Pixels(METER_WIDTH))
-            .height(norm.map(|n: &f32| Pixels(METER_HEIGHT * n.clamp(0.0, 1.0))))
-            .background_color(norm.map(|n: &f32| {
-                // Normal range green, hot yellow, clipping red. The thresholds
-                // match the dB-normalized scale (METER_DB_MIN..METER_DB_MAX):
-                //   > -6 dB (norm > 0.9) → yellow
-                //   >= 0 dB (norm == 1.0) → red
-                if *n >= 0.999 {
-                    Color::rgb(220, 70, 70)
-                } else if *n > 0.9 {
-                    Color::rgb(230, 210, 80)
-                } else {
-                    Color::rgb(80, 200, 120)
-                }
-            }));
-    })
-    .width(Pixels(METER_WIDTH))
-    .height(Pixels(METER_HEIGHT))
-    .alignment(Alignment::BottomCenter)
-    .background_color(Color::rgb(20, 20, 20));
+fn draw_peak_meter(
+    ui: &mut Ui<'_, AppData>,
+    id: &'static str,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    norm: f32,
+) {
+    ui.heavy(id, |hctx| {
+        hctx.cached(norm.to_bits(), |hctx| {
+            hctx.push_rect(RectCommand {
+                rect: Rect { x, y, w, h },
+                fill: METER_BG,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [2.0; 4],
+                clip_rect: None,
+            });
+            let lvl = norm.clamp(0.0, 1.0);
+            if lvl > 0.0 {
+                let fill_h = h * lvl;
+                let color = if lvl > 0.85 { METER_HOT } else { METER_FILL };
+                hctx.push_rect(RectCommand {
+                    rect: Rect {
+                        x,
+                        y: y + (h - fill_h),
+                        w,
+                        h: fill_h,
+                    },
+                    fill: color,
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [2.0; 4],
+                    clip_rect: None,
+                });
+            }
+        });
+    });
 }

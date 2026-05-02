@@ -1,43 +1,56 @@
-use std::path::PathBuf;
+//! 画面下端のステータスバー: ファイルパス / MIDI 入力 / status_message。
 
-use vizia::prelude::*;
+use daw_ui_core::Ui;
+use daw_ui_renderer::{Color, Rect, RectCommand};
 
-pub struct StatusBarView;
+use crate::app::AppData;
 
-impl StatusBarView {
-    pub fn new(
-        cx: &mut Context,
-        file_path: Signal<Option<PathBuf>>,
-        status_message: Signal<String>,
-    ) -> Handle<'_, Self> {
-        Self.build(cx, move |cx| {
-            HStack::new(cx, move |cx| {
-                Label::new(
-                    cx,
-                    file_path.map(|p: &Option<PathBuf>| {
-                        p.as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "(untitled)".to_string())
-                    }),
-                )
-                .color(Color::rgb(200, 200, 200));
+const COLOR_BG: Color = Color { r: 0.18, g: 0.18, b: 0.22, a: 1.0 };
+const COLOR_TEXT: Color = Color { r: 0.65, g: 0.68, b: 0.72, a: 1.0 };
+const COLOR_MSG: Color = Color { r: 0.55, g: 0.85, b: 0.55, a: 1.0 };
 
-                Element::new(cx).width(Stretch(1.0));
+pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
+    ui.heavy("status_bg", |hctx| {
+        hctx.cached((area.w.to_bits(), area.h.to_bits()), |hctx| {
+            hctx.push_rect(RectCommand {
+                rect: area,
+                fill: COLOR_BG,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: None,
+            });
+        });
+    });
 
-                // Right-aligned status message for background tasks
-                // (synthesis, rescan, etc.).
-                Label::new(cx, status_message)
-                    .color(Color::rgb(180, 220, 180));
-            })
-            .padding_left(Pixels(8.0))
-            .padding_right(Pixels(8.0));
-        })
-        .background_color(Color::rgb(28, 28, 32))
-    }
-}
+    let pad = 12.0;
+    let line_y = area.y + (area.h - 11.0) * 0.5;
 
-impl View for StatusBarView {
-    fn element(&self) -> Option<&'static str> {
-        Some("status-bar")
+    let left = format!(
+        "MIDI: {} \u{2502} file: {}",
+        if app.midi_input_label.is_empty() {
+            "(none)"
+        } else {
+            app.midi_input_label.as_str()
+        },
+        app.file_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(unsaved)".to_string()),
+    );
+    ui.label_at("status_left", &left, area.x + pad, line_y, 11.0, COLOR_TEXT);
+
+    if !app.status_message.is_empty() {
+        // 画面右寄りに status_message。文字幅が分からないので右端から逆算は難しい。
+        // 今は中央寄り左固定で。
+        let mid_x = area.x + area.w * 0.55;
+        ui.label_at(
+            "status_message",
+            &app.status_message,
+            mid_x,
+            line_y,
+            11.0,
+            COLOR_MSG,
+        );
     }
 }

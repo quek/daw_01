@@ -1,3 +1,6 @@
+理想とベストプラクティスを追求する。
+そのためは大胆に破壊して作り直す。
+
 # daw_01
 
 VOICEVOX 歌声合成を組み込んだ Rust 製 DAW。詳細は [DESIGN.md](DESIGN.md)。

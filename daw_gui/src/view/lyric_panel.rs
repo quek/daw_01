@@ -1,50 +1,66 @@
-//! Side panel showing the lyric of the currently selected note. Hidden
-//! behind a placeholder when no note is selected.
+//! 選択中ノートの歌詞編集パネル。`text_input` で歌詞を編集 → SetSelectedNoteLyric。
+//! ノート未選択時はプレースホルダ表示。
 
-use vizia::prelude::*;
+use daw_ui_core::{Edit, Ui};
+use daw_ui_renderer::{Color, Rect, RectCommand};
 
-use crate::app::AppEvent;
+use crate::app::{AppData, AppEvent};
 
-#[derive(Copy, Clone)]
-pub struct LyricPanelSignals {
-    pub selected_notes: Signal<Vec<u32>>,
-    pub selected_lyric: Memo<String>,
-}
+const COLOR_BG: Color = Color { r: 0.16, g: 0.16, b: 0.20, a: 1.0 };
+const COLOR_TEXT: Color = Color { r: 0.85, g: 0.88, b: 0.92, a: 1.0 };
+const COLOR_TEXT_DIM: Color = Color { r: 0.55, g: 0.58, b: 0.65, a: 1.0 };
 
-pub struct LyricPanel;
+pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
+    ui.heavy("lyric_bg", |hctx| {
+        hctx.cached((area.w.to_bits(), area.h.to_bits()), |hctx| {
+            hctx.push_rect(RectCommand {
+                rect: area,
+                fill: COLOR_BG,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: None,
+            });
+        });
+    });
 
-impl LyricPanel {
-    pub fn new(cx: &mut Context, sig: LyricPanelSignals) -> Handle<'_, Self> {
-        Self.build(cx, move |cx| {
-            VStack::new(cx, move |cx| {
-                Label::new(cx, "Lyric")
-                    .font_size(13.0)
-                    .color(Color::rgb(180, 180, 180));
-                Binding::new(cx, sig.selected_notes, move |cx| {
-                    let empty = sig.selected_notes.with(|v| v.is_empty());
-                    if empty {
-                        Label::new(cx, "(ノート未選択)")
-                            .color(Color::rgb(120, 120, 120))
-                            .font_size(12.0);
-                    } else {
-                        Textbox::new(cx, sig.selected_lyric)
-                            .on_edit(|ex, t| {
-                                ex.emit(AppEvent::SetSelectedNoteLyric(t));
-                            })
-                            .width(Stretch(1.0))
-                            .height(Pixels(28.0));
-                    }
-                });
+    let pad = 8.0;
+    ui.label_at(
+        "lyric_title",
+        "Lyric",
+        area.x + pad,
+        area.y + pad,
+        13.0,
+        COLOR_TEXT,
+    );
+
+    let input_y = area.y + pad + 22.0;
+    if app.selected_notes.is_empty() {
+        ui.label_at(
+            "lyric_empty",
+            "(\u{30ce}\u{30fc}\u{30c8}\u{672a}\u{9078}\u{629e})",
+            area.x + pad,
+            input_y,
+            12.0,
+            COLOR_TEXT_DIM,
+        );
+        return;
+    }
+
+    let lyric = app.selected_lyric();
+    ui.text_input_at(
+        "lyric_input",
+        Rect {
+            x: area.x + pad,
+            y: input_y,
+            w: area.w - pad * 2.0,
+            h: 28.0,
+        },
+        &lyric,
+        |new| {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetSelectedNoteLyric(new))
             })
-            .padding(Pixels(8.0))
-            .gap(Pixels(6.0))
-            .background_color(Color::rgb(36, 36, 40));
-        })
-    }
-}
-
-impl View for LyricPanel {
-    fn element(&self) -> Option<&'static str> {
-        Some("lyric-panel")
-    }
+        },
+    );
 }

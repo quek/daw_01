@@ -1,701 +1,442 @@
-//! Piano roll view for the currently selected clip.
+//! Piano roll: 鍵盤 (左) + ノート canvas + ベロシティレーン (下)。
+//! 現状: 描画 + クリックでノート選択 + Wheel で縦スクロール / Ctrl+Wheel で縦ズーム /
+//! Shift+Wheel で横スクロール。
+//! TODO: マウスドラッグでノート移動 / リサイズ / 矩形選択 / ベロシティドラッグ /
+//! ダブルクリックで AddNote。
 
-use std::cell::RefCell;
+use daw_ui_core::{Edit, Ui};
+use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
 
-use vizia::prelude::*;
-use vizia::vg;
+use crate::app::{AppData, AppEvent, DEFAULT_NOTE_DURATION};
 
-use crate::app::{AppEvent, ClipRef, DEFAULT_NOTE_DURATION, NoteBox};
+const KEYBOARD_W: f32 = 56.0;
+const VEL_LANE_H: f32 = 60.0;
 
-const COLOR_BG: Color = Color::rgb(28, 28, 32);
-const COLOR_GRID: Color = Color::rgb(48, 48, 56);
-const COLOR_BAR: Color = Color::rgb(70, 70, 80);
-const COLOR_BLACK_KEY_LANE: Color = Color::rgb(34, 34, 40);
-const COLOR_NOTE: Color = Color::rgb(120, 200, 130);
-const COLOR_NOTE_SELECTED: Color = Color::rgb(220, 240, 180);
-const COLOR_NOTE_BORDER: Color = Color::rgb(20, 28, 20);
-const COLOR_NOTE_TEXT: Color = Color::rgb(20, 30, 20);
-const COLOR_KEYBOARD_BG: Color = Color::rgb(40, 40, 44);
-const COLOR_WHITE_KEY: Color = Color::rgb(220, 220, 220);
-const COLOR_BLACK_KEY: Color = Color::rgb(40, 40, 44);
+const COLOR_BG: Color = Color { r: 0.10, g: 0.10, b: 0.12, a: 1.0 };
+const COLOR_KEY_W: Color = Color { r: 0.92, g: 0.93, b: 0.95, a: 1.0 };
+const COLOR_KEY_B: Color = Color { r: 0.18, g: 0.18, b: 0.22, a: 1.0 };
+const COLOR_KEY_TEXT: Color = Color { r: 0.30, g: 0.30, b: 0.32, a: 1.0 };
+const COLOR_GRID: Color = Color { r: 0.20, g: 0.20, b: 0.24, a: 1.0 };
+const COLOR_BAR_GRID: Color = Color { r: 0.30, g: 0.30, b: 0.36, a: 1.0 };
+const COLOR_NOTE: Color = Color { r: 0.45, g: 0.78, b: 0.95, a: 0.95 };
+const COLOR_NOTE_SEL: Color = Color { r: 0.95, g: 0.85, b: 0.45, a: 0.95 };
+const COLOR_NOTE_BORDER: Color = Color { r: 0.05, g: 0.05, b: 0.08, a: 1.0 };
+const COLOR_NOTE_TEXT: Color = Color { r: 0.06, g: 0.08, b: 0.12, a: 1.0 };
+const COLOR_PLAYHEAD: Color = Color { r: 0.90, g: 0.30, b: 0.30, a: 1.0 };
+const COLOR_VEL_BG: Color = Color { r: 0.13, g: 0.13, b: 0.16, a: 1.0 };
+const COLOR_VEL_BAR: Color = Color { r: 0.55, g: 0.78, b: 0.95, a: 0.85 };
+const COLOR_HINT: Color = Color { r: 0.55, g: 0.58, b: 0.65, a: 1.0 };
 
-const KEYBOARD_WIDTH: f32 = 48.0;
-const NOTE_RESIZE_HANDLE_PX: f32 = 4.0;
-
-fn skia_rgba(c: Color) -> vg::Color {
-    vg::Color::from_argb(c.a(), c.r(), c.g(), c.b())
-}
-
-fn fill_paint(c: Color) -> vg::Paint {
-    let mut p = vg::Paint::default();
-    p.set_color(skia_rgba(c));
-    p.set_anti_alias(false);
-    p
-}
-
-fn stroke_paint(c: Color, width: f32) -> vg::Paint {
-    let mut p = vg::Paint::default();
-    p.set_color(skia_rgba(c));
-    p.set_stroke_width(width);
-    p.set_style(vg::PaintStyle::Stroke);
-    p.set_anti_alias(false);
-    p
-}
-
-fn rect(x: f32, y: f32, w: f32, h: f32) -> vg::Rect {
-    vg::Rect::new(x, y, x + w, y + h)
-}
-
-const VELOCITY_LANE_HEIGHT: f32 = 80.0;
-
-#[derive(Copy, Clone)]
-pub struct PianoRollSignals {
-    pub selected_clip: Signal<Option<ClipRef>>,
-    pub note_boxes: Memo<Vec<NoteBox>>,
-    pub pianoroll_zoom_x: Signal<f32>,
-    pub pianoroll_zoom_y: Signal<f32>,
-    pub pianoroll_scroll_beat: Signal<f32>,
-    pub pianoroll_top_pitch: Signal<u8>,
-}
-
-pub struct PianoRollView;
-
-impl PianoRollView {
-    pub fn new(cx: &mut Context, sig: PianoRollSignals) -> Handle<'_, Self> {
-        Self.build(cx, move |cx| {
-            Binding::new(cx, sig.selected_clip, move |cx| {
-                if sig.selected_clip.get().is_none() {
-                    Label::new(cx, "クリップを選択してください")
-                        .color(Color::rgb(150, 150, 150))
-                        .font_size(13.0)
-                        .alignment(Alignment::Center)
-                        .width(Stretch(1.0))
-                        .height(Stretch(1.0));
-                } else {
-                    VStack::new(cx, move |cx| {
-                        PianoRollCanvas::new(cx, sig)
-                            .width(Stretch(1.0))
-                            .height(Stretch(1.0));
-                        VelocityLane::new(cx, sig)
-                            .width(Stretch(1.0))
-                            .height(Pixels(VELOCITY_LANE_HEIGHT));
-                    });
-                }
+pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
+    // 全体背景
+    ui.heavy("pr_bg", |hctx| {
+        hctx.cached((area.w.to_bits(), area.h.to_bits()), |hctx| {
+            hctx.push_rect(RectCommand {
+                rect: area,
+                fill: COLOR_BG,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: None,
             });
-        })
-    }
-}
+        });
+    });
 
-impl View for PianoRollView {
-    fn element(&self) -> Option<&'static str> {
-        Some("piano-roll-view")
-    }
-}
-
-#[derive(Clone, Debug)]
-enum NoteDrag {
-    Move {
-        snapshots: Vec<(u32, f64, u8)>,
-    },
-    Resize {
-        note_idx: u32,
-        original_duration: f64,
-    },
-    Marquee {
-        origin_x: f32,
-        origin_y: f32,
-        cur_x: f32,
-        cur_y: f32,
-    },
-}
-
-pub struct PianoRollCanvas {
-    drag: RefCell<Option<NoteDrag>>,
-    drag_origin_x: RefCell<f32>,
-    drag_origin_y: RefCell<f32>,
-    sig: PianoRollSignals,
-}
-
-impl PianoRollCanvas {
-    pub fn new(cx: &mut Context, sig: PianoRollSignals) -> Handle<'_, Self> {
-        Self {
-            drag: RefCell::new(None),
-            drag_origin_x: RefCell::new(0.0),
-            drag_origin_y: RefCell::new(0.0),
-            sig,
-        }
-        .build(cx, |_cx| {})
-        .bind(sig.note_boxes, |mut handle| handle.needs_redraw())
-        .bind(sig.pianoroll_zoom_x, |mut handle| handle.needs_redraw())
-        .bind(sig.pianoroll_zoom_y, |mut handle| handle.needs_redraw())
-        .bind(sig.pianoroll_scroll_beat, |mut handle| handle.needs_redraw())
-        .bind(sig.pianoroll_top_pitch, |mut handle| handle.needs_redraw())
-    }
-
-    fn coord_to_beat_pitch(
-        canvas_x: f32,
-        y: f32,
-        zoom_x: f32,
-        zoom_y: f32,
-        scroll_beat: f32,
-        top_pitch: u8,
-    ) -> Option<(f64, u8)> {
-        let beat = ((canvas_x / zoom_x).max(0.0) + scroll_beat) as f64;
-        let row = (y / zoom_y).floor();
-        if row < 0.0 {
-            return None;
-        }
-        let pitch_i32 = top_pitch as i32 - row as i32;
-        if !(0..=127).contains(&pitch_i32) {
-            return None;
-        }
-        Some((beat, pitch_i32 as u8))
-    }
-
-    fn hit_note(notes: &[NoteBox], beat: f64, pitch: u8) -> Option<NoteBox> {
-        notes
-            .iter()
-            .find(|n| {
-                n.pitch == pitch
-                    && (beat as f32) >= n.start_beat
-                    && (beat as f32) <= n.start_beat + n.duration_beats
-            })
-            .cloned()
-    }
-}
-
-fn is_black_key(pitch: u8) -> bool {
-    matches!(pitch % 12, 1 | 3 | 6 | 8 | 10)
-}
-
-impl View for PianoRollCanvas {
-    fn element(&self) -> Option<&'static str> {
-        Some("piano-roll-canvas")
-    }
-
-    fn draw(&self, cx: &mut DrawContext, canvas: &Canvas) {
-        let bounds = cx.bounds();
-        let zoom_x = self.sig.pianoroll_zoom_x.get_untracked();
-        let zoom_y = self.sig.pianoroll_zoom_y.get_untracked();
-        let scroll_beat = self.sig.pianoroll_scroll_beat.get_untracked();
-        let top_pitch = self.sig.pianoroll_top_pitch.get_untracked();
-        let notes = self.sig.note_boxes.get_untracked();
-
-        canvas.draw_rect(
-            rect(bounds.x, bounds.y, bounds.w, bounds.h),
-            &fill_paint(COLOR_BG),
+    if app.selected_clip.is_none() {
+        ui.label_at(
+            "pr_no_clip",
+            "(\u{30af}\u{30ea}\u{30c3}\u{30d7}\u{304c}\u{9078}\u{629e}\u{3055}\u{308c}\u{3066}\u{3044}\u{307e}\u{305b}\u{3093})",
+            area.x + 12.0,
+            area.y + 12.0,
+            12.0,
+            COLOR_HINT,
         );
-
-        canvas.draw_rect(
-            rect(bounds.x, bounds.y, KEYBOARD_WIDTH, bounds.h),
-            &fill_paint(COLOR_KEYBOARD_BG),
-        );
-        let mut text_paint = vg::Paint::default();
-        text_paint.set_color(skia_rgba(Color::rgb(60, 60, 60)));
-        text_paint.set_anti_alias(true);
-        let font = vg::Font::default();
-        let visible_rows = ((bounds.h / zoom_y) as u32) + 1;
-        for i in 0..=visible_rows {
-            let pitch_i = top_pitch as i32 - i as i32;
-            if pitch_i < 0 {
-                break;
-            }
-            let pitch = pitch_i as u8;
-            let y = bounds.y + (i as f32) * zoom_y;
-            if y > bounds.y + bounds.h {
-                break;
-            }
-            let key_color = if is_black_key(pitch) {
-                COLOR_BLACK_KEY
-            } else {
-                COLOR_WHITE_KEY
-            };
-            canvas.draw_rect(
-                rect(bounds.x + 1.0, y, KEYBOARD_WIDTH - 2.0, zoom_y - 1.0),
-                &fill_paint(key_color),
-            );
-            if pitch.is_multiple_of(12) {
-                let octave = (pitch / 12) as i32 - 1;
-                canvas.draw_str(
-                    format!("C{octave}"),
-                    (bounds.x + 4.0, y + zoom_y - 2.0),
-                    &font,
-                    &text_paint,
-                );
-            }
-        }
-
-        let canvas_x0 = bounds.x + KEYBOARD_WIDTH;
-        let canvas_w = bounds.w - KEYBOARD_WIDTH;
-
-        for i in 0..=visible_rows {
-            let pitch_i = top_pitch as i32 - i as i32;
-            if pitch_i < 0 {
-                break;
-            }
-            let pitch = pitch_i as u8;
-            if !is_black_key(pitch) {
-                continue;
-            }
-            let y = bounds.y + (i as f32) * zoom_y;
-            canvas.draw_rect(
-                rect(canvas_x0, y, canvas_w, zoom_y),
-                &fill_paint(COLOR_BLACK_KEY_LANE),
-            );
-        }
-
-        let grid_paint = stroke_paint(COLOR_GRID, 1.0);
-        for i in 0..=visible_rows {
-            let y = bounds.y + (i as f32) * zoom_y;
-            if y > bounds.y + bounds.h {
-                break;
-            }
-            let mut p = vg::PathBuilder::new();
-            p.move_to((canvas_x0, y));
-            p.line_to((canvas_x0 + canvas_w, y));
-            let p = p.detach();
-            canvas.draw_path(&p, &grid_paint);
-        }
-
-        let first_beat = scroll_beat.floor() as i32;
-        let visible_beats = (canvas_w / zoom_x) as i32 + 1;
-        for offset in 0..=visible_beats {
-            let beat = first_beat + offset;
-            if beat < 0 {
-                continue;
-            }
-            let x = canvas_x0 + (beat as f32 - scroll_beat) * zoom_x;
-            if x > canvas_x0 + canvas_w {
-                break;
-            }
-            let stroke = if (beat as u32).is_multiple_of(4) { 1.5 } else { 0.5 };
-            let mut p = vg::PathBuilder::new();
-            p.move_to((x, bounds.y));
-            p.line_to((x, bounds.y + bounds.h));
-            let p = p.detach();
-            canvas.draw_path(&p, &stroke_paint(COLOR_BAR, stroke));
-        }
-
-        let border_paint = stroke_paint(COLOR_NOTE_BORDER, 1.0);
-        let mut note_text_paint = vg::Paint::default();
-        note_text_paint.set_color(skia_rgba(COLOR_NOTE_TEXT));
-        note_text_paint.set_anti_alias(true);
-        for n in &notes {
-            let row_i = top_pitch as i32 - n.pitch as i32;
-            if row_i < 0 {
-                continue;
-            }
-            let row = row_i as f32;
-            let x = canvas_x0 + (n.start_beat - scroll_beat) * zoom_x;
-            let y = bounds.y + row * zoom_y;
-            if y > bounds.y + bounds.h {
-                continue;
-            }
-            let w = (n.duration_beats * zoom_x).max(2.0);
-            let h = (zoom_y - 1.0).max(2.0);
-            if x + w < canvas_x0 || x > canvas_x0 + canvas_w {
-                continue;
-            }
-            let body_color = if n.selected {
-                COLOR_NOTE_SELECTED
-            } else {
-                COLOR_NOTE
-            };
-            let r = rect(x, y, w, h);
-            canvas.draw_rect(r, &fill_paint(body_color));
-            canvas.draw_rect(r, &border_paint);
-            if !n.lyric.is_empty() && w > 16.0 {
-                canvas.draw_str(
-                    n.lyric.as_str(),
-                    (x + 3.0, y + h - 3.0),
-                    &font,
-                    &note_text_paint,
-                );
-            }
-        }
+        return;
     }
 
-    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
-        let sig = self.sig;
-        event.map(|window_event, meta| match window_event {
-            WindowEvent::MouseDown(MouseButton::Left) => {
-                let bounds = cx.bounds();
-                let mx = cx.mouse().cursor_x - bounds.x;
-                let my = cx.mouse().cursor_y - bounds.y;
-                if mx < KEYBOARD_WIDTH {
-                    return;
+    let canvas_area = Rect {
+        x: area.x + KEYBOARD_W,
+        y: area.y,
+        w: area.w - KEYBOARD_W,
+        h: area.h - VEL_LANE_H,
+    };
+    let keyboard_area = Rect {
+        x: area.x,
+        y: area.y,
+        w: KEYBOARD_W,
+        h: area.h - VEL_LANE_H,
+    };
+    let vel_area = Rect {
+        x: area.x + KEYBOARD_W,
+        y: area.y + area.h - VEL_LANE_H,
+        w: area.w - KEYBOARD_W,
+        h: VEL_LANE_H,
+    };
+
+    draw_canvas(app, ui, canvas_area);
+    draw_keyboard(app, ui, keyboard_area);
+    draw_velocity_lane(app, ui, vel_area);
+    handle_input(app, ui, canvas_area);
+}
+
+fn draw_canvas(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
+    let zoom_x = app.pianoroll_zoom_x.max(4.0);
+    let zoom_y = app.pianoroll_zoom_y.max(6.0);
+    let scroll_beat = app.pianoroll_scroll_beat;
+    let top_pitch = app.pianoroll_top_pitch as f32;
+    let notes = app.note_boxes();
+    let playhead = app.playhead_beat;
+
+    ui.heavy("pr_canvas", |hctx| {
+        let key = (
+            area.w.to_bits(),
+            area.h.to_bits(),
+            zoom_x.to_bits(),
+            zoom_y.to_bits(),
+            scroll_beat.to_bits(),
+            top_pitch.to_bits(),
+            notes.len(),
+            playhead.unwrap_or(f32::NAN).to_bits(),
+        );
+        hctx.cached(key, |hctx| {
+            // 縦線 (拍 / 小節)
+            let mut bar_lines: Vec<LineSegment> = Vec::new();
+            let mut beat_lines: Vec<LineSegment> = Vec::new();
+            let visible_beats = area.w / zoom_x;
+            let first_beat = scroll_beat.floor() as i32;
+            let last_beat = (scroll_beat + visible_beats).ceil() as i32;
+            for beat in first_beat..=last_beat {
+                let x = area.x + (beat as f32 - scroll_beat) * zoom_x;
+                if x < area.x - 1.0 {
+                    continue;
                 }
-                let canvas_x = mx - KEYBOARD_WIDTH;
-                let zoom_x = sig.pianoroll_zoom_x.get_untracked();
-                let zoom_y = sig.pianoroll_zoom_y.get_untracked();
-                let scroll_beat = sig.pianoroll_scroll_beat.get_untracked();
-                let top_pitch = sig.pianoroll_top_pitch.get_untracked();
-                let shift = cx.modifiers().shift();
-                let Some((beat, pitch)) = Self::coord_to_beat_pitch(
-                    canvas_x, my, zoom_x, zoom_y, scroll_beat, top_pitch,
-                ) else {
-                    return;
-                };
-                let notes = sig.note_boxes.get_untracked();
-                if let Some(hit) = Self::hit_note(&notes, beat, pitch) {
-                    cx.emit(AppEvent::SelectNote {
-                        note: hit.note,
-                        additive: shift,
-                    });
-                    if shift {
-                        meta.consume();
-                        return;
-                    }
-                    let right_px =
-                        (hit.start_beat + hit.duration_beats - scroll_beat) * zoom_x;
-                    let from_right = right_px - canvas_x;
-                    *self.drag_origin_x.borrow_mut() = canvas_x;
-                    *self.drag_origin_y.borrow_mut() = my;
-                    cx.emit(AppEvent::PushUndoSnapshot);
-                    *self.drag.borrow_mut() = if from_right < NOTE_RESIZE_HANDLE_PX {
-                        Some(NoteDrag::Resize {
-                            note_idx: hit.note,
-                            original_duration: hit.duration_beats as f64,
-                        })
+                if x > area.x + area.w {
+                    break;
+                }
+                let seg = LineSegment {
+                    a: [x, area.y],
+                    b: [x, area.y + area.h],
+                    color: if beat % 4 == 0 {
+                        COLOR_BAR_GRID
                     } else {
-                        let mut snapshots: Vec<(u32, f64, u8)> = notes
-                            .iter()
-                            .filter(|n| n.selected)
-                            .map(|n| (n.note, n.start_beat as f64, n.pitch))
-                            .collect();
-                        if !snapshots.iter().any(|(idx, _, _)| *idx == hit.note) {
-                            snapshots.push((
-                                hit.note,
-                                hit.start_beat as f64,
-                                hit.pitch,
-                            ));
-                        }
-                        Some(NoteDrag::Move { snapshots })
-                    };
-                    cx.emit(AppEvent::BeginDrag);
-                    cx.capture();
-                    meta.consume();
+                        COLOR_GRID
+                    },
+                };
+                if beat % 4 == 0 {
+                    bar_lines.push(seg);
                 } else {
-                    if !shift {
-                        cx.emit(AppEvent::ClearNoteSelection);
-                    }
-                    *self.drag_origin_x.borrow_mut() = canvas_x;
-                    *self.drag_origin_y.borrow_mut() = my;
-                    *self.drag.borrow_mut() = Some(NoteDrag::Marquee {
-                        origin_x: canvas_x,
-                        origin_y: my,
-                        cur_x: canvas_x,
-                        cur_y: my,
-                    });
-                    cx.emit(AppEvent::BeginDrag);
-                    cx.capture();
-                    meta.consume();
+                    beat_lines.push(seg);
                 }
             }
-            WindowEvent::MouseDoubleClick(MouseButton::Left) => {
-                let bounds = cx.bounds();
-                let mx = cx.mouse().cursor_x - bounds.x;
-                let my = cx.mouse().cursor_y - bounds.y;
-                if mx < KEYBOARD_WIDTH {
-                    return;
-                }
-                let canvas_x = mx - KEYBOARD_WIDTH;
-                let zoom_x = sig.pianoroll_zoom_x.get_untracked();
-                let zoom_y = sig.pianoroll_zoom_y.get_untracked();
-                let scroll_beat = sig.pianoroll_scroll_beat.get_untracked();
-                let top_pitch = sig.pianoroll_top_pitch.get_untracked();
-                let Some((beat, pitch)) = Self::coord_to_beat_pitch(
-                    canvas_x, my, zoom_x, zoom_y, scroll_beat, top_pitch,
-                ) else {
-                    return;
-                };
-                let notes = sig.note_boxes.get_untracked();
-                if Self::hit_note(&notes, beat, pitch).is_some() {
-                    return;
-                }
-                let Some(target) = sig.selected_clip.get_untracked() else {
-                    return;
-                };
-                let snapped = (beat * 4.0).floor() / 4.0;
-                let snapped = snapped.max(0.0);
-                cx.emit(AppEvent::AddNote {
-                    track: target.track,
-                    clip: target.clip,
-                    start_beat: snapped,
-                    duration: DEFAULT_NOTE_DURATION,
-                    pitch,
+            if !beat_lines.is_empty() {
+                hctx.push_lines(LineBatch {
+                    segments: beat_lines,
+                    line_width_px: 1.0,
+                    clip_rect: Some(area),
                 });
-                meta.consume();
             }
-            WindowEvent::MouseMove(_, _) => {
-                let kind = match self.drag.borrow().clone() {
-                    Some(k) => k,
-                    None => return,
-                };
-                let Some(target): Option<ClipRef> = sig.selected_clip.get_untracked() else {
+            if !bar_lines.is_empty() {
+                hctx.push_lines(LineBatch {
+                    segments: bar_lines,
+                    line_width_px: 1.0,
+                    clip_rect: Some(area),
+                });
+            }
+
+            // 横線 (semitone)
+            let visible_pitch_count = (area.h / zoom_y).ceil() as i32;
+            let mut h_lines: Vec<LineSegment> = Vec::new();
+            for i in 0..=visible_pitch_count {
+                let y = area.y + (i as f32) * zoom_y;
+                if y > area.y + area.h {
+                    break;
+                }
+                h_lines.push(LineSegment {
+                    a: [area.x, y],
+                    b: [area.x + area.w, y],
+                    color: COLOR_GRID,
+                });
+            }
+            if !h_lines.is_empty() {
+                hctx.push_lines(LineBatch {
+                    segments: h_lines,
+                    line_width_px: 1.0,
+                    clip_rect: Some(area),
+                });
+            }
+
+            // ノート矩形
+            for n in &notes {
+                let pitch_offset = top_pitch - n.pitch as f32;
+                let y = area.y + pitch_offset * zoom_y;
+                if y + zoom_y < area.y || y > area.y + area.h {
+                    continue;
+                }
+                let x = area.x + (n.start_beat - scroll_beat) * zoom_x;
+                let w = (n.duration_beats * zoom_x).max(2.0);
+                if x + w < area.x || x > area.x + area.w {
+                    continue;
+                }
+                let body = if n.selected { COLOR_NOTE_SEL } else { COLOR_NOTE };
+                hctx.push_rect(RectCommand {
+                    rect: Rect { x, y: y + 1.0, w, h: zoom_y - 2.0 },
+                    fill: body,
+                    border: COLOR_NOTE_BORDER,
+                    border_width: 1.0,
+                    radius: [2.0; 4],
+                    clip_rect: Some(area),
+                });
+                if w > 18.0 && !n.lyric.is_empty() {
+                    hctx.label_at(
+                        ("pr_note_lyric", n.note as usize),
+                        &n.lyric,
+                        x + 3.0,
+                        y + zoom_y * 0.5 - 5.0,
+                        10.0,
+                        COLOR_NOTE_TEXT,
+                    );
+                }
+            }
+
+            // playhead
+            if let Some(b) = playhead {
+                let x = area.x + (b - scroll_beat) * zoom_x;
+                if x >= area.x && x <= area.x + area.w {
+                    hctx.push_lines(LineBatch {
+                        segments: vec![LineSegment {
+                            a: [x, area.y],
+                            b: [x, area.y + area.h],
+                            color: COLOR_PLAYHEAD,
+                        }],
+                        line_width_px: 1.5,
+                        clip_rect: Some(area),
+                    });
+                }
+            }
+        });
+    });
+}
+
+fn draw_keyboard(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
+    let zoom_y = app.pianoroll_zoom_y.max(6.0);
+    let top_pitch = app.pianoroll_top_pitch as i32;
+    let visible_pitches = (area.h / zoom_y).ceil() as i32;
+
+    ui.heavy("pr_keyboard", |hctx| {
+        hctx.cached(
+            (area.w.to_bits(), area.h.to_bits(), zoom_y.to_bits(), top_pitch),
+            |hctx| {
+                hctx.push_rect(RectCommand {
+                    rect: area,
+                    fill: COLOR_BG,
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [0.0; 4],
+                    clip_rect: None,
+                });
+                for i in 0..visible_pitches {
+                    let pitch = top_pitch - i;
+                    if !(0..=127).contains(&pitch) {
+                        continue;
+                    }
+                    let y = area.y + (i as f32) * zoom_y;
+                    let semitone = pitch.rem_euclid(12);
+                    let is_black = matches!(semitone, 1 | 3 | 6 | 8 | 10);
+                    let fill = if is_black { COLOR_KEY_B } else { COLOR_KEY_W };
+                    hctx.push_rect(RectCommand {
+                        rect: Rect {
+                            x: area.x,
+                            y,
+                            w: area.w,
+                            h: zoom_y - 1.0,
+                        },
+                        fill,
+                        border: COLOR_NOTE_BORDER,
+                        border_width: 0.5,
+                        radius: [0.0; 4],
+                        clip_rect: Some(area),
+                    });
+                    if semitone == 0 && zoom_y >= 10.0 {
+                        let octave = (pitch / 12) - 1;
+                        hctx.label_at(
+                            ("pr_key_label", pitch),
+                            &format!("C{octave}"),
+                            area.x + 4.0,
+                            y + zoom_y * 0.5 - 5.0,
+                            10.0,
+                            COLOR_KEY_TEXT,
+                        );
+                    }
+                }
+            },
+        );
+    });
+}
+
+fn draw_velocity_lane(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
+    let zoom_x = app.pianoroll_zoom_x.max(4.0);
+    let scroll_beat = app.pianoroll_scroll_beat;
+    let notes = app.note_boxes();
+
+    ui.heavy("pr_vel_lane", |hctx| {
+        let key = (
+            area.w.to_bits(),
+            area.h.to_bits(),
+            zoom_x.to_bits(),
+            scroll_beat.to_bits(),
+            notes.len(),
+        );
+        hctx.cached(key, |hctx| {
+            hctx.push_rect(RectCommand {
+                rect: area,
+                fill: COLOR_VEL_BG,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: None,
+            });
+            for n in &notes {
+                let x = area.x + (n.start_beat - scroll_beat) * zoom_x;
+                if x < area.x - 4.0 || x > area.x + area.w + 4.0 {
+                    continue;
+                }
+                let v = (n.velocity as f32) / 127.0;
+                let h = (area.h - 6.0) * v;
+                hctx.push_rect(RectCommand {
+                    rect: Rect {
+                        x: x - 1.5,
+                        y: area.y + area.h - 3.0 - h,
+                        w: 3.0,
+                        h,
+                    },
+                    fill: if n.selected {
+                        COLOR_NOTE_SEL
+                    } else {
+                        COLOR_VEL_BAR
+                    },
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [0.0; 4],
+                    clip_rect: Some(area),
+                });
+            }
+        });
+    });
+}
+
+fn handle_input(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
+    let pointer = ui.pointer();
+    let Some((px, py)) = pointer.pos else { return };
+    if !area.contains(px, py) {
+        return;
+    }
+    let zoom_x = app.pianoroll_zoom_x.max(4.0);
+    let zoom_y = app.pianoroll_zoom_y.max(6.0);
+    let scroll_beat = app.pianoroll_scroll_beat;
+    let top_pitch = app.pianoroll_top_pitch as i32;
+    let modifiers = pointer.modifiers;
+
+    ui.heavy("pr_input", |hctx| {
+        let (sx, sy) = pointer.scroll_delta;
+        if sy.abs() > 0.001 || sx.abs() > 0.001 {
+            if modifiers.ctrl {
+                let factor = (sy * 0.005).exp();
+                let new_zoom = (zoom_y * factor).clamp(6.0, 40.0);
+                hctx.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetPianoRollZoomY(new_zoom))
+                }));
+            } else if modifiers.shift {
+                let dx_beats = -(sx + sy) / zoom_x;
+                let new_scroll = (scroll_beat + dx_beats).max(0.0);
+                hctx.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetPianoRollScrollX(new_scroll))
+                }));
+            } else {
+                let delta = (sy / 12.0).round() as i32;
+                if delta != 0 {
+                    let new_top = (top_pitch + delta).clamp(11, 127) as u8;
+                    hctx.push_edit(Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetPianoRollTopPitch(new_top))
+                    }));
+                }
+            }
+        }
+
+        if pointer.primary_just_released {
+            let area_x = area.x;
+            let area_y = area.y;
+            let additive = modifiers.shift;
+            // 全ロジックを Edit::mutate 内に閉じ込めて last_click と同時参照。
+            hctx.push_edit(Edit::mutate(move |app: &mut AppData| {
+                let now = std::time::Instant::now();
+                let is_double = matches!(
+                    app.last_click,
+                    Some((t, lx, ly))
+                        if now.duration_since(t)
+                            < std::time::Duration::from_millis(400)
+                            && (px - lx).abs() < 5.0
+                            && (py - ly).abs() < 5.0
+                );
+
+                let zoom_x = app.pianoroll_zoom_x.max(4.0);
+                let zoom_y = app.pianoroll_zoom_y.max(6.0);
+                let scroll_beat = app.pianoroll_scroll_beat;
+                let top_pitch = app.pianoroll_top_pitch as i32;
+
+                let beat = ((px - area_x) / zoom_x + scroll_beat) as f64;
+                let pitch_offset_rows = ((py - area_y) / zoom_y) as i32;
+                let pitch = top_pitch - pitch_offset_rows;
+                if !(0..=127).contains(&pitch) {
+                    app.last_click = Some((now, px, py));
+                    return;
+                }
+
+                let Some(target) = app.selected_clip else {
+                    app.last_click = Some((now, px, py));
                     return;
                 };
-                let bounds = cx.bounds();
-                let mx = cx.mouse().cursor_x - bounds.x;
-                let my = cx.mouse().cursor_y - bounds.y;
-                let canvas_x = (mx - KEYBOARD_WIDTH).max(0.0);
-                let zoom_x = sig.pianoroll_zoom_x.get_untracked();
-                let zoom_y = sig.pianoroll_zoom_y.get_untracked();
-                let dx = canvas_x - *self.drag_origin_x.borrow();
-                let dbeat = (dx / zoom_x) as f64;
-                match kind {
-                    NoteDrag::Move { snapshots } => {
-                        let dy = my - *self.drag_origin_y.borrow();
-                        let drow = (dy / zoom_y).round() as i32;
-                        let entries: Vec<(u32, f64, u8)> = snapshots
-                            .iter()
-                            .map(|(idx, beat, pitch)| {
-                                let new_start = (beat + dbeat).max(0.0);
-                                let new_pitch = (*pitch as i32)
-                                    .saturating_sub(drow)
-                                    .clamp(0, 127)
-                                    as u8;
-                                (*idx, new_start, new_pitch)
-                            })
-                            .collect();
-                        cx.emit(AppEvent::SetNotePositions(entries));
-                    }
-                    NoteDrag::Resize {
-                        note_idx,
-                        original_duration,
-                    } => {
-                        let new_dur = (original_duration + dbeat).max(0.0625);
-                        cx.emit(AppEvent::ResizeNote {
+                let hit_idx: Option<u32> = app
+                    .song
+                    .tracks
+                    .get(target.track as usize)
+                    .and_then(|t| t.clips.get(target.clip as usize))
+                    .and_then(|c| {
+                        c.notes.iter().enumerate().find_map(|(i, n)| {
+                            if n.pitch as i32 == pitch
+                                && beat >= n.start_beat
+                                && beat <= n.start_beat + n.duration_beats
+                            {
+                                Some(i as u32)
+                            } else {
+                                None
+                            }
+                        })
+                    });
+
+                if is_double {
+                    if hit_idx.is_some() {
+                        // 既存ノートをダブルクリック: 何もしない (将来: ピッチ補正など)
+                    } else {
+                        // 空白ダブルクリック → AddNote (1/16 grid に snap)
+                        let snapped = ((beat * 4.0).floor() / 4.0).max(0.0);
+                        app.handle_event(AppEvent::AddNote {
                             track: target.track,
                             clip: target.clip,
-                            note: note_idx,
-                            duration: new_dur,
+                            start_beat: snapped,
+                            duration: DEFAULT_NOTE_DURATION,
+                            pitch: pitch as u8,
                         });
                     }
-                    NoteDrag::Marquee {
-                        origin_x, origin_y, ..
-                    } => {
-                        *self.drag.borrow_mut() = Some(NoteDrag::Marquee {
-                            origin_x,
-                            origin_y,
-                            cur_x: canvas_x,
-                            cur_y: my,
-                        });
-                    }
-                }
-            }
-            WindowEvent::MouseUp(MouseButton::Left) if self.drag.borrow().is_some() => {
-                let drag = self.drag.borrow_mut().take();
-                if let Some(NoteDrag::Marquee {
-                    origin_x,
-                    origin_y,
-                    cur_x,
-                    cur_y,
-                }) = drag
-                {
-                    let zoom_x = sig.pianoroll_zoom_x.get_untracked();
-                    let zoom_y = sig.pianoroll_zoom_y.get_untracked();
-                    let scroll_beat = sig.pianoroll_scroll_beat.get_untracked();
-                    let top_pitch = sig.pianoroll_top_pitch.get_untracked();
-                    let notes = sig.note_boxes.get_untracked();
-                    let x0 = origin_x.min(cur_x);
-                    let x1 = origin_x.max(cur_x);
-                    let y0 = origin_y.min(cur_y);
-                    let y1 = origin_y.max(cur_y);
-                    let beat0 = (x0 / zoom_x + scroll_beat).max(0.0);
-                    let beat1 = (x1 / zoom_x + scroll_beat).max(0.0);
-                    let row0 = (y0 / zoom_y) as i32;
-                    let row1 = (y1 / zoom_y) as i32;
-                    let pitch_high = top_pitch as i32 - row0;
-                    let pitch_low = top_pitch as i32 - row1;
-                    let hits: Vec<u32> = notes
-                        .iter()
-                        .filter(|n| {
-                            let p = n.pitch as i32;
-                            p >= pitch_low
-                                && p <= pitch_high
-                                && n.start_beat <= beat1
-                                && n.start_beat + n.duration_beats >= beat0
-                        })
-                        .map(|n| n.note)
-                        .collect();
-                    cx.emit(AppEvent::SetNoteSelection(hits));
-                }
-                cx.release();
-                cx.emit(AppEvent::EndDrag);
-            }
-            WindowEvent::MouseScroll(_, dy) => {
-                let mods = cx.modifiers();
-                if mods.ctrl() && mods.shift() {
-                    let z = sig.pianoroll_zoom_y.get_untracked();
-                    let new_z = (z * 1.15_f32.powf(*dy)).clamp(6.0, 40.0);
-                    cx.emit(AppEvent::SetPianoRollZoomY(new_z));
-                } else if mods.ctrl() {
-                    let z = sig.pianoroll_zoom_x.get_untracked();
-                    let new_z = (z * 1.15_f32.powf(*dy)).clamp(8.0, 400.0);
-                    cx.emit(AppEvent::SetPianoRollZoomX(new_z));
-                } else if mods.shift() {
-                    let s = sig.pianoroll_scroll_beat.get_untracked();
-                    let new_s = (s - dy * 1.0).max(0.0);
-                    cx.emit(AppEvent::SetPianoRollScrollX(new_s));
+                    app.last_click = None;
                 } else {
-                    let top = sig.pianoroll_top_pitch.get_untracked() as i32;
-                    let step = if *dy > 0.0 { 2 } else { -2 };
-                    let new_top = (top + step).clamp(11, 127) as u8;
-                    cx.emit(AppEvent::SetPianoRollTopPitch(new_top));
+                    if let Some(idx) = hit_idx {
+                        app.handle_event(AppEvent::SelectNote { note: idx, additive });
+                    } else if !additive {
+                        app.handle_event(AppEvent::ClearNoteSelection);
+                    }
+                    app.last_click = Some((now, px, py));
                 }
-                meta.consume();
-            }
-            _ => {}
-        });
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Velocity lane
-// ---------------------------------------------------------------------------
-
-const COLOR_VEL_BG: Color = Color::rgb(34, 34, 38);
-const COLOR_VEL_BAR: Color = Color::rgb(170, 200, 110);
-const COLOR_VEL_BAR_SELECTED: Color = Color::rgb(220, 240, 180);
-const VEL_BAR_WIDTH: f32 = 6.0;
-const VEL_HIT_TOLERANCE_PX: f32 = 4.0;
-
-#[derive(Clone, Copy, Debug)]
-struct VelocityDrag {
-    note_idx: u32,
-    drag_origin_y: f32,
-    original_velocity: u8,
-}
-
-pub struct VelocityLane {
-    drag: RefCell<Option<VelocityDrag>>,
-    sig: PianoRollSignals,
-}
-
-impl VelocityLane {
-    pub fn new(cx: &mut Context, sig: PianoRollSignals) -> Handle<'_, Self> {
-        Self {
-            drag: RefCell::new(None),
-            sig,
+            }));
         }
-        .build(cx, |_cx| {})
-        .bind(sig.note_boxes, |mut h| h.needs_redraw())
-        .bind(sig.pianoroll_zoom_x, |mut h| h.needs_redraw())
-        .bind(sig.pianoroll_scroll_beat, |mut h| h.needs_redraw())
-    }
-
-    fn hit_bar(
-        notes: &[NoteBox],
-        canvas_x: f32,
-        scroll_beat: f32,
-        zoom_x: f32,
-    ) -> Option<NoteBox> {
-        notes
-            .iter()
-            .map(|n| {
-                let bar_x = (n.start_beat - scroll_beat) * zoom_x;
-                (n, (bar_x - canvas_x).abs())
-            })
-            .filter(|(_, d)| *d <= VEL_HIT_TOLERANCE_PX + VEL_BAR_WIDTH * 0.5)
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(n, _)| n.clone())
-    }
-}
-
-impl View for VelocityLane {
-    fn element(&self) -> Option<&'static str> {
-        Some("velocity-lane")
-    }
-
-    fn draw(&self, cx: &mut DrawContext, canvas: &Canvas) {
-        let bounds = cx.bounds();
-        let scroll_beat = self.sig.pianoroll_scroll_beat.get_untracked();
-        let zoom_x = self.sig.pianoroll_zoom_x.get_untracked();
-        let notes = self.sig.note_boxes.get_untracked();
-
-        canvas.draw_rect(
-            rect(bounds.x, bounds.y, bounds.w, bounds.h),
-            &fill_paint(COLOR_VEL_BG),
-        );
-
-        let canvas_x0 = bounds.x + KEYBOARD_WIDTH;
-        let canvas_w = bounds.w - KEYBOARD_WIDTH;
-
-        let mut p = vg::PathBuilder::new();
-        p.move_to((canvas_x0, bounds.y + bounds.h - 1.0));
-        p.line_to((canvas_x0 + canvas_w, bounds.y + bounds.h - 1.0));
-        let p = p.detach();
-        canvas.draw_path(&p, &stroke_paint(COLOR_GRID, 1.0));
-
-        for n in &notes {
-            let bar_center =
-                canvas_x0 + (n.start_beat - scroll_beat) * zoom_x;
-            let bar_x = bar_center - VEL_BAR_WIDTH * 0.5;
-            if bar_x + VEL_BAR_WIDTH < canvas_x0 || bar_x > canvas_x0 + canvas_w {
-                continue;
-            }
-            let usable_h = (bounds.h - 2.0).max(1.0);
-            let bar_h = usable_h * (n.velocity as f32 / 127.0).clamp(0.0, 1.0);
-            let bar_y = bounds.y + bounds.h - bar_h;
-            let color = if n.selected {
-                COLOR_VEL_BAR_SELECTED
-            } else {
-                COLOR_VEL_BAR
-            };
-            canvas.draw_rect(rect(bar_x, bar_y, VEL_BAR_WIDTH, bar_h), &fill_paint(color));
-        }
-    }
-
-    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
-        let sig = self.sig;
-        event.map(|window_event, meta| match window_event {
-            WindowEvent::MouseDown(MouseButton::Left) => {
-                let bounds = cx.bounds();
-                let mx = cx.mouse().cursor_x - bounds.x;
-                let my = cx.mouse().cursor_y - bounds.y;
-                if mx < KEYBOARD_WIDTH {
-                    return;
-                }
-                let canvas_x = mx - KEYBOARD_WIDTH;
-                let zoom_x = sig.pianoroll_zoom_x.get_untracked();
-                let scroll_beat = sig.pianoroll_scroll_beat.get_untracked();
-                let notes = sig.note_boxes.get_untracked();
-                let Some(hit) = Self::hit_bar(&notes, canvas_x, scroll_beat, zoom_x)
-                else {
-                    return;
-                };
-                cx.emit(AppEvent::PushUndoSnapshot);
-                *self.drag.borrow_mut() = Some(VelocityDrag {
-                    note_idx: hit.note,
-                    drag_origin_y: my,
-                    original_velocity: hit.velocity,
-                });
-                cx.capture();
-                meta.consume();
-            }
-            WindowEvent::MouseMove(_, _) => {
-                let drag = match *self.drag.borrow() {
-                    Some(d) => d,
-                    None => return,
-                };
-                let bounds = cx.bounds();
-                let my = cx.mouse().cursor_y - bounds.y;
-                let dy = drag.drag_origin_y - my;
-                let usable_h = (bounds.h - 2.0).max(1.0);
-                let delta = (dy / usable_h * 127.0).round() as i32;
-                let new_vel = (drag.original_velocity as i32 + delta).clamp(0, 127) as u8;
-                cx.emit(AppEvent::SetNoteVelocity {
-                    note: drag.note_idx,
-                    velocity: new_vel,
-                });
-            }
-            WindowEvent::MouseUp(MouseButton::Left) if self.drag.borrow().is_some() => {
-                *self.drag.borrow_mut() = None;
-                cx.release();
-                cx.emit(AppEvent::EndDrag);
-            }
-            _ => {}
-        });
-    }
+    });
 }

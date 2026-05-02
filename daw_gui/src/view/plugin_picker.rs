@@ -1,97 +1,171 @@
-//! Modal plugin picker overlay. Displays every entry from the plugin
-//! database as a clickable row; selecting one emits
-//! `AppEvent::SelectPluginFromDb` which swaps in the corresponding plugin.
+//! Plugin picker (modal overlay)。半透明背景 + 中央パネル + plugin リスト。
+//!
+//! is_plugin_picker_open == true のときだけ root.rs から呼ぶ。
 
-use vizia::prelude::*;
+use daw_ui_core::{Edit, Ui};
+use daw_ui_platform::PhysicalSize;
+use daw_ui_renderer::{Color, Rect, RectCommand};
 
-use crate::app::{AppEvent, PluginPickEntry};
+use crate::app::{AppData, AppEvent};
 
-#[derive(Copy, Clone)]
-pub struct PluginPickerSignals {
-    pub plugin_picker_visible: Signal<Vec<PluginPickEntry>>,
-    pub is_rescanning: Signal<bool>,
-}
+const COLOR_OVERLAY: Color = Color { r: 0.0, g: 0.0, b: 0.0, a: 0.6 };
+const COLOR_PANEL_BG: Color = Color { r: 0.18, g: 0.18, b: 0.22, a: 1.0 };
+const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
+const COLOR_TEXT_DIM: Color = Color { r: 0.65, g: 0.68, b: 0.72, a: 1.0 };
+const COLOR_TEXT_FORMAT: Color = Color { r: 0.55, g: 0.78, b: 0.95, a: 1.0 };
+const COLOR_ROW_BG: Color = Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 };
 
-pub struct PluginPickerView;
+const PANEL_W: f32 = 520.0;
+const PANEL_H: f32 = 460.0;
+const TITLE_H: f32 = 36.0;
+const ROW_H: f32 = 26.0;
 
-impl PluginPickerView {
-    pub fn new(cx: &mut Context, sig: PluginPickerSignals) -> Handle<'_, Self> {
-        Self.build(cx, move |cx| {
-            VStack::new(cx, move |cx| {
-                // Title row: "Select Plugin" + Rescan + close buttons.
-                HStack::new(cx, move |cx| {
-                    Label::new(cx, "Select Plugin")
-                        .font_size(16.0)
-                        .color(Color::rgb(230, 230, 230));
-                    Element::new(cx).width(Stretch(1.0));
-                    Button::new(cx, move |cx| {
-                        Label::new(
-                            cx,
-                            sig.is_rescanning.map(|r: &bool| {
-                                if *r { "Rescanning..." } else { "Rescan" }.to_string()
-                            }),
-                        )
-                        .color(Color::rgb(230, 230, 230))
-                    })
-                    .on_press(|ex| ex.emit(AppEvent::RescanPluginDb))
-                    .background_color(Color::rgb(55, 55, 60))
-                    .padding(Pixels(4.0));
-                    Button::new(cx, |cx| Label::new(cx, "✕"))
-                        .on_press(|ex| ex.emit(AppEvent::ClosePluginPicker));
-                })
-                .alignment(Alignment::Center)
-                .padding(Pixels(8.0))
-                .gap(Pixels(6.0))
-                .height(Pixels(40.0));
+pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
+    let sw = screen.width as f32;
+    let sh = screen.height as f32;
 
-                ScrollView::new(cx, move |cx| {
-                    List::new(cx, sig.plugin_picker_visible, |cx, _idx, item| {
-                        Button::new(cx, move |cx| {
-                            HStack::new(cx, move |cx| {
-                                Label::new(cx, item.map(|e| e.name.clone()))
-                                    .color(Color::rgb(230, 230, 230));
-                                Element::new(cx).width(Stretch(1.0));
-                                Label::new(cx, item.map(|e| e.vendor.clone()))
-                                    .color(Color::rgb(170, 170, 170))
-                                    .font_size(11.0);
-                                Label::new(cx, item.map(|e| e.format_label.clone()))
-                                    .color(Color::rgb(140, 180, 220))
-                                    .font_size(10.0)
-                                    .width(Pixels(44.0));
-                            })
-                            .alignment(Alignment::Center)
-                            .gap(Pixels(6.0))
-                            .padding(Pixels(4.0))
-                        })
-                        .on_press(move |ex| {
-                            let id = item.get().id.clone();
-                            ex.emit(AppEvent::SelectPluginFromDb(id));
-                        })
-                        .background_color(Color::rgb(55, 55, 60))
-                        .width(Stretch(1.0))
-                        .height(Pixels(28.0));
-                    })
-                    .class("plugin-picker-list")
-                    .gap(Pixels(2.0));
-                })
-                .height(Stretch(1.0))
-                .background_color(Color::rgb(30, 30, 34));
-            })
-            .width(Pixels(480.0))
-            .height(Pixels(420.0))
-            .background_color(Color::rgb(40, 40, 44))
-            .padding(Pixels(8.0));
-        })
-        .position_type(PositionType::Absolute)
-        .alignment(Alignment::Center)
-        .width(Stretch(1.0))
-        .height(Stretch(1.0))
-        .background_color(Color::rgba(0, 0, 0, 160))
+    // 半透明全画面オーバーレイ
+    ui.heavy("pp_overlay", |hctx| {
+        hctx.cached((sw.to_bits(), sh.to_bits()), |hctx| {
+            hctx.push_rect(RectCommand {
+                rect: Rect { x: 0.0, y: 0.0, w: sw, h: sh },
+                fill: COLOR_OVERLAY,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: None,
+            });
+        });
+    });
+
+    let panel_x = (sw - PANEL_W) * 0.5;
+    let panel_y = (sh - PANEL_H) * 0.5;
+    let panel = Rect { x: panel_x, y: panel_y, w: PANEL_W, h: PANEL_H };
+
+    // パネル背景
+    ui.heavy("pp_panel_bg", |hctx| {
+        hctx.cached(0u8, |hctx| {
+            hctx.push_rect(RectCommand {
+                rect: panel,
+                fill: COLOR_PANEL_BG,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [6.0; 4],
+                clip_rect: None,
+            });
+        });
+    });
+
+    let pad = 12.0;
+    // タイトル + Rescan / Close
+    ui.label_at(
+        "pp_title",
+        "Select Plugin",
+        panel_x + pad,
+        panel_y + pad,
+        16.0,
+        COLOR_TEXT,
+    );
+    let rescan_w = 90.0;
+    let close_w = 32.0;
+    let rescan_x = panel_x + PANEL_W - pad - rescan_w - 6.0 - close_w;
+    let close_x = panel_x + PANEL_W - pad - close_w;
+    let is_rescanning = app.is_rescanning;
+    ui.button_at(
+        "pp_rescan",
+        if is_rescanning { "Rescanning" } else { "Rescan" },
+        Rect { x: rescan_x, y: panel_y + pad - 2.0, w: rescan_w, h: 24.0 },
+        || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::RescanPluginDb)),
+    );
+    ui.button_at(
+        "pp_close",
+        "x",
+        Rect { x: close_x, y: panel_y + pad - 2.0, w: close_w, h: 24.0 },
+        || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ClosePluginPicker)),
+    );
+
+    // 一覧 (リストを下方向に配置)
+    let list_x = panel_x + pad;
+    let list_y = panel_y + TITLE_H + 6.0;
+    let list_w = PANEL_W - pad * 2.0;
+    let list_h = PANEL_H - TITLE_H - 6.0 - pad;
+    let visible = &app.plugin_picker_visible;
+    if visible.is_empty() {
+        ui.label_at(
+            "pp_empty",
+            "(\u{8a72}\u{5f53}\u{30d7}\u{30e9}\u{30b0}\u{30a4}\u{30f3}\u{306a}\u{3057})",
+            list_x,
+            list_y + 8.0,
+            12.0,
+            COLOR_TEXT_DIM,
+        );
+        return;
     }
-}
 
-impl View for PluginPickerView {
-    fn element(&self) -> Option<&'static str> {
-        Some("plugin-picker")
+    let max_rows = (list_h / (ROW_H + 2.0)).floor() as usize;
+    for (i, entry) in visible.iter().take(max_rows).enumerate() {
+        let row_y = list_y + (i as f32) * (ROW_H + 2.0);
+        let row_rect = Rect { x: list_x, y: row_y, w: list_w, h: ROW_H };
+        let id_clone = entry.id.clone();
+
+        // 行背景
+        ui.heavy(("pp_row_bg", i), |hctx| {
+            hctx.cached(i, |hctx| {
+                hctx.push_rect(RectCommand {
+                    rect: row_rect,
+                    fill: COLOR_ROW_BG,
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [3.0; 4],
+                    clip_rect: None,
+                });
+            });
+        });
+
+        // 名前 (clickable button) — 行全幅
+        ui.button_at(
+            ("pp_row_btn", i),
+            &entry.name,
+            row_rect,
+            move || {
+                let id_clone = id_clone.clone();
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SelectPluginFromDb(id_clone))
+                })
+            },
+        );
+
+        // ベンダ + フォーマットラベル overlay (button のテキストの右側、装飾のみ)
+        ui.label_at(
+            ("pp_row_vendor", i),
+            &entry.vendor,
+            list_x + list_w - 200.0,
+            row_y + 6.0,
+            10.0,
+            COLOR_TEXT_DIM,
+        );
+        ui.label_at(
+            ("pp_row_format", i),
+            &entry.format_label,
+            list_x + list_w - 50.0,
+            row_y + 6.0,
+            10.0,
+            COLOR_TEXT_FORMAT,
+        );
+    }
+
+    if visible.len() > max_rows {
+        ui.label_at(
+            "pp_more",
+            &format!(
+                "({} \u{4ef6}\u{8868}\u{793a}中 / 全 {} 件)",
+                max_rows,
+                visible.len()
+            ),
+            list_x,
+            panel_y + PANEL_H - pad - 12.0,
+            10.0,
+            COLOR_TEXT_DIM,
+        );
     }
 }

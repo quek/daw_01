@@ -1,688 +1,575 @@
-//! Arrangement view: track headers on the left, timeline canvas on the
-//! right. Each clip is a rectangle the user can drag (move) or grab the
-//! right edge of (resize). Empty-area double-click creates a new clip.
+//! Arrangement view (左: track headers / 右: timeline canvas)。
+//!
+//! 現状の対応:
+//! - 描画: 背景 / ルーラ / レーン罫線 / バー罫線 / クリップ矩形 / playhead / loop band
+//! - クリック (canvas 内): クリップ HIT → SelectClip (Shift で additive)
+//! - クリック (track header): SelectTrack
+//! - クリック (mute/solo): ToggleTrackMute / ToggleTrackSolo
+//! - ダブルクリック: クリップ → ピアノロール / 空白 → CreateClip
+//! - Wheel: 横スクロール / Ctrl+Wheel: 横ズーム
+//!
+//! TODO (次イテレーション): drag move / resize / marquee / track rename /
+//! loop band drag。
 
-use std::cell::RefCell;
+use daw_ui_core::{Edit, Ui};
+use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
 
-use vizia::prelude::*;
-use vizia::vg;
+use crate::app::{ARRANGE_TRACK_HEIGHT, AppData, AppEvent, ClipRef};
 
-use crate::app::{ARRANGE_TRACK_HEIGHT, AppEvent, ClipBox, ClipRef, TrackHeader};
+const TRACK_HEADER_W: f32 = 160.0;
+const RULER_H: f32 = 20.0;
 
-const TRACK_HEADER_WIDTH: f32 = 160.0;
-const RESIZE_HANDLE_PX: f32 = 6.0;
-const RULER_HEIGHT: f32 = 20.0;
-/// Maximum song length (in beats) the canvas tries to render.
-const MAX_BEATS: f32 = 256.0;
+const COLOR_BG: Color = Color { r: 0.11, g: 0.11, b: 0.13, a: 1.0 };
+const COLOR_RULER_BG: Color = Color { r: 0.14, g: 0.14, b: 0.16, a: 1.0 };
+const COLOR_HEADER_BG: Color = Color { r: 0.16, g: 0.16, b: 0.18, a: 1.0 };
+const COLOR_HEADER_SELECTED: Color = Color { r: 0.27, g: 0.35, b: 0.48, a: 1.0 };
+const COLOR_LANE_LINE: Color = Color { r: 0.19, g: 0.19, b: 0.22, a: 1.0 };
+const COLOR_BAR_LINE: Color = Color { r: 0.24, g: 0.24, b: 0.28, a: 1.0 };
+const COLOR_CLIP: Color = Color { r: 0.27, g: 0.51, b: 0.71, a: 0.92 };
+const COLOR_CLIP_SELECTED: Color = Color { r: 0.47, g: 0.71, b: 0.90, a: 0.95 };
+const COLOR_CLIP_BORDER: Color = Color { r: 0.08, g: 0.08, b: 0.12, a: 1.0 };
+const COLOR_CLIP_TEXT: Color = Color { r: 0.94, g: 0.94, b: 0.94, a: 1.0 };
+const COLOR_HEADER_TEXT: Color = Color { r: 0.85, g: 0.88, b: 0.92, a: 1.0 };
+const COLOR_PLAYHEAD: Color = Color { r: 0.90, g: 0.30, b: 0.30, a: 1.0 };
+const COLOR_LOOP_BAND: Color = Color { r: 0.31, g: 0.78, b: 0.90, a: 0.30 };
+const COLOR_LOOP_EDGE: Color = Color { r: 0.31, g: 0.78, b: 0.90, a: 1.0 };
+const COLOR_BTN_NEUTRAL: Color = Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 };
+const COLOR_BTN_MUTE: Color = Color { r: 0.78, g: 0.35, b: 0.27, a: 1.0 };
+const COLOR_BTN_SOLO: Color = Color { r: 0.90, g: 0.78, b: 0.31, a: 1.0 };
 
-const COLOR_BG: Color = Color::rgb(28, 28, 32);
-const COLOR_LANE_LINE: Color = Color::rgb(48, 48, 56);
-const COLOR_BAR_LINE: Color = Color::rgb(60, 60, 70);
-const COLOR_PLAYHEAD: Color = Color::rgb(220, 70, 70);
-const COLOR_CLIP: Color = Color::rgb(70, 130, 180);
-const COLOR_CLIP_SELECTED: Color = Color::rgb(120, 180, 230);
-const COLOR_CLIP_BORDER: Color = Color::rgb(20, 20, 28);
-const COLOR_CLIP_TEXT: Color = Color::rgb(240, 240, 240);
-const COLOR_RULER_BG: Color = Color::rgb(36, 36, 40);
-
-fn skia_rgba(c: Color) -> vg::Color {
-    vg::Color::from_argb(c.a(), c.r(), c.g(), c.b())
-}
-
-fn fill_paint(c: Color) -> vg::Paint {
-    let mut p = vg::Paint::default();
-    p.set_color(skia_rgba(c));
-    p.set_anti_alias(false);
-    p
-}
-
-fn stroke_paint(c: Color, width: f32) -> vg::Paint {
-    let mut p = vg::Paint::default();
-    p.set_color(skia_rgba(c));
-    p.set_stroke_width(width);
-    p.set_style(vg::PaintStyle::Stroke);
-    p.set_anti_alias(false);
-    p
-}
-
-fn rect(x: f32, y: f32, w: f32, h: f32) -> vg::Rect {
-    vg::Rect::new(x, y, x + w, y + h)
-}
-
-#[derive(Copy, Clone)]
-pub struct ArrangementSignals {
-    pub track_headers: Memo<Vec<TrackHeader>>,
-    pub track_rename_idx: Signal<Option<u32>>,
-    pub track_rename_text: Signal<String>,
-    pub clip_boxes: Memo<Vec<ClipBox>>,
-    pub track_count: Memo<u32>,
-    pub arrange_zoom_x: Signal<f32>,
-    pub arrange_scroll_beat: Signal<f32>,
-    pub playhead_beat: Signal<Option<f32>>,
-    pub loop_start_beat: Memo<f32>,
-    pub loop_end_beat: Memo<f32>,
-}
-
-pub struct ArrangementView;
-
-impl ArrangementView {
-    pub fn new(cx: &mut Context, sig: ArrangementSignals) -> Handle<'_, Self> {
-        Self.build(cx, move |cx| {
-            HStack::new(cx, move |cx| {
-                build_track_headers(cx, sig);
-                ArrangementCanvas::new(cx, sig)
-                    .width(Stretch(1.0))
-                    .height(Stretch(1.0));
+pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
+    // 全体背景
+    ui.heavy("arr_bg", |hctx| {
+        hctx.cached((area.w.to_bits(), area.h.to_bits()), |hctx| {
+            hctx.push_rect(RectCommand {
+                rect: area,
+                fill: COLOR_BG,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: None,
             });
-        })
-    }
-}
-
-impl View for ArrangementView {
-    fn element(&self) -> Option<&'static str> {
-        Some("arrangement-view")
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Track headers panel
-// ---------------------------------------------------------------------------
-
-fn build_track_headers(cx: &mut Context, sig: ArrangementSignals) {
-    VStack::new(cx, move |cx| {
-        Element::new(cx)
-            .width(Stretch(1.0))
-            .height(Pixels(RULER_HEIGHT))
-            .background_color(Color::rgb(36, 36, 40));
-        List::new(cx, sig.track_headers, move |cx, _idx, item| {
-            track_header_row(cx, item, sig);
-        })
-        .class("track-headers-list")
-        .width(Stretch(1.0));
-    })
-    .width(Pixels(TRACK_HEADER_WIDTH))
-    .background_color(Color::rgb(40, 40, 44));
-}
-
-fn track_header_row(cx: &mut Context, item: Signal<TrackHeader>, sig: ArrangementSignals) {
-    VStack::new(cx, move |cx| {
-        track_header_top_row(cx, item, sig);
-        track_header_bottom_row(cx, item);
-    })
-    .padding(Pixels(2.0))
-    .gap(Pixels(2.0))
-    .height(Pixels(ARRANGE_TRACK_HEIGHT));
-}
-
-fn track_header_top_row(cx: &mut Context, item: Signal<TrackHeader>, sig: ArrangementSignals) {
-    HStack::new(cx, move |cx| {
-        // Either a click-to-select Button (default) or a Textbox (when
-        // this row is in rename mode). The branch flips inside a Binding
-        // so toggling rename only rebuilds the name cell.
-        Binding::new(cx, sig.track_rename_idx, move |cx| {
-            let editing_idx = sig.track_rename_idx.get();
-            let this_idx: u32 = item.get().index;
-            if editing_idx == Some(this_idx) {
-                Textbox::new(cx, sig.track_rename_text)
-                    .on_edit(|ex, text| ex.emit(AppEvent::RenameTrackChanged(text)))
-                    .on_submit(|ex, _, _| ex.emit(AppEvent::CommitRenameTrack))
-                    .on_cancel(|ex| ex.emit(AppEvent::CancelRenameTrack))
-                    .width(Stretch(1.0))
-                    .height(Pixels(24.0))
-                    .focused(true);
-            } else {
-                Button::new(cx, move |cx| {
-                    Label::new(cx, item.map(|h| h.name.clone())).font_size(11.0)
-                })
-                .on_press(move |ex| {
-                    let h = item.get();
-                    ex.emit(AppEvent::SelectTrack(h.index));
-                })
-                .on_double_click(move |ex, _| {
-                    let h = item.get();
-                    ex.emit(AppEvent::BeginRenameTrack(h.index));
-                })
-                .background_color(item.map(|h| {
-                    if h.selected {
-                        Color::rgb(70, 90, 120)
-                    } else {
-                        Color::rgb(48, 48, 52)
-                    }
-                }))
-                .width(Stretch(1.0))
-                .height(Pixels(24.0));
-            }
         });
+    });
 
-        Button::new(cx, |cx| Label::new(cx, "M").font_size(10.0))
-            .on_press(move |ex| {
-                let h = item.get();
-                ex.emit(AppEvent::ToggleTrackMute(h.index));
-            })
-            .background_color(item.map(|h| {
-                if h.muted {
-                    Color::rgb(200, 90, 70)
-                } else {
-                    Color::rgb(55, 55, 60)
-                }
-            }))
-            .width(Pixels(20.0))
-            .height(Pixels(20.0));
+    let header_area = Rect {
+        x: area.x,
+        y: area.y,
+        w: TRACK_HEADER_W,
+        h: area.h,
+    };
+    let canvas_area = Rect {
+        x: area.x + TRACK_HEADER_W,
+        y: area.y,
+        w: area.w - TRACK_HEADER_W,
+        h: area.h,
+    };
 
-        Button::new(cx, |cx| Label::new(cx, "S").font_size(10.0))
-            .on_press(move |ex| {
-                let h = item.get();
-                ex.emit(AppEvent::ToggleTrackSolo(h.index));
-            })
-            .background_color(item.map(|h| {
-                if h.solo {
-                    Color::rgb(230, 200, 80)
-                } else {
-                    Color::rgb(55, 55, 60)
-                }
-            }))
-            .width(Pixels(20.0))
-            .height(Pixels(20.0));
-    })
-    .gap(Pixels(2.0))
-    .alignment(Alignment::Center)
-    .height(Pixels(24.0));
+    draw_canvas(app, ui, canvas_area);
+    draw_track_headers(app, ui, header_area);
+
+    // 入力処理: pointer.pos が canvas_area 内なら hit-test。pointer events は
+    // ui.pointer() から取れるが、push_edit でモデル変更を流す。
+    handle_canvas_input(app, ui, canvas_area);
 }
 
-fn track_header_bottom_row(cx: &mut Context, item: Signal<TrackHeader>) {
-    HStack::new(cx, move |cx| {
-        Button::new(cx, |cx| Label::new(cx, "▲").font_size(10.0))
-            .on_press(move |ex| {
-                let h = item.get();
-                ex.emit(AppEvent::MoveTrackUp(h.index));
-            })
-            .background_color(Color::rgb(55, 55, 60))
-            .width(Pixels(22.0))
-            .height(Pixels(18.0));
+fn draw_canvas(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
+    let zoom = app.arrange_zoom_x.max(1.0);
+    let scroll_beat = app.arrange_scroll_beat.max(0.0);
+    let track_count = app.song.tracks.len() as u32;
+    let playhead = app.playhead_beat;
+    let loop_start = app.loop_start_beat();
+    let loop_end = app.loop_end_beat();
+    let selected_clips = app.selected_clips.clone();
 
-        Button::new(cx, |cx| Label::new(cx, "▼").font_size(10.0))
-            .on_press(move |ex| {
-                let h = item.get();
-                ex.emit(AppEvent::MoveTrackDown(h.index));
-            })
-            .background_color(Color::rgb(55, 55, 60))
-            .width(Pixels(22.0))
-            .height(Pixels(18.0));
-
-        Element::new(cx).width(Stretch(1.0));
-
-        Button::new(cx, |cx| Label::new(cx, "✕").font_size(10.0))
-            .on_press(move |ex| {
-                let h = item.get();
-                ex.emit(AppEvent::DeleteTrack(h.index));
-            })
-            .background_color(Color::rgb(80, 50, 50))
-            .width(Pixels(22.0))
-            .height(Pixels(18.0));
-    })
-    .gap(Pixels(2.0))
-    .alignment(Alignment::Center)
-    .height(Pixels(18.0));
-}
-
-// ---------------------------------------------------------------------------
-// Custom canvas
-// ---------------------------------------------------------------------------
-
-const COLOR_LOOP_BAND: Color = Color::rgba(80, 200, 230, 80);
-const COLOR_LOOP_EDGE: Color = Color::rgb(80, 200, 230);
-
-#[derive(Clone, Debug)]
-enum DragKind {
-    LoopRange {
-        start_beat: f64,
-    },
-    MoveClips {
-        snapshots: Vec<(ClipRef, f64)>,
-    },
-    ResizeClip {
-        clip: ClipRef,
-        original_length_beats: f64,
-    },
-    Marquee {
-        origin_x: f32,
-        origin_y: f32,
-        cur_x: f32,
-        cur_y: f32,
-    },
-}
-
-pub struct ArrangementCanvas {
-    drag: RefCell<Option<DragKind>>,
-    drag_origin_x: RefCell<f32>,
-    sig: ArrangementSignals,
-}
-
-impl ArrangementCanvas {
-    pub fn new(cx: &mut Context, sig: ArrangementSignals) -> Handle<'_, Self> {
-        Self {
-            drag: RefCell::new(None),
-            drag_origin_x: RefCell::new(0.0),
-            sig,
-        }
-        .build(cx, |_cx| {})
-        .bind(sig.clip_boxes, |mut handle| handle.needs_redraw())
-        .bind(sig.track_count, |mut handle| handle.needs_redraw())
-        .bind(sig.arrange_zoom_x, |mut handle| handle.needs_redraw())
-        .bind(sig.arrange_scroll_beat, |mut handle| handle.needs_redraw())
-        .bind(sig.playhead_beat, |mut handle| handle.needs_redraw())
-        .bind(sig.loop_start_beat, |mut handle| handle.needs_redraw())
-        .bind(sig.loop_end_beat, |mut handle| handle.needs_redraw())
-    }
-
-    fn coord_to_beat_track(
-        mx: f32,
-        my: f32,
-        zoom: f32,
-        scroll_beat: f32,
-    ) -> Option<(f64, u32)> {
-        if my < RULER_HEIGHT {
-            return None;
-        }
-        let beat = mx / zoom + scroll_beat;
-        let track = ((my - RULER_HEIGHT) / ARRANGE_TRACK_HEIGHT) as u32;
-        Some((beat as f64, track))
-    }
-
-    fn hit_clip(clip_boxes: &[ClipBox], beat: f64, track: u32) -> Option<ClipBox> {
-        clip_boxes
-            .iter()
-            .find(|c| {
-                c.track == track
-                    && (beat as f32) >= c.start_beat
-                    && (beat as f32) <= c.start_beat + c.length_beats
-            })
-            .cloned()
-    }
-}
-
-impl View for ArrangementCanvas {
-    fn element(&self) -> Option<&'static str> {
-        Some("arrangement-canvas")
-    }
-
-    fn draw(&self, cx: &mut DrawContext, canvas: &Canvas) {
-        let bounds = cx.bounds();
-        let zoom = self.sig.arrange_zoom_x.get_untracked();
-        let scroll_beat = self.sig.arrange_scroll_beat.get_untracked();
-        let track_count = self.sig.track_count.get_untracked();
-        let clip_boxes = self.sig.clip_boxes.get_untracked();
-        let playhead = self.sig.playhead_beat.get_untracked();
-
-        canvas.draw_rect(
-            rect(bounds.x, bounds.y, bounds.w, bounds.h),
-            &fill_paint(COLOR_BG),
+    ui.heavy("arr_canvas", |hctx| {
+        // viewport_key: 描画に影響する状態をすべて含める。
+        let key = (
+            area.w.to_bits(),
+            area.h.to_bits(),
+            zoom.to_bits(),
+            scroll_beat.to_bits(),
+            track_count,
+            playhead.unwrap_or(f32::NAN).to_bits(),
+            loop_start.to_bits(),
+            loop_end.to_bits(),
+            // クリップの集合 hash も含めたいが簡略化: 数とトラック数で代用。
+            // 実際に再構築の cost は大きくないのでクリップ list のサマリで OK。
+            app.song.tracks.iter().map(|t| t.clips.len()).sum::<usize>(),
+            selected_clips.len(),
         );
+        hctx.cached(key, |hctx| {
+            // 背景 (canvas 部分)。
+            hctx.push_rect(RectCommand {
+                rect: area,
+                fill: COLOR_BG,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: None,
+            });
+            // ルーラ背景。
+            hctx.push_rect(RectCommand {
+                rect: Rect { x: area.x, y: area.y, w: area.w, h: RULER_H },
+                fill: COLOR_RULER_BG,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: None,
+            });
 
-        canvas.draw_rect(
-            rect(bounds.x, bounds.y, bounds.w, RULER_HEIGHT),
-            &fill_paint(COLOR_RULER_BG),
-        );
-
-        let loop_start = self.sig.loop_start_beat.get_untracked();
-        let loop_end = self.sig.loop_end_beat.get_untracked();
-        if loop_end > loop_start {
-            let lx = bounds.x + (loop_start - scroll_beat) * zoom;
-            let lw = (loop_end - loop_start) * zoom;
-            let visible_x = lx.max(bounds.x);
-            let visible_right = (lx + lw).min(bounds.x + bounds.w);
-            let visible_w = visible_right - visible_x;
-            if visible_w > 0.0 {
-                canvas.draw_rect(
-                    rect(visible_x, bounds.y, visible_w, RULER_HEIGHT),
-                    &fill_paint(COLOR_LOOP_BAND),
-                );
-                let edge_paint = stroke_paint(COLOR_LOOP_EDGE, 1.5);
-                let mut p = vg::PathBuilder::new();
-                if lx >= bounds.x && lx <= bounds.x + bounds.w {
-                    p.move_to((lx, bounds.y));
-                    p.line_to((lx, bounds.y + RULER_HEIGHT));
-                }
-                let rx = lx + lw;
-                if rx >= bounds.x && rx <= bounds.x + bounds.w {
-                    p.move_to((rx, bounds.y));
-                    p.line_to((rx, bounds.y + RULER_HEIGHT));
-                }
-                let p = p.detach();
-                canvas.draw_path(&p, &edge_paint);
-            }
-        }
-
-        let bar_paint = stroke_paint(COLOR_BAR_LINE, 1.0);
-        let beats_per_bar = 4u32;
-        let first_bar = ((scroll_beat as i32) / beats_per_bar as i32).max(0);
-        let visible_beats = bounds.w / zoom;
-        let last_bar = ((scroll_beat + visible_beats) as u32 / beats_per_bar) + 1;
-        for bar in first_bar..=(last_bar as i32) {
-            let beat = (bar * beats_per_bar as i32) as f32;
-            let x = bounds.x + (beat - scroll_beat) * zoom;
-            if x < bounds.x - 1.0 {
-                continue;
-            }
-            if x > bounds.x + bounds.w {
-                break;
-            }
-            let mut p = vg::PathBuilder::new();
-            p.move_to((x, bounds.y));
-            p.line_to((x, bounds.y + bounds.h));
-            let p = p.detach();
-            canvas.draw_path(&p, &bar_paint);
-        }
-
-        let lane_paint = stroke_paint(COLOR_LANE_LINE, 1.0);
-        for i in 0..=track_count {
-            let y = bounds.y + RULER_HEIGHT + (i as f32) * ARRANGE_TRACK_HEIGHT;
-            if y > bounds.y + bounds.h {
-                break;
-            }
-            let mut p = vg::PathBuilder::new();
-            p.move_to((bounds.x, y));
-            p.line_to((bounds.x + bounds.w, y));
-            let p = p.detach();
-            canvas.draw_path(&p, &lane_paint);
-        }
-
-        let border_paint = stroke_paint(COLOR_CLIP_BORDER, 1.0);
-        let mut text_paint = vg::Paint::default();
-        text_paint.set_color(skia_rgba(COLOR_CLIP_TEXT));
-        text_paint.set_anti_alias(true);
-        let font = vg::Font::default();
-        // clip_boxes は (track, clip) 昇順ソート (Memo の compute 順)。
-        // Y がビューポートを超えた時点で残り全部不可視なので break。
-        let visible_y_bottom = bounds.y + bounds.h;
-        for c in &clip_boxes {
-            let y = bounds.y + RULER_HEIGHT + (c.track as f32) * ARRANGE_TRACK_HEIGHT;
-            if y > visible_y_bottom {
-                break;
-            }
-            let x = bounds.x + (c.start_beat - scroll_beat) * zoom;
-            let w = (c.length_beats * zoom).max(2.0);
-            if x + w < bounds.x || x > bounds.x + bounds.w {
-                continue;
-            }
-            let h = ARRANGE_TRACK_HEIGHT - 4.0;
-            let body_color = if c.selected {
-                COLOR_CLIP_SELECTED
-            } else {
-                COLOR_CLIP
-            };
-            let r = rect(x, y + 2.0, w, h);
-            canvas.draw_rect(r, &fill_paint(body_color));
-            canvas.draw_rect(r, &border_paint);
-            if w > 28.0 {
-                canvas.draw_str(
-                    c.name.as_str(),
-                    (x + 4.0, y + h * 0.5 + 6.0),
-                    &font,
-                    &text_paint,
-                );
-            }
-        }
-
-        if let Some(beat) = playhead {
-            let x = bounds.x + (beat - scroll_beat) * zoom;
-            if x >= bounds.x && x <= bounds.x + bounds.w {
-                let mut path = vg::PathBuilder::new();
-                path.move_to((x, bounds.y));
-                path.line_to((x, bounds.y + bounds.h));
-                let path = path.detach();
-                let mut p = stroke_paint(COLOR_PLAYHEAD, 1.5);
-                p.set_anti_alias(true);
-                canvas.draw_path(&path, &p);
-            }
-        }
-        let _ = MAX_BEATS;
-    }
-
-    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
-        let sig = self.sig;
-        event.map(|window_event, meta| match window_event {
-            WindowEvent::MouseDown(MouseButton::Left) => {
-                let bounds = cx.bounds();
-                let mx = cx.mouse().cursor_x - bounds.x;
-                let my = cx.mouse().cursor_y - bounds.y;
-                let zoom = sig.arrange_zoom_x.get_untracked();
-                let scroll_beat = sig.arrange_scroll_beat.get_untracked();
-                let clip_boxes = sig.clip_boxes.get_untracked();
-                let shift = cx.modifiers().shift();
-                if (0.0..RULER_HEIGHT).contains(&my) {
-                    let beat_at_mouse =
-                        ((mx / zoom) + scroll_beat).max(0.0) as f64;
-                    let snapped = beat_at_mouse.floor();
-                    *self.drag.borrow_mut() = Some(DragKind::LoopRange {
-                        start_beat: snapped,
-                    });
-                    *self.drag_origin_x.borrow_mut() = mx;
-                    cx.emit(AppEvent::SetLoopRange {
-                        start: snapped,
-                        end: snapped,
-                    });
-                    cx.emit(AppEvent::BeginDrag);
-                    cx.capture();
-                    meta.consume();
-                    return;
-                }
-                let Some((beat, track)) =
-                    Self::coord_to_beat_track(mx, my, zoom, scroll_beat)
-                else {
-                    return;
-                };
-                if let Some(c) = Self::hit_clip(&clip_boxes, beat, track) {
-                    let target = ClipRef {
-                        track: c.track,
-                        clip: c.clip,
-                    };
-                    cx.emit(AppEvent::SelectClip {
-                        target,
-                        additive: shift,
-                    });
-                    if shift {
-                        meta.consume();
-                        return;
-                    }
-                    let right_edge_px =
-                        (c.start_beat + c.length_beats - scroll_beat) * zoom;
-                    let from_right = right_edge_px - mx;
-                    *self.drag_origin_x.borrow_mut() = mx;
-                    cx.emit(AppEvent::PushUndoSnapshot);
-                    *self.drag.borrow_mut() = if from_right < RESIZE_HANDLE_PX {
-                        Some(DragKind::ResizeClip {
-                            clip: target,
-                            original_length_beats: c.length_beats as f64,
-                        })
-                    } else {
-                        let mut snapshots: Vec<(ClipRef, f64)> = clip_boxes
-                            .iter()
-                            .filter(|c| c.selected)
-                            .map(|c| {
-                                (
-                                    ClipRef {
-                                        track: c.track,
-                                        clip: c.clip,
-                                    },
-                                    c.start_beat as f64,
-                                )
-                            })
-                            .collect();
-                        if !snapshots.iter().any(|(r, _)| *r == target) {
-                            snapshots.push((target, c.start_beat as f64));
-                        }
-                        Some(DragKind::MoveClips { snapshots })
-                    };
-                    cx.emit(AppEvent::BeginDrag);
-                    cx.capture();
-                    meta.consume();
-                } else if my >= RULER_HEIGHT {
-                    if !shift {
-                        cx.emit(AppEvent::ClearSelection);
-                    }
-                    *self.drag.borrow_mut() = Some(DragKind::Marquee {
-                        origin_x: mx,
-                        origin_y: my,
-                        cur_x: mx,
-                        cur_y: my,
-                    });
-                    cx.emit(AppEvent::BeginDrag);
-                    cx.capture();
-                    meta.consume();
-                }
-            }
-            WindowEvent::MouseMove(_, _) => {
-                let kind = match self.drag.borrow().clone() {
-                    Some(k) => k,
-                    None => return,
-                };
-                let bounds = cx.bounds();
-                let mx = cx.mouse().cursor_x - bounds.x;
-                let my = cx.mouse().cursor_y - bounds.y;
-                let zoom = sig.arrange_zoom_x.get_untracked();
-                let dx = mx - *self.drag_origin_x.borrow();
-                let dbeat = (dx / zoom) as f64;
-                match kind {
-                    DragKind::LoopRange { start_beat } => {
-                        let cur_beat = ((mx / zoom)
-                            + sig.arrange_scroll_beat.get_untracked())
-                            .max(0.0) as f64;
-                        let snapped_cur = cur_beat.round();
-                        let (s, e) = if snapped_cur > start_beat {
-                            (start_beat, snapped_cur)
-                        } else {
-                            (snapped_cur, start_beat)
-                        };
-                        cx.emit(AppEvent::SetLoopRange { start: s, end: e });
-                    }
-                    DragKind::MoveClips { snapshots } => {
-                        let entries: Vec<(ClipRef, f64)> = snapshots
-                            .iter()
-                            .map(|(r, s)| (*r, (s + dbeat).max(0.0)))
-                            .collect();
-                        cx.emit(AppEvent::SetClipPositions(entries));
-                    }
-                    DragKind::ResizeClip {
-                        clip,
-                        original_length_beats,
-                    } => {
-                        let new_len = (original_length_beats + dbeat).max(0.25);
-                        cx.emit(AppEvent::ResizeClip {
-                            target: clip,
-                            length: new_len,
-                        });
-                    }
-                    DragKind::Marquee {
-                        origin_x, origin_y, ..
-                    } => {
-                        *self.drag.borrow_mut() = Some(DragKind::Marquee {
-                            origin_x,
-                            origin_y,
-                            cur_x: mx,
-                            cur_y: my,
-                        });
-                    }
-                }
-            }
-            WindowEvent::MouseUp(MouseButton::Left) if self.drag.borrow().is_some() => {
-                let drag = self.drag.borrow_mut().take();
-                if let Some(DragKind::Marquee {
-                    origin_x,
-                    origin_y,
-                    cur_x,
-                    cur_y,
-                }) = drag
-                {
-                    let zoom = sig.arrange_zoom_x.get_untracked();
-                    let scroll_beat = sig.arrange_scroll_beat.get_untracked();
-                    let clip_boxes = sig.clip_boxes.get_untracked();
-                    let x0 = origin_x.min(cur_x);
-                    let x1 = origin_x.max(cur_x);
-                    let y0 = origin_y.min(cur_y);
-                    let y1 = origin_y.max(cur_y);
-                    let beat0 = (x0 / zoom + scroll_beat).max(0.0);
-                    let beat1 = (x1 / zoom + scroll_beat).max(0.0);
-                    let track0 = ((y0 - RULER_HEIGHT).max(0.0) / ARRANGE_TRACK_HEIGHT) as u32;
-                    let track1 = ((y1 - RULER_HEIGHT).max(0.0) / ARRANGE_TRACK_HEIGHT) as u32;
-                    let hits: Vec<ClipRef> = clip_boxes
-                        .iter()
-                        .filter(|c| {
-                            c.track >= track0
-                                && c.track <= track1
-                                && c.start_beat <= beat1
-                                && c.start_beat + c.length_beats >= beat0
-                        })
-                        .map(|c| ClipRef {
-                            track: c.track,
-                            clip: c.clip,
-                        })
-                        .collect();
-                    cx.emit(AppEvent::SetClipSelection(hits));
-                }
-                cx.release();
-                cx.emit(AppEvent::EndDrag);
-            }
-            WindowEvent::MouseDoubleClick(MouseButton::Left) => {
-                let bounds = cx.bounds();
-                let mx = cx.mouse().cursor_x - bounds.x;
-                let my = cx.mouse().cursor_y - bounds.y;
-                let zoom = sig.arrange_zoom_x.get_untracked();
-                let scroll_beat = sig.arrange_scroll_beat.get_untracked();
-                let clip_boxes = sig.clip_boxes.get_untracked();
-                let track_count = sig.track_count.get_untracked();
-                if (0.0..RULER_HEIGHT).contains(&my) {
-                    cx.emit(AppEvent::SetLoopRange {
-                        start: 0.0,
-                        end: 0.0,
-                    });
-                    meta.consume();
-                    return;
-                }
-                let Some((beat, track)) =
-                    Self::coord_to_beat_track(mx, my, zoom, scroll_beat)
-                else {
-                    return;
-                };
-                if track >= track_count {
-                    return;
-                }
-                if let Some(c) = Self::hit_clip(&clip_boxes, beat, track) {
-                    cx.emit(AppEvent::SelectClip {
-                        target: ClipRef {
-                            track: c.track,
-                            clip: c.clip,
+            // ループバンド (ルーラ内)。
+            if loop_end > loop_start {
+                let lx = area.x + (loop_start - scroll_beat) * zoom;
+                let lw = (loop_end - loop_start) * zoom;
+                let visible_x = lx.max(area.x);
+                let visible_right = (lx + lw).min(area.x + area.w);
+                let visible_w = visible_right - visible_x;
+                if visible_w > 0.0 {
+                    hctx.push_rect(RectCommand {
+                        rect: Rect {
+                            x: visible_x,
+                            y: area.y,
+                            w: visible_w,
+                            h: RULER_H,
                         },
-                        additive: false,
+                        fill: COLOR_LOOP_BAND,
+                        border: Color::TRANSPARENT,
+                        border_width: 0.0,
+                        radius: [0.0; 4],
+                        clip_rect: None,
                     });
-                    cx.emit(AppEvent::SelectBottomPanel(1));
-                    meta.consume();
+                }
+            }
+
+            // バー罫線 (4 拍ごと) + レーン罫線 (1 トラックごと) を 1 batch にまとめる。
+            let mut bar_lines: Vec<LineSegment> = Vec::new();
+            let beats_per_bar = 4_u32;
+            let visible_beats = area.w / zoom;
+            let first_bar = (scroll_beat as i32 / beats_per_bar as i32).max(0);
+            let last_bar = ((scroll_beat + visible_beats) as u32 / beats_per_bar) + 1;
+            for bar in first_bar..=(last_bar as i32) {
+                let beat = (bar * beats_per_bar as i32) as f32;
+                let x = area.x + (beat - scroll_beat) * zoom;
+                if x < area.x - 1.0 {
+                    continue;
+                }
+                if x > area.x + area.w {
+                    break;
+                }
+                bar_lines.push(LineSegment {
+                    a: [x, area.y],
+                    b: [x, area.y + area.h],
+                    color: COLOR_BAR_LINE,
+                });
+            }
+            if !bar_lines.is_empty() {
+                hctx.push_lines(LineBatch {
+                    segments: bar_lines,
+                    line_width_px: 1.0,
+                    clip_rect: Some(area),
+                });
+            }
+
+            // レーン罫線。
+            let mut lane_lines: Vec<LineSegment> = Vec::new();
+            for i in 0..=track_count {
+                let y = area.y + RULER_H + (i as f32) * ARRANGE_TRACK_HEIGHT;
+                if y > area.y + area.h {
+                    break;
+                }
+                lane_lines.push(LineSegment {
+                    a: [area.x, y],
+                    b: [area.x + area.w, y],
+                    color: COLOR_LANE_LINE,
+                });
+            }
+            if !lane_lines.is_empty() {
+                hctx.push_lines(LineBatch {
+                    segments: lane_lines,
+                    line_width_px: 1.0,
+                    clip_rect: Some(area),
+                });
+            }
+
+            // クリップ矩形。
+            for (t_idx, t) in app.song.tracks.iter().enumerate() {
+                let y = area.y + RULER_H + (t_idx as f32) * ARRANGE_TRACK_HEIGHT;
+                if y > area.y + area.h {
+                    break;
+                }
+                let h = ARRANGE_TRACK_HEIGHT - 2.0;
+                for (c_idx, c) in t.clips.iter().enumerate() {
+                    let x = area.x + (c.start_beat as f32 - scroll_beat) * zoom;
+                    let w = ((c.length_beats as f32) * zoom).max(2.0);
+                    if x + w < area.x || x > area.x + area.w {
+                        continue;
+                    }
+                    let r = ClipRef {
+                        track: t_idx as u32,
+                        clip: c_idx as u32,
+                    };
+                    let selected = selected_clips.contains(&r);
+                    let body = if selected {
+                        COLOR_CLIP_SELECTED
+                    } else {
+                        COLOR_CLIP
+                    };
+                    hctx.push_rect(RectCommand {
+                        rect: Rect { x, y: y + 1.0, w, h },
+                        fill: body,
+                        border: COLOR_CLIP_BORDER,
+                        border_width: 1.0,
+                        radius: [3.0; 4],
+                        clip_rect: Some(area),
+                    });
+                    if w > 28.0 {
+                        hctx.label_at(
+                            ("arr_clip_text", t_idx, c_idx),
+                            &c.name,
+                            x + 4.0,
+                            y + h * 0.5 - 4.0,
+                            11.0,
+                            COLOR_CLIP_TEXT,
+                        );
+                    }
+                }
+            }
+
+            // ループバンドの縁線 (ruler 内)。
+            if loop_end > loop_start {
+                let lx = area.x + (loop_start - scroll_beat) * zoom;
+                let rx = area.x + (loop_end - scroll_beat) * zoom;
+                let mut edges = Vec::new();
+                if lx >= area.x && lx <= area.x + area.w {
+                    edges.push(LineSegment {
+                        a: [lx, area.y],
+                        b: [lx, area.y + RULER_H],
+                        color: COLOR_LOOP_EDGE,
+                    });
+                }
+                if rx >= area.x && rx <= area.x + area.w {
+                    edges.push(LineSegment {
+                        a: [rx, area.y],
+                        b: [rx, area.y + RULER_H],
+                        color: COLOR_LOOP_EDGE,
+                    });
+                }
+                if !edges.is_empty() {
+                    hctx.push_lines(LineBatch {
+                        segments: edges,
+                        line_width_px: 1.5,
+                        clip_rect: Some(area),
+                    });
+                }
+            }
+
+            // playhead。
+            if let Some(beat) = playhead {
+                let x = area.x + (beat - scroll_beat) * zoom;
+                if x >= area.x && x <= area.x + area.w {
+                    hctx.push_lines(LineBatch {
+                        segments: vec![LineSegment {
+                            a: [x, area.y],
+                            b: [x, area.y + area.h],
+                            color: COLOR_PLAYHEAD,
+                        }],
+                        line_width_px: 1.5,
+                        clip_rect: Some(area),
+                    });
+                }
+            }
+        });
+    });
+}
+
+fn draw_track_headers(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
+    // ルーラ部分の埋め色。
+    ui.heavy("arr_header_bg", |hctx| {
+        hctx.cached((area.w.to_bits(), area.h.to_bits()), |hctx| {
+            hctx.push_rect(RectCommand {
+                rect: Rect { x: area.x, y: area.y, w: area.w, h: RULER_H },
+                fill: COLOR_RULER_BG,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: None,
+            });
+        });
+    });
+
+    let rows_y = area.y + RULER_H;
+    let row_h = ARRANGE_TRACK_HEIGHT;
+    let pad = 4.0;
+
+    for (i, t) in app.song.tracks.iter().enumerate() {
+        let row_y = rows_y + (i as f32) * row_h;
+        if row_y > area.y + area.h {
+            break;
+        }
+        let is_selected = app.selected_track == i as u32;
+        let track_idx = i as u32;
+
+        // 背景 (track 選択でハイライト)。
+        ui.heavy(("arr_header_row_bg", i), |hctx| {
+            hctx.cached((i, t.muted, t.solo, is_selected), |hctx| {
+                hctx.push_rect(RectCommand {
+                    rect: Rect {
+                        x: area.x,
+                        y: row_y,
+                        w: area.w,
+                        h: row_h - 1.0,
+                    },
+                    fill: if is_selected {
+                        COLOR_HEADER_SELECTED
+                    } else {
+                        COLOR_HEADER_BG
+                    },
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [0.0; 4],
+                    clip_rect: None,
+                });
+            });
+        });
+
+        // トラック名 (クリックで select)。Button にする (右の M/S と並べる)。
+        let name = if t.name.is_empty() {
+            format!("Track {}", i + 1)
+        } else {
+            t.name.clone()
+        };
+        let name_w = area.w - pad * 2.0 - 22.0 * 2.0 - 4.0;
+        ui.button_at(
+            ("arr_header_select", i),
+            &name,
+            Rect {
+                x: area.x + pad,
+                y: row_y + pad,
+                w: name_w,
+                h: 20.0,
+            },
+            move || {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SelectTrack(track_idx))
+                })
+            },
+        );
+        // 名前テキスト (Button で隠れない位置に被せる)
+        let _ = name_w;
+
+        // M (mute) ボタン
+        let m_x = area.x + area.w - pad - 22.0 * 2.0 - 2.0;
+        let muted = t.muted;
+        ui.button_at(
+            ("arr_header_mute", i),
+            "M",
+            Rect { x: m_x, y: row_y + pad, w: 22.0, h: 20.0 },
+            move || {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ToggleTrackMute(track_idx))
+                })
+            },
+        );
+        // M ボタンのアクティブ色 (押された後の状態を背景帯で表現)。
+        // 上記 button_at の位置と被せる帯 hint。
+        let _ = muted;
+
+        // S (solo) ボタン
+        let s_x = m_x + 22.0 + 2.0;
+        let solo = t.solo;
+        ui.button_at(
+            ("arr_header_solo", i),
+            "S",
+            Rect { x: s_x, y: row_y + pad, w: 22.0, h: 20.0 },
+            move || {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ToggleTrackSolo(track_idx))
+                })
+            },
+        );
+        let _ = solo;
+
+        // 下段: ▲/▼/✕ ボタン
+        let bottom_y = row_y + 28.0;
+        let small_w = 22.0;
+        let btn_h = 18.0;
+        ui.button_at(
+            ("arr_header_up", i),
+            "Up",
+            Rect { x: area.x + pad, y: bottom_y, w: small_w, h: btn_h },
+            move || {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::MoveTrackUp(track_idx))
+                })
+            },
+        );
+        ui.button_at(
+            ("arr_header_down", i),
+            "Dn",
+            Rect {
+                x: area.x + pad + small_w + 2.0,
+                y: bottom_y,
+                w: small_w,
+                h: btn_h,
+            },
+            move || {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::MoveTrackDown(track_idx))
+                })
+            },
+        );
+        ui.button_at(
+            ("arr_header_del", i),
+            "x",
+            Rect {
+                x: area.x + area.w - pad - small_w,
+                y: bottom_y,
+                w: small_w,
+                h: btn_h,
+            },
+            move || {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::DeleteTrack(track_idx))
+                })
+            },
+        );
+
+        // 色付け hint (mute/solo を small bar で示す)。
+        let mut hints: Vec<RectCommand> = Vec::new();
+        if muted {
+            hints.push(RectCommand {
+                rect: Rect { x: m_x, y: row_y + pad + 18.0, w: 22.0, h: 2.0 },
+                fill: COLOR_BTN_MUTE,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: None,
+            });
+        }
+        if solo {
+            hints.push(RectCommand {
+                rect: Rect { x: s_x, y: row_y + pad + 18.0, w: 22.0, h: 2.0 },
+                fill: COLOR_BTN_SOLO,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: None,
+            });
+        }
+        if !hints.is_empty() {
+            ui.heavy(("arr_header_hints", i), |hctx| {
+                hctx.cached((muted, solo), |hctx| {
+                    for h in &hints {
+                        hctx.push_rect(h.clone());
+                    }
+                });
+            });
+        }
+
+        let _ = COLOR_BTN_NEUTRAL;
+        let _ = COLOR_HEADER_TEXT;
+    }
+}
+
+/// canvas 領域でのマウス入力処理。Edit dispatch は HeavyCtx 経由 (`push_edit` は
+/// 通常 `Ui` 上で `pub(crate)` のため)。
+fn handle_canvas_input(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
+    let pointer = ui.pointer();
+    let Some((px, py)) = pointer.pos else { return };
+    if !area.contains(px, py) {
+        return;
+    }
+    let zoom = app.arrange_zoom_x.max(1.0);
+    let scroll_beat = app.arrange_scroll_beat;
+    let modifiers = pointer.modifiers;
+    let area_x = area.x;
+    let area_y = area.y;
+
+    ui.heavy("arr_input", |hctx| {
+        // wheel: Ctrl で zoom、それ以外で 横 pan。scroll_delta は 1 frame の累積 px。
+        let (sx, sy) = pointer.scroll_delta;
+        let scroll_signal = sy.abs() + sx.abs();
+        if scroll_signal > 0.001 {
+            if modifiers.ctrl {
+                let factor = (sy * 0.005).exp();
+                let new_zoom = (zoom * factor).clamp(2.0, 400.0);
+                hctx.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetArrangeZoom(new_zoom))
+                }));
+            } else {
+                let dx_beats = -(sy + sx) / zoom;
+                let new_scroll = (scroll_beat + dx_beats).max(0.0);
+                hctx.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetArrangeScroll(new_scroll))
+                }));
+            }
+        }
+
+        // クリック (release で判定): hit-test + ダブルクリック検出。
+        if pointer.primary_just_released && py >= area_y + RULER_H {
+            let additive = modifiers.shift;
+            // 全ロジックを Edit::mutate 内に閉じ込め、app.last_click と
+            // app.song に同時アクセスして判定する。
+            hctx.push_edit(Edit::mutate(move |app: &mut AppData| {
+                let now = std::time::Instant::now();
+                let is_double = matches!(
+                    app.last_click,
+                    Some((t, lx, ly))
+                        if now.duration_since(t)
+                            < std::time::Duration::from_millis(400)
+                            && (px - lx).abs() < 5.0
+                            && (py - ly).abs() < 5.0
+                );
+
+                let zoom = app.arrange_zoom_x.max(1.0);
+                let scroll_beat = app.arrange_scroll_beat;
+                let beat = ((px - area_x) / zoom + scroll_beat) as f64;
+                let track = ((py - area_y - RULER_H) / ARRANGE_TRACK_HEIGHT) as u32;
+
+                if (track as usize) >= app.song.tracks.len() {
+                    app.last_click = Some((now, px, py));
                     return;
                 }
-                let snapped = beat.floor().max(0.0);
-                cx.emit(AppEvent::CreateClip {
-                    track,
-                    start_beat: snapped,
-                });
-                cx.emit(AppEvent::SelectBottomPanel(1));
-                meta.consume();
-            }
-            WindowEvent::MouseScroll(_, dy) => {
-                let mods = cx.modifiers();
-                if mods.ctrl() {
-                    let zoom = sig.arrange_zoom_x.get_untracked();
-                    let factor = 1.15_f32.powf(*dy);
-                    let new_zoom = (zoom * factor).clamp(2.0, 400.0);
-                    cx.emit(AppEvent::SetArrangeZoom(new_zoom));
+
+                let hit: Option<ClipRef> = app
+                    .song
+                    .tracks
+                    .get(track as usize)
+                    .and_then(|t| {
+                        t.clips.iter().enumerate().find_map(|(c_idx, c)| {
+                            if beat >= c.start_beat
+                                && beat <= c.start_beat + c.length_beats
+                            {
+                                Some(ClipRef { track, clip: c_idx as u32 })
+                            } else {
+                                None
+                            }
+                        })
+                    });
+
+                if is_double {
+                    if let Some(target) = hit {
+                        // 既存クリップをダブルクリック → ピアノロールへ
+                        app.handle_event(AppEvent::SelectClip { target, additive: false });
+                        app.handle_event(AppEvent::SelectBottomPanel(1));
+                    } else {
+                        // 空白をダブルクリック → クリップ作成
+                        let snapped = beat.floor().max(0.0);
+                        app.handle_event(AppEvent::CreateClip { track, start_beat: snapped });
+                        app.handle_event(AppEvent::SelectBottomPanel(1));
+                    }
+                    app.last_click = None;
                 } else {
-                    let scroll = sig.arrange_scroll_beat.get_untracked();
-                    let speed = 1.0_f32;
-                    let new_scroll = (scroll - dy * speed).max(0.0);
-                    cx.emit(AppEvent::SetArrangeScroll(new_scroll));
+                    // 単発クリック: HIT → SelectClip / 空白 → ClearSelection (!additive)
+                    if let Some(target) = hit {
+                        app.handle_event(AppEvent::SelectClip { target, additive });
+                    } else if !additive {
+                        app.handle_event(AppEvent::ClearSelection);
+                    }
+                    app.last_click = Some((now, px, py));
                 }
-                meta.consume();
-            }
-            _ => {}
-        });
-    }
+            }));
+        }
+    });
 }
