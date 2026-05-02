@@ -449,32 +449,35 @@ impl AppHost for App {
             self.cur_modifiers = *m;
         }
 
-        // Space で REC トグル + 1/2/3/a で render_mode 上書き (Phase 16)
+        // Space で REC トグル + 1/2/3/a で render_mode 上書き (Phase 16)。
+        // 数字 / a は `key.text` 経由で判定 (`PhysicalKey::Other` は winit の KeyCode
+        // discriminant で OS 非依存だが値が予測困難)。
         if let AppEvent::Keyboard(key) = &ev
             && key.state == ElementState::Pressed
         {
-            match key.physical_key {
-                PhysicalKey::Space => {
-                    self.model.toggle_recording();
-                    self.rec_last_tick = None;
+            if key.physical_key == PhysicalKey::Space {
+                self.model.toggle_recording();
+                self.rec_last_tick = None;
+            } else {
+                match key.text.as_deref() {
+                    Some("1") => {
+                        self.model.forced_mode = Some(WaveformRenderMode::PeakLines);
+                        self.model.last_action = "forced: PeakLines".to_string();
+                    }
+                    Some("2") => {
+                        self.model.forced_mode = Some(WaveformRenderMode::SamplePolyline);
+                        self.model.last_action = "forced: SamplePolyline".to_string();
+                    }
+                    Some("3") => {
+                        self.model.forced_mode = Some(WaveformRenderMode::RmsBars);
+                        self.model.last_action = "forced: RmsBars".to_string();
+                    }
+                    Some(s) if s.eq_ignore_ascii_case("a") => {
+                        self.model.forced_mode = None;
+                        self.model.last_action = "Auto モードに戻る".to_string();
+                    }
+                    _ => {}
                 }
-                PhysicalKey::Other(0x31) => {
-                    self.model.forced_mode = Some(WaveformRenderMode::PeakLines);
-                    self.model.last_action = "forced: PeakLines".to_string();
-                }
-                PhysicalKey::Other(0x32) => {
-                    self.model.forced_mode = Some(WaveformRenderMode::SamplePolyline);
-                    self.model.last_action = "forced: SamplePolyline".to_string();
-                }
-                PhysicalKey::Other(0x33) => {
-                    self.model.forced_mode = Some(WaveformRenderMode::RmsBars);
-                    self.model.last_action = "forced: RmsBars".to_string();
-                }
-                PhysicalKey::Other(0x41) => {
-                    self.model.forced_mode = None;
-                    self.model.last_action = "Auto モードに戻る".to_string();
-                }
-                _ => {}
             }
         }
 

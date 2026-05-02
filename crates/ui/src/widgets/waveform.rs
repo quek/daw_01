@@ -783,7 +783,8 @@ fn build_sample_polyline_markers(
     let s_end_int = s_end_unclamped.min(valid_len);
     let n_samples = s_end_int.saturating_sub(s_start_int);
 
-    let marker_size = (style.line_width_px * 3.0).max(2.0);
+    // マーカーは line の 6 倍 (最低 6px) で line と区別できる視認サイズに。
+    let marker_size = (style.line_width_px * 6.0).max(6.0);
     let r = marker_size * 0.5;
     let mut markers: Vec<RectCommand> =
         Vec::with_capacity(n_samples * ch_iter.len());

@@ -21,7 +21,7 @@ use daw_ui_core::{
     WaveformStyle, WaveformView,
 };
 use daw_ui_platform::{
-    AppEvent, AppHost, ElementState, Modifiers, PhysicalKey, PhysicalSize, ScrollDelta,
+    AppEvent, AppHost, ElementState, Modifiers, PhysicalSize, ScrollDelta,
     WindowBackend, winit_backend,
 };
 use daw_ui_renderer::{Color, Rect, RectCommand, Renderer, Scene};
@@ -428,24 +428,26 @@ impl AppHost for App {
         if let AppEvent::ModifiersChanged(m) = &ev {
             self.cur_modifiers = *m;
         }
-        // 1/2/3/a キーで forced_mode 切替
+        // 1/2/3/a キーで forced_mode 切替。`PhysicalKey::Other` は winit の `KeyCode`
+        // discriminant で OS 非依存だが値が予測困難 → `key.text` 経由で判定する
+        // (Shift+a でも大文字 "A" として届くので eq_ignore_ascii_case で吸収)。
         if let AppEvent::Keyboard(key) = &ev
             && key.state == ElementState::Pressed
         {
-            match key.physical_key {
-                PhysicalKey::Other(0x31) => {
+            match key.text.as_deref() {
+                Some("1") => {
                     self.model.forced_mode = Some(WaveformRenderMode::PeakLines);
                     self.model.last_action = "forced: PeakLines".to_string();
                 }
-                PhysicalKey::Other(0x32) => {
+                Some("2") => {
                     self.model.forced_mode = Some(WaveformRenderMode::SamplePolyline);
                     self.model.last_action = "forced: SamplePolyline".to_string();
                 }
-                PhysicalKey::Other(0x33) => {
+                Some("3") => {
                     self.model.forced_mode = Some(WaveformRenderMode::RmsBars);
                     self.model.last_action = "forced: RmsBars".to_string();
                 }
-                PhysicalKey::Other(0x41) => {
+                Some(s) if s.eq_ignore_ascii_case("a") => {
                     self.model.forced_mode = None;
                     self.model.last_action = "Auto モードに戻る".to_string();
                 }
