@@ -39,14 +39,15 @@ git diff --name-only HEAD
 
 ### 3. パフォーマンスレビュー
 
-UI スレッド（Vizia 描画ループ）や 1 秒に数十回以上呼ばれる経路をチェック:
+UI スレッド (gui_01 の `UiHost::frame` / view の build closure / heavy() 内描画) や、
+1 秒に数十回以上呼ばれる経路 (Tick / TrackPeaksTick handler 等) をチェック:
 
 | チェック項目 | 問題パターン | 修正方針 |
 |---|---|---|
 | 描画ループ内ヒープ確保 | `Vec::new()`, `format!()` を毎フレーム | 事前確保、キャッシュ、`String` 再利用 |
-| 毎フレームの重い計算 | O(n) で全トラック走査 | dirty フラグ、差分更新 |
+| 毎フレームの重い計算 | O(n) で全トラック走査・全 clip 走査 | `ui.heavy(id, |hctx| { hctx.cached(viewport_key, ...) })` で粗粒度キャッシュ |
 | 不要な clone | `.clone()` が回避可能 | 参照で保持、ライフタイムで表現 |
-| Vizia の過剰な再描画 | 状態変化がないのにビュー再構築 | Lens / Binding で差分のみ更新 |
+| 過剰な heavy() invalidation | viewport_key に毎フレーム変わる値 (Instant 等) を含めている | viewport_key は state hash のみ。時刻は含めない |
 
 ### 4. セキュリティ / 整合性レビュー
 

@@ -11,7 +11,7 @@ Cargo workspace (Edition 2024)。
 
 ```
 common/            -- 共有型・IPC プロトコル・shared memory・データモデル
-daw_gui/           -- GUI プロセス (Vizia)
+daw_gui/           -- GUI プロセス (gui_01 / daw-ui = winit + wgpu + 自作 immediate-mode UI)
 daw_audio/         -- Audio Engine プロセス (CPAL)
 daw_plugin_host/   -- Plugin Host プロセス (CLAP/VST3)
 ```
@@ -42,55 +42,43 @@ cargo clippy --workspace -- -D warnings
 ### GUI デバッグ
 
 - UI のキーバインド・イベントは可視フィードバックが無いと動いたか判別不能
-- 迷ったら `AppData::event` 冒頭に `tracing::info!(?app_event, "received")` を仕込んでログで確認
+- 迷ったら `AppData::handle_event` 冒頭に `tracing::info!(?event, "received")` を仕込んでログで確認
 - 確認後は削除するか、debug feature で囲う（`[debug-gui]` skill 参照）
 
-### Vizia 0.4 の既知の罠（実ビルドでハマった項目）
+### gui_01 (daw-ui) アーキテクチャ要点
 
-- **Lens は廃止**: `#[derive(Lens)]` / `#[derive(Data)]` は 0.4 で消失。reactive な状態は
-  `Signal<T>` / `Memo<T>` で持つ。AppData は `pub field: Signal<T>` を直接フィールドに置き、
-  `app.field` で `Signal<T>: Copy` を取り出して View に渡す
-- **`AppData::field` 静的アクセスは廃止**: View は引数で必要な Signal を受け取る。`main.rs` で
-  `let app: &AppData = AppData::new(...).build(cx);` から `let song = app.song;` 等で各 Signal
-  を捕捉してから View 構築 / move closure に渡す
-- `Binding::new(cx, signal, |cx| { ... })` の closure は **1 引数 (`|cx|`)**。bind したい
-  Signal は外側でキャプチャして closure 内で `signal.get()` する
-- Custom View `Handle::bind(signal, |mut handle| { ... })` の closure も **1 引数** (`|mut handle|`)
-  に縮約。0.3 の `|mut handle, _|` 2 引数形は廃止
-- Custom View の `fn draw(&self, cx: &mut DrawContext, canvas: &Canvas)` は `canvas: &Canvas`
-  (immutable)。skia drawing API は interior mutability で動くのでそのまま `canvas.draw_rect(...)` 等使える
-- `vg::Path::new()` は immutable。drawing 用は `vg::PathBuilder::new()` を作って `move_to` /
-  `line_to` で組み立て、`let path = path.detach();` で `Path` に変換してから `canvas.draw_path(&path, ...)`
-- `List::new(cx, signal_of_vec, |cx, idx, item| { ... })` の `item` は `Signal<T>`
-  （0.3 では `Lens<Target=T>`）。`item.get()` は引数なし、`item.map(|t| ...)` はそのまま
-- `cx.set_default_font(&[...])` は 0.4 で公開 API から消えた。フォント指定は CSS で
-  `body { font-family: "..." }` のように行う
-- on_press の closure は `Send + Sync` 必須。Signal/Memo を generic 引数で受ける View 関数は
-  trait bound に `+ Send + Sync` を含める (`mixer_strips::strip<S>` 参照)
-- メソッド名: `Slider::on_change` callback は `(ex, value: f32)` で emit (0.3 と同じ)
-- `Alignment::Bottom` は存在しない。`BottomCenter` / `BottomLeft` / `BottomRight` のいずれか
-- `List` のデフォルトテーマが `list list-item { height: 30px }` を指定しているため、
-  per-row ラベルに空白が入る。`cx.add_stylesheet(&'static str)` でインライン CSS オーバーライド。
-  ただし `height: auto` にすると Skia の `matrix.invert().unwrap()` で panic するので、必ず固定 Pixel
-- `cx.spawn(|proxy| ...)` は **std::thread** を回すので `tokio::time::sleep` などは使えない。
-  `std::thread::sleep` + `proxy.emit(...)` でやる。`ContextProxy::emit` は UI が閉じられると
-  `Err` を返すのでそれで抜ける
-- f64 を `Signal<f64>` に直接入れる場合、NaN で `PartialEq` が常に false → set 毎に依存 Memo が
-  再評価される懸念。位置情報は `Signal<Vec<NoteBox>>` のように Vec ごと replace する戦略を維持
-
-### Keymap の Action trait bound 緩和
-
-0.3 では `Keymap` の Action 型に `Hash + Eq` が要求され、`f32` を含む `AppEvent` は
-`#[derive(Hash, Eq)]` できなかったため `to_bits/from_bits` で `u32` 運搬していた。
-0.4 では Action は `'static + Clone + PartialEq + Send + Sync` のみで OK になり、`AppEvent` は
-`#[derive(Debug, Clone, PartialEq)]` で十分。`f32` / `f64` を直接 variant に持てる。
-旧 bits 運搬パターン (`SetMasterGain(u32)` / `Tick(u64, u32, u32)` 等) は全廃。
+- **path 依存**: `daw-ui-platform` / `daw-ui-renderer` / `daw-ui-core` は workspace で
+  `path = "../gui_01/crates/*"` 指定。直接の依存は `winit 0.30` / `raw-window-handle 0.6` も追加
+- **AppData は plain mutable struct**: Signal/Memo/derive は使わない。派生は method
+  (`app.track_headers() -> Vec<TrackHeader>`) として毎フレーム計算。重ければ view 側で 1 frame 分キャッシュ
+- **イベント dispatch**: view から `Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::X))`、
+  background thread から `EventLoopProxy<AppEvent>::send_event`。`impl Model` 的な trait 接続は不要
+- **immediate-mode + heavy() escape hatch**: 通常 widget は毎フレーム再構築だが、
+  `ui.heavy(id, |hctx| { hctx.cached(viewport_key, |hctx| { ... }) })` で粗粒度キャッシュ。
+  ピアノロール / アレンジビュー等の大量描画はこの中で `push_rect / push_text / push_lines` を呼ぶ
+- **Edit<M>**: `Box<dyn FnOnce(&mut M) + Send + 'static>`。view 内クロージャから直接モデル変更可
+- **WindowBackend**: `daw-ui-platform::WindowBackend` trait を満たす型を `Renderer<W>` に渡す。
+  daw_gui は `view/window.rs::DawGuiWindow` で winit::Window をラップ
+- **イベントループ**: `view/runner.rs::Runner` が `winit::ApplicationHandler<AppEvent>` を実装。
+  WindowEvent → `daw_ui_platform::AppEvent` 変換 + InputAccumulator ingest、user_event →
+  `AppData::handle_event` dispatch、IME 差分管理、Win32 cursor 位置補正
+- **キーボードショートカット**: `Runner::dispatch_shortcut` が WindowEvent::KeyboardInput を
+  直接見て、focus 中の widget が無いとき AppEvent を発火 (Space/P/V/Ctrl+S/Ctrl+Z/Delete 等)
+- **ダブルクリック**: gui_01 v1 には built-in 検出無し。`AppData::last_click: Option<(Instant, x, y)>`
+  に最終クリックを記録し、各 view の入力ハンドラで 400ms+5px 以内なら double 判定
+- **背景スレッド**: autosave / playhead poll / MIDI / IPC bridge / VOICEVOX synth / plugin DB
+  rescan は std::thread + EventLoopProxy。`tokio::time::sleep` は不可、`std::thread::sleep` を使う
+- **HeavyCtx の API**: `push_rect`, `push_text`, `push_lines`, `push_edit`, `button_at`, `label_at`,
+  `waveform`。`Ui::push_edit` は `pub(crate)` なので、view から Edit を流す際は heavy ブロック内で
+  `hctx.push_edit(...)` を使う
 
 ### 子プロセスとクロスプロセス HWND（Windows）
 
 - `HWND` は `windows` crate で `HWND(*mut c_void)`。IPC 越しに渡すには `u64` にキャストして bincode
-- CLAP プラグインウィンドウを daw_gui に埋め込むとき、daw_gui が所有する top-level HWND を作り、
-  `daw_plugin_host` へ `u64` で送る → `clap_plugin_gui.set_parent` でプラグインが子ウィンドウ化
+- CLAP プラグイン GUI は daw_gui が所有する **別 top-level HWND** にホストする
+  (`view/plugin_embed.rs::PluginHostWindow`)。daw_gui のメインウィンドウとは独立、winit/wgpu
+  surface と干渉しない。`daw_plugin_host` へ HWND を `u64` で送る → `clap_plugin_gui.set_parent`
+  でプラグインが子ウィンドウ化
 - WNDPROC は `extern "system" fn` で Rust 状態にアクセスできないので、`GWLP_USERDATA` に
   `Arc<AtomicBool>` 等を leak で貼り付け、Drop で `Arc::from_raw` して回収する
 - プラグインのウィンドウメッセージは **作ったスレッドのキュー** に入る。daw_plugin_host は
@@ -133,7 +121,7 @@ cargo clippy --workspace -- -D warnings
 
 ### 外部 API の挙動を先に理解する
 - 推測で実装→失敗→修正のサイクルは、調査→実装より遅い
-- CLAP, clap-sys, cpal, Vizia, windows crate の挙動はドキュメント・ソースで確認してから組む
+- CLAP / clap-sys / cpal / winit / wgpu / gui_01 (daw-ui) / windows crate の挙動はドキュメント・ソースで確認してから組む
 
 ### エラーを握りつぶさない
 - `?` を安易に `ok()` / `unwrap_or_default()` に置き換えない
@@ -169,5 +157,7 @@ cargo clippy --workspace -- -D warnings
 
 ## 参照プロジェクト
 
+- `F:\dev\gui_01` — 自作 GUI ライブラリ (daw-ui)。daw_gui はこれを path 依存で取り込んでいる。
+  API ドキュメントは crate doc-comments、サンプルは `crates/examples/{mixer, arrangement, piano_roll, ...}` 参照
 - `F:\dev\sing_like_coding` — 前作 Rust DAW。IPC, CLAP ホスト, オーディオエンジンの参照実装
 - `%APPDATA%\REAPER\Scripts\yoshino\voicevox\` — VOICEVOX API 統合の参照実装 (Lua)

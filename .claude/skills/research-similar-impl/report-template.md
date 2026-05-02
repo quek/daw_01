@@ -23,19 +23,19 @@
 - Rust 側の安全ラッパの作り方: ...
 - 型変換（`*const` → `&`）の境界処理: ...
 
-#### Meadowlark / Vizia / その他
+#### Meadowlark / gui_01 (daw-ui) / その他
 - UI 層とオーディオ層の分離: ...
 - ロックフリーキュー設計: ...
-- Vizia でのカスタムビュー実装パターン: ...
+- gui_01 でのカスタム描画パターン (heavy + cached + push_*): ...
 
 ### API リファレンスからの知見
 - CLAP 公式仕様で確認したセマンティクス・スレッド制約
-- cpal / Vizia の該当 API のベストプラクティス
+- cpal / winit / wgpu / gui_01 の該当 API のベストプラクティス
 - VOICEVOX API の該当エンドポイントの挙動
 - Windows API の使用上の注意点
 
-### clap-sys / windows crate / vizia の API シグネチャ
-- 確認した関数とそのシグネチャ（C との差異）
+### clap-sys / windows crate / gui_01 の API シグネチャ
+- 確認した関数とそのシグネチャ（C との差異、Rust 側 trait bound 等）
 
 ### 推奨アプローチ
 - daw_01 での実装方針

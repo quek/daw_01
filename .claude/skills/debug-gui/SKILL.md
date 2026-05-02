@@ -8,32 +8,43 @@ description: |
 allowed-tools: Read, Grep, Glob, Edit, Bash(cargo build *), Bash(./target/debug/*)
 ---
 
-# GUI デバッグワークフロー
+# GUI デバッグワークフロー (gui_01 / daw-ui ベース)
 
 GUI のイベント（キー入力・ボタンクリック・ショートカット）が動作不明なときに、
 どの層で止まっているかを切り分ける。
 
-## 3 層モデル
+## 4 層モデル
 
-GUI イベントは概ね以下の 3 層を通る。どの層で消えているかでアプローチが変わる。
+GUI イベントは概ね以下の 4 層を通る。どこで消えているかでアプローチが変わる。
 
 ```
-┌─ 1. キー取り込み層 ───────────────┐
-│ OS → winit → Vizia event pipeline │
-│ Keymap / view の .event / focus   │
-└──────────────────────────────────┘
+┌─ 1. winit 取り込み層 ──────────────────────┐
+│ OS → winit → Runner::window_event           │
+│ → daw_ui_platform::AppEvent 変換            │
+│ → InputAccumulator::ingest                  │
+└─────────────────────────────────────────────┘
            ↓
-┌─ 2. emit 層 ────────────────────┐
-│ KeymapEntry closure →           │
-│ cx.emit(AppEvent::...)          │
-└──────────────────────────────────┘
+┌─ 2. 配線層 ────────────────────────────────┐
+│ Keyboard 単発 → Runner::dispatch_shortcut   │
+│   → app.handle_event 直接                  │
+│ それ以外 → InputAccumulator → ui.frame()   │
+│   → view 側の pointer hit-test              │
+└─────────────────────────────────────────────┘
            ↓
-┌─ 3. handler 層 ───────────────────┐
-│ Model::event → event.map(...)    │
-│ → 実際の state 変更              │
-└──────────────────────────────────┘
+┌─ 3. emit 層 ───────────────────────────────┐
+│ View 内 hctx.push_edit(Edit::mutate(...))  │
+│ → frame 末尾で `&mut AppData` に apply     │
+│ または background thread:                   │
+│   event_proxy.send_event(AppEvent::X)       │
+│   → Runner::user_event → app.handle_event   │
+└─────────────────────────────────────────────┘
            ↓
-     Lens → View 再描画
+┌─ 4. handler 層 ────────────────────────────┐
+│ AppData::handle_event(event) の match 分岐 │
+│ → 実際の state 変更                        │
+└─────────────────────────────────────────────┘
+           ↓
+     UiHost が自動 request_redraw → 次フレームで反映
 ```
 
 ## 手順
@@ -41,82 +52,84 @@ GUI イベントは概ね以下の 3 層を通る。どの層で消えている�
 ### 1. 期待動作を明確にする
 
 「何を押したら何が起きるはずか」を書き出す。例:
-- Space → AppEvent::PlayToggle → `is_playing` が反転、送信
+- Space → AppEvent::PlayToggle → `is_playing` が反転、`send_audio(Play)` 送信
 
 ### 2. 各層にトレースを仕込む
 
 **handler 層（最上流で一番わかりやすい）**:
 
 ```rust
-// daw_gui/src/app.rs の Model::event で、event.map の中に
-event.map(|app_event, _| {
-    tracing::info!(?app_event, "AppEvent received");
-    // 以下既存のハンドリング
-});
-```
-
-**emit 層（必要なら）**:
-
-```rust
-// Keymap の closure を個別に
-KeymapEntry::new(AppEvent::Foo, |cx| {
-    tracing::info!("keymap Foo fired");
-    cx.emit(AppEvent::Foo);
-})
-```
-
-Keymap はそれぞれ別 closure なので個別に log を仕込める。
-
-**キー取り込み層（最下流、一番面倒）**:
-
-```rust
-// View::event を impl する場合
-fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
-    event.map(|window_event, _| {
-        if let WindowEvent::KeyDown(code, key) = window_event {
-            tracing::info!(?code, ?key, "keydown raw");
-        }
-    });
+// daw_gui/src/app.rs の handle_event 冒頭
+pub fn handle_event(&mut self, event: AppEvent) {
+    tracing::info!(?event, "AppEvent received");
+    if Self::is_undoable(&event) { ... }
+    match event { ... }
 }
 ```
 
-または global ウォッチャーを仕込む。
+**emit 層 (view から)**:
+
+```rust
+// view 内で push_edit する直前
+hctx.push_edit(Edit::mutate(move |app: &mut AppData| {
+    tracing::info!("about to apply Foo edit");
+    app.handle_event(AppEvent::Foo);
+}));
+```
+
+**配線層 (Runner)**:
+
+```rust
+// daw_gui/src/view/runner.rs の window_event の KeyboardInput アーム
+WindowEvent::KeyboardInput { event, .. } => {
+    tracing::info!(?event.physical_key, ?event.state, "raw keydown");
+    // 既存の dispatch_shortcut / dispatch_platform_event
+}
+```
+
+**winit 取り込み層 (一番下流)**:
+
+```rust
+// dispatch_platform_event 冒頭
+fn dispatch_platform_event(&mut self, ev: PlatformEvent) {
+    tracing::info!(?ev, "platform event");
+    // ...
+}
+```
 
 ### 3. **再ビルドを明示**（必須）
 
 ```bash
-cargo build -p daw_gui
+make build       # = cargo build --workspace
 ```
 
 `cargo clippy` / `cargo check` / `cargo test` だけでは **exe が更新されない**。
 古いバイナリで検証すると「直したはずなのに動かない」で時間を溶かす。
 （このプロジェクトで 2 回繰り返している。[feedback_build_after_clippy.md] 参照）
 
-子プロセス側（daw_audio / daw_plugin_host）の挙動に関わるデバッグなら
-`cargo build --workspace` で workspace 全体を rebuild する。
+子プロセス側 (daw_audio / daw_plugin_host) も `make build` で workspace 全体を rebuild する。
 
 ### 4. 実行してキー操作 → ログを確認
 
 ```bash
-./target/debug/daw_gui.exe
+make run
 ```
-
-（必要なら `DAW_CLAP_PATH=...` 等の env 付きで）
 
 操作したら閉じて `grep` でログを絞る:
 
 ```bash
-grep -E "AppEvent|keymap|keydown" <output-file>
+grep -E "AppEvent|raw keydown|platform event" <output-file>
 ```
 
 ### 5. どこで止まったかで切り分け
 
 | 現象 | 原因の候補 | 対応 |
 |---|---|---|
-| keydown raw すら出ない | キーが winit まで届いていない / window focus が他にある / 他の consumer（Button 等）が飲んでいる | Button の navigable(false) を試す、global listener を使う、focus を明示的に View へ移す |
-| keydown raw は出るが keymap fired が出ない | Keymap のエントリ漏れ / Modifier の組み合わせ違い / 同じ Code に複数エントリで競合 | `KeyChord::new(Modifiers::X, Code::Y)` を見直す、CTRL+H と plain H のような重複は Modifiers が優先される |
-| keymap fired は出るが AppEvent received が出ない | `cx.emit` がどこにも届いていない / Model が build されていない / Lens の所有者が違う | `AppData::new(...).build(cx)` が Application::new 内で呼ばれているか、build するときの `cx` が root か確認 |
-| AppEvent received は出るが画面が変わらない | handler 内の state 変更が反映されていない / Lens 先の型が Data を実装していない / `refresh_tracker_text` 忘れ | `dirty` フラグの扱い、Vizia Data trait の要件、`tracker_text: String` のような派生 String Lens を使う |
+| raw keydown すら出ない | キーが winit まで届いていない / window focus が他にある (Plugin GUI 等別 HWND) | OS のフォーカスを daw_gui のメインウィンドウに移す。Plugin host window が focus を奪っていないか確認 |
+| raw keydown は出るが dispatch_shortcut で消えている | 修飾キーの組み合わせ違い / `dispatch_shortcut` の match に漏れ / Ctrl のはずが Shift 単独などの誤判定 | `Modifiers { ctrl, shift, alt, logo }` の状態を log に出す。`only_ctrl` / `ctrl_shift` 判定ロジックを見直す |
+| 配線層は通っているが AppEvent received が出ない | `app.handle_event` が呼ばれていない / Edit::mutate の closure が `Send + 'static` 制約で生成失敗 | view の hctx.push_edit が cached() の **外側** で呼ばれているか確認 (cached 内側は viewport_key 一致時にスキップ) |
+| AppEvent received は出るが画面が変わらない | handler 内の state 変更が実際に行われていない / ui.frame の `&mut AppData` 側で apply が走っていない | AppData の該当フィールド変更を log に出す。UiHost::frame が呼ばれているか (= Runner::render_frame が走っているか) を確認 |
+| 画面は変わるが古い状態が見える | 1 frame 遅延 (immediate-mode + Edit queue の宿命): edit は frame 描画の **後** に apply される | UiHost::frame が次フレームで自動 request_redraw を呼ぶので 2 frame 後には反映される。手動で window.request_redraw() を呼ぶと早まる |
 
 ### 6. 仕込んだトレースの後始末
 
@@ -124,23 +137,30 @@ grep -E "AppEvent|keymap|keydown" <output-file>
 
 ```rust
 #[cfg(feature = "debug-gui")]
-tracing::info!(?app_event, "AppEvent received");
+tracing::info!(?event, "AppEvent received");
 ```
 
-残しておくと RT 外とはいえ毎キー log が出てうるさい。
+残しておくと毎フレーム log が出てうるさい (特に Tick / TrackPeaksTick)。
 
-## Vizia 固有のハマりどころ
+## gui_01 / daw-ui 固有のハマりどころ
 
-- **`Keymap` はグローバル**: focused view に依存せず発火するはずだが、Button が focus を奪って
-  Space / Enter を先に飲むことがある。Button に `.navigable(false)` を付けるか、
-  Keymap を Window root で build する
-- **`Lens::map` の Target は `Data` 必須**: Song のような複雑な型は `Data` 未実装で Binding 不能。
-  派生する `String` や `u32` を AppData に持たせて Lens 化（daw_01 では `tracker_text: String`）
-- **`#[lens(ignore)]`**: Sender 等の非 `Data` フィールドには付けないと derive で詰まる
-- **Vizia 0.3.0 (crates.io) と main (GitHub) で API が違う**: Signal ベースのコード例を見つけたら
-  それは main 用、0.3.0 では Lens を使う
+- **`Ui::push_edit` は `pub(crate)`**: 通常 view から呼べない。代わりに `ui.heavy(id, |hctx| {
+  hctx.push_edit(...) })` を使う。HeavyCtx は `push_edit` を pub で expose
+- **`hctx.cached(viewport_key, |hctx| { ... })` 内の Edit は通常 OK だが、**描画コマンド**は
+  cache hit 時にスキップされて再描画されない。動的 overlay (cursor 線、選択範囲) は cached
+  の外側で `hctx.push_*` する
+- **focused widget がキー入力を独占**: `text_input` が focus を持っているとき、Runner の
+  global shortcut は dispatch_shortcut で skip される (`ui.focused_widget().is_none()` チェック)
+- **scroll_delta は 1 frame 累積**: `pointer.scroll_delta` は次の `take_frame` までに入った
+  ホイール回転量の合計 (pixels)。1 line ≈ 40px (LINE_HEIGHT_PX)
+- **PointerFrame.modifiers**: 現在の修飾キーは `pointer.modifiers` で取れる。frame をまたいで
+  保持される
+- **ダブルクリック検出は自前**: gui_01 v1 は built-in 無し。`AppData::last_click` に最終クリック
+  情報を持って 400ms+5px 以内なら double 判定 (arrangement_view / piano_roll_view 参照)
+- **背景スレッドからの wake**: `event_proxy.send_event(AppEvent::X)` は失敗する (UI が閉じた)
+  と `Err`。loop はそれで break する
 
 ## 参考コミット
 
-- `4312dab` hjkl カーソル + ノート入力・編集（本ワークフローで bug を切り分けた）
-- `ccf5b1b` hjkl カーソル移動（Song が Data 実装していないので tracker_text 方式に）
+- `8050184` GUI を Vizia から ../gui_01 (daw-ui) に置き換え (本ワークフローのリライト元)
+- `4312dab` hjkl カーソル + ノート入力・編集（旧 Vizia 時代に本ワークフローで bug を切り分けた）

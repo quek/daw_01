@@ -11,7 +11,7 @@ VOICEVOX 歌声合成を組み込んだ Rust 製 DAW。Clip ベースのタイ�
 
 | プロセス | 役割 |
 |---|---|
-| **daw_gui** | UI 表示・編集操作。Vizia ベース |
+| **daw_gui** | UI 表示・編集操作。gui_01 (daw-ui) ベース (winit + wgpu + 自作 immediate-mode) |
 | **daw_audio** | オーディオ出力・シーケンサー・ミキサー。CPAL (WASAPI) |
 | **daw_plugin_host** | CLAP/VST3 プラグインのロード・実行 |
 
@@ -99,7 +99,7 @@ daw_audio の CPAL コールバックで 1 往復（RT スレッドが wait す�
 | コンポーネント | 技術 | 実装状況 |
 |---|---|---|
 | 言語 | Rust (Edition 2024) | ✅ |
-| GUI | Vizia 0.3.0 (winit + Skia) | ✅ Lens ベース、HackGen Console NF |
+| GUI | gui_01 / daw-ui (winit 0.30 + wgpu 29 + glyphon SDF text + taffy flexbox) | ✅ immediate-mode + heavy() キャッシュ |
 | オーディオ I/O | cpal 0.15 (WASAPI 共有モード、F32) | ✅ |
 | Control plane IPC | tokio named pipe + bincode 2 | ✅ |
 | Data plane IPC | shared_memory 0.12 + windows crate (名前付きセマフォ) | ✅ |
@@ -285,13 +285,13 @@ daw_01/
 │       ├── audio_buffer.rs # 固定サイズオーディオバッファ
 │       ├── model.rs        # Song / Track / Clip / Row
 │       └── event.rs        # Note / CC / Automation イベント
-├── daw_gui/                # GUI プロセス (Vizia)
+├── daw_gui/                # GUI プロセス (gui_01 / daw-ui)
 │   └── src/
 │       ├── main.rs
 │       ├── app.rs          # アプリケーション状態
 │       ├── command/        # ユーザーアクション
 │       ├── communicator.rs # Audio/Plugin プロセスとの通信
-│       └── view/           # Vizia ビュー (Arrangement, ClipEditor, Inspector)
+│       └── view/           # ビュー (Arrangement, PianoRoll, Mixer, Inspector, etc.)
 ├── daw_audio/              # Audio Engine プロセス
 │   └── src/
 │       ├── main.rs
@@ -446,37 +446,52 @@ on_gui_closed ◀─────────────────────
   (VCV Rack)。即 destroy せず警告ログのみ
 - `set_parent` と `show` の間に `PeekMessage` ポンプを挟むとプラグインの遅延初期化が進む
 
-## GUI (Vizia)
+## GUI (gui_01 / daw-ui)
 
-### レイアウト (daw_gui/src/main.rs)
+### レイアウト (daw_gui/src/view/root.rs)
+
+`view/runner.rs::Runner` が winit イベントループを駆動し、毎フレーム
+`build_root(app, ui, screen)` を呼ぶ。`build_root` は画面を以下の領域に分割
+して各 sub view (`view/{transport,track_inspector,arrangement_view,bottom_panel,status_bar}.rs`)
+を呼ぶ:
 
 ```
-┌─ VStack ────────────────────────────┐
-│ Menu (File / Track)                 │
-│ Transport (Play/Stop, pos, BPM)     │
-│ HStack                              │
-│  ├ TrackInspector (220px)           │
-│  └ ArrangementView (stretch)        │
-│ StatusBar (file path)               │
-└─────────────────────────────────────┘
+┌─────────────────────────────────────────────────┐
+│ Transport (44px)  Play / Loop / Synth / Master  │
+├──────┬──────────────────────────────────────────┤
+│ Insp │ Arrangement (track headers + canvas)     │
+│ 280  │                                          │
+├──────┴──────────────────────────────────────────┤
+│ Bottom panel: Mixer or Piano Roll (240px)       │
+├─────────────────────────────────────────────────┤
+│ Status bar (24px)                               │
+└─────────────────────────────────────────────────┘
 ```
+
+Modal: plugin picker は `app.is_plugin_picker_open == true` のとき `view/plugin_picker.rs`
+を最後に呼んで半透明 overlay + 中央パネルとして上に重ねる。
 
 ### 状態 (daw_gui/src/app.rs の AppData)
 
-`#[derive(Lens)]` で以下を Lens 化:
-- `song: Song`
-- `file_path: Option<PathBuf>`
-- `cursor_row: u32`, `cursor_track: u32`
-- `tracker_text: String` — 描画用の事前レンダリング結果
-- `last_note: Note` — 空セル transpose のテンプレート
-- `is_playing: bool`
+plain mutable struct。reactive wrapper (Signal/Memo) は使わない:
+- `song: Song`, `file_path: Option<PathBuf>`
+- `selected_track: u32`, `selected_clip: Option<ClipRef>`, `selected_clips: Vec<ClipRef>`,
+  `selected_notes: Vec<u32>`
+- view state: `bottom_panel`, `arrange_zoom_x`, `arrange_scroll_beat`,
+  `pianoroll_zoom_x/y`, `pianoroll_scroll_beat`, `pianoroll_top_pitch`
+- 再生 / メータ: `is_playing`, `is_looping`, `playhead_beat`, `master_gain`,
+  `peak_l/r_norm`, `track_peak_display`
+- IPC: `audio_tx`, `plugin_tx`, `event_proxy: EventLoopProxy<AppEvent>`
+- view-local interaction: `last_click: Option<(Instant, x, y)>` (ダブルクリック検出)
 
-`#[lens(ignore)]`:
-- `audio_tx: Option<UnboundedSender<MainToChild>>`
-- `plugin_tx: Option<UnboundedSender<MainToChild>>`
+派生 (`Vec<TrackHeader>`, `Vec<ClipBox>`, `Vec<NoteBox>`, `Vec<TrackMixEntry>`,
+`Vec<ChainEntry>`, `String` lyric 等) は method として毎フレーム計算
+(`app.track_headers()`, `app.clip_boxes()`, `app.note_boxes()`, `app.track_mix()`,
+`app.inspector_chain()`, `app.selected_lyric()`, `app.selected_track_label()`)。
 
-`Song` は Vizia の `Data` trait を実装していないため `Binding` には使えない。
-state 変更時に `refresh_tracker_text()` で文字列化し、それを Lens 経由で Label に渡す方式。
+イベント処理: `pub fn handle_event(&mut self, event: AppEvent)` 一本。view からは
+`Edit::mutate(|app| app.handle_event(...))` で、background thread からは
+`event_proxy.send_event(...)` で呼ぶ。
 
 ### キーバインド (sing_like_coding 準拠)
 
@@ -500,7 +515,7 @@ state 変更時に `refresh_tracker_text()` で文字列化し、それを Lens 
 - [x] Named pipe + bincode の制御プレーン (Play / Stop / Session / LoadSong)
 - [x] Shared memory + セマフォのデータプレーン
 - [x] Audio Engine: CPAL (WASAPI) 経由でオーディオ出力
-- [x] GUI: Vizia で 4 パネルレイアウト + メニュー
+- [x] GUI: gui_01 (daw-ui) で 5 パネルレイアウト (transport / inspector / arrangement / bottom panel / status)
 - [x] Arrangement トラッカーグリッド描画（HackGen フォント、CJK 幅合わせ）
 - [x] hjkl ナビゲーション + ノート編集
 - [x] CLAP: Plugin Host で instrument プラグイン scan / load / activate / process

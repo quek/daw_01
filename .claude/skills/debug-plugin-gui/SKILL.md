@@ -15,7 +15,7 @@ daw_plugin_host のプラグイン GUI が動かないとき、どの層で止�
 ## 主な層
 
 ```
-daw_gui (Vizia 側)
+daw_gui (UI 側)
   ↓ AppEvent::TogglePluginGui
   ↓ PluginHostWindow::create() → u64 HWND
   ↓ MainToChild::OpenGuiEmbedded { host_hwnd } ──▶

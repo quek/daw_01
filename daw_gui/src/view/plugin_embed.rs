@@ -6,12 +6,12 @@
 //! container. The container is owned by daw_gui — the DAW controls when it
 //! opens, closes, and is resized — matching the CLAP "embedded" protocol.
 //!
-//! Why a top-level window rather than a Vizia child HWND? Vizia 0.3 does not
-//! expose its underlying winit HWND, and creating an additional native
-//! child inside a Vizia-managed area would fight winit's layout. A
-//! dedicated top-level container sidesteps that coupling while preserving
-//! the best-practice invariant that the host (not the plugin) owns the
-//! top-level window.
+//! Why a top-level window rather than a child HWND inside the main DAW
+//! window? The main window is owned by winit/wgpu, and creating an
+//! additional native child inside the GPU surface would fight the renderer's
+//! layout. A dedicated top-level container sidesteps that coupling while
+//! preserving the best-practice invariant that the host (not the plugin)
+//! owns the top-level window.
 
 #![cfg(windows)]
 
@@ -39,9 +39,9 @@ static CLASS_NAME: OnceLock<Vec<u16>> = OnceLock::new();
 /// RAII wrapper for the host-owned container HWND.
 pub struct PluginHostWindow {
     hwnd: HWND,
-    /// Set to true by the WNDPROC when the user hits the ✕ button. The Vizia
-    /// side polls this each UI tick and runs the full Close flow when set,
-    /// which cleanly tears down plugin state via IPC.
+    /// Set to true by the WNDPROC when the user hits the ✕ button. The DAW
+    /// side polls this each UI tick (in `AppData::on_tick`) and runs the
+    /// full Close flow when set, cleanly tearing down plugin state via IPC.
     close_requested: Arc<AtomicBool>,
 }
 
@@ -78,8 +78,8 @@ impl PluginHostWindow {
             )
         }?;
 
-        // Attach a close-request flag so the WNDPROC can signal the Vizia
-        // thread when the user clicks ✕.
+        // Attach a close-request flag so the WNDPROC can signal the DAW
+        // UI thread when the user clicks ✕.
         let close_requested = Arc::new(AtomicBool::new(false));
         unsafe {
             // Leak-into-pointer, reclaimed in Drop below.
@@ -97,7 +97,7 @@ impl PluginHostWindow {
     }
 
     /// Returns true once since the last call if the user clicked the ✕
-    /// button. Vizia polls this each UI tick to drive the Close flow.
+    /// button. The DAW polls this each UI tick to drive the Close flow.
     pub fn take_close_request(&self) -> bool {
         self.close_requested.swap(false, Ordering::AcqRel)
     }
@@ -223,7 +223,7 @@ unsafe extern "system" fn container_wnd_proc(
 ) -> LRESULT {
     // Intercept the ✕ button. We must NOT call DefWindowProcW for WM_CLOSE
     // (it would destroy the HWND behind our RAII wrapper). Instead: hide
-    // the window, and flip the close-request flag so the Vizia side can
+    // the window, and flip the close-request flag so the DAW side can
     // run the full close flow (send CloseGui over IPC and Drop the
     // wrapper — which is what destroys the HWND).
     if msg == WM_CLOSE {

@@ -69,7 +69,7 @@ $ARGUMENTS を実装する。
 | CLAP / VST3 仕様に関わる機能 | プリセット読込、thread pool、latency、tail、tuning 拡張 |
 | DAW として一般的な機能 | ピアノロール、ミキサー、バス、テンポオートメーション |
 | 正しい振る舞いが MIDI / CLAP 仕様に依存する | ノートオフ、ピッチベンド、MPE、時刻順イベント |
-| Vizia の使い方が不明 | カスタムビュー、キーボードフォーカス、IME、テーマ |
+| gui_01 (daw-ui) の使い方が不明 | heavy() / push_rect/text/lines, fader/knob/text_input, LayoutPass (taffy flexbox) |
 | VOICEVOX API の挙動が不明 | sing API のエッジケース、スピーカー切替、エラーハンドリング |
 
 調査で以下を明らかにする:

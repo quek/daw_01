@@ -415,7 +415,7 @@ fn dispatch_shortcut(code: WinitKeyCode, m: Modifiers, app: &mut AppData) -> boo
         // ----- Selection -----
         K::Delete if no_mod => {
             // Both events are no-op when their target is empty so the order is
-            // safe (notes prioritised in the original Vizia keymap).
+            // safe (notes are prioritised, then fall through to clip).
             app.handle_event(AppEvent::DeleteSelectedNotes);
             app.handle_event(AppEvent::DeleteSelectedClip);
             return true;

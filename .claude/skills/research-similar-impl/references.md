@@ -1,6 +1,6 @@
 # 調査対象プロジェクト
 
-| プロジェクト | 言語 | 特徴 | クローン先 | URL |
+| プロジェクト | 言語 | 特徴 | クローン先 / パス | URL |
 |---|---|---|---|---|
 | clap | C (ヘッダ) | **CLAP 仕様そのもの**。拡張ヘッダ (`ext/*.h`) でセマンティクスを確認する。**最優先** | /tmp/clap | https://github.com/free-audio/clap |
 | clap-host | C++ | CLAP ホストのリファレンス実装。ライフサイクル・スレッド設計の模範 | /tmp/clap-host | https://github.com/free-audio/clap-host |
@@ -8,7 +8,7 @@
 | nih-plug | Rust | Rust 製プラグインフレームワーク (CLAP/VST3)。FFI とイベント変換の設計 | /tmp/nih-plug | https://github.com/robbert-vdh/nih-plug |
 | clap-validator | Rust | CLAP プラグインを検証するホスト。ホスト側契約の確認に有用 | /tmp/clap-validator | https://github.com/free-audio/clap-validator |
 | Meadowlark | Rust | Rust 製 DAW、RT オーディオと UI の参考 | /tmp/meadowlark | https://github.com/MeadowlarkDAW/Meadowlark |
-| Vizia | Rust | GUI フレームワーク。カスタムビュー、Lens、IME の参考 | /tmp/vizia | https://github.com/vizia/vizia |
+| **gui_01 (daw-ui)** | Rust | **本プロジェクトで採用した自作 GUI ライブラリ。daw_01 の path 依存先** | F:\dev\gui_01 | (ローカル) |
 
 全プロジェクトを調査する必要はない。機能に最も関連するものを優先する。
 
@@ -18,33 +18,25 @@
 使うのは `Cargo.lock` で solver が選んだ crates.io 版。両者で API が違うなら、
 **crates.io 側を基準に実装する**。
 
-既知の乖離:
-- **Vizia 0.3.0 (crates.io) = Lens ベース**（`#[derive(Lens)]`, `Binding`, `Lens::map`、`Data` trait 必要）
-  **Vizia main = Signal ベースに移行中**（`Signal::new`, `ReadSignal`, `WriteSignal`）
-  → Song 型を Lens で bind するときに `Data` 未実装でコンパイル不能になる。解決策は
-  `AppData.tracker_text: String` のような派生文字列を保持して Lens 化する
-
-- **Vizia 0.3.0 の API 細部差異** (main とも違うので公式 docs を信じすぎない):
-  - `Slider::on_changing` ではなく `on_change`
-  - `Alignment::Bottom` は存在しない。`BottomCenter` / `BottomLeft` / `BottomRight`
-  - `List` のデフォルト CSS は `list-item { height: 30px }`。per-row フラット表示したい場合は
-    `cx.add_stylesheet("list.foo list-item { height: 17px; }")` で上書き
-  - `cx.spawn(|proxy| ...)` は std::thread を使うので内部で tokio の時間系 API は使えない
-
+既知の乖離・バージョン依存:
 - `windows` crate は 0.58 → 0.61 で `HANDLE` 型が `isize` → `*mut c_void` に変更
-
 - `bincode` 2.x は 1.x とは別 API（`Encode`/`Decode` derive）。IPC 型に
   `#[derive(bincode::Encode, bincode::Decode)]` が必要
+- `wgpu` 29: `InstanceDescriptor::new_without_display_handle()` でデフォルト構築、
+  `request_adapter` / `request_device` のシグネチャが `pollster::block_on` 前提に変わった
+- `winit` 0.30: `ApplicationHandler` trait に集約 (旧 EventLoop::run の closure 形式は廃止)。
+  Window 生成は `resumed` フェーズで `event_loop.create_window(attrs)`
 
 Agent に調査を依頼するときは「crates.io の `<crate> = \"X.Y.Z\"` 基準で」と明記。
 
-# 自プロジェクト（前作）
+# 自プロジェクト（前作・併存）
 
 | プロジェクト | パス | 参考ポイント |
 |---|---|---|
 | sing_like_coding | `F:\dev\sing_like_coding` | IPC (shmem.rs, protocol.rs), CLAP ホスト (clap_manager.rs), オーディオエンジン (singer.rs), コマンドパターン (command/), データモデル (model/) |
+| gui_01 サンプル | `F:\dev\gui_01\crates\examples\` | mixer / arrangement / piano_roll / automation / embedded_host / sample_editor — daw_01 の view 実装の参照 |
 
-前作に類似実装がある場合、**最も信頼性の高い参照元**として最初に確認する。
+前作 / gui_01 サンプルに類似実装がある場合、**最も信頼性の高い参照元**として最初に確認する。
 
 # API リファレンス・ガイド
 
@@ -53,8 +45,9 @@ Agent に調査を依頼するときは「crates.io の `<crate> = \"X.Y.Z\"` �
 | CLAP 公式 | https://github.com/free-audio/clap |
 | CLAP ホスト実装ガイド | https://github.com/free-audio/clap/blob/main/include/clap/plugin.h |
 | cpal | https://docs.rs/cpal |
-| Vizia ドキュメント | https://docs.vizia.dev / https://docs.rs/vizia |
-| Vizia examples | https://github.com/vizia/vizia/tree/main/examples |
+| winit | https://docs.rs/winit/0.30 |
+| wgpu | https://docs.rs/wgpu/29 |
+| gui_01 (daw-ui) | `F:\dev\gui_01\crates\{platform,renderer,ui}\src\` を直接 Read |
 | windows crate (Rust) | https://microsoft.github.io/windows-docs-rs/ |
 | Win32 API | https://learn.microsoft.com/en-us/windows/win32/api/ |
 | VOICEVOX Engine API | http://localhost:50021/docs (起動後の Swagger UI) |
@@ -75,8 +68,11 @@ Agent に調査を依頼するときは「crates.io の `<crate> = \"X.Y.Z\"` �
 | ウィンドウ埋め込み | `SetParent`, `SetWindowLongPtrW(GWL_STYLE)`, `raw-window-handle` |
 | 低レイテンシ I/O | `cpal::Stream`, WASAPI exclusive mode |
 | MIDI 入出力 | `midir::MidiInput` / `MidiOutput`, `wmidi::MidiMessage` |
-| Vizia カスタムビュー | `View` trait, `Canvas`, `cx.draw()`, キーボードイベント |
-| Vizia テーマ | CSS スタイリング、`cx.add_stylesheet()` |
+| gui_01 ボタン / フェーダー / ノブ | `Ui::button_at(id, label, rect, on_click)`, `fader_at`, `knob_at`, `text_input_at`, `checkbox_at` |
+| gui_01 カスタム描画 | `Ui::heavy(id, |hctx| { hctx.cached(viewport_key, |hctx| { hctx.push_rect/text/lines(...) }) })` |
+| gui_01 レイアウト | `LayoutPass::new() → leaf / flex / compute_at → rect(node)` (taffy flexbox ラッパー) |
+| gui_01 入力 | `Ui::pointer() → PointerFrame { pos, primary_just_pressed/released, scroll_delta, modifiers }` |
+| gui_01 background event | `EventLoopProxy<AppEvent>::send_event(event)` (winit 0.30 user event) |
 | VOICEVOX 歌唱 | `/sing_frame_audio_query`, `/frame_synthesis` |
 | VOICEVOX トーク | `/audio_query`, `/synthesis` |
 | VOICEVOX キャラクター | `/singers`, `/speakers` |
@@ -87,5 +83,5 @@ Agent に調査を依頼するときは「crates.io の `<crate> = \"X.Y.Z\"` �
 - `clap_process` のイベント配列は時刻順にソートされている必要がある
 - オーディオバッファは CLAP 側が所有する場合と、ホスト側が貸し出す場合があるため `flags` を確認
 - サブプロセスでプラグインを動かす場合、共有メモリのレイアウトとシグナリング順を厳密に設計する
-- Vizia の `View` trait 実装でイベントハンドリングの順序（`event` → `draw` サイクル）
+- gui_01 の `HeavyCtx::cached` 内の描画は viewport_key 一致時にスキップ。動的 overlay (cursor / 選択範囲) は cached の **外側** で `push_*`
 - VOICEVOX の歌唱クエリでは `key` は MIDI ノート番号（60 = C4）、`frame_length` はフレーム数（93.75Hz 基準）

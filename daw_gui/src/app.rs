@@ -7,8 +7,7 @@
 //!      lyric panel の入力源。
 //!   3. **view state** — zoom / scroll / playhead / peak meter。
 //!
-//! gui_01 (daw-ui) は immediate-mode + `Edit<M>` クロージャ方式。Vizia の
-//! `Signal<T>` / `Memo<T>` / `impl Model` は使わない。代わりに:
+//! gui_01 (daw-ui) は immediate-mode + `Edit<M>` クロージャ方式:
 //! - 状態は plain mutable field
 //! - 派生は method (`pub fn track_headers(&self) -> Vec<TrackHeader>` 等)
 //! - background thread → UI event は `EventLoopProxy<AppEvent>` 経由
@@ -308,7 +307,7 @@ impl AppData {
         }
     }
 
-    // -------- Derived snapshots (Vizia の Memo 相当、毎フレーム計算) ----------
+    // -------- Derived snapshots (毎フレーム計算; cache が必要なら view 側で持つ) -----
 
     pub fn bpm(&self) -> f32 {
         self.song.bpm
@@ -798,8 +797,8 @@ pub enum AppEvent {
 }
 
 impl AppData {
-    /// AppEvent dispatcher. Vizia の `impl Model` は無くなったので、view/runner
-    /// から直接これを呼ぶ。
+    /// AppEvent dispatcher。view から `Edit::mutate` 経由で、background thread
+    /// から `EventLoopProxy<AppEvent>` 経由で呼ばれる。
     pub fn handle_event(&mut self, event: AppEvent) {
         if Self::is_undoable(&event) {
             self.push_undo_snapshot();
