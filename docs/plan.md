@@ -727,27 +727,27 @@ arrangement) を実装 + bench 実証完了。波形 widget は PeakLines / Samp
 
 **残作業**: なし。M5.5 は単体 milestone として完了。次は M6 (Phase 2)。
 
-### M6 (Phase 2) — Phase 18-21 構成 + vello M7 送り
+### M6 (Phase 2) — Phase 18 + 21 完遂 / Phase 19 + 20 保留 / vello M7 送り ✅ M6 完了
 
-M5.5 完了後の DAW プラグイン対応・アクセシビリティ・波形編集サンプルを 4 phase に分割し、各 phase = 1 commit で段階的に進める (M5 Phase 13-17 と同形式)。当初候補 5 テーマのうち `vello サブシステム併用 (SVG アイコン用)` は、現状 rect/glyph/line で全 example が成立し SVG 需要が弱いため **M7 で評価 (M6 では見送り)**。
+M5.5 完了後の DAW プラグイン対応・アクセシビリティ・波形編集サンプルを進めた。当初 4 phase 構成 (Phase 18-21) で計画したが、**Phase 19 (baseview バックエンド)** と **Phase 20 (AccessKit 統合)** は upstream / scope 上の理由で保留に変更し、M6 は **Phase 18 + Phase 21** で完遂。当初候補 5 テーマの 1 つだった **vello サブシステム併用** は、現状 rect/glyph/line で全 example 成立 + SVG 需要弱いため **M7 で評価 (M6 では見送り)**。
 
 | Phase | テーマ | 状態 |
 |---|---|---|
-| 18 | プラグイン UI 埋め込み API + frame inject 経路 (drive_one_frame / OffscreenRenderer / examples/embedded_host) | ✅ 完了 |
-| 19 | baseview バックエンド (`WindowBackend` 第 2 実装) — feature gate `baseview` | ⏳ |
-| 20 | AccessKit 統合 (focusable widget の TreeUpdate) — feature gate `accesskit` | ⏳ |
-| 21 | 波形編集 sample (trim / linear fade / split) — examples/sample_edit_ops | ⏳ |
+| 18 | プラグイン UI 埋め込み API + frame inject 経路 (drive_one_frame / OffscreenRenderer / examples/embedded_host) | ✅ 完了 (commit d7e0a0a) |
+| 19 | baseview バックエンド (`WindowBackend` 第 2 実装) | ⏸️ 保留 — rwh 0.5/0.6 互換待ち / Window が `!Send + !Sync` / IME 未対応 / API 不安定 |
+| 20 | AccessKit 統合 (focusable widget の TreeUpdate) | ⏸️ 保留 — scope 大、ユーザ判断で M6 から除外、M7 以降で再評価 |
+| 21 | 波形編集 sample (trim / linear fade in / linear fade out) | ✅ 完了 (本コミット) |
 
 #### Phase 18 進捗 — プラグイン UI 埋め込み API + frame inject 経路 ✅ 完了
 
 | 成果物 | 状態 | 備考 |
 |---|---|---|
-| `crates/platform/src/winit_backend.rs`: `pub fn drive_one_frame<H: AppHost>(host, last_tick) -> bool` 切り出し (winit `RedrawRequested` ハンドラ内のロジックを関数化、baseview からも呼べるようにする布石) | ✅ | 本コミット |
-| `crates/platform/src/window.rs`: `WindowBackend` rustdoc にプラグイン UI 埋め込み手順 (HasWindowHandle/HasDisplayHandle 実装で外部 crate でも `Renderer<W>` に渡せる) を追記 | ✅ | 本コミット |
-| `crates/renderer/src/device.rs`: モジュール doc に「外部 crate での使用 (DAW プラグイン UI 埋め込み)」と drop 順序の責務 (親 window 寿命管理) を明記 | ✅ | 本コミット |
-| `crates/renderer/src/offscreen.rs`: `OffscreenRenderer::new(width, height)` + `render_to_rgba(&Scene) -> Vec<u8>` (window 不要、`compatible_surface=None`、render-to-texture + 256-align padding + `PollType::wait_indefinitely` readback) | ✅ | 本コミット |
-| `crates/examples/embedded_host/`: 自前 `EmbeddedHostWindow` (HasWindowHandle/HasDisplayHandle/WindowBackend 実装) を compile-time assert + `OffscreenRenderer` で 8ch fader 風 Scene を 1 frame render → `target/embedded_host_snapshot.png` 出力 | ✅ | 本コミット |
-| `cargo build/test/clippy/doc --workspace`: 全 pass、既存 6 example (mixer / waveform_validation / sample_editor / piano_roll / arrangement / automation) 回帰なし | ✅ | 本コミット |
+| `crates/platform/src/winit_backend.rs`: `pub fn drive_one_frame<H: AppHost>(host, last_tick) -> bool` 切り出し (winit `RedrawRequested` ハンドラ内のロジックを関数化、baseview からも呼べるようにする布石) | ✅ | commit d7e0a0a |
+| `crates/platform/src/window.rs`: `WindowBackend` rustdoc にプラグイン UI 埋め込み手順 (HasWindowHandle/HasDisplayHandle 実装で外部 crate でも `Renderer<W>` に渡せる) を追記 | ✅ | commit d7e0a0a |
+| `crates/renderer/src/device.rs`: モジュール doc に「外部 crate での使用 (DAW プラグイン UI 埋め込み)」と drop 順序の責務 (親 window 寿命管理) を明記 | ✅ | commit d7e0a0a |
+| `crates/renderer/src/offscreen.rs`: `OffscreenRenderer::new(width, height)` + `render_to_rgba(&Scene) -> Vec<u8>` (window 不要、`compatible_surface=None`、render-to-texture + 256-align padding + `PollType::wait_indefinitely` readback) | ✅ | commit d7e0a0a |
+| `crates/examples/embedded_host/`: 自前 `EmbeddedHostWindow` (HasWindowHandle/HasDisplayHandle/WindowBackend 実装) を compile-time assert + `OffscreenRenderer` で 8ch fader 風 Scene を 1 frame render → `target/embedded_host_snapshot.png` 出力 | ✅ | commit d7e0a0a |
+| `cargo build/test/clippy/doc --workspace`: 全 pass、既存 6 example (mixer / waveform_validation / sample_editor / piano_roll / arrangement / automation) 回帰なし | ✅ | commit d7e0a0a |
 
 **設計判断 (Phase 18)**:
 - **プラグイン UI 埋め込み API は trait bound で既にほぼ揃っていた**: `WindowBackend: HasWindowHandle + HasDisplayHandle` で raw-window-handle 受け渡しは公開済み。新規 trait method・新規型の追加は不要。Phase 18 は「足りている」ことを rustdoc + example で実証する形に。
@@ -755,12 +755,47 @@ M5.5 完了後の DAW プラグイン対応・アクセシビリティ・波形�
 - **wgpu 29 系 offscreen API の確認**: `Maintain::Wait` は廃止 (`PollType::wait_indefinitely()`)、`TexelCopyTextureInfo` / `TexelCopyBufferInfo` / `TexelCopyBufferLayout` の名称、`bytes_per_row` 256-align padding、`compatible_surface: None` で adapter 取得可 (native OK、WebGL2 のみ不可)。詳細は `CLAUDE.md` 既知の罠 (wgpu 29 offscreen) 参照。
 - **`examples/embedded_host` の `EmbeddedHostWindow` は dummy 実装**: `OffscreenRenderer` が handle 不要なので `Err(HandleError::NotSupported)`。実 DAW プラグインでは `unsafe { WindowHandle::borrow_raw(self.raw_handle) }` で親プロセスから受け取った handle を持ち上げる。compile-time assert で「外部 crate でも `WindowBackend + Send + Sync + 'static` 実装可能」を実証。
 
-**vello M7 送り判断 (Phase 18 commit に同梱)**:
-- 現状 rect/glyph/line strip primitive のみで全 example が成立、SVG アイコン需要弱い。
-- wgpu 29 + vello latest の互換性検証だけで 1 commit 食う見込み。AccessKit / baseview の方が DAW 用途として優先度高い。
-- M7 で SVG 需要が顕在化したときに改めて評価。
+#### Phase 19 (⏸️ 保留) — baseview バックエンド
 
-**残作業 (Phase 18)**: なし。次は Phase 19 (baseview バックエンド)。
+**保留理由 (実装着手時の調査で判明)**:
+- baseview master は raw_window_handle **0.5** のみ対応、gui_01 は 0.6.2。upstream PR は止まっており短期改善見込み低い。
+- 互換 shim (rwh 0.5 を別名で追加 + unsafe で 0.6 化) は unsafe コード増・メンテ負担で KISS に反する。
+- baseview `Window<'a>` は `PhantomData<*mut ()>` で `!Send + !Sync`、`Renderer<W: Send + Sync + 'static>` の bound を満たさない。
+- IME 完全未対応 / frame 駆動 ~66Hz 固定 / API 不安定 (0.1.0 で 6 年) など追加問題。
+- Phase 18 で raw-window-handle 受け渡し API は trait bound 経由で既に公開済み、実 DAW プラグインホスト (VST3/CLAP) では host が直接 raw handle を渡すので baseview バックエンドは必須ではない。
+
+**再開条件**: baseview が rwh 0.6 対応 (upstream PR merge or fork メンテ覚悟) + `Send + Sync` 実装。整い次第、Phase 18 の `drive_one_frame` をそのまま流用して 1 commit で実装可能。
+
+#### Phase 20 (⏸️ 保留) — AccessKit 統合
+
+**保留理由**:
+- scope 大: UiHost への `a11y_nodes` フィールド追加 + 6 widget (button/checkbox/fader/knob/text_input/automation_curve) への `register_a11y` 差し込み + accesskit_winit Adapter 統合 + ActionRequest → AppEvent 経路など、1 commit に収まらない可能性。
+- 現フェーズ (DAW GUI ライブラリ基盤) では a11y は実害なく後回し可能、優先度低い。
+
+**再開条件**: ユーザ判断で必要になったとき。M7 以降で再評価。
+
+#### Phase 21 進捗 — 波形編集 sample (trim / linear fade in / linear fade out) ✅ 完了
+
+| 成果物 | 状態 | 備考 |
+|---|---|---|
+| `crates/examples/sample_edit_ops/{Cargo.toml, src/main.rs}`: sample_editor を流用、ボタン UI 追加 (Trim / Fade In / Fade Out)、selection 範囲に対し destructive edit | ✅ | 本コミット |
+| Edit logic: Trim = `samples[0].drain(..start) + truncate(end-start) + generation += 1`、Fade In = `for i in start..end { samples[0][i] *= (i-start)/(end-start) } + generation += 1`、Fade Out = ramp 1→0 | ✅ | 本コミット |
+| WaveformPyramid は generation bump で再構築 (Phase 16 の incremental 拡張パスは未使用、destructive edit は完全 rebuild が DAW 通例) | ✅ | 本コミット |
+| docs/plan.md M6 セクション更新 (Phase 18 + 21 完遂、Phase 19 / 20 保留、vello M7 送り宣言を改めて明記) | ✅ | 本コミット |
+| `cargo build/test/clippy/doc --workspace`: 全 pass、既存 7 example (mixer / waveform_validation / sample_editor / piano_roll / arrangement / automation / embedded_host) 回帰なし | ✅ | 本コミット |
+
+**設計判断 (Phase 21)**:
+- **split は M7 送り**: cursor 位置で `Vec<f32>` を 2 分割するには `Model.samples: Vec<Vec<f32>>` を「複数 channel」から「複数 clip」に意味変更する必要があり、表示側 (波形 widget の per-clip cached() 化) も合わせて scope 拡大。1 commit に収めるため Phase 21 では trim / linear fade のみに絞る。
+- **curve fade は M7 送り**: automation_curve UX (Catmull-Rom + 点ドラッグ) を流用すれば実装可能だが、UI 拡張が必要。linear fade で「fade 操作の基本構造」を実証する方を優先。
+- **undo / redo は M7 送り**: history stack の整備が必要。Phase 21 では destructive edit のみ (戻せない)、`last_action` 文字列だけで何が起きたかを残す方式。
+- **sample_editor からのコピー流用**: Phase 21 の Model / View / Drag handling / Wheel zoom logic はほぼ sample_editor (commit 313d4c6) と同形。差分は (a) `forced_mode` キー切替を削除 (Auto モード固定で UI を絞る)、(b) `toolbar_y` を追加してボタン行を waveform 下に配置、(c) `Edit::mutate` 3 つを `button_at` の `on_click` で発行。
+- **WaveformPyramid generation bump で完全 rebuild**: Phase 16 で実装した incremental 拡張パス (録音中対応) は使わず、destructive edit のたびに `generation += 1` で LOD ピラミッド完全再構築。60 秒 stereo で数 ms (既測)、UI スレッドで実行可。
+
+**vello M7 送り (Phase 18 で宣言済み、再確認)**:
+- 現状 rect/glyph/line strip primitive のみで全 example (mixer / waveform_validation / sample_editor / piano_roll / arrangement / automation / embedded_host / sample_edit_ops) が成立、SVG アイコン需要弱い。
+- wgpu 29 + vello latest の互換性検証だけで 1 commit 食う見込み。M7 で SVG 需要が顕在化したときに改めて評価。
+
+**残作業 (Phase 21 / M6 全体)**: なし。**M6 完了**。次は M7 (未計画、case-by-case で判断: split / curve fade / undo の波形編集拡張、vello / SVG、baseview / AccessKit 再開、新たな widget など)。
 
 ---
 
