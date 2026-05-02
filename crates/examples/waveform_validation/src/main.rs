@@ -339,7 +339,9 @@ impl App {
                     fill: None,
                     baseline: Some(Color::rgba(1.0, 1.0, 1.0, 0.08)),
                     channel_layout: ChannelLayout::Overlay,
-                    render_mode: WaveformRenderMode::PeakLines,
+                    // M5 Phase 15: Auto モードで samples_per_pixel < 1.0 のとき
+                    // SamplePolyline (生サンプル折れ線) に自動切替する。
+                    render_mode: WaveformRenderMode::Auto,
                     line_width_px: 1.0,
                 };
                 // 各クリップが少し違うサンプル位置を表示するシフト量。view 全体に対して

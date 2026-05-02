@@ -616,6 +616,148 @@ fn build_peak_segments(
     segments
 }
 
+/// `Auto` モードのとき samples_per_pixel から実モードを決定する。
+/// 1 ピクセルあたり 1 サンプル未満 (= ズームイン状態) なら `SamplePolyline`、
+/// それ以外 (典型的な俯瞰表示) は `PeakLines` を選ぶ。閾値は plan.md の M5 仕様
+/// 「1 サンプル/ピクセル以下にズームしたとき」に合わせ 1.0 固定 (Phase 15 では
+/// flicker 対策のヒステリシスは入れず、目視で気になれば別タスクで対応)。
+fn resolve_render_mode(mode: WaveformRenderMode, samples_per_pixel: f64) -> WaveformRenderMode {
+    match mode {
+        WaveformRenderMode::Auto => {
+            if samples_per_pixel < 1.0 {
+                WaveformRenderMode::SamplePolyline
+            } else {
+                WaveformRenderMode::PeakLines
+            }
+        }
+        other => other,
+    }
+}
+
+/// `SamplePolyline` 描画: 生サンプルを直接読み、view 範囲内の連続 N 点を結ぶ
+/// `LineSegment` 列を生成する (LOD ピラミッド不使用)。`samples_per_pixel < 1.0` 前提。
+///
+/// `vertical_gain` / clamp / clipped 判定は `build_peak_segments` と挙動を揃える
+/// (gain 適用後 clamp、clipped は gain 適用前の生サンプル `|s| > 1.0` で判定)。
+/// segment の色は端点いずれかが clipped なら `fg_clipped`、両端正常なら `fg`。
+fn build_sample_polyline_segments(
+    src: &WaveformSource<'_>,
+    rect: Rect,
+    view: WaveformView,
+    style: WaveformStyle,
+) -> Vec<LineSegment> {
+    let channels = src.samples.channels();
+    let valid_len = clamp_valid_len(src);
+    if rect.w < 1.0 || rect.h < 1.0 || channels == 0 {
+        return Vec::new();
+    }
+
+    let view_start = view.start_sample as f64;
+    let view_len = view.len_samples.max(1) as f64;
+    let pixel_w = f64::from(rect.w);
+    let x_per_sample = pixel_w / view_len;
+
+    let (per_ch_h, ch_iter): (f32, Vec<usize>) = match style.channel_layout {
+        ChannelLayout::Stack => (rect.h / channels as f32, (0..channels).collect()),
+        ChannelLayout::Overlay => (rect.h, (0..channels).collect()),
+        ChannelLayout::FirstOnly => (rect.h, vec![0]),
+    };
+
+    // view 範囲のサンプル idx 列 (端点 1 つ extra で line を view 末端まで届かせる)
+    let s_start_int = view_start.max(0.0) as usize;
+    let s_end_unclamped = (view_start + view_len) as usize + 1;
+    let s_end_int = s_end_unclamped.min(valid_len);
+    let n_samples = s_end_int.saturating_sub(s_start_int);
+    let segs_per_ch = n_samples.saturating_sub(1);
+
+    let mut segments: Vec<LineSegment> =
+        Vec::with_capacity(segs_per_ch * ch_iter.len() + ch_iter.len());
+
+    // baseline (各チャンネル中央線、PeakLines と同形)
+    if let Some(base_color) = style.baseline {
+        match style.channel_layout {
+            ChannelLayout::Stack => {
+                for (slot, _ch) in ch_iter.iter().enumerate() {
+                    let y_mid = rect.y + per_ch_h * slot as f32 + per_ch_h * 0.5;
+                    segments.push(LineSegment {
+                        a: [rect.x, y_mid],
+                        b: [rect.x + rect.w, y_mid],
+                        color: base_color,
+                    });
+                }
+            }
+            ChannelLayout::Overlay | ChannelLayout::FirstOnly => {
+                let y_mid = rect.y + rect.h * 0.5;
+                segments.push(LineSegment {
+                    a: [rect.x, y_mid],
+                    b: [rect.x + rect.w, y_mid],
+                    color: base_color,
+                });
+            }
+        }
+    }
+
+    if n_samples < 2 {
+        return segments;
+    }
+
+    for (slot, &ch) in ch_iter.iter().enumerate() {
+        let ch_top = rect.y
+            + match style.channel_layout {
+                ChannelLayout::Stack => per_ch_h * slot as f32,
+                _ => 0.0,
+            };
+        let ch_mid = ch_top + per_ch_h * 0.5;
+        let ch_half = per_ch_h * 0.5;
+
+        let mut prev: Option<(f32, f32, bool)> = None; // (x, y, is_clipped)
+        for i in 0..n_samples {
+            let sample_idx = s_start_int + i;
+            let s = sample_at(&src.samples, ch, sample_idx);
+            let local_pos = sample_idx as f64 - view_start;
+            let x = rect.x + (local_pos * x_per_sample) as f32;
+            let v = (s * view.vertical_gain).clamp(-1.0, 1.0);
+            let y = ch_mid - v * ch_half;
+            let is_clipped = s.abs() > 1.0;
+            if let Some((px, py, prev_clipped)) = prev {
+                let color = if is_clipped || prev_clipped {
+                    style.fg_clipped
+                } else {
+                    style.fg
+                };
+                segments.push(LineSegment { a: [px, py], b: [x, y], color });
+            }
+            prev = Some((x, y, is_clipped));
+        }
+    }
+
+    segments
+}
+
+/// 生サンプルから 1 サンプル分の値を取り出す (channels = 0 / 範囲外は 0.0)。
+/// `peak_in_raw` の Interleaved stride アクセスと整合。
+#[inline]
+fn sample_at(samples: &SampleSlices<'_>, ch: usize, idx: usize) -> f32 {
+    match samples {
+        SampleSlices::Mono(s) => {
+            if ch == 0 { s.get(idx).copied().unwrap_or(0.0) } else { 0.0 }
+        }
+        SampleSlices::Planar(planes) => planes
+            .get(ch)
+            .and_then(|c| c.get(idx))
+            .copied()
+            .unwrap_or(0.0),
+        SampleSlices::Interleaved { data, channels } => {
+            let stride = *channels;
+            if stride == 0 || ch >= stride {
+                0.0
+            } else {
+                data.get(idx * stride + ch).copied().unwrap_or(0.0)
+            }
+        }
+    }
+}
+
 /// 事前に選択済みレベル (`col` + `decim`) を使って 1 ピクセル分の min/max を取る。
 /// レベル未選択 (= samples_per_pixel が小さすぎる) のときは生サンプルを走査する。
 #[allow(clippy::inline_always)]
@@ -697,11 +839,24 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         // pyramid は wid 経由の widget_state で持つので、closure 内で取り直す。
         // source / view / style は closure 内で borrow / Copy。
+        // M5 Phase 15: render_mode を resolve して SamplePolyline / PeakLines を分岐。
+        // SamplePolyline モードのときは LOD ピラミッドを触らず、生サンプルから直接描画する
+        // (samples_per_pixel < 1.0 = ピラミッド無意味な領域)。
         self.with_widget_node(wid, input_hash, |ui| {
-            let segments = {
-                let pyramid: &mut WaveformPyramid = ui.widget_state(wid);
-                pyramid.ensure_built(&source);
-                build_peak_segments(pyramid, &source, rect, view, style)
+            let view_len = view.len_samples.max(1) as f64;
+            let samples_per_pixel = view_len / f64::from(rect.w.max(1.0));
+            let effective_mode = resolve_render_mode(style.render_mode, samples_per_pixel);
+            let segments = match effective_mode {
+                WaveformRenderMode::SamplePolyline => {
+                    build_sample_polyline_segments(&source, rect, view, style)
+                }
+                // TODO(Phase 16): RmsBars 専用描画。Phase 15 では PeakLines にフォールバック。
+                WaveformRenderMode::PeakLines | WaveformRenderMode::RmsBars => {
+                    let pyramid: &mut WaveformPyramid = ui.widget_state(wid);
+                    pyramid.ensure_built(&source);
+                    build_peak_segments(pyramid, &source, rect, view, style)
+                }
+                WaveformRenderMode::Auto => unreachable!("resolve_render_mode で除去済"),
             };
             if !segments.is_empty() {
                 ui.push_lines(LineBatch {
@@ -890,6 +1045,47 @@ mod tests {
 
         let reference = build_full(&samples, 5_000);
         assert_pyramid_eq(&reference, &p);
+    }
+
+    /// 1ch Interleaved (`channels=1`) は同データの Mono / Planar と完全一致したピラミッドを
+    /// 構築すること。`peak_in_raw` の Interleaved 経路 (`data[i*1+0]`) が Mono の生 slice 走査と
+    /// 同等の min/max を返すことを担保する (Phase 15)。
+    #[test]
+    fn interleaved_1ch_matches_mono_pyramid() {
+        let s = deterministic_samples(10_000, 0);
+        let mono_samples = SampleSlices::Mono(&s);
+        let interleaved_samples = SampleSlices::Interleaved { data: &s, channels: 1 };
+
+        let mono_pyr = build_full(&mono_samples, 10_000);
+        let interleaved_pyr = build_full(&interleaved_samples, 10_000);
+
+        assert_pyramid_eq(&mono_pyr, &interleaved_pyr);
+    }
+
+    /// 2ch Interleaved データで ch=0 (L) と ch=1 (R) が独立に正しく取り出せること。
+    /// `[L0, R0, L1, R1, ...]` の stride アクセス (`data[i*2+ch]`) が Planar 等価であることを
+    /// 担保する (Phase 15)。
+    #[test]
+    fn interleaved_2ch_channels_independent() {
+        let l = deterministic_samples(10_000, 0);
+        let r = deterministic_samples(10_000, 1);
+        // Interleaved `[L0, R0, L1, R1, ...]` を組み立て
+        let mut interleaved: Vec<f32> = Vec::with_capacity(20_000);
+        for i in 0..10_000 {
+            interleaved.push(l[i]);
+            interleaved.push(r[i]);
+        }
+        let interleaved_samples =
+            SampleSlices::Interleaved { data: &interleaved, channels: 2 };
+
+        // Planar 版を reference に
+        let planes: [&[f32]; 2] = [&l, &r];
+        let planar_samples = SampleSlices::Planar(&planes);
+
+        let planar_pyr = build_full(&planar_samples, 10_000);
+        let interleaved_pyr = build_full(&interleaved_samples, 10_000);
+
+        assert_pyramid_eq(&planar_pyr, &interleaved_pyr);
     }
 
     /// `generation` 変化は完全再構築されること (たとえ valid_len が増えていても)。

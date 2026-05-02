@@ -534,7 +534,7 @@ cached が ~1.9x 高速。1000 widgets で frame あたり ~148 µs (= 148 ns/wi
 | **16** | マーカー (rect 角丸円) + RmsBars + examples/sample_editor | 中 | Phase 15 |
 | **17** | examples/arrangement (10×50 = 500 widgets を heavy 化) + bench | 中 | Phase 13, 16 |
 
-Phase 13, 14 完了 (2026-05-02 時点)。残 Phase 15-17 は別タスクで進める。
+Phase 13, 14, 15 完了 (2026-05-02 時点)。残 Phase 16-17 は別タスクで進める。
 
 オートメーションカーブ (ベジエ → CPU flatten → line) は当初 Phase 18 として M5 に
 入れていたが、heavy / 詳細波形 の主目標を区切りやすくするため **M5.5** (M5 完了後すぐの
@@ -594,8 +594,29 @@ Phase 13, 14 完了 (2026-05-02 時点)。残 Phase 15-17 は別タスクで進�
 - **bench は wgpu/font 不要のミニマル構成**: `UiHost::<()>::new()` + `Scene::new()` + `FrameInput::default()` で `host.frame()` を呼べる。Model に `()` を使うことでヒットテスト・選択 overlay を排除し、純粋な「heavy() + cached() の描画コマンド push コスト」を測定できる。warm-up 1 フレームで cache を populate してから本測定に入る点も scenegraph_cache.rs 踏襲。
 - **bench で cached が 5.77x 高速 (DoD: 5x+)**: M4 Phase 12 の 1000 button bench は 1.9x だったが、heavy は 1500 visible notes / フレームの rect push が dominant コストなので、cache hit の `extend_from_slice` が draw_fn の `partition_point + walk + push_rect ×1500+` を一気に置き換える分、差が 3 倍弱に拡大した。
 
-**残作業 (M5 残、Phase 15-17)**:
-- Phase 15: 波形 SamplePolyline + Auto + Interleaved unit test
+**Phase 15 進捗 (2026-05-02)** — 波形詳細モード (`SamplePolyline` + `Auto`) + Interleaved test:
+
+| 成果物 | 状態 | 備考 |
+|---|---|---|
+| `crates/ui/src/widgets/waveform.rs`: `resolve_render_mode` 追加 (Auto → SamplePolyline/PeakLines) | ✅ | (本コミット) |
+| `build_sample_polyline_segments`: 生サンプル直接読み + 連続 `LineSegment` 生成 (Stack/Overlay/FirstOnly 全対応) | ✅ | (本コミット) |
+| `sample_at` helper: Mono / Planar / Interleaved の sample 取得 (`peak_in_raw` と stride 整合) | ✅ | (本コミット) |
+| `Ui::waveform` の dispatch を SamplePolyline / PeakLines / RmsBars(fallback) に拡張 | ✅ | (本コミット) |
+| Interleaved unit test 2 件 (`interleaved_1ch_matches_mono_pyramid` / `interleaved_2ch_channels_independent`) | ✅ | (本コミット) |
+| `examples/waveform_validation` を `WaveformRenderMode::Auto` に切替 (新抽象を直後の example で実用) | ✅ | (本コミット) |
+| RmsBars は Phase 16 まで PeakLines fallback (TODO コメント付き) | ✅ | (本コミット) |
+
+**設計判断**:
+- **Auto 切替閾値 = 1.0 (固定)**: plan.md M5 仕様「1 サンプル/ピクセル以下にズームしたとき」に厳密準拠。`samples_per_pixel < 1.0` で `SamplePolyline`、それ以外で `PeakLines`。flicker 対策のヒステリシス (例 0.8/1.2 上下閾値) は Phase 15 では入れず、目視で気になれば別タスクで対応。
+- **`input_hash` に effective_mode を追加しない**: `style.render_mode` (= Auto そのもの) は既に hash に入っており、samples_per_pixel の変動は `view.len_samples` / `rect.w` の hash 変化で間接的に cache miss する → Auto 内部の切替に追加 hash 入れ込み不要 (KISS)。
+- **SamplePolyline は LOD 不使用 (生サンプル直接読み)**: `samples_per_pixel < 1.0` の領域では LOD ピラミッドの最細レベル (decimation=16) も粗すぎて意味がない。`build_sample_polyline_segments` は `pyramid` 引数を取らず `WaveformSource` の生 slice から直接 `(x, y)` 列を作る。`sample_at` helper で Mono/Planar/Interleaved 共通化。
+- **SamplePolyline モード時は `pyramid.ensure_built` を skip**: dispatch で SamplePolyline 経路だけ pyramid に触らない。次フレームで PeakLines に戻ったときは `fingerprint` チェックで no-op or 必要なら rebuild され、副作用なし。
+- **`vertical_gain` / `clamp` / `clipped` 判定は PeakLines と挙動を完全揃え**: gain 適用 → clamp → ch_mid 中央に展開、clipped は **gain 適用前の生サンプル `|s| > 1.0`** で判定。segment color は端点いずれかが clipped なら `fg_clipped`。両モード切替時に色味が連続するよう一致させた。
+- **`baseline` は両モードで同形描画**: 各 channel 中央線を 1 本の長い水平 LineSegment として push。Stack / Overlay / FirstOnly すべて `build_peak_segments` と同じパターン。
+- **`RmsBars` は PeakLines fallback (TODO Phase 16)**: 専用塗りつぶしは Phase 16 で実装する。Phase 15 で panic させず、Auto モード使用中に偶発的に `style.render_mode = RmsBars` がセットされても安全に表示できるようにする。
+- **Interleaved test 2 件で stride アクセスを固定**: `peak_in_raw` の `data[i*channels+ch]` 経路を 1ch (= Mono 一致) と 2ch (L/R 独立) で固定。今後 Interleaved 経路をいじったときに既存 Mono / Planar との一致が崩れたら即検知できる。
+
+**残作業 (M5 残、Phase 16-17)**:
 - Phase 16: マーカー (rect 角丸円) + RmsBars + examples/sample_editor
 - Phase 17: examples/arrangement (10×50 = 500 widgets を heavy 化) + bench
 
