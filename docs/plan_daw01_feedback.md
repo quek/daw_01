@@ -44,6 +44,8 @@ daw_01 (実 DAW プロトタイプ、`F:/dev/daw_01`、gui_01 を path 依存) �
 
 ## P0-1: `Shortcut::parse` が punctuation で panic する
 
+✅ done (commit eeb2ea3)
+
 ### Problem
 
 [crates/ui/src/shortcut.rs:115](../crates/ui/src/shortcut.rs#L115) `panic!("Shortcut::parse: unknown key token")`。`parse_key_token` は alphanumeric / 特殊キー / F1-F24 のみ受理。`/` `;` `,` `.` `[` `]` `\` `'` 等で起動時 panic。
@@ -116,6 +118,12 @@ feat(M9): P0-1 — Shortcut::parse で記号キー受理 + try_parse 追加
 ---
 
 ## P0-2: `Ui::tab_view` で外部から `selected` を変更できない
+
+✅ done (commit e66edaa)
+
+実装結論:
+- 未決 1 → A 案 (両方残す) を採用。`tab_view` (内部 state) + `tab_view_with_state` (外部 `&mut usize`) の 2 method を併存。同 id なら widget_state を共有し、外部値が internal を上書き sync するため途中切替も動く (回帰テスト `tab_view_internal_and_with_state_share_widget_state` で固定)。
+- 未決 2 → clamp + 書き戻し採用。dynamic な tab 増減 (close tab 等) で外部値が古くなっても次フレームで自動修正される。
 
 ### Problem
 
