@@ -696,12 +696,36 @@ arrangement) を実装 + bench 実証完了。波形 widget は PeakLines / Samp
 - examples/piano_roll: 100k notes + scroll + zoom + クリック、heavy 実用 (Phase 14)
 - examples/arrangement: 10 トラック × 50 クリップ = 500 widgets を heavy 化 (Phase 17)
 
-### M5.5 (オートメーションカーブ — M5 完了後すぐの別 milestone)
+### M5.5 (オートメーションカーブ — M5 完了後すぐの別 milestone) ✅ 完了 (2026-05-02)
 
-- ベジエ (cubic) → CPU flatten (適応分割で max segment 長 ≤ 2px) → LineSegment vec → push_lines
-- `crates/ui/src/widgets/automation.rs` で `Ui::automation_curve(id, rect, &points, style)` API
-- mixer (or 専用 example) で 1 本のオートメーションカーブ表示 + ノードドラッグで点編集
-- no-Clone trybuild 拡張
+**Phase M5.5 進捗** — `Ui::automation_curve` (cubic Bezier flatten + Catmull-Rom):
+
+| 成果物 | 状態 | 備考 |
+|---|---|---|
+| `crates/ui/src/widgets/automation.rs`: `AutomationCurveStyle` / `AutomationCurveResponse` / `AutomationCurveState` 型 + `flatten_cubic` (de Casteljau 適応分割) + `flatten_curve` (Catmull-Rom → cubic Bezier) + `Ui::automation_curve` API | ✅ | (本コミット) |
+| 適応分割閾値 `max_segment_px = 2.0` (デフォルト)、最大再帰深度 16 で無限再帰ガード | ✅ | (本コミット) |
+| `on_change(idx, (x, y)) -> Edit<M>` で 1 点だけ更新 (Vec 全体の copy 不要、no-Clone 整合) | ✅ | (本コミット) |
+| widget_state にドラッグ index + 開始 (x, y) を保持 (knob/fader と同パターン) | ✅ | (本コミット) |
+| 各点を rect 角丸円 (knob 同パターン、`radius: [r; 4]`) で描画、hover/drag で色切替 | ✅ | (本コミット) |
+| input_hash に points 全部 + style 含めて per-widget cache (Phase 11 with_widget_node 経由) | ✅ | (本コミット) |
+| `crates/ui/tests/ui/pass/automation.rs`: trybuild で no-Clone Model + automation_curve API が compile | ✅ | (本コミット) |
+| unit test 3 件: `flatten_cubic_returns_endpoint_for_straight_line` / `flatten_cubic_subdivides_for_curved` / `flatten_curve_empty_for_single_point` | ✅ | (本コミット) |
+| `crates/examples/automation/{Cargo.toml, src/main.rs}`: 6 点 sin curve + drag 編集 example | ✅ | (本コミット) |
+| `lib.rs` から `AutomationCurveResponse` / `AutomationCurveStyle` を re-export | ✅ | (本コミット) |
+| `widgets/mod.rs` に `pub mod automation` 追加 | ✅ | (本コミット) |
+| `cargo test --workspace`: 全 51 unit test pass (新規 3 件 + 既存 48) + trybuild 1 件 pass | ✅ | (本コミット) |
+
+**設計判断**:
+- **Catmull-Rom 自動 tangent 採用 (シンプル化)**: ユーザは点列 `&[(f32, f32)]` を渡すだけで滑らかな curve、Bezier handle 編集 UI は不要。隣接 4 点 `(P0, P1, P2, P3)` から `B1 = P1 + (P2-P0)/6, B2 = P2 - (P3-P1)/6` で cubic Bezier 制御点を生成。DAW UX (Ableton / Cubase 等) と整合、KISS。
+- **端点は仮想点 (P0=P1, P3=P2) で代用**: 端点で tangent が 0 になる (= 出入り角直角) が、KISS で初版採用。"natural" 端点 (P0 = 2*P1 - P2) は将来改善余地。
+- **適応分割 (de Casteljau + 中点分割)**: control points `P1, P2` の chord (P0-P3) からの最大垂直距離 `max(d1, d2)` が `style.max_segment_px` 未満まで再帰。直線部分は粗く、曲がり部分は細かく → segment 数最適化。最大再帰深度 16 で NaN / 異常値の無限再帰ガード。
+- **`on_change` シグネチャを `(usize, (f32, f32))` に**: 通常案 `FnOnce(Vec<(f32,f32)>) -> Edit<M>` だと Vec 全体の copy が発生し no-Clone 不変条件と相性悪い。`(idx, pos)` 単位で渡すことで Edit 内 `m.points[idx] = pos` の 1 点書き換えで済む。
+- **drag 編集スコープは「移動のみ」**: ユーザ判断 (Recommended)。点の追加 (double-click) / 削除 (Shift+click) は将来 M5.6 以降の拡張として保留 (Phase M5.5 のスコープを最小化、Bezier flatten + drag に集中)。
+- **input_hash に全 points を含める**: 100 点規模なら hash コスト軽量。1000 点超なら Vec allocation の毎フレーム発生が懸念だが、典型 automation curve は数十点なので KISS。
+- **node の rect 角丸円は knob と同パターン**: `radius: [r; 4]` (r = サイズ/2) で完全な円。Phase 16 のサンプル点マーカーと同形なので renderer 側追加実装なし。
+- **mixer ではなく専用 example**: mixer は既に 8ch fader/knob で密、追加スペース無し。`examples/automation` 新規作成で sample_editor / arrangement と並ぶ独立例にして mixer の保守を分離。
+
+**残作業**: なし。M5.5 は単体 milestone として完了。次は M6 (Phase 2)。
 
 ### M6 (Phase 2)
 

@@ -9,6 +9,7 @@ members = [
     "crates/examples/piano_roll",
     "crates/examples/sample_editor",
     "crates/examples/arrangement",
+    "crates/examples/automation",
 ]
 
 [workspace.package]

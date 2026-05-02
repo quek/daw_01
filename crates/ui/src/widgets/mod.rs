@@ -3,6 +3,7 @@
 //! M2: waveform (波形表示、line strip パイプラインを使う)。
 //! M3: fader / knob / checkbox / text_input。
 
+pub mod automation;
 pub mod button;
 pub mod checkbox;
 pub mod fader;
