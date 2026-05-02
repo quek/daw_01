@@ -177,7 +177,7 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // 2. パイプライン側の頂点/インスタンスバッファを準備
+        // 2. base pass の prepare
         self.rect.prepare(&self.device, &self.queue, &scene.rects, self.size);
         self.line.prepare(&self.device, &self.queue, &scene.line_batches, self.size);
         self.glyph.prepare(
@@ -187,13 +187,13 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
             self.size,
         );
 
-        // 3. encode
+        // 3. encode (base pass: clear + 通常 widget 描画)
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("daw-ui frame encoder"),
         });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("daw-ui main pass"),
+                label: Some("daw-ui base pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -209,6 +209,42 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
                 multiview_mask: None,
             });
 
+            self.rect.render(&mut pass, self.size);
+            self.line.render(&mut pass, self.size);
+            self.glyph.render(&mut pass);
+        }
+
+        // 4. popup pass — base pass の上に popup 用 primitive を再描画。
+        // 同じ pipeline インスタンスで prepare し直し → 別 render_pass で描く。
+        // LoadOp::Load で base pass の描画結果を保持。
+        if !scene.popup_rects.is_empty()
+            || !scene.popup_glyph_areas.is_empty()
+            || !scene.popup_line_batches.is_empty()
+        {
+            self.rect.prepare(&self.device, &self.queue, &scene.popup_rects, self.size);
+            self.line.prepare(&self.device, &self.queue, &scene.popup_line_batches, self.size);
+            self.glyph.prepare(
+                &self.device,
+                &self.queue,
+                &scene.popup_glyph_areas,
+                self.size,
+            );
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("daw-ui popup pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
             self.rect.render(&mut pass, self.size);
             self.line.render(&mut pass, self.size);
             self.glyph.render(&mut pass);

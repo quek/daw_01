@@ -53,6 +53,23 @@ enum Axis {
 }
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
+    /// `id` で識別される scroll_area の現在の offset を取得。
+    /// 同じ `id` で `scroll_area` がまだ呼ばれていなければ `(0.0, 0.0)`。
+    pub fn scroll_offset(&mut self, id: impl Hash) -> (f32, f32) {
+        let wid = WidgetId::ROOT.child((b"scroll_area", &id));
+        let state: &mut ScrollState = self.widget_state(wid);
+        state.offset
+    }
+
+    /// `id` で識別される scroll_area の offset を外から書き換える。
+    /// Ctrl+Wheel zoom などで anchor 維持式に offset を更新するときに使う。
+    /// 値は scroll_area 側でフレーム時に `[0, max]` にクランプされる。
+    pub fn set_scroll_offset(&mut self, id: impl Hash, offset: (f32, f32)) {
+        let wid = WidgetId::ROOT.child((b"scroll_area", &id));
+        let state: &mut ScrollState = self.widget_state(wid);
+        state.offset = offset;
+    }
+
     /// scroll_area widget。`rect` 内に `content_size` のコンテンツを表示し、
     /// はみ出し部分を scrollbar で操作可能にする。
     ///

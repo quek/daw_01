@@ -222,10 +222,12 @@ impl<M: ?Sized + 'static> UiHost<M> {
         drop(ui);
         // widget からの request_redraw 累積を commit (ui drop 後に local 変数を読む)。
         self.redraw_requested_in_last_frame = redraw_requested;
-        // ui が drop して scene の borrow が外れた後で、popup buffer を append する。
-        scene.rects.extend(popup_rects);
-        scene.glyph_areas.extend(popup_glyphs);
-        scene.line_batches.extend(popup_lines);
+        // ui が drop して scene の borrow が外れた後で、popup buffer を Scene の popup pass 用
+        // フィールドに移す (renderer は base pass の後に popup pass で再描画する設計、
+        // pipeline 順 rect→line→glyph 起因の z-order 問題を解消)。
+        scene.popup_rects.extend(popup_rects);
+        scene.popup_glyph_areas.extend(popup_glyphs);
+        scene.popup_line_batches.extend(popup_lines);
         // M4 Phase 11: 今フレームに登場しなかった widget を scenegraph から eviction。
         self.scenegraph.retain(&seen_widgets);
         edits

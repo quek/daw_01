@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use daw_ui_core::{
-    ChannelLayout, InputAccumulator, SampleSlices, UiHost, WaveformRenderMode, WaveformSource,
-    WaveformStyle, WaveformView, hash_inputs,
+    ChannelLayout, InputAccumulator, SampleSlices, UiHost, ViewportState1D, WaveformRenderMode,
+    WaveformSource, WaveformStyle, WaveformView, hash_inputs,
 };
 use daw_ui_platform::{
     AppEvent, AppHost, ElementState, Modifiers, PhysicalSize, ScrollDelta, WindowBackend,
@@ -44,12 +44,12 @@ struct ArrangementModel {
     valid_len: usize,
     generation: u64,
 
-    view_start: u64,
-    view_len: u64,
+    /// X 軸 view (M7+: ViewportState1D に集約、sample 単位)。
+    viewport: ViewportState1D,
     vertical_gain: f32,
 
+    /// レーン高さ倍率 (Ctrl+Wheel で操作)。Y scroll は scroll_area widget が管理。
     y_zoom: f32,
-    y_offset: f32,
 
     forced_mode: Option<WaveformRenderMode>,
 
@@ -65,14 +65,12 @@ impl ArrangementModel {
             samples,
             valid_len: total,
             generation: 0,
-            view_start: 0,
-            view_len: total as u64,
+            viewport: ViewportState1D::new(0.0, total as f64),
             vertical_gain: 1.0,
             y_zoom: 1.0,
-            y_offset: 0.0,
             forced_mode: None,
             last_frame_ms: 0.0,
-            last_action: format!("起動 ({N_WIDGETS} widgets を heavy 化)"),
+            last_action: format!("起動 ({N_WIDGETS} widgets を heavy 化, scroll_area 適用)"),
         }
     }
 
@@ -81,37 +79,15 @@ impl ArrangementModel {
     }
 
     fn pan_pixels(&mut self, dx: f32, widget_w: f32) {
-        if widget_w <= 0.0 || self.view_len == 0 {
-            return;
-        }
-        let spp = self.view_len as f64 / f64::from(widget_w);
-        let delta_samples = (f64::from(dx) * spp) as i64;
-        let total = self.total_frames();
-        let max_start = total.saturating_sub(self.view_len);
-        self.view_start = if delta_samples >= 0 {
-            self.view_start.saturating_sub(delta_samples.unsigned_abs())
-        } else {
-            self.view_start
-                .saturating_add(delta_samples.unsigned_abs())
-                .min(max_start)
-        };
+        let total = self.total_frames() as f64;
+        self.viewport.pan_pixels(dx, widget_w);
+        self.viewport.clamp_to(total);
     }
 
     fn zoom_at(&mut self, factor: f32, anchor_frac: f32) {
-        if self.view_len == 0 {
-            return;
-        }
-        let total = self.total_frames();
-        let anchor_sample =
-            self.view_start as f64 + f64::from(anchor_frac) * self.view_len as f64;
-        let new_len = ((self.view_len as f32) * factor)
-            .max(64.0)
-            .min(total as f32) as u64;
-        let new_anchor_offset = f64::from(anchor_frac) * new_len as f64;
-        let new_start = (anchor_sample - new_anchor_offset).max(0.0) as u64;
-        let max_start = total.saturating_sub(new_len);
-        self.view_start = new_start.min(max_start);
-        self.view_len = new_len.max(1);
+        let total = self.total_frames() as f64;
+        self.viewport.zoom_at(factor, anchor_frac, 64.0);
+        self.viewport.clamp_to(total);
     }
 }
 
@@ -140,17 +116,38 @@ fn arrangement_area(screen: PhysicalSize) -> Rect {
     Rect { x: pad_x, y: header_h, w, h }
 }
 
-fn clip_rect(area: Rect, i: usize, y_zoom: f32, y_offset: f32) -> Rect {
+/// 各 clip の時間軸上の配置 (DAW タイムライン式、X zoom が clip 幅に連動)。
+/// `viewport` で X 軸を unit (sample) → px に変換。
+/// `total_frames` は全 sample 数 (clip 配置の基準)。
+/// `scroll_offset_y` は scroll_area から得られる縦 scroll 量 (px)。
+fn clip_rect(
+    area: Rect,
+    i: usize,
+    y_zoom: f32,
+    scroll_offset_y: f32,
+    viewport: &ViewportState1D,
+    total_frames: f64,
+) -> Rect {
     let col = i % CLIPS_PER_TRACK;
     let row = i / CLIPS_PER_TRACK;
-    let cell_w = area.w / CLIPS_PER_TRACK as f32;
+    // 各 clip は CLIPS_PER_TRACK 等分で時間軸に並ぶ。clip 内は 95% を占めて 5% 間隙。
+    let clip_spacing = total_frames / CLIPS_PER_TRACK as f64;
+    let clip_start = col as f64 * clip_spacing;
+    let clip_end = clip_start + clip_spacing * 0.95;
+    let x_start = viewport.unit_to_px(clip_start, area.w);
+    let x_end = viewport.unit_to_px(clip_end, area.w);
     let cell_h = (area.h / TRACKS as f32) * y_zoom;
     Rect {
-        x: area.x + col as f32 * cell_w,
-        y: area.y + row as f32 * cell_h - y_offset,
-        w: (cell_w - 1.0).max(1.0),
+        x: area.x + x_start,
+        y: area.y + row as f32 * cell_h - scroll_offset_y,
+        w: (x_end - x_start).max(1.0),
         h: (cell_h - 1.0).max(1.0),
     }
+}
+
+/// 各 clip の時間軸上の長さ (sample 数)。clip_rect の cell_spacing × 0.95 と一致。
+fn clip_length_samples(total_frames: f64) -> u64 {
+    (total_frames / CLIPS_PER_TRACK as f64 * 0.95) as u64
 }
 
 // ----- App -----
@@ -164,7 +161,8 @@ struct App {
     input: InputAccumulator,
 
     pending_zoom_dy: f32,
-    drag_anchor: Option<(f32, u64)>,
+    /// drag 開始時の (mouse_x, viewport.view_start [unit = sample, f64])
+    drag_anchor: Option<(f32, f64)>,
     cur_mouse: Option<(f32, f32)>,
     cur_modifiers: Modifiers,
 
@@ -206,12 +204,13 @@ impl App {
         let pointer = input.pointer;
 
         // 1. drag panning (area 全域がドラッグ対象、無修飾 drag のみ)
+        // M7+: viewport.view_start (f64) を anchor として保存
         if pointer.primary_just_pressed
             && let Some((px, py)) = pointer.pos
             && area.contains(px, py)
             && !self.cur_modifiers.shift
         {
-            self.drag_anchor = Some((px, self.model.view_start));
+            self.drag_anchor = Some((px, self.model.viewport.view_start));
         }
         if pointer.primary_just_released {
             self.drag_anchor = None;
@@ -219,37 +218,38 @@ impl App {
         if let (Some((anchor_x, anchor_view_start)), Some((px, _))) =
             (self.drag_anchor, pointer.pos)
         {
-            self.model.view_start = anchor_view_start;
-            // 1 clip 幅基準で pan の感度を waveform_validation と揃える
-            let cell_w = area.w / CLIPS_PER_TRACK as f32;
-            self.model.pan_pixels(px - anchor_x, cell_w);
+            self.model.viewport.view_start = anchor_view_start;
+            // pan 感度: area 全幅基準 (= 画面 1 横分 drag で view_len 全部動く、DAW 標準)。
+            // 旧仕様 (cell_w 基準) は clip が固定配置だった頃の名残で、新仕様では area.w が正しい。
+            self.model.pan_pixels(px - anchor_x, area.w);
         }
 
-        // 2. wheel zoom (Ctrl で X/Y 切替)
+        // 2. wheel zoom — 新仕様 (M7+):
+        //   - 無修飾 Wheel: scroll_area 経由で Y scroll (本関数では何もしない)
+        //   - Shift+Wheel: X zoom (anchor = area 内の mouse_x 比率、clip 全体が時間軸上で zoom)
+        //   - Ctrl+Wheel: Y zoom (lane height) + scroll_area offset を anchor 維持で同期
+        // pending_zoom_dy は on_event で「修飾あり wheel のみ」蓄積される (下記 on_event 参照)。
+        // pending_y_zoom_update: (new_y_zoom, scale, local_y) を frame 内で scroll_offset と組み合わせる
+        let mut pending_y_zoom_update: Option<(f32, f32, f32)> = None;
         if self.pending_zoom_dy.abs() > 0.0 {
             let factor = (-self.pending_zoom_dy * 0.15).exp();
             if self.cur_modifiers.ctrl {
-                // Y zoom: y_zoom + y_offset anchor 維持 (waveform_validation と同じロジック)
                 let y_factor = 1.0 / factor;
                 let cell_h_base = area.h / TRACKS as f32;
                 let old_zoom = self.model.y_zoom;
                 let new_zoom = (old_zoom * y_factor).clamp(0.1, 16.0);
                 let mouse_y = self.cur_mouse.map_or(area.y + area.h * 0.5, |(_, my)| my);
-                let local_y = mouse_y - area.y;
+                let local_y = (mouse_y - area.y).clamp(0.0, area.h);
                 let old_cell_h = (cell_h_base * old_zoom).max(0.001);
-                let anchor_track_unit = (local_y + self.model.y_offset) / old_cell_h;
                 let new_cell_h = cell_h_base * new_zoom;
-                let new_y_offset_raw = anchor_track_unit * new_cell_h - local_y;
-                let total_h = TRACKS as f32 * new_cell_h;
-                let max_offset = (total_h - area.h).max(0.0);
-                self.model.y_zoom = new_zoom;
-                self.model.y_offset = new_y_offset_raw.clamp(0.0, max_offset);
-            } else {
-                // X zoom: view_len、anchor は cur_mouse の clip 内 x 比率
+                let scale = new_cell_h / old_cell_h;
+                // anchor 維持: new_offset = (local_y + old_offset) * scale - local_y
+                // (frame closure 内で old_offset = ui.scroll_offset を取得して計算)
+                pending_y_zoom_update = Some((new_zoom, scale, local_y));
+            } else if self.cur_modifiers.shift {
+                // X zoom: anchor は mouse_x の area 内比率 (DAW 標準: ポインタ位置を中心に zoom)
                 let anchor_frac = if let Some((mx, _)) = self.cur_mouse {
-                    let cell_w = area.w / CLIPS_PER_TRACK as f32;
-                    let local = (mx - area.x).rem_euclid(cell_w);
-                    (local / cell_w).clamp(0.0, 1.0)
+                    ((mx - area.x) / area.w).clamp(0.0, 1.0)
                 } else {
                     0.5
                 };
@@ -258,22 +258,24 @@ impl App {
             self.pending_zoom_dy = 0.0;
         }
 
-        // 3. viewport_key + cache HIT/MISS 推定 (build_ui の前段で計算)
-        let viewport_key = (
-            b"arrangement_v1" as &[u8],
-            self.model.view_start,
-            self.model.view_len,
+        // scroll_area の content_size。y_zoom × TRACKS 分の高さ。
+        let cell_h = (area.h / TRACKS as f32) * self.model.y_zoom;
+        let content_h = TRACKS as f32 * cell_h;
+        let content_size = (area.w, content_h);
+
+        // 3. viewport_key + cache HIT/MISS 推定 (scroll_offset を frame 内で取得して再計算)
+        // 一旦、簡易的に y_zoom と viewport だけで viewport_key を作る。
+        let viewport_key_seed = (
+            b"arrangement_v2" as &[u8],
+            self.model.viewport.view_start.to_bits(),
+            self.model.viewport.view_len.to_bits(),
             self.model.y_zoom.to_bits(),
-            self.model.y_offset.to_bits(),
             self.model.vertical_gain.to_bits(),
             area.w.to_bits(),
             area.h.to_bits(),
             self.model.generation,
             forced_mode_tag(self.model.forced_mode),
         );
-        let viewport_hash = hash_inputs(viewport_key);
-        self.last_cache_hit = Some(viewport_hash) == self.last_viewport_hash;
-        self.last_viewport_hash = Some(viewport_hash);
 
         let mode_str = match self.model.forced_mode {
             Some(WaveformRenderMode::PeakLines) => "PeakLines (forced)",
@@ -281,18 +283,23 @@ impl App {
             Some(WaveformRenderMode::RmsBars) => "RmsBars (forced)",
             None | Some(WaveformRenderMode::Auto) => "Auto",
         };
+        let view_start_u = self.model.viewport.view_start as u64;
+        let view_len_u = self.model.viewport.view_len as u64;
         let hud = format!(
-            "frame {:>5.2}ms │ view [{:>7}..{:>7}) │ spp {:>6.1} │ {} widgets │ y_zoom {:.2} │ y_offset {:>5.0} │ mode {} │ cache {}",
+            "frame {:>5.2}ms │ view [{:>7}..{:>7}) │ spp {:>6.1} │ {} widgets │ y_zoom {:.2} │ mode {} │ cache {}",
             self.model.last_frame_ms,
-            self.model.view_start,
-            self.model.view_start + self.model.view_len,
-            self.model.view_len as f64 / f64::from(area.w),
+            view_start_u,
+            view_start_u + view_len_u,
+            self.model.viewport.view_len / f64::from(area.w),
             N_WIDGETS,
             self.model.y_zoom,
-            self.model.y_offset,
             mode_str,
             if self.last_cache_hit { "HIT " } else { "MISS" },
         );
+
+        let last_cache_hit = self.last_cache_hit;
+        let last_viewport_hash = &mut self.last_viewport_hash;
+        let mut new_viewport_hash: u64 = 0;
 
         self.ui.frame(
             &mut self.model,
@@ -300,10 +307,22 @@ impl App {
             screen,
             input,
             |m, ui| {
+                // Ctrl+Wheel zoom の anchor 維持: scroll_area の offset を更新
+                // anchor 維持式: new_offset = (local_y + old_offset) * scale - local_y
+                // → mouse 位置 (local_y) が指す track unit が zoom 後も同じ screen 位置に残る
+                if let Some((new_zoom, scale, local_y)) = pending_y_zoom_update {
+                    let old_offset = ui.scroll_offset("arr_scroll").1;
+                    let new_offset = ((local_y + old_offset) * scale - local_y).max(0.0);
+                    ui.set_scroll_offset("arr_scroll", (0.0, new_offset));
+                    ui.push_edit(daw_ui_core::Edit::mutate(move |mm: &mut ArrangementModel| {
+                        mm.y_zoom = new_zoom;
+                    }));
+                }
+
                 // --- HUD ---
                 ui.label_at(
                     "title",
-                    "daw-ui arrangement — M5 Phase 17 (10 tracks × 50 clips = 500 widgets を heavy 化)",
+                    "daw-ui arrangement — M5 Phase 17 + M7 scroll_area (10 tracks × 50 clips = 500 widgets)",
                     16.0, 16.0, 18.0,
                     Color::rgb(0.95, 0.95, 0.97),
                 );
@@ -311,14 +330,14 @@ impl App {
                     "hud",
                     &hud,
                     16.0, 44.0, 13.0,
-                    if self.last_cache_hit {
+                    if last_cache_hit {
                         Color::rgb(0.55, 0.85, 0.65)
                     } else {
                         Color::rgb(0.95, 0.78, 0.55)
                     },
                 );
 
-                // --- 500 widgets を heavy() + cached() で描画 ---
+                // --- 500 widgets を scroll_area + heavy() + cached() で描画 ---
                 let plane: &[f32] = m.samples.first().map_or(&[][..], Vec::as_slice);
                 let planes: [&[f32]; 1] = [plane];
                 let source = WaveformSource {
@@ -338,26 +357,40 @@ impl App {
                     line_width_px: 1.0,
                 };
 
-                ui.heavy("arrangement", |hctx| {
-                    hctx.cached(viewport_key, |hctx| {
-                        let shift_per_clip = m.view_len / CLIPS_PER_TRACK as u64;
-                        let max_start = m.total_frames().saturating_sub(m.view_len);
-                        for i in 0..N_WIDGETS {
-                            let rect = clip_rect(area, i, m.y_zoom, m.y_offset);
-                            // 画面外の clip は描画 skip (cached miss 時の widget 描画コスト削減)
-                            if rect.y + rect.h < area.y || rect.y > area.y + area.h {
-                                continue;
+                let view_len_unit = m.viewport.view_len;
+                let view_start_unit = m.viewport.view_start;
+                let total_frames = m.total_frames() as f64;
+
+                ui.scroll_area("arr_scroll", area, content_size, |ui, offset| {
+                    // viewport_key に scroll_offset_y も含める (scroll で見える行が変わるため)
+                    let viewport_key = (viewport_key_seed, offset.1.to_bits());
+                    new_viewport_hash = hash_inputs(viewport_key);
+
+                    ui.heavy("arrangement", |hctx| {
+                        hctx.cached(viewport_key, |hctx| {
+                            let clip_len = clip_length_samples(total_frames);
+                            for i in 0..N_WIDGETS {
+                                let rect = clip_rect(area, i, m.y_zoom, offset.1, &m.viewport, total_frames);
+                                // viewport / scroll 範囲外なら描画 skip
+                                if rect.y + rect.h < area.y || rect.y > area.y + area.h {
+                                    continue;
+                                }
+                                if rect.x + rect.w < area.x || rect.x > area.x + area.w {
+                                    continue;
+                                }
+                                // 各 clip は波形の 0..clip_len を全幅表示 (DAW の clip 標準)。
+                                // X zoom で clip 幅 (rect.w) が変わるため、内部波形も同じ比率で
+                                // 拡大表示される。
+                                let view = WaveformView {
+                                    start_sample: 0,
+                                    len_samples: clip_len,
+                                    vertical_gain: m.vertical_gain,
+                                };
+                                let _ = hctx.waveform(("clip", i), rect, source, view, style);
                             }
-                            let view = WaveformView {
-                                start_sample: m
-                                    .view_start
-                                    .saturating_add(shift_per_clip * (i as u64))
-                                    .min(max_start),
-                                len_samples: m.view_len,
-                                vertical_gain: m.vertical_gain,
-                            };
-                            let _ = hctx.waveform(("clip", i), rect, source, view, style);
-                        }
+                            let _ = view_start_unit;
+                            let _ = view_len_unit;
+                        });
                     });
                 });
 
@@ -365,7 +398,7 @@ impl App {
                 let footer_y = (screen.height as f32 - 44.0).max(0.0);
                 ui.label_at(
                     "footer1",
-                    "Drag = X pan │ Wheel = X zoom │ Ctrl+Wheel = Y zoom (lane height)",
+                    "Drag = X pan │ Wheel = Y scroll │ Shift+Wheel = X zoom │ Ctrl+Wheel = Y zoom (lane height)",
                     16.0, footer_y, 13.0,
                     Color::rgb(0.65, 0.68, 0.72),
                 );
@@ -384,6 +417,8 @@ impl App {
             },
         );
 
+        self.last_cache_hit = Some(new_viewport_hash) == *last_viewport_hash;
+        *last_viewport_hash = Some(new_viewport_hash);
     }
 }
 
@@ -405,7 +440,13 @@ impl AppHost for App {
         if let AppEvent::PointerLeft = &ev {
             self.cur_mouse = None;
         }
-        if let AppEvent::Scroll(delta) = &ev {
+        // 修飾あり wheel (Ctrl = Y zoom / Shift = X zoom) のみ pending_zoom_dy に蓄積。
+        // 無修飾 wheel は InputAccumulator 経由で scroll_area が Y scroll として消費。
+        let is_modifier_scroll = matches!(ev, AppEvent::Scroll(_))
+            && (self.cur_modifiers.ctrl || self.cur_modifiers.shift);
+        if let AppEvent::Scroll(delta) = &ev
+            && (self.cur_modifiers.ctrl || self.cur_modifiers.shift)
+        {
             let dy = match delta {
                 ScrollDelta::Lines { y, .. } => *y,
                 ScrollDelta::Pixels { y, .. } => *y as f32 / 30.0,
@@ -439,7 +480,12 @@ impl AppHost for App {
                 _ => {}
             }
         }
-        self.input.ingest(&ev);
+        // Ctrl/Shift+wheel は zoom 用に独自処理 (上の pending_zoom_dy)。
+        // InputAccumulator に流すと scroll_area の take_scroll_in_rect が消費して
+        // anchor 維持式の new_offset から wheel 分が再度引かれて anchor がズレる。
+        if !is_modifier_scroll {
+            self.input.ingest(&ev);
+        }
         match ev {
             AppEvent::Resized(size) => {
                 self.renderer.resize(size);

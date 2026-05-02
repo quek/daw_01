@@ -135,12 +135,25 @@ pub struct LineBatch {
 }
 
 /// 1 フレームの全描画コマンド。
+///
+/// 2-pass 描画 (M7+ popup 対応):
+/// - **base pass**: `rects` → `line_batches` → `glyph_areas` の順で 1 度描画
+/// - **popup pass**: `popup_rects` → `popup_line_batches` → `popup_glyph_areas` を再度同順で描画
+///
+/// popup を独立 pass にする理由: pipeline 順 (rect→line→glyph) のため、popup の rect と
+/// 通常 widget の glyph が混在すると glyph が popup rect の上に出てしまう。popup を 2 度目の
+/// pass にすると popup 内の glyph が必ず通常 widget の最前面になる。
 #[derive(Debug)]
 pub struct Scene {
     pub clear_color: wgpu::Color,
     pub rects: Vec<RectCommand>,
     pub glyph_areas: Vec<GlyphArea>,
     pub line_batches: Vec<LineBatch>,
+    /// popup 用 deferred buffer (frame 末尾で `Ui` の popup_rects 等から移される)。
+    /// renderer はこれを 2 nd pass で描画する。
+    pub popup_rects: Vec<RectCommand>,
+    pub popup_glyph_areas: Vec<GlyphArea>,
+    pub popup_line_batches: Vec<LineBatch>,
 }
 
 impl Scene {
@@ -150,6 +163,9 @@ impl Scene {
             rects: Vec::new(),
             glyph_areas: Vec::new(),
             line_batches: Vec::new(),
+            popup_rects: Vec::new(),
+            popup_glyph_areas: Vec::new(),
+            popup_line_batches: Vec::new(),
         }
     }
 
@@ -157,6 +173,9 @@ impl Scene {
         self.rects.clear();
         self.glyph_areas.clear();
         self.line_batches.clear();
+        self.popup_rects.clear();
+        self.popup_glyph_areas.clear();
+        self.popup_line_batches.clear();
     }
 
     pub fn push_rect(&mut self, cmd: RectCommand) {

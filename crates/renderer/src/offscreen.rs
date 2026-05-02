@@ -99,6 +99,7 @@ impl OffscreenRenderer {
     ///
     /// # Errors
     /// staging buffer の `map_async` / `Device::poll` が失敗した場合。
+    #[allow(clippy::too_many_lines)]
     pub fn render_to_rgba(&mut self, scene: &Scene) -> Result<Vec<u8>, RenderError> {
         let w = self.size.width;
         let h = self.size.height;
@@ -127,24 +128,51 @@ impl OffscreenRenderer {
             mapped_at_creation: false,
         });
 
-        // 3. pipeline buffers の prepare (Renderer::render と同形)
+        // 3. base pass の prepare (Renderer::render と同形)
         self.rect.prepare(&self.device, &self.queue, &scene.rects, self.size);
         self.line.prepare(&self.device, &self.queue, &scene.line_batches, self.size);
         self.glyph.prepare(&self.device, &self.queue, &scene.glyph_areas, self.size);
 
-        // 4. encode: render pass + copy_texture_to_buffer
+        // 4. encode: base pass + (popup pass) + copy_texture_to_buffer
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("daw-ui offscreen encoder"),
         });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("daw-ui offscreen pass"),
+                label: Some("daw-ui offscreen base pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(scene.clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.rect.render(&mut pass, self.size);
+            self.line.render(&mut pass, self.size);
+            self.glyph.render(&mut pass);
+        }
+        if !scene.popup_rects.is_empty()
+            || !scene.popup_glyph_areas.is_empty()
+            || !scene.popup_line_batches.is_empty()
+        {
+            self.rect.prepare(&self.device, &self.queue, &scene.popup_rects, self.size);
+            self.line.prepare(&self.device, &self.queue, &scene.popup_line_batches, self.size);
+            self.glyph.prepare(&self.device, &self.queue, &scene.popup_glyph_areas, self.size);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("daw-ui offscreen popup pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],

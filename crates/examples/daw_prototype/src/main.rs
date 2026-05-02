@@ -146,6 +146,31 @@ impl App {
                                 m.last_action = "File → Open".to_string();
                             })
                         });
+                        // M7+ sub_menu cascade demo: hover で右に出る
+                        sub.sub_menu("Recent", |recent| {
+                            recent.item("project1.daw", || {
+                                Edit::mutate(|m: &mut DawModel| {
+                                    m.last_action = "File → Recent → project1.daw".to_string();
+                                })
+                            });
+                            recent.item("session_2026.daw", || {
+                                Edit::mutate(|m: &mut DawModel| {
+                                    m.last_action = "File → Recent → session_2026.daw".to_string();
+                                })
+                            });
+                            recent.sub_menu("Older", |older| {
+                                older.item("draft_a.daw", || {
+                                    Edit::mutate(|m: &mut DawModel| {
+                                        m.last_action = "File → Recent → Older → draft_a".to_string();
+                                    })
+                                });
+                                older.item("draft_b.daw", || {
+                                    Edit::mutate(|m: &mut DawModel| {
+                                        m.last_action = "File → Recent → Older → draft_b".to_string();
+                                    })
+                                });
+                            });
+                        });
                         sub.item("Save", || {
                             Edit::mutate(|m: &mut DawModel| {
                                 m.last_action = "File → Save".to_string();
