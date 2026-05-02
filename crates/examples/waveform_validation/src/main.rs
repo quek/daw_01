@@ -20,7 +20,7 @@ use daw_ui_core::{
     WaveformSource, WaveformStyle, WaveformView,
 };
 use daw_ui_platform::{
-    AppEvent, AppHost, ElementState, PhysicalKey, PhysicalSize, ScrollDelta,
+    AppEvent, AppHost, ElementState, Modifiers, PhysicalKey, PhysicalSize, ScrollDelta,
     WindowBackend, winit_backend,
 };
 use daw_ui_renderer::{Color, Rect, Renderer, Scene};
@@ -49,8 +49,14 @@ struct WaveformAppModel {
     view_start: u64,
     /// 表示する frame 数。
     view_len: u64,
-    /// 縦ゲイン。
+    /// 縦ゲイン (waveform 振幅倍率、現状 1.0 固定)。
     vertical_gain: f32,
+    /// レーン高さ倍率 (Ctrl+wheel で操作)。1.0 で全 TRACKS が area に収まる、
+    /// > 1.0 で 1 レーンが大きくなり下のトラックは area からはみ出す (y_offset で pan)。
+    y_zoom: f32,
+    /// レーン pan の y オフセット (px)。Ctrl+wheel zoom の cur_mouse anchor を維持するため
+    /// 自動更新する。0 で一番上の track が area top に揃う。
+    y_offset: f32,
 
     /// REC シミュレーション中かどうか。
     recording: bool,
@@ -73,6 +79,8 @@ impl WaveformAppModel {
             view_start: 0,
             view_len: total_frames as u64,
             vertical_gain: 1.0,
+            y_zoom: 1.0,
+            y_offset: 0.0,
             recording: false,
             rec_pos: 0,
             last_frame_ms: 0.0,
@@ -184,14 +192,15 @@ fn waveform_area(screen: PhysicalSize) -> Rect {
 }
 
 /// `i` 番目のクリップ (0..N_WIDGETS) の rect を返す。grid の (col, row) 配置。
-fn clip_rect(area: Rect, i: usize) -> Rect {
+/// `y_zoom` でレーン高さ倍率、`y_offset` で縦 pan (anchor 維持型 zoom 用、px 単位)。
+fn clip_rect(area: Rect, i: usize, y_zoom: f32, y_offset: f32) -> Rect {
     let col = i % CLIPS_PER_TRACK;
     let row = i / CLIPS_PER_TRACK;
     let cell_w = area.w / CLIPS_PER_TRACK as f32;
-    let cell_h = area.h / TRACKS as f32;
+    let cell_h = (area.h / TRACKS as f32) * y_zoom;
     Rect {
         x: area.x + col as f32 * cell_w,
-        y: area.y + row as f32 * cell_h,
+        y: area.y + row as f32 * cell_h - y_offset,
         // 1px のギャップでセル境界が見えるように
         w: (cell_w - 1.0).max(1.0),
         h: (cell_h - 1.0).max(1.0),
@@ -212,6 +221,9 @@ struct App {
     drag_anchor: Option<(f32, u64)>,
     /// 現在のマウス位置 (zoom anchor 用に on_event で追従)
     cur_mouse: Option<(f32, f32)>,
+    /// 現在の修飾キー状態 (`AppEvent::ModifiersChanged` で更新)。Ctrl+wheel = Y zoom
+    /// (vertical_gain) を分岐するために App 側で track する。
+    cur_modifiers: Modifiers,
 
     /// REC 中の前フレーム時刻 (経過 dt 計算用)
     rec_last_tick: Option<Instant>,
@@ -233,6 +245,7 @@ impl App {
             pending_zoom_dy: 0.0,
             drag_anchor: None,
             cur_mouse: None,
+            cur_modifiers: Modifiers::default(),
             rec_last_tick: None,
             last_frame_start: None,
         }
@@ -267,18 +280,40 @@ impl App {
             self.model.pan_pixels(px - anchor_x, cell_w);
         }
 
-        // 2. ズーム適用 (cur_mouse を anchor に)
+        // 2. ズーム適用 (Ctrl で X/Y 切替、cur_mouse を anchor に)
         if self.pending_zoom_dy.abs() > 0.0 {
-            // grid 内での anchor 位置はクリップ内 x の比率を使う。
-            let anchor_frac = if let Some((mx, _)) = self.cur_mouse {
-                let cell_w = area.w / CLIPS_PER_TRACK as f32;
-                let local = (mx - area.x).rem_euclid(cell_w);
-                (local / cell_w).clamp(0.0, 1.0)
-            } else {
-                0.5
-            };
             let factor = (-self.pending_zoom_dy * 0.15).exp();
-            self.model.zoom_at(factor, anchor_frac);
+            if self.cur_modifiers.ctrl {
+                // Y zoom: レーン高さ倍率 (y_zoom) を変更。cur_mouse.y の位置にある track が
+                // 同じスクリーン y に残るよう y_offset を anchor 維持型で更新する
+                // (= focus track が画面で動かない感覚)。
+                // Y は「ホイール上でレーン拡大」に揃えるため factor を逆数化 (X は view_len
+                // 縮小 = 拡大、Y は cell_h 拡大 = 拡大、で意味が逆になるため)。
+                let y_factor = 1.0 / factor;
+                let cell_h_base = area.h / TRACKS as f32;
+                let old_zoom = self.model.y_zoom;
+                let new_zoom = (old_zoom * y_factor).clamp(0.1, 16.0);
+                let mouse_y = self.cur_mouse.map_or(area.y + area.h * 0.5, |(_, my)| my);
+                let local_y = mouse_y - area.y;
+                let old_cell_h = (cell_h_base * old_zoom).max(0.001);
+                let anchor_track_unit = (local_y + self.model.y_offset) / old_cell_h;
+                let new_cell_h = cell_h_base * new_zoom;
+                let new_y_offset_raw = anchor_track_unit * new_cell_h - local_y;
+                let total_h = TRACKS as f32 * new_cell_h;
+                let max_offset = (total_h - area.h).max(0.0);
+                self.model.y_zoom = new_zoom;
+                self.model.y_offset = new_y_offset_raw.clamp(0.0, max_offset);
+            } else {
+                // X zoom: view_len_samples を変更、anchor はクリップ内 x の比率。
+                let anchor_frac = if let Some((mx, _)) = self.cur_mouse {
+                    let cell_w = area.w / CLIPS_PER_TRACK as f32;
+                    let local = (mx - area.x).rem_euclid(cell_w);
+                    (local / cell_w).clamp(0.0, 1.0)
+                } else {
+                    0.5
+                };
+                self.model.zoom_at(factor, anchor_frac);
+            }
             self.pending_zoom_dy = 0.0;
         }
 
@@ -349,7 +384,7 @@ impl App {
                 let shift_per_clip = m.view_len / CLIPS_PER_TRACK as u64;
                 let max_start = m.total_frames().saturating_sub(m.view_len);
                 for i in 0..N_WIDGETS {
-                    let rect = clip_rect(area, i);
+                    let rect = clip_rect(area, i, m.y_zoom, m.y_offset);
                     let view = WaveformView {
                         start_sample: m
                             .view_start
@@ -365,7 +400,7 @@ impl App {
                 let footer_y = (screen.height as f32 - 44.0).max(0.0);
                 ui.label_at(
                     "footer1",
-                    "Drag = 横スクロール (全クリップ同期) │ Wheel = ズーム │ Space = REC トグル",
+                    "Drag = 横スクロール │ Wheel = X zoom │ Ctrl+Wheel = Y zoom (vertical_gain) │ Space = REC トグル",
                     16.0,
                     footer_y,
                     13.0,
@@ -404,6 +439,10 @@ impl AppHost for App {
                 ScrollDelta::Pixels { y, .. } => *y as f32 / 30.0,
             };
             self.pending_zoom_dy += dy;
+        }
+        // 修飾キー追従 (Ctrl+wheel = Y zoom 分岐用)
+        if let AppEvent::ModifiersChanged(m) = &ev {
+            self.cur_modifiers = *m;
         }
 
         // Space で REC トグル
