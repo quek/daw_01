@@ -11,6 +11,7 @@ pub mod piano_roll_view;
 pub mod plugin_picker;
 pub mod root;
 pub mod runner;
+pub mod shortcuts;
 pub mod status_bar;
 pub mod track_inspector;
 pub mod transport;

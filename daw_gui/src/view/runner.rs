@@ -15,12 +15,11 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use daw_ui_core::{InputAccumulator, UiHost};
+use daw_ui_core::{ArboardClipboard, InputAccumulator, UiHost};
 use daw_ui_platform::{
     AppEvent as PlatformEvent, ElementState, KeyEvent, Modifiers, MouseButton, PhysicalKey,
     PhysicalPosition, PhysicalSize, ScrollDelta, WindowBackend,
 };
-use winit::keyboard::KeyCode as WinitKeyCode;
 use daw_ui_renderer::{Renderer, Scene};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition as WinitPhysPos;
@@ -33,6 +32,7 @@ use winit::keyboard::{KeyCode, PhysicalKey as WinitPhysKey};
 use winit::window::{WindowAttributes, WindowId};
 
 use crate::app::{AppData, AppEvent};
+use crate::view::shortcuts::daw_shortcut_map;
 use crate::view::window::DawGuiWindow;
 
 /// アプリ初期化で渡すパラメータ。`run` の中で main window を作って AppData を組み立てる。
@@ -69,8 +69,6 @@ struct RunnerState {
     ime_enabled: bool,
     /// 直近に OS ウィンドウへ反映したタイトル。AppData の状態と差分を見て set_title。
     last_title: String,
-    /// 現在の修飾キー状態 (ショートカット dispatch 用)。
-    modifiers: Modifiers,
 }
 
 struct Runner {
@@ -118,7 +116,10 @@ impl ApplicationHandler<AppEvent> for Runner {
         let renderer = Renderer::new(dwin.clone()).expect("Renderer::new");
 
         let ui_window = dwin.clone();
-        let ui = UiHost::<AppData>::new(move || ui_window.request_redraw());
+        let ui = UiHost::<AppData>::new(move || ui_window.request_redraw())
+            .with_history_capacity(200)
+            .with_shortcut_map(daw_shortcut_map())
+            .with_clipboard(ArboardClipboard::new());
 
         let build_app = self.build_app.take().expect("build_app 既に消費");
         let app = build_app(self.proxy.clone());
@@ -132,7 +133,6 @@ impl ApplicationHandler<AppEvent> for Runner {
             input: InputAccumulator::new(),
             ime_enabled: false,
             last_title: "daw_01".to_string(),
-            modifiers: Modifiers::default(),
         });
     }
 
@@ -190,6 +190,15 @@ impl ApplicationHandler<AppEvent> for Runner {
             WindowEvent::Focused(f) => {
                 self.dispatch_platform_event(PlatformEvent::Focus(f));
             }
+            WindowEvent::HoveredFile(path) => {
+                self.dispatch_platform_event(PlatformEvent::FileHovered(path));
+            }
+            WindowEvent::HoveredFileCancelled => {
+                self.dispatch_platform_event(PlatformEvent::FileHoverCancelled);
+            }
+            WindowEvent::DroppedFile(path) => {
+                self.dispatch_platform_event(PlatformEvent::FileDropped(path));
+            }
             WindowEvent::ModifiersChanged(mods) => {
                 let st = mods.state();
                 let m = Modifiers {
@@ -198,9 +207,6 @@ impl ApplicationHandler<AppEvent> for Runner {
                     alt: st.alt_key(),
                     logo: st.super_key(),
                 };
-                if let Some(rs) = self.state.as_mut() {
-                    rs.modifiers = m;
-                }
                 self.dispatch_platform_event(PlatformEvent::ModifiersChanged(m));
             }
             WindowEvent::Ime(ime) => match ime {
@@ -213,25 +219,9 @@ impl ApplicationHandler<AppEvent> for Runner {
                 WinitIme::Enabled | WinitIme::Disabled => {}
             },
             WindowEvent::KeyboardInput { event, .. } => {
-                let pressed = matches!(event.state, WinitElemState::Pressed);
-                let key_code = match event.physical_key {
-                    WinitPhysKey::Code(c) => Some(c),
-                    _ => None,
-                };
-                // Global shortcut: 押下 + テキスト入力に focus が無いときだけ
-                // AppEvent を発火する。focus がある (text_input 等) ときは widget に
-                // キー入力を任せる。
-                if pressed
-                    && let Some(rs) = self.state.as_mut()
-                    && rs.ui.focused_widget().is_none()
-                    && let Some(code) = key_code
-                {
-                    let dispatched = dispatch_shortcut(code, rs.modifiers, &mut rs.app);
-                    if dispatched {
-                        rs.window.request_redraw();
-                        return;
-                    }
-                }
+                // ShortcutMap への dispatch は library 側 (UiHost::frame) が処理し、
+                // root.rs::build_root の末尾で `ui.take_shortcut(name)` で消費する。
+                // ここでは PlatformEvent::Keyboard に変換するだけ。
                 let key = KeyEvent {
                     state: map_state(event.state),
                     text: event.text.map(|s| s.to_string()),
@@ -385,47 +375,3 @@ fn query_cursor_pos_in_window(_window: &winit::window::Window) -> Option<Physica
     None
 }
 
-/// 修飾キー + 物理キーから AppEvent を引いて即時 dispatch。`true` を返したら
-/// その KeyEvent はショートカットに消費されたものとして widget へは流さない。
-fn dispatch_shortcut(code: WinitKeyCode, m: Modifiers, app: &mut AppData) -> bool {
-    use WinitKeyCode as K;
-
-    let only_ctrl = m.ctrl && !m.shift && !m.alt && !m.logo;
-    let ctrl_shift = m.ctrl && m.shift && !m.alt && !m.logo;
-    let only_shift = m.shift && !m.ctrl && !m.alt && !m.logo;
-    let no_mod = !m.ctrl && !m.shift && !m.alt && !m.logo;
-
-    let event = match code {
-        // ----- File -----
-        K::KeyN if only_ctrl => AppEvent::New,
-        K::KeyO if only_ctrl => AppEvent::Open,
-        K::KeyS if only_ctrl => AppEvent::Save,
-        K::KeyS if ctrl_shift => AppEvent::SaveAs,
-        K::KeyE if only_ctrl => AppEvent::ExportWav,
-        // ----- Transport -----
-        K::Space if no_mod => AppEvent::PlayToggle,
-        K::KeyP if no_mod => AppEvent::ToggleLoop,
-        K::KeyV if no_mod => AppEvent::SynthesizeVocal,
-        // ----- Edit -----
-        K::KeyZ if only_ctrl => AppEvent::Undo,
-        K::KeyZ if ctrl_shift => AppEvent::Redo,
-        K::KeyY if only_ctrl => AppEvent::Redo,
-        K::KeyC if only_ctrl => AppEvent::CopySelectedNotes,
-        K::KeyV if only_ctrl => AppEvent::PasteNotes,
-        // ----- Selection -----
-        K::Delete if no_mod => {
-            // Both events are no-op when their target is empty so the order is
-            // safe (notes are prioritised, then fall through to clip).
-            app.handle_event(AppEvent::DeleteSelectedNotes);
-            app.handle_event(AppEvent::DeleteSelectedClip);
-            return true;
-        }
-        // ----- Help -----
-        K::F1 if no_mod => AppEvent::ToggleHelp,
-        K::Slash if only_shift => AppEvent::ToggleHelp,
-        K::Escape if no_mod => AppEvent::CloseHelp,
-        _ => return false,
-    };
-    app.handle_event(event);
-    true
-}

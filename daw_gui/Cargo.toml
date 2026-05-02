@@ -8,6 +8,7 @@ common = { path = "../common" }
 anyhow.workspace = true
 midir.workspace = true
 rfd.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 unicode-width.workspace = true

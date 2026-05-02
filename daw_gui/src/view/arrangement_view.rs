@@ -11,7 +11,9 @@
 //! TODO (次イテレーション): drag move / resize / marquee / track rename /
 //! loop band drag。
 
-use daw_ui_core::{Edit, Ui};
+use daw_ui_core::{
+    BarBeatGridStyle, Edit, TimeDisplay, TimeMapping, Ui, ViewportState1D,
+};
 use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
 
 use crate::app::{ARRANGE_TRACK_HEIGHT, AppData, AppEvent, ClipRef};
@@ -24,7 +26,6 @@ const COLOR_RULER_BG: Color = Color { r: 0.14, g: 0.14, b: 0.16, a: 1.0 };
 const COLOR_HEADER_BG: Color = Color { r: 0.16, g: 0.16, b: 0.18, a: 1.0 };
 const COLOR_HEADER_SELECTED: Color = Color { r: 0.27, g: 0.35, b: 0.48, a: 1.0 };
 const COLOR_LANE_LINE: Color = Color { r: 0.19, g: 0.19, b: 0.22, a: 1.0 };
-const COLOR_BAR_LINE: Color = Color { r: 0.24, g: 0.24, b: 0.28, a: 1.0 };
 const COLOR_CLIP: Color = Color { r: 0.27, g: 0.51, b: 0.71, a: 0.92 };
 const COLOR_CLIP_SELECTED: Color = Color { r: 0.47, g: 0.71, b: 0.90, a: 0.95 };
 const COLOR_CLIP_BORDER: Color = Color { r: 0.08, g: 0.08, b: 0.12, a: 1.0 };
@@ -71,6 +72,34 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 入力処理: pointer.pos が canvas_area 内なら hit-test。pointer events は
     // ui.pointer() から取れるが、push_edit でモデル変更を流す。
     handle_canvas_input(app, ui, canvas_area);
+
+    // M8 Phase 32: file drop placeholder。実機能 (audio clip 化) は別フェーズ。
+    // 今は status bar に drop されたパスを表示するのみ。
+    if ui.is_file_hovering_in_rect(canvas_area) {
+        ui.push_rect(RectCommand {
+            rect: canvas_area,
+            fill: Color::TRANSPARENT,
+            border: Color::rgb(0.55, 0.85, 0.95),
+            border_width: 2.0,
+            radius: [0.0; 4],
+            clip_rect: None,
+        });
+    }
+    if let Some(paths) = ui.take_file_drop_in_rect(canvas_area) {
+        let display = paths
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("(unnamed)")
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.status_message = format!("dropped: {display}");
+        }));
+    }
 }
 
 fn draw_canvas(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
@@ -142,34 +171,8 @@ fn draw_canvas(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 }
             }
 
-            // バー罫線 (4 拍ごと) + レーン罫線 (1 トラックごと) を 1 batch にまとめる。
-            let mut bar_lines: Vec<LineSegment> = Vec::new();
-            let beats_per_bar = 4_u32;
-            let visible_beats = area.w / zoom;
-            let first_bar = (scroll_beat as i32 / beats_per_bar as i32).max(0);
-            let last_bar = ((scroll_beat + visible_beats) as u32 / beats_per_bar) + 1;
-            for bar in first_bar..=(last_bar as i32) {
-                let beat = (bar * beats_per_bar as i32) as f32;
-                let x = area.x + (beat - scroll_beat) * zoom;
-                if x < area.x - 1.0 {
-                    continue;
-                }
-                if x > area.x + area.w {
-                    break;
-                }
-                bar_lines.push(LineSegment {
-                    a: [x, area.y],
-                    b: [x, area.y + area.h],
-                    color: COLOR_BAR_LINE,
-                });
-            }
-            if !bar_lines.is_empty() {
-                hctx.push_lines(LineBatch {
-                    segments: bar_lines,
-                    line_width_px: 1.0,
-                    clip_rect: Some(area),
-                });
-            }
+            // バー罫線は library の `ui.bar_beat_grid` に委譲 (heavy ブロックの外で
+            // 呼び出し)。ここでは描かない。
 
             // レーン罫線。
             let mut lane_lines: Vec<LineSegment> = Vec::new();
@@ -281,6 +284,32 @@ fn draw_canvas(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             }
         });
     });
+
+    // bar / beat grid を library widget で重ねる (RULER_H 以下のキャンバス部分のみ)。
+    // 半透明 overlay として clip 矩形の上から薄く乗る。
+    let bpm = (app.bpm() as f64).max(1.0);
+    let mapping = TimeMapping {
+        sample_rate: 48_000.0,
+        tempo_bpm: bpm,
+        time_sig: (4, 4),
+        display: TimeDisplay::BarBeat,
+    };
+    let spb = mapping.samples_per_beat();
+    let visible_beats = (area.w / zoom).max(1.0) as f64;
+    let viewport = ViewportState1D::new(scroll_beat as f64 * spb, visible_beats * spb);
+    let grid_area = Rect {
+        x: area.x,
+        y: area.y + RULER_H,
+        w: area.w,
+        h: (area.h - RULER_H).max(0.0),
+    };
+    ui.bar_beat_grid(
+        "arrange_grid",
+        grid_area,
+        mapping,
+        viewport,
+        BarBeatGridStyle::default(),
+    );
 }
 
 fn draw_track_headers(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
@@ -340,21 +369,31 @@ fn draw_track_headers(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             t.name.clone()
         };
         let name_w = area.w - pad * 2.0 - 22.0 * 2.0 - 4.0;
+        let name_rect = Rect {
+            x: area.x + pad,
+            y: row_y + pad,
+            w: name_w,
+            h: 20.0,
+        };
         ui.button_at(
             ("arr_header_select", i),
             &name,
-            Rect {
-                x: area.x + pad,
-                y: row_y + pad,
-                w: name_w,
-                h: 20.0,
-            },
+            name_rect,
             move || {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SelectTrack(track_idx))
                 })
             },
         );
+        // M8 Phase 25: track header の右クリックで Rename / Delete メニュー。
+        // Move Up/Dn は下段の Up/Dn ボタンと役割重複するので menu には入れない。
+        ui.context_menu_for(name_rect, &["Rename", "Delete"], move |idx| {
+            Edit::mutate(move |app: &mut AppData| match idx {
+                0 => app.handle_event(AppEvent::BeginRenameTrack(track_idx)),
+                1 => app.handle_event(AppEvent::DeleteTrack(track_idx)),
+                _ => {}
+            })
+        });
         // 名前テキスト (Button で隠れない位置に被せる)
         let _ = name_w;
 

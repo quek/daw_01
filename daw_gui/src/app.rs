@@ -33,8 +33,10 @@ pub struct TrackMixEntry {
     pub pan: f32,
     pub muted: bool,
     pub solo: bool,
-    pub peak_l_norm: f32,
-    pub peak_r_norm: f32,
+    /// raw linear amplitude (`-1.0..=1.0` のうち post-smoothing peak)。
+    /// `Ui::level_meter` は内部で dB 変換するので、view 側ではこのまま渡す。
+    pub peak_l_raw: f32,
+    pub peak_r_raw: f32,
 }
 
 impl Default for TrackMixEntry {
@@ -46,8 +48,8 @@ impl Default for TrackMixEntry {
             pan: 0.0,
             muted: false,
             solo: false,
-            peak_l_norm: 0.0,
-            peak_r_norm: 0.0,
+            peak_l_raw: 0.0,
+            peak_r_raw: 0.0,
         }
     }
 }
@@ -188,7 +190,6 @@ pub struct AppData {
 
     pub undo_stack: VecDeque<Song>,
     pub redo_stack: VecDeque<Song>,
-    pub note_clipboard: Vec<Note>,
 
     pub is_help_open: bool,
 
@@ -293,7 +294,6 @@ impl AppData {
             track_rename_text: String::new(),
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
-            note_clipboard: Vec::new(),
             is_help_open: false,
             recent_files: load_recent_files(),
             is_dirty: false,
@@ -414,8 +414,8 @@ impl AppData {
                     pan: t.pan,
                     muted: t.muted,
                     solo: t.solo,
-                    peak_l_norm: common::meter::db_to_norm(common::meter::linear_to_db(l)),
-                    peak_r_norm: common::meter::db_to_norm(common::meter::linear_to_db(r)),
+                    peak_l_raw: l,
+                    peak_r_raw: r,
                 }
             })
             .collect()
@@ -555,33 +555,31 @@ impl AppData {
                 | AppEvent::ResizeNote { .. }
                 | AppEvent::DeleteSelectedNotes
                 | AppEvent::SetSelectedNoteLyric(_)
-                | AppEvent::PasteNotes
                 | AppEvent::QuantizeSelectedNotes(_)
                 | AppEvent::SelectPluginFromDb(_)
                 | AppEvent::RemoveSlot { .. }
         )
     }
 
-    fn copy_selected_notes(&mut self) {
-        let Some(r) = self.selected_clip else {
-            return;
-        };
+    /// 選択中ノートを JSON シリアライズ。OS clipboard 経由で root.rs から
+    /// `Ui::set_clipboard_text` に渡される。何も copy できない (選択無し /
+    /// クリップ未選択 / シリアライズ失敗) 場合は `None`。
+    /// 戻り値は `(json, note_count)` 。`note_count` は呼び出し側で status_message
+    /// 表示等に使う (ここで status_message を書かないのは `&self` で済ませるため)。
+    pub fn copy_selected_notes_as_json(&self) -> Option<(String, usize)> {
+        let r = self.selected_clip?;
         if self.selected_notes.is_empty() {
-            return;
+            return None;
         }
-        let Some(track) = self.song.tracks.get(r.track as usize) else {
-            return;
-        };
-        let Some(clip) = track.clips.get(r.clip as usize) else {
-            return;
-        };
+        let track = self.song.tracks.get(r.track as usize)?;
+        let clip = track.clips.get(r.clip as usize)?;
         let mut copied: Vec<Note> = self
             .selected_notes
             .iter()
             .filter_map(|i| clip.notes.get(*i as usize).cloned())
             .collect();
         if copied.is_empty() {
-            return;
+            return None;
         }
         let earliest = copied
             .iter()
@@ -593,12 +591,17 @@ impl AppData {
             }
         }
         let count = copied.len();
-        self.note_clipboard = copied;
-        self.status_message = format!("コピー: {count} ノート");
+        let json = serde_json::to_string(&copied).ok()?;
+        Some((json, count))
     }
 
-    fn paste_notes(&mut self) {
-        if self.note_clipboard.is_empty() {
+    /// OS clipboard から取得した text を `Vec<Note>` として deserialize し、
+    /// 既存の paste ロジックで貼り付ける。他アプリの text が来た場合は何もしない。
+    pub fn paste_notes_from_json(&mut self, json: &str) {
+        let Ok(clipboard) = serde_json::from_str::<Vec<Note>>(json) else {
+            return;
+        };
+        if clipboard.is_empty() {
             return;
         }
         let Some(r) = self.selected_clip else {
@@ -606,7 +609,6 @@ impl AppData {
             return;
         };
         let playhead = self.playhead_beat;
-        let clipboard = self.note_clipboard.clone();
         let anchor = if let Some(playhead) = playhead {
             let clip_start = self
                 .song
@@ -619,6 +621,7 @@ impl AppData {
         } else {
             0.0
         };
+        let count = clipboard.len();
         let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
             return;
         };
@@ -634,7 +637,7 @@ impl AppData {
         }
         self.selected_notes = new_indices;
         self.sync_song_to_plugin_host();
-        self.status_message = format!("貼り付け: {} ノート", clipboard.len());
+        self.status_message = format!("貼り付け: {count} ノート");
     }
 
     fn set_note_velocity(&mut self, note_idx: u32, velocity: u8) {
@@ -695,8 +698,6 @@ pub enum AppEvent {
     Undo,
     Redo,
     PushUndoSnapshot,
-    CopySelectedNotes,
-    PasteNotes,
     QuantizeSelectedNotes(u8),
     SetNoteVelocity { note: u32, velocity: u8 },
     AddVocalTrack,
@@ -834,10 +835,6 @@ impl AppData {
             AppEvent::PushUndoSnapshot => {
                 self.push_undo_snapshot();
             }
-            AppEvent::CopySelectedNotes => {
-                self.copy_selected_notes();
-            }
-            AppEvent::PasteNotes => self.paste_notes(),
             AppEvent::QuantizeSelectedNotes(div) => {
                 self.quantize_selected_notes(div);
             }

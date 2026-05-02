@@ -1,10 +1,12 @@
 //! Piano roll: 鍵盤 (左) + ノート canvas + ベロシティレーン (下)。
-//! 現状: 描画 + クリックでノート選択 + Wheel で縦スクロール / Ctrl+Wheel で縦ズーム /
-//! Shift+Wheel で横スクロール。
-//! TODO: マウスドラッグでノート移動 / リサイズ / 矩形選択 / ベロシティドラッグ /
+//! 現状: 描画 + クリックでノート選択 + Shift+ドラッグで矩形選択 (M8 DragRect) +
+//! Wheel で縦スクロール / Ctrl+Wheel で縦ズーム / Shift+Wheel で横スクロール。
+//! TODO: マウスドラッグでノート移動 / リサイズ / ベロシティドラッグ /
 //! ダブルクリックで AddNote。
 
-use daw_ui_core::{Edit, Ui};
+use daw_ui_core::{
+    BarBeatGridStyle, Edit, TimeDisplay, TimeMapping, Ui, ViewportState1D, WidgetId,
+};
 use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent, DEFAULT_NOTE_DURATION};
@@ -17,7 +19,6 @@ const COLOR_KEY_W: Color = Color { r: 0.92, g: 0.93, b: 0.95, a: 1.0 };
 const COLOR_KEY_B: Color = Color { r: 0.18, g: 0.18, b: 0.22, a: 1.0 };
 const COLOR_KEY_TEXT: Color = Color { r: 0.30, g: 0.30, b: 0.32, a: 1.0 };
 const COLOR_GRID: Color = Color { r: 0.20, g: 0.20, b: 0.24, a: 1.0 };
-const COLOR_BAR_GRID: Color = Color { r: 0.30, g: 0.30, b: 0.36, a: 1.0 };
 const COLOR_NOTE: Color = Color { r: 0.45, g: 0.78, b: 0.95, a: 0.95 };
 const COLOR_NOTE_SEL: Color = Color { r: 0.95, g: 0.85, b: 0.45, a: 0.95 };
 const COLOR_NOTE_BORDER: Color = Color { r: 0.05, g: 0.05, b: 0.08, a: 1.0 };
@@ -99,49 +100,7 @@ fn draw_canvas(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             playhead.unwrap_or(f32::NAN).to_bits(),
         );
         hctx.cached(key, |hctx| {
-            // 縦線 (拍 / 小節)
-            let mut bar_lines: Vec<LineSegment> = Vec::new();
-            let mut beat_lines: Vec<LineSegment> = Vec::new();
-            let visible_beats = area.w / zoom_x;
-            let first_beat = scroll_beat.floor() as i32;
-            let last_beat = (scroll_beat + visible_beats).ceil() as i32;
-            for beat in first_beat..=last_beat {
-                let x = area.x + (beat as f32 - scroll_beat) * zoom_x;
-                if x < area.x - 1.0 {
-                    continue;
-                }
-                if x > area.x + area.w {
-                    break;
-                }
-                let seg = LineSegment {
-                    a: [x, area.y],
-                    b: [x, area.y + area.h],
-                    color: if beat % 4 == 0 {
-                        COLOR_BAR_GRID
-                    } else {
-                        COLOR_GRID
-                    },
-                };
-                if beat % 4 == 0 {
-                    bar_lines.push(seg);
-                } else {
-                    beat_lines.push(seg);
-                }
-            }
-            if !beat_lines.is_empty() {
-                hctx.push_lines(LineBatch {
-                    segments: beat_lines,
-                    line_width_px: 1.0,
-                    clip_rect: Some(area),
-                });
-            }
-            if !bar_lines.is_empty() {
-                hctx.push_lines(LineBatch {
-                    segments: bar_lines,
-                    line_width_px: 1.0,
-                    clip_rect: Some(area),
-                });
-            }
+            // 縦線 (拍 / 小節) は library `ui.bar_beat_grid` に委譲 (heavy ブロックの外)。
 
             // 横線 (semitone)
             let visible_pitch_count = (area.h / zoom_y).ceil() as i32;
@@ -215,6 +174,26 @@ fn draw_canvas(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             }
         });
     });
+
+    // bar / beat grid を library widget で重ねる。半透明 overlay として
+    // semitone 線・note 矩形の上に薄く線が乗る。
+    let bpm = (app.bpm() as f64).max(1.0);
+    let mapping = TimeMapping {
+        sample_rate: 48_000.0,
+        tempo_bpm: bpm,
+        time_sig: (4, 4),
+        display: TimeDisplay::BarBeat,
+    };
+    let spb = mapping.samples_per_beat();
+    let visible_beats = (area.w / zoom_x).max(1.0) as f64;
+    let viewport = ViewportState1D::new(scroll_beat as f64 * spb, visible_beats * spb);
+    ui.bar_beat_grid(
+        "pr_grid",
+        area,
+        mapping,
+        viewport,
+        BarBeatGridStyle::default(),
+    );
 }
 
 fn draw_keyboard(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
@@ -336,6 +315,10 @@ fn handle_input(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let top_pitch = app.pianoroll_top_pitch as i32;
     let modifiers = pointer.modifiers;
 
+    // 矩形選択 (M8 DragRect)。drag 量が 5px 未満なら単発クリックに委譲、
+    // それ以上なら範囲内のノートを選択して以降のクリック処理をスキップする。
+    let drag_consumed = handle_drag_rect_select(app, ui, area);
+
     ui.heavy("pr_input", |hctx| {
         let (sx, sy) = pointer.scroll_delta;
         if sy.abs() > 0.001 || sx.abs() > 0.001 {
@@ -362,7 +345,7 @@ fn handle_input(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             }
         }
 
-        if pointer.primary_just_released {
+        if pointer.primary_just_released && !drag_consumed {
             let area_x = area.x;
             let area_y = area.y;
             let additive = modifiers.shift;
@@ -439,4 +422,72 @@ fn handle_input(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             }));
         }
     });
+}
+
+/// `Ui::take_drag_rect_in_rect` で得た drag を使って矩形選択を実装する。
+/// 戻り値: `true` ならこのフレームの release は drag に消費されたので、
+/// 単発クリック処理 (handle_input) でスキップするべき。
+fn handle_drag_rect_select(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> bool {
+    let drag_wid = WidgetId::ROOT.child(b"pr_drag_select");
+    let Some(drag) = ui.take_drag_rect_in_rect(drag_wid, area) else {
+        return false;
+    };
+    if !drag.finished {
+        return false;
+    }
+    let dx = (drag.end.0 - drag.start.0).abs();
+    let dy = (drag.end.1 - drag.start.1).abs();
+    if dx < 5.0 && dy < 5.0 {
+        // 単発クリック相当 → 通常の release 処理に委譲。
+        return false;
+    }
+    let r = drag.rect();
+    let additive = drag.modifiers.shift;
+    let zoom_x = app.pianoroll_zoom_x.max(4.0);
+    let zoom_y = app.pianoroll_zoom_y.max(6.0);
+    let scroll_beat = app.pianoroll_scroll_beat;
+    let top_pitch = app.pianoroll_top_pitch as i32;
+    let area_x = area.x;
+    let area_y = area.y;
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        let Some(target) = app.selected_clip else {
+            return;
+        };
+        let Some(clip) = app
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+        else {
+            return;
+        };
+        let mut new_sel: Vec<u32> = Vec::new();
+        for (i, n) in clip.notes.iter().enumerate() {
+            let nx = area_x + (n.start_beat as f32 - scroll_beat) * zoom_x;
+            let nw = ((n.duration_beats as f32) * zoom_x).max(2.0);
+            let pitch_offset = top_pitch - n.pitch as i32;
+            let ny = area_y + pitch_offset as f32 * zoom_y;
+            let nh = zoom_y;
+            let intersects = !(nx + nw < r.x
+                || nx > r.x + r.w
+                || ny + nh < r.y
+                || ny > r.y + r.h);
+            if intersects {
+                new_sel.push(i as u32);
+            }
+        }
+        let final_sel = if additive {
+            let mut merged = app.selected_notes.clone();
+            for n in new_sel {
+                if !merged.contains(&n) {
+                    merged.push(n);
+                }
+            }
+            merged
+        } else {
+            new_sel
+        };
+        app.handle_event(AppEvent::SetNoteSelection(final_sel));
+    }));
+    true
 }

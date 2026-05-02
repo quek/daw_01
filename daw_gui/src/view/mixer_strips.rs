@@ -7,7 +7,7 @@
 //!   - Pan knob
 //!   - Volume fader (縦) + L/R peak meter
 
-use daw_ui_core::{Edit, Ui};
+use daw_ui_core::{Edit, LevelMeterStyle, MeterBallistic, Ui};
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent};
@@ -26,10 +26,8 @@ const COLOR_STRIP_BG: Color = Color { r: 0.18, g: 0.18, b: 0.22, a: 1.0 };
 const COLOR_MASTER_BG: Color = Color { r: 0.22, g: 0.22, b: 0.28, a: 1.0 };
 const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
 const COLOR_TEXT_DIM: Color = Color { r: 0.65, g: 0.68, b: 0.72, a: 1.0 };
-const COLOR_METER_BG: Color = Color { r: 0.06, g: 0.06, b: 0.08, a: 1.0 };
-const COLOR_METER_OK: Color = Color { r: 0.31, g: 0.78, b: 0.47, a: 1.0 };
-const COLOR_METER_HOT: Color = Color { r: 0.90, g: 0.78, b: 0.31, a: 1.0 };
-const COLOR_METER_CLIP: Color = Color { r: 0.86, g: 0.27, b: 0.27, a: 1.0 };
+const COLOR_MUTE_HINT: Color = Color { r: 0.86, g: 0.27, b: 0.27, a: 1.0 };
+const COLOR_SOLO_HINT: Color = Color { r: 0.90, g: 0.78, b: 0.31, a: 1.0 };
 
 const DB_MIN: f32 = -80.0;
 const DB_MAX: f32 = 6.0;
@@ -87,8 +85,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             entry.pan,
             entry.muted,
             entry.solo,
-            entry.peak_l_norm,
-            entry.peak_r_norm,
+            entry.peak_l_raw,
+            entry.peak_r_raw,
             Rect { x, y: strip_y, w: STRIP_WIDTH, h: strip_h },
             COLOR_STRIP_BG,
             entry.index,
@@ -107,8 +105,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         0.0,
         false,
         false,
-        app.peak_l_norm,
-        app.peak_r_norm,
+        app.peak_l_display,
+        app.peak_r_display,
         Rect { x: master_x, y: strip_y, w: STRIP_WIDTH, h: strip_h },
         COLOR_MASTER_BG,
         u32::MAX,
@@ -125,8 +123,8 @@ fn draw_strip(
     pan: f32,
     muted: bool,
     solo: bool,
-    peak_l_norm: f32,
-    peak_r_norm: f32,
+    peak_l_raw: f32,
+    peak_r_raw: f32,
     rect: Rect,
     bg: Color,
     track_idx: u32,
@@ -194,7 +192,7 @@ fn draw_strip(
                             w: btn_w,
                             h: 2.0,
                         },
-                        fill: COLOR_METER_CLIP,
+                        fill: COLOR_MUTE_HINT,
                         border: Color::TRANSPARENT,
                         border_width: 0.0,
                         radius: [0.0; 4],
@@ -213,7 +211,7 @@ fn draw_strip(
                             w: btn_w,
                             h: 2.0,
                         },
-                        fill: COLOR_METER_HOT,
+                        fill: COLOR_SOLO_HINT,
                         border: Color::TRANSPARENT,
                         border_width: 0.0,
                         radius: [0.0; 4],
@@ -233,6 +231,7 @@ fn draw_strip(
             Rect { x: knob_x, y, w: KNOB_SIZE, h: KNOB_SIZE },
             knob_value,
             0.5,
+            "Pan",
             move |v| {
                 let pan = v * 2.0 - 1.0;
                 Edit::mutate(move |app: &mut AppData| {
@@ -257,11 +256,13 @@ fn draw_strip(
     let fader_value = amp_to_fader(volume);
     let track_idx_for_vol = track_idx;
     let is_master_for_vol = is_master;
+    let fader_label: &'static str = if is_master_for_vol { "Master Volume" } else { "Track Volume" };
     ui.fader_at(
         ("mixer_strip_fader", layout_idx),
         Rect { x: group_x, y: fader_top, w: FADER_W, h: fader_h },
         fader_value,
         amp_to_fader(1.0),
+        fader_label,
         move |v| {
             let amp = fader_to_amp(v);
             Edit::mutate(move |app: &mut AppData| {
@@ -278,14 +279,15 @@ fn draw_strip(
     );
 
     let mx = group_x + FADER_W + METER_GAP;
-    draw_meter(
-        ui,
+    let meter_style = LevelMeterStyle::default();
+    ui.level_meter(
         ("mixer_meter_l", layout_idx),
         Rect { x: mx, y: fader_top, w: METER_W, h: fader_h },
-        peak_l_norm,
+        peak_l_raw,
+        MeterBallistic::Peak,
+        meter_style,
     );
-    draw_meter(
-        ui,
+    ui.level_meter(
         ("mixer_meter_r", layout_idx),
         Rect {
             x: mx + METER_W + METER_GAP,
@@ -293,45 +295,8 @@ fn draw_strip(
             w: METER_W,
             h: fader_h,
         },
-        peak_r_norm,
+        peak_r_raw,
+        MeterBallistic::Peak,
+        meter_style,
     );
-}
-
-fn draw_meter(ui: &mut Ui<'_, AppData>, id: (&'static str, usize), rect: Rect, norm: f32) {
-    ui.heavy(id, |hctx| {
-        hctx.cached(norm.to_bits(), |hctx| {
-            hctx.push_rect(RectCommand {
-                rect,
-                fill: COLOR_METER_BG,
-                border: Color::TRANSPARENT,
-                border_width: 0.0,
-                radius: [1.0; 4],
-                clip_rect: None,
-            });
-            let lvl = norm.clamp(0.0, 1.0);
-            if lvl > 0.0 {
-                let fill_h = rect.h * lvl;
-                let color = if lvl >= 0.999 {
-                    COLOR_METER_CLIP
-                } else if lvl > 0.85 {
-                    COLOR_METER_HOT
-                } else {
-                    COLOR_METER_OK
-                };
-                hctx.push_rect(RectCommand {
-                    rect: Rect {
-                        x: rect.x,
-                        y: rect.y + (rect.h - fill_h),
-                        w: rect.w,
-                        h: fill_h,
-                    },
-                    fill: color,
-                    border: Color::TRANSPARENT,
-                    border_width: 0.0,
-                    radius: [1.0; 4],
-                    clip_rect: None,
-                });
-            }
-        });
-    });
 }
