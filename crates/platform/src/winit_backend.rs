@@ -80,6 +80,21 @@ impl WindowBackend for WinitWindow {
     }
 }
 
+/// 1 フレーム分の駆動 (`AppEvent::Tick` + `on_render`) を行う。
+///
+/// winit の `RedrawRequested` ハンドラから直接呼ぶほか、baseview など別の
+/// `WindowBackend` 実装からも呼べる (host 駆動の frame push に対応するため)。
+///
+/// 戻り値: `host.on_render()` が `true` を返した場合は再描画継続のリクエスト。
+/// 呼び出し側は必要に応じて `WindowBackend::request_redraw` を呼ぶ。
+pub fn drive_one_frame<H: AppHost>(host: &mut H, last_tick: &mut Instant) -> bool {
+    let now = Instant::now();
+    let dt = now.duration_since(*last_tick);
+    *last_tick = now;
+    host.on_event(AppEvent::Tick(dt));
+    host.on_render()
+}
+
 /// アプリ起動エントリ — `AppHost` を渡して winit イベントループを走らせる。
 ///
 /// `factory` は `WindowBackend` を受け取って `AppHost` を組み立てるクロージャ。
@@ -205,11 +220,7 @@ impl<H: AppHost, F: FnOnce(WinitWindow) -> H> ApplicationHandler for WinitRunner
                 host.on_event(AppEvent::Keyboard(key));
             }
             WindowEvent::RedrawRequested => {
-                let now = Instant::now();
-                let dt = now.duration_since(self.last_tick);
-                self.last_tick = now;
-                host.on_event(AppEvent::Tick(dt));
-                let request_more = host.on_render();
+                let request_more = drive_one_frame(host, &mut self.last_tick);
                 if request_more
                     && let Some(w) = self.window.as_ref()
                 {

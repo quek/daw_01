@@ -10,8 +10,10 @@
 //! シーンは内部的に DisplayList として保持し、フレーム終端でバッチ描画する。
 
 pub mod device;
+pub mod offscreen;
 pub mod scene;
 pub mod pipelines;
 
 pub use device::*;
+pub use offscreen::*;
 pub use scene::*;

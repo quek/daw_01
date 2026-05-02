@@ -10,6 +10,7 @@ members = [
     "crates/examples/sample_editor",
     "crates/examples/arrangement",
     "crates/examples/automation",
+    "crates/examples/embedded_host",
 ]
 
 [workspace.package]

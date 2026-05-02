@@ -4,6 +4,15 @@
 //! - `Arc<W: WindowBackend + Send + Sync + 'static>` を保持 → `Surface<'static>` で安全に共存
 //! - 描画は `begin_frame` → 各 pipeline へ encode → `end_frame` で submit & present
 //!
+//! 外部 crate での使用 (DAW プラグイン UI 埋め込み):
+//! - `W` は winit `WinitWindow` 以外でも、`HasWindowHandle + HasDisplayHandle + WindowBackend`
+//!   を実装する自前の型で OK (例: VST3 / CLAP プラグインで親アプリから受け取った
+//!   raw window handle を保持する型)。`examples/embedded_host` 参照。
+//! - **drop 順序の責務**: 親アプリ側の window (DAW host) が drop すると `Surface` が
+//!   dangling になる。`Renderer` を破棄してから親 window を破棄する流れを呼び出し側で
+//!   守る (本構造体は `Arc<W>` で window を `'static` に持ち上げているが、raw handle
+//!   自体の有効性は親プロセス管理)。
+//!
 //! M1 の制約:
 //! - MSAA / depth / present-mode 切替は最低限
 //! - Vsync (FifoRelaxed) で安定描画

@@ -727,13 +727,40 @@ arrangement) を実装 + bench 実証完了。波形 widget は PeakLines / Samp
 
 **残作業**: なし。M5.5 は単体 milestone として完了。次は M6 (Phase 2)。
 
-### M6 (Phase 2)
+### M6 (Phase 2) — Phase 18-21 構成 + vello M7 送り
 
-- AccessKit 統合
-- baseview バックエンド (`WindowBackend` 第 2 実装) — プラグインホスト版への布石
-- プラグイン UI window 埋め込み API (raw-window-handle 受け渡し)
-- vello サブシステム併用 (SVG アイコン用に必要なら)
-- 波形編集オペレーション (trim / fade / split) のサンプル実装
+M5.5 完了後の DAW プラグイン対応・アクセシビリティ・波形編集サンプルを 4 phase に分割し、各 phase = 1 commit で段階的に進める (M5 Phase 13-17 と同形式)。当初候補 5 テーマのうち `vello サブシステム併用 (SVG アイコン用)` は、現状 rect/glyph/line で全 example が成立し SVG 需要が弱いため **M7 で評価 (M6 では見送り)**。
+
+| Phase | テーマ | 状態 |
+|---|---|---|
+| 18 | プラグイン UI 埋め込み API + frame inject 経路 (drive_one_frame / OffscreenRenderer / examples/embedded_host) | ✅ 完了 |
+| 19 | baseview バックエンド (`WindowBackend` 第 2 実装) — feature gate `baseview` | ⏳ |
+| 20 | AccessKit 統合 (focusable widget の TreeUpdate) — feature gate `accesskit` | ⏳ |
+| 21 | 波形編集 sample (trim / linear fade / split) — examples/sample_edit_ops | ⏳ |
+
+#### Phase 18 進捗 — プラグイン UI 埋め込み API + frame inject 経路 ✅ 完了
+
+| 成果物 | 状態 | 備考 |
+|---|---|---|
+| `crates/platform/src/winit_backend.rs`: `pub fn drive_one_frame<H: AppHost>(host, last_tick) -> bool` 切り出し (winit `RedrawRequested` ハンドラ内のロジックを関数化、baseview からも呼べるようにする布石) | ✅ | 本コミット |
+| `crates/platform/src/window.rs`: `WindowBackend` rustdoc にプラグイン UI 埋め込み手順 (HasWindowHandle/HasDisplayHandle 実装で外部 crate でも `Renderer<W>` に渡せる) を追記 | ✅ | 本コミット |
+| `crates/renderer/src/device.rs`: モジュール doc に「外部 crate での使用 (DAW プラグイン UI 埋め込み)」と drop 順序の責務 (親 window 寿命管理) を明記 | ✅ | 本コミット |
+| `crates/renderer/src/offscreen.rs`: `OffscreenRenderer::new(width, height)` + `render_to_rgba(&Scene) -> Vec<u8>` (window 不要、`compatible_surface=None`、render-to-texture + 256-align padding + `PollType::wait_indefinitely` readback) | ✅ | 本コミット |
+| `crates/examples/embedded_host/`: 自前 `EmbeddedHostWindow` (HasWindowHandle/HasDisplayHandle/WindowBackend 実装) を compile-time assert + `OffscreenRenderer` で 8ch fader 風 Scene を 1 frame render → `target/embedded_host_snapshot.png` 出力 | ✅ | 本コミット |
+| `cargo build/test/clippy/doc --workspace`: 全 pass、既存 6 example (mixer / waveform_validation / sample_editor / piano_roll / arrangement / automation) 回帰なし | ✅ | 本コミット |
+
+**設計判断 (Phase 18)**:
+- **プラグイン UI 埋め込み API は trait bound で既にほぼ揃っていた**: `WindowBackend: HasWindowHandle + HasDisplayHandle` で raw-window-handle 受け渡しは公開済み。新規 trait method・新規型の追加は不要。Phase 18 は「足りている」ことを rustdoc + example で実証する形に。
+- **`OffscreenRenderer` は独立 struct (既存 `Renderer<W>` 変更なし)**: window 不要のため `Renderer<W>` の generic に dummy window を入れる方法より、別 struct の方が API がクリーン。pipelines (rect/line/glyph) は target_format 引数で再利用 (新規追加なし)。
+- **wgpu 29 系 offscreen API の確認**: `Maintain::Wait` は廃止 (`PollType::wait_indefinitely()`)、`TexelCopyTextureInfo` / `TexelCopyBufferInfo` / `TexelCopyBufferLayout` の名称、`bytes_per_row` 256-align padding、`compatible_surface: None` で adapter 取得可 (native OK、WebGL2 のみ不可)。詳細は `CLAUDE.md` 既知の罠 (wgpu 29 offscreen) 参照。
+- **`examples/embedded_host` の `EmbeddedHostWindow` は dummy 実装**: `OffscreenRenderer` が handle 不要なので `Err(HandleError::NotSupported)`。実 DAW プラグインでは `unsafe { WindowHandle::borrow_raw(self.raw_handle) }` で親プロセスから受け取った handle を持ち上げる。compile-time assert で「外部 crate でも `WindowBackend + Send + Sync + 'static` 実装可能」を実証。
+
+**vello M7 送り判断 (Phase 18 commit に同梱)**:
+- 現状 rect/glyph/line strip primitive のみで全 example が成立、SVG アイコン需要弱い。
+- wgpu 29 + vello latest の互換性検証だけで 1 commit 食う見込み。AccessKit / baseview の方が DAW 用途として優先度高い。
+- M7 で SVG 需要が顕在化したときに改めて評価。
+
+**残作業 (Phase 18)**: なし。次は Phase 19 (baseview バックエンド)。
 
 ---
 

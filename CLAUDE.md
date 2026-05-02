@@ -103,6 +103,14 @@ example を実機検証する前に必ず `cargo run --bin <name>` または `ca
 
 ### wgpu (29.x 系)
 - リサイズ中の surface 再構成で `SurfaceError::Outdated` が稀に発生。`render` の戻りがエラーでもログに出して次フレームまで生かす設計。
+- **offscreen rendering** (Phase 18 で `OffscreenRenderer` を実装した際に確定):
+  - `Maintain::Wait` は 28 以前の API。29 では **`PollType::wait_indefinitely()`** に置換 (`device.poll(PollType::wait_indefinitely()).unwrap()` が定型)。`Maintain` を import すると型エラー。
+  - `compatible_surface: None` で adapter 取得可 (native は OK、WebGL2 のみ surface 必須)。プラグイン UI 埋め込みや snapshot 用途で window なしに使える。
+  - `copy_texture_to_buffer` の引数は **`TexelCopyTextureInfo` / `TexelCopyBufferInfo` / `TexelCopyBufferLayout`** (29 の新名称)。`ImageCopyTexture` 等の旧名は使えない。
+  - `bytes_per_row` は **`COPY_BYTES_PER_ROW_ALIGNMENT` (= 256) の倍数必須**。`unpadded.div_ceil(256) * 256` で staging buffer に padding し、readback 後に row 単位で詰め直す。`Queue::write_texture` には適用されない。
+  - `map_async` + `poll(Wait)` 順序: コールバック登録 → `device.poll(PollType::wait_indefinitely())` の順。逆にするとコールバックが永遠に呼ばれない。
+  - `DeviceDescriptor` の `trace: Trace::Off` / `experimental_features: ExperimentalFeatures::disabled()` フィールドが 29 で必須 (省略不可)。`device.rs` / `offscreen.rs` 双方で全フィールド明示。
+  - sRGB 二重変換は **起きない**: `Rgba8UnormSrgb` で render → そのまま PNG `ColorType::Rgba` に渡せる (PNG decoder は sRGB 仮定でデコードするので一致)。バイト単位で snapshot 比較するなら `Rgba8Unorm` (linear) を選ぶ判断もあり。
 
 ### taffy 0.10
 - **`Dimension::auto()` の flex 親に `flex_basis: 0` の grow-only 子** を入れると fit-content = 0px に潰れて `flex_grow` の比例分配が起きない。`LayoutPass::flex` は親の size を `Dimension::percent(1.0)` で「親の利用可能領域いっぱい」にしてこれを回避している (Phase 5 で発見)。
