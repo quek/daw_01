@@ -29,3 +29,7 @@ harness = false
 [[bench]]
 name = "heavy_piano_roll"
 harness = false
+
+[[bench]]
+name = "heavy_arrangement"
+harness = false

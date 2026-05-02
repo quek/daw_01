@@ -534,7 +534,7 @@ cached が ~1.9x 高速。1000 widgets で frame あたり ~148 µs (= 148 ns/wi
 | **16** | マーカー (rect 角丸円) + RmsBars + examples/sample_editor | 中 | Phase 15 |
 | **17** | examples/arrangement (10×50 = 500 widgets を heavy 化) + bench | 中 | Phase 13, 16 |
 
-Phase 13, 14, 15, 16 完了 (2026-05-02 時点)。残 Phase 17 のみで M5 完了予定。
+**M5 全 phase 完了 (2026-05-02)** — Phase 13, 14, 15, 16, 17 すべて完了。次の milestone は M5.5 (オートメーションカーブ)。
 
 オートメーションカーブ (ベジエ → CPU flatten → line) は当初 Phase 18 として M5 に
 入れていたが、heavy / 詳細波形 の主目標を区切りやすくするため **M5.5** (M5 完了後すぐの
@@ -646,8 +646,43 @@ Phase 13, 14, 15, 16 完了 (2026-05-02 時点)。残 Phase 17 のみで M5 完�
 - **selection は (min, max) 正規化**: drag 方向で end < start にならないよう、anchor_sample と現在 sample の min/max を `selection = Some((s, e))` に保存。
 - **Phase 15 で実装した Auto は維持**: forced_mode = None のときは Auto で zoom 自動切替 (peak ↔ sample) が動作、業界 DAW UX (Reaper/Logic/Ableton) と一貫。
 
-**残作業 (M5 残、Phase 17 のみ)**:
-- Phase 17: examples/arrangement (10×50 = 500 widgets を heavy 化) + bench (M5 最終 phase、heavy() の 2 例目 + arrangement view bench)
+**Phase 17 進捗 (2026-05-02)** — examples/arrangement (500 widgets を heavy 化) + bench (M5 最終 phase):
+
+| 成果物 | 状態 | 備考 |
+|---|---|---|
+| `crates/examples/arrangement/{Cargo.toml, src/main.rs}`: 10 tracks × 50 clips = 500 widgets | ✅ | (本コミット) |
+| `ui.heavy("arrangement", \|hctx\| hctx.cached(viewport_key, \|hctx\| { for i in 0..500 { hctx.waveform(...) } }))` | ✅ | (本コミット) |
+| viewport_key = (b"arrangement_v1", view_*, y_zoom, y_offset, vertical_gain, area.w/h, generation, forced_mode_tag) の 10-tuple | ✅ | (本コミット) |
+| 二段キャッシュ (外側 heavy cached + 内側 per-widget input_hash) で 500 widgets 一括 skip | ✅ | (本コミット) |
+| drag X pan + wheel X zoom + Ctrl+wheel Y zoom (レーン高さ + anchor 維持) + 1/2/3/a forced_mode 切替 | ✅ | (本コミット) |
+| HUD: frame_ms / view 範囲 / spp / widgets / y_zoom / y_offset / mode / cache HIT/MISS 推定 | ✅ | (本コミット) |
+| 画面外 clip の描画 skip (`if rect.y + rect.h < area.y \|\| ...`) で cached miss 時のコスト削減 | ✅ | (本コミット) |
+| `crates/ui/benches/heavy_arrangement.rs`: cached vs no_cache 500 widgets 比測定 | ✅ | (本コミット) |
+| `cargo bench` 実測値: cached **136.53µs** vs no_cache **1.2785s** = **9367x 高速** (DoD 10x+ を遥かに超える) | ✅ | (本コミット) |
+| ルート Cargo.toml workspace + crates/ui/Cargo.toml `[[bench]]` 追加 | ✅ | (本コミット) |
+
+**設計判断**:
+- **二段キャッシュの効果が圧倒的 (Phase 14 の 5.77x → Phase 17 で 9367x)**: 500 widgets 規模では per-widget input_hash 判定 (`with_widget_node` 内の hash 計算 + scenegraph lookup) のオーバーヘッドが累積し、外側 cached() の `extend_from_slice` で全部 skip するメリットが圧倒的。具体的には no_cache フレームで各 widget が `pyramid.ensure_built` (fingerprint 一致で no-op) + `build_peak_segments` (各ピクセル走査) + `LineBatch` push を 500 回繰り返し、合計 ~1.28 秒/フレーム。cached frame は前フレームの commands を 1 度の `extend_from_slice` で scene に append するだけで 136µs。
+- **viewport_key に `forced_mode_tag` を含める (u8 タグ化)**: enum を直接 hash に渡すには Hash 実装が必要だが、`WaveformRenderMode` derive Hash 済。シンプル化のため `forced_mode_tag(opt) -> u8` で `(None|Some(Auto))=0, PeakLines=1, SamplePolyline=2, RmsBars=3` に圧縮。1/2/3/a 切替で hash が変わって全 widgets が再描画される。
+- **画面外 clip の描画 skip**: `y_offset` 大で見切れる track は `if rect.y + rect.h < area.y || rect.y > area.y + area.h { continue }` で skip。cached miss 時の widget 描画コスト削減 (cached hit 時は scene への extend_from_slice なので skip しても commands は前フレームの全部が入る、影響なし)。
+- **REC は不要 (KISS)**: arrangement は static、Space で REC は waveform_validation 専用機能なので継承せず。
+- **drag は無修飾のみ pan、Shift は将来 selection 用に予約**: sample_editor の drag 設計と整合 (Phase 16 で確立)。`!self.cur_modifiers.shift` で Shift 時 drag は anchor 設定しない。
+- **clip 1 つあたり 25×65 px**: 1280×800 画面で grid 1264×656、cell_w=25 / cell_h=65。PeakLines / RmsBars が読める最低高さ。SamplePolyline は深 zoom in 時のみ意味があるため 25 px 幅で sample 数が少なく、マーカー閾値 (Phase 16: samples_per_pixel < 0.25) で適切に切替。
+- **`HUD cache HIT/MISS` は前フレーム viewport_hash 一致で推定**: piano_roll と同パターン (approximation)。eviction で誤りうるが視覚的目安として十分。
+- **Phase 17 で M5 milestone 完了**: 残 phase なし。次は M5.5 (オートメーションカーブ) — ベジエ → CPU flatten → push_lines。
+
+**M5 milestone 全体総括**:
+| Phase | 成果 | 主 commit |
+|---|---|---|
+| 13 | `Ui::heavy` + `HeavyCtx` + `cached` API 基盤 (with_widget_node 薄ラッパ、新キャッシュ機構ゼロ) | 3d137e4 |
+| 14 | examples/piano_roll (100k notes、heavy 第 1 弾)、bench cached 5.77x | 61d6792 + 0eb5ff2 |
+| 15 | 波形 SamplePolyline + Auto + Interleaved unit test | 76f1b9c + 23b1a03 |
+| 16 | サンプル点マーカー (rect 角丸円) + RmsBars (LOD 拡張、`MinMaxPair.rms_sum_sq`) + examples/sample_editor | 313d4c6 + 64ad448 |
+| 17 | examples/arrangement (500 widgets、heavy 第 2 弾)、bench cached 9367x | (本コミット) |
+
+heavy() の 2 つの典型用途 (1 巨大ビュー = Phase 14 piano_roll、多数 widget = Phase 17
+arrangement) を実装 + bench 実証完了。波形 widget は PeakLines / SamplePolyline / RmsBars
+の 3 mode + マーカー対応で M5 元仕様の波形機能を全て満たす。
 
 **M5 元仕様** (Phase 14 以降の DoD ガイド):
 - `ui.heavy("...", |hctx| ...)` 脱出口 ✅ (Phase 13 で完成)

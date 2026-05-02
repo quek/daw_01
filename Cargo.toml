@@ -8,6 +8,7 @@ members = [
     "crates/examples/waveform_validation",
     "crates/examples/piano_roll",
     "crates/examples/sample_editor",
+    "crates/examples/arrangement",
 ]
 
 [workspace.package]
