@@ -534,6 +534,8 @@ cached が ~1.9x 高速。1000 widgets で frame あたり ~148 µs (= 148 ns/wi
 | **16** | マーカー (rect 角丸円) + RmsBars + examples/sample_editor | 中 | Phase 15 |
 | **17** | examples/arrangement (10×50 = 500 widgets を heavy 化) + bench | 中 | Phase 13, 16 |
 
+Phase 13, 14 完了 (2026-05-02 時点)。残 Phase 15-17 は別タスクで進める。
+
 オートメーションカーブ (ベジエ → CPU flatten → line) は当初 Phase 18 として M5 に
 入れていたが、heavy / 詳細波形 の主目標を区切りやすくするため **M5.5** (M5 完了後すぐの
 別 milestone) にスライド (下記参照)。
@@ -570,8 +572,29 @@ cached が ~1.9x 高速。1000 widgets で frame あたり ~148 µs (= 148 ns/wi
   block 追加で 209 lines になり、元の 8 ch ループの index アクセスも警告対象に。build_ui の
   関数分割は別タスクへ。
 
-**残作業 (M5 残、Phase 14-17)**:
-- Phase 14: examples/piano_roll (100k notes、heavy 実用 + bench)
+**Phase 14 進捗 (2026-05-02)** — heavy() 実用第 1 弾 (examples/piano_roll):
+
+| 成果物 | 状態 | 備考 |
+|---|---|---|
+| `crates/examples/piano_roll/{Cargo.toml, src/main.rs}`: 100k notes ピアノロール | ✅ | (本コミット) |
+| 鍵盤左 widget (60px) + 拍/小節グリッド + 黒鍵 row 帯 + notes 矩形 (背景一括 cached) | ✅ | (本コミット) |
+| drag (XY 同時 pan) + wheel zoom + 短 click (drag<16px) hit-test → 選択 overlay | ✅ | (本コミット) |
+| HUD: frame_ms / visible / cache HIT/MISS 推定 / view 範囲 / pitch_top | ✅ | (本コミット) |
+| `viewport_key` = (`b"piano_roll_v1"`, view_*, area.w/h, notes_generation) の 8-tuple | ✅ | (本コミット) |
+| `crates/ui/benches/heavy_piano_roll.rs`: cached vs no_cache 100k 比測定 | ✅ | (本コミット) |
+| `cargo bench` 実測値: cached **4.51µs** vs no_cache **26.03µs** = **5.77x 高速** (DoD: 5x+) | ✅ | (本コミット) |
+| ルート Cargo.toml workspace members + crates/ui/Cargo.toml `[[bench]]` 追加 | ✅ | (本コミット) |
+
+**設計判断**:
+- **`viewport_key` に schema namespace + area 寸法 + notes_generation を含める**: `(b"piano_roll_v1", view_start_beat.to_bits(), view_len_beats.to_bits(), pitch_top.to_bits(), pitch_visible.to_bits(), grid.w.to_bits(), grid.h.to_bits(), notes_generation)` の 8-tuple。area 寸法を入れることでウィンドウリサイズ時にも cache が陳腐化せず再構築される。`notes_generation` は将来編集 API 追加時の bump hook として今から確保 (現状 0 固定)。
+- **HUD は `ui.heavy()` の外に配置**: `last_frame_ms` / `cache_status` / `visible_count` は毎フレーム値が変わるため heavy 内に入れると viewport_key 衝突 / 無意味 cache miss を誘発する。HUD 文字列は `build_ui` の冒頭で App 側で組み立て、`ui.label_at` で heavy ブロックの外に push する (mixer の構造踏襲)。
+- **HUD の cache HIT/MISS 推定**: HeavyCtx は cache hit 判定 API を持たないため、App 側で前フレームの `viewport_hash = hash_inputs(&viewport_key)` を保持して今フレームと一致なら HIT 表記する approximation。eviction や hash 衝突極端ケースで誤りうるが視覚的目安として十分。
+- **visible 範囲は `partition_point` 二分探索**: `notes` を `start_beat` 昇順ソート済前提で `[s_idx, e_idx)` を O(log N) で算出。100k から visible ~1500 まで絞ることで heavy 内の rect push を visible 件数 * 1〜2 オーダーに抑える。
+- **drag/wheel/click は App 側で吸収**: `pointer.primary_just_pressed/released` から drag_anchor を作り、release 時の累積 dx+dy < 16px で短 click 判定。`pending_click` を立てて build_ui 内で消費。pan は Edit 経由ではなく App 側で `&mut self.model` を直接書き換える (waveform_validation 既存パターン)。`Edit` は「click → selected_note_index 更新」の closure capture が必要なケースのみで使用。
+- **bench は wgpu/font 不要のミニマル構成**: `UiHost::<()>::new()` + `Scene::new()` + `FrameInput::default()` で `host.frame()` を呼べる。Model に `()` を使うことでヒットテスト・選択 overlay を排除し、純粋な「heavy() + cached() の描画コマンド push コスト」を測定できる。warm-up 1 フレームで cache を populate してから本測定に入る点も scenegraph_cache.rs 踏襲。
+- **bench で cached が 5.77x 高速 (DoD: 5x+)**: M4 Phase 12 の 1000 button bench は 1.9x だったが、heavy は 1500 visible notes / フレームの rect push が dominant コストなので、cache hit の `extend_from_slice` が draw_fn の `partition_point + walk + push_rect ×1500+` を一気に置き換える分、差が 3 倍弱に拡大した。
+
+**残作業 (M5 残、Phase 15-17)**:
 - Phase 15: 波形 SamplePolyline + Auto + Interleaved unit test
 - Phase 16: マーカー (rect 角丸円) + RmsBars + examples/sample_editor
 - Phase 17: examples/arrangement (10×50 = 500 widgets を heavy 化) + bench
