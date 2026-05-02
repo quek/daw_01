@@ -125,6 +125,8 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 
 **動機**: `Arc<dyn Fn(&mut M) + Send + Sync>` ベースの Undoable は理論上は no-Clone を守るが、`Vec<MidiNote>` / `Vec<f32>` 級の **重い inverse** を要するケース (note multi-select delete、audio trim/fade) でユーザに boilerplate を強要しないかは未検証。「新しく入れた抽象は次の機会に使う」(`feedback_use_new_abstractions.md`) を Undoable に適用するタイミング。M9 を見送って theming / animation / 信号処理 widget に直行すると、Undoable の前提が崩れたまま機能拡張が積み重なるリスク。
 
+**並行**: daw_01 から M7/M8 実利用フィードバックが 11 項目 (P0-P3) 届いている。詳細プランは [plan_daw01_feedback.md](plan_daw01_feedback.md)。Phase 41-44 の前提となる API 整備として P0-P1 を先行実施することが多い (例: P0-1 Shortcut::parse 記号受理は piano_roll の `Shift+/` shortcut で必要、P1-3 HeavyCtx delegate は piano_roll の rect-select で必要、P1-4 double-click は clip → Piano Roll タブ UX で必要)。
+
 | Phase | テーマ | 主な成果物 |
 |---|---|---|
 | 41 | piano_roll の note edit + multi-select 統合 (主軸) | `Edit::with_inverse` で note add/delete/move/resize、`Ui::take_drag_rect_in_rect` 流用で batch delete/move、`HistoryStack::begin_group/end_group` で N notes を 1 step、最小限 `Ui::set_cursor` 公開 |
