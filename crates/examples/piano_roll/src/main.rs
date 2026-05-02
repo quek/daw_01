@@ -48,11 +48,16 @@ struct Note {
 
 /// 100k 個を決定論的 LCG で生成。`start_beat` 昇順にソート。
 fn generate_notes(count: usize) -> Vec<Note> {
-    // 線形合同法 (LCG): Numerical Recipes 系の定数
+    // 線形合同法 (LCG) + splitmix64 finalizer。LCG 単体の下位 bit は周期が短く
+    // (`% 60` のような小さな modulo で「4 半音間隔」のような周期パターンが出る)、
+    // splitmix64 finalizer で全 bit を mix してから modulo を取ることで均一分散を得る。
     let mut state: u64 = 0x12345678_9ABCDEF0;
     let mut next = || {
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        state
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
     };
 
     let total_beats: f32 = 1024.0;        // 64 小節 (4/4)
@@ -101,9 +106,9 @@ impl PianoRollModel {
             notes,
             notes_generation: 0,
             view_start_beat: 0.0,
-            view_len_beats: 16.0,    // 4 小節を表示
-            pitch_top: 84.0,         // C6
-            pitch_visible: 36.0,     // 3 オクターブ
+            view_len_beats: 4.0,     // 1 小節 = 個々の note 矩形が判別可能なズーム
+            pitch_top: 72.0,         // C5
+            pitch_visible: 24.0,     // 2 オクターブ (1 row = 高めで note が見える)
             selected_note_index: None,
             last_frame_ms: 0.0,
             last_action: "起動 (Drag = pan / Wheel = zoom / Click = select)".to_string(),
@@ -271,20 +276,36 @@ impl App {
             }
         }
 
-        // --- wheel zoom ---
+        // --- wheel zoom (無修飾 = X zoom、Ctrl+wheel = Y zoom) ---
         if self.pending_zoom_dy.abs() > 0.0 {
-            let anchor_frac = if let Some((mx, _)) = self.cur_mouse {
-                ((mx - grid.x) / grid.w).clamp(0.0, 1.0)
-            } else {
-                0.5
-            };
             let factor = (-self.pending_zoom_dy * 0.15).exp();
-            let new_len = (self.model.view_len_beats * factor).clamp(0.25, 256.0);
-            let anchor_beat =
-                self.model.view_start_beat + anchor_frac * self.model.view_len_beats;
-            let new_start = (anchor_beat - anchor_frac * new_len).max(0.0);
-            self.model.view_start_beat = new_start;
-            self.model.view_len_beats = new_len;
+            if pointer.modifiers.ctrl {
+                // Y zoom: pitch_visible を変更、anchor は cur_mouse.y の grid 内比率
+                let anchor_frac = if let Some((_, my)) = self.cur_mouse {
+                    ((my - grid.y) / grid.h).clamp(0.0, 1.0)
+                } else {
+                    0.5
+                };
+                let new_visible = (self.model.pitch_visible * factor).clamp(2.0, 128.0);
+                let anchor_pitch =
+                    self.model.pitch_top - anchor_frac * self.model.pitch_visible;
+                let new_top = anchor_pitch + anchor_frac * new_visible;
+                self.model.pitch_top = new_top.clamp(new_visible - 1.0, 127.0);
+                self.model.pitch_visible = new_visible;
+            } else {
+                // X zoom: view_len_beats を変更、anchor は cur_mouse.x の grid 内比率
+                let anchor_frac = if let Some((mx, _)) = self.cur_mouse {
+                    ((mx - grid.x) / grid.w).clamp(0.0, 1.0)
+                } else {
+                    0.5
+                };
+                let new_len = (self.model.view_len_beats * factor).clamp(0.25, 256.0);
+                let anchor_beat =
+                    self.model.view_start_beat + anchor_frac * self.model.view_len_beats;
+                let new_start = (anchor_beat - anchor_frac * new_len).max(0.0);
+                self.model.view_start_beat = new_start;
+                self.model.view_len_beats = new_len;
+            }
             self.pending_zoom_dy = 0.0;
         }
     }
@@ -464,17 +485,25 @@ impl App {
                                 );
                             }
                         }
-                        // (e) notes 矩形 (visible のみ)
+                        // (e) notes 矩形 (visible のみ)。
+                        // grid_rect で X/Y 両軸を厳密 clip する (renderer 側に scissor がないため、
+                        // CPU 側で rect を切り詰めて push する)。
                         for note in visible {
                             let r = note_to_rect(*note, m, grid);
-                            // grid 範囲外を簡易クリップ (横方向 hidden は描画しない)
-                            if r.x + r.w < grid.x || r.x > grid.x + grid.w {
+                            let x_left = r.x.max(grid.x);
+                            let x_right = (r.x + r.w).min(grid.x + grid.w);
+                            let y_top = r.y.max(grid.y);
+                            let y_bot = (r.y + r.h).min(grid.y + grid.h);
+                            if x_right <= x_left || y_bot <= y_top {
                                 continue;
                             }
-                            if r.y + r.h < grid.y || r.y > grid.y + grid.h {
-                                continue;
-                            }
-                            hctx.push_rect(note_rect_command(r, pitch_color(note.velocity)));
+                            let clipped = Rect {
+                                x: x_left,
+                                y: y_top,
+                                w: x_right - x_left,
+                                h: y_bot - y_top,
+                            };
+                            hctx.push_rect(note_rect_command(clipped, pitch_color(note.velocity)));
                         }
                     });
 
@@ -485,13 +514,19 @@ impl App {
                     {
                         let note = m.notes[idx];
                         let r = note_to_rect(note, m, grid);
-                        // 強調枠 (border 風)
+                        // note より 2px 外側に張り出した黄色 fill + 白縁取りで強調
+                        let pad = 2.0;
                         hctx.push_rect(RectCommand {
-                            rect: r,
-                            fill: Color::TRANSPARENT,
-                            border: Color::rgb(1.0, 0.95, 0.55),
+                            rect: Rect {
+                                x: r.x - pad,
+                                y: r.y - pad,
+                                w: r.w + pad * 2.0,
+                                h: r.h + pad * 2.0,
+                            },
+                            fill: Color::rgb(1.0, 0.85, 0.30),
+                            border: Color::rgb(1.0, 1.0, 1.0),
                             border_width: 2.0,
-                            radius: [1.5; 4],
+                            radius: [3.0; 4],
                         });
                     }
 
@@ -525,7 +560,7 @@ impl App {
                 let footer_y = (screen.height as f32 - 44.0).max(0.0);
                 ui.label_at(
                     "footer1",
-                    "Drag = pan / Wheel = zoom / Click (drag<16px) = note 選択",
+                    "Drag = pan / Wheel = X zoom / Ctrl+Wheel = Y zoom / Click (drag<16px) = note 選択",
                     16.0, footer_y, 12.0,
                     Color::rgb(0.65, 0.68, 0.72),
                 );

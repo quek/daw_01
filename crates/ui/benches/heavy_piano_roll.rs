@@ -24,10 +24,14 @@ struct Note {
 }
 
 fn generate_notes(count: usize) -> Vec<Note> {
+    // LCG + splitmix64 finalizer (piano_roll example と同じアルゴリズム)。
     let mut state: u64 = 0x12345678_9ABCDEF0;
     let mut next = || {
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        state
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
     };
     let total_beats: f32 = 1024.0;
     let pitch_lo: u8 = 36;
