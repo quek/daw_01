@@ -1,0 +1,20 @@
+[package]
+name = "daw-ui-example-sample-editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "sample_editor"
+path = "src/main.rs"
+
+[dependencies]
+daw-ui-platform.workspace = true
+daw-ui-renderer.workspace = true
+daw-ui-core.workspace = true
+winit = "0.30.13"

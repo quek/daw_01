@@ -503,6 +503,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "daw-ui-example-sample-editor"
+version = "0.1.0"
+dependencies = [
+ "daw-ui-core",
+ "daw-ui-platform",
+ "daw-ui-renderer",
+ "winit",
+]
+
+[[package]]
 name = "daw-ui-example-waveform-validation"
 version = "0.1.0"
 dependencies = [

@@ -63,6 +63,10 @@ struct WaveformAppModel {
     /// REC 中の現在位置 (sample index)。
     rec_pos: u64,
 
+    /// `None` で Auto (Phase 15 挙動)。1/2/3 キーで明示上書き、a キーで `None` に戻す
+    /// (Phase 16 で追加、`feedback_use_new_abstractions` 適合: sample_editor と同じ仕組み)。
+    forced_mode: Option<WaveformRenderMode>,
+
     /// HUD 用: 最後のフレーム時間 (ms)。
     last_frame_ms: f32,
     last_action: String,
@@ -83,6 +87,7 @@ impl WaveformAppModel {
             y_offset: 0.0,
             recording: false,
             rec_pos: 0,
+            forced_mode: None,
             last_frame_ms: 0.0,
             last_action: "起動 (Drag = 横スクロール / Wheel = ズーム / Space = REC)"
                 .to_string(),
@@ -374,9 +379,8 @@ impl App {
                     fill: None,
                     baseline: Some(Color::rgba(1.0, 1.0, 1.0, 0.08)),
                     channel_layout: ChannelLayout::Overlay,
-                    // M5 Phase 15: Auto モードで samples_per_pixel < 1.0 のとき
-                    // SamplePolyline (生サンプル折れ線) に自動切替する。
-                    render_mode: WaveformRenderMode::Auto,
+                    // M5 Phase 15-16: forced_mode で 1/2/3 キーから明示上書き、None なら Auto。
+                    render_mode: m.forced_mode.unwrap_or(WaveformRenderMode::Auto),
                     line_width_px: 1.0,
                 };
                 // 各クリップが少し違うサンプル位置を表示するシフト量。view 全体に対して
@@ -400,7 +404,7 @@ impl App {
                 let footer_y = (screen.height as f32 - 44.0).max(0.0);
                 ui.label_at(
                     "footer1",
-                    "Drag = 横スクロール │ Wheel = X zoom │ Ctrl+Wheel = Y zoom (vertical_gain) │ Space = REC トグル",
+                    "Drag = 横スクロール │ Wheel = X zoom │ Ctrl+Wheel = Y zoom │ Space = REC │ [1] PeakLines [2] SamplePolyline [3] RmsBars [a] Auto",
                     16.0,
                     footer_y,
                     13.0,
@@ -445,13 +449,33 @@ impl AppHost for App {
             self.cur_modifiers = *m;
         }
 
-        // Space で REC トグル
+        // Space で REC トグル + 1/2/3/a で render_mode 上書き (Phase 16)
         if let AppEvent::Keyboard(key) = &ev
             && key.state == ElementState::Pressed
-            && key.physical_key == PhysicalKey::Space
         {
-            self.model.toggle_recording();
-            self.rec_last_tick = None;
+            match key.physical_key {
+                PhysicalKey::Space => {
+                    self.model.toggle_recording();
+                    self.rec_last_tick = None;
+                }
+                PhysicalKey::Other(0x31) => {
+                    self.model.forced_mode = Some(WaveformRenderMode::PeakLines);
+                    self.model.last_action = "forced: PeakLines".to_string();
+                }
+                PhysicalKey::Other(0x32) => {
+                    self.model.forced_mode = Some(WaveformRenderMode::SamplePolyline);
+                    self.model.last_action = "forced: SamplePolyline".to_string();
+                }
+                PhysicalKey::Other(0x33) => {
+                    self.model.forced_mode = Some(WaveformRenderMode::RmsBars);
+                    self.model.last_action = "forced: RmsBars".to_string();
+                }
+                PhysicalKey::Other(0x41) => {
+                    self.model.forced_mode = None;
+                    self.model.last_action = "Auto モードに戻る".to_string();
+                }
+                _ => {}
+            }
         }
 
         self.input.ingest(&ev);

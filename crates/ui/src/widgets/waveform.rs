@@ -12,7 +12,7 @@
 
 use std::hash::Hash;
 
-use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect};
+use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
 
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
@@ -180,10 +180,14 @@ struct PyramidFingerprint {
 struct MinMaxPair {
     min: f32,
     max: f32,
+    /// このペアがカバーするサンプル範囲の `sum(s^2)`。RmsBars 描画時に
+    /// `sqrt(sum_sq / n)` で RMS を計算する (Phase 16)。
+    /// メモリ +50% (8B → 12B/pair) は DAW project の MB スケールに対し許容範囲。
+    rms_sum_sq: f32,
 }
 
 impl MinMaxPair {
-    const ZERO: Self = Self { min: 0.0, max: 0.0 };
+    const ZERO: Self = Self { min: 0.0, max: 0.0, rms_sum_sq: 0.0 };
 }
 
 #[derive(Debug, Default)]
@@ -413,7 +417,7 @@ fn extend_level_from_prev(level: &mut MinMaxLevel, prev: &MinMaxLevel, channels:
     }
 }
 
-/// `[MinMaxPair]` から min/max を畳み込む。空なら `MinMaxPair::ZERO`。
+/// `[MinMaxPair]` から min/max/rms_sum_sq を畳み込む。空なら `MinMaxPair::ZERO`。
 /// peak_in_view の毎ピクセル hot path で呼ばれるので `#[inline(always)]`。
 #[allow(clippy::inline_always)]
 #[inline(always)]
@@ -423,6 +427,7 @@ fn fold_pairs(pairs: &[MinMaxPair]) -> MinMaxPair {
     }
     let mut mn = f32::INFINITY;
     let mut mx = f32::NEG_INFINITY;
+    let mut sum_sq = 0.0_f32;
     for p in pairs {
         if p.min < mn {
             mn = p.min;
@@ -430,6 +435,7 @@ fn fold_pairs(pairs: &[MinMaxPair]) -> MinMaxPair {
         if p.max > mx {
             mx = p.max;
         }
+        sum_sq += p.rms_sum_sq;
     }
     if !mn.is_finite() {
         mn = 0.0;
@@ -437,16 +443,17 @@ fn fold_pairs(pairs: &[MinMaxPair]) -> MinMaxPair {
     if !mx.is_finite() {
         mx = 0.0;
     }
-    MinMaxPair { min: mn, max: mx }
+    MinMaxPair { min: mn, max: mx, rms_sum_sq: sum_sq }
 }
 
-/// 生サンプルから `[start, end)` の min/max を取る。enum variant ごとに hot loop を分ける。
+/// 生サンプルから `[start, end)` の min/max/sum_sq を取る。enum variant ごとに hot loop を分ける。
 fn peak_in_raw(samples: &SampleSlices<'_>, ch: usize, start: usize, end: usize) -> MinMaxPair {
     if end <= start {
         return MinMaxPair::ZERO;
     }
     let mut mn = f32::INFINITY;
     let mut mx = f32::NEG_INFINITY;
+    let mut sum_sq = 0.0_f32;
     match samples {
         SampleSlices::Mono(s) => {
             if ch == 0 {
@@ -459,6 +466,7 @@ fn peak_in_raw(samples: &SampleSlices<'_>, ch: usize, start: usize, end: usize) 
                         if v > mx {
                             mx = v;
                         }
+                        sum_sq += v * v;
                     }
                 }
             }
@@ -474,6 +482,7 @@ fn peak_in_raw(samples: &SampleSlices<'_>, ch: usize, start: usize, end: usize) 
                         if v > mx {
                             mx = v;
                         }
+                        sum_sq += v * v;
                     }
                 }
             }
@@ -491,6 +500,7 @@ fn peak_in_raw(samples: &SampleSlices<'_>, ch: usize, start: usize, end: usize) 
                     if v > mx {
                         mx = v;
                     }
+                    sum_sq += v * v;
                 }
             }
         }
@@ -501,7 +511,7 @@ fn peak_in_raw(samples: &SampleSlices<'_>, ch: usize, start: usize, end: usize) 
     if !mx.is_finite() {
         mx = 0.0;
     }
-    MinMaxPair { min: mn, max: mx }
+    MinMaxPair { min: mn, max: mx, rms_sum_sq: sum_sq }
 }
 
 /// 1 フレーム分の波形セグメントを構築する。
@@ -734,6 +744,81 @@ fn build_sample_polyline_segments(
     segments
 }
 
+/// `SamplePolyline` モード時の各サンプル点マーカー (rect 角丸円、knob と同パターン) を生成
+/// (Phase 16)。`samples_per_pixel < 0.25` (= 1 sample あたり 4px 以上) のときのみ描画する
+/// (それより粗いと点が密集して視認性が落ちる + rect 数爆発)。
+///
+/// `radius: [r; 4]` (r = サイズ/2) で完全な円。
+#[allow(clippy::many_single_char_names)]
+fn build_sample_polyline_markers(
+    src: &WaveformSource<'_>,
+    rect: Rect,
+    view: WaveformView,
+    style: WaveformStyle,
+) -> Vec<RectCommand> {
+    let view_len = view.len_samples.max(1) as f64;
+    let pixel_w = f64::from(rect.w.max(1.0));
+    let samples_per_pixel = view_len / pixel_w;
+    if samples_per_pixel >= 0.25 {
+        return Vec::new();
+    }
+
+    let channels = src.samples.channels();
+    let valid_len = clamp_valid_len(src);
+    if rect.w < 1.0 || rect.h < 1.0 || channels == 0 {
+        return Vec::new();
+    }
+
+    let view_start = view.start_sample as f64;
+    let x_per_sample = pixel_w / view_len;
+
+    let (per_ch_h, ch_iter): (f32, Vec<usize>) = match style.channel_layout {
+        ChannelLayout::Stack => (rect.h / channels as f32, (0..channels).collect()),
+        ChannelLayout::Overlay => (rect.h, (0..channels).collect()),
+        ChannelLayout::FirstOnly => (rect.h, vec![0]),
+    };
+
+    let s_start_int = view_start.max(0.0) as usize;
+    let s_end_unclamped = (view_start + view_len) as usize + 1;
+    let s_end_int = s_end_unclamped.min(valid_len);
+    let n_samples = s_end_int.saturating_sub(s_start_int);
+
+    let marker_size = (style.line_width_px * 3.0).max(2.0);
+    let r = marker_size * 0.5;
+    let mut markers: Vec<RectCommand> =
+        Vec::with_capacity(n_samples * ch_iter.len());
+
+    for (slot, &ch) in ch_iter.iter().enumerate() {
+        let ch_top = rect.y
+            + match style.channel_layout {
+                ChannelLayout::Stack => per_ch_h * slot as f32,
+                _ => 0.0,
+            };
+        let ch_mid = ch_top + per_ch_h * 0.5;
+        let ch_half = per_ch_h * 0.5;
+
+        for i in 0..n_samples {
+            let sample_idx = s_start_int + i;
+            let s = sample_at(&src.samples, ch, sample_idx);
+            let local_pos = sample_idx as f64 - view_start;
+            let x = rect.x + (local_pos * x_per_sample) as f32;
+            let v = (s * view.vertical_gain).clamp(-1.0, 1.0);
+            let y = ch_mid - v * ch_half;
+            let is_clipped = s.abs() > 1.0;
+            let fill = if is_clipped { style.fg_clipped } else { style.fg };
+            markers.push(RectCommand {
+                rect: Rect { x: x - r, y: y - r, w: marker_size, h: marker_size },
+                fill,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [r; 4],
+            });
+        }
+    }
+
+    markers
+}
+
 /// 生サンプルから 1 サンプル分の値を取り出す (channels = 0 / 範囲外は 0.0)。
 /// `peak_in_raw` の Interleaved stride アクセスと整合。
 #[inline]
@@ -756,6 +841,131 @@ fn sample_at(samples: &SampleSlices<'_>, ch: usize, idx: usize) -> f32 {
             }
         }
     }
+}
+
+/// 1 ピクセル分の RMS = `sqrt(sum_sq / n)` を返す (Phase 16)。
+/// `peak_in_view_cached` を呼んで sum_sq を取り出し、サンプル数で割って sqrt する。
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn rms_in_view_cached(
+    col: Option<&[MinMaxPair]>,
+    decim: Option<usize>,
+    samples: &SampleSlices<'_>,
+    valid_len: usize,
+    ch: usize,
+    sample_start: f64,
+    sample_end: f64,
+) -> f32 {
+    let s_start = sample_start.max(0.0) as usize;
+    let s_end = (sample_end.max(0.0) as usize).min(valid_len);
+    let n = s_end.saturating_sub(s_start).max(1);
+    let pair = peak_in_view_cached(col, decim, samples, valid_len, ch, sample_start, sample_end);
+    (pair.rms_sum_sq / n as f32).sqrt()
+}
+
+/// `RmsBars` 描画 (Phase 16): `build_peak_segments` と同形だが、min/max の代わりに
+/// `±RMS` の縦線を描く。RMS は常に正値なので `0..1` を `[ch_mid - ch_half, ch_mid + ch_half]`
+/// に対称マップする (= ch_mid を中心に ±RMS の縦バー)。
+#[allow(clippy::too_many_lines)]
+fn build_rms_bar_segments(
+    pyramid: &WaveformPyramid,
+    src: &WaveformSource<'_>,
+    rect: Rect,
+    view: WaveformView,
+    style: WaveformStyle,
+) -> Vec<LineSegment> {
+    let channels = src.samples.channels();
+    let valid_len = clamp_valid_len(src);
+    if rect.w < 1.0 || rect.h < 1.0 || channels == 0 {
+        return Vec::new();
+    }
+
+    let samples = &src.samples;
+    let view_start = view.start_sample as f64;
+    let view_len = view.len_samples.max(1) as f64;
+    let pixel_w = f64::from(rect.w);
+    let samples_per_pixel = view_len / pixel_w;
+    let pixel_count = rect.w as usize;
+
+    let (per_ch_h, ch_iter): (f32, Vec<usize>) = match style.channel_layout {
+        ChannelLayout::Stack => (rect.h / channels as f32, (0..channels).collect()),
+        ChannelLayout::Overlay => (rect.h, (0..channels).collect()),
+        ChannelLayout::FirstOnly => (rect.h, vec![0]),
+    };
+
+    let mut segments: Vec<LineSegment> =
+        Vec::with_capacity(pixel_count * ch_iter.len() + ch_iter.len());
+
+    // baseline (build_peak_segments と完全同形)
+    if let Some(base_color) = style.baseline {
+        match style.channel_layout {
+            ChannelLayout::Stack => {
+                for (slot, _ch) in ch_iter.iter().enumerate() {
+                    let y_mid = rect.y + per_ch_h * slot as f32 + per_ch_h * 0.5;
+                    segments.push(LineSegment {
+                        a: [rect.x, y_mid],
+                        b: [rect.x + rect.w, y_mid],
+                        color: base_color,
+                    });
+                }
+            }
+            ChannelLayout::Overlay | ChannelLayout::FirstOnly => {
+                let y_mid = rect.y + rect.h * 0.5;
+                segments.push(LineSegment {
+                    a: [rect.x, y_mid],
+                    b: [rect.x + rect.w, y_mid],
+                    color: base_color,
+                });
+            }
+        }
+    }
+
+    let span_int = samples_per_pixel as usize;
+    let chosen_level: Option<&MinMaxLevel> = pyramid
+        .levels
+        .iter()
+        .rfind(|l| (l.decimation as usize) <= span_int);
+
+    for (slot, &ch) in ch_iter.iter().enumerate() {
+        let ch_top = rect.y
+            + match style.channel_layout {
+                ChannelLayout::Stack => per_ch_h * slot as f32,
+                _ => 0.0,
+            };
+        let ch_mid = ch_top + per_ch_h * 0.5;
+        let ch_half = per_ch_h * 0.5;
+        let cached_col: Option<&[MinMaxPair]> =
+            chosen_level.and_then(|l| l.per_channel.get(ch).map(Vec::as_slice));
+
+        for px in 0..pixel_count {
+            let p_start = view_start + (px as f64) * samples_per_pixel;
+            let p_end = view_start + (px as f64 + 1.0) * samples_per_pixel;
+            let rms = rms_in_view_cached(
+                cached_col,
+                chosen_level.map(|l| l.decimation as usize),
+                samples,
+                valid_len,
+                ch,
+                p_start,
+                p_end,
+            );
+
+            let clipped = rms > 1.0;
+            let color = if clipped { style.fg_clipped } else { style.fg };
+            let v = (rms * view.vertical_gain).clamp(0.0, 1.0);
+            let y_top = ch_mid - v * ch_half;
+            let y_bot = (ch_mid + v * ch_half).max(y_top + 1.0);
+            let x = rect.x + px as f32 + 0.5;
+
+            segments.push(LineSegment {
+                a: [x, y_top],
+                b: [x, y_bot],
+                color,
+            });
+        }
+    }
+
+    segments
 }
 
 /// 事前に選択済みレベル (`col` + `decim`) を使って 1 ピクセル分の min/max を取る。
@@ -850,11 +1060,15 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 WaveformRenderMode::SamplePolyline => {
                     build_sample_polyline_segments(&source, rect, view, style)
                 }
-                // TODO(Phase 16): RmsBars 専用描画。Phase 15 では PeakLines にフォールバック。
-                WaveformRenderMode::PeakLines | WaveformRenderMode::RmsBars => {
+                WaveformRenderMode::PeakLines => {
                     let pyramid: &mut WaveformPyramid = ui.widget_state(wid);
                     pyramid.ensure_built(&source);
                     build_peak_segments(pyramid, &source, rect, view, style)
+                }
+                WaveformRenderMode::RmsBars => {
+                    let pyramid: &mut WaveformPyramid = ui.widget_state(wid);
+                    pyramid.ensure_built(&source);
+                    build_rms_bar_segments(pyramid, &source, rect, view, style)
                 }
                 WaveformRenderMode::Auto => unreachable!("resolve_render_mode で除去済"),
             };
@@ -864,6 +1078,15 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     line_width_px: style.line_width_px.max(1.0),
                     clip_rect: Some(rect),
                 });
+            }
+            // M5 Phase 16: SamplePolyline のとき、samples_per_pixel < 0.25 ならサンプル点
+            // マーカー (rect 角丸円、knob と同パターン) を追加 push。閾値超過なら markers
+            // は空 Vec が返るので no-op。
+            if effective_mode == WaveformRenderMode::SamplePolyline {
+                let markers = build_sample_polyline_markers(&source, rect, view, style);
+                for m in markers {
+                    ui.push_rect(m);
+                }
             }
         });
 
@@ -979,6 +1202,16 @@ mod tests {
                         r_pair.max, a_pair.max,
                         "level {lvl_idx} ch {ch} pair {p} max mismatch (ref={}, actual={})",
                         r_pair.max, a_pair.max,
+                    );
+                    // rms_sum_sq は浮動小数の累積順序 (peak の sum vs fold の sum) で
+                    // 微妙に異なるため epsilon=1e-5 相対誤差 + 1e-12 絶対許容で比較。
+                    let r_rms = r_pair.rms_sum_sq;
+                    let a_rms = a_pair.rms_sum_sq;
+                    let abs_diff = (r_rms - a_rms).abs();
+                    let tol = r_rms.abs().max(a_rms.abs()) * 1e-5 + 1e-12;
+                    assert!(
+                        abs_diff <= tol,
+                        "level {lvl_idx} ch {ch} pair {p} rms_sum_sq diff (ref={r_rms}, actual={a_rms}, diff={abs_diff}, tol={tol})",
                     );
                 }
             }

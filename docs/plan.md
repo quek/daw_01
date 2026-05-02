@@ -534,7 +534,7 @@ cached が ~1.9x 高速。1000 widgets で frame あたり ~148 µs (= 148 ns/wi
 | **16** | マーカー (rect 角丸円) + RmsBars + examples/sample_editor | 中 | Phase 15 |
 | **17** | examples/arrangement (10×50 = 500 widgets を heavy 化) + bench | 中 | Phase 13, 16 |
 
-Phase 13, 14, 15 完了 (2026-05-02 時点)。残 Phase 16-17 は別タスクで進める。
+Phase 13, 14, 15, 16 完了 (2026-05-02 時点)。残 Phase 17 のみで M5 完了予定。
 
 オートメーションカーブ (ベジエ → CPU flatten → line) は当初 Phase 18 として M5 に
 入れていたが、heavy / 詳細波形 の主目標を区切りやすくするため **M5.5** (M5 完了後すぐの
@@ -616,9 +616,38 @@ Phase 13, 14, 15 完了 (2026-05-02 時点)。残 Phase 16-17 は別タスクで
 - **`RmsBars` は PeakLines fallback (TODO Phase 16)**: 専用塗りつぶしは Phase 16 で実装する。Phase 15 で panic させず、Auto モード使用中に偶発的に `style.render_mode = RmsBars` がセットされても安全に表示できるようにする。
 - **Interleaved test 2 件で stride アクセスを固定**: `peak_in_raw` の `data[i*channels+ch]` 経路を 1ch (= Mono 一致) と 2ch (L/R 独立) で固定。今後 Interleaved 経路をいじったときに既存 Mono / Planar との一致が崩れたら即検知できる。
 
-**残作業 (M5 残、Phase 16-17)**:
-- Phase 16: マーカー (rect 角丸円) + RmsBars + examples/sample_editor
-- Phase 17: examples/arrangement (10×50 = 500 widgets を heavy 化) + bench
+**Phase 16 進捗 (2026-05-02)** — マーカー + RmsBars (LOD 拡張) + examples/sample_editor:
+
+| 成果物 | 状態 | 備考 |
+|---|---|---|
+| `MinMaxPair` に `rms_sum_sq: f32` 追加 (8B → 12B/pair、メモリ +50%) | ✅ | (本コミット) |
+| `peak_in_raw` / `fold_pairs` / `extend_level_*` で sum_sq 加算 (3 variant 全部) | ✅ | (本コミット) |
+| `assert_pyramid_eq` に `rms_sum_sq` epsilon 比較追加 (1e-5 相対 + 1e-12 絶対) | ✅ | (本コミット) |
+| `rms_in_view_cached`: `peak_in_view_cached` を呼んで `sqrt(sum_sq / n)` で RMS 計算 | ✅ | (本コミット) |
+| `build_rms_bar_segments`: `build_peak_segments` 同形で ±RMS 縦線、Phase 15 fallback の TODO 除去 | ✅ | (本コミット) |
+| `build_sample_polyline_markers`: knob 同パターンの rect 角丸円 (radius=[r;4]) | ✅ | (本コミット) |
+| マーカー描画閾値 `samples_per_pixel < 0.25`、サイズ `line_width_px * 3.0` | ✅ | (本コミット) |
+| `Ui::waveform` の dispatch を 3 mode 独立 branch に + SamplePolyline でマーカー追加 push | ✅ | (本コミット) |
+| `crates/examples/sample_editor`: 1 サンプル + 選択範囲 + カーソル + 1/2/3/a キー切替 | ✅ | (本コミット) |
+| sample_editor: heavy() 経由で selection/cursor overlay (push_rect が pub なのは HeavyCtx 経由のみ) | ✅ | (本コミット) |
+| `examples/waveform_validation`: forced_mode + 1/2/3/a キー切替追加 (新抽象を直後の example で実用) | ✅ | (本コミット) |
+| 既存 5 unit test (incremental_extension / shrinking / generation_change / interleaved_1ch / interleaved_2ch) すべて pass | ✅ | (本コミット) |
+
+**設計判断**:
+- **RMS 方式 A (LOD ピラミッド拡張) 採用**: `MinMaxPair` に `rms_sum_sq` を追加して `peak_in_raw` と同じループ内で `+= v*v`、`fold_pairs` でも sum_sq 加算。毎ピクセル `sqrt(sum_sq / n)` で O(1) 取得。方式 B (毎ピクセル生計算) は 60s/48k @ 1280px で 14.7M ops/frame で 60fps 不安定、方式 C (PeakLines 流用) は "RMS" 命名と乖離するため不採用。Reaper / Logic / Ableton も方式 A 相当。
+- **メモリ +50% は許容**: 50k samples × 2ch の level 1 で +1.2MB、上位レベルは 1/16 減衰で累計 +1.4MB。DAW project の MB スケールに対し小さい。
+- **`assert_pyramid_eq` は rms に epsilon 許容**: incremental 拡張 (peak の sum) と完全再構築 (fold の sum) で浮動小数累積順序が異なり微妙な誤差 → `1e-5 相対 + 1e-12 絶対` で許容。min/max は厳密比較を維持 (順序が変わっても min/max は一致)。
+- **マーカーは `samples_per_pixel < 0.25` でのみ描画**: SamplePolyline 切替閾値 (1.0) より厳しく、4px 間隔以上のときのみ。100k サンプルでも visible 600 × ch = 1.2k rect に圧縮。閾値超過なら空 Vec で no-op。
+- **マーカーは knob と同パターン**: `radius: [r; 4]` (r = サイズ/2) で完全な円。`line_width_px * 3.0` で line より少し大きい目立つサイズ。色は `style.fg` / `style.fg_clipped` (生サンプル `|s| > 1.0`)。
+- **`Ui::waveform` の dispatch が 3 mode 独立に**: SamplePolyline / PeakLines / RmsBars それぞれ独立 branch、Phase 15 で `WaveformRenderMode::PeakLines | WaveformRenderMode::RmsBars` で fallback していた TODO を除去。`WaveformRenderMode::Auto` は `resolve_render_mode` で除去済なので `unreachable!()`。
+- **SamplePolyline 経路だけ markers を追加 push**: dispatch の後 `if effective_mode == SamplePolyline` で `build_sample_polyline_markers` → `hctx.push_rect` (waveform 内部からは `ui.push_rect` だが pub(crate) 経由)。閾値超過時は markers 空で no-op、無駄なし。
+- **sample_editor の overlay は heavy() 経由**: `Ui::push_rect` は `pub(crate)` で example から呼べないが、`HeavyCtx::push_rect` は pub。selection / cursor は `ui.heavy("overlay", |hctx| { hctx.push_rect(...) })` でラップ (cached() は使わず、毎フレーム描画)。これは Phase 13 で意図した「heavy() = push_* の脱出口」の追加用例。
+- **forced_mode + 1/2/3/a キー切替**: ユーザの「Auto デフォルト + 明示上書き両方」要望に基づき、`forced_mode: Option<WaveformRenderMode>` を Model に持つ。`m.forced_mode.unwrap_or(Auto)` で `WaveformStyle.render_mode` を決定。1/2/3 で Some(...)、a で None に戻す。`PhysicalKey::Other(0x31..0x33, 0x41)` で分岐 (現状の platform crate にキー定数がないため)。
+- **selection は (min, max) 正規化**: drag 方向で end < start にならないよう、anchor_sample と現在 sample の min/max を `selection = Some((s, e))` に保存。
+- **Phase 15 で実装した Auto は維持**: forced_mode = None のときは Auto で zoom 自動切替 (peak ↔ sample) が動作、業界 DAW UX (Reaper/Logic/Ableton) と一貫。
+
+**残作業 (M5 残、Phase 17 のみ)**:
+- Phase 17: examples/arrangement (10×50 = 500 widgets を heavy 化) + bench (M5 最終 phase、heavy() の 2 例目 + arrangement view bench)
 
 **M5 元仕様** (Phase 14 以降の DoD ガイド):
 - `ui.heavy("...", |hctx| ...)` 脱出口 ✅ (Phase 13 で完成)
