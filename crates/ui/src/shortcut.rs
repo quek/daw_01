@@ -11,6 +11,21 @@
 
 use daw_ui_platform::{ElementState, KeyEvent, Modifiers, PhysicalKey};
 
+/// `Shortcut::try_parse` の失敗内容。`spec` 全体と `reason` (短い説明) を保持する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShortcutParseError {
+    pub spec: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for ShortcutParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Shortcut::parse: {} in {:?}", self.reason, self.spec)
+    }
+}
+
+impl std::error::Error for ShortcutParseError {}
+
 /// shortcut spec (key + 修飾)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Shortcut {
@@ -25,7 +40,11 @@ impl Shortcut {
     }
 
     /// `"Ctrl+Shift+Z"` のような文字列を Shortcut に解釈する。
-    /// 解釈不能な spec は `panic!` する (const literal 想定 = 起動時に検出されるべき)。
+    /// 解釈不能な spec は `panic!` する (const literal / `with_default_bindings` のような
+    /// 起動時 hard-coded spec 想定 = 起動時に検出されるべき)。
+    ///
+    /// runtime 由来の spec (ユーザ preference / config file / プラグイン入力) を
+    /// 解釈する場合は `try_parse` を使うこと (panic を避けて Result で返す)。
     ///
     /// 受理する modifier トークン (大小無視):
     /// `Ctrl`, `Control`, `Shift`, `Alt`, `Super`, `Cmd`, `Logo`, `Win`
@@ -33,17 +52,38 @@ impl Shortcut {
     /// 受理する key トークン:
     /// - 1 文字 alphabet: `Z` / `z` (大文字に正規化)
     /// - 1 桁数字: `0`..=`9`
+    /// - 印字可能記号 (M9 P0-1): `/`, `;`, `,`, `.`, `-`, `=`, `[`, `]`, `\`, `'`, `` ` ``
+    ///   (`+` は delimiter のため受理しない)
     /// - 特殊: `Esc` / `Escape`, `Enter` / `Return`, `Space`, `Tab`, `Backspace` / `BS`,
     ///   `Delete` / `Del`, `Home`, `End`, `PageUp`, `PageDown`, `Insert` / `Ins`,
     ///   `Up` / `ArrowUp`, `Down` / `ArrowDown`, `Left` / `ArrowLeft`, `Right` / `ArrowRight`
     /// - ファンクション: `F1` ..= `F24`
     #[must_use]
     pub fn parse(spec: &str) -> Self {
+        Self::try_parse(spec).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// `parse` の Result 版。runtime 由来の spec を panic させずに解釈する。
+    ///
+    /// `Err(ShortcutParseError)` のケース:
+    /// - `+` 区切りで空トークン (`"Ctrl++Z"`, `"+Z"` 等)
+    /// - key トークンを 2 つ以上含む (`"A+B"` 等、modifier は除く)
+    /// - key トークンが 1 つもない (`"Ctrl+Shift"` 等)
+    /// - 受理されない key トークン (`"Ctrl+Foo"` 等)
+    ///
+    /// # Errors
+    /// 上記のケースで `ShortcutParseError` を返す。
+    pub fn try_parse(spec: &str) -> Result<Self, ShortcutParseError> {
         let mut mods = Modifiers::empty();
         let mut key: Option<PhysicalKey> = None;
         for part in spec.split('+') {
             let p = part.trim();
-            assert!(!p.is_empty(), "Shortcut::parse: empty token in {spec:?}");
+            if p.is_empty() {
+                return Err(ShortcutParseError {
+                    spec: spec.to_string(),
+                    reason: "empty token".to_string(),
+                });
+            }
             let lower = p.to_ascii_lowercase();
             match lower.as_str() {
                 "ctrl" | "control" => mods.ctrl = true,
@@ -51,13 +91,24 @@ impl Shortcut {
                 "alt" => mods.alt = true,
                 "super" | "cmd" | "logo" | "win" => mods.logo = true,
                 _ => {
-                    assert!(key.is_none(), "Shortcut::parse: multiple keys in {spec:?}");
-                    key = Some(parse_key_token(p));
+                    if key.is_some() {
+                        return Err(ShortcutParseError {
+                            spec: spec.to_string(),
+                            reason: "multiple keys".to_string(),
+                        });
+                    }
+                    key = Some(parse_key_token(p).map_err(|reason| ShortcutParseError {
+                        spec: spec.to_string(),
+                        reason,
+                    })?);
                 }
             }
         }
-        let key = key.unwrap_or_else(|| panic!("Shortcut::parse: no key in {spec:?}"));
-        Self { key, mods }
+        let key = key.ok_or_else(|| ShortcutParseError {
+            spec: spec.to_string(),
+            reason: "no key".to_string(),
+        })?;
+        Ok(Self { key, mods })
     }
 
     /// `KeyEvent` (Pressed) と現在の修飾キー状態に対してマッチするか。
@@ -73,25 +124,25 @@ impl Shortcut {
     }
 }
 
-fn parse_key_token(p: &str) -> PhysicalKey {
+fn parse_key_token(p: &str) -> Result<PhysicalKey, String> {
     let lower = p.to_ascii_lowercase();
     // 特殊キー (長いものから検査)
     match lower.as_str() {
-        "esc" | "escape" => return PhysicalKey::Escape,
-        "enter" | "return" => return PhysicalKey::Enter,
-        "space" => return PhysicalKey::Space,
-        "tab" => return PhysicalKey::Tab,
-        "bs" | "backspace" => return PhysicalKey::Backspace,
-        "del" | "delete" => return PhysicalKey::Delete,
-        "home" => return PhysicalKey::Home,
-        "end" => return PhysicalKey::End,
-        "pageup" | "pgup" => return PhysicalKey::PageUp,
-        "pagedown" | "pgdn" => return PhysicalKey::PageDown,
-        "ins" | "insert" => return PhysicalKey::Insert,
-        "up" | "arrowup" => return PhysicalKey::ArrowUp,
-        "down" | "arrowdown" => return PhysicalKey::ArrowDown,
-        "left" | "arrowleft" => return PhysicalKey::ArrowLeft,
-        "right" | "arrowright" => return PhysicalKey::ArrowRight,
+        "esc" | "escape" => return Ok(PhysicalKey::Escape),
+        "enter" | "return" => return Ok(PhysicalKey::Enter),
+        "space" => return Ok(PhysicalKey::Space),
+        "tab" => return Ok(PhysicalKey::Tab),
+        "bs" | "backspace" => return Ok(PhysicalKey::Backspace),
+        "del" | "delete" => return Ok(PhysicalKey::Delete),
+        "home" => return Ok(PhysicalKey::Home),
+        "end" => return Ok(PhysicalKey::End),
+        "pageup" | "pgup" => return Ok(PhysicalKey::PageUp),
+        "pagedown" | "pgdn" => return Ok(PhysicalKey::PageDown),
+        "ins" | "insert" => return Ok(PhysicalKey::Insert),
+        "up" | "arrowup" => return Ok(PhysicalKey::ArrowUp),
+        "down" | "arrowdown" => return Ok(PhysicalKey::ArrowDown),
+        "left" | "arrowleft" => return Ok(PhysicalKey::ArrowLeft),
+        "right" | "arrowright" => return Ok(PhysicalKey::ArrowRight),
         _ => {}
     }
     // F1..=F24
@@ -99,20 +150,24 @@ fn parse_key_token(p: &str) -> PhysicalKey {
         && let Ok(n) = n_str.parse::<u8>()
         && (1..=24).contains(&n)
     {
-        return PhysicalKey::F(n);
+        return Ok(PhysicalKey::F(n));
     }
     // 1 文字 alphabet → Char(uppercased)
     if p.chars().count() == 1 {
         let c = p.chars().next().expect("len 1");
         if c.is_ascii_alphabetic() {
-            return PhysicalKey::Char(c.to_ascii_uppercase());
+            return Ok(PhysicalKey::Char(c.to_ascii_uppercase()));
         }
         if c.is_ascii_digit() {
             // '0' = 0x30
-            return PhysicalKey::Digit(c as u8 - b'0');
+            return Ok(PhysicalKey::Digit(c as u8 - b'0'));
+        }
+        // M9 P0-1: 印字可能記号 11 種 (`+` は delimiter のため除く)
+        if matches!(c, '/' | ';' | ',' | '.' | '-' | '=' | '[' | ']' | '\\' | '\'' | '`') {
+            return Ok(PhysicalKey::Char(c));
         }
     }
-    panic!("Shortcut::parse: unknown key token {p:?}");
+    Err(format!("unknown key token {p:?}"))
 }
 
 /// `name -> Shortcut` の登録テーブル。
@@ -370,5 +425,87 @@ mod tests {
         assert_eq!(m.display_for("undo").as_deref(), Some("Ctrl+Z"));
         m.bind("redo", "Ctrl+Shift+Z");
         assert_eq!(m.display_for("redo").as_deref(), Some("Ctrl+Shift+Z"));
+    }
+
+    // -------- M9 P0-1: 記号キー受理 + try_parse --------
+
+    #[test]
+    fn parse_punctuation_keys() {
+        // 11 種すべて Char(c) として解釈される (modifier なし)
+        for (spec, expected_char) in [
+            ("/", '/'),
+            (";", ';'),
+            (",", ','),
+            (".", '.'),
+            ("-", '-'),
+            ("=", '='),
+            ("[", '['),
+            ("]", ']'),
+            ("\\", '\\'),
+            ("'", '\''),
+            ("`", '`'),
+        ] {
+            let sc = Shortcut::parse(spec);
+            assert_eq!(sc.key, PhysicalKey::Char(expected_char), "spec {spec:?}");
+            assert!(sc.mods.is_empty(), "spec {spec:?} should have no modifiers");
+        }
+    }
+
+    #[test]
+    fn try_parse_succeeds_for_punctuation_with_modifier() {
+        let sc = Shortcut::try_parse("Ctrl+Shift+/").expect("valid");
+        assert_eq!(sc.key, PhysicalKey::Char('/'));
+        assert!(sc.mods.ctrl && sc.mods.shift);
+    }
+
+    #[test]
+    fn try_parse_returns_error_for_unknown_token() {
+        let err = Shortcut::try_parse("Ctrl+Foo").expect_err("unknown token");
+        assert_eq!(err.spec, "Ctrl+Foo");
+        assert!(err.reason.contains("unknown key"), "got {err}");
+    }
+
+    #[test]
+    fn try_parse_returns_error_for_empty_token() {
+        let err = Shortcut::try_parse("Ctrl++Z").expect_err("empty token");
+        assert_eq!(err.spec, "Ctrl++Z");
+        assert_eq!(err.reason, "empty token");
+    }
+
+    #[test]
+    fn try_parse_returns_error_for_no_key() {
+        let err = Shortcut::try_parse("Ctrl+Shift").expect_err("no key");
+        assert_eq!(err.spec, "Ctrl+Shift");
+        assert_eq!(err.reason, "no key");
+    }
+
+    #[test]
+    fn try_parse_returns_error_for_multiple_keys() {
+        let err = Shortcut::try_parse("A+B").expect_err("two keys");
+        assert_eq!(err.reason, "multiple keys");
+    }
+
+    #[test]
+    fn parse_panics_for_unknown_token() {
+        // const literal 用 path: 不正 spec は panic する
+        let result = std::panic::catch_unwind(|| Shortcut::parse("Ctrl+???"));
+        assert!(result.is_err(), "expected panic on unknown token");
+    }
+
+    #[test]
+    fn display_for_punctuation_round_trips() {
+        let mut m = ShortcutMap::new();
+        m.bind("toggle_help", "Shift+/");
+        assert_eq!(m.display_for("toggle_help").as_deref(), Some("Shift+/"));
+        m.bind("focus_next_pane", "`");
+        assert_eq!(m.display_for("focus_next_pane").as_deref(), Some("`"));
+    }
+
+    #[test]
+    fn punctuation_shortcut_matches_key_event() {
+        let sc = Shortcut::parse("Shift+/");
+        let ev = key(PhysicalKey::Char('/'));
+        let mods = Modifiers { shift: true, ..Modifiers::empty() };
+        assert!(sc.matches(&ev, mods));
     }
 }

@@ -347,6 +347,18 @@ fn map_phys_key(k: WinitPhysKey) -> PhysicalKey {
         WinitPhysKey::Code(KeyCode::F22) => PhysicalKey::F(22),
         WinitPhysKey::Code(KeyCode::F23) => PhysicalKey::F(23),
         WinitPhysKey::Code(KeyCode::F24) => PhysicalKey::F(24),
+        // M9 P0-1: ASCII 印字可能記号 11 種 (US 配列、shift なし時の char)
+        WinitPhysKey::Code(KeyCode::Slash) => PhysicalKey::Char('/'),
+        WinitPhysKey::Code(KeyCode::Semicolon) => PhysicalKey::Char(';'),
+        WinitPhysKey::Code(KeyCode::Comma) => PhysicalKey::Char(','),
+        WinitPhysKey::Code(KeyCode::Period) => PhysicalKey::Char('.'),
+        WinitPhysKey::Code(KeyCode::Minus) => PhysicalKey::Char('-'),
+        WinitPhysKey::Code(KeyCode::Equal) => PhysicalKey::Char('='),
+        WinitPhysKey::Code(KeyCode::BracketLeft) => PhysicalKey::Char('['),
+        WinitPhysKey::Code(KeyCode::BracketRight) => PhysicalKey::Char(']'),
+        WinitPhysKey::Code(KeyCode::Backslash) => PhysicalKey::Char('\\'),
+        WinitPhysKey::Code(KeyCode::Quote) => PhysicalKey::Char('\''),
+        WinitPhysKey::Code(KeyCode::Backquote) => PhysicalKey::Char('`'),
         WinitPhysKey::Code(c) => PhysicalKey::Other(c as u32),
         WinitPhysKey::Unidentified(_) => PhysicalKey::Other(0),
     }

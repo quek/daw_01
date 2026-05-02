@@ -32,7 +32,7 @@ pub use dialog::{DialogResult, FileDialogFilter};
 pub use edit::Edit;
 pub use history::{HistoryEntry, HistoryStack};
 pub use id::WidgetId;
-pub use shortcut::{Shortcut, ShortcutMap};
+pub use shortcut::{Shortcut, ShortcutMap, ShortcutParseError};
 pub use input::{DroppedFiles, FrameInput, ImeEvent, InputAccumulator, PointerFrame};
 pub use widgets::drag_rect::DragRect;
 pub use layout::{FlexDirection, Gap, LayoutPass, NodeId, Padding};

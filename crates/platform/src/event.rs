@@ -84,6 +84,8 @@ pub struct KeyEvent {
 /// M1: 制御キー / arrow / Other(u32) のみ。
 /// M8 Phase 30: shortcut 解釈のため `Char(char)` (Latin alphabet 大文字)、`Digit(u8)`、
 /// `F(u8)`、`Delete / Home / End / PageUp / PageDown / Insert` を追加。
+/// M9 P0-1: `Char(char)` の domain を ASCII 印字可能記号 11 種にも拡張
+/// (`/ ; , . - = [ ] \ ' ``)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PhysicalKey {
     Escape,
@@ -101,7 +103,10 @@ pub enum PhysicalKey {
     ArrowDown,
     ArrowLeft,
     ArrowRight,
-    /// アルファベットキー (大文字に正規化、'A'..='Z')。
+    /// ASCII 印字可能キー。
+    /// - Latin alphabet: 大文字に正規化 ('A'..='Z')
+    /// - 記号 11 種 (US 配列、shift なし時の char):
+    ///   `/`, `;`, `,`, `.`, `-`, `=`, `[`, `]`, `\`, `'`, `` ` ``
     Char(char),
     /// 数字キー (上段の Digit0..=Digit9、テンキーは含まない)。
     Digit(u8),
