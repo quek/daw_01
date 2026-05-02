@@ -37,6 +37,9 @@ struct DawModel {
     preset_idx: usize,
     /// arrangement / piano_roll の viewport (X 軸)
     arr_viewport: ViewportState1D,
+    /// M9 P0-2: tab_view_with_state で外部制御中のタブ index
+    /// (0=Mixer / 1=Arrangement / 2=Piano Roll / 3=Sample)
+    current_tab: usize,
     /// simulated peak per channel (sin で時間変化)
     sim_phase: f32,
     last_action: String,
@@ -49,6 +52,7 @@ impl DawModel {
             mutes: [false; N_CH],
             preset_idx: 0,
             arr_viewport: ViewportState1D::new(0.0, 48_000.0 * 30.0), // 30 sec @ 48k
+            current_tab: 0,
             sim_phase: 0.0,
             last_action: "起動 — メニュー / タブ / dropdown / 右クリック を試して下さい".to_string(),
         }
@@ -305,8 +309,10 @@ impl App {
                         }
                     });
 
-                    // ---- main: tab_view ----
-                    ui.tab_view("main_tabs", main, |tabs| {
+                    // ---- main: tab_view (M9 P0-2: 外部 state 版で footer button から
+                    // タブを切替可能に) ----
+                    let mut tab_idx = m.current_tab;
+                    ui.tab_view_with_state("main_tabs", main, &mut tab_idx, |tabs| {
                         tabs.tab("Mixer", |ui, pane| {
                             drawmixer_tab(ui, m, pane);
                         });
@@ -327,9 +333,15 @@ impl App {
                             );
                         });
                     });
+                    // クリックで selected が変化していれば model に書き戻し
+                    if tab_idx != m.current_tab {
+                        ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
+                            mm.current_tab = tab_idx;
+                        }));
+                    }
                 });
 
-                // ---- 3. footer (last_action) ----
+                // ---- 3. footer (last_action + M9 P0-2: Open Piano Roll button) ----
                 ui.push_rect(RectCommand {
                     rect: footer_rect,
                     fill: Color::rgb(0.08, 0.09, 0.11),
@@ -337,6 +349,20 @@ impl App {
                     border_width: 0.0,
                     radius: [0.0; 4],
                     clip_rect: None,
+                });
+                let btn_w = 160.0;
+                let btn_pad = 4.0;
+                let btn_rect = Rect {
+                    x: footer_rect.x + footer_rect.w - btn_w - 8.0,
+                    y: footer_rect.y + btn_pad,
+                    w: btn_w,
+                    h: footer_rect.h - btn_pad * 2.0,
+                };
+                ui.button_at("open_pr", "Open Piano Roll", btn_rect, || {
+                    Edit::mutate(|m: &mut DawModel| {
+                        m.current_tab = 2;
+                        m.last_action = "footer button → Piano Roll タブへ遷移".to_string();
+                    })
                 });
                 ui.label_at(
                     "footer",
