@@ -89,22 +89,32 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             clip_rect: None,
         });
 
-        // 2. クリックで popup toggle
-        if inside && pointer.primary_just_released {
-            if already_open {
-                self.close_popup(popup_id);
-            } else {
-                self.open_popup(popup_id, rect, true);
-            }
-        }
-
-        // 3. popup 描画 + 選択検出
+        // popup_rect = items 全体の rect。anchor は body rect + popup_rect の union で
+        // outside_click 判定が popup の見える範囲全体で行われるようにする。
         let popup_rect = Rect {
             x: rect.x,
             y: rect.y + rect.h,
             w: rect.w,
             h: (items.len() as f32) * DROPDOWN_ITEM_H,
         };
+        let anchor = Rect {
+            x: rect.x.min(popup_rect.x),
+            y: rect.y.min(popup_rect.y),
+            w: rect.w.max(popup_rect.w),
+            h: (rect.y + rect.h + popup_rect.h) - rect.y,
+        };
+
+        // 2. クリックで popup toggle (click は consume して下層に流さない)
+        if inside && pointer.primary_just_released {
+            if already_open {
+                self.close_popup(popup_id);
+            } else {
+                self.open_popup(popup_id, anchor, true);
+            }
+            self.consume_pointer_click();
+        }
+
+        // 3. popup 描画 + 選択検出
         let mut chosen: Option<usize> = None;
         self.popup_layer(popup_id, |ui| {
             chosen = draw_items_popup(ui, items, popup_rect);

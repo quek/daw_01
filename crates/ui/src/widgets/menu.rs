@@ -136,13 +136,28 @@ impl<'b, 'a, M: ?Sized + 'static> MenuBarBuilder<'b, 'a, M> {
         let menu_id = ("menu_bar_top", label);
         let already_open = self.ui.is_popup_open(menu_id);
 
-        // クリックで popup を toggle
+        // popup_rect = items 全体を含む rect。open_popup の anchor として渡し、
+        // popup_layer の outside_click 判定もこの rect で行う。
+        let item_labels: Vec<&str> = builder.items.iter().map(|(s, _)| *s).collect();
+        let n = item_labels.len();
+        let popup_rect = Rect {
+            x: label_rect.x,
+            y: label_rect.y + label_rect.h,
+            w: MENU_W_DEFAULT,
+            h: (n as f32) * MENU_ITEM_H,
+        };
+        // anchor は label_rect + popup_rect を結合 (label 上の click も「popup の一部」扱いで
+        // outside にしない、popup item 上の click も anchor 内として popup_layer が処理)。
+        let anchor = union_rect(label_rect, popup_rect);
+
+        // クリックで popup を toggle (click は consume して、隣の menu に流さない)
         if inside && pointer.primary_just_released {
             if already_open {
                 self.ui.close_popup(menu_id);
             } else {
-                self.ui.open_popup(menu_id, label_rect, true);
+                self.ui.open_popup(menu_id, anchor, true);
             }
+            self.ui.consume_pointer_click();
         }
 
         // top-level label の描画 (hover / open でハイライト)
@@ -168,14 +183,6 @@ impl<'b, 'a, M: ?Sized + 'static> MenuBarBuilder<'b, 'a, M> {
         });
 
         // popup 描画 (popup_layer 経由)
-        let item_labels: Vec<&str> = builder.items.iter().map(|(s, _)| *s).collect();
-        let n = item_labels.len();
-        let popup_rect = Rect {
-            x: label_rect.x,
-            y: label_rect.y + label_rect.h,
-            w: MENU_W_DEFAULT,
-            h: (n as f32) * MENU_ITEM_H,
-        };
         let mut clicked_idx: Option<usize> = None;
         self.ui.popup_layer(menu_id, |ui| {
             clicked_idx = draw_items_popup(ui, &item_labels, popup_rect);
@@ -191,6 +198,15 @@ impl<'b, 'a, M: ?Sized + 'static> MenuBarBuilder<'b, 'a, M> {
             self.ui.close_popup(menu_id);
         }
     }
+}
+
+/// 2 つの矩形を含む最小 rect (popup の anchor 計算用)。
+fn union_rect(a: Rect, b: Rect) -> Rect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    let r = (a.x + a.w).max(b.x + b.w);
+    let bo = (a.y + a.h).max(b.y + b.h);
+    Rect { x, y, w: r - x, h: bo - y }
 }
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
@@ -223,40 +239,30 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         F: FnOnce(usize) -> Edit<M>,
     {
         let pointer = self.pointer;
-        // 右クリック検出
         let menu_id = ("context_menu", rect.x.to_bits(), rect.y.to_bits());
+        let n = items.len();
+
+        // 右クリック検出 → popup を開く (anchor は items 全体の rect で固定 = popup の見える範囲)
         if pointer.secondary_just_pressed
             && let Some((px, py)) = pointer.pos
             && rect.contains(px, py)
         {
-            // popup を開く (anchor は click 位置の小さい矩形)
-            let anchor = Rect { x: px, y: py, w: 1.0, h: 1.0 };
-            self.open_popup(menu_id, anchor, true);
-        }
-
-        // popup を描画
-        let n = items.len();
-        let popup_rect = if let Some((px, py)) = pointer.pos {
-            // 開いた瞬間の anchor は記録されないので毎フレーム pointer 位置 …
-            // ではなく、anchor を popup_state から復元する。
-            // 簡略化: popup の anchor を anchor の左上から開始する固定矩形として描画。
-            // anchor 位置は popup_state.anchor から取り出すため popup_layer 後の描画では使えない。
-            // ここでは popup_state にアクセスできないので、画面内に収まるよう pointer 位置を
-            // 直近の値で近似 (M7 では妥協、ext は M8 で改善)。
-            Rect {
+            let anchor = Rect {
                 x: px,
                 y: py,
                 w: MENU_W_DEFAULT,
                 h: (n as f32) * MENU_ITEM_H,
-            }
-        } else {
-            Rect { x: 0.0, y: 0.0, w: MENU_W_DEFAULT, h: (n as f32) * MENU_ITEM_H }
-        };
+            };
+            self.open_popup(menu_id, anchor, true);
+        }
 
+        // popup_rect は state.anchor から取得 (open 時の固定座標、毎フレーム同じ)
         let mut clicked_idx: Option<usize> = None;
-        self.popup_layer(menu_id, |ui| {
-            clicked_idx = draw_items_popup(ui, items, popup_rect);
-        });
+        if let Some(popup_rect) = self.popup_anchor(menu_id) {
+            self.popup_layer(menu_id, |ui| {
+                clicked_idx = draw_items_popup(ui, items, popup_rect);
+            });
+        }
         if let Some(idx) = clicked_idx {
             let edit = on_select(idx);
             self.push_edit(edit);

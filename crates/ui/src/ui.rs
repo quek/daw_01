@@ -362,12 +362,27 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         self.open_popups.contains_key(&wid)
     }
 
+    /// `id` で開いている popup の anchor (= popup の内容領域) を返す。
+    /// closure 内で popup_rect を再計算する代わりに使える (例: context_menu の動的位置を
+    /// open_popup 時の pointer 位置に固定したい場合)。
+    pub fn popup_anchor(&self, id: impl std::hash::Hash) -> Option<Rect> {
+        let wid = WidgetId::ROOT.child((b"popup", &id));
+        self.open_popups.get(&wid).map(|s| s.anchor)
+    }
+
     /// popup の内容を描画する。popup が開いていなければ closure は呼ばれない。
     /// closure 内で push される primitive は **deferred buffer** に積まれ、frame 末尾で
     /// base scene に append (z-order = 最前面)。
     ///
-    /// modal popup の場合: `anchor` の **外** で `primary_just_pressed` があれば自動的に
-    /// popup を close + click を消費する。
+    /// modal popup の click consumption ルール:
+    /// - `anchor` の **外** で `primary_just_pressed` → popup close + click 消費 (closure 実行せず)
+    /// - `anchor` の **内** で click → closure 内 widget で処理、popup_layer 出口で click 消費
+    ///   (popup の下にある widget には click が流れない)
+    ///
+    /// **重要**: `anchor` は「popup として扱う rect 全体」を指す (popup を開いた起点 button
+    /// だけでなく、items の rect も含めること)。さもなくば popup item 上の click が
+    /// outside_click 扱いで close されてしまう。menu_bar / dropdown / context_menu_for は
+    /// 内部で popup_rect を anchor として渡している。
     pub fn popup_layer<F>(&mut self, id: impl std::hash::Hash, f: F)
     where
         F: FnOnce(&mut Self),
@@ -389,8 +404,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.pending_focus = state.prev_focus;
             self.focus_changed_this_frame = true;
             if state.modal {
-                self.pointer.primary_just_pressed = false;
-                self.pointer.primary_just_released = false;
+                self.consume_pointer_click();
             }
             return;
         }
@@ -400,6 +414,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         self.drawing_in_popup = true;
         f(self);
         self.drawing_in_popup = prev_in_popup;
+
+        // modal popup が open しているフレーム中、anchor 内 click は popup item として
+        // 既に処理済 → 下層の widget に同じ click が流れないよう消費する。
+        // (popup item handler が close_popup を呼んだ場合も same frame で消費)
+        if state.modal
+            && self
+                .pointer
+                .pos
+                .is_some_and(|(px, py)| state.anchor.contains(px, py))
+        {
+            self.consume_pointer_click();
+        }
     }
 
     /// エディットを Scene に積む (外部 widget extension で利用可能)。
@@ -468,6 +494,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.pending_focus = None;
             self.focus_changed_this_frame = true;
         }
+    }
+
+    /// 現在のフレームの primary click (左ボタン press / release transition) を消費する。
+    /// popup / menu / dropdown 等が click を捌いた後、下層 widget に同じ click が流れないようにする。
+    /// `pointer.primary_pressed` (現在押下中フラグ) は変えない (drag 中の継続は他 widget でも見える)。
+    pub fn consume_pointer_click(&mut self) {
+        self.pointer.primary_just_pressed = false;
+        self.pointer.primary_just_released = false;
     }
 
     /// pointer が `rect` 内にあるなら、このフレームに蓄積された scroll delta (px) を取り出して

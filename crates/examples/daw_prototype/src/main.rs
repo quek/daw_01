@@ -495,8 +495,22 @@ fn draw_piano_roll_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pan
 impl AppHost for App {
     fn on_event(&mut self, ev: AppEvent) {
         self.input.ingest(&ev);
-        if let AppEvent::Resized(s) = ev {
-            self.renderer.resize(s);
+        match ev {
+            AppEvent::Resized(s) => {
+                self.renderer.resize(s);
+                self.window.request_redraw();
+            }
+            // winit ControlFlow::Wait では入力イベントだけでは再描画されないため、
+            // 入力が来たら明示的に request_redraw して build_ui を走らせる (mixer 同パターン)。
+            AppEvent::PointerMoved(_)
+            | AppEvent::PointerInput { .. }
+            | AppEvent::Scroll(_)
+            | AppEvent::Keyboard(_)
+            | AppEvent::ImePreedit { .. }
+            | AppEvent::ImeCommit(_) => {
+                self.window.request_redraw();
+            }
+            _ => {}
         }
     }
 
@@ -507,7 +521,12 @@ impl AppHost for App {
         }
         // IME (text_input がない demo だが、念のため empty で disable)
         self.window.set_ime_allowed(false);
-        false
+        // true: 毎フレーム redraw を要求 (60fps 連続描画)。
+        // - level_meter のアニメーション (sim_phase で時間進行) を動かすため
+        // - tab_view の state.selected 更新 (widget_state は Edit ではないため auto-redraw 対象外) を即時反映するため
+        // 妥協: アイドル時も電力消費。本来は library 側で `Ui::request_redraw()` を提供して
+        // widget が必要なときに redraw を要求できるようにすべき → M8 で改善予定。
+        true
     }
 }
 
