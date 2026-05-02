@@ -162,6 +162,7 @@ fn note_rect_command(rect: Rect, fill: Color) -> RectCommand {
         border: Color::TRANSPARENT,
         border_width: 0.0,
         radius: [1.5; 4],
+        clip_rect: None,
     }
 }
 
@@ -404,6 +405,7 @@ impl App {
                             border: Color::TRANSPARENT,
                             border_width: 0.0,
                             radius: [0.0; 4],
+                            clip_rect: None,
                         });
                         // (b) 黒鍵 row 帯 (薄い網)
                         let pitch_to_px = grid.h / m.pitch_visible;
@@ -422,6 +424,7 @@ impl App {
                                     border: Color::TRANSPARENT,
                                     border_width: 0.0,
                                     radius: [0.0; 4],
+                                    clip_rect: None,
                                 });
                             }
                         }
@@ -442,6 +445,7 @@ impl App {
                                 border: Color::TRANSPARENT,
                                 border_width: 0.0,
                                 radius: [0.0; 4],
+                                clip_rect: None,
                             });
                         }
                         // (d) 鍵盤左 widget (画面左 60px 固定)
@@ -452,6 +456,7 @@ impl App {
                             border: Color::TRANSPARENT,
                             border_width: 0.0,
                             radius: [0.0; 4],
+                            clip_rect: None,
                         });
                         // 各 pitch を rect で描画
                         for i in 0..=pitch_visible_int {
@@ -472,6 +477,7 @@ impl App {
                                 border: Color::TRANSPARENT,
                                 border_width: 0.0,
                                 radius: [0.0; 4],
+                                clip_rect: None,
                             });
                             // C のオクターブのみラベル (C2..C7 = 24,36,...,84,96)
                             if (pitch as u8).is_multiple_of(12) && pitch_to_px >= 8.0 {
@@ -528,6 +534,7 @@ impl App {
                             border: Color::rgb(1.0, 1.0, 1.0),
                             border_width: 2.0,
                             radius: [3.0; 4],
+                            clip_rect: None,
                         });
                     }
 

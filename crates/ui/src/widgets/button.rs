@@ -84,6 +84,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 border: Color::rgb(0.35, 0.38, 0.45),
                 border_width: 1.0,
                 radius: [6.0; 4],
+                clip_rect: None,
             });
 
             // テキストを矩形中央付近に
@@ -100,6 +101,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 font_size,
                 line_height: line_h,
                 color: Color::rgb(0.95, 0.95, 0.97),
+                clip_rect: None,
             });
         });
 

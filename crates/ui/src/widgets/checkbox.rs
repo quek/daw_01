@@ -150,6 +150,7 @@ fn draw_checkbox<M: ?Sized + 'static>(
         border: border_c,
         border_width: 1.5,
         radius: [3.0; 4],
+        clip_rect: None,
     });
 
     // チェックマーク (チェック時のみ): 2 本のラインで V を描く。
@@ -185,6 +186,7 @@ fn draw_checkbox<M: ?Sized + 'static>(
             font_size,
             line_height: line_h,
             color: Color::rgb(0.92, 0.92, 0.94),
+            clip_rect: None,
         });
     }
 }

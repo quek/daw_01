@@ -156,7 +156,7 @@ fn bench_arrangement(c: &mut Criterion) {
     c.bench_function("arrangement_no_cache_heavy_500w", |b| {
         let mut step: u64 = 0;
         b.iter_batched_ref(
-            || (UiHost::<()>::new(), Scene::new()),
+            || (UiHost::<()>::no_redraw(), Scene::new()),
             |(host, scene)| {
                 step += 1;
                 let view = (step, fixed_view.1); // view_start を 1 sample ずつずらす

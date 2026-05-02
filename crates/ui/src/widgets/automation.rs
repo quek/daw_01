@@ -292,6 +292,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     border: Color::TRANSPARENT,
                     border_width: 0.0,
                     radius: [r; 4],
+                    clip_rect: None,
                 });
             }
         });

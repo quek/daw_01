@@ -1,8 +1,15 @@
 //! 入力状態 — `AppEvent` を蓄積してフレーム毎に Ui に渡す形にする。
 
-use daw_ui_platform::{AppEvent, ElementState, KeyEvent, Modifiers, MouseButton, PhysicalPosition};
+use daw_ui_platform::{AppEvent, ElementState, KeyEvent, Modifiers, MouseButton, PhysicalPosition, ScrollDelta};
+
+/// マウスホイール 1 line を何 px に換算するか (Windows / Linux / macOS で慣用される値)。
+const LINE_HEIGHT_PX: f32 = 40.0;
 
 /// 1 フレーム分のポインタ入力スナップショット。
+///
+/// 4 つの bool flag (primary press/release + secondary press/release) は canonical な
+/// pointer event 表現で、`Modifiers` と同じく否定する意図ではないので allow する。
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PointerFrame {
     pub pos: Option<(f32, f32)>,
@@ -10,10 +17,18 @@ pub struct PointerFrame {
     pub primary_just_pressed: bool,
     /// このフレーム内で「離された」(released transition があった)。
     pub primary_just_released: bool,
-    /// 現在押下中。
+    /// 現在押下中 (左ボタン)。
     pub primary_pressed: bool,
+    /// このフレーム内で右ボタンが押下された (context menu トリガ用)。
+    pub secondary_just_pressed: bool,
+    /// このフレーム内で右ボタンが離された。
+    pub secondary_just_released: bool,
     /// 現在の修飾キー状態 (Ctrl / Shift / Alt / Logo)。Ctrl+drag による高精度モードなどに使う。
     pub modifiers: Modifiers,
+    /// このフレーム内に蓄積されたスクロール量 (物理 px)。
+    /// 符号は winit の慣行に従い「`y > 0` = wheel を上方向に回した = コンテンツが上に流れる」。
+    /// scroll_area は `state.offset.y -= scroll_delta.1` のように offset を更新する。
+    pub scroll_delta: (f32, f32),
 }
 
 /// IME (input method editor) のイベント。focused widget が処理する。
@@ -34,17 +49,26 @@ pub struct FrameInput {
 }
 
 /// 連続フレームをまたいで保持する入力状態。
+///
+/// 5 つの bool は primary/secondary press/release transition + secondary_pressed の
+/// canonical な pointer state で、`PointerFrame` と同じ理由で `struct_excessive_bools` は allow。
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default)]
 pub struct InputAccumulator {
     cur_pos: Option<(f32, f32)>,
     primary_pressed: bool,
     pending_just_pressed: bool,
     pending_just_released: bool,
+    pending_secondary_just_pressed: bool,
+    pending_secondary_just_released: bool,
+    secondary_pressed: bool,
     pending_keys: Vec<KeyEvent>,
     pending_ime: Vec<ImeEvent>,
     /// 直近の `AppEvent::ModifiersChanged` で受け取った修飾キー状態。
     /// フレームをまたいで持続する (next ModifiersChanged まで現状維持)。
     modifiers: Modifiers,
+    /// このフレーム内に蓄積されたスクロール量 (物理 px、`take_frame` で reset)。
+    accumulated_scroll: (f32, f32),
 }
 
 impl InputAccumulator {
@@ -75,6 +99,28 @@ impl InputAccumulator {
                     self.primary_pressed = false;
                 }
             },
+            AppEvent::PointerInput { button: MouseButton::Right, state } => match state {
+                ElementState::Pressed => {
+                    if !self.secondary_pressed {
+                        self.pending_secondary_just_pressed = true;
+                    }
+                    self.secondary_pressed = true;
+                }
+                ElementState::Released => {
+                    if self.secondary_pressed {
+                        self.pending_secondary_just_released = true;
+                    }
+                    self.secondary_pressed = false;
+                }
+            },
+            AppEvent::Scroll(delta) => {
+                let (dx, dy) = match delta {
+                    ScrollDelta::Lines { x, y } => (x * LINE_HEIGHT_PX, y * LINE_HEIGHT_PX),
+                    ScrollDelta::Pixels { x, y } => (*x as f32, *y as f32),
+                };
+                self.accumulated_scroll.0 += dx;
+                self.accumulated_scroll.1 += dy;
+            }
             AppEvent::Keyboard(key) => {
                 // フレーム間蓄積。order を保つために push 順で並べる。
                 self.pending_keys.push(key.clone());
@@ -95,17 +141,23 @@ impl InputAccumulator {
         }
     }
 
-    /// フレーム頭で pointer snapshot を取り、just_pressed/just_released をリセット。
+    /// フレーム頭で pointer snapshot を取り、just_pressed/just_released とスクロール累積をリセット。
     pub fn take_frame(&mut self) -> PointerFrame {
         let frame = PointerFrame {
             pos: self.cur_pos,
             primary_just_pressed: self.pending_just_pressed,
             primary_just_released: self.pending_just_released,
             primary_pressed: self.primary_pressed,
+            secondary_just_pressed: self.pending_secondary_just_pressed,
+            secondary_just_released: self.pending_secondary_just_released,
             modifiers: self.modifiers,
+            scroll_delta: self.accumulated_scroll,
         };
         self.pending_just_pressed = false;
         self.pending_just_released = false;
+        self.pending_secondary_just_pressed = false;
+        self.pending_secondary_just_released = false;
+        self.accumulated_scroll = (0.0, 0.0);
         frame
     }
 

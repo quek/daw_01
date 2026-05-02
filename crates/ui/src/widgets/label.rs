@@ -38,6 +38,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 font_size,
                 line_height: font_size * 1.2,
                 color,
+                clip_rect: None,
             });
         });
     }
@@ -66,6 +67,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 font_size,
                 line_height: line_h,
                 color: Color::rgb(0.92, 0.92, 0.94),
+                clip_rect: None,
             });
         });
         self.next_y += line_h + pad;

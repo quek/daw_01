@@ -18,6 +18,7 @@ use daw_ui_renderer::{Color, GlyphArea, LineBatch, Rect, RectCommand, Scene};
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::input::{FrameInput, ImeEvent, PointerFrame};
+use crate::popup::PopupOpenState;
 use crate::scenegraph::{CachedCommands, Scenegraph};
 use crate::widgets::WidgetState;
 
@@ -51,6 +52,11 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// edits / focus 変化の検出時にライブラリが自動で呼ぶ closure。
     /// 通常は `WindowBackend::request_redraw` をラップしたもの。
     redraw_request: Box<dyn Fn() + Send + Sync>,
+    /// M7 Phase 25: 現在開いている popup の集合 (menu / context_menu / dropdown 共通)。
+    /// `Ui::open_popup` / `Ui::close_popup` で出し入れする。`Ui` 経由で `&mut` 借用される
+    /// ため rustc から "never read" と誤判定されるが、実際には popup_layer で読まれる。
+    #[allow(dead_code)]
+    open_popups: HashMap<WidgetId, PopupOpenState>,
     _m: PhantomData<fn(&mut M)>,
 }
 
@@ -65,6 +71,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             last_ime_request: None,
             scenegraph: Scenegraph::new(),
             redraw_request: Box::new(redraw_request),
+            open_popups: HashMap::new(),
             _m: PhantomData,
         }
     }
@@ -175,9 +182,20 @@ impl<M: ?Sized + 'static> UiHost<M> {
             ime_request: None,
             scenegraph: &mut self.scenegraph,
             seen_widgets: &mut seen_widgets,
+            current_clip: None,
+            open_popups: &mut self.open_popups,
+            popup_rects: Vec::new(),
+            popup_glyphs: Vec::new(),
+            popup_lines: Vec::new(),
+            drawing_in_popup: false,
             _m: PhantomData,
         };
         f(model, &mut ui);
+        // M7 Phase 25: popup の deferred buffer を取り出して、ui の borrow が外れたあと
+        // base scene 末尾に append (z-order = 最前面) する。
+        let popup_rects = std::mem::take(&mut ui.popup_rects);
+        let popup_glyphs = std::mem::take(&mut ui.popup_glyphs);
+        let popup_lines = std::mem::take(&mut ui.popup_lines);
         // フォーカスの commit:
         // - 誰かが set_focus / clear_focus を呼んでいたら pending_focus がそのまま反映。
         // - そうでないとき、このフレームでクリック (release) があったら blur 扱いで
@@ -191,6 +209,11 @@ impl<M: ?Sized + 'static> UiHost<M> {
         self.focus_changed_in_last_frame = self.focused != prev_focused;
         // IME request の commit (フレーム内に request_ime が呼ばれていれば Some)。
         self.last_ime_request = ui.ime_request;
+        drop(ui);
+        // ui が drop して scene の borrow が外れた後で、popup buffer を append する。
+        scene.rects.extend(popup_rects);
+        scene.glyph_areas.extend(popup_glyphs);
+        scene.line_batches.extend(popup_lines);
         // M4 Phase 11: 今フレームに登場しなかった widget を scenegraph から eviction。
         self.scenegraph.retain(&seen_widgets);
         edits
@@ -238,6 +261,18 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// M4 Phase 11: このフレームで `with_widget_node` 経由で描画された widget の集合。
     /// frame 末尾で `scenegraph.retain(&seen_widgets)` を呼んで未登場 widget を eviction。
     seen_widgets: &'a mut HashSet<WidgetId>,
+    /// M7 Phase 22: 現在のクリップ矩形 (`with_clip_rect` でスタック管理)。
+    /// `push_rect / push_text / push_lines` で自動 inject される。`None` = 全画面。
+    pub(crate) current_clip: Option<Rect>,
+    /// M7 Phase 25: popup の open / close 状態 (UiHost が所有、Ui が借りる)。
+    open_popups: &'a mut HashMap<WidgetId, PopupOpenState>,
+    /// M7 Phase 25: popup_layer 内で push される rect の deferred buffer。
+    /// frame 末尾で base scene に append → z-order 最前面。
+    popup_rects: Vec<RectCommand>,
+    popup_glyphs: Vec<GlyphArea>,
+    popup_lines: Vec<LineBatch>,
+    /// `popup_layer` 内で描画中フラグ。push_* が popup_buffer に積むかを切替える。
+    drawing_in_popup: bool,
     _m: PhantomData<&'a M>,
 }
 
@@ -250,23 +285,125 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         self.pointer
     }
 
-    /// 内部: ウィジェットが描画コマンドを Scene に積む。
-    pub(crate) fn push_rect(&mut self, cmd: RectCommand) {
-        self.scene.push_rect(cmd);
+    /// 描画コマンドを Scene に積む (外部 widget extension で利用可能)。
+    /// M7 Phase 22: `current_clip` (with_clip_rect スタック) と cmd 自身の clip_rect を交差させて
+    /// renderer に渡す (cmd 自身が `Some` の場合は intersect、`None` の場合は current_clip)。
+    /// M7 Phase 25: `drawing_in_popup` 中は popup_buffer に積む (frame 末尾で z-order 最前面)。
+    pub fn push_rect(&mut self, mut cmd: RectCommand) {
+        cmd.clip_rect = merge_clip(self.current_clip, cmd.clip_rect);
+        if self.drawing_in_popup {
+            self.popup_rects.push(cmd);
+        } else {
+            self.scene.push_rect(cmd);
+        }
     }
 
-    /// 内部: ウィジェットがテキスト描画を積む。
-    pub(crate) fn push_text(&mut self, area: GlyphArea) {
-        self.scene.push_text(area);
+    /// テキスト描画を Scene に積む (外部 widget extension で利用可能)。
+    pub fn push_text(&mut self, mut area: GlyphArea) {
+        area.clip_rect = merge_clip(self.current_clip, area.clip_rect);
+        if self.drawing_in_popup {
+            self.popup_glyphs.push(area);
+        } else {
+            self.scene.push_text(area);
+        }
     }
 
-    /// 内部: ウィジェットが線分バッチを積む (波形・メータ・グリッド)。
-    pub(crate) fn push_lines(&mut self, batch: LineBatch) {
-        self.scene.push_lines(batch);
+    /// 線分バッチを Scene に積む (波形・メータ・グリッド、外部 widget extension で利用可能)。
+    pub fn push_lines(&mut self, mut batch: LineBatch) {
+        batch.clip_rect = merge_clip(self.current_clip, batch.clip_rect);
+        if self.drawing_in_popup {
+            self.popup_lines.push(batch);
+        } else {
+            self.scene.push_lines(batch);
+        }
     }
 
-    /// 内部: ウィジェットがエディットを積む。
-    pub(crate) fn push_edit(&mut self, edit: Edit<M>) {
+    /// M7 Phase 22: スコープ内の描画を `rect` でクリップする。
+    /// nested 呼び出しでは外側 clip と intersect。`scroll_area / popup_layer / split_view` で使用。
+    /// `with_widget_node` の input_hash には自動で current_clip が混ざる (キャッシュ整合性)。
+    pub fn with_clip_rect<F>(&mut self, rect: Rect, f: F)
+    where
+        F: FnOnce(&mut Self),
+    {
+        let prev = self.current_clip;
+        self.current_clip = Some(merge_clip(prev, Some(rect)).unwrap_or(rect));
+        f(self);
+        self.current_clip = prev;
+    }
+
+    // ============================================================
+    // M7 Phase 25: popup 制御
+    // ============================================================
+
+    /// popup を開く。次以降のフレームで `popup_layer(id, ..)` の closure が実行される。
+    /// `anchor` は popup を開く起点の矩形 (例: menu_bar の "File" ボタン)。
+    /// `modal` が true なら他 widget の click を抑制 (popup_layer の outside-click 検出で消費)。
+    pub fn open_popup(&mut self, id: impl std::hash::Hash, anchor: Rect, modal: bool) {
+        let wid = WidgetId::ROOT.child((b"popup", &id));
+        let prev_focus = self.pending_focus;
+        self.open_popups.insert(
+            wid,
+            PopupOpenState { anchor, modal, prev_focus },
+        );
+    }
+
+    /// popup を閉じる。popup を開く前の focus を復元する。
+    pub fn close_popup(&mut self, id: impl std::hash::Hash) {
+        let wid = WidgetId::ROOT.child((b"popup", &id));
+        if let Some(state) = self.open_popups.remove(&wid) {
+            self.pending_focus = state.prev_focus;
+            self.focus_changed_this_frame = true;
+        }
+    }
+
+    /// popup が現在開いているか。
+    pub fn is_popup_open(&self, id: impl std::hash::Hash) -> bool {
+        let wid = WidgetId::ROOT.child((b"popup", &id));
+        self.open_popups.contains_key(&wid)
+    }
+
+    /// popup の内容を描画する。popup が開いていなければ closure は呼ばれない。
+    /// closure 内で push される primitive は **deferred buffer** に積まれ、frame 末尾で
+    /// base scene に append (z-order = 最前面)。
+    ///
+    /// modal popup の場合: `anchor` の **外** で `primary_just_pressed` があれば自動的に
+    /// popup を close + click を消費する。
+    pub fn popup_layer<F>(&mut self, id: impl std::hash::Hash, f: F)
+    where
+        F: FnOnce(&mut Self),
+    {
+        let wid = WidgetId::ROOT.child((b"popup", &id));
+        let Some(state) = self.open_popups.get(&wid).copied() else {
+            return;
+        };
+
+        // outside-click 検出 (closure 実行前に判定 / 自動 close)
+        let outside_click = self.pointer.primary_just_pressed
+            && self
+                .pointer
+                .pos
+                .is_some_and(|(px, py)| !state.anchor.contains(px, py));
+        if outside_click {
+            // popup を閉じる + クリック消費 (modal なら他 widget に流さない)
+            self.open_popups.remove(&wid);
+            self.pending_focus = state.prev_focus;
+            self.focus_changed_this_frame = true;
+            if state.modal {
+                self.pointer.primary_just_pressed = false;
+                self.pointer.primary_just_released = false;
+            }
+            return;
+        }
+
+        // popup の内容を描画 (deferred buffer)
+        let prev_in_popup = self.drawing_in_popup;
+        self.drawing_in_popup = true;
+        f(self);
+        self.drawing_in_popup = prev_in_popup;
+    }
+
+    /// エディットを Scene に積む (外部 widget extension で利用可能)。
+    pub fn push_edit(&mut self, edit: Edit<M>) {
         self.edits.push(edit);
     }
 
@@ -282,6 +419,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     where
         F: FnOnce(&mut Self),
     {
+        // M7 Phase 22: current_clip も hash に混ぜる (scroll でクリップが動いたら cache 無効)。
+        let input_hash = mix_clip_into_hash(input_hash, self.current_clip);
+
         // フレーム末尾の eviction で「今フレームに登場した widget」として保持する。
         self.seen_widgets.insert(wid);
 
@@ -328,6 +468,21 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.pending_focus = None;
             self.focus_changed_this_frame = true;
         }
+    }
+
+    /// pointer が `rect` 内にあるなら、このフレームに蓄積された scroll delta (px) を取り出して
+    /// 内部 buffer を 0 に戻す。focus 不要 (scroll は pointer 位置で配信)。
+    ///
+    /// 戻り値は `(dx, dy)` (winit 慣行: `dy > 0` = wheel を上方向に回した = コンテンツが上に流れる)。
+    /// 同フレームに複数 widget が呼んでも、最初に呼んだ widget が消費する。
+    pub fn take_scroll_in_rect(&mut self, rect: Rect) -> (f32, f32) {
+        let Some((px, py)) = self.pointer.pos else { return (0.0, 0.0) };
+        if !rect.contains(px, py) {
+            return (0.0, 0.0);
+        }
+        let d = self.pointer.scroll_delta;
+        self.pointer.scroll_delta = (0.0, 0.0);
+        d
     }
 
     /// `wid` がフォーカスを持っているならフレームに溜まったキー入力を取り出す。
@@ -382,6 +537,35 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             .downcast_mut::<S>()
             .expect("WidgetState 型不一致")
     }
+}
+
+/// M7 Phase 22: 2 つの clip rect を交差させる (両方 `None` なら `None`、片方なら他方、両方なら intersect)。
+pub(crate) fn merge_clip(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(r), None) | (None, Some(r)) => Some(r),
+        (Some(a), Some(b)) => Some(a.intersect(b)),
+    }
+}
+
+/// M7 Phase 22: scroll で clip rect が変化したら scene cache を無効化するため、widget の input_hash
+/// に current_clip の bits を混ぜる (`x/y/w/h` の f32 bits + presence flag)。
+pub(crate) fn mix_clip_into_hash(input_hash: u64, clip: Option<Rect>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+    let mut h = DefaultHasher::new();
+    input_hash.hash(&mut h);
+    match clip {
+        None => 0u8.hash(&mut h),
+        Some(r) => {
+            1u8.hash(&mut h);
+            r.x.to_bits().hash(&mut h);
+            r.y.to_bits().hash(&mut h);
+            r.w.to_bits().hash(&mut h);
+            r.h.to_bits().hash(&mut h);
+        }
+    }
+    h.finish()
 }
 
 /// 視覚フィードバック用 — 押下中(矩形内 & primary_pressed)なら true。
@@ -887,6 +1071,7 @@ mod tests {
                     border: Color::TRANSPARENT,
                     border_width: 0.0,
                     radius: [0.0; 4],
+                    clip_rect: None,
                 });
             });
         });
@@ -905,6 +1090,7 @@ mod tests {
                     border: Color::TRANSPARENT,
                     border_width: 0.0,
                     radius: [0.0; 4],
+                    clip_rect: None,
                 });
             });
         });
@@ -932,6 +1118,7 @@ mod tests {
                     border: Color::TRANSPARENT,
                     border_width: 0.0,
                     radius: [0.0; 4],
+                    clip_rect: None,
                 });
             });
         });
@@ -948,6 +1135,7 @@ mod tests {
                     border: Color::TRANSPARENT,
                     border_width: 0.0,
                     radius: [0.0; 4],
+                    clip_rect: None,
                 });
             });
         });

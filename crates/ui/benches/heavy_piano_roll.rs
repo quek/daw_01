@@ -99,6 +99,7 @@ fn render_frame(
                     border: Color::TRANSPARENT,
                     border_width: 0.0,
                     radius: [0.0; 4],
+                    clip_rect: None,
                 });
                 // 拍縦線 (典型的な visible 範囲では 16 本程度、簡略形)
                 let beat_to_px = grid.w / view_len;
@@ -112,6 +113,7 @@ fn render_frame(
                         border: Color::TRANSPARENT,
                         border_width: 0.0,
                         radius: [0.0; 4],
+                        clip_rect: None,
                     });
                 }
                 // notes 矩形 (visible のみ)
@@ -128,6 +130,7 @@ fn render_frame(
                         border: Color::TRANSPARENT,
                         border_width: 0.0,
                         radius: [1.5; 4],
+                        clip_rect: None,
                     });
                 }
             });
@@ -186,7 +189,7 @@ fn bench_piano_roll(c: &mut Criterion) {
     c.bench_function("piano_roll_no_cache_viewport_100k", |b| {
         let mut step: u64 = 0;
         b.iter_batched_ref(
-            || (UiHost::<()>::new(), Scene::new()),
+            || (UiHost::<()>::no_redraw(), Scene::new()),
             |(host, scene)| {
                 step += 1;
                 // view_start を 0.001 拍ずつずらす → viewport_key が常に変わる

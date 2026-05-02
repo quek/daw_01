@@ -243,6 +243,7 @@ fn draw_fader<M: ?Sized + 'static>(
         border: Color::rgb(0.25, 0.28, 0.33),
         border_width: 1.0,
         radius: [4.0; 4],
+        clip_rect: None,
     });
 
     let (track, thumb) = fader_geometry(rect, value);
@@ -254,6 +255,7 @@ fn draw_fader<M: ?Sized + 'static>(
         border: Color::TRANSPARENT,
         border_width: 0.0,
         radius: [3.0; 4],
+        clip_rect: None,
     });
 
     // 値部分 (track の下端から上に伸びる) を強調色で塗る
@@ -270,6 +272,7 @@ fn draw_fader<M: ?Sized + 'static>(
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [3.0; 4],
+            clip_rect: None,
         });
     }
 
@@ -287,6 +290,7 @@ fn draw_fader<M: ?Sized + 'static>(
         border: Color::TRANSPARENT,
         border_width: 0.0,
         radius: [1.0; 4],
+        clip_rect: None,
     });
 }
 

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use daw_ui_core::{
-    ChannelLayout, InputAccumulator, SampleSlices, UiHost, WaveformRenderMode,
+    ChannelLayout, InputAccumulator, SampleSlices, UiHost, ViewportState1D, WaveformRenderMode,
     WaveformSource, WaveformStyle, WaveformView,
 };
 use daw_ui_platform::{
@@ -45,10 +45,8 @@ struct WaveformAppModel {
     /// 内容変更時にインクリメント。REC start 時に bump → ピラミッド完全再構築をトリガ。
     generation: u64,
 
-    /// 表示開始 sample index。
-    view_start: u64,
-    /// 表示する frame 数。
-    view_len: u64,
+    /// X 軸 view (M7 Phase 22: ViewportState1D に集約)。
+    viewport: ViewportState1D,
     /// 縦ゲイン (waveform 振幅倍率、現状 1.0 固定)。
     vertical_gain: f32,
     /// レーン高さ倍率 (Ctrl+wheel で操作)。1.0 で全 TRACKS が area に収まる、
@@ -80,8 +78,7 @@ impl WaveformAppModel {
             samples,
             valid_len: total_frames,
             generation: 0,
-            view_start: 0,
-            view_len: total_frames as u64,
+            viewport: ViewportState1D::new(0.0, total_frames as f64),
             vertical_gain: 1.0,
             y_zoom: 1.0,
             y_offset: 0.0,
@@ -127,41 +124,18 @@ impl WaveformAppModel {
         }
     }
 
-    /// 表示範囲を `dx_pixels` だけずらす (drag panning)。
+    /// 表示範囲を `dx_pixels` だけずらす (drag panning、M7: ViewportState1D 経由)。
     fn pan_pixels(&mut self, dx: f32, widget_w: f32) {
-        if widget_w <= 0.0 || self.view_len == 0 {
-            return;
-        }
-        let spp = self.view_len as f64 / f64::from(widget_w);
-        let delta_samples = (f64::from(dx) * spp) as i64;
-        let total = self.total_frames();
-        let max_start = total.saturating_sub(self.view_len);
-        // dx > 0 (右ドラッグ) → view_start を減らして表示が右へ動く。
-        self.view_start = if delta_samples >= 0 {
-            self.view_start.saturating_sub(delta_samples.unsigned_abs())
-        } else {
-            self.view_start
-                .saturating_add(delta_samples.unsigned_abs())
-                .min(max_start)
-        };
+        let total = self.total_frames() as f64;
+        self.viewport.pan_pixels(dx, widget_w);
+        self.viewport.clamp_to(total);
     }
 
-    /// `anchor_frac` (0..1) を画面上の位置として固定したまま `factor` 倍にズームする。
+    /// `anchor_frac` (0..1) を画面上の位置として固定したまま `factor` 倍 (M7: ViewportState1D 経由)。
     fn zoom_at(&mut self, factor: f32, anchor_frac: f32) {
-        if self.view_len == 0 {
-            return;
-        }
-        let total = self.total_frames();
-        let anchor_sample =
-            self.view_start as f64 + f64::from(anchor_frac) * self.view_len as f64;
-        let new_len = ((self.view_len as f32) * factor)
-            .max(64.0)
-            .min(total as f32) as u64;
-        let new_anchor_offset = f64::from(anchor_frac) * new_len as f64;
-        let new_start = (anchor_sample - new_anchor_offset).max(0.0) as u64;
-        let max_start = total.saturating_sub(new_len);
-        self.view_start = new_start.min(max_start);
-        self.view_len = new_len.max(1);
+        let total = self.total_frames() as f64;
+        self.viewport.zoom_at(factor, anchor_frac, 64.0);
+        self.viewport.clamp_to(total);
     }
 }
 
@@ -222,8 +196,8 @@ struct App {
 
     /// 累積中のホイール量 (on_render で適用)
     pending_zoom_dy: f32,
-    /// drag 開始時の (mouse_x, view_start)
-    drag_anchor: Option<(f32, u64)>,
+    /// drag 開始時の (mouse_x, view_start [unit = sample, f64])
+    drag_anchor: Option<(f32, f64)>,
     /// 現在のマウス位置 (zoom anchor 用に on_event で追従)
     cur_mouse: Option<(f32, f32)>,
     /// 現在の修飾キー状態 (`AppEvent::ModifiersChanged` で更新)。Ctrl+wheel = Y zoom
@@ -271,7 +245,7 @@ impl App {
             && let Some((px, py)) = pointer.pos
             && area.contains(px, py)
         {
-            self.drag_anchor = Some((px, self.model.view_start));
+            self.drag_anchor = Some((px, self.model.viewport.view_start));
         }
         if pointer.primary_just_released {
             self.drag_anchor = None;
@@ -281,7 +255,7 @@ impl App {
         {
             // 各クリップは width = area.w / CLIPS_PER_TRACK の中で view_len を表示する。
             // ドラッグの感覚を 1 クリップ幅基準にする (細かい操作も効くように)。
-            self.model.view_start = anchor_view_start;
+            self.model.viewport.view_start = anchor_view_start;
             let cell_w = area.w / CLIPS_PER_TRACK as f32;
             self.model.pan_pixels(px - anchor_x, cell_w);
         }
@@ -350,9 +324,9 @@ impl App {
                 let info = format!(
                     "frame {:>5.2} ms │ start {:>7} │ len {:>7} │ spp {:>6.1} │ {} widgets │ valid {:.2}s / {:.2}s │ {}",
                     m.last_frame_ms,
-                    m.view_start,
-                    m.view_len,
-                    m.view_len as f64 / f64::from(area.w),
+                    m.viewport.view_start as u64,
+                    m.viewport.view_len as u64,
+                    m.viewport.view_len as u64 as f64 / f64::from(area.w),
                     N_WIDGETS,
                     m.valid_len as f32 / SAMPLE_RATE as f32,
                     m.total_frames() as f32 / SAMPLE_RATE as f32,
@@ -386,16 +360,15 @@ impl App {
                 };
                 // 各クリップが少し違うサンプル位置を表示するシフト量。view 全体に対して
                 // 1/CLIPS_PER_TRACK の幅をずらすと、横方向にスライドするような視覚効果。
-                let shift_per_clip = m.view_len / CLIPS_PER_TRACK as u64;
-                let max_start = m.total_frames().saturating_sub(m.view_len);
+                let shift_per_clip = m.viewport.view_len as u64 / CLIPS_PER_TRACK as u64;
+                let max_start = m.total_frames().saturating_sub(m.viewport.view_len as u64);
                 for i in 0..N_WIDGETS {
                     let rect = clip_rect(area, i, m.y_zoom, m.y_offset);
                     let view = WaveformView {
-                        start_sample: m
-                            .view_start
+                        start_sample: (m.viewport.view_start as u64)
                             .saturating_add(shift_per_clip * (i as u64))
                             .min(max_start),
-                        len_samples: m.view_len,
+                        len_samples: m.viewport.view_len as u64,
                         vertical_gain: m.vertical_gain,
                     };
                     let _resp = ui.waveform(("clip", i), rect, source, view, style);

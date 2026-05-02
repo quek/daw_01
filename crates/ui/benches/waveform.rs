@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use daw_ui_core::{
-    PointerFrame, SampleSlices, UiHost, WaveformSource, WaveformStyle, WaveformView,
+    SampleSlices, UiHost, WaveformSource, WaveformStyle, WaveformView,
 };
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{Rect, Scene};
@@ -93,7 +93,7 @@ fn bench_initial_build(c: &mut Criterion) {
     for &n in &[1usize, 8, 16] {
         group.bench_function(format!("{n} widgets × 5.76M samples × 2ch"), |b| {
             b.iter_batched(
-                || (UiHost::<()>::new(), Scene::new()),
+                || (UiHost::<()>::no_redraw(), Scene::new()),
                 |(mut host, mut scene)| {
                     render_n_waveforms(&mut host, &mut scene, &planes, n, 0);
                     black_box((host, scene));
@@ -115,7 +115,7 @@ fn bench_cached_call(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("waveform/cached_call");
     for &n in &[1usize, 8, 64, 128] {
-        let mut host = UiHost::<()>::new();
+        let mut host = UiHost::<()>::no_redraw();
         let mut scene = Scene::new();
         // 事前ビルド (N 個のピラミッドが state HashMap に乗る)
         render_n_waveforms(&mut host, &mut scene, &planes, n, 0);

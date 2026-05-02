@@ -813,6 +813,7 @@ fn build_sample_polyline_markers(
                 border: Color::TRANSPARENT,
                 border_width: 0.0,
                 radius: [r; 4],
+                clip_rect: None,
             });
         }
     }

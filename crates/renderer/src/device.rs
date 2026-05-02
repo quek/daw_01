@@ -209,7 +209,7 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
                 multiview_mask: None,
             });
 
-            self.rect.render(&mut pass);
+            self.rect.render(&mut pass, self.size);
             self.line.render(&mut pass, self.size);
             self.glyph.render(&mut pass);
         }

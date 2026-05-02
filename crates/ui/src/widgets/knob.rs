@@ -232,6 +232,7 @@ fn draw_knob<M: ?Sized + 'static>(
         border: Color::rgb(0.40, 0.43, 0.47),
         border_width: 1.0,
         radius: [r; 4],
+        clip_rect: None,
     });
 
     // 角度: value=0 → -150° (7時)、value=0.5 → 0° (12時)、value=1 → +150° (5時)。

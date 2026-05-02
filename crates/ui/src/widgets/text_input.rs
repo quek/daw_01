@@ -302,6 +302,7 @@ fn draw_text_input<M: ?Sized + 'static>(
         border,
         border_width: 1.5,
         radius: [3.0; 4],
+        clip_rect: None,
     });
 
     // テキスト + preedit。preedit は cursor 位置に挿入して表示する。
@@ -336,6 +337,7 @@ fn draw_text_input<M: ?Sized + 'static>(
             font_size,
             line_height: line_h,
             color: Color::rgb(0.92, 0.92, 0.94),
+            clip_rect: None,
         });
     }
 

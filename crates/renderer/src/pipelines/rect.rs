@@ -8,7 +8,7 @@
 use bytemuck::{Pod, Zeroable};
 use daw_ui_platform::PhysicalSize;
 
-use crate::scene::RectCommand;
+use crate::scene::{Rect, RectCommand};
 
 /// シェーダに渡す instance 1 件分。
 #[repr(C)]
@@ -35,12 +35,21 @@ struct ScreenUniform {
 
 const MAX_INSTANCES: u64 = 64 * 1024;
 
+/// 1 batch を何 instance 描画するか + scissor。
+#[derive(Debug, Clone, Copy)]
+struct DrawSpan {
+    instance_start: u32,
+    instance_end: u32,
+    clip: Option<Rect>,
+}
+
 pub struct RectPipeline {
     pipeline: wgpu::RenderPipeline,
     instance_buffer: wgpu::Buffer,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    instance_count: u32,
+    /// `prepare` で構築。`render` 時に span 順で `set_scissor_rect` + draw。
+    spans: Vec<DrawSpan>,
 }
 
 impl RectPipeline {
@@ -137,7 +146,7 @@ impl RectPipeline {
             instance_buffer,
             uniform_buffer,
             bind_group,
-            instance_count: 0,
+            spans: Vec::new(),
         }
     }
 
@@ -154,10 +163,14 @@ impl RectPipeline {
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
 
-        // インスタンスを敷き詰め
+        // インスタンスを敷き詰めながら、clip_rect が同じ連続区間を 1 span にまとめる。
+        self.spans.clear();
         let count = rects.len().min(MAX_INSTANCES as usize);
         let mut instances: Vec<RectInstance> = Vec::with_capacity(count);
-        for cmd in rects.iter().take(count) {
+        let mut span_start: u32 = 0;
+        let mut current_clip: Option<Rect> = None;
+        let mut span_open = false;
+        for (i, cmd) in rects.iter().take(count).enumerate() {
             instances.push(RectInstance {
                 pos: [cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h],
                 fill: [cmd.fill.r, cmd.fill.g, cmd.fill.b, cmd.fill.a],
@@ -165,21 +178,56 @@ impl RectPipeline {
                 misc0: [cmd.border_width, cmd.radius[0], cmd.radius[1], cmd.radius[2]],
                 misc1: [cmd.radius[3], 0.0, 0.0, 0.0],
             });
+            if !span_open {
+                span_start = i as u32;
+                current_clip = cmd.clip_rect;
+                span_open = true;
+            } else if cmd.clip_rect != current_clip {
+                self.spans.push(DrawSpan {
+                    instance_start: span_start,
+                    instance_end: i as u32,
+                    clip: current_clip,
+                });
+                span_start = i as u32;
+                current_clip = cmd.clip_rect;
+            }
+        }
+        if span_open && (span_start as usize) < instances.len() {
+            self.spans.push(DrawSpan {
+                instance_start: span_start,
+                instance_end: instances.len() as u32,
+                clip: current_clip,
+            });
         }
         if !instances.is_empty() {
             queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instances));
         }
-        self.instance_count = count as u32;
     }
 
-    pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
-        if self.instance_count == 0 {
+    pub fn render(&self, pass: &mut wgpu::RenderPass<'_>, screen: PhysicalSize) {
+        if self.spans.is_empty() {
             return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-        // 1 矩形 = 6 頂点 (2 三角形)、インスタンス展開
-        pass.draw(0..6, 0..self.instance_count);
+        for span in &self.spans {
+            if let Some(clip) = span.clip {
+                let l = clip.x.max(0.0);
+                let t = clip.y.max(0.0);
+                let r = (clip.x + clip.w).min(screen.width as f32);
+                let b = (clip.y + clip.h).min(screen.height as f32);
+                if r <= l || b <= t {
+                    continue;
+                }
+                pass.set_scissor_rect(l as u32, t as u32, (r - l) as u32, (b - t) as u32);
+            } else {
+                pass.set_scissor_rect(0, 0, screen.width, screen.height);
+            }
+            // 1 矩形 = 6 頂点 (2 三角形)、インスタンス展開
+            pass.draw(0..6, span.instance_start..span.instance_end);
+        }
+        // 後続パイプラインのために scissor を全画面に戻す。
+        pass.set_scissor_rect(0, 0, screen.width, screen.height);
     }
 }

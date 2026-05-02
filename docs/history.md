@@ -695,6 +695,62 @@ M5.5 完了後の DAW プラグイン対応・アクセシビリティ・波形�
 
 **残作業 (Phase 21 / M6 全体)**: なし。**M6 完了**。M7 以降の構成は下記参照 (2026-05-02 策定 draft、利用者編集前提)。
 
+### M7 (基本 widget 拡張 + DAW 共通 widget) — Phase 22-28 全完遂、daw_prototype demo 完成 ✅ M7 完了 (2026-05-02、1 commit)
+
+ユーザ判断で **M7 全体を 1 commit** で完遂 (M6 までの phase 単位 commit と異なる単位)。Phase 22-28 + daw_prototype example + 既存 example の `ViewportState1D` 置換 + 設計判断の docs 同梱。
+
+| Phase | テーマ | 状態 |
+|---|---|---|
+| 22 | scrollbar / scroll area + 基盤 | ✅ `Ui::scroll_area` + `Ui::with_clip_rect` + `Ui::take_scroll_in_rect` + `RectCommand.clip_rect` / `GlyphArea.clip_rect` 拡張 + `RectPipeline` の scissor span 分割 + `ViewportState1D` 先行投入 |
+| 23 | menu bar / sub-menu | ✅ `Ui::menu_bar` + `MenuBuilder` (popup_layer 経由で sub-menu cascade) |
+| 24 | context menu | ✅ `Ui::context_menu_for(rect, items, on_select)` (library が右クリック吸収、利用者の boilerplate 不要) |
+| 25 | popup / dropdown / combobox | ✅ `Ui::popup_layer` (deferred buffer + focus stack + outside-click close) + `Ui::open_popup` / `close_popup` + `Ui::dropdown` |
+| 26 | tab view + split view | ✅ `Ui::tab_view` (builder pattern、選択 tab のみ closure 実行) + `Ui::split_view` (drag handle + clip 適用) |
+| 27 | time ruler / bar/beat grid | ✅ `TimeMapping` + `Ui::time_ruler` + `Ui::bar_beat_grid` (BarBeat / SMPTE / Seconds 表示) |
+| 28 | level meter | ✅ `Ui::level_meter` (Peak / RMS / VU + peak hold + dB log scale) |
+
+#### 主な成果物 (詳細)
+
+1. **`crates/ui/src/viewport.rs` 新規** — `ViewportState1D` (sample/beat/track 共通の `view_start: f64 + view_len: f64` + `pan_pixels` / `zoom_at` / `clamp_to` / `unit_to_px` / `px_to_unit`)。sample_editor / waveform_validation / sample_edit_ops の重複 4 実装を一箇所に集約 (`feedback_use_new_abstractions` 適合)。
+2. **`crates/ui/src/popup.rs` 新規** — `PopupOpenState` (anchor + modal flag + prev_focus)。`UiHost.open_popups: HashMap<WidgetId, PopupOpenState>` で popup 状態を保持。
+3. **`crates/ui/src/time.rs` 新規** — `TimeMapping { sample_rate, tempo_bpm, time_sig, display: TimeDisplay }` + `samples_per_beat` / `samples_per_bar` / `samples_to_bar_beat` / `bar_beat_to_samples` / `samples_to_smpte` / `format`。
+4. **`crates/ui/src/widgets/{scroll_area,menu,dropdown,tab_view,split_view,time_grid,level_meter}.rs` 新規** — 各 widget。`menu` は `MenuBuilder` + `MenuBarBuilder` + 内部共通 `draw_items_popup` (menu_bar / context_menu / dropdown が共有)。
+5. **`crates/renderer/src/scene.rs`** — `RectCommand.clip_rect: Option<Rect>` / `GlyphArea.clip_rect: Option<Rect>` 追加 + `Rect::intersect` ヘルパ。既存 `LineBatch.clip_rect` と統一。
+6. **`crates/renderer/src/pipelines/rect.rs`** — `LinePipeline` と同形の `DrawSpan { instance_start, instance_end, clip }` で連続 clip_rect を 1 scissor draw にまとめ、変わる境界で `set_scissor_rect` 再発行。
+7. **`crates/renderer/src/pipelines/glyph.rs`** — `GlyphArea.clip_rect` を `TextBounds` として glyphon に渡し、範囲外 glyph を切り捨て。
+8. **`crates/ui/src/ui.rs`** — `Ui` に `current_clip` / `open_popups` / `popup_rects/glyphs/lines` / `drawing_in_popup` フィールド追加。`with_clip_rect` で nested clip stack、`with_widget_node` の input_hash に `current_clip` を mix (scroll でクリップが動いたら cache 無効化)、popup_layer 内の primitive を deferred buffer に積み frame 末尾で base scene に append (z-order 最前面)。
+9. **`crates/ui/src/input.rs`** — `PointerFrame.scroll_delta: (f32, f32)` + `PointerFrame.secondary_just_pressed/released` 追加、`InputAccumulator::ingest` で `AppEvent::Scroll` (LineDelta / PixelDelta 両方) を `accumulated_scroll` に蓄積、`take_frame` で reset。`Ui::take_scroll_in_rect(rect)` が pointer 位置で消費。
+10. **`crates/examples/daw_prototype/{Cargo.toml, src/main.rs}` 新規** — visual prototype demo。menu_bar (File/Edit/View/Help) + split_view (sidebar | main) + tab_view (Mixer / Arrangement / Piano Roll / Sample) + 各 view 内で scroll_area / dropdown / time_ruler / bar_beat_grid / level_meter / context_menu_for を統合。
+11. **example 置換 (新抽象を次の機会に使う原則)** — sample_editor / waveform_validation / sample_edit_ops の `view_start: u64 / view_len: u64 / pan_pixels / zoom_at` 自前実装を `ViewportState1D` に置換。
+12. **docs/plan.md / history.md 更新** — M7 表を全 ✅ に、本節を追記 (M7 完了履歴)。
+
+#### 設計判断 (M7 全般)
+
+- **commit 戦略**: M7 全体を 1 commit (Phase 22-28 + daw_prototype + docs 同梱)。理由はユーザ判断 (5 commit / 7 commit / 1 commit の中から「全体 1 commit」を選択)。M6 (4 phase = 2 commit) より粗いが、M7 widget は相互依存が強く 1 commit 内で全 verification を通す方が整合性が高い。
+- **context_menu API**: `library 吸収方式` (右クリック判定を library が担当、利用者 boilerplate 不要) を採用。`feedback_pursue_best_practice` の「ユーザに workaround を強要する API は設計欠陥」原則に整合。
+- **ViewportState 化**: Phase 22 で **先行投入** (Phase 27 まで待たない)。理由: scroll_area の縦方向と sample_editor の X 方向が同じ式、4 箇所の重複コード解消が早いほど DRY 効果が大きい。`f64` 採用は大規模 DAW project の sample 数が `u32` を超えるため。
+- **demo 目標**: visual prototype (tab + split + menu + scroll が「見た目 DAW」になる) で M7 完結。操作の整合性 (undo / shortcut / drag&drop) は M8 で本格化、daw_prototype は M8 完了後に「操作可能な DAW prototype」として再仕上げ。
+- **clip_rect の scenegraph 整合性**: `with_widget_node` の input_hash に current_clip を XOR mix することで、scroll で clip が動いたときに cached commands が自動無効化される。heavy() 内部の cached scene にも同じ仕組みが効くため、popup の anchor 移動でキャッシュがズレる問題も解消。
+- **popup の z-order**: deferred buffer (`popup_rects` / `popup_glyphs` / `popup_lines`) を Ui に持ち、frame 末尾で base scene に append する方式。新しい z-order struct や render pass は不要 (Scene の追加順 = 描画順 という既存設計に乗る)。
+- **modal popup の click 消費**: popup の anchor 外で press があれば popup_layer 自身が `pointer.primary_just_pressed/released = false` にして他 widget に流さない (modal popup のみ)。これは「popup_layer を user closure の早い段階に置く」前提 (利用者向けの妥協ポイントとして本節に記録、M8 で改善)。
+
+#### 既知の妥協 / M8 送り
+
+- **bench files の修正**: M6 commit 24304b8 で `UiHost::new` が引数必須になったが bench (`heavy_arrangement.rs` / `heavy_piano_roll.rs` / `waveform.rs`) が未修正 → M7 で `UiHost::no_redraw()` に置換。M6 時点での pre-existing breakage の修正。
+- **context_menu の anchor 復元**: popup_state.anchor を `Ui::popup_layer` 内側で参照する経路がまだ無いため、context_menu_for は「popup を開いた瞬間の pointer 位置」を毎フレーム再評価する近似実装 (pointer が動くと popup の位置がずれる)。M8 で popup_layer の closure に `&PopupOpenState` を渡す改良予定。
+- **arrangement の scroll_area 統合**: M7 plan では「arrangement に scroll_area を被せる」とあったが、arrangement は既に `y_zoom / y_offset` で manual scroll を持つため、daw_prototype で scroll_area の利用例を示し、arrangement への統合は M8 / M9 で再評価 (重複機能の整理が必要)。
+- **focus stack の単一 popup 対応**: 現状 nested popup (sub-menu cascade) は menu_bar 内の builder で書ける形にしているが、`open_popups` HashMap で並列管理しており本格的な stack 順序は未保証。M8 popup 強化で対応予定。
+
+#### 検証結果 (本コミット時点)
+
+- `cargo build --workspace`: ✅
+- `cargo test --workspace`: ✅ (daw-ui-core 69 tests pass、daw-ui-renderer 4 tests pass、`no_clone_required` trybuild green、`widget_id_collision` pass)
+- `cargo clippy --workspace --tests -- -D warnings`: ✅
+- `cargo check --workspace --benches`: ✅ (heavy_arrangement / heavy_piano_roll / waveform 全 fix 済み)
+- `cargo run --bin daw_prototype`: ビルド ✅、実機動作確認は利用者依存 (visual prototype のため)
+
+**残作業**: なし。**M7 完了**。M8 以降の構成は plan.md M8-M14 を参照。
+
 ---
 
 ## 波形表示 UI 詳細設計 (M2 で実装、M5 で詳細モード追加)

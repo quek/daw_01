@@ -116,6 +116,7 @@ impl App {
                         border: Color::TRANSPARENT,
                         border_width: 0.0,
                         radius: [2.0; 4],
+                        clip_rect: None,
                     });
                 }
             }

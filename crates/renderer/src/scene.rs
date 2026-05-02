@@ -49,6 +49,23 @@ impl Rect {
     pub fn contains(&self, px: f32, py: f32) -> bool {
         px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
     }
+    /// 2 つの矩形の交差。重ならないときは `w/h = 0` の空矩形 (位置は左上の交差点)。
+    #[must_use]
+    pub fn intersect(&self, other: Rect) -> Rect {
+        let l = self.x.max(other.x);
+        let t = self.y.max(other.y);
+        let r = (self.x + self.w).min(other.x + other.w);
+        let b = (self.y + self.h).min(other.y + other.h);
+        if r > l && b > t {
+            Rect::new(l, t, r - l, b - t)
+        } else {
+            Rect::new(l, t, 0.0, 0.0)
+        }
+    }
+    /// `w == 0 || h == 0` のとき true。
+    pub fn is_empty(&self) -> bool {
+        self.w <= 0.0 || self.h <= 0.0
+    }
 }
 
 /// 角丸矩形 1 つ分の描画コマンド (instanced rect の入力)。
@@ -60,6 +77,9 @@ pub struct RectCommand {
     pub border_width: f32,
     /// 4 隅の半径 (順番: tl, tr, br, bl)。同一値で済む場合は `Self::uniform_radius` 使用。
     pub radius: [f32; 4],
+    /// `Some` ならこの矩形外を scissor で切り捨てる。`None` で全画面描画。
+    /// scroll_area / popup_layer / split_view が `Ui::with_clip_rect` 経由で自動設定する。
+    pub clip_rect: Option<Rect>,
 }
 
 impl RectCommand {
@@ -70,6 +90,7 @@ impl RectCommand {
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [radius; 4],
+            clip_rect: None,
         }
     }
 }
@@ -87,6 +108,9 @@ pub struct GlyphArea {
     /// 行高さ。font_size * 1.2 等。
     pub line_height: f32,
     pub color: Color,
+    /// `Some` ならこの矩形外をクリップ (glyphon の `TextBounds` で適用)。
+    /// `None` で全画面描画。`Ui::with_clip_rect` が自動設定する。
+    pub clip_rect: Option<Rect>,
 }
 
 /// 線分 1 本分。物理ピクセル単位。

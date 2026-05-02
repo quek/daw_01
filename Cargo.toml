@@ -12,6 +12,7 @@ members = [
     "crates/examples/automation",
     "crates/examples/embedded_host",
     "crates/examples/sample_edit_ops",
+    "crates/examples/daw_prototype",
 ]
 
 [workspace.package]

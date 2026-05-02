@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use daw_ui_core::{
-    ChannelLayout, Edit, InputAccumulator, SampleSlices, UiHost, WaveformRenderMode,
-    WaveformSource, WaveformStyle, WaveformView,
+    ChannelLayout, Edit, InputAccumulator, SampleSlices, UiHost, ViewportState1D,
+    WaveformRenderMode, WaveformSource, WaveformStyle, WaveformView,
 };
 use daw_ui_platform::{
     AppEvent, AppHost, Modifiers, PhysicalSize, ScrollDelta, WindowBackend, winit_backend,
@@ -46,8 +46,8 @@ struct SampleEditOpsModel {
     valid_len: usize,
     generation: u64,
 
-    view_start: u64,
-    view_len: u64,
+    /// X 軸 view (M7 Phase 22: ViewportState1D に集約)。
+    viewport: ViewportState1D,
     vertical_gain: f32,
 
     selection: Option<(u64, u64)>, // (start, end) 順序保証
@@ -65,8 +65,7 @@ impl SampleEditOpsModel {
             samples,
             valid_len: total,
             generation: 0,
-            view_start: 0,
-            view_len: total as u64,
+            viewport: ViewportState1D::new(0.0, total as f64),
             vertical_gain: 1.0,
             selection: None,
             cursor_sample: 0,
@@ -80,53 +79,24 @@ impl SampleEditOpsModel {
     }
 
     fn pan_pixels(&mut self, dx: f32, widget_w: f32) {
-        if widget_w <= 0.0 || self.view_len == 0 {
-            return;
-        }
-        let spp = self.view_len as f64 / f64::from(widget_w);
-        let delta_samples = (f64::from(dx) * spp) as i64;
-        let total = self.total_frames();
-        let max_start = total.saturating_sub(self.view_len);
-        self.view_start = if delta_samples >= 0 {
-            self.view_start.saturating_sub(delta_samples.unsigned_abs())
-        } else {
-            self.view_start
-                .saturating_add(delta_samples.unsigned_abs())
-                .min(max_start)
-        };
+        let total = self.total_frames() as f64;
+        self.viewport.pan_pixels(dx, widget_w);
+        self.viewport.clamp_to(total);
     }
 
     fn zoom_at(&mut self, factor: f32, anchor_frac: f32) {
-        if self.view_len == 0 {
-            return;
-        }
-        let total = self.total_frames();
-        let anchor_sample =
-            self.view_start as f64 + f64::from(anchor_frac) * self.view_len as f64;
-        let new_len = ((self.view_len as f32) * factor)
-            .max(8.0)
-            .min(total as f32) as u64;
-        let new_anchor_offset = f64::from(anchor_frac) * new_len as f64;
-        let new_start = (anchor_sample - new_anchor_offset).max(0.0) as u64;
-        let max_start = total.saturating_sub(new_len);
-        self.view_start = new_start.min(max_start);
-        self.view_len = new_len.max(1);
+        let total = self.total_frames() as f64;
+        self.viewport.zoom_at(factor, anchor_frac, 8.0);
+        self.viewport.clamp_to(total);
     }
 
     fn x_to_sample(&self, x: f32, area: Rect) -> u64 {
-        if area.w <= 0.0 || self.view_len == 0 {
-            return self.view_start;
-        }
-        let frac = f64::from(((x - area.x) / area.w).clamp(0.0, 1.0));
-        (self.view_start as f64 + frac * self.view_len as f64) as u64
+        let local_x = (x - area.x).clamp(0.0, area.w);
+        self.viewport.px_to_unit(local_x, area.w) as u64
     }
 
     fn sample_to_x(&self, s: u64, area: Rect) -> f32 {
-        if self.view_len == 0 {
-            return area.x;
-        }
-        let frac = (s as f64 - self.view_start as f64) / self.view_len as f64;
-        area.x + (frac as f32) * area.w
+        area.x + self.viewport.unit_to_px(s as f64, area.w)
     }
 }
 
@@ -168,9 +138,9 @@ struct App {
     scene: Scene,
     input: InputAccumulator,
 
-    /// drag 状態: (anchor_x, anchor_view_start, anchor_sample, accum_dx, kind)
+    /// drag 状態: (anchor_x, anchor_view_start (f64 unit), anchor_sample, accum_dx, kind)
     /// kind: false = pan、true = selection
-    drag_anchor: Option<(f32, u64, u64, f32, bool)>,
+    drag_anchor: Option<(f32, f64, u64, f32, bool)>,
     cur_mouse: Option<(f32, f32)>,
     cur_modifiers: Modifiers,
     pending_zoom_dy: f32,
@@ -225,7 +195,7 @@ impl App {
             let anchor_sample = self.model.x_to_sample(px, area);
             let kind_selection = self.cur_modifiers.shift;
             self.drag_anchor =
-                Some((px, self.model.view_start, anchor_sample, 0.0, kind_selection));
+                Some((px, self.model.viewport.view_start, anchor_sample, 0.0, kind_selection));
             self.pending_click = None;
             if kind_selection {
                 self.model.selection = Some((anchor_sample, anchor_sample));
@@ -246,7 +216,7 @@ impl App {
                 };
                 self.model.selection = Some((s, e));
             } else {
-                self.model.view_start = ave_start;
+                self.model.viewport.view_start = ave_start;
                 self.model.pan_pixels(dx, area.w);
             }
             if let Some(anchor) = self.drag_anchor.as_mut() {
@@ -293,8 +263,8 @@ impl App {
             "frame {:>5.2}ms │ samples {} │ view [{:>7}..{:>7}) │ cursor {} │ sel {} │ gain {:.2}x",
             self.model.last_frame_ms,
             self.model.valid_len,
-            self.model.view_start,
-            self.model.view_start + self.model.view_len,
+            self.model.viewport.view_start,
+            self.model.viewport.view_start + self.model.viewport.view_len,
             self.model.cursor_sample,
             self.model
                 .selection
@@ -327,8 +297,8 @@ impl App {
                     sample_rate: SAMPLE_RATE,
                 };
                 let view = WaveformView {
-                    start_sample: m.view_start,
-                    len_samples: m.view_len,
+                    start_sample: m.viewport.view_start as u64,
+                    len_samples: m.viewport.view_len as u64,
                     vertical_gain: m.vertical_gain,
                 };
                 let style = WaveformStyle {
@@ -359,6 +329,7 @@ impl App {
                             border: Color::TRANSPARENT,
                             border_width: 0.0,
                             radius: [0.0; 4],
+                            clip_rect: None,
                         });
                     }
                     let x_c = m.sample_to_x(m.cursor_sample, area);
@@ -368,6 +339,7 @@ impl App {
                         border: Color::TRANSPARENT,
                         border_width: 0.0,
                         radius: [0.0; 4],
+                        clip_rect: None,
                     });
                 });
 
@@ -401,8 +373,8 @@ impl App {
                             m.generation += 1;
                             m.selection = None;
                             m.cursor_sample = 0;
-                            m.view_start = 0;
-                            m.view_len = new_len as u64;
+                            m.viewport.view_start = 0.0;
+                            m.viewport.view_len = new_len as f64;
                             m.last_action = format!("Trim: {new_len} samples 残った (generation += 1 で LOD 再構築)");
                         })
                     },

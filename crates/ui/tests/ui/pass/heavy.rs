@@ -56,6 +56,7 @@ fn main() {
                             border: Color::TRANSPARENT,
                             border_width: 0.0,
                             radius: [0.0; 4],
+                            clip_rect: None,
                         });
                     }
                 });

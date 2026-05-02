@@ -73,32 +73,35 @@ A11y (AccessKit) は **本ライブラリでは採用しない方針** (2026-05-
 
 ---
 
-## 現状ワークスペース構成 (F:\dev\gui_01、M6 完了時点)
+## 現状ワークスペース構成 (F:\dev\gui_01、M7 完了時点)
 
 ```
 F:\dev\gui_01\
 ├── Cargo.toml                       # workspace, edition=2024, rust-version=1.95
 ├── rust-toolchain.toml
 ├── docs\
-│   ├── plan.md                      # ★ 本ファイル (M7+ 計画)
-│   └── history.md                   # M1-M6 + M5.5 履歴 + 詳細設計
+│   ├── plan.md                      # ★ 本ファイル (M8+ 計画)
+│   └── history.md                   # M1-M7 + M5.5 履歴 + 詳細設計
 ├── crates\
 │   ├── platform\                    # daw-ui-platform (winit抽象、raw-window-handle 経由 trait bound)
 │   │   └── src\{lib,event,window,winit_backend}.rs
 │   ├── renderer\                    # daw-ui-renderer (wgpu 29、自前パイプライン rect/line/glyph + OffscreenRenderer)
 │   │   └── src\{lib,device,offscreen,scene}.rs + pipelines\{mod,rect,line,glyph}.rs + *.wgsl
-│   ├── ui\                          # daw-ui-core (Ui/UiHost/Edit/widgets/scenegraph/heavy)
-│   │   └── src\{lib,edit,id,input,layout,scenegraph,ui}.rs
-│   │       └── widgets\{mod,button,checkbox,fader,knob,label,text_input,waveform,heavy,automation}.rs
-│   └── examples\                    # 8 example (commit 24304b8 で全動作確認済み)
+│   ├── ui\                          # daw-ui-core (Ui/UiHost/Edit/popup/time/viewport/widgets/scenegraph/heavy)
+│   │   └── src\{lib,edit,id,input,layout,popup,scenegraph,time,ui,viewport}.rs
+│   │       └── widgets\{mod,button,checkbox,dropdown,fader,heavy,knob,label,level_meter,
+│   │                    menu,scroll_area,split_view,tab_view,text_input,time_grid,
+│   │                    waveform,automation}.rs
+│   └── examples\                    # 9 example (M7 で daw_prototype を追加)
 │       ├── mixer\                   # 8ch fader / button / IME
-│       ├── waveform_validation\     # 128 widget LOD ストレステスト
-│       ├── sample_editor\           # 選択範囲 + カーソル + RmsBars
+│       ├── waveform_validation\     # 128 widget LOD ストレステスト + ViewportState1D
+│       ├── sample_editor\           # 選択範囲 + カーソル + RmsBars + ViewportState1D
 │       ├── piano_roll\              # 100k notes + heavy() cached (5.77x)
 │       ├── arrangement\             # 500 widgets + heavy() cached (9367x)
 │       ├── automation\              # cubic Bezier flatten + Catmull-Rom 点ドラッグ
 │       ├── embedded_host\           # OffscreenRenderer で PNG snapshot (プラグイン UI 埋め込み実証)
-│       └── sample_edit_ops\         # 波形 trim / linear fade in/out
+│       ├── sample_edit_ops\         # 波形 trim / linear fade in/out + ViewportState1D
+│       └── daw_prototype\           # M7 visual prototype: menu_bar + tab + split + scroll + ruler + meter
 ```
 
 ---
@@ -114,24 +117,21 @@ M1-M6 + M5.5 は完了済み (詳細: [history.md](history.md))。M6 完了時�
 - scenegraph + heavy() cached で大規模ビュー (100k notes / 500 widgets / arrangement 9367x キャッシュ高速化) 達成
 - 設計の不変条件 (no-Clone / メッセージ型禁止 / derive 禁止 / audio・IPC 不混入) 維持
 
-### M7 (基本 widget 拡張 + DAW 共通 widget、未着手)
+### M7 (基本 widget 拡張 + DAW 共通 widget、✅ 完了)
 
-DAW プロトタイプとして使える最低限のコア building block + DAW UI で頻出する時間軸 / metering widget を揃える milestone。M5/M6 で大規模ビュー (heavy / cached) と編集 sample (sample_edit_ops) は実装済みだが、scrollbar / メニュー / 右クリック / popup / time ruler / level meter 等の基本 widget が無く arrangement / piano_roll / mixer を実用的に操作できない。M7 でこれらを段階的に追加し、最終的に「mixer + arrangement + sample editor + piano roll を統合した DAW プロトタイプ demo」を作れる土台を整える。
+DAW プロトタイプとして使える最低限のコア building block + DAW UI で頻出する時間軸 / metering widget を揃えた milestone。詳細は [history.md](history.md) M7 節参照。
 
-| Phase | テーマ | 主な成果物 |
+| Phase | テーマ | 状態 |
 |---|---|---|
-| 22 | scrollbar / scroll area | `Ui::scroll_area<F>` (overflow 切り取り + scrollbar 描画 + wheel/drag scroll)、scrollbar 単体 widget |
-| 23 | menu bar / sub-menu | `Ui::menu_bar` + `Ui::menu_item`、Window 上部 dock、sub-menu cascade |
-| 24 | context menu (右クリック) | `Ui::context_menu_for(rect, items)`、右クリック popup、選択で Edit 発行 |
-| 25 | popup / dropdown / combobox | `Ui::dropdown(items, selected)`、popup 制御の汎用基盤 (Phase 22-26 で共通化) |
-| 26 | tab view + split view | `Ui::tab_view(tabs)`、`Ui::split_view(orientation, ratio)` (drag で境界調整) |
-| 27 | time ruler / bar/beat grid | bar/beat/SMPTE 表示、zoom 連動、現状 example で個別描画している grid を library 化 |
-| 28 | level meter (VU / peak / RMS) | リアルタイム metering、ballistic / RMS / peak hold |
+| 22 | scrollbar / scroll area | ✅ `Ui::scroll_area<F>` + clip_rect 全 primitive 拡張 + ViewportState1D 先行投入 |
+| 23 | menu bar / sub-menu | ✅ `Ui::menu_bar` + `MenuBuilder` (popup_layer 経由) |
+| 24 | context menu | ✅ `Ui::context_menu_for(rect, items, on_select)` (library 吸収方式、右クリック自動検出) |
+| 25 | popup / dropdown | ✅ `Ui::popup_layer` (deferred buffer + focus stack + outside-click close) + `Ui::dropdown` |
+| 26 | tab view + split view | ✅ `Ui::tab_view` (builder pattern) + `Ui::split_view` (drag handle) |
+| 27 | time ruler / bar/beat grid | ✅ `TimeMapping` + `Ui::time_ruler` + `Ui::bar_beat_grid` |
+| 28 | level meter | ✅ `Ui::level_meter` (Peak / RMS / VU + peak hold + dB log scale) |
 
-**設計判断 (M7 全般)**:
-- popup / dropdown / context menu は共通基盤 (`Ui::popup_layer`) を 1 度作って各 widget で使い回す
-- scrollbar の scroll 状態は `widget_state` (knob/fader と同パターン)
-- menu bar / context menu は modal な popup で focus を一時奪取、閉じるとき焦点を元 widget に戻す
+**完成 demo**: `daw_prototype` example で全 M7 widget を統合 (`cargo run --bin daw_prototype`)。
 
 ---
 

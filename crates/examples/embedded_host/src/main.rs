@@ -85,6 +85,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             border: Color::rgb(0.3, 0.3, 0.35),
             border_width: 1.0,
             radius: [4.0; 4],
+            clip_rect: None,
         });
         // fader handle (channel ごとに位置を変えてバリエーションを出す)
         let handle_y = 200.0 + (ch as f32) * 24.0;
@@ -101,6 +102,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         font_size: 16.0,
         line_height: 20.0,
         color: Color::WHITE,
+        clip_rect: None,
     });
 
     // 1 フレーム render → RGBA bytes (sRGB encoded、行 stride = width * 4)

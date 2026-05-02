@@ -134,27 +134,39 @@ impl GlyphPipeline {
         }
 
         // 3) TextArea は &Buffer を借りるので、cache 更新後に immutable borrow で構築。
+        // M7 Phase 22: GlyphArea.clip_rect が Some なら TextBounds で範囲外をクリップ。
         let text_areas: Vec<TextArea<'_>> = glyph_areas
             .iter()
             .zip(keys.iter())
-            .map(|(area, &key)| TextArea {
-                buffer: &self.cache[&key].buffer,
-                left: area.left,
-                top: area.top,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: 0,
-                    top: 0,
-                    right: screen.width.try_into().unwrap_or(i32::MAX),
-                    bottom: screen.height.try_into().unwrap_or(i32::MAX),
-                },
-                default_color: GlyphColor::rgba(
-                    (area.color.r * 255.0).clamp(0.0, 255.0) as u8,
-                    (area.color.g * 255.0).clamp(0.0, 255.0) as u8,
-                    (area.color.b * 255.0).clamp(0.0, 255.0) as u8,
-                    (area.color.a * 255.0).clamp(0.0, 255.0) as u8,
-                ),
-                custom_glyphs: &[],
+            .map(|(area, &key)| {
+                let bounds = area.clip_rect.map_or(
+                    TextBounds {
+                        left: 0,
+                        top: 0,
+                        right: screen.width.try_into().unwrap_or(i32::MAX),
+                        bottom: screen.height.try_into().unwrap_or(i32::MAX),
+                    },
+                    |c| TextBounds {
+                        left: c.x.max(0.0) as i32,
+                        top: c.y.max(0.0) as i32,
+                        right: ((c.x + c.w).min(screen.width as f32)).max(0.0) as i32,
+                        bottom: ((c.y + c.h).min(screen.height as f32)).max(0.0) as i32,
+                    },
+                );
+                TextArea {
+                    buffer: &self.cache[&key].buffer,
+                    left: area.left,
+                    top: area.top,
+                    scale: 1.0,
+                    bounds,
+                    default_color: GlyphColor::rgba(
+                        (area.color.r * 255.0).clamp(0.0, 255.0) as u8,
+                        (area.color.g * 255.0).clamp(0.0, 255.0) as u8,
+                        (area.color.b * 255.0).clamp(0.0, 255.0) as u8,
+                        (area.color.a * 255.0).clamp(0.0, 255.0) as u8,
+                    ),
+                    custom_glyphs: &[],
+                }
             })
             .collect();
 
@@ -205,6 +217,7 @@ mod tests {
             font_size: fs,
             line_height: lh,
             color: Color::rgb(1.0, 1.0, 1.0),
+            clip_rect: None,
         }
     }
 

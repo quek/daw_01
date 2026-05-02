@@ -6,11 +6,18 @@
 pub mod automation;
 pub mod button;
 pub mod checkbox;
+pub mod dropdown;
 pub mod fader;
 pub mod heavy;
 pub mod knob;
 pub mod label;
+pub mod level_meter;
+pub mod menu;
+pub mod scroll_area;
+pub mod split_view;
+pub mod tab_view;
 pub mod text_input;
+pub mod time_grid;
 pub mod waveform;
 
 use std::any::Any;
