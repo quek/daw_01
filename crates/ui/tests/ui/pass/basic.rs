@@ -4,7 +4,9 @@
 //! ここでビルド失敗するなら、API シグネチャに余計な制約 (例: `M: Clone`) が
 //! 紛れ込んでいるか、`Application::Message: Clone` のような型境界が露出している。
 
-use daw_ui_core::{Edit, PointerFrame, UiHost};
+use daw_ui_core::{
+    Edit, Note, NoteId, NotesEditRequest, PianoRollStyle, PianoRollView, PointerFrame, UiHost,
+};
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{Rect, Scene};
 
@@ -18,6 +20,9 @@ struct Model {
     volume: f32,
     mute: bool,
     title: String,
+    // M9 Phase 41e: piano_roll widget 用 (non-Clone Model でも piano_roll が呼べることを担保)
+    notes: Vec<Note>,
+    selected_note_ids: Vec<NoteId>,
 }
 
 fn main() {
@@ -30,6 +35,8 @@ fn main() {
         volume: 0.5,
         mute: false,
         title: String::from("untitled"),
+        notes: Vec::new(),
+        selected_note_ids: Vec::new(),
     };
 
     let edits = host.frame_to_edits(
@@ -100,6 +107,31 @@ fn main() {
             let _ = ui.text_input("title2", &m.title, |new| {
                 Edit::mutate(move |m: &mut Model| m.title = new)
             });
+            // M9 Phase 41e: piano_roll widget が non-Clone Model でコンパイルする。
+            let view = PianoRollView {
+                start_beat: 0.0,
+                len_beats: 4.0,
+                pitch_top: 72.0,
+                pitch_visible: 24.0,
+                keyboard_w: 60.0,
+                notes_generation: 0,
+            };
+            let style = PianoRollStyle::default();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &m.notes,
+                view,
+                &m.selected_note_ids,
+                &style,
+                |req| match req {
+                    NotesEditRequest::Add(_) => Edit::mutate(|_m: &mut Model| {}),
+                    NotesEditRequest::Delete(_) => Edit::mutate(|_m: &mut Model| {}),
+                    NotesEditRequest::Move(_) => Edit::mutate(|_m: &mut Model| {}),
+                    NotesEditRequest::Resize(_) => Edit::mutate(|_m: &mut Model| {}),
+                    NotesEditRequest::Select { .. } => Edit::mutate(|_m: &mut Model| {}),
+                },
+            );
         },
     );
 

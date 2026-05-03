@@ -1,109 +1,53 @@
-//! examples/piano_roll — M5 Phase 14 動作確認サンプル。
+//! examples/piano_roll — M9 Phase 41e: library widget `Ui::piano_roll` の実用例。
 //!
-//! Phase 13 で導入した `Ui::heavy` + `HeavyCtx::cached(viewport_key, ...)` を
-//! 100,000 ノートのピアノロールで実用検証する (heavy() 実用第 1 弾)。
-//!
-//! 確認項目:
-//! - 100k notes の visible filtering (二分探索) が走り、画面に矩形が出る
-//! - cached(viewport_key) によって viewport 停止フレームでは draw_fn がスキップされ、
-//!   描画コマンドが前フレームから再利用される (HUD `cache HIT` で目視)
-//! - drag (XY 同時 pan) / wheel zoom / click hit-test が機能する
-//! - 停止フレームで HUD `frame_ms` が 8ms 以下 (= 120fps 予算)
+//! 100k notes を `crates/ui/src/widgets/piano_roll.rs` の library widget で描画する。
+//! example は HUD / view state pan + wheel zoom / window 起動 / Edit factory dispatch のみ
+//! を担い、描画 + drag state machine + hit-test + Alt+drag + shortcut は widget に閉じ込める。
 //!
 //! 操作:
-//! - 左ドラッグ: 主領域 (鍵盤右側) で XY 同時 pan
-//! - マウスホイール: cur_mouse 位置を anchor に zoom
-//! - 短い click (drag 累積 < 16px): note 選択 → 選択 overlay 表示
+//! - 無修飾 drag = pan (空白 or note なし上で press → drag)
+//! - 無修飾 wheel = X zoom (cur_mouse 位置 anchor)
+//! - Ctrl+wheel = Y zoom (pitch 範囲を変える)
+//! - note 中央 drag = move (release で Undoable)
+//! - note 左右端 drag = resize (release で Undoable)
+//! - note click (drag<16px) = selection 1 個
+//! - 空白 click = selection clear
+//! - Alt+drag = rect multi-select
+//! - Insert = pointer 位置に新規 note 追加 (next_note_id を bump)
+//! - Delete = selected を一括削除
+//! - Ctrl+Z / Ctrl+Shift+Z = undo / redo (M8 history stack)
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
 use daw_ui_core::{
-    CursorIcon, Edit, InputAccumulator, UiHost, WidgetId, hash_inputs,
+    Edit, InputAccumulator, MoveDelta, Note, NoteId, NotesEditRequest, PianoRollResponse,
+    PianoRollStyle, PianoRollView, ResizeDelta, UiHost, hash_inputs,
 };
 use daw_ui_platform::{
     AppEvent, AppHost, PhysicalSize, ScrollDelta, WindowBackend, winit_backend,
 };
-use daw_ui_renderer::{Color, Rect, RectCommand, Renderer, Scene};
+use daw_ui_renderer::{Color, Rect, Renderer, Scene};
 use winit::window::WindowAttributes;
-
-// ----- レイアウト定数 -----
 
 const KEYBOARD_W: f32 = 60.0;
 const HEADER_H: f32 = 56.0;
 const FOOTER_H: f32 = 56.0;
-
-// 1 拍の表示幅 (px) と pitch row 高さは area.w / view_len_beats、area.h / pitch_visible で動的計算する。
-
-// ----- Note データ -----
-
-type NoteId = u32;
-
-/// 内部値型 (Model 型ではないので Copy/Clone OK)。
-/// M9 Phase 41a: `id: NoteId` を追加。multi-select / move / resize / undo の
-/// identity 安定のため不変 (生成時に割り当て、編集中も保持)。
-#[derive(Clone, Copy, Debug)]
-struct Note {
-    id: NoteId,
-    start_beat: f32,
-    len_beats: f32,
-    pitch: u8,    // MIDI 0..127 (生成側で 36..96 に絞る)
-    velocity: u8, // 0..127 (色濃度に使う)
-}
-
-/// 100k 個を決定論的 LCG で生成。`start_beat` 昇順にソート。`id` は 0..count を割り当て。
-fn generate_notes(count: usize) -> Vec<Note> {
-    // 線形合同法 (LCG) + splitmix64 finalizer。LCG 単体の下位 bit は周期が短く
-    // (`% 60` のような小さな modulo で「4 半音間隔」のような周期パターンが出る)、
-    // splitmix64 finalizer で全 bit を mix してから modulo を取ることで均一分散を得る。
-    let mut state: u64 = 0x12345678_9ABCDEF0;
-    let mut next = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-        z ^ (z >> 31)
-    };
-
-    let total_beats: f32 = 1024.0;        // 64 小節 (4/4)
-    let pitch_lo: u8 = 36;                // C2
-    let pitch_hi: u8 = 96;                // C7
-    let mut notes: Vec<Note> = Vec::with_capacity(count);
-    for i in 0..count {
-        let r1 = next();
-        let r2 = next();
-        let r3 = next();
-        let r4 = next();
-        let start_beat = (r1 as f32 / u64::MAX as f32) * total_beats;
-        // 長さは 0.125〜2.0 拍 (8 分音符〜2 分音符)
-        let len_beats = 0.125 + (r2 as f32 / u64::MAX as f32) * 1.875;
-        let pitch = pitch_lo + ((r3 % u64::from(pitch_hi - pitch_lo)) as u8);
-        let velocity = 32 + ((r4 % 96) as u8);
-        notes.push(Note { id: i as NoteId, start_beat, len_beats, pitch, velocity });
-    }
-    notes.sort_by(|a, b| a.start_beat.partial_cmp(&b.start_beat).unwrap_or(std::cmp::Ordering::Equal));
-    notes
-}
 
 // ----- Model -----
 
 /// no-Clone 不変条件: `Clone` / `PartialEq` / `Hash` / `Default` は実装しない。
 struct PianoRollModel {
     notes: Vec<Note>,
-    /// notes / id を編集するたびに bump する hook (`viewport_key` の cache busting)。
     notes_generation: u64,
-    /// 次に新規 note へ割り当てる id (M9 Phase 41a)。
     next_note_id: NoteId,
-    /// 選択中 note の id 集合 (M9 Phase 41a; 41c で multi-select 拡張)。
-    /// Note 自身に selected を持たせず、Model 側で single source of truth として管理。
     selected_note_ids: Vec<NoteId>,
 
     view_start_beat: f32,
-    view_len_beats: f32,   // zoom 倍率の逆数
-
-    pitch_top: f32,        // 表示 top の MIDI ピッチ (浮動小数で smooth scroll)
-    pitch_visible: f32,    // 表示する pitch 範囲 (例 36 = 3 オクターブ)
+    view_len_beats: f32,
+    pitch_top: f32,
+    pitch_visible: f32,
 
     last_frame_ms: f32,
     last_action: String,
@@ -118,19 +62,63 @@ impl PianoRollModel {
             next_note_id,
             selected_note_ids: Vec::new(),
             view_start_beat: 0.0,
-            view_len_beats: 4.0,     // 1 小節 = 個々の note 矩形が判別可能なズーム
-            pitch_top: 72.0,         // C5
-            pitch_visible: 24.0,     // 2 オクターブ (1 row = 高めで note が見える)
+            view_len_beats: 4.0,
+            pitch_top: 72.0,
+            pitch_visible: 24.0,
             last_frame_ms: 0.0,
-            last_action: "起動 (Drag = pan / Wheel = zoom / Click = select / Insert = add / Delete = del)".to_string(),
+            last_action: "起動 (Drag = pan / Wheel = zoom / Click = select / Insert / Delete)"
+                .to_string(),
+        }
+    }
+
+    /// PianoRollView (library widget に渡す値型) に変換。
+    fn view(&self) -> PianoRollView {
+        PianoRollView {
+            start_beat: self.view_start_beat,
+            len_beats: self.view_len_beats,
+            pitch_top: self.pitch_top,
+            pitch_visible: self.pitch_visible,
+            keyboard_w: KEYBOARD_W,
+            notes_generation: self.notes_generation,
         }
     }
 }
 
-// ----- Edit factory (M9 Phase 41a/b/c; multi 対応 helper、Phase 41d で snapshot_inverse 経由に統一) -----
+/// 100k 個を決定論的 LCG で生成。`start_beat` 昇順にソート。
+fn generate_notes(count: usize) -> Vec<Note> {
+    let mut state: u64 = 0x12345678_9ABCDEF0;
+    let mut next = || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    };
 
-/// 1 個 or 複数の note を一括 add する Undoable Edit。single note は `vec![note]` で呼ぶ。
-/// inverse は id で remove する。
+    let total_beats: f32 = 1024.0;
+    let pitch_lo: u8 = 36;
+    let pitch_hi: u8 = 96;
+    let mut notes: Vec<Note> = Vec::with_capacity(count);
+    for i in 0..count {
+        let r1 = next();
+        let r2 = next();
+        let r3 = next();
+        let r4 = next();
+        let start_beat = (r1 as f32 / u64::MAX as f32) * total_beats;
+        let len_beats = 0.125 + (r2 as f32 / u64::MAX as f32) * 1.875;
+        let pitch = pitch_lo + ((r3 % u64::from(pitch_hi - pitch_lo)) as u8);
+        let velocity = 32 + ((r4 % 96) as u8);
+        notes.push(Note { id: i as NoteId, start_beat, len_beats, pitch, velocity });
+    }
+    notes.sort_by(|a, b| a.start_beat.partial_cmp(&b.start_beat).unwrap_or(std::cmp::Ordering::Equal));
+    notes
+}
+
+// ----- Edit factory (M9 Phase 41a-d で snapshot_inverse 化済) -----
+
+/// 1 個 or 複数の note を一括 add する Undoable Edit。
+/// forward 内で `next_note_id` を `id+1` に bump (= Insert で id 重複しないよう自動増加)。
+/// inverse では bump しない (id は再利用しないので、undo 後に Insert すると新しい id が振られる)。
 fn make_add_notes_edit(notes: Vec<Note>) -> Edit<PianoRollModel> {
     let label = if notes.len() == 1 { "add note" } else { "add notes" };
     Edit::snapshot_inverse(
@@ -139,6 +127,7 @@ fn make_add_notes_edit(notes: Vec<Note>) -> Edit<PianoRollModel> {
         |m: &mut PianoRollModel, snap: &Vec<Note>| {
             for note in snap {
                 m.notes.push(*note);
+                m.next_note_id = m.next_note_id.max(note.id + 1);
             }
             m.notes.sort_by(|a, b| {
                 a.start_beat.partial_cmp(&b.start_beat).unwrap_or(std::cmp::Ordering::Equal)
@@ -154,15 +143,6 @@ fn make_add_notes_edit(notes: Vec<Note>) -> Edit<PianoRollModel> {
     )
 }
 
-/// move helper の delta タプル: (id, prev_start_beat, prev_pitch, next_start_beat, next_pitch)。
-type MoveDelta = (NoteId, f32, u8, f32, u8);
-/// resize helper の delta タプル: (id, prev_start_beat, prev_len_beats, next_start_beat, next_len_beats)。
-/// ResizeRight (右端 drag) は prev_start == next_start、ResizeLeft (左端 drag) は両方変わる。
-/// 1 Edit で start + len 両方を巻き戻すため start も capture する。
-type ResizeDelta = (NoteId, f32, f32, f32, f32);
-
-/// 1 個 or 複数の note を一括 move する Undoable Edit (M9 Phase 41b、Phase 41d で snapshot_inverse 化)。
-/// move 後に start_beat 順で sort し直す (visible filtering の二分探索が安定するように)。
 fn make_move_notes_edit(deltas: Vec<MoveDelta>) -> Edit<PianoRollModel> {
     let label = if deltas.len() == 1 { "move note" } else { "move notes" };
     Edit::snapshot_inverse(
@@ -195,8 +175,6 @@ fn make_move_notes_edit(deltas: Vec<MoveDelta>) -> Edit<PianoRollModel> {
     )
 }
 
-/// 1 個 or 複数の note を一括 resize する Undoable Edit (M9 Phase 41b/41c、Phase 41d で
-/// snapshot_inverse 化)。ResizeLeft (左端 drag) は start + len 両方変わるので 1 Edit で巻き戻す。
 fn make_resize_notes_edit(deltas: Vec<ResizeDelta>) -> Edit<PianoRollModel> {
     let label = if deltas.len() == 1 { "resize note" } else { "resize notes" };
     Edit::snapshot_inverse(
@@ -229,8 +207,6 @@ fn make_resize_notes_edit(deltas: Vec<ResizeDelta>) -> Edit<PianoRollModel> {
     )
 }
 
-/// selected_note_ids を一括置換する Undoable Edit (M9 Phase 41c rect multi-select 用、
-/// Phase 41d で snapshot_inverse 化)。`(prev, next)` を tuple で snapshot 共有。
 fn make_select_notes_edit(prev: Vec<NoteId>, next: Vec<NoteId>) -> Edit<PianoRollModel> {
     Edit::snapshot_inverse(
         "select notes",
@@ -244,105 +220,6 @@ fn make_select_notes_edit(prev: Vec<NoteId>, next: Vec<NoteId>) -> Edit<PianoRol
     )
 }
 
-// ----- M9 Phase 41c: note drag state machine + hit-test -----
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NoteDragKind {
-    Move,
-    ResizeLeft,
-    ResizeRight,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct NoteDragAnchor {
-    id: NoteId,
-    start_beat: f32,
-    pitch: u8,
-    len_beats: f32,
-}
-
-#[derive(Clone, Debug)]
-struct NoteDragState {
-    kind: NoteDragKind,
-    /// drag 開始時のマウス位置 (grid 局所ではなく screen)。
-    anchor_mouse: (f32, f32),
-    /// drag 開始時の各対象 note の値スナップショット。
-    anchors: Vec<NoteDragAnchor>,
-}
-
-/// note hit-test (visible filtering 後)。grid 内の cursor 位置で hit する note の id と
-/// hit zone (Move / ResizeLeft / ResizeRight) を返す。後勝ち (描画順で前面)。
-fn note_hit(
-    model: &PianoRollModel,
-    grid: Rect,
-    cx: f32,
-    cy: f32,
-) -> Option<(NoteId, NoteDragKind)> {
-    if !grid.contains(cx, cy) {
-        return None;
-    }
-    let view_start = model.view_start_beat;
-    let view_end = view_start + model.view_len_beats;
-    let s_idx = model.notes.partition_point(|n| n.start_beat + n.len_beats < view_start);
-    let e_idx = s_idx + model.notes[s_idx..].partition_point(|n| n.start_beat <= view_end);
-    let visible = &model.notes[s_idx..e_idx];
-
-    let mut hit: Option<(NoteId, NoteDragKind)> = None;
-    for note in visible {
-        let r = note_to_rect(*note, model, grid);
-        if !r.contains(cx, cy) {
-            continue;
-        }
-        let edge = 4.0;
-        let kind = if r.w > edge * 2.0 && cx - r.x < edge {
-            NoteDragKind::ResizeLeft
-        } else if r.w > edge * 2.0 && (r.x + r.w) - cx < edge {
-            NoteDragKind::ResizeRight
-        } else {
-            NoteDragKind::Move
-        };
-        hit = Some((note.id, kind));
-    }
-    hit
-}
-
-/// 2 つの矩形が交差するか (M9 Phase 41c rect select で使う)。
-fn rects_intersect(a: Rect, b: Rect) -> bool {
-    a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
-}
-
-/// hover 中の note hit zone から cursor 形状を決める (M9 Phase 41b)。
-/// 左右 4px = resize handle (`EwResize`)、中央 = `Move`。grid 外や note 上以外は None。
-fn note_hover_cursor(
-    visible: &[Note],
-    m: &PianoRollModel,
-    grid: Rect,
-    cx: f32,
-    cy: f32,
-) -> Option<CursorIcon> {
-    if !grid.contains(cx, cy) {
-        return None;
-    }
-    let mut hit_cursor: Option<CursorIcon> = None;
-    for note in visible {
-        let r = note_to_rect(*note, m, grid);
-        if !r.contains(cx, cy) {
-            continue;
-        }
-        let edge = 4.0;
-        // resize handle は note 幅が 2*edge より大きいときだけ反応 (狭い note では Move 優先)
-        let cursor = if r.w > edge * 2.0 && (cx - r.x < edge || (r.x + r.w) - cx < edge) {
-            CursorIcon::EwResize
-        } else {
-            CursorIcon::Move
-        };
-        hit_cursor = Some(cursor); // 後勝ち
-    }
-    hit_cursor
-}
-
-/// 1 個 or 複数の note を一括 delete する Undoable Edit。inverse は note 自体を push し直す
-/// (id ごと復元するので selected も再選択可)。
 fn make_delete_notes_edit(notes: Vec<Note>) -> Edit<PianoRollModel> {
     let label = if notes.len() == 1 { "delete note" } else { "delete notes" };
     Edit::snapshot_inverse(
@@ -366,59 +243,25 @@ fn make_delete_notes_edit(notes: Vec<Note>) -> Edit<PianoRollModel> {
     )
 }
 
-// ----- レイアウト helper -----
+// ----- レイアウト -----
 
-fn grid_rect(screen: PhysicalSize) -> Rect {
-    Rect {
-        x: KEYBOARD_W,
-        y: HEADER_H,
-        w: (screen.width as f32 - KEYBOARD_W).max(1.0),
-        h: (screen.height as f32 - HEADER_H - FOOTER_H).max(1.0),
-    }
-}
-
-fn keyboard_rect(screen: PhysicalSize) -> Rect {
+fn rect_for_widget(screen: PhysicalSize) -> Rect {
     Rect {
         x: 0.0,
         y: HEADER_H,
-        w: KEYBOARD_W,
+        w: (screen.width as f32).max(1.0),
         h: (screen.height as f32 - HEADER_H - FOOTER_H).max(1.0),
     }
 }
 
-/// 1 つの note の screen 座標 rect を返す。grid 外に出る部分はクリップ済み座標。
-#[allow(clippy::many_single_char_names)]
-fn note_to_rect(note: Note, m: &PianoRollModel, grid: Rect) -> Rect {
-    let beat_to_px = grid.w / m.view_len_beats;
-    let pitch_to_px = grid.h / m.pitch_visible;
-    let x = grid.x + (note.start_beat - m.view_start_beat) * beat_to_px;
-    let w = (note.len_beats * beat_to_px).max(1.5);
-    // pitch_top が画面 top (= grid.y) に対応、pitch が下がると y が増える。
-    let y = grid.y + (m.pitch_top - f32::from(note.pitch)) * pitch_to_px;
-    let h = (pitch_to_px - 1.0).max(2.0);
-    Rect { x, y, w, h }
-}
-
-fn pitch_color(velocity: u8) -> Color {
-    // velocity → 青系の濃淡 (0.5..0.95)
-    let t = f32::from(velocity) / 127.0;
-    Color::rgba(0.35 + t * 0.35, 0.55 + t * 0.30, 0.85 + t * 0.10, 1.0)
-}
-
-fn note_rect_command(rect: Rect, fill: Color) -> RectCommand {
-    RectCommand {
-        rect,
-        fill,
-        border: Color::TRANSPARENT,
-        border_width: 0.0,
-        radius: [1.5; 4],
-        clip_rect: None,
+fn grid_rect_for_user_input(screen: PhysicalSize) -> Rect {
+    let r = rect_for_widget(screen);
+    Rect {
+        x: r.x + KEYBOARD_W,
+        y: r.y,
+        w: (r.w - KEYBOARD_W).max(1.0),
+        h: r.h,
     }
-}
-
-// 黒鍵判定 (C# / D# / F# / G# / A#)
-fn is_black_key(pitch: u8) -> bool {
-    matches!(pitch % 12, 1 | 3 | 6 | 8 | 10)
 }
 
 // ----- App -----
@@ -431,23 +274,14 @@ struct App {
     scene: Scene,
     input: InputAccumulator,
 
-    /// pan drag 状態: (anchor_mouse_x, anchor_mouse_y, anchor_view_start_beat, anchor_pitch_top, accum_dx_abs, accum_dy_abs)
-    drag_anchor: Option<(f32, f32, f32, f32, f32, f32)>,
-    /// M9 Phase 41c: note drag 状態 (move / resize / 複数 select 一括)。
-    note_drag: Option<NoteDragState>,
-    /// M9 Phase 41c: drag release で build_ui に渡す anchor 群 (Undoable Edit 発行用)。
-    pending_drag_release: Option<NoteDragState>,
-    /// マウス位置 (zoom anchor / hit-test 用)
+    /// pan drag 状態 (note_drag は library widget が握るので、ここは pan 専用)。
+    /// (anchor_x, anchor_y, anchor_view_start_beat, anchor_pitch_top)
+    pan_anchor: Option<(f32, f32, f32, f32)>,
     cur_mouse: Option<(f32, f32)>,
-    /// wheel 累積 (on_render で適用)
     pending_zoom_dy: f32,
-    /// drag 短距離 release で立つ click 位置 (on_render の build_ui 内で消費)
-    pending_click: Option<(f32, f32)>,
 
-    /// HUD HIT/MISS 推定用に前フレームの viewport_hash を保持
+    /// HUD HIT/MISS 推定用
     last_viewport_hash: Option<u64>,
-    /// HUD 表示用に前フレームの visible 件数を保持
-    last_visible_count: u32,
 
     last_frame_start: Option<Instant>,
 }
@@ -455,10 +289,9 @@ struct App {
 impl App {
     fn new(window: Arc<winit_backend::WinitWindow>, n_notes: usize) -> Self {
         let renderer = Renderer::new(window.clone()).expect("Renderer::new");
-        window.set_title("daw-ui piano_roll (M5 Phase 14)");
+        window.set_title("daw-ui piano_roll (M9 Phase 41e — library widget)");
         let notes = generate_notes(n_notes);
         let mut ui = UiHost::with_window(window.clone());
-        // M9 Phase 41a: Insert で cursor 位置に note add (default bindings には含まれていない)
         ui.shortcut_map_mut().bind("add_note", "Insert");
         Self {
             ui,
@@ -468,162 +301,72 @@ impl App {
             model: PianoRollModel::new(notes),
             scene: Scene::new(),
             input: InputAccumulator::new(),
-            drag_anchor: None,
-            note_drag: None,
-            pending_drag_release: None,
+            pan_anchor: None,
             cur_mouse: None,
             pending_zoom_dy: 0.0,
-            pending_click: None,
             last_viewport_hash: None,
-            last_visible_count: 0,
             last_frame_start: None,
         }
     }
 
-    /// drag/wheel/click を on_render の頭で Model に反映。
-    /// M9 Phase 41c: note hit があれば note_drag mode、Alt 押下なら rect select (heavy 内 take_drag_rect_in_rect で処理)、
-    /// それ以外は既存の pan。
-    #[allow(clippy::too_many_lines)]
-    fn apply_pending_input(&mut self, screen: PhysicalSize) {
-        let grid = grid_rect(screen);
-        let pointer = self.input.take_frame(); // pointer のみ peek、keyboard/ime は build_ui で取り直す
+    /// pan / wheel zoom を反映 (library widget は pan を扱わないので user 側で)。
+    /// pointer は frame 用に取り出した snapshot を渡す (frame と pan で共有)。
+    fn apply_pan_and_zoom(
+        &mut self,
+        pointer: daw_ui_core::PointerFrame,
+        screen: PhysicalSize,
+    ) {
+        let grid = grid_rect_for_user_input(screen);
 
-        // --- press: 振り分け (alt = rect select / note hit = note drag / 空白 = pan) ---
+        // pan は note 上以外で press → drag。Alt 修飾は widget の rect select に譲る。
         if pointer.primary_just_pressed
+            && !pointer.modifiers.alt
             && let Some((px, py)) = pointer.pos
             && grid.contains(px, py)
         {
-            if pointer.modifiers.alt {
-                // rect select は heavy 内 take_drag_rect_in_rect が drag state を持つため、
-                // ここで pan / note_drag に入らない (= 何もしない)。
-                self.pending_click = None;
-            } else if let Some((hit_id, kind)) = note_hit(&self.model, grid, px, py) {
-                // note drag start
-                let drag_ids: Vec<NoteId> = if self.model.selected_note_ids.contains(&hit_id) {
-                    self.model.selected_note_ids.clone()
-                } else {
-                    vec![hit_id]
-                };
-                let anchors: Vec<NoteDragAnchor> = drag_ids
-                    .iter()
-                    .filter_map(|id| {
-                        self.model.notes.iter().find(|n| n.id == *id).map(|n| NoteDragAnchor {
-                            id: n.id,
-                            start_beat: n.start_beat,
-                            pitch: n.pitch,
-                            len_beats: n.len_beats,
-                        })
-                    })
-                    .collect();
-                if !anchors.is_empty() {
-                    self.note_drag = Some(NoteDragState {
-                        kind,
-                        anchor_mouse: (px, py),
-                        anchors,
-                    });
-                    self.pending_click = None;
-                }
-            } else {
-                // pan
-                self.drag_anchor = Some((
-                    px, py,
+            // note 上で press したか? note_hit を library 関数で問い合わせ。
+            // hit があれば widget が drag を握るので、user は pan しない。
+            let hit = daw_ui_core::note_hit(
+                &self.model.notes,
+                self.model.view(),
+                grid,
+                px,
+                py,
+                4.0,
+            );
+            if hit.is_none() {
+                self.pan_anchor = Some((
+                    px,
+                    py,
                     self.model.view_start_beat,
                     self.model.pitch_top,
-                    0.0, 0.0,
                 ));
-                self.pending_click = None;
             }
         }
 
-        // --- continue: note drag が active なら note 値更新、drag_anchor なら pan ---
-        if let (Some(nd), Some((px, py))) = (self.note_drag.clone(), pointer.pos) {
-            let dx = px - nd.anchor_mouse.0;
-            let dy = py - nd.anchor_mouse.1;
-            let beat_per_px = self.model.view_len_beats / grid.w;
-            let pitch_per_px = self.model.pitch_visible / grid.h;
-            let beat_delta = dx * beat_per_px;
-            let pitch_delta = (-(dy * pitch_per_px)).round() as i32;
-            match nd.kind {
-                NoteDragKind::Move => {
-                    for a in &nd.anchors {
-                        let new_start = (a.start_beat + beat_delta).max(0.0);
-                        let new_pitch =
-                            (i32::from(a.pitch) + pitch_delta).clamp(0, 127) as u8;
-                        if let Some(n) = self.model.notes.iter_mut().find(|x| x.id == a.id) {
-                            n.start_beat = new_start;
-                            n.pitch = new_pitch;
-                        }
-                    }
-                    self.model.notes.sort_by(|a, b| {
-                        a.start_beat.partial_cmp(&b.start_beat).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                }
-                NoteDragKind::ResizeRight => {
-                    for a in &nd.anchors {
-                        let new_len = (a.len_beats + beat_delta).max(0.05);
-                        if let Some(n) = self.model.notes.iter_mut().find(|x| x.id == a.id) {
-                            n.len_beats = new_len;
-                        }
-                    }
-                }
-                NoteDragKind::ResizeLeft => {
-                    for a in &nd.anchors {
-                        let max_start = a.start_beat + a.len_beats - 0.05;
-                        let new_start = (a.start_beat + beat_delta).clamp(0.0, max_start);
-                        let actual_delta = new_start - a.start_beat;
-                        let new_len = (a.len_beats - actual_delta).max(0.05);
-                        if let Some(n) = self.model.notes.iter_mut().find(|x| x.id == a.id) {
-                            n.start_beat = new_start;
-                            n.len_beats = new_len;
-                        }
-                    }
-                    self.model.notes.sort_by(|a, b| {
-                        a.start_beat.partial_cmp(&b.start_beat).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                }
-            }
-            self.model.notes_generation += 1;
-        } else if let (Some((ax, ay, ave_start, ave_pitch_top, _, _)), Some((px, py))) =
-            (self.drag_anchor, pointer.pos)
+        // pan continue
+        if let (Some((ax, ay, ave_start, ave_pitch_top)), Some((px, py))) =
+            (self.pan_anchor, pointer.pos)
         {
             let dx = px - ax;
             let dy = py - ay;
-            let beat_per_px = self.model.view_len_beats / grid.w;
-            let pitch_per_px = self.model.pitch_visible / grid.h;
-            let new_start = (ave_start - dx * beat_per_px).max(0.0);
-            let new_pitch_top = (ave_pitch_top + dy * pitch_per_px)
+            let beat_per_px = self.model.view_len_beats / grid.w.max(1.0);
+            let pitch_per_px = self.model.pitch_visible / grid.h.max(1.0);
+            self.model.view_start_beat = (ave_start - dx * beat_per_px).max(0.0);
+            self.model.pitch_top = (ave_pitch_top + dy * pitch_per_px)
                 .min(127.0)
                 .max(self.model.pitch_visible - 1.0);
-            self.model.view_start_beat = new_start;
-            self.model.pitch_top = new_pitch_top;
-            if let Some(anchor) = self.drag_anchor.as_mut() {
-                anchor.4 = dx.abs();
-                anchor.5 = dy.abs();
-            }
         }
 
-        // --- release ---
+        // pan release
         if pointer.primary_just_released {
-            if let Some(nd) = self.note_drag.take() {
-                // anchor を build_ui に渡して Undoable Edit 発行
-                self.pending_drag_release = Some(nd);
-                self.pending_click = None;
-            } else if let Some((_, _, _, _, accum_dx, accum_dy)) = self.drag_anchor.take() {
-                if accum_dx + accum_dy < 16.0
-                    && let Some(pos) = pointer.pos
-                {
-                    self.pending_click = Some(pos);
-                }
-            } else if let Some(pos) = pointer.pos {
-                self.pending_click = Some(pos);
-            }
+            self.pan_anchor = None;
         }
 
-        // --- wheel zoom (無修飾 = X zoom、Ctrl+wheel = Y zoom) ---
+        // wheel zoom (無修飾 = X zoom、Ctrl+wheel = Y zoom)
         if self.pending_zoom_dy.abs() > 0.0 {
             let factor = (-self.pending_zoom_dy * 0.15).exp();
             if pointer.modifiers.ctrl {
-                // Y zoom: pitch_visible を変更、anchor は cur_mouse.y の grid 内比率
                 let anchor_frac = if let Some((_, my)) = self.cur_mouse {
                     ((my - grid.y) / grid.h).clamp(0.0, 1.0)
                 } else {
@@ -636,7 +379,6 @@ impl App {
                 self.model.pitch_top = new_top.clamp(new_visible - 1.0, 127.0);
                 self.model.pitch_visible = new_visible;
             } else {
-                // X zoom: view_len_beats を変更、anchor は cur_mouse.x の grid 内比率
                 let anchor_frac = if let Some((mx, _)) = self.cur_mouse {
                     ((mx - grid.x) / grid.w).clamp(0.0, 1.0)
                 } else {
@@ -654,26 +396,23 @@ impl App {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn build_ui(&mut self) {
+    fn build_ui(&mut self, input: daw_ui_core::FrameInput) {
         self.scene.clear();
         let screen = self.renderer.size();
-        let grid = grid_rect(screen);
-        let kbd = keyboard_rect(screen);
-        let input = self.input.take_input();
+        let widget_rect = rect_for_widget(screen);
 
-        // viewport_key を build_ui の冒頭で計算 (HUD 用 hash + cached() 用 key 両方で同じ tuple を使う)
+        // viewport_key (HUD HIT/MISS 推定用)
         let viewport_key = (
-            b"piano_roll_v1" as &[u8],
+            b"piano_roll_v2" as &[u8],
             self.model.view_start_beat.to_bits(),
             self.model.view_len_beats.to_bits(),
             self.model.pitch_top.to_bits(),
             self.model.pitch_visible.to_bits(),
-            grid.w.to_bits(),
-            grid.h.to_bits(),
+            widget_rect.w.to_bits(),
+            widget_rect.h.to_bits(),
             self.model.notes_generation,
         );
         let viewport_hash = hash_inputs(viewport_key);
-        // HUD HIT/MISS 推定: 前フレームと同じ hash → cached が hit したはず (approximation)
         let cache_status = if Some(viewport_hash) == self.last_viewport_hash {
             "HIT "
         } else {
@@ -681,28 +420,30 @@ impl App {
         };
         self.last_viewport_hash = Some(viewport_hash);
 
-        // visible 件数を build_ui の前に算出 (HUD 表示用、heavy 内/外で再利用)
+        // visible 件数 (HUD 用)
         let view_end_beat = self.model.view_start_beat + self.model.view_len_beats;
         let view_start_beat = self.model.view_start_beat;
-        let start_idx = self.model.notes.partition_point(|n| n.start_beat + n.len_beats < view_start_beat);
-        let end_idx = start_idx
-            + self.model.notes[start_idx..].partition_point(|n| n.start_beat <= view_end_beat);
-        self.last_visible_count = (end_idx - start_idx) as u32;
+        let s_idx = self
+            .model
+            .notes
+            .partition_point(|n| n.start_beat + n.len_beats < view_start_beat);
+        let e_idx = s_idx
+            + self.model.notes[s_idx..]
+                .partition_point(|n| n.start_beat <= view_end_beat);
+        let visible_count = (e_idx - s_idx) as u32;
+        let total_notes = self.model.notes.len();
 
         let hud_text = format!(
-            "frame {:>5.2}ms │ visible {:>5} / {} notes │ cache {} │ view [{:.2}..{:.2}) beats │ pitch top={:.1}",
+            "frame {:>5.2}ms │ visible {:>5} / {} notes │ cache {} │ view [{:.2}..{:.2}) beats │ pitch top={:.1} │ sel {}",
             self.model.last_frame_ms,
-            self.last_visible_count,
-            self.model.notes.len(),
+            visible_count,
+            total_notes,
             cache_status,
             self.model.view_start_beat,
             view_end_beat,
             self.model.pitch_top,
+            self.model.selected_note_ids.len(),
         );
-
-        // pending_click / pending_drag_release を消費するため take する
-        let click_pos = self.pending_click.take();
-        let drag_release = self.pending_drag_release.take();
 
         self.ui.frame(
             &mut self.model,
@@ -710,8 +451,7 @@ impl App {
             screen,
             input,
             |m, ui| {
-                // M8 Phase 30: shortcut undo/redo (note 編集自体は M10 で本実装、ここは
-                // shortcut layer が動くことを示す demo のみ)。
+                // shortcut undo / redo
                 if ui.take_shortcut("undo") {
                     ui.request_undo();
                 }
@@ -719,10 +459,10 @@ impl App {
                     ui.request_redo();
                 }
 
-                // === HUD (heavy() の外、毎フレーム値が変わるため) ===
+                // Header HUD
                 ui.label_at(
                     "title",
-                    "daw-ui piano_roll — heavy() 実用第 1 弾 (M5 Phase 14)",
+                    "daw-ui piano_roll — M9 Phase 41e (library widget)",
                     16.0, 16.0, 16.0,
                     Color::rgb(0.92, 0.95, 0.98),
                 );
@@ -737,324 +477,57 @@ impl App {
                     },
                 );
 
-                // === heavy() ブロック: ピアノロール本体 ===
-                ui.heavy("piano_roll", |hctx| {
-                    // visible 範囲は build_ui で算出済の (start_idx, end_idx) を再計算する形で
-                    // closure に閉じ込める (slice の borrow を heavy 内に局所化)。
-                    let s_idx = m.notes.partition_point(|n| n.start_beat + n.len_beats < view_start_beat);
-                    let e_idx = s_idx
-                        + m.notes[s_idx..].partition_point(|n| n.start_beat <= view_end_beat);
-                    let visible: &[Note] = &m.notes[s_idx..e_idx];
+                // ===== Library widget 呼び出し =====
+                let view = m.view();
+                let style = PianoRollStyle::default();
+                // next_note_id を Add Edit closure に capture する (id=0 placeholder の上書き)。
+                // make_add_notes_edit の forward 内で `next_note_id` も bump されるため、
+                // capture 値は「現フレーム時点の最新値」。redo は forward 再実行で重複 id にならない。
+                let next_id_for_add = m.next_note_id;
 
-                    // --- cached(): viewport_key 一致時に skip される背景レイヤ ---
-                    hctx.cached(viewport_key, |hctx| {
-                        // (a) 主領域背景
-                        hctx.push_rect(RectCommand {
-                            rect: grid,
-                            fill: Color::rgb(0.12, 0.13, 0.16),
-                            border: Color::TRANSPARENT,
-                            border_width: 0.0,
-                            radius: [0.0; 4],
-                            clip_rect: None,
-                        });
-                        // (b) 黒鍵 row 帯 (薄い網)
-                        let pitch_to_px = grid.h / m.pitch_visible;
-                        let pitch_top_int = m.pitch_top.floor() as i32;
-                        let pitch_visible_int = m.pitch_visible.ceil() as i32;
-                        for i in 0..=pitch_visible_int {
-                            let pitch = pitch_top_int - i;
-                            if !(0..=127).contains(&pitch) {
-                                continue;
+                let resp: PianoRollResponse = ui.piano_roll(
+                    "main",
+                    widget_rect,
+                    &m.notes,
+                    view,
+                    &m.selected_note_ids,
+                    &style,
+                    move |req| match req {
+                        NotesEditRequest::Add(mut notes) => {
+                            // library widget は id=0 placeholder で渡す → user が next_note_id で上書き
+                            for note in &mut notes {
+                                note.id = next_id_for_add;
                             }
-                            if is_black_key(pitch as u8) {
-                                let y = grid.y + (m.pitch_top - pitch as f32) * pitch_to_px;
-                                hctx.push_rect(RectCommand {
-                                    rect: Rect { x: grid.x, y, w: grid.w, h: pitch_to_px },
-                                    fill: Color::rgba(1.0, 1.0, 1.0, 0.04),
-                                    border: Color::TRANSPARENT,
-                                    border_width: 0.0,
-                                    radius: [0.0; 4],
-                                    clip_rect: None,
-                                });
-                            }
+                            make_add_notes_edit(notes)
                         }
-                        // (c) 拍縦線 (1 拍ごと細線、4 拍ごと太線 = 小節)
-                        let beat_to_px = grid.w / m.view_len_beats;
-                        let first_beat = view_start_beat.floor() as i32;
-                        let last_beat = view_end_beat.ceil() as i32;
-                        for b in first_beat..=last_beat {
-                            let x = grid.x + (b as f32 - view_start_beat) * beat_to_px;
-                            if x < grid.x - 1.0 || x > grid.x + grid.w + 1.0 {
-                                continue;
-                            }
-                            let is_bar = b.rem_euclid(4) == 0;
-                            let (line_w, alpha) = if is_bar { (1.5_f32, 0.30_f32) } else { (1.0_f32, 0.12_f32) };
-                            hctx.push_rect(RectCommand {
-                                rect: Rect { x: x - line_w * 0.5, y: grid.y, w: line_w, h: grid.h },
-                                fill: Color::rgba(1.0, 1.0, 1.0, alpha),
-                                border: Color::TRANSPARENT,
-                                border_width: 0.0,
-                                radius: [0.0; 4],
-                                clip_rect: None,
-                            });
+                        NotesEditRequest::Delete(notes) => make_delete_notes_edit(notes),
+                        NotesEditRequest::Move(deltas) => make_move_notes_edit(deltas),
+                        NotesEditRequest::Resize(deltas) => make_resize_notes_edit(deltas),
+                        NotesEditRequest::Select { prev, next } => {
+                            make_select_notes_edit(prev, next)
                         }
-                        // (d) 鍵盤左 widget (画面左 60px 固定)
-                        // 背景
-                        hctx.push_rect(RectCommand {
-                            rect: kbd,
-                            fill: Color::rgb(0.22, 0.23, 0.26),
-                            border: Color::TRANSPARENT,
-                            border_width: 0.0,
-                            radius: [0.0; 4],
-                            clip_rect: None,
-                        });
-                        // 各 pitch を rect で描画
-                        for i in 0..=pitch_visible_int {
-                            let pitch = pitch_top_int - i;
-                            if !(0..=127).contains(&pitch) {
-                                continue;
-                            }
-                            let y = grid.y + (m.pitch_top - pitch as f32) * pitch_to_px;
-                            let key_rect = Rect { x: kbd.x, y, w: kbd.w - 1.0, h: pitch_to_px - 1.0 };
-                            let fill = if is_black_key(pitch as u8) {
-                                Color::rgb(0.10, 0.11, 0.13)
-                            } else {
-                                Color::rgb(0.92, 0.93, 0.95)
-                            };
-                            hctx.push_rect(RectCommand {
-                                rect: key_rect,
-                                fill,
-                                border: Color::TRANSPARENT,
-                                border_width: 0.0,
-                                radius: [0.0; 4],
-                                clip_rect: None,
-                            });
-                            // C のオクターブのみラベル (C2..C7 = 24,36,...,84,96)
-                            if (pitch as u8).is_multiple_of(12) && pitch_to_px >= 8.0 {
-                                let octave = (pitch / 12) - 1;
-                                hctx.label_at(
-                                    ("c_label", pitch),
-                                    &format!("C{octave}"),
-                                    kbd.x + 4.0,
-                                    y,
-                                    11.0,
-                                    Color::rgb(0.30, 0.30, 0.35),
-                                );
-                            }
-                        }
-                        // (e) notes 矩形 (visible のみ)。
-                        // grid_rect で X/Y 両軸を厳密 clip する (renderer 側に scissor がないため、
-                        // CPU 側で rect を切り詰めて push する)。
-                        for note in visible {
-                            let r = note_to_rect(*note, m, grid);
-                            let x_left = r.x.max(grid.x);
-                            let x_right = (r.x + r.w).min(grid.x + grid.w);
-                            let y_top = r.y.max(grid.y);
-                            let y_bot = (r.y + r.h).min(grid.y + grid.h);
-                            if x_right <= x_left || y_bot <= y_top {
-                                continue;
-                            }
-                            let clipped = Rect {
-                                x: x_left,
-                                y: y_top,
-                                w: x_right - x_left,
-                                h: y_bot - y_top,
-                            };
-                            hctx.push_rect(note_rect_command(clipped, pitch_color(note.velocity)));
-                        }
-                    });
+                    },
+                );
 
-                    // --- cached の外: 選択 overlay (毎フレーム実行、id ベース) ---
-                    if !m.selected_note_ids.is_empty() {
-                        let sel_set: HashSet<NoteId> = m.selected_note_ids.iter().copied().collect();
-                        for note in visible {
-                            if !sel_set.contains(&note.id) {
-                                continue;
-                            }
-                            let r = note_to_rect(*note, m, grid);
-                            let pad = 2.0;
-                            hctx.push_rect(RectCommand {
-                                rect: Rect {
-                                    x: r.x - pad,
-                                    y: r.y - pad,
-                                    w: r.w + pad * 2.0,
-                                    h: r.h + pad * 2.0,
-                                },
-                                fill: Color::rgb(1.0, 0.85, 0.30),
-                                border: Color::rgb(1.0, 1.0, 1.0),
-                                border_width: 2.0,
-                                radius: [3.0; 4],
-                                clip_rect: None,
-                            });
-                        }
-                    }
+                // last_action 更新は Edit::mutate で発行 (frame closure 内 m は &M なので直接書けない)。
+                // Response の状態変化を見て次フレームで反映される small status text。
+                if resp.selection_changed {
+                    ui.push_edit(Edit::mutate(|m: &mut PianoRollModel| {
+                        let n = m.selected_note_ids.len();
+                        m.last_action = format!("selection: {n} note(s)");
+                    }));
+                }
+                if resp.rect_select_active {
+                    ui.push_edit(Edit::mutate(|m: &mut PianoRollModel| {
+                        m.last_action = "rect select drag…".to_string();
+                    }));
+                }
 
-                    // --- cached の外: ヒットテスト (click 時のみ、id ベース) ---
-                    if let Some((cx, cy)) = click_pos
-                        && grid.contains(cx, cy)
-                    {
-                        let mut hit_id: Option<NoteId> = None;
-                        for note in visible {
-                            let r = note_to_rect(*note, m, grid);
-                            if r.contains(cx, cy) {
-                                hit_id = Some(note.id);
-                                // 後勝ち (描画順で前面のものが選ばれる)
-                            }
-                        }
-                        if let Some(id) = hit_id {
-                            hctx.push_edit(Edit::mutate(move |m: &mut PianoRollModel| {
-                                m.selected_note_ids = vec![id];
-                                m.last_action = format!("note id={id} 選択");
-                            }));
-                        } else {
-                            hctx.push_edit(Edit::mutate(|m: &mut PianoRollModel| {
-                                m.selected_note_ids.clear();
-                                m.last_action = "選択解除".to_string();
-                            }));
-                        }
-                    }
-
-                    // --- M9 Phase 41b: hover 中の note hit zone から cursor を変える ---
-                    if let Some((cx, cy)) = hctx.pointer().pos
-                        && let Some(cursor) = note_hover_cursor(visible, m, grid, cx, cy)
-                    {
-                        hctx.set_cursor(cursor);
-                    }
-
-                    // --- M9 Phase 41c: drag release → Undoable Edit (move/resize) を発行 ---
-                    // anchor と現在値の比較で delta を作る。drag continue で値は既に drag final
-                    // になっているが、forward/inverse は idempotent なので再 apply で破綻しない
-                    // (forward はその値を再代入、inverse で anchor 値に戻る)。
-                    if let Some(nd) = drag_release.clone() {
-                        match nd.kind {
-                            NoteDragKind::Move => {
-                                let mut deltas: Vec<MoveDelta> = Vec::new();
-                                for a in &nd.anchors {
-                                    if let Some(n) = m.notes.iter().find(|x| x.id == a.id)
-                                        && ((n.start_beat - a.start_beat).abs() > 1e-6
-                                            || n.pitch != a.pitch)
-                                    {
-                                        deltas.push((
-                                            a.id, a.start_beat, a.pitch, n.start_beat, n.pitch,
-                                        ));
-                                    }
-                                }
-                                if !deltas.is_empty() {
-                                    let n_count = deltas.len();
-                                    hctx.push_edit(make_move_notes_edit(deltas));
-                                    hctx.push_edit(Edit::mutate(
-                                        move |m: &mut PianoRollModel| {
-                                            m.last_action = format!("move {n_count} note(s)");
-                                        },
-                                    ));
-                                }
-                            }
-                            NoteDragKind::ResizeRight | NoteDragKind::ResizeLeft => {
-                                let mut deltas: Vec<ResizeDelta> = Vec::new();
-                                for a in &nd.anchors {
-                                    if let Some(n) = m.notes.iter().find(|x| x.id == a.id)
-                                        && ((n.start_beat - a.start_beat).abs() > 1e-6
-                                            || (n.len_beats - a.len_beats).abs() > 1e-6)
-                                    {
-                                        deltas.push((
-                                            a.id,
-                                            a.start_beat,
-                                            a.len_beats,
-                                            n.start_beat,
-                                            n.len_beats,
-                                        ));
-                                    }
-                                }
-                                if !deltas.is_empty() {
-                                    let n_count = deltas.len();
-                                    hctx.push_edit(make_resize_notes_edit(deltas));
-                                    hctx.push_edit(Edit::mutate(
-                                        move |m: &mut PianoRollModel| {
-                                            m.last_action = format!("resize {n_count} note(s)");
-                                        },
-                                    ));
-                                }
-                            }
-                        }
-                    }
-
-                    // --- M9 Phase 41c: Alt+drag で rect multi-select ---
-                    let select_wid = WidgetId::ROOT.child(b"piano_roll_rect_select");
-                    if let Some(drag) = hctx.take_drag_rect_in_rect(select_wid, grid)
-                        && drag.modifiers.alt
-                        && drag.finished
-                    {
-                        let drag_rect = drag.rect();
-                        let new_ids: Vec<NoteId> = visible
-                            .iter()
-                            .filter_map(|n| {
-                                let r = note_to_rect(*n, m, grid);
-                                if rects_intersect(r, drag_rect) {
-                                    Some(n.id)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        let prev = m.selected_note_ids.clone();
-                        let next = new_ids;
-                        if prev != next {
-                            let n_sel = next.len();
-                            hctx.push_edit(make_select_notes_edit(prev, next));
-                            hctx.push_edit(Edit::mutate(move |m: &mut PianoRollModel| {
-                                m.last_action = format!("rect select: {n_sel} note(s)");
-                            }));
-                        }
-                    }
-
-                    // --- M9 Phase 41a: Insert で cursor 位置に note add、Delete で selected を削除 ---
-                    if hctx.take_shortcut("add_note")
-                        && let Some((cx, cy)) = hctx.pointer().pos
-                        && grid.contains(cx, cy)
-                    {
-                        // cursor 位置を beat / pitch に逆換算 (snap なしの float)。
-                        let beat_to_px = grid.w / m.view_len_beats;
-                        let pitch_to_px = grid.h / m.pitch_visible;
-                        let start_beat = m.view_start_beat + (cx - grid.x) / beat_to_px;
-                        let pitch_f = m.pitch_top - (cy - grid.y) / pitch_to_px;
-                        let pitch = (pitch_f.round() as i32).clamp(0, 127) as u8;
-                        let new_id = m.next_note_id;
-                        let new_note = Note {
-                            id: new_id,
-                            start_beat: start_beat.max(0.0),
-                            len_beats: 0.5,    // デフォルト 8 分音符
-                            pitch,
-                            velocity: 96,
-                        };
-                        let edit = make_add_notes_edit(vec![new_note]);
-                        hctx.push_edit(edit);
-                        // next_note_id の bump は別 Mutate で (Undoable と分けることで undo 後の
-                        // id 衝突回避: undo して新たに add した場合に new_id+1 を使う)
-                        hctx.push_edit(Edit::mutate(move |m: &mut PianoRollModel| {
-                            m.next_note_id = m.next_note_id.max(new_id + 1);
-                            m.last_action = format!("add note id={new_id}");
-                        }));
-                    }
-                    if hctx.take_shortcut("delete") && !m.selected_note_ids.is_empty() {
-                        let sel_set: HashSet<NoteId> = m.selected_note_ids.iter().copied().collect();
-                        let to_delete: Vec<Note> =
-                            m.notes.iter().filter(|n| sel_set.contains(&n.id)).copied().collect();
-                        if !to_delete.is_empty() {
-                            let n = to_delete.len();
-                            let edit = make_delete_notes_edit(to_delete);
-                            hctx.push_edit(edit);
-                            hctx.push_edit(Edit::mutate(move |m: &mut PianoRollModel| {
-                                m.last_action = format!("delete {n} note(s)");
-                            }));
-                        }
-                    }
-                });
-
-                // === Footer (heavy の外) ===
+                // Footer
                 let footer_y = (screen.height as f32 - 44.0).max(0.0);
                 ui.label_at(
                     "footer1",
-                    "Drag = pan / Wheel = X zoom / Ctrl+Wheel = Y zoom / Click (drag<16px) = note 選択",
+                    "Drag = pan / Wheel = X zoom / Ctrl+Wheel = Y zoom / Click = select / Insert = add / Delete / Alt+drag = rect-select / Ctrl+Z = undo",
                     16.0, footer_y, 12.0,
                     Color::rgb(0.65, 0.68, 0.72),
                 );
@@ -1104,29 +577,30 @@ impl AppHost for App {
     fn on_render(&mut self) -> bool {
         let now = Instant::now();
         let screen = self.renderer.size();
-        // pointer 由来の drag/click/wheel を Model に反映 (build_ui の前)
-        self.apply_pending_input(screen);
+        // input を 1 度取り出し、pan/wheel logic と library widget で共有 (PointerFrame は Copy)。
+        let input = self.input.take_input();
+        let pointer = input.pointer;
+        // pan / wheel zoom (note drag は library widget が握る)
+        self.apply_pan_and_zoom(pointer, screen);
         self.last_frame_start = Some(now);
-        self.build_ui();
+        self.build_ui(input);
         if let Err(e) = self.renderer.render(&self.scene) {
             eprintln!("render error: {e}");
         }
         if let Some(t) = self.last_frame_start.take() {
             self.model.last_frame_ms = t.elapsed().as_secs_f32() * 1000.0;
         }
-        // edits / drag / wheel が出ていれば連続描画
-        self.drag_anchor.is_some() || self.pending_zoom_dy.abs() > 0.0
+        self.pan_anchor.is_some() || self.pending_zoom_dy.abs() > 0.0
     }
 }
 
 fn main() {
-    // 段階的検証用: 環境変数 PIANO_ROLL_NOTES で切り替え可能。デフォルトは 100k。
     let n_notes: usize = std::env::var("PIANO_ROLL_NOTES")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(100_000);
     let attrs = WindowAttributes::default()
-        .with_title("daw-ui piano_roll (M5 Phase 14)")
+        .with_title("daw-ui piano_roll (M9 Phase 41e)")
         .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0));
     if let Err(e) = winit_backend::run_app(attrs, move |window| App::new(Arc::new(window), n_notes)) {
         eprintln!("event loop error: {e}");
@@ -1134,7 +608,8 @@ fn main() {
 }
 
 // ============================================================
-// M9 Phase 41a: helper の Undoable round-trip tests
+// M9 Phase 41a-d: Edit factory の Undoable round-trip tests
+// (PianoRollModel 依存なので example 側に残す)
 // ============================================================
 
 #[cfg(test)]
@@ -1144,26 +619,6 @@ mod tests {
 
     fn note(id: NoteId, start: f32, len: f32, pitch: u8) -> Note {
         Note { id, start_beat: start, len_beats: len, pitch, velocity: 96 }
-    }
-
-    fn run_pair(edit: Edit<PianoRollModel>, model: &mut PianoRollModel) {
-        // Undoable variant の forward / inverse を直接呼んで round-trip を検証する。
-        let Edit::Undoable { forward, inverse, .. } = edit else {
-            panic!("expected Undoable");
-        };
-        let initial_gen = model.notes_generation;
-        let initial_count = model.notes.len();
-        forward(model);
-        assert!(
-            model.notes_generation > initial_gen,
-            "forward が generation を bump していない"
-        );
-        inverse(model);
-        assert_eq!(
-            model.notes.len(),
-            initial_count,
-            "inverse が note 数を元に戻していない"
-        );
     }
 
     #[test]
@@ -1209,7 +664,6 @@ mod tests {
             note(3, 2.0, 0.5, 67),
         ];
         let mut model = PianoRollModel::new(initial);
-        // id 2 を削除
         let to_delete = vec![note(2, 1.0, 0.5, 64)];
         let edit = make_delete_notes_edit(to_delete);
         let Edit::Undoable { forward, inverse, .. } = edit else {
@@ -1221,7 +675,7 @@ mod tests {
         assert_eq!(remaining_ids, vec![1, 3]);
         inverse(&mut model);
         let restored_ids: Vec<NoteId> = model.notes.iter().map(|n| n.id).collect();
-        assert_eq!(restored_ids, vec![1, 2, 3], "id 2 が start_beat 順位置に復元");
+        assert_eq!(restored_ids, vec![1, 2, 3]);
     }
 
     #[test]
@@ -1234,36 +688,13 @@ mod tests {
         if let Edit::Undoable { forward, .. } = edit {
             forward(&mut model);
         }
-        assert_eq!(model.selected_note_ids, vec![2], "削除した id は選択から外れる");
+        assert_eq!(model.selected_note_ids, vec![2]);
     }
-
-    #[test]
-    fn add_notes_forward_is_idempotent_for_redo() {
-        // Fn 制約 = 2 度 forward 実行 (redo 経路) しても問題ないことを確認。
-        // ただしこの helper では同 note を 2 度 push してしまう (id 衝突は許容しない設計)。
-        // Undoable な redo は forward を 1 度しか呼ばないことを前提とする (history.rs 側責務)。
-        let mut model = PianoRollModel::new(vec![]);
-        let edit = make_add_notes_edit(vec![note(0, 0.0, 0.5, 60)]);
-        if let Edit::Undoable { forward, .. } = edit {
-            forward(&mut model);
-            assert_eq!(model.notes.len(), 1);
-        }
-    }
-
-    #[test]
-    fn round_trip_uses_run_pair_helper() {
-        let mut model = PianoRollModel::new(vec![]);
-        let edit = make_add_notes_edit(vec![note(0, 0.0, 0.5, 60)]);
-        run_pair(edit, &mut model);
-    }
-
-    // -------- M9 Phase 41b: move / resize / cursor hover --------
 
     #[test]
     fn move_notes_then_undo_round_trip() {
         let initial = vec![note(0, 0.0, 0.5, 60), note(1, 1.0, 0.5, 64)];
         let mut model = PianoRollModel::new(initial);
-        // id 0 を (0.0, 60) → (2.0, 72)、id 1 を (1.0, 64) → (3.0, 70)
         let deltas: Vec<MoveDelta> = vec![
             (0u32, 0.0_f32, 60u8, 2.0_f32, 72u8),
             (1u32, 1.0_f32, 64u8, 3.0_f32, 70u8),
@@ -1276,9 +707,6 @@ mod tests {
         let n0 = model.notes.iter().find(|n| n.id == 0).unwrap();
         assert!((n0.start_beat - 2.0).abs() < 1e-6);
         assert_eq!(n0.pitch, 72);
-        let n1 = model.notes.iter().find(|n| n.id == 1).unwrap();
-        assert!((n1.start_beat - 3.0).abs() < 1e-6);
-        assert_eq!(n1.pitch, 70);
         inverse(&mut model);
         let n0 = model.notes.iter().find(|n| n.id == 0).unwrap();
         assert!((n0.start_beat - 0.0).abs() < 1e-6);
@@ -1287,109 +715,36 @@ mod tests {
 
     #[test]
     fn resize_notes_then_undo_round_trip_right_edge() {
-        // ResizeRight: prev_start == next_start、len のみ変わる
-        let initial = vec![note(0, 0.0, 0.5, 60), note(1, 1.0, 0.25, 64)];
+        let initial = vec![note(0, 0.0, 0.5, 60)];
         let mut model = PianoRollModel::new(initial);
-        let deltas: Vec<ResizeDelta> = vec![
-            (0u32, 0.0_f32, 0.5_f32, 0.0_f32, 1.0_f32),
-            (1u32, 1.0_f32, 0.25_f32, 1.0_f32, 0.75_f32),
-        ];
+        let deltas: Vec<ResizeDelta> = vec![(0u32, 0.0_f32, 0.5_f32, 0.0_f32, 1.0_f32)];
         let edit = make_resize_notes_edit(deltas);
         let Edit::Undoable { forward, inverse, .. } = edit else {
             panic!("expected Undoable");
         };
         forward(&mut model);
-        assert!((model.notes.iter().find(|n| n.id == 0).unwrap().len_beats - 1.0).abs() < 1e-6);
-        assert!((model.notes.iter().find(|n| n.id == 1).unwrap().len_beats - 0.75).abs() < 1e-6);
+        assert!((model.notes[0].len_beats - 1.0).abs() < 1e-6);
         inverse(&mut model);
-        assert!((model.notes.iter().find(|n| n.id == 0).unwrap().len_beats - 0.5).abs() < 1e-6);
-        assert!((model.notes.iter().find(|n| n.id == 1).unwrap().len_beats - 0.25).abs() < 1e-6);
+        assert!((model.notes[0].len_beats - 0.5).abs() < 1e-6);
     }
 
     #[test]
     fn resize_notes_then_undo_round_trip_left_edge() {
-        // ResizeLeft: start + len 両方変わる (左端 drag = note の左端を引き伸ばす)
         let initial = vec![note(0, 1.0, 1.0, 60)];
         let mut model = PianoRollModel::new(initial);
-        // 左端を 0.25 beat 左へ → start 0.75, len 1.25
-        let deltas: Vec<ResizeDelta> =
-            vec![(0u32, 1.0_f32, 1.0_f32, 0.75_f32, 1.25_f32)];
+        let deltas: Vec<ResizeDelta> = vec![(0u32, 1.0_f32, 1.0_f32, 0.75_f32, 1.25_f32)];
         let edit = make_resize_notes_edit(deltas);
         let Edit::Undoable { forward, inverse, .. } = edit else {
             panic!("expected Undoable");
         };
         forward(&mut model);
-        let n = model.notes.iter().find(|n| n.id == 0).unwrap();
+        let n = &model.notes[0];
         assert!((n.start_beat - 0.75).abs() < 1e-6);
         assert!((n.len_beats - 1.25).abs() < 1e-6);
         inverse(&mut model);
-        let n = model.notes.iter().find(|n| n.id == 0).unwrap();
+        let n = &model.notes[0];
         assert!((n.start_beat - 1.0).abs() < 1e-6);
         assert!((n.len_beats - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn rects_intersect_overlapping_returns_true() {
-        let a = Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 };
-        let b = Rect { x: 5.0, y: 5.0, w: 10.0, h: 10.0 };
-        assert!(rects_intersect(a, b));
-    }
-
-    #[test]
-    fn rects_intersect_disjoint_returns_false() {
-        let a = Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 };
-        let b = Rect { x: 20.0, y: 20.0, w: 10.0, h: 10.0 };
-        assert!(!rects_intersect(a, b));
-    }
-
-    #[test]
-    fn rects_intersect_touching_returns_false() {
-        // 接するだけ (共有エッジ) は intersect 扱いしない
-        let a = Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 };
-        let b = Rect { x: 10.0, y: 0.0, w: 10.0, h: 10.0 };
-        assert!(!rects_intersect(a, b));
-    }
-
-    #[test]
-    fn note_hit_returns_move_in_center() {
-        let model = make_test_model();
-        let grid = Rect { x: 50.0, y: 0.0, w: 400.0, h: 200.0 };
-        // note (id 0): start=1, len=1, pitch=60 → x∈[150,250]
-        let hit = note_hit(&model, grid, 200.0, 102.0);
-        assert_eq!(hit, Some((0, NoteDragKind::Move)));
-    }
-
-    #[test]
-    fn note_hit_returns_resize_left_at_left_edge() {
-        let model = make_test_model();
-        let grid = Rect { x: 50.0, y: 0.0, w: 400.0, h: 200.0 };
-        let hit = note_hit(&model, grid, 151.0, 102.0);
-        assert_eq!(hit, Some((0, NoteDragKind::ResizeLeft)));
-    }
-
-    #[test]
-    fn note_hit_returns_resize_right_at_right_edge() {
-        let model = make_test_model();
-        let grid = Rect { x: 50.0, y: 0.0, w: 400.0, h: 200.0 };
-        let hit = note_hit(&model, grid, 249.0, 102.0);
-        assert_eq!(hit, Some((0, NoteDragKind::ResizeRight)));
-    }
-
-    #[test]
-    fn note_hit_returns_none_outside_grid() {
-        let model = make_test_model();
-        let grid = Rect { x: 50.0, y: 0.0, w: 400.0, h: 200.0 };
-        let hit = note_hit(&model, grid, 10.0, 10.0);
-        assert_eq!(hit, None);
-    }
-
-    #[test]
-    fn note_hit_returns_none_on_empty_grid_area() {
-        let model = make_test_model();
-        let grid = Rect { x: 50.0, y: 0.0, w: 400.0, h: 200.0 };
-        // grid 内だが note の上ではない
-        let hit = note_hit(&model, grid, 200.0, 10.0);
-        assert_eq!(hit, None);
     }
 
     #[test]
@@ -1410,7 +765,6 @@ mod tests {
 
     #[test]
     fn move_preserves_sort_order() {
-        // id 0 が start=2.0 に move、id 1 が start=0.5 に move → sort 後は [1, 0] の順
         let initial = vec![note(0, 0.0, 0.5, 60), note(1, 1.0, 0.5, 64)];
         let mut model = PianoRollModel::new(initial);
         let deltas: Vec<MoveDelta> =
@@ -1420,61 +774,6 @@ mod tests {
             forward(&mut model);
         }
         let order: Vec<NoteId> = model.notes.iter().map(|n| n.id).collect();
-        assert_eq!(order, vec![1, 0], "sort_by(start_beat) で順序入替わり");
-    }
-
-    fn make_test_model() -> PianoRollModel {
-        // pitch_top=72, pitch_visible=24, view_start=0, view_len=4
-        // grid (50,0) - (450,200) と仮定すると:
-        //   beat_to_px = 400 / 4 = 100, pitch_to_px = 200 / 24 ≈ 8.33
-        let n = note(0, 1.0, 1.0, 60);
-        // note: start=1.0, len=1.0, pitch=60
-        // x = 50 + (1.0 - 0) * 100 = 150
-        // w = 1.0 * 100 = 100
-        // y = 0 + (72 - 60) * 8.33 ≈ 100
-        // h = 8.33 - 1 ≈ 7.33
-        PianoRollModel::new(vec![n])
-    }
-
-    #[test]
-    fn note_hover_cursor_returns_move_in_center() {
-        let model = make_test_model();
-        let grid = Rect { x: 50.0, y: 0.0, w: 400.0, h: 200.0 };
-        let visible: Vec<Note> = model.notes.clone();
-        // x=200 は note の中央 (150..250 の真ん中)
-        let cursor = note_hover_cursor(&visible, &model, grid, 200.0, 102.0);
-        assert_eq!(cursor, Some(CursorIcon::Move));
-    }
-
-    #[test]
-    fn note_hover_cursor_returns_ewresize_at_edges() {
-        let model = make_test_model();
-        let grid = Rect { x: 50.0, y: 0.0, w: 400.0, h: 200.0 };
-        let visible: Vec<Note> = model.notes.clone();
-        // 左端: x=151 (rect.x = 150 + 1px = handle 内)
-        let cursor_left = note_hover_cursor(&visible, &model, grid, 151.0, 102.0);
-        assert_eq!(cursor_left, Some(CursorIcon::EwResize));
-        // 右端: x=249 (rect.x + w = 250、249 = handle 内)
-        let cursor_right = note_hover_cursor(&visible, &model, grid, 249.0, 102.0);
-        assert_eq!(cursor_right, Some(CursorIcon::EwResize));
-    }
-
-    #[test]
-    fn note_hover_cursor_returns_none_outside_grid() {
-        let model = make_test_model();
-        let grid = Rect { x: 50.0, y: 0.0, w: 400.0, h: 200.0 };
-        let visible: Vec<Note> = model.notes.clone();
-        let cursor = note_hover_cursor(&visible, &model, grid, 10.0, 10.0);
-        assert_eq!(cursor, None, "grid 外は None");
-    }
-
-    #[test]
-    fn note_hover_cursor_returns_none_on_empty_area() {
-        let model = make_test_model();
-        let grid = Rect { x: 50.0, y: 0.0, w: 400.0, h: 200.0 };
-        let visible: Vec<Note> = model.notes.clone();
-        // grid 内だが note 上ではない (y=10、note は y=100 付近)
-        let cursor = note_hover_cursor(&visible, &model, grid, 200.0, 10.0);
-        assert_eq!(cursor, None);
+        assert_eq!(order, vec![1, 0]);
     }
 }
