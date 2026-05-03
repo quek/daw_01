@@ -160,6 +160,7 @@ cargo clippy --workspace -- -D warnings
 ## 参照プロジェクト
 
 - `F:\dev\gui_01` — 自作 GUI ライブラリ (daw-ui)。daw_gui はこれを path 依存で取り込んでいる。
-  API ドキュメントは crate doc-comments、サンプルは `crates/examples/{mixer, arrangement, piano_roll, ...}` 参照
+  API ドキュメントは crate doc-comments、サンプルは `crates/examples/{mixer, arrangement, piano_roll, ...}` 参照。
+  gui_01 への要望・バグ報告・質問は `docs/gui_01_conversation.md` に追記する（gui_01 Claude が同ファイルに直接返信する）
 - `F:\dev\sing_like_coding` — 前作 Rust DAW。IPC, CLAP ホスト, オーディオエンジンの参照実装
 - `%APPDATA%\REAPER\Scripts\yoshino\voicevox\` — VOICEVOX API 統合の参照実装 (Lua)
