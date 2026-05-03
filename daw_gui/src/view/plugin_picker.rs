@@ -19,6 +19,8 @@ const PANEL_W: f32 = 520.0;
 const PANEL_H: f32 = 460.0;
 const TITLE_H: f32 = 36.0;
 const ROW_H: f32 = 26.0;
+/// scroll_area の縦 scrollbar (10px) + 視覚余白 (4px)。
+const SCROLLBAR_RESERVE: f32 = 14.0;
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
     let sw = screen.width as f32;
@@ -84,7 +86,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
         || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ClosePluginPicker)),
     );
 
-    // 一覧 (リストを下方向に配置)
+    // 一覧 (scroll_area で全件表示、画面外は自動クリップ)
     let list_x = panel_x + pad;
     let list_y = panel_y + TITLE_H + 6.0;
     let list_w = PANEL_W - pad * 2.0;
@@ -102,70 +104,63 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
         return;
     }
 
-    let max_rows = (list_h / (ROW_H + 2.0)).floor() as usize;
-    for (i, entry) in visible.iter().take(max_rows).enumerate() {
-        let row_y = list_y + (i as f32) * (ROW_H + 2.0);
-        let row_rect = Rect { x: list_x, y: row_y, w: list_w, h: ROW_H };
-        let id_clone = entry.id.clone();
+    // scrollbar 分の余白を引いた row 内側幅。scroll 不要時も同じ幅にして見た目を揃える。
+    let row_inner_w = list_w - SCROLLBAR_RESERVE;
+    let total_h = (visible.len() as f32) * (ROW_H + 2.0);
 
-        // 行背景
-        ui.heavy(("pp_row_bg", i), |hctx| {
-            hctx.cached(i, |hctx| {
-                hctx.push_rect(RectCommand {
-                    rect: row_rect,
-                    fill: COLOR_ROW_BG,
-                    border: Color::TRANSPARENT,
-                    border_width: 0.0,
-                    radius: [3.0; 4],
-                    clip_rect: None,
-                });
+    let list_rect = Rect { x: list_x, y: list_y, w: list_w, h: list_h };
+    ui.scroll_area("pp_list", list_rect, (list_w, total_h), |ui, offset| {
+        for (i, entry) in visible.iter().enumerate() {
+            let row_y = list_y - offset.1 + (i as f32) * (ROW_H + 2.0);
+            // viewport 外の row はスキップ (widget id 登録も省く)
+            if row_y + ROW_H < list_y || row_y > list_y + list_h {
+                continue;
+            }
+            let row_rect = Rect { x: list_x, y: row_y, w: row_inner_w, h: ROW_H };
+            let id_clone = entry.id.clone();
+
+            // 行背景。heavy + cached(i) は scroll で row_y が変動すると stale を replay
+            // するため使わない。1 行 1 rect で cache 利得は薄い。最終的には #007
+            // (Ui::list_view) で消える tech debt なので push_rect 直呼び。
+            ui.push_rect(RectCommand {
+                rect: row_rect,
+                fill: COLOR_ROW_BG,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [3.0; 4],
+                clip_rect: None,
             });
-        });
 
-        // 名前 (clickable button) — 行全幅
-        ui.button_at(
-            ("pp_row_btn", i),
-            &entry.name,
-            row_rect,
-            move || {
-                let id_clone = id_clone.clone();
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SelectPluginFromDb(id_clone))
-                })
-            },
-        );
+            // 名前 (clickable button) — 行全幅
+            ui.button_at(
+                ("pp_row_btn", i),
+                &entry.name,
+                row_rect,
+                move || {
+                    let id_clone = id_clone.clone();
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SelectPluginFromDb(id_clone))
+                    })
+                },
+            );
 
-        // ベンダ + フォーマットラベル overlay (button のテキストの右側、装飾のみ)
-        ui.label_at(
-            ("pp_row_vendor", i),
-            &entry.vendor,
-            list_x + list_w - 200.0,
-            row_y + 6.0,
-            10.0,
-            COLOR_TEXT_DIM,
-        );
-        ui.label_at(
-            ("pp_row_format", i),
-            &entry.format_label,
-            list_x + list_w - 50.0,
-            row_y + 6.0,
-            10.0,
-            COLOR_TEXT_FORMAT,
-        );
-    }
-
-    if visible.len() > max_rows {
-        ui.label_at(
-            "pp_more",
-            &format!(
-                "({} \u{4ef6}\u{8868}\u{793a}中 / 全 {} 件)",
-                max_rows,
-                visible.len()
-            ),
-            list_x,
-            panel_y + PANEL_H - pad - 12.0,
-            10.0,
-            COLOR_TEXT_DIM,
-        );
-    }
+            // ベンダ + フォーマットラベル overlay (button のテキストの右側、装飾のみ)
+            ui.label_at(
+                ("pp_row_vendor", i),
+                &entry.vendor,
+                list_x + row_inner_w - 200.0,
+                row_y + 6.0,
+                10.0,
+                COLOR_TEXT_DIM,
+            );
+            ui.label_at(
+                ("pp_row_format", i),
+                &entry.format_label,
+                list_x + row_inner_w - 50.0,
+                row_y + 6.0,
+                10.0,
+                COLOR_TEXT_FORMAT,
+            );
+        }
+    });
 }
