@@ -96,10 +96,12 @@ gui_01 回答を待つ間、既存 widget で完結するものを片付ける�
 - mixer / piano_roll の中身 closure はそのまま維持。
 - 結果: 98 → 49 LOC (-49)、自前 `push_rect` x2 + 定数 4 個削除。
 
-### 1-2. `plugin_picker.rs` のリストを `scroll_area` 化 (modal 化は #007 待ち)
+### 1-2. `plugin_picker.rs` のリストを `scroll_area` 化 (modal 化は #007 待ち) [done f280274]
 
 - まず scroll_area で行 truncate を解消 (現状 `max_rows` で打ち切り、line 105-156)。
 - modal 化 (#007 受理後) で全面書き換え予定。先に scroll_area だけでも導入。
+- 注意: 行背景の heavy + cached(i) は scroll で stale rect を replay する
+  (cache key に row_y が無いため)。push_rect 直呼びにする。
 
 ### 1-3. `mixer_strips.rs` / `track_inspector.rs` の scroll 対応
 
@@ -152,3 +154,4 @@ daw_01 側で組むもの:
 | 2026-05-03 | (本ファイル作成) | - | plan.md 初版 |
 | 2026-05-03 | 2625255 | Phase 0 | 要望 #005-#009 を gui_01_conversation.md に投稿 |
 | 2026-05-03 | c46df37 | Phase 1-1 | bottom_panel を `tab_view_with_state` 化 (98 → 49 LOC) |
+| 2026-05-03 | f280274 | Phase 1-2 | plugin_picker のリストを `scroll_area` 化 (truncation 廃止) |
