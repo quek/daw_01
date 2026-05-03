@@ -122,7 +122,7 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 - daw_01 (実 DAW プロトタイプ) が gui_01 を path 依存で利用開始
 - 設計の不変条件 (no-Clone / メッセージ型禁止 / derive 禁止 / audio・IPC 不混入) 維持
 
-### M9 (Real DAW Validation — `Edit::Undoable` ergonomic 実証、Phase 41-43 + 44a 完了 / Phase 44b-c 残作業)
+### M9 (Real DAW Validation — `Edit::Undoable` ergonomic 実証、Phase 41-43 + 44a-b 完了 / Phase 44c 残作業)
 
 **目的**: M8 で導入した `Edit::Undoable` の ergonomic を、note 編集 / audio buffer 編集の 2 ケースで実証する。boilerplate が出れば library helper で吸収。daw_01 で並行検証して library API の fitness function を回す。
 
@@ -136,7 +136,7 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 | 42    | sample_edit_ops の trim/fade を Undoable 化                            | trim/fade in/out の 3 ボタンを `Edit::snapshot_inverse` 化。audio buffer の inverse 戦略は **混在採用**: trim = full snapshot (`Vec<Vec<f32>>` + viewport/selection/cursor)、fade in/out = 範囲 snapshot (`Vec<f32>` の e-s 個 + range + direction enum)          | ✅ 完了                     |
 | 43    | debug overlay (validation 用)                                          | `Ui::debug_overlay(rect, frame_ms)` + `UiHost::last_frame_stats() -> FrameStats` で cache_hits/misses/widget_count/scenegraph_size/history_depth を画面右上に popup z-order の半透明 overlay。Ctrl+F1 を default shortcut binding (`debug_overlay_toggle`) に追加 | ✅ 完了                     |
 | 44a   | popup pass の renderer pipeline 独立化                                 | Phase 43 で発見した「popup pass の prepare で base pass の rect/line/glyph buffer が上書きされる」問題を、renderer に `popup_rect / popup_line / popup_glyph` 3 つの独立 pipeline インスタンスを追加して根本解決                                                  | ✅ 完了                     |
-| 44b   | Undoable ergonomic 評価 + 必要なら API 改善                            | Phase 41-43 で書いた `Edit::with_inverse` 全 call site の boilerplate を計測、3 回以上繰り返されるパターンが見つかれば library helper を追加、なければ「現 API で十分」を確定                                                                                    | 未着手                      |
+| 44b   | Undoable ergonomic 評価 + 必要なら API 改善                            | call site 分類: `Edit::snapshot_inverse` 7 件 (Phase 41d で library 化済、ergonomic 良好) + fader/knob の drag release pattern 2 件 (3 件未満で premature abstraction 回避)。**追加 helper 不要、現 API で十分** を確定                                          | ✅ 完了                     |
 | 44c   | daw_01 Note schema 統合判断                                            | gui_01 Note (id: u32, f32, no lyric) と daw_01 NoteBox (note: u32 = index, f64, lyric: Option<String>) の不一致をどう統合するか方針決定                                                                                                                          | 未着手                      |
 
 **設計判断 (M9 全般)**:

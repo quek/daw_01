@@ -1381,3 +1381,81 @@ ui.heavy("track_0_clips", |hctx| {
 
 - `crates/renderer/src/device.rs`: +~10 LOC (popup_rect / popup_line / popup_glyph フィールド + new() / prepare/render 切替)。
 - `crates/ui/src/ui.rs`: -8 LOC + +5 LOC (debug_overlay を popup buffer に戻す、`drawing_in_popup` 切替 2 行 + tests 修正で popup_glyph_areas / popup_rects 検証)。
+
+---
+
+## M9 Phase 44b (Undoable ergonomic 評価、完了 2026-05-03)
+
+**目的**: Phase 41-43 で書いた `Edit::with_inverse` / `Edit::snapshot_inverse` 全 call site の boilerplate を計測し、3 回以上繰り返されるパターンが見つかれば library helper を追加、なければ「現 API で十分」を確定する。
+
+**進捗**: docs only commit で完遂 (新規コードなし、API stability の確定)。
+
+**call site 全列挙** (`Edit::with_inverse` / `Edit::snapshot_inverse`、test/comment 除く):
+
+| # | 場所 | helper 関数 | 戦略 | snapshot 型 |
+|---|---|---|---|---|
+| 1 | crates/examples/piano_roll/src/main.rs:124 | make_add_notes_edit | snapshot_inverse | `Vec<Note>` |
+| 2 | crates/examples/piano_roll/src/main.rs:148 | (delete) make_delete_notes_edit | snapshot_inverse | `Vec<Note>` |
+| 3 | crates/examples/piano_roll/src/main.rs:180 | make_move_notes_edit | snapshot_inverse | `Vec<MoveDelta>` |
+| 4 | crates/examples/piano_roll/src/main.rs:211 | make_resize_notes_edit | snapshot_inverse | `Vec<ResizeDelta>` |
+| 5 | crates/examples/piano_roll/src/main.rs:225 | make_select_notes_edit | snapshot_inverse | `(Vec<NoteId>, Vec<NoteId>)` |
+| 6 | crates/examples/sample_edit_ops/src/main.rs:51 | make_trim_edit | snapshot_inverse | `TrimSnapshot` (custom struct) |
+| 7 | crates/examples/sample_edit_ops/src/main.rs:166 | make_fade_edit | snapshot_inverse | `FadeSnapshot` (custom struct) |
+| 8 | crates/ui/src/widgets/fader.rs:231 | (inline) | with_inverse | drag release `start_value → end_value` |
+| 9 | crates/ui/src/widgets/knob.rs:193 | (inline) | with_inverse | drag release `start_value → end_value` |
+
+**パターン分類**:
+
+### パターン A: `Edit::snapshot_inverse` 経由 (7 件 / 9 件)
+
+- 全 7 件が **Phase 41d で library 化済の `Edit::snapshot_inverse(label, snap, fwd, restore)`** を使用。
+- snapshot 型のバリエーションは広い: `Vec<Note>` / `Vec<タプル>` / `(prev, next)` の tuple / 大きな custom struct (Vec<Vec<f32>> + viewport + cursor を含む) / 範囲限定 Vec<f32>。
+- どれも `S: Send + Sync + 'static` 制約を満たし、library 内で自動 Arc 化されているため user 側に Arc capture boilerplate 不要。
+- helper の forward / restore_from クロージャ内のロジックは widget 固有 (Note の id 検索、audio buffer の slice 操作 等) なので library で吸収不可能。
+- **結論: snapshot_inverse は ergonomic に十分**、call site で 7 通りの異なる snapshot 型を扱えており、抽象が機能している。
+
+### パターン B: `Edit::with_inverse` 直書き (2 件 / 9 件、fader / knob のみ)
+
+```rust
+let on_change_fwd = on_change.clone();
+let on_change_inv = on_change;
+let end = displayed_value;
+let edit = Edit::with_inverse(
+    label,
+    move |m: &mut M| on_change_fwd(end).apply(m),
+    move |m: &mut M| on_change_inv(start_value).apply(m),
+);
+```
+
+- fader / knob の drag release で `start_value → end_value` を Undoable 化するパターン。
+- 2 件で完全に同じ shape (4 行)。
+- **3 件未満なので CLAUDE.md「3 回繰り返されたら抽象化」のルール未達**。
+
+**判定**:
+
+- **追加の library helper は不要。Phase 41d の `Edit::snapshot_inverse` で現状の全 use case を吸収できている**。
+- パターン B (drag release `start_value → end_value`) は閾値未満なので premature abstraction を避け現状維持。第 3 例 (text_input commit / automation_curve drag release / 他 future widget) が登場したら helper 化検討。
+- これにより M9 期間中の **`Edit` API が安定** (Phase 45 以降で破壊的変更しない確約)。
+
+**主な学び**:
+
+- **`Edit::snapshot_inverse` の汎用性**: snapshot 型として `Vec<T: Copy>`、`(Vec<T>, Vec<T>)` tuple、巨大な custom struct (`Vec<Vec<f32>>` + プリミティブ多数) のいずれも問題なく扱えた。`S: Send + Sync + 'static` 制約は `Vec<T>` / `Arc<...>` / 普通の owned struct で満たされる。
+- **library 化の境界線が見えた**: Edit 構築の "外形" (snapshot を 2 closure で共有 + Arc 化) は library 化可能、closure 内のロジック (widget / Model 固有の field 操作) は library 化不可能。snapshot_inverse はこの境界を綺麗に切っている (helper が外形のみ、ユーザが closure を書く)。
+- **call site の総数 9 件は意外に少ない**: M9 全期間で Undoable Edit が必要な場面は 7 helper + fader/knob の 2 件のみ。validation 段階でこれだけ少ないのは「Mutate Edit で済むケースが多い」(drag 中の連続更新、UI state 変更で history に積まなくてよいケース、等) ため。`Edit::Mutate` と `Edit::Undoable` の使い分けが現実的に機能している。
+- **3 件未満は抽象化見送り**: CLAUDE.md の「3 回繰り返されたら抽象化を検討」原則に従い、fader/knob 2 件は library 化見送り。premature abstraction を回避することで API 表面積を最小に保つ。
+- **API stability 確定の意義**: Phase 44b で「現 API で十分」を確定させたことで、Phase 45 以降の機能追加 (theming / animation / 信号処理 widget 等) で `Edit` API を変更する必要がないことが保証された。daw_01 など path 依存先での breaking 変更リスクが low。
+
+**設計判断**:
+
+- **「3 回ルール」を厳守**: fader/knob 2 件で先行抽象化する誘惑を退けた。第 3 例が出るまで生 `Edit::with_inverse` を維持。
+- **closure 内のロジックは library 化不可**: forward/inverse の中で `m.notes.iter().find(|x| x.id == id)` のような widget 固有検索を書く部分は user 責務。library が `NoteCollection` trait を切れば吸収可能だが、daw_01 の独自 NoteBox schema との整合が取れなくなるため不採用 (Phase 41e でも同じ判断)。
+- **snapshot_inverse 自体の API 改善は不要**: 7 件すべてが現 signature で書けており、戻り値型 / closure 引数の追加修正は不要。
+
+**残作業**: なし。Phase 44b 完了。
+
+**Phase 44c への引き継ぎ事項**:
+
+- Phase 44c は **コード変更なしの方針決定タスク** (gui_01 Note schema vs daw_01 NoteBox schema)。Phase 44b と同じく docs only commit で完了する見込み。
+- fader/knob の drag release pattern (パターン B) は 3 件目が出るまで保留。出たときに `Edit::from_value_change(label, start, end, on_change)` のような helper を追加候補として記録。
+
+**LOC**: なし (docs only)。本 commit は `docs/plan.md` / `docs/history.md` の更新のみ。
