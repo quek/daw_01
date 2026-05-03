@@ -14,6 +14,7 @@ pub mod knob;
 pub mod label;
 pub mod level_meter;
 pub mod menu;
+pub mod panel;
 pub mod piano_roll;
 pub mod scroll_area;
 pub mod split_view;

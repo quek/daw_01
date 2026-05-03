@@ -361,14 +361,8 @@ impl App {
                 });
 
                 // ---- 3. footer (last_action + M9 P0-2: Open Piano Roll button) ----
-                ui.push_rect(RectCommand {
-                    rect: footer_rect,
-                    fill: Color::rgb(0.08, 0.09, 0.11),
-                    border: Color::TRANSPARENT,
-                    border_width: 0.0,
-                    radius: [0.0; 4],
-                    clip_rect: None,
-                });
+                // M9 Phase 45a: Ui::panel を背景塗りに使う (heavy+cached+push_rect の 1 行ラッパ)
+                ui.panel("footer_bg", footer_rect, Color::rgb(0.08, 0.09, 0.11), 0.0);
                 let btn_w = 160.0;
                 let btn_pad = 4.0;
                 let btn_rect = Rect {
