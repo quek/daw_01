@@ -47,10 +47,11 @@
 `max_rows` 手動 truncation を廃止、scroll で全件表示。
 注意: 行背景の `heavy + cached(i)` は scroll で stale rect を replay するので `push_rect` 直呼びにする。最終的に 45d (`Ui::list_view`) で消える tech debt。
 
-### 1-3. `mixer_strips.rs` / `track_inspector.rs` の scroll 対応 [next]
+### 1-3. `mixer_strips.rs` / `track_inspector.rs` の scroll 対応 [done]
 
-- mixer: 横方向 scroll_area (master strip は scroll 外に固定)。
-- inspector: 縦方向 scroll_area (chain entry が画面に入りきらないとき)。
+- mixer: 横方向 scroll_area、master strip は scroll 外に右端固定。
+- inspector: 縦方向 scroll_area、+Inst/+FX/+MIDI ボタンは scroll 外に下端固定。
+- 注意: scrollbar drag 不能のバグを発見、gui_01 #010 で報告。wheel/keyboard scroll は動作する。
 
 ## Phase 2: arrangement widget 用の schema 移行 (Phase 1 と並列)
 
@@ -139,3 +140,4 @@ daw_01 側で別途組むもの:
 | 2026-05-03 | c46df37 | Phase 1-1 | bottom_panel を `tab_view_with_state` 化 (98 → 49 LOC) |
 | 2026-05-03 | f280274 | Phase 1-2 | plugin_picker のリストを `scroll_area` 化 (truncation 廃止) |
 | 2026-05-03 | (gui_01) | Phase 0 | gui_01 から #005-#009 全件 [Replied] 受領、API 確定 |
+| 2026-05-03 | (本コミット) | Phase 1-3 | mixer/inspector を scroll_area 化、scrollbar drag bug を gui_01 #010 で報告 |

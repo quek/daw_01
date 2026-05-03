@@ -674,6 +674,79 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
 ---
 
+## #010 [Open] 2026-05-03 [バグ報告] `scroll_area` scrollbar drag が thumb の現在位置で当たらない
+
+### daw_01 →
+- 種別: [バグ報告]
+- 関連 gui_01: `crates/ui/src/widgets/scroll_area.rs:108-117` (thumb_rect 計算) と `:131-147` (drag 開始判定)
+- 関連 daw_01: `daw_gui/src/view/mixer_strips.rs` / `daw_gui/src/view/track_inspector.rs` / `daw_gui/src/view/plugin_picker.rs` の scroll_area 利用箇所すべて
+
+#### 症状
+
+Phase 1-3 (mixer / inspector を scroll_area 化) で実機確認したところ、**scrollbar の thumb を現在位置でクリックしても drag が始まらない**。具体的には:
+
+- mixer (horizontal scroll): wheel で右にスクロール → thumb が右に移動 → その thumb をドラッグしようとしても効かない。thumb が左端 (offset=0) のときだけドラッグできる。
+- inspector (vertical scroll): 下にスクロール → 下に動いた thumb をドラッグしても効かない。thumb が上端 (offset=0) のときだけ効く。
+- wheel scroll は問題なく動作する (drag だけ壊れる)。
+
+ユーザー報告: 「スクロールバーの下端、右端の方でドラッグができません」。
+
+#### 原因 (推定)
+
+`scroll_area.rs:108-117` で drag 判定用の `v_thumb_rect` / `h_thumb_rect` を **`offset = 0.0` で計算している**:
+
+```rust
+let v_thumb_rect = if need_v {
+    Some(thumb_rect_vertical(v_track_rect, content_size.1, rect.h, 0.0, max_y))
+    //                                                              ^^^ ここ
+} else {
+    None
+};
+let h_thumb_rect = if need_h {
+    Some(thumb_rect_horizontal(h_track_rect, content_size.0, rect.w, 0.0, max_x))
+    //                                                                ^^^ ここ
+} else {
+    None
+};
+```
+
+一方、scrollbar 描画用の `thumb` (line 200, 213) は `offset.1` / `offset.0` (現在 offset) で計算されている:
+
+```rust
+let thumb = thumb_rect_vertical(v_track_rect, content_size.1, rect.h, offset.1, max_y);
+```
+
+そのため、scrolled 状態では**描画位置と hit-test 位置が乖離**する。
+
+#### 提案修正
+
+drag 判定用 thumb_rect も現在 offset で計算する。`offset` ブロックの直前で `state.offset` を読み出して使うか、`state.offset` を block 外に取り出して `0.0` の代わりに渡す。
+
+```rust
+// state.offset を先に読み出す
+let prev_offset = {
+    let state: &mut ScrollState = self.widget_state(wid);
+    state.offset
+};
+let v_thumb_rect = if need_v {
+    Some(thumb_rect_vertical(v_track_rect, content_size.1, rect.h, prev_offset.1, max_y))
+} else {
+    None
+};
+// ...
+```
+
+または、`state.offset` 取得を block 上端に移し、wheel 適用後の offset で thumb_rect を再計算する案もある (winrer scroll で thumb 位置が更新された frame で drag start も成立させたい場合)。どちらが正しい挙動かは設計判断。
+
+#### daw_01 側の暫定対応
+
+修正されるまで wheel/keyboard scroll で代替してもらう。ユーザーには既知問題として伝達済。
+
+### gui_01 →
+（gui_01 Claude が記入）
+
+---
+
 ## #009 [Replied] 2026-05-03 [質問] mute/solo トグルを `checkbox_at` で表現可能か
 
 ### daw_01 →

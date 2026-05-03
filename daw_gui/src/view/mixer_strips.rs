@@ -68,35 +68,41 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let inner_pad = 8.0;
     let strip_y = area.y + inner_pad;
     let strip_h = area.h - inner_pad * 2.0;
-    let mut x = area.x + inner_pad;
 
-    // Per-track strips
-    let mix = app.track_mix();
-    for entry in &mix {
-        if x + STRIP_WIDTH > area.x + area.w - STRIP_WIDTH - STRIP_GAP * 2.0 {
-            // master strip 用に右端を空けておく。
-            break;
-        }
-        draw_strip(
-            ui,
-            entry.index as usize,
-            entry.name.as_str(),
-            entry.volume,
-            entry.pan,
-            entry.muted,
-            entry.solo,
-            entry.peak_l_raw,
-            entry.peak_r_raw,
-            Rect { x, y: strip_y, w: STRIP_WIDTH, h: strip_h },
-            COLOR_STRIP_BG,
-            entry.index,
-            false,
-        );
-        x += STRIP_WIDTH + STRIP_GAP;
-    }
-
-    // Master strip (右端固定)
+    // Master strip (右端固定、scroll_area の外)
     let master_x = area.x + area.w - inner_pad - STRIP_WIDTH;
+
+    // Per-track strips: 左端 inner_pad から master_x の手前まで scroll_area で横スクロール
+    let scroll_x = area.x + inner_pad;
+    let scroll_w = (master_x - inner_pad - scroll_x).max(0.0);
+    let scroll_rect = Rect { x: scroll_x, y: strip_y, w: scroll_w, h: strip_h };
+    let mix = app.track_mix();
+    let pitch = STRIP_WIDTH + STRIP_GAP;
+    let content_w = (mix.len() as f32) * pitch;
+    ui.scroll_area("mixer_strips", scroll_rect, (content_w, strip_h), |ui, offset| {
+        for (i, entry) in mix.iter().enumerate() {
+            let x = scroll_x - offset.0 + (i as f32) * pitch;
+            if x + STRIP_WIDTH < scroll_x || x > scroll_x + scroll_w {
+                continue;
+            }
+            draw_strip(
+                ui,
+                entry.index as usize,
+                entry.name.as_str(),
+                entry.volume,
+                entry.pan,
+                entry.muted,
+                entry.solo,
+                entry.peak_l_raw,
+                entry.peak_r_raw,
+                Rect { x, y: strip_y, w: STRIP_WIDTH, h: strip_h },
+                COLOR_STRIP_BG,
+                entry.index,
+                false,
+            );
+        }
+    });
+
     draw_strip(
         ui,
         usize::MAX,
@@ -130,18 +136,28 @@ fn draw_strip(
     track_idx: u32,
     is_master: bool,
 ) {
-    // ストリップ背景
+    // ストリップ背景。scroll_area 内では rect.x が offset で変動するので
+    // cache key に x/y bits を含める (含めないと stale rect を replay する)。
     ui.heavy(("mixer_strip_bg", layout_idx), |hctx| {
-        hctx.cached((rect.w.to_bits(), rect.h.to_bits(), bg.r.to_bits()), |hctx| {
-            hctx.push_rect(RectCommand {
-                rect,
-                fill: bg,
-                border: Color::TRANSPARENT,
-                border_width: 0.0,
-                radius: [4.0; 4],
-                clip_rect: None,
-            });
-        });
+        hctx.cached(
+            (
+                rect.x.to_bits(),
+                rect.y.to_bits(),
+                rect.w.to_bits(),
+                rect.h.to_bits(),
+                bg.r.to_bits(),
+            ),
+            |hctx| {
+                hctx.push_rect(RectCommand {
+                    rect,
+                    fill: bg,
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [4.0; 4],
+                    clip_rect: None,
+                });
+            },
+        );
     });
 
     let pad = 6.0;
@@ -181,17 +197,14 @@ fn draw_strip(
                 })
             },
         );
-        // ステータスを色帯で示す。
+        // ステータスを色帯で示す。scroll で rect.x が変動するので cache key に
+        // x/y bits を含める。45b (Ui::toggle_button_at) merge で消える tech debt。
         if muted {
+            let hint = Rect { x: rect.x + pad, y: y + TOGGLE_H - 2.0, w: btn_w, h: 2.0 };
             ui.heavy(("mixer_strip_mute_hint", layout_idx), |hctx| {
-                hctx.cached(muted, |hctx| {
+                hctx.cached((hint.x.to_bits(), hint.y.to_bits()), |hctx| {
                     hctx.push_rect(RectCommand {
-                        rect: Rect {
-                            x: rect.x + pad,
-                            y: y + TOGGLE_H - 2.0,
-                            w: btn_w,
-                            h: 2.0,
-                        },
+                        rect: hint,
                         fill: COLOR_MUTE_HINT,
                         border: Color::TRANSPARENT,
                         border_width: 0.0,
@@ -202,15 +215,16 @@ fn draw_strip(
             });
         }
         if solo {
+            let hint = Rect {
+                x: rect.x + pad + btn_w + 4.0,
+                y: y + TOGGLE_H - 2.0,
+                w: btn_w,
+                h: 2.0,
+            };
             ui.heavy(("mixer_strip_solo_hint", layout_idx), |hctx| {
-                hctx.cached(solo, |hctx| {
+                hctx.cached((hint.x.to_bits(), hint.y.to_bits()), |hctx| {
                     hctx.push_rect(RectCommand {
-                        rect: Rect {
-                            x: rect.x + pad + btn_w + 4.0,
-                            y: y + TOGGLE_H - 2.0,
-                            w: btn_w,
-                            h: 2.0,
-                        },
+                        rect: hint,
                         fill: COLOR_SOLO_HINT,
                         border: Color::TRANSPARENT,
                         border_width: 0.0,
