@@ -85,41 +85,42 @@ pub fn build_root(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize)
 
 /// 上部 menu bar (File / Edit / View) を library widget で描画。
 fn draw_menu_bar(ui: &mut Ui<'_, AppData>, rect: Rect) {
+    // M9 P1-5 (gui_01 側 breaking 変更): on_click closure に &mut Ui が渡る形に。
     ui.menu_bar(rect, |mb| {
         mb.menu("File", |m| {
-            m.item("New", || {
-                Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::New))
+            m.item("New", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::New)));
             });
-            m.item("Open...", || {
-                Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Open))
+            m.item("Open...", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Open)));
             });
-            m.item("Save", || {
-                Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Save))
+            m.item("Save", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Save)));
             });
-            m.item("Save As...", || {
-                Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::SaveAs))
+            m.item("Save As...", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::SaveAs)));
             });
-            m.item("Export WAV...", || {
-                Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ExportWav))
+            m.item("Export WAV...", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ExportWav)));
             });
         });
         mb.menu("Edit", |m| {
-            m.item("Undo", || {
-                Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Undo))
+            m.item("Undo", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Undo)));
             });
-            m.item("Redo", || {
-                Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Redo))
+            m.item("Redo", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Redo)));
             });
-            m.item("Delete", || {
-                Edit::mutate(|app: &mut AppData| {
+            m.item("Delete", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
                     app.handle_event(AppEvent::DeleteSelectedNotes);
                     app.handle_event(AppEvent::DeleteSelectedClip);
-                })
+                }));
             });
         });
         mb.menu("View", |m| {
-            m.item("Toggle Help", || {
-                Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ToggleHelp))
+            m.item("Toggle Help", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ToggleHelp)));
             });
         });
     });

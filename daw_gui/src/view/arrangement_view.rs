@@ -387,12 +387,12 @@ fn draw_track_headers(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         );
         // M8 Phase 25: track header の右クリックで Rename / Delete メニュー。
         // Move Up/Dn は下段の Up/Dn ボタンと役割重複するので menu には入れない。
-        ui.context_menu_for(name_rect, &["Rename", "Delete"], move |idx| {
-            Edit::mutate(move |app: &mut AppData| match idx {
+        ui.context_menu_for(name_rect, &["Rename", "Delete"], move |idx, ui| {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| match idx {
                 0 => app.handle_event(AppEvent::BeginRenameTrack(track_idx)),
                 1 => app.handle_event(AppEvent::DeleteTrack(track_idx)),
                 _ => {}
-            })
+            }));
         });
         // 名前テキスト (Button で隠れない位置に被せる)
         let _ = name_w;
