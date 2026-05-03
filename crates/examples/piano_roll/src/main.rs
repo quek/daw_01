@@ -127,18 +127,17 @@ impl PianoRollModel {
     }
 }
 
-// ----- Edit factory (M9 Phase 41a; multi 対応 helper) -----
+// ----- Edit factory (M9 Phase 41a/b/c; multi 対応 helper、Phase 41d で snapshot_inverse 経由に統一) -----
 
-/// 1 個 or 複数の note を一括 add する Undoable Edit。single note は `Arc::from([note])` で呼ぶ。
+/// 1 個 or 複数の note を一括 add する Undoable Edit。single note は `vec![note]` で呼ぶ。
 /// inverse は id で remove する。
-fn make_add_notes_edit(notes: Arc<[Note]>) -> Edit<PianoRollModel> {
+fn make_add_notes_edit(notes: Vec<Note>) -> Edit<PianoRollModel> {
     let label = if notes.len() == 1 { "add note" } else { "add notes" };
-    let n_fwd = Arc::clone(&notes);
-    let n_inv = notes;
-    Edit::with_inverse(
+    Edit::snapshot_inverse(
         label,
-        move |m: &mut PianoRollModel| {
-            for note in n_fwd.iter() {
+        notes,
+        |m: &mut PianoRollModel, snap: &Vec<Note>| {
+            for note in snap {
                 m.notes.push(*note);
             }
             m.notes.sort_by(|a, b| {
@@ -146,8 +145,8 @@ fn make_add_notes_edit(notes: Arc<[Note]>) -> Edit<PianoRollModel> {
             });
             m.notes_generation += 1;
         },
-        move |m: &mut PianoRollModel| {
-            let ids: HashSet<NoteId> = n_inv.iter().map(|n| n.id).collect();
+        |m: &mut PianoRollModel, snap: &Vec<Note>| {
+            let ids: HashSet<NoteId> = snap.iter().map(|n| n.id).collect();
             m.notes.retain(|x| !ids.contains(&x.id));
             m.selected_note_ids.retain(|sid| !ids.contains(sid));
             m.notes_generation += 1;
@@ -161,20 +160,16 @@ type MoveDelta = (NoteId, f32, u8, f32, u8);
 /// ResizeRight (右端 drag) は prev_start == next_start、ResizeLeft (左端 drag) は両方変わる。
 /// 1 Edit で start + len 両方を巻き戻すため start も capture する。
 type ResizeDelta = (NoteId, f32, f32, f32, f32);
-/// rect multi-select の selection 更新 helper: (prev_ids, next_ids)。
-type SelectDelta = (Arc<[NoteId]>, Arc<[NoteId]>);
 
-/// 1 個 or 複数の note を一括 move する Undoable Edit (M9 Phase 41b)。
-/// `deltas` の各要素は `MoveDelta` (タプル順序は型エイリアス参照)。
+/// 1 個 or 複数の note を一括 move する Undoable Edit (M9 Phase 41b、Phase 41d で snapshot_inverse 化)。
 /// move 後に start_beat 順で sort し直す (visible filtering の二分探索が安定するように)。
-fn make_move_notes_edit(deltas: Arc<[MoveDelta]>) -> Edit<PianoRollModel> {
+fn make_move_notes_edit(deltas: Vec<MoveDelta>) -> Edit<PianoRollModel> {
     let label = if deltas.len() == 1 { "move note" } else { "move notes" };
-    let d_fwd = Arc::clone(&deltas);
-    let d_inv = deltas;
-    Edit::with_inverse(
+    Edit::snapshot_inverse(
         label,
-        move |m: &mut PianoRollModel| {
-            for (id, _, _, ns, np) in d_fwd.iter().copied() {
+        deltas,
+        |m: &mut PianoRollModel, snap: &Vec<MoveDelta>| {
+            for (id, _, _, ns, np) in snap.iter().copied() {
                 if let Some(n) = m.notes.iter_mut().find(|x| x.id == id) {
                     n.start_beat = ns;
                     n.pitch = np;
@@ -185,8 +180,8 @@ fn make_move_notes_edit(deltas: Arc<[MoveDelta]>) -> Edit<PianoRollModel> {
             });
             m.notes_generation += 1;
         },
-        move |m: &mut PianoRollModel| {
-            for (id, ps, pp, _, _) in d_inv.iter().copied() {
+        |m: &mut PianoRollModel, snap: &Vec<MoveDelta>| {
+            for (id, ps, pp, _, _) in snap.iter().copied() {
                 if let Some(n) = m.notes.iter_mut().find(|x| x.id == id) {
                     n.start_beat = ps;
                     n.pitch = pp;
@@ -200,17 +195,15 @@ fn make_move_notes_edit(deltas: Arc<[MoveDelta]>) -> Edit<PianoRollModel> {
     )
 }
 
-/// 1 個 or 複数の note を一括 resize する Undoable Edit (M9 Phase 41b、Phase 41c で
-/// start_beat も変えられるように拡張)。
-/// ResizeLeft (左端 drag) は start + len 両方変わるので 1 Edit で巻き戻す。
-fn make_resize_notes_edit(deltas: Arc<[ResizeDelta]>) -> Edit<PianoRollModel> {
+/// 1 個 or 複数の note を一括 resize する Undoable Edit (M9 Phase 41b/41c、Phase 41d で
+/// snapshot_inverse 化)。ResizeLeft (左端 drag) は start + len 両方変わるので 1 Edit で巻き戻す。
+fn make_resize_notes_edit(deltas: Vec<ResizeDelta>) -> Edit<PianoRollModel> {
     let label = if deltas.len() == 1 { "resize note" } else { "resize notes" };
-    let d_fwd = Arc::clone(&deltas);
-    let d_inv = deltas;
-    Edit::with_inverse(
+    Edit::snapshot_inverse(
         label,
-        move |m: &mut PianoRollModel| {
-            for (id, _, _, ns, nl) in d_fwd.iter().copied() {
+        deltas,
+        |m: &mut PianoRollModel, snap: &Vec<ResizeDelta>| {
+            for (id, _, _, ns, nl) in snap.iter().copied() {
                 if let Some(n) = m.notes.iter_mut().find(|x| x.id == id) {
                     n.start_beat = ns;
                     n.len_beats = nl;
@@ -221,8 +214,8 @@ fn make_resize_notes_edit(deltas: Arc<[ResizeDelta]>) -> Edit<PianoRollModel> {
             });
             m.notes_generation += 1;
         },
-        move |m: &mut PianoRollModel| {
-            for (id, ps, pl, _, _) in d_inv.iter().copied() {
+        |m: &mut PianoRollModel, snap: &Vec<ResizeDelta>| {
+            for (id, ps, pl, _, _) in snap.iter().copied() {
                 if let Some(n) = m.notes.iter_mut().find(|x| x.id == id) {
                     n.start_beat = ps;
                     n.len_beats = pl;
@@ -236,18 +229,17 @@ fn make_resize_notes_edit(deltas: Arc<[ResizeDelta]>) -> Edit<PianoRollModel> {
     )
 }
 
-/// selected_note_ids を一括置換する Undoable Edit (M9 Phase 41c rect multi-select 用)。
-fn make_select_notes_edit(delta: SelectDelta) -> Edit<PianoRollModel> {
-    let (prev, next) = delta;
-    let prev_inv = Arc::clone(&prev);
-    let next_fwd = Arc::clone(&next);
-    Edit::with_inverse(
+/// selected_note_ids を一括置換する Undoable Edit (M9 Phase 41c rect multi-select 用、
+/// Phase 41d で snapshot_inverse 化)。`(prev, next)` を tuple で snapshot 共有。
+fn make_select_notes_edit(prev: Vec<NoteId>, next: Vec<NoteId>) -> Edit<PianoRollModel> {
+    Edit::snapshot_inverse(
         "select notes",
-        move |m: &mut PianoRollModel| {
-            m.selected_note_ids = next_fwd.to_vec();
+        (prev, next),
+        |m: &mut PianoRollModel, snap: &(Vec<NoteId>, Vec<NoteId>)| {
+            m.selected_note_ids.clone_from(&snap.1);
         },
-        move |m: &mut PianoRollModel| {
-            m.selected_note_ids = prev_inv.to_vec();
+        |m: &mut PianoRollModel, snap: &(Vec<NoteId>, Vec<NoteId>)| {
+            m.selected_note_ids.clone_from(&snap.0);
         },
     )
 }
@@ -351,20 +343,19 @@ fn note_hover_cursor(
 
 /// 1 個 or 複数の note を一括 delete する Undoable Edit。inverse は note 自体を push し直す
 /// (id ごと復元するので selected も再選択可)。
-fn make_delete_notes_edit(notes: Arc<[Note]>) -> Edit<PianoRollModel> {
+fn make_delete_notes_edit(notes: Vec<Note>) -> Edit<PianoRollModel> {
     let label = if notes.len() == 1 { "delete note" } else { "delete notes" };
-    let n_fwd = Arc::clone(&notes);
-    let n_inv = notes;
-    Edit::with_inverse(
+    Edit::snapshot_inverse(
         label,
-        move |m: &mut PianoRollModel| {
-            let ids: HashSet<NoteId> = n_fwd.iter().map(|n| n.id).collect();
+        notes,
+        |m: &mut PianoRollModel, snap: &Vec<Note>| {
+            let ids: HashSet<NoteId> = snap.iter().map(|n| n.id).collect();
             m.notes.retain(|x| !ids.contains(&x.id));
             m.selected_note_ids.retain(|sid| !ids.contains(sid));
             m.notes_generation += 1;
         },
-        move |m: &mut PianoRollModel| {
-            for note in n_inv.iter() {
+        |m: &mut PianoRollModel, snap: &Vec<Note>| {
+            for note in snap {
                 m.notes.push(*note);
             }
             m.notes.sort_by(|a, b| {
@@ -950,7 +941,7 @@ impl App {
                                 }
                                 if !deltas.is_empty() {
                                     let n_count = deltas.len();
-                                    hctx.push_edit(make_move_notes_edit(Arc::from(deltas)));
+                                    hctx.push_edit(make_move_notes_edit(deltas));
                                     hctx.push_edit(Edit::mutate(
                                         move |m: &mut PianoRollModel| {
                                             m.last_action = format!("move {n_count} note(s)");
@@ -976,7 +967,7 @@ impl App {
                                 }
                                 if !deltas.is_empty() {
                                     let n_count = deltas.len();
-                                    hctx.push_edit(make_resize_notes_edit(Arc::from(deltas)));
+                                    hctx.push_edit(make_resize_notes_edit(deltas));
                                     hctx.push_edit(Edit::mutate(
                                         move |m: &mut PianoRollModel| {
                                             m.last_action = format!("resize {n_count} note(s)");
@@ -1005,12 +996,11 @@ impl App {
                                 }
                             })
                             .collect();
-                        let prev: Arc<[NoteId]> =
-                            Arc::from(m.selected_note_ids.clone().into_boxed_slice());
-                        let next: Arc<[NoteId]> = Arc::from(new_ids.into_boxed_slice());
-                        if *prev != *next {
+                        let prev = m.selected_note_ids.clone();
+                        let next = new_ids;
+                        if prev != next {
                             let n_sel = next.len();
-                            hctx.push_edit(make_select_notes_edit((prev, next)));
+                            hctx.push_edit(make_select_notes_edit(prev, next));
                             hctx.push_edit(Edit::mutate(move |m: &mut PianoRollModel| {
                                 m.last_action = format!("rect select: {n_sel} note(s)");
                             }));
@@ -1036,7 +1026,7 @@ impl App {
                             pitch,
                             velocity: 96,
                         };
-                        let edit = make_add_notes_edit(Arc::from([new_note]));
+                        let edit = make_add_notes_edit(vec![new_note]);
                         hctx.push_edit(edit);
                         // next_note_id の bump は別 Mutate で (Undoable と分けることで undo 後の
                         // id 衝突回避: undo して新たに add した場合に new_id+1 を使う)
@@ -1051,7 +1041,7 @@ impl App {
                             m.notes.iter().filter(|n| sel_set.contains(&n.id)).copied().collect();
                         if !to_delete.is_empty() {
                             let n = to_delete.len();
-                            let edit = make_delete_notes_edit(Arc::from(to_delete));
+                            let edit = make_delete_notes_edit(to_delete);
                             hctx.push_edit(edit);
                             hctx.push_edit(Edit::mutate(move |m: &mut PianoRollModel| {
                                 m.last_action = format!("delete {n} note(s)");
@@ -1180,7 +1170,7 @@ mod tests {
     fn add_single_note_then_undo_round_trip() {
         let mut model = PianoRollModel::new(vec![]);
         let n = note(0, 0.0, 0.5, 60);
-        let edit = make_add_notes_edit(Arc::from([n]));
+        let edit = make_add_notes_edit(vec![n]);
         let Edit::Undoable { forward, inverse, .. } = edit else {
             panic!("expected Undoable");
         };
@@ -1194,11 +1184,11 @@ mod tests {
     #[test]
     fn add_multiple_notes_then_undo_round_trip() {
         let mut model = PianoRollModel::new(vec![]);
-        let notes_to_add: Arc<[Note]> = Arc::from([
+        let notes_to_add = vec![
             note(10, 1.0, 0.5, 60),
             note(11, 2.0, 0.5, 64),
             note(12, 3.0, 0.5, 67),
-        ]);
+        ];
         let edit = make_add_notes_edit(notes_to_add);
         let Edit::Undoable { forward, inverse, .. } = edit else {
             panic!("expected Undoable");
@@ -1220,7 +1210,7 @@ mod tests {
         ];
         let mut model = PianoRollModel::new(initial);
         // id 2 を削除
-        let to_delete: Arc<[Note]> = Arc::from([note(2, 1.0, 0.5, 64)]);
+        let to_delete = vec![note(2, 1.0, 0.5, 64)];
         let edit = make_delete_notes_edit(to_delete);
         let Edit::Undoable { forward, inverse, .. } = edit else {
             panic!("expected Undoable");
@@ -1239,7 +1229,7 @@ mod tests {
         let initial = vec![note(1, 0.0, 0.5, 60), note(2, 1.0, 0.5, 64)];
         let mut model = PianoRollModel::new(initial);
         model.selected_note_ids = vec![1, 2];
-        let to_delete: Arc<[Note]> = Arc::from([note(1, 0.0, 0.5, 60)]);
+        let to_delete = vec![note(1, 0.0, 0.5, 60)];
         let edit = make_delete_notes_edit(to_delete);
         if let Edit::Undoable { forward, .. } = edit {
             forward(&mut model);
@@ -1253,7 +1243,7 @@ mod tests {
         // ただしこの helper では同 note を 2 度 push してしまう (id 衝突は許容しない設計)。
         // Undoable な redo は forward を 1 度しか呼ばないことを前提とする (history.rs 側責務)。
         let mut model = PianoRollModel::new(vec![]);
-        let edit = make_add_notes_edit(Arc::from([note(0, 0.0, 0.5, 60)]));
+        let edit = make_add_notes_edit(vec![note(0, 0.0, 0.5, 60)]);
         if let Edit::Undoable { forward, .. } = edit {
             forward(&mut model);
             assert_eq!(model.notes.len(), 1);
@@ -1263,7 +1253,7 @@ mod tests {
     #[test]
     fn round_trip_uses_run_pair_helper() {
         let mut model = PianoRollModel::new(vec![]);
-        let edit = make_add_notes_edit(Arc::from([note(0, 0.0, 0.5, 60)]));
+        let edit = make_add_notes_edit(vec![note(0, 0.0, 0.5, 60)]);
         run_pair(edit, &mut model);
     }
 
@@ -1274,10 +1264,10 @@ mod tests {
         let initial = vec![note(0, 0.0, 0.5, 60), note(1, 1.0, 0.5, 64)];
         let mut model = PianoRollModel::new(initial);
         // id 0 を (0.0, 60) → (2.0, 72)、id 1 を (1.0, 64) → (3.0, 70)
-        let deltas: Arc<[MoveDelta]> = Arc::from([
+        let deltas: Vec<MoveDelta> = vec![
             (0u32, 0.0_f32, 60u8, 2.0_f32, 72u8),
             (1u32, 1.0_f32, 64u8, 3.0_f32, 70u8),
-        ]);
+        ];
         let edit = make_move_notes_edit(deltas);
         let Edit::Undoable { forward, inverse, .. } = edit else {
             panic!("expected Undoable");
@@ -1300,10 +1290,10 @@ mod tests {
         // ResizeRight: prev_start == next_start、len のみ変わる
         let initial = vec![note(0, 0.0, 0.5, 60), note(1, 1.0, 0.25, 64)];
         let mut model = PianoRollModel::new(initial);
-        let deltas: Arc<[ResizeDelta]> = Arc::from([
+        let deltas: Vec<ResizeDelta> = vec![
             (0u32, 0.0_f32, 0.5_f32, 0.0_f32, 1.0_f32),
             (1u32, 1.0_f32, 0.25_f32, 1.0_f32, 0.75_f32),
-        ]);
+        ];
         let edit = make_resize_notes_edit(deltas);
         let Edit::Undoable { forward, inverse, .. } = edit else {
             panic!("expected Undoable");
@@ -1322,8 +1312,8 @@ mod tests {
         let initial = vec![note(0, 1.0, 1.0, 60)];
         let mut model = PianoRollModel::new(initial);
         // 左端を 0.25 beat 左へ → start 0.75, len 1.25
-        let deltas: Arc<[ResizeDelta]> =
-            Arc::from([(0u32, 1.0_f32, 1.0_f32, 0.75_f32, 1.25_f32)]);
+        let deltas: Vec<ResizeDelta> =
+            vec![(0u32, 1.0_f32, 1.0_f32, 0.75_f32, 1.25_f32)];
         let edit = make_resize_notes_edit(deltas);
         let Edit::Undoable { forward, inverse, .. } = edit else {
             panic!("expected Undoable");
@@ -1406,9 +1396,9 @@ mod tests {
     fn select_notes_then_undo_restores_prev_selection() {
         let mut model = PianoRollModel::new(vec![note(0, 0.0, 0.5, 60), note(1, 1.0, 0.5, 64)]);
         model.selected_note_ids = vec![0];
-        let prev: Arc<[NoteId]> = Arc::from([0u32]);
-        let next: Arc<[NoteId]> = Arc::from([0u32, 1u32]);
-        let edit = make_select_notes_edit((prev, next));
+        let prev: Vec<NoteId> = vec![0u32];
+        let next: Vec<NoteId> = vec![0u32, 1u32];
+        let edit = make_select_notes_edit(prev, next);
         let Edit::Undoable { forward, inverse, .. } = edit else {
             panic!("expected Undoable");
         };
@@ -1423,8 +1413,8 @@ mod tests {
         // id 0 が start=2.0 に move、id 1 が start=0.5 に move → sort 後は [1, 0] の順
         let initial = vec![note(0, 0.0, 0.5, 60), note(1, 1.0, 0.5, 64)];
         let mut model = PianoRollModel::new(initial);
-        let deltas: Arc<[MoveDelta]> =
-            Arc::from([(0u32, 0.0_f32, 60u8, 2.0_f32, 60u8), (1u32, 1.0_f32, 64u8, 0.5_f32, 64u8)]);
+        let deltas: Vec<MoveDelta> =
+            vec![(0u32, 0.0_f32, 60u8, 2.0_f32, 60u8), (1u32, 1.0_f32, 64u8, 0.5_f32, 64u8)];
         let edit = make_move_notes_edit(deltas);
         if let Edit::Undoable { forward, .. } = edit {
             forward(&mut model);

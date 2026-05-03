@@ -66,6 +66,51 @@ impl<M: ?Sized + 'static> Edit<M> {
         }
     }
 
+    /// snapshot 共有付き Undoable Edit (M9 Phase 41d)。
+    ///
+    /// `Vec<Note>` / `Vec<f32>` / `Arc<[T]>` 級の重いデータを forward / inverse 両方の
+    /// closure で共有する典型パターンを 1 関数に集約し、利用者の `Arc::clone` boilerplate を
+    /// 吸収する。snapshot は library 側で `Arc` 化されて 2 closure に共有される。
+    ///
+    /// - `snapshot`: forward / inverse 両方が参照する不変データ (any `Send + Sync + 'static`)。
+    ///   通常は対象 note 群の `Arc<[Note]>` や、編集前後の値の tuple `(prev, next)` 等。
+    /// - `forward(&mut M, &S)`: 適用方向。snapshot を見て model を進める。
+    /// - `restore_from(&mut M, &S)`: 巻き戻し。snapshot から model 値を復元する。
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let notes_to_add: Arc<[Note]> = Arc::from(vec![n1, n2]);
+    /// Edit::snapshot_inverse(
+    ///     "add notes",
+    ///     notes_to_add,
+    ///     |m, snap| { for n in snap.iter() { m.notes.push(*n); } },
+    ///     |m, snap| {
+    ///         let ids: HashSet<u32> = snap.iter().map(|n| n.id).collect();
+    ///         m.notes.retain(|n| !ids.contains(&n.id));
+    ///     },
+    /// )
+    /// ```
+    pub fn snapshot_inverse<S, F, R>(
+        label: &'static str,
+        snapshot: S,
+        forward: F,
+        restore_from: R,
+    ) -> Self
+    where
+        S: Send + Sync + 'static,
+        F: Fn(&mut M, &S) + Send + Sync + 'static,
+        R: Fn(&mut M, &S) + Send + Sync + 'static,
+    {
+        let snap = Arc::new(snapshot);
+        let snap_fwd = Arc::clone(&snap);
+        let snap_inv = snap;
+        Self::with_inverse(
+            label,
+            move |m| forward(m, &snap_fwd),
+            move |m| restore_from(m, &snap_inv),
+        )
+    }
+
     /// アプリ側で保持している `&mut M` に対して apply。
     /// `Undoable` の場合は forward だけ実行する (history への push は呼び出し側責務)。
     pub fn apply(self, model: &mut M) {
@@ -89,6 +134,111 @@ impl<M: ?Sized + 'static> std::fmt::Debug for Edit<M> {
         match self {
             Self::Mutate(_) => f.write_str("Edit::Mutate(<closure>)"),
             Self::Undoable { label, .. } => write!(f, "Edit::Undoable({label})"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // M9 Phase 41d: Edit::snapshot_inverse のテスト
+
+    struct ListModel {
+        items: Vec<i32>,
+    }
+
+    #[test]
+    fn snapshot_inverse_round_trip_with_arc_slice() {
+        let mut m = ListModel { items: vec![1, 2, 3] };
+        let snapshot: Arc<[i32]> = Arc::from([10, 20, 30]);
+        let edit = Edit::snapshot_inverse(
+            "add items",
+            snapshot,
+            |m: &mut ListModel, snap: &Arc<[i32]>| {
+                for v in snap.iter() {
+                    m.items.push(*v);
+                }
+            },
+            |m: &mut ListModel, snap: &Arc<[i32]>| {
+                for v in snap.iter() {
+                    if let Some(pos) = m.items.iter().rposition(|x| *x == *v) {
+                        m.items.remove(pos);
+                    }
+                }
+            },
+        );
+        let Edit::Undoable { forward, inverse, label } = edit else {
+            panic!("expected Undoable");
+        };
+        assert_eq!(label, "add items");
+        forward(&mut m);
+        assert_eq!(m.items, vec![1, 2, 3, 10, 20, 30]);
+        inverse(&mut m);
+        assert_eq!(m.items, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn snapshot_inverse_with_tuple_pair_for_select_pattern() {
+        // (prev, next) tuple を snapshot にして「state 置換 + undo」型 helper を表現する。
+        struct SelectionModel {
+            selected: Vec<u32>,
+        }
+        let mut m = SelectionModel { selected: vec![1, 2] };
+        let snap: (Vec<u32>, Vec<u32>) = (vec![1, 2], vec![3, 4, 5]);
+        let edit = Edit::snapshot_inverse(
+            "select",
+            snap,
+            |m: &mut SelectionModel, s: &(Vec<u32>, Vec<u32>)| {
+                m.selected.clone_from(&s.1);
+            },
+            |m: &mut SelectionModel, s: &(Vec<u32>, Vec<u32>)| {
+                m.selected.clone_from(&s.0);
+            },
+        );
+        let Edit::Undoable { forward, inverse, .. } = edit else {
+            panic!();
+        };
+        forward(&mut m);
+        assert_eq!(m.selected, vec![3, 4, 5]);
+        inverse(&mut m);
+        assert_eq!(m.selected, vec![1, 2]);
+    }
+
+    #[test]
+    fn snapshot_inverse_forward_is_idempotent_for_redo() {
+        // forward を 2 度走らせても破綻しない (= Fn 制約 + idempotent な実装が前提)。
+        struct CountModel {
+            count: i32,
+        }
+        let mut m = CountModel { count: 0 };
+        let snap: i32 = 5;
+        let edit = Edit::snapshot_inverse(
+            "set count",
+            snap,
+            |m: &mut CountModel, s: &i32| m.count = *s,
+            |m: &mut CountModel, _s: &i32| m.count = 0,
+        );
+        let Edit::Undoable { forward, .. } = edit else { panic!() };
+        forward(&mut m);
+        forward(&mut m);
+        assert_eq!(m.count, 5, "set は idempotent なので 2 度 apply しても結果同じ");
+    }
+
+    #[test]
+    fn snapshot_inverse_send_sync_closures() {
+        // type system check: snapshot_inverse の戻り Edit が Send + Sync 制約を満たすことを
+        // コンパイル時に固定。
+        fn assert_send_sync<T: Send + Sync>(_: &T) {}
+        let edit = Edit::snapshot_inverse(
+            "noop",
+            42_i32,
+            |_m: &mut (), _s: &i32| {},
+            |_m: &mut (), _s: &i32| {},
+        );
+        if let Edit::Undoable { forward, inverse, .. } = &edit {
+            assert_send_sync(forward);
+            assert_send_sync(inverse);
         }
     }
 }
