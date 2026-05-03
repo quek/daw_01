@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use daw_ui_core::{
     BarBeatGridStyle, DialogResult, Edit, FaderResponse, FileDialogFilter, InputAccumulator,
-    LevelMeterStyle, MeterBallistic, Orientation, TimeMapping, TimeRulerStyle, UiHost,
-    ViewportState1D,
+    LevelMeterStyle, MenuItemSpec, MeterBallistic, Orientation, TimeMapping, TimeRulerStyle,
+    UiHost, ViewportState1D,
 };
 use daw_ui_platform::{AppEvent, AppHost, WindowBackend, winit_backend};
 use daw_ui_renderer::{Color, Rect, RectCommand, Renderer, Scene};
@@ -181,82 +181,101 @@ impl App {
                 }
 
                 // ---- 1. menu_bar ----
-                ui.menu_bar(menu_rect, |menu| {
+                // M9 P1-5: Undo/Redo の dynamic enable + shortcut hint。menu_bar の前に
+                // 取得して closure に move (内側 closure から borrow できるように `move` keyword)。
+                let edit_can_undo = ui.can_undo();
+                let edit_can_redo = ui.can_redo();
+                let undo_hint = ui.shortcut_for("undo");
+                let redo_hint = ui.shortcut_for("redo");
+                ui.menu_bar(menu_rect, move |menu| {
                     menu.menu("File", |sub| {
-                        sub.item("New", || {
-                            Edit::mutate(|m: &mut DawModel| {
+                        sub.item("New", |ui| {
+                            ui.push_edit(Edit::mutate(|m: &mut DawModel| {
                                 m.last_action = "File → New".to_string();
-                            })
+                            }));
                         });
-                        sub.item("Open...", || {
-                            Edit::mutate(|m: &mut DawModel| {
+                        sub.item("Open...", |ui| {
+                            ui.push_edit(Edit::mutate(|m: &mut DawModel| {
                                 m.last_action = "File → Open".to_string();
-                            })
+                            }));
                         });
                         // M7+ sub_menu cascade demo: hover で右に出る
                         sub.sub_menu("Recent", |recent| {
-                            recent.item("project1.daw", || {
-                                Edit::mutate(|m: &mut DawModel| {
+                            recent.item("project1.daw", |ui| {
+                                ui.push_edit(Edit::mutate(|m: &mut DawModel| {
                                     m.last_action = "File → Recent → project1.daw".to_string();
-                                })
+                                }));
                             });
-                            recent.item("session_2026.daw", || {
-                                Edit::mutate(|m: &mut DawModel| {
+                            recent.item("session_2026.daw", |ui| {
+                                ui.push_edit(Edit::mutate(|m: &mut DawModel| {
                                     m.last_action = "File → Recent → session_2026.daw".to_string();
-                                })
+                                }));
                             });
                             recent.sub_menu("Older", |older| {
-                                older.item("draft_a.daw", || {
-                                    Edit::mutate(|m: &mut DawModel| {
+                                older.item("draft_a.daw", |ui| {
+                                    ui.push_edit(Edit::mutate(|m: &mut DawModel| {
                                         m.last_action = "File → Recent → Older → draft_a".to_string();
-                                    })
+                                    }));
                                 });
-                                older.item("draft_b.daw", || {
-                                    Edit::mutate(|m: &mut DawModel| {
+                                older.item("draft_b.daw", |ui| {
+                                    ui.push_edit(Edit::mutate(|m: &mut DawModel| {
                                         m.last_action = "File → Recent → Older → draft_b".to_string();
-                                    })
+                                    }));
                                 });
                             });
                         });
-                        sub.item("Save", || {
-                            Edit::mutate(|m: &mut DawModel| {
+                        sub.item("Save", |ui| {
+                            ui.push_edit(Edit::mutate(|m: &mut DawModel| {
                                 m.last_action = "File → Save".to_string();
-                            })
+                            }));
                         });
-                        sub.item("Quit", || {
-                            Edit::mutate(|m: &mut DawModel| {
+                        sub.item("Quit", |ui| {
+                            ui.push_edit(Edit::mutate(|m: &mut DawModel| {
                                 m.last_action = "File → Quit (no-op in demo)".to_string();
-                            })
+                            }));
                         });
                     });
                     menu.menu("Edit", |sub| {
-                        // M8 Phase 29 + 30: shortcut Ctrl+Z / Ctrl+Shift+Z で undo/redo。
-                        // menu item は同 shortcut を発火する直接的経路がないため、ラベルで表記して
-                        // shortcut の存在を可視化する (本動作は shortcut layer で処理済み)。
-                        sub.item("Undo (Ctrl+Z)", || {
-                            Edit::mutate(|m: &mut DawModel| {
-                                m.last_action = "Edit → Undo: Ctrl+Z で実行されます".to_string();
-                            })
+                        // M9 P1-5 (C 案): on_click closure に &mut Ui を渡せるので、menu の Undo
+                        // から ui.request_undo() を直接発火可能。shortcut Ctrl+Z 経路と同等の動作。
+                        // enabled は can_undo() / can_redo() に基づいて動的に灰色化、shortcut_hint
+                        // で右端に "Ctrl+Z" 等を表示。
+                        sub.item_with(MenuItemSpec {
+                            label: "Undo",
+                            on_click: Box::new(|ui| {
+                                ui.request_undo();
+                                ui.push_edit(Edit::mutate(|m: &mut DawModel| {
+                                    m.last_action = "Edit → Undo (menu)".to_string();
+                                }));
+                            }),
+                            enabled: edit_can_undo,
+                            shortcut_hint: undo_hint,
                         });
-                        sub.item("Redo (Ctrl+Shift+Z)", || {
-                            Edit::mutate(|m: &mut DawModel| {
-                                m.last_action = "Edit → Redo: Ctrl+Shift+Z (or Ctrl+Y) で実行されます".to_string();
-                            })
+                        sub.item_with(MenuItemSpec {
+                            label: "Redo",
+                            on_click: Box::new(|ui| {
+                                ui.request_redo();
+                                ui.push_edit(Edit::mutate(|m: &mut DawModel| {
+                                    m.last_action = "Edit → Redo (menu)".to_string();
+                                }));
+                            }),
+                            enabled: edit_can_redo,
+                            shortcut_hint: redo_hint,
                         });
                     });
                     menu.menu("View", |sub| {
-                        sub.item("Reset zoom", || {
-                            Edit::mutate(|m: &mut DawModel| {
+                        sub.item("Reset zoom", |ui| {
+                            ui.push_edit(Edit::mutate(|m: &mut DawModel| {
                                 m.arr_viewport = ViewportState1D::new(0.0, 48_000.0 * 30.0);
                                 m.last_action = "View → Reset zoom".to_string();
-                            })
+                            }));
                         });
                     });
                     menu.menu("Help", |sub| {
-                        sub.item("About", || {
-                            Edit::mutate(|m: &mut DawModel| {
+                        sub.item("About", |ui| {
+                            ui.push_edit(Edit::mutate(|m: &mut DawModel| {
                                 m.last_action = HELP_TEXT.to_string();
-                            })
+                            }));
                         });
                     });
                 });
@@ -498,12 +517,12 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 clip_rect: Some(grid_rect),
             });
             // 右クリックで context_menu (clip 上で)
-            ui.context_menu_for(clip_rect, &["Cut", "Copy", "Delete", "Duplicate"], move |idx| {
+            ui.context_menu_for(clip_rect, &["Cut", "Copy", "Delete", "Duplicate"], move |idx, ui| {
                 let actions = ["Cut", "Copy", "Delete", "Duplicate"];
                 let label = actions.get(idx).copied().unwrap_or("?").to_string();
-                Edit::mutate(move |mm: &mut DawModel| {
+                ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
                     mm.last_action = format!("clip ctx → {label} (track {t} clip {c})");
-                })
+                }));
             });
         }
         // track separator

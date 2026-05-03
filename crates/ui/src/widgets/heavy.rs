@@ -205,9 +205,10 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
     }
 
     /// `Ui::context_menu_for` の delegate (heavy 内で右クリック menu)。
+    /// M9 P1-5 で `on_select: FnOnce(usize, &mut Ui<'_, M>)` に breaking 変更。
     pub fn context_menu_for<F>(&mut self, rect: Rect, items: &[&str], on_select: F)
     where
-        F: FnOnce(usize) -> Edit<M>,
+        F: for<'ui> FnOnce(usize, &mut Ui<'ui, M>),
     {
         self.ui.context_menu_for(rect, items, on_select);
     }
@@ -477,10 +478,9 @@ mod tests {
 
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.heavy("h_ctx", |hctx| {
-                hctx.context_menu_for(rect, &["Cut", "Copy", "Delete"], |idx| {
-                    Edit::mutate(move |(): &mut ()| {
-                        let _ = idx;
-                    })
+                hctx.context_menu_for(rect, &["Cut", "Copy", "Delete"], |idx, hctx_ui| {
+                    let _ = idx;
+                    hctx_ui.push_edit(Edit::mutate(|(): &mut ()| {}));
                 });
             });
         });

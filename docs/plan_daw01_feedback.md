@@ -337,6 +337,19 @@ feat(M9): P1-4 — Ui::take_double_click_in_rect API + fader/knob の重複ロ�
 
 ## P1-5: menu item の動的有効化と shortcut hint
 
+✅ done (commit 予定)
+
+実装結論:
+- `MenuItemSpec.enabled: bool` + `MenuItemSpec.shortcut_hint: Option<String>` を追加。
+- 短縮形 `MenuBuilder::item(label, on_click)` は `enabled: true / shortcut_hint: None` 同等。
+- 完全指定: `MenuBuilder::item_with(MenuItemSpec { ... })`。
+- **API breaking 変更 (C 案、CLAUDE.md「大胆に破壊して作り直す」原則)**:
+  - `MenuItemAction = Box<dyn FnOnce(&mut Ui<'_, M>) + 'a>` (旧 `FnOnce() -> Edit<M>`)
+  - `MenuBuilder::item` / `item_with` の `on_click`、`Ui::context_menu_for` / `HeavyCtx::context_menu_for` の `on_select` がすべて `&mut Ui` を受ける形に統一。
+  - 動機: menu item の Undo/Redo は単一 Edit ではなく `ui.request_undo()` 呼び出しを必要とするため、closure に `&mut Ui` を渡すのが最も自由度高い。「menu でできる action」は library が ADT で列挙するより closure に Ui を渡す方が拡張性高い。
+- 未決 1 (短縮形不要) → 採用 (`item_with` のみ追加)。
+- 未決 2 → `Option<String>` (所有版) を採用。`Ui::shortcut_for(name)` の戻り値をそのまま渡せる。`Option<&str>` だと closure 越しに lifetime 縛りで使いづらかった。
+
 ### Problem
 
 `m.item(label, on_click)` のみ。`can_undo()` が false でも item は active 表示。"Undo (Ctrl+Z)" のような hint も描けない、disabled menu item も作れない。
