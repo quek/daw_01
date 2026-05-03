@@ -90,11 +90,11 @@
 
 gui_01 回答を待つ間、既存 widget で完結するものを片付ける。各タスクは個別 commit。
 
-### 1-1. `bottom_panel.rs` を `tab_view_with_state` 化
+### 1-1. `bottom_panel.rs` を `tab_view_with_state` 化 [done c46df37]
 
 - archive #004 の sample を参考にタブ index `&mut u8 → &mut usize` 変換で書き換え。
 - mixer / piano_roll の中身 closure はそのまま維持。
-- 期待: ファイルが ~98 LOC → ~60 LOC、自前 `push_rect` x2 削除。
+- 結果: 98 → 49 LOC (-49)、自前 `push_rect` x2 + 定数 4 個削除。
 
 ### 1-2. `plugin_picker.rs` のリストを `scroll_area` 化 (modal 化は #007 待ち)
 
@@ -150,3 +150,5 @@ daw_01 側で組むもの:
 | 日付 | commit | Phase | 内容 |
 |---|---|---|---|
 | 2026-05-03 | (本ファイル作成) | - | plan.md 初版 |
+| 2026-05-03 | 2625255 | Phase 0 | 要望 #005-#009 を gui_01_conversation.md に投稿 |
+| 2026-05-03 | c46df37 | Phase 1-1 | bottom_panel を `tab_view_with_state` 化 (98 → 49 LOC) |
