@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
-use daw_ui_platform::{KeyEvent, PhysicalSize};
+use daw_ui_platform::{CursorIcon, KeyEvent, PhysicalSize};
 use daw_ui_renderer::{Color, GlyphArea, LineBatch, LineSegment, Rect, RectCommand, Scene};
 
 use crate::clipboard::ClipboardProvider;
@@ -62,6 +62,9 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// edits / focus 変化の検出時にライブラリが自動で呼ぶ closure。
     /// 通常は `WindowBackend::request_redraw` をラップしたもの。
     redraw_request: Box<dyn Fn() + Send + Sync>,
+    /// M9 Phase 41b: cursor 形状を OS に伝える callback。`with_window` 経由で
+    /// `WindowBackend::set_cursor` をラップ。`new` 直接呼び出しでは `None` (no-op)。
+    set_cursor_request: Option<Box<dyn Fn(CursorIcon) + Send + Sync>>,
     /// M7 Phase 25: 現在開いている popup の集合 (menu / context_menu / dropdown 共通)。
     /// `Ui::open_popup` / `Ui::close_popup` で出し入れする。`Ui` 経由で `&mut` 借用される
     /// ため rustc から "never read" と誤判定されるが、実際には popup_layer で読まれる。
@@ -89,6 +92,9 @@ pub struct UiHost<M: ?Sized + 'static> {
     transient_clipboard_writes_bytes: Vec<(&'static str, Vec<u8>)>,
     transient_dialog_requests: Vec<DialogRequest>,
     transient_consumed_dialog_results: HashSet<&'static str>,
+    /// M9 Phase 41b: 今フレームに `Ui::set_cursor` で要求された cursor (last call wins)。
+    /// `frame()` 末尾で `set_cursor_request` callback に flush され、None にリセットされる。
+    transient_cursor: Option<CursorIcon>,
     _m: PhantomData<fn(&mut M)>,
 }
 
@@ -116,6 +122,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
             transient_clipboard_writes_bytes: Vec::new(),
             transient_dialog_requests: Vec::new(),
             transient_consumed_dialog_results: HashSet::new(),
+            transient_cursor: None,
+            set_cursor_request: None,
             _m: PhantomData,
         }
     }
@@ -178,7 +186,11 @@ impl<M: ?Sized + 'static> UiHost<M> {
     where
         W: daw_ui_platform::WindowBackend + Send + Sync + 'static,
     {
-        Self::new(move || window.request_redraw())
+        let win_for_redraw = std::sync::Arc::clone(&window);
+        let win_for_cursor = window;
+        let mut host = Self::new(move || win_for_redraw.request_redraw());
+        host.set_cursor_request = Some(Box::new(move |c| win_for_cursor.set_cursor(c)));
+        host
     }
 
     /// テスト / offscreen render 用、`request_redraw` を呼ばない UiHost を構築する。
@@ -281,6 +293,13 @@ impl<M: ?Sized + 'static> UiHost<M> {
             self.pending_dialog_results.remove(name);
         }
 
+        // M9 Phase 41b: cursor flush (Ui::set_cursor で要求された形状を OS に伝える)。
+        if let Some(c) = self.transient_cursor.take()
+            && let Some(req) = self.set_cursor_request.as_ref()
+        {
+            req(c);
+        }
+
         // 自動 redraw の発火条件: edits / undo / redo / focus 変化 / widget からの request_redraw
         // / dialog 実行 (新結果が出た) / 残っている dialog 結果 (widget が次フレームで取り出す)。
         if had_edits
@@ -356,6 +375,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
         self.transient_clipboard_writes_bytes.clear();
         self.transient_dialog_requests.clear();
         self.transient_consumed_dialog_results.clear();
+        self.transient_cursor = None;
 
         let cursor = Rect::new(0.0, 0.0, screen.width as f32, screen.height as f32);
         let focused_at_start = self.focused;
@@ -406,6 +426,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             consumed_dialog_results: &mut self.transient_consumed_dialog_results,
             dialog_results: &self.pending_dialog_results,
             focus_order: &mut focus_order,
+            pending_cursor: &mut self.transient_cursor,
             _m: PhantomData,
         };
         f(model, &mut ui);
@@ -576,6 +597,10 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// このフレームに `Ui::focusable(wid, rect)` で登録された一覧。
     /// frame 末尾で UiHost に保存し、Tab / arrow nav の対象にする。
     pub(crate) focus_order: &'a mut Vec<(WidgetId, Rect)>,
+    // ---- M9 Phase 41b cursor ----
+    /// このフレーム末尾に OS に伝える cursor (last call wins)。
+    /// `Ui::set_cursor` で書き、`UiHost::frame` 末尾で `set_cursor_request` callback に流す。
+    pub(crate) pending_cursor: &'a mut Option<CursorIcon>,
     _m: PhantomData<&'a M>,
 }
 
@@ -817,6 +842,24 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 1 フレーム内で複数回呼ばれても 1 度の redraw 要求として扱う (累積 OR)。
     pub fn request_redraw(&mut self) {
         *self.redraw_requested = true;
+    }
+
+    // ============================================================
+    // M9 Phase 41b: cursor 形状要求
+    // ============================================================
+
+    /// このフレーム末尾に OS カーソル形状を変更要求する。同フレーム内で複数回呼ばれた
+    /// 場合は **last call wins** (= 直前 widget の要求は捨てられる)。
+    ///
+    /// `WindowBackend::set_cursor` callback が registered されていなければ no-op
+    /// (low-level constructor [`UiHost::new`] / [`UiHost::no_redraw`] で構築した場合)。
+    /// 通常 [`UiHost::with_window`] で構築すれば自動的に有効化される。
+    ///
+    /// `set_cursor` を呼ばなかったフレームは前フレームの形状が OS 側に保持されたまま
+    /// (winit は state-full)。reset したい場合は明示的に `set_cursor(CursorIcon::Default)`
+    /// を呼ぶこと。
+    pub fn set_cursor(&mut self, cursor: CursorIcon) {
+        *self.pending_cursor = Some(cursor);
     }
 
     // ============================================================
@@ -1344,6 +1387,7 @@ pub(crate) fn lerp_color(a: Color, b: Color, t: f32) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     /// `widget_state` で書き戻した値が次フレームでも同型として読み取れる
     /// (`Box<dyn WidgetState>` 自体への blanket impl が `as_any_mut` を奪わないことの回帰防止)。
@@ -1928,5 +1972,88 @@ mod tests {
             });
         });
         assert_eq!(b_calls.get(), 1, "b は eviction されたので cache miss、draw_fn が再実行");
+    }
+
+    // ============================================================
+    // M9 Phase 41b: Ui::set_cursor + transient flush
+    // ============================================================
+
+    #[test]
+    fn ui_set_cursor_calls_callback_on_frame_end() {
+        use std::sync::Mutex;
+        let captured: Arc<Mutex<Option<CursorIcon>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        host.set_cursor_request = Some(Box::new(move |c| {
+            *captured_clone.lock().unwrap() = Some(c);
+        }));
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+
+        host.frame(&mut (), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.set_cursor(CursorIcon::EwResize);
+        });
+
+        assert_eq!(*captured.lock().unwrap(), Some(CursorIcon::EwResize));
+    }
+
+    #[test]
+    fn ui_set_cursor_no_op_when_callback_unset() {
+        // no_redraw / new で構築した UiHost は set_cursor_request = None。
+        // Ui::set_cursor を呼んでも panic せず、何も起きないことを確認。
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+
+        host.frame(&mut (), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.set_cursor(CursorIcon::Move);
+        });
+        // no panic
+    }
+
+    #[test]
+    fn ui_set_cursor_last_call_wins_within_frame() {
+        use std::sync::Mutex;
+        let captured: Arc<Mutex<Option<CursorIcon>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        host.set_cursor_request = Some(Box::new(move |c| {
+            *captured_clone.lock().unwrap() = Some(c);
+        }));
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+
+        host.frame(&mut (), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.set_cursor(CursorIcon::EwResize);
+            ui.set_cursor(CursorIcon::Move);     // 後勝ち
+            ui.set_cursor(CursorIcon::Pointer);  // 後勝ち
+        });
+
+        assert_eq!(*captured.lock().unwrap(), Some(CursorIcon::Pointer));
+    }
+
+    #[test]
+    fn ui_set_cursor_resets_between_frames() {
+        use std::sync::Mutex;
+        let captured: Arc<Mutex<Vec<CursorIcon>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        host.set_cursor_request = Some(Box::new(move |c| {
+            captured_clone.lock().unwrap().push(c);
+        }));
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+
+        // Frame 1: set_cursor 呼ぶ
+        host.frame(&mut (), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.set_cursor(CursorIcon::EwResize);
+        });
+        // Frame 2: 呼ばない → callback も発火しないこと (前 frame の cursor は残らない)
+        host.frame(&mut (), &mut scene, screen, FrameInput::default(), |(), _ui| {});
+
+        assert_eq!(*captured.lock().unwrap(), vec![CursorIcon::EwResize]);
     }
 }

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use daw_ui_core::{
-    Edit, InputAccumulator, UiHost, hash_inputs,
+    CursorIcon, Edit, InputAccumulator, UiHost, hash_inputs,
 };
 use daw_ui_platform::{
     AppEvent, AppHost, PhysicalSize, ScrollDelta, WindowBackend, winit_backend,
@@ -153,6 +153,104 @@ fn make_add_notes_edit(notes: Arc<[Note]>) -> Edit<PianoRollModel> {
             m.notes_generation += 1;
         },
     )
+}
+
+/// move helper の delta タプル: (id, prev_start_beat, prev_pitch, next_start_beat, next_pitch)。
+type MoveDelta = (NoteId, f32, u8, f32, u8);
+/// resize helper の delta タプル: (id, prev_len_beats, next_len_beats)。
+type ResizeDelta = (NoteId, f32, f32);
+
+/// 1 個 or 複数の note を一括 move する Undoable Edit (M9 Phase 41b)。
+/// `deltas` の各要素は `MoveDelta` (タプル順序は型エイリアス参照)。
+/// move 後に start_beat 順で sort し直す (visible filtering の二分探索が安定するように)。
+fn make_move_notes_edit(deltas: Arc<[MoveDelta]>) -> Edit<PianoRollModel> {
+    let label = if deltas.len() == 1 { "move note" } else { "move notes" };
+    let d_fwd = Arc::clone(&deltas);
+    let d_inv = deltas;
+    Edit::with_inverse(
+        label,
+        move |m: &mut PianoRollModel| {
+            for (id, _, _, ns, np) in d_fwd.iter().copied() {
+                if let Some(n) = m.notes.iter_mut().find(|x| x.id == id) {
+                    n.start_beat = ns;
+                    n.pitch = np;
+                }
+            }
+            m.notes.sort_by(|a, b| {
+                a.start_beat.partial_cmp(&b.start_beat).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            m.notes_generation += 1;
+        },
+        move |m: &mut PianoRollModel| {
+            for (id, ps, pp, _, _) in d_inv.iter().copied() {
+                if let Some(n) = m.notes.iter_mut().find(|x| x.id == id) {
+                    n.start_beat = ps;
+                    n.pitch = pp;
+                }
+            }
+            m.notes.sort_by(|a, b| {
+                a.start_beat.partial_cmp(&b.start_beat).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            m.notes_generation += 1;
+        },
+    )
+}
+
+/// 1 個 or 複数の note を一括 resize (length 変更) する Undoable Edit (M9 Phase 41b)。
+/// start_beat は変えないので sort 不要。
+fn make_resize_notes_edit(deltas: Arc<[ResizeDelta]>) -> Edit<PianoRollModel> {
+    let label = if deltas.len() == 1 { "resize note" } else { "resize notes" };
+    let d_fwd = Arc::clone(&deltas);
+    let d_inv = deltas;
+    Edit::with_inverse(
+        label,
+        move |m: &mut PianoRollModel| {
+            for (id, _, nl) in d_fwd.iter().copied() {
+                if let Some(n) = m.notes.iter_mut().find(|x| x.id == id) {
+                    n.len_beats = nl;
+                }
+            }
+            m.notes_generation += 1;
+        },
+        move |m: &mut PianoRollModel| {
+            for (id, pl, _) in d_inv.iter().copied() {
+                if let Some(n) = m.notes.iter_mut().find(|x| x.id == id) {
+                    n.len_beats = pl;
+                }
+            }
+            m.notes_generation += 1;
+        },
+    )
+}
+
+/// hover 中の note hit zone から cursor 形状を決める (M9 Phase 41b)。
+/// 左右 4px = resize handle (`EwResize`)、中央 = `Move`。grid 外や note 上以外は None。
+fn note_hover_cursor(
+    visible: &[Note],
+    m: &PianoRollModel,
+    grid: Rect,
+    cx: f32,
+    cy: f32,
+) -> Option<CursorIcon> {
+    if !grid.contains(cx, cy) {
+        return None;
+    }
+    let mut hit_cursor: Option<CursorIcon> = None;
+    for note in visible {
+        let r = note_to_rect(*note, m, grid);
+        if !r.contains(cx, cy) {
+            continue;
+        }
+        let edge = 4.0;
+        // resize handle は note 幅が 2*edge より大きいときだけ反応 (狭い note では Move 優先)
+        let cursor = if r.w > edge * 2.0 && (cx - r.x < edge || (r.x + r.w) - cx < edge) {
+            CursorIcon::EwResize
+        } else {
+            CursorIcon::Move
+        };
+        hit_cursor = Some(cursor); // 後勝ち
+    }
+    hit_cursor
 }
 
 /// 1 個 or 複数の note を一括 delete する Undoable Edit。inverse は note 自体を push し直す
@@ -640,6 +738,13 @@ impl App {
                         }
                     }
 
+                    // --- M9 Phase 41b: hover 中の note hit zone から cursor を変える ---
+                    if let Some((cx, cy)) = hctx.pointer().pos
+                        && let Some(cursor) = note_hover_cursor(visible, m, grid, cx, cy)
+                    {
+                        hctx.set_cursor(cursor);
+                    }
+
                     // --- M9 Phase 41a: Insert で cursor 位置に note add、Delete で selected を削除 ---
                     if hctx.take_shortcut("add_note")
                         && let Some((cx, cy)) = hctx.pointer().pos
@@ -888,5 +993,121 @@ mod tests {
         let mut model = PianoRollModel::new(vec![]);
         let edit = make_add_notes_edit(Arc::from([note(0, 0.0, 0.5, 60)]));
         run_pair(edit, &mut model);
+    }
+
+    // -------- M9 Phase 41b: move / resize / cursor hover --------
+
+    #[test]
+    fn move_notes_then_undo_round_trip() {
+        let initial = vec![note(0, 0.0, 0.5, 60), note(1, 1.0, 0.5, 64)];
+        let mut model = PianoRollModel::new(initial);
+        // id 0 を (0.0, 60) → (2.0, 72)、id 1 を (1.0, 64) → (3.0, 70)
+        let deltas: Arc<[MoveDelta]> = Arc::from([
+            (0u32, 0.0_f32, 60u8, 2.0_f32, 72u8),
+            (1u32, 1.0_f32, 64u8, 3.0_f32, 70u8),
+        ]);
+        let edit = make_move_notes_edit(deltas);
+        let Edit::Undoable { forward, inverse, .. } = edit else {
+            panic!("expected Undoable");
+        };
+        forward(&mut model);
+        let n0 = model.notes.iter().find(|n| n.id == 0).unwrap();
+        assert!((n0.start_beat - 2.0).abs() < 1e-6);
+        assert_eq!(n0.pitch, 72);
+        let n1 = model.notes.iter().find(|n| n.id == 1).unwrap();
+        assert!((n1.start_beat - 3.0).abs() < 1e-6);
+        assert_eq!(n1.pitch, 70);
+        inverse(&mut model);
+        let n0 = model.notes.iter().find(|n| n.id == 0).unwrap();
+        assert!((n0.start_beat - 0.0).abs() < 1e-6);
+        assert_eq!(n0.pitch, 60);
+    }
+
+    #[test]
+    fn resize_notes_then_undo_round_trip() {
+        let initial = vec![note(0, 0.0, 0.5, 60), note(1, 1.0, 0.25, 64)];
+        let mut model = PianoRollModel::new(initial);
+        let deltas: Arc<[ResizeDelta]> =
+            Arc::from([(0u32, 0.5_f32, 1.0_f32), (1u32, 0.25_f32, 0.75_f32)]);
+        let edit = make_resize_notes_edit(deltas);
+        let Edit::Undoable { forward, inverse, .. } = edit else {
+            panic!("expected Undoable");
+        };
+        forward(&mut model);
+        assert!((model.notes.iter().find(|n| n.id == 0).unwrap().len_beats - 1.0).abs() < 1e-6);
+        assert!((model.notes.iter().find(|n| n.id == 1).unwrap().len_beats - 0.75).abs() < 1e-6);
+        inverse(&mut model);
+        assert!((model.notes.iter().find(|n| n.id == 0).unwrap().len_beats - 0.5).abs() < 1e-6);
+        assert!((model.notes.iter().find(|n| n.id == 1).unwrap().len_beats - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn move_preserves_sort_order() {
+        // id 0 が start=2.0 に move、id 1 が start=0.5 に move → sort 後は [1, 0] の順
+        let initial = vec![note(0, 0.0, 0.5, 60), note(1, 1.0, 0.5, 64)];
+        let mut model = PianoRollModel::new(initial);
+        let deltas: Arc<[MoveDelta]> =
+            Arc::from([(0u32, 0.0_f32, 60u8, 2.0_f32, 60u8), (1u32, 1.0_f32, 64u8, 0.5_f32, 64u8)]);
+        let edit = make_move_notes_edit(deltas);
+        if let Edit::Undoable { forward, .. } = edit {
+            forward(&mut model);
+        }
+        let order: Vec<NoteId> = model.notes.iter().map(|n| n.id).collect();
+        assert_eq!(order, vec![1, 0], "sort_by(start_beat) で順序入替わり");
+    }
+
+    fn make_test_model() -> PianoRollModel {
+        // pitch_top=72, pitch_visible=24, view_start=0, view_len=4
+        // grid (50,0) - (450,200) と仮定すると:
+        //   beat_to_px = 400 / 4 = 100, pitch_to_px = 200 / 24 ≈ 8.33
+        let n = note(0, 1.0, 1.0, 60);
+        // note: start=1.0, len=1.0, pitch=60
+        // x = 50 + (1.0 - 0) * 100 = 150
+        // w = 1.0 * 100 = 100
+        // y = 0 + (72 - 60) * 8.33 ≈ 100
+        // h = 8.33 - 1 ≈ 7.33
+        PianoRollModel::new(vec![n])
+    }
+
+    #[test]
+    fn note_hover_cursor_returns_move_in_center() {
+        let model = make_test_model();
+        let grid = Rect { x: 50.0, y: 0.0, w: 400.0, h: 200.0 };
+        let visible: Vec<Note> = model.notes.clone();
+        // x=200 は note の中央 (150..250 の真ん中)
+        let cursor = note_hover_cursor(&visible, &model, grid, 200.0, 102.0);
+        assert_eq!(cursor, Some(CursorIcon::Move));
+    }
+
+    #[test]
+    fn note_hover_cursor_returns_ewresize_at_edges() {
+        let model = make_test_model();
+        let grid = Rect { x: 50.0, y: 0.0, w: 400.0, h: 200.0 };
+        let visible: Vec<Note> = model.notes.clone();
+        // 左端: x=151 (rect.x = 150 + 1px = handle 内)
+        let cursor_left = note_hover_cursor(&visible, &model, grid, 151.0, 102.0);
+        assert_eq!(cursor_left, Some(CursorIcon::EwResize));
+        // 右端: x=249 (rect.x + w = 250、249 = handle 内)
+        let cursor_right = note_hover_cursor(&visible, &model, grid, 249.0, 102.0);
+        assert_eq!(cursor_right, Some(CursorIcon::EwResize));
+    }
+
+    #[test]
+    fn note_hover_cursor_returns_none_outside_grid() {
+        let model = make_test_model();
+        let grid = Rect { x: 50.0, y: 0.0, w: 400.0, h: 200.0 };
+        let visible: Vec<Note> = model.notes.clone();
+        let cursor = note_hover_cursor(&visible, &model, grid, 10.0, 10.0);
+        assert_eq!(cursor, None, "grid 外は None");
+    }
+
+    #[test]
+    fn note_hover_cursor_returns_none_on_empty_area() {
+        let model = make_test_model();
+        let grid = Rect { x: 50.0, y: 0.0, w: 400.0, h: 200.0 };
+        let visible: Vec<Note> = model.notes.clone();
+        // grid 内だが note 上ではない (y=10、note は y=100 付近)
+        let cursor = note_hover_cursor(&visible, &model, grid, 200.0, 10.0);
+        assert_eq!(cursor, None);
     }
 }

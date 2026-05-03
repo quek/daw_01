@@ -33,7 +33,7 @@
 use std::hash::Hash;
 use std::path::PathBuf;
 
-use daw_ui_platform::PhysicalSize;
+use daw_ui_platform::{CursorIcon, PhysicalSize};
 use daw_ui_renderer::{Color, GlyphArea, LineBatch, Rect, RectCommand};
 
 use crate::edit::Edit;
@@ -237,6 +237,11 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
     #[must_use]
     pub fn can_redo(&self) -> bool {
         self.ui.can_redo()
+    }
+
+    /// `Ui::set_cursor` の delegate (M9 Phase 41b、heavy 内 hover で cursor 変更等)。
+    pub fn set_cursor(&mut self, cursor: CursorIcon) {
+        self.ui.set_cursor(cursor);
     }
 }
 
