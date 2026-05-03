@@ -95,7 +95,48 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// M9 Phase 41b: 今フレームに `Ui::set_cursor` で要求された cursor (last call wins)。
     /// `frame()` 末尾で `set_cursor_request` callback に flush され、None にリセットされる。
     transient_cursor: Option<CursorIcon>,
+    /// M9 Phase 43: 直近フレームの統計 (debug overlay 表示用)。`frame_to_edits` 末尾で更新。
+    /// frame_ms は app 側で計測 (window backend / render pipeline により取得方法が違うため、
+    /// library は frame_ms を track せず `Ui::debug_overlay(rect, frame_ms)` の引数で受ける)。
+    last_frame_stats: FrameStats,
+    /// M9 Phase 43: working buffer (frame_to_edits の冒頭で 0 リセット、widget 描画でインクリメント、
+    /// 末尾で `last_frame_stats` に転記)。
+    current_cache_hits: u32,
+    current_cache_misses: u32,
     _m: PhantomData<fn(&mut M)>,
+}
+
+/// `Ui::debug_overlay` で表示する 1 frame 分の統計 (M9 Phase 43)。
+///
+/// `UiHost::last_frame_stats()` で取得できる。`frame_ms` は library が計測しないため
+/// 含めない (app 側で `Instant` で測定し、`Ui::debug_overlay(rect, frame_ms)` の引数で渡す)。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FrameStats {
+    /// 直近フレームに `with_widget_node` で cache hit した回数 (= 描画スキップ数)。
+    pub cache_hits: u32,
+    /// 直近フレームに `with_widget_node` で cache miss して draw_fn を実行した回数。
+    pub cache_misses: u32,
+    /// 直近フレームに登場した widget の数 (`seen_widgets` の末尾サイズ)。
+    pub widget_count: u32,
+    /// frame 末尾の scenegraph entry 数 (eviction 後)。`widget_count` と通常一致。
+    pub scenegraph_size: u32,
+    /// frame 末尾の history undo stack 深さ。
+    pub history_undo_depth: u32,
+    /// frame 末尾の history redo stack 深さ。
+    pub history_redo_depth: u32,
+}
+
+impl FrameStats {
+    /// cache hit 率 (`hits / (hits + misses)`、totalが 0 なら 0.0)。
+    #[must_use]
+    pub fn cache_hit_rate(&self) -> f32 {
+        let total = self.cache_hits + self.cache_misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.cache_hits as f32 / total as f32
+        }
+    }
 }
 
 impl<M: ?Sized + 'static> UiHost<M> {
@@ -124,8 +165,21 @@ impl<M: ?Sized + 'static> UiHost<M> {
             transient_consumed_dialog_results: HashSet::new(),
             transient_cursor: None,
             set_cursor_request: None,
+            last_frame_stats: FrameStats::default(),
+            current_cache_hits: 0,
+            current_cache_misses: 0,
             _m: PhantomData,
         }
+    }
+
+    /// M9 Phase 43: 直近フレームの統計 (debug overlay 用)。
+    ///
+    /// `frame_to_edits` 末尾で更新されるので、frame closure 外から read できる。
+    /// frame closure 内では「前 frame の stats」が見える (= `Ui::debug_overlay` で
+    /// 描画する内容)。
+    #[must_use]
+    pub fn last_frame_stats(&self) -> FrameStats {
+        self.last_frame_stats
     }
 
     /// M8 Phase 29: history stack の容量を変更 (default 100 step、0 で無効化)。
@@ -376,6 +430,10 @@ impl<M: ?Sized + 'static> UiHost<M> {
         self.transient_dialog_requests.clear();
         self.transient_consumed_dialog_results.clear();
         self.transient_cursor = None;
+        // M9 Phase 43: cache stats を frame 頭でリセット。with_widget_node 内で increment、
+        // 末尾で `last_frame_stats` に転記。
+        self.current_cache_hits = 0;
+        self.current_cache_misses = 0;
 
         let cursor = Rect::new(0.0, 0.0, screen.width as f32, screen.height as f32);
         let focused_at_start = self.focused;
@@ -427,6 +485,9 @@ impl<M: ?Sized + 'static> UiHost<M> {
             dialog_results: &self.pending_dialog_results,
             focus_order: &mut focus_order,
             pending_cursor: &mut self.transient_cursor,
+            cache_hits: &mut self.current_cache_hits,
+            cache_misses: &mut self.current_cache_misses,
+            last_frame_stats: self.last_frame_stats,
             _m: PhantomData,
         };
         f(model, &mut ui);
@@ -493,6 +554,15 @@ impl<M: ?Sized + 'static> UiHost<M> {
         self.scenegraph.retain(&seen_widgets);
         // M8 Phase 30: 次フレーム用に focusable 一覧を保存。
         self.last_focusable = focus_order_snapshot;
+        // M9 Phase 43: frame stats を確定 (debug overlay は次フレームでこれを read)。
+        self.last_frame_stats = FrameStats {
+            cache_hits: self.current_cache_hits,
+            cache_misses: self.current_cache_misses,
+            widget_count: u32::try_from(seen_widgets.len()).unwrap_or(u32::MAX),
+            scenegraph_size: u32::try_from(self.scenegraph.len()).unwrap_or(u32::MAX),
+            history_undo_depth: u32::try_from(self.history.undo_len()).unwrap_or(u32::MAX),
+            history_redo_depth: u32::try_from(self.history.redo_len()).unwrap_or(u32::MAX),
+        };
         edits
     }
 }
@@ -601,6 +671,13 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// このフレーム末尾に OS に伝える cursor (last call wins)。
     /// `Ui::set_cursor` で書き、`UiHost::frame` 末尾で `set_cursor_request` callback に流す。
     pub(crate) pending_cursor: &'a mut Option<CursorIcon>,
+    // ---- M9 Phase 43 debug stats ----
+    /// このフレームで `with_widget_node` cache hit した回数 (描画スキップ数)。
+    pub(crate) cache_hits: &'a mut u32,
+    /// このフレームで `with_widget_node` cache miss して draw_fn を実行した回数。
+    pub(crate) cache_misses: &'a mut u32,
+    /// 直近フレームの統計 (debug_overlay 表示用、Copy 値)。
+    pub(crate) last_frame_stats: FrameStats,
     _m: PhantomData<&'a M>,
 }
 
@@ -784,8 +861,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.scene.rects.extend_from_slice(&cached.rects);
             self.scene.glyph_areas.extend(cached.glyph_areas.iter().cloned());
             self.scene.line_batches.extend(cached.line_batches.iter().cloned());
+            *self.cache_hits += 1;
             return;
         }
+        *self.cache_misses += 1;
 
         // miss → draw_fn を実行して scene 末尾の差分を新規 commands として記録。
         let r0 = self.scene.rects.len();
@@ -860,6 +939,92 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// を呼ぶこと。
     pub fn set_cursor(&mut self, cursor: CursorIcon) {
         *self.pending_cursor = Some(cursor);
+    }
+
+    // ============================================================
+    // M9 Phase 43: debug overlay
+    // ============================================================
+
+    /// 直近フレームの統計を `rect` の右上に半透明 overlay として描画する。
+    ///
+    /// `frame_ms` は app 側で測定した frame の所要時間 (window backend / render pipeline
+    /// により計測方法が違うので library は track せず引数で受ける)。`0.0` を渡せば省略。
+    ///
+    /// 表示項目:
+    /// - frame: `{frame_ms:.2}ms` (引数 `frame_ms` < 1e-6 なら省略)
+    /// - cache: `{hits} / {hits+misses}` + ヒット率 `{rate:.0}%`
+    /// - widgets: `{widget_count}` (scenegraph_size と通常一致)
+    /// - history: `undo {undo_depth} / redo {redo_depth}`
+    ///
+    /// 統計は **前フレーム** の値 (今フレームは描画中でまだ確定していない)。`Ui::take_shortcut`
+    /// を組み合わせると Ctrl+F1 で toggle できる:
+    /// ```ignore
+    /// if ui.take_shortcut("debug_overlay_toggle") {
+    ///     m.show_debug = !m.show_debug;
+    /// }
+    /// if m.show_debug {
+    ///     ui.debug_overlay(area, last_frame_ms);
+    /// }
+    /// ```
+    pub fn debug_overlay(&mut self, rect: Rect, frame_ms: f32) {
+        let stats = self.last_frame_stats;
+        let line_h = 14.0;
+        let pad = 6.0;
+        let font_size = 11.0;
+        let lines: Vec<String> = {
+            let mut v = Vec::with_capacity(5);
+            if frame_ms.abs() > 1e-6 {
+                v.push(format!("frame  {frame_ms:>5.2}ms"));
+            }
+            let total = stats.cache_hits + stats.cache_misses;
+            v.push(format!(
+                "cache  {} / {} ({:>3.0}%)",
+                stats.cache_hits,
+                total,
+                stats.cache_hit_rate() * 100.0
+            ));
+            v.push(format!("wgts   {}", stats.widget_count));
+            v.push(format!("sg     {}", stats.scenegraph_size));
+            v.push(format!(
+                "hist   undo {} / redo {}",
+                stats.history_undo_depth, stats.history_redo_depth
+            ));
+            v
+        };
+        let lines_n = lines.len() as f32;
+        let bg_w = 200.0_f32.min(rect.w);
+        let bg_h = (lines_n * line_h + pad * 2.0).min(rect.h);
+        let bg_rect = Rect {
+            x: rect.x + rect.w - bg_w - pad,
+            y: rect.y + pad,
+            w: bg_w,
+            h: bg_h,
+        };
+        // 半透明背景 + テキストを **base scene に直接 push** する。popup buffer (= popup pass)
+        // を使うと glyphon TextRenderer の internal GPU buffer が base pass のものと共有
+        // されており、popup pass の prepare で base pass の glyph data が上書きされる
+        // 既知問題 (M9 Phase 43 で発見、別 Phase で popup pass を独立 TextRenderer 化して解決
+        // 予定)。debug overlay は右上の小領域 (200x82) で他 widget と重ならない前提なので、
+        // base scene に積んで render 順を base → debug の順序で済ませる。
+        self.push_rect(RectCommand {
+            rect: bg_rect,
+            fill: Color::rgba(0.05, 0.06, 0.10, 0.85),
+            border: Color::rgba(0.55, 0.85, 0.65, 0.55),
+            border_width: 1.0,
+            radius: [3.0; 4],
+            clip_rect: None,
+        });
+        for (i, text) in lines.iter().enumerate() {
+            self.push_text(GlyphArea {
+                text: text.clone(),
+                left: bg_rect.x + pad,
+                top: bg_rect.y + pad + (i as f32) * line_h,
+                font_size,
+                line_height: line_h,
+                color: Color::rgb(0.85, 0.95, 0.85),
+                clip_rect: None,
+            });
+        }
     }
 
     // ============================================================
@@ -2055,5 +2220,101 @@ mod tests {
         host.frame(&mut (), &mut scene, screen, FrameInput::default(), |(), _ui| {});
 
         assert_eq!(*captured.lock().unwrap(), vec![CursorIcon::EwResize]);
+    }
+
+    // -------- M9 Phase 43: FrameStats / debug_overlay --------
+
+    #[test]
+    fn frame_stats_default_is_zero_before_first_frame() {
+        let host: UiHost<()> = UiHost::no_redraw();
+        let s = host.last_frame_stats();
+        assert_eq!(s.cache_hits, 0);
+        assert_eq!(s.cache_misses, 0);
+        assert_eq!(s.widget_count, 0);
+        assert_eq!(s.scenegraph_size, 0);
+        assert_eq!(s.history_undo_depth, 0);
+        assert_eq!(s.history_redo_depth, 0);
+    }
+
+    #[test]
+    fn frame_stats_tracks_widget_count_and_cache_miss_then_hit() {
+        // 1 frame 目: button + label = 2 widget が miss、2 frame 目: 同じ input なら 2 hit
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.label("title", "hello");
+            ui.button("b", "click", || Edit::mutate(|()| {}));
+        });
+        let s1 = host.last_frame_stats();
+        assert!(s1.widget_count >= 2, "label + button = 2 widget 以上");
+        assert!(s1.cache_misses >= 2, "1 frame 目は全て miss");
+        assert_eq!(s1.cache_hits, 0);
+
+        scene.clear();
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.label("title", "hello");
+            ui.button("b", "click", || Edit::mutate(|()| {}));
+        });
+        let s2 = host.last_frame_stats();
+        assert!(s2.cache_hits >= 2, "2 frame 目は同じ input なので hit");
+    }
+
+    #[test]
+    fn frame_stats_cache_hit_rate_returns_zero_when_no_widgets() {
+        let stats = FrameStats::default();
+        assert!((stats.cache_hit_rate() - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn frame_stats_cache_hit_rate_computes_ratio() {
+        let stats = FrameStats {
+            cache_hits: 3,
+            cache_misses: 1,
+            ..FrameStats::default()
+        };
+        assert!((stats.cache_hit_rate() - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn debug_overlay_renders_rects_and_glyphs() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+
+        // 1 frame 目: stats を生成 (label 1 個)
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.label("title", "hi");
+        });
+        scene.clear();
+        // 2 frame 目: debug_overlay を呼ぶ
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.debug_overlay(Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 }, 5.5);
+        });
+        // base scene に rect + glyph が積まれる (popup buffer は使わない)。理由は
+        // glyphon TextRenderer の internal buffer が popup pass で上書きされる既知問題
+        // (M9 Phase 43 で発見、別 Phase で 2 つの TextRenderer に分けて解決予定)。
+        assert!(
+            scene.rects.iter().any(|r| (r.fill.a - 0.85).abs() < 1e-3),
+            "debug_overlay の半透明背景 (alpha=0.85) が base scene に積まれる"
+        );
+        assert!(
+            scene.glyph_areas.len() >= 5,
+            "debug_overlay は base scene の glyph を 5 行以上積む (frame_ms 含む 5 行)"
+        );
+    }
+
+    #[test]
+    fn debug_overlay_omits_frame_ms_when_zero() {
+        // frame_ms = 0.0 を渡したら frame 行は省略 (= cache + wgts + sg + hist の 4 行)
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.debug_overlay(Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 }, 0.0);
+        });
+        // base scene の glyph_areas に 4 行 (frame_ms 省略)。
+        assert_eq!(scene.glyph_areas.len(), 4, "frame_ms=0 で frame 行省略 → 4 行");
     }
 }

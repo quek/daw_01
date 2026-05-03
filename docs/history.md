@@ -1272,3 +1272,60 @@ ui.heavy("track_0_clips", |hctx| {
 
 - example: `crates/examples/sample_edit_ops/src/main.rs` +~190 LOC (3 helper + 4 button helper closure + 7 tests)。
 - 元 example が 540 LOC、追加で 730 LOC 程度に。Edit factory が library 化されないため、サイズ拡大は ergonomic helper 分のみ。
+
+---
+
+## M9 Phase 43 (debug overlay、完了 2026-05-03)
+
+**目的**: validation 期間中に scenegraph cache の効きや widget 数を可視化する debug overlay を library に追加する。旧 M14 Phase 56 の先行実装。
+
+**進捗**: 1 commit で完遂 (実装 + tests + mixer 統合)。
+
+**追加 API**:
+
+- `daw_ui_core::FrameStats` (Copy struct):
+  - `cache_hits: u32` — `with_widget_node` で hit した回数
+  - `cache_misses: u32` — `with_widget_node` で miss して draw_fn を実行した回数
+  - `widget_count: u32` — frame に登場した widget 数
+  - `scenegraph_size: u32` — frame 末尾の scenegraph entry 数 (eviction 後)
+  - `history_undo_depth: u32` / `history_redo_depth: u32`
+  - `cache_hit_rate() -> f32` (hits / (hits+misses))
+- `UiHost::last_frame_stats() -> FrameStats` — 直近フレームの統計を query
+- `Ui::debug_overlay(rect, frame_ms: f32)` — popup buffer (z-order 最前面) に半透明背景 + 5 行テキスト
+- shortcut default binding: `"debug_overlay_toggle"` = `Ctrl+F1`
+
+**主な学び**:
+
+- **frame_ms は library が track せず引数で受ける**: window backend / render pipeline により frame の所要時間の意味が変わる (build_ui のみ vs render 含む vs vsync 待ちまで)。app 側で `Instant` で測定して `Ui::debug_overlay` に渡す方が責務が明確。library は library 内部の決定的な統計 (cache hits / widget_count / history depth) のみ track する。
+- **stats は「直近フレーム」を read する設計**: 今フレームは描画中で確定していないので、`UiHost::last_frame_stats()` は **前フレーム** の値を返す。`Ui::debug_overlay` も前フレームの stats を表示する。1 frame 遅れるが、debug 用なので許容範囲。
+- **popup buffer (drawing_in_popup フラグ) を流用して z-order 最前面に**: M7 Phase 25 で導入した popup_layer の deferred buffer (popup_rects / popup_glyphs) を debug_overlay でも使う。menu / dropdown と同じ z-order 階層に乗るので、context_menu の上にさえ debug_overlay を出せる。
+- **shortcut の toggle 状態は app 側で持つ**: library は `take_shortcut("debug_overlay_toggle")` を返すだけで、toggle state (`show_debug_overlay: bool`) は app の Model に持たせる。これにより複数 example で個別に enable/disable でき、test も書きやすい。
+- **with_widget_node の hit/miss counter は 1 行で済む**: `*self.cache_hits += 1` / `*self.cache_misses += 1` を既存のキャッシュロジックに足すだけ。Ui struct に `cache_hits: &'a mut u32` を borrow で持たせ、frame_to_edits 末尾で `last_frame_stats` に転記する pattern。
+- **popup pass の glyph buffer 上書き問題を発見** (実機検証で判明): debug_overlay を popup buffer (drawing_in_popup = true) で push したところ、画面上半分の base scene の text 全部が消える現象が発生。原因は **glyphon TextRenderer の internal GPU buffer が単一で、popup pass の prepare で base pass のデータが上書きされる** こと。`encoder.begin_render_pass + draw` は順序通り encode されるが、`text_renderer.prepare` は `queue.write_buffer` を呼ぶため submit 時に最終 write が反映 → base render が popup data を読む。Phase 43 ではワークアラウンドとして debug_overlay を **base scene に直接 push** (popup buffer 不使用)。menu / dropdown / context_menu でも本来同じ問題が起きるはずだが、popup items が少ないか base text と被らないため気付かれていなかった可能性。Phase 44 で popup pass 用に独立した TextRenderer インスタンスを持つ修正を別途実装する必要がある。
+
+**設計判断**:
+
+- **frame_ms = 0.0 で frame 行省略**: `Ui::debug_overlay(rect, 0.0)` を呼ぶと「frame Xms」行を省略し 4 行表示になる。test や frame_ms を測定しないケースに対応。
+- **default binding `Ctrl+F1`**: F1 はヘルプキーとして OS が予約していないので衝突しにくい。validation 期間中の overlay として標準的な選択。
+- **`Ui::debug_overlay` は popup buffer を使う**: 通常の `push_rect` / `push_text` では他 widget の上に被らないので、`drawing_in_popup` フラグを一時 true にして popup buffer に push、終了時に元に戻す。
+- **library が `Ctrl+F1` を default binding に入れる**: app が rebind したい場合は `UiHost::shortcut_map_mut().unbind("debug_overlay_toggle"); .bind("debug_overlay_toggle", "...")` で上書きできる (M8 Phase 30 の API 通り)。
+
+**検証**:
+
+- library tests 6 ケース追加: `frame_stats_default_is_zero_before_first_frame` / `frame_stats_tracks_widget_count_and_cache_miss_then_hit` / `frame_stats_cache_hit_rate_returns_zero_when_no_widgets` / `frame_stats_cache_hit_rate_computes_ratio` / `debug_overlay_renders_rects_and_glyphs` / `debug_overlay_omits_frame_ms_when_zero`。
+- trybuild `tests/ui/pass/basic.rs` に `Ui::debug_overlay` 呼び出しを追加 (no-Clone Model で コンパイル可能性を CI 固定)。
+- mixer example で実機目視: Ctrl+F1 で overlay toggle、cache hit/miss 値が widget 操作で変わることを確認。
+
+**残作業**: なし。Phase 43 完了。
+
+**Phase 44 への引き継ぎ事項**:
+
+- **debug_overlay の表示項目拡張**: render time / dropped frame count / GPU memory usage 等を将来追加する場合、`FrameStats` を拡張するか別 struct (`PerformanceStats` 等) を作るかの判断。
+- **CI への scenegraph cache hit rate target**: 現在は debug overlay で目視のみ。CI bench で「典型的な mixer / piano_roll 操作で hit rate > 80%」を回帰テストにする提案 (Phase 44 で評価)。
+- **overlay の position / style カスタマイズ**: 現状 rect の右上に固定。app が左下や別 corner に出したい場合は引数で受けるか、`DebugOverlayStyle` struct を導入。validation 期間中は不要。
+
+**LOC**:
+
+- library: `crates/ui/src/ui.rs` +~120 LOC (FrameStats struct + UiHost field 3 個 + frame_to_edits stats track + Ui field 3 個 + debug_overlay impl + tests 6 ケース)、`crates/ui/src/shortcut.rs` +1 行 binding、`crates/ui/src/lib.rs` +1 type re-export。
+- example: `crates/examples/mixer/src/main.rs` +~15 LOC (Model field 2 個 + Ctrl+F1 toggle + on_render の frame_ms 計測 + debug_overlay 呼び出し)。
+- trybuild: `crates/ui/tests/ui/pass/basic.rs` +1 行。

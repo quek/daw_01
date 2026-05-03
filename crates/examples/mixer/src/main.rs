@@ -29,6 +29,10 @@ struct MixerModel {
     pans: [f32; 8],
     /// M3 動作確認用: 8 ch の mute フラグ。
     mutes: [bool; 8],
+    /// M9 Phase 43: debug overlay の表示状態 (Ctrl+F1 で toggle)。
+    show_debug_overlay: bool,
+    /// M9 Phase 43: 直近フレームの所要時間 (debug overlay 表示用)。
+    last_frame_ms: f32,
 }
 
 impl MixerModel {
@@ -41,6 +45,8 @@ impl MixerModel {
             faders: [0.50, 0.70, 0.30, 0.60, 0.40, 0.80, 0.20, 0.55],
             pans: [0.50, 0.40, 0.60, 0.55, 0.30, 0.70, 0.50, 0.45],
             mutes: [false; 8],
+            show_debug_overlay: false,
+            last_frame_ms: 0.0,
         }
     }
 }
@@ -136,6 +142,12 @@ impl App {
                 }
                 if ui.take_shortcut("redo") {
                     ui.request_redo();
+                }
+                // M9 Phase 43: Ctrl+F1 で debug overlay toggle (default binding)。
+                if ui.take_shortcut("debug_overlay_toggle") {
+                    ui.push_edit(Edit::mutate(|m: &mut MixerModel| {
+                        m.show_debug_overlay = !m.show_debug_overlay;
+                    }));
                 }
 
                 // タイトル編集 (M3 Phase 4b: text_input)。
@@ -337,6 +349,14 @@ impl App {
                         );
                     });
                 });
+
+                // M9 Phase 43: debug overlay (Ctrl+F1 で toggle、popup buffer で z-order 最前面)。
+                if m.show_debug_overlay {
+                    ui.debug_overlay(
+                        Rect { x: 0.0, y: 0.0, w: screen.width as f32, h: screen.height as f32 },
+                        m.last_frame_ms,
+                    );
+                }
             },
         );
 
@@ -364,11 +384,14 @@ impl AppHost for App {
     }
 
     fn on_render(&mut self) -> bool {
+        let frame_started = std::time::Instant::now();
         self.frames = self.frames.wrapping_add(1);
         self.build_ui();
         if let Err(e) = self.renderer.render(&self.scene) {
             eprintln!("render error: {e}");
         }
+        // M9 Phase 43: build_ui + render の所要時間を model に保存 (次フレームの debug_overlay で表示)。
+        self.model.last_frame_ms = frame_started.elapsed().as_secs_f32() * 1000.0;
         // model.title が変わっていれば OS のウィンドウタイトルを追従させる。
         if self.model.title != self.last_window_title {
             self.window.set_title(&self.model.title);

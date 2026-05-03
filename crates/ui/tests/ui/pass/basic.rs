@@ -107,6 +107,8 @@ fn main() {
             let _ = ui.text_input("title2", &m.title, |new| {
                 Edit::mutate(move |m: &mut Model| m.title = new)
             });
+            // M9 Phase 43: debug_overlay も non-Clone Model でコンパイルする。
+            ui.debug_overlay(Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 }, 5.5);
             // M9 Phase 41e: piano_roll widget が non-Clone Model でコンパイルする。
             let view = PianoRollView {
                 start_beat: 0.0,

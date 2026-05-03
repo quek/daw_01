@@ -228,6 +228,8 @@ impl ShortcutMap {
         m.bind("focus_down", "Down");
         m.bind("focus_left", "Left");
         m.bind("focus_right", "Right");
+        // M9 Phase 43: debug overlay toggle
+        m.bind("debug_overlay_toggle", "Ctrl+F1");
         m
     }
 

@@ -39,7 +39,7 @@ pub use layout::{FlexDirection, Gap, LayoutPass, NodeId, Padding};
 pub use scenegraph::{CachedCommands, SceneNode, Scenegraph, hash_inputs};
 pub use time::{TimeDisplay, TimeMapping};
 pub use daw_ui_platform::CursorIcon;
-pub use ui::{Ui, UiHost};
+pub use ui::{FrameStats, Ui, UiHost};
 pub use viewport::ViewportState1D;
 pub use widgets::level_meter::{LevelMeterStyle, MeterBallistic};
 pub use widgets::split_view::Orientation;
