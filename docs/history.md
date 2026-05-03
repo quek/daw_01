@@ -1205,9 +1205,8 @@ ui.heavy("track_0_clips", |hctx| {
 - **view 状態は user 側、widget は値渡し `PianoRollView`**: pan/zoom 更新は app 層責務、widget は描画と note drag のみ担う。view を mutate する API を入れるとスコープが膨らむ。
 - **Edit factory 5 個 (`make_*_notes_edit`) は example に残す**: forward / inverse closure 内で `m.notes` / `m.selected_note_ids` / `m.notes_generation` を mutate する必要があり、generic 化には `NotesModel` trait が必要だが、daw_01 のような独自 schema (NoteBox / lyric / f64) を持つアプリで impl 不可能になり拡張性を損なう。library 側は `NotesEditRequest` enum を介した callback パターンで責務分離。
 
-**残作業 (Phase 42-44)**:
+**残作業 (Phase 43-44)**:
 
-- Phase 42: sample_edit_ops の trim/fade を `Edit::snapshot_inverse` 化、audio buffer (`Vec<f32>`) の inverse 戦略を 3 案 (full snapshot / 差分のみ Vec / Arc COW) から選定。
 - Phase 43: `Ui::debug_overlay` で frame_ms / scenegraph_size / cache_hit_rate / widget_count / history_depth を画面右上に半透明 overlay (Ctrl+F1 toggle)。
 - Phase 44: Phase 41-43 の `Edit::with_inverse` / `Edit::snapshot_inverse` 全 call site の boilerplate を計測 + library helper 追加判断、daw_01 との Note schema 統合判断。
 
@@ -1222,3 +1221,54 @@ ui.heavy("track_0_clips", |hctx| {
 - library: `crates/ui/src/widgets/piano_roll.rs` 新設 ~1565 LOC (公開型 9 + 純粋関数 6 + Style default + `Ui::piano_roll` 本体 + tests 23 ケース)。
 - example: `crates/examples/piano_roll/src/main.rs` 1480 → 720 LOC に縮小。
 - 計画 (plan_phase41.md) は library +400 / example -600 / test +200 = net +0 を見込んでいたが、実装で純粋関数を library に出した形 (Edit factory は example 残し) になり、別の LOC 配分になった。
+
+---
+
+## M9 Phase 42 (sample_edit_ops の trim/fade を Undoable 化、完了 2026-05-03)
+
+**目的**: M9 Phase 41 で導入した `Edit::snapshot_inverse` helper を Vec<f32> 系 (audio buffer) で再利用できるか検証。sample_edit_ops の trim / fade in / fade out 3 ボタンを Undoable 化し、shortcut undo/redo (Ctrl+Z / Ctrl+Shift+Z) を実用化。
+
+**進捗**: 1 commit で完遂 (実装 + tests + docs)。
+
+**audio buffer (Vec<f32>) の inverse 戦略 — 混在採用**:
+
+| 操作 | 戦略 | snapshot 内容 | メモリ |
+|---|---|---|---|
+| trim | full snapshot | `Vec<Vec<f32>>` 全体 + viewport / selection / cursor (`TrimSnapshot` struct) | 元 buffer 全体 (96000 sample × 4 byte = ~384KB / step) |
+| fade in / out | 範囲 snapshot | `Vec<f32>` の `e-s` 個 + range + `direction: FadeDir { In, Out }` (`FadeSnapshot` struct) | 範囲分のみ (e-s) × 4 byte |
+
+**主な学び**:
+
+- **`Edit::snapshot_inverse` は Vec<f32> 系でも問題なく使える** (Phase 41 plan_phase41.md L487 引き継ぎ事項の検証成功)。`S: Send + Sync + 'static` 制約が `Vec<Vec<f32>>` (TrimSnapshot) / `Vec<f32>` (FadeSnapshot 内) の両方を満たすため、Phase 41d で導入した library helper が再利用可能。
+- **fade in/out は `direction: FadeDir { In, Out }` enum で 1 helper に統合**。in/out の差は `gain = match dir { In => t, Out => 1.0 - t }` の 1 行のみ。重複 helper を避けて命令的 boilerplate を最小化 (Phase 41 で発見した `NotesEditRequest` enum パターンと同形)。
+- **forward の idempotency が重要**: fade forward は元値 (`snap.prev_range_samples`) から再計算するため、redo (forward を 2 度呼ぶ) しても結果が変わらない。これが `Fn` 制約 (`Edit::snapshot_inverse` の forward / restore_from は `Fn`) と整合する。逆に「現値 × gain」式で書くと redo で 2 度 gain が掛かって破綻する。
+- **trim の selection 復元が UX 上重要**: trim 後 selection は `None` になるが、undo で元の `Some((s, e))` に復元される。これにより「trim → undo → 再 trim」を繰り返すワークフローが自然になる。viewport / cursor も同様。
+- **button click 時に `m: &SampleEditOpsModel` を borrow して helper に渡し、Edit を構築する** パターン: button_at の closure シグネチャ `FnOnce() -> Edit<M>` で、closure 内で `m` を `move` capture できる。selection / 範囲が無効なら `Edit::mutate` で last_action のみ更新 (history に積まない)、有効なら `Edit::snapshot_inverse` で Undoable Edit を構築。
+- **メモリコストの実測値は許容範囲** (validation 段階): trim 1 step で ~384KB (96000 sample × 4 byte)。100 step undo で 38.4MB、典型的な DAW 編集セッション (数十回の trim/fade 連続) で問題なし。差分 snapshot や Arc COW への最適化は Phase 44 で必要性を判断。
+- **shortcut undo/redo は既存 (M8 Phase 30) で十分**: `take_shortcut("undo")` / `take_shortcut("redo")` を frame closure 冒頭で呼ぶだけで、Ctrl+Z / Ctrl+Shift+Z が動作。Phase 41 の piano_roll と同パターン。
+
+**Phase 41 plan_phase41.md L487 引き継ぎ事項 (検証結果)**:
+
+> - `Edit::snapshot_inverse` の使い心地を Phase 42 (sample_edit_ops) で再検証 (Vec<f32> = `Arc<[f32]>` snapshot で同 helper が再利用できるか)
+
+→ **検証成功**。Vec<Vec<f32>> (full snapshot) も Vec<f32> (範囲 snapshot) も同 helper が使えた。Arc 化は library 内部で `Edit::snapshot_inverse` が自動的に行うので user は意識する必要なし (Phase 41d helper 設計の通り)。
+
+**設計判断**:
+
+- **trim / fade で snapshot 戦略を混在採用**: 操作の意味 (削除 vs 範囲内変更) に応じて適切な snapshot サイズを選ぶ。統一すると trim も範囲 snapshot になるが、trim は drain で範囲外データを失うので復元には全体が必要 → full snapshot が必須。fade は範囲内のみ変更なので範囲分で足りる。混在は user 側 helper の責務範囲なので library API には影響しない。
+- **direction enum で fade in/out を 1 helper に**: 当初「fade in helper / fade out helper の 2 つを書く」案もあったが、内部ロジックの差が `gain` 計算式 1 行のみだったため enum で吸収。Phase 41 の `NotesEditRequest` enum と同じく、enum は「1 frame 内で消費される一時 ADT」なのでメッセージ型禁止の不変条件と矛盾しない。
+- **selection 復元は trim のみ、fade では何もしない**: trim は selection をクリアする副作用があるので undo で復元、fade は selection を変えないので undo でも触らない。「副作用を伴う操作のみ snapshot に副作用前状態を保存」の原則。
+- **forward を idempotent に書く**: fade forward は `*slot = snap.prev_range_samples[i] * gain` で元値からの再計算 (= 何度 apply しても結果同じ)。redo 経路で破綻しない。
+
+**残作業**: なし。Phase 42 完了。
+
+**Phase 44 への引き継ぎ事項**:
+
+- **メモリ最適化の必要性判断**: 384KB / step × 100 step = 38.4MB の memory コスト。長時間セッションで膨らむ場合、Arc COW (案 C) や差分 snapshot (案 B) への切替を検討。
+- **library helper 化の閾値**: trim_edit_for / fade_edit_for は example local helper だが、daw_01 や他 DAW で似たパターンが出るか観察。出るなら `Edit::range_snapshot_inverse(label, range, prev_data, dir, fwd_kernel)` のような generic helper を library 化候補。
+- **history group API の need**: Phase 41 では不要だったが、Phase 42 で「trim + fade を 1 step に」のような複合操作が現実的に必要か検証。現状 7 ケースのテスト (`trim_then_fade_then_undo_undo_restores_original`) では「2 個の連続 Edit を 2 回 undo」で動作するため、group API は不要。
+
+**LOC**:
+
+- example: `crates/examples/sample_edit_ops/src/main.rs` +~190 LOC (3 helper + 4 button helper closure + 7 tests)。
+- 元 example が 540 LOC、追加で 730 LOC 程度に。Edit factory が library 化されないため、サイズ拡大は ergonomic helper 分のみ。

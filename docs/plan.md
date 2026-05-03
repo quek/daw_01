@@ -122,7 +122,7 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 - daw_01 (実 DAW プロトタイプ) が gui_01 を path 依存で利用開始
 - 設計の不変条件 (no-Clone / メッセージ型禁止 / derive 禁止 / audio・IPC 不混入) 維持
 
-### M9 (Real DAW Validation — `Edit::Undoable` ergonomic 実証、Phase 41 完了 / Phase 42-44 残作業)
+### M9 (Real DAW Validation — `Edit::Undoable` ergonomic 実証、Phase 41-42 完了 / Phase 43-44 残作業)
 
 **目的**: M8 で導入した `Edit::Undoable` の ergonomic を、note 編集 / audio buffer 編集の 2 ケースで実証する。boilerplate が出れば library helper で吸収。daw_01 で並行検証して library API の fitness function を回す。
 
@@ -133,7 +133,7 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 | Phase | テーマ | 主な成果物 | 状態 |
 |---|---|---|---|
 | 41 | piano_roll の note edit + multi-select 統合 + library widget 化 (主軸) | `Edit::with_inverse` / `Edit::snapshot_inverse` で note add/delete/move/resize/select、Ui::take_drag_rect_in_rect で rect multi-select、Ui::set_cursor 公開、`Ui::piano_roll` library widget + `NotesEditRequest` enum で API 完結 | ✅ 完了 (41pre+a+b+c+d+e+f) |
-| 42 | sample_edit_ops の trim/fade を Undoable 化 (並行) | trim/fade in/out の 3 ボタンを `Edit::snapshot_inverse` 化。audio buffer (`Vec<f32>`) の inverse 戦略 (full snapshot / 差分のみ / Arc COW) から 1 つ採用 | 未着手 |
+| 42 | sample_edit_ops の trim/fade を Undoable 化 | trim/fade in/out の 3 ボタンを `Edit::snapshot_inverse` 化。audio buffer の inverse 戦略は **混在採用**: trim = full snapshot (`Vec<Vec<f32>>` + viewport/selection/cursor)、fade in/out = 範囲 snapshot (`Vec<f32>` の e-s 個 + range + direction enum) | ✅ 完了 |
 | 43 | debug overlay (並行、旧 M14 Phase 56 先行実装) | `Ui::debug_overlay()` で frame_ms / scenegraph_size / cache_hit_rate / widget_count / history_depth を画面右上に半透明 overlay。Ctrl+F1 toggle | 未着手 |
 | 44 | Undoable ergonomic 評価 + 必要なら API 改善 (締め) | Phase 41-43 で書いた `Edit::with_inverse` 全 call site の boilerplate を計測、3 回以上繰り返されるパターンが見つかれば library helper を追加、なければ「現 API で十分」を確定。daw_01 で 1 操作実装してフィードバック取得 | 未着手 |
 
