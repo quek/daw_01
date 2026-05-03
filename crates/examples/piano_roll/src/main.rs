@@ -2,7 +2,7 @@
 //!
 //! 100k notes を `crates/ui/src/widgets/piano_roll.rs` の library widget で描画する。
 //! example は HUD / view state pan + wheel zoom / window 起動 / Edit factory dispatch のみ
-//! を担い、描画 + drag state machine + hit-test + Alt+drag + shortcut は widget に閉じ込める。
+//! を担い、描画 + drag state machine + hit-test + Shift+drag + shortcut は widget に閉じ込める。
 //!
 //! 操作:
 //! - 無修飾 drag = pan (空白 or note なし上で press → drag)
@@ -12,7 +12,7 @@
 //! - note 左右端 drag = resize (release で Undoable)
 //! - note click (drag<16px) = selection 1 個
 //! - 空白 click = selection clear
-//! - Alt+drag = rect multi-select
+//! - Shift+drag = rect multi-select (加算: 既存選択 ∪ rect 内)
 //! - Insert = pointer 位置に新規 note 追加 (next_note_id を bump)
 //! - Delete = selected を一括削除
 //! - Ctrl+Z / Ctrl+Shift+Z = undo / redo (M8 history stack)
@@ -330,9 +330,9 @@ impl App {
     ) {
         let grid = grid_rect_for_user_input(screen);
 
-        // pan は note 上以外で press → drag。Alt 修飾は widget の rect select に譲る。
+        // pan は note 上以外で press → drag。Shift 修飾は widget の rect select に譲る。
         if pointer.primary_just_pressed
-            && !pointer.modifiers.alt
+            && !pointer.modifiers.shift
             && let Some((px, py)) = pointer.pos
             && grid.contains(px, py)
         {
@@ -541,7 +541,7 @@ impl App {
                 let footer_y = (screen.height as f32 - 44.0).max(0.0);
                 ui.label_at(
                     "footer1",
-                    "Drag = pan / Wheel = X zoom / Ctrl+Wheel = Y zoom / Click = select / Insert = add / Delete / Alt+drag = rect-select / Ctrl+Z = undo",
+                    "Drag = pan / Wheel = X zoom / Ctrl+Wheel = Y zoom / Click = select / Insert = add / Delete / Shift+drag = rect-select (加算) / Ctrl+Z = undo",
                     16.0, footer_y, 12.0,
                     Color::rgb(0.65, 0.68, 0.72),
                 );

@@ -516,6 +516,14 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 radius: [3.0; 4],
                 clip_rect: Some(grid_rect),
             });
+            // double-click でその clip を Piano Roll タブで開く (M9 P1-4 の活用例)
+            if ui.take_double_click_in_rect(clip_rect).is_some() {
+                ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
+                    mm.current_tab = 2;
+                    mm.last_action =
+                        format!("clip dbl-click → Piano Roll (track {t} clip {c})");
+                }));
+            }
             // 右クリックで context_menu (clip 上で)
             ui.context_menu_for(clip_rect, &["Cut", "Copy", "Delete", "Duplicate"], move |idx, ui| {
                 let actions = ["Cut", "Copy", "Delete", "Duplicate"];

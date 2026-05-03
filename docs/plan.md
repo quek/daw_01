@@ -138,6 +138,7 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 | 44a   | popup pass の renderer pipeline 独立化                                 | Phase 43 で発見した「popup pass の prepare で base pass の rect/line/glyph buffer が上書きされる」問題を、renderer に `popup_rect / popup_line / popup_glyph` 3 つの独立 pipeline インスタンスを追加して根本解決                                                  | ✅ 完了                     |
 | 44b   | Undoable ergonomic 評価 + 必要なら API 改善                            | call site 分類: `Edit::snapshot_inverse` 7 件 (Phase 41d で library 化済、ergonomic 良好) + fader/knob の drag release pattern 2 件 (3 件未満で premature abstraction 回避)。**追加 helper 不要、現 API で十分** を確定                                          | ✅ 完了                     |
 | 44c   | daw_01 Note schema 統合 (f64 + lyric)                                  | **案 A 採用** (CLAUDE.md「大胆に破壊して作り直す」原則): gui_01 Note を `start_beat: f64` / `len_beats: f64` 化し、`lyric: Option<Arc<str>>` を追加。Phase 44b の API stability 確約は撤回。daw_01 が adapter なしで gui_01 widget を直接使える状態に     | ✅ 完了                     |
+| 44d   | daw_01 conversation #002-#004 対応                                     | piano_roll の rect select を **Alt+drag → Shift+drag (加算)** に breaking 置換 (daw_01 旧自前実装慣習 + DAW 業界標準に合致)。`next = prev ∪ rect_inside` で「加算」を実現、排他は空白 click + Shift+drag の 2 ステップ。daw_prototype に **clip dbl-click → Piano Roll タブ遷移** デモを追加 (M9 P1-4 `take_double_click_in_rect` の活用例)。daw_01 conversation に 3 件返信 | ✅ 完了                     |
 
 **設計判断 (M9 全般)**:
 

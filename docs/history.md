@@ -1576,3 +1576,77 @@ pub struct PianoRollStyle {
 - example: `crates/examples/piano_roll/src/main.rs` +~20 LOC (lyric demo 生成 + f64 化に伴う boundary 修正)
 - trybuild: `crates/ui/tests/ui/pass/basic.rs` +6 LOC (Note init で lyric: None + f64 リテラル)
 - docs: `docs/plan.md` 1 行更新、`docs/history.md` +~80 LOC
+
+---
+
+## M9 Phase 44d (daw_01 conversation #002-#004 対応 — piano_roll rect select breaking 変更 + clip dbl-click デモ、完了 2026-05-03)
+
+**目的**: daw_01 から `gui_01_conversation.md` に届いた 3 件のフィードバック (#002 rect select 修飾キー / #003 空白 dbl-click → AddNote / #004 clip dbl-click → タブ遷移) に対応。`piano_roll` widget の rect multi-select 修飾キーを **Alt+drag → Shift+drag (加算)** に breaking 置換し、`daw_prototype` に Phase 41g の `take_double_click_in_rect` 活用デモを追加する。
+
+**進捗**: 1 commit で完遂 (library widget + example + tests + docs + daw_01 conversation 返信)。
+
+**変更内容**:
+
+### library widget の breaking 変更 (`crates/ui/src/widgets/piano_roll.rs`):
+
+- rect multi-select の起動修飾キーを **Alt → Shift** に置換 (line 817 の `pointer.modifiers.alt` → `pointer.modifiers.shift`、release 判定 line 822 同様)
+- pan vs rect-select の gate 条件 (line 497, 613 の `!pointer.modifiers.alt` → `!pointer.modifiers.shift`)
+- 挙動を「全置換 (排他)」→ **「加算 (`next = prev ∪ rect_inside`)」** に変更:
+  - HashSet で既選択と rect 内 ids を union
+  - sort_unstable で順序安定化、prev と比較して変化ありなら `NotesEditRequest::Select` 発行
+- doc comment の Alt+drag 記述を Shift+drag に書き換え (line 135 / 152 / 334 / 444 / 494 / 806)
+- `PianoRollResponse.rect_select_active` フィールド名は不変 (汎用名のため)
+
+### example の更新 (`crates/examples/piano_roll/src/main.rs`):
+
+- module doc コメント / 操作説明 / footer label の "Alt+drag" → "Shift+drag (加算)"
+- `apply_pan_and_zoom` の修飾キー gate を Shift に置換 (line 335)
+
+### daw_prototype デモ追加 (`crates/examples/daw_prototype/src/main.rs`):
+
+- Arrangement clip ループ (line 519 直前) に `take_double_click_in_rect(clip_rect)` 呼び出しを追加
+- dbl-click 検出時に `Edit::mutate` で `m.current_tab = 2` (Piano Roll) + `last_action` を記録
+- `plan_daw01_feedback.md:308` で言及されたが未実装だった「P1-4 demo」を本対応で具体化
+
+### 新規テスト (`piano_roll.rs` 内 `#[cfg(test)] mod tests`):
+
+- `piano_roll_shift_drag_is_additive` — 既選択 [3] + Shift+drag rect (50,50)-(350,200) → next = sorted [1, 2, 3]、prev = [3]
+- `piano_roll_alt_drag_no_longer_selects` — Alt+drag では Select request 発行されないことの回帰防止
+- `modifiers_default_is_no_alt` を `assert!(!m.shift)` も含む形に拡張
+
+### daw_01 conversation file (`F:\dev\daw_01\docs\gui_01_conversation.md`):
+
+- #002 / #003 / #004 の `### gui_01 →` ブロックに返信を記入、ステータスを `[Open]` → `[Replied]` に変更
+- #002: Shift+drag (加算) に breaking 置換 + 排他は空白 click + Shift+drag の 2 ステップで実現可能を回答
+- #003: API 拡張不要、widget は dbl-click を素通し + `note_hit` (pub) で空白判定 → `take_double_click_in_rect` でエミュレート可能、エミュレートのコード例を提示
+- #004: 推奨パターン (clip ループ内で個別 `take_double_click_in_rect`) + 本対応の `daw_prototype` デモを参照可能と回答
+
+**主な学び**:
+
+- **CLAUDE.md「破壊的変更を恐れない」原則の運用**: Phase 41c で固めた Alt+drag 仕様を、daw_01 旧自前実装慣習 + DAW 業界標準 (Cubase / Logic / Bitwig で shift = 加算) に合わせて Shift+drag に置換。単一 workspace + Edition 2024 の利点で全 example / test / docs を 1 commit で同期更新。
+- **加算 select は新規 API を必要としない**: `NotesEditRequest::Select { prev, next }` の既存 enum で `next = prev ∪ rect_inside` を表現できる。排他は「空白 click で clear → Shift+drag」の 2 ステップで成立 (新規 modifier 設定や API 拡張なし)。
+- **歴史ドキュメントは時系列で残す**: `docs/plan_phase41e.md:135,183,220` および `docs/history.md:1183` の Alt+drag 記述は **Phase 41c 完了時点の事実** として残す (CLAUDE.md「歴史を書き換えない」)。本対応は新規 entry (Phase 44d) として記録し、`docs/plan.md` の現在表のみ更新。
+- **API 拡張前にエミュレート可能性を確認**: #003 は当初「widget 内蔵 fragment が必要か?」と相談だったが、`take_double_click_in_rect` (P1-4) と `note_hit` (pub) の組み合わせで widget 外側でエミュレート可能と判明 → API 拡張せず。「3 回繰り返されたら抽象化を検討」原則に整合。
+
+**設計判断**:
+
+- **デフォルト変更 vs Style 拡張 vs 完全置換**: 3 案の中から「Shift+drag のみに完全置換」を採用。daw_01 旧実装慣習に完全一致、API 表面積最小、ModifierKey 系の新型導入を回避。Alt+drag を残す案 (両対応) は「ユーザに使い分けを強要」する設計で KISS に反する。
+- **加算挙動の選択**: daw_01 #002 エントリ本文「shift+drag = 加算 rect select」を踏襲。排他がほしい場合は空白 click + Shift+drag で対応可能なため、デフォルトを加算とする方が DAW 業界標準と整合。
+- **daw_prototype デモを本対応に同梱**: `plan_daw01_feedback.md:308` の言及で計画されていたが Phase 41 までで未実装だったため、`take_double_click_in_rect` の活用例として本対応で追加。daw_01 が #004 で「実装したい UX」と回答したため、参照可能なデモが docs より具体的。
+
+**検証**:
+
+- `cargo build --workspace` ✅ / `cargo test --workspace` ✅ (新規 2 テスト含め全 pass) / `cargo clippy --workspace --tests -- -D warnings` ✅
+- `cd ../daw_01 && cargo build` ✅ (path 依存先 build OK)
+- `cargo run --bin piano_roll` 実機目視: Shift+drag で rect select 加算動作、Alt+drag では何も起きない、無修飾 drag は pan
+- `cargo run --bin daw_prototype` 実機目視: Arrangement タブの clip を dbl-click → Piano Roll タブへ遷移、footer label に "clip dbl-click → Piano Roll (track N clip M)" 表示
+
+**残作業**: なし。Phase 44d 完了。
+
+**LOC**:
+
+- library: `crates/ui/src/widgets/piano_roll.rs` ±~30 LOC (修飾キー置換 + 加算ロジック + doc + 新規テスト 2 件)
+- example: `crates/examples/piano_roll/src/main.rs` ±~5 LOC (修飾キー gate + 説明文)
+- example: `crates/examples/daw_prototype/src/main.rs` +7 LOC (clip dbl-click デモ)
+- docs: `docs/plan.md` 1 行追加 (Phase 44d 行)、`docs/history.md` +~80 LOC (本ブロック)
+- conversation: `F:\dev\daw_01\docs\gui_01_conversation.md` 3 件返信 + ステータス更新

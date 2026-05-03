@@ -132,7 +132,7 @@ pub enum NotesEditRequest {
     Move(Vec<MoveDelta>),
     /// drag release で resize。Undoable。
     Resize(Vec<ResizeDelta>),
-    /// rect select (Alt+drag) または click で selection を置換。Undoable。
+    /// rect select (Shift+drag、加算) または click で selection を更新。Undoable。
     Select { prev: Vec<NoteId>, next: Vec<NoteId> },
 }
 
@@ -149,7 +149,7 @@ pub struct PianoRollResponse {
     pub hovered_zone: Option<NoteDragKind>,
     /// drag 中ならその種別。
     pub dragging: Option<NoteDragKind>,
-    /// Alt+drag rect select が active か (HUD / status bar 表示用)。
+    /// Shift+drag rect select (加算) が active か (HUD / status bar 表示用)。
     pub rect_select_active: bool,
     /// このフレームで `NotesEditRequest::Select` を push_edit したか (= 次フレームで
     /// `selected` が変わる予定であることを app 側 UI に伝える、selection 連動 UI のトリガー)。
@@ -331,7 +331,7 @@ pub fn note_hover_cursor(
     hit_cursor
 }
 
-/// 2 つの矩形が交差するか (Alt+drag rect select で使う)。接するだけは交差扱いしない。
+/// 2 つの矩形が交差するか (Shift+drag rect select で使う)。接するだけは交差扱いしない。
 #[must_use]
 pub fn rects_intersect(a: Rect, b: Rect) -> bool {
     a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
@@ -441,7 +441,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// - **note 左右端 drag** = resize (release で `NotesEditRequest::Resize` 発行、Undoable)
     /// - **note click** (drag<16px) = selection 1 個 (`NotesEditRequest::Select` 発行)
     /// - **空白 click** = selection clear (同上)
-    /// - **Alt+drag** = rect multi-select (release で `NotesEditRequest::Select` 発行)
+    /// - **Shift+drag** = rect multi-select、**加算** (release で `NotesEditRequest::Select` 発行、
+    ///   既存 `selected` ∪ rect 内の note ids)。排他にしたい場合は空白 click で clear してから drag
     /// - **Insert** shortcut = pointer 位置に新規 note 追加 (`NotesEditRequest::Add`)。
     ///   `id` は user 側で `next_note_id` 等で割り当て、`make_edit` callback 内で参照する
     ///   ため、widget は **id=0 placeholder で `Add(vec![note_with_id_0])` を渡す**。
@@ -491,10 +492,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let visible: &[Note] = &notes[s_idx..e_idx];
 
         // ----- press 振り分け (state 更新) -----
-        // Alt+drag は take_drag_rect_in_rect が drag state を握るので、ここでは
-        // 「Alt なし note hit」だけ widget が drag を始める。
+        // Shift+drag は take_drag_rect_in_rect が drag state を握るので、ここでは
+        // 「Shift なし note hit」だけ widget が drag を始める。
         let just_pressed_on_note = pointer.primary_just_pressed
-            && !pointer.modifiers.alt
+            && !pointer.modifiers.shift
             && pointer.pos.is_some_and(|(px, py)| grid.contains(px, py));
 
         if just_pressed_on_note
@@ -610,7 +611,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         } else if let Some(p) = drag_short_click_pos {
             Some(p)
         } else if pointer.primary_just_released
-            && !pointer.modifiers.alt
+            && !pointer.modifiers.shift
             && let Some((px, py)) = pointer.pos
         {
             Some((px, py))
@@ -803,37 +804,41 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
-        // ----- Alt+drag rect multi-select -----
+        // ----- Shift+drag rect multi-select (加算) -----
         // `take_drag_rect_in_rect` は呼ぶだけで cyan 半透明 overlay を自動描画するため、
-        // pan / note drag と紛らわしくないよう **「Alt 押下時の press」または「既に rect-select
-        // drag が active」のときだけ呼ぶ**。drag 開始は press 時に Alt を見て gate、
+        // pan / note drag と紛らわしくないよう **「Shift 押下時の press」または「既に rect-select
+        // drag が active」のときだけ呼ぶ**。drag 開始は press 時に Shift を見て gate、
         // drag 中は state.drag_start.is_some() で active 判定して呼び続ける (release で finished)。
+        //
+        // 加算の意味: release frame で `next = prev ∪ rect_inside`。daw_01 旧自前実装と
+        // DAW 業界慣習 (Cubase / Logic / Bitwig) に合わせる。排他 (現選択を捨てて新規 rect)
+        // は「空白 click で clear → Shift+drag」の 2 ステップで実現可能 (新規 API 不要)。
         let drag_rect_wid = wid.child(b"rect_select");
-        let alt_rect_active = {
+        let shift_rect_active = {
             let state: &mut crate::widgets::drag_rect::DragRectState =
                 self.widget_state(drag_rect_wid);
             state.drag_start.is_some()
         };
-        let alt_press = pointer.primary_just_pressed && pointer.modifiers.alt;
-        if (alt_press || alt_rect_active)
+        let shift_press = pointer.primary_just_pressed && pointer.modifiers.shift;
+        if (shift_press || shift_rect_active)
             && let Some(drag) = self.take_drag_rect_in_rect(drag_rect_wid, grid)
         {
             response.rect_select_active = true;
-            if drag.modifiers.alt && drag.finished {
+            if drag.modifiers.shift && drag.finished {
                 let drag_rect = drag.rect();
-                let new_ids: Vec<NoteId> = visible
-                    .iter()
-                    .filter_map(|n| {
-                        let r = note_to_rect(n, view, grid);
-                        if rects_intersect(r, drag_rect) {
-                            Some(n.id)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+                let mut set: HashSet<NoteId> = selected.iter().copied().collect();
+                for n in visible {
+                    let r = note_to_rect(n, view, grid);
+                    if rects_intersect(r, drag_rect) {
+                        set.insert(n.id);
+                    }
+                }
+                let mut new_ids: Vec<NoteId> = set.into_iter().collect();
+                new_ids.sort_unstable();
                 let prev: Vec<NoteId> = selected.to_vec();
-                if prev != new_ids {
+                let mut prev_sorted = prev.clone();
+                prev_sorted.sort_unstable();
+                if prev_sorted != new_ids {
                     self.push_edit(make_edit(NotesEditRequest::Select {
                         prev,
                         next: new_ids,
@@ -1595,10 +1600,149 @@ mod tests {
         assert_eq!(model.last_request, Some(RequestKind::Move), "release で Move 発行");
     }
 
-    /// Modifiers が default (= Alt なし) で、modifier の Default 実装がエラーで失敗しないことの確認。
+    /// Modifiers が default (= 修飾なし) で、modifier の Default 実装がエラーで失敗しないことの確認。
     #[test]
     fn modifiers_default_is_no_alt() {
         let m = Modifiers::default();
         assert!(!m.alt);
+        assert!(!m.shift);
+    }
+
+    /// Shift+drag rect select が **加算**: 既選択 [3] + rect 内 {1, 2} → next = [1, 2, 3] (sorted)。
+    /// daw_01 旧自前実装の慣習に合致。
+    #[test]
+    fn piano_roll_shift_drag_is_additive() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        // note 1: x ∈ [100, 200], y ≈ [116.67, 133.33]
+        // note 2: x ∈ [200, 300], y ≈ [133.33, 150.00]
+        // note 3: x ∈ [600, 700], y ≈ [200.00, 216.67] (rect 外、prev に保持)
+        let mut model = TestModel::new(vec![
+            note(1, 0.5, 0.5, 65),
+            note(2, 1.0, 0.5, 64),
+            note(3, 3.0, 0.5, 60),
+        ]);
+        model.selected = vec![3];
+        let view = test_view();
+        let style = PianoRollStyle::default();
+        let notes_clone = model.notes.clone();
+
+        // Frame 1: Shift+press at (50, 50) — drag 開始 (空白なので note hit せず、shift 経路へ)
+        let input1 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((50.0, 50.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                modifiers: Modifiers { shift: true, ..Modifiers::empty() },
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel1 = model.selected.clone();
+        run_frame(&mut host, &mut model, input1, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone,
+                view,
+                &sel1,
+                &style,
+                dispatch,
+            );
+        });
+        // drag 中はまだ Edit 発行せず
+        assert_eq!(model.last_request, None, "drag 中は Select 発行せず");
+
+        // Frame 2: release at (350, 200) — finished で rect (50,50)-(350,200) が確定
+        let input2 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((350.0, 200.0)),
+                primary_just_released: true,
+                modifiers: Modifiers { shift: true, ..Modifiers::empty() },
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel2 = model.selected.clone();
+        run_frame(&mut host, &mut model, input2, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone,
+                view,
+                &sel2,
+                &style,
+                dispatch,
+            );
+        });
+        assert_eq!(model.last_request, Some(RequestKind::Select), "release で Select 発行");
+        assert_eq!(
+            model.last_select_next,
+            Some(vec![1, 2, 3]),
+            "加算: prev [3] + rect 内 {{1, 2}} = sorted [1, 2, 3]"
+        );
+        assert_eq!(model.last_select_prev, Some(vec![3]));
+    }
+
+    /// 旧仕様 (Alt+drag rect select) は廃止された: Alt+drag で press → release しても
+    /// Select request は発行されない。
+    #[test]
+    fn piano_roll_alt_drag_no_longer_selects() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![note(1, 0.5, 0.5, 65), note(2, 1.0, 0.5, 64)]);
+        let view = test_view();
+        let style = PianoRollStyle::default();
+        let notes_clone = model.notes.clone();
+
+        // Frame 1: Alt+press at (50, 50)
+        let input1 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((50.0, 50.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                modifiers: Modifiers { alt: true, ..Modifiers::empty() },
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel1 = model.selected.clone();
+        run_frame(&mut host, &mut model, input1, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone,
+                view,
+                &sel1,
+                &style,
+                dispatch,
+            );
+        });
+
+        // Frame 2: Alt+release at (350, 200) — 旧仕様なら Select 発行、新仕様では発行されない
+        let input2 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((350.0, 200.0)),
+                primary_just_released: true,
+                modifiers: Modifiers { alt: true, ..Modifiers::empty() },
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel2 = model.selected.clone();
+        run_frame(&mut host, &mut model, input2, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone,
+                view,
+                &sel2,
+                &style,
+                dispatch,
+            );
+        });
+        assert_eq!(model.last_request, None, "Alt+drag は rect select を起動しない");
     }
 }
