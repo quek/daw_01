@@ -1,3 +1,6 @@
+理想とベストプラクティスを追求する。
+そのためは大胆に破壊して作り直す。
+
 # Rust 製・モデルを Clone しない DAW 向け GUI ライブラリ — 設計計画 (M9 = Real DAW Validation / M1-M8 履歴は history.md)
 
 ## Context

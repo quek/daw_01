@@ -7,3 +7,4 @@ Thumbs.db
 # Claude Code per-user (共有設定 .claude/settings.json は track 可)
 .claude/settings.local.json
 
+/.claude/scheduled_tasks.lock
