@@ -122,7 +122,7 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 - daw_01 (実 DAW プロトタイプ) が gui_01 を path 依存で利用開始
 - 設計の不変条件 (no-Clone / メッセージ型禁止 / derive 禁止 / audio・IPC 不混入) 維持
 
-### M9 (Real DAW Validation — `Edit::Undoable` ergonomic 実証、未着手)
+### M9 (Real DAW Validation — `Edit::Undoable` ergonomic 実証、Phase 41 完了 / Phase 42-44 残作業)
 
 **目的**: M8 で導入した `Edit::Undoable` の ergonomic を、note 編集 / audio buffer 編集の 2 ケースで実証する。boilerplate が出れば library helper で吸収。daw_01 で並行検証して library API の fitness function を回す。
 
@@ -130,16 +130,16 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 
 **並行**: daw_01 から M7/M8 実利用フィードバックが 11 項目 (P0-P3) 届いている。詳細プランは [plan_daw01_feedback.md](plan_daw01_feedback.md)。Phase 41-44 の前提となる API 整備として P0-P1 を先行実施することが多い (例: P0-1 Shortcut::parse 記号受理は piano_roll の `Shift+/` shortcut で必要、P1-3 HeavyCtx delegate は piano_roll の rect-select で必要、P1-4 double-click は clip → Piano Roll タブ UX で必要)。
 
-| Phase | テーマ | 主な成果物 |
-|---|---|---|
-| 41 | piano_roll の note edit + multi-select 統合 (主軸) | `Edit::with_inverse` で note add/delete/move/resize、`Ui::take_drag_rect_in_rect` 流用で batch delete/move、`HistoryStack::begin_group/end_group` で N notes を 1 step、最小限 `Ui::set_cursor` 公開 |
-| 42 | sample_edit_ops の trim/fade を Undoable 化 (並行) | trim/fade in/out の 3 ボタンを `Edit::with_inverse` 化。audio buffer (`Vec<f32>`) の inverse 戦略 (full snapshot / 差分のみ / Arc COW) から 1 つ採用 |
-| 43 | debug overlay (並行、旧 M14 Phase 56 先行実装) | `Ui::debug_overlay()` で frame_ms / scenegraph_size / cache_hit_rate / widget_count / history_depth を画面右上に半透明 overlay。Ctrl+F1 toggle |
-| 44 | Undoable ergonomic 評価 + 必要なら API 改善 (締め) | Phase 41-43 で書いた `Edit::with_inverse` 全 call site の boilerplate を計測、3 回以上繰り返されるパターンが見つかれば library helper を追加、なければ「現 API で十分」を確定。daw_01 で 1 操作実装してフィードバック取得 |
+| Phase | テーマ | 主な成果物 | 状態 |
+|---|---|---|---|
+| 41 | piano_roll の note edit + multi-select 統合 + library widget 化 (主軸) | `Edit::with_inverse` / `Edit::snapshot_inverse` で note add/delete/move/resize/select、Ui::take_drag_rect_in_rect で rect multi-select、Ui::set_cursor 公開、`Ui::piano_roll` library widget + `NotesEditRequest` enum で API 完結 | ✅ 完了 (41pre+a+b+c+d+e+f) |
+| 42 | sample_edit_ops の trim/fade を Undoable 化 (並行) | trim/fade in/out の 3 ボタンを `Edit::snapshot_inverse` 化。audio buffer (`Vec<f32>`) の inverse 戦略 (full snapshot / 差分のみ / Arc COW) から 1 つ採用 | 未着手 |
+| 43 | debug overlay (並行、旧 M14 Phase 56 先行実装) | `Ui::debug_overlay()` で frame_ms / scenegraph_size / cache_hit_rate / widget_count / history_depth を画面右上に半透明 overlay。Ctrl+F1 toggle | 未着手 |
+| 44 | Undoable ergonomic 評価 + 必要なら API 改善 (締め) | Phase 41-43 で書いた `Edit::with_inverse` 全 call site の boilerplate を計測、3 回以上繰り返されるパターンが見つかれば library helper を追加、なければ「現 API で十分」を確定。daw_01 で 1 操作実装してフィードバック取得 | 未着手 |
 
 **設計判断 (M9 全般)**:
 
-- **library widget 化を後回し**: Phase 41 で piano_roll を `crates/ui/src/widgets/piano_roll.rs` に widget 化するかは Undoable ergonomic 検証後に判断。validation 段階で API を locked-down するとフィードバックが取りづらいため、まず example で書き心地確認 → boilerplate あれば library helper 追加 → その上で widget 化、の順。
+- **library widget 化は Phase 41e で完了** (2026-05-03 修正): 当初は「validation 段階で API を locked-down するとフィードバックが取りづらいため後回し」と決めたが、CLAUDE.md「理想とベストプラクティスを追求する。そのためは大胆に破壊して作り直す」方針に基づき、validation 中も breaking 変更を恐れず逐次反映する判断に変更。Phase 42-43 で発見した改善は widget API を breaking 変更で逐次反映する。daw_01 が gui_01 の Note 型を直接 import していないため、breaking 影響は軽微。
 - **history group の API 形**: `begin_group("multi-delete") ... end_group()` の明示開閉と、`Edit::group(label, vec_of_edits)` の構造化のどちらが ergonomic かは Phase 41 で実証。
 - **audio buffer inverse 戦略**: 案 A (full `Arc<[f32]>` snapshot) / 案 B (差分のみ Vec) / 案 C (`Arc<Vec<f32>>` COW) の 3 案を Phase 42 で検証、Phase 41 の Vec<Note> 戦略との整合性を基準に選定。
 - **debug overlay は本格 prod tool ではなく validation 用**: 旧 M14 Phase 56 を validation 期間中に必要なので先行実装。

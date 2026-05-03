@@ -1166,3 +1166,59 @@ ui.heavy("track_0_clips", |hctx| {
 - 2026-05-01: **M4 Phase 12 — milestone 完了** — 波形 widget の `with_widget_node` 適用 + 1000 widget bench。`ChannelLayout` / `WaveformRenderMode` に `Hash` derive 追加 (input_hash で使用)、`Ui::waveform` を with_widget_node で wrap (input_hash に generation / valid_len / sample_rate / view / style / rect を組込、ヒットテストはクロージャ外で毎フレーム実行)。Rust 標準 Hash の tuple 上限 (12 要素) 回避のため hash_inputs に nested tuple を渡す形。`crates/ui/benches/scenegraph_cache.rs` 新規 bench で 1000 buttons の cached vs no-cache を比較、cached 165 µs vs no-cache 313 µs で 1.9x 高速 (148 ns/widget の CPU prepare コスト削減)。waveform_validation で 128 widgets の波形描画 + drag scroll / wheel zoom / Space REC に regression なし。M4 milestone 全項目達成、次は M5 (heavy() + 巨大ビュー + 詳細波形モード) へ。
 - 2026-05-01: **chore(clippy)** — Rust 1.95 系の新 clippy ルールで噴出した 30+ 件の警告を解消し `cargo clippy --workspace --tests -- -D warnings` を再び通すための前提整備。`ignored_unit_patterns` (ui.rs テスト内 `|_, ui|` を `|(), ui|` に 17 件)、`uninlined_format_args` (layout / fader / knob テストの `format!("{}", x)` を `"{x}"` に 7 件)、`borrow_as_ptr` (winit_backend の `&mut pt` を `&raw mut pt`)、`match_wildcard_for_single_variants` (device.rs に wgpu 29 系 `CurrentSurfaceTexture::Validation` を明示)、`collapsible_if` / `match_same_arms` / `default_trait_access` × 4 / `cast_possible_wrap` (`screen.{w,h}.try_into().unwrap_or(i32::MAX)`) / `iter_last_double_ended` (filter().last() → rfind()) / `inline_always` (waveform hot path 用 `#[inline(always)]` に `#[allow]` 併記) / `needless_range_loop` (waveform / mixer の index アクセス) / `too_many_lines` (text_input / waveform_validation / mixer の build_ui 系大関数に `#[allow]`、関数分割は別タスク) / `missing #[must_use]` (id.rs::child)。機能変更なし、Phase 13 とは独立の chore commit として分離。
 - 2026-05-01: **M5 Phase 13** — heavy() API 基盤。`Ui::heavy(id, |hctx|)` + `HeavyCtx<'b, 'a, M>` + `cached(viewport_key, draw_fn)` を `crates/ui/src/widgets/heavy.rs` に新設。`HeavyCtx::cached` は M4 Phase 11 の `with_widget_node(child_wid, hash_inputs(viewport_key), ...)` を呼ぶだけの薄いラッパで、新キャッシュ機構ゼロ (`feedback_use_new_abstractions` 適合)。HeavyCtx は `pointer / screen / push_edit / push_rect / push_text / push_lines / waveform / label_at / button_at` を delegate (最小範囲、KISS)、`push_*` は heavy 内では `pub` (脱出口の意味、通常 widget からは引き続き `pub(crate)`)。ヒットテスト・動的 overlay は cached() の外で毎フレーム実行のパターン (waveform widget と同型)。viewport_key は explicit Hash 渡し (Clone 不要)、no-Clone 不変条件維持。`examples/mixer` に heavy_demo ブロック (m.count を viewport_key に、cache hit/miss を実機目視確認用) を 1 つ仕込み。trybuild (`tests/ui/pass/heavy.rs`、no-Clone + viewport_key Hash 制約) と単体テスト 4 本 (cache hit / miss / ヒットテスト経路 / eviction) で動作担保、合計 50 unit/test pass。clippy 増分 0、`cargo run --bin mixer` で表示・操作に regression なし。次は Phase 14 (examples/piano_roll、heavy() 実用第 1 弾)。
+
+---
+
+## M9 Phase 41 (Real DAW Validation — note edit + library widget 化、完了 2026-05-03)
+
+**目的**: M8 で導入した `Edit::Undoable` の ergonomic を note 編集ケースで実証 (Phase 41a-d)、その経験を踏まえて piano_roll を library widget 化 (Phase 41e)。
+
+**進捗**: Phase 41 全 7 commits 完遂 (41pre + 41a + 41b + 41c + 41d + 41e + 41f)。
+
+| 成果物 | 状態 | コミット |
+|---|---|---|
+| 41pre: HeavyCtx に input/popup/shortcut/clipboard/history pull API 14 method delegate | ✅ | 63b361f |
+| 41a: piano_roll に Note id 導入 + 複数対応 add/delete を Edit::with_inverse 化 | ✅ | 8c2c49e |
+| 41b: 複数対応 move/resize Undoable + Ui::set_cursor (EwResize/Move) | ✅ | c81e685 |
+| 41c: rect multi-select (Alt+drag) + selection state Undoable | ✅ | b0ac62d |
+| 41d: Edit::snapshot_inverse helper を library 化 (5 helper の Arc capture pattern を吸収) | ✅ | c0fe6b6 |
+| 41e: piano_roll を crates/ui/src/widgets/piano_roll.rs に library widget 化 | ✅ | 8878388 |
+| 41f: docs(M9 Phase 41) 完了記録 + Phase 44 評価項目更新 | ✅ | (本コミット) |
+
+**主な学び**:
+
+- **Edit::with_inverse + Arc<...> capture の boilerplate** は 5 ペア (add/delete/move/resize/select) で顕在化 → `Edit::snapshot_inverse(label, snapshot, forward, restore_from)` helper で吸収成功 (41d)。snapshot を Arc 化して 2 closure に共有する pattern を 1 関数に集約。
+- **note の identity は `id: u32` 不変** が必須。natural key (start_beat, pitch) は move で変わる、index は delete でずれる。`PianoRollModel::next_note_id` で生成時 unique 採番、編集中も保持。multi-select identity が安定する。
+- **multi-delete = 1 Edit で完結** するため history group API は Phase 41 では不要だった (複数対応 helper で N notes の delete/move/resize/select が単一 `Edit::snapshot_inverse` に集約)。`begin_group / end_group` の need が出るのは「異なる種類の Edit を 1 step に」のケース、Phase 42 (audio trim → fade 連続) で実需が出たら別途実装判断。
+- **library widget 化は callback パターン (`make_edit: Fn(NotesEditRequest) -> Edit<M>`) で API 簡潔化** (41e)。当初 5 callback 案 (on_add / on_delete / ...) ではなく単一 callback + ADT (`NotesEditRequest` enum 5 variants) で吸収。`automation_curve::on_change` callback と同形のパターン precedent。`NotesEditRequest` は 1 frame で消費される一時 ADT で、Application::Message のように Model に保存される / Clone 伝染する性質はなく、メッセージ型禁止の不変条件と矛盾しない。
+- **drag 中は library overlay 描画 + release で初めて Undoable Edit 発行** (commit-by-release pattern)。drag 中 Mutate Edit 発行や `MoveContinue` variant 追加が不要。history も「drag 1 step = 1 Edit」で綺麗に保たれる。
+- **selected_note_ids は `&[NoteId]` immutable borrow + push_edit ベース更新** (41e)。`UiHost::frame` の closure シグネチャ `for<'a> FnOnce(&'a M, &mut Ui<'a, M>)` が `model: &M` (immutable) のため、`&mut model.selected_note_ids` を取れない (borrow checker E0596)。selection 変更は `NotesEditRequest::Select` を push_edit で発行 → frame 末で apply、次フレームで反映。これは no-Clone 不変条件と整合する正しい設計だった。
+- **daw_01 (path 依存先) は gui_01 の `Note` 型を直接 import していない** ため、library 化 commit は daw_01 build に影響なし (12 ファイルが daw_ui_core を import するが Note 関連型は 0)。daw_01 は piano_roll を独自 NoteBox 型 (f64 + lyric) で実装しており、schema 不一致は Phase 44 で統合判断 (Note の f64 化 / lyric 追加 / Arc 化 等)。
+- **trybuild の no_clone_required 担保** に `Ui::piano_roll` 呼び出しを追加し、`Note` を Vec で持つ non-Clone Model でコンパイルできることを CI 固定。
+
+**設計判断 (Phase 41 中の重要決定)**:
+
+- `Ui::set_cursor(CursorIcon)` は **「最後勝ち」semantics** (cursor stack push/pop は不要、DAW UX で同 frame 複数 widget の cursor 競合は実用上発生しない、`UiHost::with_window` で `set_cursor_request` callback も自動 set)。
+- `HeavyCtx` 包括 14 method delegate (41pre): rect-select / context_menu / shortcut consume / clipboard / file drop / scroll / history が heavy 内で書けない問題を 1 commit で塞ぐ。各 method は 1 行 forward なので LOC コスト低い、heavy 抽象の漏れを防ぐ目的を優先。
+- 複数対応 helper は **最初から `Vec<Note>` / `Vec<MoveDelta>` ベース** (single note は `vec![note]` で呼ぶ): DAW では multi-select が常態。後付けで multi 化すると call site が double。
+- **library widget 化を Phase 41e で完遂** (plan.md L142 の「後回し」方針を 2026-05-03 に修正): CLAUDE.md「理想とベストプラクティスを追求する。そのためは大胆に破壊して作り直す」方針に基づき、validation 中も breaking 変更を恐れず逐次反映。daw_01 への影響軽微 (Note 未 import) が確認できたため。
+- **view 状態は user 側、widget は値渡し `PianoRollView`**: pan/zoom 更新は app 層責務、widget は描画と note drag のみ担う。view を mutate する API を入れるとスコープが膨らむ。
+- **Edit factory 5 個 (`make_*_notes_edit`) は example に残す**: forward / inverse closure 内で `m.notes` / `m.selected_note_ids` / `m.notes_generation` を mutate する必要があり、generic 化には `NotesModel` trait が必要だが、daw_01 のような独自 schema (NoteBox / lyric / f64) を持つアプリで impl 不可能になり拡張性を損なう。library 側は `NotesEditRequest` enum を介した callback パターンで責務分離。
+
+**残作業 (Phase 42-44)**:
+
+- Phase 42: sample_edit_ops の trim/fade を `Edit::snapshot_inverse` 化、audio buffer (`Vec<f32>`) の inverse 戦略を 3 案 (full snapshot / 差分のみ Vec / Arc COW) から選定。
+- Phase 43: `Ui::debug_overlay` で frame_ms / scenegraph_size / cache_hit_rate / widget_count / history_depth を画面右上に半透明 overlay (Ctrl+F1 toggle)。
+- Phase 44: Phase 41-43 の `Edit::with_inverse` / `Edit::snapshot_inverse` 全 call site の boilerplate を計測 + library helper 追加判断、daw_01 との Note schema 統合判断。
+
+**Phase 44 評価項目への引き継ぎ**:
+
+- `Edit::snapshot_inverse` の汎用性: Vec<Note> で 5 ペア吸収済。Phase 42 の Vec<f32> で同 helper が再利用できるか検証。
+- `NotesEditRequest` enum + 単一 callback パターン: callback 5 個個別ではなく ADT で簡潔化の precedent、Phase 42 の audio buffer 系で類似パターンを使うか判断材料。
+- `daw_ui_core::Note` schema (id: u32, f32, no lyric) と daw_01 NoteBox schema (note: u32 = index 内部 id, f64, lyric: Option<String>) の不一致: Phase 44 で統合判断 (`f64` 化 / `lyric: Option<Arc<str>>` 追加 / id 命名統一)。
+
+**LOC**:
+
+- library: `crates/ui/src/widgets/piano_roll.rs` 新設 ~1565 LOC (公開型 9 + 純粋関数 6 + Style default + `Ui::piano_roll` 本体 + tests 23 ケース)。
+- example: `crates/examples/piano_roll/src/main.rs` 1480 → 720 LOC に縮小。
+- 計画 (plan_phase41.md) は library +400 / example -600 / test +200 = net +0 を見込んでいたが、実装で純粋関数を library に出した形 (Edit factory は example 残し) になり、別の LOC 配分になった。

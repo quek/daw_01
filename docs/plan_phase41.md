@@ -69,7 +69,7 @@ pan / lyric / channel / midi raw は Phase 41 では追加しない (boilerplate
 
 ## Commit 分解 (7 commits、依存順)
 
-### 41pre — `feat(M9): P1-3 — HeavyCtx に input/popup pull API を包括 delegate`
+### 41pre — `feat(M9): P1-3 — HeavyCtx に input/popup pull API を包括 delegate` ✅ done (63b361f)
 
 **着手契機**: 41a の context_menu / shortcut も heavy 内で書きたいため最先行。
 
@@ -108,7 +108,7 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
 
 ---
 
-### 41a — `feat(M9 Phase 41a): piano_roll に Note id 導入 + 複数対応 add/delete を Edit::with_inverse 化`
+### 41a — `feat(M9 Phase 41a): piano_roll に Note id 導入 + 複数対応 add/delete を Edit::with_inverse 化` ✅ done (8c2c49e)
 
 **Files**:
 - 修正: [crates/examples/piano_roll/src/main.rs](../crates/examples/piano_roll/src/main.rs)
@@ -170,7 +170,7 @@ fn make_delete_notes_edit(notes: Arc<[Note]>) -> Edit<PianoRollModel> {
 
 ---
 
-### 41b — `feat(M9 Phase 41b): piano_roll に複数対応 move/resize + Ui::set_cursor (EwResize/Move)`
+### 41b — `feat(M9 Phase 41b): piano_roll に複数対応 move/resize + Ui::set_cursor (EwResize/Move)` ✅ done (c81e685)
 
 **Files**:
 - 修正: [crates/ui/src/ui.rs](../crates/ui/src/ui.rs) (`Ui::set_cursor` + `pending_cursor`、`UiHost::with_window` 内部拡張)
@@ -261,7 +261,7 @@ fn make_resize_notes_edit(deltas: Arc<[(NoteId, f32, f32)]>) -> Edit<PianoRollMo
 
 ---
 
-### 41c — `feat(M9 Phase 41c): piano_roll に rect multi-select + selection state Undoable 化`
+### 41c — `feat(M9 Phase 41c): piano_roll に rect multi-select + selection state Undoable 化` ✅ done (b0ac62d)
 
 **Files**:
 - 修正: [crates/examples/piano_roll/src/main.rs](../crates/examples/piano_roll/src/main.rs)
@@ -315,7 +315,7 @@ fn make_select_notes_edit(prev: Arc<[NoteId]>, next: Arc<[NoteId]>) -> Edit<Pian
 
 ---
 
-### 41d — `feat(M9 Phase 41d): Edit::snapshot_inverse helper を library 化 (Arc capture pattern を吸収)`
+### 41d — `feat(M9 Phase 41d): Edit::snapshot_inverse helper を library 化 (Arc capture pattern を吸収)` ✅ done (c0fe6b6)
 
 **Files**:
 - 修正: [crates/ui/src/edit.rs](../crates/ui/src/edit.rs) (`Edit::snapshot_inverse` 追加)
@@ -385,7 +385,7 @@ fn make_delete_notes_edit(notes: Arc<[Note]>) -> Edit<PianoRollModel> {
 
 ---
 
-### 41e — `feat(M9 Phase 41e): piano_roll を library widget 化 (crates/ui/src/widgets/piano_roll.rs 新設)`
+### 41e — `feat(M9 Phase 41e): piano_roll を library widget 化 (crates/ui/src/widgets/piano_roll.rs 新設)` ✅ done (8878388)
 
 **breaking 容認**: 既存 example は library widget を使う形に書き換え。daw_01 が path 依存で取り込んでいる場合、daw_01 側も同 commit で更新する。
 
@@ -424,7 +424,7 @@ fn make_delete_notes_edit(notes: Arc<[Note]>) -> Edit<PianoRollModel> {
 
 ---
 
-### 41f — `docs(M9 Phase 41): 完了記録 + Phase 44 評価項目更新`
+### 41f — `docs(M9 Phase 41): 完了記録 + Phase 44 評価項目更新` ✅ done (this commit)
 
 **Files**:
 - 修正: [docs/plan.md](plan.md) (M9 Phase 41 完了マーク、Phase 41 で得た学びを Phase 44 評価項目に反映)
