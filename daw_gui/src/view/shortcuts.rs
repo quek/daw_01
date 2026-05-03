@@ -26,5 +26,7 @@ pub fn daw_shortcut_map() -> ShortcutMap {
     m.bind("daw.synthesize_vocal", "V");
     m.bind("daw.export_wav", "Ctrl+E");
     m.bind("daw.toggle_help", "F1");
+    // gui_01 piano_roll widget の `take_shortcut("add_note")` 用バインド。
+    m.bind("add_note", "Insert");
     m
 }

@@ -68,6 +68,11 @@ pub fn build_root(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize)
         h: STATUS_H,
     };
 
+    // gui_01 widget (piano_roll 等) は `take_shortcut` を消費する側面があるため、
+    // 先に root レベルで shortcut を捌いて広域の挙動を確定させる。widget 描画時には
+    // 消費済みになり、widget 内蔵の同名 shortcut handler は no-op に縮退する。
+    dispatch_shortcuts(app, ui);
+
     draw_menu_bar(ui, menu_rect);
     transport::draw(app, ui, transport_rect);
     track_inspector::draw(app, ui, inspector_rect);
@@ -79,8 +84,6 @@ pub fn build_root(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize)
     if app.is_plugin_picker_open {
         plugin_picker::draw(app, ui, screen);
     }
-
-    dispatch_shortcuts(app, ui);
 }
 
 /// 上部 menu bar (File / Edit / View) を library widget で描画。

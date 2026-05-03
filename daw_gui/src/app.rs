@@ -150,6 +150,7 @@ pub struct AppData {
     pub pianoroll_zoom_y: f32,
     pub pianoroll_top_pitch: u8,
     pub pianoroll_scroll_beat: f32,
+    pub pianoroll_notes_generation: u64,
 
     // -------- Playback / metering --------
     pub is_playing: bool,
@@ -267,6 +268,7 @@ impl AppData {
             pianoroll_zoom_y: 14.0,
             pianoroll_top_pitch: 84, // C6
             pianoroll_scroll_beat: 0.0,
+            pianoroll_notes_generation: 0,
             is_playing: false,
             is_looping: false,
             playhead_beat: None,
@@ -524,8 +526,26 @@ impl AppData {
     }
 
     fn after_undo_redo(&mut self) {
-        self.selected_clip = None;
-        self.selected_clips.clear();
+        // selected_clip が undo 後も存在するなら維持、消えていれば None。
+        // (常に None にすると undo のたびにピアノロールがプレースホルダに戻ってしまう)
+        if let Some(r) = self.selected_clip
+            && self
+                .song
+                .tracks
+                .get(r.track as usize)
+                .and_then(|t| t.clips.get(r.clip as usize))
+                .is_none()
+        {
+            self.selected_clip = None;
+        }
+        self.selected_clips.retain(|r| {
+            self.song
+                .tracks
+                .get(r.track as usize)
+                .and_then(|t| t.clips.get(r.clip as usize))
+                .is_some()
+        });
+        // note の index は undo で容易にずれるため、安全側で clear する。
         self.selected_notes.clear();
         self.track_rename_idx = None;
         self.track_rename_text.clear();
@@ -538,6 +558,7 @@ impl AppData {
         }
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
+        self.pianoroll_notes_generation += 1;
     }
 
     fn is_undoable(event: &AppEvent) -> bool {
@@ -553,6 +574,8 @@ impl AppData {
                 | AppEvent::DeleteSelectedClip
                 | AppEvent::AddNote { .. }
                 | AppEvent::ResizeNote { .. }
+                | AppEvent::ResizeNotes(_)
+                | AppEvent::SetNotePositions(_)
                 | AppEvent::DeleteSelectedNotes
                 | AppEvent::SetSelectedNoteLyric(_)
                 | AppEvent::QuantizeSelectedNotes(_)
@@ -676,6 +699,7 @@ impl AppData {
             }
         }
         self.sync_song_to_plugin_host();
+        self.pianoroll_notes_generation += 1;
     }
 
     fn resize_track_peak_display(&mut self) {
@@ -751,6 +775,7 @@ pub enum AppEvent {
         note: u32,
         duration: f64,
     },
+    ResizeNotes(Vec<(u32, f64, f64)>),
     DeleteSelectedNotes,
     SetSelectedNoteLyric(String),
 
@@ -934,6 +959,9 @@ impl AppData {
             }
             AppEvent::SetNotePositions(entries) => {
                 self.set_note_positions(&entries);
+            }
+            AppEvent::ResizeNotes(entries) => {
+                self.resize_notes(&entries);
             }
             AppEvent::SetNoteSelection(targets) => {
                 self.selected_notes = targets;
@@ -1664,6 +1692,7 @@ impl AppData {
         }
         self.selected_notes = vec![new_idx];
         self.sync_song_to_plugin_host();
+        self.pianoroll_notes_generation += 1;
     }
 
     fn set_note_positions(&mut self, entries: &[(u32, f64, u8)]) {
@@ -1684,6 +1713,28 @@ impl AppData {
             note.pitch = pitch;
         }
         self.sync_song_to_plugin_host();
+        self.pianoroll_notes_generation += 1;
+    }
+
+    fn resize_notes(&mut self, entries: &[(u32, f64, f64)]) {
+        let Some(r) = self.selected_clip else {
+            return;
+        };
+        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(r.clip as usize) else {
+            return;
+        };
+        for &(idx, start, duration) in entries {
+            let Some(note) = clip.notes.get_mut(idx as usize) else {
+                continue;
+            };
+            note.start_beat = start.max(0.0);
+            note.duration_beats = duration.max(0.0625);
+        }
+        self.sync_song_to_plugin_host();
+        self.pianoroll_notes_generation += 1;
     }
 
     fn resize_note(
@@ -1705,6 +1756,7 @@ impl AppData {
         };
         note.duration_beats = new_duration;
         self.sync_song_to_plugin_host();
+        self.pianoroll_notes_generation += 1;
     }
 
     fn delete_selected_notes(&mut self) {
@@ -1727,6 +1779,7 @@ impl AppData {
             }
         }
         self.sync_song_to_plugin_host();
+        self.pianoroll_notes_generation += 1;
     }
 
     fn set_selected_note_lyric(&mut self, lyric: String) {
@@ -1752,6 +1805,7 @@ impl AppData {
             }
         }
         self.sync_song_to_plugin_host();
+        self.pianoroll_notes_generation += 1;
     }
 
     // -------- Plugin GUI bridge --------------------------------------------
