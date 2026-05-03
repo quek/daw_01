@@ -127,7 +127,17 @@ fn main() {
                 &m.selected_note_ids,
                 &style,
                 |req| match req {
-                    NotesEditRequest::Add(_) => Edit::mutate(|_m: &mut Model| {}),
+                    NotesEditRequest::Add(_) => Edit::mutate(|_m: &mut Model| {
+                        // Note を作る場合は lyric: None も渡す (M9 Phase 44c で追加)
+                        let _new = Note {
+                            id: 0,
+                            start_beat: 0.0_f64,
+                            len_beats: 0.5_f64,
+                            pitch: 60,
+                            velocity: 96,
+                            lyric: None,
+                        };
+                    }),
                     NotesEditRequest::Delete(_) => Edit::mutate(|_m: &mut Model| {}),
                     NotesEditRequest::Move(_) => Edit::mutate(|_m: &mut Model| {}),
                     NotesEditRequest::Resize(_) => Edit::mutate(|_m: &mut Model| {}),

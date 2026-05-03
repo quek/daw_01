@@ -44,8 +44,10 @@ struct PianoRollModel {
     next_note_id: NoteId,
     selected_note_ids: Vec<NoteId>,
 
-    view_start_beat: f32,
-    view_len_beats: f32,
+    /// 拍は f64 (M9 Phase 44c 後の Note schema と一致)。
+    view_start_beat: f64,
+    view_len_beats: f64,
+    /// pitch は MIDI 0..127 なので f32 で十分。
     pitch_top: f32,
     pitch_visible: f32,
 
@@ -95,20 +97,28 @@ fn generate_notes(count: usize) -> Vec<Note> {
         z ^ (z >> 31)
     };
 
-    let total_beats: f32 = 1024.0;
+    let total_beats: f64 = 1024.0;
     let pitch_lo: u8 = 36;
     let pitch_hi: u8 = 96;
     let mut notes: Vec<Note> = Vec::with_capacity(count);
+    // M9 Phase 44c: lyric demo として 8 note ごとに 1 つだけ Arc<str> を付ける
+    // (毎 note に付けると視覚的にうるさいので、demo として疎に配置)。
+    let demo_lyrics: [&str; 5] = ["ら", "る", "れ", "ろ", "り"];
     for i in 0..count {
         let r1 = next();
         let r2 = next();
         let r3 = next();
         let r4 = next();
-        let start_beat = (r1 as f32 / u64::MAX as f32) * total_beats;
-        let len_beats = 0.125 + (r2 as f32 / u64::MAX as f32) * 1.875;
+        let start_beat = (r1 as f64 / u64::MAX as f64) * total_beats;
+        let len_beats = 0.125_f64 + (r2 as f64 / u64::MAX as f64) * 1.875_f64;
         let pitch = pitch_lo + ((r3 % u64::from(pitch_hi - pitch_lo)) as u8);
         let velocity = 32 + ((r4 % 96) as u8);
-        notes.push(Note { id: i as NoteId, start_beat, len_beats, pitch, velocity });
+        let lyric = if i % 8 == 0 {
+            Some(Arc::from(demo_lyrics[(i / 8) % demo_lyrics.len()]))
+        } else {
+            None
+        };
+        notes.push(Note { id: i as NoteId, start_beat, len_beats, pitch, velocity, lyric });
     }
     notes.sort_by(|a, b| a.start_beat.partial_cmp(&b.start_beat).unwrap_or(std::cmp::Ordering::Equal));
     notes
@@ -125,8 +135,9 @@ fn make_add_notes_edit(notes: Vec<Note>) -> Edit<PianoRollModel> {
         label,
         notes,
         |m: &mut PianoRollModel, snap: &Vec<Note>| {
+            // Note は Copy ではない (Arc<str> lyric を持つ) ので clone() で push。
             for note in snap {
-                m.notes.push(*note);
+                m.notes.push(note.clone());
                 m.next_note_id = m.next_note_id.max(note.id + 1);
             }
             m.notes.sort_by(|a, b| {
@@ -233,7 +244,7 @@ fn make_delete_notes_edit(notes: Vec<Note>) -> Edit<PianoRollModel> {
         },
         |m: &mut PianoRollModel, snap: &Vec<Note>| {
             for note in snap {
-                m.notes.push(*note);
+                m.notes.push(note.clone());
             }
             m.notes.sort_by(|a, b| {
                 a.start_beat.partial_cmp(&b.start_beat).unwrap_or(std::cmp::Ordering::Equal)
@@ -276,7 +287,8 @@ struct App {
 
     /// pan drag 状態 (note_drag は library widget が握るので、ここは pan 専用)。
     /// (anchor_x, anchor_y, anchor_view_start_beat, anchor_pitch_top)
-    pan_anchor: Option<(f32, f32, f32, f32)>,
+    /// (anchor_x: f32, anchor_y: f32, anchor_view_start_beat: f64, anchor_pitch_top: f32)
+    pan_anchor: Option<(f32, f32, f64, f32)>,
     cur_mouse: Option<(f32, f32)>,
     pending_zoom_dy: f32,
 
@@ -350,9 +362,9 @@ impl App {
         {
             let dx = px - ax;
             let dy = py - ay;
-            let beat_per_px = self.model.view_len_beats / grid.w.max(1.0);
+            let beat_per_px: f64 = self.model.view_len_beats / f64::from(grid.w.max(1.0));
             let pitch_per_px = self.model.pitch_visible / grid.h.max(1.0);
-            self.model.view_start_beat = (ave_start - dx * beat_per_px).max(0.0);
+            self.model.view_start_beat = (ave_start - f64::from(dx) * beat_per_px).max(0.0);
             self.model.pitch_top = (ave_pitch_top + dy * pitch_per_px)
                 .min(127.0)
                 .max(self.model.pitch_visible - 1.0);
@@ -384,10 +396,12 @@ impl App {
                 } else {
                     0.5
                 };
-                let new_len = (self.model.view_len_beats * factor).clamp(0.25, 256.0);
+                // factor / anchor_frac は f32、view_len_beats は f64 → 計算は f64 で。
+                let new_len: f64 =
+                    (self.model.view_len_beats * f64::from(factor)).clamp(0.25, 256.0);
                 let anchor_beat =
-                    self.model.view_start_beat + anchor_frac * self.model.view_len_beats;
-                let new_start = (anchor_beat - anchor_frac * new_len).max(0.0);
+                    self.model.view_start_beat + f64::from(anchor_frac) * self.model.view_len_beats;
+                let new_start = (anchor_beat - f64::from(anchor_frac) * new_len).max(0.0);
                 self.model.view_start_beat = new_start;
                 self.model.view_len_beats = new_len;
             }
@@ -617,8 +631,8 @@ mod tests {
     use super::*;
     use daw_ui_core::Edit;
 
-    fn note(id: NoteId, start: f32, len: f32, pitch: u8) -> Note {
-        Note { id, start_beat: start, len_beats: len, pitch, velocity: 96 }
+    fn note(id: NoteId, start: f64, len: f64, pitch: u8) -> Note {
+        Note { id, start_beat: start, len_beats: len, pitch, velocity: 96, lyric: None }
     }
 
     #[test]
@@ -696,8 +710,8 @@ mod tests {
         let initial = vec![note(0, 0.0, 0.5, 60), note(1, 1.0, 0.5, 64)];
         let mut model = PianoRollModel::new(initial);
         let deltas: Vec<MoveDelta> = vec![
-            (0u32, 0.0_f32, 60u8, 2.0_f32, 72u8),
-            (1u32, 1.0_f32, 64u8, 3.0_f32, 70u8),
+            (0u32, 0.0_f64, 60u8, 2.0_f64, 72u8),
+            (1u32, 1.0_f64, 64u8, 3.0_f64, 70u8),
         ];
         let edit = make_move_notes_edit(deltas);
         let Edit::Undoable { forward, inverse, .. } = edit else {
@@ -717,7 +731,7 @@ mod tests {
     fn resize_notes_then_undo_round_trip_right_edge() {
         let initial = vec![note(0, 0.0, 0.5, 60)];
         let mut model = PianoRollModel::new(initial);
-        let deltas: Vec<ResizeDelta> = vec![(0u32, 0.0_f32, 0.5_f32, 0.0_f32, 1.0_f32)];
+        let deltas: Vec<ResizeDelta> = vec![(0u32, 0.0_f64, 0.5_f64, 0.0_f64, 1.0_f64)];
         let edit = make_resize_notes_edit(deltas);
         let Edit::Undoable { forward, inverse, .. } = edit else {
             panic!("expected Undoable");
@@ -732,7 +746,7 @@ mod tests {
     fn resize_notes_then_undo_round_trip_left_edge() {
         let initial = vec![note(0, 1.0, 1.0, 60)];
         let mut model = PianoRollModel::new(initial);
-        let deltas: Vec<ResizeDelta> = vec![(0u32, 1.0_f32, 1.0_f32, 0.75_f32, 1.25_f32)];
+        let deltas: Vec<ResizeDelta> = vec![(0u32, 1.0_f64, 1.0_f64, 0.75_f64, 1.25_f64)];
         let edit = make_resize_notes_edit(deltas);
         let Edit::Undoable { forward, inverse, .. } = edit else {
             panic!("expected Undoable");
@@ -768,7 +782,7 @@ mod tests {
         let initial = vec![note(0, 0.0, 0.5, 60), note(1, 1.0, 0.5, 64)];
         let mut model = PianoRollModel::new(initial);
         let deltas: Vec<MoveDelta> =
-            vec![(0u32, 0.0_f32, 60u8, 2.0_f32, 60u8), (1u32, 1.0_f32, 64u8, 0.5_f32, 64u8)];
+            vec![(0u32, 0.0_f64, 60u8, 2.0_f64, 60u8), (1u32, 1.0_f64, 64u8, 0.5_f64, 64u8)];
         let edit = make_move_notes_edit(deltas);
         if let Edit::Undoable { forward, .. } = edit {
             forward(&mut model);

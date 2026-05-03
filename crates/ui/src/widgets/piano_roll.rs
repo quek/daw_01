@@ -38,6 +38,7 @@
 
 use std::collections::HashSet;
 use std::hash::Hash;
+use std::sync::Arc;
 
 use daw_ui_platform::CursorIcon;
 use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
@@ -53,29 +54,34 @@ use crate::ui::Ui;
 /// note 識別子。生成時に割り当て、編集中も不変 (multi-select identity 安定)。
 pub type NoteId = u32;
 
-/// piano roll の 1 note (library 公開型)。Copy で軽量。
+/// piano roll の 1 note (library 公開型)。
 ///
-/// schema:
+/// schema (M9 Phase 44c で f64 化 + lyric 追加):
 /// - `id: NoteId` — 生成時に割り当て (`PianoRollModel::next_note_id` 等)、move/delete でも不変
-/// - `start_beat: f32` — 開始位置 (拍単位、0.0 = 最初の拍)
-/// - `len_beats: f32` — 長さ (拍単位)
+/// - `start_beat: f64` — 開始位置 (拍単位、0.0 = 最初の拍)。f64 で長尺 song / sample 精度を確保
+/// - `len_beats: f64` — 長さ (拍単位)
 /// - `pitch: u8` — MIDI 0..127 (実用 36..96 が C2..C7)
 /// - `velocity: u8` — MIDI 0..127 (色濃度に使う、`PianoRollStyle::note_fill_fn` で Color に変換)
-#[derive(Clone, Copy, Debug)]
+/// - `lyric: Option<Arc<str>>` — singing synthesis 用歌詞 (VOICEVOX 等)、note 上に表示。
+///   `None` なら lyric 表示せず。`Arc<str>` で多数 note 間の文字列共有を可能にする。
+///
+/// `Copy` ではない (`Arc<str>` のため `Clone` のみ)。closure capture / sort では参照渡しで対応。
+#[derive(Clone, Debug)]
 pub struct Note {
     pub id: NoteId,
-    pub start_beat: f32,
-    pub len_beats: f32,
+    pub start_beat: f64,
+    pub len_beats: f64,
     pub pitch: u8,
     pub velocity: u8,
+    pub lyric: Option<Arc<str>>,
 }
 
 /// move helper の delta タプル: (id, prev_start_beat, prev_pitch, next_start_beat, next_pitch)。
-pub type MoveDelta = (NoteId, f32, u8, f32, u8);
+pub type MoveDelta = (NoteId, f64, u8, f64, u8);
 
 /// resize helper の delta タプル: (id, prev_start_beat, prev_len_beats, next_start_beat, next_len_beats)。
 /// ResizeRight (右端 drag) は prev_start == next_start、ResizeLeft (左端 drag) は両方変わる。
-pub type ResizeDelta = (NoteId, f32, f32, f32, f32);
+pub type ResizeDelta = (NoteId, f64, f64, f64, f64);
 
 /// note drag の種別 (hit-test 結果)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,12 +96,15 @@ pub enum NoteDragKind {
 
 /// piano roll の view 状態 (pan / zoom)。値渡し (Copy) で widget に渡す。
 /// pan/zoom の更新は user 側 (widget は描画と drag のみ担う)。
+///
+/// 拍は `f64` (`Note.start_beat` / `len_beats` と同精度)、pitch は `f32` (実用上 0..127 の範囲なので
+/// f32 で十分)。
 #[derive(Clone, Copy, Debug)]
 pub struct PianoRollView {
     /// 表示 left の拍 (浮動小数で smooth scroll)。
-    pub start_beat: f32,
-    /// 表示する拍範囲 (= zoom 倍率の逆数)。例: `view_len_beats=4` で 1 小節幅。
-    pub len_beats: f32,
+    pub start_beat: f64,
+    /// 表示する拍範囲 (= zoom 倍率の逆数)。例: `view_len_beats=4.0` で 1 小節幅。
+    pub len_beats: f64,
     /// 表示 top の MIDI ピッチ (浮動小数で smooth scroll)。
     pub pitch_top: f32,
     /// 表示する pitch 範囲 (例: `24.0` で 2 オクターブ)。
@@ -145,8 +154,8 @@ pub struct PianoRollResponse {
     /// このフレームで `NotesEditRequest::Select` を push_edit したか (= 次フレームで
     /// `selected` が変わる予定であることを app 側 UI に伝える、selection 連動 UI のトリガー)。
     pub selection_changed: bool,
-    /// drag<16px の short click の grid 上 beat/pitch (snap 前)。Insert 等の代替起点に使える。
-    pub clicked_at_beat_pitch: Option<(f32, f32)>,
+    /// drag<16px の short click の grid 上 (beat: f64, pitch: f32) (snap 前)。Insert 等の代替起点に使える。
+    pub clicked_at_beat_pitch: Option<(f64, f32)>,
 }
 
 /// velocity → fill Color の関数。`fn` pointer (closure 不可、Style: Copy 維持のため)。
@@ -179,6 +188,10 @@ pub struct PianoRollStyle {
     pub resize_handle_px: f32,
     pub c_label_color: Color,
     pub c_label_font_px: f32,
+    /// M9 Phase 44c: note 上に重ねて描画する歌詞 (lyric) の色とフォントサイズ。
+    /// `Note.lyric == Some(...)` のとき note rect 上端に label 描画。
+    pub lyric_color: Color,
+    pub lyric_font_px: f32,
 }
 
 /// デフォルト velocity color (青系の濃淡 0.5..0.95)。`PianoRollStyle::note_fill_fn` の初期値。
@@ -209,6 +222,8 @@ impl Default for PianoRollStyle {
             resize_handle_px: 4.0,
             c_label_color: Color::rgb(0.30, 0.30, 0.35),
             c_label_font_px: 11.0,
+            lyric_color: Color::rgb(0.10, 0.10, 0.15),
+            lyric_font_px: 9.0,
         }
     }
 }
@@ -219,13 +234,27 @@ impl Default for PianoRollStyle {
 
 /// 1 つの note の screen 座標 rect を返す (pan/zoom 適用後、grid 外も含む raw rect)。
 /// app 側で「click 位置から note を逆引き」「drag preview rect」等の座標計算に使える。
+///
+/// Note は `Clone` のみ (Arc<str> lyric のため) なので参照渡し。
 #[must_use]
-pub fn note_to_rect(note: Note, view: PianoRollView, grid: Rect) -> Rect {
-    let beat_to_px = grid.w / view.len_beats.max(1e-6);
+pub fn note_to_rect(note: &Note, view: PianoRollView, grid: Rect) -> Rect {
+    note_geometry_to_rect(note.start_beat, note.len_beats, note.pitch, view, grid)
+}
+
+/// 内部 helper: note geometry から rect を計算。`note_to_rect` と drag preview から呼ばれる。
+/// 拍は f64、最終的な pixel 座標は f32 にcast (描画用)。
+fn note_geometry_to_rect(
+    start_beat: f64,
+    len_beats: f64,
+    pitch: u8,
+    view: PianoRollView,
+    grid: Rect,
+) -> Rect {
+    let beat_to_px = f64::from(grid.w) / view.len_beats.max(1e-6);
     let pitch_to_px = grid.h / view.pitch_visible.max(1e-6);
-    let x = grid.x + (note.start_beat - view.start_beat) * beat_to_px;
-    let w = (note.len_beats * beat_to_px).max(1.5);
-    let y = grid.y + (view.pitch_top - f32::from(note.pitch)) * pitch_to_px;
+    let x = grid.x + ((start_beat - view.start_beat) * beat_to_px) as f32;
+    let w = ((len_beats * beat_to_px) as f32).max(1.5);
+    let y = grid.y + (view.pitch_top - f32::from(pitch)) * pitch_to_px;
     let h = (pitch_to_px - 1.0).max(2.0);
     Rect { x, y, w, h }
 }
@@ -254,7 +283,7 @@ pub fn note_hit(
 
     let mut hit: Option<(NoteId, NoteDragKind)> = None;
     for note in visible {
-        let r = note_to_rect(*note, view, grid);
+        let r = note_to_rect(note, view, grid);
         if !r.contains(cx, cy) {
             continue;
         }
@@ -287,7 +316,7 @@ pub fn note_hover_cursor(
     }
     let mut hit_cursor: Option<CursorIcon> = None;
     for note in visible {
-        let r = note_to_rect(*note, view, grid);
+        let r = note_to_rect(note, view, grid);
         if !r.contains(cx, cy) {
             continue;
         }
@@ -322,9 +351,9 @@ pub fn is_black_key(pitch: u8) -> bool {
 #[derive(Clone, Copy, Debug)]
 struct NoteDragAnchor {
     id: NoteId,
-    start_beat: f32,
+    start_beat: f64,
     pitch: u8,
-    len_beats: f32,
+    len_beats: f64,
 }
 
 /// 1 度の note drag セッション (move / resize / 複数同時)。
@@ -359,40 +388,32 @@ fn note_rect_command(rect: Rect, fill: Color, radius_px: f32) -> RectCommand {
     }
 }
 
-/// drag preview の shifted note を計算 (drag 中の表示用、元 Note は不変)。
-/// kind に応じて start_beat / pitch / len_beats を delta で更新した Note を返す。
-fn drag_preview_note(
+/// drag preview の shifted note geometry を計算 (drag 中の表示用、元 Note は不変)。
+/// kind に応じて start_beat / pitch / len_beats を delta で更新した tuple を返す
+/// (Note を返さないのは Note が `Arc<str>` lyric を持つので Copy できないため、
+/// drag preview で必要な geometry 3 つだけ返す)。
+fn drag_preview_geometry(
     anchor: NoteDragAnchor,
     kind: NoteDragKind,
-    beat_delta: f32,
+    beat_delta: f64,
     pitch_delta: i32,
-) -> Note {
+) -> (f64, f64, u8) {
     match kind {
-        NoteDragKind::Move => Note {
-            id: anchor.id,
-            start_beat: (anchor.start_beat + beat_delta).max(0.0),
-            len_beats: anchor.len_beats,
-            pitch: (i32::from(anchor.pitch) + pitch_delta).clamp(0, 127) as u8,
-            velocity: 96, // velocity は drag preview で使わないので固定
-        },
-        NoteDragKind::ResizeRight => Note {
-            id: anchor.id,
-            start_beat: anchor.start_beat,
-            len_beats: (anchor.len_beats + beat_delta).max(0.05),
-            pitch: anchor.pitch,
-            velocity: 96,
-        },
+        NoteDragKind::Move => (
+            (anchor.start_beat + beat_delta).max(0.0),
+            anchor.len_beats,
+            (i32::from(anchor.pitch) + pitch_delta).clamp(0, 127) as u8,
+        ),
+        NoteDragKind::ResizeRight => (
+            anchor.start_beat,
+            (anchor.len_beats + beat_delta).max(0.05),
+            anchor.pitch,
+        ),
         NoteDragKind::ResizeLeft => {
             let max_start = anchor.start_beat + anchor.len_beats - 0.05;
             let new_start = (anchor.start_beat + beat_delta).clamp(0.0, max_start);
             let actual_delta = new_start - anchor.start_beat;
-            Note {
-                id: anchor.id,
-                start_beat: new_start,
-                len_beats: (anchor.len_beats - actual_delta).max(0.05),
-                pitch: anchor.pitch,
-                velocity: 96,
-            }
+            (new_start, (anchor.len_beats - actual_delta).max(0.05), anchor.pitch)
         }
     }
 }
@@ -505,7 +526,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ----- drag continue (描画用 delta を計算) + release 検出 -----
-        let beat_per_px = view.len_beats / grid.w.max(1.0);
+        // 拍は f64、pixel は f32 なので変換を 1 箇所で吸収。
+        let beat_per_px: f64 = view.len_beats / f64::from(grid.w.max(1.0));
         let pitch_per_px = view.pitch_visible / grid.h.max(1.0);
         let drag_session: Option<NoteDragSession> = {
             let state: &mut PianoRollState = self.widget_state(wid);
@@ -533,14 +555,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 (None, None)
             };
 
-        // drag 中の delta (pointer から計算)
-        let drag_overlay: Option<(NoteDragSession, f32, i32)> = drag_session
+        // drag 中の delta (pointer から計算)。beat_delta は f64、pitch_delta は i32 (整数 pitch 単位)。
+        let drag_overlay: Option<(NoteDragSession, f64, i32)> = drag_session
             .as_ref()
             .and_then(|nd| pointer.pos.map(|p| (nd.clone(), p)))
             .map(|(nd, (px, py))| {
                 let dx = px - nd.anchor_mouse.0;
                 let dy = py - nd.anchor_mouse.1;
-                let beat_delta = dx * beat_per_px;
+                let beat_delta = f64::from(dx) * beat_per_px;
                 let pitch_delta = (-(dy * pitch_per_px)).round() as i32;
                 (nd, beat_delta, pitch_delta)
             });
@@ -627,6 +649,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     grid,
                     style_copy.note_fill_fn,
                     style_copy.note_border_radius_px,
+                    style_copy.lyric_color,
+                    style_copy.lyric_font_px,
                 );
             });
 
@@ -653,9 +677,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             && let Some((cx, cy)) = pointer.pos
             && grid.contains(cx, cy)
         {
-            let beat_to_px = grid.w / view.len_beats.max(1e-6);
+            let beat_to_px = f64::from(grid.w) / view.len_beats.max(1e-6);
             let pitch_to_px = grid.h / view.pitch_visible.max(1e-6);
-            let start_beat = (view.start_beat + (cx - grid.x) / beat_to_px).max(0.0);
+            let start_beat = (view.start_beat + f64::from(cx - grid.x) / beat_to_px).max(0.0);
             let pitch_f = view.pitch_top - (cy - grid.y) / pitch_to_px;
             let pitch = (pitch_f.round() as i32).clamp(0, 127) as u8;
             // note id は user 側で next_note_id を bump して上書き。
@@ -666,6 +690,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 len_beats: 0.5,
                 pitch,
                 velocity: 96,
+                lyric: None,
             };
             self.push_edit(make_edit(NotesEditRequest::Add(vec![new_note])));
         }
@@ -673,7 +698,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         if self.take_shortcut("delete") && !selected.is_empty() {
             let sel_set: HashSet<NoteId> = selected.iter().copied().collect();
             let to_delete: Vec<Note> =
-                notes.iter().filter(|n| sel_set.contains(&n.id)).copied().collect();
+                notes.iter().filter(|n| sel_set.contains(&n.id)).cloned().collect();
             if !to_delete.is_empty() {
                 self.push_edit(make_edit(NotesEditRequest::Delete(to_delete)));
             }
@@ -702,9 +727,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
             // grid 内の short click なら beat/pitch も Response に載せる
             if grid.contains(cx, cy) {
-                let beat_to_px = grid.w / view.len_beats.max(1e-6);
+                let beat_to_px = f64::from(grid.w) / view.len_beats.max(1e-6);
                 let pitch_to_px = grid.h / view.pitch_visible.max(1e-6);
-                let beat = view.start_beat + (cx - grid.x) / beat_to_px;
+                let beat = view.start_beat + f64::from(cx - grid.x) / beat_to_px;
                 let pitch = view.pitch_top - (cy - grid.y) / pitch_to_px;
                 response.clicked_at_beat_pitch = Some((beat, pitch));
             }
@@ -712,10 +737,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         // ----- drag release → Move / Resize Edit 発行 -----
         if let Some(nd) = drag_release {
-            let (beat_delta, pitch_delta) = pointer.pos.map_or((0.0, 0), |(px, py)| {
+            let (beat_delta, pitch_delta): (f64, i32) = pointer.pos.map_or((0.0, 0), |(px, py)| {
                 let dx = px - nd.anchor_mouse.0;
                 let dy = py - nd.anchor_mouse.1;
-                (dx * beat_per_px, (-(dy * pitch_per_px)).round() as i32)
+                (f64::from(dx) * beat_per_px, (-(dy * pitch_per_px)).round() as i32)
             });
 
             match nd.kind {
@@ -799,7 +824,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let new_ids: Vec<NoteId> = visible
                     .iter()
                     .filter_map(|n| {
-                        let r = note_to_rect(*n, view, grid);
+                        let r = note_to_rect(n, view, grid);
                         if rects_intersect(r, drag_rect) {
                             Some(n.id)
                         } else {
@@ -868,11 +893,11 @@ fn draw_grid_background<M: ?Sized + 'static>(
 
     // (c) 拍縦線 (1 拍ごと細線、4 拍ごと太線)
     let view_end_beat = view.start_beat + view.len_beats;
-    let beat_to_px = grid.w / view.len_beats.max(1e-6);
+    let beat_to_px = f64::from(grid.w) / view.len_beats.max(1e-6);
     let first_beat = view.start_beat.floor() as i32;
     let last_beat = view_end_beat.ceil() as i32;
     for b in first_beat..=last_beat {
-        let x = grid.x + (b as f32 - view.start_beat) * beat_to_px;
+        let x = grid.x + ((f64::from(b) - view.start_beat) * beat_to_px) as f32;
         if x < grid.x - 1.0 || x > grid.x + grid.w + 1.0 {
             continue;
         }
@@ -946,7 +971,9 @@ fn draw_grid_background<M: ?Sized + 'static>(
     }
 }
 
-/// visible note を grid 内に clip して描画。
+/// visible note を grid 内に clip して描画。M9 Phase 44c 以降 `lyric: Some(...)` が
+/// あれば note rect の左端に重ねて描画する (note 高さが lyric font 1 行分以上あるときのみ)。
+#[allow(clippy::too_many_arguments)]
 fn draw_notes<M: ?Sized + 'static>(
     hctx: &mut crate::widgets::heavy::HeavyCtx<'_, '_, M>,
     visible: &[Note],
@@ -954,9 +981,11 @@ fn draw_notes<M: ?Sized + 'static>(
     grid: Rect,
     note_fill_fn: NoteFillFn,
     radius_px: f32,
+    lyric_color: Color,
+    lyric_font_px: f32,
 ) {
     for note in visible {
-        let r = note_to_rect(*note, view, grid);
+        let r = note_to_rect(note, view, grid);
         let x_left = r.x.max(grid.x);
         let x_right = (r.x + r.w).min(grid.x + grid.w);
         let y_top = r.y.max(grid.y);
@@ -971,6 +1000,21 @@ fn draw_notes<M: ?Sized + 'static>(
             h: y_bot - y_top,
         };
         hctx.push_rect(note_rect_command(clipped, note_fill_fn(note.velocity), radius_px));
+        // M9 Phase 44c: lyric を note rect 内左端に描画 (note の高さが font 1 行に届くとき)。
+        if let Some(lyric) = note.lyric.as_ref()
+            && clipped.h >= lyric_font_px + 1.0
+            && clipped.w >= lyric_font_px
+        {
+            hctx.push_text(GlyphArea {
+                text: lyric.to_string(),
+                left: clipped.x + 1.0,
+                top: clipped.y,
+                font_size: lyric_font_px,
+                line_height: lyric_font_px * 1.1,
+                color: lyric_color,
+                clip_rect: Some(clipped),
+            });
+        }
     }
 }
 
@@ -987,7 +1031,7 @@ fn draw_selection_overlay<M: ?Sized + 'static>(
         if !selected_set.contains(&note.id) {
             continue;
         }
-        let r = note_to_rect(*note, view, grid);
+        let r = note_to_rect(note, view, grid);
         let pad = style.note_selected_pad_px;
         hctx.push_rect(RectCommand {
             rect: Rect {
@@ -1012,12 +1056,13 @@ fn draw_drag_preview<M: ?Sized + 'static>(
     view: PianoRollView,
     grid: Rect,
     style: &PianoRollStyle,
-    beat_delta: f32,
+    beat_delta: f64,
     pitch_delta: i32,
 ) {
     for a in &nd.anchors {
-        let preview = drag_preview_note(*a, nd.kind, beat_delta, pitch_delta);
-        let r = note_to_rect(preview, view, grid);
+        let (start_beat, len_beats, pitch) =
+            drag_preview_geometry(*a, nd.kind, beat_delta, pitch_delta);
+        let r = note_geometry_to_rect(start_beat, len_beats, pitch, view, grid);
         let x_left = r.x.max(grid.x);
         let x_right = (r.x + r.w).min(grid.x + grid.w);
         let y_top = r.y.max(grid.y);
@@ -1053,8 +1098,8 @@ mod tests {
     use daw_ui_platform::{ElementState, KeyEvent, Modifiers, PhysicalKey, PhysicalSize};
     use daw_ui_renderer::Scene;
 
-    fn note(id: NoteId, start: f32, len: f32, pitch: u8) -> Note {
-        Note { id, start_beat: start, len_beats: len, pitch, velocity: 96 }
+    fn note(id: NoteId, start: f64, len: f64, pitch: u8) -> Note {
+        Note { id, start_beat: start, len_beats: len, pitch, velocity: 96, lyric: None }
     }
 
     fn test_view() -> PianoRollView {
@@ -1173,7 +1218,7 @@ mod tests {
     #[test]
     fn note_to_rect_basic_position() {
         let (_, view, grid) = make_test_setup();
-        let r = note_to_rect(note(0, 1.0, 1.0, 60), view, grid);
+        let r = note_to_rect(&note(0, 1.0, 1.0, 60), view, grid);
         // beat_to_px = 400/4 = 100, pitch_to_px = 200/24 ≈ 8.33
         // x = 50 + 1*100 = 150, w = 1*100 = 100
         assert!((r.x - 150.0).abs() < 1e-3);

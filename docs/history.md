@@ -1444,6 +1444,7 @@ let edit = Edit::with_inverse(
 - **call site の総数 9 件は意外に少ない**: M9 全期間で Undoable Edit が必要な場面は 7 helper + fader/knob の 2 件のみ。validation 段階でこれだけ少ないのは「Mutate Edit で済むケースが多い」(drag 中の連続更新、UI state 変更で history に積まなくてよいケース、等) ため。`Edit::Mutate` と `Edit::Undoable` の使い分けが現実的に機能している。
 - **3 件未満は抽象化見送り**: CLAUDE.md の「3 回繰り返されたら抽象化を検討」原則に従い、fader/knob 2 件は library 化見送り。premature abstraction を回避することで API 表面積を最小に保つ。
 - **API stability 確定の意義**: Phase 44b で「現 API で十分」を確定させたことで、Phase 45 以降の機能追加 (theming / animation / 信号処理 widget 等) で `Edit` API を変更する必要がないことが保証された。daw_01 など path 依存先での breaking 変更リスクが low。
+- **(2026-05-03 修正)**: Phase 44c で Note schema を f64 化 + lyric 追加する判断により API stability 確約は撤回。CLAUDE.md「大胆に破壊して作り直す」原則を `Edit` API 以外の **library 公開型** にも適用。`Edit::with_inverse` / `Edit::snapshot_inverse` 自体の signature は変わっていない (= snapshot 内容として扱える型が `Note` から `Note (f64版 + lyric)` に変わるだけ) ので、**Phase 44b の本質的な結論「現 API で十分」は維持**。
 
 **設計判断**:
 
@@ -1459,3 +1460,119 @@ let edit = Edit::with_inverse(
 - fader/knob の drag release pattern (パターン B) は 3 件目が出るまで保留。出たときに `Edit::from_value_change(label, start, end, on_change)` のような helper を追加候補として記録。
 
 **LOC**: なし (docs only)。本 commit は `docs/plan.md` / `docs/history.md` の更新のみ。
+
+---
+
+## M9 Phase 44c (daw_01 Note schema 統合 — gui_01 Note を f64 化 + lyric 追加、完了 2026-05-03)
+
+**目的**: gui_01 `daw_ui_core::Note` の schema を daw_01 `common::model::Note` (f64 + lyric) に近付ける breaking 変更で、daw_01 が adapter なしで gui_01 piano_roll widget を直接使える状態にする。
+
+**進捗**: 1 commit で完遂 (library Note 型 + 関連型 + 描画 helper + example + tests + docs)。
+
+**変更内容**:
+
+### library 公開型の breaking 変更:
+
+```rust
+// Before (Phase 41e〜44b):
+#[derive(Clone, Copy, Debug)]
+pub struct Note {
+    pub id: NoteId,
+    pub start_beat: f32,
+    pub len_beats: f32,
+    pub pitch: u8,
+    pub velocity: u8,
+}
+
+// After (Phase 44c):
+#[derive(Clone, Debug)]                 // Copy 削除 (Arc<str> のため)
+pub struct Note {
+    pub id: NoteId,
+    pub start_beat: f64,                // f32 → f64
+    pub len_beats: f64,                 // f32 → f64
+    pub pitch: u8,
+    pub velocity: u8,
+    pub lyric: Option<Arc<str>>,        // 新規追加 (singing synthesis 用)
+}
+
+pub type MoveDelta = (NoteId, f64, u8, f64, u8);            // f32 → f64
+pub type ResizeDelta = (NoteId, f64, f64, f64, f64);
+
+pub struct PianoRollView {
+    pub start_beat: f64,                // f32 → f64
+    pub len_beats: f64,                 // f32 → f64
+    pub pitch_top: f32,                 // pitch 関係は f32 維持 (MIDI 0..127)
+    pub pitch_visible: f32,
+    pub keyboard_w: f32,
+    pub notes_generation: u64,
+}
+
+pub struct PianoRollResponse {
+    // ...
+    pub clicked_at_beat_pitch: Option<(f64, f32)>,          // (beat: f64, pitch: f32)
+}
+
+pub struct PianoRollStyle {
+    // ... 既存 ...
+    pub lyric_color: Color,             // 新規 (note 上の歌詞色)
+    pub lyric_font_px: f32,             // 新規
+}
+```
+
+### 内部実装の更新:
+
+- `note_to_rect(note: &Note, ...) -> Rect` — `Note` が Copy じゃなくなったので参照渡し
+- `note_geometry_to_rect(start_beat: f64, len_beats: f64, pitch: u8, ...)` — 新規 internal helper、drag preview の計算で使う (`Note` を作らずに直接 Rect 生成)
+- `drag_preview_geometry` — 旧 `drag_preview_note` を改名、`(f64, f64, u8)` tuple を返す形に (Note 自体を作らない)
+- `NoteDragAnchor` — `start_beat: f64` / `len_beats: f64`
+- 各種 widget 内部の beat / pixel 計算を `f64::from(grid.w)` 等で f64/f32 boundary を明示
+- `draw_notes` に `lyric_color` / `lyric_font_px` 引数追加、`note.lyric.as_ref()` を見て note rect 内左端に label を描画 (note 高さが lyric font ≥ 1 行ぶんで描画)
+
+### example の更新:
+
+- `PianoRollModel.view_start_beat` / `view_len_beats` を f64 化
+- `generate_notes` で `f64` リテラル使用、**8 note ごとに 1 つ lyric を `Some(Arc::from("ら/る/れ/ろ/り"))` で付与** (デモ用)
+- `make_*_notes_edit` の closure 内で `*note` (deref copy) → `note.clone()` (Note が Copy じゃなくなったため)
+- pan/zoom logic の f32/f64 boundary 修正 (`f64::from(dx) * beat_per_px` 等)
+- App.pan_anchor の type を `Option<(f32, f32, f64, f32)>` に
+- tests の f32 リテラル全部 `_f64` に置換 (sed 一括)
+
+### trybuild の更新:
+
+- `crates/ui/tests/ui/pass/basic.rs` で `Note` 初期化に `lyric: None` 追加 + `f64` リテラル使用
+
+**主な学び**:
+
+- **CLAUDE.md「大胆に破壊して作り直す」原則の運用**: Phase 44b で確定させた API stability 確約は、より良い設計のためなら破棄してよい。重要なのは「いつでも壊せる」状態を保つこと (zero external breaking impact = daw_01 が Note 型を直接 import していない、Phase 41e で確認済み) であって、永続的な不変条件ではない。
+- **daw_01 への影響**: daw_01 が gui_01 の Note を直接 import していないので **build に影響なし**。daw_01 内部の NoteBox は今後 gui_01 Note を `From` impl で受け取る adapter を書くか、独自 schema のまま残すかは daw_01 側の判断 (= 別 phase で進める)。
+- **f32/f64 boundary 管理**: 拍は f64、pixel/pitch は f32 のレイアウトで、boundary では明示的に `f64::from(...)` / `as f32` で cast。`view.len_beats / grid.w.max(1.0)` のような暗黙混在は compiler error で誰もが気付く形が望ましい (M9 までは f32 統一だったが、混在の負担より精度の利得を取る)。
+- **`Arc<str>` lyric の選択理由**: `Option<Arc<str>>` で 100k notes のうち lyric 付き (例 12.5%) でも文字列を共有可能。`String` だと alloc が増える。daw_01 の `Note.lyric: Option<String>` から変換する場合は `Option<String> → Option<Arc<str>>` で `Arc::from(s)` 1 回 alloc は必要だが、その先 widget は複製しない。
+- **`Note: Copy` 削除の影響範囲**: 内部で `*note` (deref copy) を使っていた箇所を `note.clone()` か参照渡しに変更。`for note in &visible` のように iterator は元から `&Note` を返すので大半の箇所は影響なし。`note_to_rect(*note, ...)` 風の数か所のみ修正。
+
+**設計判断**:
+
+- **lyric を library に持ち込んだ**: 「audio / IPC に関知しない」原則と緊張するが、lyric は **画面表示文字列** であり、audio synthesis 自体は library が扱わない (= label_at と同じ「画面に文字を出す」責務)。ただし lyric 描画は `PianoRollStyle::lyric_font_px` が 0 のときスキップする等の柔軟性は今後追加可能。
+- **Copy 削除の代わりに `Arc<str>` 採用**: `Option<&'static str>` だと runtime 文字列を持てない、`Option<String>` だと多数 note の clone が重い。`Arc<str>` で多数 note 間共有 + immutable で実装シンプル。
+- **`Edit` API は変えない**: `Edit::with_inverse` / `Edit::snapshot_inverse` の signature は不変。snapshot 内容として扱う Note 型が変わるだけ。Phase 44b の本質的な結論「現 API で十分」は維持。
+- **Phase 44b の API stability 確約撤回をどう告知するか**: docs/history.md の Phase 44b ブロック末尾に「(2026-05-03 修正)」として明記。今後同じ修正パターン (validation 中の確約 → より良い設計のため撤回) が出たら同パターンを使う。
+
+**検証**:
+
+- `cargo build --workspace` ✅ / `cargo test --workspace` ✅ (146 lib + 9 piano_roll + 7 sample_edit_ops + その他 全 pass) / `cargo clippy --workspace --tests -- -D warnings` ✅
+- `cd ../daw_01 && cargo build` ✅ (gui_01 の Note 型を import していないため影響なし)
+- `cargo run --bin piano_roll` で実機目視: f64 化後も 100k notes が表示、8 note ごとの lyric ("ら"/"る"/"れ"/"ろ"/"り") が note rect 上に表示、pan/zoom/drag/Insert/Delete/Ctrl+Z 全 OK
+
+**残作業**: なし。Phase 44c 完了 = **M9 全完了**。
+
+**Phase 45 以降への引き継ぎ事項**:
+
+- **daw_01 側の adapter 実装** (daw_01 task): NoteBox → daw_ui_core::Note の `From` impl (or 関数)。daw_01 内部で gui_01 widget を採用する判断は daw_01 側で行う。
+- **lyric font の i18n 対応**: 現状 HackGen Console NF で日本語表示 OK。CJK / emoji の font fallback は M11 (旧 M11、凍結中) で扱う。
+- **lyric の hash 影響**: scenegraph cache の input_hash に lyric を含める必要があるか確認。現状 `notes_generation` で全体 invalidation するので問題ないはず。
+
+**LOC**:
+
+- library: `crates/ui/src/widgets/piano_roll.rs` +~30 LOC (lyric field 追加 + Style 拡張 + draw_notes 拡張 + helper rename / signature 変更)
+- example: `crates/examples/piano_roll/src/main.rs` +~20 LOC (lyric demo 生成 + f64 化に伴う boundary 修正)
+- trybuild: `crates/ui/tests/ui/pass/basic.rs` +6 LOC (Note init で lyric: None + f64 リテラル)
+- docs: `docs/plan.md` 1 行更新、`docs/history.md` +~80 LOC
