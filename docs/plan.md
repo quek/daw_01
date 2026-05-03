@@ -14,130 +14,113 @@
 
 **「daw_01 の UI 描画は全て gui_01 widget で構築する」** を目標にする。
 
-- 自前 `push_rect` / `push_text` / `push_lines` は最終的にゼロを目指す。
-- gui_01 に widget が無い領域は **gui_01 側で widget 化する要望を投げる**。daw_01 内で自前実装を温存しない。
-- 機能拡張 (drag/resize/marquee 等) は gui_01 widget 化が完了してから、widget API 上で組む。
+- 自前 `push_rect` / `push_text` / `push_lines` は最終的にゼロ。
+- gui_01 に widget が無い領域は **gui_01 側で widget 化を要望**、daw_01 内で自前実装を温存しない。
+- 機能拡張 (drag/resize/marquee 等) は gui_01 widget 化が完了してから widget API 上で組む。
 
 理由: piano_roll widget 化 (commit 52394b5) で 493 → 320 LOC、cache 統合・Shift+drag 等の挙動共通化のメリットを実証済み。同じパターンを arrangement / plugin_picker にも適用したい。
 
-## 現状インベントリ (2026-05-03 時点)
+## gui_01 側ロードマップ (#005-#009 受領済)
 
-`daw_gui/src/view/` に残っている自前描画は **31 箇所**。3 カテゴリに分類:
+詳細 API は `docs/gui_01_conversation.md` 参照。実装順:
 
-### A. gui_01 既存 widget で置換可 (daw_01 だけで対応)
-
-| 箇所 | 置換先 widget |
-|---|---|
-| `bottom_panel.rs:24,44` タブストリップ手書き | `Ui::tab_view_with_state` (#004 で推奨パターン受領済) |
-| `mixer_strips.rs:188,207` mute/solo hint 帯 | `Ui::checkbox_at` で M/S トグルを表現 |
-| `mixer_strips.rs:76` / `track_inspector.rs:67` truncate | `Ui::scroll_area` を活用 |
-| `plugin_picker.rs:105-156` リスト truncate | `Ui::scroll_area` を活用 |
-
-### B. gui_01 に widget が無い → 要望が必要
-
-| 領域 | 影響 LOC | 提案 widget |
+| gui_01 phase | 内容 | daw_01 側の取り込み作業 |
 |---|---|---|
-| `arrangement_view.rs` 全体 (canvas/ruler/headers/clips/loop band/playhead) | ~600 | `Ui::arrangement` widget |
-| `piano_roll_view.rs:229-320` velocity lane + playhead | ~90 | `piano_roll` widget に `velocity_lane` + `playhead_beat` オプション拡張 |
-| `plugin_picker.rs` 全体 (overlay + panel + list) | ~170 | `Ui::modal` + `Ui::list_view` (仮想スクロール対応) |
-| 各 view の背景塗り (12 箇所) | 軽微 | `Ui::panel(rect, fill, radius)` helper |
+| **45a** | `Ui::panel` + `Ui::panel_with_border` (#008) | 12 箇所の背景塗りを置換 |
+| **45b** | `Ui::toggle_button_at` (#009) | mixer の M/S を置換 |
+| **45c** | `PianoRollView` に `velocity_lane_h` + `playhead_beat` 追加 (breaking、#006) | PianoRollView 構築箇所更新、`draw_velocity_lane` / `draw_playhead` (-90 LOC) を削除 |
+| **45d** | `Ui::modal` + `Ui::list_view` (#007) | plugin_picker.rs を rewrite (171 → ~80 LOC) |
+| **45e** | `Ui::arrangement` widget (#005、4 sub-phase A-D) | arrangement_view.rs を rewrite (614 → ~150 LOC) |
 
-### C. 機能未実装 (widget が来てから手をつける)
+各 phase の merge は gui_01 conversation file 経由で通知される。
 
-- arrangement: drag move / resize / marquee select / track rename UI / loop band drag
-- track_inspector: chain reorder (drag で並べ替え)
-- mixer / inspector / plugin_picker の scroll 動作確認
+## Phase 1: ローカル置換 (gui_01 merge 不要)
 
-## Phase 0: gui_01 への要望投稿 (immediate / blocking)
-
-`docs/gui_01_conversation.md` に以下のエントリを追加。番号は既存 archive (#001-#004) の続きで #005 から。
-
-### #005 [要望] `Ui::arrangement` widget の新設
-
-- piano_roll widget と同等粒度の "1 枚で完結する" widget。Track / Clip / loop / playhead / ruler / track headers を構造で渡し、Edit を返す。
-- 入力: drag move / resize / marquee select / wheel zoom & scroll / clip dbl-click / track header クリック。
-- daw_01 側 reference: `daw_gui/src/view/arrangement_view.rs` 全文を提示し「これを置き換えたい」と明示。
-- API イメージ案を 1 つ提示 (`piano_roll` の API と並びを揃える)。
-
-### #006 [要望] `piano_roll` widget の velocity lane + playhead 内蔵オプション
-
-- 現状 daw_01 側で `draw_velocity_lane` (piano_roll_view.rs:229) と `draw_playhead` (:280) を自前で持っている。
-- 要望: `PianoRollStyle` (or `PianoRollView`) に `velocity_lane_h: f32` (0 で disabled) と `playhead_beat: Option<f64>` を追加し、widget 内で描画してほしい。
-- 利点: piano_roll widget 1 呼び出しで完結、view 側ロジックが空白 dbl-click + wheel handler のみに縮退。
-
-### #007 [要望] `Ui::modal` + `Ui::list_view` widget
-
-- plugin_picker.rs を完全 widget 化したい。
-- `modal(id, screen, panel_size, |panel_rect, ui| { ... })` で半透明オーバーレイ + 中央 panel + Esc / 外側クリックで close を一括化。
-- `list_view(id, rect, &items, &selected, |row_ui, item, idx| { ... })` で行描画 + 仮想スクロール + キーボード上下移動 + 選択ハイライト。
-- daw_01 側に「Open File」「Save As」等の dialog も増えるので、modal は今後の Save / Open / Export ダイアログでも再利用予定。
-
-### #008 [質問] `Ui::panel(rect, fill, radius)` helper を入れる意義
-
-- 各 view の背景塗りで `ui.heavy(... |hctx| hctx.cached(... hctx.push_rect(...)))` を 12 箇所書いている。
-- 単純 1 段の filled rect なら `ui.panel(rect, fill, radius)` 1 行で済む helper があると "raw push_rect ゼロ" を達成しやすい。
-- gui_01 側のポリシー (薄い helper を増やす vs heavy で抽象化させる) を確認したい。要らなければ daw_01 側 helper でも可。
-
-### #009 [要望] `Ui::checkbox_at` を mute/solo の表現に使う
-
-- 現状 `button_at("M") + 色帯 push_rect` でトグルの ON/OFF を表現している。
-- gui_01 の `checkbox_at` を使えば 1 呼び出しで済むが、ラベル"M"/"S"の見た目を維持したい。
-- 質問: `CheckboxStyle` に `label_override: Option<&str>` 等で「□ の代わりに任意ラベル + 背景色変化」を許容できるか。難しければ daw_01 で button + heavy push_rect を続ける。
-
-**Phase 0 完了条件**: 上記 5 件を `gui_01_conversation.md` に投稿し、gui_01 から `[Replied]` を受領。
-
-## Phase 1: ローカル置換 (Phase 0 と並行)
-
-gui_01 回答を待つ間、既存 widget で完結するものを片付ける。各タスクは個別 commit。
+既存 gui_01 widget だけで完結する作業。各タスクは個別 commit。
 
 ### 1-1. `bottom_panel.rs` を `tab_view_with_state` 化 [done c46df37]
 
-- archive #004 の sample を参考にタブ index `&mut u8 → &mut usize` 変換で書き換え。
-- mixer / piano_roll の中身 closure はそのまま維持。
-- 結果: 98 → 49 LOC (-49)、自前 `push_rect` x2 + 定数 4 個削除。
+98 → 49 LOC、自前 `push_rect` x2 + 定数 4 個削除。
 
-### 1-2. `plugin_picker.rs` のリストを `scroll_area` 化 (modal 化は #007 待ち) [done f280274]
+### 1-2. `plugin_picker.rs` のリストを `scroll_area` 化 [done f280274]
 
-- まず scroll_area で行 truncate を解消 (現状 `max_rows` で打ち切り、line 105-156)。
-- modal 化 (#007 受理後) で全面書き換え予定。先に scroll_area だけでも導入。
-- 注意: 行背景の heavy + cached(i) は scroll で stale rect を replay する
-  (cache key に row_y が無いため)。push_rect 直呼びにする。
+`max_rows` 手動 truncation を廃止、scroll で全件表示。
+注意: 行背景の `heavy + cached(i)` は scroll で stale rect を replay するので `push_rect` 直呼びにする。最終的に 45d (`Ui::list_view`) で消える tech debt。
 
-### 1-3. `mixer_strips.rs` / `track_inspector.rs` の scroll 対応
+### 1-3. `mixer_strips.rs` / `track_inspector.rs` の scroll 対応 [next]
 
-- mixer: 横方向 scroll_area (master strip は scroll 外に固定したい)。
+- mixer: 横方向 scroll_area (master strip は scroll 外に固定)。
 - inspector: 縦方向 scroll_area (chain entry が画面に入りきらないとき)。
 
-### 1-4. `mixer_strips.rs` mute/solo を `checkbox_at` 化
+## Phase 2: arrangement widget 用の schema 移行 (Phase 1 と並列)
 
-- #009 の回答次第。受理 → checkbox_at 化、保留 → 現状維持。
+gui_01 #005 回答で確定: arrangement widget は **clip_id / track_id を index ではなく安定 ID で受ける** 設計。daw_01 側の schema を先に整えると 45e merge 直後すぐ widget に乗せられる。
 
-## Phase 2: arrangement widget 大改造 (#005 受理後)
+詳細は `docs/plan_arrangement_widget_rewrite.md` を起こして展開予定だが、最低限の作業:
 
-`docs/plan_arrangement_widget_rewrite.md` に詳細計画を起こす (piano_roll の `plan_piano_roll_widget_rewrite.md` と同じ構成)。
+1. `Clip` schema に `id: u32` フィールド追加
+2. `Track` に `next_clip_id: u32` 採番ロジックを追加 (clip 作成時に bump)
+3. `Track` に `id: u32` フィールド追加
+4. `Song` に `next_track_id: u32` 採番ロジックを追加
+5. `ClipRef.clip` の意味を index → clip_id に切替 (型は `u32` のまま意味だけ変える)
+6. クリップ参照箇所 (handle_event 内の `selected_clip` lookup 等) を index 検索 → id 検索に書き換え
 
-- gui_01 側で widget が完成したら、daw_01 の `arrangement_view.rs` 614 LOC → ~150 LOC へ縮約。
-- 自前 `handle_canvas_input` (line 516-614) も widget 内蔵入力で代替、daw_01 側は SelectClip / SelectBottomPanel(1) に変換するだけ。
-- track_headers (line 315-512) も widget 内に移管 → mute/solo button が widget 内 callback。
+bincode encode/decode と Song の新規作成・読み込み・autosave への影響を検証。
 
-## Phase 3: 機能拡張 (Phase 2 後)
+着手前に `docs/plan_arrangement_widget_rewrite.md` を作成し、この移行を 1 段階目として詳細計画する。
 
-arrangement widget 内蔵で実装される想定 (gui_01 側で組む):
+## Phase 3: gui_01 widget 取り込み (45a-45e merge トリガ)
 
+gui_01 phase が merge されたら順に取り込む。
+
+### 3a. `Ui::panel` 取り込み (45a 後)
+
+12 箇所の `ui.heavy(... |hctx| hctx.cached(... hctx.push_rect(...)))` を `ui.panel(id, rect, fill, radius)` に置換。border 付き 1 件 (file drop hover) は `panel_with_border`。
+
+※ 12 箇所のうち plugin_picker (45d 化で消える) と arrangement clip 矩形 (45e 化で消える) を除けば、実質置換対象は 9 箇所。
+
+### 3b. `Ui::toggle_button_at` 取り込み (45b 後)
+
+`mixer_strips.rs:164-222` の M/S を置換。`button_at + 自前 hint band push_rect` の 2 段構えが 1 呼び出しに。
+※ `arrangement_view.rs` 側の M/S は 3e (arrangement widget) で消えるので置換対象は mixer のみ。
+
+### 3c. piano_roll velocity / playhead 削除 (45c 後)
+
+`PianoRollView` 構築箇所 (`piano_roll_view.rs:76-83`) に `velocity_lane_h: 60.0` / `playhead_beat: app.playhead_beat.map(|b| b as f64)` を追加。
+`draw_velocity_lane` / `draw_playhead` 関数 (90 LOC) を削除。view ファイルが 320 → ~230 LOC。
+
+### 3d. `plugin_picker.rs` を modal + list_view で rewrite (45d 後)
+
+171 → ~80 LOC を目標に全面書き換え。conversation #007 の rewrite サンプル (line 565-577) をベース。
+
+### 3e. arrangement_view.rs を `Ui::arrangement` で rewrite (45e 後)
+
+Phase 2 で schema 移行済が前提。`docs/plan_arrangement_widget_rewrite.md` で詳細展開。
+gui_01 側 sub-phase に対応:
+- 45e-A merge → `draw_canvas` 相当を置換 (-210 LOC 見込み)
+- 45e-B merge → drag move / resize / rect select の自前実装削除
+- 45e-C merge → loop band drag を widget callback に
+- 45e-D merge → `draw_track_headers` を置換 (-200 LOC 見込み)、context_menu と rename UI は daw_01 側で `track_header_rects` を使って外側に書く
+
+最終的に arrangement_view.rs 614 → ~150 LOC。
+
+## Phase 4: arrangement-driven 機能拡張 (Phase 3e 後)
+
+widget 内蔵で動くもの (3e で同時に有効化):
 - clip drag move / resize
 - marquee (rect) select
-- track rename inline (header の名前を text_input に切替)
-- loop band drag (現状は ruler ドラッグで範囲設定だけ可、コミット 74246c8)
+- loop band drag (現状は ruler ドラッグでの範囲設定のみ、commit 74246c8)
+- track rename UI (BeginRenameTrack Edit を受けて daw_01 側で text_input に切替)
 
-daw_01 側で組むもの:
-- track_inspector chain reorder (drag で MIDI FX / Inst / FX 内の並び替え)。`Ui::list_view` (#007) が drag-reorder をサポートするなら そちらに乗る。
+daw_01 側で別途組むもの:
+- track_inspector chain reorder。45d 時点で `Ui::list_view` には drag-reorder 無し (gui_01 #007 回答)。将来 `Ui::reorderable_list` が来たら乗る、来ない間は drag-handle button + Edit でも可。
 
-## Phase 4: 仕上げ
+## Phase 5: 仕上げ
 
 - `daw_gui/src/view/` 全体で `push_rect` / `push_text` / `push_lines` が **0 件** であることを grep で確認。
-- ない場合、残った箇所の事情を本ファイルに記録 (gui_01 側で widget 化が困難な特殊用途等)。
+- 残った箇所があれば事情を本ファイルに記録。
 - `cargo build --workspace` warning 0 / `cargo clippy -- -D warnings` クリーン。
-- `cargo run -p daw_gui` で全画面の操作確認 (transport / arrangement / piano_roll / mixer / inspector / plugin_picker / dialog)。
+- `cargo run -p daw_gui` で全画面の操作確認 (transport / arrangement / piano_roll / mixer / inspector / plugin_picker / modal)。
 
 ## 並行で進める無関係タスク (このプランの外)
 
@@ -145,13 +128,14 @@ daw_01 側で組むもの:
 - VOICEVOX 合成パイプラインの最適化
 - Audio Engine 側のチューニング
 
-これらは widget 化と独立、必要になったら別途 plan ファイルを起こす。
+必要になったら別途 plan ファイルを起こす。
 
 ## 進捗ログ
 
 | 日付 | commit | Phase | 内容 |
 |---|---|---|---|
-| 2026-05-03 | (本ファイル作成) | - | plan.md 初版 |
+| 2026-05-03 | (plan.md 初版) | - | master plan 作成 |
 | 2026-05-03 | 2625255 | Phase 0 | 要望 #005-#009 を gui_01_conversation.md に投稿 |
 | 2026-05-03 | c46df37 | Phase 1-1 | bottom_panel を `tab_view_with_state` 化 (98 → 49 LOC) |
 | 2026-05-03 | f280274 | Phase 1-2 | plugin_picker のリストを `scroll_area` 化 (truncation 廃止) |
+| 2026-05-03 | (gui_01) | Phase 0 | gui_01 から #005-#009 全件 [Replied] 受領、API 確定 |
