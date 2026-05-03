@@ -143,3 +143,12 @@ example を実機検証する前に必ず `cargo run --bin <name>` または `ca
 - 設計の正本: [docs/plan.md](docs/plan.md)
 - フィードバック / 過去知見: `~/.claude/projects/F--dev-gui-01/memory/`
 - skill 一式: [.claude/skills/](.claude/skills) (`implement` / `debug-ui` / `research-similar-impl` / `review`)
+
+## daw_01 (sibling project) との対話
+
+daw_01 から gui_01 への要望・バグ報告・質問は
+`F:\dev\daw_01\docs\gui_01_conversation.md` に蓄積される。
+
+ユーザーから「daw_01 から依頼が来てる」と言われたらこのファイルを読み、
+`[Open]` エントリの `### gui_01 →` ブロックに返信を書き、ステータスを
+`[Replied]` に変更する。
