@@ -117,6 +117,8 @@ fn main() {
                 pitch_visible: 24.0,
                 keyboard_w: 60.0,
                 notes_generation: 0,
+                velocity_lane_h: 0.0,
+                playhead_beat: None,
             };
             let style = PianoRollStyle::default();
             let _ = ui.piano_roll(

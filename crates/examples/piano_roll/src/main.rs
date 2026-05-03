@@ -82,6 +82,10 @@ impl PianoRollModel {
             pitch_visible: self.pitch_visible,
             keyboard_w: KEYBOARD_W,
             notes_generation: self.notes_generation,
+            // M9 Phase 45c: velocity lane は無効、playhead は固定値で 1 本表示
+            // (45c で導入した新機能の visible デモ)。
+            velocity_lane_h: 0.0,
+            playhead_beat: Some(2.0),
         }
     }
 }

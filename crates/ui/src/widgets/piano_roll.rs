@@ -113,6 +113,15 @@ pub struct PianoRollView {
     pub keyboard_w: f32,
     /// notes / id を編集するたびに bump する hook (cache busting)。
     pub notes_generation: u64,
+    /// (M9 Phase 45c) velocity lane の高さ (px)。`0.0` で disabled。
+    /// `> 0` のとき rect の下から `velocity_lane_h` px を velocity lane として確保し、
+    /// 残りを既存の grid + keyboard に配分する (velocity lane は keyboard 領域には被せない、
+    /// grid と同じ x 範囲のみ)。
+    pub velocity_lane_h: f32,
+    /// (M9 Phase 45c) playhead 線を描く拍位置 (拍)。`None` で disabled。
+    /// `Some(b)` で `b` が `[start_beat, start_beat + len_beats]` 範囲内なら、
+    /// note grid と velocity lane を縦断する 1 本の線が描かれる。
+    pub playhead_beat: Option<f64>,
 }
 
 /// piano roll が user に発行する Edit 要求の種別。
@@ -192,6 +201,16 @@ pub struct PianoRollStyle {
     /// `Note.lyric == Some(...)` のとき note rect 上端に label 描画。
     pub lyric_color: Color,
     pub lyric_font_px: f32,
+    /// (M9 Phase 45c) playhead 線の色。`PianoRollView::playhead_beat == Some(_)` のときのみ使用。
+    pub playhead_color: Color,
+    /// (M9 Phase 45c) playhead 線の幅 (px)。bar_line と紛れない程度に太くする。
+    pub playhead_width_px: f32,
+    /// (M9 Phase 45c) velocity lane の背景色。
+    pub velocity_lane_bg: Color,
+    /// (M9 Phase 45c) velocity bar の色。selection 反映は将来 phase (drag editing と一緒)。
+    pub velocity_bar_color: Color,
+    /// (M9 Phase 45c) velocity bar の幅 (px)。
+    pub velocity_bar_width_px: f32,
 }
 
 /// デフォルト velocity color (青系の濃淡 0.5..0.95)。`PianoRollStyle::note_fill_fn` の初期値。
@@ -222,6 +241,13 @@ impl Default for PianoRollStyle {
             resize_handle_px: 4.0,
             c_label_color: Color::rgb(0.30, 0.30, 0.35),
             c_label_font_px: 11.0,
+            // M9 Phase 45c: playhead / velocity lane defaults
+            // playhead は bar_line (白 alpha 0.3) と紛れないよう強い赤系 + 太め
+            playhead_color: Color::rgb(1.0, 0.25, 0.10),
+            playhead_width_px: 2.5,
+            velocity_lane_bg: Color::rgb(0.16, 0.17, 0.20),
+            velocity_bar_color: Color::rgb(0.50, 0.65, 0.85),
+            velocity_bar_width_px: 3.0,
             lyric_color: Color::rgb(0.10, 0.10, 0.15),
             lyric_font_px: 9.0,
         }
@@ -473,15 +499,25 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let wid = WidgetId::ROOT.child((b"piano_roll_widget", &id));
         let pointer = self.pointer;
 
-        // grid / keyboard レイアウト
+        // grid / keyboard / velocity lane レイアウト (M9 Phase 45c で vel_area 追加)。
+        // velocity_lane_h > 0 のとき rect の下端 vel_h px を vel_area として確保し、
+        // 残り main_h を keyboard + grid に配分する (vel_area は keyboard に被せない)。
         let kbd_w = view.keyboard_w.max(0.0);
+        let vel_h = view.velocity_lane_h.max(0.0).min(rect.h * 0.5);
+        let main_h = (rect.h - vel_h).max(1.0);
         let grid = Rect {
             x: rect.x + kbd_w,
             y: rect.y,
             w: (rect.w - kbd_w).max(1.0),
-            h: rect.h.max(1.0),
+            h: main_h,
         };
-        let kbd = Rect { x: rect.x, y: rect.y, w: kbd_w, h: rect.h.max(1.0) };
+        let kbd = Rect { x: rect.x, y: rect.y, w: kbd_w, h: main_h };
+        let vel_area = Rect {
+            x: rect.x + kbd_w,
+            y: rect.y + main_h,
+            w: (rect.w - kbd_w).max(1.0),
+            h: vel_h,
+        };
 
         // visible filter (二分探索)
         let view_end_beat = view.start_beat + view.len_beats;
@@ -620,6 +656,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         };
 
         // ----- 描画 (heavy ブロック + cached + 動的 overlay) -----
+        // M9 Phase 45c: viewport_key に vel_h を追加 (velocity lane 高さ変化で cache 無効化)。
         let viewport_key = (
             b"piano_roll_widget_v1" as &[u8],
             view.start_beat.to_bits(),
@@ -630,6 +667,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             grid.h.to_bits(),
             kbd.w.to_bits(),
             view.notes_generation,
+            vel_h.to_bits(),
         );
 
         let visible_owned: Vec<Note> = visible.to_vec();
@@ -653,9 +691,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     style_copy.lyric_color,
                     style_copy.lyric_font_px,
                 );
+                // M9 Phase 45c: velocity lane (vel_h > 0 のとき内蔵描画)
+                if vel_h > 0.0 {
+                    draw_velocity_lane(hctx, &visible_owned, view_copy, vel_area, &style_copy);
+                }
             });
 
-            // === cached の外: 動的 overlay (selection / drag preview / cursor) ===
+            // === cached の外: 動的 overlay (selection / drag preview / cursor / playhead) ===
             // selection overlay
             if !selected_set.is_empty() {
                 draw_selection_overlay(
@@ -670,6 +712,25 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // drag preview (drag 中の shifted rect)
             if let Some((nd, bd, pd)) = drag_overlay_clone {
                 draw_drag_preview(hctx, &nd, view_copy, grid, &style_copy, bd, pd);
+            }
+            // M9 Phase 45c: playhead 線 (time で動くので cache 対象外、毎フレーム描画)。
+            // 範囲外なら描画スキップ。grid と vel_area を縦断する 1 本。
+            if let Some(b) = view_copy.playhead_beat
+                && b >= view_copy.start_beat
+                && b <= view_copy.start_beat + view_copy.len_beats
+            {
+                let beat_to_px = f64::from(grid.w) / view_copy.len_beats.max(1e-6);
+                let x = grid.x + ((b - view_copy.start_beat) * beat_to_px) as f32;
+                let y_top = grid.y;
+                let y_bottom = vel_area.y + vel_area.h;
+                draw_playhead_line(
+                    hctx,
+                    x,
+                    y_top,
+                    y_bottom,
+                    style_copy.playhead_color,
+                    style_copy.playhead_width_px,
+                );
             }
         });
 
@@ -1091,6 +1152,75 @@ fn draw_drag_preview<M: ?Sized + 'static>(
     }
 }
 
+/// (M9 Phase 45c) velocity lane の描画。`vel_area` は keyboard を除いた grid と同じ x 範囲。
+/// 各 visible note の start_beat 位置に幅 `style.velocity_bar_width_px` の縦 bar を、
+/// `velocity / 127` の比率で高さを決めて bottom-aligned で描画する。
+fn draw_velocity_lane<M: ?Sized + 'static>(
+    hctx: &mut crate::widgets::heavy::HeavyCtx<'_, '_, M>,
+    visible: &[Note],
+    view: PianoRollView,
+    vel_area: Rect,
+    style: &PianoRollStyle,
+) {
+    // 背景塗り
+    hctx.push_rect(RectCommand {
+        rect: vel_area,
+        fill: style.velocity_lane_bg,
+        border: Color::TRANSPARENT,
+        border_width: 0.0,
+        radius: [0.0; 4],
+        clip_rect: None,
+    });
+    let beat_to_px = f64::from(vel_area.w) / view.len_beats.max(1e-6);
+    let half_w = style.velocity_bar_width_px * 0.5;
+    for n in visible {
+        let bar_h = vel_area.h * (f32::from(n.velocity) / 127.0);
+        if bar_h <= 0.0 {
+            continue;
+        }
+        let cx = vel_area.x + ((n.start_beat - view.start_beat) * beat_to_px) as f32;
+        // grid 範囲外は skip (visible は端に半分はみ出る note も含み得る)
+        if cx + half_w < vel_area.x || cx - half_w > vel_area.x + vel_area.w {
+            continue;
+        }
+        hctx.push_rect(RectCommand {
+            rect: Rect {
+                x: cx - half_w,
+                y: vel_area.y + vel_area.h - bar_h,
+                w: style.velocity_bar_width_px,
+                h: bar_h,
+            },
+            fill: style.velocity_bar_color,
+            border: Color::TRANSPARENT,
+            border_width: 0.0,
+            radius: [0.0; 4],
+            clip_rect: None,
+        });
+    }
+}
+
+/// (M9 Phase 45c) playhead 線。`x` を中心に `y_top..y_bottom` の縦線 1 本。
+/// 内部 helper として private。`arrangement` widget (Phase 45e) でも使う想定で
+/// 切り出されているが、現時点では piano_roll 専用。
+fn draw_playhead_line<M: ?Sized + 'static>(
+    hctx: &mut crate::widgets::heavy::HeavyCtx<'_, '_, M>,
+    x: f32,
+    y_top: f32,
+    y_bottom: f32,
+    color: Color,
+    width_px: f32,
+) {
+    use daw_ui_renderer::{LineBatch, LineSegment};
+    if y_bottom <= y_top {
+        return;
+    }
+    hctx.push_lines(LineBatch {
+        segments: vec![LineSegment { a: [x, y_top], b: [x, y_bottom], color }],
+        line_width_px: width_px,
+        clip_rect: None,
+    });
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -1115,6 +1245,8 @@ mod tests {
             pitch_visible: 24.0,
             keyboard_w: 0.0,
             notes_generation: 0,
+            velocity_lane_h: 0.0,
+            playhead_beat: None,
         }
     }
 
@@ -1744,5 +1876,109 @@ mod tests {
             );
         });
         assert_eq!(model.last_request, None, "Alt+drag は rect select を起動しない");
+    }
+
+    // ============================================================
+    // M9 Phase 45c: velocity lane + playhead 内蔵描画のテスト
+    // ============================================================
+
+    /// 同じ widget 呼び出しで velocity_lane_h を変えたときの scene.rects 差分を測る helper。
+    /// 各テストは別々の `host` で cache 状態を分離する (heavy() の cache key が再構築される)。
+    fn count_rects_with_view(view: PianoRollView, notes: &[Note]) -> (usize, usize) {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let model = TestModel::new(notes.to_vec());
+        let style = PianoRollStyle::default();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 400 };
+        host.frame_to_edits(&model, &mut scene, screen, FrameInput::default(), |_, ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &model.notes,
+                view,
+                &[],
+                &style,
+                dispatch,
+            );
+        });
+        (scene.rects.len(), scene.line_batches.len())
+    }
+
+    #[test]
+    fn velocity_lane_disabled_by_default() {
+        let v_off = test_view(); // velocity_lane_h: 0.0
+        let mut v_on = test_view();
+        v_on.velocity_lane_h = 60.0;
+
+        let notes = vec![note(1, 0.5, 0.5, 60), note(2, 1.5, 0.5, 64)];
+        let (rects_off, _) = count_rects_with_view(v_off, &notes);
+        let (rects_on, _) = count_rects_with_view(v_on, &notes);
+
+        // velocity_lane_h > 0 で bg 1 + bar 2 = 3 個多い rect が積まれる。
+        assert_eq!(rects_on, rects_off + 3, "velocity lane bg + 2 bars が追加される");
+    }
+
+    #[test]
+    fn velocity_lane_skips_zero_velocity_bars() {
+        // velocity 0 のみの notes で vel_h: 0 vs 60 の差分を測る。
+        // 期待: bg 1 個のみ追加 (bar は skip)、合計差分 = 1。
+        let v_off = test_view();
+        let mut v_on = test_view();
+        v_on.velocity_lane_h = 60.0;
+        let n_zero = vec![Note {
+            id: 1,
+            start_beat: 0.5,
+            len_beats: 0.5,
+            pitch: 60,
+            velocity: 0,
+            lyric: None,
+        }];
+        let (rects_off, _) = count_rects_with_view(v_off, &n_zero);
+        let (rects_on, _) = count_rects_with_view(v_on, &n_zero);
+
+        assert_eq!(rects_on, rects_off + 1, "velocity 0 のみなら bar は出ず bg のみ追加");
+    }
+
+    #[test]
+    fn playhead_renders_line_batch_when_in_range() {
+        let v_off = test_view(); // playhead_beat: None
+        let mut v_on = test_view();
+        v_on.playhead_beat = Some(2.0); // len_beats=4.0、範囲内
+
+        let notes = vec![note(1, 0.5, 0.5, 60)];
+        let (_, lines_off) = count_rects_with_view(v_off, &notes);
+        let (_, lines_on) = count_rects_with_view(v_on, &notes);
+
+        assert_eq!(lines_on, lines_off + 1, "playhead 1 LineBatch が追加される");
+    }
+
+    #[test]
+    fn playhead_skipped_when_out_of_range() {
+        let v_off = test_view();
+        let mut v_out = test_view();
+        v_out.playhead_beat = Some(100.0); // start=0, len=4 の範囲外
+
+        let notes = vec![note(1, 0.5, 0.5, 60)];
+        let (_, lines_off) = count_rects_with_view(v_off, &notes);
+        let (_, lines_out) = count_rects_with_view(v_out, &notes);
+
+        assert_eq!(lines_off, lines_out, "範囲外 playhead は描画されない");
+    }
+
+    #[test]
+    fn playhead_and_velocity_lane_combine() {
+        let v_off = test_view();
+        let mut v_both = test_view();
+        v_both.velocity_lane_h = 60.0;
+        v_both.playhead_beat = Some(2.0);
+
+        let notes = vec![note(1, 0.5, 0.5, 60), note(2, 1.5, 0.5, 64)];
+        let (rects_off, lines_off) = count_rects_with_view(v_off, &notes);
+        let (rects_both, lines_both) = count_rects_with_view(v_both, &notes);
+
+        // velocity lane: bg 1 + 2 bars = 3 個 rect 増 / playhead: 1 LineBatch 増
+        assert_eq!(rects_both, rects_off + 3);
+        assert_eq!(lines_both, lines_off + 1);
     }
 }
