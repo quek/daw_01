@@ -103,6 +103,12 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// 末尾で `last_frame_stats` に転記)。
     current_cache_hits: u32,
     current_cache_misses: u32,
+    /// M9 P1-4: 直近 click (primary_just_released frame) の `(時刻, x, y)`。
+    /// `take_double_click_in_rect` でダブルクリック判定に使う。
+    /// is_double と判定したら次フレーム以降の連続 click 誤動作防止のため None にクリア。
+    last_click: Option<(std::time::Instant, f32, f32)>,
+    /// M9 P1-4: ダブルクリック判定の閾値 `(時間, 位置 px)`。default 400ms / 5px。
+    double_click_threshold: (std::time::Duration, f32),
     _m: PhantomData<fn(&mut M)>,
 }
 
@@ -168,8 +174,16 @@ impl<M: ?Sized + 'static> UiHost<M> {
             last_frame_stats: FrameStats::default(),
             current_cache_hits: 0,
             current_cache_misses: 0,
+            last_click: None,
+            double_click_threshold: (std::time::Duration::from_millis(400), 5.0),
             _m: PhantomData,
         }
+    }
+
+    /// M9 P1-4: ダブルクリック判定の閾値を変更 (default: 400ms / 5px)。
+    /// `Ui::take_double_click_in_rect` の判定に使う。
+    pub fn set_double_click_threshold(&mut self, ms: u64, px: f32) {
+        self.double_click_threshold = (std::time::Duration::from_millis(ms), px);
     }
 
     /// M9 Phase 43: 直近フレームの統計 (debug overlay 用)。
@@ -435,6 +449,27 @@ impl<M: ?Sized + 'static> UiHost<M> {
         self.current_cache_hits = 0;
         self.current_cache_misses = 0;
 
+        // M9 P1-4: ダブルクリック判定。primary_just_released で前回 click との時間/位置 diff を見て、
+        // threshold 内なら `pending_double_click` を Some に立てる。同 frame 内で
+        // `Ui::take_double_click_in_rect(rect)` が rect.contains で 1 度だけ消費する。
+        let mut pending_double_click: Option<(f32, f32)> = None;
+        if pointer.primary_just_released
+            && let Some((px, py)) = pointer.pos
+        {
+            let now = std::time::Instant::now();
+            let (max_dur, max_px) = self.double_click_threshold;
+            let is_double = self.last_click.is_some_and(|(t, lx, ly)| {
+                now.duration_since(t) < max_dur && (px - lx).hypot(py - ly) < max_px
+            });
+            if is_double {
+                pending_double_click = Some((px, py));
+                // 連続 3 click 誤動作防止のため last_click を None に
+                self.last_click = None;
+            } else {
+                self.last_click = Some((now, px, py));
+            }
+        }
+
         let cursor = Rect::new(0.0, 0.0, screen.width as f32, screen.height as f32);
         let focused_at_start = self.focused;
         let mut seen_widgets: HashSet<WidgetId> = HashSet::new();
@@ -488,6 +523,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             cache_hits: &mut self.current_cache_hits,
             cache_misses: &mut self.current_cache_misses,
             last_frame_stats: self.last_frame_stats,
+            pending_double_click: &mut pending_double_click,
             _m: PhantomData,
         };
         f(model, &mut ui);
@@ -678,6 +714,10 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     pub(crate) cache_misses: &'a mut u32,
     /// 直近フレームの統計 (debug_overlay 表示用、Copy 値)。
     pub(crate) last_frame_stats: FrameStats,
+    // ---- M9 P1-4 double-click ----
+    /// このフレームで double-click が判定されていれば release 位置 (primary_just_released
+    /// の座標)。`take_double_click_in_rect(rect)` が rect.contains で 1 度だけ消費する。
+    pub(crate) pending_double_click: &'a mut Option<(f32, f32)>,
     _m: PhantomData<&'a M>,
 }
 
@@ -1025,6 +1065,29 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             });
         }
         self.drawing_in_popup = prev_in_popup;
+    }
+
+    // ============================================================
+    // M9 P1-4: double-click 判定
+    // ============================================================
+
+    /// `rect` 内で発生したダブルクリックを 1 度だけ消費する。
+    ///
+    /// 判定: 直前の `primary_just_released` から `UiHost::set_double_click_threshold`
+    /// (default 400ms / 5px) 内に再度 release され、かつ release 位置が `rect` 内なら
+    /// `Some((x, y))` を返す。同 frame 内で 2 度目の `take_double_click_in_rect` を呼んでも
+    /// 同 rect の double-click は再消費されない (1 frame で 1 度だけ Some)。
+    ///
+    /// release ベース (drag と区別しやすい)、UiHost-level global state なので「同時に 2 つの
+    /// widget で double-click 中」のようなケースは扱わない (real DAW で発生しない前提)。
+    pub fn take_double_click_in_rect(&mut self, rect: Rect) -> Option<(f32, f32)> {
+        let (px, py) = (*self.pending_double_click)?;
+        if rect.contains(px, py) {
+            *self.pending_double_click = None;
+            Some((px, py))
+        } else {
+            None
+        }
     }
 
     // ============================================================
@@ -2315,5 +2378,129 @@ mod tests {
         });
         // popup buffer の glyph_areas に 4 行 (frame_ms 省略)。
         assert_eq!(scene.popup_glyph_areas.len(), 4, "frame_ms=0 で frame 行省略 → 4 行");
+    }
+
+    // -------- M9 P1-4: take_double_click_in_rect --------
+
+    /// release frame で release pos を返すヘルパ。
+    fn release_at(x: f32, y: f32) -> FrameInput {
+        FrameInput {
+            pointer: PointerFrame {
+                pos: Some((x, y)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn take_double_click_in_rect_within_threshold_returns_some() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+
+        // 1 度目: take は None (last_click が登録されるだけ)
+        host.frame_to_edits(&(), &mut scene, screen, release_at(100.0, 100.0), |(), ui| {
+            assert_eq!(ui.take_double_click_in_rect(rect), None, "1st release → None");
+        });
+        // 2 度目: 同位置で release → double-click として Some 返却
+        host.frame_to_edits(&(), &mut scene, screen, release_at(100.0, 100.0), |(), ui| {
+            assert_eq!(
+                ui.take_double_click_in_rect(rect),
+                Some((100.0, 100.0)),
+                "2nd release が threshold 内 → Some"
+            );
+        });
+    }
+
+    #[test]
+    fn take_double_click_in_rect_outside_position_returns_none() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+
+        host.frame_to_edits(&(), &mut scene, screen, release_at(100.0, 100.0), |(), _ui| {});
+        // 2 度目が 10px ずれる → distance > 5px なので None
+        host.frame_to_edits(&(), &mut scene, screen, release_at(110.0, 100.0), |(), ui| {
+            assert_eq!(ui.take_double_click_in_rect(rect), None);
+        });
+    }
+
+    #[test]
+    fn take_double_click_in_rect_outside_rect_returns_none() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        // double-click は発生するが、rect 外なら None
+        let small_rect = Rect { x: 200.0, y: 200.0, w: 50.0, h: 50.0 };
+
+        host.frame_to_edits(&(), &mut scene, screen, release_at(100.0, 100.0), |(), _ui| {});
+        host.frame_to_edits(&(), &mut scene, screen, release_at(100.0, 100.0), |(), ui| {
+            assert_eq!(
+                ui.take_double_click_in_rect(small_rect),
+                None,
+                "double-click 位置が rect 外 → None"
+            );
+        });
+    }
+
+    #[test]
+    fn take_double_click_in_rect_consumes() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+
+        host.frame_to_edits(&(), &mut scene, screen, release_at(50.0, 50.0), |(), _ui| {});
+        host.frame_to_edits(&(), &mut scene, screen, release_at(50.0, 50.0), |(), ui| {
+            assert!(ui.take_double_click_in_rect(rect).is_some(), "1 度目 take → Some");
+            assert_eq!(ui.take_double_click_in_rect(rect), None, "2 度目 take → None (consume 済)");
+        });
+    }
+
+    #[test]
+    fn take_double_click_in_rect_threshold_change_works() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+        // 閾値を 10ms / 1px に厳しくする
+        host.set_double_click_threshold(10, 1.0);
+
+        host.frame_to_edits(&(), &mut scene, screen, release_at(50.0, 50.0), |(), _ui| {});
+        // 1px 超のずれ → double-click 不成立
+        host.frame_to_edits(&(), &mut scene, screen, release_at(52.0, 50.0), |(), ui| {
+            assert_eq!(
+                ui.take_double_click_in_rect(rect),
+                None,
+                "threshold 1px なので 2px ずれは double-click 不成立"
+            );
+        });
+    }
+
+    #[test]
+    fn take_double_click_in_rect_triple_click_does_not_double_fire() {
+        // 3 連続 release で「2 度目で double-click 成立 → 3 度目は double-click にならない」
+        // (last_click は 2 度目で None にクリアされる)
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+
+        host.frame_to_edits(&(), &mut scene, screen, release_at(50.0, 50.0), |(), _ui| {});
+        host.frame_to_edits(&(), &mut scene, screen, release_at(50.0, 50.0), |(), ui| {
+            assert!(ui.take_double_click_in_rect(rect).is_some(), "2nd → Some");
+        });
+        // 3rd release: 2nd で last_click が None になっているので double-click 不成立
+        host.frame_to_edits(&(), &mut scene, screen, release_at(50.0, 50.0), |(), ui| {
+            assert_eq!(
+                ui.take_double_click_in_rect(rect),
+                None,
+                "3rd release は 2nd の double-click 後なので Single click 扱い"
+            );
+        });
     }
 }

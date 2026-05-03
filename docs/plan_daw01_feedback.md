@@ -268,6 +268,13 @@ feat(M9): P1-3 — HeavyCtx に input/popup pull API を包括 delegate
 
 ## P1-4: ダブルクリック判定の public API
 
+✅ done (commit 予定)
+
+実装結論:
+- 未決 1 → **global state** 採用 (UiHost-level の `last_click: Option<(Instant, f32, f32)>` + `double_click_threshold: (Duration, f32)`)。real DAW で「同時に 2 つの widget で double-click 中」は発生しない前提。
+- 未決 2 → **release ベース** 採用 (drag と区別しやすい、daw_01 piano_roll の AddNote と同パターン)。
+- fader/knob の internal logic は **keep** (CLAUDE.md「3 回繰り返したら抽象化」原則で 2 件は閾値未満、widget 固有の press ベース reset 動作を独立に保つ)。
+
 ### Problem
 
 ダブルクリック検出は fader/knob 内部の private 実装のみ。daw_01 では `AppData::last_click: Option<(Instant, x, y)>` を view 越しに自前管理。
