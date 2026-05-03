@@ -31,6 +31,7 @@
 //! input_hash で個別判定される。
 
 use std::hash::Hash;
+use std::path::PathBuf;
 
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{Color, GlyphArea, LineBatch, Rect, RectCommand};
@@ -40,6 +41,7 @@ use crate::id::WidgetId;
 use crate::input::PointerFrame;
 use crate::scenegraph::hash_inputs;
 use crate::ui::Ui;
+use crate::widgets::drag_rect::DragRect;
 use crate::widgets::waveform::{WaveformResponse, WaveformSource, WaveformStyle, WaveformView};
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
@@ -153,6 +155,88 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
         on_click: impl FnOnce() -> Edit<M>,
     ) {
         self.ui.button_at(id, text, rect, on_click);
+    }
+
+    // === M9 P1-3: input / popup / shortcut / clipboard / dialog / history pull API ===
+    //
+    // すべて `Ui` の同名メソッドへの 1 行 forward。heavy 抽象の漏れ (rect-select / 右クリック /
+    // shortcut consume などが heavy 内で書けなかった) を 1 commit で塞ぐ。
+
+    /// `Ui::take_drag_rect_in_rect` の delegate (rect multi-select 用)。
+    pub fn take_drag_rect_in_rect(&mut self, wid: WidgetId, bounds: Rect) -> Option<DragRect> {
+        self.ui.take_drag_rect_in_rect(wid, bounds)
+    }
+
+    /// `Ui::take_file_drop_in_rect` の delegate (heavy 内に audio file を drop)。
+    pub fn take_file_drop_in_rect(&mut self, rect: Rect) -> Option<Vec<PathBuf>> {
+        self.ui.take_file_drop_in_rect(rect)
+    }
+
+    /// `Ui::is_file_hovering_in_rect` の delegate (drop target highlight 用)。
+    #[must_use]
+    pub fn is_file_hovering_in_rect(&self, rect: Rect) -> bool {
+        self.ui.is_file_hovering_in_rect(rect)
+    }
+
+    /// `Ui::take_clipboard_paste` の delegate。
+    pub fn take_clipboard_paste(&mut self) -> Option<String> {
+        self.ui.take_clipboard_paste()
+    }
+
+    /// `Ui::set_clipboard_text` の delegate。
+    pub fn set_clipboard_text(&mut self, s: String) {
+        self.ui.set_clipboard_text(s);
+    }
+
+    /// `Ui::take_shortcut` の delegate (heavy 内で `delete` などの shortcut を consume)。
+    pub fn take_shortcut(&mut self, name: &'static str) -> bool {
+        self.ui.take_shortcut(name)
+    }
+
+    /// `Ui::shortcut_for` の delegate (menu hint / overlay 表示用)。
+    #[must_use]
+    pub fn shortcut_for(&self, name: &'static str) -> Option<String> {
+        self.ui.shortcut_for(name)
+    }
+
+    /// `Ui::take_scroll_in_rect` の delegate (heavy 内で zoom / scroll)。
+    pub fn take_scroll_in_rect(&mut self, rect: Rect) -> (f32, f32) {
+        self.ui.take_scroll_in_rect(rect)
+    }
+
+    /// `Ui::context_menu_for` の delegate (heavy 内で右クリック menu)。
+    pub fn context_menu_for<F>(&mut self, rect: Rect, items: &[&str], on_select: F)
+    where
+        F: FnOnce(usize) -> Edit<M>,
+    {
+        self.ui.context_menu_for(rect, items, on_select);
+    }
+
+    /// `Ui::request_redraw` の delegate。
+    pub fn request_redraw(&mut self) {
+        self.ui.request_redraw();
+    }
+
+    /// `Ui::request_undo` の delegate (heavy 内で Ctrl+Z 検出 → undo 要求)。
+    pub fn request_undo(&mut self) {
+        self.ui.request_undo();
+    }
+
+    /// `Ui::request_redo` の delegate。
+    pub fn request_redo(&mut self) {
+        self.ui.request_redo();
+    }
+
+    /// `Ui::can_undo` の delegate (heavy 内で UI 状態の表示判断に使う)。
+    #[must_use]
+    pub fn can_undo(&self) -> bool {
+        self.ui.can_undo()
+    }
+
+    /// `Ui::can_redo` の delegate。
+    #[must_use]
+    pub fn can_redo(&self) -> bool {
+        self.ui.can_redo()
     }
 }
 
@@ -289,6 +373,129 @@ mod tests {
             e.apply(&mut model);
         }
         assert_eq!(model.value, 1);
+    }
+
+    // -------- M9 P1-3: HeavyCtx delegate (input/popup/shortcut/clipboard/history) --------
+
+    /// `take_drag_rect_in_rect` が heavy 内で呼べる (drag 中でなければ None)。
+    #[test]
+    fn heavy_take_drag_rect_in_rect_returns_none_without_drag() {
+        use crate::id::WidgetId;
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let bounds = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.heavy("h_drag", |hctx| {
+                let wid = WidgetId::ROOT.child(b"hctx_drag_test");
+                let result = hctx.take_drag_rect_in_rect(wid, bounds);
+                assert!(result.is_none(), "no drag in progress → None");
+            });
+        });
+    }
+
+    /// shortcut consume が `Ui` と `HeavyCtx` で state 共有されている。
+    /// 外側で consume → heavy 内では再 consume できない。
+    #[test]
+    fn heavy_take_shortcut_consumed_outside_is_unavailable_inside() {
+        use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+
+        // default bindings に "delete" = Delete key が含まれる
+        let key = KeyEvent {
+            state: ElementState::Pressed,
+            text: None,
+            physical_key: PhysicalKey::Delete,
+        };
+
+        let outer = Cell::new(false);
+        let inner = Cell::new(false);
+
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput { keyboard: vec![key], ..Default::default() },
+            |(), ui| {
+                outer.set(ui.take_shortcut("delete"));
+                ui.heavy("h_sc", |hctx| {
+                    inner.set(hctx.take_shortcut("delete"));
+                });
+            },
+        );
+        assert!(outer.get(), "shortcut consumed outside heavy");
+        assert!(!inner.get(), "consumed → inside heavy returns false (state shared)");
+    }
+
+    /// `take_shortcut` を heavy 内側で先に呼ぶと、外側では false。逆方向の sharing 確認。
+    #[test]
+    fn heavy_take_shortcut_consumed_inside_is_unavailable_outside() {
+        use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let key = KeyEvent {
+            state: ElementState::Pressed,
+            text: None,
+            physical_key: PhysicalKey::Delete,
+        };
+
+        let inner = Cell::new(false);
+        let outer = Cell::new(false);
+
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput { keyboard: vec![key], ..Default::default() },
+            |(), ui| {
+                ui.heavy("h_sc2", |hctx| {
+                    inner.set(hctx.take_shortcut("delete"));
+                });
+                outer.set(ui.take_shortcut("delete"));
+            },
+        );
+        assert!(inner.get());
+        assert!(!outer.get());
+    }
+
+    /// `context_menu_for` が heavy 内で panic なく呼べる (popup の細部は menu.rs で検証済)。
+    #[test]
+    fn heavy_context_menu_for_runs_inside_without_panic() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let rect = Rect { x: 10.0, y: 10.0, w: 50.0, h: 50.0 };
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.heavy("h_ctx", |hctx| {
+                hctx.context_menu_for(rect, &["Cut", "Copy", "Delete"], |idx| {
+                    Edit::mutate(move |(): &mut ()| {
+                        let _ = idx;
+                    })
+                });
+            });
+        });
+        // 右クリックなしのため popup は開かない、panic なしを担保するだけ
+    }
+
+    /// `is_file_hovering_in_rect` / `take_file_drop_in_rect` が heavy 内で呼べる。
+    #[test]
+    fn heavy_file_drop_apis_run_inside() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.heavy("h_drop", |hctx| {
+                assert!(!hctx.is_file_hovering_in_rect(rect));
+                assert!(hctx.take_file_drop_in_rect(rect).is_none());
+            });
+        });
     }
 
     /// heavy ブロックを 1 フレームスキップ → 次フレームで呼ぶと cache miss
