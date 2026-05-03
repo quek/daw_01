@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use daw_ui_core::{
     BarBeatGridStyle, DialogResult, Edit, FaderResponse, FileDialogFilter, InputAccumulator,
-    LevelMeterStyle, MenuItemSpec, MeterBallistic, Orientation, TimeMapping, TimeRulerStyle,
-    UiHost, ViewportState1D,
+    LevelMeterStyle, ListViewStyle, MenuItemSpec, MeterBallistic, ModalStyle, Orientation,
+    TimeMapping, TimeRulerStyle, UiHost, ViewportState1D,
 };
 use daw_ui_platform::{AppEvent, AppHost, WindowBackend, winit_backend};
 use daw_ui_renderer::{Color, Rect, RectCommand, Renderer, Scene};
@@ -43,6 +43,10 @@ struct DawModel {
     /// simulated peak per channel (sin で時間変化)
     sim_phase: f32,
     last_action: String,
+    /// (M9 Phase 45d) `Demo Dialog` ボタン押下から次フレーム frame 開始時の `ui.open_modal`
+    /// 発火までを繋ぐ 1 frame レイテンシ用フラグ。`button_at` の click closure からは
+    /// `&mut Ui` にアクセスできないので、Edit 経由で立てて次フレームに `ui.open_modal` する。
+    open_demo_request: bool,
 }
 
 impl DawModel {
@@ -55,6 +59,7 @@ impl DawModel {
             current_tab: 0,
             sim_phase: 0.0,
             last_action: "起動 — メニュー / タブ / dropdown / 右クリック を試して下さい".to_string(),
+            open_demo_request: false,
         }
     }
 
@@ -377,6 +382,21 @@ impl App {
                         m.last_action = "footer button → Piano Roll タブへ遷移".to_string();
                     })
                 });
+
+                // M9 Phase 45d: Demo Dialog button + Ui::modal + Ui::list_view デモ
+                let demo_btn_w = 110.0;
+                let demo_btn_rect = Rect {
+                    x: btn_rect.x - demo_btn_w - 8.0,
+                    y: btn_rect.y,
+                    w: demo_btn_w,
+                    h: btn_rect.h,
+                };
+                ui.button_at("open_demo", "Demo Dialog", demo_btn_rect, || {
+                    Edit::mutate(|m: &mut DawModel| {
+                        m.open_demo_request = true;
+                        m.last_action = "Demo Dialog open".to_string();
+                    })
+                });
                 ui.label_at(
                     "footer",
                     &m.last_action,
@@ -384,6 +404,69 @@ impl App {
                     footer_rect.y + 5.0,
                     12.0,
                     Color::rgb(0.85, 0.88, 0.92),
+                );
+
+                // ---- 4. Demo Dialog (M9 Phase 45d): button click → 次フレーム open_modal ----
+                if m.open_demo_request {
+                    ui.open_modal("demo");
+                    ui.push_edit(Edit::mutate(|m: &mut DawModel| {
+                        m.open_demo_request = false;
+                    }));
+                }
+                let modal_style = ModalStyle::default();
+                let list_style = ListViewStyle::default();
+                let demo_items: [&str; 8] = [
+                    "Reverb", "Delay", "Compressor", "EQ",
+                    "Limiter", "Chorus", "Distortion", "Gate",
+                ];
+                ui.modal(
+                    "demo",
+                    (380.0, 360.0),
+                    &modal_style,
+                    Some(Box::new(|| {
+                        Edit::mutate(|m: &mut DawModel| {
+                            m.last_action = "Demo Dialog closed".to_string();
+                        })
+                    })),
+                    |ui, panel| {
+                        // タイトル
+                        ui.label_at(
+                            "demo_title",
+                            "Demo Dialog (Phase 45d) — クリックで close",
+                            panel.x + 16.0,
+                            panel.y + 16.0,
+                            14.0,
+                            Color::rgb(0.95, 0.95, 0.97),
+                        );
+                        // list_view
+                        let list_rect = Rect {
+                            x: panel.x + 16.0,
+                            y: panel.y + 48.0,
+                            w: panel.w - 32.0,
+                            h: panel.h - 64.0,
+                        };
+                        let resp = ui.list_view(
+                            "demo_list",
+                            list_rect,
+                            &demo_items,
+                            None,
+                            &list_style,
+                            |ui, name, i, row, _sel| {
+                                ui.label_at(
+                                    ("demo_label", i),
+                                    name,
+                                    row.x + 12.0,
+                                    row.y + 6.0,
+                                    13.0,
+                                    Color::rgb(0.92, 0.92, 0.94),
+                                );
+                            },
+                        );
+                        // 行 click で close (= ESC / outside click と同じ閉じ方)
+                        if resp.clicked.is_some() {
+                            ui.close_modal("demo");
+                        }
+                    },
                 );
             },
         );

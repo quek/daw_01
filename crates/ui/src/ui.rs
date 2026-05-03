@@ -815,6 +815,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         self.open_popups.get(&wid).map(|s| s.anchor)
     }
 
+    /// 開いている popup の `anchor` だけを更新する (focus 復元情報 `prev_focus` は維持)。
+    /// 画面サイズ変化等で popup の位置が動くケース (例: modal の中央配置を毎フレーム
+    /// 再計算したい) で使う。popup が閉じていれば no-op。
+    pub fn update_popup_anchor(&mut self, id: impl std::hash::Hash, anchor: Rect) {
+        let wid = WidgetId::ROOT.child((b"popup", &id));
+        if let Some(state) = self.open_popups.get_mut(&wid) {
+            state.anchor = anchor;
+        }
+    }
+
     /// popup の内容を描画する。popup が開いていなければ closure は呼ばれない。
     /// closure 内で push される primitive は **deferred buffer** に積まれ、frame 末尾で
     /// base scene に append (z-order = 最前面)。

@@ -48,7 +48,9 @@ pub use widgets::automation::{AutomationCurveResponse, AutomationCurveStyle};
 pub use widgets::checkbox::CheckboxResponse;
 pub use widgets::fader::FaderResponse;
 pub use widgets::heavy::HeavyCtx;
+pub use widgets::list_view::{ListViewResponse, ListViewStyle};
 pub use widgets::menu::MenuItemSpec;
+pub use widgets::modal::ModalStyle;
 pub use widgets::knob::KnobResponse;
 pub use widgets::piano_roll::{
     Note, NoteDragKind, NoteFillFn, NoteId, NotesEditRequest, MoveDelta, PianoRollResponse,
