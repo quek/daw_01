@@ -21,6 +21,7 @@ pub mod split_view;
 pub mod tab_view;
 pub mod text_input;
 pub mod time_grid;
+pub mod toggle_button;
 pub mod waveform;
 
 use std::any::Any;

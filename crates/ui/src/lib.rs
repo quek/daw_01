@@ -56,6 +56,7 @@ pub use widgets::piano_roll::{
     note_hover_cursor, note_to_rect, rects_intersect,
 };
 pub use widgets::text_input::TextInputResponse;
+pub use widgets::toggle_button::{ToggleButtonResponse, ToggleButtonStyle};
 pub use widgets::waveform::{
     ChannelLayout, SampleSlices, WaveformHit, WaveformRenderMode, WaveformResponse,
     WaveformSource, WaveformStyle, WaveformView,

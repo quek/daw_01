@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use daw_ui_core::{Edit, FlexDirection, Gap, InputAccumulator, LayoutPass, NodeId, Padding, UiHost};
 use daw_ui_platform::{AppEvent, AppHost, PhysicalSize, WindowBackend, winit_backend};
-use daw_ui_core::{FaderResponse, KnobResponse, TextInputResponse};
+use daw_ui_core::{FaderResponse, KnobResponse, TextInputResponse, ToggleButtonStyle};
 use daw_ui_renderer::{Color, Rect, RectCommand, Renderer, Scene};
 use winit::window::WindowAttributes;
 
@@ -314,11 +314,21 @@ impl App {
                         },
                     );
 
-                    let _ = ui.checkbox_at(
+                    // M9 Phase 45b: toggle_button_at で DAW 慣習の M (mute) ボタン。
+                    // ON のとき下端に赤の hint band が出る (`hint_band: Some(red)`)。
+                    let mute_style = ToggleButtonStyle {
+                        on_color: Color::rgb(0.55, 0.20, 0.20),
+                        hint_band: Some(Color::rgb(0.95, 0.30, 0.30)),
+                        radius: 4.0,
+                        font_size: 13.0,
+                        ..ToggleButtonStyle::default()
+                    };
+                    let _ = ui.toggle_button_at(
                         ("ch_mute", i),
+                        "M",
                         mute_rect,
                         m.mutes[i],
-                        "Mute",
+                        &mute_style,
                         move |new| {
                             Edit::mutate(move |m: &mut MixerModel| {
                                 m.mutes[i] = new;
