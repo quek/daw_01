@@ -15,6 +15,7 @@
 //! - マウスホイール: cur_mouse 位置を anchor に zoom
 //! - 短い click (drag 累積 < 16px): note 選択 → 選択 overlay 表示
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -37,16 +38,21 @@ const FOOTER_H: f32 = 56.0;
 
 // ----- Note データ -----
 
+type NoteId = u32;
+
 /// 内部値型 (Model 型ではないので Copy/Clone OK)。
+/// M9 Phase 41a: `id: NoteId` を追加。multi-select / move / resize / undo の
+/// identity 安定のため不変 (生成時に割り当て、編集中も保持)。
 #[derive(Clone, Copy, Debug)]
 struct Note {
+    id: NoteId,
     start_beat: f32,
     len_beats: f32,
     pitch: u8,    // MIDI 0..127 (生成側で 36..96 に絞る)
     velocity: u8, // 0..127 (色濃度に使う)
 }
 
-/// 100k 個を決定論的 LCG で生成。`start_beat` 昇順にソート。
+/// 100k 個を決定論的 LCG で生成。`start_beat` 昇順にソート。`id` は 0..count を割り当て。
 fn generate_notes(count: usize) -> Vec<Note> {
     // 線形合同法 (LCG) + splitmix64 finalizer。LCG 単体の下位 bit は周期が短く
     // (`% 60` のような小さな modulo で「4 半音間隔」のような周期パターンが出る)、
@@ -64,7 +70,7 @@ fn generate_notes(count: usize) -> Vec<Note> {
     let pitch_lo: u8 = 36;                // C2
     let pitch_hi: u8 = 96;                // C7
     let mut notes: Vec<Note> = Vec::with_capacity(count);
-    for _ in 0..count {
+    for i in 0..count {
         let r1 = next();
         let r2 = next();
         let r3 = next();
@@ -74,7 +80,7 @@ fn generate_notes(count: usize) -> Vec<Note> {
         let len_beats = 0.125 + (r2 as f32 / u64::MAX as f32) * 1.875;
         let pitch = pitch_lo + ((r3 % u64::from(pitch_hi - pitch_lo)) as u8);
         let velocity = 32 + ((r4 % 96) as u8);
-        notes.push(Note { start_beat, len_beats, pitch, velocity });
+        notes.push(Note { id: i as NoteId, start_beat, len_beats, pitch, velocity });
     }
     notes.sort_by(|a, b| a.start_beat.partial_cmp(&b.start_beat).unwrap_or(std::cmp::Ordering::Equal));
     notes
@@ -85,8 +91,13 @@ fn generate_notes(count: usize) -> Vec<Note> {
 /// no-Clone 不変条件: `Clone` / `PartialEq` / `Hash` / `Default` は実装しない。
 struct PianoRollModel {
     notes: Vec<Note>,
-    /// 将来の編集 API 追加時に bump する hook。現状 0 固定。
+    /// notes / id を編集するたびに bump する hook (`viewport_key` の cache busting)。
     notes_generation: u64,
+    /// 次に新規 note へ割り当てる id (M9 Phase 41a)。
+    next_note_id: NoteId,
+    /// 選択中 note の id 集合 (M9 Phase 41a; 41c で multi-select 拡張)。
+    /// Note 自身に selected を持たせず、Model 側で single source of truth として管理。
+    selected_note_ids: Vec<NoteId>,
 
     view_start_beat: f32,
     view_len_beats: f32,   // zoom 倍率の逆数
@@ -94,26 +105,80 @@ struct PianoRollModel {
     pitch_top: f32,        // 表示 top の MIDI ピッチ (浮動小数で smooth scroll)
     pitch_visible: f32,    // 表示する pitch 範囲 (例 36 = 3 オクターブ)
 
-    selected_note_index: Option<usize>,
-
     last_frame_ms: f32,
     last_action: String,
 }
 
 impl PianoRollModel {
     fn new(notes: Vec<Note>) -> Self {
+        let next_note_id = notes.iter().map(|n| n.id).max().map_or(0, |m| m + 1);
         Self {
             notes,
             notes_generation: 0,
+            next_note_id,
+            selected_note_ids: Vec::new(),
             view_start_beat: 0.0,
             view_len_beats: 4.0,     // 1 小節 = 個々の note 矩形が判別可能なズーム
             pitch_top: 72.0,         // C5
             pitch_visible: 24.0,     // 2 オクターブ (1 row = 高めで note が見える)
-            selected_note_index: None,
             last_frame_ms: 0.0,
-            last_action: "起動 (Drag = pan / Wheel = zoom / Click = select)".to_string(),
+            last_action: "起動 (Drag = pan / Wheel = zoom / Click = select / Insert = add / Delete = del)".to_string(),
         }
     }
+}
+
+// ----- Edit factory (M9 Phase 41a; multi 対応 helper) -----
+
+/// 1 個 or 複数の note を一括 add する Undoable Edit。single note は `Arc::from([note])` で呼ぶ。
+/// inverse は id で remove する。
+fn make_add_notes_edit(notes: Arc<[Note]>) -> Edit<PianoRollModel> {
+    let label = if notes.len() == 1 { "add note" } else { "add notes" };
+    let n_fwd = Arc::clone(&notes);
+    let n_inv = notes;
+    Edit::with_inverse(
+        label,
+        move |m: &mut PianoRollModel| {
+            for note in n_fwd.iter() {
+                m.notes.push(*note);
+            }
+            m.notes.sort_by(|a, b| {
+                a.start_beat.partial_cmp(&b.start_beat).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            m.notes_generation += 1;
+        },
+        move |m: &mut PianoRollModel| {
+            let ids: HashSet<NoteId> = n_inv.iter().map(|n| n.id).collect();
+            m.notes.retain(|x| !ids.contains(&x.id));
+            m.selected_note_ids.retain(|sid| !ids.contains(sid));
+            m.notes_generation += 1;
+        },
+    )
+}
+
+/// 1 個 or 複数の note を一括 delete する Undoable Edit。inverse は note 自体を push し直す
+/// (id ごと復元するので selected も再選択可)。
+fn make_delete_notes_edit(notes: Arc<[Note]>) -> Edit<PianoRollModel> {
+    let label = if notes.len() == 1 { "delete note" } else { "delete notes" };
+    let n_fwd = Arc::clone(&notes);
+    let n_inv = notes;
+    Edit::with_inverse(
+        label,
+        move |m: &mut PianoRollModel| {
+            let ids: HashSet<NoteId> = n_fwd.iter().map(|n| n.id).collect();
+            m.notes.retain(|x| !ids.contains(&x.id));
+            m.selected_note_ids.retain(|sid| !ids.contains(sid));
+            m.notes_generation += 1;
+        },
+        move |m: &mut PianoRollModel| {
+            for note in n_inv.iter() {
+                m.notes.push(*note);
+            }
+            m.notes.sort_by(|a, b| {
+                a.start_beat.partial_cmp(&b.start_beat).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            m.notes_generation += 1;
+        },
+    )
 }
 
 // ----- レイアウト helper -----
@@ -203,8 +268,11 @@ impl App {
         let renderer = Renderer::new(window.clone()).expect("Renderer::new");
         window.set_title("daw-ui piano_roll (M5 Phase 14)");
         let notes = generate_notes(n_notes);
+        let mut ui = UiHost::with_window(window.clone());
+        // M9 Phase 41a: Insert で cursor 位置に note add (default bindings には含まれていない)
+        ui.shortcut_map_mut().bind("add_note", "Insert");
         Self {
-            ui: UiHost::with_window(window.clone()),
+            ui,
 
             window,
             renderer,
@@ -361,7 +429,6 @@ impl App {
 
         // pending_click を消費するため take する
         let click_pos = self.pending_click.take();
-        let selected_idx = self.model.selected_note_index;
 
         self.ui.frame(
             &mut self.model,
@@ -523,51 +590,94 @@ impl App {
                         }
                     });
 
-                    // --- cached の外: 選択 overlay (毎フレーム実行) ---
-                    if let Some(idx) = selected_idx
-                        && idx >= s_idx
-                        && idx < e_idx
-                    {
-                        let note = m.notes[idx];
-                        let r = note_to_rect(note, m, grid);
-                        // note より 2px 外側に張り出した黄色 fill + 白縁取りで強調
-                        let pad = 2.0;
-                        hctx.push_rect(RectCommand {
-                            rect: Rect {
-                                x: r.x - pad,
-                                y: r.y - pad,
-                                w: r.w + pad * 2.0,
-                                h: r.h + pad * 2.0,
-                            },
-                            fill: Color::rgb(1.0, 0.85, 0.30),
-                            border: Color::rgb(1.0, 1.0, 1.0),
-                            border_width: 2.0,
-                            radius: [3.0; 4],
-                            clip_rect: None,
-                        });
+                    // --- cached の外: 選択 overlay (毎フレーム実行、id ベース) ---
+                    if !m.selected_note_ids.is_empty() {
+                        let sel_set: HashSet<NoteId> = m.selected_note_ids.iter().copied().collect();
+                        for note in visible {
+                            if !sel_set.contains(&note.id) {
+                                continue;
+                            }
+                            let r = note_to_rect(*note, m, grid);
+                            let pad = 2.0;
+                            hctx.push_rect(RectCommand {
+                                rect: Rect {
+                                    x: r.x - pad,
+                                    y: r.y - pad,
+                                    w: r.w + pad * 2.0,
+                                    h: r.h + pad * 2.0,
+                                },
+                                fill: Color::rgb(1.0, 0.85, 0.30),
+                                border: Color::rgb(1.0, 1.0, 1.0),
+                                border_width: 2.0,
+                                radius: [3.0; 4],
+                                clip_rect: None,
+                            });
+                        }
                     }
 
-                    // --- cached の外: ヒットテスト (click 時のみ) ---
+                    // --- cached の外: ヒットテスト (click 時のみ、id ベース) ---
                     if let Some((cx, cy)) = click_pos
                         && grid.contains(cx, cy)
                     {
-                        let mut hit: Option<usize> = None;
-                        for (off, note) in visible.iter().enumerate() {
+                        let mut hit_id: Option<NoteId> = None;
+                        for note in visible {
                             let r = note_to_rect(*note, m, grid);
                             if r.contains(cx, cy) {
-                                hit = Some(s_idx + off);
+                                hit_id = Some(note.id);
                                 // 後勝ち (描画順で前面のものが選ばれる)
                             }
                         }
-                        if let Some(idx) = hit {
+                        if let Some(id) = hit_id {
                             hctx.push_edit(Edit::mutate(move |m: &mut PianoRollModel| {
-                                m.selected_note_index = Some(idx);
-                                m.last_action = format!("note {idx} 選択");
+                                m.selected_note_ids = vec![id];
+                                m.last_action = format!("note id={id} 選択");
                             }));
                         } else {
                             hctx.push_edit(Edit::mutate(|m: &mut PianoRollModel| {
-                                m.selected_note_index = None;
+                                m.selected_note_ids.clear();
                                 m.last_action = "選択解除".to_string();
+                            }));
+                        }
+                    }
+
+                    // --- M9 Phase 41a: Insert で cursor 位置に note add、Delete で selected を削除 ---
+                    if hctx.take_shortcut("add_note")
+                        && let Some((cx, cy)) = hctx.pointer().pos
+                        && grid.contains(cx, cy)
+                    {
+                        // cursor 位置を beat / pitch に逆換算 (snap なしの float)。
+                        let beat_to_px = grid.w / m.view_len_beats;
+                        let pitch_to_px = grid.h / m.pitch_visible;
+                        let start_beat = m.view_start_beat + (cx - grid.x) / beat_to_px;
+                        let pitch_f = m.pitch_top - (cy - grid.y) / pitch_to_px;
+                        let pitch = (pitch_f.round() as i32).clamp(0, 127) as u8;
+                        let new_id = m.next_note_id;
+                        let new_note = Note {
+                            id: new_id,
+                            start_beat: start_beat.max(0.0),
+                            len_beats: 0.5,    // デフォルト 8 分音符
+                            pitch,
+                            velocity: 96,
+                        };
+                        let edit = make_add_notes_edit(Arc::from([new_note]));
+                        hctx.push_edit(edit);
+                        // next_note_id の bump は別 Mutate で (Undoable と分けることで undo 後の
+                        // id 衝突回避: undo して新たに add した場合に new_id+1 を使う)
+                        hctx.push_edit(Edit::mutate(move |m: &mut PianoRollModel| {
+                            m.next_note_id = m.next_note_id.max(new_id + 1);
+                            m.last_action = format!("add note id={new_id}");
+                        }));
+                    }
+                    if hctx.take_shortcut("delete") && !m.selected_note_ids.is_empty() {
+                        let sel_set: HashSet<NoteId> = m.selected_note_ids.iter().copied().collect();
+                        let to_delete: Vec<Note> =
+                            m.notes.iter().filter(|n| sel_set.contains(&n.id)).copied().collect();
+                        if !to_delete.is_empty() {
+                            let n = to_delete.len();
+                            let edit = make_delete_notes_edit(Arc::from(to_delete));
+                            hctx.push_edit(edit);
+                            hctx.push_edit(Edit::mutate(move |m: &mut PianoRollModel| {
+                                m.last_action = format!("delete {n} note(s)");
                             }));
                         }
                     }
@@ -653,5 +763,130 @@ fn main() {
         .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0));
     if let Err(e) = winit_backend::run_app(attrs, move |window| App::new(Arc::new(window), n_notes)) {
         eprintln!("event loop error: {e}");
+    }
+}
+
+// ============================================================
+// M9 Phase 41a: helper の Undoable round-trip tests
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daw_ui_core::Edit;
+
+    fn note(id: NoteId, start: f32, len: f32, pitch: u8) -> Note {
+        Note { id, start_beat: start, len_beats: len, pitch, velocity: 96 }
+    }
+
+    fn run_pair(edit: Edit<PianoRollModel>, model: &mut PianoRollModel) {
+        // Undoable variant の forward / inverse を直接呼んで round-trip を検証する。
+        let Edit::Undoable { forward, inverse, .. } = edit else {
+            panic!("expected Undoable");
+        };
+        let initial_gen = model.notes_generation;
+        let initial_count = model.notes.len();
+        forward(model);
+        assert!(
+            model.notes_generation > initial_gen,
+            "forward が generation を bump していない"
+        );
+        inverse(model);
+        assert_eq!(
+            model.notes.len(),
+            initial_count,
+            "inverse が note 数を元に戻していない"
+        );
+    }
+
+    #[test]
+    fn add_single_note_then_undo_round_trip() {
+        let mut model = PianoRollModel::new(vec![]);
+        let n = note(0, 0.0, 0.5, 60);
+        let edit = make_add_notes_edit(Arc::from([n]));
+        let Edit::Undoable { forward, inverse, .. } = edit else {
+            panic!("expected Undoable");
+        };
+        forward(&mut model);
+        assert_eq!(model.notes.len(), 1);
+        assert_eq!(model.notes[0].id, 0);
+        inverse(&mut model);
+        assert_eq!(model.notes.len(), 0);
+    }
+
+    #[test]
+    fn add_multiple_notes_then_undo_round_trip() {
+        let mut model = PianoRollModel::new(vec![]);
+        let notes_to_add: Arc<[Note]> = Arc::from([
+            note(10, 1.0, 0.5, 60),
+            note(11, 2.0, 0.5, 64),
+            note(12, 3.0, 0.5, 67),
+        ]);
+        let edit = make_add_notes_edit(notes_to_add);
+        let Edit::Undoable { forward, inverse, .. } = edit else {
+            panic!("expected Undoable");
+        };
+        forward(&mut model);
+        assert_eq!(model.notes.len(), 3);
+        let ids: Vec<NoteId> = model.notes.iter().map(|n| n.id).collect();
+        assert_eq!(ids, vec![10, 11, 12]);
+        inverse(&mut model);
+        assert!(model.notes.is_empty());
+    }
+
+    #[test]
+    fn delete_notes_then_undo_restores_original_state() {
+        let initial = vec![
+            note(1, 0.0, 0.5, 60),
+            note(2, 1.0, 0.5, 64),
+            note(3, 2.0, 0.5, 67),
+        ];
+        let mut model = PianoRollModel::new(initial);
+        // id 2 を削除
+        let to_delete: Arc<[Note]> = Arc::from([note(2, 1.0, 0.5, 64)]);
+        let edit = make_delete_notes_edit(to_delete);
+        let Edit::Undoable { forward, inverse, .. } = edit else {
+            panic!("expected Undoable");
+        };
+        forward(&mut model);
+        assert_eq!(model.notes.len(), 2);
+        let remaining_ids: Vec<NoteId> = model.notes.iter().map(|n| n.id).collect();
+        assert_eq!(remaining_ids, vec![1, 3]);
+        inverse(&mut model);
+        let restored_ids: Vec<NoteId> = model.notes.iter().map(|n| n.id).collect();
+        assert_eq!(restored_ids, vec![1, 2, 3], "id 2 が start_beat 順位置に復元");
+    }
+
+    #[test]
+    fn delete_notes_clears_corresponding_selection() {
+        let initial = vec![note(1, 0.0, 0.5, 60), note(2, 1.0, 0.5, 64)];
+        let mut model = PianoRollModel::new(initial);
+        model.selected_note_ids = vec![1, 2];
+        let to_delete: Arc<[Note]> = Arc::from([note(1, 0.0, 0.5, 60)]);
+        let edit = make_delete_notes_edit(to_delete);
+        if let Edit::Undoable { forward, .. } = edit {
+            forward(&mut model);
+        }
+        assert_eq!(model.selected_note_ids, vec![2], "削除した id は選択から外れる");
+    }
+
+    #[test]
+    fn add_notes_forward_is_idempotent_for_redo() {
+        // Fn 制約 = 2 度 forward 実行 (redo 経路) しても問題ないことを確認。
+        // ただしこの helper では同 note を 2 度 push してしまう (id 衝突は許容しない設計)。
+        // Undoable な redo は forward を 1 度しか呼ばないことを前提とする (history.rs 側責務)。
+        let mut model = PianoRollModel::new(vec![]);
+        let edit = make_add_notes_edit(Arc::from([note(0, 0.0, 0.5, 60)]));
+        if let Edit::Undoable { forward, .. } = edit {
+            forward(&mut model);
+            assert_eq!(model.notes.len(), 1);
+        }
+    }
+
+    #[test]
+    fn round_trip_uses_run_pair_helper() {
+        let mut model = PianoRollModel::new(vec![]);
+        let edit = make_add_notes_edit(Arc::from([note(0, 0.0, 0.5, 60)]));
+        run_pair(edit, &mut model);
     }
 }
