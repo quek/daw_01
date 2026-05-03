@@ -1320,6 +1320,7 @@ ui.heavy("track_0_clips", |hctx| {
 
 **Phase 44 への引き継ぎ事項**:
 
+- **popup pass の glyph buffer 上書き問題の根本修正** → **Phase 44a で解決済**。
 - **debug_overlay の表示項目拡張**: render time / dropped frame count / GPU memory usage 等を将来追加する場合、`FrameStats` を拡張するか別 struct (`PerformanceStats` 等) を作るかの判断。
 - **CI への scenegraph cache hit rate target**: 現在は debug overlay で目視のみ。CI bench で「典型的な mixer / piano_roll 操作で hit rate > 80%」を回帰テストにする提案 (Phase 44 で評価)。
 - **overlay の position / style カスタマイズ**: 現状 rect の右上に固定。app が左下や別 corner に出したい場合は引数で受けるか、`DebugOverlayStyle` struct を導入。validation 期間中は不要。
@@ -1329,3 +1330,54 @@ ui.heavy("track_0_clips", |hctx| {
 - library: `crates/ui/src/ui.rs` +~120 LOC (FrameStats struct + UiHost field 3 個 + frame_to_edits stats track + Ui field 3 個 + debug_overlay impl + tests 6 ケース)、`crates/ui/src/shortcut.rs` +1 行 binding、`crates/ui/src/lib.rs` +1 type re-export。
 - example: `crates/examples/mixer/src/main.rs` +~15 LOC (Model field 2 個 + Ctrl+F1 toggle + on_render の frame_ms 計測 + debug_overlay 呼び出し)。
 - trybuild: `crates/ui/tests/ui/pass/basic.rs` +1 行。
+
+---
+
+## M9 Phase 44a (popup pass の renderer pipeline 独立化、完了 2026-05-03)
+
+**目的**: Phase 43 で発見した「popup pass の prepare で base pass の GPU buffer が上書きされる」問題を根本解決する。Phase 43 では debug_overlay を base scene に push する workaround で回避していたが、menu / dropdown / context_menu でも同様の現象が起きうるため (popup items が少ないと顕在化しないが理論上 base text / rect が破壊される)、popup pass 用に独立した pipeline インスタンスを持たせて干渉を断つ。
+
+**進捗**: 1 commit で完遂 (renderer 修正 + Ui::debug_overlay を popup buffer に戻す + tests 修正)。
+
+**追加 API**: なし (内部実装の修正のみ)。
+
+**実装の要点**:
+
+- **renderer に独立 pipeline インスタンスを追加** (`crates/renderer/src/device.rs` `Renderer` struct):
+  - `popup_rect: RectPipeline` (base 用 `rect` と独立 instance buffer / vertex buffer)
+  - `popup_line: LinePipeline` (base 用 `line` と独立 segment buffer)
+  - `popup_glyph: GlyphPipeline` (base 用 `glyph` と独立 glyphon TextRenderer / Atlas / Buffer cache)
+- popup pass の prepare/render を `self.popup_rect.*` / `self.popup_line.*` / `self.popup_glyph.*` に切替
+- `Ui::debug_overlay` を popup buffer (`drawing_in_popup = true`) に戻す → z-order 最前面で描画
+- library tests (`debug_overlay_renders_rects_and_glyphs` / `_omits_frame_ms_when_zero`) を popup_rects / popup_glyph_areas 検証に修正
+
+**主な学び**:
+
+- **wgpu の `queue.write_buffer` は queue 化される**: 同 frame 内で 2 度 `prepare` を呼んで同じ pipeline の internal buffer を書くと、submit 時に **最終 write** が GPU に反映される。base pass の draw command も popup data を読んでしまう。これは glyph (glyphon Atlas) だけでなく、自前 RectPipeline / LinePipeline (instanced rect / line strip) でも同じ問題が起きる。Phase 43 で glyph のみ独立化したが、Phase 44a で実機検証時に「text_input の枠 rect が消える」現象から rect / line も同じ問題と判明。
+- **3 pipeline すべて popup 用インスタンスを持つ必要**: `prepare→render→prepare→render` パターンを採るなら、各 pipeline で independent buffer を持たないといけない。実装は `RectPipeline::new` / `LinePipeline::new` / `GlyphPipeline::new` を 2 度呼ぶだけで済む (~6 LOC)。GPU メモリは ~2x になるが、popup の primitive 数は base より大幅に少ない (典型的に < 10 個) ため実害は小さい。
+- **過去の menu / dropdown / context_menu でこの問題が露呈しなかった理由**: popup items の rect / glyph 数が少ない & base scene 上の primitive と座標的に重ならないため、上書きの影響が "目に見える"レベルに達しなかった可能性が高い。debug_overlay は 5 行 + 1 半透明 rect で popup buffer を埋める初の large user で、ようやく顕在化した。
+- **Phase 43 の workaround (debug_overlay を base scene に push) は不要に**: Phase 44a で popup pass を独立化した後は、debug_overlay を popup buffer に戻して z-order を最前面にできる (= 通常 popup と同様 menu / dropdown より上に出る)。
+
+**設計判断**:
+
+- **`PipelineSet` のような構造体に bundle しない**: `Renderer` に直接 `popup_rect` / `popup_line` / `popup_glyph` の 3 フィールドを追加。bundle すると swap や独立処理が書きにくい。
+- **base / popup で pipeline 実装は同一**: `RectPipeline::new` 等を 2 度呼ぶだけで OK、専用 `PopupRectPipeline` 型は作らない。差は instance / buffer の独立のみ。
+- **glyphon Atlas も独立**: フォント atlas は base / popup で 2 個になるが、debug 用途の popup 描画では数フォント分のみ使うので実害は小さい。共有 atlas を作る案もあるが、glyphon の API が atlas 共有を直接 expose していないため複雑になる。
+
+**検証**:
+
+- `cargo build --workspace` ✅ / `cargo test --workspace` ✅ (新規 test なし、既存 6 + その他全 pass) / `cargo clippy --workspace --tests -- -D warnings` ✅
+- `cargo run --bin mixer` で **Ctrl+F1 toggle** → debug overlay 表示 + 画面上部の text_input 枠 / タイトル / count / status 全表示 OK
+- `cargo run --bin daw_prototype` で **clip 上の右クリック context_menu** → "Cut / Copy / Delete / Duplicate" items 表示 + base scene の他 widget が消えない OK
+
+**残作業**: なし。Phase 44a 完了。
+
+**Phase 44b/c への引き継ぎ事項**:
+
+- **GPU メモリの計測**: popup 用 pipeline 追加で GPU memory が ~2x。validation 期間中は問題ないが、将来 plugin host で複数 piano_roll instance を出すケースで合算が大きくなったら再評価。
+- **独立 pipeline の必要性 review**: 「popup buffer を **そもそも使わない**」 (= 全 widget を base scene に push、z-order は描画順で制御) という設計案も理論上ある。ただし popup items の click 時に下層の widget に click が漏れる問題があるので、popup buffer + outside-click 検出 の仕組みは維持する必要がある。Phase 44a の独立 pipeline 追加が KISS な解決策。
+
+**LOC**:
+
+- `crates/renderer/src/device.rs`: +~10 LOC (popup_rect / popup_line / popup_glyph フィールド + new() / prepare/render 切替)。
+- `crates/ui/src/ui.rs`: -8 LOC + +5 LOC (debug_overlay を popup buffer に戻す、`drawing_in_popup` 切替 2 行 + tests 修正で popup_glyph_areas / popup_rects 検証)。

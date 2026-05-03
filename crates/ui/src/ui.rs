@@ -1000,12 +1000,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             w: bg_w,
             h: bg_h,
         };
-        // 半透明背景 + テキストを **base scene に直接 push** する。popup buffer (= popup pass)
-        // を使うと glyphon TextRenderer の internal GPU buffer が base pass のものと共有
-        // されており、popup pass の prepare で base pass の glyph data が上書きされる
-        // 既知問題 (M9 Phase 43 で発見、別 Phase で popup pass を独立 TextRenderer 化して解決
-        // 予定)。debug overlay は右上の小領域 (200x82) で他 widget と重ならない前提なので、
-        // base scene に積んで render 順を base → debug の順序で済ませる。
+        // M9 Phase 44a: popup buffer (= popup pass) に push して z-order 最前面に。
+        // Phase 43 で発見した「popup pass の glyph buffer 上書き」問題は Phase 44a で
+        // popup_glyph: GlyphPipeline を独立インスタンスにすることで根本解決済み。
+        let prev_in_popup = self.drawing_in_popup;
+        self.drawing_in_popup = true;
         self.push_rect(RectCommand {
             rect: bg_rect,
             fill: Color::rgba(0.05, 0.06, 0.10, 0.85),
@@ -1025,6 +1024,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 clip_rect: None,
             });
         }
+        self.drawing_in_popup = prev_in_popup;
     }
 
     // ============================================================
@@ -2292,16 +2292,15 @@ mod tests {
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.debug_overlay(Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 }, 5.5);
         });
-        // base scene に rect + glyph が積まれる (popup buffer は使わない)。理由は
-        // glyphon TextRenderer の internal buffer が popup pass で上書きされる既知問題
-        // (M9 Phase 43 で発見、別 Phase で 2 つの TextRenderer に分けて解決予定)。
+        // M9 Phase 44a: popup buffer (z-order 最前面) に rect + glyph が積まれる。
+        // popup_glyph が独立 GlyphPipeline になったので base pass の glyph と干渉しない。
         assert!(
-            scene.rects.iter().any(|r| (r.fill.a - 0.85).abs() < 1e-3),
-            "debug_overlay の半透明背景 (alpha=0.85) が base scene に積まれる"
+            !scene.popup_rects.is_empty(),
+            "debug_overlay は popup buffer の rect を 1 個以上積む"
         );
         assert!(
-            scene.glyph_areas.len() >= 5,
-            "debug_overlay は base scene の glyph を 5 行以上積む (frame_ms 含む 5 行)"
+            scene.popup_glyph_areas.len() >= 5,
+            "debug_overlay は popup buffer の glyph を 5 行以上積む (frame_ms 含む)"
         );
     }
 
@@ -2314,7 +2313,7 @@ mod tests {
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.debug_overlay(Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 }, 0.0);
         });
-        // base scene の glyph_areas に 4 行 (frame_ms 省略)。
-        assert_eq!(scene.glyph_areas.len(), 4, "frame_ms=0 で frame 行省略 → 4 行");
+        // popup buffer の glyph_areas に 4 行 (frame_ms 省略)。
+        assert_eq!(scene.popup_glyph_areas.len(), 4, "frame_ms=0 で frame 行省略 → 4 行");
     }
 }

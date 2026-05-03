@@ -35,6 +35,18 @@ pub struct Renderer<W: WindowBackend + Send + Sync + 'static> {
     rect: RectPipeline,
     line: LinePipeline,
     glyph: GlyphPipeline,
+    /// M9 Phase 44a: popup pass 用の独立 pipeline インスタンス群。
+    /// rect / line / glyph いずれも `prepare` 内で `queue.write_buffer` を呼ぶため、
+    /// 同じ pipeline を `prepare→render→prepare→render` すると submit 時の最終 write が
+    /// 反映される結果、base pass の render が popup pass の data を読んでしまう。
+    /// (具体例: popup pass で `self.rect.prepare(&scene.popup_rects, ...)` すると、
+    ///  base pass の `self.rect.render` が popup_rects を render して text_input の枠 rect 等が
+    ///  消える)。これを回避するため popup 用に独立した pipeline インスタンスを持ち、内部
+    ///  vertex/instance buffer / Atlas / Buffer cache を分離する。GPU メモリは ~2x になるが、
+    ///  popup の primitive 数は base より大幅に少ないので実害は小さい。
+    popup_rect: RectPipeline,
+    popup_line: LinePipeline,
+    popup_glyph: GlyphPipeline,
     /// 現在の物理ピクセルサイズ。
     size: PhysicalSize,
     /// Window の所有権 (drop 順序のため最後)
@@ -101,6 +113,9 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
         let rect = RectPipeline::new(&device, format);
         let line = LinePipeline::new(&device, format);
         let glyph = GlyphPipeline::new(&device, &queue, format);
+        let popup_rect = RectPipeline::new(&device, format);
+        let popup_line = LinePipeline::new(&device, format);
+        let popup_glyph = GlyphPipeline::new(&device, &queue, format);
 
         Ok(Self {
             surface,
@@ -110,6 +125,9 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
             rect,
             line,
             glyph,
+            popup_rect,
+            popup_line,
+            popup_glyph,
             size,
             _window: window,
         })
@@ -221,9 +239,15 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
             || !scene.popup_glyph_areas.is_empty()
             || !scene.popup_line_batches.is_empty()
         {
-            self.rect.prepare(&self.device, &self.queue, &scene.popup_rects, self.size);
-            self.line.prepare(&self.device, &self.queue, &scene.popup_line_batches, self.size);
-            self.glyph.prepare(
+            // M9 Phase 44a: popup_rect / popup_line / popup_glyph (独立 pipeline インスタンス) を
+            // 使う。base 用 self.rect / self.line / self.glyph を再 prepare すると、各 pipeline の
+            // internal GPU buffer (instance buffer / vertex buffer / glyphon Atlas) が popup data で
+            // 上書きされる。queue.write_buffer の最終 write が submit 時に反映されるため、
+            // base pass の render が popup data を読んでしまい text_input の枠 rect / 画面上部の
+            // text が消える等の症状になる。独立インスタンスで干渉を避ける。
+            self.popup_rect.prepare(&self.device, &self.queue, &scene.popup_rects, self.size);
+            self.popup_line.prepare(&self.device, &self.queue, &scene.popup_line_batches, self.size);
+            self.popup_glyph.prepare(
                 &self.device,
                 &self.queue,
                 &scene.popup_glyph_areas,
@@ -245,9 +269,9 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.rect.render(&mut pass, self.size);
-            self.line.render(&mut pass, self.size);
-            self.glyph.render(&mut pass);
+            self.popup_rect.render(&mut pass, self.size);
+            self.popup_line.render(&mut pass, self.size);
+            self.popup_glyph.render(&mut pass);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
