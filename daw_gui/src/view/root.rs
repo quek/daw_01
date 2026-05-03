@@ -207,10 +207,15 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>) {
         }
     }
     if ui.take_shortcut("delete") {
-        // 選択ノートが空のときは clip 削除に fall through。
-        ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.handle_event(AppEvent::DeleteSelectedNotes);
-            app.handle_event(AppEvent::DeleteSelectedClip);
+        // ノート選択があればノート削除、無ければ clip 削除。
+        // 両方 dispatch するとノート選択中でも clip が消えてしまう。
+        let has_notes = !app.selected_notes.is_empty();
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            if has_notes {
+                app.handle_event(AppEvent::DeleteSelectedNotes);
+            } else {
+                app.handle_event(AppEvent::DeleteSelectedClip);
+            }
         }));
     }
 
