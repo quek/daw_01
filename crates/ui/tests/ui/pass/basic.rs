@@ -181,7 +181,6 @@ fn main() {
                             len_beats: 1.0,
                             name: std::sync::Arc::from("clip"),
                             color: None,
-                            volume: 1.0,
                         };
                     }),
                     ArrangementEditRequest::ResizeClips(_) => Edit::mutate(|_m: &mut Model| {}),
@@ -201,9 +200,6 @@ fn main() {
                         Edit::mutate(|_m: &mut Model| {})
                     }
                     ArrangementEditRequest::ReorderTracks(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::SetClipVolume { .. } => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
                     ArrangementEditRequest::ToggleTrackMute(_) => {
