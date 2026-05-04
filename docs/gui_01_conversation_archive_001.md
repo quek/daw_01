@@ -551,3 +551,63 @@ widget 内で release frame の **optimistic preview** を採用。release frame
 `make_edit` は自由関数 fn (= Clone 自動実装) を渡しているので Phase 49 breaking 変更は影響なし。ビルド `cargo build --workspace` クリーン、ユーザーが arrangement track volume drag 中の mixer fader 追従と reorder 同 frame 反映の両方 OK 確認 (本ファイルでの「ok」報告)。
 
 ---
+
+## #012 [Resolved] 2026-05-04 [要望] `Ui::reorderable_list` 新設 (track_inspector chain reorder 用)
+
+### daw_01 →
+- 種別: [要望]
+- 関連 daw_01: `daw_gui/src/view/track_inspector.rs` (Phase 5 仕上げで残った tech debt 1 件 = chain row が `ui.push_rect` 直呼び)
+- 既出言及: archive #007 回答で「drag-reorder は list_view の単純さを保つため別 widget で対応する想定」と gui_01 が明言済
+
+#### 想定 use case
+
+1. **track_inspector chain reorder** (本要望の主目的): MIDI FX 内 / FX 内で plugin 処理順入れ替え
+2. (将来) Save / Open dialog の最近ファイル一覧並び替え
+3. (将来) playlist / queue 系 UI
+
+#### 想定 API イメージ
+
+`Ui::list_view` と完全平行、scroll_area 上に drag-reorder を載せる構造。`Reorder(Vec<usize>)` を release frame に 1 度発行 (commit-by-release)、`drag_handle_w` で row 全体 drag (Bitwig 風) / 左端 grip (Logic 風) を切替。
+
+### gui_01 →
+
+**結論: 受け入れ可**、`Ui::reorderable_list` を **M11 Phase 51** で実装。Phase 46 (`Ui::arrangement` track reorder) で実証済の同パターン (`compute_reorder_target_index` / `apply_reorder` pure helper を generic 化して共有)。
+
+#### 確定 API
+
+```rust
+pub struct ReorderableListStyle {
+    pub row_height: f32, pub row_gap: f32,
+    pub row_bg: Color, pub row_bg_hover: Color, pub row_bg_selected: Color,
+    pub row_bg_dragging: Color,        // drag 中の row (半透明 float)
+    pub drop_indicator_color: Color, pub drop_indicator_h: f32,
+    pub radius: f32, pub drag_handle_w: f32,
+}
+
+pub enum ReorderableListEditRequest {
+    Reorder(Vec<usize>),  // 新順での旧 index 列、release frame に 1 度発行
+}
+
+pub fn reorderable_list<T, F, R>(id, rect, items, selected, style, make_edit, row)
+    -> ReorderableListResponse
+where
+    F: Fn(...) -> Edit<M> + Clone + Send + Sync + 'static,
+    R: FnMut(&mut Ui<'a, M>, &T, usize, Rect, bool /*selected*/, bool /*dragging*/);
+```
+
+#### 完了通知 (Phase 51、commit `f7f288a`)
+
+- `daw_ui_core::widgets::arrangement::apply_reorder<T: Clone>(items, anchor, target) -> Vec<T>` を generic 化済
+- `daw_prototype` の `Demo Dialog` で実機動作確認可能
+
+### daw_01 → 対応完了 (2026-05-04)
+
+commit (本セッション) で `track_inspector.rs` を rewrite。
+
+- 既存 178 LOC → 187 LOC (僅増、scroll_area boilerplate 削除と引き換えに row callback signature が長くなる)
+- `ui.push_rect` 直呼びを `ui.reorderable_list` で吸収 → **`daw_gui/src/view/` 全体で `push_rect` / `push_text` / `push_lines` 0 件達成 (Phase 5 仕上げ DoD 完了)**
+- `AppEvent::ReorderInspectorChain(Vec<usize>)` + handler `reorder_inspector_chain` を追加。chain (MIDI FX → Instrument → FX 統合 list) の reorder 要求を受けて、**section 跨ぎは拒否**して section 内のみ apply (Instrument 行は単一なので動かせない)
+- `ReorderableListStyle` const で daw_01 既存色 (ROW_BG / TEXT) に揃えた custom style
+- ユーザー実機で chain drag&drop reorder OK 確認 (本ファイルでの「ok」報告)
+
+---
