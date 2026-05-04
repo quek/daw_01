@@ -153,3 +153,5 @@ daw_01 側で別途組むもの:
 | 2026-05-04 | 59c93ec | Phase 3d | plugin_picker.rs を Ui::modal + Ui::list_view で rewrite (167 → 145 LOC) |
 | 2026-05-04 | 73e3504 | Phase 2  | Track / Clip に stable id を追加 (next_*_id 採番、ensure_ids、CURRENT_VERSION 2→3) |
 | 2026-05-04 | eda8954 | Phase 3e | arrangement_view を Ui::arrangement widget で rewrite (614 → 322 LOC、id ↔ index 変換層) |
+| 2026-05-04 | b7b9def | M10 取り込み | gui_01 #010 (Phase 46-48 + 47b/c) build 追従 + #011 (UX 非対称 2 件) を gui_01 に相談 |
+| 2026-05-04 | (gui_01) | -            | gui_01 が #011 に Phase 49 (volume live update) + Phase 50 (reorder optimistic preview) で対応、daw_01 側は make_edit が fn 自由関数なので追従不要 |

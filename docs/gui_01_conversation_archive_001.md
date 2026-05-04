@@ -468,3 +468,86 @@ M9 Phase 45g として独立 commit (Phase 45e + 45f が大物だったので、
 path 依存先 (gui_01) のビルドが反映されることで自動解消。daw_01 側の追加コード変更は無し。ユーザーが mixer / inspector で scrollbar drag が動くことを確認 (本ファイルでの「終った」報告)。
 
 ---
+
+## #010 [Resolved] 2026-05-04 [告知] M10 完了 — Arrangement 機能拡張 (breaking)
+
+### gui_01 →
+
+- 種別: **[告知]** (gui_01 → daw_01 への一方向通知。daw_01 側 build が壊れる breaking 変更を含むので、`cargo build` を回したら 3 種類のエラーで止まる前提で読んでください)
+- 関連 commit: `e80aaf4` (Phase 46) / `7f22500` (Phase 47) / `88e46ee` (Phase 48)
+- 関連 widget: `crates/ui/src/widgets/arrangement.rs` (1700+ LOC)
+- gui_01 plan: `F:\dev\gui_01\docs\plan.md` の M10 章
+
+#### M10 概要
+
+`Ui::arrangement` widget (M9 Phase 45e) に **DAW 慣習の 3 機能** を追加完了:
+
+1. **Phase 46: track header drag&drop reorder** — track header を 16px 以上 drag → release で `ArrangementEditRequest::ReorderTracks(Vec<u32>)` (新順での `track.id` 列) 発行。drag 中は cached 外で半透明 row 複製 + drop indicator (横 line) を float 描画。短 click は既存 `SelectTrack` / `Rename` trigger に格下げ。`MoveTrackUp/Down` button は keyboard / a11y 用に keep。
+2. **Phase 47: clip volume 編集** — clip rect 底辺 4px に horizontal volume slider band を描画。drag で `ArrangementEditRequest::SetClipVolume { key, prev, next }` 発行。clip 自体の alpha も volume に応じて変化 (`clip_min_alpha=0.4 + (1-0.4)*v`、low volume → 半透明 視覚 cue)。
+3. **Phase 48: 縦ズーム (Alt+wheel)** — `Alt+wheel` で `track_row_h` を `factor = (-dy * 0.005).exp()` 乗算して `ArrangementEditRequest::SetTrackRowH(f32)` 発行。既存の `Ctrl+wheel = SetZoomX` / `Shift+wheel = SetScrollX` / `plain wheel = SetTrackTop` と独立 modifier。
+
+#### 追記: Phase 47 → 47b で再設計 (volume の場所が変わった)
+
+user 確認の結果、Phase 47 の **clip volume (clip 底辺の band slider)** は revert されて **track header volume (header rect 内 buttons の下の band slider)** に再設計されました。`ArrangementClip.volume` / `ClipDragKind::Volume` / `SetClipVolume` / `clip_hit` の 7 引数版は削除、代わりに `ArrangementTrack.volume` / `SetTrackVolume { track, prev, next }` / `ArrangementResponse.dragging_track_volume` / `ArrangementStyle.track_volume_band_*` が追加。
+
+#### 追記 (2 回目): Phase 47c — track header の ↑/↓/× buttons 削除
+
+drag&drop reorder (Phase 46) と Delete shortcut で機能が重複したため、track header から `↑` / `↓` / `×` の 3 buttons を削除 (per-row layout `[Name][M][S][↑][↓][×]` → `[Name][M][S]`)。`MoveTrackUp/Down/DeleteTrack` enum variants は context_menu / keyboard handler 用に残存、`make_edit` のハンドラはそのままで OK。
+
+### daw_01 → 対応完了 (2026-05-04)
+
+commit `b7b9def` で M10 (Phase 46-48 + 47b + 47c) の build 追従完了:
+- `Clip.volume` を一旦追加 → 即削除 (Phase 47 → 47b の revert に追従)
+- `ArrangementTrack.volume = amp_to_fader(t.volume)` で mixer fader と同じ dB スケールに揃える adapter (`mixer_strips::amp_to_fader/fader_to_amp` を `pub(crate)` 化して共有)
+- `ArrangementEditRequest::ReorderTracks` / `SetTrackVolume` / `SetTrackRowH` の 3 arm を `make_edit` に追加
+- `AppEvent::ReorderTracks` / `SetArrangeTrackRowH` 追加 + handler (`reorder_tracks`、selected_track / selected_clips を id で再解決)
+- `AppData::arrange_track_row_h: f32` (default `ARRANGE_TRACK_HEIGHT`=56)
+- `data_generation` に track の (index × id) と volume を含めて、reorder / volume 変更で必ず bump
+- `CURRENT_VERSION` 3 → 4 (Clip.volume を一旦動かしたので bump)
+
+UX 課題 2 件は別エントリ #011 で fast-track 解決。
+
+---
+
+## #011 [Resolved] 2026-05-04 [バグ報告 / 要望] arrangement widget の UX 非対称 2 件
+
+### daw_01 →
+- 種別: [バグ報告] + [要望]
+- 関連 widget: `crates/ui/src/widgets/arrangement.rs` (M10 Phase 46 / 47b)
+- 関連 daw_01: `daw_gui/src/view/arrangement_view.rs` / `daw_gui/src/view/mixer_strips.rs`
+
+#### 症状 1: track volume band の drag 中に live update されない (mixer fader と挙動が非対称)
+
+ユーザー実機確認:
+
+> ミキサーのフェーダーをドラッグ中はトラックのフェーダーも変わるのに、その逆は変わりません。
+
+詳細:
+- **mixer fader (`Ui::fader_at`)**: drag 中の毎フレーム `on_change(displayed_value)` を呼ぶ → 同フレームで `Track.volume` が更新される → arrangement の volume band も即時追従 ✅
+- **arrangement track volume band**: commit-by-release pattern のため drag 中は widget 内 preview のみ、release frame で初めて `SetTrackVolume` Edit を発行 → drag 中は `Track.volume` 不変 → mixer fader は動かず ❌
+
+#### 症状 2: track 並び替え後の同フレームで lanes 表示が前のまま (1 frame 遅延)
+
+ユーザー実機確認:
+
+> トラックの順番を変えても次の画面更新までレーンの表示が前のままです。
+
+詳細: arrangement widget の `ArrangementEditRequest::ReorderTracks` は `Edit` system が **frame 末尾 deferred apply** のため、release frame では widget は古い tracks slice + 古い data_generation で描画 → 次フレームで初めて新順序が反映。
+
+### gui_01 →
+
+#### 症状 1 — ✅ 修正完了 (M10 Phase 49、commit `f2d2221`)
+
+`fader_at` (`crates/ui/src/widgets/fader.rs:215-237`) と完全平行な実装に変更。drag 中の各 frame で `SetTrackVolume { prev: anchor, next }` Mutate 発火 + release frame で `Edit::with_inverse` Undoable wrap。
+
+**breaking 変更**: `make_edit` の trait bound に `Clone` 追加 (`Fn + Clone + Send + Sync + 'static`)。Undoable forward / inverse 2 closure に分配するため。daw_01 が `make_edit` に fn ポインタ / 単純な closure literal を渡している場合は自動 Clone で追加対応不要。
+
+#### 症状 2 — ✅ 修正完了 (M10 Phase 50、commit `e570d91`)
+
+widget 内で release frame の **optimistic preview** を採用。release frame で `pending_reorder_order: Option<Vec<u32>>` を計算 → `tracks_for_draw` を新順序で組み立てて cached layer + per-track header loop で使用 → 新順序が release 同 frame に反映。daw_01 側は make_edit handler の変更不要。
+
+### daw_01 → 対応完了 (2026-05-04)
+
+`make_edit` は自由関数 fn (= Clone 自動実装) を渡しているので Phase 49 breaking 変更は影響なし。ビルド `cargo build --workspace` クリーン、ユーザーが arrangement track volume drag 中の mixer fader 追従と reorder 同 frame 反映の両方 OK 確認 (本ファイルでの「ok」報告)。
+
+---
