@@ -620,6 +620,9 @@ struct TrackVolumeDragSession {
     band_rect: Rect,
     /// drag 中の最終 mouse x 位置 (release frame の `pointer.pos` に頼らない保険)。
     last_mouse_x: f32,
+    /// M10 Phase 49: drag 中に最後に発火した volume 値 (毎 frame 同値発火を抑制)。
+    /// drag 開始時は `anchor_volume` で初期化、各 frame で current `next` と差分があれば Mutate 発火 + 更新。
+    last_emitted_volume: f32,
 }
 
 #[derive(Debug, Default)]
@@ -1001,7 +1004,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         make_edit: F,
     ) -> ArrangementResponse
     where
-        F: Fn(ArrangementEditRequest) -> Edit<M> + Send + Sync + 'static,
+        // M10 Phase 49: `Clone` を要求 (fader_at と同じく Undoable Edit の forward/inverse 2 closure に
+        // make_edit を分配するため)。daw_prototype + trybuild basic.rs の closure literal は capture が
+        // 自動 Clone なので追加対応不要。
+        F: Fn(ArrangementEditRequest) -> Edit<M> + Clone + Send + Sync + 'static,
     {
         let wid = WidgetId::ROOT.child((b"arrangement_widget", &id));
         let pointer = self.pointer;
@@ -1103,12 +1109,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 if let Some(band) = layout.volume_band
                     && band.contains(px, py)
                 {
+                    let av = t.volume.clamp(0.0, 1.0);
                     let state: &mut ArrangementState = self.widget_state(wid);
                     state.track_volume_drag = Some(TrackVolumeDragSession {
                         track_id: t.id,
-                        anchor_volume: t.volume.clamp(0.0, 1.0),
+                        anchor_volume: av,
                         band_rect: band,
                         last_mouse_x: px,
+                        last_emitted_volume: av,
                     });
                 } else {
                     let in_small_button = layout.buttons.iter().any(|b| b.contains(px, py));
@@ -1142,6 +1150,33 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
             if let Some(ref mut tv) = state.track_volume_drag {
                 tv.last_mouse_x = px;
+            }
+        }
+
+        // M10 Phase 49: track volume drag 中の per-frame live update。
+        // release frame は Mutate 発火を抑制し、release ブロックの Undoable Edit に任せる
+        // (= fader_at の `suppress_mutate_on_release` と同パターン)。
+        // 同値発火を抑えるため `last_emitted_volume` と差分比較。
+        if let Some((px, _py)) = pointer.pos
+            && !pointer.primary_just_released
+        {
+            let mut volume_emit: Option<(u32, f32, f32)> = None;
+            {
+                let state: &mut ArrangementState = self.widget_state(wid);
+                if let Some(ref mut tv) = state.track_volume_drag {
+                    let next = volume_from_mouse_x(px, tv.band_rect.x, tv.band_rect.w);
+                    if (next - tv.last_emitted_volume).abs() > 1e-4 {
+                        volume_emit = Some((tv.track_id, tv.anchor_volume, next));
+                        tv.last_emitted_volume = next;
+                    }
+                }
+            }
+            if let Some((track, prev, next)) = volume_emit {
+                self.push_edit(make_edit(ArrangementEditRequest::SetTrackVolume {
+                    track,
+                    prev,
+                    next,
+                }));
             }
         }
         // 2) drag overlay 計算用に clone を取る (last_mouse を更新した後)。
@@ -1574,15 +1609,36 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
-        // ---- M10 Phase 47b: track volume drag release → SetTrackVolume ----
+        // ---- M10 Phase 47b+49: track volume drag release → Undoable Edit ----
+        // drag 中は per-frame Mutate で live update 済 (mixer fader と挙動同期)。
+        // release frame は Mutate suppress + `Edit::with_inverse` で Undoable wrap (Ctrl+Z で 1 回 undo)。
+        // forward = end_value、inverse = anchor_volume の対称な make_edit 呼び出し。
         if let Some(tv) = track_volume_release {
-            let next = volume_from_mouse_x(tv.last_mouse_x, tv.band_rect.x, tv.band_rect.w);
-            if (next - tv.anchor_volume).abs() > 1e-4 {
-                self.push_edit(make_edit(ArrangementEditRequest::SetTrackVolume {
-                    track: tv.track_id,
-                    prev: tv.anchor_volume,
-                    next,
-                }));
+            let end = volume_from_mouse_x(tv.last_mouse_x, tv.band_rect.x, tv.band_rect.w);
+            if (end - tv.anchor_volume).abs() > 1e-4 {
+                let track_id = tv.track_id;
+                let anchor = tv.anchor_volume;
+                let make_edit_fwd = make_edit.clone();
+                let make_edit_inv = make_edit.clone();
+                self.push_edit(Edit::with_inverse(
+                    "set track volume",
+                    move |m: &mut M| {
+                        make_edit_fwd(ArrangementEditRequest::SetTrackVolume {
+                            track: track_id,
+                            prev: anchor,
+                            next: end,
+                        })
+                        .apply(m);
+                    },
+                    move |m: &mut M| {
+                        make_edit_inv(ArrangementEditRequest::SetTrackVolume {
+                            track: track_id,
+                            prev: end,
+                            next: anchor,
+                        })
+                        .apply(m);
+                    },
+                ));
             }
         }
 

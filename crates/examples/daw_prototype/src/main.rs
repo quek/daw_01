@@ -624,11 +624,71 @@ fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
 
 #[allow(clippy::too_many_lines)]
 fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pane: Rect) {
+    // M10 Phase 49 検証用: 下部に mini mixer strip (各 track の vertical fader、DAW 慣習で
+    // mixer は arrangement の下)。arrangement の volume band と **同じ `arr_tracks[i].volume`
+    // source-of-truth** に bind するので、片方を drag すると drag 中もリアルタイムで他方が
+    // 追従することを 1 画面で確認できる。
+    let strip_h = 96.0_f32;
+    let strip_pad = 8.0_f32;
+    let arr_pane = Rect {
+        x: pane.x,
+        y: pane.y,
+        w: pane.w,
+        h: (pane.h - strip_h).max(100.0),
+    };
+    let strip_rect = Rect {
+        x: pane.x,
+        y: arr_pane.y + arr_pane.h,
+        w: pane.w,
+        h: strip_h,
+    };
+
+    // strip 背景
+    ui.panel("arr_minimix_bg", strip_rect, Color::rgb(0.12, 0.13, 0.16), 0.0);
+    // 各 track の mini fader (volume のみ)
+    let n_t = m.arr_tracks.len();
+    let fader_w = 30.0_f32;
+    let fader_gap = 4.0_f32;
+    let inner_x0 = strip_rect.x + strip_pad;
+    let inner_y = strip_rect.y + strip_pad;
+    let inner_h = (strip_rect.h - strip_pad * 2.0).max(20.0);
+    for (i, t) in m.arr_tracks.iter().enumerate() {
+        #[allow(clippy::cast_precision_loss)]
+        let fx = inner_x0 + i as f32 * (fader_w + fader_gap);
+        if fx + fader_w > strip_rect.x + strip_rect.w {
+            break;
+        }
+        let f_rect = Rect { x: fx, y: inner_y, w: fader_w, h: inner_h };
+        let tid = t.id;
+        let cur_vol = t.volume;
+        let _ = ui.fader_at(
+            ("arr_minifader", tid),
+            f_rect,
+            cur_vol,
+            1.0,
+            "track volume",
+            move |v| {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(tt) = mm.arr_tracks.iter_mut().find(|t| t.id == tid) {
+                        tt.volume = v.clamp(0.0, 1.0);
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!("minimix: track {tid} → {v:.2}");
+                })
+            },
+        );
+        // track 番号 label
+        let label = format!("{}", i + 1);
+        let lab_y = strip_rect.y + strip_rect.h - 14.0;
+        let _ = (label, lab_y); // label 描画は省略 (Ui::label_at が必要)
+    }
+    let _ = n_t;
+
     let arr_tracks = arr_track_views(m);
     let style = ArrangementStyle::default();
     let resp = ui.arrangement(
         "arr",
-        pane,
+        arr_pane,
         &arr_tracks,
         m.arr_view,
         &m.arr_selected_clips,
