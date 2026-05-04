@@ -103,26 +103,43 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let scroll = self.take_scroll_in_rect(rect);
 
         // ---- 2. scrollbar drag 処理 + offset 更新 ----
+        // M9 Phase 45g (daw_01 conversation #010): drag 判定用 thumb_rect は **wheel 適用後の
+        // 現在 offset** で計算する。旧実装は `offset = 0.0` で計算していたため、scrolled 状態
+        // で thumb の描画位置と hit-test 位置が乖離して drag が始まらない bug があった。
         let v_track_rect = vertical_scrollbar_rect(rect, need_h);
         let h_track_rect = horizontal_scrollbar_rect(rect, need_v);
-        let v_thumb_rect = if need_v {
-            Some(thumb_rect_vertical(v_track_rect, content_size.1, rect.h, 0.0, max_y))
-        } else {
-            None
-        };
-        let h_thumb_rect = if need_h {
-            Some(thumb_rect_horizontal(h_track_rect, content_size.0, rect.w, 0.0, max_x))
-        } else {
-            None
-        };
 
         let scrolled = scroll.0.abs() > 1e-4 || scroll.1.abs() > 1e-4;
-        let offset = {
+        let (offset, v_thumb_rect, h_thumb_rect) = {
             let state: &mut ScrollState = self.widget_state(wid);
             // wheel 適用 (winit 慣行: y > 0 = wheel up = view 上方向)。offset.y -= scroll.y
             // で「wheel down → offset 増 → 下のコンテンツが見える」になる。
             state.offset.0 = (state.offset.0 - scroll.0).clamp(0.0, max_x);
             state.offset.1 = (state.offset.1 - scroll.1).clamp(0.0, max_y);
+
+            // wheel 適用後の現在 offset で thumb_rect を計算 (drag hit-test + 描画で共有)。
+            let v_thumb_rect = if need_v {
+                Some(thumb_rect_vertical(
+                    v_track_rect,
+                    content_size.1,
+                    rect.h,
+                    state.offset.1,
+                    max_y,
+                ))
+            } else {
+                None
+            };
+            let h_thumb_rect = if need_h {
+                Some(thumb_rect_horizontal(
+                    h_track_rect,
+                    content_size.0,
+                    rect.w,
+                    state.offset.0,
+                    max_x,
+                ))
+            } else {
+                None
+            };
 
             // scrollbar drag 開始判定
             if pointer.primary_just_pressed
@@ -176,7 +193,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 state.drag = None;
             }
 
-            state.offset
+            (state.offset, v_thumb_rect, h_thumb_rect)
         };
 
         // wheel scroll / drag 中は次フレーム再描画を要求 (state 変化を視覚反映するため)
@@ -191,13 +208,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             f(ui, offset);
         });
 
-        // ---- 4. scrollbar 描画 (track + thumb) ----
-        if need_v {
+        // ---- 4. scrollbar 描画 (track + thumb)。drag hit-test と同一 thumb rect を使う ----
+        if let Some(thumb) = v_thumb_rect {
             let track_color = Color::rgba(1.0, 1.0, 1.0, 0.04);
             let thumb_color = Color::rgba(0.7, 0.75, 0.85, 0.55);
             let thumb_hover = Color::rgba(0.85, 0.90, 1.00, 0.80);
             self.push_rect(RectCommand::uniform_radius(v_track_rect, track_color, 2.0));
-            let thumb = thumb_rect_vertical(v_track_rect, content_size.1, rect.h, offset.1, max_y);
             let hovered = pointer.pos.is_some_and(|(px, py)| thumb.contains(px, py));
             self.push_rect(RectCommand::uniform_radius(
                 thumb,
@@ -205,12 +221,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 3.0,
             ));
         }
-        if need_h {
+        if let Some(thumb) = h_thumb_rect {
             let track_color = Color::rgba(1.0, 1.0, 1.0, 0.04);
             let thumb_color = Color::rgba(0.7, 0.75, 0.85, 0.55);
             let thumb_hover = Color::rgba(0.85, 0.90, 1.00, 0.80);
             self.push_rect(RectCommand::uniform_radius(h_track_rect, track_color, 2.0));
-            let thumb = thumb_rect_horizontal(h_track_rect, content_size.0, rect.w, offset.0, max_x);
             let hovered = pointer.pos.is_some_and(|(px, py)| thumb.contains(px, py));
             self.push_rect(RectCommand::uniform_radius(
                 thumb,
@@ -315,5 +330,91 @@ mod tests {
         let r = thumb_rect_vertical(track, 400.0, 200.0, 200.0, 200.0);
         // thumb_h = 100 (track 200 * 200/400)、frac = 1.0、thumb_y = 0 + (200 - 100) * 1 = 100
         assert_eq!(r.y, 100.0);
+    }
+
+    /// M9 Phase 45g (daw_01 conversation #010): scrolled 状態で thumb 位置を click → drag 開始
+    /// regression。旧実装は drag 判定用 thumb_rect が `offset = 0.0` で計算されたため、scrolled
+    /// 状態 (thumb が track 上端から離れた位置) を click しても hit-test が空振りして drag が始まら
+    /// なかった。修正後は **wheel 適用後の現在 `state.offset`** で thumb_rect を計算するので、
+    /// scrolled thumb 位置で click → drag が始まり、その後 pointer move で offset が動く。
+    #[test]
+    fn drag_starts_at_scrolled_thumb_position() {
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 400 };
+
+        // viewport 200、content 600 → max_y = 400、thumb_len = 200*200/600 ≈ 66.7 (THUMB_MIN_LEN
+        // 24 を超えるので clamp なし)。
+        let area = Rect { x: 0.0, y: 0.0, w: 100.0, h: 200.0 };
+        let content = (100.0_f32, 600.0_f32);
+        let max_y = (content.1 - area.h).max(0.0); // = 400
+
+        // 1) wheel で 200 px 下へスクロール (offset_y = 200)。
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((50.0, 50.0)),
+                scroll_delta: (0.0, -200.0),
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        };
+        let _ = host.frame_to_edits(&(), &mut scene, screen, input, |(), ui| {
+            ui.scroll_area("test", area, content, |_, _| {});
+        });
+
+        // 2) 次フレーム: thumb 描画位置 (現在 offset 反映) を計算。frac = 0.5 で thumb は track の
+        // 中央付近 (y > 1.0) に来る。
+        let track = vertical_scrollbar_rect(area, false);
+        let thumb_at_scrolled =
+            thumb_rect_vertical(track, content.1, area.h, 200.0, max_y);
+        assert!(
+            thumb_at_scrolled.y > 1.0,
+            "scrolled thumb は track 上端から離れる (旧 bug の root cause): y={}",
+            thumb_at_scrolled.y
+        );
+
+        // 3) scrolled thumb 位置を press。
+        let press_x = thumb_at_scrolled.x + 1.0;
+        let press_y = thumb_at_scrolled.y + 5.0;
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((press_x, press_y)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        };
+        let _ = host.frame_to_edits(&(), &mut scene, screen, input, |(), ui| {
+            ui.scroll_area("test", area, content, |_, _| {});
+        });
+
+        // 4) 30px 下に move + release。drag が成立していれば offset.1 が 200 から増える。
+        let observed = std::cell::Cell::new((0.0_f32, 0.0_f32));
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((press_x, press_y + 30.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        };
+        let _ = host.frame_to_edits(&(), &mut scene, screen, input, |(), ui| {
+            let off = ui.scroll_area("test", area, content, |_, _| {});
+            observed.set(off);
+        });
+        let off = observed.get();
+        // drag 成立 → offset.1 > 200 (下方向 drag で増)。旧 bug なら offset.1 == 200 のまま。
+        assert!(
+            off.1 > 200.0,
+            "scrolled thumb 位置からの下方向 drag で offset.1 が 200 から進む (got {})",
+            off.1
+        );
     }
 }
