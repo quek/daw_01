@@ -39,19 +39,7 @@ const COLOR_BTN_MUTE: Color = Color { r: 0.78, g: 0.35, b: 0.27, a: 1.0 };
 const COLOR_BTN_SOLO: Color = Color { r: 0.90, g: 0.78, b: 0.31, a: 1.0 };
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
-    // 全体背景
-    ui.heavy("arr_bg", |hctx| {
-        hctx.cached((area.w.to_bits(), area.h.to_bits()), |hctx| {
-            hctx.push_rect(RectCommand {
-                rect: area,
-                fill: COLOR_BG,
-                border: Color::TRANSPARENT,
-                border_width: 0.0,
-                radius: [0.0; 4],
-                clip_rect: None,
-            });
-        });
-    });
+    ui.panel("arr_bg", area, COLOR_BG, 0.0);
 
     let header_area = Rect {
         x: area.x,
@@ -76,14 +64,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // M8 Phase 32: file drop placeholder。実機能 (audio clip 化) は別フェーズ。
     // 今は status bar に drop されたパスを表示するのみ。
     if ui.is_file_hovering_in_rect(canvas_area) {
-        ui.push_rect(RectCommand {
-            rect: canvas_area,
-            fill: Color::TRANSPARENT,
-            border: Color::rgb(0.55, 0.85, 0.95),
-            border_width: 2.0,
-            radius: [0.0; 4],
-            clip_rect: None,
-        });
+        ui.panel_with_border(
+            "arr_file_drop_hint",
+            canvas_area,
+            Color::TRANSPARENT,
+            Color::rgb(0.55, 0.85, 0.95),
+            2.0,
+            0.0,
+        );
     }
     if let Some(paths) = ui.take_file_drop_in_rect(canvas_area) {
         let display = paths

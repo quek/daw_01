@@ -51,19 +51,7 @@ fn fader_to_amp(n: f32) -> f32 {
 }
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
-    // 背景
-    ui.heavy("mixer_bg", |hctx| {
-        hctx.cached((area.w.to_bits(), area.h.to_bits()), |hctx| {
-            hctx.push_rect(RectCommand {
-                rect: area,
-                fill: COLOR_BG,
-                border: Color::TRANSPARENT,
-                border_width: 0.0,
-                radius: [0.0; 4],
-                clip_rect: None,
-            });
-        });
-    });
+    ui.panel("mixer_bg", area, COLOR_BG, 0.0);
 
     let inner_pad = 8.0;
     let strip_y = area.y + inner_pad;
@@ -136,29 +124,7 @@ fn draw_strip(
     track_idx: u32,
     is_master: bool,
 ) {
-    // ストリップ背景。scroll_area 内では rect.x が offset で変動するので
-    // cache key に x/y bits を含める (含めないと stale rect を replay する)。
-    ui.heavy(("mixer_strip_bg", layout_idx), |hctx| {
-        hctx.cached(
-            (
-                rect.x.to_bits(),
-                rect.y.to_bits(),
-                rect.w.to_bits(),
-                rect.h.to_bits(),
-                bg.r.to_bits(),
-            ),
-            |hctx| {
-                hctx.push_rect(RectCommand {
-                    rect,
-                    fill: bg,
-                    border: Color::TRANSPARENT,
-                    border_width: 0.0,
-                    radius: [4.0; 4],
-                    clip_rect: None,
-                });
-            },
-        );
-    });
+    ui.panel(("mixer_strip_bg", layout_idx), rect, bg, 4.0);
 
     let pad = 6.0;
     let mut y = rect.y + pad;

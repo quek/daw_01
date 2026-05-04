@@ -2,7 +2,7 @@
 //! ノート未選択時はプレースホルダ表示。
 
 use daw_ui_core::{Edit, Ui};
-use daw_ui_renderer::{Color, Rect, RectCommand};
+use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent};
 
@@ -11,18 +11,7 @@ const COLOR_TEXT: Color = Color { r: 0.85, g: 0.88, b: 0.92, a: 1.0 };
 const COLOR_TEXT_DIM: Color = Color { r: 0.55, g: 0.58, b: 0.65, a: 1.0 };
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
-    ui.heavy("lyric_bg", |hctx| {
-        hctx.cached((area.w.to_bits(), area.h.to_bits()), |hctx| {
-            hctx.push_rect(RectCommand {
-                rect: area,
-                fill: COLOR_BG,
-                border: Color::TRANSPARENT,
-                border_width: 0.0,
-                radius: [0.0; 4],
-                clip_rect: None,
-            });
-        });
-    });
+    ui.panel("lyric_bg", area, COLOR_BG, 0.0);
 
     let pad = 8.0;
     ui.label_at(

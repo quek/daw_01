@@ -5,7 +5,7 @@
 //! ここでは持たない。
 
 use daw_ui_core::{Edit, Ui};
-use daw_ui_renderer::{Color, Rect, RectCommand};
+use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent};
 
@@ -13,19 +13,7 @@ const BG: Color = Color { r: 0.16, g: 0.16, b: 0.20, a: 1.0 };
 const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
-    // 背景
-    ui.heavy("transport_bg", |hctx| {
-        hctx.cached((area.w.to_bits(), area.h.to_bits()), |hctx| {
-            hctx.push_rect(RectCommand {
-                rect: area,
-                fill: BG,
-                border: Color::TRANSPARENT,
-                border_width: 0.0,
-                radius: [0.0; 4],
-                clip_rect: None,
-            });
-        });
-    });
+    ui.panel("transport_bg", area, BG, 0.0);
 
     let pad = 12.0;
     let mut x = area.x + pad;

@@ -11,7 +11,7 @@ use daw_ui_core::{
     Edit, MoveDelta, Note, NotesEditRequest, PianoRollStyle, PianoRollView, ResizeDelta, Ui,
     note_hit,
 };
-use daw_ui_renderer::{Color, Rect, RectCommand};
+use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent, ClipRef, DEFAULT_NOTE_DURATION};
 
@@ -24,18 +24,7 @@ const COLOR_HINT: Color = Color { r: 0.55, g: 0.58, b: 0.65, a: 1.0 };
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let Some(target) = app.selected_clip else {
         // クリップ未選択時のプレースホルダ
-        ui.heavy("pr_bg_empty", |hctx| {
-            hctx.cached((area.w.to_bits(), area.h.to_bits()), |hctx| {
-                hctx.push_rect(RectCommand {
-                    rect: area,
-                    fill: COLOR_BG,
-                    border: Color::TRANSPARENT,
-                    border_width: 0.0,
-                    radius: [0.0; 4],
-                    clip_rect: None,
-                });
-            });
-        });
+        ui.panel("pr_bg_empty", area, COLOR_BG, 0.0);
         ui.label_at(
             "pr_no_clip",
             "(\u{30af}\u{30ea}\u{30c3}\u{30d7}\u{304c}\u{9078}\u{629e}\u{3055}\u{308c}\u{3066}\u{3044}\u{307e}\u{305b}\u{3093})",

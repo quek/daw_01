@@ -6,7 +6,7 @@
 
 use daw_ui_core::{Edit, Ui};
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, Rect, RectCommand};
+use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent};
 use crate::view::{
@@ -24,18 +24,12 @@ pub fn build_root(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize)
     let sh = screen.height as f32;
 
     // 全画面背景。
-    ui.heavy("root_bg", |hctx| {
-        hctx.cached((screen.width, screen.height), |hctx| {
-            hctx.push_rect(RectCommand {
-                rect: Rect { x: 0.0, y: 0.0, w: sw, h: sh },
-                fill: Color::rgb(0.10, 0.10, 0.12),
-                border: Color::TRANSPARENT,
-                border_width: 0.0,
-                radius: [0.0; 4],
-                clip_rect: None,
-            });
-        });
-    });
+    ui.panel(
+        "root_bg",
+        Rect { x: 0.0, y: 0.0, w: sw, h: sh },
+        Color::rgb(0.10, 0.10, 0.12),
+        0.0,
+    );
 
     // ----- レイアウト計算 -----
     let menu_rect = Rect { x: 0.0, y: 0.0, w: sw, h: MENU_H };

@@ -19,19 +19,7 @@ const SECTION_TEXT: Color = Color { r: 0.55, g: 0.62, b: 0.78, a: 1.0 };
 const SCROLLBAR_RESERVE: f32 = 14.0;
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
-    // 背景
-    ui.heavy("inspector_bg", |hctx| {
-        hctx.cached((area.w.to_bits(), area.h.to_bits()), |hctx| {
-            hctx.push_rect(RectCommand {
-                rect: area,
-                fill: BG,
-                border: Color::TRANSPARENT,
-                border_width: 0.0,
-                radius: [0.0; 4],
-                clip_rect: None,
-            });
-        });
-    });
+    ui.panel("inspector_bg", area, BG, 0.0);
 
     let pad = 12.0;
     let mut y = area.y + pad;

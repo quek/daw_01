@@ -1,7 +1,7 @@
 //! 画面下端のステータスバー: ファイルパス / MIDI 入力 / status_message。
 
 use daw_ui_core::Ui;
-use daw_ui_renderer::{Color, Rect, RectCommand};
+use daw_ui_renderer::{Color, Rect};
 
 use crate::app::AppData;
 
@@ -10,18 +10,7 @@ const COLOR_TEXT: Color = Color { r: 0.65, g: 0.68, b: 0.72, a: 1.0 };
 const COLOR_MSG: Color = Color { r: 0.55, g: 0.85, b: 0.55, a: 1.0 };
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
-    ui.heavy("status_bg", |hctx| {
-        hctx.cached((area.w.to_bits(), area.h.to_bits()), |hctx| {
-            hctx.push_rect(RectCommand {
-                rect: area,
-                fill: COLOR_BG,
-                border: Color::TRANSPARENT,
-                border_width: 0.0,
-                radius: [0.0; 4],
-                clip_rect: None,
-            });
-        });
-    });
+    ui.panel("status_bg", area, COLOR_BG, 0.0);
 
     let pad = 12.0;
     let line_y = area.y + (area.h - 11.0) * 0.5;
