@@ -115,8 +115,11 @@ impl ApplicationHandler<AppEvent> for Runner {
         let dwin = Arc::new(DawGuiWindow::new(window));
         let renderer = Renderer::new(dwin.clone()).expect("Renderer::new");
 
-        let ui_window = dwin.clone();
-        let ui = UiHost::<AppData>::new(move || ui_window.request_redraw())
+        // `with_window` で `set_cursor_request` callback を `WindowBackend::set_cursor`
+        // に自動接続する。これが無いと widget 内の `Ui::set_cursor` 要求が OS まで
+        // 届かず、ピアノロール / アレンジビューの hover / drag でカーソル形状が
+        // 変わらない。
+        let ui = UiHost::<AppData>::with_window(dwin.clone())
             .with_history_capacity(200)
             .with_shortcut_map(daw_shortcut_map())
             .with_clipboard(ArboardClipboard::new());
