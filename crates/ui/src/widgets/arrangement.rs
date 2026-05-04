@@ -59,6 +59,10 @@ pub struct ArrangementTrack {
     pub muted: bool,
     pub solo: bool,
     pub clips: Vec<ArrangementClip>,
+    /// M10 Phase 47b: track volume (`0.0..=1.0`、`1.0` で unity)。
+    /// track header rect 内 buttons の下に horizontal slider band として描画される (`row_h` 余裕がある時のみ)。
+    /// 将来 `ArrangementClip.volume` を再導入する場合は `effective = track.volume * clip.volume` の乗算 (DAW 標準)。
+    pub volume: f32,
 }
 
 /// arrangement の view 状態 (pan / zoom / playhead / loop)。値渡し (Copy)。
@@ -151,6 +155,9 @@ pub enum ArrangementEditRequest {
     /// M10 Phase 46: track header drag&drop による並び替え。`order` は新順での `track.id` 列。
     /// `MoveTrackUp/Down` は keep (button / keyboard 用)、`ReorderTracks` は drag&drop 用。
     ReorderTracks(Vec<u32>),
+    /// M10 Phase 47b: track header の bottom band slider drag による volume 編集。
+    /// `next` は `0.0..=1.0` で widget 側 clamp 済み。`prev/next` で Undoable 化容易。
+    SetTrackVolume { track: u32, prev: f32, next: f32 },
     ToggleTrackMute(u32),
     ToggleTrackSolo(u32),
     SetLoopRange { start: f64, end: f64 },
@@ -177,6 +184,8 @@ pub struct ArrangementResponse {
     pub ruler_rect: Rect,
     /// M10 Phase 46: drag 中の track id (`Some` なら header reorder drag セッションが進行中)。
     pub reordering: Option<u32>,
+    /// M10 Phase 47b: drag 中の track id (`Some` なら header volume slider drag セッションが進行中)。
+    pub dragging_track_volume: Option<u32>,
 }
 
 impl Default for ArrangementResponse {
@@ -192,6 +201,7 @@ impl Default for ArrangementResponse {
             track_header_rects: Vec::new(),
             ruler_rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             reordering: None,
+            dragging_track_volume: None,
         }
     }
 }
@@ -237,6 +247,14 @@ pub struct ArrangementStyle {
     pub reorder_drop_indicator_h: f32,
     /// drag 中 row 複製の不透明度 (`0.0..1.0`、`1.0` で完全不透明)。RGB は元 row 色 (selected/header) を使う。
     pub reorder_drag_alpha: f32,
+    /// M10 Phase 47b: track header bottom band slider の縦幅 (px、`0.0` で disable)。
+    /// 必要 row_h の目安は `pad*2 + btn_h + gap + band_h` (default で `4*2 + 20 + 2 + 4 = 34px`、
+    /// 32px row では非表示 = progressive disclosure。Phase 48 縦ズームで row_h を上げると表示される)。
+    pub track_volume_band_h: f32,
+    /// volume band の trough (背景) 色。
+    pub track_volume_band_track: Color,
+    /// volume band の fill (volume 値表示) 色。
+    pub track_volume_band_fill: Color,
 }
 
 impl Default for ArrangementStyle {
@@ -299,6 +317,9 @@ impl Default for ArrangementStyle {
             reorder_drop_indicator: Color::rgb(0.50, 0.85, 1.0),
             reorder_drop_indicator_h: 2.0,
             reorder_drag_alpha: 0.6,
+            track_volume_band_h: 4.0,
+            track_volume_band_track: Color::rgba(0.0, 0.0, 0.0, 0.45),
+            track_volume_band_fill: Color::rgb(0.95, 0.95, 0.97),
         }
     }
 }
@@ -462,6 +483,16 @@ pub fn compute_reorder_target_index(
     }
 }
 
+/// M10 Phase 47b: `mouse_x` から band 内の volume 値 (`0.0..=1.0`) を計算。
+/// `band_w <= 0` で `0.0` を返す (ガード)。
+#[must_use]
+pub fn volume_from_mouse_x(mouse_x: f32, band_x: f32, band_w: f32) -> f32 {
+    if band_w <= 0.0 {
+        return 0.0;
+    }
+    ((mouse_x - band_x) / band_w).clamp(0.0, 1.0)
+}
+
 /// M10 Phase 46: anchor を抜き取って target に挿入した新順 `Vec<u32>` を返す。
 /// `anchor_index >= ids.len()` または `target_index > ids.len()-1` (after remove) でも安全に clamp。
 #[must_use]
@@ -476,16 +507,19 @@ pub fn apply_reorder(ids: &[u32], anchor_index: usize, target_index: usize) -> V
     v
 }
 
-/// track header 1 行内のレイアウト (Name button + 5 small buttons + drop indicator)。
-/// `name_rect` (= drag start zone & text area)、`buttons` (= [M, S, Up, Dn, Del])、`inner` (padded row)。
+/// track header 1 行内のレイアウト (Name button + 5 small buttons + 任意の volume band)。
+/// `name_rect` (= drag start zone & text area)、`buttons` (= [M, S, Up, Dn, Del])、
+/// `volume_band` は inner 下部に band 用の余裕がある時のみ `Some` (Phase 47b)。
 struct HeaderRowLayout {
     inner: Rect,
     name_rect: Rect,
     buttons: [Rect; 5],
+    /// M10 Phase 47b: track volume band rect (`row_h` 余裕がある時のみ Some)。
+    volume_band: Option<Rect>,
 }
 
 #[allow(clippy::similar_names)]
-fn header_row_layout(row: Rect) -> HeaderRowLayout {
+fn header_row_layout(row: Rect, volume_band_h: f32) -> HeaderRowLayout {
     let pad = 4.0_f32;
     let inner = Rect {
         x: row.x + pad,
@@ -493,6 +527,7 @@ fn header_row_layout(row: Rect) -> HeaderRowLayout {
         w: (row.w - pad * 2.0).max(2.0),
         h: (row.h - pad * 2.0).max(2.0),
     };
+    // buttons は常に 20px max (band の有無で縮めない)。band は inner.h に余裕があるときだけ表示する。
     let btn_h = inner.h.min(20.0);
     let small = 22.0_f32;
     let gap = 2.0_f32;
@@ -505,7 +540,21 @@ fn header_row_layout(row: Rect) -> HeaderRowLayout {
         *slot = Rect { x: x_cursor, y: inner.y, w: small, h: btn_h };
         x_cursor += small + gap;
     }
-    HeaderRowLayout { inner, name_rect, buttons }
+    // band 表示条件: band_h > 0 && buttons の下に gap + band 分が収まる (progressive disclosure)。
+    // default (`track_volume_band_h=4` / `gap=2`) なら inner.h >= 26 (= row_h >= 34) で表示。
+    let band_h = volume_band_h.max(0.0);
+    let band_gap = 2.0_f32;
+    let volume_band = if band_h > 0.0 && btn_h + band_gap + band_h <= inner.h {
+        Some(Rect {
+            x: inner.x,
+            y: inner.y + btn_h + band_gap,
+            w: inner.w,
+            h: band_h,
+        })
+    } else {
+        None
+    };
+    HeaderRowLayout { inner, name_rect, buttons, volume_band }
 }
 
 // ============================================================
@@ -559,11 +608,23 @@ struct TrackReorderSession {
     last_mouse_y: f32,
 }
 
+/// M10 Phase 47b: track header の bottom band slider drag による volume 編集セッション。
+#[derive(Clone, Copy, Debug)]
+struct TrackVolumeDragSession {
+    track_id: u32,
+    anchor_volume: f32,
+    /// drag 開始時の band rect (mouse_x → 0..1 マップに使用、release frame に view が変化しても安定)。
+    band_rect: Rect,
+    /// drag 中の最終 mouse x 位置 (release frame の `pointer.pos` に頼らない保険)。
+    last_mouse_x: f32,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ArrangementState {
     clip_drag: Option<ClipDragSession>,
     loop_drag: Option<LoopDragSession>,
     track_reorder: Option<TrackReorderSession>,
+    track_volume_drag: Option<TrackVolumeDragSession>,
 }
 
 // ============================================================
@@ -1022,9 +1083,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     last_mouse_x: px,
                 });
             }
-            // M10 Phase 46: track header drag (reorder) を press で検出。
-            // header_pane 内 + Name button area を含む row + M/S/Up/Dn/Del button rect 非 hit のとき start。
-            // 16px 未満 drag は release で click 格下げ (= button_at の SelectTrack / ↑/↓ button が代替)。
+            // M10 Phase 46+47b: track header press 振り分け
+            //  - volume band 内 → TrackVolumeDragSession (priority 最高)
+            //  - 上記以外 + Name button area を含む row + M/S/Up/Dn/Del button rect 非 hit → reorder
+            //  - 16px 未満 drag は release で click 格下げ (button_at の SelectTrack / ↑↓ button が代替)
             if header_w > 0.0
                 && header_pane.contains(px, py)
                 && let Some(idx) =
@@ -1034,16 +1096,28 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let row_y = header_pane.y - view.track_top + idx as f32 * view.track_row_h;
                 let row =
                     Rect { x: header_pane.x, y: row_y, w: header_pane.w, h: view.track_row_h };
-                let layout = header_row_layout(row);
-                let in_small_button = layout.buttons.iter().any(|b| b.contains(px, py));
-                if !in_small_button {
+                let layout = header_row_layout(row, style.track_volume_band_h);
+                if let Some(band) = layout.volume_band
+                    && band.contains(px, py)
+                {
                     let state: &mut ArrangementState = self.widget_state(wid);
-                    state.track_reorder = Some(TrackReorderSession {
-                        anchor_track_id: t.id,
-                        anchor_index: idx,
-                        anchor_mouse_y: py,
-                        last_mouse_y: py,
+                    state.track_volume_drag = Some(TrackVolumeDragSession {
+                        track_id: t.id,
+                        anchor_volume: t.volume.clamp(0.0, 1.0),
+                        band_rect: band,
+                        last_mouse_x: px,
                     });
+                } else {
+                    let in_small_button = layout.buttons.iter().any(|b| b.contains(px, py));
+                    if !in_small_button {
+                        let state: &mut ArrangementState = self.widget_state(wid);
+                        state.track_reorder = Some(TrackReorderSession {
+                            anchor_track_id: t.id,
+                            anchor_index: idx,
+                            anchor_mouse_y: py,
+                            last_mouse_y: py,
+                        });
+                    }
                 }
             }
         }
@@ -1062,6 +1136,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
             if let Some(ref mut tr) = state.track_reorder {
                 tr.last_mouse_y = py;
+            }
+            if let Some(ref mut tv) = state.track_volume_drag {
+                tv.last_mouse_x = px;
             }
         }
         // 2) drag overlay 計算用に clone を取る (last_mouse を更新した後)。
@@ -1113,6 +1190,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 None
             };
 
+        // M10 Phase 47b: track volume drag session の overlay 用 clone と release 取り出し。
+        let track_volume_session: Option<TrackVolumeDragSession> = {
+            let state: &mut ArrangementState = self.widget_state(wid);
+            state.track_volume_drag
+        };
+        let track_volume_release: Option<TrackVolumeDragSession> =
+            if pointer.primary_just_released {
+                let state: &mut ArrangementState = self.widget_state(wid);
+                state.track_volume_drag.take()
+            } else {
+                None
+            };
+
         // drag overlay delta (last_mouse ベース、release と一貫)
         let beat_per_px = view.len_beats / f64::from(lanes.w.max(1.0));
         let row_per_px = 1.0_f32 / view.track_row_h.max(1.0);
@@ -1158,6 +1248,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
         response.dragging = clip_drag_session.as_ref().map(|nd| nd.kind);
         response.reordering = track_reorder_session.map(|tr| tr.anchor_track_id);
+        response.dragging_track_volume = track_volume_session.map(|tv| tv.track_id);
 
         // ---- cursor ----
         // drag 中 / hover 中の clip 上 / それ以外で arrangement 内なら明示的に Default
@@ -1170,6 +1261,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.set_cursor(cur);
         } else if response.reordering.is_some() {
             self.set_cursor(CursorIcon::Move);
+        } else if response.dragging_track_volume.is_some() {
+            self.set_cursor(CursorIcon::EwResize);
         } else if let Some(zone) = response.hovered_zone {
             let cur = match zone {
                 ClipDragKind::Move => CursorIcon::Move,
@@ -1473,6 +1566,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
+        // ---- M10 Phase 47b: track volume drag release → SetTrackVolume ----
+        if let Some(tv) = track_volume_release {
+            let next = volume_from_mouse_x(tv.last_mouse_x, tv.band_rect.x, tv.band_rect.w);
+            if (next - tv.anchor_volume).abs() > 1e-4 {
+                self.push_edit(make_edit(ArrangementEditRequest::SetTrackVolume {
+                    track: tv.track_id,
+                    prev: tv.anchor_volume,
+                    next,
+                }));
+            }
+        }
+
         // ---- Shift+drag rect select (lanes 内で加算) ----
         let drag_rect_wid = wid.child(b"rect_select");
         let shift_rect_active = {
@@ -1569,13 +1674,40 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     self.panel(("arr_thbg", t.id), row, style.header_bg, 0.0);
                 }
 
-                let layout = header_row_layout(row);
+                let layout = header_row_layout(row, style.track_volume_band_h);
                 let inner = layout.inner;
                 let name_rect = layout.name_rect;
                 let [m_rect, s_rect, up_rect, dn_rect, del_rect] = layout.buttons;
                 let _ = inner;
                 let button_zones: [Rect; 6] =
                     [name_rect, m_rect, s_rect, up_rect, dn_rect, del_rect];
+
+                // M10 Phase 47b: track volume band 描画。
+                // drag 中の track はその drag session の last_mouse_x で preview volume を計算 (リアルタイム feedback)。
+                if let Some(band) = layout.volume_band {
+                    let dragging_this = track_volume_session
+                        .filter(|tv| tv.track_id == t.id);
+                    let display_v = if let Some(tv) = dragging_this {
+                        volume_from_mouse_x(tv.last_mouse_x, tv.band_rect.x, tv.band_rect.w)
+                    } else {
+                        t.volume.clamp(0.0, 1.0)
+                    };
+                    self.panel(
+                        ("arr_tvol_track", t.id),
+                        band,
+                        style.track_volume_band_track,
+                        0.0,
+                    );
+                    let fill_w = band.w * display_v;
+                    if fill_w > 0.0 {
+                        self.panel(
+                            ("arr_tvol_fill", t.id),
+                            Rect { x: band.x, y: band.y, w: fill_w, h: band.h },
+                            style.track_volume_band_fill,
+                            0.0,
+                        );
+                    }
+                }
 
                 let id_name = ("arr_tname", t.id);
                 let id_mute = ("arr_tmute", t.id);
@@ -1684,6 +1816,7 @@ mod tests {
             muted: false,
             solo: false,
             clips,
+            volume: 1.0,
         }
     }
 
@@ -1927,6 +2060,59 @@ mod tests {
     fn apply_reorder_safe_on_oob() {
         assert_eq!(apply_reorder(&[1, 2, 3], 5, 0), vec![1, 2, 3]); // anchor OOB
         assert_eq!(apply_reorder(&[], 0, 0), Vec::<u32>::new()); // empty
+    }
+
+    // M10 Phase 47b: track header volume
+    #[test]
+    fn volume_from_mouse_x_basic() {
+        // band_x=100, band_w=200 → mouse=100 → 0.0、200 → 0.5、300 → 1.0
+        assert!((volume_from_mouse_x(100.0, 100.0, 200.0) - 0.0).abs() < 1e-6);
+        assert!((volume_from_mouse_x(200.0, 100.0, 200.0) - 0.5).abs() < 1e-6);
+        assert!((volume_from_mouse_x(300.0, 100.0, 200.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn volume_from_mouse_x_clamps_outside() {
+        assert!((volume_from_mouse_x(50.0, 100.0, 200.0) - 0.0).abs() < 1e-6);
+        assert!((volume_from_mouse_x(500.0, 100.0, 200.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn volume_from_mouse_x_zero_width_safe() {
+        assert!((volume_from_mouse_x(100.0, 100.0, 0.0) - 0.0).abs() < 1e-6);
+        assert!((volume_from_mouse_x(100.0, 100.0, -10.0) - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn header_row_layout_hides_band_at_default_row_h() {
+        // default row_h=32 → inner_h=24、btn=20 + gap=2 + band=4 = 26 > 24 → 非表示
+        let row = Rect { x: 0.0, y: 0.0, w: 200.0, h: 32.0 };
+        let layout = header_row_layout(row, 4.0);
+        assert!(layout.volume_band.is_none(), "default 32px row では band 非表示 (progressive disclosure)");
+    }
+
+    #[test]
+    fn header_row_layout_shows_band_when_large_enough() {
+        // row_h=34 → inner_h=26 = 20+2+4 → ぎりぎり表示
+        let row = Rect { x: 0.0, y: 0.0, w: 200.0, h: 34.0 };
+        let layout = header_row_layout(row, 4.0);
+        assert!(layout.volume_band.is_some(), "row_h=34 で band 表示開始");
+
+        // row_h=48 で十分余裕あり
+        let row = Rect { x: 0.0, y: 0.0, w: 200.0, h: 48.0 };
+        let layout = header_row_layout(row, 4.0);
+        assert!(layout.volume_band.is_some(), "row_h=48 で band 表示");
+        let band = layout.volume_band.unwrap();
+        assert!((band.h - 4.0).abs() < 1e-6, "band の高さ = volume_band_h");
+        assert!(band.y > layout.buttons[0].y, "band は buttons の下に来る");
+    }
+
+    #[test]
+    fn header_row_layout_hides_band_when_volume_band_h_zero() {
+        // band_h=0 → 常に非表示 (disable)
+        let row = Rect { x: 0.0, y: 0.0, w: 200.0, h: 100.0 };
+        let layout = header_row_layout(row, 0.0);
+        assert!(layout.volume_band.is_none(), "band_h=0 で disable");
     }
 
     // M10 Phase 48: vertical zoom (Alt+wheel)

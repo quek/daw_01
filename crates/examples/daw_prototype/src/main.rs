@@ -45,6 +45,8 @@ struct DawTrack {
     solo: bool,
     next_clip_id: u32,
     clips: Vec<DawClip>,
+    /// M10 Phase 47b: track volume (`0.0..=1.0`、`1.0` で unity)。
+    volume: f32,
 }
 
 struct DawModel {
@@ -99,6 +101,7 @@ impl DawModel {
                 solo: false,
                 next_clip_id: 2,
                 clips,
+                volume: 0.75,
             });
         }
         let arr_view = ArrangementView {
@@ -106,7 +109,9 @@ impl DawModel {
             len_beats: 24.0,
             track_top: 0.0,
             tracks_visible: 8.0,
-            track_row_h: 32.0,
+            // M10 Phase 47b: track header の volume band を表示するため row_h を 36px に (>= 34px が表示閾値)。
+            // Phase 48 の Alt+wheel 縦ズームで動的変更可能。
+            track_row_h: 36.0,
             header_w: 180.0,
             ruler_h: 24.0,
             playhead_beat: Some(2.0),
@@ -601,6 +606,7 @@ fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
             name: Arc::clone(&t.name),
             muted: t.muted,
             solo: t.solo,
+            volume: t.volume,
             clips: t
                 .clips
                 .iter()
@@ -751,6 +757,15 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 mm.arr_view.data_generation += 1;
                 mm.last_action = format!("arr: MoveTrackDown {id}");
             }),
+            ArrangementEditRequest::SetTrackVolume { track, prev: _, next } => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == track) {
+                        t.volume = next.clamp(0.0, 1.0);
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!("arr: SetTrackVolume {track} → {:.2}", next.clamp(0.0, 1.0));
+                })
+            }
             ArrangementEditRequest::ReorderTracks(order) => Edit::mutate(move |mm: &mut DawModel| {
                 let n = order.len();
                 // id → DawTrack の lookup table を作って、order 順で並べ直す。
