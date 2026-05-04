@@ -121,6 +121,12 @@ cargo clippy --workspace -- -D warnings
 - 同じデータを複数箇所に複製しない
 - 「この値は誰が所有し、誰が更新するか」を明確にしてから実装する
 
+### まず調べる
+- 設計提案・前提確認・実装方針を書く前に、必ず一次情報を調査する
+- 公式ドキュメント (Ardour manual / REAPER manual / clap repo / cpal docs / windows API docs 等)、spec ファイル (clap/ext/*.h / VST3 spec)、参照実装ソース (sing_like_coding / gui_01 / clap-host / nih-plug 等) を読む
+- ユーザーの発言は調査の方向ヒントとして扱い、最終根拠は一次情報で取る。引用 URL や行番号付きで書く
+- 推測で書かない
+
 ### 外部 API の挙動を先に理解する
 - 推測で実装→失敗→修正のサイクルは、調査→実装より遅い
 - CLAP / clap-sys / cpal / winit / wgpu / gui_01 (daw-ui) / windows crate の挙動はドキュメント・ソースで確認してから組む

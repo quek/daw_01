@@ -1,10 +1,32 @@
+use std::cell::Cell;
 use std::ffi::{CStr, c_char, c_void};
 
 use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_host_gui};
+use clap_sys::ext::thread_check::{CLAP_EXT_THREAD_CHECK, clap_host_thread_check};
 use clap_sys::host::clap_host;
 use clap_sys::version::CLAP_VERSION;
 
 use crate::plugin_instance::HostCallbacks;
+
+thread_local! {
+    /// Set to `true` on each process_server worker thread by
+    /// `mark_audio_thread`; left `false` everywhere else (plugin-main /
+    /// IPC / GUI). Read by the CLAP `thread_check` extension callback so
+    /// plugins can validate they aren't calling main-thread-only APIs
+    /// from inside `process()`.
+    static IS_AUDIO_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Mark the calling thread as a CLAP "audio thread". Call this once per
+/// worker thread (right after the priority boost) so the plugin's
+/// `is_audio_thread()` check sees `true` while `plugin.process()` runs.
+pub fn mark_audio_thread() {
+    IS_AUDIO_THREAD.with(|c| c.set(true));
+}
+
+fn is_audio_thread_tls() -> bool {
+    IS_AUDIO_THREAD.with(|c| c.get())
+}
 
 const NAME: &CStr = c"daw_01";
 const VENDOR: &CStr = c"daw_01";
@@ -20,6 +42,7 @@ pub struct Host {
     /// below. `#[repr(C)]` makes the offset deterministic.
     pub clap: clap_host,
     pub clap_gui: clap_host_gui,
+    pub clap_thread_check: clap_host_thread_check,
     pub callbacks: HostCallbacks,
 }
 
@@ -44,6 +67,10 @@ impl Host {
                 request_show: Some(gui_request_show),
                 request_hide: Some(gui_request_hide),
                 closed: Some(gui_closed),
+            },
+            clap_thread_check: clap_host_thread_check {
+                is_main_thread: Some(thread_check_is_main_thread),
+                is_audio_thread: Some(thread_check_is_audio_thread),
             },
             callbacks,
         });
@@ -88,7 +115,20 @@ unsafe extern "C" fn get_extension(
     if id_cstr == CLAP_EXT_GUI {
         return std::ptr::from_ref(&this.clap_gui) as *const c_void;
     }
+    if id_cstr == CLAP_EXT_THREAD_CHECK {
+        return std::ptr::from_ref(&this.clap_thread_check) as *const c_void;
+    }
     std::ptr::null()
+}
+
+// --- clap_host_thread_check entries --------------------------------------
+
+unsafe extern "C" fn thread_check_is_main_thread(_host: *const clap_host) -> bool {
+    !is_audio_thread_tls()
+}
+
+unsafe extern "C" fn thread_check_is_audio_thread(_host: *const clap_host) -> bool {
+    is_audio_thread_tls()
 }
 
 unsafe extern "C" fn request_restart(_host: *const clap_host) {

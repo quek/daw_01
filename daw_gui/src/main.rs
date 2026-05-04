@@ -349,9 +349,6 @@ fn spawn_incoming_bridge(
                 ChildToMain::SlotGuiClosed { track, slot } => {
                     Some(AppEvent::GuiClosedFromChild { track, slot })
                 }
-                ChildToMain::ExportWavComplete { error } => {
-                    Some(AppEvent::ExportWavComplete { error })
-                }
                 ChildToMain::SlotPluginLoaded {
                     track,
                     slot,

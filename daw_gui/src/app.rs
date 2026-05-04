@@ -706,10 +706,6 @@ pub enum AppEvent {
     // -------- VOICEVOX ----------------------------------------------------
     SynthesizeVocal,
     VocalSynthCompleted,
-
-    // -------- Export ------------------------------------------------------
-    ExportWav,
-    ExportWavComplete { error: Option<String> },
 }
 
 impl AppData {
@@ -793,7 +789,7 @@ impl AppData {
             AppEvent::EndDrag => {
                 self.is_dragging = false;
                 let song = self.song.clone();
-                self.send_both(MainToChild::LoadSong(song));
+                self.send_audio(MainToChild::LoadSong(song));
             }
             AppEvent::MidiNoteOn { pitch, velocity } => {
                 self.handle_midi_note_on(pitch, velocity);
@@ -947,16 +943,6 @@ impl AppData {
             AppEvent::TrackPeaksTick(peaks) => {
                 self.on_track_peaks_tick(&peaks);
             }
-            AppEvent::ExportWav => {
-                self.action_export_wav();
-            }
-            AppEvent::ExportWavComplete { error } => {
-                if let Some(e) = error {
-                    self.status_message = format!("WAV 書き出し失敗: {e}");
-                } else {
-                    self.status_message = "WAV 書き出し完了".to_string();
-                }
-            }
             AppEvent::SynthesizeVocal => {
                 self.status_message = "VOICEVOX 合成中...".to_string();
                 self.begin_vocal_synth();
@@ -997,8 +983,7 @@ impl AppData {
     /// audio engine and the plugin host both need (LoadSong, mixer
     /// strip changes, etc.).
     fn send_both(&self, msg: MainToChild) {
-        self.send_audio(msg.clone());
-        self.send_plugin(msg);
+        self.send_audio(msg);
     }
 
     fn sync_song_to_plugin_host(&mut self) {
@@ -1007,7 +992,7 @@ impl AppData {
             return;
         }
         let song = self.song.clone();
-        self.send_both(MainToChild::LoadSong(song));
+        self.send_audio(MainToChild::LoadSong(song));
     }
 
     // -------- File ----------------------------------------------------------
@@ -1214,7 +1199,7 @@ impl AppData {
 
     fn play(&mut self) {
         let song = self.song.clone();
-        self.send_both(MainToChild::LoadSong(song));
+        self.send_audio(MainToChild::LoadSong(song));
         self.send_audio(MainToChild::Play);
         self.send_plugin(MainToChild::Play);
         self.is_playing = true;
@@ -2254,7 +2239,7 @@ impl AppData {
                 common::audio_bridge::SAMPLE_RATE as f64 * 60.0 / song_snapshot.bpm as f64;
             let clip_start_samples = (clip_start_beat * samples_per_beat).max(0.0) as u64;
 
-            self.send_plugin(MainToChild::SetVocalAudio {
+            self.send_audio(MainToChild::SetVocalAudio {
                 track: r.track,
                 clip: r.clip,
                 clip_start_samples,
@@ -2314,12 +2299,8 @@ impl AppData {
         if let Some(t) = self.song.tracks.get_mut(track as usize) {
             t.volume = v;
         }
-        // A2: daw_audio is the mixer now, so send to both children.
-        // plugin_host still listens for the legacy audio thread but
-        // ignores the message there once that path is removed.
         let msg = MainToChild::SetTrackVolume { track, volume: v };
-        self.send_audio(msg.clone());
-        self.send_plugin(msg);
+        self.send_audio(msg);
     }
 
     fn set_track_pan(&mut self, track: u32, pan: f32) {
@@ -2328,8 +2309,7 @@ impl AppData {
             t.pan = p;
         }
         let msg = MainToChild::SetTrackPan { track, pan: p };
-        self.send_audio(msg.clone());
-        self.send_plugin(msg);
+        self.send_audio(msg);
     }
 
     fn toggle_track_mute(&mut self, track: u32) {
@@ -2339,8 +2319,7 @@ impl AppData {
         t.muted = !t.muted;
         let muted = t.muted;
         let msg = MainToChild::SetTrackMuted { track, muted };
-        self.send_audio(msg.clone());
-        self.send_plugin(msg);
+        self.send_audio(msg);
     }
 
     fn toggle_track_solo(&mut self, track: u32) {
@@ -2350,8 +2329,7 @@ impl AppData {
         t.solo = !t.solo;
         let solo = t.solo;
         let msg = MainToChild::SetTrackSolo { track, solo };
-        self.send_audio(msg.clone());
-        self.send_plugin(msg);
+        self.send_audio(msg);
     }
 
     fn on_track_peaks_tick(&mut self, peaks: &[(f32, f32)]) {
@@ -2420,18 +2398,6 @@ impl AppData {
             .unwrap_or_else(|| plugin_id.to_string())
     }
 
-    fn action_export_wav(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("WAV", &["wav"])
-            .save_file()
-        else {
-            return;
-        };
-        self.status_message = "WAV 書き出し中...".to_string();
-        let song = self.song.clone();
-        self.send_both(MainToChild::LoadSong(song));
-        self.send_plugin(MainToChild::ExportWav { path });
-    }
 }
 
 // ---------------------------------------------------------------------------

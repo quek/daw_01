@@ -7,9 +7,16 @@ edition.workspace = true
 common = { path = "../common" }
 anyhow.workspace = true
 arc-swap.workspace = true
+assert_no_alloc = { workspace = true, optional = true }
 cpal.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+
+[features]
+# Debug-only: detects heap allocations in audio worker threads at
+# runtime. Build with `--features rt-assert` to catch RT violations
+# (Vec::push, format!, etc.) before they cause dropouts.
+rt-assert = ["dep:assert_no_alloc"]

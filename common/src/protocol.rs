@@ -37,10 +37,6 @@ pub enum ChildToMain {
         kind: ChildKind,
         pid: u32,
     },
-    /// Offline WAV export finished (or failed).
-    ExportWavComplete {
-        error: Option<String>,
-    },
     /// Plugin-host confirmed `SetSlotPlugin` and reported the stable id /
     /// display name of the descriptor that actually loaded.
     /// `plugin_id` is the host's session-unique identifier for this
@@ -115,19 +111,10 @@ pub enum MainToChild {
     LoadSong(crate::model::Song),
     SetLoop(bool),
     SetMasterGain(f32),
-    /// Per-track mixer parameter changes. plugin_host applies each to the
-    /// matching audio-thread-visible `TrackAudioParams` atomic without
-    /// stopping the audio thread.
     /// Pre-rendered vocal audio for a single clip on a track. `samples`
     /// is mono f32, `sample_rate` matches `AudioSession::sample_rate` (or
     /// is resampled by the host). `clip_start_samples` is the absolute
     /// sample offset within the song where this clip begins.
-    /// Offline-render the entire song to a WAV file. plugin_host runs the
-    /// render on the plugin-main thread (audio thread stopped), then
-    /// replies with `ChildToMain::ExportWavComplete`.
-    ExportWav {
-        path: std::path::PathBuf,
-    },
     SetVocalAudio {
         track: u32,
         clip: u32,

@@ -20,6 +20,8 @@ pub mod worker_bridge;
 #[cfg(windows)]
 pub mod client;
 #[cfg(windows)]
+pub mod mmcss;
+#[cfg(windows)]
 pub mod pipe;
 #[cfg(windows)]
 pub mod win_sem;

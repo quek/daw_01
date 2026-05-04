@@ -96,9 +96,6 @@ fn draw_menu_bar(ui: &mut Ui<'_, AppData>, rect: Rect) {
             m.item("Save As...", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::SaveAs)));
             });
-            m.item("Export WAV...", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ExportWav)));
-            });
         });
         mb.menu("Edit", |m| {
             m.item("Undo", |ui| {
@@ -165,12 +162,6 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>) {
             app.handle_event(AppEvent::SaveAs)
         }));
     }
-    if ui.take_shortcut("daw.export_wav") {
-        ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.handle_event(AppEvent::ExportWav)
-        }));
-    }
-
     // ----- Edit -----
     // Task A 段階: 既存の自前 Undo/Redo (AppEvent::Undo/Redo) に流す。
     // Task B で `ui.request_undo()` / `ui.request_redo()` に切り替える。

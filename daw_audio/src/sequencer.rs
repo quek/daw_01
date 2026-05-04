@@ -131,3 +131,216 @@ pub fn collect_events_for_buffer(
         (e.time, priority)
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::model::{Clip, Note, Track};
+
+    fn one_note_song(start_beat: f64, duration_beats: f64, pitch: u8) -> Song {
+        Song {
+            bpm: 120.0,
+            tracks: vec![Track {
+                name: "T".into(),
+                clips: vec![Clip {
+                    id: 1,
+                    name: "C".into(),
+                    start_beat: 0.0,
+                    length_beats: 8.0,
+                    notes: vec![Note {
+                        start_beat,
+                        duration_beats,
+                        pitch,
+                        velocity: 100,
+                        lyric: None,
+                    }],
+                }],
+                ..Track::default()
+            }],
+            ..Song::default()
+        }
+    }
+
+    /// 120 BPM, 48 kHz: samples_per_beat = 24000.
+    const SR: u32 = 48000;
+    const SPB: u64 = 24_000;
+
+    #[test]
+    fn note_starting_at_buffer_zero_emits_on_at_time_zero() {
+        let song = one_note_song(0.0, 1.0, 60);
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect_events_for_buffer(Some(&song), 0, SR, 0, 1024, &mut out, &mut active);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].time, 0);
+        assert!(matches!(out[0].event, NoteTransition::On { key: 60, .. }));
+        assert_eq!(active, vec![60]);
+    }
+
+    #[test]
+    fn note_off_emitted_in_buffer_containing_end() {
+        let song = one_note_song(0.0, 1.0, 60);
+        let mut out = Vec::new();
+        let mut active = vec![60u8];
+        collect_events_for_buffer(
+            Some(&song),
+            0,
+            SR,
+            SPB - 100,
+            200,
+            &mut out,
+            &mut active,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].event, NoteTransition::Off { key: 60 }));
+        assert!(active.is_empty(), "active set must drop the off note");
+    }
+
+    #[test]
+    fn note_entirely_inside_buffer_emits_on_then_off() {
+        let song = one_note_song(0.0, 0.01, 60);
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect_events_for_buffer(Some(&song), 0, SR, 0, 1024, &mut out, &mut active);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0].event, NoteTransition::On { key: 60, .. }));
+        assert!(matches!(out[1].event, NoteTransition::Off { key: 60 }));
+        assert!(out[0].time < out[1].time);
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn chord_emits_two_ons_at_same_time() {
+        let mut song = one_note_song(0.0, 1.0, 60);
+        if let Some(clip) = song.tracks[0].clips.first_mut() {
+            clip.notes.push(Note {
+                start_beat: 0.0,
+                duration_beats: 1.0,
+                pitch: 64,
+                velocity: 100,
+                lyric: None,
+            });
+        }
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect_events_for_buffer(Some(&song), 0, SR, 0, 1024, &mut out, &mut active);
+        assert_eq!(out.len(), 2);
+        for e in &out {
+            assert_eq!(e.time, 0);
+            assert!(matches!(e.event, NoteTransition::On { .. }));
+        }
+        active.sort_unstable();
+        assert_eq!(active, vec![60, 64]);
+    }
+
+    #[test]
+    fn no_song_returns_empty() {
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect_events_for_buffer(None, 0, SR, 0, 1024, &mut out, &mut active);
+        assert!(out.is_empty());
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn note_outside_buffer_emits_nothing() {
+        let song = one_note_song(2.0, 1.0, 60);
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect_events_for_buffer(Some(&song), 0, SR, 0, 1000, &mut out, &mut active);
+        assert!(out.is_empty());
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn note_extending_past_clip_end_is_clamped() {
+        let mut song = one_note_song(7.0, 4.0, 60);
+        song.tracks[0].clips[0].length_beats = 8.0;
+        let playhead = 8 * SPB - 100;
+        let frames = 200u32;
+        let mut out = Vec::new();
+        let mut active = vec![60u8];
+        collect_events_for_buffer(
+            Some(&song),
+            0,
+            SR,
+            playhead,
+            frames,
+            &mut out,
+            &mut active,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].event, NoteTransition::Off { key: 60 }));
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn note_past_clip_end_is_skipped_entirely() {
+        let mut song = one_note_song(10.0, 1.0, 60);
+        song.tracks[0].clips[0].length_beats = 4.0;
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect_events_for_buffer(
+            Some(&song),
+            0,
+            SR,
+            10 * SPB - 100,
+            200,
+            &mut out,
+            &mut active,
+        );
+        assert!(out.is_empty());
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn output_is_sorted_with_off_before_on_at_same_time() {
+        let song = Song {
+            bpm: 120.0,
+            tracks: vec![Track {
+                name: "T".into(),
+                clips: vec![Clip {
+                    id: 1,
+                    name: "C".into(),
+                    start_beat: 0.0,
+                    length_beats: 4.0,
+                    notes: vec![
+                        Note {
+                            start_beat: 0.0,
+                            duration_beats: 1.0,
+                            pitch: 60,
+                            velocity: 100,
+                            lyric: None,
+                        },
+                        Note {
+                            start_beat: 1.0,
+                            duration_beats: 1.0,
+                            pitch: 60,
+                            velocity: 100,
+                            lyric: None,
+                        },
+                    ],
+                }],
+                ..Track::default()
+            }],
+            ..Song::default()
+        };
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect_events_for_buffer(
+            Some(&song),
+            0,
+            SR,
+            0,
+            (2 * SPB) as u32,
+            &mut out,
+            &mut active,
+        );
+        assert_eq!(out.len(), 3);
+        assert!(matches!(out[0].event, NoteTransition::On { .. }));
+        assert_eq!(out[0].time, 0);
+        assert!(matches!(out[1].event, NoteTransition::Off { .. }));
+        assert!(matches!(out[2].event, NoteTransition::On { .. }));
+        assert_eq!(out[1].time, out[2].time);
+    }
+}

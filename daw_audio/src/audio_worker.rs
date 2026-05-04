@@ -273,6 +273,13 @@ fn run_worker(
     all_done: SendableHandle,
 ) {
     boost_thread_priority("audio worker");
+    // Join "Pro Audio" so MMCSS keeps this thread on the priority-class
+    // schedule the audio mixer/sequencer loop relies on. Held until the
+    // worker drops out of `run_worker`, then auto-reverted.
+    let _mmcss = common::mmcss::join_pro_audio();
+    if _mmcss.is_none() {
+        tracing::warn!("audio worker: MMCSS join (Pro Audio) failed");
+    }
     loop {
         unsafe {
             WaitForSingleObject(wake.0, INFINITE);

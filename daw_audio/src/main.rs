@@ -2,6 +2,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, Result};
+
+// Debug-only: route every heap allocation through `AllocDisabler` so the
+// `assert_no_alloc!(...)` blocks inside audio worker code panic the
+// instant an RT path tries to allocate. Enabled by `--features rt-assert`.
+#[cfg(feature = "rt-assert")]
+#[global_allocator]
+static GLOBAL: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 use common::audio_bridge::AudioBridgeHandle;
 use common::meter::compute_block_peak;
 use common::protocol::{ChildKind, MainToChild};
@@ -179,7 +186,6 @@ async fn recv_loop(
             | Ok(MainToChild::ReorderTracks(_))
             | Ok(MainToChild::RequestSlotState { .. })
             | Ok(MainToChild::RequestAllStates)
-            | Ok(MainToChild::ExportWav { .. })
             | Ok(MainToChild::OpenSlotGuiEmbedded { .. })
             | Ok(MainToChild::CloseSlotGui { .. })
             | Ok(MainToChild::ResizeSlotGui { .. })

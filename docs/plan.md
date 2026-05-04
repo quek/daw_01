@@ -30,54 +30,37 @@ DESIGN.md M1 残項目を 6 タスクに分解。`docs/plan_<feature>.md` への
 ### 着手順マップ
 
 ```
-A2 multi-track ─┬─→ A1 VOICEVOX ─┐
-                │                 ├─→ M1 完成
-                └─→ A3 WAV export ┘
-A6 tempo/timesig (独立、早期で OK)
+A2 (完了 ✓) ─┬─→ A1 VOICEVOX ─┐
+              │                 ├─→ M1 完成
+              └─→ A3 WAV export ┘
+A6 tempo/timesig (独立、早期で OK ← 推奨次タスク)
 A4 autosave     (独立、早期で OK)
 A5 lyric UI     (gui_01 #015 要望 → 取り込み、A1 の前提)
 ```
 
 優先順序の根拠:
-- **A2 が基盤**。現状 `Track 0 / Clip 0 / モノフォニック` で固定 ([daw_plugin_host/src/audio.rs](daw_plugin_host/src/audio.rs) の audio thread)。これを解かないと A1 (VOICEVOX) も A3 (mixdown) も「単一 track のみ」になる。
-- **A6 / A4** は独立で軽量。A2 の合間に挟める。
-- **A5** は gui_01 改修先行 (#015)。reply 待ちの間 A1 の Engine / HTTP 周りを進める。
-- **A1** は A2 + A5 完了後に本格実装。
-- **A3** は A2 完了後 (multi-track mix を offline render に流用)。
+- **A2 完了**。track-parallel スレッドプール + MMCSS / thread_check / assert_no_alloc が稼働。次タスクの前提が整った
+- **A6 / A4** は独立で軽量。次の推奨タスクは **A6 (tempo/timesig 変更 UI)**
+- **A5** は gui_01 改修先行 (#015)。reply 待ちの間 A1 の Engine / HTTP 周りを進める
+- **A1** は A5 完了後に本格実装
+- **A3** は engine resource 共有化が必要 (大規模)、A1 と並行可
 
-### A2: 責務分担正常化 + track-parallel スレッドプール化 [優先度 1 — 基盤]
+### A2: 責務分担正常化 + track-parallel スレッドプール化 [完了]
 
 詳細は [docs/plan_a2_audio_engine.md](plan_a2_audio_engine.md)。
 
-**やったこと (PR1-7、 build / clippy clean)**:
+**完了内容 (PR1-7 + cleanup PR、 build / clippy / test clean、 ユーザー smoke test OK)**:
 
-1. **責務分担の正常化** — DESIGN.md の規定どおり `daw_audio = シーケンサー / mixer / オーディオ出力`、`daw_plugin_host = プラグインのロード / process` に整理。 sing_like_coding 流の handshake-driven に書き換え
-2. **新しい IPC layer (per-plugin shmem + per-worker event)** — `common::process_data::ProcessData` (16 KB / plugin)、`common::worker_bridge::WorkerBridge` (worker_task 配列)、 Win32 named auto-reset events を per-worker pair で
-3. **track-parallel スレッドプール (両プロセス N worker、 1:1 ペア)** —
-   - `daw_audio::audio_worker::AudioWorkerPool`: master + N worker が work-stealing カウンタで track を fan-out → master が `reduce_master` で serial 累積 (race 回避)
-   - `daw_plugin_host::process_server::WorkerPool`: 各 worker が wake event 待ち → `worker_bridge.worker_task[i]` で plugin_id 受信 → `plugin.process()` 呼び出し → done event signal
-4. **plugin_id registry** — plugin_host が SetSlotPlugin で plugin_id 発行 + ProcessData shmem create + raw plugin pointer を `Arc<ArcSwap<Vec<Option<PluginEntry>>>>` に publish。 daw_audio が `slot_to_plugin_id` map で (track, slot) → plugin_id を引いて dispatch
-5. **TIME_CRITICAL priority** — 両プロセスの worker thread が `SetThreadPriority(THREAD_PRIORITY_TIME_CRITICAL)` で起動
+1. **責務分担の正常化** — DESIGN.md の規定どおり `daw_audio = シーケンサー / mixer / オーディオ出力`、`daw_plugin_host = プラグインのロード / process` に整理
+2. **新しい IPC layer** — per-plugin `ProcessData` shmem (16 KB / plugin)、per-worker `WorkerBridge` shmem + Win32 named auto-reset events
+3. **track-parallel スレッドプール (両プロセス N worker、 1:1 ペア)** — `audio_worker::AudioWorkerPool` が work-stealing で track を fan-out、`process_server::WorkerPool` が各 plugin を wake/done event で dispatch
+4. **plugin_id registry** — plugin_host が SetSlotPlugin で発行 + shmem create + `Arc<ArcSwap<Vec<Option<PluginEntry>>>>` で publish、daw_audio は `slot_to_plugin_id` map で引く
+5. **TIME_CRITICAL priority + MMCSS** — 両プロセスの worker が `SetThreadPriority(TIME_CRITICAL)` + `AvSetMmThreadCharacteristicsW("Pro Audio")` (Drop で revert)
+6. **CLAP `thread_check` ext** — host 側で `clap_host_thread_check` を提供、TLS フラグで is_audio_thread を判定
+7. **assert_no_alloc** — `[features] rt-assert` 追加、`cargo test --features rt-assert` で RT 違反検出可能
+8. **旧 audio thread コード完全撤去** — `run_audio`, `collect_events_for_buffer`, `Tracks::params/vocal`, `TrackAudioParams (旧)`, `VocalAudio (旧)`, `PerTrackState`, `start_audio_legacy`, `AudioThread`, `TrackRouting`, `AudioRouting` を全削除 (~1500 行減)、tests を `daw_audio/src/sequencer.rs` に移植
 
-**受け入れ基準** (まだ実機テスト未確認、 次の作業):
-- 2 トラック以上に別 instrument を載せて同時再生で音が混ざる
-- track の `muted` / `solo` トグルが即座に反映
-- track の `volume` / `pan` 変更で master 出力が変わる
-- `cargo clippy --workspace -- -D warnings` clean ✅
-
-**追加で完了 (旧 audio thread 撤去 / mixer 反映)**:
-
-- `SetTrackVolume / Pan / Muted / Solo` を daw_audio が受信 → ArcSwap で Song を新スナップショットに差し替え → 次の buffer から process_track が新 volume/pan で動く ([daw_audio/src/main.rs](../daw_audio/src/main.rs) の `update_song_track`)
-- `SetVocalAudio` を daw_audio が受信 → engine の `vocal_store: HashMap<u32, Arc<ArcSwapOption<VocalAudio>>>` に hot-swap → process_track_owned が instrument の無い track で再生
-- 旧 daw_plugin_host audio thread を **de facto 撤去**: `TracksHandle::mutate / start_audio / stop_audio` を no-op 化、`install_plugin` / `remove_plugin` が `activate / start_processing / stop_processing / deactivate` を直接呼ぶ。 `run_audio` / `collect_events_for_buffer` / `start_audio_legacy` などは dead code として残置 (`#[allow(dead_code)]`)、 完全削除は別 PR で
-
-**残タスク (M1 完成までに別 PR で実施)**:
-
-1. **smoke test**: `cargo run -p daw_gui` で 1 instrument plugin を読み込んで音が出るか実機確認。 まだ未テスト
-2. **`export_wav_offline` の修復 / daw_audio への移管**: 旧 audio thread の stop/start に依存していたので、 mutate を no-op 化した今は動作しない。 daw_audio 側で offline render を再実装する必要
-3. **旧コードの完全削除** (`run_audio`, `collect_events_for_buffer`, `Tracks::params/vocal`, `TrackAudioParams`, `VocalAudio`, `PerTrackState`, `start_audio_legacy`, `AudioThread`, `TrackRouting`, `AudioRouting`, `PluginPtr` redundancy 等で 数百〜数千行)
-4. **MMCSS** (`AvSetMmThreadCharacteristicsW("Pro Audio")`)、 **CLAP `thread_check` ext** の host 側実装、 **assert_no_alloc** debug feature
-5. **動的 track 増減**: 現状 LoadSong 時に Song 全体を更新するパターン。 GUI 操作中 (例えば AddTrack) で routing が即時更新されるかは smoke test で確認
+**未完: WAV export** — A2 残タスクとしてあったが、daw_audio 側 LocalState 共有設計が大規模変更のため A3 で本格実装に切り出し。本フェーズでは plugin_host の旧 export_wav_offline + GUI Export メニューを削除のみ (機能は一時停止状態で A3 まで持ち越し)。
 
 ### A6: tempo / time_sig 変更 UI [優先度 2 — 独立 / 軽量]
 
@@ -173,28 +156,42 @@ A5 lyric UI     (gui_01 #015 要望 → 取り込み、A1 の前提)
 
 着手時 `docs/plan_a1_voicevox.md` を切り出し必須 (大規模)。
 
-### A3: WAV 書き出し / mixdown [優先度 6]
+### A3: WAV 書き出し / mixdown (freewheel offline render) [優先度 6]
 
-**現状**: export 機能なし。
+**現状**: A2 で plugin_host 側の旧 export_wav_offline を削除し、GUI Export メニューも一旦無効化済。daw_audio 側に新規実装する。
+
+**設計方針** (Ardour [Export Dialog manual](https://manual.ardour.org/exporting/export-dialog/) と CLAP [render ext spec](https://github.com/free-audio/clap/blob/main/include/clap/ext/render.h) を一次情報根拠):
+- **freewheel mode 採用**: export 中は通常再生を停止、CPAL callback は無音、export thread が同じ AudioWorkerPool / plugin shmem を使って CPU 限界速度で render
+- **plugin instance は複製しない**: Ardour / REAPER とも標準は同 instance 流用、複製案はメモリ 2 倍化で非現実的
+- **CLAP `clap_plugin_render` ext**: export 開始前に全 plugin に `set(CLAP_RENDER_OFFLINE)`、完了で `CLAP_RENDER_REALTIME`
 
 **やること**:
-1. File menu (or transport の Export ボタン) に "Export WAV..." を追加 (`rfd::FileDialog` でパス選択)
-2. offline render mode を `daw_audio` に新設: audio thread とは別の dedicated thread で sequencer + plugin process を CPAL コールバック非依存で走らせる
-3. 出力長は `Song.length_beats` をデフォルト、UI で Loop range / Selection も選択可
-4. `hound` crate で WAV 書き出し (16/24/32 bit, 48000 Hz fixed)
-5. 進捗 modal (cancel button、IPC で `ChildToMain::ExportProgress` を流す)
-6. VOICEVOX cache を併用 (再合成しない)
+1. **engine の resource 共有化**: `LocalState` の `plugin_refs` / `slot_to_plugin_id` / `vocal_store` / `worker_syncs` / `worker_pool` を `SharedState` に Arc 化して移管 (CPAL closure と export thread で共有可能に)
+2. **新規 `daw_audio/src/export.rs`**: offline render loop + WAV writer。export thread が `process_track_owned` を `Song.length_beats` 分ループ呼び出し、 `hound::WavWriter` で出力
+3. CPAL callback は `shared.export_running` 中、`process_buffer` を skip し無音出力
+4. `MainToChild::ExportWav { path }` を再導入 (or `MainToAudio::ExportWav`)、daw_audio で受信
+5. `ChildToMain::ExportWavComplete { error }` を audio から送信
+6. `LoadedPlugin` trait に `set_render_mode(mode)` 追加、ClapPlugin で `clap_plugin_render` ext を取得 / set 呼び出し
+7. GUI File menu / `Ctrl+E` shortcut / `action_export_wav` 復活
+8. UI: export 中は status bar に「Export 中」表示、Play ボタンを無効化
 
 **主な変更ファイル**:
-- 新規 `daw_audio/src/render.rs` (offline render loop)
-- 新規 `daw_gui/src/export.rs` (dialog + progress modal)
-- [common/src/protocol.rs](common/src/protocol.rs) (`MainToChild::ExportWav { path, length_beats, bit_depth }` / `ChildToMain::ExportProgress`)
+- 新規 `daw_audio/src/export.rs`
+- [daw_audio/src/engine.rs](daw_audio/src/engine.rs) (resource 共有化、export hook)
+- [daw_audio/src/main.rs](daw_audio/src/main.rs) (ExportWav handler + writer thread)
+- [daw_plugin_host/src/plugin_instance.rs](daw_plugin_host/src/plugin_instance.rs) (`set_render_mode`)
+- [daw_plugin_host/src/clap_plugin.rs](daw_plugin_host/src/clap_plugin.rs) (`clap_plugin_render` 実装)
+- [common/src/protocol.rs](common/src/protocol.rs) (ExportWav / ExportWavComplete 再追加)
+- [daw_gui/src/app.rs](daw_gui/src/app.rs) (action_export_wav 復活)
+- [daw_gui/src/view/root.rs](daw_gui/src/view/root.rs) (File menu / shortcut)
 
 **受け入れ基準**:
-- File → Export WAV → パス選択 → WAV ファイルが書き出される
+- File → Export WAV → パス選択 → 再生中は自動停止 → freewheel offline render → WAV ファイルが書き出される
 - 書き出した WAV を別アプリで再生 → DAW 内の再生と聴感上一致
-- export 中に cancel ボタンで中断できる
-- export 中も DAW 自体は操作可能 (offline render は別スレッド)
+- export 中は CPAL は無音、 完了後通常再生に復帰可能
+- VOICEVOX cache を併用 (再合成しない、A1 完成後)
+
+着手時 `docs/plan_a3_wav_export.md` を切り出し推奨 (engine の resource 共有化が大規模変更のため)。
 
 ## Phase 7 以降 (M2 へのつながり、現時点では着手しない)
 
@@ -239,4 +236,5 @@ A5 lyric UI     (gui_01 #015 要望 → 取り込み、A1 の前提)
 | 2026-05-04 | a2117cb | chore  | .gitignore に /.claude/scheduled_tasks.lock を追加 |
 | 2026-05-04 | af44c46 | M13 取り込み | gui_01 #014 (M13 Phase 55) を取り込み — アレンジビュー小節番号 ruler + ピアノロール ruler 領域 + time_sig 対応 grid |
 | 2026-05-04 | 12be490 | Phase 0 | gui_01 #014 を Resolved 化、archive へ移動 |
-| 2026-05-04 | (uncommitted) | A2 PR1-7 | 責務分担正常化 + track-parallel スレッドプール化 (build/clippy clean、 実機 smoke test 未): plan_a2_audio_engine.md 参照。 残 cleanup と smoke test は別 PR |
+| 2026-05-04 | 8954bed | A2 PR1-7 | 責務分担正常化 + track-parallel スレッドプール化 (build/clippy clean): plan_a2_audio_engine.md 参照 |
+| 2026-05-05 | (uncommitted) | A2 完了 | 残 cleanup + audio quality: 旧 audio thread コード全削除 (~1500 行)、`tests` を `daw_audio/src/sequencer.rs` に移植、MMCSS (`AvSetMmThreadCharacteristicsW("Pro Audio")`) を両 worker pool に追加、CLAP `thread_check` ext (host 提供 + TLS) 実装、`rt-assert` feature (`assert_no_alloc`) 追加。CLAUDE.md に「まず調べる」 ルール追記。WAV export は LocalState 共有設計が大規模変更のため A3 で本格実装に切り出し (旧 export_wav_offline と GUI メニューは削除のみ) |

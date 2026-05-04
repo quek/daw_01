@@ -142,6 +142,17 @@ fn run_worker(
             tracing::warn!(error = ?e, worker_idx = idx, "failed to raise plugin worker priority");
         }
     }
+    // MMCSS "Pro Audio" task class: held for the worker's lifetime so
+    // the OS scheduler keeps `plugin.process()` calls on the realtime
+    // priority class. Reverts automatically on Drop.
+    let _mmcss = common::mmcss::join_pro_audio();
+    if _mmcss.is_none() {
+        tracing::warn!(worker_idx = idx, "plugin worker MMCSS join failed");
+    }
+    // Tell the CLAP `thread_check` extension this thread counts as an
+    // audio thread, so plugins calling `host.is_audio_thread()` from
+    // inside `process()` get the correct answer.
+    crate::clap_host::mark_audio_thread();
     tracing::info!(worker_idx = idx, "plugin worker started");
     // Pre-allocated event-conversion buffer so the RT path doesn't
     // touch the allocator during dispatch.

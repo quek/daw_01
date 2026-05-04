@@ -7,7 +7,6 @@ edition.workspace = true
 common = { path = "../common" }
 anyhow.workspace = true
 arc-swap.workspace = true
-hound.workspace = true
 clap-sys.workspace = true
 com-scrape-types.workspace = true
 libloading.workspace = true
