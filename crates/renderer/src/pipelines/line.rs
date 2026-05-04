@@ -171,7 +171,7 @@ impl LinePipeline {
         let span_start = self.spans.len() as u32;
         for batch in batches {
             let start = self.instances.len() as u32;
-            for seg in &batch.segments {
+            for seg in batch.segments.iter() {
                 if self.instances.len() as u64 >= MAX_INSTANCES {
                     break;
                 }

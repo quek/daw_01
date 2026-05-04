@@ -76,7 +76,7 @@ impl<'b, 'a, M: ?Sized + 'static> TabBuilder<'b, 'a, M> {
             });
         }
         self.ui.push_text(GlyphArea {
-            text: label.to_string(),
+            text: label.into(),
             left: tab_rect.x + TAB_PAD_X,
             top: tab_rect.y + (tab_rect.h - TAB_FONT * 1.2) * 0.5,
             font_size: TAB_FONT,

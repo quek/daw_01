@@ -795,7 +795,7 @@ fn draw_clip<M: ?Sized + 'static>(
     });
     if r.w > 24.0 && r.h > style.clip_text_size + 2.0 {
         hctx.push_text(GlyphArea {
-            text: clip.name.to_string(),
+            text: clip.name.clone(),
             left: r.x + 4.0,
             top: r.y + 2.0,
             font_size: style.clip_text_size,
@@ -865,7 +865,7 @@ fn draw_selection_overlay<M: ?Sized + 'static>(
             });
             if r.w > 24.0 && r.h > style.clip_text_size + 2.0 {
                 hctx.push_text(GlyphArea {
-                    text: c.name.to_string(),
+                    text: c.name.clone(),
                     left: r.x + 4.0,
                     top: r.y + 2.0,
                     font_size: style.clip_text_size,

@@ -1076,7 +1076,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             };
             if !segments.is_empty() {
                 ui.push_lines(LineBatch {
-                    segments,
+                    segments: segments.into(),
                     line_width_px: style.line_width_px.max(1.0),
                     clip_rect: Some(rect),
                 });

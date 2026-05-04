@@ -21,7 +21,7 @@ pub(crate) fn draw_playhead_line<M: ?Sized + 'static>(
         return;
     }
     hctx.push_lines(LineBatch {
-        segments: vec![LineSegment { a: [x, y_top], b: [x, y_bottom], color }],
+        segments: vec![LineSegment { a: [x, y_top], b: [x, y_bottom], color }].into(),
         line_width_px: width_px,
         clip_rect: None,
     });

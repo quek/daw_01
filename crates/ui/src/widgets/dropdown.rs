@@ -57,7 +57,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let label = items.get(selected).copied().unwrap_or("");
         if !label.is_empty() {
             self.push_text(GlyphArea {
-                text: label.to_string(),
+                text: label.into(),
                 left: rect.x + DROPDOWN_PAD_X,
                 top: rect.y + (rect.h - DROPDOWN_FONT * 1.2) * 0.5,
                 font_size: DROPDOWN_FONT,
@@ -84,7 +84,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     b: [arrow_x + arrow_size, arrow_y - arrow_size * 0.5],
                     color: arrow_color,
                 },
-            ],
+            ]
+            .into(),
             line_width_px: 1.5,
             clip_rect: None,
         });

@@ -1077,7 +1077,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         });
         for (i, text) in lines.iter().enumerate() {
             self.push_text(GlyphArea {
-                text: text.clone(),
+                text: text.as_str().into(),
                 left: bg_rect.x + pad,
                 top: bg_rect.y + pad + (i as f32) * line_h,
                 font_size,
@@ -1202,7 +1202,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             },
             LineSegment { a: [rect.x, rect.y + rect.h], b: [rect.x, rect.y], color },
         ];
-        self.push_lines(LineBatch { segments, line_width_px: 1.0, clip_rect: None });
+        self.push_lines(LineBatch { segments: segments.into(), line_width_px: 1.0, clip_rect: None });
     }
 
     /// `name` に登録された shortcut を表記文字列で返す ("Ctrl+Z" 等)。menu 右端の表示用。

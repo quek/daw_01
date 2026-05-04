@@ -297,7 +297,7 @@ fn draw_knob<M: ?Sized + 'static>(
     }
     if !active.is_empty() {
         ui.push_lines(LineBatch {
-            segments: active,
+            segments: active.into(),
             line_width_px: 4.0,
             clip_rect: None,
         });
@@ -316,7 +316,7 @@ fn draw_knob<M: ?Sized + 'static>(
     }
     if !inactive.is_empty() {
         ui.push_lines(LineBatch {
-            segments: inactive,
+            segments: inactive.into(),
             line_width_px: 4.0,
             clip_rect: None,
         });
@@ -331,7 +331,7 @@ fn draw_knob<M: ?Sized + 'static>(
         color: Color::rgb(0.95, 0.97, 1.00),
     };
     ui.push_lines(LineBatch {
-        segments: vec![indicator],
+        segments: vec![indicator].into(),
         line_width_px: 4.0,
         clip_rect: None,
     });

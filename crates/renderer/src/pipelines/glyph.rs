@@ -255,7 +255,7 @@ mod tests {
 
     fn area(text: &str, fs: f32, lh: f32) -> GlyphArea {
         GlyphArea {
-            text: text.to_string(),
+            text: text.into(),
             left: 0.0,
             top: 0.0,
             font_size: fs,

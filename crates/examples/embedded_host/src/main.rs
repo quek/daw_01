@@ -96,7 +96,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ));
     }
     scene.push_text(GlyphArea {
-        text: "daw-ui Phase 18 — Plugin UI Embedding (OffscreenRenderer)".to_string(),
+        text: "daw-ui Phase 18 — Plugin UI Embedding (OffscreenRenderer)".into(),
         left: 30.0,
         top: 20.0,
         font_size: 16.0,

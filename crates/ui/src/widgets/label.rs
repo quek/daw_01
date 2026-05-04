@@ -32,7 +32,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         ));
         self.with_widget_node(wid, input_hash, |ui| {
             ui.push_text(GlyphArea {
-                text: text.to_string(),
+                text: text.into(),
                 left: x,
                 top: y,
                 font_size,
@@ -61,7 +61,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         ));
         self.with_widget_node(wid, input_hash, |ui| {
             ui.push_text(GlyphArea {
-                text: text.to_string(),
+                text: text.into(),
                 left: x,
                 top: y,
                 font_size,

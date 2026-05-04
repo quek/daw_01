@@ -363,7 +363,7 @@ fn draw_text_input<M: ?Sized + 'static>(
     };
     if !combined.is_empty() {
         ui.push_text(GlyphArea {
-            text: combined,
+            text: combined.into(),
             left: tx,
             top: ty,
             font_size,
@@ -384,7 +384,8 @@ fn draw_text_input<M: ?Sized + 'static>(
                 a: [pre_x, underline_y],
                 b: [pre_x + preedit_w, underline_y],
                 color: Color::rgb(0.95, 0.85, 0.55),
-            }],
+            }]
+            .into(),
             line_width_px: 1.5,
             clip_rect: Some(rect),
         });
@@ -400,7 +401,8 @@ fn draw_text_input<M: ?Sized + 'static>(
                 a: [cursor_x, cursor_y],
                 b: [cursor_x, cursor_y + cursor_h],
                 color: Color::rgb(0.95, 0.97, 1.0),
-            }],
+            }]
+            .into(),
             line_width_px: 1.5,
             clip_rect: Some(rect),
         });

@@ -194,7 +194,7 @@ fn draw_toggle_button<M: ?Sized + 'static>(
     let tx = rect.x + (rect.w - approx_w).max(0.0) * 0.5;
     let ty = rect.y + (rect.h - line_h).max(0.0) * 0.5;
     ui.push_text(GlyphArea {
-        text: text.to_string(),
+        text: text.into(),
         left: tx,
         top: ty,
         font_size: style.font_size,

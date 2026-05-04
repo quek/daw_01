@@ -234,6 +234,28 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 - ✅ `cargo build --workspace` / `cargo test --workspace` (226 unit test、+10 件 = reorderable_list 7 + text_input 3) / `cargo clippy --workspace --tests -- -D warnings` / `cargo test -p daw-ui-core --test no_clone_required` 全 ✅
 - 🔲 `cargo run --bin daw_prototype` で Demo Dialog → Plugin Chain reorder + track header 右クリック → Rename → 即タイプ可能 (Phase 52) 動作確認 (user 側で実施)
 
+### M12 (Performance optimization — perf_review_2026-05-04 P0 系) — 進行中
+
+**目的**: 2026-05-04 の全体 perf review ([docs/perf_review_2026-05-04.md](perf_review_2026-05-04.md)) で発見された P0 critical 2 件を修正する。`Ui::with_widget_node` の cache hit/miss 経路で `Primitive` を Vec ごと毎フレーム clone している (Glyph に String / Line に Vec を内包) のと、`arrangement.rs` の `tracks_for_draw.clone()` が release frame 以外でも 2 度発火する問題。
+
+**動機**: scenegraph cache の「cache hit が free」前提が、`Primitive::clone()` の中で String/Vec の二次 alloc が発生していたため崩れていた。1000+ widget のフレームで毎 hit ごと alloc が widget × primitive 数だけ発火し、heavy() で expecting する 60fps 維持が脅かされる状態。
+
+| Phase | テーマ | 主な成果物 | 状態 |
+|---|---|---|---|
+| 53 | `Primitive` 内コンテナを `Arc` 化 (P0-1) | `GlyphArea::text: String` → `Arc<str>`、`LineBatch::segments: Vec<LineSegment>` → `Arc<[LineSegment]>` に **breaking 変更**。`Primitive::clone()` を refcount のみに圧縮し、`with_widget_node` の cache hit/miss 経路 (scenegraph) で発火する `cached.primitives.iter().cloned()` / `to_vec()` が String/Vec の二次 alloc 無しで済むようにする。renderer pipeline 側 (`area.text.hash()` / `&area.text` で `Buffer::set_text` / `batch.segments.iter()` 等) は `Arc<T>` の deref で全て無変更。`line.rs:174` の `for seg in &batch.segments` だけ `&Arc<[T]>` が `IntoIterator` でないので `batch.segments.iter()` に変更。`menu.rs:634` の `g.text.as_str()` は `Arc<str>::as_str` が unstable のため `g.text.as_ref()` に変更。構築側 (~30 箇所、widget / example / test 全部) は `text: foo.to_string()` → `text: foo.into()` (`&str → Arc<str>`) / `segments: my_vec` → `segments: my_vec.into()` (`Vec → Arc<[T]>`) のように `.into()` を 1 つ追加。すでに `Arc<str>` だった `ArrangementClip.name` / `note.lyric` は `clone()` で refcount bump に変更 (旧 `to_string().into()` の二重 alloc を撲滅)。daw_01 grep で直接構築箇所無しを確認、conversation 通知不要 | ✅ 完了 |
+
+**設計判断**:
+
+- **内部 field Arc 化** (現行) vs **variant payload Arc 化** (`Primitive::Glyph(Arc<GlyphArea>)`) の二択で前者を採用: (a) renderer 側 API が無変更、(b) `Rect` variant は Copy のままなので局所的、(c) `GlyphArea::clip_rect` 等の field 直接参照を保てる
+- **`LineBatch: Default`** は維持: `Arc<[T]>: Default` が std で `Arc::from(&[])` 相当を提供しており、derive(Default) がそのまま動く
+
+**完了条件 (DoD)**:
+
+- ✅ Phase 53 完了
+- ✅ `cargo build --workspace` / `cargo test --workspace` (226 unit test、Phase 52 から件数同じ = 既存 test の API 互換維持) / `cargo clippy --workspace --tests -- -D warnings` / `cargo test -p daw-ui-core --test no_clone_required` 全 ✅
+- 🔲 Phase 54 (P0-2) 完了
+- 🔲 `cargo bench -p daw-ui-core --bench scenegraph_cache` で cache hit frame の per-frame µs が削減されること (期待 30-70% 短縮)
+
 ---
 
 ## 凍結 (M9+M10+M11 完了後の再評価対象)

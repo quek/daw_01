@@ -167,7 +167,8 @@ fn draw_checkbox<M: ?Sized + 'static>(
             segments: vec![
                 LineSegment { a: p1, b: p2, color: check_color },
                 LineSegment { a: p2, b: p3, color: check_color },
-            ],
+            ]
+            .into(),
             line_width_px: 2.0,
             clip_rect: None,
         });
@@ -180,7 +181,7 @@ fn draw_checkbox<M: ?Sized + 'static>(
         let tx = box_rect.x + BOX_SIZE + LABEL_GAP;
         let ty = rect.y + (rect.h - line_h) * 0.5;
         ui.push_text(GlyphArea {
-            text: label.to_string(),
+            text: label.into(),
             left: tx,
             top: ty,
             font_size,

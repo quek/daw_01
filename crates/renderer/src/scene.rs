@@ -15,6 +15,20 @@
 //! renderer は同 type の連続 primitive を 1 つの "run" にまとめて batch、各 run ごとに
 //! drawcall を発行する。state 切り替え数は run 数に比例 (典型的に 10-50 / frame、許容範囲)。
 //! popup pass も同じ pattern (`popup_primitives: Vec<Primitive>`)。
+//!
+//! ## M12 Phase 53: GlyphArea / LineBatch の重コンテナを `Arc` 化
+//!
+//! `Primitive::clone()` は `with_widget_node` の cache hit/miss 経路 (scenegraph) で
+//! `cached.primitives.iter().cloned()` / `to_vec()` 経由で毎フレーム発火する。
+//! 旧設計の `GlyphArea::text: String` / `LineBatch::segments: Vec<LineSegment>` だと
+//! cache hit ごとに String alloc + Vec alloc が widget 数 × primitive 数だけ発火し、
+//! 「cache hit が free」という前提が崩れていた (perf_review_2026-05-04 P0-1)。
+//!
+//! `Arc<str>` / `Arc<[LineSegment]>` 化で `Primitive::clone()` は **refcount の bump
+//! のみ**になり、heavy な primitive list の clone コストが消える。`&Arc<T>` は `&T`
+//! に deref できるので renderer pipeline 側 (`area.text.hash()` / `&area.text` /
+//! `&batch.segments` 等) は無変更で動く。構築側は `text: "...".into()` /
+//! `segments: vec![...].into()` のように `.into()` を 1 つ追加するだけ。
 
 /// RGBA、各成分 [0.0, 1.0] (sRGB)。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -109,10 +123,14 @@ impl RectCommand {
 }
 
 /// テキスト描画 1 ブロック分。glyphon の `TextArea` に近い情報を持つ。
+///
+/// `text` は `Arc<str>` で持つ (M12 Phase 53)。`Primitive::clone()` (scenegraph cache
+/// hit 経路で毎フレーム発火) を refcount のみに圧縮するため。構築側は `&str` /
+/// `String` から `.into()` で渡せる。
 #[derive(Debug, Clone)]
 pub struct GlyphArea {
     /// 表示する文字列 (UTF-8)。
-    pub text: String,
+    pub text: std::sync::Arc<str>,
     /// クリップ矩形の左上 (物理ピクセル)。
     pub left: f32,
     pub top: f32,
@@ -139,9 +157,13 @@ pub struct LineSegment {
 /// 線分の集まり 1 バッチ分。同じ `line_width_px` と `clip_rect` を共有する。
 ///
 /// 1 ウィジェット = 1 バッチが基本想定 (波形ウィジェットの clip rect で縁を切る)。
+///
+/// `segments` は `Arc<[LineSegment]>` で持つ (M12 Phase 53)。`Primitive::clone()`
+/// を refcount のみに圧縮するため。構築側は `Vec<LineSegment>` から `.into()` で
+/// 渡せる (`segments.push(...)` で組み立てた後に 1 度だけ Arc::from で確定する)。
 #[derive(Debug, Clone, Default)]
 pub struct LineBatch {
-    pub segments: Vec<LineSegment>,
+    pub segments: std::sync::Arc<[LineSegment]>,
     pub line_width_px: f32,
     /// `Some` ならこの矩形外を scissor で切り捨てる。
     pub clip_rect: Option<Rect>,

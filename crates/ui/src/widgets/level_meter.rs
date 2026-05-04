@@ -200,7 +200,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         if rect.h > 40.0 {
             let label = format!("{db:.1}");
             self.push_text(GlyphArea {
-                text: label,
+                text: label.into(),
                 left: rect.x + 2.0,
                 top: rect.y + rect.h - 14.0,
                 font_size: 10.0,

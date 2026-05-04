@@ -1025,7 +1025,7 @@ fn draw_grid_background<M: ?Sized + 'static>(
             if (pitch as u8).is_multiple_of(12) && pitch_to_px >= 8.0 {
                 let octave = (pitch / 12) - 1;
                 hctx.push_text(GlyphArea {
-                    text: format!("C{octave}"),
+                    text: format!("C{octave}").into(),
                     left: kbd.x + 4.0,
                     top: y,
                     font_size: style.c_label_font_px,
@@ -1073,7 +1073,7 @@ fn draw_notes<M: ?Sized + 'static>(
             && clipped.w >= lyric_font_px
         {
             hctx.push_text(GlyphArea {
-                text: lyric.to_string(),
+                text: lyric.clone(),
                 left: clipped.x + 1.0,
                 top: clipped.y,
                 font_size: lyric_font_px,

@@ -120,7 +120,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
             if !tick_segs.is_empty() {
                 ui.push_lines(LineBatch {
-                    segments: tick_segs,
+                    segments: tick_segs.into(),
                     line_width_px: 1.0,
                     clip_rect: Some(rect),
                 });
@@ -138,7 +138,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let x = rect.x + local_x;
                 let label = mapping.format(s);
                 ui.push_text(GlyphArea {
-                    text: label,
+                    text: label.into(),
                     left: x + RULER_LABEL_PAD_X,
                     top: rect.y + 2.0,
                     font_size: RULER_FONT,
@@ -200,14 +200,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
             if !beat_segs.is_empty() {
                 ui.push_lines(LineBatch {
-                    segments: beat_segs,
+                    segments: beat_segs.into(),
                     line_width_px: style.beat_line_width,
                     clip_rect: Some(rect),
                 });
             }
             if !bar_segs.is_empty() {
                 ui.push_lines(LineBatch {
-                    segments: bar_segs,
+                    segments: bar_segs.into(),
                     line_width_px: style.bar_line_width,
                     clip_rect: Some(rect),
                 });

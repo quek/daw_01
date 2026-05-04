@@ -118,7 +118,7 @@ pub(crate) fn draw_items_popup<'a, M: ?Sized + 'static>(
             });
         }
         ui.push_text(GlyphArea {
-            text: (*item).to_string(),
+            text: (*item).into(),
             left: item_rect.x + MENU_PAD_X,
             top: item_rect.y + (MENU_ITEM_H - MENU_FONT * 1.2) * 0.5,
             font_size: MENU_FONT,
@@ -264,7 +264,7 @@ impl<'b, 'a, M: ?Sized + 'static> MenuBarBuilder<'b, 'a, M> {
             });
         }
         self.ui.push_text(GlyphArea {
-            text: label.to_string(),
+            text: label.into(),
             left: label_rect.x + MENU_PAD_X,
             top: label_rect.y + (label_rect.h - MENU_FONT * 1.2) * 0.5,
             font_size: MENU_FONT,
@@ -355,7 +355,7 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
             Color::rgb(0.50, 0.52, 0.56)
         };
         ui.push_text(GlyphArea {
-            text: label.to_string(),
+            text: label.into(),
             left: item_rect.x + MENU_PAD_X,
             top: item_rect.y + (MENU_ITEM_H - MENU_FONT * 1.2) * 0.5,
             font_size: MENU_FONT,
@@ -367,7 +367,7 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
         if let Some(hint) = item_hint {
             let hint_w = (hint.chars().count() as f32) * 7.0;
             ui.push_text(GlyphArea {
-                text: hint.to_string(),
+                text: hint.into(),
                 left: item_rect.x + item_rect.w - MENU_PAD_X - hint_w,
                 top: item_rect.y + (MENU_ITEM_H - MENU_FONT * 1.2) * 0.5,
                 font_size: MENU_FONT,
@@ -379,7 +379,7 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
         if is_sub {
             // 右端に「▶」マーカー
             ui.push_text(GlyphArea {
-                text: "▶".to_string(),
+                text: "▶".into(),
                 left: item_rect.x + item_rect.w - MENU_PAD_X - MENU_FONT,
                 top: item_rect.y + (MENU_ITEM_H - MENU_FONT * 1.2) * 0.5,
                 font_size: MENU_FONT,
@@ -631,7 +631,7 @@ mod tests {
         });
         // popup_glyph_areas に "Undo" と "Ctrl+Z" の両方が含まれる
         let texts: Vec<&str> =
-            scene.iter_popup_glyphs().map(|g| g.text.as_str()).collect();
+            scene.iter_popup_glyphs().map(|g| g.text.as_ref()).collect();
         assert!(texts.contains(&"Undo"), "label が popup に描画される: {texts:?}");
         assert!(texts.contains(&"Ctrl+Z"), "shortcut_hint が popup に描画される: {texts:?}");
     }
