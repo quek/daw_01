@@ -36,6 +36,8 @@ struct DawClip {
     len_beats: f64,
     name: Arc<str>,
     color: Option<Color>,
+    /// M10 Phase 47: clip volume (`0.0..=1.0`、`1.0` で unity)。
+    volume: f32,
 }
 
 struct DawTrack {
@@ -90,6 +92,7 @@ impl DawModel {
                     len_beats: 4.0,
                     name: Arc::from(format!("clip{}", ci + 1)),
                     color: None,
+                    volume: 1.0,
                 });
             }
             tracks.push(DawTrack {
@@ -610,6 +613,7 @@ fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
                     len_beats: c.len_beats,
                     name: Arc::clone(&c.name),
                     color: c.color,
+                    volume: c.volume,
                 })
                 .collect(),
         })
@@ -708,6 +712,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                             len_beats: 2.0,
                             name: Arc::from(format!("new{new_id}")),
                             color: None,
+                            volume: 1.0,
                         };
                         let pos = t
                             .clips
@@ -768,6 +773,18 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 mm.arr_view.data_generation += 1;
                 mm.last_action = format!("arr: ReorderTracks ({n})");
             }),
+            ArrangementEditRequest::SetClipVolume { key, prev: _, next } => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == key.track)
+                        && let Some(c) = t.clips.iter_mut().find(|c| c.id == key.clip)
+                    {
+                        c.volume = next.clamp(0.0, 1.0);
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action =
+                        format!("arr: SetClipVolume {key:?} → {:.2}", next.clamp(0.0, 1.0));
+                })
+            }
             ArrangementEditRequest::ToggleTrackMute(id) => Edit::mutate(move |mm: &mut DawModel| {
                 if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == id) {
                     t.muted = !t.muted;

@@ -49,6 +49,9 @@ pub struct ArrangementClip {
     pub len_beats: f64,
     pub name: Arc<str>,
     pub color: Option<Color>,
+    /// M10 Phase 47: clip volume (`0.0..=1.0`、`1.0` で unity)。
+    /// clip rect 底辺の volume slider band と clip 色の透明度に反映される (`alpha = 0.4 + volume * 0.6`)。
+    pub volume: f32,
 }
 
 /// 1 つの track。`clips` は `start_beat` 昇順前提。
@@ -113,6 +116,8 @@ pub enum ClipDragKind {
     ResizeLeft,
     /// 右端 drag = len_beats のみ変化。
     ResizeRight,
+    /// M10 Phase 47: 底辺 volume band drag = volume のみ変化 (位置・幅は不変)。
+    Volume,
 }
 
 /// `MoveClips` の delta 1 件 (track 跨ぎ可)。`from.clip` は track 跨ぎでも不変。
@@ -151,6 +156,9 @@ pub enum ArrangementEditRequest {
     /// M10 Phase 46: track header drag&drop による並び替え。`order` は新順での `track.id` 列。
     /// `MoveTrackUp/Down` は keep (button / keyboard 用)、`ReorderTracks` は drag&drop 用。
     ReorderTracks(Vec<u32>),
+    /// M10 Phase 47: clip volume 編集 (drag release で `prev → next` を発行)。
+    /// `next` は `0.0..=1.0` で widget 側 clamp 済み。
+    SetClipVolume { key: ClipKey, prev: f32, next: f32 },
     ToggleTrackMute(u32),
     ToggleTrackSolo(u32),
     SetLoopRange { start: f64, end: f64 },
@@ -174,6 +182,8 @@ pub struct ArrangementResponse {
     pub ruler_rect: Rect,
     /// M10 Phase 46: drag 中の track id (`Some` なら header reorder drag セッションが進行中)。
     pub reordering: Option<u32>,
+    /// M10 Phase 47: drag 中の clip volume key (`Some` なら volume band drag セッションが進行中)。
+    pub dragging_clip_volume: Option<ClipKey>,
 }
 
 impl Default for ArrangementResponse {
@@ -189,6 +199,7 @@ impl Default for ArrangementResponse {
             track_header_rects: Vec::new(),
             ruler_rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             reordering: None,
+            dragging_clip_volume: None,
         }
     }
 }
@@ -234,6 +245,15 @@ pub struct ArrangementStyle {
     pub reorder_drop_indicator_h: f32,
     /// drag 中 row 複製の不透明度 (`0.0..1.0`、`1.0` で完全不透明)。RGB は元 row 色 (selected/header) を使う。
     pub reorder_drag_alpha: f32,
+    /// M10 Phase 47: clip 底辺の volume slider band の縦幅 (px、`0.0` で disable = volume 編集無効化)。
+    pub clip_volume_band_h: f32,
+    /// volume band の trough (背景) 色。
+    pub clip_volume_band_track: Color,
+    /// volume band の fill (volume 値表示) 色。
+    pub clip_volume_band_fill: Color,
+    /// 低 volume 時の clip 透明度 minimum (`0.0..1.0`、`1.0` で透明にしない)。
+    /// 実 alpha = `clip_min_alpha + (1 - clip_min_alpha) * volume`。
+    pub clip_min_alpha: f32,
 }
 
 impl Default for ArrangementStyle {
@@ -296,6 +316,10 @@ impl Default for ArrangementStyle {
             reorder_drop_indicator: Color::rgb(0.50, 0.85, 1.0),
             reorder_drop_indicator_h: 2.0,
             reorder_drag_alpha: 0.6,
+            clip_volume_band_h: 4.0,
+            clip_volume_band_track: Color::rgba(0.0, 0.0, 0.0, 0.45),
+            clip_volume_band_fill: Color::rgb(0.95, 0.95, 0.97),
+            clip_min_alpha: 0.40,
         }
     }
 }
@@ -322,6 +346,11 @@ pub fn clip_to_rect(
 }
 
 /// lanes 内 cursor 位置から hit する (ClipKey, ClipDragKind) を返す (後勝ち)。
+///
+/// hit-test 優先順位 (clip rect 内で):
+/// - 左右端 `resize_handle_px` 内 → `ResizeLeft` / `ResizeRight`
+/// - 底辺 `volume_band_h` 内 (`> 0.0` のとき) → `Volume`
+/// - それ以外 (clip body) → `Move`
 #[must_use]
 pub fn clip_hit(
     tracks: &[ArrangementTrack],
@@ -330,6 +359,7 @@ pub fn clip_hit(
     cx: f32,
     cy: f32,
     resize_handle_px: f32,
+    volume_band_h: f32,
 ) -> Option<(ClipKey, ClipDragKind)> {
     if !lanes.contains(cx, cy) {
         return None;
@@ -343,10 +373,13 @@ pub fn clip_hit(
             continue;
         }
         let edge = resize_handle_px;
+        let band = volume_band_h.max(0.0);
         let kind = if r.w > edge * 2.0 && cx - r.x < edge {
             ClipDragKind::ResizeLeft
         } else if r.w > edge * 2.0 && (r.x + r.w) - cx < edge {
             ClipDragKind::ResizeRight
+        } else if band > 0.0 && r.h > band + 4.0 && (r.y + r.h) - cy <= band {
+            ClipDragKind::Volume
         } else {
             ClipDragKind::Move
         };
@@ -459,6 +492,16 @@ pub fn compute_reorder_target_index(
     }
 }
 
+/// M10 Phase 47: `mouse_x` から clip rect 内の volume 値 (`0.0..=1.0`) を計算。
+/// `clip_w <= 0` で `0.0` を返す (ガード)。
+#[must_use]
+pub fn volume_from_mouse_x(mouse_x: f32, clip_x: f32, clip_w: f32) -> f32 {
+    if clip_w <= 0.0 {
+        return 0.0;
+    }
+    ((mouse_x - clip_x) / clip_w).clamp(0.0, 1.0)
+}
+
 /// M10 Phase 46: anchor を抜き取って target に挿入した新順 `Vec<u32>` を返す。
 /// `anchor_index >= ids.len()` または `target_index > ids.len()-1` (after remove) でも安全に clamp。
 #[must_use]
@@ -515,6 +558,11 @@ struct ClipDragAnchor {
     start_beat: f64,
     len_beats: f64,
     track_index: usize,
+    /// M10 Phase 47: drag 開始時の volume (Volume kind drag の prev 値、`0.0..=1.0`)。
+    anchor_volume: f32,
+    /// M10 Phase 47: clip rect (drag 開始時のスクリーン座標)。Volume drag で mouse_x → 0..1 マップ
+    /// と band overlay 描画に使用する (release frame に view が変化しても anchor 時点で安定)。
+    anchor_clip_rect: Rect,
 }
 
 #[derive(Clone, Debug)]
@@ -711,7 +759,11 @@ fn draw_clip<M: ?Sized + 'static>(
     if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
         return;
     }
-    let fill = clip.color.unwrap_or(style.clip_default_fill);
+    // M10 Phase 47: clip body 色は volume を alpha に反映 (low volume → 半透明、視覚 cue)。
+    let base_fill = clip.color.unwrap_or(style.clip_default_fill);
+    let v = clip.volume.clamp(0.0, 1.0);
+    let alpha = (style.clip_min_alpha + (1.0 - style.clip_min_alpha) * v).clamp(0.0, 1.0);
+    let fill = Color::rgba(base_fill.r, base_fill.g, base_fill.b, base_fill.a * alpha);
     hctx.push_rect(RectCommand {
         rect: r,
         fill,
@@ -730,6 +782,20 @@ fn draw_clip<M: ?Sized + 'static>(
             color: style.clip_text_color,
             clip_rect: Some(r),
         });
+    }
+    // M10 Phase 47: 底辺 volume slider band (clip_volume_band_h > 0 + clip 高さに余裕がある時のみ)。
+    if style.clip_volume_band_h > 0.0 && r.h > style.clip_volume_band_h + 4.0 {
+        let band_h = style.clip_volume_band_h;
+        let band_track = Rect { x: r.x, y: r.y + r.h - band_h, w: r.w, h: band_h };
+        push_filled_rect(hctx, band_track, style.clip_volume_band_track);
+        let fill_w = r.w * v;
+        if fill_w > 0.0 {
+            push_filled_rect(
+                hctx,
+                Rect { x: r.x, y: r.y + r.h - band_h, w: fill_w, h: band_h },
+                style.clip_volume_band_fill,
+            );
+        }
     }
 }
 
@@ -833,6 +899,8 @@ fn drag_preview_geometry(
             let actual_delta = new_start - anchor.start_beat;
             (new_start, (anchor.len_beats - actual_delta).max(0.05), anchor.track_index)
         }
+        // M10 Phase 47: Volume drag は clip 位置・幅・track index を変更しない (overlay は別途 band 描画)。
+        ClipDragKind::Volume => (anchor.start_beat, anchor.len_beats, anchor.track_index),
     }
 }
 
@@ -847,6 +915,10 @@ fn draw_drag_preview<M: ?Sized + 'static>(
     beat_delta: f64,
     track_delta: i32,
 ) {
+    // M10 Phase 47: Volume drag は別 overlay (`draw_volume_drag_preview`)、ここでは描画しない。
+    if matches!(nd.kind, ClipDragKind::Volume) {
+        return;
+    }
     for a in &nd.anchors {
         let (start, len, new_idx) =
             drag_preview_geometry(*a, nd.kind, beat_delta, track_delta, n_tracks);
@@ -856,6 +928,7 @@ fn draw_drag_preview<M: ?Sized + 'static>(
             len_beats: len,
             name: Arc::from(""),
             color: None,
+            volume: 1.0,
         };
         let r = clip_to_rect(new_idx, &preview_clip, view, lanes);
         if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
@@ -867,6 +940,50 @@ fn draw_drag_preview<M: ?Sized + 'static>(
             border: style.clip_selected_border,
             border_width: style.clip_selected_border_w,
             radius: [style.clip_radius; 4],
+            clip_rect: Some(lanes),
+        });
+    }
+}
+
+/// M10 Phase 47: Volume drag 中の preview overlay (元 band を上書き、現在 mouse_x の volume 値で fill)。
+fn draw_volume_drag_preview<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    nd: &ClipDragSession,
+    style: &ArrangementStyle,
+    lanes: Rect,
+) {
+    if !matches!(nd.kind, ClipDragKind::Volume) {
+        return;
+    }
+    let band_h = style.clip_volume_band_h;
+    if band_h <= 0.0 {
+        return;
+    }
+    let Some(a) = nd.anchors.first() else {
+        return;
+    };
+    let r = a.anchor_clip_rect;
+    if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
+        return;
+    }
+    let v = volume_from_mouse_x(nd.last_mouse.0, r.x, r.w);
+    let band_track = Rect { x: r.x, y: r.y + r.h - band_h, w: r.w, h: band_h };
+    hctx.push_rect(RectCommand {
+        rect: band_track,
+        fill: style.clip_volume_band_track,
+        border: Color::TRANSPARENT,
+        border_width: 0.0,
+        radius: [0.0; 4],
+        clip_rect: Some(lanes),
+    });
+    let fill_w = r.w * v;
+    if fill_w > 0.0 {
+        hctx.push_rect(RectCommand {
+            rect: Rect { x: r.x, y: r.y + r.h - band_h, w: fill_w, h: band_h },
+            fill: style.clip_volume_band_fill,
+            border: Color::TRANSPARENT,
+            border_width: 0.0,
+            radius: [0.0; 4],
             clip_rect: Some(lanes),
         });
     }
@@ -967,9 +1084,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             if in_lanes
                 && !shift
                 && let Some((hit_key, kind)) =
-                    clip_hit(tracks, view, lanes, px, py, style.resize_handle_px)
+                    clip_hit(tracks, view, lanes, px, py, style.resize_handle_px, style.clip_volume_band_h)
             {
-                let drag_keys: Vec<ClipKey> = if selected_clips.contains(&hit_key) {
+                // M10 Phase 47: Volume drag は **常に単一 clip** (multi-select 連動しない)。
+                // Move/Resize は selection 全体を drag する既存挙動を維持。
+                let drag_keys: Vec<ClipKey> = if matches!(kind, ClipDragKind::Volume) {
+                    vec![hit_key]
+                } else if selected_clips.contains(&hit_key) {
                     selected_clips.to_vec()
                 } else {
                     vec![hit_key]
@@ -980,11 +1101,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         tracks.iter().enumerate().find(|(_, t)| t.id == k.track)
                         && let Some(c) = t.clips.iter().find(|c| c.id == k.clip)
                     {
+                        let r = clip_to_rect(t_idx, c, view, lanes);
                         anchors.push(ClipDragAnchor {
                             key: *k,
                             start_beat: c.start_beat,
                             len_beats: c.len_beats,
                             track_index: t_idx,
+                            anchor_volume: c.volume.clamp(0.0, 1.0),
+                            anchor_clip_rect: r,
                         });
                     }
                 }
@@ -1147,7 +1271,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             response.hovered_track = track_index_from_y(cy, lanes.y, view.track_top, view.track_row_h)
                 .and_then(|idx| tracks.get(idx).map(|t| t.id));
             if let Some((hit_key, hit_kind)) =
-                clip_hit(tracks, view, lanes, cx, cy, style.resize_handle_px)
+                clip_hit(tracks, view, lanes, cx, cy, style.resize_handle_px, style.clip_volume_band_h)
             {
                 response.hovered_clip = Some(hit_key);
                 response.hovered_zone = Some(hit_kind);
@@ -1155,6 +1279,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
         response.dragging = clip_drag_session.as_ref().map(|nd| nd.kind);
         response.reordering = track_reorder_session.map(|tr| tr.anchor_track_id);
+        response.dragging_clip_volume = clip_drag_session
+            .as_ref()
+            .filter(|nd| matches!(nd.kind, ClipDragKind::Volume))
+            .and_then(|nd| nd.anchors.first().map(|a| a.key));
 
         // ---- cursor ----
         // drag 中 / hover 中の clip 上 / それ以外で arrangement 内なら明示的に Default
@@ -1162,7 +1290,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         if let Some(kind) = response.dragging {
             let cur = match kind {
                 ClipDragKind::Move => CursorIcon::Move,
-                ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => CursorIcon::EwResize,
+                ClipDragKind::ResizeLeft
+                | ClipDragKind::ResizeRight
+                | ClipDragKind::Volume => CursorIcon::EwResize,
             };
             self.set_cursor(cur);
         } else if response.reordering.is_some() {
@@ -1170,7 +1300,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         } else if let Some(zone) = response.hovered_zone {
             let cur = match zone {
                 ClipDragKind::Move => CursorIcon::Move,
-                ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => CursorIcon::EwResize,
+                ClipDragKind::ResizeLeft
+                | ClipDragKind::ResizeRight
+                | ClipDragKind::Volume => CursorIcon::EwResize,
             };
             self.set_cursor(cur);
         } else if let Some((px, py)) = pointer.pos
@@ -1247,6 +1379,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     bd,
                     td,
                 );
+                draw_volume_drag_preview(hctx, &nd, &style_copy, lanes);
             }
             // loop band: drag preview がある場合は preview を描く、無ければ view.loop_range
             if let Some(range) = loop_preview_clone.or(view_copy.loop_range) {
@@ -1386,6 +1519,24 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         self.push_edit(make_edit(ArrangementEditRequest::ResizeClips(deltas)));
                     }
                 }
+                // M10 Phase 47: Volume drag は単一 anchor 前提 (press detection で確約)、
+                // last_mouse.0 から anchor_clip_rect で 0..1 にマップ。
+                ClipDragKind::Volume => {
+                    if let Some(a) = nd.anchors.first() {
+                        let next = volume_from_mouse_x(
+                            nd.last_mouse.0,
+                            a.anchor_clip_rect.x,
+                            a.anchor_clip_rect.w,
+                        );
+                        if (next - a.anchor_volume).abs() > 1e-4 {
+                            self.push_edit(make_edit(ArrangementEditRequest::SetClipVolume {
+                                key: a.key,
+                                prev: a.anchor_volume,
+                                next,
+                            }));
+                        }
+                    }
+                }
             }
         }
 
@@ -1395,7 +1546,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         {
             let prev = selected_clips.to_vec();
             let next: Vec<ClipKey> =
-                if let Some((hit_key, _)) = clip_hit(tracks, view, lanes, cx, cy, style.resize_handle_px) {
+                if let Some((hit_key, _)) = clip_hit(tracks, view, lanes, cx, cy, style.resize_handle_px, style.clip_volume_band_h) {
                     vec![hit_key]
                 } else {
                     Vec::new()
@@ -1420,7 +1571,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             && !pointer.modifiers.shift
             && let Some((cx, cy)) = pointer.pos
             && lanes.contains(cx, cy)
-            && clip_hit(tracks, view, lanes, cx, cy, style.resize_handle_px).is_none()
+            && clip_hit(tracks, view, lanes, cx, cy, style.resize_handle_px, style.clip_volume_band_h).is_none()
             && !selected_clips.is_empty()
         {
             self.push_edit(make_edit(ArrangementEditRequest::SelectClips {
@@ -1528,7 +1679,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // ---- double-click (lanes 内で clip / 空白) ----
         if let Some((cx, cy)) = self.take_double_click_in_rect(lanes) {
             if let Some((hit_key, _)) =
-                clip_hit(tracks, view, lanes, cx, cy, style.resize_handle_px)
+                clip_hit(tracks, view, lanes, cx, cy, style.resize_handle_px, style.clip_volume_band_h)
             {
                 self.push_edit(make_edit(ArrangementEditRequest::DoubleClickClip(hit_key)));
             } else if let Some(idx) =
@@ -1664,6 +1815,7 @@ mod tests {
             start_beat: start,
             len_beats: len,
             name: Arc::from(name),
+            volume: 1.0,
             color: None,
         }
     }
@@ -1734,7 +1886,7 @@ mod tests {
         let lanes = test_lanes();
         let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
         // clip rect at (0, 2, 160, 28), center = (80, 16)
-        let hit = clip_hit(&tracks, view, lanes, 80.0, 16.0, 4.0);
+        let hit = clip_hit(&tracks, view, lanes, 80.0, 16.0, 4.0, 0.0);
         assert_eq!(
             hit,
             Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::Move))
@@ -1746,7 +1898,7 @@ mod tests {
         let view = test_view();
         let lanes = test_lanes();
         let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
-        let hit = clip_hit(&tracks, view, lanes, 1.0, 16.0, 4.0);
+        let hit = clip_hit(&tracks, view, lanes, 1.0, 16.0, 4.0, 0.0);
         assert_eq!(
             hit,
             Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeLeft))
@@ -1758,7 +1910,7 @@ mod tests {
         let view = test_view();
         let lanes = test_lanes();
         let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
-        let hit = clip_hit(&tracks, view, lanes, 159.0, 16.0, 4.0);
+        let hit = clip_hit(&tracks, view, lanes, 159.0, 16.0, 4.0, 0.0);
         assert_eq!(
             hit,
             Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeRight))
@@ -1770,7 +1922,7 @@ mod tests {
         let view = test_view();
         let lanes = test_lanes();
         let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
-        let hit = clip_hit(&tracks, view, lanes, -10.0, -10.0, 4.0);
+        let hit = clip_hit(&tracks, view, lanes, -10.0, -10.0, 4.0, 0.0);
         assert_eq!(hit, None);
     }
 
@@ -1842,6 +1994,8 @@ mod tests {
             start_beat: 4.0,
             len_beats: 2.0,
             track_index: 0,
+            anchor_volume: 1.0,
+            anchor_clip_rect: Rect { x: 0.0, y: 0.0, w: 100.0, h: 28.0 },
         };
         let (s, l, idx) = drag_preview_geometry(anchor, ClipDragKind::Move, 1.5, 5, 3);
         assert!((s - 5.5).abs() < 1e-9);
@@ -1920,6 +2074,75 @@ mod tests {
         assert_eq!(apply_reorder(&[], 0, 0), Vec::<u32>::new()); // empty
     }
 
+    // M10 Phase 47: clip volume
+    #[test]
+    fn volume_from_mouse_x_basic() {
+        // clip_x=100, clip_w=200 → mouse=100 → 0.0、200 → 0.5、300 → 1.0
+        assert!((volume_from_mouse_x(100.0, 100.0, 200.0) - 0.0).abs() < 1e-6);
+        assert!((volume_from_mouse_x(200.0, 100.0, 200.0) - 0.5).abs() < 1e-6);
+        assert!((volume_from_mouse_x(300.0, 100.0, 200.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn volume_from_mouse_x_clamps_outside() {
+        assert!((volume_from_mouse_x(50.0, 100.0, 200.0) - 0.0).abs() < 1e-6);
+        assert!((volume_from_mouse_x(500.0, 100.0, 200.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn volume_from_mouse_x_zero_width_safe() {
+        assert!((volume_from_mouse_x(100.0, 100.0, 0.0) - 0.0).abs() < 1e-6);
+        assert!((volume_from_mouse_x(100.0, 100.0, -10.0) - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn clip_hit_returns_volume_at_bottom_band() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        // clip rect at (0, 2, 160, 28) → bottom band y in [28, 30] (band_h=4 だが clip 高さ 28 に余裕がある)
+        // mouse at (80, 27.5) → bottom 4px 内 (28+2-4=26 ~ 28+2=30 範囲)
+        let hit = clip_hit(&tracks, view, lanes, 80.0, 28.0, 4.0, 4.0);
+        assert_eq!(hit, Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::Volume)));
+    }
+
+    #[test]
+    fn clip_hit_resize_takes_priority_over_volume() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        // 左下角 (1, 28) → 左端 4px + 下端 4px の競合 → ResizeLeft が優先 (resize > volume > move)
+        let hit = clip_hit(&tracks, view, lanes, 1.0, 28.0, 4.0, 4.0);
+        assert_eq!(hit, Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeLeft)));
+    }
+
+    #[test]
+    fn clip_hit_volume_disabled_when_band_h_zero() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        // band_h=0 で bottom 領域も Move 扱い
+        let hit = clip_hit(&tracks, view, lanes, 80.0, 28.0, 4.0, 0.0);
+        assert_eq!(hit, Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::Move)));
+    }
+
+    #[test]
+    fn drag_preview_geometry_volume_no_move() {
+        let anchor = ClipDragAnchor {
+            key: ClipKey { track: 0, clip: 0 },
+            start_beat: 4.0,
+            len_beats: 2.0,
+            track_index: 1,
+            anchor_volume: 0.5,
+            anchor_clip_rect: Rect { x: 0.0, y: 0.0, w: 100.0, h: 28.0 },
+        };
+        let (s, l, idx) = drag_preview_geometry(anchor, ClipDragKind::Volume, 1.5, 5, 3);
+        // Volume drag は位置・幅・track index を変えない
+        assert!((s - 4.0).abs() < 1e-9);
+        assert!((l - 2.0).abs() < 1e-9);
+        assert_eq!(idx, 1);
+    }
+
     #[test]
     fn drag_preview_geometry_resize_left_clamps_min_len() {
         let anchor = ClipDragAnchor {
@@ -1927,6 +2150,8 @@ mod tests {
             start_beat: 4.0,
             len_beats: 2.0,
             track_index: 1,
+            anchor_volume: 1.0,
+            anchor_clip_rect: Rect { x: 0.0, y: 0.0, w: 100.0, h: 28.0 },
         };
         let (s, l, idx) = drag_preview_geometry(anchor, ClipDragKind::ResizeLeft, 10.0, 0, 4);
         // max_start = 4 + 2 - 0.05 = 5.95 → new_start clamped to 5.95
