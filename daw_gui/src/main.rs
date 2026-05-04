@@ -372,6 +372,16 @@ fn spawn_incoming_bridge(
                 ChildToMain::AllPluginStates { entries } => {
                     Some(AppEvent::AllStatesReceived(entries))
                 }
+                ChildToMain::ExportWavComplete { error } => {
+                    // PR3 stub: log only. PR5 wires this back to the
+                    // GUI status bar via AppEvent::ExportWavComplete.
+                    if let Some(err) = error {
+                        tracing::warn!(error = %err, "ExportWavComplete: failed");
+                    } else {
+                        tracing::info!("ExportWavComplete: success");
+                    }
+                    None
+                }
                 ChildToMain::Hello { .. } => None,
             };
             if let Some(event) = event

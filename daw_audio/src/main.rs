@@ -177,10 +177,16 @@ async fn recv_loop(
                     samples,
                 });
             }
-            // Plugin lifecycle, GUI, state save/restore, export, vocal
-            // synthesis, per-track mixer params, slot reorder, and the
-            // plugin-host CloseWorkerPool tear-down all stay on the
-            // plugin_host side (or move to daw_audio in PR6d+).
+            // ExportWav is the trigger for A3's offline render thread.
+            // PR3 only stubs the receive arm so the protocol roundtrips;
+            // PR4 wires it to daw_audio/src/export.rs.
+            Ok(MainToChild::ExportWav { path }) => {
+                tracing::info!(path = %path.display(), "ExportWav received (PR3 stub, PR4 will drive the render)");
+            }
+            // Plugin lifecycle, GUI, state save/restore, per-track
+            // mixer params, slot reorder, render-mode bookend, and the
+            // plugin-host worker-pool tear-down stay on the
+            // plugin_host side.
             Ok(MainToChild::Ack)
             | Ok(MainToChild::Session(_))
             | Ok(MainToChild::SetSlotPlugin { .. })
@@ -194,6 +200,7 @@ async fn recv_loop(
             | Ok(MainToChild::OpenSlotGuiEmbedded { .. })
             | Ok(MainToChild::CloseSlotGui { .. })
             | Ok(MainToChild::ResizeSlotGui { .. })
+            | Ok(MainToChild::SetRenderMode(_))
             | Ok(MainToChild::CloseWorkerPool) => {}
             Err(e) => {
                 tracing::info!(error = ?e, "receive loop ending");

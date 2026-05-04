@@ -15,7 +15,9 @@ use std::thread::JoinHandle;
 
 use anyhow::{Context, Result};
 use common::plugin_format::PluginFormat;
-use common::protocol::{AudioSession, ChildKind, ChildToMain, MainToChild, PluginSlot, SlotState};
+use common::protocol::{
+    AudioSession, ChildKind, ChildToMain, MainToChild, PluginSlot, RenderMode, SlotState,
+};
 use common::wire::{read_msg, write_msg};
 use tokio::net::windows::named_pipe::NamedPipeClient;
 use tokio::sync::mpsc as tmpsc;
@@ -188,6 +190,9 @@ enum PluginCommand {
     },
     /// Tear down the worker pool started by `OpenWorkerPool`.
     CloseWorkerPool,
+    /// Set every loaded plugin's CLAP render mode (Realtime ↔ Offline).
+    /// Sent by daw_audio bookending an offline export.
+    SetRenderMode(RenderMode),
     Shutdown,
 }
 
@@ -395,6 +400,23 @@ fn plugin_main_loop(
                     if let Some(pool) = worker_pool.take() {
                         pool.shutdown();
                     }
+                }
+                PluginCommand::SetRenderMode(mode) => {
+                    // Forward the CLAP render hint to every loaded
+                    // plugin in every chain. Failures (plugin missing
+                    // the extension, mode rejected) are best-effort and
+                    // don't surface to the audio side.
+                    for chain in tracks.tracks.chains.values_mut() {
+                        for plugin in chain
+                            .midi_fx_chain
+                            .iter_mut()
+                            .chain(chain.instrument.iter_mut())
+                            .chain(chain.fx_chain.iter_mut())
+                        {
+                            let _ = plugin.set_render_mode(mode);
+                        }
+                    }
+                    tracing::info!(?mode, "render mode broadcast to all plugins");
                 }
                 PluginCommand::SetSlotPlugin {
                     track,
@@ -1043,6 +1065,16 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
         MainToChild::CloseWorkerPool => {
             tracing::info!("received CloseWorkerPool");
             plugin.send(PluginCommand::CloseWorkerPool);
+        }
+        MainToChild::SetRenderMode(mode) => {
+            tracing::info!(?mode, "received SetRenderMode");
+            plugin.send(PluginCommand::SetRenderMode(mode));
+        }
+        MainToChild::ExportWav { .. } => {
+            // ExportWav is consumed by daw_audio (which freewheels the
+            // song through its existing AudioWorker pool). The plugin
+            // host doesn't drive the render any more — it only switches
+            // render mode on `MainToChild::SetRenderMode`.
         }
         // OpenPluginShmem / ClosePluginShmem flow daw_gui → daw_audio,
         // not into the plugin host (the plugin host is the *creator* of
