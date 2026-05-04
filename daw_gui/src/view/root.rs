@@ -74,10 +74,9 @@ pub fn build_root(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize)
     bottom_panel::draw(app, ui, bottom_rect);
     status_bar::draw(app, ui, status_rect);
 
-    // Modal: plugin picker。最後に描く (上に乗せる)。
-    if app.is_plugin_picker_open {
-        plugin_picker::draw(app, ui, screen);
-    }
+    // Modal: plugin picker。draw 関数内で modal の open/close を app.is_plugin_picker_open
+    // と同期させる (常時呼び、内部で is_modal_open / open_modal を管理)。
+    plugin_picker::draw(app, ui, screen);
 }
 
 /// 上部 menu bar (File / Edit / View) を library widget で描画。
@@ -219,7 +218,8 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>) {
             app.handle_event(AppEvent::ToggleHelp)
         }));
     }
-    if ui.take_shortcut("escape") {
+    // modal が開いている間は escape を消費しない (modal 側で close する)。
+    if !app.is_plugin_picker_open && ui.take_shortcut("escape") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::CloseHelp)
         }));
