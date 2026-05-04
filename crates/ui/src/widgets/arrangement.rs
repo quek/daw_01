@@ -507,13 +507,12 @@ pub fn apply_reorder(ids: &[u32], anchor_index: usize, target_index: usize) -> V
     v
 }
 
-/// track header 1 行内のレイアウト (Name button + 5 small buttons + 任意の volume band)。
-/// `name_rect` (= drag start zone & text area)、`buttons` (= [M, S, Up, Dn, Del])、
-/// `volume_band` は inner 下部に band 用の余裕がある時のみ `Some` (Phase 47b)。
+/// track header 1 行内のレイアウト (Name button + 2 small buttons + 任意の volume band)。
+/// `name_rect` (= drag start zone & text area)、`buttons` (= [M, S]、Phase 47c で ↑/↓/× は drag&drop +
+/// Delete shortcut に置換され削除)、`volume_band` は inner 下部に band 用の余裕がある時のみ `Some` (Phase 47b)。
 struct HeaderRowLayout {
-    inner: Rect,
     name_rect: Rect,
-    buttons: [Rect; 5],
+    buttons: [Rect; 2],
     /// M10 Phase 47b: track volume band rect (`row_h` 余裕がある時のみ Some)。
     volume_band: Option<Rect>,
 }
@@ -531,11 +530,15 @@ fn header_row_layout(row: Rect, volume_band_h: f32) -> HeaderRowLayout {
     let btn_h = inner.h.min(20.0);
     let small = 22.0_f32;
     let gap = 2.0_f32;
-    let total_right = small * 5.0 + gap * 5.0;
+    // Phase 47c: M + S の 2 button (← Phase 45e の name + M + S + ↑ + ↓ + × の 6 button から削減)。
+    // ↑/↓ は drag&drop reorder (Phase 46) で代替、× は Delete shortcut (Phase 47c) で代替。
+    let n_btn = 2;
+    #[allow(clippy::cast_precision_loss)]
+    let total_right = small * n_btn as f32 + gap * n_btn as f32;
     let name_w = (inner.w - total_right).max(20.0);
     let name_rect = Rect { x: inner.x, y: inner.y, w: name_w, h: btn_h };
     let mut x_cursor = inner.x + name_w + gap;
-    let mut buttons = [Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }; 5];
+    let mut buttons = [Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }; 2];
     for slot in &mut buttons {
         *slot = Rect { x: x_cursor, y: inner.y, w: small, h: btn_h };
         x_cursor += small + gap;
@@ -554,7 +557,7 @@ fn header_row_layout(row: Rect, volume_band_h: f32) -> HeaderRowLayout {
     } else {
         None
     };
-    HeaderRowLayout { inner, name_rect, buttons, volume_band }
+    HeaderRowLayout { name_rect, buttons, volume_band }
 }
 
 // ============================================================
@@ -1394,11 +1397,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         });
 
-        // ---- shortcut: Delete (selected clips を一括削除) ----
-        if self.take_shortcut("delete") && !selected_clips.is_empty() {
-            self.push_edit(make_edit(ArrangementEditRequest::DeleteClips(
-                selected_clips.to_vec(),
-            )));
+        // ---- shortcut: Delete ----
+        // Phase 47c: clip 選択優先、無ければ selected_track を削除。
+        if self.take_shortcut("delete") {
+            if !selected_clips.is_empty() {
+                self.push_edit(make_edit(ArrangementEditRequest::DeleteClips(
+                    selected_clips.to_vec(),
+                )));
+            } else if let Some(tid) = selected_track {
+                self.push_edit(make_edit(ArrangementEditRequest::DeleteTrack(tid)));
+            }
         }
 
         // ---- clip drag release → MoveClips / ResizeClips ----
@@ -1675,12 +1683,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 }
 
                 let layout = header_row_layout(row, style.track_volume_band_h);
-                let inner = layout.inner;
                 let name_rect = layout.name_rect;
-                let [m_rect, s_rect, up_rect, dn_rect, del_rect] = layout.buttons;
-                let _ = inner;
-                let button_zones: [Rect; 6] =
-                    [name_rect, m_rect, s_rect, up_rect, dn_rect, del_rect];
+                let [m_rect, s_rect] = layout.buttons;
+                let button_zones: [Rect; 3] = [name_rect, m_rect, s_rect];
 
                 // M10 Phase 47b: track volume band 描画。
                 // drag 中の track はその drag session の last_mouse_x で preview volume を計算 (リアルタイム feedback)。
@@ -1712,24 +1717,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let id_name = ("arr_tname", t.id);
                 let id_mute = ("arr_tmute", t.id);
                 let id_solo = ("arr_tsolo", t.id);
-                let id_up = ("arr_tup", t.id);
-                let id_dn = ("arr_tdn", t.id);
-                let id_del = ("arr_tdel", t.id);
 
                 let track_id = t.id;
                 let muted = t.muted;
                 let solo = t.solo;
-
-                // make_edit 経由の Edit を発行する closure を 1 つずつ作成 (make_edit を Arc 化して share)
-                let make_edit_arc: Arc<dyn Fn(ArrangementEditRequest) -> Edit<M> + Send + Sync> = {
-                    // make_edit は move でこのクロージャに 1 度だけ取り込まれる + 各 button click に share する
-                    // ただし make_edit は外側 closure に move されるので、内側で Arc::clone できない。
-                    // そこで make_edit を Arc に包むのは一度だけ、widget 全体で 1 回だけ実行できる場所がない。
-                    // → 各 button では make_edit を直接呼ぶことができないので、1 つの fn pointer にせず
-                    // closure の中で req を作って push_edit する。
-                    Arc::new(|_| -> Edit<M> { unreachable!("placeholder") })
-                };
-                drop(make_edit_arc); // 上のコメント通り、Arc 化は実装上不要 (各 closure で req を make_edit に直接渡す)
 
                 let name_text = t.name.clone();
                 // Name button: single click → SelectTrack (header background click と同じ動作)、
@@ -1750,15 +1741,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 self.toggle_button_at(id_solo, "S", s_rect, solo, &style.solo_button, |_| {
                     make_edit(ArrangementEditRequest::ToggleTrackSolo(track_id))
                 });
-                self.button_at(id_up, "↑", up_rect, || {
-                    make_edit(ArrangementEditRequest::MoveTrackUp(track_id))
-                });
-                self.button_at(id_dn, "↓", dn_rect, || {
-                    make_edit(ArrangementEditRequest::MoveTrackDown(track_id))
-                });
-                self.button_at(id_del, "×", del_rect, || {
-                    make_edit(ArrangementEditRequest::DeleteTrack(track_id))
-                });
+                // Phase 47c: ↑/↓/× button は削除 (drag&drop reorder + Delete shortcut で代替)。
+                // `MoveTrackUp/Down` / `DeleteTrack` Edit variants は context menu / keyboard 用に残す。
 
                 // Response.track_header_rects に積む
                 response.track_header_rects.push((t.id, row));
