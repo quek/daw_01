@@ -148,7 +148,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 w: rect.w - 4.0,
                 h: 22.0,
             };
-            let resp = ui.text_input_at(
+            let resp = ui.text_input_at_focused(
                 ("track_rename", track_id),
                 input_rect,
                 &app.track_rename_text,
