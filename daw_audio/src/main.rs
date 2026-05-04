@@ -23,7 +23,7 @@ mod sequencer;
 mod tracks;
 mod vocal;
 
-use engine::{LocalState, PlaybackCommand, SharedState};
+use engine::{EngineShared, LocalState, PlaybackCommand, SharedState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -45,6 +45,10 @@ async fn main() -> Result<()> {
     );
 
     let shared = Arc::new(SharedState::new());
+    // Engine resources shared between the CPAL closure and (in A3) the
+    // export thread. Held by `LocalState` for the audio path; export
+    // will hold its own clone.
+    let engine_shared = Arc::new(EngineShared::new());
     // Master gain stays a separate atomic from `SharedState` because the
     // CPAL closure applies it on the device-final samples (post-engine).
     let master_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
@@ -57,6 +61,7 @@ async fn main() -> Result<()> {
 
     let _stream = start_output_stream(
         Arc::clone(&shared),
+        Arc::clone(&engine_shared),
         Arc::clone(&bridge),
         Arc::clone(&master_gain),
         session.sample_rate,
@@ -300,6 +305,7 @@ fn handle_open_plugin_shmem(
 
 fn start_output_stream(
     shared: Arc<SharedState>,
+    engine_shared: Arc<EngineShared>,
     bridge: Arc<AudioBridgeHandle>,
     master_gain: Arc<AtomicU32>,
     session_sample_rate: u32,
@@ -336,6 +342,7 @@ fn start_output_stream(
         &config,
         channels,
         shared,
+        engine_shared,
         bridge,
         master_gain,
         session_sample_rate,
@@ -351,6 +358,7 @@ fn build_stream(
     config: &cpal::StreamConfig,
     channels: u16,
     shared: Arc<SharedState>,
+    engine_shared: Arc<EngineShared>,
     bridge: Arc<AudioBridgeHandle>,
     master_gain: Arc<AtomicU32>,
     session_sample_rate: u32,
@@ -361,7 +369,7 @@ fn build_stream(
     // `LocalState` is the CPAL closure's exclusive heap. It holds
     // master_l/r and the per-track scratch — pre-allocated here, never
     // touched outside the audio thread.
-    let mut local = LocalState::new(max_frames, cmd_rx);
+    let mut local = LocalState::new(max_frames, cmd_rx, engine_shared);
 
     let stream = device
         .build_output_stream(

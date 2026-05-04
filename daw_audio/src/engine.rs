@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use common::model::{Song, Track};
 use common::plugin_ref::{PluginRef, WorkerSyncRef};
 use common::process_data::EventKind;
@@ -29,6 +29,7 @@ use common::protocol::PluginSlot;
 use common::timing::{effective_loop_bounds, song_ended};
 use common::worker_bridge::WorkerBridgeHandle;
 
+use crate::audio_worker::AudioWorkerPool;
 use crate::mixer::TrackScratch;
 use crate::sequencer::{NoteTransition, TimedNoteEvent, collect_events_for_buffer};
 use crate::vocal::VocalAudio;
@@ -118,6 +119,61 @@ impl Default for SharedState {
     }
 }
 
+/// Engine resources shared between the CPAL audio thread and (in A3) an
+/// offline-export worker. All fields are wait-free: the IPC apply path
+/// (`pump_commands`) publishes new snapshots via `ArcSwap::store`, RT
+/// readers `load()` an immutable snapshot for the duration of one
+/// buffer.
+///
+/// Held by `LocalState::shared` (the CPAL closure) and — once A3 lands
+/// — also by the export thread, so both can drive `plugin.process()`
+/// without re-syncing per-buffer state.
+pub struct EngineShared {
+    /// Owned `WorkerBridge` shmem. Populated on `OpenWorkerPool`.
+    pub worker_bridge: ArcSwapOption<WorkerBridgeHandle>,
+    /// Per-worker handshake handles (one per audio-engine worker), in
+    /// the same order the plugin host's `WorkerPool` opened them.
+    pub worker_syncs: ArcSwap<Vec<WorkerSyncRef>>,
+    /// `plugin_id` → `PluginRef` (process_data shmem ptr). New
+    /// snapshot on every plugin load / unload.
+    pub plugin_refs: ArcSwap<HashMap<u32, PluginRef>>,
+    /// `(track, slot)` → `plugin_id`. New snapshot in lock-step with
+    /// `plugin_refs`.
+    pub slot_to_plugin_id: ArcSwap<HashMap<(u32, PluginSlot), u32>>,
+    /// Per-track pre-rendered vocal audio (VOICEVOX results). The outer
+    /// map is snapshotted on add/remove; the inner `ArcSwapOption` is
+    /// hot-swapped on `SetVocalAudio` so re-synthesis lands on the next
+    /// buffer.
+    pub vocal_store: ArcSwap<HashMap<u32, Arc<ArcSwapOption<VocalAudio>>>>,
+    /// Worker pool that fans per-track work across N audio-engine
+    /// workers. `None` until `OpenWorkerPool` arrives.
+    pub worker_pool: ArcSwapOption<AudioWorkerPool>,
+    /// Set by A3's export thread while it owns the audio path. CPAL
+    /// callback skips its `process_buffer` and writes silence so the
+    /// export render can drive `plugin.process()` exclusively.
+    pub export_running: AtomicBool,
+}
+
+impl EngineShared {
+    pub fn new() -> Self {
+        Self {
+            worker_bridge: ArcSwapOption::empty(),
+            worker_syncs: ArcSwap::from_pointee(Vec::new()),
+            plugin_refs: ArcSwap::from_pointee(HashMap::new()),
+            slot_to_plugin_id: ArcSwap::from_pointee(HashMap::new()),
+            vocal_store: ArcSwap::from_pointee(HashMap::new()),
+            worker_pool: ArcSwapOption::empty(),
+            export_running: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Default for EngineShared {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Audio-thread-private engine state. Lives in the CPAL closure for the
 /// whole stream lifetime.
 pub struct LocalState {
@@ -131,30 +187,12 @@ pub struct LocalState {
     /// detect Play/Stop transitions and reset the playhead / queue
     /// note-offs cleanly.
     pub playing: bool,
-    /// Owned `WorkerBridge` shmem the audio thread reads from. None
-    /// until OpenWorkerPool arrives.
-    pub worker_bridge: Option<WorkerBridgeHandle>,
-    /// Per-worker handshake handles (one per audio-engine worker).
-    /// Populated alongside `worker_bridge`.
-    pub worker_syncs: Vec<WorkerSyncRef>,
-    /// `plugin_id` → `PluginRef` (process_data shmem ptr). Populated as
-    /// the plugin host loads instances and we receive the shmem ids.
-    pub plugin_refs: HashMap<u32, PluginRef>,
-    /// `(track, slot)` → `plugin_id`. Lets `process_buffer` walk the
-    /// song's tracks and find the plugin instance assigned to each slot.
-    pub slot_to_plugin_id: HashMap<(u32, PluginSlot), u32>,
-    /// Per-track pre-rendered vocal audio (e.g. VOICEVOX synthesis
-    /// result). `process_track_owned` reads these directly into the
-    /// track output when the track has no instrument plugin.
-    pub vocal_store: HashMap<u32, Arc<ArcSwapOption<crate::vocal::VocalAudio>>>,
     /// Pending IPC commands from the receive loop. Drained at the top
-    /// of every `process_buffer` so handles arrive before dispatch.
+    /// of every `process_buffer` so `EngineShared` snapshots are fresh
+    /// before dispatch.
     pub cmd_rx: tokio::sync::mpsc::UnboundedReceiver<AudioCommand>,
-    /// Worker pool that runs per-track plugin dispatch in parallel.
-    /// `None` until the engine knows it can spawn workers (e.g. before
-    /// `OpenWorkerPool` arrives), in which case the master falls back
-    /// to a serial loop.
-    pub worker_pool: Option<crate::audio_worker::AudioWorkerPool>,
+    /// Resources shared with the (future) export thread.
+    pub shared: Arc<EngineShared>,
     /// Debug-only: playhead at the last heartbeat log. Throttles
     /// `engine heartbeat` to once per second of audio time.
     #[cfg(debug_assertions)]
@@ -165,6 +203,7 @@ impl LocalState {
     pub fn new(
         max_frames: usize,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<AudioCommand>,
+        shared: Arc<EngineShared>,
     ) -> Self {
         let scratch = (0..MAX_TRACKS).map(|_| TrackScratch::new()).collect();
         Self {
@@ -172,21 +211,19 @@ impl LocalState {
             master_l: vec![0.0; max_frames],
             master_r: vec![0.0; max_frames],
             playing: false,
-            worker_bridge: None,
-            worker_syncs: Vec::new(),
-            plugin_refs: HashMap::new(),
-            slot_to_plugin_id: HashMap::new(),
-            vocal_store: HashMap::new(),
             cmd_rx,
-            worker_pool: None,
+            shared,
             #[cfg(debug_assertions)]
             last_heartbeat_playhead: 0,
         }
     }
 
     /// Drain pending IPC commands. Called at the top of `process_buffer`.
-    /// Allocations only happen when the daw_gui side mutates plugin
-    /// graph (plugin add/remove) — outside the steady-state RT path.
+    /// Each command publishes a fresh snapshot into `EngineShared` via
+    /// `ArcSwap::store`, so RT readers see the new state on this very
+    /// buffer. Allocations only happen here when the daw_gui side
+    /// mutates the plugin graph (plugin add/remove) — outside the
+    /// steady-state RT path.
     fn pump_commands(&mut self) {
         while let Ok(cmd) = self.cmd_rx.try_recv() {
             match cmd {
@@ -195,16 +232,21 @@ impl LocalState {
                     worker_syncs,
                 } => {
                     let n = worker_syncs.len() as u32;
-                    self.worker_bridge = Some(bridge);
-                    self.worker_syncs = worker_syncs;
+                    self.shared.worker_bridge.store(Some(Arc::new(bridge)));
+                    self.shared.worker_syncs.store(Arc::new(worker_syncs));
                     // Spawn the audio-engine worker pool to fan
                     // per-track work out 1:1 against the plugin host.
-                    match crate::audio_worker::AudioWorkerPool::new(n) {
-                        Ok(pool) => self.worker_pool = Some(pool),
-                        Err(e) => tracing::error!(error = ?e, "AudioWorkerPool::new failed"),
+                    match AudioWorkerPool::new(n) {
+                        Ok(pool) => {
+                            self.shared.worker_pool.store(Some(Arc::new(pool)));
+                        }
+                        Err(e) => {
+                            tracing::error!(error = ?e, "AudioWorkerPool::new failed");
+                            self.shared.worker_pool.store(None);
+                        }
                     }
                     tracing::info!(
-                        n_workers = self.worker_syncs.len(),
+                        n_workers = self.shared.worker_syncs.load().len(),
                         "audio engine bound to plugin-host worker pool"
                     );
                 }
@@ -214,19 +256,30 @@ impl LocalState {
                     track,
                     slot,
                 } => {
-                    // If the same (track, slot) had a previous plugin,
-                    // drop its mapping first so `process_buffer` doesn't
-                    // dispatch to a stale ProcessData.
-                    if let Some(stale) = self.slot_to_plugin_id.insert((track, slot), plugin_id) {
-                        self.plugin_refs.remove(&stale);
+                    // Snapshot-copy-mutate-publish so RT readers either
+                    // see the old map or the fully-populated new one,
+                    // never a partial state.
+                    let mut new_refs: HashMap<u32, PluginRef> =
+                        (**self.shared.plugin_refs.load()).clone();
+                    let mut new_slot: HashMap<(u32, PluginSlot), u32> =
+                        (**self.shared.slot_to_plugin_id.load()).clone();
+                    if let Some(stale) = new_slot.insert((track, slot), plugin_id) {
+                        new_refs.remove(&stale);
                     }
-                    self.plugin_refs.insert(plugin_id, plugin_ref);
+                    new_refs.insert(plugin_id, plugin_ref);
+                    self.shared.plugin_refs.store(Arc::new(new_refs));
+                    self.shared.slot_to_plugin_id.store(Arc::new(new_slot));
                     tracing::info!(plugin_id, track, ?slot, "plugin shmem registered");
                 }
                 AudioCommand::ClosePluginShmem { plugin_id } => {
-                    self.plugin_refs.remove(&plugin_id);
-                    self.slot_to_plugin_id
-                        .retain(|_, pid| *pid != plugin_id);
+                    let mut new_refs: HashMap<u32, PluginRef> =
+                        (**self.shared.plugin_refs.load()).clone();
+                    let mut new_slot: HashMap<(u32, PluginSlot), u32> =
+                        (**self.shared.slot_to_plugin_id.load()).clone();
+                    new_refs.remove(&plugin_id);
+                    new_slot.retain(|_, pid| *pid != plugin_id);
+                    self.shared.plugin_refs.store(Arc::new(new_refs));
+                    self.shared.slot_to_plugin_id.store(Arc::new(new_slot));
                     tracing::info!(plugin_id, "plugin shmem dropped");
                 }
                 AudioCommand::SetVocalAudio {
@@ -238,11 +291,21 @@ impl LocalState {
                         clip_start_samples,
                         samples,
                     });
-                    let slot = self
-                        .vocal_store
-                        .entry(track)
-                        .or_insert_with(|| Arc::new(ArcSwapOption::empty()));
-                    slot.store(Some(new_audio));
+                    // Reuse an existing per-track ArcSwapOption if we
+                    // have one (so any clone the audio path is holding
+                    // sees the new sample), else mint one and publish a
+                    // new outer map snapshot.
+                    let cur = self.shared.vocal_store.load();
+                    if let Some(slot) = cur.get(&track) {
+                        slot.store(Some(new_audio));
+                    } else {
+                        let mut new_map: HashMap<u32, Arc<ArcSwapOption<VocalAudio>>> =
+                            (**cur).clone();
+                        let slot = Arc::new(ArcSwapOption::empty());
+                        slot.store(Some(new_audio));
+                        new_map.insert(track, slot);
+                        self.shared.vocal_store.store(Arc::new(new_map));
+                    }
                     tracing::info!(track, "vocal audio updated");
                 }
             }
@@ -294,17 +357,26 @@ impl LocalState {
             let any_solo = song.tracks.iter().any(|t| t.solo);
             let n_tracks = song.tracks.len().min(MAX_TRACKS);
 
+            // Snapshot the wait-free shared state once for this buffer.
+            // Guards stay live until the end of the call so the workers
+            // can safely deref them via the publish pointers.
+            let plugin_refs_g = self.shared.plugin_refs.load();
+            let slot_map_g = self.shared.slot_to_plugin_id.load();
+            let vocal_store_g = self.shared.vocal_store.load();
+            let worker_syncs_g = self.shared.worker_syncs.load();
+            let pool_g = self.shared.worker_pool.load();
+
             // Fan the per-track work out across the audio worker pool
             // when one is bound; otherwise fall back to serial dispatch
             // through `worker_syncs[0]` (still correct, just slower).
-            if let Some(pool) = self.worker_pool.as_ref() {
+            if let Some(pool) = pool_g.as_deref() {
                 pool.dispatch_and_wait(
                     Some(song),
                     &mut self.scratch[..n_tracks],
-                    &self.plugin_refs,
-                    &self.slot_to_plugin_id,
-                    &self.vocal_store,
-                    &self.worker_syncs,
+                    &plugin_refs_g,
+                    &slot_map_g,
+                    &vocal_store_g,
+                    &worker_syncs_g,
                     &mut self.master_l[..n],
                     &mut self.master_r[..n],
                     sample_rate,
@@ -314,18 +386,18 @@ impl LocalState {
                     any_solo,
                 );
             } else {
-                let worker_sync = self.worker_syncs.first();
+                let worker_sync = worker_syncs_g.first();
                 for track_idx in 0..n_tracks {
                     let song_track = &song.tracks[track_idx];
                     let scratch = &mut self.scratch[track_idx];
                     let track_id = song_track.id;
-                    let vocal = self.vocal_store.get(&track_id);
+                    let vocal = vocal_store_g.get(&track_id);
                     process_track_owned(
                         track_idx as u32,
                         song_track,
                         scratch,
-                        &self.plugin_refs,
-                        &self.slot_to_plugin_id,
+                        &plugin_refs_g,
+                        &slot_map_g,
                         vocal,
                         worker_sync,
                         sample_rate,
@@ -363,12 +435,9 @@ impl LocalState {
                         .take(n_tracks)
                         .map(|s| (s.peak_l, s.peak_r, s.effective_mute))
                         .collect();
-                    let plugin_ids: Vec<u32> = self.plugin_refs.keys().copied().collect();
-                    let slot_keys: Vec<((u32, PluginSlot), u32)> = self
-                        .slot_to_plugin_id
-                        .iter()
-                        .map(|(k, v)| (*k, *v))
-                        .collect();
+                    let plugin_ids: Vec<u32> = plugin_refs_g.keys().copied().collect();
+                    let slot_keys: Vec<((u32, PluginSlot), u32)> =
+                        slot_map_g.iter().map(|(k, v)| (*k, *v)).collect();
                     tracing::info!(
                         playing,
                         playhead,
@@ -376,8 +445,8 @@ impl LocalState {
                         ?track_peaks,
                         ?plugin_ids,
                         ?slot_keys,
-                        n_workers = self.worker_syncs.len(),
-                        worker_pool = self.worker_pool.is_some(),
+                        n_workers = worker_syncs_g.len(),
+                        worker_pool = pool_g.is_some(),
                         "engine heartbeat"
                     );
                 }

@@ -30,20 +30,20 @@ DESIGN.md M1 残項目を 6 タスクに分解。`docs/plan_<feature>.md` への
 ### 着手順マップ
 
 ```
-A2 (完了 ✓) ─┬─→ A1 VOICEVOX ─┐
-              │                 ├─→ M1 完成
-              └─→ A3 WAV export ┘
-A6 tempo/timesig (独立、早期で OK ← 推奨次タスク)
-A4 autosave     (独立、早期で OK)
-A5 lyric UI     (gui_01 #015 要望 → 取り込み、A1 の前提)
+A2 (完了 ✓) ─→ A3 WAV export (機能復旧 ← 次タスク) ─┬─→ A1 VOICEVOX ─→ M1 完成
+                                                      │
+A6 tempo/timesig (独立、A3 後)                       │
+A4 autosave     (独立、A3 後)                        │
+A5 lyric UI     (gui_01 #015 要望、 A1 の前提)        │
 ```
 
 優先順序の根拠:
-- **A2 完了**。track-parallel スレッドプール + MMCSS / thread_check / assert_no_alloc が稼働。次タスクの前提が整った
-- **A6 / A4** は独立で軽量。次の推奨タスクは **A6 (tempo/timesig 変更 UI)**
+- **A2 完了**。track-parallel スレッドプール + MMCSS / thread_check / assert_no_alloc が稼働
+- **A3 が次** — A2 で旧 export_wav_offline を削除して GUI Export メニューも消した状態。機能消失中なので「新機能 (A6 等)」 より「機能復旧 (A3)」 を優先する
+- **A3 は engine resource 共有化を伴う大規模変更**: `LocalState` の `plugin_refs / slot_to_plugin_id / vocal_store / worker_syncs / worker_pool` を `SharedState` に Arc 化する設計が前提。`docs/plan_a3_wav_export.md` への切り出し推奨
+- **A6 / A4** は A3 完了後に着手 (独立で軽量)
 - **A5** は gui_01 改修先行 (#015)。reply 待ちの間 A1 の Engine / HTTP 周りを進める
 - **A1** は A5 完了後に本格実装
-- **A3** は engine resource 共有化が必要 (大規模)、A1 と並行可
 
 ### A2: 責務分担正常化 + track-parallel スレッドプール化 [完了]
 

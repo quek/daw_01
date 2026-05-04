@@ -29,6 +29,7 @@ use windows::Win32::{
 use crate::process_data::ProcessData;
 
 /// Owned by daw_audio. One per loaded plugin instance.
+#[derive(Clone, Copy)]
 pub struct PluginRef {
     pub plugin_id: u32,
     pub process_data: *mut ProcessData,
@@ -65,6 +66,13 @@ pub struct WorkerSyncRef {
 
 #[cfg(windows)]
 unsafe impl Send for WorkerSyncRef {}
+
+// Safe: the audio engine and the (future A3) export thread only read
+// `worker_task` (atomic), `event_wake`, and `event_done`. The handles
+// themselves are kernel objects with their own internal sync; Rust's
+// `*const AtomicU32` carries the actual atomicity for `worker_task`.
+#[cfg(windows)]
+unsafe impl Sync for WorkerSyncRef {}
 
 #[cfg(windows)]
 impl WorkerSyncRef {
