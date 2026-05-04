@@ -9,7 +9,7 @@ use daw_ui_renderer::{Color, GlyphArea, LineBatch, LineSegment, Rect};
 
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
-use crate::time::TimeMapping;
+use crate::time::{TimeDisplay, TimeMapping};
 use crate::ui::Ui;
 use crate::viewport::ViewportState1D;
 
@@ -126,7 +126,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 });
             }
 
-            // bar label (小節番号 / SMPTE / 秒)
+            // bar label (BarBeat は小節番号のみ "1", "2", ...; その他は mapping.format で
+            // SMPTE / 秒文字列をそのまま使う)。
             let bar_index_start = (viewport.view_start / mapping.samples_per_bar()).floor() as i64;
             let bar_index_end = (view_end / mapping.samples_per_bar()).ceil() as i64;
             for bar in bar_index_start..=bar_index_end {
@@ -136,7 +137,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 }
                 let local_x = viewport.unit_to_px(s, rect.w);
                 let x = rect.x + local_x;
-                let label = mapping.format(s);
+                let label = match mapping.display {
+                    TimeDisplay::BarBeat => {
+                        let (bar_num, _beat) = mapping.samples_to_bar_beat(s);
+                        format!("{bar_num}")
+                    }
+                    _ => mapping.format(s),
+                };
                 ui.push_text(GlyphArea {
                     text: label.into(),
                     left: x + RULER_LABEL_PAD_X,

@@ -258,6 +258,34 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 - 🔲 `cargo bench -p daw-ui-core --bench scenegraph_cache` で cache hit frame の per-frame µs が削減されること (期待 30-70% 短縮、bench 環境差で揺れるため数値確認は user 側で実施)
 - 🔲 `cargo run --bin daw_prototype` で arrangement track reorder / clip drag / volume drag の regression なしを目視確認 (user 側で実施)
 
+### M13 (Library widget polish: time_ruler / bar_beat_grid 統合) — 進行中
+
+**目的**: `Ui::arrangement` / `Ui::piano_roll` を library `time_ruler` / `bar_beat_grid` に乗せ替えて、daw_01 conversation #014 の 3 要望 (a) 小節番号テキスト表示、(b) `time_sig` 対応 grid (3/4・5/4・6/8 等で bar 線が正しい拍位置に出る)、(c) piano_roll の上部 ruler 領域新設 を 1 commit で達成する。CLAUDE.md「新しく入れた抽象は次の機会に使う」原則と memory `feedback_pursue_best_practice`「ユーザに workaround を強要する API は設計欠陥」を同時に満たす (daw_01 が「自前で別途 ruler を組む」回避策を強いられていた状況を library 内で吸収)。
+
+**動機**: M7 Phase 27 で `Ui::time_ruler` / `Ui::bar_beat_grid` (拍/小節縦線 + 小節番号テキスト + `time_sig` 対応式 `numerator * 4 / denominator`) を library に追加していたが、`Ui::arrangement` / `Ui::piano_roll` widget は内部で独自に bar/beat 縦線を描画していた (= `b.rem_euclid(4) == 0` の 4 拍ハードコード、ruler に小節番号テキスト無し、piano_roll は ruler 領域自体無し)。library 抽象が arrangement / piano_roll でしか使い道がない上に、それらの widget が library 抽象を使っていない設計欠陥を解消する。
+
+| Phase | テーマ | 主な成果物 | 状態 |
+|---|---|---|---|
+| 55 | `Ui::arrangement` / `Ui::piano_roll` を library `time_ruler` / `bar_beat_grid` に統合 (daw_01 #014) | `ArrangementView` / `PianoRollView` に **`bpm: f32` + `time_sig: (u8, u8)`** を追加、`PianoRollView` には **`ruler_h: f32`** も追加 (PianoRollView は Default impl 無いので breaking、3 caller を 1 commit で全更新)。`ArrangementStyle::ruler_label_color` / `PianoRollStyle::ruler_bg` + `ruler_label_color` を新設 (Default 経由で非 breaking)。`HeavyCtx::time_ruler` / `HeavyCtx::bar_beat_grid` delegate 追加 (cached layer 内で呼ぶ enabler)。`arrangement::draw_ruler_bg` 関数を削除し `hctx.time_ruler` に置換 (小節番号テキスト出る)。`arrangement::draw_lanes_bg` の bar/beat 縦線描画ループを削除し `hctx.bar_beat_grid` に置換 (3/4・6/8 等で bar 線が time_sig 対応)。`piano_roll::draw_grid_background` の (c) 拍縦線セクションを削除し `hctx.bar_beat_grid` に置換、レイアウトに ruler 領域を新設 (`grid.y = rect.y + ruler_h`、ruler は keyboard_w から始まる、`ruler_h: 0.0` で旧 piano_roll 互換)。**4 拍ハードコード `b.rem_euclid(4) == 0` を 3 箇所すべて撲滅**。viewport_key を **v2 化**、arrangement は 3 つ目の nested tuple として `(bpm, time_sig.0, time_sig.1)` を、piano_roll は `ruler_h.to_bits()` + 12 要素目に `(bpm, time_sig.0, time_sig.1)` 組タプルとして追加 (tuple Hash impl 12 要素上限に収める)。**library `time_ruler` の BarBeat label format を `mapping.format` (= "1.1", "2.1", ... 形式) から `format!("{bar_num}")` (= "1", "2", "3", ... 形式) に変更** (daw_01 #014 が期待する小節番号のみの表示、Seconds/SMPTE は `mapping.format` 経由のまま)。`ruler_h > 0.0` ガードで ruler を skip 可能 (旧 piano_roll 互換 + arrangement の test_view 互換)。**unit test 6 件追加** (arrangement: 3/4 で bar 線が 3 拍ごと / "1" "2" "3" ラベル / time_sig 切替で bar 線 set 変化、piano_roll: ruler_h=0 で label 無し / ruler_h=20 で "1" "2" 出る / grid bar 線の y_top が >=ruler_h)。daw_prototype `arr_view` / examples/piano_roll `view` / trybuild `basic.rs` の 3 caller を全更新 (`PianoRollView` Default impl 無し breaking)。**daw_01 への影響**: gui_01 commit と同期で `ArrangementView` / `PianoRollView` 構築箇所に `bpm` + `time_sig` (+ `ruler_h`) を追加する必要あり (daw_01 conversation #014 で受領後の追従指示を記入) | ✅ 完了 |
+
+**設計判断**:
+
+- **`bpm: f32` + `time_sig: (u8, u8)` を直接 view に持つ案 A** を採用 (`TimeMapping` を直接受ける案 B は不採用): daw_01 caller の薄さを優先 (`bpm: app.song.bpm, time_sig: app.song.time_sig` の 2 行で済む)。`sample_rate` は widget 内部で `48_000.0` ダミー値を合成 (BarBeat 表示の bar 線位置計算では比例定数として打ち消されるため不要、Seconds/SMPTE 切替時は将来別 API で受ける)。
+- **`HeavyCtx` に `time_ruler` / `bar_beat_grid` delegate を追加**: `hctx.cached(viewport_key, |hctx| ...)` 内から `Ui::time_ruler` を直接呼べないため (HeavyCtx は Ui ではない)。既存 `label_at` / `button_at` / `context_menu_for` delegate と同パターン。`with_widget_node` のネスト (cached layer wid 内で time_ruler wid) は既存 `HeavyCtx::cached` 自身の `with_widget_node` 呼び出しと同じパターンで問題なし。
+- **`ruler_h > 0.0` ガード**: arrangement / piano_roll 両方で ruler 領域が空のとき `time_ruler` 呼び出しを skip。これがないと ruler 内 tick 線がすべて bar_line color (= tick_color として共有) で出てしまい、cached layer 全体の primitive 数が増える + lanes/grid と区別できないノイズが入る。`piano_roll` は元々 ruler 無し (旧互換) なので必須、`arrangement` も既存 `ruler_h: 0.0` test_view との互換のため同じガードを入れる。
+- **library `time_ruler` の BarBeat ラベル変更**: `mapping.format(s)` の出力 `"1.1"` (= bar.beat) は daw_01 #014 が期待する小節番号のみ "1", "2", "3" と異なる。`time_grid.rs` 内で `match mapping.display { TimeDisplay::BarBeat => format!("{bar_num}"), _ => mapping.format(s) }` に変更。Seconds/SMPTE 表示は引き続き `mapping.format` を経由する。daw_prototype piano_roll_tab デモ (= 唯一の既存 caller) でも "1", "2" 表示になるが visible な regression は無い (簡略化方向)。
+- **piano_roll の ruler は `keyboard_w` から始まる**: keyboard 上に小節番号は出さず grid と同じ x 範囲のみ (DAW 慣習)。`arrangement` の `header_w` から ruler 始まりと平行。
+- **piano_roll の viewport_key で `time_sig` を `(u32, u32)` 組として 1 要素化**: 既存 10 要素 + ruler_h + bpm + time_sig = 13 要素は tuple Hash impl 12 上限超過。`(view.bpm.to_bits(), u32::from(time_sig.0), u32::from(time_sig.1))` を 1 要素にまとめて 12 要素ぴったりに収める。
+- **`PianoRollView` の Default impl は維持して追加しない** (M9 Phase 45c 既存設計): caller に明示的な値設定を強制する設計を継続、3 fields 追加で 3 caller を 1 commit 全更新する (M9 Phase 45c と同パターン)。
+- **daw_prototype の piano_roll_tab はスコープ外**: 同関数は `Ui::piano_roll` を未使用 (生 `push_rect` + `time_ruler` 直呼びの単体デモ)、Phase 55 では触らない。`Ui::piano_roll` 化は `DawModel.notes` / `selected_note_ids` / `notes_generation` 追加が必要なので別 phase 候補としてメモ。
+
+**完了条件 (DoD)** — すべて達成 (2026-05-04):
+
+- ✅ Phase 55 完了
+- ✅ `cargo build --workspace` / `cargo test --workspace` (**232 unit test、Phase 54 から +6 件**) / `cargo clippy --workspace --tests -- -D warnings` / `cargo test -p daw-ui-core --test no_clone_required` 全 ✅
+- 🔲 `cargo run --bin daw_prototype` で arrangement タブの ruler に "1", "2", "3" 等の小節番号が出ること、time_sig (3, 4) 切替で bar 線が 3 拍ごとに移動することを目視確認 (user 側で実施)
+- 🔲 daw_01 conversation #014 を `[Open]` → `[Replied]` に更新 (本 commit と同 sequence で別 step、`daw_01` ディレクトリでは commit しない)
+
 ---
 
 ## 凍結 (M9+M10+M11 完了後の再評価対象)

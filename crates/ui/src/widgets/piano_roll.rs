@@ -45,8 +45,12 @@ use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
+use crate::scenegraph::hash_inputs;
+use crate::time::{TimeDisplay, TimeMapping};
 use crate::ui::Ui;
+use crate::viewport::ViewportState1D;
 use crate::widgets::playhead::draw_playhead_line;
+use crate::widgets::time_grid::{BarBeatGridStyle, TimeRulerStyle};
 
 // ============================================================
 // Public types
@@ -123,6 +127,18 @@ pub struct PianoRollView {
     /// `Some(b)` で `b` が `[start_beat, start_beat + len_beats]` 範囲内なら、
     /// note grid と velocity lane を縦断する 1 本の線が描かれる。
     pub playhead_beat: Option<f64>,
+    /// (M13 Phase 55) ruler 領域の高さ (px、`0.0` で ruler 無し → 旧 piano_roll 互換)。
+    /// `> 0` のとき rect の top から `ruler_h` px を ruler として確保し、その下に keyboard /
+    /// grid を配置 (keyboard と grid の `y` がともに `rect.y + ruler_h` から開始)。
+    /// ruler は keyboard 領域には被せず、grid と同じ x 範囲のみ。
+    pub ruler_h: f32,
+    /// (M13 Phase 55) テンポ (BPM)。`time_ruler` / `bar_beat_grid` に渡す
+    /// `TimeMapping::tempo_bpm` に使う。BarBeat 表示の bar 線位置計算では `time_sig` だけで
+    /// 足りるが、将来 Seconds/SMPTE 切替で必要になるため field として保持。
+    pub bpm: f32,
+    /// (M13 Phase 55) 拍子 (numerator, denominator)。`(4, 4)` で 4/4、`(3, 4)` で 3/4、
+    /// `(6, 8)` で 6/8。内部で `numerator * 4 / denominator` (= beats_per_bar) に変換。
+    pub time_sig: (u8, u8),
 }
 
 /// piano roll が user に発行する Edit 要求の種別。
@@ -212,6 +228,10 @@ pub struct PianoRollStyle {
     pub velocity_bar_color: Color,
     /// (M9 Phase 45c) velocity bar の幅 (px)。
     pub velocity_bar_width_px: f32,
+    /// (M13 Phase 55) ruler 領域の背景色 (`view.ruler_h > 0` のとき `time_ruler` の `bg` に渡す)。
+    pub ruler_bg: Color,
+    /// (M13 Phase 55) ruler の小節番号テキスト色 (`time_ruler` の `label_color` に渡す)。
+    pub ruler_label_color: Color,
 }
 
 /// デフォルト velocity color (青系の濃淡 0.5..0.95)。`PianoRollStyle::note_fill_fn` の初期値。
@@ -251,6 +271,9 @@ impl Default for PianoRollStyle {
             velocity_bar_width_px: 3.0,
             lyric_color: Color::rgb(0.10, 0.10, 0.15),
             lyric_font_px: 9.0,
+            // M13 Phase 55: ruler 領域 (`view.ruler_h > 0` のときのみ描画)
+            ruler_bg: Color::rgb(0.13, 0.14, 0.17),
+            ruler_label_color: Color::rgb(0.85, 0.88, 0.92),
         }
     }
 }
@@ -500,22 +523,29 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let wid = WidgetId::ROOT.child((b"piano_roll_widget", &id));
         let pointer = self.pointer;
 
-        // grid / keyboard / velocity lane レイアウト (M9 Phase 45c で vel_area 追加)。
-        // velocity_lane_h > 0 のとき rect の下端 vel_h px を vel_area として確保し、
-        // 残り main_h を keyboard + grid に配分する (vel_area は keyboard に被せない)。
+        // grid / keyboard / velocity lane / ruler レイアウト
+        // M13 Phase 55: rect の top から `ruler_h` 分を ruler 領域、その下に main_h
+        // (= keyboard + grid)、最下段に vel_h (velocity lane)。`ruler_h = 0.0` で旧互換。
         let kbd_w = view.keyboard_w.max(0.0);
-        let vel_h = view.velocity_lane_h.max(0.0).min(rect.h * 0.5);
-        let main_h = (rect.h - vel_h).max(1.0);
-        let grid = Rect {
+        let ruler_h = view.ruler_h.max(0.0).min(rect.h * 0.5);
+        let vel_h = view.velocity_lane_h.max(0.0).min((rect.h - ruler_h) * 0.5);
+        let main_h = (rect.h - ruler_h - vel_h).max(1.0);
+        let ruler = Rect {
             x: rect.x + kbd_w,
             y: rect.y,
             w: (rect.w - kbd_w).max(1.0),
+            h: ruler_h,
+        };
+        let grid = Rect {
+            x: rect.x + kbd_w,
+            y: rect.y + ruler_h,
+            w: (rect.w - kbd_w).max(1.0),
             h: main_h,
         };
-        let kbd = Rect { x: rect.x, y: rect.y, w: kbd_w, h: main_h };
+        let kbd = Rect { x: rect.x, y: rect.y + ruler_h, w: kbd_w, h: main_h };
         let vel_area = Rect {
             x: rect.x + kbd_w,
-            y: rect.y + main_h,
+            y: rect.y + ruler_h + main_h,
             w: (rect.w - kbd_w).max(1.0),
             h: vel_h,
         };
@@ -658,8 +688,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         // ----- 描画 (heavy ブロック + cached + 動的 overlay) -----
         // M9 Phase 45c: viewport_key に vel_h を追加 (velocity lane 高さ変化で cache 無効化)。
+        // M13 Phase 55: ruler_h / bpm / time_sig を追加 + v2 に bump (cache 構造変化)。
+        // tuple Hash impl は 12 要素まで → bpm + time_sig を 1 つの組に纏めて 12 要素に収める。
         let viewport_key = (
-            b"piano_roll_widget_v1" as &[u8],
+            b"piano_roll_widget_v2" as &[u8],
             view.start_beat.to_bits(),
             view.len_beats.to_bits(),
             view.pitch_top.to_bits(),
@@ -669,7 +701,36 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             kbd.w.to_bits(),
             view.notes_generation,
             vel_h.to_bits(),
+            ruler_h.to_bits(),
+            (view.bpm.to_bits(), u32::from(view.time_sig.0), u32::from(view.time_sig.1)),
         );
+
+        // M13 Phase 55: library `time_ruler` / `bar_beat_grid` を呼ぶための共通 mapping。
+        // beat 単位 view を sample 単位 ViewportState1D に変換 (sample_rate = 48k は BarBeat
+        // 表示で比例定数として打ち消されるダミー)。
+        let mapping = TimeMapping {
+            sample_rate: 48_000.0,
+            tempo_bpm: f64::from(view.bpm.max(1.0)),
+            time_sig: (view.time_sig.0.max(1), view.time_sig.1.max(1)),
+            display: TimeDisplay::BarBeat,
+        };
+        let spb = mapping.samples_per_beat();
+        let sample_viewport =
+            ViewportState1D::new(view.start_beat * spb, view.len_beats.max(1e-6) * spb);
+        let grid_style_pr = BarBeatGridStyle {
+            bar_color: style.bar_line,
+            beat_color: style.beat_line,
+            bar_line_width: style.bar_line_width_px,
+            beat_line_width: style.beat_line_width_px,
+        };
+        let ruler_style_pr = TimeRulerStyle {
+            bg: style.ruler_bg,
+            tick_color: style.bar_line,
+            label_color: style.ruler_label_color,
+            bar_tick_height: 12.0,
+            beat_tick_height: 5.0,
+        };
+        let id_for_inner: u64 = hash_inputs(&id);
 
         let visible_owned: Vec<Note> = visible.to_vec();
         let style_copy = *style;
@@ -682,6 +743,22 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // === cached(): viewport_key 一致時に skip される背景レイヤ ===
             hctx.cached(viewport_key, |hctx| {
                 draw_grid_background(hctx, grid, kbd, view_copy, &style_copy);
+                hctx.bar_beat_grid(
+                    ("pr_grid", id_for_inner),
+                    grid,
+                    mapping,
+                    sample_viewport,
+                    grid_style_pr,
+                );
+                if ruler_h > 0.0 {
+                    hctx.time_ruler(
+                        ("pr_ruler", id_for_inner),
+                        ruler,
+                        mapping,
+                        sample_viewport,
+                        ruler_style_pr,
+                    );
+                }
                 draw_notes(
                     hctx,
                     &visible_owned,
@@ -958,31 +1035,8 @@ fn draw_grid_background<M: ?Sized + 'static>(
         }
     }
 
-    // (c) 拍縦線 (1 拍ごと細線、4 拍ごと太線)
-    let view_end_beat = view.start_beat + view.len_beats;
-    let beat_to_px = f64::from(grid.w) / view.len_beats.max(1e-6);
-    let first_beat = view.start_beat.floor() as i32;
-    let last_beat = view_end_beat.ceil() as i32;
-    for b in first_beat..=last_beat {
-        let x = grid.x + ((f64::from(b) - view.start_beat) * beat_to_px) as f32;
-        if x < grid.x - 1.0 || x > grid.x + grid.w + 1.0 {
-            continue;
-        }
-        let is_bar = b.rem_euclid(4) == 0;
-        let (line_w, color) = if is_bar {
-            (style.bar_line_width_px, style.bar_line)
-        } else {
-            (style.beat_line_width_px, style.beat_line)
-        };
-        hctx.push_rect(RectCommand {
-            rect: Rect { x: x - line_w * 0.5, y: grid.y, w: line_w, h: grid.h },
-            fill: color,
-            border: Color::TRANSPARENT,
-            border_width: 0.0,
-            radius: [0.0; 4],
-            clip_rect: None,
-        });
-    }
+    // (c) 拍縦線 (1 拍ごと細線、bar 縦線) — M13 Phase 55 で library `Ui::bar_beat_grid` に統合。
+    // この関数の caller (piano_roll cached layer) で `hctx.bar_beat_grid` を呼ぶ。
 
     // (d) keyboard widget (左端、kbd.w > 0 のみ)
     if kbd.w > 0.0 {
@@ -1229,6 +1283,9 @@ mod tests {
             notes_generation: 0,
             velocity_lane_h: 0.0,
             playhead_beat: None,
+            ruler_h: 0.0,
+            bpm: 120.0,
+            time_sig: (4, 4),
         }
     }
 
@@ -1962,5 +2019,105 @@ mod tests {
         // velocity lane: bg 1 + 2 bars = 3 個 rect 増 / playhead: 1 LineBatch 増
         assert_eq!(rects_both, rects_off + 3);
         assert_eq!(lines_both, lines_off + 1);
+    }
+
+    // -------- M13 Phase 55: ruler / time_sig 対応 grid の確認 --------
+
+    /// 1 frame 描画して `Scene` を返す helper。
+    fn render_piano_roll_once(view: PianoRollView, notes: &[Note]) -> daw_ui_renderer::Scene {
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::FrameInput;
+        use crate::ui::UiHost;
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 400 };
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            let style = PianoRollStyle::default();
+            let _ = ui.piano_roll(
+                "pr_test",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                notes,
+                view,
+                &[],
+                &style,
+                |_| Edit::mutate(|()| {}),
+            );
+        });
+        scene
+    }
+
+    /// `ruler_h: 0.0` で bar 番号 label が出ない (旧 piano_roll 互換)。
+    #[test]
+    fn ruler_h_zero_disables_bar_labels() {
+        let mut view = test_view();
+        view.ruler_h = 0.0;
+        view.bpm = 120.0;
+        view.time_sig = (4, 4);
+        let scene = render_piano_roll_once(view, &[]);
+        let labels: Vec<String> =
+            scene.iter_glyphs().map(|g| g.text.as_ref().to_string()).collect();
+        for blocked in ["1", "2", "3"] {
+            assert!(
+                !labels.iter().any(|s| s == blocked),
+                "ruler_h=0.0 で bar label {blocked:?} は出ない: labels={labels:?}",
+            );
+        }
+    }
+
+    /// `ruler_h: 20.0` で bar label "1", "2" が出る (small bars only)。
+    #[test]
+    fn ruler_h_positive_emits_bar_labels() {
+        let mut view = test_view();
+        view.start_beat = 0.0;
+        view.len_beats = 8.0; // 2 小節分
+        view.ruler_h = 20.0;
+        view.bpm = 120.0;
+        view.time_sig = (4, 4);
+        let scene = render_piano_roll_once(view, &[]);
+        let labels: Vec<String> =
+            scene.iter_glyphs().map(|g| g.text.as_ref().to_string()).collect();
+        for expected in ["1", "2"] {
+            assert!(
+                labels.iter().any(|s| s == expected),
+                "ruler_h=20.0 で bar label {expected:?} が出る: labels={expected:?}, found={labels:?}",
+            );
+        }
+    }
+
+    /// `ruler_h: 20.0` のとき grid 内 bar 線の y が `rect.y + 20.0` 以降から始まる
+    /// (= grid 領域が ruler 分シフトしている)。
+    /// ruler 内の tick 線 (短い) は除外し、grid 全幅の bar 線 (長い) のみ判定する。
+    #[test]
+    fn grid_y_offset_with_ruler() {
+        let style = PianoRollStyle::default();
+        let mut view = test_view();
+        view.start_beat = 0.0;
+        view.len_beats = 8.0;
+        view.ruler_h = 20.0;
+        view.bpm = 120.0;
+        view.time_sig = (4, 4);
+        let scene = render_piano_roll_once(view, &[]);
+
+        // bar_color で seg が long (高さ > ruler_h) のものを grid 内 bar 線として抽出。
+        let grid_bar_y_tops: Vec<f32> = scene
+            .iter_lines()
+            .flat_map(|b| b.segments.iter().copied())
+            .filter(|seg| seg.color == style.bar_line)
+            .filter(|seg| (seg.b[1] - seg.a[1]).abs() > 20.0)
+            .map(|seg| seg.a[1].min(seg.b[1]))
+            .collect();
+        assert!(
+            !grid_bar_y_tops.is_empty(),
+            "grid 内 bar 線が出ている (sanity)",
+        );
+        for y in &grid_bar_y_tops {
+            assert!(
+                *y >= 20.0 - 0.1,
+                "ruler_h=20 で grid bar 線の y_top は >=20.0: actual={y}",
+            );
+        }
     }
 }

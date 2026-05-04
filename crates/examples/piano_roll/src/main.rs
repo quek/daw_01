@@ -86,6 +86,11 @@ impl PianoRollModel {
             // (45c で導入した新機能の visible デモ)。
             velocity_lane_h: 0.0,
             playhead_beat: Some(2.0),
+            // M13 Phase 55: ruler 領域 + bpm + time_sig (デモのため ruler_h: 20.0 で
+            // 上端に小節番号テキスト表示)。
+            ruler_h: 20.0,
+            bpm: 120.0,
+            time_sig: (4, 4),
         }
     }
 }

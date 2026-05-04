@@ -139,6 +139,11 @@ fn main() {
                 notes_generation: 0,
                 velocity_lane_h: 0.0,
                 playhead_beat: None,
+                // M13 Phase 55: ruler/bpm/time_sig (no-Clone Model でも構造体リテラルが
+                // コンパイルできることを確認)
+                ruler_h: 0.0,
+                bpm: 120.0,
+                time_sig: (4, 4),
             };
             let style = PianoRollStyle::default();
             let _ = ui.piano_roll(

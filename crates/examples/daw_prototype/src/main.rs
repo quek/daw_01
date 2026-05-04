@@ -120,6 +120,9 @@ impl DawModel {
             playhead_beat: Some(2.0),
             loop_range: Some((4.0, 12.0)),
             data_generation: 0,
+            // M13 Phase 55: bpm + time_sig (4/4 で従来挙動維持)
+            bpm: 120.0,
+            time_sig: (4, 4),
         };
         Self {
             faders: [0.55, 0.70, 0.30, 0.60, 0.40, 0.80, 0.20, 0.55],

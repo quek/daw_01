@@ -25,9 +25,13 @@ use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
+use crate::scenegraph::hash_inputs;
+use crate::time::{TimeDisplay, TimeMapping};
 use crate::ui::Ui;
+use crate::viewport::ViewportState1D;
 use crate::widgets::heavy::HeavyCtx;
 use crate::widgets::playhead::draw_playhead_line;
+use crate::widgets::time_grid::{BarBeatGridStyle, TimeRulerStyle};
 use crate::widgets::toggle_button::ToggleButtonStyle;
 
 // ============================================================
@@ -89,6 +93,14 @@ pub struct ArrangementView {
     /// track 構成 / clip 編集で bump する hook (cache busting)。
     /// selection 変化では bump しない (selection は cached 外 overlay)。
     pub data_generation: u64,
+    /// テンポ (BPM)。M13 Phase 55 で追加。`time_ruler` / `bar_beat_grid` に渡す
+    /// `TimeMapping::tempo_bpm` に使う (BarBeat 表示の bar 線位置計算では `time_sig` だけで
+    /// 足りるが、将来 Seconds/SMPTE 切替で必要になるため field として保持)。
+    pub bpm: f32,
+    /// 拍子 (numerator, denominator)。M13 Phase 55 で追加。`(4, 4)` で 4/4、`(3, 4)` で 3/4、
+    /// `(6, 8)` で 6/8。内部で `numerator * 4 / denominator` (= beats_per_bar) に変換
+    /// (3/4 → 3, 6/8 → 3)。
+    pub time_sig: (u8, u8),
 }
 
 impl Default for ArrangementView {
@@ -104,6 +116,8 @@ impl Default for ArrangementView {
             playhead_beat: None,
             loop_range: None,
             data_generation: 0,
+            bpm: 120.0,
+            time_sig: (4, 4),
         }
     }
 }
@@ -255,6 +269,8 @@ pub struct ArrangementStyle {
     pub track_volume_band_track: Color,
     /// volume band の fill (volume 値表示) 色。
     pub track_volume_band_fill: Color,
+    /// M13 Phase 55: ruler の小節番号テキスト色 (`time_ruler` 内の label_color にマップ)。
+    pub ruler_label_color: Color,
 }
 
 impl Default for ArrangementStyle {
@@ -320,6 +336,7 @@ impl Default for ArrangementStyle {
             track_volume_band_h: 4.0,
             track_volume_band_track: Color::rgba(0.0, 0.0, 0.0, 0.45),
             track_volume_band_fill: Color::rgb(0.95, 0.95, 0.97),
+            ruler_label_color: Color::rgb(0.85, 0.88, 0.92),
         }
     }
 }
@@ -651,45 +668,9 @@ fn push_filled_rect<M: ?Sized + 'static>(hctx: &mut HeavyCtx<'_, '_, M>, r: Rect
     });
 }
 
-fn draw_ruler_bg<M: ?Sized + 'static>(
-    hctx: &mut HeavyCtx<'_, '_, M>,
-    ruler: Rect,
-    view: ArrangementView,
-    style: &ArrangementStyle,
-) {
-    push_filled_rect(hctx, ruler, style.ruler_bg);
-    let view_end = view.start_beat + view.len_beats;
-    let beat_to_px = f64::from(ruler.w) / view.len_beats.max(1e-6);
-    #[allow(clippy::cast_possible_truncation)]
-    let first = view.start_beat.floor() as i32;
-    #[allow(clippy::cast_possible_truncation)]
-    let last = view_end.ceil() as i32;
-    for b in first..=last {
-        #[allow(clippy::cast_possible_truncation)]
-        let x = ruler.x + ((f64::from(b) - view.start_beat) * beat_to_px) as f32;
-        if x < ruler.x - 1.0 || x > ruler.x + ruler.w + 1.0 {
-            continue;
-        }
-        let is_bar = b.rem_euclid(4) == 0;
-        let (line_w, color) = if is_bar {
-            (style.bar_line_width_px, style.bar_line)
-        } else {
-            (style.beat_line_width_px, style.beat_line)
-        };
-        let h_ratio = if is_bar { 1.0 } else { 0.55 };
-        push_filled_rect(
-            hctx,
-            Rect {
-                x: x - line_w * 0.5,
-                y: ruler.y + ruler.h * (1.0 - h_ratio),
-                w: line_w,
-                h: ruler.h * h_ratio,
-            },
-            color,
-        );
-    }
-}
-
+// M13 Phase 55: ruler / lanes grid の bar/beat 縦線 + 小節番号テキスト描画は library
+// `Ui::time_ruler` / `Ui::bar_beat_grid` (heavy.rs delegate 経由) に統合した。
+// この関数は lanes 背景 + per-row 背景 (selection / mute/solo hint / lane separator) のみ。
 fn draw_lanes_bg<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     lanes: Rect,
@@ -744,32 +725,6 @@ fn draw_lanes_bg<M: ?Sized + 'static>(
                 h: style.lane_line_width_px,
             },
             style.lane_line,
-        );
-    }
-
-    // bar/beat 縦線 (lanes 全幅)
-    let view_end = view.start_beat + view.len_beats;
-    let beat_to_px = f64::from(lanes.w) / view.len_beats.max(1e-6);
-    #[allow(clippy::cast_possible_truncation)]
-    let first = view.start_beat.floor() as i32;
-    #[allow(clippy::cast_possible_truncation)]
-    let last = view_end.ceil() as i32;
-    for b in first..=last {
-        #[allow(clippy::cast_possible_truncation)]
-        let x = lanes.x + ((f64::from(b) - view.start_beat) * beat_to_px) as f32;
-        if x < lanes.x - 1.0 || x > lanes.x + lanes.w + 1.0 {
-            continue;
-        }
-        let is_bar = b.rem_euclid(4) == 0;
-        let (line_w, color) = if is_bar {
-            (style.bar_line_width_px, style.bar_line)
-        } else {
-            (style.beat_line_width_px, style.beat_line)
-        };
-        push_filled_rect(
-            hctx,
-            Rect { x: x - line_w * 0.5, y: lanes.y, w: line_w, h: lanes.h },
-            color,
         );
     }
 }
@@ -1356,9 +1311,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // M10 Phase 50: pending_reorder_hash を viewport_key に入れて、release frame の optimistic
         // preview で cache miss を強制 (新順序での再描画を 1 frame 遅延なく行う)。
         // tuple Hash 実装は 12 要素まで → nested tuple で 13 要素分を表現。
+        // M13 Phase 55: bpm / time_sig を 3 つ目の nested tuple で追加し v2 に bump。
         let viewport_key = (
             (
-                b"arrangement_widget_v1" as &[u8],
+                b"arrangement_widget_v2" as &[u8],
                 rect.w.to_bits(),
                 rect.h.to_bits(),
                 view.start_beat.to_bits(),
@@ -1372,6 +1328,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 u64::from(selected_track.unwrap_or(u32::MAX)),
             ),
             pending_reorder_hash,
+            (view.bpm.to_bits(), u32::from(view.time_sig.0), u32::from(view.time_sig.1)),
         );
 
         // M10 Phase 50: pending_reorder_order があれば新順序で `tracks_for_draw` を組み立て、
@@ -1426,13 +1383,56 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 (tr, target)
             });
 
+        // M13 Phase 55: ruler / lanes grid を library `time_ruler` / `bar_beat_grid` に統合。
+        // beat 単位の view を sample 単位の `ViewportState1D` に変換 (sample_rate = 48k で
+        // 比例定数は打ち消されるので BarBeat 表示には影響しない)。
+        let mapping = TimeMapping {
+            sample_rate: 48_000.0,
+            tempo_bpm: f64::from(view.bpm.max(1.0)),
+            time_sig: (view.time_sig.0.max(1), view.time_sig.1.max(1)),
+            display: TimeDisplay::BarBeat,
+        };
+        let spb = mapping.samples_per_beat();
+        let sample_viewport =
+            ViewportState1D::new(view.start_beat * spb, view.len_beats.max(1e-6) * spb);
+        let grid_style = BarBeatGridStyle {
+            bar_color: style.bar_line,
+            beat_color: style.beat_line,
+            bar_line_width: style.bar_line_width_px,
+            beat_line_width: style.beat_line_width_px,
+        };
+        let ruler_style = TimeRulerStyle {
+            bg: style.ruler_bg,
+            tick_color: style.bar_line,
+            label_color: style.ruler_label_color,
+            bar_tick_height: 12.0,
+            beat_tick_height: 5.0,
+        };
+        // heavy() closure は `'static` 要求なので id を hash 化して move capture。
+        let id_for_inner: u64 = hash_inputs(&id);
+
         self.heavy(("arrangement_inner", &id), move |hctx| {
             // === cached: viewport_key 一致時 skip ===
             hctx.cached(viewport_key, |hctx| {
                 push_filled_rect(hctx, header_pane, style_copy.header_bg);
                 draw_lanes_bg(hctx, lanes, &tracks_owned, view_copy, selected_track, &style_copy);
+                hctx.bar_beat_grid(
+                    ("arr_grid", id_for_inner),
+                    lanes,
+                    mapping,
+                    sample_viewport,
+                    grid_style,
+                );
                 draw_clips(hctx, &tracks_owned, view_copy, lanes, &style_copy);
-                draw_ruler_bg(hctx, ruler, view_copy, &style_copy);
+                if view_copy.ruler_h > 0.0 {
+                    hctx.time_ruler(
+                        ("arr_ruler", id_for_inner),
+                        ruler,
+                        mapping,
+                        sample_viewport,
+                        ruler_style,
+                    );
+                }
             });
 
             // === cached 外: selection / drag preview / playhead / loop band ===
@@ -1932,6 +1932,8 @@ mod tests {
             playhead_beat: None,
             loop_range: None,
             data_generation: 0,
+            bpm: 120.0,
+            time_sig: (4, 4),
         }
     }
 
@@ -2320,5 +2322,131 @@ mod tests {
         assert!((s - 5.95).abs() < 1e-6);
         assert!((l - 0.05).abs() < 1e-6);
         assert_eq!(idx, 1);
+    }
+
+    // -------- M13 Phase 55: ruler / time_sig 対応 grid の確認 --------
+
+    /// 1 frame 描画して `scene.iter_glyphs()` と `iter_lines()` で primitive を取得する helper。
+    fn render_arrangement_once(view: ArrangementView) -> daw_ui_renderer::Scene {
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::FrameInput;
+        use crate::ui::UiHost;
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 400 };
+        let tracks: Vec<ArrangementTrack> = vec![track(0, "t0", vec![])];
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            let style = ArrangementStyle::default();
+            let _ = ui.arrangement(
+                "arr_test",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &tracks,
+                view,
+                &[],
+                None,
+                &style,
+                |_| Edit::mutate(|()| {}),
+            );
+        });
+        scene
+    }
+
+    /// time_sig (3, 4) で grid の bar 縦線が 0/3/6/9/12 拍位置に出る。
+    /// `len_beats: 12.0` (= 4 小節分 of 3/4) の view で `Primitive::Line` から bar 線の x を抽出。
+    #[test]
+    fn time_sig_3_4_grid_bar_lines_at_3_beat_intervals() {
+        let mut view = test_view();
+        view.start_beat = 0.0;
+        view.len_beats = 12.0;
+        view.header_w = 0.0; // lanes が rect 全幅
+        view.ruler_h = 0.0;
+        view.time_sig = (3, 4);
+        let scene = render_arrangement_once(view);
+
+        // bar_color (= bar_line スタイル) の line segments を抽出して x 座標を集める。
+        let style = ArrangementStyle::default();
+        let bar_xs: std::collections::BTreeSet<i32> = scene
+            .iter_lines()
+            .flat_map(|b| b.segments.iter().copied())
+            .filter(|seg| seg.color == style.bar_line)
+            .map(|seg| seg.a[0].round() as i32)
+            .collect();
+        // 800px / 12 beats = 66.66px/beat → bar 位置 0/3/6/9/12 拍 = 0/200/400/600/800 px
+        for expected_beat in [0, 3, 6, 9, 12] {
+            let expected_x = (f64::from(expected_beat) * (800.0_f64 / 12.0)).round() as i32;
+            assert!(
+                bar_xs
+                    .iter()
+                    .any(|&x| (x - expected_x).abs() <= 2),
+                "bar at beat {expected_beat} expected near x={expected_x}, got xs={bar_xs:?}",
+            );
+        }
+        // 4/4 でハードコードされていたら beat 4 (= x=266) に bar 線が出るはず → 出ないことも確認
+        let four_beat_x = (4.0_f64 * (800.0_f64 / 12.0)).round() as i32;
+        assert!(
+            !bar_xs
+                .iter()
+                .any(|&x| (x - four_beat_x).abs() <= 2),
+            "3/4 で 4 拍位置 (x={four_beat_x}) に bar 線は出ない: xs={bar_xs:?}",
+        );
+    }
+
+    /// time_sig (4, 4) で ruler に "1", "2", "3" の小節番号テキストが出る。
+    #[test]
+    fn arrangement_ruler_emits_bar_number_text() {
+        let mut view = test_view();
+        view.start_beat = 0.0;
+        view.len_beats = 16.0; // 4 小節分 of 4/4
+        view.header_w = 0.0;
+        view.ruler_h = 24.0;
+        view.time_sig = (4, 4);
+        let scene = render_arrangement_once(view);
+
+        let labels: Vec<String> = scene
+            .iter_glyphs()
+            .map(|g| g.text.as_ref().to_string())
+            .collect();
+        for expected in ["1", "2", "3"] {
+            assert!(
+                labels.iter().any(|s| s == expected),
+                "ruler に {expected:?} が出る: labels={labels:?}",
+            );
+        }
+        // 旧 "1.1" 形式は出ない (M13 で BarBeat label を bar 番号のみに変更)
+        assert!(
+            !labels.iter().any(|s| s == "1.1"),
+            "BarBeat label は \"1\" 形式 (旧 \"1.1\" 形式は廃止): labels={labels:?}",
+        );
+    }
+
+    /// time_sig 切替で bar 線の x 座標 set が変わる (= viewport_key v2 が time_sig を含んでいて
+    /// 再描画が走る)。
+    #[test]
+    fn arrangement_grid_bar_lines_change_on_time_sig() {
+        let style = ArrangementStyle::default();
+        let collect_bar_xs = |time_sig: (u8, u8)| -> std::collections::BTreeSet<i32> {
+            let mut view = test_view();
+            view.start_beat = 0.0;
+            view.len_beats = 12.0;
+            view.header_w = 0.0;
+            view.ruler_h = 0.0;
+            view.time_sig = time_sig;
+            let scene = render_arrangement_once(view);
+            scene
+                .iter_lines()
+                .flat_map(|b| b.segments.iter().copied())
+                .filter(|seg| seg.color == style.bar_line)
+                .map(|seg| seg.a[0].round() as i32)
+                .collect()
+        };
+        let xs_4_4 = collect_bar_xs((4, 4));
+        let xs_3_4 = collect_bar_xs((3, 4));
+        assert_ne!(
+            xs_4_4, xs_3_4,
+            "time_sig 切替で bar 線 set が変わる: 4/4={xs_4_4:?}, 3/4={xs_3_4:?}",
+        );
     }
 }
