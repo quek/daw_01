@@ -118,8 +118,13 @@ daw_01 側で別途組むもの:
 ## Phase 5: 仕上げ
 
 - `daw_gui/src/view/` 全体で `push_rect` / `push_text` / `push_lines` が **0 件** であることを grep で確認。
-- 残った箇所があれば事情を本ファイルに記録。
-- `cargo build --workspace` warning 0 / `cargo clippy -- -D warnings` クリーン。
+  - **2026-05-04 時点**: `track_inspector.rs:77` の chain row 背景 1 件のみ残存。
+    scroll_area 内で row_y が変動するため heavy+cached が使えず ui.push_rect 直呼び。
+    将来 `Ui::reorderable_list` (gui_01) が来れば消える tech debt。
+- `cargo build --workspace` warning は 5 件 (Phase 3 で widget に移譲した model 派生メソッド
+  群: track_count / track_headers / clip_boxes / note_boxes / recent_paths_display と
+  ClipBox / NoteBox / TrackHeader / 一部 AppEvent variant が dead_code)。
+  これらは Phase 3 完了で本当に未使用になったので清掃可能 (別 commit)。
 - `cargo run -p daw_gui` で全画面の操作確認 (transport / arrangement / piano_roll / mixer / inspector / plugin_picker / modal)。
 
 ## 並行で進める無関係タスク (このプランの外)
@@ -142,3 +147,9 @@ daw_01 側で別途組むもの:
 | 2026-05-03 | 2d6d70e | Phase 1-3 | mixer/inspector を scroll_area 化、scrollbar drag bug を gui_01 #010 で報告 |
 | 2026-05-04 | (gui_01) | Phase 0 | gui_01 から #006 (Phase 45c API) と #010 (Phase 45g 修正済) の返信受領 |
 | 2026-05-04 | 8aebba3 | Phase 3c | piano_roll の velocity / playhead を gui_01 widget 内蔵に移譲 (#006 解決、320 → ~210 LOC) |
+| 2026-05-04 | ad26af5 | Phase 0 | gui_01 #006 / #010 を Resolved 化、archive_001.md へ移動 |
+| 2026-05-04 | 51ff532 | Phase 3a | 背景塗りを Ui::panel / panel_with_border に置換 (10 箇所、heavy+cached boilerplate を 1 行化) |
+| 2026-05-04 | bbda445 | Phase 3b | mixer の M/S を Ui::toggle_button_at に置換 (button + 自前 hint band の 2 段構えを 1 呼び出しに) |
+| 2026-05-04 | 59c93ec | Phase 3d | plugin_picker.rs を Ui::modal + Ui::list_view で rewrite (167 → 145 LOC) |
+| 2026-05-04 | 73e3504 | Phase 2  | Track / Clip に stable id を追加 (next_*_id 採番、ensure_ids、CURRENT_VERSION 2→3) |
+| 2026-05-04 | eda8954 | Phase 3e | arrangement_view を Ui::arrangement widget で rewrite (614 → 322 LOC、id ↔ index 変換層) |
