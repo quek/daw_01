@@ -5,11 +5,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::plugin_format::PluginFormat;
 
-/// Bumped to `3` when stable `id` fields were added to `Track` / `Clip`
-/// (track / clip move and id-based addressing for the gui_01 arrangement
-/// widget). Older `.daw` files cannot be loaded; this is acceptable while
-/// the project is still in M1 / pre-release.
-pub const CURRENT_VERSION: u32 = 3;
+/// Bumped to `4` after a brief detour at `3` (which had a per-`Clip`
+/// `volume` field that gui_01 then decided to put on `Track` instead —
+/// the existing `Track::volume` covers it, so the per-clip field was
+/// removed). Older `.daw` files cannot be loaded; acceptable while the
+/// project is still in M1 / pre-release.
+pub const CURRENT_VERSION: u32 = 4;
 
 /// Serde adapter for `Option<Vec<u8>>` that writes binary data as base64 in
 /// JSON (and other human-readable formats). Bincode bypasses this and uses
@@ -394,9 +395,10 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_three() {
-        // Bumped to 3 when stable id schema was added to Track / Clip.
-        // Pinning the constant in a test catches accidental rollback.
-        assert_eq!(CURRENT_VERSION, 3);
+    fn current_version_is_four() {
+        // Bumped to 4 after a brief detour at 3 (per-Clip volume that
+        // gui_01 then removed). Pinning the constant catches accidental
+        // rollback.
+        assert_eq!(CURRENT_VERSION, 4);
     }
 }

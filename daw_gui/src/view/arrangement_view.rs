@@ -12,7 +12,8 @@ use daw_ui_core::{
 };
 use daw_ui_renderer::{Color, Rect};
 
-use crate::app::{ARRANGE_TRACK_HEIGHT, AppData, AppEvent, ClipRef};
+use crate::app::{AppData, AppEvent, ClipRef};
+use crate::view::mixer_strips::{amp_to_fader, fader_to_amp};
 
 const TRACK_HEADER_W: f32 = 160.0;
 const RULER_H: f32 = 20.0;
@@ -27,6 +28,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             name: Arc::from(t.name.as_str()),
             muted: t.muted,
             solo: t.solo,
+            // mixer fader と同じ dB スケール (DB_MIN..DB_MAX) で表示する。
+            // 編集 callback で受け取った値は fader_to_amp で linear に戻す。
+            volume: amp_to_fader(t.volume),
             clips: t
                 .clips
                 .iter()
@@ -60,6 +64,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         .map(|t| t.id);
 
     let zoom = app.arrange_zoom_x.max(1.0);
+    let row_h = app.arrange_track_row_h.max(1.0);
     let lanes_w = (area.w - TRACK_HEADER_W).max(1.0);
     let loop_range = if app.song.loop_end_beat > app.song.loop_start_beat {
         Some((app.song.loop_start_beat, app.song.loop_end_beat))
@@ -67,22 +72,31 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         None
     };
     // data_generation: schema 編集を反映する粗粒度 hash。track 数 + clip 総数 +
-    // 各 track の name 長さ和。selection / drag / playhead では bump しない。
-    let data_generation = (app.song.tracks.len() as u64)
-        .wrapping_mul(0x100)
+    // 各 track の name 長さ和 + track 並び順 (id × position) を含めることで
+    // reorder でも bump する (selection / drag / playhead では bump しない)。
+    let data_generation = (app.song.tracks.len() as u64).wrapping_mul(0x10000)
         + app
             .song
             .tracks
             .iter()
-            .map(|t| t.clips.len() as u64 + (t.name.len() as u64))
+            .enumerate()
+            .map(|(i, t)| {
+                ((i as u64).wrapping_mul(31).wrapping_add(t.id as u64 + 1))
+                    .wrapping_mul(0x100)
+                    + (t.clips.len() as u64)
+                    + (t.name.len() as u64)
+                    // M10 Phase 47b: track volume も `data_generation` 因子に
+                    // (band 表示更新のため、float→bits hash で bump する)。
+                    + (t.volume.to_bits() as u64)
+            })
             .sum::<u64>();
 
     let view = ArrangementView {
         start_beat: app.arrange_scroll_beat as f64,
         len_beats: (lanes_w / zoom) as f64,
         track_top: 0.0,
-        tracks_visible: ((area.h - RULER_H) / ARRANGE_TRACK_HEIGHT).max(1.0),
-        track_row_h: ARRANGE_TRACK_HEIGHT,
+        tracks_visible: ((area.h - RULER_H) / row_h).max(1.0),
+        track_row_h: row_h,
         header_w: TRACK_HEADER_W,
         ruler_h: RULER_H,
         playhead_beat: app.playhead_beat.map(|b| b as f64),
@@ -266,6 +280,27 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
                 }
             })
         }
+        ArrangementEditRequest::ReorderTracks(order) => {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ReorderTracks(order.clone()));
+            })
+        }
+        ArrangementEditRequest::SetTrackVolume { track: track_id, prev: _, next } => {
+            // band は dB スケールで表示しているので、widget からは fader-scale value
+            // (0..1) が来る。fader_to_amp で linear amp に戻して反映する。
+            let amp = fader_to_amp(next.clamp(0.0, 1.0));
+            Edit::mutate(move |app: &mut AppData| {
+                if let Some(idx) = app.song.tracks.iter().position(|t| t.id == track_id) {
+                    app.handle_event(AppEvent::SetTrackVolume {
+                        track: idx as u32,
+                        amp,
+                    });
+                }
+            })
+        }
+        ArrangementEditRequest::SetTrackRowH(h) => Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::SetArrangeTrackRowH(h));
+        }),
         ArrangementEditRequest::BeginRenameTrack(track_id) => {
             Edit::mutate(move |app: &mut AppData| {
                 if let Some(idx) = app.song.tracks.iter().position(|t| t.id == track_id) {

@@ -146,6 +146,9 @@ pub struct AppData {
     pub bottom_panel: u8,
     pub arrange_zoom_x: f32,
     pub arrange_scroll_beat: f32,
+    /// arrangement の 1 track row 高さ (px)。Alt+wheel で 16..96 に縦ズーム。
+    /// default は `ARRANGE_TRACK_HEIGHT`。
+    pub arrange_track_row_h: f32,
     pub pianoroll_zoom_x: f32,
     pub pianoroll_zoom_y: f32,
     pub pianoroll_top_pitch: u8,
@@ -264,6 +267,7 @@ impl AppData {
             bottom_panel: 0,
             arrange_zoom_x: ARRANGE_PX_PER_BEAT,
             arrange_scroll_beat: 0.0,
+            arrange_track_row_h: ARRANGE_TRACK_HEIGHT,
             pianoroll_zoom_x: 64.0,
             pianoroll_zoom_y: 14.0,
             pianoroll_top_pitch: 84, // C6
@@ -730,6 +734,9 @@ pub enum AppEvent {
     DeleteTrack(u32),
     MoveTrackUp(u32),
     MoveTrackDown(u32),
+    /// 新順での `Track.id` 列で `song.tracks` を並び替える (drag&drop reorder)。
+    /// order に含まれない track はそのまま末尾に残す。
+    ReorderTracks(Vec<u32>),
     SelectTrack(u32),
     BeginRenameTrack(u32),
     RenameTrackChanged(String),
@@ -800,6 +807,7 @@ pub enum AppEvent {
     // -------- Scroll / zoom -----------------------------------------------
     SetArrangeScroll(f32),
     SetArrangeZoom(f32),
+    SetArrangeTrackRowH(f32),
     SetPianoRollScrollX(f32),
     SetPianoRollTopPitch(u8),
     SetPianoRollZoomX(f32),
@@ -872,6 +880,7 @@ impl AppData {
             AppEvent::DeleteTrack(idx) => self.delete_track(idx),
             AppEvent::MoveTrackUp(idx) => self.swap_tracks(idx, idx.saturating_sub(1)),
             AppEvent::MoveTrackDown(idx) => self.swap_tracks(idx, idx + 1),
+            AppEvent::ReorderTracks(order) => self.reorder_tracks(&order),
             AppEvent::SelectTrack(idx) => self.select_track(idx),
             AppEvent::BeginRenameTrack(idx) => {
                 self.begin_rename_track(idx);
@@ -986,6 +995,9 @@ impl AppData {
             }
             AppEvent::SetArrangeScroll(scroll) => {
                 self.arrange_scroll_beat = scroll.max(0.0);
+            }
+            AppEvent::SetArrangeTrackRowH(h) => {
+                self.arrange_track_row_h = h.clamp(16.0, 96.0);
             }
             AppEvent::SetArrangeZoom(zoom) => {
                 self.arrange_zoom_x = zoom.clamp(2.0, 400.0);
@@ -1403,6 +1415,68 @@ impl AppData {
         } else if self.selected_track == b {
             self.selected_track = a;
         }
+        self.resize_track_peak_display();
+        self.sync_song_to_plugin_host();
+    }
+
+    /// Drag&drop reorder。`order` は新順での `Track.id` 列。order に含まれない
+    /// track は末尾に残す (gui_01 daw_prototype の流儀に合わせ防御的)。
+    fn reorder_tracks(&mut self, order: &[u32]) {
+        if order.is_empty() {
+            return;
+        }
+        // 並びが変化しない場合は no-op
+        let same = order.iter().enumerate().all(|(i, id)| {
+            self.song.tracks.get(i).map(|t| t.id) == Some(*id)
+        });
+        if same && order.len() == self.song.tracks.len() {
+            return;
+        }
+        self.push_undo_snapshot();
+        let selected_track_id = self
+            .song
+            .tracks
+            .get(self.selected_track as usize)
+            .map(|t| t.id);
+        let selected_clip_keys: Vec<(u32, u32)> = self
+            .selected_clips
+            .iter()
+            .filter_map(|r| {
+                let t = self.song.tracks.get(r.track as usize)?;
+                let c = t.clips.get(r.clip as usize)?;
+                Some((t.id, c.id))
+            })
+            .collect();
+
+        let mut new_tracks = Vec::with_capacity(self.song.tracks.len());
+        for id in order {
+            if let Some(pos) = self.song.tracks.iter().position(|t| t.id == *id) {
+                new_tracks.push(self.song.tracks.remove(pos));
+            }
+        }
+        new_tracks.extend(self.song.tracks.drain(..));
+        self.song.tracks = new_tracks;
+
+        // selection を id で復元
+        if let Some(id) = selected_track_id
+            && let Some(idx) = self.song.tracks.iter().position(|t| t.id == id)
+        {
+            self.selected_track = idx as u32;
+        }
+        let new_clips: Vec<ClipRef> = selected_clip_keys
+            .iter()
+            .filter_map(|(tid, cid)| {
+                let t_idx = self.song.tracks.iter().position(|t| t.id == *tid)?;
+                let c_idx = self.song.tracks[t_idx]
+                    .clips
+                    .iter()
+                    .position(|c| c.id == *cid)?;
+                Some(ClipRef { track: t_idx as u32, clip: c_idx as u32 })
+            })
+            .collect();
+        self.selected_clips = new_clips.clone();
+        self.selected_clip = new_clips.first().copied();
+
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
     }

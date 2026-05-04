@@ -51,11 +51,11 @@ const STYLE_SOLO: ToggleButtonStyle = ToggleButtonStyle {
     ..TOGGLE_BUTTON_BASE
 };
 
-const DB_MIN: f32 = -80.0;
-const DB_MAX: f32 = 6.0;
-const DB_RANGE: f32 = DB_MAX - DB_MIN;
+pub(crate) const DB_MIN: f32 = -80.0;
+pub(crate) const DB_MAX: f32 = 6.0;
+pub(crate) const DB_RANGE: f32 = DB_MAX - DB_MIN;
 
-fn amp_to_fader(amp: f32) -> f32 {
+pub(crate) fn amp_to_fader(amp: f32) -> f32 {
     if amp <= 0.0 {
         return 0.0;
     }
@@ -63,7 +63,7 @@ fn amp_to_fader(amp: f32) -> f32 {
     ((db - DB_MIN) / DB_RANGE).clamp(0.0, 1.0)
 }
 
-fn fader_to_amp(n: f32) -> f32 {
+pub(crate) fn fader_to_amp(n: f32) -> f32 {
     let db = n * DB_RANGE + DB_MIN;
     if db <= DB_MIN {
         0.0
