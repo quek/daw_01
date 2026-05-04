@@ -670,6 +670,10 @@ pub enum AppEvent {
     SelectPluginFromDb(String),
     ToggleSlotGui { slot_kind: u8, slot_index: u32 },
     RemoveSlot { slot_kind: u8, slot_index: u32 },
+    /// inspector chain (MIDI FX → Instrument → FX を一列にした list) の reorder。
+    /// `order` は新順での旧 chain index 列。section 跨ぎ (slot_kind が変わる移動)
+    /// は handler 側で拒否する。
+    ReorderInspectorChain(Vec<usize>),
     SetMasterGain(f32),
 
     // -------- IPC events from plugin_host ---------------------------------
@@ -903,6 +907,9 @@ impl AppData {
             }
             AppEvent::RemoveSlot { slot_kind, slot_index } => {
                 self.remove_slot(slot_kind, slot_index);
+            }
+            AppEvent::ReorderInspectorChain(order) => {
+                self.reorder_inspector_chain(&order);
             }
             AppEvent::SetMasterGain(amp) => {
                 self.set_master_gain(amp);
@@ -1326,6 +1333,22 @@ impl AppData {
             })
             .collect();
 
+        // 元順序での index 列を計算 (`order[i]` の id を持つ track の旧 index)。
+        // この `index_order` を `MainToChild::ReorderTracks` で 1 度送り、
+        // plugin host 側で 1 回の `tracks.mutate` (= 1 回の audio thread stop/start)
+        // で chains / params / vocal を新順序に並び替える。
+        let index_order: Vec<u32> = order
+            .iter()
+            .filter_map(|id| {
+                self.song
+                    .tracks
+                    .iter()
+                    .position(|t| t.id == *id)
+                    .map(|p| p as u32)
+            })
+            .collect();
+
+        // song.tracks を新順序に並び替え (= 表示モデル更新)。
         let mut new_tracks = Vec::with_capacity(self.song.tracks.len());
         for id in order {
             if let Some(pos) = self.song.tracks.iter().position(|t| t.id == *id) {
@@ -1355,6 +1378,12 @@ impl AppData {
         self.selected_clips = new_clips.clone();
         self.selected_clip = new_clips.first().copied();
 
+        // chains / params / vocal を 1 回の `tracks.mutate` で並び替え (ReorderTracks)。
+        // 続けて `LoadSong` で `song_store` も新順序に同期 (LoadSong は params 更新と
+        // song の atomic swap だけなので audio thread を止めない)。両方送らないと
+        // chains は新順序、song_store は旧順序のまま → clip が違う track の chain で
+        // 再生されて「クリップが入れかわる」現象が出る。
+        self.send_plugin(MainToChild::ReorderTracks(index_order));
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
     }
@@ -1938,6 +1967,57 @@ impl AppData {
                 .map(|p| p.plugin_id.as_str())?,
         };
         Some(self.resolve_name(id))
+    }
+
+    /// inspector chain (MIDI FX → Instrument → FX を一列で表示) の reorder。
+    /// `order[i]` は新位置 i に来る旧 chain index。section 跨ぎ (slot_kind が
+    /// 変わる移動) は無視 (DAW 慣習: signal flow 順序の意味が壊れる)。
+    fn reorder_inspector_chain(&mut self, order: &[usize]) {
+        let chain = self.inspector_chain();
+        if chain.len() != order.len() {
+            return;
+        }
+        // section 整合性チェック: 各位置の slot_kind が変わらないこと
+        let same_section = order
+            .iter()
+            .enumerate()
+            .all(|(new_i, &old_i)| {
+                chain.get(old_i).map(|e| e.slot_kind)
+                    == chain.get(new_i).map(|e| e.slot_kind)
+            });
+        if !same_section {
+            return;
+        }
+        let track_idx = self.selected_track;
+        let Some(track) = self.song.tracks.get_mut(track_idx as usize) else {
+            return;
+        };
+        // chain の構成: [midi_fx_chain..., (instrument), fx_chain...]
+        let midi_count = track.midi_fx_chain.len();
+        let inst_count = usize::from(track.instrument.is_some());
+        let fx_start = midi_count + inst_count;
+
+        // MIDI FX section を新順序で並び替え
+        if midi_count > 0 {
+            let new_midi: Vec<_> = (0..midi_count)
+                .map(|new_i| track.midi_fx_chain[order[new_i]].clone())
+                .collect();
+            track.midi_fx_chain = new_midi;
+        }
+        // FX section を新順序で並び替え
+        let fx_count = track.fx_chain.len();
+        if fx_count > 0 {
+            let new_fx: Vec<_> = (0..fx_count)
+                .map(|new_i| {
+                    let chain_new_i = fx_start + new_i;
+                    let chain_old_i = order[chain_new_i];
+                    let fx_old_i = chain_old_i - fx_start;
+                    track.fx_chain[fx_old_i].clone()
+                })
+                .collect();
+            track.fx_chain = new_fx;
+        }
+        self.sync_song_to_plugin_host();
     }
 
     fn remove_slot(&mut self, slot_kind: u8, slot_index: u32) {

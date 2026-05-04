@@ -167,6 +167,12 @@ pub enum MainToChild {
     /// vocal audio between `a` and `b`. The audio thread sees the new
     /// arrangement on the next buffer.
     SwapTracks { a: u32, b: u32 },
+    /// Apply a multi-track reorder in **one** `tracks.mutate` call (i.e. one
+    /// audio-thread stop/start cycle). `order[i]` is the previous index of
+    /// the track that should end up at the new position `i`. Used by the
+    /// arrangement widget's drag-and-drop reorder so multiple `SwapTracks`
+    /// commands don't thrash the audio thread.
+    ReorderTracks(Vec<u32>),
     /// Ask the plugin_host to capture state for one slot. Reply is
     /// `ChildToMain::SlotPluginState`.
     RequestSlotState {

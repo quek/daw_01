@@ -119,6 +119,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     // track header の右クリックメニュー (Rename / Delete) を widget 外で重ねる。
     // widget は track_header_rects と BeginRenameTrack / DeleteTrack の発行までを担う。
+    // rename mode 中の track には text_input を rect に重ね描きする。
+    let renaming_track_id = app
+        .track_rename_idx
+        .and_then(|idx| app.song.tracks.get(idx as usize).map(|t| t.id));
     for (track_id, rect) in resp.track_header_rects {
         ui.context_menu_for(rect, &["Rename", "Delete"], move |idx, ui| {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -133,6 +137,33 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 }
             }));
         });
+
+        if Some(track_id) == renaming_track_id {
+            // text_input は track header rect の上端に被せる (M/S トグル等は隠れる)。
+            // text_input widget が click で focus を取る。Enter で commit、Esc は
+            // root の escape shortcut handler が CancelRenameTrack を発行する。
+            let input_rect = Rect {
+                x: rect.x + 2.0,
+                y: rect.y + 2.0,
+                w: rect.w - 4.0,
+                h: 22.0,
+            };
+            let resp = ui.text_input_at(
+                ("track_rename", track_id),
+                input_rect,
+                &app.track_rename_text,
+                |new| {
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::RenameTrackChanged(new.clone()));
+                    })
+                },
+            );
+            if resp.committed {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::CommitRenameTrack);
+                }));
+            }
+        }
     }
 
     // file drop の hint frame は widget の上に被せる。canvas (lanes) のみ受け付け。

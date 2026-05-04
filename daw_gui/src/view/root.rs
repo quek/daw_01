@@ -219,9 +219,16 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>) {
         }));
     }
     // modal が開いている間は escape を消費しない (modal 側で close する)。
+    // rename mode 中は CancelRenameTrack へ振り、それ以外は CloseHelp。
     if !app.is_plugin_picker_open && ui.take_shortcut("escape") {
-        ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.handle_event(AppEvent::CloseHelp)
-        }));
+        if app.track_rename_idx.is_some() {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CancelRenameTrack)
+            }));
+        } else {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CloseHelp)
+            }));
+        }
     }
 }

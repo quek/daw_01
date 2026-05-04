@@ -146,6 +146,7 @@ enum PluginCommand {
         a: u32,
         b: u32,
     },
+    ReorderTracks(Vec<u32>),
     LoadSong(Song),
     Play,
     Stop,
@@ -514,6 +515,17 @@ fn plugin_main_loop(
                         &loop_state,
                         |t| {
                             t.swap_indices(a, b);
+                        },
+                    );
+                }
+                PluginCommand::ReorderTracks(order) => {
+                    let _ = tracks.mutate(
+                        &session,
+                        &playback_state,
+                        &song_store,
+                        &loop_state,
+                        |t| {
+                            t.reorder_indices(&order);
                         },
                     );
                 }
@@ -993,6 +1005,10 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             tracing::info!(a, b, "received SwapTracks");
             plugin.send(PluginCommand::SwapTracks { a, b });
         }
+        MainToChild::ReorderTracks(order) => {
+            tracing::info!(?order, "received ReorderTracks");
+            plugin.send(PluginCommand::ReorderTracks(order));
+        }
         MainToChild::RequestSlotState { track, slot } => {
             tracing::info!(track, ?slot, "received RequestSlotState");
             plugin.send(PluginCommand::RequestSlotState { track, slot });
@@ -1197,6 +1213,41 @@ impl Tracks {
             if let Some(v) = self.vocal.remove(&k) {
                 self.vocal.insert(k - 1, v);
             }
+        }
+    }
+
+    /// Reorder all chains / params / vocal so that the entry previously at
+    /// `order[i]` ends up at the new index `i`. Indices not mentioned in
+    /// `order` keep their original key. Used by `ReorderTracks` (single
+    /// `mutate` call = single audio-thread stop/start) to apply an N-way
+    /// drag&drop reorder without thrashing the audio thread.
+    fn reorder_indices(&mut self, order: &[u32]) {
+        let identity = order.iter().enumerate().all(|(i, &o)| o == i as u32);
+        if identity {
+            return;
+        }
+        let mapping: std::collections::HashMap<u32, u32> = order
+            .iter()
+            .enumerate()
+            .map(|(new_i, &old_i)| (old_i, new_i as u32))
+            .collect();
+        let chains_snapshot: Vec<(u32, _)> =
+            std::mem::take(&mut self.chains).into_iter().collect();
+        for (old_i, c) in chains_snapshot {
+            let new_i = mapping.get(&old_i).copied().unwrap_or(old_i);
+            self.chains.insert(new_i, c);
+        }
+        let params_snapshot: Vec<(u32, _)> =
+            std::mem::take(&mut self.params).into_iter().collect();
+        for (old_i, p) in params_snapshot {
+            let new_i = mapping.get(&old_i).copied().unwrap_or(old_i);
+            self.params.insert(new_i, p);
+        }
+        let vocal_snapshot: Vec<(u32, _)> =
+            std::mem::take(&mut self.vocal).into_iter().collect();
+        for (old_i, v) in vocal_snapshot {
+            let new_i = mapping.get(&old_i).copied().unwrap_or(old_i);
+            self.vocal.insert(new_i, v);
         }
     }
 

@@ -107,6 +107,7 @@ async fn recv_loop(
             | Ok(MainToChild::MoveSlot { .. })
             | Ok(MainToChild::RemoveTrack { .. })
             | Ok(MainToChild::SwapTracks { .. })
+            | Ok(MainToChild::ReorderTracks(_))
             | Ok(MainToChild::RequestSlotState { .. })
             | Ok(MainToChild::RequestAllStates) => {
                 // CLAP plugin lifecycle / state is handled by daw_plugin_host.
