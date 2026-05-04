@@ -122,7 +122,7 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 - daw_01 (実 DAW プロトタイプ) が gui_01 を path 依存で利用開始
 - 設計の不変条件 (no-Clone / メッセージ型禁止 / derive 禁止 / audio・IPC 不混入) 維持
 
-### M9 (Real DAW Validation — `Edit::Undoable` ergonomic 実証、Phase 41-43 + 44a-c 完了)
+### M9 (Real DAW Validation — `Edit::Undoable` ergonomic 実証 + daw_01 conversation 統合) — ✅ 完了 (2026-05-04)
 
 **目的**: M8 で導入した `Edit::Undoable` の ergonomic を、note 編集 / audio buffer 編集の 2 ケースで実証する。boilerplate が出れば library helper で吸収。daw_01 で並行検証して library API の fitness function を回す。
 
@@ -163,22 +163,52 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 - 「重い data inverse」用に library helper (例: `Edit::snapshot_inverse(label, fwd, restore_from)`) を追加すべきか (Phase 42 / 44)
 - Vec<f32> の Arc 共有時の `Send + Sync` 制約が問題になるか (Phase 42)
 
+**完了条件 (DoD)** — すべて達成 (2026-05-04):
+
+- ✅ Phase 41-43 のすべての `Edit::with_inverse` が library helper (`Edit::snapshot_inverse`) で吸収済 (Phase 44b で確認、3 件未満 helper 不要 ergonomic も verify)
+- ✅ daw_01 で arrangement / piano_roll / mixer / inspector / browser 等の操作が gui_01 widget で動作 (Phase 44c-45g で会話ベース統合、conversation #001-#010 すべて [Replied])
+- ✅ `cargo build --workspace` / `cargo test --workspace` (200 unit test) / `cargo clippy --workspace --tests -- -D warnings` / `cargo test -p daw-ui-core --test no_clone_required` 全 ✅
+- ✅ `cargo run --bin piano_roll` で N notes 操作 → Undo / Redo 確認済
+- ✅ `cargo run --bin sample_edit_ops` で trim / fade Undo / Redo 確認済
+- ✅ 全 example で Ctrl+F1 → debug overlay toggle 動作
+- ✅ `cargo run --bin daw_prototype` で arrangement / piano_roll / mixer / sample タブ + modal demo / clip drag / Rename overlay / scrollbar drag (Phase 45g) 動作
+
+### M10 (Arrangement 機能拡張) — 🟡 計画
+
+**目的**: M9 Phase 45e で実装した `Ui::arrangement` widget の **欠けている daw 機能** を追加する。Phase 45e 動作確認で user 要望が出た 3 機能 (drag&drop track 並び替え / clip volume / 縦ズーム) を library API として shipping 確定する。
+
+**動機**: M9 Phase 45e 完了時点で arrangement widget は「最小限の DAW timeline」(track header / clip drag / loop band / playhead) を提供するが、実用には:
+- track 並び替えが ↑/↓ button のみで遅い (drag&drop が DAW 慣習)
+- clip ごとの volume 調整ができない (DAW core 機能)
+- track の縦ズームができない (画面が狭いとき不便)
+
+これら 3 つは conversation #005 確定 API の **拡張** であり、API breaking 変更も恐れず 1 commit ずつで shipping (CLAUDE.md「破壊して作り直す」原則)。
+
+| Phase | テーマ                                       | 主な成果物                                                                                                                                                                                                                                  | 状態      |
+|-------|----------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------|
+| 46    | drag&drop で track 並び替え                   | `ArrangementEditRequest::ReorderTracks(Vec<u32>)` 新 variant (新順での `track.id` 列)。track header rect 上で primary press → 16px 以上 drag → release で reorder 発行 (commit-by-release、piano_roll の clip drag と同パターン)。drag 中は dragging track の半透明複製を cached 外で **floating** 描画、drop 先に drop indicator (横 line) も描画。↑/↓ button は keep (a11y / keyboard 用 + 列挙的 reorder)。daw_prototype で `Vec<DawTrack>::swap` ベースで apply 確認 + regression test | 🟡 計画 |
+| 47    | clip volume 編集                              | `ArrangementClip` に `volume: f32` (0..1, default 1.0) 追加 (**breaking**、daw_prototype + trybuild basic.rs 1 commit 追従)。clip rect 上に **horizontal volume slider band** (clip 高の 4px) を bottom-aligned で描画 + drag で `SetClipVolume(ClipKey, f32)` 発行。slider hit zone は clip body (Move drag) と独立 (clip body は volume zone を除外した上端 -4px の範囲で Move 判定)。clip 描画も volume を不透明度に反映 (low volume → 半透明、視覚 cue) | 🟡 計画 |
+| 48    | 縦ズーム (`track_row_h` 動的変更)             | `ArrangementEditRequest::SetTrackRowH(f32)` 新 variant。**`Alt+wheel`** で track_row_h を `f` で乗算して発行 (min/max は daw_prototype 側で clamp、目安 16..96 px)。既存の `Ctrl+wheel = SetZoomX` / `Shift+wheel = SetScrollX` / `plain wheel = SetTrackTop` と独立 modifier (`Alt` は gui_01 内未使用)。Ableton / Reaper 標準と整合、1 modifier で ergonomic。macOS の `Option+scroll = system 横スクロール` 衝突は将来 macOS 対応時に winit event 受信側で対処 | 🟡 計画 |
+
+**設計判断**:
+
+- **drag&drop preview の見た目**: dragging track header を半透明 (`alpha 0.6`) でカーソル位置に追従 + drop indicator (横 line、target track の上下) を描画。release で `ReorderTracks(new_order)` 発行
+- **clip volume の slider 位置**: 「clip 内 bottom band」 vs 「clip 上に重ねる外部 widget」の 2 案。前者を採用 (clip と一体感、外部 widget だと clip 数 = widget 数で重い)
+- **縦ズームの modifier**: **`Alt+wheel`** を採用 (Ableton / Reaper 標準と整合、1 modifier で ergonomic、gui_01 内 Alt 未使用)。`Ctrl+Shift+wheel` (Bitwig 派生) は 2 modifier で却下
+
 **完了条件 (DoD)**:
 
-- Phase 41-43 のすべての `Edit::with_inverse` が boilerplate コメントなしで自然に書けるか、library helper で吸収できている
-- daw_01 で 1 操作 (例: track 追加 + undo) を実装し、API が破綻しないことを確認
-- `cargo build --workspace` / `cargo test --workspace` / `cargo clippy --workspace --tests -- -D warnings` 全 ✅
-- `cargo run --bin piano_roll` で N notes を rect 選択 → Delete → Ctrl+Z で 1 step 復元、Ctrl+Shift+Z で再 delete 可
-- `cargo run --bin sample_edit_ops` で trim → Ctrl+Z 復元、fade → Ctrl+Z → Ctrl+Shift+Z 可
-- 全 example で Ctrl+F1 → debug overlay toggle 動作
+- Phase 46-48 全完了で daw_01 conversation の関連エントリに [Replied] (もし新規 [Open] が来たら fold)
+- `cargo build --workspace` / `cargo test --workspace` / `cargo clippy --workspace --tests -- -D warnings` / `cargo test -p daw-ui-core --test no_clone_required` 全 ✅
+- `cargo run --bin daw_prototype` で track drag&drop / clip volume slider / Ctrl+Shift+wheel 縦ズーム を実機確認
 
 ---
 
-## 凍結 (Phase 44 完了後に再評価)
+## 凍結 (M9+M10 完了後の再評価対象)
 
-下記 milestone はすべて凍結。**Phase 44 で Undoable ergonomic 検証 + daw_01 フィードバック取得が完了した後に、改めて優先順位を見直す**。一覧は traceability のために残すが、phase 番号は新 M9 と衝突するため参考扱い (canonical な phase 番号は新 M9 のみ)。
+下記 milestone は **凍結**。M9 (Real DAW Validation) + M10 (Arrangement 機能拡張) 完了の状態で、改めて優先順位を見直す。canonical な phase 番号は M9-M10 のみ。
 
-### 凍結: 旧 M9 (描画 / theming + アニメ + アイコン)
+### 凍結: 描画 / theming + アニメ + アイコン (旧 M9)
 
 - theming システム (`Theme` struct、color palette / state スタイル)
 - dark / light theme 切替
@@ -186,14 +216,13 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 - vello 統合 + SVG アイコン
 - gradient / shadow / blur
 
-### 凍結: 旧 M10 (DAW 固有 widget — 信号処理系)
+### 凍結: DAW 固有 widget — 信号処理系 (旧 M10)
 
-- piano keyboard widget (単体)
-- MIDI piano roll widget (library widget 化) ※**新 M9 Phase 41 で note edit 含めて先行検証中、validation 後に widget 化判断**
+- piano keyboard widget (単体、piano_roll と独立した「鍵盤だけ」widget)
 - spectrogram (FFT + LOD)
 - EQ curve / filter response (Bezier flatten 流用)
 
-### 凍結: 旧 M11 (テキスト / 多言語)
+### 凍結: テキスト / 多言語 (旧 M11)
 
 - IME 強化 (preedit cursor 精度、proportional font 対応)
 - font fallback (CJK / emoji)
@@ -201,22 +230,14 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 - 文字選択 (drag / triple-click / shift+arrow)
 - i18n 基盤
 
-### 凍結: 旧 M12 (OS 統合)
+### 凍結: OS 統合 (旧 M12 残り)
 
-- multi-window (各 window に独立 UiHost)
-- file dialog 強化 (filter / directory chooser / recent files)
-- cursor 詳細 (text/pointer/resize/crosshair の full set) ※**新 M9 Phase 41 で最小実装**
-- fullscreen / borderless
+- file dialog 強化 (filter / directory chooser / recent files、現状 rfd 0.15 minimum)
+- cursor 詳細 (Resize 8 方向 / Help / NotAllowed 等の full set、現状 Move / EwResize / Default のみ)
+- fullscreen / borderless (DAW ライブモード等)
 
-### 凍結: 旧 M13 (プラットフォーム第 2 実装)
+### 凍結: 開発体験 + リリース整備 (旧 M14)
 
-- baseview 再評価 (rwh 0.6 対応または fork パターン)
-- 実 plugin host 検証 (REAPER / Bitwig / CLAP / VST3 wrapper)
-- プラグイン UI host integration sample
-
-### 凍結: 旧 M14 (開発体験 + リリース整備)
-
-- debug overlay ※**新 M9 Phase 43 で先行実装**
 - widget tree inspector (frame の widget 構造可視化、hit-test 視覚化)
 - snapshot test framework (OffscreenRenderer + PNG diff、CI 自動化)
 - widget catalog example
@@ -225,7 +246,10 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 
 ### 不採用
 
-- AccessKit (M6 Phase 20): 個人 DAW プロジェクトのため対象外、再評価対象外。
+- **AccessKit** (旧 M6 Phase 20、2026-05-02 ユーザ判断): 個人 DAW プロジェクトのため対象外、再評価対象外。
+- **baseview / 実 plugin host 検証 / プラグイン UI host integration sample** (旧 M13、2026-05-04 ユーザ判断): daw_01 で plugin editor は **別 stack** で動作中 (`Win32 / X11 embedding` 等)。gui_01 は「ホスト DAW のメイン UI」専用に割り切り、plugin renderer 用途は drop。
+- **multi-window** (旧 M12、2026-05-04 ユーザ判断): plugin editor 別 stack なら gui_01 で複数 window を持つ動機は薄い (mixer 別 window 等のホスト UI 分離は単一 window + tab/split で代替)。drop。
+- **`embedded_host` example** (M9 Phase 21 OffscreenRenderer の PNG snapshot は維持、plugin host 連携サンプルとしての立ち位置は drop): plugin host 用途を drop したことに合わせて、example は OffscreenRenderer の **動作確認** 単体例として位置付け直す (実 plugin に embed する手順は提供しない)。
 
 ---
 
