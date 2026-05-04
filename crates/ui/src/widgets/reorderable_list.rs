@@ -1,0 +1,669 @@
+//! `reorderable_list` ウィジェット — `scroll_area` 上に drag&drop reorder を内蔵した list (M11 Phase 51)。
+//!
+//! daw_01 conversation `#012 [Replied]` で確定した API。`list_view` と完全平行な API
+//! (scroll_area + row callback) に drag-reorder セマンティクスを足したもの。
+//!
+//! 設計:
+//! - `make_edit: Fn(ReorderableListEditRequest) -> Edit<M> + Clone + Send + Sync + 'static`
+//!   (M10 Phase 49 の `Ui::arrangement` と同じ trait bound、Undoable Edit の forward/inverse 2
+//!   closure に分配するため `Clone` 必要)
+//! - `Reorder(Vec<usize>)`: release frame で 1 度だけ発行。`order` は新順での元 index 列で
+//!   `new_items[i] = items[order[i]]`、または `apply_reorder<T: Clone>(items, anchor, target)`
+//!   helper でも apply 可能。stable id ベースが必要なら caller 側で `key_of(items[order[i]])`
+//!   等にマッピングする。
+//! - `drag_handle_w`: `0.0` で row 全体 drag (Bitwig 風)、`> 0.0` で row 左端 N px だけ
+//!   drag 起点 (Logic / Cubase 風グリップ)。残り領域は row callback の button_at 等で消費可能。
+//! - **commit-by-release**: drag 中は library が overlay 描画 (元 row 半透明 + drop indicator)、
+//!   release frame で初めて `Reorder` を発行する。dy < 16px は短 click → `clicked` に格下げ。
+//! - **release frame optimistic preview**: arrangement Phase 50 と同パターン。release frame で
+//!   先に新順序を計算 → state に保存 → 同フレーム + 次フレームの 1 度ずつ新順序で描画して
+//!   Edit 適用 1 frame 遅延の visual 揺れを抑える。
+//! - reorder logic は arrangement の `compute_reorder_target_index` / `apply_reorder` を再利用。
+
+use std::cell::Cell;
+use std::hash::Hash;
+
+use daw_ui_renderer::{Color, Rect, RectCommand};
+
+use crate::edit::Edit;
+use crate::id::WidgetId;
+use crate::ui::Ui;
+use crate::widgets::arrangement::{apply_reorder, compute_reorder_target_index};
+
+/// `scroll_area` 内部の scrollbar 幅 (`scroll_area::SCROLLBAR_W` のミラー、row 幅から差し引くため)。
+const SCROLLBAR_W: f32 = 10.0;
+
+/// drag commit 判定の最小移動量 (px)。これ未満では click 扱いに格下げ。
+/// arrangement の `TrackReorderSession` (Phase 46) と同値。
+const DRAG_THRESHOLD_PX: f32 = 16.0;
+
+#[derive(Clone, Copy, Debug)]
+pub struct ReorderableListStyle {
+    pub row_height: f32,
+    pub row_gap: f32,
+    pub row_bg: Color,
+    pub row_bg_hover: Color,
+    pub row_bg_selected: Color,
+    /// drag 中の anchor row 背景 (半透明風)。
+    pub row_bg_dragging: Color,
+    /// drop 位置の横 line 色。
+    pub drop_indicator_color: Color,
+    pub drop_indicator_h: f32,
+    pub radius: f32,
+    /// `0.0` で row 全体 drag、`> 0.0` で row 左端 N px だけ drag 起点
+    /// (残り領域は row callback の button_at 等が click を消費可能)。
+    pub drag_handle_w: f32,
+}
+
+impl Default for ReorderableListStyle {
+    fn default() -> Self {
+        Self {
+            row_height: 26.0,
+            row_gap: 2.0,
+            row_bg: Color::rgb(0.13, 0.14, 0.18),
+            row_bg_hover: Color::rgb(0.18, 0.20, 0.26),
+            row_bg_selected: Color::rgb(0.32, 0.55, 0.85),
+            row_bg_dragging: Color::rgba(0.30, 0.40, 0.55, 0.85),
+            drop_indicator_color: Color::rgb(0.32, 0.55, 0.85),
+            drop_indicator_h: 2.0,
+            radius: 2.0,
+            drag_handle_w: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReorderableListResponse {
+    /// このフレームで click された row index (drag 距離 < 16px の release で trigger)。
+    pub clicked: Option<usize>,
+    /// hover 中の row index (任意フレーム)。
+    pub hovered: Option<usize>,
+    /// drag 中の anchor row index。drag 開始フレーム以降、release まで保持。
+    pub dragging: Option<usize>,
+}
+
+/// release frame で 1 度発行される reorder Edit リクエスト。
+#[derive(Debug)]
+pub enum ReorderableListEditRequest {
+    /// `order` は新順での元 index 列。`new_items[i] = items[order[i]]` で並び替え可能、
+    /// または `daw_ui_core::widgets::arrangement::apply_reorder(items, anchor, target)` で
+    /// 直接 `Vec<T>` を得られる (内部で apply_reorder を使ってこの値を計算している)。
+    Reorder(Vec<usize>),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReorderSession {
+    anchor_index: usize,
+    anchor_mouse_y: f32,
+    /// drag 中の最終 mouse y (release frame の `pointer.pos` が press 位置のままになる
+    /// winit ケースに備えて、widget state 側で確実に保持)。
+    last_mouse_y: f32,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ReorderableListState {
+    session: Option<ReorderSession>,
+    /// release frame で計算した「次フレーム描画用」の新順 index 列。
+    /// Some の間は同フレーム + 次フレーム描画でこの順序を反映する (1 frame の visual 遅延を
+    /// 解消)。次フレームに enter したら自動的に消費 (= None)。
+    pending_order: Option<Vec<usize>>,
+}
+
+impl<'a, M: ?Sized + 'static> Ui<'a, M> {
+    /// `scroll_area` 上の drag&drop reorder list。各 row は `row` callback で描画する。
+    ///
+    /// drag による並び替えは release frame で `make_edit(ReorderableListEditRequest::Reorder(order))` を
+    /// 1 度だけ発行する (commit-by-release)。dy < 16px の release は click 扱い (`Response.clicked`)。
+    ///
+    /// `selected: Option<usize>` は描画用ハイライトのみ (本 widget は selection を管理しない、
+    /// caller が `clicked` を見て更新する)。
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn reorderable_list<T, F, R>(
+        &mut self,
+        id: impl Hash,
+        rect: Rect,
+        items: &[T],
+        selected: Option<usize>,
+        style: &ReorderableListStyle,
+        make_edit: F,
+        mut row: R,
+    ) -> ReorderableListResponse
+    where
+        F: Fn(ReorderableListEditRequest) -> Edit<M> + Clone + Send + Sync + 'static,
+        R: FnMut(&mut Ui<'a, M>, &T, usize, Rect, /*selected*/ bool, /*dragging*/ bool),
+    {
+        let wid = WidgetId::ROOT.child((b"reorderable_list", &id));
+        let pointer = self.pointer;
+        let row_total_h = style.row_height + style.row_gap;
+        let item_count = items.len();
+        let content_h = (item_count as f32) * row_total_h;
+
+        let needs_scrollbar = content_h > rect.h;
+        let row_visible_w = if needs_scrollbar {
+            (rect.w - SCROLLBAR_W).max(0.0)
+        } else {
+            rect.w
+        };
+
+        // ---- press 検出 ----
+        // drag_handle_w 範囲内 (or row 全体) で primary_just_pressed → reorder session 開始
+        if pointer.primary_just_pressed
+            && let Some((px, py)) = pointer.pos
+            && rect.contains(px, py)
+            && row_total_h > 0.0
+        {
+            let in_handle = if style.drag_handle_w <= 0.0 {
+                true
+            } else {
+                (px - rect.x) <= style.drag_handle_w
+            };
+            if in_handle {
+                let scroll_y = self.scroll_offset(("reorderable_list_scroll", &id)).1;
+                let local = py - rect.y + scroll_y;
+                if local >= 0.0 {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let idx = (local / row_total_h) as usize;
+                    if idx < item_count {
+                        let state: &mut ReorderableListState = self.widget_state(wid);
+                        state.session = Some(ReorderSession {
+                            anchor_index: idx,
+                            anchor_mouse_y: py,
+                            last_mouse_y: py,
+                        });
+                    }
+                }
+            }
+        }
+
+        // ---- drag continue: 毎フレーム last_mouse_y を更新 ----
+        if let Some((_px, py)) = pointer.pos {
+            let state: &mut ReorderableListState = self.widget_state(wid);
+            if let Some(ref mut s) = state.session {
+                s.last_mouse_y = py;
+            }
+        }
+
+        // ---- release: session 取り出し → Reorder 発行 or click 格下げ ----
+        let release_session: Option<ReorderSession> = if pointer.primary_just_released {
+            let state: &mut ReorderableListState = self.widget_state(wid);
+            state.session.take()
+        } else {
+            None
+        };
+
+        let mut clicked: Option<usize> = None;
+        if let Some(s) = release_session {
+            let dy = (s.last_mouse_y - s.anchor_mouse_y).abs();
+            if dy >= DRAG_THRESHOLD_PX {
+                let scroll_y = self.scroll_offset(("reorderable_list_scroll", &id)).1;
+                let target = compute_reorder_target_index(
+                    s.anchor_index,
+                    s.last_mouse_y,
+                    rect.y,
+                    scroll_y,
+                    row_total_h,
+                    item_count,
+                );
+                if target != s.anchor_index {
+                    let cur: Vec<usize> = (0..item_count).collect();
+                    let new_order = apply_reorder(&cur, s.anchor_index, target);
+                    let edit = make_edit(ReorderableListEditRequest::Reorder(new_order.clone()));
+                    self.push_edit(edit);
+                    let state: &mut ReorderableListState = self.widget_state(wid);
+                    state.pending_order = Some(new_order);
+                }
+            } else {
+                // 短 click: row 全体 drag mode のときだけ clicked を発火 (drag handle mode では
+                // row 残り領域の button_at 等が click を消費する想定なので、widget は出さない)。
+                if style.drag_handle_w <= 0.0 {
+                    clicked = Some(s.anchor_index);
+                }
+            }
+        }
+
+        // ---- 描画用 session snapshot + pending_order 取得 ----
+        let session_for_overlay: Option<ReorderSession> = {
+            let state: &mut ReorderableListState = self.widget_state(wid);
+            state.session
+        };
+        let pending_order_for_draw: Option<Vec<usize>> = {
+            let state: &mut ReorderableListState = self.widget_state(wid);
+            // pending_order は 1 frame だけ保持して次フレームで消費 (= take して使い回し)。
+            state.pending_order.take()
+        };
+
+        // ---- 描画 (scroll_area + per-row push_rect、list_view と同パターン) ----
+        let style_copy = *style;
+        let item_count_copy = item_count;
+        let hovered = Cell::new(None::<usize>);
+
+        self.scroll_area(
+            ("reorderable_list_scroll", &id),
+            rect,
+            (rect.w, content_h),
+            |ui, offset| {
+                if item_count_copy == 0 || row_total_h <= 0.0 {
+                    return;
+                }
+                let visible_top = offset.1;
+                let visible_bottom = offset.1 + rect.h;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let i_start = (visible_top / row_total_h).floor().max(0.0) as usize;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let i_end = ((visible_bottom / row_total_h).ceil() as usize).min(item_count_copy);
+
+                // 描画順は **表示順** (= pending_order があれば preview 順、無ければ元順)。
+                // i は表示位置 (0..item_count)、src は実 items index (= pending_order[i] or i)。
+                for i in i_start..i_end {
+                    let src = pending_order_for_draw
+                        .as_ref()
+                        .and_then(|o| o.get(i).copied())
+                        .unwrap_or(i);
+                    if src >= item_count_copy {
+                        continue;
+                    }
+                    #[allow(clippy::cast_precision_loss)]
+                    let row_y = rect.y - offset.1 + (i as f32) * row_total_h;
+                    let row_rect = Rect {
+                        x: rect.x,
+                        y: row_y,
+                        w: row_visible_w,
+                        h: style_copy.row_height,
+                    };
+                    let inside = pointer
+                        .pos
+                        .is_some_and(|(px, py)| row_rect.contains(px, py));
+                    let is_selected = selected == Some(src);
+                    let is_dragging = session_for_overlay.is_some_and(|s| s.anchor_index == src);
+                    let bg = if is_dragging {
+                        style_copy.row_bg_dragging
+                    } else if is_selected {
+                        style_copy.row_bg_selected
+                    } else if inside {
+                        style_copy.row_bg_hover
+                    } else {
+                        style_copy.row_bg
+                    };
+                    ui.push_rect(RectCommand {
+                        rect: row_rect,
+                        fill: bg,
+                        border: Color::TRANSPARENT,
+                        border_width: 0.0,
+                        radius: [style_copy.radius; 4],
+                        clip_rect: None,
+                    });
+                    row(ui, &items[src], src, row_rect, is_selected, is_dragging);
+
+                    if inside {
+                        hovered.set(Some(src));
+                    }
+                }
+
+                // ---- drop indicator: drag 中で dy >= threshold なら描画 ----
+                if let Some(s) = session_for_overlay {
+                    let dy = (s.last_mouse_y - s.anchor_mouse_y).abs();
+                    if dy >= DRAG_THRESHOLD_PX && item_count_copy > 0 {
+                        let target = compute_reorder_target_index(
+                            s.anchor_index,
+                            s.last_mouse_y,
+                            rect.y,
+                            offset.1,
+                            row_total_h,
+                            item_count_copy,
+                        );
+                        if target != s.anchor_index {
+                            // anchor 抜き取り後の挿入位置 → 表示上の line 位置:
+                            //   target <= anchor → row[target] の上端
+                            //   target >  anchor → row[target+1] の上端 (= row[target] 抜き取り後の次行の上)
+                            let target_visual = if target > s.anchor_index { target + 1 } else { target };
+                            #[allow(clippy::cast_precision_loss)]
+                            let indicator_y = rect.y - offset.1
+                                + (target_visual as f32) * row_total_h
+                                - style_copy.drop_indicator_h * 0.5;
+                            // viewport 内 clamp (上下端で indicator がはみ出さないように)
+                            let y_clamped = indicator_y
+                                .max(rect.y)
+                                .min(rect.y + rect.h - style_copy.drop_indicator_h);
+                            ui.push_rect(RectCommand {
+                                rect: Rect {
+                                    x: rect.x,
+                                    y: y_clamped,
+                                    w: row_visible_w,
+                                    h: style_copy.drop_indicator_h,
+                                },
+                                fill: style_copy.drop_indicator_color,
+                                border: Color::TRANSPARENT,
+                                border_width: 0.0,
+                                radius: [0.0; 4],
+                                clip_rect: None,
+                            });
+                        }
+                    }
+                }
+            },
+        );
+
+        ReorderableListResponse {
+            clicked,
+            hovered: hovered.get(),
+            dragging: session_for_overlay.map(|s| s.anchor_index),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::sync::{Arc, Mutex};
+
+    use daw_ui_platform::PhysicalSize;
+    use daw_ui_renderer::{Rect, Scene};
+
+    use super::{ReorderableListEditRequest, ReorderableListStyle};
+    use crate::edit::Edit;
+    use crate::input::{FrameInput, PointerFrame};
+    use crate::ui::UiHost;
+
+    /// 元 index 列 `0..n` から anchor → target reorder 適用後の Vec<usize>。
+    /// `apply_reorder<usize>` の単純 wrapper、test 側で期待値計算に使う。
+    fn order_after(n: usize, anchor: usize, target: usize) -> Vec<usize> {
+        let cur: Vec<usize> = (0..n).collect();
+        crate::widgets::arrangement::apply_reorder(&cur, anchor, target)
+    }
+
+    #[test]
+    fn reorderable_list_calls_row_for_each_visible_item() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let style = ReorderableListStyle::default();
+        let items: Vec<u32> = (0..5).collect();
+        let calls = Cell::new(0u32);
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.reorderable_list(
+                "rl",
+                Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 },
+                &items,
+                None,
+                &style,
+                |_| Edit::mutate(|()| {}),
+                |_ui, _item, _i, _row_rect, _sel, _drag| {
+                    calls.set(calls.get() + 1);
+                },
+            );
+        });
+
+        assert_eq!(calls.get(), 5, "全 5 row 呼ばれる (画面に収まる)");
+    }
+
+    #[test]
+    fn reorderable_list_skips_offscreen_rows() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let style = ReorderableListStyle::default();
+        let items: Vec<u32> = (0..1000).collect();
+        let calls = Cell::new(0u32);
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.reorderable_list(
+                "rl",
+                Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 },
+                &items,
+                None,
+                &style,
+                |_| Edit::mutate(|()| {}),
+                |_ui, _item, _i, _row_rect, _sel, _drag| {
+                    calls.set(calls.get() + 1);
+                },
+            );
+        });
+
+        assert!(calls.get() < 20, "1000 row のうち画面外は skip ({})", calls.get());
+        assert!(calls.get() > 0);
+    }
+
+    #[test]
+    fn short_release_triggers_clicked_not_reorder() {
+        // press → release 同フレーム (dy = 0) → click 扱い、Reorder Edit は発行されない
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let style = ReorderableListStyle::default();
+        let items: Vec<u32> = (0..5).collect();
+
+        let edit_log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let edit_log_for_clo = edit_log.clone();
+        let make_edit = move |_req: ReorderableListEditRequest| -> Edit<()> {
+            let log = edit_log_for_clo.clone();
+            Edit::mutate(move |()| {
+                log.lock().unwrap().push("reorder");
+            })
+        };
+
+        // row index 1 で press + release
+        let click = PointerFrame {
+            pos: Some((100.0, 40.0)),
+            primary_just_pressed: true,
+            primary_just_released: true,
+            ..PointerFrame::default()
+        };
+
+        let resp_clicked = Cell::new(None::<usize>);
+        let resp_drag = Cell::new(None::<usize>);
+
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput { pointer: click, ..Default::default() },
+            |(), ui| {
+                let r = ui.reorderable_list(
+                    "rl",
+                    Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 },
+                    &items,
+                    None,
+                    &style,
+                    make_edit.clone(),
+                    |_, _, _, _, _, _| {},
+                );
+                resp_clicked.set(r.clicked);
+                resp_drag.set(r.dragging);
+            },
+        );
+
+        assert_eq!(resp_clicked.get(), Some(1), "短 release は clicked に格下げ");
+        assert!(edit_log.lock().unwrap().is_empty(), "Reorder Edit は発行されない");
+    }
+
+    #[test]
+    fn long_drag_release_emits_reorder_edit() {
+        // press row 0 → drag down 100px → release で Reorder 発行
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let style = ReorderableListStyle::default();
+        let items: Vec<u32> = (0..5).collect();
+
+        let captured: Arc<Mutex<Option<Vec<usize>>>> = Arc::new(Mutex::new(None));
+        let captured_clo = captured.clone();
+        let make_edit = move |req: ReorderableListEditRequest| -> Edit<()> {
+            let cap = captured_clo.clone();
+            match req {
+                ReorderableListEditRequest::Reorder(order) => {
+                    *cap.lock().unwrap() = Some(order);
+                    Edit::mutate(|()| {})
+                }
+            }
+        };
+
+        // frame 1: press row 0 (y = 12 → row index 0)
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((100.0, 12.0)),
+                    primary_just_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| {
+                ui.reorderable_list(
+                    "rl",
+                    Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 },
+                    &items,
+                    None,
+                    &style,
+                    make_edit.clone(),
+                    |_, _, _, _, _, _| {},
+                );
+            },
+        );
+        scene.clear();
+
+        // frame 2: drag down to y=130 + release (dy = 118px > 16、row_total_h=28、
+        // local = 130 / 28 = 4.64 → idx 4 frac > 0.5 → target_unbounded = 5、anchor=0 で
+        // target_u(5) > anchor+1(1) → target = 5-1 = 4 → apply_reorder = [1,2,3,4,0])
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((100.0, 130.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| {
+                ui.reorderable_list(
+                    "rl",
+                    Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 },
+                    &items,
+                    None,
+                    &style,
+                    make_edit.clone(),
+                    |_, _, _, _, _, _| {},
+                );
+            },
+        );
+
+        let order = captured.lock().unwrap().clone();
+        assert!(order.is_some(), "Reorder Edit が発行された");
+        let order = order.unwrap();
+        // row_total_h = 28、y=120 → local = 120 / 28 = 4.28 → idx 4 frac > 0.5 → target_unbounded = 5 → clamp 5
+        // anchor 0、target_unbounded 5、target 5 - 1 = 4 (anchor より後挿入は -1 詰め)
+        // → apply_reorder(0..5, 0, 4) = [1, 2, 3, 4, 0]
+        assert_eq!(order, order_after(5, 0, 4), "row 0 を末尾に reorder");
+    }
+
+    #[test]
+    fn drag_handle_w_restricts_press_zone() {
+        // drag_handle_w = 12.0、press at x=20 (handle 範囲外) → session 開始しない → click 扱い
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let style = ReorderableListStyle { drag_handle_w: 12.0, ..Default::default() };
+        let items: Vec<u32> = (0..5).collect();
+
+        let resp_drag = Cell::new(None::<usize>);
+
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((20.0, 12.0)),
+                    primary_just_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| {
+                let r = ui.reorderable_list(
+                    "rl",
+                    Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 },
+                    &items,
+                    None,
+                    &style,
+                    |_| Edit::mutate(|()| {}),
+                    |_, _, _, _, _, _| {},
+                );
+                resp_drag.set(r.dragging);
+            },
+        );
+
+        assert_eq!(resp_drag.get(), None, "handle 外 press は session 開始しない");
+    }
+
+    #[test]
+    fn drag_handle_w_inside_starts_session() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let style = ReorderableListStyle { drag_handle_w: 12.0, ..Default::default() };
+        let items: Vec<u32> = (0..5).collect();
+
+        let resp_drag = Cell::new(None::<usize>);
+
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((6.0, 12.0)),
+                    primary_just_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| {
+                let r = ui.reorderable_list(
+                    "rl",
+                    Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 },
+                    &items,
+                    None,
+                    &style,
+                    |_| Edit::mutate(|()| {}),
+                    |_, _, _, _, _, _| {},
+                );
+                resp_drag.set(r.dragging);
+            },
+        );
+
+        assert_eq!(resp_drag.get(), Some(0), "handle 内 press で session 開始");
+    }
+
+    #[test]
+    fn empty_items_renders_nothing() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let style = ReorderableListStyle::default();
+        let items: Vec<u32> = vec![];
+        let calls = Cell::new(0u32);
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.reorderable_list(
+                "rl",
+                Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 },
+                &items,
+                None,
+                &style,
+                |_| Edit::mutate(|()| {}),
+                |_, _, _, _, _, _| {
+                    calls.set(calls.get() + 1);
+                },
+            );
+        });
+
+        assert_eq!(calls.get(), 0, "空 list で row callback は 0 回");
+    }
+}

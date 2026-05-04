@@ -7,7 +7,7 @@
 use daw_ui_core::{
     ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView,
     ClipKey, Edit, Note, NoteId, NotesEditRequest, PianoRollStyle, PianoRollView, PointerFrame,
-    UiHost,
+    ReorderableListEditRequest, ReorderableListStyle, UiHost,
 };
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{Rect, Scene};
@@ -29,6 +29,8 @@ struct Model {
     arr_tracks: Vec<ArrangementTrack>,
     arr_selected_clips: Vec<ClipKey>,
     arr_selected_track: Option<u32>,
+    // M11 Phase 51: reorderable_list widget 用 (non-Clone Model でも呼べることを担保)
+    chain: Vec<String>,
 }
 
 fn main() {
@@ -46,6 +48,7 @@ fn main() {
         arr_tracks: Vec::new(),
         arr_selected_clips: Vec::new(),
         arr_selected_track: None,
+        chain: Vec::new(),
     };
 
     let edits = host.frame_to_edits(
@@ -221,6 +224,19 @@ fn main() {
                         Edit::mutate(|_m: &mut Model| {})
                     }
                 },
+            );
+            // M11 Phase 51: reorderable_list widget が non-Clone Model でコンパイルする。
+            let rl_style = ReorderableListStyle::default();
+            let _ = ui.reorderable_list(
+                "rl",
+                Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 },
+                &m.chain,
+                None,
+                &rl_style,
+                |req| match req {
+                    ReorderableListEditRequest::Reorder(_) => Edit::mutate(|_m: &mut Model| {}),
+                },
+                |_ui, _name: &String, _i, _row, _sel, _drag| {},
             );
         },
     );

@@ -20,6 +20,7 @@ pub mod modal;
 pub mod panel;
 pub mod piano_roll;
 pub mod playhead;
+pub mod reorderable_list;
 pub mod scroll_area;
 pub mod split_view;
 pub mod tab_view;

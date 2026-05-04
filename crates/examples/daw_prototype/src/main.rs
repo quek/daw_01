@@ -20,7 +20,8 @@ use daw_ui_core::{
     ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView,
     BarBeatGridStyle, ClipKey, DialogResult, Edit, FaderResponse, FileDialogFilter,
     InputAccumulator, LevelMeterStyle, ListViewStyle, MenuItemSpec, MeterBallistic, ModalStyle,
-    Orientation, TimeMapping, TimeRulerStyle, UiHost, ViewportState1D, WidgetId,
+    Orientation, ReorderableListEditRequest, ReorderableListStyle, TimeMapping, TimeRulerStyle,
+    UiHost, ViewportState1D, WidgetId,
 };
 use daw_ui_platform::{AppEvent, AppHost, WindowBackend, winit_backend};
 use daw_ui_renderer::{Color, Rect, RectCommand, Renderer, Scene};
@@ -78,6 +79,9 @@ struct DawModel {
     /// rename 開始した最初のフレームを示すフラグ。`true` のフレームで `ui.set_focus()` を呼んで
     /// text_input にプログラム的にフォーカスを与え、その後 `false` にリセットする。
     arr_rename_just_started: bool,
+    /// (M11 Phase 51) `Ui::reorderable_list` demo 用。Demo Dialog の plugin chain。
+    /// drag&drop で並び替え、`ReorderableListEditRequest::Reorder(order)` で新順 index 列を受信。
+    demo_chain: Vec<String>,
 }
 
 impl DawModel {
@@ -133,6 +137,13 @@ impl DawModel {
             arr_selected_track: None,
             arr_rename_target: None,
             arr_rename_just_started: false,
+            demo_chain: vec![
+                "MIDI Quantize".to_string(),
+                "Synth".to_string(),
+                "Reverb".to_string(),
+                "EQ".to_string(),
+                "Limiter".to_string(),
+            ],
         }
     }
 
@@ -484,13 +495,15 @@ impl App {
                 }
                 let modal_style = ModalStyle::default();
                 let list_style = ListViewStyle::default();
+                let reorder_style = ReorderableListStyle::default();
                 let demo_items: [&str; 8] = [
                     "Reverb", "Delay", "Compressor", "EQ",
                     "Limiter", "Chorus", "Distortion", "Gate",
                 ];
+                let chain_ref: &[String] = &m.demo_chain;
                 ui.modal(
                     "demo",
-                    (380.0, 360.0),
+                    (420.0, 540.0),
                     &modal_style,
                     Some(Box::new(|| {
                         Edit::mutate(|m: &mut DawModel| {
@@ -501,18 +514,27 @@ impl App {
                         // タイトル
                         ui.label_at(
                             "demo_title",
-                            "Demo Dialog (Phase 45d) — クリックで close",
+                            "Demo Dialog — list_view + reorderable_list",
                             panel.x + 16.0,
                             panel.y + 16.0,
                             14.0,
                             Color::rgb(0.95, 0.95, 0.97),
                         );
-                        // list_view
+
+                        // ---- 上半分: list_view (effects 一覧、行 click で close) ----
+                        ui.label_at(
+                            "demo_lv_label",
+                            "Effects (list_view、行クリックで close)",
+                            panel.x + 16.0,
+                            panel.y + 44.0,
+                            12.0,
+                            Color::rgb(0.78, 0.80, 0.85),
+                        );
                         let list_rect = Rect {
                             x: panel.x + 16.0,
-                            y: panel.y + 48.0,
+                            y: panel.y + 64.0,
                             w: panel.w - 32.0,
-                            h: panel.h - 64.0,
+                            h: 200.0,
                         };
                         let resp = ui.list_view(
                             "demo_list",
@@ -531,10 +553,54 @@ impl App {
                                 );
                             },
                         );
-                        // 行 click で close (= ESC / outside click と同じ閉じ方)
                         if resp.clicked.is_some() {
                             ui.close_modal("demo");
                         }
+
+                        // ---- 下半分: reorderable_list (Plugin Chain、drag で並び替え) ----
+                        ui.label_at(
+                            "demo_rl_label",
+                            "Plugin Chain (reorderable_list、drag で並び替え)",
+                            panel.x + 16.0,
+                            panel.y + 280.0,
+                            12.0,
+                            Color::rgb(0.78, 0.80, 0.85),
+                        );
+                        let reorder_rect = Rect {
+                            x: panel.x + 16.0,
+                            y: panel.y + 300.0,
+                            w: panel.w - 32.0,
+                            h: 220.0,
+                        };
+                        ui.reorderable_list(
+                            "demo_chain",
+                            reorder_rect,
+                            chain_ref,
+                            None,
+                            &reorder_style,
+                            |req: ReorderableListEditRequest| match req {
+                                ReorderableListEditRequest::Reorder(order) => {
+                                    Edit::mutate(move |m: &mut DawModel| {
+                                        let new_chain: Vec<String> = order
+                                            .iter()
+                                            .filter_map(|&i| m.demo_chain.get(i).cloned())
+                                            .collect();
+                                        m.demo_chain = new_chain;
+                                        m.last_action = "Plugin Chain reordered".to_string();
+                                    })
+                                }
+                            },
+                            |ui, name, i, row, _sel, _drag| {
+                                ui.label_at(
+                                    ("demo_chain_label", i),
+                                    name,
+                                    row.x + 12.0,
+                                    row.y + 6.0,
+                                    13.0,
+                                    Color::rgb(0.92, 0.92, 0.94),
+                                );
+                            },
+                        );
                     },
                 );
             },

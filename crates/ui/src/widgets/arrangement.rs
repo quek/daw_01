@@ -493,17 +493,20 @@ pub fn volume_from_mouse_x(mouse_x: f32, band_x: f32, band_w: f32) -> f32 {
     ((mouse_x - band_x) / band_w).clamp(0.0, 1.0)
 }
 
-/// M10 Phase 46: anchor を抜き取って target に挿入した新順 `Vec<u32>` を返す。
-/// `anchor_index >= ids.len()` または `target_index > ids.len()-1` (after remove) でも安全に clamp。
+/// M10 Phase 46 / M11 Phase 51: anchor を抜き取って target に挿入した新順 `Vec<T>` を返す。
+/// `anchor_index >= items.len()` または `target_index > items.len()-1` (after remove) でも安全に clamp。
+///
+/// M11 Phase 51 で `<T: Clone>` に generic 化。`u32` 用途 (track_id 列) でも `usize` 用途
+/// (`reorderable_list` の元 index 列) でも単相化で動く。
 #[must_use]
-pub fn apply_reorder(ids: &[u32], anchor_index: usize, target_index: usize) -> Vec<u32> {
-    if ids.is_empty() || anchor_index >= ids.len() {
-        return ids.to_vec();
+pub fn apply_reorder<T: Clone>(items: &[T], anchor_index: usize, target_index: usize) -> Vec<T> {
+    if items.is_empty() || anchor_index >= items.len() {
+        return items.to_vec();
     }
-    let mut v: Vec<u32> = ids.to_vec();
-    let id = v.remove(anchor_index);
+    let mut v: Vec<T> = items.to_vec();
+    let it = v.remove(anchor_index);
     let insert_at = target_index.min(v.len());
-    v.insert(insert_at, id);
+    v.insert(insert_at, it);
     v
 }
 
@@ -2147,7 +2150,7 @@ mod tests {
     #[test]
     fn apply_reorder_safe_on_oob() {
         assert_eq!(apply_reorder(&[1, 2, 3], 5, 0), vec![1, 2, 3]); // anchor OOB
-        assert_eq!(apply_reorder(&[], 0, 0), Vec::<u32>::new()); // empty
+        assert_eq!(apply_reorder::<u32>(&[], 0, 0), Vec::<u32>::new()); // empty
     }
 
     // M10 Phase 47b: track header volume

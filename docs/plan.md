@@ -206,9 +206,36 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 - ✅ `cargo build --workspace` / `cargo test --workspace` (216 unit test) / `cargo clippy --workspace --tests -- -D warnings` / `cargo test -p daw-ui-core --test no_clone_required` 全 ✅
 - 🔲 `cargo run --bin daw_prototype` で track drag&drop / **track header volume slider** / **Alt+wheel** 縦ズーム を実機確認 (user 側で実施)
 
+### M11 (Library widget 拡充: drag-reorder list) — 進行中
+
+**目的**: daw_01 conversation `#012 [Replied]` (2026-05-04) で要望された `Ui::reorderable_list` widget を新設し、汎用 drag&drop reorder を library API として提供する。daw_01 track_inspector の Chain section (MIDI FX / FX 内 plugin 順序入替) の `push_rect` 直呼びを置換可能にし、Phase 5 仕上げで残った「view layer の `push_rect` 直呼び 0 件」DoD を達成可能にする。
+
+**動機**: M10 完了時点で gui_01 の list 系 widget は 2 種:
+- `Ui::list_view` (M9 Phase 45d): 単純 scroll list (drag-reorder 内蔵せず、#007 で別 widget 路線確定済)
+- `Ui::arrangement` 内蔵 track reorder (M10 Phase 46/50): timeline 専用、外に出ていない
+
+両者の中間 = 「汎用 drag-reorder list」が欠落していたが、`#012` の要望と M10 で外出し済の pure helper (`compute_reorder_target_index` / `apply_reorder`) を組み合わせれば短工数で実装可能。
+
+| Phase | テーマ | 主な成果物 | 状態 |
+|---|---|---|---|
+| 51 | `Ui::reorderable_list` 新設 | **公開型** (`ReorderableListStyle` / `ReorderableListResponse` / `ReorderableListEditRequest::Reorder(Vec<usize>)`)、`Ui::reorderable_list<T, F, R>` method (scroll_area wrapper + drag session state + commit-by-release で Reorder 1 度発行)。**`drag_handle_w`** parameter 対応 (`0.0` で row 全体 drag = Bitwig 風、`> 0.0` で row 左端 N px だけ drag 起点 = Logic / Cubase 風グリップ、残り領域は row callback の button_at 等が消費可)。**drop indicator** 横 line (target 位置に row 全幅、viewport clamp 付き)。**dragging row 半透明背景** (`row_bg_dragging`)。**release frame optimistic preview** (`pending_order` を 1 frame 保持して新順序で描画、Edit 適用 1 frame 遅延の visual 揺れを抑える、arrangement Phase 50 と同パターン)。`apply_reorder` を **`<T: Clone>`** に generic 化 (既存 `&[u32]` caller は単相化で無修正、`reorderable_list` は `&[usize]` で利用)。pure helper `compute_reorder_target_index` (anchor + target index 計算、id 概念無し) はそのまま流用。`make_edit: Fn(...) -> Edit<M> + Clone + Send + Sync + 'static` (M10 Phase 49 の `Ui::arrangement` と同 trait bound、Undoable Edit の forward/inverse 2 closure に分配するため `Clone` 必要)。**unit test 7 件** (visible row 数 / virtualization / 短 release で click 格下げ / drag release で Reorder 発行 / drag_handle_w 範囲外 press 無視 / drag_handle_w 範囲内 press / 空 list)。**trybuild basic.rs に reorderable_list 呼び出し追加** (no-Clone Model 制約 CI 固定)。**daw_prototype Demo Dialog に Plugin Chain demo** 1 セクション追加 (list_view デモの下、5 plugin chain を drag で並び替え) — memory `feedback_use_new_abstractions.md` 「新抽象は次の機会に使う」原則。`crates/ui/src/widgets/reorderable_list.rs` 669 LOC (test 含む) | ✅ 完了 |
+
+**設計判断**:
+
+- **`Reorder(Vec<usize>)` 元 index ベース**: chain plugin は識別子を持たない (`Vec<PluginInstance>` で index ベース管理) ので index が自然。`new_items[i] = items[order[i]]` semantics で commit-by-release で 1 度発行。stable id を持つデータ向けには将来 `key_of: Fn(&T) -> K` overload を追加する余地を残す (本 phase ではスコープ外)。
+- **release frame `pending_order` を 1 frame 保持**: arrangement Phase 50 (track reorder) と同パターンで、release Edit が deferred apply されることによる「release 直後 frame で旧順序が描かれる」visual 揺れを抑える。次フレームで `take()` して消費する単純実装。
+- **`drag_handle_w` を style に持たせる**: `0.0` (= row 全体 drag) を default にしつつ、`> 0.0` で row 左端だけを drag 起点にできる設計値。残り領域は row callback の button_at 等が click を消費する想定 (chain row の "GUI / ×" ボタン等)。
+- **drop indicator は scroll_area 内で push_rect 直呼び**: drag float row (popup_layer 経由) は採用せず、scroll_area の closure 内で row 群と同じ z-order に描画する単純実装 (modal や popup の上に出ない、リスト内に閉じる方が DAW UX に整合)。
+
+**完了条件 (DoD)**:
+
+- ✅ Phase 51 完了
+- ✅ `cargo build --workspace` / `cargo test --workspace` (223 unit test、+7 件) / `cargo clippy --workspace --tests -- -D warnings` / `cargo test -p daw-ui-core --test no_clone_required` 全 ✅
+- 🔲 `cargo run --bin daw_prototype` で Demo Dialog → Plugin Chain reorder 動作確認 (user 側で実施)
+
 ---
 
-## 凍結 (M9+M10 完了後の再評価対象)
+## 凍結 (M9+M10+M11 完了後の再評価対象)
 
 下記 milestone は **凍結**。M9 (Real DAW Validation) + M10 (Arrangement 機能拡張) 完了の状態で、改めて優先順位を見直す。canonical な phase 番号は M9-M10 のみ。
 

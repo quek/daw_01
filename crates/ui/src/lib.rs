@@ -62,6 +62,9 @@ pub use widgets::piano_roll::{
     PianoRollStyle, PianoRollView, ResizeDelta, default_velocity_color, is_black_key, note_hit,
     note_hover_cursor, note_to_rect, rects_intersect,
 };
+pub use widgets::reorderable_list::{
+    ReorderableListEditRequest, ReorderableListResponse, ReorderableListStyle,
+};
 pub use widgets::text_input::TextInputResponse;
 pub use widgets::toggle_button::{ToggleButtonResponse, ToggleButtonStyle};
 pub use widgets::waveform::{
