@@ -1377,7 +1377,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // M10 Phase 50: pending_reorder_order があれば新順序で `tracks_for_draw` を組み立て、
         // cached layer + per-track header loop の両方で使う (1 frame の visual 遅延を解消)。
         // 防御: order に含まれなかった track は元順序のまま末尾に keep。
-        let tracks_for_draw: Vec<ArrangementTrack> =
+        //
+        // M12 Phase 54 (perf_review_2026-05-04 P0-2): `Arc<[ArrangementTrack]>` で持つ。
+        // heavy() closure (line 1420) は `'static` 要求のため owned コピーが必要だが、
+        // per-track header loop (line 1777) でも同じデータを使うため、closure 用に
+        // 別の owned コピーを用意するしかない。Arc にすれば 2 度目以降は refcount のみで
+        // 済むので「通常 frame で発火する 2 度目の deep clone」(N tracks × M clips の
+        // 比例 alloc) を撲滅できる。1 度目 (`Arc::from(tracks)` または reorder build)
+        // は heavy() の `'static` 要件で不可避 (ArrangementTrack 内部 Vec<ArrangementClip>
+        // の owned コピー必要、Cow は `'static` ライフタイムで成立しない)。
+        let tracks_for_draw: Arc<[ArrangementTrack]> =
             if let Some(order) = &pending_reorder_order {
                 let mut reordered: Vec<ArrangementTrack> = Vec::with_capacity(tracks.len());
                 for id in order {
@@ -1390,11 +1399,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         reordered.push(t.clone());
                     }
                 }
-                reordered
+                reordered.into()
             } else {
-                tracks.to_vec()
+                Arc::from(tracks)
             };
-        let tracks_owned: Vec<ArrangementTrack> = tracks_for_draw.clone();
+        let tracks_owned: Arc<[ArrangementTrack]> = Arc::clone(&tracks_for_draw);
         let style_copy = *style;
         let view_copy = view;
         let selected_set: HashSet<ClipKey> = selected_clips.iter().copied().collect();
