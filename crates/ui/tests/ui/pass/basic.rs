@@ -218,6 +218,9 @@ fn main() {
                     ArrangementEditRequest::SetZoomX(_) => Edit::mutate(|_m: &mut Model| {}),
                     ArrangementEditRequest::SetScrollX(_) => Edit::mutate(|_m: &mut Model| {}),
                     ArrangementEditRequest::SetTrackTop(_) => Edit::mutate(|_m: &mut Model| {}),
+                    ArrangementEditRequest::SetTrackRowH(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
                 },
             );
         },

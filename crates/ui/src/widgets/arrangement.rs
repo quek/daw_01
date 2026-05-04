@@ -165,6 +165,9 @@ pub enum ArrangementEditRequest {
     SetZoomX(f32),
     SetScrollX(f64),
     SetTrackTop(f32),
+    /// M10 Phase 48: 縦ズーム (`track_row_h` を絶対値で更新、`Alt+wheel` で発火)。
+    /// min/max の clamp は app 側で実施 (目安 16..96 px)。
+    SetTrackRowH(f32),
 }
 
 /// `Ui::arrangement` の戻り値。
@@ -1658,13 +1661,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
-        // ---- wheel: Ctrl=zoom_x / Shift=scroll_x / plain=track_top ----
+        // ---- wheel: Ctrl=zoom_x / Alt=zoom_y (row_h) / Shift=scroll_x / plain=track_top ----
         let scroll = self.take_scroll_in_rect(lanes);
         if scroll.1.abs() > 0.0 || scroll.0.abs() > 0.0 {
             let dy = scroll.1;
             if pointer.modifiers.ctrl {
                 let factor = (-dy * 0.005).exp();
                 self.push_edit(make_edit(ArrangementEditRequest::SetZoomX(factor)));
+            } else if pointer.modifiers.alt {
+                // M10 Phase 48: Alt+wheel で row_h 縦ズーム (zoom_x と同じ exp curve)。
+                // app 側で 16..96 px 等の clamp を実施。
+                let factor = (-dy * 0.005).exp();
+                let new_h = view.track_row_h * factor;
+                self.push_edit(make_edit(ArrangementEditRequest::SetTrackRowH(new_h)));
             } else if pointer.modifiers.shift {
                 let delta = -f64::from(dy) * beat_per_px * 4.0;
                 self.push_edit(make_edit(ArrangementEditRequest::SetScrollX(
@@ -2072,6 +2081,97 @@ mod tests {
     fn apply_reorder_safe_on_oob() {
         assert_eq!(apply_reorder(&[1, 2, 3], 5, 0), vec![1, 2, 3]); // anchor OOB
         assert_eq!(apply_reorder(&[], 0, 0), Vec::<u32>::new()); // empty
+    }
+
+    // M10 Phase 48: vertical zoom (Alt+wheel)
+    #[test]
+    fn alt_wheel_emits_set_track_row_h() {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::{Modifiers, PhysicalSize};
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        // arrangement widget の Edit を観測するため、Model に最終 row_h と最終 track_top を持つ。
+        struct Model {
+            row_h: f32,
+            track_top: f32,
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        let tracks = vec![track(0, "t", vec![]), track(1, "u", vec![])];
+        let view = ArrangementView::default();
+        let mut model = Model {
+            row_h: view.track_row_h,
+            track_top: 0.0,
+            tracks,
+            view,
+        };
+
+        let observed: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let observed_cb = Arc::clone(&observed);
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((400.0, 200.0)),
+                scroll_delta: (0.0, -100.0),
+                modifiers: Modifiers { alt: true, ..Modifiers::default() },
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        };
+        let edits = host.frame_to_edits(&model, &mut scene, screen, input, |m, ui| {
+            let style = ArrangementStyle::default();
+            let observed_cb = Arc::clone(&observed_cb);
+            let _ = ui.arrangement(
+                "arr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &m.tracks,
+                m.view,
+                &[],
+                None,
+                &style,
+                move |req| match req {
+                    ArrangementEditRequest::SetTrackRowH(h) => {
+                        observed_cb.lock().unwrap().push("SetTrackRowH");
+                        Edit::mutate(move |mm: &mut Model| mm.row_h = h)
+                    }
+                    ArrangementEditRequest::SetTrackTop(t) => {
+                        observed_cb.lock().unwrap().push("SetTrackTop");
+                        Edit::mutate(move |mm: &mut Model| mm.track_top = t)
+                    }
+                    _ => {
+                        observed_cb.lock().unwrap().push("other");
+                        Edit::mutate(|_| {})
+                    }
+                },
+            );
+        });
+        for e in edits {
+            e.apply(&mut model);
+        }
+        let log = observed.lock().unwrap();
+        assert!(
+            log.contains(&"SetTrackRowH"),
+            "Alt+wheel で SetTrackRowH が発火する: log={:?}",
+            *log
+        );
+        assert!(
+            !log.contains(&"SetTrackTop"),
+            "Alt+wheel では SetTrackTop は発火しない: log={:?}",
+            *log
+        );
+        // exp(-(-100) * 0.005) = exp(0.5) ≈ 1.6487 → row_h = 32 * 1.6487 ≈ 52.76
+        assert!(
+            (model.row_h - 32.0 * 0.5_f32.exp()).abs() < 1e-3,
+            "row_h は exp curve で更新される: actual={}",
+            model.row_h
+        );
     }
 
     // M10 Phase 47: clip volume

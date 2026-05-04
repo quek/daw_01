@@ -173,7 +173,7 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 - ✅ 全 example で Ctrl+F1 → debug overlay toggle 動作
 - ✅ `cargo run --bin daw_prototype` で arrangement / piano_roll / mixer / sample タブ + modal demo / clip drag / Rename overlay / scrollbar drag (Phase 45g) 動作
 
-### M10 (Arrangement 機能拡張) — 🟡 計画
+### M10 (Arrangement 機能拡張) — ✅ 完了 (2026-05-04)
 
 **目的**: M9 Phase 45e で実装した `Ui::arrangement` widget の **欠けている daw 機能** を追加する。Phase 45e 動作確認で user 要望が出た 3 機能 (drag&drop track 並び替え / clip volume / 縦ズーム) を library API として shipping 確定する。
 
@@ -188,7 +188,7 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 |-------|----------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------|
 | 46    | drag&drop で track 並び替え                   | `ArrangementEditRequest::ReorderTracks(Vec<u32>)` 新 variant (新順での `track.id` 列)。`ArrangementResponse.reordering: Option<u32>` (drag 中 track id) 追加。`ArrangementStyle` に `reorder_drop_indicator` / `reorder_drop_indicator_h` / `reorder_drag_alpha` 追加 (Default 経由非 breaking)。`ArrangementState.track_reorder: Option<TrackReorderSession>` 追加 (anchor_track_id / anchor_index / anchor_mouse_y / last_mouse_y、release frame の pos 不安定対策で last_mouse_y を毎 frame update、既存 ClipDragSession と同パターン)。track header rect 上で M/S/Up/Dn/Del button rect 非 hit + primary press → reorder セッション開始、Name button area は include (drag start zone)。release で `dy >= 16px` なら `apply_reorder(cur_ids, anchor_index, target)` で新順発行、`< 16px` は click 格下げ (button_at の SelectTrack / Rename trigger に任せる)。drag 中は cached 外で **半透明 dragging row 複製** (`reorder_drag_alpha=0.6`、track_selected_bg を base color) と **横 line drop indicator** (header_pane + lanes 全幅、target row top に `reorder_drop_indicator_h=2px`) を float 描画。pure helper `compute_reorder_target_index(anchor_idx, mouse_y, header_top, track_top, row_h, n_tracks)` + `apply_reorder(ids, anchor_idx, target)` を切り出して 9 unit test (上端外 / 下端 clamp / self+next no-op / above keeps / below offsets / scroll / row_h=0 / apply 基本 / OOB safe)。`header_row_layout(row) -> HeaderRowLayout` 共通 helper を抽出 (per-track loop + reorder press detection で DRY)。daw_prototype に `ReorderTracks(order)` ハンドラ (id lookup + Vec rebuild、N_TRACKS=12 で O(n^2) 受容) と trybuild basic.rs に variant 追加 (1 commit で全 caller 追従) | ✅ 完了 |
 | 47    | clip volume 編集                              | `ArrangementClip` に `volume: f32` 追加 (**breaking**、daw_prototype + trybuild basic.rs 1 commit 追従、`0.0..=1.0` で `1.0` が unity)。`ArrangementEditRequest::SetClipVolume { key, prev, next }` 新 variant (prev/next で Undoable 化容易)。`ClipDragKind::Volume` を追加して clip rect 底辺 `clip_volume_band_h=4px` で volume slider band を hit-test (priority: 左右端 resize > 底辺 volume > body move)。Volume drag は **常に単一 clip** (multi-select 連動しない)、`ArrangementResponse.dragging_clip_volume: Option<ClipKey>` で app に通知。`ClipDragAnchor` に `anchor_volume` / `anchor_clip_rect: Rect` を追加、release で `volume_from_mouse_x(mouse_x, clip_x, clip_w)` で 0..1 マップ + `SetClipVolume` 発行。drag 中は cached 外で `draw_volume_drag_preview` が anchor 時 clip rect 全幅に新 volume band を float 描画 (cached の旧 band を上書き、リアルタイム feedback)。clip 描画も volume を alpha に反映 (`clip_min_alpha=0.4 + (1-0.4)*v` で low volume → 半透明 視覚 cue)。`ArrangementStyle` に `clip_volume_band_h` / `clip_volume_band_track` / `clip_volume_band_fill` / `clip_min_alpha` 追加 (Default 経由非 breaking)。pure helper `volume_from_mouse_x` を 3 unit test (basic / clamp 範囲外 / zero width safe) + `clip_hit` Volume zone 検出 3 test (bottom band / resize 優先 / band_h=0 disable) + `drag_preview_geometry` Volume no-op 1 test。daw_prototype: `DawClip.volume: f32` 追加 + `SetClipVolume` ハンドラ (`c.volume = next.clamp(0.0, 1.0)` + data_generation bump) | ✅ 完了 |
-| 48    | 縦ズーム (`track_row_h` 動的変更)             | `ArrangementEditRequest::SetTrackRowH(f32)` 新 variant。**`Alt+wheel`** で track_row_h を `f` で乗算して発行 (min/max は daw_prototype 側で clamp、目安 16..96 px)。既存の `Ctrl+wheel = SetZoomX` / `Shift+wheel = SetScrollX` / `plain wheel = SetTrackTop` と独立 modifier (`Alt` は gui_01 内未使用)。Ableton / Reaper 標準と整合、1 modifier で ergonomic。macOS の `Option+scroll = system 横スクロール` 衝突は将来 macOS 対応時に winit event 受信側で対処 | 🟡 計画 |
+| 48    | 縦ズーム (`track_row_h` 動的変更)             | `ArrangementEditRequest::SetTrackRowH(f32)` 新 variant。**`Alt+wheel`** で track_row_h を `factor = (-dy * 0.005).exp()` で乗算して発行 (zoom_x と同じ exp curve)。既存の `Ctrl+wheel = SetZoomX` / `Shift+wheel = SetScrollX` / `plain wheel = SetTrackTop` と独立 modifier。daw_prototype: `SetTrackRowH(h)` ハンドラで `h.clamp(16.0, 96.0)` + `track_top` 上限再計算 + `data_generation` bump。integration test (UiHost::frame_to_edits + Alt 修飾 + scroll_delta) で SetTrackRowH 発火 + SetTrackTop 不発火 + exp curve で row_h 更新を確認。macOS の `Option+scroll = system 横スクロール` 衝突は将来 macOS 対応時に winit event 受信側で対処 | ✅ 完了 |
 
 **設計判断**:
 
@@ -196,11 +196,11 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 - **clip volume の slider 位置**: 「clip 内 bottom band」 vs 「clip 上に重ねる外部 widget」の 2 案。前者を採用 (clip と一体感、外部 widget だと clip 数 = widget 数で重い)
 - **縦ズームの modifier**: **`Alt+wheel`** を採用 (Ableton / Reaper 標準と整合、1 modifier で ergonomic、gui_01 内 Alt 未使用)。`Ctrl+Shift+wheel` (Bitwig 派生) は 2 modifier で却下
 
-**完了条件 (DoD)**:
+**完了条件 (DoD)** — すべて達成 (2026-05-04):
 
-- Phase 46-48 全完了で daw_01 conversation の関連エントリに [Replied] (もし新規 [Open] が来たら fold)
-- `cargo build --workspace` / `cargo test --workspace` / `cargo clippy --workspace --tests -- -D warnings` / `cargo test -p daw-ui-core --test no_clone_required` 全 ✅
-- `cargo run --bin daw_prototype` で track drag&drop / clip volume slider / Ctrl+Shift+wheel 縦ズーム を実機確認
+- ✅ Phase 46-48 全完了 (新 `daw_01` conversation entry はまだ来ていないため fold 対象なし、来た時に対応)
+- ✅ `cargo build --workspace` / `cargo test --workspace` (217 unit test) / `cargo clippy --workspace --tests -- -D warnings` / `cargo test -p daw-ui-core --test no_clone_required` 全 ✅
+- 🔲 `cargo run --bin daw_prototype` で track drag&drop / clip volume slider / **Alt+wheel** 縦ズーム を実機確認 (user 側で実施)
 
 ---
 

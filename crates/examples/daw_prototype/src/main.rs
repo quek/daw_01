@@ -818,6 +818,17 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                     * mm.arr_view.track_row_h;
                 mm.arr_view.track_top = top.clamp(0.0, max_top);
             }),
+            ArrangementEditRequest::SetTrackRowH(h) => Edit::mutate(move |mm: &mut DawModel| {
+                let new_h = h.clamp(16.0, 96.0);
+                mm.arr_view.track_row_h = new_h;
+                // row_h 変化に伴う track_top の上限再計算 (拡大時に下端が空かないように)。
+                let max_top = (mm.arr_tracks.len() as f32 - mm.arr_view.tracks_visible)
+                    .max(0.0)
+                    * new_h;
+                mm.arr_view.track_top = mm.arr_view.track_top.clamp(0.0, max_top);
+                mm.arr_view.data_generation += 1;
+                mm.last_action = format!("arr: SetTrackRowH → {new_h:.1}");
+            }),
         },
     );
 
