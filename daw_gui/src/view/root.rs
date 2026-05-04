@@ -184,20 +184,20 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>) {
             app.handle_event(AppEvent::Redo)
         }));
     }
-    if ui.take_shortcut("copy") {
-        if let Some((json, count)) = app.copy_selected_notes_as_json() {
-            ui.set_clipboard_text(json);
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.status_message = format!("コピー: {count} ノート");
-            }));
-        }
+    if ui.take_shortcut("copy")
+        && let Some((json, count)) = app.copy_selected_notes_as_json()
+    {
+        ui.set_clipboard_text(json);
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.status_message = format!("コピー: {count} ノート");
+        }));
     }
-    if ui.take_shortcut("paste") {
-        if let Some(text) = ui.take_clipboard_paste() {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.paste_notes_from_json(&text);
-            }));
-        }
+    if ui.take_shortcut("paste")
+        && let Some(text) = ui.take_clipboard_paste()
+    {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.paste_notes_from_json(&text);
+        }));
     }
     if ui.take_shortcut("delete") {
         // ノート選択があればノート削除、無ければ clip 削除。

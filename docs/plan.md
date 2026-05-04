@@ -121,10 +121,8 @@ daw_01 側で別途組むもの:
   - **2026-05-04 時点**: `track_inspector.rs:77` の chain row 背景 1 件のみ残存。
     scroll_area 内で row_y が変動するため heavy+cached が使えず ui.push_rect 直呼び。
     将来 `Ui::reorderable_list` (gui_01) が来れば消える tech debt。
-- `cargo build --workspace` warning は 5 件 (Phase 3 で widget に移譲した model 派生メソッド
-  群: track_count / track_headers / clip_boxes / note_boxes / recent_paths_display と
-  ClipBox / NoteBox / TrackHeader / 一部 AppEvent variant が dead_code)。
-  これらは Phase 3 完了で本当に未使用になったので清掃可能 (別 commit)。
+- `cargo build --workspace` warning **0 件** (Phase 5 で清掃済)。
+- `cargo clippy --workspace -- -D warnings` **クリーン** (Phase 5 で 4 件修正)。
 - `cargo run -p daw_gui` で全画面の操作確認 (transport / arrangement / piano_roll / mixer / inspector / plugin_picker / modal)。
 
 ## 並行で進める無関係タスク (このプランの外)

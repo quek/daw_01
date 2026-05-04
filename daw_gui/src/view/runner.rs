@@ -430,7 +430,7 @@ fn query_cursor_pos_in_window(window: &winit::window::Window) -> Option<Physical
     if unsafe { GetCursorPos(&raw mut pt) }.is_err() {
         return None;
     }
-    if unsafe { ScreenToClient(hwnd, &raw mut pt) }.as_bool() == false {
+    if !unsafe { ScreenToClient(hwnd, &raw mut pt) }.as_bool() {
         return None;
     }
     Some(PhysicalPosition {

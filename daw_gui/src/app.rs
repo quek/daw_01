@@ -96,36 +96,6 @@ pub struct ClipRef {
     pub clip: u32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ClipBox {
-    pub track: u32,
-    pub clip: u32,
-    pub name: String,
-    pub start_beat: f32,
-    pub length_beats: f32,
-    pub selected: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct NoteBox {
-    pub note: u32,
-    pub start_beat: f32,
-    pub duration_beats: f32,
-    pub pitch: u8,
-    pub velocity: u8,
-    pub lyric: String,
-    pub selected: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct TrackHeader {
-    pub index: u32,
-    pub name: String,
-    pub muted: bool,
-    pub solo: bool,
-    pub selected: bool,
-}
-
 pub const ARRANGE_PX_PER_BEAT: f32 = 24.0;
 pub const ARRANGE_TRACK_HEIGHT: f32 = 56.0;
 pub const DEFAULT_NOTE_DURATION: f64 = 0.25;
@@ -210,11 +180,6 @@ pub struct AppData {
     /// 背景スレッド (autosave / playhead poll / MIDI / IPC bridge / VOICEVOX
     /// 合成 / plugin DB rescan) からメインスレッドへ AppEvent を送るためのプロキシ。
     pub event_proxy: EventLoopProxy<AppEvent>,
-
-    /// view-local interaction: ダブルクリック検出用。
-    /// (instant, x, y) — 単発クリック発生時にここに記録、次のクリックが
-    /// 400ms 以内 & ±5px 以内なら double-click 扱い。
-    pub last_click: Option<(std::time::Instant, f32, f32)>,
 }
 
 impl AppData {
@@ -309,7 +274,6 @@ impl AppData {
             step_cursor_beat: 0.0,
             step_size_beats: DEFAULT_NOTE_DURATION,
             event_proxy,
-            last_click: None,
         }
     }
 
@@ -317,89 +281,6 @@ impl AppData {
 
     pub fn bpm(&self) -> f32 {
         self.song.bpm
-    }
-
-    pub fn loop_start_beat(&self) -> f32 {
-        self.song.loop_start_beat as f32
-    }
-
-    pub fn loop_end_beat(&self) -> f32 {
-        self.song.loop_end_beat as f32
-    }
-
-    pub fn track_count(&self) -> u32 {
-        self.song.tracks.len() as u32
-    }
-
-    pub fn track_headers(&self) -> Vec<TrackHeader> {
-        let sel = self.selected_track;
-        self.song
-            .tracks
-            .iter()
-            .enumerate()
-            .map(|(i, t)| TrackHeader {
-                index: i as u32,
-                name: if t.name.is_empty() {
-                    format!("Track {}", i + 1)
-                } else {
-                    t.name.clone()
-                },
-                muted: t.muted,
-                solo: t.solo,
-                selected: i as u32 == sel,
-            })
-            .collect()
-    }
-
-    pub fn clip_boxes(&self) -> Vec<ClipBox> {
-        let selected = &self.selected_clips;
-        self.song
-            .tracks
-            .iter()
-            .enumerate()
-            .flat_map(|(t_idx, t)| {
-                t.clips.iter().enumerate().map(move |(c_idx, c)| {
-                    let r = ClipRef {
-                        track: t_idx as u32,
-                        clip: c_idx as u32,
-                    };
-                    ClipBox {
-                        track: t_idx as u32,
-                        clip: c_idx as u32,
-                        name: c.name.clone(),
-                        start_beat: c.start_beat as f32,
-                        length_beats: c.length_beats as f32,
-                        selected: selected.contains(&r),
-                    }
-                })
-            })
-            .collect()
-    }
-
-    pub fn note_boxes(&self) -> Vec<NoteBox> {
-        let Some(ClipRef { track, clip }) = self.selected_clip else {
-            return Vec::new();
-        };
-        let selected = &self.selected_notes;
-        let Some(t) = self.song.tracks.get(track as usize) else {
-            return Vec::new();
-        };
-        let Some(c) = t.clips.get(clip as usize) else {
-            return Vec::new();
-        };
-        c.notes
-            .iter()
-            .enumerate()
-            .map(|(i, n)| NoteBox {
-                note: i as u32,
-                start_beat: n.start_beat as f32,
-                duration_beats: n.duration_beats as f32,
-                pitch: n.pitch,
-                velocity: n.velocity,
-                lyric: n.lyric.clone().unwrap_or_default(),
-                selected: selected.contains(&(i as u32)),
-            })
-            .collect()
     }
 
     pub fn track_mix(&self) -> Vec<TrackMixEntry> {
@@ -491,14 +372,6 @@ impl AppData {
             });
         }
         chain
-    }
-
-    pub fn recent_paths_display(&self) -> Vec<String> {
-        self.recent_files
-            .paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect()
     }
 
     // -------- Undo/Redo ----------------------------------------------------
@@ -712,6 +585,11 @@ impl AppData {
     }
 }
 
+/// 一部 variant は将来の機能 (rename UI / quantize / autosave / piano-roll
+/// shortcut 等) で使う予定なので、現時点で未参照でも残す。新規 variant 追加時に
+/// 既存の event handler と一貫性を保つため、enum 全体に `#[allow(dead_code)]`
+/// を付ける。
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppEvent {
     // -------- File / playback ---------------------------------------------
@@ -1454,7 +1332,7 @@ impl AppData {
                 new_tracks.push(self.song.tracks.remove(pos));
             }
         }
-        new_tracks.extend(self.song.tracks.drain(..));
+        new_tracks.append(&mut self.song.tracks);
         self.song.tracks = new_tracks;
 
         // selection を id で復元
