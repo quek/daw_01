@@ -793,7 +793,7 @@ impl AppData {
             AppEvent::EndDrag => {
                 self.is_dragging = false;
                 let song = self.song.clone();
-                self.send_plugin(MainToChild::LoadSong(song));
+                self.send_both(MainToChild::LoadSong(song));
             }
             AppEvent::MidiNoteOn { pitch, velocity } => {
                 self.handle_midi_note_on(pitch, velocity);
@@ -993,13 +993,21 @@ impl AppData {
         }
     }
 
+    /// Fan a message out to both children. Used for state messages the
+    /// audio engine and the plugin host both need (LoadSong, mixer
+    /// strip changes, etc.).
+    fn send_both(&self, msg: MainToChild) {
+        self.send_audio(msg.clone());
+        self.send_plugin(msg);
+    }
+
     fn sync_song_to_plugin_host(&mut self) {
         self.is_dirty = true;
         if self.is_dragging {
             return;
         }
         let song = self.song.clone();
-        self.send_plugin(MainToChild::LoadSong(song));
+        self.send_both(MainToChild::LoadSong(song));
     }
 
     // -------- File ----------------------------------------------------------
@@ -1206,7 +1214,7 @@ impl AppData {
 
     fn play(&mut self) {
         let song = self.song.clone();
-        self.send_plugin(MainToChild::LoadSong(song));
+        self.send_both(MainToChild::LoadSong(song));
         self.send_audio(MainToChild::Play);
         self.send_plugin(MainToChild::Play);
         self.is_playing = true;
@@ -1221,7 +1229,7 @@ impl AppData {
 
     fn toggle_loop(&mut self) {
         self.is_looping = !self.is_looping;
-        self.send_plugin(MainToChild::SetLoop(self.is_looping));
+        self.send_both(MainToChild::SetLoop(self.is_looping));
     }
 
     fn set_loop_range(&mut self, start: f64, end: f64) {
@@ -2306,7 +2314,12 @@ impl AppData {
         if let Some(t) = self.song.tracks.get_mut(track as usize) {
             t.volume = v;
         }
-        self.send_plugin(MainToChild::SetTrackVolume { track, volume: v });
+        // A2: daw_audio is the mixer now, so send to both children.
+        // plugin_host still listens for the legacy audio thread but
+        // ignores the message there once that path is removed.
+        let msg = MainToChild::SetTrackVolume { track, volume: v };
+        self.send_audio(msg.clone());
+        self.send_plugin(msg);
     }
 
     fn set_track_pan(&mut self, track: u32, pan: f32) {
@@ -2314,7 +2327,9 @@ impl AppData {
         if let Some(t) = self.song.tracks.get_mut(track as usize) {
             t.pan = p;
         }
-        self.send_plugin(MainToChild::SetTrackPan { track, pan: p });
+        let msg = MainToChild::SetTrackPan { track, pan: p };
+        self.send_audio(msg.clone());
+        self.send_plugin(msg);
     }
 
     fn toggle_track_mute(&mut self, track: u32) {
@@ -2323,7 +2338,9 @@ impl AppData {
         };
         t.muted = !t.muted;
         let muted = t.muted;
-        self.send_plugin(MainToChild::SetTrackMuted { track, muted });
+        let msg = MainToChild::SetTrackMuted { track, muted };
+        self.send_audio(msg.clone());
+        self.send_plugin(msg);
     }
 
     fn toggle_track_solo(&mut self, track: u32) {
@@ -2332,7 +2349,9 @@ impl AppData {
         };
         t.solo = !t.solo;
         let solo = t.solo;
-        self.send_plugin(MainToChild::SetTrackSolo { track, solo });
+        let msg = MainToChild::SetTrackSolo { track, solo };
+        self.send_audio(msg.clone());
+        self.send_plugin(msg);
     }
 
     fn on_track_peaks_tick(&mut self, peaks: &[(f32, f32)]) {
@@ -2410,7 +2429,7 @@ impl AppData {
         };
         self.status_message = "WAV 書き出し中...".to_string();
         let song = self.song.clone();
-        self.send_plugin(MainToChild::LoadSong(song));
+        self.send_both(MainToChild::LoadSong(song));
         self.send_plugin(MainToChild::ExportWav { path });
     }
 }

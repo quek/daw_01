@@ -1,32 +1,22 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, Result};
-use common::audio_bridge::{AudioBridgeHandle, CHANNELS, MAX_FRAMES};
+use common::audio_bridge::AudioBridgeHandle;
 use common::meter::compute_block_peak;
 use common::protocol::{ChildKind, MainToChild};
-use common::win_sem::Semaphore;
 use common::wire::read_msg;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tokio::net::windows::named_pipe::NamedPipeClient;
 
-#[repr(u8)]
-#[derive(Clone, Copy)]
-enum PlayState {
-    Silence = 0,
-    TestTone = 1,
-    Plugin = 2,
-}
+mod audio_worker;
+mod engine;
+mod mixer;
+mod sequencer;
+mod tracks;
+mod vocal;
 
-impl PlayState {
-    fn from_u8(v: u8) -> Self {
-        match v {
-            1 => Self::TestTone,
-            2 => Self::Plugin,
-            _ => Self::Silence,
-        }
-    }
-}
+use engine::{LocalState, PlaybackCommand, SharedState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -46,94 +36,154 @@ async fn main() -> Result<()> {
     let bridge = Arc::new(
         AudioBridgeHandle::open(&session.shmem_id).context("failed to open audio shmem")?,
     );
-    let request_sem = Arc::new(
-        Semaphore::open(&session.request_sem_id).context("failed to open request semaphore")?,
-    );
-    let ready_sem = Arc::new(
-        Semaphore::open(&session.ready_sem_id).context("failed to open ready semaphore")?,
-    );
 
-    let initial = if std::env::var_os("DAW_AUDIO_TEST_TONE").is_some() {
-        PlayState::TestTone
-    } else {
-        PlayState::Silence
-    };
-    let play_state = Arc::new(AtomicU8::new(initial as u8));
-    // Master gain is stored as f32 bits in an AtomicU32 so the CPAL callback
-    // can load it with a single relaxed atomic op. Default 1.0 (0 dB).
+    let shared = Arc::new(SharedState::new());
+    // Master gain stays a separate atomic from `SharedState` because the
+    // CPAL closure applies it on the device-final samples (post-engine).
     let master_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
 
+    // AudioCommand channel: the receive loop pushes handle-bearing
+    // commands (OpenWorkerPool / OpenPluginShmem / ClosePluginShmem)
+    // into this; the audio thread drains it at the top of every buffer.
+    let (cmd_tx, cmd_rx) =
+        tokio::sync::mpsc::unbounded_channel::<engine::AudioCommand>();
+
     let _stream = start_output_stream(
-        Arc::clone(&play_state),
+        Arc::clone(&shared),
         Arc::clone(&bridge),
-        Arc::clone(&request_sem),
-        Arc::clone(&ready_sem),
         Arc::clone(&master_gain),
+        session.sample_rate,
+        cmd_rx,
     )
     .context("failed to start audio stream")?;
     tracing::info!("audio stream running");
 
-    recv_loop(pipe, play_state, master_gain).await;
+    recv_loop(pipe, shared, master_gain, cmd_tx).await;
     tracing::info!("daw_audio exiting");
     Ok(())
 }
 
 async fn recv_loop(
     mut pipe: NamedPipeClient,
-    state: Arc<AtomicU8>,
+    shared: Arc<SharedState>,
     master_gain: Arc<AtomicU32>,
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<engine::AudioCommand>,
 ) {
     loop {
         match read_msg::<_, MainToChild>(&mut pipe).await {
             Ok(MainToChild::Play) => {
                 tracing::info!("received Play");
-                state.store(PlayState::Plugin as u8, Ordering::Relaxed);
+                shared
+                    .playback
+                    .store(PlaybackCommand::Play as u8, Ordering::Release);
             }
             Ok(MainToChild::Stop) => {
                 tracing::info!("received Stop");
-                state.store(PlayState::Silence as u8, Ordering::Relaxed);
+                shared
+                    .playback
+                    .store(PlaybackCommand::Stop as u8, Ordering::Release);
             }
-            Ok(MainToChild::Ack) => {
-                tracing::warn!("unexpected Ack outside of handshake");
+            Ok(MainToChild::SetLoop(b)) => {
+                shared.looping.store(b, Ordering::Release);
             }
-            Ok(MainToChild::Session(_)) => {
-                tracing::warn!("received Session after initial handshake (ignored)");
+            Ok(MainToChild::LoadSong(song)) => {
+                shared.song.store(Some(Arc::new(song)));
             }
-            Ok(MainToChild::LoadSong(_)) => {
-                // Song state lives in daw_plugin_host; daw_audio does not use it.
+            Ok(MainToChild::SetMasterGain(g)) => {
+                let clamped = g.clamp(0.0, 1.0);
+                master_gain.store(clamped.to_bits(), Ordering::Relaxed);
             }
-            Ok(MainToChild::SetSlotPlugin { .. })
+            Ok(MainToChild::OpenWorkerPool {
+                n_workers,
+                worker_bridge_shmem_id,
+                wake_event_names,
+                done_event_names,
+            }) => {
+                if let Err(e) = handle_open_worker_pool(
+                    n_workers,
+                    &worker_bridge_shmem_id,
+                    &wake_event_names,
+                    &done_event_names,
+                    &cmd_tx,
+                ) {
+                    tracing::error!(error = ?e, "failed to open audio-side worker pool");
+                }
+            }
+            Ok(MainToChild::OpenPluginShmem {
+                plugin_id,
+                shmem_id,
+                track,
+                slot,
+            }) => {
+                if let Err(e) =
+                    handle_open_plugin_shmem(plugin_id, &shmem_id, track, slot, &cmd_tx)
+                {
+                    tracing::error!(error = ?e, plugin_id, "failed to open plugin shmem");
+                }
+            }
+            Ok(MainToChild::ClosePluginShmem { plugin_id }) => {
+                let _ = cmd_tx.send(engine::AudioCommand::ClosePluginShmem { plugin_id });
+            }
+            Ok(MainToChild::SetTrackVolume { track, volume }) => {
+                update_song_track(&shared, |s| {
+                    if let Some(t) = s.tracks.get_mut(track as usize) {
+                        t.volume = volume.clamp(0.0, 1.0);
+                    }
+                });
+            }
+            Ok(MainToChild::SetTrackPan { track, pan }) => {
+                update_song_track(&shared, |s| {
+                    if let Some(t) = s.tracks.get_mut(track as usize) {
+                        t.pan = pan.clamp(-1.0, 1.0);
+                    }
+                });
+            }
+            Ok(MainToChild::SetTrackMuted { track, muted }) => {
+                update_song_track(&shared, |s| {
+                    if let Some(t) = s.tracks.get_mut(track as usize) {
+                        t.muted = muted;
+                    }
+                });
+            }
+            Ok(MainToChild::SetTrackSolo { track, solo }) => {
+                update_song_track(&shared, |s| {
+                    if let Some(t) = s.tracks.get_mut(track as usize) {
+                        t.solo = solo;
+                    }
+                });
+            }
+            Ok(MainToChild::SetVocalAudio {
+                track,
+                clip: _,
+                clip_start_samples,
+                sample_rate: _,
+                samples,
+            }) => {
+                let _ = cmd_tx.send(engine::AudioCommand::SetVocalAudio {
+                    track,
+                    clip_start_samples,
+                    samples,
+                });
+            }
+            // Plugin lifecycle, GUI, state save/restore, export, vocal
+            // synthesis, per-track mixer params, slot reorder, and the
+            // plugin-host CloseWorkerPool tear-down all stay on the
+            // plugin_host side (or move to daw_audio in PR6d+).
+            Ok(MainToChild::Ack)
+            | Ok(MainToChild::Session(_))
+            | Ok(MainToChild::SetSlotPlugin { .. })
             | Ok(MainToChild::RemoveSlotPlugin { .. })
             | Ok(MainToChild::MoveSlot { .. })
             | Ok(MainToChild::RemoveTrack { .. })
             | Ok(MainToChild::SwapTracks { .. })
             | Ok(MainToChild::ReorderTracks(_))
             | Ok(MainToChild::RequestSlotState { .. })
-            | Ok(MainToChild::RequestAllStates) => {
-                // CLAP plugin lifecycle / state is handled by daw_plugin_host.
-            }
-            Ok(MainToChild::SetLoop(_)) => {
-                // Loop state lives in daw_plugin_host; daw_audio does not use it.
-            }
-            Ok(MainToChild::ExportWav { .. }) | Ok(MainToChild::SetVocalAudio { .. }) => {
-                // Handled by daw_plugin_host.
-            }
-            Ok(MainToChild::SetTrackVolume { .. })
-            | Ok(MainToChild::SetTrackPan { .. })
-            | Ok(MainToChild::SetTrackMuted { .. })
-            | Ok(MainToChild::SetTrackSolo { .. }) => {
-                // Per-track mixer params live in daw_plugin_host's audio thread.
-            }
-            Ok(MainToChild::SetMasterGain(g)) => {
-                let clamped = g.clamp(0.0, 1.0);
-                tracing::info!(gain = clamped, "received SetMasterGain");
-                master_gain.store(clamped.to_bits(), Ordering::Relaxed);
-            }
-            Ok(MainToChild::OpenSlotGuiEmbedded { .. })
+            | Ok(MainToChild::RequestAllStates)
+            | Ok(MainToChild::ExportWav { .. })
+            | Ok(MainToChild::OpenSlotGuiEmbedded { .. })
             | Ok(MainToChild::CloseSlotGui { .. })
-            | Ok(MainToChild::ResizeSlotGui { .. }) => {
-                // Plugin GUI lifecycle is handled by daw_plugin_host.
-            }
+            | Ok(MainToChild::ResizeSlotGui { .. })
+            | Ok(MainToChild::CloseWorkerPool) => {}
             Err(e) => {
                 tracing::info!(error = ?e, "receive loop ending");
                 break;
@@ -142,12 +192,112 @@ async fn recv_loop(
     }
 }
 
+/// Open the WorkerBridge shmem + N (wake, done) events for the audio
+/// side, build N `WorkerSyncRef`s pointing at the bridge slots, and
+/// hand the bundle to the audio thread via the command channel.
+fn handle_open_worker_pool(
+    n_workers: u32,
+    worker_bridge_shmem_id: &str,
+    wake_event_names: &[String],
+    done_event_names: &[String],
+    cmd_tx: &tokio::sync::mpsc::UnboundedSender<engine::AudioCommand>,
+) -> Result<()> {
+    anyhow::ensure!(
+        wake_event_names.len() == n_workers as usize,
+        "wake_event_names len {} != n_workers {}",
+        wake_event_names.len(),
+        n_workers
+    );
+    anyhow::ensure!(
+        done_event_names.len() == n_workers as usize,
+        "done_event_names len {} != n_workers {}",
+        done_event_names.len(),
+        n_workers
+    );
+    let bridge = common::worker_bridge::WorkerBridgeHandle::open(worker_bridge_shmem_id)
+        .context("failed to open worker_bridge shmem")?;
+    // Per-slot pointer into the bridge's worker_task array — stable for
+    // the bridge's lifetime, which the audio thread holds (see
+    // LocalState::worker_bridge).
+    let bridge_ref = bridge.bridge();
+    let mut worker_syncs = Vec::with_capacity(n_workers as usize);
+    for i in 0..n_workers as usize {
+        let wake = common::plugin_ref::create_named_event(&wake_event_names[i])
+            .with_context(|| format!("failed to open wake event {i}"))?;
+        let done = common::plugin_ref::create_named_event(&done_event_names[i])
+            .with_context(|| format!("failed to open done event {i}"))?;
+        worker_syncs.push(common::plugin_ref::WorkerSyncRef {
+            worker_idx: i as u32,
+            worker_task: &bridge_ref.worker_task[i] as *const _,
+            event_wake: wake,
+            event_done: done,
+        });
+    }
+    cmd_tx
+        .send(engine::AudioCommand::OpenWorkerPool {
+            bridge,
+            worker_syncs,
+        })
+        .map_err(|_| anyhow::anyhow!("audio command channel closed"))?;
+    Ok(())
+}
+
+/// Apply `f` to a clone of the current song and publish the result.
+/// `ArcSwap` keeps the swap wait-free for the audio thread; the clone
+/// happens on the IPC thread, which is acceptable because mixer-strip
+/// changes are user-driven (slider drag rate, not per-buffer).
+fn update_song_track<F>(shared: &Arc<engine::SharedState>, f: F)
+where
+    F: FnOnce(&mut common::model::Song),
+{
+    let snapshot = shared.song.load();
+    let Some(song) = snapshot.as_deref() else {
+        return;
+    };
+    let mut next = song.clone();
+    f(&mut next);
+    shared.song.store(Some(Arc::new(next)));
+}
+
+/// Open the per-plugin `ProcessData` shmem and ship a `PluginRef` to the
+/// audio thread along with the (track, slot) it's assigned to.
+fn handle_open_plugin_shmem(
+    plugin_id: u32,
+    shmem_id: &str,
+    track: u32,
+    slot: common::protocol::PluginSlot,
+    cmd_tx: &tokio::sync::mpsc::UnboundedSender<engine::AudioCommand>,
+) -> Result<()> {
+    let handle = common::process_data::ProcessDataHandle::open(shmem_id)
+        .context("failed to open ProcessData shmem")?;
+    let plugin_ref = common::plugin_ref::PluginRef {
+        plugin_id,
+        process_data: handle.ptr(),
+    };
+    cmd_tx
+        .send(engine::AudioCommand::OpenPluginShmem {
+            plugin_id,
+            plugin_ref,
+            track,
+            slot,
+        })
+        .map_err(|_| anyhow::anyhow!("audio command channel closed"))?;
+    // The handle owns the shmem mapping. We can't move it across to the
+    // audio thread inside the command — instead, the engine's PluginRef
+    // is just a raw pointer, so this side has to keep the mapping alive
+    // until ClosePluginShmem. Stash it in a leaky static for now; PR8
+    // will hang it off a proper `PluginShmemRegistry`.
+    let leaked = Box::leak(Box::new(handle));
+    let _ = leaked;
+    Ok(())
+}
+
 fn start_output_stream(
-    play_state: Arc<AtomicU8>,
+    shared: Arc<SharedState>,
     bridge: Arc<AudioBridgeHandle>,
-    request_sem: Arc<Semaphore>,
-    ready_sem: Arc<Semaphore>,
     master_gain: Arc<AtomicU32>,
+    session_sample_rate: u32,
+    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<engine::AudioCommand>,
 ) -> Result<cpal::Stream> {
     let host = cpal::default_host();
     let device = host
@@ -178,13 +328,12 @@ fn start_output_stream(
     let stream = build_stream(
         &device,
         &config,
-        sample_rate,
         channels,
-        play_state,
+        shared,
         bridge,
-        request_sem,
-        ready_sem,
         master_gain,
+        session_sample_rate,
+        cmd_rx,
     )?;
     stream.play().context("failed to start stream")?;
     Ok(stream)
@@ -194,85 +343,63 @@ fn start_output_stream(
 fn build_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    sample_rate: u32,
     channels: u16,
-    play_state: Arc<AtomicU8>,
+    shared: Arc<SharedState>,
     bridge: Arc<AudioBridgeHandle>,
-    request_sem: Arc<Semaphore>,
-    ready_sem: Arc<Semaphore>,
     master_gain: Arc<AtomicU32>,
+    session_sample_rate: u32,
+    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<engine::AudioCommand>,
 ) -> Result<cpal::Stream> {
-    use std::f32::consts::TAU;
-    let freq_hz: f32 = 440.0;
-    let amplitude: f32 = 0.1;
-    let phase_inc = freq_hz * TAU / sample_rate as f32;
     let channels_usize = channels as usize;
-    let bridge_channels = CHANNELS as usize;
-    let mut phase: f32 = 0.0;
+    let max_frames = common::process_data::MAX_FRAMES;
+    // `LocalState` is the CPAL closure's exclusive heap. It holds
+    // master_l/r and the per-track scratch — pre-allocated here, never
+    // touched outside the audio thread.
+    let mut local = LocalState::new(max_frames, cmd_rx);
 
     let stream = device
         .build_output_stream(
             config,
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                let state = PlayState::from_u8(play_state.load(Ordering::Relaxed));
+                let frames = (data.len() / channels_usize).min(max_frames);
+
+                local.process_buffer(&shared, session_sample_rate, frames);
+
+                // A2: publish the engine's playhead to shmem so the GUI
+                // can draw the cursor. `u64::MAX` is the "not playing"
+                // sentinel the GUI already understands.
+                let published_ph = if local.playing {
+                    shared.playhead.load(Ordering::Acquire)
+                } else {
+                    u64::MAX
+                };
+                bridge.set_playhead_samples(published_ph);
+
                 let gain = f32::from_bits(master_gain.load(Ordering::Relaxed));
 
-                match state {
-                    PlayState::Silence => {
-                        for s in data.iter_mut() {
-                            *s = 0.0;
+                // Interleave master_l/r into the device buffer, applying
+                // master_gain. Lanes beyond stereo on the device are
+                // zeroed.
+                unsafe {
+                    let dst = data.as_mut_ptr();
+                    for i in 0..frames {
+                        let l = local.master_l[i] * gain;
+                        let r = local.master_r[i] * gain;
+                        let out = dst.add(i * channels_usize);
+                        *out = l;
+                        if channels_usize > 1 {
+                            *out.add(1) = r;
                         }
-                    }
-                    PlayState::TestTone => {
-                        for frame in data.chunks_mut(channels_usize) {
-                            let sample = phase.sin() * amplitude * gain;
-                            for s in frame.iter_mut() {
-                                *s = sample;
-                            }
-                            phase += phase_inc;
-                            if phase >= TAU {
-                                phase -= TAU;
-                            }
-                        }
-                    }
-                    PlayState::Plugin => {
-                        let frames = (data.len() / channels_usize).min(MAX_FRAMES as usize);
-                        bridge.set_frames_requested(frames as u32);
-                        if request_sem.release().is_err() || ready_sem.wait().is_err() {
-                            for s in data.iter_mut() {
-                                *s = 0.0;
-                            }
-                            bridge.set_peaks(0.0, 0.0);
-                            return;
-                        }
-                        // Copy interleaved stereo from shmem into the CPAL buffer
-                        // while multiplying by master gain. Expand to
-                        // `channels_usize` if the device has more than 2.
-                        unsafe {
-                            let src = bridge.samples_ptr();
-                            for i in 0..frames {
-                                let l = *src.add(i * bridge_channels) * gain;
-                                let r = *src.add(i * bridge_channels + 1) * gain;
-                                let out = data.as_mut_ptr().add(i * channels_usize);
-                                *out = l;
-                                if channels_usize > 1 {
-                                    *out.add(1) = r;
-                                }
-                                for c in 2..channels_usize {
-                                    *out.add(c) = 0.0;
-                                }
-                            }
-                        }
-                        let filled = frames * channels_usize;
-                        for s in &mut data[filled..] {
-                            *s = 0.0;
+                        for c in 2..channels_usize {
+                            *out.add(c) = 0.0;
                         }
                     }
                 }
+                let filled = frames * channels_usize;
+                for s in &mut data[filled..] {
+                    *s = 0.0;
+                }
 
-                // Compute and publish per-block peaks on the post-gain signal.
-                // Slicing by `channels_usize` keeps us correct for mono/N-ch
-                // devices; we meter the first two lanes.
                 let (peak_l, peak_r) = block_peaks_stereo(data, channels_usize);
                 bridge.set_peaks(peak_l, peak_r);
             },
@@ -319,14 +446,12 @@ mod tests {
 
     #[test]
     fn block_peaks_stereo_mono_duplicates() {
-        // Mono device: both meters show the single channel's peak.
         let data = [0.1, -0.5, 0.3];
         assert_eq!(block_peaks_stereo(&data, 1), (0.5, 0.5));
     }
 
     #[test]
     fn block_peaks_stereo_interleaved_picks_per_channel_max() {
-        // frames: (0.1,-0.4) (-0.2,0.3) (0.05,-0.5)
         let data = [0.1, -0.4, -0.2, 0.3, 0.05, -0.5];
         assert_eq!(block_peaks_stereo(&data, 2), (0.2, 0.5));
     }

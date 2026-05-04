@@ -43,11 +43,17 @@ pub enum ChildToMain {
     },
     /// Plugin-host confirmed `SetSlotPlugin` and reported the stable id /
     /// display name of the descriptor that actually loaded.
+    /// `plugin_id` is the host's session-unique identifier for this
+    /// instance; `shmem_id` names the `ProcessData` shared memory the
+    /// host created so daw_audio can `OpenShared` it and use the
+    /// worker-pool dispatch to drive `plugin.process()`.
     SlotPluginLoaded {
         track: u32,
         slot: PluginSlot,
         id: String,
         name: String,
+        plugin_id: u32,
+        shmem_id: String,
     },
     /// Reply to `RequestSlotState`. `None` = plugin unavailable or state
     /// extension missing.
@@ -199,6 +205,36 @@ pub enum MainToChild {
         width: u32,
         height: u32,
     },
+    // --- A2 audio engine refactor -------------------------------------
+    /// Stand up the per-buffer plugin process worker pool. `n_workers`
+    /// audio-engine workers will pair 1:1 with `n_workers` plugin-host
+    /// workers via the named events listed (one wake + one done per
+    /// pair). The `WorkerBridge` shmem published under
+    /// `worker_bridge_shmem_id` carries the per-worker `worker_task`
+    /// (plugin id) the audio side writes before each dispatch.
+    OpenWorkerPool {
+        n_workers: u32,
+        worker_bridge_shmem_id: String,
+        wake_event_names: Vec<String>,
+        done_event_names: Vec<String>,
+    },
+    /// Tear down the worker pool started by `OpenWorkerPool`. Plugin-host
+    /// workers exit and the IDs they held become invalid.
+    CloseWorkerPool,
+    /// Map a `ProcessData` shmem region into the consumer (daw_audio).
+    /// `track` and `slot` let the audio engine slot the plugin into the
+    /// right place in its routing graph; `plugin_id` is the host's
+    /// session-unique id and `shmem_id` names the shmem the host
+    /// already created.
+    OpenPluginShmem {
+        plugin_id: u32,
+        shmem_id: String,
+        track: u32,
+        slot: PluginSlot,
+    },
+    /// Drop the `ProcessData` mapping for `plugin_id` after the plugin
+    /// instance is being torn down.
+    ClosePluginShmem { plugin_id: u32 },
 }
 
 #[cfg(test)]

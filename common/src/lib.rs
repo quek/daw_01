@@ -5,13 +5,17 @@ pub mod meter;
 pub mod model;
 pub mod plugin_db;
 pub mod plugin_format;
+pub mod plugin_ref;
+pub mod process_data;
 pub mod project;
 pub mod protocol;
 pub mod recent;
 pub mod timing;
+pub mod track_params;
 pub mod voicevox;
 pub mod vst3_scan;
 pub mod wire;
+pub mod worker_bridge;
 
 #[cfg(windows)]
 pub mod client;

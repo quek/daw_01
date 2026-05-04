@@ -53,15 +53,43 @@ fn main() -> Result<()> {
         .context("failed to create ready semaphore")?;
     tracing::info!(?session, "created audio session handles");
 
+    // A2: per-buffer plugin process worker pool. We create the
+    // worker_bridge shmem (carrying per-worker plugin-id slots) and
+    // N pairs of (wake, done) named events here so both child
+    // processes can `OpenShared` / `CreateEventA`-with-existing-name
+    // them when they receive `OpenWorkerPool`. Handles are kept on
+    // the daw_gui stack for the whole session lifetime — Windows
+    // reference-counts the kernel objects, so the children's
+    // handles stay valid even though daw_gui doesn't poke them.
+    let n_workers = pick_worker_count();
+    let worker_bridge_shmem_id = common::plugin_ref::worker_bridge_shmem_id(pid);
+    let _worker_bridge = common::worker_bridge::WorkerBridgeHandle::create(&worker_bridge_shmem_id)
+        .context("failed to create worker_bridge shmem")?;
+    let (wake_event_names, done_event_names, _wake_handles, _done_handles) =
+        create_worker_event_pairs(pid, n_workers)?;
+    tracing::info!(n_workers, "created plugin worker pool handles");
+
     let (audio_child, plugin_child, mut audio_server, mut plugin_server) =
         rt.block_on(spawn_and_handshake(&job))?;
 
     rt.block_on(async {
         write_msg(&mut audio_server, &MainToChild::Session(session.clone())).await?;
         write_msg(&mut plugin_server, &MainToChild::Session(session.clone())).await?;
+        // Both children consume `OpenWorkerPool`: plugin_host spawns
+        // the actual `plugin.process()` worker pool, daw_audio opens
+        // the matching events / WorkerBridge so its audio engine can
+        // dispatch through `WorkerSyncRef::dispatch`.
+        let open_pool = MainToChild::OpenWorkerPool {
+            n_workers,
+            worker_bridge_shmem_id: worker_bridge_shmem_id.clone(),
+            wake_event_names: wake_event_names.clone(),
+            done_event_names: done_event_names.clone(),
+        };
+        write_msg(&mut audio_server, &open_pool).await?;
+        write_msg(&mut plugin_server, &open_pool).await?;
         anyhow::Ok(())
     })
-    .context("failed to send audio session")?;
+    .context("failed to send audio session / worker pool")?;
 
     // Children プロセスは run_runner 終了まで生かす。
     let _children = (audio_child, plugin_child);
@@ -87,6 +115,11 @@ fn main() -> Result<()> {
             .with_title("daw_01")
             .with_inner_size(LogicalSize::new(1280.0, 800.0)),
         build_app: Box::new(move |proxy: EventLoopProxy<AppEvent>| {
+            // Clone the audio_tx for the incoming bridge before AppData
+            // takes ownership of the original — the bridge needs to
+            // forward SlotPluginLoaded → OpenPluginShmem to daw_audio.
+            let audio_tx_for_bridge = audio_tx.clone();
+
             // AppData 本体を組み立てる。
             let app = AppData::new(audio_tx, plugin_tx, None, plugin_db_for_app, proxy.clone());
 
@@ -94,7 +127,7 @@ fn main() -> Result<()> {
             spawn_playhead_poller(bridge_for_app, proxy.clone());
             spawn_autosave_timer(proxy.clone());
             spawn_midi_input(proxy.clone());
-            spawn_incoming_bridge(incoming_rx, proxy.clone());
+            spawn_incoming_bridge(incoming_rx, proxy.clone(), audio_tx_for_bridge);
 
             app
         }),
@@ -107,6 +140,53 @@ fn main() -> Result<()> {
     tracing::info!("daw_gui exiting");
     drop(bridge);
     Ok(())
+}
+
+/// Pick a worker count. Defaults to `available_parallelism - 1` so the
+/// OS / GUI thread keeps a core, capped at `MAX_WORKERS`. `DAW_AUDIO_WORKERS`
+/// env var overrides for tuning.
+fn pick_worker_count() -> u32 {
+    let n = std::env::var("DAW_AUDIO_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().saturating_sub(1).max(1) as u32)
+                .unwrap_or(2)
+        });
+    n.min(common::worker_bridge::MAX_WORKERS as u32).max(1)
+}
+
+/// Create N pairs of (wake, done) auto-reset named events. Returns the
+/// names (so we can pass them to the children via IPC) plus the handles
+/// daw_gui keeps alive for the session.
+#[allow(clippy::type_complexity)]
+fn create_worker_event_pairs(
+    pid: u32,
+    n_workers: u32,
+) -> Result<(
+    Vec<String>,
+    Vec<String>,
+    Vec<windows::Win32::Foundation::HANDLE>,
+    Vec<windows::Win32::Foundation::HANDLE>,
+)> {
+    let mut wake_names = Vec::with_capacity(n_workers as usize);
+    let mut done_names = Vec::with_capacity(n_workers as usize);
+    let mut wakes = Vec::with_capacity(n_workers as usize);
+    let mut dones = Vec::with_capacity(n_workers as usize);
+    for i in 0..n_workers {
+        let wn = common::plugin_ref::worker_wake_event_name(pid, i);
+        let dn = common::plugin_ref::worker_done_event_name(pid, i);
+        let wh = common::plugin_ref::create_named_event(&wn)
+            .with_context(|| format!("failed to create wake event {i}"))?;
+        let dh = common::plugin_ref::create_named_event(&dn)
+            .with_context(|| format!("failed to create done event {i}"))?;
+        wake_names.push(wn);
+        done_names.push(dn);
+        wakes.push(wh);
+        dones.push(dh);
+    }
+    Ok((wake_names, done_names, wakes, dones))
 }
 
 async fn spawn_and_handshake(
@@ -247,9 +327,15 @@ fn load_or_build_plugin_db() -> Option<Arc<common::plugin_db::PluginDatabase>> {
 
 /// IPC bridge: tokio mpsc → EventLoopProxy。background スレッドで blocking
 /// recv し、`AppEvent` に変換して proxy へ送る。
+///
+/// `audio_tx` is also passed in so SlotPluginLoaded can be forwarded to
+/// daw_audio as `OpenPluginShmem` — daw_audio needs the plugin_id /
+/// shmem_id pair to map the per-plugin `ProcessData` and dispatch
+/// `plugin.process()` via the worker pool.
 fn spawn_incoming_bridge(
     mut rx: UnboundedReceiver<ChildToMain>,
     proxy: EventLoopProxy<AppEvent>,
+    audio_tx: tokio::sync::mpsc::UnboundedSender<MainToChild>,
 ) {
     std::thread::spawn(move || {
         while let Some(msg) = rx.blocking_recv() {
@@ -266,7 +352,23 @@ fn spawn_incoming_bridge(
                 ChildToMain::ExportWavComplete { error } => {
                     Some(AppEvent::ExportWavComplete { error })
                 }
-                ChildToMain::SlotPluginLoaded { track, slot, id, name } => {
+                ChildToMain::SlotPluginLoaded {
+                    track,
+                    slot,
+                    id,
+                    name,
+                    plugin_id,
+                    shmem_id,
+                } => {
+                    // Forward the shmem mapping to daw_audio so it can
+                    // open the per-plugin ProcessData region and start
+                    // dispatching plugin.process() via the worker pool.
+                    let _ = audio_tx.send(MainToChild::OpenPluginShmem {
+                        plugin_id,
+                        shmem_id,
+                        track,
+                        slot,
+                    });
                     Some(AppEvent::SlotPluginLoadedFromChild { track, slot, id, name })
                 }
                 ChildToMain::SlotPluginState { .. } => None,

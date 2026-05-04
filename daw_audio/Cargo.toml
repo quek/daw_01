@@ -6,6 +6,10 @@ edition.workspace = true
 [dependencies]
 common = { path = "../common" }
 anyhow.workspace = true
+arc-swap.workspace = true
 cpal.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

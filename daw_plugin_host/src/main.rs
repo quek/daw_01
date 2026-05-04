@@ -1,6 +1,7 @@
 mod clap_host;
 mod clap_plugin;
 mod plugin_instance;
+mod process_server;
 mod vst3_events;
 mod vst3_host;
 mod vst3_plugin;
@@ -80,6 +81,8 @@ pub enum PluginEvent {
         slot: PluginSlot,
         id: String,
         name: String,
+        plugin_id: u32,
+        shmem_id: String,
     },
     SlotPluginState {
         track: u32,
@@ -106,9 +109,21 @@ impl From<PluginEvent> for ChildToMain {
             PluginEvent::SlotGuiClosed { track, slot } => {
                 ChildToMain::SlotGuiClosed { track, slot }
             }
-            PluginEvent::SlotPluginLoaded { track, slot, id, name } => {
-                ChildToMain::SlotPluginLoaded { track, slot, id, name }
-            }
+            PluginEvent::SlotPluginLoaded {
+                track,
+                slot,
+                id,
+                name,
+                plugin_id,
+                shmem_id,
+            } => ChildToMain::SlotPluginLoaded {
+                track,
+                slot,
+                id,
+                name,
+                plugin_id,
+                shmem_id,
+            },
             PluginEvent::SlotPluginState { track, slot, data } => {
                 ChildToMain::SlotPluginState { track, slot, data }
             }
@@ -118,6 +133,30 @@ impl From<PluginEvent> for ChildToMain {
             }
         }
     }
+}
+
+/// Atomically publish a new entry (or `None` to remove) in the plugin
+/// registry. Clones the current `Vec` so old worker snapshots stay
+/// valid until they're dropped.
+fn publish_plugin_registry(
+    registry: &PluginRegistry,
+    plugin_id: u32,
+    entry: Option<PluginEntry>,
+) {
+    let current = registry.load();
+    let mut next: Vec<Option<PluginEntry>> = (**current)
+        .iter()
+        .map(|opt| opt.as_ref().map(|e| PluginEntry {
+            plugin: PluginPtr(e.plugin.0),
+            process_data: e.process_data,
+        }))
+        .collect();
+    let idx = plugin_id as usize;
+    if next.len() <= idx {
+        next.resize_with(idx + 1, || None);
+    }
+    next[idx] = entry;
+    registry.store(std::sync::Arc::new(next));
 }
 
 /// Commands processed serially on the plugin-main thread.
@@ -198,6 +237,18 @@ enum PluginCommand {
     ExportWav {
         path: std::path::PathBuf,
     },
+    /// Stand up the per-buffer plugin process worker pool. Drives
+    /// `process_server::WorkerPool::open` on the plugin-main thread so
+    /// the audio engine on the daw_audio side can dispatch
+    /// `plugin.process()` calls via the worker_wake/done event pairs.
+    OpenWorkerPool {
+        n_workers: u32,
+        worker_bridge_shmem_id: String,
+        wake_event_names: Vec<String>,
+        done_event_names: Vec<String>,
+    },
+    /// Tear down the worker pool started by `OpenWorkerPool`.
+    CloseWorkerPool,
     Shutdown,
 }
 
@@ -362,6 +413,32 @@ fn plugin_main_loop(
     let song_store: Arc<ArcSwapOption<Song>> = Arc::new(ArcSwapOption::from(None));
     let loop_state = Arc::new(AtomicBool::new(false));
     let mut tracks = TracksHandle::new();
+    // A2: plugin-process worker pool paired 1:1 with audio-engine
+    // workers. Stored as an Option so OpenWorkerPool can replace any
+    // stale pool (e.g. on session restart).
+    let mut worker_pool: Option<process_server::WorkerPool> = None;
+
+    // A2: plugin instance registry.
+    //   - `next_plugin_id` issues a session-unique id every time a
+    //     plugin instance is loaded.
+    //   - `plugin_shmems` owns the `ProcessData` shmem created here so
+    //     daw_audio can `OpenShared` it via `ChildToMain::SlotPluginLoaded`.
+    //   - `plugin_lookup` maps `(track, slot)` to the live plugin id so
+    //     RemoveSlotPlugin / RemoveTrack / SwapTracks can clean up.
+    //   - `plugin_registry` is the lock-free `plugin_id` → entry table
+    //     read by the worker pool during dispatch.
+    let plugin_host_pid = std::process::id();
+    let mut next_plugin_id: u32 = 1;
+    let mut plugin_shmems: HashMap<u32, common::process_data::ProcessDataHandle> = HashMap::new();
+    let mut plugin_lookup: HashMap<(u32, PluginSlot), u32> = HashMap::new();
+    // Defensive dedup: if the GUI somehow sends `SetSlotPlugin` twice
+    // for the same (track, slot, plugin_id) (we've seen the picker
+    // double-fire) we skip the second to avoid the workers racing on
+    // a destroy → re-install path. Keyed by (track, slot) → loaded
+    // plugin's stable id string.
+    let mut loaded_id_for_slot: HashMap<(u32, PluginSlot), String> = HashMap::new();
+    let plugin_registry: PluginRegistry =
+        Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
 
     // Per-(track, slot) host callbacks: each loaded plugin captures its
     // (track, slot) so the async CLAP callback (request_resize / closed)
@@ -400,9 +477,39 @@ fn plugin_main_loop(
             };
             match cmd {
                 PluginCommand::Shutdown => {
+                    if let Some(pool) = worker_pool.take() {
+                        pool.shutdown();
+                    }
                     tracks.shutdown();
                     tracing::info!("plugin-main thread exiting");
                     return;
+                }
+                PluginCommand::OpenWorkerPool {
+                    n_workers,
+                    worker_bridge_shmem_id,
+                    wake_event_names,
+                    done_event_names,
+                } => {
+                    if let Some(pool) = worker_pool.take() {
+                        pool.shutdown();
+                    }
+                    match process_server::WorkerPool::open(
+                        n_workers,
+                        &worker_bridge_shmem_id,
+                        &wake_event_names,
+                        &done_event_names,
+                        Arc::clone(&plugin_registry),
+                    ) {
+                        Ok(pool) => worker_pool = Some(pool),
+                        Err(e) => {
+                            tracing::error!(error = ?e, "failed to open plugin worker pool");
+                        }
+                    }
+                }
+                PluginCommand::CloseWorkerPool => {
+                    if let Some(pool) = worker_pool.take() {
+                        pool.shutdown();
+                    }
                 }
                 PluginCommand::SetSlotPlugin {
                     track,
@@ -412,6 +519,17 @@ fn plugin_main_loop(
                     plugin_id,
                     initial_state,
                 } => {
+                    // Defensive dedup against picker double-fire. Same
+                    // plugin id at the same slot ⇒ ignore.
+                    if loaded_id_for_slot.get(&(track, slot)) == Some(&plugin_id) {
+                        tracing::info!(
+                            track,
+                            ?slot,
+                            id = %plugin_id,
+                            "SetSlotPlugin: same plugin already loaded, ignoring duplicate"
+                        );
+                        continue;
+                    }
                     // Note: tracks.mutate stops and restarts the audio
                     // thread to swap in the new plugin. We do NOT touch
                     // playback_state — the user's Play/Stop choice should
@@ -426,22 +544,104 @@ fn plugin_main_loop(
                             }
                             let loaded_id = plugin.id().to_string();
                             let loaded_name = plugin.name().to_string();
+                            let sr = session.sample_rate;
+                            let mf = session.max_frames;
                             let result = tracks.mutate(
                                 &session,
                                 &playback_state,
                                 &song_store,
                                 &loop_state,
-                                |t| install_plugin(t.ensure_track(track), slot, plugin),
+                                |t| install_plugin(t.ensure_track(track), slot, plugin, sr, mf),
                             );
                             if let Err(e) = result {
                                 tracing::error!(error = ?e, track, ?slot, "failed to install plugin");
                             } else {
-                                let _ = evt_tx.send(PluginEvent::SlotPluginLoaded {
-                                    track,
-                                    slot,
-                                    id: loaded_id,
-                                    name: loaded_name,
-                                });
+                                // A new instance landed; mint its
+                                // plugin_id, create its ProcessData
+                                // shmem, drop any stale shmem from a
+                                // previous plugin in the same slot,
+                                // then notify daw_gui (which forwards
+                                // the shmem id to daw_audio).
+                                if let Some(old_pid) = plugin_lookup.remove(&(track, slot)) {
+                                    plugin_shmems.remove(&old_pid);
+                                }
+                                let new_plugin_id = next_plugin_id;
+                                next_plugin_id += 1;
+                                let shmem_id = format!(
+                                    "daw_01_pd_{plugin_host_pid}_{new_plugin_id}"
+                                );
+                                match common::process_data::ProcessDataHandle::create(
+                                    &shmem_id,
+                                ) {
+                                    Ok(handle) => {
+                                        let pd_ptr = handle.ptr();
+                                        plugin_shmems.insert(new_plugin_id, handle);
+                                        plugin_lookup.insert((track, slot), new_plugin_id);
+                                        loaded_id_for_slot.insert((track, slot), plugin_id.clone());
+
+                                        // Capture the freshly-installed
+                                        // plugin pointer in a borrow
+                                        // scope that ends before any
+                                        // other use of `tracks`.
+                                        let plugin_ptr_raw: Option<
+                                            *mut (dyn LoadedPlugin + 'static),
+                                        > = {
+                                            let opt = tracks
+                                                .tracks
+                                                .plugin_at_mut(track, slot);
+                                            opt.map(|p| {
+                                                // SAFETY: the Box that
+                                                // owns this trait
+                                                // object lives in
+                                                // `tracks.chains` and is
+                                                // only dropped via
+                                                // `tracks.mutate`, which
+                                                // stops the audio thread
+                                                // before tearing down a
+                                                // chain. Worker
+                                                // dispatches always
+                                                // synchronise via the
+                                                // event handshake, so
+                                                // every read happens
+                                                // while the pointer is
+                                                // still valid.
+                                                let r: &mut dyn LoadedPlugin = p;
+                                                let raw: *mut dyn LoadedPlugin = r;
+                                                unsafe {
+                                                    std::mem::transmute::<
+                                                        *mut dyn LoadedPlugin,
+                                                        *mut (dyn LoadedPlugin + 'static),
+                                                    >(raw)
+                                                }
+                                            })
+                                        };
+                                        if let Some(p) = plugin_ptr_raw {
+                                            publish_plugin_registry(
+                                                &plugin_registry,
+                                                new_plugin_id,
+                                                Some(PluginEntry {
+                                                    plugin: PluginPtr(p),
+                                                    process_data: pd_ptr,
+                                                }),
+                                            );
+                                        }
+                                        let _ = evt_tx.send(PluginEvent::SlotPluginLoaded {
+                                            track,
+                                            slot,
+                                            id: loaded_id,
+                                            name: loaded_name,
+                                            plugin_id: new_plugin_id,
+                                            shmem_id,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = ?e,
+                                            new_plugin_id,
+                                            "failed to create ProcessData shmem"
+                                        );
+                                    }
+                                }
                             }
                         }
                         Err(e) => {
@@ -461,6 +661,10 @@ fn plugin_main_loop(
                             }
                         },
                     );
+                    if let Some(removed_pid) = plugin_lookup.remove(&(track, slot)) {
+                        plugin_shmems.remove(&removed_pid);
+                        publish_plugin_registry(&plugin_registry, removed_pid, None);
+                    }
                 }
                 PluginCommand::MoveSlot { track, from, to } => {
                     let _ = tracks.mutate(
@@ -684,10 +888,28 @@ fn plugin_main_loop(
 
 /// Place `plugin` into the slot, replacing any previous occupant. Audio
 /// thread is stopped by the caller (via `TracksHandle::mutate`).
-fn install_plugin(chain: &mut Chain, slot: PluginSlot, plugin: Box<dyn LoadedPlugin>) {
+fn install_plugin(
+    chain: &mut Chain,
+    slot: PluginSlot,
+    mut plugin: Box<dyn LoadedPlugin>,
+    sample_rate: u32,
+    max_frames: u32,
+) {
+    // A2: the legacy audio thread used to call activate / start_processing
+    // in its prologue. With the audio engine driving plugin.process() via
+    // the process_server worker pool, the plugin must be in the started
+    // state by the time it lands in the chain.
+    if let Err(e) = plugin.activate(f64::from(sample_rate), 64, max_frames) {
+        tracing::error!(error = ?e, ?slot, "plugin.activate failed");
+    }
+    if let Err(e) = plugin.start_processing() {
+        tracing::error!(error = ?e, ?slot, "start_processing failed; plugin may be silent");
+    }
     match slot {
         PluginSlot::Instrument => {
             if let Some(mut old) = chain.instrument.replace(plugin) {
+                old.stop_processing();
+                old.deactivate();
                 old.gui_destroy();
             }
         }
@@ -695,6 +917,8 @@ fn install_plugin(chain: &mut Chain, slot: PluginSlot, plugin: Box<dyn LoadedPlu
             let i = i as usize;
             if i < chain.fx_chain.len() {
                 if let Some(old) = chain.fx_chain.get_mut(i) {
+                    old.stop_processing();
+                    old.deactivate();
                     old.gui_destroy();
                 }
                 chain.fx_chain[i] = plugin;
@@ -706,6 +930,8 @@ fn install_plugin(chain: &mut Chain, slot: PluginSlot, plugin: Box<dyn LoadedPlu
             let i = i as usize;
             if i < chain.midi_fx_chain.len() {
                 if let Some(old) = chain.midi_fx_chain.get_mut(i) {
+                    old.stop_processing();
+                    old.deactivate();
                     old.gui_destroy();
                 }
                 chain.midi_fx_chain[i] = plugin;
@@ -720,6 +946,8 @@ fn remove_plugin(chain: &mut Chain, slot: PluginSlot) {
     match slot {
         PluginSlot::Instrument => {
             if let Some(mut old) = chain.instrument.take() {
+                old.stop_processing();
+                old.deactivate();
                 old.gui_destroy();
             }
         }
@@ -727,6 +955,8 @@ fn remove_plugin(chain: &mut Chain, slot: PluginSlot) {
             let i = i as usize;
             if i < chain.fx_chain.len() {
                 let mut old = chain.fx_chain.remove(i);
+                old.stop_processing();
+                old.deactivate();
                 old.gui_destroy();
             }
         }
@@ -734,6 +964,8 @@ fn remove_plugin(chain: &mut Chain, slot: PluginSlot) {
             let i = i as usize;
             if i < chain.midi_fx_chain.len() {
                 let mut old = chain.midi_fx_chain.remove(i);
+                old.stop_processing();
+                old.deactivate();
                 old.gui_destroy();
             }
         }
@@ -1083,6 +1315,47 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
                 height,
             });
         }
+        MainToChild::OpenWorkerPool {
+            n_workers,
+            worker_bridge_shmem_id,
+            wake_event_names,
+            done_event_names,
+        } => {
+            tracing::info!(
+                n_workers,
+                shmem = %worker_bridge_shmem_id,
+                "received OpenWorkerPool"
+            );
+            plugin.send(PluginCommand::OpenWorkerPool {
+                n_workers,
+                worker_bridge_shmem_id,
+                wake_event_names,
+                done_event_names,
+            });
+        }
+        MainToChild::CloseWorkerPool => {
+            tracing::info!("received CloseWorkerPool");
+            plugin.send(PluginCommand::CloseWorkerPool);
+        }
+        // OpenPluginShmem / ClosePluginShmem flow daw_gui → daw_audio,
+        // not into the plugin host (the plugin host is the *creator* of
+        // the shmem and already owns the handle in `plugin_shmems`).
+        // We log if these arrive here just to flag a routing bug.
+        MainToChild::OpenPluginShmem { plugin_id, shmem_id, track, slot } => {
+            tracing::warn!(
+                plugin_id,
+                shmem = %shmem_id,
+                track,
+                ?slot,
+                "OpenPluginShmem reached plugin_host (should be daw_audio only)"
+            );
+        }
+        MainToChild::ClosePluginShmem { plugin_id } => {
+            tracing::warn!(
+                plugin_id,
+                "ClosePluginShmem reached plugin_host (should be daw_audio only)"
+            );
+        }
         other => {
             tracing::info!(?other, "received (no handler)");
         }
@@ -1098,8 +1371,32 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
 /// to the spec). The pointer is a trait-object fat pointer (data +
 /// vtable) so the audio thread can call `LoadedPlugin` methods against
 /// whichever backend — CLAP or VST3 — is behind the slot.
-struct PluginPtr(*mut (dyn LoadedPlugin + 'static));
+pub struct PluginPtr(pub *mut (dyn LoadedPlugin + 'static));
 unsafe impl Send for PluginPtr {}
+// `Sync` is the contract that the plugin-main thread and the
+// process-server worker that owns this plugin's slot won't touch the
+// instance simultaneously. The plugin-main thread restarts the worker
+// pool whenever it mutates the chain (load/remove/swap), so a plugin
+// pointer is only ever accessed by one thread at a time.
+unsafe impl Sync for PluginPtr {}
+
+/// Per-plugin process-server entry. `plugin` is the trait-object pointer
+/// the worker calls `process()` on; `process_data` is the shared-memory
+/// `ProcessData` slot the audio engine wrote inputs into. The pair lives
+/// in `plugin_registry` keyed by `plugin_id`.
+pub struct PluginEntry {
+    pub plugin: PluginPtr,
+    pub process_data: *mut common::process_data::ProcessData,
+}
+unsafe impl Send for PluginEntry {}
+unsafe impl Sync for PluginEntry {}
+
+/// Lock-free `plugin_id` → `PluginEntry` lookup the worker pool reads
+/// during dispatch. The plugin-main thread publishes a fresh `Vec` on
+/// every plugin add / remove via `ArcSwap::store`; old snapshots stay
+/// valid until the last worker drops its `Guard`.
+pub type PluginRegistry =
+    std::sync::Arc<arc_swap::ArcSwap<Vec<Option<PluginEntry>>>>;
 
 /// Per-track signal chain owned on the plugin-main thread. The audio thread
 /// receives raw pointer snapshots at spawn time (see [`AudioRouting`]).
@@ -1320,6 +1617,7 @@ struct TracksHandle {
     audio: Option<AudioThread>,
 }
 
+#[allow(dead_code)] // Retired with the legacy audio thread (A2).
 struct AudioThread {
     handle: Option<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
@@ -1342,50 +1640,48 @@ impl TracksHandle {
         self.tracks.plugin_at_mut(track, slot)
     }
 
-    /// Stop the audio thread, run `f` to mutate the tracks on the main
-    /// thread, and restart the audio thread with the new routing.
+    /// Apply `f` to the chains. The legacy audio thread used to stop
+    /// and restart around this call to swap raw plugin pointers safely;
+    /// with the audio engine driving plugin.process() through the
+    /// process_server worker pool (and `install_plugin` /
+    /// `remove_plugin` handling activate / start_processing for us)
+    /// the mutation is just a plain field update.
     fn mutate<F>(
         &mut self,
-        session: &AudioSession,
-        playback_state: &Arc<AtomicU8>,
-        song_store: &Arc<ArcSwapOption<Song>>,
-        loop_state: &Arc<AtomicBool>,
+        _session: &AudioSession,
+        _playback_state: &Arc<AtomicU8>,
+        _song_store: &Arc<ArcSwapOption<Song>>,
+        _loop_state: &Arc<AtomicBool>,
         f: F,
     ) -> Result<()>
     where
         F: FnOnce(&mut Tracks),
     {
-        self.stop_audio();
         f(&mut self.tracks);
-        self.start_audio(session, playback_state, song_store, loop_state)
+        Ok(())
     }
 
     fn stop_audio(&mut self) {
-        let Some(mut at) = self.audio.take() else {
-            return;
-        };
-        at.shutdown.store(true, Ordering::Release);
-        let _ = at.request_sem.release();
-        if let Some(handle) = at.handle.take()
-            && handle.join().is_err()
-        {
-            tracing::error!("audio thread panicked");
-        }
-        // Safe to touch plugins again now that the audio thread has exited.
-        for chain in self.tracks.chains.values_mut() {
-            for mfx in &mut chain.midi_fx_chain {
-                mfx.deactivate();
-            }
-            if let Some(inst) = chain.instrument.as_mut() {
-                inst.deactivate();
-            }
-            for fx in &mut chain.fx_chain {
-                fx.deactivate();
-            }
-        }
+        // A2: the legacy audio thread is retired. install_plugin /
+        // remove_plugin own activate / start_processing now, so this
+        // call is a no-op kept for IPC paths still calling it (export
+        // / shutdown). The audio engine in daw_audio drives plugin
+        // process via the process_server worker pool.
     }
 
     fn start_audio(
+        &mut self,
+        _session: &AudioSession,
+        _playback_state: &Arc<AtomicU8>,
+        _song_store: &Arc<ArcSwapOption<Song>>,
+        _loop_state: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        // A2: see `stop_audio` comment. Legacy audio thread retired.
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn start_audio_legacy(
         &mut self,
         session: &AudioSession,
         playback_state: &Arc<AtomicU8>,

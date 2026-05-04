@@ -869,10 +869,12 @@ name = "daw_audio"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "common",
  "cpal",
  "tokio",
  "tracing",
+ "windows 0.61.3",
 ]
 
 [[package]]

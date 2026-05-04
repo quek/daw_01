@@ -45,30 +45,39 @@ A5 lyric UI     (gui_01 #015 要望 → 取り込み、A1 の前提)
 - **A1** は A2 + A5 完了後に本格実装。
 - **A3** は A2 完了後 (multi-track mix を offline render に流用)。
 
-### A2: multi-track / polyphonic 再生 [優先度 1 — 基盤]
+### A2: 責務分担正常化 + track-parallel スレッドプール化 [優先度 1 — 基盤]
 
-**現状の制約**: `daw_plugin_host` の audio thread が `song.tracks[0].clips[0]` 固定で、`active_notes` を 1 つだけ持ち単音再トリガ ([daw_plugin_host/src/audio.rs](daw_plugin_host/src/audio.rs))。
+詳細は [docs/plan_a2_audio_engine.md](plan_a2_audio_engine.md)。
 
-**やること**:
-1. **全 track loop**: audio thread で `song.tracks.iter()` を walk、各 track が個別の plugin instance を持つ
-2. **Polyphonic note state**: `active_notes` を `Vec<NoteState>` 化、同時刻の複数 NoteOn を保持
-3. **Per-track mix**: track 単位の f32 buffer を確保 (RT スレッドでの allocation 禁止 — `activate` 時に事前確保)、master へ sum
-4. **Volume / pan / mute / solo を mix に反映** (現状 schema にあるが audio に無接続)
-5. **Plugin host のスレッド分離**: track 単位で `Plugin` を持つので main-thread でのライフサイクルを track ごとに直列化
+**やったこと (PR1-7、 build / clippy clean)**:
 
-**主な変更ファイル**:
-- [daw_plugin_host/src/audio.rs](daw_plugin_host/src/audio.rs) (audio thread の全面書換)
-- [daw_plugin_host/src/host.rs](daw_plugin_host/src/host.rs) (plugin instance map: `track_id → Plugin`)
-- [daw_audio/src/engine.rs](daw_audio/src/engine.rs) (master mix が plugin_host から受ける format 変更を吸収)
+1. **責務分担の正常化** — DESIGN.md の規定どおり `daw_audio = シーケンサー / mixer / オーディオ出力`、`daw_plugin_host = プラグインのロード / process` に整理。 sing_like_coding 流の handshake-driven に書き換え
+2. **新しい IPC layer (per-plugin shmem + per-worker event)** — `common::process_data::ProcessData` (16 KB / plugin)、`common::worker_bridge::WorkerBridge` (worker_task 配列)、 Win32 named auto-reset events を per-worker pair で
+3. **track-parallel スレッドプール (両プロセス N worker、 1:1 ペア)** —
+   - `daw_audio::audio_worker::AudioWorkerPool`: master + N worker が work-stealing カウンタで track を fan-out → master が `reduce_master` で serial 累積 (race 回避)
+   - `daw_plugin_host::process_server::WorkerPool`: 各 worker が wake event 待ち → `worker_bridge.worker_task[i]` で plugin_id 受信 → `plugin.process()` 呼び出し → done event signal
+4. **plugin_id registry** — plugin_host が SetSlotPlugin で plugin_id 発行 + ProcessData shmem create + raw plugin pointer を `Arc<ArcSwap<Vec<Option<PluginEntry>>>>` に publish。 daw_audio が `slot_to_plugin_id` map で (track, slot) → plugin_id を引いて dispatch
+5. **TIME_CRITICAL priority** — 両プロセスの worker thread が `SetThreadPriority(THREAD_PRIORITY_TIME_CRITICAL)` で起動
 
-**受け入れ基準**:
+**受け入れ基準** (まだ実機テスト未確認、 次の作業):
 - 2 トラック以上に別 instrument を載せて同時再生で音が混ざる
-- 1 clip 内に同時刻 NoteOn を 2 つ以上配置 → 両方鳴る
 - track の `muted` / `solo` トグルが即座に反映
 - track の `volume` / `pan` 変更で master 出力が変わる
-- `cargo clippy --workspace -- -D warnings` clean
+- `cargo clippy --workspace -- -D warnings` clean ✅
 
-着手時 `docs/plan_a2_multi_track.md` を切り出し検討。
+**追加で完了 (旧 audio thread 撤去 / mixer 反映)**:
+
+- `SetTrackVolume / Pan / Muted / Solo` を daw_audio が受信 → ArcSwap で Song を新スナップショットに差し替え → 次の buffer から process_track が新 volume/pan で動く ([daw_audio/src/main.rs](../daw_audio/src/main.rs) の `update_song_track`)
+- `SetVocalAudio` を daw_audio が受信 → engine の `vocal_store: HashMap<u32, Arc<ArcSwapOption<VocalAudio>>>` に hot-swap → process_track_owned が instrument の無い track で再生
+- 旧 daw_plugin_host audio thread を **de facto 撤去**: `TracksHandle::mutate / start_audio / stop_audio` を no-op 化、`install_plugin` / `remove_plugin` が `activate / start_processing / stop_processing / deactivate` を直接呼ぶ。 `run_audio` / `collect_events_for_buffer` / `start_audio_legacy` などは dead code として残置 (`#[allow(dead_code)]`)、 完全削除は別 PR で
+
+**残タスク (M1 完成までに別 PR で実施)**:
+
+1. **smoke test**: `cargo run -p daw_gui` で 1 instrument plugin を読み込んで音が出るか実機確認。 まだ未テスト
+2. **`export_wav_offline` の修復 / daw_audio への移管**: 旧 audio thread の stop/start に依存していたので、 mutate を no-op 化した今は動作しない。 daw_audio 側で offline render を再実装する必要
+3. **旧コードの完全削除** (`run_audio`, `collect_events_for_buffer`, `Tracks::params/vocal`, `TrackAudioParams`, `VocalAudio`, `PerTrackState`, `start_audio_legacy`, `AudioThread`, `TrackRouting`, `AudioRouting`, `PluginPtr` redundancy 等で 数百〜数千行)
+4. **MMCSS** (`AvSetMmThreadCharacteristicsW("Pro Audio")`)、 **CLAP `thread_check` ext** の host 側実装、 **assert_no_alloc** debug feature
+5. **動的 track 増減**: 現状 LoadSong 時に Song 全体を更新するパターン。 GUI 操作中 (例えば AddTrack) で routing が即時更新されるかは smoke test で確認
 
 ### A6: tempo / time_sig 変更 UI [優先度 2 — 独立 / 軽量]
 
@@ -230,3 +239,4 @@ A5 lyric UI     (gui_01 #015 要望 → 取り込み、A1 の前提)
 | 2026-05-04 | a2117cb | chore  | .gitignore に /.claude/scheduled_tasks.lock を追加 |
 | 2026-05-04 | af44c46 | M13 取り込み | gui_01 #014 (M13 Phase 55) を取り込み — アレンジビュー小節番号 ruler + ピアノロール ruler 領域 + time_sig 対応 grid |
 | 2026-05-04 | 12be490 | Phase 0 | gui_01 #014 を Resolved 化、archive へ移動 |
+| 2026-05-04 | (uncommitted) | A2 PR1-7 | 責務分担正常化 + track-parallel スレッドプール化 (build/clippy clean、 実機 smoke test 未): plan_a2_audio_engine.md 参照。 残 cleanup と smoke test は別 PR |
