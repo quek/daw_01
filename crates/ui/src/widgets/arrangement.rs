@@ -148,6 +148,9 @@ pub enum ArrangementEditRequest {
     DeleteTrack(u32),
     MoveTrackUp(u32),
     MoveTrackDown(u32),
+    /// M10 Phase 46: track header drag&drop による並び替え。`order` は新順での `track.id` 列。
+    /// `MoveTrackUp/Down` は keep (button / keyboard 用)、`ReorderTracks` は drag&drop 用。
+    ReorderTracks(Vec<u32>),
     ToggleTrackMute(u32),
     ToggleTrackSolo(u32),
     SetLoopRange { start: f64, end: f64 },
@@ -169,6 +172,8 @@ pub struct ArrangementResponse {
     /// 各 track header の rect (app 側で `context_menu_for` / rename overlay を重ねる用)。
     pub track_header_rects: Vec<(u32, Rect)>,
     pub ruler_rect: Rect,
+    /// M10 Phase 46: drag 中の track id (`Some` なら header reorder drag セッションが進行中)。
+    pub reordering: Option<u32>,
 }
 
 impl Default for ArrangementResponse {
@@ -183,6 +188,7 @@ impl Default for ArrangementResponse {
             clicked_at_track_beat: None,
             track_header_rects: Vec::new(),
             ruler_rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            reordering: None,
         }
     }
 }
@@ -222,6 +228,12 @@ pub struct ArrangementStyle {
     pub resize_handle_px: f32,
     pub mute_button: ToggleButtonStyle,
     pub solo_button: ToggleButtonStyle,
+    /// M10 Phase 46: track header drag&drop 時に drop 位置 (target row の上 edge) に描く横 line の色。
+    pub reorder_drop_indicator: Color,
+    /// drop indicator の縦幅 (px)。
+    pub reorder_drop_indicator_h: f32,
+    /// drag 中 row 複製の不透明度 (`0.0..1.0`、`1.0` で完全不透明)。RGB は元 row 色 (selected/header) を使う。
+    pub reorder_drag_alpha: f32,
 }
 
 impl Default for ArrangementStyle {
@@ -281,6 +293,9 @@ impl Default for ArrangementStyle {
             resize_handle_px: 4.0,
             mute_button,
             solo_button,
+            reorder_drop_indicator: Color::rgb(0.50, 0.85, 1.0),
+            reorder_drop_indicator_h: 2.0,
+            reorder_drag_alpha: 0.6,
         }
     }
 }
@@ -400,6 +415,96 @@ fn px_to_beat(px: f32, lanes_x: f32, lanes_w: f32, view: ArrangementView) -> f64
     view.start_beat + f64::from(px - lanes_x) * beat_per_px
 }
 
+/// M10 Phase 46: drag 中の `mouse_y` から **drop target index** (anchor 抜き取り後に挿入する位置) を計算。
+///
+/// `header_top` は header_pane.y、`track_top` は view scroll。`row_h <= 0` または `n_tracks == 0` で `0` を返す。
+/// 返り値は `0..n_tracks` (= `Vec::insert` で渡せる範囲、anchor を除いた「挿入位置」semantics)。
+///
+/// アルゴリズム: `mouse_y` から row index を計算し (上端で 0、下端で n_tracks に clamp)、
+/// row 中央線より上で hover → その row の前、下で hover → その row の後に挿入。
+/// anchor index 自身に hover の場合は anchor index を返す (no-op)。
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn compute_reorder_target_index(
+    anchor_index: usize,
+    mouse_y: f32,
+    header_top: f32,
+    track_top: f32,
+    row_h: f32,
+    n_tracks: usize,
+) -> usize {
+    if n_tracks == 0 || row_h <= 0.0 {
+        return 0;
+    }
+    let local = mouse_y - header_top + track_top;
+    if local <= 0.0 {
+        return 0;
+    }
+    // local / row_h を「row 内 fractional 位置」付きで取り、中央 (0.5) より上下で挿入位置を判定。
+    let raw = local / row_h;
+    let idx = raw as usize;
+    let frac = raw - raw.floor();
+    // 中央線より下 → 次の row の前に挿入
+    let target_unbounded = if frac >= 0.5 { idx + 1 } else { idx };
+    let target_u = target_unbounded.min(n_tracks);
+    // anchor 抜き取り後の semantics: anchor 自身またはその直後 (= anchor_index, anchor_index+1) は no-op。
+    if target_u == anchor_index || target_u == anchor_index + 1 {
+        return anchor_index;
+    }
+    // anchor より後の挿入は 1 詰めて semantics を合わせる (Vec::remove(anchor) → Vec::insert(target-1))。
+    if target_u > anchor_index + 1 {
+        target_u - 1
+    } else {
+        target_u
+    }
+}
+
+/// M10 Phase 46: anchor を抜き取って target に挿入した新順 `Vec<u32>` を返す。
+/// `anchor_index >= ids.len()` または `target_index > ids.len()-1` (after remove) でも安全に clamp。
+#[must_use]
+pub fn apply_reorder(ids: &[u32], anchor_index: usize, target_index: usize) -> Vec<u32> {
+    if ids.is_empty() || anchor_index >= ids.len() {
+        return ids.to_vec();
+    }
+    let mut v: Vec<u32> = ids.to_vec();
+    let id = v.remove(anchor_index);
+    let insert_at = target_index.min(v.len());
+    v.insert(insert_at, id);
+    v
+}
+
+/// track header 1 行内のレイアウト (Name button + 5 small buttons + drop indicator)。
+/// `name_rect` (= drag start zone & text area)、`buttons` (= [M, S, Up, Dn, Del])、`inner` (padded row)。
+struct HeaderRowLayout {
+    inner: Rect,
+    name_rect: Rect,
+    buttons: [Rect; 5],
+}
+
+#[allow(clippy::similar_names)]
+fn header_row_layout(row: Rect) -> HeaderRowLayout {
+    let pad = 4.0_f32;
+    let inner = Rect {
+        x: row.x + pad,
+        y: row.y + pad,
+        w: (row.w - pad * 2.0).max(2.0),
+        h: (row.h - pad * 2.0).max(2.0),
+    };
+    let btn_h = inner.h.min(20.0);
+    let small = 22.0_f32;
+    let gap = 2.0_f32;
+    let total_right = small * 5.0 + gap * 5.0;
+    let name_w = (inner.w - total_right).max(20.0);
+    let name_rect = Rect { x: inner.x, y: inner.y, w: name_w, h: btn_h };
+    let mut x_cursor = inner.x + name_w + gap;
+    let mut buttons = [Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }; 5];
+    for slot in &mut buttons {
+        *slot = Rect { x: x_cursor, y: inner.y, w: small, h: btn_h };
+        x_cursor += small + gap;
+    }
+    HeaderRowLayout { inner, name_rect, buttons }
+}
+
 // ============================================================
 // Internal state
 // ============================================================
@@ -441,10 +546,21 @@ struct LoopDragSession {
     last_mouse_x: f32,
 }
 
+/// M10 Phase 46: track header drag&drop による reorder セッション。
+#[derive(Clone, Copy, Debug)]
+struct TrackReorderSession {
+    anchor_track_id: u32,
+    anchor_index: usize,
+    anchor_mouse_y: f32,
+    /// drag 中の最終 mouse y 位置 (release frame の `pointer.pos` に頼らない保険、`ClipDragSession.last_mouse` と同理由)。
+    last_mouse_y: f32,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ArrangementState {
     clip_drag: Option<ClipDragSession>,
     loop_drag: Option<LoopDragSession>,
+    track_reorder: Option<TrackReorderSession>,
 }
 
 // ============================================================
@@ -903,10 +1019,34 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     last_mouse_x: px,
                 });
             }
+            // M10 Phase 46: track header drag (reorder) を press で検出。
+            // header_pane 内 + Name button area を含む row + M/S/Up/Dn/Del button rect 非 hit のとき start。
+            // 16px 未満 drag は release で click 格下げ (= button_at の SelectTrack / ↑/↓ button が代替)。
+            if header_w > 0.0
+                && header_pane.contains(px, py)
+                && let Some(idx) =
+                    track_index_from_y(py, header_pane.y, view.track_top, view.track_row_h)
+                && let Some(t) = tracks.get(idx)
+            {
+                let row_y = header_pane.y - view.track_top + idx as f32 * view.track_row_h;
+                let row =
+                    Rect { x: header_pane.x, y: row_y, w: header_pane.w, h: view.track_row_h };
+                let layout = header_row_layout(row);
+                let in_small_button = layout.buttons.iter().any(|b| b.contains(px, py));
+                if !in_small_button {
+                    let state: &mut ArrangementState = self.widget_state(wid);
+                    state.track_reorder = Some(TrackReorderSession {
+                        anchor_track_id: t.id,
+                        anchor_index: idx,
+                        anchor_mouse_y: py,
+                        last_mouse_y: py,
+                    });
+                }
+            }
         }
 
         // ---- drag continue / release 検出 ----
-        // 1) drag 中なら毎フレーム last_mouse / last_mouse_x を update (release frame の
+        // 1) drag 中なら毎フレーム last_mouse / last_mouse_x / last_mouse_y を update (release frame の
         //    pointer.pos が winit によっては press 位置のままになる事があるため、widget
         //    state 側で drag 中の最終位置を確実に保持する)。
         if let Some((px, py)) = pointer.pos {
@@ -916,6 +1056,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
             if let Some(ref mut ld) = state.loop_drag {
                 ld.last_mouse_x = px;
+            }
+            if let Some(ref mut tr) = state.track_reorder {
+                tr.last_mouse_y = py;
             }
         }
         // 2) drag overlay 計算用に clone を取る (last_mouse を更新した後)。
@@ -953,6 +1096,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         } else {
             None
         };
+
+        // M10 Phase 46: track reorder session の overlay 用 clone と release 取り出し。
+        let track_reorder_session: Option<TrackReorderSession> = {
+            let state: &mut ArrangementState = self.widget_state(wid);
+            state.track_reorder
+        };
+        let track_reorder_release_raw: Option<TrackReorderSession> =
+            if pointer.primary_just_released {
+                let state: &mut ArrangementState = self.widget_state(wid);
+                state.track_reorder.take()
+            } else {
+                None
+            };
 
         // drag overlay delta (last_mouse ベース、release と一貫)
         let beat_per_px = view.len_beats / f64::from(lanes.w.max(1.0));
@@ -998,6 +1154,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
         response.dragging = clip_drag_session.as_ref().map(|nd| nd.kind);
+        response.reordering = track_reorder_session.map(|tr| tr.anchor_track_id);
 
         // ---- cursor ----
         // drag 中 / hover 中の clip 上 / それ以外で arrangement 内なら明示的に Default
@@ -1008,6 +1165,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => CursorIcon::EwResize,
             };
             self.set_cursor(cur);
+        } else if response.reordering.is_some() {
+            self.set_cursor(CursorIcon::Move);
         } else if let Some(zone) = response.hovered_zone {
             let cur = match zone {
                 ClipDragKind::Move => CursorIcon::Move,
@@ -1042,6 +1201,22 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let selected_set: HashSet<ClipKey> = selected_clips.iter().copied().collect();
         let drag_overlay_clone = clip_drag_overlay.clone();
         let loop_preview_clone = loop_drag_preview_range;
+        let header_pane_copy = header_pane;
+        // M10 Phase 46: track reorder の drag preview に必要な情報 (anchor index / 現在 mouse_y / target idx)。
+        // dist >= 16px のときのみ overlay 描画 (短 click 中は静止 = button click と区別がつかないため UI ノイズ)。
+        let reorder_overlay: Option<(TrackReorderSession, usize)> = track_reorder_session
+            .filter(|tr| (tr.last_mouse_y - tr.anchor_mouse_y).abs() >= 16.0)
+            .map(|tr| {
+                let target = compute_reorder_target_index(
+                    tr.anchor_index,
+                    tr.last_mouse_y,
+                    header_pane.y,
+                    view.track_top,
+                    view.track_row_h,
+                    tracks.len(),
+                );
+                (tr, target)
+            });
 
         self.heavy(("arrangement_inner", &id), move |hctx| {
             // === cached: viewport_key 一致時 skip ===
@@ -1091,6 +1266,34 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     lanes.y + lanes.h,
                     style_copy.playhead_color,
                     style_copy.playhead_width_px,
+                );
+            }
+
+            // === M10 Phase 46: track reorder drop indicator + dragging row preview ===
+            if let Some((tr, target_idx)) = reorder_overlay {
+                #[allow(clippy::cast_precision_loss)]
+                let indicator_y = header_pane_copy.y - view_copy.track_top
+                    + target_idx as f32 * view_copy.track_row_h;
+                push_filled_rect(
+                    hctx,
+                    Rect {
+                        x: header_pane_copy.x,
+                        y: indicator_y - style_copy.reorder_drop_indicator_h * 0.5,
+                        w: header_pane_copy.w + lanes.w,
+                        h: style_copy.reorder_drop_indicator_h,
+                    },
+                    style_copy.reorder_drop_indicator,
+                );
+                // dragging row 半透明複製 (header_pane 領域、last_mouse_y 中心)。
+                let row_h = view_copy.track_row_h;
+                let drag_y = (tr.last_mouse_y - row_h * 0.5)
+                    .clamp(header_pane_copy.y, header_pane_copy.y + header_pane_copy.h - row_h);
+                let alpha = style_copy.reorder_drag_alpha.clamp(0.0, 1.0);
+                let base_rgb = style_copy.track_selected_bg;
+                push_filled_rect(
+                    hctx,
+                    Rect { x: header_pane_copy.x, y: drag_y, w: header_pane_copy.w, h: row_h },
+                    Color::rgba(base_rgb.r, base_rgb.g, base_rgb.b, alpha),
                 );
             }
         });
@@ -1245,6 +1448,28 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.push_edit(make_edit(ArrangementEditRequest::SetLoopRange { start, end }));
         }
 
+        // ---- M10 Phase 46: track reorder release → ReorderTracks ----
+        // dist < 16px → click 格下げ (button_at の SelectTrack / Rename trigger に任せる)
+        // dist >= 16px → 新順を計算して発行
+        if let Some(tr) = track_reorder_release_raw {
+            let dy = (tr.last_mouse_y - tr.anchor_mouse_y).abs();
+            if dy >= 16.0 {
+                let target = compute_reorder_target_index(
+                    tr.anchor_index,
+                    tr.last_mouse_y,
+                    header_pane.y,
+                    view.track_top,
+                    view.track_row_h,
+                    tracks.len(),
+                );
+                if target != tr.anchor_index {
+                    let cur_ids: Vec<u32> = tracks.iter().map(|t| t.id).collect();
+                    let new_order = apply_reorder(&cur_ids, tr.anchor_index, target);
+                    self.push_edit(make_edit(ArrangementEditRequest::ReorderTracks(new_order)));
+                }
+            }
+        }
+
         // ---- Shift+drag rect select (lanes 内で加算) ----
         let drag_rect_wid = wid.child(b"rect_select");
         let shift_rect_active = {
@@ -1335,36 +1560,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     self.panel(("arr_thbg", t.id), row, style.header_bg, 0.0);
                 }
 
-                let pad = 4.0_f32;
-                let inner = Rect {
-                    x: row.x + pad,
-                    y: row.y + pad,
-                    w: (row.w - pad * 2.0).max(2.0),
-                    h: (row.h - pad * 2.0).max(2.0),
-                };
-                let btn_h = inner.h.min(20.0);
-                let small = 22.0_f32;
-                let m_w = small;
-                let s_w = small;
-                let up_w = small;
-                let dn_w = small;
-                let del_w = small;
-                let gap = 2.0_f32;
-                // 順序: [Name (残り)] [M] [S] [Up] [Dn] [Del]
-                let total_right = m_w + s_w + up_w + dn_w + del_w + gap * 5.0;
-                let name_w = (inner.w - total_right).max(20.0);
-                let name_rect = Rect { x: inner.x, y: inner.y, w: name_w, h: btn_h };
-                let mut x_cursor = inner.x + name_w + gap;
-                let m_rect = Rect { x: x_cursor, y: inner.y, w: m_w, h: btn_h };
-                x_cursor += m_w + gap;
-                let s_rect = Rect { x: x_cursor, y: inner.y, w: s_w, h: btn_h };
-                x_cursor += s_w + gap;
-                let up_rect = Rect { x: x_cursor, y: inner.y, w: up_w, h: btn_h };
-                x_cursor += up_w + gap;
-                let dn_rect = Rect { x: x_cursor, y: inner.y, w: dn_w, h: btn_h };
-                x_cursor += dn_w + gap;
-                let del_rect = Rect { x: x_cursor, y: inner.y, w: del_w, h: btn_h };
-
+                let layout = header_row_layout(row);
+                let inner = layout.inner;
+                let name_rect = layout.name_rect;
+                let [m_rect, s_rect, up_rect, dn_rect, del_rect] = layout.buttons;
+                let _ = inner;
                 let button_zones: [Rect; 6] =
                     [name_rect, m_rect, s_rect, up_rect, dn_rect, del_rect];
 
@@ -1648,6 +1848,76 @@ mod tests {
         assert!((l - 2.0).abs() < 1e-9);
         // 0 + 5 = 5 → clamped to 2 (tracks=3 → max idx = 2)
         assert_eq!(idx, 2);
+    }
+
+    // M10 Phase 46: track reorder
+    #[test]
+    fn compute_reorder_target_above_first_row() {
+        // 上端外 → 0
+        assert_eq!(compute_reorder_target_index(2, -10.0, 0.0, 0.0, 32.0, 5), 0);
+        assert_eq!(compute_reorder_target_index(2, 0.0, 0.0, 0.0, 32.0, 5), 0);
+    }
+
+    #[test]
+    fn compute_reorder_target_below_last_row() {
+        // 下端外 → n_tracks (clamp)、anchor=0 で n=5 → target_u=5、anchor 後なので 5-1=4
+        assert_eq!(compute_reorder_target_index(0, 1000.0, 0.0, 0.0, 32.0, 5), 4);
+    }
+
+    #[test]
+    fn compute_reorder_target_self_or_next_returns_anchor() {
+        // anchor=2, mouse on row 2 → no-op = 2
+        // row 2 中央 = 32*2 + 16 = 80
+        assert_eq!(compute_reorder_target_index(2, 80.0, 0.0, 0.0, 32.0, 5), 2);
+        // anchor=2, mouse on row 2 中央より下 = 90 → target=3, anchor+1 → no-op = 2
+        assert_eq!(compute_reorder_target_index(2, 90.0, 0.0, 0.0, 32.0, 5), 2);
+    }
+
+    #[test]
+    fn compute_reorder_target_above_anchor_keeps_target() {
+        // anchor=4, row 1 中央 (40) → target_u=1 → anchor より前なので 1
+        assert_eq!(compute_reorder_target_index(4, 40.0, 0.0, 0.0, 32.0, 5), 1);
+        // anchor=4, row 0 上半分 (10) → target_u=0
+        assert_eq!(compute_reorder_target_index(4, 10.0, 0.0, 0.0, 32.0, 5), 0);
+    }
+
+    #[test]
+    fn compute_reorder_target_below_anchor_offsets_by_one() {
+        // anchor=0, row 3 中央 (32*3+16=112) → frac=0.5 → target_unbounded=4 → anchor 抜き後 [r1, r2, r3, r4] の
+        // 「row 3 と row 4 の間」= new index 3。target_u=4 > anchor+1=1 で 4-1=3。
+        assert_eq!(compute_reorder_target_index(0, 112.0, 0.0, 0.0, 32.0, 5), 3);
+        // anchor=1, mouse=144 → row 4.5 → target_unbounded=5 → clamp to 5 → 5-1=4
+        assert_eq!(compute_reorder_target_index(1, 144.0, 0.0, 0.0, 32.0, 5), 4);
+    }
+
+    #[test]
+    fn compute_reorder_target_with_track_top_scroll() {
+        // header_top=10 + track_top=16 (1/2 row 上にスクロール) + mouse_y=18 → local=24 → row 0.75 → frac>=0.5 → row 1
+        // anchor=3, target_u=1 → anchor より前 → 1
+        assert_eq!(compute_reorder_target_index(3, 18.0, 10.0, 16.0, 32.0, 5), 1);
+    }
+
+    #[test]
+    fn compute_reorder_target_zero_row_h_safe() {
+        assert_eq!(compute_reorder_target_index(0, 100.0, 0.0, 0.0, 0.0, 5), 0);
+        assert_eq!(compute_reorder_target_index(0, 100.0, 0.0, 0.0, 32.0, 0), 0);
+    }
+
+    #[test]
+    fn apply_reorder_basic() {
+        // [10, 20, 30, 40, 50] anchor=0 → target=2: [20, 30, 10, 40, 50]
+        assert_eq!(apply_reorder(&[10, 20, 30, 40, 50], 0, 2), vec![20, 30, 10, 40, 50]);
+        // anchor=4 → target=0: [50, 10, 20, 30, 40]
+        assert_eq!(apply_reorder(&[10, 20, 30, 40, 50], 4, 0), vec![50, 10, 20, 30, 40]);
+        // anchor=2 → target=2 (compute_reorder_target_index が anchor 自身を返した no-op semantics):
+        // remove(2)=30 → [10, 20, 40, 50]、insert(2, 30) → 元 array に戻る
+        assert_eq!(apply_reorder(&[10, 20, 30, 40, 50], 2, 2), vec![10, 20, 30, 40, 50]);
+    }
+
+    #[test]
+    fn apply_reorder_safe_on_oob() {
+        assert_eq!(apply_reorder(&[1, 2, 3], 5, 0), vec![1, 2, 3]); // anchor OOB
+        assert_eq!(apply_reorder(&[], 0, 0), Vec::<u32>::new()); // empty
     }
 
     #[test]

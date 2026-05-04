@@ -751,6 +751,23 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 mm.arr_view.data_generation += 1;
                 mm.last_action = format!("arr: MoveTrackDown {id}");
             }),
+            ArrangementEditRequest::ReorderTracks(order) => Edit::mutate(move |mm: &mut DawModel| {
+                let n = order.len();
+                // id → DawTrack の lookup table を作って、order 順で並べ直す。
+                // Vec::swap_remove で順次取り出すと O(n^2) になるが N_TRACKS=12 なので問題なし。
+                let mut new_tracks: Vec<DawTrack> = Vec::with_capacity(n);
+                for id in &order {
+                    if let Some(pos) = mm.arr_tracks.iter().position(|t| t.id == *id) {
+                        new_tracks.push(mm.arr_tracks.remove(pos));
+                    }
+                }
+                // order に含まれなかった track は末尾に keep (gui_01 widget が一部 id だけ送る semantics は
+                // 無いが、防御的に)。
+                new_tracks.append(&mut mm.arr_tracks);
+                mm.arr_tracks = new_tracks;
+                mm.arr_view.data_generation += 1;
+                mm.last_action = format!("arr: ReorderTracks ({n})");
+            }),
             ArrangementEditRequest::ToggleTrackMute(id) => Edit::mutate(move |mm: &mut DawModel| {
                 if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == id) {
                     t.muted = !t.muted;

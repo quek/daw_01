@@ -199,6 +199,9 @@ fn main() {
                     ArrangementEditRequest::MoveTrackDown(_) => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
+                    ArrangementEditRequest::ReorderTracks(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
                     ArrangementEditRequest::ToggleTrackMute(_) => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
