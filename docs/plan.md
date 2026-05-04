@@ -20,19 +20,18 @@
 
 理由: piano_roll widget 化 (commit 52394b5) で 493 → 320 LOC、cache 統合・Shift+drag 等の挙動共通化のメリットを実証済み。同じパターンを arrangement / plugin_picker にも適用したい。
 
-## gui_01 側ロードマップ (#005-#009 受領済)
+## gui_01 側ロードマップ (#005-#010 全て受領済 / Phase 45a-45g merge 済)
 
 詳細 API は `docs/gui_01_conversation.md` 参照。実装順:
 
-| gui_01 phase | 内容 | daw_01 側の取り込み作業 |
-|---|---|---|
-| **45a** | `Ui::panel` + `Ui::panel_with_border` (#008) | 12 箇所の背景塗りを置換 |
-| **45b** | `Ui::toggle_button_at` (#009) | mixer の M/S を置換 |
-| **45c** | `PianoRollView` に `velocity_lane_h` + `playhead_beat` 追加 (breaking、#006) | PianoRollView 構築箇所更新、`draw_velocity_lane` / `draw_playhead` (-90 LOC) を削除 |
-| **45d** | `Ui::modal` + `Ui::list_view` (#007) | plugin_picker.rs を rewrite (171 → ~80 LOC) |
-| **45e** | `Ui::arrangement` widget (#005、4 sub-phase A-D) | arrangement_view.rs を rewrite (614 → ~150 LOC) |
-
-各 phase の merge は gui_01 conversation file 経由で通知される。
+| gui_01 phase | 内容 | daw_01 側の取り込み作業 | status |
+|---|---|---|---|
+| **45a** | `Ui::panel` + `Ui::panel_with_border` (#008) | 12 箇所の背景塗りを置換 | merged (gui_01) |
+| **45b** | `Ui::toggle_button_at` (#009) | mixer の M/S を置換 | merged (gui_01) |
+| **45c** | `PianoRollView` に `velocity_lane_h` + `playhead_beat` 追加 (breaking、#006) | PianoRollView 構築箇所更新、`draw_velocity_lane` / `draw_playhead` を削除 | **取り込み完了 (8aebba3)** |
+| **45d** | `Ui::modal` + `Ui::list_view` (#007) | plugin_picker.rs を rewrite (171 → ~80 LOC) | merged (gui_01) |
+| **45e** | `Ui::arrangement` widget (#005、4 sub-phase A-D) | arrangement_view.rs を rewrite (614 → ~150 LOC) | merged (gui_01) |
+| **45g** | `scroll_area` thumb drag 修正 (#010) | path 依存先で自動反映、追加コードなし | **対応完了 (再ビルドで解消)** |
 
 ## Phase 1: ローカル置換 (gui_01 merge 不要)
 
@@ -141,3 +140,5 @@ daw_01 側で別途組むもの:
 | 2026-05-03 | f280274 | Phase 1-2 | plugin_picker のリストを `scroll_area` 化 (truncation 廃止) |
 | 2026-05-03 | (gui_01) | Phase 0 | gui_01 から #005-#009 全件 [Replied] 受領、API 確定 |
 | 2026-05-03 | 2d6d70e | Phase 1-3 | mixer/inspector を scroll_area 化、scrollbar drag bug を gui_01 #010 で報告 |
+| 2026-05-04 | (gui_01) | Phase 0 | gui_01 から #006 (Phase 45c API) と #010 (Phase 45g 修正済) の返信受領 |
+| 2026-05-04 | 8aebba3 | Phase 3c | piano_roll の velocity / playhead を gui_01 widget 内蔵に移譲 (#006 解決、320 → ~210 LOC) |
