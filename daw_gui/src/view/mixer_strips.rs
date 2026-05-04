@@ -7,8 +7,8 @@
 //!   - Pan knob
 //!   - Volume fader (縦) + L/R peak meter
 
-use daw_ui_core::{Edit, LevelMeterStyle, MeterBallistic, Ui};
-use daw_ui_renderer::{Color, Rect, RectCommand};
+use daw_ui_core::{Edit, LevelMeterStyle, MeterBallistic, ToggleButtonStyle, Ui};
+use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent};
 
@@ -28,6 +28,28 @@ const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
 const COLOR_TEXT_DIM: Color = Color { r: 0.65, g: 0.68, b: 0.72, a: 1.0 };
 const COLOR_MUTE_HINT: Color = Color { r: 0.86, g: 0.27, b: 0.27, a: 1.0 };
 const COLOR_SOLO_HINT: Color = Color { r: 0.90, g: 0.78, b: 0.31, a: 1.0 };
+
+const TOGGLE_BUTTON_BASE: ToggleButtonStyle = ToggleButtonStyle {
+    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
+    on_color: Color { r: 0.30, g: 0.30, b: 0.36, a: 1.0 },
+    hint_band: None,
+    hint_band_h: 2.0,
+    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    border_width: 1.0,
+    radius: 4.0,
+    font_size: 12.0,
+    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+};
+
+const STYLE_MUTE: ToggleButtonStyle = ToggleButtonStyle {
+    hint_band: Some(COLOR_MUTE_HINT),
+    ..TOGGLE_BUTTON_BASE
+};
+
+const STYLE_SOLO: ToggleButtonStyle = ToggleButtonStyle {
+    hint_band: Some(COLOR_SOLO_HINT),
+    ..TOGGLE_BUTTON_BASE
+};
 
 const DB_MIN: f32 = -80.0;
 const DB_MAX: f32 = 6.0;
@@ -141,65 +163,31 @@ fn draw_strip(
     y += TOP_LABEL_H;
 
     if !is_master {
-        // M / S トグル (ボタン2本)
         let btn_w = (rect.w - pad * 2.0 - 4.0) * 0.5;
-        ui.button_at(
+        ui.toggle_button_at(
             ("mixer_strip_mute", layout_idx),
             "M",
             Rect { x: rect.x + pad, y, w: btn_w, h: TOGGLE_H },
-            move || {
+            muted,
+            &STYLE_MUTE,
+            move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::ToggleTrackMute(track_idx))
                 })
             },
         );
-        ui.button_at(
+        ui.toggle_button_at(
             ("mixer_strip_solo", layout_idx),
             "S",
             Rect { x: rect.x + pad + btn_w + 4.0, y, w: btn_w, h: TOGGLE_H },
-            move || {
+            solo,
+            &STYLE_SOLO,
+            move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::ToggleTrackSolo(track_idx))
                 })
             },
         );
-        // ステータスを色帯で示す。scroll で rect.x が変動するので cache key に
-        // x/y bits を含める。45b (Ui::toggle_button_at) merge で消える tech debt。
-        if muted {
-            let hint = Rect { x: rect.x + pad, y: y + TOGGLE_H - 2.0, w: btn_w, h: 2.0 };
-            ui.heavy(("mixer_strip_mute_hint", layout_idx), |hctx| {
-                hctx.cached((hint.x.to_bits(), hint.y.to_bits()), |hctx| {
-                    hctx.push_rect(RectCommand {
-                        rect: hint,
-                        fill: COLOR_MUTE_HINT,
-                        border: Color::TRANSPARENT,
-                        border_width: 0.0,
-                        radius: [0.0; 4],
-                        clip_rect: None,
-                    });
-                });
-            });
-        }
-        if solo {
-            let hint = Rect {
-                x: rect.x + pad + btn_w + 4.0,
-                y: y + TOGGLE_H - 2.0,
-                w: btn_w,
-                h: 2.0,
-            };
-            ui.heavy(("mixer_strip_solo_hint", layout_idx), |hctx| {
-                hctx.cached((hint.x.to_bits(), hint.y.to_bits()), |hctx| {
-                    hctx.push_rect(RectCommand {
-                        rect: hint,
-                        fill: COLOR_SOLO_HINT,
-                        border: Color::TRANSPARENT,
-                        border_width: 0.0,
-                        radius: [0.0; 4],
-                        clip_rect: None,
-                    });
-                });
-            });
-        }
         y += TOGGLE_H + 6.0;
 
         // Pan knob (-1..1 → 0..1)
