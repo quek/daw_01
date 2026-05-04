@@ -119,6 +119,14 @@ fn main() {
             let _ = ui.text_input("title2", &m.title, |new| {
                 Edit::mutate(move |m: &mut Model| m.title = new)
             });
+            // M11 Phase 52: text_input_at_focused (open 時自動 focus 版) も non-Clone Model で
+            // コンパイルする。
+            let _ = ui.text_input_at_focused(
+                "rename",
+                Rect { x: 0.0, y: 0.0, w: 200.0, h: 28.0 },
+                &m.title,
+                |new| Edit::mutate(move |m: &mut Model| m.title = new),
+            );
             // M9 Phase 43: debug_overlay も non-Clone Model でコンパイルする。
             ui.debug_overlay(Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 }, 5.5);
             // M9 Phase 41e: piano_roll widget が non-Clone Model でコンパイルする。

@@ -219,6 +219,7 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 | Phase | テーマ | 主な成果物 | 状態 |
 |---|---|---|---|
 | 51 | `Ui::reorderable_list` 新設 | **公開型** (`ReorderableListStyle` / `ReorderableListResponse` / `ReorderableListEditRequest::Reorder(Vec<usize>)`)、`Ui::reorderable_list<T, F, R>` method (scroll_area wrapper + drag session state + commit-by-release で Reorder 1 度発行)。**`drag_handle_w`** parameter 対応 (`0.0` で row 全体 drag = Bitwig 風、`> 0.0` で row 左端 N px だけ drag 起点 = Logic / Cubase 風グリップ、残り領域は row callback の button_at 等が消費可)。**drop indicator** 横 line (target 位置に row 全幅、viewport clamp 付き)。**dragging row 半透明背景** (`row_bg_dragging`)。**release frame optimistic preview** (`pending_order` を 1 frame 保持して新順序で描画、Edit 適用 1 frame 遅延の visual 揺れを抑える、arrangement Phase 50 と同パターン)。`apply_reorder` を **`<T: Clone>`** に generic 化 (既存 `&[u32]` caller は単相化で無修正、`reorderable_list` は `&[usize]` で利用)。pure helper `compute_reorder_target_index` (anchor + target index 計算、id 概念無し) はそのまま流用。`make_edit: Fn(...) -> Edit<M> + Clone + Send + Sync + 'static` (M10 Phase 49 の `Ui::arrangement` と同 trait bound、Undoable Edit の forward/inverse 2 closure に分配するため `Clone` 必要)。**unit test 7 件** (visible row 数 / virtualization / 短 release で click 格下げ / drag release で Reorder 発行 / drag_handle_w 範囲外 press 無視 / drag_handle_w 範囲内 press / 空 list)。**trybuild basic.rs に reorderable_list 呼び出し追加** (no-Clone Model 制約 CI 固定)。**daw_prototype Demo Dialog に Plugin Chain demo** 1 セクション追加 (list_view デモの下、5 plugin chain を drag で並び替え) — memory `feedback_use_new_abstractions.md` 「新抽象は次の機会に使う」原則。`crates/ui/src/widgets/reorderable_list.rs` 669 LOC (test 含む) | ✅ 完了 |
+| 52 | `Ui::text_input_at_focused` 新設 (daw_01 #013) | rename UI / inline edit の「メニュー → text_input 表示 → 即タイプ可能」(Logic / Bitwig / Cubase 慣習の F2 rename) を 1 関数で実現する `Ui::text_input_at_focused<F>(id, rect, text, on_change) -> TextInputResponse` を新設。`text_input_at` (既存) は不変 (breaking なし)。**初回 show 判定は frame counter なしに既存 `Scenegraph` の eviction 機構を活用**: `Scenegraph::contains(wid)` を pub method で出し、`Ui::was_widget_visible_last_frame(wid)` `pub(crate)` helper 経由で「前フレームに `with_widget_node` で描画されたか」を判定。`!was_visible_last_frame` のときに `set_focus(wid)` + `cursor_byte = text.len()` を実行 → caller 側の boolean flag 不要。完全に非表示 (フレーム飛ばし) → 戻ったときも再 focus される (= eviction で初回扱い)。**unit test 3 件** (初回 show で focus 取得 / 連続 visible では caller の手動 set_focus を上書きしない / 不可視 → 再表示で再 focus)。**trybuild basic.rs に呼び出し追加** (no-Clone Model 制約 CI 固定)。**daw_prototype の `arr_rename_just_started: bool` フィールド + 関連 boilerplate (BeginRenameTrack 2 箇所での set / overlay 描画箇所での `WidgetId::ROOT.child((b"text_input", &id))` 再現 + `set_focus`) を完全削除** し、`text_input_at_focused` 1 行に置換 — memory `feedback_pursue_best_practice` 「ユーザに workaround を強要する API は設計欠陥」と `feedback_use_new_abstractions` 「新抽象を次の機会に使う」を同時に満たす | ✅ 完了 |
 
 **設計判断**:
 
@@ -229,9 +230,9 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 
 **完了条件 (DoD)**:
 
-- ✅ Phase 51 完了
-- ✅ `cargo build --workspace` / `cargo test --workspace` (223 unit test、+7 件) / `cargo clippy --workspace --tests -- -D warnings` / `cargo test -p daw-ui-core --test no_clone_required` 全 ✅
-- 🔲 `cargo run --bin daw_prototype` で Demo Dialog → Plugin Chain reorder 動作確認 (user 側で実施)
+- ✅ Phase 51-52 完了
+- ✅ `cargo build --workspace` / `cargo test --workspace` (226 unit test、+10 件 = reorderable_list 7 + text_input 3) / `cargo clippy --workspace --tests -- -D warnings` / `cargo test -p daw-ui-core --test no_clone_required` 全 ✅
+- 🔲 `cargo run --bin daw_prototype` で Demo Dialog → Plugin Chain reorder + track header 右クリック → Rename → 即タイプ可能 (Phase 52) 動作確認 (user 側で実施)
 
 ---
 

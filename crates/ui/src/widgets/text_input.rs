@@ -262,6 +262,36 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         self.next_y += h + pad;
         resp
     }
+
+    /// M11 Phase 52 (daw_01 conversation #013): `text_input_at` と同じ挙動だが、widget が
+    /// 「前フレームに登場していなかった」場合に **自動でキーボードフォーカスを取得** +
+    /// cursor を text 末尾に置く。
+    ///
+    /// 用途: rename UI / inline edit の「メニュー → text_input 表示 → 即タイプ可能」
+    /// (Logic / Bitwig / Cubase 慣習の F2 rename) を 1 関数で実現する。
+    ///
+    /// 「初回 show」判定は internal Scenegraph (前フレーム登場 widget の eviction 機構)
+    /// を使う実装で、caller 側の boolean flag は不要。完全に非表示 (フレーム飛ばし) →
+    /// 戻ったときも再度 focus する。
+    pub fn text_input_at_focused<F>(
+        &mut self,
+        id: impl Hash,
+        rect: Rect,
+        text: &str,
+        on_change: F,
+    ) -> TextInputResponse
+    where
+        F: FnOnce(String) -> Edit<M>,
+    {
+        let wid = WidgetId::ROOT.child((b"text_input", &id));
+        if !self.was_widget_visible_last_frame(wid) {
+            // 初回 show (or 一度消えて再登場): 自動 focus + cursor を text 末尾へ
+            self.set_focus(wid);
+            let state: &mut TextInputState = self.widget_state(wid);
+            state.cursor_byte = text.len();
+        }
+        self.text_input_at(id, rect, text, on_change)
+    }
 }
 
 /// 等幅フォント (HackGen Console NF) の ASCII 文字幅 (= font_size / 2 = 14 / 2 = 7)。
@@ -374,5 +404,134 @@ fn draw_text_input<M: ?Sized + 'static>(
             line_width_px: 1.5,
             clip_rect: Some(rect),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! M11 Phase 52: `text_input_at_focused` のテスト群。
+    //! 「初回 show」判定が前フレームの Scenegraph 登場有無に基づくこと、再登場時に
+    //! 再 focus されること、連続 visible では caller の手動 blur を上書きしないこと
+    //! を確認する。
+
+    use daw_ui_platform::PhysicalSize;
+    use daw_ui_renderer::{Rect, Scene};
+
+    use crate::edit::Edit;
+    use crate::id::WidgetId;
+    use crate::input::FrameInput;
+    use crate::ui::UiHost;
+
+    /// `text_input_at_focused` が内部で計算する WidgetId と同じ式。テスト用 helper。
+    fn text_input_wid(id: &str) -> WidgetId {
+        WidgetId::ROOT.child((b"text_input", &id))
+    }
+
+    #[test]
+    fn focused_variant_takes_focus_on_first_show() {
+        // frame 1: text_input_at_focused 呼び出し → focus 取得
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.text_input_at_focused(
+                "rename",
+                Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
+                "abc",
+                |_new| Edit::mutate(|()| {}),
+            );
+        });
+
+        assert_eq!(
+            host.focused_widget(),
+            Some(text_input_wid("rename")),
+            "初回 show でキーボードフォーカスを取得"
+        );
+    }
+
+    #[test]
+    fn focused_variant_does_not_steal_focus_when_continuously_visible() {
+        // frame 1: text_input_at_focused 呼び出し → focus 取得
+        // frame 2: caller 側で別の widget に focus 移動 (set_focus 直接呼び)
+        //          → text_input_at_focused は連続 visible なので focus を奪い返さない
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let other_wid = WidgetId::ROOT.child(b"other_input");
+
+        // frame 1
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.text_input_at_focused(
+                "rename",
+                Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
+                "abc",
+                |_new| Edit::mutate(|()| {}),
+            );
+        });
+        assert_eq!(host.focused_widget(), Some(text_input_wid("rename")));
+        scene.clear();
+
+        // frame 2: caller 側で別 widget に focus 移動 + text_input_at_focused 連続呼び出し
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.set_focus(other_wid);
+            ui.text_input_at_focused(
+                "rename",
+                Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
+                "abc",
+                |_new| Edit::mutate(|()| {}),
+            );
+        });
+        assert_eq!(
+            host.focused_widget(),
+            Some(other_wid),
+            "連続 visible なら focus を奪い返さない (= caller の set_focus が勝つ)"
+        );
+    }
+
+    #[test]
+    fn focused_variant_re_focuses_after_invisible_frame() {
+        // frame 1: 表示 → focus 取得
+        // frame 2: 表示せず (= 不可視 → eviction)
+        // frame 3: 再表示 → 再度 focus 取得
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let other_wid = WidgetId::ROOT.child(b"other_input");
+
+        // frame 1: text_input_at_focused 表示 → focus
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.text_input_at_focused(
+                "rename",
+                Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
+                "abc",
+                |_new| Edit::mutate(|()| {}),
+            );
+        });
+        assert_eq!(host.focused_widget(), Some(text_input_wid("rename")));
+        scene.clear();
+
+        // frame 2: 表示なし (text_input_at_focused 呼び出さない) + 別 widget に focus 移動
+        // (この間に scenegraph eviction で text_input の entry は消える)
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.set_focus(other_wid);
+        });
+        assert_eq!(host.focused_widget(), Some(other_wid));
+        scene.clear();
+
+        // frame 3: 再表示 → 再 focus
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.text_input_at_focused(
+                "rename",
+                Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
+                "abc",
+                |_new| Edit::mutate(|()| {}),
+            );
+        });
+        assert_eq!(
+            host.focused_widget(),
+            Some(text_input_wid("rename")),
+            "不可視 → 再表示で再度 focus 取得 (= eviction で初回 show と同じ扱い)"
+        );
     }
 }

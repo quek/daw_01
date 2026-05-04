@@ -884,6 +884,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         self.edits.push(edit);
     }
 
+    /// M11 Phase 52: `wid` が前フレームの描画 (= `with_widget_node` 経由) に登場していたかを返す。
+    /// `text_input_at_focused` 等が「初回 show」判定に使う。
+    /// frame 末尾の `scenegraph.retain(&seen)` で eviction されるため、このフレーム途中で
+    /// 呼んだとき `true` ⇔ 「前フレームに登場した」。
+    pub(crate) fn was_widget_visible_last_frame(&self, wid: WidgetId) -> bool {
+        self.scenegraph.contains(wid)
+    }
+
     /// M4 Phase 11: per-widget の描画を input_hash でキャッシュ付き実行する。
     ///
     /// `input_hash` が前フレームと一致 → `draw_fn` を実行せず、前フレームに記録した

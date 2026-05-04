@@ -21,7 +21,7 @@ use daw_ui_core::{
     BarBeatGridStyle, ClipKey, DialogResult, Edit, FaderResponse, FileDialogFilter,
     InputAccumulator, LevelMeterStyle, ListViewStyle, MenuItemSpec, MeterBallistic, ModalStyle,
     Orientation, ReorderableListEditRequest, ReorderableListStyle, TimeMapping, TimeRulerStyle,
-    UiHost, ViewportState1D, WidgetId,
+    UiHost, ViewportState1D,
 };
 use daw_ui_platform::{AppEvent, AppHost, WindowBackend, winit_backend};
 use daw_ui_renderer::{Color, Rect, RectCommand, Renderer, Scene};
@@ -74,11 +74,10 @@ struct DawModel {
     arr_selected_clips: Vec<ClipKey>,
     arr_selected_track: Option<u32>,
     /// `BeginRenameTrack(id)` 受信時にセット。`Some(id)` 中は該当 track header 上に
-    /// `text_input_at` を重ね描画。Enter / blur / ESC で `None` に戻す。
+    /// `text_input_at_focused` を重ね描画 (M11 Phase 52 で `text_input_at` から差し替え、
+    /// 「初回 show 自動 focus」が widget 内蔵で boilerplate ゼロ)。Enter / blur / ESC で
+    /// `None` に戻す。
     arr_rename_target: Option<u32>,
-    /// rename 開始した最初のフレームを示すフラグ。`true` のフレームで `ui.set_focus()` を呼んで
-    /// text_input にプログラム的にフォーカスを与え、その後 `false` にリセットする。
-    arr_rename_just_started: bool,
     /// (M11 Phase 51) `Ui::reorderable_list` demo 用。Demo Dialog の plugin chain。
     /// drag&drop で並び替え、`ReorderableListEditRequest::Reorder(order)` で新順 index 列を受信。
     demo_chain: Vec<String>,
@@ -136,7 +135,6 @@ impl DawModel {
             arr_selected_clips: Vec::new(),
             arr_selected_track: None,
             arr_rename_target: None,
-            arr_rename_just_started: false,
             demo_chain: vec![
                 "MIDI Quantize".to_string(),
                 "Synth".to_string(),
@@ -854,7 +852,6 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
             }
             ArrangementEditRequest::BeginRenameTrack(id) => Edit::mutate(move |mm: &mut DawModel| {
                 mm.arr_rename_target = Some(id);
-                mm.arr_rename_just_started = true;
                 mm.last_action = format!("arr: BeginRenameTrack {id}");
             }),
             ArrangementEditRequest::DeleteTrack(id) => Edit::mutate(move |mm: &mut DawModel| {
@@ -963,7 +960,6 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
             match idx {
                 0 => ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
                     mm.arr_rename_target = Some(tid);
-                    mm.arr_rename_just_started = true;
                     mm.last_action = format!("arr: Rename {tid} (context)");
                 })),
                 1 => ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
@@ -1001,16 +997,6 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 w: (rect.w - pad * 2.0).max(20.0),
                 h: (rect.h - pad * 2.0).max(20.0),
             };
-            // 初回フレームで text_input にプログラム的に focus を与える (内部 wid は
-            // `WidgetId::ROOT.child((b"text_input", &id))` 規約)。
-            if m.arr_rename_just_started {
-                let text_input_wid =
-                    WidgetId::ROOT.child((b"text_input", &("arr_rename", rid)));
-                ui.set_focus(text_input_wid);
-                ui.push_edit(Edit::mutate(|mm: &mut DawModel| {
-                    mm.arr_rename_just_started = false;
-                }));
-            }
             // text_input は背景塗りを持たないため、後ろの track header text が透けて見える。
             // overlay 用に不透明 panel を先に置く (text_input より一段下、glyph より上に来る)。
             ui.panel(
@@ -1019,10 +1005,19 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 Color::rgb(0.18, 0.20, 0.24),
                 3.0,
             );
+            // M11 Phase 52 (daw_01 #013): `text_input_at_focused` で「初回 show 自動 focus」を
+            // widget に内蔵 — 旧 `arr_rename_just_started` boilerplate (caller 側で
+            // `WidgetId::ROOT.child((b"text_input", &id))` を再現して `set_focus` を呼ぶ) を
+            // 完全削除。`arr_rename_target = Some(rid)` だけで Logic / Bitwig 慣習の
+            // 「Rename → 即タイプ可能」が成立する。
+            //
             // on_change では track 名だけ更新 (`arr_rename_target` は触らない、
             // overlay 消去は Enter (resp.committed) / ESC (take_shortcut) で行う)。
-            let resp_text =
-                ui.text_input_at(("arr_rename", rid), text_rect, &cur_name, move |new| {
+            let resp_text = ui.text_input_at_focused(
+                ("arr_rename", rid),
+                text_rect,
+                &cur_name,
+                move |new| {
                     Edit::mutate(move |mm: &mut DawModel| {
                         if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == rid) {
                             t.name = Arc::from(new.as_str());
@@ -1030,7 +1025,8 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                         mm.arr_view.data_generation += 1;
                         mm.last_action = format!("arr: rename → {new}");
                     })
-                });
+                },
+            );
             // Enter で確定 → overlay 消去
             if resp_text.committed {
                 ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
@@ -1049,7 +1045,6 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
             // header_rect が引けない (track 削除済) → クリア
             ui.push_edit(Edit::mutate(|mm: &mut DawModel| {
                 mm.arr_rename_target = None;
-                mm.arr_rename_just_started = false;
             }));
         }
     }

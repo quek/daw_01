@@ -68,6 +68,14 @@ impl Scenegraph {
         self.nodes.retain(|wid, _| seen.contains(wid));
     }
 
+    /// `wid` が前フレームに登場していた (= `record` 後 `retain` で残った) かを返す。
+    /// M11 Phase 52: `text_input_at_focused` が「初回 show」判定に使う。
+    /// frame 末尾の `retain` で eviction されるため、このフレーム途中で呼んだとき
+    /// `true` ⇔ 「前フレームに `with_widget_node` で描画された」。
+    pub fn contains(&self, wid: WidgetId) -> bool {
+        self.nodes.contains_key(&wid)
+    }
+
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
