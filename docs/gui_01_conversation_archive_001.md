@@ -611,3 +611,49 @@ commit (本セッション) で `track_inspector.rs` を rewrite。
 - ユーザー実機で chain drag&drop reorder OK 確認 (本ファイルでの「ok」報告)
 
 ---
+
+## #013 [Resolved] 2026-05-04 [要望] `text_input_at` に「open 時の自動 focus」option
+
+### daw_01 →
+- 種別: [要望]
+- 関連 daw_01: `daw_gui/src/view/arrangement_view.rs` (track rename UI、Phase 4 で実装済)
+- 関連 gui_01: `crates/ui/src/widgets/text_input.rs`
+
+#### 背景
+
+track rename UI を実装したが、ユーザーから「初回 focus 手動 click 必要は UX として
+ダメ」とフィードバック (Logic / Bitwig / Cubase は Rename → 即タイプ可能)。
+`text_input_at` は click ベース focus モデル、caller が「open 時自動 focus」を
+制御できない。`Ui::set_focus(WidgetId)` は public だが widget id 計算式が
+内部実装依存でワークアラウンド。
+
+#### 想定対応 4 案
+
+- 案 A: `text_input_at` に `request_focus_on_show: bool` 引数追加 (breaking)
+- 案 B: 別関数 `text_input_at_focused` を新設 (非 breaking)
+- 案 C: `TextInputResponse.widget_id` 公開 + caller 側で frame state 管理
+- 案 D: `Ui::request_focus_next_frame(id_pattern)` 抽象 API
+
+### gui_01 →
+
+**案 B 採用** (`Ui::text_input_at_focused`)、M11 Phase 52 (commit `879789d`) 完了。
+
+実装は frame counter 不要、既存 `Scenegraph` (前フレーム登場 widget の eviction
+機構) の `contains(wid)` を `pub(crate) was_widget_visible_last_frame` で公開
+して「初回 show」を判定。`text_input_at` の薄ラッパで `set_focus` + cursor 末尾。
+
+```rust
+pub fn text_input_at_focused<F>(id, rect, text, on_change) -> TextInputResponse
+where F: FnOnce(String) -> Edit<M>;
+```
+
+既存 `text_input_at` / `text_input` は **不変** (breaking なし)。
+
+### daw_01 → 対応完了 (2026-05-04)
+
+commit (本セッション) で `arrangement_view.rs` の rename overlay 描画 1 行を
+`ui.text_input_at(...)` → `ui.text_input_at_focused(...)` に置換するだけで完了。
+caller boilerplate ゼロで track header 右クリック「Rename」→ **即タイプ可能**
+を達成 (本ファイルでの「ok」報告)。
+
+---

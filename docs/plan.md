@@ -157,3 +157,4 @@ daw_01 側で別途組むもの:
 | 2026-05-04 | (本セッション) | Phase 4 | track rename UI 実装 (arrangement の track header 右クリック → text_input 重ね描き / Enter commit / Esc cancel)。初回 focus 自動取得は #013 で gui_01 に要望中 |
 | 2026-05-04 | (本セッション) | Phase 4 + 5 | track_inspector chain section を `Ui::reorderable_list` で書き換え、`AppEvent::ReorderInspectorChain` で section 内 reorder のみ apply (section 跨ぎ拒否)、**`push_rect` / `push_text` / `push_lines` 全 view layer 0 件達成 (Phase 5 仕上げ DoD)** |
 | 2026-05-04 | (本セッション) | bug fix | track 並び替えで plugin instance state を保持 + clip / chain の対応関係を保つため `MainToChild::ReorderTracks(Vec<u32>)` IPC を新設 (1 回の `tracks.mutate` で chains/params/vocal を並び替え + 続けて `LoadSong` で `song_store` も新順序に同期) |
+| 2026-05-04 | (本セッション) | Phase 4 仕上げ | gui_01 #013 (M11 Phase 52) で `Ui::text_input_at_focused` 完了、daw_01 で `text_input_at` → `text_input_at_focused` 1 行置換 → track Rename → 即タイプ可能 (caller boilerplate ゼロ) |
