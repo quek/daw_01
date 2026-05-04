@@ -102,6 +102,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         playhead_beat: app.playhead_beat.map(|b| b as f64),
         loop_range,
         data_generation,
+        bpm: app.song.bpm,
+        time_sig: app.song.time_sig,
     };
 
     let style = ArrangementStyle::default();

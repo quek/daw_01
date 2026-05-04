@@ -17,6 +17,7 @@ use crate::app::{AppData, AppEvent, ClipRef, DEFAULT_NOTE_DURATION};
 
 const KEYBOARD_W: f32 = 56.0;
 const VEL_LANE_H: f32 = 60.0;
+const RULER_H: f32 = 20.0;
 
 const COLOR_BG: Color = Color { r: 0.10, g: 0.10, b: 0.12, a: 1.0 };
 const COLOR_HINT: Color = Color { r: 0.55, g: 0.58, b: 0.65, a: 1.0 };
@@ -36,11 +37,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         return;
     };
 
-    // widget が velocity lane を内蔵 (M9 Phase 45c)、grid 部分は area から keyboard と vel lane を引いた領域。
-    let grid_h = area.h - VEL_LANE_H;
+    // widget が ruler / velocity lane を内蔵 (M13 Phase 55 で ruler 追加)、
+    // grid 部分は area から keyboard / ruler / vel lane を引いた領域。
+    // note hit detection はこの grid_rect を使うので、widget 内部 layout と
+    // 揃えておく (rect.y から ruler_h、その下に keyboard+grid、最下段に vel_lane)。
+    let grid_h = area.h - VEL_LANE_H - RULER_H;
     let grid_rect = Rect {
         x: area.x + KEYBOARD_W,
-        y: area.y,
+        y: area.y + RULER_H,
         w: area.w - KEYBOARD_W,
         h: grid_h,
     };
@@ -57,6 +61,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         notes_generation: app.pianoroll_notes_generation,
         velocity_lane_h: VEL_LANE_H,
         playhead_beat: app.playhead_beat.map(|b| b as f64),
+        ruler_h: RULER_H,
+        bpm: app.song.bpm,
+        time_sig: app.song.time_sig,
     };
     let style = PianoRollStyle::default();
     let resize_handle_px = style.resize_handle_px;
