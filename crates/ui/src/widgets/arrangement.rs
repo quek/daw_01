@@ -1228,6 +1228,42 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 None
             };
 
+        // M10 Phase 50: track reorder release frame の **optimistic preview** —
+        // Edit::ReorderTracks は frame 末尾 deferred apply のため、release 直後の cached layer は
+        // 旧順序で描画されてしまう (#011 症状 2)。release frame で新順序を先に計算し、
+        // tracks_for_draw として cached layer + per-track header loop に渡すことで 1 frame 遅延を解消。
+        // viewport_key に reorder hash を入れて cache miss を強制。
+        let pending_reorder_order: Option<Vec<u32>> =
+            if let Some(tr) = track_reorder_release_raw {
+                let dy = (tr.last_mouse_y - tr.anchor_mouse_y).abs();
+                if dy >= 16.0 {
+                    let target = compute_reorder_target_index(
+                        tr.anchor_index,
+                        tr.last_mouse_y,
+                        header_pane.y,
+                        view.track_top,
+                        view.track_row_h,
+                        tracks.len(),
+                    );
+                    if target == tr.anchor_index {
+                        None
+                    } else {
+                        let cur_ids: Vec<u32> = tracks.iter().map(|t| t.id).collect();
+                        Some(apply_reorder(&cur_ids, tr.anchor_index, target))
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+        let pending_reorder_hash: u64 = pending_reorder_order
+            .as_ref()
+            .map_or(0, |v| {
+                v.iter()
+                    .fold(0_u64, |a, x| a.wrapping_mul(31).wrapping_add(u64::from(*x)))
+            });
+
         // M10 Phase 47b: track volume drag session の overlay 用 clone と release 取り出し。
         let track_volume_session: Option<TrackVolumeDragSession> = {
             let state: &mut ArrangementState = self.widget_state(wid);
@@ -1314,22 +1350,48 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ---- 描画 (heavy + cached + 動的 overlay) ----
+        // M10 Phase 50: pending_reorder_hash を viewport_key に入れて、release frame の optimistic
+        // preview で cache miss を強制 (新順序での再描画を 1 frame 遅延なく行う)。
+        // tuple Hash 実装は 12 要素まで → nested tuple で 13 要素分を表現。
         let viewport_key = (
-            b"arrangement_widget_v1" as &[u8],
-            rect.w.to_bits(),
-            rect.h.to_bits(),
-            view.start_beat.to_bits(),
-            view.len_beats.to_bits(),
-            view.track_top.to_bits(),
-            view.track_row_h.to_bits(),
-            view.tracks_visible.to_bits(),
-            view.header_w.to_bits(),
-            view.ruler_h.to_bits(),
-            view.data_generation,
-            u64::from(selected_track.unwrap_or(u32::MAX)),
+            (
+                b"arrangement_widget_v1" as &[u8],
+                rect.w.to_bits(),
+                rect.h.to_bits(),
+                view.start_beat.to_bits(),
+                view.len_beats.to_bits(),
+                view.track_top.to_bits(),
+                view.track_row_h.to_bits(),
+                view.tracks_visible.to_bits(),
+                view.header_w.to_bits(),
+                view.ruler_h.to_bits(),
+                view.data_generation,
+                u64::from(selected_track.unwrap_or(u32::MAX)),
+            ),
+            pending_reorder_hash,
         );
 
-        let tracks_owned: Vec<ArrangementTrack> = tracks.to_vec();
+        // M10 Phase 50: pending_reorder_order があれば新順序で `tracks_for_draw` を組み立て、
+        // cached layer + per-track header loop の両方で使う (1 frame の visual 遅延を解消)。
+        // 防御: order に含まれなかった track は元順序のまま末尾に keep。
+        let tracks_for_draw: Vec<ArrangementTrack> =
+            if let Some(order) = &pending_reorder_order {
+                let mut reordered: Vec<ArrangementTrack> = Vec::with_capacity(tracks.len());
+                for id in order {
+                    if let Some(t) = tracks.iter().find(|t| t.id == *id) {
+                        reordered.push(t.clone());
+                    }
+                }
+                for t in tracks {
+                    if !reordered.iter().any(|x| x.id == t.id) {
+                        reordered.push(t.clone());
+                    }
+                }
+                reordered
+            } else {
+                tracks.to_vec()
+            };
+        let tracks_owned: Vec<ArrangementTrack> = tracks_for_draw.clone();
         let style_copy = *style;
         let view_copy = view;
         let selected_set: HashSet<ClipKey> = selected_clips.iter().copied().collect();
@@ -1589,24 +1651,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         // ---- M10 Phase 46: track reorder release → ReorderTracks ----
         // dist < 16px → click 格下げ (button_at の SelectTrack / Rename trigger に任せる)
-        // dist >= 16px → 新順を計算して発行
-        if let Some(tr) = track_reorder_release_raw {
-            let dy = (tr.last_mouse_y - tr.anchor_mouse_y).abs();
-            if dy >= 16.0 {
-                let target = compute_reorder_target_index(
-                    tr.anchor_index,
-                    tr.last_mouse_y,
-                    header_pane.y,
-                    view.track_top,
-                    view.track_row_h,
-                    tracks.len(),
-                );
-                if target != tr.anchor_index {
-                    let cur_ids: Vec<u32> = tracks.iter().map(|t| t.id).collect();
-                    let new_order = apply_reorder(&cur_ids, tr.anchor_index, target);
-                    self.push_edit(make_edit(ArrangementEditRequest::ReorderTracks(new_order)));
-                }
-            }
+        // dist >= 16px → 新順を計算して発行 (Phase 50: pending_reorder_order を再利用、二重計算回避)
+        if let Some(new_order) = pending_reorder_order {
+            self.push_edit(make_edit(ArrangementEditRequest::ReorderTracks(new_order)));
         }
 
         // ---- M10 Phase 47b+49: track volume drag release → Undoable Edit ----
@@ -1722,8 +1769,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ---- track headers (button_at × 4 + toggle_button_at × 2) + SelectTrack トリガ ----
+        // M10 Phase 50: tracks_for_draw を使う (release frame の optimistic preview と同順序)。
         if header_w > 0.0 {
-            for (i, t) in tracks.iter().enumerate() {
+            for (i, t) in tracks_for_draw.iter().enumerate() {
                 let row_y = header_pane.y - view.track_top + i as f32 * view.track_row_h;
                 let row =
                     Rect { x: header_pane.x, y: row_y, w: header_pane.w, h: view.track_row_h };
