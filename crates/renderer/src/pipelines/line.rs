@@ -37,13 +37,29 @@ struct DrawSpan {
     clip: Option<Rect>,
 }
 
+/// 1 つの "run" の draw range (`spans` の `[span_start, span_end)`)。
+#[derive(Debug, Clone, Copy)]
+pub struct LineRun {
+    span_start: u32,
+    span_end: u32,
+}
+
+impl LineRun {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.span_start == self.span_end
+    }
+}
+
 pub struct LinePipeline {
     pipeline: wgpu::RenderPipeline,
     instance_buffer: wgpu::Buffer,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    /// `prepare` で構築。`render` 時はこの spans を順に draw。
+    /// `enqueue_run` で frame 全体に append、`render_run` 時に sub-range を順に draw。
     spans: Vec<DrawSpan>,
+    /// frame 全体の line instance scratch (`upload` で 1 度に GPU へ転送)。
+    instances: Vec<LineInstance>,
 }
 
 impl LinePipeline {
@@ -140,32 +156,26 @@ impl LinePipeline {
             uniform_buffer,
             bind_group,
             spans: Vec::new(),
+            instances: Vec::new(),
         }
     }
 
-    pub fn prepare(
-        &mut self,
-        _device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        batches: &[LineBatch],
-        screen: PhysicalSize,
-    ) {
-        // ScreenUniform 更新
-        let uniform = ScreenUniform {
-            size: [screen.width as f32, screen.height as f32, 0.0, 0.0],
-        };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
-
-        // 全 batch の segment を 1 本のインスタンスバッファに詰めて、span だけ覚える
+    /// frame 開始時に呼ぶ。
+    pub fn begin_frame(&mut self) {
         self.spans.clear();
-        let mut instances: Vec<LineInstance> = Vec::new();
+        self.instances.clear();
+    }
+
+    /// 1 つの run として `batches` を enqueue する。
+    pub fn enqueue_run(&mut self, batches: &[LineBatch]) -> LineRun {
+        let span_start = self.spans.len() as u32;
         for batch in batches {
-            let start = instances.len() as u32;
+            let start = self.instances.len() as u32;
             for seg in &batch.segments {
-                if instances.len() as u64 >= MAX_INSTANCES {
+                if self.instances.len() as u64 >= MAX_INSTANCES {
                     break;
                 }
-                instances.push(LineInstance {
+                self.instances.push(LineInstance {
                     a: seg.a,
                     b: seg.b,
                     color: [seg.color.r, seg.color.g, seg.color.b, seg.color.a],
@@ -173,7 +183,7 @@ impl LinePipeline {
                     _pad: [0.0; 3],
                 });
             }
-            let end = instances.len() as u32;
+            let end = self.instances.len() as u32;
             if end > start {
                 self.spans.push(DrawSpan {
                     instance_start: start,
@@ -181,26 +191,45 @@ impl LinePipeline {
                     clip: batch.clip_rect,
                 });
             }
-            if instances.len() as u64 >= MAX_INSTANCES {
+            if self.instances.len() as u64 >= MAX_INSTANCES {
                 break;
             }
         }
-        if !instances.is_empty() {
-            queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instances));
+        let span_end = self.spans.len() as u32;
+        LineRun { span_start, span_end }
+    }
+
+    /// frame 全 run の enqueue 後に呼ぶ。
+    pub fn upload(&self, queue: &wgpu::Queue, screen: PhysicalSize) {
+        let uniform = ScreenUniform {
+            size: [screen.width as f32, screen.height as f32, 0.0, 0.0],
+        };
+        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+        if !self.instances.is_empty() {
+            queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.instances),
+            );
         }
     }
 
-    pub fn render(&self, pass: &mut wgpu::RenderPass<'_>, screen: PhysicalSize) {
-        if self.spans.is_empty() {
+    /// 1 つの run を render pass に発行する。
+    pub fn render_run(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        screen: PhysicalSize,
+        run: LineRun,
+    ) {
+        if run.is_empty() {
             return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
 
-        for span in &self.spans {
+        for span in &self.spans[run.span_start as usize..run.span_end as usize] {
             if let Some(clip) = span.clip {
-                // 画面内にクランプ。範囲外なら描画しない。
                 let l = clip.x.max(0.0);
                 let t = clip.y.max(0.0);
                 let r = (clip.x + clip.w).min(screen.width as f32);
@@ -215,7 +244,6 @@ impl LinePipeline {
             pass.draw(0..6, span.instance_start..span.instance_end);
         }
 
-        // 後続パイプラインのために scissor を全画面に戻す。
         pass.set_scissor_rect(0, 0, screen.width, screen.height);
     }
 }

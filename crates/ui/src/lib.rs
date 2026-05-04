@@ -44,6 +44,11 @@ pub use viewport::ViewportState1D;
 pub use widgets::level_meter::{LevelMeterStyle, MeterBallistic};
 pub use widgets::split_view::Orientation;
 pub use widgets::time_grid::{BarBeatGridStyle, TimeRulerStyle};
+pub use widgets::arrangement::{
+    ArrangementClip, ArrangementEditRequest, ArrangementResponse, ArrangementStyle,
+    ArrangementTrack, ArrangementView, ClipDragKind, ClipKey, LoopBandHit, MoveClipDelta,
+    ResizeClipDelta, clip_hit, clip_to_rect, loop_band_hit_kind, track_index_from_y,
+};
 pub use widgets::automation::{AutomationCurveResponse, AutomationCurveStyle};
 pub use widgets::checkbox::CheckboxResponse;
 pub use widgets::fader::FaderResponse;

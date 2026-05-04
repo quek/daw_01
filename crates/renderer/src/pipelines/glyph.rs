@@ -43,16 +43,35 @@ struct CachedBuffer {
     last_seen_frame: u64,
 }
 
+/// 1 つの "run" を識別する handle。`renderers` pool 内の index を指す。
+#[derive(Debug, Clone, Copy)]
+pub struct GlyphRun {
+    /// `renderers` pool 内の index。`u32::MAX` は empty run (描画なし)。
+    idx: u32,
+}
+
+impl GlyphRun {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.idx == u32::MAX
+    }
+}
+
 pub struct GlyphPipeline {
     font_system: FontSystem,
     swash_cache: SwashCache,
     viewport: Viewport,
     atlas: TextAtlas,
-    text_renderer: TextRenderer,
     /// 同一 (text, font_size, line_height) の Buffer を再利用する cache。
     cache: HashMap<u64, CachedBuffer>,
     /// `prepare` が呼ばれた回数。eviction 判定に使う。
     frame_counter: u64,
+    /// 1 frame 内で 1 run = 1 TextRenderer。glyphon の `prepare`/`render` は 1 instance の
+    /// 内部 buffer を上書きするため、複数 run を 1 instance で running するとデータが壊れる。
+    /// pool は frame 内で必要数まで grow し、shrink しない (allocate コストは grow 1 度だけ)。
+    renderers: Vec<TextRenderer>,
+    /// 現フレームで使った run 数。`begin_frame` で 0 にリセット、`enqueue_run` で increment。
+    next_renderer_idx: usize,
 }
 
 impl GlyphPipeline {
@@ -63,10 +82,11 @@ impl GlyphPipeline {
     ) -> Self {
         let font_system = FontSystem::new();
         let swash_cache = SwashCache::new();
-        let cache = Cache::new(device);
-        let viewport = Viewport::new(device, &cache);
-        let mut atlas = TextAtlas::new(device, queue, &cache, target_format);
-        let text_renderer =
+        let cache_handle = Cache::new(device);
+        let viewport = Viewport::new(device, &cache_handle);
+        let mut atlas = TextAtlas::new(device, queue, &cache_handle, target_format);
+        // pool の初期 instance 1 つ。frame 内で run 数が増えれば grow する。
+        let initial_renderer =
             TextRenderer::new(&mut atlas, device, MultisampleState::default(), None);
 
         Self {
@@ -74,42 +94,76 @@ impl GlyphPipeline {
             swash_cache,
             viewport,
             atlas,
-            text_renderer,
             cache: HashMap::new(),
             frame_counter: 0,
+            renderers: vec![initial_renderer],
+            next_renderer_idx: 0,
         }
     }
 
-    pub fn prepare(
+    /// frame 開始時に呼ぶ。pool index を 0 に戻す。viewport 更新もここで。
+    pub fn begin_frame(&mut self, queue: &wgpu::Queue, screen: PhysicalSize) {
+        self.frame_counter += 1;
+        self.next_renderer_idx = 0;
+        self.viewport.update(
+            queue,
+            Resolution { width: screen.width, height: screen.height },
+        );
+    }
+
+    /// 1 つの run として `glyph_areas` を enqueue する。
+    /// pool の index を内部で取得 (足りなければ新 `TextRenderer` を allocate)、その instance に
+    /// prepare して `GlyphRun` handle を返す。`glyph_areas` が空なら empty run handle を返す。
+    pub fn enqueue_run(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         glyph_areas: &[GlyphArea],
         screen: PhysicalSize,
-    ) {
-        self.frame_counter += 1;
-        self.viewport.update(
-            queue,
-            Resolution { width: screen.width, height: screen.height },
-        );
-
+    ) -> GlyphRun {
         if glyph_areas.is_empty() {
-            // 空でも prepare 呼んでおかないと前フレームの描画が残る場合がある
-            let _ = self.text_renderer.prepare(
-                device,
-                queue,
-                &mut self.font_system,
+            return GlyphRun { idx: u32::MAX };
+        }
+        // pool grow if needed
+        while self.next_renderer_idx >= self.renderers.len() {
+            self.renderers.push(TextRenderer::new(
                 &mut self.atlas,
-                &self.viewport,
-                std::iter::empty::<TextArea<'_>>(),
-                &mut self.swash_cache,
-            );
-            // eviction は空フレームでも進めて、長時間 idle で残骸を残さない。
-            let frame = self.frame_counter;
-            self.cache.retain(|_, e| frame.saturating_sub(e.last_seen_frame) < EVICT_AFTER_FRAMES);
+                device,
+                MultisampleState::default(),
+                None,
+            ));
+        }
+        let idx = self.next_renderer_idx;
+        self.prepare_renderer(device, queue, idx, glyph_areas, screen);
+        self.next_renderer_idx += 1;
+        GlyphRun { idx: idx as u32 }
+    }
+
+    /// frame 末で呼ぶ: cache eviction を進める。
+    pub fn end_frame(&mut self) {
+        let frame = self.frame_counter;
+        self.cache.retain(|_, e| frame.saturating_sub(e.last_seen_frame) < EVICT_AFTER_FRAMES);
+    }
+
+    /// 1 つの run を render pass に発行する。
+    pub fn render_run(&self, pass: &mut wgpu::RenderPass<'_>, run: GlyphRun) {
+        if run.is_empty() {
             return;
         }
+        let renderer = &self.renderers[run.idx as usize];
+        if let Err(e) = renderer.render(&self.atlas, &self.viewport, pass) {
+            eprintln!("glyph render error: {e:?}");
+        }
+    }
 
+    fn prepare_renderer(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer_idx: usize,
+        glyph_areas: &[GlyphArea],
+        screen: PhysicalSize,
+    ) {
         // 1) 各 GlyphArea のキーを計算 (2 度目の lookup を避けるため Vec に保存)。
         let keys: Vec<u64> = glyph_areas.iter().map(buffer_key).collect();
 
@@ -170,7 +224,7 @@ impl GlyphPipeline {
             })
             .collect();
 
-        if let Err(e) = self.text_renderer.prepare(
+        if let Err(e) = self.renderers[renderer_idx].prepare(
             device,
             queue,
             &mut self.font_system,
@@ -180,16 +234,6 @@ impl GlyphPipeline {
             &mut self.swash_cache,
         ) {
             eprintln!("glyph prepare error: {e:?}");
-        }
-
-        // 4) 古い entry の eviction。EVICT_AFTER_FRAMES より長く使われていない entry は捨てる。
-        let frame = self.frame_counter;
-        self.cache.retain(|_, e| frame.saturating_sub(e.last_seen_frame) < EVICT_AFTER_FRAMES);
-    }
-
-    pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
-        if let Err(e) = self.text_renderer.render(&self.atlas, &self.viewport, pass) {
-            eprintln!("glyph render error: {e:?}");
         }
     }
 

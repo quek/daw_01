@@ -19,7 +19,9 @@ use std::sync::mpsc::sync_channel;
 use daw_ui_platform::PhysicalSize;
 
 use crate::device::{RenderError, RendererInitError};
-use crate::pipelines::{glyph::GlyphPipeline, line::LinePipeline, rect::RectPipeline};
+use crate::pipelines::{
+    enqueue_runs, glyph::GlyphPipeline, line::LinePipeline, rect::RectPipeline, render_runs,
+};
 use crate::scene::Scene;
 
 /// surface を使わない wgpu レンダラ。
@@ -128,10 +130,32 @@ impl OffscreenRenderer {
             mapped_at_creation: false,
         });
 
-        // 3. base pass の prepare (Renderer::render と同形)
-        self.rect.prepare(&self.device, &self.queue, &scene.rects, self.size);
-        self.line.prepare(&self.device, &self.queue, &scene.line_batches, self.size);
-        self.glyph.prepare(&self.device, &self.queue, &scene.glyph_areas, self.size);
+        // 3. begin_frame + enqueue (call-order interleave、device.rs と同形)
+        self.rect.begin_frame();
+        self.line.begin_frame();
+        self.glyph.begin_frame(&self.queue, self.size);
+
+        let base_runs = enqueue_runs(
+            &scene.primitives,
+            &mut self.rect,
+            &mut self.line,
+            &mut self.glyph,
+            &self.device,
+            &self.queue,
+            self.size,
+        );
+        let popup_runs = enqueue_runs(
+            &scene.popup_primitives,
+            &mut self.rect,
+            &mut self.line,
+            &mut self.glyph,
+            &self.device,
+            &self.queue,
+            self.size,
+        );
+
+        self.rect.upload(&self.queue, self.size);
+        self.line.upload(&self.queue, self.size);
 
         // 4. encode: base pass + (popup pass) + copy_texture_to_buffer
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -154,17 +178,16 @@ impl OffscreenRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.rect.render(&mut pass, self.size);
-            self.line.render(&mut pass, self.size);
-            self.glyph.render(&mut pass);
+            render_runs(
+                &base_runs,
+                &self.rect,
+                &self.line,
+                &self.glyph,
+                &mut pass,
+                self.size,
+            );
         }
-        if !scene.popup_rects.is_empty()
-            || !scene.popup_glyph_areas.is_empty()
-            || !scene.popup_line_batches.is_empty()
-        {
-            self.rect.prepare(&self.device, &self.queue, &scene.popup_rects, self.size);
-            self.line.prepare(&self.device, &self.queue, &scene.popup_line_batches, self.size);
-            self.glyph.prepare(&self.device, &self.queue, &scene.popup_glyph_areas, self.size);
+        if !popup_runs.is_empty() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("daw-ui offscreen popup pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -181,10 +204,16 @@ impl OffscreenRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.rect.render(&mut pass, self.size);
-            self.line.render(&mut pass, self.size);
-            self.glyph.render(&mut pass);
+            render_runs(
+                &popup_runs,
+                &self.rect,
+                &self.line,
+                &self.glyph,
+                &mut pass,
+                self.size,
+            );
         }
+        self.glyph.end_frame();
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &target,

@@ -3,6 +3,7 @@
 //! M2: waveform (波形表示、line strip パイプラインを使う)。
 //! M3: fader / knob / checkbox / text_input。
 
+pub mod arrangement;
 pub mod automation;
 pub mod button;
 pub mod checkbox;
@@ -18,6 +19,7 @@ pub mod menu;
 pub mod modal;
 pub mod panel;
 pub mod piano_roll;
+pub mod playhead;
 pub mod scroll_area;
 pub mod split_view;
 pub mod tab_view;

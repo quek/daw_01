@@ -202,10 +202,11 @@ impl ShortcutMap {
     /// - `"escape"` = Escape
     /// - `"tab_next"` = Tab
     /// - `"tab_prev"` = Shift+Tab
-    /// - `"focus_up"` = ArrowUp
-    /// - `"focus_down"` = ArrowDown
-    /// - `"focus_left"` = ArrowLeft
-    /// - `"focus_right"` = ArrowRight
+    ///
+    /// **note**: 修飾キーなしの矢印 (`Up` / `Down` / `Left` / `Right`) は **default binding せず**。
+    /// shortcut layer は frame 頭で keyboard_events から consume するため、bind すると text_input
+    /// 等の内部矢印キー処理 (cursor 移動) を奪ってしまう。focus traversal を入れるときは
+    /// `typing_focus` を見て consume を抑制する path を整備する必要がある (M9 Phase 45e bug fix)。
     #[must_use]
     pub fn with_default_bindings() -> Self {
         let mut m = Self::new();
@@ -224,10 +225,6 @@ impl ShortcutMap {
         m.bind("escape", "Escape");
         m.bind("tab_next", "Tab");
         m.bind("tab_prev", "Shift+Tab");
-        m.bind("focus_up", "Up");
-        m.bind("focus_down", "Down");
-        m.bind("focus_left", "Left");
-        m.bind("focus_right", "Right");
         // M9 Phase 43: debug overlay toggle
         m.bind("debug_overlay_toggle", "Ctrl+F1");
         m

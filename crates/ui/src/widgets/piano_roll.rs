@@ -46,6 +46,7 @@ use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::ui::Ui;
+use crate::widgets::playhead::draw_playhead_line;
 
 // ============================================================
 // Public types
@@ -1199,27 +1200,8 @@ fn draw_velocity_lane<M: ?Sized + 'static>(
     }
 }
 
-/// (M9 Phase 45c) playhead 線。`x` を中心に `y_top..y_bottom` の縦線 1 本。
-/// 内部 helper として private。`arrangement` widget (Phase 45e) でも使う想定で
-/// 切り出されているが、現時点では piano_roll 専用。
-fn draw_playhead_line<M: ?Sized + 'static>(
-    hctx: &mut crate::widgets::heavy::HeavyCtx<'_, '_, M>,
-    x: f32,
-    y_top: f32,
-    y_bottom: f32,
-    color: Color,
-    width_px: f32,
-) {
-    use daw_ui_renderer::{LineBatch, LineSegment};
-    if y_bottom <= y_top {
-        return;
-    }
-    hctx.push_lines(LineBatch {
-        segments: vec![LineSegment { a: [x, y_top], b: [x, y_bottom], color }],
-        line_width_px: width_px,
-        clip_rect: None,
-    });
-}
+// (M9 Phase 45e) `draw_playhead_line` は `crate::widgets::playhead` に切り出し済み。
+// piano_roll / arrangement 両方が `pub(crate) fn` を呼ぶ形にリファクタ。
 
 // ============================================================
 // Tests
@@ -1902,7 +1884,7 @@ mod tests {
                 dispatch,
             );
         });
-        (scene.rects.len(), scene.line_batches.len())
+        (scene.rect_count(), scene.line_count())
     }
 
     #[test]

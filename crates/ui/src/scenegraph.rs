@@ -12,17 +12,16 @@ use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use daw_ui_renderer::{GlyphArea, LineBatch, RectCommand};
+use daw_ui_renderer::Primitive;
 
 use crate::id::WidgetId;
 
-/// per-widget の前フレーム描画コマンド。`Ui::with_widget_node` がキャッシュ命中時に
-/// scene へ append する素材。
+/// per-widget の前フレーム描画コマンド (M9 Phase 45f: rect/glyph/line を call order で
+/// 並べた `Vec<Primitive>` に統一)。
+/// `Ui::with_widget_node` がキャッシュ命中時に scene 末尾に append する素材。
 #[derive(Debug, Clone, Default)]
 pub struct CachedCommands {
-    pub rects: Vec<RectCommand>,
-    pub glyph_areas: Vec<GlyphArea>,
-    pub line_batches: Vec<LineBatch>,
+    pub primitives: Vec<Primitive>,
 }
 
 /// per-widget の前フレーム情報。input_hash 一致 = 描画変化なし = `commands` を再利用可。

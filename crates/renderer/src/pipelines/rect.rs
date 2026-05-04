@@ -43,13 +43,30 @@ struct DrawSpan {
     clip: Option<Rect>,
 }
 
+/// 1 つの "run" = 連続した同一 type primitive 群の draw range。
+/// `RectPipeline.spans` 内の `[span_start, span_end)` を 1 run として draw する。
+#[derive(Debug, Clone, Copy)]
+pub struct RectRun {
+    span_start: u32,
+    span_end: u32,
+}
+
+impl RectRun {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.span_start == self.span_end
+    }
+}
+
 pub struct RectPipeline {
     pipeline: wgpu::RenderPipeline,
     instance_buffer: wgpu::Buffer,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    /// `prepare` で構築。`render` 時に span 順で `set_scissor_rect` + draw。
+    /// `enqueue_run` で構築 (frame 全体で linear)。`render_run` 時に span 順で `set_scissor_rect` + draw。
     spans: Vec<DrawSpan>,
+    /// frame 全体の instance バッファ scratch (`upload` で 1 度に GPU へ転送)。
+    instances: Vec<RectInstance>,
 }
 
 impl RectPipeline {
@@ -147,31 +164,28 @@ impl RectPipeline {
             uniform_buffer,
             bind_group,
             spans: Vec::new(),
+            instances: Vec::new(),
         }
     }
 
-    pub fn prepare(
-        &mut self,
-        _device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        rects: &[RectCommand],
-        screen: PhysicalSize,
-    ) {
-        // ScreenUniform を更新
-        let uniform = ScreenUniform {
-            size: [screen.width as f32, screen.height as f32, 0.0, 0.0],
-        };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
-
-        // インスタンスを敷き詰めながら、clip_rect が同じ連続区間を 1 span にまとめる。
+    /// frame 開始時に呼ぶ。`spans` と `instances` の scratch を空にする。
+    pub fn begin_frame(&mut self) {
         self.spans.clear();
-        let count = rects.len().min(MAX_INSTANCES as usize);
-        let mut instances: Vec<RectInstance> = Vec::with_capacity(count);
-        let mut span_start: u32 = 0;
+        self.instances.clear();
+    }
+
+    /// 1 つの run として `rects` を enqueue する。`spans` / `instances` は frame 全体で linear
+    /// に成長するので、以前の run の data は保持されたままで append される。
+    pub fn enqueue_run(&mut self, rects: &[RectCommand]) -> RectRun {
+        let span_start = self.spans.len() as u32;
+        let avail = MAX_INSTANCES.saturating_sub(self.instances.len() as u64) as usize;
+        let count = rects.len().min(avail);
+        let mut span_inst_start: u32 = self.instances.len() as u32;
         let mut current_clip: Option<Rect> = None;
         let mut span_open = false;
-        for (i, cmd) in rects.iter().take(count).enumerate() {
-            instances.push(RectInstance {
+        for cmd in rects.iter().take(count) {
+            let i = self.instances.len() as u32;
+            self.instances.push(RectInstance {
                 pos: [cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h],
                 fill: [cmd.fill.r, cmd.fill.g, cmd.fill.b, cmd.fill.a],
                 border: [cmd.border.r, cmd.border.g, cmd.border.b, cmd.border.a],
@@ -179,39 +193,59 @@ impl RectPipeline {
                 misc1: [cmd.radius[3], 0.0, 0.0, 0.0],
             });
             if !span_open {
-                span_start = i as u32;
+                span_inst_start = i;
                 current_clip = cmd.clip_rect;
                 span_open = true;
             } else if cmd.clip_rect != current_clip {
                 self.spans.push(DrawSpan {
-                    instance_start: span_start,
-                    instance_end: i as u32,
+                    instance_start: span_inst_start,
+                    instance_end: i,
                     clip: current_clip,
                 });
-                span_start = i as u32;
+                span_inst_start = i;
                 current_clip = cmd.clip_rect;
             }
         }
-        if span_open && (span_start as usize) < instances.len() {
+        if span_open && (span_inst_start as usize) < self.instances.len() {
             self.spans.push(DrawSpan {
-                instance_start: span_start,
-                instance_end: instances.len() as u32,
+                instance_start: span_inst_start,
+                instance_end: self.instances.len() as u32,
                 clip: current_clip,
             });
         }
-        if !instances.is_empty() {
-            queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instances));
+        let span_end = self.spans.len() as u32;
+        RectRun { span_start, span_end }
+    }
+
+    /// frame 全 run の enqueue が終わったあとに呼ぶ。`instances` 全体を GPU に upload + uniform 更新。
+    pub fn upload(&self, queue: &wgpu::Queue, screen: PhysicalSize) {
+        let uniform = ScreenUniform {
+            size: [screen.width as f32, screen.height as f32, 0.0, 0.0],
+        };
+        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+        if !self.instances.is_empty() {
+            queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.instances),
+            );
         }
     }
 
-    pub fn render(&self, pass: &mut wgpu::RenderPass<'_>, screen: PhysicalSize) {
-        if self.spans.is_empty() {
+    /// 1 つの run を render pass に発行する (set_pipeline + scissor span ごとに draw)。
+    pub fn render_run(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        screen: PhysicalSize,
+        run: RectRun,
+    ) {
+        if run.is_empty() {
             return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-        for span in &self.spans {
+        for span in &self.spans[run.span_start as usize..run.span_end as usize] {
             if let Some(clip) = span.clip {
                 let l = clip.x.max(0.0);
                 let t = clip.y.max(0.0);

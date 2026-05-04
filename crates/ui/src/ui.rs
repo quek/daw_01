@@ -14,7 +14,9 @@ use std::marker::PhantomData;
 use std::path::PathBuf;
 
 use daw_ui_platform::{CursorIcon, KeyEvent, PhysicalSize};
-use daw_ui_renderer::{Color, GlyphArea, LineBatch, LineSegment, Rect, RectCommand, Scene};
+use daw_ui_renderer::{
+    Color, GlyphArea, LineBatch, LineSegment, Primitive, Rect, RectCommand, Scene,
+};
 
 use crate::clipboard::ClipboardProvider;
 use crate::dialog::{DialogKind, DialogRequest, DialogResult, FileDialogFilter};
@@ -495,9 +497,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             seen_widgets: &mut seen_widgets,
             current_clip: None,
             open_popups: &mut self.open_popups,
-            popup_rects: Vec::new(),
-            popup_glyphs: Vec::new(),
-            popup_lines: Vec::new(),
+            popup_primitives: Vec::new(),
             drawing_in_popup: false,
             redraw_requested: &mut redraw_requested,
             file_drop,
@@ -561,9 +561,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
 
         // M7 Phase 25: popup の deferred buffer を取り出して、ui の borrow が外れたあと
         // base scene 末尾に append (z-order = 最前面) する。
-        let popup_rects = std::mem::take(&mut ui.popup_rects);
-        let popup_glyphs = std::mem::take(&mut ui.popup_glyphs);
-        let popup_lines = std::mem::take(&mut ui.popup_lines);
+        let popup_primitives = std::mem::take(&mut ui.popup_primitives);
         // フォーカスの commit:
         // - 誰かが set_focus / clear_focus を呼んでいたら pending_focus がそのまま反映。
         // - そうでないとき、このフレームでクリック (release) があったら blur 扱いで
@@ -583,9 +581,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
         // ui が drop して scene の borrow が外れた後で、popup buffer を Scene の popup pass 用
         // フィールドに移す (renderer は base pass の後に popup pass で再描画する設計、
         // pipeline 順 rect→line→glyph 起因の z-order 問題を解消)。
-        scene.popup_rects.extend(popup_rects);
-        scene.popup_glyph_areas.extend(popup_glyphs);
-        scene.popup_line_batches.extend(popup_lines);
+        scene.popup_primitives.extend(popup_primitives);
         // M4 Phase 11: 今フレームに登場しなかった widget を scenegraph から eviction。
         self.scenegraph.retain(&seen_widgets);
         // M8 Phase 30: 次フレーム用に focusable 一覧を保存。
@@ -657,9 +653,9 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     open_popups: &'a mut HashMap<WidgetId, PopupOpenState>,
     /// M7 Phase 25: popup_layer 内で push される rect の deferred buffer。
     /// frame 末尾で base scene に append → z-order 最前面。
-    popup_rects: Vec<RectCommand>,
-    popup_glyphs: Vec<GlyphArea>,
-    popup_lines: Vec<LineBatch>,
+    /// drawing_in_popup 中の primitive 列 (`Primitive::Rect/Glyph/Line` の混在)。
+    /// frame 末で `scene.popup_primitives` に move する。
+    popup_primitives: Vec<Primitive>,
     /// `popup_layer` 内で描画中フラグ。push_* が popup_buffer に積むかを切替える。
     drawing_in_popup: bool,
     /// M7 後の改善: widget が `Ui::request_redraw()` を呼んだら true。
@@ -737,7 +733,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     pub fn push_rect(&mut self, mut cmd: RectCommand) {
         cmd.clip_rect = merge_clip(self.current_clip, cmd.clip_rect);
         if self.drawing_in_popup {
-            self.popup_rects.push(cmd);
+            self.popup_primitives.push(Primitive::Rect(cmd));
         } else {
             self.scene.push_rect(cmd);
         }
@@ -747,7 +743,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     pub fn push_text(&mut self, mut area: GlyphArea) {
         area.clip_rect = merge_clip(self.current_clip, area.clip_rect);
         if self.drawing_in_popup {
-            self.popup_glyphs.push(area);
+            self.popup_primitives.push(Primitive::Glyph(area));
         } else {
             self.scene.push_text(area);
         }
@@ -757,7 +753,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     pub fn push_lines(&mut self, mut batch: LineBatch) {
         batch.clip_rect = merge_clip(self.current_clip, batch.clip_rect);
         if self.drawing_in_popup {
-            self.popup_lines.push(batch);
+            self.popup_primitives.push(Primitive::Line(batch));
         } else {
             self.scene.push_lines(batch);
         }
@@ -906,26 +902,34 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // フレーム末尾の eviction で「今フレームに登場した widget」として保持する。
         self.seen_widgets.insert(wid);
 
-        // hash 一致 → cached commands を scene に append、draw_fn は実行しない。
+        // hash 一致 → cached primitives を call order で scene 末尾に append、draw_fn は実行しない。
         if let Some(cached) = self.scenegraph.get_cached(wid, input_hash) {
-            self.scene.rects.extend_from_slice(&cached.rects);
-            self.scene.glyph_areas.extend(cached.glyph_areas.iter().cloned());
-            self.scene.line_batches.extend(cached.line_batches.iter().cloned());
+            if self.drawing_in_popup {
+                self.popup_primitives
+                    .extend(cached.primitives.iter().cloned());
+            } else {
+                self.scene
+                    .primitives
+                    .extend(cached.primitives.iter().cloned());
+            }
             *self.cache_hits += 1;
             return;
         }
         *self.cache_misses += 1;
 
-        // miss → draw_fn を実行して scene 末尾の差分を新規 commands として記録。
-        let r0 = self.scene.rects.len();
-        let g0 = self.scene.glyph_areas.len();
-        let l0 = self.scene.line_batches.len();
-        draw_fn(self);
-        let commands = CachedCommands {
-            rects: self.scene.rects[r0..].to_vec(),
-            glyph_areas: self.scene.glyph_areas[g0..].to_vec(),
-            line_batches: self.scene.line_batches[l0..].to_vec(),
+        // miss → draw_fn を実行して scene / popup 末尾の差分を新規 commands として記録。
+        let p0 = if self.drawing_in_popup {
+            self.popup_primitives.len()
+        } else {
+            self.scene.primitives.len()
         };
+        draw_fn(self);
+        let new_primitives: Vec<Primitive> = if self.drawing_in_popup {
+            self.popup_primitives[p0..].to_vec()
+        } else {
+            self.scene.primitives[p0..].to_vec()
+        };
+        let commands = CachedCommands { primitives: new_primitives };
         self.scenegraph.record(wid, input_hash, commands);
     }
 
@@ -2109,7 +2113,7 @@ mod tests {
             });
         });
         assert_eq!(calls_1.get(), 1, "1 回目は draw_fn が実行される");
-        assert_eq!(scene.rects.len(), 1);
+        assert_eq!(scene.rect_count(), 1);
 
         // Frame 2: 同じ wid + 同じ hash → cache hit、draw_fn は実行されない。
         scene.clear();
@@ -2129,8 +2133,8 @@ mod tests {
         });
         assert_eq!(calls_2.get(), 0, "2 回目は cache hit で draw_fn が実行されない");
         // scene には cache 経由で同じ rect が積まれている。
-        assert_eq!(scene.rects.len(), 1);
-        assert_eq!(scene.rects[0].rect, test_rect);
+        assert_eq!(scene.rect_count(), 1);
+        assert_eq!(scene.iter_rects().next().unwrap().rect, test_rect);
     }
 
     /// M4 Phase 11: hash が変わると cache miss、draw_fn が再実行される。
@@ -2367,12 +2371,13 @@ mod tests {
         });
         // M9 Phase 44a: popup buffer (z-order 最前面) に rect + glyph が積まれる。
         // popup_glyph が独立 GlyphPipeline になったので base pass の glyph と干渉しない。
+        // M9 Phase 45f: rect/glyph/line を統合した popup_primitives で count を見る。
         assert!(
-            !scene.popup_rects.is_empty(),
+            scene.popup_rect_count() >= 1,
             "debug_overlay は popup buffer の rect を 1 個以上積む"
         );
         assert!(
-            scene.popup_glyph_areas.len() >= 5,
+            scene.popup_glyph_count() >= 5,
             "debug_overlay は popup buffer の glyph を 5 行以上積む (frame_ms 含む)"
         );
     }
@@ -2387,7 +2392,7 @@ mod tests {
             ui.debug_overlay(Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 }, 0.0);
         });
         // popup buffer の glyph_areas に 4 行 (frame_ms 省略)。
-        assert_eq!(scene.popup_glyph_areas.len(), 4, "frame_ms=0 で frame 行省略 → 4 行");
+        assert_eq!(scene.popup_glyph_count(), 4, "frame_ms=0 で frame 行省略 → 4 行");
     }
 
     // -------- M9 P1-4: take_double_click_in_rect --------

@@ -1,7 +1,20 @@
-//! `Scene` — 1 フレーム分の描画コマンド (DisplayList)。
+//! `Scene` — 1 フレーム分の描画コマンド (DisplayList、call-order interleave)。
 //!
-//! 上位層は `Scene::push_rect` 等でコマンドを積み、`Renderer::render(&scene)` を呼ぶ。
-//! 後の M3 で内部 scenegraph + 差分検出に置き換わるが、M1 では毎フレーム積み直しで OK。
+//! 上位層は `Scene::push_rect` / `push_text` / `push_lines` でコマンドを積み、
+//! `Renderer::render(&scene)` を呼ぶ。
+//!
+//! ## M9 Phase 45f: call-order primitive interleave
+//!
+//! 旧設計 (M7-M9 Phase 45e) は `rects` / `glyph_areas` / `line_batches` を **別 Vec**
+//! に振り分け、renderer が `rect → line → glyph` の固定順で描画していた。これは
+//! GPU の pipeline 切り替えコストを最小化する設計だが、副作用として **z-order が
+//! type ベース** になり、後から push した rect が前に push した glyph より下に描画
+//! される。 panel + text_input のような overlay で button text が透けて見える根本原因。
+//!
+//! 新設計: 全 primitive を **`primitives: Vec<Primitive>`** に call order で並べる。
+//! renderer は同 type の連続 primitive を 1 つの "run" にまとめて batch、各 run ごとに
+//! drawcall を発行する。state 切り替え数は run 数に比例 (典型的に 10-50 / frame、許容範囲)。
+//! popup pass も同じ pattern (`popup_primitives: Vec<Primitive>`)。
 
 /// RGBA、各成分 [0.0, 1.0] (sRGB)。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -134,60 +147,144 @@ pub struct LineBatch {
     pub clip_rect: Option<Rect>,
 }
 
-/// 1 フレームの全描画コマンド。
+/// 描画 primitive 1 つ分。`Scene::primitives` は **call order** でこれを並べる。
+#[derive(Debug, Clone)]
+pub enum Primitive {
+    Rect(RectCommand),
+    Glyph(GlyphArea),
+    Line(LineBatch),
+}
+
+/// 1 フレームの全描画コマンド (call-order interleave)。
 ///
 /// 2-pass 描画 (M7+ popup 対応):
-/// - **base pass**: `rects` → `line_batches` → `glyph_areas` の順で 1 度描画
-/// - **popup pass**: `popup_rects` → `popup_line_batches` → `popup_glyph_areas` を再度同順で描画
-///
-/// popup を独立 pass にする理由: pipeline 順 (rect→line→glyph) のため、popup の rect と
-/// 通常 widget の glyph が混在すると glyph が popup rect の上に出てしまう。popup を 2 度目の
-/// pass にすると popup 内の glyph が必ず通常 widget の最前面になる。
+/// - **base pass**: `primitives` を call order で walk、同 type 連続 primitive を 1 run に
+///   batch、各 run ごとに drawcall。run 順 = z-order。
+/// - **popup pass**: `popup_primitives` を同様に walk、base pass の上に再 render
+///   (`LoadOp::Load`)。popup 内 primitive は base 内 primitive の最前面に出る。
 #[derive(Debug)]
 pub struct Scene {
     pub clear_color: wgpu::Color,
-    pub rects: Vec<RectCommand>,
-    pub glyph_areas: Vec<GlyphArea>,
-    pub line_batches: Vec<LineBatch>,
-    /// popup 用 deferred buffer (frame 末尾で `Ui` の popup_rects 等から移される)。
-    /// renderer はこれを 2 nd pass で描画する。
-    pub popup_rects: Vec<RectCommand>,
-    pub popup_glyph_areas: Vec<GlyphArea>,
-    pub popup_line_batches: Vec<LineBatch>,
+    /// base pass の primitive 列 (call order で並ぶ、z-order を保つ)。
+    pub primitives: Vec<Primitive>,
+    /// popup pass の primitive 列。
+    pub popup_primitives: Vec<Primitive>,
 }
 
 impl Scene {
     pub fn new() -> Self {
         Self {
             clear_color: wgpu::Color { r: 0.05, g: 0.05, b: 0.06, a: 1.0 },
-            rects: Vec::new(),
-            glyph_areas: Vec::new(),
-            line_batches: Vec::new(),
-            popup_rects: Vec::new(),
-            popup_glyph_areas: Vec::new(),
-            popup_line_batches: Vec::new(),
+            primitives: Vec::new(),
+            popup_primitives: Vec::new(),
         }
     }
 
     pub fn clear(&mut self) {
-        self.rects.clear();
-        self.glyph_areas.clear();
-        self.line_batches.clear();
-        self.popup_rects.clear();
-        self.popup_glyph_areas.clear();
-        self.popup_line_batches.clear();
+        self.primitives.clear();
+        self.popup_primitives.clear();
     }
 
     pub fn push_rect(&mut self, cmd: RectCommand) {
-        self.rects.push(cmd);
+        self.primitives.push(Primitive::Rect(cmd));
     }
 
     pub fn push_text(&mut self, area: GlyphArea) {
-        self.glyph_areas.push(area);
+        self.primitives.push(Primitive::Glyph(area));
     }
 
     pub fn push_lines(&mut self, batch: LineBatch) {
-        self.line_batches.push(batch);
+        self.primitives.push(Primitive::Line(batch));
+    }
+
+    // ---- Test / debug helpers (旧 `scene.rects.len()` 等の代替) ----
+
+    /// base pass の rect primitive の数。
+    #[must_use]
+    pub fn rect_count(&self) -> usize {
+        self.primitives.iter().filter(|p| matches!(p, Primitive::Rect(_))).count()
+    }
+
+    /// base pass の glyph primitive の数。
+    #[must_use]
+    pub fn glyph_count(&self) -> usize {
+        self.primitives.iter().filter(|p| matches!(p, Primitive::Glyph(_))).count()
+    }
+
+    /// base pass の line batch primitive の数。
+    #[must_use]
+    pub fn line_count(&self) -> usize {
+        self.primitives.iter().filter(|p| matches!(p, Primitive::Line(_))).count()
+    }
+
+    /// base pass の rect primitive を call order で iterate。
+    pub fn iter_rects(&self) -> impl Iterator<Item = &RectCommand> {
+        self.primitives.iter().filter_map(|p| match p {
+            Primitive::Rect(c) => Some(c),
+            _ => None,
+        })
+    }
+
+    /// base pass の glyph primitive を call order で iterate。
+    pub fn iter_glyphs(&self) -> impl Iterator<Item = &GlyphArea> {
+        self.primitives.iter().filter_map(|p| match p {
+            Primitive::Glyph(g) => Some(g),
+            _ => None,
+        })
+    }
+
+    /// base pass の line batch を call order で iterate。
+    pub fn iter_lines(&self) -> impl Iterator<Item = &LineBatch> {
+        self.primitives.iter().filter_map(|p| match p {
+            Primitive::Line(l) => Some(l),
+            _ => None,
+        })
+    }
+
+    /// popup pass の rect primitive の数。
+    #[must_use]
+    pub fn popup_rect_count(&self) -> usize {
+        self.popup_primitives.iter().filter(|p| matches!(p, Primitive::Rect(_))).count()
+    }
+
+    /// popup pass の glyph primitive の数。
+    #[must_use]
+    pub fn popup_glyph_count(&self) -> usize {
+        self.popup_primitives.iter().filter(|p| matches!(p, Primitive::Glyph(_))).count()
+    }
+
+    /// popup pass の line batch の数。
+    #[must_use]
+    pub fn popup_line_count(&self) -> usize {
+        self.popup_primitives.iter().filter(|p| matches!(p, Primitive::Line(_))).count()
+    }
+
+    /// popup pass の rect primitive を call order で iterate。
+    pub fn iter_popup_rects(&self) -> impl Iterator<Item = &RectCommand> {
+        self.popup_primitives.iter().filter_map(|p| match p {
+            Primitive::Rect(c) => Some(c),
+            _ => None,
+        })
+    }
+
+    /// popup pass の glyph primitive を call order で iterate。
+    pub fn iter_popup_glyphs(&self) -> impl Iterator<Item = &GlyphArea> {
+        self.popup_primitives.iter().filter_map(|p| match p {
+            Primitive::Glyph(g) => Some(g),
+            _ => None,
+        })
+    }
+
+    /// test で `scene.rects_vec()[0]` のような index access を可能にする helper (RectCommand を copy)。
+    #[must_use]
+    pub fn rects_vec(&self) -> Vec<RectCommand> {
+        self.iter_rects().copied().collect()
+    }
+
+    /// test 用 helper (popup rect)。
+    #[must_use]
+    pub fn popup_rects_vec(&self) -> Vec<RectCommand> {
+        self.iter_popup_rects().copied().collect()
     }
 }
 

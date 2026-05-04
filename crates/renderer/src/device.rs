@@ -21,7 +21,9 @@ use std::sync::Arc;
 
 use daw_ui_platform::{PhysicalSize, WindowBackend};
 
-use crate::pipelines::{glyph::GlyphPipeline, line::LinePipeline, rect::RectPipeline};
+use crate::pipelines::{
+    enqueue_runs, glyph::GlyphPipeline, line::LinePipeline, rect::RectPipeline, render_runs,
+};
 use crate::scene::Scene;
 
 /// 描画器本体。アプリ層が1つ持ち、フレーム毎に `render(&Scene)` を呼ぶ。
@@ -167,6 +169,7 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
     ///
     /// # Errors
     /// サーフェステクスチャ取得不可 (デバイス消失等)。
+    #[allow(clippy::too_many_lines)]
     pub fn render(&mut self, scene: &Scene) -> Result<(), RenderError> {
         // 1. サーフェステクスチャ取得 (wgpu 29 は CurrentSurfaceTexture enum を返す)
         let frame = match self.surface.get_current_texture() {
@@ -195,17 +198,43 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // 2. base pass の prepare
-        self.rect.prepare(&self.device, &self.queue, &scene.rects, self.size);
-        self.line.prepare(&self.device, &self.queue, &scene.line_batches, self.size);
-        self.glyph.prepare(
+        // 2. begin_frame: 各 pipeline の scratch / pool を reset
+        self.rect.begin_frame();
+        self.line.begin_frame();
+        self.glyph.begin_frame(&self.queue, self.size);
+        self.popup_rect.begin_frame();
+        self.popup_line.begin_frame();
+        self.popup_glyph.begin_frame(&self.queue, self.size);
+
+        // 3. base pass: scene.primitives を call order で walk、同 type 連続を 1 run に enqueue
+        let base_runs = enqueue_runs(
+            &scene.primitives,
+            &mut self.rect,
+            &mut self.line,
+            &mut self.glyph,
             &self.device,
             &self.queue,
-            &scene.glyph_areas,
             self.size,
         );
 
-        // 3. encode (base pass: clear + 通常 widget 描画)
+        // 4. popup pass: scene.popup_primitives を同様に enqueue
+        let popup_runs = enqueue_runs(
+            &scene.popup_primitives,
+            &mut self.popup_rect,
+            &mut self.popup_line,
+            &mut self.popup_glyph,
+            &self.device,
+            &self.queue,
+            self.size,
+        );
+
+        // 5. upload (rect/line の instance buffer を 1 度に GPU へ転送、glyph は enqueue 内で済)
+        self.rect.upload(&self.queue, self.size);
+        self.line.upload(&self.queue, self.size);
+        self.popup_rect.upload(&self.queue, self.size);
+        self.popup_line.upload(&self.queue, self.size);
+
+        // 6. encode (base pass: clear + 全 base run を call order で render)
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("daw-ui frame encoder"),
         });
@@ -226,33 +255,21 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-
-            self.rect.render(&mut pass, self.size);
-            self.line.render(&mut pass, self.size);
-            self.glyph.render(&mut pass);
-        }
-
-        // 4. popup pass — base pass の上に popup 用 primitive を再描画。
-        // 同じ pipeline インスタンスで prepare し直し → 別 render_pass で描く。
-        // LoadOp::Load で base pass の描画結果を保持。
-        if !scene.popup_rects.is_empty()
-            || !scene.popup_glyph_areas.is_empty()
-            || !scene.popup_line_batches.is_empty()
-        {
-            // M9 Phase 44a: popup_rect / popup_line / popup_glyph (独立 pipeline インスタンス) を
-            // 使う。base 用 self.rect / self.line / self.glyph を再 prepare すると、各 pipeline の
-            // internal GPU buffer (instance buffer / vertex buffer / glyphon Atlas) が popup data で
-            // 上書きされる。queue.write_buffer の最終 write が submit 時に反映されるため、
-            // base pass の render が popup data を読んでしまい text_input の枠 rect / 画面上部の
-            // text が消える等の症状になる。独立インスタンスで干渉を避ける。
-            self.popup_rect.prepare(&self.device, &self.queue, &scene.popup_rects, self.size);
-            self.popup_line.prepare(&self.device, &self.queue, &scene.popup_line_batches, self.size);
-            self.popup_glyph.prepare(
-                &self.device,
-                &self.queue,
-                &scene.popup_glyph_areas,
+            render_runs(
+                &base_runs,
+                &self.rect,
+                &self.line,
+                &self.glyph,
+                &mut pass,
                 self.size,
             );
+        }
+
+        // 7. popup pass: base pass の上に popup primitives を render。
+        // M9 Phase 44a: popup_rect / popup_line / popup_glyph (独立 pipeline インスタンス) を使う。
+        // base 用 pipeline の GPU buffer が popup data で上書きされて base render が壊れる
+        // 干渉を避けるため、独立インスタンスを維持。
+        if !popup_runs.is_empty() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("daw-ui popup pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -269,10 +286,19 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.popup_rect.render(&mut pass, self.size);
-            self.popup_line.render(&mut pass, self.size);
-            self.popup_glyph.render(&mut pass);
+            render_runs(
+                &popup_runs,
+                &self.popup_rect,
+                &self.popup_line,
+                &self.popup_glyph,
+                &mut pass,
+                self.size,
+            );
         }
+
+        // 8. end_frame: glyph cache eviction を進める
+        self.glyph.end_frame();
+        self.popup_glyph.end_frame();
 
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();

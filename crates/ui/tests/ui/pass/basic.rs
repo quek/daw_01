@@ -5,7 +5,9 @@
 //! 紛れ込んでいるか、`Application::Message: Clone` のような型境界が露出している。
 
 use daw_ui_core::{
-    Edit, Note, NoteId, NotesEditRequest, PianoRollStyle, PianoRollView, PointerFrame, UiHost,
+    ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView,
+    ClipKey, Edit, Note, NoteId, NotesEditRequest, PianoRollStyle, PianoRollView, PointerFrame,
+    UiHost,
 };
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{Rect, Scene};
@@ -23,6 +25,10 @@ struct Model {
     // M9 Phase 41e: piano_roll widget 用 (non-Clone Model でも piano_roll が呼べることを担保)
     notes: Vec<Note>,
     selected_note_ids: Vec<NoteId>,
+    // M9 Phase 45e: arrangement widget 用 (non-Clone Model でも arrangement が呼べることを担保)
+    arr_tracks: Vec<ArrangementTrack>,
+    arr_selected_clips: Vec<ClipKey>,
+    arr_selected_track: Option<u32>,
 }
 
 fn main() {
@@ -37,6 +43,9 @@ fn main() {
         title: String::from("untitled"),
         notes: Vec::new(),
         selected_note_ids: Vec::new(),
+        arr_tracks: Vec::new(),
+        arr_selected_clips: Vec::new(),
+        arr_selected_track: None,
     };
 
     let edits = host.frame_to_edits(
@@ -144,6 +153,64 @@ fn main() {
                     NotesEditRequest::Move(_) => Edit::mutate(|_m: &mut Model| {}),
                     NotesEditRequest::Resize(_) => Edit::mutate(|_m: &mut Model| {}),
                     NotesEditRequest::Select { .. } => Edit::mutate(|_m: &mut Model| {}),
+                },
+            );
+            // M9 Phase 45e: arrangement widget が non-Clone Model でコンパイルする。
+            // 全 17 variants を make_edit でハンドルすることで API exhaustive 担保。
+            let arr_view = ArrangementView::default();
+            let arr_style = ArrangementStyle::default();
+            let _ = ui.arrangement(
+                "arr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &m.arr_tracks,
+                arr_view,
+                &m.arr_selected_clips,
+                m.arr_selected_track,
+                &arr_style,
+                |req| match req {
+                    ArrangementEditRequest::SelectClips { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::SelectTrack { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::MoveClips(_) => Edit::mutate(|_m: &mut Model| {
+                        let _new_clip = ArrangementClip {
+                            id: 0,
+                            start_beat: 0.0,
+                            len_beats: 1.0,
+                            name: std::sync::Arc::from("clip"),
+                            color: None,
+                        };
+                    }),
+                    ArrangementEditRequest::ResizeClips(_) => Edit::mutate(|_m: &mut Model| {}),
+                    ArrangementEditRequest::DeleteClips(_) => Edit::mutate(|_m: &mut Model| {}),
+                    ArrangementEditRequest::DoubleClickClip(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::DoubleClickEmpty { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::BeginRenameTrack(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::DeleteTrack(_) => Edit::mutate(|_m: &mut Model| {}),
+                    ArrangementEditRequest::MoveTrackUp(_) => Edit::mutate(|_m: &mut Model| {}),
+                    ArrangementEditRequest::MoveTrackDown(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::ToggleTrackMute(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::ToggleTrackSolo(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::SetLoopRange { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::SetZoomX(_) => Edit::mutate(|_m: &mut Model| {}),
+                    ArrangementEditRequest::SetScrollX(_) => Edit::mutate(|_m: &mut Model| {}),
+                    ArrangementEditRequest::SetTrackTop(_) => Edit::mutate(|_m: &mut Model| {}),
                 },
             );
         },

@@ -260,7 +260,7 @@ mod tests {
         // scene.rects 末尾に近い 3 行分を見て、index 1 の行が selected_bg と一致するか。
         // (scroll_area が末尾に scrollbar も push するが content_h <= rect.h なら scrollbar なし)
         let sel_bg = style.row_bg_selected;
-        let found_selected = scene.rects.iter().any(|r| {
+        let found_selected = scene.iter_rects().any(|r| {
             (r.fill.r - sel_bg.r).abs() < 1e-6
                 && (r.fill.g - sel_bg.g).abs() < 1e-6
                 && (r.fill.b - sel_bg.b).abs() < 1e-6

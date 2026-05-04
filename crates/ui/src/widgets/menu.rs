@@ -631,7 +631,7 @@ mod tests {
         });
         // popup_glyph_areas に "Undo" と "Ctrl+Z" の両方が含まれる
         let texts: Vec<&str> =
-            scene.popup_glyph_areas.iter().map(|g| g.text.as_str()).collect();
+            scene.iter_popup_glyphs().map(|g| g.text.as_str()).collect();
         assert!(texts.contains(&"Undo"), "label が popup に描画される: {texts:?}");
         assert!(texts.contains(&"Ctrl+Z"), "shortcut_hint が popup に描画される: {texts:?}");
     }

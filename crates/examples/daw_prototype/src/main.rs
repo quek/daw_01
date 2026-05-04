@@ -17,9 +17,10 @@
 use std::sync::Arc;
 
 use daw_ui_core::{
-    BarBeatGridStyle, DialogResult, Edit, FaderResponse, FileDialogFilter, InputAccumulator,
-    LevelMeterStyle, ListViewStyle, MenuItemSpec, MeterBallistic, ModalStyle, Orientation,
-    TimeMapping, TimeRulerStyle, UiHost, ViewportState1D,
+    ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView,
+    BarBeatGridStyle, ClipKey, DialogResult, Edit, FaderResponse, FileDialogFilter,
+    InputAccumulator, LevelMeterStyle, ListViewStyle, MenuItemSpec, MeterBallistic, ModalStyle,
+    Orientation, TimeMapping, TimeRulerStyle, UiHost, ViewportState1D, WidgetId,
 };
 use daw_ui_platform::{AppEvent, AppHost, WindowBackend, winit_backend};
 use daw_ui_renderer::{Color, Rect, RectCommand, Renderer, Scene};
@@ -28,6 +29,23 @@ use winit::window::WindowAttributes;
 const N_CH: usize = 8;
 const N_TRACKS: usize = 12;
 const N_BROWSER_ITEMS: usize = 40;
+
+struct DawClip {
+    id: u32,
+    start_beat: f64,
+    len_beats: f64,
+    name: Arc<str>,
+    color: Option<Color>,
+}
+
+struct DawTrack {
+    id: u32,
+    name: Arc<str>,
+    muted: bool,
+    solo: bool,
+    next_clip_id: u32,
+    clips: Vec<DawClip>,
+}
 
 struct DawModel {
     /// mixer faders / pans / mutes
@@ -47,10 +65,54 @@ struct DawModel {
     /// 発火までを繋ぐ 1 frame レイテンシ用フラグ。`button_at` の click closure からは
     /// `&mut Ui` にアクセスできないので、Edit 経由で立てて次フレームに `ui.open_modal` する。
     open_demo_request: bool,
+    // (M9 Phase 45e) arrangement widget 用 state
+    arr_tracks: Vec<DawTrack>,
+    arr_view: ArrangementView,
+    arr_selected_clips: Vec<ClipKey>,
+    arr_selected_track: Option<u32>,
+    /// `BeginRenameTrack(id)` 受信時にセット。`Some(id)` 中は該当 track header 上に
+    /// `text_input_at` を重ね描画。Enter / blur / ESC で `None` に戻す。
+    arr_rename_target: Option<u32>,
+    /// rename 開始した最初のフレームを示すフラグ。`true` のフレームで `ui.set_focus()` を呼んで
+    /// text_input にプログラム的にフォーカスを与え、その後 `false` にリセットする。
+    arr_rename_just_started: bool,
 }
 
 impl DawModel {
     fn new() -> Self {
+        let mut tracks: Vec<DawTrack> = Vec::with_capacity(N_TRACKS);
+        for ti in 0..N_TRACKS {
+            let mut clips: Vec<DawClip> = Vec::with_capacity(2);
+            for ci in 0..2 {
+                clips.push(DawClip {
+                    id: ci as u32,
+                    start_beat: ti as f64 * 1.5 + f64::from(ci) * 6.0,
+                    len_beats: 4.0,
+                    name: Arc::from(format!("clip{}", ci + 1)),
+                    color: None,
+                });
+            }
+            tracks.push(DawTrack {
+                id: ti as u32,
+                name: Arc::from(format!("Track {}", ti + 1)),
+                muted: false,
+                solo: false,
+                next_clip_id: 2,
+                clips,
+            });
+        }
+        let arr_view = ArrangementView {
+            start_beat: 0.0,
+            len_beats: 24.0,
+            track_top: 0.0,
+            tracks_visible: 8.0,
+            track_row_h: 32.0,
+            header_w: 180.0,
+            ruler_h: 24.0,
+            playhead_beat: Some(2.0),
+            loop_range: Some((4.0, 12.0)),
+            data_generation: 0,
+        };
         Self {
             faders: [0.55, 0.70, 0.30, 0.60, 0.40, 0.80, 0.20, 0.55],
             mutes: [false; N_CH],
@@ -60,6 +122,12 @@ impl DawModel {
             sim_phase: 0.0,
             last_action: "起動 — メニュー / タブ / dropdown / 右クリック を試して下さい".to_string(),
             open_demo_request: false,
+            arr_tracks: tracks,
+            arr_view,
+            arr_selected_clips: Vec::new(),
+            arr_selected_track: None,
+            arr_rename_target: None,
+            arr_rename_just_started: false,
         }
     }
 
@@ -68,10 +136,6 @@ impl DawModel {
         // mute はゼロ、fader で attenuation、peak は ±1 にクリップ可能
         if self.mutes[ch] { 0.0 } else { (f * self.faders[ch] * 1.2).clamp(0.0, 1.5) }
     }
-}
-
-fn arr_total_samples() -> f64 {
-    48_000.0 * 60.0 // 60 sec @ 48k
 }
 
 const PRESETS: &[&str] = &["Default", "Mixer-only", "Arrangement", "Piano-roll"];
@@ -528,97 +592,297 @@ fn drawmixer_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pane: Rec
     }
 }
 
-fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pane: Rect) {
-    let mapping = TimeMapping::default_4_4_120();
-    let ruler_h = 24.0;
-    let ruler_rect = Rect { x: pane.x, y: pane.y, w: pane.w, h: ruler_h };
-    let grid_rect = Rect {
-        x: pane.x,
-        y: pane.y + ruler_h,
-        w: pane.w,
-        h: (pane.h - ruler_h).max(50.0),
-    };
+/// `DawTrack` 列を `ArrangementTrack` に変換 (Arc<str> のみ clone)。
+fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
+    m.arr_tracks
+        .iter()
+        .map(|t| ArrangementTrack {
+            id: t.id,
+            name: Arc::clone(&t.name),
+            muted: t.muted,
+            solo: t.solo,
+            clips: t
+                .clips
+                .iter()
+                .map(|c| ArrangementClip {
+                    id: c.id,
+                    start_beat: c.start_beat,
+                    len_beats: c.len_beats,
+                    name: Arc::clone(&c.name),
+                    color: c.color,
+                })
+                .collect(),
+        })
+        .collect()
+}
 
-    // wheel zoom
-    let scroll = ui.take_scroll_in_rect(grid_rect);
-    if scroll.1.abs() > 0.0 {
-        let factor = (-scroll.1 * 0.005).exp();
-        let anchor_frac = if let Some((px, _)) = ui.pointer().pos {
-            ((px - grid_rect.x) / grid_rect.w.max(1.0)).clamp(0.0, 1.0)
-        } else {
-            0.5
-        };
-        let total = arr_total_samples();
-        ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
-            mm.arr_viewport.zoom_at(factor, anchor_frac, 1024.0);
-            mm.arr_viewport.clamp_to(total);
-        }));
+#[allow(clippy::too_many_lines)]
+fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pane: Rect) {
+    let arr_tracks = arr_track_views(m);
+    let style = ArrangementStyle::default();
+    let resp = ui.arrangement(
+        "arr",
+        pane,
+        &arr_tracks,
+        m.arr_view,
+        &m.arr_selected_clips,
+        m.arr_selected_track,
+        &style,
+        |req| match req {
+            ArrangementEditRequest::SelectClips { next, .. } => {
+                let next_v = next;
+                Edit::mutate(move |mm: &mut DawModel| {
+                    mm.arr_selected_clips = next_v;
+                    mm.last_action = "arr: SelectClips".to_string();
+                })
+            }
+            ArrangementEditRequest::SelectTrack { next, .. } => Edit::mutate(move |mm: &mut DawModel| {
+                mm.arr_selected_track = next;
+                mm.last_action = format!("arr: SelectTrack {next:?}");
+            }),
+            ArrangementEditRequest::MoveClips(deltas) => Edit::mutate(move |mm: &mut DawModel| {
+                let n = deltas.len();
+                for d in deltas {
+                    // remove from source track
+                    let removed = mm
+                        .arr_tracks
+                        .iter_mut()
+                        .find(|t| t.id == d.from.track)
+                        .and_then(|t| {
+                            let pos = t.clips.iter().position(|c| c.id == d.from.clip)?;
+                            Some(t.clips.remove(pos))
+                        });
+                    if let Some(mut clip) = removed {
+                        clip.start_beat = d.next_start_beat;
+                        if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == d.to_track) {
+                            // start_beat 順に挿入
+                            let pos = t
+                                .clips
+                                .iter()
+                                .position(|c| c.start_beat > clip.start_beat)
+                                .unwrap_or(t.clips.len());
+                            t.clips.insert(pos, clip);
+                        }
+                    }
+                }
+                mm.arr_view.data_generation += 1;
+                mm.last_action = format!("arr: MoveClips ({n})");
+            }),
+            ArrangementEditRequest::ResizeClips(deltas) => Edit::mutate(move |mm: &mut DawModel| {
+                let n = deltas.len();
+                for d in deltas {
+                    if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == d.key.track)
+                        && let Some(c) = t.clips.iter_mut().find(|c| c.id == d.key.clip)
+                    {
+                        c.start_beat = d.next_start;
+                        c.len_beats = d.next_len;
+                    }
+                }
+                mm.arr_view.data_generation += 1;
+                mm.last_action = format!("arr: ResizeClips ({n})");
+            }),
+            ArrangementEditRequest::DeleteClips(keys) => Edit::mutate(move |mm: &mut DawModel| {
+                let n = keys.len();
+                for k in keys {
+                    if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == k.track) {
+                        t.clips.retain(|c| c.id != k.clip);
+                    }
+                }
+                mm.arr_selected_clips.clear();
+                mm.arr_view.data_generation += 1;
+                mm.last_action = format!("arr: DeleteClips ({n})");
+            }),
+            ArrangementEditRequest::DoubleClickClip(key) => Edit::mutate(move |mm: &mut DawModel| {
+                mm.current_tab = 2;
+                mm.last_action =
+                    format!("arr: dbl-click clip → Piano Roll (track {} clip {})", key.track, key.clip);
+            }),
+            ArrangementEditRequest::DoubleClickEmpty { track, beat } => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == track) {
+                        let new_id = t.next_clip_id;
+                        t.next_clip_id += 1;
+                        let clip = DawClip {
+                            id: new_id,
+                            start_beat: beat.max(0.0),
+                            len_beats: 2.0,
+                            name: Arc::from(format!("new{new_id}")),
+                            color: None,
+                        };
+                        let pos = t
+                            .clips
+                            .iter()
+                            .position(|c| c.start_beat > clip.start_beat)
+                            .unwrap_or(t.clips.len());
+                        t.clips.insert(pos, clip);
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!("arr: CreateClip @ track {track} beat {beat:.2}");
+                })
+            }
+            ArrangementEditRequest::BeginRenameTrack(id) => Edit::mutate(move |mm: &mut DawModel| {
+                mm.arr_rename_target = Some(id);
+                mm.arr_rename_just_started = true;
+                mm.last_action = format!("arr: BeginRenameTrack {id}");
+            }),
+            ArrangementEditRequest::DeleteTrack(id) => Edit::mutate(move |mm: &mut DawModel| {
+                mm.arr_tracks.retain(|t| t.id != id);
+                if mm.arr_selected_track == Some(id) {
+                    mm.arr_selected_track = None;
+                }
+                mm.arr_view.data_generation += 1;
+                mm.last_action = format!("arr: DeleteTrack {id}");
+            }),
+            ArrangementEditRequest::MoveTrackUp(id) => Edit::mutate(move |mm: &mut DawModel| {
+                if let Some(idx) = mm.arr_tracks.iter().position(|t| t.id == id)
+                    && idx > 0
+                {
+                    mm.arr_tracks.swap(idx, idx - 1);
+                }
+                mm.arr_view.data_generation += 1;
+                mm.last_action = format!("arr: MoveTrackUp {id}");
+            }),
+            ArrangementEditRequest::MoveTrackDown(id) => Edit::mutate(move |mm: &mut DawModel| {
+                if let Some(idx) = mm.arr_tracks.iter().position(|t| t.id == id)
+                    && idx + 1 < mm.arr_tracks.len()
+                {
+                    mm.arr_tracks.swap(idx, idx + 1);
+                }
+                mm.arr_view.data_generation += 1;
+                mm.last_action = format!("arr: MoveTrackDown {id}");
+            }),
+            ArrangementEditRequest::ToggleTrackMute(id) => Edit::mutate(move |mm: &mut DawModel| {
+                if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == id) {
+                    t.muted = !t.muted;
+                }
+                mm.arr_view.data_generation += 1;
+                mm.last_action = format!("arr: ToggleMute {id}");
+            }),
+            ArrangementEditRequest::ToggleTrackSolo(id) => Edit::mutate(move |mm: &mut DawModel| {
+                if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == id) {
+                    t.solo = !t.solo;
+                }
+                mm.arr_view.data_generation += 1;
+                mm.last_action = format!("arr: ToggleSolo {id}");
+            }),
+            ArrangementEditRequest::SetLoopRange { start, end } => Edit::mutate(move |mm: &mut DawModel| {
+                let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+                mm.arr_view.loop_range = Some((lo, hi));
+                mm.last_action = format!("arr: SetLoopRange [{lo:.2}, {hi:.2}]");
+            }),
+            ArrangementEditRequest::SetZoomX(factor) => Edit::mutate(move |mm: &mut DawModel| {
+                let new_len = (mm.arr_view.len_beats * f64::from(factor)).clamp(1.0, 256.0);
+                mm.arr_view.len_beats = new_len;
+                mm.last_action = format!("arr: SetZoomX → len={new_len:.2}");
+            }),
+            ArrangementEditRequest::SetScrollX(start) => Edit::mutate(move |mm: &mut DawModel| {
+                mm.arr_view.start_beat = start.max(0.0);
+            }),
+            ArrangementEditRequest::SetTrackTop(top) => Edit::mutate(move |mm: &mut DawModel| {
+                let max_top = (mm.arr_tracks.len() as f32 - mm.arr_view.tracks_visible)
+                    .max(0.0)
+                    * mm.arr_view.track_row_h;
+                mm.arr_view.track_top = top.clamp(0.0, max_top);
+            }),
+        },
+    );
+
+    // ---- track header 右クリック context_menu (Rename / Delete) ----
+    for (track_id, header_rect) in &resp.track_header_rects {
+        let tid = *track_id;
+        ui.context_menu_for(*header_rect, &["Rename", "Delete"], move |idx, ui| {
+            match idx {
+                0 => ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
+                    mm.arr_rename_target = Some(tid);
+                    mm.arr_rename_just_started = true;
+                    mm.last_action = format!("arr: Rename {tid} (context)");
+                })),
+                1 => ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
+                    mm.arr_tracks.retain(|t| t.id != tid);
+                    if mm.arr_selected_track == Some(tid) {
+                        mm.arr_selected_track = None;
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!("arr: Delete {tid} (context)");
+                })),
+                _ => {}
+            }
+        });
     }
 
-    let viewport = m.arr_viewport;
-    ui.time_ruler("arr_ruler", ruler_rect, mapping, viewport, TimeRulerStyle::default());
-
-    // 背景 + grid
-    ui.push_rect(RectCommand {
-        rect: grid_rect,
-        fill: Color::rgb(0.10, 0.11, 0.13),
-        border: Color::TRANSPARENT,
-        border_width: 0.0,
-        radius: [0.0; 4],
-        clip_rect: None,
-    });
-    ui.bar_beat_grid("arr_grid", grid_rect, mapping, viewport, BarBeatGridStyle::default());
-
-    // 仮 12 トラック の clip 表示
-    let track_h = (grid_rect.h / N_TRACKS as f32).max(20.0);
-    for t in 0..N_TRACKS {
-        let row_y = grid_rect.y + track_h * t as f32;
-        let row_rect = Rect { x: grid_rect.x, y: row_y, w: grid_rect.w, h: track_h };
-        // クリップ: 各トラックに 2 個ずつ仮配置 (samples 単位)
-        for c in 0..2 {
-            let start_s = (t as f64 * 96000.0 + f64::from(c) * 144000.0) % arr_total_samples();
-            let len_s = 72000.0;
-            let x0 = grid_rect.x + viewport.unit_to_px(start_s, grid_rect.w);
-            let w = viewport.unit_to_px(len_s, grid_rect.w);
-            let clip_rect = Rect { x: x0, y: row_y + 2.0, w, h: track_h - 4.0 };
-            // viewport 外なら skip
-            if clip_rect.x + clip_rect.w < grid_rect.x || clip_rect.x > grid_rect.x + grid_rect.w {
-                continue;
-            }
-            ui.push_rect(RectCommand {
-                rect: clip_rect,
-                fill: Color::rgb(0.18, 0.40, 0.65),
-                border: Color::rgb(0.30, 0.55, 0.78),
-                border_width: 1.0,
-                radius: [3.0; 4],
-                clip_rect: Some(grid_rect),
-            });
-            // double-click でその clip を Piano Roll タブで開く (M9 P1-4 の活用例)
-            if ui.take_double_click_in_rect(clip_rect).is_some() {
-                ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
-                    mm.current_tab = 2;
-                    mm.last_action =
-                        format!("clip dbl-click → Piano Roll (track {t} clip {c})");
+    // ---- Rename UI overlay (text_input_at を該当 header rect 上に重ねる) ----
+    if let Some(rid) = m.arr_rename_target {
+        // 該当 track の現名 + header rect を引く
+        let cur_name = m
+            .arr_tracks
+            .iter()
+            .find(|t| t.id == rid)
+            .map(|t| t.name.to_string())
+            .unwrap_or_default();
+        let header_rect = resp
+            .track_header_rects
+            .iter()
+            .find(|(id, _)| *id == rid)
+            .map(|(_, r)| *r);
+        if let Some(rect) = header_rect {
+            let pad = 4.0_f32;
+            let text_rect = Rect {
+                x: rect.x + pad,
+                y: rect.y + pad,
+                w: (rect.w - pad * 2.0).max(20.0),
+                h: (rect.h - pad * 2.0).max(20.0),
+            };
+            // 初回フレームで text_input にプログラム的に focus を与える (内部 wid は
+            // `WidgetId::ROOT.child((b"text_input", &id))` 規約)。
+            if m.arr_rename_just_started {
+                let text_input_wid =
+                    WidgetId::ROOT.child((b"text_input", &("arr_rename", rid)));
+                ui.set_focus(text_input_wid);
+                ui.push_edit(Edit::mutate(|mm: &mut DawModel| {
+                    mm.arr_rename_just_started = false;
                 }));
             }
-            // 右クリックで context_menu (clip 上で)
-            ui.context_menu_for(clip_rect, &["Cut", "Copy", "Delete", "Duplicate"], move |idx, ui| {
-                let actions = ["Cut", "Copy", "Delete", "Duplicate"];
-                let label = actions.get(idx).copied().unwrap_or("?").to_string();
+            // text_input は背景塗りを持たないため、後ろの track header text が透けて見える。
+            // overlay 用に不透明 panel を先に置く (text_input より一段下、glyph より上に来る)。
+            ui.panel(
+                ("arr_rename_bg", rid),
+                text_rect,
+                Color::rgb(0.18, 0.20, 0.24),
+                3.0,
+            );
+            // on_change では track 名だけ更新 (`arr_rename_target` は触らない、
+            // overlay 消去は Enter (resp.committed) / ESC (take_shortcut) で行う)。
+            let resp_text =
+                ui.text_input_at(("arr_rename", rid), text_rect, &cur_name, move |new| {
+                    Edit::mutate(move |mm: &mut DawModel| {
+                        if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == rid) {
+                            t.name = Arc::from(new.as_str());
+                        }
+                        mm.arr_view.data_generation += 1;
+                        mm.last_action = format!("arr: rename → {new}");
+                    })
+                });
+            // Enter で確定 → overlay 消去
+            if resp_text.committed {
                 ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
-                    mm.last_action = format!("clip ctx → {label} (track {t} clip {c})");
+                    mm.arr_rename_target = None;
+                    mm.last_action = format!("arr: Rename {rid} committed");
                 }));
-            });
+            }
+            // ESC でキャンセル
+            if ui.take_shortcut("escape") {
+                ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
+                    mm.arr_rename_target = None;
+                    mm.last_action = "arr: Rename cancelled".to_string();
+                }));
+            }
+        } else {
+            // header_rect が引けない (track 削除済) → クリア
+            ui.push_edit(Edit::mutate(|mm: &mut DawModel| {
+                mm.arr_rename_target = None;
+                mm.arr_rename_just_started = false;
+            }));
         }
-        // track separator
-        ui.push_rect(RectCommand {
-            rect: Rect { x: row_rect.x, y: row_rect.y + row_rect.h - 1.0, w: row_rect.w, h: 1.0 },
-            fill: Color::rgba(0.0, 0.0, 0.0, 0.5),
-            border: Color::TRANSPARENT,
-            border_width: 0.0,
-            radius: [0.0; 4],
-            clip_rect: None,
-        });
     }
 }
 

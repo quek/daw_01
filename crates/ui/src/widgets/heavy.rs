@@ -289,8 +289,8 @@ mod tests {
             });
         });
         assert_eq!(calls.get(), 1);
-        assert_eq!(scene.rects.len(), 1);
-        assert_eq!(scene.rects[0].rect, test_rect);
+        assert_eq!(scene.rect_count(), 1);
+        assert_eq!(scene.rects_vec()[0].rect, test_rect);
 
         // Frame 2: 同じ viewport_key → cache hit、draw_fn skip。scene には cached 経由で
         // 同じ rect が積まれる。
@@ -304,8 +304,8 @@ mod tests {
             });
         });
         assert_eq!(calls.get(), 1, "cache hit で draw_fn は呼ばれない");
-        assert_eq!(scene.rects.len(), 1, "cache 経由で同じ rect が積まれる");
-        assert_eq!(scene.rects[0].rect, test_rect);
+        assert_eq!(scene.rect_count(), 1, "cache 経由で同じ rect が積まれる");
+        assert_eq!(scene.rects_vec()[0].rect, test_rect);
     }
 
     /// viewport_key が変わると cache miss、draw_fn が再実行される。

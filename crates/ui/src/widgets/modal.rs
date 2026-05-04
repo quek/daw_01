@@ -298,9 +298,9 @@ mod tests {
         // popup_layer 内 (`drawing_in_popup = true`) の primitive は `scene.popup_rects` に
         // 移される (Phase 44a で popup pass を独立 pipeline 化した結果)。
         assert!(
-            scene.popup_rects.len() >= 2,
-            "overlay + panel が popup_rects に積まれた ({:?})",
-            scene.popup_rects.len()
+            scene.popup_rect_count() >= 2,
+            "overlay + panel が popup_primitives に積まれた ({})",
+            scene.popup_rect_count()
         );
     }
 

@@ -323,8 +323,9 @@ mod tests {
         });
 
         // 1: 本体 / 2: hint band
-        assert_eq!(scene.rects.len(), 2);
-        let band = &scene.rects[1];
+        assert_eq!(scene.rect_count(), 2);
+        let rects = scene.rects_vec();
+        let band = &rects[1];
         assert!((band.rect.h - style.hint_band_h).abs() < 1e-6);
         assert!((band.rect.y + band.rect.h - rect.h).abs() < 1e-6);
         assert!((band.fill.r - 1.0).abs() < 1e-6);
@@ -345,7 +346,7 @@ mod tests {
             ui.toggle_button_at("t", "M", rect, false, &style, |_| Edit::mutate(|(): &mut ()| {}));
         });
 
-        assert_eq!(scene.rects.len(), 1, "value=false なら hint band は出ない");
+        assert_eq!(scene.rect_count(), 1, "value=false なら hint band は出ない");
     }
 
     #[test]
@@ -360,7 +361,7 @@ mod tests {
             ui.toggle_button_at("t", "M", rect, true, &style, |_| Edit::mutate(|(): &mut ()| {}));
         });
 
-        assert_eq!(scene.rects.len(), 1, "hint_band: None なら value=true でも帯なし");
+        assert_eq!(scene.rect_count(), 1, "hint_band: None なら value=true でも帯なし");
     }
 
     #[test]
@@ -381,7 +382,7 @@ mod tests {
                 Edit::mutate(|(): &mut ()| {})
             });
         });
-        let off_r = scene.rects[0].fill.r;
+        let off_r = scene.rects_vec()[0].fill.r;
 
         scene.clear();
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
@@ -389,7 +390,7 @@ mod tests {
                 Edit::mutate(|(): &mut ()| {})
             });
         });
-        let on_r = scene.rects[0].fill.r;
+        let on_r = scene.rects_vec()[0].fill.r;
 
         assert!(off_r < 0.5);
         assert!(on_r > 0.5);

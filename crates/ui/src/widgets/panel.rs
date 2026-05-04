@@ -104,13 +104,13 @@ mod tests {
             ui.panel("bg", rect, fill, 0.0);
         });
 
-        assert_eq!(scene.rects.len(), 1);
-        assert_eq!(scene.rects[0].rect, rect);
-        assert!(approx(scene.rects[0].fill.r, fill.r));
-        assert!(approx(scene.rects[0].fill.g, fill.g));
-        assert!(approx(scene.rects[0].fill.b, fill.b));
-        assert!(approx(scene.rects[0].border_width, 0.0));
-        assert!(scene.rects[0].radius.iter().all(|r| approx(*r, 0.0)));
+        assert_eq!(scene.rect_count(), 1);
+        assert_eq!(scene.rects_vec()[0].rect, rect);
+        assert!(approx(scene.rects_vec()[0].fill.r, fill.r));
+        assert!(approx(scene.rects_vec()[0].fill.g, fill.g));
+        assert!(approx(scene.rects_vec()[0].fill.b, fill.b));
+        assert!(approx(scene.rects_vec()[0].border_width, 0.0));
+        assert!(scene.rects_vec()[0].radius.iter().all(|r| approx(*r, 0.0)));
     }
 
     #[test]
@@ -126,10 +126,10 @@ mod tests {
             ui.panel_with_border("bg2", rect, fill, border, 2.0, 6.0);
         });
 
-        assert_eq!(scene.rects.len(), 1);
-        assert!(approx(scene.rects[0].border_width, 2.0));
-        assert!(scene.rects[0].radius.iter().all(|r| approx(*r, 6.0)));
-        assert!(approx(scene.rects[0].border.r, 1.0));
+        assert_eq!(scene.rect_count(), 1);
+        assert!(approx(scene.rects_vec()[0].border_width, 2.0));
+        assert!(scene.rects_vec()[0].radius.iter().all(|r| approx(*r, 6.0)));
+        assert!(approx(scene.rects_vec()[0].border.r, 1.0));
     }
 
     #[test]
@@ -143,14 +143,14 @@ mod tests {
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.panel("bg", rect, fill, 0.0);
         });
-        assert_eq!(scene.rects.len(), 1);
+        assert_eq!(scene.rect_count(), 1);
 
         scene.clear();
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.panel("bg", rect, fill, 0.0);
         });
-        assert_eq!(scene.rects.len(), 1, "2 回目も rect が cached 経由で積まれる");
-        assert_eq!(scene.rects[0].rect, rect);
+        assert_eq!(scene.rect_count(), 1, "2 回目も rect が cached 経由で積まれる");
+        assert_eq!(scene.rects_vec()[0].rect, rect);
     }
 
     #[test]
@@ -167,8 +167,8 @@ mod tests {
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.panel("bg", Rect { x: 0.0, y: 0.0, w: 200.0, h: 100.0 }, fill, 0.0);
         });
-        assert_eq!(scene.rects.len(), 1);
-        assert!(approx(scene.rects[0].rect.w, 200.0));
+        assert_eq!(scene.rect_count(), 1);
+        assert!(approx(scene.rects_vec()[0].rect.w, 200.0));
     }
 
     #[test]
@@ -185,8 +185,8 @@ mod tests {
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.panel("bg", rect, Color::rgb(0.9, 0.1, 0.1), 0.0);
         });
-        assert_eq!(scene.rects.len(), 1);
-        assert!((scene.rects[0].fill.r - 0.9).abs() < 1e-6);
+        assert_eq!(scene.rect_count(), 1);
+        assert!((scene.rects_vec()[0].fill.r - 0.9).abs() < 1e-6);
     }
 
     #[test]
@@ -200,8 +200,8 @@ mod tests {
             ui.panel("a", Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, fill, 0.0);
             ui.panel("b", Rect { x: 100.0, y: 0.0, w: 100.0, h: 100.0 }, fill, 0.0);
         });
-        assert_eq!(scene.rects.len(), 2);
-        assert!(approx(scene.rects[0].rect.x, 0.0));
-        assert!(approx(scene.rects[1].rect.x, 100.0));
+        assert_eq!(scene.rect_count(), 2);
+        assert!(approx(scene.rects_vec()[0].rect.x, 0.0));
+        assert!(approx(scene.rects_vec()[1].rect.x, 100.0));
     }
 }
