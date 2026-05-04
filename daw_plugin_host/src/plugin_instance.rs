@@ -14,6 +14,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use common::plugin_format::PluginFormat;
+use common::protocol::RenderMode;
 
 use crate::clap_plugin::ClapPlugin;
 use crate::vst3_plugin::Vst3Plugin;
@@ -86,6 +87,14 @@ pub trait LoadedPlugin: Send {
     /// into `out`, draining the plugin's buffer in place (pre-allocated
     /// capacity preserved).
     fn drain_out_notes_into(&mut self, out: &mut Vec<TimedNoteEvent>);
+
+    // --- render-mode hint (CLAP `render` ext) ---------------------------
+    /// Tell the plugin whether the next `process()` calls are realtime
+    /// or offline (during WAV export). Returns `true` if the plugin
+    /// accepted the change. CLAP plugins forward to
+    /// `clap_plugin_render.set`; backends without the extension return
+    /// `false` and continue at whatever mode they were already in.
+    fn set_render_mode(&mut self, mode: RenderMode) -> bool;
 
     // --- persistence (plugin-main thread) -------------------------------
     fn state_save(&self) -> Result<Option<Vec<u8>>>;

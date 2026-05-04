@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use common::plugin_format::PluginFormat;
+use common::protocol::RenderMode;
 use common::vst3_scan::resolve_vst3_dll;
 use libloading::{Library, Symbol};
 use vst3::{
@@ -743,6 +744,14 @@ impl LoadedPlugin for Vst3Plugin {
 
     fn drain_out_notes_into(&mut self, out: &mut Vec<TimedNoteEvent>) {
         out.append(&mut self.collected_out_notes);
+    }
+
+    fn set_render_mode(&mut self, _mode: RenderMode) -> bool {
+        // VST3 has `IComponent::setIoMode` and `ProcessSetup::processMode`
+        // for offline rendering, but mapping our `RenderMode` to those is
+        // M2 work. M1: no-op. CLAP plugins still get the proper signal
+        // because they're the only backend exporting now.
+        false
     }
 
     fn state_save(&self) -> Result<Option<Vec<u8>>> {

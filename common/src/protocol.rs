@@ -22,6 +22,19 @@ pub enum ChildKind {
     PluginHost,
 }
 
+/// CLAP `render` extension mode. Sent to the plugin host via
+/// `MainToChild::SetRenderMode` so it can call
+/// `clap_plugin_render.set` on every loaded plugin.
+///
+/// `Realtime` is the default — plugins should optimise for low latency.
+/// `Offline` is set during WAV export so plugins free to use higher
+/// quality / non-realtime algorithms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub enum RenderMode {
+    Realtime,
+    Offline,
+}
+
 impl ChildKind {
     pub fn as_str(self) -> &'static str {
         match self {

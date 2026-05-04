@@ -15,6 +15,9 @@ use clap_sys::ext::gui::{
     CLAP_EXT_GUI, CLAP_WINDOW_API_WIN32, clap_plugin_gui, clap_window, clap_window_handle,
 };
 use clap_sys::ext::note_ports::{CLAP_EXT_NOTE_PORTS, clap_plugin_note_ports};
+use clap_sys::ext::render::{
+    CLAP_EXT_RENDER, CLAP_RENDER_OFFLINE, CLAP_RENDER_REALTIME, clap_plugin_render,
+};
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
 use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
@@ -23,6 +26,7 @@ use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
 use clap_sys::process::clap_process;
 use clap_sys::version::clap_version_is_compatible;
 use common::plugin_format::PluginFormat;
+use common::protocol::RenderMode;
 use libloading::{Library, Symbol};
 
 use crate::clap_host::Host;
@@ -956,6 +960,30 @@ impl LoadedPlugin for ClapPlugin {
 
     fn drain_out_notes_into(&mut self, out: &mut Vec<TimedNoteEvent>) {
         self.drain_out_notes_into(out);
+    }
+
+    fn set_render_mode(&mut self, mode: RenderMode) -> bool {
+        if self.plugin.is_null() {
+            return false;
+        }
+        let plugin = unsafe { &*self.plugin };
+        let Some(get_ext) = plugin.get_extension else {
+            return false;
+        };
+        let ext_ptr =
+            unsafe { get_ext(self.plugin, CLAP_EXT_RENDER.as_ptr()) } as *const clap_plugin_render;
+        if ext_ptr.is_null() {
+            return false;
+        }
+        let render_mode = match mode {
+            RenderMode::Realtime => CLAP_RENDER_REALTIME,
+            RenderMode::Offline => CLAP_RENDER_OFFLINE,
+        };
+        let set_fn = unsafe { (*ext_ptr).set };
+        let Some(set_fn) = set_fn else {
+            return false;
+        };
+        unsafe { set_fn(self.plugin, render_mode) }
     }
 
     fn state_save(&self) -> Result<Option<Vec<u8>>> {
