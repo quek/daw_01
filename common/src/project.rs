@@ -95,6 +95,7 @@ mod tests {
                     style_name: "ノーマル".into(),
                 },
                 clips: vec![Clip {
+                    id: 1,
                     name: "こんにちは".into(),
                     start_beat: 0.0,
                     length_beats: 16.0,

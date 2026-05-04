@@ -455,6 +455,7 @@ mod tests {
     #[test]
     fn empty_clip_yields_two_rests() {
         let clip = Clip {
+            id: 1,
             name: "c".into(),
             start_beat: 0.0,
             length_beats: 4.0,
@@ -469,6 +470,7 @@ mod tests {
     #[test]
     fn single_note_emits_rest_note_rest() {
         let clip = Clip {
+            id: 1,
             name: "c".into(),
             start_beat: 0.0,
             length_beats: 4.0,
@@ -492,6 +494,7 @@ mod tests {
     #[test]
     fn gap_between_notes_emits_rest_in_between() {
         let clip = Clip {
+            id: 1,
             name: "c".into(),
             start_beat: 0.0,
             length_beats: 8.0,
@@ -530,6 +533,7 @@ mod tests {
         // Notes that end exactly where the next one starts shouldn't get
         // a 0-frame rest stuffed between them.
         let clip = Clip {
+            id: 1,
             name: "c".into(),
             start_beat: 0.0,
             length_beats: 8.0,
@@ -561,6 +565,7 @@ mod tests {
     #[test]
     fn lyric_with_quotes_is_escaped() {
         let clip = Clip {
+            id: 1,
             name: "c".into(),
             start_beat: 0.0,
             length_beats: 4.0,
@@ -580,6 +585,7 @@ mod tests {
     #[test]
     fn unsorted_notes_are_sorted_before_emitting() {
         let clip = Clip {
+            id: 1,
             name: "c".into(),
             start_beat: 0.0,
             length_beats: 8.0,

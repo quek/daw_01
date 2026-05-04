@@ -89,6 +89,7 @@ mod tests {
                 name: "T".into(),
                 source: InstrumentSource::BuiltinSynth,
                 clips: vec![Clip {
+                    id: 1,
                     name: "C".into(),
                     start_beat,
                     length_beats,
@@ -149,6 +150,7 @@ mod tests {
                 Track {
                     name: "A".into(),
                     clips: vec![Clip {
+                        id: 1,
                         name: "A0".into(),
                         start_beat: 0.0,
                         length_beats: 4.0,
@@ -159,6 +161,7 @@ mod tests {
                 Track {
                     name: "B".into(),
                     clips: vec![Clip {
+                        id: 1,
                         name: "B0".into(),
                         start_beat: 6.0,
                         length_beats: 2.0,

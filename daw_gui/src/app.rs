@@ -1130,8 +1130,9 @@ impl AppData {
 
     fn action_open_path(&mut self, path: PathBuf) {
         match common::project::load(&path) {
-            Ok(song) => {
+            Ok(mut song) => {
                 tracing::info!(path = %path.display(), "loaded project");
+                song.ensure_ids();
                 self.restore_plugin_from_song(&song);
                 self.song = song;
                 self.file_path = Some(path.clone());
@@ -1442,7 +1443,9 @@ impl AppData {
 
     fn ensure_first_track(&mut self) {
         if self.song.tracks.is_empty() {
+            let id = self.song.alloc_track_id();
             self.song.tracks.push(Track {
+                id,
                 name: "Track 1".into(),
                 ..Track::default()
             });
@@ -1451,16 +1454,20 @@ impl AppData {
     }
 
     fn action_add_vocal_track(&mut self) {
+        let id = self.song.alloc_track_id();
         let index = self.song.tracks.len() + 1;
-        let track = Track {
+        let mut track = Track {
+            id,
             name: format!("Track {index}"),
             source: InstrumentSource::Vocal {
                 speaker_id: common::voicevox::DEFAULT_SINGER_ID,
                 style_name: "ノーマル".into(),
             },
-            clips: vec![demo_clip()],
             ..Track::default()
         };
+        let mut clip = demo_clip();
+        clip.id = track.alloc_clip_id();
+        track.clips.push(clip);
         self.song.tracks.push(track);
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
@@ -1468,8 +1475,10 @@ impl AppData {
     }
 
     fn action_add_instrument_track(&mut self) {
+        let id = self.song.alloc_track_id();
         let index = self.song.tracks.len() + 1;
         let track = Track {
+            id,
             name: format!("Track {index}"),
             source: InstrumentSource::None,
             clips: Vec::new(),
@@ -1611,9 +1620,12 @@ impl AppData {
         let Some(track) = self.song.tracks.get_mut(track_idx as usize) else {
             return;
         };
+        let new_clip_id = track.alloc_clip_id();
         let new_idx = track.clips.len() as u32;
+        let clip_no = track.clips.len() + 1;
         track.clips.push(Clip {
-            name: format!("Clip {}", track.clips.len() + 1),
+            id: new_clip_id,
+            name: format!("Clip {clip_no}"),
             start_beat,
             length_beats: DEFAULT_CLIP_LENGTH,
             notes: Vec::new(),
@@ -2415,6 +2427,7 @@ fn demo_clip() -> Clip {
         })
         .collect();
     Clip {
+        id: 1,
         name: "こんにちわ".into(),
         start_beat: 0.0,
         length_beats: 4.0,

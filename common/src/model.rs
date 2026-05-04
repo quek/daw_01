@@ -5,10 +5,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::plugin_format::PluginFormat;
 
-/// Bumped from `1` when the row-based clip model was replaced by free-time
-/// notes. Older `.daw` files cannot be loaded; this is acceptable while
+/// Bumped to `3` when stable `id` fields were added to `Track` / `Clip`
+/// (track / clip move and id-based addressing for the gui_01 arrangement
+/// widget). Older `.daw` files cannot be loaded; this is acceptable while
 /// the project is still in M1 / pre-release.
-pub const CURRENT_VERSION: u32 = 2;
+pub const CURRENT_VERSION: u32 = 3;
 
 /// Serde adapter for `Option<Vec<u8>>` that writes binary data as base64 in
 /// JSON (and other human-readable formats). Bincode bypasses this and uses
@@ -62,6 +63,12 @@ pub struct Song {
     pub loop_start_beat: f64,
     #[serde(default)]
     pub loop_end_beat: f64,
+    /// Stable id allocator for `Track`. Bumped each time a new track is
+    /// created; never reused even after deletion. `0` is reserved as
+    /// "未採番" sentinel — assigned the first available id at allocation
+    /// time.
+    #[serde(default)]
+    pub next_track_id: u32,
 }
 
 impl Default for Song {
@@ -73,7 +80,48 @@ impl Default for Song {
             tracks: Vec::new(),
             loop_start_beat: 0.0,
             loop_end_beat: 0.0,
+            next_track_id: 1,
         }
+    }
+}
+
+impl Song {
+    /// Allocate a new stable track id, bumping the song-level counter.
+    pub fn alloc_track_id(&mut self) -> u32 {
+        let id = self.next_track_id.max(1);
+        self.next_track_id = id + 1;
+        id
+    }
+
+    /// Re-assign stable ids to all tracks / clips after loading an older
+    /// project file (or any save predating the id schema). Idempotent:
+    /// records that already have non-zero ids are left untouched, and
+    /// `next_*_id` counters are bumped above the highest seen id.
+    pub fn ensure_ids(&mut self) {
+        for track in &mut self.tracks {
+            if track.id == 0 {
+                track.id = self.next_track_id.max(1);
+                self.next_track_id = track.id + 1;
+            } else if track.id >= self.next_track_id {
+                self.next_track_id = track.id + 1;
+            }
+            track.ensure_clip_ids();
+        }
+        if self.next_track_id == 0 {
+            self.next_track_id = 1;
+        }
+    }
+
+    pub fn track_index_by_id(&self, track_id: u32) -> Option<usize> {
+        self.tracks.iter().position(|t| t.id == track_id)
+    }
+
+    pub fn track_by_id(&self, track_id: u32) -> Option<&Track> {
+        self.tracks.iter().find(|t| t.id == track_id)
+    }
+
+    pub fn track_by_id_mut(&mut self, track_id: u32) -> Option<&mut Track> {
+        self.tracks.iter_mut().find(|t| t.id == track_id)
     }
 }
 
@@ -90,6 +138,12 @@ impl Default for Song {
 /// final audio is mixed into the master bus.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Track {
+    /// Stable id assigned by `Song::alloc_track_id`. `0` is "未採番"
+    /// sentinel — reassigned by `Song::ensure_ids` when loading an older
+    /// file. Persists across track add/remove and reorder; arrangement
+    /// widget addresses tracks by this id, not by index.
+    #[serde(default)]
+    pub id: u32,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instrument: Option<PluginInstance>,
@@ -114,6 +168,10 @@ pub struct Track {
     pub source: InstrumentSource,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clips: Vec<Clip>,
+    /// Per-track stable id allocator for `Clip`. Bumped each time a new
+    /// clip is created on this track.
+    #[serde(default)]
+    pub next_clip_id: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
@@ -128,6 +186,7 @@ pub enum InstrumentSource {
 impl Default for Track {
     fn default() -> Self {
         Self {
+            id: 0,
             name: String::new(),
             instrument: None,
             midi_fx_chain: Vec::new(),
@@ -138,7 +197,45 @@ impl Default for Track {
             solo: false,
             source: InstrumentSource::None,
             clips: Vec::new(),
+            next_clip_id: 1,
         }
+    }
+}
+
+impl Track {
+    /// Allocate a new stable clip id, bumping the per-track counter.
+    pub fn alloc_clip_id(&mut self) -> u32 {
+        let id = self.next_clip_id.max(1);
+        self.next_clip_id = id + 1;
+        id
+    }
+
+    /// Re-assign stable ids to all clips. Idempotent (clips with non-zero
+    /// ids are left alone, counter is bumped above the max seen).
+    pub fn ensure_clip_ids(&mut self) {
+        for clip in &mut self.clips {
+            if clip.id == 0 {
+                clip.id = self.next_clip_id.max(1);
+                self.next_clip_id = clip.id + 1;
+            } else if clip.id >= self.next_clip_id {
+                self.next_clip_id = clip.id + 1;
+            }
+        }
+        if self.next_clip_id == 0 {
+            self.next_clip_id = 1;
+        }
+    }
+
+    pub fn clip_index_by_id(&self, clip_id: u32) -> Option<usize> {
+        self.clips.iter().position(|c| c.id == clip_id)
+    }
+
+    pub fn clip_by_id(&self, clip_id: u32) -> Option<&Clip> {
+        self.clips.iter().find(|c| c.id == clip_id)
+    }
+
+    pub fn clip_by_id_mut(&mut self, clip_id: u32) -> Option<&mut Clip> {
+        self.clips.iter_mut().find(|c| c.id == clip_id)
     }
 }
 
@@ -179,6 +276,11 @@ impl PluginInstance {
 /// that care about time order must sort by `Note::start_beat` themselves.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Clip {
+    /// Stable id within the owning track. `0` is "未採番" sentinel —
+    /// reassigned by `Track::ensure_clip_ids` when loading. Persists across
+    /// move and resize.
+    #[serde(default)]
+    pub id: u32,
     pub name: String,
     pub start_beat: f64,
     pub length_beats: f64,
@@ -263,6 +365,7 @@ mod tests {
                     style_name: "ノーマル".into(),
                 },
                 clips: vec![Clip {
+                    id: 1,
                     name: "こんにちは".into(),
                     start_beat: 0.0,
                     length_beats: 16.0,
@@ -291,9 +394,9 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_two() {
-        // Bumped when row-based clips were replaced by free-time notes.
+    fn current_version_is_three() {
+        // Bumped to 3 when stable id schema was added to Track / Clip.
         // Pinning the constant in a test catches accidental rollback.
-        assert_eq!(CURRENT_VERSION, 2);
+        assert_eq!(CURRENT_VERSION, 3);
     }
 }

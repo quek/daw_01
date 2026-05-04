@@ -2247,6 +2247,7 @@ mod tests {
             tracks: vec![Track {
                 name: "T".into(),
                 clips: vec![Clip {
+                    id: 1,
                     name: "C".into(),
                     start_beat: 0.0,
                     length_beats: 8.0,
@@ -2421,6 +2422,7 @@ mod tests {
             tracks: vec![Track {
                 name: "T".into(),
                 clips: vec![Clip {
+                    id: 1,
                     name: "C".into(),
                     start_beat: 0.0,
                     length_beats: 4.0,
