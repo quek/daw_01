@@ -210,7 +210,9 @@ pub struct PianoRollStyle {
     pub note_selected_border: Color,
     pub note_selected_border_w: f32,
     pub note_selected_pad_px: f32,
-    /// resize handle の幅 (px)。note 左右この px 内 = resize、それ以外 = move。
+    /// resize handle の幅 (px)。note rect 左右 edge から **内外** この px = resize、
+    /// それ以外 (rect 中央) = move。短 note (`r.w <= resize_handle_px * 2`) は rect 内
+    /// すべて Move、rect 外側のみ resize 判定。
     pub resize_handle_px: f32,
     pub c_label_color: Color,
     pub c_label_font_px: f32,
@@ -309,8 +311,53 @@ fn note_geometry_to_rect(
     Rect { x, y, w, h }
 }
 
+/// 内部 helper: cursor 位置がこの note のどの zone (Move / ResizeLeft / ResizeRight)
+/// に該当するかを返す。`note_hit` / `note_hover_cursor` から共通で呼ばれる。
+///
+/// 判定範囲 (x 方向): note rect の左右 edge から **内外** ±`edge` px (= 8px 幅のハンドル帯)。
+/// y 方向は note rect 内のみ (拡張なし、隣接 pitch との衝突回避)。
+///
+/// 短 note (`r.w <= edge * 2.0`) は rect 内では Move 強制 (左右 edge 領域が重なって
+/// 判別不能なため)、rect 外側のみ ResizeLeft / ResizeRight として扱う。
+fn note_zone_at(
+    note: &Note,
+    view: PianoRollView,
+    grid: Rect,
+    cx: f32,
+    cy: f32,
+    edge: f32,
+) -> Option<NoteDragKind> {
+    let r = note_to_rect(note, view, grid);
+    // y は note rect 内のみ (Rect::contains の半開区間と整合)
+    if cy < r.y || cy >= r.y + r.h {
+        return None;
+    }
+    // x の拡張範囲 [r.x - edge, r.x + r.w + edge) 外は不参加
+    if cx < r.x - edge || cx >= r.x + r.w + edge {
+        return None;
+    }
+    let in_rect = cx >= r.x && cx < r.x + r.w;
+    let near_left = cx < r.x + edge;
+    let near_right = cx >= r.x + r.w - edge;
+    let short_note = r.w <= edge * 2.0;
+
+    Some(if short_note && in_rect {
+        NoteDragKind::Move
+    } else if near_left && (!in_rect || cx - r.x < edge) {
+        NoteDragKind::ResizeLeft
+    } else if near_right && (!in_rect || (r.x + r.w) - cx < edge) {
+        NoteDragKind::ResizeRight
+    } else {
+        NoteDragKind::Move
+    })
+}
+
 /// note hit-test (visible filtering 後)。grid 内の cursor 位置で hit する note の id と
 /// hit zone (Move / ResizeLeft / ResizeRight) を返す。後勝ち (描画順で前面)。
+///
+/// resize handle は note rect の左右 edge から **内外** ±`resize_handle_px` の範囲
+/// (= 8px 幅のハンドル帯)。短 note (`r.w <= resize_handle_px * 2`) は rect 内は Move 強制、
+/// rect 外側のみ resize 判定。
 ///
 /// `notes` は start_beat 昇順にソート済を仮定 (二分探索で visible 範囲を絞る)。
 #[must_use]
@@ -333,25 +380,16 @@ pub fn note_hit(
 
     let mut hit: Option<(NoteId, NoteDragKind)> = None;
     for note in visible {
-        let r = note_to_rect(note, view, grid);
-        if !r.contains(cx, cy) {
-            continue;
+        if let Some(kind) = note_zone_at(note, view, grid, cx, cy, resize_handle_px) {
+            hit = Some((note.id, kind));
         }
-        let edge = resize_handle_px;
-        let kind = if r.w > edge * 2.0 && cx - r.x < edge {
-            NoteDragKind::ResizeLeft
-        } else if r.w > edge * 2.0 && (r.x + r.w) - cx < edge {
-            NoteDragKind::ResizeRight
-        } else {
-            NoteDragKind::Move
-        };
-        hit = Some((note.id, kind));
     }
     hit
 }
 
 /// hover 中の note hit zone から cursor 形状を決める。
-/// 左右 `resize_handle_px` = `EwResize`、中央 = `Move`、grid 外や note 上以外は None。
+/// note rect 左右 edge の内外 ±`resize_handle_px` = `EwResize`、中央 = `Move`、
+/// grid 外やどの note の判定範囲外も None。
 #[must_use]
 pub fn note_hover_cursor(
     visible: &[Note],
@@ -366,17 +404,12 @@ pub fn note_hover_cursor(
     }
     let mut hit_cursor: Option<CursorIcon> = None;
     for note in visible {
-        let r = note_to_rect(note, view, grid);
-        if !r.contains(cx, cy) {
-            continue;
+        if let Some(kind) = note_zone_at(note, view, grid, cx, cy, resize_handle_px) {
+            hit_cursor = Some(match kind {
+                NoteDragKind::Move => CursorIcon::Move,
+                NoteDragKind::ResizeLeft | NoteDragKind::ResizeRight => CursorIcon::EwResize,
+            });
         }
-        let edge = resize_handle_px;
-        let cursor = if r.w > edge * 2.0 && (cx - r.x < edge || (r.x + r.w) - cx < edge) {
-            CursorIcon::EwResize
-        } else {
-            CursorIcon::Move
-        };
-        hit_cursor = Some(cursor);
     }
     hit_cursor
 }
@@ -652,7 +685,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
         response.dragging = drag_session.as_ref().map(|nd| nd.kind);
 
-        // hover 中の cursor 形状要求 (note 上のみ、drag 中は drag kind 対応)
+        // hover 中の cursor 形状要求 (drag 中は drag kind、note hover (拡張範囲含む) は
+        // hover_cursor、その他 widget 内は Default に明示 reset で stale cursor を防ぐ)。
+        // winit は state-full なので set_cursor を呼ばないと前フレームの形状が残る (ui.rs:999)。
         if response.dragging.is_some() {
             let cursor = match response.dragging {
                 Some(NoteDragKind::Move) => CursorIcon::Move,
@@ -667,6 +702,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 note_hover_cursor(visible, view, grid, cx, cy, style.resize_handle_px)
         {
             self.set_cursor(cursor);
+        } else if pointer.pos.is_some_and(|(px, py)| rect.contains(px, py)) {
+            self.set_cursor(CursorIcon::Default);
         }
 
         // ----- pending click 判定 -----
@@ -1389,6 +1426,81 @@ mod tests {
         let (notes, view, grid) = make_test_setup();
         let cursor = note_hover_cursor(&notes, view, grid, 200.0, 10.0, 4.0);
         assert_eq!(cursor, None);
+    }
+
+    // -------- Hit-test extension tests (rect 外側 ±resize_handle_px) --------
+    // note (id 0) start=1, len=1 → rect x∈[150,250]、edge=4 で拡張範囲 x∈[146,254)。
+
+    #[test]
+    fn note_hit_returns_resize_left_at_outer_left_handle() {
+        let (notes, view, grid) = make_test_setup();
+        // x=147 = r.x(150) - 3 → 拡張範囲内、左端 handle
+        let hit = note_hit(&notes, view, grid, 147.0, 102.0, 4.0);
+        assert_eq!(hit, Some((0, NoteDragKind::ResizeLeft)));
+    }
+
+    #[test]
+    fn note_hit_returns_resize_right_at_outer_right_handle() {
+        let (notes, view, grid) = make_test_setup();
+        // x=252 = r.x+r.w(250) + 2 → 拡張範囲内、右端 handle
+        let hit = note_hit(&notes, view, grid, 252.0, 102.0, 4.0);
+        assert_eq!(hit, Some((0, NoteDragKind::ResizeRight)));
+    }
+
+    #[test]
+    fn note_hit_returns_none_just_past_outer_handle() {
+        let (notes, view, grid) = make_test_setup();
+        // x=145 = r.x(150) - 5 → 拡張範囲 [146, 254) の外
+        let hit = note_hit(&notes, view, grid, 145.0, 102.0, 4.0);
+        assert_eq!(hit, None);
+    }
+
+    #[test]
+    fn note_hit_short_note_inside_returns_move() {
+        // 短 note (len=0.05 → w=5px、< edge*2=8) の rect 内中央は Move 強制
+        let notes = vec![note(0, 1.0, 0.05, 60)];
+        let view = test_view();
+        let grid = Rect { x: 50.0, y: 0.0, w: 400.0, h: 200.0 };
+        // r.x = 150, r.w = 5。中央 x=152 で内側
+        let hit = note_hit(&notes, view, grid, 152.0, 102.0, 4.0);
+        assert_eq!(hit, Some((0, NoteDragKind::Move)));
+    }
+
+    #[test]
+    fn note_hit_short_note_outer_left_returns_resize_left() {
+        // 短 note でも rect 外側左は ResizeLeft (内外あいまい性なし)
+        let notes = vec![note(0, 1.0, 0.05, 60)];
+        let view = test_view();
+        let grid = Rect { x: 50.0, y: 0.0, w: 400.0, h: 200.0 };
+        // r.x = 150。x=148 = r.x - 2 → 外側左
+        let hit = note_hit(&notes, view, grid, 148.0, 102.0, 4.0);
+        assert_eq!(hit, Some((0, NoteDragKind::ResizeLeft)));
+    }
+
+    #[test]
+    fn note_hit_adjacent_notes_back_wins_at_shared_handle() {
+        // note A (id 0, start=1, len=1) → rect x∈[150,250]、右端拡張 [246,254)
+        // note B (id 1, start=2, len=1) → rect x∈[250,350]、左端拡張 [246,254)
+        // x=251 は両方の拡張ハンドル領域に入る → 後勝ちで B
+        let notes = vec![note(0, 1.0, 1.0, 60), note(1, 2.0, 1.0, 60)];
+        let view = test_view();
+        let grid = Rect { x: 50.0, y: 0.0, w: 400.0, h: 200.0 };
+        let hit = note_hit(&notes, view, grid, 251.0, 102.0, 4.0);
+        assert_eq!(hit, Some((1, NoteDragKind::ResizeLeft)));
+    }
+
+    #[test]
+    fn note_hover_cursor_returns_ewresize_at_outer_left_handle() {
+        let (notes, view, grid) = make_test_setup();
+        let cursor = note_hover_cursor(&notes, view, grid, 147.0, 102.0, 4.0);
+        assert_eq!(cursor, Some(CursorIcon::EwResize));
+    }
+
+    #[test]
+    fn note_hover_cursor_returns_ewresize_at_outer_right_handle() {
+        let (notes, view, grid) = make_test_setup();
+        let cursor = note_hover_cursor(&notes, view, grid, 252.0, 102.0, 4.0);
+        assert_eq!(cursor, Some(CursorIcon::EwResize));
     }
 
     #[test]
@@ -2119,5 +2231,105 @@ mod tests {
                 "ruler_h=20 で grid bar 線の y_top は >=20.0: actual={y}",
             );
         }
+    }
+
+    // -------- Stale cursor reset tests --------
+    // piano_roll widget が pointer 位置に応じて cursor を明示的に reset するか検証。
+    // winit は state-full なので、note 外で set_cursor を呼ばないと前フレームの形状が残る
+    // (ui.rs:999 で明記)。修正後は pointer が widget rect 内かつ note hover 圏外で
+    // CursorIcon::Default を明示 set する。
+
+    fn run_frame_with_cursor_capture<F: FnOnce(&mut Ui<'_, TestModel>)>(
+        captured: Arc<std::sync::Mutex<Vec<CursorIcon>>>,
+        model: &mut TestModel,
+        input: FrameInput,
+        f: F,
+    ) {
+        let captured_clone = Arc::clone(&captured);
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        host.set_cursor_request = Some(Box::new(move |c| {
+            captured_clone.lock().unwrap().push(c);
+        }));
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 400 };
+        host.frame(model, &mut scene, screen, input, |_, ui| {
+            f(ui);
+        });
+    }
+
+    #[test]
+    fn piano_roll_resets_cursor_to_default_when_pointer_in_widget_but_not_on_note() {
+        let captured: Arc<std::sync::Mutex<Vec<CursorIcon>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut model = TestModel::new(vec![note(0, 1.0, 1.0, 60)]);
+        let view = test_view();
+        let style = PianoRollStyle::default();
+        let notes_clone = model.notes.clone();
+        // grid 内だが note 外 (note rect は x∈[200,400] y≈[200,215]、(50,50) は note 外)
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((50.0, 50.0)),
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel = model.selected.clone();
+        run_frame_with_cursor_capture(Arc::clone(&captured), &mut model, input, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone,
+                view,
+                &sel,
+                &style,
+                dispatch,
+            );
+        });
+        assert_eq!(captured.lock().unwrap().as_slice(), &[CursorIcon::Default]);
+    }
+
+    #[test]
+    fn piano_roll_does_not_set_cursor_when_pointer_outside_widget() {
+        let captured: Arc<std::sync::Mutex<Vec<CursorIcon>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut model = TestModel::new(vec![note(0, 1.0, 1.0, 60)]);
+        let view = test_view();
+        let style = PianoRollStyle::default();
+        let notes_clone = model.notes.clone();
+        // pointer が widget rect (0,0)-(800,400) の外 → 何もしない (他 widget の責務)
+        // screen は (1000,600) で widget 外も合法
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((900.0, 500.0)),
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel = model.selected.clone();
+        let captured_clone = Arc::clone(&captured);
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        host.set_cursor_request = Some(Box::new(move |c| {
+            captured_clone.lock().unwrap().push(c);
+        }));
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 1000, height: 600 };
+        host.frame(&mut model, &mut scene, screen, input, |_, ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone,
+                view,
+                &sel,
+                &style,
+                dispatch,
+            );
+        });
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "widget 外では set_cursor を呼ばない: actual={:?}",
+            *captured.lock().unwrap()
+        );
     }
 }

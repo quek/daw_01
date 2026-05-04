@@ -66,7 +66,8 @@ pub struct UiHost<M: ?Sized + 'static> {
     redraw_request: Box<dyn Fn() + Send + Sync>,
     /// M9 Phase 41b: cursor 形状を OS に伝える callback。`with_window` 経由で
     /// `WindowBackend::set_cursor` をラップ。`new` 直接呼び出しでは `None` (no-op)。
-    set_cursor_request: Option<Box<dyn Fn(CursorIcon) + Send + Sync>>,
+    /// `pub(crate)` は他 widget の `#[cfg(test)]` で cursor 検証 mock を直接 inject するため。
+    pub(crate) set_cursor_request: Option<Box<dyn Fn(CursorIcon) + Send + Sync>>,
     /// M7 Phase 25: 現在開いている popup の集合 (menu / context_menu / dropdown 共通)。
     /// `Ui::open_popup` / `Ui::close_popup` で出し入れする。`Ui` 経由で `&mut` 借用される
     /// ため rustc から "never read" と誤判定されるが、実際には popup_layer で読まれる。

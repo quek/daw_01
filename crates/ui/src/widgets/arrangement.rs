@@ -252,6 +252,9 @@ pub struct ArrangementStyle {
     pub loop_band: Color,
     pub loop_handle: Color,
     pub loop_handle_w: f32,
+    /// resize handle の幅 (px)。clip rect 左右 edge から **内外** この px = resize、
+    /// それ以外 (rect 中央) = move。短 clip (`r.w <= resize_handle_px * 2`) は rect 内
+    /// すべて Move、rect 外側のみ resize 判定。
     pub resize_handle_px: f32,
     pub mute_button: ToggleButtonStyle,
     pub solo_button: ToggleButtonStyle,
@@ -362,7 +365,53 @@ pub fn clip_to_rect(
     Rect { x, y: row_top + 2.0, w, h }
 }
 
+/// 内部 helper: cursor 位置がこの clip のどの zone (Move / ResizeLeft / ResizeRight)
+/// に該当するかを返す。`clip_hit` から呼ばれる。
+///
+/// 判定範囲 (x 方向): clip rect の左右 edge から **内外** ±`edge` px (= 8px 幅のハンドル帯)。
+/// y 方向は clip rect 内のみ (拡張なし、隣接 track row との衝突回避)。
+///
+/// 短 clip (`r.w <= edge * 2.0`) は rect 内では Move 強制 (左右 edge 領域が重なって
+/// 判別不能なため)、rect 外側のみ ResizeLeft / ResizeRight として扱う。
+fn clip_zone_at(
+    track_idx: usize,
+    clip: &ArrangementClip,
+    view: ArrangementView,
+    lanes: Rect,
+    cx: f32,
+    cy: f32,
+    edge: f32,
+) -> Option<ClipDragKind> {
+    let r = clip_to_rect(track_idx, clip, view, lanes);
+    // y は clip rect 内のみ (Rect::contains の半開区間と整合)
+    if cy < r.y || cy >= r.y + r.h {
+        return None;
+    }
+    // x の拡張範囲 [r.x - edge, r.x + r.w + edge) 外は不参加
+    if cx < r.x - edge || cx >= r.x + r.w + edge {
+        return None;
+    }
+    let in_rect = cx >= r.x && cx < r.x + r.w;
+    let near_left = cx < r.x + edge;
+    let near_right = cx >= r.x + r.w - edge;
+    let short_clip = r.w <= edge * 2.0;
+
+    Some(if short_clip && in_rect {
+        ClipDragKind::Move
+    } else if near_left && (!in_rect || cx - r.x < edge) {
+        ClipDragKind::ResizeLeft
+    } else if near_right && (!in_rect || (r.x + r.w) - cx < edge) {
+        ClipDragKind::ResizeRight
+    } else {
+        ClipDragKind::Move
+    })
+}
+
 /// lanes 内 cursor 位置から hit する (ClipKey, ClipDragKind) を返す (後勝ち)。
+///
+/// resize handle は clip rect の左右 edge から **内外** ±`resize_handle_px` の範囲
+/// (= 8px 幅のハンドル帯)。短 clip (`r.w <= resize_handle_px * 2`) は rect 内は Move 強制、
+/// rect 外側のみ resize 判定。
 #[must_use]
 pub fn clip_hit(
     tracks: &[ArrangementTrack],
@@ -379,19 +428,11 @@ pub fn clip_hit(
     let track = tracks.get(track_idx)?;
     let mut hit: Option<(ClipKey, ClipDragKind)> = None;
     for clip in &track.clips {
-        let r = clip_to_rect(track_idx, clip, view, lanes);
-        if !r.contains(cx, cy) {
-            continue;
+        if let Some(kind) =
+            clip_zone_at(track_idx, clip, view, lanes, cx, cy, resize_handle_px)
+        {
+            hit = Some((ClipKey { track: track.id, clip: clip.id }, kind));
         }
-        let edge = resize_handle_px;
-        let kind = if r.w > edge * 2.0 && cx - r.x < edge {
-            ClipDragKind::ResizeLeft
-        } else if r.w > edge * 2.0 && (r.x + r.w) - cx < edge {
-            ClipDragKind::ResizeRight
-        } else {
-            ClipDragKind::Move
-        };
-        hit = Some((ClipKey { track: track.id, clip: clip.id }, kind));
     }
     hit
 }
@@ -2016,6 +2057,95 @@ mod tests {
         let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
         let hit = clip_hit(&tracks, view, lanes, -10.0, -10.0, 4.0);
         assert_eq!(hit, None);
+    }
+
+    // -------- Hit-test extension tests (clip rect 外側 ±resize_handle_px) --------
+    // clip (id 100) start=4, len=4 → rect x∈[160,320] y∈[66,94] in track 2
+    // (test_lanes (0,0,640,256), test_view 16 beats / 8 tracks / row_h=32)。
+    // ただし以下のテストは start=0 len=4 → x∈[0,160] y∈[2,30] in track 0 を使う。
+
+    #[test]
+    fn clip_hit_returns_resize_left_at_outer_left_handle() {
+        let view = test_view();
+        let lanes = test_lanes();
+        // clip rect x∈[0,160]、edge=4 で拡張範囲 x∈[-4,164)。lanes の左端 0 で外側左を表現できないので
+        // clip start=2 (x=80) の clip を使い、cx=77 で外側左 (x=80-3) を確認。
+        let tracks = vec![track(10, "t0", vec![clip(100, 2.0, 4.0, "c")])];
+        let hit = clip_hit(&tracks, view, lanes, 77.0, 16.0, 4.0);
+        assert_eq!(
+            hit,
+            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeLeft))
+        );
+    }
+
+    #[test]
+    fn clip_hit_returns_resize_right_at_outer_right_handle() {
+        let view = test_view();
+        let lanes = test_lanes();
+        // clip rect x∈[0,160]、cx=162 = rect 右端(160) + 2 → 外側右
+        let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        let hit = clip_hit(&tracks, view, lanes, 162.0, 16.0, 4.0);
+        assert_eq!(
+            hit,
+            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeRight))
+        );
+    }
+
+    #[test]
+    fn clip_hit_returns_none_just_past_outer_handle() {
+        let view = test_view();
+        let lanes = test_lanes();
+        // clip rect x∈[0,160]。cx=165 = rect 右端 + 5 → 拡張範囲 [-4,164) の外
+        let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        let hit = clip_hit(&tracks, view, lanes, 165.0, 16.0, 4.0);
+        assert_eq!(hit, None);
+    }
+
+    #[test]
+    fn clip_hit_short_clip_inside_returns_move() {
+        let view = test_view();
+        let lanes = test_lanes();
+        // 短 clip (len=0.1 → w=4px、edge*2=8px 以下) の rect 内中央は Move 強制
+        // start=2, len=0.1 → x=80, w=4
+        let tracks = vec![track(10, "t0", vec![clip(100, 2.0, 0.1, "c")])];
+        let hit = clip_hit(&tracks, view, lanes, 81.0, 16.0, 4.0);
+        assert_eq!(
+            hit,
+            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::Move))
+        );
+    }
+
+    #[test]
+    fn clip_hit_short_clip_outer_left_returns_resize_left() {
+        let view = test_view();
+        let lanes = test_lanes();
+        // 短 clip でも rect 外側左は ResizeLeft
+        // start=2, len=0.1 → x=80。cx=78 = x - 2 → 外側左
+        let tracks = vec![track(10, "t0", vec![clip(100, 2.0, 0.1, "c")])];
+        let hit = clip_hit(&tracks, view, lanes, 78.0, 16.0, 4.0);
+        assert_eq!(
+            hit,
+            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeLeft))
+        );
+    }
+
+    #[test]
+    fn clip_hit_adjacent_clips_back_wins_at_shared_handle() {
+        let view = test_view();
+        let lanes = test_lanes();
+        // clip A (id 100, start=0, len=4) → x∈[0,160]、右端拡張 [156,164)
+        // clip B (id 101, start=4, len=4) → x∈[160,320]、左端拡張 [156,164)
+        // cx=161 は両方の拡張ハンドル領域 → 後勝ちで B
+        let tracks = vec![track(
+            10,
+            "t0",
+            vec![clip(100, 0.0, 4.0, "a"), clip(101, 4.0, 4.0, "b")],
+        )];
+        let hit = clip_hit(&tracks, view, lanes, 161.0, 16.0, 4.0);
+        assert_eq!(
+            hit,
+            Some((ClipKey { track: 10, clip: 101 }, ClipDragKind::ResizeLeft))
+        );
     }
 
     #[test]
