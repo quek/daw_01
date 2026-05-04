@@ -12,194 +12,126 @@
 
 ## 大方針
 
-**Phase 1-5 (UI を gui_01 widget で再構築) は完了**。次は **DESIGN.md の M1 (= 「VOICEVOX 歌唱 + Clip ベース DAW」) を実用ラインに乗せる** ことが最大目標。
+**「daw_01 の UI 描画は全て gui_01 widget で構築する」** を目標にする。
 
-これまでに達成済みの土台:
-- 3 プロセス分離 + IPC (named pipe + shared memory)
-- CLAP plugin scan / load / activate / process / GUI embed
-- gui_01 widget による全 view 構築 (`push_rect` / `push_text` / `push_lines` 0 件)
-- arrangement / piano_roll widget (M13 Phase 55 で小節番号 ruler + time_sig 対応 grid)
-- master fader / peak meter / loop / hover-cursor / track rename / chain reorder
+- 自前 `push_rect` / `push_text` / `push_lines` は最終的にゼロ。
+- gui_01 に widget が無い領域は **gui_01 側で widget 化を要望**、daw_01 内で自前実装を温存しない。
+- 機能拡張 (drag/resize/marquee 等) は gui_01 widget 化が完了してから widget API 上で組む。
 
-不足は M1 残 6 項目 (Phase 6 で潰す)。
+理由: piano_roll widget 化 (commit 52394b5) で 493 → 320 LOC、cache 統合・Shift+drag 等の挙動共通化のメリットを実証済み。同じパターンを arrangement / plugin_picker にも適用したい。
 
-## Phase 6: M1 完成
+## gui_01 側ロードマップ (#005-#010 全て受領済 / Phase 45a-45g merge 済)
 
-DESIGN.md M1 残項目を 6 タスクに分解。`docs/plan_<feature>.md` への切り出しは着手時に判断 (本ファイルでは概要のみ)。
+詳細 API は `docs/gui_01_conversation.md` 参照。実装順:
 
-### 着手順マップ
+| gui_01 phase | 内容 | daw_01 側の取り込み作業 | status |
+|---|---|---|---|
+| **45a** | `Ui::panel` + `Ui::panel_with_border` (#008) | 12 箇所の背景塗りを置換 | merged (gui_01) |
+| **45b** | `Ui::toggle_button_at` (#009) | mixer の M/S を置換 | merged (gui_01) |
+| **45c** | `PianoRollView` に `velocity_lane_h` + `playhead_beat` 追加 (breaking、#006) | PianoRollView 構築箇所更新、`draw_velocity_lane` / `draw_playhead` を削除 | **取り込み完了 (8aebba3)** |
+| **45d** | `Ui::modal` + `Ui::list_view` (#007) | plugin_picker.rs を rewrite (171 → ~80 LOC) | merged (gui_01) |
+| **45e** | `Ui::arrangement` widget (#005、4 sub-phase A-D) | arrangement_view.rs を rewrite (614 → ~150 LOC) | merged (gui_01) |
+| **45g** | `scroll_area` thumb drag 修正 (#010) | path 依存先で自動反映、追加コードなし | **対応完了 (再ビルドで解消)** |
 
-```
-A2 multi-track ─┬─→ A1 VOICEVOX ─┐
-                │                 ├─→ M1 完成
-                └─→ A3 WAV export ┘
-A6 tempo/timesig (独立、早期で OK)
-A4 autosave     (独立、早期で OK)
-A5 lyric UI     (gui_01 #015 要望 → 取り込み、A1 の前提)
-```
+## Phase 1: ローカル置換 (gui_01 merge 不要)
 
-優先順序の根拠:
-- **A2 が基盤**。現状 `Track 0 / Clip 0 / モノフォニック` で固定 ([daw_plugin_host/src/audio.rs](daw_plugin_host/src/audio.rs) の audio thread)。これを解かないと A1 (VOICEVOX) も A3 (mixdown) も「単一 track のみ」になる。
-- **A6 / A4** は独立で軽量。A2 の合間に挟める。
-- **A5** は gui_01 改修先行 (#015)。reply 待ちの間 A1 の Engine / HTTP 周りを進める。
-- **A1** は A2 + A5 完了後に本格実装。
-- **A3** は A2 完了後 (multi-track mix を offline render に流用)。
+既存 gui_01 widget だけで完結する作業。各タスクは個別 commit。
 
-### A2: multi-track / polyphonic 再生 [優先度 1 — 基盤]
+### 1-1. `bottom_panel.rs` を `tab_view_with_state` 化 [done c46df37]
 
-**現状の制約**: `daw_plugin_host` の audio thread が `song.tracks[0].clips[0]` 固定で、`active_notes` を 1 つだけ持ち単音再トリガ ([daw_plugin_host/src/audio.rs](daw_plugin_host/src/audio.rs))。
+98 → 49 LOC、自前 `push_rect` x2 + 定数 4 個削除。
 
-**やること**:
-1. **全 track loop**: audio thread で `song.tracks.iter()` を walk、各 track が個別の plugin instance を持つ
-2. **Polyphonic note state**: `active_notes` を `Vec<NoteState>` 化、同時刻の複数 NoteOn を保持
-3. **Per-track mix**: track 単位の f32 buffer を確保 (RT スレッドでの allocation 禁止 — `activate` 時に事前確保)、master へ sum
-4. **Volume / pan / mute / solo を mix に反映** (現状 schema にあるが audio に無接続)
-5. **Plugin host のスレッド分離**: track 単位で `Plugin` を持つので main-thread でのライフサイクルを track ごとに直列化
+### 1-2. `plugin_picker.rs` のリストを `scroll_area` 化 [done f280274]
 
-**主な変更ファイル**:
-- [daw_plugin_host/src/audio.rs](daw_plugin_host/src/audio.rs) (audio thread の全面書換)
-- [daw_plugin_host/src/host.rs](daw_plugin_host/src/host.rs) (plugin instance map: `track_id → Plugin`)
-- [daw_audio/src/engine.rs](daw_audio/src/engine.rs) (master mix が plugin_host から受ける format 変更を吸収)
+`max_rows` 手動 truncation を廃止、scroll で全件表示。
+注意: 行背景の `heavy + cached(i)` は scroll で stale rect を replay するので `push_rect` 直呼びにする。最終的に 45d (`Ui::list_view`) で消える tech debt。
 
-**受け入れ基準**:
-- 2 トラック以上に別 instrument を載せて同時再生で音が混ざる
-- 1 clip 内に同時刻 NoteOn を 2 つ以上配置 → 両方鳴る
-- track の `muted` / `solo` トグルが即座に反映
-- track の `volume` / `pan` 変更で master 出力が変わる
-- `cargo clippy --workspace -- -D warnings` clean
+### 1-3. `mixer_strips.rs` / `track_inspector.rs` の scroll 対応 [done]
 
-着手時 `docs/plan_a2_multi_track.md` を切り出し検討。
+- mixer: 横方向 scroll_area、master strip は scroll 外に右端固定。
+- inspector: 縦方向 scroll_area、+Inst/+FX/+MIDI ボタンは scroll 外に下端固定。
+- 注意: scrollbar drag 不能のバグを発見、gui_01 #010 で報告。wheel/keyboard scroll は動作する。
 
-### A6: tempo / time_sig 変更 UI [優先度 2 — 独立 / 軽量]
+## Phase 2: arrangement widget 用の schema 移行 (Phase 1 と並列)
 
-**現状**: `Song { bpm, time_sig }` schema 完備、#014 で ruler/grid も連動済み。**変更 UI が無い**。
+gui_01 #005 回答で確定: arrangement widget は **clip_id / track_id を index ではなく安定 ID で受ける** 設計。daw_01 側の schema を先に整えると 45e merge 直後すぐ widget に乗せられる。
 
-**やること**:
-1. transport に BPM number_input (1.0..400.0) を追加
-2. transport に time_sig 用 (numerator: 1..32, denominator: 2/4/8/16 dropdown) を追加
-3. `AppEvent::SetSongBpm(f32)` / `SetSongTimeSig(u8, u8)` 追加
-4. `handle_event` で `song.bpm` / `song.time_sig` を更新 + plugin_host に `LoadSong` を送り直す (既存パスに乗る)
-5. undoable history 対象とする
+詳細は `docs/plan_arrangement_widget_rewrite.md` を起こして展開予定だが、最低限の作業:
 
-**主な変更ファイル**:
-- [daw_gui/src/view/transport.rs](daw_gui/src/view/transport.rs)
-- [daw_gui/src/app.rs](daw_gui/src/app.rs)
+1. `Clip` schema に `id: u32` フィールド追加
+2. `Track` に `next_clip_id: u32` 採番ロジックを追加 (clip 作成時に bump)
+3. `Track` に `id: u32` フィールド追加
+4. `Song` に `next_track_id: u32` 採番ロジックを追加
+5. `ClipRef.clip` の意味を index → clip_id に切替 (型は `u32` のまま意味だけ変える)
+6. クリップ参照箇所 (handle_event 内の `selected_clip` lookup 等) を index 検索 → id 検索に書き換え
 
-**受け入れ基準**:
-- transport から BPM 変更 → ruler/grid + 再生テンポが追従
-- time_sig 変更 → bar 線位置が変化
-- Undo/Redo で変更を巻き戻せる
+bincode encode/decode と Song の新規作成・読み込み・autosave への影響を検証。
 
-### A4: autosave + 起動時復元 [優先度 3 — 独立 / 軽量]
+着手前に `docs/plan_arrangement_widget_rewrite.md` を作成し、この移行を 1 段階目として詳細計画する。
 
-**現状**: 手動保存 (`Ctrl+S`) のみ。
+## Phase 3: gui_01 widget 取り込み (45a-45e merge トリガ)
 
-**やること**:
-1. background thread で 60 秒ごとに `<file_path>.autosave.daw` (file_path == None なら `%APPDATA%/daw_01/recovery/<uuid>.autosave.daw`) に保存
-2. dirty flag (modified since last save) を AppData に追加 → dirty かつ 60 秒経過で書く
-3. 起動時に recovery ディレクトリを scan + 既存 file の autosave 兄弟を検出 → modal で「復元しますか?」プロンプト
-4. 正常終了時に autosave ファイルを削除
+gui_01 phase が merge されたら順に取り込む。
 
-**主な変更ファイル**:
-- 新規 `daw_gui/src/autosave.rs`
-- [daw_gui/src/main.rs](daw_gui/src/main.rs) (起動時 detection)
-- [daw_gui/src/app.rs](daw_gui/src/app.rs) (`AppEvent::Autosave*`、`dirty: bool`)
+### 3a. `Ui::panel` 取り込み (45a 後)
 
-**受け入れ基準**:
-- 60 秒後に autosave ファイルが作成される
-- アプリを kill して再起動 → 復元プロンプトが出る
-- 「復元」で直近の autosave からロードできる
-- 「破棄」で autosave ファイルを削除
+12 箇所の `ui.heavy(... |hctx| hctx.cached(... hctx.push_rect(...)))` を `ui.panel(id, rect, fill, radius)` に置換。border 付き 1 件 (file drop hover) は `panel_with_border`。
 
-### A5: piano_roll note 歌詞編集 UI [優先度 4 — gui_01 #015]
+※ 12 箇所のうち plugin_picker (45d 化で消える) と arrangement clip 矩形 (45e 化で消える) を除けば、実質置換対象は 9 箇所。
 
-**現状**: `Note { lyric: Option<String> }` schema あり、piano_roll widget の表示も M9 Phase 44c で済 (歌詞文字を note 上にレイアウト)。**入力 UI が無い**。
+### 3b. `Ui::toggle_button_at` 取り込み (45b 後)
 
-**やること**:
-1. **gui_01 conversation #015 起こす**: piano_roll widget 内で note を選択 → F2 / Enter / dbl-click で text_input overlay 起動 → Enter commit / Esc cancel / Tab で次 note へ。編集中は drag/resize/wheel zoom を抑制 (modal-ish)
-2. gui_01 reply 受領後、daw_01 側で `NotesEditRequest::SetLyric { id, text }` ハンドリング、`AppEvent::SetNoteLyric { clip_ref, note_id, text }` 追加
-3. IME 入力対応 (CJK モーラ単位、既存 `text_input_at` の IME 機構に乗る)
+`mixer_strips.rs:164-222` の M/S を置換。`button_at + 自前 hint band push_rect` の 2 段構えが 1 呼び出しに。
+※ `arrangement_view.rs` 側の M/S は 3e (arrangement widget) で消えるので置換対象は mixer のみ。
 
-**主な変更ファイル**:
-- `docs/gui_01_conversation.md` #015 起こし
-- gui_01 reply 後: [daw_gui/src/view/piano_roll_view.rs](daw_gui/src/view/piano_roll_view.rs)、[daw_gui/src/app.rs](daw_gui/src/app.rs)
+### 3c. piano_roll velocity / playhead 削除 (45c 後)
 
-**受け入れ基準**:
-- piano_roll で note を選択 → F2 / Enter で inline 編集
-- Tab で次の note (start_beat 順) へ移動
-- 入力した歌詞が JSON プロジェクトファイルに保存される
-- IME 入力で CJK が正しく入る (commit 時のみ反映、preedit は表示)
+`PianoRollView` 構築箇所 (`piano_roll_view.rs:76-83`) に `velocity_lane_h: 60.0` / `playhead_beat: app.playhead_beat.map(|b| b as f64)` を追加。
+`draw_velocity_lane` / `draw_playhead` 関数 (90 LOC) を削除。view ファイルが 320 → ~230 LOC。
 
-### A1: VOICEVOX 統合 [優先度 5 — 本丸]
+### 3d. `plugin_picker.rs` を modal + list_view で rewrite (45d 後)
 
-**現状**: `daw_audio/voicevox.rs` プレースホルダ ([common/src/model.rs](common/src/model.rs) の `InstrumentSource::Vocal` schema は完備)。
+171 → ~80 LOC を目標に全面書き換え。conversation #007 の rewrite サンプル (line 565-577) をベース。
 
-**やること** (REAPER VOICEVOX スクリプト = `%APPDATA%\REAPER\Scripts\yoshino\voicevox\` を参照実装に):
-1. **HTTP client** (`reqwest` async): `/sing_frame_audio_query` / `/frame_synthesis` / `/audio_query` / `/synthesis` / `/speakers`
-2. **Engine 自動起動**: 設定 (`%APPDATA%/daw_01/voicevox_engine_path`) から実行ファイルパスを読み、subprocess + Job Object で寿命管理 (DESIGN.md の手法を流用)
-3. **歌詞分割**: 小書きかな (ぁぃぅぇぉゃゅょっ) は直前と結合して 1 モーラ化
-4. **Sing pipeline**:
-   - Clip notes → `{"notes":[{"id","key","frame_length","lyric"}, ...]}` JSON
-   - `POST /sing_frame_audio_query?speaker=6000` (波音リツ固定) → audio_query
-   - `outputSamplingRate=48000` 書き換え
-   - `POST /frame_synthesis?speaker={singer_id}` → WAV bytes
-5. **WAV cache**: `clip_id + content_hash → Vec<f32>` を `daw_audio` 側で保持。同 clip 同内容は再合成しない
-6. **Vocal track の audio mix**: audio thread は cache から該当時刻の f32 を読んで master へ mix。track の plugin chain (`fx_chain`) は通すが `instrument` は使わない (Vocal は WAV 直挿し)
-7. **Track Inspector の Vocal source UI**: speaker / style 選択 dropdown ([speakers] API レスポンス + cache)
-8. **失敗時の resilience**: Engine 起動失敗 / HTTP 失敗時は track を mute 扱い、エラーメッセージ表示、他 track は影響受けず再生続行
+### 3e. arrangement_view.rs を `Ui::arrangement` で rewrite (45e 後)
 
-**主な変更ファイル**:
-- [daw_audio/src/voicevox.rs](daw_audio/src/voicevox.rs) (現状プレースホルダ → 実装)
-- 新規 `daw_audio/src/voicevox_cache.rs` (clip_id → Vec<f32>)
-- 新規 `daw_audio/src/voicevox_engine.rs` (subprocess 起動 + ヘルスチェック)
-- [daw_audio/src/engine.rs](daw_audio/src/engine.rs) (Vocal track の mix-in)
-- [daw_gui/src/view/track_inspector.rs](daw_gui/src/view/track_inspector.rs) (Vocal source 編集)
-- [common/src/protocol.rs](common/src/protocol.rs) (Vocal track 内容変更を audio に伝達するメッセージが必要なら追加)
+Phase 2 で schema 移行済が前提。`docs/plan_arrangement_widget_rewrite.md` で詳細展開。
+gui_01 側 sub-phase に対応:
+- 45e-A merge → `draw_canvas` 相当を置換 (-210 LOC 見込み)
+- 45e-B merge → drag move / resize / rect select の自前実装削除
+- 45e-C merge → loop band drag を widget callback に
+- 45e-D merge → `draw_track_headers` を置換 (-200 LOC 見込み)、context_menu と rename UI は daw_01 側で `track_header_rects` を使って外側に書く
 
-**受け入れ基準**:
-- 新規 Vocal track 作成 → speaker 選択 → clip 内 note に歌詞入力 → 再生で歌う
-- 同 clip の 2 度目の再生はキャッシュヒット (合成 1 回のみ)
-- Engine 起動失敗時はエラー表示 + 他 track は再生継続
-- Vocal track の `volume` / `pan` / `muted` / `solo` が反映 (A2 完了が前提)
+最終的に arrangement_view.rs 614 → ~150 LOC。
 
-着手時 `docs/plan_a1_voicevox.md` を切り出し必須 (大規模)。
+## Phase 4: arrangement-driven 機能拡張 (Phase 3e 後)
 
-### A3: WAV 書き出し / mixdown [優先度 6]
+widget 内蔵で動くもの (3e で同時に有効化):
+- clip drag move / resize
+- marquee (rect) select
+- loop band drag (現状は ruler ドラッグでの範囲設定のみ、commit 74246c8)
+- track rename UI (BeginRenameTrack Edit を受けて daw_01 側で text_input に切替)
 
-**現状**: export 機能なし。
+daw_01 側で別途組むもの:
+- track_inspector chain reorder。45d 時点で `Ui::list_view` には drag-reorder 無し (gui_01 #007 回答)。将来 `Ui::reorderable_list` が来たら乗る、来ない間は drag-handle button + Edit でも可。
 
-**やること**:
-1. File menu (or transport の Export ボタン) に "Export WAV..." を追加 (`rfd::FileDialog` でパス選択)
-2. offline render mode を `daw_audio` に新設: audio thread とは別の dedicated thread で sequencer + plugin process を CPAL コールバック非依存で走らせる
-3. 出力長は `Song.length_beats` をデフォルト、UI で Loop range / Selection も選択可
-4. `hound` crate で WAV 書き出し (16/24/32 bit, 48000 Hz fixed)
-5. 進捗 modal (cancel button、IPC で `ChildToMain::ExportProgress` を流す)
-6. VOICEVOX cache を併用 (再合成しない)
+## Phase 5: 仕上げ
 
-**主な変更ファイル**:
-- 新規 `daw_audio/src/render.rs` (offline render loop)
-- 新規 `daw_gui/src/export.rs` (dialog + progress modal)
-- [common/src/protocol.rs](common/src/protocol.rs) (`MainToChild::ExportWav { path, length_beats, bit_depth }` / `ChildToMain::ExportProgress`)
+- `daw_gui/src/view/` 全体で `push_rect` / `push_text` / `push_lines` が **0 件** であることを grep で確認。
+  - **2026-05-04 時点**: `track_inspector.rs:77` の chain row 背景 1 件のみ残存。
+    scroll_area 内で row_y が変動するため heavy+cached が使えず ui.push_rect 直呼び。
+    将来 `Ui::reorderable_list` (gui_01) が来れば消える tech debt。
+- `cargo build --workspace` warning **0 件** (Phase 5 で清掃済)。
+- `cargo clippy --workspace -- -D warnings` **クリーン** (Phase 5 で 4 件修正)。
+- `cargo run -p daw_gui` で全画面の操作確認 (transport / arrangement / piano_roll / mixer / inspector / plugin_picker / modal)。
 
-**受け入れ基準**:
-- File → Export WAV → パス選択 → WAV ファイルが書き出される
-- 書き出した WAV を別アプリで再生 → DAW 内の再生と聴感上一致
-- export 中に cancel ボタンで中断できる
-- export 中も DAW 自体は操作可能 (offline render は別スレッド)
+## 並行で進める無関係タスク (このプランの外)
 
-## Phase 7 以降 (M2 へのつながり、現時点では着手しない)
+- VST3 サポート (M2)
+- VOICEVOX 合成パイプラインの最適化
+- Audio Engine 側のチューニング
 
-メモリと DESIGN.md より、M2 候補:
-- VST3 対応
-- オートメーション
-- send / return バス、グループ track
-- オーディオ録音 + オーディオクリップ
-- MIDI 録音 / export
-- メトロノーム / count-in
-- アンドゥ / リドゥ統合 (gui_01 `HistoryStack` の wire-up 確認)
-- Linux 対応
-
-各々に着手するときに本ファイルへ Phase 7 以降を追加する。
+必要になったら別途 plan ファイルを起こす。
 
 ## 進捗ログ
 
@@ -222,11 +154,7 @@ A5 lyric UI     (gui_01 #015 要望 → 取り込み、A1 の前提)
 | 2026-05-04 | b7b9def | M10 取り込み | gui_01 #010 (Phase 46-48 + 47b/c) build 追従 + #011 (UX 非対称 2 件) を gui_01 に相談 |
 | 2026-05-04 | (gui_01) | -            | gui_01 が #011 に Phase 49 (volume live update) + Phase 50 (reorder optimistic preview) で対応、daw_01 側は make_edit が fn 自由関数なので追従不要 |
 | 2026-05-04 | da0bdf5 | Phase 5 | dead_code 清掃 (ClipBox/NoteBox/TrackHeader 構造体 + 派生メソッド削除、AppEvent に `#[allow(dead_code)]`) + clippy fix 4 件 |
-| 2026-05-04 | b12adff | Phase 4 | track rename / chain reorder / reorder IPC 取り込み |
-| 2026-05-04 | d832627 | Phase 4 仕上げ | gui_01 #013 (M11 Phase 52) `text_input_at_focused` 取り込み、track Rename → 即タイプ可能 |
-| 2026-05-04 | b9a3fe2 | Phase 0 | gui_01 #013 を Resolved 化、archive へ移動 |
-| 2026-05-04 | ce08095 | bug fix | `UiHost::with_window` で cursor 配線、hover/drag のカーソル形状が変化しない問題を解消 |
-| 2026-05-04 | 22ffa56 | Phase 0 | gui_01 #014 [Open] ルーラー & time_sig 対応 grid 要望 |
-| 2026-05-04 | a2117cb | chore  | .gitignore に /.claude/scheduled_tasks.lock を追加 |
-| 2026-05-04 | af44c46 | M13 取り込み | gui_01 #014 (M13 Phase 55) を取り込み — アレンジビュー小節番号 ruler + ピアノロール ruler 領域 + time_sig 対応 grid |
-| 2026-05-04 | 12be490 | Phase 0 | gui_01 #014 を Resolved 化、archive へ移動 |
+| 2026-05-04 | (本セッション) | Phase 4 | track rename UI 実装 (arrangement の track header 右クリック → text_input 重ね描き / Enter commit / Esc cancel)。初回 focus 自動取得は #013 で gui_01 に要望中 |
+| 2026-05-04 | (本セッション) | Phase 4 + 5 | track_inspector chain section を `Ui::reorderable_list` で書き換え、`AppEvent::ReorderInspectorChain` で section 内 reorder のみ apply (section 跨ぎ拒否)、**`push_rect` / `push_text` / `push_lines` 全 view layer 0 件達成 (Phase 5 仕上げ DoD)** |
+| 2026-05-04 | (本セッション) | bug fix | track 並び替えで plugin instance state を保持 + clip / chain の対応関係を保つため `MainToChild::ReorderTracks(Vec<u32>)` IPC を新設 (1 回の `tracks.mutate` で chains/params/vocal を並び替え + 続けて `LoadSong` で `song_store` も新順序に同期) |
+| 2026-05-04 | (本セッション) | Phase 4 仕上げ | gui_01 #013 (M11 Phase 52) で `Ui::text_input_at_focused` 完了、daw_01 で `text_input_at` → `text_input_at_focused` 1 行置換 → track Rename → 即タイプ可能 (caller boilerplate ゼロ) |
