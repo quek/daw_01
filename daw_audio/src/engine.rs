@@ -314,14 +314,21 @@ impl LocalState {
 
     /// Render `frames` of master output into `master_l/r`. Walks the
     /// current `Song`, dispatching every plugin in every track's chain
-    /// via the worker pool. PR6d3: serial dispatch (master uses
-    /// `worker_syncs[0]`); PR6d4 will fan out across the N pairs.
+    /// via the worker pool.
     pub fn process_buffer(&mut self, shared: &SharedState, sample_rate: u32, frames: usize) {
         self.pump_commands();
 
         let n = frames;
         self.master_l[..n].fill(0.0);
         self.master_r[..n].fill(0.0);
+
+        // A3 freewheel: while the export thread holds the audio
+        // resources, write silence and skip dispatch so the worker pool
+        // and plugin instances are exclusively driven by the export
+        // render loop.
+        if self.shared.export_running.load(Ordering::Acquire) {
+            return;
+        }
 
         // Play / Stop edge handling. On Play, restart playhead and clear
         // active notes. On Stop, queue offs at frame 0 of the next buffer

@@ -9,6 +9,7 @@ anyhow.workspace = true
 arc-swap.workspace = true
 assert_no_alloc = { workspace = true, optional = true }
 cpal.workspace = true
+hound.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

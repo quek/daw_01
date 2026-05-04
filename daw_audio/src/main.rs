@@ -18,6 +18,7 @@ use tokio::net::windows::named_pipe::NamedPipeClient;
 
 mod audio_worker;
 mod engine;
+mod export;
 mod mixer;
 mod sequencer;
 mod tracks;
@@ -70,7 +71,15 @@ async fn main() -> Result<()> {
     .context("failed to start audio stream")?;
     tracing::info!("audio stream running");
 
-    recv_loop(pipe, shared, master_gain, cmd_tx).await;
+    recv_loop(
+        pipe,
+        shared,
+        Arc::clone(&engine_shared),
+        master_gain,
+        session.sample_rate,
+        cmd_tx,
+    )
+    .await;
     tracing::info!("daw_audio exiting");
     Ok(())
 }
@@ -78,7 +87,9 @@ async fn main() -> Result<()> {
 async fn recv_loop(
     mut pipe: NamedPipeClient,
     shared: Arc<SharedState>,
+    engine_shared: Arc<EngineShared>,
     master_gain: Arc<AtomicU32>,
+    session_sample_rate: u32,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<engine::AudioCommand>,
 ) {
     loop {
@@ -177,11 +188,37 @@ async fn recv_loop(
                     samples,
                 });
             }
-            // ExportWav is the trigger for A3's offline render thread.
-            // PR3 only stubs the receive arm so the protocol roundtrips;
-            // PR4 wires it to daw_audio/src/export.rs.
+            // ExportWav: kick off the offline render on a dedicated
+            // thread so the IPC receive loop stays responsive. The
+            // export thread silences the CPAL callback via
+            // `EngineShared::export_running` while it holds the audio
+            // resources.
             Ok(MainToChild::ExportWav { path }) => {
-                tracing::info!(path = %path.display(), "ExportWav received (PR3 stub, PR4 will drive the render)");
+                let song_snap = shared.song.load();
+                let Some(song_arc) = song_snap.as_ref() else {
+                    tracing::warn!("ExportWav received but no song loaded");
+                    continue;
+                };
+                let song = (**song_arc).clone();
+                drop(song_snap);
+                let engine_shared_clone = Arc::clone(&engine_shared);
+                let sample_rate = session_sample_rate;
+                if let Err(e) = std::thread::Builder::new()
+                    .name("daw-audio-export".into())
+                    .spawn(move || {
+                        if let Err(e) = export::run_export(
+                            path,
+                            engine_shared_clone,
+                            song,
+                            sample_rate,
+                            common::process_data::MAX_FRAMES,
+                        ) {
+                            tracing::error!(error = ?e, "offline WAV export failed");
+                        }
+                    })
+                {
+                    tracing::error!(error = ?e, "failed to spawn export thread");
+                }
             }
             // Plugin lifecycle, GUI, state save/restore, per-track
             // mixer params, slot reorder, render-mode bookend, and the
