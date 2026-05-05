@@ -37,9 +37,18 @@ pub struct Vst3Entry {
     pub dll_path: PathBuf,
 }
 
+/// Re-entry safety upper bound for the directory recursion. VST3 install
+/// trees are vendor/category-deep but flat; 8 absorbs symlink loops without
+/// imposing a real limit.
+const MAX_DEPTH: u8 = 8;
+
 /// Scans `%COMMONPROGRAMFILES%\VST3` (or the default `C:\Program Files\Common Files\VST3`)
-/// non-recursively for `.vst3` entries and resolves each one's DLL path.
-/// Individual unresolvable entries are logged and skipped.
+/// **recursively** for `.vst3` entries (vendor subfolders are standard per
+/// the VST3 SDK, e.g. `…\VST3\Steinberg\HALion 7.vst3`) and resolves each
+/// one's DLL path. The `.vst3` bundle itself is treated as a leaf — we
+/// don't recurse into `Contents/x86_64-win/` because that's the bundle
+/// internals, not a search path. Individual unresolvable entries are
+/// logged and skipped.
 pub fn scan_system_vst3_directory() -> Result<Vec<Vst3Entry>> {
     let common_files = std::env::var_os("COMMONPROGRAMFILES")
         .map(PathBuf::from)
@@ -49,27 +58,52 @@ pub fn scan_system_vst3_directory() -> Result<Vec<Vst3Entry>> {
 }
 
 fn scan_directory(dir: &Path) -> Result<Vec<Vst3Entry>> {
+    let mut plugins = Vec::new();
+    walk(dir, &mut plugins, 0)?;
+    plugins.sort_by(|a, b| a.bundle_path.cmp(&b.bundle_path));
+    Ok(plugins)
+}
+
+fn walk(dir: &Path, out: &mut Vec<Vst3Entry>, depth: u8) -> Result<()> {
+    if depth > MAX_DEPTH {
+        return Ok(());
+    }
     let entries = std::fs::read_dir(dir)
         .with_context(|| format!("reading directory {}", dir.display()))?;
-    let mut plugins = Vec::new();
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().is_none_or(|ext| ext != "vst3") {
+        if path.extension().is_some_and(|ext| ext == "vst3") {
+            // bundle (file or dir) は leaf として処理。 中の Contents/… には入らない
+            match resolve_vst3_dll(&path) {
+                Ok(dll) => out.push(Vst3Entry {
+                    bundle_path: path,
+                    dll_path: dll,
+                }),
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        path = %path.display(),
+                        "VST3 entry unresolved, skipping"
+                    );
+                }
+            }
             continue;
         }
-        match resolve_vst3_dll(&path) {
-            Ok(dll) => plugins.push(Vst3Entry {
-                bundle_path: path,
-                dll_path: dll,
-            }),
-            Err(e) => {
-                tracing::warn!(error = ?e, path = %path.display(), "VST3 entry unresolved, skipping");
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            // 非 .vst3 のサブディレクトリは vendor/category folder の
+            // 可能性。 再帰して中の .vst3 を拾う。
+            if let Err(e) = walk(&path, out, depth + 1) {
+                tracing::warn!(
+                    error = ?e,
+                    path = %path.display(),
+                    "VST3 subdirectory scan failed, skipping"
+                );
             }
         }
     }
-    plugins.sort_by(|a, b| a.bundle_path.cmp(&b.bundle_path));
-    Ok(plugins)
+    Ok(())
 }
 
 /// Returns the actual DLL path for the given `.vst3` bundle or legacy file.
@@ -308,5 +342,42 @@ mod tests {
         let bundle = dir.path().join("broken.vst3");
         std::fs::create_dir_all(bundle.join("Contents").join("x86_64-win")).unwrap();
         assert!(resolve_vst3_dll(&bundle).is_err());
+    }
+
+    /// 0 件の root を walk する基本テスト。
+    #[test]
+    fn walk_empty_dir_yields_nothing() {
+        let dir = tempdir().unwrap();
+        assert!(scan_directory(dir.path()).unwrap().is_empty());
+    }
+
+    /// vendor subfolder 内の .vst3 bundle が拾えることを検証 (本修正の主目的)。
+    #[test]
+    fn walk_recurses_into_vendor_subfolder() {
+        let dir = tempdir().unwrap();
+        let vendor = dir.path().join("Steinberg");
+        let bundle = vendor.join("HALion.vst3");
+        let dll_dir = bundle.join("Contents").join("x86_64-win");
+        std::fs::create_dir_all(&dll_dir).unwrap();
+        std::fs::write(dll_dir.join("HALion.vst3"), b"").unwrap();
+        let v = scan_directory(dir.path()).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].bundle_path, bundle);
+    }
+
+    /// .vst3 bundle 内の `Contents/` 等には再帰しない (内部ファイルを別 entry
+    /// として誤検出しないこと)。
+    #[test]
+    fn walk_does_not_recurse_into_vst3_bundle() {
+        let dir = tempdir().unwrap();
+        let bundle = dir.path().join("foo.vst3");
+        let dll_dir = bundle.join("Contents").join("x86_64-win");
+        std::fs::create_dir_all(&dll_dir).unwrap();
+        std::fs::write(dll_dir.join("foo.vst3"), b"").unwrap();
+        // bundle 直下の dll も `.vst3` 拡張子だが、 walk は bundle に入らないので
+        // 検出される entry は bundle 自体の 1 つだけ。
+        let v = scan_directory(dir.path()).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].bundle_path, bundle);
     }
 }
