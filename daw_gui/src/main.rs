@@ -97,7 +97,7 @@ fn main() -> Result<()> {
     let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel::<MainToChild>();
     let (plugin_tx, plugin_rx) = tokio::sync::mpsc::unbounded_channel::<MainToChild>();
     let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel::<ChildToMain>();
-    rt.spawn(send_loop(audio_server, audio_rx));
+    rt.spawn(audio_pipe_loop(audio_server, audio_rx, incoming_tx.clone()));
     rt.spawn(plugin_pipe_loop(plugin_server, plugin_rx, incoming_tx));
 
     let plugin_db = load_or_build_plugin_db();
@@ -242,14 +242,37 @@ async fn handshake(
     Ok((hello, server))
 }
 
-async fn send_loop(mut pipe: NamedPipeServer, mut rx: UnboundedReceiver<MainToChild>) {
-    while let Some(msg) = rx.recv().await {
-        if let Err(e) = write_msg(&mut pipe, &msg).await {
-            tracing::error!(error = ?e, ?msg, "failed to send message to child");
-            break;
+async fn audio_pipe_loop(
+    mut pipe: NamedPipeServer,
+    mut rx: UnboundedReceiver<MainToChild>,
+    incoming_tx: tokio::sync::mpsc::UnboundedSender<ChildToMain>,
+) {
+    loop {
+        tokio::select! {
+            msg = read_msg::<_, ChildToMain>(&mut pipe) => {
+                match msg {
+                    Ok(m) => {
+                        if incoming_tx.send(m).is_err() {
+                            tracing::info!("incoming receiver dropped; audio pipe loop exiting");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::info!(error = ?e, "daw_audio pipe closed");
+                        break;
+                    }
+                }
+            }
+            Some(msg) = rx.recv() => {
+                if let Err(e) = write_msg(&mut pipe, &msg).await {
+                    tracing::error!(error = ?e, ?msg, "failed to send message to daw_audio");
+                    break;
+                }
+            }
+            else => break,
         }
     }
-    tracing::info!("send loop ended");
+    tracing::info!("audio pipe loop ended");
 }
 
 async fn plugin_pipe_loop(
@@ -373,14 +396,7 @@ fn spawn_incoming_bridge(
                     Some(AppEvent::AllStatesReceived(entries))
                 }
                 ChildToMain::ExportWavComplete { error } => {
-                    // PR3 stub: log only. PR5 wires this back to the
-                    // GUI status bar via AppEvent::ExportWavComplete.
-                    if let Some(err) = error {
-                        tracing::warn!(error = %err, "ExportWavComplete: failed");
-                    } else {
-                        tracing::info!("ExportWavComplete: success");
-                    }
-                    None
+                    Some(AppEvent::ExportWavComplete { error })
                 }
                 ChildToMain::Hello { .. } => None,
             };

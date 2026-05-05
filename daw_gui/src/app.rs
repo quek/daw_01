@@ -706,6 +706,10 @@ pub enum AppEvent {
     // -------- VOICEVOX ----------------------------------------------------
     SynthesizeVocal,
     VocalSynthCompleted,
+
+    // -------- WAV export -------------------------------------------------
+    ExportWav,
+    ExportWavComplete { error: Option<String> },
 }
 
 impl AppData {
@@ -942,6 +946,21 @@ impl AppData {
             }
             AppEvent::TrackPeaksTick(peaks) => {
                 self.on_track_peaks_tick(&peaks);
+            }
+            AppEvent::ExportWav => {
+                self.action_export_wav();
+            }
+            AppEvent::ExportWavComplete { error } => {
+                // Either way, hand the plugins back to realtime mode
+                // (we set Offline before triggering the export).
+                self.send_plugin(MainToChild::SetRenderMode(
+                    common::protocol::RenderMode::Realtime,
+                ));
+                if let Some(err) = error {
+                    self.status_message = format!("WAV 書き出し失敗: {err}");
+                } else {
+                    self.status_message = "WAV 書き出し完了".to_string();
+                }
             }
             AppEvent::SynthesizeVocal => {
                 self.status_message = "VOICEVOX 合成中...".to_string();
@@ -2398,6 +2417,33 @@ impl AppData {
             .unwrap_or_else(|| plugin_id.to_string())
     }
 
+    /// File → Export WAV...:
+    ///   1. Pick a destination via the OS file dialog.
+    ///   2. Tell the plugin host to switch every plugin to
+    ///      `CLAP_RENDER_OFFLINE` so plugins offering the `clap.render`
+    ///      extension can use higher-quality algorithms.
+    ///   3. Send `ExportWav { path }` to daw_audio, which freewheels
+    ///      the song through the existing AudioWorker pool while the
+    ///      CPAL callback writes silence.
+    ///   4. On `ExportWavComplete` the handler flips render mode back
+    ///      to Realtime (see `AppEvent::ExportWavComplete` arm).
+    fn action_export_wav(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("WAV", &["wav"])
+            .save_file()
+        else {
+            return;
+        };
+        self.status_message = "WAV 書き出し中...".to_string();
+        // Make sure daw_audio has the latest song snapshot before the
+        // freewheel run starts.
+        let song = self.song.clone();
+        self.send_audio(MainToChild::LoadSong(song));
+        self.send_plugin(MainToChild::SetRenderMode(
+            common::protocol::RenderMode::Offline,
+        ));
+        self.send_audio(MainToChild::ExportWav { path });
+    }
 }
 
 // ---------------------------------------------------------------------------

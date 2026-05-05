@@ -11,9 +11,10 @@ use anyhow::{Context, Result};
 static GLOBAL: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 use common::audio_bridge::AudioBridgeHandle;
 use common::meter::compute_block_peak;
-use common::protocol::{ChildKind, MainToChild};
-use common::wire::read_msg;
+use common::protocol::{ChildKind, ChildToMain, MainToChild};
+use common::wire::{read_msg, write_msg};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use tokio::io::ReadHalf;
 use tokio::net::windows::named_pipe::NamedPipeClient;
 
 mod audio_worker;
@@ -71,13 +72,30 @@ async fn main() -> Result<()> {
     .context("failed to start audio stream")?;
     tracing::info!("audio stream running");
 
+    // Split the pipe so the receive loop can keep reading while the
+    // export thread (off-tokio) ships completion notifications back to
+    // daw_gui. `out_rx` drains the queue on a single tokio task so the
+    // pipe writer is single-owner.
+    let (read_half, mut write_half) = tokio::io::split(pipe);
+    let (out_tx, mut out_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ChildToMain>();
+    tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            if let Err(e) = write_msg(&mut write_half, &msg).await {
+                tracing::error!(error = ?e, "failed to send ChildToMain from daw_audio");
+                break;
+            }
+        }
+    });
+
     recv_loop(
-        pipe,
+        read_half,
         shared,
         Arc::clone(&engine_shared),
         master_gain,
         session.sample_rate,
         cmd_tx,
+        out_tx,
     )
     .await;
     tracing::info!("daw_audio exiting");
@@ -85,12 +103,13 @@ async fn main() -> Result<()> {
 }
 
 async fn recv_loop(
-    mut pipe: NamedPipeClient,
+    mut pipe: ReadHalf<NamedPipeClient>,
     shared: Arc<SharedState>,
     engine_shared: Arc<EngineShared>,
     master_gain: Arc<AtomicU32>,
     session_sample_rate: u32,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<engine::AudioCommand>,
+    out_tx: tokio::sync::mpsc::UnboundedSender<ChildToMain>,
 ) {
     loop {
         match read_msg::<_, MainToChild>(&mut pipe).await {
@@ -197,27 +216,41 @@ async fn recv_loop(
                 let song_snap = shared.song.load();
                 let Some(song_arc) = song_snap.as_ref() else {
                     tracing::warn!("ExportWav received but no song loaded");
+                    let _ = out_tx.send(ChildToMain::ExportWavComplete {
+                        error: Some("no song loaded".into()),
+                    });
                     continue;
                 };
                 let song = (**song_arc).clone();
                 drop(song_snap);
                 let engine_shared_clone = Arc::clone(&engine_shared);
+                let out_tx_clone = out_tx.clone();
                 let sample_rate = session_sample_rate;
                 if let Err(e) = std::thread::Builder::new()
                     .name("daw-audio-export".into())
                     .spawn(move || {
-                        if let Err(e) = export::run_export(
+                        let result = export::run_export(
                             path,
                             engine_shared_clone,
                             song,
                             sample_rate,
                             common::process_data::MAX_FRAMES,
-                        ) {
-                            tracing::error!(error = ?e, "offline WAV export failed");
-                        }
+                        );
+                        let error_msg = match result {
+                            Ok(()) => None,
+                            Err(e) => {
+                                tracing::error!(error = ?e, "offline WAV export failed");
+                                Some(format!("{e:#}"))
+                            }
+                        };
+                        let _ = out_tx_clone
+                            .send(ChildToMain::ExportWavComplete { error: error_msg });
                     })
                 {
                     tracing::error!(error = ?e, "failed to spawn export thread");
+                    let _ = out_tx.send(ChildToMain::ExportWavComplete {
+                        error: Some(format!("failed to spawn export thread: {e}")),
+                    });
                 }
             }
             // Plugin lifecycle, GUI, state save/restore, per-track
