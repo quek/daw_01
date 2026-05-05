@@ -676,3 +676,102 @@ const STYLE_M: ToggleButtonStyle = ToggleButtonStyle {
 
 ---
 
+## #017 [Open] 2026-05-05 [要望] `Ui::piano_roll` に note 歌詞 inline 編集 (text_input overlay) を内蔵
+
+### daw_01 →
+
+- 種別: [要望]
+- 関連 daw_01 ファイル: [daw_gui/src/view/piano_roll_view.rs](../daw_gui/src/view/piano_roll_view.rs)、 [daw_gui/src/app.rs](../daw_gui/src/app.rs:729) (`AppEvent::SetSelectedNoteLyric` 既存)
+- 関連 gui_01 ファイル:
+  - `crates/ui/src/widgets/piano_roll.rs:543` (`pub fn piano_roll`)
+  - `crates/ui/src/widgets/piano_roll.rs:74` (`Note { lyric: Option<Arc<str>> }`)
+  - `crates/ui/src/widgets/piano_roll.rs:164` (`NotesEditRequest`)
+  - `crates/ui/src/widgets/piano_roll.rs:1162` (歌詞描画 — 既存)
+  - 参考: `crates/ui/src/widgets/text_input.rs::text_input_at_focused` (M11 Phase 52、 daw_01 #013 由来) — rename UI で使った inline edit pattern
+
+#### 背景
+
+daw_01 は VOICEVOX 歌唱機能を持つ DAW。 各 note に `lyric: Option<Arc<str>>` schema が完備、 `Ui::piano_roll` widget の歌詞描画 (M9 Phase 44c) も済んでいて、 note 矩形上に歌詞テキストが表示される。 **でも歌詞を入力する UI が無い** — JSON ファイル直編集するしかない状態。
+
+歌唱パイプラインの A1 (VOICEVOX 統合) 着手の前提なので、 ここを潰したい。
+
+#### 期待挙動
+
+DAW 業界慣習 (Cubase / REAPER / Logic / Cakewalk いずれも同パターン) に揃える:
+1. piano_roll で note を 1 つ選択 (既存 `Select` request 経由)
+2. **F2** または **Enter** または note rect の **dbl-click** で「歌詞編集モード」 に入る → note rect 内に text_input overlay が出る (既存 lyric があれば prefill、 cursor 末尾、 全選択でも可)
+3. **Enter** で commit → モード解除、 lyric が反映
+4. **Esc** で cancel → モード解除、 lyric は変更前のまま
+5. **Tab** で次の note (start_beat 順、 同 beat なら pitch 高い順) に移動 + 編集モード継続。 **Shift+Tab** で逆順
+6. 編集モード中は piano_roll の他の入力 (drag / resize / wheel zoom / rect-select) を抑制
+7. **IME 対応**: text_input_at の preedit / commit 機構をそのまま使い、 CJK モーラ単位入力が成立すること (track rename と同じ)
+
+#### 想定 API (Option C: widget 内蔵案、 daw_01 推奨)
+
+`piano_roll` 内部で text_input overlay 完結、 daw_01 側は `SetLyric` request の処理だけ書けば良い形:
+
+```rust
+// crates/ui/src/widgets/piano_roll.rs
+
+pub enum NotesEditRequest {
+    // ... existing 4 variants ...
+    /// note 1 つの歌詞を更新。 widget 内で commit 検知時に発行。
+    /// `lyric == None` で歌詞削除 (空文字列 commit の解釈は widget に任せる、
+    /// 現状の daw_01 側は空文字列を None と同等扱い予定)。
+    SetLyric { id: NoteId, lyric: Option<String> },
+}
+
+pub struct PianoRollResponse {
+    // ... existing ...
+    /// 歌詞編集 mode 中の note id (text_input が表示されている note)。
+    /// daw_01 は global shortcut (Ctrl+Z 等) を抑制する判断に使える。
+    pub lyric_editing: Option<NoteId>,
+}
+```
+
+挙動:
+- F2 / Enter / dbl-click 検知は widget 内で処理 → `lyric_editing` を Some(id) に
+- text_input rect は note 矩形と同じ (or 末尾 right padding)、 font は既存の `lyric_font_px`
+- `text_input_at_focused` を流用 (既存 inline-edit pattern)
+- Enter commit → `NotesEditRequest::SetLyric { id, lyric: Some(text) }` を発行 → `lyric_editing` を None
+- Esc / outside click → `lyric_editing` を None (request は発行しない)
+- Tab / Shift+Tab で次 note へ → `SetLyric` (現値で commit) + 次の `lyric_editing` を立てる
+- 編集 mode 中は existing drag / resize / wheel / rect-select を short-circuit (widget 内のみで完結、 daw_01 側は何もしない)
+
+#### Option B (fallback): widget は note rect 情報だけ提供、 overlay は daw_01 側
+
+もし widget 内蔵が大規模になりすぎる懸念があれば:
+
+```rust
+pub struct PianoRollResponse {
+    // ...
+    /// note id → screen rect の map (visible note のみ)。 daw_01 側で
+    /// この rect 上に `text_input_at_focused` を被せる。
+    pub note_screen_rects: Vec<(NoteId, Rect)>,
+}
+```
+
+daw_01 側で AppData に `lyric_editing_note: Option<NoteId>` + buffer を持ち、 piano_roll_view 内で text_input 重ね描き。
+
+ただし Option B は arrangement_view の track_rename と同じ「app 側に edit state 保持」 で、 piano_roll_view から AppData へのフィードバック量が増える + IME 状態管理が二重化する懸念。 widget 内蔵 (Option C) のほうが相性が良いはず。
+
+#### daw_01 側で対応する実装 (受領後)
+
+- `AppEvent::SetNoteLyric { clip_ref: ClipRef, note_id: u32, lyric: Option<String> }` 追加
+- `make_edit` で `NotesEditRequest::SetLyric` を上記 AppEvent に変換
+- handler は既存の `set_selected_note_lyric` を参考に、 単一 note 用に書く
+- `is_undoable` に追加 (commit 時 1 度の undo snapshot)
+- 既存 `AppEvent::SetSelectedNoteLyric` (= 全 selected note に同じ歌詞を一括設定) は別 use case として残す or 廃止
+
+#### 確認したい点
+
+1. Option C (widget 内蔵) で受け入れ可か、 Option B (rect 提供のみ) を希望するか
+2. F2 / Enter / dbl-click のキーバインド集合はこの 3 つで合意できるか (REAPER は F2 のみ、 Cubase は Tab 編集も標準)
+3. Tab / Shift+Tab の next-note 順序は (start_beat 昇順 → 同 beat なら pitch 降順) で OK か
+4. Enter で空文字列 commit したときは `Some("")` のままにする? それとも widget が `None` に変換? (daw_01 側は両方扱える)
+
+### gui_01 →
+（gui_01 Claude が記入）
+
+---
+
