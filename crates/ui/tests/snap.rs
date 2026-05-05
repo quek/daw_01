@@ -30,6 +30,7 @@ fn snap_disabled_returns_raw() {
         mode: SnapMode::Straight { div: 16 },
         enabled: false,
         min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
     };
     assert!(!cfg.is_active(false));
     assert!((cfg.snap_beat(1.234, false, 64.0) - 1.234).abs() < 1e-12);
@@ -42,6 +43,7 @@ fn alt_pressed_returns_raw() {
         mode: SnapMode::Straight { div: 16 },
         enabled: true,
         min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
     };
     assert!(cfg.is_active(false));
     assert!(!cfg.is_active(true));
@@ -55,6 +57,7 @@ fn straight_16_snaps_quarter() {
         mode: SnapMode::Straight { div: 16 },
         enabled: true,
         min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
     };
     // 1/16 = 0.0625 拍。1.234 / 0.0625 = 19.744 → round 20 → 20 * 0.0625 = 1.25
     let snapped = cfg.snap_beat(1.234, false, 64.0);
@@ -67,6 +70,7 @@ fn triplet_4_unit() {
         mode: SnapMode::Triplet { div: 4 },
         enabled: true,
         min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
     };
     let unit = cfg.beat_unit(64.0).expect("active");
     // (2/3) / 4 = 0.16666...
@@ -79,6 +83,7 @@ fn dotted_8_unit() {
         mode: SnapMode::Dotted { div: 8 },
         enabled: true,
         min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
     };
     let unit = cfg.beat_unit(64.0).expect("active");
     // 1.5 / 8 = 0.1875
@@ -108,6 +113,7 @@ fn min_beat_unit_floor() {
         mode: SnapMode::Adaptive,
         enabled: true,
         min_beat_unit: 1.0 / 64.0,
+        time_sig: (4, 4),
     };
     let unit = cfg.beat_unit(1600.0).unwrap();
     assert!((unit - (1.0 / 64.0)).abs() < 1e-9, "got {unit}");
@@ -119,6 +125,7 @@ fn snap_beat_delta_negative() {
         mode: SnapMode::Straight { div: 16 },
         enabled: true,
         min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
     };
     // -1.234 / 0.0625 = -19.744 → round -20 → -20 * 0.0625 = -1.25
     let snapped = cfg.snap_beat_delta(-1.234, false, 64.0);
@@ -140,4 +147,72 @@ fn min_visible_grid_px_boundary_64() {
     let cfg = SnapConfig::DEFAULT;
     let unit = cfg.beat_unit(48.0).unwrap();
     assert!((unit - 0.25).abs() < 1e-9, "got {unit}");
+}
+
+// (M14 Phase 61c / daw_01 #011) Bars { count } 系 unit test。 1 bar = `time_sig.0 * 4 /
+// time_sig.1` 拍 (4/4 → 4 拍、 3/4 → 3 拍、 6/8 → 3 拍)。 count = 0 は None で defensive。
+
+#[test]
+fn bars_1_at_4_4_is_4_beats() {
+    let cfg = SnapConfig {
+        mode: SnapMode::Bars { count: 1 },
+        enabled: true,
+        min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
+    };
+    let unit = cfg.beat_unit(64.0).expect("active");
+    assert!((unit - 4.0).abs() < 1e-9, "1 bar @ 4/4 = 4 拍、 got {unit}");
+}
+
+#[test]
+fn bars_2_at_3_4_is_6_beats() {
+    let cfg = SnapConfig {
+        mode: SnapMode::Bars { count: 2 },
+        enabled: true,
+        min_beat_unit: 1.0 / 128.0,
+        time_sig: (3, 4),
+    };
+    let unit = cfg.beat_unit(64.0).expect("active");
+    // 3/4: beats_per_bar = 3 * 4 / 4 = 3 拍。 2 bars = 6 拍。
+    assert!((unit - 6.0).abs() < 1e-9, "2 bars @ 3/4 = 6 拍、 got {unit}");
+}
+
+#[test]
+fn bars_4_at_6_8_is_12_beats() {
+    let cfg = SnapConfig {
+        mode: SnapMode::Bars { count: 4 },
+        enabled: true,
+        min_beat_unit: 1.0 / 128.0,
+        time_sig: (6, 8),
+    };
+    let unit = cfg.beat_unit(64.0).expect("active");
+    // 6/8: beats_per_bar = 6 * 4 / 8 = 3 拍。 4 bars = 12 拍。
+    assert!((unit - 12.0).abs() < 1e-9, "4 bars @ 6/8 = 12 拍、 got {unit}");
+}
+
+#[test]
+fn bars_count_zero_returns_none() {
+    let cfg = SnapConfig {
+        mode: SnapMode::Bars { count: 0 },
+        enabled: true,
+        min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
+    };
+    assert!(
+        cfg.beat_unit(64.0).is_none(),
+        "Bars count=0 は None (defensive、 dropdown 等で 0 漏れ防止)"
+    );
+}
+
+#[test]
+fn bars_snap_aligns_to_bar_boundary() {
+    // 4/4 で raw 7.3 拍 → 1 bar (= 4 拍) snap → round(7.3 / 4) = round(1.825) = 2 → 2 * 4 = 8.0
+    let cfg = SnapConfig {
+        mode: SnapMode::Bars { count: 1 },
+        enabled: true,
+        min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
+    };
+    let snapped = cfg.snap_beat(7.3, false, 64.0);
+    assert!((snapped - 8.0).abs() < 1e-9, "Bars 1 で 7.3 → 8.0 (2 小節目頭)、 got {snapped}");
 }

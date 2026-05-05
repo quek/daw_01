@@ -17,11 +17,16 @@ pub enum SnapMode {
     Dotted { div: u32 },
     /// `(2/3)/div` 拍 (三連符)。
     Triplet { div: u32 },
+    /// (M14 Phase 61c / daw_01 #011) `count` bar 単位 snap。 1 bar の拍数は `SnapConfig.time_sig`
+    /// から `numerator * 4 / denominator` で計算 (4/4 → 4 拍、 3/4 → 3 拍、 6/8 → 3 拍)。
+    /// `count = 0` は `Off` 同等 (`beat_unit` が `None` を返す、 defensive)。
+    /// 1/2 bar 等の分数 bar は表現不可 (実需要が出たら fraction Bars を別途検討)。
+    Bars { count: u32 },
     /// zoom (px/beat) に応じて 1/N を自動選択 (`MIN_VISIBLE_GRID_PX = 12.0` 以上を満たす最大 unit)。
     Adaptive,
 }
 
-/// snap 設定。`mode` + `enabled` + `min_beat_unit` (snap unit の下限) の 3 値で表現。
+/// snap 設定。`mode` + `enabled` + `min_beat_unit` (snap unit の下限) + `time_sig` で表現。
 ///
 /// `Eq` は `min_beat_unit: f64` を含むので derive 不可、`PartialEq` のみ。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -29,18 +34,25 @@ pub struct SnapConfig {
     pub mode: SnapMode,
     pub enabled: bool,
     pub min_beat_unit: f64,
+    /// (M14 Phase 61c / daw_01 #011) `Bars` mode の 1 bar 拍数計算用。
+    /// `(numerator, denominator)`、 default `(4, 4)`。 caller (`PianoRollView` /
+    /// `ArrangementView` を組む側) は既に `view.time_sig` を持つので、 SnapConfig 組み立て時に
+    /// 同じ source から 1 行で渡す (二重持ちは caller 責務、 ずれても 1 frame 遅延のみで実害小)。
+    /// `Bars` 以外の mode では使われない。
+    pub time_sig: (u8, u8),
 }
 
 /// `Adaptive` の zoom 閾値。`zoom_x * unit >= MIN_VISIBLE_GRID_PX` を満たす最大 unit を選ぶ。
 const MIN_VISIBLE_GRID_PX: f64 = 12.0;
 
 impl SnapConfig {
-    /// デフォルト snap (Adaptive ON、`min_beat_unit = 1/128`)。
+    /// デフォルト snap (Adaptive ON、`min_beat_unit = 1/128`、 `time_sig = (4, 4)`)。
     /// `Default::default()` と同値。
     pub const DEFAULT: Self = Self {
         mode: SnapMode::Adaptive,
         enabled: true,
         min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
     };
 
     /// 明示的に snap を切る。caller が「絶対 snap させたくない」場面で渡す。
@@ -48,6 +60,7 @@ impl SnapConfig {
         mode: SnapMode::Off,
         enabled: false,
         min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
     };
 
     /// `alt_pressed` (一時無効化) / `enabled = false` / `mode == Off` のいずれかで `false`。
@@ -62,6 +75,7 @@ impl SnapConfig {
     /// 現在の snap mode + zoom から 1 unit の長さ (拍) を返す。
     /// `min_beat_unit` で floor。snap が無効 (alt / disabled / Off) なら `None`。
     /// zoom が 0 / 負 / 非有限のときは `MIN_VISIBLE_GRID_PX` 計算が破綻するので `None`。
+    /// `Bars { count: 0 }` も `None` (defensive、 caller の dropdown 等で 0 が漏れた場合)。
     #[must_use]
     pub fn beat_unit(&self, zoom_x_px_per_beat: f32) -> Option<f64> {
         if !self.is_active(false) {
@@ -72,6 +86,17 @@ impl SnapConfig {
             SnapMode::Straight { div } => 1.0 / f64::from(div.max(1)),
             SnapMode::Triplet { div } => (2.0 / 3.0) / f64::from(div.max(1)),
             SnapMode::Dotted { div } => 1.5 / f64::from(div.max(1)),
+            // (M14 Phase 61c / daw_01 #011) Bars: 1 bar = `time_sig.0 * 4 / time_sig.1` 拍。
+            // count = 0 は None で skip。 time_sig の各成分は 0 防御で max(1)。
+            SnapMode::Bars { count } => {
+                if count == 0 {
+                    return None;
+                }
+                let num = f64::from(self.time_sig.0.max(1));
+                let den = f64::from(self.time_sig.1.max(1));
+                let beats_per_bar = num * 4.0 / den;
+                beats_per_bar * f64::from(count)
+            }
             SnapMode::Adaptive => beat_unit_for_zoom(zoom_x_px_per_beat),
         };
         let unit = raw_unit.max(self.min_beat_unit);

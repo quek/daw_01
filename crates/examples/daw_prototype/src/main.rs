@@ -763,7 +763,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
         &m.arr_selected_clips,
         m.arr_selected_track,
         &style,
-        |req| match req {
+        move |req| match req {
             ArrangementEditRequest::SelectClips { next, .. } => {
                 let next_v = next;
                 Edit::mutate(move |mm: &mut DawModel| {
@@ -930,11 +930,18 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 mm.arr_view.loop_range = Some((lo, hi));
                 mm.last_action = format!("arr: SetLoopRange [{lo:.2}, {hi:.2}]");
             }),
-            ArrangementEditRequest::SetZoomX(factor) => Edit::mutate(move |mm: &mut DawModel| {
-                let new_len = (mm.arr_view.len_beats * f64::from(factor)).clamp(1.0, 256.0);
-                mm.arr_view.len_beats = new_len;
-                mm.last_action = format!("arr: SetZoomX → len={new_len:.2}");
-            }),
+            ArrangementEditRequest::SetZoomX(zoom) => {
+                // M14 Phase 61a (#011): widget は **絶対値 px/beat** を送る (旧 factor 直送り
+                // semantic は廃止)。 example の `len_beats` は `lanes_w / zoom` で逆引き保存する。
+                // header_w = 180.0 は arr_view 構築時と一致 (L118)。
+                let lanes_w = f64::from((arr_pane.w - 180.0).max(1.0));
+                Edit::mutate(move |mm: &mut DawModel| {
+                    let z = zoom.clamp(2.0, 400.0);
+                    let new_len = (lanes_w / f64::from(z)).clamp(1.0, 256.0);
+                    mm.arr_view.len_beats = new_len;
+                    mm.last_action = format!("arr: SetZoomX → zoom={z:.1} px/beat, len={new_len:.2}");
+                })
+            },
             ArrangementEditRequest::SetScrollX(start) => Edit::mutate(move |mm: &mut DawModel| {
                 mm.arr_view.start_beat = start.max(0.0);
             }),

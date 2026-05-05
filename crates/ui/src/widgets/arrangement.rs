@@ -181,6 +181,10 @@ pub enum ArrangementEditRequest {
     ToggleTrackMute(u32),
     ToggleTrackSolo(u32),
     SetLoopRange { start: f64, end: f64 },
+    /// 横ズーム (`zoom_x_px_per_beat` = px/beat を **絶対値で更新**、`Ctrl+wheel` で発火)。
+    /// widget 側で `current_zoom_x * factor` を計算済の絶対値を送る (`SetTrackRowH` と同パターン)。
+    /// min/max の clamp は app 側で実施 (目安 2..400 px/beat、 1 拍 = 2px の超 zoom out 〜
+    /// 1 拍 = 400px の超 zoom in)。 widget 側は NaN/inf 防御の sanity clamp `0.1..10000` のみ。
     SetZoomX(f32),
     SetScrollX(f64),
     SetTrackTop(f32),
@@ -726,6 +730,33 @@ fn compute_clip_drag_beat_delta(
     let snapped_pivot =
         snap.snap_beat(pivot + raw_beat_delta, nd.last_alt, zoom_x_px_per_beat);
     snapped_pivot - pivot
+}
+
+/// M14 Phase 61b (#011): caller の `data_generation` は track 構成 (順序 / mute / solo /
+/// volume / name / clip 個数) のみの責務に整理し、 clip 個別の `(id, start_beat, len_beats)`
+/// 変化は widget 側で吸収する。 旧設計は caller が data_generation で全網羅を要求されており、
+/// 漏れると drag move 後に古い clip rect が残像として残る (#011 (2))。 全 caller が同じ
+/// boilerplate を書くのは設計欠陥のシグナル (`feedback_pursue_best_practice`)。
+///
+/// FNV-1a 風 fold (大きな素数倍 + xor)。 100 clip × 4 fold step = ~100ns @ 4GHz、 16ms 予算
+/// の 0.001%。 `ArrangementClip` は gui_01 公開型なので widget が hash する権利あり (no-Clone
+/// 不変条件にも触れない、 `u32`/`f64` は Copy)。
+fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
+    const PRIME: u64 = 0x100_0000_01B3; // FNV-1a 64bit prime
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325; // FNV-1a 64bit offset basis
+    for t in tracks {
+        h ^= u64::from(t.id);
+        h = h.wrapping_mul(PRIME);
+        for c in &t.clips {
+            h ^= u64::from(c.id);
+            h = h.wrapping_mul(PRIME);
+            h ^= c.start_beat.to_bits();
+            h = h.wrapping_mul(PRIME);
+            h ^= c.len_beats.to_bits();
+            h = h.wrapping_mul(PRIME);
+        }
+    }
+    h
 }
 
 // ============================================================
@@ -1436,9 +1467,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // preview で cache miss を強制 (新順序での再描画を 1 frame 遅延なく行う)。
         // tuple Hash 実装は 12 要素まで → nested tuple で 13 要素分を表現。
         // M13 Phase 55: bpm / time_sig を 3 つ目の nested tuple で追加し v2 に bump。
+        // M14 Phase 61b (#011): clip 個別の (id, start_beat, len_beats) 変化を widget 側で hash
+        // して 4 つ目の outer 要素 internal_clip_hash として viewport_key に追加 + v3 に bump。
+        let internal_clip_hash = fold_arrangement_clip_hash(tracks);
         let viewport_key = (
             (
-                b"arrangement_widget_v2" as &[u8],
+                b"arrangement_widget_v3" as &[u8],
                 rect.w.to_bits(),
                 rect.h.to_bits(),
                 view.start_beat.to_bits(),
@@ -1453,6 +1487,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             ),
             pending_reorder_hash,
             (view.bpm.to_bits(), u32::from(view.time_sig.0), u32::from(view.time_sig.1)),
+            internal_clip_hash,
         );
 
         // M10 Phase 50: pending_reorder_order があれば新順序で `tracks_for_draw` を組み立て、
@@ -1900,13 +1935,43 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         if scroll.1.abs() > 0.0 || scroll.0.abs() > 0.0 {
             let dy = scroll.1;
             if pointer.modifiers.ctrl {
-                let factor = (-dy * 0.005).exp();
-                self.push_edit(make_edit(ArrangementEditRequest::SetZoomX(factor)));
+                // M14 Phase 61a (#011): wheel up = zoom in (符号反転)、 1 ノッチで ~20% 変化
+                // (係数 0.005 → 0.0015、 Cubase/Live 同等)、 SetZoomX を絶対値送信に統一
+                // (旧設計は factor 0.55..1.82 を直送りで daw_01 の clamp(2, 400) で必ず 2 に
+                // 張り付き ruler 1〜100 圧縮を起こしていた)。 SetTrackRowH と同パターン。
+                // M14 Phase 61a follow-up: マウス位置を anchor に zoom (Cubase/Live 標準)、
+                // SetScrollX を同 frame で発行して beat_at_mouse を維持。
+                let factor = (dy * 0.0015).exp();
+                let new_zoom = (zoom_x_px_per_beat * factor).clamp(0.1, 10000.0);
+                if let Some((mx, _)) = pointer.pos {
+                    let beat_at_mouse =
+                        view.start_beat + f64::from(mx - lanes.x) * beat_per_px;
+                    let new_beat_per_px = 1.0 / f64::from(new_zoom);
+                    let new_start = beat_at_mouse - f64::from(mx - lanes.x) * new_beat_per_px;
+                    self.push_edit(make_edit(ArrangementEditRequest::SetScrollX(
+                        new_start.max(0.0),
+                    )));
+                }
+                self.push_edit(make_edit(ArrangementEditRequest::SetZoomX(new_zoom)));
             } else if pointer.modifiers.alt {
                 // M10 Phase 48: Alt+wheel で row_h 縦ズーム (zoom_x と同じ exp curve)。
                 // app 側で 16..96 px 等の clamp を実施。
-                let factor = (-dy * 0.005).exp();
+                // M14 Phase 61a (#011): 符号反転 + 係数 0.005→0.0015 (Ctrl+wheel と一貫、
+                // wheel up = zoom in、 row 大きく)。
+                // M14 Phase 61a follow-up: マウス y 位置を anchor に zoom、 SetTrackTop を同
+                // frame で発行して mouse 下の track が画面上で動かないようにする (Cubase 標準)。
+                let factor = (dy * 0.0015).exp();
                 let new_h = view.track_row_h * factor;
+                if let Some((_, my)) = pointer.pos
+                    && view.track_row_h > 0.0
+                {
+                    let abs_pos = (f64::from(my - lanes.y) + f64::from(view.track_top))
+                        / f64::from(view.track_row_h);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let new_top =
+                        (abs_pos * f64::from(new_h) - f64::from(my - lanes.y)).max(0.0) as f32;
+                    self.push_edit(make_edit(ArrangementEditRequest::SetTrackTop(new_top)));
+                }
                 self.push_edit(make_edit(ArrangementEditRequest::SetTrackRowH(new_h)));
             } else if pointer.modifiers.shift {
                 let delta = -f64::from(dy) * beat_per_px * 4.0;
@@ -2551,14 +2616,18 @@ mod tests {
             "Alt+wheel で SetTrackRowH が発火する: log={:?}",
             *log
         );
+        // M14 Phase 61a follow-up: Alt+wheel は anchor 調整のため **SetTrackTop も同 frame で発火**
+        // する (mouse 下の track が画面上で動かないようにする、 Cubase 標準)。
         assert!(
-            !log.contains(&"SetTrackTop"),
-            "Alt+wheel では SetTrackTop は発火しない: log={:?}",
+            log.contains(&"SetTrackTop"),
+            "Alt+wheel は anchor 調整のため SetTrackTop も発火する: log={:?}",
             *log
         );
-        // exp(-(-100) * 0.005) = exp(0.5) ≈ 1.6487 → row_h = 32 * 1.6487 ≈ 52.76
+        // M14 Phase 61a (#011): 符号反転 + 係数低減後の挙動。
+        // dy=-100 (wheel down) → factor = exp(-100 * 0.0015) = exp(-0.15) ≈ 0.8607
+        //   → row_h = 32 * 0.8607 ≈ 27.54 (wheel down で row 縮む = zoom out、 一般 DAW 一致)。
         assert!(
-            (model.row_h - 32.0 * 0.5_f32.exp()).abs() < 1e-3,
+            (model.row_h - 32.0 * (-0.15_f32).exp()).abs() < 1e-3,
             "row_h は exp curve で更新される: actual={}",
             model.row_h
         );
@@ -2679,7 +2748,7 @@ mod tests {
         );
     }
 
-    /// time_sig 切替で bar 線の x 座標 set が変わる (= viewport_key v2 が time_sig を含んでいて
+    /// time_sig 切替で bar 線の x 座標 set が変わる (= viewport_key v3 が time_sig を含んでいて
     /// 再描画が走る)。
     #[test]
     fn arrangement_grid_bar_lines_change_on_time_sig() {
@@ -2704,6 +2773,63 @@ mod tests {
         assert_ne!(
             xs_4_4, xs_3_4,
             "time_sig 切替で bar 線 set が変わる: 4/4={xs_4_4:?}, 3/4={xs_3_4:?}",
+        );
+    }
+
+    // M14 Phase 61b (#011): fold_arrangement_clip_hash の cache invalidation 性質を verify。
+    // (1) 同一データなら 2 回 fold して同値、 (2) clip.start_beat 変化で hash 変わる、
+    // (3) clip.len_beats 変化で hash 変わる、 (4) clip.id 入替で hash 変わる。
+
+    #[test]
+    fn fold_arrangement_clip_hash_stable_for_unchanged_data() {
+        let tracks = vec![track(
+            10,
+            "t0",
+            vec![clip(100, 0.0, 4.0, "c0"), clip(101, 8.0, 2.0, "c1")],
+        )];
+        let h1 = fold_arrangement_clip_hash(&tracks);
+        let h2 = fold_arrangement_clip_hash(&tracks);
+        assert_eq!(h1, h2, "同じ tracks slice の fold は冪等");
+    }
+
+    #[test]
+    fn fold_arrangement_clip_hash_changes_on_clip_move() {
+        let before = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        let after = vec![track(10, "t0", vec![clip(100, 4.0, 4.0, "c")])]; // start_beat 0 → 4
+        assert_ne!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after),
+            "clip.start_beat 変化で hash が変わる (#011 残像 fix)"
+        );
+    }
+
+    #[test]
+    fn fold_arrangement_clip_hash_changes_on_clip_resize() {
+        let before = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        let after = vec![track(10, "t0", vec![clip(100, 0.0, 6.0, "c")])]; // len_beats 4 → 6
+        assert_ne!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after),
+            "clip.len_beats 変化で hash が変わる (#011 残像 fix)"
+        );
+    }
+
+    #[test]
+    fn fold_arrangement_clip_hash_changes_on_clip_id_swap() {
+        let before = vec![track(
+            10,
+            "t0",
+            vec![clip(100, 0.0, 4.0, "c"), clip(101, 8.0, 2.0, "d")],
+        )];
+        let after = vec![track(
+            10,
+            "t0",
+            vec![clip(101, 0.0, 4.0, "c"), clip(100, 8.0, 2.0, "d")],
+        )]; // id 入替 (位置同じでも identity 違う)
+        assert_ne!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after),
+            "clip.id 入替で hash が変わる (FNV identity 確認)"
         );
     }
 }

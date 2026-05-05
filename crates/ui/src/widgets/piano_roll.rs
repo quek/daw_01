@@ -590,6 +590,39 @@ fn compute_note_drag_beat_delta(
     snapped_pivot - pivot
 }
 
+/// M14 Phase 61b (#011): arrangement と同根。 caller の `notes_generation` は note 数や編集
+/// epoch のみで bump しがちで、 個別 note の `(id, start_beat, len_beats, pitch, velocity,
+/// lyric)` 変化が漏れると drag 残像が発生する。 widget 内部で全 visible note を fold して
+/// viewport_key に追加する (caller boilerplate 強要回避、 `feedback_pursue_best_practice`)。
+///
+/// `lyric: Option<Arc<str>>` は **identity hash** (`Arc::as_ptr`) で扱う。 daw_01 VOICEVOX
+/// 歌詞編集の `SetLyrics` は `Arc::from(...)` で新規作成するので pointer が変われば cache
+/// 無効化が走る。 「同 string を別 Arc で持つ」 caller には不正確だが、 daw_01 は `Arc::clone`
+/// で共有するので問題なし (実需要が出たら中身 hash に切替、 follow-up)。
+///
+/// 5000 note × 6 fold step = ~5μs @ 4GHz、 16ms 予算の 0.03%。
+fn fold_piano_roll_note_hash(notes: &[Note]) -> u64 {
+    const PRIME: u64 = 0x100_0000_01B3; // FNV-1a 64bit prime
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325; // FNV-1a 64bit offset basis
+    for n in notes {
+        h ^= u64::from(n.id);
+        h = h.wrapping_mul(PRIME);
+        h ^= n.start_beat.to_bits();
+        h = h.wrapping_mul(PRIME);
+        h ^= n.len_beats.to_bits();
+        h = h.wrapping_mul(PRIME);
+        h ^= u64::from(n.pitch);
+        h = h.wrapping_mul(PRIME);
+        h ^= u64::from(n.velocity);
+        h = h.wrapping_mul(PRIME);
+        if let Some(s) = &n.lyric {
+            h ^= Arc::as_ptr(s).cast::<()>() as usize as u64;
+            h = h.wrapping_mul(PRIME);
+        }
+    }
+    h
+}
+
 /// piano_roll widget の永続状態 (`UiHost.state` に置かれる)。
 #[derive(Debug, Default)]
 pub(crate) struct PianoRollState {
@@ -971,19 +1004,27 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // M9 Phase 45c: viewport_key に vel_h を追加 (velocity lane 高さ変化で cache 無効化)。
         // M13 Phase 55: ruler_h / bpm / time_sig を追加 + v2 に bump (cache 構造変化)。
         // tuple Hash impl は 12 要素まで → bpm + time_sig を 1 つの組に纏めて 12 要素に収める。
+        // M14 Phase 61b (#011): note 個別の (id, start_beat, len_beats, pitch, velocity, lyric)
+        // 変化を widget 側で hash して 2 要素 outer tuple に wrap + v3 に bump (arrangement の
+        // clip drag 残像と同根の予防、 caller の notes_generation は note 数や編集 epoch のみで
+        // 不十分なケースを吸収)。
+        let internal_note_hash = fold_piano_roll_note_hash(visible);
         let viewport_key = (
-            b"piano_roll_widget_v2" as &[u8],
-            view.start_beat.to_bits(),
-            view.len_beats.to_bits(),
-            view.pitch_top.to_bits(),
-            view.pitch_visible.to_bits(),
-            grid.w.to_bits(),
-            grid.h.to_bits(),
-            kbd.w.to_bits(),
-            view.notes_generation,
-            vel_h.to_bits(),
-            ruler_h.to_bits(),
-            (view.bpm.to_bits(), u32::from(view.time_sig.0), u32::from(view.time_sig.1)),
+            (
+                b"piano_roll_widget_v3" as &[u8],
+                view.start_beat.to_bits(),
+                view.len_beats.to_bits(),
+                view.pitch_top.to_bits(),
+                view.pitch_visible.to_bits(),
+                grid.w.to_bits(),
+                grid.h.to_bits(),
+                kbd.w.to_bits(),
+                view.notes_generation,
+                vel_h.to_bits(),
+                ruler_h.to_bits(),
+                (view.bpm.to_bits(), u32::from(view.time_sig.0), u32::from(view.time_sig.1)),
+            ),
+            internal_note_hash,
         );
 
         // M13 Phase 55: library `time_ruler` / `bar_beat_grid` を呼ぶための共通 mapping。
@@ -1140,7 +1181,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 .snap_beat(raw_start, pointer.modifiers.alt, zoom_x_px_per_beat)
                 .max(0.0);
             let pitch_f = view.pitch_top - (cy - grid.y) / pitch_to_px;
-            let pitch = (pitch_f.round() as i32).clamp(0, 127) as u8;
+            // M14 Phase 61d (#012): 描画式 `y = grid.y + (pitch_top - pitch) * pitch_to_px` の
+            // 逆関数として ceil() を使う (pitch P の視覚行 y ∈ [(top-P)*pt, (top-P+1)*pt) なので
+            // 逆引きは pitch_f ∈ (P-1, P] のとき P を返す = ceil)。 round() だと判定領域が視覚行
+            // に対して半行ぶん上にずれて、 行の下半分にカーソルがあると 1 つ下のピッチに化ける。
+            let pitch = (pitch_f.ceil() as i32).clamp(0, 127) as u8;
             // note id は user 側で next_note_id を bump して上書き。
             // ここでは placeholder id=0 で渡す (user は make_edit closure 内で bump 済 id を使う)。
             let new_note = Note {
@@ -2087,6 +2132,8 @@ mod tests {
         last_select_next: Option<Vec<NoteId>>,
         /// (M14 Phase 59) 最後に発行された `SetLyrics` の内容。
         last_set_lyrics: Option<Vec<(NoteId, Option<String>)>>,
+        /// (M14 Phase 61d / daw_01 #012) 最後に Add request で渡された note の pitch。
+        last_added_pitch: Option<u8>,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2108,6 +2155,7 @@ mod tests {
                 last_select_prev: None,
                 last_select_next: None,
                 last_set_lyrics: None,
+                last_added_pitch: None,
             }
         }
     }
@@ -2116,8 +2164,12 @@ mod tests {
     ) -> impl Fn(NotesEditRequest) -> Edit<TestModel> + Send + Sync + 'static + Clone {
         |req: NotesEditRequest| -> Edit<TestModel> {
             match req {
-                NotesEditRequest::Add(_) => {
-                    Edit::mutate(|m: &mut TestModel| m.last_request = Some(RequestKind::Add))
+                NotesEditRequest::Add(notes) => {
+                    let pitch = notes.first().map(|n| n.pitch);
+                    Edit::mutate(move |m: &mut TestModel| {
+                        m.last_request = Some(RequestKind::Add);
+                        m.last_added_pitch = pitch;
+                    })
                 }
                 NotesEditRequest::Delete(notes) => Edit::mutate(move |m: &mut TestModel| {
                     m.last_request = Some(RequestKind::Delete);
@@ -2172,6 +2224,52 @@ mod tests {
         for e in edits {
             e.apply(model);
         }
+    }
+
+    /// (M14 Phase 61d / daw_01 #012) Insert shortcut で視覚行の **下半分** にカーソルがあっても
+    /// その行の pitch (= ceil) で Add される。 旧 `pitch_f.round()` は半行ぶん上にずれて 1 pitch
+    /// 下のノートが追加される bug があった。 test_view: pitch_top=72, pitch_visible=24, grid h=400
+    /// → pitch_to_px = 16.667。 cy=215 は pitch 60 の行 (y ∈ [200, 216.667)) の下半分、
+    /// pitch_f = 72 - 215/16.667 = 59.1 → ceil = 60 (正)、 round = 59 (旧 bug)。
+    #[test]
+    fn piano_roll_insert_shortcut_uses_ceil_for_pitch() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        host.shortcut_map_mut().bind("add_note", "Insert");
+        let mut model = TestModel::new(vec![]);
+        let view = test_view();
+        let style = PianoRollStyle::default();
+        let key = KeyEvent {
+            state: ElementState::Pressed,
+            text: None,
+            physical_key: PhysicalKey::Insert,
+        };
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((100.0, 215.0)), // pitch 60 の visual 行の下半分
+                ..PointerFrame::default()
+            },
+            keyboard: vec![key],
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, input, |ui| {
+            let sel: Vec<NoteId> = vec![];
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &[],
+                view,
+                &sel,
+                &style,
+                dispatch,
+            );
+        });
+        assert_eq!(model.last_request, Some(RequestKind::Add));
+        assert_eq!(
+            model.last_added_pitch,
+            Some(60),
+            "cy=215 (pitch 60 行の下半分) は ceil で pitch=60、 round だと 59 にずれる (#012)"
+        );
     }
 
     /// Insert shortcut で Add request が発行される (id=0 placeholder)。
@@ -3528,6 +3626,90 @@ mod tests {
             model.last_set_lyrics,
             Some(vec![(72u32, Some("a".to_string())), (60u32, Some("b".to_string()))]),
             "同 beat なら高 pitch (72) が先、低 pitch (60) が次"
+        );
+    }
+
+    // M14 Phase 61b (#011): fold_piano_roll_note_hash の cache invalidation 性質を verify。
+    // (1) 同一データ stable、 (2-5) start_beat / len_beats / pitch / velocity 各変化で hash 変
+    // 化、 (6) lyric Arc identity の振る舞い (同 Arc clone は同 hash、 別 Arc::from は別 hash)。
+
+    fn note_with_velocity(id: NoteId, start: f64, len: f64, pitch: u8, vel: u8) -> Note {
+        Note { id, start_beat: start, len_beats: len, pitch, velocity: vel, lyric: None }
+    }
+
+    #[test]
+    fn fold_piano_roll_note_hash_stable() {
+        let notes = vec![note(0, 0.0, 1.0, 60), note(1, 1.0, 0.5, 64)];
+        assert_eq!(
+            fold_piano_roll_note_hash(&notes),
+            fold_piano_roll_note_hash(&notes),
+            "同じ notes の fold は冪等"
+        );
+    }
+
+    #[test]
+    fn fold_piano_roll_note_hash_changes_on_move() {
+        let before = vec![note(0, 0.0, 1.0, 60)];
+        let after = vec![note(0, 0.5, 1.0, 60)]; // start 0 → 0.5
+        assert_ne!(
+            fold_piano_roll_note_hash(&before),
+            fold_piano_roll_note_hash(&after),
+        );
+    }
+
+    #[test]
+    fn fold_piano_roll_note_hash_changes_on_resize() {
+        let before = vec![note(0, 0.0, 1.0, 60)];
+        let after = vec![note(0, 0.0, 2.0, 60)]; // len 1 → 2
+        assert_ne!(
+            fold_piano_roll_note_hash(&before),
+            fold_piano_roll_note_hash(&after),
+        );
+    }
+
+    #[test]
+    fn fold_piano_roll_note_hash_changes_on_pitch() {
+        let before = vec![note(0, 0.0, 1.0, 60)];
+        let after = vec![note(0, 0.0, 1.0, 64)]; // pitch 60 → 64
+        assert_ne!(
+            fold_piano_roll_note_hash(&before),
+            fold_piano_roll_note_hash(&after),
+        );
+    }
+
+    #[test]
+    fn fold_piano_roll_note_hash_changes_on_velocity() {
+        let before = vec![note_with_velocity(0, 0.0, 1.0, 60, 96)];
+        let after = vec![note_with_velocity(0, 0.0, 1.0, 60, 127)]; // vel 96 → 127
+        assert_ne!(
+            fold_piano_roll_note_hash(&before),
+            fold_piano_roll_note_hash(&after),
+        );
+    }
+
+    #[test]
+    fn fold_piano_roll_note_hash_lyric_arc_identity() {
+        let shared: Arc<str> = Arc::from("a");
+        let n1 = Note {
+            id: 0,
+            start_beat: 0.0,
+            len_beats: 1.0,
+            pitch: 60,
+            velocity: 96,
+            lyric: Some(Arc::clone(&shared)),
+        };
+        let n1_dup = Note { lyric: Some(Arc::clone(&shared)), ..n1.clone() };
+        // 同 Arc::clone → 同 pointer → 同 hash
+        assert_eq!(
+            fold_piano_roll_note_hash(std::slice::from_ref(&n1)),
+            fold_piano_roll_note_hash(std::slice::from_ref(&n1_dup)),
+        );
+        // 別 Arc::from(同 string) → 別 pointer → 別 hash (daw_01 SetLyrics は新規 Arc::from で
+        // この振る舞いに依存して cache invalidate する)。
+        let n2 = Note { lyric: Some(Arc::<str>::from("a")), ..n1.clone() };
+        assert_ne!(
+            fold_piano_roll_note_hash(std::slice::from_ref(&n1)),
+            fold_piano_roll_note_hash(std::slice::from_ref(&n2)),
         );
     }
 }

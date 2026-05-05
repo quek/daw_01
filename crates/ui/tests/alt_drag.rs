@@ -166,6 +166,7 @@ const SNAP_16: SnapConfig = SnapConfig {
     mode: SnapMode::Straight { div: 16 },
     enabled: true,
     min_beat_unit: 1.0 / 128.0,
+    time_sig: (4, 4),
 };
 
 /// Alt 持ち続け → release で raw commit (snap bypass)。
