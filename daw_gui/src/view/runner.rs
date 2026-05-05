@@ -335,6 +335,7 @@ fn map_phys_key(k: WinitPhysKey) -> PhysicalKey {
     match k {
         WinitPhysKey::Code(KeyCode::Escape) => PhysicalKey::Escape,
         WinitPhysKey::Code(KeyCode::Enter) => PhysicalKey::Enter,
+        WinitPhysKey::Code(KeyCode::NumpadEnter) => PhysicalKey::NumpadEnter,
         WinitPhysKey::Code(KeyCode::Space) => PhysicalKey::Space,
         WinitPhysKey::Code(KeyCode::Tab) => PhysicalKey::Tab,
         WinitPhysKey::Code(KeyCode::Backspace) => PhysicalKey::Backspace,

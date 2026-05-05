@@ -268,4 +268,5 @@ A5 lyric UI     (gui_01 #015、 A1 の前提)
 | 2026-05-05 | 469acd7 | A3 smoke fix | smoke test で発見した 3 件 (Play/Stop/SetLoop の plugin_host 重複送信、 Ctrl+E shortcut 漏れ、 メーター peak の publish 漏れ) を修正 |
 | 2026-05-05 | 02fe061 | A7 完了 | plugin ロード race の同期化: AppData::pending_plugin_loads + track_pending_load helper で SetSlotPlugin 送信時に再生中なら自動 Stop、 全 SlotPluginLoaded 受信完了で自動 Play 再開 |
 | 2026-05-05 | 77cc7c5 | A6 完了 | transport bar に BPM / time_sig 編集 UI: text_input + dropdown、 commit で song 更新 + LoadSong 再送 + Undo/Redo 対応。 numpad Enter 不対応は gui_01 #016 で対応依頼 |
-| 2026-05-05 | (this commit) | gui_01 #015 解決 | gui_01 M14 Phase 56 (button_at_clicked + take_*_in_rect の modal 透過抑制) を取り込み、 plugin_picker.rs の ✕ ボタンを button_at_clicked + close_modal に置換。 ✕ click / wheel scroll / Esc / outside click 全 expected。 plan.md 既知 bug クリア |
+| 2026-05-05 | 4211315 | gui_01 #015 解決 | gui_01 M14 Phase 56 (button_at_clicked + take_*_in_rect の modal 透過抑制) を取り込み、 plugin_picker.rs の ✕ ボタンを button_at_clicked + close_modal に置換。 ✕ click / wheel scroll / Esc / outside click 全 expected。 plan.md 既知 bug クリア |
+| 2026-05-05 | (this commit) | gui_01 #016 解決 | gui_01 M14 Phase 57 (PhysicalKey::NumpadEnter 追加 + text_input commit 拡張) を取り込み + daw_gui/src/view/runner.rs::map_phys_key にも NumpadEnter マッピング追加 (gui_01 winit_backend と二重実装の都合)。 BPM 入力欄でテンキー Enter による commit を実機確認 |

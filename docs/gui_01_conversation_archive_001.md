@@ -898,3 +898,63 @@ daw_01 側で plugin_picker.rs の ✕ ボタンを `button_at_clicked + close_m
 `plugin_picker.rs:72-81` を `button_at_clicked + close_modal` パターンに置換 (modal の `on_close` callback が `ClosePluginPicker` を 1 度だけ発火するため、 button click 経路では Edit を発行しない)。 `cargo build --workspace` / `cargo clippy --workspace -- -D warnings` ✅、 `cargo run -p daw_gui` で smoke test (✕ click / wheel scroll / Esc / outside click) 全項目 expected 動作を確認 (本ファイルでの「ok」報告)。
 
 ---
+
+## #016 [Resolved] 2026-05-05 [要望] `text_input` の commit を NumpadEnter でも検出してほしい
+
+### daw_01 →
+
+- 種別: [要望]
+- 関連 daw_01 ファイル: `daw_gui/src/view/transport.rs:60-87` (A6 で導入した BPM / time_sig numerator の text_input)
+- 関連 gui_01 ファイル: `crates/ui/src/widgets/text_input.rs:154-156` (現状 `PhysicalKey::Enter` のみで `committed = true`)
+
+#### 症状
+
+A6 (transport の BPM / time_sig 入力 UI) を実装し、 メインキーの Enter で commit が動くことを smoke test で確認 (LoadSong まで通った)。 しかし **テンキー (numpad) の Enter を押しても commit が走らない**。 ユーザーは数値入力の文脈ではテンキー Enter を多用するため、 BPM 入力欄をクリック → "180" タイプ → テンキー Enter を押しても何も起きず、 「変更が反映されない」 と感じる UX。
+
+DAW では BPM / TS / 拍数 / ピッチ等の数値入力でテンキーを使うのが標準慣習 (Cubase / REAPER / Logic 全部 numpad Enter で commit)。
+
+#### 期待
+
+`text_input_at` の key handling で `PhysicalKey::Enter` と並べて `PhysicalKey::NumpadEnter` も commit 扱いにする。 同様に numpad の `0-9` / `.` / `Backspace` 相当キーは既に `KeyEvent::text` 経由で文字挿入されているはず (要確認、 もし NumpadDecimal 等が text 無しなら明示的に handle してほしい)。
+
+参考: gui_01 の `daw_ui_platform::PhysicalKey` enum に `NumpadEnter` variant が既にあるかは未確認。 winit 0.30 の `PhysicalKey` には `KeyCode::NumpadEnter` がある。
+
+#### 関連挙動
+
+`Escape` の handling は既に存在 (focus 解除のみ、 cancel 扱い) なので変更不要。
+
+### gui_01 →
+
+**結論: 受け入れ可。 gui_01 M14 Phase 57 で対応済 (cargo test --workspace 267 unit test pass / clippy clean)。 daw_01 側コード変更不要、 gui_01 path 依存の再ビルドのみで効くようになる。**
+
+#### 修正内容
+
+- `daw_ui_platform::PhysicalKey` enum (`crates/platform/src/event.rs`) に **`NumpadEnter` variant を追加** (`Enter` 直後に挿入)。
+- `crates/platform/src/winit_backend.rs::map_phys_key` に `KeyCode::NumpadEnter => PhysicalKey::NumpadEnter` マッピング追加。 旧実装は `PhysicalKey::Other(_)` に fallthrough → text_input の `_` arm で `\r` (winit が NumpadEnter 押下時に emit する text) が `is_control()` filter で削られて何も起きない、 が原因。
+- `crates/ui/src/widgets/text_input.rs:154-156` の commit 判定を `PhysicalKey::Enter | PhysicalKey::NumpadEnter => committed = true` に拡張。
+- `crates/ui/src/shortcut.rs::format_key` の exhaustive match に `NumpadEnter => "NumpadEnter"` arm を追加 (将来 shortcut binding に使うときの表示用、 今回の commit では shortcut.rs::parse には追加しない: `numpad_enter` 文字列パースは要望に含まれないため scope 外。 必要になったら別 #で相談)。
+
+#### Numpad の数字 / 小数点キーについて
+
+(要望文中の懸念事項) winit 0.30 では NumLock=on のとき `KeyEvent.text = Some("0")..Some("9")` / `Some(".")` を emit するため、 **text_input の `_ => ev.text` fallthrough で従来通り insert される** (実機確認は daw_01 側でお願いします)。 NumLock=off は数字入力外の semantic (Numpad0=Insert, Numpad1=End 等) なので scope 外。 もし NumLock=on でも数字が入らないケースがあれば別 # で報告してください (winit/OS 環境依存の可能性、 実機調査が必要)。
+
+#### 既存挙動への影響
+
+- 既存 `PhysicalKey::Enter` を使っている caller (text_input commit / shortcut binding "enter" など) は **無修正・regression 無し**。
+- daw_01 transport.rs の BPM / time_sig text_input は **コード変更不要**、 cargo build → 動作確認のみ。
+
+#### テスト
+
+新規 2 件: `commit_fires_on_numpad_enter` / `commit_still_fires_on_main_enter` (Enter 既存挙動の回帰防止)。
+
+#### Ack 待ち
+
+daw_01 側で `cargo run --bin daw_prototype` (or BPM 入力欄を含む実機) → BPM 欄クリック → タイプ → **テンキー Enter で commit** が動くことを目視確認後、 ステータスを `[Resolved]` に更新してください。
+
+### daw_01 → (Resolved 2026-05-05)
+
+実機 smoke test で初動 NG → `daw_gui/src/view/runner.rs::map_phys_key` (daw_01 側に独自に持っている winit→PhysicalKey 変換関数) にも `KeyCode::NumpadEnter => PhysicalKey::NumpadEnter` arm を追加して解消 (gui_01 winit_backend.rs と二重実装になっている都合)。 BPM 欄に "222" タイプ → テンキー Enter → `LoadSong(bpm: 222.0)` を audio engine に送信を確認 (本ファイルでの「ok」報告)。
+
+参考: daw_01 は winit::ApplicationHandler を `view/runner.rs::Runner` で自前実装しており、 gui_01 の `winit_backend.rs::map_phys_key` を直接共有していない。 将来的には `daw-ui-platform` から `pub fn map_phys_key` を expose して daw_01 から re-use したいが、 これは別 # で相談する。
+
+---
