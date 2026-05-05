@@ -293,6 +293,7 @@ fn format_key(k: PhysicalKey) -> String {
     match k {
         PhysicalKey::Escape => "Esc".into(),
         PhysicalKey::Enter => "Enter".into(),
+        PhysicalKey::NumpadEnter => "NumpadEnter".into(),
         PhysicalKey::Space => "Space".into(),
         PhysicalKey::Tab => "Tab".into(),
         PhysicalKey::Backspace => "Backspace".into(),

@@ -151,7 +151,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                                 }
                             }
                         }
-                        PhysicalKey::Enter => {
+                        // M14 Phase 57 (daw_01 #016): NumpadEnter も commit 扱い。
+                        // DAW の数値入力 (BPM / time_sig / 拍数 / ピッチ等) でテンキー Enter を
+                        // 多用する慣習 (Cubase / REAPER / Logic 全部 numpad Enter で commit)。
+                        PhysicalKey::Enter | PhysicalKey::NumpadEnter => {
                             committed = true;
                         }
                         PhysicalKey::Escape => {
@@ -535,5 +538,98 @@ mod tests {
             Some(text_input_wid("rename")),
             "不可視 → 再表示で再度 focus 取得 (= eviction で初回 show と同じ扱い)"
         );
+    }
+
+    /// daw_01 #016: テンキー Enter (`PhysicalKey::NumpadEnter`) も commit 扱いになる。
+    /// メインキー Enter (`PhysicalKey::Enter`) と同じく `TextInputResponse.committed = true`
+    /// を返す。DAW 数値入力 (BPM / time_sig / 拍数 / ピッチ等) でテンキー Enter を多用する
+    /// 業界慣習 (Cubase / REAPER / Logic) に合わせる。
+    #[test]
+    fn commit_fires_on_numpad_enter() {
+        use std::cell::Cell;
+
+        use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        // frame 1: text_input_at_focused 表示 → 自動 focus
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.text_input_at_focused(
+                "ti",
+                Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
+                "abc",
+                |_new| Edit::mutate(|()| {}),
+            );
+        });
+
+        // frame 2: NumpadEnter を送って committed = true を確認
+        let committed = Cell::new(false);
+        let numpad_enter = KeyEvent {
+            state: ElementState::Pressed,
+            text: None,
+            physical_key: PhysicalKey::NumpadEnter,
+        };
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput { keyboard: vec![numpad_enter], ..Default::default() },
+            |(), ui| {
+                let resp = ui.text_input_at_focused(
+                    "ti",
+                    Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
+                    "abc",
+                    |_new| Edit::mutate(|()| {}),
+                );
+                committed.set(resp.committed);
+            },
+        );
+        assert!(committed.get(), "NumpadEnter で committed=true");
+    }
+
+    /// 既存挙動の回帰確認: メインキー Enter でも引き続き commit する。
+    #[test]
+    fn commit_still_fires_on_main_enter() {
+        use std::cell::Cell;
+
+        use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.text_input_at_focused(
+                "ti",
+                Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
+                "abc",
+                |_new| Edit::mutate(|()| {}),
+            );
+        });
+
+        let committed = Cell::new(false);
+        let enter = KeyEvent {
+            state: ElementState::Pressed,
+            text: None,
+            physical_key: PhysicalKey::Enter,
+        };
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput { keyboard: vec![enter], ..Default::default() },
+            |(), ui| {
+                let resp = ui.text_input_at_focused(
+                    "ti",
+                    Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
+                    "abc",
+                    |_new| Edit::mutate(|()| {}),
+                );
+                committed.set(resp.committed);
+            },
+        );
+        assert!(committed.get(), "Enter でも従来通り committed=true (回帰防止)");
     }
 }

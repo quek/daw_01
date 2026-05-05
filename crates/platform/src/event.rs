@@ -86,10 +86,16 @@ pub struct KeyEvent {
 /// `F(u8)`、`Delete / Home / End / PageUp / PageDown / Insert` を追加。
 /// M9 P0-1: `Char(char)` の domain を ASCII 印字可能記号 11 種にも拡張
 /// (`/ ; , . - = [ ] \ ' ``)。
+/// M14 Phase 57 (daw_01 #016): テンキー Enter (`NumpadEnter`) を追加。DAW 数値入力で
+/// 多用される (Cubase / REAPER / Logic 等の業界慣習)。`text_input` の commit 判定で
+/// `Enter | NumpadEnter` のどちらでも成立するように拡張する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PhysicalKey {
     Escape,
     Enter,
+    /// テンキー (numpad) の Enter キー。`Enter` とは別の物理キーだが、
+    /// commit / 改行 / shortcut 等の semantic では通常同じ扱いをする。
+    NumpadEnter,
     Space,
     Tab,
     Backspace,
