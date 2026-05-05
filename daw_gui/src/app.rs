@@ -166,6 +166,10 @@ pub struct AppData {
     // -------- Background workers --------
     pub synth_result: Arc<Mutex<Vec<common::voicevox::SynthResult>>>,
     pub rescan_result: Arc<Mutex<Option<PluginDatabase>>>,
+    /// VOICEVOX engine `/singers` の結果。 起動時に background thread が
+    /// `AppEvent::SingersLoaded` で投入する。 engine 未起動 / fetch 失敗時は
+    /// 空のまま (Track Inspector の dropdown は default singer のみ表示)。
+    pub singers: Vec<common::voicevox::VoiceVoxSinger>,
     pub is_rescanning: bool,
     pub status_message: String,
 
@@ -297,6 +301,7 @@ impl AppData {
             pending_play: false,
             synth_result: Arc::new(Mutex::new(Vec::new())),
             rescan_result: Arc::new(Mutex::new(None)),
+            singers: Vec::new(),
             is_rescanning: false,
             status_message: String::new(),
             track_rename_idx: None,
@@ -495,6 +500,7 @@ impl AppData {
                 | AppEvent::SetNotePositions(_)
                 | AppEvent::DeleteSelectedNotes
                 | AppEvent::SetSelectedNoteLyric(_)
+                | AppEvent::SetNoteLyrics(_)
                 | AppEvent::QuantizeSelectedNotes(_)
                 | AppEvent::SelectPluginFromDb(_)
                 | AppEvent::RemoveSlot { .. }
@@ -727,6 +733,10 @@ pub enum AppEvent {
     ResizeNotes(Vec<(u32, f64, f64)>),
     DeleteSelectedNotes,
     SetSelectedNoteLyric(String),
+    /// gui_01 #017 で widget が L キー → Enter commit 時に発行する歌詞分配
+    /// バッチ。 各 `(note_id, lyric)` を `selected_clip` 内で更新。 lyric が
+    /// `None` or 空文字列なら歌詞削除 (`Note.lyric = None`)。
+    SetNoteLyrics(Vec<(u32, Option<String>)>),
 
     // -------- Plugin picker / chain ---------------------------------------
     OpenPluginPickerFor(PickerTarget),
@@ -770,6 +780,9 @@ pub enum AppEvent {
     // -------- VOICEVOX ----------------------------------------------------
     SynthesizeVocal,
     VocalSynthCompleted,
+    /// VOICEVOX engine `/singers` の取得結果。 起動時 background thread が
+    /// 1 度発行する。 失敗時は空 Vec で送る。
+    SingersLoaded(Vec<common::voicevox::VoiceVoxSinger>),
 
     // -------- WAV export -------------------------------------------------
     ExportWav,
@@ -949,6 +962,9 @@ impl AppData {
             AppEvent::SetSelectedNoteLyric(text) => {
                 self.set_selected_note_lyric(text);
             }
+            AppEvent::SetNoteLyrics(updates) => {
+                self.set_note_lyrics(&updates);
+            }
             AppEvent::OpenPluginPickerFor(target) => {
                 self.plugin_picker_target = target;
                 self.refresh_picker_visible();
@@ -1056,6 +1072,13 @@ impl AppData {
             }
             AppEvent::VocalSynthCompleted => {
                 self.finish_vocal_synth();
+            }
+            AppEvent::SingersLoaded(singers) => {
+                tracing::info!(
+                    count = singers.len(),
+                    "VOICEVOX singers loaded"
+                );
+                self.singers = singers;
             }
         }
     }
@@ -2040,6 +2063,40 @@ impl AppData {
         }
         self.sync_song_to_plugin_host();
         self.pianoroll_notes_generation += 1;
+    }
+
+    /// gui_01 #017: piano_roll widget が L キー → Enter commit で発行する
+    /// 歌詞分配 batch を `selected_clip` 内の note に適用。 各 entry は
+    /// `(note_index, Option<String>)`、 `None` or 空文字列で歌詞削除。
+    /// `selected_clip` が無いと no-op。
+    fn set_note_lyrics(&mut self, updates: &[(u32, Option<String>)]) {
+        let Some(r) = self.selected_clip else {
+            return;
+        };
+        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(r.clip as usize) else {
+            return;
+        };
+        let mut changed = false;
+        for (id, lyric) in updates {
+            if let Some(n) = clip.notes.get_mut(*id as usize) {
+                let normalised =
+                    lyric.as_ref().and_then(|s| {
+                        let t = s.trim();
+                        if t.is_empty() { None } else { Some(t.to_string()) }
+                    });
+                if n.lyric != normalised {
+                    n.lyric = normalised;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.sync_song_to_plugin_host();
+            self.pianoroll_notes_generation += 1;
+        }
     }
 
     // -------- Plugin GUI bridge --------------------------------------------

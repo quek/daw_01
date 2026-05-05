@@ -110,6 +110,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             NotesEditRequest::Select { next, .. } => Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::SetNoteSelection(next.clone()));
             }),
+            NotesEditRequest::SetLyrics(updates) => {
+                // gui_01 #017 で widget が L キー編集 → Enter commit 時に
+                // 1 batch で発行する歌詞分配 request。 各 (note_id, lyric)
+                // を current selected_clip 内で更新。
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetNoteLyrics(updates.clone()));
+                })
+            }
         }
     };
 

@@ -24,7 +24,7 @@ pub const VOICEVOX_URL: &str = "http://localhost:50021";
 
 /// `/singers` レスポンスの 1 entry。 1 キャラクターと、 そのスタイル (= sing
 /// 用 style id 群)。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VoiceVoxSinger {
     pub name: String,
     pub styles: Vec<VoiceVoxStyle>,
@@ -32,7 +32,7 @@ pub struct VoiceVoxSinger {
 
 /// 各キャラクターのスタイル (= 表情 / 歌唱モード)。 `id` が `synthesize_song`
 /// に渡す singer_id。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VoiceVoxStyle {
     pub id: u32,
     pub name: String,
