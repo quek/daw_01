@@ -676,4 +676,48 @@ const STYLE_M: ToggleButtonStyle = ToggleButtonStyle {
 
 ---
 
+## #015 [Open] 2026-05-05 [バグ報告] plugin_picker (`Ui::modal` + `Ui::list_view`) の ✕ ボタン / wheel scroll が効かない
+
+### daw_01 →
+- 種別: [バグ報告]
+- 関連ファイル:
+  - daw_01: `daw_gui/src/view/plugin_picker.rs` (`Ui::modal` + `Ui::list_view` で構築済、 145 LOC)
+  - gui_01 想定箇所:
+    - `crates/ui/src/widgets/modal.rs` の close button hit-test
+    - `crates/ui/src/widgets/list_view.rs` (もしくは内部 `scroll_area`) の wheel event 処理
+
+#### 現象 (実機 smoke test、 2026-05-05)
+
+1. **✕ ボタンが効かない**: プラグインセレクターの右上 ✕ ボタンをクリックしても modal が閉じない。 `close_on_escape: true` で Esc 押下では閉じる、 `close_on_outside_click: true` で外側クリックでも閉じる。 ✕ ボタンだけ反応しない。
+2. **マウスホイールが効かない**: list_view 内でマウスホイールを回しても scroll しない。 scrollbar drag は機能。 list の rows 数が画面内に収まらない時 (= scrollbar が見える時) のみ問題が顕在化。
+
+#### 再現手順
+
+1. daw_01 を起動 → track header の "+ Instrument" / "+ Fx" / "+ MidiFx" を押す → plugin_picker modal が開く
+2. (a) modal 右上の ✕ アイコンを単発クリック → 何も起きない (期待: `on_close` callback 発火 = modal close)
+3. (b) plugin リスト領域でマウスホイールを回す → リストがスクロールしない (期待: list を縦スクロール)
+
+#### 期待挙動
+
+- (a) ✕ ボタン: クリックで `on_close` を発火、 Esc / outside click と同じ経路で modal を閉じる
+- (b) wheel: list_view 内で wheel event を消費し、 内部 scroll_offset を更新
+
+#### 想定 root cause (gui_01 側で見るところ)
+
+- (a) `Ui::modal` の close button 描画は出ているが、 hit-test の z-order / rect が list_view (panel content) に食われている可能性。 もしくは button click が `on_close` callback に配線されていない (button クリック → modal close の経路が抜けている)
+- (b) `Ui::list_view` (or 内部 `scroll_area`) で `MouseWheel` event を input accumulator から拾って scroll_offset に変換するハンドラが入っていない / focus を持っていないと wheel を消費しない仕様になっている
+
+#### daw_01 側のコード参照
+
+[daw_gui/src/view/plugin_picker.rs](../daw_gui/src/view/plugin_picker.rs) — `Ui::modal` の `on_close` に `AppEvent::ClosePluginPicker` を配線。 `Ui::list_view` をデフォルト style で呼んでいるだけで、 wheel handling は widget 側に期待。
+
+#### daw_01 側の影響
+
+`plugin_picker` 以外でも `Ui::list_view` を使っている箇所があれば同じ scroll 不具合が再現する可能性あり (現状は picker のみ)。 `Ui::modal` は `plugin_picker` のみ使用 (確認時点)。
+
+### gui_01 →
+（gui_01 Claude が記入）
+
+---
+
 
