@@ -9,6 +9,7 @@ pub mod lyric_panel;
 pub mod mixer_strips;
 pub mod piano_roll_view;
 pub mod plugin_picker;
+pub mod recovery_modal;
 pub mod root;
 pub mod runner;
 pub mod shortcuts;

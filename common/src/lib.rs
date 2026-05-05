@@ -10,6 +10,7 @@ pub mod process_data;
 pub mod project;
 pub mod protocol;
 pub mod recent;
+pub mod recovery;
 pub mod timing;
 pub mod track_params;
 pub mod voicevox;

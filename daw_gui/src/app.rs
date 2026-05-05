@@ -188,6 +188,15 @@ pub struct AppData {
 
     pub is_dirty: bool,
     pub last_autosave: std::time::Instant,
+    /// Crash-recovery session id (uuid v4)。 起動時に AppData::new で 1 回生成、
+    /// 未保存プロジェクトの autosave file 名 (`<id>.autosave.daw`) と
+    /// `on_shutdown` での cleanup target に使う。
+    pub recovery_session_id: String,
+    /// 起動時 recovery_dir scan + Open 時 sidecar 検出で蓄積される復元候補。
+    /// `recovery_modal` が空でない間 modal を出す。
+    pub recovery_candidates: Vec<PathBuf>,
+    /// `recovery_candidates` を modal に出すかどうか (Dismiss で false)。
+    pub show_recovery_modal: bool,
     pub is_dragging: bool,
     pub midi_input_label: String,
 
@@ -218,6 +227,14 @@ impl AppData {
         let initial_peak_display = vec![(0.0, 0.0); song.tracks.len()];
         let initial_bpm = song.bpm;
         let initial_time_sig_num = song.time_sig.0;
+        let recovery_candidates = common::recovery::scan_recovery_files();
+        let show_recovery_modal = !recovery_candidates.is_empty();
+        if show_recovery_modal {
+            tracing::info!(
+                count = recovery_candidates.len(),
+                "recovery candidates found at startup"
+            );
+        }
         let plugin_picker_entries = plugin_db
             .as_ref()
             .map(|db| {
@@ -292,6 +309,9 @@ impl AppData {
             recent_files: load_recent_files(),
             is_dirty: false,
             last_autosave: std::time::Instant::now(),
+            recovery_session_id: common::recovery::new_session_id(),
+            recovery_candidates,
+            show_recovery_modal,
             is_dragging: false,
             midi_input_label: String::new(),
             step_cursor_beat: 0.0,
@@ -659,6 +679,15 @@ pub enum AppEvent {
     CloseHelp,
     OpenRecent(PathBuf),
     AutosaveTick,
+    /// Recovery modal で「復元」 を押した。 候補 .autosave.daw を読み込み、
+    /// candidates から remove + 元 file 削除。 sidecar 復元なら file_path は
+    /// 元 .daw、 recovery_dir 復元なら file_path = None (新規プロジェクト扱い)。
+    RecoveryRestore(PathBuf),
+    /// Recovery modal で「破棄」 を押した。 該当 .autosave.daw を削除 +
+    /// candidates から remove。
+    RecoveryDiscard(PathBuf),
+    /// Recovery modal を閉じる (候補は次回起動時にも見える)。
+    RecoveryDismiss,
     BeginDrag,
     EndDrag,
     MidiNoteOn { pitch: u8, velocity: u8 },
@@ -836,6 +865,15 @@ impl AppData {
             }
             AppEvent::AutosaveTick => {
                 self.maybe_autosave();
+            }
+            AppEvent::RecoveryRestore(path) => {
+                self.restore_recovery(path);
+            }
+            AppEvent::RecoveryDiscard(path) => {
+                self.discard_recovery(path);
+            }
+            AppEvent::RecoveryDismiss => {
+                self.show_recovery_modal = false;
             }
             AppEvent::BeginDrag => {
                 self.is_dragging = true;
@@ -1082,6 +1120,15 @@ impl AppData {
     }
 
     fn action_open_path(&mut self, path: PathBuf) {
+        // Recursive open を防ぐ: autosave file を直接開いた場合は弾く
+        // (RecoveryRestore で開くべきもの)。
+        if common::recovery::is_autosave_file(&path) {
+            self.status_message = format!(
+                "autosave ファイルは Recovery modal から復元してください: {}",
+                path.display()
+            );
+            return;
+        }
         match common::project::load(&path) {
             Ok(mut song) => {
                 tracing::info!(path = %path.display(), "loaded project");
@@ -1096,6 +1143,18 @@ impl AppData {
                 self.sync_song_to_plugin_host();
                 self.resync_song_edit_texts();
                 self.is_dirty = false;
+                // sidecar 検出: 前回のセッションが正常終了せず、 同 file の
+                // autosave が残っているなら recovery modal に追加。 ユーザーが
+                // 「復元」 で sidecar に切り替えられる。
+                let sidecar = common::recovery::sidecar_for(&path);
+                if sidecar.exists() && !self.recovery_candidates.contains(&sidecar) {
+                    tracing::info!(
+                        sidecar = %sidecar.display(),
+                        "sidecar autosave detected on open"
+                    );
+                    self.recovery_candidates.push(sidecar);
+                    self.show_recovery_modal = true;
+                }
                 self.push_recent(path);
             }
             Err(e) => {
@@ -1122,21 +1181,31 @@ impl AppData {
         if !self.is_dirty {
             return;
         }
-        let Some(orig) = self.file_path.as_ref() else {
-            return;
-        };
         if self.last_autosave.elapsed() < std::time::Duration::from_secs(60) {
             return;
         }
-        let mut autosave_path = orig.clone();
-        let mut name = autosave_path
-            .file_name()
-            .map(|s| s.to_os_string())
-            .unwrap_or_default();
-        name.push(".autosave.daw");
-        autosave_path.set_file_name(name);
-        let result = common::project::save(&autosave_path, &self.song);
-        match result {
+
+        // 保存先決定: file_path Some なら sidecar、 None なら recovery_dir。
+        let autosave_path = match self.file_path.as_ref() {
+            Some(orig) => common::recovery::sidecar_for(orig),
+            None => {
+                if let Err(e) = common::recovery::ensure_recovery_dir() {
+                    tracing::warn!(error = ?e, "failed to create recovery dir");
+                    return;
+                }
+                let Some(p) = common::recovery::recovery_path_for_session(
+                    &self.recovery_session_id,
+                ) else {
+                    tracing::warn!(
+                        "could not resolve recovery path (no LOCALAPPDATA?)"
+                    );
+                    return;
+                };
+                p
+            }
+        };
+
+        match common::project::save(&autosave_path, &self.song) {
             Ok(()) => {
                 tracing::info!(path = %autosave_path.display(), "autosaved");
                 self.last_autosave = std::time::Instant::now();
@@ -1146,6 +1215,87 @@ impl AppData {
                     error = ?e,
                     path = %autosave_path.display(),
                     "autosave failed"
+                );
+            }
+        }
+    }
+
+    /// Recovery modal で「復元」 を押した処理。 sidecar 形式 (`<x>.daw.autosave.daw`)
+    /// なら元 `<x>.daw` を file_path にセット、 recovery_dir 内 (`<uuid>.autosave.daw`)
+    /// なら file_path = None (新規プロジェクト扱い、 ユーザーが Save As)。
+    fn restore_recovery(&mut self, autosave_path: PathBuf) {
+        let Ok(mut song) = common::project::load(&autosave_path) else {
+            tracing::error!(
+                path = %autosave_path.display(),
+                "failed to load recovery file"
+            );
+            self.status_message =
+                format!("復元失敗: {}", autosave_path.display());
+            return;
+        };
+        song.ensure_ids();
+        self.restore_plugin_from_song(&song);
+        self.song = song;
+        self.file_path = common::recovery::original_file_for_sidecar(&autosave_path);
+        self.selected_track = 0;
+        self.selected_clip = None;
+        self.selected_notes.clear();
+        self.resize_track_peak_display();
+        self.sync_song_to_plugin_host();
+        self.resync_song_edit_texts();
+        self.is_dirty = false;
+        let _ = std::fs::remove_file(&autosave_path);
+        self.recovery_candidates.retain(|p| p != &autosave_path);
+        if self.recovery_candidates.is_empty() {
+            self.show_recovery_modal = false;
+        }
+        tracing::info!(
+            recovered_to = ?self.file_path,
+            "recovery restored"
+        );
+    }
+
+    /// Recovery modal で「破棄」 を押した処理。 file 削除 + candidates から外す。
+    fn discard_recovery(&mut self, autosave_path: PathBuf) {
+        if let Err(e) = std::fs::remove_file(&autosave_path) {
+            tracing::warn!(
+                error = ?e,
+                path = %autosave_path.display(),
+                "failed to remove recovery file"
+            );
+        }
+        self.recovery_candidates.retain(|p| p != &autosave_path);
+        if self.recovery_candidates.is_empty() {
+            self.show_recovery_modal = false;
+        }
+    }
+
+    /// アプリ正常終了時 (`WindowEvent::CloseRequested`) に呼ぶ cleanup。
+    /// 自セッションで作った recovery file (sidecar / recovery_dir 両方) を削除。
+    /// recovery file が無ければ no-op。 削除失敗は warn でログのみ。
+    pub fn on_shutdown(&self) {
+        // 自セッションの recovery_dir file
+        if let Some(p) = common::recovery::recovery_path_for_session(
+            &self.recovery_session_id,
+        ) && p.exists()
+            && let Err(e) = std::fs::remove_file(&p)
+        {
+            tracing::warn!(
+                error = ?e,
+                path = %p.display(),
+                "failed to remove recovery file on shutdown"
+            );
+        }
+        // sidecar (file_path が Some なら)
+        if let Some(orig) = self.file_path.as_ref() {
+            let side = common::recovery::sidecar_for(orig);
+            if side.exists()
+                && let Err(e) = std::fs::remove_file(&side)
+            {
+                tracing::warn!(
+                    error = ?e,
+                    path = %side.display(),
+                    "failed to remove sidecar on shutdown"
                 );
             }
         }

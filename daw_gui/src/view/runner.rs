@@ -148,6 +148,9 @@ impl ApplicationHandler<AppEvent> for Runner {
         match event {
             WindowEvent::CloseRequested => {
                 tracing::info!("window close requested");
+                if let Some(state) = self.state.as_ref() {
+                    state.app.on_shutdown();
+                }
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {

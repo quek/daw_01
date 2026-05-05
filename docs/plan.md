@@ -33,8 +33,8 @@ DESIGN.md M1 残項目を 6 タスクに分解。`docs/plan_<feature>.md` への
 A2 (完了 ✓) ─→ A3 WAV export (完了 ✓) ─→ A7 plugin load 同期 (完了 ✓) ─┬─→ A1 VOICEVOX ─→ M1 完成
                                                                          │
 A6 tempo/timesig (完了 ✓)
-A4 autosave     (← 次タスク、独立、軽量)
-A5 lyric UI     (gui_01 #015、 A1 の前提)
+A4 autosave     (完了 ✓)
+A5 lyric UI     (← 次タスク、 gui_01 #015 は解決済、 A1 の前提)
 ```
 
 ### 既知の残 bug
@@ -46,7 +46,7 @@ A5 lyric UI     (gui_01 #015、 A1 の前提)
 - **A3 完了**: freewheel offline render + CLAP render ext で WAV export 復旧 (5 PR + smoke fix、 plan_a3_wav_export.md 参照)
 - **A7 完了**: plugin ロード race condition の同期化 (plan_a7_plugin_load_sync.md 参照)
 - **A6 完了**: transport に BPM / time_sig 編集 UI を追加 (plan_a6_tempo_timesig.md 参照)
-- **A4 が次** (独立で軽量、 autosave + 起動時復元)
+- **A4 完了**: autosave + crash recovery + 起動時復元 modal (plan_a4_autosave_recovery.md 参照)
 - **A5** は gui_01 改修先行 (#015)。reply 待ちの間 A1 の Engine / HTTP 周りを進める
 - **A1** は A5 完了後に本格実装
 
@@ -82,26 +82,25 @@ A5 lyric UI     (gui_01 #015、 A1 の前提)
 
 **スコープ外 (M2 範囲)**: CLAP/VST3 plugin への transport / tempo 通知 (`clap_event_transport_t`)、 tempo automation、 拍子 automation、 bar 番号 offset。
 
-### A4: autosave + 起動時復元 [優先度 3 — 独立 / 軽量]
+### A4: autosave + 起動時復元 [完了]
 
-**現状**: 手動保存 (`Ctrl+S`) のみ。
+詳細は [docs/plan_a4_autosave_recovery.md](plan_a4_autosave_recovery.md)。
 
-**やること**:
-1. background thread で 60 秒ごとに `<file_path>.autosave.daw` (file_path == None なら `%APPDATA%/daw_01/recovery/<uuid>.autosave.daw`) に保存
-2. dirty flag (modified since last save) を AppData に追加 → dirty かつ 60 秒経過で書く
-3. 起動時に recovery ディレクトリを scan + 既存 file の autosave 兄弟を検出 → modal で「復元しますか?」プロンプト
-4. 正常終了時に autosave ファイルを削除
+**完了内容 (build / clippy / test --workspace clean、 ユーザー smoke test OK)**:
 
-**主な変更ファイル**:
-- 新規 `daw_gui/src/autosave.rs`
-- [daw_gui/src/main.rs](daw_gui/src/main.rs) (起動時 detection)
-- [daw_gui/src/app.rs](daw_gui/src/app.rs) (`AppEvent::Autosave*`、`dirty: bool`)
+- 新規 `common/src/recovery.rs`: recovery_dir / sidecar / session_id / scan helpers + uuid v4 生成 (5 unit test)
+- AppData に `recovery_session_id` (uuid v4) / `recovery_candidates` / `show_recovery_modal` 追加
+- `maybe_autosave` を改修: file_path Some なら sidecar (`<file>.daw.autosave.daw`)、 None なら `%LOCALAPPDATA%\daw_01\recovery\<session_id>.autosave.daw` に save
+- `AppEvent::RecoveryRestore / RecoveryDiscard / RecoveryDismiss` + handler 実装。 復元時は sidecar なら元 .daw を file_path に、 recovery_dir 内 file なら file_path=None で新規プロジェクト扱い
+- `action_open_path`: Open 時に sidecar 存在チェック → 候補に push
+- 新規 `daw_gui/src/view/recovery_modal.rs`: gui_01 `Ui::modal` + `button_at_clicked + close_modal` パターン (modal 内で各候補に「復元 / 破棄」、 下部に「閉じる」)
+- `runner.rs::CloseRequested`: `AppData::on_shutdown` で当セッションの recovery file (recovery_dir / sidecar 両方) を削除
+- smoke 確認: × 閉じで cleanup ✅、 PowerShell `Stop-Process -Force` 経由の真の kill 後に file 残存 ✅、 再起動で modal 表示 ✅、 「復元 / 破棄 / 閉じる」 全て expected
 
-**受け入れ基準**:
-- 60 秒後に autosave ファイルが作成される
-- アプリを kill して再起動 → 復元プロンプトが出る
-- 「復元」で直近の autosave からロードできる
-- 「破棄」で autosave ファイルを削除
+**スコープ外 (将来課題)**:
+- 古い recovery file の自動 GC (現状ユーザー操作で破棄)
+- multi-instance での同時 recovery 衝突対策 (uuid v4 で衝突確率は実用上ゼロ)
+- conflict 解決 UI (sidecar と元 file の自動 diff / merge)
 
 ### A5: piano_roll note 歌詞編集 UI [優先度 4 — gui_01 #015]
 
@@ -269,4 +268,5 @@ A5 lyric UI     (gui_01 #015、 A1 の前提)
 | 2026-05-05 | 02fe061 | A7 完了 | plugin ロード race の同期化: AppData::pending_plugin_loads + track_pending_load helper で SetSlotPlugin 送信時に再生中なら自動 Stop、 全 SlotPluginLoaded 受信完了で自動 Play 再開 |
 | 2026-05-05 | 77cc7c5 | A6 完了 | transport bar に BPM / time_sig 編集 UI: text_input + dropdown、 commit で song 更新 + LoadSong 再送 + Undo/Redo 対応。 numpad Enter 不対応は gui_01 #016 で対応依頼 |
 | 2026-05-05 | 4211315 | gui_01 #015 解決 | gui_01 M14 Phase 56 (button_at_clicked + take_*_in_rect の modal 透過抑制) を取り込み、 plugin_picker.rs の ✕ ボタンを button_at_clicked + close_modal に置換。 ✕ click / wheel scroll / Esc / outside click 全 expected。 plan.md 既知 bug クリア |
-| 2026-05-05 | (this commit) | gui_01 #016 解決 | gui_01 M14 Phase 57 (PhysicalKey::NumpadEnter 追加 + text_input commit 拡張) を取り込み + daw_gui/src/view/runner.rs::map_phys_key にも NumpadEnter マッピング追加 (gui_01 winit_backend と二重実装の都合)。 BPM 入力欄でテンキー Enter による commit を実機確認 |
+| 2026-05-05 | 9648aba | gui_01 #016 解決 | gui_01 M14 Phase 57 (PhysicalKey::NumpadEnter 追加 + text_input commit 拡張) を取り込み + daw_gui/src/view/runner.rs::map_phys_key にも NumpadEnter マッピング追加 (gui_01 winit_backend と二重実装の都合)。 BPM 入力欄でテンキー Enter による commit を実機確認 |
+| 2026-05-05 | (this commit) | A4 完了 | autosave 拡充 (file_path None でも recovery_dir に save) + 起動時 recovery_modal + 「復元 / 破棄 / 閉じる」 + 正常終了時 cleanup + Open 時 sidecar 検出。 真の kill (PowerShell Stop-Process -Force) 後の file 残存 + 再起動 modal 表示まで実機確認 |

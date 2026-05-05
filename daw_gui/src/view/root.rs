@@ -10,7 +10,8 @@ use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent};
 use crate::view::{
-    arrangement_view, bottom_panel, plugin_picker, status_bar, track_inspector, transport,
+    arrangement_view, bottom_panel, plugin_picker, recovery_modal, status_bar, track_inspector,
+    transport,
 };
 
 pub const MENU_H: f32 = 24.0;
@@ -77,6 +78,10 @@ pub fn build_root(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize)
     // Modal: plugin picker。draw 関数内で modal の open/close を app.is_plugin_picker_open
     // と同期させる (常時呼び、内部で is_modal_open / open_modal を管理)。
     plugin_picker::draw(app, ui, screen);
+
+    // Modal: recovery (起動時 or Open 時に検出された autosave 候補)。
+    // app.show_recovery_modal を internal で監視するため常時呼び。
+    recovery_modal::draw(app, ui, screen);
 }
 
 /// 上部 menu bar (File / Edit / View) を library widget で描画。
