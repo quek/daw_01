@@ -138,6 +138,12 @@ example を実機検証する前に必ず `cargo run --bin <name>` または `ca
 ### widget state の downcast
 - `state: HashMap<WidgetId, Box<dyn WidgetState>>` から型復元するとき、`Box<dyn WidgetState>` 自身に WidgetState の blanket impl が当たって外側 Box の TypeId を返すバグに注意。`&mut **entry` で明示的に deref してから `as_any_mut().downcast_mut::<S>()` する (M2 で修正、回帰テスト済)。
 
+### text_input の buffer 動作 (M14 Phase 59 で uncontrolled 化)
+- **`text_input_at` は `was_focused == true` 中は `TextInputState.buffer_text` を source-of-truth にする** (uncontrolled mode)。`text` 引数は **gained_focus 時の初期値** としてのみ使われ、 focus 中の typing は buffer を mutate する (毎フレーム reset しない)。 これにより piano_roll の歌詞 inline 編集 (#017) など「commit するまで model に書かない」 UX が caller boilerplate なしで実現可能。
+- **focus 中に外部から `text` 引数が変わっても buffer は反映しない** (= ユーザの typing が消えない)。 controlled 動作 (per-keystroke の model 更新) を望むなら caller が on_change で model 更新する既存パターンで OK (text == buffer なので挙動完全互換)。
+- **再表示時の state stale**: 同一 widget id を invisible 期間後に再 show する場合、 `state.last_focused == true` (前 session の終了状態) が残ると gained_focus が発火せず buffer / 全選択 reset が走らない。 `text_input_at_focused` は `was_widget_visible_last_frame == false` 時に `state.last_focused = false` を強制 reset することで対処済 (歌詞編集の「分配済 1 文字 + 全選択」 を保証)。
+- **lyric 描画は cached の外**: piano_roll の lyric は `draw_lyrics` 独立 fn で selection overlay の **後** に描画 (cached 内 `draw_notes` で描くと selection の黄色 fill に隠れるため)。 `font_size = (note_h * 0.75).clamp(7.0, lyric_font_px)` で note 高さスケール、 `lyric_font_px` は MAX cap として解釈。
+
 ## 参考リソース
 
 - 設計の正本: [docs/plan.md](docs/plan.md)
