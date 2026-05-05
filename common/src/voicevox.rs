@@ -21,6 +21,57 @@ use crate::model::{Clip, Note, Song};
 /// Engine REST API endpoint.  voicevox_engine の公開 URL は voicevox_engine
 /// module からも参照する。
 pub const VOICEVOX_URL: &str = "http://localhost:50021";
+
+/// `/singers` レスポンスの 1 entry。 1 キャラクターと、 そのスタイル (= sing
+/// 用 style id 群)。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VoiceVoxSinger {
+    pub name: String,
+    pub styles: Vec<VoiceVoxStyle>,
+}
+
+/// 各キャラクターのスタイル (= 表情 / 歌唱モード)。 `id` が `synthesize_song`
+/// に渡す singer_id。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VoiceVoxStyle {
+    pub id: u32,
+    pub name: String,
+}
+
+/// VOICEVOX engine の `/singers` を叩いて全キャラクター + スタイル一覧を取得。
+/// blocking、 5 秒 timeout。 engine 未起動なら `Err`。 起動直後 (= まだ ready
+/// でない) なら 5 秒 timeout 内で接続エラー、 リトライ可能。
+pub fn fetch_singers() -> anyhow::Result<Vec<VoiceVoxSinger>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    let resp = client.get(format!("{VOICEVOX_URL}/singers")).send()?;
+    let body = resp.text()?;
+    let json: serde_json::Value = serde_json::from_str(&body)?;
+    let arr = json
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("/singers response is not a JSON array"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let name = item["name"].as_str().unwrap_or("").to_string();
+        let styles = item["styles"]
+            .as_array()
+            .map(|sa| {
+                sa.iter()
+                    .filter_map(|s| {
+                        Some(VoiceVoxStyle {
+                            id: s["id"].as_u64()? as u32,
+                            name: s["name"].as_str()?.to_string(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        out.push(VoiceVoxSinger { name, styles });
+    }
+    Ok(out)
+}
+
 /// Speaker id used for the sing_frame_audio_query step (query generation
 /// only — the actual singer voice is selected at frame_synthesis time).
 /// 6000 = 波音リツ, same as the REAPER reference script.
@@ -42,12 +93,16 @@ const REST_FRAMES: u32 = 10;
 /// one `SynthResult` per clip processed (success or failure). Non-vocal
 /// tracks are skipped.
 ///
-/// `singer_id` is the VOICEVOX style id for sing mode (e.g. 6000).
-/// `speaker_id` is the VOICEVOX style id for talk mode.
+/// `default_singer_id` is the fallback for sing mode when the track's
+/// `InstrumentSource::Vocal { speaker_id }` is 0 (uninitialised). Each
+/// vocal track may override with its own `speaker_id`.
+///
+/// `default_talk_speaker_id` is the same fallback for talk mode (clips
+/// with no pitched notes).
 pub fn synthesize_song(
     song: &Song,
-    singer_id: u32,
-    speaker_id: u32,
+    default_singer_id: u32,
+    default_talk_speaker_id: u32,
 ) -> Vec<SynthResult> {
     let client = reqwest::blocking::Client::new();
     let mut results = Vec::new();
@@ -60,11 +115,10 @@ pub fn synthesize_song(
         else {
             continue;
         };
-        // model.speaker_id is for **talk** mode (e.g. ずんだもん=3).
-        // For **sing** mode, we always use the caller-provided singer_id
-        // (default 6000 = 波音リツ) because VOICEVOX's singer list and
-        // speaker list are entirely separate ID spaces.
-        let _ = model_speaker;
+        // sing/talk 両方とも、 track の speaker_id != 0 が指定されていれば
+        // それを優先 (UI で設定された singer)、 0 なら caller の default。
+        let track_speaker = if *model_speaker != 0 { *model_speaker } else { 0 };
+        let singer_id = if track_speaker != 0 { track_speaker } else { default_singer_id };
 
         for (clip_idx, clip) in track.clips.iter().enumerate() {
             // A clip with at least one note that has any pitch goes into
@@ -103,7 +157,7 @@ pub fn synthesize_song(
                 if text.is_empty() {
                     continue;
                 }
-                let sid = if *model_speaker != 0 { *model_speaker } else { speaker_id };
+                let sid = if track_speaker != 0 { track_speaker } else { default_talk_speaker_id };
                 match synthesize_talk(&client, &text, sid) {
                     Ok(b) => b,
                     Err(e) => {
