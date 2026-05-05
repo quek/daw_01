@@ -454,7 +454,7 @@ fn build_stream(
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                 let frames = (data.len() / channels_usize).min(max_frames);
 
-                local.process_buffer(&shared, session_sample_rate, frames);
+                local.process_buffer(&shared, &bridge, session_sample_rate, frames);
 
                 // A2: publish the engine's playhead to shmem so the GUI
                 // can draw the cursor. `u64::MAX` is the "not playing"

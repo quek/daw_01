@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
+use common::audio_bridge::AudioBridgeHandle;
 use common::model::{Song, Track};
 use common::plugin_ref::{PluginRef, WorkerSyncRef};
 use common::process_data::EventKind;
@@ -314,8 +315,15 @@ impl LocalState {
 
     /// Render `frames` of master output into `master_l/r`. Walks the
     /// current `Song`, dispatching every plugin in every track's chain
-    /// via the worker pool.
-    pub fn process_buffer(&mut self, shared: &SharedState, sample_rate: u32, frames: usize) {
+    /// via the worker pool. Also publishes per-track peak meter values
+    /// into the shared `AudioBridge` so the GUI mixer strips animate.
+    pub fn process_buffer(
+        &mut self,
+        shared: &SharedState,
+        bridge: &AudioBridgeHandle,
+        sample_rate: u32,
+        frames: usize,
+    ) {
         self.pump_commands();
 
         let n = frames;
@@ -420,6 +428,13 @@ impl LocalState {
             // Reduce all tracks' post-fader audio into the master bus.
             // Sequential — `dispatch_and_wait` has already joined.
             reduce_master(&self.scratch, n_tracks, &mut self.master_l, &mut self.master_r, n);
+
+            // Publish per-track peak meters into the shared AudioBridge
+            // so the GUI mixer strips animate. Atomic stores, RT-safe.
+            // Tracks with effective_mute already have peak_l/r == 0.
+            for (i, tr) in self.scratch.iter().take(n_tracks).enumerate() {
+                bridge.set_track_peak(i, tr.peak_l, tr.peak_r);
+            }
 
             // Debug heartbeat: once per second of audio time, dump the
             // engine's view of the world so we can tell whether the

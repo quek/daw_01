@@ -998,13 +998,6 @@ impl AppData {
         }
     }
 
-    /// Fan a message out to both children. Used for state messages the
-    /// audio engine and the plugin host both need (LoadSong, mixer
-    /// strip changes, etc.).
-    fn send_both(&self, msg: MainToChild) {
-        self.send_audio(msg);
-    }
-
     fn sync_song_to_plugin_host(&mut self) {
         self.is_dirty = true;
         if self.is_dragging {
@@ -1220,20 +1213,18 @@ impl AppData {
         let song = self.song.clone();
         self.send_audio(MainToChild::LoadSong(song));
         self.send_audio(MainToChild::Play);
-        self.send_plugin(MainToChild::Play);
         self.is_playing = true;
     }
 
     fn stop(&mut self) {
         self.send_audio(MainToChild::Stop);
-        self.send_plugin(MainToChild::Stop);
         self.is_playing = false;
         self.playhead_beat = None;
     }
 
     fn toggle_loop(&mut self) {
         self.is_looping = !self.is_looping;
-        self.send_both(MainToChild::SetLoop(self.is_looping));
+        self.send_audio(MainToChild::SetLoop(self.is_looping));
     }
 
     fn set_loop_range(&mut self, start: f64, end: f64) {
