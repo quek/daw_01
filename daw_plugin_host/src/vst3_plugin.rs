@@ -32,12 +32,12 @@ use vst3::{
         IPluginFactoryTrait, PClassInfo, TUID, ViewRect, kNotImplemented, kPlatformTypeHWND,
         kResultOk, kResultTrue,
         Vst::{
-            AudioBusBuffers, AudioBusBuffers__type0, BusDirections_, Event, Event__type0,
-            Event_, IAudioProcessor, IAudioProcessorTrait, IComponent, IComponentTrait,
-            IConnectionPoint, IConnectionPointTrait, IEditController, IEditControllerTrait,
-            IEventList, MediaTypes_, NoteOffEvent, NoteOnEvent, ProcessContext,
-            ProcessContext_::StatesAndFlags_, ProcessData, ProcessModes_, ProcessSetup,
-            SpeakerArr, SpeakerArrangement, SymbolicSampleSizes_,
+            AudioBusBuffers, AudioBusBuffers__type0, BusDirection, BusDirections_, BusInfo,
+            Event, Event__type0, Event_, IAudioProcessor, IAudioProcessorTrait, IComponent,
+            IComponentTrait, IConnectionPoint, IConnectionPointTrait, IEditController,
+            IEditControllerTrait, IEventList, MediaTypes_, NoteOffEvent, NoteOnEvent,
+            ProcessContext, ProcessContext_::StatesAndFlags_, ProcessData, ProcessModes_,
+            ProcessSetup, SpeakerArr, SpeakerArrangement, SymbolicSampleSizes_,
         },
     },
 };
@@ -276,23 +276,23 @@ impl Vst3Plugin {
             transfer_component_state(&component, &controller);
         }
 
-        // Query audio bus counts for activate()-time buffer allocation.
-        let in_bus_count = unsafe {
-            component.getBusCount(
-                MediaTypes_::kAudio,
-                BusDirections_::kInput,
-            )
-        };
-        let out_bus_count = unsafe {
-            component.getBusCount(
-                MediaTypes_::kAudio,
-                BusDirections_::kOutput,
-            )
-        };
-        tracing::info!(in_bus_count, out_bus_count, "VST3 audio bus counts");
+        // 全 bus (audio + event, in + out) を enumerate して 1 件ずつログ。
+        // MeldaProduction の MSoundFactory のように main bus 以外に sidechain /
+        // sub bus を多数持つプラグインを debug するため、 channel count や
+        // busType (Main / Aux) を明示する。
+        log_all_buses(&component);
 
-        let input_channels = if in_bus_count > 0 { 2 } else { 0 };
-        let output_channels = if out_bus_count > 0 { 2 } else { 0 };
+        // Query main audio bus channel count for activate()-time buffer
+        // allocation. 旧実装は「bus 数 > 0 なら 2ch 決め打ち」 だったが、 main
+        // bus が mono / 4ch の plugin で破綻する。 main bus (busType == Main)
+        // の channelCount をそのまま採用する。
+        let input_channels = main_audio_bus_channel_count(&component, BusDirections_::kInput);
+        let output_channels = main_audio_bus_channel_count(&component, BusDirections_::kOutput);
+        tracing::info!(
+            input_channels,
+            output_channels,
+            "VST3 main audio bus channel counts"
+        );
 
         Ok(Self {
             _library: library,
@@ -324,6 +324,111 @@ impl Vst3Plugin {
             plug_frame,
             gui_attached: std::cell::Cell::new(false),
         })
+    }
+}
+
+/// `String128` ([TChar; 128] = u16 array) を Rust String に。 null terminator
+/// 以降は捨てる。 Bus 名等の人間可読ログ表示用。
+fn utf16_buf_to_string<const N: usize>(buf: &[u16; N]) -> String {
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(N);
+    String::from_utf16_lossy(&buf[..end])
+}
+
+/// Audio + Event bus を全 enumerate して 1 件ずつ INFO ログ。 channel count や
+/// busType (Main / Aux) を出すことで、 multi-bus plugin の構成把握 + 不整合
+/// debug を可能にする。
+fn log_all_buses(component: &ComPtr<IComponent>) {
+    for (media_label, media) in [
+        ("Audio", MediaTypes_::kAudio),
+        ("Event", MediaTypes_::kEvent),
+    ] {
+        for (dir_label, dir) in [
+            ("In", BusDirections_::kInput),
+            ("Out", BusDirections_::kOutput),
+        ] {
+            let count = unsafe { component.getBusCount(media, dir) };
+            for i in 0..count {
+                let mut info: BusInfo = unsafe { std::mem::zeroed() };
+                let res = unsafe { component.getBusInfo(media, dir, i, &mut info) };
+                if res != kResultOk {
+                    tracing::warn!(
+                        media = media_label,
+                        dir = dir_label,
+                        index = i,
+                        res = format!("{res:#x}"),
+                        "VST3 getBusInfo failed"
+                    );
+                    continue;
+                }
+                tracing::info!(
+                    media = media_label,
+                    dir = dir_label,
+                    index = i,
+                    channels = info.channelCount,
+                    bus_type = info.busType,
+                    flags = format!("{:#x}", info.flags),
+                    name = %utf16_buf_to_string(&info.name),
+                    "VST3 bus"
+                );
+            }
+        }
+    }
+}
+
+/// 指定 audio bus の channel count から SpeakerArrangement を導出。 mono → kMono、
+/// 2 → kStereo、 0 → 0 (= 空 arrangement、 plugin に「この bus は使わない」 を伝える)、
+/// その他は fallback (kStereo) を返す。 channel count 取得失敗時も fallback。
+fn arrangement_for_bus(
+    component: &ComPtr<IComponent>,
+    dir: BusDirection,
+    index: i32,
+    fallback: SpeakerArrangement,
+) -> SpeakerArrangement {
+    let mut info: BusInfo = unsafe { std::mem::zeroed() };
+    let res = unsafe {
+        component.getBusInfo(MediaTypes_::kAudio, dir, index, &mut info)
+    };
+    if res != kResultOk {
+        return fallback;
+    }
+    match info.channelCount {
+        0 => 0,
+        1 => SpeakerArr::kMono,
+        2 => SpeakerArr::kStereo,
+        _ => fallback,
+    }
+}
+
+/// `busType == Main` の最初の audio bus の channel count を返す。 main bus が
+/// 無ければ index 0 (= 多くの plugin で main 相当)、 それも無ければ 0。
+/// VST3 spec: BusType の Main は `kMain` (= 0)。
+fn main_audio_bus_channel_count(
+    component: &ComPtr<IComponent>,
+    dir: BusDirection,
+) -> u32 {
+    let count = unsafe { component.getBusCount(MediaTypes_::kAudio, dir) };
+    if count == 0 {
+        return 0;
+    }
+    // Pass 1: BusType::kMain (= 0) を探す。
+    for i in 0..count {
+        let mut info: BusInfo = unsafe { std::mem::zeroed() };
+        let res = unsafe {
+            component.getBusInfo(MediaTypes_::kAudio, dir, i, &mut info)
+        };
+        if res == kResultOk && info.busType == 0 {
+            return info.channelCount.max(0) as u32;
+        }
+    }
+    // Pass 2: 何も Main が無ければ index 0 をそのまま採用。
+    let mut info: BusInfo = unsafe { std::mem::zeroed() };
+    let res = unsafe {
+        component.getBusInfo(MediaTypes_::kAudio, dir, 0, &mut info)
+    };
+    if res == kResultOk {
+        info.channelCount.max(0) as u32
+    } else {
+        0
     }
 }
 
@@ -491,16 +596,35 @@ impl LoadedPlugin for Vst3Plugin {
 
         // 1. Negotiate speaker arrangements for each bus (MVP: stereo).
         let stereo: SpeakerArrangement = SpeakerArr::kStereo;
-        let mut in_arr: Vec<SpeakerArrangement> = if self.input_channels > 0 {
-            vec![stereo]
-        } else {
-            Vec::new()
+        // VST3 spec: setBusArrangements は **全 audio bus について** 1 つずつ
+        // SpeakerArrangement を渡す必要がある。 旧実装は「main bus 1 個だけに
+        // stereo」 を渡していたため、 multi-bus plugin (例: MeldaProduction
+        // MSoundFactory は main + sidechain + sub) で arrangement 不整合に
+        // なり、 plugin が処理を停止していた。
+        //
+        // 各 bus の channel count を `getBusInfo` で query → mono なら
+        // kMono、 2 なら kStereo、 4 以上なら kStereoSurround (落とせる範囲で
+        // 近似)。 plugin が拒否 (kResultFalse) した場合はそのまま続行 — 多くの
+        // plugin は内部で best-effort fallback する。
+        let in_arr_count = unsafe {
+            self.component.getBusCount(MediaTypes_::kAudio, BusDirections_::kInput)
         };
-        let mut out_arr: Vec<SpeakerArrangement> = if self.output_channels > 0 {
-            vec![stereo]
-        } else {
-            Vec::new()
+        let out_arr_count = unsafe {
+            self.component.getBusCount(MediaTypes_::kAudio, BusDirections_::kOutput)
         };
+        let mut in_arr: Vec<SpeakerArrangement> = (0..in_arr_count)
+            .map(|i| arrangement_for_bus(&self.component, BusDirections_::kInput, i, stereo))
+            .collect();
+        let mut out_arr: Vec<SpeakerArrangement> = (0..out_arr_count)
+            .map(|i| arrangement_for_bus(&self.component, BusDirections_::kOutput, i, stereo))
+            .collect();
+        tracing::info!(
+            in_count = in_arr_count,
+            out_count = out_arr_count,
+            in_arr = ?in_arr,
+            out_arr = ?out_arr,
+            "VST3 setBusArrangements request"
+        );
         let sba = unsafe {
             self.audio.setBusArrangements(
                 in_arr.as_mut_ptr(),
@@ -511,6 +635,30 @@ impl LoadedPlugin for Vst3Plugin {
         };
         if sba != kResultOk && sba != kResultTrue {
             tracing::warn!(res = format!("{sba:#x}"), "setBusArrangements non-OK (continuing)");
+        }
+        // negotiated arrangement を確認 (plugin によっては request と異なる
+        // arrangement を採用する)。
+        for i in 0..in_arr_count {
+            let mut got: SpeakerArrangement = 0;
+            let res = unsafe {
+                self.audio.getBusArrangement(BusDirections_::kInput, i, &mut got)
+            };
+            tracing::info!(
+                dir = "In", index = i, res = format!("{res:#x}"),
+                arrangement = format!("{got:#x}"),
+                "VST3 negotiated arrangement"
+            );
+        }
+        for i in 0..out_arr_count {
+            let mut got: SpeakerArrangement = 0;
+            let res = unsafe {
+                self.audio.getBusArrangement(BusDirections_::kOutput, i, &mut got)
+            };
+            tracing::info!(
+                dir = "Out", index = i, res = format!("{res:#x}"),
+                arrangement = format!("{got:#x}"),
+                "VST3 negotiated arrangement"
+            );
         }
 
         // 2. setupProcessing
@@ -815,17 +963,37 @@ impl LoadedPlugin for Vst3Plugin {
             return Ok(());
         }
         let view_raw = unsafe { self.controller.createView(c"editor".as_ptr()) };
-        anyhow::ensure!(!view_raw.is_null(), "IEditController::createView returned null");
+        if view_raw.is_null() {
+            tracing::warn!(
+                plugin = %self.name,
+                "VST3 createView returned null — plugin has no editor"
+            );
+            anyhow::bail!("IEditController::createView returned null");
+        }
         let Some(view) = (unsafe { ComPtr::<IPlugView>::from_raw(view_raw) }) else {
             anyhow::bail!("createView returned null after from_raw");
         };
+        // HWND platform を plugin が受け入れるか確認 (false なら GUI embed
+        // 不可、 plugin 側の標準 window で出す必要がある = MVP では未対応)。
+        let supported = unsafe { view.isPlatformTypeSupported(kPlatformTypeHWND) };
+        tracing::info!(
+            plugin = %self.name,
+            supported = format!("{supported:#x}"),
+            expected_ok = format!("{kResultOk:#x}"),
+            "VST3 isPlatformTypeSupported(HWND)"
+        );
         // Attach the plug-frame so resize requests get routed back.
         let frame_ptr = self
             .plug_frame
             .to_com_ptr::<vst3::Steinberg::IPlugFrame>()
             .context("plug_frame has no IPlugFrame")?
             .into_raw();
-        let _ = unsafe { view.setFrame(frame_ptr) };
+        let set_frame_res = unsafe { view.setFrame(frame_ptr) };
+        tracing::info!(
+            plugin = %self.name,
+            res = format!("{set_frame_res:#x}"),
+            "VST3 setFrame"
+        );
         // Keep one ref in self via `view`; Release the extra we added via
         // into_raw — setFrame does addRef internally so ownership is balanced.
         let _ = unsafe { ComPtr::<vst3::Steinberg::IPlugFrame>::from_raw(frame_ptr) };
@@ -869,10 +1037,28 @@ impl LoadedPlugin for Vst3Plugin {
             .as_ref()
             .context("gui not created — call gui_create_embedded first")?;
         let res = unsafe { view.attached(hwnd as *mut c_void, kPlatformTypeHWND) };
+        tracing::info!(
+            plugin = %self.name,
+            hwnd = format!("{hwnd:#x}"),
+            res = format!("{res:#x}"),
+            "VST3 IPlugView::attached(HWND)"
+        );
         anyhow::ensure!(
             res == kResultOk,
             "IPlugView::attached(HWND) -> {:#x}",
             res
+        );
+        // attached 直後に getSize で plugin が要求する初期サイズを取得 + ログ。
+        // MeldaProduction 等は ここで自身の preferred size を返すので、 0×0
+        // ならば描画 surface 未初期化の signal。
+        let mut rect = ViewRect { left: 0, top: 0, right: 0, bottom: 0 };
+        let size_res = unsafe { view.getSize(&mut rect) };
+        tracing::info!(
+            plugin = %self.name,
+            res = format!("{size_res:#x}"),
+            w = rect.right - rect.left,
+            h = rect.bottom - rect.top,
+            "VST3 getSize after attached"
         );
         self.gui_attached.set(true);
         Ok(())

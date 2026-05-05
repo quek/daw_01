@@ -39,7 +39,7 @@ A5 lyric UI     (← 次タスク、 gui_01 #015 は解決済、 A1 の前提)
 
 ### 既知の残 bug
 
-1. **MSoundFactory (VST3, MeldaProduction) の GUI が黒画面で音も鳴らない** (2026-05-05 確認)。 plugin window は開く + タイトル「Plugin — MSoundFactory」 は出るが、 内部描画が全くなく真っ黒。 audio process も無音。 同 vendor の MDynamics 等は未検証。 daw_plugin_host の VST3 GUI embed (HWND 渡し / IPlugView::attached) or process 周りに root cause がある可能性。 別 issue 化候補
+(現時点で blocking なものは無し。 transport の text_input は numpad Enter と main Enter 両方対応済。 MSoundFactory の GUI 黒画面 + 無音は VST3 bus enumeration / setBusArrangements 改善 + 詳細ログ追加で解消、 再現性なし。)
 
 優先順序の根拠:
 - **A2 完了**: track-parallel スレッドプール + MMCSS / thread_check / assert_no_alloc 稼働
