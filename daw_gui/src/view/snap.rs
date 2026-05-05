@@ -16,7 +16,8 @@ pub const SNAP_LABELS: &[&str] = &[
     "1/1", "1/2", "1/4", "1/8", "1/16", "1/32", "1/64", "1/128", // 0..=7  Straight
     "1/2T", "1/4T", "1/8T", "1/16T", "1/32T",                    // 8..=12 Triplet
     "1/4.", "1/8.", "1/16.", "1/32.",                            // 13..=16 Dotted
-    "Adaptive",                                                  // 17
+    "1 bar", "2 bar", "4 bar",                                   // 17..=19 Bars
+    "Adaptive",                                                  // 20
 ];
 
 pub const CHOICE_PIANOROLL_DEFAULT: u8 = 4; // "1/16"
@@ -43,7 +44,10 @@ pub fn choice_to_mode(idx: u8) -> SnapMode {
         14 => SnapMode::Dotted { div: 8 },
         15 => SnapMode::Dotted { div: 16 },
         16 => SnapMode::Dotted { div: 32 },
-        17 => SnapMode::Adaptive,
+        17 => SnapMode::Bars { count: 1 },
+        18 => SnapMode::Bars { count: 2 },
+        19 => SnapMode::Bars { count: 4 },
+        20 => SnapMode::Adaptive,
         _ => SnapMode::Off,
     }
 }
@@ -68,7 +72,10 @@ pub fn mode_to_choice(mode: SnapMode) -> Option<u8> {
         SnapMode::Dotted { div: 8 } => Some(14),
         SnapMode::Dotted { div: 16 } => Some(15),
         SnapMode::Dotted { div: 32 } => Some(16),
-        SnapMode::Adaptive => Some(17),
+        SnapMode::Bars { count: 1 } => Some(17),
+        SnapMode::Bars { count: 2 } => Some(18),
+        SnapMode::Bars { count: 4 } => Some(19),
+        SnapMode::Adaptive => Some(20),
         _ => None,
     }
 }
@@ -161,7 +168,9 @@ mod tests {
     fn toggle_triplet_no_pair_is_noop() {
         // "1/1" (idx 0) は Triplet 対応無し → no-op
         assert_eq!(toggle_triplet_choice(0), 0);
-        // "Adaptive" (idx 17) も no-op
+        // "Adaptive" (idx 20) も no-op
+        assert_eq!(toggle_triplet_choice(20), 20);
+        // "1 bar" (idx 17) も no-op (Bars に triplet 対応無し)
         assert_eq!(toggle_triplet_choice(17), 17);
     }
 
@@ -171,6 +180,16 @@ mod tests {
         for i in 0..SNAP_LABELS.len() as u8 {
             let mode = choice_to_mode(i);
             assert_eq!(mode_to_choice(mode), Some(i), "index {i}");
+        }
+    }
+
+    #[test]
+    fn bars_choice_round_trip() {
+        // 1 bar (17) / 2 bar (18) / 4 bar (19) は Bars { count } に変換、戻す。
+        for i in 17..=19 {
+            let mode = choice_to_mode(i);
+            assert!(matches!(mode, SnapMode::Bars { .. }), "idx {i}");
+            assert_eq!(mode_to_choice(mode), Some(i));
         }
     }
 }
