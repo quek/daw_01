@@ -170,6 +170,10 @@ pub struct AppData {
     /// `AppEvent::SingersLoaded` で投入する。 engine 未起動 / fetch 失敗時は
     /// 空のまま (Track Inspector の dropdown は default singer のみ表示)。
     pub singers: Vec<common::voicevox::VoiceVoxSinger>,
+    /// VOICEVOX 合成結果 in-memory cache (process lifetime のみ)。 Synth ボタン
+    /// 押下時に各 clip の content_hash + singer_id を key に lookup → hit なら
+    /// HTTP call をスキップ。 永続化は将来 Phase。
+    pub voicevox_cache: Arc<Mutex<common::voicevox_cache::VoiceVoxCache>>,
     pub is_rescanning: bool,
     pub status_message: String,
 
@@ -302,6 +306,7 @@ impl AppData {
             synth_result: Arc::new(Mutex::new(Vec::new())),
             rescan_result: Arc::new(Mutex::new(None)),
             singers: Vec::new(),
+            voicevox_cache: Arc::new(Mutex::new(common::voicevox_cache::VoiceVoxCache::new())),
             is_rescanning: false,
             status_message: String::new(),
             track_rename_idx: None,
@@ -2570,13 +2575,24 @@ impl AppData {
     fn begin_vocal_synth(&self) {
         let song = self.song.clone();
         let slot = Arc::clone(&self.synth_result);
+        let cache_arc = Arc::clone(&self.voicevox_cache);
         let proxy = self.event_proxy.clone();
         std::thread::spawn(move || {
-            let results = common::voicevox::synthesize_song(
-                &song,
-                common::voicevox::DEFAULT_SINGER_ID,
-                common::voicevox::DEFAULT_SINGER_ID,
-            );
+            // Cache mutex は thread 内で持ちっぱなし。 UI thread は cache を
+            // 読まないので blocking はしない。 synth 中の cache write/read を
+            // 単一 thread に集約。
+            let results = match cache_arc.lock() {
+                Ok(mut cache) => common::voicevox::synthesize_song(
+                    &song,
+                    common::voicevox::DEFAULT_SINGER_ID,
+                    common::voicevox::DEFAULT_SINGER_ID,
+                    &mut cache,
+                ),
+                Err(_) => {
+                    tracing::error!("voicevox_cache mutex poisoned, skipping synth");
+                    Vec::new()
+                }
+            };
             if let Ok(mut guard) = slot.lock() {
                 *guard = results;
             }

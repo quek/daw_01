@@ -14,6 +14,7 @@ pub mod recovery;
 pub mod timing;
 pub mod track_params;
 pub mod voicevox;
+pub mod voicevox_cache;
 pub mod voicevox_engine;
 pub mod vst3_scan;
 pub mod wire;

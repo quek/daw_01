@@ -103,6 +103,7 @@ pub fn synthesize_song(
     song: &Song,
     default_singer_id: u32,
     default_talk_speaker_id: u32,
+    cache: &mut crate::voicevox_cache::VoiceVoxCache,
 ) -> Vec<SynthResult> {
     let client = reqwest::blocking::Client::new();
     let mut results = Vec::new();
@@ -121,6 +122,26 @@ pub fn synthesize_song(
         let singer_id = if track_speaker != 0 { track_speaker } else { default_singer_id };
 
         for (clip_idx, clip) in track.clips.iter().enumerate() {
+            // Cache lookup — clip 内容 + singer_id が同じなら HTTP call
+            // を skip。 talk mode も sing mode も同じ key 体系で hit。
+            let cache_key = crate::voicevox_cache::VoiceVoxCache::key_for_clip(clip, singer_id);
+            if let Some(cached) = cache.get(cache_key) {
+                tracing::info!(
+                    track = track_idx,
+                    clip = clip_idx,
+                    cache_key,
+                    "VOICEVOX cache hit"
+                );
+                results.push(SynthResult {
+                    track: track_idx as u32,
+                    clip: clip_idx as u32,
+                    samples: cached.samples.clone(),
+                    sample_rate: cached.sample_rate,
+                    error: None,
+                });
+                continue;
+            }
+
             // A clip with at least one note that has any pitch goes into
             // sing mode; otherwise we fall back to talk mode using
             // whatever lyrics are attached (used for spoken intros, etc.).
@@ -177,6 +198,14 @@ pub fn synthesize_song(
 
             match decode_wav_to_f32(&wav_bytes) {
                 Ok((samples, sr)) => {
+                    // Cache に store (次回同 clip 同 singer で hit)
+                    cache.insert(
+                        cache_key,
+                        crate::voicevox_cache::CachedClip {
+                            samples: samples.clone(),
+                            sample_rate: sr,
+                        },
+                    );
                     results.push(SynthResult {
                         track: track_idx as u32,
                         clip: clip_idx as u32,
