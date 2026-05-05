@@ -18,7 +18,9 @@ use crate::model::{Clip, Note, Song};
 // Config
 // ---------------------------------------------------------------------------
 
-const VOICEVOX_URL: &str = "http://localhost:50021";
+/// Engine REST API endpoint.  voicevox_engine の公開 URL は voicevox_engine
+/// module からも参照する。
+pub const VOICEVOX_URL: &str = "http://localhost:50021";
 /// Speaker id used for the sing_frame_audio_query step (query generation
 /// only — the actual singer voice is selected at frame_synthesis time).
 /// 6000 = 波音リツ, same as the REAPER reference script.

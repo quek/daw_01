@@ -1,4 +1,5 @@
 use std::mem::size_of;
+use std::os::windows::io::AsRawHandle;
 
 use anyhow::{Context, Result};
 use tokio::process::Child;
@@ -45,6 +46,15 @@ impl JobHandle {
         let raw = child
             .raw_handle()
             .ok_or_else(|| anyhow::anyhow!("child has no Windows HANDLE"))?;
+        unsafe { AssignProcessToJobObject(self.handle, HANDLE(raw)) }
+            .context("AssignProcessToJobObject failed")?;
+        Ok(())
+    }
+
+    /// std::process::Child 用の同等 helper。 VOICEVOX engine など、 tokio
+    /// runtime に依存しない subprocess に使う。
+    pub fn assign_std(&self, child: &std::process::Child) -> Result<()> {
+        let raw = child.as_raw_handle();
         unsafe { AssignProcessToJobObject(self.handle, HANDLE(raw)) }
             .context("AssignProcessToJobObject failed")?;
         Ok(())
