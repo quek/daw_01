@@ -174,6 +174,14 @@ pub struct AppData {
     /// 押下時に各 clip の content_hash + singer_id を key に lookup → hit なら
     /// HTTP call をスキップ。 永続化は将来 Phase。
     pub voicevox_cache: Arc<Mutex<common::voicevox_cache::VoiceVoxCache>>,
+    /// VOICEVOX engine の auto-kill 用 Job。 daw_gui 起動時に作る Job と
+    /// 同じものを共有 (Vocal 関連操作で初めて engine を spawn するときに
+    /// 紐付け)。
+    pub voicevox_job: Arc<crate::job::JobHandle>,
+    /// VOICEVOX engine 起動を 1 度だけ trigger するためのフラグ。 lazy 起動:
+    /// 起動時 auto-launch せず、 Vocal track 選択 / Synth ボタン押下等で初めて
+    /// `ensure_voicevox_engine()` が `true` にして background spawn する。
+    pub voicevox_launch_attempted: bool,
     pub is_rescanning: bool,
     pub status_message: String,
 
@@ -224,6 +232,7 @@ impl AppData {
         _clap_plugin_path: Option<PathBuf>,
         plugin_db: Option<Arc<PluginDatabase>>,
         event_proxy: EventLoopProxy<AppEvent>,
+        voicevox_job: Arc<crate::job::JobHandle>,
     ) -> Self {
         let song = Song {
             tracks: vec![Track {
@@ -307,6 +316,8 @@ impl AppData {
             rescan_result: Arc::new(Mutex::new(None)),
             singers: Vec::new(),
             voicevox_cache: Arc::new(Mutex::new(common::voicevox_cache::VoiceVoxCache::new())),
+            voicevox_job,
+            voicevox_launch_attempted: false,
             is_rescanning: false,
             status_message: String::new(),
             track_rename_idx: None,
@@ -2523,15 +2534,59 @@ impl AppData {
 
     // -------- VOICEVOX -----------------------------------------------------
 
-    fn begin_vocal_synth(&self) {
+    fn begin_vocal_synth(&mut self) {
         let song = self.song.clone();
         let slot = Arc::clone(&self.synth_result);
         let cache_arc = Arc::clone(&self.voicevox_cache);
         let proxy = self.event_proxy.clone();
+        let job = Arc::clone(&self.voicevox_job);
+        // Lazy 起動の重複 spawn 防止フラグ。 1 度試行すれば以降は engine の
+        // is_running 判定だけで分岐 (engine 落ちたユーザー再起動は手動で OK)。
+        let need_launch = !self.voicevox_launch_attempted;
+        self.voicevox_launch_attempted = true;
         std::thread::spawn(move || {
-            // Cache mutex は thread 内で持ちっぱなし。 UI thread は cache を
-            // 読まないので blocking はしない。 synth 中の cache write/read を
-            // 単一 thread に集約。
+            // 1. Engine 起動 (まだ試行していなければ)
+            if need_launch && !common::voicevox_engine::is_running() {
+                if let Some(exe) = common::voicevox_engine::resolve_engine_path() {
+                    tracing::info!(exe = %exe.display(), "lazy spawn VOICEVOX engine for synthesis");
+                    match common::voicevox_engine::spawn_engine(&exe) {
+                        Ok(child) => {
+                            if let Err(e) = job.assign_std(&child) {
+                                tracing::warn!(error = ?e, "failed to attach VOICEVOX to job");
+                            }
+                            // child を drop しても std::process::Child は wait
+                            // しない (Windows)。 auto-kill は JobObject 経由。
+                            std::mem::forget(child);
+                        }
+                        Err(e) => {
+                            tracing::error!(error = ?e, exe = %exe.display(), "failed to spawn VOICEVOX engine");
+                        }
+                    }
+                } else {
+                    let cfg_hint = common::voicevox_engine::engine_path_config_file()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<no localappdata>".into());
+                    tracing::warn!(
+                        hint = %cfg_hint,
+                        "VOICEVOX engine path not configured (set DAW_VOICEVOX_PATH or write the exe path to the config file)"
+                    );
+                }
+            }
+            // 2. Engine ready 待ち (60s timeout)
+            if !common::voicevox_engine::wait_until_ready() {
+                tracing::warn!(timeout_secs = 60, "VOICEVOX engine not ready, aborting synth");
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Vec::new();
+                }
+                let _ = proxy.send_event(AppEvent::VocalSynthCompleted);
+                return;
+            }
+            // 3. Singers fetch (初回のみ意味あり、 2 回目以降も harmless)
+            if let Ok(singers) = common::voicevox::fetch_singers() {
+                tracing::info!(count = singers.len(), "fetched VOICEVOX singers");
+                let _ = proxy.send_event(AppEvent::SingersLoaded(singers));
+            }
+            // 4. 合成 (既存パス)
             let results = match cache_arc.lock() {
                 Ok(mut cache) => common::voicevox::synthesize_song(
                     &song,

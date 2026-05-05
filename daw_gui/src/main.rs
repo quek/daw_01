@@ -34,13 +34,11 @@ fn main() -> Result<()> {
     let job = Arc::new(JobHandle::new()?);
     let rt = Runtime::new().context("failed to create tokio runtime")?;
 
-    // VOICEVOX engine を background thread で起動。 設定済かつ未起動なら spawn、
-    // ready になるまで polling。 既に起動済 / path 未設定 / spawn 失敗時は
-    // ログのみ残してスキップ (Synth ボタン押下時にエラー表示でユーザー通知)。
-    // ready 後 (or 起動済) に `/singers` を fetch して `AppEvent::SingersLoaded`
-    // を発行 — これで Track Inspector の speaker dropdown が埋まる。
-    // proxy はまだ build_app 内でしか作れないので、 closure 内で wire する形に
-    // 変更 (build_app 内の thread spawn に統合)。
+    // VOICEVOX engine は **lazy 起動**: 起動時に auto-spawn せず、 Synth ボタン
+    // 押下 (`AppData::begin_vocal_synth`) で初めて spawn + ready 待ち + singers
+    // fetch + 合成 を 1 background thread で実行。 これで「VOICEVOX を使わない
+    // セッション」 では engine プロセスを立ち上げない。 job は AppData に持たせ、
+    // 初回 spawn 時に `assign_std` で daw_gui 終了 → engine auto-kill を担保。
 
     let pid = std::process::id();
     let session = AudioSession {
@@ -129,15 +127,22 @@ fn main() -> Result<()> {
             // forward SlotPluginLoaded → OpenPluginShmem to daw_audio.
             let audio_tx_for_bridge = audio_tx.clone();
 
-            // AppData 本体を組み立てる。
-            let app = AppData::new(audio_tx, plugin_tx, None, plugin_db_for_app, proxy.clone());
+            // AppData 本体を組み立てる。 job は AppData に持たせて lazy
+            // VOICEVOX 起動 (begin_vocal_synth から) で使う。
+            let app = AppData::new(
+                audio_tx,
+                plugin_tx,
+                None,
+                plugin_db_for_app,
+                proxy.clone(),
+                job_for_app,
+            );
 
             // ----- 背景スレッド群 -----
             spawn_playhead_poller(bridge_for_app, proxy.clone());
             spawn_autosave_timer(proxy.clone());
             spawn_midi_input(proxy.clone());
             spawn_incoming_bridge(incoming_rx, proxy.clone(), audio_tx_for_bridge);
-            spawn_voicevox_engine_launcher(job_for_app, proxy.clone());
 
             app
         }),
@@ -436,78 +441,6 @@ fn spawn_midi_input(proxy: EventLoopProxy<AppEvent>) {
             Err(e) => {
                 tracing::warn!(error = ?e, "failed to open MIDI input");
                 let _ = proxy.send_event(AppEvent::MidiInputOpened(None));
-            }
-        }
-    });
-}
-
-/// VOICEVOX engine を background thread で起動し、 JobObject に紐付けて
-/// daw_gui 終了時の auto-kill を担保する。 既に起動済 / path 未設定 /
-/// spawn 失敗時は warn ログのみ (daw_gui 起動を阻害しない)。 60 秒 polling
-/// timeout。 ready 後に `/singers` を fetch して `AppEvent::SingersLoaded`
-/// を発行 (Track Inspector の speaker dropdown 埋め用)。
-fn spawn_voicevox_engine_launcher(
-    job: Arc<JobHandle>,
-    proxy: EventLoopProxy<AppEvent>,
-) {
-    std::thread::spawn(move || {
-        let already_running = common::voicevox_engine::is_running();
-        if already_running {
-            tracing::info!("VOICEVOX engine already running, skipping spawn");
-        } else if let Some(exe) = common::voicevox_engine::resolve_engine_path() {
-            tracing::info!(exe = %exe.display(), "spawning VOICEVOX engine");
-            match common::voicevox_engine::spawn_engine(&exe) {
-                Ok(child) => {
-                    if let Err(e) = job.assign_std(&child) {
-                        tracing::warn!(
-                            error = ?e,
-                            "failed to attach VOICEVOX engine to JobObject — daw_gui exit will not auto-kill it"
-                        );
-                    }
-                    // child を drop しても std::process::Child は wait しない
-                    // — auto-kill は JobObject 経由。
-                    std::mem::forget(child);
-                }
-                Err(e) => {
-                    tracing::error!(error = ?e, exe = %exe.display(), "failed to spawn VOICEVOX engine");
-                    return;
-                }
-            }
-        } else {
-            let cfg_hint = common::voicevox_engine::engine_path_config_file()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<no localappdata>".into());
-            tracing::warn!(
-                hint = %cfg_hint,
-                "VOICEVOX engine path not configured (set DAW_VOICEVOX_PATH or write the exe path to the config file)"
-            );
-            return;
-        }
-        // engine ready 待ち (already_running なら即 true 返るが、 念のため
-        // wait_until_ready で / version 確認)
-        let ready = if already_running {
-            true
-        } else {
-            let r = common::voicevox_engine::wait_until_ready();
-            if r {
-                tracing::info!("VOICEVOX engine ready");
-            } else {
-                tracing::warn!(
-                    timeout_secs = 60,
-                    "VOICEVOX engine startup timeout — Synth button may fail"
-                );
-            }
-            r
-        };
-        if ready {
-            match common::voicevox::fetch_singers() {
-                Ok(singers) => {
-                    tracing::info!(count = singers.len(), "fetched VOICEVOX singers");
-                    let _ = proxy.send_event(AppEvent::SingersLoaded(singers));
-                }
-                Err(e) => {
-                    tracing::warn!(error = ?e, "failed to fetch /singers");
-                }
             }
         }
     });
