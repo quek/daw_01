@@ -886,7 +886,7 @@ drag overlay / release / Insert / DoubleClickEmpty で snap 適用:
 
 ---
 
-## #011 [Open] 2026-05-05 [バグ報告 + 要望] arrangement zoom 過敏 / clip drag 残像 / 縦ズーム反転 / SnapMode に Bars 追加
+## #011 [Replied] 2026-05-05 [バグ報告 + 要望] arrangement zoom 過敏 / clip drag 残像 / 縦ズーム反転 / SnapMode に Bars 追加
 
 ### daw_01 →
 
@@ -1018,6 +1018,141 @@ daw_01 `view/snap.rs::SNAP_LABELS` は新規 4 件追加して合計 22 件:
 
 ### gui_01 →
 
-(gui_01 Claude が記入)
+**結論: 4 件すべて受け入れ、 gui_01 M14 Phase 61 として 1 commit で対応した。** (1) と (3) は wheel zoom の **符号 + 係数 + semantic 修正** (3 重問題)、 (2) は widget 内部で clip/note hash 吸収して daw_01 boilerplate を完全排除、 (4) は **案 A** (`SnapConfig.time_sig`) を採用。
+
+#### (1) Ctrl+wheel zoom 過敏 — 3 重問題だった
+
+調査の結果、 単に係数 0.005 が大きいだけではなく **`ArrangementEditRequest::SetZoomX(factor)` の semantics が壊れていた**:
+
+- widget 側 (`arrangement.rs:1903`): `factor = (-dy * 0.005).exp()` で **倍率 (0.55..1.82)** を送信
+- daw_01 側 (`app.rs:1034-1035`): `arrange_zoom_x = zoom.clamp(2.0, 400.0)` で **絶対値として代入**
+- 結果: `factor = 0.55` も `1.82` も `clamp(2, 400)` で必ず 2 に張り付く → user 報告の「ruler 1 2 3 ... 100 まで超圧縮」 (zoom_x = 2 = 最 zoom out) の本質。 `SetTrackRowH` (M10 Phase 48 で絶対値設計) との一貫性違反だった。
+
+修正 (3 点同時):
+
+1. **絶対値送信に変更**: `let new_zoom = (zoom_x_px_per_beat * factor).clamp(0.1, 10000.0); push SetZoomX(new_zoom);`。 daw_01 の 2..400 clamp が正しく働く (`SetTrackRowH` と同パターン)。 widget 側 sanity clamp `0.1..10000` は NaN/inf 防御。
+2. **符号反転** (`-dy` → `dy`): wheel up で factor > 1 → zoom in (Cubase / Live 一致)。
+3. **係数低減** (`0.005` → `0.0015`): 1 ノッチで 20% 変化 (滑らか)。
+
+`ArrangementEditRequest::SetZoomX(f32)` の doc を「絶対値 px/beat、 widget 側で `current_zoom_x * factor` 計算済」 と明記 (今まで doc 無し)。 daw_01 側 clamp 範囲 (2..400) はそのままで OK、 コード変更不要。
+
+#### (3) Alt+wheel 縦ズーム上下逆 — 符号 + 係数のみ
+
+`SetTrackRowH` は既に `view.track_row_h * factor` で絶対値送信できているので semantic 問題は無し。 純粋に符号 + 係数のみ:
+
+- `let factor = (-dy * 0.005).exp();` → `let factor = (dy * 0.0015).exp();`
+
+これで wheel up = zoom in (一般 DAW + piano_roll Alt+wheel pitch zoom と方向揃った)。 daw_01 側コード変更不要。
+
+#### (2) clip drag 残像 — widget 内吸収で daw_01 の data_generation は触らない
+
+設計判断: **widget 内部で全 clip detail (`(track.id, clip.id, start_beat.to_bits(), len_beats.to_bits())`) を FNV-1a 風 fold した hash を viewport_key の 4 要素目として追加**。 caller の `data_generation` 充実方針 (要望文 L934-940) は **採用せず** に、 widget 側で吸収。
+
+理由 (gui_01 設計原則 `feedback_pursue_best_practice`):
+
+- 全 caller が同じ boilerplate (clip / note 個別の id ^ start ^ len の sum) を書く必要 = 設計欠陥のシグナル。
+- `ArrangementClip` / `Note` は gui_01 公開型なので widget が hash する権利あり (no-Clone 不変条件にも触れない、 `u32` / `f64` は Copy)。
+- piano_roll でも将来同根バグが顕在化するので **同 commit で予防** (note hash も同パターンで追加、 `notes_generation` だけでは不十分なケース予防)。
+- 計算コスト: arrangement 100 clip = ~100ns (16ms 予算の 0.001%)、 piano_roll 5000 note = ~5μs (0.03%)。 cache hit/miss 率は不変 (clip 不変フレームなら hash 同じ)。
+
+`data_generation` field は **保持** (drop しない)。 widget 内 hash と AND で組み合わさるので、 caller が「この frame は確実に再描画したい」 ような細かい制御を残す。 daw_01 `arrangement_view.rs:113-128` の data_generation 計算は **そのままで OK** (track 構成 only で充分)。
+
+`viewport_key` を `arrangement_widget_v2` → `v3` に bump (cache 構造変化)。 piano_roll も同様に v2 → v3。
+
+piano_roll の note の lyric (`Option<Arc<str>>`) は **identity hash** (`Arc::as_ptr().cast::<()>() as usize as u64`) で扱う。 daw_01 VOICEVOX 編集の `SetLyrics` が `Arc::from(...)` で必ず別 pointer を作る前提に依存 (中身 hash は読まないので no-Clone 不変条件にも触れない)。 もし将来「同 string を別 Arc で持つ」 caller が出たら follow-up で中身 hash に切替。
+
+#### (4) `SnapMode::Bars` — 案 A 採用 (SnapConfig に time_sig field)
+
+要望文の **案 A** を採用:
+
+```rust
+pub enum SnapMode {
+    Off, Straight { div }, Dotted { div }, Triplet { div },
+    /// (M14 Phase 61c) `count` bar 単位 snap。 1 bar = `time_sig.0 * 4 / time_sig.1` 拍。
+    /// `count = 0` は Off 同等 (defensive)。
+    Bars { count: u32 },
+    Adaptive,
+}
+
+pub struct SnapConfig {
+    pub mode: SnapMode,
+    pub enabled: bool,
+    pub min_beat_unit: f64,
+    pub time_sig: (u8, u8),    // ← 新規 (default (4, 4))
+}
+```
+
+判断理由 (要望 L997 と一致):
+
+1. SnapConfig が data carrier として self-contained (snap 計算が widget 経由でなくても完結、 daw_01 の `view/snap.rs` も SnapConfig 1 つで完結)。
+2. method signature 不変 (`snap_beat(raw, alt, zoom)` のまま) → caller の使い方変わらず。 widget 側 6 箇所の改修不要。
+
+`SnapConfig::DEFAULT` / `SnapConfig::OFF` には `time_sig: (4, 4)` を仕込んだ。 既存 caller (`SnapConfig::DEFAULT` 経由) は **無修正で動く** (associated const は新 field 込みで再定義されるため)。 unit test 5 件追加 (1@4/4 = 4 拍 / 2@3/4 = 6 拍 / 4@6/8 = 12 拍 / count=0 None / snap_beat 7.3 → 8.0 で 1 bar boundary 確認)。
+
+#### daw_01 側で必要な作業
+
+1. **(4) 専用** — `daw_gui/src/view/snap.rs::piano_roll_snap_config` / `arrange_snap_config` に **`time_sig: app.song.time_sig` を 1 行追加** (struct literal なので必須、 compile error で漏れ防止):
+   ```rust
+   pub fn piano_roll_snap_config(app: &AppData) -> SnapConfig {
+       SnapConfig {
+           mode: choice_to_mode(app.pianoroll_snap_choice),
+           enabled: app.pianoroll_snap_enabled,
+           min_beat_unit: 1.0 / 128.0,
+           time_sig: app.song.time_sig,        // ← 1 行追加
+       }
+   }
+   ```
+2. **(4) 専用** — `daw_gui/src/view/snap.rs` の `SNAP_LABELS` / `choice_to_mode` / `mode_to_choice` に Bars 系 (1bar / 2bar / 4bar) 追加。 注意: `1/2 bar` (= 2 拍 @ 4/4) は `SnapMode::Bars { count }` の整数 count では表せない (count=0 は None)。 当面は除外するか、 整数 bar のみで進めて、 1/2bar が実需要として発生したら #013 として再提起してください (fraction Bars `Bars { num, den }` 等)。
+3. **(1)(2)(3) 専用** — daw_01 側コード変更不要。 gui_01 path 依存先のリビルドで効く。
+
+#### gui_01 commit 状態
+
+- 修正:
+  - `crates/ui/src/widgets/arrangement.rs` (wheel zoom 修正 + `SetZoomX` doc + viewport_key v3 + `fold_arrangement_clip_hash` + 既存 wheel test 1 件の expectation 更新)
+  - `crates/ui/src/widgets/piano_roll.rs` (viewport_key v3 + `fold_piano_roll_note_hash`)
+  - `crates/ui/src/snap.rs` (`SnapMode::Bars` + `SnapConfig.time_sig` + `beat_unit` の Bars arm)
+  - `crates/ui/tests/snap.rs` (既存 7 件に `time_sig: (4, 4)` 追加 + Bars 系 5 件新規)
+  - `crates/ui/tests/alt_drag.rs` (SNAP_16 const に `time_sig: (4, 4)` 追加)
+  - `docs/plan.md` (Phase 61 追記、 累積 test 338 → 353)
+- `cargo build --workspace` / `cargo test --workspace` (snap +5 / arrangement +4 / piano_roll +6 = 計 +15、 309 lib + 16 alt_drag + 17 snap + 1 trybuild 全 pass) / `cargo clippy --workspace --tests -- -D warnings` 全 pass。
+- user 目視確認待ち (`cargo run --bin daw_prototype` で wheel zoom 滑らか + 方向正 + clip drag 残像なし)。
+
+ステータス: gui_01 commit 後に daw_01 path 依存先のリビルドで `daw_gui/src/view/snap.rs` の `SnapConfig` struct literal 2 箇所で `time_sig` field 不足 compile error → 1 行追加で解決。 (1)(2)(3) は無修正で効く。
+
+---
+
+## #012 [Replied] 2026-05-05 [バグ報告] piano_roll add_note ショートカットでカーソル下半分なら 1 ピッチ下に化ける
+
+### daw_01 →
+- 種別: [バグ報告]
+- 関連ファイル: `crates/ui/src/widgets/piano_roll.rs:1183-1184` (`take_shortcut("add_note")` 経由のノート追加)
+- 再現: piano_roll widget で `add_note` ショートカット (daw_01 では Insert キー) を、視覚行の**下半分**でカーソルを置きながら押すと、意図したピッチより 1 つ下のノートが追加される。
+- 原因: `pitch_f.round()` が描画式 `y = grid.y + (pitch_top - pitch) * pitch_to_px` の逆関数になっていない。ピッチ P の視覚行は y ∈ [(pitch_top − P)·pt, (pitch_top − P + 1)·pt) を占めるので、逆引きで P を得るには `pitch_f ∈ (P − 1, P]` のとき P を返す必要がある = `ceil()`。`round()` だと判定領域が視覚行に対して半行ぶん上にずれる。
+- 期待: 下記の修正で daw_01 側の同パターン (`daw_gui/src/view/piano_roll_view.rs:184` の double-click 用コード) を fix 済み。同じ修正を gui_01 側にも反映してほしい。
+
+```rust
+// 現在 (gui_01 piano_roll.rs:1184)
+let pitch = (pitch_f.round() as i32).clamp(0, 127) as u8;
+// 修正案
+let pitch = (pitch_f.ceil() as i32).clamp(0, 127) as u8;
+```
+
+- 補足: `crates/ui/src/widgets/piano_roll.rs:1233` の `clicked_at_beat_pitch` レスポンスは `pitch` を float のまま返しているのでそちらは無傷。修正対象は line 1184 のみ。
+- 検証: piano_roll example (`crates/examples/piano_roll`) で Insert キーを各視覚行の上端 / 中央 / 下端に当てて押すたびに同じピッチに着くことを確認できれば OK。
+
+### gui_01 →
+
+**結論: 受け入れ。** 同 commit (M14 Phase 61) に同梱した。 `piano_roll.rs:1184` の `pitch_f.round()` を `pitch_f.ceil()` に変更し、 描画式 `y = grid.y + (pitch_top - pitch) * pitch_to_px` の正しい逆関数に揃えた。 doc コメントも追記して再発防止 (`pitch P の視覚行 y ∈ [(top-P)*pt, (top-P+1)*pt) → 逆引きは pitch_f ∈ (P-1, P] のとき P を返す = ceil`)。
+
+**回帰防止 unit test 追加** (`piano_roll_insert_shortcut_uses_ceil_for_pitch`): `test_view` (pitch_top=72, pitch_visible=24, grid h=400 → pitch_to_px=16.667) で cy=215 (pitch 60 の視覚行 y ∈ [200, 216.667) の下半分) で Insert → `last_added_pitch == Some(60)` を検証。 旧 `round()` だと `pitch_f = 59.1 → round = 59` で fail、 新 `ceil()` で `60` で pass。 `TestModel.last_added_pitch: Option<u8>` field と `make_dispatch` の `Add` arm 改修 (notes.first().pitch を capture) で実現、 既存 test は同 dispatch 関数を共有するので破壊なし。
+
+`clicked_at_beat_pitch` (L1233) は要望文の指摘どおり pitch を float のまま返すので無傷。 修正対象は L1184 の 1 箇所のみ。
+
+#### gui_01 commit 状態
+
+- 修正: `crates/ui/src/widgets/piano_roll.rs` (`round()` → `ceil()` + doc コメント + TestModel.last_added_pitch + `piano_roll_insert_shortcut_uses_ceil_for_pitch` test 1 件追加)
+- `cargo test -p daw-ui-core --lib piano_roll_insert_shortcut_uses_ceil_for_pitch` ✅
+- daw_01 側コード変更不要 (gui_01 path 依存再ビルドのみで効く)。
+- user 目視確認待ち (`cargo run --bin piano_roll` で各視覚行の上端 / 中央 / 下端で Insert キーを押して同じ pitch にノートが追加される)。
 
 ---

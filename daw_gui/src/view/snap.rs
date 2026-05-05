@@ -78,6 +78,7 @@ pub fn piano_roll_snap_config(app: &AppData) -> SnapConfig {
         mode: choice_to_mode(app.pianoroll_snap_choice),
         enabled: app.pianoroll_snap_enabled,
         min_beat_unit: 1.0 / 128.0,
+        time_sig: app.song.time_sig,
     }
 }
 
@@ -86,6 +87,7 @@ pub fn arrange_snap_config(app: &AppData) -> SnapConfig {
         mode: choice_to_mode(app.arrange_snap_choice),
         enabled: app.arrange_snap_enabled,
         min_beat_unit: 1.0 / 128.0,
+        time_sig: app.song.time_sig,
     }
 }
 
