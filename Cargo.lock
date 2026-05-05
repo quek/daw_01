@@ -879,6 +879,7 @@ dependencies = [
  "assert_no_alloc",
  "common",
  "cpal",
+ "hound",
  "tokio",
  "tracing",
  "windows 0.61.3",

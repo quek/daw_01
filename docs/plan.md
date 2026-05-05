@@ -30,18 +30,18 @@ DESIGN.md M1 残項目を 6 タスクに分解。`docs/plan_<feature>.md` への
 ### 着手順マップ
 
 ```
-A2 (完了 ✓) ─→ A3 WAV export (機能復旧 ← 次タスク) ─┬─→ A1 VOICEVOX ─→ M1 完成
-                                                      │
-A6 tempo/timesig (独立、A3 後)                       │
-A4 autosave     (独立、A3 後)                        │
-A5 lyric UI     (gui_01 #015 要望、 A1 の前提)        │
+A2 (完了 ✓) ─→ A3 WAV export (完了 ✓) ─┬─→ A1 VOICEVOX ─→ M1 完成
+                                          │
+A6 tempo/timesig (← 次タスク、独立、軽量) │
+A4 autosave     (独立、軽量)              │
+A5 lyric UI     (gui_01 #015、 A1 の前提) │
 ```
 
 優先順序の根拠:
-- **A2 完了**。track-parallel スレッドプール + MMCSS / thread_check / assert_no_alloc が稼働
-- **A3 が次** — A2 で旧 export_wav_offline を削除して GUI Export メニューも消した状態。機能消失中なので「新機能 (A6 等)」 より「機能復旧 (A3)」 を優先する
-- **A3 は engine resource 共有化を伴う大規模変更**: `LocalState` の `plugin_refs / slot_to_plugin_id / vocal_store / worker_syncs / worker_pool` を `SharedState` に Arc 化する設計が前提。`docs/plan_a3_wav_export.md` への切り出し推奨
-- **A6 / A4** は A3 完了後に着手 (独立で軽量)
+- **A2 完了**: track-parallel スレッドプール + MMCSS / thread_check / assert_no_alloc 稼働
+- **A3 完了**: freewheel offline render + CLAP render ext で WAV export 復旧 (5 PR、 plan_a3_wav_export.md 参照)
+- **A6 が次** (推奨): tempo / time_sig 変更 UI。独立かつ軽量なので素早く着手可
+- **A4** は A6 後 (独立で軽量、 autosave + 起動時復元)
 - **A5** は gui_01 改修先行 (#015)。reply 待ちの間 A1 の Engine / HTTP 周りを進める
 - **A1** は A5 完了後に本格実装
 
@@ -156,7 +156,29 @@ A5 lyric UI     (gui_01 #015 要望、 A1 の前提)        │
 
 着手時 `docs/plan_a1_voicevox.md` を切り出し必須 (大規模)。
 
-### A3: WAV 書き出し / mixdown (freewheel offline render) [優先度 6]
+### A3: WAV 書き出し / mixdown (freewheel offline render) [完了]
+
+詳細は [docs/plan_a3_wav_export.md](plan_a3_wav_export.md)。
+
+**完了内容 (PR1-5、 build / clippy / test --features rt-assert all clean)**:
+
+- engine resource 共有化: `LocalState` の `worker_bridge` / `worker_syncs` / `plugin_refs` / `slot_to_plugin_id` / `vocal_store` / `worker_pool` を `Arc<EngineShared>` に移管 (ArcSwap で wait-free 共有)
+- CLAP `clap_plugin_render` ext: `LoadedPlugin::set_render_mode(mode)` を追加、 ClapPlugin で `clap_plugin_render::set` 呼び出し
+- protocol: `MainToChild::ExportWav { path }` / `SetRenderMode(RenderMode)` 追加、 `ChildToMain::ExportWavComplete { error }` 復活
+- daw_audio: `daw_audio/src/export.rs` で freewheel offline render を実装。 同 AudioWorkerPool で track-parallel + plugin handshake を駆動、 hound::WavWriter で出力。 `export_running` フラグで CPAL callback を silence
+- IPC: audio pipe を tokio::io::split で双方向化、 export 完了通知を ChildToMain::ExportWavComplete で送信
+- GUI: File → Export WAV / Ctrl+E / status bar 表示復活、 SetRenderMode(Offline/Realtime) を export bookend で plugin host に送る
+
+**残課題 (M1 完成後の検討、 必要なら別 plan)**:
+
+- 進捗 modal (cancel button、 export thread を中断する mechanism)
+- Selection / Loop range のみの export
+- VST3 の render mode サポート (現状 no-op、 IComponent::setIoMode へのマップは M2)
+- has_hard_realtime_requirement() を返す plugin (hardware proxy 等) のサポートは M2 で realtime export 検討
+
+---
+
+### A3 (旧版): WAV 書き出し / mixdown [優先度 6 — 完了済、 以下は元計画]
 
 **現状**: A2 で plugin_host 側の旧 export_wav_offline を削除し、GUI Export メニューも一旦無効化済。daw_audio 側に新規実装する。
 
@@ -237,4 +259,9 @@ A5 lyric UI     (gui_01 #015 要望、 A1 の前提)        │
 | 2026-05-04 | af44c46 | M13 取り込み | gui_01 #014 (M13 Phase 55) を取り込み — アレンジビュー小節番号 ruler + ピアノロール ruler 領域 + time_sig 対応 grid |
 | 2026-05-04 | 12be490 | Phase 0 | gui_01 #014 を Resolved 化、archive へ移動 |
 | 2026-05-04 | 8954bed | A2 PR1-7 | 責務分担正常化 + track-parallel スレッドプール化 (build/clippy clean): plan_a2_audio_engine.md 参照 |
-| 2026-05-05 | (uncommitted) | A2 完了 | 残 cleanup + audio quality: 旧 audio thread コード全削除 (~1500 行)、`tests` を `daw_audio/src/sequencer.rs` に移植、MMCSS (`AvSetMmThreadCharacteristicsW("Pro Audio")`) を両 worker pool に追加、CLAP `thread_check` ext (host 提供 + TLS) 実装、`rt-assert` feature (`assert_no_alloc`) 追加。CLAUDE.md に「まず調べる」 ルール追記。WAV export は LocalState 共有設計が大規模変更のため A3 で本格実装に切り出し (旧 export_wav_offline と GUI メニューは削除のみ) |
+| 2026-05-05 | d7a7575 | A2 完了 | 残 cleanup + audio quality: 旧 audio thread コード全削除 (~1500 行)、tests を daw_audio/src/sequencer.rs に移植、MMCSS / CLAP thread_check ext / assert_no_alloc 追加。 CLAUDE.md に「まず調べる」 ルール追記。 WAV export は A3 で本格実装に切り出し |
+| 2026-05-05 | 82f7e54 | A3 PR1 | LocalState から EngineShared を抽出 (Arc + ArcSwap で wait-free 共有)、 機能変化なし |
+| 2026-05-05 | c10141d | A3 PR2 | LoadedPlugin::set_render_mode trait method 追加、 ClapPlugin で clap_plugin_render::set 呼び出し、 Vst3Plugin は no-op |
+| 2026-05-05 | 4ace2a5 | A3 PR3 | protocol 拡張: MainToChild::ExportWav / SetRenderMode + ChildToMain::ExportWavComplete 復活、 plugin_host で全 plugin に render mode broadcast |
+| 2026-05-05 | 9607660 | A3 PR4 | daw_audio/src/export.rs 新規: freewheel offline render + WavWriter。 export_running フラグで CPAL callback を silence、 同 worker pool / plugin shmem を export thread が独占駆動 |
+| 2026-05-05 | e8b3d6e | A3 完了 | GUI で File→Export WAV / Ctrl+E / status bar 復活。 audio pipe を read/write 双方向化し、 export 完了通知を ChildToMain::ExportWavComplete で daw_gui へ。 SetRenderMode(Offline/Realtime) bookend で plugin に CLAP render hint |
