@@ -286,6 +286,32 @@ M1-M8 + M5.5 は完了済み (詳細: [history.md](history.md))。M8 完了時�
 - 🔲 `cargo run --bin daw_prototype` で arrangement タブの ruler に "1", "2", "3" 等の小節番号が出ること、time_sig (3, 4) 切替で bar 線が 3 拍ごとに移動することを目視確認 (user 側で実施)
 - 🔲 daw_01 conversation #014 を `[Open]` → `[Replied]` に更新 (本 commit と同 sequence で別 step、`daw_01` ディレクトリでは commit しない)
 
+### M14 (Modal popup の input masking + `button_at_clicked` — daw_01 #015) — 進行中
+
+**目的**: daw_01 conversation `#015 [Open]` (2026-05-05) で報告された plugin_picker (`Ui::modal` + `Ui::list_view` で構築) の 2 件のバグを 1 commit で修正する。 (a) ✕ ボタンクリックが反応しない、(b) modal 内 list_view で wheel scroll が効かない。両者とも gui_01 側 root cause、API 2 点の追加で完結。
+
+**動機**:
+- (a) `button_at` の `on_click: FnOnce() -> Edit<M>` は `&mut Ui` を取れないため、click closure 内で `close_modal` を呼べない。Edit が daw_01 側 boolean を flip しても gui_01 内部の `open_popups` HashMap (popup state) は不変 → `modal.rs:87` の `is_modal_open` が true のまま → modal 描画継続。「click が無視される」と見える symptom の正体。menu item `m.item("New", |ui| { ui.push_edit(...) })` (M9 P1-5) で確立した「click handler が `&mut Ui` を取る」 pattern を button にも提供する必要があった。
+- (b) daw_01 `root.rs:73` で `arrangement_view::draw` が `plugin_picker::draw` より先に呼ばれ、`arrangement.rs:1783` の `take_scroll_in_rect(lanes)` が pointer (modal panel 内) の scroll_delta を消費 → modal の list_view が呼ぶ頃には (0, 0)。modal panel と arrangement.lanes 矩形が overlap するため発生 (1280×720 で modal 中央 (640, 360) と lanes (440, 88, 840, 368) がかぶる)。同種の問題は `take_drag_rect_in_rect` / `take_double_click_in_rect` でも潜在 (今回は未報告だが将来必ず出る)。
+
+| Phase | テーマ | 主な成果物 | 状態 |
+|---|---|---|---|
+| 56 | `button_at_clicked` 新設 + 全 take_* で modal-aware masking | **(a) `Ui::button_at_clicked(id, text, rect) -> bool`** を `crates/ui/src/widgets/button.rs` に新設 (`#[must_use]`)。click された frame で `true` を返す Edit-less 版。既存 `button_at` の本体をこちらに移し、`button_at` は `if button_at_clicked(...) { push_edit(on_click()) }` で 1 行 wrapper にリファクタ (DRY、hit-test 挙動の乖離防止)。menu item と同じ「click handler が `&mut Ui` を必要とする」pattern を button に提供 (modal の `close_modal` / `set_focus` / 複数 `push_edit` / 動的 popup 開閉)。**(b) `Ui::pointer_blocked_by_modal_popup()` helper** を `pub(crate)` で `crates/ui/src/ui.rs` に追加 — `drawing_in_popup` でない caller かつ pointer.pos が `open_popups` の `modal=true` な anchor 内にあれば `true`。`take_scroll_in_rect` / `take_drag_rect_in_rect` / `take_double_click_in_rect` 冒頭で `if self.pointer_blocked_by_modal_popup() { return /* zero/None */; }` で早期 return。modal popup の下に隠れている widget は pointer 入力を一切消費しない (overlay の意味が失われる問題を解消)。popup_layer 内 (modal の body) は `drawing_in_popup=true` なので通常通り消費可能。**unit test 5 件**追加 (button: press+release inside で click=true / press outside → release inside で click=false、ui: take_scroll で modal 下 (0,0) と popup_layer 内 (0,-3) の対比 / take_drag_rect で modal 下は drag 開始しない / take_double_click で modal 下は None)。`Ui::button_at` 既存 caller は無修正 (返り値追加のみ非破壊)、daw_01 plugin_picker.rs の ✕ ボタンは `button_at_clicked` + `close_modal` への書き換えが必要 (conversation #015 で daw_01 Claude に指示)。wheel 側は daw_01 側コード変更不要 (gui_01 修正のみで効くようになる) | 🚧 進行中 |
+
+**設計判断**:
+
+- **`button_at_clicked` を新設、`button_at` の signature 変更は不採用**: `button_at` を `FnOnce(&mut Ui<M>) -> ()` に breaking 変更する案は menu item `m.item` の pattern と整合するが、既存 `button_at` callers (mixer / track_inspector / transport / examples / trybuild など何十か所) を 1 commit で全更新する破壊コストが過大。`button_at_clicked` を別 method として追加すれば「Edit を返したい場合」と「Ui 操作したい場合」の 2 用途で signature を分離でき、menu item の `&mut Ui` pattern と方向性は同じ。
+- **builtin close button (`ModalStyle::show_close_button: bool`) は不採用**: daw_01 plugin_picker の Rescan + ✕ レイアウト都合と相反、style に hardcode された見た目を強制する。daw_01 が title row 内の ✕ 位置を完全制御できる方が良い (CLAUDE.md「要件にない変更を入れない」)。
+- **`Ui::sync_modal(bool)` も不採用**: on_close 二重発火 + boolean ↔ popup state 二重管理を温存するので筋が悪い。「button click → close_modal → on_close fires → Edit (ClosePluginPicker) で boolean false」の一方向フローで完結する設計 (現状 modal API の意図) を維持。
+- **`take_drag` / `take_double_click` にも masking を適用**: 一貫性 (3 関数のうち 1 つだけ漏れると次のバグ報告が必ず来る — `feedback_pursue_best_practice`「ユーザに workaround を強要する API は設計欠陥」原則)。コスト極小 (helper 1 関数 + 3 箇所に 1 行ずつ)。
+
+**完了条件 (DoD)**:
+
+- 🚧 Phase 56 実装中
+- ✅ `cargo build --workspace` / `cargo test --workspace` (**265 unit test、Phase 55 から +5 件 → 各 crate sum: 254 + 9 + 1 + 1 = 265**) / `cargo clippy --workspace --tests -- -D warnings` / `cargo test -p daw-ui-core --test no_clone_required` 全 ✅
+- 🔲 `cargo run --bin daw_prototype` で modal demo (Demo Dialog ボタンから plugin_picker 風の modal を開く example が存在すれば) の wheel scroll / 任意の close button が機能することを目視確認 (user 側で実施)。daw_01 側で `cargo run --bin daw_prototype` (daw_01 内) → plugin_picker → ✕ クリック / wheel scroll / outside click / Esc 全て regression 無し動作確認も別途必要 (daw_01 Claude / user 側)
+- 🔲 daw_01 conversation #015 を `[Open]` → `[Replied]` に更新 (本 commit と同 sequence で別 step、`daw_01` ディレクトリでは commit しない)
+
 ---
 
 ## 凍結 (M9+M10+M11 完了後の再評価対象)

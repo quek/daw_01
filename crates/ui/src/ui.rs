@@ -880,6 +880,29 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
     }
 
+    /// pointer が **modal popup の anchor 内** にあり、現在の widget が `drawing_in_popup`
+    /// でない (= popup_layer の外で動いている) とき `true`。
+    ///
+    /// daw_01 #015 の root cause: arrangement_view が plugin_picker (modal) より先に走り
+    /// `take_scroll_in_rect(lanes)` が pointer (modal panel 内) の scroll_delta を消費 →
+    /// list_view が呼ぶ頃には (0, 0)。modal の下に隠れている widget は pointer 入力を
+    /// 一切消費すべきでない (overlay の意味が失われる) ため、`take_scroll_in_rect` /
+    /// `take_drag_rect_in_rect` / `take_double_click_in_rect` 冒頭で早期 return する。
+    ///
+    /// popup_layer 内部 (= modal の body) では `drawing_in_popup == true` なので false を
+    /// 返し、通常通り消費可能。
+    pub(crate) fn pointer_blocked_by_modal_popup(&self) -> bool {
+        if self.drawing_in_popup {
+            return false;
+        }
+        let Some((px, py)) = self.pointer.pos else {
+            return false;
+        };
+        self.open_popups
+            .values()
+            .any(|s| s.modal && s.anchor.contains(px, py))
+    }
+
     /// エディットを Scene に積む (外部 widget extension で利用可能)。
     pub fn push_edit(&mut self, edit: Edit<M>) {
         self.edits.push(edit);
@@ -1104,6 +1127,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// release ベース (drag と区別しやすい)、UiHost-level global state なので「同時に 2 つの
     /// widget で double-click 中」のようなケースは扱わない (real DAW で発生しない前提)。
     pub fn take_double_click_in_rect(&mut self, rect: Rect) -> Option<(f32, f32)> {
+        // modal popup の下に隠れている widget は pointer 入力を消費しない (#015)。
+        if self.pointer_blocked_by_modal_popup() {
+            return None;
+        }
         let (px, py) = (*self.pending_double_click)?;
         if rect.contains(px, py) {
             *self.pending_double_click = None;
@@ -1285,6 +1312,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         wid: WidgetId,
         bounds: Rect,
     ) -> Option<DragRect> {
+        // modal popup の下に隠れている widget は pointer 入力を消費しない (#015)。
+        if self.pointer_blocked_by_modal_popup() {
+            return None;
+        }
         let pointer = self.pointer;
         let modifiers = pointer.modifiers;
 
@@ -1406,6 +1437,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 戻り値は `(dx, dy)` (winit 慣行: `dy > 0` = wheel を上方向に回した = コンテンツが上に流れる)。
     /// 同フレームに複数 widget が呼んでも、最初に呼んだ widget が消費する。
     pub fn take_scroll_in_rect(&mut self, rect: Rect) -> (f32, f32) {
+        // modal popup の下に隠れている widget は pointer 入力を消費しない (#015)。
+        if self.pointer_blocked_by_modal_popup() {
+            return (0.0, 0.0);
+        }
         let Some((px, py)) = self.pointer.pos else { return (0.0, 0.0) };
         if !rect.contains(px, py) {
             return (0.0, 0.0);
@@ -2526,5 +2561,115 @@ mod tests {
                 "3rd release は 2nd の double-click 後なので Single click 扱い"
             );
         });
+    }
+
+    // -------- M9 Phase 46 (daw_01 #015): modal popup の下に隠れた widget の入力を遮断する --------
+
+    /// daw_01 #015 root cause: arrangement_view が plugin_picker (modal) より先に走り
+    /// `take_scroll_in_rect(lanes)` が pointer (modal panel 内) の scroll_delta を消費 →
+    /// list_view の scroll_area が呼ぶ頃には (0, 0) になっていた。
+    ///
+    /// 修正: `take_scroll_in_rect` 冒頭で `pointer_blocked_by_modal_popup()` 判定 →
+    /// modal popup anchor 内 pointer かつ drawing_in_popup でない場合は (0, 0) を返す。
+    /// popup_layer 内の widget (modal の body) は drawing_in_popup=true で通常通り消費可能。
+    #[test]
+    fn take_scroll_returns_zero_when_under_modal_anchor_outside_popup_layer() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let anchor = Rect { x: 100.0, y: 100.0, w: 200.0, h: 200.0 };
+        let pos = (150.0, 150.0); // anchor 内
+
+        // 1 frame目: open_popup で modal popup を開く (anchor 確定)
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.open_popup("test_modal", anchor, true);
+        });
+
+        // 2 frame目: pointer が anchor 内、scroll_delta あり。
+        // 通常 widget (drawing_in_popup=false) の take_scroll_in_rect → (0, 0)
+        // popup_layer 内 (drawing_in_popup=true) の take_scroll_in_rect → (0, -3)
+        let outside_scroll = std::cell::Cell::new((0.0_f32, 0.0_f32));
+        let inside_scroll = std::cell::Cell::new((0.0_f32, 0.0_f32));
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some(pos),
+                    scroll_delta: (0.0, -3.0),
+                    ..PointerFrame::default()
+                },
+                ..FrameInput::default()
+            },
+            |(), ui| {
+                // 通常 widget: anchor 内 pointer で消費しようとしても (0, 0)
+                outside_scroll.set(ui.take_scroll_in_rect(anchor));
+                // popup_layer 内: 通常通り消費可能
+                ui.popup_layer("test_modal", |ui| {
+                    inside_scroll.set(ui.take_scroll_in_rect(anchor));
+                });
+            },
+        );
+        assert_eq!(outside_scroll.get(), (0.0, 0.0), "modal 下では scroll は消費されない");
+        assert_eq!(inside_scroll.get(), (0.0, -3.0), "popup_layer 内では消費される");
+    }
+
+    /// `take_drag_rect_in_rect` も同じく modal anchor 下では drag を始めない。
+    #[test]
+    fn take_drag_rect_blocked_under_modal_anchor() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let anchor = Rect { x: 100.0, y: 100.0, w: 200.0, h: 200.0 };
+        let bounds = anchor; // 同じ rect で drag を始めようとしても block される
+        let pos = (150.0, 150.0);
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.open_popup("modal2", anchor, true);
+        });
+
+        let outside_drag_some = std::cell::Cell::new(true);
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some(pos),
+                    primary_just_pressed: true,
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..FrameInput::default()
+            },
+            |(), ui| {
+                let wid = WidgetId::ROOT.child(b"drag");
+                outside_drag_some.set(ui.take_drag_rect_in_rect(wid, bounds).is_some());
+            },
+        );
+        assert!(!outside_drag_some.get(), "modal 下では drag が始まらない");
+    }
+
+    /// `take_double_click_in_rect` も同じく modal anchor 下では double-click を返さない。
+    #[test]
+    fn take_double_click_blocked_under_modal_anchor() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let anchor = Rect { x: 100.0, y: 100.0, w: 200.0, h: 200.0 };
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.open_popup("modal3", anchor, true);
+        });
+
+        // 1st release で last_click 登録、2nd release で double-click 成立する条件を満たすが、
+        // anchor 下なので take_double_click_in_rect は None を返す。
+        host.frame_to_edits(&(), &mut scene, screen, release_at(150.0, 150.0), |(), _ui| {});
+        let observed = std::cell::Cell::new(Some((0.0_f32, 0.0_f32)));
+        host.frame_to_edits(&(), &mut scene, screen, release_at(150.0, 150.0), |(), ui| {
+            observed.set(ui.take_double_click_in_rect(anchor));
+        });
+        assert_eq!(observed.get(), None, "modal 下では double-click は返されない");
     }
 }

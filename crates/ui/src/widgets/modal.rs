@@ -159,7 +159,7 @@ mod tests {
     use std::cell::Cell;
 
     use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey, PhysicalSize};
-    use daw_ui_renderer::Scene;
+    use daw_ui_renderer::{Rect, Scene};
 
     use super::ModalStyle;
     use crate::edit::Edit;
@@ -329,5 +329,83 @@ mod tests {
         });
 
         assert!(on_close_fired.get(), "body 内 close で on_close が呼ばれた");
+    }
+
+    /// daw_01 #015: modal body 内の ✕ ボタンを `button_at_clicked` で実装し、
+    /// click された frame で `close_modal` を呼ぶと on_close が発火し、次フレームで
+    /// `is_modal_open == false` になる回帰テスト。
+    #[test]
+    fn close_button_inside_modal_closes_via_button_at_clicked() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let style = ModalStyle::default();
+        let on_close_fired = std::rc::Rc::new(Cell::new(false));
+
+        // open + 1 frame で anchor を panel_rect に確定 (panel 200x100 を screen 800x600 中央)。
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.open_modal("dlg");
+            ui.modal("dlg", (200.0, 100.0), &style, None, |_ui, _r| {});
+        });
+
+        // panel_rect = (300, 250, 200, 100)、close button rect は panel 右上 (470, 252, 24, 24)。
+        let close_rect = Rect { x: 470.0, y: 252.0, w: 24.0, h: 24.0 };
+        let pos = (482.0, 264.0); // close_rect 中央
+
+        // press
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some(pos),
+                    primary_just_pressed: true,
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..FrameInput::default()
+            },
+            |(), ui| {
+                ui.modal("dlg", (200.0, 100.0), &style, None, |ui, _panel| {
+                    let _ = ui.button_at_clicked("close_x", "x", close_rect);
+                });
+            },
+        );
+
+        // release → button_at_clicked が true → close_modal → on_close 発火
+        let on_close_fired_clone = on_close_fired.clone();
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some(pos),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..FrameInput::default()
+            },
+            |(), ui| {
+                let on_close: Option<Box<dyn FnOnce() -> Edit<()>>> = Some(Box::new(move || {
+                    on_close_fired_clone.set(true);
+                    Edit::mutate(|(): &mut ()| {})
+                }));
+                ui.modal("dlg", (200.0, 100.0), &style, on_close, |ui, _panel| {
+                    if ui.button_at_clicked("close_x", "x", close_rect) {
+                        ui.close_modal("dlg");
+                    }
+                });
+            },
+        );
+
+        assert!(on_close_fired.get(), "close button click で on_close が発火する");
+
+        let still_open = Cell::new(true);
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            still_open.set(ui.is_modal_open("dlg"));
+        });
+        assert!(!still_open.get(), "次フレームで modal が閉じている");
     }
 }
