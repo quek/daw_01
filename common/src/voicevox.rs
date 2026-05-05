@@ -614,4 +614,86 @@ mod tests {
         assert_eq!(entries[1].0, Some(60));
         assert_eq!(entries[3].0, Some(64));
     }
+
+    // ---- split_into_morae --------------------------------------------------
+
+    #[test]
+    fn split_kana_basic() {
+        assert_eq!(split_into_morae("あいうえお"), vec!["あ", "い", "う", "え", "お"]);
+    }
+
+    #[test]
+    fn split_combines_small_kana_with_previous() {
+        // "きゃ" は 1 モーラ
+        assert_eq!(split_into_morae("きゃ"), vec!["きゃ"]);
+        // "しゅんかん" → "しゅ" / "ん" / "か" / "ん"
+        assert_eq!(split_into_morae("しゅんかん"), vec!["しゅ", "ん", "か", "ん"]);
+        // "ちょこ" → "ちょ" / "こ"
+        assert_eq!(split_into_morae("ちょこ"), vec!["ちょ", "こ"]);
+    }
+
+    #[test]
+    fn split_combines_small_katakana() {
+        assert_eq!(split_into_morae("キャラ"), vec!["キャ", "ラ"]);
+    }
+
+    #[test]
+    fn split_handles_sokuon() {
+        // 促音 "っ" は 1 モーラとして扱う前モーラの長音化用、 ただしモーラ単位
+        // としては VOICEVOX 仕様上 "っ" 単体で 1 entry として扱う方が正確
+        // — ここでは「小書き仮名は前と結合」 ルールに従い "ばっ" は 1 モーラ
+        assert_eq!(split_into_morae("ばった"), vec!["ばっ", "た"]);
+    }
+
+    #[test]
+    fn split_empty_string_returns_empty() {
+        assert!(split_into_morae("").is_empty());
+    }
+
+    #[test]
+    fn split_starts_with_small_kana() {
+        // 行頭が小書き仮名の場合は単独で 1 モーラ (前に結合先がない)
+        assert_eq!(split_into_morae("ぁい"), vec!["ぁ", "い"]);
+    }
+
+    #[test]
+    fn split_handles_ascii_passthrough() {
+        // ASCII / 漢字等は 1 char = 1 モーラ
+        assert_eq!(split_into_morae("ab漢字"), vec!["a", "b", "漢", "字"]);
+    }
+}
+
+/// 歌詞テキストをモーラ単位の Vec に分割する。
+///
+/// VOICEVOX sing API は「1 note = 1 モーラ」 を前提とするため、 ユーザー入力
+/// 「あいうえ」 を 4 note に分配する用途や、 入力検証用途に使う。
+///
+/// **ルール**:
+///
+/// - 基本: 1 char = 1 モーラ
+/// - **小書き仮名** (ぁぃぅぇぉ ゃゅょ っ ァィゥェォ ャュョ ッ) は **直前の char と結合**
+///   して 1 モーラ。 例: "きゃ" は 1 モーラ、 "しゅんかん" は 4 モーラ ("しゅ" / "ん"
+///   / "か" / "ん")
+/// - 行頭が小書き仮名 (= 結合先が無い) の場合は単独で 1 モーラ
+/// - ASCII / 漢字 / 空白は 1 char = 1 モーラ (拗音判定はせず passthrough)
+pub fn split_into_morae(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for ch in text.chars() {
+        if is_small_kana(ch) && !out.is_empty() {
+            out.last_mut().unwrap().push(ch);
+        } else {
+            out.push(ch.to_string());
+        }
+    }
+    out
+}
+
+fn is_small_kana(ch: char) -> bool {
+    matches!(
+        ch,
+        // ひらがな小書き
+        'ぁ' | 'ぃ' | 'ぅ' | 'ぇ' | 'ぉ' | 'ゃ' | 'ゅ' | 'ょ' | 'っ' | 'ゎ'
+        // カタカナ小書き
+        | 'ァ' | 'ィ' | 'ゥ' | 'ェ' | 'ォ' | 'ャ' | 'ュ' | 'ョ' | 'ッ' | 'ヮ'
+    )
 }
