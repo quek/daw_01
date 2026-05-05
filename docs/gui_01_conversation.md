@@ -697,14 +697,36 @@ daw_01 は VOICEVOX 歌唱機能を持つ DAW。 各 note に `lyric: Option<Arc
 
 #### 期待挙動
 
-DAW 業界慣習 (Cubase / REAPER / Logic / Cakewalk いずれも同パターン) に揃える:
+VOCALOID / REAPER VOICEVOX script 等の歌唱 DAW 慣習に揃える:
+
 1. piano_roll で note を 1 つ選択 (既存 `Select` request 経由)
-2. **F2** または **Enter** または note rect の **dbl-click** で「歌詞編集モード」 に入る → note rect 内に text_input overlay が出る (既存 lyric があれば prefill、 cursor 末尾、 全選択でも可)
-3. **Enter** で commit → モード解除、 lyric が反映
-4. **Esc** で cancel → モード解除、 lyric は変更前のまま
-5. **Tab** で次の note (start_beat 順、 同 beat なら pitch 高い順) に移動 + 編集モード継続。 **Shift+Tab** で逆順
+2. **L キー**で「歌詞編集モード」 に入る → 該当 note rect 内に text_input overlay が出る (既存 lyric があれば prefill + 全選択)
+3. **Enter で commit + 次の note に自動移動して編集継続**
+   (= 連続入力可能。 commit ごとに `SetLyric` 発行 + 次 note の歌詞を prefill + cursor 全選択)
+4. **Esc** で cancel → モード解除、 直近 commit 以外は反映しない
+5. 「**最後の note**」 で Enter したらモード解除 (or 先頭 note へ wrap せず止まる)
 6. 編集モード中は piano_roll の他の入力 (drag / resize / wheel zoom / rect-select) を抑制
 7. **IME 対応**: text_input_at の preedit / commit 機構をそのまま使い、 CJK モーラ単位入力が成立すること (track rename と同じ)
+
+#### 一括歌詞入力 (重要、 VOICEVOX 用)
+
+**2 モーラ以上を一度に入力したら、 残りモーラを自動的に後続 note に分配する**:
+
+例: 4 つの note (♪♪♪♪) で先頭 note を編集モードにして「**あいうえ**」 と入力 → Enter:
+- note 1 = "あ"
+- note 2 = "い"
+- note 3 = "う"
+- note 4 = "え"
+- (5 note 目以降への入力テキストがあれば自動的に上書き継続、 残 note が無ければ捨てる)
+
+**モーラ分割ルール** (REAPER VOICEVOX script に準拠):
+- 基本 1 char = 1 モーラ
+- **小書きかな** (ぁぃぅぇぉ ゃゅょ っ ァィゥェォ ャュョ ッ) は **直前の char と結合して 1 モーラ**
+  - 例: "きゃ" → 1 モーラ ("き" と "ゃ" は分離しない)
+  - 例: "しゅんかん" → 4 モーラ ("しゅ" / "ん" / "か" / "ん")
+- ASCII / 漢字 / その他はそのまま 1 char = 1 モーラとして扱う (合成境界は CJK 拗音以外は無し)
+
+実装案: `crates/ui/src/widgets/piano_roll.rs` 内に `split_into_morae(text: &str) -> Vec<String>` ヘルパー、 commit 時に分割 → 1 つ目を現 note に、 2 つ目以降を後続 note に順次 SetLyric 発行 + 編集 cursor を最後の対象 note + 1 へ移動。
 
 #### 想定 API (Option C: widget 内蔵案、 daw_01 推奨)
 
@@ -730,13 +752,13 @@ pub struct PianoRollResponse {
 ```
 
 挙動:
-- F2 / Enter / dbl-click 検知は widget 内で処理 → `lyric_editing` を Some(id) に
+- L キー検知は widget 内で処理 (selected.len() == 1 のとき有効) → `lyric_editing` を Some(id) に
 - text_input rect は note 矩形と同じ (or 末尾 right padding)、 font は既存の `lyric_font_px`
-- `text_input_at_focused` を流用 (既存 inline-edit pattern)
-- Enter commit → `NotesEditRequest::SetLyric { id, lyric: Some(text) }` を発行 → `lyric_editing` を None
-- Esc / outside click → `lyric_editing` を None (request は発行しない)
-- Tab / Shift+Tab で次 note へ → `SetLyric` (現値で commit) + 次の `lyric_editing` を立てる
+- `text_input_at_focused` を流用 (既存 inline-edit pattern、 prefill + 全選択)
+- **Enter commit** → text を `split_into_morae` で分割 → 各モーラを順次 `SetLyric { id_n, lyric: Some(morae[n]) }` で発行 (n note 分、 残テキストは捨てる) → `lyric_editing` を「最後に書き込んだ note + 1」 (= 次 note) に移動 + その note の現 lyric を prefill + 全選択。 後続 note が無ければ `lyric_editing = None`
+- **Esc** → `lyric_editing` を None (途中入力テキストは捨てる、 SetLyric 発行なし)
 - 編集 mode 中は existing drag / resize / wheel / rect-select を short-circuit (widget 内のみで完結、 daw_01 側は何もしない)
+- L キーは編集 mode 中は text_input に取られる (日本語入力 IME 経由なら問題なし、 直接 ASCII 入力で "l" が必要なら text_input がそのまま挿入)
 
 #### Option B (fallback): widget は note rect 情報だけ提供、 overlay は daw_01 側
 
@@ -760,15 +782,18 @@ daw_01 側で AppData に `lyric_editing_note: Option<NoteId>` + buffer を持�
 - `AppEvent::SetNoteLyric { clip_ref: ClipRef, note_id: u32, lyric: Option<String> }` 追加
 - `make_edit` で `NotesEditRequest::SetLyric` を上記 AppEvent に変換
 - handler は既存の `set_selected_note_lyric` を参考に、 単一 note 用に書く
-- `is_undoable` に追加 (commit 時 1 度の undo snapshot)
+- `is_undoable` に追加 (commit 時 1 度の undo snapshot — ただし「あいうえ」 一括分配は **1 つの SetLyric ごとに発行 = 4 回 push** になるので、 widget 側で連続発行を 1 batch で送れる variant
+  (`SetLyrics(Vec<(NoteId, Option<String>)>)`) があると undo 単位が綺麗。 1 つの API にまとめても OK)
 - 既存 `AppEvent::SetSelectedNoteLyric` (= 全 selected note に同じ歌詞を一括設定) は別 use case として残す or 廃止
 
 #### 確認したい点
 
 1. Option C (widget 内蔵) で受け入れ可か、 Option B (rect 提供のみ) を希望するか
-2. F2 / Enter / dbl-click のキーバインド集合はこの 3 つで合意できるか (REAPER は F2 のみ、 Cubase は Tab 編集も標準)
-3. Tab / Shift+Tab の next-note 順序は (start_beat 昇順 → 同 beat なら pitch 降順) で OK か
-4. Enter で空文字列 commit したときは `Some("")` のままにする? それとも widget が `None` に変換? (daw_01 側は両方扱える)
+2. **L キー単独**で編集モード起動で問題ないか (selected.len() == 1 のときのみ有効、 選択なし or 複数選択時は no-op)
+3. **next-note 順序**: start_beat 昇順 → 同 beat なら pitch 降順 (高→低) で OK か
+4. **モーラ分割 helper**: `split_into_morae` を gui_01 widget 内に置くべきか、 daw_01 側に置く (= widget は単に「commit text の各 char 単位で分配」 で済ませる) のどちらが良いか。 拗音判定ロジックは小さい (10 数文字の lookup table) ので widget 内蔵でも軽量
+5. **空文字列 commit**: Enter で空のまま commit したときは `Some("")` のままにする? それとも widget が `None` に変換? (daw_01 側は両方扱える)
+6. **一括分配の境界条件**: 残 note 数 < 入力モーラ数のとき余りは捨てる (現案) で OK か、 最後の note に残全部を結合して入れる選択肢もある
 
 ### gui_01 →
 （gui_01 Claude が記入）
