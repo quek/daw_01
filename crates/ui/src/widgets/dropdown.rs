@@ -90,19 +90,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             clip_rect: None,
         });
 
-        // popup_rect = items 全体の rect。anchor は body rect + popup_rect の union で
-        // outside_click 判定が popup の見える範囲全体で行われるようにする。
-        let popup_rect = Rect {
-            x: rect.x,
-            y: rect.y + rect.h,
-            w: rect.w,
-            h: (items.len() as f32) * DROPDOWN_ITEM_H,
-        };
+        // popup_rect は popup_rect_below_or_above で auto-flip + clamp 込み計算
+        // (画面下端で popup がはみ出す場合は上に flip)。 anchor は body rect + popup_rect
+        // の汎用 union で flip 後でも outside_click 判定が両方を「内」 として扱える。
+        let popup_h = (items.len() as f32) * DROPDOWN_ITEM_H;
+        let popup_rect =
+            crate::popup::popup_rect_below_or_above(rect, rect.w, popup_h, self.screen());
+        let union_left = rect.x.min(popup_rect.x);
+        let union_top = rect.y.min(popup_rect.y);
         let anchor = Rect {
-            x: rect.x.min(popup_rect.x),
-            y: rect.y.min(popup_rect.y),
-            w: rect.w.max(popup_rect.w),
-            h: (rect.y + rect.h + popup_rect.h) - rect.y,
+            x: union_left,
+            y: union_top,
+            w: (rect.x + rect.w).max(popup_rect.x + popup_rect.w) - union_left,
+            h: (rect.y + rect.h).max(popup_rect.y + popup_rect.h) - union_top,
         };
 
         // 2. クリックで popup toggle (click は consume して下層に流さない)

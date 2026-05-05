@@ -231,14 +231,16 @@ impl<'b, 'a, M: ?Sized + 'static> MenuBarBuilder<'b, 'a, M> {
         let menu_id = ("menu_bar_top", label);
         let already_open = self.ui.is_popup_open(menu_id);
 
-        // popup_rect = entries 全体を含む rect。
+        // popup_rect = entries 全体を含む rect。 auto-flip + clamp は
+        // popup_rect_below_or_above 任せ (画面下端 / 右端で安全)。
         let n = builder.entries.len();
-        let popup_rect = Rect {
-            x: label_rect.x,
-            y: label_rect.y + label_rect.h,
-            w: MENU_W_DEFAULT,
-            h: (n as f32) * MENU_ITEM_H,
-        };
+        let popup_h = (n as f32) * MENU_ITEM_H;
+        let popup_rect = crate::popup::popup_rect_below_or_above(
+            label_rect,
+            MENU_W_DEFAULT,
+            popup_h,
+            self.ui.screen(),
+        );
         let anchor = union_rect(label_rect, popup_rect);
 
         // クリックで popup を toggle (click は consume)
@@ -494,17 +496,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let menu_id = ("context_menu", rect.x.to_bits(), rect.y.to_bits());
         let n = items.len();
 
-        // 右クリック検出 → popup を開く (anchor は items 全体の rect で固定 = popup の見える範囲)
+        // 右クリック検出 → popup を開く (anchor は items 全体の rect = popup の見える範囲)。
+        // popup_rect_clamped_at で画面下端 / 右端の clamp 込み (flip しない、 DAW 標準)。
         if pointer.secondary_just_pressed
             && let Some((px, py)) = pointer.pos
             && rect.contains(px, py)
         {
-            let anchor = Rect {
-                x: px,
-                y: py,
-                w: MENU_W_DEFAULT,
-                h: (n as f32) * MENU_ITEM_H,
-            };
+            let popup_h = (n as f32) * MENU_ITEM_H;
+            let anchor = crate::popup::popup_rect_clamped_at(
+                (px, py),
+                MENU_W_DEFAULT,
+                popup_h,
+                self.screen(),
+            );
             self.open_popup(menu_id, anchor, true);
         }
 
