@@ -7,6 +7,10 @@
           {
             "type": "command",
             "command": "bash F:/dev/gui_01/.claude/hooks/session_start_daw01_open.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash F:/dev/gui_01/.claude/hooks/sessionstart_show_pending_reflections.sh"
           }
         ]
       }
@@ -18,6 +22,17 @@
           {
             "type": "command",
             "command": "bash F:/dev/gui_01/.claude/hooks/pretooluse_git_commit_review_reminder.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash F:/dev/gui_01/.claude/hooks/stop_session_reflect.sh"
           }
         ]
       }
