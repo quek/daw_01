@@ -39,7 +39,7 @@ A5 lyric UI     (gui_01 #015、 A1 の前提)
 
 ### 既知の残 bug
 
-1. **プラグインセレクターの ✕ ボタンが効かない**: gui_01 widget レベル。 `docs/gui_01_conversation.md` に投げる候補。
+(現時点で blocking なものは無し。 transport の text_input が numpad Enter で commit しない件は gui_01 #016 で対応依頼中、 main Enter で代替可能。)
 
 優先順序の根拠:
 - **A2 完了**: track-parallel スレッドプール + MMCSS / thread_check / assert_no_alloc 稼働
@@ -267,4 +267,5 @@ A5 lyric UI     (gui_01 #015、 A1 の前提)
 | 2026-05-05 | e8b3d6e | A3 完了 | GUI で File→Export WAV / Ctrl+E / status bar 復活。 audio pipe を read/write 双方向化し、 export 完了通知を ChildToMain::ExportWavComplete で daw_gui へ。 SetRenderMode(Offline/Realtime) bookend で plugin に CLAP render hint |
 | 2026-05-05 | 469acd7 | A3 smoke fix | smoke test で発見した 3 件 (Play/Stop/SetLoop の plugin_host 重複送信、 Ctrl+E shortcut 漏れ、 メーター peak の publish 漏れ) を修正 |
 | 2026-05-05 | 02fe061 | A7 完了 | plugin ロード race の同期化: AppData::pending_plugin_loads + track_pending_load helper で SetSlotPlugin 送信時に再生中なら自動 Stop、 全 SlotPluginLoaded 受信完了で自動 Play 再開 |
-| 2026-05-05 | (this commit) | A6 完了 | transport bar に BPM / time_sig 編集 UI: text_input + dropdown、 commit で song 更新 + LoadSong 再送 + Undo/Redo 対応。 numpad Enter 不対応は gui_01 #016 で対応依頼 |
+| 2026-05-05 | 77cc7c5 | A6 完了 | transport bar に BPM / time_sig 編集 UI: text_input + dropdown、 commit で song 更新 + LoadSong 再送 + Undo/Redo 対応。 numpad Enter 不対応は gui_01 #016 で対応依頼 |
+| 2026-05-05 | (this commit) | gui_01 #015 解決 | gui_01 M14 Phase 56 (button_at_clicked + take_*_in_rect の modal 透過抑制) を取り込み、 plugin_picker.rs の ✕ ボタンを button_at_clicked + close_modal に置換。 ✕ click / wheel scroll / Esc / outside click 全 expected。 plan.md 既知 bug クリア |

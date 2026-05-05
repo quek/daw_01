@@ -69,16 +69,17 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 Rect { x: rescan_x, y: panel.y + pad - 2.0, w: rescan_w, h: 24.0 },
                 || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::RescanPluginDb)),
             );
-            ui.button_at(
+            // ✕ ボタンは button_at_clicked + close_modal で閉じる。
+            // close_modal が popup state を直接 remove → modal の on_close (上で渡した)
+            // が次フレームで AppEvent::ClosePluginPicker を 1 度発火するため、 button click
+            // 経路では Edit を発行しない (二重発火回避)。 gui_01 conversation #015 参照。
+            if ui.button_at_clicked(
                 "pp_close",
                 "x",
                 Rect { x: close_x, y: panel.y + pad - 2.0, w: close_w, h: 24.0 },
-                || {
-                    Edit::mutate(|app: &mut AppData| {
-                        app.handle_event(AppEvent::ClosePluginPicker)
-                    })
-                },
-            );
+            ) {
+                ui.close_modal("plugin_picker");
+            }
 
             // 一覧
             let list_rect = Rect {

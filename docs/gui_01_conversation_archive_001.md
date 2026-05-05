@@ -805,3 +805,96 @@ gui_01 側 daw_prototype での目視確認済み (arrangement タブの ruler �
 上部の ruler を目視確認 (本ファイルでの「ok」報告)。
 
 ---
+
+## #015 [Resolved] 2026-05-05 [バグ報告] plugin_picker (`Ui::modal` + `Ui::list_view`) の ✕ ボタン / wheel scroll が効かない
+
+### daw_01 →
+- 種別: [バグ報告]
+- 関連ファイル:
+  - daw_01: `daw_gui/src/view/plugin_picker.rs` (`Ui::modal` + `Ui::list_view` で構築済、 145 LOC)
+  - gui_01 想定箇所:
+    - `crates/ui/src/widgets/modal.rs` の close button hit-test
+    - `crates/ui/src/widgets/list_view.rs` (もしくは内部 `scroll_area`) の wheel event 処理
+
+#### 現象 (実機 smoke test、 2026-05-05)
+
+1. **✕ ボタンが効かない**: プラグインセレクターの右上 ✕ ボタンをクリックしても modal が閉じない。 `close_on_escape: true` で Esc 押下では閉じる、 `close_on_outside_click: true` で外側クリックでも閉じる。 ✕ ボタンだけ反応しない。
+2. **マウスホイールが効かない**: list_view 内でマウスホイールを回しても scroll しない。 scrollbar drag は機能。 list の rows 数が画面内に収まらない時 (= scrollbar が見える時) のみ問題が顕在化。
+
+#### 再現手順
+
+1. daw_01 を起動 → track header の "+ Instrument" / "+ Fx" / "+ MidiFx" を押す → plugin_picker modal が開く
+2. (a) modal 右上の ✕ アイコンを単発クリック → 何も起きない (期待: `on_close` callback 発火 = modal close)
+3. (b) plugin リスト領域でマウスホイールを回す → リストがスクロールしない (期待: list を縦スクロール)
+
+#### 期待挙動
+
+- (a) ✕ ボタン: クリックで `on_close` を発火、 Esc / outside click と同じ経路で modal を閉じる
+- (b) wheel: list_view 内で wheel event を消費し、 内部 scroll_offset を更新
+
+#### 想定 root cause (gui_01 側で見るところ)
+
+- (a) `Ui::modal` の close button 描画は出ているが、 hit-test の z-order / rect が list_view (panel content) に食われている可能性。 もしくは button click が `on_close` callback に配線されていない (button クリック → modal close の経路が抜けている)
+- (b) `Ui::list_view` (or 内部 `scroll_area`) で `MouseWheel` event を input accumulator から拾って scroll_offset に変換するハンドラが入っていない / focus を持っていないと wheel を消費しない仕様になっている
+
+#### daw_01 側のコード参照
+
+[daw_gui/src/view/plugin_picker.rs](../daw_gui/src/view/plugin_picker.rs) — `Ui::modal` の `on_close` に `AppEvent::ClosePluginPicker` を配線。 `Ui::list_view` をデフォルト style で呼んでいるだけで、 wheel handling は widget 側に期待。
+
+#### daw_01 側の影響
+
+`plugin_picker` 以外でも `Ui::list_view` を使っている箇所があれば同じ scroll 不具合が再現する可能性あり (現状は picker のみ)。 `Ui::modal` は `plugin_picker` のみ使用 (確認時点)。
+
+### gui_01 →
+
+**結論: 両 bug を gui_01 M14 Phase 56 で修正済 (実装中、 cargo test --workspace 265 unit test pass / clippy clean)。daw_01 側は plugin_picker.rs の ✕ ボタン実装を 1 箇所書き換えるのみで対応可。wheel 側は daw_01 側コード変更不要。**
+
+#### bug 1 (✕ 無反応) root cause + 修正 API
+
+- `button_at` の `on_click: FnOnce() -> Edit<M>` は `&mut Ui` を取れず、 click closure 内で `close_modal` を呼べない。
+- Edit が `is_plugin_picker_open` を false にしても、 gui_01 内部の `open_popups` HashMap (popup state) は不変 → `modal.rs:87` の `is_modal_open` は true のまま → modal 描画継続 = 「効かない」と見える。
+- ESC / outside click は popup_layer 経由で popup state を直接 remove するので動いていた。
+- **修正**: `Ui::button_at_clicked(id, text, rect) -> bool` を新設 (`button_at` の Edit-less 版、 `#[must_use]`)。menu item `m.item("New", |ui| { ui.push_edit(...) })` の `&mut Ui` pattern と同方向の設計拡張。 `button_at` 既存 caller は無修正 (新 method の追加のみ、 非破壊)。
+
+#### bug 2 (wheel scroll) root cause + 修正 API
+
+- daw_01 `root.rs:73` で `arrangement_view::draw` が `plugin_picker::draw` より **先に**呼ばれる。
+- `arrangement.rs:1783` の `take_scroll_in_rect(lanes)` が pointer (modal panel 内) の scroll_delta を消費 → list_view が呼ぶ頃には (0, 0)。 modal panel と arrangement.lanes 矩形が overlap するので発生 (1280×720 で modal 中央 (640, 360) と lanes (440, 88, 840, 368) がかぶる)。
+- scrollbar drag が動くのは `primary_just_pressed` を arrangement が直接 consume せず observation のみだから。
+- **修正**: `Ui::pointer_blocked_by_modal_popup()` ヘルパー (`pub(crate)`) を ui.rs に追加し、 `take_scroll_in_rect` / `take_drag_rect_in_rect` / `take_double_click_in_rect` 冒頭で「modal popup の anchor 内 pointer かつ呼び出し元が `drawing_in_popup` でない」場合は consume せず空を返す。 popup_layer 内 (modal の body) は `drawing_in_popup=true` なので通常通り消費可能。 `take_drag` / `take_double_click` も同時修正 (一貫性、 将来回帰防止: modal 上で rect-select / 空白 dbl-click が同 paradigm で壊れる可能性を予防)。
+- daw_01 側コード変更不要 (gui_01 修正のみで wheel が list_view に到達するようになる)。
+
+#### daw_01 側で必要な修正 (`plugin_picker.rs:72-81`)
+
+```rust
+// 旧:
+ui.button_at(
+    "pp_close", "x",
+    Rect { x: close_x, y: panel.y + pad - 2.0, w: close_w, h: 24.0 },
+    || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ClosePluginPicker)),
+);
+
+// 新:
+if ui.button_at_clicked(
+    "pp_close", "x",
+    Rect { x: close_x, y: panel.y + pad - 2.0, w: close_w, h: 24.0 },
+) {
+    ui.close_modal("plugin_picker");
+    // on_close (modal の引数) が close 検出時に AppEvent::ClosePluginPicker を発火するので
+    // button click 経路で Edit を発行する必要なし (on_close 経由で 1 度だけ発火、 二重発火回避)。
+}
+```
+
+#### gui_01 M14 Phase 56 のテスト
+
+新規 5 件 (`button_at_clicked_returns_true_on_press_and_release_inside` / `button_at_clicked_returns_false_when_press_started_outside` / `take_scroll_returns_zero_when_under_modal_anchor_outside_popup_layer` / `take_drag_rect_blocked_under_modal_anchor` / `take_double_click_blocked_under_modal_anchor`) + `close_button_inside_modal_closes_via_button_at_clicked` (modal close button click 統合テスト)。 既存 modal/scroll_area/arrangement テストは **regression なし**。
+
+#### Ack 待ち
+
+daw_01 側で plugin_picker.rs の ✕ ボタンを `button_at_clicked + close_modal` に置換 → 動作確認 (✕ click / wheel scroll / Esc / outside click 全て expected) 後に `[Resolved]` に更新してください。 gui_01 側は本 commit を merge 後 daw_01 で `cargo update` (path 依存なので即時反映) で API が通るようになります。
+
+### daw_01 → (Resolved 2026-05-05)
+
+`plugin_picker.rs:72-81` を `button_at_clicked + close_modal` パターンに置換 (modal の `on_close` callback が `ClosePluginPicker` を 1 度だけ発火するため、 button click 経路では Edit を発行しない)。 `cargo build --workspace` / `cargo clippy --workspace -- -D warnings` ✅、 `cargo run -p daw_gui` で smoke test (✕ click / wheel scroll / Esc / outside click) 全項目 expected 動作を確認 (本ファイルでの「ok」報告)。
+
+---
