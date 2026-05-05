@@ -172,6 +172,13 @@ pub struct AppData {
     pub track_rename_idx: Option<u32>,
     pub track_rename_text: String,
 
+    /// Transport BPM 入力欄の編集中文字列。 commit (Enter) で parse + clamp +
+    /// `song.bpm` に反映、 song を切り替える際 (open / new / undo / redo) は
+    /// `resync_song_edit_texts` で formatted な現値に書き戻す。
+    pub bpm_edit_text: String,
+    /// Transport time_sig numerator 入力欄の編集中文字列。 同上。
+    pub time_sig_num_edit_text: String,
+
     pub undo_stack: VecDeque<Song>,
     pub redo_stack: VecDeque<Song>,
 
@@ -209,6 +216,8 @@ impl AppData {
             ..Song::default()
         };
         let initial_peak_display = vec![(0.0, 0.0); song.tracks.len()];
+        let initial_bpm = song.bpm;
+        let initial_time_sig_num = song.time_sig.0;
         let plugin_picker_entries = plugin_db
             .as_ref()
             .map(|db| {
@@ -275,6 +284,8 @@ impl AppData {
             status_message: String::new(),
             track_rename_idx: None,
             track_rename_text: String::new(),
+            bpm_edit_text: format!("{initial_bpm:.1}"),
+            time_sig_num_edit_text: initial_time_sig_num.to_string(),
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             is_help_open: false,
@@ -290,10 +301,6 @@ impl AppData {
     }
 
     // -------- Derived snapshots (毎フレーム計算; cache が必要なら view 側で持つ) -----
-
-    pub fn bpm(&self) -> f32 {
-        self.song.bpm
-    }
 
     pub fn track_mix(&self) -> Vec<TrackMixEntry> {
         self.song
@@ -447,6 +454,7 @@ impl AppData {
         }
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
+        self.resync_song_edit_texts();
         self.pianoroll_notes_generation += 1;
     }
 
@@ -470,6 +478,9 @@ impl AppData {
                 | AppEvent::QuantizeSelectedNotes(_)
                 | AppEvent::SelectPluginFromDb(_)
                 | AppEvent::RemoveSlot { .. }
+                | AppEvent::CommitBpmEdit
+                | AppEvent::CommitTimeSigNumEdit
+                | AppEvent::SetSongTimeSigDenominator(_)
         )
     }
 
@@ -613,6 +624,18 @@ pub enum AppEvent {
     Stop,
     PlayToggle,
     ToggleLoop,
+    /// Transport BPM 入力欄の文字列が変わった (commit ではなく途中入力)。
+    /// Undo 対象外。
+    BpmEditChanged(String),
+    /// BPM 入力欄で Enter (commit)。 parse + clamp(1.0..=400.0) + Song.bpm 反映 +
+    /// `bpm_edit_text` を formatted な現値に書き戻す。 Undo 対象。
+    CommitBpmEdit,
+    /// time_sig numerator 入力欄の文字列が変わった。 Undo 対象外。
+    TimeSigNumEditChanged(String),
+    /// numerator 入力欄で Enter (commit)。 parse + clamp(1..=32) + 反映。 Undo 対象。
+    CommitTimeSigNumEdit,
+    /// time_sig denominator dropdown で選択された (2/4/8/16 のみ valid)。 Undo 対象。
+    SetSongTimeSigDenominator(u8),
     Undo,
     Redo,
     PushUndoSnapshot,
@@ -756,6 +779,21 @@ impl AppData {
             }
             AppEvent::ToggleLoop => {
                 self.toggle_loop();
+            }
+            AppEvent::BpmEditChanged(s) => {
+                self.bpm_edit_text = s;
+            }
+            AppEvent::CommitBpmEdit => {
+                self.commit_bpm_edit();
+            }
+            AppEvent::TimeSigNumEditChanged(s) => {
+                self.time_sig_num_edit_text = s;
+            }
+            AppEvent::CommitTimeSigNumEdit => {
+                self.commit_time_sig_num_edit();
+            }
+            AppEvent::SetSongTimeSigDenominator(den) => {
+                self.set_song_time_sig_denominator(den);
             }
             AppEvent::Undo => self.undo(),
             AppEvent::Redo => self.redo(),
@@ -1029,6 +1067,7 @@ impl AppData {
         self.selected_notes.clear();
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
+        self.resync_song_edit_texts();
         tracing::info!("new project");
     }
 
@@ -1055,6 +1094,7 @@ impl AppData {
                 self.selected_notes.clear();
                 self.resize_track_peak_display();
                 self.sync_song_to_plugin_host();
+                self.resync_song_edit_texts();
                 self.is_dirty = false;
                 self.push_recent(path);
             }
@@ -2159,6 +2199,52 @@ impl AppData {
         self.peak_r_display = new_r;
         self.peak_l_norm = common::meter::db_to_norm(common::meter::linear_to_db(new_l));
         self.peak_r_norm = common::meter::db_to_norm(common::meter::linear_to_db(new_r));
+    }
+
+    /// BPM 入力欄を Enter で commit。 parse 成功なら 1.0..=400.0 に clamp して
+    /// `song.bpm` に反映、 parse 失敗なら現値を維持。 どちらも edit_text を
+    /// formatted な現値 (`"{:.1}"`) に書き戻して表示を整える。
+    fn commit_bpm_edit(&mut self) {
+        if let Ok(v) = self.bpm_edit_text.trim().parse::<f32>() {
+            let clamped = v.clamp(1.0, 400.0);
+            if (self.song.bpm - clamped).abs() > f32::EPSILON {
+                self.song.bpm = clamped;
+                self.sync_song_to_plugin_host();
+            }
+        }
+        self.bpm_edit_text = format!("{:.1}", self.song.bpm);
+    }
+
+    /// time_sig numerator 入力欄を Enter で commit。 parse 成功なら 1..=32 に
+    /// clamp、 失敗なら現値維持。 edit_text は現値の string 表現に書き戻す。
+    fn commit_time_sig_num_edit(&mut self) {
+        if let Ok(v) = self.time_sig_num_edit_text.trim().parse::<u8>() {
+            let clamped = v.clamp(1, 32);
+            if self.song.time_sig.0 != clamped {
+                self.song.time_sig.0 = clamped;
+                self.sync_song_to_plugin_host();
+            }
+        }
+        self.time_sig_num_edit_text = self.song.time_sig.0.to_string();
+    }
+
+    /// time_sig denominator dropdown で選択された値を反映。 2/4/8/16 以外は無視。
+    fn set_song_time_sig_denominator(&mut self, den: u8) {
+        if !matches!(den, 2 | 4 | 8 | 16) {
+            tracing::warn!(den, "ignoring invalid time_sig denominator");
+            return;
+        }
+        if self.song.time_sig.1 != den {
+            self.song.time_sig.1 = den;
+            self.sync_song_to_plugin_host();
+        }
+    }
+
+    /// `self.song` が外部要因 (open / new / undo / redo / autosave 復元 etc.) で
+    /// 差し替わった後に、 transport 入力欄の表示文字列を現値に書き戻す。
+    fn resync_song_edit_texts(&mut self) {
+        self.bpm_edit_text = format!("{:.1}", self.song.bpm);
+        self.time_sig_num_edit_text = self.song.time_sig.0.to_string();
     }
 
     fn set_master_gain(&mut self, gain: f32) {

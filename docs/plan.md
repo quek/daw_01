@@ -32,8 +32,8 @@ DESIGN.md M1 残項目を 6 タスクに分解。`docs/plan_<feature>.md` への
 ```
 A2 (完了 ✓) ─→ A3 WAV export (完了 ✓) ─→ A7 plugin load 同期 (完了 ✓) ─┬─→ A1 VOICEVOX ─→ M1 完成
                                                                          │
-A6 tempo/timesig (← 次タスク、独立、軽量)
-A4 autosave     (独立、軽量)
+A6 tempo/timesig (完了 ✓)
+A4 autosave     (← 次タスク、独立、軽量)
 A5 lyric UI     (gui_01 #015、 A1 の前提)
 ```
 
@@ -45,8 +45,8 @@ A5 lyric UI     (gui_01 #015、 A1 の前提)
 - **A2 完了**: track-parallel スレッドプール + MMCSS / thread_check / assert_no_alloc 稼働
 - **A3 完了**: freewheel offline render + CLAP render ext で WAV export 復旧 (5 PR + smoke fix、 plan_a3_wav_export.md 参照)
 - **A7 完了**: plugin ロード race condition の同期化 (plan_a7_plugin_load_sync.md 参照)
-- **A6 が次** (推奨): tempo / time_sig 変更 UI、 独立かつ軽量
-- **A4** は A6 後 (独立で軽量、 autosave + 起動時復元)
+- **A6 完了**: transport に BPM / time_sig 編集 UI を追加 (plan_a6_tempo_timesig.md 参照)
+- **A4 が次** (独立で軽量、 autosave + 起動時復元)
 - **A5** は gui_01 改修先行 (#015)。reply 待ちの間 A1 の Engine / HTTP 周りを進める
 - **A1** は A5 完了後に本格実装
 
@@ -67,25 +67,20 @@ A5 lyric UI     (gui_01 #015、 A1 の前提)
 
 **未完: WAV export** — A2 残タスクとしてあったが、daw_audio 側 LocalState 共有設計が大規模変更のため A3 で本格実装に切り出し。本フェーズでは plugin_host の旧 export_wav_offline + GUI Export メニューを削除のみ (機能は一時停止状態で A3 まで持ち越し)。
 
-### A6: tempo / time_sig 変更 UI [優先度 2 — 独立 / 軽量]
+### A6: tempo / time_sig 変更 UI [完了]
 
-**現状**: `Song { bpm, time_sig }` schema 完備、#014 で ruler/grid も連動済み。**変更 UI が無い**。
+詳細は [docs/plan_a6_tempo_timesig.md](plan_a6_tempo_timesig.md)。
 
-**やること**:
-1. transport に BPM number_input (1.0..400.0) を追加
-2. transport に time_sig 用 (numerator: 1..32, denominator: 2/4/8/16 dropdown) を追加
-3. `AppEvent::SetSongBpm(f32)` / `SetSongTimeSig(u8, u8)` 追加
-4. `handle_event` で `song.bpm` / `song.time_sig` を更新 + plugin_host に `LoadSong` を送り直す (既存パスに乗る)
-5. undoable history 対象とする
+**完了内容 (build / clippy / test --features rt-assert all clean、 ユーザー smoke test OK)**:
 
-**主な変更ファイル**:
-- [daw_gui/src/view/transport.rs](daw_gui/src/view/transport.rs)
-- [daw_gui/src/app.rs](daw_gui/src/app.rs)
+- transport bar に BPM `text_input` (1.0..=400.0 clamp、 commit で audio engine に LoadSong 再送)
+- 同じく time_sig numerator `text_input` (1..=32 clamp) と denominator `dropdown` (2/4/8/16)
+- AppData に `bpm_edit_text` / `time_sig_num_edit_text` 編集 buffer、 `AppEvent::BpmEditChanged` / `CommitBpmEdit` / `TimeSigNumEditChanged` / `CommitTimeSigNumEdit` / `SetSongTimeSigDenominator` を追加
+- commit 系 3 種を `is_undoable` に登録 → handle_event 冒頭の `push_undo_snapshot` で自動 undo 対応
+- `resync_song_edit_texts` helper で song 差し替え時 (after_undo_redo / action_new / action_open_path) に表示 buffer を現値に書き戻す
+- 再生テンポは sequencer の `samples_per_beat = sample_rate * 60 / song.bpm` (sequencer.rs:71) が ArcSwap publish された Song を毎フレーム参照 → 変更が次フレームから即時反映
 
-**受け入れ基準**:
-- transport から BPM 変更 → ruler/grid + 再生テンポが追従
-- time_sig 変更 → bar 線位置が変化
-- Undo/Redo で変更を巻き戻せる
+**スコープ外 (M2 範囲)**: CLAP/VST3 plugin への transport / tempo 通知 (`clap_event_transport_t`)、 tempo automation、 拍子 automation、 bar 番号 offset。
 
 ### A4: autosave + 起動時復元 [優先度 3 — 独立 / 軽量]
 
@@ -272,3 +267,4 @@ A5 lyric UI     (gui_01 #015、 A1 の前提)
 | 2026-05-05 | e8b3d6e | A3 完了 | GUI で File→Export WAV / Ctrl+E / status bar 復活。 audio pipe を read/write 双方向化し、 export 完了通知を ChildToMain::ExportWavComplete で daw_gui へ。 SetRenderMode(Offline/Realtime) bookend で plugin に CLAP render hint |
 | 2026-05-05 | 469acd7 | A3 smoke fix | smoke test で発見した 3 件 (Play/Stop/SetLoop の plugin_host 重複送信、 Ctrl+E shortcut 漏れ、 メーター peak の publish 漏れ) を修正 |
 | 2026-05-05 | 02fe061 | A7 完了 | plugin ロード race の同期化: AppData::pending_plugin_loads + track_pending_load helper で SetSlotPlugin 送信時に再生中なら自動 Stop、 全 SlotPluginLoaded 受信完了で自動 Play 再開 |
+| 2026-05-05 | (this commit) | A6 完了 | transport bar に BPM / time_sig 編集 UI: text_input + dropdown、 commit で song 更新 + LoadSong 再送 + Undo/Redo 対応。 numpad Enter 不対応は gui_01 #016 で対応依頼 |
