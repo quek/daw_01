@@ -153,6 +153,16 @@ pub struct AppData {
     // -------- Mixer --------
     pub track_peak_display: Vec<(f32, f32)>,
 
+    // -------- Plugin load tracking (A7 race-condition fix) -----------
+    /// `(track, slot)` pairs we've sent `SetSlotPlugin` for but haven't
+    /// yet received `SlotPluginLoaded` back. While non-empty, Play is
+    /// queued so the audio engine doesn't dispatch silent buffers for
+    /// tracks whose plugins are still being loaded.
+    pub pending_plugin_loads: std::collections::HashSet<(u32, PluginSlot)>,
+    /// `play()` was called while `pending_plugin_loads` was non-empty;
+    /// re-fire it once the last `SlotPluginLoaded` arrives.
+    pub pending_play: bool,
+
     // -------- Background workers --------
     pub synth_result: Arc<Mutex<Vec<common::voicevox::SynthResult>>>,
     pub rescan_result: Arc<Mutex<Option<PluginDatabase>>>,
@@ -257,6 +267,8 @@ impl AppData {
             #[cfg(windows)]
             plugin_host_windows: HashMap::new(),
             track_peak_display: initial_peak_display,
+            pending_plugin_loads: std::collections::HashSet::new(),
+            pending_play: false,
             synth_result: Arc::new(Mutex::new(Vec::new())),
             rescan_result: Arc::new(Mutex::new(None)),
             is_rescanning: false,
@@ -1122,6 +1134,7 @@ impl AppData {
                 tracing::error!(id = %inst.plugin_id, track, ?slot, "plugin id not in database");
                 continue;
             };
+            self.track_pending_load(track, slot);
             self.send_plugin(MainToChild::SetSlotPlugin {
                 track,
                 slot,
@@ -1210,10 +1223,45 @@ impl AppData {
     // -------- Playback -----------------------------------------------------
 
     fn play(&mut self) {
+        // A7: if any plugin is still in the SetSlotPlugin →
+        // SlotPluginLoaded round-trip (its `OpenPluginShmem` may not
+        // have reached the audio engine yet), queue the Play so every
+        // track starts on the same buffer once registration completes.
+        // Without this the just-loaded tracks render silent for the
+        // first few buffers / first loop.
+        if !self.pending_plugin_loads.is_empty() {
+            self.pending_play = true;
+            self.status_message = format!(
+                "プラグイン読み込み中... (残 {})",
+                self.pending_plugin_loads.len()
+            );
+            return;
+        }
         let song = self.song.clone();
         self.send_audio(MainToChild::LoadSong(song));
         self.send_audio(MainToChild::Play);
         self.is_playing = true;
+    }
+
+    /// A7: register a `(track, slot)` we just sent `SetSlotPlugin` for,
+    /// and — if playback is currently running — pause it until the last
+    /// `SlotPluginLoaded` arrives. Without the pause, plugins loaded
+    /// while playing render silent until the audio engine's
+    /// `OpenPluginShmem` register catches up (typically several buffers
+    /// or a loop wrap behind).
+    fn track_pending_load(&mut self, track: u32, slot: PluginSlot) {
+        if self.pending_plugin_loads.is_empty() && self.is_playing {
+            self.send_audio(MainToChild::Stop);
+            self.is_playing = false;
+            self.pending_play = true;
+        }
+        self.pending_plugin_loads.insert((track, slot));
+        if self.pending_play {
+            self.status_message = format!(
+                "プラグイン読み込み中... (残 {})",
+                self.pending_plugin_loads.len()
+            );
+        }
     }
 
     fn stop(&mut self) {
@@ -1915,6 +1963,20 @@ impl AppData {
                 }
             }
         }
+
+        // A7: this load is done. If Play was queued waiting for the
+        // last plugin to register on the audio side, fire it now.
+        self.pending_plugin_loads.remove(&(track, slot));
+        if self.pending_plugin_loads.is_empty() && self.pending_play {
+            self.pending_play = false;
+            self.status_message.clear();
+            self.play();
+        } else if !self.pending_plugin_loads.is_empty() && self.pending_play {
+            self.status_message = format!(
+                "プラグイン読み込み中... (残 {})",
+                self.pending_plugin_loads.len()
+            );
+        }
     }
 
     fn toggle_slot_gui(&mut self, slot_kind: u8, slot_index: u32) {
@@ -2144,6 +2206,7 @@ impl AppData {
                 PluginSlot::MidiFx(next)
             }
         };
+        self.track_pending_load(track_idx, dest_slot);
         self.send_plugin(MainToChild::SetSlotPlugin {
             track: track_idx,
             slot: dest_slot,
