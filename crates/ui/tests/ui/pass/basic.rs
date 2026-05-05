@@ -169,6 +169,7 @@ fn main() {
                     NotesEditRequest::Move(_) => Edit::mutate(|_m: &mut Model| {}),
                     NotesEditRequest::Resize(_) => Edit::mutate(|_m: &mut Model| {}),
                     NotesEditRequest::Select { .. } => Edit::mutate(|_m: &mut Model| {}),
+                    NotesEditRequest::SetLyrics(_) => Edit::mutate(|_m: &mut Model| {}),
                 },
             );
             // M9 Phase 45e: arrangement widget が non-Clone Model でコンパイルする。

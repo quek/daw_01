@@ -160,6 +160,11 @@ pub enum NotesEditRequest {
     Resize(Vec<ResizeDelta>),
     /// rect select (Shift+drag、加算) または click で selection を更新。Undoable。
     Select { prev: Vec<NoteId>, next: Vec<NoteId> },
+    /// (M14 Phase 59 / daw_01 #017) note 群の lyric を一括更新。
+    /// 1 commit = 1 Edit = 1 undo 単位 (歌詞 inline 編集 + モーラ単位での次 note 自動分配を
+    /// 1 つの undo にまとめる)。`lyric == None` で歌詞削除 (空文字列 commit は widget 内で
+    /// `None` に正規化済)。`Vec` の順序は分配順 (start_beat asc → 同 beat なら pitch desc)。
+    SetLyrics(Vec<(NoteId, Option<String>)>),
 }
 
 /// `Ui::piano_roll` の戻り値。app 側で connection / hover state の表示に使う。
@@ -182,6 +187,14 @@ pub struct PianoRollResponse {
     pub selection_changed: bool,
     /// drag<16px の short click の grid 上 (beat: f64, pitch: f32) (snap 前)。Insert 等の代替起点に使える。
     pub clicked_at_beat_pitch: Option<(f64, f32)>,
+    /// (M14 Phase 59 / daw_01 #017) 歌詞編集 mode 中の note id。`Some(_)` のとき
+    /// piano_roll 内に text_input overlay が出ており、drag/resize/wheel/click は全て
+    /// 短絡 (`dragging` 等は同時に None になる)。app 側で「他 UI grey-out」「Ctrl+Z 抑制」
+    /// 等の判断に使える (typing_focus による global shortcut 抑制は `text_input_at` が自動)。
+    pub lyric_editing: Option<NoteId>,
+    /// (M14 Phase 59 / daw_01 #017) 直近 commit frame で「note 数より入力モーラが多くて
+    /// 捨てた数」。0 なら通常、`>0` なら daw_01 で status bar / toast 表示等に使える。
+    pub lyric_overflow_morae: usize,
 }
 
 /// velocity → fill Color の関数。`fn` pointer (closure 不可、Style: Copy 維持のため)。
@@ -217,9 +230,22 @@ pub struct PianoRollStyle {
     pub c_label_color: Color,
     pub c_label_font_px: f32,
     /// M9 Phase 44c: note 上に重ねて描画する歌詞 (lyric) の色とフォントサイズ。
-    /// `Note.lyric == Some(...)` のとき note rect 上端に label 描画。
+    /// `Note.lyric == Some(...)` のとき note rect 内に label 描画 (vertical center)。
+    /// **(M14 Phase 59)** `lyric_font_px` は **MAX cap** として解釈される。 実 font_size は
+    /// `(note_h * 0.75).clamp(7.0, lyric_font_px)` で note の高さに連動する (zoom in / out で
+    /// 自動スケール、 daw_01 #017 動作確認で「9px 固定だと小さすぎる」 指摘から)。
     pub lyric_color: Color,
     pub lyric_font_px: f32,
+    /// (M14 Phase 59 / daw_01 #017) 歌詞編集モード起動 shortcut name。
+    /// `Some(name)` のとき `take_shortcut(name)` を 1 frame 1 度監視し、起動条件
+    /// (`selected.len() == 1` かつ `lyric_editing == None`) を満たせば編集モードに入る。
+    /// `None` で機能完全無効 (text_input overlay も出ない)。
+    ///
+    /// 既定値 `Some("piano_roll.edit_lyric")`。caller 側で
+    /// `host.shortcut_map_mut().bind("piano_roll.edit_lyric", "L")` を 1 度呼ぶ。
+    /// `with_default_bindings()` には**含めない** (修飾なし `L` は他文脈で別意味になりうる
+    /// ため caller opt-in 方針)。
+    pub lyric_edit_shortcut: Option<&'static str>,
     /// (M9 Phase 45c) playhead 線の色。`PianoRollView::playhead_beat == Some(_)` のときのみ使用。
     pub playhead_color: Color,
     /// (M9 Phase 45c) playhead 線の幅 (px)。bar_line と紛れない程度に太くする。
@@ -272,7 +298,11 @@ impl Default for PianoRollStyle {
             velocity_bar_color: Color::rgb(0.50, 0.65, 0.85),
             velocity_bar_width_px: 3.0,
             lyric_color: Color::rgb(0.10, 0.10, 0.15),
-            lyric_font_px: 9.0,
+            // M14 Phase 59: MAX cap (実 font_size = note_h * 0.75 で note 高さスケール)。
+            // 旧 9.0 固定 → 24.0 max にして zoom in 時の readable 化。
+            lyric_font_px: 24.0,
+            // M14 Phase 59 / daw_01 #017: 歌詞編集 (L キー) shortcut。caller が `bind("L")` する想定。
+            lyric_edit_shortcut: Some("piano_roll.edit_lyric"),
             // M13 Phase 55: ruler 領域 (`view.ruler_h > 0` のときのみ描画)
             ruler_bg: Color::rgb(0.13, 0.14, 0.17),
             ruler_label_color: Color::rgb(0.85, 0.88, 0.92),
@@ -426,6 +456,80 @@ pub fn is_black_key(pitch: u8) -> bool {
     matches!(pitch % 12, 1 | 3 | 6 | 8 | 10)
 }
 
+/// 日本語テキストをモーラ単位で分割する (歌唱合成用)。
+///
+/// `Ui::piano_roll` の歌詞 inline 編集 (M14 Phase 59 / daw_01 #017) が「`Enter` で
+/// commit text を分割して次 note へ自動分配」するために使う公開 helper。daw_01 以外
+/// (将来のボーカルエディタ等) でも再利用可。
+///
+/// # 分割ルール (REAPER VOICEVOX script に準拠)
+///
+/// - 基本: 1 char = 1 モーラ
+/// - **小書きかな** (`ぁぃぅぇぉ ゃゅょ っ ゎ ァィゥェォ ャュョ ッ ヮ`) は **直前の char と結合**。
+///   - 例: `"きゃ"` → 1 モーラ (`["きゃ"]`)
+///   - 例: `"しゅんかん"` → 4 モーラ (`["しゅ", "ん", "か", "ん"]`)
+/// - 連続小書きは結合先 char に積まれる (`"きゃっ"` → `["きゃっ"]`)
+/// - 先頭 char が小書きかなの場合は単独 1 モーラ (defensive、通常入力では発生しない)
+/// - ASCII / 漢字 / その他はそのまま 1 char = 1 モーラ
+///
+/// # 例
+///
+/// ```
+/// use daw_ui_core::split_into_morae;
+/// assert_eq!(split_into_morae("あいうえ"), vec!["あ", "い", "う", "え"]);
+/// assert_eq!(split_into_morae("しゅんかん"), vec!["しゅ", "ん", "か", "ん"]);
+/// assert_eq!(split_into_morae(""), Vec::<String>::new());
+/// ```
+#[must_use]
+pub fn split_into_morae(text: &str) -> Vec<String> {
+    const SMALL_KANA: &[char] = &[
+        'ぁ', 'ぃ', 'ぅ', 'ぇ', 'ぉ', 'ゃ', 'ゅ', 'ょ', 'っ', 'ゎ', 'ァ', 'ィ', 'ゥ', 'ェ', 'ォ',
+        'ャ', 'ュ', 'ョ', 'ッ', 'ヮ',
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for c in text.chars() {
+        if SMALL_KANA.contains(&c)
+            && let Some(last) = out.last_mut()
+        {
+            last.push(c);
+        } else {
+            out.push(c.to_string());
+        }
+    }
+    out
+}
+
+/// `from_id` を起点に、(start_beat asc → 同 beat なら pitch desc) 順で `count` 個の
+/// 後続 note id を返す (起点 note 自身を `out[0]` に含む)。
+///
+/// `Ui::piano_roll` の歌詞 inline 編集 (M14 Phase 59 / daw_01 #017) が「Enter で commit
+/// したモーラを起点 note + 後続 note に順次分配」するために使う内部 helper。
+///
+/// - `from_id` が見つからなければ空 Vec
+/// - 後続 note が `count - 1` 個に満たなければ Vec の長さは `count` より小さくなる
+/// - 順序は (start_beat asc, pitch desc): 同拍なら **高 pitch が先** (歌唱メロディと整合、
+///   高い音を先に拾う)
+///
+/// `notes` が start_beat 昇順ソート済前提でも、同 beat 内の pitch 順までは保証されないため
+/// 関数内で安定 sort をかける。
+fn collect_next_notes_for_lyric(notes: &[Note], from_id: NoteId, count: usize) -> Vec<NoteId> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut sorted: Vec<&Note> = notes.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.start_beat
+            .partial_cmp(&b.start_beat)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            // pitch desc (高 pitch を先に)
+            .then(b.pitch.cmp(&a.pitch))
+    });
+    let Some(pos) = sorted.iter().position(|n| n.id == from_id) else {
+        return Vec::new();
+    };
+    sorted[pos..].iter().take(count).map(|n| n.id).collect()
+}
+
 // ============================================================
 // Internal state (widget 内部のみ、`pub(crate)`)
 // ============================================================
@@ -453,6 +557,12 @@ struct NoteDragSession {
 pub(crate) struct PianoRollState {
     /// note drag (Move / ResizeLeft / ResizeRight) の anchor。drag release で None に戻す。
     note_drag: Option<NoteDragSession>,
+    /// (M14 Phase 59 / daw_01 #017) 歌詞編集中の note id (text_input overlay 表示中)。
+    /// L キー検知で `Some(selected[0])` に遷移 (`selected.len() == 1` のときのみ)、
+    /// Enter で 1) commit + 分配 → 2) 次 note へ移動 or `None` 復帰、Esc で `None`、
+    /// 編集対象 note が消失したら defensive で `None`。`Some(_)` のとき drag/resize/wheel/click
+    /// は全て短絡 (typing_focus が立つので global shortcut も自動抑制)。
+    lyric_editing: Option<NoteId>,
 }
 
 // ============================================================
@@ -556,6 +666,52 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let wid = WidgetId::ROOT.child((b"piano_roll_widget", &id));
         let pointer = self.pointer;
 
+        // ===== M14 Phase 59 / daw_01 #017: 歌詞 inline 編集 mode =====
+        // Frame 開始時、lyric_editing が selected と sync しているか defensive check。
+        // 編集対象 note が消失したら自動で None に戻す (note 削除等のため)。
+        let mut lyric_editing: Option<NoteId> = {
+            let state: &mut PianoRollState = self.widget_state(wid);
+            if let Some(eid) = state.lyric_editing
+                && !notes.iter().any(|n| n.id == eid)
+            {
+                state.lyric_editing = None;
+            }
+            state.lyric_editing
+        };
+        // L キー検知: lyric_editing == None かつ selected.len() == 1 のときのみ起動。
+        // `"piano_roll.edit_lyric"` は `is_typing_only_shortcut` に追加済 (M14 Phase 59)。
+        // 編集中 (typing_focus = true) は shortcut layer を素通りして text_input に届く
+        // (= `'l'` 文字としてタイプ可能)。take_shortcut は frame 頭の typing_lock 判定後
+        // pending_shortcuts に積まれた name を引くので、編集中は false を返す。
+        if lyric_editing.is_none()
+            && let Some(name) = style.lyric_edit_shortcut
+            && self.take_shortcut(name)
+            && selected.len() == 1
+        {
+            lyric_editing = Some(selected[0]);
+            // 編集モードに入る瞬間、stale な note_drag セッションを clear (drag 中に L
+            // を押した稀なケース対策)。
+            let state: &mut PianoRollState = self.widget_state(wid);
+            state.lyric_editing = lyric_editing;
+            state.note_drag = None;
+        }
+        // Esc 検知: 編集モード中の Esc は "escape" shortcut が global で consume するため
+        // text_input の自前 Esc ハンドラ経由ではなく piano_roll が明示的に handle する
+        // (= take_shortcut("escape") で消費 → lyric_editing = None で即時 cancel)。
+        // これで「編集中の Esc → 1 frame で完全 cancel」を保証 (text_input の blur 検出
+        // 経路 (resp.focused = false) は外 click 等の defensive fallback として残す)。
+        if let Some(edit_id_for_esc) = lyric_editing
+            && self.take_shortcut("escape")
+        {
+            // text_input の focus を明示的に clear (text_input id は ("piano_roll_lyric", edit_id))
+            let ti_wid =
+                WidgetId::ROOT.child((b"text_input", &("piano_roll_lyric", edit_id_for_esc)));
+            self.clear_focus_if_focused(ti_wid);
+            lyric_editing = None;
+            self.widget_state::<PianoRollState>(wid).lyric_editing = None;
+        }
+        let editing_mode = lyric_editing.is_some();
+
         // grid / keyboard / velocity lane / ruler レイアウト
         // M13 Phase 55: rect の top から `ruler_h` 分を ruler 領域、その下に main_h
         // (= keyboard + grid)、最下段に vel_h (velocity lane)。`ruler_h = 0.0` で旧互換。
@@ -594,7 +750,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // ----- press 振り分け (state 更新) -----
         // Shift+drag は take_drag_rect_in_rect が drag state を握るので、ここでは
         // 「Shift なし note hit」だけ widget が drag を始める。
-        let just_pressed_on_note = pointer.primary_just_pressed
+        // M14 Phase 59: editing_mode 中は drag/click を全短絡。
+        let just_pressed_on_note = !editing_mode
+            && pointer.primary_just_pressed
             && !pointer.modifiers.shift
             && pointer.pos.is_some_and(|(px, py)| grid.contains(px, py));
 
@@ -709,8 +867,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // ----- pending click 判定 -----
         // 2 通り: (a) drag が起こらなかった pure release、(b) drag は始まったが <16px で
         // click に格下げされた release。どちらも grid 上の click として selection 切替の
-        // trigger に使う。
-        let pending_click: Option<(f32, f32)> = if drag_release.is_some() {
+        // trigger に使う。M14 Phase 59: editing_mode 中は click を発火しない。
+        let pending_click: Option<(f32, f32)> = if editing_mode || drag_release.is_some() {
             None
         } else if let Some(p) = drag_short_click_pos {
             Some(p)
@@ -775,6 +933,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // selected は heavy 内 borrow 不可なので Vec を所有権渡しで closure に取り込む
         let selected_set: HashSet<NoteId> = selected.iter().copied().collect();
         let drag_overlay_clone = drag_overlay.clone();
+        let lyric_editing_for_draw = lyric_editing;
 
         self.heavy(("piano_roll_inner", &id), move |hctx| {
             // === cached(): viewport_key 一致時に skip される背景レイヤ ===
@@ -803,8 +962,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     grid,
                     style_copy.note_fill_fn,
                     style_copy.note_border_radius_px,
-                    style_copy.lyric_color,
-                    style_copy.lyric_font_px,
                 );
                 // M9 Phase 45c: velocity lane (vel_h > 0 のとき内蔵描画)
                 if vel_h > 0.0 {
@@ -812,8 +969,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 }
             });
 
-            // === cached の外: 動的 overlay (selection / drag preview / cursor / playhead) ===
-            // selection overlay
+            // === cached の外: 動的 overlay (selection / drag preview / lyric / cursor / playhead) ===
+            // selection overlay (note の上、lyric の下)
             if !selected_set.is_empty() {
                 draw_selection_overlay(
                     hctx,
@@ -828,6 +985,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             if let Some((nd, bd, pd)) = drag_overlay_clone {
                 draw_drag_preview(hctx, &nd, view_copy, grid, &style_copy, bd, pd);
             }
+            // M14 Phase 59: lyric 描画 (selection overlay より後 = 黄色 fill に隠れない、
+            // 編集中 note は text_input overlay に譲る)。 font_size は note 高さスケール。
+            draw_lyrics(
+                hctx,
+                &visible_owned,
+                view_copy,
+                grid,
+                style_copy.lyric_color,
+                style_copy.lyric_font_px,
+                lyric_editing_for_draw,
+            );
             // M9 Phase 45c: playhead 線 (time で動くので cache 対象外、毎フレーム描画)。
             // 範囲外なら描画スキップ。grid と vel_area を縦断する 1 本。
             if let Some(b) = view_copy.playhead_beat
@@ -850,7 +1018,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         });
 
         // ----- shortcut: Insert (note 追加) / Delete (selected 削除) -----
-        if self.take_shortcut("add_note")
+        // M14 Phase 59: editing_mode 中は global shortcut が typing_focus で抑制される
+        // ため take_shortcut は false を返すはずだが、defensive で明示 guard。
+        if !editing_mode
+            && self.take_shortcut("add_note")
             && let Some((cx, cy)) = pointer.pos
             && grid.contains(cx, cy)
         {
@@ -872,7 +1043,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.push_edit(make_edit(NotesEditRequest::Add(vec![new_note])));
         }
 
-        if self.take_shortcut("delete") && !selected.is_empty() {
+        if !editing_mode && self.take_shortcut("delete") && !selected.is_empty() {
             let sel_set: HashSet<NoteId> = selected.iter().copied().collect();
             let to_delete: Vec<Note> =
                 notes.iter().filter(|n| sel_set.contains(&n.id)).cloned().collect();
@@ -996,7 +1167,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             state.drag_start.is_some()
         };
         let shift_press = pointer.primary_just_pressed && pointer.modifiers.shift;
-        if (shift_press || shift_rect_active)
+        // M14 Phase 59: editing_mode 中は Shift+drag rect select も短絡。
+        if !editing_mode
+            && (shift_press || shift_rect_active)
             && let Some(drag) = self.take_drag_rect_in_rect(drag_rect_wid, grid)
         {
             response.rect_select_active = true;
@@ -1023,6 +1196,108 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 }
             }
         }
+
+        // ===== M14 Phase 59 / daw_01 #017: 歌詞 inline 編集 overlay (text_input + commit dispatch) =====
+        // lyric_editing が Some なら、編集対象 note の rect 内に text_input を重ね描きし、
+        // Enter / NumpadEnter で commit text を `split_into_morae` で分割 → 後続 note へ
+        // 1 SetLyrics Edit (1 undo) で分配。Esc は text_input が focus clear → 次 frame で
+        // resp.focused == false 検出 → lyric_editing = None (2 frame で UX 完了)。
+        if let Some(edit_id) = lyric_editing {
+            // borrow conflict 回避: 必要なデータを先にコピーしてから self.text_input を呼ぶ。
+            let edit_data = notes.iter().find(|n| n.id == edit_id).map(|n| {
+                let raw_rect = note_to_rect(n, view, grid);
+                let prefill = n.lyric.as_deref().unwrap_or("").to_string();
+                (raw_rect, prefill)
+            });
+            if let Some((raw_rect, prefill)) = edit_data {
+                // grid 内に clip (note rect が grid 外にはみ出している場合)
+                let clipped_x = raw_rect.x.max(grid.x);
+                let clipped_y = raw_rect.y.max(grid.y);
+                let clipped_w = (raw_rect.x + raw_rect.w).min(grid.x + grid.w) - clipped_x;
+                let clipped_h = (raw_rect.y + raw_rect.h).min(grid.y + grid.h) - clipped_y;
+                // M14 Phase 59: text_input overlay の最小表示サイズ (8 px)。 旧 `style.lyric_font_px`
+                // を threshold にしていたが、 lyric_font_px が MAX cap になったため固定値に変更
+                // (text_input は font_size 14 px 既定で 8 px 高あれば最低限読める)。
+                if clipped_w < 8.0 || clipped_h < 8.0 {
+                    // 表示できないほど小さい (zoom out 過多 etc) → 編集モード解除
+                    self.widget_state::<PianoRollState>(wid).lyric_editing = None;
+                    lyric_editing = None;
+                } else {
+                    let clipped = Rect {
+                        x: clipped_x,
+                        y: clipped_y,
+                        w: clipped_w,
+                        h: clipped_h,
+                    };
+                    // text_input_at_focused: id に edit_id を含めることで note 切替時に
+                    // widget id が変化 → was_widget_visible_last_frame == false → 自動 focus +
+                    // 全選択 (gained_focus 検知経由)。
+                    let resp = self.text_input_at_focused(
+                        ("piano_roll_lyric", edit_id),
+                        clipped,
+                        &prefill,
+                        // on_change は per-keystroke で呼ばれるが、ここでは何もしない
+                        // (commit 検出で 1 度だけ SetLyrics 発行 = 1 undo)。
+                        |_new_text| Edit::mutate(|_: &mut M| {}),
+                    );
+
+                    if resp.committed {
+                        let committed_text = resp.committed_text.unwrap_or_default();
+                        let morae: Vec<String> = if committed_text.is_empty() {
+                            // 空文字 commit → 起点 note の歌詞を None に (= 削除)
+                            Vec::new()
+                        } else {
+                            split_into_morae(&committed_text)
+                        };
+                        // 起点 note の歌詞 update count: 空入力は 1 (起点を None に)、
+                        // それ以外は morae.len() 個分の連続 note を取る。
+                        let target_count = morae.len().max(1);
+                        let target_ids =
+                            collect_next_notes_for_lyric(notes, edit_id, target_count);
+                        let mut updates: Vec<(NoteId, Option<String>)> =
+                            Vec::with_capacity(target_ids.len());
+                        for (i, nid) in target_ids.iter().enumerate() {
+                            let lyric = morae.get(i).cloned().filter(|s| !s.is_empty());
+                            updates.push((*nid, lyric));
+                        }
+                        // 余り (overflow) を Response に載せる (note 数 < 入力モーラ数の場合)。
+                        response.lyric_overflow_morae =
+                            morae.len().saturating_sub(target_ids.len());
+                        if !updates.is_empty() {
+                            self.push_edit(make_edit(NotesEditRequest::SetLyrics(updates)));
+                        }
+                        // 次 note へ移動 (= 分配し終わった先の note id、無ければ None)
+                        let all_sorted =
+                            collect_next_notes_for_lyric(notes, edit_id, usize::MAX);
+                        let next_id = all_sorted.get(target_ids.len()).copied();
+                        self.widget_state::<PianoRollState>(wid).lyric_editing = next_id;
+                        lyric_editing = next_id;
+                        // selection も自動追従 (daw_01 UI が同期、note 強調が次 note へ)
+                        if let Some(nid) = next_id
+                            && selected != [nid].as_slice()
+                        {
+                            let prev = selected.to_vec();
+                            self.push_edit(make_edit(NotesEditRequest::Select {
+                                prev,
+                                next: vec![nid],
+                            }));
+                            response.selection_changed = true;
+                        }
+                    } else if !resp.focused {
+                        // Esc 検出 (or 外 click による blur): text_input が
+                        // clear_focus_if_focused → 次 frame で resp.focused = false。
+                        self.widget_state::<PianoRollState>(wid).lyric_editing = None;
+                        lyric_editing = None;
+                    }
+                }
+            } else {
+                // defensive: notes に edit_id が無い (フレーム頭の sync check で本来 None
+                // にしているので通常起こらない)
+                self.widget_state::<PianoRollState>(wid).lyric_editing = None;
+                lyric_editing = None;
+            }
+        }
+        response.lyric_editing = lyric_editing;
 
         response
     }
@@ -1139,8 +1414,6 @@ fn draw_notes<M: ?Sized + 'static>(
     grid: Rect,
     note_fill_fn: NoteFillFn,
     radius_px: f32,
-    lyric_color: Color,
-    lyric_font_px: f32,
 ) {
     for note in visible {
         let r = note_to_rect(note, view, grid);
@@ -1158,21 +1431,62 @@ fn draw_notes<M: ?Sized + 'static>(
             h: y_bot - y_top,
         };
         hctx.push_rect(note_rect_command(clipped, note_fill_fn(note.velocity), radius_px));
-        // M9 Phase 44c: lyric を note rect 内左端に描画 (note の高さが font 1 行に届くとき)。
-        if let Some(lyric) = note.lyric.as_ref()
-            && clipped.h >= lyric_font_px + 1.0
-            && clipped.w >= lyric_font_px
-        {
-            hctx.push_text(GlyphArea {
-                text: lyric.clone(),
-                left: clipped.x + 1.0,
-                top: clipped.y,
-                font_size: lyric_font_px,
-                line_height: lyric_font_px * 1.1,
-                color: lyric_color,
-                clip_rect: Some(clipped),
-            });
+    }
+}
+
+/// (M14 Phase 59) note 上に歌詞を描画する独立 pass。 selection overlay / drag preview の
+/// **後** に呼んで lyric を最前面に置く (旧設計では cached 内 draw_notes 内で描いていたため
+/// selection の黄色 fill に覆われていた、 daw_01 #017 動作確認で発覚)。
+///
+/// font_size は note rect の高さに連動 (`note_h * 0.7` を `lyric_font_px_max` で cap)。
+/// 縦方向中央寄せで note 内に収める。 lyric_editing 中の note は text_input overlay が
+/// 出ているので skip (= 編集中歌詞は text_input 内で表示される)。
+fn draw_lyrics<M: ?Sized + 'static>(
+    hctx: &mut crate::widgets::heavy::HeavyCtx<'_, '_, M>,
+    visible: &[Note],
+    view: PianoRollView,
+    grid: Rect,
+    lyric_color: Color,
+    lyric_font_px_max: f32,
+    skip_note_id: Option<NoteId>,
+) {
+    for note in visible {
+        if Some(note.id) == skip_note_id {
+            continue;
         }
+        let Some(lyric) = note.lyric.as_ref() else {
+            continue;
+        };
+        let r = note_to_rect(note, view, grid);
+        let x_left = r.x.max(grid.x);
+        let x_right = (r.x + r.w).min(grid.x + grid.w);
+        let y_top = r.y.max(grid.y);
+        let y_bot = (r.y + r.h).min(grid.y + grid.h);
+        if x_right <= x_left || y_bot <= y_top {
+            continue;
+        }
+        let clipped = Rect {
+            x: x_left,
+            y: y_top,
+            w: x_right - x_left,
+            h: y_bot - y_top,
+        };
+        // note 高さに比例した font (cap = lyric_font_px_max)、 最低 7px 以上で描画。
+        let font_size = (clipped.h * 0.75).clamp(7.0, lyric_font_px_max);
+        if clipped.h < font_size + 1.0 || clipped.w < font_size {
+            continue;
+        }
+        // 縦方向中央寄せ: top = clipped.y + (clipped.h - font_size) / 2
+        let top = clipped.y + ((clipped.h - font_size) * 0.5).max(0.0);
+        hctx.push_text(GlyphArea {
+            text: lyric.clone(),
+            left: clipped.x + 2.0,
+            top,
+            font_size,
+            line_height: font_size * 1.1,
+            color: lyric_color,
+            clip_rect: Some(clipped),
+        });
     }
 }
 
@@ -1521,6 +1835,114 @@ mod tests {
         assert!(!is_black_key(4)); // E
     }
 
+    // -------- M14 Phase 59 / daw_01 #017: split_into_morae unit tests --------
+
+    #[test]
+    fn split_into_morae_single_char() {
+        assert_eq!(split_into_morae("あ"), vec!["あ"]);
+    }
+
+    #[test]
+    fn split_into_morae_basic_distribution() {
+        assert_eq!(split_into_morae("あいうえ"), vec!["あ", "い", "う", "え"]);
+    }
+
+    #[test]
+    fn split_into_morae_combines_yo() {
+        assert_eq!(split_into_morae("きゃ"), vec!["きゃ"]);
+    }
+
+    #[test]
+    fn split_into_morae_combines_tsu() {
+        // "ぱっと" = ぱ + っ (結合) + と → 2 モーラ
+        assert_eq!(split_into_morae("ぱっと"), vec!["ぱっ", "と"]);
+    }
+
+    #[test]
+    fn split_into_morae_consecutive_small_kana() {
+        // "きゃっ" = き + ゃ (結合) + っ (続けて結合) → 1 モーラ
+        assert_eq!(split_into_morae("きゃっ"), vec!["きゃっ"]);
+    }
+
+    #[test]
+    fn split_into_morae_leading_small_kana_defensive() {
+        // 先頭小書きは defensive で単独 1 モーラ (通常入力では発生しない)
+        assert_eq!(split_into_morae("ぁい"), vec!["ぁ", "い"]);
+    }
+
+    #[test]
+    fn split_into_morae_empty() {
+        assert_eq!(split_into_morae(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn split_into_morae_long_kana() {
+        // "しゅんかんいどう" = しゅ / ん / か / ん / い / ど / う → 7 モーラ
+        assert_eq!(
+            split_into_morae("しゅんかんいどう"),
+            vec!["しゅ", "ん", "か", "ん", "い", "ど", "う"]
+        );
+    }
+
+    #[test]
+    fn split_into_morae_ascii_one_per_char() {
+        assert_eq!(split_into_morae("abc"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn split_into_morae_katakana_yo() {
+        // カタカナの拗音も同様に結合
+        assert_eq!(split_into_morae("シュン"), vec!["シュ", "ン"]);
+    }
+
+    // -------- M14 Phase 59 / daw_01 #017: collect_next_notes_for_lyric unit tests --------
+
+    #[test]
+    fn collect_next_notes_returns_self_first() {
+        let notes = vec![note(10, 0.0, 1.0, 60), note(20, 1.0, 1.0, 60), note(30, 2.0, 1.0, 60)];
+        let result = collect_next_notes_for_lyric(&notes, 10, 2);
+        assert_eq!(result, vec![10, 20]);
+    }
+
+    #[test]
+    fn collect_next_notes_sorted_by_start_beat() {
+        // notes が start_beat ソート前提だが、関数内で sort を保証
+        let notes = vec![note(10, 0.0, 1.0, 60), note(20, 1.0, 1.0, 60), note(30, 2.0, 1.0, 60)];
+        let result = collect_next_notes_for_lyric(&notes, 10, 3);
+        assert_eq!(result, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn collect_next_notes_same_beat_pitch_desc() {
+        // 同 start_beat なら高 pitch が先 (歌詞編集モードで「高音先取り」が歌唱メロディと整合)
+        let notes = vec![note(10, 0.0, 1.0, 60), note(20, 0.0, 1.0, 72), note(30, 1.0, 1.0, 60)];
+        // 起点 = id 20 (pitch 72、start_beat 0.0)
+        // sorted: 20 (0.0, 72) → 10 (0.0, 60) → 30 (1.0, 60)
+        let result = collect_next_notes_for_lyric(&notes, 20, 3);
+        assert_eq!(result, vec![20, 10, 30]);
+    }
+
+    #[test]
+    fn collect_next_notes_truncates_when_count_exceeds() {
+        let notes = vec![note(10, 0.0, 1.0, 60), note(20, 1.0, 1.0, 60)];
+        let result = collect_next_notes_for_lyric(&notes, 10, 5);
+        assert_eq!(result, vec![10, 20], "残数が count より少ないとき truncate");
+    }
+
+    #[test]
+    fn collect_next_notes_empty_when_id_not_found() {
+        let notes = vec![note(10, 0.0, 1.0, 60)];
+        let result = collect_next_notes_for_lyric(&notes, 999, 3);
+        assert_eq!(result, Vec::<NoteId>::new());
+    }
+
+    #[test]
+    fn collect_next_notes_zero_count() {
+        let notes = vec![note(10, 0.0, 1.0, 60), note(20, 1.0, 1.0, 60)];
+        let result = collect_next_notes_for_lyric(&notes, 10, 0);
+        assert_eq!(result, Vec::<NoteId>::new());
+    }
+
     // -------- Widget integration tests --------
 
     /// 簡易テスト Model (no-Clone 不変条件: Clone/Default/Hash 不要)。
@@ -1530,6 +1952,8 @@ mod tests {
         last_request: Option<RequestKind>,
         last_select_prev: Option<Vec<NoteId>>,
         last_select_next: Option<Vec<NoteId>>,
+        /// (M14 Phase 59) 最後に発行された `SetLyrics` の内容。
+        last_set_lyrics: Option<Vec<(NoteId, Option<String>)>>,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1539,6 +1963,7 @@ mod tests {
         Move,
         Resize,
         Select,
+        SetLyrics,
     }
 
     impl TestModel {
@@ -1549,6 +1974,7 @@ mod tests {
                 last_request: None,
                 last_select_prev: None,
                 last_select_next: None,
+                last_set_lyrics: None,
             }
         }
     }
@@ -1579,6 +2005,19 @@ mod tests {
                         m.last_select_prev = Some(prev_clone.clone());
                         m.last_select_next = Some(next_clone.clone());
                         m.selected.clone_from(&next_clone);
+                    })
+                }
+                NotesEditRequest::SetLyrics(updates) => {
+                    let updates_clone = updates.clone();
+                    Edit::mutate(move |m: &mut TestModel| {
+                        m.last_request = Some(RequestKind::SetLyrics);
+                        // 実際の Model 反映 (歌詞を Note.lyric に書き戻す)
+                        for (id, lyric) in &updates_clone {
+                            if let Some(n) = m.notes.iter_mut().find(|n| n.id == *id) {
+                                n.lyric = lyric.as_deref().map(Arc::from);
+                            }
+                        }
+                        m.last_set_lyrics = Some(updates_clone.clone());
                     })
                 }
             }
@@ -2330,6 +2769,632 @@ mod tests {
             captured.lock().unwrap().is_empty(),
             "widget 外では set_cursor を呼ばない: actual={:?}",
             *captured.lock().unwrap()
+        );
+    }
+
+    // ============================================================
+    // M14 Phase 59 / daw_01 #017: 歌詞 inline 編集 widget integration tests
+    // ============================================================
+
+    fn key_l() -> KeyEvent {
+        KeyEvent {
+            state: ElementState::Pressed,
+            text: None,
+            physical_key: PhysicalKey::Char('L'),
+        }
+    }
+
+    /// 文字 `c` (ASCII alphabet) と挿入 text を持つ KeyEvent を作る。
+    /// `text` は IME 経由でも user 直接 type でも text_input.rs が `ev.text` を見るので
+    /// 多バイト文字 (例: "あ") も渡せる。
+    fn key_typing(c: char, text: &str) -> KeyEvent {
+        KeyEvent {
+            state: ElementState::Pressed,
+            text: Some(text.to_string()),
+            physical_key: PhysicalKey::Char(c.to_ascii_uppercase()),
+        }
+    }
+
+    fn key_enter() -> KeyEvent {
+        KeyEvent {
+            state: ElementState::Pressed,
+            text: None,
+            physical_key: PhysicalKey::Enter,
+        }
+    }
+
+    fn key_esc() -> KeyEvent {
+        KeyEvent {
+            state: ElementState::Pressed,
+            text: None,
+            physical_key: PhysicalKey::Escape,
+        }
+    }
+
+    fn setup_lyric_test_host() -> UiHost<TestModel> {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        host.shortcut_map_mut().bind("piano_roll.edit_lyric", "L");
+        host
+    }
+
+    /// 共通の piano_roll 呼び出し (rect 800x400 / kbd_w=0)。
+    fn run_lyric_frame(
+        host: &mut UiHost<TestModel>,
+        model: &mut TestModel,
+        input: FrameInput,
+        view: PianoRollView,
+        style: &PianoRollStyle,
+        on_resp: impl FnOnce(&PianoRollResponse),
+    ) {
+        let sel = model.selected.clone();
+        let notes_clone = model.notes.clone();
+        let resp_cell: std::cell::RefCell<Option<PianoRollResponse>> =
+            std::cell::RefCell::new(None);
+        run_frame(host, model, input, |ui| {
+            let dispatch = make_dispatch();
+            let resp = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone,
+                view,
+                &sel,
+                style,
+                dispatch,
+            );
+            *resp_cell.borrow_mut() = Some(resp);
+        });
+        on_resp(resp_cell.borrow().as_ref().expect("resp captured"));
+    }
+
+    /// L キー + selected.len() == 1 → lyric_editing = Some(selected[0])、Edit 発行なし。
+    #[test]
+    fn lyric_edit_l_key_enters_mode_when_single_selected() {
+        let mut host = setup_lyric_test_host();
+        let mut model = TestModel::new(vec![note(0, 1.0, 1.0, 60)]);
+        model.selected = vec![0];
+        let view = test_view();
+        let style = PianoRollStyle::default();
+
+        let input = FrameInput { keyboard: vec![key_l()], ..Default::default() };
+        let mut got_lyric_editing = None;
+        run_lyric_frame(&mut host, &mut model, input, view, &style, |resp| {
+            got_lyric_editing = resp.lyric_editing;
+        });
+        assert_eq!(got_lyric_editing, Some(0));
+        assert_eq!(model.last_request, None, "L で mode 入っただけ、Edit 発行なし");
+    }
+
+    #[test]
+    fn lyric_edit_l_key_noop_when_zero_selected() {
+        let mut host = setup_lyric_test_host();
+        let mut model = TestModel::new(vec![note(0, 1.0, 1.0, 60)]);
+        model.selected = vec![]; // 選択なし
+        let view = test_view();
+        let style = PianoRollStyle::default();
+
+        let input = FrameInput { keyboard: vec![key_l()], ..Default::default() };
+        let mut got_lyric_editing = Some(0);
+        run_lyric_frame(&mut host, &mut model, input, view, &style, |resp| {
+            got_lyric_editing = resp.lyric_editing;
+        });
+        assert_eq!(got_lyric_editing, None);
+    }
+
+    #[test]
+    fn lyric_edit_l_key_noop_when_multi_selected() {
+        let mut host = setup_lyric_test_host();
+        let mut model = TestModel::new(vec![
+            note(0, 1.0, 1.0, 60),
+            note(1, 2.0, 1.0, 60),
+        ]);
+        model.selected = vec![0, 1]; // 複数選択
+        let view = test_view();
+        let style = PianoRollStyle::default();
+
+        let input = FrameInput { keyboard: vec![key_l()], ..Default::default() };
+        let mut got_lyric_editing = Some(0);
+        run_lyric_frame(&mut host, &mut model, input, view, &style, |resp| {
+            got_lyric_editing = resp.lyric_editing;
+        });
+        assert_eq!(got_lyric_editing, None);
+    }
+
+    #[test]
+    fn lyric_edit_disabled_via_style_none() {
+        let mut host = setup_lyric_test_host();
+        let mut model = TestModel::new(vec![note(0, 1.0, 1.0, 60)]);
+        model.selected = vec![0];
+        let view = test_view();
+        let style = PianoRollStyle {
+            lyric_edit_shortcut: None, // 無効化
+            ..PianoRollStyle::default()
+        };
+
+        let input = FrameInput { keyboard: vec![key_l()], ..Default::default() };
+        let mut got_lyric_editing = Some(0);
+        run_lyric_frame(&mut host, &mut model, input, view, &style, |resp| {
+            got_lyric_editing = resp.lyric_editing;
+        });
+        assert_eq!(got_lyric_editing, None, "style.lyric_edit_shortcut=None なら L で起動しない");
+    }
+
+    /// 1 note のみ → "a" + Enter → SetLyrics 発行 + lyric_editing = None。
+    /// Frame 1: L → enter mode
+    /// Frame 2: type "a" + Enter → commit + clear (no next note)
+    #[test]
+    fn lyric_edit_enter_commits_single_note_and_clears() {
+        let mut host = setup_lyric_test_host();
+        let mut model = TestModel::new(vec![note(0, 1.0, 1.0, 60)]);
+        model.selected = vec![0];
+        let view = test_view();
+        let style = PianoRollStyle::default();
+
+        // Frame 1: L
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput { keyboard: vec![key_l()], ..Default::default() },
+            view,
+            &style,
+            |_| {},
+        );
+
+        // Frame 2: 'a' + Enter
+        let mut got_lyric_editing = Some(0);
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput {
+                keyboard: vec![key_typing('a', "a"), key_enter()],
+                ..Default::default()
+            },
+            view,
+            &style,
+            |resp| got_lyric_editing = resp.lyric_editing,
+        );
+        assert_eq!(model.last_request, Some(RequestKind::SetLyrics));
+        assert_eq!(model.last_set_lyrics, Some(vec![(0u32, Some("a".to_string()))]));
+        assert_eq!(got_lyric_editing, None, "次 note 無し → mode 解除");
+    }
+
+    /// 4 notes 同 pitch → "abcd" + Enter → 各 note に 1 char ずつ分配 (start_beat 順)。
+    #[test]
+    fn lyric_edit_enter_distributes_morae_to_next_notes() {
+        let mut host = setup_lyric_test_host();
+        let mut model = TestModel::new(vec![
+            note(10, 0.0, 0.5, 60),
+            note(20, 0.5, 0.5, 60),
+            note(30, 1.0, 0.5, 60),
+            note(40, 1.5, 0.5, 60),
+        ]);
+        model.selected = vec![10];
+        let view = test_view();
+        let style = PianoRollStyle::default();
+
+        // Frame 1: L
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput { keyboard: vec![key_l()], ..Default::default() },
+            view,
+            &style,
+            |_| {},
+        );
+
+        // Frame 2: "abcd" + Enter (4 chars + commit)
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput {
+                keyboard: vec![
+                    key_typing('a', "a"),
+                    key_typing('b', "b"),
+                    key_typing('c', "c"),
+                    key_typing('d', "d"),
+                    key_enter(),
+                ],
+                ..Default::default()
+            },
+            view,
+            &style,
+            |_| {},
+        );
+        assert_eq!(
+            model.last_set_lyrics,
+            Some(vec![
+                (10u32, Some("a".to_string())),
+                (20u32, Some("b".to_string())),
+                (30u32, Some("c".to_string())),
+                (40u32, Some("d".to_string())),
+            ])
+        );
+    }
+
+    /// 4 notes、入力 2 mora → 2 note に分配 + lyric_editing = Some(notes[2].id) (= 次へ移動)。
+    #[test]
+    fn lyric_edit_enter_advances_to_next_when_more_notes_remain() {
+        let mut host = setup_lyric_test_host();
+        let mut model = TestModel::new(vec![
+            note(10, 0.0, 0.5, 60),
+            note(20, 0.5, 0.5, 60),
+            note(30, 1.0, 0.5, 60),
+            note(40, 1.5, 0.5, 60),
+        ]);
+        model.selected = vec![10];
+        let view = test_view();
+        let style = PianoRollStyle::default();
+
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput { keyboard: vec![key_l()], ..Default::default() },
+            view,
+            &style,
+            |_| {},
+        );
+
+        let mut got_lyric_editing = None;
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput {
+                keyboard: vec![key_typing('a', "a"), key_typing('b', "b"), key_enter()],
+                ..Default::default()
+            },
+            view,
+            &style,
+            |resp| got_lyric_editing = resp.lyric_editing,
+        );
+        assert_eq!(
+            model.last_set_lyrics,
+            Some(vec![(10u32, Some("a".to_string())), (20u32, Some("b".to_string()))])
+        );
+        assert_eq!(got_lyric_editing, Some(30), "次 note (id 30) へ移動");
+        // selection も追従していること (同じ frame で Select 発行された)
+        assert_eq!(model.selected, vec![30u32]);
+    }
+
+    /// 拗音結合: "しゅんかん" → 4 mora ([しゅ] [ん] [か] [ん])。
+    #[test]
+    fn lyric_edit_enter_combines_kana_correctly() {
+        let mut host = setup_lyric_test_host();
+        let mut model = TestModel::new(vec![
+            note(10, 0.0, 0.5, 60),
+            note(20, 0.5, 0.5, 60),
+            note(30, 1.0, 0.5, 60),
+            note(40, 1.5, 0.5, 60),
+        ]);
+        model.selected = vec![10];
+        let view = test_view();
+        let style = PianoRollStyle::default();
+
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput { keyboard: vec![key_l()], ..Default::default() },
+            view,
+            &style,
+            |_| {},
+        );
+
+        // "しゅんかん" を IME 経由ではなく KeyEvent.text 直接挿入で simulate
+        // (実際の IME 入力は manual test: cargo run --bin piano_roll で確認)
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput {
+                keyboard: vec![
+                    key_typing('a', "し"),
+                    key_typing('b', "ゅ"),
+                    key_typing('c', "ん"),
+                    key_typing('d', "か"),
+                    key_typing('e', "ん"),
+                    key_enter(),
+                ],
+                ..Default::default()
+            },
+            view,
+            &style,
+            |_| {},
+        );
+        assert_eq!(
+            model.last_set_lyrics,
+            Some(vec![
+                (10u32, Some("しゅ".to_string())),
+                (20u32, Some("ん".to_string())),
+                (30u32, Some("か".to_string())),
+                (40u32, Some("ん".to_string())),
+            ])
+        );
+    }
+
+    /// 2 notes に 3 mora 入力 → SetLyrics 2 件 + lyric_overflow_morae == 1。
+    #[test]
+    fn lyric_edit_overflow_morae_count_in_response() {
+        let mut host = setup_lyric_test_host();
+        let mut model = TestModel::new(vec![
+            note(10, 0.0, 0.5, 60),
+            note(20, 0.5, 0.5, 60),
+        ]);
+        model.selected = vec![10];
+        let view = test_view();
+        let style = PianoRollStyle::default();
+
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput { keyboard: vec![key_l()], ..Default::default() },
+            view,
+            &style,
+            |_| {},
+        );
+
+        let mut overflow = 0;
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput {
+                keyboard: vec![
+                    key_typing('a', "a"),
+                    key_typing('b', "b"),
+                    key_typing('c', "c"),
+                    key_enter(),
+                ],
+                ..Default::default()
+            },
+            view,
+            &style,
+            |resp| overflow = resp.lyric_overflow_morae,
+        );
+        assert_eq!(
+            model.last_set_lyrics,
+            Some(vec![(10u32, Some("a".to_string())), (20u32, Some("b".to_string()))])
+        );
+        assert_eq!(overflow, 1, "余りモーラ 1 個分 (= 'c') が捨てられた");
+    }
+
+    /// Frame 1: L → mode 入る。Frame 2: "a" + Esc → SetLyrics 発行されず + lyric_editing = None。
+    #[test]
+    fn lyric_edit_esc_cancels_without_setlyrics() {
+        let mut host = setup_lyric_test_host();
+        let mut model = TestModel::new(vec![note(0, 1.0, 1.0, 60)]);
+        model.selected = vec![0];
+        let view = test_view();
+        let style = PianoRollStyle::default();
+
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput { keyboard: vec![key_l()], ..Default::default() },
+            view,
+            &style,
+            |_| {},
+        );
+
+        let mut got_lyric_editing = Some(0);
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput {
+                keyboard: vec![key_typing('a', "a"), key_esc()],
+                ..Default::default()
+            },
+            view,
+            &style,
+            |resp| got_lyric_editing = resp.lyric_editing,
+        );
+        assert_eq!(model.last_request, None, "Esc で cancel → SetLyrics 発行なし");
+        assert_eq!(got_lyric_editing, None, "Esc 1 frame で完全 cancel");
+    }
+
+    /// 編集中 (frame 2) の primary press on note → drag が始まらない。
+    #[test]
+    fn lyric_edit_short_circuits_drag() {
+        let mut host = setup_lyric_test_host();
+        let mut model = TestModel::new(vec![note(0, 1.0, 1.0, 60)]);
+        model.selected = vec![0];
+        let view = test_view();
+        let style = PianoRollStyle::default();
+
+        // Frame 1: L → enter mode
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput { keyboard: vec![key_l()], ..Default::default() },
+            view,
+            &style,
+            |_| {},
+        );
+
+        // Frame 2: primary press on note (lyric_editing = Some(0))
+        let mut dragging = Some(NoteDragKind::Move);
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((300.0, 200.0)),
+                    primary_just_pressed: true,
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            view,
+            &style,
+            |resp| dragging = resp.dragging,
+        );
+        assert_eq!(dragging, None, "編集中は drag 開始しない");
+    }
+
+    /// 既存 lyric "x" を持つ note → 全選択 (auto on focus) + Backspace 相当の入力なしで Enter
+    /// → 「変更なしで Enter」となる。 ※ 「全選択を replace せずに Enter」と
+    /// 「全選択 → Backspace → Enter」は別。後者は次 test。
+    /// 当 test は「prefill が text_input に入っている → 何もしないで Enter → committed_text =
+    /// 既存の "x" → SetLyrics(0, Some("x"))」 (no-op だが Edit は発行される) を確認。
+    #[test]
+    fn lyric_edit_prefill_then_enter_commits_existing_lyric() {
+        let mut host = setup_lyric_test_host();
+        let mut model = TestModel::new(vec![Note {
+            id: 0,
+            start_beat: 1.0,
+            len_beats: 1.0,
+            pitch: 60,
+            velocity: 96,
+            lyric: Some(Arc::from("x")),
+        }]);
+        model.selected = vec![0];
+        let view = test_view();
+        let style = PianoRollStyle::default();
+
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput { keyboard: vec![key_l()], ..Default::default() },
+            view,
+            &style,
+            |_| {},
+        );
+
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput { keyboard: vec![key_enter()], ..Default::default() },
+            view,
+            &style,
+            |_| {},
+        );
+        // prefill "x" がそのまま commit text として渡る → SetLyrics(0, Some("x"))
+        assert_eq!(model.last_set_lyrics, Some(vec![(0u32, Some("x".to_string()))]));
+    }
+
+    /// `"x"` lyric を持つ note → 全選択 → typing で空 (※ 全選択中の typing は replace)
+    /// → Enter → SetLyrics(0, None) (空文字列正規化)。
+    /// 簡易化: 直接 select_all (Ctrl+A) → Backspace → Enter の代わりに
+    /// "全選択中に何かを type して Enter" だと replace になる。 ここでは
+    /// **既存 lyric を Backspace で削除 → Enter** で空文字列 commit を再現する。
+    #[test]
+    fn lyric_edit_empty_string_normalized_to_none() {
+        let mut host = setup_lyric_test_host();
+        let mut model = TestModel::new(vec![Note {
+            id: 0,
+            start_beat: 1.0,
+            len_beats: 1.0,
+            pitch: 60,
+            velocity: 96,
+            lyric: Some(Arc::from("x")),
+        }]);
+        model.selected = vec![0];
+        let view = test_view();
+        let style = PianoRollStyle::default();
+
+        // Frame 1: L → enter mode (prefill = "x"、全選択済)
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput { keyboard: vec![key_l()], ..Default::default() },
+            view,
+            &style,
+            |_| {},
+        );
+
+        // Frame 2: Backspace で全選択 "x" を削除 (text_input は空に) → Enter
+        let key_backspace = KeyEvent {
+            state: ElementState::Pressed,
+            text: None,
+            physical_key: PhysicalKey::Backspace,
+        };
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput {
+                keyboard: vec![key_backspace, key_enter()],
+                ..Default::default()
+            },
+            view,
+            &style,
+            |_| {},
+        );
+        assert_eq!(
+            model.last_set_lyrics,
+            Some(vec![(0u32, None)]),
+            "空文字 commit は None に正規化"
+        );
+    }
+
+    /// lyric_editing = Some(id) 状態で notes から id を消す → 次 frame で
+    /// frame 頭 sync check が lyric_editing = None に reset。
+    #[test]
+    fn lyric_edit_auto_clears_when_target_note_deleted() {
+        let mut host = setup_lyric_test_host();
+        let mut model = TestModel::new(vec![note(0, 1.0, 1.0, 60)]);
+        model.selected = vec![0];
+        let view = test_view();
+        let style = PianoRollStyle::default();
+
+        // Frame 1: L → enter mode
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput { keyboard: vec![key_l()], ..Default::default() },
+            view,
+            &style,
+            |_| {},
+        );
+
+        // notes から id 0 を消す (= 外部要因で note 削除)
+        model.notes.clear();
+
+        // Frame 2: lyric_editing が Some(0) のまま render → 頭 sync で None に reset
+        let mut got_lyric_editing = Some(0);
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput::default(),
+            view,
+            &style,
+            |resp| got_lyric_editing = resp.lyric_editing,
+        );
+        assert_eq!(got_lyric_editing, None, "編集対象 note 消失で auto-clear");
+    }
+
+    /// 同 start_beat、pitch 60/72 の 2 note → pitch 72 起点で "ab" + Enter →
+    /// SetLyrics(72→"a", 60→"b") (高 pitch 先取り順序)。
+    #[test]
+    fn lyric_edit_same_beat_pitch_desc_order() {
+        let mut host = setup_lyric_test_host();
+        let mut model = TestModel::new(vec![
+            note(60, 0.0, 0.5, 60),  // pitch 60、id 60 (id=pitch でわかりやすく)
+            note(72, 0.0, 0.5, 72),  // pitch 72、id 72 (高 pitch)
+        ]);
+        model.selected = vec![72]; // 高 pitch を起点に
+        let view = test_view();
+        let style = PianoRollStyle::default();
+
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput { keyboard: vec![key_l()], ..Default::default() },
+            view,
+            &style,
+            |_| {},
+        );
+
+        run_lyric_frame(
+            &mut host,
+            &mut model,
+            FrameInput {
+                keyboard: vec![key_typing('a', "a"), key_typing('b', "b"), key_enter()],
+                ..Default::default()
+            },
+            view,
+            &style,
+            |_| {},
+        );
+        assert_eq!(
+            model.last_set_lyrics,
+            Some(vec![(72u32, Some("a".to_string())), (60u32, Some("b".to_string()))]),
+            "同 beat なら高 pitch (72) が先、低 pitch (60) が次"
         );
     }
 }

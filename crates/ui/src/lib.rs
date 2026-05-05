@@ -61,7 +61,7 @@ pub use widgets::knob::KnobResponse;
 pub use widgets::piano_roll::{
     Note, NoteDragKind, NoteFillFn, NoteId, NotesEditRequest, MoveDelta, PianoRollResponse,
     PianoRollStyle, PianoRollView, ResizeDelta, default_velocity_color, is_black_key, note_hit,
-    note_hover_cursor, note_to_rect, rects_intersect,
+    note_hover_cursor, note_to_rect, rects_intersect, split_into_morae,
 };
 pub use widgets::reorderable_list::{
     ReorderableListEditRequest, ReorderableListResponse, ReorderableListStyle,

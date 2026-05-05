@@ -41,6 +41,26 @@ pub(crate) struct TextInputState {
     /// 前フレームの focus 状態 (gained_focus 検知用)。
     /// `was_focused == true && last_focused == false` で「focus 取得」と判定し全選択する。
     last_focused: bool,
+    /// **(M14 Phase 59)** focus 中の編集 buffer (uncontrolled mode の source-of-truth)。
+    ///
+    /// 設計理由 (CLAUDE.md「ユーザに同じ workaround を書かせる API は設計欠陥」):
+    /// - 旧設計: 毎フレーム `working = text.to_string()` で reset、 caller の on_change で都度 model 書き戻す
+    ///   (= controlled)。 「commit するまで model に書かない」 (= rename / lyric / dialog input / search)
+    ///   UX では caller が自前 buffer を持って on_change で writeback する boilerplate が必要だった。
+    /// - 新設計: `was_focused == true` の間は `state.buffer_text` を source-of-truth にし、
+    ///   typing で buffer を mutate、 frame 末に書き戻す。 `gained_focus` (= `last_focused == false`
+    ///   から `was_focused == true` に変わった frame) で `text` 引数の値で初期化 + 全選択。
+    ///   `!was_focused` のときは text 引数をそのまま表示 (controlled、 既存挙動と完全互換)。
+    ///
+    /// 効果:
+    /// - 既存 controlled callers (daw_01 #013 rename 等): 各 keystroke で on_change → caller が
+    ///   model 更新 → 次 frame text 引数 = model 値 = buffer 値、 となり挙動完全互換
+    /// - uncontrolled callers (piano_roll 歌詞 inline 編集 等): on_change を no-op にしても
+    ///   buffer に typed text が蓄積、 commit (Enter) で `committed_text` が正しい final text を返す
+    /// - 唯一の挙動差: focus 中に **外部から `text` 引数が変わった場合** (= caller の on_change
+    ///   経由ではなく、 別経路で model が変化)、 buffer が ignore する (= ユーザの typing が勝つ)。
+    ///   undo/redo 中の rename 等のレアケース、 むしろ「ユーザの typing が消えない」 方が直感的。
+    buffer_text: String,
 }
 
 /// `text` の `from` 位置から左方向に直近の char 境界を返す (`from` が境界ならそのまま返す)。
@@ -75,12 +95,20 @@ fn delete_range(working: &mut String, cursor: &mut usize, anchor: &mut usize) ->
     true
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct TextInputResponse {
     /// この widget が現在キーボードフォーカスを持っているか。
     pub focused: bool,
-    /// このフレームで Enter キーが押されたか。
+    /// このフレームで Enter / NumpadEnter キーが押されたか。
     pub committed: bool,
+    /// (M14 Phase 59 / daw_01 #017) commit frame でのみ Some。Enter / NumpadEnter 押下時の
+    /// 最終テキスト (= 直前の編集を含む working buffer)。変更が無いまま Enter したケースは
+    /// caller passed `text` の clone。通常 frame は None。
+    ///
+    /// `on_change` callback は per-keystroke で呼ばれ、commit 時の確定 text を取り出す手段が
+    /// なかった (`piano_roll` の歌詞 inline 編集で「Enter で commit text を取り出して
+    /// `split_into_morae` で分割→次 note へ分配」が必要になり追加)。
+    pub committed_text: Option<String>,
 }
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
@@ -127,16 +155,31 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         let was_focused = self.is_focused(wid);
 
-        // gained_focus 検知 + 全選択 (click / programmatic focus / `text_input_at_focused` 統一、
-        // F2 rename 標準挙動)。last_focused を mem::replace で更新しつつ、前 frame の値を比較。
+        // gained_focus 検知 + 全選択 + buffer_text 初期化 (M14 Phase 59)。
+        // click / programmatic focus / `text_input_at_focused` を 1 箇所で処理 (F2 rename 標準挙動)。
+        // `buffer_text` は focus 中の source-of-truth で、 gained_focus でのみ `text` 引数から
+        // 初期化、 typing で mutate される。 `!was_focused` のとき `text` 引数表示 (controlled)。
         {
             let state: &mut TextInputState = self.widget_state(wid);
             let prev = std::mem::replace(&mut state.last_focused, was_focused);
             if was_focused && !prev {
+                state.buffer_text = text.to_string();
                 state.anchor_byte = 0;
-                state.cursor_byte = text.len();
+                state.cursor_byte = state.buffer_text.len();
             }
         }
+
+        // 表示 / working buffer の source-of-truth を決定 (M14 Phase 59):
+        // - was_focused: state.buffer_text (uncontrolled、 typing で mutate)
+        // - !was_focused: text 引数 (controlled、 caller が source-of-truth)
+        // 後段の typing 処理で buffer_text が変化したら、 frame 末に再 read して描画 / IME /
+        // committed_text に反映するため `mut` で持つ。
+        let mut displayed_text: String = if was_focused {
+            let state: &mut TextInputState = self.widget_state(wid);
+            state.buffer_text.clone()
+        } else {
+            text.to_string()
+        };
 
         // フォーカス中の shortcut + IME + キー入力処理。selection を考慮して
         // 文字入力 / Backspace / Delete / IME Commit / Paste は全部
@@ -171,7 +214,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
             if any_input {
                 let state: &mut TextInputState = self.widget_state(wid);
-                let mut working = text.to_string();
+                // M14 Phase 59: working は state.buffer_text (focus 中の source-of-truth)
+                // から開始。 旧設計の毎フレーム `text` reset を廃止し、 typing が frame 跨ぎで
+                // 蓄積されるように。 frame 末で state.buffer_text に書き戻す。
+                let mut working = state.buffer_text.clone();
                 let mut cursor = state.cursor_byte.min(working.len());
                 let mut anchor = state.anchor_byte.min(working.len());
                 let mut changed = false;
@@ -325,6 +371,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 }
                 state.cursor_byte = cursor.min(working.len());
                 state.anchor_byte = anchor.min(working.len());
+                // M14 Phase 59: buffer_text に書き戻す (frame 跨ぎの source-of-truth)
+                state.buffer_text.clone_from(&working);
+                // displayed_text も typing 後の値に更新 (描画 / IME / committed_text 用)
+                displayed_text = working;
                 if let Some(s) = clipboard_write {
                     self.set_clipboard_text(s);
                 }
@@ -335,11 +385,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // 描画用 cursor + anchor + preedit を state から取り出す。
+        // M14 Phase 59: cursor / anchor の clamp は displayed_text (= focus 中 buffer_text、
+        // 非 focus 中 text 引数) の長さに対して行う。
         let (cursor_byte_for_draw, anchor_byte_for_draw, preedit_for_draw) = {
             let state: &mut TextInputState = self.widget_state(wid);
             (
-                state.cursor_byte.min(text.len()),
-                state.anchor_byte.min(text.len()),
+                state.cursor_byte.min(displayed_text.len()),
+                state.anchor_byte.min(displayed_text.len()),
                 state.preedit.clone(),
             )
         };
@@ -352,18 +404,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             rect.y.to_bits(),
             rect.w.to_bits(),
             rect.h.to_bits(),
-            text,
+            displayed_text.as_str(),
             cursor_byte_for_draw as u64,
             anchor_byte_for_draw as u64,
             preedit_for_draw.as_str(),
             was_focused,
         ));
         let preedit_str = preedit_for_draw.clone();
+        let displayed_for_draw = displayed_text.clone();
         self.with_widget_node(wid, input_hash, |ui| {
             draw_text_input(
                 ui,
                 rect,
-                text,
+                &displayed_for_draw,
                 was_focused,
                 cursor_byte_for_draw,
                 anchor_byte_for_draw,
@@ -375,7 +428,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         if was_focused {
             let pad_x = 8.0;
             let font_size = 14.0;
-            let prefix = text.get(..cursor_byte_for_draw).unwrap_or("");
+            let prefix = displayed_text.get(..cursor_byte_for_draw).unwrap_or("");
             let cursor_x = rect.x
                 + pad_x
                 + self.measure_text(prefix, font_size)
@@ -392,12 +445,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.set_typing_focus(true);
         }
 
+        // commit frame では「Enter 押下時点の working buffer の最終値」を返す。
+        // M14 Phase 59: displayed_text は typing 反映後の値 (focus 中 = buffer_text、
+        // 非 focus 中 = text 引数)。 commit 時はこれをそのまま返せば良い。
+        let committed_text = if committed { Some(displayed_text.clone()) } else { None };
+
         if let Some(t) = new_text {
             let edit = on_change(t);
             self.push_edit(edit);
         }
 
-        TextInputResponse { focused: was_focused, committed }
+        TextInputResponse { focused: was_focused, committed, committed_text }
     }
 
     /// vstack カーソル位置に 1 行 text_input を追加 (高さ 28px、幅は cursor 幅)。
@@ -448,10 +506,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     {
         let wid = WidgetId::ROOT.child((b"text_input", &id));
         if !self.was_widget_visible_last_frame(wid) {
-            // 初回 show (or 一度消えて再登場): 自動 focus 取得。
-            // anchor / cursor の全選択は text_input_at 内 gained_focus 検知で行う
-            // (last_focused = false な状態で was_focused = true になるので発火する)。
+            // 初回 show (or 一度消えて再登場): 自動 focus 取得 + state reset。
+            // **重要 (M14 Phase 59 / daw_01 #017 再表示 bug fix)**:
+            // state.last_focused が前 session の終了時 (`true`) のまま残っていると、
+            // 直後の `text_input_at` で `prev == true` となり gained_focus が検知されず
+            // buffer / 全選択 reset が走らない (= 前回入力した text が再表示される、
+            // ユーザーから見ると「既に分配済の歌詞 'abc' が再び出てしまう」 症状)。
+            // ここで明示的に `last_focused = false` に戻して、 直後の gained_focus path を
+            // 発火させる (buffer = text 引数で初期化 + 全選択)。
             self.set_focus(wid);
+            let state: &mut TextInputState = self.widget_state(wid);
+            state.last_focused = false;
         }
         self.text_input_at(id, rect, text, on_change)
     }

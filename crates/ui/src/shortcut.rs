@@ -284,6 +284,9 @@ impl ShortcutMap {
 /// - `"select_all"` (Ctrl+A): typing 中は text_input の全選択
 /// - `"delete"` (Delete): typing 中は cursor 後 1 char 削除 / 範囲削除
 /// - `"cut"` (Ctrl+X) / `"copy"` (Ctrl+C) / `"paste"` (Ctrl+V): typing 中は OS clipboard 経由のテキスト編集
+/// - `"piano_roll.edit_lyric"` (default `L`): 歌詞編集モード中は text_input に `'l'` 文字として
+///   届かないと困る (M14 Phase 59 / daw_01 #017)。modeless mode-toggle key は
+///   typing-only の典型 (= typing 中は global suppression、それ以外は global 発火)。
 ///
 /// 含めないもの (典型テキストエディタでも global なので、typing 中も global のまま):
 /// - `undo` / `redo` (Word/VSCode 等もテキスト編集中の Ctrl+Z は document 全体の undo)
@@ -292,7 +295,10 @@ impl ShortcutMap {
 /// - `save` / `save_as` / `open` / `new` / `debug_overlay_toggle`
 #[must_use]
 pub fn is_typing_only_shortcut(name: &str) -> bool {
-    matches!(name, "select_all" | "delete" | "cut" | "copy" | "paste")
+    matches!(
+        name,
+        "select_all" | "delete" | "cut" | "copy" | "paste" | "piano_roll.edit_lyric"
+    )
 }
 
 /// `Shortcut` を表記文字列に戻す ("Ctrl+Shift+Z" 形式)。

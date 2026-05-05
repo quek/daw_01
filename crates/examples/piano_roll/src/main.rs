@@ -97,6 +97,23 @@ impl PianoRollModel {
 
 /// 100k 個を決定論的 LCG で生成。`start_beat` 昇順にソート。
 fn generate_notes(count: usize) -> Vec<Note> {
+    // M14 Phase 59 / daw_01 #017: 小 count (≤ 32) は歌詞編集 demo 用に「default view 内に
+    // 並ぶ連続 note 列」を生成する。 100k benchmark 用 LCG random 配置は count > 32 のときのみ。
+    // default view は 4 拍 × 24 pitch (start_beat=0..4、 pitch_top=72) なので、
+    // 0.5 拍刻みで pitch=60 (中央 C) 行に並べると最大 8 note が画面内に collide なく入る。
+    if count <= 32 {
+        return (0..count)
+            .map(|i| Note {
+                id: i as NoteId,
+                start_beat: i as f64 * 0.5,
+                len_beats: 0.45,
+                pitch: 60,
+                velocity: 96,
+                lyric: None,
+            })
+            .collect();
+    }
+
     let mut state: u64 = 0x12345678_9ABCDEF0;
     let mut next = || {
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -240,6 +257,35 @@ fn make_select_notes_edit(prev: Vec<NoteId>, next: Vec<NoteId>) -> Edit<PianoRol
     )
 }
 
+/// (M14 Phase 59 / daw_01 #017) note 群の lyric を一括更新する undoable Edit。
+/// snapshot に `(id, prev_lyric, next_lyric)` を持って forward/inverse を切替える。
+/// `prev_lyric` は widget が dispatch closure で `m.notes` から事前に capture 済み。
+fn make_set_lyrics_edit(
+    deltas: Vec<(NoteId, Option<String>, Option<String>)>,
+) -> Edit<PianoRollModel> {
+    let label = if deltas.len() == 1 { "set lyric" } else { "set lyrics" };
+    Edit::snapshot_inverse(
+        label,
+        deltas,
+        |m: &mut PianoRollModel, snap: &Vec<(NoteId, Option<String>, Option<String>)>| {
+            for (id, _prev, next) in snap {
+                if let Some(n) = m.notes.iter_mut().find(|x| x.id == *id) {
+                    n.lyric = next.as_deref().map(Arc::from);
+                }
+            }
+            m.notes_generation += 1;
+        },
+        |m: &mut PianoRollModel, snap: &Vec<(NoteId, Option<String>, Option<String>)>| {
+            for (id, prev, _next) in snap {
+                if let Some(n) = m.notes.iter_mut().find(|x| x.id == *id) {
+                    n.lyric = prev.as_deref().map(Arc::from);
+                }
+            }
+            m.notes_generation += 1;
+        },
+    )
+}
+
 fn make_delete_notes_edit(notes: Vec<Note>) -> Edit<PianoRollModel> {
     let label = if notes.len() == 1 { "delete note" } else { "delete notes" };
     Edit::snapshot_inverse(
@@ -301,6 +347,12 @@ struct App {
     cur_mouse: Option<(f32, f32)>,
     pending_zoom_dy: f32,
 
+    /// (M14 Phase 59 / daw_01 #017) IME 有効/無効と候補ウィンドウ位置の差分管理。
+    /// `UiHost::ime_request()` の `Some` / `None` 切替を監視し、 `set_ime_allowed` を
+    /// 状態遷移時のみ呼ぶ (mixer.rs と同パターン)。 IME 候補位置 (cursor 直下) は
+    /// `text_input_at` 内 `request_ime` で渡されるので、 ここでは差分のみ反映。
+    ime_enabled: bool,
+
     /// HUD HIT/MISS 推定用
     last_viewport_hash: Option<u64>,
 
@@ -314,6 +366,10 @@ impl App {
         let notes = generate_notes(n_notes);
         let mut ui = UiHost::with_window(window.clone());
         ui.shortcut_map_mut().bind("add_note", "Insert");
+        // M14 Phase 59 / daw_01 #017: 歌詞 inline 編集モードの起動 shortcut。
+        // PianoRollStyle::default().lyric_edit_shortcut == Some("piano_roll.edit_lyric") と
+        // 整合する name を bind する。caller opt-in のため with_default_bindings には含めない。
+        ui.shortcut_map_mut().bind("piano_roll.edit_lyric", "L");
         Self {
             ui,
 
@@ -325,6 +381,7 @@ impl App {
             pan_anchor: None,
             cur_mouse: None,
             pending_zoom_dy: 0.0,
+            ime_enabled: false,
             last_viewport_hash: None,
             last_frame_start: None,
         }
@@ -507,6 +564,12 @@ impl App {
                 // make_add_notes_edit の forward 内で `next_note_id` も bump されるため、
                 // capture 値は「現フレーム時点の最新値」。redo は forward 再実行で重複 id にならない。
                 let next_id_for_add = m.next_note_id;
+                // M14 Phase 59 / daw_01 #017: SetLyrics の undo 用 prev capture。
+                // widget は新 lyric のみ (Vec<(NoteId, Option<String>)>) を返すので、
+                // dispatch closure で「現フレーム時点の各 note の lyric」を snapshot して
+                // make_set_lyrics_edit に prev として渡す。
+                let lyric_snapshot: Vec<(NoteId, Option<Arc<str>>)> =
+                    m.notes.iter().map(|n| (n.id, n.lyric.clone())).collect();
 
                 let resp: PianoRollResponse = ui.piano_roll(
                     "main",
@@ -528,6 +591,20 @@ impl App {
                         NotesEditRequest::Resize(deltas) => make_resize_notes_edit(deltas),
                         NotesEditRequest::Select { prev, next } => {
                             make_select_notes_edit(prev, next)
+                        }
+                        NotesEditRequest::SetLyrics(updates) => {
+                            // updates = Vec<(NoteId, Option<String>)>。snapshot から prev を引く。
+                            let with_prev: Vec<(NoteId, Option<String>, Option<String>)> = updates
+                                .into_iter()
+                                .map(|(id, next)| {
+                                    let prev = lyric_snapshot
+                                        .iter()
+                                        .find(|(nid, _)| *nid == id)
+                                        .and_then(|(_, l)| l.as_deref().map(String::from));
+                                    (id, prev, next)
+                                })
+                                .collect();
+                            make_set_lyrics_edit(with_prev)
                         }
                     },
                 );
@@ -612,6 +689,31 @@ impl AppHost for App {
         }
         if let Some(t) = self.last_frame_start.take() {
             self.model.last_frame_ms = t.elapsed().as_secs_f32() * 1000.0;
+        }
+        // M14 Phase 59 / daw_01 #017: IME 有効/無効 + 候補ウィンドウ位置を OS に伝える
+        // (text_input が focus 中に `request_ime` した cursor area を winit に渡す)。
+        // mixer.rs と同パターンで差分管理。
+        match (self.ime_enabled, self.ui.ime_request()) {
+            (false, Some(area)) => {
+                self.window.set_ime_allowed(true);
+                self.window.set_ime_cursor_area(
+                    f64::from(area.x), f64::from(area.y),
+                    f64::from(area.w), f64::from(area.h),
+                );
+                self.ime_enabled = true;
+            }
+            (true, Some(area)) => {
+                // 位置だけ追従 (IME 候補が cursor 移動に追いつくよう毎フレーム)
+                self.window.set_ime_cursor_area(
+                    f64::from(area.x), f64::from(area.y),
+                    f64::from(area.w), f64::from(area.h),
+                );
+            }
+            (true, None) => {
+                self.window.set_ime_allowed(false);
+                self.ime_enabled = false;
+            }
+            (false, None) => {}
         }
         self.pan_anchor.is_some() || self.pending_zoom_dy.abs() > 0.0
     }
