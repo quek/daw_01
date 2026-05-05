@@ -47,7 +47,8 @@ A5 lyric UI     (← 次タスク、 gui_01 #015 は解決済、 A1 の前提)
 - **A7 完了**: plugin ロード race condition の同期化 (plan_a7_plugin_load_sync.md 参照)
 - **A6 完了**: transport に BPM / time_sig 編集 UI を追加 (plan_a6_tempo_timesig.md 参照)
 - **A4 完了**: autosave + crash recovery + 起動時復元 modal (plan_a4_autosave_recovery.md 参照)
-- **A1 大半完了** (Phase A/B/C/D): VOICEVOX engine 自動起動 + per-track speaker UI + WAV cache + 拗音結合 (plan_a1_voicevox.md 参照)。 残: gui_01 #017 完成後の L キー編集 smoke test と歌唱 quality check
+- **A1 大半完了** (Phase A/B/C/D): VOICEVOX engine 自動起動 + per-track speaker UI + WAV cache + 拗音結合 (plan_a1_voicevox.md 参照)。 残: 歌唱 quality check のみ
+- **A5 完了**: piano_roll の L キー歌詞編集 + 一括モーラ分配 (gui_01 #017、 M14 Phase 59) 完成、 daw_01 側で AppEvent::SetNoteLyrics + handler + L キー bind を wire。 旧 lyric_panel は冗長になり削除
 - **A5** は gui_01 改修先行 (#015)。reply 待ちの間 A1 の Engine / HTTP 周りを進める
 - **A1** は A5 完了後に本格実装
 

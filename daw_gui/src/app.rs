@@ -357,25 +357,6 @@ impl AppData {
             .collect()
     }
 
-    pub fn selected_lyric(&self) -> String {
-        let Some(n_idx) = self.selected_notes.first().copied() else {
-            return String::new();
-        };
-        let Some(r) = self.selected_clip else {
-            return String::new();
-        };
-        let Some(track) = self.song.tracks.get(r.track as usize) else {
-            return String::new();
-        };
-        let Some(clip) = track.clips.get(r.clip as usize) else {
-            return String::new();
-        };
-        let Some(note) = clip.notes.get(n_idx as usize) else {
-            return String::new();
-        };
-        note.lyric.clone().unwrap_or_default()
-    }
-
     pub fn selected_track_label(&self) -> String {
         let sel = self.selected_track;
         self.song
@@ -504,8 +485,7 @@ impl AppData {
                 | AppEvent::ResizeNotes(_)
                 | AppEvent::SetNotePositions(_)
                 | AppEvent::DeleteSelectedNotes
-                | AppEvent::SetSelectedNoteLyric(_)
-                | AppEvent::SetNoteLyrics(_)
+                | AppEvent::SetNoteLyrics { .. }
                 | AppEvent::SetTrackSpeaker { .. }
                 | AppEvent::QuantizeSelectedNotes(_)
                 | AppEvent::SelectPluginFromDb(_)
@@ -738,11 +718,14 @@ pub enum AppEvent {
     },
     ResizeNotes(Vec<(u32, f64, f64)>),
     DeleteSelectedNotes,
-    SetSelectedNoteLyric(String),
-    /// gui_01 #017 で widget が L キー → Enter commit 時に発行する歌詞分配
-    /// バッチ。 各 `(note_id, lyric)` を `selected_clip` 内で更新。 lyric が
-    /// `None` or 空文字列なら歌詞削除 (`Note.lyric = None`)。
-    SetNoteLyrics(Vec<(u32, Option<String>)>),
+    /// gui_01 #017 (M14 Phase 59) で piano_roll widget が L キー → Enter
+    /// commit 時に発行する歌詞分配バッチ。 各 `(note_id, lyric)` を指定
+    /// `clip_ref` 内で更新。 widget が空文字列を `None` に正規化済みなので
+    /// daw_01 側で `is_empty` 判定不要 (None = 歌詞削除)。 1 batch = 1 undo。
+    SetNoteLyrics {
+        clip_ref: ClipRef,
+        lyrics: Vec<(u32, Option<String>)>,
+    },
 
     // -------- Plugin picker / chain ---------------------------------------
     OpenPluginPickerFor(PickerTarget),
@@ -973,11 +956,8 @@ impl AppData {
                 self.selected_notes = targets;
             }
             AppEvent::DeleteSelectedNotes => self.delete_selected_notes(),
-            AppEvent::SetSelectedNoteLyric(text) => {
-                self.set_selected_note_lyric(text);
-            }
-            AppEvent::SetNoteLyrics(updates) => {
-                self.set_note_lyrics(&updates);
+            AppEvent::SetNoteLyrics { clip_ref, lyrics } => {
+                self.set_note_lyrics(clip_ref, &lyrics);
             }
             AppEvent::OpenPluginPickerFor(target) => {
                 self.plugin_picker_target = target;
@@ -2056,32 +2036,6 @@ impl AppData {
         self.pianoroll_notes_generation += 1;
     }
 
-    fn set_selected_note_lyric(&mut self, lyric: String) {
-        let Some(r) = self.selected_clip else {
-            return;
-        };
-        let trimmed = lyric.trim();
-        let value = if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        };
-        let selected = self.selected_notes.clone();
-        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
-            return;
-        };
-        let Some(clip) = track.clips.get_mut(r.clip as usize) else {
-            return;
-        };
-        for &i in &selected {
-            if let Some(n) = clip.notes.get_mut(i as usize) {
-                n.lyric = value.clone();
-            }
-        }
-        self.sync_song_to_plugin_host();
-        self.pianoroll_notes_generation += 1;
-    }
-
     /// Track Inspector の Vocal speaker dropdown 経由で speaker_id 変更。
     /// 対象 track が `InstrumentSource::Vocal` でなければ no-op。
     fn set_track_speaker(&mut self, track: u32, speaker_id: u32, style_name: String) {
@@ -2103,18 +2057,15 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
-    /// gui_01 #017: piano_roll widget が L キー → Enter commit で発行する
-    /// 歌詞分配 batch を `selected_clip` 内の note に適用。 各 entry は
-    /// `(note_index, Option<String>)`、 `None` or 空文字列で歌詞削除。
-    /// `selected_clip` が無いと no-op。
-    fn set_note_lyrics(&mut self, updates: &[(u32, Option<String>)]) {
-        let Some(r) = self.selected_clip else {
+    /// gui_01 #017 (M14 Phase 59): piano_roll widget が L キー → Enter
+    /// commit で発行する歌詞分配 batch を、 指定 `clip_ref` 内の note に
+    /// 適用。 各 entry は `(note_index, Option<String>)`、 widget 側で空文字列
+    /// は `None` に正規化済み (= 歌詞削除)。 clip_ref が無効なら no-op。
+    fn set_note_lyrics(&mut self, clip_ref: ClipRef, updates: &[(u32, Option<String>)]) {
+        let Some(track) = self.song.tracks.get_mut(clip_ref.track as usize) else {
             return;
         };
-        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
-            return;
-        };
-        let Some(clip) = track.clips.get_mut(r.clip as usize) else {
+        let Some(clip) = track.clips.get_mut(clip_ref.clip as usize) else {
             return;
         };
         let mut changed = false;

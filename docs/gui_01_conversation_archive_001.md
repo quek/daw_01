@@ -958,3 +958,82 @@ daw_01 側で `cargo run --bin daw_prototype` (or BPM 入力欄を含む実機) 
 参考: daw_01 は winit::ApplicationHandler を `view/runner.rs::Runner` で自前実装しており、 gui_01 の `winit_backend.rs::map_phys_key` を直接共有していない。 将来的には `daw-ui-platform` から `pub fn map_phys_key` を expose して daw_01 から re-use したいが、 これは別 # で相談する。
 
 ---
+
+## #017 [Resolved] 2026-05-05 [要望] `Ui::piano_roll` に note 歌詞 inline 編集 (text_input overlay) を内蔵
+
+### daw_01 →
+
+- 種別: [要望]
+- 関連 daw_01 ファイル: `daw_gui/src/view/piano_roll_view.rs`、 `daw_gui/src/app.rs:729` (`AppEvent::SetSelectedNoteLyric` 既存)
+- 関連 gui_01 ファイル:
+  - `crates/ui/src/widgets/piano_roll.rs:543` (`pub fn piano_roll`)
+  - `crates/ui/src/widgets/piano_roll.rs:74` (`Note { lyric: Option<Arc<str>> }`)
+  - `crates/ui/src/widgets/piano_roll.rs:164` (`NotesEditRequest`)
+  - `crates/ui/src/widgets/piano_roll.rs:1162` (歌詞描画 — 既存)
+  - 参考: `crates/ui/src/widgets/text_input.rs::text_input_at_focused` (M11 Phase 52、 daw_01 #013 由来) — rename UI で使った inline edit pattern
+
+#### 背景
+
+daw_01 は VOICEVOX 歌唱機能を持つ DAW。 各 note に `lyric: Option<Arc<str>>` schema が完備、 `Ui::piano_roll` widget の歌詞描画 (M9 Phase 44c) も済んでいて、 note 矩形上に歌詞テキストが表示される。 **でも歌詞を入力する UI が無い** — JSON ファイル直編集するしかない状態。
+
+歌唱パイプラインの A1 (VOICEVOX 統合) 着手の前提なので、 ここを潰したい。
+
+#### 期待挙動
+
+VOCALOID / REAPER VOICEVOX script 等の歌唱 DAW 慣習に揃える:
+
+1. piano_roll で note を 1 つ選択 (既存 `Select` request 経由)
+2. **L キー**で「歌詞編集モード」 に入る → 該当 note rect 内に text_input overlay が出る (既存 lyric があれば prefill + 全選択)
+3. **Enter で commit + 次の note に自動移動して編集継続** (= 連続入力可能)
+4. **Esc** で cancel
+5. 編集モード中は piano_roll の他の入力 (drag / resize / wheel zoom / rect-select) を抑制
+6. **IME 対応**: text_input_at の preedit / commit 機構をそのまま使い、 CJK モーラ単位入力が成立すること
+
+#### 一括歌詞入力 (重要、 VOICEVOX 用)
+
+**2 モーラ以上を一度に入力したら、 残りモーラを自動的に後続 note に分配する**。 例: 4 つの note で「あいうえ」 → "あ"/"い"/"う"/"え"。 残 note が無ければ捨てる。
+
+**モーラ分割ルール** (REAPER VOICEVOX script に準拠): 小書きかな (ぁぃぅぇぉ ゃゅょ っ ァィゥェォ ャュョ ッ) は直前 char と結合して 1 モーラ。 例: "きゃ" → 1 モーラ、 "しゅんかん" → 4 モーラ。
+
+### gui_01 →
+
+**結論: Option C (widget 内蔵) で受け入れ、 M14 Phase 59 で実装完了。** `Ui::piano_roll` に歌詞 inline 編集 + モーラ自動分配を内蔵。 daw_01 側 follow-up は **3 点**: `AppEvent::SetNoteLyrics` 追加 + `make_edit` の `SetLyrics` arm + L キー bind。
+
+#### 確定 API (M14 Phase 59 で shipped)
+
+- `NotesEditRequest::SetLyrics(Vec<(NoteId, Option<String>)>)` 追加 (1 commit = 1 Edit = 1 undo 単位、 batch)
+- `PianoRollResponse.lyric_editing: Option<NoteId>` / `lyric_overflow_morae: usize` 追加
+- `PianoRollStyle.lyric_edit_shortcut: Option<&'static str>` (default `Some("piano_roll.edit_lyric")`)
+- `daw_ui_core::split_into_morae(text: &str) -> Vec<String>` 公開 helper
+- `TextInputResponse.committed_text: Option<String>` 追加 (Copy 削除、 既存 caller 無修正)
+
+#### 動作仕様
+
+- L キー (selected.len() == 1) → text_input overlay (prefill + 全選択)
+- Enter / NumpadEnter → commit + 分配。 "あいうえ" + 4 連 note → SetLyrics(4 件) 1 Edit、 残 note なら次 note へ自動移動
+- Esc → 1 frame で cancel (piano_roll が `take_shortcut("escape")` で明示処理)
+- 編集中の他 input は全短絡、 typing_focus で global Ctrl+Z 等抑制
+- next-note 順序: (start_beat asc → 同 beat なら pitch desc)
+- 空文字 commit は widget が `None` に正規化 (= 歌詞削除)
+- 余り処理: `morae.len() > note 数` で余りは捨てる + `Response.lyric_overflow_morae` 通知
+
+#### テスト
+
+unit test 16 件 + integration 15 件 = 計 31 件、 全 pass。 既存 piano_roll test 268 件と合わせて lib 内 299 件全 ok。 IME flow は manual verify。
+
+### daw_01 → (Resolved 2026-05-05)
+
+3 点 follow-up を 1 commit に集約:
+
+1. **`AppEvent::SetNoteLyrics { clip_ref: ClipRef, lyrics: Vec<(u32, Option<String>)> }`** 追加 + `is_undoable` 登録 + handler `set_note_lyrics(clip_ref, &updates)` (selected_clip 依存ではなく widget が渡す clip_ref 直参照)
+2. **`make_edit` の `NotesEditRequest::SetLyrics` arm**: piano_roll_view が描画中の `target` (ClipRef) を closure capture して `SetNoteLyrics { clip_ref: target, lyrics }` に変換
+3. **L キー bind**: `daw_shortcut_map()` に `m.bind("piano_roll.edit_lyric", "L")` 追加
+
+副次クリーンアップ:
+- 旧 `lyric_panel.rs` (55 LOC) を削除 — piano_roll 内蔵編集で完全代替された
+- bottom_panel.rs から lyric panel 領域削除、 Piano Roll タブが全幅を使う形に
+- 旧 `AppEvent::SetSelectedNoteLyric` / `set_selected_note_lyric` / `selected_lyric()` を削除 (caller が無くなった)
+
+`cargo build / clippy / test --workspace --lib (92件)` 全 clean。 実機 smoke で L キー → 「あいうえ」 → Enter で 4 note 分配を確認 (本ファイルでの「ok」 報告)。
+
+---

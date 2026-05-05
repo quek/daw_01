@@ -111,11 +111,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 app.handle_event(AppEvent::SetNoteSelection(next.clone()));
             }),
             NotesEditRequest::SetLyrics(updates) => {
-                // gui_01 #017 で widget が L キー編集 → Enter commit 時に
-                // 1 batch で発行する歌詞分配 request。 各 (note_id, lyric)
-                // を current selected_clip 内で更新。
+                // gui_01 #017 (M14 Phase 59): widget が L キー編集 → Enter
+                // commit 時に 1 batch で発行する歌詞分配 request。 widget は
+                // 編集対象 clip を context として知らないので、 piano_roll_view
+                // が描画中の `target` (ClipRef) を closure に capture して渡す。
+                let target_clip = target;
                 Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetNoteLyrics(updates.clone()));
+                    app.handle_event(AppEvent::SetNoteLyrics {
+                        clip_ref: target_clip,
+                        lyrics: updates.clone(),
+                    });
                 })
             }
         }

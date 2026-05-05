@@ -28,5 +28,9 @@ pub fn daw_shortcut_map() -> ShortcutMap {
     m.bind("daw.toggle_help", "F1");
     // gui_01 piano_roll widget の `take_shortcut("add_note")` 用バインド。
     m.bind("add_note", "Insert");
+    // gui_01 #017 (M14 Phase 59): piano_roll で note 1 つ選択中に L で歌詞
+    // 編集モード起動。 修飾なし shortcut だが widget 側で `is_typing_only`
+    // 扱いされるので、 編集中の text_input 入力中は 'l' 文字として届く。
+    m.bind("piano_roll.edit_lyric", "L");
     m
 }
