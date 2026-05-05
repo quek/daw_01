@@ -34,8 +34,11 @@ pub fn engine_path_config_file() -> Option<PathBuf> {
 ///
 /// 1. env `DAW_VOICEVOX_PATH` (絶対パス)
 /// 2. 設定ファイル `voicevox_engine_path.txt` の 1 行目 (前後 trim)
+/// 3. **デフォルトインストール先候補** (実体ありの順):
+///     - `%LOCALAPPDATA%\Programs\VOICEVOX\VOICEVOX.exe` (ユーザー領域インストール)
+///     - `C:\Program Files\VOICEVOX\VOICEVOX.exe` (system インストール)
 ///
-/// どちらも無ければ `None`。
+/// どれも該当なしなら `None` (= 起動 skip、 ユーザーが手動で立ち上げる想定)。
 pub fn resolve_engine_path() -> Option<PathBuf> {
     if let Some(env_path) = std::env::var_os("DAW_VOICEVOX_PATH") {
         let p = PathBuf::from(env_path);
@@ -57,7 +60,33 @@ pub fn resolve_engine_path() -> Option<PathBuf> {
             "voicevox_engine_path.txt points to non-existent file"
         );
     }
+    for candidate in default_install_candidates() {
+        if candidate.exists() {
+            tracing::info!(
+                path = %candidate.display(),
+                "resolved VOICEVOX exe via default install candidate"
+            );
+            return Some(candidate);
+        }
+    }
     None
+}
+
+/// VOICEVOX のデフォルトインストール先候補。 上から順に existence check して、
+/// 最初に見つかったものを採用する。 `dirs::data_local_dir()` が解決できない
+/// 環境では user 領域候補は省略。
+fn default_install_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::with_capacity(2);
+    if let Some(local_app_data) = dirs::data_local_dir() {
+        out.push(
+            local_app_data
+                .join("Programs")
+                .join("VOICEVOX")
+                .join("VOICEVOX.exe"),
+        );
+    }
+    out.push(PathBuf::from(r"C:\Program Files\VOICEVOX\VOICEVOX.exe"));
+    out
 }
 
 /// VOICEVOX engine が起動中か (`/version` が 200 を返せば true)。
