@@ -99,6 +99,20 @@ cargo clippy --workspace -- -D warnings
 - ホスト側 `clap_host_gui` は `host_data` に `&mut Host` のポインタを仕込み、
   callback 内で復元する（`Box<Host>` は heap 固定なのでポインタが安定）
 
+## Reflection の確認 (AHE 自律改善ループ)
+
+セッション開始時、`docs/reflection_latest.md` の最新エントリを Read してから作業に入る。
+過去セッションの自動検出（同じコマンド連続 / Edit 集中 / Bash 失敗 / Read 集中）が記録されており、
+改善余地があれば skill / hook / agent / command / memory への昇格を検討する。
+
+ループ構造:
+1. 各 tool 呼び出しは `PostToolUse` hook (`scripts/log_metric.ps1`) で `~/.claude/projects/F--dev-daw-01/metrics/YYYY-MM.jsonl` に追記
+2. session 終了時に `Stop` hook (`scripts/reflect.ps1`) がパターン検出 → `docs/reflection_latest.md` に提案
+3. 次セッション開始時にここを読み、harness の改善（hook 追加 / skill 化 / memory 化）を検討
+4. 採用した改善は別 session で実装、次の log で効果が現れる
+
+詳細設計は `docs/plan_ahe.md` (章 1.5 autonomy spectrum + 章 3 H13/H14/H15)。
+
 ## 応答・コミット
 
 - 応答は日本語

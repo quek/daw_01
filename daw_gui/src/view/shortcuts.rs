@@ -26,6 +26,13 @@ pub fn daw_shortcut_map() -> ShortcutMap {
     m.bind("daw.synthesize_vocal", "V");
     m.bind("daw.export_wav", "Ctrl+E");
     m.bind("daw.toggle_help", "F1");
+    // Grid snap (G キー) / auto-fit zoom (X キー)。focus 中の text_input 無効時のみ発火。
+    m.bind("daw.toggle_snap", "G");
+    m.bind("daw.fit_view", "X");
+    // Ableton Live 互換 (modifier 無し版): 1=Narrow, 2=Widen, 3=Toggle Triplet。
+    m.bind("daw.narrow_grid", "1");
+    m.bind("daw.widen_grid", "2");
+    m.bind("daw.toggle_triplet", "3");
     // gui_01 piano_roll widget の `take_shortcut("add_note")` 用バインド。
     m.bind("add_note", "Insert");
     // gui_01 #017 (M14 Phase 59): piano_roll で note 1 つ選択中に L で歌詞

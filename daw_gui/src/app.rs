@@ -124,6 +124,25 @@ pub struct AppData {
     pub pianoroll_top_pitch: u8,
     pub pianoroll_scroll_beat: f32,
     pub pianoroll_notes_generation: u64,
+    /// FL Studio の smart length 互換: 直近に作成 / リサイズ / クリック選択した
+    /// ノートの長さ (拍)。次の新規追加時のデフォルト長として使う。session 内
+    /// in-memory のみ、永続化はしない。`add_note` / `resize_notes` /
+    /// `SetNoteSelection` ハンドラで更新。
+    pub last_note_duration_beats: f64,
+
+    // -------- Grid snap state --------
+    /// piano_roll の Snap on/off (Snap toggle / `G` キー)。
+    pub pianoroll_snap_enabled: bool,
+    /// `view::snap::SNAP_LABELS` の index。`view::snap::choice_to_mode` で SnapMode に変換。
+    pub pianoroll_snap_choice: u8,
+    pub arrange_snap_enabled: bool,
+    pub arrange_snap_choice: u8,
+    /// auto-fit (`X` キー / `Fit` ボタン / SelectClip 経由) で参照する piano_roll
+    /// grid 領域サイズ (px)。`view::root` / `view::bottom_panel` が piano_roll タブ
+    /// 描画時に毎フレーム書き込む。0 は「未測定」フラグ扱い (auto-fit を skip)。
+    pub last_pianoroll_grid_size: (f32, f32),
+    /// 同様に arrangement の lanes 領域サイズ (px)。
+    pub last_arrange_canvas_size: (f32, f32),
 
     // -------- Playback / metering --------
     pub is_playing: bool,
@@ -291,6 +310,13 @@ impl AppData {
             pianoroll_top_pitch: 84, // C6
             pianoroll_scroll_beat: 0.0,
             pianoroll_notes_generation: 0,
+            last_note_duration_beats: DEFAULT_NOTE_DURATION,
+            pianoroll_snap_enabled: true,
+            pianoroll_snap_choice: crate::view::snap::CHOICE_PIANOROLL_DEFAULT,
+            arrange_snap_enabled: true,
+            arrange_snap_choice: crate::view::snap::CHOICE_ARRANGE_DEFAULT,
+            last_pianoroll_grid_size: (0.0, 0.0),
+            last_arrange_canvas_size: (0.0, 0.0),
             is_playing: false,
             is_looping: false,
             playhead_beat: None,
@@ -770,6 +796,27 @@ pub enum AppEvent {
     SetPianoRollZoomY(f32),
     SetLoopRange { start: f64, end: f64 },
 
+    // -------- Grid snap ---------------------------------------------------
+    SetPianoRollSnapEnabled(bool),
+    SetPianoRollSnapChoice(u8),
+    SetArrangeSnapEnabled(bool),
+    SetArrangeSnapChoice(u8),
+    TogglePianoRollSnap,
+    ToggleArrangeSnap,
+    /// `1` キー (Ableton Live "Narrow Grid" 互換): snap unit を 1 段細かく。
+    NarrowPianoRollGrid,
+    NarrowArrangeGrid,
+    /// `2` キー (Widen Grid): snap unit を 1 段粗く。
+    WidenPianoRollGrid,
+    WidenArrangeGrid,
+    /// `3` キー (Toggle Triplet): Straight ↔ Triplet (div は維持)。
+    TogglePianoRollTriplet,
+    ToggleArrangeTriplet,
+    /// `X` キー / "Fit" ボタン / SelectClip 経由の auto-fit zoom。
+    /// piano_roll は selected_clip のノート bbox に、arrangement は全 clip に fit。
+    FitPianoRollToClip,
+    FitArrangeToContent,
+
     // -------- Mixer -------------------------------------------------------
     SetTrackVolume { track: u32, amp: f32 },
     SetTrackPan { track: u32, pan: f32 },
@@ -965,6 +1012,17 @@ impl AppData {
             }
             AppEvent::SetNoteSelection(targets) => {
                 self.selected_notes = targets;
+                if let Some(&last_idx) = self.selected_notes.last()
+                    && let Some(r) = self.selected_clip
+                    && let Some(note) = self
+                        .song
+                        .tracks
+                        .get(r.track as usize)
+                        .and_then(|t| t.clips.get(r.clip as usize))
+                        .and_then(|c| c.notes.get(last_idx as usize))
+                {
+                    self.last_note_duration_beats = note.duration_beats.max(0.0625);
+                }
             }
             AppEvent::DeleteSelectedNotes => self.delete_selected_notes(),
             AppEvent::SetNoteLyrics { clip_ref, lyrics } => {
@@ -1088,8 +1146,61 @@ impl AppData {
             AppEvent::SetTrackSpeaker { track, speaker_id, style_name } => {
                 self.set_track_speaker(track, speaker_id, style_name);
             }
+            AppEvent::SetPianoRollSnapEnabled(b) => {
+                self.pianoroll_snap_enabled = b;
+            }
+            AppEvent::SetPianoRollSnapChoice(c) => {
+                self.pianoroll_snap_choice = clamp_snap_choice(c);
+            }
+            AppEvent::SetArrangeSnapEnabled(b) => {
+                self.arrange_snap_enabled = b;
+            }
+            AppEvent::SetArrangeSnapChoice(c) => {
+                self.arrange_snap_choice = clamp_snap_choice(c);
+            }
+            AppEvent::TogglePianoRollSnap => {
+                self.pianoroll_snap_enabled = !self.pianoroll_snap_enabled;
+            }
+            AppEvent::ToggleArrangeSnap => {
+                self.arrange_snap_enabled = !self.arrange_snap_enabled;
+            }
+            AppEvent::NarrowPianoRollGrid => {
+                self.pianoroll_snap_choice =
+                    crate::view::snap::narrow_choice(self.pianoroll_snap_choice);
+            }
+            AppEvent::NarrowArrangeGrid => {
+                self.arrange_snap_choice =
+                    crate::view::snap::narrow_choice(self.arrange_snap_choice);
+            }
+            AppEvent::WidenPianoRollGrid => {
+                self.pianoroll_snap_choice =
+                    crate::view::snap::widen_choice(self.pianoroll_snap_choice);
+            }
+            AppEvent::WidenArrangeGrid => {
+                self.arrange_snap_choice =
+                    crate::view::snap::widen_choice(self.arrange_snap_choice);
+            }
+            AppEvent::TogglePianoRollTriplet => {
+                self.pianoroll_snap_choice =
+                    crate::view::snap::toggle_triplet_choice(self.pianoroll_snap_choice);
+            }
+            AppEvent::ToggleArrangeTriplet => {
+                self.arrange_snap_choice =
+                    crate::view::snap::toggle_triplet_choice(self.arrange_snap_choice);
+            }
+            AppEvent::FitPianoRollToClip => {
+                self.fit_piano_roll_to_clip();
+            }
+            AppEvent::FitArrangeToContent => {
+                self.fit_arrange_to_content();
+            }
         }
     }
+}
+
+fn clamp_snap_choice(c: u8) -> u8 {
+    let max = (crate::view::snap::SNAP_LABELS.len() - 1) as u8;
+    c.min(max)
 }
 
 impl AppData {
@@ -1833,6 +1944,11 @@ impl AppData {
         if let Some(r) = primary {
             self.select_track(r.track);
         }
+        // クリップが新しく primary になったらピアノロールを auto-fit。
+        // 同 clip 再選択でも fit し直す (ノート編集で範囲が変わることがある)。
+        if primary.is_some() {
+            self.fit_piano_roll_to_clip();
+        }
     }
 
     fn set_clip_selection(&mut self, targets: Vec<ClipRef>) {
@@ -1844,6 +1960,83 @@ impl AppData {
         if let Some(r) = primary {
             self.select_track(r.track);
         }
+        if primary.is_some() {
+            self.fit_piano_roll_to_clip();
+        }
+    }
+
+    /// 現 selected_clip のノート bounding box が piano_roll grid 領域に
+    /// 収まるよう zoom_x / zoom_y / scroll_beat / top_pitch を自動調整する。
+    /// ノート無しの clip は clip 全長が見える初期 zoom にフォールバック。
+    /// `last_pianoroll_grid_size` が未測定 (= 0) の場合は何もしない。
+    fn fit_piano_roll_to_clip(&mut self) {
+        let Some(target) = self.selected_clip else { return };
+        let Some(track) = self.song.tracks.get(target.track as usize) else { return };
+        let Some(clip) = track.clips.get(target.clip as usize) else { return };
+        let (grid_w, grid_h) = self.last_pianoroll_grid_size;
+        if grid_w < 16.0 || grid_h < 16.0 {
+            return;
+        }
+
+        if clip.notes.is_empty() {
+            self.pianoroll_scroll_beat = 0.0;
+            self.pianoroll_zoom_x =
+                (grid_w / clip.length_beats.max(1.0) as f32).clamp(8.0, 400.0);
+            self.pianoroll_top_pitch = 84;
+            self.pianoroll_zoom_y = 14.0;
+        } else {
+            let min_beat = clip
+                .notes
+                .iter()
+                .map(|n| n.start_beat)
+                .fold(f64::INFINITY, f64::min);
+            let max_beat = clip
+                .notes
+                .iter()
+                .map(|n| n.start_beat + n.duration_beats)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let min_pitch = clip.notes.iter().map(|n| n.pitch).min().unwrap_or(60);
+            let max_pitch = clip.notes.iter().map(|n| n.pitch).max().unwrap_or(60);
+
+            let span_beats = (max_beat - min_beat + 2.0).max(1.0);
+            let span_pitch = (i32::from(max_pitch) - i32::from(min_pitch) + 4).max(4);
+
+            self.pianoroll_scroll_beat = (min_beat - 1.0).max(0.0) as f32;
+            self.pianoroll_zoom_x = (f64::from(grid_w) / span_beats).clamp(8.0, 400.0) as f32;
+            self.pianoroll_top_pitch = (i32::from(max_pitch) + 2).clamp(11, 127) as u8;
+            self.pianoroll_zoom_y = (grid_h / span_pitch as f32).clamp(6.0, 40.0);
+        }
+        self.pianoroll_notes_generation = self.pianoroll_notes_generation.wrapping_add(1);
+    }
+
+    /// 全 track の全 clip が arrangement canvas に収まるよう zoom_x / scroll_beat /
+    /// track_row_h を自動調整する。clip 0 個なら song.length_beats でフォールバック。
+    fn fit_arrange_to_content(&mut self) {
+        let (canvas_w, canvas_h) = self.last_arrange_canvas_size;
+        if canvas_w < 16.0 || canvas_h < 16.0 {
+            return;
+        }
+        let track_count = self.song.tracks.len().max(1);
+
+        let (min_beat, max_beat) = self
+            .song
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), c| {
+                (lo.min(c.start_beat), hi.max(c.start_beat + c.length_beats))
+            });
+        let (min_beat, max_beat) = if min_beat.is_finite() {
+            (min_beat, max_beat)
+        } else {
+            (0.0, self.song.length_beats.max(16.0))
+        };
+
+        let span_beats = (max_beat - min_beat + 4.0).max(4.0);
+        self.arrange_scroll_beat = (min_beat - 2.0).max(0.0) as f32;
+        self.arrange_zoom_x = (f64::from(canvas_w) / span_beats).clamp(2.0, 400.0) as f32;
+        let row_h = (canvas_h / track_count as f32).clamp(16.0, 96.0);
+        self.arrange_track_row_h = row_h;
     }
 
     fn set_clip_positions(&mut self, entries: &[(ClipRef, f64)]) {
@@ -1956,6 +2149,7 @@ impl AppData {
             self.selected_clips = vec![r];
         }
         self.selected_notes = vec![new_idx];
+        self.last_note_duration_beats = duration;
         self.sync_song_to_plugin_host();
         self.pianoroll_notes_generation += 1;
     }
@@ -1997,6 +2191,9 @@ impl AppData {
             };
             note.start_beat = start.max(0.0);
             note.duration_beats = duration.max(0.0625);
+        }
+        if let Some(&(_, _, duration)) = entries.last() {
+            self.last_note_duration_beats = duration.max(0.0625);
         }
         self.sync_song_to_plugin_host();
         self.pianoroll_notes_generation += 1;

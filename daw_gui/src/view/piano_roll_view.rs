@@ -8,29 +8,53 @@
 use std::sync::Arc;
 
 use daw_ui_core::{
-    Edit, MoveDelta, Note, NotesEditRequest, PianoRollStyle, PianoRollView, ResizeDelta, Ui,
-    note_hit,
+    Edit, MoveDelta, Note, NotesEditRequest, PianoRollStyle, PianoRollView, ResizeDelta,
+    ToggleButtonStyle, Ui, note_hit,
 };
 use daw_ui_renderer::{Color, Rect};
 
-use crate::app::{AppData, AppEvent, ClipRef, DEFAULT_NOTE_DURATION};
+use crate::app::{AppData, AppEvent, ClipRef};
+use crate::view::snap::{self, SNAP_LABELS};
 
 const KEYBOARD_W: f32 = 56.0;
 const VEL_LANE_H: f32 = 60.0;
 const RULER_H: f32 = 20.0;
+const TOOLBAR_H: f32 = 24.0;
 
 const COLOR_BG: Color = Color { r: 0.10, g: 0.10, b: 0.12, a: 1.0 };
 const COLOR_HINT: Color = Color { r: 0.55, g: 0.58, b: 0.65, a: 1.0 };
 
+const SNAP_TOGGLE_STYLE: ToggleButtonStyle = ToggleButtonStyle {
+    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
+    on_color: Color { r: 0.30, g: 0.50, b: 0.70, a: 1.0 },
+    hint_band: None,
+    hint_band_h: 2.0,
+    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    border_width: 1.0,
+    radius: 3.0,
+    font_size: 12.0,
+    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+};
+
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
+    // 上部 24 px を Snap toolbar に。残りを widget 本体 (body) に渡す。
+    let toolbar_rect = Rect { x: area.x, y: area.y, w: area.w, h: TOOLBAR_H };
+    let body = Rect {
+        x: area.x,
+        y: area.y + TOOLBAR_H,
+        w: area.w,
+        h: (area.h - TOOLBAR_H).max(0.0),
+    };
+    draw_snap_toolbar(app, ui, toolbar_rect);
+
     let Some(target) = app.selected_clip else {
         // クリップ未選択時のプレースホルダ
-        ui.panel("pr_bg_empty", area, COLOR_BG, 0.0);
+        ui.panel("pr_bg_empty", body, COLOR_BG, 0.0);
         ui.label_at(
             "pr_no_clip",
             "(\u{30af}\u{30ea}\u{30c3}\u{30d7}\u{304c}\u{9078}\u{629e}\u{3055}\u{308c}\u{3066}\u{3044}\u{307e}\u{305b}\u{3093})",
-            area.x + 12.0,
-            area.y + 12.0,
+            body.x + 12.0,
+            body.y + 12.0,
             12.0,
             COLOR_HINT,
         );
@@ -38,16 +62,25 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     };
 
     // widget が ruler / velocity lane を内蔵 (M13 Phase 55 で ruler 追加)、
-    // grid 部分は area から keyboard / ruler / vel lane を引いた領域。
+    // grid 部分は body から keyboard / ruler / vel lane を引いた領域。
     // note hit detection はこの grid_rect を使うので、widget 内部 layout と
     // 揃えておく (rect.y から ruler_h、その下に keyboard+grid、最下段に vel_lane)。
-    let grid_h = area.h - VEL_LANE_H - RULER_H;
+    let grid_h = body.h - VEL_LANE_H - RULER_H;
     let grid_rect = Rect {
-        x: area.x + KEYBOARD_W,
-        y: area.y + RULER_H,
-        w: area.w - KEYBOARD_W,
+        x: body.x + KEYBOARD_W,
+        y: body.y + RULER_H,
+        w: body.w - KEYBOARD_W,
         h: grid_h,
     };
+
+    // auto-fit (X キー / Fit ボタン / SelectClip 経由) のために、現フレームの grid 領域
+    // サイズを記録する。1 frame 遅延で OK (X キー押下の次フレームに反映される)。
+    let grid_size = (grid_rect.w, grid_rect.h);
+    if app.last_pianoroll_grid_size != grid_size {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.last_pianoroll_grid_size = grid_size;
+        }));
+    }
 
     let widget_notes = build_widget_notes(app, target);
     let zoom_x = app.pianoroll_zoom_x.max(4.0);
@@ -64,6 +97,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         ruler_h: RULER_H,
         bpm: app.song.bpm,
         time_sig: app.song.time_sig,
+        snap: snap::piano_roll_snap_config(app),
     };
     let style = PianoRollStyle::default();
     let resize_handle_px = style.resize_handle_px;
@@ -79,7 +113,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         track: target.track,
                         clip: target.clip,
                         start_beat: n.start_beat,
-                        duration: n.len_beats,
+                        duration: app.last_note_duration_beats,
                         pitch: n.pitch,
                     });
                 })
@@ -128,7 +162,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     let resp = ui.piano_roll(
         "piano_roll",
-        area,
+        body,
         &widget_notes,
         view,
         &app.selected_notes,
@@ -136,14 +170,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         make_edit,
     );
 
-    // 空白上 dbl-click → AddNote (1/16 grid snap、gui_01 #003 のサンプルベース)
+    // 空白上 dbl-click → AddNote (snap_choice / Alt 押下を尊重)。
     if let Some((px, py)) = ui.take_double_click_in_rect(grid_rect)
         && note_hit(&widget_notes, view, grid_rect, px, py, resize_handle_px).is_none()
     {
         let beat_to_px = grid_rect.w as f64 / view.len_beats.max(1e-6);
         let pitch_to_px = grid_rect.h / view.pitch_visible.max(1e-6);
         let beat_raw = view.start_beat + (px - grid_rect.x) as f64 / beat_to_px;
-        let snapped_beat = ((beat_raw * 16.0).round() / 16.0).max(0.0);
+        let cfg = snap::piano_roll_snap_config(app);
+        let alt = ui.pointer().modifiers.alt;
+        let snapped_beat = cfg.snap_beat(beat_raw, alt, app.pianoroll_zoom_x).max(0.0);
         let pitch_raw = view.pitch_top - (py - grid_rect.y) / pitch_to_px;
         let pitch = (pitch_raw.round() as i32).clamp(0, 127) as u8;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -151,13 +187,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 track: target.track,
                 clip: target.clip,
                 start_beat: snapped_beat,
-                duration: DEFAULT_NOTE_DURATION,
+                duration: app.last_note_duration_beats,
                 pitch,
             });
         }));
     }
 
     // wheel handler — note drag 中は無効
+    // 一般的な DAW (Ableton Live / Reaper) 流: Ctrl=横ズーム, Alt=縦ズーム,
+    // Shift=横スクロール, plain=ピッチスクロール (上下)。
     if resp.dragging.is_none() {
         let pointer = ui.pointer();
         if let Some((px, py)) = pointer.pos
@@ -169,11 +207,36 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 let top_pitch = app.pianoroll_top_pitch as i32;
                 let modifiers = pointer.modifiers;
                 if modifiers.ctrl {
+                    // Ctrl+wheel: 横ズーム。マウス位置の拍を anchor として保持する
+                    // (一般的な DAW の挙動)。new_scroll = anchor_beat - (px-grid.x)/new_zoom。
+                    let factor = (sy * 0.005).exp();
+                    let new_zoom = (zoom_x * factor).clamp(8.0, 400.0);
+                    if (new_zoom - zoom_x).abs() > 1e-3 {
+                        let anchor_beat =
+                            f64::from(scroll_beat) + f64::from((px - grid_rect.x) / zoom_x);
+                        let new_scroll =
+                            (anchor_beat - f64::from((px - grid_rect.x) / new_zoom)).max(0.0)
+                                as f32;
+                        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                            app.handle_event(AppEvent::SetPianoRollZoomX(new_zoom));
+                            app.handle_event(AppEvent::SetPianoRollScrollX(new_scroll));
+                        }));
+                    }
+                } else if modifiers.alt {
+                    // Alt+wheel: 縦ズーム。マウス位置のピッチを anchor として保持。
+                    // top_pitch は u8 なので round 後 best-effort。
                     let factor = (sy * 0.005).exp();
                     let new_zoom = (zoom_y * factor).clamp(6.0, 40.0);
-                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::SetPianoRollZoomY(new_zoom));
-                    }));
+                    if (new_zoom - zoom_y).abs() > 1e-3 {
+                        let anchor_pitch =
+                            f32::from(top_pitch as u8) - (py - grid_rect.y) / zoom_y;
+                        let new_top_f = anchor_pitch + (py - grid_rect.y) / new_zoom;
+                        let new_top = new_top_f.round().clamp(11.0, 127.0) as u8;
+                        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                            app.handle_event(AppEvent::SetPianoRollZoomY(new_zoom));
+                            app.handle_event(AppEvent::SetPianoRollTopPitch(new_top));
+                        }));
+                    }
                 } else if modifiers.shift {
                     let dx_beats = -(sx + sy) / zoom_x;
                     let new_scroll = (scroll_beat + dx_beats).max(0.0);
@@ -193,6 +256,65 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
     }
 
+}
+
+/// 上部 24 px の Snap toolbar を描画。
+/// 配置: [Snap toggle 60px] [snap unit dropdown 90px] [Fit button 50px]
+fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
+    ui.panel("pr_toolbar_bg", rect, COLOR_BG, 0.0);
+
+    let pad = 6.0;
+    let h = 18.0;
+    let y = rect.y + (rect.h - h) * 0.5;
+
+    let toggle_w = 60.0;
+    let dropdown_w = 90.0;
+    let fit_w = 50.0;
+
+    let toggle_rect = Rect { x: rect.x + pad, y, w: toggle_w, h };
+    let dropdown_rect = Rect {
+        x: toggle_rect.x + toggle_rect.w + pad,
+        y,
+        w: dropdown_w,
+        h,
+    };
+    let fit_rect = Rect {
+        x: dropdown_rect.x + dropdown_rect.w + pad,
+        y,
+        w: fit_w,
+        h,
+    };
+
+    ui.toggle_button_at(
+        "pr_snap_toggle",
+        "Snap",
+        toggle_rect,
+        app.pianoroll_snap_enabled,
+        &SNAP_TOGGLE_STYLE,
+        |new| {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetPianoRollSnapEnabled(new));
+            })
+        },
+    );
+
+    if let Some(idx) = ui.dropdown(
+        "pr_snap_unit",
+        dropdown_rect,
+        SNAP_LABELS,
+        app.pianoroll_snap_choice as usize,
+    ) {
+        let new = idx as u8;
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::SetPianoRollSnapChoice(new));
+        }));
+    }
+
+    ui.button_at("pr_fit", "Fit", fit_rect, || {
+        Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::FitPianoRollToClip);
+        })
+    });
 }
 
 /// `daw_ui_core::Note` 形式に変換 (毎フレーム alloc、widget 内 cached で性能 OK)。

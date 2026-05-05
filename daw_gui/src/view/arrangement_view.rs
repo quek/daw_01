@@ -8,17 +8,53 @@ use std::sync::Arc;
 
 use daw_ui_core::{
     ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack,
-    ArrangementView, ClipKey, Edit, Ui,
+    ArrangementView, ClipKey, Edit, ToggleButtonStyle, Ui,
 };
 use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent, ClipRef};
 use crate::view::mixer_strips::{amp_to_fader, fader_to_amp};
+use crate::view::snap::{self, SNAP_LABELS};
 
 const TRACK_HEADER_W: f32 = 160.0;
 const RULER_H: f32 = 20.0;
+const TOOLBAR_H: f32 = 24.0;
+const COLOR_TOOLBAR_BG: Color = Color { r: 0.10, g: 0.10, b: 0.12, a: 1.0 };
+
+const SNAP_TOGGLE_STYLE: ToggleButtonStyle = ToggleButtonStyle {
+    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
+    on_color: Color { r: 0.30, g: 0.50, b: 0.70, a: 1.0 },
+    hint_band: None,
+    hint_band_h: 2.0,
+    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    border_width: 1.0,
+    radius: 3.0,
+    font_size: 12.0,
+    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+};
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
+    // 上部 24 px を Snap toolbar に。残りを arrangement widget に渡す。
+    let toolbar_rect = Rect { x: area.x, y: area.y, w: area.w, h: TOOLBAR_H };
+    let body = Rect {
+        x: area.x,
+        y: area.y + TOOLBAR_H,
+        w: area.w,
+        h: (area.h - TOOLBAR_H).max(0.0),
+    };
+    draw_snap_toolbar(app, ui, toolbar_rect);
+    let area = body;
+
+    // auto-fit (X キー / Fit ボタン) のために、現フレームの canvas (lanes) サイズを記録。
+    let canvas_w = (area.w - TRACK_HEADER_W).max(0.0);
+    let canvas_h = (area.h - RULER_H).max(0.0);
+    let canvas_size = (canvas_w, canvas_h);
+    if app.last_arrange_canvas_size != canvas_size {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.last_arrange_canvas_size = canvas_size;
+        }));
+    }
+
     let tracks: Vec<ArrangementTrack> = app
         .song
         .tracks
@@ -104,9 +140,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         data_generation,
         bpm: app.song.bpm,
         time_sig: app.song.time_sig,
+        snap: snap::arrange_snap_config(app),
     };
 
     let style = ArrangementStyle::default();
+
+    // arrangement widget へ流す Edit 生成。
+    // gui_01 #010 (M14 Phase 60) 以降、DoubleClickEmpty.beat / MoveClips / ResizeClips の
+    // delta は widget 内で snap 済み (Alt 一時無効化も内部処理) なので、daw_01 側で
+    // post-process は不要。
 
     let resp = ui.arrangement(
         "arrangement",
@@ -232,12 +274,13 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
             })
         }
         ArrangementEditRequest::DoubleClickEmpty { track, beat } => {
+            // gui_01 #010 (M14 Phase 60) 以降、widget 内 snap 済み (Alt 一時無効化込み)。
+            let start_beat = beat.max(0.0);
             Edit::mutate(move |app: &mut AppData| {
                 if let Some(t_idx) = app.song.tracks.iter().position(|t| t.id == track) {
-                    let snapped = beat.floor().max(0.0);
                     app.handle_event(AppEvent::CreateClip {
                         track: t_idx as u32,
-                        start_beat: snapped,
+                        start_beat,
                     });
                     app.handle_event(AppEvent::SelectBottomPanel(1));
                 }
@@ -365,4 +408,63 @@ fn clip_key_to_ref(app: &AppData, key: ClipKey) -> Option<ClipRef> {
     let t_idx = app.song.tracks.iter().position(|t| t.id == key.track)?;
     let c_idx = app.song.tracks[t_idx].clips.iter().position(|c| c.id == key.clip)?;
     Some(ClipRef { track: t_idx as u32, clip: c_idx as u32 })
+}
+
+/// 上部 24 px の Snap toolbar を描画。
+/// 配置: [Snap toggle 60px] [snap unit dropdown 90px] [Fit button 50px]
+fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
+    ui.panel("arr_toolbar_bg", rect, COLOR_TOOLBAR_BG, 0.0);
+
+    let pad = 6.0;
+    let h = 18.0;
+    let y = rect.y + (rect.h - h) * 0.5;
+
+    let toggle_w = 60.0;
+    let dropdown_w = 90.0;
+    let fit_w = 50.0;
+
+    let toggle_rect = Rect { x: rect.x + pad, y, w: toggle_w, h };
+    let dropdown_rect = Rect {
+        x: toggle_rect.x + toggle_rect.w + pad,
+        y,
+        w: dropdown_w,
+        h,
+    };
+    let fit_rect = Rect {
+        x: dropdown_rect.x + dropdown_rect.w + pad,
+        y,
+        w: fit_w,
+        h,
+    };
+
+    ui.toggle_button_at(
+        "arr_snap_toggle",
+        "Snap",
+        toggle_rect,
+        app.arrange_snap_enabled,
+        &SNAP_TOGGLE_STYLE,
+        |new| {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetArrangeSnapEnabled(new));
+            })
+        },
+    );
+
+    if let Some(idx) = ui.dropdown(
+        "arr_snap_unit",
+        dropdown_rect,
+        SNAP_LABELS,
+        app.arrange_snap_choice as usize,
+    ) {
+        let new = idx as u8;
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::SetArrangeSnapChoice(new));
+        }));
+    }
+
+    ui.button_at("arr_fit", "Fit", fit_rect, || {
+        Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::FitArrangeToContent);
+        })
+    });
 }

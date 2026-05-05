@@ -66,7 +66,7 @@ pub fn build_root(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize)
     // gui_01 widget (piano_roll 等) は `take_shortcut` を消費する側面があるため、
     // 先に root レベルで shortcut を捌いて広域の挙動を確定させる。widget 描画時には
     // 消費済みになり、widget 内蔵の同名 shortcut handler は no-op に縮退する。
-    dispatch_shortcuts(app, ui);
+    dispatch_shortcuts(app, ui, bottom_rect);
 
     draw_menu_bar(ui, menu_rect);
     transport::draw(app, ui, transport_rect);
@@ -131,7 +131,10 @@ fn draw_menu_bar(ui: &mut Ui<'_, AppData>, rect: Rect) {
 /// 要求に変換する。`Ui::take_shortcut` は 1 度だけ消費するので、各 name について
 /// この関数で一括処理する。`app` は immut で受けて、コピーや状態判定のみで使う
 /// (mutation は `Ui::push_edit(Edit::mutate(...))` 経由)。
-fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>) {
+///
+/// `bottom_rect` は piano_roll active 判定用。マウスが bottom_panel 領域内 + Piano Roll
+/// タブが選択中なら G/X/1/2/3 を piano_roll 系に流す。それ以外は arrange 系。
+fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect) {
     // ----- Transport -----
     if ui.take_shortcut("daw.play_toggle") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
@@ -212,6 +215,63 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>) {
                 app.handle_event(AppEvent::DeleteSelectedNotes);
             } else {
                 app.handle_event(AppEvent::DeleteSelectedClip);
+            }
+        }));
+    }
+
+    // ----- Grid snap / fit -----
+    // active view 判定: マウスが bottom_panel 領域内 AND Piano Roll タブ選択中なら
+    // piano_roll 系、それ以外 (arrangement 領域 / Mixer タブ等) は arrange 系へ。
+    // タブ選択だけで判定すると、Piano Roll タブを開いたまま arrangement を
+    // 操作している時もショートカットが piano_roll 側に流れてしまう。
+    // focus 中の text_input は ShortcutMap 側で is_typing_only 判定により抑止される。
+    let pointer_in_bottom = ui
+        .pointer()
+        .pos
+        .is_some_and(|(px, py)| bottom_rect.contains(px, py));
+    let is_pianoroll_active = app.bottom_panel == 1 && pointer_in_bottom;
+    if ui.take_shortcut("daw.toggle_snap") {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            if is_pianoroll_active {
+                app.handle_event(AppEvent::TogglePianoRollSnap);
+            } else {
+                app.handle_event(AppEvent::ToggleArrangeSnap);
+            }
+        }));
+    }
+    if ui.take_shortcut("daw.fit_view") {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            if is_pianoroll_active {
+                app.handle_event(AppEvent::FitPianoRollToClip);
+            } else {
+                app.handle_event(AppEvent::FitArrangeToContent);
+            }
+        }));
+    }
+    if ui.take_shortcut("daw.narrow_grid") {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            if is_pianoroll_active {
+                app.handle_event(AppEvent::NarrowPianoRollGrid);
+            } else {
+                app.handle_event(AppEvent::NarrowArrangeGrid);
+            }
+        }));
+    }
+    if ui.take_shortcut("daw.widen_grid") {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            if is_pianoroll_active {
+                app.handle_event(AppEvent::WidenPianoRollGrid);
+            } else {
+                app.handle_event(AppEvent::WidenArrangeGrid);
+            }
+        }));
+    }
+    if ui.take_shortcut("daw.toggle_triplet") {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            if is_pianoroll_active {
+                app.handle_event(AppEvent::TogglePianoRollTriplet);
+            } else {
+                app.handle_event(AppEvent::ToggleArrangeTriplet);
             }
         }));
     }
