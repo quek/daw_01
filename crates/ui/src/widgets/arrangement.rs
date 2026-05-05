@@ -26,6 +26,7 @@ use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
+use crate::snap::SnapConfig;
 use crate::time::{TimeDisplay, TimeMapping};
 use crate::ui::Ui;
 use crate::viewport::ViewportState1D;
@@ -101,6 +102,10 @@ pub struct ArrangementView {
     /// `(6, 8)` で 6/8。内部で `numerator * 4 / denominator` (= beats_per_bar) に変換
     /// (3/4 → 3, 6/8 → 3)。
     pub time_sig: (u8, u8),
+    /// (M9 Phase 45f) drag overlay と commit 値、 dblclick `beat` の grid 吸着設定 (#010 [Replied])。
+    /// `Default::default()` は `Adaptive` ON。 raw 動作を保ちたい caller は `SnapConfig::OFF` を渡す。
+    /// drag 中 `pointer.modifiers.alt` で一時無効化。
+    pub snap: SnapConfig,
 }
 
 impl Default for ArrangementView {
@@ -118,6 +123,7 @@ impl Default for ArrangementView {
             data_generation: 0,
             bpm: 120.0,
             time_sig: (4, 4),
+            snap: SnapConfig::DEFAULT,
         }
     }
 }
@@ -641,6 +647,12 @@ struct ClipDragSession {
     /// winit の implementation によっては press 位置のままになる事があるため、release では
     /// `last_mouse` を delta 計算に使う (drag preview と一致する位置で確定する)。
     last_mouse: (f32, f32),
+    /// drag 中の最終 alt 状態。 drag overlay と release commit の **両方** がこれを真値とする
+    /// (`pointer.modifiers.alt` を直接見ない)。 continuation frame で毎 frame update し、
+    /// release frame では `allow_update = false` で skip することで release 直前の値を保持する。
+    /// これにより OS event 順序 (ModifiersChanged が MouseInput(Released) より先に来るケース)
+    /// に依存せず、 overlay と commit が必ず同一値で確定する。
+    last_alt: bool,
     anchors: Vec<ClipDragAnchor>,
 }
 
@@ -692,6 +704,28 @@ pub(crate) struct ArrangementState {
     loop_drag: Option<LoopDragSession>,
     track_reorder: Option<TrackReorderSession>,
     track_volume_drag: Option<TrackVolumeDragSession>,
+}
+
+/// 絶対位置 snap で計算した clip drag の beat delta (overlay と release commit で共有)。
+/// anchor 0 の編集対象端 (Move=start / ResizeRight=end / ResizeLeft=start) の絶対位置を
+/// snap → その差分を全 anchor に適用 (相対関係維持 + anchor 0 が grid に着地)。
+/// anchors が空のときは raw を返す (defensive)。
+fn compute_clip_drag_beat_delta(
+    nd: &ClipDragSession,
+    raw_beat_delta: f64,
+    snap: &SnapConfig,
+    zoom_x_px_per_beat: f32,
+) -> f64 {
+    let Some(a0) = nd.anchors.first() else {
+        return raw_beat_delta;
+    };
+    let pivot = match nd.kind {
+        ClipDragKind::Move | ClipDragKind::ResizeLeft => a0.start_beat,
+        ClipDragKind::ResizeRight => a0.start_beat + a0.len_beats,
+    };
+    let snapped_pivot =
+        snap.snap_beat(pivot + raw_beat_delta, nd.last_alt, zoom_x_px_per_beat);
+    snapped_pivot - pivot
 }
 
 // ============================================================
@@ -880,6 +914,7 @@ fn drag_preview_geometry(
     beat_delta: f64,
     track_delta: i32,
     n_tracks: usize,
+    min_len: f64,
 ) -> (f64, f64, usize) {
     match kind {
         ClipDragKind::Move => {
@@ -893,14 +928,14 @@ fn drag_preview_geometry(
         }
         ClipDragKind::ResizeRight => (
             anchor.start_beat,
-            (anchor.len_beats + beat_delta).max(0.05),
+            (anchor.len_beats + beat_delta).max(min_len),
             anchor.track_index,
         ),
         ClipDragKind::ResizeLeft => {
-            let max_start = anchor.start_beat + anchor.len_beats - 0.05;
+            let max_start = anchor.start_beat + anchor.len_beats - min_len;
             let new_start = (anchor.start_beat + beat_delta).clamp(0.0, max_start);
             let actual_delta = new_start - anchor.start_beat;
-            (new_start, (anchor.len_beats - actual_delta).max(0.05), anchor.track_index)
+            (new_start, (anchor.len_beats - actual_delta).max(min_len), anchor.track_index)
         }
     }
 }
@@ -915,10 +950,11 @@ fn draw_drag_preview<M: ?Sized + 'static>(
     n_tracks: usize,
     beat_delta: f64,
     track_delta: i32,
+    min_len: f64,
 ) {
     for a in &nd.anchors {
         let (start, len, new_idx) =
-            drag_preview_geometry(*a, nd.kind, beat_delta, track_delta, n_tracks);
+            drag_preview_geometry(*a, nd.kind, beat_delta, track_delta, n_tracks, min_len);
         let preview_clip = ArrangementClip {
             id: a.key.clip,
             start_beat: start,
@@ -1061,11 +1097,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     }
                 }
                 if !anchors.is_empty() {
+                    let press_alt = pointer.modifiers.alt;
                     let state: &mut ArrangementState = self.widget_state(wid);
                     state.clip_drag = Some(ClipDragSession {
                         kind,
                         anchor_mouse: (px, py),
                         last_mouse: (px, py),
+                        last_alt: press_alt,
                         anchors,
                     });
                 }
@@ -1133,21 +1171,40 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ---- drag continue / release 検出 ----
-        // 1) drag 中なら毎フレーム last_mouse / last_mouse_x / last_mouse_y を update (release frame の
-        //    pointer.pos が winit によっては press 位置のままになる事があるため、widget
-        //    state 側で drag 中の最終位置を確実に保持する)。
+        // drag 中なら continuation frame で `last_mouse` / `last_alt` (および各 drag の last_*) を
+        // update。 **release frame の `last_alt` は update しない** — 同 frame に
+        // ModifiersChanged(alt=false) が先行する現象 (alt が一瞬 false に化ける) を回避するため、
+        // release 直前 frame の値を保持する。 **release frame の `last_mouse` は pointer.pos が
+        // anchor と異なる場合のみ update** — winit は release frame で `pointer.pos` を press 位置
+        // に戻すことがあり、 そのまま上書きすると delta = 0 で commit not pushed (drag が「元に戻る」
+        // ように見える)。 pointer.pos == anchor のときは continuation 由来の last_mouse を保持し、
+        // そうでないときは pointer.pos が真値 (= 通常 release pos、 OR press → 1 frame で release した
+        // short drag の release pos) として update する。
         if let Some((px, py)) = pointer.pos {
+            let alt_now = pointer.modifiers.alt;
+            let is_release = pointer.primary_just_released;
             let state: &mut ArrangementState = self.widget_state(wid);
             if let Some(ref mut nd) = state.clip_drag {
-                nd.last_mouse = (px, py);
+                if !is_release {
+                    nd.last_mouse = (px, py);
+                    nd.last_alt = alt_now;
+                } else if (px, py) != nd.anchor_mouse {
+                    nd.last_mouse = (px, py);
+                }
             }
-            if let Some(ref mut ld) = state.loop_drag {
+            if let Some(ref mut ld) = state.loop_drag
+                && !is_release
+            {
                 ld.last_mouse_x = px;
             }
-            if let Some(ref mut tr) = state.track_reorder {
+            if let Some(ref mut tr) = state.track_reorder
+                && !is_release
+            {
                 tr.last_mouse_y = py;
             }
-            if let Some(ref mut tv) = state.track_volume_drag {
+            if let Some(ref mut tv) = state.track_volume_drag
+                && !is_release
+            {
                 tv.last_mouse_x = px;
             }
         }
@@ -1194,7 +1251,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let dx = nd.last_mouse.0 - nd.anchor_mouse.0;
                 let dy = nd.last_mouse.1 - nd.anchor_mouse.1;
                 let dist = dx.abs() + dy.abs();
-                if dist < 16.0 {
+                // 短 click 化 (drag → click 格下げ) の閾値は **mouse jitter を ignore する程度** (4px) に
+                // 抑える。 旧実装の 16px 閾値は過剰で、 user が「ちょっとずらす」 操作も吸収して
+                // しまい release で元位置 (= 通常 grid 上) に戻る → 「grid に飛ぶ」 symptom の主因。
+                // 適用条件:
+                //   - **Resize (Left/Right)** は閾値関係なく常に commit (resize handle 上の click は
+                //     意味がない、 短 drag でも長さ変更を反映すべき)。
+                //   - **Move** で **Alt なし** のときのみ jitter 閾値で短 click 化。 click vs drag の
+                //     区別が必要なのは Move のみ (click = selection 切替、 drag = 移動)。
+                //   - **Alt 押下中** は Move でも閾値 skip (Alt は raw 微調整の明示意図)。
+                let is_move = matches!(nd.kind, ClipDragKind::Move);
+                let demote = is_move && !nd.last_alt && dist < 4.0;
+                if demote {
                     (None, Some(nd.last_mouse))
                 } else {
                     (Some(nd), None)
@@ -1278,13 +1346,28 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         // drag overlay delta (last_mouse ベース、release と一貫)
         let beat_per_px = view.len_beats / f64::from(lanes.w.max(1.0));
+        // M9 Phase 45f: snap 用 zoom = lanes.w / view.len_beats (Adaptive 計算用)。
+        let zoom_x_px_per_beat: f32 = (1.0 / beat_per_px) as f32;
         let row_per_px = 1.0_f32 / view.track_row_h.max(1.0);
         let clip_drag_overlay: Option<(ClipDragSession, f64, i32)> = clip_drag_session
             .as_ref()
             .map(|nd| {
                 let dx = nd.last_mouse.0 - nd.anchor_mouse.0;
                 let dy = nd.last_mouse.1 - nd.anchor_mouse.1;
-                let beat_delta = f64::from(dx) * beat_per_px;
+                let raw = f64::from(dx) * beat_per_px;
+                // **絶対位置 snap** (= Cubase / Live と同じ「nearest grid alignment」 動作):
+                // anchor 0 の編集対象端 (Move=start / ResizeRight=end / ResizeLeft=start) の絶対位置を
+                // grid に round → その差分 (`adjusted_delta`) を全 anchor に同じだけ適用する。
+                // delta-snap (= raw_delta だけを round) だと anchor が grid 外に既にずれていた場合
+                // (例: 前回 Alt+drag で +0.078 拍ずらした) に release してもずれが永久残る。
+                // 絶対 snap なら anchor 0 が必ず grid 上に着地し、 複数選択は相対関係を維持。
+                // alt は drag state の `last_alt` を真値とし、 `pointer.modifiers.alt` を直接見ない。
+                let beat_delta = compute_clip_drag_beat_delta(
+                    nd,
+                    raw,
+                    &view.snap,
+                    zoom_x_px_per_beat,
+                );
                 #[allow(clippy::cast_possible_truncation)]
                 let track_delta = (dy * row_per_px).round() as i32;
                 (nd.clone(), beat_delta, track_delta)
@@ -1406,6 +1489,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let view_copy = view;
         let selected_set: HashSet<ClipKey> = selected_clips.iter().copied().collect();
         let drag_overlay_clone = clip_drag_overlay.clone();
+        // M9 Phase 45f: drag overlay の Resize min_len は snap unit (snap_unit < 0.05 なら 0.05)。
+        // release 側 min_len と一貫させるため、 alt 真値は drag session の `last_alt` を使う
+        // (overlay と release commit が必ず同一 unit で確定する)。 overlay 不在時 (drag していない)
+        // は min_len 自体使われないので、 alt = false で適当な値で初期化しておけばよい。
+        let drag_overlay_alt =
+            clip_drag_overlay.as_ref().is_some_and(|(nd, _, _)| nd.last_alt);
+        let drag_overlay_min_len: f64 = if view.snap.is_active(drag_overlay_alt) {
+            view.snap.beat_unit(zoom_x_px_per_beat).map_or(0.05, |u| u.max(0.05))
+        } else {
+            0.05
+        };
         let loop_preview_clone = loop_drag_preview_range;
         let header_pane_copy = header_pane;
         // M10 Phase 46: track reorder の drag preview に必要な情報 (anchor index / 現在 mouse_y / target idx)。
@@ -1495,6 +1589,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     tracks_owned.len(),
                     bd,
                     td,
+                    drag_overlay_min_len,
                 );
             }
             // loop band: drag preview がある場合は preview を描く、無ければ view.loop_range
@@ -1560,14 +1655,35 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ---- clip drag release → MoveClips / ResizeClips ----
+        // M9 Phase 60: anchor 0 の delta を `view.snap.snap_beat_delta` で round → 全 anchor に
+        // 同 delta 適用。 Resize の min_len は snap unit に合わせる (snap_unit < 0.05 なら 0.05)。
+        // **alt は drag 中の最終 `nd.last_alt` を真値とする** — release frame の `pointer.modifiers.alt`
+        // は OS event 順序 (ModifiersChanged が MouseInput(Released) より先に届く) によって false に
+        // 化けることがあるため信用しない。 `last_alt` は continuation frame で更新され release frame
+        // では `allow_update = false` で保持されるので OS event 順序に依存しない。 overlay の snap
+        // 判定とも同一値で確定し、 「release で grid に飛ぶ」 不整合が起きない。
         let clip_drag_release_was_some = clip_drag_release.is_some();
         if let Some(nd) = clip_drag_release {
+            let release_alt = nd.last_alt;
             let (beat_delta, track_delta): (f64, i32) = {
                 let dx = nd.last_mouse.0 - nd.anchor_mouse.0;
                 let dy = nd.last_mouse.1 - nd.anchor_mouse.1;
+                let raw = f64::from(dx) * beat_per_px;
+                // 絶対位置 snap (overlay と一貫)。 詳細は `compute_clip_drag_beat_delta` を参照。
+                let snapped = compute_clip_drag_beat_delta(
+                    &nd,
+                    raw,
+                    &view.snap,
+                    zoom_x_px_per_beat,
+                );
                 #[allow(clippy::cast_possible_truncation)]
                 let td = (dy * row_per_px).round() as i32;
-                (f64::from(dx) * beat_per_px, td)
+                (snapped, td)
+            };
+            let min_len = if view.snap.is_active(release_alt) {
+                view.snap.beat_unit(zoom_x_px_per_beat).map_or(0.05, |u| u.max(0.05))
+            } else {
+                0.05
             };
             match nd.kind {
                 ClipDragKind::Move => {
@@ -1602,7 +1718,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 ClipDragKind::ResizeRight => {
                     let mut deltas: Vec<ResizeClipDelta> = Vec::new();
                     for a in &nd.anchors {
-                        let new_len = (a.len_beats + beat_delta).max(0.05);
+                        let new_len = (a.len_beats + beat_delta).max(min_len);
                         if (new_len - a.len_beats).abs() > 1e-6 {
                             deltas.push(ResizeClipDelta {
                                 key: a.key,
@@ -1620,10 +1736,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 ClipDragKind::ResizeLeft => {
                     let mut deltas: Vec<ResizeClipDelta> = Vec::new();
                     for a in &nd.anchors {
-                        let max_start = a.start_beat + a.len_beats - 0.05;
+                        let max_start = a.start_beat + a.len_beats - min_len;
                         let new_start = (a.start_beat + beat_delta).clamp(0.0, max_start);
                         let actual = new_start - a.start_beat;
-                        let new_len = (a.len_beats - actual).max(0.05);
+                        let new_len = (a.len_beats - actual).max(min_len);
                         if (new_start - a.start_beat).abs() > 1e-6
                             || (new_len - a.len_beats).abs() > 1e-6
                         {
@@ -1813,7 +1929,15 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 track_index_from_y(cy, lanes.y, view.track_top, view.track_row_h)
                 && let Some(t) = tracks.get(idx)
             {
-                let beat = px_to_beat(cx, lanes.x, lanes.w, view);
+                let raw_beat = px_to_beat(cx, lanes.x, lanes.w, view);
+                // M9 Phase 45f: dblclick beat も widget 内 snap (#010 [Replied])。 daw_01 側で
+                // `beat.floor()` を消せるようになる。 single frame の click なので drag state は
+                // 関与せず、 直接 `pointer.modifiers.alt` を読んでよい。
+                let beat = view.snap.snap_beat(
+                    raw_beat,
+                    pointer.modifiers.alt,
+                    zoom_x_px_per_beat,
+                );
                 self.push_edit(make_edit(ArrangementEditRequest::DoubleClickEmpty {
                     track: t.id,
                     beat,
@@ -1975,6 +2099,8 @@ mod tests {
             data_generation: 0,
             bpm: 120.0,
             time_sig: (4, 4),
+            // 数値検証 test は raw beat 値を期待するので明示 OFF。
+            snap: SnapConfig::OFF,
         }
     }
 
@@ -2217,7 +2343,7 @@ mod tests {
             len_beats: 2.0,
             track_index: 0,
         };
-        let (s, l, idx) = drag_preview_geometry(anchor, ClipDragKind::Move, 1.5, 5, 3);
+        let (s, l, idx) = drag_preview_geometry(anchor, ClipDragKind::Move, 1.5, 5, 3, 0.05);
         assert!((s - 5.5).abs() < 1e-9);
         assert!((l - 2.0).abs() < 1e-9);
         // 0 + 5 = 5 → clamped to 2 (tracks=3 → max idx = 2)
@@ -2446,7 +2572,8 @@ mod tests {
             len_beats: 2.0,
             track_index: 1,
         };
-        let (s, l, idx) = drag_preview_geometry(anchor, ClipDragKind::ResizeLeft, 10.0, 0, 4);
+        let (s, l, idx) =
+            drag_preview_geometry(anchor, ClipDragKind::ResizeLeft, 10.0, 0, 4, 0.05);
         // max_start = 4 + 2 - 0.05 = 5.95 → new_start clamped to 5.95
         // actual_delta = 5.95 - 4 = 1.95 → new_len = 2 - 1.95 = 0.05
         assert!((s - 5.95).abs() < 1e-6);

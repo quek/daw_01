@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use daw_ui_core::{
     Edit, InputAccumulator, MoveDelta, Note, NoteId, NotesEditRequest, PianoRollResponse,
-    PianoRollStyle, PianoRollView, ResizeDelta, UiHost, hash_inputs,
+    PianoRollStyle, PianoRollView, ResizeDelta, SnapConfig, UiHost, hash_inputs,
 };
 use daw_ui_platform::{
     AppEvent, AppHost, PhysicalSize, ScrollDelta, WindowBackend, winit_backend,
@@ -91,6 +91,8 @@ impl PianoRollModel {
             ruler_h: 20.0,
             bpm: 120.0,
             time_sig: (4, 4),
+            // M9 Phase 45f (#010 [Replied]): デフォルト Adaptive snap で grid 吸着の動作確認。
+            snap: SnapConfig::DEFAULT,
         }
     }
 }
@@ -321,12 +323,20 @@ fn rect_for_widget(screen: PhysicalSize) -> Rect {
 }
 
 fn grid_rect_for_user_input(screen: PhysicalSize) -> Rect {
+    // M9 Phase 60 fix: ruler_h / velocity_lane_h を引いて widget 内部 grid と一致させる。
+    // これがズレると `note_hit` の grid.y origin が widget と app で異なり、 同じ note でも
+    // app は hit=None / widget は hit=Some となり pan と note drag が同時に走る既存 bug
+    // (Phase 55 ruler 追加以降)。 値は `App::view()` の `ruler_h: 20.0` / `velocity_lane_h: 0.0`
+    // と一致 (構造上 model から view を渡せば DRY だが、 grid_rect_for_user_input は app
+    // 側 layout 関数なので const と一致させる方針)。
+    const RULER_H: f32 = 20.0;
+    const VELOCITY_LANE_H: f32 = 0.0;
     let r = rect_for_widget(screen);
     Rect {
         x: r.x + KEYBOARD_W,
-        y: r.y,
+        y: r.y + RULER_H,
         w: (r.w - KEYBOARD_W).max(1.0),
-        h: r.h,
+        h: (r.h - RULER_H - VELOCITY_LANE_H).max(1.0),
     }
 }
 

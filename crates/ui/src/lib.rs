@@ -20,6 +20,7 @@ pub mod layout;
 pub mod popup;
 pub mod scenegraph;
 pub mod shortcut;
+pub mod snap;
 pub mod text_metrics;
 pub mod time;
 pub mod ui;
@@ -38,6 +39,7 @@ pub use input::{DroppedFiles, FrameInput, ImeEvent, InputAccumulator, PointerFra
 pub use widgets::drag_rect::DragRect;
 pub use layout::{FlexDirection, Gap, LayoutPass, NodeId, Padding};
 pub use scenegraph::{CachedCommands, SceneNode, Scenegraph, hash_inputs};
+pub use snap::{SnapConfig, SnapMode};
 pub use time::{TimeDisplay, TimeMapping};
 pub use daw_ui_platform::CursorIcon;
 pub use ui::{FrameStats, Ui, UiHost};

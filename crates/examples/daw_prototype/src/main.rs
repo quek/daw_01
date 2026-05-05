@@ -20,8 +20,8 @@ use daw_ui_core::{
     ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView,
     BarBeatGridStyle, ClipKey, DialogResult, Edit, FaderResponse, FileDialogFilter,
     InputAccumulator, LevelMeterStyle, ListViewStyle, MenuItemSpec, MeterBallistic, ModalStyle,
-    Orientation, ReorderableListEditRequest, ReorderableListStyle, TimeMapping, TimeRulerStyle,
-    UiHost, ViewportState1D,
+    Orientation, ReorderableListEditRequest, ReorderableListStyle, SnapConfig, TimeMapping,
+    TimeRulerStyle, UiHost, ViewportState1D,
 };
 use daw_ui_platform::{AppEvent, AppHost, WindowBackend, winit_backend};
 use daw_ui_renderer::{Color, Rect, RectCommand, Renderer, Scene};
@@ -123,6 +123,8 @@ impl DawModel {
             // M13 Phase 55: bpm + time_sig (4/4 で従来挙動維持)
             bpm: 120.0,
             time_sig: (4, 4),
+            // M9 Phase 45f (#010 [Replied]): デフォルト Adaptive snap で grid 吸着の動作確認。
+            snap: SnapConfig::DEFAULT,
         };
         Self {
             faders: [0.55, 0.70, 0.30, 0.60, 0.40, 0.80, 0.20, 0.55],

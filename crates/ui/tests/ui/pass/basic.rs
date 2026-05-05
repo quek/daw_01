@@ -144,6 +144,8 @@ fn main() {
                 ruler_h: 0.0,
                 bpm: 120.0,
                 time_sig: (4, 4),
+                // M9 Phase 45f: SnapConfig も non-Clone Model でコンパイル可能。
+                snap: daw_ui_core::SnapConfig::DEFAULT,
             };
             let style = PianoRollStyle::default();
             let _ = ui.piano_roll(

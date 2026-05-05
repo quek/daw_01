@@ -46,6 +46,7 @@ use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
+use crate::snap::SnapConfig;
 use crate::time::{TimeDisplay, TimeMapping};
 use crate::ui::Ui;
 use crate::viewport::ViewportState1D;
@@ -139,6 +140,10 @@ pub struct PianoRollView {
     /// (M13 Phase 55) 拍子 (numerator, denominator)。`(4, 4)` で 4/4、`(3, 4)` で 3/4、
     /// `(6, 8)` で 6/8。内部で `numerator * 4 / denominator` (= beats_per_bar) に変換。
     pub time_sig: (u8, u8),
+    /// (M9 Phase 45f) drag overlay と commit 値の grid 吸着設定 (#010 [Replied])。
+    /// `Default::default()` は `Adaptive` ON。 raw 動作を保ちたい caller は `SnapConfig::OFF` を渡す。
+    /// drag 中 `pointer.modifiers.alt` で一時無効化。
+    pub snap: SnapConfig,
 }
 
 /// piano roll が user に発行する Edit 要求の種別。
@@ -550,6 +555,39 @@ struct NoteDragSession {
     /// drag 開始時のマウス位置 (screen)。
     anchor_mouse: (f32, f32),
     anchors: Vec<NoteDragAnchor>,
+    /// drag 中の最終 pointer 位置 (M9 Phase 60、 arrangement.rs と同パターン)。
+    /// winit は release frame で `pointer.pos` を press 位置に戻すことがあり、 そのまま delta
+    /// 計算すると beat_delta = 0 で commit されない / 「元に戻る」 ように見える bug への対策。
+    /// release では `last_mouse` を delta 計算に使う = drag preview と一致する位置で確定。
+    last_mouse: (f32, f32),
+    /// drag 中の最終 alt 状態。 drag overlay と release commit の **両方** がこれを真値とする
+    /// (`pointer.modifiers.alt` を直接見ない)。 continuation frame で毎 frame update し、
+    /// release frame では `allow_update = false` で skip することで release 直前の値を保持する。
+    /// これにより OS event 順序 (ModifiersChanged が MouseInput(Released) より先に来るケース)
+    /// に依存せず、 overlay と commit が必ず同一値で確定する。
+    last_alt: bool,
+}
+
+/// 絶対位置 snap で計算した note drag の beat delta (overlay と release commit で共有)。
+/// anchor 0 の編集対象端 (Move=start / ResizeRight=end / ResizeLeft=start) の絶対位置を
+/// snap → その差分を全 anchor に適用 (相対関係維持 + anchor 0 が grid に着地)。 anchors が
+/// 空のときは raw を返す (defensive)。
+fn compute_note_drag_beat_delta(
+    nd: &NoteDragSession,
+    raw_beat_delta: f64,
+    snap: &SnapConfig,
+    zoom_x_px_per_beat: f32,
+) -> f64 {
+    let Some(a0) = nd.anchors.first() else {
+        return raw_beat_delta;
+    };
+    let pivot = match nd.kind {
+        NoteDragKind::Move | NoteDragKind::ResizeLeft => a0.start_beat,
+        NoteDragKind::ResizeRight => a0.start_beat + a0.len_beats,
+    };
+    let snapped_pivot =
+        snap.snap_beat(pivot + raw_beat_delta, nd.last_alt, zoom_x_px_per_beat);
+    snapped_pivot - pivot
 }
 
 /// piano_roll widget の永続状態 (`UiHost.state` に置かれる)。
@@ -590,6 +628,7 @@ fn drag_preview_geometry(
     kind: NoteDragKind,
     beat_delta: f64,
     pitch_delta: i32,
+    min_len: f64,
 ) -> (f64, f64, u8) {
     match kind {
         NoteDragKind::Move => (
@@ -599,14 +638,14 @@ fn drag_preview_geometry(
         ),
         NoteDragKind::ResizeRight => (
             anchor.start_beat,
-            (anchor.len_beats + beat_delta).max(0.05),
+            (anchor.len_beats + beat_delta).max(min_len),
             anchor.pitch,
         ),
         NoteDragKind::ResizeLeft => {
-            let max_start = anchor.start_beat + anchor.len_beats - 0.05;
+            let max_start = anchor.start_beat + anchor.len_beats - min_len;
             let new_start = (anchor.start_beat + beat_delta).clamp(0.0, max_start);
             let actual_delta = new_start - anchor.start_beat;
-            (new_start, (anchor.len_beats - actual_delta).max(0.05), anchor.pitch)
+            (new_start, (anchor.len_beats - actual_delta).max(min_len), anchor.pitch)
         }
     }
 }
@@ -778,16 +817,44 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 })
                 .collect();
             if !anchors.is_empty() {
+                let press_alt = pointer.modifiers.alt;
                 let state: &mut PianoRollState = self.widget_state(wid);
-                state.note_drag =
-                    Some(NoteDragSession { kind, anchor_mouse: (px, py), anchors });
+                state.note_drag = Some(NoteDragSession {
+                    kind,
+                    anchor_mouse: (px, py),
+                    anchors,
+                    last_mouse: (px, py),
+                    last_alt: press_alt,
+                });
             }
         }
 
         // ----- drag continue (描画用 delta を計算) + release 検出 -----
         // 拍は f64、pixel は f32 なので変換を 1 箇所で吸収。
         let beat_per_px: f64 = view.len_beats / f64::from(grid.w.max(1.0));
+        // SnapConfig::Adaptive 用 zoom = grid.w / view.len_beats。 0 除算は beat_per_px 側で対処済み。
+        let zoom_x_px_per_beat: f32 = (1.0 / beat_per_px) as f32;
         let pitch_per_px = view.pitch_visible / grid.h.max(1.0);
+        // drag 継続中は毎 continuation frame で `last_mouse` / `last_alt` を update。
+        // **release frame の `last_alt` は update しない** — 同 frame に ModifiersChanged(alt=false)
+        // が先行する現象 (alt が一瞬 false に化ける) を回避するため、 release 直前 frame の値を保持する。
+        // **release frame の `last_mouse` は pointer.pos が anchor と異なる場合のみ update** —
+        // winit は release frame で `pointer.pos` を press 位置に戻すことがあり、 そのまま上書きすると
+        // delta=0 で commit not pushed (drag が「元に戻る」 ように見える)。 pointer.pos == anchor のときは
+        // continuation 由来の last_mouse を保持し、 そうでないときは pointer.pos が真値 (= 通常 release
+        // pos、 OR press → 1 frame で release した short drag の release pos) として update する。
+        if let Some((px, py)) = pointer.pos {
+            let alt_now = pointer.modifiers.alt;
+            let state: &mut PianoRollState = self.widget_state(wid);
+            if let Some(ref mut nd) = state.note_drag {
+                if !pointer.primary_just_released {
+                    nd.last_mouse = (px, py);
+                    nd.last_alt = alt_now;
+                } else if (px, py) != nd.anchor_mouse {
+                    nd.last_mouse = (px, py);
+                }
+            }
+        }
         let drag_session: Option<NoteDragSession> = {
             let state: &mut PianoRollState = self.widget_state(wid);
             state.note_drag.clone()
@@ -802,10 +869,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         };
         let (drag_release, drag_short_click_pos): (Option<NoteDragSession>, Option<(f32, f32)>) =
             if let Some(nd) = drag_release_raw {
-                let dist = pointer.pos.map_or(0.0, |(px, py)| {
-                    (px - nd.anchor_mouse.0).abs() + (py - nd.anchor_mouse.1).abs()
-                });
-                if dist < 16.0 {
+                // dist 判定 / delta 計算は両者とも `nd.last_mouse` を真値とする (pointer.pos の
+                // winit-bug 化を上の continuation block で吸収済み)。 click 短縮は pointer.pos
+                // ではなく last_mouse 基準。
+                // 短 click 化 (drag → click 格下げ) の閾値は **mouse jitter を ignore する程度** (4px)。
+                //   - Resize (Left/Right) は常に commit (resize handle 上 click は意味なし)
+                //   - Move + Alt なしのみ jitter 閾値で短 click 化 (click=selection / drag=移動 の区別)
+                //   - Alt 押下中は Move でも閾値 skip (raw 微調整の明示意図)
+                let dist = (nd.last_mouse.0 - nd.anchor_mouse.0).abs()
+                    + (nd.last_mouse.1 - nd.anchor_mouse.1).abs();
+                let is_move = matches!(nd.kind, NoteDragKind::Move);
+                let demote = is_move && !nd.last_alt && dist < 4.0;
+                if demote {
                     (None, pointer.pos)
                 } else {
                     (Some(nd), None)
@@ -815,13 +890,24 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             };
 
         // drag 中の delta (pointer から計算)。beat_delta は f64、pitch_delta は i32 (整数 pitch 単位)。
+        // M9 Phase 45f: anchor 0 の delta を `view.snap.snap_beat_delta` で round → 全 anchor に
+        // 同 delta 適用 (相対関係維持)。 alt 押下で snap 一時無効化。
+        // alt は drag state の `last_alt` を真値とし、 `pointer.modifiers.alt` を直接見ない
+        // (release frame の commit と必ず同一値で確定するため)。
         let drag_overlay: Option<(NoteDragSession, f64, i32)> = drag_session
             .as_ref()
             .and_then(|nd| pointer.pos.map(|p| (nd.clone(), p)))
             .map(|(nd, (px, py))| {
                 let dx = px - nd.anchor_mouse.0;
                 let dy = py - nd.anchor_mouse.1;
-                let beat_delta = f64::from(dx) * beat_per_px;
+                let raw = f64::from(dx) * beat_per_px;
+                // 絶対位置 snap (詳細は `compute_note_drag_beat_delta` 参照、 arrangement と同パターン)。
+                let beat_delta = compute_note_drag_beat_delta(
+                    &nd,
+                    raw,
+                    &view.snap,
+                    zoom_x_px_per_beat,
+                );
                 let pitch_delta = (-(dy * pitch_per_px)).round() as i32;
                 (nd, beat_delta, pitch_delta)
             });
@@ -934,6 +1020,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let selected_set: HashSet<NoteId> = selected.iter().copied().collect();
         let drag_overlay_clone = drag_overlay.clone();
         let lyric_editing_for_draw = lyric_editing;
+        // M9 Phase 45f: drag overlay の Resize min_len は snap unit に合わせる
+        // (snap_unit < 0.05 なら 0.05)。 release 側 min_len と同じ計算で一貫性確保。 alt 真値は
+        // drag session の `last_alt` (overlay と release commit が必ず同一 unit で確定する)。
+        // overlay 不在時 (drag していない) は min_len 自体使われないので alt = false で適当に初期化。
+        let drag_overlay_alt = drag_overlay.as_ref().is_some_and(|(nd, _, _)| nd.last_alt);
+        let drag_overlay_min_len: f64 = if view.snap.is_active(drag_overlay_alt) {
+            view.snap.beat_unit(zoom_x_px_per_beat).map_or(0.05, |u| u.max(0.05))
+        } else {
+            0.05
+        };
 
         self.heavy(("piano_roll_inner", &id), move |hctx| {
             // === cached(): viewport_key 一致時に skip される背景レイヤ ===
@@ -983,7 +1079,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
             // drag preview (drag 中の shifted rect)
             if let Some((nd, bd, pd)) = drag_overlay_clone {
-                draw_drag_preview(hctx, &nd, view_copy, grid, &style_copy, bd, pd);
+                draw_drag_preview(
+                    hctx,
+                    &nd,
+                    view_copy,
+                    grid,
+                    &style_copy,
+                    bd,
+                    pd,
+                    drag_overlay_min_len,
+                );
             }
             // M14 Phase 59: lyric 描画 (selection overlay より後 = 黄色 fill に隠れない、
             // 編集中 note は text_input overlay に譲る)。 font_size は note 高さスケール。
@@ -1027,7 +1132,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         {
             let beat_to_px = f64::from(grid.w) / view.len_beats.max(1e-6);
             let pitch_to_px = grid.h / view.pitch_visible.max(1e-6);
-            let start_beat = (view.start_beat + f64::from(cx - grid.x) / beat_to_px).max(0.0);
+            let raw_start = (view.start_beat + f64::from(cx - grid.x) / beat_to_px).max(0.0);
+            // M9 Phase 45f: Insert は widget 内発火、grid 吸着が UX 自然 (#010 [Replied])。
+            // single frame の click なので drag state は関与せず、 直接 `pointer.modifiers.alt` を読む。
+            let start_beat = view
+                .snap
+                .snap_beat(raw_start, pointer.modifiers.alt, zoom_x_px_per_beat)
+                .max(0.0);
             let pitch_f = view.pitch_top - (cy - grid.y) / pitch_to_px;
             let pitch = (pitch_f.round() as i32).clamp(0, 127) as u8;
             // note id は user 側で next_note_id を bump して上書き。
@@ -1084,12 +1195,30 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ----- drag release → Move / Resize Edit 発行 -----
+        // M9 Phase 60: anchor 0 の delta を `view.snap.snap_beat_delta` で round → 全 anchor に
+        // 同 delta 適用。 Resize の min_len は snap unit に合わせる (snap_unit < 0.05 なら 0.05)。
+        // **alt は drag 中の最終 `nd.last_alt` を真値とする** — release frame の `pointer.modifiers.alt`
+        // は OS event 順序 (ModifiersChanged が MouseInput(Released) より先に届く) によって false に
+        // 化けることがあるため信用しない。 `last_alt` は continuation frame で更新され release frame
+        // では `allow_update = false` で保持されるので OS event 順序に依存しない。 overlay の snap
+        // 判定とも同一値で確定し、 「release で grid に飛ぶ」 不整合が起きない。
         if let Some(nd) = drag_release {
-            let (beat_delta, pitch_delta): (f64, i32) = pointer.pos.map_or((0.0, 0), |(px, py)| {
-                let dx = px - nd.anchor_mouse.0;
-                let dy = py - nd.anchor_mouse.1;
-                (f64::from(dx) * beat_per_px, (-(dy * pitch_per_px)).round() as i32)
-            });
+            let release_alt = nd.last_alt;
+            // pointer.pos に頼らず `nd.last_mouse` を使う (winit release frame で pointer.pos が
+            // press 位置に戻る既存問題、 arrangement と同パターン)。
+            let dx = nd.last_mouse.0 - nd.anchor_mouse.0;
+            let dy = nd.last_mouse.1 - nd.anchor_mouse.1;
+            let raw = f64::from(dx) * beat_per_px;
+            // 絶対位置 snap (overlay と一貫)。
+            let beat_delta =
+                compute_note_drag_beat_delta(&nd, raw, &view.snap, zoom_x_px_per_beat);
+            #[allow(clippy::cast_possible_truncation)]
+            let pitch_delta = (-(dy * pitch_per_px)).round() as i32;
+            let min_len = if view.snap.is_active(release_alt) {
+                view.snap.beat_unit(zoom_x_px_per_beat).map_or(0.05, |u| u.max(0.05))
+            } else {
+                0.05
+            };
 
             match nd.kind {
                 NoteDragKind::Move => {
@@ -1110,7 +1239,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 NoteDragKind::ResizeRight => {
                     let mut deltas: Vec<ResizeDelta> = Vec::new();
                     for a in &nd.anchors {
-                        let new_len = (a.len_beats + beat_delta).max(0.05);
+                        let new_len = (a.len_beats + beat_delta).max(min_len);
                         if (new_len - a.len_beats).abs() > 1e-6 {
                             deltas.push((
                                 a.id,
@@ -1128,10 +1257,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 NoteDragKind::ResizeLeft => {
                     let mut deltas: Vec<ResizeDelta> = Vec::new();
                     for a in &nd.anchors {
-                        let max_start = a.start_beat + a.len_beats - 0.05;
+                        let max_start = a.start_beat + a.len_beats - min_len;
                         let new_start = (a.start_beat + beat_delta).clamp(0.0, max_start);
                         let actual_delta = new_start - a.start_beat;
-                        let new_len = (a.len_beats - actual_delta).max(0.05);
+                        let new_len = (a.len_beats - actual_delta).max(min_len);
                         if (new_start - a.start_beat).abs() > 1e-6
                             || (new_len - a.len_beats).abs() > 1e-6
                         {
@@ -1522,6 +1651,7 @@ fn draw_selection_overlay<M: ?Sized + 'static>(
 }
 
 /// drag 中の shifted note rect (drag preview) を描画。
+#[allow(clippy::too_many_arguments)]
 fn draw_drag_preview<M: ?Sized + 'static>(
     hctx: &mut crate::widgets::heavy::HeavyCtx<'_, '_, M>,
     nd: &NoteDragSession,
@@ -1530,10 +1660,11 @@ fn draw_drag_preview<M: ?Sized + 'static>(
     style: &PianoRollStyle,
     beat_delta: f64,
     pitch_delta: i32,
+    min_len: f64,
 ) {
     for a in &nd.anchors {
         let (start_beat, len_beats, pitch) =
-            drag_preview_geometry(*a, nd.kind, beat_delta, pitch_delta);
+            drag_preview_geometry(*a, nd.kind, beat_delta, pitch_delta, min_len);
         let r = note_geometry_to_rect(start_beat, len_beats, pitch, view, grid);
         let x_left = r.x.max(grid.x);
         let x_right = (r.x + r.w).min(grid.x + grid.w);
@@ -1637,6 +1768,8 @@ mod tests {
             ruler_h: 0.0,
             bpm: 120.0,
             time_sig: (4, 4),
+            // 数値検証 test は raw beat 値を期待するので明示 OFF。
+            snap: SnapConfig::OFF,
         }
     }
 
