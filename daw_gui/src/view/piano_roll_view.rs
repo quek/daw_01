@@ -181,7 +181,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let alt = ui.pointer().modifiers.alt;
         let snapped_beat = cfg.snap_beat(beat_raw, alt, app.pianoroll_zoom_x).max(0.0);
         let pitch_raw = view.pitch_top - (py - grid_rect.y) / pitch_to_px;
-        let pitch = (pitch_raw.round() as i32).clamp(0, 127) as u8;
+        // ceil(): 描画式 `y = grid.y + (pitch_top - pitch) * pt` の逆関数。
+        // round() だと判定領域が視覚行の半行ぶん上にずれて、行下半クリックが 1 下に化ける。
+        let pitch = (pitch_raw.ceil() as i32).clamp(0, 127) as u8;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::AddNote {
                 track: target.track,
