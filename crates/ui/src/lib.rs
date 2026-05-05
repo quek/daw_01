@@ -20,6 +20,7 @@ pub mod layout;
 pub mod popup;
 pub mod scenegraph;
 pub mod shortcut;
+pub mod text_metrics;
 pub mod time;
 pub mod ui;
 pub mod viewport;

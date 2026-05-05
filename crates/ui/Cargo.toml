@@ -22,6 +22,9 @@ clipboard = ["dep:arboard"]
 daw-ui-platform.workspace = true
 daw-ui-renderer.workspace = true
 taffy = "0.10.1"
+# M14 Phase 58: text_input の cursor / selection 位置を proportional font の実 advance で計算するため、
+# cosmic-text を直接依存に追加 (renderer の glyphon 0.11 が使う 0.18.2 と同一バージョンで揃える)。
+cosmic-text = "0.18.2"
 rfd = { version = "0.15", optional = true }
 arboard = { version = "3", optional = true }
 

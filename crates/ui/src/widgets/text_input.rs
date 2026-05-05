@@ -1,12 +1,17 @@
-//! `text_input` ウィジェット — 1 行テキスト編集 (ASCII + UTF-8 char 単位)。
+//! `text_input` ウィジェット — 1 行テキスト編集 (UTF-8 / IME / OS 標準 selection)。
 //!
-//! Phase 4b: ASCII / 単純な char 単位編集。IME 対応は Phase 4c。
+//! - **Focus 取得時に全選択** (click / programmatic / `text_input_at_focused` 統一、F2 rename 標準挙動)
+//! - **anchor + cursor の 2 点 selection** (egui `CCursorRange` 流、anchor==cursor で no-selection)
+//! - **Shift+Arrow** で anchor 固定 cursor のみ動かして範囲拡張、修飾なし矢印で collapse / 移動
+//! - **Ctrl+A** で全選択、文字入力 / Backspace / Delete / IME Commit / Paste は **すべて
+//!   `replace_range(min..max, new)` 1 形式** に正規化して selection を範囲削除 → insert で完結
+//! - **Ctrl+C / Ctrl+V / Ctrl+X** で OS clipboard 経由の cut/copy/paste
+//! - **Delete** で selection あれば範囲削除、なければ cursor 後 1 char 削除
+//! - **Enter / Escape** は既存通り (Response.committed / 自己 blur)
+//! - **IME preedit/commit** は selection を末尾 collapse + 範囲 replace
 //!
-//! - クリックで focus 取得 (cursor は末尾に移動)
-//! - Backspace: cursor 直前の文字を削除
-//! - Arrow Left/Right: cursor を char 境界単位で移動
-//! - その他のキー入力 (`KeyEvent::text`): cursor 位置に挿入 (制御文字は除外)
-//! - Enter: 「commit された」と response で通知 (フォーカスは保ったまま、blur はアプリ側責務)
+//! shortcut layer 衝突 (piano_roll / arrangement の `take_shortcut("delete")` 等) は
+//! `Ui::set_typing_focus(true)` + `take_typing_shortcut(name)` で回避する (M14 Phase 57)。
 
 use std::hash::Hash;
 
@@ -24,11 +29,50 @@ use crate::ui::Ui;
 pub(crate) struct TextInputState {
     /// 直近の press がこの widget 内から始まったか (button と同じモデル)。
     press_started_inside: bool,
-    /// cursor の byte 位置。char 境界に揃っていることを保証する。
+    /// cursor の byte 位置 (selection の primary 端、Shift+Arrow で動く方)。
+    /// char 境界に揃っていることを保証する。
     cursor_byte: usize,
+    /// selection の anchor 端 (Shift+Arrow で固定される方)。
+    /// `anchor_byte == cursor_byte` で no-selection、不等で selection あり。
+    anchor_byte: usize,
     /// IME 変換中の preedit テキスト。空文字列なら preedit 中ではない。
     /// model.text には反映されず、描画のときに cursor 位置に挿入表示する。
     preedit: String,
+    /// 前フレームの focus 状態 (gained_focus 検知用)。
+    /// `was_focused == true && last_focused == false` で「focus 取得」と判定し全選択する。
+    last_focused: bool,
+}
+
+/// `text` の `from` 位置から左方向に直近の char 境界を返す (`from` が境界ならそのまま返す)。
+fn prev_char_boundary(text: &str, from: usize) -> usize {
+    let mut i = from.min(text.len());
+    while i > 0 && !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// `text` の `from` 位置から右方向に直近の char 境界を返す (`from` が境界ならそのまま返す)。
+fn next_char_boundary(text: &str, from: usize) -> usize {
+    let mut i = from.min(text.len());
+    while i < text.len() && !text.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// 範囲削除 ([min, max)) 一発。`cursor == anchor` (no-selection) なら何もせず false を返す。
+/// 削除すると `cursor = anchor = min` に collapse する。
+fn delete_range(working: &mut String, cursor: &mut usize, anchor: &mut usize) -> bool {
+    let lo = (*cursor).min(*anchor);
+    let hi = (*cursor).max(*anchor);
+    if lo == hi {
+        return false;
+    }
+    working.replace_range(lo..hi, "");
+    *cursor = lo;
+    *anchor = lo;
+    true
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -70,11 +114,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             click
         };
 
-        // Click inside → focus 取得 + cursor を末尾へ。
+        // Click inside → focus 取得 (cursor / anchor は下の gained_focus 検知で全選択する)。
         if click {
             self.set_focus(wid);
-            let state: &mut TextInputState = self.widget_state(wid);
-            state.cursor_byte = text.len();
         }
 
         // Press が rect 外で発生 + 自分が focus を持っていたら自己 blur。
@@ -85,31 +127,77 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         let was_focused = self.is_focused(wid);
 
-        // フォーカス中の入力処理 (IME → 通常キー の順)。
-        // 同じ working buffer に積んで、最後にまとめて Edit を 1 つだけ発行する。
+        // gained_focus 検知 + 全選択 (click / programmatic focus / `text_input_at_focused` 統一、
+        // F2 rename 標準挙動)。last_focused を mem::replace で更新しつつ、前 frame の値を比較。
+        {
+            let state: &mut TextInputState = self.widget_state(wid);
+            let prev = std::mem::replace(&mut state.last_focused, was_focused);
+            if was_focused && !prev {
+                state.anchor_byte = 0;
+                state.cursor_byte = text.len();
+            }
+        }
+
+        // フォーカス中の shortcut + IME + キー入力処理。selection を考慮して
+        // 文字入力 / Backspace / Delete / IME Commit / Paste は全部
+        // `replace_range(min..max, new)` 1 形式に正規化する。
         let mut new_text: Option<String> = None;
         let mut committed = false;
         let mut escape_pressed = false;
         if was_focused {
+            // typing-only shortcut (前フレームに `set_typing_focus(true)` を出していたフレームで
+            // shortcut layer から keyboard_events に残してある) を先に拾う。
+            let select_all_pressed = self.take_typing_shortcut("select_all");
+            let delete_pressed = self.take_typing_shortcut("delete");
+            let cut_pressed = self.take_typing_shortcut("cut");
+            let copy_pressed = self.take_typing_shortcut("copy");
+            let paste_pressed = self.take_typing_shortcut("paste");
+            let pasted_text = if paste_pressed {
+                self.take_clipboard_paste()
+            } else {
+                None
+            };
+
             let ime_events = self.take_ime_events_if_focused(wid);
             let key_events = self.take_keyboard_events_if_focused(wid);
-            if !ime_events.is_empty() || !key_events.is_empty() {
+            let mods = pointer.modifiers;
+            let any_input = select_all_pressed
+                || delete_pressed
+                || cut_pressed
+                || copy_pressed
+                || paste_pressed
+                || !ime_events.is_empty()
+                || !key_events.is_empty();
+
+            if any_input {
                 let state: &mut TextInputState = self.widget_state(wid);
                 let mut working = text.to_string();
                 let mut cursor = state.cursor_byte.min(working.len());
+                let mut anchor = state.anchor_byte.min(working.len());
                 let mut changed = false;
+                let mut clipboard_write: Option<String> = None;
 
-                // IME 先: preedit は state にだけ反映、commit は working に挿入。
+                // IME 先: preedit 開始時に selection を範囲削除して collapse、
+                // commit は (preedit 経由で既に collapse 済みのはずだが念のため) 再度範囲削除して insert。
                 for ev in ime_events {
                     match ev {
                         ImeEvent::Preedit { text: pre, .. } => {
+                            if state.preedit.is_empty()
+                                && delete_range(&mut working, &mut cursor, &mut anchor)
+                            {
+                                changed = true;
+                            }
                             state.preedit = pre;
                         }
                         ImeEvent::Commit(committed_text) => {
                             state.preedit.clear();
+                            if delete_range(&mut working, &mut cursor, &mut anchor) {
+                                changed = true;
+                            }
                             if !committed_text.is_empty() {
                                 working.insert_str(cursor, &committed_text);
                                 cursor += committed_text.len();
+                                anchor = cursor;
                                 changed = true;
                             }
                         }
@@ -123,32 +211,44 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     }
                     match ev.physical_key {
                         PhysicalKey::Backspace => {
-                            if cursor > 0 {
-                                let mut prev = cursor - 1;
-                                while prev > 0 && !working.is_char_boundary(prev) {
-                                    prev -= 1;
-                                }
+                            if delete_range(&mut working, &mut cursor, &mut anchor) {
+                                changed = true;
+                            } else if cursor > 0 {
+                                let prev = prev_char_boundary(&working, cursor - 1);
                                 working.replace_range(prev..cursor, "");
                                 cursor = prev;
+                                anchor = prev;
                                 changed = true;
                             }
                         }
                         PhysicalKey::ArrowLeft => {
-                            if cursor > 0 {
-                                cursor -= 1;
-                                while cursor > 0 && !working.is_char_boundary(cursor) {
-                                    cursor -= 1;
+                            if mods.shift {
+                                // selection 拡張: anchor 固定で cursor だけ左移動。
+                                if cursor > 0 {
+                                    cursor = prev_char_boundary(&working, cursor - 1);
                                 }
+                            } else if cursor != anchor {
+                                // selection を min に collapse。
+                                let lo = cursor.min(anchor);
+                                cursor = lo;
+                                anchor = lo;
+                            } else if cursor > 0 {
+                                cursor = prev_char_boundary(&working, cursor - 1);
+                                anchor = cursor;
                             }
                         }
                         PhysicalKey::ArrowRight => {
-                            if cursor < working.len() {
-                                cursor += 1;
-                                while cursor < working.len()
-                                    && !working.is_char_boundary(cursor)
-                                {
-                                    cursor += 1;
+                            if mods.shift {
+                                if cursor < working.len() {
+                                    cursor = next_char_boundary(&working, cursor + 1);
                                 }
+                            } else if cursor != anchor {
+                                let hi = cursor.max(anchor);
+                                cursor = hi;
+                                anchor = hi;
+                            } else if cursor < working.len() {
+                                cursor = next_char_boundary(&working, cursor + 1);
+                                anchor = cursor;
                             }
                         }
                         // M14 Phase 57 (daw_01 #016): NumpadEnter も commit 扱い。
@@ -165,8 +265,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                                 let filtered: String =
                                     input_text.chars().filter(|c| !c.is_control()).collect();
                                 if !filtered.is_empty() {
+                                    delete_range(&mut working, &mut cursor, &mut anchor);
                                     working.insert_str(cursor, &filtered);
                                     cursor += filtered.len();
+                                    anchor = cursor;
                                     changed = true;
                                 }
                             }
@@ -174,24 +276,76 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     }
                 }
 
+                // typing-only shortcut の処理 (key 処理後)。
+                if select_all_pressed {
+                    anchor = 0;
+                    cursor = working.len();
+                }
+                if cut_pressed || copy_pressed {
+                    let lo = cursor.min(anchor);
+                    let hi = cursor.max(anchor);
+                    if lo != hi {
+                        clipboard_write = Some(working[lo..hi].to_string());
+                        if cut_pressed {
+                            working.replace_range(lo..hi, "");
+                            cursor = lo;
+                            anchor = lo;
+                            changed = true;
+                        }
+                    }
+                }
+                if paste_pressed
+                    && let Some(p) = pasted_text
+                {
+                    let filtered: String = p.chars().filter(|c| !c.is_control()).collect();
+                    if delete_range(&mut working, &mut cursor, &mut anchor) {
+                        changed = true;
+                    }
+                    if !filtered.is_empty() {
+                        working.insert_str(cursor, &filtered);
+                        cursor += filtered.len();
+                        anchor = cursor;
+                        changed = true;
+                    }
+                }
+                if delete_pressed {
+                    if delete_range(&mut working, &mut cursor, &mut anchor) {
+                        changed = true;
+                    } else if cursor < working.len() {
+                        let next = next_char_boundary(&working, cursor + 1);
+                        working.replace_range(cursor..next, "");
+                        // cursor / anchor は変わらない (削除された分が後ろに詰まる)
+                        anchor = cursor;
+                        changed = true;
+                    }
+                }
+
                 if changed {
                     new_text = Some(working.clone());
                 }
                 state.cursor_byte = cursor.min(working.len());
+                state.anchor_byte = anchor.min(working.len());
+                if let Some(s) = clipboard_write {
+                    self.set_clipboard_text(s);
+                }
             }
         }
         if escape_pressed {
             self.clear_focus_if_focused(wid);
         }
 
-        // 描画用 cursor + preedit を state から取り出す。
-        let (cursor_byte_for_draw, preedit_for_draw) = {
+        // 描画用 cursor + anchor + preedit を state から取り出す。
+        let (cursor_byte_for_draw, anchor_byte_for_draw, preedit_for_draw) = {
             let state: &mut TextInputState = self.widget_state(wid);
-            (state.cursor_byte.min(text.len()), state.preedit.clone())
+            (
+                state.cursor_byte.min(text.len()),
+                state.anchor_byte.min(text.len()),
+                state.preedit.clone(),
+            )
         };
 
         // 描画。M4 Phase 11: with_widget_node で input_hash キャッシュ。
-        // text / cursor / preedit / focused が同じなら描画スキップ可。
+        // text / cursor / anchor / preedit / focused が同じなら描画スキップ可。
         let input_hash = hash_inputs((
             b"text_input",
             rect.x.to_bits(),
@@ -200,6 +354,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             rect.h.to_bits(),
             text,
             cursor_byte_for_draw as u64,
+            anchor_byte_for_draw as u64,
             preedit_for_draw.as_str(),
             was_focused,
         ));
@@ -211,6 +366,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 text,
                 was_focused,
                 cursor_byte_for_draw,
+                anchor_byte_for_draw,
                 &preedit_str,
             );
         });
@@ -218,11 +374,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // フォーカス中なら IME 候補ウィンドウ位置を要求する (cursor 直下)。
         if was_focused {
             let pad_x = 8.0;
+            let font_size = 14.0;
             let prefix = text.get(..cursor_byte_for_draw).unwrap_or("");
             let cursor_x = rect.x
                 + pad_x
-                + approx_text_width(prefix)
-                + approx_text_width(&preedit_for_draw);
+                + self.measure_text(prefix, font_size)
+                + self.measure_text(&preedit_for_draw, font_size);
             let cursor_y_top = rect.y + 4.0;
             let cursor_h = (rect.h - 8.0).max(1.0);
             self.request_ime(Rect {
@@ -267,15 +424,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     }
 
     /// M11 Phase 52 (daw_01 conversation #013): `text_input_at` と同じ挙動だが、widget が
-    /// 「前フレームに登場していなかった」場合に **自動でキーボードフォーカスを取得** +
-    /// cursor を text 末尾に置く。
+    /// 「前フレームに登場していなかった」場合に **自動でキーボードフォーカスを取得**
+    /// + 全選択する (`text_input_at` の gained_focus 検知が 1 箇所で処理する)。
     ///
-    /// 用途: rename UI / inline edit の「メニュー → text_input 表示 → 即タイプ可能」
-    /// (Logic / Bitwig / Cubase 慣習の F2 rename) を 1 関数で実現する。
+    /// 用途: rename UI / inline edit の「メニュー → text_input 表示 → 即タイプで上書き」
+    /// (Logic / Bitwig / Cubase / OS の F2 rename 慣習) を 1 関数で実現する。
     ///
     /// 「初回 show」判定は internal Scenegraph (前フレーム登場 widget の eviction 機構)
     /// を使う実装で、caller 側の boolean flag は不要。完全に非表示 (フレーム飛ばし) →
     /// 戻ったときも再度 focus する。
+    ///
+    /// M14 Phase 57 で「初回 show 時 cursor を末尾」→「初回 show 時 全選択」に変更
+    /// (CLAUDE.md「破壊的 API 変更を恐れない」、OS の F2 rename 標準挙動と一致)。
     pub fn text_input_at_focused<F>(
         &mut self,
         id: impl Hash,
@@ -288,32 +448,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     {
         let wid = WidgetId::ROOT.child((b"text_input", &id));
         if !self.was_widget_visible_last_frame(wid) {
-            // 初回 show (or 一度消えて再登場): 自動 focus + cursor を text 末尾へ
+            // 初回 show (or 一度消えて再登場): 自動 focus 取得。
+            // anchor / cursor の全選択は text_input_at 内 gained_focus 検知で行う
+            // (last_focused = false な状態で was_focused = true になるので発火する)。
             self.set_focus(wid);
-            let state: &mut TextInputState = self.widget_state(wid);
-            state.cursor_byte = text.len();
         }
         self.text_input_at(id, rect, text, on_change)
     }
-}
-
-/// 等幅フォント (HackGen Console NF) の ASCII 文字幅 (= font_size / 2 = 14 / 2 = 7)。
-const APPROX_CHAR_W: f32 = 7.0;
-/// 等幅フォントの CJK 文字幅 (= font_size = 14、ASCII の 2 倍)。
-const APPROX_CJK_W: f32 = 14.0;
-
-/// 文字列の概算ピクセル幅。ASCII は 8px、それ以外は 16px で計算する。
-/// (preedit や cursor の x 位置を求めるのに使う暫定実装)
-fn approx_text_width(text: &str) -> f32 {
-    text.chars()
-        .map(|c| {
-            if c.is_ascii() {
-                APPROX_CHAR_W
-            } else {
-                APPROX_CJK_W
-            }
-        })
-        .sum()
 }
 
 fn draw_text_input<M: ?Sized + 'static>(
@@ -322,6 +463,7 @@ fn draw_text_input<M: ?Sized + 'static>(
     text: &str,
     focused: bool,
     cursor_byte: usize,
+    anchor_byte: usize,
     preedit: &str,
 ) {
     // 背景。
@@ -347,14 +489,39 @@ fn draw_text_input<M: ?Sized + 'static>(
     let tx = rect.x + pad_x;
     let ty = rect.y + (rect.h - line_h) * 0.5;
 
+    // M14 Phase 58: prefix / preedit の x advance を **glyphon と同じ shape** で実測。
+    // 旧 `approx_text_width` (ASCII 7px / CJK 14px の固定概算) は proportional system font
+    // の "m" (~11px) や "i" (~4px) で実 advance と大きくずれていた。
+    let prefix = text.get(..cursor_byte).unwrap_or("");
+    let suffix = text.get(cursor_byte..).unwrap_or("");
+    let prefix_w = ui.measure_text(prefix, font_size);
+    let preedit_w = ui.measure_text(preedit, font_size);
+
+    // M14 Phase 57: 選択範囲の半透明矩形 (背景の上、テキストの下に積む)。
+    // preedit 中は selection は collapse 済みなので考慮不要。focus 喪失時は描画しない。
+    let sel_lo = cursor_byte.min(anchor_byte);
+    let sel_hi = cursor_byte.max(anchor_byte);
+    if focused && sel_lo != sel_hi && preedit.is_empty() {
+        let lo_str = text.get(..sel_lo).unwrap_or("");
+        let hi_str = text.get(..sel_hi).unwrap_or("");
+        let sel_lo_w = ui.measure_text(lo_str, font_size);
+        let sel_hi_w = ui.measure_text(hi_str, font_size);
+        let sel_x = tx + sel_lo_w;
+        let sel_w = sel_hi_w - sel_lo_w;
+        ui.push_rect(RectCommand {
+            rect: Rect { x: sel_x, y: ty, w: sel_w, h: line_h },
+            fill: Color::rgba(0.30, 0.50, 0.85, 0.45),
+            border: Color::rgba(0.0, 0.0, 0.0, 0.0),
+            border_width: 0.0,
+            radius: [0.0; 4],
+            clip_rect: Some(rect),
+        });
+    }
+
     // テキスト全体 (prefix + preedit + suffix) を 1 つの GlyphArea で描画する。
     // glyphon の自動レイアウトに任せれば、フォントの実 advance に基づいて正確に並ぶ
     // (proportional でも monospace でも OK)。preedit の色分けは GlyphArea が単色なので
-    // 諦め、代わりに下線で区別する。色分け復活には cosmic-text の Buffer::layout_runs()
-    // で実 measure が必要 (ui crate が renderer の FontSystem に access する経路を整備
-    // するフェーズで対応予定)。
-    let prefix = text.get(..cursor_byte).unwrap_or("");
-    let suffix = text.get(cursor_byte..).unwrap_or("");
+    // 諦め、代わりに下線で区別する。
     let combined = if preedit.is_empty() {
         text.to_string()
     } else {
@@ -376,9 +543,7 @@ fn draw_text_input<M: ?Sized + 'static>(
         });
     }
 
-    // preedit の下線 (位置は概算 — HackGen Console NF の半角=7 / 全角=14 で計算)。
-    let prefix_w = approx_text_width(prefix);
-    let preedit_w = approx_text_width(preedit);
+    // preedit の下線 (位置は実 measure)。
     if !preedit.is_empty() {
         let pre_x = tx + prefix_w;
         let underline_y = rect.y + rect.h - 4.0;
@@ -631,5 +796,329 @@ mod tests {
             },
         );
         assert!(committed.get(), "Enter でも従来通り committed=true (回帰防止)");
+    }
+
+    // ============================================================================
+    // M14 Phase 57: selection / Ctrl+A / Shift+Arrow / Delete / cut/copy/paste
+    // ============================================================================
+
+    use std::sync::{Arc, Mutex};
+
+    use daw_ui_platform::{ElementState, KeyEvent, Modifiers, PhysicalKey};
+
+    use crate::clipboard::ClipboardProvider;
+    use crate::input::PointerFrame;
+
+    /// テスト用 clipboard provider (Arc<Mutex<...>> で内容を共有して assertion で確認できる)。
+    struct MemClipboard {
+        text: Arc<Mutex<Option<String>>>,
+    }
+
+    impl ClipboardProvider for MemClipboard {
+        fn get_text(&mut self) -> Option<String> {
+            self.text.lock().unwrap().clone()
+        }
+        fn set_text(&mut self, t: String) {
+            *self.text.lock().unwrap() = Some(t);
+        }
+    }
+
+    fn key_pressed(physical: PhysicalKey) -> KeyEvent {
+        KeyEvent { state: ElementState::Pressed, text: None, physical_key: physical }
+    }
+
+    fn key_pressed_text(physical: PhysicalKey, t: &str) -> KeyEvent {
+        KeyEvent {
+            state: ElementState::Pressed,
+            text: Some(t.into()),
+            physical_key: physical,
+        }
+    }
+
+    fn frame_with_keys(keys: Vec<KeyEvent>, mods: Modifiers) -> FrameInput {
+        FrameInput {
+            pointer: PointerFrame { modifiers: mods, ..Default::default() },
+            keyboard: keys,
+            ..Default::default()
+        }
+    }
+
+    /// Frame 1 (focus 取得 + 全選択 + typing_focus 立て) を回す helper。
+    /// `frame()` を使うので末尾で clipboard provider への flush も走る (cut/copy 検証用)。
+    fn run_focus_frame(host: &mut UiHost<()>, scene: &mut Scene, screen: PhysicalSize, text: &str) {
+        let mut m = ();
+        host.frame(&mut m, scene, screen, FrameInput::default(), |(), ui| {
+            ui.text_input_at_focused(
+                "ti",
+                Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
+                text,
+                |_new| Edit::mutate(|()| {}),
+            );
+        });
+    }
+
+    /// Frame 2: 与えた input でキー処理を 1 回回し、on_change に渡された text を返す。
+    /// `text_input_at_focused` を使うので caller は連続して同じ text を渡せばよい。
+    fn run_input_frame(
+        host: &mut UiHost<()>,
+        scene: &mut Scene,
+        screen: PhysicalSize,
+        text: &str,
+        input: FrameInput,
+    ) -> Option<String> {
+        let observed: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let observed_capt = observed.clone();
+        let mut m = ();
+        host.frame(&mut m, scene, screen, input, |(), ui| {
+            ui.text_input_at_focused(
+                "ti",
+                Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
+                text,
+                |new| {
+                    *observed_capt.lock().unwrap() = Some(new);
+                    Edit::mutate(|()| {})
+                },
+            );
+        });
+        observed.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn gained_focus_selects_all_and_typing_replaces_text() {
+        // Frame 1: focus 取得 → 全選択 (anchor=0, cursor=3 for "abc")
+        // Frame 2: 't' 入力 → selection 範囲削除 + 't' insert → "t" になる
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        run_focus_frame(&mut host, &mut scene, screen, "abc");
+        scene.clear();
+
+        let input = frame_with_keys(
+            vec![key_pressed_text(PhysicalKey::Char('T'), "t")],
+            Modifiers::default(),
+        );
+        let observed = run_input_frame(&mut host, &mut scene, screen, "abc", input);
+        assert_eq!(observed.as_deref(), Some("t"), "全選択 → 't' で全置換");
+    }
+
+    #[test]
+    fn ctrl_a_selects_all_then_delete_clears_text() {
+        // Frame 1: focus 取得 (= 全選択)。
+        // Frame 2: ArrowRight 2回 → selection collapse + cursor=末尾 (no-selection, cursor=3)。
+        // Frame 3: Ctrl+A → 全選択 (anchor=0, cursor=3)。
+        // Frame 4: Delete → 範囲削除 → "" になる。
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        run_focus_frame(&mut host, &mut scene, screen, "abc");
+        scene.clear();
+
+        // Frame 2: ArrowRight (selection を末尾に collapse、cursor=3 anchor=3)
+        let _ = run_input_frame(
+            &mut host,
+            &mut scene,
+            screen,
+            "abc",
+            frame_with_keys(vec![key_pressed(PhysicalKey::ArrowRight)], Modifiers::default()),
+        );
+        scene.clear();
+
+        // Frame 3: Ctrl+A → 全選択 (typing-only shortcut なので keyboard_events に残り、
+        // text_input が take_typing_shortcut("select_all") で受ける)。
+        let ctrl = Modifiers { ctrl: true, ..Modifiers::empty() };
+        let _ = run_input_frame(
+            &mut host,
+            &mut scene,
+            screen,
+            "abc",
+            frame_with_keys(vec![key_pressed(PhysicalKey::Char('A'))], ctrl),
+        );
+        scene.clear();
+
+        // Frame 4: Delete → 範囲削除 → ""
+        let observed = run_input_frame(
+            &mut host,
+            &mut scene,
+            screen,
+            "abc",
+            frame_with_keys(vec![key_pressed(PhysicalKey::Delete)], Modifiers::default()),
+        );
+        assert_eq!(observed.as_deref(), Some(""), "Ctrl+A → Delete で空文字列");
+    }
+
+    #[test]
+    fn delete_no_selection_removes_one_char_after_cursor() {
+        // Frame 1: focus + 全選択
+        // Frame 2: ArrowLeft → cursor=anchor=0 (collapse to min)
+        // Frame 3: Delete → cursor 後 1 char ("abc" → "bc")
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        run_focus_frame(&mut host, &mut scene, screen, "abc");
+        scene.clear();
+        let _ = run_input_frame(
+            &mut host,
+            &mut scene,
+            screen,
+            "abc",
+            frame_with_keys(vec![key_pressed(PhysicalKey::ArrowLeft)], Modifiers::default()),
+        );
+        scene.clear();
+        let observed = run_input_frame(
+            &mut host,
+            &mut scene,
+            screen,
+            "abc",
+            frame_with_keys(vec![key_pressed(PhysicalKey::Delete)], Modifiers::default()),
+        );
+        assert_eq!(observed.as_deref(), Some("bc"), "selection なし Delete で 1 char 削除");
+    }
+
+    #[test]
+    fn backspace_with_selection_removes_range() {
+        // 全選択状態で Backspace → 範囲削除 → ""
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        run_focus_frame(&mut host, &mut scene, screen, "abc");
+        scene.clear();
+        let observed = run_input_frame(
+            &mut host,
+            &mut scene,
+            screen,
+            "abc",
+            frame_with_keys(vec![key_pressed(PhysicalKey::Backspace)], Modifiers::default()),
+        );
+        assert_eq!(observed.as_deref(), Some(""), "全選択 + Backspace で範囲削除");
+    }
+
+    #[test]
+    fn shift_arrow_extends_selection_then_typing_replaces_only_selection() {
+        // Frame 1: focus + 全選択 (anchor=0 cursor=3)
+        // Frame 2: ArrowRight → collapse cursor=3 anchor=3
+        // Frame 3: Shift+ArrowLeft → cursor=2 anchor=3 (= "c" 1 char 選択)
+        // Frame 4: 'X' → "ab" + "X" = "abX"
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        run_focus_frame(&mut host, &mut scene, screen, "abc");
+        scene.clear();
+        let _ = run_input_frame(
+            &mut host,
+            &mut scene,
+            screen,
+            "abc",
+            frame_with_keys(vec![key_pressed(PhysicalKey::ArrowRight)], Modifiers::default()),
+        );
+        scene.clear();
+        let shift = Modifiers { shift: true, ..Modifiers::empty() };
+        let _ = run_input_frame(
+            &mut host,
+            &mut scene,
+            screen,
+            "abc",
+            frame_with_keys(vec![key_pressed(PhysicalKey::ArrowLeft)], shift),
+        );
+        scene.clear();
+        let observed = run_input_frame(
+            &mut host,
+            &mut scene,
+            screen,
+            "abc",
+            frame_with_keys(
+                vec![key_pressed_text(PhysicalKey::Char('X'), "X")],
+                Modifiers::default(),
+            ),
+        );
+        assert_eq!(
+            observed.as_deref(),
+            Some("abX"),
+            "Shift+ArrowLeft で 1 char 選択 → 'X' で末尾 1 char を置換"
+        );
+    }
+
+    #[test]
+    fn copy_writes_selection_to_clipboard_without_modifying_text() {
+        // 全選択 + Ctrl+C → clipboard に "abc"、text 不変
+        let clip_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let provider = MemClipboard { text: clip_text.clone() };
+
+        let mut host: UiHost<()> = UiHost::no_redraw().with_clipboard(provider);
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        run_focus_frame(&mut host, &mut scene, screen, "abc");
+        scene.clear();
+        let ctrl = Modifiers { ctrl: true, ..Modifiers::empty() };
+        let observed = run_input_frame(
+            &mut host,
+            &mut scene,
+            screen,
+            "abc",
+            frame_with_keys(vec![key_pressed(PhysicalKey::Char('C'))], ctrl),
+        );
+        // text 不変 → on_change が呼ばれず observed = None
+        assert_eq!(observed, None, "Ctrl+C は text を変えない");
+        assert_eq!(
+            clip_text.lock().unwrap().as_deref(),
+            Some("abc"),
+            "selection が clipboard に書かれる"
+        );
+    }
+
+    #[test]
+    fn cut_writes_selection_to_clipboard_and_removes() {
+        // 全選択 + Ctrl+X → clipboard に "abc"、text = ""
+        let clip_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let provider = MemClipboard { text: clip_text.clone() };
+
+        let mut host: UiHost<()> = UiHost::no_redraw().with_clipboard(provider);
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        run_focus_frame(&mut host, &mut scene, screen, "abc");
+        scene.clear();
+        let ctrl = Modifiers { ctrl: true, ..Modifiers::empty() };
+        let observed = run_input_frame(
+            &mut host,
+            &mut scene,
+            screen,
+            "abc",
+            frame_with_keys(vec![key_pressed(PhysicalKey::Char('X'))], ctrl),
+        );
+        assert_eq!(observed.as_deref(), Some(""), "Ctrl+X で範囲削除");
+        assert_eq!(
+            clip_text.lock().unwrap().as_deref(),
+            Some("abc"),
+            "selection が clipboard に書かれる"
+        );
+    }
+
+    #[test]
+    fn paste_replaces_selection_with_clipboard_content() {
+        // 全選択 + Ctrl+V (clipboard 内容 = "XYZ") → text = "XYZ"
+        let clip_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(Some("XYZ".to_string())));
+        let provider = MemClipboard { text: clip_text };
+
+        let mut host: UiHost<()> = UiHost::no_redraw().with_clipboard(provider);
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        run_focus_frame(&mut host, &mut scene, screen, "abc");
+        scene.clear();
+        let ctrl = Modifiers { ctrl: true, ..Modifiers::empty() };
+        let observed = run_input_frame(
+            &mut host,
+            &mut scene,
+            screen,
+            "abc",
+            frame_with_keys(vec![key_pressed(PhysicalKey::Char('V'))], ctrl),
+        );
+        assert_eq!(observed.as_deref(), Some("XYZ"), "Ctrl+V で範囲を clipboard 内容で置換");
     }
 }

@@ -5,9 +5,14 @@
 //! `name` を `Ui::pending_shortcuts` に積む。widget は `Ui::take_shortcut(name)` で
 //! 1 度だけ消費する (pull 型)。
 //!
-//! global / context-sensitive の両立: 修飾キーなしの shortcut (Space 等) は
-//! `Ui::set_typing_focus(true)` (text_input が focus 中に呼ぶ) のフレームで
-//! 抑制される (= keyboard_events に戻して text_input に届く)。
+//! global / context-sensitive の両立 (M14 Phase 57 で整備):
+//! `Ui::set_typing_focus(true)` (text_input が focus 中に呼ぶ) が立った **次の**
+//! フレームから、`is_typing_only_shortcut(name)` が true な name (`select_all` /
+//! `delete` / `cut` / `copy` / `paste`) は shortcut layer で消費されず、
+//! `keyboard_events` に残る。`Ui::take_typing_shortcut(name)` で focused widget が
+//! 拾う。これで「text_input focused 中に Delete 打鍵 → piano_roll の note 削除に
+//! 流れてしまう」誤反応を防ぐ。undo/redo / tab navigation / escape は典型テキスト
+//! エディタでも global なので除外。
 
 use daw_ui_platform::{ElementState, KeyEvent, Modifiers, PhysicalKey};
 
@@ -205,8 +210,10 @@ impl ShortcutMap {
     ///
     /// **note**: 修飾キーなしの矢印 (`Up` / `Down` / `Left` / `Right`) は **default binding せず**。
     /// shortcut layer は frame 頭で keyboard_events から consume するため、bind すると text_input
-    /// 等の内部矢印キー処理 (cursor 移動) を奪ってしまう。focus traversal を入れるときは
-    /// `typing_focus` を見て consume を抑制する path を整備する必要がある (M9 Phase 45e bug fix)。
+    /// 等の内部矢印キー処理 (cursor 移動) を奪ってしまう。M14 Phase 57 で typing_focus 対応
+    /// path が整備され、`select_all` / `delete` / `cut` / `copy` / `paste` のような
+    /// **テキスト編集中に widget 内に届くべき shortcut** は `is_typing_only_shortcut` が
+    /// true を返し、typing_focus 中は keyboard_events に残るようになった。
     #[must_use]
     pub fn with_default_bindings() -> Self {
         let mut m = Self::new();
@@ -268,6 +275,24 @@ impl ShortcutMap {
         let (sc, _) = self.entries.iter().find(|(_, n)| *n == name)?;
         Some(format_shortcut(*sc))
     }
+}
+
+/// shortcut name が「typing 中の text widget に渡すべき」(= typing_focus が立っている
+/// フレームでは shortcut layer で消費せず keyboard_events に残す) か判定する。
+///
+/// 含まれる name:
+/// - `"select_all"` (Ctrl+A): typing 中は text_input の全選択
+/// - `"delete"` (Delete): typing 中は cursor 後 1 char 削除 / 範囲削除
+/// - `"cut"` (Ctrl+X) / `"copy"` (Ctrl+C) / `"paste"` (Ctrl+V): typing 中は OS clipboard 経由のテキスト編集
+///
+/// 含めないもの (典型テキストエディタでも global なので、typing 中も global のまま):
+/// - `undo` / `redo` (Word/VSCode 等もテキスト編集中の Ctrl+Z は document 全体の undo)
+/// - `tab_next` / `tab_prev` (typing 中も次の入力欄へ移動)
+/// - `escape` (typing 中も modal close)
+/// - `save` / `save_as` / `open` / `new` / `debug_overlay_toggle`
+#[must_use]
+pub fn is_typing_only_shortcut(name: &str) -> bool {
+    matches!(name, "select_all" | "delete" | "cut" | "copy" | "paste")
 }
 
 /// `Shortcut` を表記文字列に戻す ("Ctrl+Shift+Z" 形式)。

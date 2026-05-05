@@ -16,11 +16,11 @@ use glyphon::{
 };
 use wgpu::MultisampleState;
 
-/// 既定で使うフォント family。固定幅 (CJK は ASCII の 2 倍) なので、
-/// `text_input` などの cursor / 下線位置を ASCII=font_size/2、CJK=font_size の
-/// 単純な近似で正しく出せる。インストールされていない環境では glyphon の
-/// fallback (システムデフォルト) に倒れる。
-const DEFAULT_FONT_FAMILY: &str = "HackGen Console NF";
+/// 既定で使うフォント family。固定幅 (CJK は ASCII の 2 倍)。
+/// インストールされていない環境では glyphon の fallback (システムデフォルト) に倒れる。
+/// M14 Phase 58 で ui crate の `TextMetrics` が **同じフォント名で shape する** ために
+/// `pub` で expose (renderer と ui の shape 設定を 1 ソースに揃える Single Source of Truth)。
+pub const DEFAULT_FONT_FAMILY: &str = "HackGen Console NF";
 
 /// この値より長く未使用の cache entry は eviction される (約 5 秒 @ 60fps)。
 const EVICT_AFTER_FRAMES: u64 = 300;

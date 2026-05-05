@@ -16,4 +16,5 @@ pub mod pipelines;
 
 pub use device::*;
 pub use offscreen::*;
+pub use pipelines::glyph::DEFAULT_FONT_FAMILY;
 pub use scene::*;

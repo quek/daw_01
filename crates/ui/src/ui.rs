@@ -26,7 +26,8 @@ use crate::id::WidgetId;
 use crate::input::{DroppedFiles, FrameInput, ImeEvent, PointerFrame};
 use crate::popup::PopupOpenState;
 use crate::scenegraph::{CachedCommands, Scenegraph};
-use crate::shortcut::ShortcutMap;
+use crate::shortcut::{self, ShortcutMap};
+use crate::text_metrics::TextMetrics;
 use crate::widgets::WidgetState;
 use crate::widgets::drag_rect::{DragRect, DragRectState};
 
@@ -112,6 +113,16 @@ pub struct UiHost<M: ?Sized + 'static> {
     last_click: Option<(std::time::Instant, f32, f32)>,
     /// M9 P1-4: ダブルクリック判定の閾値 `(時間, 位置 px)`。default 400ms / 5px。
     double_click_threshold: (std::time::Duration, f32),
+    /// M14 Phase 57: 前フレームに `Ui::set_typing_focus(true)` が立ったか。立っていた場合、
+    /// 今フレーム冒頭の shortcut layer は `is_typing_only_shortcut(name)` (= `select_all`
+    /// `delete` `cut` `copy` `paste`) を `pending_shortcuts` に積まず `keyboard_events`
+    /// に残し、focused widget が `Ui::take_typing_shortcut(name)` で拾えるようにする。
+    last_typing_focus: bool,
+    /// M14 Phase 58: text shape による proportional font の実 advance 計算器。`Ui::measure_text`
+    /// 経由で text_input の cursor / selection の x 位置を pixel-accurate に取得する。
+    /// renderer 側の `GlyphPipeline` 内 `FontSystem` とは別 instance だが、同じ system fonts を
+    /// 読むので shape 結果は一致する (キャッシュは別)。
+    text_metrics: TextMetrics,
     _m: PhantomData<fn(&mut M)>,
 }
 
@@ -179,6 +190,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
             current_cache_misses: 0,
             last_click: None,
             double_click_threshold: (std::time::Duration::from_millis(400), 5.0),
+            last_typing_focus: false,
+            text_metrics: TextMetrics::new(),
             _m: PhantomData,
         }
     }
@@ -411,27 +424,44 @@ impl<M: ?Sized + 'static> UiHost<M> {
         let mut keyboard_events = keyboard;
         let mut ime_events = ime;
 
-        // M8 Phase 30: shortcut layer (frame 頭)。keyboard_events を `shortcut_map.matches` で
-        // 走査、マッチした events を取り除いて name を `pending_shortcuts` に積む。
+        // M8 Phase 30 / M14 Phase 57: shortcut layer (frame 頭)。keyboard_events を
+        // `shortcut_map.matches` で走査、マッチした events を取り除いて name を
+        // `pending_shortcuts` に積む。**前フレームに `set_typing_focus(true)` が立って
+        // いれば**、`is_typing_only_shortcut(name)` が true な name (`select_all` /
+        // `delete` / `cut` / `copy` / `paste`) は global 消費を抑制し、`keyboard_events`
+        // に残して focused widget が `take_typing_shortcut(name)` で拾えるようにする。
         // text_input が後で `take_keyboard_events_if_focused` で取るのは shortcut 後の残り。
         let modifiers = pointer.modifiers;
+        let typing_lock = self.last_typing_focus;
         let mut pending_shortcuts: Vec<&'static str> = Vec::new();
+        // typing 中に keyboard_events に残された paste shortcut があれば clipboard を read する
+        // (text_input が `take_typing_shortcut("paste")` で受け取る前に provider から取り出す)。
+        let mut typing_paste_pending = false;
         keyboard_events.retain(|ev| {
             if let Some(name) = self.shortcut_map.matches(ev, modifiers) {
-                pending_shortcuts.push(name);
-                false
+                if typing_lock && shortcut::is_typing_only_shortcut(name) {
+                    if name == "paste" {
+                        typing_paste_pending = true;
+                    }
+                    true
+                } else {
+                    pending_shortcuts.push(name);
+                    false
+                }
             } else {
                 true
             }
         });
 
-        // M8 Phase 31: clipboard paste — paste shortcut がマッチしていれば provider から read。
-        // 1 フレーム内で paste と他の shortcut が同時に発生しても、paste の取り出しは 1 度限り。
-        let pending_clipboard_paste: Option<String> = if pending_shortcuts.contains(&"paste") {
-            self.clipboard.as_mut().and_then(|c| c.get_text())
-        } else {
-            None
-        };
+        // M8 Phase 31 / M14 Phase 57: clipboard paste — paste shortcut が global / typing どちらの
+        // 経路にあっても provider から read しておく。1 フレーム内で paste と他の shortcut が
+        // 同時に発生しても、paste の取り出しは 1 度限り。
+        let pending_clipboard_paste: Option<String> =
+            if pending_shortcuts.contains(&"paste") || typing_paste_pending {
+                self.clipboard.as_mut().and_then(|c| c.get_text())
+            } else {
+                None
+            };
 
         // M8 Phase 29: history の現状をスナップショットして Ui に渡す (`can_undo` 等の query 用)。
         let history_can_undo = self.history.can_undo();
@@ -505,6 +535,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             file_hover,
             pending_shortcuts: &mut pending_shortcuts,
             typing_focus: &mut typing_focus,
+            text_metrics: &mut self.text_metrics,
             shortcut_map: &self.shortcut_map,
             pending_undo: &mut self.transient_undo_requested,
             pending_redo: &mut self.transient_redo_requested,
@@ -579,6 +610,9 @@ impl<M: ?Sized + 'static> UiHost<M> {
         drop(ui);
         // widget からの request_redraw 累積を commit (ui drop 後に local 変数を読む)。
         self.redraw_requested_in_last_frame = redraw_requested;
+        // M14 Phase 57: 次フレームの shortcut layer (typing-only shortcut の global 抑制)
+        // のために、今フレームに `Ui::set_typing_focus(true)` が立ったかを記録。
+        self.last_typing_focus = typing_focus;
         // ui が drop して scene の borrow が外れた後で、popup buffer を Scene の popup pass 用
         // フィールドに移す (renderer は base pass の後に popup pass で再描画する設計、
         // pipeline 順 rect→line→glyph 起因の z-order 問題を解消)。
@@ -674,6 +708,8 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// text_input 等が focus 中に呼ぶ。修飾なし shortcut の判定で使う (現状は記録のみ、
     /// shortcut layer 自体は frame 頭で済ませる KISS 設計)。
     pub(crate) typing_focus: &'a mut bool,
+    /// M14 Phase 58: text shape による実 advance 計算器 (`Ui::measure_text` 経由でアクセス)。
+    pub(crate) text_metrics: &'a mut TextMetrics,
     /// shortcut display_for などの query 用 (mutable は UiHost::shortcut_map_mut 経由)。
     pub(crate) shortcut_map: &'a ShortcutMap,
     // ---- M8 Phase 29 history ----
@@ -1195,6 +1231,45 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     #[must_use]
     pub fn has_shortcut(&self, name: &'static str) -> bool {
         self.pending_shortcuts.contains(&name)
+    }
+
+    /// M14 Phase 57: typing-only shortcut (前フレームの `set_typing_focus(true)` で global
+    /// 消費が抑制された name) を `keyboard_events` から消費する。focused text widget が
+    /// `Ctrl+A` / `Delete` / `Ctrl+X/C/V` 等を `take_shortcut` ではなくこの API で取り出す。
+    ///
+    /// 一致条件: `shortcut_map.matches(ev, modifiers) == Some(name)` の **最初の Pressed**
+    /// event を `keyboard_events` から remove して true を返す。同じ name を続けて呼ぶと
+    /// 2 度目以降は false (`take_shortcut` と同じ pull モデル)。
+    ///
+    /// `is_typing_only_shortcut(name)` が false な name (例: `undo`) を渡しても false を返す。
+    /// これは「typing-only に分類されない shortcut は global path で `take_shortcut(name)`
+    /// から取るべき」というポリシー強制のため。
+    pub fn take_typing_shortcut(&mut self, name: &'static str) -> bool {
+        if !shortcut::is_typing_only_shortcut(name) {
+            return false;
+        }
+        let mods = self.pointer.modifiers;
+        let pos = self.keyboard_events.iter().position(|ev| {
+            matches!(ev.state, daw_ui_platform::ElementState::Pressed)
+                && self.shortcut_map.matches(ev, mods) == Some(name)
+        });
+        if let Some(i) = pos {
+            self.keyboard_events.remove(i);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// M14 Phase 58: `text` を `font_size` で shape したときの **末尾までの x advance** を返す。
+    /// proportional font (system default の Segoe UI / Helvetica 等) の実 advance に基づくので、
+    /// text_input の cursor / selection の x 位置計算に使うと pixel-accurate。
+    /// 空文字列なら 0.0。
+    ///
+    /// 内部の `cosmic_text::FontSystem` は renderer 側 (`GlyphPipeline`) のものとは別 instance だが、
+    /// 同じ system fonts を読むので shape 結果は一致する (キャッシュは別)。
+    pub fn measure_text(&mut self, text: &str, font_size: f32) -> f32 {
+        self.text_metrics.measure_advance(text, font_size)
     }
 
     /// text_input 等の typing widget が focus 中に呼ぶ。修飾なし shortcut (Space 等) を
@@ -2129,6 +2204,59 @@ mod tests {
             let a_keys2 = ui.take_keyboard_events_if_focused(id_a);
             assert_eq!(a_keys2.len(), 0);
         });
+    }
+
+    /// M14 Phase 57: text_input が focus を持っている (= 前フレームに `set_typing_focus(true)`
+    /// が立った) フレームでは、shortcut layer が `delete` / `select_all` / `cut` / `copy`
+    /// / `paste` を `pending_shortcuts` に積まず `keyboard_events` に残す。これにより
+    /// piano_roll / arrangement の `take_shortcut("delete")` が誤発火しない。
+    #[test]
+    fn typing_focus_blocks_global_delete_shortcut() {
+        use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        // Frame 1: text_input_at_focused で focus 取得 + 描画中に set_typing_focus(true)
+        // → frame 末尾で UiHost.last_typing_focus = true。
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.text_input_at_focused(
+                "ti",
+                Rect { x: 10.0, y: 10.0, w: 100.0, h: 24.0 },
+                "x",
+                |_| Edit::mutate(|()| {}),
+            );
+        });
+
+        // Frame 2: Delete を送る。typing_lock が立っているので shortcut layer は delete を
+        // pending_shortcuts に積まず、keyboard_events に残す。take_shortcut("delete") は false。
+        let delete_ev = KeyEvent {
+            state: ElementState::Pressed,
+            text: None,
+            physical_key: PhysicalKey::Delete,
+        };
+        let outer_got_delete = std::cell::Cell::new(true);
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput { keyboard: vec![delete_ev], ..Default::default() },
+            |(), ui| {
+                // 他の widget (piano_roll 役) が先に take_shortcut("delete") を呼んでも false。
+                outer_got_delete.set(ui.take_shortcut("delete"));
+                ui.text_input_at_focused(
+                    "ti",
+                    Rect { x: 10.0, y: 10.0, w: 100.0, h: 24.0 },
+                    "x",
+                    |_| Edit::mutate(|()| {}),
+                );
+            },
+        );
+        assert!(
+            !outer_got_delete.get(),
+            "typing_focus 中は take_shortcut(\"delete\") が false を返す (= 他 widget の note 削除等を防ぐ)"
+        );
     }
 
     /// M4 Phase 11: 同じ wid + input_hash で 2 回呼ぶと、2 回目は draw_fn が実行されない

@@ -220,6 +220,11 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
         self.ui.take_shortcut(name)
     }
 
+    /// M14 Phase 57: `Ui::take_typing_shortcut` の delegate (heavy 内 text widget 用)。
+    pub fn take_typing_shortcut(&mut self, name: &'static str) -> bool {
+        self.ui.take_typing_shortcut(name)
+    }
+
     /// `Ui::shortcut_for` の delegate (menu hint / overlay 表示用)。
     #[must_use]
     pub fn shortcut_for(&self, name: &'static str) -> Option<String> {
