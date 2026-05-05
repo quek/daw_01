@@ -50,6 +50,82 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     );
     y += 28.0;
 
+    // Vocal source 編集 (Vocal track のときのみ)
+    if let Some(track) = app.song.tracks.get(app.selected_track as usize)
+        && let common::model::InstrumentSource::Vocal { speaker_id, .. } = &track.source
+    {
+        ui.label_at(
+            "inspector_vocal_label",
+            "Vocal Speaker",
+            area.x + pad,
+            y,
+            12.0,
+            TEXT_DIM,
+        );
+        y += 18.0;
+        let dropdown_rect = Rect {
+            x: area.x + pad,
+            y,
+            w: area.w - pad * 2.0,
+            h: 24.0,
+        };
+        // singers が空 (engine 未起動 / fetch 失敗) なら placeholder ラベルだけ
+        if app.singers.is_empty() {
+            ui.label_at(
+                "inspector_vocal_placeholder",
+                "(VOICEVOX engine 未起動 — speaker 一覧取得待ち)",
+                dropdown_rect.x + 4.0,
+                dropdown_rect.y + 6.0,
+                11.0,
+                TEXT_DIM,
+            );
+        } else {
+            // 各 singer の各 style を 1 entry に flatten。
+            // 「<キャラ名> - <スタイル名>」 を表示、 selected_idx は speaker_id 一致で決定
+            let entries: Vec<(u32, String, String)> = app
+                .singers
+                .iter()
+                .flat_map(|s| {
+                    s.styles.iter().map(move |st| {
+                        (
+                            st.id,
+                            s.name.clone(),
+                            st.name.clone(),
+                        )
+                    })
+                })
+                .collect();
+            let labels: Vec<String> = entries
+                .iter()
+                .map(|(_, n, sn)| format!("{n} - {sn}"))
+                .collect();
+            let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let selected_idx = entries
+                .iter()
+                .position(|(id, _, _)| *id == *speaker_id)
+                .unwrap_or(0);
+            if let Some(picked) = ui.dropdown(
+                "inspector_vocal_dropdown",
+                dropdown_rect,
+                &label_refs,
+                selected_idx,
+            ) && let Some((id, _, style_name)) = entries.get(picked)
+            {
+                let track_idx = app.selected_track;
+                let new_id = *id;
+                let new_style = style_name.clone();
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetTrackSpeaker {
+                        track: track_idx,
+                        speaker_id: new_id,
+                        style_name: new_style.clone(),
+                    });
+                }));
+            }
+        }
+        y += 30.0;
+    }
+
     // 「Chain」見出し
     ui.label_at(
         "inspector_chain_label",

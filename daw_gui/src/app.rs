@@ -501,6 +501,7 @@ impl AppData {
                 | AppEvent::DeleteSelectedNotes
                 | AppEvent::SetSelectedNoteLyric(_)
                 | AppEvent::SetNoteLyrics(_)
+                | AppEvent::SetTrackSpeaker { .. }
                 | AppEvent::QuantizeSelectedNotes(_)
                 | AppEvent::SelectPluginFromDb(_)
                 | AppEvent::RemoveSlot { .. }
@@ -783,6 +784,14 @@ pub enum AppEvent {
     /// VOICEVOX engine `/singers` の取得結果。 起動時 background thread が
     /// 1 度発行する。 失敗時は空 Vec で送る。
     SingersLoaded(Vec<common::voicevox::VoiceVoxSinger>),
+    /// Track Inspector の Vocal speaker dropdown で選択された singer。
+    /// `track.source` を `InstrumentSource::Vocal { speaker_id, style_name }`
+    /// に書き換える。 Vocal 以外の track に対しては no-op。
+    SetTrackSpeaker {
+        track: u32,
+        speaker_id: u32,
+        style_name: String,
+    },
 
     // -------- WAV export -------------------------------------------------
     ExportWav,
@@ -1079,6 +1088,9 @@ impl AppData {
                     "VOICEVOX singers loaded"
                 );
                 self.singers = singers;
+            }
+            AppEvent::SetTrackSpeaker { track, speaker_id, style_name } => {
+                self.set_track_speaker(track, speaker_id, style_name);
             }
         }
     }
@@ -2063,6 +2075,27 @@ impl AppData {
         }
         self.sync_song_to_plugin_host();
         self.pianoroll_notes_generation += 1;
+    }
+
+    /// Track Inspector の Vocal speaker dropdown 経由で speaker_id 変更。
+    /// 対象 track が `InstrumentSource::Vocal` でなければ no-op。
+    fn set_track_speaker(&mut self, track: u32, speaker_id: u32, style_name: String) {
+        let Some(t) = self.song.tracks.get_mut(track as usize) else {
+            return;
+        };
+        let common::model::InstrumentSource::Vocal {
+            speaker_id: cur_id,
+            style_name: cur_style,
+        } = &mut t.source
+        else {
+            return;
+        };
+        if *cur_id == speaker_id && *cur_style == style_name {
+            return;
+        }
+        *cur_id = speaker_id;
+        *cur_style = style_name;
+        self.sync_song_to_plugin_host();
     }
 
     /// gui_01 #017: piano_roll widget が L キー → Enter commit で発行する
