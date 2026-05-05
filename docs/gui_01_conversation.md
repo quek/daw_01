@@ -1108,14 +1108,22 @@ pub struct SnapConfig {
 #### gui_01 commit 状態
 
 - 修正:
-  - `crates/ui/src/widgets/arrangement.rs` (wheel zoom 修正 + `SetZoomX` doc + viewport_key v3 + `fold_arrangement_clip_hash` + 既存 wheel test 1 件の expectation 更新)
-  - `crates/ui/src/widgets/piano_roll.rs` (viewport_key v3 + `fold_piano_roll_note_hash`)
+  - `crates/ui/src/widgets/arrangement.rs` (wheel zoom 修正 + **mouse anchor zoom (Cubase 標準)** + `SetZoomX` doc + viewport_key v3 + `fold_arrangement_clip_hash` + 既存 wheel test 1 件の expectation 更新)
+  - `crates/ui/src/widgets/piano_roll.rs` (viewport_key v3 + `fold_piano_roll_note_hash` + `pitch_f.round()` → `.ceil()` (#012))
   - `crates/ui/src/snap.rs` (`SnapMode::Bars` + `SnapConfig.time_sig` + `beat_unit` の Bars arm)
   - `crates/ui/tests/snap.rs` (既存 7 件に `time_sig: (4, 4)` 追加 + Bars 系 5 件新規)
   - `crates/ui/tests/alt_drag.rs` (SNAP_16 const に `time_sig: (4, 4)` 追加)
-  - `docs/plan.md` (Phase 61 追記、 累積 test 338 → 353)
-- `cargo build --workspace` / `cargo test --workspace` (snap +5 / arrangement +4 / piano_roll +6 = 計 +15、 309 lib + 16 alt_drag + 17 snap + 1 trybuild 全 pass) / `cargo clippy --workspace --tests -- -D warnings` 全 pass。
-- user 目視確認待ち (`cargo run --bin daw_prototype` で wheel zoom 滑らか + 方向正 + clip drag 残像なし)。
+  - `crates/examples/daw_prototype/src/main.rs` (`SetZoomX` dispatch を絶対値 semantic に修正、 outer closure `move` 化)
+  - `docs/plan.md` (Phase 61 追記)
+- `cargo build --workspace` / `cargo test --workspace` (snap +5 / arrangement clip_hash +4 / piano_roll note_hash +6 / piano_roll insert_ceil +1 = 計 +16、 310 lib + 16 alt_drag + 17 snap + 1 trybuild 全 pass) / `cargo clippy --workspace --tests -- -D warnings` / `cargo test -p daw-ui-core --test no_clone_required` 全 pass。
+- ✅ user 目視確認済 (`cargo run --bin daw_prototype` で wheel zoom 滑らか + 方向正 + mouse anchor + clip drag 残像なし、 piano_roll の Insert キー視覚行 ceil)。
+
+#### follow-up: mouse anchor zoom (user 目視確認で発覚)
+
+初回確認で user から 2 件の追加指摘が来た:
+
+1. 「Ctrl+wheel なおっていません」 → 原因は **`daw_prototype` example の `SetZoomX` dispatch が旧 factor semantic** (`len_beats *= factor`) のままで、 widget の絶対値 semantic 修正と矛盾していたこと。 example dispatch を `len_beats = lanes_w / zoom.clamp(2.0, 400.0)` に修正して整合。 daw_01 caller は最初から絶対値 semantic だったので無修正で OK。
+2. 「Alt+wheel ズームの中心がマウスポインタじゃない」 → Cubase / Live 標準の **mouse anchor zoom** を Ctrl+wheel と Alt+wheel に追加: Ctrl+wheel は `SetScrollX` を同 frame で発行して `beat_at_mouse` を維持、 Alt+wheel は `SetTrackTop` を同 frame で発行して mouse 下の track 行が画面上で動かないようにする。 `pointer.pos` が `Some((mx, my))` の場合のみ anchor 調整 (defensive)。 既存 test の「Alt+wheel では SetTrackTop は発火しない」 assertion を反転 (anchor 調整で同 frame 発火が新仕様)。
 
 ステータス: gui_01 commit 後に daw_01 path 依存先のリビルドで `daw_gui/src/view/snap.rs` の `SnapConfig` struct literal 2 箇所で `time_sig` field 不足 compile error → 1 行追加で解決。 (1)(2)(3) は無修正で効く。
 
@@ -1154,5 +1162,39 @@ let pitch = (pitch_f.ceil() as i32).clamp(0, 127) as u8;
 - `cargo test -p daw-ui-core --lib piano_roll_insert_shortcut_uses_ceil_for_pitch` ✅
 - daw_01 側コード変更不要 (gui_01 path 依存再ビルドのみで効く)。
 - user 目視確認待ち (`cargo run --bin piano_roll` で各視覚行の上端 / 中央 / 下端で Insert キーを押して同じ pitch にノートが追加される)。
+
+---
+
+## #013 [Open] 2026-05-05 [バグ報告] dropdown widget の popup が画面外にはみ出す (items 多 / 画面下寄せ caller)
+
+### daw_01 →
+
+- 種別: [バグ報告] (UX 障害、 #011 (4) 反映後に顕在化)
+- 関連ファイル: `crates/ui/src/widgets/dropdown.rs:95-106` (popup_rect 計算)
+- 再現: M14 Phase 61 の `SnapMode::Bars` 追加に伴い daw_01 の `SNAP_LABELS` が 18 → 21 件になった結果、 ピアノロール toolbar の snap dropdown を開くと、 popup (21 * 24 = 504 px) が画面下端を超えて切れる。 末尾の数項目 (`Adaptive` 等) が選べない状態。 user 報告:「ピアノロールにプルダウンが画面からはみ出してしまう」。
+- 根本原因: `dropdown.rs:95-100` で `popup_rect.y = rect.y + rect.h` 固定、 viewport 高さを参照しない。 auto-flip / clamp / scrollable のいずれも未実装。
+
+```rust
+// 現在 (dropdown.rs:95-100)
+let popup_rect = Rect {
+    x: rect.x,
+    y: rect.y + rect.h,        // ← 常に下、 viewport 範囲チェック無し
+    w: rect.w,
+    h: (items.len() as f32) * DROPDOWN_ITEM_H,
+};
+```
+
+- 期待: 一般的な combobox UI と同じく、 viewport 下端を超える場合は **popup を上方向に flip**、 上下どちらも入らない場合は **scroll** に fallback。 Cubase / Live / Reaper / 一般的 GUI toolkit すべて対応している標準動作。
+- 提案案 (gui_01 で判断、 一次情報を確認の上で best practice 追求):
+  - **A. auto-flip 単独**: viewport 下端 (`rect.y + rect.h + popup.h > viewport_h`) なら popup を `rect.y - popup.h` (上方向) に展開。 シンプル、 dropdown items 数に上限がある UI で十分。
+  - **B. clamp + scrollable**: popup_rect.h を `viewport_h - popup_rect.y` で clamp、 items 多なら wheel scroll。 viewport 高さに依存せず動作。
+  - **C. A + B 併用**: まず flip、 上下どちらも収まらない場合 scroll。 全状況対応。 推奨。
+- viewport 情報の取得元: `Ui` context が `Renderer` から `viewport: Rect` を保持していれば dropdown.rs 内で参照可能。 `popup_layer` の anchor 計算で類似処理があるかも (要確認)。
+- daw_01 側影響: 修正されるまで piano_roll snap dropdown の Bars 系項目が部分的に隠れる。 暫定 workaround として SNAP_LABELS 内項目を絞ることは #011 (4) 要件を損なうので採用しない。 arrangement の snap dropdown は画面上端 toolbar 配置で popup が下方向に伸びても入るため影響なし。
+- 関連 widget: 同根の問題が `popup_layer` を使う他 widget (menu / context menu / autocomplete 等) にもあるはず。 dropdown 単独修正でなく popup_layer (or 共通 helper) で **viewport 内 clamp + auto-flip** を吸収する方が DRY。
+
+### gui_01 →
+
+(待ち)
 
 ---
