@@ -32,15 +32,24 @@ DESIGN.md M1 残項目を 6 タスクに分解。`docs/plan_<feature>.md` への
 ```
 A2 (完了 ✓) ─→ A3 WAV export (完了 ✓) ─┬─→ A1 VOICEVOX ─→ M1 完成
                                           │
-A6 tempo/timesig (← 次タスク、独立、軽量) │
-A4 autosave     (独立、軽量)              │
-A5 lyric UI     (gui_01 #015、 A1 の前提) │
+A7 plugin load 同期 (← 次タスク、 A2/A3 残 bug 復旧)
+A6 tempo/timesig (独立、軽量)
+A4 autosave     (独立、軽量)
+A5 lyric UI     (gui_01 #015、 A1 の前提)
 ```
+
+### 既知の残 bug (A2/A3 後)
+
+A3 smoke test で発見、 別 plan で対応:
+
+1. **plugin ロード race condition (A2 由来)**: Open / track 追加で plugin ロード時、 audio engine 側の `OpenPluginShmem` register が非同期完了するため、 ロード完了前に Play すると該当 track が一時 silent (ループ後 / 数秒後に鳴り始める)。 A2 で旧 audio thread の同期点 (`tracks.mutate` の stop/restart) を撤去したため発生。 A7 (新規) で SetSlotPlugin の同期化 or Play 時の plugin register 待機を設計する。
+2. **プラグインセレクターの ✕ ボタンが効かない**: gui_01 widget レベル。 `docs/gui_01_conversation.md` に投げる候補。
 
 優先順序の根拠:
 - **A2 完了**: track-parallel スレッドプール + MMCSS / thread_check / assert_no_alloc 稼働
-- **A3 完了**: freewheel offline render + CLAP render ext で WAV export 復旧 (5 PR、 plan_a3_wav_export.md 参照)
-- **A6 が次** (推奨): tempo / time_sig 変更 UI。独立かつ軽量なので素早く着手可
+- **A3 完了**: freewheel offline render + CLAP render ext で WAV export 復旧 (5 PR + smoke fix、 plan_a3_wav_export.md 参照)
+- **A7 が次** (推奨): A2 残 bug = plugin ロード race condition の根本対応 (機能復旧優先、 memory: feedback_recovery_priority)
+- **A6** は A7 後 (tempo/timesig、 独立軽量)
 - **A4** は A6 後 (独立で軽量、 autosave + 起動時復元)
 - **A5** は gui_01 改修先行 (#015)。reply 待ちの間 A1 の Engine / HTTP 周りを進める
 - **A1** は A5 完了後に本格実装
