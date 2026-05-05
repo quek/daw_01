@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash F:/dev/gui_01/.claude/hooks/session_start_daw01_open.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash F:/dev/gui_01/.claude/hooks/pretooluse_git_commit_review_reminder.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
