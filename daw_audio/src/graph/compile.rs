@@ -158,6 +158,14 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
     for &i in &order {
         let track = &song.tracks[i as usize];
         let track_idx = i;
+        // PR4 sidechain: emit `SidechainTap` for every plugin on this
+        // track with a `sidechain_sources` entry pointing at a valid
+        // source track. The tap must run **before** the plugin's own
+        // `process()` (i.e. before ProcessTrack / ProcessGroupFx for
+        // this track) so the engine can stage the source signal in the
+        // plugin's `pd.buffer_aux_in[port]` shmem region.
+        emit_sidechain_taps(track, track_idx, &id_to_idx, &mut nodes);
+
         if is_group.contains(&track.id) {
             // This track has children → it acts as a group bus. Sum
             // the children's scratches into its own scratch, then run
@@ -265,6 +273,60 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         delay_lines,
         port_buffers: super::PortBufferPool::new(),
     })
+}
+
+/// PR4 sidechain: track の chain (`midi_fx_chain` / `instrument` /
+/// `fx_chain`) を順に walk して、 各 plugin の `sidechain_sources` 中で
+/// 有効な (= source track が song に存在する) entry について
+/// `NodeOp::SidechainTap` を `nodes` に push する。 dangling reference は
+/// 寛容に skip (compile error にしない)。 source track の `ProcessTrack`
+/// が前に emit されていれば scratch が埋まっているので tap は意味を持つ。
+fn emit_sidechain_taps(
+    track: &common::model::Track,
+    _dst_track_idx: u32,
+    id_to_idx: &HashMap<u32, u32>,
+    nodes: &mut Vec<NodeOp>,
+) {
+    let dst_track = track.id;
+    let push_taps = |nodes: &mut Vec<NodeOp>,
+                     plugins: &[common::model::PluginInstance],
+                     slot_kind: fn(u32) -> common::protocol::PluginSlot| {
+        for (slot_idx, inst) in plugins.iter().enumerate() {
+            for (port_idx, src_track_id_opt) in inst.sidechain_sources.iter().enumerate() {
+                let Some(src_track_id) = src_track_id_opt else {
+                    continue;
+                };
+                let Some(src_idx) = id_to_idx.get(src_track_id) else {
+                    // dangling reference: silently skip
+                    continue;
+                };
+                nodes.push(NodeOp::SidechainTap {
+                    src: BufRef::TrackScratch(*src_idx),
+                    dst_track,
+                    dst_slot: slot_kind(slot_idx as u32),
+                    aux_in_port: port_idx as u8,
+                });
+            }
+        }
+    };
+    push_taps(nodes, &track.midi_fx_chain, common::protocol::PluginSlot::MidiFx);
+    if let Some(inst) = &track.instrument {
+        for (port_idx, src_track_id_opt) in inst.sidechain_sources.iter().enumerate() {
+            let Some(src_track_id) = src_track_id_opt else {
+                continue;
+            };
+            let Some(src_idx) = id_to_idx.get(src_track_id) else {
+                continue;
+            };
+            nodes.push(NodeOp::SidechainTap {
+                src: BufRef::TrackScratch(*src_idx),
+                dst_track,
+                dst_slot: common::protocol::PluginSlot::Instrument,
+                aux_in_port: port_idx as u8,
+            });
+        }
+    }
+    push_taps(nodes, &track.fx_chain, common::protocol::PluginSlot::Fx);
 }
 
 /// `path_latency[idx]` を計算してキャッシュする。 既に値があれば即返却
@@ -948,5 +1010,134 @@ mod tests {
                 self.write = (self.write + 1) % self.cap;
             }
         }
+    }
+
+    // ---- PR4 Sidechain ----
+
+    /// Compile-level test: Track 2 (index 1) の Fx(0) plugin に
+    /// `sidechain_sources = [Some(track_1.id)]` が設定されているとき、
+    /// `compile_schedule` は次の順で nodes を emit する。
+    ///
+    /// 1. `ProcessTrack(0)` (Track 1、 source)
+    /// 2. `SidechainTap { src: TrackScratch(0), dst_track: 2,
+    ///    dst_slot: Fx(0), aux_in_port: 0 }`
+    /// 3. `ProcessTrack(1)` (Track 2、 receiver)
+    /// 4. `Mix` → Master
+    ///
+    /// 順序が肝: SidechainTap は Track 1 の scratch が埋まった **後** で
+    /// Track 2 の plugin が process() を呼ばれる **前** に挿入される。
+    /// engine.rs はこの op を見て plugin の `pd.buffer_aux_in[0]` に
+    /// Track 1 の signal を copy してから plugin.process() を dispatch する。
+    #[test]
+    fn sidechain_emits_tap_before_destination_process_track() {
+        use common::model::PluginInstance;
+        use common::plugin_format::PluginFormat;
+        use common::protocol::PluginSlot;
+
+        let song = Song {
+            tracks: vec![
+                Track {
+                    id: 1,
+                    name: "Source".into(),
+                    ..Track::default()
+                },
+                Track {
+                    id: 2,
+                    name: "Dest".into(),
+                    fx_chain: vec![PluginInstance {
+                        plugin_id: "test.compressor".into(),
+                        format: PluginFormat::Vst3,
+                        state: None,
+                        // aux input port 0 ← Track 1's output
+                        sidechain_sources: vec![Some(1)],
+                    }],
+                    ..Track::default()
+                },
+            ],
+            ..Song::default()
+        };
+        let sched = compile_schedule(&song).unwrap();
+
+        // (a) SidechainTap が emit されている。
+        let tap_idx = sched
+            .nodes
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    NodeOp::SidechainTap {
+                        src: BufRef::TrackScratch(0),
+                        dst_track: 2,
+                        dst_slot: PluginSlot::Fx(0),
+                        aux_in_port: 0,
+                    }
+                )
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected SidechainTap (src=TrackScratch(0), dst=2,Fx(0), port=0); \
+                     nodes={:?}",
+                    sched.nodes
+                )
+            });
+
+        // (b) source track の ProcessTrack が tap より前 (= source scratch
+        //     が埋まってから tap で copy される)。
+        let src_proc_idx = sched
+            .nodes
+            .iter()
+            .position(|op| matches!(op, NodeOp::ProcessTrack { track_idx: 0 }))
+            .expect("ProcessTrack(0) missing");
+        assert!(
+            src_proc_idx < tap_idx,
+            "source ProcessTrack must run before SidechainTap: src={src_proc_idx} tap={tap_idx}"
+        );
+
+        // (c) destination track の ProcessTrack が tap より後 (= plugin
+        //     process() が呼ばれる前に sidechain buffer が埋まる)。
+        let dst_proc_idx = sched
+            .nodes
+            .iter()
+            .position(|op| matches!(op, NodeOp::ProcessTrack { track_idx: 1 }))
+            .expect("ProcessTrack(1) missing");
+        assert!(
+            tap_idx < dst_proc_idx,
+            "SidechainTap must run before destination ProcessTrack: tap={tap_idx} dst={dst_proc_idx}"
+        );
+    }
+
+    /// 同じく compile-level test: `sidechain_sources` の対象 track が
+    /// 存在しない (DanglingReference) 場合は無視する (Tap を emit しない、
+    /// schedule 全体は壊さない)。 schedule 自体の compile error にすると
+    /// 編集中に他の compile error が track 間で連鎖して厄介なので、
+    /// 寛容に扱う。
+    #[test]
+    fn sidechain_with_dangling_source_track_is_skipped() {
+        use common::model::PluginInstance;
+        use common::plugin_format::PluginFormat;
+
+        let song = Song {
+            tracks: vec![Track {
+                id: 1,
+                name: "Lone".into(),
+                fx_chain: vec![PluginInstance {
+                    plugin_id: "test.compressor".into(),
+                    format: PluginFormat::Vst3,
+                    state: None,
+                    sidechain_sources: vec![Some(99)], // 存在しない track
+                }],
+                ..Track::default()
+            }],
+            ..Song::default()
+        };
+        let sched = compile_schedule(&song).unwrap();
+        assert!(
+            !sched
+                .nodes
+                .iter()
+                .any(|op| matches!(op, NodeOp::SidechainTap { .. })),
+            "dangling sidechain source must not emit SidechainTap; nodes={:?}",
+            sched.nodes
+        );
     }
 }

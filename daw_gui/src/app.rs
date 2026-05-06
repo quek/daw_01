@@ -2936,6 +2936,7 @@ impl AppData {
                     plugin_id: id,
                     format,
                     state,
+                    sidechain_sources: Vec::new(),
                 });
             }
             PluginSlot::Fx(i) => {
@@ -2949,6 +2950,7 @@ impl AppData {
                     plugin_id: id,
                     format,
                     state: existing_state,
+                    sidechain_sources: Vec::new(),
                 };
                 if i < t.fx_chain.len() {
                     t.fx_chain[i] = inst;
@@ -2967,6 +2969,7 @@ impl AppData {
                     plugin_id: id,
                     format,
                     state: existing_state,
+                    sidechain_sources: Vec::new(),
                 };
                 if i < t.midi_fx_chain.len() {
                     t.midi_fx_chain[i] = inst;

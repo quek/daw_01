@@ -276,6 +276,14 @@ pub struct PluginInstance {
         with = "base64_opt"
     )]
     pub state: Option<Vec<u8>>,
+    /// PR4 sidechain: per-aux-input-port routing source. Each entry maps
+    /// the plugin's `is_main=false` aux input port index to a source
+    /// `Track::id`. `None` (or absent index) leaves that port silent.
+    /// `Vec` length = number of aux input ports the user has hooked up;
+    /// shorter than the plugin's actual port count is fine (trailing
+    /// ports stay silent).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidechain_sources: Vec<Option<u32>>,
 }
 
 impl PluginInstance {
@@ -284,6 +292,7 @@ impl PluginInstance {
             plugin_id,
             format,
             state: None,
+            sidechain_sources: Vec::new(),
         }
     }
 }
