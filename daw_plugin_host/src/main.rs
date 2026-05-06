@@ -382,6 +382,12 @@ fn plugin_main_loop(
                 Ok(c) => c,
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    // worker pool を先に shutdown する。 worker thread が
+                    // 動いたまま `tracks.shutdown()` で plugin Drop を
+                    // 走らせると UAF。
+                    if let Some(pool) = worker_pool.take() {
+                        pool.shutdown();
+                    }
                     tracks.shutdown();
                     return;
                 }
@@ -485,171 +491,203 @@ fn plugin_main_loop(
                         }
                         continue;
                     }
-                    // Note: tracks.mutate stops and restarts the audio
-                    // thread to swap in the new plugin. We do NOT touch
-                    // playback_state — the user's Play/Stop choice should
-                    // survive a chain edit.
-                    let callbacks = make_callbacks(track, slot);
-                    match load_plugin(format, &path, &plugin_id, callbacks) {
-                        Ok(plugin) => {
-                            if let Some(bytes) = initial_state
-                                && let Err(e) = plugin.state_load(&bytes)
-                            {
-                                tracing::error!(error = ?e, "state_load failed");
-                            }
-                            let loaded_id = plugin.id().to_string();
-                            let loaded_name = plugin.name().to_string();
-                            let sr = session.sample_rate;
-                            let mf = session.max_frames;
-                            tracks.mutate(|t| {
-                                install_plugin(t.ensure_track(track), slot, plugin, sr, mf)
-                            });
-                            {
-                                // A new instance landed; mint its
-                                // plugin_id, create its ProcessData
-                                // shmem, drop any stale shmem from a
-                                // previous plugin in the same slot,
-                                // then notify daw_gui (which forwards
-                                // the shmem id to daw_audio).
-                                if let Some(old_pid) = plugin_lookup.remove(&(track, slot)) {
-                                    plugin_shmems.remove(&old_pid);
-                                }
-                                let new_plugin_id = next_plugin_id;
-                                next_plugin_id += 1;
-                                let shmem_id = format!(
-                                    "daw_01_pd_{plugin_host_pid}_{new_plugin_id}"
-                                );
-                                match common::process_data::ProcessDataHandle::create(
-                                    &shmem_id,
-                                ) {
-                                    Ok(handle) => {
-                                        let pd_ptr = handle.ptr();
-                                        plugin_shmems.insert(new_plugin_id, handle);
-                                        plugin_lookup.insert((track, slot), new_plugin_id);
-                                        loaded_id_for_slot.insert((track, slot), plugin_id.clone());
-                                        // PR4.5: cache (id, name) so the
-                                        // duplicate-SetSlotPlugin branch
-                                        // above can re-emit SlotPluginLoaded
-                                        // without re-loading the plugin.
-                                        loaded_meta_for_slot.insert(
-                                            (track, slot),
-                                            (loaded_id.clone(), loaded_name.clone()),
-                                        );
+                    // Note: ユーザーの Play/Stop 状態は chain 編集を
+                    // またいで維持する (playback_state には触らない)。
+                    //
+                    // 順序: load_plugin → 旧 plugin の detach → registry
+                    // None publish → quiesce → 旧 plugin teardown → 新
+                    // plugin install。 load_plugin が失敗した場合は
+                    // 旧 plugin をそのまま残す (UX 上自然な挙動)。
 
-                                        // Capture the freshly-installed
-                                        // plugin pointer in a borrow
-                                        // scope that ends before any
-                                        // other use of `tracks`.
-                                        let plugin_ptr_raw: Option<
+                    // (1) 新 plugin の instantiate。 ここまでで失敗 ⇒
+                    //     旧 plugin の状態は触らずに早期 return。
+                    let callbacks = make_callbacks(track, slot);
+                    let plugin = match load_plugin(format, &path, &plugin_id, callbacks) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::error!(error = ?e, ?format, path = %path.display(), "load failed");
+                            continue;
+                        }
+                    };
+                    if let Some(bytes) = initial_state
+                        && let Err(e) = plugin.state_load(&bytes)
+                    {
+                        tracing::error!(error = ?e, "state_load failed");
+                    }
+
+                    // (2) 旧 plugin を chain から detach (DLL call なし)。
+                    let old_pid = plugin_lookup.get(&(track, slot)).copied();
+                    let mut detached_old: Option<Box<dyn LoadedPlugin>> = None;
+                    tracks.mutate(|t| {
+                        if let Some(chain) = t.chains.get_mut(&track) {
+                            detached_old = detach_plugin(chain, slot);
+                        }
+                    });
+
+                    // (3) 旧 plugin_id の registry を None で publish。
+                    if let Some(pid) = old_pid {
+                        publish_plugin_registry(&plugin_registry, pid, None);
+                    }
+
+                    // (4) worker pool に in-flight な process() を排出させる。
+                    //     旧 plugin を deref している worker が居る間は block。
+                    if let Some(pool) = worker_pool.as_ref() {
+                        pool.quiesce();
+                    }
+
+                    // (5) 旧 plugin を teardown + drop。
+                    if let Some(old) = detached_old {
+                        teardown_plugin(old);
+                    }
+                    if let Some(pid) = old_pid {
+                        plugin_lookup.remove(&(track, slot));
+                        plugin_shmems.remove(&pid);
+                    }
+
+                    // (6) 新 plugin を chain に install (activate +
+                    //     start_processing 含む)。
+                    let loaded_id = plugin.id().to_string();
+                    let loaded_name = plugin.name().to_string();
+                    let sr = session.sample_rate;
+                    let mf = session.max_frames;
+                    tracks.mutate(|t| {
+                        install_plugin(t.ensure_track(track), slot, plugin, sr, mf)
+                    });
+
+                    // (7) 新 plugin に plugin_id を割り当て、 ProcessData
+                    //     shmem を作って daw_gui に通知する。
+                    let new_plugin_id = next_plugin_id;
+                    next_plugin_id += 1;
+                    let shmem_id =
+                        format!("daw_01_pd_{plugin_host_pid}_{new_plugin_id}");
+                    match common::process_data::ProcessDataHandle::create(&shmem_id) {
+                        Ok(handle) => {
+                            let pd_ptr = handle.ptr();
+                            plugin_shmems.insert(new_plugin_id, handle);
+                            plugin_lookup.insert((track, slot), new_plugin_id);
+                            loaded_id_for_slot.insert((track, slot), plugin_id.clone());
+                            // PR4.5: 同 plugin_id の SetSlotPlugin が再度
+                            // 来たとき (= 同プロジェクトの 2 度目 LoadSong)
+                            // に dedup branch から SlotPluginLoaded を再
+                            // emit するためのキャッシュ。
+                            loaded_meta_for_slot.insert(
+                                (track, slot),
+                                (loaded_id.clone(), loaded_name.clone()),
+                            );
+
+                            // Install 直後の plugin pointer を short-lived な
+                            // borrow scope で取得。 borrow が抜けたあとで
+                            // tracks を再利用する。
+                            let plugin_ptr_raw: Option<*mut (dyn LoadedPlugin + 'static)> = {
+                                let opt = tracks.tracks.plugin_at_mut(track, slot);
+                                opt.map(|p| {
+                                    // SAFETY: この trait object を所有する
+                                    // `Box` は `tracks.chains` に住み、 drop
+                                    // するパスは
+                                    //   detach_plugin → registry-None →
+                                    //   WorkerPool::quiesce → teardown_plugin
+                                    // のみ。 worker pool の dispatch は
+                                    // `DispatchCounter::enter` / `exit` で
+                                    // この raw pointer の使用期間を
+                                    // synchronize する (process_server.rs
+                                    // の module-level docs 参照)。
+                                    let r: &mut dyn LoadedPlugin = p;
+                                    let raw: *mut dyn LoadedPlugin = r;
+                                    unsafe {
+                                        std::mem::transmute::<
+                                            *mut dyn LoadedPlugin,
                                             *mut (dyn LoadedPlugin + 'static),
-                                        > = {
-                                            let opt = tracks
-                                                .tracks
-                                                .plugin_at_mut(track, slot);
-                                            opt.map(|p| {
-                                                // SAFETY: the Box that
-                                                // owns this trait
-                                                // object lives in
-                                                // `tracks.chains` and is
-                                                // only dropped via
-                                                // `tracks.mutate`, which
-                                                // stops the audio thread
-                                                // before tearing down a
-                                                // chain. Worker
-                                                // dispatches always
-                                                // synchronise via the
-                                                // event handshake, so
-                                                // every read happens
-                                                // while the pointer is
-                                                // still valid.
-                                                let r: &mut dyn LoadedPlugin = p;
-                                                let raw: *mut dyn LoadedPlugin = r;
-                                                unsafe {
-                                                    std::mem::transmute::<
-                                                        *mut dyn LoadedPlugin,
-                                                        *mut (dyn LoadedPlugin + 'static),
-                                                    >(raw)
-                                                }
-                                            })
-                                        };
-                                        if let Some(p) = plugin_ptr_raw {
-                                            publish_plugin_registry(
-                                                &plugin_registry,
-                                                new_plugin_id,
-                                                Some(PluginEntry {
-                                                    plugin: PluginPtr(p),
-                                                    process_data: pd_ptr,
-                                                }),
-                                            );
-                                        }
-                                        let _ = evt_tx.send(PluginEvent::SlotPluginLoaded {
-                                            track,
-                                            slot,
-                                            id: loaded_id,
-                                            name: loaded_name,
-                                            plugin_id: new_plugin_id,
-                                            shmem_id,
-                                        });
-                                        // PR3.3: query the plugin's reported
-                                        // latency right after activate
-                                        // (CLAP `[main-thread & active]` /
-                                        // VST3 `[UI-thread & Setup Done]`
-                                        // both satisfied here). Send a
-                                        // `PluginLatencyChanged` even when
-                                        // samples == 0 so daw_gui can
-                                        // overwrite a previously-cached
-                                        // value if the user replaces a
-                                        // plugin in the same slot.
-                                        if let Some(p) = plugin_ptr_raw {
-                                            let samples = unsafe {
-                                                (*p).query_latency()
-                                            };
-                                            tracing::info!(
-                                                plugin_id = new_plugin_id,
-                                                samples,
-                                                "plugin reported latency"
-                                            );
-                                            let _ = evt_tx.send(
-                                                PluginEvent::PluginLatencyChanged {
-                                                    plugin_id: new_plugin_id,
-                                                    samples,
-                                                },
-                                            );
-                                        }
+                                        >(raw)
                                     }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            error = ?e,
-                                            new_plugin_id,
-                                            "failed to create ProcessData shmem"
-                                        );
-                                    }
-                                }
+                                })
+                            };
+                            if let Some(p) = plugin_ptr_raw {
+                                publish_plugin_registry(
+                                    &plugin_registry,
+                                    new_plugin_id,
+                                    Some(PluginEntry {
+                                        plugin: PluginPtr(p),
+                                        process_data: pd_ptr,
+                                    }),
+                                );
+                            }
+                            let _ = evt_tx.send(PluginEvent::SlotPluginLoaded {
+                                track,
+                                slot,
+                                id: loaded_id,
+                                name: loaded_name,
+                                plugin_id: new_plugin_id,
+                                shmem_id,
+                            });
+                            // PR3.3: activate 直後 (CLAP `[main-thread &
+                            // active]` / VST3 `[UI-thread & Setup Done]`
+                            // を満たすここ) で plugin の latency を query
+                            // して daw_gui へ送る。 samples == 0 でも送る
+                            // ことで、 同 slot の plugin 入れ替え時に
+                            // 古い値を上書きできる。
+                            if let Some(p) = plugin_ptr_raw {
+                                let samples = unsafe { (*p).query_latency() };
+                                tracing::info!(
+                                    plugin_id = new_plugin_id,
+                                    samples,
+                                    "plugin reported latency"
+                                );
+                                let _ = evt_tx.send(PluginEvent::PluginLatencyChanged {
+                                    plugin_id: new_plugin_id,
+                                    samples,
+                                });
                             }
                         }
                         Err(e) => {
-                            tracing::error!(error = ?e, ?format, path = %path.display(), "load failed");
+                            tracing::error!(
+                                error = ?e,
+                                new_plugin_id,
+                                "failed to create ProcessData shmem"
+                            );
                         }
                     }
                 }
                 PluginCommand::RemoveSlotPlugin { track, slot } => {
+                    // (1) plugin を chain から取り出すだけ (DLL call なし)。
+                    let mut detached: Option<Box<dyn LoadedPlugin>> = None;
                     tracks.mutate(|t| {
-                            if let Some(chain) = t.chains.get_mut(&track) {
-                                remove_plugin(chain, slot);
-                            }
+                        if let Some(chain) = t.chains.get_mut(&track) {
+                            detached = detach_plugin(chain, slot);
+                        }
                     });
-                    if let Some(removed_pid) = plugin_lookup.remove(&(track, slot)) {
-                        plugin_shmems.remove(&removed_pid);
-                        publish_plugin_registry(&plugin_registry, removed_pid, None);
+                    let removed_pid = plugin_lookup.get(&(track, slot)).copied();
+
+                    // (2) registry から `None` を publish して、 以降の
+                    // worker dispatch が この plugin_id を見つけられないよう
+                    // にする。
+                    if let Some(pid) = removed_pid {
+                        publish_plugin_registry(&plugin_registry, pid, None);
+                    }
+
+                    // (3) worker pool に in-flight な process() があれば
+                    // 排出する。 pool が None (= OpenWorkerPool 前 / 後) なら
+                    // worker そのものが居ないので no-op。
+                    if let Some(pool) = worker_pool.as_ref() {
+                        pool.quiesce();
+                    }
+
+                    // (4) ここまで来れば worker は plugin を deref
+                    // していないので、 plugin-main thread で安全に teardown
+                    // + drop できる。
+                    if let Some(plugin) = detached {
+                        teardown_plugin(plugin);
+                    }
+
+                    if let Some(pid) = removed_pid {
+                        plugin_lookup.remove(&(track, slot));
+                        plugin_shmems.remove(&pid);
                         loaded_id_for_slot.remove(&(track, slot));
                         loaded_meta_for_slot.remove(&(track, slot));
-                        // PR2.1: notify daw_gui so it can forward
-                        // ClosePluginShmem to daw_audio (otherwise audio
-                        // thread keeps calling process() on a destroyed
-                        // plugin → "VST3 plugin not processing" errors
-                        // and worker dispatch deadlock).
+                        // PR2.1: daw_gui に `ClosePluginShmem` を audio engine
+                        // に転送させて、 audio thread が destroyed plugin に
+                        // process() を呼び続けないようにする。
                         let _ = evt_tx.send(PluginEvent::SlotPluginUnloaded {
-                            plugin_id: removed_pid,
+                            plugin_id: pid,
                         });
                     }
                 }
@@ -661,47 +699,58 @@ fn plugin_main_loop(
                     });
                 }
                 PluginCommand::RemoveTrack { track } => {
-                    // `track` is a stable `Track::id`. Collect every
-                    // plugin_id that lived under this track so we can
-                    // notify daw_gui *after* drop.
+                    // `track` は stable な `Track::id`。 この track に
+                    // 属する plugin_id を集めておき、 drop の **後** に
+                    // daw_gui へ通知する。
                     let removed_pids: Vec<u32> = plugin_lookup
                         .iter()
                         .filter_map(|(&(t, _), &pid)| if t == track { Some(pid) } else { None })
                         .collect();
+
+                    // (1) chain ごと取り出すだけ (DLL call なし)。
+                    let mut detached_chain: Option<Chain> = None;
                     tracks.mutate(|t| {
-                        if let Some(mut chain) = t.chains.remove(&track) {
-                            // **Each plugin must be properly torn down**:
-                            // stop_processing → deactivate → gui_destroy
-                            // → drop. Skipping `stop_processing` /
-                            // `deactivate` makes some VST3 plugins
-                            // (kHs Chorus 等) crash on Drop because
-                            // their internal worker threads are still
-                            // active when the COM object goes away.
-                            // Mirrors `remove_plugin()` behaviour.
-                            for mut mfx in chain.midi_fx_chain.drain(..) {
-                                mfx.stop_processing();
-                                mfx.deactivate();
-                                mfx.gui_destroy();
-                            }
-                            if let Some(mut inst) = chain.instrument.take() {
-                                inst.stop_processing();
-                                inst.deactivate();
-                                inst.gui_destroy();
-                            }
-                            for mut fx in chain.fx_chain.drain(..) {
-                                fx.stop_processing();
-                                fx.deactivate();
-                                fx.gui_destroy();
-                            }
-                            // Plugins drop here, after proper teardown.
-                        }
+                        detached_chain = t.chains.remove(&track);
                     });
+
+                    // (2) registry から、 この track 由来の plugin_id を
+                    // 全て None で publish。 以降の worker dispatch は
+                    // skip path に流れる。
+                    for &pid in &removed_pids {
+                        publish_plugin_registry(&plugin_registry, pid, None);
+                    }
+
+                    // (3) in-flight な process() を排出する。
+                    if let Some(pool) = worker_pool.as_ref() {
+                        pool.quiesce();
+                    }
+
+                    // (4) plugin-main thread で teardown + drop。 worker は
+                    // もうこれらの plugin を deref していない。
+                    //
+                    // **teardown 順序を守ること**: stop_processing →
+                    // deactivate → gui_destroy → drop。 これを skip すると
+                    // 一部 VST3 plugin (kHs Chorus 等) が internal worker
+                    // thread が active なまま COM object が消えて Drop で
+                    // crash する。
+                    if let Some(mut chain) = detached_chain {
+                        for mfx in chain.midi_fx_chain.drain(..) {
+                            teardown_plugin(mfx);
+                        }
+                        if let Some(inst) = chain.instrument.take() {
+                            teardown_plugin(inst);
+                        }
+                        for fx in chain.fx_chain.drain(..) {
+                            teardown_plugin(fx);
+                        }
+                    }
+
                     plugin_lookup.retain(|&(t, _), _| t != track);
                     loaded_id_for_slot.retain(|&(t, _), _| t != track);
                     loaded_meta_for_slot.retain(|&(t, _), _| t != track);
                     for pid in removed_pids {
                         plugin_shmems.remove(&pid);
-                        publish_plugin_registry(&plugin_registry, pid, None);
+                        // registry は (2) で既に None 化済み。
                         let _ = evt_tx.send(PluginEvent::SlotPluginUnloaded { plugin_id: pid });
                     }
                 }
@@ -770,12 +819,20 @@ fn plugin_main_loop(
         }
     }
 
+    // worker pool を先に shutdown して、 worker thread が止まってから
+    // plugin を drop する。 順序を逆にすると UAF。
+    if let Some(pool) = worker_pool.take() {
+        pool.shutdown();
+    }
     tracks.shutdown();
     tracing::info!("plugin-main thread exiting (WM_QUIT)");
 }
 
-/// Place `plugin` into the slot, replacing any previous occupant. Audio
-/// thread is stopped by the caller (via `TracksHandle::mutate`).
+/// `slot` に `plugin` を挿入する。 同じ slot に既存 plugin がある場合は
+/// 呼び出し側で先に [`detach_plugin`] で抜き取り、 `WorkerPool::quiesce`
+/// で in-flight な `process()` を排出してから [`teardown_plugin`] に
+/// 渡す責務がある。 ここでは新 plugin の `activate` / `start_processing`
+/// と Vec への挿入のみを行う。
 fn install_plugin(
     chain: &mut Chain,
     slot: PluginSlot,
@@ -783,10 +840,10 @@ fn install_plugin(
     sample_rate: u32,
     max_frames: u32,
 ) {
-    // A2: the legacy audio thread used to call activate / start_processing
-    // in its prologue. With the audio engine driving plugin.process() via
-    // the process_server worker pool, the plugin must be in the started
-    // state by the time it lands in the chain.
+    // A2: 旧実装は audio thread 側の prologue で activate /
+    // start_processing を呼んでいた。 worker pool 経由の process()
+    // dispatch に切り替えた現在は、 chain に置く時点で started 状態に
+    // しておく必要がある。
     if let Err(e) = plugin.activate(f64::from(sample_rate), 64, max_frames) {
         tracing::error!(error = ?e, ?slot, "plugin.activate failed");
     }
@@ -795,34 +852,20 @@ fn install_plugin(
     }
     match slot {
         PluginSlot::Instrument => {
-            if let Some(mut old) = chain.instrument.replace(plugin) {
-                old.stop_processing();
-                old.deactivate();
-                old.gui_destroy();
-            }
+            chain.instrument = Some(plugin);
         }
         PluginSlot::Fx(i) => {
             let i = i as usize;
-            if i < chain.fx_chain.len() {
-                if let Some(old) = chain.fx_chain.get_mut(i) {
-                    old.stop_processing();
-                    old.deactivate();
-                    old.gui_destroy();
-                }
-                chain.fx_chain[i] = plugin;
+            if i <= chain.fx_chain.len() {
+                chain.fx_chain.insert(i, plugin);
             } else {
                 chain.fx_chain.push(plugin);
             }
         }
         PluginSlot::MidiFx(i) => {
             let i = i as usize;
-            if i < chain.midi_fx_chain.len() {
-                if let Some(old) = chain.midi_fx_chain.get_mut(i) {
-                    old.stop_processing();
-                    old.deactivate();
-                    old.gui_destroy();
-                }
-                chain.midi_fx_chain[i] = plugin;
+            if i <= chain.midi_fx_chain.len() {
+                chain.midi_fx_chain.insert(i, plugin);
             } else {
                 chain.midi_fx_chain.push(plugin);
             }
@@ -830,34 +873,39 @@ fn install_plugin(
     }
 }
 
-fn remove_plugin(chain: &mut Chain, slot: PluginSlot) {
+/// `slot` の plugin を chain から **取り出すだけ** (DLL call なし)。
+/// 戻り値の `Box<dyn LoadedPlugin>` はまだ active / processing 状態の
+/// ことがあるため、 呼び出し側は registry から `None` を publish し
+/// `WorkerPool::quiesce` で in-flight `process()` を排出した後、
+/// [`teardown_plugin`] で破棄する。
+///
+/// 「detach → registry-None → quiesce → teardown」 の順序を分けて持つ
+/// のは、 plugin-main thread が `Box` を drop する瞬間に worker thread
+/// が `unsafe { &mut *entry.plugin.0 }` で deref していると UAF に
+/// なるため。 詳細は `process_server.rs` の module-level docs。
+fn detach_plugin(chain: &mut Chain, slot: PluginSlot) -> Option<Box<dyn LoadedPlugin>> {
     match slot {
-        PluginSlot::Instrument => {
-            if let Some(mut old) = chain.instrument.take() {
-                old.stop_processing();
-                old.deactivate();
-                old.gui_destroy();
-            }
-        }
+        PluginSlot::Instrument => chain.instrument.take(),
         PluginSlot::Fx(i) => {
             let i = i as usize;
-            if i < chain.fx_chain.len() {
-                let mut old = chain.fx_chain.remove(i);
-                old.stop_processing();
-                old.deactivate();
-                old.gui_destroy();
-            }
+            (i < chain.fx_chain.len()).then(|| chain.fx_chain.remove(i))
         }
         PluginSlot::MidiFx(i) => {
             let i = i as usize;
-            if i < chain.midi_fx_chain.len() {
-                let mut old = chain.midi_fx_chain.remove(i);
-                old.stop_processing();
-                old.deactivate();
-                old.gui_destroy();
-            }
+            (i < chain.midi_fx_chain.len()).then(|| chain.midi_fx_chain.remove(i))
         }
     }
+}
+
+/// CLAP / VST3 spec の teardown 順 (stop_processing → deactivate →
+/// gui_destroy → drop) を実行する。 呼び出し側は事前に [`detach_plugin`]
+/// および `WorkerPool::quiesce` を済ませて、 worker thread からの
+/// 参照が無いことを保証する。
+fn teardown_plugin(mut plugin: Box<dyn LoadedPlugin>) {
+    plugin.stop_processing();
+    plugin.deactivate();
+    plugin.gui_destroy();
+    drop(plugin);
 }
 
 fn move_plugin(chain: &mut Chain, from: PluginSlot, to: PluginSlot) {
@@ -1301,9 +1349,14 @@ impl Tracks {
     }
 }
 
-/// RAII owner for every track's signal chain. Mutations go through
-/// `mutate` which is now a plain field update (the daw_audio engine
-/// drives plugin.process() via the process_server worker pool).
+/// 全 track の signal chain を持つ RAII owner。 mutation は `mutate`
+/// 経由で行うが、 これ自体は plain field update であり同期はしない。
+/// plugin の **drop** のように worker thread からの参照と衝突する
+/// 編集は、 呼び出し側で
+///   `detach_plugin → publish_plugin_registry(None) →
+///    WorkerPool::quiesce → teardown_plugin`
+/// の順序で実施する責務がある。 invariant の詳細は process_server.rs
+/// の module-level docs を参照。
 struct TracksHandle {
     tracks: Tracks,
 }
@@ -1323,11 +1376,13 @@ impl TracksHandle {
         self.tracks.plugin_at_mut(track, slot)
     }
 
-    /// Apply `f` to the chains. With the audio engine driving
-    /// plugin.process() through the process_server worker pool (and
-    /// `install_plugin` / `remove_plugin` handling activate /
-    /// start_processing for us) the mutation is just a plain field
-    /// update.
+    /// 内部 `Tracks` に `f` を適用する。 process_server の worker pool
+    /// が `plugin.process()` を駆動している現在、 ここでの mutation は
+    /// 単なる field update に過ぎない (worker thread の synchronization は
+    /// 行わない)。 worker thread が観測中の plugin を **drop** するような
+    /// 編集は、 呼び出し側で `detach_plugin` + `WorkerPool::quiesce` を
+    /// 経由してから `teardown_plugin` でやる。 詳細は struct doc-comment
+    /// および `process_server.rs` の module-level docs 参照。
     fn mutate<F>(&mut self, f: F)
     where
         F: FnOnce(&mut Tracks),
@@ -1335,8 +1390,14 @@ impl TracksHandle {
         f(&mut self.tracks);
     }
 
+    /// 全 plugin を main thread で drop する。 **呼び出し側は事前に
+    /// worker pool を `WorkerPool::shutdown` で閉じておくこと。** さも
+    /// なければ worker thread が `plugin.process()` を実行している最中に
+    /// `Box` の Drop が走り UAF になる。
     fn shutdown(mut self) {
-        // Drop plugins on the main thread.
+        // Drop の前に GUI 系を解除しておく (CLAP/VST3 の spec に従う
+        // 順序: gui_destroy → 自動 Drop で stop_processing/deactivate/
+        // destroy/terminate)。
         for chain in self.tracks.chains.values_mut() {
             for mfx in &mut chain.midi_fx_chain {
                 mfx.gui_destroy();
@@ -1348,7 +1409,7 @@ impl TracksHandle {
                 fx.gui_destroy();
             }
         }
-        // Plugins drop here, running `Plugin::drop` on the main thread.
+        // ここで `Plugin::drop` が main thread で走る。
     }
 }
 
