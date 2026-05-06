@@ -341,6 +341,13 @@ fn plugin_main_loop(
     // a destroy → re-install path. Keyed by (track, slot) → loaded
     // plugin's stable id string.
     let mut loaded_id_for_slot: HashMap<(u32, PluginSlot), String> = HashMap::new();
+    // PR4.5 fix: cache the display name + shmem id alongside loaded_id so
+    // we can re-emit a `SlotPluginLoaded` event when SetSlotPlugin arrives
+    // for an already-loaded slot (= 2nd LoadSong of the same project).
+    // Without re-emitting, daw_gui's `pending_plugin_loads` never clears
+    // and queued Play (`pending_play`) can never fire — playback freezes.
+    let mut loaded_meta_for_slot: HashMap<(u32, PluginSlot), (String, String)> =
+        HashMap::new();
     let plugin_registry: PluginRegistry =
         Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
 
@@ -441,14 +448,41 @@ fn plugin_main_loop(
                     initial_state,
                 } => {
                     // Defensive dedup against picker double-fire. Same
-                    // plugin id at the same slot ⇒ ignore.
+                    // plugin id at the same slot ⇒ ignore re-load, but
+                    // we must STILL emit `SlotPluginLoaded` so daw_gui
+                    // can clear its `pending_plugin_loads` entry for this
+                    // slot — otherwise a second project-load (same plugins)
+                    // leaves the entry pending forever and `play()`
+                    // refuses to start (`pending_play=true` in
+                    // `app.rs::play()`).
                     if loaded_id_for_slot.get(&(track, slot)) == Some(&plugin_id) {
                         tracing::info!(
                             track,
                             ?slot,
                             id = %plugin_id,
-                            "SetSlotPlugin: same plugin already loaded, ignoring duplicate"
+                            "SetSlotPlugin: same plugin already loaded, re-emitting SlotPluginLoaded"
                         );
+                        if let (Some(&new_plugin_id), Some((cached_id, cached_name))) = (
+                            plugin_lookup.get(&(track, slot)),
+                            loaded_meta_for_slot.get(&(track, slot)),
+                        ) {
+                            let shmem_id = format!(
+                                "daw_01_pd_{plugin_host_pid}_{new_plugin_id}"
+                            );
+                            let _ = evt_tx.send(PluginEvent::SlotPluginLoaded {
+                                track,
+                                slot,
+                                id: cached_id.clone(),
+                                name: cached_name.clone(),
+                                plugin_id: new_plugin_id,
+                                shmem_id,
+                            });
+                        } else {
+                            tracing::warn!(
+                                track, ?slot,
+                                "duplicate SetSlotPlugin: meta cache miss, daw_gui pending may stick"
+                            );
+                        }
                         continue;
                     }
                     // Note: tracks.mutate stops and restarts the audio
@@ -493,6 +527,14 @@ fn plugin_main_loop(
                                         plugin_shmems.insert(new_plugin_id, handle);
                                         plugin_lookup.insert((track, slot), new_plugin_id);
                                         loaded_id_for_slot.insert((track, slot), plugin_id.clone());
+                                        // PR4.5: cache (id, name) so the
+                                        // duplicate-SetSlotPlugin branch
+                                        // above can re-emit SlotPluginLoaded
+                                        // without re-loading the plugin.
+                                        loaded_meta_for_slot.insert(
+                                            (track, slot),
+                                            (loaded_id.clone(), loaded_name.clone()),
+                                        );
 
                                         // Capture the freshly-installed
                                         // plugin pointer in a borrow
@@ -600,6 +642,7 @@ fn plugin_main_loop(
                         plugin_shmems.remove(&removed_pid);
                         publish_plugin_registry(&plugin_registry, removed_pid, None);
                         loaded_id_for_slot.remove(&(track, slot));
+                        loaded_meta_for_slot.remove(&(track, slot));
                         // PR2.1: notify daw_gui so it can forward
                         // ClosePluginShmem to daw_audio (otherwise audio
                         // thread keeps calling process() on a destroyed
@@ -655,6 +698,7 @@ fn plugin_main_loop(
                     });
                     plugin_lookup.retain(|&(t, _), _| t != track);
                     loaded_id_for_slot.retain(|&(t, _), _| t != track);
+                    loaded_meta_for_slot.retain(|&(t, _), _| t != track);
                     for pid in removed_pids {
                         plugin_shmems.remove(&pid);
                         publish_plugin_registry(&plugin_registry, pid, None);
