@@ -103,6 +103,29 @@ impl ChainEntry {
     }
 }
 
+/// Per-plugin sidechain wiring entry shown in the inspector. One row per
+/// chain plugin (MIDI FX / Instrument / Fx); the `current_source` field
+/// is the value of `PluginInstance::sidechain_sources[0]` (port 0; the
+/// inspector only exposes the first aux input port for now).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidechainEntry {
+    pub track_id: u32,
+    pub slot_kind: u8,
+    pub slot_index: u32,
+    pub plugin_name: String,
+    pub current_source: Option<u32>,
+}
+
+/// Sidechain source picker choice: `None` = "—" (disconnected),
+/// `Some(track_id)` = a specific track. Self-track is filtered out by
+/// the picker because feeding a track its own output into a sidechain
+/// creates a feedback loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidechainSourceChoice {
+    pub label: String,
+    pub track_id: Option<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PickerTarget {
     Instrument,
@@ -523,6 +546,73 @@ impl AppData {
         }
     }
 
+    /// Per-plugin sidechain wiring entries shown in the inspector. One
+    /// entry per chain plugin (MidiFx / Instrument / Fx); each carries
+    /// the plugin's current `sidechain_sources[0]` value (port 0; PR4
+    /// only exposes the first aux input port through the inspector). The
+    /// track picker UI maps `None` → "—" and `Some(track_id)` → the
+    /// track's name. Self-track is filtered out by the picker because
+    /// feeding a track its own output into a sidechain creates a
+    /// feedback loop the schedule compiler catches with `GraphError::Cycle`.
+    pub fn sidechain_entries(&self) -> Vec<SidechainEntry> {
+        let Some(track) = self
+            .cursor_track_index()
+            .and_then(|i| self.song.tracks.get(i))
+        else {
+            return Vec::new();
+        };
+        let mut entries: Vec<SidechainEntry> = Vec::new();
+        for (i, p) in track.midi_fx_chain.iter().enumerate() {
+            entries.push(SidechainEntry {
+                track_id: track.id,
+                slot_kind: 0,
+                slot_index: i as u32,
+                plugin_name: resolve_plugin_name(&self.plugin_db, &p.plugin_id),
+                current_source: p.sidechain_sources.first().copied().flatten(),
+            });
+        }
+        if let Some(inst) = track.instrument.as_ref() {
+            entries.push(SidechainEntry {
+                track_id: track.id,
+                slot_kind: 1,
+                slot_index: 0,
+                plugin_name: resolve_plugin_name(&self.plugin_db, &inst.plugin_id),
+                current_source: inst.sidechain_sources.first().copied().flatten(),
+            });
+        }
+        for (i, p) in track.fx_chain.iter().enumerate() {
+            entries.push(SidechainEntry {
+                track_id: track.id,
+                slot_kind: 2,
+                slot_index: i as u32,
+                plugin_name: resolve_plugin_name(&self.plugin_db, &p.plugin_id),
+                current_source: p.sidechain_sources.first().copied().flatten(),
+            });
+        }
+        entries
+    }
+
+    /// Sidechain source picker choices: "—" (None) followed by every
+    /// track in the song **except** the cursor track itself.
+    pub fn sidechain_source_choices(&self) -> Vec<SidechainSourceChoice> {
+        let cursor_id = self.cursor_track_id();
+        let mut choices: Vec<SidechainSourceChoice> = Vec::with_capacity(self.song.tracks.len() + 1);
+        choices.push(SidechainSourceChoice {
+            label: "—".into(),
+            track_id: None,
+        });
+        for t in &self.song.tracks {
+            if Some(t.id) == cursor_id {
+                continue;
+            }
+            choices.push(SidechainSourceChoice {
+                label: format!("{} (id {})", t.name, t.id),
+                track_id: Some(t.id),
+            });
+        }
+        choices
+    }
+
     pub fn inspector_chain(&self) -> Vec<ChainEntry> {
         let Some(idx) = self.cursor_track_index() else {
             return Vec::new();
@@ -926,6 +1016,18 @@ pub enum AppEvent {
     SelectPluginFromDb(String),
     ToggleSlotGui { slot_kind: u8, slot_index: u32 },
     RemoveSlot { slot_kind: u8, slot_index: u32 },
+    /// PR4 sidechain: wire / unwire the sidechain source for a plugin's
+    /// aux input port. `track_id` + (slot_kind, slot_index) identifies
+    /// the plugin instance; `port` selects the aux input port on that
+    /// plugin (0 = first sidechain bus); `source` is `Some(track_id)`
+    /// to wire from a track, or `None` to disconnect.
+    SetSidechainSource {
+        track_id: u32,
+        slot_kind: u8,
+        slot_index: u32,
+        port: u8,
+        source: Option<u32>,
+    },
     /// inspector chain (MIDI FX → Instrument → FX を一列にした list) の reorder。
     /// `order` は新順での旧 chain index 列。section 跨ぎ (slot_kind が変わる移動)
     /// は handler 側で拒否する。
@@ -1262,6 +1364,15 @@ impl AppData {
             }
             AppEvent::RemoveSlot { slot_kind, slot_index } => {
                 self.remove_slot(slot_kind, slot_index);
+            }
+            AppEvent::SetSidechainSource {
+                track_id,
+                slot_kind,
+                slot_index,
+                port,
+                source,
+            } => {
+                self.set_sidechain_source(track_id, slot_kind, slot_index, port, source);
             }
             AppEvent::ReorderInspectorChain(order) => {
                 self.reorder_inspector_chain(&order);
@@ -3163,6 +3274,37 @@ impl AppData {
                 .collect();
             track.fx_chain = new_fx;
         }
+        self.sync_song_to_plugin_host();
+    }
+
+    /// PR4 sidechain: route a track's output into a plugin's `aux_in_port`.
+    /// `source = None` disconnects. The plugin's
+    /// `PluginInstance.sidechain_sources[port]` slot is created on demand;
+    /// shorter vectors are extended with `None` placeholders so port `port`
+    /// becomes addressable. After mutation we re-`sync_song_to_plugin_host`
+    /// so `compile_schedule` regenerates the `SidechainTap` ops.
+    fn set_sidechain_source(
+        &mut self,
+        track_id: u32,
+        slot_kind: u8,
+        slot_index: u32,
+        port: u8,
+        source: Option<u32>,
+    ) {
+        let Some(track) = self.song.track_by_id_mut(track_id) else {
+            return;
+        };
+        let plugin = match slot_kind {
+            0 => track.midi_fx_chain.get_mut(slot_index as usize),
+            1 => track.instrument.as_mut(),
+            _ => track.fx_chain.get_mut(slot_index as usize),
+        };
+        let Some(inst) = plugin else { return };
+        let port_idx = port as usize;
+        if inst.sidechain_sources.len() <= port_idx {
+            inst.sidechain_sources.resize(port_idx + 1, None);
+        }
+        inst.sidechain_sources[port_idx] = source;
         self.sync_song_to_plugin_host();
     }
 

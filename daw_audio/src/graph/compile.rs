@@ -75,39 +75,87 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         .filter_map(|t| t.parent_group_id)
         .collect();
 
-    // ---- detect parent-chain cycles via iterative DFS ----
-    // depth: 0 = unvisited, 1 = on current path, 2 = fully explored.
-    let mut state = vec![0u8; n];
+    // ---- gather children per group track ----
+    // (moved up from below: required by both cycle detection and depth fill)
+    let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (idx, t) in song.tracks.iter().enumerate() {
+        if let Some(pid) = t.parent_group_id {
+            children_of.entry(pid).or_default().push(idx as u32);
+        }
+    }
+
+    // ---- detect cycles in path_latency dependency graph ----
+    //
+    // `compute_path_latency` recurses through:
+    //   1. children of a group track (group depends on every child's path_latency)
+    //   2. sidechain sources of plugins on the track (track depends on each
+    //      sidechain source's path_latency)
+    //
+    // Cycle in this dep-graph ⇒ infinite recursion in path_latency ⇒ must
+    // reject up front. Iterative 3-color DFS over the dep edges.
+    //
+    // PR4: this subsumes the old parent-chain-only detector — children-of
+    // edges cover all parent cycles, sidechain-source edges cover all
+    // sidechain feedback (incl. self-feedback A → A and A→B→A).
+    let mut state = vec![0u8; n]; // 0=unvisited, 1=on current path, 2=done
+    let dep_edges_for = |idx: u32| -> Vec<u32> {
+        let track = &song.tracks[idx as usize];
+        let mut out: Vec<u32> = Vec::new();
+        if let Some(kids) = children_of.get(&track.id) {
+            out.extend(kids.iter().copied());
+        }
+        let push_chain_sc = |chain: &[common::model::PluginInstance],
+                             out: &mut Vec<u32>| {
+            for p in chain {
+                for src_id_opt in &p.sidechain_sources {
+                    if let Some(src_id) = src_id_opt
+                        && let Some(&src_idx) = id_to_idx.get(src_id)
+                    {
+                        out.push(src_idx);
+                    }
+                }
+            }
+        };
+        push_chain_sc(&track.midi_fx_chain, &mut out);
+        if let Some(inst) = &track.instrument {
+            for src_id_opt in &inst.sidechain_sources {
+                if let Some(src_id) = src_id_opt
+                    && let Some(&src_idx) = id_to_idx.get(src_id)
+                {
+                    out.push(src_idx);
+                }
+            }
+        }
+        push_chain_sc(&track.fx_chain, &mut out);
+        out
+    };
     for start in 0..n {
         if state[start] != 0 {
             continue;
         }
-        let mut stack: Vec<u32> = vec![start as u32];
-        while let Some(&top) = stack.last() {
-            let s = state[top as usize];
-            if s == 0 {
-                state[top as usize] = 1;
-                let track = &song.tracks[top as usize];
-                if let Some(pid) = track.parent_group_id {
-                    let pidx = id_to_idx[&pid];
-                    match state[pidx as usize] {
-                        0 => stack.push(pidx),
-                        1 => return Err(GraphError::Cycle),
-                        _ => {
-                            state[top as usize] = 2;
-                            stack.pop();
-                        }
-                    }
-                } else {
-                    state[top as usize] = 2;
-                    stack.pop();
+        // Stack carries (node, next-edge-index-to-explore).
+        let mut stack: Vec<(u32, usize)> = vec![(start as u32, 0)];
+        state[start] = 1;
+        while let Some(&(node, edge_i)) = stack.last() {
+            let deps = dep_edges_for(node);
+            if edge_i >= deps.len() {
+                state[node as usize] = 2;
+                stack.pop();
+                continue;
+            }
+            // Advance the edge cursor on the current frame before we
+            // possibly push a new one.
+            if let Some(top) = stack.last_mut() {
+                top.1 += 1;
+            }
+            let target = deps[edge_i];
+            match state[target as usize] {
+                0 => {
+                    state[target as usize] = 1;
+                    stack.push((target, 0));
                 }
-            } else if s == 1 {
-                // Children done — mark fully explored and pop.
-                state[top as usize] = 2;
-                stack.pop();
-            } else {
-                stack.pop();
+                1 => return Err(GraphError::Cycle),
+                _ => {}
             }
         }
     }
@@ -140,15 +188,8 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         fill_depth(i as u32, &song.tracks, &id_to_idx, &mut depth);
     }
 
-    // ---- gather children per group track ----
-    let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
-    for (idx, t) in song.tracks.iter().enumerate() {
-        if let Some(pid) = t.parent_group_id {
-            children_of.entry(pid).or_default().push(idx as u32);
-        }
-    }
-
     // ---- emit ops in descending-depth order ----
+    // (children_of was gathered above for cycle detection — reuse it here.)
     let mut order: Vec<u32> = (0..n as u32).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(depth[i as usize]));
 
@@ -224,6 +265,7 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
             &song.tracks,
             &is_group,
             &children_of,
+            &id_to_idx,
             &mut path_latency,
         );
     }
@@ -330,27 +372,56 @@ fn emit_sidechain_taps(
 }
 
 /// `path_latency[idx]` を計算してキャッシュする。 既に値があれば即返却
-/// (memoization)。 群 (`is_group` メンバ) は子の path_latency の最大値を
-/// 自身の input bus latency として、 そこに自身の `reported_latency_samples`
-/// を足す (group 自身の FX chain latency を加算)。 leaf は子無しなので
-/// `own` のみ。
+/// (memoization)。
+///
+/// PR3: group (`is_group` メンバ) は子の path_latency の最大値を自身の input
+/// bus latency として、 そこに自身の `reported_latency_samples` を足す。
+///
+/// PR4 sidechain × PDC: track の plugin chain (`midi_fx_chain` / `instrument`
+/// / `fx_chain`) の各 plugin の `sidechain_sources` も `input bus latency`
+/// に取り込む。 すなわち:
+///
+///   input_latency(T) = max(
+///       max(child.path_latency for child in children_of(T)),
+///       max(source.path_latency for (P, source) in sidechain_inputs(T))
+///   )
+///   path_latency(T) = input_latency(T) + T.reported_latency_samples
+///
+/// 仕様根拠: Ardour `route.cc::process_output_buffers` の "feed-forward
+/// latency reporting" — sidechain edge も `Latent` の input の一種として
+/// 扱う。 こうすると master / group bus の sibling alignment compensation が
+/// sidechain 経由の遅延を含めた最大 path を基準に補償する (= 「サイドチェイン
+/// 受信 track の出力が他の sibling track と musical time で揃う」)。
+///
+/// **注意 (本実装の限界)**: ここでは plugin の **入力 bus 単位** で latency
+/// を揃える。 plugin が chain の途中 (slot K, K>0) にいるときは pre-plugin
+/// chain prefix latency があり、 plugin 内部での main vs aux alignment は
+/// それを考慮した DelayTrackInput op (= 別 PR) で完成する。 現状でも graph
+/// layer の不変量は成立するので master / group の audio mix は崩れない。
+///
+/// dangling reference (= sidechain source が song に存在しない) は wrap せず
+/// 0 として扱う (compile error にしない方針、 編集中の中間状態を許容)。
 fn compute_path_latency(
     idx: u32,
     tracks: &[common::model::Track],
     is_group: &HashSet<u32>,
     children_of: &HashMap<u32, Vec<u32>>,
+    id_to_idx: &HashMap<u32, u32>,
     cache: &mut [u32],
 ) -> u32 {
     if cache[idx as usize] != u32::MAX {
         return cache[idx as usize];
     }
     let track = &tracks[idx as usize];
-    let max_input: u32 = if is_group.contains(&track.id) {
+
+    let group_input: u32 = if is_group.contains(&track.id) {
         children_of
             .get(&track.id)
             .map(|kids| {
                 kids.iter()
-                    .map(|&c| compute_path_latency(c, tracks, is_group, children_of, cache))
+                    .map(|&c| {
+                        compute_path_latency(c, tracks, is_group, children_of, id_to_idx, cache)
+                    })
                     .max()
                     .unwrap_or(0)
             })
@@ -358,6 +429,36 @@ fn compute_path_latency(
     } else {
         0
     };
+
+    let mut sidechain_input: u32 = 0;
+    let mut consider = |src_id_opt: &Option<u32>, cache: &mut [u32]| {
+        if let Some(src_id) = src_id_opt
+            && let Some(&src_idx) = id_to_idx.get(src_id)
+        {
+            let l =
+                compute_path_latency(src_idx, tracks, is_group, children_of, id_to_idx, cache);
+            if l > sidechain_input {
+                sidechain_input = l;
+            }
+        }
+    };
+    for p in &track.midi_fx_chain {
+        for src in &p.sidechain_sources {
+            consider(src, cache);
+        }
+    }
+    if let Some(inst) = &track.instrument {
+        for src in &inst.sidechain_sources {
+            consider(src, cache);
+        }
+    }
+    for p in &track.fx_chain {
+        for src in &p.sidechain_sources {
+            consider(src, cache);
+        }
+    }
+
+    let max_input = group_input.max(sidechain_input);
     let total = max_input.saturating_add(track.reported_latency_samples);
     cache[idx as usize] = total;
     total
@@ -1104,6 +1205,168 @@ mod tests {
             tap_idx < dst_proc_idx,
             "SidechainTap must run before destination ProcessTrack: tap={tap_idx} dst={dst_proc_idx}"
         );
+    }
+
+    /// PR4 sidechain × PDC integration: dest track の plugin が source track
+    /// から sidechain 入力を受けている場合、 dest 自身の `path_latency` は
+    /// 「sidechain source の path_latency」 を **input bus latency として
+    /// 取り込んだ上で** dest 自身の chain latency を加算する。 こうすると
+    /// master mix の sibling alignment が source の遅延分も補償する。
+    ///
+    /// 仕様根拠: Ardour `route.cc` の `Latent` 基底クラス + sidechain
+    /// (`Send`/`PluginInsert::sidechain_input`) の implicit synchronization。
+    /// 実装上は sidechain edge を `compute_path_latency` の input fan-in に
+    /// 加算するだけで graph layer の不変量が成立する。
+    ///
+    /// セットアップ:
+    ///   Track A (id=1, latency 100) → master, source for sidechain
+    ///   Track B (id=2, latency 50, fx slot 0 sidechain ← A) → master
+    ///
+    /// 修正前 (PDC が sidechain edge を見ていない):
+    ///   path_latency(A) = 100, path_latency(B) = 50
+    ///   master mix max = 100, B が 50 サンプル遅延される (B が low-latency)。
+    ///   → B の plugin は main を「即時」、 aux を A の遅延済み信号で受ける。
+    ///   master 上では B が遅延されて A と「揃う」 が、 plugin 内部の sidechain
+    ///   検出は時間軸ずれの状態。 さらに B の output に master mix delay が
+    ///   掛かるので musical alignment が壊れる方向に動く。
+    ///
+    /// 修正後 (sidechain edge を path_latency に取り込む):
+    ///   path_latency(B) = max(0, path_latency(A)=100) + 50 = 150
+    ///   master mix max = 150, A が 50 サンプル遅延される (A が low-latency)。
+    ///   → master 上の musical alignment が一致する。 sibling drift が消える。
+    ///
+    /// 残課題 (本テスト範囲外): plugin の main vs aux 内部 alignment は per-slot
+    /// chain prefix latency が必要なので、 別 PR で `DelayTrackInput` op を
+    /// 入れて対応。
+    #[test]
+    fn pdc_sidechain_source_path_latency_propagates_to_dest() {
+        use common::model::PluginInstance;
+        use common::plugin_format::PluginFormat;
+
+        let song = Song {
+            tracks: vec![
+                Track {
+                    id: 1,
+                    name: "Source".into(),
+                    reported_latency_samples: 100,
+                    ..Track::default()
+                },
+                Track {
+                    id: 2,
+                    name: "Dest".into(),
+                    reported_latency_samples: 50,
+                    fx_chain: vec![PluginInstance {
+                        plugin_id: "test.compressor".into(),
+                        format: PluginFormat::Vst3,
+                        state: None,
+                        sidechain_sources: vec![Some(1)],
+                    }],
+                    ..Track::default()
+                },
+            ],
+            ..Song::default()
+        };
+        let sched = compile_schedule(&song).unwrap();
+
+        // Master Mix の input は (TrackScratch(0), TrackScratch(1)) の 2 本。
+        // path_latency(A=0) = 100, path_latency(B=1) = 100 + 50 = 150 になっている
+        // はずなので、 max=150 に対し A (=100) を 50 サンプル遅延する `ApplyDelay`
+        // が master mix の直前に出る。
+        let master_mix_pos = sched
+            .nodes
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    NodeOp::Mix {
+                        dst: BufRef::Master,
+                        ..
+                    }
+                )
+            })
+            .expect("Master Mix must exist");
+
+        // Source (TrackScratch(0)) が低 latency 側、 50 サンプル補償される。
+        let apply_pos = sched
+            .nodes
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    NodeOp::ApplyDelay {
+                        buf: BufRef::TrackScratch(0),
+                        frames: 50,
+                        ..
+                    }
+                )
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected ApplyDelay {{ TrackScratch(0), frames: 50 }} \
+                     to align Source(latency 100) with Dest(input 100 + chain 50 = 150) \
+                     before Master Mix; got nodes={:?}",
+                    sched.nodes
+                )
+            });
+        assert!(
+            apply_pos < master_mix_pos,
+            "compensating ApplyDelay must come before Master Mix"
+        );
+
+        // Dest (TrackScratch(1)) には ApplyDelay が刺さらない (= max-latency 側)。
+        let dest_has_delay = sched.nodes.iter().any(|op| {
+            matches!(
+                op,
+                NodeOp::ApplyDelay {
+                    buf: BufRef::TrackScratch(1),
+                    ..
+                }
+            )
+        });
+        assert!(
+            !dest_has_delay,
+            "the highest-latency path (Dest including sidechain input) must NOT receive ApplyDelay"
+        );
+    }
+
+    /// PR4 sidechain × PDC: sidechain edge が cycle を作る (A→B→A) 場合、
+    /// `compile_schedule` は `GraphError::Cycle` を返す。 graph layer で
+    /// 検出しないと `compute_path_latency` が無限再帰する。
+    #[test]
+    fn sidechain_cycle_between_two_tracks_is_rejected() {
+        use common::model::PluginInstance;
+        use common::plugin_format::PluginFormat;
+
+        // A(id=1) の plugin が B(id=2) からの sidechain を、
+        // B(id=2) の plugin が A(id=1) からの sidechain を要求 → cycle。
+        let song = Song {
+            tracks: vec![
+                Track {
+                    id: 1,
+                    name: "A".into(),
+                    fx_chain: vec![PluginInstance {
+                        plugin_id: "test.compressor".into(),
+                        format: PluginFormat::Vst3,
+                        state: None,
+                        sidechain_sources: vec![Some(2)],
+                    }],
+                    ..Track::default()
+                },
+                Track {
+                    id: 2,
+                    name: "B".into(),
+                    fx_chain: vec![PluginInstance {
+                        plugin_id: "test.compressor".into(),
+                        format: PluginFormat::Vst3,
+                        state: None,
+                        sidechain_sources: vec![Some(1)],
+                    }],
+                    ..Track::default()
+                },
+            ],
+            ..Song::default()
+        };
+        assert_eq!(compile_schedule(&song).err(), Some(GraphError::Cycle));
     }
 
     /// 同じく compile-level test: `sidechain_sources` の対象 track が
