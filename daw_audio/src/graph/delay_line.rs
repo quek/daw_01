@@ -68,6 +68,31 @@ impl DelayLine {
         self.buf_r.fill(0.0);
         self.write = 0;
     }
+
+    /// `step` の in-place 版: `l` / `r` 1 組のスライスを入力でも出力でも
+    /// 兼用する。 audio engine の post-dispatch では track の scratch
+    /// (`TrackScratch::track_l/r`) を **そのまま** 遅延線に通したいので、
+    /// 別バッファを毎呼出しで確保するわけにはいかず in-place が必要。
+    ///
+    /// 各 sample で「ring に書き込む → ring の `delay` サンプル前を読む
+    /// → `l[i]` / `r[i]` に書き戻す」 順なので、 同じスライスを使っても
+    /// 当該サンプル以外の入力を破壊しない。
+    pub fn step_in_place(&mut self, l: &mut [f32], r: &mut [f32], delay: usize) {
+        if self.capacity == 0 {
+            return;
+        }
+        let n = l.len().min(r.len());
+        let cap = self.capacity;
+        let d = delay.min(cap - 1);
+        for i in 0..n {
+            self.buf_l[self.write] = l[i];
+            self.buf_r[self.write] = r[i];
+            let read = (self.write + cap - d) % cap;
+            l[i] = self.buf_l[read];
+            r[i] = self.buf_r[read];
+            self.write = (self.write + 1) % cap;
+        }
+    }
 }
 
 #[cfg(test)]

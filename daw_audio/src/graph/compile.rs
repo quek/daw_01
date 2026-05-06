@@ -20,6 +20,7 @@ use std::collections::HashSet;
 
 use common::model::Song;
 
+use super::delay_line::DelayLine;
 use super::schedule::{BufRef, NodeOp, Schedule};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,11 +192,113 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         dst: BufRef::Master,
     });
 
+    // ---- PR3: Plugin Delay Compensation ----
+    //
+    // 各 track の **path latency** を計算し、 Mix の合流点で path 間の
+    // 不一致を `ApplyDelay` で補償する。 Ardour の `Latent` 基底クラス +
+    // `route.cc::process_output_buffers` の流儀:
+    //
+    //   path_latency(leaf)  = leaf.reported_latency_samples
+    //   path_latency(group) = max(child.path_latency) + group.reported_latency_samples
+    //
+    // ※ group では子達が group bus に流れ込むときに既に sibling alignment が
+    //   行われている (ここで挿入する `ApplyDelay` で揃う) ので、 group の
+    //   入力 bus 時点では全員 `max(child.path_latency)` に揃っている。
+    //   従って group 自身の path_latency = max + own。
+    //
+    // 補償ルール: 各 Mix ノードの srcs の中で `path_latency` が最も小さい側に、
+    //   `frames = max_path - this_path` の `ApplyDelay` を **Mix の直前に**
+    //   挿入する。 こうすると合流点で全 src の累積 latency が揃う。
+    let mut path_latency = vec![u32::MAX; n];
+    for i in 0..n {
+        compute_path_latency(
+            i as u32,
+            &song.tracks,
+            &is_group,
+            &children_of,
+            &mut path_latency,
+        );
+    }
+
+    // 既存の nodes を線形に走査し、 Mix を見つけたらその直前に
+    // `ApplyDelay` を挿入する。 in-place 操作よりも build-from-scratch
+    // の方が境界条件が単純なので、 一度別 Vec に組み直す。
+    let mut delay_lines: Vec<DelayLine> = Vec::new();
+    let mut nodes_with_pdc: Vec<NodeOp> = Vec::with_capacity(nodes.len() + n);
+    for op in nodes.into_iter() {
+        if let NodeOp::Mix { ref srcs, .. } = op {
+            // この Mix の入力中で最大の path latency を求める。
+            let max_path = srcs
+                .iter()
+                .filter_map(|(b, _)| match b {
+                    BufRef::TrackScratch(i) => Some(path_latency[*i as usize]),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+            // 各 src を必要なら `ApplyDelay` で max に揃える。
+            for (b, _) in srcs.iter() {
+                let BufRef::TrackScratch(i) = b else {
+                    continue;
+                };
+                let this = path_latency[*i as usize];
+                if this < max_path {
+                    let comp = max_path - this;
+                    let line_idx = delay_lines.len() as u32;
+                    // DelayLine.step は `delay <= capacity - 1` を要求
+                    // (`delay_line.rs:55-56` の clamp ロジック)。 補償量
+                    // ちょうどを返すために capacity = comp + 1。
+                    delay_lines.push(DelayLine::with_capacity((comp as usize) + 1));
+                    nodes_with_pdc.push(NodeOp::ApplyDelay {
+                        buf: BufRef::TrackScratch(*i),
+                        line_idx,
+                        frames: comp,
+                    });
+                }
+            }
+        }
+        nodes_with_pdc.push(op);
+    }
+
     Ok(Schedule {
-        nodes,
-        delay_lines: Vec::new(),
+        nodes: nodes_with_pdc,
+        delay_lines,
         port_buffers: super::PortBufferPool::new(),
     })
+}
+
+/// `path_latency[idx]` を計算してキャッシュする。 既に値があれば即返却
+/// (memoization)。 群 (`is_group` メンバ) は子の path_latency の最大値を
+/// 自身の input bus latency として、 そこに自身の `reported_latency_samples`
+/// を足す (group 自身の FX chain latency を加算)。 leaf は子無しなので
+/// `own` のみ。
+fn compute_path_latency(
+    idx: u32,
+    tracks: &[common::model::Track],
+    is_group: &HashSet<u32>,
+    children_of: &HashMap<u32, Vec<u32>>,
+    cache: &mut [u32],
+) -> u32 {
+    if cache[idx as usize] != u32::MAX {
+        return cache[idx as usize];
+    }
+    let track = &tracks[idx as usize];
+    let max_input: u32 = if is_group.contains(&track.id) {
+        children_of
+            .get(&track.id)
+            .map(|kids| {
+                kids.iter()
+                    .map(|&c| compute_path_latency(c, tracks, is_group, children_of, cache))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let total = max_input.saturating_add(track.reported_latency_samples);
+    cache[idx as usize] = total;
+    total
 }
 
 #[cfg(test)]
@@ -522,5 +625,328 @@ mod tests {
             compile_schedule(&song).err(),
             Some(GraphError::DanglingReference(99))
         );
+    }
+
+    // ---- PR3: Plugin Delay Compensation ----
+
+    /// Compile-level test: 親子無しの 2 track が並行に master へ流れるとき、
+    /// 片方のみが latency 100 を report していたら、 もう片方 (latency 0)
+    /// に対して `ApplyDelay { frames: 100 }` を Master Mix の **直前** に
+    /// 挿入し、 必要な DelayLine を `Schedule::delay_lines` に確保すべき。
+    ///
+    /// 仕様根拠: Ardour `libs/ardour/route.cc::process_output_buffers` —
+    /// 各ルート内の effective_latency を直列加算し、 sink (Master) で全
+    /// path を最大値に揃えるため、 latency が小さい path に DelayLine を
+    /// 挿入する。
+    #[test]
+    fn pdc_parallel_tracks_emit_compensating_delay_for_lower_latency_path() {
+        let song = Song {
+            tracks: vec![
+                Track {
+                    id: 1,
+                    name: "Clean".into(),
+                    reported_latency_samples: 0,
+                    ..Track::default()
+                },
+                Track {
+                    id: 2,
+                    name: "Latent".into(),
+                    reported_latency_samples: 100,
+                    ..Track::default()
+                },
+            ],
+            ..Song::default()
+        };
+        let sched = compile_schedule(&song).unwrap();
+
+        // (a) DelayLine が 1 本以上、 capacity ≥ 100 で確保されている。
+        assert!(
+            sched
+                .delay_lines
+                .iter()
+                .any(|dl| dl.capacity() >= 100),
+            "compile_schedule must allocate a DelayLine for the laggard's compensation; \
+             got delay_lines.len()={}",
+            sched.delay_lines.len()
+        );
+
+        // (b) Master Mix の **直前** に latency=0 path (TrackScratch(0)) へ
+        //     ApplyDelay { frames: 100 } が刺さっている。
+        let master_mix_pos = sched
+            .nodes
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    NodeOp::Mix {
+                        dst: BufRef::Master,
+                        ..
+                    }
+                )
+            })
+            .expect("Master Mix must exist");
+        let apply_pos = sched
+            .nodes
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    NodeOp::ApplyDelay {
+                        buf: BufRef::TrackScratch(0),
+                        frames: 100,
+                        ..
+                    }
+                )
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "ApplyDelay {{ buf: TrackScratch(0), frames: 100 }} must be inserted \
+                     before Master Mix; got nodes={:?}",
+                    sched.nodes
+                )
+            });
+        assert!(
+            apply_pos < master_mix_pos,
+            "ApplyDelay must come before Master Mix"
+        );
+
+        // (c) latency が大きい側 (TrackScratch(1)) には DelayLine 不要 —
+        //     こちらは「全 path の max」と同じ累積 latency を持つので、
+        //     compensation を入れると余計な遅延になる。
+        let laggard_has_apply = sched.nodes.iter().any(|op| {
+            matches!(
+                op,
+                NodeOp::ApplyDelay {
+                    buf: BufRef::TrackScratch(1),
+                    ..
+                }
+            )
+        });
+        assert!(
+            !laggard_has_apply,
+            "the highest-latency path should NOT receive an ApplyDelay"
+        );
+    }
+
+    /// 数値テスト: 各 track に「latency を持つ plugin」 をロードした状態で
+    /// 同一の impulse を input すると、 PDC 無しでは plugin の遅延だけ
+    /// master の合流点で時間がずれる (= 「トラック間の音ずれ」)。 PDC が
+    /// 効いていれば、 低 latency path が補償されて master 上の単一 peak
+    /// に収束する。
+    ///
+    /// 構成:
+    ///   Track A (id=1) ← LatencyPlugin(0)   identity
+    ///   Track B (id=2) ← LatencyPlugin(100) input を 100 sample 遅延
+    ///   両 track に impulse @sample 0 を入力 → master へ合流
+    ///
+    /// 期待:
+    ///   PDC OK → master_l[100] ≈ 2.0、 他は 0
+    ///   PDC NG → master_l[0]   ≈ 1.0  (A だけ即時) , master_l[100] ≈ 1.0 (B 遅延)
+    ///            → これが「音ずれ」 で、 本テストはこの状況を assertion で検出
+    #[test]
+    fn pdc_two_track_impulse_aligns_at_master_with_loaded_latency_plugin() {
+        const FRAMES: usize = 256;
+
+        let song = Song {
+            tracks: vec![
+                Track {
+                    id: 1,
+                    name: "A".into(),
+                    reported_latency_samples: 0,
+                    ..Track::default()
+                },
+                Track {
+                    id: 2,
+                    name: "B".into(),
+                    reported_latency_samples: 100,
+                    ..Track::default()
+                },
+            ],
+            ..Song::default()
+        };
+        let mut sched = compile_schedule(&song).unwrap();
+
+        // Track ごとに「ロードされた plugin」 を持たせる。 production の
+        // CLAP/VST3 と違って format-agnostic な test stub だが、
+        //   - state を持つ (history ring buffer)
+        //   - process(input -> output) に latency 分の遅延を入れる
+        // という意味で「latency を持つ loaded plugin」 そのもの。 Track の
+        // 並び (idx) → plugin のマップで保持する。
+        let mut plugins: Vec<LatencyPlugin> =
+            vec![LatencyPlugin::new(0), LatencyPlugin::new(100)];
+
+        // 各 track の scratch (stereo)。 ProcessTrack ハンドラで
+        // plugin.process(input) を呼んだ結果を書き込む。
+        let mut scratch_l: Vec<Vec<f32>> = vec![vec![0.0; FRAMES]; 2];
+        let mut scratch_r: Vec<Vec<f32>> = vec![vec![0.0; FRAMES]; 2];
+
+        // 共通入力: impulse @sample 0
+        let mut input_l = vec![0.0f32; FRAMES];
+        let mut input_r = vec![0.0f32; FRAMES];
+        input_l[0] = 1.0;
+        input_r[0] = 1.0;
+
+        let mut master_l = vec![0.0f32; FRAMES];
+        let mut master_r = vec![0.0f32; FRAMES];
+
+        // production の engine.rs:917-968 の dispatch loop を test 用に複製。
+        // ProcessTrack で「ロード済 plugin」 の process() を回し、 Mix /
+        // ApplyDelay は production と同じロジック。
+        for op in &mut sched.nodes {
+            match op {
+                NodeOp::ProcessTrack { track_idx } => {
+                    let i = *track_idx as usize;
+                    plugins[i].process(
+                        &input_l,
+                        &input_r,
+                        &mut scratch_l[i],
+                        &mut scratch_r[i],
+                    );
+                }
+                NodeOp::ProcessGroupFx { .. } | NodeOp::SidechainTap { .. } => {
+                    // この test では未使用
+                }
+                NodeOp::Mix {
+                    srcs,
+                    dst: BufRef::Master,
+                } => {
+                    for (b, gain) in srcs.iter() {
+                        let BufRef::TrackScratch(i) = b else {
+                            continue;
+                        };
+                        let i = *i as usize;
+                        for j in 0..FRAMES {
+                            master_l[j] += scratch_l[i][j] * gain;
+                            master_r[j] += scratch_r[i][j] * gain;
+                        }
+                    }
+                }
+                NodeOp::Mix {
+                    srcs,
+                    dst: BufRef::TrackScratch(target_idx),
+                } => {
+                    let target = *target_idx as usize;
+                    let mut new_l = vec![0.0f32; FRAMES];
+                    let mut new_r = vec![0.0f32; FRAMES];
+                    for (b, gain) in srcs.iter() {
+                        let BufRef::TrackScratch(i) = b else {
+                            continue;
+                        };
+                        let i = *i as usize;
+                        for j in 0..FRAMES {
+                            new_l[j] += scratch_l[i][j] * gain;
+                            new_r[j] += scratch_r[i][j] * gain;
+                        }
+                    }
+                    scratch_l[target] = new_l;
+                    scratch_r[target] = new_r;
+                }
+                NodeOp::Mix { .. } => {
+                    // Pooled / PluginAuxOut: PR4
+                }
+                NodeOp::ApplyDelay {
+                    buf,
+                    line_idx,
+                    frames,
+                } => {
+                    let BufRef::TrackScratch(i) = buf else {
+                        continue;
+                    };
+                    let i = *i as usize;
+                    let line = &mut sched.delay_lines[*line_idx as usize];
+                    let in_l = scratch_l[i].clone();
+                    let in_r = scratch_r[i].clone();
+                    line.step(
+                        &in_l,
+                        &in_r,
+                        &mut scratch_l[i],
+                        &mut scratch_r[i],
+                        *frames as usize,
+                    );
+                }
+            }
+            // input は 1 buffer 分だけ消費するので、 2 回目以降は input を
+            // 0 で埋める必要は無い (ProcessTrack はループ中に 2 回呼ばれない
+            // 想定。 ループは 1 buffer 1 イテレーション)。
+            let _ = (&input_l, &input_r);
+        }
+
+        // (a) sample 0 には peak が立たない (= Track A の出力が PDC で
+        //     100 sample 遅延されて、 sample 0 の地点には何も無い)。
+        assert!(
+            master_l[0].abs() < 1e-6,
+            "master_l[0] should be 0 after PDC, got {} (= track misalignment)",
+            master_l[0]
+        );
+
+        // (b) sample 100 で 2 track の impulse が重なって peak になる。
+        assert!(
+            (master_l[100] - 2.0).abs() < 1e-6,
+            "master_l[100] should be ~2.0 (both tracks' impulses aligned), got {}",
+            master_l[100]
+        );
+
+        // (c) sample 100 以外は 0 (= 1 つの peak だけ、 「音ずれ」 なし)。
+        for (i, &v) in master_l.iter().enumerate() {
+            if i == 100 {
+                continue;
+            }
+            assert!(
+                v.abs() < 1e-6,
+                "master_l[{}] should be 0, got {} (= track misalignment)",
+                i,
+                v
+            );
+        }
+    }
+
+    /// テスト専用「latency を持つ plugin」 stub。 production の `LoadedPlugin`
+    /// trait は format 固有 (CLAP/VST3) の重い API を必要とするため、 PDC
+    /// グラフレイヤを単独で検証するためだけの最小 stub を test mod 内に置く。
+    /// `process(input -> output)` で `latency` サンプルだけ遅延した出力を返す。
+    struct LatencyPlugin {
+        latency: usize,
+        hist_l: Vec<f32>,
+        hist_r: Vec<f32>,
+        write: usize,
+        cap: usize,
+    }
+
+    impl LatencyPlugin {
+        fn new(latency: usize) -> Self {
+            // capacity = latency + 1 で「latency 分の遅延」 を厳密に再現
+            // (DelayLine の clamp 仕様と整合)。
+            let cap = latency + 1;
+            Self {
+                latency,
+                hist_l: vec![0.0; cap],
+                hist_r: vec![0.0; cap],
+                write: 0,
+                cap,
+            }
+        }
+
+        fn process(
+            &mut self,
+            in_l: &[f32],
+            in_r: &[f32],
+            out_l: &mut [f32],
+            out_r: &mut [f32],
+        ) {
+            let n = in_l.len().min(in_r.len()).min(out_l.len()).min(out_r.len());
+            if self.latency == 0 {
+                out_l[..n].copy_from_slice(&in_l[..n]);
+                out_r[..n].copy_from_slice(&in_r[..n]);
+                return;
+            }
+            for i in 0..n {
+                self.hist_l[self.write] = in_l[i];
+                self.hist_r[self.write] = in_r[i];
+                let read = (self.write + self.cap - self.latency) % self.cap;
+                out_l[i] = self.hist_l[read];
+                out_r[i] = self.hist_r[read];
+                self.write = (self.write + 1) % self.cap;
+            }
+        }
     }
 }

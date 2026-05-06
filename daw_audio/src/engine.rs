@@ -514,7 +514,7 @@ impl LocalState {
             // execution so groups + future PDC + sidechain hops can plug
             // in by extending `NodeOp` rather than this function.
             execute_schedule_post_dispatch(
-                &self.cached_schedule,
+                &mut self.cached_schedule,
                 &mut self.scratch[..MAX_TRACKS],
                 &mut self.master_l[..n],
                 &mut self.master_r[..n],
@@ -900,7 +900,7 @@ pub fn reduce_master(
 /// `dispatch_and_wait` has already filled the per-track scratches.
 #[allow(clippy::too_many_arguments)]
 fn execute_schedule_post_dispatch(
-    schedule: &Schedule,
+    schedule: &mut Schedule,
     scratch: &mut [TrackScratch],
     master_l: &mut [f32],
     master_r: &mut [f32],
@@ -914,7 +914,15 @@ fn execute_schedule_post_dispatch(
     playing: bool,
     any_solo: bool,
 ) {
-    for op in &schedule.nodes {
+    // `nodes` の不変参照と `delay_lines` の可変参照を同時に取りたい
+    // (ApplyDelay で line を引きながら nodes を回すため)。 `Schedule`
+    // を split borrow で 2 つの参照に分解する。
+    let Schedule {
+        nodes,
+        delay_lines,
+        port_buffers: _,
+    } = schedule;
+    for op in nodes.iter() {
         match op {
             NodeOp::ProcessTrack { .. } => {
                 // Already handled by dispatch_and_wait above.
@@ -958,8 +966,30 @@ fn execute_schedule_post_dispatch(
                     any_solo,
                 );
             }
-            NodeOp::ApplyDelay { .. } => {
-                // PR3.
+            NodeOp::ApplyDelay {
+                buf,
+                line_idx,
+                frames: delay_frames,
+            } => {
+                // PR3: `buf` の scratch を in-place で `delay_frames` だけ
+                // 遅延させる。 `compile_schedule` は path latency が大きい
+                // 側に揃えるため、 小さい side の `BufRef::TrackScratch(i)`
+                // を絶対指す前提。 想定外 BufRef は無視。
+                let BufRef::TrackScratch(track_idx) = *buf else {
+                    continue;
+                };
+                let Some(s) = scratch.get_mut(track_idx as usize) else {
+                    continue;
+                };
+                let Some(line) = delay_lines.get_mut(*line_idx as usize) else {
+                    continue;
+                };
+                let n = (n).min(s.track_l.len()).min(s.track_r.len());
+                line.step_in_place(
+                    &mut s.track_l[..n],
+                    &mut s.track_r[..n],
+                    *delay_frames as usize,
+                );
             }
             NodeOp::SidechainTap { .. } => {
                 // PR4.
