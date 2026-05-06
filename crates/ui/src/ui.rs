@@ -898,10 +898,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // popup の内容を描画 (deferred buffer)
+        // M14 Phase 63a (#014): popup overlay は z-order 最前面の modal なので、 base scene
+        // の clip 制約 (= caller が `with_clip_rect(pane_rect, ..)` で囲んだ pane) から免除する。
+        // 退避しないと `push_rect/push_text/push_lines` が `merge_clip(current_clip, ..)` を
+        // 適用して popup primitive が pane_rect で clip され、 画面上に出ても見えなくなる
+        // (piano_roll snap dropdown が tab pane 内で消える regression を起こした)。
         let prev_in_popup = self.drawing_in_popup;
+        let prev_clip = self.current_clip;
         self.drawing_in_popup = true;
+        self.current_clip = None;
         f(self);
         self.drawing_in_popup = prev_in_popup;
+        self.current_clip = prev_clip;
 
         // modal popup が open しているフレーム中、anchor 内 click は popup item として
         // 既に処理済 → 下層の widget に同じ click が流れないよう消費する。
@@ -2799,5 +2807,57 @@ mod tests {
             observed.set(ui.take_double_click_in_rect(anchor));
         });
         assert_eq!(observed.get(), None, "modal 下では double-click は返されない");
+    }
+
+    // -------- M14 Phase 63a (daw_01 #014): popup overlay は外側 with_clip_rect から免除 --------
+
+    /// daw_01 #014 regression: piano_roll の snap dropdown が tab pane (with_clip_rect で
+    /// 囲まれた領域) 内で完全に消える bug。 root cause は `push_rect/text/lines` が
+    /// `drawing_in_popup` の真偽に関係なく `merge_clip(current_clip, ..)` を popup primitive
+    /// にも適用していたこと。 popup overlay は z-order 最前面の modal なので、 base scene の
+    /// clip 制約から免除されるべき (Cubase / Live / 一般 GUI toolkit と同 semantics)。
+    ///
+    /// 修正: `popup_layer` entry で `current_clip` を `None` に一時退避し、 退出時 restore。
+    #[test]
+    fn popup_primitives_not_clipped_by_outer_with_clip_rect() {
+        use daw_ui_renderer::{Color, RectCommand};
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        // pane_rect は piano_roll が tab pane で囲まれる典型 case を想定。
+        let pane_rect = Rect { x: 0.0, y: 200.0, w: 800.0, h: 200.0 };
+        let popup_anchor = Rect { x: 100.0, y: 280.0, w: 120.0, h: 24.0 };
+
+        // 1 frame目: modal popup を open (anchor 確定)
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.open_popup("p_clip_test", popup_anchor, true);
+        });
+
+        // 2 frame目: with_clip_rect(pane_rect) 内で popup_layer 経由で rect を push。
+        // 修正前は popup primitive の clip_rect が pane_rect を継承して画面に出ても見えなかった。
+        // 修正後は popup_layer entry で current_clip = None なので、 popup primitive は
+        // 外側 pane の clip 制約を受けない (renderer は popup pass で全画面に描画可能)。
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.with_clip_rect(pane_rect, |ui| {
+                ui.popup_layer("p_clip_test", |ui| {
+                    ui.push_rect(RectCommand {
+                        rect: Rect { x: 100.0, y: 50.0, w: 120.0, h: 480.0 },
+                        fill: Color::rgb(0.1, 0.1, 0.1),
+                        border: Color::rgb(0.3, 0.3, 0.3),
+                        border_width: 1.0,
+                        radius: [0.0; 4],
+                        clip_rect: None,
+                    });
+                });
+            });
+        });
+
+        let popup_rects = scene.popup_rects_vec();
+        assert_eq!(popup_rects.len(), 1, "popup primitive が 1 件積まれた");
+        assert_eq!(
+            popup_rects[0].clip_rect, None,
+            "popup primitive の clip_rect は外側 with_clip_rect (pane_rect) を継承しない"
+        );
     }
 }
