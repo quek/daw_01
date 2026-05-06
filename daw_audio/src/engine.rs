@@ -1073,22 +1073,31 @@ pub fn execute_schedule_post_dispatch(
                 // (e.g. a future PluginAuxOut output) is ignored — handled
                 // by PR4.4 / PR5.
                 let BufRef::TrackScratch(src_idx) = *src else {
+                    tracing::trace!("sidechain tap: non-TrackScratch src skipped");
                     continue;
                 };
                 let Some(src_scratch) = scratch.get(src_idx as usize) else {
+                    tracing::trace!(src_idx, "sidechain tap: src_idx out of scratch range");
                     continue;
                 };
                 let port = *aux_in_port as usize;
                 if port >= common::process_data::MAX_AUX_IN {
+                    tracing::trace!(port, "sidechain tap: port >= MAX_AUX_IN");
                     continue;
                 }
                 // Resolve the runtime plugin_id for (dst_track, dst_slot).
                 // PR2.1: the chains map is keyed by (track_id, slot).
                 let key = (*dst_track, *dst_slot);
                 let Some(&plugin_id) = slot_to_plugin_id.get(&key) else {
+                    tracing::trace!(
+                        dst_track = *dst_track,
+                        ?dst_slot,
+                        "sidechain tap: slot_to_plugin_id miss",
+                    );
                     continue;
                 };
                 let Some(plugin_ref) = plugin_refs.get(&plugin_id) else {
+                    tracing::trace!(plugin_id, "sidechain tap: plugin_refs miss");
                     continue;
                 };
                 let pd = plugin_ref.data_mut();

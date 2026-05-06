@@ -99,11 +99,25 @@ impl Song {
     /// project file (or any save predating the id schema). Idempotent:
     /// records that already have non-zero ids are left untouched, and
     /// `next_*_id` counters are bumped above the highest seen id.
+    ///
+    /// PR4.5 sidechain regression fix: when a track's id changes here,
+    /// every reference to the old id (= other tracks' `parent_group_id`
+    /// and per-plugin `sidechain_sources` entries) is remapped to the new
+    /// id. Without this remap, a saved project that used `id == 0` as a
+    /// sentinel for the first track would, on load, lose all its sidechain
+    /// wiring (the references would dangle, `compile_schedule` silently
+    /// skips dangling refs, and the user sees no sidechain signal).
     pub fn ensure_ids(&mut self) {
+        // Pass 1: assign fresh ids to sentinel tracks, recording the
+        // (old_id → new_id) remap so refs can be patched in pass 2.
+        let mut id_remap: std::collections::HashMap<u32, u32> =
+            std::collections::HashMap::new();
         for track in &mut self.tracks {
             if track.id == 0 {
-                track.id = self.next_track_id.max(1);
-                self.next_track_id = track.id + 1;
+                let new_id = self.next_track_id.max(1);
+                self.next_track_id = new_id + 1;
+                id_remap.insert(0, new_id);
+                track.id = new_id;
             } else if track.id >= self.next_track_id {
                 self.next_track_id = track.id + 1;
             }
@@ -111,6 +125,44 @@ impl Song {
         }
         if self.next_track_id == 0 {
             self.next_track_id = 1;
+        }
+
+        // Pass 2: patch every reference to a remapped id. Multi-sentinel
+        // cases (= more than one track started with id 0) collapse to the
+        // *last* remap entry inserted for key 0 above, which is fine for
+        // the typical "one sentinel for the first track" case. Anything
+        // else was already malformed before save.
+        if id_remap.is_empty() {
+            return;
+        }
+        for track in &mut self.tracks {
+            if let Some(pid) = track.parent_group_id
+                && let Some(&new_pid) = id_remap.get(&pid)
+            {
+                track.parent_group_id = Some(new_pid);
+            }
+            let remap_chain = |chain: &mut [PluginInstance]| {
+                for p in chain.iter_mut() {
+                    for src in p.sidechain_sources.iter_mut() {
+                        if let Some(old_id) = *src
+                            && let Some(&new_id) = id_remap.get(&old_id)
+                        {
+                            *src = Some(new_id);
+                        }
+                    }
+                }
+            };
+            remap_chain(&mut track.midi_fx_chain);
+            if let Some(inst) = track.instrument.as_mut() {
+                for src in inst.sidechain_sources.iter_mut() {
+                    if let Some(old_id) = *src
+                        && let Some(&new_id) = id_remap.get(&old_id)
+                    {
+                        *src = Some(new_id);
+                    }
+                }
+            }
+            remap_chain(&mut track.fx_chain);
         }
     }
 
@@ -345,6 +397,74 @@ mod tests {
     fn song_default_roundtrip() {
         let song = Song::default();
         assert_eq!(json_roundtrip(&song), song);
+    }
+
+    /// Regression test for sidechain pipeline: when `ensure_ids()` rewrites
+    /// a `track.id == 0` sentinel into a fresh id, every reference to that
+    /// old id (= `sidechain_sources` entries and `parent_group_id`) must be
+    /// remapped too. Otherwise the references dangle, `compile_schedule`
+    /// silently skips them (treating dangling sidechain sources as
+    /// `continue`), and the user sees no sidechain signal even though the
+    /// dropdown is wired correctly.
+    ///
+    /// Setup:
+    ///   Track Kick id=0 (sentinel) → after ensure_ids gets id=2
+    ///   Track Bass id=1 with fx[0].sidechain_sources=[Some(0)] (= Kick)
+    ///                    parent_group_id = Some(0) (= Kick)
+    /// Expected after ensure_ids:
+    ///   Bass.fx[0].sidechain_sources == [Some(2)]
+    ///   Bass.parent_group_id == Some(2)
+    #[test]
+    fn ensure_ids_remaps_sidechain_sources_and_parent_group_id() {
+        use crate::plugin_format::PluginFormat;
+
+        let mut song = Song {
+            bpm: 120.0,
+            time_sig: (4, 4),
+            length_beats: 64.0,
+            tracks: vec![
+                Track {
+                    id: 0, // sentinel — will be replaced by ensure_ids
+                    name: "Kick".into(),
+                    ..Track::default()
+                },
+                Track {
+                    id: 1,
+                    name: "Bass".into(),
+                    parent_group_id: Some(0), // points at Kick's old sentinel id
+                    fx_chain: vec![PluginInstance {
+                        plugin_id: "test.compressor".into(),
+                        format: PluginFormat::Vst3,
+                        state: None,
+                        sidechain_sources: vec![Some(0)], // points at Kick
+                    }],
+                    ..Track::default()
+                },
+            ],
+            next_track_id: 2,
+            ..Song::default()
+        };
+
+        song.ensure_ids();
+
+        // Kick got rebased.
+        let kick = &song.tracks[0];
+        assert_ne!(kick.id, 0, "ensure_ids should replace sentinel id 0");
+        let new_kick_id = kick.id;
+
+        // Bass kept its id but its references must be remapped.
+        let bass = &song.tracks[1];
+        assert_eq!(bass.id, 1);
+        assert_eq!(
+            bass.parent_group_id,
+            Some(new_kick_id),
+            "parent_group_id pointing at sentinel must be remapped to the new id"
+        );
+        assert_eq!(
+            bass.fx_chain[0].sidechain_sources,
+            vec![Some(new_kick_id)],
+            "sidechain_sources pointing at sentinel must be remapped to the new id"
+        );
     }
 
     #[test]
