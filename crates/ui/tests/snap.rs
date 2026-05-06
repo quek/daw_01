@@ -52,14 +52,14 @@ fn alt_pressed_returns_raw() {
 }
 
 #[test]
-fn straight_16_snaps_quarter() {
+fn straight_16_snaps_to_grid() {
     let cfg = SnapConfig {
         mode: SnapMode::Straight { div: 16 },
         enabled: true,
         min_beat_unit: 1.0 / 128.0,
         time_sig: (4, 4),
     };
-    // 1/16 = 0.0625 拍。1.234 / 0.0625 = 19.744 → round 20 → 20 * 0.0625 = 1.25
+    // DAW 業界標準: 1/16 = 16 分音符 = 0.25 拍。 1.234 / 0.25 = 4.936 → round 5 → 5 * 0.25 = 1.25
     let snapped = cfg.snap_beat(1.234, false, 64.0);
     assert!((snapped - 1.25).abs() < 1e-9, "got {snapped}");
 }
@@ -73,8 +73,8 @@ fn triplet_4_unit() {
         time_sig: (4, 4),
     };
     let unit = cfg.beat_unit(64.0).expect("active");
-    // (2/3) / 4 = 0.16666...
-    assert!((unit - (2.0 / 3.0 / 4.0)).abs() < 1e-9);
+    // DAW 業界標準: 1/4T = 4 分音符 3 連符 = 1 beat の 2/3 = 0.6667 拍。 (8/3)/4 = 0.6667。
+    assert!((unit - (8.0 / 3.0 / 4.0)).abs() < 1e-9);
 }
 
 #[test]
@@ -86,8 +86,8 @@ fn dotted_8_unit() {
         time_sig: (4, 4),
     };
     let unit = cfg.beat_unit(64.0).expect("active");
-    // 1.5 / 8 = 0.1875
-    assert!((unit - 0.1875).abs() < 1e-9);
+    // DAW 業界標準: 1/8. = 8 分音符付点 = 0.5 拍 * 1.5 = 0.75 拍。 6/8 = 0.75。
+    assert!((unit - 0.75).abs() < 1e-9);
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn snap_beat_delta_negative() {
         min_beat_unit: 1.0 / 128.0,
         time_sig: (4, 4),
     };
-    // -1.234 / 0.0625 = -19.744 → round -20 → -20 * 0.0625 = -1.25
+    // 1/16 = 0.25 拍。 -1.234 / 0.25 = -4.936 → round -5 → -5 * 0.25 = -1.25
     let snapped = cfg.snap_beat_delta(-1.234, false, 64.0);
     assert!((snapped + 1.25).abs() < 1e-9, "got {snapped}");
 }
@@ -215,4 +215,138 @@ fn bars_snap_aligns_to_bar_boundary() {
     };
     let snapped = cfg.snap_beat(7.3, false, 64.0);
     assert!((snapped - 8.0).abs() < 1e-9, "Bars 1 で 7.3 → 8.0 (2 小節目頭)、 got {snapped}");
+}
+
+// (M14 Phase 63a / daw_01 #015) DAW 業界標準対応の明示テスト。
+// label "1/N" は N 分音符 (Nth note)、 quarter note (1/4) を 1 beat の基準とする
+// (Cubase / Live / Reaper / FL Studio で共通)。
+
+#[test]
+fn straight_4_is_one_beat() {
+    // 1/4 note = quarter note = 1 beat (DAW 業界標準の基準)
+    let cfg = SnapConfig {
+        mode: SnapMode::Straight { div: 4 },
+        enabled: true,
+        min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
+    };
+    let unit = cfg.beat_unit(64.0).expect("active");
+    assert!((unit - 1.0).abs() < 1e-9, "1/4 note = 1 beat、 got {unit}");
+}
+
+#[test]
+fn straight_8_is_half_beat() {
+    // 1/8 note = eighth note = 0.5 beat
+    let cfg = SnapConfig {
+        mode: SnapMode::Straight { div: 8 },
+        enabled: true,
+        min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
+    };
+    let unit = cfg.beat_unit(64.0).expect("active");
+    assert!((unit - 0.5).abs() < 1e-9, "1/8 note = 0.5 beat、 got {unit}");
+}
+
+#[test]
+fn straight_1_is_whole_note() {
+    // 1/1 note = whole note = 4 beats (= 4/4 では 1 bar、 3/4 / 6/8 では 1 bar と異なる)
+    let cfg = SnapConfig {
+        mode: SnapMode::Straight { div: 1 },
+        enabled: true,
+        min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
+    };
+    let unit = cfg.beat_unit(64.0).expect("active");
+    assert!((unit - 4.0).abs() < 1e-9, "1/1 note = 4 beats (whole note)、 got {unit}");
+}
+
+#[test]
+fn straight_16_is_quarter_beat() {
+    // 1/16 note = sixteenth note = 0.25 beat
+    let cfg = SnapConfig {
+        mode: SnapMode::Straight { div: 16 },
+        enabled: true,
+        min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
+    };
+    let unit = cfg.beat_unit(64.0).expect("active");
+    assert!((unit - 0.25).abs() < 1e-9, "1/16 note = 0.25 beat、 got {unit}");
+}
+
+#[test]
+fn triplet_4_is_two_thirds_beat() {
+    // 1/4T = 4 分音符 3 連符 = 1 beat の 2/3 = 0.6667 beat
+    let cfg = SnapConfig {
+        mode: SnapMode::Triplet { div: 4 },
+        enabled: true,
+        min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
+    };
+    let unit = cfg.beat_unit(64.0).expect("active");
+    assert!((unit - 2.0 / 3.0).abs() < 1e-9, "1/4T = 2/3 beat、 got {unit}");
+}
+
+#[test]
+fn dotted_4_is_one_and_half_beat() {
+    // 1/4. = 4 分音符付点 = 1 beat * 1.5 = 1.5 beat
+    let cfg = SnapConfig {
+        mode: SnapMode::Dotted { div: 4 },
+        enabled: true,
+        min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
+    };
+    let unit = cfg.beat_unit(64.0).expect("active");
+    assert!((unit - 1.5).abs() < 1e-9, "1/4. = 1.5 beat、 got {unit}");
+}
+
+#[test]
+fn straight_div_1_vs_bars_count_1_at_3_4_diverges() {
+    // 4/4 では Straight { div: 1 } (= 4 beats) と Bars { count: 1 } (= 4 beats) は同値、
+    // 3/4 では Straight = 4 beats、 Bars = 3 beats で分岐 (両概念併存の意義)。
+    let straight = SnapConfig {
+        mode: SnapMode::Straight { div: 1 },
+        enabled: true,
+        min_beat_unit: 1.0 / 128.0,
+        time_sig: (3, 4),
+    };
+    let bars = SnapConfig {
+        mode: SnapMode::Bars { count: 1 },
+        enabled: true,
+        min_beat_unit: 1.0 / 128.0,
+        time_sig: (3, 4),
+    };
+    let s_unit = straight.beat_unit(64.0).expect("active");
+    let b_unit = bars.beat_unit(64.0).expect("active");
+    assert!(
+        (s_unit - 4.0).abs() < 1e-9,
+        "Straight div=1 は time_sig 非依存で 4 beats、 got {s_unit}"
+    );
+    assert!(
+        (b_unit - 3.0).abs() < 1e-9,
+        "Bars count=1 @ 3/4 = 3 beats、 got {b_unit}"
+    );
+    assert!(
+        (s_unit - b_unit).abs() > 0.5,
+        "3/4 では Straight div=1 と Bars count=1 は分岐する (両概念併存)"
+    );
+}
+
+#[test]
+fn straight_div_1_vs_bars_count_1_at_4_4_match() {
+    // 4/4 では Straight { div: 1 } と Bars { count: 1 } が同値 (両者 4 beats)。
+    let straight = SnapConfig {
+        mode: SnapMode::Straight { div: 1 },
+        enabled: true,
+        min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
+    };
+    let bars = SnapConfig {
+        mode: SnapMode::Bars { count: 1 },
+        enabled: true,
+        min_beat_unit: 1.0 / 128.0,
+        time_sig: (4, 4),
+    };
+    let s_unit = straight.beat_unit(64.0).expect("active");
+    let b_unit = bars.beat_unit(64.0).expect("active");
+    assert!((s_unit - b_unit).abs() < 1e-9, "4/4 では一致、 got s={s_unit} b={b_unit}");
 }

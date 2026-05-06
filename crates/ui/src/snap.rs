@@ -6,16 +6,36 @@
 //!
 //! デフォルト = `Adaptive` ON (DAW UI の業界標準。Cubase / Live と一致)。
 //! 「絶対 snap させたくない」場面では `SnapConfig::OFF` を明示的に渡す。
+//!
+//! # 単位の semantics (DAW 業界標準と一致)
+//!
+//! label `"1/N"` は **N 分音符 (Nth note)** を表し、 quarter note (1/4) を 1 beat の
+//! 基準とする (Cubase / Live / Reaper / FL Studio / REAPER manual 等で共通の慣行、
+//! MIDI ticks per quarter note の業界標準とも整合)。
+//!
+//! - whole note (1/1) = 4 beats (= 1 bar @ 4/4)
+//! - half note (1/2) = 2 beats
+//! - quarter note (1/4) = 1 beat
+//! - eighth note (1/8) = 0.5 beat
+//! - sixteenth note (1/16) = 0.25 beat
+//! - 32nd note (1/32) = 0.125 beat
+//!
+//! `Bars { count }` は別概念で `time_sig` 依存 (4/4 では 1 bar = 4 beats、 3/4 では 3 beats、
+//! 6/8 では 3 beats)。 4/4 の場合 `Straight { div: 1 }` と `Bars { count: 1 }` は同値、
+//! それ以外の拍子では分岐する。
 
 /// snap mode。`Off` 以外で `enabled = true` のとき `snap_beat` が `raw` を round する。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapMode {
     Off,
-    /// `1/div` 拍 (例: `div = 16` → 1/16 拍)。
+    /// `4/div` 拍 (= div 分音符、 div=4 → 1/4 note = 1 beat、 div=16 → 1/16 note = 0.25 beat)。
+    /// DAW 業界標準 (Cubase / Live / Reaper) の "1/N" label 解釈と一致。
     Straight { div: u32 },
-    /// `1.5/div` 拍 (付点音符)。
+    /// `6/div` 拍 (= div 分音符の付点、 div=4 → 1/4. = 1.5 beat、 div=8 → 1/8. = 0.75 beat)。
+    /// 付点係数 = 1.5、 base = `Straight` と共通の `4/div` 拍。
     Dotted { div: u32 },
-    /// `(2/3)/div` 拍 (三連符)。
+    /// `(8/3)/div` 拍 (= div 分音符の 3 連符、 div=4 → 1/4T = 0.6667 beat)。
+    /// 三連係数 = 2/3、 base = `Straight` と共通の `4/div` 拍。
     Triplet { div: u32 },
     /// (M14 Phase 61c / daw_01 #011) `count` bar 単位 snap。 1 bar の拍数は `SnapConfig.time_sig`
     /// から `numerator * 4 / denominator` で計算 (4/4 → 4 拍、 3/4 → 3 拍、 6/8 → 3 拍)。
@@ -83,9 +103,13 @@ impl SnapConfig {
         }
         let raw_unit = match self.mode {
             SnapMode::Off => return None,
-            SnapMode::Straight { div } => 1.0 / f64::from(div.max(1)),
-            SnapMode::Triplet { div } => (2.0 / 3.0) / f64::from(div.max(1)),
-            SnapMode::Dotted { div } => 1.5 / f64::from(div.max(1)),
+            // DAW 業界標準: "1/N" label = N 分音符。 whole note (= 4 quarter notes = 4 beats)
+            // を base に `4/div` 拍。 div=4 → 1.0 beat (1/4 note = 1 beat = quarter note)。
+            SnapMode::Straight { div } => 4.0 / f64::from(div.max(1)),
+            // 三連係数 2/3 を Straight に乗算。 div=4 → (8/3)/4 = 0.6667 beat (1/4T)。
+            SnapMode::Triplet { div } => (8.0 / 3.0) / f64::from(div.max(1)),
+            // 付点係数 1.5 を Straight に乗算。 div=4 → 6/4 = 1.5 beat (1/4.)。
+            SnapMode::Dotted { div } => 6.0 / f64::from(div.max(1)),
             // (M14 Phase 61c / daw_01 #011) Bars: 1 bar = `time_sig.0 * 4 / time_sig.1` 拍。
             // count = 0 は None で skip。 time_sig の各成分は 0 防御で max(1)。
             SnapMode::Bars { count } => {

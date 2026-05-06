@@ -32,7 +32,8 @@ use daw_ui_renderer::{Rect, Scene};
 // ============================================================
 
 const WIDGET_RECT: Rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 };
-/// `Straight { div: 16 }` 用 zoom: 1 拍 = 64 px → grid 幅 800px で 12.5 拍。 1/16 = 0.0625 拍。
+/// `Straight { div: 16 }` 用 zoom: 1 拍 = 64 px → grid 幅 800px で 12.5 拍。 1/16 = 0.25 拍
+/// (DAW 業界標準: 1/N = N 分音符、 1/16 = 16 分音符 = 0.25 beat)。
 /// この zoom で `view.len_beats` を逆算して `lanes.w / view.len_beats == 64` にする。
 const ZOOM_X_PX_PER_BEAT: f32 = 64.0;
 
@@ -151,11 +152,11 @@ fn arr_frame(host: &mut UiHost<ArrModel>, m: &mut ArrModel, input: FrameInput, s
 
 /// clip (start_beat=4.0, len_beats=2.0) の中央 px 位置 = beat 5.0 → 320 px。
 const ARR_CLIP_CENTER_PX: (f32, f32) = (320.0, 16.0);
-/// drag 終点 px。 +110 px = +1.71875 拍 (snap unit 1/16=0.0625 にちょうど合わない位置)。
+/// drag 終点 px。 +110 px = +1.71875 拍 (snap unit 1/16=0.25 にちょうど合わない位置)。
 const ARR_DRAG_END_PX: (f32, f32) = (430.0, 16.0);
 /// 期待 raw delta = 110 / 64 = 1.71875。
 const ARR_EXPECTED_RAW_DELTA: f64 = 110.0 / 64.0;
-/// 期待 snapped delta = round(1.71875 / 0.0625) * 0.0625 = round(27.5) * 0.0625 = 28 * 0.0625 = 1.75。
+/// 期待 snapped delta = round(1.71875 / 0.25) * 0.25 = round(6.875) * 0.25 = 7 * 0.25 = 1.75。
 const ARR_EXPECTED_SNAPPED_DELTA: f64 = 1.75;
 /// 開始 start_beat + raw delta = 4.0 + 1.71875 = 5.71875。
 const ARR_EXPECTED_RAW_NEW_START: f64 = 4.0 + ARR_EXPECTED_RAW_DELTA;
@@ -335,8 +336,10 @@ fn arr_no_alt_short_drag_above_jitter_commits_snapped() {
 
     let move_deltas = m.last_move.expect("8px drag は Move Edit を発行すべき (jitter 4px 超)");
     let new_start = move_deltas[0].next_start_beat;
-    // raw = 8/64 = 0.125 拍。 snap 1/16 = 0.0625 → round(0.125/0.0625)=2 → 2*0.0625 = 0.125 (一致)
-    let expected = 4.0 + 0.125;
+    // raw_delta = 8/64 = 0.125 拍。 absolute snap: pivot=4.0、 raw_end=4.125。
+    // snap unit 1/16 = 0.25 → round(4.125/0.25) = round(16.5) = 17 → 17*0.25 = 4.25。
+    // adjusted_delta = 0.25、 new_start = 4.0 + 0.25 = 4.25。
+    let expected = 4.0 + 0.25;
     assert!(
         (new_start - expected).abs() < 1e-9,
         "Alt なし short drag (8px) snapped: expected new_start={expected}, got {new_start}"
@@ -354,7 +357,8 @@ fn arr_no_alt_drag_from_off_grid_anchor_lands_on_grid() {
     m.tracks[0].clips[0].start_beat = 4.078_125; // = 4.0 + 5/64
 
     // Alt なしで +30px (= 0.46875 拍) drag。 raw 終点 = 4.078125 + 0.46875 = 4.546875。
-    // 1/16 grid (0.0625 倍数) で round → 4.5625。 adjusted_delta = 4.5625 - 4.078125 = 0.484375。
+    // 1/16 grid (0.25 倍数) で round → round(18.1875) = 18 → 4.5。
+    // adjusted_delta = 4.5 - 4.078125 = 0.421875。
     // press は clip 中央 ((4.078125 + 1.0) * 64 = 325.0 px) に置く (resize handle 4px 内側を避ける)。
     let press_x = (4.078_125_f32 + 1.0) * ZOOM_X_PX_PER_BEAT;
     let mut input = FrameInput::default();
@@ -369,13 +373,13 @@ fn arr_no_alt_drag_from_off_grid_anchor_lands_on_grid() {
 
     let move_deltas = m.last_move.expect("MoveClips should be emitted");
     let new_start = move_deltas[0].next_start_beat;
-    let expected = 4.5625_f64; // 4.078125 + 0.484375 = 4.5625 (grid 上)
+    let expected = 4.5_f64; // 4.078125 + 0.421875 = 4.5 (grid 上、 snap unit 0.25)
     assert!(
         (new_start - expected).abs() < 1e-9,
         "off-grid anchor + Alt なし drag は new_start={expected} (grid 上) に着地すべき、 got {new_start}"
     );
     // 重要: anchor のずれ (0.078125) が解消されて grid に吸着したことを assert。
-    let grid_unit = 1.0_f64 / 16.0;
+    let grid_unit = 0.25_f64; // 1/16 note = 0.25 beat (DAW 業界標準)
     let on_grid_residual = (new_start / grid_unit).round() * grid_unit;
     assert!(
         (new_start - on_grid_residual).abs() < 1e-9,
@@ -636,7 +640,8 @@ fn pr_no_alt_short_drag_above_jitter_commits_snapped() {
         .last_move
         .expect("Alt なし 8px drag (piano_roll) は Move Edit を発行すべき");
     let new_start = move_deltas[0].3;
-    let expected = 4.0 + 0.125;
+    // arr 版と同じ: pivot=4.0、 raw_end=4.125、 snap unit 0.25 → 4.25。
+    let expected = 4.0 + 0.25;
     assert!(
         (new_start - expected).abs() < 1e-9,
         "piano_roll Alt なし short drag (8px): expected new_start={expected}, got {new_start}"
@@ -663,7 +668,8 @@ fn pr_no_alt_drag_from_off_grid_anchor_lands_on_grid() {
 
     let move_deltas = m.last_move.expect("Move should be emitted");
     let new_start = move_deltas[0].3;
-    let expected = 4.5625_f64;
+    // arr 版と同じ: 4.078125 + 0.46875 = 4.546875、 snap unit 0.25 で round → 4.5。
+    let expected = 4.5_f64;
     assert!(
         (new_start - expected).abs() < 1e-9,
         "piano_roll off-grid anchor: expected new_start={expected}, got {new_start}"
