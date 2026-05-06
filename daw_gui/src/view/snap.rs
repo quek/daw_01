@@ -98,10 +98,13 @@ pub fn arrange_snap_config(app: &AppData) -> SnapConfig {
     }
 }
 
-/// "1" キー (Narrow Grid): div を 2 倍 (細かく)。範囲外 / Off / Adaptive は no-op。
+/// "1" キー (Narrow Grid): div を 2 倍 (細かく)。Bars は count を半分にし、
+/// count=1 まで来たら "1/1" (Straight div=1) に降りる。範囲外 / Off / Adaptive は no-op。
 pub fn narrow_choice(idx: u8) -> u8 {
     let mode = choice_to_mode(idx);
     let new_mode = match mode {
+        SnapMode::Bars { count } if count > 1 => SnapMode::Bars { count: count / 2 },
+        SnapMode::Bars { count: 1 } => SnapMode::Straight { div: 1 },
         SnapMode::Straight { div } if div < 128 => SnapMode::Straight { div: div * 2 },
         SnapMode::Triplet { div } if div < 32 => SnapMode::Triplet { div: div * 2 },
         SnapMode::Dotted { div } if div < 32 => SnapMode::Dotted { div: div * 2 },
@@ -110,11 +113,14 @@ pub fn narrow_choice(idx: u8) -> u8 {
     mode_to_choice(new_mode).unwrap_or(idx)
 }
 
-/// "2" キー (Widen Grid): div を半分 (粗く)。
+/// "2" キー (Widen Grid): div を半分 (粗く)。Straight div=1 まで来たら Bars count=1
+/// (1 bar) に上がる。Bars 系は count を倍に (1→2→4)、count=4 で頭打ち。
 pub fn widen_choice(idx: u8) -> u8 {
     let mode = choice_to_mode(idx);
     let new_mode = match mode {
         SnapMode::Straight { div } if div > 1 => SnapMode::Straight { div: div / 2 },
+        SnapMode::Straight { div: 1 } => SnapMode::Bars { count: 1 },
+        SnapMode::Bars { count } if count < 4 => SnapMode::Bars { count: count * 2 },
         SnapMode::Triplet { div } if div > 2 => SnapMode::Triplet { div: div / 2 },
         SnapMode::Dotted { div } if div > 4 => SnapMode::Dotted { div: div / 2 },
         other => other,
@@ -151,8 +157,24 @@ mod tests {
         // "1/4" (idx 2) → "1/2" (idx 1) → "1/1" (idx 0)
         assert_eq!(widen_choice(2), 1);
         assert_eq!(widen_choice(1), 0);
-        // 最小 "1/1" (idx 0) は no-op
-        assert_eq!(widen_choice(0), 0);
+    }
+
+    #[test]
+    fn widen_crosses_into_bars() {
+        // "1/1" (idx 0) → "1 bar" (17) → "2 bar" (18) → "4 bar" (19)
+        assert_eq!(widen_choice(0), 17);
+        assert_eq!(widen_choice(17), 18);
+        assert_eq!(widen_choice(18), 19);
+        // 最大 "4 bar" (idx 19) は no-op
+        assert_eq!(widen_choice(19), 19);
+    }
+
+    #[test]
+    fn narrow_crosses_back_to_straight() {
+        // "4 bar" (19) → "2 bar" (18) → "1 bar" (17) → "1/1" (0)
+        assert_eq!(narrow_choice(19), 18);
+        assert_eq!(narrow_choice(18), 17);
+        assert_eq!(narrow_choice(17), 0);
     }
 
     #[test]
