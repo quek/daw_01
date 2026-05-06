@@ -991,8 +991,47 @@ pub fn execute_schedule_post_dispatch(
                     *delay_frames as usize,
                 );
             }
-            NodeOp::SidechainTap { .. } => {
-                // PR4.
+            NodeOp::SidechainTap {
+                src,
+                dst_track,
+                dst_slot,
+                aux_in_port,
+            } => {
+                // PR4 sidechain: copy source track's scratch L/R into the
+                // destination plugin's `pd.buffer_aux_in[port]` shmem
+                // region, marking the port active so `daw_plugin_host`
+                // forwards it as a CLAP `clap_audio_buffer` / VST3
+                // aux bus on the next `process()`. Source != TrackScratch
+                // (e.g. a future PluginAuxOut output) is ignored — handled
+                // by PR4.4 / PR5.
+                let BufRef::TrackScratch(src_idx) = *src else {
+                    continue;
+                };
+                let Some(src_scratch) = scratch.get(src_idx as usize) else {
+                    continue;
+                };
+                let port = *aux_in_port as usize;
+                if port >= common::process_data::MAX_AUX_IN {
+                    continue;
+                }
+                // Resolve the runtime plugin_id for (dst_track, dst_slot).
+                // PR2.1: the chains map is keyed by (track_id, slot).
+                let key = (*dst_track, *dst_slot);
+                let Some(&plugin_id) = slot_to_plugin_id.get(&key) else {
+                    continue;
+                };
+                let Some(plugin_ref) = plugin_refs.get(&plugin_id) else {
+                    continue;
+                };
+                let pd = plugin_ref.data_mut();
+                let copy_n = n
+                    .min(src_scratch.track_l.len())
+                    .min(src_scratch.track_r.len());
+                pd.buffer_aux_in[port][0][..copy_n]
+                    .copy_from_slice(&src_scratch.track_l[..copy_n]);
+                pd.buffer_aux_in[port][1][..copy_n]
+                    .copy_from_slice(&src_scratch.track_r[..copy_n]);
+                pd.aux_in_active[port] = 1;
             }
         }
     }

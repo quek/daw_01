@@ -14,6 +14,12 @@
 pub const MAX_FRAMES: usize = 1024;
 pub const MAX_CHANNELS: usize = 2;
 pub const MAX_EVENTS: usize = 256;
+/// PR4 sidechain: how many `is_main=false` aux input ports per plugin
+/// the host reserves shmem for. 1 covers the typical "single sidechain
+/// trigger" use case (compressor / gate / ducker); we allocate one
+/// extra slot (= 2) to leave room for plugins that expose 2 separate
+/// keying inputs without a host upgrade.
+pub const MAX_AUX_IN: usize = 2;
 
 #[repr(C)]
 pub struct ProcessData {
@@ -40,6 +46,21 @@ pub struct ProcessData {
     pub buffer_in: [[f32; MAX_FRAMES]; MAX_CHANNELS],
     /// Planar f32 output audio.
     pub buffer_out: [[f32; MAX_FRAMES]; MAX_CHANNELS],
+    /// PR4 sidechain: planar f32 aux input audio
+    /// (port × channel × frame). Filled by the audio engine's
+    /// `NodeOp::SidechainTap` handler before plugin.process(). The
+    /// per-port `aux_in_active` flag tells the plugin host whether to
+    /// pass that port to the plugin (CLAP `clap_audio_buffer` /
+    /// VST3 `AudioBusBuffers`); inactive ports are skipped or fed
+    /// silence so plugins that don't request a sidechain stay quiet.
+    pub buffer_aux_in: [[[f32; MAX_FRAMES]; MAX_CHANNELS]; MAX_AUX_IN],
+    /// 1 = aux input port is wired up this buffer, 0 = no source set
+    /// (plugin host should pass silence / null buffer to the plugin).
+    pub aux_in_active: [u8; MAX_AUX_IN],
+    /// Pad to keep the next field aligned (struct must remain a plain
+    /// data layout for shmem). Sum: `MAX_AUX_IN * sizeof(u8) + pad`
+    /// reaches the next u32 boundary.
+    pub _pad_aux: [u8; 2],
 }
 
 #[repr(C)]
@@ -84,6 +105,9 @@ impl ProcessData {
             events_out: [EMPTY_EVENT; MAX_EVENTS],
             buffer_in: [[0.0; MAX_FRAMES]; MAX_CHANNELS],
             buffer_out: [[0.0; MAX_FRAMES]; MAX_CHANNELS],
+            buffer_aux_in: [[[0.0; MAX_FRAMES]; MAX_CHANNELS]; MAX_AUX_IN],
+            aux_in_active: [0; MAX_AUX_IN],
+            _pad_aux: [0; 2],
         }
     }
 
