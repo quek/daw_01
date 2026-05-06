@@ -334,6 +334,65 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         input_delay_per_track[i] = max_sc;
     }
 
+    // PR4.5 diagnostic: log the SidechainTap count + per-tap details so
+    // the user can verify their sidechain wiring is honored by the graph
+    // compiler. compile_schedule runs only at edit-time transitions
+    // (Engine::refresh_schedule), not the RT path, so this isn't spammy.
+    let tap_count = nodes_with_pdc
+        .iter()
+        .filter(|op| matches!(op, NodeOp::SidechainTap { .. }))
+        .count();
+    if tap_count > 0 {
+        tracing::info!(
+            tap_count,
+            n_tracks = song.tracks.len(),
+            "compile_schedule emitted SidechainTap(s)",
+        );
+        for op in &nodes_with_pdc {
+            if let NodeOp::SidechainTap {
+                src,
+                dst_track,
+                dst_slot,
+                aux_in_port,
+            } = op
+            {
+                tracing::info!(?src, dst_track = *dst_track, ?dst_slot, port = *aux_in_port,
+                    "  SidechainTap detail");
+            }
+        }
+    } else {
+        // Diagnose: any track has a non-empty sidechain_sources?
+        let any_wired = song.tracks.iter().any(|t| {
+            t.midi_fx_chain.iter().any(|p| p.sidechain_sources.iter().any(|s| s.is_some()))
+                || t.instrument
+                    .as_ref()
+                    .map(|p| p.sidechain_sources.iter().any(|s| s.is_some()))
+                    .unwrap_or(false)
+                || t.fx_chain.iter().any(|p| p.sidechain_sources.iter().any(|s| s.is_some()))
+        });
+        if any_wired {
+            tracing::warn!(
+                "compile_schedule: sidechain_sources are wired but no SidechainTap was \
+                 emitted — likely all sources point at non-existent track ids (dangling)"
+            );
+            for (i, t) in song.tracks.iter().enumerate() {
+                for (j, p) in t.fx_chain.iter().enumerate() {
+                    if !p.sidechain_sources.is_empty() {
+                        tracing::warn!(
+                            track_idx = i,
+                            track_id = t.id,
+                            fx_slot = j,
+                            sidechain_sources = ?p.sidechain_sources,
+                            "  fx_chain plugin with sidechain_sources",
+                        );
+                    }
+                }
+            }
+            let known_ids: Vec<u32> = song.tracks.iter().map(|t| t.id).collect();
+            tracing::warn!(track_ids = ?known_ids, "  song track ids");
+        }
+    }
+
     Ok(Schedule {
         nodes: nodes_with_pdc,
         delay_lines,

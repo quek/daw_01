@@ -589,6 +589,36 @@ impl AppData {
                 current_source: p.sidechain_sources.first().copied().flatten(),
             });
         }
+        // PR4.5 diagnostic: if any chain plugin has a non-empty
+        // sidechain_sources, log the resolved current_source values once
+        // per inspector_chain rebuild. Helps catch UI ↔ model state
+        // mismatches (= dropdown shows "—" but model has Some(id)).
+        let any_wired = entries.iter().any(|e| e.current_source.is_some())
+            || track
+                .midi_fx_chain
+                .iter()
+                .chain(track.fx_chain.iter())
+                .chain(track.instrument.as_ref().into_iter())
+                .any(|p| !p.sidechain_sources.is_empty());
+        if any_wired {
+            // Dump raw model state alongside entries so we can see the
+            // exact values UI is displaying. trace! to avoid frame-rate
+            // spam at default log levels; enable with RUST_LOG=trace.
+            let raw: Vec<(u8, u32, String, Vec<Option<u32>>)> = track
+                .midi_fx_chain
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (0u8, i as u32, p.plugin_id.clone(), p.sidechain_sources.clone()))
+                .chain(track.instrument.as_ref().map(|p| (1u8, 0u32, p.plugin_id.clone(), p.sidechain_sources.clone())))
+                .chain(track.fx_chain.iter().enumerate().map(|(i, p)| (2u8, i as u32, p.plugin_id.clone(), p.sidechain_sources.clone())))
+                .collect();
+            tracing::trace!(
+                cursor_track_id = track.id,
+                ?raw,
+                ?entries,
+                "sidechain_entries: rebuilt for cursor track"
+            );
+        }
         entries
     }
 
@@ -3036,32 +3066,44 @@ impl AppData {
         let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
             return;
         };
+        // PR4.5 sidechain wiring preservation: when a plugin finishes
+        // loading via SlotPluginLoaded, we replace the existing
+        // PluginInstance with a fresh one carrying the resolved id +
+        // saved state, but **must preserve `sidechain_sources`** —
+        // otherwise wiring set by the user (or loaded from a saved .daw
+        // file) gets clobbered to `Vec::new()` here, which then
+        // (a) makes the inspector dropdown display "—" instead of the
+        //     wired source track, and (b) propagates to daw_audio via
+        //     the next LoadSong, killing the SidechainTap in
+        //     `compile_schedule`. The user's symptom: dropdown empty +
+        //     no ducking after Open, then everything works once they
+        //     re-pick the source manually (which writes Some(id) back).
         match slot {
             PluginSlot::Instrument => {
-                let (state, format) = t
+                let (state, format, existing_sc) = t
                     .instrument
                     .as_ref()
-                    .map(|i| (i.state.clone(), i.format))
-                    .unwrap_or((None, PluginFormat::Clap));
+                    .map(|i| (i.state.clone(), i.format, i.sidechain_sources.clone()))
+                    .unwrap_or((None, PluginFormat::Clap, Vec::new()));
                 t.instrument = Some(common::model::PluginInstance {
                     plugin_id: id,
                     format,
                     state,
-                    sidechain_sources: Vec::new(),
+                    sidechain_sources: existing_sc,
                 });
             }
             PluginSlot::Fx(i) => {
                 let i = i as usize;
-                let (existing_state, format) = t
+                let (existing_state, format, existing_sc) = t
                     .fx_chain
                     .get(i)
-                    .map(|p| (p.state.clone(), p.format))
-                    .unwrap_or((None, PluginFormat::Clap));
+                    .map(|p| (p.state.clone(), p.format, p.sidechain_sources.clone()))
+                    .unwrap_or((None, PluginFormat::Clap, Vec::new()));
                 let inst = common::model::PluginInstance {
                     plugin_id: id,
                     format,
                     state: existing_state,
-                    sidechain_sources: Vec::new(),
+                    sidechain_sources: existing_sc,
                 };
                 if i < t.fx_chain.len() {
                     t.fx_chain[i] = inst;
@@ -3071,16 +3113,16 @@ impl AppData {
             }
             PluginSlot::MidiFx(i) => {
                 let i = i as usize;
-                let (existing_state, format) = t
+                let (existing_state, format, existing_sc) = t
                     .midi_fx_chain
                     .get(i)
-                    .map(|p| (p.state.clone(), p.format))
-                    .unwrap_or((None, PluginFormat::Clap));
+                    .map(|p| (p.state.clone(), p.format, p.sidechain_sources.clone()))
+                    .unwrap_or((None, PluginFormat::Clap, Vec::new()));
                 let inst = common::model::PluginInstance {
                     plugin_id: id,
                     format,
                     state: existing_state,
-                    sidechain_sources: Vec::new(),
+                    sidechain_sources: existing_sc,
                 };
                 if i < t.midi_fx_chain.len() {
                     t.midi_fx_chain[i] = inst;
