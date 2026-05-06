@@ -28,7 +28,7 @@ struct Model {
     // M9 Phase 45e: arrangement widget 用 (non-Clone Model でも arrangement が呼べることを担保)
     arr_tracks: Vec<ArrangementTrack>,
     arr_selected_clips: Vec<ClipKey>,
-    arr_selected_track: Option<u32>,
+    arr_selected_tracks: Vec<u32>,
     // M11 Phase 51: reorderable_list widget 用 (non-Clone Model でも呼べることを担保)
     chain: Vec<String>,
 }
@@ -47,7 +47,7 @@ fn main() {
         selected_note_ids: Vec::new(),
         arr_tracks: Vec::new(),
         arr_selected_clips: Vec::new(),
-        arr_selected_track: None,
+        arr_selected_tracks: Vec::new(),
         chain: Vec::new(),
     };
 
@@ -184,7 +184,7 @@ fn main() {
                 &m.arr_tracks,
                 arr_view,
                 &m.arr_selected_clips,
-                m.arr_selected_track,
+                &m.arr_selected_tracks,
                 &arr_style,
                 |req| match req {
                     ArrangementEditRequest::SelectClips { .. } => {
@@ -237,6 +237,12 @@ fn main() {
                     ArrangementEditRequest::SetScrollX(_) => Edit::mutate(|_m: &mut Model| {}),
                     ArrangementEditRequest::SetTrackTop(_) => Edit::mutate(|_m: &mut Model| {}),
                     ArrangementEditRequest::SetTrackRowH(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::ToggleGroupCollapsed(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::SetTrackParent { tracks: _, parent: _, anchor_after: _ } => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
                 },

@@ -94,6 +94,9 @@ fn arr_model() -> ArrModel {
             color: None,
         }],
         volume: 1.0,
+        parent_id: None,
+        depth: 0,
+        collapsed: false,
     };
     ArrModel { tracks: vec![track], selected: Vec::new(), last_move: None }
 }
@@ -131,7 +134,7 @@ fn arr_frame(host: &mut UiHost<ArrModel>, m: &mut ArrModel, input: FrameInput, s
             &model.tracks,
             view,
             &model.selected,
-            None,
+            &[],
             &style,
             |req| match req {
                 ArrangementEditRequest::SelectClips { next, .. } => {

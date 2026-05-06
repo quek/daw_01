@@ -48,6 +48,8 @@ struct DawTrack {
     clips: Vec<DawClip>,
     /// M10 Phase 47b: track volume (`0.0..=1.0`、`1.0` で unity)。
     volume: f32,
+    /// M14 Phase 63c (#016): 親 track id (`None` で top-level)。 Reaper folder / Live group 互換。
+    parent_id: Option<u32>,
 }
 
 struct DawModel {
@@ -72,7 +74,13 @@ struct DawModel {
     arr_tracks: Vec<DawTrack>,
     arr_view: ArrangementView,
     arr_selected_clips: Vec<ClipKey>,
-    arr_selected_track: Option<u32>,
+    /// M14 Phase 63c (#016): multi-select 化 (旧 `arr_selected_track: Option<u32>` から transition)。
+    /// 単一選択 = `vec![tid]`、 解除 = `vec![]`、 multi-select は Shift/Ctrl click で widget 側が
+    /// modifier-aware に next を生成して送ってくる。
+    arr_selected_tracks: Vec<u32>,
+    /// M14 Phase 63c (#016): 折り畳み中の group track id 集合。 widget の `track.collapsed` field
+    /// を caller 側で computed して渡す source-of-truth。 `ToggleGroupCollapsed(id)` Edit 受信で toggle。
+    arr_collapsed_groups: std::collections::HashSet<u32>,
     /// `BeginRenameTrack(id)` 受信時にセット。`Some(id)` 中は該当 track header 上に
     /// `text_input_at_focused` を重ね描画 (M11 Phase 52 で `text_input_at` から差し替え、
     /// 「初回 show 自動 focus」が widget 内蔵で boilerplate ゼロ)。Enter / blur / ESC で
@@ -97,14 +105,22 @@ impl DawModel {
                     color: None,
                 });
             }
+            // M14 Phase 63c (#016) demo: track 0 を group とし、 track 1-2 を子に。
+            // 残り (3+) は top-level、 disclosure ▼/▶ + indent + collapsed 動作確認用。
+            let parent_id = if ti == 1 || ti == 2 { Some(0_u32) } else { None };
             tracks.push(DawTrack {
                 id: ti as u32,
-                name: Arc::from(format!("Track {}", ti + 1)),
+                name: Arc::from(if ti == 0 {
+                    "Group A".to_string()
+                } else {
+                    format!("Track {}", ti + 1)
+                }),
                 muted: false,
                 solo: false,
                 next_clip_id: 2,
                 clips,
                 volume: 0.75,
+                parent_id,
             });
         }
         let arr_view = ArrangementView {
@@ -138,7 +154,8 @@ impl DawModel {
             arr_tracks: tracks,
             arr_view,
             arr_selected_clips: Vec::new(),
-            arr_selected_track: None,
+            arr_selected_tracks: Vec::new(),
+            arr_collapsed_groups: std::collections::HashSet::new(),
             arr_rename_target: None,
             demo_chain: vec![
                 "MIDI Quantize".to_string(),
@@ -668,6 +685,20 @@ fn drawmixer_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pane: Rec
 
 /// `DawTrack` 列を `ArrangementTrack` に変換 (Arc<str> のみ clone)。
 fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
+    // M14 Phase 63c (#016): parent_id chain を辿って depth を計算 + collapsed フラグを caller 側
+    // (`m.arr_collapsed_groups`) から各 track に焼き込む。 widget は depth を読むだけ (BFS は caller 責務)。
+    let depth_of = |id: u32| -> u8 {
+        let mut depth = 0_u8;
+        let mut cur = m.arr_tracks.iter().find(|t| t.id == id).and_then(|t| t.parent_id);
+        for _ in 0..64 {
+            let Some(pid) = cur else {
+                break;
+            };
+            depth = depth.saturating_add(1);
+            cur = m.arr_tracks.iter().find(|t| t.id == pid).and_then(|t| t.parent_id);
+        }
+        depth
+    };
     m.arr_tracks
         .iter()
         .map(|t| ArrangementTrack {
@@ -687,6 +718,9 @@ fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
                     color: c.color,
                 })
                 .collect(),
+            parent_id: t.parent_id,
+            depth: depth_of(t.id),
+            collapsed: m.arr_collapsed_groups.contains(&t.id),
         })
         .collect()
 }
@@ -761,7 +795,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
         &arr_tracks,
         m.arr_view,
         &m.arr_selected_clips,
-        m.arr_selected_track,
+        &m.arr_selected_tracks,
         &style,
         move |req| match req {
             ArrangementEditRequest::SelectClips { next, .. } => {
@@ -771,9 +805,10 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                     mm.last_action = "arr: SelectClips".to_string();
                 })
             }
-            ArrangementEditRequest::SelectTrack { next, .. } => Edit::mutate(move |mm: &mut DawModel| {
-                mm.arr_selected_track = next;
-                mm.last_action = format!("arr: SelectTrack {next:?}");
+            ArrangementEditRequest::SelectTrack { next, modifier, .. } => Edit::mutate(move |mm: &mut DawModel| {
+                let n = next.len();
+                mm.arr_selected_tracks = next;
+                mm.last_action = format!("arr: SelectTrack ({n}, {modifier:?})");
             }),
             ArrangementEditRequest::MoveClips(deltas) => Edit::mutate(move |mm: &mut DawModel| {
                 let n = deltas.len();
@@ -861,8 +896,13 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
             }),
             ArrangementEditRequest::DeleteTrack(id) => Edit::mutate(move |mm: &mut DawModel| {
                 mm.arr_tracks.retain(|t| t.id != id);
-                if mm.arr_selected_track == Some(id) {
-                    mm.arr_selected_track = None;
+                mm.arr_selected_tracks.retain(|t| *t != id);
+                mm.arr_collapsed_groups.remove(&id);
+                // 子の parent_id が `id` を指していた場合は top-level に持ち上げる (orphan 防止)。
+                for t in &mut mm.arr_tracks {
+                    if t.parent_id == Some(id) {
+                        t.parent_id = None;
+                    }
                 }
                 mm.arr_view.data_generation += 1;
                 mm.last_action = format!("arr: DeleteTrack {id}");
@@ -962,6 +1002,47 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 mm.arr_view.data_generation += 1;
                 mm.last_action = format!("arr: SetTrackRowH → {new_h:.1}");
             }),
+            ArrangementEditRequest::ToggleGroupCollapsed(id) => Edit::mutate(move |mm: &mut DawModel| {
+                if mm.arr_collapsed_groups.contains(&id) {
+                    mm.arr_collapsed_groups.remove(&id);
+                } else {
+                    mm.arr_collapsed_groups.insert(id);
+                }
+                mm.arr_view.data_generation += 1;
+                mm.last_action = format!("arr: ToggleGroupCollapsed {id}");
+            }),
+            ArrangementEditRequest::SetTrackParent { tracks, parent, anchor_after } => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    let n = tracks.len();
+                    // (1) source tracks を arr_tracks から remove (順序維持)
+                    let mut removed: Vec<DawTrack> = Vec::with_capacity(n);
+                    for tid in &tracks {
+                        if let Some(pos) = mm.arr_tracks.iter().position(|t| t.id == *tid) {
+                            removed.push(mm.arr_tracks.remove(pos));
+                        }
+                    }
+                    // (2) parent_id を更新
+                    for t in &mut removed {
+                        t.parent_id = parent;
+                    }
+                    // (3) anchor_after 直後に insert (None で先頭)
+                    let insert_at = match anchor_after {
+                        Some(aid) => mm
+                            .arr_tracks
+                            .iter()
+                            .position(|t| t.id == aid)
+                            .map_or(0, |i| i + 1),
+                        None => 0,
+                    };
+                    for (i, t) in removed.into_iter().enumerate() {
+                        mm.arr_tracks.insert(insert_at + i, t);
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!(
+                        "arr: SetTrackParent ({n} → {parent:?}, after {anchor_after:?})"
+                    );
+                })
+            }
         },
     );
 
@@ -976,8 +1057,12 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 })),
                 1 => ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
                     mm.arr_tracks.retain(|t| t.id != tid);
-                    if mm.arr_selected_track == Some(tid) {
-                        mm.arr_selected_track = None;
+                    mm.arr_selected_tracks.retain(|t| *t != tid);
+                    mm.arr_collapsed_groups.remove(&tid);
+                    for t in &mut mm.arr_tracks {
+                        if t.parent_id == Some(tid) {
+                            t.parent_id = None;
+                        }
                     }
                     mm.arr_view.data_generation += 1;
                     mm.last_action = format!("arr: Delete {tid} (context)");

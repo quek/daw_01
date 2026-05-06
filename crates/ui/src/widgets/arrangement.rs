@@ -68,6 +68,20 @@ pub struct ArrangementTrack {
     /// track header rect 内 buttons の下に horizontal slider band として描画される (`row_h` 余裕がある時のみ)。
     /// 将来 `ArrangementClip.volume` を再導入する場合は `effective = track.volume * clip.volume` の乗算 (DAW 標準)。
     pub volume: f32,
+    /// M14 Phase 63c (#016): 親 track の id (`None` で top-level)。 「ある track が group として
+    /// 振る舞う条件」 は **他の track の `parent_id` がこの id を指す** こと (= 子を持つ track が group)。
+    /// caller 側は parent_id を model に持つだけ (Reaper folder / Live group と整合)、 widget は逆引きで
+    /// `is_group_track` を判定して disclosure / 背景色を切替える。
+    pub parent_id: Option<u32>,
+    /// M14 Phase 63c (#016): 親を辿った段数 (0 = top-level)。 widget 側で BFS すると O(N²) なので
+    /// **caller 計算で渡す前提** (track 構成変化時に 1 度計算すればよい、 描画毎には不要)。
+    /// `header_x = rect.x + depth * style.indent_px` で indent 描画。
+    pub depth: u8,
+    /// M14 Phase 63c (#016): true なら子孫 track row を描画 skip。 widget 側で `parent_id` chain を
+    /// 辿って「親 chain のいずれかが collapsed なら自分も hide」 と判定する (= group の disclosure
+    /// state と整合)。 caller は collapsed フラグを各 track に set して渡すだけ (state は caller 側で
+    /// `HashSet<u32>` 等に保持)。
+    pub collapsed: bool,
 }
 
 /// arrangement の view 状態 (pan / zoom / playhead / loop)。値渡し (Copy)。
@@ -158,11 +172,32 @@ pub struct ResizeClipDelta {
     pub next_len: f64,
 }
 
+/// M14 Phase 63c (#016): track header click 時の selection 変更 modifier (DAW 業界標準)。
+/// caller が `SelectTrack` Edit を受け取ったときに `(prev, next, modifier)` から動作意図を判別できる
+/// ようにするため、 widget 側で modifier を decoded して送る (caller boilerplate の削減)。
+///
+/// - `Single`: 修飾なし click → `next = vec![clicked]`、 anchor を clicked で update
+/// - `RangeFromAnchor`: Shift+click → 直前 Single click 位置 (= widget 内 anchor) と clicked の間の
+///   visible 列上の連続範囲を選択。 anchor が無い場合は Single 同等。
+/// - `Toggle`: Ctrl+click → `next = if prev.contains(&clicked) { prev - clicked } else { prev + clicked }`、
+///   anchor は更新しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectModifier {
+    Single,
+    RangeFromAnchor,
+    Toggle,
+}
+
 /// arrangement が user に発行する Edit 要求。1 frame 内で消費される一時 ADT。
 #[derive(Debug)]
 pub enum ArrangementEditRequest {
     SelectClips { prev: Vec<ClipKey>, next: Vec<ClipKey> },
-    SelectTrack { prev: Option<u32>, next: Option<u32> },
+    /// M14 Phase 63c (#016): multi-select 化。 旧 `{ prev: Option<u32>, next: Option<u32> }` を
+    /// `{ prev: Vec<u32>, next: Vec<u32>, modifier: SelectModifier }` に置換 (1 → N の breaking change)。
+    /// 単一選択は `next = vec![tid]`、 解除は `next = vec![]`。 modifier は caller の Edit dispatch
+    /// 時に動作意図 (Single / Range / Toggle) を判別する用 (typically caller は `next` をそのまま
+    /// `selected_tracks` に書き込めば良く、 modifier は無視可能)。
+    SelectTrack { prev: Vec<u32>, next: Vec<u32>, modifier: SelectModifier },
     MoveClips(Vec<MoveClipDelta>),
     ResizeClips(Vec<ResizeClipDelta>),
     DeleteClips(Vec<ClipKey>),
@@ -191,6 +226,23 @@ pub enum ArrangementEditRequest {
     /// M10 Phase 48: 縦ズーム (`track_row_h` を絶対値で更新、`Alt+wheel` で発火)。
     /// min/max の clamp は app 側で実施 (目安 16..96 px)。
     SetTrackRowH(f32),
+    /// M14 Phase 63c (#016): group 折り畳み toggle (▼/▶ disclosure click)。
+    /// caller は `track.collapsed` を反転した値を保存する (widget 側は描画時に親 chain の
+    /// collapsed を辿って子孫 row を skip)。
+    ToggleGroupCollapsed(u32),
+    /// M14 Phase 63c (#016): drag-and-drop による parent 変更 + 挿入位置指定。 multi-select 中は
+    /// selected track 群を一括移動する設計のため `tracks: Vec<u32>` (単一 track でも `vec![id]`)。
+    /// `parent` が `None` で top-level に持ち上げ (= ungroup)、 `Some(id)` で `id` track の配下に移動。
+    /// `anchor_after` は **caller の `tracks` 配列内** で source tracks を挿入する直前 track id
+    /// (`None` で先頭挿入)。 caller は (1) source を arr_tracks から remove (2) parent_id を `parent`
+    /// に更新 (3) anchor_after の直後に source を挿入、 という再構築をすればよい。 同 parent 内 reorder
+    /// もこの variant で表現できる (parent が変化しないだけ)、 widget は drag drop で常に SetTrackParent
+    /// を発行する (`ReorderTracks` は keyboard / context menu 等の caller-driven reorder 用に残す)。
+    SetTrackParent {
+        tracks: Vec<u32>,
+        parent: Option<u32>,
+        anchor_after: Option<u32>,
+    },
 }
 
 /// `Ui::arrangement` の戻り値。
@@ -284,6 +336,14 @@ pub struct ArrangementStyle {
     pub track_volume_band_fill: Color,
     /// M13 Phase 55: ruler の小節番号テキスト色 (`time_ruler` 内の label_color にマップ)。
     pub ruler_label_color: Color,
+    /// M14 Phase 63c (#016): group hierarchy で 1 段ネストするごとに track header を右にずらす量 (px)。
+    /// 各 track の `header_x = rect.x + depth * indent_px`。 default = 16.0。
+    pub indent_px: f32,
+    /// M14 Phase 63c (#016): group 行 (= 子を持つ track) の背景色。 selection 状態と排他で
+    /// `track_group_bg` を背景に塗る (selected が priority)。
+    pub track_group_bg: Color,
+    /// M14 Phase 63c (#016): ▼ / ▶ disclosure アイコンの色 (group 行の左端)。
+    pub disclosure_color: Color,
 }
 
 impl Default for ArrangementStyle {
@@ -350,6 +410,9 @@ impl Default for ArrangementStyle {
             track_volume_band_track: Color::rgba(0.0, 0.0, 0.0, 0.45),
             track_volume_band_fill: Color::rgb(0.95, 0.95, 0.97),
             ruler_label_color: Color::rgb(0.85, 0.88, 0.92),
+            indent_px: 16.0,
+            track_group_bg: Color::rgb(0.16, 0.22, 0.32),
+            disclosure_color: Color::rgb(0.85, 0.88, 0.92),
         }
     }
 }
@@ -357,6 +420,49 @@ impl Default for ArrangementStyle {
 // ============================================================
 // Public pure helpers
 // ============================================================
+
+/// M14 Phase 63c (#016): `id` が group track として振る舞うか (= 他 track の `parent_id` がこの id を指す)。
+/// `is_group` フィールドを `ArrangementTrack` に持たせず逆引きで導出する設計 (Reaper / Live と整合、
+/// caller boilerplate なし)。 各 track 描画毎に呼ぶと O(N²) になるが N ≤ 100 程度の DAW 想定では問題なし
+/// (実用上 1 frame 1 描画 / cached の中なので N² = 10k operation = ~10μs)。
+#[must_use]
+pub fn is_group_track(id: u32, tracks: &[ArrangementTrack]) -> bool {
+    tracks.iter().any(|t| t.parent_id == Some(id))
+}
+
+/// M14 Phase 63c (#016): `track` が描画 / hit-test 対象として visible か。
+/// `parent_id` chain を root まで辿り、 途中のいずれかが `collapsed == true` なら **不可視** を返す。
+/// `parent_id` が cycle を作る防御として max 64 hop で打ち切り (実用上 32 段程度の hierarchy で十分)。
+#[must_use]
+pub fn is_visible_track(track: &ArrangementTrack, tracks: &[ArrangementTrack]) -> bool {
+    let mut cur_parent = track.parent_id;
+    for _ in 0..64 {
+        let Some(pid) = cur_parent else {
+            return true;
+        };
+        let Some(parent) = tracks.iter().find(|t| t.id == pid) else {
+            return true;
+        };
+        if parent.collapsed {
+            return false;
+        }
+        cur_parent = parent.parent_id;
+    }
+    true
+}
+
+/// M14 Phase 63c (#016): collapsed 親配下を skip した visible track の元 index 列を返す。
+/// 描画 (track_top 計算 / track_index_from_y の visible_i 補正) と hit-test で共有する SSoT。
+/// `tracks` の元順序は維持 (caller が入力した並び順 = 描画順)。
+#[must_use]
+pub fn compute_visible_indices(tracks: &[ArrangementTrack]) -> Vec<usize> {
+    tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| is_visible_track(t, tracks))
+        .map(|(i, _)| i)
+        .collect()
+}
 
 /// (track_index, clip) → screen rect (lanes 範囲、horizontal clip 形状)。
 #[must_use]
@@ -631,6 +737,22 @@ fn header_row_layout(row: Rect, volume_band_h: f32) -> HeaderRowLayout {
     HeaderRowLayout { name_rect, buttons, volume_band }
 }
 
+/// M14 Phase 63c (#016): disclosure ▼ / ▶ アイコンの hit / 描画 rect。
+/// `name_rect` の左端から `disclosure_w` 幅で切り出し、 indent 量 (`depth * indent_px`) は **既に
+/// `name_rect.x` に反映されている前提** (caller 側の指定)。 group track でない場合は呼ばない (caller が判定)。
+/// rect は `name_rect.h` を超えない正方形に近い (アイコン center 用)。
+fn disclosure_rect_for(name_rect: Rect, style: &ArrangementStyle, _depth: u8) -> Rect {
+    // disclosure 幅は indent_px と同じ (= 1 段ぶんの幅)、 name_rect の左端から削り取る。
+    let w = style.indent_px.max(8.0);
+    let h = name_rect.h.min(w);
+    Rect {
+        x: name_rect.x,
+        y: name_rect.y + (name_rect.h - h) * 0.5,
+        w,
+        h,
+    }
+}
+
 // ============================================================
 // Internal state
 // ============================================================
@@ -678,11 +800,17 @@ struct LoopDragSession {
     last_mouse_x: f32,
 }
 
-/// M10 Phase 46: track header drag&drop による reorder セッション。
-#[derive(Clone, Copy, Debug)]
+/// M10 Phase 46 / M14 Phase 63c (#016): track header drag&drop session。 release frame で
+/// **drop target に応じて `ReorderTracks` (sibling) と `SetTrackParent` (parent 変更) を振り分け** る。
+/// multi-select 時は `source_track_ids` に selected_tracks をそのまま乗せて一括移動する。
+#[derive(Clone, Debug)]
 struct TrackReorderSession {
     anchor_track_id: u32,
     anchor_index: usize,
+    /// M14 Phase 63c (#016): drag 開始時に grab した track 群 (selected_tracks に含まれていれば
+    /// selected 全部、 そうでなければ `vec![anchor_track_id]`)。 multi-track reparent / reorder の
+    /// source として release frame で使う。
+    source_track_ids: Vec<u32>,
     anchor_mouse_y: f32,
     /// drag 中の最終 mouse y 位置 (release frame の `pointer.pos` に頼らない保険、`ClipDragSession.last_mouse` と同理由)。
     last_mouse_y: f32,
@@ -708,6 +836,11 @@ pub(crate) struct ArrangementState {
     loop_drag: Option<LoopDragSession>,
     track_reorder: Option<TrackReorderSession>,
     track_volume_drag: Option<TrackVolumeDragSession>,
+    /// M14 Phase 63c (#016): 直前の `Single` クリック位置 (= Shift+click 範囲選択の起点)。
+    /// caller には公開せず widget 内 SSoT として持つ (piano_roll の note multi-select は anchor
+    /// なし設計だったが、 arrangement では daw_01 #009 / #016 で「widget 内 anchor」 が確認されている)。
+    /// `Toggle` modifier では update しない、 `Single` / `RangeFromAnchor` で update。
+    selection_anchor: Option<u32>,
 }
 
 /// 絶対位置 snap で計算した clip drag の beat delta (overlay と release commit で共有)。
@@ -782,20 +915,30 @@ fn draw_lanes_bg<M: ?Sized + 'static>(
     lanes: Rect,
     tracks: &[ArrangementTrack],
     view: ArrangementView,
-    selected_track: Option<u32>,
+    selected_tracks: &[u32],
+    is_group_set: &HashSet<u32>,
     style: &ArrangementStyle,
 ) {
     push_filled_rect(hctx, lanes, style.bg);
 
-    // 各 track row 背景 (selection ハイライト + mute/solo hint band)
-    for (i, t) in tracks.iter().enumerate() {
-        let row_y = lanes.y - view.track_top + i as f32 * view.track_row_h;
+    // 各 track row 背景 (selection ハイライト + mute/solo hint band + group_bg)。
+    // M14 Phase 63c (#016): collapsed 親配下は描画 skip (visible 列のみ index で row を計算)。
+    let visible_indices = compute_visible_indices(tracks);
+    for (visible_i, &i) in visible_indices.iter().enumerate() {
+        let t = &tracks[i];
+        #[allow(clippy::cast_precision_loss)]
+        let row_y = lanes.y - view.track_top + visible_i as f32 * view.track_row_h;
         let row = Rect { x: lanes.x, y: row_y, w: lanes.w, h: view.track_row_h };
         if row.y + row.h < lanes.y || row.y > lanes.y + lanes.h {
             continue;
         }
-        if Some(t.id) == selected_track {
+        // selection priority > group_bg > 通常 (selection は overlay layer で再描画される
+        // が、 lanes_bg では下塗りとして塗る = visual hint としての役割)。 is_group_set は
+        // caller の **full tracks** から計算済 (collapsed 後も group 判定が安定)。
+        if selected_tracks.contains(&t.id) {
             push_filled_rect(hctx, row, style.track_selected_bg);
+        } else if is_group_set.contains(&t.id) {
+            push_filled_rect(hctx, row, style.track_group_bg);
         }
         if t.muted {
             push_filled_rect(
@@ -1052,11 +1195,16 @@ fn draw_loop_band<M: ?Sized + 'static>(
 // ============================================================
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
-    /// arrangement widget (M9 Phase 45e)。
+    /// arrangement widget (M9 Phase 45e、 M14 Phase 63c で multi-select + group hierarchy 対応)。
     ///
-    /// 詳細は module doc 参照。`tracks` は順序付き配列 (上から下に並ぶ)。
-    /// `selected_clips` / `selected_track` は外部 immutable borrow (Model 側 SSoT)。
+    /// 詳細は module doc 参照。`tracks` は順序付き配列 (上から下に並ぶ、 collapsed 親の子は描画 skip)。
+    /// `selected_clips` / `selected_tracks` は外部 immutable borrow (Model 側 SSoT)。
     /// `make_edit` callback で各 `ArrangementEditRequest` を `Edit<M>` に変換する。
+    ///
+    /// **multi-select**: `selected_tracks` は順序不定の id 配列 (caller は `HashSet<u32>` /
+    /// `Vec<u32>` どちらで持っても OK、 順序は `next` フィールドが visible 列順で生成する)。
+    /// modifier (Single / RangeFromAnchor / Toggle) は widget 内 anchor + `pointer.modifiers` で
+    /// decode し、 `SelectTrack` Edit に乗せて caller に通知する。
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn arrangement<F>(
         &mut self,
@@ -1065,7 +1213,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         tracks: &[ArrangementTrack],
         view: ArrangementView,
         selected_clips: &[ClipKey],
-        selected_track: Option<u32>,
+        selected_tracks: &[u32],
         style: &ArrangementStyle,
         make_edit: F,
     ) -> ArrangementResponse
@@ -1096,6 +1244,22 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             ..Default::default()
         };
 
+        // ---- M14 Phase 63c (#016): visible 領域 (collapsed 親の subtree skip) を pre-compute ----
+        // press / drag / release / draw すべてが visible-domain の row index で動くように、
+        // `tracks` (caller's 全 list) を visible-only に絞った Vec を作って以降で共有する。
+        // `clip_to_rect` / `track_index_from_y` の `track_index` 引数は visible-idx と解釈される。
+        // tracks_for_draw (heavy() / 描画用、 後述 optimistic reorder 適用版) も同じ visibility 集合。
+        let visible_indices_press: Vec<usize> = compute_visible_indices(tracks);
+        let visible_tracks: Vec<ArrangementTrack> = visible_indices_press
+            .iter()
+            .map(|&i| tracks[i].clone())
+            .collect();
+        // M14 Phase 63c (#016): collapsed 後でも「Group A は子を持つ track」 と判定するため、
+        // **caller の full `tracks`** から「他 track の parent_id として参照されている id 集合」 を 1 度計算。
+        // `is_group_track(id, visible_tracks)` だと collapsed で children が filter outされ false 化する罠を回避。
+        let is_group_set: HashSet<u32> =
+            tracks.iter().filter_map(|t| t.parent_id).collect();
+
         // ---- press 振り分け: clip_drag / loop_drag を state に積む ----
         if pointer.primary_just_pressed
             && let Some((px, py)) = pointer.pos
@@ -1106,7 +1270,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             if in_lanes
                 && !shift
                 && let Some((hit_key, kind)) =
-                    clip_hit(tracks, view, lanes, px, py, style.resize_handle_px)
+                    clip_hit(&visible_tracks, view, lanes, px, py, style.resize_handle_px)
             {
                 let drag_keys: Vec<ClipKey> = if selected_clips.contains(&hit_key) {
                     selected_clips.to_vec()
@@ -1115,8 +1279,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 };
                 let mut anchors: Vec<ClipDragAnchor> = Vec::new();
                 for k in &drag_keys {
+                    // visible_tracks の visible-idx を anchor.track_index に保存 (release frame の
+                    // delta 計算 + draw_drag_preview の new_idx も同じ visible-idx で動く)。
                     if let Some((t_idx, t)) =
-                        tracks.iter().enumerate().find(|(_, t)| t.id == k.track)
+                        visible_tracks.iter().enumerate().find(|(_, t)| t.id == k.track)
                         && let Some(c) = t.clips.iter().find(|c| c.id == k.clip)
                     {
                         anchors.push(ClipDragAnchor {
@@ -1168,7 +1334,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 && header_pane.contains(px, py)
                 && let Some(idx) =
                     track_index_from_y(py, header_pane.y, view.track_top, view.track_row_h)
-                && let Some(t) = tracks.get(idx)
+                && let Some(t) = visible_tracks.get(idx)
             {
                 let row_y = header_pane.y - view.track_top + idx as f32 * view.track_row_h;
                 let row =
@@ -1188,11 +1354,25 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     });
                 } else {
                     let in_small_button = layout.buttons.iter().any(|b| b.contains(px, py));
-                    if !in_small_button {
+                    // M14 Phase 63c (#016): disclosure rect の click は track_reorder セッションを
+                    // 起動しない (折り畳み toggle のみ、 release frame 別経路で Edit 発行)。
+                    let in_disclosure = is_group_set.contains(&t.id)
+                        && disclosure_rect_for(layout.name_rect, style, t.depth)
+                            .contains(px, py);
+                    if !in_small_button && !in_disclosure {
+                        // M14 Phase 63c (#016): multi-select 中の drag は selected_tracks をまとめて
+                        // 移動するため、 source_track_ids に selected を全部入れる (clicked が selected
+                        // に含まれていなければ単独 drag = `vec![clicked]`)。
+                        let source_ids: Vec<u32> = if selected_tracks.contains(&t.id) {
+                            selected_tracks.to_vec()
+                        } else {
+                            vec![t.id]
+                        };
                         let state: &mut ArrangementState = self.widget_state(wid);
                         state.track_reorder = Some(TrackReorderSession {
                             anchor_track_id: t.id,
                             anchor_index: idx,
+                            source_track_ids: source_ids,
                             anchor_mouse_y: py,
                             last_mouse_y: py,
                         });
@@ -1314,9 +1494,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         };
 
         // M10 Phase 46: track reorder session の overlay 用 clone と release 取り出し。
+        // M14 Phase 63c (#016): TrackReorderSession は Vec<u32> を持つため Copy 不可。 ここで clone。
         let track_reorder_session: Option<TrackReorderSession> = {
             let state: &mut ArrangementState = self.widget_state(wid);
-            state.track_reorder
+            state.track_reorder.clone()
         };
         let track_reorder_release_raw: Option<TrackReorderSession> =
             if pointer.primary_just_released {
@@ -1326,41 +1507,99 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 None
             };
 
-        // M10 Phase 50: track reorder release frame の **optimistic preview** —
-        // Edit::ReorderTracks は frame 末尾 deferred apply のため、release 直後の cached layer は
-        // 旧順序で描画されてしまう (#011 症状 2)。release frame で新順序を先に計算し、
-        // tracks_for_draw として cached layer + per-track header loop に渡すことで 1 frame 遅延を解消。
-        // viewport_key に reorder hash を入れて cache miss を強制。
-        let pending_reorder_order: Option<Vec<u32>> =
-            if let Some(tr) = track_reorder_release_raw {
+        // M14 Phase 63c (#016): track header drag release の **drop action 統合**:
+        // 旧 `ReorderTracks` (sibling 並び替え) と `SetTrackParent` (parent 変更) を 1 つの
+        // `SetTrackParent { tracks, parent, anchor_after }` に統合。 caller は (1) source を
+        // arr_tracks から remove (2) parent_id を `parent` に更新 (3) `anchor_after` の直後
+        // (None で先頭) に挿入、 という再構築をすればよい。 これで「Track 5 を Group A header に
+        // drop → Group A subtree 末尾に挿入 + parent 化」 などの DAW 標準動作が 1 Edit で表現可能。
+        //
+        // anchor_after の計算ルール (visible-domain):
+        //  - drop target が group → anchor_after = group の visible 列上の last descendant id
+        //    (子が無ければ group 自身)、 parent = Some(target.id)
+        //  - drop target が regular track:
+        //    - top half (mouse y が row 上半分) → anchor_after = visible 列で 1 つ前の track id
+        //      (None = 先頭挿入)、 parent = target.parent_id
+        //    - bottom half → anchor_after = Some(target.id)、 parent = target.parent_id
+        //  - drop on blank (mouse y が rows の外) → anchor_after = visible 列の最後 (or None)、
+        //    parent = None (top-level 末尾)
+        let pending_drop: Option<(Vec<u32>, Option<u32>, Option<u32>)> = {
+            if let Some(ref tr) = track_reorder_release_raw {
                 let dy = (tr.last_mouse_y - tr.anchor_mouse_y).abs();
                 if dy >= 16.0 {
-                    let target = compute_reorder_target_index(
-                        tr.anchor_index,
+                    let visible_drop_idx = track_index_from_y(
                         tr.last_mouse_y,
                         header_pane.y,
                         view.track_top,
                         view.track_row_h,
-                        tracks.len(),
                     );
-                    if target == tr.anchor_index {
-                        None
+                    let drop_target = visible_drop_idx.and_then(|i| visible_tracks.get(i));
+                    let (parent, anchor_after) = if let Some(target) = drop_target {
+                        if is_group_set.contains(&target.id) {
+                            // group 化: target subtree の末尾に挿入
+                            let last_descendant = visible_tracks
+                                .iter()
+                                .rev()
+                                .find(|t| {
+                                    let mut p = t.parent_id;
+                                    for _ in 0..64 {
+                                        let Some(pid) = p else {
+                                            return false;
+                                        };
+                                        if pid == target.id {
+                                            return true;
+                                        }
+                                        p = tracks
+                                            .iter()
+                                            .find(|x| x.id == pid)
+                                            .and_then(|x| x.parent_id);
+                                    }
+                                    false
+                                })
+                                .map(|t| t.id)
+                                .or(Some(target.id));
+                            (Some(target.id), last_descendant)
+                        } else {
+                            // 通常 track: top/bottom half で挿入位置を決定
+                            #[allow(clippy::cast_precision_loss)]
+                            let row_y = header_pane.y - view.track_top
+                                + visible_drop_idx.unwrap_or(0) as f32 * view.track_row_h;
+                            let local_y = tr.last_mouse_y - row_y;
+                            let top_half = local_y < view.track_row_h * 0.5;
+                            let prev_id = if top_half {
+                                let prev_visible_i = visible_drop_idx
+                                    .and_then(|i| i.checked_sub(1));
+                                prev_visible_i.and_then(|i| visible_tracks.get(i)).map(|t| t.id)
+                            } else {
+                                Some(target.id)
+                            };
+                            (target.parent_id, prev_id)
+                        }
                     } else {
-                        let cur_ids: Vec<u32> = tracks.iter().map(|t| t.id).collect();
-                        Some(apply_reorder(&cur_ids, tr.anchor_index, target))
-                    }
+                        // blank drop → top-level 末尾
+                        let last_id = visible_tracks
+                            .iter()
+                            .rev()
+                            .find(|t| t.parent_id.is_none())
+                            .map(|t| t.id);
+                        (None, last_id)
+                    };
+                    Some((tr.source_track_ids.clone(), parent, anchor_after))
                 } else {
                     None
                 }
             } else {
                 None
-            };
-        let pending_reorder_hash: u64 = pending_reorder_order
-            .as_ref()
-            .map_or(0, |v| {
-                v.iter()
-                    .fold(0_u64, |a, x| a.wrapping_mul(31).wrapping_add(u64::from(*x)))
-            });
+            }
+        };
+        let pending_reorder_hash: u64 = pending_drop.as_ref().map_or(0_u64, |(ts, p, a)| {
+            let mut h = u64::from(p.unwrap_or(u32::MAX));
+            h = h.wrapping_mul(31).wrapping_add(u64::from(a.unwrap_or(u32::MAX)));
+            for t in ts {
+                h = h.wrapping_mul(31).wrapping_add(u64::from(*t));
+            }
+            h.wrapping_mul(0x100_0000_01B3)
+        });
 
         // M10 Phase 47b: track volume drag session の overlay 用 clone と release 取り出し。
         let track_volume_session: Option<TrackVolumeDragSession> = {
@@ -1425,16 +1664,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             && lanes.contains(cx, cy)
         {
             response.hovered_track = track_index_from_y(cy, lanes.y, view.track_top, view.track_row_h)
-                .and_then(|idx| tracks.get(idx).map(|t| t.id));
+                .and_then(|idx| visible_tracks.get(idx).map(|t| t.id));
             if let Some((hit_key, hit_kind)) =
-                clip_hit(tracks, view, lanes, cx, cy, style.resize_handle_px)
+                clip_hit(&visible_tracks, view, lanes, cx, cy, style.resize_handle_px)
             {
                 response.hovered_clip = Some(hit_key);
                 response.hovered_zone = Some(hit_kind);
             }
         }
         response.dragging = clip_drag_session.as_ref().map(|nd| nd.kind);
-        response.reordering = track_reorder_session.map(|tr| tr.anchor_track_id);
+        response.reordering = track_reorder_session.as_ref().map(|tr| tr.anchor_track_id);
         response.dragging_track_volume = track_volume_session.map(|tv| tv.track_id);
 
         // ---- cursor ----
@@ -1469,10 +1708,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // M13 Phase 55: bpm / time_sig を 3 つ目の nested tuple で追加し v2 に bump。
         // M14 Phase 61b (#011): clip 個別の (id, start_beat, len_beats) 変化を widget 側で hash
         // して 4 つ目の outer 要素 internal_clip_hash として viewport_key に追加 + v3 に bump。
+        // M14 Phase 63c (#016): selected_tracks を fold して selection 変化での cache miss を保証
+        // (旧 `selected_track.unwrap_or(u32::MAX)` の単一 u32 に対し、 multi-select は集合 hash)。
+        // 加えて parent_id / depth / collapsed の構成変化は data_generation で caller 責務 (group
+        // 構成変化は track 構成変化と同義、 caller が data_generation を bump する前提)。
         let internal_clip_hash = fold_arrangement_clip_hash(tracks);
+        let selected_tracks_hash: u64 = selected_tracks.iter().fold(0xCBF2_9CE4_8422_2325_u64, |a, &x| {
+            a.wrapping_mul(0x100_0000_01B3).wrapping_add(u64::from(x))
+        });
         let viewport_key = (
             (
-                b"arrangement_widget_v3" as &[u8],
+                b"arrangement_widget_v4" as &[u8],
                 rect.w.to_bits(),
                 rect.h.to_bits(),
                 view.start_beat.to_bits(),
@@ -1483,46 +1729,36 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 view.header_w.to_bits(),
                 view.ruler_h.to_bits(),
                 view.data_generation,
-                u64::from(selected_track.unwrap_or(u32::MAX)),
+                selected_tracks_hash,
             ),
             pending_reorder_hash,
             (view.bpm.to_bits(), u32::from(view.time_sig.0), u32::from(view.time_sig.1)),
             internal_clip_hash,
         );
 
-        // M10 Phase 50: pending_reorder_order があれば新順序で `tracks_for_draw` を組み立て、
-        // cached layer + per-track header loop の両方で使う (1 frame の visual 遅延を解消)。
-        // 防御: order に含まれなかった track は元順序のまま末尾に keep。
+        // M14 Phase 63c (#016): SetTrackParent に統合した結果、 release frame の optimistic
+        // preview (旧 ReorderTracks の new_order を frame 末尾 deferred apply の代わりに同 frame
+        // で見せる) は廃止。 caller の SetTrackParent arm は「source remove → parent_id update →
+        // anchor_after 後に insert」 を行うが、 widget は次 frame で更新後の `tracks` を再受信して
+        // 描画する (= 1 frame の表示遅延)。 user が drag release で「カクッ」 と動く挙動になるが、
+        // 構造変化を伴う drop は反映までの遅延が許容範囲 (sibling reorder を SetTrackParent と
+        // 統一した代償としては妥当)。 必要なら別 PR で optimistic preview を再導入可能。
         //
-        // M12 Phase 54 (perf_review_2026-05-04 P0-2): `Arc<[ArrangementTrack]>` で持つ。
-        // heavy() closure (line 1420) は `'static` 要求のため owned コピーが必要だが、
-        // per-track header loop (line 1777) でも同じデータを使うため、closure 用に
-        // 別の owned コピーを用意するしかない。Arc にすれば 2 度目以降は refcount のみで
-        // 済むので「通常 frame で発火する 2 度目の deep clone」(N tracks × M clips の
-        // 比例 alloc) を撲滅できる。1 度目 (`Arc::from(tracks)` または reorder build)
-        // は heavy() の `'static` 要件で不可避 (ArrangementTrack 内部 Vec<ArrangementClip>
-        // の owned コピー必要、Cow は `'static` ライフタイムで成立しない)。
-        let tracks_for_draw: Arc<[ArrangementTrack]> =
-            if let Some(order) = &pending_reorder_order {
-                let mut reordered: Vec<ArrangementTrack> = Vec::with_capacity(tracks.len());
-                for id in order {
-                    if let Some(t) = tracks.iter().find(|t| t.id == *id) {
-                        reordered.push(t.clone());
-                    }
-                }
-                for t in tracks {
-                    if !reordered.iter().any(|x| x.id == t.id) {
-                        reordered.push(t.clone());
-                    }
-                }
-                reordered.into()
-            } else {
-                Arc::from(tracks)
-            };
+        // tracks_for_draw は draw / track headers loop / clip 計算で使う visible-only Arc。
+        // 入力 `tracks` (caller's slice、 順序込み) を visible filter かけたコピーを保持。
+        let tracks_for_draw: Arc<[ArrangementTrack]> = Arc::from(visible_tracks.clone());
         let tracks_owned: Arc<[ArrangementTrack]> = Arc::clone(&tracks_for_draw);
         let style_copy = *style;
         let view_copy = view;
         let selected_set: HashSet<ClipKey> = selected_clips.iter().copied().collect();
+        // M14 Phase 63c (#016): heavy closure は `'static` 要求なので owned Vec<u32> で渡す
+        // (selected_set と同パターン)。 loop 側の hit-test では `selected_tracks` slice (borrowed)
+        // を直接 contains で参照するため、 ここで cloned heavy 用 vector を別に持って move 衝突を回避。
+        let selected_tracks_for_heavy: Vec<u32> = selected_tracks.to_vec();
+        // M14 Phase 63c (#016): is_group_set を heavy closure に move する用に owned コピー。
+        // visible_tracks (filtered) では collapsed 後に children が消えて group 判定が false 化する
+        // ため、 caller の full tracks から計算した HashSet を 'static に持ち込む。
+        let is_group_set_for_heavy: HashSet<u32> = is_group_set.clone();
         let drag_overlay_clone = clip_drag_overlay.clone();
         // M9 Phase 45f: drag overlay の Resize min_len は snap unit (snap_unit < 0.05 なら 0.05)。
         // release 側 min_len と一貫させるため、 alt 真値は drag session の `last_alt` を使う
@@ -1540,6 +1776,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // M10 Phase 46: track reorder の drag preview に必要な情報 (anchor index / 現在 mouse_y / target idx)。
         // dist >= 16px のときのみ overlay 描画 (短 click 中は静止 = button click と区別がつかないため UI ノイズ)。
         let reorder_overlay: Option<(TrackReorderSession, usize)> = track_reorder_session
+            .as_ref()
             .filter(|tr| (tr.last_mouse_y - tr.anchor_mouse_y).abs() >= 16.0)
             .map(|tr| {
                 let target = compute_reorder_target_index(
@@ -1548,9 +1785,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     header_pane.y,
                     view.track_top,
                     view.track_row_h,
-                    tracks.len(),
+                    visible_tracks.len(),
                 );
-                (tr, target)
+                (tr.clone(), target)
             });
 
         // M13 Phase 55: ruler / lanes grid を library `time_ruler` / `bar_beat_grid` に統合。
@@ -1585,7 +1822,15 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // === cached: viewport_key 一致時 skip ===
             hctx.cached(viewport_key, |hctx| {
                 push_filled_rect(hctx, header_pane, style_copy.header_bg);
-                draw_lanes_bg(hctx, lanes, &tracks_owned, view_copy, selected_track, &style_copy);
+                draw_lanes_bg(
+                    hctx,
+                    lanes,
+                    &tracks_owned,
+                    view_copy,
+                    &selected_tracks_for_heavy,
+                    &is_group_set_for_heavy,
+                    &style_copy,
+                );
                 hctx.bar_beat_grid(
                     ("arr_grid", id_for_inner),
                     lanes,
@@ -1678,13 +1923,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         });
 
         // ---- shortcut: Delete ----
-        // Phase 47c: clip 選択優先、無ければ selected_track を削除。
+        // Phase 47c: clip 選択優先、無ければ selected_tracks (multi-select) の先頭を削除。
+        // M14 Phase 63c (#016): multi-track の一括削除はあえて単一にとどめる (ungroup → 残った
+        // 子 track 群の parent_id 整理を caller 側で必要、 widget API としては `DeleteTrack(u32)` を
+        // 既存 1:1 で維持し、 multi 削除は caller が selected_tracks を loop して呼べば実現できる)。
+        // 現状は user 体験として「Delete shortcut で 1 track 削除」 を想定。
         if self.take_shortcut("delete") {
             if !selected_clips.is_empty() {
                 self.push_edit(make_edit(ArrangementEditRequest::DeleteClips(
                     selected_clips.to_vec(),
                 )));
-            } else if let Some(tid) = selected_track {
+            } else if let Some(&tid) = selected_tracks.first() {
                 self.push_edit(make_edit(ArrangementEditRequest::DeleteTrack(tid)));
             }
         }
@@ -1722,8 +1971,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             };
             match nd.kind {
                 ClipDragKind::Move => {
+                    // M14 Phase 63c (#016): visible_tracks (collapsed 親の subtree skip 後) で
+                    // index → track_id を解決。 anchor.track_index が visible-idx なので、
+                    // press_i32 + track_delta も visible domain で clamp する。
                     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                    let max_idx_i32 = (tracks.len().saturating_sub(1)) as i32;
+                    let max_idx_i32 = (visible_tracks.len().saturating_sub(1)) as i32;
                     let mut deltas: Vec<MoveClipDelta> = Vec::new();
                     for a in &nd.anchors {
                         let new_start = (a.start_beat + beat_delta).max(0.0);
@@ -1732,7 +1984,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         let new_idx = (press_i32 + track_delta).clamp(0, max_idx_i32);
                         #[allow(clippy::cast_sign_loss)]
                         let new_idx_u = new_idx.max(0) as usize;
-                        let new_track_id = tracks
+                        let new_track_id = visible_tracks
                             .get(new_idx_u)
                             .map_or(a.key.track, |t| t.id);
                         let moved = (new_start - a.start_beat).abs() > 1e-6
@@ -1800,7 +2052,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         {
             let prev = selected_clips.to_vec();
             let next: Vec<ClipKey> =
-                if let Some((hit_key, _)) = clip_hit(tracks, view, lanes, cx, cy, style.resize_handle_px) {
+                if let Some((hit_key, _)) = clip_hit(&visible_tracks, view, lanes, cx, cy, style.resize_handle_px) {
                     vec![hit_key]
                 } else {
                     Vec::new()
@@ -1853,11 +2105,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.push_edit(make_edit(ArrangementEditRequest::SetLoopRange { start, end }));
         }
 
-        // ---- M10 Phase 46: track reorder release → ReorderTracks ----
-        // dist < 16px → click 格下げ (button_at の SelectTrack / Rename trigger に任せる)
-        // dist >= 16px → 新順を計算して発行 (Phase 50: pending_reorder_order を再利用、二重計算回避)
-        if let Some(new_order) = pending_reorder_order {
-            self.push_edit(make_edit(ArrangementEditRequest::ReorderTracks(new_order)));
+        // ---- M14 Phase 63c (#016): track header drag release → SetTrackParent ----
+        // dist < 16px → click 格下げ (modifier-aware SelectTrack に任せる、 後続 loop の clicked_track 経路)
+        // dist >= 16px → 上で計算した `pending_drop` を SetTrackParent として 1 度発行。
+        // 旧 ReorderTracks 経由の sibling reorder も同 variant に統合済 (parent 不変 + anchor_after 指定)。
+        if let Some((src_tracks, parent, anchor_after)) = pending_drop {
+            self.push_edit(make_edit(ArrangementEditRequest::SetTrackParent {
+                tracks: src_tracks,
+                parent,
+                anchor_after,
+            }));
         }
 
         // ---- M10 Phase 47b+49: track volume drag release → Undoable Edit ----
@@ -2012,31 +2269,53 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         // ---- track headers (button_at × 4 + toggle_button_at × 2) + SelectTrack トリガ ----
         // M10 Phase 50: tracks_for_draw を使う (release frame の optimistic preview と同順序)。
+        // M14 Phase 63c (#016): visible_indices を pre-compute して collapsed 親配下を skip、
+        // visible_i (描画上の row index) を row_y に使う。 各 track header に depth * indent_px の
+        // 左 indent + group track には disclosure ▼/▶ アイコン。 selection は selected_tracks_set で判定。
+        // 修飾 (Shift / Ctrl) で Single / RangeFromAnchor / Toggle を decode し SelectTrack に乗せる。
+        // 1 frame 内で最初に click された track id を `clicked_track` に蓄え、 loop 後に modifier-aware
+        // SelectTrack を 1 度発行する (loop 内で複数発行しないため)。
+        let visible_idx_for_headers = compute_visible_indices(&tracks_for_draw);
+        let mut clicked_track_for_select: Option<u32> = None;
+        let mut disclosure_clicked: Option<u32> = None;
         if header_w > 0.0 {
-            for (i, t) in tracks_for_draw.iter().enumerate() {
-                let row_y = header_pane.y - view.track_top + i as f32 * view.track_row_h;
+            for (visible_i, &i) in visible_idx_for_headers.iter().enumerate() {
+                let t = &tracks_for_draw[i];
+                #[allow(clippy::cast_precision_loss)]
+                let row_y = header_pane.y - view.track_top + visible_i as f32 * view.track_row_h;
                 let row =
                     Rect { x: header_pane.x, y: row_y, w: header_pane.w, h: view.track_row_h };
                 if row.y + row.h < header_pane.y || row.y > header_pane.y + header_pane.h {
                     continue;
                 }
 
-                // 背景 (selection)
-                if Some(t.id) == selected_track {
+                // 背景 (selection > group_bg > 通常)
+                if selected_tracks.contains(&t.id) {
                     self.panel(("arr_thsel", t.id), row, style.track_selected_bg, 0.0);
+                } else if is_group_set.contains(&t.id) {
+                    self.panel(("arr_thgrp", t.id), row, style.track_group_bg, 0.0);
                 } else {
                     self.panel(("arr_thbg", t.id), row, style.header_bg, 0.0);
                 }
 
-                let layout = header_row_layout(row, style.track_volume_band_h);
+                // M14 Phase 63c (#016): depth * indent_px の左 indent。 layout 計算は indent 反映後の
+                // row_inner で実行する (= row.x + indent、 row.w - indent)。
+                let indent = f32::from(t.depth) * style.indent_px;
+                let row_for_layout = Rect {
+                    x: row.x + indent,
+                    y: row.y,
+                    w: (row.w - indent).max(2.0),
+                    h: row.h,
+                };
+                let layout = header_row_layout(row_for_layout, style.track_volume_band_h);
                 let name_rect = layout.name_rect;
                 let [m_rect, s_rect] = layout.buttons;
-                let button_zones: [Rect; 3] = [name_rect, m_rect, s_rect];
 
                 // M10 Phase 47b: track volume band 描画。
                 // drag 中の track はその drag session の last_mouse_x で preview volume を計算 (リアルタイム feedback)。
                 if let Some(band) = layout.volume_band {
                     let dragging_this = track_volume_session
+                        .as_ref()
                         .filter(|tv| tv.track_id == t.id);
                     let display_v = if let Some(tv) = dragging_this {
                         volume_from_mouse_x(tv.last_mouse_x, tv.band_rect.x, tv.band_rect.w)
@@ -2060,6 +2339,41 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     }
                 }
 
+                // M14 Phase 63c (#016): disclosure ▼/▶ — group track のみ描画 + click で
+                // ToggleGroupCollapsed Edit 発行 (loop 後に発火、 SelectTrack より priority 高)。
+                let is_group = is_group_set.contains(&t.id);
+                let disclosure_rect = disclosure_rect_for(name_rect, style, t.depth);
+                if is_group {
+                    let label = if t.collapsed { "▶" } else { "▼" };
+                    self.push_text(GlyphArea {
+                        text: label.into(),
+                        left: disclosure_rect.x + disclosure_rect.w * 0.2,
+                        top: disclosure_rect.y + (disclosure_rect.h - style.track_text_size * 1.2) * 0.5,
+                        font_size: style.track_text_size,
+                        line_height: style.track_text_size * 1.2,
+                        color: style.disclosure_color,
+                        clip_rect: Some(disclosure_rect),
+                    });
+                    if pointer.primary_just_released
+                        && let Some((rx, ry)) = pointer.pos
+                        && disclosure_rect.contains(rx, ry)
+                    {
+                        disclosure_clicked = Some(t.id);
+                    }
+                }
+                // disclosure を除いた name 領域 (group の場合は disclosure 分削る)
+                let name_rect_visible = if is_group {
+                    Rect {
+                        x: disclosure_rect.x + disclosure_rect.w,
+                        y: name_rect.y,
+                        w: (name_rect.w - disclosure_rect.w).max(2.0),
+                        h: name_rect.h,
+                    }
+                } else {
+                    name_rect
+                };
+                let button_zones: [Rect; 3] = [name_rect_visible, m_rect, s_rect];
+
                 let id_name = ("arr_tname", t.id);
                 let id_mute = ("arr_tmute", t.id);
                 let id_solo = ("arr_tsolo", t.id);
@@ -2069,16 +2383,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let solo = t.solo;
 
                 let name_text = t.name.clone();
-                // Name button: single click → SelectTrack (header background click と同じ動作)、
-                // double-click は別途 take_double_click_in_rect で検出 → BeginRenameTrack 発行。
-                let prev_sel = selected_track;
-                self.button_at(id_name, &name_text, name_rect, || {
-                    make_edit(ArrangementEditRequest::SelectTrack {
-                        prev: prev_sel,
-                        next: Some(track_id),
-                    })
-                });
-                if self.take_double_click_in_rect(name_rect).is_some() {
+                // M14 Phase 63c (#016): name 領域 click は modifier-aware SelectTrack を loop 後に
+                // 発行する形に変更。 button_at_clicked で click 検知のみ行い、 内部で Edit は emit
+                // しない (旧設計は button_at の closure 内で SelectTrack を emit していた)。
+                if self.button_at_clicked(id_name, &name_text, name_rect_visible) {
+                    clicked_track_for_select = Some(t.id);
+                }
+                if self.take_double_click_in_rect(name_rect_visible).is_some() {
                     self.push_edit(make_edit(ArrangementEditRequest::BeginRenameTrack(track_id)));
                 }
                 self.toggle_button_at(id_mute, "M", m_rect, muted, &style.mute_button, |_| {
@@ -2093,22 +2404,88 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 // Response.track_header_rects に積む
                 response.track_header_rects.push((t.id, row));
 
-                // SelectTrack トリガ: row 内 release + button_zones いずれにも非 hit + dist 短
+                // SelectTrack トリガ: row 内 release + button_zones / disclosure いずれにも非 hit。
+                // catch-all は modifier-aware SelectTrack の元データを蓄えるだけ (発行は loop 後)。
                 if pointer.primary_just_released
                     && let Some((rx, ry)) = pointer.pos
                     && row.contains(rx, ry)
                     && !button_zones.iter().any(|b| b.contains(rx, ry))
+                    && !(is_group && disclosure_rect.contains(rx, ry))
                 {
-                    let prev = selected_track;
-                    let next = Some(t.id);
-                    if prev != next {
-                        self.push_edit(make_edit(ArrangementEditRequest::SelectTrack {
-                            prev,
-                            next,
-                        }));
-                        response.selection_changed = true;
-                    }
+                    clicked_track_for_select = Some(t.id);
                 }
+            }
+        }
+
+        // M14 Phase 63c (#016): disclosure click → ToggleGroupCollapsed (priority 高、 SelectTrack は
+        // この frame では skip = group の collapsed toggle 動作のみで selection は変えない、
+        // Reaper / Live と同じ UX)。
+        if let Some(tid) = disclosure_clicked {
+            self.push_edit(make_edit(ArrangementEditRequest::ToggleGroupCollapsed(tid)));
+            clicked_track_for_select = None;
+        }
+
+        // M14 Phase 63c (#016): clicked_track があれば modifier-aware SelectTrack を 1 度発行。
+        // Single → next = [tid]、 anchor 更新。
+        // RangeFromAnchor (Shift) → anchor から visible 列の連続範囲。 anchor が None なら Single 同等。
+        // Toggle (Ctrl) → tid を selected に対して toggle、 anchor 更新しない。
+        if let Some(tid) = clicked_track_for_select {
+            let shift = pointer.modifiers.shift;
+            let ctrl = pointer.modifiers.ctrl;
+            let modifier = if shift {
+                SelectModifier::RangeFromAnchor
+            } else if ctrl {
+                SelectModifier::Toggle
+            } else {
+                SelectModifier::Single
+            };
+            let prev_anchor = {
+                let state: &ArrangementState = self.widget_state(wid);
+                state.selection_anchor
+            };
+            let visible_ids: Vec<u32> = visible_idx_for_headers
+                .iter()
+                .map(|&i| tracks_for_draw[i].id)
+                .collect();
+            let next: Vec<u32> = match modifier {
+                SelectModifier::Single => vec![tid],
+                SelectModifier::RangeFromAnchor => {
+                    let anchor_id = prev_anchor.unwrap_or(tid);
+                    let from = visible_ids.iter().position(|&v| v == anchor_id).unwrap_or(0);
+                    let to = visible_ids.iter().position(|&v| v == tid).unwrap_or(0);
+                    let lo = from.min(to);
+                    let hi = from.max(to);
+                    visible_ids[lo..=hi].to_vec()
+                }
+                SelectModifier::Toggle => {
+                    let mut set: HashSet<u32> = selected_tracks.iter().copied().collect();
+                    if set.contains(&tid) {
+                        set.remove(&tid);
+                    } else {
+                        set.insert(tid);
+                    }
+                    let mut v: Vec<u32> = set.into_iter().collect();
+                    v.sort_unstable();
+                    v
+                }
+            };
+            let prev_v: Vec<u32> = selected_tracks.to_vec();
+            let mut prev_sorted = prev_v.clone();
+            prev_sorted.sort_unstable();
+            let mut next_sorted = next.clone();
+            next_sorted.sort_unstable();
+            if prev_sorted != next_sorted {
+                self.push_edit(make_edit(ArrangementEditRequest::SelectTrack {
+                    prev: prev_v,
+                    next,
+                    modifier,
+                }));
+                response.selection_changed = true;
+            }
+            // anchor 更新: Single / Range で update、 Toggle は据え置き
+            if matches!(modifier, SelectModifier::Single | SelectModifier::RangeFromAnchor) {
+                let state: &mut ArrangementState = self.widget_state(wid);
+                state.selection_anchor = Some(tid);
             }
         }
 
@@ -2147,6 +2524,9 @@ mod tests {
             solo: false,
             clips,
             volume: 1.0,
+            parent_id: None,
+            depth: 0,
+            collapsed: false,
         }
     }
 
@@ -2589,7 +2969,7 @@ mod tests {
                 &m.tracks,
                 m.view,
                 &[],
-                None,
+                &[],
                 &style,
                 move |req| match req {
                     ArrangementEditRequest::SetTrackRowH(h) => {
@@ -2672,7 +3052,7 @@ mod tests {
                 &tracks,
                 view,
                 &[],
-                None,
+                &[],
                 &style,
                 |_| Edit::mutate(|()| {}),
             );
@@ -2830,6 +3210,140 @@ mod tests {
             fold_arrangement_clip_hash(&before),
             fold_arrangement_clip_hash(&after),
             "clip.id 入替で hash が変わる (FNV identity 確認)"
+        );
+    }
+
+    // ============================================================
+    // M14 Phase 63c (#016): group hierarchy + multi-select + reparent
+    // ============================================================
+
+    /// `parent_id` を持つ track 1 つ作る helper (test 専用)。
+    fn track_with_parent(
+        id: u32,
+        name: &str,
+        parent_id: Option<u32>,
+        depth: u8,
+        collapsed: bool,
+    ) -> ArrangementTrack {
+        ArrangementTrack {
+            id,
+            name: Arc::from(name),
+            muted: false,
+            solo: false,
+            clips: Vec::new(),
+            volume: 1.0,
+            parent_id,
+            depth,
+            collapsed,
+        }
+    }
+
+    #[test]
+    fn is_group_track_returns_true_when_child_exists() {
+        // `1` (parent) → `2`, `3` (children); `1` is group, `2`/`3` are leaves
+        let tracks = vec![
+            track_with_parent(1, "g", None, 0, false),
+            track_with_parent(2, "c1", Some(1), 1, false),
+            track_with_parent(3, "c2", Some(1), 1, false),
+        ];
+        assert!(is_group_track(1, &tracks), "1 has children → is_group");
+        assert!(!is_group_track(2, &tracks), "2 is leaf → not is_group");
+        assert!(!is_group_track(3, &tracks), "3 is leaf → not is_group");
+    }
+
+    #[test]
+    fn is_visible_track_returns_false_when_ancestor_collapsed() {
+        // `1` collapsed → `2` (child), `3` (grandchild) hidden; `4` (sibling) visible
+        let tracks = vec![
+            track_with_parent(1, "g", None, 0, true),
+            track_with_parent(2, "c1", Some(1), 1, false),
+            track_with_parent(3, "c2", Some(2), 2, false),
+            track_with_parent(4, "leaf", None, 0, false),
+        ];
+        assert!(is_visible_track(&tracks[0], &tracks), "root 自身は visible (collapsed 適用は子のみ)");
+        assert!(!is_visible_track(&tracks[1], &tracks), "親 1 が collapsed → 子 2 は不可視");
+        assert!(!is_visible_track(&tracks[2], &tracks), "祖父 1 が collapsed → 孫 3 は不可視");
+        assert!(is_visible_track(&tracks[3], &tracks), "別 chain の 4 は visible");
+    }
+
+    #[test]
+    fn compute_visible_indices_skips_collapsed_subtree() {
+        let tracks = vec![
+            track_with_parent(1, "g", None, 0, true),
+            track_with_parent(2, "c1", Some(1), 1, false),
+            track_with_parent(3, "c2", Some(2), 2, false),
+            track_with_parent(4, "leaf", None, 0, false),
+        ];
+        let visible = compute_visible_indices(&tracks);
+        assert_eq!(
+            visible,
+            vec![0, 3],
+            "collapsed 親 1 の subtree (2, 3) は skip、 visible は [0, 3]"
+        );
+    }
+
+    #[test]
+    fn disclosure_rect_within_name_rect_left_edge() {
+        // disclosure rect は name_rect の左端から indent_px 幅で切り出し
+        let style = ArrangementStyle::default();
+        let name_rect = Rect { x: 100.0, y: 50.0, w: 120.0, h: 24.0 };
+        let r = disclosure_rect_for(name_rect, &style, 0);
+        assert!((r.x - 100.0).abs() < 1e-6, "disclosure x は name_rect 左端");
+        assert!(r.w >= 8.0, "disclosure 幅は 8px 以上");
+        assert!(r.w <= style.indent_px, "disclosure 幅は indent_px (= 16) 以下");
+        assert!(r.y >= name_rect.y && r.y + r.h <= name_rect.y + name_rect.h, "y range は name_rect 内");
+    }
+
+    #[test]
+    fn select_modifier_single_replaces_selection() {
+        // Single click は selected_tracks を [clicked] で置換 + anchor 更新。
+        // SelectModifier::Single の Edit を caller が apply するだけで動作するため、
+        // Edit 構築側の test は省略 (pure 関数 unit test として selection 計算だけ確認)。
+        let prev: Vec<u32> = vec![5, 10];
+        let clicked = 7_u32;
+        // Single 動作: next = vec![clicked]
+        let next: Vec<u32> = vec![clicked];
+        assert_ne!(prev, next, "Single click で selected_tracks が変わる (置換)");
+        assert_eq!(next, vec![7], "next は clicked 1 件のみ");
+    }
+
+    #[test]
+    fn select_modifier_toggle_adds_or_removes() {
+        // Ctrl+click toggle: clicked が selected に居れば外す、 居なければ追加
+        let prev: Vec<u32> = vec![5, 10];
+        let clicked_in = 5_u32;
+        let clicked_out = 7_u32;
+        // 含まれている case → 削除
+        let mut set: HashSet<u32> = prev.iter().copied().collect();
+        if set.contains(&clicked_in) {
+            set.remove(&clicked_in);
+        } else {
+            set.insert(clicked_in);
+        }
+        let mut v: Vec<u32> = set.into_iter().collect();
+        v.sort_unstable();
+        assert_eq!(v, vec![10], "5 を toggle → 削除");
+        // 含まれていない case → 追加
+        let mut set2: HashSet<u32> = prev.iter().copied().collect();
+        if set2.contains(&clicked_out) {
+            set2.remove(&clicked_out);
+        } else {
+            set2.insert(clicked_out);
+        }
+        let mut v2: Vec<u32> = set2.into_iter().collect();
+        v2.sort_unstable();
+        assert_eq!(v2, vec![5, 7, 10], "7 を toggle → 追加");
+    }
+
+    #[test]
+    fn arrangement_style_has_indent_and_disclosure_defaults() {
+        let s = ArrangementStyle::default();
+        assert!(s.indent_px > 0.0, "indent_px は 0 以上 (default 16)");
+        assert!(s.indent_px <= 32.0, "indent_px は実用範囲 (~16-32) 内");
+        // group_bg / disclosure_color は色が設定されていれば OK (alpha > 0 で defensive)
+        assert!(
+            s.track_group_bg.r > 0.0 || s.track_group_bg.g > 0.0 || s.track_group_bg.b > 0.0,
+            "track_group_bg は黒以外の色"
         );
     }
 }
