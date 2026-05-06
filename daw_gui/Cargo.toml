@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 common = { path = "../common" }
 anyhow.workspace = true
+boa_engine = "0.21"
 midir.workspace = true
 rfd.workspace = true
 serde_json.workspace = true
@@ -20,3 +21,7 @@ raw-window-handle.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+
+[dev-dependencies]
+hound = "3.5"
+tempfile = "3"

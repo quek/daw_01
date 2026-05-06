@@ -899,7 +899,7 @@ pub fn reduce_master(
 /// scratches → master). `ProcessTrack` ops are no-ops here because
 /// `dispatch_and_wait` has already filled the per-track scratches.
 #[allow(clippy::too_many_arguments)]
-fn execute_schedule_post_dispatch(
+pub fn execute_schedule_post_dispatch(
     schedule: &mut Schedule,
     scratch: &mut [TrackScratch],
     master_l: &mut [f32],

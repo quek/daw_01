@@ -28,7 +28,10 @@ use anyhow::{Context, Result};
 use common::model::Song;
 use hound::{SampleFormat, WavSpec, WavWriter};
 
-use crate::engine::{EngineShared, MAX_TRACKS, process_track_owned, reduce_master};
+use crate::engine::{
+    EngineShared, MAX_TRACKS, execute_schedule_post_dispatch, process_track_owned,
+};
+use crate::graph::compile_schedule;
 use crate::mixer::TrackScratch;
 
 /// Hard ceiling on the rendered tail (10 s past `length_beats`). Stops
@@ -129,6 +132,14 @@ fn render_loop(
 
     let any_solo = song.tracks.iter().any(|t| t.solo);
 
+    // Compile the routing schedule once for the whole render — same
+    // structure as the live audio thread's `cached_schedule`. PDC
+    // compensation (`ApplyDelay`), group buses (`Mix → TrackScratch`)
+    // and SidechainTap all live in here; without using it the export
+    // would silently bypass PR3 PDC and mis-render group hierarchies.
+    let mut schedule = compile_schedule(song)
+        .map_err(|e| anyhow::anyhow!("export schedule compile failed: {e:?}"))?;
+
     let mut playhead: u64 = 0;
     while playhead < total_samples {
         let remaining = total_samples - playhead;
@@ -186,7 +197,26 @@ fn render_loop(
             }
         }
 
-        reduce_master(scratch, n_tracks, master_l, master_r, frames);
+        // Apply the routing schedule: ProcessTrack ops are no-ops here
+        // (already done by `dispatch_and_wait` / `process_track_owned`
+        // above). The remaining ops (`Mix` → master, `ApplyDelay` PDC,
+        // `ProcessGroupFx` group bus FX) are what differentiates this
+        // from a flat sum.
+        execute_schedule_post_dispatch(
+            &mut schedule,
+            &mut scratch[..MAX_TRACKS],
+            &mut master_l[..frames],
+            &mut master_r[..frames],
+            frames,
+            song,
+            &plugin_refs_g,
+            &slot_map_g,
+            worker_syncs_g.first(),
+            sample_rate,
+            frames as u32,
+            true,
+            any_solo,
+        );
 
         // Write interleaved stereo + track block peak for tail
         // detection.

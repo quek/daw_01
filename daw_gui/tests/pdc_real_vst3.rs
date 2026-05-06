@@ -1,0 +1,129 @@
+//! PDC integration test: 実 VST3 plugin (MeldaProduction MCenter) を
+//! load して、 track 間の位相揃いを WAV 出力で確認する。
+//!
+//! flow:
+//! 1. `tests/scripts/pdc_mcenter.js` を `daw_gui --script` で実行
+//! 2. JS が track A (no plugin) と track B (MCenter loaded) に同一の
+//!    impulse @sample 0 を注入
+//! 3. JS が `daw.exportWav` を呼んで master output を WAV に書き出し
+//! 4. ここで WAV を読み戻し、 master の peak 位置を検出
+//! 5. PDC が効いていれば L/R 両方が同位置に peak を持つ (=「音ずれ」 無し)
+//!
+//! MCenter 不在環境では SKIP (`return` で test pass)。
+
+use std::path::Path;
+
+const MCENTER_PATH: &str =
+    "C:/Program Files/Common Files/VST3/MeldaProduction/Stereo/MCenter.vst3";
+
+#[test]
+fn pdc_real_mcenter_aligns_master_output() {
+    // 1. MCenter 不在なら SKIP
+    if !Path::new(MCENTER_PATH).exists() {
+        eprintln!("SKIP: {MCENTER_PATH} not installed");
+        return;
+    }
+
+    // 2. tempfile に WAV を書き出す
+    let tmp = tempfile::Builder::new()
+        .suffix(".wav")
+        .tempfile()
+        .expect("create temp wav");
+    let out_path = tmp.path().to_path_buf();
+    drop(tmp); // close handle, leave path string
+
+    // 3. daw_gui --script で headless 実行
+    let exe = env!("CARGO_BIN_EXE_daw_gui");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("scripts")
+        .join("pdc_mcenter.js");
+    let status = std::process::Command::new(exe)
+        .args([
+            "--script",
+            script.to_str().unwrap(),
+            "--output",
+            out_path.to_str().unwrap(),
+        ])
+        .status()
+        .expect("spawn daw_gui");
+    assert!(
+        status.success(),
+        "daw_gui --script exited non-zero (status={status:?})"
+    );
+
+    // 4. WAV 読み戻し → 最大値の position を計算
+    let mut reader = hound::WavReader::open(&out_path).expect("open wav");
+    let spec = reader.spec();
+    assert_eq!(spec.channels, 2, "expected stereo WAV");
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read float samples"),
+        hound::SampleFormat::Int => {
+            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|s| s.map(|v| v as f32 / max))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read int samples")
+        }
+    };
+    assert!(samples.len() >= 4, "WAV too short");
+
+    let (l, r): (Vec<f32>, Vec<f32>) = samples
+        .chunks_exact(2)
+        .map(|c| (c[0], c[1]))
+        .unzip();
+
+    // 5. 仕組み (MCenter デフォルト latency = 4096 sample):
+    //    - Track A: declared latency 0、 vocal impulse @0、 plugin 無し
+    //    - Track B: declared latency 4096 (= MCenter 実値、 `setTrackLatency`)、
+    //      MCenter loaded (Fx slot 0)、 vocal impulse @0
+    //    PDC が効いていれば:
+    //      Track A の path latency (0) を Track B の path latency (4096)
+    //      に揃えるため、 Track A の scratch に `ApplyDelay(4096)` が刺さる
+    //      → Track A の impulse は sample 4096 で出る
+    //      Track B は MCenter で 4096 sample 遅延されて出る
+    //      master[4096] = Track A (0.7071) + Track B (0.7071) = **~1.4142**
+    //      master[0..4096] = ほぼ 0
+    //
+    //    PDC が無効なら:
+    //      Track A: sample 0 で 0.7071
+    //      Track B: sample 4096 で 0.7071 (MCenter 単独)
+    //      → 2 つの分離した peak、 master[0] = 0.7071、 master[4096] = 0.7071
+    //
+    //    判定: master[4096] が ~1.4142 (overlay 印) なら PDC 効いている。
+    //    PDC 無しなら master[4096] = 0.7071 にしかならず assertion で fail。
+    const MCENTER_LATENCY: usize = 4096;
+    let amp_4096 = l[MCENTER_LATENCY].abs();
+    eprintln!("L sample[0]: {}", l[0]);
+    eprintln!("L sample[{}]: {}", MCENTER_LATENCY, l[MCENTER_LATENCY]);
+    eprintln!("R sample[{}]: {}", MCENTER_LATENCY, r[MCENTER_LATENCY]);
+    let _ = r;
+
+    // PDC overlay: 両 track の impulse が sample 4096 で重なるので
+    // master の振幅は ~1.4142 (≈ 2 * 0.7071)。 1.2 以上を許容。
+    assert!(
+        amp_4096 > 1.2,
+        "expected PDC-overlaid peak at sample {} (~1.4142), got {:.4}; \
+         L[0]={:.4}, L[{}]={:.4}",
+        MCENTER_LATENCY,
+        amp_4096,
+        l[0],
+        MCENTER_LATENCY,
+        l[MCENTER_LATENCY],
+    );
+
+    // PDC が動いていない場合、 Track A は sample 0 に出る → master[0] が
+    // 0.5 以上。 PDC 効いていれば Track A は sample 4096 に移動して
+    // master[0] = 0 になる。
+    let amp_0 = l[0].abs();
+    assert!(
+        amp_0 < 0.1,
+        "sample 0 amplitude {:.4} too high; PDC apparently not delaying Track A",
+        amp_0,
+    );
+}
+

@@ -11,8 +11,10 @@
 //! 構築できる。
 
 pub mod app;
+pub mod bootstrap;
 pub mod dispatcher;
 pub mod job;
 pub mod midi;
+pub mod script;
 pub mod subprocess;
 pub mod view;

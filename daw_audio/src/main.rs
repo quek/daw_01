@@ -202,11 +202,34 @@ async fn recv_loop(
                 sample_rate: _,
                 samples,
             }) => {
-                let _ = cmd_tx.send(engine::AudioCommand::SetVocalAudio {
-                    track,
+                // Apply directly to `engine_shared.vocal_store` from the
+                // receive loop (instead of going through the audio thread's
+                // `cmd_rx`). During `ExportWav` the audio CPAL callback is
+                // silenced (`export_running == true`) and stops pumping
+                // its command queue, which would otherwise let
+                // `SetVocalAudio` arriving just before the export racy-
+                // miss the export thread's first `vocal_store.load()`.
+                // `ArcSwap.store` is wait-free thread-safe, so this stays
+                // RT-safe for the audio callback that's reading concurrently.
+                let new_audio = Arc::new(crate::vocal::VocalAudio {
                     clip_start_samples,
                     samples,
                 });
+                let cur = engine_shared.vocal_store.load();
+                if let Some(slot) = cur.get(&track) {
+                    slot.store(Some(new_audio));
+                } else {
+                    let mut new_map: std::collections::HashMap<
+                        u32,
+                        Arc<arc_swap::ArcSwapOption<crate::vocal::VocalAudio>>,
+                    > = (**cur).clone();
+                    new_map.insert(
+                        track,
+                        Arc::new(arc_swap::ArcSwapOption::from(Some(new_audio))),
+                    );
+                    engine_shared.vocal_store.store(Arc::new(new_map));
+                }
+                tracing::info!(track, "vocal audio updated (direct)");
             }
             // ExportWav: kick off the offline render on a dedicated
             // thread so the IPC receive loop stays responsive. The
