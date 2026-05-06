@@ -101,15 +101,11 @@ RT 処理順 (compile_schedule で生成される NodeOp の論理的順序):
 - 0 なら no-op + log
 
 ### 挿入位置
-**現状の実装は「`song.tracks` の末尾に append」 — 仕様乖離**。
+**「選択トラックのうち、index が最も小さいものの直前」** (= 一番上の選択 track の上、Live 互換)。
 
-理想は「選択トラックのうち、index が最も小さいものの直前」 (= 一番上の選択 track の上、Live 互換) だが、daw_plugin_host 側の `Tracks::chains: HashMap<track_idx, TrackChain>` が **track index ベース** で、daw_gui 側で `Vec::insert(idx, group)` するとプラグインホストの chains が同期されず子の plugin chain が無音になる (LoadSong は daw_audio のみが受信、daw_plugin_host は受信しない: `daw_plugin_host/src/main.rs` grep で 0 件)。
+PR2.1 で daw_plugin_host の `Tracks::chains` と daw_audio engine の `slot_to_plugin_id` を **`Track::id` ベース**に改修した結果、`Vec::insert(idx, group)` で既存 track の Vec position が shift しても plugin chain の lookup は壊れない。これにより視覚位置仕様を実現できた。
 
-修正経路の候補（別 PR で対応）:
-1. daw_plugin_host の `chains` を `HashMap<(track_id, slot), ...>` (track id ベース) に改修
-2. または `MainToChild::InsertTrack { at: u32, id: u32 }` 専用 IPC を新設して daw_plugin_host 側の chains を shift up
-
-PR2 は機能優先で末尾 append にとどめる。視覚位置は別 PR で追従する。
+副次効果として `MainToChild::SwapTracks` / `MainToChild::ReorderTracks` も削除済 (Vec position 操作は plugin host に通知不要)。`Tracks::shift_after_remove` / `swap_indices` / `reorder_indices` も不要になり削除。
 
 ### 共通親の引き継ぎ
 - 「全選択 track の `parent_group_id` が同一」のとき、新 group も同じ親を引き継ぐ
@@ -344,5 +340,5 @@ Mix { srcs: [..., scratch[group], ...], dst: Master }
 | 子 solo 時の group effective_mute 透過 (`has_soloed_descendant`) | ✅ |
 | group 選択時の Inspector ボタン表示分岐 撤回 (Reaper folder 流で group も全機能保持) | ✅ |
 | smoke test (group 化 → 子の音継続、 ungroup → 音継続、 ungroup フリーズ無し) | ✅ (2026-05-06 ユーザー検証 済) |
-| **group 化時の挿入位置「一番上の選択 track の直前」 → 末尾 append** | ⚠️ **別 PR** (§4 参照: daw_plugin_host を track id ベースに改修要) |
+| **group 化時の挿入位置「一番上の選択 track の直前」** | ✅ (PR2.1 で plugin_host を track_id ベースに改修して達成) |
 | Mixer strip の階層インデント | ⚠️ 別 PR (gui_01 widget 側拡張要 or 自前描画拡張) |

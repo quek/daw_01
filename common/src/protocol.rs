@@ -101,6 +101,16 @@ pub enum ChildToMain {
         track: u32,
         slot: PluginSlot,
     },
+    /// Plugin host destroyed a plugin instance (RemoveSlotPlugin /
+    /// RemoveTrack 経由)。 daw_gui はこれを受け取って
+    /// `MainToChild::ClosePluginShmem { plugin_id }` を daw_audio に
+    /// 転送し、 audio engine の `plugin_refs` / `slot_to_plugin_id`
+    /// から stale entry を消す。 これを送らないと audio thread が
+    /// destroy 済 plugin に process() を呼んで「VST3 plugin not
+    /// processing」 エラー / deadlock を起こす。
+    SlotPluginUnloaded {
+        plugin_id: u32,
+    },
 }
 
 /// Single entry in the `AllPluginStates` reply.
@@ -185,19 +195,11 @@ pub enum MainToChild {
         to: PluginSlot,
     },
     /// Drop the entire chain for `track` (every MIDI FX / Instrument / FX
-    /// slot), tearing down each plugin's GUI first. Sent when the user
-    /// removes a whole track so the audio thread stops rendering it.
+    /// slot), tearing down each plugin's GUI first. `track` is a stable
+    /// `Track::id` (since PR2.1 the plugin host's chain map is keyed by
+    /// id, not Vec position). Sent when the user removes a whole track
+    /// so the audio thread stops rendering it.
     RemoveTrack { track: u32 },
-    /// Reorder the chains map: swap the plugin chains / mixer params /
-    /// vocal audio between `a` and `b`. The audio thread sees the new
-    /// arrangement on the next buffer.
-    SwapTracks { a: u32, b: u32 },
-    /// Apply a multi-track reorder in **one** `tracks.mutate` call (i.e. one
-    /// audio-thread stop/start cycle). `order[i]` is the previous index of
-    /// the track that should end up at the new position `i`. Used by the
-    /// arrangement widget's drag-and-drop reorder so multiple `SwapTracks`
-    /// commands don't thrash the audio thread.
-    ReorderTracks(Vec<u32>),
     /// Ask the plugin_host to capture state for one slot. Reply is
     /// `ChildToMain::SlotPluginState`.
     RequestSlotState {

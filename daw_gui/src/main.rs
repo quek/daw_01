@@ -1,9 +1,3 @@
-mod app;
-mod job;
-mod midi;
-mod subprocess;
-mod view;
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,9 +17,10 @@ use winit::dpi::LogicalSize;
 use winit::event_loop::EventLoopProxy;
 use winit::window::WindowAttributes;
 
-use crate::app::{AppData, AppEvent};
-use crate::job::JobHandle;
-use crate::view::runner::{run as run_runner, RunnerInit};
+use daw_gui::app::{AppData, AppEvent};
+use daw_gui::dispatcher::{Win32JobDispatcher, WinitDispatcher};
+use daw_gui::job::JobHandle;
+use daw_gui::view::runner::{run as run_runner, RunnerInit};
 
 fn main() -> Result<()> {
     common::logging::init_tracing();
@@ -129,13 +124,18 @@ fn main() -> Result<()> {
 
             // AppData 本体を組み立てる。 job は AppData に持たせて lazy
             // VOICEVOX 起動 (begin_vocal_synth から) で使う。
+            // dispatcher は production 実装でラップ (test では別実装を注入)。
+            let event_dispatcher: Arc<dyn daw_gui::dispatcher::BackgroundDispatcher> =
+                Arc::new(WinitDispatcher::new(proxy.clone()));
+            let job_dispatcher: Arc<dyn daw_gui::dispatcher::JobDispatcher> =
+                Arc::new(Win32JobDispatcher::new(job_for_app));
             let app = AppData::new(
                 audio_tx,
                 plugin_tx,
                 None,
                 plugin_db_for_app,
-                proxy.clone(),
-                job_for_app,
+                event_dispatcher,
+                job_dispatcher,
             );
 
             // ----- 背景スレッド群 -----
@@ -220,9 +220,9 @@ async fn spawn_and_handshake(
         .create(&plugin_pipe)
         .with_context(|| format!("failed to create pipe {plugin_pipe}"))?;
 
-    let audio_child = subprocess::spawn_sibling("daw_audio", [&audio_pipe])?;
+    let audio_child = daw_gui::subprocess::spawn_sibling("daw_audio", [&audio_pipe])?;
     job.assign(&audio_child)?;
-    let plugin_child = subprocess::spawn_sibling("daw_plugin_host", [&plugin_pipe])?;
+    let plugin_child = daw_gui::subprocess::spawn_sibling("daw_plugin_host", [&plugin_pipe])?;
     job.assign(&plugin_child)?;
 
     let (audio_result, plugin_result) = tokio::try_join!(
@@ -404,11 +404,28 @@ fn spawn_incoming_bridge(
                         track,
                         slot,
                     });
-                    Some(AppEvent::SlotPluginLoadedFromChild { track, slot, id, name })
+                    Some(AppEvent::SlotPluginLoadedFromChild {
+                        track,
+                        slot,
+                        id,
+                        name,
+                        plugin_id,
+                    })
                 }
                 ChildToMain::SlotPluginState { .. } => None,
                 ChildToMain::AllPluginStates { entries } => {
                     Some(AppEvent::AllStatesReceived(entries))
+                }
+                ChildToMain::SlotPluginUnloaded { plugin_id } => {
+                    // PR2.1: plugin_host が plugin destroy を完了したので、
+                    // daw_audio engine の plugin_refs / slot_to_plugin_id
+                    // から stale entry を削除させる。 (delete_track /
+                    // ungroup では daw_gui が **先に直接** ClosePluginShmem
+                    // を送って use-after-free deadlock を防ぐので、 ここは
+                    // 通常の RemoveSlotPlugin 経由の cleanup 用。
+                    // 重複 ClosePluginShmem は idempotent なので問題なし。)
+                    let _ = audio_tx.send(MainToChild::ClosePluginShmem { plugin_id });
+                    Some(AppEvent::SlotPluginUnloadedFromChild { plugin_id })
                 }
                 ChildToMain::ExportWavComplete { error } => {
                     Some(AppEvent::ExportWavComplete { error })
@@ -428,7 +445,7 @@ fn spawn_incoming_bridge(
 fn spawn_midi_input(proxy: EventLoopProxy<AppEvent>) {
     let proxy_for_midi = proxy.clone();
     std::thread::spawn(move || {
-        match crate::midi::open_default_input(proxy_for_midi) {
+        match daw_gui::midi::open_default_input(proxy_for_midi) {
             Ok(Some(handle)) => {
                 let name = handle.port_name.clone();
                 Box::leak(Box::new(handle));

@@ -315,13 +315,48 @@ impl LocalState {
                 AudioCommand::ClosePluginShmem { plugin_id } => {
                     let mut new_refs: HashMap<u32, PluginRef> =
                         (**self.shared.plugin_refs.load()).clone();
-                    let mut new_slot: HashMap<(u32, PluginSlot), u32> =
-                        (**self.shared.slot_to_plugin_id.load()).clone();
-                    new_refs.remove(&plugin_id);
+                    let cur_slot = self.shared.slot_to_plugin_id.load();
+                    // Find the (track_id, slot) that pointed at this
+                    // plugin_id BEFORE we remove the entry, so we can
+                    // shift remaining same-kind slots in the same
+                    // track downwards (mirrors the Vec::remove that
+                    // daw_gui / daw_plugin_host did on their fx_chain
+                    // / midi_fx_chain). Without this shift, removing
+                    // Fx(0) leaves Fx(1) stranded under its old key,
+                    // and `process_track_owned` looks up Fx(0) → no
+                    // hit → silent (group fx dropped on deletion).
+                    let removed_key = cur_slot
+                        .iter()
+                        .find_map(|(k, v)| if *v == plugin_id { Some(*k) } else { None });
+                    let mut new_slot: HashMap<(u32, PluginSlot), u32> = (**cur_slot).clone();
                     new_slot.retain(|_, pid| *pid != plugin_id);
+                    if let Some((track_id, removed_slot)) = removed_key {
+                        let entries: Vec<((u32, PluginSlot), u32)> = new_slot.drain().collect();
+                        for ((tid, slot), pid) in entries {
+                            let new_slot_kind = if tid == track_id {
+                                match (removed_slot, slot) {
+                                    (PluginSlot::Fx(removed_i), PluginSlot::Fx(i))
+                                        if i > removed_i =>
+                                    {
+                                        PluginSlot::Fx(i - 1)
+                                    }
+                                    (PluginSlot::MidiFx(removed_i), PluginSlot::MidiFx(i))
+                                        if i > removed_i =>
+                                    {
+                                        PluginSlot::MidiFx(i - 1)
+                                    }
+                                    (_, other) => other,
+                                }
+                            } else {
+                                slot
+                            };
+                            new_slot.insert((tid, new_slot_kind), pid);
+                        }
+                    }
+                    new_refs.remove(&plugin_id);
                     self.shared.plugin_refs.store(Arc::new(new_refs));
                     self.shared.slot_to_plugin_id.store(Arc::new(new_slot));
-                    tracing::info!(plugin_id, "plugin shmem dropped");
+                    tracing::info!(plugin_id, "plugin shmem dropped + slot shifted");
                 }
                 AudioCommand::SetVocalAudio {
                     track,
@@ -651,9 +686,13 @@ pub fn process_track_owned(
         );
     }
 
+    let track_id = song_track.id;
     // ---- MIDI FX chain ----
     for i in 0..song_track.midi_fx_chain.len() {
-        let key = (track_idx, PluginSlot::MidiFx(i as u32));
+        // PR2.1: chains map の key は (track_id, slot)。 song.tracks の
+        // Vec position に依存しないので、 group 化や drag&drop reorder
+        // で index が shift しても plugin lookup が壊れない。
+        let key = (track_id, PluginSlot::MidiFx(i as u32));
         let Some(&plugin_id) = slot_to_plugin_id.get(&key) else {
             continue;
         };
@@ -733,7 +772,7 @@ pub fn process_track_owned(
 
     // ---- Instrument ----
     if song_track.instrument.is_some() {
-        let key = (track_idx, PluginSlot::Instrument);
+        let key = (track_id, PluginSlot::Instrument);
         if let Some(&plugin_id) = slot_to_plugin_id.get(&key)
             && let Some(plugin_ref) = plugin_refs.get(&plugin_id)
             && let Some(ws) = worker_sync
@@ -762,7 +801,7 @@ pub fn process_track_owned(
 
     // ---- Audio FX chain ----
     for i in 0..song_track.fx_chain.len() {
-        let key = (track_idx, PluginSlot::Fx(i as u32));
+        let key = (track_id, PluginSlot::Fx(i as u32));
         let Some(&plugin_id) = slot_to_plugin_id.get(&key) else {
             continue;
         };
@@ -907,7 +946,6 @@ fn execute_schedule_post_dispatch(
                     continue;
                 };
                 run_group_fx_chain(
-                    *track_idx,
                     track,
                     song,
                     target,
@@ -1035,7 +1073,6 @@ fn has_soloed_descendant(song: &Song, track_id: u32) -> bool {
 /// have no clips of their own.
 #[allow(clippy::too_many_arguments)]
 fn run_group_fx_chain(
-    track_idx: u32,
     song_track: &Track,
     song: &Song,
     scratch: &mut TrackScratch,
@@ -1048,9 +1085,12 @@ fn run_group_fx_chain(
     any_solo: bool,
 ) {
     let n = frames as usize;
+    let track_id = song_track.id;
 
     for i in 0..song_track.fx_chain.len() {
-        let key = (track_idx, PluginSlot::Fx(i as u32));
+        // PR2.1: id ベースの key で lookup (plugin chain は track_id
+        // で識別、 song.tracks の Vec position に依存しない)。
+        let key = (track_id, PluginSlot::Fx(i as u32));
         let Some(&plugin_id) = slot_to_plugin_id.get(&key) else {
             continue;
         };

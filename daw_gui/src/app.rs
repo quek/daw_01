@@ -23,7 +23,20 @@ use common::plugin_db::PluginDatabase;
 use common::plugin_format::PluginFormat;
 use common::protocol::{MainToChild, PluginSlot, SlotState};
 use tokio::sync::mpsc::UnboundedSender;
-use winit::event_loop::EventLoopProxy;
+
+use crate::dispatcher::{BackgroundDispatcher, JobDispatcher};
+
+/// `plan_track_removal_ipc` の出力。 順序が deadlock 防止に必須なので
+/// テスト可能な enum で表現する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackRemovalIpc {
+    /// daw_audio engine に `MainToChild::ClosePluginShmem { plugin_id }`
+    /// を送る (use-after-free deadlock 防止のため RemoveTrack より先)。
+    CloseAudioShmem { plugin_id: u32 },
+    /// daw_plugin_host に `MainToChild::RemoveTrack { track }` を送る
+    /// (plugin chain の proper teardown)。
+    RemoveTrackFromPluginHost { track_id: u32 },
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackMixEntry {
@@ -123,6 +136,15 @@ pub struct AppData {
     /// 折り畳み中の group track id 集合。 group 自身が `kind == Group`
     /// (= 子を持つ) かつこの set に含まれていれば子孫の row を hide。
     pub collapsed_groups: std::collections::HashSet<u32>,
+    /// `track_id → 現在ロード済の plugin_id 列`。 plugin_host から
+    /// `SlotPluginLoaded` を受信したときに register、 `SlotPluginUnloaded`
+    /// で drain。 `RemoveTrack` を plugin_host に送る前に audio engine
+    /// に直接 `ClosePluginShmem` を発射して plugin_refs / slot_to_plugin_id
+    /// を空にし、 plugin destroy 中の use-after-free (`pd.prepare()` で
+    /// unmapped shmem を踏む → audio worker が AV で silent terminate
+    /// → all_done 永久 wait) を防ぐ。 daw_gui が plugin_id を保持する
+    /// ための単一 source of truth。
+    pub track_plugin_ids: std::collections::HashMap<u32, Vec<u32>>,
     pub selected_clip: Option<ClipRef>,
     pub selected_clips: Vec<ClipRef>,
     pub selected_notes: Vec<u32>,
@@ -208,10 +230,11 @@ pub struct AppData {
     /// 押下時に各 clip の content_hash + singer_id を key に lookup → hit なら
     /// HTTP call をスキップ。 永続化は将来 Phase。
     pub voicevox_cache: Arc<Mutex<common::voicevox_cache::VoiceVoxCache>>,
-    /// VOICEVOX engine の auto-kill 用 Job。 daw_gui 起動時に作る Job と
-    /// 同じものを共有 (Vocal 関連操作で初めて engine を spawn するときに
-    /// 紐付け)。
-    pub voicevox_job: Arc<crate::job::JobHandle>,
+    /// VOICEVOX engine の auto-kill 用 Job dispatcher。
+    /// production は `Win32JobDispatcher` (`JobHandle::assign_std` ラップ)、
+    /// test は `NoopJobDispatcher`。 trait DI により AppData::new の
+    /// 引数は OS-API 抽象だけで完結する。
+    pub voicevox_job: Arc<dyn JobDispatcher>,
     /// VOICEVOX engine 起動を 1 度だけ trigger するためのフラグ。 lazy 起動:
     /// 起動時 auto-launch せず、 Vocal track 選択 / Synth ボタン押下等で初めて
     /// `ensure_voicevox_engine()` が `true` にして background spawn する。
@@ -254,8 +277,10 @@ pub struct AppData {
     pub step_size_beats: f64,
 
     /// 背景スレッド (autosave / playhead poll / MIDI / IPC bridge / VOICEVOX
-    /// 合成 / plugin DB rescan) からメインスレッドへ AppEvent を送るためのプロキシ。
-    pub event_proxy: EventLoopProxy<AppEvent>,
+    /// 合成 / plugin DB rescan) からメインスレッドへ `AppEvent` を送るための
+    /// dispatcher。 production は `WinitDispatcher` (winit `EventLoopProxy`
+    /// ラップ)、 test は `RecordingDispatcher` (Mutex<Vec> に蓄積)。
+    pub event_proxy: Arc<dyn BackgroundDispatcher>,
 }
 
 impl AppData {
@@ -265,8 +290,8 @@ impl AppData {
         // 将来的な auto-select 用に予約。現在は song に反映していない。
         _clap_plugin_path: Option<PathBuf>,
         plugin_db: Option<Arc<PluginDatabase>>,
-        event_proxy: EventLoopProxy<AppEvent>,
-        voicevox_job: Arc<crate::job::JobHandle>,
+        event_proxy: Arc<dyn BackgroundDispatcher>,
+        voicevox_job: Arc<dyn JobDispatcher>,
     ) -> Self {
         let song = Song {
             tracks: vec![Track {
@@ -314,6 +339,7 @@ impl AppData {
             file_path: None,
             selected_track_ids: Vec::new(),
             collapsed_groups: std::collections::HashSet::new(),
+            track_plugin_ids: std::collections::HashMap::new(),
             selected_clip: None,
             selected_clips: Vec::new(),
             selected_notes: Vec::new(),
@@ -902,7 +928,23 @@ pub enum AppEvent {
     GuiOpenedFromChild { track: u32, slot: PluginSlot, width: u32, height: u32 },
     GuiRequestResizeFromChild { track: u32, slot: PluginSlot, width: u32, height: u32 },
     GuiClosedFromChild { track: u32, slot: PluginSlot },
-    SlotPluginLoadedFromChild { track: u32, slot: PluginSlot, id: String, name: String },
+    SlotPluginLoadedFromChild {
+        track: u32,
+        slot: PluginSlot,
+        id: String,
+        name: String,
+        /// plugin_host が割り振った session-unique な plugin instance id。
+        /// daw_gui 側は `track_plugin_ids` に登録して、 後続の delete /
+        /// ungroup で先に ClosePluginShmem を audio に直接送るのに使う。
+        plugin_id: u32,
+    },
+    /// plugin_host が plugin destroy したことの通知。 `track_plugin_ids`
+    /// から該当 plugin_id を取り除き、 もし audio engine 側で未削除
+    /// (= daw_gui が直接 ClosePluginShmem を先送りしていない経路で
+    /// 来た場合) なら ClosePluginShmem を audio に転送する。
+    SlotPluginUnloadedFromChild {
+        plugin_id: u32,
+    },
     AllStatesReceived(Vec<SlotState>),
     RescanPluginDb,
     PluginDbRescanCompleted,
@@ -1223,8 +1265,11 @@ impl AppData {
             AppEvent::GuiClosedFromChild { track, slot } => {
                 self.on_gui_closed(track, slot);
             }
-            AppEvent::SlotPluginLoadedFromChild { track, slot, id, name } => {
-                self.on_plugin_loaded_from_child(track, slot, id, name);
+            AppEvent::SlotPluginLoadedFromChild { track, slot, id, name, plugin_id } => {
+                self.on_plugin_loaded_from_child(track, slot, id, name, plugin_id);
+            }
+            AppEvent::SlotPluginUnloadedFromChild { plugin_id } => {
+                self.on_plugin_unloaded_from_child(plugin_id);
             }
             AppEvent::AllStatesReceived(entries) => {
                 self.on_all_states_from_child(entries);
@@ -1581,9 +1626,11 @@ impl AppData {
             tracing::warn!("plugin database not loaded; cannot resolve plugin ids");
             return;
         };
+        // PR2.1: send `Track::id` (not Vec position) so the plugin host
+        // keys its chains by id from the start.
         let mut to_send: Vec<(u32, PluginSlot, common::model::PluginInstance)> = Vec::new();
-        for (track_idx, track) in song.tracks.iter().enumerate() {
-            let t = track_idx as u32;
+        for track in song.tracks.iter() {
+            let t = track.id;
             for (i, p) in track.midi_fx_chain.iter().enumerate() {
                 to_send.push((t, PluginSlot::MidiFx(i as u32), p.clone()));
             }
@@ -1775,13 +1822,39 @@ impl AppData {
         subtree_idxs.sort_unstable();
         subtree_idxs.dedup();
 
+        // PR2.1 race-fix: 順序を「song update → LoadSong → plugin
+        // destroy → RemoveTrack」 に固定する。 song update を先に送ら
+        // ないと、 audio thread が古い schedule (削除対象 track の
+        // ProcessTrack / ProcessGroupFx を含む) で destroyed plugin に
+        // dispatch して deadlock する。
+        // (a) snapshot を取って順次 song.tracks.remove
+        let mut snapshots: Vec<(u32, common::model::Track)> =
+            Vec::with_capacity(subtree_idxs.len());
         for &i in subtree_idxs.iter().rev() {
+            let removed_id = self.song.tracks[i as usize].id;
+            let snapshot = self.song.tracks[i as usize].clone();
             #[cfg(windows)]
             {
-                self.plugin_host_windows.retain(|&(t, _), _| t != i);
+                self.plugin_host_windows.retain(|&(t, _), _| t != removed_id);
             }
             self.song.tracks.remove(i as usize);
-            self.send_plugin(MainToChild::RemoveTrack { track: i });
+            snapshots.push((removed_id, snapshot));
+        }
+        // (b) LoadSong で audio engine を新 schedule に
+        self.sync_song_to_plugin_host();
+        // (c) **重要 (deadlock 防止)**: RemoveTrack 送信前に daw_audio
+        // に直接 ClosePluginShmem を送って plugin_refs から stale entry
+        // を消す。 plugin_host の `plugin_shmems.remove` で shmem を
+        // unmap した直後、 audio worker が `pd.prepare()` で unmapped
+        // memory を読み AV → silent terminate → all_done 永久 wait
+        // を防ぐため。
+        for (removed_id, _snapshot) in snapshots {
+            if let Some(pids) = self.track_plugin_ids.remove(&removed_id) {
+                for pid in pids {
+                    self.send_audio(MainToChild::ClosePluginShmem { plugin_id: pid });
+                }
+            }
+            self.send_plugin(MainToChild::RemoveTrack { track: removed_id });
         }
 
         // selected_clip: if its track was deleted, clear; otherwise
@@ -1859,7 +1932,8 @@ impl AppData {
         }
         self.push_undo_snapshot();
         self.song.tracks.swap(a as usize, b as usize);
-        self.send_plugin(MainToChild::SwapTracks { a, b });
+        // PR2.1: plugin_host の chains は `Track::id` ベースなので、
+        // Vec position swap は通知不要。 SwapTracks IPC は削除済。
         if let Some(r) = self.selected_clip {
             self.selected_clip = Some(ClipRef {
                 track: if r.track == a {
@@ -1951,12 +2025,11 @@ impl AppData {
         self.selected_clips = new_clips.clone();
         self.selected_clip = new_clips.first().copied();
 
-        // chains / params / vocal を 1 回の `tracks.mutate` で並び替え (ReorderTracks)。
-        // 続けて `LoadSong` で `song_store` も新順序に同期 (LoadSong は params 更新と
-        // song の atomic swap だけなので audio thread を止めない)。両方送らないと
-        // chains は新順序、song_store は旧順序のまま → clip が違う track の chain で
-        // 再生されて「クリップが入れかわる」現象が出る。
-        self.send_plugin(MainToChild::ReorderTracks(index_order));
+        // PR2.1: plugin_host の chains は `Track::id` ベースなので、
+        // Vec position の reorder は通知不要。 ReorderTracks IPC は
+        // 削除済。 LoadSong (sync_song_to_plugin_host) で song_store
+        // のみ新順序に同期する。
+        let _ = index_order;
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
     }
@@ -2123,23 +2196,47 @@ impl AppData {
                 t.parent_group_id = Some(group_id);
             }
         }
-        // 新 group track を **末尾に append** する。 Vec::insert で
-        // 既存 track の index を shift させると plugin host 側の
-        // `slot_to_plugin_id: HashMap<(track_idx, slot), plugin_id>`
-        // が壊れて子の plugin chain が見失われ無音になる。 LoadSong
-        // も `(track_idx, slot)` キーを再マッピングしないので追従
-        // しない。 視覚位置は仕様 §4 で「一番上の選択の直前」 とした
-        // が、 plugin host を `(track_id, slot)` ベースに改修するまで
-        // は実現できない (別 PR で対応)。 末尾 append の間も子の
-        // plugin chain は (track_idx, slot) 不変なので無音にならない。
-        let _ = top_child_idx;
-        self.song.tracks.push(group_track);
+        // 仕様 §4: 「一番上の選択 track の直前」 に挿入 (= 子の上に
+        // ヘッダー)。 PR2.1 で plugin_host の chains を `Track::id`
+        // ベースに改修した結果、 Vec::insert で既存 track の Vec
+        // position が shift しても plugin chain の lookup は壊れない
+        // (engine の `slot_to_plugin_id` も (track_id, slot) ベース)。
+        let insert_at = top_child_idx.min(self.song.tracks.len());
+        self.song.tracks.insert(insert_at, group_track);
         // 新規 group track を選択状態に (Live 互換: グループ化直後は
         // 親 group が selection cursor になる)。
         self.selected_track_ids = vec![group_id];
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
         tracing::info!(group_id, ?child_ids, "grouped tracks");
+    }
+
+    /// `action_ungroup_tracks` / `delete_track` で送る IPC 列を組み立てる
+    /// pure function。 順序が必須仕様 (deadlock 防止) なので、 ロジックを
+    /// ここに集約して unit test で検証する:
+    ///
+    /// 1. `audio: ClosePluginShmem(plugin_id)` × N — 削除対象 track が
+    ///    持っていた全 plugin について先に audio engine に送る。 これに
+    ///    より plugin_refs / slot_to_plugin_id から stale entry が消え、
+    ///    audio worker が destroyed plugin に dispatch する race を断つ。
+    /// 2. `plugin_host: RemoveTrack(track_id)` — plugin_host が chain
+    ///    の Box<Plugin> を properly tear down (stop_processing →
+    ///    deactivate → gui_destroy → drop) して、 shmem mapping を
+    ///    unmap する。 (1) で audio 側はもう触らないので安全。
+    pub fn plan_track_removal_ipc(
+        track_ids: &[u32],
+        track_plugin_ids: &std::collections::HashMap<u32, Vec<u32>>,
+    ) -> Vec<TrackRemovalIpc> {
+        let mut plan = Vec::new();
+        for track_id in track_ids {
+            if let Some(pids) = track_plugin_ids.get(track_id) {
+                for pid in pids {
+                    plan.push(TrackRemovalIpc::CloseAudioShmem { plugin_id: *pid });
+                }
+            }
+            plan.push(TrackRemovalIpc::RemoveTrackFromPluginHost { track_id: *track_id });
+        }
+        plan
     }
 
     /// Alt+G: 選択中の group track の subtree を 1 階層持ち上げる。
@@ -2175,36 +2272,63 @@ impl AppData {
             (-(depth as i32), -(self.song.track_index_by_id(*id).unwrap_or(0) as i32))
         });
 
+        // 各 group の plugin chain snapshot を **削除前に** 取得して
+        // おく (後の plugin destroy 用)。 song.tracks から group を
+        // remove した後では取得できない。
+        let group_snapshots: Vec<(u32, common::model::Track)> = groups_to_ungroup
+            .iter()
+            .filter_map(|gid| self.song.track_by_id(*gid).map(|t| (*gid, t.clone())))
+            .collect();
+
         let mut new_selection: Vec<u32> = Vec::new();
         for group_id in &groups_to_ungroup {
             let Some(group_track) = self.song.track_by_id(*group_id) else {
                 continue;
             };
             let new_parent = group_track.parent_group_id;
-            // 子の parent_group_id を group の親に書き換え
             for t in &mut self.song.tracks {
                 if t.parent_group_id == Some(*group_id) {
                     t.parent_group_id = new_parent;
                     new_selection.push(t.id);
                 }
             }
-            // group track 自体を削除 + plugin host 側の slot 状態を同期。
-            // RemoveTrack IPC を送らないと、 plugin host の
-            // `slot_to_plugin_id: HashMap<(track_idx, slot), plugin_id>`
-            // で **後続 track の index が shift されず**、 ungroup 後の
-            // 子 track が正しい plugin chain を見つけられず無音になる。
-            // delete_track と同じパターンで RemoveTrack を送る。
             if let Some(pos) = self.song.tracks.iter().position(|t| t.id == *group_id) {
-                let idx = pos as u32;
                 #[cfg(windows)]
                 {
-                    self.plugin_host_windows.retain(|&(t, _), _| t != idx);
+                    self.plugin_host_windows
+                        .retain(|&(t, _), _| t != *group_id);
                 }
                 self.song.tracks.remove(pos);
-                self.send_plugin(MainToChild::RemoveTrack { track: idx });
             }
-            // collapsed_groups からも消えた group id を除外
             self.collapsed_groups.remove(group_id);
+        }
+
+        // **song update + LoadSong を先に送る** → daw_audio engine が
+        // 新 schedule (group が消えた状態) を即適用。 audio thread が
+        // 古い schedule の ProcessGroupFx で destroyed plugin にアクセス
+        // する race を回避する。
+        self.sync_song_to_plugin_host();
+
+        // **重要 (deadlock 防止)**: plugin_host が `tracks.mutate` で
+        // chain の Box<Plugin> を drop すると `plugin_shmems.remove(&pid)`
+        // で `ProcessDataHandle` も drop され、 OS が shmem mapping を
+        // unmap する。 audio worker thread がその直後に `pd.prepare()`
+        // で unmapped memory を読むと **access violation で worker が
+        // silently terminate** し、 master の `WaitForSingleObject(all_done,
+        // INFINITE)` が永久 wait → 18 秒 audio thread 完全停止。
+        //
+        // 対策: RemoveTrack を plugin_host に送る **前に** daw_audio に
+        // 直接 ClosePluginShmem を送って `plugin_refs` / `slot_to_plugin_id`
+        // から stale entry を削除させ、 audio worker が destroyed plugin
+        // を dispatch しないようにする。
+        let _ = group_snapshots;
+        for group_id in &groups_to_ungroup {
+            if let Some(pids) = self.track_plugin_ids.remove(group_id) {
+                for pid in pids {
+                    self.send_audio(MainToChild::ClosePluginShmem { plugin_id: pid });
+                }
+            }
+            self.send_plugin(MainToChild::RemoveTrack { track: *group_id });
         }
         // selection: ungroup 後は元 group の子を選択 (Live 互換)。
         if !new_selection.is_empty() {
@@ -2265,21 +2389,23 @@ impl AppData {
         if len == 0 {
             return;
         }
-        let removed_idx = (len - 1) as u32;
-        let removed_name = self.song.tracks.pop().map(|t| t.name);
-        if let Some(name) = removed_name {
-            tracing::info!(
-                index = removed_idx,
-                name = %name,
-                "removed last track"
-            );
-        }
+        // PR2.1: pop() の前に id を保存し、 IPC は id で送る。
+        let Some(removed) = self.song.tracks.pop() else {
+            return;
+        };
+        let removed_id = removed.id;
+        tracing::info!(
+            index = (len - 1) as u32,
+            id = removed_id,
+            name = %removed.name,
+            "removed last track"
+        );
         #[cfg(windows)]
         {
             self.plugin_host_windows
-                .retain(|&(t, _), _| t != removed_idx);
+                .retain(|&(t, _), _| t != removed_id);
         }
-        self.send_plugin(MainToChild::RemoveTrack { track: removed_idx });
+        self.send_plugin(MainToChild::RemoveTrack { track: removed_id });
         // selected_track_ids は id ベース。 削除対象 track id を除外
         // (Vec の index で持つ subtree とは異なり id 直接判定)。 残りが
         // 空なら最後尾にフォールバック。
@@ -2292,6 +2418,9 @@ impl AppData {
             self.selected_track_ids.push(t.id);
         }
         self.collapsed_groups.retain(|id| live_ids.contains(id));
+        // `selected_clips` / `selected_clip` は ClipRef.track を Vec
+        // index で持つ仕様。 末尾削除なので index = pop した位置 (= 旧 len-1)。
+        let removed_idx = len as u32 - 1;
         self.selected_clips.retain(|c| c.track != removed_idx);
         if let Some(r) = self.selected_clip
             && r.track == removed_idx
@@ -2758,14 +2887,23 @@ impl AppData {
 
     fn on_plugin_loaded_from_child(
         &mut self,
-        track: u32,
+        track_id: u32,
         slot: PluginSlot,
         id: String,
         _name: String,
+        plugin_id: u32,
     ) {
-        let track_idx = track as usize;
+        // PR2.1: ChildToMain `track` is now a `Track::id`. Resolve to
+        // a Vec position only for the local `song.tracks` mutation;
+        // the plugin host stores chains by id directly.
+        // plugin_id を track_plugin_ids に登録 (delete / ungroup 時の
+        // ClosePluginShmem 先送りに使用、 use-after-free deadlock 防止)。
+        let entry = self.track_plugin_ids.entry(track_id).or_default();
+        if !entry.contains(&plugin_id) {
+            entry.push(plugin_id);
+        }
         self.ensure_first_track();
-        let Some(t) = self.song.tracks.get_mut(track_idx) else {
+        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
             return;
         };
         match slot {
@@ -2821,7 +2959,7 @@ impl AppData {
 
         // A7: this load is done. If Play was queued waiting for the
         // last plugin to register on the audio side, fire it now.
-        self.pending_plugin_loads.remove(&(track, slot));
+        self.pending_plugin_loads.remove(&(track_id, slot));
         if self.pending_plugin_loads.is_empty() && self.pending_play {
             self.pending_play = false;
             self.status_message.clear();
@@ -2834,23 +2972,39 @@ impl AppData {
         }
     }
 
+    /// plugin_host が plugin destroy を完了した通知を受けて、
+    /// `track_plugin_ids` から該当 plugin_id を取り除く。 audio engine
+    /// 側の `ClosePluginShmem` は daw_gui main.rs (`ChildToMain::
+    /// SlotPluginUnloaded` ハンドラ) で先に転送済なので、 ここでは
+    /// daw_gui ローカル状態のクリーンアップのみ。
+    fn on_plugin_unloaded_from_child(&mut self, plugin_id: u32) {
+        for entry in self.track_plugin_ids.values_mut() {
+            entry.retain(|p| *p != plugin_id);
+        }
+        self.track_plugin_ids.retain(|_, v| !v.is_empty());
+    }
+
     fn toggle_slot_gui(&mut self, slot_kind: u8, slot_index: u32) {
         let slot = match slot_kind {
             0 => PluginSlot::MidiFx(slot_index),
             1 => PluginSlot::Instrument,
             _ => PluginSlot::Fx(slot_index),
         };
-        let track = self.cursor_track_index().unwrap_or(0) as u32;
+        // PR2.1: plugin_host_windows / IPC は track_id ベース。
+        let Some(track_idx) = self.cursor_track_index() else {
+            return;
+        };
+        let track_id = self.song.tracks[track_idx].id;
         #[cfg(windows)]
         {
-            if self.plugin_host_windows.contains_key(&(track, slot)) {
-                self.send_plugin(MainToChild::CloseSlotGui { track, slot });
+            if self.plugin_host_windows.contains_key(&(track_id, slot)) {
+                self.send_plugin(MainToChild::CloseSlotGui { track: track_id, slot });
                 return;
             }
             let label = self
                 .song
                 .tracks
-                .get(track as usize)
+                .get(track_idx)
                 .and_then(|t| self.slot_ref_name(t, slot))
                 .unwrap_or_else(|| "(unknown)".into());
             match crate::view::plugin_embed::PluginHostWindow::create(
@@ -2860,9 +3014,9 @@ impl AppData {
             ) {
                 Ok(win) => {
                     let hwnd = win.hwnd_u64();
-                    self.plugin_host_windows.insert((track, slot), win);
+                    self.plugin_host_windows.insert((track_id, slot), win);
                     self.send_plugin(MainToChild::OpenSlotGuiEmbedded {
-                        track,
+                        track: track_id,
                         slot,
                         host_hwnd: hwnd,
                     });
@@ -2872,7 +3026,7 @@ impl AppData {
         }
         #[cfg(not(windows))]
         {
-            let _ = (track, slot, slot_kind, slot_index);
+            let _ = (track_id, slot, slot_kind, slot_index);
         }
     }
 
@@ -2946,12 +3100,23 @@ impl AppData {
             1 => PluginSlot::Instrument,
             _ => PluginSlot::Fx(slot_index),
         };
-        let track_idx = self.cursor_track_index().unwrap_or(0) as u32;
+        let Some(track_idx) = self.cursor_track_index() else {
+            return;
+        };
+        // PR2.1: send `Track::id` to the plugin host.
+        let track_id = self.song.tracks[track_idx].id;
         self.send_plugin(MainToChild::RemoveSlotPlugin {
-            track: track_idx,
+            track: track_id,
             slot,
         });
-        if let Some(track) = self.song.tracks.get_mut(track_idx as usize) {
+        // **GUI lifecycle**: plugin_host が plugin を destroy しても、
+        // daw_gui 側の host HWND (`plugin_host_windows` の値) は自動で
+        // 閉じない。 ここで drop することで `PluginHostWindow::Drop` が
+        // `DestroyWindow` を呼んで容器ウィンドウを閉じる。 さらに
+        // `Fx(slot_index)` を削除すると `Fx(slot_index+1..)` は 1 段
+        // shift するので、 残った GUI window の key も再 mapping する。
+        self.cleanup_slot_gui(track_id, slot);
+        if let Some(track) = self.song.tracks.get_mut(track_idx) {
             match slot {
                 PluginSlot::Instrument => track.instrument = None,
                 PluginSlot::Fx(i) => {
@@ -2966,6 +3131,60 @@ impl AppData {
                         track.midi_fx_chain.remove(i);
                     }
                 }
+            }
+        }
+    }
+
+    /// `(track_id, slot)` の host window を破棄し、 同 track の
+    /// 後続 Fx / MidiFx の key を 1 つずつ前にずらす (Vec::remove 後の
+    /// chain index と整合させるため)。 Instrument は単一スロットなので
+    /// shift 不要。 Windows 専用 (Linux では `plugin_host_windows` 自体
+    /// を持たない)。
+    #[cfg(windows)]
+    fn cleanup_slot_gui(&mut self, track_id: u32, slot: PluginSlot) {
+        // 対象スロットの host window を drop (= DestroyWindow)。
+        self.plugin_host_windows.remove(&(track_id, slot));
+        match slot {
+            PluginSlot::Instrument => {}
+            PluginSlot::Fx(removed_idx) => {
+                self.shift_slot_gui_keys(track_id, removed_idx, true);
+            }
+            PluginSlot::MidiFx(removed_idx) => {
+                self.shift_slot_gui_keys(track_id, removed_idx, false);
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn cleanup_slot_gui(&mut self, _track_id: u32, _slot: PluginSlot) {}
+
+    /// Fx (`is_fx == true`) または MidiFx の index >= `removed_idx + 1`
+    /// なエントリを 1 つずつ前にずらす。
+    #[cfg(windows)]
+    fn shift_slot_gui_keys(&mut self, track_id: u32, removed_idx: u32, is_fx: bool) {
+        let mut moves: Vec<(PluginSlot, PluginSlot)> = Vec::new();
+        for &(t, slot) in self.plugin_host_windows.keys() {
+            if t != track_id {
+                continue;
+            }
+            match (is_fx, slot) {
+                (true, PluginSlot::Fx(i)) if i > removed_idx => {
+                    moves.push((PluginSlot::Fx(i), PluginSlot::Fx(i - 1)));
+                }
+                (false, PluginSlot::MidiFx(i)) if i > removed_idx => {
+                    moves.push((PluginSlot::MidiFx(i), PluginSlot::MidiFx(i - 1)));
+                }
+                _ => {}
+            }
+        }
+        // 前方から順に move (低 index 側を先に詰める)。
+        moves.sort_by_key(|(from, _)| match from {
+            PluginSlot::Fx(i) | PluginSlot::MidiFx(i) => *i,
+            PluginSlot::Instrument => 0,
+        });
+        for (from, to) in moves {
+            if let Some(win) = self.plugin_host_windows.remove(&(track_id, from)) {
+                self.plugin_host_windows.insert((track_id, to), win);
             }
         }
     }
@@ -3084,39 +3303,34 @@ impl AppData {
         let entry_id = entry.id.clone();
         let entry_format = entry.format;
         self.ensure_first_track();
-        let track_idx = self.cursor_track_index().unwrap_or(0) as u32;
+        let Some(track_idx) = self.cursor_track_index() else {
+            return;
+        };
+        // PR2.1: send `Track::id` to the plugin host (track_idx は
+        // ローカルの song.tracks 操作のみで使う)。
+        let track_id = self.song.tracks[track_idx].id;
         let target = self.plugin_picker_target;
         let dest_slot = match target {
             PickerTarget::Instrument => PluginSlot::Instrument,
             PickerTarget::Fx => {
-                let next = self
-                    .song
-                    .tracks
-                    .get(track_idx as usize)
-                    .map(|t| t.fx_chain.len() as u32)
-                    .unwrap_or(0);
+                let next = self.song.tracks[track_idx].fx_chain.len() as u32;
                 PluginSlot::Fx(next)
             }
             PickerTarget::MidiFx => {
-                let next = self
-                    .song
-                    .tracks
-                    .get(track_idx as usize)
-                    .map(|t| t.midi_fx_chain.len() as u32)
-                    .unwrap_or(0);
+                let next = self.song.tracks[track_idx].midi_fx_chain.len() as u32;
                 PluginSlot::MidiFx(next)
             }
         };
-        self.track_pending_load(track_idx, dest_slot);
+        self.track_pending_load(track_id, dest_slot);
         self.send_plugin(MainToChild::SetSlotPlugin {
-            track: track_idx,
+            track: track_id,
             slot: dest_slot,
             format: entry_format,
             path,
             plugin_id: entry_id.clone(),
             initial_state: None,
         });
-        if let Some(track) = self.song.tracks.get_mut(track_idx as usize) {
+        if let Some(track) = self.song.tracks.get_mut(track_idx) {
             match dest_slot {
                 PluginSlot::Instrument => {
                     track.instrument = Some(common::model::PluginInstance::new(
@@ -3186,13 +3400,13 @@ impl AppData {
                 if let Ok(mut guard) = slot.lock() {
                     *guard = Vec::new();
                 }
-                let _ = proxy.send_event(AppEvent::VocalSynthCompleted);
+                proxy.send(AppEvent::VocalSynthCompleted);
                 return;
             }
             // 3. Singers fetch (初回のみ意味あり、 2 回目以降も harmless)
             if let Ok(singers) = common::voicevox::fetch_singers() {
                 tracing::info!(count = singers.len(), "fetched VOICEVOX singers");
-                let _ = proxy.send_event(AppEvent::SingersLoaded(singers));
+                proxy.send(AppEvent::SingersLoaded(singers));
             }
             // 4. 合成 (既存パス)
             let results = match cache_arc.lock() {
@@ -3210,7 +3424,7 @@ impl AppData {
             if let Ok(mut guard) = slot.lock() {
                 *guard = results;
             }
-            let _ = proxy.send_event(AppEvent::VocalSynthCompleted);
+            proxy.send(AppEvent::VocalSynthCompleted);
         });
     }
 
@@ -3301,11 +3515,11 @@ impl AppData {
                 if let Ok(mut guard) = slot.lock() {
                     *guard = Some(db);
                 }
-                let _ = proxy.send_event(AppEvent::PluginDbRescanCompleted);
+                proxy.send(AppEvent::PluginDbRescanCompleted);
             }
             Err(e) => {
                 tracing::error!(error = ?e, "plugin rescan failed");
-                let _ = proxy.send_event(AppEvent::PluginDbRescanCompleted);
+                proxy.send(AppEvent::PluginDbRescanCompleted);
             }
         });
     }

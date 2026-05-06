@@ -264,8 +264,6 @@ async fn recv_loop(
             | Ok(MainToChild::RemoveSlotPlugin { .. })
             | Ok(MainToChild::MoveSlot { .. })
             | Ok(MainToChild::RemoveTrack { .. })
-            | Ok(MainToChild::SwapTracks { .. })
-            | Ok(MainToChild::ReorderTracks(_))
             | Ok(MainToChild::RequestSlotState { .. })
             | Ok(MainToChild::RequestAllStates)
             | Ok(MainToChild::OpenSlotGuiEmbedded { .. })

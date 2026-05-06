@@ -70,6 +70,12 @@ pub enum PluginEvent {
     AllPluginStates {
         entries: Vec<SlotState>,
     },
+    /// Plugin destroyed (RemoveSlotPlugin / RemoveTrack 経由)。 daw_gui が
+    /// `MainToChild::ClosePluginShmem { plugin_id }` を daw_audio に
+    /// 転送して plugin_refs / slot_to_plugin_id を整理させるための通知。
+    SlotPluginUnloaded {
+        plugin_id: u32,
+    },
 }
 
 impl From<PluginEvent> for ChildToMain {
@@ -103,6 +109,9 @@ impl From<PluginEvent> for ChildToMain {
                 ChildToMain::SlotPluginState { track, slot, data }
             }
             PluginEvent::AllPluginStates { entries } => ChildToMain::AllPluginStates { entries },
+            PluginEvent::SlotPluginUnloaded { plugin_id } => {
+                ChildToMain::SlotPluginUnloaded { plugin_id }
+            }
         }
     }
 }
@@ -153,11 +162,6 @@ enum PluginCommand {
     RemoveTrack {
         track: u32,
     },
-    SwapTracks {
-        a: u32,
-        b: u32,
-    },
-    ReorderTracks(Vec<u32>),
     RequestSlotState {
         track: u32,
         slot: PluginSlot,
@@ -559,6 +563,15 @@ fn plugin_main_loop(
                     if let Some(removed_pid) = plugin_lookup.remove(&(track, slot)) {
                         plugin_shmems.remove(&removed_pid);
                         publish_plugin_registry(&plugin_registry, removed_pid, None);
+                        loaded_id_for_slot.remove(&(track, slot));
+                        // PR2.1: notify daw_gui so it can forward
+                        // ClosePluginShmem to daw_audio (otherwise audio
+                        // thread keeps calling process() on a destroyed
+                        // plugin → "VST3 plugin not processing" errors
+                        // and worker dispatch deadlock).
+                        let _ = evt_tx.send(PluginEvent::SlotPluginUnloaded {
+                            plugin_id: removed_pid,
+                        });
                     }
                 }
                 PluginCommand::MoveSlot { track, from, to } => {
@@ -569,38 +582,48 @@ fn plugin_main_loop(
                     });
                 }
                 PluginCommand::RemoveTrack { track } => {
+                    // `track` is a stable `Track::id`. Collect every
+                    // plugin_id that lived under this track so we can
+                    // notify daw_gui *after* drop.
+                    let removed_pids: Vec<u32> = plugin_lookup
+                        .iter()
+                        .filter_map(|(&(t, _), &pid)| if t == track { Some(pid) } else { None })
+                        .collect();
                     tracks.mutate(|t| {
-                            // Destroy every plugin's GUI before dropping
-                            // the chain so the CLAP gui lifecycle (destroy
-                            // must precede plugin destroy) is honoured.
-                            if let Some(mut chain) = t.chains.remove(&track) {
-                                for mfx in &mut chain.midi_fx_chain {
-                                    mfx.gui_destroy();
-                                }
-                                if let Some(inst) = chain.instrument.as_mut() {
-                                    inst.gui_destroy();
-                                }
-                                for fx in &mut chain.fx_chain {
-                                    fx.gui_destroy();
-                                }
-                                // Plugins drop here, on plugin-main.
+                        if let Some(mut chain) = t.chains.remove(&track) {
+                            // **Each plugin must be properly torn down**:
+                            // stop_processing → deactivate → gui_destroy
+                            // → drop. Skipping `stop_processing` /
+                            // `deactivate` makes some VST3 plugins
+                            // (kHs Chorus 等) crash on Drop because
+                            // their internal worker threads are still
+                            // active when the COM object goes away.
+                            // Mirrors `remove_plugin()` behaviour.
+                            for mut mfx in chain.midi_fx_chain.drain(..) {
+                                mfx.stop_processing();
+                                mfx.deactivate();
+                                mfx.gui_destroy();
                             }
-                            // The GUI just removed `track` from
-                            // `song.tracks`, shifting every higher track
-                            // down by 1. Mirror that on our chain map so
-                            // chain keys keep matching the song indices.
-                            t.shift_after_remove(track);
+                            if let Some(mut inst) = chain.instrument.take() {
+                                inst.stop_processing();
+                                inst.deactivate();
+                                inst.gui_destroy();
+                            }
+                            for mut fx in chain.fx_chain.drain(..) {
+                                fx.stop_processing();
+                                fx.deactivate();
+                                fx.gui_destroy();
+                            }
+                            // Plugins drop here, after proper teardown.
+                        }
                     });
-                }
-                PluginCommand::SwapTracks { a, b } => {
-                    tracks.mutate(|t| {
-                            t.swap_indices(a, b);
-                    });
-                }
-                PluginCommand::ReorderTracks(order) => {
-                    tracks.mutate(|t| {
-                            t.reorder_indices(&order);
-                    });
+                    plugin_lookup.retain(|&(t, _), _| t != track);
+                    loaded_id_for_slot.retain(|&(t, _), _| t != track);
+                    for pid in removed_pids {
+                        plugin_shmems.remove(&pid);
+                        publish_plugin_registry(&plugin_registry, pid, None);
+                        let _ = evt_tx.send(PluginEvent::SlotPluginUnloaded { plugin_id: pid });
+                    }
                 }
                 PluginCommand::RequestSlotState { track, slot } => {
                     let data = match tracks.plugin_at_mut(track, slot) {
@@ -1002,14 +1025,6 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             tracing::info!(track, "received RemoveTrack");
             plugin.send(PluginCommand::RemoveTrack { track });
         }
-        MainToChild::SwapTracks { a, b } => {
-            tracing::info!(a, b, "received SwapTracks");
-            plugin.send(PluginCommand::SwapTracks { a, b });
-        }
-        MainToChild::ReorderTracks(order) => {
-            tracing::info!(?order, "received ReorderTracks");
-            plugin.send(PluginCommand::ReorderTracks(order));
-        }
         MainToChild::RequestSlotState { track, slot } => {
             tracing::info!(track, ?slot, "received RequestSlotState");
             plugin.send(PluginCommand::RequestSlotState { track, slot });
@@ -1179,75 +1194,30 @@ impl Chain {
 
 /// All tracks with loaded plugins. Lazily-populated: `ensure_track` creates
 /// an empty chain on first access so a Track with no plugins isn't stored.
+///
+/// **The HashMap key is `Track::id` (stable across track add / remove /
+/// reorder), not the song's Vec position.** PR2.1 moved away from
+/// index-based keys so `Vec::insert` / `swap` / reorder on the GUI side
+/// no longer drift the chain map. Without that, `shift_after_remove` /
+/// `swap_indices` / `reorder_indices` were removed — chains are
+/// addressed solely by id and Vec position changes are invisible to the
+/// plugin host.
 #[derive(Default)]
 struct Tracks {
     chains: HashMap<u32, Chain>,
 }
 
 impl Tracks {
-    fn ensure_track(&mut self, track: u32) -> &mut Chain {
-        self.chains.entry(track).or_default()
+    fn ensure_track(&mut self, track_id: u32) -> &mut Chain {
+        self.chains.entry(track_id).or_default()
     }
 
     fn plugin_at_mut(
         &mut self,
-        track: u32,
+        track_id: u32,
         slot: PluginSlot,
     ) -> Option<&mut (dyn LoadedPlugin + '_)> {
-        self.chains.get_mut(&track).and_then(|c| c.plugin_at_mut(slot))
-    }
-
-    /// After removing the chain at `removed`, shift every entry with a
-    /// higher key down by one so the keys stay aligned with the song's
-    /// `tracks` Vec.
-    fn shift_after_remove(&mut self, removed: u32) {
-        let mut keys: Vec<u32> = self
-            .chains
-            .keys()
-            .copied()
-            .filter(|&k| k > removed)
-            .collect();
-        keys.sort_unstable();
-        for k in keys {
-            if let Some(c) = self.chains.remove(&k) {
-                self.chains.insert(k - 1, c);
-            }
-        }
-    }
-
-    /// Reorder chains so the entry previously at `order[i]` ends up at
-    /// the new index `i`. Indices not mentioned keep their original key.
-    fn reorder_indices(&mut self, order: &[u32]) {
-        let identity = order.iter().enumerate().all(|(i, &o)| o == i as u32);
-        if identity {
-            return;
-        }
-        let mapping: std::collections::HashMap<u32, u32> = order
-            .iter()
-            .enumerate()
-            .map(|(new_i, &old_i)| (old_i, new_i as u32))
-            .collect();
-        let chains_snapshot: Vec<(u32, _)> =
-            std::mem::take(&mut self.chains).into_iter().collect();
-        for (old_i, c) in chains_snapshot {
-            let new_i = mapping.get(&old_i).copied().unwrap_or(old_i);
-            self.chains.insert(new_i, c);
-        }
-    }
-
-    /// Swap chains at `a` and `b`. No-op when either side is missing.
-    fn swap_indices(&mut self, a: u32, b: u32) {
-        if a == b {
-            return;
-        }
-        if let (Some(ca), Some(cb)) = (self.chains.remove(&a), self.chains.remove(&b)) {
-            self.chains.insert(a, cb);
-            self.chains.insert(b, ca);
-        } else if let Some(c) = self.chains.remove(&a) {
-            self.chains.insert(b, c);
-        } else if let Some(c) = self.chains.remove(&b) {
-            self.chains.insert(a, c);
-        }
+        self.chains.get_mut(&track_id).and_then(|c| c.plugin_at_mut(slot))
     }
 }
 
