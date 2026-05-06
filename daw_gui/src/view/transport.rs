@@ -163,6 +163,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     );
     x += inst_w + 18.0;
 
+    // Group track には専用ボタンを置かない。Ableton Live と同じく
+    // 「選択トラックを Ctrl+G でまとめる」フローのみ提供する
+    // (空のグループは意味がないため)。
+
     // Playhead 位置 (text)
     let playhead = app
         .playhead_beat

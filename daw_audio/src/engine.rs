@@ -31,6 +31,7 @@ use common::timing::{effective_loop_bounds, song_ended};
 use common::worker_bridge::WorkerBridgeHandle;
 
 use crate::audio_worker::AudioWorkerPool;
+use crate::graph::{BufRef, NodeOp, Schedule, compile_schedule};
 use crate::mixer::TrackScratch;
 use crate::sequencer::{NoteTransition, TimedNoteEvent, collect_events_for_buffer};
 use crate::vocal::VocalAudio;
@@ -194,6 +195,15 @@ pub struct LocalState {
     pub cmd_rx: tokio::sync::mpsc::UnboundedReceiver<AudioCommand>,
     /// Resources shared with the (future) export thread.
     pub shared: Arc<EngineShared>,
+    /// Cached routing schedule. Recompiled (heap alloc) only when
+    /// `cached_song` is `Arc::ptr_eq`-different from the current song
+    /// snapshot, i.e. on user edits — not on every audio buffer. PR3
+    /// will move `compile_schedule` off the audio thread entirely and
+    /// publish via `ArcSwap` for fully wait-free pickup.
+    pub cached_schedule: Schedule,
+    /// Last `Arc<Song>` we compiled the schedule from, kept alive so
+    /// pointer equality is meaningful across buffers.
+    pub cached_song: Option<Arc<Song>>,
     /// Debug-only: playhead at the last heartbeat log. Throttles
     /// `engine heartbeat` to once per second of audio time.
     #[cfg(debug_assertions)]
@@ -214,8 +224,38 @@ impl LocalState {
             playing: false,
             cmd_rx,
             shared,
+            cached_schedule: Schedule::empty(),
+            cached_song: None,
             #[cfg(debug_assertions)]
             last_heartbeat_playhead: 0,
+        }
+    }
+
+    /// Refresh `cached_schedule` if the snapshot Arc changed since the
+    /// last call. Heap allocation is concentrated here (called only on
+    /// edit-time transitions) so the steady-state RT path stays free of
+    /// `Vec` growth.
+    fn refresh_schedule(&mut self, current_song: Option<&Arc<Song>>) {
+        let need_refresh = match (&self.cached_song, current_song) {
+            (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if !need_refresh {
+            return;
+        }
+        if let Some(song_arc) = current_song {
+            match compile_schedule(song_arc.as_ref()) {
+                Ok(s) => self.cached_schedule = s,
+                Err(e) => {
+                    // Routing is broken (cycle / dangling parent_group_id);
+                    // fall back to the empty schedule (silent master) so
+                    // the user sees the problem rather than mysterious audio.
+                    tracing::warn!(?e, "graph compile failed; master goes silent");
+                    self.cached_schedule = Schedule::empty();
+                }
+            }
+            self.cached_song = Some(Arc::clone(song_arc));
         }
     }
 
@@ -326,6 +366,12 @@ impl LocalState {
     ) {
         self.pump_commands();
 
+        // Refresh the cached routing schedule before the dispatch starts
+        // so the master mix step sees the right node order. `refresh_schedule`
+        // is a no-op when the song Arc hasn't changed.
+        let song_snapshot = shared.song.load();
+        self.refresh_schedule(song_snapshot.as_ref());
+
         let n = frames;
         self.master_l[..n].fill(0.0);
         self.master_r[..n].fill(0.0);
@@ -364,8 +410,9 @@ impl LocalState {
         }
         let playing = self.playing;
 
-        let snapshot = shared.song.load();
-        let song_ref = snapshot.as_deref();
+        // Reuse the snapshot we took for `refresh_schedule` so the
+        // dispatch sees the same song the schedule was compiled from.
+        let song_ref = song_snapshot.as_deref();
         let playhead = shared.playhead.load(Ordering::Acquire);
 
         if let Some(song) = song_ref {
@@ -425,9 +472,27 @@ impl LocalState {
                 }
             }
 
-            // Reduce all tracks' post-fader audio into the master bus.
-            // Sequential — `dispatch_and_wait` has already joined.
-            reduce_master(&self.scratch, n_tracks, &mut self.master_l, &mut self.master_r, n);
+            // Walk the cached schedule to (a) mix children → group
+            // scratches, (b) run each group's audio fx + strip, (c) sum
+            // top-level scratches into the master bus. The legacy
+            // `reduce_master` call is replaced by this graph-driven
+            // execution so groups + future PDC + sidechain hops can plug
+            // in by extending `NodeOp` rather than this function.
+            execute_schedule_post_dispatch(
+                &self.cached_schedule,
+                &mut self.scratch[..MAX_TRACKS],
+                &mut self.master_l[..n],
+                &mut self.master_r[..n],
+                n,
+                song,
+                &plugin_refs_g,
+                &slot_map_g,
+                worker_syncs_g.first(),
+                sample_rate,
+                n as u32,
+                playing,
+                any_solo,
+            );
 
             // Publish per-track peak meters into the shared AudioBridge
             // so the GUI mixer strips animate. Atomic stores, RT-safe.
@@ -543,6 +608,27 @@ pub fn process_track_owned(
     any_solo: bool,
 ) {
     let n = frames as usize;
+
+    // Tracks that have children (i.e. behave as a "group" / folder)
+    // are handled by the post-dispatch schedule walk: the children's
+    // outputs are mixed into this track's scratch by a `Mix` op, then
+    // `ProcessGroupFx` applies the audio fx_chain and strip. Skip the
+    // sequencer / midi_fx / instrument stages here so the dispatch
+    // doesn't smear plugin output into a buffer the schedule is about
+    // to overwrite. PR2 phase 1 keeps "group ignores its own clips /
+    // instrument" semantics; phase 5 will switch to Reaper's folder
+    // model where the group's own clips also feed the post-fx mix.
+    let has_children = song
+        .map(|s| s.tracks.iter().any(|t| t.parent_group_id == Some(song_track.id)))
+        .unwrap_or(false);
+    if has_children {
+        scratch.track_l[..n].fill(0.0);
+        scratch.track_r[..n].fill(0.0);
+        scratch.peak_l = 0.0;
+        scratch.peak_r = 0.0;
+        scratch.effective_mute = false;
+        return;
+    }
 
     // ---- Sequencer: assemble this buffer's MIDI bus ----
     scratch.midi_bus_a.clear();
@@ -744,6 +830,11 @@ pub fn process_track_owned(
 /// the master thread after `dispatch_and_wait` returns, so writers no
 /// longer touch `master_{l,r}`. Sequential, but cache-friendly: each
 /// scratch is read straight through.
+///
+/// Used by `export.rs` (the offline freewheel render) which still walks
+/// tracks flatly. The realtime engine now goes through
+/// `execute_schedule_post_dispatch` so groups + PDC + sidechain hops can
+/// plug in by extending `NodeOp`.
 pub fn reduce_master(
     scratch: &[TrackScratch],
     n_tracks: usize,
@@ -760,5 +851,265 @@ pub fn reduce_master(
             master_l[i] += tr.track_l[i];
             master_r[i] += tr.track_r[i];
         }
+    }
+}
+
+/// Replay the post-dispatch portion of the routing schedule:
+/// `Mix { dst: TrackScratch }` (children → group bus), `ProcessGroupFx`
+/// (group's fx_chain + strip), and `Mix { dst: Master }` (top-level
+/// scratches → master). `ProcessTrack` ops are no-ops here because
+/// `dispatch_and_wait` has already filled the per-track scratches.
+#[allow(clippy::too_many_arguments)]
+fn execute_schedule_post_dispatch(
+    schedule: &Schedule,
+    scratch: &mut [TrackScratch],
+    master_l: &mut [f32],
+    master_r: &mut [f32],
+    n: usize,
+    song: &Song,
+    plugin_refs: &HashMap<u32, PluginRef>,
+    slot_to_plugin_id: &HashMap<(u32, PluginSlot), u32>,
+    worker_sync: Option<&WorkerSyncRef>,
+    sample_rate: u32,
+    frames: u32,
+    playing: bool,
+    any_solo: bool,
+) {
+    for op in &schedule.nodes {
+        match op {
+            NodeOp::ProcessTrack { .. } => {
+                // Already handled by dispatch_and_wait above.
+            }
+            NodeOp::Mix {
+                srcs,
+                dst: BufRef::TrackScratch(target_idx),
+            } => {
+                mix_into_track_scratch(scratch, *target_idx as usize, srcs, n);
+            }
+            NodeOp::Mix {
+                srcs,
+                dst: BufRef::Master,
+            } => {
+                mix_into_master(scratch, srcs, master_l, master_r, n);
+            }
+            NodeOp::Mix {
+                dst: BufRef::Pooled(_) | BufRef::PluginAuxOut { .. },
+                ..
+            } => {
+                // PR4: pooled targets and plugin aux-out routing land
+                // here once parallel-out support arrives.
+            }
+            NodeOp::ProcessGroupFx { track_idx } => {
+                let Some(track) = song.tracks.get(*track_idx as usize) else {
+                    continue;
+                };
+                let Some(target) = scratch.get_mut(*track_idx as usize) else {
+                    continue;
+                };
+                run_group_fx_chain(
+                    *track_idx,
+                    track,
+                    song,
+                    target,
+                    plugin_refs,
+                    slot_to_plugin_id,
+                    worker_sync,
+                    sample_rate,
+                    frames,
+                    playing,
+                    any_solo,
+                );
+            }
+            NodeOp::ApplyDelay { .. } => {
+                // PR3.
+            }
+            NodeOp::SidechainTap { .. } => {
+                // PR4.
+            }
+        }
+    }
+}
+
+/// Sum the listed source scratches into `scratch[target_idx]` (used to
+/// feed group buses with their children). Clears the target first so
+/// stale samples from a previous buffer don't leak.
+fn mix_into_track_scratch(
+    scratch: &mut [TrackScratch],
+    target_idx: usize,
+    srcs: &[(BufRef, f32)],
+    n: usize,
+) {
+    if target_idx >= scratch.len() {
+        return;
+    }
+    {
+        let target = &mut scratch[target_idx];
+        target.track_l[..n].fill(0.0);
+        target.track_r[..n].fill(0.0);
+    }
+    let (left, right) = scratch.split_at_mut(target_idx);
+    let (target_slot, after) = right.split_first_mut().expect("split bounds checked above");
+    for (src, gain) in srcs {
+        let BufRef::TrackScratch(s_idx) = src else {
+            continue;
+        };
+        let s = *s_idx as usize;
+        if s == target_idx {
+            continue;
+        }
+        let s_scratch = if s < target_idx {
+            &left[s]
+        } else if s - target_idx - 1 < after.len() {
+            &after[s - target_idx - 1]
+        } else {
+            continue;
+        };
+        if s_scratch.effective_mute {
+            continue;
+        }
+        let g = *gain;
+        for i in 0..n {
+            target_slot.track_l[i] += s_scratch.track_l[i] * g;
+            target_slot.track_r[i] += s_scratch.track_r[i] * g;
+        }
+    }
+}
+
+/// Sum each non-muted source scratch (with its routing gain) into the
+/// master bus. The master buffers are zeroed earlier in `process_buffer`
+/// so this is `+= ` style accumulation.
+fn mix_into_master(
+    scratch: &[TrackScratch],
+    srcs: &[(BufRef, f32)],
+    master_l: &mut [f32],
+    master_r: &mut [f32],
+    n: usize,
+) {
+    let n = n.min(master_l.len()).min(master_r.len());
+    for (src, gain) in srcs {
+        let BufRef::TrackScratch(s_idx) = src else {
+            continue;
+        };
+        let Some(s_scratch) = scratch.get(*s_idx as usize) else {
+            continue;
+        };
+        if s_scratch.effective_mute {
+            continue;
+        }
+        let g = *gain;
+        for i in 0..n {
+            master_l[i] += s_scratch.track_l[i] * g;
+            master_r[i] += s_scratch.track_r[i] * g;
+        }
+    }
+}
+
+/// `track_id` の子孫 (parent_group_id chain で辿れる) のいずれかが
+/// `solo == true` なら true。 Ableton Live の "soloed via children"
+/// 挙動 (group track 自身が solo されていなくても、 子が solo なら
+/// group も透過させる) のために使う。 cycle-safe: hops 上限 32。
+fn has_soloed_descendant(song: &Song, track_id: u32) -> bool {
+    let mut frontier: Vec<u32> = vec![track_id];
+    let mut hops = 0_usize;
+    while let Some(pid) = frontier.pop() {
+        hops += 1;
+        if hops > song.tracks.len() + 1 {
+            return false;
+        }
+        for t in &song.tracks {
+            if t.parent_group_id == Some(pid) {
+                if t.solo {
+                    return true;
+                }
+                frontier.push(t.id);
+            }
+        }
+    }
+    false
+}
+
+/// Run a Group track's audio fx chain on its already-mixed input
+/// scratch, then apply the group's mixer strip (volume / pan / mute /
+/// solo + peak meter). Mirrors the audio-fx tail of `process_track_owned`,
+/// but skips the sequencer / MIDI FX / instrument stages because groups
+/// have no clips of their own.
+#[allow(clippy::too_many_arguments)]
+fn run_group_fx_chain(
+    track_idx: u32,
+    song_track: &Track,
+    song: &Song,
+    scratch: &mut TrackScratch,
+    plugin_refs: &HashMap<u32, PluginRef>,
+    slot_to_plugin_id: &HashMap<(u32, PluginSlot), u32>,
+    worker_sync: Option<&WorkerSyncRef>,
+    sample_rate: u32,
+    frames: u32,
+    playing: bool,
+    any_solo: bool,
+) {
+    let n = frames as usize;
+
+    for i in 0..song_track.fx_chain.len() {
+        let key = (track_idx, PluginSlot::Fx(i as u32));
+        let Some(&plugin_id) = slot_to_plugin_id.get(&key) else {
+            continue;
+        };
+        let Some(plugin_ref) = plugin_refs.get(&plugin_id) else {
+            continue;
+        };
+        let Some(ws) = worker_sync else { continue };
+
+        let pd = plugin_ref.data_mut();
+        pd.prepare();
+        pd.frames = frames;
+        pd.playing = if playing { 1 } else { 0 };
+        pd.sample_rate = sample_rate;
+        pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
+        pd.buffer_in[1][..n].copy_from_slice(&scratch.track_r[..n]);
+        if let Err(e) = ws.dispatch(plugin_id) {
+            tracing::error!(error = ?e, plugin_id, "group fx dispatch failed");
+            continue;
+        }
+        scratch.track_l[..n].copy_from_slice(&pd.buffer_out[0][..n]);
+        scratch.track_r[..n].copy_from_slice(&pd.buffer_out[1][..n]);
+    }
+
+    let volume = song_track.volume;
+    let pan = song_track.pan.clamp(-1.0, 1.0);
+    let muted = song_track.muted;
+    let solo = song_track.solo;
+    // Live 互換: 子のいずれかが solo されている場合、 group 自身は
+    // solo フラグが立っていなくても透過させる ("soloed via children")。
+    // → `effective_mute = muted || (any_solo && !solo && !子に solo)`
+    let effective_mute = muted
+        || (any_solo
+            && !solo
+            && !has_soloed_descendant(song, song_track.id));
+    scratch.effective_mute = effective_mute;
+    if effective_mute {
+        scratch.track_l[..n].fill(0.0);
+        scratch.track_r[..n].fill(0.0);
+        scratch.peak_l = 0.0;
+        scratch.peak_r = 0.0;
+    } else {
+        let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+        let gain_l = angle.cos() * volume;
+        let gain_r = angle.sin() * volume;
+        let mut peak_l = 0.0_f32;
+        let mut peak_r = 0.0_f32;
+        for i in 0..n {
+            let l = scratch.track_l[i] * gain_l;
+            let r = scratch.track_r[i] * gain_r;
+            scratch.track_l[i] = l;
+            scratch.track_r[i] = r;
+            if l.abs() > peak_l {
+                peak_l = l.abs();
+            }
+            if r.abs() > peak_r {
+                peak_r = r.abs();
+            }
+        }
+        scratch.peak_l = peak_l;
+        scratch.peak_r = peak_r;
     }
 }

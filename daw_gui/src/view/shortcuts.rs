@@ -26,6 +26,10 @@ pub fn daw_shortcut_map() -> ShortcutMap {
     m.bind("daw.synthesize_vocal", "V");
     m.bind("daw.export_wav", "Ctrl+E");
     m.bind("daw.toggle_help", "F1");
+    // Ableton Live 互換: Ctrl+G で選択トラック群をグループ化、
+    // Alt+G で解除。 G 単独は元の grid snap toggle のまま。
+    m.bind("daw.group_tracks", "Ctrl+G");
+    m.bind("daw.ungroup_tracks", "Alt+G");
     // Grid snap (G キー) / auto-fit zoom (X キー)。focus 中の text_input 無効時のみ発火。
     m.bind("daw.toggle_snap", "G");
     m.bind("daw.fit_view", "X");

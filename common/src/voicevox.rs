@@ -518,6 +518,7 @@ fn urlencoding_encode(s: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use serde_json::Value;

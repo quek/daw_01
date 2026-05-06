@@ -20,6 +20,7 @@ use tokio::net::windows::named_pipe::NamedPipeClient;
 mod audio_worker;
 mod engine;
 mod export;
+mod graph;
 mod mixer;
 mod sequencer;
 mod tracks;

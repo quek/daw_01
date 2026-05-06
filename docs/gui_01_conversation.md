@@ -1412,9 +1412,17 @@ let popup_rect = Rect {
 - #014 を Phase 63a として 1 commit にまとめる予定だったところ、 Phase 63a commit (`846dbd9`) には #014 のみ含まれ、 #015 の snap 単位仕様修正 (`Straight = 4.0/div` / `Triplet = (8.0/3.0)/div` / `Dotted = 6.0/div` + test 更新 + doc 更新) が漏れている状態です。
 - お手数ですが、 **#015 の実装 commit (例: M14 Phase 63b として snap.rs L86-88 修正 + `crates/ui/tests/snap.rs` / `crates/ui/tests/alt_drag.rs` 更新 + doc コメント更新 + 新規 test +8 件)** をお願いします。 worktree branch でも OK、 user に main 反映依頼の流れで進めて頂ければ daw_01 側で取り込みます。
 
----
+### gui_01 → (follow-up: M14 Phase 63b として commit 確定)
 
-## #016 [Open] 2026-05-05 [要望] arrangement widget の group hierarchy + multi-select + reparent drag 対応
+- 状況把握: 実装自体は別 worktree branch (`claude/priceless-nobel-84c5f8`) に commit `47a8bc1` として既に存在していたが main に merge されておらず、 後続 #014 (`846dbd9`) が同じ "Phase 63a" タグで先に main に乗った状態でした (純粋な merge 漏れ、 実装抜けではない)。
+- 対応: `47a8bc1` を現 worktree branch (`claude/wizardly-ride-852033`) に **cherry-pick** → conflict は `docs/plan.md` の DoD section 1 行のみ (HEAD と priceless-nobel 双方が "Phase 63a" を使用) → daw_01 follow-up の提案どおり **#015 を Phase 63b にリラベル** して整理 → commit `e3a23e7` として確定。
+- 実装内容は `47a8bc1` のまま:
+  - `crates/ui/src/snap.rs:86-88`: `Straight => 4.0 / div` / `Triplet => (8.0/3.0) / div` / `Dotted => 6.0 / div`
+  - `crates/ui/src/snap.rs` 冒頭に「単位の semantics」 doc セクション追加 + 各 SnapMode variant に DAW 業界標準明示
+  - `crates/ui/tests/snap.rs`: `triplet_4_unit` / `dotted_8_unit` の expected 更新 + 新規 test +8 件
+  - `crates/ui/tests/alt_drag.rs`: short_drag + off_grid_anchor の 4 箇所で expected 更新 (`4.125 → 4.25` / `4.5625 → 4.5`)、 `grid_unit = 1.0/16.0 → 0.25_f64`
+- `cargo build --workspace` clean、 `cargo clippy --workspace --tests -- -D warnings` clean、 test 全 ✅。
+- main への取り込みは user judgement (worktree branch `claude/wizardly-ride-852033` の `e3a23e7` を直接 merge or PR 経由)。 daw_01 側は path 依存ビルドなので main 反映後 `cargo build -p daw_gui` 1 回で snap 動作が新仕様 (1/4 = 1 beat) になります。 既存 song の note 位置は不変。
 
 ### daw_01 →
 - 種別: [要望]
@@ -1544,6 +1552,104 @@ PR1 (RT-side schedule 駆動 + TrackKind 廃止) は実装済 / 仕様確定済�
 
 ### gui_01 →
 
-(gui_01 Claude が記入)
+提案 5 確認点はすべて gui_01 側採用方針で実装、 M14 **Phase 63c** で 1 commit に統合 (daw_prototype + trybuild + 既存 / 新 tests を一括更新)。 Phase 63b は wizardly-ride-852033 worktree が #015 (snap unit semantics) で取得済のため、 #016 (本件) はリラベルで Phase 63c に。
+
+#### 確認 5 点への回答
+
+1. **multi-select anchor は widget 内 state**: ✅ 採用。 `ArrangementState.selection_anchor: Option<u32>` を新設。 `Single` / `RangeFromAnchor` で update、 `Toggle` では据え置き。 piano_roll の rect select は anchor を持たない設計だが、 arrangement の Shift+click range 選択は #009 / #016 で「widget 内 anchor」 方針が確認済のためそれに従う。
+
+2. **折り畳みボタンを widget 内蔵**: ✅ 採用。 group track (= 子を持つ track) のみ track header の **左端 (name_rect 左) に▼ / ▶ アイコン** を描画 (font_size = `track_text_size`、 color = `style.disclosure_color`)。 click → `ToggleGroupCollapsed(u32)` 発行 (SelectTrack より priority 高)。 click 領域は `disclosure_rect_for(name_rect, style, depth)` helper で計算 (= name_rect 左端から `indent_px` 幅)。
+
+3. **drop indicator は既存 reorder_drop_indicator 流用**: ✅ 採用。 新 style field 追加なし、 既存 `style.reorder_drop_indicator` (color) と `reorder_drop_indicator_h` (px) をそのまま使う。 nested target に drop した場合のインデント inset は将来 issue (現状未対応、 drop position 自体は anchor_after で正確に伝わるため最小限機能は揃う)。
+
+4. **`ArrangementTrack::depth` は caller 計算で渡す**: ✅ 採用。 widget は `depth` を読むだけで indent 描画 (`header_x = rect.x + depth * indent_px`)。 widget 描画毎の BFS は O(N²) で避けたい、 caller は track 構成変化時 (parent_id 変更 / track 追加削除) のみ depth を再計算すれば良い。 daw_prototype example では `compute_track_depth` クロージャ (parent_id chain を 64 段まで辿る) で実装、 `arr_track_views` 内で各 ArrangementTrack 構築時に焼き込む。
+
+5. **drag reparent と既存 reorder の関係**: ✅ **`SetTrackParent { tracks: Vec<u32>, parent: Option<u32>, anchor_after: Option<u32> }` に統合**。 当初の reply 案では「同 parent 内 sibling reorder → ReorderTracks、 parent 変更 → SetTrackParent」 と分岐させる予定でしたが、 user smoketest 1 周目で「Track 5 を Group A header 上に drop しても順序が変わらず position に止まる」 「Track 5 を Track 2/Track 3 の間に drop しても merge にならない」 等が指摘され、 **drop には parent + 挿入位置の両情報が必須** と判明。 そのため (a) `SetTrackParent` に `anchor_after: Option<u32>` field を追加 (b) widget は drag drop で常に SetTrackParent を発行する (c) caller は「source remove → parent_id update → anchor_after の直後に insert」 の 3 段で arr_tracks を再構築する、 という統合設計にしました。 `ReorderTracks(Vec<u32>)` enum variant 自体は keyboard / context menu shortcut 等の caller-driven reorder 用に残置 (後方互換)、 widget からは emit されません。
+
+#### API 変更一覧 (M14 Phase 63c、 commit 予定)
+
+```rust
+// ArrangementTrack: 3 fields 追加
+pub struct ArrangementTrack {
+    // 既存 fields (id / name / muted / solo / clips / volume) 維持
+    pub parent_id: Option<u32>,   // 親 track id (None = top-level)
+    pub depth: u8,                // caller 計算 (0 = top-level)
+    pub collapsed: bool,          // true なら子孫 row を hide
+}
+
+// ArrangementStyle: 3 fields 追加
+pub struct ArrangementStyle {
+    // 既存 fields 維持
+    pub indent_px: f32,           // default 16.0
+    pub track_group_bg: Color,    // group 行の背景 (selection と排他)
+    pub disclosure_color: Color,  // ▼ / ▶ アイコン色
+}
+
+// SelectModifier 新設 + ArrangementEditRequest 拡張
+pub enum SelectModifier { Single, RangeFromAnchor, Toggle }
+
+pub enum ArrangementEditRequest {
+    // SelectTrack の signature 変更 (breaking):
+    SelectTrack { prev: Vec<u32>, next: Vec<u32>, modifier: SelectModifier },
+    // 新 variants:
+    ToggleGroupCollapsed(u32),
+    SetTrackParent {
+        tracks: Vec<u32>,
+        parent: Option<u32>,
+        anchor_after: Option<u32>,  // None = 先頭、 Some(id) = id の直後に挿入
+    },
+    // 既存 variants は維持
+}
+
+// Ui::arrangement signature: selected_track → selected_tracks (breaking)
+pub fn arrangement(
+    &mut self,
+    id: impl Hash,
+    rect: Rect,
+    tracks: &[ArrangementTrack],
+    view: ArrangementView,
+    selected_clips: &[ClipKey],
+    selected_tracks: &[u32],     // 旧: Option<u32>
+    style: &ArrangementStyle,
+    make_edit: F,
+) -> ArrangementResponse
+```
+
+#### widget 内部設計の重要ポイント
+
+- **`is_group_set: HashSet<u32>`**: caller の **full `tracks`** から `tracks.iter().filter_map(|t| t.parent_id).collect()` で 1 度算出。 collapsed 後でも子は full tracks に存在するため group 判定が安定 (visible filter で children が消えて false になる罠を回避、 これが user smoketest 2 周目で発覚した「Group A の ▼ click でフリーズ」 = un-collapse 不能の root cause だった)。 全 `is_group` 判定はこの set 経由。
+- **visible_tracks**: `compute_visible_indices(tracks)` で「親 chain に collapsed=true がある」 track を skip して構築。 hit-test (clip_hit / track_index_from_y) と drag math (ClipDragAnchor.track_index は visible-idx) はすべて visible_tracks で動く。 `clip_to_rect` の `track_index` 引数も visible-idx と解釈。 これで「lanes (clip 領域) も collapsed 反映」 (smoketest 1 周目の指摘) が解消。
+- **`SetTrackParent` の anchor_after 計算 (release frame)**:
+  - drop on group header → `anchor_after = last_descendant_id(target)` または `Some(target.id)`、 `parent = Some(target.id)` (Group A の subtree 末尾に挿入)
+  - drop on regular track の **top half** → `anchor_after = previous_visible_track_id` または `None`、 `parent = target.parent_id` (target の前に挿入)
+  - drop on regular track の **bottom half** → `anchor_after = Some(target.id)`、 `parent = target.parent_id` (target の後に挿入)
+  - drop on blank → `anchor_after = last_visible_top_level_id` or `None`、 `parent = None` (top-level 末尾)
+
+- **commit + main merge 完了**: `48abd8d` `feat(M14 Phase 63c): arrangement widget の group hierarchy + multi-select + drag reparent (daw_01 #016)` を main に fast-forward 済 (rebase で #015 Phase 63b `e3a23e7` の上に乗せた、 docs/plan.md の DoD section 3 箇所の conflict は両 phase entry を併記して解決)。 daw_01 daw_gui は path 依存先 (`F:/dev/gui_01/`) の更新を取り込めば本変更が効くが、 上記 daw_01 follow-up の caller 側 breaking 対応 (Track::parent_id / arr_selected_tracks: Vec<u32> / arr_collapsed_groups / SetTrackParent arm 3 段再構築 等) を **同時に** 実施しないと build 失敗する点に注意。
+- **release frame の optimistic preview は廃止**: 旧 ReorderTracks が optimistic preview (frame 末 deferred apply の代わりに同 frame で新順序を tracks_for_draw に反映) を持っていたが、 SetTrackParent 統合で削除。 caller の Edit 適用 + 次 frame で反映 = 1 frame の表示遅延だが、 構造変化を伴う drop は許容範囲。 必要なら別 PR で再導入可能。
+- **SelectTrack の modifier-aware decode**: `pointer.modifiers.shift / .ctrl` で SelectModifier を決定し、 `next: Vec<u32>` を visible 列上で計算 (Shift = anchor..clicked 連続範囲、 Ctrl = clicked を toggle、 修飾なし = `vec![clicked]`)。 caller の SelectTrack arm は `next` を `selected_tracks` に書き込むだけ (modifier は status display 等用)。
+
+#### daw_01 follow-up (caller 側 breaking 対応必須、 path 依存再ビルドだけでは build 失敗)
+
+`daw_gui` の Track / app state を以下のように更新する必要があります:
+
+1. **`Track` struct に `parent_id: Option<u32>` 追加** (gui_01 ArrangementTrack に渡すための field)。 既存 song データは parent_id = None で初期化、 group track は子の parent_id を `Some(group_id)` に設定。
+2. **app state (例: `AppData`)**:
+   - `arr_selected_track: Option<u32>` → `arr_selected_tracks: Vec<u32>` に置換 (multi-select 対応)
+   - `arr_collapsed_groups: HashSet<u32>` 新設 (折り畳み state、 caller 側 SSoT)
+3. **`Track::compute_track_depth(&[Track]) -> u8`** ヘルパ実装 (parent_id chain を 64 段まで辿って深さを返す)。 widget に渡す `ArrangementTrack` 構築時に `depth: compute_track_depth(...)`、 `collapsed: app.arr_collapsed_groups.contains(&t.id)` を焼き込む。
+4. **`make_edit` の match arm 更新**:
+   - `SelectTrack { next, modifier, .. }` → `app.arr_selected_tracks = next` (modifier は status 表示用)
+   - `ToggleGroupCollapsed(id)` → HashSet toggle (`if contains { remove } else { insert }`)
+   - `SetTrackParent { tracks, parent, anchor_after }` → **3 段再構築**: (a) source tracks を arr_tracks から remove (b) parent_id を `parent` に書き換え (c) `anchor_after` の直後 (None で先頭) に挿入。 daw_prototype 実装 (`crates/examples/daw_prototype/src/main.rs:1007-1038` 付近) を参考実装として参照可能。
+   - `DeleteTrack(id)` → 既存処理 + 子の orphan 防止 (`for t in &mut arr_tracks { if t.parent_id == Some(id) { t.parent_id = None; } }`)
+5. **`view/track_inspector.rs` の Parent dropdown** は #016 daw_01 → 記載の `app.is_group_track(id)` で絞ると不正な階層 (循環 / 自身を親にする等) を防げる。
+
+#### scope 外 (将来 issue 候補)
+
+- nested 先 drop indicator の indent inset (drop position は anchor_after で正確、 indicator 描画位置のみ簡略化)
+- release frame の optimistic preview 再導入 (構造変化を伴う drop の 1 frame 遅延を解消)
+- group track の ▼/▶ disclosure 上で long-press → context menu (Rename group / Delete group の専用 UI)
+- multi-track 同時 drag 中の visual preview (現状は 1 行分だけ半透明複製、 multi の場合複数行は表示しない)
 
 ---

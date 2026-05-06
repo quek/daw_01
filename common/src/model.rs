@@ -5,12 +5,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::plugin_format::PluginFormat;
 
-/// Bumped to `4` after a brief detour at `3` (which had a per-`Clip`
-/// `volume` field that gui_01 then decided to put on `Track` instead —
-/// the existing `Track::volume` covers it, so the per-clip field was
-/// removed). Older `.daw` files cannot be loaded; acceptable while the
-/// project is still in M1 / pre-release.
-pub const CURRENT_VERSION: u32 = 4;
+/// Bumped to `5` to support the routing graph (group tracks + plugin
+/// latency cache). The new `Track::kind` / `parent_group_id` /
+/// `reported_latency_samples` fields all default sensibly via
+/// `#[serde(default)]`, so v4 `.daw` files load forward without any
+/// migration step. Bumped to `4` previously after a brief detour at
+/// `3` (per-`Clip` `volume` later moved to `Track::volume`).
+pub const CURRENT_VERSION: u32 = 5;
 
 /// Serde adapter for `Option<Vec<u8>>` that writes binary data as base64 in
 /// JSON (and other human-readable formats). Bincode bypasses this and uses
@@ -136,7 +137,8 @@ impl Song {
 ///    to the instrument's audio output in order.
 ///
 /// Clips on the track feed the MIDI FX chain at the top of the buffer. The
-/// final audio is mixed into the master bus.
+/// final audio flows into the parent — either a `Group` track (when
+/// `parent_group_id == Some(id)`) or the master bus (when `None`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Track {
     /// Stable id assigned by `Song::alloc_track_id`. `0` is "未採番"
@@ -173,6 +175,19 @@ pub struct Track {
     /// clip is created on this track.
     #[serde(default)]
     pub next_clip_id: u32,
+    /// Parent group track id. `None` ⇒ this track feeds the master bus
+    /// directly. Any track can act as a "group" — that role is derived
+    /// from whether other tracks point at this one's id, not stored on
+    /// the track itself (Reaper's folder-track model). Forms a tree of
+    /// arbitrary depth; cycles are rejected by the graph compiler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_group_id: Option<u32>,
+    /// Most recent plugin-reported latency for this track, populated by
+    /// the plugin host via the CLAP `latency` extension and cached on
+    /// the model so the GUI can display it and the routing graph can
+    /// recompile PDC compensation. Not user-editable.
+    #[serde(default)]
+    pub reported_latency_samples: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
@@ -199,6 +214,8 @@ impl Default for Track {
             source: InstrumentSource::None,
             clips: Vec::new(),
             next_clip_id: 1,
+            parent_group_id: None,
+            reported_latency_samples: 0,
         }
     }
 }
@@ -395,10 +412,55 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_four() {
-        // Bumped to 4 after a brief detour at 3 (per-Clip volume that
-        // gui_01 then removed). Pinning the constant catches accidental
-        // rollback.
-        assert_eq!(CURRENT_VERSION, 4);
+    fn current_version_is_five() {
+        // Bumped to 5 to add the routing graph fields (kind /
+        // parent_group_id / reported_latency_samples). All defaulted
+        // via `#[serde(default)]` so v4 files load forward. Pinning
+        // the constant catches accidental rollback.
+        assert_eq!(CURRENT_VERSION, 5);
+    }
+
+    #[test]
+    fn v4_track_loads_forward_with_default_routing_fields() {
+        // A v4 .daw file (no `parent_group_id` / `reported_latency_samples`
+        // keys) must round-trip through serde_json into a v5 `Track`
+        // with defaulted graph fields.
+        let v4_json = r#"{
+            "id": 7,
+            "name": "Lead",
+            "volume": 0.9,
+            "pan": 0.0,
+            "next_clip_id": 1
+        }"#;
+        let track: Track = serde_json::from_str(v4_json).unwrap();
+        assert_eq!(track.id, 7);
+        assert_eq!(track.parent_group_id, None);
+        assert_eq!(track.reported_latency_samples, 0);
+    }
+
+    #[test]
+    fn track_with_parent_group_id_roundtrip() {
+        // The "group" role is implicit (track 1 here ends up acting as
+        // a group because track 2 points at it via parent_group_id).
+        // No explicit `kind` field exists.
+        let song = Song {
+            tracks: vec![
+                Track {
+                    id: 1,
+                    name: "Drums".into(),
+                    parent_group_id: None,
+                    ..Track::default()
+                },
+                Track {
+                    id: 2,
+                    name: "Kick".into(),
+                    parent_group_id: Some(1),
+                    ..Track::default()
+                },
+            ],
+            ..Song::default()
+        };
+        let restored: Song = json_roundtrip(&song);
+        assert_eq!(restored, song);
     }
 }

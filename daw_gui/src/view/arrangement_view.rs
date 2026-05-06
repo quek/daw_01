@@ -78,6 +78,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     color: None,
                 })
                 .collect(),
+            // gui_01 #016 で追加された group hierarchy fields:
+            parent_id: t.parent_group_id,
+            depth: app.compute_track_depth(t),
+            collapsed: app.collapsed_groups.contains(&t.id),
         })
         .collect();
 
@@ -93,11 +97,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         })
         .collect();
 
-    let selected_track_id = app
-        .song
-        .tracks
-        .get(app.selected_track as usize)
-        .map(|t| t.id);
+    // gui_01 #016 で `selected_track: u32` → `selected_tracks: &[u32]`
+    // (track id 列) に変更されたので、 そのまま渡す。
+    let selected_tracks: &[u32] = &app.selected_track_ids;
 
     let zoom = app.arrange_zoom_x.max(1.0);
     let row_h = app.arrange_track_row_h.max(1.0);
@@ -156,7 +158,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         &tracks,
         view,
         &selected_clips,
-        selected_track_id,
+        selected_tracks,
         &style,
         make_edit,
     );
@@ -257,12 +259,62 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
             })
         }
         ArrangementEditRequest::SelectTrack { next, .. } => {
+            // gui_01 #016: multi-select 対応。 widget が決定した
+            // `next: Vec<u32>` (id 列、 modifier-aware で Single /
+            // RangeFromAnchor / Toggle が解決済) をそのまま反映する。
             Edit::mutate(move |app: &mut AppData| {
-                if let Some(track_id) = next
-                    && let Some(idx) = app.song.tracks.iter().position(|t| t.id == track_id)
-                {
-                    app.handle_event(AppEvent::SelectTrack(idx as u32));
+                app.selected_track_ids = next.clone();
+                // selected_clip / selected_clips も末尾の cursor track
+                // 上の clip だけ残す形で同期したいが、 multi-select 中は
+                // clip 選択の優先度が低いので暫定的に変更しない。
+            })
+        }
+        ArrangementEditRequest::ToggleGroupCollapsed(track_id) => {
+            Edit::mutate(move |app: &mut AppData| {
+                if app.collapsed_groups.contains(&track_id) {
+                    app.collapsed_groups.remove(&track_id);
+                } else {
+                    app.collapsed_groups.insert(track_id);
                 }
+            })
+        }
+        ArrangementEditRequest::SetTrackParent {
+            tracks,
+            parent,
+            anchor_after,
+        } => {
+            // gui_01 #016 reply: drag&drop reparent + reorder の統合 Edit。
+            // 3 段再構築 (a) source tracks を song.tracks から remove
+            // (b) parent_group_id を新親に書き換え (c) anchor_after の
+            // 直後 (None で先頭) に insert。
+            Edit::mutate(move |app: &mut AppData| {
+                let mut moved: Vec<common::model::Track> = tracks
+                    .iter()
+                    .filter_map(|id| {
+                        let pos = app.song.tracks.iter().position(|t| t.id == *id)?;
+                        Some(app.song.tracks.remove(pos))
+                    })
+                    .collect();
+                if moved.is_empty() {
+                    return;
+                }
+                for t in &mut moved {
+                    t.parent_group_id = parent;
+                }
+                let insert_at = match anchor_after {
+                    None => 0,
+                    Some(after_id) => app
+                        .song
+                        .tracks
+                        .iter()
+                        .position(|t| t.id == after_id)
+                        .map(|i| i + 1)
+                        .unwrap_or(app.song.tracks.len()),
+                };
+                for (offset, t) in moved.into_iter().enumerate() {
+                    app.song.tracks.insert(insert_at + offset, t);
+                }
+                app.sync_song_to_plugin_host();
             })
         }
         ArrangementEditRequest::DoubleClickClip(key) => {

@@ -23,6 +23,10 @@ const METER_GAP: f32 = 2.0;
 
 const COLOR_BG: Color = Color { r: 0.13, g: 0.13, b: 0.15, a: 1.0 };
 const COLOR_STRIP_BG: Color = Color { r: 0.18, g: 0.18, b: 0.22, a: 1.0 };
+/// Group / sub-mix bus strip — slightly bluer than a regular strip and
+/// closer in luminance to MASTER_BG so the eye reads it as a bus rather
+/// than a track.
+const COLOR_GROUP_BG: Color = Color { r: 0.18, g: 0.22, b: 0.30, a: 1.0 };
 const COLOR_MASTER_BG: Color = Color { r: 0.22, g: 0.22, b: 0.28, a: 1.0 };
 const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
 const COLOR_TEXT_DIM: Color = Color { r: 0.65, g: 0.68, b: 0.72, a: 1.0 };
@@ -95,10 +99,21 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             if x + STRIP_WIDTH < scroll_x || x > scroll_x + scroll_w {
                 continue;
             }
+            // Group strips wear a bluer tint so the eye picks them
+            // out from regular per-track strips. PR2 shows depth as a
+            // small "↳" prefix on the name (real indented mixer rows
+            // would need a per-row layout overhaul; deferred).
+            let bg = if entry.is_group { COLOR_GROUP_BG } else { COLOR_STRIP_BG };
+            let display_name = if entry.depth > 0 {
+                let arrows = "↳".repeat(entry.depth.min(4) as usize);
+                format!("{arrows} {}", entry.name)
+            } else {
+                entry.name.clone()
+            };
             draw_strip(
                 ui,
                 entry.index as usize,
-                entry.name.as_str(),
+                &display_name,
                 entry.volume,
                 entry.pan,
                 entry.muted,
@@ -106,7 +121,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 entry.peak_l_raw,
                 entry.peak_r_raw,
                 Rect { x, y: strip_y, w: STRIP_WIDTH, h: strip_h },
-                COLOR_STRIP_BG,
+                bg,
                 entry.index,
                 false,
             );

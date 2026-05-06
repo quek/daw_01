@@ -37,6 +37,12 @@ pub struct TrackMixEntry {
     /// `Ui::level_meter` は内部で dB 変換するので、view 側ではこのまま渡す。
     pub peak_l_raw: f32,
     pub peak_r_raw: f32,
+    /// `kind == Group` のとき mixer strip / arrangement で別色表示し、
+    /// 子トラックを束ねる sub-mix bus として識別する。
+    pub is_group: bool,
+    /// このトラックの depth (parent_group_id を辿った段数)。 0 = master 直下、
+    /// 1 = 1 段ネスト、… mixer strip / arrangement view が階層インデント描画に使う。
+    pub depth: u8,
 }
 
 impl Default for TrackMixEntry {
@@ -50,6 +56,8 @@ impl Default for TrackMixEntry {
             solo: false,
             peak_l_raw: 0.0,
             peak_r_raw: 0.0,
+            is_group: false,
+            depth: 0,
         }
     }
 }
@@ -107,7 +115,14 @@ pub struct AppData {
     pub file_path: Option<PathBuf>,
 
     // -------- Selection --------
-    pub selected_track: u32,
+    /// Track multi-selection (Ableton Live / Reaper 互換)。 末尾要素 =
+    /// 「最後にクリックした anchor」 = カーソル相当。 widget 側 (gui_01
+    /// arrangement) からは `selected_tracks: &[u32]` として渡す。 id
+    /// ベース (Track::id) で持ち、 track 並び替えでも安定。
+    pub selected_track_ids: Vec<u32>,
+    /// 折り畳み中の group track id 集合。 group 自身が `kind == Group`
+    /// (= 子を持つ) かつこの set に含まれていれば子孫の row を hide。
+    pub collapsed_groups: std::collections::HashSet<u32>,
     pub selected_clip: Option<ClipRef>,
     pub selected_clips: Vec<ClipRef>,
     pub selected_notes: Vec<u32>,
@@ -297,7 +312,8 @@ impl AppData {
         Self {
             song,
             file_path: None,
-            selected_track: 0,
+            selected_track_ids: Vec::new(),
+            collapsed_groups: std::collections::HashSet::new(),
             selected_clip: None,
             selected_clips: Vec::new(),
             selected_notes: Vec::new(),
@@ -369,6 +385,60 @@ impl AppData {
 
     // -------- Derived snapshots (毎フレーム計算; cache が必要なら view 側で持つ) -----
 
+    /// 「カーソル相当」 = `selected_track_ids` の末尾要素。 `None` の
+    /// ときは選択ゼロ (まだ何もクリックしていない / 全 track 削除直後)。
+    pub fn cursor_track_id(&self) -> Option<u32> {
+        self.selected_track_ids.last().copied()
+    }
+
+    /// カーソル track の `song.tracks` 内 index。 selection は id ベース
+    /// なので、 track 並び替え後でも index は再評価される。
+    pub fn cursor_track_index(&self) -> Option<usize> {
+        let id = self.cursor_track_id()?;
+        self.song.tracks.iter().position(|t| t.id == id)
+    }
+
+    /// 単一カーソル選択にする。 multi-select を使う UI 側からは
+    /// `selected_track_ids = vec![id]` を直接書く方が自然なので、 これは
+    /// 既存の「index で選択しなおす」 旧フローを id ベースに変換する
+    /// 互換ヘルパ。 当面は呼び出し側がない (Phase 2 移行中) ので
+    /// dead_code を許容。
+    #[allow(dead_code)]
+    pub fn set_cursor_track_index(&mut self, idx: usize) {
+        if let Some(t) = self.song.tracks.get(idx) {
+            self.selected_track_ids = vec![t.id];
+        }
+    }
+
+    /// A track acts as a "group" iff at least one other track points
+    /// at it via `parent_group_id`. The role is purely derived — there
+    /// is no `Track::kind` field. SSOT (CLAUDE.md).
+    pub fn is_group_track(&self, track_id: u32) -> bool {
+        self.song
+            .tracks
+            .iter()
+            .any(|t| t.parent_group_id == Some(track_id))
+    }
+
+    /// Walk a track's `parent_group_id` chain to count how many group
+    /// hops sit between it and the master bus. Saturated at 32 to keep
+    /// pathological cycles (which the schedule compiler also rejects)
+    /// from looping forever in the GUI's derived snapshot.
+    pub fn compute_track_depth(&self, track: &common::model::Track) -> u8 {
+        let mut cursor = track.parent_group_id;
+        let mut depth: u8 = 0;
+        let mut hops = 0;
+        while let Some(pid) = cursor {
+            depth = depth.saturating_add(1);
+            hops += 1;
+            if hops > 32 {
+                break;
+            }
+            cursor = self.song.track_by_id(pid).and_then(|t| t.parent_group_id);
+        }
+        depth
+    }
+
     pub fn track_mix(&self) -> Vec<TrackMixEntry> {
         self.song
             .tracks
@@ -389,31 +459,45 @@ impl AppData {
                     solo: t.solo,
                     peak_l_raw: l,
                     peak_r_raw: r,
+                    is_group: self.is_group_track(t.id),
+                    depth: self.compute_track_depth(t),
                 }
             })
             .collect()
     }
 
     pub fn selected_track_label(&self) -> String {
-        let sel = self.selected_track;
-        self.song
-            .tracks
-            .get(sel as usize)
-            .map(|t| {
-                if t.name.is_empty() {
-                    format!("Track {}", sel + 1)
-                } else {
-                    t.name.clone()
-                }
-            })
-            .unwrap_or_else(|| format!("Track {}", sel + 1))
+        let n_selected = self.selected_track_ids.len();
+        if n_selected > 1 {
+            return format!("{n_selected} tracks selected");
+        }
+        match self.cursor_track_index() {
+            Some(idx) => self
+                .song
+                .tracks
+                .get(idx)
+                .map(|t| {
+                    if t.name.is_empty() {
+                        format!("Track {}", idx + 1)
+                    } else {
+                        t.name.clone()
+                    }
+                })
+                .unwrap_or_else(|| format!("Track {}", idx + 1)),
+            None => "(no track)".into(),
+        }
     }
 
     pub fn inspector_chain(&self) -> Vec<ChainEntry> {
-        let Some(track) = self.song.tracks.get(self.selected_track as usize) else {
+        let Some(idx) = self.cursor_track_index() else {
+            return Vec::new();
+        };
+        let Some(track) = self.song.tracks.get(idx) else {
             return Vec::new();
         };
         let mut chain: Vec<ChainEntry> = Vec::new();
+        // Reaper folder model: every track (group or not) can carry
+        // MIDI FX / instrument / audio FX, so show all rows uniformly.
         for (i, p) in track.midi_fx_chain.iter().enumerate() {
             chain.push(ChainEntry {
                 slot_kind: 0,
@@ -493,13 +577,19 @@ impl AppData {
         self.selected_notes.clear();
         self.track_rename_idx = None;
         self.track_rename_text.clear();
-        let track_max = self.song.tracks.len().saturating_sub(1) as u32;
-        let is_empty = self.song.tracks.is_empty();
-        if is_empty {
-            self.selected_track = 0;
-        } else if self.selected_track > track_max {
-            self.selected_track = track_max;
+        // selected_track_ids: undo で track が消えていたら除外。 残りが
+        // 空なら「最後の track をカーソル」 にフォールバック (UI が
+        // 完全選択ゼロでフリーズしないため)。
+        let live_ids: std::collections::HashSet<u32> =
+            self.song.tracks.iter().map(|t| t.id).collect();
+        self.selected_track_ids.retain(|id| live_ids.contains(id));
+        if self.selected_track_ids.is_empty()
+            && let Some(last) = self.song.tracks.last()
+        {
+            self.selected_track_ids.push(last.id);
         }
+        // collapsed_groups も track が消えていたら除外。
+        self.collapsed_groups.retain(|id| live_ids.contains(id));
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
         self.resync_song_edit_texts();
@@ -512,6 +602,9 @@ impl AppData {
             AppEvent::New
                 | AppEvent::AddVocalTrack
                 | AppEvent::AddInstrumentTrack
+                | AppEvent::GroupSelectedTracks { .. }
+                | AppEvent::UngroupTracks { .. }
+                | AppEvent::SetTrackParent { .. }
                 | AppEvent::RemoveLastTrack
                 | AppEvent::CommitRenameTrack
                 | AppEvent::CreateClip { .. }
@@ -692,6 +785,34 @@ pub enum AppEvent {
     SetNoteVelocity { note: u32, velocity: u8 },
     AddVocalTrack,
     AddInstrumentTrack,
+    /// Group the selected tracks under a fresh group track. Mirrors
+    /// Ableton Live's Cmd/Ctrl+G: the existing tracks become children
+    /// (their `parent_group_id` is set), and the new group is inserted
+    /// just *before* the highest-positioned selected track (= 一番上の
+    /// 選択 track の直前 / 子の上にヘッダー)。 `track_ids` must be
+    /// non-empty — Live forbids empty groups and so do we. If a
+    /// selected track is itself a group (= already has children), it
+    /// ends up nested under the new group (Live behaviour, depth
+    /// unbounded).
+    GroupSelectedTracks {
+        track_ids: Vec<u32>,
+    },
+    /// Ungroup the selected group tracks. Children are reparented to
+    /// the group's own parent (master or upper group), then the group
+    /// track itself is removed. The group's `fx_chain` is lost
+    /// (Ableton Live convention). Non-group tracks in the selection
+    /// are silently ignored.
+    UngroupTracks {
+        track_ids: Vec<u32>,
+    },
+    /// Reparent a track. `track_id` becomes a child of `parent_id` (or
+    /// a top-level track when `parent_id == None`). The graph compiler
+    /// rejects the edit (silently keeping the old parent) if it would
+    /// produce a cycle.
+    SetTrackParent {
+        track_id: u32,
+        parent_id: Option<u32>,
+    },
     RemoveLastTrack,
     DeleteTrack(u32),
     MoveTrackUp(u32),
@@ -905,6 +1026,15 @@ impl AppData {
             }
             AppEvent::AddVocalTrack => self.action_add_vocal_track(),
             AppEvent::AddInstrumentTrack => self.action_add_instrument_track(),
+            AppEvent::GroupSelectedTracks { track_ids } => {
+                self.action_group_selected_tracks(&track_ids);
+            }
+            AppEvent::UngroupTracks { track_ids } => {
+                self.action_ungroup_tracks(&track_ids);
+            }
+            AppEvent::SetTrackParent { track_id, parent_id } => {
+                self.action_set_track_parent(track_id, parent_id);
+            }
             AppEvent::RemoveLastTrack => self.action_remove_last_track(),
             AppEvent::DeleteTrack(idx) => self.delete_track(idx),
             AppEvent::MoveTrackUp(idx) => self.swap_tracks(idx, idx.saturating_sub(1)),
@@ -1228,7 +1358,7 @@ impl AppData {
         }
     }
 
-    fn sync_song_to_plugin_host(&mut self) {
+    pub(crate) fn sync_song_to_plugin_host(&mut self) {
         self.is_dirty = true;
         if self.is_dragging {
             return;
@@ -1242,7 +1372,8 @@ impl AppData {
     fn action_new(&mut self) {
         self.song = Song::default();
         self.file_path = None;
-        self.selected_track = 0;
+        self.selected_track_ids.clear();
+        self.collapsed_groups.clear();
         self.selected_clip = None;
         self.selected_notes.clear();
         self.resize_track_peak_display();
@@ -1278,7 +1409,8 @@ impl AppData {
                 self.restore_plugin_from_song(&song);
                 self.song = song;
                 self.file_path = Some(path.clone());
-                self.selected_track = 0;
+                self.selected_track_ids.clear();
+                self.collapsed_groups.clear();
                 self.selected_clip = None;
                 self.selected_notes.clear();
                 self.resize_track_peak_display();
@@ -1379,7 +1511,8 @@ impl AppData {
         self.restore_plugin_from_song(&song);
         self.song = song;
         self.file_path = common::recovery::original_file_for_sidecar(&autosave_path);
-        self.selected_track = 0;
+        self.selected_track_ids.clear();
+        self.collapsed_groups.clear();
         self.selected_clip = None;
         self.selected_notes.clear();
         self.resize_track_peak_display();
@@ -1625,34 +1758,95 @@ impl AppData {
             return;
         }
         self.push_undo_snapshot();
-        #[cfg(windows)]
-        {
-            self.plugin_host_windows.retain(|&(t, _), _| t != idx);
+
+        // When deleting a Group track, Live recursively removes its
+        // entire subtree (children + nested groups) so dangling
+        // `parent_group_id` references don't survive. Collect the full
+        // subtree of stable ids, then resolve them to current indices
+        // and remove from highest to lowest so earlier indices stay
+        // valid during the loop.
+        let target_id = self.song.tracks[idx as usize].id;
+        let subtree_ids = self.collect_track_subtree_ids(target_id);
+        let mut subtree_idxs: Vec<u32> = subtree_ids
+            .iter()
+            .filter_map(|id| self.song.track_index_by_id(*id))
+            .map(|i| i as u32)
+            .collect();
+        subtree_idxs.sort_unstable();
+        subtree_idxs.dedup();
+
+        for &i in subtree_idxs.iter().rev() {
+            #[cfg(windows)]
+            {
+                self.plugin_host_windows.retain(|&(t, _), _| t != i);
+            }
+            self.song.tracks.remove(i as usize);
+            self.send_plugin(MainToChild::RemoveTrack { track: i });
         }
-        self.song.tracks.remove(idx as usize);
-        self.send_plugin(MainToChild::RemoveTrack { track: idx });
+
+        // selected_clip: if its track was deleted, clear; otherwise
+        // shift down by the number of deleted tracks above it.
         if let Some(r) = self.selected_clip {
-            if r.track == idx {
+            if subtree_idxs.contains(&r.track) {
                 self.selected_clip = None;
                 self.selected_notes.clear();
-            } else if r.track > idx {
+            } else {
+                let drops_above = subtree_idxs.iter().filter(|&&i| i < r.track).count() as u32;
                 self.selected_clip = Some(ClipRef {
-                    track: r.track - 1,
+                    track: r.track - drops_above,
                     clip: r.clip,
                 });
             }
         }
-        let new_track = if self.selected_track == idx {
-            idx.saturating_sub(1)
-        } else if self.selected_track > idx {
-            self.selected_track - 1
-        } else {
-            self.selected_track
-        };
-        let max = self.song.tracks.len().saturating_sub(1) as u32;
-        self.selected_track = new_track.min(max);
+
+        // selected_track_ids: subtree に含まれていた id を全て除外。
+        // 残りが空なら直近の生存 track にフォールバック (UI 完全選択
+        // ゼロを避ける)。
+        let subtree_ids_set: std::collections::HashSet<u32> = subtree_ids.iter().copied().collect();
+        self.selected_track_ids
+            .retain(|id| !subtree_ids_set.contains(id));
+        if self.selected_track_ids.is_empty()
+            && let Some(t) = self.song.tracks.last()
+        {
+            self.selected_track_ids.push(t.id);
+        }
+        // collapsed_groups からも消えた id を除外。
+        self.collapsed_groups
+            .retain(|id| !subtree_ids_set.contains(id));
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
+    }
+
+    /// Return `root_id` plus every descendant track that points at it
+    /// (directly or transitively) via `parent_group_id`. Used by
+    /// `delete_track` when removing a Group: the whole subtree is
+    /// dropped together (Live convention) so no orphan references
+    /// survive. Cycle-safe via a hop limit.
+    fn collect_track_subtree_ids(&self, root_id: u32) -> Vec<u32> {
+        let mut result = vec![root_id];
+        let mut frontier = vec![root_id];
+        let mut hops = 0;
+        while !frontier.is_empty() {
+            hops += 1;
+            if hops > self.song.tracks.len() + 1 {
+                tracing::error!(
+                    root_id,
+                    "collect_track_subtree_ids: cycle detected, aborting BFS"
+                );
+                break;
+            }
+            let mut next = Vec::new();
+            for &pid in &frontier {
+                for t in &self.song.tracks {
+                    if t.parent_group_id == Some(pid) && !result.contains(&t.id) {
+                        result.push(t.id);
+                        next.push(t.id);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        result
     }
 
     fn swap_tracks(&mut self, a: u32, b: u32) {
@@ -1678,11 +1872,8 @@ impl AppData {
                 clip: r.clip,
             });
         }
-        if self.selected_track == a {
-            self.selected_track = b;
-        } else if self.selected_track == b {
-            self.selected_track = a;
-        }
+        // selected_track_ids は id ベースなので track の index swap で
+        // 自動的に追従する (id は変わらないため再マッピング不要)。
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
     }
@@ -1704,7 +1895,7 @@ impl AppData {
         let selected_track_id = self
             .song
             .tracks
-            .get(self.selected_track as usize)
+            .get(self.cursor_track_index().unwrap_or(0))
             .map(|t| t.id);
         let selected_clip_keys: Vec<(u32, u32)> = self
             .selected_clips
@@ -1741,12 +1932,11 @@ impl AppData {
         new_tracks.append(&mut self.song.tracks);
         self.song.tracks = new_tracks;
 
-        // selection を id で復元
-        if let Some(id) = selected_track_id
-            && let Some(idx) = self.song.tracks.iter().position(|t| t.id == id)
-        {
-            self.selected_track = idx as u32;
-        }
+        // selected_track_ids は id ベースなので、 reorder 後も自動的に
+        // 整合 (id は変わらず、 song.tracks の Vec 内 index が変わるだけ
+        // で `cursor_track_index` が再評価される)。 selected_track_id
+        // 局所変数は不要。
+        let _ = selected_track_id;
         let new_clips: Vec<ClipRef> = selected_clip_keys
             .iter()
             .filter_map(|(tid, cid)| {
@@ -1771,13 +1961,16 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
+    /// 単独選択する (index ベース、 旧 API 互換)。 新 multi-select API
+    /// (gui_01 #016) からは `SelectTrack { next, modifier, .. }` 経由で
+    /// `selected_track_ids` を直接書き込む。
     fn select_track(&mut self, idx: u32) {
-        let n = self.song.tracks.len() as u32;
-        if idx >= n {
+        let Some(t) = self.song.tracks.get(idx as usize) else {
             return;
-        }
-        if self.selected_track != idx {
-            self.selected_track = idx;
+        };
+        let id = t.id;
+        if self.selected_track_ids.as_slice() != [id] {
+            self.selected_track_ids = vec![id];
         }
     }
 
@@ -1854,6 +2047,219 @@ impl AppData {
         tracing::info!(index, "added instrument track");
     }
 
+    /// Ableton Live's Cmd/Ctrl+G: wrap the listed `track_ids` in a
+    /// fresh `kind == Group` track. The selected tracks become the
+    /// group's children (their `parent_group_id` is rewritten), and
+    /// the new group is inserted just after the highest-indexed
+    /// selected track so it visually sits at the top of its
+    /// children's "block" (Live convention). Empty selections are
+    /// silently ignored — Live forbids empty groups.
+    ///
+    /// Already-grouped tracks keep their old parent's settings; only
+    /// their immediate parent pointer is rewritten. If a selected
+    /// track was a group itself, it ends up nested under the new
+    /// group (depth unbounded).
+    fn action_group_selected_tracks(&mut self, track_ids: &[u32]) {
+        if track_ids.is_empty() {
+            tracing::info!("group request ignored: empty selection");
+            return;
+        }
+        // De-duplicate while preserving the first-appearance order.
+        let mut child_ids: Vec<u32> = Vec::with_capacity(track_ids.len());
+        for &id in track_ids {
+            if !child_ids.contains(&id) {
+                child_ids.push(id);
+            }
+        }
+        // Validate all ids exist before mutating anything.
+        if child_ids.iter().any(|id| self.song.track_by_id(*id).is_none()) {
+            tracing::warn!(?child_ids, "group request: stale track id, abort");
+            return;
+        }
+        // 仕様 §4: 「選択トラックのうち、 index が最も小さいものの
+        // 直前」 に新グループを挿入 (= 一番上の選択 track の上)。
+        // Live 互換、 視覚的には「子の上にヘッダー行」。
+        let top_child_idx = child_ids
+            .iter()
+            .filter_map(|id| self.song.track_index_by_id(*id))
+            .min()
+            .unwrap_or(self.song.tracks.len());
+        // Inherit the common parent of the selection if every selected
+        // track shared the same `parent_group_id` — preserves Live's
+        // behaviour of grouping inside a group keeps you in the parent.
+        let common_parent = {
+            let first_parent = self
+                .song
+                .track_by_id(child_ids[0])
+                .and_then(|t| t.parent_group_id);
+            if child_ids.iter().all(|id| {
+                self.song
+                    .track_by_id(*id)
+                    .and_then(|t| t.parent_group_id)
+                    == first_parent
+            }) {
+                first_parent
+            } else {
+                None
+            }
+        };
+        let group_id = self.song.alloc_track_id();
+        let group_index = self.song.tracks.len() + 1;
+        let group_track = Track {
+            id: group_id,
+            name: format!("Group {group_index}"),
+            // Reaper folder model: a "group" is just a track that has
+            // children. No dedicated kind enum — once the children's
+            // `parent_group_id` is repointed below, this track auto-
+            // matically becomes a group bus to the engine.
+            parent_group_id: common_parent,
+            source: InstrumentSource::None,
+            clips: Vec::new(),
+            ..Track::default()
+        };
+        // Repoint every selected track's parent to the new group.
+        for &cid in &child_ids {
+            if let Some(t) = self.song.track_by_id_mut(cid) {
+                t.parent_group_id = Some(group_id);
+            }
+        }
+        // 新 group track を **末尾に append** する。 Vec::insert で
+        // 既存 track の index を shift させると plugin host 側の
+        // `slot_to_plugin_id: HashMap<(track_idx, slot), plugin_id>`
+        // が壊れて子の plugin chain が見失われ無音になる。 LoadSong
+        // も `(track_idx, slot)` キーを再マッピングしないので追従
+        // しない。 視覚位置は仕様 §4 で「一番上の選択の直前」 とした
+        // が、 plugin host を `(track_id, slot)` ベースに改修するまで
+        // は実現できない (別 PR で対応)。 末尾 append の間も子の
+        // plugin chain は (track_idx, slot) 不変なので無音にならない。
+        let _ = top_child_idx;
+        self.song.tracks.push(group_track);
+        // 新規 group track を選択状態に (Live 互換: グループ化直後は
+        // 親 group が selection cursor になる)。
+        self.selected_track_ids = vec![group_id];
+        self.resize_track_peak_display();
+        self.sync_song_to_plugin_host();
+        tracing::info!(group_id, ?child_ids, "grouped tracks");
+    }
+
+    /// Alt+G: 選択中の group track の subtree を 1 階層持ち上げる。
+    /// 仕様 §5: 子の `parent_group_id` を group の親 (master or 上位
+    /// group) に向ける + group track 自体を削除。 group の `fx_chain`
+    /// は失われる (Live 仕様)。 複数 group が選択されているときは深い
+    /// (子) → 浅い (親) の順に処理してインデックスを安定させる。
+    fn action_ungroup_tracks(&mut self, track_ids: &[u32]) {
+        if track_ids.is_empty() {
+            return;
+        }
+        // 選択された track の中から「実際に子を持つ」ものだけ ungroup
+        // 対象。 通常 track が選択に混じっていても無視。
+        let mut groups_to_ungroup: Vec<u32> = track_ids
+            .iter()
+            .copied()
+            .filter(|id| self.is_group_track(*id))
+            .collect();
+        if groups_to_ungroup.is_empty() {
+            tracing::info!(
+                ?track_ids,
+                "ungroup request: no group track in selection, ignored"
+            );
+            return;
+        }
+        // 深さ降順 (子から先に処理)。 同階層なら index 大きい方から。
+        groups_to_ungroup.sort_by_key(|id| {
+            let depth = self
+                .song
+                .track_by_id(*id)
+                .map(|t| self.compute_track_depth(t))
+                .unwrap_or(0);
+            (-(depth as i32), -(self.song.track_index_by_id(*id).unwrap_or(0) as i32))
+        });
+
+        let mut new_selection: Vec<u32> = Vec::new();
+        for group_id in &groups_to_ungroup {
+            let Some(group_track) = self.song.track_by_id(*group_id) else {
+                continue;
+            };
+            let new_parent = group_track.parent_group_id;
+            // 子の parent_group_id を group の親に書き換え
+            for t in &mut self.song.tracks {
+                if t.parent_group_id == Some(*group_id) {
+                    t.parent_group_id = new_parent;
+                    new_selection.push(t.id);
+                }
+            }
+            // group track 自体を削除 + plugin host 側の slot 状態を同期。
+            // RemoveTrack IPC を送らないと、 plugin host の
+            // `slot_to_plugin_id: HashMap<(track_idx, slot), plugin_id>`
+            // で **後続 track の index が shift されず**、 ungroup 後の
+            // 子 track が正しい plugin chain を見つけられず無音になる。
+            // delete_track と同じパターンで RemoveTrack を送る。
+            if let Some(pos) = self.song.tracks.iter().position(|t| t.id == *group_id) {
+                let idx = pos as u32;
+                #[cfg(windows)]
+                {
+                    self.plugin_host_windows.retain(|&(t, _), _| t != idx);
+                }
+                self.song.tracks.remove(pos);
+                self.send_plugin(MainToChild::RemoveTrack { track: idx });
+            }
+            // collapsed_groups からも消えた group id を除外
+            self.collapsed_groups.remove(group_id);
+        }
+        // selection: ungroup 後は元 group の子を選択 (Live 互換)。
+        if !new_selection.is_empty() {
+            self.selected_track_ids = new_selection;
+        }
+        self.resize_track_peak_display();
+        self.sync_song_to_plugin_host();
+        tracing::info!(?groups_to_ungroup, "ungrouped tracks");
+    }
+
+    /// Reparent `track_id` to `parent_id` (or detach to the master bus
+    /// when `parent_id` is None). Any track is allowed as a parent
+    /// (the "group" role is implicit — a track that has children).
+    /// Validates the new parent chain doesn't contain `track_id`
+    /// itself so the schedule compiler never sees a cyclic state.
+    fn action_set_track_parent(&mut self, track_id: u32, parent_id: Option<u32>) {
+        if Some(track_id) == parent_id {
+            tracing::warn!(track_id, "ignored self-parent edit");
+            return;
+        }
+        if let Some(pid) = parent_id {
+            if self.song.track_by_id(pid).is_none() {
+                tracing::warn!(track_id, parent_id = pid, "ignored: parent track not found");
+                return;
+            }
+            // Walk the parent's chain upward looking for `track_id`. If
+            // we find it, the edit would create a cycle.
+            let mut cursor = Some(pid);
+            let mut hops = 0u32;
+            while let Some(c) = cursor {
+                if c == track_id {
+                    tracing::warn!(track_id, parent_id = pid, "ignored: would create a cycle");
+                    return;
+                }
+                hops += 1;
+                if hops > self.song.tracks.len() as u32 + 1 {
+                    // Existing graph already has a cycle; abort to avoid an infinite loop.
+                    tracing::error!("existing parent chain is cyclic; aborting reparent");
+                    return;
+                }
+                cursor = self
+                    .song
+                    .track_by_id(c)
+                    .and_then(|t| t.parent_group_id);
+            }
+        }
+        let Some(track) = self.song.track_by_id_mut(track_id) else {
+            tracing::warn!(track_id, "ignored: track not found");
+            return;
+        };
+        track.parent_group_id = parent_id;
+        self.sync_song_to_plugin_host();
+        tracing::info!(track_id, ?parent_id, "track reparented");
+    }
+
     fn action_remove_last_track(&mut self) {
         let len = self.song.tracks.len();
         if len == 0 {
@@ -1874,13 +2280,18 @@ impl AppData {
                 .retain(|&(t, _), _| t != removed_idx);
         }
         self.send_plugin(MainToChild::RemoveTrack { track: removed_idx });
-        let new_max = self.song.tracks.len().saturating_sub(1) as u32;
-        let is_empty = self.song.tracks.is_empty();
-        if is_empty {
-            self.selected_track = 0;
-        } else if self.selected_track > new_max {
-            self.selected_track = new_max;
+        // selected_track_ids は id ベース。 削除対象 track id を除外
+        // (Vec の index で持つ subtree とは異なり id 直接判定)。 残りが
+        // 空なら最後尾にフォールバック。
+        let live_ids: std::collections::HashSet<u32> =
+            self.song.tracks.iter().map(|t| t.id).collect();
+        self.selected_track_ids.retain(|id| live_ids.contains(id));
+        if self.selected_track_ids.is_empty()
+            && let Some(t) = self.song.tracks.last()
+        {
+            self.selected_track_ids.push(t.id);
         }
+        self.collapsed_groups.retain(|id| live_ids.contains(id));
         self.selected_clips.retain(|c| c.track != removed_idx);
         if let Some(r) = self.selected_clip
             && r.track == removed_idx
@@ -2429,7 +2840,7 @@ impl AppData {
             1 => PluginSlot::Instrument,
             _ => PluginSlot::Fx(slot_index),
         };
-        let track = self.selected_track;
+        let track = self.cursor_track_index().unwrap_or(0) as u32;
         #[cfg(windows)]
         {
             if self.plugin_host_windows.contains_key(&(track, slot)) {
@@ -2497,7 +2908,7 @@ impl AppData {
         if !same_section {
             return;
         }
-        let track_idx = self.selected_track;
+        let track_idx = self.cursor_track_index().unwrap_or(0) as u32;
         let Some(track) = self.song.tracks.get_mut(track_idx as usize) else {
             return;
         };
@@ -2535,7 +2946,7 @@ impl AppData {
             1 => PluginSlot::Instrument,
             _ => PluginSlot::Fx(slot_index),
         };
-        let track_idx = self.selected_track;
+        let track_idx = self.cursor_track_index().unwrap_or(0) as u32;
         self.send_plugin(MainToChild::RemoveSlotPlugin {
             track: track_idx,
             slot,
@@ -2673,7 +3084,7 @@ impl AppData {
         let entry_id = entry.id.clone();
         let entry_format = entry.format;
         self.ensure_first_track();
-        let track_idx = self.selected_track;
+        let track_idx = self.cursor_track_index().unwrap_or(0) as u32;
         let target = self.plugin_picker_target;
         let dest_slot = match target {
             PickerTarget::Instrument => PluginSlot::Instrument,

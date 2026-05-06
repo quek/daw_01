@@ -146,6 +146,28 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             app.handle_event(AppEvent::ToggleLoop)
         }));
     }
+    // Ableton Live's Cmd/Ctrl+G — group the selected tracks. gui_01
+    // #016 で arrangement widget が track header の Shift/Ctrl クリック
+    // 多重選択を実装したので、 selection は `selected_track_ids` から
+    // 直接取れる。 空なら no-op。
+    if ui.take_shortcut("daw.group_tracks") {
+        let track_ids = app.selected_track_ids.clone();
+        if !track_ids.is_empty() {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::GroupSelectedTracks { track_ids });
+            }));
+        }
+    }
+    // Alt+G — ungroup the selected group tracks (Ableton Live の
+    // Cmd/Ctrl+Shift+G に相当、 本 DAW はユーザー指定で Alt+G)。
+    if ui.take_shortcut("daw.ungroup_tracks") {
+        let track_ids = app.selected_track_ids.clone();
+        if !track_ids.is_empty() {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::UngroupTracks { track_ids });
+            }));
+        }
+    }
     if ui.take_shortcut("daw.synthesize_vocal") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::SynthesizeVocal)

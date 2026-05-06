@@ -6,6 +6,15 @@ use anyhow::{Context, Result};
 
 use crate::model::{CURRENT_VERSION, ProjectFile, Song};
 
+/// Oldest project-file version `load` will accept. Versions below this
+/// (currently `1` = the retired row-based format) are rejected with a
+/// "re-create the project" error. Versions in `[MIN_LOADABLE_VERSION,
+/// CURRENT_VERSION)` are accepted and forward-migrated via
+/// `#[serde(default)]` on any new fields — fine because every field
+/// added since v2 has a sensible default and no reinterpretation of
+/// existing data.
+const MIN_LOADABLE_VERSION: u32 = 2;
+
 pub fn save(path: impl AsRef<Path>, song: &Song) -> Result<()> {
     let path = path.as_ref();
     let tmp = tmp_path(path);
@@ -49,14 +58,21 @@ pub fn load(path: impl AsRef<Path>) -> Result<Song> {
             CURRENT_VERSION
         );
     }
-    if project.version < CURRENT_VERSION {
+    if project.version < MIN_LOADABLE_VERSION {
         anyhow::bail!(
-            "project file {} uses legacy version {}; the row-based format \
-             was retired in version {}. Re-create the project in the \
+            "project file {} uses retired version {} (the row-based \
+             format predating version 2); re-create the project in the \
              current free-time-note format.",
             path.display(),
             project.version,
-            CURRENT_VERSION
+        );
+    }
+    if project.version < CURRENT_VERSION {
+        tracing::info!(
+            path = %path.display(),
+            from_version = project.version,
+            current_version = CURRENT_VERSION,
+            "loaded legacy project file; missing fields filled with serde defaults"
         );
     }
     Ok(project.song)
@@ -162,6 +178,40 @@ mod tests {
     }
 
     #[test]
+    fn load_accepts_v4_with_default_routing_fields() {
+        // v4 saves had no `kind` / `parent_group_id` /
+        // `reported_latency_samples` keys on each `Track`. Loading must
+        // succeed and fill those fields with their serde defaults
+        // (Audio / None / 0).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v4.daw");
+        let v4_json = r#"{
+            "version": 4,
+            "song": {
+                "bpm": 140.0,
+                "time_sig": [4, 4],
+                "length_beats": 64.0,
+                "tracks": [
+                    {
+                        "id": 1,
+                        "name": "Lead",
+                        "volume": 0.85,
+                        "pan": 0.0,
+                        "next_clip_id": 1
+                    }
+                ]
+            }
+        }"#;
+        fs::write(&path, v4_json).unwrap();
+        let song = load(&path).expect("v4 must forward-migrate");
+        assert_eq!(song.bpm, 140.0);
+        assert_eq!(song.tracks.len(), 1);
+        let t = &song.tracks[0];
+        assert_eq!(t.parent_group_id, None);
+        assert_eq!(t.reported_latency_samples, 0);
+    }
+
+    #[test]
     fn load_rejects_legacy_row_based_version() {
         // Version 1 was the row-based format; we no longer support it.
         let dir = tempdir().unwrap();
@@ -172,7 +222,7 @@ mod tests {
         )
         .unwrap();
         let err = load(&path).unwrap_err().to_string();
-        assert!(err.contains("legacy"), "unexpected error: {err}");
+        assert!(err.contains("retired"), "unexpected error: {err}");
     }
 
     #[test]

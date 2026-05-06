@@ -51,7 +51,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     y += 28.0;
 
     // Vocal source 編集 (Vocal track のときのみ)
-    if let Some(track) = app.song.tracks.get(app.selected_track as usize)
+    if let Some(track) = app.song.tracks.get(app.cursor_track_index().unwrap_or(0))
         && let common::model::InstrumentSource::Vocal { speaker_id, .. } = &track.source
     {
         ui.label_at(
@@ -111,7 +111,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 selected_idx,
             ) && let Some((id, _, style_name)) = entries.get(picked)
             {
-                let track_idx = app.selected_track;
+                let track_idx = app.cursor_track_index().unwrap_or(0) as u32;
                 let new_id = *id;
                 let new_style = style_name.clone();
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -122,6 +122,83 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     });
                 }));
             }
+        }
+        y += 30.0;
+    }
+
+    // ---- Parent group dropdown ---------------------------------------
+    // Reaper folder / Live group equivalent. The selected track can
+    // optionally be reparented under any other track that already has
+    // children (or any track really — the cycle check in
+    // `action_set_track_parent` rejects bad picks). Master bus =
+    // "(top-level)" sentinel.
+    if let Some(track) = app.song.tracks.get(app.cursor_track_index().unwrap_or(0)) {
+        // Candidates: tracks that already have at least one child (= are
+        // groups in the Reaper-folder sense), excluding the selected
+        // track itself and any of its descendants. Picking a non-group
+        // track as parent is also valid, but the dropdown only surfaces
+        // existing groups — to convert a regular track into a group,
+        // the user picks it as parent here and the act of pointing at
+        // it makes it one. PR2 phase 1 keeps the simpler "groups only"
+        // candidate list; expand later if it surfaces as a friction.
+        let groups: Vec<(u32, String)> = app
+            .song
+            .tracks
+            .iter()
+            .filter(|t| app.is_group_track(t.id) && t.id != track.id)
+            .map(|t| (t.id, if t.name.is_empty() { format!("Group {}", t.id) } else { t.name.clone() }))
+            .collect();
+
+        ui.label_at(
+            "inspector_parent_label",
+            "Parent",
+            area.x + pad,
+            y,
+            12.0,
+            TEXT_DIM,
+        );
+        y += 18.0;
+
+        let dropdown_rect = Rect {
+            x: area.x + pad,
+            y,
+            w: area.w - pad * 2.0,
+            h: 24.0,
+        };
+
+        // Build option list: "(top-level)" then every other group track.
+        let mut labels: Vec<String> = Vec::with_capacity(groups.len() + 1);
+        labels.push("(top-level)".into());
+        labels.extend(groups.iter().map(|(_, n)| n.clone()));
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+
+        let selected_idx = match track.parent_group_id {
+            None => 0,
+            Some(pid) => groups
+                .iter()
+                .position(|(id, _)| *id == pid)
+                .map(|i| i + 1)
+                .unwrap_or(0),
+        };
+
+        if let Some(picked) = ui.dropdown(
+            "inspector_parent_dropdown",
+            dropdown_rect,
+            &label_refs,
+            selected_idx,
+        ) {
+            let new_parent = if picked == 0 {
+                None
+            } else {
+                groups.get(picked - 1).map(|(id, _)| *id)
+            };
+            let track_id = track.id;
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetTrackParent {
+                    track_id,
+                    parent_id: new_parent,
+                });
+            }));
         }
         y += 30.0;
     }
@@ -221,9 +298,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         },
     );
 
-    // 下端: + Instrument / + FX / + MIDI FX
+    // 下端: + Inst / + FX / + MIDI FX。Reaper folder 流で group track
+    // も全機能を持てる仕様 (plan_group_track.md §1)、よって group も
+    // 普通 track と同じ 3 ボタン表示。
     let btn_w = (area.w - pad * 2.0 - 12.0) / 3.0;
-
     ui.button_at(
         "inspector_add_inst",
         "+ Inst",
