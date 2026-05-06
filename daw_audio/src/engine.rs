@@ -1222,3 +1222,84 @@ fn run_group_fx_chain(
         scratch.peak_r = peak_r;
     }
 }
+
+#[cfg(test)]
+mod sidechain_tests {
+    use super::*;
+    use crate::graph::compile_schedule;
+    use common::model::{PluginInstance, Song, Track};
+    use common::plugin_format::PluginFormat;
+
+    /// PR4 Sidechain engine-handler test: 実 plugin を立てなくても、
+    /// `execute_schedule_post_dispatch` の `NodeOp::SidechainTap` ハンドラ
+    /// が source TrackScratch の signal を `pd.buffer_aux_in[port]` に正しく
+    /// copy することを直接検証する。 ProcessData は heap に Box で置き、
+    /// `PluginRef` を手書きして plugin_refs / slot_to_plugin_id に登録する。
+    #[test]
+    fn sidechain_tap_copies_source_track_into_plugin_aux_in_buffer() {
+        let song = Song {
+            tracks: vec![
+                Track { id: 1, name: "Source".into(), ..Track::default() },
+                Track {
+                    id: 2,
+                    name: "Dest".into(),
+                    fx_chain: vec![PluginInstance {
+                        plugin_id: "test.scc".into(),
+                        format: PluginFormat::Vst3,
+                        state: None,
+                        sidechain_sources: vec![Some(1)],
+                    }],
+                    ..Track::default()
+                },
+            ],
+            ..Song::default()
+        };
+        let mut schedule = compile_schedule(&song).unwrap();
+        assert!(schedule.nodes.iter().any(|op| matches!(op, NodeOp::SidechainTap { .. })));
+
+        const FRAMES: usize = 64;
+        let mut scratch: Vec<TrackScratch> =
+            (0..common::audio_bridge::MAX_TRACKS).map(|_| TrackScratch::new()).collect();
+        for i in 0..FRAMES {
+            scratch[0].track_l[i] = (i as f32) * 0.1;
+            scratch[0].track_r[i] = -(i as f32) * 0.1;
+        }
+        let mut master_l = vec![0.0f32; FRAMES];
+        let mut master_r = vec![0.0f32; FRAMES];
+
+        let mut pd = Box::new(common::process_data::ProcessData::empty());
+        let pd_ptr: *mut common::process_data::ProcessData = &mut *pd;
+        let plugin_id: u32 = 42;
+        let plugin_ref = common::plugin_ref::PluginRef { plugin_id, process_data: pd_ptr };
+        let mut plugin_refs: HashMap<u32, common::plugin_ref::PluginRef> = HashMap::new();
+        plugin_refs.insert(plugin_id, plugin_ref);
+
+        let mut slot_to_plugin_id: HashMap<(u32, common::protocol::PluginSlot), u32> =
+            HashMap::new();
+        slot_to_plugin_id.insert((2, common::protocol::PluginSlot::Fx(0)), plugin_id);
+
+        execute_schedule_post_dispatch(
+            &mut schedule,
+            &mut scratch,
+            &mut master_l,
+            &mut master_r,
+            FRAMES,
+            &song,
+            &plugin_refs,
+            &slot_to_plugin_id,
+            None,
+            48_000,
+            FRAMES as u32,
+            true,
+            false,
+        );
+
+        for i in 0..FRAMES {
+            let want_l = (i as f32) * 0.1;
+            let want_r = -(i as f32) * 0.1;
+            assert!((pd.buffer_aux_in[0][0][i] - want_l).abs() < 1e-6);
+            assert!((pd.buffer_aux_in[0][1][i] - want_r).abs() < 1e-6);
+        }
+        assert_eq!(pd.aux_in_active[0], 1);
+    }
+}
