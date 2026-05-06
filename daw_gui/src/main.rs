@@ -20,12 +20,16 @@ use daw_gui::view::runner::{RunnerInit, run as run_runner};
 struct CliArgs {
     script: Option<PathBuf>,
     output: Option<PathBuf>,
+    /// Free-form `--arg KEY=VALUE` pairs. Exposed to JS as
+    /// `daw.scriptArgs[key]` so test scripts can take parameters.
+    extra: Vec<(String, String)>,
 }
 
 fn parse_args() -> Result<CliArgs> {
     let args: Vec<String> = std::env::args().collect();
     let mut script: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
+    let mut extra: Vec<(String, String)> = Vec::new();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -43,8 +47,20 @@ fn parse_args() -> Result<CliArgs> {
                     .ok_or_else(|| anyhow::anyhow!("--output needs a path"))?;
                 output = Some(PathBuf::from(v));
             }
+            "--arg" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--arg needs KEY=VALUE"))?;
+                let (k, val) = v
+                    .split_once('=')
+                    .ok_or_else(|| anyhow::anyhow!("--arg requires KEY=VALUE form (got {v:?})"))?;
+                extra.push((k.to_string(), val.to_string()));
+            }
             "--help" | "-h" => {
-                println!("daw_gui [--script <path.js>] [--output <path.wav>]");
+                println!(
+                    "daw_gui [--script <path.js>] [--output <path.wav>] [--arg KEY=VALUE]..."
+                );
                 std::process::exit(0);
             }
             _ => {
@@ -53,7 +69,11 @@ fn parse_args() -> Result<CliArgs> {
         }
         i += 1;
     }
-    Ok(CliArgs { script, output })
+    Ok(CliArgs {
+        script,
+        output,
+        extra,
+    })
 }
 
 fn main() -> Result<()> {
@@ -65,7 +85,7 @@ fn main() -> Result<()> {
 
     if let Some(script_path) = cli.script.as_ref() {
         tracing::info!(script = %script_path.display(), "headless script mode");
-        return run_scripted(bootstrap, script_path, cli.output.as_deref());
+        return run_scripted(bootstrap, script_path, cli.output.as_deref(), &cli.extra);
     }
 
     run_gui(bootstrap)

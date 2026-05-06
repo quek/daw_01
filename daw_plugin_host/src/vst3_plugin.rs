@@ -85,6 +85,14 @@ pub struct Vst3Plugin {
     output_ptrs: Vec<*mut f32>,
     max_frames: u32,
     sample_rate: f64,
+    /// PR4 sidechain: per-aux-input-bus channel counts in the plugin's
+    /// declared bus order (skipping the main bus). Capped at
+    /// `MAX_AUX_IN`. Empty when the plugin has only the main input bus.
+    aux_input_channels: Vec<u32>,
+    /// Pre-allocated planar buffers for each aux input bus (bus × ch × frame).
+    aux_input_buffers: Vec<Vec<Vec<f32>>>,
+    /// Per-aux-bus channel pointer scratch (refreshed each process()).
+    aux_input_ptrs: Vec<Vec<*mut f32>>,
 
     /// Scratch buffer for input events fed to the plugin this tick. Cleared
     /// and re-filled on every `process()`.
@@ -288,10 +296,12 @@ impl Vst3Plugin {
         // の channelCount をそのまま採用する。
         let input_channels = main_audio_bus_channel_count(&component, BusDirections_::kInput);
         let output_channels = main_audio_bus_channel_count(&component, BusDirections_::kOutput);
+        let aux_input_channels = aux_input_bus_channels(&component);
         tracing::info!(
             input_channels,
             output_channels,
-            "VST3 main audio bus channel counts"
+            aux_input_count = aux_input_channels.len(),
+            "VST3 audio bus channel counts"
         );
 
         Ok(Self {
@@ -315,6 +325,9 @@ impl Vst3Plugin {
             output_ptrs: Vec::new(),
             max_frames: 0,
             sample_rate: 0.0,
+            aux_input_channels,
+            aux_input_buffers: Vec::new(),
+            aux_input_ptrs: Vec::new(),
             in_event_buffer: Vec::with_capacity(256),
             collected_out_notes: Vec::with_capacity(256),
             in_event_list: ComWrapper::new(Vst3InEventList::new()),
@@ -401,6 +414,36 @@ fn arrangement_for_bus(
 
 /// `busType == Main` の最初の audio bus の channel count を返す。 main bus が
 /// 無ければ index 0 (= 多くの plugin で main 相当)、 それも無ければ 0。
+/// PR4 sidechain: enumerate `is_main=false` (= `kAux`) input buses and
+/// return their channel counts in declaration order. Capped at
+/// `MAX_AUX_IN`. Empty when the plugin has only the main input bus.
+fn aux_input_bus_channels(component: &ComPtr<IComponent>) -> Vec<u32> {
+    use vst3::Steinberg::Vst::{BusDirections_, BusInfo, BusTypes_, MediaTypes_};
+    let count = unsafe { component.getBusCount(MediaTypes_::kAudio, BusDirections_::kInput) };
+    let mut aux: Vec<u32> = Vec::new();
+    for i in 0..count {
+        let mut info: BusInfo = unsafe { std::mem::zeroed() };
+        let res = unsafe {
+            component.getBusInfo(MediaTypes_::kAudio, BusDirections_::kInput, i, &mut info)
+        };
+        if res != vst3::Steinberg::kResultOk {
+            continue;
+        }
+        if info.busType == BusTypes_::kAux {
+            if aux.len() >= common::process_data::MAX_AUX_IN {
+                tracing::warn!(
+                    bus_index = i,
+                    cap = common::process_data::MAX_AUX_IN,
+                    "VST3 plugin declared more aux input buses than the host caps to"
+                );
+                break;
+            }
+            aux.push(info.channelCount as u32);
+        }
+    }
+    aux
+}
+
 /// VST3 spec: BusType の Main は `kMain` (= 0)。
 fn main_audio_bus_channel_count(
     component: &ComPtr<IComponent>,
@@ -722,6 +765,22 @@ impl LoadedPlugin for Vst3Plugin {
             .map(|_| vec![0.0f32; max_frames as usize])
             .collect();
         self.output_ptrs = vec![std::ptr::null_mut(); self.output_channels as usize];
+        // PR4 sidechain: allocate planar buffers + ptr scratch for each
+        // aux input bus. Mirrors the main input bus allocation above.
+        self.aux_input_buffers = self
+            .aux_input_channels
+            .iter()
+            .map(|&ch| {
+                (0..ch as usize)
+                    .map(|_| vec![0.0f32; max_frames as usize])
+                    .collect()
+            })
+            .collect();
+        self.aux_input_ptrs = self
+            .aux_input_channels
+            .iter()
+            .map(|&ch| vec![std::ptr::null_mut(); ch as usize])
+            .collect();
         self.active = true;
         tracing::info!(name = %self.name, sample_rate, max_frames, "VST3 plugin activated");
         Ok(())
@@ -771,6 +830,7 @@ impl LoadedPlugin for Vst3Plugin {
         frames: u32,
         events: &[TimedNoteEvent],
         input_audio: &[&[f32]],
+        aux_inputs: &[crate::plugin_instance::AuxInputBuf<'_>],
     ) -> Result<i32> {
         anyhow::ensure!(self.processing, "VST3 plugin not processing");
 
@@ -796,6 +856,29 @@ impl LoadedPlugin for Vst3Plugin {
         for i in 0..self.output_buffers.len() {
             self.output_ptrs[i] = self.output_buffers[i].as_mut_ptr();
         }
+        // PR4 sidechain: copy aux input audio into our pre-allocated
+        // planar bus buffers, mirroring the main bus copy above. Each
+        // aux bus channel pointer is refreshed here so AudioBusBuffers
+        // sees the latest base pointers.
+        for (bus_idx, bus_bufs) in self.aux_input_buffers.iter_mut().enumerate() {
+            let aux = aux_inputs.get(bus_idx).copied();
+            for (ch, buf) in bus_bufs.iter_mut().enumerate() {
+                let cap = n.min(buf.len());
+                let src: &[f32] = match (aux, ch) {
+                    (Some(a), 0) if a.active => a.l,
+                    (Some(a), 1) if a.active => a.r,
+                    _ => &[],
+                };
+                let copy_n = cap.min(src.len());
+                buf[..copy_n].copy_from_slice(&src[..copy_n]);
+                if copy_n < cap {
+                    buf[copy_n..cap].fill(0.0);
+                }
+            }
+            for (ch, ptrs) in self.aux_input_ptrs[bus_idx].iter_mut().enumerate() {
+                *ptrs = bus_bufs[ch].as_mut_ptr();
+            }
+        }
 
         // --- Build Event buffer and hand it to the reusable input list.
         // No per-process allocation: both `in_event_buffer` and
@@ -819,14 +902,27 @@ impl LoadedPlugin for Vst3Plugin {
             .to_com_ptr::<IEventList>()
             .context("Vst3OutEventList has no IEventList")?;
 
-        // --- Assemble AudioBusBuffers.
-        let mut in_bus = AudioBusBuffers {
-            numChannels: self.input_channels as i32,
-            silenceFlags: 0,
-            __field0: AudioBusBuffers__type0 {
-                channelBuffers32: self.input_ptrs.as_mut_ptr(),
-            },
-        };
+        // --- Assemble AudioBusBuffers (main + aux inputs).
+        let mut in_buses: Vec<AudioBusBuffers> =
+            Vec::with_capacity(1 + self.aux_input_channels.len());
+        if self.input_channels > 0 {
+            in_buses.push(AudioBusBuffers {
+                numChannels: self.input_channels as i32,
+                silenceFlags: 0,
+                __field0: AudioBusBuffers__type0 {
+                    channelBuffers32: self.input_ptrs.as_mut_ptr(),
+                },
+            });
+        }
+        for bus_idx in 0..self.aux_input_channels.len() {
+            in_buses.push(AudioBusBuffers {
+                numChannels: self.aux_input_channels[bus_idx] as i32,
+                silenceFlags: 0,
+                __field0: AudioBusBuffers__type0 {
+                    channelBuffers32: self.aux_input_ptrs[bus_idx].as_mut_ptr(),
+                },
+            });
+        }
         let mut out_bus = AudioBusBuffers {
             numChannels: self.output_channels as i32,
             silenceFlags: 0,
@@ -848,12 +944,12 @@ impl LoadedPlugin for Vst3Plugin {
             processMode: ProcessModes_::kRealtime,
             symbolicSampleSize: SymbolicSampleSizes_::kSample32,
             numSamples: frames as i32,
-            numInputs: if self.input_channels > 0 { 1 } else { 0 },
+            numInputs: in_buses.len() as i32,
             numOutputs: if self.output_channels > 0 { 1 } else { 0 },
-            inputs: if self.input_channels > 0 {
-                &mut in_bus
-            } else {
+            inputs: if in_buses.is_empty() {
                 std::ptr::null_mut()
+            } else {
+                in_buses.as_mut_ptr()
             },
             outputs: if self.output_channels > 0 {
                 &mut out_bus

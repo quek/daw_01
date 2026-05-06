@@ -9,7 +9,7 @@ use clap_sys::events::{
     clap_event_note, clap_input_events, clap_output_events,
 };
 use clap_sys::ext::audio_ports::{
-    CLAP_EXT_AUDIO_PORTS, clap_audio_port_info, clap_plugin_audio_ports,
+    CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, clap_audio_port_info, clap_plugin_audio_ports,
 };
 use clap_sys::ext::gui::{
     CLAP_EXT_GUI, CLAP_WINDOW_API_WIN32, clap_plugin_gui, clap_window, clap_window_handle,
@@ -71,6 +71,16 @@ pub struct ClapPlugin {
     /// `clap_plugin_latency` vtable pointer (PR3.3). `None` when the
     /// plugin doesn't implement the latency extension.
     latency_ext: Option<*const clap_plugin_latency>,
+    /// PR4 sidechain: per-aux-input-port channel counts in the plugin's
+    /// declared port order. Length capped at `MAX_AUX_IN`. Empty when
+    /// the plugin has no `is_main=false` input ports.
+    aux_input_channels: Vec<u32>,
+    /// Pre-allocated planar buffers for each aux input port. Outer:
+    /// aux port idx. Middle: channel idx within port. Inner: per-frame
+    /// f32 (capped at `max_frames`).
+    aux_input_buffers: Vec<Vec<Vec<f32>>>,
+    /// Per-aux-port channel pointer scratch (filled each `process` call).
+    aux_input_ptrs: Vec<Vec<*mut f32>>,
 }
 
 // The plugin holds raw pointers but ownership is exclusive within the struct.
@@ -204,9 +214,11 @@ impl ClapPlugin {
         log_note_ports(plugin_ptr, get_ext);
         let input_channels = query_port_channel_count(plugin_ptr, get_ext, true);
         let output_channels = query_output_channel_count(plugin_ptr, get_ext);
+        let aux_input_channels = query_aux_input_channels(plugin_ptr, get_ext);
         tracing::info!(
             input_channels,
             output_channels,
+            aux_input_count = aux_input_channels.len(),
             "plugin audio channel count"
         );
 
@@ -261,6 +273,9 @@ impl ClapPlugin {
             gui_created: false,
             state_ext,
             latency_ext,
+            aux_input_channels,
+            aux_input_buffers: Vec::new(),
+            aux_input_ptrs: Vec::new(),
         }))
     }
 
@@ -433,6 +448,24 @@ impl ClapPlugin {
             .map(|_| vec![0.0f32; max_frames as usize])
             .collect();
         self.output_ptrs = vec![std::ptr::null_mut(); self.output_channels as usize];
+        // PR4 sidechain: allocate planar buffers for each aux input port,
+        // one Vec<f32> per channel, sized to max_frames. The
+        // `data32` pointer scratch (`aux_input_ptrs`) is rebuilt every
+        // process() call.
+        self.aux_input_buffers = self
+            .aux_input_channels
+            .iter()
+            .map(|&ch_count| {
+                (0..ch_count as usize)
+                    .map(|_| vec![0.0f32; max_frames as usize])
+                    .collect()
+            })
+            .collect();
+        self.aux_input_ptrs = self
+            .aux_input_channels
+            .iter()
+            .map(|&ch_count| vec![std::ptr::null_mut(); ch_count as usize])
+            .collect();
         tracing::info!(sample_rate, max_frames, "plugin activated");
         Ok(())
     }
@@ -508,6 +541,7 @@ impl ClapPlugin {
         frames: u32,
         events: &[TimedNoteEvent],
         input_audio: &[&[f32]],
+        aux_inputs: &[crate::plugin_instance::AuxInputBuf<'_>],
     ) -> Result<i32> {
         anyhow::ensure!(self.processing, "plugin not processing");
 
@@ -540,18 +574,60 @@ impl ClapPlugin {
         for i in 0..self.input_buffers.len() {
             self.input_ptrs[i] = self.input_buffers[i].as_mut_ptr();
         }
+        // PR4 sidechain: copy aux inputs into our pre-allocated planar
+        // aux_input_buffers and rebuild aux_input_ptrs scratch. Inactive
+        // ports get silence so the plugin sees a consistent buffer
+        // regardless of routing state.
+        for (port_idx, port_bufs) in self.aux_input_buffers.iter_mut().enumerate() {
+            let aux = aux_inputs.get(port_idx).copied();
+            for (ch, buf) in port_bufs.iter_mut().enumerate() {
+                let cap = n.min(buf.len());
+                let src: &[f32] = match (aux, ch) {
+                    (Some(a), 0) if a.active => a.l,
+                    (Some(a), 1) if a.active => a.r,
+                    // Plugin asked for >2 channels — feed silence; not
+                    // supported by our stereo-only sidechain pipeline.
+                    _ => &[],
+                };
+                let copy_n = cap.min(src.len());
+                buf[..copy_n].copy_from_slice(&src[..copy_n]);
+                if copy_n < cap {
+                    buf[copy_n..cap].fill(0.0);
+                }
+            }
+            for (ch, ptrs) in self.aux_input_ptrs[port_idx].iter_mut().enumerate() {
+                *ptrs = port_bufs[ch].as_mut_ptr();
+            }
+        }
         // Refresh output channel pointers (buffers are pre-allocated).
         for i in 0..self.output_buffers.len() {
             self.output_ptrs[i] = self.output_buffers[i].as_mut_ptr();
         }
 
-        let audio_in = clap_audio_buffer {
-            data32: self.input_ptrs.as_mut_ptr(),
-            data64: std::ptr::null_mut(),
-            channel_count: self.input_channels,
-            latency: 0,
-            constant_mask: 0,
-        };
+        // PR4 sidechain: build the full clap_audio_buffer array — main
+        // input first (matching CLAP convention that port 0 is main),
+        // then each aux port. Length = 1 (main) + aux count when main is
+        // present, else 0 (instrument with no audio input + no aux).
+        let mut input_bufs: Vec<clap_audio_buffer> =
+            Vec::with_capacity(1 + self.aux_input_channels.len());
+        if self.input_channels > 0 {
+            input_bufs.push(clap_audio_buffer {
+                data32: self.input_ptrs.as_mut_ptr(),
+                data64: std::ptr::null_mut(),
+                channel_count: self.input_channels,
+                latency: 0,
+                constant_mask: 0,
+            });
+        }
+        for port_idx in 0..self.aux_input_channels.len() {
+            input_bufs.push(clap_audio_buffer {
+                data32: self.aux_input_ptrs[port_idx].as_mut_ptr(),
+                data64: std::ptr::null_mut(),
+                channel_count: self.aux_input_channels[port_idx],
+                latency: 0,
+                constant_mask: 0,
+            });
+        }
         let mut audio_out = clap_audio_buffer {
             data32: self.output_ptrs.as_mut_ptr(),
             data64: std::ptr::null_mut(),
@@ -570,10 +646,10 @@ impl ClapPlugin {
             try_push: Some(collect_out_note_try_push),
         };
 
-        let (audio_inputs, audio_inputs_count) = if self.input_channels == 0 {
+        let (audio_inputs, audio_inputs_count) = if input_bufs.is_empty() {
             (std::ptr::null(), 0)
         } else {
-            (&raw const audio_in, 1)
+            (input_bufs.as_ptr(), input_bufs.len() as u32)
         };
         let (audio_outputs, audio_outputs_count) = if self.output_channels == 0 {
             (std::ptr::null_mut(), 0)
@@ -595,6 +671,9 @@ impl ClapPlugin {
 
         let process = unsafe { (*self.plugin).process }.context("plugin.process is null")?;
         let status = unsafe { process(self.plugin, &process_ctx) };
+        // input_bufs lives until end of scope here, so the data32
+        // pointers it stored stay valid through the FFI call above.
+        drop(input_bufs);
         Ok(status)
     }
 
@@ -823,6 +902,48 @@ fn query_output_channel_count(plugin: *const clap_plugin, get_ext: GetExtFn) -> 
     query_port_channel_count(plugin, get_ext, false)
 }
 
+/// PR4 sidechain: enumerate the plugin's `is_main=false` input ports and
+/// return their channel counts in declaration order. Capped at
+/// `common::process_data::MAX_AUX_IN` (extras logged + ignored). Returns
+/// an empty Vec for plugins without aux inputs (the typical instrument /
+/// non-sidechain effect case).
+fn query_aux_input_channels(plugin: *const clap_plugin, get_ext: GetExtFn) -> Vec<u32> {
+    let ext_ptr =
+        unsafe { get_ext(plugin, CLAP_EXT_AUDIO_PORTS.as_ptr()) } as *const clap_plugin_audio_ports;
+    if ext_ptr.is_null() {
+        return Vec::new();
+    }
+    let ext = unsafe { &*ext_ptr };
+    let Some(count_fn) = ext.count else {
+        return Vec::new();
+    };
+    let Some(get) = ext.get else {
+        return Vec::new();
+    };
+    let port_count = unsafe { count_fn(plugin, true) };
+    let mut aux: Vec<u32> = Vec::new();
+    for i in 0..port_count {
+        let mut info = std::mem::MaybeUninit::<clap_audio_port_info>::zeroed();
+        let ok = unsafe { get(plugin, i, true, info.as_mut_ptr()) };
+        if !ok {
+            continue;
+        }
+        let info = unsafe { info.assume_init() };
+        if info.flags & CLAP_AUDIO_PORT_IS_MAIN == 0 {
+            if aux.len() >= common::process_data::MAX_AUX_IN {
+                tracing::warn!(
+                    port_index = i,
+                    cap = common::process_data::MAX_AUX_IN,
+                    "plugin declared more aux input ports than the host caps to"
+                );
+                break;
+            }
+            aux.push(info.channel_count);
+        }
+    }
+    aux
+}
+
 /// Queries the plugin's first audio port in the given direction. `is_input`
 /// selects input vs output ports. Returns `0` when the plugin declares no
 /// port of that direction (e.g. instrument with no audio input, or pure
@@ -981,8 +1102,9 @@ impl LoadedPlugin for ClapPlugin {
         frames: u32,
         events: &[TimedNoteEvent],
         input_audio: &[&[f32]],
+        aux_inputs: &[crate::plugin_instance::AuxInputBuf<'_>],
     ) -> Result<i32> {
-        self.process(frames, events, input_audio)
+        self.process(frames, events, input_audio, aux_inputs)
     }
 
     fn output_buffer(&self, channel: usize) -> Option<&[f32]> {

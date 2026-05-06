@@ -42,11 +42,16 @@ pub fn run_scripted(
     bootstrap: Bootstrap,
     script_path: &Path,
     output_override: Option<&Path>,
+    extra_args: &[(String, String)],
 ) -> Result<()> {
     let source = std::fs::read_to_string(script_path)
         .with_context(|| format!("failed to read script {}", script_path.display()))?;
     HOST.with_borrow_mut(|h| {
-        *h = Some(ScriptHost::new(bootstrap, output_override.map(PathBuf::from)));
+        *h = Some(ScriptHost::new(
+            bootstrap,
+            output_override.map(PathBuf::from),
+            extra_args.to_vec(),
+        ));
     });
 
     let result = (|| -> Result<()> {
@@ -84,13 +89,20 @@ struct ScriptHost {
 #[derive(Default, Clone)]
 struct ScriptArgs {
     output: Option<PathBuf>,
+    /// Free-form `--arg KEY=VALUE` pairs from the CLI, exposed as
+    /// `daw.scriptArgs[key]` properties.
+    extra: Vec<(String, String)>,
 }
 
 impl ScriptHost {
-    fn new(bootstrap: Bootstrap, output: Option<PathBuf>) -> Self {
+    fn new(
+        bootstrap: Bootstrap,
+        output: Option<PathBuf>,
+        extra: Vec<(String, String)>,
+    ) -> Self {
         Self {
             bootstrap,
-            script_args: ScriptArgs { output },
+            script_args: ScriptArgs { output, extra },
             last_loaded_song: None,
             plugin_to_track: std::collections::HashMap::new(),
             plugin_latencies: std::collections::HashMap::new(),
@@ -292,17 +304,31 @@ fn register_daw_globals(ctx: &mut Context) -> Result<()> {
         )
         .build();
 
-    // `daw.scriptArgs` (= { output: <CLI で指定された --output 値 or null> })
+    // `daw.scriptArgs` = { output: <CLI で指定された --output or null>,
+    //                      <extra key>: <extra value>, ... }
     let args_obj = boa_engine::object::ObjectInitializer::new(ctx).build();
-    let output_value: JsValue = HOST.with_borrow(|h| {
-        match h.as_ref().and_then(|h| h.script_args.output.as_ref()) {
-            Some(p) => JsString::from(p.to_string_lossy().as_ref()).into(),
-            None => JsValue::null(),
-        }
-    });
+    let (output_value, extras): (JsValue, Vec<(String, String)>) =
+        HOST.with_borrow(|h| {
+            let host = h.as_ref();
+            let output = match host.and_then(|h| h.script_args.output.as_ref()) {
+                Some(p) => JsString::from(p.to_string_lossy().as_ref()).into(),
+                None => JsValue::null(),
+            };
+            let extras = host
+                .map(|h| h.script_args.extra.clone())
+                .unwrap_or_default();
+            (output, extras)
+        });
     args_obj
         .set(js_string!("output"), output_value, false, ctx)
         .map_err(|e| anyhow!("set scriptArgs.output: {e}"))?;
+    for (k, v) in extras {
+        let key = JsString::from(k.as_str());
+        let val: JsValue = JsString::from(v.as_str()).into();
+        args_obj
+            .set(key, val, false, ctx)
+            .map_err(|e| anyhow!("set scriptArgs.{k}: {e}"))?;
+    }
     daw.set(js_string!("scriptArgs"), args_obj, false, ctx)
         .map_err(|e| anyhow!("set daw.scriptArgs: {e}"))?;
 

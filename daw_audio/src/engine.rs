@@ -56,10 +56,14 @@ pub enum AudioCommand {
     /// A new plugin instance was loaded; the audio engine has opened
     /// its `ProcessData` shmem and is ready to drive `plugin.process()`.
     /// `track` / `slot` let the engine slot the plugin into its routing
-    /// graph at the matching position.
+    /// graph at the matching position. `handle` keeps the daw_audio-side
+    /// shmem mapping alive — without it, `plugin_ref.process_data` would
+    /// be a dangling pointer once `handle_open_plugin_shmem` returns and
+    /// drops its local `ProcessDataHandle`.
     OpenPluginShmem {
         plugin_id: u32,
         plugin_ref: PluginRef,
+        handle: common::process_data::ProcessDataHandle,
         track: u32,
         slot: PluginSlot,
     },
@@ -294,6 +298,7 @@ impl LocalState {
                 AudioCommand::OpenPluginShmem {
                     plugin_id,
                     plugin_ref,
+                    handle,
                     track,
                     slot,
                 } => {
@@ -310,6 +315,15 @@ impl LocalState {
                     new_refs.insert(plugin_id, plugin_ref);
                     self.shared.plugin_refs.store(Arc::new(new_refs));
                     self.shared.slot_to_plugin_id.store(Arc::new(new_slot));
+                    // The `handle` keeps the daw_audio-side shmem
+                    // mapping alive for the life of the AudioCommand;
+                    // immediately leak it to extend that lifetime to the
+                    // end of the process. ClosePluginShmem doesn't
+                    // currently reclaim the memory — see
+                    // `handle_open_plugin_shmem` for the original
+                    // leak-on-open pattern this mirrors.
+                    let leaked = Box::leak(Box::new(handle));
+                    let _ = leaked;
                     tracing::info!(plugin_id, track, ?slot, "plugin shmem registered");
                 }
                 AudioCommand::ClosePluginShmem { plugin_id } => {

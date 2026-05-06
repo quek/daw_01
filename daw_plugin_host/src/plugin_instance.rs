@@ -35,6 +35,22 @@ pub struct TimedNoteEvent {
     pub event: NoteTransition,
 }
 
+/// PR4 sidechain: one aux input port worth of buffers handed to
+/// `LoadedPlugin::process`. Mirrors `pd.buffer_aux_in[port]` /
+/// `pd.aux_in_active[port]` from the shmem `ProcessData`. Stereo only
+/// (CLAP / VST3 both expose stereo aux for the typical sidechain
+/// compressor / gate / ducker workflows).
+#[derive(Clone, Copy)]
+pub struct AuxInputBuf<'a> {
+    /// Whether the audio engine wrote real audio into `l` / `r` this
+    /// buffer. Inactive ports are still passed (so plugin's port count
+    /// stays stable across calls) but with silent slices, and CLAP
+    /// backends are free to pass `data32: null` instead.
+    pub active: bool,
+    pub l: &'a [f32],
+    pub r: &'a [f32],
+}
+
 /// Host callbacks plugins may trigger on *any* thread (usually the
 /// plugin's GUI thread). Implementations must be `Send + Sync` and must
 /// not block the caller — plugins often hold an internal lock across
@@ -74,11 +90,16 @@ pub trait LoadedPlugin: Send {
     fn stop_processing(&mut self);
     /// Runs one buffer. `events` must be sorted by ascending `time` (CLAP
     /// requirement, also honoured by VST3 for consistency).
+    /// `aux_inputs` carries PR4 sidechain audio: one entry per `is_main=false`
+    /// input port the plugin declared, in declaration order. `active=false`
+    /// means the host has no source wired to this aux port — backends pass
+    /// silence (or null `data32` for CLAP) so the plugin observes silence.
     fn process(
         &mut self,
         frames: u32,
         events: &[TimedNoteEvent],
         input_audio: &[&[f32]],
+        aux_inputs: &[AuxInputBuf<'_>],
     ) -> Result<i32>;
     /// Planar output. `None` means "no such channel" (e.g. mono plugin
     /// queried for channel 1).

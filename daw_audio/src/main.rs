@@ -388,17 +388,11 @@ fn handle_open_plugin_shmem(
         .send(engine::AudioCommand::OpenPluginShmem {
             plugin_id,
             plugin_ref,
+            handle,
             track,
             slot,
         })
         .map_err(|_| anyhow::anyhow!("audio command channel closed"))?;
-    // The handle owns the shmem mapping. We can't move it across to the
-    // audio thread inside the command — instead, the engine's PluginRef
-    // is just a raw pointer, so this side has to keep the mapping alive
-    // until ClosePluginShmem. Stash it in a leaky static for now; PR8
-    // will hang it off a proper `PluginShmemRegistry`.
-    let leaked = Box::leak(Box::new(handle));
-    let _ = leaked;
     Ok(())
 }
 

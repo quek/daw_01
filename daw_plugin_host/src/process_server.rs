@@ -224,7 +224,30 @@ fn run_worker(
         let (in_a, in_b) = pd.buffer_in.split_at(1);
         let input_audio: [&[f32]; 2] = [&in_a[0][..n], &in_b[0][..n]];
 
-        if let Err(e) = plugin.process(frames, &events_in, &input_audio) {
+        // PR4 sidechain: build per-aux-port input slices from
+        // `pd.buffer_aux_in` + `pd.aux_in_active`. The order is the host's
+        // declared aux port order (port 0 first), matching what the
+        // plugin's `is_main=false` declarations should be in.
+        let aux_inputs: [crate::plugin_instance::AuxInputBuf<'_>;
+            common::process_data::MAX_AUX_IN] = std::array::from_fn(|port| {
+            let active = pd.aux_in_active[port] != 0;
+            crate::plugin_instance::AuxInputBuf {
+                active,
+                l: &pd.buffer_aux_in[port][0][..n],
+                r: &pd.buffer_aux_in[port][1][..n],
+            }
+        });
+        // Reset aux_in_active for the next buffer; the audio engine is
+        // responsible for re-asserting it via `NodeOp::SidechainTap`. This
+        // keeps stale routing from leaking when the user disconnects the
+        // sidechain (no SidechainTap emitted ⇒ aux_in_active stays 0).
+        for flag in &mut pd.aux_in_active {
+            *flag = 0;
+        }
+
+        if let Err(e) =
+            plugin.process(frames, &events_in, &input_audio, &aux_inputs)
+        {
             tracing::error!(error = ?e, plugin_id, "plugin.process() failed");
         } else {
             // Copy output audio into the shmem.
