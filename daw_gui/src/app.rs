@@ -747,6 +747,12 @@ impl AppData {
         self.collapsed_groups.retain(|id| live_ids.contains(id));
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
+        // Undo / Redo は plugin_host / audio engine の plugin
+        // load 状態に直接 IPC を発行しないので、 ここで Song と
+        // `track_plugin_ids` を diff して同期させる。 さもなければ
+        // 「Bass track 削除 → Undo で track は復活するが plugin は
+        // load されない (= 音が出ない)」 となる。
+        self.reconcile_plugins_with_song();
         self.resync_song_edit_texts();
         self.pianoroll_notes_generation += 1;
     }
@@ -1778,6 +1784,129 @@ impl AppData {
                     "failed to remove sidecar on shutdown"
                 );
             }
+        }
+    }
+
+    /// Undo / Redo 後に呼んで、 `Song.tracks` と `track_plugin_ids`
+    /// (= plugin_host に load されている plugin 一覧) を diff し、
+    /// 必要な IPC を発行して両者を再同期する。
+    ///
+    /// Undo / Redo は `Song` の clone 入れ替えだけ行うので、 plugin_host
+    /// と audio engine 側の load 状態は元に戻らない。 そのまま放置すると
+    /// 「track 削除 → Undo で track 復活 → plugin が host に load されて
+    /// いないので音が鳴らない」 という UX バグになる。
+    ///
+    /// 2 phase:
+    ///   - **Phase A: stale remove** — `track_plugin_ids` にあるが
+    ///     `Song.tracks` には居ない track を、 `delete_track` と同じ
+    ///     IPC 順 (audio に `ClosePluginShmem` を先送り → plugin_host
+    ///     に `RemoveTrack`) で破棄する。 Redo が track 削除を進めた
+    ///     場合に発動する。
+    ///   - **Phase B: missing reload** — `Song.tracks` にあるが
+    ///     `track_plugin_ids` に key 自体が無い track の plugin chain を
+    ///     `SetSlotPlugin` で再 load する。 plugin_host 側は同 plugin_id
+    ///     の同 slot を dedup する (no-op + `SlotPluginLoaded` 再 emit)
+    ///     ので、 partial に host 側に残っているケースで送り直しても
+    ///     副作用はない。 ただし「同 track 内で plugin 構成が部分的に
+    ///     変わった Undo」 は本実装では同期しない (= track 全体が host に
+    ///     居なくなったケースのみ対応)。 この拡張は別 task。
+    ///
+    /// Plugin の **state** は `Song.PluginInstance::state` (= 直近の
+    /// project save 時点) を `initial_state` として渡す。 削除直前の
+    /// 最新 state (= knob を回した値) を復元するには `RequestAllStates`
+    /// を Undo snapshot タイミングで同期する別仕組みが要るので、 これも
+    /// 別 task として残す。
+    fn reconcile_plugins_with_song(&mut self) {
+        // Phase A: Song に無い track を host から消す。
+        let song_track_ids: std::collections::HashSet<u32> =
+            self.song.tracks.iter().map(|t| t.id).collect();
+        let stale_track_ids: Vec<u32> = self
+            .track_plugin_ids
+            .keys()
+            .copied()
+            .filter(|id| !song_track_ids.contains(id))
+            .collect();
+        if !stale_track_ids.is_empty() {
+            tracing::info!(?stale_track_ids, "reconcile: removing stale tracks from plugin host");
+        }
+        for track_id in stale_track_ids {
+            // `delete_track` と同じ IPC 順序: audio engine に
+            // ClosePluginShmem を先送りしてから plugin_host に
+            // RemoveTrack。
+            if let Some(plugin_ids) = self.track_plugin_ids.remove(&track_id) {
+                for pid in plugin_ids {
+                    self.send_audio(MainToChild::ClosePluginShmem { plugin_id: pid });
+                }
+            }
+            self.send_plugin(MainToChild::RemoveTrack { track: track_id });
+            // host から消す track の pending load / GUI window も掃除。
+            self.pending_plugin_loads.retain(|(t, _)| *t != track_id);
+            #[cfg(windows)]
+            {
+                self.plugin_host_windows.retain(|&(t, _), _| t != track_id);
+            }
+        }
+
+        // Phase B: host に key として存在しない track の plugin を再 load。
+        // `restore_plugin_from_song` を借りて DRY 化したいが、 そちらは
+        // 「全 track を投げる」 仕様なので、 こちらは「Song にあるが
+        // track_plugin_ids に key 不在」 の track だけに絞って同等処理を
+        // 行う。
+        let song = self.song.clone();
+        let to_load: Vec<(u32, PluginSlot, common::model::PluginInstance)> = song
+            .tracks
+            .iter()
+            .filter(|t| !self.track_plugin_ids.contains_key(&t.id))
+            .flat_map(|track| {
+                let mut entries = Vec::new();
+                let t = track.id;
+                for (i, p) in track.midi_fx_chain.iter().enumerate() {
+                    entries.push((t, PluginSlot::MidiFx(i as u32), p.clone()));
+                }
+                if let Some(inst) = track.instrument.as_ref() {
+                    entries.push((t, PluginSlot::Instrument, inst.clone()));
+                }
+                for (i, p) in track.fx_chain.iter().enumerate() {
+                    entries.push((t, PluginSlot::Fx(i as u32), p.clone()));
+                }
+                entries
+            })
+            .collect();
+
+        if to_load.is_empty() {
+            return;
+        }
+
+        let Some(db) = self.plugin_db.clone() else {
+            tracing::warn!(
+                pending = to_load.len(),
+                "reconcile: plugin database not loaded; cannot reload plugins"
+            );
+            return;
+        };
+        tracing::info!(
+            count = to_load.len(),
+            "reconcile: reloading plugins for restored tracks"
+        );
+        for (track, slot, inst) in to_load {
+            let Some(entry) = db.find_by_id(&inst.plugin_id) else {
+                tracing::error!(
+                    id = %inst.plugin_id,
+                    track,
+                    ?slot,
+                    "reconcile: plugin id not in database"
+                );
+                continue;
+            };
+            self.track_pending_load(track, slot);
+            self.send_plugin(MainToChild::SetSlotPlugin {
+                track,
+                slot,
+                format: entry.format,
+                path: entry.path.clone(),
+                plugin_id: entry.id.clone(),
+                initial_state: inst.state.clone(),
+            });
         }
     }
 
