@@ -96,6 +96,14 @@ pub trait LoadedPlugin: Send {
     /// `false` and continue at whatever mode they were already in.
     fn set_render_mode(&mut self, mode: RenderMode) -> bool;
 
+    /// PR3.3 PDC: query the plugin's reported processing latency in
+    /// samples (host sample_rate). Called once right after `activate()`
+    /// succeeds (CLAP spec: `clap_plugin_latency.get` requires
+    /// `[main-thread & active]`; VST3 spec: `IAudioProcessor::
+    /// getLatencySamples` requires Setup Done state). Backends without
+    /// the extension or that don't expose latency return 0.
+    fn query_latency(&mut self) -> u32;
+
     // --- persistence (plugin-main thread) -------------------------------
     fn state_save(&self) -> Result<Option<Vec<u8>>>;
     fn state_load(&self, data: &[u8]) -> Result<()>;

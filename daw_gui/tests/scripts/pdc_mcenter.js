@@ -67,10 +67,17 @@ daw.setSlotPlugin(
 );
 daw.waitForPluginLoaded(2, 2, 0, 30000);
 
-// MCenter の実 internal latency 4096 sample (Reaper FX dialog 表示)。
-// PR3.3 の自動 IPC ができるまで script から手動 set。
-const MCENTER_LATENCY = 4096;
-daw.setTrackLatency(2, MCENTER_LATENCY);
+// PR3.3: plugin が `ChildToMain::PluginLatencyChanged { plugin_id, samples }`
+// で自身の latency を IPC 経由で通知する。 script.rs の `pump_until` が
+// 受信して last_loaded_song の `reported_latency_samples` を 4096 に更新し、
+// `LoadSong` を再送 → daw_audio が `compile_schedule` で PDC を再計算する。
+// `setTrackLatency` 手動 call は不要になった。
+//
+// 確実に最新 latency が schedule に反映されてから `setVocalAudio` する
+// よう、 `waitForPluginLoaded` の後に明示的に IPC drain を 1 frame 挟む
+// のが理想だが、 `pump_until` 中に PluginLatencyChanged は同じ ack で
+// 届く (plugin_host が SlotPluginLoaded → PluginLatencyChanged の順で
+// emit) ので、 waitForPluginLoaded 完了時には latency 反映済。
 
 const click = new Float32Array(FRAMES);
 click[0] = 1.0;

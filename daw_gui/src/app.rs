@@ -145,6 +145,14 @@ pub struct AppData {
     /// → all_done 永久 wait) を防ぐ。 daw_gui が plugin_id を保持する
     /// ための単一 source of truth。
     pub track_plugin_ids: std::collections::HashMap<u32, Vec<u32>>,
+    /// PR3.3 PDC: `plugin_id → reported latency samples`。 plugin_host から
+    /// `ChildToMain::PluginLatencyChanged` を受信して更新、
+    /// `SlotPluginUnloaded` で drop。 各 track の累積 latency は
+    /// `track_plugin_ids[track_id].iter().map(|pid| plugin_latencies[pid]).sum()`
+    /// で計算して `Track::reported_latency_samples` に書く。 これが
+    /// `LoadSong` で daw_audio に渡って `compile_schedule` の PDC 補償に
+    /// 反映される (chain 内の plugin が直列に latency を加算する Ardour 流)。
+    pub plugin_latencies: std::collections::HashMap<u32, u32>,
     pub selected_clip: Option<ClipRef>,
     pub selected_clips: Vec<ClipRef>,
     pub selected_notes: Vec<u32>,
@@ -340,6 +348,7 @@ impl AppData {
             selected_track_ids: Vec::new(),
             collapsed_groups: std::collections::HashSet::new(),
             track_plugin_ids: std::collections::HashMap::new(),
+            plugin_latencies: std::collections::HashMap::new(),
             selected_clip: None,
             selected_clips: Vec::new(),
             selected_notes: Vec::new(),
@@ -945,6 +954,13 @@ pub enum AppEvent {
     SlotPluginUnloadedFromChild {
         plugin_id: u32,
     },
+    /// PR3.3: plugin_host から forward された 「plugin が報告した latency」 通知。
+    /// `plugin_latencies` に積んで track の累積 latency を再計算、 song を
+    /// 更新して LoadSong を daw_audio に再送 (compile_schedule で PDC 反映)。
+    PluginLatencyChangedFromChild {
+        plugin_id: u32,
+        samples: u32,
+    },
     AllStatesReceived(Vec<SlotState>),
     RescanPluginDb,
     PluginDbRescanCompleted,
@@ -1270,6 +1286,9 @@ impl AppData {
             }
             AppEvent::SlotPluginUnloadedFromChild { plugin_id } => {
                 self.on_plugin_unloaded_from_child(plugin_id);
+            }
+            AppEvent::PluginLatencyChangedFromChild { plugin_id, samples } => {
+                self.on_plugin_latency_changed(plugin_id, samples);
             }
             AppEvent::AllStatesReceived(entries) => {
                 self.on_all_states_from_child(entries);
@@ -2982,6 +3001,56 @@ impl AppData {
             entry.retain(|p| *p != plugin_id);
         }
         self.track_plugin_ids.retain(|_, v| !v.is_empty());
+        // PR3.3: drop the latency entry for the destroyed plugin and
+        // recompute every track's total since the chain shape changed.
+        self.plugin_latencies.remove(&plugin_id);
+        self.recompute_track_latencies();
+    }
+
+    /// PR3.3: store the new per-plugin reported latency, recompute the
+    /// owning track's total (sum of all its plugin latencies), and push the
+    /// updated `Song` to daw_audio so `compile_schedule` regenerates the
+    /// PDC delay lines.
+    fn on_plugin_latency_changed(&mut self, plugin_id: u32, samples: u32) {
+        self.plugin_latencies.insert(plugin_id, samples);
+        self.recompute_track_latencies();
+    }
+
+    /// Walk every `track_plugin_ids` entry, sum the plugin latencies into the
+    /// matching `Track::reported_latency_samples`, and re-`sync_song_to_plugin_host`
+    /// if anything changed. No-op when the totals already agree.
+    fn recompute_track_latencies(&mut self) {
+        let mut changed = false;
+        for (track_id, plugin_ids) in &self.track_plugin_ids {
+            let total: u32 = plugin_ids
+                .iter()
+                .map(|pid| self.plugin_latencies.get(pid).copied().unwrap_or(0))
+                .sum();
+            if let Some(track) = self.song.track_by_id_mut(*track_id)
+                && track.reported_latency_samples != total
+            {
+                track.reported_latency_samples = total;
+                changed = true;
+            }
+        }
+        // Tracks with no loaded plugins should report 0 — clear any stale
+        // value (e.g. the last plugin in a track was just removed).
+        let track_ids_with_plugins: std::collections::HashSet<u32> =
+            self.track_plugin_ids.keys().copied().collect();
+        for track in &mut self.song.tracks {
+            if !track_ids_with_plugins.contains(&track.id)
+                && track.reported_latency_samples != 0
+            {
+                track.reported_latency_samples = 0;
+                changed = true;
+            }
+        }
+        if changed {
+            // sync_song_to_plugin_host pushes the Song to daw_audio (the
+            // schedule recompile happens inside `LocalState::refresh_schedule`
+            // when it spots the new song Arc).
+            self.sync_song_to_plugin_host();
+        }
     }
 
     fn toggle_slot_gui(&mut self, slot_kind: u8, slot_index: u32) {

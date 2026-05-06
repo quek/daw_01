@@ -76,6 +76,13 @@ pub enum PluginEvent {
     SlotPluginUnloaded {
         plugin_id: u32,
     },
+    /// PR3.3: plugin が報告した自身の processing latency。 plugin が
+    /// activate された直後 (CLAP `activate` / VST3 `setActive(true)`) に
+    /// query して emit。 daw_gui へ forward され、 schedule に反映される。
+    PluginLatencyChanged {
+        plugin_id: u32,
+        samples: u32,
+    },
 }
 
 impl From<PluginEvent> for ChildToMain {
@@ -111,6 +118,9 @@ impl From<PluginEvent> for ChildToMain {
             PluginEvent::AllPluginStates { entries } => ChildToMain::AllPluginStates { entries },
             PluginEvent::SlotPluginUnloaded { plugin_id } => {
                 ChildToMain::SlotPluginUnloaded { plugin_id }
+            }
+            PluginEvent::PluginLatencyChanged { plugin_id, samples } => {
+                ChildToMain::PluginLatencyChanged { plugin_id, samples }
             }
         }
     }
@@ -538,6 +548,32 @@ fn plugin_main_loop(
                                             plugin_id: new_plugin_id,
                                             shmem_id,
                                         });
+                                        // PR3.3: query the plugin's reported
+                                        // latency right after activate
+                                        // (CLAP `[main-thread & active]` /
+                                        // VST3 `[UI-thread & Setup Done]`
+                                        // both satisfied here). Send a
+                                        // `PluginLatencyChanged` even when
+                                        // samples == 0 so daw_gui can
+                                        // overwrite a previously-cached
+                                        // value if the user replaces a
+                                        // plugin in the same slot.
+                                        if let Some(p) = plugin_ptr_raw {
+                                            let samples = unsafe {
+                                                (*p).query_latency()
+                                            };
+                                            tracing::info!(
+                                                plugin_id = new_plugin_id,
+                                                samples,
+                                                "plugin reported latency"
+                                            );
+                                            let _ = evt_tx.send(
+                                                PluginEvent::PluginLatencyChanged {
+                                                    plugin_id: new_plugin_id,
+                                                    samples,
+                                                },
+                                            );
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::error!(

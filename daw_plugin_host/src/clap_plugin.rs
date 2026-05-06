@@ -14,6 +14,7 @@ use clap_sys::ext::audio_ports::{
 use clap_sys::ext::gui::{
     CLAP_EXT_GUI, CLAP_WINDOW_API_WIN32, clap_plugin_gui, clap_window, clap_window_handle,
 };
+use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
 use clap_sys::ext::note_ports::{CLAP_EXT_NOTE_PORTS, clap_plugin_note_ports};
 use clap_sys::ext::render::{
     CLAP_EXT_RENDER, CLAP_RENDER_OFFLINE, CLAP_RENDER_REALTIME, clap_plugin_render,
@@ -67,6 +68,9 @@ pub struct ClapPlugin {
     /// `clap_plugin_state` vtable pointer. `None` when the plugin does not
     /// implement the state extension (project save/load will skip it).
     state_ext: Option<*const clap_plugin_state>,
+    /// `clap_plugin_latency` vtable pointer (PR3.3). `None` when the
+    /// plugin doesn't implement the latency extension.
+    latency_ext: Option<*const clap_plugin_latency>,
 }
 
 // The plugin holds raw pointers but ownership is exclusive within the struct.
@@ -221,6 +225,16 @@ impl ClapPlugin {
         };
         tracing::info!(has_state = state_ext.is_some(), "plugin state extension");
 
+        // PR3.3: Look up optional clap.latency extension for PDC.
+        let latency_ptr = unsafe { get_ext(plugin_ptr, CLAP_EXT_LATENCY.as_ptr()) }
+            as *const clap_plugin_latency;
+        let latency_ext = if latency_ptr.is_null() {
+            None
+        } else {
+            Some(latency_ptr)
+        };
+        tracing::info!(has_latency = latency_ext.is_some(), "plugin latency extension");
+
         Ok(Some(Self {
             _library: library,
             entry: entry_ptr,
@@ -246,6 +260,7 @@ impl ClapPlugin {
             gui_ext,
             gui_created: false,
             state_ext,
+            latency_ext,
         }))
     }
 
@@ -384,6 +399,22 @@ impl ClapPlugin {
 
     fn gui_ref(&self) -> Option<&clap_plugin_gui> {
         self.gui_ext.and_then(|p| unsafe { p.as_ref() })
+    }
+
+    /// PR3.3: query CLAP plugin's reported latency. Spec: must be called on
+    /// main-thread while plugin is active. Returns 0 if the plugin doesn't
+    /// implement `clap.latency`.
+    pub fn query_latency_samples(&self) -> u32 {
+        let Some(ext_ptr) = self.latency_ext else {
+            return 0;
+        };
+        let Some(ext) = (unsafe { ext_ptr.as_ref() }) else {
+            return 0;
+        };
+        let Some(get) = ext.get else {
+            return 0;
+        };
+        unsafe { get(self.plugin) }
     }
 
     pub fn activate(&mut self, sample_rate: f64, min_frames: u32, max_frames: u32) -> Result<()> {
@@ -984,6 +1015,10 @@ impl LoadedPlugin for ClapPlugin {
             return false;
         };
         unsafe { set_fn(self.plugin, render_mode) }
+    }
+
+    fn query_latency(&mut self) -> u32 {
+        self.query_latency_samples()
     }
 
     fn state_save(&self) -> Result<Option<Vec<u8>>> {

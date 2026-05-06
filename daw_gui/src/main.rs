@@ -174,6 +174,9 @@ fn spawn_incoming_bridge(
                     let _ = audio_tx.send(MainToChild::ClosePluginShmem { plugin_id });
                     Some(AppEvent::SlotPluginUnloadedFromChild { plugin_id })
                 }
+                ChildToMain::PluginLatencyChanged { plugin_id, samples } => {
+                    Some(AppEvent::PluginLatencyChangedFromChild { plugin_id, samples })
+                }
                 ChildToMain::ExportWavComplete { error } => {
                     Some(AppEvent::ExportWavComplete { error })
                 }

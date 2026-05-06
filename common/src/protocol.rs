@@ -111,6 +111,19 @@ pub enum ChildToMain {
     SlotPluginUnloaded {
         plugin_id: u32,
     },
+    /// Plugin が報告した自身の processing latency (samples 単位、 host
+    /// sample_rate)。 PR3 PDC pipeline の最終段で、 plugin が active 化
+    /// した直後 (CLAP `activate` 完了直後 / VST3 `setActive(true)` 完了
+    /// 直後) もしくは plugin が `host->request_restart()` /
+    /// `IComponentHandler::restartComponent(kLatencyChanged)` で再 query
+    /// を要求して deactivate→activate→get の往復を完了した直後に発火。
+    /// daw_gui は plugin_id から (track_id, slot) を逆引きして
+    /// `Track::reported_latency_samples` を更新し、 daw_audio に
+    /// `LoadSong` を再送して compile_schedule に PDC を再計算させる。
+    PluginLatencyChanged {
+        plugin_id: u32,
+        samples: u32,
+    },
 }
 
 /// Single entry in the `AllPluginStates` reply.

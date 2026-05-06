@@ -902,6 +902,18 @@ impl LoadedPlugin for Vst3Plugin {
         false
     }
 
+    fn query_latency(&mut self) -> u32 {
+        // PR3.3: VST3 spec (`IAudioProcessor::getLatencySamples`):
+        //   "Gets the current Latency in samples. ... if internally needs
+        //    to look in advance (like compressors) 512 samples then this
+        //    plug-in should report 512 as latency."
+        // Thread requirement: `[UI-thread & Setup Done]` — host must call
+        // it after `setupProcessing` completed. We invoke right after our
+        // `activate()` ran `setupProcessing` + `setActive(true)`, so we're
+        // safely past the Setup Done barrier.
+        unsafe { self.audio.getLatencySamples() }
+    }
+
     fn state_save(&self) -> Result<Option<Vec<u8>>> {
         let write = ComWrapper::new(Vst3WriteStream::new());
         let stream_ptr = write

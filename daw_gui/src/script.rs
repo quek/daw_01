@@ -72,6 +72,13 @@ struct ScriptHost {
     /// 直前の `loadSongFromObject` で送った Song を keep。 `setTrackLatency`
     /// など差分更新が必要な API のために。
     last_loaded_song: Option<Song>,
+    /// PR3.3: GUI mode の `AppData` と同じ役割。 `pump_until` 内で
+    /// `SlotPluginLoaded` を見たときに `(plugin_id → track_id)` を覚えて
+    /// おき、 `PluginLatencyChanged` 受信時に track の累積 latency を
+    /// 計算して `last_loaded_song` を更新 → `LoadSong` を再送する。
+    plugin_to_track: std::collections::HashMap<u32, u32>,
+    plugin_latencies: std::collections::HashMap<u32, u32>,
+    track_plugin_ids: std::collections::HashMap<u32, Vec<u32>>,
 }
 
 #[derive(Default, Clone)]
@@ -85,43 +92,41 @@ impl ScriptHost {
             bootstrap,
             script_args: ScriptArgs { output },
             last_loaded_song: None,
+            plugin_to_track: std::collections::HashMap::new(),
+            plugin_latencies: std::collections::HashMap::new(),
+            track_plugin_ids: std::collections::HashMap::new(),
         }
     }
 
     /// `incoming_rx` から条件 `pred` を満たす event が来るまで pump。
-    /// 他の event は `SlotPluginLoaded` のみ副作用処理し (audio に
-    /// `OpenPluginShmem` を forward — GUI mode の `spawn_incoming_bridge`
-    /// と同等)、 残りは drain して捨てる。 timeout を超えたら `Err`。
+    /// 他の event は副作用処理して drain (production GUI mode の
+    /// `spawn_incoming_bridge` 相当):
+    ///   - `SlotPluginLoaded` → `OpenPluginShmem` を audio に forward + plugin
+    ///     ↔ track を local map に記録
+    ///   - `PluginLatencyChanged` → plugin latency を local map に積み、
+    ///     track 累積を recompute、 `last_loaded_song` を更新して
+    ///     `LoadSong` を audio に再送 (PR3.3 PDC 反映経路)
+    ///   - `SlotPluginUnloaded` → plugin_id を 3 つの local map から退避
+    ///
+    /// timeout を超えたら `Err`。
     fn pump_until<F>(&mut self, mut pred: F, timeout: Duration) -> Result<ChildToMain>
     where
         F: FnMut(&ChildToMain) -> bool,
     {
         let deadline = Instant::now() + timeout;
-        // split borrow: `&mut incoming_rx` と `&audio_tx` を同時に持つため。
-        let audio_tx = self.bootstrap.audio_tx.clone();
-        let rx = self
-            .bootstrap
-            .incoming_rx
-            .as_mut()
-            .expect("Bootstrap.incoming_rx already taken (GUI mode)");
         loop {
-            match rx.try_recv() {
+            // tokio mpsc の try_recv は &mut self を要求。 split-borrow で
+            // `audio_tx` と `incoming_rx` を別々に持つため、 receive ごとに
+            // local 変数に取り出す。
+            let recv_result = self
+                .bootstrap
+                .incoming_rx
+                .as_mut()
+                .expect("Bootstrap.incoming_rx already taken (GUI mode)")
+                .try_recv();
+            match recv_result {
                 Ok(msg) => {
-                    if let ChildToMain::SlotPluginLoaded {
-                        track,
-                        slot,
-                        plugin_id,
-                        shmem_id,
-                        ..
-                    } = &msg
-                    {
-                        let _ = audio_tx.send(MainToChild::OpenPluginShmem {
-                            plugin_id: *plugin_id,
-                            shmem_id: shmem_id.clone(),
-                            track: *track,
-                            slot: *slot,
-                        });
-                    }
+                    self.handle_incoming(&msg);
                     if pred(&msg) {
                         return Ok(msg);
                     }
@@ -136,6 +141,104 @@ impl ScriptHost {
                     return Err(anyhow!("incoming pipe closed"));
                 }
             }
+        }
+    }
+
+    fn handle_incoming(&mut self, msg: &ChildToMain) {
+        match msg {
+            ChildToMain::SlotPluginLoaded {
+                track,
+                plugin_id,
+                shmem_id,
+                slot,
+                ..
+            } => {
+                let _ = self.bootstrap.audio_tx.send(MainToChild::OpenPluginShmem {
+                    plugin_id: *plugin_id,
+                    shmem_id: shmem_id.clone(),
+                    track: *track,
+                    slot: *slot,
+                });
+                self.plugin_to_track.insert(*plugin_id, *track);
+                self.track_plugin_ids
+                    .entry(*track)
+                    .or_default()
+                    .push(*plugin_id);
+            }
+            ChildToMain::SlotPluginUnloaded { plugin_id } => {
+                self.plugin_latencies.remove(plugin_id);
+                self.plugin_to_track.remove(plugin_id);
+                for v in self.track_plugin_ids.values_mut() {
+                    v.retain(|p| p != plugin_id);
+                }
+                self.track_plugin_ids.retain(|_, v| !v.is_empty());
+                self.recompute_track_latencies();
+            }
+            ChildToMain::PluginLatencyChanged { plugin_id, samples } => {
+                self.plugin_latencies.insert(*plugin_id, *samples);
+                self.recompute_track_latencies();
+            }
+            _ => {}
+        }
+    }
+
+    /// pending な incoming events を `for_duration` だけ drain する。
+    /// 主に `exportWav` の前に PluginLatencyChanged を取り込んで song を
+    /// 最新化するために使う (export thread が song を snapshot する前に
+    /// LoadSong を届けたい)。 期間内に新規 event が無くても block しない。
+    fn drain_pending_for(&mut self, for_duration: Duration) {
+        let deadline = Instant::now() + for_duration;
+        while Instant::now() < deadline {
+            let recv = self
+                .bootstrap
+                .incoming_rx
+                .as_mut()
+                .expect("Bootstrap.incoming_rx already taken (GUI mode)")
+                .try_recv();
+            match recv {
+                Ok(msg) => self.handle_incoming(&msg),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    /// AppData::recompute_track_latencies の script-mode mirror。 song の
+    /// 各 track について plugin latencies を sum し、 値が変わったら
+    /// `LoadSong` を audio に再送して PDC を反映させる。
+    fn recompute_track_latencies(&mut self) {
+        let Some(song) = self.last_loaded_song.as_mut() else {
+            return;
+        };
+        let mut changed = false;
+        for (track_id, plugin_ids) in &self.track_plugin_ids {
+            let total: u32 = plugin_ids
+                .iter()
+                .map(|pid| self.plugin_latencies.get(pid).copied().unwrap_or(0))
+                .sum();
+            if let Some(t) = song.tracks.iter_mut().find(|t| t.id == *track_id)
+                && t.reported_latency_samples != total
+            {
+                t.reported_latency_samples = total;
+                changed = true;
+            }
+        }
+        let track_ids_with_plugins: std::collections::HashSet<u32> =
+            self.track_plugin_ids.keys().copied().collect();
+        for t in &mut song.tracks {
+            if !track_ids_with_plugins.contains(&t.id)
+                && t.reported_latency_samples != 0
+            {
+                t.reported_latency_samples = 0;
+                changed = true;
+            }
+        }
+        if changed {
+            let cloned = song.clone();
+            let _ = self.bootstrap.audio_tx.send(MainToChild::LoadSong(cloned.clone()));
+            let _ = self.bootstrap.plugin_tx.send(MainToChild::LoadSong(cloned));
         }
     }
 }
@@ -372,6 +475,13 @@ fn daw_export_wav(
     let timeout_ms = u64::try_from_js(args.get_or_undefined(1), ctx).unwrap_or(60_000);
 
     let pump_result = with_host(|h| {
+        // PR3.3: 直前に発火された IPC events (PluginLatencyChanged 等) を
+        // exportWav の前に drain して、 latency が `last_loaded_song` →
+        // `LoadSong` 再送経路で `compile_schedule` まで反映されるのを待つ。
+        // export thread は ExportWav arrival 時点で `shared.song` を snapshot
+        // するので、 event drain して LoadSong を先に届けないと PDC が
+        // 適用されない song で render が始まる。
+        h.drain_pending_for(Duration::from_millis(50));
         let _ = h.bootstrap.audio_tx.send(MainToChild::ExportWav {
             path: PathBuf::from(path_str),
         });
