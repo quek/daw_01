@@ -218,10 +218,26 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let btns_h = 26.0;
     let btns_y = area.y + area.h - btns_h - pad;
 
+    // Sidechain section: only render if there's at least one plugin in the
+    // chain. Vertical budget: 18 px header + 4 px gap + (24 + 4) px per row,
+    // capped at 4 rows; if more entries exist they overflow off-screen
+    // (vertical scrolling not yet implemented in inspector). Without this
+    // dynamic budget the chain list would always shrink even when no
+    // sidechain wiring is meaningful.
+    let sc_entries = app.sidechain_entries();
+    let sc_section_h = if sc_entries.is_empty() {
+        0.0
+    } else {
+        let row_h = 24.0;
+        let row_gap = 4.0;
+        let visible_rows = sc_entries.len().min(4);
+        18.0 + 4.0 + visible_rows as f32 * (row_h + row_gap) + 6.0
+    };
+
     let list_x = area.x + pad;
     let list_y = y;
     let list_w = area.w - pad * 2.0;
-    let list_h = (btns_y - 6.0 - list_y).max(0.0);
+    let list_h = (btns_y - 6.0 - list_y - sc_section_h).max(0.0);
     let list_rect = Rect { x: list_x, y: list_y, w: list_w, h: list_h };
 
     let btn_gui_w = 44.0;
@@ -297,6 +313,94 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             );
         },
     );
+
+    // ---- Sidechain section ------------------------------------------
+    // PR4.5 sidechain UI: per-plugin source picker. ECS-flat dropdown per
+    // chain row so the user can wire any track's output into the plugin's
+    // first aux input port (sidechain_sources[0]). Self-track is filtered
+    // out (would create a feedback cycle which `compile_schedule` rejects).
+    // Only the first aux port is exposed; multi-port plugins (rare) still
+    // need editing via .daw file or follow-up UI.
+    if !sc_entries.is_empty() {
+        let sc_header_y = btns_y - sc_section_h;
+        ui.label_at(
+            "inspector_sc_label",
+            "Sidechain",
+            area.x + pad,
+            sc_header_y,
+            12.0,
+            TEXT_DIM,
+        );
+        let row_h = 24.0;
+        let row_gap = 4.0;
+        let mut row_y = sc_header_y + 18.0 + 4.0;
+        let visible_rows = sc_entries.len().min(4);
+        let choices = app.sidechain_source_choices();
+        let labels: Vec<String> = choices.iter().map(|c| c.label.clone()).collect();
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let dropdown_w = 140.0;
+        let name_x = area.x + pad;
+        let dropdown_x = area.x + area.w - pad - dropdown_w;
+        for (i, entry) in sc_entries.iter().take(visible_rows).enumerate() {
+            // Truncate plugin name visually if it's too long for the
+            // available left half — gui_01 doesn't auto-clip, so we
+            // budget by char count (rough; mono font assumption). Use
+            // `chars().take()` for UTF-8 safety: byte-slicing would panic
+            // on multi-byte boundaries (Japanese / fancy plugin names).
+            let max_name_chars = ((dropdown_x - name_x - 8.0) / 7.0) as usize;
+            let n_chars = entry.plugin_name.chars().count();
+            let display_name = if n_chars > max_name_chars && max_name_chars > 3 {
+                let truncated: String =
+                    entry.plugin_name.chars().take(max_name_chars - 1).collect();
+                format!("{truncated}…")
+            } else {
+                entry.plugin_name.clone()
+            };
+            ui.label_at(
+                ("inspector_sc_name", i),
+                &display_name,
+                name_x,
+                row_y + 6.0,
+                11.0,
+                TEXT,
+            );
+            let dropdown_rect = Rect {
+                x: dropdown_x,
+                y: row_y,
+                w: dropdown_w,
+                h: row_h,
+            };
+            let selected_idx = match entry.current_source {
+                None => 0,
+                Some(src_id) => choices
+                    .iter()
+                    .position(|c| c.track_id == Some(src_id))
+                    .unwrap_or(0),
+            };
+            if let Some(picked) = ui.dropdown(
+                ("inspector_sc_dropdown", i),
+                dropdown_rect,
+                &label_refs,
+                selected_idx,
+            ) && let Some(choice) = choices.get(picked)
+            {
+                let track_id = entry.track_id;
+                let slot_kind = entry.slot_kind;
+                let slot_index = entry.slot_index;
+                let new_source = choice.track_id;
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetSidechainSource {
+                        track_id,
+                        slot_kind,
+                        slot_index,
+                        port: 0,
+                        source: new_source,
+                    });
+                }));
+            }
+            row_y += row_h + row_gap;
+        }
+    }
 
     // 下端: + Inst / + FX / + MIDI FX。Reaper folder 流で group track
     // も全機能を持てる仕様 (plan_group_track.md §1)、よって group も
