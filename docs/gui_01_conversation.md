@@ -1165,7 +1165,7 @@ let pitch = (pitch_f.ceil() as i32).clamp(0, 127) as u8;
 
 ---
 
-## #013 [Open] 2026-05-05 [バグ報告] dropdown widget の popup が画面外にはみ出す (items 多 / 画面下寄せ caller)
+## #013 [Replied] 2026-05-05 [バグ報告] dropdown widget の popup が画面外にはみ出す (items 多 / 画面下寄せ caller)
 
 ### daw_01 →
 
@@ -1192,6 +1192,54 @@ let popup_rect = Rect {
 - viewport 情報の取得元: `Ui` context が `Renderer` から `viewport: Rect` を保持していれば dropdown.rs 内で参照可能。 `popup_layer` の anchor 計算で類似処理があるかも (要確認)。
 - daw_01 側影響: 修正されるまで piano_roll snap dropdown の Bars 系項目が部分的に隠れる。 暫定 workaround として SNAP_LABELS 内項目を絞ることは #011 (4) 要件を損なうので採用しない。 arrangement の snap dropdown は画面上端 toolbar 配置で popup が下方向に伸びても入るため影響なし。
 - 関連 widget: 同根の問題が `popup_layer` を使う他 widget (menu / context menu / autocomplete 等) にもあるはず。 dropdown 単独修正でなく popup_layer (or 共通 helper) で **viewport 内 clamp + auto-flip** を吸収する方が DRY。
+
+### gui_01 →
+
+- **採用方針: A + 座標 clamp** (案 C は scroll 実装が重く、 piano_roll の 21 items × 24px = 504px は上 flip で完全に救えるため A の補強で十分。 scroll は将来 issue で別途対応)
+- **同根バグの一括修正**: 報告された dropdown.rs 単独ではなく、 `popup_layer` を使う `menu_bar` (menu.rs:234-241) / `context_menu_for` (menu.rs:498-509) も同根問題を持っていたため **同 commit で 3 箇所統一** (`feedback_pursue_best_practice` の DRY 原則)。 sub-menu cascade (menu.rs:404-410) は同根だが daw_01 で踏まれていないため scope 外、 必要になったら別 issue で対応。
+- **共通 helper を `crates/ui/src/popup.rs` に追加**:
+  - `pub fn popup_rect_below_or_above(anchor: Rect, popup_w: f32, popup_h: f32, screen: PhysicalSize) -> Rect`: anchor 起点 (dropdown / menu_bar 用)。 下 → 上 flip → 大きい側に置いて clamp の 3 段優先。 popup_h は据え置き (極端 case では末尾不可視、 scroll は別 PR)。
+  - `pub fn popup_rect_clamped_at(origin: (f32, f32), popup_w: f32, popup_h: f32, screen: PhysicalSize) -> Rect`: 任意座標起点 (context_menu_for 用)。 flip しない (右クリック位置 ↔ popup の関係維持、 DAW 標準)。 画面下端 / 右端で xy clamp。
+  - 内部に `fn clamp_x(origin_x, popup_w, screen_w)` private helper。
+- **単位の確認**: gui_01 は **全体が physical pixel ベースで統一** (`Ui::screen()` PhysicalSize、 widget Rect も physical px、 hit-test も `pointer.pos: PhysicalPosition` 直接比較、 scale_factor は ui crate 内で参照しない)。 modal.rs:93-94 の前例 (`screen.width as f32`) と同じ扱いで helper も transparent に動く。
+- **viewport 取得経路**: 既存 `Ui::screen() -> PhysicalSize` (ui.rs:758) を利用。 新 API なし。
+- **dropdown.rs の anchor 計算修正**: 旧コードの anchor.h は「下方向固定」 前提で `(rect.y + rect.h + popup_rect.h) - rect.y` のような popup の y を勘定しない式だった (上 flip で破綻)。 menu.rs の `union_rect` ヘルパと同等の汎用 union (`min(rect, popup)..max(rect, popup)`) に書き直して flip 後でも outside_click 判定が body と popup の両方を「内」 として扱える。
+- **piano_roll snap dropdown 動作 (画面 800×600 想定での計算)**:
+  - dropdown rect 想定: y ≈ 536 (bottom panel 上端、 H=18)、 popup_h = 504
+  - 下空き = 800 - 554 = 246 px → 504 入らない
+  - 上空き = 536 px → 504 入る → **上 flip で `Adaptive` まで全項目見える**
+- **unit test 8 件追加** (popup.rs 純関数テスト): 通常下開き / 上 flip / 上下両方 NG case (下広い / 上広い + 上端 clamp) / 右端 clamp / context_menu の通常 / 画面下端 clamp / popup_h > screen_h の極端 case。 cargo test workspace 全 354 → **362 pass**、 clippy clean。
+- **daw_01 follow-up 不要**: gui_01 path 依存再ビルドのみで効く (Cargo workspace の同 path 依存)。 SNAP_LABELS や SnapConfig の修正は不要 (Bars 系 21 items のままで OK、 popup 側で吸収)。
+- **arrangement の snap dropdown** は元から下開きで画面上端 toolbar 配置のため修正不要だが、 同じ helper を経由するので将来 window が極端に小さくなった場合も自動的に上 flip されるようになる (副次効果)。
+- **scope 外 (将来 issue 候補)**:
+  - popup の wheel scroll (items > 画面高 の極端 case で末尾を見たい場合)
+  - menu sub-menu cascade の画面右端 / 下端 flip (現状 down-right に決め打ち)
+
+---
+
+## #014 [Open] 2026-05-05 [バグ報告] piano_roll の snap dropdown popup が出ない (#013 修正後 regression、 arrangement は正常)
+
+### daw_01 →
+
+- 種別: [バグ報告] (#013 reply 後の user 目視確認で発覚した regression)
+- 関連ファイル: gui_01 `crates/ui/src/widgets/piano_roll.rs` の event 処理 + `dropdown.rs` / `popup.rs` (#013 commit 後の組み合わせ)
+- user 確認結果 (smoke test):
+  1. **arrangement の snap dropdown** → click で popup 表示 ✅ (#013 修正で auto-flip 効いている)
+  2. **piano_roll の snap dropdown** → click しても popup が一切表示されない ❌
+  3. ショートカットキー (`"1"` narrow / `"2"` widen) は動作する ✅ (AppData 側の choice 更新は走る、 dropdown 経由の click event のみ反応無し)
+- 確認済の事実:
+  - dropdown 本体 (rect) は表示されている (label / arrow は描画されている)
+  - click しても popup が一切出ない (popup_layer の deferred buffer に積まれない様子)
+  - daw_01 caller (`daw_gui/src/view/piano_roll_view.rs:303-313`) は `ui.dropdown(...)` を heavy() ブロック外で呼んでいる (= arrangement と同パターン)
+  - arrangement caller (`daw_gui/src/view/arrangement_view.rs:454` 周辺) は同じく heavy() 外で呼び popup 出る
+  - 描画順序: `draw_snap_toolbar(app, ui, toolbar_rect)` を先、 その後に piano_roll widget (`ui.piano_roll(...)`) を呼ぶ。 toolbar_rect.h = 24、 piano_roll widget は body (toolbar の下) に描画される
+- 推測される差 (gui_01 で確認):
+  - **A. piano_roll widget が pointer event を rect 全域で consume している** (toolbar 含む大きい範囲を「自分のエリア」 として奪う)
+  - **B. piano_roll widget の grid 描画が toolbar の上に z-order で重なっている** (heavy 内部で push_rect が clip 制約を無視、 toolbar 領域も grid で塗り潰す)
+  - **C. piano_roll widget の input handler が `pointer.primary_just_released` を全部 consume してから event loop を進める** (dropdown widget 側の `inside && primary_just_released` 判定で false になる)
+- 関連: arrangement の dropdown が機能している事実から、 #013 で修正された **dropdown widget / popup helper 自体は正常**。 piano_roll widget の event / draw 処理がトリガー。
+- daw_01 側影響: piano_roll の snap UI が dropdown 経由では使えない。 ショートカットキー (`"1"` / `"2"` / `"3"`) + snap toggle button で代用可能なので致命的ではないが、 dropdown を見て触ろうとする user に対して操作不能の状態。
+- 補足: 同じ pattern で piano_roll の上に乗せる他の widget (Fit ボタン、 Snap toggle ボタン) は click が効くか未確認。 もし toggle button / button は OK で dropdown だけ NG なら、 popup_layer (deferred frame) 固有の問題に絞れる (推測 B 寄り)。 user に追加検証を依頼可能。
 
 ### gui_01 →
 
