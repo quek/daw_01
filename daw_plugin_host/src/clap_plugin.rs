@@ -33,11 +33,16 @@ use libloading::{Library, Symbol};
 use crate::clap_host::Host;
 use crate::plugin_instance::{HostCallbacks, LoadedPlugin, NoteTransition, TimedNoteEvent};
 
-/// Loaded CLAP plugin instance. Holds every resource alive until dropped; the
-/// drop order (custom cleanup → fields → Library) ensures `destroy` / `deinit`
-/// run before the DLL is unloaded.
+/// Loaded CLAP plugin instance. Holds every resource alive until dropped.
+/// Drop sequence:
+///   1. `impl Drop` body — explicit `gui.destroy` → `plugin.destroy` →
+///      `entry.deinit` (all DLL calls).
+///   2. fields in declaration order (Rust reference: "fields of a struct
+///      are dropped in the same order as they were declared"). `_library`
+///      is declared LAST so `FreeLibrary` runs after every other field's
+///      Drop — none of which call into the DLL today, but ordering it
+///      this way keeps the host robust against future fields that might.
 pub struct ClapPlugin {
-    _library: Library,
     entry: *const clap_plugin_entry,
     plugin: *const clap_plugin,
     _host: Box<Host>,
@@ -81,6 +86,9 @@ pub struct ClapPlugin {
     aux_input_buffers: Vec<Vec<Vec<f32>>>,
     /// Per-aux-port channel pointer scratch (filled each `process` call).
     aux_input_ptrs: Vec<Vec<*mut f32>>,
+    /// DLL handle. Declared LAST so `FreeLibrary` runs after every other
+    /// field's Drop. See struct doc-comment for the full sequence.
+    _library: Library,
 }
 
 // The plugin holds raw pointers but ownership is exclusive within the struct.

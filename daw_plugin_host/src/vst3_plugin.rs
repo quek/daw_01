@@ -48,18 +48,18 @@ use crate::vst3_host::{Vst3ComponentHandler, Vst3HostApp, Vst3PlugFrame};
 use crate::vst3_stream::{Vst3ReadStream, Vst3WriteStream};
 
 /// A loaded VST3 plugin (the IComponent + the associated IEditController
-/// for GUI/state). The `_library` field keeps the DLL loaded for as long as
-/// we hold any ComPtr into it — drop order: `component`/`controller`/`view`
-/// Release first (inside the ComPtrs' Drop), then the `Library` unloads.
+/// for GUI/state). Field drop order is **declaration order** (Rust
+/// reference: "The fields of a struct are dropped in the same order as
+/// they were declared"), so `_library` is declared LAST: every ComPtr's
+/// `Release()` (which calls back into the DLL) must run before the
+/// `Library` Drop unloads the DLL.
 pub struct Vst3Plugin {
-    // DLL handle kept alive while any ComPtr references it. Declared first
-    // so it drops LAST (field drop order = declaration order).
-    _library: Library,
     id: String,
     name: String,
     path: PathBuf,
 
-    // ComPtrs into the plugin.
+    // ComPtrs into the plugin. Drop runs `Release()` which calls into
+    // the DLL — must precede `_library` drop below.
     component: ComPtr<IComponent>,
     audio: ComPtr<IAudioProcessor>,
     /// Either == component (single-component plugin) or a distinct object
@@ -117,6 +117,15 @@ pub struct Vst3Plugin {
     /// Plug-frame used to relay resize requests back to daw_gui.
     plug_frame: ComWrapper<Vst3PlugFrame>,
     gui_attached: std::cell::Cell<bool>,
+
+    /// DLL handle. Declared LAST so it drops LAST (field drop = declaration
+    /// order): every ComPtr/ComWrapper above must Release into the still-loaded
+    /// DLL before `FreeLibrary` runs here. Reversing this order produces an
+    /// AV ~84-100ms after Drop on plugins (e.g. MeldaProduction VST3) whose
+    /// `IComponent::Release` does heavy global cleanup — by the time their
+    /// `DllMain(DLL_PROCESS_DETACH)` finishes the host has already torn the
+    /// vtable down.
+    _library: Library,
 }
 
 unsafe impl Send for Vst3Plugin {}
