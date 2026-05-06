@@ -7,6 +7,7 @@
 
 #![allow(dead_code)]
 
+use crate::graph::DelayLine;
 use crate::sequencer::{PerTrackState, TimedNoteEvent};
 
 pub const MAX_FRAMES: usize = common::process_data::MAX_FRAMES;
@@ -30,6 +31,14 @@ pub struct TrackScratch {
     /// Set during dispatch: `muted || (any_solo && !solo)`. The reduce step
     /// reads this to skip the accumulation entirely for muted tracks.
     pub effective_mute: bool,
+    /// PR4.5 sidechain plugin-internal alignment: per-track input delay
+    /// applied between instrument output and the fx_chain. Capacity grown
+    /// only at edit-time (engine schedule swap) so the RT path stays free
+    /// of the allocator. Capacity 0 = no delay (most tracks); a track with
+    /// fx_chain sidechain gets its line resized to `Schedule::
+    /// input_delay_per_track[track_idx] + 1` (DelayLine spec requires
+    /// capacity ≥ delay + 1).
+    pub input_delay_line: DelayLine,
 }
 
 impl TrackScratch {
@@ -43,6 +52,7 @@ impl TrackScratch {
             peak_l: 0.0,
             peak_r: 0.0,
             effective_mute: false,
+            input_delay_line: DelayLine::with_capacity(0),
         }
     }
 }

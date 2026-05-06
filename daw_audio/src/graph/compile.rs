@@ -48,6 +48,7 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
             }],
             delay_lines: Vec::new(),
             port_buffers: super::PortBufferPool::new(),
+            input_delay_per_track: Vec::new(),
         });
     }
 
@@ -310,10 +311,34 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         nodes_with_pdc.push(op);
     }
 
+    // PR4.5 sidechain plugin-internal alignment: per-track input delay.
+    // Only fx_chain plugin sidechain_sources contribute (instrument sidechain
+    // is MVP-out-of-scope because aligning it would require also delaying
+    // MIDI events into the instrument). Walk each track's fx_chain and
+    // pick `max(path_latency(src))` over all sidechain entries.
+    let mut input_delay_per_track = vec![0u32; n];
+    for (i, track) in song.tracks.iter().enumerate() {
+        let mut max_sc: u32 = 0;
+        for p in &track.fx_chain {
+            for src_id_opt in &p.sidechain_sources {
+                if let Some(src_id) = src_id_opt
+                    && let Some(&src_idx) = id_to_idx.get(src_id)
+                {
+                    let l = path_latency[src_idx as usize];
+                    if l > max_sc {
+                        max_sc = l;
+                    }
+                }
+            }
+        }
+        input_delay_per_track[i] = max_sc;
+    }
+
     Ok(Schedule {
         nodes: nodes_with_pdc,
         delay_lines,
         port_buffers: super::PortBufferPool::new(),
+        input_delay_per_track,
     })
 }
 
@@ -1326,6 +1351,115 @@ mod tests {
         assert!(
             !dest_has_delay,
             "the highest-latency path (Dest including sidechain input) must NOT receive ApplyDelay"
+        );
+    }
+
+    /// PR4.5 plugin-internal alignment: dest track の fx_chain plugin が
+    /// sidechain 入力を持つとき、 `Schedule::input_delay_per_track` に dest
+    /// track の input_delay_samples として「sidechain source の max
+    /// path_latency」 が記録される。 これは engine 側で `process_track_owned`
+    /// が instrument 出力 → fx_chain の境目で delay を入れて plugin の
+    /// main vs aux を時刻揃えするための spec。
+    ///
+    /// 本テストは graph layer のみを検証 (engine の delay 適用は別レイヤ)。
+    /// fx_chain の sidechain は `input_delay` に反映、 midi_fx_chain /
+    /// instrument の sidechain は反映しない (= MVP scope。 instrument の
+    /// sidechain alignment は MIDI event 側も遅延させる必要があり、 別 PR)。
+    #[test]
+    fn pdc_sidechain_input_delay_recorded_for_dest_fx_chain_track() {
+        use common::model::PluginInstance;
+        use common::plugin_format::PluginFormat;
+
+        let song = Song {
+            tracks: vec![
+                Track {
+                    id: 1,
+                    name: "Source".into(),
+                    reported_latency_samples: 100,
+                    ..Track::default()
+                },
+                Track {
+                    id: 2,
+                    name: "Dest".into(),
+                    reported_latency_samples: 50,
+                    fx_chain: vec![PluginInstance {
+                        plugin_id: "test.compressor".into(),
+                        format: PluginFormat::Vst3,
+                        state: None,
+                        sidechain_sources: vec![Some(1)],
+                    }],
+                    ..Track::default()
+                },
+                Track {
+                    id: 3,
+                    name: "Bystander".into(),
+                    ..Track::default()
+                },
+            ],
+            ..Song::default()
+        };
+        let sched = compile_schedule(&song).unwrap();
+
+        assert_eq!(
+            sched.input_delay_per_track.len(),
+            3,
+            "input_delay_per_track must have one entry per track"
+        );
+        assert_eq!(
+            sched.input_delay_per_track[0], 0,
+            "Source has no sidechain inputs, so input_delay = 0"
+        );
+        assert_eq!(
+            sched.input_delay_per_track[1], 100,
+            "Dest receives sidechain from Source(path_latency=100), \
+             so input_delay must equal Source.path_latency"
+        );
+        assert_eq!(
+            sched.input_delay_per_track[2], 0,
+            "Bystander has no sidechain wiring, input_delay = 0"
+        );
+    }
+
+    /// PR4.5 plugin-internal alignment: midi_fx_chain や instrument に
+    /// sidechain wiring があっても `input_delay_per_track` には反映しない。
+    /// これは MVP scope 制限 (instrument input は MIDI 経由なので audio
+    /// stream に delay を入れるだけでは不十分、 MIDI event も遅延させる
+    /// 必要がある — 別 PR)。
+    #[test]
+    fn pdc_sidechain_instrument_input_delay_skipped_in_mvp() {
+        use common::model::PluginInstance;
+        use common::plugin_format::PluginFormat;
+
+        let song = Song {
+            tracks: vec![
+                Track {
+                    id: 1,
+                    name: "Source".into(),
+                    reported_latency_samples: 100,
+                    ..Track::default()
+                },
+                Track {
+                    id: 2,
+                    name: "Dest".into(),
+                    instrument: Some(PluginInstance {
+                        plugin_id: "test.synth".into(),
+                        format: PluginFormat::Vst3,
+                        state: None,
+                        sidechain_sources: vec![Some(1)],
+                    }),
+                    ..Track::default()
+                },
+            ],
+            ..Song::default()
+        };
+        let sched = compile_schedule(&song).unwrap();
+
+        // path_latency は instrument の sidechain も拾う (= 100 + 0 = 100)
+        // ので master mix の sibling alignment は機能する。
+        // ただし input_delay_per_track には乗らない (MVP scope)。
+        assert_eq!(
+            sched.input_delay_per_track[1], 0,
+            "instrument sidechain は input_delay に反映しない (MVP scope)"
         );
     }
 

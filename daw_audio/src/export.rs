@@ -171,6 +171,7 @@ fn render_loop(
                 frames_u32,
                 true,
                 any_solo,
+                &schedule.input_delay_per_track,
             );
         } else {
             let worker_sync = worker_syncs_g.first();
@@ -179,6 +180,11 @@ fn render_loop(
                 let song_track = &song.tracks[track_idx];
                 let track_id = song_track.id;
                 let vocal = vocal_store_g.get(&track_id);
+                let input_delay = schedule
+                    .input_delay_per_track
+                    .get(track_idx)
+                    .copied()
+                    .unwrap_or(0);
                 process_track_owned(
                     track_idx as u32,
                     song_track,
@@ -193,6 +199,7 @@ fn render_loop(
                     true,
                     Some(song),
                     any_solo,
+                    input_delay,
                 );
             }
         }

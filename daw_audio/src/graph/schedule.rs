@@ -85,6 +85,21 @@ pub struct Schedule {
     /// Pooled stereo buffers used by ops whose dst is `BufRef::Pooled`.
     /// PR1 leaves this empty.
     pub port_buffers: PortBufferPool,
+    /// PR4.5 sidechain plugin-internal alignment: per-track input delay
+    /// in samples, applied **after** vocal/clip render + instrument output
+    /// but **before** the audio FX chain. This brings each track's main
+    /// signal into musical alignment with its sidechain sources, so a
+    /// sidechain plugin sees `main_in` and `aux_in` at the same musical
+    /// time.
+    ///
+    /// Indexed by song track index (parallel to `song.tracks`). Entry `i`
+    /// is `max(path_latency(src) for src in fx_chain[*].sidechain_sources)`,
+    /// or 0 if the track has no fx_chain sidechain wiring.
+    ///
+    /// MVP scope: only `fx_chain` plugin sidechain is reflected here.
+    /// `midi_fx_chain` / `instrument` sidechain alignment requires
+    /// delaying MIDI events too (out of scope for PR4.5).
+    pub input_delay_per_track: Vec<u32>,
 }
 
 impl Schedule {
@@ -93,6 +108,7 @@ impl Schedule {
             nodes: Vec::new(),
             delay_lines: Vec::new(),
             port_buffers: PortBufferPool::new(),
+            input_delay_per_track: Vec::new(),
         }
     }
 }

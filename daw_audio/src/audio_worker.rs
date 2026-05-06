@@ -66,6 +66,13 @@ pub struct DispatchShared {
     pub frames: AtomicU32,
     pub playing: AtomicU8,
     pub any_solo: AtomicU8,
+    /// PR4.5 sidechain plugin-internal alignment: per-track input delay
+    /// in samples (= `Schedule::input_delay_per_track` snapshotted into
+    /// the worker pool's shared state for the current dispatch). `null`
+    /// means the engine's main loop didn't pass a slice (fallback / not
+    /// yet wired); workers treat that as 0 delay for every track.
+    pub input_delays_base: AtomicPtr<u32>,
+    pub n_input_delays: AtomicU32,
 }
 
 unsafe impl Send for DispatchShared {}
@@ -92,6 +99,8 @@ impl DispatchShared {
             frames: AtomicU32::new(0),
             playing: AtomicU8::new(0),
             any_solo: AtomicU8::new(0),
+            input_delays_base: AtomicPtr::new(std::ptr::null_mut()),
+            n_input_delays: AtomicU32::new(0),
         }
     }
 }
@@ -155,6 +164,7 @@ impl AudioWorkerPool {
     /// barrier (wake/all_done) ensures the workers only touch this
     /// state inside the call.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_and_wait(
         &self,
         song: Option<&Song>,
@@ -170,6 +180,7 @@ impl AudioWorkerPool {
         frames: u32,
         playing: bool,
         any_solo: bool,
+        input_delay_per_track: &[u32],
     ) {
         let n_tracks = song.map(|s| s.tracks.len() as u32).unwrap_or(0);
         let n_tracks = n_tracks.min(scratch.len() as u32);
@@ -220,6 +231,23 @@ impl AudioWorkerPool {
         self.shared
             .any_solo
             .store(if any_solo { 1 } else { 0 }, Ordering::Release);
+        // PR4.5: publish per-track input delay slice so workers can read
+        // their track's value without locking. Empty slice (= no
+        // sidechain wiring anywhere) → null pointer + len 0.
+        if input_delay_per_track.is_empty() {
+            self.shared
+                .input_delays_base
+                .store(std::ptr::null_mut(), Ordering::Release);
+            self.shared.n_input_delays.store(0, Ordering::Release);
+        } else {
+            self.shared.input_delays_base.store(
+                input_delay_per_track.as_ptr() as *mut u32,
+                Ordering::Release,
+            );
+            self.shared
+                .n_input_delays
+                .store(input_delay_per_track.len() as u32, Ordering::Release);
+        }
 
         let n_workers = self.workers.len() as u32;
         // pending = N workers; master itself is *also* a runner but is
@@ -316,6 +344,11 @@ fn run_work_loop(shared: &DispatchShared) {
     let frames = shared.frames.load(Ordering::Acquire);
     let playing = shared.playing.load(Ordering::Acquire) != 0;
     let any_solo = shared.any_solo.load(Ordering::Acquire) != 0;
+    // PR4.5 sidechain plugin-internal alignment: input-delay slice
+    // published by `dispatch_and_wait`. May be null (no sidechain wiring),
+    // in which case every track gets 0 delay.
+    let input_delays_base = shared.input_delays_base.load(Ordering::Acquire);
+    let n_input_delays = shared.n_input_delays.load(Ordering::Acquire);
 
     if scratch_base.is_null()
         || plugin_refs_ptr.is_null()
@@ -361,6 +394,17 @@ fn run_work_loop(shared: &DispatchShared) {
 
         let track_id = song_track.id;
         let vocal = vocal_store.get(&track_id);
+        // PR4.5: read this track's input_delay; falls back to 0 if the
+        // master didn't publish a slice (= no sidechain wiring) or the
+        // index is out of range (defensive, shouldn't happen).
+        let input_delay = if input_delays_base.is_null() || track_idx >= n_input_delays {
+            0u32
+        } else {
+            // SAFETY: master holds the slice alive for the dispatch window
+            // (it lives in `Schedule::input_delay_per_track` cached on the
+            // engine), and `track_idx < n_input_delays` keeps us in bounds.
+            unsafe { *input_delays_base.add(track_idx as usize) }
+        };
         // master_{l,r} are reduced sequentially by the master thread
         // after `dispatch_and_wait` returns — workers leave the
         // post-fader audio in `scratch.track_l/r`.
@@ -378,6 +422,7 @@ fn run_work_loop(shared: &DispatchShared) {
             playing,
             Some(song),
             any_solo,
+            input_delay,
         );
     }
 }

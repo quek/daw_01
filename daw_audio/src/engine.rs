@@ -260,6 +260,27 @@ impl LocalState {
                 }
             }
             self.cached_song = Some(Arc::clone(song_arc));
+            // PR4.5 sidechain plugin-internal alignment: ensure each
+            // TrackScratch's input_delay_line has enough capacity for the
+            // newly compiled schedule. Reallocates only when capacity needs
+            // to grow (and only at edit-time, never in the RT buffer
+            // dispatch). DelayLine.step_in_place clamps `delay >= cap`
+            // requests to `cap - 1`, so capacity must be `delay + 1`.
+            for (i, &delay) in self
+                .cached_schedule
+                .input_delay_per_track
+                .iter()
+                .enumerate()
+            {
+                if i >= self.scratch.len() {
+                    break;
+                }
+                let need_cap = delay as usize + 1;
+                if delay > 0 && self.scratch[i].input_delay_line.capacity() < need_cap {
+                    self.scratch[i].input_delay_line =
+                        crate::graph::DelayLine::with_capacity(need_cap);
+                }
+            }
         }
     }
 
@@ -495,6 +516,7 @@ impl LocalState {
                     n as u32,
                     playing,
                     any_solo,
+                    &self.cached_schedule.input_delay_per_track,
                 );
             } else {
                 let worker_sync = worker_syncs_g.first();
@@ -503,6 +525,12 @@ impl LocalState {
                     let scratch = &mut self.scratch[track_idx];
                     let track_id = song_track.id;
                     let vocal = vocal_store_g.get(&track_id);
+                    let input_delay = self
+                        .cached_schedule
+                        .input_delay_per_track
+                        .get(track_idx)
+                        .copied()
+                        .unwrap_or(0);
                     process_track_owned(
                         track_idx as u32,
                         song_track,
@@ -517,6 +545,7 @@ impl LocalState {
                         playing,
                         Some(song),
                         any_solo,
+                        input_delay,
                     );
                 }
             }
@@ -640,6 +669,14 @@ impl LocalState {
 ///
 /// `worker_sync` may be `None` if `OpenWorkerPool` hasn't arrived yet
 /// — in that case plugin chains are skipped entirely (silent track).
+///
+/// `input_delay_samples`: PR4.5 sidechain plugin-internal alignment. If
+/// non-zero, the track's main signal (vocal / instrument output) is
+/// delayed by that many samples **before** the audio FX chain runs.
+/// The caller (engine main loop / export) passes
+/// `Schedule::input_delay_per_track[track_idx]`, which compile_schedule
+/// has set to `max(path_latency(src) for src in fx_chain[*].sidechain_sources)`.
+/// 0 = no delay (the common case).
 #[allow(clippy::too_many_arguments)]
 pub fn process_track_owned(
     track_idx: u32,
@@ -655,6 +692,7 @@ pub fn process_track_owned(
     playing: bool,
     song: Option<&Song>,
     any_solo: bool,
+    input_delay_samples: u32,
 ) {
     let n = frames as usize;
 
@@ -813,6 +851,21 @@ pub fn process_track_owned(
         }
     }
 
+    // ---- PR4.5 sidechain plugin-internal alignment ------------------
+    // Delay the track's main signal so it lines up musically with any
+    // sidechain `aux_in` the fx_chain plugins read from `pd.buffer_aux_in`.
+    // Without this delay, a compressor's main_in arrives at musical time t
+    // but its aux_in (= source.scratch tapped via SidechainTap) is at
+    // musical time t - source.path_latency, so the compressor's gain
+    // reduction lags the trigger by source.path_latency. The DelayLine's
+    // capacity was sized in `Engine::refresh_schedule` (only ever grows on
+    // edit-time, never in the RT path).
+    if input_delay_samples > 0 {
+        scratch
+            .input_delay_line
+            .step_in_place(&mut scratch.track_l[..n], &mut scratch.track_r[..n], input_delay_samples as usize);
+    }
+
     // ---- Audio FX chain ----
     for i in 0..song_track.fx_chain.len() {
         let key = (track_id, PluginSlot::Fx(i as u32));
@@ -935,6 +988,7 @@ pub fn execute_schedule_post_dispatch(
         nodes,
         delay_lines,
         port_buffers: _,
+        input_delay_per_track: _,
     } = schedule;
     for op in nodes.iter() {
         match op {
