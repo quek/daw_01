@@ -278,6 +278,11 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         slot_kind: 2, // Fx
         slot_index: 0,
     });
+    // RemoveSlot は plugin の最新 state を取ってから Undo snapshot →
+    // 削除 という deferred path を通る (PendingStateRequest)。 test では
+    // plugin_host を mock していないので、 fake で AllStatesReceived を
+    // 流して deferred edit を実行させる。
+    app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
     let plugin_msgs = drain(&mut plugin_rx);
     assert!(
         plugin_msgs.iter().any(|m| matches!(
@@ -322,6 +327,10 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     app.handle_event(AppEvent::UngroupTracks {
         track_ids: vec![group_id],
     });
+    // RemoveSlot と同じく、 group_track の fx_chain が削除されるため
+    // ungroup も deferred path (state 取得 → Undo snapshot → 実 ungroup)
+    // を通る。 fake で AllStatesReceived を流して inner を発火させる。
+    app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
 
     let audio_msgs = drain(&mut audio_rx);
     let plugin_msgs = drain(&mut plugin_rx);

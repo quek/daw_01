@@ -230,7 +230,11 @@ pub struct AppData {
     pub plugin_picker_target: PickerTarget,
 
     // -------- Save flow / IPC --------
-    pub pending_save_path: Option<PathBuf>,
+    /// 現在 plugin_host へ `RequestAllStates` を投げて返答待ち中の理由。
+    /// `None` の間は新規 request を発行できる。 `Some` の間に来た新規
+    /// request は fallback (state 同期なし) で即時実行する。
+    /// 詳細は [`PendingStateRequest`] / [`DeferredEdit`]。
+    pub pending_state_request: Option<PendingStateRequest>,
     pub audio_tx: Option<UnboundedSender<MainToChild>>,
     pub plugin_tx: Option<UnboundedSender<MainToChild>>,
     #[cfg(windows)]
@@ -404,7 +408,7 @@ impl AppData {
             plugin_picker_visible: Vec::new(),
             is_plugin_picker_open: false,
             plugin_picker_target: PickerTarget::Instrument,
-            pending_save_path: None,
+            pending_state_request: None,
             audio_tx: Some(audio_tx),
             plugin_tx: Some(plugin_tx),
             #[cfg(windows)]
@@ -757,6 +761,13 @@ impl AppData {
         self.pianoroll_notes_generation += 1;
     }
 
+    /// `handle_event` の冒頭で push_undo_snapshot を auto する対象 event。
+    ///
+    /// **plugin が削除される event (`DeleteTrack` / `UngroupTracks` /
+    /// `RemoveSlot`) はここに含めない**。 これらは dispatcher 側で
+    /// `RequestAllStates` を経由してから push_undo_snapshot するため、
+    /// auto push と重複してしまう。 plugin state 同期付き Undo の
+    /// 詳細は [`PendingStateRequest`] / [`DeferredEdit`] を参照。
     fn is_undoable(event: &AppEvent) -> bool {
         matches!(
             event,
@@ -764,7 +775,6 @@ impl AppData {
                 | AppEvent::AddVocalTrack
                 | AppEvent::AddInstrumentTrack
                 | AppEvent::GroupSelectedTracks { .. }
-                | AppEvent::UngroupTracks { .. }
                 | AppEvent::SetTrackParent { .. }
                 | AppEvent::RemoveLastTrack
                 | AppEvent::CommitRenameTrack
@@ -780,7 +790,6 @@ impl AppData {
                 | AppEvent::SetTrackSpeaker { .. }
                 | AppEvent::QuantizeSelectedNotes(_)
                 | AppEvent::SelectPluginFromDb(_)
-                | AppEvent::RemoveSlot { .. }
                 | AppEvent::CommitBpmEdit
                 | AppEvent::CommitTimeSigNumEdit
                 | AppEvent::SetSongTimeSigDenominator(_)
@@ -913,6 +922,33 @@ impl AppData {
 
 /// 一部 variant は将来の機能 (rename UI / quantize / autosave / piano-roll
 /// shortcut 等) で使う予定なので、現時点で未参照でも残す。新規 variant 追加時に
+/// `RequestAllStates` の発行理由。 plugin_host から `AllPluginStates`
+/// が返ってくるまで [`AppData::pending_state_request`] に保持し、
+/// 受信時に対応する完了処理 (save または deferred edit) を実行する。
+///
+/// 「同時に複数の理由」 は持てない (`Option<PendingStateRequest>` が
+/// 1 つのため)。 すでに `Some` のときに来た新規 request は state 同期
+/// 無しで即時実行する fallback ロジックが各 dispatcher 側にある。
+#[derive(Debug, Clone)]
+pub enum PendingStateRequest {
+    /// project save。 ファイル書き出し完了で消費される。
+    Save { path: PathBuf },
+    /// plugin が **削除される** 編集操作の Undo snapshot 作成。
+    /// state を Song に書き込んでから [`AppData::push_undo_snapshot`]
+    /// を呼ぶことで、 削除直前の knob 値等を Undo で復元できる。
+    Deferred(DeferredEdit),
+}
+
+/// state 取得が完了したあとに plugin-main thread へ実行させる編集。
+/// track index ではなく **stable な `track_id`** で持つので、 pending
+/// 中に他の編集が track の Vec position をずらしても整合性が保たれる。
+#[derive(Debug, Clone)]
+pub enum DeferredEdit {
+    DeleteTrack { track_id: u32 },
+    UngroupTracks { track_ids: Vec<u32> },
+    RemoveSlot { track_id: u32, slot: PluginSlot },
+}
+
 /// 既存の event handler と一貫性を保つため、enum 全体に `#[allow(dead_code)]`
 /// を付ける。
 #[allow(dead_code)]
@@ -1965,22 +2001,28 @@ impl AppData {
         self.begin_save(path);
     }
 
-    fn begin_save(&mut self, path: PathBuf) {
-        let has_plugin = self.song.tracks.iter().any(|t| {
+    /// Song 内に CLAP/VST3 plugin が 1 つでもあるか。 何も無ければ
+    /// `RequestAllStates` を発行する意味が無いので、 deferred / save の
+    /// dispatcher は plugin なしを早期判定して即時実行に切り替える。
+    fn song_has_plugin(&self) -> bool {
+        self.song.tracks.iter().any(|t| {
             t.instrument.is_some() || !t.fx_chain.is_empty() || !t.midi_fx_chain.is_empty()
-        });
-        if has_plugin {
-            self.pending_save_path = Some(path);
-            self.send_plugin(MainToChild::RequestAllStates);
-        } else {
-            self.finish_save(path, Vec::new());
-        }
+        })
     }
 
-    fn finish_save(&mut self, path: PathBuf, states: Vec<SlotState>) {
-        for s in &states {
-            let Some(track) = self.song.tracks.get_mut(s.track as usize) else {
-                tracing::warn!(track = s.track, ?s.slot, "save: track not found in model");
+    /// `AllPluginStates` で受け取った各 plugin の state を `Song` の
+    /// 対応する `PluginInstance::state` に書き戻す。 save flow と Undo
+    /// snapshot deferred path の両方で呼ばれる共通 helper。
+    ///
+    /// `track` の検索は Vec position ではなく **`Track::id` 一致** で
+    /// 行う。 plugin_host は SlotState の `track` を `Track::id` で
+    /// 詰める仕様 (PR2.1)。 旧実装は `tracks.get_mut(s.track as usize)`
+    /// と Vec index で検索していたが、 deferred path で track が再
+    /// 並び替わっていると壊れるため改めた。
+    fn apply_plugin_states(&mut self, states: &[SlotState]) {
+        for s in states {
+            let Some(track) = self.song.tracks.iter_mut().find(|t| t.id == s.track) else {
+                tracing::warn!(track = s.track, ?s.slot, "apply_plugin_states: track id not found");
                 continue;
             };
             match s.slot {
@@ -2001,6 +2043,33 @@ impl AppData {
                 }
             }
         }
+    }
+
+    /// project save の trigger。 plugin がある場合は plugin_host から
+    /// 最新 state を取って Song に書き戻してから save する。 plugin が
+    /// 1 つもなければ即 save。
+    ///
+    /// 既に `RequestAllStates` を発行中 (= 別の deferred edit の sync を
+    /// 待っている) なら、 fallback として state 同期なしで即時 save する
+    /// (= 古い save 挙動)。 これは「 plugin を消そうとしたタイミングで
+    /// Ctrl+S」 のような狭い race のための妥協で、 実用上の問題は無い。
+    fn begin_save(&mut self, path: PathBuf) {
+        if self.pending_state_request.is_some() {
+            tracing::warn!("begin_save: pending state request already in flight; saving without state sync");
+            self.save_after_states(path);
+            return;
+        }
+        if !self.song_has_plugin() {
+            self.save_after_states(path);
+            return;
+        }
+        self.pending_state_request = Some(PendingStateRequest::Save { path });
+        self.send_plugin(MainToChild::RequestAllStates);
+    }
+
+    /// state 適用 (save flow なら `apply_plugin_states` 済み、 plugin が
+    /// 無ければ no-op) のあとファイルを書き出す。
+    fn save_after_states(&mut self, path: PathBuf) {
         if self.save_to(&path) {
             self.file_path = Some(path);
         }
@@ -2089,11 +2158,39 @@ impl AppData {
 
     // -------- Track operations ---------------------------------------------
 
+    /// `AppEvent::DeleteTrack` の dispatcher。 plugin が song に居る
+    /// 場合は `RequestAllStates` を投げて、 受信時に最新 plugin state
+    /// を Song に書き込んでから [`Self::push_undo_snapshot`] + 削除を
+    /// 実行する。 これで「knob を回した状態で track 削除 → Undo」 で
+    /// knob 値が復元される。 plugin 無しの song / 既に pending 中の
+    /// 場合は state 同期なしで即時実行。
     fn delete_track(&mut self, idx: u32) {
+        let Some(track_id) = self.song.tracks.get(idx as usize).map(|t| t.id) else {
+            return;
+        };
+        if !self.song_has_plugin() || self.pending_state_request.is_some() {
+            self.push_undo_snapshot();
+            self.delete_track_inner(track_id);
+            return;
+        }
+        self.pending_state_request = Some(PendingStateRequest::Deferred(
+            DeferredEdit::DeleteTrack { track_id },
+        ));
+        self.send_plugin(MainToChild::RequestAllStates);
+    }
+
+    /// 実際の削除処理。 [`Self::on_all_states_from_child`] か上の
+    /// dispatcher の即時 fallback path から呼ばれる。 どちらでも呼び出し
+    /// 側で `push_undo_snapshot` 済みである前提なので、 ここでは push
+    /// しない。
+    fn delete_track_inner(&mut self, track_id: u32) {
+        let Some(idx) = self.song.track_index_by_id(track_id) else {
+            return;
+        };
+        let idx = idx as u32;
         if idx as usize >= self.song.tracks.len() {
             return;
         }
-        self.push_undo_snapshot();
 
         // When deleting a Group track, Live recursively removes its
         // entire subtree (children + nested groups) so dangling
@@ -2533,7 +2630,28 @@ impl AppData {
     /// group) に向ける + group track 自体を削除。 group の `fx_chain`
     /// は失われる (Live 仕様)。 複数 group が選択されているときは深い
     /// (子) → 浅い (親) の順に処理してインデックスを安定させる。
+    /// `AppEvent::UngroupTracks` の dispatcher。 group track を ungroup
+    /// すると group の `fx_chain` が削除されるため、 [`delete_track`] と
+    /// 同様 plugin の最新 state を取ってから Undo snapshot を取って実行
+    /// する。
     fn action_ungroup_tracks(&mut self, track_ids: &[u32]) {
+        if track_ids.is_empty() {
+            return;
+        }
+        if !self.song_has_plugin() || self.pending_state_request.is_some() {
+            self.push_undo_snapshot();
+            self.action_ungroup_tracks_inner(track_ids);
+            return;
+        }
+        self.pending_state_request = Some(PendingStateRequest::Deferred(
+            DeferredEdit::UngroupTracks {
+                track_ids: track_ids.to_vec(),
+            },
+        ));
+        self.send_plugin(MainToChild::RequestAllStates);
+    }
+
+    fn action_ungroup_tracks_inner(&mut self, track_ids: &[u32]) {
         if track_ids.is_empty() {
             return;
         }
@@ -3479,6 +3597,8 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
+    /// `AppEvent::RemoveSlot` の dispatcher。 削除する plugin の最新
+    /// state を取ってから Undo snapshot + 削除を行う。
     fn remove_slot(&mut self, slot_kind: u8, slot_index: u32) {
         let slot = match slot_kind {
             0 => PluginSlot::MidiFx(slot_index),
@@ -3488,8 +3608,24 @@ impl AppData {
         let Some(track_idx) = self.cursor_track_index() else {
             return;
         };
-        // PR2.1: send `Track::id` to the plugin host.
         let track_id = self.song.tracks[track_idx].id;
+
+        if !self.song_has_plugin() || self.pending_state_request.is_some() {
+            self.push_undo_snapshot();
+            self.remove_slot_inner(track_id, slot);
+            return;
+        }
+        self.pending_state_request = Some(PendingStateRequest::Deferred(
+            DeferredEdit::RemoveSlot { track_id, slot },
+        ));
+        self.send_plugin(MainToChild::RequestAllStates);
+    }
+
+    fn remove_slot_inner(&mut self, track_id: u32, slot: PluginSlot) {
+        let Some(track_idx) = self.song.track_index_by_id(track_id) else {
+            return;
+        };
+        // PR2.1: send `Track::id` to the plugin host.
         self.send_plugin(MainToChild::RemoveSlotPlugin {
             track: track_id,
             slot,
@@ -3574,11 +3710,43 @@ impl AppData {
         }
     }
 
+    /// `plugin_host` から `AllPluginStates` 受信。 全 plugin の最新
+    /// state を Song に書き戻したあと、 [`AppData::pending_state_request`]
+    /// に応じた完了処理 (save または deferred edit) を実行する。
     fn on_all_states_from_child(&mut self, states: Vec<SlotState>) {
-        let Some(path) = self.pending_save_path.take() else {
+        // Save / Deferred どちらでも Song の state は最新化したいので
+        // ここで一律書き戻す。 pending が None だった場合 (= 想定外
+        // タイミングの応答) でも害はない。
+        self.apply_plugin_states(&states);
+        let Some(req) = self.pending_state_request.take() else {
             return;
         };
-        self.finish_save(path, states);
+        match req {
+            PendingStateRequest::Save { path } => self.save_after_states(path),
+            PendingStateRequest::Deferred(edit) => {
+                // ここで初めて Undo snapshot を push する。 Song に
+                // 最新 state が入った状態を捕まえるため (plugin が
+                // 削除される編集を Undo すると knob 値が復元される)。
+                self.push_undo_snapshot();
+                self.execute_deferred_edit(edit);
+            }
+        }
+    }
+
+    /// `AllPluginStates` 受信後に呼ばれる。 deferred edit を実際に実行
+    /// する。 inner 関数群は `push_undo_snapshot` を呼ばない (= 上の
+    /// `on_all_states_from_child` 側で push 済みであり、 二重 push を
+    /// 避けるため)。
+    fn execute_deferred_edit(&mut self, edit: DeferredEdit) {
+        match edit {
+            DeferredEdit::DeleteTrack { track_id } => self.delete_track_inner(track_id),
+            DeferredEdit::UngroupTracks { track_ids } => {
+                self.action_ungroup_tracks_inner(&track_ids)
+            }
+            DeferredEdit::RemoveSlot { track_id, slot } => {
+                self.remove_slot_inner(track_id, slot)
+            }
+        }
     }
 
     // -------- Tick / metering ----------------------------------------------
