@@ -189,6 +189,29 @@ pub enum MainToChild {
         sample_rate: u32,
         samples: Vec<f32>,
     },
+    /// Generic in-memory audio buffer keyed by `id` — the same `id`
+    /// embedded in `AudioSourcePath::Generated { id }`. Multi-channel
+    /// (planar `samples[channel][frame]`). Replaces `SetVocalAudio`
+    /// over PR8: any synthesised audio (VOICEVOX result, future
+    /// render-in-place output) goes through this variant. The audio
+    /// engine stores it in `EngineShared::generated_audio_store`
+    /// keyed by `id` and resolves `AudioSourcePath::Generated` lookups
+    /// against that map. Spec: `docs/plan_audio_clip.md` §9.3.
+    SetGeneratedAudio {
+        id: u64,
+        sample_rate: u32,
+        channels: u16,
+        /// Planar storage — outer length must equal `channels`. All
+        /// inner vecs must be the same length (= frame count).
+        samples: Vec<Vec<f32>>,
+    },
+    /// Tell the audio engine the current project directory so it can
+    /// resolve `AudioSourcePath::ProjectRelative` entries against
+    /// `<project_dir>/samples/<...>`. `None` for unsaved projects —
+    /// in that state any `ProjectRelative` AudioSource fails to load
+    /// and the corresponding clip plays silence with a "missing
+    /// source" badge in the GUI. Spec: §9.2.
+    SetProjectDir(Option<std::path::PathBuf>),
     SetTrackVolume { track: u32, volume: f32 },
     SetTrackPan { track: u32, pan: f32 },
     SetTrackMuted { track: u32, muted: bool },

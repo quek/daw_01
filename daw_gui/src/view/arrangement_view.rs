@@ -190,9 +190,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 let Some(target) = clip_key_to_ref(app, key) else {
                     return;
                 };
-                match idx {
-                    0 => app.handle_event(AppEvent::MakeClipUnique(target)),
-                    _ => {}
+                if idx == 0 {
+                    app.handle_event(AppEvent::MakeClipUnique(target));
                 }
             }));
         });
@@ -265,18 +264,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         );
     }
     if let Some(paths) = ui.take_file_drop_in_rect(canvas_area) {
-        let display = paths
-            .iter()
-            .map(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("(unnamed)")
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
+        // Phase 1 PR3: paths 経由で `ImportAudio` を発火。 drop 座標
+        // → (target_track, target_beat) の解決は PR4 で改善。 現状は
+        // handler 側で「最初の track の playhead 位置に縦並び配置」
+        // を default にしている (`docs/plan_audio_clip.md` §3.1)。
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.status_message = format!("dropped: {display}");
+            app.handle_event(AppEvent::ImportAudio { paths });
         }));
     }
 }

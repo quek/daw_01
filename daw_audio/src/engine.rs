@@ -18,6 +18,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
@@ -30,6 +31,7 @@ use common::protocol::PluginSlot;
 use common::timing::{effective_loop_bounds, song_ended};
 use common::worker_bridge::WorkerBridgeHandle;
 
+use crate::audio_clip_renderer::{AudioClipRenderer, AudioSourceBuffer};
 use crate::audio_worker::AudioWorkerPool;
 use crate::graph::{BufRef, NodeOp, Schedule, compile_schedule};
 use crate::mixer::TrackScratch;
@@ -149,7 +151,8 @@ pub struct EngineShared {
     /// Per-track pre-rendered vocal audio (VOICEVOX results). The outer
     /// map is snapshotted on add/remove; the inner `ArcSwapOption` is
     /// hot-swapped on `SetVocalAudio` so re-synthesis lands on the next
-    /// buffer.
+    /// buffer. Retired in PR8 in favour of `audio_clip_renderer` +
+    /// `generated_audio_store` (Phase 1 spec §6.1).
     pub vocal_store: ArcSwap<HashMap<u32, Arc<ArcSwapOption<VocalAudio>>>>,
     /// Worker pool that fans per-track work across N audio-engine
     /// workers. `None` until `OpenWorkerPool` arrives.
@@ -158,6 +161,26 @@ pub struct EngineShared {
     /// callback skips its `process_buffer` and writes silence so the
     /// export render can drive `plugin.process()` exclusively.
     pub export_running: AtomicBool,
+    /// Audio clip render snapshot. Built off-thread in
+    /// `compile_audio_schedule` (PR6) and published via `ArcSwap`. The
+    /// audio thread `load()`s once per buffer to find events that
+    /// overlap the current playhead range. Empty until imports start
+    /// landing.
+    pub audio_clip_renderer: ArcSwap<AudioClipRenderer>,
+    /// In-memory audio buffers keyed by `Generated { id }` —
+    /// VOICEVOX synthesis results, future render-in-place output, etc.
+    /// Distinct from `audio_clip_renderer.sources` because file-backed
+    /// `AudioSource`s are decoded by the engine itself from path,
+    /// while generated audio is *delivered* via IPC
+    /// (`MainToChild::SetGeneratedAudio`). PR6 merges this into the
+    /// schedule's `sources` map at compile time.
+    pub generated_audio_store: ArcSwap<HashMap<u64, Arc<AudioSourceBuffer>>>,
+    /// Current project directory, used to resolve
+    /// `AudioSourcePath::ProjectRelative`. `None` for unsaved projects
+    /// — `ProjectRelative` paths fail to resolve in that state and the
+    /// caller is expected to use `Absolute` (import_cache fallback).
+    /// Updated by `MainToChild::SetProjectDir`.
+    pub project_dir: ArcSwapOption<PathBuf>,
 }
 
 impl EngineShared {
@@ -170,6 +193,9 @@ impl EngineShared {
             vocal_store: ArcSwap::from_pointee(HashMap::new()),
             worker_pool: ArcSwapOption::empty(),
             export_running: AtomicBool::new(false),
+            audio_clip_renderer: ArcSwap::from_pointee(AudioClipRenderer::empty()),
+            generated_audio_store: ArcSwap::from_pointee(HashMap::new()),
+            project_dir: ArcSwapOption::empty(),
         }
     }
 }

@@ -6,17 +6,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::plugin_format::PluginFormat;
 
-/// Bumped to `6` for shared/linked clip support: notes moved out of
-/// `Clip` into `Song.clip_contents` keyed by `Clip.content_id`, so
-/// multiple clips can share the same source content (REAPER pooled MIDI
-/// model). v5 `.daw` files still load — `Song::ensure_clip_contents`
-/// migrates the legacy per-`Clip` `notes` into the shared store on load.
-/// See `docs/plan_clip_share_clone.md`.
+/// Bumped to `7` for audio clip / WAV import support: `ClipContent`
+/// becomes an `enum { Midi(MidiContent), Audio(AudioContent) }` so the
+/// same shared-content store can hold MIDI notes or audio events, and
+/// `Song.audio_sources` is added as a pool of imported WAV references.
+/// v6 `.daw` files still load — the old struct form `{notes: [...]}`
+/// deserializes into `Midi(MidiContent { notes })` via
+/// `#[serde(untagged)]` because `MidiContent` and `AudioContent` have
+/// disjoint field sets. See `docs/plan_audio_clip.md`.
 ///
-/// Previously bumped to `5` for the routing graph (group tracks +
-/// plugin latency cache) and `4` for moving per-`Clip` `volume` onto
-/// `Track::volume` (a brief detour at `3`).
-pub const CURRENT_VERSION: u32 = 6;
+/// Previously: `6` (shared/linked clip — notes moved into
+/// `Song.clip_contents` keyed by `Clip.content_id`, REAPER pooled MIDI
+/// model — see `docs/plan_clip_share_clone.md`); `5` (routing graph +
+/// plugin latency cache); `4` (per-`Clip` `volume` moved onto
+/// `Track::volume`); `3` was a brief detour.
+pub const CURRENT_VERSION: u32 = 7;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -93,6 +97,19 @@ pub struct Song {
     /// allocations start at `1`.
     #[serde(default)]
     pub next_content_id: ContentId,
+    /// Pool of imported audio file references (WAV / generated). Each
+    /// entry is keyed by `AudioSourceId` and shared by every
+    /// `AudioEvent.source_id` that points at it. Decoded sample buffers
+    /// are NOT stored here — only metadata (path / sample_rate / channels
+    /// / frames). The actual buffers are decoded independently in each
+    /// process (GUI / audio engine) from the path. Entries with refcount
+    /// == 0 are GC'd by `Song::gc_audio_sources` before save.
+    #[serde(default)]
+    pub audio_sources: HashMap<AudioSourceId, AudioSource>,
+    /// Stable id allocator for `AudioSourceId`. `0` is the sentinel; valid
+    /// allocations start at `1`.
+    #[serde(default)]
+    pub next_audio_source_id: AudioSourceId,
 }
 
 impl Default for Song {
@@ -107,6 +124,8 @@ impl Default for Song {
             next_track_id: 1,
             clip_contents: HashMap::new(),
             next_content_id: 1,
+            audio_sources: HashMap::new(),
+            next_audio_source_id: 1,
         }
     }
 }
@@ -255,17 +274,21 @@ impl Song {
                             // the same migrated content_id is impossible
                             // (v5 stored notes per-clip; migration emits
                             // a fresh content_id per clip), so just
-                            // overwrite if it ever happens.
-                            c.notes = notes.clone();
+                            // overwrite if it ever happens. Promote any
+                            // existing Audio variant back to Midi (also
+                            // shouldn't happen, but keep the invariant).
+                            *c = ClipContent::Midi(MidiContent {
+                                notes: notes.clone(),
+                            });
                         })
-                        .or_insert(ClipContent { notes });
+                        .or_insert_with(|| {
+                            ClipContent::Midi(MidiContent { notes })
+                        });
                 } else {
                     // Ensure an entry exists for every referenced
                     // content_id so lookups never have to handle the
                     // missing case.
-                    self.clip_contents
-                        .entry(cid)
-                        .or_insert_with(ClipContent::default);
+                    self.clip_contents.entry(cid).or_default();
                 }
             }
         }
@@ -289,21 +312,24 @@ impl Song {
     pub fn clip_notes(&self, clip: &Clip) -> &[Note] {
         self.clip_contents
             .get(&clip.content_id)
-            .map(|c| c.notes.as_slice())
+            .and_then(|c| c.notes())
             .unwrap_or(&[])
     }
 
     /// Mutable lookup for the notes of a clip identified by `(track_idx,
     /// clip_idx)`. Resolves `content_id` and returns a mutable reference
     /// to the shared `notes` vector. Returns `None` if the indices are
-    /// out of range or the `content_id` has no entry.
+    /// out of range, the `content_id` has no entry, or the entry is an
+    /// `Audio` variant.
     pub fn notes_in_clip_mut(
         &mut self,
         track_idx: usize,
         clip_idx: usize,
     ) -> Option<&mut Vec<Note>> {
         let content_id = self.tracks.get(track_idx)?.clips.get(clip_idx)?.content_id;
-        self.clip_contents.get_mut(&content_id).map(|c| &mut c.notes)
+        self.clip_contents
+            .get_mut(&content_id)
+            .and_then(|c| c.notes_mut())
     }
 
     /// Drop `clip_contents` entries that no clip references. Called
@@ -318,6 +344,74 @@ impl Song {
             .map(|c| c.content_id)
             .collect();
         self.clip_contents.retain(|id, _| live.contains(id));
+    }
+
+    /// Allocate a fresh `AudioSourceId`, bumping the song-level counter.
+    pub fn alloc_audio_source_id(&mut self) -> AudioSourceId {
+        let id = self.next_audio_source_id.max(1);
+        self.next_audio_source_id = id + 1;
+        id
+    }
+
+    /// Refcount of an `AudioSourceId` = total `AudioEvent.source_id`
+    /// references across every audio `ClipContent` in the song. Used by
+    /// `gc_audio_sources` and Inspector display.
+    pub fn audio_source_refcount(&self, source_id: AudioSourceId) -> usize {
+        self.clip_contents
+            .values()
+            .filter_map(|c| match c {
+                ClipContent::Audio(a) => Some(a.events.iter()),
+                ClipContent::Midi(_) => None,
+            })
+            .flatten()
+            .filter(|ev| ev.source_id == source_id)
+            .count()
+    }
+
+    /// Drop `audio_sources` entries no `AudioEvent` references. Mirrors
+    /// `gc_clip_contents` — called before save so the on-disk pool stays
+    /// tidy. In-memory entries with refcount=0 are kept briefly so
+    /// Undo can restore them.
+    pub fn gc_audio_sources(&mut self) {
+        let live: std::collections::HashSet<AudioSourceId> = self
+            .clip_contents
+            .values()
+            .filter_map(|c| match c {
+                ClipContent::Audio(a) => Some(a.events.iter()),
+                ClipContent::Midi(_) => None,
+            })
+            .flatten()
+            .map(|ev| ev.source_id)
+            .collect();
+        self.audio_sources.retain(|id, _| live.contains(id));
+    }
+
+    /// Re-assign fresh `AudioSourceId` to any source whose id is the
+    /// `0` sentinel (and bump `next_audio_source_id` above the highest
+    /// seen). Idempotent — sources with non-zero ids are left untouched.
+    /// Mirrors `ensure_clip_contents` semantics.
+    pub fn ensure_audio_source_ids(&mut self) {
+        let mut max_seen: AudioSourceId = 0;
+        for id in self.audio_sources.keys() {
+            if *id != 0 {
+                max_seen = max_seen.max(*id);
+            }
+        }
+        if self.next_audio_source_id <= max_seen {
+            self.next_audio_source_id = max_seen + 1;
+        }
+        if self.next_audio_source_id == 0 {
+            self.next_audio_source_id = 1;
+        }
+        // Re-key any AudioSource currently held under id 0. AudioEvent
+        // references to id 0 are NOT remapped — those remain dangling
+        // (= "missing source") which is the correct UX for unresolved
+        // imports. Callers that mint a fresh AudioSource should always
+        // go through `alloc_audio_source_id` and avoid sentinel 0.
+        if let Some(orphan) = self.audio_sources.remove(&0) {
+            let new_id = self.alloc_audio_source_id();
+            self.audio_sources.insert(new_id, orphan);
+        }
     }
 }
 
@@ -522,14 +616,214 @@ pub struct Clip {
     pub notes: Vec<Note>,
 }
 
-/// Shared content (notes) referenced by one or more `Clip`s via
-/// `Clip.content_id`. Stored on `Song.clip_contents`. Notes are in
-/// arbitrary order — readers that care about time order must sort by
-/// `Note::start_beat` themselves.
+/// Shared content referenced by one or more `Clip`s via
+/// `Clip.content_id`. Stored on `Song.clip_contents`. Carries either
+/// MIDI notes (`Midi(MidiContent)`) or audio events
+/// (`Audio(AudioContent)`) depending on the variant.
+///
+/// `#[serde(untagged)]` lets v6 `.daw` files (which serialised
+/// `ClipContent` as a flat struct `{ "notes": [...] }`) deserialize
+/// directly into `Midi(MidiContent { notes })` — `MidiContent.notes`
+/// vs `AudioContent.events` are disjoint field sets so the dispatch
+/// is unambiguous. bincode (used over IPC) ignores the serde-untagged
+/// attribute and encodes the variant index as usual.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[serde(untagged)]
+pub enum ClipContent {
+    Midi(MidiContent),
+    Audio(AudioContent),
+}
+
+impl Default for ClipContent {
+    fn default() -> Self {
+        ClipContent::Midi(MidiContent::default())
+    }
+}
+
+impl ClipContent {
+    /// Borrow the notes slice if this is a `Midi` variant. `Audio`
+    /// variants return `None`. Used by `Song::clip_notes` and other
+    /// helpers that previously read `clip.notes` directly.
+    pub fn notes(&self) -> Option<&[Note]> {
+        match self {
+            ClipContent::Midi(m) => Some(m.notes.as_slice()),
+            ClipContent::Audio(_) => None,
+        }
+    }
+
+    /// Mutably borrow the notes vec for a `Midi` variant. `Audio`
+    /// variants return `None`.
+    pub fn notes_mut(&mut self) -> Option<&mut Vec<Note>> {
+        match self {
+            ClipContent::Midi(m) => Some(&mut m.notes),
+            ClipContent::Audio(_) => None,
+        }
+    }
+
+    /// Borrow the audio events slice if this is an `Audio` variant.
+    pub fn audio_events(&self) -> Option<&[AudioEvent]> {
+        match self {
+            ClipContent::Audio(a) => Some(a.events.as_slice()),
+            ClipContent::Midi(_) => None,
+        }
+    }
+
+    /// Mutably borrow the events vec for an `Audio` variant.
+    pub fn audio_events_mut(&mut self) -> Option<&mut Vec<AudioEvent>> {
+        match self {
+            ClipContent::Audio(a) => Some(&mut a.events),
+            ClipContent::Midi(_) => None,
+        }
+    }
+}
+
+/// MIDI clip content — a bag of notes positioned in clip-local beats.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
-pub struct ClipContent {
+pub struct MidiContent {
+    /// Notes are in arbitrary order — readers that care about time
+    /// order must sort by `Note::start_beat`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<Note>,
+}
+
+/// Audio clip content — an ordered list of audio events that play
+/// within the clip. Bitwig "Clip ⊃ Audio Events" hierarchy
+/// ([docs/plan_audio_clip.md](../../docs/plan_audio_clip.md)). Events
+/// can overlap (mixed) or sit side by side; clip-internal layout is
+/// defined by each event's `event_start_in_clip_beats` /
+/// `event_length_beats`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct AudioContent {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<AudioEvent>,
+}
+
+/// Stable id for an entry in `Song.audio_sources`. `0` is the "未採番"
+/// sentinel — `Song::ensure_audio_source_ids` reassigns it on load.
+pub type AudioSourceId = u32;
+
+/// Reference to an imported audio file (WAV / FLAC / generated). Path
+/// resolution is governed by `AudioSourcePath`. Sample buffers are NOT
+/// stored on the model — each process (GUI / audio engine) decodes the
+/// file independently from the path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct AudioSource {
+    pub path: AudioSourcePath,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub frames: u64,
+    /// BPM detected from WAV cue chunks / ACID metadata. Used by
+    /// `StretchMode::Repitch` / `Stretch` to translate to project BPM.
+    /// `None` when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_bpm: Option<f32>,
+    /// MIDI key the loop was recorded at — relevant for sample-based
+    /// instruments. `None` when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_key: Option<u8>,
+}
+
+/// Path resolution strategy for an `AudioSource`. Normal imports
+/// produce `ProjectRelative` after copying the file into
+/// `<project_dir>/samples/<basename>_<hash8>.<ext>`. `Absolute` is
+/// reserved for the unsaved-project import-cache fallback (and a
+/// future "link to external sample" mode). `Generated` is used by
+/// VOICEVOX and other in-memory synthesised audio with no file on
+/// disk; the `id` is the same one carried by
+/// `MainToChild::SetGeneratedAudio`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub enum AudioSourcePath {
+    ProjectRelative(PathBuf),
+    Absolute(PathBuf),
+    Generated { id: u64 },
+}
+
+/// One playable audio event inside an `AudioContent`. Maps a slice of
+/// an `AudioSource` (`source_*_frames`) to a position in the clip
+/// (`event_start_in_clip_beats` + `event_length_beats`) and applies
+/// per-event playback parameters (gain / pan / pitch / fade / stretch).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct AudioEvent {
+    pub source_id: AudioSourceId,
+    pub event_start_in_clip_beats: f64,
+    pub event_length_beats: f64,
+    pub source_start_frames: u64,
+    pub source_end_frames: u64,
+
+    pub gain_db: f32,
+    pub pan: f32,
+    pub pitch_semitones: f32,
+    pub formant_semitones: f32,
+
+    pub stretch_mode: StretchMode,
+
+    pub fade_in_beats: f64,
+    pub fade_out_beats: f64,
+    pub fade_in_curve: FadeCurve,
+    pub fade_out_curve: FadeCurve,
+
+    pub reversed: bool,
+    pub muted: bool,
+
+    /// Auto-detected transient frames (sample units). Phase 4+; empty
+    /// in Phase 1.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub onsets: Vec<u64>,
+    /// User-placed beat markers for `StretchMode::Stretch`. Phase 3+;
+    /// empty in Phase 1.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub beat_markers: Vec<BeatMarker>,
+}
+
+impl Default for AudioEvent {
+    fn default() -> Self {
+        Self {
+            source_id: 0,
+            event_start_in_clip_beats: 0.0,
+            event_length_beats: 0.0,
+            source_start_frames: 0,
+            source_end_frames: 0,
+            gain_db: 0.0,
+            pan: 0.0,
+            pitch_semitones: 0.0,
+            formant_semitones: 0.0,
+            stretch_mode: StretchMode::Raw,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+            reversed: false,
+            muted: false,
+            onsets: Vec::new(),
+            beat_markers: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Encode, Decode)]
+pub enum StretchMode {
+    #[default]
+    Raw,
+    Repitch,
+    Stretch,
+    Slice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Encode, Decode)]
+pub enum FadeCurve {
+    #[default]
+    Linear,
+    Exponential,
+    SCurve,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct BeatMarker {
+    /// Position inside the source file (sample frames).
+    pub source_frame: u64,
+    /// Position inside the event (event-local beats) where the source
+    /// frame is locked to land.
+    pub locked_beat: f64,
 }
 
 /// A free-time note inside a clip. `start_beat` is relative to the clip
@@ -707,13 +1001,15 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_six() {
-        // Bumped to 6 to add `Song.clip_contents` + `Clip.content_id`
-        // for shared/linked clips (REAPER pooled MIDI model). v5 files
-        // forward-migrate via `Song::ensure_clip_contents` (called
-        // automatically by `project::load`). Pinning the constant
-        // catches accidental rollback.
-        assert_eq!(CURRENT_VERSION, 6);
+    fn current_version_is_seven() {
+        // Bumped to 7 for audio clip / WAV import support: `ClipContent`
+        // becomes an `enum { Midi(MidiContent), Audio(AudioContent) }`
+        // and `Song.audio_sources` is added. v6 files forward-migrate
+        // automatically — `#[serde(untagged)]` on `ClipContent` makes
+        // the legacy struct form `{notes: [...]}` deserialize into
+        // `Midi(MidiContent { notes })`. Pinning the constant catches
+        // accidental rollback.
+        assert_eq!(CURRENT_VERSION, 7);
     }
 
     #[test]

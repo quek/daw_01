@@ -18,10 +18,11 @@ daw-ui-renderer.workspace = true
 daw-ui-core.workspace = true
 winit.workspace = true
 raw-window-handle.workspace = true
+hound = "3.5"
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 
 [dev-dependencies]
-hound = "3.5"
 tempfile = "3"

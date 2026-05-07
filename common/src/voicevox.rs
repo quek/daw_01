@@ -128,7 +128,7 @@ pub fn synthesize_song(
             let notes: &[Note] = song
                 .clip_contents
                 .get(&clip.content_id)
-                .map(|c| c.notes.as_slice())
+                .and_then(|c| c.notes())
                 .unwrap_or(&[]);
 
             // Cache lookup — notes 内容 + singer_id が同じなら HTTP call

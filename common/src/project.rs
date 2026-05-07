@@ -19,11 +19,12 @@ pub fn save(path: impl AsRef<Path>, song: &Song) -> Result<()> {
     let path = path.as_ref();
     let tmp = tmp_path(path);
 
-    // GC orphan content entries (refcount == 0) before serializing so
-    // disk files stay tidy. Working on a clone — caller's in-memory
-    // Song is not mutated.
+    // GC orphan content / audio_source entries (refcount == 0) before
+    // serializing so disk files stay tidy. Working on a clone —
+    // caller's in-memory Song is not mutated.
     let mut song = song.clone();
     song.gc_clip_contents();
+    song.gc_audio_sources();
     let project = ProjectFile {
         version: CURRENT_VERSION,
         song,
@@ -83,8 +84,12 @@ pub fn load(path: impl AsRef<Path>) -> Result<Song> {
     let mut song = project.song;
     // v5 → v6 migration: drain any legacy `Clip.notes` into the shared
     // `clip_contents` store, allocating fresh `content_id` for clips that
-    // still carry the sentinel `0`. Idempotent for v6 files.
+    // still carry the sentinel `0`. Idempotent for v6 / v7 files.
     song.ensure_clip_contents();
+    // v6 → v7 forward migration: `audio_sources` is empty for v6 files
+    // (serde default), but we still bump `next_audio_source_id` above
+    // any sentinel just in case. Idempotent.
+    song.ensure_audio_source_ids();
     Ok(song)
 }
 
@@ -97,7 +102,7 @@ fn tmp_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Clip, ClipContent, InstrumentSource, Note, Track};
+    use crate::model::{Clip, ClipContent, InstrumentSource, MidiContent, Note, Track};
     use tempfile::tempdir;
 
     #[test]
@@ -118,7 +123,7 @@ mod tests {
         let cid = song.alloc_content_id();
         song.clip_contents.insert(
             cid,
-            ClipContent {
+            ClipContent::Midi(MidiContent {
                 notes: vec![
                     Note {
                         start_beat: 0.0,
@@ -135,7 +140,7 @@ mod tests {
                         lyric: Some("ん".into()),
                     },
                 ],
-            },
+            }),
         );
         song.tracks.push(Track {
             id: 1,
@@ -156,6 +161,66 @@ mod tests {
         });
         save(&path, &song).unwrap();
         assert_eq!(load(&path).unwrap(), song);
+    }
+
+    #[test]
+    fn load_v6_clip_content_struct_form_deserializes_as_midi_variant() {
+        // v6 saves stored `ClipContent` as a flat struct
+        // `{ "notes": [...] }`. v7 promotes `ClipContent` to an enum
+        // `Midi(MidiContent) | Audio(AudioContent)` with
+        // `#[serde(untagged)]` so the legacy struct form deserialises
+        // straight into `Midi(MidiContent { notes })`.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v6.daw");
+        let v6_json = r#"{
+            "version": 6,
+            "song": {
+                "bpm": 120.0,
+                "time_sig": [4, 4],
+                "length_beats": 64.0,
+                "next_track_id": 2,
+                "next_content_id": 2,
+                "clip_contents": {
+                    "1": {
+                        "notes": [
+                            {"start_beat": 0.0, "duration_beats": 1.0, "pitch": 60, "velocity": 100}
+                        ]
+                    }
+                },
+                "tracks": [
+                    {
+                        "id": 1,
+                        "name": "Lead",
+                        "volume": 1.0,
+                        "pan": 0.0,
+                        "next_clip_id": 2,
+                        "clips": [
+                            {
+                                "id": 1,
+                                "name": "C",
+                                "start_beat": 0.0,
+                                "length_beats": 4.0,
+                                "content_id": 1
+                            }
+                        ]
+                    }
+                ]
+            }
+        }"#;
+        fs::write(&path, v6_json).unwrap();
+        let song = load(&path).expect("v6 must forward-migrate to v7");
+        let content = song
+            .clip_contents
+            .get(&1)
+            .expect("v6 content_id 1 must round-trip");
+        let notes = content
+            .notes()
+            .expect("legacy struct form must deserialise as Midi variant");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].pitch, 60);
+        // audio_sources defaults to empty for v6 files.
+        assert!(song.audio_sources.is_empty());
+        assert!(song.next_audio_source_id >= 1);
     }
 
     #[test]
@@ -205,8 +270,9 @@ mod tests {
             .clip_contents
             .get(&clip.content_id)
             .expect("content_id must have an entry after migration");
-        assert_eq!(content.notes.len(), 1);
-        assert_eq!(content.notes[0].pitch, 60);
+        let notes = content.notes().expect("legacy Clip.notes must migrate to Midi variant");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].pitch, 60);
     }
 
     #[test]

@@ -18,13 +18,17 @@ use std::sync::{Arc, Mutex};
 
 const UNDO_LIMIT: usize = 200;
 
-use common::model::{Clip, ClipContent, InstrumentSource, Note, Song, Track};
+use common::model::{
+    AudioContent, AudioEvent, Clip, ClipContent, InstrumentSource, Note, Song, Track,
+};
 use common::plugin_db::PluginDatabase;
 use common::plugin_format::PluginFormat;
 use common::protocol::{MainToChild, PluginSlot, SlotState};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::audio_source_cache::AudioSourceCache;
 use crate::dispatcher::{BackgroundDispatcher, JobDispatcher};
+use crate::import_audio;
 
 /// `plan_track_removal_ipc` の出力。 順序が deadlock 防止に必須なので
 /// テスト可能な enum で表現する。
@@ -149,6 +153,12 @@ pub struct AppData {
     // -------- Song / file --------
     pub song: Song,
     pub file_path: Option<PathBuf>,
+    /// Decoded sample buffers for `Song.audio_sources`, keyed by
+    /// `AudioSourceId`. Filled lazily on import (Phase 1 PR3). The
+    /// audio engine maintains its own independent cache — file-backed
+    /// sources are decoded twice (once per process) to keep IPC lean
+    /// (`docs/plan_audio_clip.md` §6.1 / §8.3).
+    pub audio_source_cache: AudioSourceCache,
 
     // -------- Selection --------
     /// Track multi-selection (Ableton Live / Reaper 互換)。 末尾要素 =
@@ -383,6 +393,7 @@ impl AppData {
         Self {
             song,
             file_path: None,
+            audio_source_cache: AudioSourceCache::new(),
             selected_track_ids: Vec::new(),
             collapsed_groups: std::collections::HashSet::new(),
             track_plugin_ids: std::collections::HashMap::new(),
@@ -1287,6 +1298,19 @@ pub enum AppEvent {
     // -------- WAV export -------------------------------------------------
     ExportWav,
     ExportWavComplete { error: Option<String> },
+
+    // -------- Audio clip import (Phase 1 PR3) ----------------------------
+    /// Import one or more audio files into the song. Triggered by
+    /// `arrangement` drag&drop and the File → Import Audio menu (PR3).
+    /// The handler decodes each file (Phase 1: synchronous + WAV-only,
+    /// `docs/plan_audio_clip.md` §7), copies it into
+    /// `<project_dir>/samples/<basename>_<hash>.<ext>` (or the unsaved-
+    /// project import_cache as fallback), registers an `AudioSource`,
+    /// stashes the decoded buffer in `audio_source_cache`, and creates
+    /// an audio clip on the first track at the current playhead.
+    /// Phase 2 moves decode to a background thread so large WAVs (up
+    /// to 4 GB §7.2) don't block the UI.
+    ImportAudio { paths: Vec<PathBuf> },
 }
 
 impl AppData {
@@ -1596,6 +1620,9 @@ impl AppData {
             }
             AppEvent::ExportWav => {
                 self.action_export_wav();
+            }
+            AppEvent::ImportAudio { paths } => {
+                self.action_import_audio(paths);
             }
             AppEvent::ExportWavComplete { error } => {
                 // Either way, hand the plugins back to realtime mode
@@ -2225,6 +2252,26 @@ impl AppData {
     }
 
     fn save_to(&mut self, path: &Path) -> bool {
+        // Phase 1 PR3: 未保存 project 中に import した audio source は
+        // user import_cache に置かれている。 save 時に
+        // `<project_dir>/samples/` へ move + path を ProjectRelative に
+        // 書き換える (`docs/plan_audio_clip.md` §13 Q2)。 失敗しても
+        // save は続行し、 missing source として扱う。
+        if let Some(project_dir) = path.parent()
+            && let Err(e) = import_audio::migrate_unsaved_audio_sources_into(
+                &mut self.song,
+                project_dir,
+            )
+        {
+            tracing::warn!(
+                error = ?e,
+                path = %path.display(),
+                "audio sources のうち import_cache → samples/ への移行で一部失敗"
+            );
+            self.status_message = format!(
+                "Audio sources の samples/ 移行で一部失敗: {e}"
+            );
+        }
         match common::project::save(path, &self.song) {
             Ok(()) => {
                 tracing::info!(path = %path.display(), "saved project");
@@ -3283,16 +3330,16 @@ impl AppData {
         let new_length = src_clip.length_beats;
         let new_name = src_clip.name.clone();
         let src_content_id = src_clip.content_id;
-        let cloned_notes = self
+        let cloned_content = self
             .song
             .clip_contents
             .get(&src_content_id)
-            .map(|c| c.notes.clone())
+            .cloned()
             .unwrap_or_default();
         let new_content_id = self.song.alloc_content_id();
         self.song
             .clip_contents
-            .insert(new_content_id, ClipContent { notes: cloned_notes });
+            .insert(new_content_id, cloned_content);
         let Some(track) = self.song.tracks.get_mut(source.track as usize) else {
             return;
         };
@@ -3375,16 +3422,16 @@ impl AppData {
             let new_length = src_clip.length_beats;
             let new_name = src_clip.name.clone();
             let src_content_id = src_clip.content_id;
-            let cloned_notes = self
+            let cloned_content = self
                 .song
                 .clip_contents
                 .get(&src_content_id)
-                .map(|c| c.notes.clone())
+                .cloned()
                 .unwrap_or_default();
             let new_content_id = self.song.alloc_content_id();
             self.song
                 .clip_contents
-                .insert(new_content_id, ClipContent { notes: cloned_notes });
+                .insert(new_content_id, cloned_content);
             let Some(to_track_idx) = self.song.track_index_by_id(to_track_id) else {
                 continue;
             };
@@ -3428,16 +3475,16 @@ impl AppData {
             self.status_message = "すでに独立 clip です".to_string();
             return;
         }
-        let cloned_notes = self
+        let cloned_content = self
             .song
             .clip_contents
             .get(&content_id)
-            .map(|c| c.notes.clone())
+            .cloned()
             .unwrap_or_default();
         let new_content_id = self.song.alloc_content_id();
         self.song
             .clip_contents
-            .insert(new_content_id, ClipContent { notes: cloned_notes });
+            .insert(new_content_id, cloned_content);
         let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
             return;
         };
@@ -4736,11 +4783,130 @@ impl AppData {
         ));
         self.send_audio(MainToChild::ExportWav { path });
     }
+
+    /// Import one or more audio files into the song (Phase 1 PR3).
+    /// Synchronous — blocks the UI until decode completes (Phase 2
+    /// will move this to a background thread; spec §7.4). Each file:
+    ///
+    /// 1. Hash + copy into `<project_dir>/samples/` (or import_cache
+    ///    fallback for unsaved projects, §13 Q2).
+    /// 2. Decode (WAV-only in Phase 1).
+    /// 3. Allocate `AudioSourceId`, register on `Song.audio_sources`.
+    /// 4. Stash decoded buffer in `audio_source_cache`.
+    /// 5. Build a single `AudioEvent` covering the whole source and
+    ///    wrap it in a fresh `ClipContent::Audio` content. Place a
+    ///    `Clip` on the cursor track at the playhead. Phase 2 / PR4
+    ///    refines drop-coordinate → (track, beat) resolution.
+    ///
+    /// Failures (unsupported format, oversize, decode error) surface
+    /// in `status_message`; partial progress (= some files succeeded)
+    /// is preserved.
+    fn action_import_audio(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        let project_dir: Option<PathBuf> = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.parent().map(Path::to_path_buf));
+
+        // Phase 1 PR3: drop coordinate → track resolution は gui_01 #023
+        // 待ち (`take_file_drop_in_rect` の戻り値に position を含める要望)。
+        // 暫定として「最後に選択した track」 (= cursor track) に配置する。
+        // 未選択時は最初の track にフォールバック。 gui_01 #023 が解決
+        // したら drop 座標から track を解決する形に置き換える (PR4)。
+        let target_track_idx: usize = self.cursor_track_index().unwrap_or(0);
+        let start_beat_seed: f64 = self.playhead_beat.unwrap_or(0.0) as f64;
+        if self.song.tracks.is_empty() {
+            self.status_message =
+                "Audio import: 配置先のトラックが無いため取り込めません".to_string();
+            return;
+        }
+
+        let bpm = self.song.bpm;
+        let mut imported_ok = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        let mut next_start_beat = start_beat_seed.max(0.0);
+
+        for path in paths {
+            let imported = match import_audio::import_one(&path, project_dir.as_deref()) {
+                Ok(i) => i,
+                Err(e) => {
+                    errors.push(format!("{}: {e}", path.display()));
+                    continue;
+                }
+            };
+
+            let length_beats =
+                frames_to_beats(imported.buffer.frames, imported.buffer.sample_rate, bpm);
+
+            let source_id = self.song.alloc_audio_source_id();
+            self.song.audio_sources.insert(source_id, imported.source);
+            self.audio_source_cache.insert(source_id, imported.buffer.clone());
+
+            let event = AudioEvent {
+                source_id,
+                event_start_in_clip_beats: 0.0,
+                event_length_beats: length_beats,
+                source_start_frames: 0,
+                source_end_frames: imported.buffer.frames,
+                ..AudioEvent::default()
+            };
+            let content_id = self.song.alloc_content_id();
+            self.song.clip_contents.insert(
+                content_id,
+                ClipContent::Audio(AudioContent {
+                    events: vec![event],
+                }),
+            );
+
+            let display_name = imported.display_name.clone();
+            let track = &mut self.song.tracks[target_track_idx];
+            let new_clip_id = track.alloc_clip_id();
+            track.clips.push(Clip {
+                id: new_clip_id,
+                name: display_name,
+                start_beat: next_start_beat,
+                length_beats,
+                content_id,
+                notes: Vec::new(),
+            });
+            next_start_beat += length_beats;
+            imported_ok += 1;
+        }
+
+        if imported_ok > 0 {
+            self.is_dirty = true;
+            self.sync_song_to_plugin_host();
+        }
+
+        self.status_message = match (imported_ok, errors.is_empty()) {
+            (0, false) => format!("Audio import 失敗: {}", errors.join(" / ")),
+            (n, true) => format!("Audio import 完了: {n} ファイル"),
+            (n, false) => format!(
+                "Audio import: {n} ファイル成功、 {} 件エラー: {}",
+                errors.len(),
+                errors.join(" / ")
+            ),
+        };
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Free standing helpers
 // ---------------------------------------------------------------------------
+
+/// frames @ source_sr → beats @ project bpm. Used to size newly
+/// imported audio clips so the visual length matches the file
+/// duration at the project's current tempo.
+fn frames_to_beats(frames: u64, sample_rate: u32, bpm: f32) -> f64 {
+    if sample_rate == 0 || bpm <= 0.0 {
+        return 0.0;
+    }
+    let secs = frames as f64 / sample_rate as f64;
+    secs * (bpm as f64) / 60.0
+}
+
 
 fn load_recent_files() -> common::recent::RecentFiles {
     let Some(path) = common::recent::default_path() else {

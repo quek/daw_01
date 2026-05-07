@@ -17,6 +17,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tokio::io::ReadHalf;
 use tokio::net::windows::named_pipe::NamedPipeClient;
 
+mod audio_clip_renderer;
 mod audio_worker;
 mod engine;
 mod export;
@@ -230,6 +231,64 @@ async fn recv_loop(
                     engine_shared.vocal_store.store(Arc::new(new_map));
                 }
                 tracing::info!(track, "vocal audio updated (direct)");
+            }
+            // SetGeneratedAudio (Phase 1 PR2): in-memory audio buffer
+            // delivered by the GUI for `AudioSourcePath::Generated { id }`
+            // sources (VOICEVOX results from PR8 onward; future render-
+            // in-place output too). Stored in `EngineShared::
+            // generated_audio_store`; PR6's `compile_audio_schedule` will
+            // merge these into the renderer's `sources` map at compile
+            // time. Wait-free `ArcSwap.store` is RT-safe vs the audio
+            // callback that reads concurrently.
+            Ok(MainToChild::SetGeneratedAudio {
+                id,
+                sample_rate,
+                channels,
+                samples,
+            }) => {
+                if samples.len() != channels as usize {
+                    tracing::error!(
+                        id,
+                        channels,
+                        samples_outer_len = samples.len(),
+                        "SetGeneratedAudio: planar samples outer length must equal channels — dropping"
+                    );
+                    continue;
+                }
+                let frames = samples.first().map(|s| s.len() as u64).unwrap_or(0);
+                if !samples.iter().all(|s| s.len() as u64 == frames) {
+                    tracing::error!(
+                        id,
+                        frames,
+                        "SetGeneratedAudio: planar channels have mismatched lengths — dropping"
+                    );
+                    continue;
+                }
+                let buffer = Arc::new(crate::audio_clip_renderer::AudioSourceBuffer {
+                    sample_rate,
+                    channels,
+                    frames,
+                    samples,
+                });
+                let cur = engine_shared.generated_audio_store.load();
+                let mut new_map: std::collections::HashMap<
+                    u64,
+                    Arc<crate::audio_clip_renderer::AudioSourceBuffer>,
+                > = (**cur).clone();
+                new_map.insert(id, buffer);
+                engine_shared.generated_audio_store.store(Arc::new(new_map));
+                tracing::info!(id, channels, frames, "generated audio buffer stored");
+            }
+            // SetProjectDir (Phase 1 PR2): record the current project
+            // directory so PR6's `compile_audio_schedule` can resolve
+            // `AudioSourcePath::ProjectRelative` against
+            // `<project_dir>/samples/<...>`. `None` for unsaved
+            // projects.
+            Ok(MainToChild::SetProjectDir(dir)) => {
+                engine_shared
+                    .project_dir
+                    .store(dir.as_ref().map(|p| Arc::new(p.clone())));
+                tracing::info!(?dir, "project_dir updated");
             }
             // ExportWav: kick off the offline render on a dedicated
             // thread so the IPC receive loop stays responsive. The

@@ -88,7 +88,7 @@ pub fn collect_events_for_buffer(
         let notes: &[Note] = song
             .clip_contents
             .get(&clip.content_id)
-            .map(|c| c.notes.as_slice())
+            .and_then(|c| c.notes())
             .unwrap_or(&[]);
         for note in notes {
             if note.duration_beats <= 0.0 {
@@ -143,19 +143,21 @@ pub fn collect_events_for_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::model::{Clip, ClipContent, Track};
+    use common::model::{Clip, ClipContent, MidiContent, Track};
 
     fn one_note_song(start_beat: f64, duration_beats: f64, pitch: u8) -> Song {
         // v6: notes は Song.clip_contents に置く。 inline の `notes:` は
         // legacy field (空) のままで、 ensure_clip_contents が migrate する
         // 想定だが、 ここでは直接 clip_contents を構築して migrate を挟まず
         // production と同形にする。
-        let mut song = Song::default();
-        song.bpm = 120.0;
+        let mut song = Song {
+            bpm: 120.0,
+            ..Song::default()
+        };
         let content_id = song.alloc_content_id();
         song.clip_contents.insert(
             content_id,
-            ClipContent {
+            ClipContent::Midi(MidiContent {
                 notes: vec![Note {
                     start_beat,
                     duration_beats,
@@ -163,7 +165,7 @@ mod tests {
                     velocity: 100,
                     lyric: None,
                 }],
-            },
+            }),
         );
         song.tracks.push(Track {
             id: 1,
@@ -233,13 +235,18 @@ mod tests {
     fn chord_emits_two_ons_at_same_time() {
         let mut song = one_note_song(0.0, 1.0, 60);
         let cid = song.tracks[0].clips[0].content_id;
-        song.clip_contents.get_mut(&cid).unwrap().notes.push(Note {
-            start_beat: 0.0,
-            duration_beats: 1.0,
-            pitch: 64,
-            velocity: 100,
-            lyric: None,
-        });
+        song.clip_contents
+            .get_mut(&cid)
+            .unwrap()
+            .notes_mut()
+            .expect("Midi variant")
+            .push(Note {
+                start_beat: 0.0,
+                duration_beats: 1.0,
+                pitch: 64,
+                velocity: 100,
+                lyric: None,
+            });
         let mut out = Vec::new();
         let mut active = Vec::new();
         collect_events_for_buffer(Some(&song), 0, SR, 0, 1024, &mut out, &mut active);
@@ -314,12 +321,14 @@ mod tests {
 
     #[test]
     fn output_is_sorted_with_off_before_on_at_same_time() {
-        let mut song = Song::default();
-        song.bpm = 120.0;
+        let mut song = Song {
+            bpm: 120.0,
+            ..Song::default()
+        };
         let cid = song.alloc_content_id();
         song.clip_contents.insert(
             cid,
-            ClipContent {
+            ClipContent::Midi(MidiContent {
                 notes: vec![
                     Note {
                         start_beat: 0.0,
@@ -336,7 +345,7 @@ mod tests {
                         lyric: None,
                     },
                 ],
-            },
+            }),
         );
         song.tracks.push(Track {
             id: 1,
