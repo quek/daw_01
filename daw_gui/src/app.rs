@@ -168,6 +168,17 @@ pub struct AppData {
     /// → all_done 永久 wait) を防ぐ。 daw_gui が plugin_id を保持する
     /// ための単一 source of truth。
     pub track_plugin_ids: std::collections::HashMap<u32, Vec<u32>>,
+    /// `(track_id, PluginSlot)` → 現在 plugin_host に load されている
+    /// plugin の情報。 Undo/Redo の reconcile (`reconcile_plugins_with_song`)
+    /// で「Song の各 slot の plugin が host 側と一致しているか」 を slot
+    /// 粒度で diff するために使う。 [`Self::track_plugin_ids`] が track
+    /// 単位の plugin_id 集合だけを持つのに対し、 こちらは slot ごとの
+    /// 詳細 (どの slot にどの plugin string id) まで track する。
+    ///
+    /// 更新タイミング: `SlotPluginLoaded` 受信時に insert、
+    /// `SlotPluginUnloaded` 受信時に reverse-lookup retain、
+    /// 削除系編集の `_inner` 関数内で track / slot 単位で remove。
+    pub loaded_slots: std::collections::HashMap<(u32, PluginSlot), LoadedSlotInfo>,
     /// PR3.3 PDC: `plugin_id → reported latency samples`。 plugin_host から
     /// `ChildToMain::PluginLatencyChanged` を受信して更新、
     /// `SlotPluginUnloaded` で drop。 各 track の累積 latency は
@@ -375,6 +386,7 @@ impl AppData {
             selected_track_ids: Vec::new(),
             collapsed_groups: std::collections::HashSet::new(),
             track_plugin_ids: std::collections::HashMap::new(),
+            loaded_slots: std::collections::HashMap::new(),
             plugin_latencies: std::collections::HashMap::new(),
             selected_clip: None,
             selected_clips: Vec::new(),
@@ -922,6 +934,17 @@ impl AppData {
 
 /// 一部 variant は将来の機能 (rename UI / quantize / autosave / piano-roll
 /// shortcut 等) で使う予定なので、現時点で未参照でも残す。新規 variant 追加時に
+/// `loaded_slots` の値: 1 つの (track, slot) ペアに対する load 情報。
+#[derive(Debug, Clone)]
+pub struct LoadedSlotInfo {
+    /// session-unique numeric plugin id (= plugin_host が割り当てる u32)。
+    pub plugin_id: u32,
+    /// stable string id (= `PluginInstance::plugin_id` と同じ値)。
+    /// reconcile の slot-level diff で「Song と host で同じ plugin が
+    /// 居るか」 を判定するキー。
+    pub plugin_id_str: String,
+}
+
 /// `RequestAllStates` の発行理由。 plugin_host から `AllPluginStates`
 /// が返ってくるまで [`AppData::pending_state_request`] に保持し、
 /// 受信時に対応する完了処理 (save または deferred edit) を実行する。
@@ -1823,47 +1846,52 @@ impl AppData {
         }
     }
 
-    /// Undo / Redo 後に呼んで、 `Song.tracks` と `track_plugin_ids`
-    /// (= plugin_host に load されている plugin 一覧) を diff し、
-    /// 必要な IPC を発行して両者を再同期する。
+    /// Undo / Redo 後に呼んで、 `Song.tracks` と plugin_host の load
+    /// 状態を **slot 粒度で** diff し、 必要な IPC を発行して両者を
+    /// 再同期する。
     ///
     /// Undo / Redo は `Song` の clone 入れ替えだけ行うので、 plugin_host
     /// と audio engine 側の load 状態は元に戻らない。 そのまま放置すると
     /// 「track 削除 → Undo で track 復活 → plugin が host に load されて
-    /// いないので音が鳴らない」 という UX バグになる。
+    /// いないので音が鳴らない」「FX 1 個追加 → Undo でも host にその FX
+    /// が残り続ける」 等の UX バグになる。
     ///
-    /// 2 phase:
-    ///   - **Phase A: stale remove** — `track_plugin_ids` にあるが
-    ///     `Song.tracks` には居ない track を、 `delete_track` と同じ
-    ///     IPC 順 (audio に `ClosePluginShmem` を先送り → plugin_host
-    ///     に `RemoveTrack`) で破棄する。 Redo が track 削除を進めた
-    ///     場合に発動する。
-    ///   - **Phase B: missing reload** — `Song.tracks` にあるが
-    ///     `track_plugin_ids` に key 自体が無い track の plugin chain を
-    ///     `SetSlotPlugin` で再 load する。 plugin_host 側は同 plugin_id
-    ///     の同 slot を dedup する (no-op + `SlotPluginLoaded` 再 emit)
-    ///     ので、 partial に host 側に残っているケースで送り直しても
-    ///     副作用はない。 ただし「同 track 内で plugin 構成が部分的に
-    ///     変わった Undo」 は本実装では同期しない (= track 全体が host に
-    ///     居なくなったケースのみ対応)。 この拡張は別 task。
+    /// Phase A (stale tracks remove): `loaded_slots` にあるが
+    /// `Song.tracks` には居ない `track_id` を、 `delete_track` と同じ
+    /// IPC 順 (audio に `ClosePluginShmem` 先送り → plugin_host に
+    /// `RemoveTrack`) で破棄する。 Redo が track 削除を進めた場合に
+    /// 発動する。
     ///
-    /// Plugin の **state** は `Song.PluginInstance::state` (= 直近の
-    /// project save 時点) を `initial_state` として渡す。 削除直前の
-    /// 最新 state (= knob を回した値) を復元するには `RequestAllStates`
-    /// を Undo snapshot タイミングで同期する別仕組みが要るので、 これも
-    /// 別 task として残す。
+    /// Phase B (per-slot diff): `Song.tracks` の各 track について
+    /// [`AppData::loaded_slots`] と「Song の各 `(slot, plugin_id_str)`」
+    /// を比較する。 host にあるが Song に無い slot は `RemoveSlotPlugin`、
+    /// Song にあるが host に無い slot もしくは host にあるが
+    /// `plugin_id_str` が違う slot は `SetSlotPlugin`。 plugin_host の
+    /// SetSlotPlugin handler は同 plugin_id を同 slot に置く dedup logic
+    /// を持つので、 一致 slot に改めて送信しても no-op
+    /// (`SlotPluginLoaded` を再 emit するだけ)。
+    ///
+    /// plugin の **state** は `Song.PluginInstance::state` を
+    /// `initial_state` として渡す。 直前 commit で push_undo_snapshot 前に
+    /// `RequestAllStates` で最新 state を Song に書き戻しているので、
+    /// 削除直前の knob 値も Undo で復元される。
     fn reconcile_plugins_with_song(&mut self) {
-        // Phase A: Song に無い track を host から消す。
+        // Phase A: Song に無い track を host から消す。 `loaded_slots` に
+        // 1 つでも残っている track id (= host 側 plugin chain がまだ
+        // ある) を見れば判定できる。
         let song_track_ids: std::collections::HashSet<u32> =
             self.song.tracks.iter().map(|t| t.id).collect();
-        let stale_track_ids: Vec<u32> = self
-            .track_plugin_ids
+        let stale_track_ids: std::collections::HashSet<u32> = self
+            .loaded_slots
             .keys()
-            .copied()
-            .filter(|id| !song_track_ids.contains(id))
+            .map(|(tid, _)| *tid)
+            .filter(|tid| !song_track_ids.contains(tid))
             .collect();
         if !stale_track_ids.is_empty() {
-            tracing::info!(?stale_track_ids, "reconcile: removing stale tracks from plugin host");
+            tracing::info!(
+                ?stale_track_ids,
+                "reconcile: removing stale tracks from plugin host"
+            );
         }
         for track_id in stale_track_ids {
             // `delete_track` と同じ IPC 順序: audio engine に
@@ -1875,74 +1903,100 @@ impl AppData {
                 }
             }
             self.send_plugin(MainToChild::RemoveTrack { track: track_id });
-            // host から消す track の pending load / GUI window も掃除。
+            // host から消す track の pending load / GUI window / slot
+            // cache も掃除。
             self.pending_plugin_loads.retain(|(t, _)| *t != track_id);
+            self.loaded_slots.retain(|(t, _), _| *t != track_id);
             #[cfg(windows)]
             {
                 self.plugin_host_windows.retain(|&(t, _), _| t != track_id);
             }
         }
 
-        // Phase B: host に key として存在しない track の plugin を再 load。
-        // `restore_plugin_from_song` を借りて DRY 化したいが、 そちらは
-        // 「全 track を投げる」 仕様なので、 こちらは「Song にあるが
-        // track_plugin_ids に key 不在」 の track だけに絞って同等処理を
-        // 行う。
+        // Phase B: 各 track について Song の slot 列と host の slot 列
+        // (= `loaded_slots` の対応 entries) を diff する。
         let song = self.song.clone();
-        let to_load: Vec<(u32, PluginSlot, common::model::PluginInstance)> = song
-            .tracks
-            .iter()
-            .filter(|t| !self.track_plugin_ids.contains_key(&t.id))
-            .flat_map(|track| {
-                let mut entries = Vec::new();
-                let t = track.id;
-                for (i, p) in track.midi_fx_chain.iter().enumerate() {
-                    entries.push((t, PluginSlot::MidiFx(i as u32), p.clone()));
-                }
-                if let Some(inst) = track.instrument.as_ref() {
-                    entries.push((t, PluginSlot::Instrument, inst.clone()));
-                }
-                for (i, p) in track.fx_chain.iter().enumerate() {
-                    entries.push((t, PluginSlot::Fx(i as u32), p.clone()));
-                }
-                entries
-            })
-            .collect();
-
-        if to_load.is_empty() {
-            return;
-        }
-
         let Some(db) = self.plugin_db.clone() else {
-            tracing::warn!(
-                pending = to_load.len(),
-                "reconcile: plugin database not loaded; cannot reload plugins"
-            );
+            // plugin DB が未ロードなら SetSlotPlugin の組み立て不可。
+            // RemoveSlotPlugin 単体は db 不要だが、 Phase B はまとめて
+            // skip する (= db ロード待ち)。
+            if !song.tracks.is_empty() {
+                tracing::warn!("reconcile: plugin database not loaded; phase B skipped");
+            }
             return;
         };
-        tracing::info!(
-            count = to_load.len(),
-            "reconcile: reloading plugins for restored tracks"
-        );
-        for (track, slot, inst) in to_load {
-            let Some(entry) = db.find_by_id(&inst.plugin_id) else {
-                tracing::error!(
-                    id = %inst.plugin_id,
-                    track,
+
+        for track in &song.tracks {
+            let track_id = track.id;
+
+            // Song 側の (slot, plugin_id_str, &PluginInstance) 列。
+            let mut song_slots: Vec<(PluginSlot, &common::model::PluginInstance)> = Vec::new();
+            for (i, p) in track.midi_fx_chain.iter().enumerate() {
+                song_slots.push((PluginSlot::MidiFx(i as u32), p));
+            }
+            if let Some(inst) = track.instrument.as_ref() {
+                song_slots.push((PluginSlot::Instrument, inst));
+            }
+            for (i, p) in track.fx_chain.iter().enumerate() {
+                song_slots.push((PluginSlot::Fx(i as u32), p));
+            }
+            let song_slot_set: std::collections::HashSet<PluginSlot> =
+                song_slots.iter().map(|(s, _)| *s).collect();
+
+            // (1) host にあるが Song に無い slot → RemoveSlotPlugin
+            let host_extra_slots: Vec<PluginSlot> = self
+                .loaded_slots
+                .iter()
+                .filter(|((tid, _), _)| *tid == track_id)
+                .map(|((_, s), _)| *s)
+                .filter(|s| !song_slot_set.contains(s))
+                .collect();
+            for slot in host_extra_slots {
+                tracing::info!(track_id, ?slot, "reconcile: removing extra host slot");
+                self.send_plugin(MainToChild::RemoveSlotPlugin {
+                    track: track_id,
+                    slot,
+                });
+                self.cleanup_slot_gui(track_id, slot);
+                self.loaded_slots.remove(&(track_id, slot));
+                self.pending_plugin_loads.remove(&(track_id, slot));
+            }
+
+            // (2) Song にあるが host に無い、 または plugin_id_str が
+            // 違う slot → SetSlotPlugin
+            for (slot, inst) in song_slots {
+                let need_load = match self.loaded_slots.get(&(track_id, slot)) {
+                    None => true,
+                    Some(info) => info.plugin_id_str != inst.plugin_id,
+                };
+                if !need_load {
+                    continue;
+                }
+                let Some(entry) = db.find_by_id(&inst.plugin_id) else {
+                    tracing::error!(
+                        id = %inst.plugin_id,
+                        track = track_id,
+                        ?slot,
+                        "reconcile: plugin id not in database"
+                    );
+                    continue;
+                };
+                tracing::info!(
+                    track_id,
                     ?slot,
-                    "reconcile: plugin id not in database"
+                    plugin_id = %inst.plugin_id,
+                    "reconcile: loading slot from song"
                 );
-                continue;
-            };
-            self.track_pending_load(track, slot);
-            self.send_plugin(MainToChild::SetSlotPlugin {
-                track,
-                slot,
-                format: entry.format,
-                path: entry.path.clone(),
-                plugin_id: entry.id.clone(),
-                initial_state: inst.state.clone(),
-            });
+                self.track_pending_load(track_id, slot);
+                self.send_plugin(MainToChild::SetSlotPlugin {
+                    track: track_id,
+                    slot,
+                    format: entry.format,
+                    path: entry.path.clone(),
+                    plugin_id: entry.id.clone(),
+                    initial_state: inst.state.clone(),
+                });
+            }
         }
     }
 
@@ -2223,6 +2277,10 @@ impl AppData {
             {
                 self.plugin_host_windows.retain(|&(t, _), _| t != removed_id);
             }
+            // slot cache からも削除する track 由来の entry を外す。
+            // SlotPluginUnloaded event の到着待ち race を狭めて、
+            // reconcile が stale entry を見ないようにする防御的 cleanup。
+            self.loaded_slots.retain(|(t, _), _| *t != removed_id);
             self.song.tracks.remove(i as usize);
             snapshots.push((removed_id, snapshot));
         }
@@ -2705,6 +2763,7 @@ impl AppData {
                     self.plugin_host_windows
                         .retain(|&(t, _), _| t != *group_id);
                 }
+                self.loaded_slots.retain(|(t, _), _| *t != *group_id);
                 self.song.tracks.remove(pos);
             }
             self.collapsed_groups.remove(group_id);
@@ -3309,6 +3368,15 @@ impl AppData {
         if !entry.contains(&plugin_id) {
             entry.push(plugin_id);
         }
+        // slot 単位での load 状態 cache。 reconcile の slot-level diff
+        // (Undo で同 track 内の plugin 構成が変化した場合の同期) で参照。
+        self.loaded_slots.insert(
+            (track_id, slot),
+            LoadedSlotInfo {
+                plugin_id,
+                plugin_id_str: id.clone(),
+            },
+        );
         self.ensure_first_track();
         let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
             return;
@@ -3404,6 +3472,9 @@ impl AppData {
             entry.retain(|p| *p != plugin_id);
         }
         self.track_plugin_ids.retain(|_, v| !v.is_empty());
+        // slot 単位 cache からも、 同 plugin_id を持つ entry を retain で外す。
+        self.loaded_slots
+            .retain(|_, info| info.plugin_id != plugin_id);
         // PR3.3: drop the latency entry for the destroyed plugin and
         // recompute every track's total since the chain shape changed.
         self.plugin_latencies.remove(&plugin_id);
@@ -3637,6 +3708,10 @@ impl AppData {
         // `Fx(slot_index)` を削除すると `Fx(slot_index+1..)` は 1 段
         // shift するので、 残った GUI window の key も再 mapping する。
         self.cleanup_slot_gui(track_id, slot);
+        // slot cache から該当 entry を即時削除。 SlotPluginUnloaded event
+        // 到着前に reconcile が走っても stale entry を見ないようにする
+        // 防御策。
+        self.loaded_slots.remove(&(track_id, slot));
         if let Some(track) = self.song.tracks.get_mut(track_idx) {
             match slot {
                 PluginSlot::Instrument => track.instrument = None,
