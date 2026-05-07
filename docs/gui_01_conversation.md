@@ -2439,3 +2439,74 @@ cached 内/外を分けているのは、 selection が変わるたびに `draw_
 
 user 目視確認 → main 確定後、 本ブロックに「commit X 確定」 を追記して通知します (#019 / #020 と同じ運用)。
 
+## #023 [Open] 2026-05-07 [要望] `Ui::take_file_drop_in_rect` を `Option<DroppedFiles>` 返却に拡張 (drop 位置で track 解決したい)
+
+関連仕様: [daw_01:docs/plan_audio_clip.md](daw_01:docs/plan_audio_clip.md) §3.1 (Audio import drop 経路)
+
+### 背景
+
+daw_01 で audio file の drag&drop import を実装中
+([daw_01:docs/plan_audio_clip.md](daw_01:docs/plan_audio_clip.md) §3.1)。 仕様書では:
+
+> drop 座標 (x, y) → (start_beat, track) に解決 → AudioSource pool に追加
+
+としており、 ユーザーが「トラック 2 にドロップしたらトラック 2 に配置」 されることを期待
+している (Bitwig / Ableton / REAPER 流)。
+
+ところが現状の `Ui::take_file_drop_in_rect(rect)` は `Option<Vec<PathBuf>>` のみ返すため、
+caller (= daw_01 の `arrangement_view`) は drop 位置を知る術が無い。 内部では
+`DroppedFiles { paths, position }` を保持していて rect 判定にも `position` を使っている
+([gui_01:crates/ui/src/ui.rs:1360-1367](gui_01:crates/ui/src/ui.rs:1360))
+ので、 戻り値で position も渡してくれれば daw_01 が drop 位置 → (track, beat) に解決できる。
+
+### 要望内容
+
+#### 1. `Ui::take_file_drop_in_rect` の戻り値を `Option<DroppedFiles>` に変更
+
+```rust
+// gui_01: crates/ui/src/ui.rs
+
+// 旧
+pub fn take_file_drop_in_rect(&mut self, rect: Rect) -> Option<Vec<PathBuf>> { ... }
+
+// 新
+pub fn take_file_drop_in_rect(&mut self, rect: Rect) -> Option<DroppedFiles> { ... }
+```
+
+`DroppedFiles` は既存の pub 型 ([gui_01:crates/ui/src/input.rs:15](gui_01:crates/ui/src/input.rs:15))
+で `paths: Vec<PathBuf> + position: (f32, f32)` を持つ。 `lib.rs` で既に
+`pub use input::{DroppedFiles, ...}` されているので追加 export も不要のはず。
+
+#### 2. `HeavyCtx::take_file_drop_in_rect` も同形に追従
+
+```rust
+// gui_01: crates/ui/src/widgets/heavy.rs:198
+pub fn take_file_drop_in_rect(&mut self, rect: Rect) -> Option<DroppedFiles> {
+    self.ui.take_file_drop_in_rect(rect)
+}
+```
+
+#### 3. 受け入れ基準
+
+- daw_01 が以下のように書ける:
+  ```rust
+  if let Some(drop) = ui.take_file_drop_in_rect(canvas_area) {
+      // drop.paths: Vec<PathBuf>
+      // drop.position: (f32, f32) — viewport 座標
+      // → daw_01 が track row / beat に解決して AppEvent::ImportAudio を発火
+  }
+  ```
+- gui_01 内 caller (`crates/examples/daw_prototype/src/main.rs:291` 等) の `paths` 直接
+  束縛箇所が `drop.paths` に追従。
+- `crates/ui/tests/m8_integration.rs` の既存 test (`file_drop_consumed_by_take_in_rect` /
+  `file_drop_outside_rect_returns_none`) が `paths_received` の型変更に追従して clean。
+
+### daw_01 側の暫定 (gui_01 #023 解決前)
+
+drop 位置を取れない間は「最後に選択した track (= cursor_track_id) に配置」 する暫定動作で
+動かしている ([daw_01:daw_gui/src/app.rs](daw_01:daw_gui/src/app.rs) `action_import_audio`)。
+gui_01 #023 が main にマージされたら、 `arrangement_view.rs` の drop handler で drop
+position を使って (track, beat) を解決し、 `AppEvent::ImportAudio { paths, target_track,
+target_beat }` のように target を渡せる形に書き換える (関連: PR4 で arrangement clip
+移動 / trim にも drop position を使うため、 本要望の実現が PR4 着手の前提)。
+
