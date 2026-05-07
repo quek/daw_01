@@ -93,6 +93,7 @@ mod tests {
                     name: "C".into(),
                     start_beat,
                     length_beats,
+                    content_id: 0,
                     notes: Vec::new(),
                 }],
                 ..Track::default()
@@ -154,6 +155,7 @@ mod tests {
                         name: "A0".into(),
                         start_beat: 0.0,
                         length_beats: 4.0,
+                        content_id: 0,
                         notes: Vec::new(),
                     }],
                     ..Track::default()
@@ -165,6 +167,7 @@ mod tests {
                         name: "B0".into(),
                         start_beat: 6.0,
                         length_beats: 2.0,
+                        content_id: 0,
                         notes: Vec::new(),
                     }],
                     ..Track::default()

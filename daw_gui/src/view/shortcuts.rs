@@ -43,5 +43,11 @@ pub fn daw_shortcut_map() -> ShortcutMap {
     // 編集モード起動。 修飾なし shortcut だが widget 側で `is_typing_only`
     // 扱いされるので、 編集中の text_input 入力中は 'l' 文字として届く。
     m.bind("piano_roll.edit_lyric", "L");
+    // gui_01 #019: 選択中 clip の末尾直後にコピー生成。
+    // - D: 共有コピー (linked clip、 source content を共有)
+    // - Alt+D: 独立コピー (notes を deep clone + 新 ContentId)
+    // text_input フォーカス中は無効 (gui_01 が自動処理)。
+    m.bind("daw.duplicate_clip_shared", "D");
+    m.bind("daw.duplicate_clip_unique", "Alt+D");
     m
 }

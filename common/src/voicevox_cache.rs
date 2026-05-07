@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use crate::model::Clip;
+use crate::model::Note;
 
 pub type CacheKey = u64;
 
@@ -56,12 +56,17 @@ impl VoiceVoxCache {
         self.map.clear();
     }
 
-    /// `(clip notes, singer_id)` から安定 hash を計算。 同じ内容 (notes が
+    /// `(notes, singer_id)` から安定 hash を計算。 同じ内容 (notes が
     /// 同じ start/duration/pitch/velocity/lyric) で同じ singer なら同じ key。
     /// notes の順序は start_beat で sort してから hash するので、 編集中に
     /// 順序が変わっても hash は不変。
-    pub fn key_for_clip(clip: &Clip, singer_id: u32) -> CacheKey {
-        let mut sorted: Vec<&crate::model::Note> = clip.notes.iter().collect();
+    ///
+    /// v6 の linked clip 対応で `Clip` から直接 notes を取らない。 caller が
+    /// `Song.clip_contents[clip.content_id].notes` を取り出して渡す。 これで
+    /// 共有 clip / 独立コピーの区別なく「同じ notes 内容」 なら同 cache key
+    /// になる (独立コピーでも内容が同じなら 1 回合成で済む)。
+    pub fn key_for_notes(notes: &[Note], singer_id: u32) -> CacheKey {
+        let mut sorted: Vec<&Note> = notes.iter().collect();
         sorted.sort_by(|a, b| {
             a.start_beat
                 .partial_cmp(&b.start_beat)
@@ -86,14 +91,6 @@ impl VoiceVoxCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Note;
-
-    fn make_clip(notes: Vec<Note>) -> Clip {
-        Clip {
-            notes,
-            ..Clip::default()
-        }
-    }
 
     fn note(start: f64, dur: f64, pitch: u8, lyric: Option<&str>) -> Note {
         Note {
@@ -106,48 +103,48 @@ mod tests {
     }
 
     #[test]
-    fn key_is_stable_for_identical_clips() {
-        let a = make_clip(vec![note(0.0, 1.0, 60, Some("ら"))]);
-        let b = make_clip(vec![note(0.0, 1.0, 60, Some("ら"))]);
+    fn key_is_stable_for_identical_notes() {
+        let a = vec![note(0.0, 1.0, 60, Some("ら"))];
+        let b = vec![note(0.0, 1.0, 60, Some("ら"))];
         assert_eq!(
-            VoiceVoxCache::key_for_clip(&a, 6000),
-            VoiceVoxCache::key_for_clip(&b, 6000)
+            VoiceVoxCache::key_for_notes(&a, 6000),
+            VoiceVoxCache::key_for_notes(&b, 6000)
         );
     }
 
     #[test]
     fn key_differs_when_singer_changes() {
-        let c = make_clip(vec![note(0.0, 1.0, 60, Some("ら"))]);
+        let c = vec![note(0.0, 1.0, 60, Some("ら"))];
         assert_ne!(
-            VoiceVoxCache::key_for_clip(&c, 6000),
-            VoiceVoxCache::key_for_clip(&c, 3001)
+            VoiceVoxCache::key_for_notes(&c, 6000),
+            VoiceVoxCache::key_for_notes(&c, 3001)
         );
     }
 
     #[test]
     fn key_differs_when_lyric_changes() {
-        let a = make_clip(vec![note(0.0, 1.0, 60, Some("ら"))]);
-        let b = make_clip(vec![note(0.0, 1.0, 60, Some("り"))]);
+        let a = vec![note(0.0, 1.0, 60, Some("ら"))];
+        let b = vec![note(0.0, 1.0, 60, Some("り"))];
         assert_ne!(
-            VoiceVoxCache::key_for_clip(&a, 6000),
-            VoiceVoxCache::key_for_clip(&b, 6000)
+            VoiceVoxCache::key_for_notes(&a, 6000),
+            VoiceVoxCache::key_for_notes(&b, 6000)
         );
     }
 
     #[test]
     fn key_stable_under_note_reorder() {
         // start_beat 順に sort される ⇒ 入力順に依存しない
-        let a = make_clip(vec![
+        let a = vec![
             note(0.0, 1.0, 60, Some("あ")),
             note(1.0, 1.0, 62, Some("い")),
-        ]);
-        let b = make_clip(vec![
+        ];
+        let b = vec![
             note(1.0, 1.0, 62, Some("い")),
             note(0.0, 1.0, 60, Some("あ")),
-        ]);
+        ];
         assert_eq!(
-            VoiceVoxCache::key_for_clip(&a, 6000),
-            VoiceVoxCache::key_for_clip(&b, 6000)
+            VoiceVoxCache::key_for_notes(&a, 6000),
+            VoiceVoxCache::key_for_notes(&b, 6000)
         );
     }
 

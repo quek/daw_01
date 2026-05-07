@@ -330,6 +330,8 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
 }
 
 /// `daw_ui_core::Note` 形式に変換 (毎フレーム alloc、widget 内 cached で性能 OK)。
+/// v6 linked clip: notes は `Song.clip_contents` 経由で lookup。 共有 clip
+/// 群はすべて同じ notes を見る。
 fn build_widget_notes(app: &AppData, target: ClipRef) -> Vec<Note> {
     let Some(track) = app.song.tracks.get(target.track as usize) else {
         return Vec::new();
@@ -337,7 +339,8 @@ fn build_widget_notes(app: &AppData, target: ClipRef) -> Vec<Note> {
     let Some(clip) = track.clips.get(target.clip as usize) else {
         return Vec::new();
     };
-    clip.notes
+    app.song
+        .clip_notes(clip)
         .iter()
         .enumerate()
         .map(|(i, n)| Note {

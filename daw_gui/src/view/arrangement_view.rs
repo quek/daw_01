@@ -76,6 +76,20 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     len_beats: c.length_beats,
                     name: Arc::from(c.name.as_str()),
                     color: None,
+                    // gui_01 #019 (M14 Phase 63e): refcount >= 2 (= 共有 clip)
+                    // のときだけ Some(hue)。 widget が hue + style.share_group_S/L
+                    // で HSL→RGB 変換してアクセント色 + link glyph を描画。
+                    // hue は content_id の golden-ratio hash で `[0.0, 1.0)` に
+                    // 一様分布させ、 共有グループ間で色が衝突しにくいようにする。
+                    share_group_color: if app
+                        .song
+                        .clip_content_refcount(c.content_id)
+                        >= 2
+                    {
+                        Some(content_id_to_hue(c.content_id))
+                    } else {
+                        None
+                    },
                 })
                 .collect(),
             // gui_01 #016 で追加された group hierarchy fields:
@@ -162,6 +176,27 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         &style,
         make_edit,
     );
+
+    // gui_01 #020 (M14 Phase 63f): clip 上の右クリックメニュー (Make Unique)。
+    // widget が `clip_rects: Vec<(ClipKey, Rect)>` を返してくれるので、
+    // track_header_rects と同じパターンで context_menu_for を重ねる。
+    // refcount==1 の clip では `MakeClipUnique` handler が「すでに独立 clip」
+    // status_message を出すだけなので、 context menu はすべての clip に
+    // 同形で出す (条件分岐で項目を省くと UX が分かりにくい)。
+    for (clip_key, rect) in &resp.clip_rects {
+        let key = *clip_key;
+        ui.context_menu_for(*rect, &["Make Unique"], move |idx, ui| {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                let Some(target) = clip_key_to_ref(app, key) else {
+                    return;
+                };
+                match idx {
+                    0 => app.handle_event(AppEvent::MakeClipUnique(target)),
+                    _ => {}
+                }
+            }));
+        });
+    }
 
     // track header の右クリックメニュー (Rename / Delete) を widget 外で重ねる。
     // widget は track_header_rects と BeginRenameTrack / DeleteTrack の発行までを担う。
@@ -339,15 +374,50 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
             })
         }
         ArrangementEditRequest::MoveClips(deltas) => {
+            // `MoveClipDelta::to_track` を保持して track 跨ぎ move に対応。
             Edit::mutate(move |app: &mut AppData| {
-                let entries: Vec<(ClipRef, f64)> = deltas
+                let entries: Vec<(ClipRef, u32, f64)> = deltas
                     .iter()
                     .filter_map(|d| {
-                        clip_key_to_ref(app, d.from).map(|r| (r, d.next_start_beat))
+                        clip_key_to_ref(app, d.from)
+                            .map(|r| (r, d.to_track, d.next_start_beat))
                     })
                     .collect();
                 if !entries.is_empty() {
                     app.handle_event(AppEvent::SetClipPositions(entries));
+                }
+            })
+        }
+        ArrangementEditRequest::CloneClipsLinked(deltas) => {
+            // gui_01 #019: Ctrl+drag → release。 元 clip を残し、 各 source の
+            // drop 位置に共有コピーを生成。 daw_01 側で `content_id` を流用する。
+            // to_track が source の track と異なれば track 跨ぎコピー。
+            Edit::mutate(move |app: &mut AppData| {
+                let entries: Vec<(ClipRef, u32, f64)> = deltas
+                    .iter()
+                    .filter_map(|d| {
+                        clip_key_to_ref(app, d.from)
+                            .map(|r| (r, d.to_track, d.next_start_beat))
+                    })
+                    .collect();
+                if !entries.is_empty() {
+                    app.handle_event(AppEvent::CloneClipsLinked(entries));
+                }
+            })
+        }
+        ArrangementEditRequest::CloneClipsIndependent(deltas) => {
+            // gui_01 #019: Ctrl+Shift+drag → release。 同上だが content を
+            // deep clone + 新 ContentId で独立コピー。
+            Edit::mutate(move |app: &mut AppData| {
+                let entries: Vec<(ClipRef, u32, f64)> = deltas
+                    .iter()
+                    .filter_map(|d| {
+                        clip_key_to_ref(app, d.from)
+                            .map(|r| (r, d.to_track, d.next_start_beat))
+                    })
+                    .collect();
+                if !entries.is_empty() {
+                    app.handle_event(AppEvent::CloneClipsIndependent(entries));
                 }
             })
         }
@@ -454,6 +524,16 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
             Edit::mutate(|_| {})
         }
     }
+}
+
+/// gui_01 #019: 共有 clip 群を視覚区別するためのアクセント色 hue 計算。
+/// golden ratio (0.61803...) を掛けて fract で `[0.0, 1.0)` に一様分布させる
+/// (連番の content_id でも色が満遍なくバラける)。 widget 側で
+/// `ArrangementStyle.share_group_saturation` / `share_group_fill_lightness` /
+/// `share_group_border_lightness` と組み合わせて HSL → RGB 変換される。
+fn content_id_to_hue(content_id: common::model::ContentId) -> f32 {
+    const GOLDEN_RATIO_CONJUGATE: f32 = 0.618_034;
+    (content_id as f32 * GOLDEN_RATIO_CONJUGATE).fract()
 }
 
 fn clip_key_to_ref(app: &AppData, key: ClipKey) -> Option<ClipRef> {

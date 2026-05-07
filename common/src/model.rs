@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use bincode::{Decode, Encode};
@@ -5,13 +6,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::plugin_format::PluginFormat;
 
-/// Bumped to `5` to support the routing graph (group tracks + plugin
-/// latency cache). The new `Track::kind` / `parent_group_id` /
-/// `reported_latency_samples` fields all default sensibly via
-/// `#[serde(default)]`, so v4 `.daw` files load forward without any
-/// migration step. Bumped to `4` previously after a brief detour at
-/// `3` (per-`Clip` `volume` later moved to `Track::volume`).
-pub const CURRENT_VERSION: u32 = 5;
+/// Bumped to `6` for shared/linked clip support: notes moved out of
+/// `Clip` into `Song.clip_contents` keyed by `Clip.content_id`, so
+/// multiple clips can share the same source content (REAPER pooled MIDI
+/// model). v5 `.daw` files still load — `Song::ensure_clip_contents`
+/// migrates the legacy per-`Clip` `notes` into the shared store on load.
+/// See `docs/plan_clip_share_clone.md`.
+///
+/// Previously bumped to `5` for the routing graph (group tracks +
+/// plugin latency cache) and `4` for moving per-`Clip` `volume` onto
+/// `Track::volume` (a brief detour at `3`).
+pub const CURRENT_VERSION: u32 = 6;
+
+/// Stable id for shared clip content (notes). Allocated by
+/// `Song::alloc_content_id` and referenced by `Clip::content_id`.
+/// `0` is the "未採番" sentinel — `Song::ensure_clip_contents` reassigns
+/// any zero-valued `content_id` on load.
+pub type ContentId = u32;
 
 /// Serde adapter for `Option<Vec<u8>>` that writes binary data as base64 in
 /// JSON (and other human-readable formats). Bincode bypasses this and uses
@@ -71,6 +82,17 @@ pub struct Song {
     /// time.
     #[serde(default)]
     pub next_track_id: u32,
+    /// Shared clip content store. Each `Clip.content_id` references one
+    /// entry here; multiple clips with the same `content_id` share the
+    /// same `notes` (linked / pooled clips, REAPER pooled MIDI model).
+    /// Entries with refcount == 0 are GC'd by `Song::gc_clip_contents`
+    /// before save.
+    #[serde(default)]
+    pub clip_contents: HashMap<ContentId, ClipContent>,
+    /// Stable id allocator for `ContentId`. `0` is the sentinel; valid
+    /// allocations start at `1`.
+    #[serde(default)]
+    pub next_content_id: ContentId,
 }
 
 impl Default for Song {
@@ -83,6 +105,8 @@ impl Default for Song {
             loop_start_beat: 0.0,
             loop_end_beat: 0.0,
             next_track_id: 1,
+            clip_contents: HashMap::new(),
+            next_content_id: 1,
         }
     }
 }
@@ -176,6 +200,124 @@ impl Song {
 
     pub fn track_by_id_mut(&mut self, track_id: u32) -> Option<&mut Track> {
         self.tracks.iter_mut().find(|t| t.id == track_id)
+    }
+
+    /// Allocate a fresh `ContentId`, bumping the song-level counter.
+    pub fn alloc_content_id(&mut self) -> ContentId {
+        let id = self.next_content_id.max(1);
+        self.next_content_id = id + 1;
+        id
+    }
+
+    /// Migrate v5 `.daw` files: legacy `Clip.notes` (deserialize-only)
+    /// gets moved into `clip_contents` keyed by a freshly allocated
+    /// `content_id`. Idempotent — clips that already have non-zero
+    /// `content_id` and an empty `notes` vector are left alone.
+    ///
+    /// Also assigns fresh `content_id` to clips with `content_id == 0`
+    /// (sentinel) and ensures every referenced `content_id` has an
+    /// entry in `clip_contents` (creating an empty one if missing —
+    /// shouldn't happen in practice but keeps the invariant cheap).
+    pub fn ensure_clip_contents(&mut self) {
+        // Collect all live content_ids first so we can bump the counter
+        // above the highest one before allocating new ids for sentinels.
+        let mut max_seen: ContentId = 0;
+        for track in &self.tracks {
+            for clip in &track.clips {
+                if clip.content_id != 0 {
+                    max_seen = max_seen.max(clip.content_id);
+                }
+            }
+        }
+        if self.next_content_id <= max_seen {
+            self.next_content_id = max_seen + 1;
+        }
+        if self.next_content_id == 0 {
+            self.next_content_id = 1;
+        }
+
+        for t_idx in 0..self.tracks.len() {
+            for c_idx in 0..self.tracks[t_idx].clips.len() {
+                let needs_new_id = self.tracks[t_idx].clips[c_idx].content_id == 0;
+                let has_legacy_notes = !self.tracks[t_idx].clips[c_idx].notes.is_empty();
+                if needs_new_id {
+                    let new_id = self.alloc_content_id();
+                    self.tracks[t_idx].clips[c_idx].content_id = new_id;
+                }
+                let cid = self.tracks[t_idx].clips[c_idx].content_id;
+                if has_legacy_notes {
+                    let notes =
+                        std::mem::take(&mut self.tracks[t_idx].clips[c_idx].notes);
+                    self.clip_contents
+                        .entry(cid)
+                        .and_modify(|c| {
+                            // Two clips both carrying legacy notes for
+                            // the same migrated content_id is impossible
+                            // (v5 stored notes per-clip; migration emits
+                            // a fresh content_id per clip), so just
+                            // overwrite if it ever happens.
+                            c.notes = notes.clone();
+                        })
+                        .or_insert(ClipContent { notes });
+                } else {
+                    // Ensure an entry exists for every referenced
+                    // content_id so lookups never have to handle the
+                    // missing case.
+                    self.clip_contents
+                        .entry(cid)
+                        .or_insert_with(ClipContent::default);
+                }
+            }
+        }
+    }
+
+    /// Refcount of a `ContentId` = number of clips across all tracks
+    /// referencing it. Used by the GUI to switch the visual style
+    /// between "shared" (>=2) and "regular" (==1) and by GC.
+    pub fn clip_content_refcount(&self, content_id: ContentId) -> usize {
+        self.tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .filter(|c| c.content_id == content_id)
+            .count()
+    }
+
+    /// Resolve a `Clip`'s shared notes via its `content_id`. Returns
+    /// an empty slice if `content_id` doesn't have an entry (e.g. a
+    /// freshly-constructed clip before `ensure_clip_contents` ran).
+    /// Used everywhere that previously read `clip.notes` directly.
+    pub fn clip_notes(&self, clip: &Clip) -> &[Note] {
+        self.clip_contents
+            .get(&clip.content_id)
+            .map(|c| c.notes.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Mutable lookup for the notes of a clip identified by `(track_idx,
+    /// clip_idx)`. Resolves `content_id` and returns a mutable reference
+    /// to the shared `notes` vector. Returns `None` if the indices are
+    /// out of range or the `content_id` has no entry.
+    pub fn notes_in_clip_mut(
+        &mut self,
+        track_idx: usize,
+        clip_idx: usize,
+    ) -> Option<&mut Vec<Note>> {
+        let content_id = self.tracks.get(track_idx)?.clips.get(clip_idx)?.content_id;
+        self.clip_contents.get_mut(&content_id).map(|c| &mut c.notes)
+    }
+
+    /// Drop `clip_contents` entries that no clip references. Called
+    /// before save so disk files stay tidy. In-memory we keep zero-ref
+    /// entries around briefly (e.g. between a delete and the next
+    /// frame) — Undo restores from the snapshot regardless.
+    pub fn gc_clip_contents(&mut self) {
+        let live: std::collections::HashSet<ContentId> = self
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .map(|c| c.content_id)
+            .collect();
+        self.clip_contents.retain(|id, _| live.contains(id));
     }
 }
 
@@ -351,8 +493,9 @@ impl PluginInstance {
 
 /// A clip is a free-time container of notes positioned along the song
 /// timeline. `start_beat` and `length_beats` define where the clip lives;
-/// `notes` holds the notes within the clip in arbitrary order — readers
-/// that care about time order must sort by `Note::start_beat` themselves.
+/// the actual notes are stored in `Song.clip_contents` keyed by
+/// `content_id` so multiple clips can share the same source (REAPER
+/// pooled MIDI / linked clip model).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Clip {
     /// Stable id within the owning track. `0` is "未採番" sentinel —
@@ -363,6 +506,28 @@ pub struct Clip {
     pub name: String,
     pub start_beat: f64,
     pub length_beats: f64,
+    /// Reference into `Song.clip_contents`. `0` is the "未採番" sentinel —
+    /// reassigned by `Song::ensure_clip_contents` when loading. Multiple
+    /// clips with the same `content_id` share notes (linked clips).
+    #[serde(default)]
+    pub content_id: ContentId,
+    /// **Legacy v5 deserialize-only field**: in v5 `Clip` owned `notes`
+    /// directly. v6+ stores notes in `Song.clip_contents` keyed by
+    /// `content_id`. After deserialization, `Song::ensure_clip_contents`
+    /// drains non-empty `notes` into `clip_contents` and clears the
+    /// vector. **In-memory the field is always empty**; never write to
+    /// it directly. Skipped on serialize when empty so v6 files don't
+    /// emit it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<Note>,
+}
+
+/// Shared content (notes) referenced by one or more `Clip`s via
+/// `Clip.content_id`. Stored on `Song.clip_contents`. Notes are in
+/// arbitrary order — readers that care about time order must sort by
+/// `Note::start_beat` themselves.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct ClipContent {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<Note>,
 }
@@ -516,6 +681,7 @@ mod tests {
                     name: "こんにちは".into(),
                     start_beat: 0.0,
                     length_beats: 16.0,
+                    content_id: 0,
                     notes: vec![
                         Note {
                             start_beat: 0.0,
@@ -541,12 +707,13 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_five() {
-        // Bumped to 5 to add the routing graph fields (kind /
-        // parent_group_id / reported_latency_samples). All defaulted
-        // via `#[serde(default)]` so v4 files load forward. Pinning
-        // the constant catches accidental rollback.
-        assert_eq!(CURRENT_VERSION, 5);
+    fn current_version_is_six() {
+        // Bumped to 6 to add `Song.clip_contents` + `Clip.content_id`
+        // for shared/linked clips (REAPER pooled MIDI model). v5 files
+        // forward-migrate via `Song::ensure_clip_contents` (called
+        // automatically by `project::load`). Pinning the constant
+        // catches accidental rollback.
+        assert_eq!(CURRENT_VERSION, 6);
     }
 
     #[test]

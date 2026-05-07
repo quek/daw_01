@@ -12,7 +12,7 @@ use std::io::Cursor;
 
 use anyhow::{Context, Result};
 
-use crate::model::{Clip, Note, Song};
+use crate::model::{Note, Song};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -122,9 +122,19 @@ pub fn synthesize_song(
         let singer_id = if track_speaker != 0 { track_speaker } else { default_singer_id };
 
         for (clip_idx, clip) in track.clips.iter().enumerate() {
-            // Cache lookup — clip 内容 + singer_id が同じなら HTTP call
+            // v6 linked clip: notes は Song.clip_contents に。 共有 clip /
+            // 独立 clip を区別せず、 同じ content_id の clip は同じ notes
+            // で 1 回だけ合成 (cache key も notes ベース)。
+            let notes: &[Note] = song
+                .clip_contents
+                .get(&clip.content_id)
+                .map(|c| c.notes.as_slice())
+                .unwrap_or(&[]);
+
+            // Cache lookup — notes 内容 + singer_id が同じなら HTTP call
             // を skip。 talk mode も sing mode も同じ key 体系で hit。
-            let cache_key = crate::voicevox_cache::VoiceVoxCache::key_for_clip(clip, singer_id);
+            let cache_key =
+                crate::voicevox_cache::VoiceVoxCache::key_for_notes(notes, singer_id);
             if let Some(cached) = cache.get(cache_key) {
                 tracing::info!(
                     track = track_idx,
@@ -145,9 +155,9 @@ pub fn synthesize_song(
             // A clip with at least one note that has any pitch goes into
             // sing mode; otherwise we fall back to talk mode using
             // whatever lyrics are attached (used for spoken intros, etc.).
-            let has_pitched_notes = clip.notes.iter().any(|n| n.pitch > 0);
+            let has_pitched_notes = notes.iter().any(|n| n.pitch > 0);
             let wav_bytes = if has_pitched_notes {
-                match synthesize_sing_clip(&client, clip, song.bpm, singer_id) {
+                match synthesize_sing_clip(&client, notes, song.bpm, singer_id) {
                     Ok(b) => b,
                     Err(e) => {
                         let msg = format!("{e:#}");
@@ -164,7 +174,7 @@ pub fn synthesize_song(
                 }
             } else {
                 // Talk mode: concatenate lyrics in time order.
-                let mut sorted: Vec<&Note> = clip.notes.iter().collect();
+                let mut sorted: Vec<&Note> = notes.iter().collect();
                 sorted.sort_by(|a, b| {
                     a.start_beat
                         .partial_cmp(&b.start_beat)
@@ -249,11 +259,11 @@ pub struct SynthResult {
 
 fn synthesize_sing_clip(
     client: &reqwest::blocking::Client,
-    clip: &Clip,
+    notes: &[Note],
     bpm: f32,
     singer_id: u32,
 ) -> Result<Vec<u8>> {
-    let query_json = build_sing_query(clip, bpm);
+    let query_json = build_sing_query(notes, bpm);
     tracing::info!(json_len = query_json.len(), "sing_frame_audio_query");
 
     // Step 1: sing_frame_audio_query
@@ -366,7 +376,7 @@ fn synthesize_talk(
 /// touch. The first note's `start_beat` becomes `frame 0` of the query —
 /// VOICEVOX renders relative to the first non-rest entry, not relative to
 /// the song timeline, so anything before the first note is ignored.
-fn build_sing_query(clip: &Clip, bpm: f32) -> String {
+fn build_sing_query(notes: &[Note], bpm: f32) -> String {
     let mut parts: Vec<String> = Vec::new();
 
     // Leading rest (gives the synth a moment of silence for the attack).
@@ -375,10 +385,9 @@ fn build_sing_query(clip: &Clip, bpm: f32) -> String {
         REST_FRAMES
     ));
 
-    // Sort notes by start_beat — `Clip.notes` is unordered by contract,
-    // and this builder requires monotonic timing.
-    let mut sorted: Vec<&Note> = clip
-        .notes
+    // Sort notes by start_beat — `ClipContent.notes` is unordered by
+    // contract, and this builder requires monotonic timing.
+    let mut sorted: Vec<&Note> = notes
         .iter()
         .filter(|n| n.duration_beats > 0.0 && n.pitch > 0)
         .collect();
@@ -521,6 +530,7 @@ fn urlencoding_encode(s: &str) -> String {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use crate::model::Clip;
     use serde_json::Value;
 
     fn parse_query(json: &str) -> Vec<(Option<i64>, i64, String)> {
@@ -545,9 +555,10 @@ mod tests {
             name: "c".into(),
             start_beat: 0.0,
             length_beats: 4.0,
+            content_id: 0,
             notes: Vec::new(),
         };
-        let q = build_sing_query(&clip, 120.0);
+        let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|e| e.0.is_none()));
@@ -560,6 +571,7 @@ mod tests {
             name: "c".into(),
             start_beat: 0.0,
             length_beats: 4.0,
+            content_id: 0,
             notes: vec![Note {
                 start_beat: 0.0,
                 duration_beats: 1.0,
@@ -568,7 +580,7 @@ mod tests {
                 lyric: Some("ら".into()),
             }],
         };
-        let q = build_sing_query(&clip, 120.0);
+        let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].0, None);
@@ -584,6 +596,7 @@ mod tests {
             name: "c".into(),
             start_beat: 0.0,
             length_beats: 8.0,
+            content_id: 0,
             notes: vec![
                 Note {
                     start_beat: 0.0,
@@ -601,7 +614,7 @@ mod tests {
                 },
             ],
         };
-        let q = build_sing_query(&clip, 120.0);
+        let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);
         // rest_start, note0, gap_rest, note1, rest_end
         assert_eq!(entries.len(), 5);
@@ -623,6 +636,7 @@ mod tests {
             name: "c".into(),
             start_beat: 0.0,
             length_beats: 8.0,
+            content_id: 0,
             notes: vec![
                 Note {
                     start_beat: 0.0,
@@ -640,7 +654,7 @@ mod tests {
                 },
             ],
         };
-        let q = build_sing_query(&clip, 120.0);
+        let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);
         // rest_start, note0, note1, rest_end — no rest between notes.
         assert_eq!(entries.len(), 4);
@@ -655,6 +669,7 @@ mod tests {
             name: "c".into(),
             start_beat: 0.0,
             length_beats: 4.0,
+            content_id: 0,
             notes: vec![Note {
                 start_beat: 0.0,
                 duration_beats: 1.0,
@@ -663,7 +678,7 @@ mod tests {
                 lyric: Some("\"a\"".into()),
             }],
         };
-        let q = build_sing_query(&clip, 120.0);
+        let q = build_sing_query(&clip.notes, 120.0);
         // Must remain valid JSON despite embedded quotes.
         let _: Value = serde_json::from_str(&q).expect("invalid JSON output");
     }
@@ -675,6 +690,7 @@ mod tests {
             name: "c".into(),
             start_beat: 0.0,
             length_beats: 8.0,
+            content_id: 0,
             notes: vec![
                 Note {
                     start_beat: 2.0,
@@ -692,7 +708,7 @@ mod tests {
                 },
             ],
         };
-        let q = build_sing_query(&clip, 120.0);
+        let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);
         // After sort: rest, note(60,こ), gap_rest, note(64,に), rest
         assert_eq!(entries[1].0, Some(60));

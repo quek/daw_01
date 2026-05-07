@@ -298,6 +298,28 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }));
     }
 
+    // ----- Clip duplicate (gui_01 #019) -----
+    // D / Alt+D で選択中 clip の末尾直後に共有/独立コピーを生成。
+    // 連打すると前回コピーが新たな選択になり、 後ろに連続して並ぶ
+    // (REAPER / Ableton の Ctrl+D 流)。 複数選択中は各々の末尾直後に
+    // 並列生成。 selected_clip が None なら no-op。
+    if ui.take_shortcut("daw.duplicate_clip_shared") {
+        let sources: Vec<crate::app::ClipRef> = app.selected_clips.clone();
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            for src in &sources {
+                app.handle_event(AppEvent::DuplicateClipShared { source: *src });
+            }
+        }));
+    }
+    if ui.take_shortcut("daw.duplicate_clip_unique") {
+        let sources: Vec<crate::app::ClipRef> = app.selected_clips.clone();
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            for src in &sources {
+                app.handle_event(AppEvent::DuplicateClipUnique { source: *src });
+            }
+        }));
+    }
+
     // ----- Help -----
     if ui.take_shortcut("daw.toggle_help") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {

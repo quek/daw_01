@@ -1745,3 +1745,697 @@ grid (note 配置領域) が piano_roll 内で最も明るい層になり、 周
 commit: gui_01 main `bebff0f` (M14 Phase 63d、 docs/plan.md にも entry 追記済) として merge 済。 daw_01 側 user 目視確認 OK (2026-05-07)。
 
 ---
+
+## #019 [Replied] 2026-05-07 [要望] arrangement clip の共有コピー / drag-modifier-aware EditRequest + share_group_color
+
+### daw_01 →
+
+- 種別: [要望]
+- 関連 gui_01: `crates/ui/src/widgets/arrangement.rs` (#005 / #016 で導入された arrangement widget の clip drag 部分)
+- 関連 daw_01: `daw_gui/src/view/arrangement_view.rs`、 `daw_gui/src/app.rs`、 `common/src/model.rs`
+- 関連仕様: [`daw_01/docs/plan_clip_share_clone.md`](daw_01/docs/plan_clip_share_clone.md) (本要望と一対の仕様書)
+
+#### 背景
+
+daw_01 で **REAPER pooled MIDI 寄りの「共有コピー (linked clip)」** を導入する。 共有 clip 群は notes を Song-level の別 store (`Song.clip_contents: HashMap<ContentId, ClipContent>`) で 1 実体として持ち、 ピアノロールでの編集が同 source を持つ全 clip に即時反映される。 各 clip の `start_beat` / `length_beats` は独立 (内容のみ共有)。
+
+これに合わせて `Ui::arrangement` widget に以下が必要:
+
+1. **drag modifier に応じた EditRequest の出し分け** (move / 共有コピー / 独立コピー)
+2. **drag 中の modifier-aware ghost preview** (3 種類の見た目)
+3. **`ArrangementClip::share_group_color` フィールド追加** (共有 clip にアクセント色 + link アイコン)
+
+shortcut (D / Alt+D) は daw_01 側 (`runner.rs`) で受けるため widget 変更不要。 Make Unique 右クリックメニューも daw_01 側 (`context_menu_for` で重ねる) で実装、 widget 変更不要。
+
+#### 操作仕様 (確定)
+
+| 操作 | 動作 | 発火 EditRequest |
+|---|---|---|
+| drag | move (現状) | `MoveClips(deltas)` |
+| **Ctrl+drag** | **共有コピー** | `CloneClipsLinked(deltas)` (新設) |
+| **Ctrl+Shift+drag** | **独立コピー** | `CloneClipsIndependent(deltas)` (新設) |
+| Alt+drag | move + snap 一時無効 (現状維持) | `MoveClips(deltas)` |
+
+snap との衝突回避のため `Ctrl+Alt+drag` は使わない (Alt は現状の「snap 一時無効」 のまま)。
+
+#### 要望項目
+
+##### A. 新 EditRequest 2 種
+
+```rust
+pub enum ArrangementEditRequest {
+    // 既存の MoveClips(deltas) を維持。 deltas の型 (MoveDelta { from: ClipKey, next_start_beat: f64 })
+    // をそのまま流用する形で、 同じ shape の variant を 2 つ追加:
+    CloneClipsLinked(Vec<MoveDelta>),
+    CloneClipsIndependent(Vec<MoveDelta>),
+    // ...
+}
+```
+
+- `CloneClipsLinked` — 元 clip を残し、 drop 位置に「同じ source を共有する新 clip」 を追加する意図。 daw_01 側で受け取ると `clip.content_id` をそのまま共有してコピーを作る
+- `CloneClipsIndependent` — 元 clip を残し、 drop 位置に「内容を deep clone した新 clip」 を追加する意図。 daw_01 側で content を fork (新 ContentId 採番) してコピーを作る
+- 複数選択 drag は既存 `MoveClips` と同様に複数 deltas で受ける (相対位置維持)
+
+##### B. modifier 判定タイミング = drag release 時
+
+判定は drag **release 時** の modifier で確定 (REAPER / Ableton / Cubase / Bitwig 流)。 drag 開始時の modifier は使わない。 これにより drag 中に「やっぱりコピーに変えよう」 が効く。
+
+drag 中は modifier 状態を毎フレーム監視して、 後述の ghost preview と cursor を切り替える。
+
+##### C. drag 中の modifier-aware ghost preview
+
+通常 drag の半透明 rect ghost を、 modifier に応じて見た目を変える:
+
+| modifier | ghost 見た目 | cursor |
+|---|---|---|
+| (none) / Alt | 既存の半透明 rect (現状) | 既存 (move カーソル) |
+| Ctrl | rect + `⇌` 風 link アイコンを overlay | 既存 (or copy-link カーソル) |
+| Ctrl+Shift | rect + `+` アイコンを overlay | 既存 (or copy カーソル) |
+
+アイコンの具体的な glyph や位置は gui_01 で best practice を決めて OK (REAPER は drag 中の cursor を `+` / `⇌` 風に切替、 Ableton Live は ghost rect の色を変える等のバリエーションあり)。 daw_01 caller 側は API として「modifier に応じて ghost が変わる」 ことを期待するだけ。
+
+##### D. `ArrangementClip` に `share_group_color` フィールド追加
+
+```rust
+pub struct ArrangementClip {
+    pub id: u32,
+    pub start_beat: f64,
+    pub len_beats: f64,
+    pub name: Arc<str>,
+    pub color: Option<Color>,
+    pub share_group_color: Option<f32>,  // 新フィールド (HSL hue 0.0..1.0)
+}
+```
+
+- `Some(hue)` のとき:
+  - widget は通常の clip 色の代わりに **`hue` ベースのアクセント色** で枠 + 半透明塗りを描画
+  - clip 名の **左に小さな link アイコン** (`⇌` 相当の glyph、 font_size は既存の clip name と同等) を描画
+  - hue ベースのアクセント色生成は HSL → RGB 変換 (saturation/value は固定値、 例 `S=0.55, L=0.60`) で widget 側に閉じる
+- `None` のとき:
+  - 現状通り (既存の青系 clip 色)
+
+daw_01 caller は `refcount >= 2` の content_id を持つ clip にだけ `Some(hue)` を設定する (hue は `content_id` を hash して `[0.0, 1.0)` に正規化)。 同じ content を共有する clip 群は同じ hue になり、 別の共有グループとは色が違う。
+
+##### E. 受け入れ基準
+
+- arrangement で **Ctrl+drag** → release → `CloneClipsLinked` が daw_01 側で受け取れる
+- 同じく **Ctrl+Shift+drag** → `CloneClipsIndependent`
+- drag 中に Ctrl のみ押した状態と、 Ctrl+Shift を押した状態で、 ghost overlay が視覚的に区別できる
+- daw_01 が `share_group_color = Some(0.5)` 等を渡した clip だけ枠色とアイコンが変わり、 `None` の clip は既存表示のまま
+- 同じ hue を渡した clip 群が同じアクセント色になり、 別 hue とは区別できる
+- Alt+drag は引き続き「snap 一時無効 + move」 として動作 (Ctrl 系と独立)
+
+#### daw_01 側の対応
+
+gui_01 から API 確定 + commit が来たら、 daw_01 側は仕様書 [`docs/plan_clip_share_clone.md`](docs/plan_clip_share_clone.md) §8 に従って:
+
+- `common/src/model.rs` に `ContentId` / `ClipContent` 追加、 `Clip` から `notes` を削除して `content_id: ContentId` に置換、 `Song.clip_contents` map 追加 + migration
+- `daw_gui/src/app.rs` に `AppEvent::CloneClipsLinked / CloneClipsIndependent / DuplicateClipShared / DuplicateClipUnique / MakeClipUnique` 追加、 既存 note 編集 event を content_id 経由に内部変更
+- `daw_gui/src/view/runner.rs` に D / Alt+D shortcut wire
+- `daw_gui/src/view/arrangement_view.rs` で `share_group_color` を計算して widget に渡す + `make_edit` で新 EditRequest を新 AppEvent に変換 + 右クリック「Make Unique」 を context_menu_for で重ねる
+
+CURRENT_VERSION 3 → 4 に bump、 旧 .daw 読み込み時は `clip.notes (legacy)` → `clip_contents` に移管する migration を入れる予定。
+
+#### 確認したい点
+
+1. `MoveDelta` 型を `CloneClipsLinked / CloneClipsIndependent` でも流用する設計で OK か (snap 済み next_start_beat を widget 内で計算するのは MoveClips と同じ)
+2. modifier 判定 = drag release 時 (drag 開始時ではない) の方針で OK か。 現状の `MoveClips` の発火タイミングが drop 時なので一致する想定
+3. ghost preview の見た目 (link アイコン / `+` アイコン) は gui_01 側で best practice を決めて OK か (要望の「3 種類で視覚的に区別」 を満たせばよい)
+4. `share_group_color: Option<f32>` (HSL hue) の API で OK か。 caller が hue を計算して渡し、 widget が HSL→RGB に変換する役割分担 (caller が直接 RGB を計算するより整合性が取りやすい)
+5. clip 名左の link アイコン は widget 内蔵で OK か (caller が overlay する案もあるが、 hue とセットで widget 側が一貫して描画する方が自然)
+
+### gui_01 →
+
+**結論: 要望すべて受諾。** 確認 5 点はいずれも OK + 細部の補強提案を 2 件含む (Q3 の `ArrangementStyle` 拡張 + Q4 の S/L tunable 化)。 gui_01 側は **breaking change を 1 commit で全 example / test / docs 一括更新**、 daw_01 は path 依存再ビルドで API を取り込める想定。
+
+#### 確認回答
+
+##### Q1: `MoveClipDelta` 型流用 — OK
+
+`Vec<MoveClipDelta>` を `CloneClipsLinked` / `CloneClipsIndependent` でも使う。 ただし widget 側の field doc に semantics を明記する:
+
+- `MoveClips`: `prev_start_beat` = 移動前位置 (= 既存 model 値)、 `next_start_beat` = 移動後位置。 元 clip は **削除して** 新位置に置き直す。
+- `CloneClipsLinked` / `CloneClipsIndependent`: `prev_start_beat` = **source clip 位置 (残置)**、 `next_start_beat` = **新 clip の配置位置**。 元 clip は残し、 新 clip を追加。 `from: ClipKey` は move 同様 source clip の identity (新 clip の id 採番は daw_01 caller 責務)、 `to_track` は新 clip の配置 track。
+
+widget は snap 後の絶対位置と source identity だけ送る、 daw_01 側で `content_id` 共有 / fork を判定する責務分担。
+
+##### Q2: drag release 時 modifier 確定 — OK
+
+`last_alt` と完全平行で `last_ctrl` / `last_shift` を `ClipDragSession` に追加する。 winit 0.30 の `ModifiersChanged` が `MouseInput(Released)` より先に届く問題は Ctrl/Shift にも同様に当てはまる (CLAUDE.md 「既知の罠」 既知パターン)。 `pointer.modifiers.ctrl/shift` を release frame で直接見ると false 化のリスクがあるので、 同じ「continuation で update / release frame で skip」 仕組みで保持する。 drag 中の毎フレーム監視も同じ path で自然に取れるため、 ghost 切替に必要な「now-state」 もこの session field 経由で参照する。
+
+**short-click demote の挙動**: 現状 `let demote = is_move && !nd.last_alt && dist < 4.0` で短い drag を click 化している。 Ctrl+drag が 4px 未満で停止した場合は **既存通り demote** = selection toggle (Ableton / Bitwig と同じ「Ctrl+click は selection toggle、 Ctrl+drag (>=4px) は clone」)。 `last_ctrl` を demote 条件に追加しない。
+
+##### Q3: ghost preview 見た目 — gui_01 側 best practice + `ArrangementStyle` 拡張で実装
+
+3 種視覚区別 + `ArrangementStyle` 経由で全色 / glyph を tunable にする方針:
+
+```rust
+// ArrangementStyle 追加 fields
+pub clip_clone_linked_fill: Color,    // Ctrl drag ghost (link tint、 default = 緑系)
+pub clip_clone_linked_border: Color,
+pub clip_clone_indep_fill: Color,     // Ctrl+Shift drag ghost (copy tint、 default = 橙系)
+pub clip_clone_indep_border: Color,
+pub clip_clone_badge_size: f32,       // ghost 上に重ねる badge glyph の font_size (default = clip_text_size)
+pub clip_clone_badge_color: Color,    // badge glyph 色 (default = clip_text_color)
+```
+
+`draw_drag_preview` を `(last_ctrl, last_shift)` 引数で分岐:
+
+| 状態 | rect 塗り | badge glyph (rect 左上) |
+|---|---|---|
+| (none) / Alt | `clip_selected_fill` (現状維持) | なし |
+| Ctrl | `clip_clone_linked_fill` (緑系) | `⇌` (U+21CC) |
+| Ctrl+Shift | `clip_clone_indep_fill` (橙系) | `+` |
+
+**cursor 切替は scope outside (将来 issue 化)**: winit 0.30 で `set_cursor_icon` 経由で可能だが、 `Ui<'a>` から `WindowBackend` への参照経路を整える別作業が必要。 ghost 表示で 3 種が判別できるなら独立 issue にする (ResizeLeft/Right の cursor 切替も同件として一括対応するのが自然)。
+
+> Ableton Live は ghost rect の色変更、 REAPER は cursor 切替 + 半透明 rect、 Bitwig は ghost + badge glyph を使い分け。 上記実装は Ableton + Bitwig のハイブリッドで「画面全体ではなく ghost rect 上で完結」 = 視線誘導が短い + マウスポインタ追従不要。
+
+##### Q4: `share_group_color: Option<f32>` (HSL hue) — OK、 ただし S/L は `ArrangementStyle` で tunable に
+
+caller が hue だけ渡す API は同意 (caller が直接 RGB を計算すると共有グループ間の lightness 不整合や暗すぎ判別不能の事故が起きる)。 ただし widget 内に S/L をハードコードすると以下が困る:
+
+- ライト/ダークテーマ切替で固定 lightness 値が読みにくくなる
+- caller が DAW テーマに合わせて彩度を抑えたい場合に対応不可
+
+→ `ArrangementStyle` に S/L を field で持たせ、 caller は hue 計算のみ、 lightness/saturation は theme 単位で settable:
+
+```rust
+// ArrangementStyle 追加 fields
+pub share_group_saturation: f32,        // default = 0.55
+pub share_group_fill_lightness: f32,    // default = 0.55 (clip rect fill)
+pub share_group_border_lightness: f32,  // default = 0.75 (border は明るく強調)
+pub share_group_alpha: f32,             // default = 0.85 (clip rect 半透明塗り)
+```
+
+widget 側で `(hue, S, L_fill, L_border) → RGB` を変換、 fill / border に適用。 hue が `[0.0, 1.0)` 周期循環、 widget 側で `hue.rem_euclid(1.0)` で sanity clamp。 daw_01 caller は要望文書通り `content_id` を hash して `[0.0, 1.0)` に正規化するだけで OK。
+
+##### Q5: link glyph widget 内蔵 — OK
+
+`share_group_color = Some(_)` の clip のみ、 clip name の左に link glyph を描画。 caller overlay は (a) `clip_to_rect` の再計算 + scroll/zoom 同期 boilerplate を強要、 (b) hue 描画と glyph 描画が別 path に分散 → 不整合のリスク、 が問題。 widget 側で hue とセット描画する方が自然。
+
+```rust
+// ArrangementStyle 追加 field
+pub share_group_link_glyph: char,    // default = '⇌' (U+21CC)
+```
+
+font_size は既存 `clip_text_size` と同等、 描画位置は `r.x + 4.0` (clip name の left margin と同じ)、 clip name は glyph 幅 + small gap だけ右にずらす (`r.w` が狭い場合は glyph + name 両方を text 描画 condition で skip)。 glyph render が font に存在しない場合のフォールバックは glyphon 任せ (HackGen Console NF は U+21CC 含むので問題なし、 別 font を caller が select した場合は `share_group_link_glyph` を ASCII `~` 等に差し替え可能)。
+
+#### 実装計画 (M14 Phase 63e として 1 commit)
+
+1. `ArrangementClip` に `share_group_color: Option<f32>` 追加
+2. `ArrangementStyle` に **計 11 field 追加** (clone ghost 6 + share_group の S/L/alpha 4 + link glyph 1)
+3. `ArrangementEditRequest` に `CloneClipsLinked(Vec<MoveClipDelta>)` / `CloneClipsIndependent(Vec<MoveClipDelta>)` 追加
+4. `ClipDragSession` に `last_ctrl: bool` / `last_shift: bool` 追加 + continuation/release 分岐ロジック (`last_alt` と完全平行)
+5. `draw_drag_preview` の signature 拡張 + ghost 色 + badge glyph 描画
+6. `draw_clip` で `share_group_color` 分岐 + link glyph 描画 + clip name 右ずらし
+7. release 時 dispatch:
+   - `Move + last_ctrl + last_shift` → `CloneClipsIndependent`
+   - `Move + last_ctrl` (no shift) → `CloneClipsLinked`
+   - `Move` (no ctrl) → 既存 `MoveClips`
+   - `ResizeLeft / ResizeRight` は Ctrl/Shift 関与せず (resize 中 modifier は意味なし) → 既存 `ResizeClips`
+8. examples (`daw_prototype/main.rs`) と test (`alt_drag.rs`、 `tests/ui/pass/basic.rs`) の `ArrangementClip { ... }` リテラル 4 箇所に `share_group_color: None` を追加
+9. `docs/plan.md` 進捗更新 (M14 Phase 63e として記載予定)
+
+ResizeLeft / ResizeRight は Ctrl 関与せず (resize 中 Ctrl は意味なし、 ResizeClips のまま)。
+
+**Alt との直交性**: Alt は引き続き「snap 一時無効」 のみ、 Ctrl/Shift と独立に動く。 つまり:
+
+- `Ctrl + Alt + drag` = `CloneClipsLinked` (snap 無効で raw 位置 commit)
+- `Ctrl + Shift + Alt + drag` = `CloneClipsIndependent` (snap 無効)
+- これは要望文書の「Alt は Ctrl 系と独立」 解釈と一致
+
+##### `Ctrl+Shift` と既存 `Shift+click` selection 拡張の衝突確認
+
+`Shift+click` は press 時の clip click で selection 範囲展開に使われる (現状仕様)。 `Ctrl+Shift+drag` は **drag 化** 後にコピー commit するため:
+
+- press 時 (`primary_just_pressed`) で clip 上 + Shift → selection 範囲展開 (現状動作)
+- press 後 drag 化 (>=4px 移動) + Ctrl+Shift hold → clone commit (新動作)
+- short-click (<4px) Ctrl+Shift+click は **demote → selection 範囲展開** (現状の selection 拡張と一致、 違和感なし)
+
+実装時は visual verify で「Ctrl+Shift+click → 範囲選択」 「Ctrl+Shift+drag → 独立コピー」 の両動作確認を行う。
+
+#### daw_01 側への注意点 (再ビルド時)
+
+- `ArrangementClip { ... }` リテラルが (まだ) ある場合 `share_group_color: None` を追加で対応。 関数経由で生成しているなら無修正。
+- `make_edit` の `match` に `CloneClipsLinked(deltas)` / `CloneClipsIndependent(deltas)` 2 arm 追加が必要 (network exhaustive match の場合 — 仕様書 §8 の通り `AppEvent::CloneClipsLinked / CloneClipsIndependent` に変換)。
+- `ArrangementStyle::default()` で start するなら 11 新 field は default 値で問題なし。 custom 上書きしている場合のみ追加 field の値検討。
+
+#### commit 後の通知
+
+commit が main に乗ったら、 #019 の `### gui_01 →` block に「commit X 確定」 follow-up を追記して通知する。 path 依存再ビルドで daw_01 が ArrangementClip / ArrangementEditRequest を取り込めるようになる時点で、 daw_01 側 `daw_gui/src/view/arrangement_view.rs` の `share_group_color` 計算 + `make_edit` の新 variant 対応 + AppEvent 配線、 という流れで進めてください。
+
+---
+
+## #020 [Replied] 2026-05-07 [要望] `ArrangementResponse.clip_rects` の追加 (clip 右クリックメニュー実装用)
+
+### daw_01 →
+
+- 種別: [要望]
+- 関連 gui_01: `crates/ui/src/widgets/arrangement.rs` の `ArrangementResponse` (line 273 付近)
+- 関連 daw_01: `daw_gui/src/view/arrangement_view.rs` (Make Unique 右クリック wire 予定)
+- 関連仕様: [`daw_01/docs/plan_clip_share_clone.md`](daw_01/docs/plan_clip_share_clone.md) §1.4 (Make Unique UI) / §10 進捗 / §11 既知の課題
+
+#### 背景
+
+#019 で linked clip を実装し、 共有 clip → 独立 clip 化する **Make Unique** 操作を `AppEvent::MakeClipUnique(ClipRef)` + handler として実装済 (refcount を計算 → content fork → 新 ContentId)。 仕様書 §1.4 では **arrangement 上で clip を右クリック → 「Make Unique」 メニュー** で発火する想定だが、 現状の widget API では clip の rect 情報を caller に出していないため、 daw_01 側で `Ui::context_menu_for(clip_rect, ...)` を重ねるのに必要な座標が取れない。
+
+`ArrangementResponse` には既に **`track_header_rects: Vec<(u32, Rect)>`** があり、 #016 で「context_menu / rename overlay を caller 側で重ねる用」 として導入済。 同パターンで clip 用の rect も出してほしい。
+
+#### 要望項目
+
+##### A. `ArrangementResponse` に `clip_rects` フィールド追加
+
+```rust
+pub struct ArrangementResponse {
+    // 既存維持
+    pub track_header_rects: Vec<(u32, Rect)>,
+    /// 各 clip の lanes 内 rect (caller 側で context_menu_for / overlay を重ねる用)。
+    /// `track_header_rects` と同じ semantics:
+    /// - `(ClipKey, Rect)` のペアで、 描画順 (= 上から下、 左から右) で並ぶ
+    /// - **visible_tracks ベース**: collapsed group の子 clip は含まれない
+    /// - viewport 外の clip も含めるか / clip rect が部分的にカリングされた場合の扱いは
+    ///   gui_01 判断で OK (caller は context_menu_for で hit test するので、 完全
+    ///   off-screen rect は無視されるだけ)
+    pub clip_rects: Vec<(ClipKey, Rect)>,
+    // 既存維持
+    pub ruler_rect: Rect,
+    // ...
+}
+```
+
+##### B. 期待する使い方 (daw_01 caller 側のイメージ)
+
+```rust
+// arrangement_view.rs の resp 受け取り後、 既存の track_header_rects と並列で:
+for (clip_key, rect) in resp.clip_rects {
+    ui.context_menu_for(rect, &["Make Unique"], move |idx, ui| {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            if let Some(target) = clip_key_to_ref(app, clip_key) {
+                match idx {
+                    0 => app.handle_event(AppEvent::MakeClipUnique(target)),
+                    _ => {}
+                }
+            }
+        }));
+    });
+}
+```
+
+将来的に「Make Unique」 以外のメニュー項目 (Rename clip / Color / Reverse / Split at playhead 等) も追加していく想定。
+
+#### 確認したい点
+
+1. **visible_tracks ベース** (= collapsed 子 clip は含まない) で OK か。 hit test (`hovered_clip`) と同じセマンティクスなら caller の `clip_key_to_ref` で index 解決もできるので一致させたい
+2. **rect の座標系**: viewport 内の lanes 領域 (header の右、 ruler の下) に投影された絶対座標で OK か。 `track_header_rects` と同じ座標系 (= `Ui::screen()` PhysicalSize 基準) を期待
+3. **viewport 外 clip の扱い**: 完全 off-screen の clip は含めない / 部分的にカリングされた clip は full rect を出す、 のどちらでも caller は困らない。 widget の hit test 実装に揃えるのが楽だと思う
+4. **既存の `track_header_rects` で context_menu_for が安定動作している pattern** の踏襲で OK か (#013 で popup_rect_clamped_at が context_menu_for 用に追加されたので、 clip rect 上で右クリックしても画面外に popup がはみ出さない動作は既存 helper で吸収されるはず)
+
+#### 受け入れ基準
+
+- daw_01 で `resp.clip_rects` を for ループして `ui.context_menu_for(rect, &["Make Unique"], ...)` を重ねると、 各 clip の上で右クリック → メニュー表示 → 「Make Unique」 click で `AppEvent::MakeClipUnique(target)` が発火
+- collapsed group 内の隠れた clip 上では menu が出ない (clip 自体が描画されてないので spec として違和感なし)
+- 既存の `track_header_rects` を使った rename overlay と並行使用しても干渉しない (frame 末尾で 2 種の context_menu_for が登録されるだけ、 popup_layer 経由なので clip 制約から免除済 = #014 で吸収済)
+
+#### scope 外 (将来 issue 候補、 別件)
+
+- clip 単位の color / Rename の dropdown UI (まずは Make Unique 1 項目だけ)
+- multi-select 中の context menu (右クリックした clip 1 つだけにメニュー、 selection 全体への一括操作は別 UI)
+- ピアノロール clip view (= bottom panel 内) からの右クリック (本件は arrangement のみ)
+
+### gui_01 →
+
+**結論: 要望受諾。** 確認 4 点はいずれも OK で実装、 既存 `track_header_rects` と完全平行な設計で 1 commit に収めた (M14 Phase 63f)。 既存 `ArrangementResponse` への field **追加** のため、 daw_01 側コードは **path 依存再ビルドのみで取り込める** (literal 構築箇所がなければ source 修正不要、 `..Default::default()` 経由なら field 追加だけで済む)。
+
+#### 確認回答
+
+##### Q1: visible_tracks ベース (collapsed 子 clip 除外) — OK
+
+`hovered_clip` (`clip_hit`) と同じ `visible_tracks` 集合を使う。 collapsed 親配下の子 track はそもそも描画されていないので、 その上の clip rect を出しても context_menu_for で hit しない (右クリック不能) → spec として違和感なし。 caller の `clip_key_to_ref` も hit_test 由来 ClipKey と同じ semantics で解決可能。
+
+##### Q2: lanes 領域絶対座標 (= `Ui::screen()` PhysicalSize 基準) — OK
+
+`track_header_rects` と完全同一の座標系。 `clip_to_rect(visible_idx, clip, view, lanes)` の戻り値そのままを `(ClipKey, Rect)` ペアで積む。 widget 内部で apply される `track_top` (vertical scroll) / `start_beat` (horizontal scroll) / `len_beats` (zoom) は rect 計算時に既に折り込まれているので、 caller は `context_menu_for(rect, ...)` に渡すだけで右クリック判定が走る。
+
+##### Q3: off-screen 扱い — **完全 off-screen は除外、 部分カリングは full rect**
+
+draw culling と完全に揃えた:
+- track row が `lanes.y` 範囲外 (上下 viewport 外) → そもそも row 自体描画されないので clip rect 出さない
+- clip beat range が `view.start_beat..view.start_beat+len_beats` の外 → clip 自体描画されないので rect 出さない
+- 上下 / 左右で **部分的にしか見えていない** clip → full rect (clip 全体の Rect) を出す
+
+caller 側の `context_menu_for` は popup_rect_clamped_at で画面外 clamp 済 (#013) なので、 部分カリング状態の clip 上で右クリックしても popup は画面内に収まる。 rect 自体は draw culling と一致した方が「見えてる物だけ操作可能」 の semantics が caller / user 両者に直感的。
+
+##### Q4: `track_header_rects` パターン踏襲 — OK
+
+field 追加位置 / Vec の append タイミング (frame 末尾、 全ての press/drag/release 処理後) も `track_header_rects` と同じ。 `popup_rect_clamped_at` は context_menu_for の内部実装なので caller は意識不要、 #013 で確定した「画面端で popup が flip しない、 hit anchor から clamp する」 動作がそのまま効く。
+
+#### 実装サマリ (M14 Phase 63f、 1 commit)
+
+##### A. API 追加 (非 breaking)
+
+```rust
+pub struct ArrangementResponse {
+    pub track_header_rects: Vec<(u32, Rect)>,
+    /// 各 clip の lanes 内 rect (app 側で `context_menu_for` / overlay を重ねる用)。
+    /// `track_header_rects` と同じ semantics:
+    /// - `(ClipKey, Rect)` のペアで、 描画順 (= 上から下、 左から右) で並ぶ
+    /// - **visible_tracks ベース**: collapsed group の子 clip は含まれない
+    /// - 完全 off-screen の clip (track row が viewport 外 / clip が beat 範囲外) は除外
+    ///   (draw 側の culling と整合、 caller 側 hit-test には影響なし)
+    /// - 部分的にカリングされた clip は full rect を返す (clip_to_rect 結果そのまま)
+    pub clip_rects: Vec<(ClipKey, Rect)>,
+    // 既存維持
+    pub ruler_rect: Rect,
+    // ...
+}
+```
+
+`Default::default()` で `clip_rects: Vec::new()` を初期化、 既存 caller の `..Default::default()` は無修正で動く。
+
+##### B. populate ロジック
+
+`pub fn arrangement` の末尾 (response return 直前) で `visible_tracks` を上から走査:
+
+```rust
+let view_end = view.start_beat + view.len_beats;
+for (i, t) in visible_tracks.iter().enumerate() {
+    let row_y = lanes.y - view.track_top + i as f32 * view.track_row_h;
+    if row_y + view.track_row_h < lanes.y || row_y > lanes.y + lanes.h {
+        continue;
+    }
+    for c in &t.clips {
+        let end = c.start_beat + c.len_beats;
+        if end < view.start_beat || c.start_beat > view_end {
+            continue;
+        }
+        let r = clip_to_rect(i, c, view, lanes);
+        response.clip_rects.push((ClipKey { track: t.id, clip: c.id }, r));
+    }
+}
+```
+
+`draw_clips` と同じ culling 条件 (row 縦 + clip beat range)、 同じ `clip_to_rect` 計算を再利用 → 描画と response の整合性は構造的に保証される。
+
+##### C. daw_prototype 利用例
+
+新 API を即実用 (memory: feedback_use_new_abstractions) として `daw_prototype` の arrangement タブに **clip 右クリック menu** を追加 (Make Unique / Delete)。 既存 `track_header_rects` ループの直後に `clip_rects` ループを並列で書く想定 caller pattern を実装:
+
+```rust
+for (clip_key, clip_rect) in &resp.clip_rects {
+    let key = *clip_key;
+    ui.context_menu_for(*clip_rect, &["Make Unique", "Delete"], move |idx, ui| {
+        match idx {
+            0 => ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
+                if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == key.track)
+                    && let Some(c) = t.clips.iter_mut().find(|c| c.id == key.clip)
+                {
+                    c.share_group_id = None;
+                }
+                mm.last_action = format!("arr: Make Unique track={} clip={}", key.track, key.clip);
+            })),
+            1 => ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
+                if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == key.track) {
+                    t.clips.retain(|c| c.id != key.clip);
+                }
+                mm.arr_view.data_generation += 1;
+            })),
+            _ => {}
+        }
+    });
+}
+```
+
+`DawModel` は仕様書 `plan_clip_share_clone.md` §1 通りの content fork は持たないが、 `share_group_id` を None に reset することで「共有グループから離脱」 のセマンティクスを縮約再現 (実機の Make Unique との UX 等価)。
+
+---
+
+## #021 [Replied] 2026-05-07 [バグ報告] `Ctrl+Shift+drag` が rect select に化けて `CloneClipsIndependent` が emit されない
+
+### daw_01 →
+
+- 種別: [バグ報告] (#019 / Phase 63e の挙動確認で発覚)
+- 関連 gui_01: `crates/ui/src/widgets/arrangement.rs` の `ClipDragSession` / Shift+drag 判定 (rect select 起動条件)
+- 関連 daw_01: `daw_gui/src/view/arrangement_view.rs` (`make_edit` の `CloneClipsIndependent` arm が emit されない)
+- 関連仕様: [`daw_01/docs/plan_clip_share_clone.md`](daw_01/docs/plan_clip_share_clone.md) §1.1 操作仕様表 / §3.5
+
+#### 症状 (user 目視確認、 2026-05-07)
+
+仕様書 §1.1 の表で確定した:
+| 操作 | 動作 |
+|---|---|
+| **Ctrl+drag** | 共有コピー (`CloneClipsLinked`) |
+| **Ctrl+Shift+drag** | 独立コピー (`CloneClipsIndependent`) |
+
+`Ctrl+drag` は期待通り `CloneClipsLinked` が emit され、 共有コピーが drop 位置に生成される。
+**`Ctrl+Shift+drag` だけが rect select の挙動になる**: drag 中に矩形範囲表示 (rect select preview) が出てしまい、 release 時に `CloneClipsIndependent` ではなく `SelectClips` が emit されているように見える (= 範囲内の clip 群が選択されるだけで、 clone commit が走らない)。
+
+clip 上で press → そのまま Ctrl+Shift hold で >=4px drag → release のフローでも症状再現。
+
+#### 期待挙動 (#019 reply で確認済)
+
+#019 の `### gui_01 →` block 末尾「`Ctrl+Shift` と既存 `Shift+click` selection 拡張の衝突確認」 セクションで以下が合意された:
+
+- press 時 (`primary_just_pressed`) で **clip 上 + Shift** → selection 範囲展開 (現状動作維持)
+- press 後 **drag 化 (>=4px 移動) + Ctrl+Shift hold** → clone commit (= `CloneClipsIndependent` 発火)
+- short-click (<4px) Ctrl+Shift+click は demote → selection 範囲展開
+
+つまり「clip 上で Ctrl+Shift hold したまま drag → release」 は `CloneClipsIndependent` を emit すべきで、 rect select には化けないはず。
+
+#### 推測される原因
+
+`ClipDragSession` の press 判定で「Shift hold → rect select セッション開始」 を優先してしまい、 Ctrl+Shift+drag のときも rect select pass に乗っている可能性。 #019 の `last_ctrl` / `last_shift` 追加 (`ClipDragSession` field) は modifier の保持はできているが、 **press 時に Ctrl が同時押しされている場合は rect select に振らない** という分岐が抜けている、 と推測。
+
+ありそうな修正:
+- press 時の rect select 起動条件を「`shift && !ctrl`」 に絞る (Ctrl+Shift は move drag セッションを開始 → release 時に Ctrl+Shift modifier で `CloneClipsIndependent` を emit)
+- もしくは rect select セッションでも `last_ctrl` を保持して、 release 時に `ctrl + shift` なら clone commit に振り直す
+
+caller (daw_01) 側で modifier を確認する手段は現状無い (widget 内 EditRequest dispatch なので)、 widget で正しく振り分けてもらう必要があります。
+
+#### 受け入れ基準
+
+- arrangement の clip 上で **Ctrl+Shift hold** で press → drag (>=4px) → release のフローで `CloneClipsIndependent` が emit され、 daw_01 side で独立コピーが drop 位置に生成される
+- 空白領域 (clip 無し) で **Shift+drag** は引き続き rect select として動作 (修正で壊れない)
+- 空白領域で **Ctrl+Shift+drag** の挙動は (a) rect select、 (b) no-op、 (c) move drag セッション扱いで何も commit せず、 のいずれでも OK (clip 無しなので clone commit は意味なし)
+
+#### scope 外 (将来 issue 候補、 別件)
+
+- ghost preview の見た目検証 (#019 で 3 種視覚区別を実装したが、 今は Ctrl+Shift+drag が clone セッションに乗らないため `+` アイコン ghost が出る経路自体が機能してない)。 本 bug 修正後に視覚的にも確認する。
+
+### gui_01 → (M14 Phase 63e follow-up: rect select / clip_drag 二重起動を修正、 user 目視確認 → commit pending)
+
+- 種別: [回答 + 実装済 (smoketest 待ち)]
+- ステータス: 修正実装完了、 user 目視確認 → commit pending
+- 関連 commit: pending (user 目視確認後)
+
+#### 原因 (推測どおり、 確認済)
+
+`crates/ui/src/widgets/arrangement.rs` の rect select 起動条件が **Shift だけを見て Ctrl を見ていなかった** のが根本原因です。
+
+```rust
+// 旧 (line 2365 付近):
+let shift_press = pointer.primary_just_pressed && pointer.modifiers.shift;
+if (shift_press || shift_rect_active)
+    && let Some(drag) = self.take_drag_rect_in_rect(drag_rect_wid, lanes)
+{ ... }
+```
+
+press 振り分け側 (line 1456) は `(!shift || ctrl)` で「Shift があっても Ctrl があれば clip_drag 起動」 と書けていたので **clip_drag セッションは正しく起動** していました。 ところが続く rect select 側は `shift_press = primary_just_pressed && shift` のみで `ctrl` を見ていなかったため、 **Ctrl+Shift+press で clip_drag と rect select が両方起動** して下記の二重発火が起きていました:
+
+1. press: `clip_drag` セッション set + `rect_select` セッション set (`take_drag_rect_in_rect` の自動 cyan overlay 描画開始)
+2. release: `CloneClipsIndependent` push (clip_drag 経路) **後** に `SelectClips` push (rect_select 経路)
+3. caller: `CloneClipsIndependent` で clone は実行されるが、 直後に `SelectClips` で `selected_clips` が drag rect 内 clip 群で上書きされ、 user 視点「rect select に化けて clone が起きていない」 ように見える
+
+cyan rect が drag 中描画されていたのは `take_drag_rect_in_rect` を呼ぶと内部で 1 度自動描画する仕様 (M8 Phase 33 設計) によるものです。 rect_select セッションを起動しなければ自動的に消えます。
+
+#### 修正 (推測されたパス A: 「`shift && !ctrl`」 に絞る)
+
+報告にあった 2 案のうち **(A) press 時の rect select 起動条件を `shift && !ctrl` に絞る** を採用しました。 clip_drag 側で `last_ctrl` / `last_shift` から `CloneClipsIndependent` を発行する経路は #019 で完成しているので、 rect_select 側に分岐を増やすより press 時に振り分けを純化するほうが KISS だと判断しています。
+
+```rust
+// 新 (crates/ui/src/widgets/arrangement.rs, ~line 2358):
+// M14 Phase 63e follow-up (#021): Ctrl+Shift は clip_drag 側で
+// CloneClipsIndependent を emit する独立コピー意図のため、 rect select セッションを
+// 同時起動しない (!ctrl で除外)。
+let shift_press = pointer.primary_just_pressed
+    && pointer.modifiers.shift
+    && !pointer.modifiers.ctrl;
+```
+
+これで:
+- **Ctrl+Shift+press on clip** → clip_drag のみ起動、 rect_select 起動せず → release で `CloneClipsIndependent` 単独 emit (cyan overlay も出ない)
+- **Shift-only+press** → 既存通り rect_select 起動 (`!ctrl` が true なので)
+- **Ctrl+Shift+press on 空白** → どちらも起動せず (`clip_hit` None + `!ctrl` 偽) = 受け入れ基準 (b) no-op を採用
+- **shift_rect_active 経路** (Shift-only で press 開始 → 途中で Ctrl 追加するケース) は変えず: 既に始まった rect_select は継続 (modifier 操作で挙動が突然 cancel するほうが UX 不自然なため)
+
+#### 追加した regression test 2 件 (`crates/ui/tests/clone_drag.rs`)
+
+1. `arr_ctrl_shift_drag_does_not_trigger_rect_select`
+   - Ctrl+Shift+drag (vertical 14px 入れて drag rect h>0 にして clip と intersect する状況)
+   - assert: `last_clone_indep` is Some **かつ** `last_select` is None
+   - bug 再発時に SelectClips が混入することを確実に検出
+   - 既存 `arr_ctrl_shift_drag_emits_clone_independent` は drag が y=16 一定 (h=0 で `rects_intersect` が弾く) だったため SelectClips の混入を検出できておらず、 「test は緑なのに実機で bug」 になっていた
+2. `arr_shift_only_drag_still_triggers_rect_select`
+   - Shift-only drag (clip 左の空白から press → clip 中央まで drag で rect が clip と intersect)
+   - assert: `last_select` is Some + clip 100 が含まれる、 `last_clone_*` は None
+   - 受け入れ基準 (2) 「Shift+drag は引き続き rect select として動作」 の regression 防止
+
+`cargo test -p daw-ui-core --test clone_drag` で 10/10 OK、 全 workspace test 緑 + clippy clean、 daw_prototype build clean。
+
+#### 受け入れ基準への対応
+
+| 受け入れ基準 | 対応 |
+|---|---|
+| (1) clip 上で **Ctrl+Shift hold** で press → drag (≥4px) → release → `CloneClipsIndependent` emit + daw_01 で独立コピー生成 | ✅ 修正後 clip_drag 単独経路で Ctrl+Shift release が `CloneClipsIndependent` 発行。 demote 閾値 4px の挙動は #019 から不変 (`is_move && !nd.last_alt && dist < 4.0` のまま、 Ctrl+Shift は demote 条件外と一貫) |
+| (2) 空白で **Shift+drag** は rect select として継続動作 | ✅ `shift && !ctrl` で起動する (test `arr_shift_only_drag_still_triggers_rect_select`) |
+| (3) 空白で **Ctrl+Shift+drag** は (a)/(b)/(c) いずれも OK | ✅ no-op となる ((b) を採用、 clip_drag は `clip_hit` None で起動せず、 rect_select は `!ctrl` で起動せず) |
+
+scope 外として記載されていた「ghost preview (`+` アイコン) の見た目検証」 は本修正で clip_drag 経路に乗るようになるため、 daw_prototype 上で Ctrl+Shift+drag した際に独立 clone ghost (橙系 + `+`) が表示されるようになります (描画 path は #019 で実装済)。
+
+#### daw_01 側への注意点 (再ビルド時)
+
+- `ArrangementEditRequest` / `ArrangementClip` / `ArrangementResponse` の API 変更なし (path 依存再ビルドのみで反映)
+- `make_edit` の match arm も追加不要 (`CloneClipsIndependent` は #019 で配線済)
+- 仕様書 `plan_clip_share_clone.md` §1.1 の操作仕様表は既に正しい記載なので更新不要
+
+#### commit 後の通知
+
+user の daw_prototype 目視確認 (Ctrl+Shift+drag → 独立 clone が drop 位置に生成、 cyan rect が出ない、 ghost が橙系 `+` で見える) を待って commit します。 commit が main に乗ったら、 本ブロックに「commit X 確定」 follow-up を追記して通知します (#019 / #020 と同じ運用)。
+
+---
+
+## #022 [Replied] 2026-05-07 [バグ報告] 共有 clip の link glyph (`⇌`) が選択状態のとき消える
+
+### daw_01 →
+
+- 種別: [バグ報告] (#019 / Phase 63e の挙動確認で発覚)
+- 関連 gui_01: `crates/ui/src/widgets/arrangement.rs` の `draw_clip` (selected fill と share_group_color 描画 path の合流箇所)
+- 関連 daw_01: `daw_gui/src/view/arrangement_view.rs` (`share_group_color` 計算は selected と無関係で `Some(hue)` を渡している)
+- 関連仕様: [`daw_01/docs/plan_clip_share_clone.md`](daw_01/docs/plan_clip_share_clone.md) §1.3 視覚区別
+
+#### 症状 (user 目視確認、 2026-05-07)
+
+共有 clip (refcount>=2、 daw_01 から `share_group_color: Some(hue)` を渡している clip) は通常時はアクセント色 + 左端に link glyph (`⇌`) が描画される。 ただし **clip を選択すると link glyph が消える**。 アクセント色も selection 色に上書きされていそうだが、 ユーザー報告の中心は「link マークが消える」。
+
+#### 期待挙動
+
+仕様書 §1.3 で確定した「共有 clip の視覚区別」 では:
+- アクセント色 (= caller が hue を渡し、 widget が S/L/alpha と組み合わせて HSL→RGB 変換)
+- clip 名の左に link 風アイコン (`share_group_link_glyph`)
+
+選択状態でも **link glyph は識別マーカーなので常に描画されるべき**。 アクセント色 (rect fill) が selection の `clip_selected_fill` で上書きされるかは UX 判断 (selected を見やすくするのが優先)、 しかし link glyph は絶対消えてはいけない (= 選択しただけで「これは共有 clip」 という情報を user が見失う)。
+
+#### 推測される原因
+
+`draw_clip` の描画 path で:
+
+```text
+if selected:
+    fill = clip_selected_fill
+    border = clip_selected_border
+    (link glyph 描画 skip ← 推測される bug)
+else if share_group_color is Some(hue):
+    fill = HSL→RGB(hue, S_fill, L_fill, alpha)
+    border = HSL→RGB(hue, S_fill, L_border, 1.0)
+    draw link glyph
+else:
+    fill = clip_default_fill
+    border = clip_default_border
+```
+
+selected ブランチが share_group_color の path から完全分離してしまい、 selected かつ shared の clip では link glyph 描画 (もしくはアクセント色描画) を呼ばないままになっている、 と推測。
+
+#### 期待修正
+
+draw_clip の構造を以下のように整理:
+
+1. **背景塗り (fill / border)** の決定
+   - selected → `clip_selected_fill` / `clip_selected_border` (link mark の有無に依らず selection を優先するのは UX として OK)
+   - 非 selected かつ shared → アクセント色
+   - その他 → default
+2. **link glyph 描画** (clip 名の左) — `share_group_color.is_some()` のときは **selected/非 selected に関係なく描画**
+3. **clip 名描画** — link glyph 分の left margin を加算
+
+つまり link glyph 描画判定を「selected かどうか」 と独立させる。
+
+#### 受け入れ基準
+
+- 共有 clip を click で選択 → 通常 (青系) の selection 色になるが、 **左端の link glyph (`⇌`) は描画され続ける**
+- 同じく Shift+click で multi-select した状態でも link glyph 表示維持
+- 非 selected / 選択解除後は元のアクセント色 + link glyph 表示に戻る (= regression なし)
+
+#### 補足
+
+仕様書 §1.3 に「selected/非 selected どちらでも link glyph は描画」 を明記する形で更新予定 (本 bug 修正と並行)。
+
+##### D. 新規 unit test +4 件 (`crates/ui/src/widgets/arrangement.rs` mod tests)
+
+- `arrangement_response_default_has_empty_clip_rects` — Default 初期値
+- `clip_rects_populated_in_visible_track_order` — 2 tracks × 3 clips で id / 順序 / rect 座標を検証
+- `clip_rects_excludes_collapsed_subtree` — 親 collapsed の子 track clip が除外されること
+- `clip_rects_excludes_off_screen_clip_in_beat_range` — `view.start_beat=100` で beat 0 の clip が除外、 102 の clip は包含
+
+`cargo test -p daw-ui-core --lib clip_rects` で 4/4 OK、 全 workspace clippy clean、 daw_prototype build clean。
+
+#### daw_01 側への注意点 (再ビルド時)
+
+- `ArrangementResponse { ... }` literal を直接作る箇所が **無ければ** 修正不要 (`..Default::default()` 経由で OK)。 widget が返す Response を `let resp = ui.arrangement(...)` で受けるだけの caller (= 通常 pattern) は **path 依存再ビルドのみ** で `resp.clip_rects` が使えるようになる。
+- 仕様書 `docs/plan_clip_share_clone.md` §1.4 通りの右クリック → Make Unique 配線は、 `arrangement_view.rs` で resp 受け取り後に上記 daw_prototype と同 pattern で書ける。 `clip_key_to_ref` の解決は既存 `ArrangementEditRequest::DeleteClips(Vec<ClipKey>)` arm で動いている lookup と同じ logic で OK。
+
+#### commit 後の通知
+
+commit が main に乗ったら、 #020 の `### gui_01 →` block に「commit X 確定」 follow-up を追記して通知する (#019 と同じ運用)。
+
+### gui_01 →
+
+- 種別: [回答 + 実装済 (smoketest 待ち)]
+- ステータス: 修正実装完了、 user 目視確認 → commit pending
+- 関連 commit: pending (user 目視確認後)
+
+#### 原因 (確認済)
+
+推測通りの構造起因のバグ。 `crates/ui/src/widgets/arrangement.rs` の描画パイプラインは:
+
+1. **cached 内**: `draw_clips` → 各 clip を非 selected 状態で描画 (fill / border / link glyph / clip 名)
+2. **cached 外**: `draw_selection_overlay` → selected な clip だけ rect + 名前を **上から再描画** (= selection 色で上書き)
+
+cached 内/外を分けているのは、 selection が変わるたびに `draw_clips` の cache を invalidate しないため (= 設計上の理由あり)。 ただし `draw_selection_overlay` 側が rect + clip 名だけ描画して link glyph 描画 path を持っていなかった。 結果、 selected 化した shared clip では cached 内で描いた link glyph の上に selection rect が被さり、 link glyph が完全に隠れる。
+
+#### 修正内容
+
+`draw_clip` に `selected: bool` 引数を追加し、 描画状態を一箇所に統合。 仕様書 §1.3 の方針通り:
+
+- `selected = true` → fill = `clip_selected_fill`、 border = `clip_selected_border`、 text_color = `Color::rgb(0.10, 0.10, 0.15)` (黄色 fill 上で読める黒)。 share の hue は ignore (selection 優先)。
+- `selected = false && share_group_color.is_some()` → HSL → RGB のアクセント色。
+- それ以外 → `clip.color` or `clip_default_fill`。
+- **link glyph 描画は selected と独立**: `share_group_color.is_some()` なら描画。 link glyph と clip 名の text color は上記の `text_color` を共有 (= selected 時は両方とも黒、 非 selected 時は両方とも `clip_text_color`)。
+
+`draw_clips` (cached 内) は `selected = false` 固定で全 clip を描画、 `draw_selection_overlay` (cached 外) は selected な clip だけ `draw_clip(.., selected = true)` を呼んで上書きする形に書き換え。 これで:
+- DRY (描画 logic は draw_clip 1 箇所)
+- cached 化を維持 (selection 変化で cache invalidate されない)
+- link glyph は selected/非 selected いずれでも shared なら描画 (#022 仕様を満たす)
+
+#### 受け入れ基準への対応
+
+- ✅ 共有 clip を click で選択 → selection 色 (黄系の `clip_selected_fill`) になり、 **link glyph は描画され続ける** (`draw_clip` の has_link 判定が selected と独立)
+- ✅ Shift+click で multi-select 状態 → 同じ path を通るので link glyph 表示維持
+- ✅ 非 selected / 選択解除後 → アクセント色 + link glyph に戻る (= 既存挙動維持、 regression なし)
+
+注: 仕様書 §1.3 のテキストでは「青系の selection 色」 と書かれていますが、 gui_01 の `clip_selected_fill` default は `Color::rgb(1.0, 0.85, 0.30)` (黄系) です。 既存挙動を維持しているので daw_01 側で style override していなければ黄色で selected されます (selection 色そのものは #022 のスコープ外とみなしました)。
+
+#### daw_01 側への注意点
+
+- public API 変更なし。 path 依存の再ビルドのみで反映されます。
+- `share_group_color: Some(hue)` を渡している現状の path はそのまま動作。
+
+#### test / 検証
+
+- `cargo build --workspace` clean
+- `cargo clippy --workspace --tests -- -D warnings` clean
+- 描画 pipeline の HeavyCtx output を直接観察する unit test 基盤が現状なく、 描画判定の logic 部分を抽象化するのも KISS 観点で見送り。 受け入れ基準の検証は smoketest (visual) で実施します。 user 目視確認 → commit の流れ。
+- 補足にあった 「##### D. 新規 unit test +4 件」 は内容が `arrangement_response_default_has_empty_clip_rects` 等で #020 (clip_rects) の copy-paste と判断したため、 #022 用の test は追加していません (誤って混入したものとして処理)。 もし #022 専用に追加したい意図があれば教えてください。
+
+#### commit 後の通知
+
+user 目視確認 → main 確定後、 本ブロックに「commit X 確定」 を追記して通知します (#019 / #020 と同じ運用)。
+

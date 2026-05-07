@@ -19,9 +19,14 @@ pub fn save(path: impl AsRef<Path>, song: &Song) -> Result<()> {
     let path = path.as_ref();
     let tmp = tmp_path(path);
 
+    // GC orphan content entries (refcount == 0) before serializing so
+    // disk files stay tidy. Working on a clone — caller's in-memory
+    // Song is not mutated.
+    let mut song = song.clone();
+    song.gc_clip_contents();
     let project = ProjectFile {
         version: CURRENT_VERSION,
-        song: song.clone(),
+        song,
     };
     let json = serde_json::to_string_pretty(&project)
         .context("failed to serialize project to JSON")?;
@@ -75,7 +80,12 @@ pub fn load(path: impl AsRef<Path>) -> Result<Song> {
             "loaded legacy project file; missing fields filled with serde defaults"
         );
     }
-    Ok(project.song)
+    let mut song = project.song;
+    // v5 → v6 migration: drain any legacy `Clip.notes` into the shared
+    // `clip_contents` store, allocating fresh `content_id` for clips that
+    // still carry the sentinel `0`. Idempotent for v6 files.
+    song.ensure_clip_contents();
+    Ok(song)
 }
 
 fn tmp_path(path: &Path) -> PathBuf {
@@ -87,7 +97,7 @@ fn tmp_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Clip, InstrumentSource, Note, Track};
+    use crate::model::{Clip, ClipContent, InstrumentSource, Note, Track};
     use tempfile::tempdir;
 
     #[test]
@@ -103,41 +113,100 @@ mod tests {
     fn save_and_load_vocal_clip_roundtrip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("project.daw");
-        let song = Song {
-            tracks: vec![Track {
-                name: "Vocal".into(),
-                source: InstrumentSource::Vocal {
-                    speaker_id: 3,
-                    style_name: "ノーマル".into(),
-                },
-                clips: vec![Clip {
-                    id: 1,
-                    name: "こんにちは".into(),
-                    start_beat: 0.0,
-                    length_beats: 16.0,
-                    notes: vec![
-                        Note {
-                            start_beat: 0.0,
-                            duration_beats: 1.0,
-                            pitch: 60,
-                            velocity: 100,
-                            lyric: Some("こ".into()),
-                        },
-                        Note {
-                            start_beat: 1.0,
-                            duration_beats: 0.5,
-                            pitch: 62,
-                            velocity: 100,
-                            lyric: Some("ん".into()),
-                        },
-                    ],
-                }],
-                ..Track::default()
+        // v6 形式で構築 (notes は clip_contents へ、 clip.notes は空)。
+        let mut song = Song::default();
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent {
+                notes: vec![
+                    Note {
+                        start_beat: 0.0,
+                        duration_beats: 1.0,
+                        pitch: 60,
+                        velocity: 100,
+                        lyric: Some("こ".into()),
+                    },
+                    Note {
+                        start_beat: 1.0,
+                        duration_beats: 0.5,
+                        pitch: 62,
+                        velocity: 100,
+                        lyric: Some("ん".into()),
+                    },
+                ],
+            },
+        );
+        song.tracks.push(Track {
+            id: 1,
+            name: "Vocal".into(),
+            source: InstrumentSource::Vocal {
+                speaker_id: 3,
+                style_name: "ノーマル".into(),
+            },
+            clips: vec![Clip {
+                id: 1,
+                name: "こんにちは".into(),
+                start_beat: 0.0,
+                length_beats: 16.0,
+                content_id: cid,
+                notes: Vec::new(),
             }],
-            ..Song::default()
-        };
+            ..Track::default()
+        });
         save(&path, &song).unwrap();
         assert_eq!(load(&path).unwrap(), song);
+    }
+
+    #[test]
+    fn load_v5_migrates_clip_notes_to_clip_contents() {
+        // v5 saves stored notes per-`Clip` directly. After load, the
+        // legacy `notes` vector must be drained into `clip_contents` and
+        // a fresh `content_id` allocated.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v5.daw");
+        let v5_json = r#"{
+            "version": 5,
+            "song": {
+                "bpm": 120.0,
+                "time_sig": [4, 4],
+                "length_beats": 64.0,
+                "tracks": [
+                    {
+                        "id": 1,
+                        "name": "Lead",
+                        "volume": 1.0,
+                        "pan": 0.0,
+                        "next_clip_id": 2,
+                        "clips": [
+                            {
+                                "id": 1,
+                                "name": "C",
+                                "start_beat": 0.0,
+                                "length_beats": 4.0,
+                                "notes": [
+                                    {"start_beat": 0.0, "duration_beats": 1.0, "pitch": 60, "velocity": 100}
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        }"#;
+        fs::write(&path, v5_json).unwrap();
+        let song = load(&path).expect("v5 must forward-migrate");
+        let clip = &song.tracks[0].clips[0];
+        assert_ne!(clip.content_id, 0, "ensure_clip_contents must allocate");
+        assert!(
+            clip.notes.is_empty(),
+            "legacy notes must be drained on migration"
+        );
+        let content = song
+            .clip_contents
+            .get(&clip.content_id)
+            .expect("content_id must have an entry after migration");
+        assert_eq!(content.notes.len(), 1);
+        assert_eq!(content.notes[0].pitch, 60);
     }
 
     #[test]

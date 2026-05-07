@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use common::model::Song;
+use common::model::{Note, Song};
 
 #[derive(Debug, Clone, Copy)]
 pub enum NoteTransition {
@@ -82,7 +82,15 @@ pub fn collect_events_for_buffer(
             continue;
         }
 
-        for note in &clip.notes {
+        // v6 linked clip: notes は Song.clip_contents から取り出す。
+        // 共有 clip 群は同じ content から同じ notes を見るので、 別々の
+        // 配置位置 (clip.start_beat) で同じ内容が再生される。
+        let notes: &[Note] = song
+            .clip_contents
+            .get(&clip.content_id)
+            .map(|c| c.notes.as_slice())
+            .unwrap_or(&[]);
+        for note in notes {
             if note.duration_beats <= 0.0 {
                 continue;
             }
@@ -135,30 +143,42 @@ pub fn collect_events_for_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::model::{Clip, Note, Track};
+    use common::model::{Clip, ClipContent, Track};
 
     fn one_note_song(start_beat: f64, duration_beats: f64, pitch: u8) -> Song {
-        Song {
-            bpm: 120.0,
-            tracks: vec![Track {
-                name: "T".into(),
-                clips: vec![Clip {
-                    id: 1,
-                    name: "C".into(),
-                    start_beat: 0.0,
-                    length_beats: 8.0,
-                    notes: vec![Note {
-                        start_beat,
-                        duration_beats,
-                        pitch,
-                        velocity: 100,
-                        lyric: None,
-                    }],
+        // v6: notes は Song.clip_contents に置く。 inline の `notes:` は
+        // legacy field (空) のままで、 ensure_clip_contents が migrate する
+        // 想定だが、 ここでは直接 clip_contents を構築して migrate を挟まず
+        // production と同形にする。
+        let mut song = Song::default();
+        song.bpm = 120.0;
+        let content_id = song.alloc_content_id();
+        song.clip_contents.insert(
+            content_id,
+            ClipContent {
+                notes: vec![Note {
+                    start_beat,
+                    duration_beats,
+                    pitch,
+                    velocity: 100,
+                    lyric: None,
                 }],
-                ..Track::default()
+            },
+        );
+        song.tracks.push(Track {
+            id: 1,
+            name: "T".into(),
+            clips: vec![Clip {
+                id: 1,
+                name: "C".into(),
+                start_beat: 0.0,
+                length_beats: 8.0,
+                content_id,
+                notes: Vec::new(),
             }],
-            ..Song::default()
-        }
+            ..Track::default()
+        });
+        song
     }
 
     /// 120 BPM, 48 kHz: samples_per_beat = 24000.
@@ -212,15 +232,14 @@ mod tests {
     #[test]
     fn chord_emits_two_ons_at_same_time() {
         let mut song = one_note_song(0.0, 1.0, 60);
-        if let Some(clip) = song.tracks[0].clips.first_mut() {
-            clip.notes.push(Note {
-                start_beat: 0.0,
-                duration_beats: 1.0,
-                pitch: 64,
-                velocity: 100,
-                lyric: None,
-            });
-        }
+        let cid = song.tracks[0].clips[0].content_id;
+        song.clip_contents.get_mut(&cid).unwrap().notes.push(Note {
+            start_beat: 0.0,
+            duration_beats: 1.0,
+            pitch: 64,
+            velocity: 100,
+            lyric: None,
+        });
         let mut out = Vec::new();
         let mut active = Vec::new();
         collect_events_for_buffer(Some(&song), 0, SR, 0, 1024, &mut out, &mut active);
@@ -295,36 +314,43 @@ mod tests {
 
     #[test]
     fn output_is_sorted_with_off_before_on_at_same_time() {
-        let song = Song {
-            bpm: 120.0,
-            tracks: vec![Track {
-                name: "T".into(),
-                clips: vec![Clip {
-                    id: 1,
-                    name: "C".into(),
-                    start_beat: 0.0,
-                    length_beats: 4.0,
-                    notes: vec![
-                        Note {
-                            start_beat: 0.0,
-                            duration_beats: 1.0,
-                            pitch: 60,
-                            velocity: 100,
-                            lyric: None,
-                        },
-                        Note {
-                            start_beat: 1.0,
-                            duration_beats: 1.0,
-                            pitch: 60,
-                            velocity: 100,
-                            lyric: None,
-                        },
-                    ],
-                }],
-                ..Track::default()
+        let mut song = Song::default();
+        song.bpm = 120.0;
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent {
+                notes: vec![
+                    Note {
+                        start_beat: 0.0,
+                        duration_beats: 1.0,
+                        pitch: 60,
+                        velocity: 100,
+                        lyric: None,
+                    },
+                    Note {
+                        start_beat: 1.0,
+                        duration_beats: 1.0,
+                        pitch: 60,
+                        velocity: 100,
+                        lyric: None,
+                    },
+                ],
+            },
+        );
+        song.tracks.push(Track {
+            id: 1,
+            name: "T".into(),
+            clips: vec![Clip {
+                id: 1,
+                name: "C".into(),
+                start_beat: 0.0,
+                length_beats: 4.0,
+                content_id: cid,
+                notes: Vec::new(),
             }],
-            ..Song::default()
-        };
+            ..Track::default()
+        });
         let mut out = Vec::new();
         let mut active = Vec::new();
         collect_events_for_buffer(

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 const UNDO_LIMIT: usize = 200;
 
-use common::model::{Clip, InstrumentSource, Note, Song, Track};
+use common::model::{Clip, ClipContent, InstrumentSource, Note, Song, Track};
 use common::plugin_db::PluginDatabase;
 use common::plugin_format::PluginFormat;
 use common::protocol::{MainToChild, PluginSlot, SlotState};
@@ -793,6 +793,11 @@ impl AppData {
                 | AppEvent::CreateClip { .. }
                 | AppEvent::ResizeClip { .. }
                 | AppEvent::DeleteSelectedClip
+                | AppEvent::DuplicateClipShared { .. }
+                | AppEvent::DuplicateClipUnique { .. }
+                | AppEvent::CloneClipsLinked(_)
+                | AppEvent::CloneClipsIndependent(_)
+                | AppEvent::MakeClipUnique(_)
                 | AppEvent::AddNote { .. }
                 | AppEvent::ResizeNote { .. }
                 | AppEvent::ResizeNotes(_)
@@ -821,10 +826,11 @@ impl AppData {
         }
         let track = self.song.tracks.get(r.track as usize)?;
         let clip = track.clips.get(r.clip as usize)?;
+        let notes = self.song.clip_notes(clip);
         let mut copied: Vec<Note> = self
             .selected_notes
             .iter()
-            .filter_map(|i| clip.notes.get(*i as usize).cloned())
+            .filter_map(|i| notes.get(*i as usize).cloned())
             .collect();
         if copied.is_empty() {
             return None;
@@ -870,18 +876,18 @@ impl AppData {
             0.0
         };
         let count = clipboard.len();
-        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
-            return;
-        };
-        let Some(clip) = track.clips.get_mut(r.clip as usize) else {
+        let Some(notes) = self
+            .song
+            .notes_in_clip_mut(r.track as usize, r.clip as usize)
+        else {
             return;
         };
         let mut new_indices = Vec::with_capacity(clipboard.len());
         for src in &clipboard {
             let mut n = src.clone();
             n.start_beat += anchor;
-            new_indices.push(clip.notes.len() as u32);
-            clip.notes.push(n);
+            new_indices.push(notes.len() as u32);
+            notes.push(n);
         }
         self.selected_notes = new_indices;
         self.sync_song_to_plugin_host();
@@ -892,13 +898,13 @@ impl AppData {
         let Some(r) = self.selected_clip else {
             return;
         };
-        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
+        let Some(notes) = self
+            .song
+            .notes_in_clip_mut(r.track as usize, r.clip as usize)
+        else {
             return;
         };
-        let Some(clip) = track.clips.get_mut(r.clip as usize) else {
-            return;
-        };
-        let Some(note) = clip.notes.get_mut(note_idx as usize) else {
+        let Some(note) = notes.get_mut(note_idx as usize) else {
             return;
         };
         note.velocity = velocity;
@@ -916,15 +922,15 @@ impl AppData {
         let Some(r) = self.selected_clip else {
             return;
         };
-        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
-            return;
-        };
-        let Some(clip) = track.clips.get_mut(r.clip as usize) else {
+        let Some(notes) = self
+            .song
+            .notes_in_clip_mut(r.track as usize, r.clip as usize)
+        else {
             return;
         };
         let mut changed = false;
         for (note_idx, vel) in updates {
-            if let Some(note) = clip.notes.get_mut(*note_idx as usize) {
+            if let Some(note) = notes.get_mut(*note_idx as usize) {
                 note.velocity = *vel;
                 changed = true;
             }
@@ -941,14 +947,14 @@ impl AppData {
         let div = div.max(1) as f64;
         let snap = |b: f64| (b * div).round() / div;
         let selected = self.selected_notes.clone();
-        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
-            return;
-        };
-        let Some(clip) = track.clips.get_mut(r.clip as usize) else {
+        let Some(notes) = self
+            .song
+            .notes_in_clip_mut(r.track as usize, r.clip as usize)
+        else {
             return;
         };
         for &i in &selected {
-            if let Some(n) = clip.notes.get_mut(i as usize) {
+            if let Some(n) = notes.get_mut(i as usize) {
                 n.start_beat = snap(n.start_beat).max(0.0);
             }
         }
@@ -1106,9 +1112,29 @@ pub enum AppEvent {
     SetClipSelection(Vec<ClipRef>),
     ClearSelection,
     ResizeClip { target: ClipRef, length: f64 },
-    SetClipPositions(Vec<(ClipRef, f64)>),
+    /// `(source_ref, to_track_id, next_start_beat)` のタプル列。
+    /// to_track_id == source の track id なら同 track 内 move、 違えば
+    /// track 跨ぎ move (clip 自体を別 track の `clips: Vec<Clip>` に移す)。
+    SetClipPositions(Vec<(ClipRef, u32, f64)>),
     CreateClip { track: u32, start_beat: f64 },
     DeleteSelectedClip,
+    /// 選択中 clip の末尾直後に共有コピー (linked clip) を生成 (D shortcut /
+    /// `docs/plan_clip_share_clone.md` §3.2)。 source の `content_id` を
+    /// そのまま新 clip にコピー。
+    DuplicateClipShared { source: ClipRef },
+    /// 選択中 clip の末尾直後に独立コピー (notes を deep clone + 新 ContentId)
+    /// を生成 (Alt+D shortcut / §3.3)。
+    DuplicateClipUnique { source: ClipRef },
+    /// arrangement Ctrl+drag → release の結果。 各 entry は `(source ClipRef,
+    /// to_track_id, drop_start_beat)` (snap 済み)、 元 clip は残し、 drop 位置に
+    /// 共有コピー を to_track 上で生成。 (§3.4)
+    CloneClipsLinked(Vec<(ClipRef, u32, f64)>),
+    /// arrangement Ctrl+Shift+drag → release。 同上だが content は deep clone
+    /// + 新 ContentId 採番で独立化。 (§3.5)
+    CloneClipsIndependent(Vec<(ClipRef, u32, f64)>),
+    /// 右クリック「Make Unique」 — 共有 clip を独立化。 refcount==1 の場合は
+    /// no-op (§3.6)。
+    MakeClipUnique(ClipRef),
 
     // -------- Piano roll / note operations --------------------------------
     SelectNote { note: u32, additive: bool },
@@ -1647,6 +1673,21 @@ impl AppData {
             }
             AppEvent::FitArrangeToContent => {
                 self.fit_arrange_to_content();
+            }
+            AppEvent::DuplicateClipShared { source } => {
+                self.duplicate_clip_shared(source);
+            }
+            AppEvent::DuplicateClipUnique { source } => {
+                self.duplicate_clip_unique(source);
+            }
+            AppEvent::CloneClipsLinked(entries) => {
+                self.clone_clips_linked(&entries);
+            }
+            AppEvent::CloneClipsIndependent(entries) => {
+                self.clone_clips_independent(&entries);
+            }
+            AppEvent::MakeClipUnique(target) => {
+                self.make_clip_unique(target);
             }
         }
     }
@@ -2960,10 +3001,14 @@ impl AppData {
         };
         let cursor = self.step_cursor_beat;
         let step = self.step_size_beats;
-        let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
-            return;
-        };
-        let Some(clip) = track.clips.get_mut(target.clip as usize) else {
+        let target_track_idx = target.track as usize;
+        let target_clip_idx = target.clip as usize;
+        let Some(clip) = self
+            .song
+            .tracks
+            .get(target_track_idx)
+            .and_then(|t| t.clips.get(target_clip_idx))
+        else {
             return;
         };
         let cursor = if cursor >= clip.length_beats {
@@ -2971,8 +3016,14 @@ impl AppData {
         } else {
             cursor
         };
-        let new_idx = clip.notes.len() as u32;
-        clip.notes.push(common::model::Note {
+        let Some(notes) = self
+            .song
+            .notes_in_clip_mut(target_track_idx, target_clip_idx)
+        else {
+            return;
+        };
+        let new_idx = notes.len() as u32;
+        notes.push(common::model::Note {
             start_beat: cursor,
             duration_beats: step,
             pitch,
@@ -3038,25 +3089,24 @@ impl AppData {
             return;
         }
 
-        if clip.notes.is_empty() {
+        let notes = self.song.clip_notes(clip);
+        if notes.is_empty() {
             self.pianoroll_scroll_beat = 0.0;
             self.pianoroll_zoom_x =
                 (grid_w / clip.length_beats.max(1.0) as f32).clamp(8.0, 400.0);
             self.pianoroll_top_pitch = 84;
             self.pianoroll_zoom_y = 14.0;
         } else {
-            let min_beat = clip
-                .notes
+            let min_beat = notes
                 .iter()
                 .map(|n| n.start_beat)
                 .fold(f64::INFINITY, f64::min);
-            let max_beat = clip
-                .notes
+            let max_beat = notes
                 .iter()
                 .map(|n| n.start_beat + n.duration_beats)
                 .fold(f64::NEG_INFINITY, f64::max);
-            let min_pitch = clip.notes.iter().map(|n| n.pitch).min().unwrap_or(60);
-            let max_pitch = clip.notes.iter().map(|n| n.pitch).max().unwrap_or(60);
+            let min_pitch = notes.iter().map(|n| n.pitch).min().unwrap_or(60);
+            let max_pitch = notes.iter().map(|n| n.pitch).max().unwrap_or(60);
 
             let span_beats = (max_beat - min_beat + 2.0).max(1.0);
             let span_pitch = (i32::from(max_pitch) - i32::from(min_pitch) + 4).max(4);
@@ -3099,15 +3149,78 @@ impl AppData {
         self.arrange_track_row_h = row_h;
     }
 
-    fn set_clip_positions(&mut self, entries: &[(ClipRef, f64)]) {
-        for (target, beat) in entries {
-            let new_start = beat.max(0.0);
-            if let Some(track) = self.song.tracks.get_mut(target.track as usize)
-                && let Some(clip) = track.clips.get_mut(target.clip as usize)
-            {
-                clip.start_beat = new_start;
+    fn set_clip_positions(&mut self, entries: &[(ClipRef, u32, f64)]) {
+        // track 跨ぎ move: source track と to_track が異なれば clip を remove +
+        // 別 track に再 push。 同 track 内なら start_beat だけ update。
+        // 同 track 内で複数 entry がある場合、 高い clip_idx から処理しないと
+        // 配列インデックスが先に変動してしまうので、 source.track 同一 group
+        // ごとに clip_idx 降順で sort してから処理する。
+        let mut entries: Vec<(ClipRef, u32, f64)> = entries.to_vec();
+        entries.sort_by(|a, b| {
+            a.0.track
+                .cmp(&b.0.track)
+                .then_with(|| b.0.clip.cmp(&a.0.clip))
+        });
+
+        let mut new_refs: Vec<(u32, u32)> = Vec::with_capacity(entries.len());
+        for (source, to_track_id, new_start_beat) in entries {
+            let new_start = new_start_beat.max(0.0);
+            let Some(source_track_id) = self
+                .song
+                .tracks
+                .get(source.track as usize)
+                .map(|t| t.id)
+            else {
+                continue;
+            };
+            if source_track_id == to_track_id {
+                if let Some(track) = self.song.tracks.get_mut(source.track as usize)
+                    && let Some(clip) = track.clips.get_mut(source.clip as usize)
+                {
+                    clip.start_beat = new_start;
+                    new_refs.push((source.track, clip.id));
+                }
+            } else {
+                let Some(to_track_idx) =
+                    self.song.track_index_by_id(to_track_id)
+                else {
+                    continue;
+                };
+                let Some(removed) =
+                    self.song.tracks.get_mut(source.track as usize).and_then(|t| {
+                        if (source.clip as usize) < t.clips.len() {
+                            Some(t.clips.remove(source.clip as usize))
+                        } else {
+                            None
+                        }
+                    })
+                else {
+                    continue;
+                };
+                let Some(to_track) = self.song.tracks.get_mut(to_track_idx) else {
+                    continue;
+                };
+                let new_clip_id = to_track.alloc_clip_id();
+                let mut new_clip = removed;
+                new_clip.id = new_clip_id;
+                new_clip.start_beat = new_start;
+                to_track.clips.push(new_clip);
+                new_refs.push((to_track_idx as u32, new_clip_id));
             }
         }
+        // ClipRef を最新の (track_idx, clip_idx) に再構築。
+        self.selected_clips = new_refs
+            .iter()
+            .filter_map(|(t_idx, c_id)| {
+                let track = self.song.tracks.get(*t_idx as usize)?;
+                let c_idx = track.clips.iter().position(|c| c.id == *c_id)?;
+                Some(ClipRef {
+                    track: *t_idx,
+                    clip: c_idx as u32,
+                })
+            })
+            .collect();
+        self.selected_clip = self.selected_clips.last().copied();
         self.sync_song_to_plugin_host();
     }
 
@@ -3121,8 +3234,230 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
+    /// 共有コピー (D shortcut): 末尾直後 (start+length) に同サイズの clip を
+    /// 1 つ生成、 `content_id` を流用。 `docs/plan_clip_share_clone.md` §3.2。
+    fn duplicate_clip_shared(&mut self, source: ClipRef) {
+        let Some(track) = self.song.tracks.get(source.track as usize) else {
+            return;
+        };
+        let Some(src_clip) = track.clips.get(source.clip as usize) else {
+            return;
+        };
+        let new_start_beat = src_clip.start_beat + src_clip.length_beats;
+        let new_length = src_clip.length_beats;
+        let content_id = src_clip.content_id;
+        let new_name = src_clip.name.clone();
+        let Some(track) = self.song.tracks.get_mut(source.track as usize) else {
+            return;
+        };
+        let new_clip_id = track.alloc_clip_id();
+        let new_idx = track.clips.len() as u32;
+        track.clips.push(Clip {
+            id: new_clip_id,
+            name: new_name,
+            start_beat: new_start_beat,
+            length_beats: new_length,
+            content_id,
+            notes: Vec::new(),
+        });
+        let r = ClipRef {
+            track: source.track,
+            clip: new_idx,
+        };
+        self.selected_clip = Some(r);
+        self.selected_clips = vec![r];
+        self.selected_notes.clear();
+        self.sync_song_to_plugin_host();
+    }
+
+    /// 独立コピー (Alt+D shortcut): 末尾直後に同サイズ、 ただし content を
+    /// deep clone + 新 ContentId 採番で独立化。 §3.3。
+    fn duplicate_clip_unique(&mut self, source: ClipRef) {
+        let Some(track) = self.song.tracks.get(source.track as usize) else {
+            return;
+        };
+        let Some(src_clip) = track.clips.get(source.clip as usize) else {
+            return;
+        };
+        let new_start_beat = src_clip.start_beat + src_clip.length_beats;
+        let new_length = src_clip.length_beats;
+        let new_name = src_clip.name.clone();
+        let src_content_id = src_clip.content_id;
+        let cloned_notes = self
+            .song
+            .clip_contents
+            .get(&src_content_id)
+            .map(|c| c.notes.clone())
+            .unwrap_or_default();
+        let new_content_id = self.song.alloc_content_id();
+        self.song
+            .clip_contents
+            .insert(new_content_id, ClipContent { notes: cloned_notes });
+        let Some(track) = self.song.tracks.get_mut(source.track as usize) else {
+            return;
+        };
+        let new_clip_id = track.alloc_clip_id();
+        let new_idx = track.clips.len() as u32;
+        track.clips.push(Clip {
+            id: new_clip_id,
+            name: new_name,
+            start_beat: new_start_beat,
+            length_beats: new_length,
+            content_id: new_content_id,
+            notes: Vec::new(),
+        });
+        let r = ClipRef {
+            track: source.track,
+            clip: new_idx,
+        };
+        self.selected_clip = Some(r);
+        self.selected_clips = vec![r];
+        self.selected_notes.clear();
+        self.sync_song_to_plugin_host();
+    }
+
+    /// arrangement Ctrl+drag → release: 各 (source, drop_start_beat) で
+    /// 共有コピーを生成。 元 clip 群はそのまま、 selected_clips は新 clip
+    /// 群に置き換える (drag 後に選択が新 clip に移るのは MoveClips と同じ semantics)。
+    /// §3.4。
+    fn clone_clips_linked(&mut self, entries: &[(ClipRef, u32, f64)]) {
+        let mut new_refs = Vec::with_capacity(entries.len());
+        for &(source, to_track_id, drop_start) in entries {
+            let Some(track) = self.song.tracks.get(source.track as usize) else {
+                continue;
+            };
+            let Some(src_clip) = track.clips.get(source.clip as usize) else {
+                continue;
+            };
+            let new_length = src_clip.length_beats;
+            let new_name = src_clip.name.clone();
+            let content_id = src_clip.content_id;
+            let Some(to_track_idx) = self.song.track_index_by_id(to_track_id) else {
+                continue;
+            };
+            let Some(to_track) = self.song.tracks.get_mut(to_track_idx) else {
+                continue;
+            };
+            let new_clip_id = to_track.alloc_clip_id();
+            let new_idx = to_track.clips.len() as u32;
+            to_track.clips.push(Clip {
+                id: new_clip_id,
+                name: new_name,
+                start_beat: drop_start.max(0.0),
+                length_beats: new_length,
+                content_id,
+                notes: Vec::new(),
+            });
+            new_refs.push(ClipRef {
+                track: to_track_idx as u32,
+                clip: new_idx,
+            });
+        }
+        if !new_refs.is_empty() {
+            self.selected_clip = new_refs.last().copied();
+            self.selected_clips = new_refs;
+            self.selected_notes.clear();
+            self.sync_song_to_plugin_host();
+        }
+    }
+
+    /// arrangement Ctrl+Shift+drag → release: 各 (source, drop_start_beat)
+    /// で独立コピーを生成。 §3.5。
+    fn clone_clips_independent(&mut self, entries: &[(ClipRef, u32, f64)]) {
+        let mut new_refs = Vec::with_capacity(entries.len());
+        for &(source, to_track_id, drop_start) in entries {
+            let Some(track) = self.song.tracks.get(source.track as usize) else {
+                continue;
+            };
+            let Some(src_clip) = track.clips.get(source.clip as usize) else {
+                continue;
+            };
+            let new_length = src_clip.length_beats;
+            let new_name = src_clip.name.clone();
+            let src_content_id = src_clip.content_id;
+            let cloned_notes = self
+                .song
+                .clip_contents
+                .get(&src_content_id)
+                .map(|c| c.notes.clone())
+                .unwrap_or_default();
+            let new_content_id = self.song.alloc_content_id();
+            self.song
+                .clip_contents
+                .insert(new_content_id, ClipContent { notes: cloned_notes });
+            let Some(to_track_idx) = self.song.track_index_by_id(to_track_id) else {
+                continue;
+            };
+            let Some(to_track) = self.song.tracks.get_mut(to_track_idx) else {
+                continue;
+            };
+            let new_clip_id = to_track.alloc_clip_id();
+            let new_idx = to_track.clips.len() as u32;
+            to_track.clips.push(Clip {
+                id: new_clip_id,
+                name: new_name,
+                start_beat: drop_start.max(0.0),
+                length_beats: new_length,
+                content_id: new_content_id,
+                notes: Vec::new(),
+            });
+            new_refs.push(ClipRef {
+                track: to_track_idx as u32,
+                clip: new_idx,
+            });
+        }
+        if !new_refs.is_empty() {
+            self.selected_clip = new_refs.last().copied();
+            self.selected_clips = new_refs;
+            self.selected_notes.clear();
+            self.sync_song_to_plugin_host();
+        }
+    }
+
+    /// Make Unique (右クリック): 共有 clip → 独立化。 refcount==1 なら no-op。
+    /// §3.6。
+    fn make_clip_unique(&mut self, target: ClipRef) {
+        let Some(track) = self.song.tracks.get(target.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get(target.clip as usize) else {
+            return;
+        };
+        let content_id = clip.content_id;
+        if self.song.clip_content_refcount(content_id) <= 1 {
+            self.status_message = "すでに独立 clip です".to_string();
+            return;
+        }
+        let cloned_notes = self
+            .song
+            .clip_contents
+            .get(&content_id)
+            .map(|c| c.notes.clone())
+            .unwrap_or_default();
+        let new_content_id = self.song.alloc_content_id();
+        self.song
+            .clip_contents
+            .insert(new_content_id, ClipContent { notes: cloned_notes });
+        let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(target.clip as usize) else {
+            return;
+        };
+        clip.content_id = new_content_id;
+        self.sync_song_to_plugin_host();
+        self.status_message = "Clip を独立化しました".to_string();
+    }
+
     fn create_clip(&mut self, track_idx: u32, start_beat: f64) {
         let start_beat = start_beat.max(0.0);
+        // Allocate the shared content slot first so the new clip points
+        // at a real entry. Orphan content_ids (if track lookup below
+        // fails) get reclaimed by `Song::gc_clip_contents` before save.
+        let content_id = self.song.alloc_content_id();
+        self.song
+            .clip_contents
+            .insert(content_id, ClipContent::default());
         let Some(track) = self.song.tracks.get_mut(track_idx as usize) else {
             return;
         };
@@ -3134,6 +3469,7 @@ impl AppData {
             name: format!("Clip {clip_no}"),
             start_beat,
             length_beats: DEFAULT_CLIP_LENGTH,
+            content_id,
             notes: Vec::new(),
         });
         let r = ClipRef {
@@ -3186,14 +3522,14 @@ impl AppData {
     ) {
         let start_beat = start_beat.max(0.0);
         let duration = duration.max(0.0625);
-        let Some(track) = self.song.tracks.get_mut(track_idx as usize) else {
+        let Some(notes) = self
+            .song
+            .notes_in_clip_mut(track_idx as usize, clip_idx as usize)
+        else {
             return;
         };
-        let Some(clip) = track.clips.get_mut(clip_idx as usize) else {
-            return;
-        };
-        let new_idx = clip.notes.len() as u32;
-        clip.notes.push(Note {
+        let new_idx = notes.len() as u32;
+        notes.push(Note {
             start_beat,
             duration_beats: duration,
             pitch,
@@ -3218,14 +3554,14 @@ impl AppData {
         let Some(r) = self.selected_clip else {
             return;
         };
-        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
-            return;
-        };
-        let Some(clip) = track.clips.get_mut(r.clip as usize) else {
+        let Some(notes) = self
+            .song
+            .notes_in_clip_mut(r.track as usize, r.clip as usize)
+        else {
             return;
         };
         for &(idx, beat, pitch) in entries {
-            let Some(note) = clip.notes.get_mut(idx as usize) else {
+            let Some(note) = notes.get_mut(idx as usize) else {
                 continue;
             };
             note.start_beat = beat.max(0.0);
@@ -3239,14 +3575,14 @@ impl AppData {
         let Some(r) = self.selected_clip else {
             return;
         };
-        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
-            return;
-        };
-        let Some(clip) = track.clips.get_mut(r.clip as usize) else {
+        let Some(notes) = self
+            .song
+            .notes_in_clip_mut(r.track as usize, r.clip as usize)
+        else {
             return;
         };
         for &(idx, start, duration) in entries {
-            let Some(note) = clip.notes.get_mut(idx as usize) else {
+            let Some(note) = notes.get_mut(idx as usize) else {
                 continue;
             };
             note.start_beat = start.max(0.0);
@@ -3267,13 +3603,13 @@ impl AppData {
         new_duration: f64,
     ) {
         let new_duration = new_duration.max(0.0625);
-        let Some(track) = self.song.tracks.get_mut(track_idx as usize) else {
+        let Some(notes) = self
+            .song
+            .notes_in_clip_mut(track_idx as usize, clip_idx as usize)
+        else {
             return;
         };
-        let Some(clip) = track.clips.get_mut(clip_idx as usize) else {
-            return;
-        };
-        let Some(note) = clip.notes.get_mut(note_idx as usize) else {
+        let Some(note) = notes.get_mut(note_idx as usize) else {
             return;
         };
         note.duration_beats = new_duration;
@@ -3290,13 +3626,14 @@ impl AppData {
         }
         let mut indices = std::mem::take(&mut self.selected_notes);
         indices.sort_unstable_by(|a, b| b.cmp(a));
-        if let Some(track) = self.song.tracks.get_mut(r.track as usize)
-            && let Some(clip) = track.clips.get_mut(r.clip as usize)
+        if let Some(notes) = self
+            .song
+            .notes_in_clip_mut(r.track as usize, r.clip as usize)
         {
             for i in &indices {
                 let i = *i as usize;
-                if i < clip.notes.len() {
-                    clip.notes.remove(i);
+                if i < notes.len() {
+                    notes.remove(i);
                 }
             }
         }
@@ -3330,15 +3667,15 @@ impl AppData {
     /// 適用。 各 entry は `(note_index, Option<String>)`、 widget 側で空文字列
     /// は `None` に正規化済み (= 歌詞削除)。 clip_ref が無効なら no-op。
     fn set_note_lyrics(&mut self, clip_ref: ClipRef, updates: &[(u32, Option<String>)]) {
-        let Some(track) = self.song.tracks.get_mut(clip_ref.track as usize) else {
-            return;
-        };
-        let Some(clip) = track.clips.get_mut(clip_ref.clip as usize) else {
+        let Some(notes) = self
+            .song
+            .notes_in_clip_mut(clip_ref.track as usize, clip_ref.clip as usize)
+        else {
             return;
         };
         let mut changed = false;
         for (id, lyric) in updates {
-            if let Some(n) = clip.notes.get_mut(*id as usize) {
+            if let Some(n) = notes.get_mut(*id as usize) {
                 let normalised =
                     lyric.as_ref().and_then(|s| {
                         let t = s.trim();
@@ -4449,6 +4786,11 @@ fn demo_clip() -> Clip {
         name: "こんにちわ".into(),
         start_beat: 0.0,
         length_beats: 4.0,
+        // Sentinel: caller is expected to allocate a content_id and
+        // move `notes` into `Song.clip_contents` via `ensure_clip_contents`
+        // (or by constructing the clip via `Song::create_empty_clip` +
+        // pushing notes into the content store directly).
+        content_id: 0,
         notes,
     }
 }
