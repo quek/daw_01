@@ -224,11 +224,19 @@ pub type NoteFillFn = fn(velocity: u8) -> Color;
 /// `note_fill_fn` は velocity を Color に変換する関数 (default = `default_velocity_color`)。
 #[derive(Clone, Copy, Debug)]
 pub struct PianoRollStyle {
+    /// grid (note 領域) の背景色 = **白鍵レーン**。
+    ///
+    /// **不変条件 (M14 Phase 63d / daw_01 #017)**: `black_row_overlay` を `bg` に src-over 合成した
+    /// 結果が `bg` より **暗く** なるよう値を選ぶこと (= 鍵盤側 `white_key` > `black_key` の
+    /// 濃淡関係を grid 側でも保つ)。Ableton Live / Cubase / Reaper / FL Studio 等の主流 DAW 慣習。
+    /// `default_black_row_is_darker_than_white_row` test で固定。
     pub bg: Color,
     pub keyboard_bg: Color,
     pub white_key: Color,
     pub black_key: Color,
-    /// grid 内の黒鍵 row 帯 (薄い網)。
+    /// grid 内の黒鍵 row 帯。`bg` (= 白鍵レーン) に src-over 合成して描画され、
+    /// **`bg` よりわずかに暗くする** ために黒系 (`rgba(0,0,0,a)`) の半透明色を使う。
+    /// 詳細は `bg` の不変条件 doc 参照 (M14 Phase 63d / daw_01 #017)。
     pub black_row_overlay: Color,
     /// 4 拍ごとの太線 (小節線)。
     pub bar_line: Color,
@@ -291,11 +299,18 @@ pub fn default_velocity_color(velocity: u8) -> Color {
 impl Default for PianoRollStyle {
     fn default() -> Self {
         Self {
-            bg: Color::rgb(0.12, 0.13, 0.16),
+            // M14 Phase 63d / daw_01 #017: 鍵盤側 `white_key (0.92) > black_key (0.10)` の濃淡に
+            // 揃え、grid の **白鍵レーン (= bg) を黒鍵レーン (= bg + overlay) より明るく** する。
+            // 旧値 `bg=(0.12)` + `overlay=rgba(1,1,1,0.04)` は黒鍵 row が約 (0.155) で bg より
+            // 明るくなる (鍵盤と逆) symptom があった。Live / Cubase / Reaper 慣習に合わせる。
+            // 階層: ruler_bg(0.13) < velocity_lane_bg(0.16) < bg(0.18) < keyboard_bg(0.22)
+            // → grid (note 配置領域) が最も明るく、 周辺 panel が段階的に暗い。
+            bg: Color::rgb(0.18, 0.19, 0.22),
             keyboard_bg: Color::rgb(0.22, 0.23, 0.26),
             white_key: Color::rgb(0.92, 0.93, 0.95),
             black_key: Color::rgb(0.10, 0.11, 0.13),
-            black_row_overlay: Color::rgba(1.0, 1.0, 1.0, 0.04),
+            // src-over 合成で黒鍵 row ≈ (0.135, 0.143, 0.165)、 bg との差 0.045〜0.055。
+            black_row_overlay: Color::rgba(0.0, 0.0, 0.0, 0.25),
             bar_line: Color::rgba(1.0, 1.0, 1.0, 0.30),
             beat_line: Color::rgba(1.0, 1.0, 1.0, 0.12),
             bar_line_width_px: 1.5,
@@ -2025,6 +2040,32 @@ mod tests {
             // 数値検証 test は raw beat 値を期待するので明示 OFF。
             snap: SnapConfig::OFF,
         }
+    }
+
+    // -------- Style invariants (M14 Phase 63d / daw_01 #017) --------
+
+    /// `PianoRollStyle::default()` の `bg` (= 白鍵レーン) と `black_row_overlay` を src-over
+    /// 合成した結果 (= 黒鍵レーン) は **bg より暗くなる** こと。鍵盤側の white_key > black_key
+    /// と濃淡関係を一致させる業界標準動作。 Ableton Live / Cubase / Reaper / FL Studio 慣習。
+    #[test]
+    fn default_black_row_is_darker_than_white_row() {
+        let style = PianoRollStyle::default();
+        let bg = style.bg;
+        let ov = style.black_row_overlay;
+        // src-over: out = src.rgb * src.a + dst.rgb * (1 - src.a)
+        let bk_r = ov.r * ov.a + bg.r * (1.0 - ov.a);
+        let bk_g = ov.g * ov.a + bg.g * (1.0 - ov.a);
+        let bk_b = ov.b * ov.a + bg.b * (1.0 - ov.a);
+        assert!(
+            bk_r < bg.r && bk_g < bg.g && bk_b < bg.b,
+            "黒鍵 row ({bk_r}, {bk_g}, {bk_b}) は bg ({}, {}, {}) より暗いべき (鍵盤と整合)",
+            bg.r, bg.g, bg.b
+        );
+        // 鍵盤側の濃淡関係も同方向であることを念のため確認 (regression 防止)。
+        assert!(
+            style.white_key.r > style.black_key.r,
+            "鍵盤 white_key.r > black_key.r 不変条件"
+        );
     }
 
     // -------- Pure function tests (note_hit / note_hover_cursor / rects_intersect) --------
