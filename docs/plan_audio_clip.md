@@ -914,9 +914,39 @@ migration 不要 (Track 構造変更なし)。
 
 ### Q2 sample copy 方針 → **import 時に project dir 内へコピー**
 
+#### Project = bundle directory (Bitwig / Ableton / Logic 流)
+
+`File → Save As` の UI は **「名前を付けて保存」 ダイアログ** (`rfd::FileDialog
+::save_file` with `.daw` filter)。 ユーザーは普通に `<parent>/wav03.daw` のように
+プロジェクト名を入力し、 daw_01 は親フォルダ内に **同名のフォルダを自動作成** して
+中に project file (`wav03.daw`) と `samples/` などを配置する:
+
+```
+<parent_dir>/
+└── wav03/                       -- daw_01 が自動作成した bundle directory
+    ├── wav03.daw                -- project file (= フォルダ名と同じ)
+    ├── samples/                 -- import した audio file の copy 置き場
+    │   ├── kick_a3f4b912.wav
+    │   └── lead_5e1c2d04.wav
+    └── bounce/                  -- Phase 2: Bounce In Place 出力先
+```
+
+つまりユーザー入力 `<parent>/wav03.daw` → 実際の保存先は `<parent>/wav03/wav03.daw`。
+これにより「ファイル名だけ選んだら samples/ がどこに作られるか分からない」 旧挙動と、
+「`pick_folder` dialog では Windows の input 欄に新フォルダ名を入れても "パスが存在
+しません" エラーで先に進めない」 という UI 問題の両方を回避できる (Bitwig / Ableton
+の Save As と同じ流れ)。
+
+既存 `<parent>/<name>/<name>.daw` の上書きは確認ダイアログ (`rfd::MessageDialog`) を
+出してから。 `<parent>/<name>/` フォルダが既に存在しても daw_01 は (空であれ非空であれ)
+そのまま使い、 `samples/` 等のサブフォルダだけ `create_dir_all` で確保する。
+
+`File → Save` (=`Ctrl+S`) は既存 `file_path` があればそのまま上書き、 無ければ
+`action_save_as` (= 上記の名前ダイアログ) にフォールバック。
+
+#### import file の配置
+
 import した WAV は `<project_dir>/samples/<sanitized_name>_<short_hash>.wav` にコピーし、
-`AudioSourcePath::ProjectRelative(samples/<filename>)` で記録する。 元 WAV が削除 / 移動
-されてもプロジェクトは壊れない。
 
 詳細:
 - **import 時**:

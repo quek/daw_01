@@ -2167,13 +2167,59 @@ impl AppData {
         }
     }
 
+    /// Bitwig / Ableton / Logic 流: project = bundle directory。 UX として
+    /// ユーザーは普通の「名前を付けて保存」 dialog でプロジェクト名
+    /// (例: `wav03.daw`) を入力する。 daw_01 はその親フォルダ内に
+    /// **同名のフォルダを作成** し、 中に project file (`wav03.daw`) と
+    /// `samples/` (imported audio copy)、 将来 `bounce/` 等を配置する。
+    /// = ユーザー入力 `<parent>/wav03.daw` → 実際の保存先は
+    /// `<parent>/wav03/wav03.daw`。 これにより
+    /// 「ファイル名だけ選んだら samples/ がどこに作られるか分からない」
+    /// 旧挙動と「pick_folder dialog では新規フォルダを作れない」 (Windows
+    /// の input 欄問題) を同時に解消する。 仕様書:
+    /// `docs/plan_audio_clip.md` §5 / §13 Q2。
     fn action_save_as(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
+        let Some(picked) = rfd::FileDialog::new()
             .add_filter("daw", &["daw"])
+            .set_title("プロジェクト名 / 保存先を選択 (フォルダは自動作成されます)")
             .save_file()
         else {
             return;
         };
+        let Some(stem) = picked
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
+            self.status_message = "プロジェクト名を取得できませんでした".to_string();
+            return;
+        };
+        let parent = picked
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let project_dir = parent.join(&stem);
+        let path = project_dir.join(format!("{stem}.daw"));
+        if path.exists() {
+            let res = rfd::MessageDialog::new()
+                .set_title("プロジェクトの上書き確認")
+                .set_description(format!(
+                    "{} は既に存在します。 上書きしますか？",
+                    path.display()
+                ))
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .show();
+            if res != rfd::MessageDialogResult::Yes {
+                return;
+            }
+        }
+        if let Err(e) = std::fs::create_dir_all(&project_dir) {
+            self.status_message = format!(
+                "プロジェクトフォルダの作成に失敗: {} ({e})",
+                project_dir.display()
+            );
+            return;
+        }
         self.begin_save(path);
     }
 
