@@ -350,4 +350,6 @@ A8 で A (load 失敗 → pending stuck) は解消したが、 reconcile 経由�
 | 2026-05-06 | d049060 / 9ee2dca | plugin_host 安定化 | VST3/CLAP の `_library` を struct 末尾に移動 (Drop 順序 crash fix) + DispatchCounter + WorkerPool::quiesce で plugin Drop を audio worker と同期 (UAF fix) |
 | 2026-05-07 | 22d7a9e / 5a9df06 / 4dc982c | Undo/Redo plugin sync | track-level reconcile (削除 → Undo で plugin 再 load) + Undo snapshot 直前に最新 state を Song に書き戻し (knob 値復元) + slot 粒度の reconcile (同 track 内 plugin 追加/削除/切替を同期) |
 | 2026-05-07 | 88bf3dc | A8 完了 | plugin load 失敗通知 (`SlotPluginLoadFailed`) を新設、 plugin_host 2 失敗 path で emit (orphan cleanup 含む)、 daw_gui で pending 解放 + queue Play flush + status 表示。 integration test 2 件 |
-| 2026-05-07 | (this commit) | M1 達成 | DESIGN.md M1 マイルストーンの全項目完了。 plan.md / DESIGN.md を実態に追従更新 (VST3 GUI embed / sidechain / PDC / グループトラック / Undo/Redo を M1 に取り込み、 M2 候補を細分化) |
+| 2026-05-07 | aa0bb7a | M1 達成 | DESIGN.md M1 マイルストーンの全項目完了。 plan.md / DESIGN.md を実態に追従更新 (VST3 GUI embed / sidechain / PDC / グループトラック / Undo/Redo を M1 に取り込み、 M2 候補を細分化) |
+| 2026-05-07 | 2f60f2e | gui_01 #018 [Open] | piano_roll velocity lane の drag 編集を内蔵要望 (NotesEditRequest::SetVelocity 新設、 multi-select 一括変更、 click<3px no-op、 release frame で 1 batch) |
+| 2026-05-07 | (this commit) | gui_01 #018 [Resolved] | gui_01 main を fast-forward (5632b41 = M14 Phase 64) で取り込み、 daw_01 側で `NotesEditRequest::SetVelocity` arm + `AppEvent::SetNoteVelocities(Vec<(u32, u8)>)` + handler `set_note_velocities` を追加。 1 drag = 1 Undo step (`is_undoable` に登録)。 conversation.md の #018 entry は archive_001.md に移動 |

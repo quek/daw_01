@@ -799,6 +799,7 @@ impl AppData {
                 | AppEvent::SetNotePositions(_)
                 | AppEvent::DeleteSelectedNotes
                 | AppEvent::SetNoteLyrics { .. }
+                | AppEvent::SetNoteVelocities(_)
                 | AppEvent::SetTrackSpeaker { .. }
                 | AppEvent::QuantizeSelectedNotes(_)
                 | AppEvent::SelectPluginFromDb(_)
@@ -904,6 +905,35 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
+    /// gui_01 #018 (M14 Phase 64): velocity lane drag の release frame で
+    /// 1 batch 発行される `(note_id, new_velocity)` 列を一括適用。 widget
+    /// から渡される id は piano_roll widget 上の `NoteId` (= clip 内 note
+    /// index に同じ値域、 daw_01 でも u32)。 1 batch を 1 Undo step とする
+    /// ため、 push_undo_snapshot は handle_event の auto push 経路に任せる
+    /// (`is_undoable` で `SetNoteVelocities` を許可)。 sync_song_to_plugin_host
+    /// は最後に 1 度だけ呼ぶ (毎 note 同期は無駄)。
+    fn set_note_velocities(&mut self, updates: &[(u32, u8)]) {
+        let Some(r) = self.selected_clip else {
+            return;
+        };
+        let Some(track) = self.song.tracks.get_mut(r.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(r.clip as usize) else {
+            return;
+        };
+        let mut changed = false;
+        for (note_idx, vel) in updates {
+            if let Some(note) = clip.notes.get_mut(*note_idx as usize) {
+                note.velocity = *vel;
+                changed = true;
+            }
+        }
+        if changed {
+            self.sync_song_to_plugin_host();
+        }
+    }
+
     fn quantize_selected_notes(&mut self, div: u8) {
         let Some(r) = self.selected_clip else {
             return;
@@ -1003,6 +1033,10 @@ pub enum AppEvent {
     PushUndoSnapshot,
     QuantizeSelectedNotes(u8),
     SetNoteVelocity { note: u32, velocity: u8 },
+    /// gui_01 #018 (M14 Phase 64): velocity lane drag で 1 batch 更新。
+    /// `selected_clip` の note を `(id, velocity)` で一括書き換え。 1 drag =
+    /// 1 Undo step。
+    SetNoteVelocities(Vec<(u32, u8)>),
     AddVocalTrack,
     AddInstrumentTrack,
     /// Group the selected tracks under a fresh group track. Mirrors
@@ -1287,6 +1321,9 @@ impl AppData {
             }
             AppEvent::SetNoteVelocity { note, velocity } => {
                 self.set_note_velocity(note, velocity);
+            }
+            AppEvent::SetNoteVelocities(updates) => {
+                self.set_note_velocities(&updates);
             }
             AppEvent::AddVocalTrack => self.action_add_vocal_track(),
             AppEvent::AddInstrumentTrack => self.action_add_instrument_track(),

@@ -1037,3 +1037,299 @@ unit test 16 件 + integration 15 件 = 計 31 件、 全 pass。 既存 piano_r
 `cargo build / clippy / test --workspace --lib (92件)` 全 clean。 実機 smoke で L キー → 「あいうえ」 → Enter で 4 note 分配を確認 (本ファイルでの「ok」 報告)。
 
 ---
+## #018 [Resolved] 2026-05-07 [要望] `Ui::piano_roll` の velocity lane に drag 編集を追加
+
+### daw_01 →
+
+- 種別: [要望]
+- 関連ファイル:
+  - daw_01 側: [daw_gui/src/view/piano_roll_view.rs](../daw_gui/src/view/piano_roll_view.rs) (既に widget 呼び出し済)
+  - gui_01 側: `crates/ui/src/widgets/piano_roll.rs` (velocity lane 描画は `:1740 draw_velocity_lane`)
+
+#### 背景
+
+現状 `Ui::piano_roll` widget は velocity lane を **描画は内蔵済** (M9 Phase 45c、
+[#006 Resolved](gui_01_conversation_archive_001.md))。 `velocity_lane_h: f32` を
+`> 0` にすると下端に lane を確保し、 各 note の start_beat 位置に `velocity / 127`
+比率の縦 bar を描画してくれる。 note 色濃度も `default_velocity_color` で velocity
+に追従する。
+
+しかし **velocity lane 上で マウス drag による編集が未対応**:
+
+- `NotesEditRequest` enum は `Add` / `Delete` / `Move` / `Resize` / `Select` /
+  `SetLyrics` の 6 variants のみ。 velocity を更新する variant が無い
+- velocity lane 領域内での pointer 入力は widget が消費せず素通り、 caller も
+  独自に hit test できない (widget が body 全体を取る)
+
+`ef8588c ピアノロール下にベロシティレーン (ノート毎のバー + 縦ドラッグで編集)`
+は古い vizia 時代の piano_roll_view が独自実装していた機能ですが、 `8aebba3
+refactor: piano_roll の velocity / playhead を gui_01 widget 内蔵に移譲` で widget
+側に移譲した際に **編集機構 (drag) は引き継がれず描画のみが残った** 状態です。
+
+結果、 マウスで velocity を変える手段が無く、 MIDI step input 経由でしか
+設定できない。 DAW として致命的に不便なので、 widget 側で drag 編集を内蔵
+してほしい。
+
+#### 想定 API イメージ
+
+新 variant `NotesEditRequest::SetVelocity(Vec<(NoteId, u8)>)` を追加:
+
+```rust
+pub enum NotesEditRequest {
+    Add(Vec<Note>),
+    Delete(Vec<Note>),
+    Move(Vec<MoveDelta>),
+    Resize(Vec<ResizeDelta>),
+    Select { prev: Vec<NoteId>, next: Vec<NoteId> },
+    SetLyrics(Vec<(NoteId, String)>),
+    /// (新規) velocity lane 内 drag による velocity 更新。 release frame で
+    /// 1 batch 発行 (Move / Resize と同じ pattern)。 単一 note でも Vec で
+    /// 渡す (multi-select 一括変更に対応)。 値は `0..=127` clamp 済。
+    SetVelocity(Vec<(NoteId, u8)>),
+}
+```
+
+#### drag 仕様 (希望)
+
+- **lane 内 pointer down**: lane 領域 (`rect.bottom - velocity_lane_h..rect.bottom`)
+  で `mouse_down`
+- **hit 対象**: pointer.x 位置にある note の bar (= note start_beat の x 座標 ±
+  `velocity_bar_width_px / 2 + tolerance(=4 px)`)。 hit 無しなら drag 開始しない
+  (lane 余白を click しても 0 にならない)
+- **drag axis**: 縦のみ (横移動は無視)。 pointer.y が lane bottom = velocity 0、
+  lane top = velocity 127 として `127 - ((py - lane.y) / lane.h * 127.0)` で
+  絶対値に直接 set (一般的 DAW 流の「絶対値 mode」)
+- **multi-select**: drag 開始 note が selected に含まれていれば、 selected 全 note
+  を **同じ絶対値** にセット。 含まれていなければ単一 note 編集 (selection は変えない)
+- **release frame で発行**: `SetVelocity(Vec<(NoteId, u8)>)` を `make_edit` に流す
+  (Move / Resize と同 pattern、 drag 中は library が overlay で preview 描画)
+- **click 単発 (drag<3px)**: no-op (誤操作防止)
+- **Undo 単位**: release frame の 1 batch を 1 Undo step とみなす (caller 側は
+  `is_undoable` 経路に乗せて push_undo_snapshot)
+
+#### 確認したい点
+
+1. **multi-select 時の意味論**: 上記「全 note を **絶対値**」 で push しますが、
+   Live は modifier 切替 (default 絶対 / Shift で 相対 delta) があります。 v1 は
+   絶対のみ + 別 phase で Shift modifier 追加 で問題ないでしょうか?
+
+2. **bar hit tolerance**: bar 幅 (`velocity_bar_width_px=3.0`) は狭くて hit 困難。
+   tolerance を **bar 中央から左右 ±4 px** で取る案ですが、 別案 (bar 範囲を内部
+   bar_width × 2 に広げる、 等) があれば。
+
+3. **drag overlay 描画**: 既存 Move / Resize と同じく **library 側で overlay 描画** で
+   問題ないでしょうか? (`PianoRollStyle::velocity_bar_color` を流用 + drag 中は
+   alpha を上げる、 など widget 内で完結)
+
+4. **middle-click で reset**: Live 流の「middle-click で default velocity (=100) に
+   戻す」 ジェスチャは v1 で入れるかは pending、 widget 側の判断にお任せします
+   (なくても困らない、 あれば歓迎)
+
+#### gui_01 側で見るべきソース
+
+- `crates/ui/src/widgets/piano_roll.rs`
+  - `:122` `velocity_lane_h: f32` field doc
+  - `:705` plugin doc (drag 仕様の英語まとめ)
+  - `:792` lane area 計算 (`vel_h = view.velocity_lane_h.max(0.0).min((rect.h - ruler_h) * 0.5)`)
+  - `:1281,1299,1322` Move / Resize delta 発行ロジック (release frame で push_edit、 同じ pattern で SetVelocity も発行可能)
+  - `:1740 draw_velocity_lane` (現状は描画のみ)
+
+#### 受け入れ基準
+
+1. piano_roll example で `velocity_lane_h > 0` のとき lane 内 drag → release で
+   `NotesEditRequest::SetVelocity` が発行される
+2. multi-select 状態で drag → 全 selected note の velocity が同じ絶対値に
+3. drag<3px の click は no-op
+4. lane 外 click は従来通り note grid 側の handler に流れる (= add note dbl-click 等を
+   壊さない)
+5. unit test: 既存 `velocity_lane_disabled_by_default` / `velocity_lane_skips_zero_velocity_bars`
+   に加えて、 lane 内 drag → SetVelocity 発行の test を追加
+
+### gui_01 →
+
+提案された API + drag 仕様を **そのまま採用** で実装、 M14 **Phase 64** として 1 commit に統合
+(piano_roll example + trybuild + 既存 / 新 tests を一括更新)。 worktree branch
+`claude/compassionate-torvalds-084fdf` で実装済、 main 取り込みは user judgement。
+
+#### 確認 4 点への回答
+
+1. **multi-select 絶対値 mode (v1) ✅ 採用、 Shift relative は別 phase**: spec どおり「全 selected note を同じ
+   絶対値に set」。 Live の Shift modifier (相対 delta) は v2 候補として保留 (実装は `anchor_velocities` から
+   delta 計算するだけだが、 modifier UX を別 phase で議論したい)。
+
+2. **bar hit tolerance ±4 px ✅ 採用**: bar 中央から左右 ±(`velocity_bar_width_px / 2 + 4.0`) px =
+   default で ±5.5px (= 11px 幅) の hit zone。 「bar 範囲を 2 倍に広げる」 案より ±4 px 固定の方が zoom
+   out 時に隣接 bar との衝突を回避しやすいため。 ±4 px は CLAUDE.md 既知の罠の「mouse jitter 用 4 px 閾値」
+   とも整合。
+
+3. **drag overlay は library 側で完結 ✅ 採用**: `draw_velocity_lane` を `cached()` の外に移動して
+   `velocity_override: Option<(&[NoteId], u8)>` 引数追加、 drag 中は対象 ids の bar が new_vel で
+   render される (alpha 強調等の visual diff は v1 で見送り、 必要なら別 phase)。 静的時の cost は
+   visible_count 個の rect commands (~50-100、 GPU 数千 ns、 16ms 予算の 0.01% 未満で誤差)。 cached
+   から外した代わりに drag preview は **新 model 値を待たず即時反映** = caller の Edit apply 経由の
+   「1 frame 遅延」 を避ける。
+
+4. **middle-click reset ✅ v1 では入れない**: pointer event に middle button 経路がまだ生えていない
+   (= AppEvent / PointerFrame 拡張が必要)、 spec も「あれば歓迎、 なくても困らない」 なので v1 scope 外。
+   将来 issue 候補 (`pointer.middle_just_pressed` を platform crate に追加 → widget で context 別 reset)。
+
+#### API 一覧 (M14 Phase 64、 commit `48abd8d` の続編)
+
+```rust
+// crates/ui/src/widgets/piano_roll.rs
+
+/// (M14 Phase 64) velocity lane drag の commit タプル: `(id, new_velocity)`。
+/// 絶対値 (0..=127 clamp 済)、prev は持たない。
+pub type VelocityUpdate = (NoteId, u8);
+
+pub enum NotesEditRequest {
+    // 既存 6 variants 維持
+    /// (M14 Phase 64) velocity lane 内 drag による velocity 更新。 release frame で 1 batch 発行。
+    SetVelocity(Vec<VelocityUpdate>),
+}
+
+pub struct PianoRollResponse {
+    // 既存 fields 維持
+    /// (M14 Phase 64) velocity lane 内 drag が active か (HUD / status bar 表示用)。
+    pub velocity_dragging: bool,
+}
+```
+
+`crates/ui/src/lib.rs` に `VelocityUpdate` を re-export 追加 (caller が `daw_ui_core::VelocityUpdate`
+で参照可能)。
+
+#### widget 内部設計の重要ポイント
+
+- **`VelocityDragSession`** (内部 state、 `PianoRollState.velocity_drag: Option<_>`):
+  ```rust
+  struct VelocityDragSession {
+      target_ids: Vec<NoteId>,           // drag 起点 hit が selected に含まれれば selected 全部、 そうでなければ単一
+      anchor_velocities: Vec<(NoteId, u8)>, // 短 click 判定 + 「変化なし note 除外」 用
+      anchor_mouse: (f32, f32),          // 短 click 判定の基準
+      last_mouse: (f32, f32),            // winit release frame の pos 巻き戻し対策 (note_drag と同パターン)
+  }
+  ```
+  note_drag (Move/Resize) と独立、 同 frame に両方 active にならない (pointer は press 時に grid か
+  vel_area のどちらか)。
+
+- **絶対値計算 helper**:
+  ```rust
+  fn velocity_from_y(py: f32, vel_area: Rect) -> u8 {
+      if vel_area.h <= 0.0 { return 0; }
+      let t = (1.0 - (py - vel_area.y) / vel_area.h).clamp(0.0, 1.0);
+      (t * 127.0).round() as u8
+  }
+  ```
+  `vel_area.y` (lane top) = 127、 `vel_area.y + vel_area.h` (lane bottom) = 0、 範囲外 clamp。
+
+- **bar hit-test helper**: `velocity_bar_hit(visible, view, vel_area, cx, bar_width, tolerance)` で
+  bar 中央 ±(bar_width/2 + tolerance) px 幅の hit zone、 後勝ち (visible 順で前面、 `note_hit` と同
+  semantics)。
+
+- **release commit**: `dx.abs() + dy.abs() >= 3.0` のみ SetVelocity 発行 (drag<3px は no-op)。
+  anchor velocity と new value が同値の note は updates から除外 (no-op Edit avoid)。
+
+- **draw_velocity_lane を cached の外に移動**: drag 中は対象 ids の bar 高さが pointer.y で動的に
+  変わるため。 静的時の cost は visible_count 個の rect commands (~50-100、 GPU 数千 ns、 16ms 予算の
+  0.01% 未満)。 cached の note_hash 経由で velocity 変化が反映されるパスは廃止 (lane が cached の外に
+  なったため自動的に毎 frame 反映)。
+
+- **pending_click 修正 (副次的 latent bug fix)**: `pending_click` を `grid.contains(pos)` で gate 追加。
+  旧実装は vel_area / ruler / keyboard 等 grid 外の release でも `Vec::new()` selection clear を発行する
+  latent bug (vel_area click が selection を意図せず clear する症状) を解消。 grid 内の空白 release は
+  従来どおり selection clear (動作不変)。 既存 test `piano_roll_response_clears_selection_on_empty_click`
+  は grid 内 click なので影響なし。
+
+#### 受け入れ基準対応 (5/5 ✅)
+
+1. ✅ `velocity_lane_h > 0` のとき lane 内 drag → release で `NotesEditRequest::SetVelocity` 発行
+2. ✅ multi-select 状態で drag → 全 selected note の velocity が同じ絶対値に
+3. ✅ drag<3px の click は no-op
+4. ✅ lane 外 click は従来通り note grid 側の handler に流れる (Insert / dbl-click 等を壊さない)
+5. ✅ unit test: `velocity_lane_disabled_by_default` / `velocity_lane_skips_zero_velocity_bars` を維持
+   (cached 外に移動しても rect 数は不変)、 **新規 test +14 件**:
+   - pure helpers (6 件): `velocity_from_y_at_lane_top_returns_127` / `velocity_from_y_at_lane_bottom_returns_0`
+     / `velocity_from_y_clamps_above_lane_to_127` / `velocity_from_y_clamps_below_lane_to_0` /
+     `velocity_from_y_zero_height_is_defensive_zero` / `velocity_bar_hit_finds_note_at_start_beat` /
+     `velocity_bar_hit_misses_outside_tolerance` / `velocity_bar_hit_overlapping_returns_last`
+   - integration (8 件): `velocity_drag_emits_set_velocity_on_release` /
+     `velocity_drag_no_op_for_short_drag` / `velocity_drag_targets_all_selected_when_hit_in_selection` /
+     `velocity_drag_targets_only_hit_when_not_in_selection` / `velocity_drag_skips_when_lane_disabled` /
+     `velocity_drag_misses_empty_lane_area_no_selection_change` / `velocity_drag_response_dragging_flag` /
+     `velocity_drag_excludes_unchanged_velocities`
+
+#### daw_01 follow-up (caller 側必須対応)
+
+`NotesEditRequest` に variant 追加なので **既存 caller の `match req { ... }` は exhaustive match
+失敗 → compile error で漏れ検出される** (compile error が guide してくれる、 untyped fallthrough の罠なし)。
+具体的に必要な変更は 2 点:
+
+1. **`make_edit` の SetVelocity arm 追加**: `daw_gui` の piano_roll dispatch closure に下記 arm を追加。
+   piano_roll example の参考実装 (`crates/examples/piano_roll/src/main.rs`):
+
+   ```rust
+   // dispatch closure 直前に snapshot capture
+   let velocity_snapshot: Vec<(NoteId, u8)> =
+       m.notes.iter().map(|n| (n.id, n.velocity)).collect();
+
+   // match req { ... } に追加
+   NotesEditRequest::SetVelocity(updates) => {
+       // updates: Vec<VelocityUpdate>。snapshot から prev velocity を引いて undo 復元用 tuple へ。
+       let with_prev: Vec<(NoteId, u8, u8)> = updates
+           .into_iter()
+           .map(|(id, next): VelocityUpdate| {
+               let prev = velocity_snapshot
+                   .iter()
+                   .find(|(nid, _)| *nid == id)
+                   .map_or(0_u8, |(_, v)| *v);
+               (id, prev, next)
+           })
+           .collect();
+       make_set_velocity_edit(with_prev)
+   }
+
+   // make_set_velocity_edit factory (snapshot_inverse で undo 対応)
+   fn make_set_velocity_edit(deltas: Vec<(NoteId, u8, u8)>) -> Edit<DawModel> {
+       let label = if deltas.len() == 1 { "set velocity" } else { "set velocities" };
+       Edit::snapshot_inverse(
+           label,
+           deltas,
+           |m, snap| { for (id, _prev, next) in snap {
+               if let Some(n) = m.notes.iter_mut().find(|x| x.id == *id) { n.velocity = *next; }
+           }},
+           |m, snap| { for (id, prev, _next) in snap {
+               if let Some(n) = m.notes.iter_mut().find(|x| x.id == *id) { n.velocity = *prev; }
+           }},
+       )
+   }
+   ```
+
+2. **`PianoRollView.velocity_lane_h: 60.0` 等で lane 表示を有効化**: 現状 daw_01 が
+   `velocity_lane_h: 0.0` ならまずは表示有効化が必要。 piano_roll example でも同じく `60.0` に変更
+   して visual demo を有効化済。
+
+`Note.velocity` schema は不変 (既存 `u8` 0..=127 を使う)。 song save/load 既存ロジックも無修正で動く。
+
+#### scope 外 (将来 issue 候補)
+
+- Shift modifier で multi-select の **相対 delta mode** (Live 流、 v2)。 anchor_velocities を delta
+  計算に使うだけなので実装は軽いが、 modifier UX を v2 で議論したい。
+- middle-click で default velocity = 100 reset (Live 流): pointer event に middle button 経路を生やす
+  必要あり (platform crate の AppEvent / PointerFrame 拡張)。
+- velocity drag 中の cursor 形状 (`NsResize`): 軽い polish、 v2 候補。
+- velocity bar 上 hover で bar ハイライト (preview 強調): 視覚 feedback 強化、 v2 候補。
+- drag preview alpha 強調 (drag 中の bar が通常 bar と区別しやすいよう alpha 上げ): 視覚 feedback 強化、 v2 候補。
+
+#### 確認状況
+
+- ✅ `cargo build --workspace` clean
+- ✅ `cargo clippy --workspace --tests -- -D warnings` clean
+- ✅ `cargo test --workspace` 全 ✅ (piano_roll +14 / 全 392 件)
+- 🔲 piano_roll example での user 目視確認 (drag → SetVelocity 発行 / multi-select / drag<3px no-op /
+   lane 余白 click で selection 不変)
+- 🔲 daw_01 daw_gui での caller 側更新 + user 目視確認
+
+main 反映は user judgement (worktree branch `claude/compassionate-torvalds-084fdf` を直接 merge or
+PR 経由)。 daw_01 側は path 依存ビルドなので main 反映後 `cargo build -p daw_gui` で compile error
+(SetVelocity arm 不足) が出るので、 上記 follow-up の 2 点を反映すれば動く。
+

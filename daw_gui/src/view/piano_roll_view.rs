@@ -157,6 +157,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     });
                 })
             }
+            NotesEditRequest::SetVelocity(updates) => {
+                // gui_01 #018 (M14 Phase 64): velocity lane 内 drag の release
+                // frame で 1 batch 発行される `Vec<(NoteId, u8)>`。 multi-select
+                // 中はすべての selected note が同じ絶対値、 単独 hit は単一
+                // note のみ含まれる。 drag<3px は widget 側で除外済。
+                let entries: Vec<(u32, u8)> = updates.into_iter().collect();
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetNoteVelocities(entries.clone()));
+                })
+            }
         }
     };
 
