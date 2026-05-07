@@ -441,3 +441,83 @@ fn arr_ctrl_drag_on_resize_handle_still_emits_resize() {
     assert!(m.last_clone_indep.is_none());
     assert!(m.last_resize.is_some(), "ResizeClips が発火すべき");
 }
+
+// ============================================================
+// #021: Ctrl+Shift+drag が rect select に化けない (= SelectClips を emit しない)
+// ============================================================
+
+/// Ctrl+Shift+drag は **clip_drag セッションのみ** 起動し、 rect select セッションを
+/// 同時起動してはいけない。 起動してしまうと release 時に `SelectClips` が `CloneClipsIndependent`
+/// の後から push され、 daw_01 側 model で「clone 後 selection 上書き」 = 「rect select に
+/// 化けて clone が起きていない」 ように見える symptom が出る。
+///
+/// 検証は (a) `last_clone_indep` が Some (b) `last_select` が None の両方。
+/// drag 経路に **vertical 14px** を入れて drag rect h>0 にしている (h=0 だと rects_intersect が
+/// 弾いて、 たとえ rect select が活きていても SelectClips が発火しない偶然の test pass を起こすため)。
+#[test]
+fn arr_ctrl_shift_drag_does_not_trigger_rect_select() {
+    let mut host: UiHost<ArrModel> = UiHost::no_redraw();
+    let mut m = arr_model();
+    let cs = modifiers_csa(true, true, false);
+
+    let mut input = FrameInput::default();
+    input.pointer = pointer_press(ARR_CLIP_CENTER_PX.0, ARR_CLIP_CENTER_PX.1, cs);
+    arr_frame(&mut host, &mut m, input, SNAP_16);
+    // continuation で h>0 になるよう vertical も移動 (drag rect が clip rect と intersect する状況)。
+    let mut input = FrameInput::default();
+    input.pointer = pointer_hold(380.0, 24.0, cs);
+    arr_frame(&mut host, &mut m, input, SNAP_16);
+    let mut input = FrameInput::default();
+    input.pointer = pointer_hold(ARR_DRAG_END_PX.0, 30.0, cs);
+    arr_frame(&mut host, &mut m, input, SNAP_16);
+    let mut input = FrameInput::default();
+    input.pointer = pointer_release(ARR_DRAG_END_PX.0, 30.0, cs);
+    arr_frame(&mut host, &mut m, input, SNAP_16);
+
+    assert!(
+        m.last_clone_indep.is_some(),
+        "Ctrl+Shift+drag → CloneClipsIndependent が emit されるべき"
+    );
+    assert!(
+        m.last_select.is_none(),
+        "Ctrl+Shift+drag は rect select に化けず SelectClips を emit してはいけない (#021)"
+    );
+}
+
+/// **Shift-only** drag (Ctrl なし) は引き続き rect select として動作し、 clip 範囲交差で
+/// `SelectClips` を emit する (#021 fix の回帰防止: ctrl 除外条件が shift-only を
+/// 巻き添えで殺していないことを確認)。
+#[test]
+fn arr_shift_only_drag_still_triggers_rect_select() {
+    let mut host: UiHost<ArrModel> = UiHost::no_redraw();
+    let mut m = arr_model();
+    let shift = modifiers_csa(false, true, false);
+
+    // clip rect = (256, 0, 128, 32)。 clip 左の空白 (40, 8) から press → clip 中央を巻き込む
+    // (300, 24) まで drag。 drag rect = (40, 8, 260, 16)、 clip rect と intersect する。
+    // press は clip 上ではない (x=40 は clip 左端 256 より左) ので clip_hit が None、
+    // 結果 clip_drag セッションは起動せず rect_select 経路のみが通る。
+    let mut input = FrameInput::default();
+    input.pointer = pointer_press(40.0, 8.0, shift);
+    arr_frame(&mut host, &mut m, input, SNAP_16);
+    let mut input = FrameInput::default();
+    input.pointer = pointer_hold(200.0, 16.0, shift);
+    arr_frame(&mut host, &mut m, input, SNAP_16);
+    let mut input = FrameInput::default();
+    input.pointer = pointer_release(300.0, 24.0, shift);
+    arr_frame(&mut host, &mut m, input, SNAP_16);
+
+    assert!(
+        m.last_clone_indep.is_none(),
+        "Shift-only drag は CloneClipsIndependent を emit しない"
+    );
+    assert!(
+        m.last_clone_linked.is_none(),
+        "Shift-only drag は CloneClipsLinked を emit しない"
+    );
+    let sel = m.last_select.expect(
+        "Shift-only drag は rect select で SelectClips を emit する (#021 regression check)",
+    );
+    assert_eq!(sel.len(), 1, "drag rect 内の clip 1 つが selected に入る");
+    assert_eq!(sel[0].clip, 100);
+}
