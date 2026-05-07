@@ -1755,6 +1755,16 @@ impl AppData {
         if self.is_dragging {
             return;
         }
+        // PR6: project_dir も送る (audio engine は AudioSourcePath::
+        // ProjectRelative を解決するために必要、 §9.2)。 send_audio は
+        // 順序保証付きの IPC なので SetProjectDir → LoadSong の順で
+        // 送れば audio side の LoadSong handler 内で project_dir が
+        // 既に最新になっている。
+        let project_dir: Option<PathBuf> = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.parent().map(Path::to_path_buf));
+        self.send_audio(MainToChild::SetProjectDir(project_dir));
         let song = self.song.clone();
         self.send_audio(MainToChild::LoadSong(song));
     }
@@ -2323,6 +2333,20 @@ impl AppData {
                 tracing::info!(path = %path.display(), "saved project");
                 self.is_dirty = false;
                 self.push_recent(path.to_path_buf());
+                // PR6: Save の中で audio_sources の path が
+                // `Absolute(import_cache)` → `ProjectRelative(samples/)`
+                // に書き換わり、 さらに project_dir も新たに確定した。
+                // 両方を audio engine へ再送して
+                // `AudioClipRenderer` を rebuild させる (順序保証付き
+                // IPC なので SetProjectDir → LoadSong)。 file_path は
+                // 呼び出し側 `save_after_states` が確定するが、
+                // path.parent() を直接使えば Save 時点の project_dir
+                // を正しく送れる。
+                let project_dir: Option<PathBuf> =
+                    path.parent().map(Path::to_path_buf);
+                self.send_audio(MainToChild::SetProjectDir(project_dir));
+                let song = self.song.clone();
+                self.send_audio(MainToChild::LoadSong(song));
                 true
             }
             Err(e) => {

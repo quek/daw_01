@@ -155,6 +155,9 @@ fn render_loop(
         let vocal_store_g = engine_shared.vocal_store.load();
         let worker_syncs_g = engine_shared.worker_syncs.load();
         let pool_g = engine_shared.worker_pool.load();
+        let audio_renderer_g = engine_shared.audio_clip_renderer.load();
+        let audio_renderer: &crate::audio_clip_renderer::AudioClipRenderer =
+            &audio_renderer_g;
 
         if let Some(pool) = pool_g.as_deref() {
             pool.dispatch_and_wait(
@@ -163,6 +166,7 @@ fn render_loop(
                 &plugin_refs_g,
                 &slot_map_g,
                 &vocal_store_g,
+                audio_renderer,
                 &worker_syncs_g,
                 &mut master_l[..frames],
                 &mut master_r[..frames],
@@ -192,6 +196,7 @@ fn render_loop(
                     &plugin_refs_g,
                     &slot_map_g,
                     vocal,
+                    Some(audio_renderer),
                     worker_sync,
                     sample_rate,
                     playhead,

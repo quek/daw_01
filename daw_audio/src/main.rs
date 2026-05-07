@@ -131,6 +131,23 @@ async fn recv_loop(
                 shared.looping.store(b, Ordering::Release);
             }
             Ok(MainToChild::LoadSong(song)) => {
+                // PR6: AudioClipRenderer を再 build (WAV decode + event
+                // schedule flatten)。 LoadSong は IPC 受信スレッドから
+                // 呼ばれるので decode はここで synchronous (Phase 2 で
+                // background 化、 docs/plan_audio_clip.md §11)。
+                let project_dir_g = engine_shared.project_dir.load();
+                let project_dir: Option<std::path::PathBuf> =
+                    project_dir_g.as_ref().map(|arc| (**arc).clone());
+                let generated_g = engine_shared.generated_audio_store.load();
+                let renderer = audio_clip_renderer::compile_audio_schedule(
+                    &song,
+                    project_dir.as_deref(),
+                    session_sample_rate,
+                    &generated_g,
+                );
+                engine_shared
+                    .audio_clip_renderer
+                    .store(Arc::new(renderer));
                 shared.song.store(Some(Arc::new(song)));
             }
             Ok(MainToChild::SetMasterGain(g)) => {

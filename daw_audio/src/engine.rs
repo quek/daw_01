@@ -523,6 +523,9 @@ impl LocalState {
             let vocal_store_g = self.shared.vocal_store.load();
             let worker_syncs_g = self.shared.worker_syncs.load();
             let pool_g = self.shared.worker_pool.load();
+            // PR6: audio clip renderer snapshot for this buffer.
+            let audio_renderer_g = self.shared.audio_clip_renderer.load();
+            let audio_renderer: &AudioClipRenderer = &audio_renderer_g;
 
             // Fan the per-track work out across the audio worker pool
             // when one is bound; otherwise fall back to serial dispatch
@@ -534,6 +537,7 @@ impl LocalState {
                     &plugin_refs_g,
                     &slot_map_g,
                     &vocal_store_g,
+                    audio_renderer,
                     &worker_syncs_g,
                     &mut self.master_l[..n],
                     &mut self.master_r[..n],
@@ -564,6 +568,7 @@ impl LocalState {
                         &plugin_refs_g,
                         &slot_map_g,
                         vocal,
+                        Some(audio_renderer),
                         worker_sync,
                         sample_rate,
                         playhead,
@@ -638,6 +643,8 @@ impl LocalState {
                         ?slot_keys,
                         n_workers = worker_syncs_g.len(),
                         worker_pool = pool_g.is_some(),
+                        audio_clip_n_events = audio_renderer.schedule.len(),
+                        audio_clip_n_sources = audio_renderer.sources.len(),
                         "engine heartbeat"
                     );
                 }
@@ -711,6 +718,7 @@ pub fn process_track_owned(
     plugin_refs: &HashMap<u32, PluginRef>,
     slot_to_plugin_id: &HashMap<(u32, PluginSlot), u32>,
     vocal: Option<&Arc<ArcSwapOption<VocalAudio>>>,
+    audio_renderer: Option<&AudioClipRenderer>,
     worker_sync: Option<&WorkerSyncRef>,
     sample_rate: u32,
     playhead: u64,
@@ -875,6 +883,23 @@ pub fn process_track_owned(
                 scratch.track_r[..n].copy_from_slice(&pd.buffer_out[1][..n]);
             }
         }
+    }
+
+    // ---- Phase 1 PR6: audio clip events ----
+    // Bitwig Hybrid Track 流: audio clip 出力は instrument 出力に
+    // **加算** されてから fx chain を通る (`docs/plan_audio_clip.md`
+    // §13 Q6 / §6.1)。 1 track 内で MIDI clip と Audio clip が混在
+    // しても、 audio events は instrument を bypass して effect chain
+    // の入口でそのまま合流する。
+    if let Some(renderer) = audio_renderer {
+        crate::audio_clip_renderer::render_audio_events(
+            renderer,
+            track_idx as usize,
+            &mut scratch.track_l[..n],
+            &mut scratch.track_r[..n],
+            playhead,
+            frames,
+        );
     }
 
     // ---- PR4.5 sidechain plugin-internal alignment ------------------

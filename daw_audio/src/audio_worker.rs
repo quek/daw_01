@@ -56,6 +56,10 @@ pub struct DispatchShared {
     pub plugin_refs_ptr: AtomicPtr<HashMap<u32, PluginRef>>,
     pub slot_map_ptr: AtomicPtr<HashMap<(u32, PluginSlot), u32>>,
     pub vocal_store_ptr: AtomicPtr<HashMap<u32, Arc<ArcSwapOption<VocalAudio>>>>,
+    /// PR6: per-buffer audio clip render snapshot. `null` ⇒ workers
+    /// pass `None` to `process_track_owned` (= 旧挙動互換、 audio
+    /// clip mix を skip)。
+    pub audio_renderer_ptr: AtomicPtr<crate::audio_clip_renderer::AudioClipRenderer>,
     pub worker_syncs_base: AtomicPtr<WorkerSyncRef>,
     pub n_worker_syncs: AtomicU32,
     pub master_l_base: AtomicPtr<f32>,
@@ -89,6 +93,7 @@ impl DispatchShared {
             plugin_refs_ptr: AtomicPtr::new(std::ptr::null_mut()),
             slot_map_ptr: AtomicPtr::new(std::ptr::null_mut()),
             vocal_store_ptr: AtomicPtr::new(std::ptr::null_mut()),
+            audio_renderer_ptr: AtomicPtr::new(std::ptr::null_mut()),
             worker_syncs_base: AtomicPtr::new(std::ptr::null_mut()),
             n_worker_syncs: AtomicU32::new(0),
             master_l_base: AtomicPtr::new(std::ptr::null_mut()),
@@ -172,6 +177,7 @@ impl AudioWorkerPool {
         plugin_refs: &HashMap<u32, PluginRef>,
         slot_map: &HashMap<(u32, PluginSlot), u32>,
         vocal_store: &HashMap<u32, Arc<ArcSwapOption<VocalAudio>>>,
+        audio_renderer: &crate::audio_clip_renderer::AudioClipRenderer,
         worker_syncs: &[WorkerSyncRef],
         master_l: &mut [f32],
         master_r: &mut [f32],
@@ -204,6 +210,10 @@ impl AudioWorkerPool {
             .store(slot_map as *const _ as *mut _, Ordering::Release);
         self.shared.vocal_store_ptr.store(
             vocal_store as *const _ as *mut _,
+            Ordering::Release,
+        );
+        self.shared.audio_renderer_ptr.store(
+            audio_renderer as *const _ as *mut _,
             Ordering::Release,
         );
         self.shared.worker_syncs_base.store(
@@ -337,6 +347,7 @@ fn run_work_loop(shared: &DispatchShared) {
     let plugin_refs_ptr = shared.plugin_refs_ptr.load(Ordering::Acquire);
     let slot_map_ptr = shared.slot_map_ptr.load(Ordering::Acquire);
     let vocal_store_ptr = shared.vocal_store_ptr.load(Ordering::Acquire);
+    let audio_renderer_ptr = shared.audio_renderer_ptr.load(Ordering::Acquire);
     let worker_syncs_base = shared.worker_syncs_base.load(Ordering::Acquire);
     let n_worker_syncs = shared.n_worker_syncs.load(Ordering::Acquire);
     let sample_rate = shared.sample_rate.load(Ordering::Acquire);
@@ -369,6 +380,15 @@ fn run_work_loop(shared: &DispatchShared) {
     let plugin_refs = unsafe { &*plugin_refs_ptr };
     let slot_map = unsafe { &*slot_map_ptr };
     let vocal_store = unsafe { &*vocal_store_ptr };
+    // PR6: audio_renderer_ptr が null のときは render を skip (= None)。
+    let audio_renderer: Option<&crate::audio_clip_renderer::AudioClipRenderer> =
+        if audio_renderer_ptr.is_null() {
+            None
+        } else {
+            // SAFETY: master holds the AudioClipRenderer (Guard or
+            // ArcSwap snapshot) alive for the dispatch window.
+            Some(unsafe { &*audio_renderer_ptr })
+        };
     let worker_syncs = unsafe {
         std::slice::from_raw_parts(worker_syncs_base, n_worker_syncs as usize)
     };
@@ -415,6 +435,7 @@ fn run_work_loop(shared: &DispatchShared) {
             plugin_refs,
             slot_map,
             vocal,
+            audio_renderer,
             worker_sync,
             sample_rate,
             playhead,
