@@ -103,15 +103,16 @@ daw_audio の CPAL コールバックで 1 往復（RT スレッドが wait す�
 | オーディオ I/O | cpal 0.15 (WASAPI 共有モード、F32) | ✅ |
 | Control plane IPC | tokio named pipe + bincode 2 | ✅ |
 | Data plane IPC | shared_memory 0.12 + windows crate (名前付きセマフォ) | ✅ |
-| CLAP ホスト | clap-sys 0.5 + libloading 0.8 | ✅ |
-| VST3 (M2) | vst3-sys (候補) | 未着手 |
-| VOICEVOX 通信 | reqwest (async HTTP) | 未着手 |
+| CLAP ホスト | clap-sys 0.5 + libloading 0.8 | ✅ scan / load / activate / process / GUI embed / sidechain / PDC |
+| VST3 ホスト | vst3-sys 0.1 + libloading 0.8 | ✅ scan / load / activate / process / GUI embed / sidechain / PDC |
+| VOICEVOX 通信 | reqwest (async HTTP) | ✅ engine 自動起動 + sing/talk + WAV cache |
 | JSON シリアライズ | serde + serde_json (プロジェクトファイル) | ✅ |
 | バイナリシリアライズ | bincode 2 (IPC) | ✅ |
 | Async runtime | tokio (sync / rt-multi-thread / net / macros / io-util / process) | ✅ |
 | 文字幅計算 | unicode-width 0.2 (CJK lyric セル padding) | ✅ |
 | Lock-free 共有 | arc-swap 1 (Song を audio thread へ wait-free 配布) | ✅ |
-| MIDI (将来) | midir / midly / wmidi | 未着手 |
+| MIDI 入力 | midir 0.10 | ✅ step input |
+| MIDI 出力 / 録音 / export | — | 未着手 (M2) |
 | ファイルダイアログ | rfd 0.15 | ✅ |
 
 ## データモデル
@@ -508,38 +509,82 @@ plain mutable struct。reactive wrapper (Signal/Memo) は使わない:
 
 ## マイルストーン
 
-### M1: 使える DAW
+### M1: 使える DAW (完了)
+
+#### 基盤 (3 プロセス + IPC)
 
 - [x] 3 プロセス起動 + IPC ハンドシェイク
 - [x] Job Object によるプロセス寿命管理
 - [x] Named pipe + bincode の制御プレーン (Play / Stop / Session / LoadSong)
 - [x] Shared memory + セマフォのデータプレーン
 - [x] Audio Engine: CPAL (WASAPI) 経由でオーディオ出力
+- [x] track-parallel スレッドプール + MMCSS / `thread_check` / `assert_no_alloc` (A2)
+
+#### GUI / 編集
+
 - [x] GUI: gui_01 (daw-ui) で 5 パネルレイアウト (transport / inspector / arrangement / bottom panel / status)
-- [x] Arrangement トラッカーグリッド描画（HackGen フォント、CJK 幅合わせ）
+- [x] Arrangement (Bitwig 風 Clip タイムライン)
+- [x] ピアノロール (gui_01 widget、 velocity lane、 snap toolbar、 auto-fit zoom、 smart note length)
 - [x] hjkl ナビゲーション + ノート編集
-- [x] CLAP: Plugin Host で instrument プラグイン scan / load / activate / process
-- [x] Song データ駆動の再生（Track 0 / Clip 0、モノフォニック）
-- [x] プロジェクト保存・読込 (`.daw` JSON アトミック書き込み)
-- [x] プラグイン選択 GUI (Track Inspector, ホットスワップ対応)
-- [x] ループ再生 (`P` キー / Transport ボタン、clip 範囲をシームレス wrap)
-- [x] CLAP プラグイン GUI エディタ (embedded, Win32 host-owned container)
-- [x] マスターフェーダー + L/R ピークメーター (Transport 右端)
-- [x] 再生位置ハイライト (Tracker View)
-- [ ] オートセーブ + 起動時復元プロンプト
-- [ ] VOICEVOX: 歌詞入力 → sing 合成 → WAV キャッシュ → 再生
-- [ ] WAV 書き出し
-- [ ] velocity / lyric / FX 列の編集
+- [x] velocity / lyric / FX 編集 (lyric は piano_roll inline 編集)
+- [x] ノートのコピー/ペースト + 量子化
+- [x] 任意トラック削除 + 並び替え (▲▼✕ ボタン)
+- [x] Undo / Redo (Ctrl+Z / Ctrl+Shift+Z、 plugin instance 同期込み)
+- [x] BPM / time_sig 変更 UI (A6)
+- [x] Track Inspector (cursor_track 連動、 ホットスワップ、 Sidechain dropdown)
+- [x] Master fader + L/R peak meter
+- [x] ループ再生 (`P` キー、 clip 範囲を wrap)
+- [x] 再生位置ハイライト
 
-### M2 以降
+#### Plugin Host
 
-- [ ] VST3 対応
-- [ ] ピアノロール
-- [ ] ミキサー GUI
-- [ ] オートメーション
-- [ ] MIDI 入出力
-- [ ] Linux 対応
-- [ ] プラグイン GUI 埋め込み
+- [x] CLAP: scan / load / activate / process / GUI embed (Win32 host-owned)
+- [x] VST3: scan / load / activate / process / GUI embed (`IPlugView` + `IPlugFrame::resizeView`)
+- [x] Plugin GUI lifecycle (Open / Close / Resize 通知 IPC)
+- [x] PDC (Plugin Delay Compensation、 自動全補償、 CLAP / VST3 両対応)
+- [x] サイドチェイン routing (track → 任意 plugin の aux input port、 実 VST3 (MCompressor) で integration test)
+- [x] パラアウト routing (plugin の aux output port → 任意 track / group / Master)
+- [x] グループトラック (Reaper folder 流、 ネスト無制限、 group fx)
+- [x] plugin worker pool UAF 対策 (`DispatchCounter` + `WorkerPool::quiesce`)
+- [x] plugin load 失敗通知 (`SlotPluginLoadFailed`、 A8、 88bf3dc)
+
+#### Song 永続化
+
+- [x] プロジェクト保存・読込 (`.daw` JSON アトミック書き込み、 v5)
+- [x] オートセーブ + 起動時復元 modal (A4、 sidecar / recovery_dir 両対応)
+- [x] WAV 書き出し (A3、 freewheel offline render + `clap_plugin_render` ext)
+
+#### VOICEVOX
+
+- [x] HTTP client + engine 自動起動 + Job Object 紐付け (A1 Phase A)
+- [x] per-track speaker 選択 UI + `/singers` fetch (A1 Phase B)
+- [x] WAV cache (A1 Phase C)
+- [x] 拗音結合 (`split_into_morae`、 A1 Phase D)
+- [x] piano_roll inline 歌詞編集 (`L` キー、 A5)
+
+#### MIDI
+
+- [x] MIDI step input (midir)
+
+### M2 候補 (未着手)
+
+#### オートメーション + 表現力
+
+- [ ] パラメータオートメーション (lane 表示 + plugin パラメータ送信)
+- [ ] tempo / time_sig オートメーション
+- [ ] CLAP `clap_event_transport_t` / VST3 `processContext` で transport / tempo を plugin に通知
+- [ ] VST3 `IMidiMapping` (MIDI controller → plugin パラメータ)
+- [ ] VST3 `IComponent::setIoMode(kOfflineProcessing)` (export 高品質モード)
+
+#### 録音
+
+- [ ] オーディオ録音 + オーディオクリップ
+- [ ] MIDI 録音 + export
+- [ ] メトロノーム / count-in
+
+#### 移植
+
+- [ ] Linux 対応 (CPAL ALSA、 X11 / Wayland window、 CLAP `gtk` embed)
 
 ## 参照
 

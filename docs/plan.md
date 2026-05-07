@@ -12,45 +12,58 @@
 
 ## 大方針
 
-**Phase 1-5 (UI を gui_01 widget で再構築) は完了**。次は **DESIGN.md の M1 (= 「VOICEVOX 歌唱 + Clip ベース DAW」) を実用ラインに乗せる** ことが最大目標。
+**Phase 1-5 (UI を gui_01 widget で再構築) と Phase 6 (M1 完成) はすべて完了**。
+M1 で着手予定だった VST3 / sidechain / PDC / グループトラック / Undo/Redo / plugin
+GUI embed もすべて実装済。 次は **M2 = DAW としての表現力** (オートメーション /
+録音 / メトロノーム / Linux 対応) を進める。
 
 これまでに達成済みの土台:
 - 3 プロセス分離 + IPC (named pipe + shared memory)
-- CLAP plugin scan / load / activate / process / GUI embed
-- gui_01 widget による全 view 構築 (`push_rect` / `push_text` / `push_lines` 0 件)
-- arrangement / piano_roll widget (M13 Phase 55 で小節番号 ruler + time_sig 対応 grid)
-- master fader / peak meter / loop / hover-cursor / track rename / chain reorder
+- CLAP / VST3 統一 plugin host (scan / load / activate / process / GUI embed / sidechain / PDC)
+- track-parallel スレッドプール + MMCSS + RT 違反検出 (A2)
+- gui_01 widget による全 view 構築 (arrangement / piano_roll / mixer / inspector / transport)
+- VOICEVOX 統合 (engine 自動起動 + per-track speaker + WAV cache + 拗音結合)
+- WAV export (freewheel offline render)
+- autosave + 起動時 recovery modal
+- Undo/Redo (plugin instance reconcile + state snapshot 同期)
+- plugin load 失敗通知 (`SlotPluginLoadFailed`、 A8)
 
-不足は M1 残 6 項目 (Phase 6 で潰す)。
+## Phase 6: M1 完成 (完了)
 
-## Phase 6: M1 完成
-
-DESIGN.md M1 残項目を 6 タスクに分解。`docs/plan_<feature>.md` への切り出しは着手時に判断 (本ファイルでは概要のみ)。
-
-### 着手順マップ
+DESIGN.md M1 残項目を Axx タスクに分解 + 派生で routing_graph / Undo/Redo plugin
+sync chain を実装。 着手順マップ (実態):
 
 ```
-A2 (完了 ✓) ─→ A3 WAV export (完了 ✓) ─→ A7 plugin load 同期 (完了 ✓) ─┬─→ A1 VOICEVOX ─→ M1 完成
-                                                                         │
-A6 tempo/timesig (完了 ✓)
-A4 autosave     (完了 ✓)
-A5 lyric UI     (← 次タスク、 gui_01 #015 は解決済、 A1 の前提)
+A2 audio engine        ─┐
+A3 WAV export          ─┤
+A6 tempo/timesig       ─┼─→ A4 autosave ─┬─→ A5 lyric UI ─→ A1 VOICEVOX ─┐
+A7 plugin load 同期    ─┘                │                                 ├─→ M1 完成
+                                          ↓                                 │
+                              routing_graph PR1-4 (group / PDC / sidechain / paraout)
+                              + plugin_host stability (UAF / crash fix)
+                              + Undo/Redo plugin sync chain
+                              + A8 plugin load 失敗通知                    ─┘
 ```
+
+各タスクの詳細は `docs/plan_<feature>.md` を参照:
+- [plan_a1_voicevox.md](plan_a1_voicevox.md) (A1)
+- [plan_a2_audio_engine.md](plan_a2_audio_engine.md) (A2)
+- [plan_a3_wav_export.md](plan_a3_wav_export.md) (A3)
+- [plan_a4_autosave_recovery.md](plan_a4_autosave_recovery.md) (A4)
+- [plan_a6_tempo_timesig.md](plan_a6_tempo_timesig.md) (A6)
+- [plan_a7_plugin_load_sync.md](plan_a7_plugin_load_sync.md) (A7)
+- [plan_a8_plugin_load_failure.md](plan_a8_plugin_load_failure.md) (A8)
+- [plan_routing_graph.md](plan_routing_graph.md) (group / PDC / sidechain / paraout)
+- [plan_group_track.md](plan_group_track.md) (routing_graph PR2 詳細)
+- [plan_piano_roll_widget_rewrite.md](plan_piano_roll_widget_rewrite.md)
+- [plan_smart_note_length.md](plan_smart_note_length.md)
 
 ### 既知の残 bug
 
-(現時点で blocking なものは無し。 transport の text_input は numpad Enter と main Enter 両方対応済。 MSoundFactory の GUI 黒画面 + 無音は VST3 bus enumeration / setBusArrangements 改善 + 詳細ログ追加で解消、 再現性なし。)
+無し (blocking なし)。 MSoundFactory の GUI 黒画面 + 無音は VST3 bus enumeration /
+setBusArrangements 改善で解消、 再現性なし。
 
-優先順序の根拠:
-- **A2 完了**: track-parallel スレッドプール + MMCSS / thread_check / assert_no_alloc 稼働
-- **A3 完了**: freewheel offline render + CLAP render ext で WAV export 復旧 (5 PR + smoke fix、 plan_a3_wav_export.md 参照)
-- **A7 完了**: plugin ロード race condition の同期化 (plan_a7_plugin_load_sync.md 参照)
-- **A6 完了**: transport に BPM / time_sig 編集 UI を追加 (plan_a6_tempo_timesig.md 参照)
-- **A4 完了**: autosave + crash recovery + 起動時復元 modal (plan_a4_autosave_recovery.md 参照)
-- **A1 大半完了** (Phase A/B/C/D): VOICEVOX engine 自動起動 + per-track speaker UI + WAV cache + 拗音結合 (plan_a1_voicevox.md 参照)。 残: 歌唱 quality check のみ
-- **A5 完了**: piano_roll の L キー歌詞編集 + 一括モーラ分配 (gui_01 #017、 M14 Phase 59) 完成、 daw_01 側で AppEvent::SetNoteLyrics + handler + L キー bind を wire。 旧 lyric_panel は冗長になり削除
-- **A5** は gui_01 改修先行 (#015)。reply 待ちの間 A1 の Engine / HTTP 周りを進める
-- **A1** は A5 完了後に本格実装
+### 完了タスクの要約
 
 ### A2: 責務分担正常化 + track-parallel スレッドプール化 [完了]
 
@@ -104,7 +117,10 @@ A5 lyric UI     (← 次タスク、 gui_01 #015 は解決済、 A1 の前提)
 - multi-instance での同時 recovery 衝突対策 (uuid v4 で衝突確率は実用上ゼロ)
 - conflict 解決 UI (sidecar と元 file の自動 diff / merge)
 
-### A5: piano_roll note 歌詞編集 UI [優先度 4 — gui_01 #015]
+### A5: piano_roll note 歌詞編集 UI [完了]
+
+詳細は本ファイル「### 完了タスクの要約」 と進捗ログ参照。 以下は元計画。
+
 
 **現状**: `Note { lyric: Option<String> }` schema あり、piano_roll widget の表示も M9 Phase 44c で済 (歌詞文字を note 上にレイアウト)。**入力 UI が無い**。
 
@@ -123,7 +139,10 @@ A5 lyric UI     (← 次タスク、 gui_01 #015 は解決済、 A1 の前提)
 - 入力した歌詞が JSON プロジェクトファイルに保存される
 - IME 入力で CJK が正しく入る (commit 時のみ反映、preedit は表示)
 
-### A1: VOICEVOX 統合 [優先度 5 — 本丸]
+### A1: VOICEVOX 統合 [完了]
+
+詳細は [plan_a1_voicevox.md](plan_a1_voicevox.md) と進捗ログ参照。 以下は元計画。
+
 
 **現状**: `daw_audio/voicevox.rs` プレースホルダ ([common/src/model.rs](common/src/model.rs) の `InstrumentSource::Vocal` schema は完備)。
 
@@ -216,19 +235,65 @@ A5 lyric UI     (← 次タスク、 gui_01 #015 は解決済、 A1 の前提)
 
 着手時 `docs/plan_a3_wav_export.md` を切り出し推奨 (engine の resource 共有化が大規模変更のため)。
 
-## Phase 7 以降 (M2 へのつながり、現時点では着手しない)
+## Phase 7: M2 = DAW としての表現力 (未着手)
 
-メモリと DESIGN.md より、M2 候補:
-- VST3 対応
-- オートメーション
-- send / return バス、グループ track
-- オーディオ録音 + オーディオクリップ
-- MIDI 録音 / export
-- メトロノーム / count-in
-- アンドゥ / リドゥ統合 (gui_01 `HistoryStack` の wire-up 確認)
-- Linux 対応
+M1 で土台 (3 プロセス + IPC + CLAP/VST3 host + sidechain/PDC + Undo/Redo + VOICEVOX
++ WAV export + autosave) が揃ったので、 M2 は **再生できる DAW から制作できる
+DAW へ** のステップ。
 
-各々に着手するときに本ファイルへ Phase 7 以降を追加する。
+### B1: オートメーション + transport 通知
+
+最大の機能追加。 plugin パラメータの時間変化を扱う。
+
+- パラメータオートメーション (lane 表示 + clip 同期 + plugin への送信)
+- tempo / time_sig オートメーション
+- CLAP `clap_event_param_value` / `clap_event_transport_t` で plugin に通知
+- VST3 `IAudioProcessor::ProcessData::processContext` で transport / tempo を送る
+- VST3 `IMidiMapping` (MIDI controller → plugin パラメータ)
+- VST3 `IComponent::setIoMode(kOfflineProcessing)` (export 高品質モード切替、
+  現状 `set_render_mode` no-op)
+
+着手時 `docs/plan_b1_automation.md` を切り出し。
+
+### B2: オーディオ録音
+
+- CPAL input stream (WASAPI 共有モード)
+- オーディオクリップ (.wav 直挿し) + arrangement 表示
+- 録音 → クリップ書き込み → ディスクに `.daw` と並んで save
+
+### B3: メトロノーム / count-in
+
+B2 録音の前提 (録音時のテンポ guide)。 既存 sequencer に乗せる軽量実装。
+
+- 内蔵 click 音 (短い square wave)
+- count-in 1 / 2 小節 オプション
+- transport bar に on/off ボタン
+
+### B4: MIDI 録音 / export
+
+- MIDI input から note を arrangement の MIDI clip に録音
+- `.mid` 形式 (midly) で export
+
+### B5: Linux 対応
+
+- CPAL ALSA backend
+- X11 / Wayland window (winit が対応済)
+- CLAP Linux GUI embed (`gtk` API、 現状 Win32 専用)
+- VST3 Linux GUI embed (`X11EmbedWindow`、 同様)
+- Job Object 相当 (Linux は prctl `PR_SET_PDEATHSIG`)
+
+### Undo/Redo plugin sync の残リスク (B/D/E)
+
+A8 で A (load 失敗 → pending stuck) は解消したが、 reconcile 経由で残るリスク:
+
+- **B** 連続 deferred edit の race: `pending_state_request.is_some()` 即時 fallback
+  で 2 番目以降の knob 値が Undo で復元されない (`app.rs:2225,2699,3684`)
+- **D** Test カバレッジ不足: 4dc982c (slot-level diff) の integration test なし
+- **E** 多段 Undo パフォーマンス未検証: `after_undo_redo` で reconcile が毎 step
+  走る (機能正しさは OK、 連続 load/unload のコスト未測定)
+
+着手時 `docs/plan_undo_reconcile_polish.md` を切り出し。 規模が小さいので B5
+着手前のクッションタスクとしても可。
 
 ## 進捗ログ
 
@@ -271,4 +336,18 @@ A5 lyric UI     (← 次タスク、 gui_01 #015 は解決済、 A1 の前提)
 | 2026-05-05 | 77cc7c5 | A6 完了 | transport bar に BPM / time_sig 編集 UI: text_input + dropdown、 commit で song 更新 + LoadSong 再送 + Undo/Redo 対応。 numpad Enter 不対応は gui_01 #016 で対応依頼 |
 | 2026-05-05 | 4211315 | gui_01 #015 解決 | gui_01 M14 Phase 56 (button_at_clicked + take_*_in_rect の modal 透過抑制) を取り込み、 plugin_picker.rs の ✕ ボタンを button_at_clicked + close_modal に置換。 ✕ click / wheel scroll / Esc / outside click 全 expected。 plan.md 既知 bug クリア |
 | 2026-05-05 | 9648aba | gui_01 #016 解決 | gui_01 M14 Phase 57 (PhysicalKey::NumpadEnter 追加 + text_input commit 拡張) を取り込み + daw_gui/src/view/runner.rs::map_phys_key にも NumpadEnter マッピング追加 (gui_01 winit_backend と二重実装の都合)。 BPM 入力欄でテンキー Enter による commit を実機確認 |
-| 2026-05-05 | (this commit) | A4 完了 | autosave 拡充 (file_path None でも recovery_dir に save) + 起動時 recovery_modal + 「復元 / 破棄 / 閉じる」 + 正常終了時 cleanup + Open 時 sidecar 検出。 真の kill (PowerShell Stop-Process -Force) 後の file 残存 + 再起動 modal 表示まで実機確認 |
+| 2026-05-05 | (A4 commit) | A4 完了 | autosave 拡充 (file_path None でも recovery_dir に save) + 起動時 recovery_modal + 「復元 / 破棄 / 閉じる」 + 正常終了時 cleanup + Open 時 sidecar 検出。 真の kill (PowerShell Stop-Process -Force) 後の file 残存 + 再起動 modal 表示まで実機確認 |
+| 2026-05-05 | 6df6f55 ... e23ecd7 | A1 完了 | VOICEVOX 統合 Phase A/B/C/D 全完了: engine 自動起動 + JobObject + per-track speaker dropdown + /singers fetch + WAV cache + split_into_morae (拗音結合) |
+| 2026-05-05 | 5311564 | A5 完了 | piano_roll L キー歌詞編集 wire (gui_01 #017 取り込み) + 旧 lyric_panel 削除 |
+| 2026-05-06 | f3d35e1 / ef8588c / 70ff180 / 4992d38 | piano_roll polish | ノートのコピペ + 量子化、 velocity lane、 任意トラック削除/並び替え、 Undo/Redo (Ctrl+Z) を Song snapshot で実装 |
+| 2026-05-06 | 52cab33 | piano_roll widget | piano_roll_view を gui_01 Ui::piano_roll widget で書き換え |
+| 2026-05-06 | 6e4e558 / a359f7b / 85b705d | piano_roll snap | snap toolbar (Bars / Straight) + auto-fit zoom + smart note length + AHE 自律改善ループ稼働 |
+| 2026-05-06 | d454bd6 | routing_graph 基盤 | 共通 schedule + group track (Reaper folder 流) + nest 無制限 + gui_01 #016 追従 |
+| 2026-05-06 | 9b44d2a | PR2.1 | plugin_host を track_id ベース化 + GUI lifecycle 修正 (delete/ungroup race 対策) |
+| 2026-05-06 | 9816b15 / af63880 / 4828d27 | PR3 PDC 完成 | graph layer に PDC 補償 + JS scripting + headless mode + 実 VST3 (MCenter) integration test + plugin auto-latency IPC (CLAP + VST3) |
+| 2026-05-06 | 134cc9f / e8c0b3d / b37354d / 19870b0 / e94dd7e | PR4 sidechain | compile_schedule に sidechain edge + ProcessData::buffer_aux_in + engine SidechainTap + plugin_host で aux input を CLAP/VST3 process() に渡す + PDC × sidechain integration |
+| 2026-05-06 | a4c8d51 / 9fa9810 / 1d58167 / 8fc09d2 / 6bb8a98 | PR4.5 follow-up | track_inspector に Sidechain section + plugin-internal main vs aux alignment + ensure_ids() の sidechain 参照 dangle 修正 + reload で sidechain_sources 保持 + duplicate SetSlotPlugin で SlotPluginLoaded 再 emit |
+| 2026-05-06 | d049060 / 9ee2dca | plugin_host 安定化 | VST3/CLAP の `_library` を struct 末尾に移動 (Drop 順序 crash fix) + DispatchCounter + WorkerPool::quiesce で plugin Drop を audio worker と同期 (UAF fix) |
+| 2026-05-07 | 22d7a9e / 5a9df06 / 4dc982c | Undo/Redo plugin sync | track-level reconcile (削除 → Undo で plugin 再 load) + Undo snapshot 直前に最新 state を Song に書き戻し (knob 値復元) + slot 粒度の reconcile (同 track 内 plugin 追加/削除/切替を同期) |
+| 2026-05-07 | 88bf3dc | A8 完了 | plugin load 失敗通知 (`SlotPluginLoadFailed`) を新設、 plugin_host 2 失敗 path で emit (orphan cleanup 含む)、 daw_gui で pending 解放 + queue Play flush + status 表示。 integration test 2 件 |
+| 2026-05-07 | (this commit) | M1 達成 | DESIGN.md M1 マイルストーンの全項目完了。 plan.md / DESIGN.md を実態に追従更新 (VST3 GUI embed / sidechain / PDC / グループトラック / Undo/Redo を M1 に取り込み、 M2 候補を細分化) |
