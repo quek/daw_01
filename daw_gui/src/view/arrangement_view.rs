@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use daw_ui_core::{
     ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack,
-    ArrangementView, ClipKey, Edit, ToggleButtonStyle, Ui,
+    ArrangementView, ChannelLayout, ClipKey, Edit, SampleSlices, ToggleButtonStyle, Ui,
+    WaveformRenderMode, WaveformSource, WaveformStyle, WaveformView,
 };
 use daw_ui_renderer::{Color, Rect};
 
@@ -183,6 +184,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // refcount==1 の clip では `MakeClipUnique` handler が「すでに独立 clip」
     // status_message を出すだけなので、 context menu はすべての clip に
     // 同形で出す (条件分岐で項目を省くと UX が分かりにくい)。
+    //
+    // Phase 1 PR4: audio clip の波形描画も同 loop で重ね描き。
+    // Ui::arrangement が描いた clip rect の上に `Ui::waveform` を配置し、
+    // ContentId が `ClipContent::Audio` の場合だけ rect 内に波形を表示する。
+    // gui_01 #023 で drop position が取れるようになったらここに resolve
+    // ロジックも追加する (PR4 範囲外)。
     for (clip_key, rect) in &resp.clip_rects {
         let key = *clip_key;
         ui.context_menu_for(*rect, &["Make Unique"], move |idx, ui| {
@@ -195,6 +202,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 }
             }));
         });
+        draw_audio_clip_waveform(app, ui, *clip_key, *rect);
     }
 
     // track header の右クリックメニュー (Rename / Delete) を widget 外で重ねる。
@@ -592,4 +600,100 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
             app.handle_event(AppEvent::FitArrangeToContent);
         })
     });
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 PR4: audio clip 内の波形描画 (`Ui::waveform` を clip rect に重ねる)
+// ---------------------------------------------------------------------------
+
+/// 1 つの audio clip rect 内に波形を描く。 ContentId が `ClipContent::Audio`
+/// でなければ何もしない (= MIDI / Vocal clip は通常通り描画される)。
+///
+/// `Ui::arrangement` は clip rect (border + name) を既に描画しているので、
+/// その中に少し margin を取って `Ui::waveform` を呼ぶ。 PR4 段階では 1
+/// clip = 1 event を前提 (Audio Editor で複数 event を編集できるのは
+/// Phase 2 / PR8)。 source 参照が `audio_source_cache` に無い (=
+/// 起動直後でまだ decode されていない / missing source) clip は無音で表示
+/// される (波形なし)。
+fn draw_audio_clip_waveform(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    clip_key: ClipKey,
+    clip_rect: Rect,
+) {
+    let Some(t_idx) = app.song.tracks.iter().position(|t| t.id == clip_key.track) else {
+        return;
+    };
+    let Some(c_idx) = app.song.tracks[t_idx]
+        .clips
+        .iter()
+        .position(|c| c.id == clip_key.clip)
+    else {
+        return;
+    };
+    let clip = &app.song.tracks[t_idx].clips[c_idx];
+    let Some(content) = app.song.clip_contents.get(&clip.content_id) else {
+        return;
+    };
+    let Some(events) = content.audio_events() else {
+        return; // MIDI / Vocal clip は対象外
+    };
+    let Some(event) = events.first() else {
+        return; // 空の audio content (= 起こらないはずだが defensive)
+    };
+    let Some(buffer) = app.audio_source_cache.get(event.source_id) else {
+        return; // まだ decode されていない / missing source — silent display
+    };
+
+    // clip rect は widget が border + name 領域を含めて描画している。
+    // 波形は内側 padding を取って描く: 上部 14 px (= name)、 左右 2 px。
+    let inset_top: f32 = 14.0;
+    let inset_lr: f32 = 2.0;
+    let view_rect = Rect {
+        x: clip_rect.x + inset_lr,
+        y: clip_rect.y + inset_top,
+        w: (clip_rect.w - inset_lr * 2.0).max(0.0),
+        h: (clip_rect.h - inset_top - inset_lr).max(0.0),
+    };
+    if view_rect.w <= 0.0 || view_rect.h <= 0.0 {
+        return;
+    }
+
+    // SampleSlices::Planar 用に &[&[f32]] スライスを作る (毎フレーム
+    // alloc は許容、 RT path ではなく GUI 描画 path)。
+    let planes_borrowed: Vec<&[f32]> = buffer.samples.iter().map(Vec::as_slice).collect();
+
+    // event の切り出し範囲を viewport にする。 generation は source_id
+    // 単位で固定 (sample buffer は import 後に変わらない)。
+    let event_len_frames = event
+        .source_end_frames
+        .saturating_sub(event.source_start_frames);
+
+    let source = WaveformSource {
+        samples: SampleSlices::Planar(&planes_borrowed),
+        valid_len: buffer.frames as usize,
+        generation: event.source_id as u64,
+        sample_rate: buffer.sample_rate,
+    };
+    let view = WaveformView {
+        start_sample: event.source_start_frames,
+        len_samples: event_len_frames.max(1),
+        vertical_gain: 1.0,
+    };
+    let style = WaveformStyle {
+        fg: Color::rgba(0.55, 0.85, 0.95, 0.85),
+        fg_clipped: Color::rgb(0.95, 0.45, 0.40),
+        fill: None,
+        baseline: Some(Color::rgba(1.0, 1.0, 1.0, 0.10)),
+        channel_layout: ChannelLayout::Overlay,
+        render_mode: WaveformRenderMode::Auto,
+        line_width_px: 1.0,
+    };
+    let _ = ui.waveform(
+        ("audio_clip_wf", clip_key.track, clip_key.clip),
+        view_rect,
+        source,
+        view,
+        style,
+    );
 }
