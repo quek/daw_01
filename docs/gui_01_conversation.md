@@ -1653,3 +1653,59 @@ pub fn arrangement(
 - multi-track 同時 drag 中の visual preview (現状は 1 行分だけ半透明複製、 multi の場合複数行は表示しない)
 
 ---
+
+## #017 [Open] 2026-05-07 [バグ報告] `Ui::piano_roll` の白鍵/黒鍵レーンの濃淡が鍵盤と逆転している
+
+### daw_01 →
+- 種別: [バグ報告]
+- 関連ファイル: `crates/ui/src/widgets/piano_roll.rs:280-284` (`PianoRollStyle::default()`)、`crates/ui/src/widgets/piano_roll.rs:1502-1522` (黒鍵 row 帯描画)
+
+#### 症状
+
+ピアノロール本体 (グリッド) 側で **白鍵レーンの方が黒鍵レーンより濃く (暗く)** 描画されており、左の鍵盤 (白鍵 = 明、黒鍵 = 暗) と濃淡が逆転している。daw_01 ユーザーから「鍵盤とノートレーンの塗つぶしがずれている」と報告。
+
+#### 原因
+
+`PianoRollStyle::default()` の色設定:
+
+```rust
+bg: Color::rgb(0.12, 0.13, 0.16),                       // ノートレーン bg (暗い)
+black_row_overlay: Color::rgba(1.0, 1.0, 1.0, 0.04),    // 白の overlay → 黒鍵レーンを「明るく」する
+```
+
+src-over 合成すると黒鍵レーンの最終色は `(0.155, 0.165, 0.194)` で bg `(0.12, 0.13, 0.16)` よりわずかに **明るい**。一方:
+
+```rust
+white_key: Color::rgb(0.92, 0.93, 0.95),  // 鍵盤の白鍵 (明るい)
+black_key: Color::rgb(0.10, 0.11, 0.13),  // 鍵盤の黒鍵 (暗い)
+```
+
+なので、鍵盤側 (白鍵 = 明、黒鍵 = 暗) と グリッド側 (白鍵レーン = 暗、黒鍵レーン = 明) で大小関係が反転する。
+
+#### 期待挙動
+
+Ableton Live / Reaper / Cubase / FL Studio など主流 DAW の慣習に合わせ、**黒鍵レーンを白鍵レーンより暗く** する。鍵盤と濃淡を一致させる。
+
+#### 想定修正
+
+`PianoRollStyle::default()` で:
+- `bg` をやや明るくして「白鍵レーン色」とする
+- `black_row_overlay` を黒系の半透明にして「黒鍵レーンを暗くする」
+
+例 (差分 0.03〜0.05 で視認性確保):
+
+```rust
+bg: Color::rgb(0.18, 0.19, 0.22),                       // 白鍵レーン (明)
+black_row_overlay: Color::rgba(0.0, 0.0, 0.0, 0.25),    // 黒鍵レーンを暗くする
+```
+
+合成結果: 黒鍵レーン ≈ `(0.135, 0.143, 0.165)` < 白鍵レーン `(0.18, 0.19, 0.22)` で、鍵盤 (白鍵 0.92 > 黒鍵 0.10) と整合。
+
+具体値は gui_01 example (`crates/examples/piano_roll`) と他 widget の bg トーンを見て調整してください。
+
+### gui_01 →
+（gui_01 Claude が記入）
+
+---
+
+---
