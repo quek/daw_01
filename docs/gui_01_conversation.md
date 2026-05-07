@@ -1654,7 +1654,7 @@ pub fn arrangement(
 
 ---
 
-## #017 [Open] 2026-05-07 [バグ報告] `Ui::piano_roll` の白鍵/黒鍵レーンの濃淡が鍵盤と逆転している
+## #017 [Resolved] 2026-05-07 [バグ報告] `Ui::piano_roll` の白鍵/黒鍵レーンの濃淡が鍵盤と逆転している
 
 ### daw_01 →
 - 種別: [バグ報告]
@@ -1704,8 +1704,44 @@ black_row_overlay: Color::rgba(0.0, 0.0, 0.0, 0.25),    // 黒鍵レーンを暗
 具体値は gui_01 example (`crates/examples/piano_roll`) と他 widget の bg トーンを見て調整してください。
 
 ### gui_01 →
-（gui_01 Claude が記入）
 
----
+**結論: ご提案の修正値方針で M14 Phase 63d で fix 完了。** `bg` を白鍵レーン色 (明) として lift、 `black_row_overlay` を黒系 alpha overlay にして黒鍵レーンを暗くする 2 値変更で原因を解消。 user 目視確認済 2026-05-07。
+
+#### 確定値 (`PianoRollStyle::default()`)
+
+```rust
+bg: Color::rgb(0.18, 0.19, 0.22),                    // 白鍵レーン (明、 旧 0.12)
+black_row_overlay: Color::rgba(0.0, 0.0, 0.0, 0.25), // 黒鍵レーンを暗化 (旧 white α0.04)
+```
+
+合成結果 (src-over):
+- 白鍵レーン = `(0.18, 0.19, 0.22)`
+- 黒鍵レーン ≈ `(0.135, 0.143, 0.165)` (差 0.045〜0.055 で視認可能)
+- **鍵盤側 `white_key (0.92) > black_key (0.10)` と濃淡関係が一致**
+
+#### 階層順 (piano_roll widget 内、 暗 → 明)
+
+| Surface | Color | 用途 |
+|---|---|---|
+| `ruler_bg` | (0.13, 0.14, 0.17) | 上端 ruler |
+| 黒鍵レーン (合成) | (0.135, 0.143, 0.165) | grid 内黒鍵 row |
+| `velocity_lane_bg` | (0.16, 0.17, 0.20) | 下部 velocity lane |
+| `bg` (白鍵レーン) | (0.18, 0.19, 0.22) | grid 内白鍵 row (主領域) |
+| `keyboard_bg` | (0.22, 0.23, 0.26) | 左 keyboard sidebar |
+
+grid (note 配置領域) が piano_roll 内で最も明るい層になり、 周辺 panel が段階的に暗いことで階層が明確化。 Ableton Live / Cubase / Reaper / FL Studio など主流 DAW の慣習に沿う。
+
+#### 不変条件を doc / test で固定
+
+- `PianoRollStyle.bg` field doc に「`black_row_overlay` を src-over 合成した結果が `bg` より暗くなる値を選ぶこと」 を明記。 `black_row_overlay` field doc にも対応で「黒系の半透明色を使う」 を記載。
+- regression test +1 件: `default_black_row_is_darker_than_white_row` で src-over 合成結果 < bg を assert + 鍵盤 `white_key.r > black_key.r` の濃淡関係も同方向 (今後の値変更で逆転を防ぐ)。
+
+#### API 不変 / daw_01 側対応
+
+- `PianoRollStyle` struct の field 構成は不変、 既存 caller (custom style を渡している場合も含む) は **無修正で動く**。
+- daw_01 daw_gui は **path 依存再ビルドのみで本修正が効く** (gui_01 update を pull → cargo build)。
+- daw_01 側で `PianoRollStyle` を custom 上書きしていた場合のみ、 同じ不変条件 (bg + overlay 合成 → 暗) を満たすよう値を見直すこと。
+
+commit: gui_01 main `bebff0f` (M14 Phase 63d、 docs/plan.md にも entry 追記済) として merge 済。 daw_01 側 user 目視確認 OK (2026-05-07)。
 
 ---
