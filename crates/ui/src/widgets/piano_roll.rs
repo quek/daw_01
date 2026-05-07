@@ -89,6 +89,10 @@ pub type MoveDelta = (NoteId, f64, u8, f64, u8);
 /// ResizeRight (右端 drag) は prev_start == next_start、ResizeLeft (左端 drag) は両方変わる。
 pub type ResizeDelta = (NoteId, f64, f64, f64, f64);
 
+/// (M14 Phase 64 / daw_01 #018) velocity lane drag の commit タプル: `(id, new_velocity)`。
+/// 絶対値 (0..=127 clamp 済)、prev は持たない (`Move` / `Resize` の delta と異なり差分計算不要)。
+pub type VelocityUpdate = (NoteId, u8);
+
 /// note drag の種別 (hit-test 結果)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoteDragKind {
@@ -170,12 +174,19 @@ pub enum NotesEditRequest {
     /// 1 つの undo にまとめる)。`lyric == None` で歌詞削除 (空文字列 commit は widget 内で
     /// `None` に正規化済)。`Vec` の順序は分配順 (start_beat asc → 同 beat なら pitch desc)。
     SetLyrics(Vec<(NoteId, Option<String>)>),
+    /// (M14 Phase 64 / daw_01 #018) velocity lane 内 drag による velocity 更新。
+    /// release frame で 1 batch 発行 (Move / Resize と同じ pattern)。
+    /// 単一 note でも `Vec` で渡し、 multi-select 時は drag 起点の note 含む selected 全 note が
+    /// 同じ絶対値に set される (Live / Cubase 流の絶対値 mode)。値は `0..=127` clamp 済。
+    /// drag<3px の release は no-op (Edit 発行されない、誤操作防止)。
+    SetVelocity(Vec<VelocityUpdate>),
 }
 
 /// `Ui::piano_roll` の戻り値。app 側で connection / hover state の表示に使う。
 ///
 /// `Vec<Edit<M>>` は載せない (widget が `ui.push_edit` で内部発行する、fader と同パターン)。
 #[derive(Clone, Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PianoRollResponse {
     /// pointer が grid 内にあるか (keyboard 領域は除く)。
     pub hovered: bool,
@@ -200,6 +211,9 @@ pub struct PianoRollResponse {
     /// (M14 Phase 59 / daw_01 #017) 直近 commit frame で「note 数より入力モーラが多くて
     /// 捨てた数」。0 なら通常、`>0` なら daw_01 で status bar / toast 表示等に使える。
     pub lyric_overflow_morae: usize,
+    /// (M14 Phase 64 / daw_01 #018) velocity lane 内 drag が active か (HUD / status bar 表示用)。
+    /// `true` のとき drag preview が velocity lane に出ており、release で `SetVelocity` 発行 (drag<3px は no-op)。
+    pub velocity_dragging: bool,
 }
 
 /// velocity → fill Color の関数。`fn` pointer (closure 不可、Style: Copy 維持のため)。
@@ -568,6 +582,69 @@ struct NoteDragSession {
     last_alt: bool,
 }
 
+/// (M14 Phase 64 / daw_01 #018) velocity lane 内 drag session。
+///
+/// note drag (Move/Resize) と独立: vel_area での press → release で完結する別状態。
+/// 同 frame に両方は active にならない (pointer は press 時に grid か vel_area のどちらか)。
+///
+/// **絶対値 mode**: pointer.y を毎 frame `0..=127` に直接 map (Live / Cubase 流)。 anchor velocity
+/// は短 click 判定 (drag<3px) と「変化なし note を Edit から除外」 用に保持。 spec 上 prev は
+/// 持たないので `SetVelocity` は new value のみ伝える。
+#[derive(Clone, Debug)]
+struct VelocityDragSession {
+    /// 影響範囲 ids: drag 起点で hit した note が selected に含まれるなら selected 全部、
+    /// 含まれなければ単一 hit の id のみ。 起動時に固定し、drag 中の selected 変化には追従しない
+    /// (= "drag 開始時点の意図" を保持)。 順序は selected の順 (overlay の id-list 共有用)。
+    target_ids: Vec<NoteId>,
+    /// drag 開始時の各 target の velocity (短 click 判定 + 「変化なし note 除外」 用)。
+    anchor_velocities: Vec<(NoteId, u8)>,
+    /// drag 開始時のマウス位置 (screen px)。 短 click 判定の基準。
+    anchor_mouse: (f32, f32),
+    /// drag 中の最終 pointer 位置 (note_drag と同パターン: winit release frame の pos 巻き戻し対策)。
+    last_mouse: (f32, f32),
+}
+
+/// (M14 Phase 64 / daw_01 #018) `pointer.y` から絶対 velocity (0..=127) を計算。
+///
+/// `vel_area.y` (lane top) = 127、 `vel_area.y + vel_area.h` (lane bottom) = 0 として
+/// 線形 map。 範囲外は clamp (lane の上を超えて drag したら 127、 下を超えたら 0)。
+/// `vel_area.h <= 0` (= disabled) なら 0 を返す (defensive)。
+fn velocity_from_y(py: f32, vel_area: Rect) -> u8 {
+    if vel_area.h <= 0.0 {
+        return 0;
+    }
+    let t = (1.0 - (py - vel_area.y) / vel_area.h).clamp(0.0, 1.0);
+    (t * 127.0).round() as u8
+}
+
+/// (M14 Phase 64 / daw_01 #018) velocity lane 内の hit-test。
+///
+/// `cx` 位置にある note の velocity bar に hit するかを判定。 各 note の bar 中央 x は
+/// `vel_area.x + (n.start_beat - view.start_beat) * beat_to_px`。 hit zone は **bar 中央から
+/// 左右 ± `(velocity_bar_width_px / 2 + tolerance)` px**。 後勝ち (visible 順で前面)。
+///
+/// `cy` が `vel_area` 内かは caller 側で判定済み前提 (この関数は x 方向のみ判定)。
+/// 戻り値 `None` は「この cx に bar 無し」 (lane 余白のクリック)。
+fn velocity_bar_hit(
+    visible: &[Note],
+    view: PianoRollView,
+    vel_area: Rect,
+    cx: f32,
+    bar_width: f32,
+    tolerance: f32,
+) -> Option<NoteId> {
+    let beat_to_px = f64::from(vel_area.w) / view.len_beats.max(1e-6);
+    let half_w = bar_width * 0.5 + tolerance;
+    let mut hit: Option<NoteId> = None;
+    for n in visible {
+        let nx = vel_area.x + ((n.start_beat - view.start_beat) * beat_to_px) as f32;
+        if (cx - nx).abs() <= half_w {
+            hit = Some(n.id);
+        }
+    }
+    hit
+}
+
 /// 絶対位置 snap で計算した note drag の beat delta (overlay と release commit で共有)。
 /// anchor 0 の編集対象端 (Move=start / ResizeRight=end / ResizeLeft=start) の絶対位置を
 /// snap → その差分を全 anchor に適用 (相対関係維持 + anchor 0 が grid に着地)。 anchors が
@@ -634,6 +711,9 @@ pub(crate) struct PianoRollState {
     /// 編集対象 note が消失したら defensive で `None`。`Some(_)` のとき drag/resize/wheel/click
     /// は全て短絡 (typing_focus が立つので global shortcut も自動抑制)。
     lyric_editing: Option<NoteId>,
+    /// (M14 Phase 64 / daw_01 #018) velocity lane 内 drag session。
+    /// vel_area での press → release で完結。 note_drag と同時には active にならない。
+    velocity_drag: Option<VelocityDragSession>,
 }
 
 // ============================================================
@@ -862,6 +942,54 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
+        // ----- velocity lane press 振り分け (M14 Phase 64 / daw_01 #018) -----
+        // vel_h > 0 のとき vel_area 内 press でかつ velocity bar 上なら velocity_drag 開始。
+        // bar 上でなければ何もしない (= lane 余白 click は no-op で selection も変えない)。
+        // editing_mode / Shift 押下中 / note_drag 既に active のときは skip (排他)。
+        let just_pressed_in_vel_lane = !editing_mode
+            && pointer.primary_just_pressed
+            && !pointer.modifiers.shift
+            && vel_h > 0.0
+            && pointer.pos.is_some_and(|(px, py)| vel_area.contains(px, py));
+        if just_pressed_in_vel_lane
+            && self.widget_state::<PianoRollState>(wid).note_drag.is_none()
+            && let Some((px, py)) = pointer.pos
+            && let Some(hit_id) = velocity_bar_hit(
+                visible,
+                view,
+                vel_area,
+                px,
+                style.velocity_bar_width_px,
+                4.0,
+            )
+        {
+            let target_ids: Vec<NoteId> = if selected.contains(&hit_id) {
+                selected.to_vec()
+            } else {
+                vec![hit_id]
+            };
+            let anchor_velocities: Vec<(NoteId, u8)> = target_ids
+                .iter()
+                .filter_map(|id_target| {
+                    notes
+                        .iter()
+                        .find(|n| n.id == *id_target)
+                        .map(|n| (n.id, n.velocity))
+                })
+                .collect();
+            if !anchor_velocities.is_empty() {
+                let final_targets: Vec<NoteId> =
+                    anchor_velocities.iter().map(|(id, _)| *id).collect();
+                let state: &mut PianoRollState = self.widget_state(wid);
+                state.velocity_drag = Some(VelocityDragSession {
+                    target_ids: final_targets,
+                    anchor_velocities,
+                    anchor_mouse: (px, py),
+                    last_mouse: (px, py),
+                });
+            }
+        }
+
         // ----- drag continue (描画用 delta を計算) + release 検出 -----
         // 拍は f64、pixel は f32 なので変換を 1 箇所で吸収。
         let beat_per_px: f64 = view.len_beats / f64::from(grid.w.max(1.0));
@@ -887,16 +1015,37 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     nd.last_mouse = (px, py);
                 }
             }
+            // velocity_drag 側も同様に last_mouse update (note_drag と同じ winit release frame
+            // pos 巻き戻し対策)。 alt は velocity drag の挙動に影響しない (絶対値 mode 固定)。
+            // continuation frame は常に update、 release frame は pointer.pos が anchor と異なる
+            // ときのみ update (winit が release frame で pointer.pos を press 位置に巻き戻す bug 対策)。
+            if let Some(ref mut vd) = state.velocity_drag
+                && (!pointer.primary_just_released || (px, py) != vd.anchor_mouse)
+            {
+                vd.last_mouse = (px, py);
+            }
         }
         let drag_session: Option<NoteDragSession> = {
             let state: &mut PianoRollState = self.widget_state(wid);
             state.note_drag.clone()
+        };
+        let velocity_drag_session: Option<VelocityDragSession> = {
+            let state: &mut PianoRollState = self.widget_state(wid);
+            state.velocity_drag.clone()
         };
         // drag release で取り出すが、drag 距離が 16px 未満なら **click に格下げ** する
         // (= 短い「press → release」は note 中央上の click として selection 切替に振り向ける)。
         let drag_release_raw: Option<NoteDragSession> = if pointer.primary_just_released {
             let state: &mut PianoRollState = self.widget_state(wid);
             state.note_drag.take()
+        } else {
+            None
+        };
+        // (M14 Phase 64 / daw_01 #018) velocity_drag release: drag<3px は「click 単発 = no-op」
+        // として扱い SetVelocity 発行しない。 後段の commit ブロックで dist 判定 + Edit 発行。
+        let velocity_drag_release: Option<VelocityDragSession> = if pointer.primary_just_released {
+            let state: &mut PianoRollState = self.widget_state(wid);
+            state.velocity_drag.take()
         } else {
             None
         };
@@ -961,6 +1110,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             response.hovered_zone = Some(hover_kind);
         }
         response.dragging = drag_session.as_ref().map(|nd| nd.kind);
+        response.velocity_dragging = velocity_drag_session.is_some();
 
         // hover 中の cursor 形状要求 (drag 中は drag kind、note hover (拡張範囲含む) は
         // hover_cursor、その他 widget 内は Default に明示 reset で stale cursor を防ぐ)。
@@ -987,13 +1137,22 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // 2 通り: (a) drag が起こらなかった pure release、(b) drag は始まったが <16px で
         // click に格下げされた release。どちらも grid 上の click として selection 切替の
         // trigger に使う。M14 Phase 59: editing_mode 中は click を発火しない。
-        let pending_click: Option<(f32, f32)> = if editing_mode || drag_release.is_some() {
+        // (M14 Phase 64 / daw_01 #018) velocity_drag_release 中も click 扱いしない (drag<3px no-op
+        // でも selection を変えない / 通常 release は SetVelocity 発行で完結)。
+        // (M14 Phase 64) vel_area / ruler / keyboard 等 grid 外の release は selection に影響させない
+        // = `grid.contains(pos)` で gate (旧: 無条件 release で grid 外なら selection clear する
+        // latent bug を修正)。 grid 内の空白 release は従来どおり selection clear。
+        let pending_click: Option<(f32, f32)> = if editing_mode
+            || drag_release.is_some()
+            || velocity_drag_release.is_some()
+        {
             None
         } else if let Some(p) = drag_short_click_pos {
             Some(p)
         } else if pointer.primary_just_released
             && !pointer.modifiers.shift
             && let Some((px, py)) = pointer.pos
+            && grid.contains(px, py)
         {
             Some((px, py))
         } else {
@@ -1071,6 +1230,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         } else {
             0.05
         };
+        // (M14 Phase 64 / daw_01 #018) velocity drag preview: drag 中なら target_ids の bar を
+        // current pointer.y → 絶対 velocity の値で描画 override。 None のときは note.velocity 通常描画。
+        // velocity_drag は press 時に vel_area.h > 0 を gate してあるため vel_area.h > 0 が前提。
+        let velocity_drag_overlay: Option<(Vec<NoteId>, u8)> =
+            velocity_drag_session.as_ref().map(|vd| {
+                let new_vel = velocity_from_y(vd.last_mouse.1, vel_area);
+                (vd.target_ids.clone(), new_vel)
+            });
 
         self.heavy(("piano_roll_inner", &id), move |hctx| {
             // === cached(): viewport_key 一致時に skip される背景レイヤ ===
@@ -1100,13 +1267,23 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     style_copy.note_fill_fn,
                     style_copy.note_border_radius_px,
                 );
-                // M9 Phase 45c: velocity lane (vel_h > 0 のとき内蔵描画)
-                if vel_h > 0.0 {
-                    draw_velocity_lane(hctx, &visible_owned, view_copy, vel_area, &style_copy);
-                }
             });
 
-            // === cached の外: 動的 overlay (selection / drag preview / lyric / cursor / playhead) ===
+            // === cached の外: 動的 overlay (selection / velocity lane / drag preview / lyric / cursor / playhead) ===
+            // (M14 Phase 64 / daw_01 #018) velocity lane は cached の外に移動。 drag preview の
+            // override velocity を毎 frame 反映するため (drag 中はバー高さが pointer.y で変わる)。
+            // 静的時は visible 数 ≤ ~100 なので毎 frame 描画でも負荷は軽微 (rect command ~100 個)、
+            // model 更新時の cache 無効化を待たずに即時反映するメリットが上回る。
+            if vel_h > 0.0 {
+                draw_velocity_lane(
+                    hctx,
+                    &visible_owned,
+                    view_copy,
+                    vel_area,
+                    &style_copy,
+                    velocity_drag_overlay.as_ref().map(|(ids, v)| (ids.as_slice(), *v)),
+                );
+            }
             // selection overlay (note の上、lyric の下)
             if !selected_set.is_empty() {
                 draw_selection_overlay(
@@ -1321,6 +1498,29 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     if !deltas.is_empty() {
                         self.push_edit(make_edit(NotesEditRequest::Resize(deltas)));
                     }
+                }
+            }
+        }
+
+        // ----- velocity drag release → SetVelocity Edit 発行 (M14 Phase 64 / daw_01 #018) -----
+        // drag<3px は no-op (誤操作防止)。 release frame では last_mouse を真値とする
+        // (note_drag と同パターン: winit が release frame で pointer.pos を press 位置に巻き戻す対策)。
+        // 絶対値 mode: pointer.y から `velocity_from_y` で 0..=127 計算 → 全 target に同じ値を set。
+        // anchor velocity と一致する note は updates から除外 (no-op Edit を avoid)。
+        if let Some(vd) = velocity_drag_release {
+            let dx = vd.last_mouse.0 - vd.anchor_mouse.0;
+            let dy = vd.last_mouse.1 - vd.anchor_mouse.1;
+            let dist = dx.abs() + dy.abs();
+            if dist >= 3.0 {
+                let new_vel = velocity_from_y(vd.last_mouse.1, vel_area);
+                let mut updates: Vec<VelocityUpdate> = Vec::new();
+                for (id, anchor_vel) in &vd.anchor_velocities {
+                    if *anchor_vel != new_vel {
+                        updates.push((*id, new_vel));
+                    }
+                }
+                if !updates.is_empty() {
+                    self.push_edit(make_edit(NotesEditRequest::SetVelocity(updates)));
                 }
             }
         }
@@ -1734,15 +1934,20 @@ fn draw_drag_preview<M: ?Sized + 'static>(
     }
 }
 
-/// (M9 Phase 45c) velocity lane の描画。`vel_area` は keyboard を除いた grid と同じ x 範囲。
+/// (M9 Phase 45c / M14 Phase 64) velocity lane の描画。`vel_area` は keyboard を除いた grid と同じ x 範囲。
 /// 各 visible note の start_beat 位置に幅 `style.velocity_bar_width_px` の縦 bar を、
 /// `velocity / 127` の比率で高さを決めて bottom-aligned で描画する。
+///
+/// (M14 Phase 64 / daw_01 #018) `velocity_override` が `Some((ids, new_vel))` のとき、
+/// 含まれる id の note は `n.velocity` の代わりに `new_vel` で bar を描画する (drag preview)。
+/// drag 中はこの override が active になり、release で None に戻る (= cache 経由で実値が反映)。
 fn draw_velocity_lane<M: ?Sized + 'static>(
     hctx: &mut crate::widgets::heavy::HeavyCtx<'_, '_, M>,
     visible: &[Note],
     view: PianoRollView,
     vel_area: Rect,
     style: &PianoRollStyle,
+    velocity_override: Option<(&[NoteId], u8)>,
 ) {
     // 背景塗り
     hctx.push_rect(RectCommand {
@@ -1756,7 +1961,11 @@ fn draw_velocity_lane<M: ?Sized + 'static>(
     let beat_to_px = f64::from(vel_area.w) / view.len_beats.max(1e-6);
     let half_w = style.velocity_bar_width_px * 0.5;
     for n in visible {
-        let bar_h = vel_area.h * (f32::from(n.velocity) / 127.0);
+        let vel = match velocity_override {
+            Some((ids, ov)) if ids.contains(&n.id) => ov,
+            _ => n.velocity,
+        };
+        let bar_h = vel_area.h * (f32::from(vel) / 127.0);
         if bar_h <= 0.0 {
             continue;
         }
@@ -2134,6 +2343,8 @@ mod tests {
         last_set_lyrics: Option<Vec<(NoteId, Option<String>)>>,
         /// (M14 Phase 61d / daw_01 #012) 最後に Add request で渡された note の pitch。
         last_added_pitch: Option<u8>,
+        /// (M14 Phase 64 / daw_01 #018) 最後に発行された `SetVelocity` の内容。
+        last_set_velocity: Option<Vec<VelocityUpdate>>,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2144,6 +2355,7 @@ mod tests {
         Resize,
         Select,
         SetLyrics,
+        SetVelocity,
     }
 
     impl TestModel {
@@ -2156,6 +2368,7 @@ mod tests {
                 last_select_next: None,
                 last_set_lyrics: None,
                 last_added_pitch: None,
+                last_set_velocity: None,
             }
         }
     }
@@ -2203,6 +2416,19 @@ mod tests {
                             }
                         }
                         m.last_set_lyrics = Some(updates_clone.clone());
+                    })
+                }
+                NotesEditRequest::SetVelocity(updates) => {
+                    let updates_clone = updates.clone();
+                    Edit::mutate(move |m: &mut TestModel| {
+                        m.last_request = Some(RequestKind::SetVelocity);
+                        // 実際の Model 反映 (velocity を Note.velocity に書き戻す)
+                        for (id, vel) in &updates_clone {
+                            if let Some(n) = m.notes.iter_mut().find(|n| n.id == *id) {
+                                n.velocity = *vel;
+                            }
+                        }
+                        m.last_set_velocity = Some(updates_clone.clone());
                     })
                 }
             }
@@ -2801,6 +3027,539 @@ mod tests {
         // velocity lane: bg 1 + 2 bars = 3 個 rect 増 / playhead: 1 LineBatch 増
         assert_eq!(rects_both, rects_off + 3);
         assert_eq!(lines_both, lines_off + 1);
+    }
+
+    // ============================================================
+    // M14 Phase 64 / daw_01 #018: velocity lane drag 編集のテスト
+    // ============================================================
+    //
+    // test_view + Rect (0,0)-(800,400) + velocity_lane_h: 60.0 の geometry:
+    //   ruler_h=0, kbd_w=0, vel_h=60, main_h=340
+    //   vel_area = Rect { x: 0, y: 340, w: 800, h: 60 }
+    // velocity_from_y:
+    //   y=340 (lane top)    → 127
+    //   y=400 (lane bottom) → 0
+    //   y=370 (lane center) → 64
+    // bar x for note start_beat=B (view.start_beat=0, len_beats=4):
+    //   bx = 0 + (B - 0) * (800 / 4) = B * 200
+
+    /// `velocity_from_y` の境界 + clamp。
+    #[test]
+    fn velocity_from_y_at_lane_top_returns_127() {
+        let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
+        assert_eq!(velocity_from_y(340.0, area), 127);
+    }
+
+    #[test]
+    fn velocity_from_y_at_lane_bottom_returns_0() {
+        let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
+        assert_eq!(velocity_from_y(400.0, area), 0);
+    }
+
+    #[test]
+    fn velocity_from_y_clamps_above_lane_to_127() {
+        let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
+        assert_eq!(velocity_from_y(100.0, area), 127, "lane の上を超えても 127 で clamp");
+    }
+
+    #[test]
+    fn velocity_from_y_clamps_below_lane_to_0() {
+        let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
+        assert_eq!(velocity_from_y(500.0, area), 0, "lane の下を超えても 0 で clamp");
+    }
+
+    #[test]
+    fn velocity_from_y_zero_height_is_defensive_zero() {
+        let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 0.0 };
+        assert_eq!(velocity_from_y(340.0, area), 0);
+    }
+
+    /// `velocity_bar_hit` の hit / miss / tolerance。
+    #[test]
+    fn velocity_bar_hit_finds_note_at_start_beat() {
+        let view = test_view(); // start_beat=0, len_beats=4 → bar x = beat * 200
+        let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
+        let notes = vec![note(7, 1.0, 0.5, 60)]; // bar x = 200
+        // 中央は hit
+        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, 3.0, 4.0), Some(7));
+        // 中央 ±5.5px (= bar_width/2 + tolerance) は hit
+        assert_eq!(velocity_bar_hit(&notes, view, area, 195.0, 3.0, 4.0), Some(7));
+        assert_eq!(velocity_bar_hit(&notes, view, area, 205.0, 3.0, 4.0), Some(7));
+    }
+
+    #[test]
+    fn velocity_bar_hit_misses_outside_tolerance() {
+        let view = test_view();
+        let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
+        let notes = vec![note(7, 1.0, 0.5, 60)]; // bar x = 200
+        // hit zone は ±5.5px。 7 px 離れていれば miss。
+        assert_eq!(velocity_bar_hit(&notes, view, area, 207.0, 3.0, 4.0), None);
+        assert_eq!(velocity_bar_hit(&notes, view, area, 193.0, 3.0, 4.0), None);
+    }
+
+    #[test]
+    fn velocity_bar_hit_overlapping_returns_last() {
+        // 2 つの note が同 start_beat にあるとき、 後勝ち (visible 順 = note_hit と同 semantics)。
+        let view = test_view();
+        let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
+        let notes = vec![note(1, 1.0, 0.5, 60), note(2, 1.0, 0.5, 67)];
+        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, 3.0, 4.0), Some(2));
+    }
+
+    /// vel_area での press → drag → release で `SetVelocity` 発行。
+    #[test]
+    fn velocity_drag_emits_set_velocity_on_release() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![note(7, 1.0, 0.5, 60)]); // velocity 96
+        let mut view = test_view();
+        view.velocity_lane_h = 60.0;
+        let style = PianoRollStyle::default();
+
+        // Frame 1: press at bar x=200 (note 7 の start_beat=1.0), y=370 (lane center, vel ~64)
+        let input1 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 370.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel1 = model.selected.clone();
+        let notes_clone = model.notes.clone();
+        run_frame(&mut host, &mut model, input1, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone,
+                view,
+                &sel1,
+                &style,
+                dispatch,
+            );
+        });
+        assert_eq!(model.last_request, None, "drag 中は SetVelocity 発行せず");
+
+        // Frame 2: release at y=350 (vel ~106, drag dist = 20px > 3px → commit)
+        let input2 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 350.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel2 = model.selected.clone();
+        let notes_clone2 = model.notes.clone();
+        run_frame(&mut host, &mut model, input2, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone2,
+                view,
+                &sel2,
+                &style,
+                dispatch,
+            );
+        });
+        assert_eq!(
+            model.last_request,
+            Some(RequestKind::SetVelocity),
+            "release で SetVelocity 発行"
+        );
+        let updates = model.last_set_velocity.as_ref().expect("SetVelocity payload");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, 7, "note id = 7");
+        // velocity_from_y(350.0, vel_area) = (1 - (350-340)/60) * 127 = (1 - 0.1667) * 127 = 105.83 → 106
+        assert_eq!(updates[0].1, 106, "y=350 で絶対 velocity ~106");
+        assert_eq!(model.notes[0].velocity, 106, "Model 反映");
+    }
+
+    /// vel_area で drag<3px (= 単発 click 相当) → SetVelocity は発行されない (誤操作防止)。
+    #[test]
+    fn velocity_drag_no_op_for_short_drag() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![note(7, 1.0, 0.5, 60)]);
+        let mut view = test_view();
+        view.velocity_lane_h = 60.0;
+        let style = PianoRollStyle::default();
+
+        // press と release を 1 frame で同時 = drag 0px = 短 click
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 370.0)),
+                primary_just_pressed: true,
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel = model.selected.clone();
+        let notes_clone = model.notes.clone();
+        run_frame(&mut host, &mut model, input, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone,
+                view,
+                &sel,
+                &style,
+                dispatch,
+            );
+        });
+        assert_eq!(model.last_request, None, "drag<3px は SetVelocity 発行せず");
+        assert!(
+            model.last_set_velocity.is_none(),
+            "SetVelocity payload も発行されない"
+        );
+        assert_eq!(model.notes[0].velocity, 96, "velocity 不変 (anchor のまま)");
+    }
+
+    /// drag 起点 note が selected に含まれるとき、 全 selected が同じ velocity に。
+    #[test]
+    fn velocity_drag_targets_all_selected_when_hit_in_selection() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model =
+            TestModel::new(vec![note(1, 0.5, 0.5, 60), note(2, 1.0, 0.5, 60), note(3, 1.5, 0.5, 60)]);
+        model.selected = vec![1, 2, 3];
+        let mut view = test_view();
+        view.velocity_lane_h = 60.0;
+        let style = PianoRollStyle::default();
+
+        // press at note 2 の bar (x = 200)
+        let input1 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 370.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel1 = model.selected.clone();
+        let notes_clone = model.notes.clone();
+        run_frame(&mut host, &mut model, input1, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone,
+                view,
+                &sel1,
+                &style,
+                dispatch,
+            );
+        });
+
+        // release at y=340 (= velocity 127)
+        let input2 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 340.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel2 = model.selected.clone();
+        let notes_clone2 = model.notes.clone();
+        run_frame(&mut host, &mut model, input2, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone2,
+                view,
+                &sel2,
+                &style,
+                dispatch,
+            );
+        });
+        let updates = model.last_set_velocity.as_ref().expect("SetVelocity payload");
+        // 3 つ全て velocity 127 に
+        let mut ids: Vec<NoteId> = updates.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert!(updates.iter().all(|(_, v)| *v == 127));
+    }
+
+    /// drag 起点 note が selected に含まれないとき、 単一 hit のみ更新 (selection 不変)。
+    #[test]
+    fn velocity_drag_targets_only_hit_when_not_in_selection() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model =
+            TestModel::new(vec![note(1, 0.5, 0.5, 60), note(2, 1.0, 0.5, 60), note(3, 1.5, 0.5, 60)]);
+        model.selected = vec![1, 3]; // note 2 は含まれない
+        let mut view = test_view();
+        view.velocity_lane_h = 60.0;
+        let style = PianoRollStyle::default();
+
+        // press at note 2 の bar (x = 200)
+        let input1 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 370.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel1 = model.selected.clone();
+        let notes_clone = model.notes.clone();
+        run_frame(&mut host, &mut model, input1, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone,
+                view,
+                &sel1,
+                &style,
+                dispatch,
+            );
+        });
+
+        // release at y=340 (= velocity 127)
+        let input2 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 340.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel2 = model.selected.clone();
+        let notes_clone2 = model.notes.clone();
+        run_frame(&mut host, &mut model, input2, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone2,
+                view,
+                &sel2,
+                &style,
+                dispatch,
+            );
+        });
+        let updates = model.last_set_velocity.as_ref().expect("SetVelocity payload");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, 2, "primary hit (id 2) のみ更新");
+        assert_eq!(updates[0].1, 127);
+    }
+
+    /// vel_h = 0 なら velocity drag は起動しない (lane 自体無効)。
+    #[test]
+    fn velocity_drag_skips_when_lane_disabled() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![note(7, 1.0, 0.5, 60)]);
+        let view = test_view(); // velocity_lane_h: 0.0
+        let style = PianoRollStyle::default();
+
+        // press + release at vel_area 相当の y (vel_h=0 だと vel_area が無いので grid 内扱い)。
+        // x=200, y=370 だと grid 内 (grid h = 400)、 note 7 は pitch 60 (y ~ 200) なので空白 click。
+        // SetVelocity は発行されないことを確認 (note の velocity は note() helper の default 96 のまま)。
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 370.0)),
+                primary_just_pressed: true,
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel = model.selected.clone();
+        let notes_clone = model.notes.clone();
+        run_frame(&mut host, &mut model, input, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone,
+                view,
+                &sel,
+                &style,
+                dispatch,
+            );
+        });
+        assert!(
+            model.last_set_velocity.is_none(),
+            "vel_h=0 では velocity drag は起動しない"
+        );
+        assert_eq!(model.notes[0].velocity, 96, "velocity 不変 (note() helper の default)");
+    }
+
+    /// vel_area で bar が無い x position に press → velocity_drag は起動せず selection も変わらない。
+    #[test]
+    fn velocity_drag_misses_empty_lane_area_no_selection_change() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![note(7, 1.0, 0.5, 60)]);
+        model.selected = vec![7]; // 既存 selection あり
+        let mut view = test_view();
+        view.velocity_lane_h = 60.0;
+        let style = PianoRollStyle::default();
+
+        // x=400 は note 7 (bar x=200) から 200 px 離れていて hit zone 外 → bar 無し空白 click
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((400.0, 370.0)),
+                primary_just_pressed: true,
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel = model.selected.clone();
+        let notes_clone = model.notes.clone();
+        run_frame(&mut host, &mut model, input, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone,
+                view,
+                &sel,
+                &style,
+                dispatch,
+            );
+        });
+        assert!(
+            model.last_set_velocity.is_none(),
+            "bar 無しの空白 click では SetVelocity 発行されない"
+        );
+        // selection も維持される (vel_area click は pending_click 経由の selection clear に流れない)。
+        assert_eq!(model.selected, vec![7], "selection 不変");
+    }
+
+    /// velocity drag 中は `PianoRollResponse::velocity_dragging == true`。
+    #[test]
+    fn velocity_drag_response_dragging_flag() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![note(7, 1.0, 0.5, 60)]);
+        let mut view = test_view();
+        view.velocity_lane_h = 60.0;
+        let style = PianoRollStyle::default();
+
+        // Frame 1: press → velocity_drag 開始
+        let input1 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 370.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel1 = model.selected.clone();
+        let notes_clone = model.notes.clone();
+        run_frame(&mut host, &mut model, input1, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone,
+                view,
+                &sel1,
+                &style,
+                dispatch,
+            );
+        });
+
+        // Frame 2: continuation (drag 中) → response.velocity_dragging = true
+        let input2 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 350.0)),
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel2 = model.selected.clone();
+        let notes_clone2 = model.notes.clone();
+        let dragging_flag = std::cell::Cell::new(false);
+        run_frame(&mut host, &mut model, input2, |ui| {
+            let dispatch = make_dispatch();
+            let resp = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone2,
+                view,
+                &sel2,
+                &style,
+                dispatch,
+            );
+            dragging_flag.set(resp.velocity_dragging);
+        });
+        assert!(dragging_flag.get(), "drag 中は velocity_dragging = true");
+    }
+
+    /// SetVelocity payload は anchor velocity と同じ note を除外する (no-op Edit avoid)。
+    #[test]
+    fn velocity_drag_excludes_unchanged_velocities() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        // note 1: velocity 64, note 2: velocity 127
+        let mut model = TestModel::new(vec![
+            Note { id: 1, start_beat: 0.5, len_beats: 0.5, pitch: 60, velocity: 64, lyric: None },
+            Note { id: 2, start_beat: 1.0, len_beats: 0.5, pitch: 60, velocity: 127, lyric: None },
+        ]);
+        model.selected = vec![1, 2];
+        let mut view = test_view();
+        view.velocity_lane_h = 60.0;
+        let style = PianoRollStyle::default();
+
+        // press at bar 1 (x=100, beat=0.5) → multi-select 全部 target
+        let input1 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((100.0, 370.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel1 = model.selected.clone();
+        let notes_clone = model.notes.clone();
+        run_frame(&mut host, &mut model, input1, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone,
+                view,
+                &sel1,
+                &style,
+                dispatch,
+            );
+        });
+
+        // release at y=340 (= velocity 127) → note 2 は anchor 127 と一致するので除外、note 1 のみ更新
+        let input2 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((100.0, 340.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel2 = model.selected.clone();
+        let notes_clone2 = model.notes.clone();
+        run_frame(&mut host, &mut model, input2, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone2,
+                view,
+                &sel2,
+                &style,
+                dispatch,
+            );
+        });
+        let updates = model.last_set_velocity.as_ref().expect("SetVelocity payload");
+        assert_eq!(updates.len(), 1, "note 2 は anchor 127 と new 127 一致で除外");
+        assert_eq!(updates[0], (1, 127));
     }
 
     // -------- M13 Phase 55: ruler / time_sig 対応 grid の確認 --------

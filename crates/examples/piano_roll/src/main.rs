@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use daw_ui_core::{
     Edit, InputAccumulator, MoveDelta, Note, NoteId, NotesEditRequest, PianoRollResponse,
-    PianoRollStyle, PianoRollView, ResizeDelta, SnapConfig, UiHost, hash_inputs,
+    PianoRollStyle, PianoRollView, ResizeDelta, SnapConfig, UiHost, VelocityUpdate, hash_inputs,
 };
 use daw_ui_platform::{
     AppEvent, AppHost, PhysicalSize, ScrollDelta, WindowBackend, winit_backend,
@@ -82,9 +82,9 @@ impl PianoRollModel {
             pitch_visible: self.pitch_visible,
             keyboard_w: KEYBOARD_W,
             notes_generation: self.notes_generation,
-            // M9 Phase 45c: velocity lane は無効、playhead は固定値で 1 本表示
-            // (45c で導入した新機能の visible デモ)。
-            velocity_lane_h: 0.0,
+            // M9 Phase 45c: velocity lane の描画 + M14 Phase 64: lane 内 drag で velocity 編集。
+            // 60.0 px で表示 (drag→ release で SetVelocity 発行 / multi-select で同値更新)。
+            velocity_lane_h: 60.0,
             playhead_beat: Some(2.0),
             // M13 Phase 55: ruler 領域 + bpm + time_sig (デモのため ruler_h: 20.0 で
             // 上端に小節番号テキスト表示)。
@@ -262,6 +262,34 @@ fn make_select_notes_edit(prev: Vec<NoteId>, next: Vec<NoteId>) -> Edit<PianoRol
 /// (M14 Phase 59 / daw_01 #017) note 群の lyric を一括更新する undoable Edit。
 /// snapshot に `(id, prev_lyric, next_lyric)` を持って forward/inverse を切替える。
 /// `prev_lyric` は widget が dispatch closure で `m.notes` から事前に capture 済み。
+/// (M14 Phase 64 / daw_01 #018) velocity を 1 commit で更新する Edit。
+/// `(id, prev_velocity, next_velocity)` を snapshot に持ち、 forward / backward 両方向で適用可能。
+/// widget は `Vec<(NoteId, u8)>` (= new only) を渡してくるので、 caller が現フレーム時点の
+/// `m.notes` から prev を引いて この helper に渡す (make_set_lyrics_edit と同 pattern)。
+fn make_set_velocity_edit(deltas: Vec<(NoteId, u8, u8)>) -> Edit<PianoRollModel> {
+    let label = if deltas.len() == 1 { "set velocity" } else { "set velocities" };
+    Edit::snapshot_inverse(
+        label,
+        deltas,
+        |m: &mut PianoRollModel, snap: &Vec<(NoteId, u8, u8)>| {
+            for (id, _prev, next) in snap {
+                if let Some(n) = m.notes.iter_mut().find(|x| x.id == *id) {
+                    n.velocity = *next;
+                }
+            }
+            m.notes_generation += 1;
+        },
+        |m: &mut PianoRollModel, snap: &Vec<(NoteId, u8, u8)>| {
+            for (id, prev, _next) in snap {
+                if let Some(n) = m.notes.iter_mut().find(|x| x.id == *id) {
+                    n.velocity = *prev;
+                }
+            }
+            m.notes_generation += 1;
+        },
+    )
+}
+
 fn make_set_lyrics_edit(
     deltas: Vec<(NoteId, Option<String>, Option<String>)>,
 ) -> Edit<PianoRollModel> {
@@ -580,6 +608,11 @@ impl App {
                 // make_set_lyrics_edit に prev として渡す。
                 let lyric_snapshot: Vec<(NoteId, Option<Arc<str>>)> =
                     m.notes.iter().map(|n| (n.id, n.lyric.clone())).collect();
+                // M14 Phase 64 / daw_01 #018: SetVelocity も同様に prev snapshot。
+                // widget は (NoteId, new_velocity) のみ送ってくるので caller 側で prev を引いて
+                // make_set_velocity_edit に (id, prev, next) として渡す = undo で復元可能に。
+                let velocity_snapshot: Vec<(NoteId, u8)> =
+                    m.notes.iter().map(|n| (n.id, n.velocity)).collect();
 
                 let resp: PianoRollResponse = ui.piano_roll(
                     "main",
@@ -615,6 +648,21 @@ impl App {
                                 })
                                 .collect();
                             make_set_lyrics_edit(with_prev)
+                        }
+                        NotesEditRequest::SetVelocity(updates) => {
+                            // updates: Vec<VelocityUpdate> = Vec<(NoteId, u8)>。snapshot から prev velocity を引いて
+                            // (id, prev, next) tuple に変換 → make_set_velocity_edit へ (undo 復元用)。
+                            let with_prev: Vec<(NoteId, u8, u8)> = updates
+                                .into_iter()
+                                .map(|(id, next): VelocityUpdate| {
+                                    let prev = velocity_snapshot
+                                        .iter()
+                                        .find(|(nid, _)| *nid == id)
+                                        .map_or(0_u8, |(_, v)| *v);
+                                    (id, prev, next)
+                                })
+                                .collect();
+                            make_set_velocity_edit(with_prev)
                         }
                     },
                 );
