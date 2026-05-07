@@ -1097,13 +1097,23 @@ fn draw_clip<M: ?Sized + 'static>(
     clip: &ArrangementClip,
     style: &ArrangementStyle,
     lanes: Rect,
+    selected: bool,
 ) {
     if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
         return;
     }
-    // M14 Phase 63e (#019): share_group_color = Some(hue) なら HSL → RGB で fill / border を
-    // 上書き。 caller の `clip.color` は ignore (share clip は group hue で識別する設計)。
-    let (fill, border) = if let Some(hue) = clip.share_group_color {
+    // M14 Phase 63e (#019) + Phase 63f (#022): 描画状態は (selected, share_group_color) の
+    // 組合せで決まる。 selected は selection 色を最優先 (link glyph の有無に依らず) し、
+    // share_group_color は非 selected かつ Some(hue) の場合のみ HSL → RGB で fill / border を
+    // 上書き。 caller の `clip.color` は share clip では ignore (group hue で識別する設計)。
+    let (fill, border, border_w, text_color) = if selected {
+        (
+            style.clip_selected_fill,
+            style.clip_selected_border,
+            style.clip_selected_border_w,
+            Color::rgb(0.10, 0.10, 0.15),
+        )
+    } else if let Some(hue) = clip.share_group_color {
         let fill_c = hsl_to_rgb(
             hue,
             style.share_group_saturation,
@@ -1116,22 +1126,28 @@ fn draw_clip<M: ?Sized + 'static>(
             style.share_group_border_lightness,
             1.0,
         );
-        (fill_c, border_c)
+        (fill_c, border_c, style.clip_border_w, style.clip_text_color)
     } else {
-        (clip.color.unwrap_or(style.clip_default_fill), style.clip_border)
+        (
+            clip.color.unwrap_or(style.clip_default_fill),
+            style.clip_border,
+            style.clip_border_w,
+            style.clip_text_color,
+        )
     };
     hctx.push_rect(RectCommand {
         rect: r,
         fill,
         border,
-        border_width: style.clip_border_w,
+        border_width: border_w,
         radius: [style.clip_radius; 4],
         clip_rect: Some(lanes),
     });
     if r.w > 24.0 && r.h > style.clip_text_size + 2.0 {
         // share clip は name の左に link glyph (`⇌` 等) を 1 文字描画。 glyph 幅は font 依存だが、
         // 等幅 (HackGen Console NF) では `clip_text_size` ~= 1 文字幅。 name は glyph + 2px gap
-        // だけ右にずらす。 通常 clip (None) は従来通り `r.x + 4.0` で描画。
+        // だけ右にずらす。 通常 clip (None) は従来通り `r.x + 4.0` で描画。 link glyph は
+        // selection と独立 (= selected でも shared なら描画) — #022 で確定。
         let has_link = clip.share_group_color.is_some();
         let text_left = if has_link {
             r.x + 4.0 + style.clip_text_size + 2.0
@@ -1145,7 +1161,7 @@ fn draw_clip<M: ?Sized + 'static>(
                 top: r.y + 2.0,
                 font_size: style.clip_text_size,
                 line_height: style.clip_text_size * 1.2,
-                color: style.clip_text_color,
+                color: text_color,
                 clip_rect: Some(r),
             });
         }
@@ -1155,7 +1171,7 @@ fn draw_clip<M: ?Sized + 'static>(
             top: r.y + 2.0,
             font_size: style.clip_text_size,
             line_height: style.clip_text_size * 1.2,
-            color: style.clip_text_color,
+            color: text_color,
             clip_rect: Some(r),
         });
     }
@@ -1180,7 +1196,7 @@ fn draw_clips<M: ?Sized + 'static>(
                 continue;
             }
             let r = clip_to_rect(i, c, view, lanes);
-            draw_clip(hctx, r, c, style, lanes);
+            draw_clip(hctx, r, c, style, lanes, false);
         }
     }
 }
@@ -1193,6 +1209,8 @@ fn draw_selection_overlay<M: ?Sized + 'static>(
     lanes: Rect,
     style: &ArrangementStyle,
 ) {
+    // M14 Phase 63f (#022): selected clip を `draw_clip(.., selected=true)` で上書き再描画。
+    // 共通 helper を使うので link glyph (share clip) は selection と独立に描画される。
     if selected.is_empty() {
         return;
     }
@@ -1207,28 +1225,7 @@ fn draw_selection_overlay<M: ?Sized + 'static>(
                 continue;
             }
             let r = clip_to_rect(i, c, view, lanes);
-            if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
-                continue;
-            }
-            hctx.push_rect(RectCommand {
-                rect: r,
-                fill: style.clip_selected_fill,
-                border: style.clip_selected_border,
-                border_width: style.clip_selected_border_w,
-                radius: [style.clip_radius; 4],
-                clip_rect: Some(lanes),
-            });
-            if r.w > 24.0 && r.h > style.clip_text_size + 2.0 {
-                hctx.push_text(GlyphArea {
-                    text: c.name.clone(),
-                    left: r.x + 4.0,
-                    top: r.y + 2.0,
-                    font_size: style.clip_text_size,
-                    line_height: style.clip_text_size * 1.2,
-                    color: Color::rgb(0.10, 0.10, 0.15),
-                    clip_rect: Some(r),
-                });
-            }
+            draw_clip(hctx, r, c, style, lanes, true);
         }
     }
 }
@@ -2359,13 +2356,22 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ---- Shift+drag rect select (lanes 内で加算) ----
+        // M14 Phase 63e follow-up (#021): **Ctrl+Shift** は clip_drag 側で
+        // `CloneClipsIndependent` を emit する独立コピー意図のため、 rect select セッションを
+        // 同時起動しない (`!ctrl` で除外)。 これを入れずに Ctrl+Shift+press したとき:
+        //   - 上の press 振り分けで clip_drag 起動 (`(!shift || ctrl)` 経由)
+        //   - ここで rect select 起動 → cyan overlay 描画 + release 時 `SelectClips` push
+        //   両方走って `CloneClipsIndependent` の後 `SelectClips` で selection が上書きされ、
+        //   user 視点「rect select に化けて clone が起きない」 症状になる。
         let drag_rect_wid = wid.child(b"rect_select");
         let shift_rect_active = {
             let state: &mut crate::widgets::drag_rect::DragRectState =
                 self.widget_state(drag_rect_wid);
             state.drag_start.is_some()
         };
-        let shift_press = pointer.primary_just_pressed && pointer.modifiers.shift;
+        let shift_press = pointer.primary_just_pressed
+            && pointer.modifiers.shift
+            && !pointer.modifiers.ctrl;
         if (shift_press || shift_rect_active)
             && let Some(drag) = self.take_drag_rect_in_rect(drag_rect_wid, lanes)
         {
