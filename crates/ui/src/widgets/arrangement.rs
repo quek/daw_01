@@ -280,6 +280,14 @@ pub struct ArrangementResponse {
     pub clicked_at_track_beat: Option<(u32, f64)>,
     /// 各 track header の rect (app 側で `context_menu_for` / rename overlay を重ねる用)。
     pub track_header_rects: Vec<(u32, Rect)>,
+    /// 各 clip の lanes 内 rect (app 側で `context_menu_for` / overlay を重ねる用)。
+    /// `track_header_rects` と同じ semantics:
+    /// - `(ClipKey, Rect)` のペアで、 描画順 (= 上から下、 左から右) で並ぶ
+    /// - **visible_tracks ベース**: collapsed group の子 clip は含まれない
+    /// - 完全 off-screen の clip (track row が viewport 外 / clip が beat 範囲外) は除外
+    ///   (draw 側の culling と整合、 caller 側 hit-test には影響なし)
+    /// - 部分的にカリングされた clip は full rect を返す (clip_to_rect 結果そのまま)
+    pub clip_rects: Vec<(ClipKey, Rect)>,
     pub ruler_rect: Rect,
     /// M10 Phase 46: drag 中の track id (`Some` なら header reorder drag セッションが進行中)。
     pub reordering: Option<u32>,
@@ -298,6 +306,7 @@ impl Default for ArrangementResponse {
             selection_changed: false,
             clicked_at_track_beat: None,
             track_header_rects: Vec::new(),
+            clip_rects: Vec::new(),
             ruler_rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             reordering: None,
             dragging_track_volume: None,
@@ -2688,6 +2697,27 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
+        // ---- M14 Phase 63f (#020): clip_rects を visible-tracks 順 (= 描画順) で積む ----
+        // draw_clips と同じ culling: row が lanes 外 / clip が view beat 範囲外なら除外。
+        // 部分カリングは full rect を返す (caller の context_menu_for は popup_rect_clamped_at で
+        // 画面外はみ出しを吸収するため、 視野内に少しでも見えていれば十分操作可能)。
+        let view_end = view.start_beat + view.len_beats;
+        for (i, t) in visible_tracks.iter().enumerate() {
+            #[allow(clippy::cast_precision_loss)]
+            let row_y = lanes.y - view.track_top + i as f32 * view.track_row_h;
+            if row_y + view.track_row_h < lanes.y || row_y > lanes.y + lanes.h {
+                continue;
+            }
+            for c in &t.clips {
+                let end = c.start_beat + c.len_beats;
+                if end < view.start_beat || c.start_beat > view_end {
+                    continue;
+                }
+                let r = clip_to_rect(i, c, view, lanes);
+                response.clip_rects.push((ClipKey { track: t.id, clip: c.id }, r));
+            }
+        }
+
         response
     }
 }
@@ -2978,6 +3008,196 @@ mod tests {
         assert!(s.playhead_width_px > 0.0);
         assert!(s.mute_solo_hint_h > 0.0);
         assert!(s.clip_radius >= 0.0);
+    }
+
+    // M14 Phase 63f (#020): clip_rects API
+    #[test]
+    fn arrangement_response_default_has_empty_clip_rects() {
+        let r = ArrangementResponse::default();
+        assert!(r.clip_rects.is_empty());
+        assert!(r.track_header_rects.is_empty());
+    }
+
+    #[test]
+    fn clip_rects_populated_in_visible_track_order() {
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::FrameInput;
+        use crate::ui::UiHost;
+
+        // 2 tracks × 2 clips。 clip_rects は visible-tracks 順 (track id 1 → 2)、
+        // 各 track 内は clips の slice 順 (start_beat 昇順) で並ぶ。
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        let tracks = vec![
+            track(1, "t1", vec![clip(10, 0.0, 2.0, "a"), clip(11, 4.0, 2.0, "b")]),
+            track(2, "t2", vec![clip(20, 8.0, 2.0, "c")]),
+        ];
+        let view = ArrangementView { header_w: 0.0, ruler_h: 0.0, ..ArrangementView::default() };
+        let mut model = Model { tracks, view };
+
+        let observed: Arc<std::sync::Mutex<Vec<(ClipKey, Rect)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_cb = Arc::clone(&observed);
+        let _ = host.frame_to_edits(
+            &model,
+            &mut scene,
+            screen,
+            FrameInput::default(),
+            |m, ui| {
+                let style = ArrangementStyle::default();
+                let resp = ui.arrangement(
+                    "arr",
+                    Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                    &m.tracks,
+                    m.view,
+                    &[],
+                    &[],
+                    &style,
+                    |_| Edit::mutate(|_: &mut Model| {}),
+                );
+                *observed_cb.lock().unwrap() = resp.clip_rects.clone();
+            },
+        );
+        // model は frame_to_edits で apply されない (closure 内 push_edit を呼んでないので edits は空)
+        let _ = &mut model;
+
+        let rects = observed.lock().unwrap();
+        assert_eq!(rects.len(), 3, "全 visible clip 3 件: got {}", rects.len());
+        // 順序: track 1 (start=0) → track 1 (start=4) → track 2 (start=8)
+        assert_eq!(rects[0].0, ClipKey { track: 1, clip: 10 });
+        assert_eq!(rects[1].0, ClipKey { track: 1, clip: 11 });
+        assert_eq!(rects[2].0, ClipKey { track: 2, clip: 20 });
+        // rect.x が beat 順で増加 (左→右)
+        assert!(rects[0].1.x < rects[1].1.x);
+        // track 0 と 1 の rect.y が異なる (上→下、 track 1 → track 2)
+        assert!(rects[0].1.y < rects[2].1.y);
+    }
+
+    #[test]
+    fn clip_rects_excludes_collapsed_subtree() {
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::FrameInput;
+        use crate::ui::UiHost;
+
+        // track 1 (group, collapsed) の子 track 2 の clip は clip_rects に出ない。
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        let mut t1 = track(1, "g", vec![clip(10, 0.0, 2.0, "a")]);
+        t1.collapsed = true;
+        let mut t2 = track(2, "child", vec![clip(20, 4.0, 2.0, "b")]);
+        t2.parent_id = Some(1);
+        t2.depth = 1;
+        let view = ArrangementView { header_w: 0.0, ruler_h: 0.0, ..ArrangementView::default() };
+        let mut model = Model { tracks: vec![t1, t2], view };
+
+        let observed: Arc<std::sync::Mutex<Vec<(ClipKey, Rect)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_cb = Arc::clone(&observed);
+        let _ = host.frame_to_edits(
+            &model,
+            &mut scene,
+            screen,
+            FrameInput::default(),
+            |m, ui| {
+                let style = ArrangementStyle::default();
+                let resp = ui.arrangement(
+                    "arr",
+                    Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                    &m.tracks,
+                    m.view,
+                    &[],
+                    &[],
+                    &style,
+                    |_| Edit::mutate(|_: &mut Model| {}),
+                );
+                *observed_cb.lock().unwrap() = resp.clip_rects.clone();
+            },
+        );
+        let _ = &mut model;
+
+        let rects = observed.lock().unwrap();
+        // group 親 (collapsed = true でも group track 自身は visible) の clip 1 つのみ。
+        // 子 track (parent = collapsed) の clip は除外。
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].0, ClipKey { track: 1, clip: 10 });
+    }
+
+    #[test]
+    fn clip_rects_excludes_off_screen_clip_in_beat_range() {
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::FrameInput;
+        use crate::ui::UiHost;
+
+        // view.start_beat = 100、 len_beats = 16 で clip(0, 2.0, ...) は完全に view 外 (end<start)
+        // → clip_rects から除外。 view 内 clip は含まれる。
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        let tracks = vec![track(
+            1,
+            "t",
+            vec![clip(10, 0.0, 2.0, "off"), clip(11, 102.0, 4.0, "on")],
+        )];
+        let view = ArrangementView {
+            start_beat: 100.0,
+            len_beats: 16.0,
+            header_w: 0.0,
+            ruler_h: 0.0,
+            ..ArrangementView::default()
+        };
+        let mut model = Model { tracks, view };
+
+        let observed: Arc<std::sync::Mutex<Vec<(ClipKey, Rect)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_cb = Arc::clone(&observed);
+        let _ = host.frame_to_edits(
+            &model,
+            &mut scene,
+            screen,
+            FrameInput::default(),
+            |m, ui| {
+                let style = ArrangementStyle::default();
+                let resp = ui.arrangement(
+                    "arr",
+                    Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                    &m.tracks,
+                    m.view,
+                    &[],
+                    &[],
+                    &style,
+                    |_| Edit::mutate(|_: &mut Model| {}),
+                );
+                *observed_cb.lock().unwrap() = resp.clip_rects.clone();
+            },
+        );
+        let _ = &mut model;
+
+        let rects = observed.lock().unwrap();
+        assert_eq!(rects.len(), 1, "off-screen clip は除外: got {}", rects.len());
+        assert_eq!(rects[0].0, ClipKey { track: 1, clip: 11 });
     }
 
     #[test]

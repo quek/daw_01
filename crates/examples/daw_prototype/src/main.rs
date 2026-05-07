@@ -1190,6 +1190,38 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
         });
     }
 
+    // ---- M14 Phase 63f (#020): clip 右クリック context_menu (Make Unique / Delete) ----
+    // `resp.clip_rects` は visible-tracks 順 / draw 順で並ぶ (collapsed 子 / off-screen は除外)。
+    // Make Unique は share_group_id を None にして共有グループから外す (daw_01 #020 仕様の縮約版、
+    // daw_prototype は Song.clip_contents 相当を持たないため content fork は不要)。
+    for (clip_key, clip_rect) in &resp.clip_rects {
+        let key = *clip_key;
+        ui.context_menu_for(*clip_rect, &["Make Unique", "Delete"], move |idx, ui| {
+            match idx {
+                0 => ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == key.track)
+                        && let Some(c) = t.clips.iter_mut().find(|c| c.id == key.clip)
+                    {
+                        c.share_group_id = None;
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action =
+                        format!("arr: Make Unique track={} clip={} (context)", key.track, key.clip);
+                })),
+                1 => ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == key.track) {
+                        t.clips.retain(|c| c.id != key.clip);
+                    }
+                    mm.arr_selected_clips.retain(|k| *k != key);
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action =
+                        format!("arr: Delete track={} clip={} (context)", key.track, key.clip);
+                })),
+                _ => {}
+            }
+        });
+    }
+
     // ---- Rename UI overlay (text_input_at を該当 header rect 上に重ねる) ----
     if let Some(rid) = m.arr_rename_target {
         // 該当 track の現名 + header rect を引く
