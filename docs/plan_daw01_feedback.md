@@ -218,7 +218,7 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
     // 新規 (input pull)
     pub fn take_scroll_in_rect(&mut self, rect: Rect) -> (f32, f32);
     pub fn take_drag_rect_in_rect(&mut self, wid: WidgetId, bounds: Rect) -> Option<DragRect>;
-    pub fn take_file_drop_in_rect(&mut self, rect: Rect) -> Option<Vec<PathBuf>>;
+    pub fn take_file_drop_in_rect(&mut self, rect: Rect) -> Option<DroppedFiles>;
     pub fn is_file_hovering_in_rect(&self, rect: Rect) -> bool;
     pub fn take_double_click_in_rect(&mut self, rect: Rect) -> Option<(f32, f32)>;  // P1-4 後
     pub fn take_shortcut(&mut self, name: &'static str) -> bool;

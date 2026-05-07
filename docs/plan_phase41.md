@@ -80,7 +80,7 @@ pan / lyric / channel / midi raw は Phase 41 では追加しない (boilerplate
 ```rust
 impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
     pub fn take_drag_rect_in_rect(&mut self, wid: WidgetId, bounds: Rect) -> Option<DragRect>;
-    pub fn take_file_drop_in_rect(&mut self, rect: Rect) -> Option<Vec<PathBuf>>;
+    pub fn take_file_drop_in_rect(&mut self, rect: Rect) -> Option<DroppedFiles>;
     pub fn is_file_hovering_in_rect(&self, rect: Rect) -> bool;
     pub fn take_clipboard_paste(&mut self) -> Option<String>;
     pub fn set_clipboard_text(&mut self, s: String);

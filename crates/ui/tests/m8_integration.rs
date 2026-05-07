@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 
 use daw_ui_core::{
-    Edit, FrameInput, InputAccumulator, NoopClipboard, PointerFrame, UiHost, WidgetId,
+    DroppedFiles, Edit, FrameInput, InputAccumulator, NoopClipboard, PointerFrame, UiHost, WidgetId,
 };
 use daw_ui_platform::{
     AppEvent, ElementState, KeyEvent, Modifiers, PhysicalKey, PhysicalPosition, PhysicalSize,
@@ -201,12 +201,17 @@ fn file_drop_consumed_by_take_in_rect() {
     assert_eq!(drop.paths.len(), 1);
     assert!((drop.position.0 - 50.0).abs() < 1e-5);
 
-    let mut paths_received: Option<Vec<PathBuf>> = None;
+    let mut drop_received: Option<DroppedFiles> = None;
     run(&mut host, &mut m, input, |_, ui| {
         let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
-        paths_received = ui.take_file_drop_in_rect(rect);
+        drop_received = ui.take_file_drop_in_rect(rect);
     });
-    assert_eq!(paths_received.as_ref().map(Vec::len), Some(1));
+    let drop = drop_received.expect("file drop should be consumed");
+    assert_eq!(drop.paths.len(), 1);
+    assert_eq!(drop.paths[0], PathBuf::from("/tmp/x.wav"));
+    // Phase 32 → daw_01 #023 拡張: caller が drop position を受け取れる。
+    assert!((drop.position.0 - 50.0).abs() < 1e-5);
+    assert!((drop.position.1 - 50.0).abs() < 1e-5);
 }
 
 #[test]
@@ -219,13 +224,13 @@ fn file_drop_outside_rect_returns_none() {
     accum.ingest(&AppEvent::FileDropped(PathBuf::from("/tmp/x.wav")));
     let input = accum.take_input();
 
-    let mut paths_received: Option<Vec<PathBuf>> = None;
+    let mut drop_received: Option<DroppedFiles> = None;
     run(&mut host, &mut m, input, |_, ui| {
         // drop pos = (500, 500) は (0, 0, 100, 100) の外
         let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
-        paths_received = ui.take_file_drop_in_rect(rect);
+        drop_received = ui.take_file_drop_in_rect(rect);
     });
-    assert!(paths_received.is_none());
+    assert!(drop_received.is_none());
 }
 
 // ============================================================

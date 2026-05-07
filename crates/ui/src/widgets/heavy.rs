@@ -31,14 +31,13 @@
 //! input_hash で個別判定される。
 
 use std::hash::Hash;
-use std::path::PathBuf;
 
 use daw_ui_platform::{CursorIcon, PhysicalSize};
 use daw_ui_renderer::{Color, GlyphArea, LineBatch, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
-use crate::input::PointerFrame;
+use crate::input::{DroppedFiles, PointerFrame};
 use crate::scenegraph::hash_inputs;
 use crate::time::TimeMapping;
 use crate::ui::Ui;
@@ -195,7 +194,7 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
     }
 
     /// `Ui::take_file_drop_in_rect` の delegate (heavy 内に audio file を drop)。
-    pub fn take_file_drop_in_rect(&mut self, rect: Rect) -> Option<Vec<PathBuf>> {
+    pub fn take_file_drop_in_rect(&mut self, rect: Rect) -> Option<DroppedFiles> {
         self.ui.take_file_drop_in_rect(rect)
     }
 

@@ -1355,15 +1355,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     // M8 Phase 32: file drop
     // ============================================================
 
-    /// `rect` 内に file がドロップされていれば paths を 1 度だけ取り出す。
+    /// `rect` 内に file がドロップされていれば `DroppedFiles` を 1 度だけ取り出す。
     /// 同 frame 内で複数 widget が呼んでも先勝ち。
-    pub fn take_file_drop_in_rect(&mut self, rect: Rect) -> Option<Vec<PathBuf>> {
+    /// 戻り値の `position` は drop 直前の cursor 座標 (viewport 座標)。
+    /// caller は drop.paths と drop.position から (track, beat) など好きな解決を行う。
+    pub fn take_file_drop_in_rect(&mut self, rect: Rect) -> Option<DroppedFiles> {
         let drop_pos = self.file_drop.as_ref()?.position;
         if !rect.contains(drop_pos.0, drop_pos.1) {
             return None;
         }
-        let drop = self.file_drop.take()?;
-        Some(drop.paths)
+        self.file_drop.take()
     }
 
     /// `rect` 内に file が hover 中か (drop target highlight 用、consume せず)。

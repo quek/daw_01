@@ -760,7 +760,7 @@ M5.5 完了後の DAW プラグイン対応・アクセシビリティ・波形�
 | 29 | history stack (undo / redo) | ✅ `Edit::Undoable { forward, inverse, label }` variant + `Edit::with_inverse` + `HistoryStack<M>` + `Ui::request_undo / request_redo / can_undo / can_redo / undo_label / redo_label` (no-Clone 維持、`Arc<dyn Fn>` で forward/inverse を保持) |
 | 30 | keyboard shortcut + navigation | ✅ `Shortcut::parse / matches` + `ShortcutMap::with_default_bindings` (undo/redo/cut/copy/paste/save/open/tab_next/tab_prev/focus_*) + `Ui::take_shortcut` (Pull 型) + `Ui::focusable / draw_focus_ring` + Tab traversal (登場順) + arrow nav (2D 最近傍) |
 | 31 | clipboard (cut / copy / paste) | ✅ `ClipboardProvider` trait + `NoopClipboard` + `ArboardClipboard` (feature `clipboard`) + `UiHost::with_clipboard` + `Ui::take_clipboard_paste / set_clipboard_text` (paste shortcut 検出内蔵) |
-| 32 | drag & drop (OS file) | ✅ `AppEvent::FileHovered / FileDropped / FileHoverCancelled` + `InputAccumulator` 蓄積 + `Ui::take_file_drop_in_rect / is_file_hovering_in_rect` (drop 直前 cur_pos を合成) |
+| 32 | drag & drop (OS file) | ✅ `AppEvent::FileHovered / FileDropped / FileHoverCancelled` + `InputAccumulator` 蓄積 + `Ui::take_file_drop_in_rect / is_file_hovering_in_rect` (drop 直前 cur_pos を合成)。 M14 で `take_file_drop_in_rect` の戻り型を `Option<DroppedFiles>` に拡張 (drop position も caller に提供、daw_01 #023) |
 | 33 | multi-select (rect drag) | ✅ `DragRect { start, end, modifiers, finished }` + `Ui::take_drag_rect_in_rect(wid, bounds)` (drag 中は半透明 cyan overlay を library 自動描画) |
 | 34 | file dialog (native) | ✅ `FileDialogFilter / DialogResult` + `Ui::request_*_file_dialog / take_dialog_result` (rfd 同期実行、UiHost::frame 末尾 block、feature `dialog`) |
 

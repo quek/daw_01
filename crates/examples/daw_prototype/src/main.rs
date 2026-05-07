@@ -286,13 +286,17 @@ impl App {
                         m.last_action = action;
                     }));
                 }
-                // M8 Phase 32: file drop を window 全体で受ける。drop された path を last_action に表示。
+                // M8 Phase 32: file drop を window 全体で受ける。drop された path と座標を last_action に表示。
+                // daw_01 #023 拡張: 戻り値の DroppedFiles から position も使える (track 解決等)。
                 let screen_rect = Rect::new(0.0, 0.0, ui.screen().width as f32, ui.screen().height as f32);
-                if let Some(paths) = ui.take_file_drop_in_rect(screen_rect) {
-                    let action = format!(
-                        "drop: {}",
-                        paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "),
-                    );
+                if let Some(drop) = ui.take_file_drop_in_rect(screen_rect) {
+                    let paths_str = drop
+                        .paths
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let action = format!("drop: {} @ ({:.0}, {:.0})", paths_str, drop.position.0, drop.position.1);
                     ui.push_edit(Edit::mutate(move |m: &mut DawModel| {
                         m.last_action = action;
                     }));
