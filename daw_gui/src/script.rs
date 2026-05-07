@@ -190,6 +190,20 @@ impl ScriptHost {
                 self.plugin_latencies.insert(*plugin_id, *samples);
                 self.recompute_track_latencies();
             }
+            ChildToMain::SlotPluginLoadFailed {
+                track,
+                slot,
+                plugin_id,
+                reason,
+            } => {
+                tracing::error!(
+                    track,
+                    ?slot,
+                    %plugin_id,
+                    %reason,
+                    "script: plugin load failed"
+                );
+            }
             _ => {}
         }
     }

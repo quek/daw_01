@@ -111,6 +111,18 @@ pub enum ChildToMain {
     SlotPluginUnloaded {
         plugin_id: u32,
     },
+    /// `SetSlotPlugin` の load が失敗した。 daw_gui は
+    /// `pending_plugin_loads` から該当 entry を解放し、 `pending_play`
+    /// が立っていれば flush する (= 「失敗 = 完了」 と等価扱いで Play
+    /// queue を解放)。 song の slot は touch せず、 旧 plugin が居れば
+    /// 継続。 reason は plugin host 側 `tracing::error!` 相当の文字列
+    /// (例: "library load failed: ABI mismatch")。
+    SlotPluginLoadFailed {
+        track: u32,
+        slot: PluginSlot,
+        plugin_id: String,
+        reason: String,
+    },
     /// Plugin が報告した自身の processing latency (samples 単位、 host
     /// sample_rate)。 PR3 PDC pipeline の最終段で、 plugin が active 化
     /// した直後 (CLAP `activate` 完了直後 / VST3 `setActive(true)` 完了

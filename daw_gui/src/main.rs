@@ -194,6 +194,17 @@ fn spawn_incoming_bridge(
                     let _ = audio_tx.send(MainToChild::ClosePluginShmem { plugin_id });
                     Some(AppEvent::SlotPluginUnloadedFromChild { plugin_id })
                 }
+                ChildToMain::SlotPluginLoadFailed {
+                    track,
+                    slot,
+                    plugin_id,
+                    reason,
+                } => Some(AppEvent::SlotPluginLoadFailedFromChild {
+                    track,
+                    slot,
+                    plugin_id,
+                    reason,
+                }),
                 ChildToMain::PluginLatencyChanged { plugin_id, samples } => {
                     Some(AppEvent::PluginLatencyChangedFromChild { plugin_id, samples })
                 }

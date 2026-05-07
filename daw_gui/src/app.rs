@@ -614,7 +614,7 @@ impl AppData {
                 .midi_fx_chain
                 .iter()
                 .chain(track.fx_chain.iter())
-                .chain(track.instrument.as_ref().into_iter())
+                .chain(track.instrument.as_ref())
                 .any(|p| !p.sidechain_sources.is_empty());
         if any_wired {
             // Dump raw model state alongside entries so we can see the
@@ -1151,6 +1151,15 @@ pub enum AppEvent {
     SlotPluginUnloadedFromChild {
         plugin_id: u32,
     },
+    /// plugin_host で `SetSlotPlugin` の load が失敗した通知。
+    /// `pending_plugin_loads` から該当 entry を解放し、 status_message に
+    /// エラー表示、 `pending_play` が立っていれば flush する。
+    SlotPluginLoadFailedFromChild {
+        track: u32,
+        slot: PluginSlot,
+        plugin_id: String,
+        reason: String,
+    },
     /// PR3.3: plugin_host から forward された 「plugin が報告した latency」 通知。
     /// `plugin_latencies` に積んで track の累積 latency を再計算、 song を
     /// 更新して LoadSong を daw_audio に再送 (compile_schedule で PDC 反映)。
@@ -1492,6 +1501,14 @@ impl AppData {
             }
             AppEvent::SlotPluginUnloadedFromChild { plugin_id } => {
                 self.on_plugin_unloaded_from_child(plugin_id);
+            }
+            AppEvent::SlotPluginLoadFailedFromChild {
+                track,
+                slot,
+                plugin_id,
+                reason,
+            } => {
+                self.on_plugin_load_failed_from_child(track, slot, plugin_id, reason);
             }
             AppEvent::PluginLatencyChangedFromChild { plugin_id, samples } => {
                 self.on_plugin_latency_changed(plugin_id, samples);
@@ -3459,6 +3476,55 @@ impl AppData {
                 "プラグイン読み込み中... (残 {})",
                 self.pending_plugin_loads.len()
             );
+        }
+    }
+
+    /// plugin_host で `SetSlotPlugin` が失敗した (`load_plugin` Err か
+    /// `ProcessDataHandle::create` Err) 通知を受けたときの後処理。
+    ///
+    /// A7 の `track_pending_load` で詰めた `pending_plugin_loads` の
+    /// entry が plugin_host 側で消費されないと、 「プラグイン読み込み
+    /// 中...」 status のまま `pending_play` が永久に flush されない
+    /// (= 再生不能) になる。 失敗 = ロード round-trip 完了 と等価
+    /// 扱いで pending を解放し、 必要なら queue Play を flush する。
+    ///
+    /// Song の slot は touch しない: 旧 plugin が居れば継続再生、 reconcile
+    /// 由来で旧無し → slot 空のまま。 ユーザーには status_message でエラー
+    /// を表示するだけ。
+    fn on_plugin_load_failed_from_child(
+        &mut self,
+        track: u32,
+        slot: PluginSlot,
+        plugin_id: String,
+        reason: String,
+    ) {
+        tracing::error!(
+            track,
+            ?slot,
+            %plugin_id,
+            %reason,
+            "plugin load failed (notified by plugin host)"
+        );
+        self.pending_plugin_loads.remove(&(track, slot));
+        // pending_play 解放: A7 と同じロジック (`on_plugin_loaded_from_child`
+        // と対称)。 失敗で空になったタイミングで queue Play を flush する。
+        if self.pending_plugin_loads.is_empty() && self.pending_play {
+            self.pending_play = false;
+            self.status_message =
+                format!("プラグイン読み込み失敗: {plugin_id} ({reason})");
+            self.play();
+        } else if !self.pending_plugin_loads.is_empty() && self.pending_play {
+            // まだ他の load が走っているなら、 残数表示を更新しつつエラーは
+            // 上書き (最新の状況をユーザーに見せる)。
+            self.status_message = format!(
+                "プラグイン読み込み失敗: {plugin_id} ({reason}) — 残 {}",
+                self.pending_plugin_loads.len()
+            );
+        } else {
+            // pending_play は立っていない (= 再生中じゃなかった or stop 済) ので
+            // 単に status にエラーを出すだけ。
+            self.status_message =
+                format!("プラグイン読み込み失敗: {plugin_id} ({reason})");
         }
     }
 

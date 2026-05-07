@@ -83,6 +83,16 @@ pub enum PluginEvent {
         plugin_id: u32,
         samples: u32,
     },
+    /// `SetSlotPlugin` の load が失敗した (`load_plugin` Err か
+    /// `ProcessDataHandle::create` Err)。 daw_gui の `pending_plugin_loads`
+    /// を解放するために emit する。 emit せずに `continue` だけで戻ると
+    /// pending stuck で Play queue が永久に解放されない。
+    PluginLoadFailed {
+        track: u32,
+        slot: PluginSlot,
+        plugin_id: String,
+        reason: String,
+    },
 }
 
 impl From<PluginEvent> for ChildToMain {
@@ -122,6 +132,17 @@ impl From<PluginEvent> for ChildToMain {
             PluginEvent::PluginLatencyChanged { plugin_id, samples } => {
                 ChildToMain::PluginLatencyChanged { plugin_id, samples }
             }
+            PluginEvent::PluginLoadFailed {
+                track,
+                slot,
+                plugin_id,
+                reason,
+            } => ChildToMain::SlotPluginLoadFailed {
+                track,
+                slot,
+                plugin_id,
+                reason,
+            },
         }
     }
 }
@@ -506,6 +527,17 @@ fn plugin_main_loop(
                         Ok(p) => p,
                         Err(e) => {
                             tracing::error!(error = ?e, ?format, path = %path.display(), "load failed");
+                            // pending stuck 防止: daw_gui の
+                            // `pending_plugin_loads` を解放するため失敗
+                            // 通知を送る。 旧 plugin は touch していない
+                            // ので chain はそのまま (= 旧 plugin が居れば
+                            // 継続再生)。
+                            let _ = evt_tx.send(PluginEvent::PluginLoadFailed {
+                                track,
+                                slot,
+                                plugin_id: plugin_id.clone(),
+                                reason: format!("{e}"),
+                            });
                             continue;
                         }
                     };
@@ -644,6 +676,31 @@ fn plugin_main_loop(
                                 new_plugin_id,
                                 "failed to create ProcessData shmem"
                             );
+                            // orphan cleanup: 新 plugin は既に
+                            // `install_plugin` で chain に live。 SetSlotPlugin
+                            // の旧 plugin teardown と同じ「detach → quiesce
+                            // → teardown」 dance で安全に外す。 registry
+                            // 側は new_plugin_id が未 publish なので publish
+                            // None は不要。 旧 plugin は既に teardown 済
+                            // (line 540) なので slot は空のまま。
+                            let mut detached: Option<Box<dyn LoadedPlugin>> = None;
+                            tracks.mutate(|t| {
+                                if let Some(chain) = t.chains.get_mut(&track) {
+                                    detached = detach_plugin(chain, slot);
+                                }
+                            });
+                            if let Some(pool) = worker_pool.as_ref() {
+                                pool.quiesce();
+                            }
+                            if let Some(p) = detached {
+                                teardown_plugin(p);
+                            }
+                            let _ = evt_tx.send(PluginEvent::PluginLoadFailed {
+                                track,
+                                slot,
+                                plugin_id: plugin_id.clone(),
+                                reason: format!("shmem create failed: {e}"),
+                            });
                         }
                     }
                 }
