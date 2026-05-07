@@ -54,6 +54,13 @@ pub struct ArrangementClip {
     pub len_beats: f64,
     pub name: Arc<str>,
     pub color: Option<Color>,
+    /// M14 Phase 63e (#019): 共有 (linked) clip のアクセント色 hue (HSL の H、 `[0.0, 1.0)` 周期)。
+    /// `None` で通常 clip (既存の `color` を使う)、 `Some(hue)` で widget が
+    /// `(hue, share_group_saturation, share_group_fill_lightness, share_group_border_lightness)`
+    /// → RGB 変換した塗り / 枠を描画 + clip 名の左に `share_group_link_glyph` を描く。
+    /// caller は `content_id` を `[0.0, 1.0)` に hash して渡す想定 (refcount >= 2 のときだけ
+    /// `Some` を入れれば、 同じ content を共有する clip 群が同色 + link icon になる)。
+    pub share_group_color: Option<f32>,
 }
 
 /// 1 つの track。`clips` は `start_beat` 昇順前提。
@@ -199,6 +206,22 @@ pub enum ArrangementEditRequest {
     /// `selected_tracks` に書き込めば良く、 modifier は無視可能)。
     SelectTrack { prev: Vec<u32>, next: Vec<u32>, modifier: SelectModifier },
     MoveClips(Vec<MoveClipDelta>),
+    /// M14 Phase 63e (#019): **Ctrl + drag** で発火する「共有コピー」 意図。 `MoveClips` と同じ
+    /// `Vec<MoveClipDelta>` shape だが、 semantics が異なる:
+    /// - `from`: source clip identity (残置、 削除しない)
+    /// - `to_track`: 新 clip の配置 track
+    /// - `prev_start_beat`: source clip 位置 (informational、 残置)
+    /// - `next_start_beat`: 新 clip の配置位置 (snap 適用済 absolute beat)
+    ///
+    /// daw_01 caller は (a) source clip を残し (b) `from.clip` の `content_id` をそのまま共有する
+    /// 新 clip を `to_track` の `next_start_beat` に追加する。 ピアノロール編集が同 source の
+    /// 全 clip に即時反映される (REAPER pooled MIDI 流)。
+    CloneClipsLinked(Vec<MoveClipDelta>),
+    /// M14 Phase 63e (#019): **Ctrl + Shift + drag** で発火する「独立コピー」 意図。 `from` が
+    /// 指す source clip を残し、 内容を **deep clone した新 clip** を追加する意図。 daw_01 caller は
+    /// content を fork (新 `ContentId` を採番) して新 clip に紐付ける。 fields の意味は
+    /// `CloneClipsLinked` と同じ。
+    CloneClipsIndependent(Vec<MoveClipDelta>),
     ResizeClips(Vec<ResizeClipDelta>),
     DeleteClips(Vec<ClipKey>),
     DoubleClickClip(ClipKey),
@@ -344,6 +367,31 @@ pub struct ArrangementStyle {
     pub track_group_bg: Color,
     /// M14 Phase 63c (#016): ▼ / ▶ disclosure アイコンの色 (group 行の左端)。
     pub disclosure_color: Color,
+    // ---- M14 Phase 63e (#019): drag-modifier-aware ghost (Ctrl / Ctrl+Shift) ----
+    /// Ctrl + drag 中の ghost rect 塗り (linked clone 意図、 default = 緑系の半透明)。
+    pub clip_clone_linked_fill: Color,
+    /// Ctrl + drag 中の ghost rect 枠色 (default = 明るい緑)。
+    pub clip_clone_linked_border: Color,
+    /// Ctrl + Shift + drag 中の ghost rect 塗り (independent clone 意図、 default = 橙系の半透明)。
+    pub clip_clone_indep_fill: Color,
+    /// Ctrl + Shift + drag 中の ghost rect 枠色 (default = 明るい橙)。
+    pub clip_clone_indep_border: Color,
+    /// ghost rect 左上に重ねる badge glyph (`⇌` / `+`) の font_size。 default = `clip_text_size`。
+    pub clip_clone_badge_size: f32,
+    /// badge glyph の color (default = `clip_text_color` と同等の白)。
+    pub clip_clone_badge_color: Color,
+    // ---- M14 Phase 63e (#019): share group (linked clip group) 描画パラメータ ----
+    /// `share_group_color = Some(hue)` の clip 描画で使う HSL の S (`[0.0, 1.0]`、 default = 0.55)。
+    pub share_group_saturation: f32,
+    /// share clip の rect 塗り (fill) に使う HSL の L (default = 0.55)。
+    pub share_group_fill_lightness: f32,
+    /// share clip の rect 枠 (border) に使う HSL の L (default = 0.75、 fill より明るくして強調)。
+    pub share_group_border_lightness: f32,
+    /// share clip の rect 塗り alpha (`[0.0, 1.0]`、 default = 0.85、 微透明にして他 clip と区別)。
+    pub share_group_alpha: f32,
+    /// share clip の name 左に描く link glyph (default = `'⇌'` U+21CC)。 font に存在しない場合は
+    /// caller 側で ASCII (`'~'` 等) に差し替える。
+    pub share_group_link_glyph: char,
 }
 
 impl Default for ArrangementStyle {
@@ -413,6 +461,22 @@ impl Default for ArrangementStyle {
             indent_px: 16.0,
             track_group_bg: Color::rgb(0.16, 0.22, 0.32),
             disclosure_color: Color::rgb(0.85, 0.88, 0.92),
+            // M14 Phase 63e (#019): clone ghost (Ctrl / Ctrl+Shift) — 緑系 / 橙系で 3 種視覚区別。
+            // selected fill (黄系 = (1.0, 0.85, 0.30)) と色相を分けて drag 中に「同じ ghost
+            // にしか見えない」 状態を回避。
+            clip_clone_linked_fill: Color::rgba(0.40, 0.85, 0.55, 0.55),
+            clip_clone_linked_border: Color::rgb(0.55, 1.0, 0.70),
+            clip_clone_indep_fill: Color::rgba(1.0, 0.65, 0.30, 0.55),
+            clip_clone_indep_border: Color::rgb(1.0, 0.80, 0.45),
+            clip_clone_badge_size: 11.0,
+            clip_clone_badge_color: Color::rgb(0.10, 0.10, 0.12),
+            // share_group_color の HSL 変換パラメータ — saturation 0.55 で派手すぎず、 fill L=0.55、
+            // border L=0.75 で fill より明るく差をつける (識別性 + コントラスト両立)。
+            share_group_saturation: 0.55,
+            share_group_fill_lightness: 0.55,
+            share_group_border_lightness: 0.75,
+            share_group_alpha: 0.85,
+            share_group_link_glyph: '⇌',
         }
     }
 }
@@ -779,6 +843,17 @@ struct ClipDragSession {
     /// これにより OS event 順序 (ModifiersChanged が MouseInput(Released) より先に来るケース)
     /// に依存せず、 overlay と commit が必ず同一値で確定する。
     last_alt: bool,
+    /// M14 Phase 63e (#019): drag 中の最終 ctrl 状態。 `last_alt` と同じ仕組みで保持する
+    /// (winit 0.30 の `ModifiersChanged` が `MouseInput(Released)` より先に届く race を回避)。
+    /// release 時 dispatch で `Move + last_ctrl + !last_shift` → `CloneClipsLinked`、
+    /// `Move + last_ctrl + last_shift` → `CloneClipsIndependent`、 それ以外 (ResizeLeft/Right
+    /// 含む) → 既存 `MoveClips` / `ResizeClips`。 ghost overlay も `last_ctrl` を読んで色 / badge
+    /// glyph を切替えるため、 commit と overlay が必ず同一値で確定する。
+    last_ctrl: bool,
+    /// M14 Phase 63e (#019): drag 中の最終 shift 状態。 `last_ctrl` と組み合わせて
+    /// `CloneClipsLinked` (ctrl のみ) と `CloneClipsIndependent` (ctrl + shift) を識別する。
+    /// 保持仕組みは `last_alt` / `last_ctrl` と同じ (continuation で update / release で skip)。
+    last_shift: bool,
     anchors: Vec<ClipDragAnchor>,
 }
 
@@ -978,6 +1053,35 @@ fn draw_lanes_bg<M: ?Sized + 'static>(
     }
 }
 
+/// M14 Phase 63e (#019): HSL `(h, s, l, a)` → RGBA `Color` 変換 (`share_group_color` 用)。
+/// `h` は `[0.0, 1.0)` 周期 (0=赤, 0.33=緑, 0.66=青)。 caller が範囲外を渡した場合は内部で
+/// `rem_euclid(1.0)` してから処理 (defensive)。 standard CSS HSL の chroma-based 算出に従う。
+/// 単一文字名 (h/s/l/a/c/x/m) は HSL→RGB の標準表記 (CSS 仕様準拠)、 数学関数として保持。
+#[allow(clippy::many_single_char_names)]
+fn hsl_to_rgb(h: f32, s: f32, l: f32, a: f32) -> Color {
+    let h = h.rem_euclid(1.0);
+    let s = s.clamp(0.0, 1.0);
+    let l = l.clamp(0.0, 1.0);
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let h6 = h * 6.0;
+    let x = c * (1.0 - (h6.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = if h6 < 1.0 {
+        (c, x, 0.0)
+    } else if h6 < 2.0 {
+        (x, c, 0.0)
+    } else if h6 < 3.0 {
+        (0.0, c, x)
+    } else if h6 < 4.0 {
+        (0.0, x, c)
+    } else if h6 < 5.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    let m = l - c * 0.5;
+    Color::rgba(r1 + m, g1 + m, b1 + m, a)
+}
+
 fn draw_clip<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     r: Rect,
@@ -988,19 +1092,57 @@ fn draw_clip<M: ?Sized + 'static>(
     if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
         return;
     }
-    let fill = clip.color.unwrap_or(style.clip_default_fill);
+    // M14 Phase 63e (#019): share_group_color = Some(hue) なら HSL → RGB で fill / border を
+    // 上書き。 caller の `clip.color` は ignore (share clip は group hue で識別する設計)。
+    let (fill, border) = if let Some(hue) = clip.share_group_color {
+        let fill_c = hsl_to_rgb(
+            hue,
+            style.share_group_saturation,
+            style.share_group_fill_lightness,
+            style.share_group_alpha,
+        );
+        let border_c = hsl_to_rgb(
+            hue,
+            style.share_group_saturation,
+            style.share_group_border_lightness,
+            1.0,
+        );
+        (fill_c, border_c)
+    } else {
+        (clip.color.unwrap_or(style.clip_default_fill), style.clip_border)
+    };
     hctx.push_rect(RectCommand {
         rect: r,
         fill,
-        border: style.clip_border,
+        border,
         border_width: style.clip_border_w,
         radius: [style.clip_radius; 4],
         clip_rect: Some(lanes),
     });
     if r.w > 24.0 && r.h > style.clip_text_size + 2.0 {
+        // share clip は name の左に link glyph (`⇌` 等) を 1 文字描画。 glyph 幅は font 依存だが、
+        // 等幅 (HackGen Console NF) では `clip_text_size` ~= 1 文字幅。 name は glyph + 2px gap
+        // だけ右にずらす。 通常 clip (None) は従来通り `r.x + 4.0` で描画。
+        let has_link = clip.share_group_color.is_some();
+        let text_left = if has_link {
+            r.x + 4.0 + style.clip_text_size + 2.0
+        } else {
+            r.x + 4.0
+        };
+        if has_link {
+            hctx.push_text(GlyphArea {
+                text: Arc::from(style.share_group_link_glyph.to_string()),
+                left: r.x + 4.0,
+                top: r.y + 2.0,
+                font_size: style.clip_text_size,
+                line_height: style.clip_text_size * 1.2,
+                color: style.clip_text_color,
+                clip_rect: Some(r),
+            });
+        }
         hctx.push_text(GlyphArea {
             text: clip.name.clone(),
-            left: r.x + 4.0,
+            left: text_left,
             top: r.y + 2.0,
             font_size: style.clip_text_size,
             line_height: style.clip_text_size * 1.2,
@@ -1126,6 +1268,21 @@ fn draw_drag_preview<M: ?Sized + 'static>(
     track_delta: i32,
     min_len: f64,
 ) {
+    // M14 Phase 63e (#019): Ctrl / Ctrl+Shift drag は ghost を別色 + badge glyph に切替えて
+    // 「move / linked clone / independent clone」 の 3 種を視覚区別する。 Resize 中は Ctrl 関与
+    // なし (既存 selected_fill のまま)。 commit / overlay の判定はどちらも `nd.last_*` を真値と
+    // するので、 release frame の OS event 順序問題に依存せず一致する。
+    let is_move_clone = matches!(nd.kind, ClipDragKind::Move) && nd.last_ctrl;
+    let (fill, border, badge_glyph) = if is_move_clone {
+        if nd.last_shift {
+            (style.clip_clone_indep_fill, style.clip_clone_indep_border, Some('+'))
+        } else {
+            (style.clip_clone_linked_fill, style.clip_clone_linked_border, Some('⇌'))
+        }
+    } else {
+        (style.clip_selected_fill, style.clip_selected_border, None)
+    };
+
     for a in &nd.anchors {
         let (start, len, new_idx) =
             drag_preview_geometry(*a, nd.kind, beat_delta, track_delta, n_tracks, min_len);
@@ -1135,6 +1292,7 @@ fn draw_drag_preview<M: ?Sized + 'static>(
             len_beats: len,
             name: Arc::from(""),
             color: None,
+            share_group_color: None,
         };
         let r = clip_to_rect(new_idx, &preview_clip, view, lanes);
         if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
@@ -1142,12 +1300,27 @@ fn draw_drag_preview<M: ?Sized + 'static>(
         }
         hctx.push_rect(RectCommand {
             rect: r,
-            fill: style.clip_selected_fill,
-            border: style.clip_selected_border,
+            fill,
+            border,
             border_width: style.clip_selected_border_w,
             radius: [style.clip_radius; 4],
             clip_rect: Some(lanes),
         });
+        // ghost rect 左上に badge glyph (`⇌` / `+`) を 1 文字描画。 rect が小さすぎるときは省略。
+        if let Some(g) = badge_glyph
+            && r.w > style.clip_clone_badge_size + 4.0
+            && r.h > style.clip_clone_badge_size + 2.0
+        {
+            hctx.push_text(GlyphArea {
+                text: Arc::from(g.to_string()),
+                left: r.x + 4.0,
+                top: r.y + 2.0,
+                font_size: style.clip_clone_badge_size,
+                line_height: style.clip_clone_badge_size * 1.2,
+                color: style.clip_clone_badge_color,
+                clip_rect: Some(r),
+            });
+        }
     }
 }
 
@@ -1267,8 +1440,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let in_lanes = lanes.contains(px, py);
             let in_ruler = ruler.contains(px, py);
             let shift = pointer.modifiers.shift;
+            let ctrl = pointer.modifiers.ctrl;
+            // M14 Phase 63e (#019): Ctrl+Shift+drag は clone (Independent) 意図のため clip_drag に
+            // 流す。 Shift only (Ctrl なし) は従来通り rect select に流す (`!shift || ctrl` で
+            // 「Shift があっても Ctrl があれば clip_drag」)。
             if in_lanes
-                && !shift
+                && (!shift || ctrl)
                 && let Some((hit_key, kind)) =
                     clip_hit(&visible_tracks, view, lanes, px, py, style.resize_handle_px)
             {
@@ -1295,12 +1472,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 }
                 if !anchors.is_empty() {
                     let press_alt = pointer.modifiers.alt;
+                    let press_ctrl = pointer.modifiers.ctrl;
+                    let press_shift = pointer.modifiers.shift;
                     let state: &mut ArrangementState = self.widget_state(wid);
                     state.clip_drag = Some(ClipDragSession {
                         kind,
                         anchor_mouse: (px, py),
                         last_mouse: (px, py),
                         last_alt: press_alt,
+                        last_ctrl: press_ctrl,
+                        last_shift: press_shift,
                         anchors,
                     });
                 }
@@ -1393,12 +1574,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // short drag の release pos) として update する。
         if let Some((px, py)) = pointer.pos {
             let alt_now = pointer.modifiers.alt;
+            let ctrl_now = pointer.modifiers.ctrl;
+            let shift_now = pointer.modifiers.shift;
             let is_release = pointer.primary_just_released;
             let state: &mut ArrangementState = self.widget_state(wid);
             if let Some(ref mut nd) = state.clip_drag {
                 if !is_release {
                     nd.last_mouse = (px, py);
                     nd.last_alt = alt_now;
+                    // M14 Phase 63e (#019): ctrl / shift も同じ仕組みで update。 release frame は
+                    // ModifiersChanged が MouseInput より先に届いて false 化するリスクがあるので skip。
+                    nd.last_ctrl = ctrl_now;
+                    nd.last_shift = shift_now;
                 } else if (px, py) != nd.anchor_mouse {
                     nd.last_mouse = (px, py);
                 }
@@ -1999,7 +2186,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         }
                     }
                     if !deltas.is_empty() {
-                        self.push_edit(make_edit(ArrangementEditRequest::MoveClips(deltas)));
+                        // M14 Phase 63e (#019): Move + Ctrl + Shift → CloneClipsIndependent、
+                        // Move + Ctrl → CloneClipsLinked、 それ以外 → 既存 MoveClips。
+                        // `last_ctrl` / `last_shift` は overlay と同じ真値を読むので、 release
+                        // frame の OS event 順序問題に依存せず確定する。 Alt は直交 (snap 一時
+                        // 無効のみ) で、 既に上の `compute_clip_drag_beat_delta` で適用済。
+                        let req = if nd.last_ctrl && nd.last_shift {
+                            ArrangementEditRequest::CloneClipsIndependent(deltas)
+                        } else if nd.last_ctrl {
+                            ArrangementEditRequest::CloneClipsLinked(deltas)
+                        } else {
+                            ArrangementEditRequest::MoveClips(deltas)
+                        };
+                        self.push_edit(make_edit(req));
                     }
                 }
                 ClipDragKind::ResizeRight => {
@@ -2513,6 +2712,7 @@ mod tests {
             len_beats: len,
             name: Arc::from(name),
             color: None,
+            share_group_color: None,
         }
     }
 

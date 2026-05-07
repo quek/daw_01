@@ -201,8 +201,15 @@ fn main() {
                             len_beats: 1.0,
                             name: std::sync::Arc::from("clip"),
                             color: None,
+                            share_group_color: None,
                         };
                     }),
+                    ArrangementEditRequest::CloneClipsLinked(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::CloneClipsIndependent(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
                     ArrangementEditRequest::ResizeClips(_) => Edit::mutate(|_m: &mut Model| {}),
                     ArrangementEditRequest::DeleteClips(_) => Edit::mutate(|_m: &mut Model| {}),
                     ArrangementEditRequest::DoubleClickClip(_) => {

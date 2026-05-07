@@ -37,6 +37,11 @@ struct DawClip {
     len_beats: f64,
     name: Arc<str>,
     color: Option<Color>,
+    /// M14 Phase 63e (#019): linked clone group id (`None` = 通常 clip)。 同じ `Some(gid)` を
+    /// 持つ clip 群は同じ share group (= 同じ hue で描画 + clip name 左に link glyph)。 daw_01
+    /// 本体では `content_id` (notes 共有 store の key) に対応する概念。 prototype では「同じ
+    /// content を共有しているふり」 として gid だけ track する。
+    share_group_id: Option<u32>,
 }
 
 struct DawTrack {
@@ -81,6 +86,12 @@ struct DawModel {
     /// M14 Phase 63c (#016): 折り畳み中の group track id 集合。 widget の `track.collapsed` field
     /// を caller 側で computed して渡す source-of-truth。 `ToggleGroupCollapsed(id)` Edit 受信で toggle。
     arr_collapsed_groups: std::collections::HashSet<u32>,
+    /// M14 Phase 63e (#019): linked clone で発番する group id の counter。
+    /// `CloneClipsLinked` 受信時、 source に group_id がなければ新採番、 source / dst 両方に
+    /// 同じ id を assign。 `arr_tracks_for_widget` で `(gid as f32 * 0.618034).rem_euclid(1.0)`
+    /// で hue 化して `ArrangementClip.share_group_color` に渡す (golden-ratio で隣接 group が
+    /// 色相的に十分離れる、 well-known hash trick)。
+    arr_next_share_group_id: u32,
     /// `BeginRenameTrack(id)` 受信時にセット。`Some(id)` 中は該当 track header 上に
     /// `text_input_at_focused` を重ね描画 (M11 Phase 52 で `text_input_at` から差し替え、
     /// 「初回 show 自動 focus」が widget 内蔵で boilerplate ゼロ)。Enter / blur / ESC で
@@ -103,6 +114,7 @@ impl DawModel {
                     len_beats: 4.0,
                     name: Arc::from(format!("clip{}", ci + 1)),
                     color: None,
+                    share_group_id: None,
                 });
             }
             // M14 Phase 63c (#016) demo: track 0 を group とし、 track 1-2 を子に。
@@ -156,6 +168,7 @@ impl DawModel {
             arr_selected_clips: Vec::new(),
             arr_selected_tracks: Vec::new(),
             arr_collapsed_groups: std::collections::HashSet::new(),
+            arr_next_share_group_id: 0,
             arr_rename_target: None,
             demo_chain: vec![
                 "MIDI Quantize".to_string(),
@@ -716,6 +729,12 @@ fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
                     len_beats: c.len_beats,
                     name: Arc::clone(&c.name),
                     color: c.color,
+                    // M14 Phase 63e (#019): group_id を golden-ratio hash で hue 化
+                    // (隣接 group が色相的に十分離れる well-known trick)。
+                    #[allow(clippy::cast_precision_loss)]
+                    share_group_color: c.share_group_id.map(|gid| {
+                        ((gid as f32) * 0.618_034).rem_euclid(1.0)
+                    }),
                 })
                 .collect(),
             parent_id: t.parent_id,
@@ -838,6 +857,104 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 mm.arr_view.data_generation += 1;
                 mm.last_action = format!("arr: MoveClips ({n})");
             }),
+            // M14 Phase 63e (#019): Ctrl + drag — 「共有コピー」 意図。 source clip は残し、
+            // 同じ share_group_id を持つ新 clip を `to_track` の `next_start_beat` に追加する。
+            // source 側に group_id がなければ新採番、 既にあれば既存値を流用 (= 同 group に追加)。
+            // daw_01 本体では content_id 共有 + Song.clip_contents map 経由で notes を共有するが、
+            // prototype では「同じ group id を持つ clip 群を hue で塗り分ける」 だけで意図を表現。
+            ArrangementEditRequest::CloneClipsLinked(deltas) => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    let n = deltas.len();
+                    for d in deltas {
+                        // 1) source の現在の group_id を取得
+                        let existing_gid = mm
+                            .arr_tracks
+                            .iter()
+                            .find(|t| t.id == d.from.track)
+                            .and_then(|t| t.clips.iter().find(|c| c.id == d.from.clip))
+                            .and_then(|c| c.share_group_id);
+                        let group_id = existing_gid.unwrap_or_else(|| {
+                            let id = mm.arr_next_share_group_id;
+                            mm.arr_next_share_group_id += 1;
+                            id
+                        });
+                        // 2) source clip に group_id を assign (もし None だったら set)
+                        let src_info = mm
+                            .arr_tracks
+                            .iter_mut()
+                            .find(|t| t.id == d.from.track)
+                            .and_then(|t| {
+                                t.clips.iter_mut().find(|c| c.id == d.from.clip).map(|c| {
+                                    c.share_group_id = Some(group_id);
+                                    (Arc::clone(&c.name), c.color, c.len_beats)
+                                })
+                            });
+                        let Some((name, color, len_beats)) = src_info else { continue };
+                        // 3) to_track に新 clip を追加 (同 group_id)
+                        if let Some(target) =
+                            mm.arr_tracks.iter_mut().find(|t| t.id == d.to_track)
+                        {
+                            let new_id = target.next_clip_id;
+                            target.next_clip_id += 1;
+                            let new_clip = DawClip {
+                                id: new_id,
+                                start_beat: d.next_start_beat,
+                                len_beats,
+                                name,
+                                color,
+                                share_group_id: Some(group_id),
+                            };
+                            let pos = target
+                                .clips
+                                .iter()
+                                .position(|c| c.start_beat > new_clip.start_beat)
+                                .unwrap_or(target.clips.len());
+                            target.clips.insert(pos, new_clip);
+                        }
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!("arr: CloneClipsLinked ({n})");
+                })
+            }
+            // M14 Phase 63e (#019): Ctrl+Shift + drag — 「独立コピー」 意図。 source clip は残し、
+            // 内容を fork した独立 clip を追加する (share group には入れない、 group_id = None)。
+            // daw_01 では content を deep clone + 新 ContentId 採番、 prototype では単純コピー。
+            ArrangementEditRequest::CloneClipsIndependent(deltas) => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    let n = deltas.len();
+                    for d in deltas {
+                        let src_info = mm
+                            .arr_tracks
+                            .iter()
+                            .find(|t| t.id == d.from.track)
+                            .and_then(|t| t.clips.iter().find(|c| c.id == d.from.clip))
+                            .map(|c| (Arc::clone(&c.name), c.color, c.len_beats));
+                        let Some((name, color, len_beats)) = src_info else { continue };
+                        if let Some(target) =
+                            mm.arr_tracks.iter_mut().find(|t| t.id == d.to_track)
+                        {
+                            let new_id = target.next_clip_id;
+                            target.next_clip_id += 1;
+                            let new_clip = DawClip {
+                                id: new_id,
+                                start_beat: d.next_start_beat,
+                                len_beats,
+                                name,
+                                color,
+                                share_group_id: None,
+                            };
+                            let pos = target
+                                .clips
+                                .iter()
+                                .position(|c| c.start_beat > new_clip.start_beat)
+                                .unwrap_or(target.clips.len());
+                            target.clips.insert(pos, new_clip);
+                        }
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!("arr: CloneClipsIndependent ({n})");
+                })
+            }
             ArrangementEditRequest::ResizeClips(deltas) => Edit::mutate(move |mm: &mut DawModel| {
                 let n = deltas.len();
                 for d in deltas {
@@ -878,6 +995,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                             len_beats: 2.0,
                             name: Arc::from(format!("new{new_id}")),
                             color: None,
+                            share_group_id: None,
                         };
                         let pos = t
                             .clips
