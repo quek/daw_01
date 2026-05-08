@@ -105,28 +105,47 @@ pub fn default_cache_path() -> Option<PathBuf> {
 /// in the cached `PluginEntry`, mirroring how external plugins use a
 /// real filesystem path. The plugin host's `builtin` module dispatches
 /// on the URI to construct the Rust implementation.
-///
-/// PR-V1 ships a single `Silence` instrument as the reference impl;
-/// PR-V2 will add `builtin://daw_01.voicevox` next to it.
 pub const BUILTIN_ID_SILENCE: &str = "builtin://daw_01.silence";
+pub const BUILTIN_ID_VOICEVOX: &str = "builtin://daw_01.voicevox";
 
 /// Returns the canonical list of daw_01-bundled plugin descriptors.
 /// `scan_system` appends these unconditionally so the picker UI sees
 /// them on every fresh scan. Order here is the order the picker
 /// receives them.
 pub fn builtin_descriptors() -> Vec<PluginEntry> {
-    vec![PluginEntry {
-        id: BUILTIN_ID_SILENCE.to_string(),
-        format: PluginFormat::Builtin,
-        name: "Silence (builtin)".to_string(),
-        vendor: "daw_01".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        // Mirror CLAP feature taxonomy so plugin pickers that filter by
-        // category route this to the instrument list.
-        features: vec!["instrument".to_string(), "synthesizer".to_string()],
-        path: PathBuf::from(BUILTIN_ID_SILENCE),
-        descriptor_index: 0,
-    }]
+    let version = env!("CARGO_PKG_VERSION");
+    let instrument_features = vec![
+        "instrument".to_string(),
+        "synthesizer".to_string(),
+    ];
+    vec![
+        PluginEntry {
+            id: BUILTIN_ID_SILENCE.to_string(),
+            format: PluginFormat::Builtin,
+            name: "Silence (builtin)".to_string(),
+            vendor: "daw_01".to_string(),
+            version: version.to_string(),
+            // Mirror CLAP feature taxonomy so pickers that filter by
+            // category route this to the instrument list.
+            features: instrument_features.clone(),
+            path: PathBuf::from(BUILTIN_ID_SILENCE),
+            descriptor_index: 0,
+        },
+        PluginEntry {
+            id: BUILTIN_ID_VOICEVOX.to_string(),
+            format: PluginFormat::Builtin,
+            name: "VOICEVOX (builtin)".to_string(),
+            vendor: "daw_01".to_string(),
+            version: version.to_string(),
+            features: {
+                let mut f = instrument_features;
+                f.push("vocal".to_string());
+                f
+            },
+            path: PathBuf::from(BUILTIN_ID_VOICEVOX),
+            descriptor_index: 0,
+        },
+    ]
 }
 
 /// Scan every `.clap` under the system CLAP directory plus every `.vst3`

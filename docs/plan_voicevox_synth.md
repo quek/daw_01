@@ -17,6 +17,16 @@
     完全に同じ)
   - unit test 5 件追加 (load 成功 / unknown / non-URI / process 無音 /
     state roundtrip)
+- ✅ **PR-V2.1**: VOICEVOX builtin plugin skeleton 完了
+  - `VoicevoxBuiltin` struct + `VoicevoxState { speaker_id, style_name }`
+    (`daw_plugin_host/src/builtin/voicevox.rs`)
+  - `BUILTIN_ID_VOICEVOX` を `builtin_descriptors()` に追加 → picker UI
+    から VOICEVOX を選択可能に
+  - bincode で state encode/decode の skeleton (= state_load は PR-V2.5
+    で `&mut self` 化 + full restore 実装予定、 現状は parse 妥当性確認
+    + warn ログのみ)
+  - unit test 5 件追加 (default state / bincode roundtrip / id-format /
+    silent process / state_save bytes)
 
 ## 動機 — なぜ専用 codepath を捨てるか
 
@@ -112,31 +122,72 @@ CLAP / VST3 の MIDI events に「歌詞 string」 を直接載せる規格は�
 
 **規模**: ~600-800 行。 VOICEVOX 合成は **PR-V2** で別途実装。
 
-### PR-V2: VOICEVOX builtin plugin 実装
+### PR-V2: VOICEVOX builtin plugin 実装 (= sub-PR 分割)
 
-**スコープ**:
+合計規模 ~800-1200 行 + 新 host API 設計が必要なため、 5 つの sub-PR に
+分割して 1 セッション完結のリスクを下げる。
 
-- `daw_plugin_host::builtin::voicevox` module 新設
-- 入力: MIDI note events + 並列歌詞バッファ (= 歌詞 string 列、 note 順)
-- 出力: stereo audio (engine_sr)
-- 内部状態:
-  - speaker_id / style_name (= plugin parameter)
-  - HTTP client (= reqwest async, tokio runtime はホスト側持ち)
-  - 合成済 audio cache (`note_id → AudioBuffer`、 LRU / per-note 永続)
-  - 起動時に bulk synth (= clip の note 列を一括で `singing_query` →
-    `singing_synthesis`)、 cache に格納
-- process() は cache から該当 note の audio を時間軸に合わせて mix
+#### PR-V2.1: skeleton (✅ 完了)
 
-**設計判断**:
+- `daw_plugin_host::builtin::voicevox` module 新設、 `VoicevoxBuiltin`
+  struct を `LoadedPlugin` 実装 (= 現状 process() は無音を返すだけ)
+- `VoicevoxState { speaker_id, style_name }` struct + bincode encode /
+  decode で project file persistence の skeleton
+- `BUILTIN_ID_VOICEVOX = "builtin://daw_01.voicevox"` を `common::
+  plugin_db` に追加、 `builtin_descriptors()` で picker UI に露出
+- `daw_plugin_host` crate に bincode dependency 追加
+- unit test 5 件追加 (default state / bincode roundtrip / id-format /
+  silent process / state_save bytes)
 
-- HTTP は plugin 内部で **tokio runtime の handle を host から借りる**
-  (= host が `cap_host_audio_thread_handle` 的な拡張を builtin plugin に
-  渡す)。 audio thread からは block しないため、 cache miss 時は dummy
-  silence を返して synth thread で背景 fetch
-- 合成 cache は **plugin state に serialize** (= save 時に WAV-PCM とし
-  て embedded)。 project file size は数 MB / 数十秒 vocal なので 許容
+`state_load` は `LoadedPlugin` trait が `&self` 受け取りなので、
+parse の妥当性確認だけで self.state は default のまま (= 既存 user の
+speaker / style 選択は復元されない、 PR-V2.5 で trait 拡張 + full
+restore に置換予定、 影響範囲は 2 fields のみで user 再選択で復旧可能)。
 
-**規模**: ~800-1200 行 (HTTP 経路 + cache + process() 統合)。
+#### PR-V2.2: 歌詞付き MIDI events を builtin plugin に渡す host API
+
+- `LoadedPlugin` trait か builtin 専用 sidecar (= `BuiltinPluginCtx`) に
+  「note_id → 歌詞 string」 map を渡す method を追加
+- daw_audio 側: vocal track の clip notes から歌詞 + note_id を抽出して
+  plugin host に送る経路 (= 既存 `process_track_owned` の vocal block
+  からのコード移行)
+- daw_gui 側: notes 編集時に「歌詞変更」 を builtin plugin に flush
+  する経路 (= edit → IPC → plugin の歌詞バッファ更新 → bulk re-synth)
+
+**規模**: ~200-400 行。
+
+#### PR-V2.3: HTTP synthesis + cache 統合
+
+- `common::voicevox::synthesize_song` 経由の bulk synth を `VoicevoxBuiltin`
+  内部から呼ぶ経路
+- `common::voicevox_cache` の per-note cache を builtin plugin の
+  internal cache として再利用 (= LRU / disk persistence)
+- HTTP client は **plugin 内部で tokio runtime の handle を host から
+  借りる** (= audio thread block 回避、 cache miss は silence + 背景
+  fetch)
+
+**規模**: ~300-400 行。
+
+#### PR-V2.4: process() で cache 引き → mix integration
+
+- `process()` 内で cache から該当 note の audio を取り出し、 buffer の
+  時間軸に合わせて output_l / output_r に書き込む
+- pitch / velocity / 音量 envelope は VOICEVOX 側合成済なので host は
+  単純に WAV を流すだけ
+- cache miss 時の placeholder (= 無音) と「synth 中」 の状態通知
+
+**規模**: ~150-250 行。
+
+#### PR-V2.5: state save / restore 完全対応 + trait API 拡張
+
+- `LoadedPlugin::state_load(&mut self, ...)` への trait API 変更
+  (= CLAP / VST3 / Builtin すべての backend を更新)
+- `VoicevoxBuiltin::state_load` で speaker / style + cache を full
+  restore (= bincode embed)
+- migration helper: 旧 state 形式 (= speaker_id / style_name のみ) も
+  読める後方互換性 (= bincode optional field)
+
+**規模**: ~150-250 行。
 
 ### PR-V3: Vocal track の builtin plugin 切替
 

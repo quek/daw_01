@@ -1116,6 +1116,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "bincode",
  "clap-sys",
  "com-scrape-types",
  "common",

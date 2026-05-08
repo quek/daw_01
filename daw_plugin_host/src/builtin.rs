@@ -39,13 +39,17 @@
 //! plugin without further wiring.
 
 use anyhow::{Result, bail};
-use common::plugin_db::BUILTIN_ID_SILENCE;
+use common::plugin_db::{BUILTIN_ID_SILENCE, BUILTIN_ID_VOICEVOX};
 use common::plugin_format::PluginFormat;
 use common::protocol::RenderMode;
 
 use crate::plugin_instance::{
     AuxInputBuf, HostCallbacks, LoadedPlugin, TimedNoteEvent,
 };
+
+mod voicevox;
+
+pub use voicevox::VoicevoxBuiltin;
 
 /// Stable URI prefix used for all builtin plugin identifiers. Never
 /// refers to a real filesystem location — `load_builtin` checks the
@@ -70,6 +74,7 @@ pub fn load_builtin(
     }
     match uri {
         BUILTIN_ID_SILENCE => Ok(Box::new(Silence::new()) as Box<dyn LoadedPlugin>),
+        BUILTIN_ID_VOICEVOX => Ok(Box::new(VoicevoxBuiltin::new()) as Box<dyn LoadedPlugin>),
         other => bail!("unknown builtin plugin id: {other}"),
     }
 }
