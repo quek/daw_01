@@ -2809,6 +2809,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             beat_color: style.beat_line,
             bar_line_width: style.bar_line_width_px,
             beat_line_width: style.beat_line_width_px,
+            // M14 Phase 63m (daw_01 #027): zoom 連動の beat 線間引き (default 4px)。
+            ..BarBeatGridStyle::default()
         };
         let ruler_style = TimeRulerStyle {
             bg: style.ruler_bg,
@@ -2816,6 +2818,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             label_color: style.ruler_label_color,
             bar_tick_height: 12.0,
             beat_tick_height: 5.0,
+            // M14 Phase 63m (daw_01 #027): zoom 連動の label / beat tick 間引き (default 60 / 4 px)。
+            ..TimeRulerStyle::default()
         };
         // heavy() closure は `'static` 要求なので id を hash 化して move capture。
         let id_for_inner: u64 = hash_inputs(&id);
