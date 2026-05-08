@@ -186,18 +186,25 @@ multi-event clip を作成する手段がないとテストもできないので
    歌詞 / note) と audio buffer の併存をどう model 化するかの設計議論が
    必要。 急ぎでないので Phase 3+ の Stretch / Slice 着手前に再検討
 
-## 進行順
+## 進行状況 (2026-05-08 更新)
 
-着手予定 (2026-05-08 更新): **PR-A ✅ → PR-B ✅ → PR-D 段階 1 → 段階 2
-→ 段階 3 → PR-C** に並べ替え。
+着手済み:
+- ✅ **PR-A**: `common::audio_render` 共通化 (commit `3a3826e`)
+- ✅ **PR-B**: multi-clip drag Undo 統合 (commit `4401d59`)
+- ✅ **PR-D 段階 1**: Audio Editor event selection + Duplicate (commit `38b0a9b`)
+- ✅ **gui_01 #026 [Open]**: rect-based pointer hit-test API 要望 (commit `2675218`)
+- ✅ **PR-D 段階 2**: Inspector multi-event + Ctrl+] / Ctrl+[ navigation (commit `24dd71d`)
 
-理由: PR-C (plugin-FX Bounce) は IPC 拡張 + state 管理 + WAV crop + 新
-track 自動作成 + plugin の release tail 扱いなど検討事項が多く、 1
-セッションで完結させると state machine の race 等の細かいバグを取り
-こぼす危険がある。 一方 PR-D 段階 1 (event selection + Duplicate) は
-既存 model + Audio Editor view への小拡張で済み、 multi-event clip を
-作る基盤になる (= PR-C で plugin-FX Bounce する対象も multi-event clip
-で意味が生まれる、 順序として理にかなう)。
+次セッションで:
+- ⏳ **PR-D 段階 3**: drag UI = event 中央 drag 移動 / 左右端 drag trim
+  / 空白 drop で event 追加 / context menu の Duplicate / Delete。
+  gui_01 #026 (= `take_primary_press_in_rect` + `take_drag_in_rect`) の
+  main マージを待ってから着手 (= 待ちきれなければ自前 hit test を
+  audio_editor.rs に書くが、 widget 側の API 整備が clean)
+- ⏳ **PR-C**: plugin-FX Bounce (= 新 track + 新 Clip)。 規模大 (= IPC
+  + state 管理 + WAV crop + 新 track 自動作成 + plugin の release tail
+  扱い)。 1 セッション完結のリスクが高いため独立セッションで腰据えて
+  取り組む
 
 各 PR ごとに `cargo build / clippy / test --features rt-assert` clean を
-確認、 `docs/plan.md` 進捗ログにエントリ追加 + commit。
+確認、 `docs/plan.md` 進捗ログにエントリ追加 + commit する運用は維持。
