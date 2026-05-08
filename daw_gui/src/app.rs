@@ -138,7 +138,7 @@ pub enum PickerTarget {
     MidiFx,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub struct ClipRef {
     pub track: u32,
     pub clip: u32,

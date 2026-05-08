@@ -12,6 +12,7 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
@@ -26,7 +27,9 @@ use common::model::Song;
 use common::plugin_format::PluginFormat;
 use common::protocol::{ChildToMain, MainToChild, PluginSlot};
 
+use crate::app::{AppData, AppEvent, ClipRef};
 use crate::bootstrap::Bootstrap;
+use crate::dispatcher::{NoopJobDispatcher, RecordingDispatcher};
 
 thread_local! {
     /// Running script の host state。 `run_scripted` が `Some(...)` をセットし、
@@ -77,6 +80,13 @@ struct ScriptHost {
     /// 直前の `loadSongFromObject` で送った Song を keep。 `setTrackLatency`
     /// など差分更新が必要な API のために。
     last_loaded_song: Option<Song>,
+    /// PR7 follow-up (JS test infra): GUI mode の `AppData` と同じ役割を
+    /// script mode でも持つ。 AppEvent を script から発火できるように
+    /// するため、 production の `AppData::handle_event` を直接呼ぶ
+    /// (= `daw.dispatchSplit` / `daw.glueSelectedClips` 等の API は
+    /// app.handle_event 経由)。 dispatcher は test 用の Recording / Noop
+    /// を使う (winit event loop 無し)。
+    app: AppData,
     /// PR3.3: GUI mode の `AppData` と同じ役割。 `pump_until` 内で
     /// `SlotPluginLoaded` を見たときに `(plugin_id → track_id)` を覚えて
     /// おき、 `PluginLatencyChanged` 受信時に track の累積 latency を
@@ -100,6 +110,22 @@ impl ScriptHost {
         output: Option<PathBuf>,
         extra: Vec<(String, String)>,
     ) -> Self {
+        // AppData::new は audio_tx / plugin_tx の clone を要求する。
+        // bootstrap 内の sender は production と同形なのでそのまま渡せる
+        // (= app.handle_event 内の send_audio / send_plugin がそのまま
+        // bootstrap が握る IPC channel に流れる)。 dispatcher は test
+        // 用 noop / recording。 `_proxy` を返す Recording 実装を
+        // BackgroundDispatcher として渡し、 background thread は
+        // script では使わないので spawn されない (AppData の API を
+        // 同期呼び出しするだけ)。
+        let app = AppData::new(
+            bootstrap.audio_tx.clone(),
+            bootstrap.plugin_tx.clone(),
+            None,
+            None,
+            RecordingDispatcher::new(),
+            Arc::new(NoopJobDispatcher),
+        );
         Self {
             bootstrap,
             script_args: ScriptArgs { output, extra },
@@ -107,6 +133,7 @@ impl ScriptHost {
             plugin_to_track: std::collections::HashMap::new(),
             plugin_latencies: std::collections::HashMap::new(),
             track_plugin_ids: std::collections::HashMap::new(),
+            app,
         }
     }
 
@@ -315,6 +342,46 @@ fn register_daw_globals(ctx: &mut Context) -> Result<()> {
             NativeFunction::from_fn_ptr(daw_set_track_latency),
             js_string!("setTrackLatency"),
             2,
+        )
+        // ----- PR7 follow-up (JS test infra) ----------------------------
+        // app.* の API は ScriptHost::app (= AppData) を直接 mutate して
+        // production と同じ AppEvent handler を回す。 IPC は AppData の
+        // 内部 send_audio / send_plugin から bootstrap の channel に
+        // 流れる。 production GUI mode と挙動を一致させる。
+        .function(
+            NativeFunction::from_fn_ptr(daw_app_load_song_json),
+            js_string!("appLoadSongJson"),
+            1,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(daw_inspect_song_json),
+            js_string!("inspectSongJson"),
+            0,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(daw_set_selection),
+            js_string!("setSelection"),
+            1,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(daw_set_hover_clip),
+            js_string!("setHoverClip"),
+            1,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(daw_set_hover_beat),
+            js_string!("setHoverBeat"),
+            1,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(daw_dispatch_split),
+            js_string!("dispatchSplit"),
+            1,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(daw_dispatch_glue),
+            js_string!("dispatchGlue"),
+            0,
         )
         .build();
 
@@ -568,5 +635,119 @@ fn daw_set_track_latency(
     res.map_err(|e| {
         JsError::from_native(JsNativeError::error().with_message(format!("setTrackLatency: {e}")))
     })?;
+    Ok(JsValue::undefined())
+}
+
+// ---------------------------------------------------------------------------
+// PR7 follow-up: AppData-driven test API (`daw.appLoadSongJson` /
+// `inspectSongJson` / `setSelection` / `setHoverClip` / `setHoverBeat` /
+// `dispatchSplit` / `dispatchGlue`).
+//
+// 全 JS ↔ Rust の橋は **JSON 文字列** で統一して boa の object iteration
+// 沼を避ける。 JS 側は `JSON.stringify` / `JSON.parse` を使うだけ。 全 API
+// は同期 (= AppData の handler を直接呼ぶ)、 IPC は AppData 内部の
+// `send_audio` / `send_plugin` から bootstrap channel に流れる。
+// ---------------------------------------------------------------------------
+
+fn js_native(msg: impl Into<String>) -> JsError {
+    JsError::from_native(JsNativeError::error().with_message(msg.into()))
+}
+
+fn arg_to_string(args: &[JsValue], idx: usize, ctx: &mut Context) -> JsResult<String> {
+    Ok(args
+        .get_or_undefined(idx)
+        .to_string(ctx)?
+        .to_std_string_escaped())
+}
+
+fn daw_app_load_song_json(
+    _this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let json = arg_to_string(args, 0, ctx)?;
+    let mut song: Song = serde_json::from_str(&json)
+        .map_err(|e| js_native(format!("appLoadSongJson: parse: {e}")))?;
+    song.ensure_ids();
+    song.ensure_clip_contents();
+    song.ensure_audio_source_ids();
+    with_host(|host| {
+        host.app.song = song;
+        host.app.sync_song_to_plugin_host();
+    });
+    Ok(JsValue::undefined())
+}
+
+fn daw_inspect_song_json(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let json = with_host(|host| serde_json::to_string(&host.app.song))
+        .map_err(|e| js_native(format!("inspectSongJson: serialize: {e}")))?;
+    Ok(JsString::from(json.as_str()).into())
+}
+
+fn daw_set_selection(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let json = arg_to_string(args, 0, ctx)?;
+    let refs: Vec<ClipRef> = serde_json::from_str(&json)
+        .map_err(|e| js_native(format!("setSelection: parse: {e}")))?;
+    with_host(|host| {
+        host.app.selected_clip = refs.last().copied();
+        host.app.selected_clips = refs;
+    });
+    Ok(JsValue::undefined())
+}
+
+fn daw_set_hover_clip(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    // 引数は JSON 文字列。 "null" or `{"track":N,"clip":N}`。
+    let json = arg_to_string(args, 0, ctx)?;
+    let trimmed = json.trim();
+    let cref: Option<ClipRef> = if trimmed == "null" || trimmed.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_str(trimmed)
+                .map_err(|e| js_native(format!("setHoverClip: parse: {e}")))?,
+        )
+    };
+    with_host(|host| host.app.arrangement_hover_clip = cref);
+    Ok(JsValue::undefined())
+}
+
+fn daw_set_hover_beat(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    // 数値 or null。 to_number(ctx)? は null/undefined → NaN なので NaN
+    // チェックで None を表現する。
+    let arg = args.get_or_undefined(0);
+    let beat: Option<f64> = if arg.is_null() || arg.is_undefined() {
+        None
+    } else {
+        let n = arg.to_number(ctx)?;
+        if n.is_nan() { None } else { Some(n) }
+    };
+    with_host(|host| {
+        host.app.arrangement_hover_beat = beat;
+        host.app.arrangement_hover_beat_raw = beat;
+    });
+    Ok(JsValue::undefined())
+}
+
+fn daw_dispatch_split(_this: &JsValue, args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    let snap = args.get_or_undefined(0).to_boolean();
+    with_host(|host| {
+        host.app
+            .handle_event(AppEvent::SplitClipAtPlayhead { snap });
+    });
+    Ok(JsValue::undefined())
+}
+
+fn daw_dispatch_glue(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _ctx: &mut Context,
+) -> JsResult<JsValue> {
+    with_host(|host| {
+        host.app.handle_event(AppEvent::GlueSelectedClips);
+    });
     Ok(JsValue::undefined())
 }
