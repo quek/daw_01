@@ -243,6 +243,13 @@ pub struct AppData {
     /// 表示される。 audio clip ダブルクリックで `Some` 化、 Esc / Audio
     /// Editor close で `None` に戻る。
     pub audio_editor_clip: Option<ClipRef>,
+    /// Audio Editor で選択中の event index (`audio_editor_clip` の clip
+    /// 内 events Vec への index)。 PR-D 段階 1 で導入: multi-event clip
+    /// で個別 event を選択 → Duplicate / Delete / Inspector 編集の
+    /// target にする。 `None` で「未選択」 (= clip 自体は開いてる)、
+    /// `Some(0)` がデフォルト (= first event)。 audio_editor_clip が None
+    /// になったら自動的に None (= editor 閉じたら selection も消える)。
+    pub audio_editor_selected_event: Option<usize>,
     pub arrange_zoom_x: f32,
     pub arrange_scroll_beat: f32,
     /// arrangement の 1 track row 高さ (px)。Alt+wheel で 16..96 に縦ズーム。
@@ -469,6 +476,7 @@ impl AppData {
             selected_notes: Vec::new(),
             bottom_panel: 0,
             audio_editor_clip: None,
+            audio_editor_selected_event: None,
             arrange_zoom_x: ARRANGE_PX_PER_BEAT,
             arrange_scroll_beat: 0.0,
             arrange_track_row_h: ARRANGE_TRACK_HEIGHT,
@@ -933,6 +941,7 @@ impl AppData {
                 | AppEvent::SetClipGainDbBatch(_)
                 | AppEvent::SetClipFadeBeatsBatch(_)
                 | AppEvent::SetClipFadeCurveBatch(_)
+                | AppEvent::DuplicateAudioEditorEvent
                 | AppEvent::ImportAudio { .. }
                 | AppEvent::AddNote { .. }
                 | AppEvent::ResizeNote { .. }
@@ -1601,6 +1610,21 @@ pub enum AppEvent {
     SetClipFadeBeatsBatch(Vec<(ClipRef, FadeEdgeKind, f64)>),
     /// `(target, edge, curve)` 列で fade curve を一括設定。
     SetClipFadeCurveBatch(Vec<(ClipRef, FadeEdgeKind, common::model::FadeCurve)>),
+
+    // ---- Audio Editor event 単位編集 (Phase 2 PR-D 段階 1) -----------
+    /// Audio Editor 内で event index を選択 (= clip 内 events Vec の
+    /// index)。 `None` で選択解除。 `audio_editor_clip` が `None` の
+    /// ときは no-op。 view state なので非 undoable。
+    SelectAudioEditorEvent(Option<usize>),
+
+    /// 現在 Audio Editor で開いている clip + 選択中 event を Duplicate
+    /// (= 同 source の event を直後に複製)。 spec §3.10.2 の `Ctrl+D`
+    /// 動作。 `audio_editor_clip` / `audio_editor_selected_event` が
+    /// `Some` でないと no-op。 新 event は元 event の右隣 (= clip 内
+    /// 位置 = `src.event_start_in_clip_beats + src.event_length_beats`)、
+    /// 同 source + 同パラメータ。 clip.length_beats が足りなければ自動
+    /// で伸ばす。 selection は新 event に移る。
+    DuplicateAudioEditorEvent,
 }
 
 /// `*Batch` 系 AppEvent で fade in / out を区別するための marker。
@@ -2005,6 +2029,12 @@ impl AppData {
             }
             AppEvent::CloseAudioEditor => {
                 self.close_audio_editor();
+            }
+            AppEvent::SelectAudioEditorEvent(idx) => {
+                self.audio_editor_selected_event = idx;
+            }
+            AppEvent::DuplicateAudioEditorEvent => {
+                self.duplicate_audio_editor_event();
             }
             AppEvent::ToggleClipReversed(target) => {
                 let cur = self.is_clip_audio_event_reversed(target);
@@ -4403,6 +4433,59 @@ impl AppData {
 
     fn close_audio_editor(&mut self) {
         self.audio_editor_clip = None;
+        self.audio_editor_selected_event = None;
+    }
+
+    /// PR-D 段階 1: Audio Editor で開いている clip + 選択中 event を
+    /// Duplicate (= 同 source の event を直後に複製、 spec §3.10.2 の
+    /// `Ctrl+D`)。 audio_editor_clip と audio_editor_selected_event の
+    /// どちらかが None なら no-op。 新 event は src.event_start +
+    /// src.event_length_beats の位置に配置、 同 source / 同パラメータ。
+    /// clip.length_beats は新 event の終端を超えないように自動拡張。
+    /// selection は新 event index に進む。
+    fn duplicate_audio_editor_event(&mut self) {
+        let Some(target) = self.audio_editor_clip else {
+            return;
+        };
+        let Some(idx) = self.audio_editor_selected_event else {
+            return;
+        };
+        let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(target.clip as usize) else {
+            return;
+        };
+        let content_id = clip.content_id;
+        let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+        else {
+            return;
+        };
+        let Some(src) = audio.events.get(idx).cloned() else {
+            return;
+        };
+        let new_start = src.event_start_in_clip_beats + src.event_length_beats;
+        let mut new_event = src.clone();
+        new_event.event_start_in_clip_beats = new_start;
+        let insert_at = idx + 1;
+        if insert_at >= audio.events.len() {
+            audio.events.push(new_event);
+        } else {
+            audio.events.insert(insert_at, new_event);
+        }
+        // clip.length_beats を必要に応じて拡張 (= 新 event の右端を含むよう
+        // に)。 元 length より長くなる場合のみ更新。
+        let needed = new_start + src.event_length_beats;
+        if needed > clip.length_beats {
+            clip.length_beats = needed;
+        }
+        self.audio_editor_selected_event = Some(insert_at);
+        self.is_dirty = true;
+        self.sync_song_to_plugin_host();
+        if self.clip_edit_buffer_target == Some(target) {
+            self.resync_clip_audio_event_edit_buffers(target);
+        }
     }
 
     /// 全選択 audio clip に短 fade を一括適用 (`docs/plan_audio_clip

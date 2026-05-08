@@ -94,9 +94,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         return;
     }
 
-    // 1 clip = 1 event 前提 (Phase 2 PR6 minimal)、 first event を表示。
-    // multi-event は後続 PR で event ごとに rect を分割描画する。
-    let Some(event) = audio.events.first() else {
+    // ----- Multi-event 対応 (Phase 2 PR-D 段階 1) ---------------------
+    // events.iter().enumerate() で各 event ごとに rect を分割描画。
+    // event の rect = wf_area を `(event_start / clip.length_beats)` 〜
+    // `((event_start + event_length) / clip.length_beats)` で割り当てる。
+    // 選択中 event (= `audio_editor_selected_event`、 None なら 0 を
+    // default) は border highlight。 Click 検出 / drag は段階 2 以降。
+    if audio.events.is_empty() {
         ui.label_at(
             "audio_editor_no_event",
             "(空の audio content — event がありません)",
@@ -106,58 +110,106 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             TEXT_DIM,
         );
         return;
-    };
-    let Some(buffer) = app.audio_source_cache.get(event.source_id) else {
-        ui.label_at(
-            "audio_editor_no_buffer",
-            "(decode 待ち / missing source)",
-            wf_area.x + 4.0,
-            wf_area.y + 8.0,
-            11.0,
-            TEXT_DIM,
+    }
+    let selected_idx = app.audio_editor_selected_event.unwrap_or(0);
+    let clip_len_beats = clip.length_beats.max(1e-6); // 0 div 防御
+
+    for (idx, event) in audio.events.iter().enumerate() {
+        let Some(buffer) = app.audio_source_cache.get(event.source_id) else {
+            // 当該 event は decode 待ち / missing source → 透けて見える
+            // 範囲だけマーカー描画 (= 他 event は描く)。
+            continue;
+        };
+
+        // event rect (clip 内の time range を wf_area 全幅にマップ)
+        let evt_x_start = (event.event_start_in_clip_beats / clip_len_beats) as f32;
+        let evt_x_end = ((event.event_start_in_clip_beats + event.event_length_beats)
+            / clip_len_beats) as f32;
+        let event_rect = Rect {
+            x: wf_area.x + evt_x_start.clamp(0.0, 1.0) * wf_area.w,
+            y: wf_area.y,
+            w: ((evt_x_end - evt_x_start) * wf_area.w).max(2.0),
+            h: wf_area.h,
+        };
+
+        let planes_borrowed: Vec<&[f32]> =
+            buffer.samples.iter().map(Vec::as_slice).collect();
+        let event_len_frames = event
+            .source_end_frames
+            .saturating_sub(event.source_start_frames)
+            .max(1);
+
+        let source = WaveformSource {
+            samples: SampleSlices::Planar(&planes_borrowed),
+            valid_len: buffer.frames as usize,
+            generation: event.source_id as u64,
+            sample_rate: buffer.sample_rate,
+        };
+        let view = WaveformView {
+            start_sample: event.source_start_frames,
+            len_samples: event_len_frames,
+            vertical_gain: 1.0,
+        };
+        let is_selected = idx == selected_idx;
+        let fg = if is_selected {
+            Color::rgba(0.65, 0.95, 1.0, 0.95)
+        } else {
+            Color::rgba(0.45, 0.70, 0.85, 0.85)
+        };
+        let style = WaveformStyle {
+            fg,
+            fg_clipped: Color::rgb(0.95, 0.45, 0.40),
+            fill: None,
+            baseline: Some(Color::rgba(1.0, 1.0, 1.0, 0.15)),
+            channel_layout: ChannelLayout::Stack,
+            render_mode: WaveformRenderMode::Auto,
+            line_width_px: 1.0,
+        };
+        let _ = ui.waveform(
+            ("audio_editor_wf", clip.id, idx),
+            event_rect,
+            source,
+            view,
+            style,
         );
-        return;
-    };
 
-    // SampleSlices::Planar は &[&[f32]] を要求。 GUI 描画 path なので
-    // 毎フレーム alloc は許容 (RT path ではない)。
-    let planes_borrowed: Vec<&[f32]> = buffer.samples.iter().map(Vec::as_slice).collect();
-    let event_len = event
-        .source_end_frames
-        .saturating_sub(event.source_start_frames)
-        .max(1);
-
-    let source = WaveformSource {
-        samples: SampleSlices::Planar(&planes_borrowed),
-        valid_len: buffer.frames as usize,
-        generation: event.source_id as u64,
-        sample_rate: buffer.sample_rate,
-    };
-    let view = WaveformView {
-        start_sample: event.source_start_frames,
-        len_samples: event_len,
-        vertical_gain: 1.0,
-    };
-    let style = WaveformStyle {
-        fg: Color::rgba(0.55, 0.85, 0.95, 0.95),
-        fg_clipped: Color::rgb(0.95, 0.45, 0.40),
-        fill: None,
-        baseline: Some(Color::rgba(1.0, 1.0, 1.0, 0.18)),
-        // multi-channel のとき左右に振り分けて描く (mono は overlay と
-        // 同等)。 arrangement の mini 波形は Overlay にしてあるが、
-        // Audio Editor では縦軸が広いので Stacked にして source の
-        // channel 構造が見えるようにする。
-        channel_layout: ChannelLayout::Stack,
-        render_mode: WaveformRenderMode::Auto,
-        line_width_px: 1.0,
-    };
-    let _ = ui.waveform(
-        ("audio_editor_wf", clip.id),
-        wf_area,
-        source,
-        view,
-        style,
-    );
+        // Selection border (= 選択中のみ視認できる枠)。 1 px 太い線で
+        // 上下左右を marker。 push_rect で半透明帯にしても良いが、
+        // border の方が波形を遮らない。
+        if is_selected {
+            let border_color = Color::rgba(0.95, 0.78, 0.31, 0.85);
+            ui.push_lines(LineBatch {
+                segments: std::sync::Arc::from(vec![
+                    // top
+                    LineSegment {
+                        a: [event_rect.x, event_rect.y],
+                        b: [event_rect.x + event_rect.w, event_rect.y],
+                        color: border_color,
+                    },
+                    // bottom
+                    LineSegment {
+                        a: [event_rect.x, event_rect.y + event_rect.h],
+                        b: [event_rect.x + event_rect.w, event_rect.y + event_rect.h],
+                        color: border_color,
+                    },
+                    // left
+                    LineSegment {
+                        a: [event_rect.x, event_rect.y],
+                        b: [event_rect.x, event_rect.y + event_rect.h],
+                        color: border_color,
+                    },
+                    // right
+                    LineSegment {
+                        a: [event_rect.x + event_rect.w, event_rect.y],
+                        b: [event_rect.x + event_rect.w, event_rect.y + event_rect.h],
+                        color: border_color,
+                    },
+                ]),
+                line_width_px: 1.5,
+                clip_rect: Some(wf_area),
+            });
+        }
+    }
 
     // ----- Playhead 線 (Phase 2 PR7) -----
     // 再生中 / Stop 後 (= playhead_beat is Some) かつ playhead が現
@@ -186,12 +238,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
     }
 
-    // Source meta (debug-ish ヘルパー: source ファイル / sample_rate /
-    // channels)。 Phase 4+ で source メタ情報を Inspector 側にも出す
-    // (`docs/plan_audio_clip.md` §3.9 Source 行)。
-    if let Some(audio_source) = app.song.audio_sources.get(&event.source_id) {
+    // Source meta (= 選択中 event の source 情報)。 Phase 4+ で
+    // Inspector の Source 行 (`docs/plan_audio_clip.md` §3.9) として
+    // 出す予定だが、 当面は Audio Editor 内 footer に出して視認性を
+    // 確保する。 multi-event のときは選択中 event の source を参照。
+    let footer_event = audio.events.get(selected_idx).or(audio.events.first());
+    if let Some(footer_event) = footer_event
+        && let Some(audio_source) = app.song.audio_sources.get(&footer_event.source_id)
+    {
         let meta = format!(
-            "{}  {} Hz · {} ch · {} frames",
+            "{}  {} Hz · {} ch · {} frames  ({} events)",
             match &audio_source.path {
                 common::model::AudioSourcePath::ProjectRelative(p) => p.display().to_string(),
                 common::model::AudioSourcePath::Absolute(p) => p.display().to_string(),
@@ -200,6 +256,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             audio_source.sample_rate,
             audio_source.channels,
             audio_source.frames,
+            audio.events.len(),
         );
         ui.label_at(
             "audio_editor_meta",

@@ -350,6 +350,15 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             app.handle_event(AppEvent::ToggleHelp)
         }));
     }
+    // Phase 2 PR-D 段階 1: Audio Editor 開いているとき Ctrl+D で
+    // 選択中 event を Duplicate。 audio_editor_clip is None のときは
+    // 消費しない (= 既存 D / Alt+D の clip duplicate と紛らわしくない
+    // よう、 Audio Editor 内限定の shortcut として gate する)。
+    if app.audio_editor_clip.is_some() && ui.take_shortcut("daw.duplicate_audio_event") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::DuplicateAudioEditorEvent)
+        }));
+    }
     // modal が開いている間は escape を消費しない (modal 側で close する)。
     // 優先度: rename mode → Audio Editor close → CloseHelp。 rename と
     // Audio Editor は同時には開かない (= rename は track header の上、

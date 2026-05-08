@@ -188,11 +188,16 @@ multi-event clip を作成する手段がないとテストもできないので
 
 ## 進行順
 
-着手予定: **PR-A → PR-B → PR-C → PR-D 段階 1 → PR-D 段階 2 → PR-D 段階 3**
+着手予定 (2026-05-08 更新): **PR-A ✅ → PR-B ✅ → PR-D 段階 1 → 段階 2
+→ 段階 3 → PR-C** に並べ替え。
 
-PR-A / PR-B は機械的なリファクタ + cosmetic で短く済むので 1 セッションで
-両方 commit。 PR-C は IPC 設計が含まれるので 1 セッション 1 PR、 PR-D は
-段階分け前提で各 1 PR。
+理由: PR-C (plugin-FX Bounce) は IPC 拡張 + state 管理 + WAV crop + 新
+track 自動作成 + plugin の release tail 扱いなど検討事項が多く、 1
+セッションで完結させると state machine の race 等の細かいバグを取り
+こぼす危険がある。 一方 PR-D 段階 1 (event selection + Duplicate) は
+既存 model + Audio Editor view への小拡張で済み、 multi-event clip を
+作る基盤になる (= PR-C で plugin-FX Bounce する対象も multi-event clip
+で意味が生まれる、 順序として理にかなう)。
 
 各 PR ごとに `cargo build / clippy / test --features rt-assert` clean を
 確認、 `docs/plan.md` 進捗ログにエントリ追加 + commit。

@@ -57,5 +57,9 @@ pub fn daw_shortcut_map() -> ShortcutMap {
     m.bind("daw.split_clip_at_cursor", "E");
     m.bind("daw.split_clip_at_cursor_no_snap", "Alt+E");
     m.bind("daw.glue_selected_clips", "J");
+    // Phase 2 PR-D 段階 1: Audio Editor で開いている clip 内 event を
+    // Duplicate (spec §3.10.2 の `Ctrl+D`)。 root.rs::dispatch_shortcuts
+    // で `audio_editor_clip is Some` のときだけ消費するよう gate。
+    m.bind("daw.duplicate_audio_event", "Ctrl+D");
     m
 }
