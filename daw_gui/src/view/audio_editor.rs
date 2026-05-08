@@ -16,8 +16,8 @@
 use std::sync::Arc;
 
 use daw_ui_core::{
-    ChannelLayout, DragKind, Edit, SampleSlices, Ui, WaveformRenderMode, WaveformSource,
-    WaveformStyle, WaveformView,
+    ChannelLayout, DragKind, Edit, SampleSlices, TimeDisplay, TimeMapping, TimeRulerStyle, Ui,
+    ViewportState1D, WaveformRenderMode, WaveformSource, WaveformStyle, WaveformView,
 };
 use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect};
 
@@ -117,6 +117,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // ----- Header (clip 名 + length + close button) -------------------
     let pad = 12.0;
     let header_h = 24.0;
+    let ruler_h = 20.0;
     ui.label_at(
         "audio_editor_title",
         &format!(
@@ -140,12 +141,44 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::CloseAudioEditor))
     });
 
+    // ----- Ruler (MIDI エディタ同様、 song 全体の絶対 bar 番号を表示) -
+    // wf_area が clip 全体を全幅マッピングするので、 viewport も clip
+    // の time range (= clip.start_beat .. clip.start_beat + length_beats
+    // を sample 単位に換算) を見せる。 これで bar 番号は曲全体基準で
+    // 表示される (= 例: clip が小節 5 から始まれば左端が "5")。
+    let ruler_rect = Rect {
+        x: area.x + pad,
+        y: area.y + header_h,
+        w: (area.w - pad * 2.0).max(0.0),
+        h: ruler_h,
+    };
+    if ruler_rect.w > 0.0 && clip.length_beats > 0.0 {
+        let mapping = TimeMapping {
+            sample_rate: common::audio_bridge::SAMPLE_RATE as f64,
+            tempo_bpm: app.song.bpm as f64,
+            time_sig: app.song.time_sig,
+            display: TimeDisplay::BarBeat,
+        };
+        let spb = mapping.samples_per_beat();
+        let viewport = ViewportState1D {
+            view_start: clip.start_beat * spb,
+            view_len: clip.length_beats * spb,
+        };
+        ui.time_ruler(
+            "audio_editor_ruler",
+            ruler_rect,
+            mapping,
+            viewport,
+            TimeRulerStyle::default(),
+        );
+    }
+
     // ----- Waveform area --------------------------------------------
     let wf_area = Rect {
         x: area.x + pad,
-        y: area.y + header_h + 12.0,
+        y: area.y + header_h + ruler_h + 4.0,
         w: (area.w - pad * 2.0).max(0.0),
-        h: (area.h - header_h - 24.0).max(0.0),
+        h: (area.h - header_h - ruler_h - 4.0 - 24.0).max(0.0),
     };
     if wf_area.w <= 0.0 || wf_area.h <= 0.0 {
         return;
@@ -438,6 +471,27 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 path,
                 position_in_clip_beats: pos_beats.max(0.0),
             });
+        }));
+    }
+
+    // ----- Mouse hover → clip 内 beat (E キー split / 将来の波形操作用) -----
+    // wf_area 内のマウス位置を clip-local beat (clip 始端 = 0) に変換。
+    // E キー (action_split_clips_at_cursor) は audio editor 開いてる時
+    // 既存の arrangement_hover ではなく **この値** を優先採用する
+    // (= bottom panel にマウスがある時点で arrangement hover は更新
+    // されないため、 そのままだと「マウスを arrangement に置いて」 status
+    // で no-op に陥る)。 マウスが waveform 外なら None で push し、
+    // E キーは fallback (playhead / selection) に流れる。
+    let hover_in_clip: Option<f64> = ui.pointer().pos.and_then(|(px, py)| {
+        if !wf_area.contains(px, py) {
+            return None;
+        }
+        let in_clip = ((px - wf_area.x).max(0.0) as f64) * beats_per_px;
+        Some(in_clip.clamp(0.0, clip_len_beats))
+    });
+    if app.audio_editor_hover_beat_in_clip != hover_in_clip {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.audio_editor_hover_beat_in_clip = hover_in_clip;
         }));
     }
 

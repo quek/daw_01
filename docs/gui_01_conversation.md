@@ -272,3 +272,96 @@ if let Some(drop) = ui.take_file_drop_in_rect(editor_area) {
 
 ---
 
+## #027 [Open] 2026-05-08 [要望] `time_ruler` / `bar_beat_grid` の zoom 連動間引き (label / tick / beat 線)
+
+関連仕様:
+- [daw_01:docs/plan_ruler_density.md](daw_01:docs/plan_ruler_density.md) — 最終形態の API + 実装方針 + テスト方針
+
+### daw_01 →
+
+- 種別: [要望]
+- 関連 daw_01: 影響なし (= path 依存再ビルドで自動取り込み)
+- 関連 gui_01: `crates/ui/src/widgets/time_grid.rs:131-156` (label loop), `time_grid.rs:103-120` (tick loop), `time_grid.rs:184-222` (bar_beat_grid)
+
+#### 背景
+
+daw_01 の arrangement view を強くズームアウト (= 1 bar が数 px) すると、
+`time_ruler` が描く bar label (`"1"`, `"2"`, `"3"` ...) が完全に重なって
+読めなくなる。 現状の `time_ruler` 実装は viewport 内の全 bar を残らず
+描画する loop なので、 caller (daw_01) 側からは間引きが制御できない。
+
+`bar_beat_grid` も同じく全 beat 縦線を描くため、 zoom 小では beat 線が
+密集して bar/beat 区別が困難 + 描画コスト増。
+
+ユーザー報告 (2026-05-08): 「ズームアウトするルーラ上の数字が重なる」。
+
+#### 期待 UX
+
+Reaper / Live / Cubase 流の自動間引き:
+
+- 1 bar の表示幅が「読める閾値」 (= 例 60 px) 未満になったら、 label step を
+  2 倍ずつ skip する。 ラベルは `1, 2, 3, 4, ...` → `1, 3, 5, 7, ...` →
+  `1, 5, 9, ...` → `1, 9, 17, ...` のように対数的に間引く (2 のべき乗 step
+  推奨、 連続性が保たれる)。
+- bar tick も label と同じ step で間引く (= label の根元には必ず tick、
+  それ以外の bar 位置には tick なし)。
+- beat tick (label を持たない短い tick) は 1 beat 表示幅が 4 px 未満
+  なら描画しない (= zoom 小で消える)。
+- `bar_beat_grid` の beat 線も同様に 1 beat 表示幅が 4 px 未満なら消す
+  (= bar 縦線のみ残る)。
+
+#### 想定 API
+
+`TimeRulerStyle` / `BarBeatGridStyle` に以下の field を追加:
+
+```rust
+pub struct TimeRulerStyle {
+    // 既存 field 省略
+    /// ラベルが重ならない最小間隔 (px)。 1 bar の表示 px 幅が
+    /// この値未満なら、 描画 step を 2 bar / 4 bar / 8 bar ... と
+    /// 2 倍ずつ skip する。 default 60.0。
+    pub min_label_spacing_px: f32,
+    /// beat tick (label 無し) の最小 1 beat 表示幅 (px)。 これ未満
+    /// では beat tick を描かず bar tick のみ。 default 4.0。
+    pub min_beat_tick_px: f32,
+}
+
+pub struct BarBeatGridStyle {
+    // 既存 field 省略
+    /// beat 縦線の最小 1 beat 表示幅 (px)。 これ未満では beat 縦線
+    /// を描かず bar 縦線のみ。 default 4.0。
+    pub min_beat_line_px: f32,
+}
+```
+
+実装案 (`time_ruler` 内):
+
+```rust
+let px_per_bar = (mapping.samples_per_bar() / viewport.view_len) as f32 * rect.w;
+let mut label_step: i64 = 1;
+if px_per_bar > 0.0 && style.min_label_spacing_px > 0.0 {
+    while (px_per_bar * label_step as f32) < style.min_label_spacing_px {
+        label_step = label_step.saturating_mul(2);
+        if label_step > (1 << 20) { break; }
+    }
+}
+// bar label loop で `bar.rem_euclid(label_step) != 0` を skip。
+// bar tick loop も同 step で skip、 beat tick は min_beat_tick_px 比較。
+```
+
+`bar_beat_grid` も同様に `min_beat_line_px` で beat 線を on/off。
+
+#### 後方互換 / daw_01 側対応
+
+- field 追加のみ (default 値で既存挙動と等価) のため、 daw_01 側は
+  path 依存再ビルドだけで取り込める。
+- daw_01 内の caller (audio_editor / arrangement / piano_roll) は無変更。
+- 受け入れテスト: daw_01 で `cargo run -p daw_gui` → arrangement view
+  をマウスホイールでズームアウト → bar label が重ならず段階的に skip
+  すること、 ズームインで再び細かくなること。
+
+### gui_01 →
+（未返信）
+
+---
+

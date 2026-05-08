@@ -271,6 +271,11 @@ pub struct AppData {
     /// `Some(0)` がデフォルト (= first event)。 audio_editor_clip が None
     /// になったら自動的に None (= editor 閉じたら selection も消える)。
     pub audio_editor_selected_event: Option<usize>,
+    /// Audio Editor 内のマウス hover 位置を clip 内 beat (clip 始端 = 0)
+    /// に変換した値。 audio_editor.rs が毎フレーム push、 マウスが
+    /// waveform 領域外なら `None`。 E キー (split) と将来の波形クリック
+    /// 系操作で「マウス位置を cursor として使う」 ために保持する。
+    pub audio_editor_hover_beat_in_clip: Option<f64>,
     pub arrange_zoom_x: f32,
     pub arrange_scroll_beat: f32,
     /// arrangement の 1 track row 高さ (px)。Alt+wheel で 16..96 に縦ズーム。
@@ -305,6 +310,12 @@ pub struct AppData {
     pub is_playing: bool,
     pub is_looping: bool,
     pub playhead_beat: Option<f32>,
+    /// Pro Tools 流の「Stop で再生開始位置に戻す」 用、 直前の play()
+    /// 開始時点の playhead を保持。 stop() で playhead_beat に書き戻し
+    /// + SeekTo IPC で audio engine も同位置にリセットする。 None の
+    /// 間 (= まだ一度も play していない or stop 済みで restore 完了) は
+    /// stop() は何もしない。
+    pub playback_origin_beat: Option<f32>,
     pub master_gain: f32,
     pub peak_l_display: f32,
     pub peak_r_display: f32,
@@ -506,6 +517,7 @@ impl AppData {
             bottom_panel: 0,
             audio_editor_clip: None,
             audio_editor_selected_event: None,
+            audio_editor_hover_beat_in_clip: None,
             arrange_zoom_x: ARRANGE_PX_PER_BEAT,
             arrange_scroll_beat: 0.0,
             arrange_track_row_h: ARRANGE_TRACK_HEIGHT,
@@ -524,6 +536,7 @@ impl AppData {
             is_playing: false,
             is_looping: false,
             playhead_beat: None,
+            playback_origin_beat: None,
             master_gain: 1.0,
             peak_l_display: 0.0,
             peak_r_display: 0.0,
@@ -3133,6 +3146,10 @@ impl AppData {
         // build が同期で 2 秒以上かかり再生開始が遅延)。 song の変更は
         // 既に sync_song_to_plugin_host 経由で audio engine に届いている
         // 前提 (= IPC 順序保証)。
+        // Pro Tools 流の「Stop で開始位置に戻る」 用に、 実際の再生
+        // 開始時の playhead を保存。 ruler クリック等で playhead を
+        // 移動してから play した場合は、 その位置が origin になる。
+        self.playback_origin_beat = Some(self.playhead_beat.unwrap_or(0.0));
         self.send_audio(MainToChild::Play);
         self.is_playing = true;
     }
@@ -3161,10 +3178,19 @@ impl AppData {
     fn stop(&mut self) {
         self.send_audio(MainToChild::Stop);
         self.is_playing = false;
-        // playhead_beat はクリアしない (= 停止位置を保持して GUI に
-        // 表示し続ける、 ruler click 用)。 audio engine 側も stop 後の
-        // shared.playhead をそのまま publish するので、 on_tick で
-        // 最新値が同期される。
+        // Pro Tools 流: 停止時に playhead を「再生開始位置」 (= 直前の
+        // play() 呼び出し時点の playhead) に戻す。 GUI 側 playhead_beat
+        // の即時上書きと、 audio engine への SeekTo IPC を 1 セットで
+        // 実行する。 後者を送らないと on_tick が直近サンプル位置を返し
+        // て GUI 側の戻し操作を打ち消す。 origin が None (= まだ一度も
+        // play していない) なら playhead は触らない。
+        if let Some(origin) = self.playback_origin_beat.take() {
+            self.playhead_beat = Some(origin);
+            let sr = common::audio_bridge::SAMPLE_RATE as f64;
+            let bpm = self.song.bpm.max(1.0) as f64;
+            let samples = (origin as f64 * 60.0 / bpm * sr).max(0.0) as u64;
+            self.send_audio(MainToChild::SeekTo { samples });
+        }
     }
 
     fn toggle_loop(&mut self) {
@@ -4949,6 +4975,7 @@ impl AppData {
     fn close_audio_editor(&mut self) {
         self.audio_editor_clip = None;
         self.audio_editor_selected_event = None;
+        self.audio_editor_hover_beat_in_clip = None;
     }
 
     /// PR-D 段階 1: Audio Editor で開いている clip + 選択中 event を
@@ -7167,6 +7194,48 @@ impl AppData {
     /// Works on MIDI / Audio / Vocal clips alike. See
     /// `docs/plan_audio_clip.md` §3.3 / §3.3.1.
     fn action_split_clips_at_cursor(&mut self, snap: bool) {
+        // Audio Editor が開いていて、 マウスが waveform 領域内にある
+        // ときは「audio_editor_clip を audio editor のマウス hover 位置
+        // で split」 として優先処理する。 audio editor は bottom_panel
+        // 内なので arrangement_hover_beat は更新されず、 既存 path だと
+        // 「マウスを arrangement に置いて...」 status で no-op になる。
+        if let Some(target) = self.audio_editor_clip {
+            let cursor_in_song = self
+                .audio_editor_hover_beat_in_clip
+                .and_then(|in_clip| {
+                    self.song
+                        .tracks
+                        .get(target.track as usize)
+                        .and_then(|t| t.clips.get(target.clip as usize))
+                        .map(|clip| clip.start_beat + in_clip)
+                });
+            if let Some(cursor) = cursor_in_song {
+                let mut new_selection: Vec<ClipRef> = Vec::new();
+                if self.split_clip_at_beat(target, cursor, &mut new_selection) {
+                    if !new_selection.is_empty() {
+                        // 編集中 clip (= target = 前半) を Audio Editor の
+                        // 表示対象として保持。 selected_clips は前半 +
+                        // 後半の両方を含めて arrangement に highlight。
+                        let mut sel = new_selection;
+                        sel.push(target);
+                        self.selected_clips = sel;
+                        self.selected_clip = Some(target);
+                        self.selected_notes.clear();
+                    }
+                    self.status_message =
+                        "Split: Audio Editor で clip を分割しました".into();
+                    self.is_dirty = true;
+                    self.sync_song_to_plugin_host();
+                } else {
+                    self.status_message =
+                        "Split: マウス位置が clip 範囲外のため分割されませんでした".into();
+                }
+                return;
+            }
+            // hover が無い (マウスが waveform 外) ときは fallback で
+            // playhead / selection を試みる: 既存 path に流れる。
+        }
+
         let cursor: f64 = if snap {
             self.arrangement_hover_beat
                 .or(self.arrangement_hover_beat_raw)
