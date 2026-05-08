@@ -1556,8 +1556,8 @@ pub enum AppEvent {
     TrackPeaksTick(Vec<(f32, f32)>),
 
     // -------- VOICEVOX ----------------------------------------------------
-    SynthesizeVocal,
-    VocalSynthCompleted,
+    // PR-V4: SynthesizeVocal / VocalSynthCompleted は削除済 (builtin
+    // VOICEVOX plugin 経由で自動 synth)。
     /// VOICEVOX engine `/singers` の取得結果。 起動時 background thread が
     /// 1 度発行する。 失敗時は空 Vec で送る。
     SingersLoaded(Vec<common::voicevox::VoiceVoxSinger>),
@@ -2322,13 +2322,11 @@ impl AppData {
                     self.status_message = "WAV 書き出し完了".to_string();
                 }
             }
-            AppEvent::SynthesizeVocal => {
-                self.status_message = "VOICEVOX 合成中...".to_string();
-                self.begin_vocal_synth();
-            }
-            AppEvent::VocalSynthCompleted => {
-                self.finish_vocal_synth();
-            }
+            // PR-V4: SynthesizeVocal / VocalSynthCompleted は削除済。
+            // vocal track は builtin VOICEVOX plugin が自動 synth する
+            // (= sync_vocal_metadata 経由で歌詞 / note を flush →
+            // background thread で HTTP synth)。 user の explicit
+            // synth トリガは不要。
             AppEvent::SingersLoaded(singers) => {
                 tracing::info!(
                     count = singers.len(),
@@ -2463,13 +2461,20 @@ impl AppData {
     // -------- File ----------------------------------------------------------
 
     fn action_new(&mut self) {
-        self.song = Song::default();
+        let mut song = Song::default();
+        Self::migrate_legacy_vocal_tracks(&mut song);
+        self.song = song;
         self.file_path = None;
         self.selected_track_ids.clear();
         self.collapsed_groups.clear();
         self.selected_clip = None;
         self.selected_notes.clear();
         self.resize_track_peak_display();
+        // sync 前に migrated vocal track の builtin VOICEVOX を SetSlotPlugin
+        // で plugin host に load 要求する (= restore_plugin_from_song と同
+        // 経路、 起動直後の Song::default のみ self を持つので clone 経由)。
+        let song_snapshot = self.song.clone();
+        self.restore_plugin_from_song(&song_snapshot);
         self.sync_song_to_plugin_host();
         self.resync_song_edit_texts();
         tracing::info!("new project");
@@ -2499,6 +2504,7 @@ impl AppData {
             Ok(mut song) => {
                 tracing::info!(path = %path.display(), "loaded project");
                 song.ensure_ids();
+                Self::migrate_legacy_vocal_tracks(&mut song);
                 self.restore_plugin_from_song(&song);
                 self.song = song;
                 self.file_path = Some(path.clone());
@@ -2820,6 +2826,38 @@ impl AppData {
                     initial_state: inst.state.clone(),
                 });
             }
+        }
+    }
+
+    /// PR-V3 後段: 旧 project file を読み込んだとき、 `track.source =
+    /// Vocal` で `track.instrument` が空の track を「builtin VOICEVOX が
+    /// instrument に load された状態」 に書き換える。 caller (= action_
+    /// open_path / action_new) は本関数で `&mut song` を migrate してから
+    /// `restore_plugin_from_song` に渡す → 通常の plugin restore と同じ
+    /// 経路で daw_plugin_host 側に SetSlotPlugin が飛ぶ。
+    ///
+    /// 既に instrument が居る vocal track (= 既に PR-V3 前段で auto-load
+    /// 済 or 手動で plugin を入れた) は touch しない。 idempotent。
+    fn migrate_legacy_vocal_tracks(song: &mut Song) {
+        for track in &mut song.tracks {
+            let is_legacy_vocal = matches!(
+                track.source,
+                common::model::InstrumentSource::Vocal { .. }
+            ) && track.instrument.is_none();
+            if !is_legacy_vocal {
+                continue;
+            }
+            track.instrument = Some(common::model::PluginInstance {
+                plugin_id: common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
+                format: PluginFormat::Builtin,
+                state: None,
+                sidechain_sources: Vec::new(),
+            });
+            tracing::info!(
+                track_id = track.id,
+                track_name = %track.name,
+                "PR-V3: legacy vocal track migrated to builtin VOICEVOX"
+            );
         }
     }
 
@@ -6693,146 +6731,10 @@ impl AppData {
         }
     }
 
-    // -------- VOICEVOX -----------------------------------------------------
-
-    fn begin_vocal_synth(&mut self) {
-        let song = self.song.clone();
-        let slot = Arc::clone(&self.synth_result);
-        let cache_arc = Arc::clone(&self.voicevox_cache);
-        let proxy = self.event_proxy.clone();
-        let job = Arc::clone(&self.voicevox_job);
-        // Lazy 起動の重複 spawn 防止フラグ。 1 度試行すれば以降は engine の
-        // is_running 判定だけで分岐 (engine 落ちたユーザー再起動は手動で OK)。
-        let need_launch = !self.voicevox_launch_attempted;
-        self.voicevox_launch_attempted = true;
-        std::thread::spawn(move || {
-            // 1. Engine 起動 (まだ試行していなければ)
-            if need_launch && !common::voicevox_engine::is_running() {
-                if let Some(exe) = common::voicevox_engine::resolve_engine_path() {
-                    tracing::info!(exe = %exe.display(), "lazy spawn VOICEVOX engine for synthesis");
-                    match common::voicevox_engine::spawn_engine(&exe) {
-                        Ok(child) => {
-                            if let Err(e) = job.assign_std(&child) {
-                                tracing::warn!(error = ?e, "failed to attach VOICEVOX to job");
-                            }
-                            // child を drop しても std::process::Child は wait
-                            // しない (Windows)。 auto-kill は JobObject 経由。
-                            std::mem::forget(child);
-                        }
-                        Err(e) => {
-                            tracing::error!(error = ?e, exe = %exe.display(), "failed to spawn VOICEVOX engine");
-                        }
-                    }
-                } else {
-                    let cfg_hint = common::voicevox_engine::engine_path_config_file()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "<no localappdata>".into());
-                    tracing::warn!(
-                        hint = %cfg_hint,
-                        "VOICEVOX engine path not configured (set DAW_VOICEVOX_PATH or write the exe path to the config file)"
-                    );
-                }
-            }
-            // 2. Engine ready 待ち (60s timeout)
-            if !common::voicevox_engine::wait_until_ready() {
-                tracing::warn!(timeout_secs = 60, "VOICEVOX engine not ready, aborting synth");
-                if let Ok(mut guard) = slot.lock() {
-                    *guard = Vec::new();
-                }
-                proxy.send(AppEvent::VocalSynthCompleted);
-                return;
-            }
-            // 3. Singers fetch (初回のみ意味あり、 2 回目以降も harmless)
-            if let Ok(singers) = common::voicevox::fetch_singers() {
-                tracing::info!(count = singers.len(), "fetched VOICEVOX singers");
-                proxy.send(AppEvent::SingersLoaded(singers));
-            }
-            // 4. 合成 (既存パス)
-            let results = match cache_arc.lock() {
-                Ok(mut cache) => common::voicevox::synthesize_song(
-                    &song,
-                    common::voicevox::DEFAULT_SINGER_ID,
-                    common::voicevox::DEFAULT_SINGER_ID,
-                    &mut cache,
-                ),
-                Err(_) => {
-                    tracing::error!("voicevox_cache mutex poisoned, skipping synth");
-                    Vec::new()
-                }
-            };
-            if let Ok(mut guard) = slot.lock() {
-                *guard = results;
-            }
-            proxy.send(AppEvent::VocalSynthCompleted);
-        });
-    }
-
-    fn finish_vocal_synth(&mut self) {
-        let results: Vec<common::voicevox::SynthResult> = self
-            .synth_result
-            .lock()
-            .ok()
-            .map(|mut g| std::mem::take(&mut *g))
-            .unwrap_or_default();
-
-        if results.is_empty() {
-            let errors: Vec<String> = self
-                .synth_result
-                .lock()
-                .ok()
-                .map(|g| g.iter().filter_map(|r| r.error.clone()).collect())
-                .unwrap_or_default();
-            let msg = if errors.is_empty() {
-                "合成結果なし（Vocal トラックがないか VOICEVOX が応答しません）".to_string()
-            } else {
-                format!("合成エラー: {}", errors.join("; "))
-            };
-            self.status_message = msg;
-            return;
-        }
-
-        let ok_results: Vec<_> = results.iter().filter(|r| r.error.is_none()).collect();
-        let err_count = results.len() - ok_results.len();
-        let msg = if err_count > 0 {
-            let first_err = results
-                .iter()
-                .find_map(|r| r.error.as_deref())
-                .unwrap_or("不明");
-            format!(
-                "合成: {} 成功, {} 失敗 ({})",
-                ok_results.len(),
-                err_count,
-                first_err
-            )
-        } else {
-            format!("合成完了 — {} クリップ。Play で再生", ok_results.len())
-        };
-        self.status_message = msg;
-
-        // PR8: SetVocalAudio retired in favour of SetGeneratedAudio.
-        // The audio engine looks the per-clip vocal buffer up by
-        // `vocal_gen_id(track_id, clip_id) = (track_id << 32) | clip_id`
-        // — same encoding lives in `daw_audio::engine::vocal_gen_id`.
-        // Convert mono samples to planar 1-ch (`Vec<Vec<f32>>`) so the
-        // generic audio buffer layout used everywhere else applies.
-        let song_snapshot = self.song.clone();
-        for r in &ok_results {
-            let Some((track_id, clip_id)) = song_snapshot
-                .tracks
-                .get(r.track as usize)
-                .and_then(|t| t.clips.get(r.clip as usize).map(|c| (t.id, c.id)))
-            else {
-                continue;
-            };
-            let id = ((track_id as u64) << 32) | (clip_id as u64);
-            self.send_audio(MainToChild::SetGeneratedAudio {
-                id,
-                sample_rate: r.sample_rate,
-                channels: 1,
-                samples: vec![r.samples.clone()],
-            });
-        }
-    }
+    // PR-V4: 旧 VOICEVOX synth path (begin_vocal_synth /
+    // finish_vocal_synth) は削除。 vocal track は builtin VOICEVOX
+    // instrument plugin で再生され、 歌詞 flush は sync_vocal_metadata で
+    // 自動行われる (= explicit Synth ボタンは不要)。
 
     // -------- Plugin DB rescan --------------------------------------------
 

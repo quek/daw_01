@@ -163,8 +163,7 @@ pub fn decode_wav(path: &Path) -> Result<AudioSourceBuffer> {
 }
 
 /// Build an `AudioClipRenderer` snapshot from the current Song. Walks
-/// `Song.audio_sources` (decoding file-backed entries via `hound` and
-/// looking up generated entries in `generated_audio_store`), then
+/// `Song.audio_sources` (decoding file-backed entries via `hound`), then
 /// flattens every `ClipContent::Audio` event in every track into the
 /// schedule. Sorted by `start_frame` ascending so the render loop can
 /// short-circuit once `start_frame >= buf_end`.
@@ -172,11 +171,16 @@ pub fn decode_wav(path: &Path) -> Result<AudioSourceBuffer> {
 /// Decode is synchronous on the caller (the IPC receive loop in Phase 1).
 /// Phase 2 moves decode to a background thread so >100 MB samples don't
 /// stall the receive loop.
+///
+/// PR-V4: `AudioSourcePath::Generated` 経路 (= 旧 VOICEVOX `SetGenerated
+/// Audio` 経由で渡される generated buffer の参照) は廃止。 VOICEVOX 合成
+/// は builtin instrument plugin (`PluginFormat::Builtin`) 内で完結する。
+/// 既存 project が `AudioSourcePath::Generated` を含んで読まれた場合は
+/// warn ログ + skip (= silent な audio として再生される)。
 pub fn compile_audio_schedule(
     song: &Song,
     project_dir: Option<&Path>,
     engine_sample_rate: u32,
-    generated_audio_store: &HashMap<u64, Arc<AudioSourceBuffer>>,
 ) -> AudioClipRenderer {
     let mut sources: HashMap<AudioSourceId, Arc<AudioSourceBuffer>> = HashMap::new();
     if engine_sample_rate == 0 || song.bpm <= 0.0 {
@@ -209,11 +213,11 @@ pub fn compile_audio_schedule(
                 }
             },
             AudioSourcePath::Generated { id: gen_id } => {
-                let Some(buf) = generated_audio_store.get(gen_id) else {
-                    tracing::warn!(gen_id, "Generated source not yet delivered via SetGeneratedAudio; skipping");
-                    continue;
-                };
-                Arc::clone(buf)
+                tracing::warn!(
+                    gen_id,
+                    "PR-V4: AudioSourcePath::Generated は廃止 (VOICEVOX は builtin plugin 経由)、 skipping"
+                );
+                continue;
             }
         };
         sources.insert(id, buffer);

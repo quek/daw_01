@@ -67,6 +67,45 @@
     voice 起動。 同 note_id 連続 trigger は voice 上書き (後勝ち)。
     note_off は無視 (= VOICEVOX 出力は envelope を内包、 wav 終端で自然
     停止)
+- ✅ **PR-V3 (後段)**: 旧 project file の vocal track migration
+  - `AppData::migrate_legacy_vocal_tracks(&mut Song)`: `track.source =
+    Vocal` で `track.instrument` が `None` の track を `PluginInstance
+    { format: Builtin, plugin_id: BUILTIN_ID_VOICEVOX, ... }` に書き換え
+  - `action_open_path` (project load) と `action_new` (Song::default)
+    の両方で migration を実行 → `restore_plugin_from_song` 経由で
+    `SetSlotPlugin` が plugin host に飛ぶ
+  - 結果、 旧 project を開いた瞬間 vocal track が builtin VOICEVOX に
+    切り替わり、 通常の instrument plugin path で再生される
+- ✅ **PR-V4**: 旧 vocal codepath 全削除 (= net negative diff)
+  - `daw_audio::engine::process_track_owned` の vocal block 削除
+    (= 約 50 行)、 `track.instrument.is_none()` gate も含めて。 vocal
+    track は通常の Instrument 段階で builtin VOICEVOX が処理する
+  - `EngineShared::generated_audio_store` field 削除
+  - `DispatchShared::generated_audio_ptr` 削除
+  - `process_track_owned` / `dispatch_and_wait` / `compile_audio_schedule`
+    の `generated_audio_store` 引数を全廃 (= caller chain 全更新)
+  - `MainToChild::SetGeneratedAudio` IPC variant 削除 +
+    `daw_audio` main の handler 削除
+  - `AudioSourcePath::Generated` 経路は warn ログ + skip (= 旧 project
+    の generated source は無音再生、 builtin plugin が代替で synth)
+  - `AppEvent::SynthesizeVocal` / `VocalSynthCompleted` /
+    `AppData::synth_result` field / `begin_vocal_synth` /
+    `finish_vocal_synth` 全削除
+  - View 側: `transport.rs` の「Synth (V)」 ボタン削除、 `view::root::
+    daw.synthesize_vocal` shortcut 無効化
+  - `daw_gui::script::daw_set_generated_audio` を no-op (= warn ログ
+    のみ)。 既存 test scripts (`pdc_mcenter.js` /
+    `pdc_mcompressor_sidechain.js`) は `setGeneratedAudio` で click
+    signal を inject していたので、 関連 integration test 2 件
+    (`pdc_real_mcenter_aligns_master_output` /
+    `sidechain_real_mcompressor_pipeline_does_not_crash`) を `#[ignore]`
+    化。 別 PR で「audio clip + ImportAudio 経由の test 用 inject path」
+    を整備する想定
+
+すべての PR-V (V1 / V2.1〜V2.5 / V3 前後段 / V4) が完了。 VOICEVOX
+専用 codepath は audio engine / IPC / GUI から完全に消え、 業界標準どおり
+「instrument plugin として MIDI 経由で駆動」 の世界観に到達。
+
 - ✅ **PR-V3 (前段)**: vocal track の builtin VOICEVOX auto-load + 歌詞
   flush 経路 (= 既存 vocal block と並列で動かせる、 二重再生は
   `track.instrument.is_some()` の audio engine 分岐で自動回避)

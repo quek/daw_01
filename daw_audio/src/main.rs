@@ -136,12 +136,10 @@ async fn recv_loop(
                 let project_dir_g = engine_shared.project_dir.load();
                 let project_dir: Option<std::path::PathBuf> =
                     project_dir_g.as_ref().map(|arc| (**arc).clone());
-                let generated_g = engine_shared.generated_audio_store.load();
                 let renderer = audio_clip_renderer::compile_audio_schedule(
                     &song,
                     project_dir.as_deref(),
                     session_sample_rate,
-                    &generated_g,
                 );
                 engine_shared
                     .audio_clip_renderer
@@ -213,54 +211,10 @@ async fn recv_loop(
             }
             // SetGeneratedAudio (Phase 1 PR8): in-memory audio buffer
             // delivered by the GUI. Used both for
-            // `AudioSourcePath::Generated { id }` (file-pool entries the
-            // user can wire into AudioContent events) and for
-            // VOICEVOX-style per-clip vocal output (gen_id =
-            // `(track_id as u64) << 32 | clip_id as u64`, picked up by
-            // `process_track_owned`'s vocal block). Applied directly
-            // from the receive loop with `ArcSwap.store` so the audio
-            // callback sees the new buffer on the next dispatch
-            // without going through `cmd_rx` — that channel is parked
-            // while `export_running` is set.
-            Ok(MainToChild::SetGeneratedAudio {
-                id,
-                sample_rate,
-                channels,
-                samples,
-            }) => {
-                if samples.len() != channels as usize {
-                    tracing::error!(
-                        id,
-                        channels,
-                        samples_outer_len = samples.len(),
-                        "SetGeneratedAudio: planar samples outer length must equal channels — dropping"
-                    );
-                    continue;
-                }
-                let frames = samples.first().map(|s| s.len() as u64).unwrap_or(0);
-                if !samples.iter().all(|s| s.len() as u64 == frames) {
-                    tracing::error!(
-                        id,
-                        frames,
-                        "SetGeneratedAudio: planar channels have mismatched lengths — dropping"
-                    );
-                    continue;
-                }
-                let buffer = Arc::new(crate::audio_clip_renderer::AudioSourceBuffer {
-                    sample_rate,
-                    channels,
-                    frames,
-                    samples,
-                });
-                let cur = engine_shared.generated_audio_store.load();
-                let mut new_map: std::collections::HashMap<
-                    u64,
-                    Arc<crate::audio_clip_renderer::AudioSourceBuffer>,
-                > = (**cur).clone();
-                new_map.insert(id, buffer);
-                engine_shared.generated_audio_store.store(Arc::new(new_map));
-                tracing::info!(id, channels, frames, "generated audio buffer stored");
-            }
+            // PR-V4: `MainToChild::SetGeneratedAudio` 削除済 (= VOICEVOX
+            // 経路は builtin instrument plugin が plugin host 内で完結)。
+            // 互換性のため variant をしばらく残す場合は ignore arm を
+            // 入れるが、 完全削除したのでここは何もしない。
             // SetProjectDir (Phase 1 PR2): record the current project
             // directory so PR6's `compile_audio_schedule` can resolve
             // `AudioSourcePath::ProjectRelative` against

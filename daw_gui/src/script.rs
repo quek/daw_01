@@ -16,7 +16,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
-use boa_engine::object::builtins::JsTypedArray;
 use boa_engine::property::Attribute;
 use boa_engine::value::TryFromJs;
 use boa_engine::{
@@ -539,39 +538,18 @@ fn daw_wait_for_plugin_loaded(
     Ok(JsValue::undefined())
 }
 
-/// JS test API: `daw.setGeneratedAudio(id, samples, sample_rate)`. Mono-only
-/// (`channels = 1`) — multi-channel test injection can be added when a use
-/// case appears. `id` matches the IPC `MainToChild::SetGeneratedAudio { id }`
-/// keyspace; for VOICEVOX-style test payloads use
-/// `((track_id << 32) | clip_id)`.
+/// PR-V4: JS test API `daw.setGeneratedAudio` は無効化 (= no-op)。 旧
+/// `MainToChild::SetGeneratedAudio` 経路を IPC から削除したため。
+/// 新しい builtin VOICEVOX 経路では plugin が自前で synth するので、
+/// JS 側から audio buffer を直接注入する API は不要。
 fn daw_set_generated_audio(
     _this: &JsValue,
-    args: &[JsValue],
-    ctx: &mut Context,
+    _args: &[JsValue],
+    _ctx: &mut Context,
 ) -> JsResult<JsValue> {
-    let id = u64::try_from_js(args.get_or_undefined(0), ctx)?;
-    let samples_value = args.get_or_undefined(1).clone();
-    let sample_rate = u32::try_from_js(args.get_or_undefined(2), ctx)?;
-
-    let typed = JsTypedArray::from_object(samples_value.as_object().ok_or_else(|| {
-        JsNativeError::typ().with_message("samples must be a Float32Array")
-    })?)
-    .map_err(|_| JsNativeError::typ().with_message("samples must be a Float32Array"))?;
-    let len = typed.length(ctx)?;
-    let mut samples = Vec::with_capacity(len);
-    for i in 0..len {
-        let v = typed.at(i as i64, ctx)?;
-        samples.push(v.to_number(ctx)? as f32);
-    }
-
-    with_host(|h| {
-        let _ = h.bootstrap.audio_tx.send(MainToChild::SetGeneratedAudio {
-            id,
-            sample_rate,
-            channels: 1,
-            samples: vec![samples],
-        });
-    });
+    tracing::warn!(
+        "daw.setGeneratedAudio: PR-V4 で削除済 (= builtin VOICEVOX plugin 経由に移行)、 no-op"
+    );
     Ok(JsValue::undefined())
 }
 

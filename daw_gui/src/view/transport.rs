@@ -133,15 +133,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     );
     x += loop_w + 6.0;
 
-    // VOICEVOX synth
-    let synth_w = 88.0;
-    ui.button_at(
-        "transport_synth",
-        "Synth (V)",
-        Rect { x, y: cy, w: synth_w, h: bh },
-        || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::SynthesizeVocal)),
-    );
-    x += synth_w + 6.0;
+    // PR-V4: 旧「Synth (V)」 ボタンは削除。 builtin VOICEVOX plugin が
+    // 歌詞 / notes 変更時に自動 synth する (= sync_vocal_metadata 経由)。
 
     // Add Vocal Track
     let add_w = 110.0;

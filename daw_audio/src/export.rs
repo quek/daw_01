@@ -191,7 +191,6 @@ fn render_loop(
         // Snapshot the same wait-free state the audio thread reads.
         let plugin_refs_g = engine_shared.plugin_refs.load();
         let slot_map_g = engine_shared.slot_to_plugin_id.load();
-        let generated_audio_g = engine_shared.generated_audio_store.load();
         let worker_syncs_g = engine_shared.worker_syncs.load();
         let pool_g = engine_shared.worker_pool.load();
         let audio_renderer_g = engine_shared.audio_clip_renderer.load();
@@ -204,7 +203,6 @@ fn render_loop(
                 &mut scratch[..n_tracks],
                 &plugin_refs_g,
                 &slot_map_g,
-                &generated_audio_g,
                 audio_renderer,
                 &worker_syncs_g,
                 &mut master_l[..frames],
@@ -232,7 +230,6 @@ fn render_loop(
                     &mut scratch[track_idx],
                     &plugin_refs_g,
                     &slot_map_g,
-                    &generated_audio_g,
                     Some(audio_renderer),
                     worker_sync,
                     sample_rate,

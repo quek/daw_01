@@ -173,11 +173,10 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             }));
         }
     }
-    if ui.take_shortcut("daw.synthesize_vocal") {
-        ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.handle_event(AppEvent::SynthesizeVocal)
-        }));
-    }
+    // PR-V4: daw.synthesize_vocal shortcut は無効化 (builtin VOICEVOX
+    // plugin が自動 synth するため explicit trigger 不要)。 user が
+    // shortcut を押しても sync_vocal_metadata で再 flush が走るので、
+    // 「再 synth したい」 場合は notes 編集すれば trigger される。
 
     // ----- File -----
     if ui.take_shortcut("new") {

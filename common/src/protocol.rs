@@ -223,22 +223,10 @@ pub enum MainToChild {
     /// `render` extension can pick higher-quality algorithms during
     /// export and revert afterwards.
     SetRenderMode(RenderMode),
-    /// Generic in-memory audio buffer keyed by `id`. The same `id`
-    /// is embedded in `AudioSourcePath::Generated { id }` for
-    /// file-pool-style lookups, and is the per-clip key VOICEVOX
-    /// uses for its synthesised vocal audio (PR8: replaces the old
-    /// `SetVocalAudio`). Multi-channel (planar
-    /// `samples[channel][frame]`). The audio engine stores the buffer
-    /// in `EngineShared::generated_audio_store`. Spec:
-    /// `docs/plan_audio_clip.md` §9.3.
-    SetGeneratedAudio {
-        id: u64,
-        sample_rate: u32,
-        channels: u16,
-        /// Planar storage — outer length must equal `channels`. All
-        /// inner vecs must be the same length (= frame count).
-        samples: Vec<Vec<f32>>,
-    },
+    // PR-V4: `MainToChild::SetGeneratedAudio` 削除済。 旧 path で
+    // VOICEVOX 合成結果を audio engine に流していたが、 builtin
+    // instrument plugin (`PluginFormat::Builtin`) が plugin host 内で
+    // 合成を完結させるため不要に。
     /// Tell the audio engine the current project directory so it can
     /// resolve `AudioSourcePath::ProjectRelative` entries against
     /// `<project_dir>/samples/<...>`. `None` for unsaved projects —
