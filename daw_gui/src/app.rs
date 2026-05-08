@@ -339,6 +339,22 @@ pub struct AppData {
     /// Transport time_sig numerator 入力欄の編集中文字列。 同上。
     pub time_sig_num_edit_text: String,
 
+    // ---- Audio event 数値 field 編集 buffer (Phase 2 PR2) ---------------
+    /// 現 buffer がどの clip 用にロードされているか。 `selected_clip` が
+    /// 変わったら view 側が `AppEvent::ResyncClipEditBuffers(target)` を
+    /// 発火して `resync_clip_audio_event_edit_buffers` で再生成。 `None`
+    /// は「未ロード」 (= 起動直後 / clip 未選択)。 編集 buffer の中身が
+    /// この target の現値と整合する保証はないが (= ユーザー入力中はズレる)、
+    /// commit / resync で必ず書き戻す。
+    pub clip_edit_buffer_target: Option<ClipRef>,
+    /// `AudioEvent.gain_db` 入力欄の編集中文字列 (`{:.1}` で format)。
+    pub clip_gain_db_edit_text: String,
+    /// `AudioEvent.pan` 入力欄の編集中文字列 (`{:.2}`、 -1.0 .. 1.0)。
+    pub clip_pan_edit_text: String,
+    /// `AudioEvent.pitch_semitones` 入力欄の編集中文字列 (`{:+.1}`、
+    /// -96.0 .. 96.0、 Bitwig spec §3.6)。
+    pub clip_pitch_edit_text: String,
+
     pub undo_stack: VecDeque<Song>,
     pub redo_stack: VecDeque<Song>,
 
@@ -485,6 +501,10 @@ impl AppData {
             track_rename_text: String::new(),
             bpm_edit_text: format!("{initial_bpm:.1}"),
             time_sig_num_edit_text: initial_time_sig_num.to_string(),
+            clip_edit_buffer_target: None,
+            clip_gain_db_edit_text: String::new(),
+            clip_pan_edit_text: String::new(),
+            clip_pitch_edit_text: String::new(),
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             is_help_open: false,
@@ -874,6 +894,12 @@ impl AppData {
                 | AppEvent::SetClipReversed { .. }
                 | AppEvent::SetClipMuted { .. }
                 | AppEvent::SetClipStretchMode { .. }
+                | AppEvent::CommitClipGainEdit
+                | AppEvent::CommitClipPanEdit
+                | AppEvent::CommitClipPitchEdit
+                | AppEvent::SetClipGainDb { .. }
+                | AppEvent::SetClipPan { .. }
+                | AppEvent::SetClipPitchSemitones { .. }
                 | AppEvent::ImportAudio { .. }
                 | AppEvent::AddNote { .. }
                 | AppEvent::ResizeNote { .. }
@@ -1425,6 +1451,38 @@ pub enum AppEvent {
     /// `Stretch` / `Slice` は §3.7 に従って Raw 同等で再生される
     /// (Phase 3+ で本実装)。
     SetClipStretchMode { target: ClipRef, mode: common::model::StretchMode },
+
+    // ---- Audio event 数値 field 編集 (Phase 2 PR2) ----------------------
+    /// Inspector の `target` clip 用 edit buffer (gain / pan / pitch) を
+    /// `target` の現値で再生成する。 `selected_clip` 切替や Undo/Redo /
+    /// open / new で発火。 view 側でも buffer の target が現選択と
+    /// 違ければ `Edit::mutate` で同 AppEvent を push する。 buffer の
+    /// 中身を「現値の formatted 文字列」 に書き戻す純 sync 操作なので
+    /// `is_undoable` ではない。
+    ResyncClipEditBuffers(ClipRef),
+
+    /// text_input が 1 文字毎に発行する change event。 buffer 文字列を
+    /// 受け取って `clip_*_edit_text` に書き込むだけ (parse / commit はしない)。
+    /// `is_undoable` ではない (= 連続 typing で undo step を量産しない、
+    /// commit 系を 1 step とする)。
+    ClipGainEditChanged(String),
+    ClipPanEditChanged(String),
+    ClipPitchEditChanged(String),
+
+    /// text_input commit (Enter / focus 喪失) で `clip_*_edit_text` を
+    /// parse して該当 field を更新、 失敗時は buffer を現値に書き戻す。
+    /// `is_undoable` (= 1 commit = 1 Undo step)。 既存 `CommitBpmEdit` と
+    /// 同じパターン。
+    CommitClipGainEdit,
+    CommitClipPanEdit,
+    CommitClipPitchEdit,
+
+    /// Programmatic な field 設定 (Inspector の commit から呼ばれる /
+    /// JS test API 経由 / 将来の knob drag からも)。 全 event に
+    /// broadcast (`SetClipReversed` 等と同じ semantics)。
+    SetClipGainDb { target: ClipRef, gain_db: f32 },
+    SetClipPan { target: ClipRef, pan: f32 },
+    SetClipPitchSemitones { target: ClipRef, semitones: f32 },
 }
 
 impl AppData {
@@ -1749,6 +1807,36 @@ impl AppData {
             }
             AppEvent::SetClipStretchMode { target, mode } => {
                 self.set_clip_audio_event_stretch_mode(target, mode);
+            }
+            AppEvent::ResyncClipEditBuffers(target) => {
+                self.resync_clip_audio_event_edit_buffers(target);
+            }
+            AppEvent::ClipGainEditChanged(s) => {
+                self.clip_gain_db_edit_text = s;
+            }
+            AppEvent::ClipPanEditChanged(s) => {
+                self.clip_pan_edit_text = s;
+            }
+            AppEvent::ClipPitchEditChanged(s) => {
+                self.clip_pitch_edit_text = s;
+            }
+            AppEvent::CommitClipGainEdit => {
+                self.commit_clip_gain_edit();
+            }
+            AppEvent::CommitClipPanEdit => {
+                self.commit_clip_pan_edit();
+            }
+            AppEvent::CommitClipPitchEdit => {
+                self.commit_clip_pitch_edit();
+            }
+            AppEvent::SetClipGainDb { target, gain_db } => {
+                self.set_clip_audio_event_gain_db(target, gain_db);
+            }
+            AppEvent::SetClipPan { target, pan } => {
+                self.set_clip_audio_event_pan(target, pan);
+            }
+            AppEvent::SetClipPitchSemitones { target, semitones } => {
+                self.set_clip_audio_event_pitch_semitones(target, semitones);
             }
             AppEvent::SplitClipAtPlayhead { snap } => {
                 self.action_split_clips_at_cursor(snap);
@@ -3547,6 +3635,157 @@ impl AppData {
         }
     }
 
+    fn set_clip_audio_event_gain_db(&mut self, target: ClipRef, gain_db: f32) {
+        let gain_db = gain_db.clamp(-80.0, 24.0);
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return;
+        };
+        if let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+        {
+            for event in &mut audio.events {
+                event.gain_db = gain_db;
+            }
+            self.sync_song_to_plugin_host();
+        }
+        self.resync_clip_audio_event_edit_buffers(target);
+    }
+
+    fn set_clip_audio_event_pan(&mut self, target: ClipRef, pan: f32) {
+        let pan = pan.clamp(-1.0, 1.0);
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return;
+        };
+        if let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+        {
+            for event in &mut audio.events {
+                event.pan = pan;
+            }
+            self.sync_song_to_plugin_host();
+        }
+        self.resync_clip_audio_event_edit_buffers(target);
+    }
+
+    fn set_clip_audio_event_pitch_semitones(&mut self, target: ClipRef, semitones: f32) {
+        // Bitwig spec §3.6: Pitch range is -96 .. +96 semitones.
+        let semitones = semitones.clamp(-96.0, 96.0);
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return;
+        };
+        if let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+        {
+            for event in &mut audio.events {
+                event.pitch_semitones = semitones;
+            }
+            self.sync_song_to_plugin_host();
+        }
+        self.resync_clip_audio_event_edit_buffers(target);
+    }
+
+    /// `clip_*_edit_text` を `target` clip の first event の現値で
+    /// 再生成する。 select 切替や Undo/Redo / open 時に呼ぶ。 target が
+    /// 該当 clip を解決できない / `ClipContent::Audio` でない場合は
+    /// buffer を空に戻して target を `None` 化する (= inspector で
+    /// audio event section が消えている状態に整合)。
+    fn resync_clip_audio_event_edit_buffers(&mut self, target: ClipRef) {
+        let event_snapshot = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .and_then(|c| {
+                if let Some(common::model::ClipContent::Audio(audio)) =
+                    self.song.clip_contents.get(&c.content_id)
+                {
+                    audio.events.first().cloned()
+                } else {
+                    None
+                }
+            });
+        match event_snapshot {
+            Some(ev) => {
+                self.clip_edit_buffer_target = Some(target);
+                self.clip_gain_db_edit_text = format!("{:.1}", ev.gain_db);
+                self.clip_pan_edit_text = format!("{:.2}", ev.pan);
+                self.clip_pitch_edit_text = format!("{:+.1}", ev.pitch_semitones);
+            }
+            None => {
+                self.clip_edit_buffer_target = None;
+                self.clip_gain_db_edit_text.clear();
+                self.clip_pan_edit_text.clear();
+                self.clip_pitch_edit_text.clear();
+            }
+        }
+    }
+
+    /// text_input commit (Enter / focus 喪失) 経路。 buffer を parse して
+    /// 成功時は `set_clip_audio_event_gain_db` 経由で全 event 更新 +
+    /// resync (= buffer を formatted な現値に書き戻し)、 失敗時は
+    /// status_message + buffer のみ resync。 `CommitBpmEdit` と同じ pattern。
+    fn commit_clip_gain_edit(&mut self) {
+        let Some(target) = self.clip_edit_buffer_target else {
+            return;
+        };
+        match self.clip_gain_db_edit_text.trim().parse::<f32>() {
+            Ok(v) => self.set_clip_audio_event_gain_db(target, v),
+            Err(_) => {
+                self.status_message =
+                    format!("Gain: '{}' を数値として解釈できません", self.clip_gain_db_edit_text);
+                self.resync_clip_audio_event_edit_buffers(target);
+            }
+        }
+    }
+
+    fn commit_clip_pan_edit(&mut self) {
+        let Some(target) = self.clip_edit_buffer_target else {
+            return;
+        };
+        match self.clip_pan_edit_text.trim().parse::<f32>() {
+            Ok(v) => self.set_clip_audio_event_pan(target, v),
+            Err(_) => {
+                self.status_message =
+                    format!("Pan: '{}' を数値として解釈できません", self.clip_pan_edit_text);
+                self.resync_clip_audio_event_edit_buffers(target);
+            }
+        }
+    }
+
+    fn commit_clip_pitch_edit(&mut self) {
+        let Some(target) = self.clip_edit_buffer_target else {
+            return;
+        };
+        match self.clip_pitch_edit_text.trim().parse::<f32>() {
+            Ok(v) => self.set_clip_audio_event_pitch_semitones(target, v),
+            Err(_) => {
+                self.status_message = format!(
+                    "Pitch: '{}' を数値として解釈できません",
+                    self.clip_pitch_edit_text
+                );
+                self.resync_clip_audio_event_edit_buffers(target);
+            }
+        }
+    }
+
     /// 右端 trim ハンドラ。 `length_beats` を更新し、 audio clip では
     /// 各 `AudioEvent.event_length_beats` を新しい clip 長 (= clip 内 beats
     /// 軸) でクランプする。 これは Bitwig 流右端 trim 挙動 (`docs/plan
@@ -4696,6 +4935,18 @@ impl AppData {
     fn resync_song_edit_texts(&mut self) {
         self.bpm_edit_text = format!("{:.1}", self.song.bpm);
         self.time_sig_num_edit_text = self.song.time_sig.0.to_string();
+        // Audio event 数値 buffer も song 差し替え (open / new / undo /
+        // redo) に追従。 selected_clip が無い / 範囲外 / 非 audio なら
+        // resync が target を None 化してくれる。
+        match self.selected_clip {
+            Some(target) => self.resync_clip_audio_event_edit_buffers(target),
+            None => {
+                self.clip_edit_buffer_target = None;
+                self.clip_gain_db_edit_text.clear();
+                self.clip_pan_edit_text.clear();
+                self.clip_pitch_edit_text.clear();
+            }
+        }
     }
 
     fn set_master_gain(&mut self, gain: f32) {

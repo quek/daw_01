@@ -88,13 +88,26 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     );
     y += 28.0;
 
-    // ---- Audio Event section (Phase 2 PR1) ---------------------------
+    // ---- Audio Event section (Phase 2 PR1 + PR2) -----------------------
     // selected_clip が `ClipContent::Audio` のとき、 first event の field
-    // (Reverse / Mute / Stretch Mode) を編集できるトグル + ドロップダウン
-    // を表示。 編集 AppEvent は全 event に broadcast (Phase 1 で 1 clip
+    // を編集できる UI を表示。 PR1 で Reverse / Mute toggle + Stretch Mode
+    // dropdown、 PR2 で Gain (dB) / Pan / Pitch (semitones) text_input を
+    // 追加。 編集 AppEvent は全 event に broadcast (Phase 1 で 1 clip
     // 1 event 前提なので first event = clip 全体)。 `docs/plan_audio_clip
-    // .md` §3.7 / §3.8 / §3.9 (AudioEvent 選択時)。
+    // .md` §3.6 / §3.7 / §3.8 / §3.9 (AudioEvent 選択時)。
     if let Some(summary) = app.inspector_audio_event_summary() {
+        // text_input edit buffer の target が現選択と違ければ buffer
+        // 再生成を発火する。 1 frame だけ古い buffer を表示するが、
+        // 次 frame で正しい formatted 値に書き戻る (= 体感的にちらつかない)。
+        // 同じ Clip を選択し直しただけでは target は変わらない (=
+        // ResyncClipEditBuffers が無駄に走らない)。
+        if app.clip_edit_buffer_target != Some(summary.target) {
+            let target = summary.target;
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ResyncClipEditBuffers(target));
+            }));
+        }
+
         ui.label_at(
             "inspector_audio_event_label",
             "Audio Event",
@@ -182,7 +195,95 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 })
             }));
         }
-        y += 24.0 + 12.0;
+        y += 24.0 + 8.0;
+
+        // ---- Phase 2 PR2: numeric field text_input ------------------
+        // Gain (dB) / Pan / Pitch (semitones) を 1 行ずつ。 既存の
+        // `bpm_edit_text` と同じ「buffer に逐次書き込み + Enter で
+        // commit」 pattern。 buffer は target が現選択と整合するときのみ
+        // 表示用、 そうでなければ commit でも無視される。
+        let input_h = 22.0;
+        let label_w = 60.0;
+        let input_x = area.x + pad + label_w;
+        let input_w = row_w - label_w;
+
+        // Gain
+        ui.label_at(
+            "inspector_audio_gain_label",
+            "Gain dB",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT_DIM,
+        );
+        let gain_resp = ui.text_input_at(
+            "inspector_audio_gain_input",
+            Rect { x: input_x, y, w: input_w, h: input_h },
+            &app.clip_gain_db_edit_text,
+            |s| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ClipGainEditChanged(s))
+                })
+            },
+        );
+        if gain_resp.committed {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CommitClipGainEdit)
+            }));
+        }
+        y += input_h + 4.0;
+
+        // Pan
+        ui.label_at(
+            "inspector_audio_pan_label",
+            "Pan",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT_DIM,
+        );
+        let pan_resp = ui.text_input_at(
+            "inspector_audio_pan_input",
+            Rect { x: input_x, y, w: input_w, h: input_h },
+            &app.clip_pan_edit_text,
+            |s| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ClipPanEditChanged(s))
+                })
+            },
+        );
+        if pan_resp.committed {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CommitClipPanEdit)
+            }));
+        }
+        y += input_h + 4.0;
+
+        // Pitch (semitones)
+        ui.label_at(
+            "inspector_audio_pitch_label",
+            "Pitch st",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT_DIM,
+        );
+        let pitch_resp = ui.text_input_at(
+            "inspector_audio_pitch_input",
+            Rect { x: input_x, y, w: input_w, h: input_h },
+            &app.clip_pitch_edit_text,
+            |s| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ClipPitchEditChanged(s))
+                })
+            },
+        );
+        if pitch_resp.committed {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CommitClipPitchEdit)
+            }));
+        }
+        y += input_h + 12.0;
     }
 
     // Vocal source 編集 (Vocal track のときのみ)
