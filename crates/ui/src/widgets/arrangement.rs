@@ -239,6 +239,13 @@ pub enum ArrangementEditRequest {
     ToggleTrackMute(u32),
     ToggleTrackSolo(u32),
     SetLoopRange { start: f64, end: f64 },
+    /// M14 Phase 63j (#024): ruler 上 click / drag による playhead seek 要求。 caller は
+    /// (a) `view.playhead_beat = Some(beat)` 更新 (b) audio engine への seek IPC 送信に変換する。
+    /// widget は press frame と continuation frame (drag 中) で発火し、 release frame では
+    /// emit しない (drag 中の最後の値が確定値、 release 専用 commit は無し)。 同 frame 内で
+    /// 同値を 2 回送らないよう session 側で `last_emitted_beat` を保持。
+    /// **snap 適用済 + `0.0` 以上に clamp** (`view.snap.snap_beat(raw, alt, zoom)`)。
+    SetPlayheadBeat(f64),
     /// 横ズーム (`zoom_x_px_per_beat` = px/beat を **絶対値で更新**、`Ctrl+wheel` で発火)。
     /// widget 側で `current_zoom_x * factor` を計算済の絶対値を送る (`SetTrackRowH` と同パターン)。
     /// min/max の clamp は app 側で実施 (目安 2..400 px/beat、 1 拍 = 2px の超 zoom out 〜
@@ -882,6 +889,10 @@ struct LoopDragSession {
     /// drag 中の最終 mouse x 位置 (release frame の `pointer.pos` に頼らないための保険、
     /// `ClipDragSession.last_mouse` と同じ理由)。
     last_mouse_x: f32,
+    /// M14 Phase 63j (#024): drag 中の最終 alt 状態。 `ClipDragSession.last_alt` と
+    /// 同じ仕組みで track (continuation で update、 release で skip)。 release frame の
+    /// `pointer.modifiers.alt` が ModifiersChanged 先行で false 化する race を回避。
+    last_alt: bool,
 }
 
 /// M10 Phase 46 / M14 Phase 63c (#016): track header drag&drop session。 release frame で
@@ -898,6 +909,21 @@ struct TrackReorderSession {
     anchor_mouse_y: f32,
     /// drag 中の最終 mouse y 位置 (release frame の `pointer.pos` に頼らない保険、`ClipDragSession.last_mouse` と同理由)。
     last_mouse_y: f32,
+}
+
+/// M14 Phase 63j (#024): ruler 上の plain (= Shift 非保持) click / drag による
+/// playhead seek セッション。 press frame で `state.playhead_drag = Some(...)` し、
+/// continuation frame で毎 frame `SetPlayheadBeat` を発行 (`last_emitted_beat` で重複抑制)。
+/// release frame で `take()` して discard (commit-by-release 無し、 既に逐次発行済)。
+#[derive(Clone, Copy, Debug)]
+struct PlayheadDragSession {
+    /// drag 中の最終 mouse x 位置 (release frame の `pointer.pos` に頼らない保険、
+    /// `ClipDragSession.last_mouse` と同理由)。 release では emit しないので現状未使用だが、
+    /// 他 drag session と field 構成を揃えて将来の visual debug を容易にする。
+    last_mouse_x: f32,
+    /// drag 中に最後に発火した snap 適用済 beat 値 (毎 frame 同値発火を抑制)。
+    /// press frame で初期化済み (= press 即発行値)、 continuation で differ 時のみ更新 + emit。
+    last_emitted_beat: f64,
 }
 
 /// M10 Phase 47b: track header の bottom band slider drag による volume 編集セッション。
@@ -920,6 +946,9 @@ pub(crate) struct ArrangementState {
     loop_drag: Option<LoopDragSession>,
     track_reorder: Option<TrackReorderSession>,
     track_volume_drag: Option<TrackVolumeDragSession>,
+    /// M14 Phase 63j (#024): ruler plain click / drag による playhead seek セッション。
+    /// `Shift` 修飾無しの ruler 内 press で開始、 release で `take()` して discard。
+    playhead_drag: Option<PlayheadDragSession>,
     /// M14 Phase 63c (#016): 直前の `Single` クリック位置 (= Shift+click 範囲選択の起点)。
     /// caller には公開せず widget 内 SSoT として持つ (piano_roll の note multi-select は anchor
     /// なし設計だったが、 arrangement では daw_01 #009 / #016 で「widget 内 anchor」 が確認されている)。
@@ -947,6 +976,47 @@ fn compute_clip_drag_beat_delta(
     let snapped_pivot =
         snap.snap_beat(pivot + raw_beat_delta, nd.last_alt, zoom_x_px_per_beat);
     snapped_pivot - pivot
+}
+
+/// M14 Phase 63j (#024): loop drag の overlay と release commit で共有する snap 適用済
+/// `(start, end)` 計算。 clip drag と同じ pattern (overlay と commit が必ず同一値で確定):
+/// - **Start drag**: 端点 (cur_beat) を grid に round → `min(snapped, anchor_loop.1)` で start 確定
+/// - **End drag**: 端点 (cur_beat) を grid に round → `max(snapped, anchor_loop.0)` で end 確定
+/// - **Middle drag**: 絶対位置 snap (Cubase / Live の Move pattern と同じ)。 `anchor_loop.0` を pivot
+///   として grid に round → その差分 (delta) を両端に適用、 duration 維持。
+/// - **NewRange**: `anchor_press_beat` は press 時に snap 済 (caller 側責務)、 ここは cur_beat だけ
+///   snap。 両端を独立に snap してから順序正規化。 duration 0 でも問題なし (caller 側で扱う)。
+///
+/// `last_alt = true` で snap 一時無効 (raw 通過、 `MoveClips` と同じ alt 直交 policy)。
+fn compute_loop_drag_endpoints(
+    ld: &LoopDragSession,
+    cur_beat_raw: f64,
+    snap: &SnapConfig,
+    zoom_x_px_per_beat: f32,
+) -> (f64, f64) {
+    let alt = ld.last_alt;
+    match ld.kind {
+        LoopDragKind::Start => {
+            let s = snap.snap_beat(cur_beat_raw, alt, zoom_x_px_per_beat);
+            (s.min(ld.anchor_loop.1), ld.anchor_loop.1)
+        }
+        LoopDragKind::End => {
+            let e = snap.snap_beat(cur_beat_raw, alt, zoom_x_px_per_beat);
+            (ld.anchor_loop.0, e.max(ld.anchor_loop.0))
+        }
+        LoopDragKind::Middle => {
+            let raw_delta = cur_beat_raw - ld.anchor_press_beat;
+            let pivot = ld.anchor_loop.0;
+            let snapped_pivot =
+                snap.snap_beat(pivot + raw_delta, alt, zoom_x_px_per_beat);
+            let delta = snapped_pivot - pivot;
+            (ld.anchor_loop.0 + delta, ld.anchor_loop.1 + delta)
+        }
+        LoopDragKind::NewRange => {
+            let other = snap.snap_beat(cur_beat_raw, alt, zoom_x_px_per_beat);
+            (ld.anchor_press_beat.min(other), ld.anchor_press_beat.max(other))
+        }
+    }
 }
 
 /// M14 Phase 61b (#011): caller の `data_generation` は track 構成 (順序 / mute / solo /
@@ -1417,6 +1487,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let lanes =
             Rect { x: rect.x + header_w, y: rect.y + ruler_h, w: lanes_w, h: lanes_h };
 
+        // M9 Phase 45f / M14 Phase 63j (#024): snap 用 zoom = lanes.w / view.len_beats。
+        // press 振り分け (ruler の playhead seek) でも snap 計算に必要なため、 後の overlay 計算と
+        // 共有する目的で関数の頭で 1 度計算する。
+        let beat_per_px = view.len_beats / f64::from(lanes.w.max(1.0));
+        #[allow(clippy::cast_possible_truncation)]
+        let zoom_x_px_per_beat: f32 = (1.0 / beat_per_px) as f32;
+
         // ---- response 初期 ----
         let mut response = ArrangementResponse {
             ruler_rect: ruler,
@@ -1439,7 +1516,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let is_group_set: HashSet<u32> =
             tracks.iter().filter_map(|t| t.parent_id).collect();
 
-        // ---- press 振り分け: clip_drag / loop_drag を state に積む ----
+        // ---- press 振り分け: clip_drag / loop_drag / playhead_drag を state に積む ----
+        // M14 Phase 63j (#024): ruler の plain click は press frame で `SetPlayheadBeat` を 1 度
+        // 発火する (continuation は後段の per-frame block 経由)。 press block 内では state borrow が
+        // 走るため `push_edit` は呼べず、 `press_seek_beat` に貯めて press block を抜けてから 1 度発行。
+        let mut press_seek_beat: Option<f64> = None;
         if pointer.primary_just_pressed
             && let Some((px, py)) = pointer.pos
         {
@@ -1494,24 +1575,66 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
             if in_ruler {
                 let press_beat = px_to_beat(px, ruler.x, ruler.w, view);
-                let kind = if let Some(range) = view.loop_range {
-                    match loop_band_hit_kind(range, view, ruler, px, 4.0) {
-                        Some(LoopBandHit::Start) => LoopDragKind::Start,
-                        Some(LoopBandHit::End) => LoopDragKind::End,
-                        Some(LoopBandHit::Middle) => LoopDragKind::Middle,
-                        None => LoopDragKind::NewRange,
-                    }
+                let press_alt = pointer.modifiers.alt;
+                // M14 Phase 63j (#024): plain (= Shift 非保持) ruler 操作は **playhead seek**
+                // (Bitwig / Reaper / Ableton 流)、 Shift 修飾で従来の loop range edit に振り分け。
+                //
+                // 旧設計 (M9 Phase 45e〜): plain ruler drag = loop NewRange / Middle drag、 loop 端
+                // ハンドル drag = Start/End。 これでは「再生中の任意位置で split したい」 UX で
+                // ruler 上に playhead を置く手段が無く、 daw_01 #024 で「ユーザビリティが壊滅的」 と報告。
+                //
+                // 新設計:
+                //   - **plain ruler click/drag** → `SetPlayheadBeat` 連続発火 (snap 適用 + clamp ≥ 0)
+                //   - **Shift + ruler drag** → loop edit (NewRange / 既存 loop の Start/End/Middle)
+                // multi-track 系 widget で Shift は加算選択用なので潰さない設計判断、 ruler は
+                // 単一軸で Shift の他用途が無いので loop ops 専用 modifier として再利用する。
+                if shift {
+                    let kind = if let Some(range) = view.loop_range {
+                        match loop_band_hit_kind(range, view, ruler, px, 4.0) {
+                            Some(LoopBandHit::Start) => LoopDragKind::Start,
+                            Some(LoopBandHit::End) => LoopDragKind::End,
+                            Some(LoopBandHit::Middle) => LoopDragKind::Middle,
+                            None => LoopDragKind::NewRange,
+                        }
+                    } else {
+                        LoopDragKind::NewRange
+                    };
+                    // M14 Phase 63j (#024): NewRange の anchor 端点は press 時 snap で
+                    // grid に着地させる (caller 側 boilerplate を強要しない設計、 release 端点も
+                    // `compute_loop_drag_endpoints` で snap される)。 既存 loop の Start/End/Middle
+                    // drag は anchor が `view.loop_range` 由来 (= 既に commit 済 = grid 上前提) なので
+                    // press 時 snap 不要、 raw `press_beat` を保持して Middle の delta 計算に使う。
+                    let anchor_press_beat_for_session = match kind {
+                        LoopDragKind::NewRange => view
+                            .snap
+                            .snap_beat(press_beat, press_alt, zoom_x_px_per_beat),
+                        _ => press_beat,
+                    };
+                    let anchor_loop = view.loop_range.unwrap_or((
+                        anchor_press_beat_for_session,
+                        anchor_press_beat_for_session,
+                    ));
+                    let state: &mut ArrangementState = self.widget_state(wid);
+                    state.loop_drag = Some(LoopDragSession {
+                        kind,
+                        anchor_loop,
+                        anchor_press_beat: anchor_press_beat_for_session,
+                        last_mouse_x: px,
+                        last_alt: press_alt,
+                    });
                 } else {
-                    LoopDragKind::NewRange
-                };
-                let anchor_loop = view.loop_range.unwrap_or((press_beat, press_beat));
-                let state: &mut ArrangementState = self.widget_state(wid);
-                state.loop_drag = Some(LoopDragSession {
-                    kind,
-                    anchor_loop,
-                    anchor_press_beat: press_beat,
-                    last_mouse_x: px,
-                });
+                    // playhead seek session 開始 + press frame で 1 度発火 (continuation 発火は
+                    // 後段の per-frame block が担当)。 snap は `MoveClips` と同 policy: alt 押下で
+                    // 一時 OFF、 zoom_x_px_per_beat に対する Adaptive grid。
+                    let snapped =
+                        view.snap.snap_beat(press_beat, press_alt, zoom_x_px_per_beat).max(0.0);
+                    let state: &mut ArrangementState = self.widget_state(wid);
+                    state.playhead_drag = Some(PlayheadDragSession {
+                        last_mouse_x: px,
+                        last_emitted_beat: snapped,
+                    });
+                    press_seek_beat = Some(snapped);
+                }
             }
             // M10 Phase 46+47b: track header press 振り分け
             //  - volume band 内 → TrackVolumeDragSession (priority 最高)
@@ -1568,6 +1691,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
+        // M14 Phase 63j (#024): press block で貯めた playhead seek を 1 度発行 (state borrow 終了後)。
+        if let Some(beat) = press_seek_beat {
+            self.push_edit(make_edit(ArrangementEditRequest::SetPlayheadBeat(beat)));
+        }
+
         // ---- drag continue / release 検出 ----
         // drag 中なら continuation frame で `last_mouse` / `last_alt` (および各 drag の last_*) を
         // update。 **release frame の `last_alt` は update しない** — 同 frame に
@@ -1600,6 +1728,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 && !is_release
             {
                 ld.last_mouse_x = px;
+                // M14 Phase 63j (#024): last_alt は continuation で update、 release は
+                // skip (clip_drag と同じ pattern、 OS event 順序による false 化 race を回避)。
+                ld.last_alt = alt_now;
             }
             if let Some(ref mut tr) = state.track_reorder
                 && !is_release
@@ -1610,6 +1741,39 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 && !is_release
             {
                 tv.last_mouse_x = px;
+            }
+            // M14 Phase 63j (#024): playhead_drag continuation で last_mouse_x を track。
+            // release frame は session を後段で `take()` するため update 不要。
+            if let Some(ref mut pd) = state.playhead_drag
+                && !is_release
+            {
+                pd.last_mouse_x = px;
+            }
+        }
+
+        // M14 Phase 63j (#024): playhead drag continuation の per-frame live update。
+        // press frame は press block 内で発火済 (`press_seek_beat`)、 ここは continuation のみ。
+        // release frame は emit せず session を後段で take して discard する (commit-by-release 無し)。
+        // `last_emitted_beat` で同値発火を抑制 (1e-6 拍 = ~10μs @ 120BPM 以下は ignore)。
+        if let Some((px, _py)) = pointer.pos
+            && !pointer.primary_just_pressed
+            && !pointer.primary_just_released
+        {
+            let alt = pointer.modifiers.alt;
+            let mut emit_beat: Option<f64> = None;
+            {
+                let state: &mut ArrangementState = self.widget_state(wid);
+                if let Some(ref mut pd) = state.playhead_drag {
+                    let raw = px_to_beat(px, ruler.x, ruler.w, view);
+                    let next = view.snap.snap_beat(raw, alt, zoom_x_px_per_beat).max(0.0);
+                    if (next - pd.last_emitted_beat).abs() > 1e-6 {
+                        emit_beat = Some(next);
+                        pd.last_emitted_beat = next;
+                    }
+                }
+            }
+            if let Some(beat) = emit_beat {
+                self.push_edit(make_edit(ArrangementEditRequest::SetPlayheadBeat(beat)));
             }
         }
 
@@ -1807,10 +1971,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 None
             };
 
-        // drag overlay delta (last_mouse ベース、release と一貫)
-        let beat_per_px = view.len_beats / f64::from(lanes.w.max(1.0));
-        // M9 Phase 45f: snap 用 zoom = lanes.w / view.len_beats (Adaptive 計算用)。
-        let zoom_x_px_per_beat: f32 = (1.0 / beat_per_px) as f32;
+        // M14 Phase 63j (#024): playhead_drag は release frame で take して discard。
+        // continuous emit は per-frame block で完了済、 release 専用 commit は不要。
+        if pointer.primary_just_released {
+            let state: &mut ArrangementState = self.widget_state(wid);
+            let _ = state.playhead_drag.take();
+        }
+
+        // drag overlay delta (last_mouse ベース、release と一貫)。
+        // M14 Phase 63j (#024): `beat_per_px` / `zoom_x_px_per_beat` は関数頭で計算済 (press 振り分けの
+        // playhead seek snap でも使うため)。 ここでは shadow せず再利用する。
         let row_per_px = 1.0_f32 / view.track_row_h.max(1.0);
         let clip_drag_overlay: Option<(ClipDragSession, f64, i32)> = clip_drag_session
             .as_ref()
@@ -1836,20 +2006,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 (nd.clone(), beat_delta, track_delta)
             });
 
+        // M14 Phase 63j (#024): overlay の preview range も `compute_loop_drag_endpoints` で
+        // snap 適用済 (commit と同一値で確定、 release 時の「カクッ」 ずれを回避)。 alt は session の
+        // `last_alt` を真値とし、 `pointer.modifiers.alt` を直接見ない (clip_drag と同じ pattern)。
         let loop_drag_preview_range: Option<(f64, f64)> = loop_drag_session.map(|ld| {
             let cur_beat = px_to_beat(ld.last_mouse_x, ruler.x, ruler.w, view);
-            match ld.kind {
-                LoopDragKind::Start => (cur_beat.min(ld.anchor_loop.1), ld.anchor_loop.1),
-                LoopDragKind::End => (ld.anchor_loop.0, cur_beat.max(ld.anchor_loop.0)),
-                LoopDragKind::Middle => {
-                    let dx_beat = cur_beat - ld.anchor_press_beat;
-                    (ld.anchor_loop.0 + dx_beat, ld.anchor_loop.1 + dx_beat)
-                }
-                LoopDragKind::NewRange => (
-                    ld.anchor_press_beat.min(cur_beat),
-                    ld.anchor_press_beat.max(cur_beat),
-                ),
-            }
+            compute_loop_drag_endpoints(&ld, cur_beat, &view.snap, zoom_x_px_per_beat)
         });
 
         // ---- hover 計算 ----
@@ -2293,20 +2455,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ---- loop drag release → SetLoopRange ----
+        // M14 Phase 63j (#024): snap 適用済 endpoints を overlay と共通の helper で計算。
+        // alt は `ld.last_alt` を真値とし、 release frame の `pointer.modifiers.alt` を直接見ない
+        // (clip_drag と同じ理由 — OS event 順序で false 化する race を回避)。
         if let Some(ld) = loop_drag_release {
             let cur_beat = px_to_beat(ld.last_mouse_x, ruler.x, ruler.w, view);
-            let (start, end) = match ld.kind {
-                LoopDragKind::Start => (cur_beat.min(ld.anchor_loop.1), ld.anchor_loop.1),
-                LoopDragKind::End => (ld.anchor_loop.0, cur_beat.max(ld.anchor_loop.0)),
-                LoopDragKind::Middle => {
-                    let dx = cur_beat - ld.anchor_press_beat;
-                    (ld.anchor_loop.0 + dx, ld.anchor_loop.1 + dx)
-                }
-                LoopDragKind::NewRange => (
-                    ld.anchor_press_beat.min(cur_beat),
-                    ld.anchor_press_beat.max(cur_beat),
-                ),
-            };
+            let (start, end) =
+                compute_loop_drag_endpoints(&ld, cur_beat, &view.snap, zoom_x_px_per_beat);
             self.push_edit(make_edit(ArrangementEditRequest::SetLoopRange { start, end }));
         }
 
@@ -2740,6 +2895,7 @@ fn rects_intersect(a: Rect, b: Rect) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snap::SnapMode;
 
     fn clip(id: u32, start: f64, len: f64, name: &str) -> ArrangementClip {
         ArrangementClip {
@@ -3771,5 +3927,646 @@ mod tests {
             s.track_group_bg.r > 0.0 || s.track_group_bg.g > 0.0 || s.track_group_bg.b > 0.0,
             "track_group_bg は黒以外の色"
         );
+    }
+
+    // ============================================================
+    // M14 Phase 63j (#024): ruler click / drag による playhead seek
+    // ============================================================
+
+    /// ruler 内 plain (Shift 非保持) click で `SetPlayheadBeat` が press frame で発火する。
+    #[test]
+    fn ruler_plain_click_emits_set_playhead_beat() {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        // header_w = 0 / ruler_h = 24 / lanes_w = 800 / len_beats = 16 → 50 px/beat
+        let view = ArrangementView {
+            header_w: 0.0,
+            ruler_h: 24.0,
+            start_beat: 0.0,
+            len_beats: 16.0,
+            snap: SnapConfig::OFF,
+            ..ArrangementView::default()
+        };
+        let model = Model { tracks: vec![track(0, "t", vec![])], view };
+
+        let observed: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
+        let observed_cb = Arc::clone(&observed);
+        // ruler 内 (y=10 < ruler_h=24) で px=200 → beat = 200 / 50 = 4.0
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 10.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        };
+        let _ = host.frame_to_edits(&model, &mut scene, screen, input, |m, ui| {
+            let style = ArrangementStyle::default();
+            let observed_cb = Arc::clone(&observed_cb);
+            let _ = ui.arrangement(
+                "arr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &m.tracks,
+                m.view,
+                &[],
+                &[],
+                &style,
+                move |req| {
+                    if let ArrangementEditRequest::SetPlayheadBeat(b) = req {
+                        observed_cb.lock().unwrap().push(b);
+                    }
+                    Edit::mutate(|_: &mut Model| {})
+                },
+            );
+        });
+        let log = observed.lock().unwrap();
+        assert_eq!(log.len(), 1, "press frame で 1 度だけ発火: log={log:?}");
+        assert!((log[0] - 4.0).abs() < 1e-6, "beat = px/(px_per_beat) = 200/50 = 4.0: got {}", log[0]);
+    }
+
+    /// ruler 内 click でも **Shift 修飾**は loop range edit に振り分けられ、 SetPlayheadBeat は emit しない。
+    #[test]
+    fn ruler_shift_click_does_not_emit_set_playhead_beat() {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::{Modifiers, PhysicalSize};
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let view = ArrangementView {
+            header_w: 0.0,
+            ruler_h: 24.0,
+            snap: SnapConfig::OFF,
+            ..ArrangementView::default()
+        };
+        let model = Model { tracks: vec![track(0, "t", vec![])], view };
+
+        let seek_log: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let seek_log_cb = Arc::clone(&seek_log);
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 10.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                modifiers: Modifiers { shift: true, ..Modifiers::default() },
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        };
+        let _ = host.frame_to_edits(&model, &mut scene, screen, input, |m, ui| {
+            let style = ArrangementStyle::default();
+            let seek_log_cb = Arc::clone(&seek_log_cb);
+            let _ = ui.arrangement(
+                "arr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &m.tracks,
+                m.view,
+                &[],
+                &[],
+                &style,
+                move |req| {
+                    if matches!(req, ArrangementEditRequest::SetPlayheadBeat(_)) {
+                        *seek_log_cb.lock().unwrap() += 1;
+                    }
+                    Edit::mutate(|_: &mut Model| {})
+                },
+            );
+        });
+        assert_eq!(*seek_log.lock().unwrap(), 0, "Shift+ruler click は SetPlayheadBeat 非発火 (loop ops 専用)");
+    }
+
+    /// ruler 内 click で `view.snap` が active なら snap 適用済 beat が emit される (alt 非保持)。
+    #[test]
+    fn ruler_plain_click_applies_snap_when_active() {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+        use crate::snap::{SnapConfig, SnapMode};
+
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        // 50 px/beat、 snap = Beat (1 拍単位)、 px=210 → raw beat 4.2 → snap → 4.0
+        // 1 beat snap = 1/4 note = SnapMode::Straight { div: 4 }
+        let view = ArrangementView {
+            header_w: 0.0,
+            ruler_h: 24.0,
+            start_beat: 0.0,
+            len_beats: 16.0,
+            snap: SnapConfig {
+                mode: SnapMode::Straight { div: 4 },
+                enabled: true,
+                min_beat_unit: 1.0 / 128.0,
+                time_sig: (4, 4),
+            },
+            ..ArrangementView::default()
+        };
+        let model = Model { tracks: vec![track(0, "t", vec![])], view };
+
+        let observed: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
+        let observed_cb = Arc::clone(&observed);
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((210.0, 10.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        };
+        let _ = host.frame_to_edits(&model, &mut scene, screen, input, |m, ui| {
+            let style = ArrangementStyle::default();
+            let observed_cb = Arc::clone(&observed_cb);
+            let _ = ui.arrangement(
+                "arr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &m.tracks,
+                m.view,
+                &[],
+                &[],
+                &style,
+                move |req| {
+                    if let ArrangementEditRequest::SetPlayheadBeat(b) = req {
+                        observed_cb.lock().unwrap().push(b);
+                    }
+                    Edit::mutate(|_: &mut Model| {})
+                },
+            );
+        });
+        let log = observed.lock().unwrap();
+        assert_eq!(log.len(), 1, "1 度だけ発火: log={log:?}");
+        assert!(
+            (log[0] - 4.0).abs() < 1e-6,
+            "raw=4.2 → snap (Beat 1) → 4.0: got {}",
+            log[0],
+        );
+    }
+
+    /// ruler drag 中 (press → continuation) で位置移動毎に SetPlayheadBeat が継続発火する。
+    /// 同 frame 同値抑制 (`last_emitted_beat` 比較) の確認も兼ねる。
+    #[test]
+    fn ruler_drag_emits_continuous_set_playhead_beat() {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let view = ArrangementView {
+            header_w: 0.0,
+            ruler_h: 24.0,
+            snap: SnapConfig::OFF,
+            ..ArrangementView::default()
+        };
+        let model = Model { tracks: vec![track(0, "t", vec![])], view };
+
+        let observed: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
+        let observed_cb = Arc::clone(&observed);
+
+        // helper: 1 frame 流す (3 frame: press → move → release)
+        let run_frame = |host: &mut UiHost<Model>,
+                         scene: &mut Scene,
+                         input: FrameInput,
+                         observed_cb: Arc<Mutex<Vec<f64>>>| {
+            let _ = host.frame_to_edits(&model, scene, screen, input, |m, ui| {
+                let style = ArrangementStyle::default();
+                let _ = ui.arrangement(
+                    "arr",
+                    Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                    &m.tracks,
+                    m.view,
+                    &[],
+                    &[],
+                    &style,
+                    move |req| {
+                        if let ArrangementEditRequest::SetPlayheadBeat(b) = req {
+                            observed_cb.lock().unwrap().push(b);
+                        }
+                        Edit::mutate(|_: &mut Model| {})
+                    },
+                );
+            });
+        };
+
+        // frame 1: press at px=100 → beat 2.0
+        run_frame(
+            &mut host,
+            &mut scene,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((100.0, 10.0)),
+                    primary_just_pressed: true,
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..FrameInput::default()
+            },
+            Arc::clone(&observed_cb),
+        );
+        // frame 2: continuation, drag to px=300 → beat 6.0
+        run_frame(
+            &mut host,
+            &mut scene,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((300.0, 10.0)),
+                    primary_just_pressed: false,
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..FrameInput::default()
+            },
+            Arc::clone(&observed_cb),
+        );
+        // frame 3: release → no emit (release 専用 commit 無し)
+        run_frame(
+            &mut host,
+            &mut scene,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((300.0, 10.0)),
+                    primary_just_pressed: false,
+                    primary_pressed: false,
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..FrameInput::default()
+            },
+            Arc::clone(&observed_cb),
+        );
+
+        let log = observed.lock().unwrap();
+        assert_eq!(log.len(), 2, "press + continuation の 2 発、 release は emit しない: log={log:?}");
+        assert!((log[0] - 2.0).abs() < 1e-6, "press frame: beat = 100/50 = 2.0: got {}", log[0]);
+        assert!((log[1] - 6.0).abs() < 1e-6, "drag frame: beat = 300/50 = 6.0: got {}", log[1]);
+    }
+
+    // ============================================================
+    // M14 Phase 63j (#024): loop range edit に snap 適用
+    // ============================================================
+
+    fn snap_quarter_beat() -> SnapConfig {
+        // 1 beat snap = SnapMode::Straight { div: 4 }
+        SnapConfig {
+            mode: SnapMode::Straight { div: 4 },
+            enabled: true,
+            min_beat_unit: 1.0 / 128.0,
+            time_sig: (4, 4),
+        }
+    }
+
+    /// `compute_loop_drag_endpoints` の Start drag は moving 端点を grid に snap、 fixed 端点は不変。
+    #[test]
+    fn loop_endpoints_start_drag_snaps_moving_endpoint() {
+        let ld = LoopDragSession {
+            kind: LoopDragKind::Start,
+            anchor_loop: (4.0, 12.0),
+            anchor_press_beat: 4.0,
+            last_mouse_x: 0.0,
+            last_alt: false,
+        };
+        let snap = snap_quarter_beat();
+        // cur_beat raw = 1.7 → snap → 2.0 (1 beat grid に round)、 end は 12.0 不変
+        let (s, e) = compute_loop_drag_endpoints(&ld, 1.7, &snap, 50.0);
+        assert!((s - 2.0).abs() < 1e-6, "Start drag で raw 1.7 → snap 2.0: got {s}");
+        assert!((e - 12.0).abs() < 1e-6, "End は不変 12.0: got {e}");
+    }
+
+    /// End drag は end 端点を grid に snap、 start 端点は不変。
+    #[test]
+    fn loop_endpoints_end_drag_snaps_moving_endpoint() {
+        let ld = LoopDragSession {
+            kind: LoopDragKind::End,
+            anchor_loop: (4.0, 12.0),
+            anchor_press_beat: 12.0,
+            last_mouse_x: 0.0,
+            last_alt: false,
+        };
+        let snap = snap_quarter_beat();
+        // cur_beat raw = 13.4 → snap → 13.0、 start は 4.0 不変
+        let (s, e) = compute_loop_drag_endpoints(&ld, 13.4, &snap, 50.0);
+        assert!((s - 4.0).abs() < 1e-6, "Start は不変 4.0: got {s}");
+        assert!((e - 13.0).abs() < 1e-6, "End drag で raw 13.4 → snap 13.0: got {e}");
+    }
+
+    /// Middle drag は両端点を同 delta で平行移動 (duration 維持)、 delta は anchor_loop.0 が
+    /// grid に着地するよう計算 (Cubase Move 流の絶対位置 snap)。
+    #[test]
+    fn loop_endpoints_middle_drag_preserves_duration_with_snap() {
+        let ld = LoopDragSession {
+            kind: LoopDragKind::Middle,
+            anchor_loop: (4.0, 12.0),
+            anchor_press_beat: 6.0, // press 位置 (anchor_loop 内側のどこか)
+            last_mouse_x: 0.0,
+            last_alt: false,
+        };
+        let snap = snap_quarter_beat();
+        // cur_beat raw = 7.7 → raw_delta = 1.7 → pivot = 4.0、 4.0 + 1.7 = 5.7 → snap → 6.0
+        // → delta = 6.0 - 4.0 = 2.0 → new_range = (4.0+2.0, 12.0+2.0) = (6.0, 14.0)
+        // duration = 14.0 - 6.0 = 8.0 = 元 duration 維持
+        let (s, e) = compute_loop_drag_endpoints(&ld, 7.7, &snap, 50.0);
+        assert!((s - 6.0).abs() < 1e-6, "Middle drag で start は snap 6.0: got {s}");
+        assert!((e - 14.0).abs() < 1e-6, "Middle drag で end も同 delta 移動 14.0: got {e}");
+        assert!(
+            ((e - s) - 8.0).abs() < 1e-6,
+            "duration 8.0 維持: got {}",
+            e - s
+        );
+    }
+
+    /// NewRange は 両端点を independent に snap (anchor_press_beat は press 時 snap 済前提、
+    /// helper は cur_beat だけ snap)、 順序 (min, max) で正規化。
+    #[test]
+    fn loop_endpoints_newrange_snaps_both_endpoints() {
+        // anchor_press_beat = 2.0 (press 時 snap 済の値を caller が渡してくる)
+        let ld = LoopDragSession {
+            kind: LoopDragKind::NewRange,
+            anchor_loop: (2.0, 2.0),
+            anchor_press_beat: 2.0,
+            last_mouse_x: 0.0,
+            last_alt: false,
+        };
+        let snap = snap_quarter_beat();
+        // cur_beat raw = 9.4 → snap → 9.0、 anchor_press = 2.0、 → (2.0, 9.0)
+        let (s, e) = compute_loop_drag_endpoints(&ld, 9.4, &snap, 50.0);
+        assert!((s - 2.0).abs() < 1e-6, "NewRange start = anchor_press 2.0: got {s}");
+        assert!((e - 9.0).abs() < 1e-6, "NewRange end = snap(9.4) = 9.0: got {e}");
+    }
+
+    /// NewRange で cur_beat < anchor_press_beat の場合、 (min, max) 順序で正規化される。
+    #[test]
+    fn loop_endpoints_newrange_normalizes_reversed_drag() {
+        let ld = LoopDragSession {
+            kind: LoopDragKind::NewRange,
+            anchor_loop: (8.0, 8.0),
+            anchor_press_beat: 8.0,
+            last_mouse_x: 0.0,
+            last_alt: false,
+        };
+        let snap = snap_quarter_beat();
+        // 右から左に drag: cur_beat raw = 3.4 → snap → 3.0、 anchor_press = 8.0
+        // → (3.0, 8.0) (min, max で正規化)
+        let (s, e) = compute_loop_drag_endpoints(&ld, 3.4, &snap, 50.0);
+        assert!((s - 3.0).abs() < 1e-6, "右→左 drag でも min が start: got {s}");
+        assert!((e - 8.0).abs() < 1e-6, "max が end: got {e}");
+    }
+
+    /// `last_alt = true` で snap 一時無効、 raw 値が通る (`MoveClips` 同 policy)。
+    #[test]
+    fn loop_endpoints_alt_bypasses_snap() {
+        let ld = LoopDragSession {
+            kind: LoopDragKind::End,
+            anchor_loop: (4.0, 12.0),
+            anchor_press_beat: 12.0,
+            last_mouse_x: 0.0,
+            last_alt: true, // alt 押下中は snap 無効
+        };
+        let snap = snap_quarter_beat();
+        // cur_beat raw = 13.4 → alt bypass → 13.4 そのまま
+        let (s, e) = compute_loop_drag_endpoints(&ld, 13.4, &snap, 50.0);
+        assert!((s - 4.0).abs() < 1e-6, "Start は不変 4.0: got {s}");
+        assert!((e - 13.4).abs() < 1e-6, "alt bypass で raw 13.4 そのまま: got {e}");
+    }
+
+    /// snap OFF 時は raw 値が通る (regression: 既存の non-snap caller を壊さない)。
+    #[test]
+    fn loop_endpoints_snap_off_returns_raw() {
+        let ld = LoopDragSession {
+            kind: LoopDragKind::Start,
+            anchor_loop: (4.0, 12.0),
+            anchor_press_beat: 4.0,
+            last_mouse_x: 0.0,
+            last_alt: false,
+        };
+        // cur_beat raw = 2.345 → snap OFF なので 2.345 そのまま
+        let (s, e) = compute_loop_drag_endpoints(&ld, 2.345, &SnapConfig::OFF, 50.0);
+        assert!((s - 2.345).abs() < 1e-6, "snap OFF で raw 通過: got {s}");
+        assert!((e - 12.0).abs() < 1e-6, "End は不変: got {e}");
+    }
+
+    /// Shift+ruler drag → SetLoopRange が release frame で snap 適用済 endpoints で発火する
+    /// (整合性確認: NewRange、 press → drag → release の 3 frame 経由)。
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn shift_ruler_drag_emits_set_loop_range_with_snap() {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::{Modifiers, PhysicalSize};
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        // 50 px/beat、 snap = Straight { div: 4 } (1 beat snap)
+        let view = ArrangementView {
+            header_w: 0.0,
+            ruler_h: 24.0,
+            start_beat: 0.0,
+            len_beats: 16.0,
+            snap: SnapConfig {
+                mode: SnapMode::Straight { div: 4 },
+                enabled: true,
+                min_beat_unit: 1.0 / 128.0,
+                time_sig: (4, 4),
+            },
+            ..ArrangementView::default()
+        };
+        let model = Model { tracks: vec![track(0, "t", vec![])], view };
+
+        let observed: Arc<Mutex<Vec<(f64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let observed_cb = Arc::clone(&observed);
+
+        let run_frame = |host: &mut UiHost<Model>,
+                         scene: &mut Scene,
+                         input: FrameInput,
+                         observed_cb: Arc<Mutex<Vec<(f64, f64)>>>| {
+            let _ = host.frame_to_edits(&model, scene, screen, input, |m, ui| {
+                let style = ArrangementStyle::default();
+                let _ = ui.arrangement(
+                    "arr",
+                    Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                    &m.tracks,
+                    m.view,
+                    &[],
+                    &[],
+                    &style,
+                    move |req| {
+                        if let ArrangementEditRequest::SetLoopRange { start, end } = req {
+                            observed_cb.lock().unwrap().push((start, end));
+                        }
+                        Edit::mutate(|_: &mut Model| {})
+                    },
+                );
+            });
+        };
+
+        // frame 1: Shift+press at px=85 → raw 1.7 拍 → press 時 snap → 2.0
+        run_frame(
+            &mut host,
+            &mut scene,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((85.0, 10.0)),
+                    primary_just_pressed: true,
+                    primary_pressed: true,
+                    modifiers: Modifiers { shift: true, ..Modifiers::default() },
+                    ..PointerFrame::default()
+                },
+                ..FrameInput::default()
+            },
+            Arc::clone(&observed_cb),
+        );
+        // frame 2: drag to px=470 → raw 9.4 拍
+        run_frame(
+            &mut host,
+            &mut scene,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((470.0, 10.0)),
+                    primary_just_pressed: false,
+                    primary_pressed: true,
+                    modifiers: Modifiers { shift: true, ..Modifiers::default() },
+                    ..PointerFrame::default()
+                },
+                ..FrameInput::default()
+            },
+            Arc::clone(&observed_cb),
+        );
+        // frame 3: release at px=470 → raw 9.4 → snap → 9.0
+        run_frame(
+            &mut host,
+            &mut scene,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((470.0, 10.0)),
+                    primary_just_pressed: false,
+                    primary_pressed: false,
+                    primary_just_released: true,
+                    modifiers: Modifiers { shift: true, ..Modifiers::default() },
+                    ..PointerFrame::default()
+                },
+                ..FrameInput::default()
+            },
+            Arc::clone(&observed_cb),
+        );
+
+        let log = observed.lock().unwrap();
+        assert_eq!(log.len(), 1, "release frame で 1 度だけ SetLoopRange 発火: log={log:?}");
+        let (start, end) = log[0];
+        assert!(
+            (start - 2.0).abs() < 1e-6,
+            "start は press 時 snap → 2.0 (raw 1.7): got {start}"
+        );
+        assert!(
+            (end - 9.0).abs() < 1e-6,
+            "end は release 時 snap → 9.0 (raw 9.4): got {end}"
+        );
+    }
+
+    /// ruler 外 (lanes 内) の plain click では SetPlayheadBeat が emit されない (canvas 既存挙動維持)。
+    #[test]
+    fn lanes_click_does_not_emit_set_playhead_beat() {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let view = ArrangementView {
+            header_w: 0.0,
+            ruler_h: 24.0,
+            snap: SnapConfig::OFF,
+            ..ArrangementView::default()
+        };
+        let model = Model { tracks: vec![track(0, "t", vec![])], view };
+
+        let seek_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let seek_count_cb = Arc::clone(&seek_count);
+        // y=100 (lanes 内、 ruler_h=24 を超える) で press
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 100.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        };
+        let _ = host.frame_to_edits(&model, &mut scene, screen, input, |m, ui| {
+            let style = ArrangementStyle::default();
+            let seek_count_cb = Arc::clone(&seek_count_cb);
+            let _ = ui.arrangement(
+                "arr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &m.tracks,
+                m.view,
+                &[],
+                &[],
+                &style,
+                move |req| {
+                    if matches!(req, ArrangementEditRequest::SetPlayheadBeat(_)) {
+                        *seek_count_cb.lock().unwrap() += 1;
+                    }
+                    Edit::mutate(|_: &mut Model| {})
+                },
+            );
+        });
+        assert_eq!(*seek_count.lock().unwrap(), 0, "lanes 内 click は SetPlayheadBeat 非発火");
     }
 }

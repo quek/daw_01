@@ -241,6 +241,9 @@ fn main() {
                     ArrangementEditRequest::SetLoopRange { .. } => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
+                    ArrangementEditRequest::SetPlayheadBeat(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
                     ArrangementEditRequest::SetZoomX(_) => Edit::mutate(|_m: &mut Model| {}),
                     ArrangementEditRequest::SetScrollX(_) => Edit::mutate(|_m: &mut Model| {}),
                     ArrangementEditRequest::SetTrackTop(_) => Edit::mutate(|_m: &mut Model| {}),

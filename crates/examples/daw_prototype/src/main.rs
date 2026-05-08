@@ -1092,6 +1092,13 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 mm.arr_view.loop_range = Some((lo, hi));
                 mm.last_action = format!("arr: SetLoopRange [{lo:.2}, {hi:.2}]");
             }),
+            // M14 Phase 63j (#024): ruler click / drag による playhead seek。 daw_prototype は audio
+            // engine を持たないので `playhead_beat` の更新だけで OK (実 daw_01 は seek IPC も発行)。
+            ArrangementEditRequest::SetPlayheadBeat(beat) => Edit::mutate(move |mm: &mut DawModel| {
+                let b = beat.max(0.0);
+                mm.arr_view.playhead_beat = Some(b);
+                mm.last_action = format!("arr: SetPlayheadBeat {b:.3}");
+            }),
             ArrangementEditRequest::SetZoomX(zoom) => {
                 // M14 Phase 61a (#011): widget は **絶対値 px/beat** を送る (旧 factor 直送り
                 // semantic は廃止)。 example の `len_beats` は `lanes_w / zoom` で逆引き保存する。
