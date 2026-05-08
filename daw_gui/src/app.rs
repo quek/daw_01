@@ -7282,11 +7282,13 @@ impl AppData {
         // で split」 として優先処理する。 audio editor は bottom_panel
         // 内なので arrangement_hover_beat は更新されず、 既存 path だと
         // 「マウスを arrangement に置いて...」 status で no-op になる。
-        if self.audio_editor_clip.is_some() {
-            // Audio Editor が開いているときは clip 分割ではなく event 分割
-            // (= clip 内 audio event を 2 つに割る)。 Bitwig / Reaper の
-            // Audio Detail Editor と同じ慣行。 cursor 外 / event 上に乗って
-            // いない場合は helper 内で status_message を出して return。
+        // Audio Editor 上の波形領域に **マウスが乗っているとき** だけ
+        // event 分割に振り分ける。 Audio Editor が開いていてもマウスが
+        // arrangement 上にある場合は通常の clip 分割パスを使う (= ユーザー
+        // は arrangement の clip を分割したいのでそのまま流す)。
+        if self.audio_editor_clip.is_some()
+            && self.audio_editor_hover_beat_in_clip.is_some()
+        {
             self.action_split_audio_editor_event_at_cursor();
             return;
         }

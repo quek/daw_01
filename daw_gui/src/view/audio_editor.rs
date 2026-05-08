@@ -188,6 +188,86 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             viewport,
             TimeRulerStyle::default(),
         );
+
+        // ----- 既存 loop region overlay (ruler 上に半透明バンド) -----
+        // arrangement view と同色の cyan、 view 範囲との交差のみ描画。
+        if app.song.loop_end_beat > app.song.loop_start_beat {
+            let view_start_song = clip.start_beat + view_start_beat;
+            let view_end_song = view_start_song + view_len_beats;
+            let lstart = app.song.loop_start_beat;
+            let lend = app.song.loop_end_beat;
+            let visible_start = lstart.max(view_start_song);
+            let visible_end = lend.min(view_end_song);
+            if visible_end > visible_start && view_len_beats > 0.0 {
+                let nstart = ((visible_start - view_start_song) / view_len_beats) as f32;
+                let nend = ((visible_end - view_start_song) / view_len_beats) as f32;
+                let band = Rect {
+                    x: ruler_rect.x + nstart * ruler_rect.w,
+                    y: ruler_rect.y,
+                    w: ((nend - nstart) * ruler_rect.w).max(1.0),
+                    h: ruler_rect.h,
+                };
+                ui.push_rect(daw_ui_renderer::RectCommand {
+                    rect: band,
+                    fill: Color::rgba(0.30, 0.85, 0.95, 0.18),
+                    border: Color::rgba(0.30, 0.85, 0.95, 0.55),
+                    border_width: 1.0,
+                    radius: [0.0; 4],
+                    clip_rect: Some(ruler_rect),
+                });
+            }
+        }
+    }
+
+    // ----- Ruler interaction (arrangement と同じ操作感) -----------------
+    // gui_01 #024 の arrangement widget 内蔵動作を Audio Editor 用に
+    // 外部実装。 plain (= Shift 非保持) press / drag = 連続 SetPlayheadBeat、
+    // Shift+drag = release 時に SetLoopRange。 anchor / current の x 座標を
+    // view_start_beat + view_norm * view_len_beats で song-absolute beat
+    // に換算してから AppEvent に渡す。
+    if ruler_rect.w > 0.0
+        && view_len_beats > 0.0
+        && let Some(drag) =
+            ui.take_drag_in_rect(("audio_editor_ruler_drag", clip.id), ruler_rect)
+    {
+        let to_song_beat = |x_px: f32| -> f64 {
+            let local_x = (x_px - ruler_rect.x).clamp(0.0, ruler_rect.w);
+            let view_norm = (local_x / ruler_rect.w) as f64;
+            (clip.start_beat + view_start_beat + view_norm * view_len_beats).max(0.0)
+        };
+        let cur_beat = to_song_beat(drag.current.0);
+        if drag.start_modifiers.shift {
+            // Shift+drag: release frame に commit (= drag 中は preview なし、
+            // 軽量実装。 必要なら将来 preview 追加可能)。
+            if drag.kind == DragKind::Released {
+                let anchor_beat = to_song_beat(drag.anchor.0);
+                let (start, end) = if anchor_beat <= cur_beat {
+                    (anchor_beat, cur_beat)
+                } else {
+                    (cur_beat, anchor_beat)
+                };
+                if (end - start).abs() > 1e-6 {
+                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetLoopRange { start, end });
+                    }));
+                }
+            }
+        } else {
+            // 素 drag / 単発 click: Started + Continuing で連続 SetPlayheadBeat
+            // (= Stop 中も Play 中も即座にプレイカーソル移動 + IPC SeekTo)。
+            // arrangement_view の make_edit を参考に、 GUI 側 playhead_beat
+            // 更新 + audio engine への SeekTo IPC を 1 つの Edit にまとめる。
+            if drag.kind != DragKind::Released {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    let beat = cur_beat.max(0.0);
+                    app.playhead_beat = Some(beat as f32);
+                    let sr = common::audio_bridge::SAMPLE_RATE as f64;
+                    let bpm = app.song.bpm.max(1.0) as f64;
+                    let samples = (beat * 60.0 / bpm * sr).max(0.0) as u64;
+                    app.send_audio(common::protocol::MainToChild::SeekTo { samples });
+                }));
+            }
+        }
     }
 
     // ----- Waveform area --------------------------------------------
