@@ -17,7 +17,7 @@ use daw_ui_core::{
     ChannelLayout, Edit, SampleSlices, Ui, WaveformRenderMode, WaveformSource,
     WaveformStyle, WaveformView,
 };
-use daw_ui_renderer::{Color, Rect};
+use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect};
 
 use crate::app::{AppData, AppEvent};
 
@@ -158,6 +158,33 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         view,
         style,
     );
+
+    // ----- Playhead 線 (Phase 2 PR7) -----
+    // 再生中 / Stop 後 (= playhead_beat is Some) かつ playhead が現
+    // clip の範囲内なら、 wf_area 上に縦線を重ねる。 視覚的に「曲全体の
+    // どこを再生しているか」 が Audio Editor 内でも分かる。 view は
+    // event.event_start_in_clip_beats から event_length_beats まで
+    // (= 1 event = clip 全体) を全幅マッピングしているので、
+    // x = wf_area.x + (in_clip_beats / clip.length_beats) * wf_area.w。
+    if let Some(ph_beat) = app.playhead_beat {
+        let ph_beat = ph_beat as f64;
+        let clip_start = clip.start_beat;
+        let clip_end = clip_start + clip.length_beats;
+        if ph_beat >= clip_start && ph_beat < clip_end && clip.length_beats > 0.0 {
+            let in_clip = ph_beat - clip_start;
+            let x = wf_area.x + (in_clip / clip.length_beats) as f32 * wf_area.w;
+            let color = Color::rgba(1.0, 0.55, 0.20, 0.9);
+            ui.push_lines(LineBatch {
+                segments: std::sync::Arc::from(vec![LineSegment {
+                    a: [x, wf_area.y],
+                    b: [x, wf_area.y + wf_area.h],
+                    color,
+                }]),
+                line_width_px: 1.5,
+                clip_rect: Some(wf_area),
+            });
+        }
+    }
 
     // Source meta (debug-ish ヘルパー: source ファイル / sample_rate /
     // channels)。 Phase 4+ で source メタ情報を Inspector 側にも出す

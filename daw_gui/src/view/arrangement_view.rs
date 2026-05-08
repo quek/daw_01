@@ -198,7 +198,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let key = *clip_key;
         ui.context_menu_for(
             *rect,
-            &["Make Unique", "Auto-Fade", "Auto-Crossfade"],
+            &["Make Unique", "Auto-Fade", "Auto-Crossfade", "Reverse"],
             move |idx, ui| {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     let Some(target) = clip_key_to_ref(app, key) else {
@@ -208,6 +208,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         0 => app.handle_event(AppEvent::MakeClipUnique(target)),
                         1 => app.handle_event(AppEvent::AutoFadeSelectedClips),
                         2 => app.handle_event(AppEvent::AutoCrossfadeSelectedClips),
+                        // Reverse は右クリック対象 clip 1 つだけを toggle
+                        // (Auto-Fade と違って selection 全体ではなく当該
+                        // clip のみ。 Bitwig clip メニューでも同様)。
+                        3 => app.handle_event(AppEvent::ToggleClipReversed(target)),
                         _ => {}
                     }
                 }));

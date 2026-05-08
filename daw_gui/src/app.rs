@@ -928,6 +928,7 @@ impl AppData {
                 | AppEvent::SetClipFadeOutCurve { .. }
                 | AppEvent::AutoFadeSelectedClips
                 | AppEvent::AutoCrossfadeSelectedClips
+                | AppEvent::ToggleClipReversed(_)
                 | AppEvent::ImportAudio { .. }
                 | AppEvent::AddNote { .. }
                 | AppEvent::ResizeNote { .. }
@@ -1567,6 +1568,13 @@ pub enum AppEvent {
     /// `audio_editor_clip = None` に戻して bottom_panel は現在のタブ
     /// (Piano Roll) を維持。
     CloseAudioEditor,
+
+    /// `target` clip の first event の `reversed` を反転 (= 右クリック
+    /// メニュー「Reverse」 用 toggle、 `docs/plan_audio_clip.md` §3.8)。
+    /// Inspector でも同 field は編集できるが、 メニューから 1 操作で
+    /// 切り替えられる UX を提供。 内部的には現値を読んで
+    /// `SetClipReversed` を呼ぶのと等価で、 全 event に broadcast。
+    ToggleClipReversed(ClipRef),
 }
 
 impl AppData {
@@ -1961,6 +1969,10 @@ impl AppData {
             }
             AppEvent::CloseAudioEditor => {
                 self.close_audio_editor();
+            }
+            AppEvent::ToggleClipReversed(target) => {
+                let cur = self.is_clip_audio_event_reversed(target);
+                self.set_clip_audio_event_reversed(target, !cur);
             }
             AppEvent::SplitClipAtPlayhead { snap } => {
                 self.action_split_clips_at_cursor(snap);
@@ -3683,6 +3695,25 @@ impl AppData {
             .collect();
         self.selected_clip = self.selected_clips.last().copied();
         self.sync_song_to_plugin_host();
+    }
+
+    /// `target` clip の first event の `reversed` 値を読む。 audio で
+    /// ない / event が空 / 範囲外なら `false`。 メニューの toggle 用。
+    fn is_clip_audio_event_reversed(&self, target: ClipRef) -> bool {
+        self.song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .and_then(|c| {
+                if let Some(common::model::ClipContent::Audio(audio)) =
+                    self.song.clip_contents.get(&c.content_id)
+                {
+                    audio.events.first().map(|e| e.reversed)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(false)
     }
 
     /// 選択 audio clip の全 `AudioEvent.reversed` をまとめて更新する。
