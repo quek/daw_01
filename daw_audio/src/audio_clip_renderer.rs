@@ -27,6 +27,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use common::audio_render::{fade_envelope, pitch_ratio_for};
 use common::model::{
     AudioSourceId, AudioSourcePath, ClipContent, FadeCurve, Song, StretchMode,
 };
@@ -239,14 +240,12 @@ pub fn compile_audio_schedule(
                 if end_frame <= start_frame {
                     continue;
                 }
-                let pitch_factor = 2f64.powf(event.pitch_semitones as f64 / 12.0);
-                let sr_factor = buffer.sample_rate as f64 / engine_sample_rate as f64;
-                let pitch_ratio = match event.stretch_mode {
-                    StretchMode::Raw => sr_factor,
-                    StretchMode::Repitch => sr_factor * pitch_factor,
-                    // Phase 1 fallback: Stretch / Slice は Raw 同等 (PR4+ で本実装)
-                    StretchMode::Stretch | StretchMode::Slice => sr_factor,
-                };
+                let pitch_ratio = pitch_ratio_for(
+                    event.stretch_mode,
+                    buffer.sample_rate,
+                    engine_sample_rate,
+                    event.pitch_semitones,
+                );
                 let gain_lin = 10f32.powf(event.gain_db / 20.0);
                 let fade_in_frames =
                     (event.fade_in_beats.max(0.0) * samples_per_beat).max(0.0) as u64;
@@ -285,19 +284,6 @@ pub fn compile_audio_schedule(
         "compiled audio schedule"
     );
     AudioClipRenderer { schedule, sources }
-}
-
-/// Compute fade envelope at `t` (frames since fade start). 0..=1 range.
-fn fade_envelope(t: u64, fade_len: u64, curve: FadeCurve) -> f32 {
-    if fade_len == 0 || t >= fade_len {
-        return 1.0;
-    }
-    let x = (t as f32) / (fade_len as f32);
-    match curve {
-        FadeCurve::Linear => x,
-        FadeCurve::Exponential => x * x,
-        FadeCurve::SCurve => 0.5 - 0.5 * (std::f32::consts::PI * x).cos(),
-    }
 }
 
 /// Mix every audio event for `track_idx` into `track_l/track_r` for the

@@ -3711,23 +3711,6 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
-    /// 0..=1 の fade envelope。 `daw_audio::audio_clip_renderer
-    /// ::fade_envelope` と同一ロジック (Phase 3+ で共通 crate に切り出し
-    /// 予定、 現状は bounce / Phase 4 audio editor 等の offline 計算
-    /// 用に AppData side で重複定義)。
-    #[allow(clippy::cast_precision_loss)]
-    fn bounce_fade_env(t: u64, fade_len: u64, curve: common::model::FadeCurve) -> f32 {
-        if fade_len == 0 || t >= fade_len {
-            return 1.0;
-        }
-        let x = (t as f32) / (fade_len as f32);
-        match curve {
-            common::model::FadeCurve::Linear => x,
-            common::model::FadeCurve::Exponential => x * x,
-            common::model::FadeCurve::SCurve => 0.5 - 0.5 * (std::f32::consts::PI * x).cos(),
-        }
-    }
-
     /// Bounce In Place (Pre-FX、 `docs/plan_audio_clip.md` §3.8 / §13 Q8)。
     /// `target` clip 内の全 events を engine sample_rate で stereo mix
     /// して WAV 32-bit float ファイルに書き出し、 新 `AudioSource` を
@@ -3797,12 +3780,12 @@ impl AppData {
                 continue;
             }
 
-            let pitch_factor = 2f64.powf(event.pitch_semitones as f64 / 12.0);
-            let sr_factor = buffer.sample_rate as f64 / engine_sr as f64;
-            let pitch_ratio = match event.stretch_mode {
-                common::model::StretchMode::Repitch => sr_factor * pitch_factor,
-                _ => sr_factor,
-            };
+            let pitch_ratio = common::audio_render::pitch_ratio_for(
+                event.stretch_mode,
+                buffer.sample_rate,
+                engine_sr,
+                event.pitch_semitones,
+            );
             let gain_lin = 10f32.powf(event.gain_db / 20.0);
             let pan_rad = (event.pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
             let pan_l = pan_rad.cos();
@@ -3830,11 +3813,17 @@ impl AppData {
                     break;
                 }
                 let local = i as u64;
-                let fade_in =
-                    Self::bounce_fade_env(local, fade_in_frames, event.fade_in_curve);
+                let fade_in = common::audio_render::fade_envelope(
+                    local,
+                    fade_in_frames,
+                    event.fade_in_curve,
+                );
                 let tail = event_total.saturating_sub(local + 1);
-                let fade_out =
-                    Self::bounce_fade_env(tail, fade_out_frames, event.fade_out_curve);
+                let fade_out = common::audio_render::fade_envelope(
+                    tail,
+                    fade_out_frames,
+                    event.fade_out_curve,
+                );
                 let env = fade_in * fade_out * gain_lin;
                 if env == 0.0 {
                     continue;
