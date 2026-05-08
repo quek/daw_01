@@ -180,58 +180,20 @@ multi-event clip を作成する手段がないとテストもできないので
    ように。 Bounce In Place / Bounce (with FX) 両方の fallback path
    組み立ても helper 経由に DRY 化。
 
-2. **VOICEVOX → ClipContent::Audio 統合**: PR8 commit message で予告した
-   後続 PR。 現状 `process_track_owned` の専用 vocal block で再生して
-   いるが、 audio_clip_renderer 経由に統合したい。 ただし MIDI clip (=
-   歌詞 / note) と audio buffer の併存をどう model 化するかの設計議論が
-   必要。 急ぎでないので Phase 3+ の Stretch / Slice 着手前に再検討。
+2. ~~**VOICEVOX → ClipContent::Audio 統合**~~ — **再設計済 (別 plan に
+   分離)**: 当初は「ClipContent::Audio に notes を埋め込むか別 variant
+   追加するか」 という local な統合議論だったが、 「ゼロから作るなら」
+   観点で再検討した結果、 **業界標準どおり VOICEVOX を内蔵 instrument
+   plugin として扱う** のが理想と決定。 Vocal 用専用 codepath
+   (`InstrumentSource::Vocal` / `process_track_owned` の vocal block
+   / `EngineShared::generated_audio_store`) はすべて廃止し、 VOICEVOX
+   は通常の MIDI track + Instrument plugin slot で扱えるようにする。
 
-   #### 設計選択肢 (= 着手前にユーザー判断が要る):
-
-   - **(a) `ClipContent::VocalAudio { events, notes }`** (新 variant):
-     既存 `Audio { events }` と並列に 1 variant 増やし、 vocal clip だけ
-     notes を持つ。 利点: track.kind = Vocal の流れと素直、 既存
-     `clip_contents` の pool 構造を変えない。 欠点: ClipContent のデータ
-     スキーマ拡張で bincode / serde 互換性に注意 (= migration 必要)。
-
-   - **(b) `ClipContent::Audio { events, notes: Vec<Note> }`** に notes
-     を埋め込む (既存 variant 拡張): 同 ClipContent で notes を共存。
-     利点: variant 数を増やさない、 instrument track に audio overlay
-     する高度な使い方にも転用可能。 欠点: `notes.is_empty()` の
-     instrument 系 audio clip と vocal clip が型上区別できなくなる、
-     audio editor / piano roll の責務分離が曖昧化。
-
-   - **(c) `clip.notes: Vec<Note>` (=既存) + `clip.content_id ->
-     ClipContent::Audio`** で audio buffer を保持 (= clip レベルで
-     notes と audio events を持つ二重構造): 利点: 既存 model の
-     `Clip.notes` は Phase 0 から存在、 `clip_contents.get(content_id)`
-     で audio events を取れる構造に整合。 欠点: instrument MIDI clip も
-     `Clip.notes` を使っているので、 vocal track だけ「audio events も
-     持つ」 状態にする条件分岐が piano_roll / audio_editor / VOICEVOX
-     synth 経路に散らばる。
-
-   - **(d) Vocal track は MIDI clip と Audio clip の 2 系統を track 上に
-     並列配置**: VOICEVOX 合成結果を AudioClip として MIDI clip と隣に
-     置く。 利点: 既存の Audio clip pipeline をそのまま使える、 MIDI と
-     audio の対応関係は metadata で管理。 欠点: 「歌詞編集 → 自動的に
-     bounced audio が再生される」 という UX が崩れる (= manual sync
-     必要)。
-
-   #### 推奨
-
-   現状の `Track.kind == Vocal` + `Clip.notes` (= 歌詞 + note) +
-   `process_track_owned` で VOICEVOX 合成済 audio buffer を `EngineShared
-   ::generated_audio_store` から引いてくる仕組みは、 既に「audio buffer
-   が clip 単位で対応」 していて、 内部実装は (c) に近い。 統合方針として
-   は **(c) を明示化** する方向が破壊的変更最小: `Clip.audio_buffer_id`
-   (= `AudioSourceId` を VOICEVOX 合成結果として割り当てる) を持たせて、
-   `audio_clip_renderer` が vocal track の MIDI clip 描画時に
-   `clip.audio_buffer_id` を参照する形に統一する。 model 変更は小、
-   audio engine の専用 vocal block は削除可能。
-
-   ただし、 これは既存 PR8 「VOICEVOX 経路を SetGeneratedAudio に移行」
-   commit `a04cc3b` の後で再検討する話なので、 **本 plan の範囲外** と
-   して Phase 3+ (Stretch / Slice) 着手前にユーザーと一緒に再設計。
+   詳細設計と段階ロードマップ (PR-V1 〜 PR-V5) は
+   [`plan_voicevox_synth.md`](plan_voicevox_synth.md)。 規模超大型
+   (~2000-3500 行 + plugin host 拡張) のため、 着手は別セッション。
+   現状の vocal block は動作しているので「機能復旧 > 新機能」 原則で
+   即時着手はしない。 中間妥協案 (旧 (a) (b) (c) (d)) はもう検討不要。
 
 ## 進行状況 (2026-05-08 更新)
 
@@ -265,10 +227,12 @@ multi-event clip を作成する手段がないとテストもできないので
   に組み込み。 Bounce In Place / Bounce (with FX) 両方の fallback path
   組み立ても helper 経由に DRY 化。
 
-設計議論待ち (= ユーザー判断要):
-- 🟡 **VOICEVOX → ClipContent::Audio 統合**: 上記「設計選択肢」 (a)〜(d) の
-  どれを採用するかでき決め次第着手。 推奨は (c) 明示化方針。 Phase 3+
-  着手前に user と確認。
+別 plan に分離 (= 着手は別セッション):
+- 📋 **VOICEVOX 内蔵 instrument plugin 化** ([`plan_voicevox_synth.md`](plan_voicevox_synth.md)):
+  業界標準 (VOCALOID / Synthesizer V Studio が VST3 で配布) に倣い、
+  vocal 専用 codepath を全廃して通常の MIDI + instrument plugin の枠で
+  扱う。 規模超大型のため段階分割 (PR-V1 〜 V4)、 機能復旧優先で着手
+  保留。
 
 各 PR ごとに `cargo build / clippy / test --features rt-assert` clean を
 確認、 `docs/plan.md` 進捗ログにエントリ追加 + commit する運用は維持。
