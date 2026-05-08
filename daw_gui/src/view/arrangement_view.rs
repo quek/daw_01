@@ -14,7 +14,7 @@ use daw_ui_core::{
 };
 use daw_ui_renderer::{Color, Rect};
 
-use crate::app::{AppData, AppEvent, ClipRef};
+use crate::app::{AppData, AppEvent, ClipRef, FadeEdgeKind};
 use crate::view::mixer_strips::{amp_to_fader, fader_to_amp};
 use crate::view::snap::{self, SNAP_LABELS};
 
@@ -673,59 +673,60 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
             Edit::mutate(|_| {})
         }
         // gui_01 #025 (M14 Phase 63k): clip 上 grip drag 経路。 widget は
-        // drag release で 1 度だけ delta を発行するので、 ここで既存
-        // AppEvent (Phase 2 PR2-3) に変換してそのまま undo step を取る。
-        // 各 delta は独立 Edit step ではなく 1 release = 1 batch なので、
-        // 全 delta を 1 Edit::mutate 内で順に発火させる (= ただし
-        // is_undoable は 1 AppEvent ごとに 1 step を取るので、 multi-clip
-        // 一括 drag のときは Undo 1 回で全 clip 戻る挙動にはならない、
-        // 小規模 issue なので future polish 対象)。
+        // drag release で 1 度だけ delta 群を発行する。 Phase 2 PR-B で
+        // multi-clip 一括 drag を 1 Undo step にまとめるため、 batch
+        // AppEvent (`SetClipGainDbBatch` / `SetClipFadeBeatsBatch` /
+        // `SetClipFadeCurveBatch`) に変換して 1 度だけ発火する。 Inspector
+        // commit 経路の単発 AppEvent (`SetClipGainDb` 等) は引き続き存在。
         ArrangementEditRequest::SetClipGainDb(deltas) => {
             Edit::mutate(move |app: &mut AppData| {
-                for d in &deltas {
-                    if let Some(target) = clip_key_to_ref(app, d.key) {
-                        app.handle_event(AppEvent::SetClipGainDb {
-                            target,
-                            gain_db: d.next_gain_db,
-                        });
-                    }
+                let entries: Vec<(ClipRef, f32)> = deltas
+                    .iter()
+                    .filter_map(|d| {
+                        clip_key_to_ref(app, d.key).map(|t| (t, d.next_gain_db))
+                    })
+                    .collect();
+                if !entries.is_empty() {
+                    app.handle_event(AppEvent::SetClipGainDbBatch(entries));
                 }
             })
         }
         ArrangementEditRequest::SetClipFade(deltas) => {
             Edit::mutate(move |app: &mut AppData| {
-                for d in &deltas {
-                    if let Some(target) = clip_key_to_ref(app, d.key) {
-                        match d.edge {
-                            FadeEdge::In => app.handle_event(AppEvent::SetClipFadeInBeats {
-                                target,
-                                beats: d.next_beats,
-                            }),
-                            FadeEdge::Out => app.handle_event(AppEvent::SetClipFadeOutBeats {
-                                target,
-                                beats: d.next_beats,
-                            }),
-                        }
-                    }
+                let entries: Vec<(ClipRef, FadeEdgeKind, f64)> = deltas
+                    .iter()
+                    .filter_map(|d| {
+                        clip_key_to_ref(app, d.key).map(|t| {
+                            let edge = match d.edge {
+                                FadeEdge::In => FadeEdgeKind::In,
+                                FadeEdge::Out => FadeEdgeKind::Out,
+                            };
+                            (t, edge, d.next_beats)
+                        })
+                    })
+                    .collect();
+                if !entries.is_empty() {
+                    app.handle_event(AppEvent::SetClipFadeBeatsBatch(entries));
                 }
             })
         }
         ArrangementEditRequest::SetClipFadeCurve(deltas) => {
             Edit::mutate(move |app: &mut AppData| {
-                for d in &deltas {
-                    if let Some(target) = clip_key_to_ref(app, d.key) {
-                        let curve = model_curve_from_widget(d.next_curve);
-                        match d.edge {
-                            FadeEdge::In => app.handle_event(AppEvent::SetClipFadeInCurve {
-                                target,
-                                curve,
-                            }),
-                            FadeEdge::Out => app.handle_event(AppEvent::SetClipFadeOutCurve {
-                                target,
-                                curve,
-                            }),
-                        }
-                    }
+                let entries: Vec<(ClipRef, FadeEdgeKind, common::model::FadeCurve)> = deltas
+                    .iter()
+                    .filter_map(|d| {
+                        clip_key_to_ref(app, d.key).map(|t| {
+                            let edge = match d.edge {
+                                FadeEdge::In => FadeEdgeKind::In,
+                                FadeEdge::Out => FadeEdgeKind::Out,
+                            };
+                            let curve = model_curve_from_widget(d.next_curve);
+                            (t, edge, curve)
+                        })
+                    })
+                    .collect();
+                if !entries.is_empty() {
+                    app.handle_event(AppEvent::SetClipFadeCurveBatch(entries));
                 }
             })
         }

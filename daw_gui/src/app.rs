@@ -930,6 +930,9 @@ impl AppData {
                 | AppEvent::AutoCrossfadeSelectedClips
                 | AppEvent::ToggleClipReversed(_)
                 | AppEvent::BounceClipInPlace(_)
+                | AppEvent::SetClipGainDbBatch(_)
+                | AppEvent::SetClipFadeBeatsBatch(_)
+                | AppEvent::SetClipFadeCurveBatch(_)
                 | AppEvent::ImportAudio { .. }
                 | AppEvent::AddNote { .. }
                 | AppEvent::ResizeNote { .. }
@@ -1586,6 +1589,28 @@ pub enum AppEvent {
     /// snapshot。 同 ContentId を共有していた linked clip も同じ新
     /// content に置換される (= 既存 ContentId を上書き)。
     BounceClipInPlace(ClipRef),
+
+    // ---- multi-clip drag batch (Phase 2 PR-B) ---------------------------
+    /// gui_01 widget が multi-clip 一括 drag (= dB / fade / curve) を 1
+    /// release で発行する場合、 各 delta を 1 AppEvent にまとめて 1
+    /// Undo step とする。 delta 数だけ単発 AppEvent を撃つと Undo step
+    /// が分散してしまう (Phase 2 PR-B、 `docs/plan_audio_followup.md` §PR-B)。
+    /// 単発 `SetClipGainDb` 等は Inspector commit 経路で引き続き使用。
+    SetClipGainDbBatch(Vec<(ClipRef, f32)>),
+    /// `(target, edge, beats)` 列で fade length を一括設定。
+    SetClipFadeBeatsBatch(Vec<(ClipRef, FadeEdgeKind, f64)>),
+    /// `(target, edge, curve)` 列で fade curve を一括設定。
+    SetClipFadeCurveBatch(Vec<(ClipRef, FadeEdgeKind, common::model::FadeCurve)>),
+}
+
+/// `*Batch` 系 AppEvent で fade in / out を区別するための marker。
+/// `daw_ui_core::FadeEdge` は widget 側 type で daw_01 model 側 enum
+/// に直接置けないので、 AppEvent module 内に再定義 (= bincode 経由は
+/// 不要なので common::model に追加する必要なし)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FadeEdgeKind {
+    In,
+    Out,
 }
 
 impl AppData {
@@ -1987,6 +2012,35 @@ impl AppData {
             }
             AppEvent::BounceClipInPlace(target) => {
                 self.bounce_clip_in_place(target);
+            }
+            AppEvent::SetClipGainDbBatch(entries) => {
+                for (target, gain_db) in &entries {
+                    self.set_clip_audio_event_gain_db(*target, *gain_db);
+                }
+            }
+            AppEvent::SetClipFadeBeatsBatch(entries) => {
+                for (target, edge, beats) in &entries {
+                    match edge {
+                        FadeEdgeKind::In => {
+                            self.set_clip_audio_event_fade_in_beats(*target, *beats);
+                        }
+                        FadeEdgeKind::Out => {
+                            self.set_clip_audio_event_fade_out_beats(*target, *beats);
+                        }
+                    }
+                }
+            }
+            AppEvent::SetClipFadeCurveBatch(entries) => {
+                for (target, edge, curve) in &entries {
+                    match edge {
+                        FadeEdgeKind::In => {
+                            self.set_clip_audio_event_fade_in_curve(*target, *curve);
+                        }
+                        FadeEdgeKind::Out => {
+                            self.set_clip_audio_event_fade_out_curve(*target, *curve);
+                        }
+                    }
+                }
             }
             AppEvent::SplitClipAtPlayhead { snap } => {
                 self.action_split_clips_at_cursor(snap);
