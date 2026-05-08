@@ -199,7 +199,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         snap: snap::arrange_snap_config(app),
     };
 
-    let style = ArrangementStyle::default();
+    // audio_edit が Some の clip に widget が描画する dB handle line (gain_db = 0
+    // で clip 中央を貫通する細い水平線) は、 視覚的には波形と被って邪魔になる。
+    // hit zone (`audio_db_handle_band_h`) は色と無関係なので、 線色を完全透明に
+    // して描画だけ抑制する (drag は引き続き機能する)。
+    let style = ArrangementStyle {
+        audio_db_handle_color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+        ..ArrangementStyle::default()
+    };
 
     // arrangement widget へ流す Edit 生成。
     // gui_01 #010 (M14 Phase 60) 以降、DoubleClickEmpty.beat / MoveClips / ResizeClips の
@@ -233,6 +240,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // (`docs/plan_audio_clip.md` §3.5)。 選択 clip 群に対して動くので、
     // 右クリックされた clip 自体の selection を変える/変えないは handler
     // 側に任せる (= MakeClipUnique も同 pattern)。
+    let lanes_x = area.x + TRACK_HEADER_W;
     for (clip_key, rect) in &resp.clip_rects {
         let key = *clip_key;
         ui.context_menu_for(
@@ -273,7 +281,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 }));
             },
         );
-        draw_audio_clip_waveform(app, ui, *clip_key, *rect);
+        let is_selected = selected_clips.contains(clip_key);
+        draw_audio_clip_waveform(app, ui, *clip_key, *rect, lanes_x, is_selected);
         draw_audio_clip_value_overlay(app, ui, *clip_key, *rect);
     }
 
@@ -849,6 +858,8 @@ fn draw_audio_clip_waveform(
     ui: &mut Ui<'_, AppData>,
     clip_key: ClipKey,
     clip_rect: Rect,
+    lanes_x: f32,
+    is_selected: bool,
 ) {
     let Some(t_idx) = app.song.tracks.iter().position(|t| t.id == clip_key.track) else {
         return;
@@ -878,12 +889,33 @@ fn draw_audio_clip_waveform(
     // 波形は内側 padding を取って描く: 上部 14 px (= name)、 左右 2 px。
     let inset_top: f32 = 14.0;
     let inset_lr: f32 = 2.0;
-    let view_rect = Rect {
+    let mut view_rect = Rect {
         x: clip_rect.x + inset_lr,
         y: clip_rect.y + inset_top,
         w: (clip_rect.w - inset_lr * 2.0).max(0.0),
         h: (clip_rect.h - inset_top - inset_lr).max(0.0),
     };
+    // arrangement widget は viewport の左端より早く始まる clip も full rect で
+    // 返してくる (部分カリング rect は culled せず caller 側で扱う仕様)。
+    // そのまま `Ui::waveform` に渡すと track header 領域まで波形が伸びるため、
+    // lanes_x で左端を clamp し、削った分の frame だけ start_sample をシフトする。
+    let event_len_frames = event
+        .source_end_frames
+        .saturating_sub(event.source_start_frames);
+    let mut view_start_sample = event.source_start_frames;
+    let mut view_len_samples = event_len_frames.max(1);
+    if view_rect.x < lanes_x {
+        let cut_px = lanes_x - view_rect.x;
+        if cut_px >= view_rect.w {
+            return; // 完全に lanes 外
+        }
+        let frames_per_px = (event_len_frames as f64 / clip_rect.w.max(1.0) as f64).max(0.0);
+        let skip_frames = (cut_px as f64 * frames_per_px) as u64;
+        view_start_sample = view_start_sample.saturating_add(skip_frames);
+        view_len_samples = view_len_samples.saturating_sub(skip_frames).max(1);
+        view_rect.x = lanes_x;
+        view_rect.w -= cut_px;
+    }
     if view_rect.w <= 0.0 || view_rect.h <= 0.0 {
         return;
     }
@@ -892,12 +924,6 @@ fn draw_audio_clip_waveform(
     // alloc は許容、 RT path ではなく GUI 描画 path)。
     let planes_borrowed: Vec<&[f32]> = buffer.samples.iter().map(Vec::as_slice).collect();
 
-    // event の切り出し範囲を viewport にする。 generation は source_id
-    // 単位で固定 (sample buffer は import 後に変わらない)。
-    let event_len_frames = event
-        .source_end_frames
-        .saturating_sub(event.source_start_frames);
-
     let source = WaveformSource {
         samples: SampleSlices::Planar(&planes_borrowed),
         valid_len: buffer.frames as usize,
@@ -905,15 +931,28 @@ fn draw_audio_clip_waveform(
         sample_rate: buffer.sample_rate,
     };
     let view = WaveformView {
-        start_sample: event.source_start_frames,
-        len_samples: event_len_frames.max(1),
+        start_sample: view_start_sample,
+        len_samples: view_len_samples,
         vertical_gain: 1.0,
     };
+    // 選択 clip 背景は黄色 (clip_selected_fill = rgb(1.0, 0.85, 0.30)) なので、
+    // 通常時の水色波形だと視認性が悪い。 選択時は濃紺に切り替える。
+    let (fg, fg_clipped) = if is_selected {
+        (
+            Color::rgba(0.05, 0.10, 0.25, 0.95),
+            Color::rgb(0.55, 0.05, 0.05),
+        )
+    } else {
+        (
+            Color::rgba(0.55, 0.85, 0.95, 0.85),
+            Color::rgb(0.95, 0.45, 0.40),
+        )
+    };
     let style = WaveformStyle {
-        fg: Color::rgba(0.55, 0.85, 0.95, 0.85),
-        fg_clipped: Color::rgb(0.95, 0.45, 0.40),
+        fg,
+        fg_clipped,
         fill: None,
-        baseline: Some(Color::rgba(1.0, 1.0, 1.0, 0.10)),
+        baseline: None,
         channel_layout: ChannelLayout::Overlay,
         render_mode: WaveformRenderMode::Auto,
         line_width_px: 1.0,

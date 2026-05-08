@@ -163,7 +163,7 @@ pub struct ClipRef {
 }
 
 pub const ARRANGE_PX_PER_BEAT: f32 = 24.0;
-pub const ARRANGE_TRACK_HEIGHT: f32 = 56.0;
+pub const ARRANGE_TRACK_HEIGHT: f32 = 88.0;
 pub const DEFAULT_NOTE_DURATION: f64 = 0.25;
 pub const DEFAULT_CLIP_LENGTH: f64 = 4.0;
 
@@ -2104,7 +2104,12 @@ impl AppData {
                 self.arrange_scroll_beat = scroll.max(0.0);
             }
             AppEvent::SetArrangeTrackRowH(h) => {
-                self.arrange_track_row_h = h.clamp(16.0, 96.0);
+                // 上限は viewport 高に近いところまで広げる (1 トラックを画面いっぱいに
+                // 表示できるようにする)。 viewport 高はここでは未知なので大きめに取り、
+                // 実描画時は area.h と min を取って絶対に visible 数 0 にならない構造で
+                // 描画側 (`tracks_visible = ((area.h - RULER_H) / row_h).max(1.0)`) が
+                // 吸収する。
+                self.arrange_track_row_h = h.clamp(16.0, 2000.0);
             }
             AppEvent::SetArrangeZoom(zoom) => {
                 self.arrange_zoom_x = zoom.clamp(2.0, 400.0);
