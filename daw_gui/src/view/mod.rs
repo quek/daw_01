@@ -4,6 +4,7 @@
 pub mod plugin_embed;
 
 pub mod arrangement_view;
+pub mod audio_editor;
 pub mod bottom_panel;
 pub mod mixer_strips;
 pub mod piano_roll_view;

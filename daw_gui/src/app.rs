@@ -236,6 +236,13 @@ pub struct AppData {
 
     // -------- View state --------
     pub bottom_panel: u8,
+    /// `Some(target)` で Audio Editor (= clip ダブルクリックで開く波形
+    /// 編集 view) が開いている。 bottom_panel の Piano Roll タブが
+    /// audio_editor view に切り替わる (`docs/plan_audio_clip.md` §3.10
+    /// 「piano_roll の領域を流用」)。 `None` なら通常の Piano Roll が
+    /// 表示される。 audio clip ダブルクリックで `Some` 化、 Esc / Audio
+    /// Editor close で `None` に戻る。
+    pub audio_editor_clip: Option<ClipRef>,
     pub arrange_zoom_x: f32,
     pub arrange_scroll_beat: f32,
     /// arrangement の 1 track row 高さ (px)。Alt+wheel で 16..96 に縦ズーム。
@@ -461,6 +468,7 @@ impl AppData {
             selected_clips: Vec::new(),
             selected_notes: Vec::new(),
             bottom_panel: 0,
+            audio_editor_clip: None,
             arrange_zoom_x: ARRANGE_PX_PER_BEAT,
             arrange_scroll_beat: 0.0,
             arrange_track_row_h: ARRANGE_TRACK_HEIGHT,
@@ -1547,6 +1555,18 @@ pub enum AppEvent {
     /// next.start` を判定 → overlap_beats を両 fade に設定。 隙間がある
     /// (= overlap が無い) ペアは no-op。
     AutoCrossfadeSelectedClips,
+
+    // ---- Audio Editor (Phase 2 PR6, `docs/plan_audio_clip.md` §3.10) ---
+    /// audio clip ダブルクリックで Audio Editor を開く。
+    /// `audio_editor_clip = Some(target)` + bottom_panel を tab 1
+    /// (Piano Roll 切替先) に切り替え。 ClipContent::Audio 以外を渡された
+    /// 場合は no-op (status_message 出さず silent skip)。
+    OpenAudioEditor(ClipRef),
+
+    /// Audio Editor を閉じる (Esc shortcut / 切替操作経由)。
+    /// `audio_editor_clip = None` に戻して bottom_panel は現在のタブ
+    /// (Piano Roll) を維持。
+    CloseAudioEditor,
 }
 
 impl AppData {
@@ -1935,6 +1955,12 @@ impl AppData {
             }
             AppEvent::AutoCrossfadeSelectedClips => {
                 self.auto_crossfade_selected_clips();
+            }
+            AppEvent::OpenAudioEditor(target) => {
+                self.open_audio_editor(target);
+            }
+            AppEvent::CloseAudioEditor => {
+                self.close_audio_editor();
             }
             AppEvent::SplitClipAtPlayhead { snap } => {
                 self.action_split_clips_at_cursor(snap);
@@ -3962,6 +3988,37 @@ impl AppData {
                 self.resync_clip_audio_event_edit_buffers(target);
             }
         }
+    }
+
+    /// audio clip 判定。 `target` が指す clip が `ClipContent::Audio` か。
+    /// MIDI / Vocal / 範囲外は false。 Audio Editor の open 判定で使う。
+    pub fn is_audio_clip(&self, target: ClipRef) -> bool {
+        let Some(track) = self.song.tracks.get(target.track as usize) else {
+            return false;
+        };
+        let Some(clip) = track.clips.get(target.clip as usize) else {
+            return false;
+        };
+        matches!(
+            self.song.clip_contents.get(&clip.content_id),
+            Some(common::model::ClipContent::Audio(_))
+        )
+    }
+
+    /// audio clip ダブルクリックで Audio Editor を開く。 `target` が
+    /// 非 audio (MIDI / Vocal / 範囲外) なら silent no-op。 bottom_panel
+    /// を tab 1 (= 通常 Piano Roll、 audio_editor_clip is Some なら
+    /// audio_editor view に切り替わる) に揃える。
+    fn open_audio_editor(&mut self, target: ClipRef) {
+        if !self.is_audio_clip(target) {
+            return;
+        }
+        self.audio_editor_clip = Some(target);
+        self.bottom_panel = 1;
+    }
+
+    fn close_audio_editor(&mut self) {
+        self.audio_editor_clip = None;
     }
 
     /// 全選択 audio clip に短 fade を一括適用 (`docs/plan_audio_clip

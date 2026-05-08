@@ -435,7 +435,16 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
             Edit::mutate(move |app: &mut AppData| {
                 if let Some(target) = clip_key_to_ref(app, key) {
                     app.handle_event(AppEvent::SelectClip { target, additive: false });
-                    app.handle_event(AppEvent::SelectBottomPanel(1));
+                    // Phase 2 PR6: audio clip は Audio Editor を、 それ以外
+                    // (MIDI / Vocal) は Piano Roll を開く (`docs/plan_audio
+                    // _clip.md` §3.10)。 bottom_panel 切替は handler 内で
+                    // 行われるので、 ここでは AppEvent を発火するだけ。
+                    if app.is_audio_clip(target) {
+                        app.handle_event(AppEvent::OpenAudioEditor(target));
+                    } else {
+                        app.handle_event(AppEvent::CloseAudioEditor);
+                        app.handle_event(AppEvent::SelectBottomPanel(1));
+                    }
                 }
             })
         }

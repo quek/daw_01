@@ -351,11 +351,17 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }));
     }
     // modal が開いている間は escape を消費しない (modal 側で close する)。
-    // rename mode 中は CancelRenameTrack へ振り、それ以外は CloseHelp。
+    // 優先度: rename mode → Audio Editor close → CloseHelp。 rename と
+    // Audio Editor は同時には開かない (= rename は track header の上、
+    // Audio Editor は bottom panel の中) ので順番でも実用 OK。
     if !app.is_plugin_picker_open && ui.take_shortcut("escape") {
         if app.track_rename_idx.is_some() {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::CancelRenameTrack)
+            }));
+        } else if app.audio_editor_clip.is_some() {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CloseAudioEditor)
             }));
         } else {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
