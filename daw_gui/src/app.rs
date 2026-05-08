@@ -929,6 +929,7 @@ impl AppData {
                 | AppEvent::AutoFadeSelectedClips
                 | AppEvent::AutoCrossfadeSelectedClips
                 | AppEvent::ToggleClipReversed(_)
+                | AppEvent::BounceClipInPlace(_)
                 | AppEvent::ImportAudio { .. }
                 | AppEvent::AddNote { .. }
                 | AppEvent::ResizeNote { .. }
@@ -1575,6 +1576,16 @@ pub enum AppEvent {
     /// 切り替えられる UX を提供。 内部的には現値を読んで
     /// `SetClipReversed` を呼ぶのと等価で、 全 event に broadcast。
     ToggleClipReversed(ClipRef),
+
+    /// Bounce In Place (Pre-FX、 `docs/plan_audio_clip.md` §3.8)。
+    /// `target` clip 内の全 events を offline mix して 1 つの WAV
+    /// (stereo 32-bit float) に書き出し、 新 `AudioSource` を採番して
+    /// Song.audio_sources に追加、 `ClipContent::Audio { events: [新
+    /// 1 event] }` に置換する。 Pre-FX = plugin chain (instrument /
+    /// fx_chain) を通さない、 source の events を mix しただけの
+    /// snapshot。 同 ContentId を共有していた linked clip も同じ新
+    /// content に置換される (= 既存 ContentId を上書き)。
+    BounceClipInPlace(ClipRef),
 }
 
 impl AppData {
@@ -1973,6 +1984,9 @@ impl AppData {
             AppEvent::ToggleClipReversed(target) => {
                 let cur = self.is_clip_audio_event_reversed(target);
                 self.set_clip_audio_event_reversed(target, !cur);
+            }
+            AppEvent::BounceClipInPlace(target) => {
+                self.bounce_clip_in_place(target);
             }
             AppEvent::SplitClipAtPlayhead { snap } => {
                 self.action_split_clips_at_cursor(snap);
@@ -3695,6 +3709,302 @@ impl AppData {
             .collect();
         self.selected_clip = self.selected_clips.last().copied();
         self.sync_song_to_plugin_host();
+    }
+
+    /// 0..=1 の fade envelope。 `daw_audio::audio_clip_renderer
+    /// ::fade_envelope` と同一ロジック (Phase 3+ で共通 crate に切り出し
+    /// 予定、 現状は bounce / Phase 4 audio editor 等の offline 計算
+    /// 用に AppData side で重複定義)。
+    #[allow(clippy::cast_precision_loss)]
+    fn bounce_fade_env(t: u64, fade_len: u64, curve: common::model::FadeCurve) -> f32 {
+        if fade_len == 0 || t >= fade_len {
+            return 1.0;
+        }
+        let x = (t as f32) / (fade_len as f32);
+        match curve {
+            common::model::FadeCurve::Linear => x,
+            common::model::FadeCurve::Exponential => x * x,
+            common::model::FadeCurve::SCurve => 0.5 - 0.5 * (std::f32::consts::PI * x).cos(),
+        }
+    }
+
+    /// Bounce In Place (Pre-FX、 `docs/plan_audio_clip.md` §3.8 / §13 Q8)。
+    /// `target` clip 内の全 events を engine sample_rate で stereo mix
+    /// して WAV 32-bit float ファイルに書き出し、 新 `AudioSource` を
+    /// 採番して `Song.audio_sources` に insert、 `audio_source_cache` に
+    /// 登録、 `ClipContent::Audio { events: [単一新 event] }` で置換、
+    /// audio engine に `SetGeneratedAudio` で配信する。 同 `ContentId` を
+    /// 共有していた linked clip も新 content で同期される (= `clip_contents`
+    /// は `ContentId` 単位の pool)。
+    ///
+    /// 出力先: project_dir があれば `<project_dir>/bounce/<name>_<ts>.wav`、
+    /// 未保存 project は `%LOCALAPPDATA%/daw_01/bounce_cache/<random>.wav`
+    /// (= `import_cache` と同じ fallback、 save 時に `<project_dir>/bounce/`
+    /// へ移動するのは将来 PR で `migrate_unsaved_audio_sources_into` 相当の
+    /// helper を bounce 用にも追加)。
+    ///
+    /// Pre-FX なので plugin chain (instrument / fx_chain) は通さない。
+    /// source の events を fade / gain / pan / pitch_ratio で mix した
+    /// snapshot のみ。 plugin 効果込みの bounce は spec §3.8 "Bounce"
+    /// (= 新 Clip + 新 track) で別 PR。
+    fn bounce_clip_in_place(&mut self, target: ClipRef) {
+        let Some(track) = self.song.tracks.get(target.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get(target.clip as usize).cloned() else {
+            return;
+        };
+        let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get(&clip.content_id).cloned()
+        else {
+            self.status_message = "Bounce In Place: audio clip ではありません".into();
+            return;
+        };
+        if audio.events.is_empty() {
+            self.status_message = "Bounce In Place: events が空です".into();
+            return;
+        }
+
+        let engine_sr = common::audio_bridge::SAMPLE_RATE;
+        let bpm = self.song.bpm.max(1.0) as f64;
+        let samples_per_beat = engine_sr as f64 * 60.0 / bpm;
+        let total_frames = (clip.length_beats * samples_per_beat).max(0.0) as usize;
+        if total_frames == 0 {
+            self.status_message = "Bounce In Place: clip 長が 0 です".into();
+            return;
+        }
+
+        // ---- mix loop (Pre-FX、 audio_clip_renderer のロジックを daw_gui
+        // 側に portion-wise port。 Phase 3+ で render_audio_events を共通
+        // crate に切り出して DRY 化を検討。 ここは offline 1 回きりの
+        // 計算なので allocation も自由)。
+        let mut mix_l = vec![0.0_f32; total_frames];
+        let mut mix_r = vec![0.0_f32; total_frames];
+        for event in &audio.events {
+            if event.muted {
+                continue;
+            }
+            let Some(buffer) = self.audio_source_cache.get(event.source_id) else {
+                continue;
+            };
+            let event_start =
+                (event.event_start_in_clip_beats * samples_per_beat).max(0.0) as usize;
+            let event_end =
+                ((event.event_start_in_clip_beats + event.event_length_beats) * samples_per_beat)
+                    .max(0.0) as usize;
+            let event_len = event_end.saturating_sub(event_start);
+            if event_len == 0 {
+                continue;
+            }
+
+            let pitch_factor = 2f64.powf(event.pitch_semitones as f64 / 12.0);
+            let sr_factor = buffer.sample_rate as f64 / engine_sr as f64;
+            let pitch_ratio = match event.stretch_mode {
+                common::model::StretchMode::Repitch => sr_factor * pitch_factor,
+                _ => sr_factor,
+            };
+            let gain_lin = 10f32.powf(event.gain_db / 20.0);
+            let pan_rad = (event.pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
+            let pan_l = pan_rad.cos();
+            let pan_r = pan_rad.sin();
+            let fade_in_frames =
+                (event.fade_in_beats.max(0.0) * samples_per_beat).max(0.0) as u64;
+            let fade_out_frames =
+                (event.fade_out_beats.max(0.0) * samples_per_beat).max(0.0) as u64;
+            let event_total = event_len as u64;
+            let source_len = event
+                .source_end_frames
+                .saturating_sub(event.source_start_frames);
+
+            let l_plane: &[f32] =
+                buffer.samples.first().map(Vec::as_slice).unwrap_or(&[]);
+            let r_plane: &[f32] = if buffer.channels >= 2 {
+                buffer.samples.get(1).map(Vec::as_slice).unwrap_or(l_plane)
+            } else {
+                l_plane
+            };
+
+            for i in 0..event_len {
+                let dst = event_start + i;
+                if dst >= total_frames {
+                    break;
+                }
+                let local = i as u64;
+                let fade_in =
+                    Self::bounce_fade_env(local, fade_in_frames, event.fade_in_curve);
+                let tail = event_total.saturating_sub(local + 1);
+                let fade_out =
+                    Self::bounce_fade_env(tail, fade_out_frames, event.fade_out_curve);
+                let env = fade_in * fade_out * gain_lin;
+                if env == 0.0 {
+                    continue;
+                }
+                let source_pos = i as f64 * pitch_ratio;
+                let source_pos = if event.reversed {
+                    source_len as f64 - 1.0 - source_pos
+                } else {
+                    source_pos
+                };
+                if source_pos < 0.0 {
+                    continue;
+                }
+                let i0 = source_pos.floor() as i64;
+                let frac = (source_pos - i0 as f64) as f32;
+                if i0 < 0 {
+                    continue;
+                }
+                let abs0 = event.source_start_frames + i0 as u64;
+                let abs1 = abs0 + 1;
+                if abs0 >= event.source_end_frames || abs0 >= buffer.frames {
+                    continue;
+                }
+                let s_l0 = l_plane.get(abs0 as usize).copied().unwrap_or(0.0);
+                let s_r0 = r_plane.get(abs0 as usize).copied().unwrap_or(0.0);
+                let s_l1 = l_plane.get(abs1 as usize).copied().unwrap_or(s_l0);
+                let s_r1 = r_plane.get(abs1 as usize).copied().unwrap_or(s_r0);
+                let s_l = s_l0 + (s_l1 - s_l0) * frac;
+                let s_r = s_r0 + (s_r1 - s_r0) * frac;
+                let sqrt2 = std::f32::consts::SQRT_2;
+                mix_l[dst] += s_l * env * pan_l * sqrt2;
+                mix_r[dst] += s_r * env * pan_r * sqrt2;
+            }
+        }
+
+        // ---- WAV 書き出し ----
+        // file 名: clip 名を sanitize + ts8 (epoch milli の下 8 桁)。
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64 % 100_000_000)
+            .unwrap_or(0);
+        let safe_name: String = clip
+            .name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect();
+        let safe_name = if safe_name.is_empty() {
+            "bounce".into()
+        } else {
+            safe_name
+        };
+        let filename = format!("{safe_name}_{ts:08}.wav");
+
+        let project_dir = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+        let (out_path, source_path) = match project_dir.as_deref() {
+            Some(dir) => {
+                let bounce_dir = dir.join("bounce");
+                if let Err(e) = std::fs::create_dir_all(&bounce_dir) {
+                    self.status_message =
+                        format!("Bounce In Place: bounce/ 作成失敗: {e}");
+                    return;
+                }
+                let dst = bounce_dir.join(&filename);
+                (
+                    dst.clone(),
+                    common::model::AudioSourcePath::ProjectRelative(
+                        std::path::PathBuf::from("bounce").join(&filename),
+                    ),
+                )
+            }
+            None => {
+                // 未保存 project は import_cache と同様、 user cache に
+                // 一時書き出し。 save 時の migration helper は将来追加。
+                let cache = std::env::var_os("LOCALAPPDATA")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir)
+                    .join("daw_01")
+                    .join("bounce_cache");
+                if let Err(e) = std::fs::create_dir_all(&cache) {
+                    self.status_message =
+                        format!("Bounce In Place: bounce_cache/ 作成失敗: {e}");
+                    return;
+                }
+                let dst = cache.join(&filename);
+                (
+                    dst.clone(),
+                    common::model::AudioSourcePath::Absolute(dst.clone()),
+                )
+            }
+        };
+
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: engine_sr,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let writer = match hound::WavWriter::create(&out_path, spec) {
+            Ok(w) => w,
+            Err(e) => {
+                self.status_message =
+                    format!("Bounce In Place: WAV create 失敗: {e}");
+                return;
+            }
+        };
+        let mut writer = writer;
+        for i in 0..total_frames {
+            if writer.write_sample(mix_l[i]).is_err()
+                || writer.write_sample(mix_r[i]).is_err()
+            {
+                self.status_message = "Bounce In Place: WAV 書き込み失敗".into();
+                let _ = std::fs::remove_file(&out_path);
+                return;
+            }
+        }
+        if let Err(e) = writer.finalize() {
+            self.status_message =
+                format!("Bounce In Place: WAV finalize 失敗: {e}");
+            let _ = std::fs::remove_file(&out_path);
+            return;
+        }
+
+        // ---- AudioSource 採番 + Song / cache 更新 ----
+        let new_source_id = self.song.alloc_audio_source_id();
+        let new_source = common::model::AudioSource {
+            path: source_path,
+            sample_rate: engine_sr,
+            channels: 2,
+            frames: total_frames as u64,
+            original_bpm: Some(self.song.bpm),
+            root_key: None,
+        };
+        self.song.audio_sources.insert(new_source_id, new_source);
+        let new_buffer = std::sync::Arc::new(crate::audio_source_cache::AudioSourceBuffer {
+            sample_rate: engine_sr,
+            channels: 2,
+            frames: total_frames as u64,
+            samples: vec![mix_l, mix_r],
+        });
+        self.audio_source_cache.insert(new_source_id, new_buffer);
+
+        // ClipContent::Audio を 1 event 構成に置換 (= bounce 後は flat な
+        // single-event clip)。 Phase 1 の 1 clip 1 event 前提と整合。
+        let new_event = common::model::AudioEvent {
+            source_id: new_source_id,
+            event_start_in_clip_beats: 0.0,
+            event_length_beats: clip.length_beats,
+            source_start_frames: 0,
+            source_end_frames: total_frames as u64,
+            ..common::model::AudioEvent::default()
+        };
+        if let Some(content) = self.song.clip_contents.get_mut(&clip.content_id) {
+            *content = common::model::ClipContent::Audio(common::model::AudioContent {
+                events: vec![new_event],
+            });
+        }
+
+        self.is_dirty = true;
+        self.sync_song_to_plugin_host();
+        if self.clip_edit_buffer_target == Some(target) {
+            self.resync_clip_audio_event_edit_buffers(target);
+        }
+        self.status_message = format!(
+            "Bounce In Place: '{}' を {} に書き出し",
+            clip.name,
+            out_path.display()
+        );
     }
 
     /// `target` clip の first event の `reversed` 値を読む。 audio で

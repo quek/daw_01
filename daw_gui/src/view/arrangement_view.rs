@@ -198,7 +198,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let key = *clip_key;
         ui.context_menu_for(
             *rect,
-            &["Make Unique", "Auto-Fade", "Auto-Crossfade", "Reverse"],
+            &[
+                "Make Unique",
+                "Auto-Fade",
+                "Auto-Crossfade",
+                "Reverse",
+                "Bounce In Place",
+            ],
             move |idx, ui| {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     let Some(target) = clip_key_to_ref(app, key) else {
@@ -212,6 +218,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         // (Auto-Fade と違って selection 全体ではなく当該
                         // clip のみ。 Bitwig clip メニューでも同様)。
                         3 => app.handle_event(AppEvent::ToggleClipReversed(target)),
+                        // Bounce In Place: Pre-FX (= plugin chain 通さず)、
+                        // 当該 clip のみ。 Phase 2 PR9 (`docs/plan_audio
+                        // _clip.md` §3.8)。
+                        4 => app.handle_event(AppEvent::BounceClipInPlace(target)),
                         _ => {}
                     }
                 }));
