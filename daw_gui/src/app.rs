@@ -2412,7 +2412,7 @@ fn clamp_snap_choice(c: u8) -> u8 {
 impl AppData {
     // -------- IPC -----------------------------------------------------------
 
-    fn send_audio(&self, msg: MainToChild) {
+    pub(crate) fn send_audio(&self, msg: MainToChild) {
         tracing::info!(?msg, "sending to audio");
         let Some(tx) = self.audio_tx.as_ref() else {
             tracing::warn!("audio sender is not configured");

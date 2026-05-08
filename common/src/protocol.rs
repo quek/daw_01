@@ -223,6 +223,13 @@ pub enum MainToChild {
     /// `render` extension can pick higher-quality algorithms during
     /// export and revert afterwards.
     SetRenderMode(RenderMode),
+    /// Reposition the audio engine's playhead. Sent by daw_gui when the
+    /// user clicks/drags the arrangement ruler. `samples` is the absolute
+    /// frame offset from the start of the song at the engine sample rate.
+    /// Takes effect on the next audio buffer regardless of `playing`
+    /// state, so click-to-seek works both while stopped and during
+    /// playback.
+    SeekTo { samples: u64 },
     // PR-V4: `MainToChild::SetGeneratedAudio` 削除済。 旧 path で
     // VOICEVOX 合成結果を audio engine に流していたが、 builtin
     // instrument plugin (`PluginFormat::Builtin`) が plugin host 内で

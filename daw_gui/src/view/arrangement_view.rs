@@ -416,14 +416,21 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
     match req {
         // gui_01 #024 (resolved): ruler click / drag で発火する seek
-        // 要求。 daw_01 は AppData.playhead_beat を更新する (= GUI 上の
-        // playhead 表示を即移動)。 audio engine への seek IPC 送信は
-        // 別 PR で対応 (Phase 1 では GUI 側の表示更新のみ、 Split は
-        // arrangement_hover_beat / playhead_beat を使うので click で
-        // seek した beat 位置に Split できる)。
+        // 要求。 PR-V4 fix: GUI 側 playhead_beat を更新するだけでなく
+        // audio engine にも `MainToChild::SeekTo { samples }` を IPC
+        // 送信して再生位置を同期する (= Stop 中も Play 中も click 位置
+        // に飛ぶ)。 sample 換算は engine sample rate (= 48000) と
+        // song.bpm から `beat × 60 / bpm × sr`。
         ArrangementEditRequest::SetPlayheadBeat(beat) => {
             Edit::mutate(move |app: &mut AppData| {
-                app.playhead_beat = Some(beat.max(0.0) as f32);
+                let beat = beat.max(0.0);
+                app.playhead_beat = Some(beat as f32);
+                let sr = common::audio_bridge::SAMPLE_RATE as f64;
+                let bpm = app.song.bpm.max(1.0) as f64;
+                let samples = (beat * 60.0 / bpm * sr).max(0.0) as u64;
+                app.send_audio(common::protocol::MainToChild::SeekTo {
+                    samples,
+                });
             })
         }
         ArrangementEditRequest::SelectClips { next, .. } => {

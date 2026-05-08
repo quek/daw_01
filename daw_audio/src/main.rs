@@ -128,6 +128,15 @@ async fn recv_loop(
             Ok(MainToChild::SetLoop(b)) => {
                 shared.looping.store(b, Ordering::Release);
             }
+            Ok(MainToChild::SeekTo { samples }) => {
+                // SharedState::playhead は audio thread が毎 buffer
+                // store するので、 IPC 受信スレッドで store するのは
+                // race にならない (= 直前の値が一瞬だけ見えるが、 次
+                // buffer で確実に上書き)。 GUI 側 ruler click 経由で
+                // ユーザーが想定する位置に飛ぶ。
+                shared.playhead.store(samples, Ordering::Release);
+                tracing::info!(samples, "received SeekTo");
+            }
             Ok(MainToChild::LoadSong(song)) => {
                 // PR6: AudioClipRenderer を再 build (WAV decode + event
                 // schedule flatten)。 LoadSong は IPC 受信スレッドから

@@ -448,7 +448,13 @@ impl LocalState {
         match (self.playing, desired) {
             (false, PlaybackCommand::Play) => {
                 self.playing = true;
-                shared.playhead.store(0, Ordering::Release);
+                // 旧挙動: Play で必ず playhead を 0 に戻す。 これは
+                // 「ruler click で位置を変えても Play 押すと頭から
+                // 再生される」 という不便さの原因。 業界標準 (REAPER /
+                // Ableton / Studio One) は「Play は現在の playhead
+                // から再生」、 ホームに戻すのは別 shortcut (= Home キー
+                // 等)。 daw_01 もそれに合わせ、 SeekTo IPC で書き込ま
+                // れた現在の playhead をそのまま使う。
                 for s in self.scratch.iter_mut() {
                     s.state.active_notes.clear();
                     s.state.pending_offs.clear();
