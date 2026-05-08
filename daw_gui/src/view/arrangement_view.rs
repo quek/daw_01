@@ -343,6 +343,17 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 /// Edit 列をフレーム末尾 apply する gui_01 の流儀に乗る)。
 fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
     match req {
+        // gui_01 #024 (resolved): ruler click / drag で発火する seek
+        // 要求。 daw_01 は AppData.playhead_beat を更新する (= GUI 上の
+        // playhead 表示を即移動)。 audio engine への seek IPC 送信は
+        // 別 PR で対応 (Phase 1 では GUI 側の表示更新のみ、 Split は
+        // arrangement_hover_beat / playhead_beat を使うので click で
+        // seek した beat 位置に Split できる)。
+        ArrangementEditRequest::SetPlayheadBeat(beat) => {
+            Edit::mutate(move |app: &mut AppData| {
+                app.playhead_beat = Some(beat.max(0.0) as f32);
+            })
+        }
         ArrangementEditRequest::SelectClips { next, .. } => {
             Edit::mutate(move |app: &mut AppData| {
                 let next_refs: Vec<ClipRef> =

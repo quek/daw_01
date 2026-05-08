@@ -2593,7 +2593,7 @@ user 目視確認 → main 確定後、 本ブロックに「commit X 確定」 
 
 ---
 
-## #024 [Replied] 2026-05-07 [要望] `Ui::arrangement` widget の ruler クリックで playhead seek (`SetPlayheadBeat(f64)`)
+## #024 [Resolved] 2026-05-07 [要望] `Ui::arrangement` widget の ruler クリックで playhead seek (`SetPlayheadBeat(f64)`)
 
 関連仕様: [daw_01:docs/plan_audio_clip.md](daw_01:docs/plan_audio_clip.md) §3.3 (Split は cursor = playhead 位置で分割)、 §14 (shortcut)
 
