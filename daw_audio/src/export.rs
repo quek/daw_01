@@ -42,13 +42,29 @@ const TAIL_MAX_SECONDS: u64 = 10;
 /// Run the offline WAV export to completion. Blocks the caller until the
 /// file is finalised. RT-irrelevant — the CPAL callback writes silence
 /// while `engine_shared.export_running` is set.
+///
+/// `range`:
+/// - `None` — full song export (= `MainToChild::ExportWav`). Walks
+///   `0..(song.length_beats × samples_per_beat) + tail_max` and writes
+///   every frame to the WAV.
+/// - `Some((start_frame, end_frame))` — clip-range bounce
+///   (`MainToChild::BounceClipFxOnline`). Walks the song from frame 0
+///   so plugin state at `start_frame` is fully accumulated (= reverb
+///   tails / parameter ramps / sidechain history are correct), but
+///   writes only frames in `[start_frame, end_frame)` plus tail
+///   silence past `end_frame`. Returns the frame count written.
+///
+/// Returns the number of frames written to the WAV (= can be less than
+/// the requested range if tail silence is detected and the render
+/// stopped early).
 pub fn run_export(
     path: PathBuf,
     engine_shared: Arc<EngineShared>,
     song: Song,
     sample_rate: u32,
     max_frames: usize,
-) -> Result<()> {
+    range: Option<(u64, u64)>,
+) -> Result<u64> {
     if song.bpm <= 0.0 {
         anyhow::bail!("song.bpm must be positive (got {})", song.bpm);
     }
@@ -56,13 +72,26 @@ pub fn run_export(
     let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(song.bpm);
     let song_length_samples = (song.length_beats * samples_per_beat).max(0.0) as u64;
     let tail_max_samples = u64::from(sample_rate) * TAIL_MAX_SECONDS;
-    let total_samples = song_length_samples + tail_max_samples;
+
+    let (write_start, write_end) = range.unwrap_or((0, song_length_samples));
+    if write_end < write_start {
+        anyhow::bail!(
+            "invalid bounce range: end_frame ({write_end}) < start_frame ({write_start})"
+        );
+    }
+    // walk past write_end by tail_max so plugin release tails / verbs
+    // can decay; walk start is always frame 0 to keep plugin state
+    // consistent at the requested start_frame.
+    let total_samples = write_end + tail_max_samples;
 
     tracing::info!(
         path = %path.display(),
         sample_rate,
         n_tracks,
         song_length_samples,
+        write_start,
+        write_end,
+        is_clip_range = range.is_some(),
         "starting offline WAV export"
     );
 
@@ -89,7 +118,8 @@ pub fn run_export(
         sample_rate,
         max_frames,
         total_samples,
-        song_length_samples,
+        write_start,
+        write_end,
         &mut scratch,
         &mut master_l,
         &mut master_r,
@@ -100,14 +130,18 @@ pub fn run_export(
     // never gets wedged.
     engine_shared.export_running.store(false, Ordering::Release);
 
-    render_result?;
+    let frames_written = render_result?;
 
     writer
         .finalize()
         .with_context(|| format!("failed to finalize WAV {}", path.display()))?;
 
-    tracing::info!(path = %path.display(), "offline WAV export finished");
-    Ok(())
+    tracing::info!(
+        path = %path.display(),
+        frames_written,
+        "offline WAV export finished"
+    );
+    Ok(frames_written)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -118,12 +152,13 @@ fn render_loop(
     sample_rate: u32,
     max_frames: usize,
     total_samples: u64,
-    song_length_samples: u64,
+    write_start: u64,
+    write_end: u64,
     scratch: &mut [TrackScratch],
     master_l: &mut [f32],
     master_r: &mut [f32],
     writer: &mut WavWriter<std::io::BufWriter<std::fs::File>>,
-) -> Result<()> {
+) -> Result<u64> {
     // Tail-silence cutoff: stop early if the master bus stays under
     // -60 dB for half a second once we're past the song body.
     let silence_thresh: f32 = 0.001;
@@ -140,6 +175,10 @@ fn render_loop(
     let mut schedule = compile_schedule(song)
         .map_err(|e| anyhow::anyhow!("export schedule compile failed: {e:?}"))?;
 
+    // Frame counter for the WAV output. Walking the song always starts
+    // at frame 0 so plugin state at `write_start` is properly built up,
+    // but we don't write samples to the WAV before reaching `write_start`.
+    let mut frames_written: u64 = 0;
     let mut playhead: u64 = 0;
     while playhead < total_samples {
         let remaining = total_samples - playhead;
@@ -228,33 +267,52 @@ fn render_loop(
             any_solo,
         );
 
-        // Write interleaved stereo + track block peak for tail
-        // detection.
+        // Compute block peak across the full block (for tail-silence
+        // detection past write_end).
+        let block_start = playhead;
+        let block_end = playhead + frames as u64;
         let mut block_peak: f32 = 0.0;
         for i in 0..frames {
             let l = master_l[i];
             let r = master_r[i];
-            writer
-                .write_sample(l)
-                .context("failed to write WAV sample (left)")?;
-            writer
-                .write_sample(r)
-                .context("failed to write WAV sample (right)")?;
             block_peak = block_peak.max(l.abs()).max(r.abs());
+        }
+
+        // Write only frames in [write_start, ∞). When the block
+        // straddles write_start (e.g. write_start = 12000, block =
+        // [10000, 11500) → none written; block = [10000, 13000) →
+        // skip 0..2000, write 2000..3000), the suffix is written.
+        // Before write_start, the entire block is rendered (= plugin
+        // state advances) but skipped from the WAV output.
+        if block_end > write_start {
+            let local_start = (write_start.saturating_sub(block_start)) as usize;
+            for i in local_start..frames {
+                let l = master_l[i];
+                let r = master_r[i];
+                writer
+                    .write_sample(l)
+                    .context("failed to write WAV sample (left)")?;
+                writer
+                    .write_sample(r)
+                    .context("failed to write WAV sample (right)")?;
+                frames_written += 1;
+            }
         }
 
         playhead += frames as u64;
 
-        // Tail-silence detection only kicks in once we're past the
-        // declared song body; the body itself may legitimately be
-        // silent (intro, etc.) and we shouldn't truncate it.
-        if playhead >= song_length_samples {
+        // Tail-silence detection only kicks in once we're past
+        // `write_end` (= the declared song / clip body). The body
+        // itself may legitimately be silent (intro, gap between
+        // events) and we shouldn't truncate it.
+        if playhead >= write_end {
             if block_peak < silence_thresh {
                 silence_counter += frames as u64;
                 if silence_counter >= silence_cutoff_samples {
                     tracing::info!(
                         playhead,
-                        song_length_samples,
+                        write_end,
+                        frames_written,
                         "tail silence detected, stopping export early"
                     );
                     break;
@@ -265,5 +323,5 @@ fn render_loop(
         }
     }
 
-    Ok(())
+    Ok(frames_written)
 }

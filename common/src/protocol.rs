@@ -56,6 +56,19 @@ pub enum ChildToMain {
     ExportWavComplete {
         error: Option<String>,
     },
+    /// Offline plugin-FX bounce finished (or failed). Mirror of
+    /// `ExportWavComplete` but for `MainToChild::BounceClipFxOnline`.
+    /// `frames` is the actual number of frames written to the WAV
+    /// (= `end_frame - start_frame` plus tail silence kept).
+    /// `source_track` / `source_clip` echo the request so the host can
+    /// look up which clip the result belongs to.
+    BounceClipFxComplete {
+        path: std::path::PathBuf,
+        source_track: u32,
+        source_clip: u32,
+        error: Option<String>,
+        frames: u64,
+    },
     /// Plugin-host confirmed `SetSlotPlugin` and reported the stable id /
     /// display name of the descriptor that actually loaded.
     /// `plugin_id` is the host's session-unique identifier for this
@@ -171,6 +184,27 @@ pub enum MainToChild {
     /// `ChildToMain::ExportWavComplete`.
     ExportWav {
         path: std::path::PathBuf,
+    },
+    /// Offline-render a clip range with the **full plugin chain** (= post-FX)
+    /// to a WAV file. Used by `Bounce (with FX)` (`docs/plan_audio_clip
+    /// .md` §3.8). Same freewheel pipeline as `ExportWav` but the WAV
+    /// captures only frames in `[start_frame, end_frame)` (plus tail
+    /// silence cutoff). The render walks the song from frame 0 so plugin
+    /// state at `start_frame` is fully accumulated (= reverb tails /
+    /// parameter ramps / sidechain history are correct). The host sends
+    /// this with `SetRenderMode(Offline)` bookended around it. The audio
+    /// engine replies with `ChildToMain::BounceClipFxComplete`.
+    ///
+    /// `source_track` / `source_clip` are echoed back in the completion
+    /// reply so the host can resolve which clip the freshly-written WAV
+    /// belongs to (= multiple bounces in flight not supported in M1, but
+    /// the field structure leaves room for it).
+    BounceClipFxOnline {
+        path: std::path::PathBuf,
+        source_track: u32,
+        source_clip: u32,
+        start_frame: u64,
+        end_frame: u64,
     },
     /// Tell the plugin host to switch every loaded plugin's CLAP render
     /// mode (Realtime ↔ Offline). The audio side bookends an export

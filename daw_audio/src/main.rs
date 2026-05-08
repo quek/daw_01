@@ -300,9 +300,10 @@ async fn recv_loop(
                             song,
                             sample_rate,
                             common::process_data::MAX_FRAMES,
+                            None,
                         );
                         let error_msg = match result {
-                            Ok(()) => None,
+                            Ok(_frames) => None,
                             Err(e) => {
                                 tracing::error!(error = ?e, "offline WAV export failed");
                                 Some(format!("{e:#}"))
@@ -315,6 +316,72 @@ async fn recv_loop(
                     tracing::error!(error = ?e, "failed to spawn export thread");
                     let _ = out_tx.send(ChildToMain::ExportWavComplete {
                         error: Some(format!("failed to spawn export thread: {e}")),
+                    });
+                }
+            }
+            Ok(MainToChild::BounceClipFxOnline {
+                path,
+                source_track,
+                source_clip,
+                start_frame,
+                end_frame,
+            }) => {
+                let song_snap = shared.song.load();
+                let Some(song_arc) = song_snap.as_ref() else {
+                    tracing::warn!("BounceClipFxOnline received but no song loaded");
+                    let _ = out_tx.send(ChildToMain::BounceClipFxComplete {
+                        path,
+                        source_track,
+                        source_clip,
+                        error: Some("no song loaded".into()),
+                        frames: 0,
+                    });
+                    continue;
+                };
+                let song = (**song_arc).clone();
+                drop(song_snap);
+                let engine_shared_clone = Arc::clone(&engine_shared);
+                let out_tx_clone = out_tx.clone();
+                let sample_rate = session_sample_rate;
+                let path_for_thread = path.clone();
+                if let Err(e) = std::thread::Builder::new()
+                    .name("daw-audio-bounce-fx".into())
+                    .spawn(move || {
+                        let path_for_complete = path_for_thread.clone();
+                        let result = export::run_export(
+                            path_for_thread,
+                            engine_shared_clone,
+                            song,
+                            sample_rate,
+                            common::process_data::MAX_FRAMES,
+                            Some((start_frame, end_frame)),
+                        );
+                        let (error_msg, frames) = match result {
+                            Ok(frames) => (None, frames),
+                            Err(e) => {
+                                tracing::error!(
+                                    error = ?e,
+                                    "offline plugin-FX bounce failed"
+                                );
+                                (Some(format!("{e:#}")), 0)
+                            }
+                        };
+                        let _ = out_tx_clone.send(ChildToMain::BounceClipFxComplete {
+                            path: path_for_complete,
+                            source_track,
+                            source_clip,
+                            error: error_msg,
+                            frames,
+                        });
+                    })
+                {
+                    tracing::error!(error = ?e, "failed to spawn bounce thread");
+                    let _ = out_tx.send(ChildToMain::BounceClipFxComplete {
+                        path,
+                        source_track,
+                        source_clip,
+                        error: Some(format!("failed to spawn bounce thread: {e}")),
+                        frames: 0,
                     });
                 }
             }
