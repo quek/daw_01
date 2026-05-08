@@ -2453,6 +2453,11 @@ impl AppData {
         self.send_audio(MainToChild::SetProjectDir(project_dir));
         let song = self.song.clone();
         self.send_audio(MainToChild::LoadSong(song));
+        // PR-V3: vocal track が builtin VOICEVOX を instrument に持つ場合、
+        // notes / bpm 変更を plugin に flush して背景 synth を trigger。
+        // 既存 vocal block (= track.instrument is None の旧 project) には
+        // 影響しない (= sync_vocal_metadata 内で format check で skip)。
+        self.sync_vocal_metadata();
     }
 
     // -------- File ----------------------------------------------------------
@@ -3459,10 +3464,103 @@ impl AppData {
         let mut clip = demo_clip();
         clip.id = track.alloc_clip_id();
         track.clips.push(clip);
+        // PR-V3: track.instrument を Builtin VOICEVOX で初期化。
+        // SlotPluginLoadedFromChild が来る前に Track 側でも format =
+        // Builtin を保持しておかないと、 後段の handler が「既存 format」
+        // を Clap default に決めてしまう (= line 5944 周辺の logic)。
+        track.instrument = Some(common::model::PluginInstance {
+            plugin_id: common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
+            format: PluginFormat::Builtin,
+            state: None,
+            sidechain_sources: Vec::new(),
+        });
         self.song.tracks.push(track);
         self.resize_track_peak_display();
+
+        // SetSlotPlugin で plugin host に builtin VOICEVOX を load させる。
+        // path は URI、 plugin_id は同 URI (= builtin の場合 path == id)。
+        // 結果は SlotPluginLoadedFromChild で受信、 daw_audio はその plugin
+        // を instrument 段階で process する (= 既存 vocal block は
+        // track.instrument.is_some() で自動 skip、 二重再生にならない)。
+        self.send_plugin(MainToChild::SetSlotPlugin {
+            track: id,
+            slot: PluginSlot::Instrument,
+            format: PluginFormat::Builtin,
+            path: std::path::PathBuf::from(common::plugin_db::BUILTIN_ID_VOICEVOX),
+            plugin_id: common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
+            initial_state: None,
+        });
         self.sync_song_to_plugin_host();
-        tracing::info!(index, "added vocal track");
+        // 直後に歌詞 metadata を flush (= demo_clip の lyrics で初期 synth
+        // が走る)。 plugin_id がまだ未確定の場合は SlotPluginLoadedFromChild
+        // で再 flush される。
+        self.sync_vocal_metadata();
+        tracing::info!(index, "added vocal track (builtin VOICEVOX)");
+    }
+
+    /// PR-V3: track.source = Vocal で instrument に builtin VOICEVOX が
+    /// load されている全 track の clip notes を `NoteMetadata` 配列に
+    /// 変換し、 plugin host に `SetBuiltinPluginNoteMetadata` で送る。
+    /// plugin_id 未確定 (= load 完了通知前) の track はスキップ、
+    /// `SlotPluginLoadedFromChild` 受信時に再呼び出しされる。
+    pub fn sync_vocal_metadata(&self) {
+        let bpm = self.song.bpm;
+        for track in &self.song.tracks {
+            if !matches!(track.source, common::model::InstrumentSource::Vocal { .. }) {
+                continue;
+            }
+            // builtin VOICEVOX を instrument に持っているか?
+            let Some(inst) = track.instrument.as_ref() else {
+                continue;
+            };
+            if inst.format != PluginFormat::Builtin
+                || inst.plugin_id != common::plugin_db::BUILTIN_ID_VOICEVOX
+            {
+                continue;
+            }
+            // plugin_id (= u32 host-side id) を loaded_slots から引く。
+            let Some(slot_info) = self
+                .loaded_slots
+                .get(&(track.id, PluginSlot::Instrument))
+            else {
+                continue;
+            };
+            let host_plugin_id = slot_info.plugin_id;
+
+            // 全 clip の notes を NoteMetadata 配列に flatten。 note_id は
+            // (clip-internal index) を「track 内通し番号」 にしないと衝突
+            // する可能性があるので、 ここでは「全 clip 連結 index」 を使う
+            // (= clip 1 の note 数 + clip 2 の note index)。 PR-V2.4 で
+            // 改めて clip 単位にする予定。
+            let mut entries: Vec<common::plugin_metadata::NoteMetadata> = Vec::new();
+            for clip in &track.clips {
+                let notes: &[common::model::Note] = self
+                    .song
+                    .clip_contents
+                    .get(&clip.content_id)
+                    .and_then(|c| c.notes())
+                    .unwrap_or(&[]);
+                for n in notes {
+                    let note_id = entries.len() as u32;
+                    entries.push(common::plugin_metadata::NoteMetadata {
+                        note_id,
+                        // clip-relative beats を song-absolute に変換 (=
+                        // VOICEVOX synth wrapper が earliest を引いて
+                        // 0 起点にする、 clip 境界跨ぎでも一貫)。
+                        start_beat: clip.start_beat + n.start_beat,
+                        duration_beats: n.duration_beats,
+                        pitch: n.pitch,
+                        velocity: n.velocity,
+                        lyric: n.lyric.clone().unwrap_or_default(),
+                    });
+                }
+            }
+            self.send_plugin(MainToChild::SetBuiltinPluginNoteMetadata {
+                plugin_id: host_plugin_id,
+                bpm,
+                entries,
+            });
+        }
     }
 
     fn action_add_instrument_track(&mut self) {
@@ -6001,6 +6099,16 @@ impl AppData {
                 "プラグイン読み込み中... (残 {})",
                 self.pending_plugin_loads.len()
             );
+        }
+
+        // PR-V3: builtin VOICEVOX が instrument に load されたら、 直後に
+        // 歌詞 metadata を flush して背景 synth を trigger する。 plugin_id
+        // が `loaded_slots` に登録された後でないと sync_vocal_metadata が
+        // skip するため、 ここで明示呼び出し。 vocal でない track の load
+        // も同 path を通るが、 sync_vocal_metadata 内で format check して
+        // skip するので overhead は最小。
+        if slot == PluginSlot::Instrument {
+            self.sync_vocal_metadata();
         }
     }
 

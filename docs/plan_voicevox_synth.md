@@ -44,6 +44,24 @@
     追加 (= 役割は plugin_host のみ)
   - unit test 1 件追加 (set_note_metadata で lyrics buffer が完全置換、
     空 flush で全消去)
+- ✅ **PR-V3 (前段)**: vocal track の builtin VOICEVOX auto-load + 歌詞
+  flush 経路 (= 既存 vocal block と並列で動かせる、 二重再生は
+  `track.instrument.is_some()` の audio engine 分岐で自動回避)
+  - `action_add_vocal_track`: track 作成と同時に builtin VOICEVOX を
+    `SetSlotPlugin` で load 要求、 track.instrument に
+    `PluginInstance { format: Builtin, plugin_id: BUILTIN_ID_VOICEVOX
+    , state: None }` を pre-fill (= 後続 `SlotPluginLoadedFromChild`
+    handler が format = Clap default で上書きするのを防ぐ)
+  - `AppData::sync_vocal_metadata()` 新設: 全 vocal track の clip notes
+    を `NoteMetadata` 配列に変換 → `SetBuiltinPluginNoteMetadata` で
+    plugin host に送信。 plugin_id 未確定の track はスキップ
+  - 呼び出し hook: `sync_song_to_plugin_host` 末尾 + `on_plugin_loaded
+    _from_child` (slot == Instrument) (= load 完了通知の直後に flush)
+  - 既存 project (= track.source = Vocal だが instrument = None) は
+    legacy vocal block で動作、 影響なし
+  - daw_audio 側変更なし: `process_track_owned` の vocal block は
+    `song_track.instrument.is_none()` で gate 済 (= builtin load 後は
+    自動 skip、 二重再生回避)
 - ✅ **PR-V2.5**: state save / restore 完全対応 (PR-V2.3 と並行で着手)
   - `LoadedPlugin::state_load(&mut self, ...)` に trait method の signature
     変更。 ClapPlugin / Vst3Plugin / Silence / VoicevoxBuiltin すべての
