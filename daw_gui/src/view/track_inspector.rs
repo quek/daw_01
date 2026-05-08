@@ -10,7 +10,7 @@ use daw_ui_core::{
 use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent, PickerTarget};
-use common::model::StretchMode;
+use common::model::{FadeCurve, StretchMode};
 
 const BG: Color = Color { r: 0.16, g: 0.16, b: 0.20, a: 1.0 };
 const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
@@ -55,6 +55,24 @@ fn stretch_mode_from_index(i: usize) -> StretchMode {
         2 => StretchMode::Stretch,
         3 => StretchMode::Slice,
         _ => StretchMode::Raw,
+    }
+}
+
+const FADE_CURVE_LABELS: &[&str] = &["Linear", "Exp", "SCurve"];
+
+fn fade_curve_to_index(c: FadeCurve) -> usize {
+    match c {
+        FadeCurve::Linear => 0,
+        FadeCurve::Exponential => 1,
+        FadeCurve::SCurve => 2,
+    }
+}
+
+fn fade_curve_from_index(i: usize) -> FadeCurve {
+    match i {
+        1 => FadeCurve::Exponential,
+        2 => FadeCurve::SCurve,
+        _ => FadeCurve::Linear,
     }
 }
 
@@ -281,6 +299,100 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         if pitch_resp.committed {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::CommitClipPitchEdit)
+            }));
+        }
+        y += input_h + 8.0;
+
+        // ---- Phase 2 PR3: Fade In / Fade Out (length + curve) -------
+        // length は text_input (beats、 0..clip_length で clamp)、 curve
+        // は dropdown (Linear / Exponential / SCurve、 spec §3.5)。
+        // length と curve を同 1 行に並べる: label 60 + length 80 + curve
+        // 残りの 3 区分。
+        let fade_curve_w = 80.0;
+        let fade_len_w = (row_w - label_w - fade_curve_w - 4.0).max(40.0);
+        let fade_len_x = area.x + pad + label_w;
+        let fade_curve_x = fade_len_x + fade_len_w + 4.0;
+
+        // Fade In length + curve
+        ui.label_at(
+            "inspector_audio_fade_in_label",
+            "Fade In",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT_DIM,
+        );
+        let fade_in_resp = ui.text_input_at(
+            "inspector_audio_fade_in_input",
+            Rect { x: fade_len_x, y, w: fade_len_w, h: input_h },
+            &app.clip_fade_in_edit_text,
+            |s| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ClipFadeInEditChanged(s))
+                })
+            },
+        );
+        if fade_in_resp.committed {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CommitClipFadeInEdit)
+            }));
+        }
+        let fade_in_idx = fade_curve_to_index(summary.fade_in_curve);
+        if let Some(picked) = ui.dropdown(
+            "inspector_audio_fade_in_curve",
+            Rect { x: fade_curve_x, y, w: fade_curve_w, h: input_h },
+            FADE_CURVE_LABELS,
+            fade_in_idx,
+        ) {
+            let target = summary.target;
+            let new_curve = fade_curve_from_index(picked);
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetClipFadeInCurve {
+                    target,
+                    curve: new_curve,
+                })
+            }));
+        }
+        y += input_h + 4.0;
+
+        // Fade Out length + curve
+        ui.label_at(
+            "inspector_audio_fade_out_label",
+            "Fade Out",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT_DIM,
+        );
+        let fade_out_resp = ui.text_input_at(
+            "inspector_audio_fade_out_input",
+            Rect { x: fade_len_x, y, w: fade_len_w, h: input_h },
+            &app.clip_fade_out_edit_text,
+            |s| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ClipFadeOutEditChanged(s))
+                })
+            },
+        );
+        if fade_out_resp.committed {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CommitClipFadeOutEdit)
+            }));
+        }
+        let fade_out_idx = fade_curve_to_index(summary.fade_out_curve);
+        if let Some(picked) = ui.dropdown(
+            "inspector_audio_fade_out_curve",
+            Rect { x: fade_curve_x, y, w: fade_curve_w, h: input_h },
+            FADE_CURVE_LABELS,
+            fade_out_idx,
+        ) {
+            let target = summary.target;
+            let new_curve = fade_curve_from_index(picked);
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetClipFadeOutCurve {
+                    target,
+                    curve: new_curve,
+                })
             }));
         }
         y += input_h + 12.0;

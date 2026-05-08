@@ -121,6 +121,8 @@ pub struct InspectorAudioEventSummary {
     pub reversed: bool,
     pub muted: bool,
     pub stretch_mode: common::model::StretchMode,
+    pub fade_in_curve: common::model::FadeCurve,
+    pub fade_out_curve: common::model::FadeCurve,
 }
 
 /// Per-plugin sidechain wiring entry shown in the inspector. One row per
@@ -354,6 +356,12 @@ pub struct AppData {
     /// `AudioEvent.pitch_semitones` 入力欄の編集中文字列 (`{:+.1}`、
     /// -96.0 .. 96.0、 Bitwig spec §3.6)。
     pub clip_pitch_edit_text: String,
+    /// `AudioEvent.fade_in_beats` 入力欄の編集中文字列 (`{:.3}`、
+    /// 0.0 .. clip.length_beats で clamp、 Bitwig spec §3.5)。
+    pub clip_fade_in_edit_text: String,
+    /// `AudioEvent.fade_out_beats` 入力欄の編集中文字列 (`{:.3}`、
+    /// 0.0 .. clip.length_beats で clamp)。
+    pub clip_fade_out_edit_text: String,
 
     pub undo_stack: VecDeque<Song>,
     pub redo_stack: VecDeque<Song>,
@@ -505,6 +513,8 @@ impl AppData {
             clip_gain_db_edit_text: String::new(),
             clip_pan_edit_text: String::new(),
             clip_pitch_edit_text: String::new(),
+            clip_fade_in_edit_text: String::new(),
+            clip_fade_out_edit_text: String::new(),
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             is_help_open: false,
@@ -747,6 +757,8 @@ impl AppData {
             reversed: event.reversed,
             muted: event.muted,
             stretch_mode: event.stretch_mode,
+            fade_in_curve: event.fade_in_curve,
+            fade_out_curve: event.fade_out_curve,
         })
     }
 
@@ -900,6 +912,12 @@ impl AppData {
                 | AppEvent::SetClipGainDb { .. }
                 | AppEvent::SetClipPan { .. }
                 | AppEvent::SetClipPitchSemitones { .. }
+                | AppEvent::CommitClipFadeInEdit
+                | AppEvent::CommitClipFadeOutEdit
+                | AppEvent::SetClipFadeInBeats { .. }
+                | AppEvent::SetClipFadeOutBeats { .. }
+                | AppEvent::SetClipFadeInCurve { .. }
+                | AppEvent::SetClipFadeOutCurve { .. }
                 | AppEvent::ImportAudio { .. }
                 | AppEvent::AddNote { .. }
                 | AppEvent::ResizeNote { .. }
@@ -1483,6 +1501,25 @@ pub enum AppEvent {
     SetClipGainDb { target: ClipRef, gain_db: f32 },
     SetClipPan { target: ClipRef, pan: f32 },
     SetClipPitchSemitones { target: ClipRef, semitones: f32 },
+
+    // ---- Audio event fade 編集 (Phase 2 PR3) ----------------------------
+    /// Fade In length (beats) 入力欄の per-character 更新 / commit。
+    /// `Clip*EditChanged` 系と同じ pattern: per-character は非 undoable、
+    /// Commit (Enter / focus 喪失) で parse + clamp + 全 event broadcast、
+    /// undo step を消費する。
+    ClipFadeInEditChanged(String),
+    ClipFadeOutEditChanged(String),
+    CommitClipFadeInEdit,
+    CommitClipFadeOutEdit,
+
+    /// Fade length / curve の programmatic 設定。 `SetClipGainDb` 等と
+    /// 同じ semantics で全 event に broadcast、 値は clip.length_beats
+    /// で clamp (= fade が clip より長くならない)。 curve は spec §3.5
+    /// の Linear / Exponential / SCurve から選択 (Inspector dropdown 経由)。
+    SetClipFadeInBeats { target: ClipRef, beats: f64 },
+    SetClipFadeOutBeats { target: ClipRef, beats: f64 },
+    SetClipFadeInCurve { target: ClipRef, curve: common::model::FadeCurve },
+    SetClipFadeOutCurve { target: ClipRef, curve: common::model::FadeCurve },
 }
 
 impl AppData {
@@ -1837,6 +1874,30 @@ impl AppData {
             }
             AppEvent::SetClipPitchSemitones { target, semitones } => {
                 self.set_clip_audio_event_pitch_semitones(target, semitones);
+            }
+            AppEvent::ClipFadeInEditChanged(s) => {
+                self.clip_fade_in_edit_text = s;
+            }
+            AppEvent::ClipFadeOutEditChanged(s) => {
+                self.clip_fade_out_edit_text = s;
+            }
+            AppEvent::CommitClipFadeInEdit => {
+                self.commit_clip_fade_in_edit();
+            }
+            AppEvent::CommitClipFadeOutEdit => {
+                self.commit_clip_fade_out_edit();
+            }
+            AppEvent::SetClipFadeInBeats { target, beats } => {
+                self.set_clip_audio_event_fade_in_beats(target, beats);
+            }
+            AppEvent::SetClipFadeOutBeats { target, beats } => {
+                self.set_clip_audio_event_fade_out_beats(target, beats);
+            }
+            AppEvent::SetClipFadeInCurve { target, curve } => {
+                self.set_clip_audio_event_fade_in_curve(target, curve);
+            }
+            AppEvent::SetClipFadeOutCurve { target, curve } => {
+                self.set_clip_audio_event_fade_out_curve(target, curve);
             }
             AppEvent::SplitClipAtPlayhead { snap } => {
                 self.action_split_clips_at_cursor(snap);
@@ -3728,12 +3789,156 @@ impl AppData {
                 self.clip_gain_db_edit_text = format!("{:.1}", ev.gain_db);
                 self.clip_pan_edit_text = format!("{:.2}", ev.pan);
                 self.clip_pitch_edit_text = format!("{:+.1}", ev.pitch_semitones);
+                self.clip_fade_in_edit_text = format!("{:.3}", ev.fade_in_beats);
+                self.clip_fade_out_edit_text = format!("{:.3}", ev.fade_out_beats);
             }
             None => {
                 self.clip_edit_buffer_target = None;
                 self.clip_gain_db_edit_text.clear();
                 self.clip_pan_edit_text.clear();
                 self.clip_pitch_edit_text.clear();
+                self.clip_fade_in_edit_text.clear();
+                self.clip_fade_out_edit_text.clear();
+            }
+        }
+    }
+
+    /// `target` clip の length_beats を fade clamp 用に取得する helper。
+    /// clip が解決できなければ `None`。
+    fn clip_length_beats(&self, target: ClipRef) -> Option<f64> {
+        Some(
+            self.song
+                .tracks
+                .get(target.track as usize)?
+                .clips
+                .get(target.clip as usize)?
+                .length_beats,
+        )
+    }
+
+    fn set_clip_audio_event_fade_in_beats(&mut self, target: ClipRef, beats: f64) {
+        // Spec §3.5: fade は clip 内 beats、 clip 長を超えないように clamp。
+        let max_beats = self.clip_length_beats(target).unwrap_or(0.0);
+        let beats = beats.clamp(0.0, max_beats);
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return;
+        };
+        if let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+        {
+            for event in &mut audio.events {
+                event.fade_in_beats = beats;
+            }
+            self.sync_song_to_plugin_host();
+        }
+        self.resync_clip_audio_event_edit_buffers(target);
+    }
+
+    fn set_clip_audio_event_fade_out_beats(&mut self, target: ClipRef, beats: f64) {
+        let max_beats = self.clip_length_beats(target).unwrap_or(0.0);
+        let beats = beats.clamp(0.0, max_beats);
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return;
+        };
+        if let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+        {
+            for event in &mut audio.events {
+                event.fade_out_beats = beats;
+            }
+            self.sync_song_to_plugin_host();
+        }
+        self.resync_clip_audio_event_edit_buffers(target);
+    }
+
+    fn set_clip_audio_event_fade_in_curve(
+        &mut self,
+        target: ClipRef,
+        curve: common::model::FadeCurve,
+    ) {
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return;
+        };
+        if let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+        {
+            for event in &mut audio.events {
+                event.fade_in_curve = curve;
+            }
+            self.sync_song_to_plugin_host();
+        }
+    }
+
+    fn set_clip_audio_event_fade_out_curve(
+        &mut self,
+        target: ClipRef,
+        curve: common::model::FadeCurve,
+    ) {
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return;
+        };
+        if let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+        {
+            for event in &mut audio.events {
+                event.fade_out_curve = curve;
+            }
+            self.sync_song_to_plugin_host();
+        }
+    }
+
+    fn commit_clip_fade_in_edit(&mut self) {
+        let Some(target) = self.clip_edit_buffer_target else {
+            return;
+        };
+        match self.clip_fade_in_edit_text.trim().parse::<f64>() {
+            Ok(v) => self.set_clip_audio_event_fade_in_beats(target, v),
+            Err(_) => {
+                self.status_message = format!(
+                    "Fade In: '{}' を数値として解釈できません",
+                    self.clip_fade_in_edit_text
+                );
+                self.resync_clip_audio_event_edit_buffers(target);
+            }
+        }
+    }
+
+    fn commit_clip_fade_out_edit(&mut self) {
+        let Some(target) = self.clip_edit_buffer_target else {
+            return;
+        };
+        match self.clip_fade_out_edit_text.trim().parse::<f64>() {
+            Ok(v) => self.set_clip_audio_event_fade_out_beats(target, v),
+            Err(_) => {
+                self.status_message = format!(
+                    "Fade Out: '{}' を数値として解釈できません",
+                    self.clip_fade_out_edit_text
+                );
+                self.resync_clip_audio_event_edit_buffers(target);
             }
         }
     }
