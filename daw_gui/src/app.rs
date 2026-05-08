@@ -1585,7 +1585,14 @@ pub enum AppEvent {
     /// an audio clip on the first track at the current playhead.
     /// Phase 2 moves decode to a background thread so large WAVs (up
     /// to 4 GB §7.2) don't block the UI.
-    ImportAudio { paths: Vec<PathBuf> },
+    ImportAudio {
+        paths: Vec<PathBuf>,
+        /// drag&drop で drop position から計算された target track index
+        /// (= arrangement view の y 座標から). `None` なら handler 側で
+        /// `cursor_track_index().unwrap_or(0)` にフォールバック (= File
+        /// menu / 起動 dialog 経由の場合は位置情報がないため)。
+        target_track_idx: Option<u32>,
+    },
 
     /// File menu → "Import Audio..." entry. Opens an `rfd` file picker
     /// (multi-select, WAV filter), then forwards the chosen paths to
@@ -2151,8 +2158,8 @@ impl AppData {
             AppEvent::ExportWav => {
                 self.action_export_wav();
             }
-            AppEvent::ImportAudio { paths } => {
-                self.action_import_audio(paths);
+            AppEvent::ImportAudio { paths, target_track_idx } => {
+                self.action_import_audio(paths, target_track_idx);
             }
             AppEvent::OpenImportAudioDialog => {
                 self.action_open_import_audio_dialog();
@@ -3121,8 +3128,11 @@ impl AppData {
             );
             return;
         }
-        let song = self.song.clone();
-        self.send_audio(MainToChild::LoadSong(song));
+        // play() で LoadSong を再送しない (= 旧バグ: 大量 WAV のとき
+        // audio engine の compile_audio_schedule = decode + schedule
+        // build が同期で 2 秒以上かかり再生開始が遅延)。 song の変更は
+        // 既に sync_song_to_plugin_host 経由で audio engine に届いている
+        // 前提 (= IPC 順序保証)。
         self.send_audio(MainToChild::Play);
         self.is_playing = true;
     }
@@ -7013,7 +7023,9 @@ impl AppData {
         if paths.is_empty() {
             return;
         }
-        self.action_import_audio(paths);
+        // dialog 経由は位置情報がないので target_track_idx = None
+        // (= cursor_track にフォールバック)。
+        self.action_import_audio(paths, None);
     }
 
     /// PR-D 段階 3: Audio Editor の context menu "Add From Source..."。
@@ -7041,7 +7053,11 @@ impl AppData {
         });
     }
 
-    fn action_import_audio(&mut self, paths: Vec<PathBuf>) {
+    fn action_import_audio(
+        &mut self,
+        paths: Vec<PathBuf>,
+        target_track_idx: Option<u32>,
+    ) {
         if paths.is_empty() {
             return;
         }
@@ -7050,12 +7066,15 @@ impl AppData {
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
 
-        // Phase 1 PR3: drop coordinate → track resolution は gui_01 #023
-        // 待ち (`take_file_drop_in_rect` の戻り値に position を含める要望)。
-        // 暫定として「最後に選択した track」 (= cursor track) に配置する。
-        // 未選択時は最初の track にフォールバック。 gui_01 #023 が解決
-        // したら drop 座標から track を解決する形に置き換える (PR4)。
-        let target_track_idx: usize = self.cursor_track_index().unwrap_or(0);
+        // 引数 `target_track_idx` (= drag&drop の drop 位置から arrangement
+        // view が計算) を最優先、 None なら cursor_track_index にフォール
+        // バック (= File menu / dialog 経由)、 さらに無いときは 0。 範囲外
+        // (= track 数を超える) 値は最後の track に clamp。
+        let n_tracks = self.song.tracks.len();
+        let target_track_idx: usize = target_track_idx
+            .map(|i| (i as usize).min(n_tracks.saturating_sub(1)))
+            .or_else(|| self.cursor_track_index())
+            .unwrap_or(0);
         let start_beat_seed: f64 = self.playhead_beat.unwrap_or(0.0) as f64;
         if self.song.tracks.is_empty() {
             self.status_message =

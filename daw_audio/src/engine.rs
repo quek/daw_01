@@ -845,7 +845,10 @@ pub fn process_track_owned(
     // §13 Q6 / §6.1)。 1 track 内で MIDI clip と Audio clip が混在
     // しても、 audio events は instrument を bypass して effect chain
     // の入口でそのまま合流する。
-    if let Some(renderer) = audio_renderer {
+    //
+    // playing == false (Stop / 一時停止) では audio clip を mix しない
+    // (= 旧バグ: Stop でも render し続けてブーンと鳴り続けた)。
+    if playing && let Some(renderer) = audio_renderer {
         crate::audio_clip_renderer::render_audio_events(
             renderer,
             track_idx as usize,

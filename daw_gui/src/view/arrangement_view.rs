@@ -344,16 +344,25 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         );
     }
     if let Some(drop) = ui.take_file_drop_in_rect(canvas_area) {
-        // gui_01 #023 (resolved): `take_file_drop_in_rect` の戻り値が
-        // `DroppedFiles { paths, position }` になったので drop position
-        // から (target_track, target_beat) を解決可能。 ただし現状の
-        // `AppEvent::ImportAudio { paths }` 経路は target を持たない
-        // (handler 側 cursor_track にフォールバック) ので、 まずは paths
-        // だけ取り出して既存挙動を維持。 PR4 範囲で target 解決を追加
-        // する際にここで position から (track, beat) を計算する。
+        // gui_01 #023 (resolved) + drop target 解決:
+        // `DroppedFiles { paths, position }` の position.y から track
+        // index を計算し、 `ImportAudio` の `target_track_idx` で渡す。
+        // 同 widget の hover_clip 計算 (= 数行下) と同じ
+        // `(local_y / row_h)` 式。 canvas 外なら None で fallback。
         let paths = drop.paths;
+        let drop_y = drop.position.1;
+        let canvas_top = canvas_area.y;
+        let local_y = drop_y - canvas_top;
+        let target_track_idx = if local_y >= 0.0 {
+            Some((local_y / row_h.max(1.0)) as u32)
+        } else {
+            None
+        };
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::ImportAudio { paths });
+            app.handle_event(AppEvent::ImportAudio {
+                paths,
+                target_track_idx,
+            });
         }));
     }
 
