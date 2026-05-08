@@ -21,7 +21,7 @@ use daw_ui_core::{
 };
 use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect};
 
-use crate::app::{AppData, AppEvent, AudioEventTrimSide};
+use crate::app::{AppData, AppEvent, AudioEventTrimSide, MIN_AUDIO_EDITOR_VIEW_LEN_BEATS};
 
 const BG: Color = Color { r: 0.10, g: 0.11, b: 0.13, a: 1.0 };
 const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
@@ -141,18 +141,35 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::CloseAudioEditor))
     });
 
+    // ----- View state (scroll / zoom) ------------------------------------
+    // `audio_editor_view_start_beat` / `audio_editor_view_len_beats` は
+    // `OpenAudioEditor` で 0 / clip.length_beats にセット済み (= 全体表示
+    // 初期状態)。 wheel handler が以降 SetAudioEditorScroll / SetAudioEditorZoom
+    // を発火する。 描画前に clamp し直して視覚的に無効値を防ぐ (= clip
+    // が縮んだ等で view が clip 外に飛び出すケース)。
+    let total_beats = clip.length_beats.max(MIN_AUDIO_EDITOR_VIEW_LEN_BEATS);
+    let view_len_beats = if app.audio_editor_view_len_beats > 0.0 {
+        app.audio_editor_view_len_beats
+            .clamp(MIN_AUDIO_EDITOR_VIEW_LEN_BEATS, total_beats)
+    } else {
+        total_beats
+    };
+    let max_view_start = (total_beats - view_len_beats).max(0.0);
+    let view_start_beat = app
+        .audio_editor_view_start_beat
+        .clamp(0.0, max_view_start);
+
     // ----- Ruler (MIDI エディタ同様、 song 全体の絶対 bar 番号を表示) -
-    // wf_area が clip 全体を全幅マッピングするので、 viewport も clip
-    // の time range (= clip.start_beat .. clip.start_beat + length_beats
-    // を sample 単位に換算) を見せる。 これで bar 番号は曲全体基準で
-    // 表示される (= 例: clip が小節 5 から始まれば左端が "5")。
+    // viewport は view_start_beat .. view_start_beat + view_len_beats を
+    // sample 単位に換算 (clip.start_beat 加算で song 絶対座標)。 zoom
+    // 中も bar 番号は曲全体基準で表示される。
     let ruler_rect = Rect {
         x: area.x + pad,
         y: area.y + header_h,
         w: (area.w - pad * 2.0).max(0.0),
         h: ruler_h,
     };
-    if ruler_rect.w > 0.0 && clip.length_beats > 0.0 {
+    if ruler_rect.w > 0.0 && view_len_beats > 0.0 {
         let mapping = TimeMapping {
             sample_rate: common::audio_bridge::SAMPLE_RATE as f64,
             tempo_bpm: app.song.bpm as f64,
@@ -161,8 +178,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         };
         let spb = mapping.samples_per_beat();
         let viewport = ViewportState1D {
-            view_start: clip.start_beat * spb,
-            view_len: clip.length_beats * spb,
+            view_start: (clip.start_beat + view_start_beat) * spb,
+            view_len: view_len_beats * spb,
         };
         ui.time_ruler(
             "audio_editor_ruler",
@@ -203,14 +220,69 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
     let selected_idx = app.audio_editor_selected_event.unwrap_or(0);
     let clip_len_beats = clip.length_beats.max(1e-6); // 0 div 防御
-    // PR-D 段階 3: rect-based hit-test 用に px → beats 換算係数を準備。
-    // wf_area.w (px) = clip_len_beats (beats) なので 1 px = beats_per_px。
-    let beats_per_px = (clip_len_beats / wf_area.w as f64).max(1e-9);
+    // view ベース px → beats 換算係数。 view_len_beats は zoom 中に変動
+    // するので毎フレーム再計算。 wf_area.w (px) は view_len_beats (beats)
+    // 分の幅を表示している。 1 px = beats_per_px。
+    let beats_per_px = (view_len_beats / wf_area.w as f64).max(1e-9);
     let target = match app.audio_editor_clip {
         Some(t) => t,
         None => return,
     };
     let clip_id = clip.id;
+
+    // ----- Wheel scroll / zoom (Bitwig 流) -------------------------------
+    // 素 wheel = 水平 scroll、 Ctrl+wheel = anchor 保持 zoom、
+    // Shift+wheel = 高速 scroll (3x)、 Alt+wheel は scope 外 (no-op)。
+    // drag 中 (`take_drag_in_rect` で active session) はこの handler
+    // より後で event walk が走るため、 drag は通常通り進む。 ただし
+    // wheel と drag が同 frame に来るケースは pointer.scroll_delta を
+    // 消費して drag 計算には影響しない (gui_01 が分離管理)。
+    {
+        let pointer = ui.pointer();
+        if let Some((px, py)) = pointer.pos
+            && wf_area.contains(px, py)
+            && wf_area.w > 0.0
+        {
+            let (sx, sy) = pointer.scroll_delta;
+            if sy.abs() > 0.001 || sx.abs() > 0.001 {
+                let m = pointer.modifiers;
+                if m.ctrl {
+                    // Ctrl+wheel: 水平 zoom。 マウス位置の beat を anchor
+                    // として保持: new_view_start = anchor_beat - frac * new_len。
+                    let factor = (sy * 0.005).exp() as f64;
+                    let new_len = (view_len_beats / factor)
+                        .clamp(MIN_AUDIO_EDITOR_VIEW_LEN_BEATS, total_beats);
+                    if (new_len - view_len_beats).abs() > 1e-6 {
+                        let anchor_frac = ((px - wf_area.x) / wf_area.w).clamp(0.0, 1.0) as f64;
+                        let anchor_beat = view_start_beat + anchor_frac * view_len_beats;
+                        let new_start = (anchor_beat - anchor_frac * new_len)
+                            .clamp(0.0, (total_beats - new_len).max(0.0));
+                        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                            app.handle_event(AppEvent::SetAudioEditorZoom {
+                                view_start_beat: new_start,
+                                view_len_beats: new_len,
+                            });
+                        }));
+                    }
+                } else if m.alt {
+                    // Alt+wheel: 当面 no-op (将来 vertical_gain zoom 等に
+                    // 割り当て可能、 spec 確定後に拡張)。
+                } else {
+                    // 素 wheel / Shift+wheel: 水平 scroll。 piano_roll と
+                    // 同じ符号 (wheel up = view_start 減少 = timeline 左へ)。
+                    let speed = if m.shift { 3.0 } else { 1.0 };
+                    let dx_beats = -((sx + sy) as f64) * beats_per_px * speed;
+                    let new_start =
+                        (view_start_beat + dx_beats).clamp(0.0, max_view_start);
+                    if (new_start - view_start_beat).abs() > 1e-9 {
+                        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                            app.handle_event(AppEvent::SetAudioEditorScroll(new_start));
+                        }));
+                    }
+                }
+            }
+        }
+    }
 
     for (idx, event) in audio.events.iter().enumerate() {
         let Some(buffer) = app.audio_source_cache.get(event.source_id) else {
@@ -219,14 +291,24 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             continue;
         };
 
-        // event rect (clip 内の time range を wf_area 全幅にマップ)
-        let evt_x_start = (event.event_start_in_clip_beats / clip_len_beats) as f32;
-        let evt_x_end = ((event.event_start_in_clip_beats + event.event_length_beats)
-            / clip_len_beats) as f32;
+        // event rect (view 範囲を wf_area 全幅にマップ、 view 外 event は
+        // [0,1] clamp で端に貼り付く)。 zoom 中も view_start_beat /
+        // view_len_beats が更新されているので毎フレーム正しく追従。
+        let evt_norm_start =
+            ((event.event_start_in_clip_beats - view_start_beat) / view_len_beats) as f32;
+        let evt_norm_end = ((event.event_start_in_clip_beats + event.event_length_beats
+            - view_start_beat)
+            / view_len_beats) as f32;
+        let evt_x_start_clamped = evt_norm_start.clamp(0.0, 1.0);
+        let evt_x_end_clamped = evt_norm_end.clamp(0.0, 1.0);
+        if evt_x_end_clamped <= evt_x_start_clamped {
+            // 完全に view 外 → skip (描画 / hit-test 不要、 cache 効率化)。
+            continue;
+        }
         let event_rect = Rect {
-            x: wf_area.x + evt_x_start.clamp(0.0, 1.0) * wf_area.w,
+            x: wf_area.x + evt_x_start_clamped * wf_area.w,
             y: wf_area.y,
-            w: ((evt_x_end - evt_x_start) * wf_area.w).max(2.0),
+            w: ((evt_x_end_clamped - evt_x_start_clamped) * wf_area.w).max(2.0),
             h: wf_area.h,
         };
 
@@ -237,6 +319,27 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             .saturating_sub(event.source_start_frames)
             .max(1);
 
+        // visible-portion を source frames にマップ。 evt_x_*_clamped は
+        // [0, 1] 内の view 内 ratio。 event の clip 内範囲は
+        // event_start..event_start+event_length。 view の clip 内範囲は
+        // view_start_beat..view_start_beat+view_len_beats。 両者の交差を
+        // event-local 比率に直して event_len_frames に掛ける。
+        let event_len_beats_safe = event.event_length_beats.max(1e-9);
+        let event_view_start_beat =
+            event.event_start_in_clip_beats.max(view_start_beat);
+        let event_view_end_beat = (event.event_start_in_clip_beats
+            + event.event_length_beats)
+            .min(view_start_beat + view_len_beats);
+        let visible_start_in_event =
+            (event_view_start_beat - event.event_start_in_clip_beats).max(0.0);
+        let visible_len_in_event =
+            (event_view_end_beat - event_view_start_beat).max(0.0);
+        let src_visible_start_frames = event.source_start_frames
+            + ((visible_start_in_event / event_len_beats_safe)
+                * event_len_frames as f64) as u64;
+        let src_visible_len_frames = ((visible_len_in_event / event_len_beats_safe)
+            * event_len_frames as f64) as u64;
+
         let source = WaveformSource {
             samples: SampleSlices::Planar(&planes_borrowed),
             valid_len: buffer.frames as usize,
@@ -244,8 +347,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             sample_rate: buffer.sample_rate,
         };
         let view = WaveformView {
-            start_sample: event.source_start_frames,
-            len_samples: event_len_frames,
+            start_sample: src_visible_start_frames,
+            len_samples: src_visible_len_frames.max(1),
             vertical_gain: 1.0,
         };
         let is_selected = idx == selected_idx;
@@ -311,12 +414,19 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // ----- Hit-test (PR-D 段階 3 / gui_01 #026) -----
         // event_rect を [left grip, center, right grip] に分割。 left/right
         // grip は trim drag、 center は move drag。 grip 幅は 6 px、 event
-        // が 18 px 未満なら grip を出さず center のみ (= 無理に trim
-        // しなくて良い、 操作性優先)。
+        // が 18 px 未満なら grip を出さず center のみ。 event の端が view
+        // 外にクリップされている場合 (= zoom 中に event が画面端を超えた)
+        // は対応 grip を無効化 (= grip rect が view 端にあって誤った beat
+        // を返すのを防ぐ)。
         const GRIP_W: f32 = 6.0;
         let usable_w = event_rect.w.max(0.0);
+        let left_edge_in_view = evt_norm_start >= 0.0;
+        let right_edge_in_view = evt_norm_end <= 1.0;
         let (lw, rw) = if usable_w >= GRIP_W * 3.0 {
-            (GRIP_W, GRIP_W)
+            (
+                if left_edge_in_view { GRIP_W } else { 0.0 },
+                if right_edge_in_view { GRIP_W } else { 0.0 },
+            )
         } else {
             (0.0, 0.0)
         };
@@ -463,8 +573,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     if let Some(drop) = ui.take_file_drop_in_rect(wf_area)
         && let Some(path) = drop.paths.into_iter().next()
     {
-        let pos_beats =
-            ((drop.position.0 - wf_area.x).max(0.0) as f64) * beats_per_px;
+        // drop x 位置を view 内 ratio → clip-local beat に換算。
+        let pos_beats = view_start_beat
+            + ((drop.position.0 - wf_area.x).max(0.0) as f64) * beats_per_px;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::AddAudioEventFromFile {
                 clip: target,
@@ -486,7 +597,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         if !wf_area.contains(px, py) {
             return None;
         }
-        let in_clip = ((px - wf_area.x).max(0.0) as f64) * beats_per_px;
+        let in_clip = view_start_beat
+            + ((px - wf_area.x).max(0.0) as f64) * beats_per_px;
         Some(in_clip.clamp(0.0, clip_len_beats))
     });
     if app.audio_editor_hover_beat_in_clip != hover_in_clip {
@@ -505,10 +617,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     if let Some(ph_beat) = app.playhead_beat {
         let ph_beat = ph_beat as f64;
         let clip_start = clip.start_beat;
-        let clip_end = clip_start + clip.length_beats;
-        if ph_beat >= clip_start && ph_beat < clip_end && clip.length_beats > 0.0 {
-            let in_clip = ph_beat - clip_start;
-            let x = wf_area.x + (in_clip / clip.length_beats) as f32 * wf_area.w;
+        // playhead の clip 内位置 (clip 始端 = 0)。 view 範囲外 (zoom 中
+        // で playhead が画面外) なら描画 skip。
+        let in_clip = ph_beat - clip_start;
+        let view_end_beat = view_start_beat + view_len_beats;
+        if in_clip >= view_start_beat
+            && in_clip < view_end_beat
+            && view_len_beats > 0.0
+        {
+            let norm = (in_clip - view_start_beat) / view_len_beats;
+            let x = wf_area.x + norm as f32 * wf_area.w;
             let color = Color::rgba(1.0, 0.55, 0.20, 0.9);
             ui.push_lines(LineBatch {
                 segments: std::sync::Arc::from(vec![LineSegment {

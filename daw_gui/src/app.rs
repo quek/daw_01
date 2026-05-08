@@ -167,6 +167,11 @@ pub const ARRANGE_TRACK_HEIGHT: f32 = 56.0;
 pub const DEFAULT_NOTE_DURATION: f64 = 0.25;
 pub const DEFAULT_CLIP_LENGTH: f64 = 4.0;
 
+/// Audio Editor zoom の最小 view span (beats)。 1/64 拍 = 約 0.015 beats。
+/// これ未満は描画上意味がなく `view_len` を 0 に近づけると `beats_per_px`
+/// が発散するので clamp。
+pub const MIN_AUDIO_EDITOR_VIEW_LEN_BEATS: f64 = 1.0 / 64.0;
+
 /// Phase 2 PR-C: 進行中の plugin-FX bounce の追跡 entry。
 /// `MainToChild::BounceClipFxOnline` 発火時に `AppData::pending_clip_fx_bounce
 /// = Some(...)` でセット、 `ChildToMain::BounceClipFxComplete` 受信で
@@ -276,6 +281,15 @@ pub struct AppData {
     /// waveform 領域外なら `None`。 E キー (split) と将来の波形クリック
     /// 系操作で「マウス位置を cursor として使う」 ために保持する。
     pub audio_editor_hover_beat_in_clip: Option<f64>,
+    /// Audio Editor の表示開始位置 (clip 始端からの offset、 beats 単位)。
+    /// `OpenAudioEditor` で 0 にリセット、 wheel scroll / Ctrl+wheel zoom で
+    /// 更新。 view 範囲は `[view_start_beat, view_start_beat + view_len_beats]`
+    /// で、 0 ≤ view_start ≤ clip.length - view_len をホスト側で clamp。
+    pub audio_editor_view_start_beat: f64,
+    /// Audio Editor の表示 span (beats 単位)。 `OpenAudioEditor` で
+    /// `clip.length_beats` にリセット (= 全体表示)。 Ctrl+wheel で zoom
+    /// 倍率変更、 最小 `MIN_AUDIO_EDITOR_VIEW_LEN_BEATS` で clamp。
+    pub audio_editor_view_len_beats: f64,
     pub arrange_zoom_x: f32,
     pub arrange_scroll_beat: f32,
     /// arrangement の 1 track row 高さ (px)。Alt+wheel で 16..96 に縦ズーム。
@@ -518,6 +532,8 @@ impl AppData {
             audio_editor_clip: None,
             audio_editor_selected_event: None,
             audio_editor_hover_beat_in_clip: None,
+            audio_editor_view_start_beat: 0.0,
+            audio_editor_view_len_beats: 0.0,
             arrange_zoom_x: ARRANGE_PX_PER_BEAT,
             arrange_scroll_beat: 0.0,
             arrange_track_row_h: ARRANGE_TRACK_HEIGHT,
@@ -1781,6 +1797,17 @@ pub enum AppEvent {
     /// `(target, edge, curve)` 列で fade curve を一括設定。
     SetClipFadeCurveBatch(Vec<(ClipRef, FadeEdgeKind, common::model::FadeCurve)>),
 
+    // ---- Audio Editor scroll / zoom -----------------------------------
+    /// Audio Editor の `view_start_beat` を変更 (= 水平 scroll)。
+    /// 0 ≤ start ≤ clip.length_beats - view_len_beats で clamp、
+    /// `audio_editor_clip` が None なら no-op。 view state なので非 undoable。
+    SetAudioEditorScroll(f64),
+    /// Audio Editor の `view_start_beat` / `view_len_beats` を一括変更
+    /// (= zoom anchor 保持のため start/len 同時更新)。 view_len は
+    /// `MIN_AUDIO_EDITOR_VIEW_LEN_BEATS` 以上 + clip.length_beats 以下、
+    /// view_start も clamp。 `audio_editor_clip` が None なら no-op。
+    SetAudioEditorZoom { view_start_beat: f64, view_len_beats: f64 },
+
     // ---- Audio Editor event 単位編集 (Phase 2 PR-D 段階 1) -----------
     /// Audio Editor 内で event index を選択 (= clip 内 events Vec の
     /// index)。 `None` で選択解除。 `audio_editor_clip` が `None` の
@@ -2251,6 +2278,12 @@ impl AppData {
             }
             AppEvent::CloseAudioEditor => {
                 self.close_audio_editor();
+            }
+            AppEvent::SetAudioEditorScroll(start) => {
+                self.set_audio_editor_scroll(start);
+            }
+            AppEvent::SetAudioEditorZoom { view_start_beat, view_len_beats } => {
+                self.set_audio_editor_zoom(view_start_beat, view_len_beats);
             }
             AppEvent::SelectAudioEditorEvent(idx) => {
                 self.audio_editor_selected_event = idx;
@@ -4970,12 +5003,62 @@ impl AppData {
         }
         self.audio_editor_clip = Some(target);
         self.bottom_panel = 1;
+        // 開いた clip 全体を見せる初期 view (= 既存挙動と等価)。 wheel
+        // scroll / Ctrl+wheel zoom で以降は view_start / view_len を変更。
+        let len_beats = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map_or(0.0, |c| c.length_beats);
+        self.audio_editor_view_start_beat = 0.0;
+        self.audio_editor_view_len_beats = len_beats.max(0.0);
     }
 
     fn close_audio_editor(&mut self) {
         self.audio_editor_clip = None;
         self.audio_editor_selected_event = None;
         self.audio_editor_hover_beat_in_clip = None;
+        self.audio_editor_view_start_beat = 0.0;
+        self.audio_editor_view_len_beats = 0.0;
+    }
+
+    /// Audio Editor 水平 scroll: `view_start_beat` を `[0, total - view_len]`
+    /// で clamp。 `audio_editor_clip` が None / clip が解決できない場合は no-op。
+    fn set_audio_editor_scroll(&mut self, new_start: f64) {
+        let Some(target) = self.audio_editor_clip else { return };
+        let Some(clip) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+        else {
+            return;
+        };
+        let total = clip.length_beats.max(0.0);
+        let view_len = self.audio_editor_view_len_beats.max(0.0).min(total);
+        let max_start = (total - view_len).max(0.0);
+        self.audio_editor_view_start_beat = new_start.clamp(0.0, max_start);
+    }
+
+    /// Audio Editor zoom: `view_start_beat` + `view_len_beats` を一括設定。
+    /// `view_len` は `[MIN_AUDIO_EDITOR_VIEW_LEN_BEATS, clip.length]`、
+    /// `view_start` は `[0, clip.length - view_len]` で clamp。
+    fn set_audio_editor_zoom(&mut self, new_start: f64, new_len: f64) {
+        let Some(target) = self.audio_editor_clip else { return };
+        let Some(clip) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+        else {
+            return;
+        };
+        let total = clip.length_beats.max(0.0);
+        let len = new_len.clamp(MIN_AUDIO_EDITOR_VIEW_LEN_BEATS, total.max(MIN_AUDIO_EDITOR_VIEW_LEN_BEATS));
+        let max_start = (total - len).max(0.0);
+        self.audio_editor_view_start_beat = new_start.clamp(0.0, max_start);
+        self.audio_editor_view_len_beats = len;
     }
 
     /// PR-D 段階 1: Audio Editor で開いている clip + 選択中 event を
@@ -7199,41 +7282,13 @@ impl AppData {
         // で split」 として優先処理する。 audio editor は bottom_panel
         // 内なので arrangement_hover_beat は更新されず、 既存 path だと
         // 「マウスを arrangement に置いて...」 status で no-op になる。
-        if let Some(target) = self.audio_editor_clip {
-            let cursor_in_song = self
-                .audio_editor_hover_beat_in_clip
-                .and_then(|in_clip| {
-                    self.song
-                        .tracks
-                        .get(target.track as usize)
-                        .and_then(|t| t.clips.get(target.clip as usize))
-                        .map(|clip| clip.start_beat + in_clip)
-                });
-            if let Some(cursor) = cursor_in_song {
-                let mut new_selection: Vec<ClipRef> = Vec::new();
-                if self.split_clip_at_beat(target, cursor, &mut new_selection) {
-                    if !new_selection.is_empty() {
-                        // 編集中 clip (= target = 前半) を Audio Editor の
-                        // 表示対象として保持。 selected_clips は前半 +
-                        // 後半の両方を含めて arrangement に highlight。
-                        let mut sel = new_selection;
-                        sel.push(target);
-                        self.selected_clips = sel;
-                        self.selected_clip = Some(target);
-                        self.selected_notes.clear();
-                    }
-                    self.status_message =
-                        "Split: Audio Editor で clip を分割しました".into();
-                    self.is_dirty = true;
-                    self.sync_song_to_plugin_host();
-                } else {
-                    self.status_message =
-                        "Split: マウス位置が clip 範囲外のため分割されませんでした".into();
-                }
-                return;
-            }
-            // hover が無い (マウスが waveform 外) ときは fallback で
-            // playhead / selection を試みる: 既存 path に流れる。
+        if self.audio_editor_clip.is_some() {
+            // Audio Editor が開いているときは clip 分割ではなく event 分割
+            // (= clip 内 audio event を 2 つに割る)。 Bitwig / Reaper の
+            // Audio Detail Editor と同じ慣行。 cursor 外 / event 上に乗って
+            // いない場合は helper 内で status_message を出して return。
+            self.action_split_audio_editor_event_at_cursor();
+            return;
         }
 
         let cursor: f64 = if snap {
@@ -7282,6 +7337,130 @@ impl AppData {
         self.status_message = format!("Split: {split_count} clip を分割しました");
         self.is_dirty = true;
         self.sync_song_to_plugin_host();
+    }
+
+    /// Audio Editor が開いているとき、 cursor 位置 (= マウス hover、
+    /// fallback で playhead) が乗っている event を 2 つに分割する。
+    /// `audio_editor_clip` は変更せず、 audio content の events Vec に
+    /// 後半 event を `event_idx + 1` の位置に挿入。 fade_out (前半側) と
+    /// fade_in (後半側) は 0 にリセット (Bitwig / Reaper の split 慣行)。
+    /// 選択は後半 event に移動。
+    ///
+    /// 戻り値は分割成功時 `true`。 cursor が解決できない / event 上に
+    /// 乗っていない場合は status_message を出して `false` を返す。
+    fn action_split_audio_editor_event_at_cursor(&mut self) -> bool {
+        let Some(target) = self.audio_editor_clip else {
+            return false;
+        };
+
+        // cursor 位置 (clip 内 beat)。 hover (= マウスが waveform 上)
+        // を最優先、 無ければ playhead が clip 内なら playhead を使う。
+        let in_clip_beat: Option<f64> = self
+            .audio_editor_hover_beat_in_clip
+            .or_else(|| {
+                let ph = self.playhead_beat? as f64;
+                let clip = self
+                    .song
+                    .tracks
+                    .get(target.track as usize)?
+                    .clips
+                    .get(target.clip as usize)?;
+                let in_clip = ph - clip.start_beat;
+                (in_clip >= 0.0 && in_clip < clip.length_beats).then_some(in_clip)
+            });
+        let Some(in_clip_beat) = in_clip_beat else {
+            self.status_message =
+                "Split: マウスを Audio Editor の波形上に置くか playhead を clip 内に置いてください"
+                    .into();
+            return false;
+        };
+
+        // event_idx を解決 (= cursor が strict interior に乗っている event)。
+        let track = self
+            .song
+            .tracks
+            .get(target.track as usize);
+        let clip = track.and_then(|t| t.clips.get(target.clip as usize));
+        let Some(clip) = clip else { return false };
+        let content_id = clip.content_id;
+        let Some(common::model::ClipContent::Audio(audio_ro)) =
+            self.song.clip_contents.get(&content_id)
+        else {
+            return false;
+        };
+        let event_idx_opt = audio_ro.events.iter().position(|e| {
+            let s = e.event_start_in_clip_beats;
+            let l = e.event_length_beats;
+            in_clip_beat > s + 1e-9 && in_clip_beat < s + l - 1e-9
+        });
+        let Some(event_idx) = event_idx_opt else {
+            self.status_message =
+                "Split: カーソル位置に分割可能な event がありません".into();
+            return false;
+        };
+        // 元 event を clone して詳細パラメータを後半 event にコピー。
+        let event = audio_ro.events[event_idx].clone();
+
+        // mut 取り直し → 分割実行。
+        let Some(common::model::ClipContent::Audio(audio_mut)) =
+            self.song.clip_contents.get_mut(&content_id)
+        else {
+            return false;
+        };
+
+        let offset_in_event = in_clip_beat - event.event_start_in_clip_beats;
+        let len_beats = event.event_length_beats.max(1e-9);
+        let event_len_frames = event
+            .source_end_frames
+            .saturating_sub(event.source_start_frames);
+        let frame_offset = ((offset_in_event / len_beats) * event_len_frames as f64)
+            .round()
+            .clamp(0.0, event_len_frames as f64) as u64;
+
+        // reversed のときは clip 時間 → source frame の対応が逆向き
+        // (event_start に source_end が、 event_end に source_start が
+        // 対応)。 split frame も反転して計算する。
+        let (front_ss, front_se, back_ss, back_se) = if event.reversed {
+            let mid = event.source_end_frames.saturating_sub(frame_offset);
+            (mid, event.source_end_frames, event.source_start_frames, mid)
+        } else {
+            let mid = event.source_start_frames + frame_offset;
+            (event.source_start_frames, mid, mid, event.source_end_frames)
+        };
+
+        // 前半 event を in-place で更新 (= event_start は変えず、 length と
+        // source 範囲を縮める)。 fade_out は split で消す (右端が新しく
+        // なったので元 fade_out 値は意味を失う)。
+        {
+            let front = &mut audio_mut.events[event_idx];
+            front.source_start_frames = front_ss;
+            front.source_end_frames = front_se;
+            front.event_length_beats = offset_in_event;
+            front.fade_out_beats = 0.0;
+        }
+
+        // 後半 event は元 event のパラメータ (gain / pan / pitch / fade /
+        // stretch / reversed / muted / onsets / beat_markers) を引き継ぐ。
+        // event_start は cursor 位置、 length は残り、 source は分割後の
+        // 後半側、 fade_in は 0 にリセット (左端が新しいため)。
+        let mut back = event.clone();
+        back.source_start_frames = back_ss;
+        back.source_end_frames = back_se;
+        back.event_start_in_clip_beats = in_clip_beat;
+        back.event_length_beats = (len_beats - offset_in_event).max(0.0);
+        back.fade_in_beats = 0.0;
+        audio_mut.events.insert(event_idx + 1, back);
+
+        // 選択は後半 event (= ユーザーは「分割直後に新規 event を編集
+        // したい」 ことが多い、 Reaper / Bitwig 流)。
+        self.audio_editor_selected_event = Some(event_idx + 1);
+        self.status_message = "Split: event を分割しました".into();
+        self.is_dirty = true;
+        self.sync_song_to_plugin_host();
+        if self.clip_edit_buffer_target == Some(target) {
+            self.resync_clip_audio_event_edit_buffers(target);
+        }
+        true
     }
 
     /// Single-clip split helper. Returns `true` iff the playhead lay
