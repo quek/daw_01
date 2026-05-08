@@ -61,5 +61,11 @@ pub fn daw_shortcut_map() -> ShortcutMap {
     // Duplicate (spec §3.10.2 の `Ctrl+D`)。 root.rs::dispatch_shortcuts
     // で `audio_editor_clip is Some` のときだけ消費するよう gate。
     m.bind("daw.duplicate_audio_event", "Ctrl+D");
+    // PR-D 段階 2: Audio Editor 内で multi-event clip の event 選択を
+    // 移動する keyboard navigation (= Inspector / overlay highlight が
+    // 当該 event に追従)。 Ctrl+] / Ctrl+[ で next / prev (Bitwig clip
+    // navigation を参考)。 audio_editor_clip is Some 時のみ消費。
+    m.bind("daw.next_audio_event", "Ctrl+]");
+    m.bind("daw.prev_audio_event", "Ctrl+[");
     m
 }

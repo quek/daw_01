@@ -359,6 +359,21 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             app.handle_event(AppEvent::DuplicateAudioEditorEvent)
         }));
     }
+    // PR-D 段階 2: Audio Editor 内 event 選択 navigation (Ctrl+] / Ctrl+[)。
+    // 現選択 idx を ±1 wrap-around で移動。 audio_editor が開いてないと
+    // 無効、 events が空なら no-op。
+    if app.audio_editor_clip.is_some() && ui.take_shortcut("daw.next_audio_event") {
+        let next = app.next_audio_editor_event_idx(1);
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::SelectAudioEditorEvent(next))
+        }));
+    }
+    if app.audio_editor_clip.is_some() && ui.take_shortcut("daw.prev_audio_event") {
+        let prev = app.next_audio_editor_event_idx(-1);
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::SelectAudioEditorEvent(prev))
+        }));
+    }
     // modal が開いている間は escape を消費しない (modal 側で close する)。
     // 優先度: rename mode → Audio Editor close → CloseHelp。 rename と
     // Audio Editor は同時には開かない (= rename は track header の上、

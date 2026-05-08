@@ -767,7 +767,17 @@ impl AppData {
         else {
             return None;
         };
-        let event = audio.events.first()?;
+        // PR-D 段階 2: audio_editor が同じ clip を開いていて event を
+        // 選択中なら、 そちらの event を Inspector の target にする。
+        // multi-event clip でも個別 event を編集可能。 audio_editor が
+        // 閉じている / 別 clip を開いている / 選択中 event idx が範囲外
+        // なら first event (= Phase 2 PR1-3 と同じ既存挙動)。
+        let event_idx = if self.audio_editor_clip == Some(cref) {
+            self.audio_editor_selected_event.unwrap_or(0)
+        } else {
+            0
+        };
+        let event = audio.events.get(event_idx).or(audio.events.first())?;
         Some(InspectorAudioEventSummary {
             target: cref,
             reversed: event.reversed,
@@ -776,6 +786,93 @@ impl AppData {
             fade_in_curve: event.fade_in_curve,
             fade_out_curve: event.fade_out_curve,
         })
+    }
+
+    /// PR-D 段階 2: Audio Editor の event 選択を `delta` (= +1 / -1) 分
+    /// 進める / 戻す helper。 wrap-around (= 末尾 +1 で 0 に戻る、 0
+    /// -1 で末尾)。 events が空 / audio_editor_clip が None のときは
+    /// `None`、 1 event のときは Some(0) (= 動かない)。 root.rs から
+    /// shortcut handler 経由で呼ばれて `SelectAudioEditorEvent` の
+    /// 引数を組み立てる用。
+    pub fn next_audio_editor_event_idx(&self, delta: i32) -> Option<usize> {
+        let target = self.audio_editor_clip?;
+        let track = self.song.tracks.get(target.track as usize)?;
+        let clip = track.clips.get(target.clip as usize)?;
+        let common::model::ClipContent::Audio(audio) =
+            self.song.clip_contents.get(&clip.content_id)?
+        else {
+            return None;
+        };
+        let n = audio.events.len();
+        if n == 0 {
+            return None;
+        }
+        let cur = self.audio_editor_selected_event.unwrap_or(0).min(n - 1);
+        let n_i = n as i32;
+        let next = (cur as i32).wrapping_add(delta).rem_euclid(n_i);
+        Some(next as usize)
+    }
+
+    /// PR-D 段階 2: set_clip_audio_event_* 系 helper の broadcast 範囲を
+    /// 決める。 audio_editor が `target` clip を開いていて event を
+    /// 選択中なら、 当該 event 1 つだけ更新 (= multi-event clip の個別
+    /// 編集)。 そうでなければ全 event に broadcast (= Phase 2 PR1-3 の
+    /// 既存挙動、 1 clip 1 event 前提なので broadcast = first event 編集)。
+    /// 引数 `n_events` は当該 ClipContent::Audio の events 長 (= 呼び出し
+    /// 前に immutable get で取得)。
+    fn audio_event_target_indices(
+        &self,
+        target: ClipRef,
+        n_events: usize,
+    ) -> std::ops::Range<usize> {
+        if self.audio_editor_clip == Some(target)
+            && let Some(idx) = self.audio_editor_selected_event
+            && idx < n_events
+        {
+            idx..(idx + 1)
+        } else {
+            0..n_events
+        }
+    }
+
+    /// PR-D 段階 2 の集約 helper: `target` clip の `ClipContent::Audio`
+    /// 内、 `audio_event_target_indices` で決まる範囲の event 群に
+    /// closure `f` を適用 + sync。 audio_editor で個別 event 選択中なら
+    /// その 1 つだけ、 そうでなければ全 event を更新する。 戻り値は
+    /// 「実際に何らかの event を更新したか」 (= caller が edit buffer
+    /// resync を呼ぶかの判断に使う)。
+    fn mutate_audio_events_in_clip<F>(&mut self, target: ClipRef, mut f: F) -> bool
+    where
+        F: FnMut(&mut common::model::AudioEvent),
+    {
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return false;
+        };
+        let n_events = match self.song.clip_contents.get(&content_id) {
+            Some(common::model::ClipContent::Audio(a)) => a.events.len(),
+            _ => return false,
+        };
+        let range = self.audio_event_target_indices(target, n_events);
+        if range.is_empty() {
+            return false;
+        }
+        if let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+        {
+            for event in &mut audio.events[range] {
+                f(event);
+            }
+            self.sync_song_to_plugin_host();
+            true
+        } else {
+            false
+        }
     }
 
     pub fn inspector_chain(&self) -> Vec<ChainEntry> {
@@ -4099,144 +4196,47 @@ impl AppData {
             .unwrap_or(false)
     }
 
-    /// 選択 audio clip の全 `AudioEvent.reversed` をまとめて更新する。
-    /// 非 audio clip (`ClipContent::Midi` / 未登録 content_id) は no-op。
-    /// `docs/plan_audio_clip.md` §3.8。
+    /// `AudioEvent.reversed` を更新 (`docs/plan_audio_clip.md` §3.8)。
+    /// audio_editor で event を選択中なら当該 event のみ、 さもなくば
+    /// 全 event に broadcast (= multi-event 対応 / 1 clip 1 event 互換、
+    /// PR-D 段階 2)。
     fn set_clip_audio_event_reversed(&mut self, target: ClipRef, reversed: bool) {
-        let Some(content_id) = self
-            .song
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
-            .map(|c| c.content_id)
-        else {
-            return;
-        };
-        if let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
-        {
-            for event in &mut audio.events {
-                event.reversed = reversed;
-            }
-            self.sync_song_to_plugin_host();
-        }
+        self.mutate_audio_events_in_clip(target, |e| e.reversed = reversed);
     }
 
-    /// 選択 audio clip の全 `AudioEvent.muted` をまとめて更新する (event
-    /// 単位の silent flag、 track-mute とは独立)。
+    /// `AudioEvent.muted` を更新 (event 単位 silent flag、 track-mute と
+    /// 独立)。 broadcast 範囲は `audio_event_target_indices` 仕様。
     fn set_clip_audio_event_muted(&mut self, target: ClipRef, muted: bool) {
-        let Some(content_id) = self
-            .song
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
-            .map(|c| c.content_id)
-        else {
-            return;
-        };
-        if let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
-        {
-            for event in &mut audio.events {
-                event.muted = muted;
-            }
-            self.sync_song_to_plugin_host();
-        }
+        self.mutate_audio_events_in_clip(target, |e| e.muted = muted);
     }
 
-    /// 選択 audio clip の全 `AudioEvent.stretch_mode` をまとめて更新する。
-    /// `compile_audio_schedule` (`daw_audio/src/audio_clip_renderer.rs`) が
-    /// 次の LoadSong で再 compile して、 Repitch の場合は pitch_ratio の
-    /// 再計算が走る。 Phase 1 で再生に効くのは `Raw` / `Repitch` のみ
-    /// (§3.7、 Stretch / Slice は Raw 同等で再生される)。
+    /// `AudioEvent.stretch_mode` を更新。 `compile_audio_schedule` が
+    /// 次の LoadSong で再 compile し、 Repitch の場合は pitch_ratio の
+    /// 再計算が走る。 Phase 1 で再生に効くのは Raw / Repitch のみ。
     fn set_clip_audio_event_stretch_mode(
         &mut self,
         target: ClipRef,
         mode: common::model::StretchMode,
     ) {
-        let Some(content_id) = self
-            .song
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
-            .map(|c| c.content_id)
-        else {
-            return;
-        };
-        if let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
-        {
-            for event in &mut audio.events {
-                event.stretch_mode = mode;
-            }
-            self.sync_song_to_plugin_host();
-        }
+        self.mutate_audio_events_in_clip(target, |e| e.stretch_mode = mode);
     }
 
     fn set_clip_audio_event_gain_db(&mut self, target: ClipRef, gain_db: f32) {
         let gain_db = gain_db.clamp(-80.0, 24.0);
-        let Some(content_id) = self
-            .song
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
-            .map(|c| c.content_id)
-        else {
-            return;
-        };
-        if let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
-        {
-            for event in &mut audio.events {
-                event.gain_db = gain_db;
-            }
-            self.sync_song_to_plugin_host();
-        }
+        self.mutate_audio_events_in_clip(target, |e| e.gain_db = gain_db);
         self.resync_clip_audio_event_edit_buffers(target);
     }
 
     fn set_clip_audio_event_pan(&mut self, target: ClipRef, pan: f32) {
         let pan = pan.clamp(-1.0, 1.0);
-        let Some(content_id) = self
-            .song
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
-            .map(|c| c.content_id)
-        else {
-            return;
-        };
-        if let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
-        {
-            for event in &mut audio.events {
-                event.pan = pan;
-            }
-            self.sync_song_to_plugin_host();
-        }
+        self.mutate_audio_events_in_clip(target, |e| e.pan = pan);
         self.resync_clip_audio_event_edit_buffers(target);
     }
 
     fn set_clip_audio_event_pitch_semitones(&mut self, target: ClipRef, semitones: f32) {
         // Bitwig spec §3.6: Pitch range is -96 .. +96 semitones.
         let semitones = semitones.clamp(-96.0, 96.0);
-        let Some(content_id) = self
-            .song
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
-            .map(|c| c.content_id)
-        else {
-            return;
-        };
-        if let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
-        {
-            for event in &mut audio.events {
-                event.pitch_semitones = semitones;
-            }
-            self.sync_song_to_plugin_host();
-        }
+        self.mutate_audio_events_in_clip(target, |e| e.pitch_semitones = semitones);
         self.resync_clip_audio_event_edit_buffers(target);
     }
 
@@ -4297,46 +4297,14 @@ impl AppData {
         // Spec §3.5: fade は clip 内 beats、 clip 長を超えないように clamp。
         let max_beats = self.clip_length_beats(target).unwrap_or(0.0);
         let beats = beats.clamp(0.0, max_beats);
-        let Some(content_id) = self
-            .song
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
-            .map(|c| c.content_id)
-        else {
-            return;
-        };
-        if let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
-        {
-            for event in &mut audio.events {
-                event.fade_in_beats = beats;
-            }
-            self.sync_song_to_plugin_host();
-        }
+        self.mutate_audio_events_in_clip(target, |e| e.fade_in_beats = beats);
         self.resync_clip_audio_event_edit_buffers(target);
     }
 
     fn set_clip_audio_event_fade_out_beats(&mut self, target: ClipRef, beats: f64) {
         let max_beats = self.clip_length_beats(target).unwrap_or(0.0);
         let beats = beats.clamp(0.0, max_beats);
-        let Some(content_id) = self
-            .song
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
-            .map(|c| c.content_id)
-        else {
-            return;
-        };
-        if let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
-        {
-            for event in &mut audio.events {
-                event.fade_out_beats = beats;
-            }
-            self.sync_song_to_plugin_host();
-        }
+        self.mutate_audio_events_in_clip(target, |e| e.fade_out_beats = beats);
         self.resync_clip_audio_event_edit_buffers(target);
     }
 
@@ -4345,23 +4313,7 @@ impl AppData {
         target: ClipRef,
         curve: common::model::FadeCurve,
     ) {
-        let Some(content_id) = self
-            .song
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
-            .map(|c| c.content_id)
-        else {
-            return;
-        };
-        if let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
-        {
-            for event in &mut audio.events {
-                event.fade_in_curve = curve;
-            }
-            self.sync_song_to_plugin_host();
-        }
+        self.mutate_audio_events_in_clip(target, |e| e.fade_in_curve = curve);
     }
 
     fn set_clip_audio_event_fade_out_curve(
@@ -4369,23 +4321,7 @@ impl AppData {
         target: ClipRef,
         curve: common::model::FadeCurve,
     ) {
-        let Some(content_id) = self
-            .song
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
-            .map(|c| c.content_id)
-        else {
-            return;
-        };
-        if let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
-        {
-            for event in &mut audio.events {
-                event.fade_out_curve = curve;
-            }
-            self.sync_song_to_plugin_host();
-        }
+        self.mutate_audio_events_in_clip(target, |e| e.fade_out_curve = curve);
     }
 
     fn commit_clip_fade_in_edit(&mut self) {
