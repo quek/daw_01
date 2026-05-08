@@ -36,6 +36,7 @@ pub use history::{HistoryEntry, HistoryStack};
 pub use id::WidgetId;
 pub use shortcut::{Shortcut, ShortcutMap, ShortcutParseError};
 pub use input::{DroppedFiles, FrameInput, ImeEvent, InputAccumulator, PointerFrame};
+pub use widgets::drag_in_rect::{DragInfo, DragKind};
 pub use widgets::drag_rect::DragRect;
 pub use layout::{FlexDirection, Gap, LayoutPass, NodeId, Padding};
 pub use scenegraph::{CachedCommands, SceneNode, Scenegraph, hash_inputs};

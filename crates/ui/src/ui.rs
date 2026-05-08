@@ -29,6 +29,7 @@ use crate::scenegraph::{CachedCommands, Scenegraph};
 use crate::shortcut::{self, ShortcutMap};
 use crate::text_metrics::TextMetrics;
 use crate::widgets::WidgetState;
+use crate::widgets::drag_in_rect::{DragInRectState, DragInfo, DragKind};
 use crate::widgets::drag_rect::{DragRect, DragRectState};
 
 /// アプリが 1 つ持つ UI ホスト。フレーム間で UI 内部状態を保持する。
@@ -1185,6 +1186,42 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     }
 
     // ============================================================
+    // M14 Phase 63l: caller 側 view 用 rect-based primary press 取得 (daw_01 #026)
+    // ============================================================
+
+    /// `rect` 内で primary が **press された** frame に 1 度だけ `Some((x, y))` を返す。
+    ///
+    /// `take_double_click_in_rect` の single-click (release ベース) 版ではなく、
+    /// **press ベース** で取り出す API。 drag start の起点を取りたい場合や、 click と同時に
+    /// 即座に反応する低 latency UI (= 段階 2 の event 選択) で使う。 release を待つと
+    /// drag detection が手遅れになる。
+    ///
+    /// semantics:
+    /// - rect 内で primary がこのフレームに新たに押下された (= `primary_just_pressed`) → `Some((x, y))`
+    /// - rect 外 / press なし / modal popup 配下 → `None`
+    /// - 同 frame 内で 2 度目以降の呼び出しは `None` (`consume_pointer_click` で消費する
+    ///   ため、 他 widget の click 検出 (button 等) からも消える)
+    /// - 戻り座標は press 時点の pointer 位置 (viewport 座標)
+    pub fn take_primary_press_in_rect(&mut self, rect: Rect) -> Option<(f32, f32)> {
+        if self.pointer_blocked_by_modal_popup() {
+            return None;
+        }
+        if !self.pointer.primary_just_pressed {
+            return None;
+        }
+        let (px, py) = self.pointer.pos?;
+        if !rect.contains(px, py) {
+            return None;
+        }
+        // 1 frame 内で 2 度目以降は None / 他 widget の click 検出も巻き込む。
+        // 既存 `take_drag_rect_in_rect` は consume_pointer_click を呼ばないが、
+        // こちらは「caller view の click を確定的に取った」 後に下層 widget に流さない
+        // 意図 (= popup 外 click と同じ挙動) で揃える。
+        self.consume_pointer_click();
+        Some((px, py))
+    }
+
+    // ============================================================
     // M8 Phase 29: history (undo / redo)
     // ============================================================
 
@@ -1454,6 +1491,100 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         });
 
         Some(drag)
+    }
+
+    // ============================================================
+    // M14 Phase 63l: caller 側 view 用 rect-anchored drag session (daw_01 #026)
+    // ============================================================
+
+    /// `rect` を anchor とする **drag session** を 1 つ追跡する low-level primitive。
+    ///
+    /// `take_drag_rect_in_rect` (multi-select 用、 半透明 overlay を自動描画する) と異なり、
+    /// **描画は一切行わない**。 caller 側 view (= Audio Editor の event ごとの rect 上に
+    /// 中央 drag = 移動 / 端 drag = trim を載せる) が anchor 付き press / release を取り
+    /// 出して自前で UI を描けるよう、 純粋に pointer state を返すだけ。
+    ///
+    /// semantics:
+    /// - `rect` 内で primary が press された frame: `Some(DragInfo { kind: Started, .. })` を
+    ///   1 度返し、 内部 state に anchor を記録 (= `consume_pointer_click` も実施)
+    /// - 次フレーム以降、 release されるまで毎フレーム `Some(DragInfo { kind: Continuing, .. })`
+    ///   を返す (rect 外に pointer が出ても drag session は継続)
+    /// - release frame: `Some(DragInfo { kind: Released, .. })` を 1 度返し、 内部 state を clear
+    /// - 以降は `None`
+    /// - rect 外で primary が押下された場合、 anchor を記録せず session は始まらない
+    /// - modal popup 配下では session が始まらない (#015 と同じ早期 return)
+    /// - 同 frame 内で複数の caller が同 rect を要求しても、 drag 開始 frame は
+    ///   `consume_pointer_click` で他 caller の press 検出を消すため 1 度だけ消費される
+    /// - drag 中の `pointer.primary_pressed` (現在押下中フラグ) は消費しない → 他 widget が
+    ///   読みたい場合は読める (drag rect / button の armed 判定が同 frame に共存可能)
+    ///
+    /// `id` は drag session を識別するための任意 Hash 値 (i32 / &str / `(label, idx)` 等)。
+    /// 内部で `WidgetId::ROOT.child((b"drag_in_rect", &id))` に変換する。 同じ `id` を
+    /// 複数回呼ぶと同一 session 扱いだが、 1 frame 内で複数の `id` を呼んで「複数 session
+    /// が同時に走る」 のは pointer 1 つしか無いので意味が無い (実質的に 1 session)。
+    pub fn take_drag_in_rect(
+        &mut self,
+        id: impl std::hash::Hash,
+        rect: Rect,
+    ) -> Option<DragInfo> {
+        if self.pointer_blocked_by_modal_popup() {
+            return None;
+        }
+        let wid = WidgetId::ROOT.child((b"drag_in_rect", &id));
+        let pointer = self.pointer;
+        let modifiers = pointer.modifiers;
+
+        // press → anchor 記録 (rect 内のみ)。 already_active なら start を上書きしない。
+        let just_started = {
+            let state: &mut DragInRectState = self.widget_state(wid);
+            let already_active = state.anchor.is_some();
+            if !already_active
+                && pointer.primary_just_pressed
+                && let Some((px, py)) = pointer.pos
+                && rect.contains(px, py)
+            {
+                state.anchor = Some((px, py));
+                state.start_modifiers = modifiers;
+                true
+            } else {
+                false
+            }
+        };
+        // drag 開始 frame は他 widget に同じ click を流さない (consume)。
+        if just_started {
+            self.consume_pointer_click();
+        }
+
+        // anchor / start_modifiers / release 判定の snapshot。 release 時は state も clear。
+        let (anchor_opt, start_modifiers, just_released) = {
+            let state: &mut DragInRectState = self.widget_state(wid);
+            let active = state.anchor.is_some();
+            let just_released = active && pointer.primary_just_released;
+            let snap = (state.anchor, state.start_modifiers, just_released);
+            if just_released {
+                state.anchor = None;
+            }
+            snap
+        };
+        let anchor = anchor_opt?;
+
+        let kind = if just_started {
+            DragKind::Started
+        } else if just_released {
+            DragKind::Released
+        } else {
+            DragKind::Continuing
+        };
+        let current = pointer.pos.unwrap_or(anchor);
+
+        Some(DragInfo {
+            anchor,
+            current,
+            delta: (current.0 - anchor.0, current.1 - anchor.1),
+            kind,
+            start_modifiers,
+            modifiers,
+        })
     }
 
     // ============================================================
@@ -2859,6 +2990,350 @@ mod tests {
         assert_eq!(
             popup_rects[0].clip_rect, None,
             "popup primitive の clip_rect は外側 with_clip_rect (pane_rect) を継承しない"
+        );
+    }
+
+    // -------- M14 Phase 63l (daw_01 #026): take_primary_press_in_rect / take_drag_in_rect --------
+
+    /// press frame で `pos` の primary just_pressed を返すヘルパ。
+    fn press_at(x: f32, y: f32) -> FrameInput {
+        FrameInput {
+            pointer: PointerFrame {
+                pos: Some((x, y)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// drag 中 (= 既に press 済 + pointer 移動中) を表すヘルパ。
+    fn hold_at(x: f32, y: f32) -> FrameInput {
+        FrameInput {
+            pointer: PointerFrame {
+                pos: Some((x, y)),
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// drag release frame ヘルパ。
+    fn release_pressed_at(x: f32, y: f32) -> FrameInput {
+        FrameInput {
+            pointer: PointerFrame {
+                pos: Some((x, y)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn take_primary_press_in_rect_returns_some_on_press_inside() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let rect = Rect { x: 50.0, y: 50.0, w: 100.0, h: 100.0 };
+
+        let observed = std::cell::Cell::new(None);
+        host.frame_to_edits(&(), &mut scene, screen, press_at(100.0, 100.0), |(), ui| {
+            observed.set(ui.take_primary_press_in_rect(rect));
+        });
+        assert_eq!(observed.get(), Some((100.0, 100.0)));
+    }
+
+    #[test]
+    fn take_primary_press_in_rect_returns_none_outside_rect() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let rect = Rect { x: 50.0, y: 50.0, w: 50.0, h: 50.0 };
+
+        let observed = std::cell::Cell::new(Some((0.0_f32, 0.0_f32)));
+        // press は来るが rect 外
+        host.frame_to_edits(&(), &mut scene, screen, press_at(200.0, 200.0), |(), ui| {
+            observed.set(ui.take_primary_press_in_rect(rect));
+        });
+        assert_eq!(observed.get(), None);
+    }
+
+    #[test]
+    fn take_primary_press_in_rect_returns_none_without_just_pressed() {
+        // primary_just_pressed が false (= primary_pressed のみ true) のフレームでは消費しない
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+
+        let observed = std::cell::Cell::new(Some((0.0_f32, 0.0_f32)));
+        host.frame_to_edits(&(), &mut scene, screen, hold_at(100.0, 100.0), |(), ui| {
+            observed.set(ui.take_primary_press_in_rect(rect));
+        });
+        assert_eq!(observed.get(), None, "press transition なし → None");
+    }
+
+    #[test]
+    fn take_primary_press_in_rect_consumes_within_frame() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+
+        let first = std::cell::Cell::new(None);
+        let second = std::cell::Cell::new(Some((0.0_f32, 0.0_f32)));
+        host.frame_to_edits(&(), &mut scene, screen, press_at(150.0, 150.0), |(), ui| {
+            first.set(ui.take_primary_press_in_rect(rect));
+            second.set(ui.take_primary_press_in_rect(rect));
+        });
+        assert_eq!(first.get(), Some((150.0, 150.0)), "1 度目 take → Some");
+        assert_eq!(second.get(), None, "2 度目 take → None (consume_pointer_click 済)");
+    }
+
+    #[test]
+    fn take_primary_press_in_rect_blocked_under_modal_anchor() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let anchor = Rect { x: 50.0, y: 50.0, w: 200.0, h: 200.0 };
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.open_popup("press_modal", anchor, true);
+        });
+
+        let observed = std::cell::Cell::new(Some((0.0_f32, 0.0_f32)));
+        host.frame_to_edits(&(), &mut scene, screen, press_at(150.0, 150.0), |(), ui| {
+            observed.set(ui.take_primary_press_in_rect(anchor));
+        });
+        assert_eq!(observed.get(), None, "modal 下では press は返されない");
+    }
+
+    #[test]
+    fn take_drag_in_rect_started_continuing_released_lifecycle() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+
+        // frame 1: press → Started
+        let phase1 = std::cell::Cell::new(None::<DragKind>);
+        let anchor1 = std::cell::Cell::new(None::<(f32, f32)>);
+        host.frame_to_edits(&(), &mut scene, screen, press_at(100.0, 100.0), |(), ui| {
+            if let Some(d) = ui.take_drag_in_rect("session1", rect) {
+                phase1.set(Some(d.kind));
+                anchor1.set(Some(d.anchor));
+            }
+        });
+        assert_eq!(phase1.get(), Some(DragKind::Started));
+        assert_eq!(anchor1.get(), Some((100.0, 100.0)));
+
+        // frame 2: hold (move) → Continuing + delta が更新
+        let phase2 = std::cell::Cell::new(None::<DragKind>);
+        let delta2 = std::cell::Cell::new((0.0_f32, 0.0_f32));
+        host.frame_to_edits(&(), &mut scene, screen, hold_at(120.0, 110.0), |(), ui| {
+            if let Some(d) = ui.take_drag_in_rect("session1", rect) {
+                phase2.set(Some(d.kind));
+                delta2.set(d.delta);
+            }
+        });
+        assert_eq!(phase2.get(), Some(DragKind::Continuing));
+        assert!((delta2.get().0 - 20.0).abs() < 1e-5);
+        assert!((delta2.get().1 - 10.0).abs() < 1e-5);
+
+        // frame 3: release → Released
+        let phase3 = std::cell::Cell::new(None::<DragKind>);
+        host.frame_to_edits(&(), &mut scene, screen, release_pressed_at(130.0, 115.0), |(), ui| {
+            if let Some(d) = ui.take_drag_in_rect("session1", rect) {
+                phase3.set(Some(d.kind));
+            }
+        });
+        assert_eq!(phase3.get(), Some(DragKind::Released));
+
+        // frame 4: idle → None
+        let phase4 = std::cell::Cell::new(Some(DragKind::Released));
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            phase4.set(ui.take_drag_in_rect("session1", rect).map(|d| d.kind));
+        });
+        assert_eq!(phase4.get(), None);
+    }
+
+    #[test]
+    fn take_drag_in_rect_starts_only_inside_rect() {
+        // rect 外で press されても session は始まらない (anchor None のまま)
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let rect = Rect { x: 200.0, y: 200.0, w: 50.0, h: 50.0 };
+
+        let observed = std::cell::Cell::new(Some(DragKind::Started));
+        host.frame_to_edits(&(), &mut scene, screen, press_at(50.0, 50.0), |(), ui| {
+            observed.set(ui.take_drag_in_rect("outside_press", rect).map(|d| d.kind));
+        });
+        assert_eq!(observed.get(), None);
+
+        // 次フレームに hold で pointer が rect 内に入っても、 session は始まっていないので None
+        let observed2 = std::cell::Cell::new(Some(DragKind::Started));
+        host.frame_to_edits(&(), &mut scene, screen, hold_at(220.0, 220.0), |(), ui| {
+            observed2.set(ui.take_drag_in_rect("outside_press", rect).map(|d| d.kind));
+        });
+        assert_eq!(observed2.get(), None, "rect 外 press は session を開かない");
+    }
+
+    #[test]
+    fn take_drag_in_rect_continues_when_pointer_leaves_rect() {
+        // rect 内で press → 次フレームに rect 外に pointer が出ても Continuing で session 継続
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let rect = Rect { x: 100.0, y: 100.0, w: 50.0, h: 50.0 };
+
+        let p1 = std::cell::Cell::new(None::<DragKind>);
+        host.frame_to_edits(&(), &mut scene, screen, press_at(120.0, 120.0), |(), ui| {
+            p1.set(ui.take_drag_in_rect("leave", rect).map(|d| d.kind));
+        });
+        assert_eq!(p1.get(), Some(DragKind::Started));
+
+        // pointer が rect から出る位置 (300, 200) に移動
+        let p2 = std::cell::Cell::new(None::<DragKind>);
+        let delta2 = std::cell::Cell::new((0.0_f32, 0.0_f32));
+        host.frame_to_edits(&(), &mut scene, screen, hold_at(300.0, 200.0), |(), ui| {
+            if let Some(d) = ui.take_drag_in_rect("leave", rect) {
+                p2.set(Some(d.kind));
+                delta2.set(d.delta);
+            }
+        });
+        assert_eq!(p2.get(), Some(DragKind::Continuing), "rect 外でも session 継続");
+        assert!((delta2.get().0 - 180.0).abs() < 1e-5);
+        assert!((delta2.get().1 - 80.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn take_drag_in_rect_blocked_under_modal_anchor() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let anchor = Rect { x: 50.0, y: 50.0, w: 200.0, h: 200.0 };
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.open_popup("drag_modal", anchor, true);
+        });
+
+        let observed = std::cell::Cell::new(Some(DragKind::Started));
+        host.frame_to_edits(&(), &mut scene, screen, press_at(150.0, 150.0), |(), ui| {
+            observed.set(ui.take_drag_in_rect("blocked", anchor).map(|d| d.kind));
+        });
+        assert_eq!(observed.get(), None, "modal 下では drag が始まらない");
+    }
+
+    #[test]
+    fn take_drag_in_rect_release_returned_only_once() {
+        // Released を返した後の同 frame に同 id で再度呼ぶと None (state 既に clear)
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+
+        // session を開始しておく
+        host.frame_to_edits(&(), &mut scene, screen, press_at(100.0, 100.0), |(), ui| {
+            assert!(ui.take_drag_in_rect("once", rect).is_some());
+        });
+        // release frame で 1 度目 Released、 2 度目は None
+        let first = std::cell::Cell::new(None::<DragKind>);
+        let second = std::cell::Cell::new(Some(DragKind::Released));
+        host.frame_to_edits(&(), &mut scene, screen, release_pressed_at(110.0, 110.0), |(), ui| {
+            first.set(ui.take_drag_in_rect("once", rect).map(|d| d.kind));
+            second.set(ui.take_drag_in_rect("once", rect).map(|d| d.kind));
+        });
+        assert_eq!(first.get(), Some(DragKind::Released));
+        assert_eq!(second.get(), None, "1 度 Released を返した後 anchor は cleared");
+    }
+
+    #[test]
+    fn take_drag_in_rect_consumes_press_within_start_frame() {
+        // drag 開始 frame に同じ rect で take_primary_press_in_rect を呼んでも consume 済 → None
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+
+        let drag_phase = std::cell::Cell::new(None::<DragKind>);
+        let press_after = std::cell::Cell::new(Some((0.0_f32, 0.0_f32)));
+        host.frame_to_edits(&(), &mut scene, screen, press_at(100.0, 100.0), |(), ui| {
+            drag_phase.set(ui.take_drag_in_rect("consume_test", rect).map(|d| d.kind));
+            press_after.set(ui.take_primary_press_in_rect(rect));
+        });
+        assert_eq!(drag_phase.get(), Some(DragKind::Started));
+        assert_eq!(press_after.get(), None, "drag 開始 frame に press は consume 済");
+    }
+
+    #[test]
+    fn take_drag_in_rect_records_start_modifiers() {
+        // start 時の Shift 押下が start_modifiers に記録され、 Continuing/Released まで保持される
+        use daw_ui_platform::Modifiers;
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+
+        let shift_only = Modifiers { shift: true, ..Modifiers::empty() };
+
+        // press 時に Shift 押下中
+        let start_mods_p1 = std::cell::Cell::new(Modifiers::empty());
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((100.0, 100.0)),
+                    primary_just_pressed: true,
+                    primary_pressed: true,
+                    modifiers: shift_only,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| {
+                if let Some(d) = ui.take_drag_in_rect("mod_test", rect) {
+                    start_mods_p1.set(d.start_modifiers);
+                }
+            },
+        );
+        assert!(start_mods_p1.get().shift, "Started で Shift 記録");
+
+        // Continuing で Shift を離しても start_modifiers は SHIFT のまま、 modifiers は empty
+        let start_mods_p2 = std::cell::Cell::new(Modifiers::empty());
+        let cur_mods_p2 = std::cell::Cell::new(shift_only);
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((110.0, 110.0)),
+                    primary_pressed: true,
+                    modifiers: Modifiers::empty(),
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| {
+                if let Some(d) = ui.take_drag_in_rect("mod_test", rect) {
+                    start_mods_p2.set(d.start_modifiers);
+                    cur_mods_p2.set(d.modifiers);
+                }
+            },
+        );
+        assert!(
+            start_mods_p2.get().shift,
+            "Continuing でも start_modifiers は SHIFT 保持"
+        );
+        assert!(
+            !cur_mods_p2.get().shift,
+            "modifiers (現フレーム) は SHIFT 解除を反映"
         );
     }
 }
