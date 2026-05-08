@@ -1232,7 +1232,17 @@ pub enum AppEvent {
     SelectClip { target: ClipRef, additive: bool },
     SetClipSelection(Vec<ClipRef>),
     ClearSelection,
-    ResizeClip { target: ClipRef, length: f64 },
+    /// Clip の右端 trim (= `start_beat` 同値、 `length_beats` のみ更新) と
+    /// 左端 trim (= `start_beat` を進めて `length_beats` を縮める) の両方を
+    /// カバー。 audio clip の場合は handler が delta_start を計算して各
+    /// `AudioEvent.event_start_in_clip_beats` / `source_start_frames` /
+    /// `event_length_beats` を追従させる (Bitwig spec §3.2)。 gui_01
+    /// `ResizeClipDelta` の `next_start` / `next_len` 両方をそのまま流す。
+    ResizeClip {
+        target: ClipRef,
+        start_beat: f64,
+        length: f64,
+    },
     /// `(source_ref, to_track_id, next_start_beat)` のタプル列。
     /// to_track_id == source の track id なら同 track 内 move、 違えば
     /// track 跨ぎ move (clip 自体を別 track の `clips: Vec<Clip>` に移す)。
@@ -1668,8 +1678,12 @@ impl AppData {
                 self.selected_clips.clear();
                 self.selected_notes.clear();
             }
-            AppEvent::ResizeClip { target, length } => {
-                self.resize_clip(target, length);
+            AppEvent::ResizeClip {
+                target,
+                start_beat,
+                length,
+            } => {
+                self.resize_clip(target, start_beat, length);
             }
             AppEvent::SetClipPositions(entries) => {
                 self.set_clip_positions(&entries);
@@ -3991,31 +4005,89 @@ impl AppData {
         }
     }
 
-    /// 右端 trim ハンドラ。 `length_beats` を更新し、 audio clip では
-    /// 各 `AudioEvent.event_length_beats` を新しい clip 長 (= clip 内 beats
-    /// 軸) でクランプする。 これは Bitwig 流右端 trim 挙動 (`docs/plan
-    /// _audio_clip.md` §3.2 — `length_beats` 変更、 source 範囲は変えない、
-    /// source より長く伸ばすと残り無音) を実現するためで、 event 側を
-    /// 連動させないと `compile_audio_schedule` が clip 範囲を超えて event
-    /// を render し続ける (= UI で縮めたつもりの clip がスピーカーから鳴り
-    /// 続ける見た目とのズレ)。 left-edge trim は arrangement widget が
-    /// `ResizeClips` delta に `next_start` を持たないので Phase 2 で
-    /// gui_01 #025 として要望予定。
-    fn resize_clip(&mut self, target: ClipRef, new_length_beats: f64) {
+    /// Clip の左右端 trim ハンドラ。 caller (arrangement widget) は
+    /// `ResizeClipDelta { prev_start, next_start, prev_len, next_len }`
+    /// から `next_start` / `next_len` を直接渡す。 ここで `delta_start =
+    /// new_start_beat - prev_start_beat` を計算し、 audio clip では
+    /// 各 event の clip 内位置 (`event_start_in_clip_beats`) と source 切り
+    /// 出し (`source_start_frames` / `event_length_beats`) を整合させる
+    /// (Bitwig 流 §3.2)。 MIDI clip では既存どおり `start_beat` /
+    /// `length_beats` のみ更新。
+    ///
+    /// 左端 trim (delta_start > 0):
+    /// - clip.start_beat += delta_start、 clip.length_beats -= delta_start (= next_len)
+    /// - 各 event: clip 内 beats 軸を維持するため event_start_in_clip_beats
+    ///   から delta_start を引く。 event の絶対位置 (= clip.start_beat +
+    ///   event.event_start_in_clip_beats) は変わらない (= source の同位置を
+    ///   そのまま再生する)
+    /// - delta_start が event の途中に入った場合は event の左端を切り
+    ///   詰める: event_start_in_clip_beats = 0、 event_length_beats を
+    ///   削った分だけ縮める、 source_start_frames を delta_samples 進める
+    ///
+    /// 左端を伸ばす (delta_start < 0): event は単に右へスライド (= source
+    /// は変えない、 clip 先頭の追加範囲は無音)。 source_start_frames を
+    /// 負方向に動かすのは安全でない (source 開始フレームを超えると
+    /// 配列範囲外) ので、 単純な後方スライドのみ。
+    ///
+    /// 右端 trim (delta_start == 0): 既存挙動 = length_beats を縮め、
+    /// audio event を new_length_beats でクランプ。
+    ///
+    /// Phase 2 PR4 では Raw mode 前提で source_start_frames 計算に
+    /// source.sample_rate * 60 / song.bpm を使う (= Repitch 中の左端 trim
+    /// は pitch_ratio 補正が要るが将来 PR スコープ)。
+    fn resize_clip(&mut self, target: ClipRef, new_start_beat: f64, new_length_beats: f64) {
         let new_length_beats = new_length_beats.max(0.0625);
-        let content_id = {
+        let new_start_beat = new_start_beat.max(0.0);
+        let bpm = self.song.bpm.max(1.0) as f64;
+        let (content_id, prev_start_beat) = {
             let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
                 return;
             };
             let Some(clip) = track.clips.get_mut(target.clip as usize) else {
                 return;
             };
+            let prev_start_beat = clip.start_beat;
+            clip.start_beat = new_start_beat;
             clip.length_beats = new_length_beats;
-            clip.content_id
+            (clip.content_id, prev_start_beat)
         };
+        let delta_start = new_start_beat - prev_start_beat;
+
+        // Snapshot の per-source sample_rate (event ごとに lookup できる
+        // よう immutable borrow を先に切る)。 Phase 2 PR4 は Raw mode 前提。
+        let audio_sources = self.song.audio_sources.clone();
 
         if let Some(ClipContent::Audio(audio)) = self.song.clip_contents.get_mut(&content_id) {
             for event in &mut audio.events {
+                if delta_start > 0.0 {
+                    // 左端 trim: event を delta_start だけ手前にずらして
+                    // 絶対位置を維持する。 結果が負なら event の左端を
+                    // 削る (source_start_frames を進める)。
+                    let new_evt_start = event.event_start_in_clip_beats - delta_start;
+                    if new_evt_start >= 0.0 {
+                        event.event_start_in_clip_beats = new_evt_start;
+                    } else {
+                        let chopped_beats = -new_evt_start;
+                        let source_sr = audio_sources
+                            .get(&event.source_id)
+                            .map(|s| s.sample_rate as f64)
+                            .unwrap_or(48000.0);
+                        let chopped_samples =
+                            (chopped_beats * source_sr * 60.0 / bpm).max(0.0) as u64;
+                        event.event_start_in_clip_beats = 0.0;
+                        event.event_length_beats =
+                            (event.event_length_beats - chopped_beats).max(0.0);
+                        event.source_start_frames = event
+                            .source_start_frames
+                            .saturating_add(chopped_samples)
+                            .min(event.source_end_frames);
+                    }
+                } else if delta_start < 0.0 {
+                    // 左端を伸ばした: event を後方スライド。 source は
+                    // 触らない (= 追加範囲は無音、 §3.2 に合致)。
+                    event.event_start_in_clip_beats -= delta_start;
+                }
+                // 右端 trim 相当の clamp (delta_start のいずれかでも適用)
                 let max_event_len =
                     (new_length_beats - event.event_start_in_clip_beats).max(0.0);
                 if event.event_length_beats > max_event_len {

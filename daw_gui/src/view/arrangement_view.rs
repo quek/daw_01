@@ -493,8 +493,15 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
             Edit::mutate(move |app: &mut AppData| {
                 for d in &deltas {
                     if let Some(target) = clip_key_to_ref(app, d.key) {
+                        // PR4: gui_01 widget は左端 grip drag → next_start
+                        // 進、 next_len 縮の delta を、 右端 grip drag →
+                        // next_start == prev_start、 next_len 変の delta を
+                        // emit する。 daw_01 は両方を `ResizeClip` handler
+                        // にそのまま渡し、 audio event の追従は handler 内で
+                        // 計算する (`docs/plan_audio_clip.md` §3.2)。
                         app.handle_event(AppEvent::ResizeClip {
                             target,
+                            start_beat: d.next_start,
                             length: d.next_len,
                         });
                     }
