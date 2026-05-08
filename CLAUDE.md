@@ -1,6 +1,21 @@
 理想とベストプラクティスを追求する。
 そのためは大胆に破壊して作り直す。
 
+## Session 開始時の必須チェック (AHE self-improvement loop)
+
+session 開始時、 system context に `=== Required Action: 前 session の reflection 候補を処理 ===` というブロックが含まれていたら、 **user の最初の依頼に応答する前に必ず処理する**。 skip 禁止。
+
+候補は 2 種類:
+- **user 修正発言検出**: 前 session で user が「違う」「ではなく」 等を発言 → 私の応答が誤った可能性
+- **rework signal**: 前 session で `git rebase` / `git commit --amend` / `git reset --hard` / `git push --force` / `git cherry-pick` が走った → 事前 check で回避できた可能性
+
+各候補を以下のいずれかで処理する (skip も「忘れて user 依頼に進む」 も両方禁止):
+
+1. **save**: 一般化できる learning なら `~/.claude/projects/F--dev-gui-01/memory/feedback_*.md` に書き、 `MEMORY.md` index に 1 行追加。 同じ pain point が **別 worktree / 別 phase / 別 widget** でも再発しそうなら save。
+2. **discard**: 1 度きりの偶発事象、 既に memory にある内容、 noise なら無視。 user 報告に「N 件 discard (理由)」 を 1 文添える。
+
+処理が終わってから user の依頼に応答する。 「無視して進む」 を選んだ session が連続すると AHE が学ばなくなる (= 2026-05-08 以前は Stop hook bug でこの状態だった)。
+
 # gui_01
 
 Rust 製・モデルを Clone しない DAW 向け GUI ライブラリ。GUI のみを扱い、audio / IPC には一切関知しない。

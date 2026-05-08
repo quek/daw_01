@@ -1,19 +1,29 @@
 #!/usr/bin/env bash
-# Stop hook: detect user-correction patterns in the latest user turn and stage
-# a reflection memo for the next session to consider as feedback memory.
+# Stop hook: detect learnable signals from the latest assistant turn and stage
+# them as reflection candidates for the next session.
 #
-# Triggered after every assistant turn. We read only the latest user message
-# from the transcript (not the whole history) to avoid duplicate logging.
+# Triggered after every assistant turn. We read the latest user message + the
+# latest assistant turn from the transcript (not the whole history) to avoid
+# duplicate logging across turns. Per-session dedup uses .session_events.<id>.log
+# (auto-discarded by SessionStart's rotation).
 #
-# Patterns flagged as "correction-like" (lexical proxy for semantic correction):
+# Two classes of signals are captured:
+#
+# (A) User correction patterns (lexical proxy for semantic correction)
 #   negation:    違う / そうじゃ / 間違 / ではなく / でなく / "no, / don't / wrong / incorrect
 #   challenge:   ぎませんか / 過ぎ / すぎ / ないんですか / じゃないですか / instead / actually
 #   redirect:    やめて / 代わりに
-# False positives are acceptable — the next session sees them as candidates.
-# Missing a real correction is the worse failure mode (over-detect, under-act).
+#
+# (B) Assistant rework signals (process pain points the user may not articulate)
+#   git rebase / git commit --amend / git reset --hard / git push --force / git cherry-pick
+#   These often mean a recoverable mistake or a missed pre-commit check that
+#   could become a reusable feedback memory.
+#
+# False positives are acceptable — the next session sees them as candidates and
+# the LLM judges save vs discard. Missing a real signal is the worse failure mode.
 #
 # Output: appends one line to .claude/.session_reflect_pending.md (gitignored).
-# Silent if no correction detected. Never blocks the stop event.
+# Silent if no signal detected. Never blocks the stop event.
 set -euo pipefail
 
 INPUT=$(cat)
@@ -25,18 +35,44 @@ SESSION_ID=$(printf '%s' "$INPUT" | sed -n 's/.*"session_id":[[:space:]]*"\([^"]
 [ -f "$TRANSCRIPT" ] || exit 0
 [ -d "$CWD" ] || exit 0
 
-LATEST_USER=$(tac "$TRANSCRIPT" 2>/dev/null | awk '/"role"[[:space:]]*:[[:space:]]*"user"/ && !/tool_use_id/ && !/tool_result/ {print; exit}' || true)
-[ -n "$LATEST_USER" ] || exit 0
+PENDING="$CWD/.claude/.session_reflect_pending.md"
+SESSION_LOG="$CWD/.claude/.session_events.${SESSION_ID}.log"
+TIMESTAMP=$(date +%Y-%m-%dT%H:%M)
 
-PATTERNS='違う|そうじゃ|間違|ではなく|でなく|ぎませんか|過ぎ|すぎ|ないんですか|じゃないですか|やめて|代わりに|wrong|incorrect|"no,|don'\''t|instead|actually'
-if ! printf '%s' "$LATEST_USER" | grep -qiE "$PATTERNS"; then
-  exit 0
+# (A) user correction pattern detection — single line per turn
+LATEST_USER=$(tac "$TRANSCRIPT" 2>/dev/null | awk '/"role"[[:space:]]*:[[:space:]]*"user"/ && !/tool_use_id/ && !/tool_result/ {print; exit}' || true)
+if [ -n "$LATEST_USER" ]; then
+  PATTERNS='違う|そうじゃ|間違|ではなく|でなく|ぎませんか|過ぎ|すぎ|ないんですか|じゃないですか|やめて|代わりに|wrong|incorrect|"no,|don'\''t|instead|actually'
+  if printf '%s' "$LATEST_USER" | grep -qiE "$PATTERNS"; then
+    SNIPPET=$(printf '%s' "$LATEST_USER" | head -c 200 | tr -d '\n\r')
+    # dedupe per session (same user message can't trigger twice — but Stop fires
+    # once per turn so the latest user message is fixed for the current Stop event;
+    # dedup is mostly defensive against transcript re-reads).
+    KEY="user-correction:$(printf '%s' "$LATEST_USER" | sha1sum | cut -c1-16)"
+    if ! grep -qF "$KEY" "$SESSION_LOG" 2>/dev/null; then
+      echo "$KEY" >> "$SESSION_LOG"
+      printf -- '- [%s] session=%s 修正パターン検出: %s ...\n' "$TIMESTAMP" "$SESSION_ID" "$SNIPPET" >> "$PENDING"
+    fi
+  fi
 fi
 
-PENDING="$CWD/.claude/.session_reflect_pending.md"
-TIMESTAMP=$(date +%Y-%m-%dT%H:%M)
-SNIPPET=$(printf '%s' "$LATEST_USER" | head -c 200 | tr -d '\n\r')
-
-cat >> "$PENDING" <<MEMO
-- [$TIMESTAMP] session=$SESSION_ID 修正パターン検出: $SNIPPET ...
-MEMO
+# (B) assistant rework signal detection — looks at the latest assistant turn's
+# bash tool calls. Dedupe per session so each unique rework command is logged
+# only once even if it appears across multiple turns.
+LATEST_ASSISTANT=$(tac "$TRANSCRIPT" 2>/dev/null | awk '/"role"[[:space:]]*:[[:space:]]*"assistant"/ {print; exit}' || true)
+if [ -n "$LATEST_ASSISTANT" ]; then
+  # extract distinct rework commands (whitespace-collapsed, sort -u for stability)
+  REWORK=$(printf '%s' "$LATEST_ASSISTANT" \
+    | grep -oE 'git rebase|git commit --amend|git reset --hard|git push --force|git cherry-pick' \
+    | sort -u || true)
+  if [ -n "$REWORK" ]; then
+    while IFS= read -r cmd; do
+      [ -z "$cmd" ] && continue
+      KEY="rework:$cmd"
+      if ! grep -qF "$KEY" "$SESSION_LOG" 2>/dev/null; then
+        echo "$KEY" >> "$SESSION_LOG"
+        printf -- '- [%s] session=%s rework signal: %s (この session 内で発生 — 事前 check で回避できなかったか検討)\n' "$TIMESTAMP" "$SESSION_ID" "$cmd" >> "$PENDING"
+      fi
+    done <<< "$REWORK"
+  fi
+fi
