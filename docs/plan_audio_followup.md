@@ -192,22 +192,29 @@ multi-event clip を作成する手段がないとテストもできないので
 - ✅ **PR-A**: `common::audio_render` 共通化 (commit `3a3826e`)
 - ✅ **PR-B**: multi-clip drag Undo 統合 (commit `4401d59`)
 - ✅ **PR-D 段階 1**: Audio Editor event selection + Duplicate (commit `38b0a9b`)
-- ✅ **gui_01 #026 [Replied]**: rect-based pointer hit-test API 要望 (commit
+- ✅ **gui_01 #026 [Closed]**: rect-based pointer hit-test API 要望 (commit
   `2675218`、 gui_01 側 M14 Phase 63l で `take_primary_press_in_rect` +
-  `take_drag_in_rect` 実装完了 → daw_01 path 依存再ビルドで利用可)
+  `take_drag_in_rect` 実装、 daw_01 path 依存再ビルドで取り込み完了)
 - ✅ **PR-D 段階 2**: Inspector multi-event + Ctrl+] / Ctrl+[ navigation (commit `24dd71d`)
 - ✅ **PR-D 段階 3**: rect-based drag UI = 中央 drag 移動 / 左右端 trim
   / 空白 drop で event 追加 / Delete shortcut / 右クリック context menu
-  (Duplicate / Delete / Add From Source...)。 AppEvent
-  `SetAudioEventStart` / `SetAudioEventTrim` / `AddAudioEventFromFile` /
-  `DeleteAudioEvent` + `AudioEventTrimSide` 新設、 全 undoable。
-  ghost preview (move = outline / trim = vertical line) 付き。
+  (Duplicate / Delete / Add From Source...) (commit `7d77fb9`)
+- ✅ **PR-C 段階 1**: protocol `BounceClipFxOnline` /
+  `BounceClipFxComplete` + `daw_audio::export::run_export` に range
+  arg 追加、 walk は frame 0 から / write は `[start, end)` のみ +
+  tail silence cutoff (commit `0e5e2c6`)
+- ✅ **PR-C 段階 2**: `AppEvent::BounceClipWithFx` /
+  `BounceClipFxComplete` + `pending_clip_fx_bounce` state +
+  `bounce_clip_with_fx` / `handle_bounce_clip_fx_complete` handler。
+  完了通知で 新 audio source (decode → cache) + 新 track ("(FX)" suffix)
+  + 新 clip 配置 + Undo snapshot。 右クリックメニューに
+  「Bounce (with FX)」 を追加。
 
-次セッションで:
-- ⏳ **PR-C**: plugin-FX Bounce (= 新 track + 新 Clip)。 規模大 (= IPC
-  + state 管理 + WAV crop + 新 track 自動作成 + plugin の release tail
-  扱い)。 1 セッション完結のリスクが高いため独立セッションで腰据えて
-  取り組む
+すべての PR (PR-A / PR-B / PR-C / PR-D) と gui_01 #026 が完了。
+
+後回し (= 他 PR で必要になったら着手):
+- ⏳ bounce_cache migration helper (緊急度低)
+- ⏳ VOICEVOX → ClipContent::Audio 統合 (Phase 3+ で再検討)
 
 各 PR ごとに `cargo build / clippy / test --features rt-assert` clean を
 確認、 `docs/plan.md` 進捗ログにエントリ追加 + commit する運用は維持。

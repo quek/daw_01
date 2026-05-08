@@ -243,6 +243,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 "Auto-Crossfade",
                 "Reverse",
                 "Bounce In Place",
+                "Bounce (with FX)",
             ],
             move |idx, ui| {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -258,9 +259,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         // clip のみ。 Bitwig clip メニューでも同様)。
                         3 => app.handle_event(AppEvent::ToggleClipReversed(target)),
                         // Bounce In Place: Pre-FX (= plugin chain 通さず)、
-                        // 当該 clip のみ。 Phase 2 PR9 (`docs/plan_audio
-                        // _clip.md` §3.8)。
+                        // 当該 clip の content を 1 event の baked audio に
+                        // 置換 (= 元 track 内で同 path)。 Phase 2 PR9
+                        // (`docs/plan_audio_clip.md` §3.8)。
                         4 => app.handle_event(AppEvent::BounceClipInPlace(target)),
+                        // Bounce (with FX): plugin chain を **通した** 結果を
+                        // **新 track + 新 Clip** に書き出す (元 clip は不変)。
+                        // async (= IPC freewheel render → 完了通知)。
+                        // Phase 2 PR-C (`docs/plan_audio_followup.md`)。
+                        5 => app.handle_event(AppEvent::BounceClipWithFx(target)),
                         _ => {}
                     }
                 }));

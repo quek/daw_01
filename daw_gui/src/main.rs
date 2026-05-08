@@ -211,10 +211,19 @@ fn spawn_incoming_bridge(
                 ChildToMain::ExportWavComplete { error } => {
                     Some(AppEvent::ExportWavComplete { error })
                 }
-                // Phase 2 PR-C 段階 2 で AppEvent::BounceClipFxComplete を
-                // 追加して proxy.send_event でつなぐ。 段階 1 (= protocol +
-                // audio engine pipe) では ignore で先に build / test を通す。
-                ChildToMain::BounceClipFxComplete { .. } => None,
+                ChildToMain::BounceClipFxComplete {
+                    path,
+                    source_track,
+                    source_clip,
+                    error,
+                    frames,
+                } => Some(AppEvent::BounceClipFxComplete {
+                    path,
+                    source_track,
+                    source_clip,
+                    error,
+                    frames,
+                }),
                 ChildToMain::Hello { .. } => None,
             };
             if let Some(event) = event

@@ -167,6 +167,27 @@ pub const ARRANGE_TRACK_HEIGHT: f32 = 56.0;
 pub const DEFAULT_NOTE_DURATION: f64 = 0.25;
 pub const DEFAULT_CLIP_LENGTH: f64 = 4.0;
 
+/// Phase 2 PR-C: 進行中の plugin-FX bounce の追跡 entry。
+/// `MainToChild::BounceClipFxOnline` 発火時に `AppData::pending_clip_fx_bounce
+/// = Some(...)` でセット、 `ChildToMain::BounceClipFxComplete` 受信で
+/// 完了処理 (= 新 audio source + 新 track + 新 Clip 配置) → `None` に戻す。
+/// `path` / `source_track` / `source_clip` は IPC echo back と pending entry
+/// の identifier 照合に使う。 `clip_name` / `clip_length_beats` /
+/// `start_beat` は完了時の新 track / 新 Clip の名前 / 配置に使う。
+/// `source_path` は完了時に AudioSource として登録するときの
+/// `AudioSourcePath` (= ProjectRelative or Absolute、 outpath が
+/// `<project_dir>/bounce/...` か `bounce_cache/...` かで決まる)。
+#[derive(Debug, Clone)]
+pub struct PendingClipFxBounce {
+    pub source_track: u32,
+    pub source_clip: u32,
+    pub out_path: PathBuf,
+    pub source_path: common::model::AudioSourcePath,
+    pub clip_name: String,
+    pub clip_length_beats: f64,
+    pub start_beat: f64,
+}
+
 pub struct AppData {
     // -------- Song / file --------
     pub song: Song,
@@ -305,6 +326,14 @@ pub struct AppData {
     pub pending_state_request: Option<PendingStateRequest>,
     pub audio_tx: Option<UnboundedSender<MainToChild>>,
     pub plugin_tx: Option<UnboundedSender<MainToChild>>,
+
+    /// Phase 2 PR-C: plugin-FX bounce が進行中なら `Some`。 `None` で
+    /// 新規 bounce を受け付ける。 同時 1 件のみ。 `MainToChild::
+    /// BounceClipFxOnline` 発火時に `Some` 化、 `ChildToMain::
+    /// BounceClipFxComplete` 受信で `None` に戻す + 新 track / 新 clip
+    /// 配置。 path / source_track / source_clip は IPC echo back と
+    /// pending entry を identifier 照合するために保持。
+    pub pending_clip_fx_bounce: Option<PendingClipFxBounce>,
     #[cfg(windows)]
     pub plugin_host_windows:
         HashMap<(u32, PluginSlot), crate::view::plugin_embed::PluginHostWindow>,
@@ -508,6 +537,7 @@ impl AppData {
             pending_state_request: None,
             audio_tx: Some(audio_tx),
             plugin_tx: Some(plugin_tx),
+            pending_clip_fx_bounce: None,
             #[cfg(windows)]
             plugin_host_windows: HashMap::new(),
             track_peak_display: initial_peak_display,
@@ -1700,6 +1730,25 @@ pub enum AppEvent {
     /// content に置換される (= 既存 ContentId を上書き)。
     BounceClipInPlace(ClipRef),
 
+    // ---- Bounce (with FX) — Phase 2 PR-C --------------------------------
+    /// audio clip を **plugin chain 込み** で render し、 結果を **新 track**
+    /// に新 audio clip として配置 (`docs/plan_audio_followup.md` PR-C)。
+    /// async (= IPC freewheel render → ChildToMain::BounceClipFxComplete)。
+    /// `is_undoable` には入れず、 完了通知 handler 内で
+    /// `push_undo_snapshot` を明示呼び出し (= 1 完了 = 1 Undo step)。
+    BounceClipWithFx(ClipRef),
+    /// Plugin-FX bounce 完了通知 (audio engine 側 thread → main thread)。
+    /// `error == None` で `path` の WAV が完全書き出し成功。 `frames`
+    /// は実際に書き出された frame 数 (tail 込み)。 `source_track` /
+    /// `source_clip` は元 clip 識別子 (= pending entry と照合に使う)。
+    BounceClipFxComplete {
+        path: PathBuf,
+        source_track: u32,
+        source_clip: u32,
+        error: Option<String>,
+        frames: u64,
+    },
+
     // ---- multi-clip drag batch (Phase 2 PR-B) ---------------------------
     /// gui_01 widget が multi-clip 一括 drag (= dB / fade / curve) を 1
     /// release で発行する場合、 各 delta を 1 AppEvent にまとめて 1
@@ -2207,6 +2256,24 @@ impl AppData {
             }
             AppEvent::BounceClipInPlace(target) => {
                 self.bounce_clip_in_place(target);
+            }
+            AppEvent::BounceClipWithFx(target) => {
+                self.bounce_clip_with_fx(target);
+            }
+            AppEvent::BounceClipFxComplete {
+                path,
+                source_track,
+                source_clip,
+                error,
+                frames,
+            } => {
+                self.handle_bounce_clip_fx_complete(
+                    path,
+                    source_track,
+                    source_clip,
+                    error,
+                    frames,
+                );
             }
             AppEvent::SetClipGainDbBatch(entries) => {
                 for (target, gain_db) in &entries {
@@ -4242,6 +4309,267 @@ impl AppData {
             "Bounce In Place: '{}' を {} に書き出し",
             clip.name,
             out_path.display()
+        );
+    }
+
+    /// PR-C: plugin chain 込みで render し、 結果を **新 track + 新 Clip**
+    /// に配置 (`docs/plan_audio_followup.md` PR-C / `docs/plan_audio_clip
+    /// .md` §3.8 "Bounce")。 Bounce In Place (Pre-FX) と異なり async (=
+    /// IPC 経由で freewheel render 完了通知待ち)。 完了通知の handler
+    /// (`handle_bounce_clip_fx_complete`) 内で Undo snapshot を 1 回だけ
+    /// 取る。 既に bounce 進行中なら重複 request を拒否。
+    fn bounce_clip_with_fx(&mut self, target: ClipRef) {
+        if self.pending_clip_fx_bounce.is_some() {
+            self.status_message =
+                "Bounce (with FX): 既に bounce 中です。 完了をお待ちください".into();
+            return;
+        }
+        let Some(track) = self.song.tracks.get(target.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get(target.clip as usize).cloned() else {
+            return;
+        };
+        let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get(&clip.content_id).cloned()
+        else {
+            self.status_message = "Bounce (with FX): audio clip ではありません".into();
+            return;
+        };
+        if audio.events.is_empty() {
+            self.status_message = "Bounce (with FX): events が空です".into();
+            return;
+        }
+
+        let engine_sr = common::audio_bridge::SAMPLE_RATE;
+        let bpm = self.song.bpm.max(1.0) as f64;
+        let samples_per_beat = engine_sr as f64 * 60.0 / bpm;
+        let start_frame = (clip.start_beat * samples_per_beat).max(0.0) as u64;
+        let end_frame = ((clip.start_beat + clip.length_beats) * samples_per_beat)
+            .max(0.0) as u64;
+        if end_frame <= start_frame {
+            self.status_message = "Bounce (with FX): clip 長が 0 です".into();
+            return;
+        }
+
+        // 出力 path を決定。 logic は bounce_clip_in_place と同じだが
+        // suffix を `_fx_` にして区別 (= 同 clip を Pre-FX / FX 両方
+        // bounce しても上書きにならない)。
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64 % 100_000_000)
+            .unwrap_or(0);
+        let safe_name: String = clip
+            .name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let safe_name = if safe_name.is_empty() {
+            "bounce".into()
+        } else {
+            safe_name
+        };
+        let filename = format!("{safe_name}_fx_{ts:08}.wav");
+
+        let project_dir = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+        let (out_path, source_path) = match project_dir.as_deref() {
+            Some(dir) => {
+                let bounce_dir = dir.join("bounce");
+                if let Err(e) = std::fs::create_dir_all(&bounce_dir) {
+                    self.status_message =
+                        format!("Bounce (with FX): bounce/ 作成失敗: {e}");
+                    return;
+                }
+                let dst = bounce_dir.join(&filename);
+                (
+                    dst.clone(),
+                    common::model::AudioSourcePath::ProjectRelative(
+                        std::path::PathBuf::from("bounce").join(&filename),
+                    ),
+                )
+            }
+            None => {
+                let cache = std::env::var_os("LOCALAPPDATA")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir)
+                    .join("daw_01")
+                    .join("bounce_cache");
+                if let Err(e) = std::fs::create_dir_all(&cache) {
+                    self.status_message =
+                        format!("Bounce (with FX): bounce_cache/ 作成失敗: {e}");
+                    return;
+                }
+                let dst = cache.join(&filename);
+                (
+                    dst.clone(),
+                    common::model::AudioSourcePath::Absolute(dst.clone()),
+                )
+            }
+        };
+
+        // pending entry をセット。 完了通知 handler はこの entry を見て
+        // 新 track / 新 clip を組み立てる。
+        self.pending_clip_fx_bounce = Some(PendingClipFxBounce {
+            source_track: target.track,
+            source_clip: target.clip,
+            out_path: out_path.clone(),
+            source_path,
+            clip_name: clip.name.clone(),
+            clip_length_beats: clip.length_beats,
+            start_beat: clip.start_beat,
+        });
+
+        // bookend: SetRenderMode(Offline) → LoadSong (= 最新 song
+        // snapshot を audio engine に渡す) → BounceClipFxOnline。
+        // ExportWav と同じ pattern。 完了通知で Realtime に戻す。
+        let song = self.song.clone();
+        self.send_audio(MainToChild::LoadSong(song));
+        self.send_plugin(MainToChild::SetRenderMode(
+            common::protocol::RenderMode::Offline,
+        ));
+        self.send_audio(MainToChild::BounceClipFxOnline {
+            path: out_path,
+            source_track: target.track,
+            source_clip: target.clip,
+            start_frame,
+            end_frame,
+        });
+        self.status_message =
+            format!("Bounce (with FX): '{}' を render 中...", clip.name);
+    }
+
+    /// PR-C: BounceClipFxOnline 完了通知の処理。 SetRenderMode(Realtime)
+    /// で bookend 解除、 success なら新 audio source + 新 track + 新
+    /// audio clip を配置 + Undo snapshot。 失敗時は status_message のみ
+    /// (= pending クリア + 残骸ファイル削除)。
+    fn handle_bounce_clip_fx_complete(
+        &mut self,
+        path: PathBuf,
+        source_track: u32,
+        source_clip: u32,
+        error: Option<String>,
+        frames: u64,
+    ) {
+        // bookend を Realtime に戻す (= 失敗時も忘れず)。
+        self.send_plugin(MainToChild::SetRenderMode(
+            common::protocol::RenderMode::Realtime,
+        ));
+
+        let Some(pending) = self.pending_clip_fx_bounce.take() else {
+            tracing::warn!("BounceClipFxComplete with no pending bounce; ignoring");
+            return;
+        };
+        if pending.source_track != source_track
+            || pending.source_clip != source_clip
+            || pending.out_path != path
+        {
+            tracing::warn!(
+                ?path,
+                source_track,
+                source_clip,
+                "BounceClipFxComplete identifier mismatch with pending; ignoring"
+            );
+            return;
+        }
+        if let Some(err) = error {
+            self.status_message = format!("Bounce (with FX) 失敗: {err}");
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        if frames == 0 {
+            self.status_message =
+                "Bounce (with FX): render 結果が空です (= silence のみ?)".into();
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+
+        // 1 完了 = 1 Undo step として snapshot を取る。
+        self.push_undo_snapshot();
+
+        let engine_sr = common::audio_bridge::SAMPLE_RATE;
+        // 採番した new_source_id を `audio_sources` に登録。 path は
+        // `pending.source_path` (= ProjectRelative or Absolute、 確定済)。
+        let new_source = common::model::AudioSource {
+            path: pending.source_path,
+            sample_rate: engine_sr,
+            channels: 2,
+            frames,
+            original_bpm: Some(self.song.bpm),
+            root_key: None,
+        };
+        let new_source_id = self.song.alloc_audio_source_id();
+        self.song.audio_sources.insert(new_source_id, new_source);
+
+        // decode して audio_source_cache に登録 (= 即時再生で playback
+        // できるよう)。 失敗しても tracker 表示等は問題ないので warn だけ。
+        match crate::import_audio::decode_wav(&path) {
+            Ok(buffer) => {
+                self.audio_source_cache.insert(new_source_id, Arc::new(buffer));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "Bounce (with FX): WAV decode for cache failed (track is created; will reload on next save/load)"
+                );
+            }
+        }
+
+        // 新 track 作成 (空 plugin chain)。 名前は元 clip 名 + " (FX)"。
+        let new_track_id = self.song.alloc_track_id();
+        let new_track_name = format!("{} (FX)", pending.clip_name);
+        let new_track = Track {
+            id: new_track_id,
+            name: new_track_name.clone(),
+            clips: Vec::new(),
+            ..Track::default()
+        };
+        self.song.tracks.push(new_track);
+        let new_track_idx = self.song.tracks.len() - 1;
+
+        // 新 Clip = single-event content (= bounce 結果は flat な audio)。
+        let new_event = AudioEvent {
+            source_id: new_source_id,
+            event_start_in_clip_beats: 0.0,
+            event_length_beats: pending.clip_length_beats,
+            source_start_frames: 0,
+            source_end_frames: frames,
+            ..AudioEvent::default()
+        };
+        let new_content_id = self.song.alloc_content_id();
+        self.song.clip_contents.insert(
+            new_content_id,
+            common::model::ClipContent::Audio(common::model::AudioContent {
+                events: vec![new_event],
+            }),
+        );
+
+        let new_track_mut = &mut self.song.tracks[new_track_idx];
+        let new_clip_id = new_track_mut.alloc_clip_id();
+        new_track_mut.clips.push(common::model::Clip {
+            id: new_clip_id,
+            name: format!("{} (bounced FX)", pending.clip_name),
+            start_beat: pending.start_beat,
+            length_beats: pending.clip_length_beats,
+            content_id: new_content_id,
+            notes: Vec::new(),
+        });
+
+        self.resize_track_peak_display();
+        self.is_dirty = true;
+        self.sync_song_to_plugin_host();
+        self.status_message = format!(
+            "Bounce (with FX) 完了: 新トラック '{}' を追加",
+            new_track_name
         );
     }
 
