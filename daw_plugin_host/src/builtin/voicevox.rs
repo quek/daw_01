@@ -48,8 +48,15 @@ pub struct VoicevoxState {
 
 impl Default for VoicevoxState {
     fn default() -> Self {
+        // VOICEVOX `frame_synthesis` (= sing 合成) は **歌唱可能な
+        // singer style id** を要求する。 talk speaker id (= 6 等) を
+        // 渡すと 500 Internal Server Error。 既存 `common::voicevox::
+        // DEFAULT_SINGER_ID = 3061` (= 春日部つむぎ ノーマル相当) を
+        // builtin plugin の default に揃える。 user が GUI で speaker
+        // を変えた値は state_save で project file に永続化される
+        // (PR-V2.5)。
         Self {
-            speaker_id: 6,
+            speaker_id: common::voicevox::DEFAULT_SINGER_ID,
             style_name: "ノーマル".to_string(),
         }
     }
@@ -82,6 +89,9 @@ struct SynthResult {
 /// retrigger は voice を上書き (= 後勝ち、 「歌詞編集で同 note を再合成」
 /// した場合に古い voice を切って新 voice に差し替える挙動)。
 struct Voice {
+    /// 起動 note_id (debug / introspection 用に保持。 PR-V2.4 MVP は
+    /// 単一 voice rolling なので識別には現状使われていない)。
+    #[allow(dead_code)]
     note_id: u32,
     samples: Arc<Vec<f32>>,
     sample_rate: u32,
@@ -147,6 +157,9 @@ impl VoicevoxBuiltin {
         let result_arc = Arc::clone(&self.synth_result);
         // 直近 job だけ処理する (= 連続 flush は最後の 1 件だけ synth、
         // 古い job は drop)。 mpsc は順序保証だが coalescing は手動。
+        // また、 synth 失敗 (= engine 起動中の接続失敗) で job を捨てると
+        // 永久に音が鳴らないので、 失敗した job は同 slot に残して
+        // 「retry pending」 にする。
         let coalesce = Arc::new(Mutex::new(None::<SynthJob>));
         let coalesce_recv = Arc::clone(&coalesce);
 
@@ -166,14 +179,22 @@ impl VoicevoxBuiltin {
                 // 処理 thread: poll で coalesce slot を取り出して synth。
                 // 真面目に condvar するほどのレイテンシ要求は無い (歌詞編集
                 // から数百 ms ずれて synth 開始でも user 知覚しない)。
+                let mut retry_after = std::time::Instant::now();
                 loop {
-                    let job = {
+                    // retry backoff を尊重 (= 失敗直後の即時再 try を防ぐ)。
+                    let now = std::time::Instant::now();
+                    if now < retry_after {
+                        std::thread::sleep(retry_after - now);
+                    }
+                    // 新 job が来てれば take、 無ければ「前回失敗 job が
+                    // pending か」 を見るために peek。
+                    let job_opt = {
                         let Ok(mut slot) = coalesce.lock() else {
                             return;
                         };
                         slot.take()
                     };
-                    let Some(job) = job else {
+                    let Some(job) = job_opt else {
                         if Arc::strong_count(&coalesce) <= 1 {
                             // 受信 thread が exit (= sender drop)、 keep
                             // alive する理由なし。
@@ -213,6 +234,19 @@ impl VoicevoxBuiltin {
                                 error = ?e,
                                 "VoicevoxBuiltin: synth failed (engine 起動済? localhost:50021)"
                             );
+                            // engine 起動中で接続失敗の可能性が高いので、
+                            // job を coalesce slot に戻して 1.5s 後に retry。
+                            // 受信 thread が新 job を入れたら override される
+                            // (= 最新版で再試行)、 入らなければ同 job を
+                            // また試す。 60s 待っても engine が立たない場合
+                            // user 介入が必要なので、 backoff は無限。
+                            if let Ok(mut slot) = coalesce.lock()
+                                && slot.is_none()
+                            {
+                                *slot = Some(job);
+                            }
+                            retry_after = std::time::Instant::now()
+                                + std::time::Duration::from_millis(1500);
                         }
                     }
                 }
@@ -303,12 +337,17 @@ impl LoadedPlugin for VoicevoxBuiltin {
         // 止が歌唱として自然)。 同 buffer 内で event.time を考慮する
         // resample は polish。
         for ev in events {
-            if let crate::plugin_instance::NoteTransition::On { note_id, velocity, .. } = ev.event {
+            if let crate::plugin_instance::NoteTransition::On { note_id, velocity, key } = ev.event {
                 let snapshot = self
                     .synth_result
                     .read()
                     .ok()
                     .and_then(|guard| guard.clone());
+                tracing::debug!(
+                    note_id, key, velocity,
+                    has_synth = snapshot.is_some(),
+                    "VoicevoxBuiltin: note_on received"
+                );
                 let Some(res) = snapshot else {
                     continue;
                 };
@@ -317,11 +356,27 @@ impl LoadedPlugin for VoicevoxBuiltin {
                     .get(&note_id)
                     .copied()
                     .unwrap_or(0) as usize;
+                tracing::debug!(
+                    note_id,
+                    synth_offset,
+                    samples_len = res.samples.len(),
+                    sample_rate = res.sample_rate,
+                    "VoicevoxBuiltin: voice started"
+                );
                 if synth_offset >= res.samples.len() {
                     // synth から note_id が外れている (= 歌詞数とずれた)
                     // 場合は無視。
                     continue;
                 }
+                // VOICEVOX wav は「全 note 連続録音」 として返される
+                // (= note 1 区間 [t1..t2]、 note 2 区間 [t2..t3]、 …)。
+                // 複数 voice を並行再生すると、 同じ wav の被る区間が
+                // 複数の cursor で同時に流れて位相干渉 → 音量低下 +
+                // 不自然な音。 note_on を「現在再生中 voice の置換 (=
+                // rolling)」 として扱い、 active_voices を 1 voice
+                // 単一に保つ。 wav は連続なので、 cursor を新 note の
+                // synth_offset に jump させれば実質「VOICEVOX が想定
+                // した連続再生」 と等価。
                 let voice = Voice {
                     note_id,
                     samples: Arc::clone(&res.samples),
@@ -329,15 +384,8 @@ impl LoadedPlugin for VoicevoxBuiltin {
                     velocity: velocity as f32,
                     cursor: synth_offset,
                 };
-                if let Some(slot) = self
-                    .active_voices
-                    .iter_mut()
-                    .find(|v| v.note_id == note_id)
-                {
-                    *slot = voice;
-                } else {
-                    self.active_voices.push(voice);
-                }
+                self.active_voices.clear();
+                self.active_voices.push(voice);
             }
             // note_off は無視。
         }
@@ -358,7 +406,11 @@ impl LoadedPlugin for VoicevoxBuiltin {
                     );
                     sr_warned = true;
                 }
-                let amp = (voice.velocity / 127.0).clamp(0.0, 1.0);
+                // PR-V2.4 fix: NoteTransition::On.velocity は既に
+                // sequencer で `note.velocity / 127.0` (= 0..1 範囲) に
+                // 正規化されている。 ここで更に 127 で割ると 0.0062 倍
+                // (約 -44 dB) になり「とても小さい」 という症状になる。
+                let amp = voice.velocity.clamp(0.0, 1.0);
                 let remaining = voice.samples.len().saturating_sub(voice.cursor);
                 let copy_n = remaining.min(frames_usize);
                 for k in 0..copy_n {
@@ -509,9 +561,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_state_is_zundamon_normal() {
+    fn default_state_uses_sing_speaker() {
         let s = VoicevoxState::default();
-        assert_eq!(s.speaker_id, 6);
+        // sing 合成可能 speaker (= common::voicevox::DEFAULT_SINGER_ID)
+        // が default。 talk speaker id (= 6) を渡すと frame_synthesis が
+        // 500 を返すので注意。
+        assert_eq!(s.speaker_id, common::voicevox::DEFAULT_SINGER_ID);
         assert_eq!(s.style_name, "ノーマル");
     }
 

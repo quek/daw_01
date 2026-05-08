@@ -3502,6 +3502,13 @@ impl AppData {
         let mut clip = demo_clip();
         clip.id = track.alloc_clip_id();
         track.clips.push(clip);
+        // demo_clip() は content_id = 0 (sentinel) + Clip.notes に直接
+        // notes を持つ legacy 形式で返す。 push 後に ensure_clip_contents
+        // を呼んで「notes → clip_contents 移送 + content_id 採番」 を
+        // 実行しないと、 notes_in_clip_mut が None を返して以降のノート
+        // 編集 (= AddNote / piano_roll) が no-op になる。 ensure_clip_
+        // contents は idempotent なので tracks.push 後の任意のタイミング
+        // で OK。 ここで song に push 後に呼ぶのが最も自然。
         // PR-V3: track.instrument を Builtin VOICEVOX で初期化。
         // SlotPluginLoadedFromChild が来る前に Track 側でも format =
         // Builtin を保持しておかないと、 後段の handler が「既存 format」
@@ -3513,6 +3520,7 @@ impl AppData {
             sidechain_sources: Vec::new(),
         });
         self.song.tracks.push(track);
+        self.song.ensure_clip_contents();
         self.resize_track_peak_display();
 
         // SetSlotPlugin で plugin host に builtin VOICEVOX を load させる。
@@ -3541,8 +3549,19 @@ impl AppData {
     /// 変換し、 plugin host に `SetBuiltinPluginNoteMetadata` で送る。
     /// plugin_id 未確定 (= load 完了通知前) の track はスキップ、
     /// `SlotPluginLoadedFromChild` 受信時に再呼び出しされる。
-    pub fn sync_vocal_metadata(&self) {
+    ///
+    /// PR-V4 follow-up: vocal track が 1 つでも存在するなら VOICEVOX
+    /// engine を lazy spawn する。 旧 `begin_vocal_synth` 内にあった
+    /// 起動 logic を移植 (= localhost:50021 が起動済でなければ自動で
+    /// spawn、 builtin plugin の HTTP synth を成功させる前提)。
+    pub fn sync_vocal_metadata(&mut self) {
         let bpm = self.song.bpm;
+        let has_vocal_track = self.song.tracks.iter().any(|t| {
+            matches!(t.source, common::model::InstrumentSource::Vocal { .. })
+        });
+        if has_vocal_track {
+            self.ensure_voicevox_engine();
+        }
         for track in &self.song.tracks {
             if !matches!(track.source, common::model::InstrumentSource::Vocal { .. }) {
                 continue;
@@ -6735,6 +6754,51 @@ impl AppData {
     // finish_vocal_synth) は削除。 vocal track は builtin VOICEVOX
     // instrument plugin で再生され、 歌詞 flush は sync_vocal_metadata で
     // 自動行われる (= explicit Synth ボタンは不要)。
+
+    /// VOICEVOX engine の lazy spawn (旧 `begin_vocal_synth` から
+    /// 移植)。 sync_vocal_metadata で「vocal track が 1 つでもある」
+    /// 状態が初めて発生した時に呼ばれ、 background thread で
+    /// `voicevox_engine::is_running()` を確認、 未起動なら
+    /// `spawn_engine` で localhost:50021 を立ち上げる。 try は 1 度
+    /// だけ (`voicevox_launch_attempted` flag で抑止)、 user が手動で
+    /// engine を落とした場合は手動再起動。 spawn 後の child は
+    /// `JobObject` に attach するので daw_gui 終了で auto-kill される。
+    fn ensure_voicevox_engine(&mut self) {
+        if self.voicevox_launch_attempted {
+            return;
+        }
+        self.voicevox_launch_attempted = true;
+        let job = Arc::clone(&self.voicevox_job);
+        std::thread::spawn(move || {
+            if common::voicevox_engine::is_running() {
+                return;
+            }
+            let Some(exe) = common::voicevox_engine::resolve_engine_path() else {
+                let cfg_hint = common::voicevox_engine::engine_path_config_file()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<no localappdata>".into());
+                tracing::warn!(
+                    hint = %cfg_hint,
+                    "VOICEVOX engine path not configured (set DAW_VOICEVOX_PATH or write the exe path to the config file)"
+                );
+                return;
+            };
+            tracing::info!(exe = %exe.display(), "lazy spawn VOICEVOX engine for builtin plugin");
+            match common::voicevox_engine::spawn_engine(&exe) {
+                Ok(child) => {
+                    if let Err(e) = job.assign_std(&child) {
+                        tracing::warn!(error = ?e, "failed to attach VOICEVOX to job");
+                    }
+                    // child を drop しても std::process::Child は wait
+                    // しない (Windows)。 JobObject 経由で auto-kill される。
+                    std::mem::forget(child);
+                }
+                Err(e) => {
+                    tracing::error!(error = ?e, exe = %exe.display(), "failed to spawn VOICEVOX engine");
+                }
+            }
+        });
+    }
 
     // -------- Plugin DB rescan --------------------------------------------
 
