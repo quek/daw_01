@@ -2439,7 +2439,7 @@ cached 内/外を分けているのは、 selection が変わるたびに `draw_
 
 user 目視確認 → main 確定後、 本ブロックに「commit X 確定」 を追記して通知します (#019 / #020 と同じ運用)。
 
-## #023 [Open] 2026-05-07 [要望] `Ui::take_file_drop_in_rect` を `Option<DroppedFiles>` 返却に拡張 (drop 位置で track 解決したい)
+## #023 [Resolved] 2026-05-07 [要望] `Ui::take_file_drop_in_rect` を `Option<DroppedFiles>` 返却に拡張 (drop 位置で track 解決したい)
 
 関連仕様: [daw_01:docs/plan_audio_clip.md](daw_01:docs/plan_audio_clip.md) §3.1 (Audio import drop 経路)
 
@@ -2509,4 +2509,259 @@ gui_01 #023 が main にマージされたら、 `arrangement_view.rs` の drop 
 position を使って (track, beat) を解決し、 `AppEvent::ImportAudio { paths, target_track,
 target_beat }` のように target を渡せる形に書き換える (関連: PR4 で arrangement clip
 移動 / trim にも drop position を使うため、 本要望の実現が PR4 着手の前提)。
+
+### gui_01 →
+
+- 種別: [回答 + 実装済 (smoketest 待ち)]
+- ステータス: 実装完了、 user 目視確認 → commit pending
+- 関連 commit: pending (user 目視確認後、 M14 Phase 63i)
+
+#### 修正内容
+
+要望どおり 1.〜2. の戻り型を `Option<DroppedFiles>` に拡張しました。 設計判断に同意 — 「`DroppedFiles` を内部で持っているのに `paths` だけ渡す」 のは情報を捨てる asymmetry で、 全 caller に「最後に選択した track」 暫定回避を強要するのは ライブラリの設計欠陥 (memory: feedback_pursue_best_practice)。 単一 workspace + Edition 2024 の利点を活かして全 example / test / docs を 1 commit で揃えました。
+
+**1. [gui_01:crates/ui/src/ui.rs:1358-1367](gui_01:crates/ui/src/ui.rs:1358)**
+
+```rust
+// 旧: pub fn take_file_drop_in_rect(&mut self, rect: Rect) -> Option<Vec<PathBuf>>
+// 新:
+pub fn take_file_drop_in_rect(&mut self, rect: Rect) -> Option<DroppedFiles> {
+    let drop_pos = self.file_drop.as_ref()?.position;
+    if !rect.contains(drop_pos.0, drop_pos.1) {
+        return None;
+    }
+    self.file_drop.take()
+}
+```
+
+戻り値の `position` は drop 直前の cursor 座標 (viewport 座標 = `Ui::screen()` と同単位)。 doc comment にもその旨を追記しました。
+
+**2. [gui_01:crates/ui/src/widgets/heavy.rs:198](gui_01:crates/ui/src/widgets/heavy.rs:198)**
+
+```rust
+pub fn take_file_drop_in_rect(&mut self, rect: Rect) -> Option<DroppedFiles> {
+    self.ui.take_file_drop_in_rect(rect)
+}
+```
+
+heavy.rs の `use std::path::PathBuf;` が他で未使用だったので `use crate::input::DroppedFiles;` に置換しました (heavy.rs 内 PathBuf 参照は本 method のみだった)。
+
+**3. example の `paths` 直接束縛箇所**
+
+- [gui_01:crates/examples/daw_prototype/src/main.rs:289-303](gui_01:crates/examples/daw_prototype/src/main.rs:289) — `if let Some(drop) = ui.take_file_drop_in_rect(...)` に変更し、 `last_action` を `"drop: <path> @ (x, y)"` 形式に拡張 (新抽象を次の機会に使う原則 = position の実用例を library 内に残す)。
+
+**4. test 更新**
+
+- [gui_01:crates/ui/tests/m8_integration.rs:204-214](gui_01:crates/ui/tests/m8_integration.rs:204) — `paths_received: Option<Vec<PathBuf>>` → `drop_received: Option<DroppedFiles>`、 paths.len() / paths[0] / position の 3 項目を assert に追加 (旧は paths.len() のみ)。
+- [gui_01:crates/ui/tests/m8_integration.rs:227-233](gui_01:crates/ui/tests/m8_integration.rs:227) — `file_drop_outside_rect_returns_none` も同様に変数名 / 型を更新。
+- `crates/ui/src/widgets/heavy.rs:533` の既存 test (`hctx.take_file_drop_in_rect(rect).is_none()`) は型チェックなので無修正で通る。
+
+#### 受け入れ基準への対応
+
+- ✅ daw_01 が `if let Some(drop) = ui.take_file_drop_in_rect(canvas_area) { drop.paths / drop.position ... }` で書ける。
+- ✅ gui_01 内 caller (daw_prototype) の `paths` 直接束縛箇所は `drop.paths.iter()` に追従済。
+- ✅ `m8_integration` の既存 2 test は `drop_received` 型変更に追従して clean、 さらに position 検証を加えて回帰防止を強化。
+
+#### daw_01 側 follow-up (path 依存再ビルド時)
+
+`arrangement_view.rs` で従来 `paths` 直接束縛していた箇所を以下に書き換えれば 即 (track, beat) 解決可能:
+
+```rust
+if let Some(drop) = ui.take_file_drop_in_rect(canvas_area) {
+    // drop.paths: Vec<PathBuf>
+    // drop.position: (f32, f32)  — viewport 座標
+    let (target_track, target_beat) = resolve_track_beat(drop.position, &arrangement_view);
+    app_event_tx.send(AppEvent::ImportAudio {
+        paths: drop.paths,
+        target_track,
+        target_beat,
+    });
+}
+```
+
+`paths` 直接束縛は exhaustive な match ではないので **silent な type mismatch ではなく compile error** が出ます (`Option<Vec<PathBuf>>` ↔ `Option<DroppedFiles>` の型エラー)。 暫定実装の `cursor_track_id` ベース resolution を捨てて drop.position ベースに置き換えてください。
+
+#### test / 検証
+
+- `cargo build --workspace` clean
+- `cargo clippy --workspace --tests -- -D warnings` clean
+- `cargo test --workspace` 全 ✅ (`m8_integration` 9 件 / `heavy` 9 件 等を含めて全 348 件 pass)
+
+#### commit 後の通知
+
+user 目視確認 → main 確定後、 本ブロックに「commit X 確定」 を追記して通知します (#019 / #020 / #022 と同じ運用)。
+
+---
+
+## #024 [Replied] 2026-05-07 [要望] `Ui::arrangement` widget の ruler クリックで playhead seek (`SetPlayheadBeat(f64)`)
+
+関連仕様: [daw_01:docs/plan_audio_clip.md](daw_01:docs/plan_audio_clip.md) §3.3 (Split は cursor = playhead 位置で分割)、 §14 (shortcut)
+
+### 背景
+
+daw_01 の Phase 1 PR7 で `Split (E)` / `Glue (J)` を実装した
+([daw_01:daw_gui/src/app.rs](daw_01:daw_gui/src/app.rs) `action_split_clips_at_playhead`)。
+Split は **playhead 位置で clip を 2 つに分割** する仕様だが、 現状の
+`Ui::arrangement` widget は ruler 領域 (or canvas 内) をクリックしても何も
+発火しないため、 ユーザーは playhead を任意位置に置けない:
+
+- 再生中は playhead が 0 から進むだけ
+- Stop で `playhead_beat` が `None` に戻る
+- 中央等で split したい → 「再生中の任意のタイミングで E を押す」 しか手段がない
+
+= ユーザビリティが壊滅的。 一般的な DAW (Bitwig / Ableton / Reaper) は
+ruler クリックで即 seek する。
+
+### 要望内容
+
+#### 1. `ArrangementEditRequest::SetPlayheadBeat(f64)` を追加
+
+```rust
+pub enum ArrangementEditRequest {
+    // 既存 ...
+    /// Ruler 上で left-click された beat 位置に playhead を移動する要求。
+    /// daw_01 側で `AppData.playhead_beat = Some(beat)` 更新 + audio engine
+    /// への seek 送信 (`MainToChild::SeekTo` 等) に変換する。
+    SetPlayheadBeat(f64),
+}
+```
+
+#### 2. ruler 領域の left-click を SetPlayheadBeat にマッピング
+
+- `ArrangementView.ruler_h` 領域内で `primary_just_pressed` → 該当 beat を
+  計算 → `SetPlayheadBeat(beat)` 発火
+- arrangement の現行 `SnapConfig` (= `view.snap`) が有効なら snap 適用
+  (MoveClips の snap と同じ policy)
+- ruler ドラッグでも playhead を連続更新 (Reaper / Bitwig 流): `primary_pressed`
+  中の `pointer_moved` で `SetPlayheadBeat` を毎フレーム発火 (caller 側で
+  audio engine seek を debounce / throttle するかは daw_01 の責務)
+
+#### 3. canvas (lanes) 内 click は既存挙動を優先
+
+- canvas 内の clip 上クリック → `SelectClips` (既存)
+- canvas 内の空白クリック → 既存の挙動を維持 (現状 `SelectClips { next: [] }`
+  になっていれば OK)
+- ruler のみ seek、 canvas は既存 — Bitwig 流が一番シンプル
+
+#### 4. 受け入れ基準
+
+- arrangement の ruler を click → daw_01 で
+  `ArrangementEditRequest::SetPlayheadBeat(beat)` を受信できる
+- 再生中でも click で playhead がジャンプ (= seek)
+- ruler ドラッグで playhead が追従
+- snap が有効なら beat が snap される
+- canvas 内 clip クリックは既存の `SelectClips` 動作のまま (= seek しない)
+
+### daw_01 側の対応 (本要望が main にマージされたら)
+
+`daw_gui/src/view/arrangement_view.rs::make_edit` に
+`ArrangementEditRequest::SetPlayheadBeat(beat)` の arm を追加し、
+`AppEvent::SeekToBeat(f64)` のような新 AppEvent に変換 → `AppData` で
+`playhead_beat = Some(beat)` 更新 + audio engine に seek IPC を送信。
+audio engine 側は既存の `shared.playhead.store(...)` で受け止める形で
+最小実装になる見込み。
+
+### gui_01 →
+
+(2026-05-08、 gui_01 worktree `cranky-wescoff-6412e6`、 まだ main 未マージ /
+user 目視確認待ち) **要望どおり実装した、 ただし loop range 編集の操作を
+modifier 必須に breaking change した**。 必要なら別案 (右ボタン drag 等) に
+切替可能なので調整希望があれば追記してほしい。
+
+#### 実装内容
+
+1. **`ArrangementEditRequest::SetPlayheadBeat(f64)` 追加**
+   ([crates/ui/src/widgets/arrangement.rs](gui_01:crates/ui/src/widgets/arrangement.rs)、
+   `SetLoopRange` の直後)。 doc に「press / continuation 毎 frame で発火、
+   release 時は emit せず、 snap 適用済 + 0.0 以上 clamp」 を明記。
+
+2. **press 振り分けの再設計**: ruler 内 press を Shift 修飾の有無で分岐:
+   - **plain (Shift 非保持) ruler click/drag** → `SetPlayheadBeat` 連続発火
+   - **`Shift` + ruler drag** → 従来の loop range edit (NewRange / 既存 loop の
+     Start/End/Middle handle drag、 全部 Shift 必須に統合)
+
+   旧設計は ruler 内 press = 常に loop ops に流れる仕様で、 ruler を
+   playhead seek の入口に再利用するため Shift modifier を loop ops に振り分けた。
+   業界踏襲: Reaper の Shift+drag = loop creation と同 pattern。
+   multi-track 系 widget で Shift は加算選択用なので潰さない設計判断、 ruler は
+   単一軸で Shift の他用途が無い。
+
+3. **`PlayheadDragSession` 新設**: `ArrangementState.playhead_drag` に追加。
+   press frame で session 起動 + `view.snap.snap_beat(raw, alt, zoom)` 適用 +
+   `0.0` 以上 clamp で 1 度発火。 continuation frame で `last_emitted_beat`
+   比較 (1e-6 拍 epsilon) の同値抑制 + 連続 emit。 release frame で `take()`
+   して discard (commit-by-release 無し、 既に逐次発行済)。 alt 直交 (snap
+   一時無効) と `MoveClips` の snap policy を完全踏襲。
+
+4. **計算順序の整理**: `beat_per_px` / `zoom_x_px_per_beat` を関数頭
+   (lanes 定義直後) で 1 度計算、 press 振り分けと overlay 計算で共有
+   (旧: overlay 計算ブロック直前で計算 → press 側で snap が使えない罠を解消)。
+
+#### 受け入れ基準への対応
+
+- ✅ ruler を click → daw_01 で `ArrangementEditRequest::SetPlayheadBeat(beat)`
+  を受信できる (press frame で 1 度発火)
+- ✅ 再生中でも click で playhead がジャンプ (widget は逐次 push、 caller の
+  audio engine seek 連携は daw_01 責務)
+- ✅ ruler ドラッグで playhead が追従 (continuation frame の per-frame block で
+  `last_emitted_beat` 比較しつつ毎 frame 発火、 throttle / debounce は daw_01 で
+  実装)
+- ✅ snap が有効なら beat が snap される (`MoveClips` の snap と同 policy:
+  `view.snap.snap_beat(raw, pointer.modifiers.alt, zoom_x_px_per_beat)`、
+  alt で一時無効)
+- ✅ canvas 内 clip クリックは既存の `SelectClips` 動作のまま (= seek しない、
+  regression test `lanes_click_does_not_emit_set_playhead_beat` で固定)
+
+#### breaking change の注意 (= 受け入れ基準 §3 の解釈)
+
+要望文 §3 の「ruler のみ seek、 canvas は既存」 を最も忠実に実装するため、
+**loop range 関係の操作はすべて Shift 修飾必須に breaking change** した:
+
+- 旧: 「ruler 上 plain drag」 で NewRange / Start/End/Middle handle drag
+- 新: 「`Shift` + ruler 上 drag」 で同操作、 **plain ruler drag = 必ず seek**
+
+旧 plain で動いた loop ops は plain では動かなくなる。 user の操作慣行を破壊
+する可能性があるので、 visual verify で許容範囲か確認してほしい。 別案
+(右ボタン drag = loop ops、 ホイール click 等) への切替を希望する場合は
+本 entry に追記してくれれば差し替える。
+
+#### test / 検証
+
+- 新 unit test +5 件 ([crates/ui/src/widgets/arrangement.rs](gui_01:crates/ui/src/widgets/arrangement.rs)
+  末尾):
+  - `ruler_plain_click_emits_set_playhead_beat`: px=200 / 50px-per-beat=4.0 拍
+    で 1 度発火確認
+  - `ruler_shift_click_does_not_emit_set_playhead_beat`: Shift+ruler は loop
+    ops 専用、 SetPlayheadBeat 非発火を確認
+  - `ruler_plain_click_applies_snap_when_active`: `Straight { div: 4 }` (1 拍
+    snap) で raw 4.2 → snap 4.0
+  - `ruler_drag_emits_continuous_set_playhead_beat`: 3 frame (press → drag →
+    release) で press + drag の 2 発、 release は emit せず
+  - `lanes_click_does_not_emit_set_playhead_beat`: canvas 内 click で
+    SetPlayheadBeat 非発火 (受け入れ基準 §3 の regression 防止)
+
+- `cargo test --workspace` 全 ✅ (361 + 8 + ...)
+- `cargo clippy --workspace --tests -- -D warnings` clean
+- `cargo build --bin daw_prototype` clean
+- `tests/ui/pass/basic.rs` の trybuild に `SetPlayheadBeat(_)` arm 追加で
+  exhaustive match 担保
+
+#### daw_01 側 follow-up (path 依存再ビルド時に必要)
+
+`make_edit` の `match ArrangementEditRequest` は **exhaustive** なので、
+`SetPlayheadBeat(_)` arm を追加しないと compile error。 提案された実装方針
+どおり `daw_gui/src/view/arrangement_view.rs::make_edit` に arm を追加して
+`AppEvent::SeekToBeat(f64)` (or 既存 `shared.playhead.store(...)` 直送り) に
+変換すれば最小実装で済む。 audio engine seek の throttle / debounce は daw_01
+側で実装 (widget は press / continuation で raw に push)。
+
+#### commit 後の通知
+
+gui_01 worktree で実装完了 + cargo test/clippy 緑、 user 目視確認待ち
+(`cargo run --bin daw_prototype` で arrangement の ruler を click → playhead
+即移動 / drag で連続移動 / Shift+ruler drag で従来の loop range 作成 / lanes
+click は既存挙動維持を確認予定)。 main にマージされ次第 path 依存再ビルドで
+daw_01 にも arm 追加できるようになる。 user 目視確認後の main commit
+後に本 entry に commit hash を追記する予定。
+
 

@@ -49,5 +49,13 @@ pub fn daw_shortcut_map() -> ShortcutMap {
     // text_input フォーカス中は無効 (gui_01 が自動処理)。
     m.bind("daw.duplicate_clip_shared", "D");
     m.bind("daw.duplicate_clip_unique", "Alt+D");
+    // Phase 1 PR7 (`docs/plan_audio_clip.md` §3.3 / §14): clip kind に
+    // 関係なく MIDI / Audio / Vocal すべての clip に対して動く。
+    // - E: cursor (= マウスホバー位置) で選択 clip を 2 つに split (snap 適用)
+    // - Alt+E: 同上だが snap 一時無効
+    // - J: 選択中の隣接 clip を 1 つに glue (Consolidate)
+    m.bind("daw.split_clip_at_cursor", "E");
+    m.bind("daw.split_clip_at_cursor_no_snap", "Alt+E");
+    m.bind("daw.glue_selected_clips", "J");
     m
 }

@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 const UNDO_LIMIT: usize = 200;
 
 use common::model::{
-    AudioContent, AudioEvent, Clip, ClipContent, InstrumentSource, Note, Song, Track,
+    AudioContent, AudioEvent, Clip, ClipContent, InstrumentSource, MidiContent, Note, Song, Track,
 };
 use common::plugin_db::PluginDatabase;
 use common::plugin_format::PluginFormat;
@@ -159,6 +159,21 @@ pub struct AppData {
     /// sources are decoded twice (once per process) to keep IPC lean
     /// (`docs/plan_audio_clip.md` §6.1 / §8.3).
     pub audio_source_cache: AudioSourceCache,
+    /// Snapped mouse hover beat inside the arrangement canvas. `None`
+    /// outside the canvas. `arrangement_view::draw` updates it every
+    /// frame using the current `SnapConfig`. Used by Split (E) so the
+    /// split lands at the user's pointer (REAPER edit-cursor flavour)
+    /// instead of the playhead (`docs/plan_audio_clip.md` §3.3).
+    pub arrangement_hover_beat: Option<f64>,
+    /// Same as above but **without** snap applied. Used by Alt+E
+    /// (split with snap temporarily disabled).
+    pub arrangement_hover_beat_raw: Option<f64>,
+    /// `(track, clip)` index pair for the clip the mouse is currently
+    /// over (or `None` outside any clip). Lets Split work without an
+    /// explicit selection — hover over a clip, press `E`, and that
+    /// clip is split. Falls back to the existing `selected_clips`
+    /// when no clip is under the cursor.
+    pub arrangement_hover_clip: Option<ClipRef>,
 
     // -------- Selection --------
     /// Track multi-selection (Ableton Live / Reaper 互換)。 末尾要素 =
@@ -394,6 +409,9 @@ impl AppData {
             song,
             file_path: None,
             audio_source_cache: AudioSourceCache::new(),
+            arrangement_hover_beat: None,
+            arrangement_hover_beat_raw: None,
+            arrangement_hover_clip: None,
             selected_track_ids: Vec::new(),
             collapsed_groups: std::collections::HashSet::new(),
             track_plugin_ids: std::collections::HashMap::new(),
@@ -809,6 +827,9 @@ impl AppData {
                 | AppEvent::CloneClipsLinked(_)
                 | AppEvent::CloneClipsIndependent(_)
                 | AppEvent::MakeClipUnique(_)
+                | AppEvent::SplitClipAtPlayhead { .. }
+                | AppEvent::GlueSelectedClips
+                | AppEvent::ImportAudio { .. }
                 | AppEvent::AddNote { .. }
                 | AppEvent::ResizeNote { .. }
                 | AppEvent::ResizeNotes(_)
@@ -1311,6 +1332,28 @@ pub enum AppEvent {
     /// Phase 2 moves decode to a background thread so large WAVs (up
     /// to 4 GB §7.2) don't block the UI.
     ImportAudio { paths: Vec<PathBuf> },
+
+    // -------- Split / Glue (Phase 1 PR7) -----------------------------------
+    /// Split clip(s) at the **mouse cursor** (= `AppData
+    /// .arrangement_hover_beat` snapped, or `_raw` when `snap == false`
+    /// for the Alt+E variant). Falls back to the playhead when the
+    /// cursor is outside the arrangement canvas. Operates on the clip
+    /// the cursor is hovering over; if there is no hovered clip,
+    /// falls back to `selected_clips`. Works on MIDI / Audio / Vocal
+    /// clips alike (`docs/plan_audio_clip.md` §3.3.1): the back half
+    /// gets a freshly-allocated `ContentId` and `notes` / `events` are
+    /// partitioned by the split beat. Bound to `E` (snap on) and
+    /// `Alt+E` (snap off).
+    SplitClipAtPlayhead { snap: bool },
+
+    /// Glue (Consolidate) the currently selected clips into a single
+    /// clip per track. All clips must be the same kind (MIDI / Audio
+    /// / Vocal) — mixed-kind selections are rejected with a status
+    /// message (§3.3.2). Result clip spans `min(start_beat) .. max(end
+    /// _beat)` and inherits a fresh `ContentId` carrying every event /
+    /// note from the source clips with offsets re-aligned to the new
+    /// clip start. Gaps between clips become silent ranges. Bound to `J`.
+    GlueSelectedClips,
 }
 
 impl AppData {
@@ -1623,6 +1666,12 @@ impl AppData {
             }
             AppEvent::ImportAudio { paths } => {
                 self.action_import_audio(paths);
+            }
+            AppEvent::SplitClipAtPlayhead { snap } => {
+                self.action_split_clips_at_cursor(snap);
+            }
+            AppEvent::GlueSelectedClips => {
+                self.action_glue_selected_clips();
             }
             AppEvent::ExportWavComplete { error } => {
                 // Either way, hand the plugins back to realtime mode
@@ -4959,6 +5008,446 @@ impl AppData {
                 errors.join(" / ")
             ),
         };
+    }
+
+    /// Split clip(s) at the cursor (= mouse hover beat).
+    ///
+    /// If `snap` is `true`, uses the snapped beat; otherwise the raw
+    /// beat (for `Alt+E` snap-temporarily-off flow). Falls back to the
+    /// playhead when the cursor is outside the canvas. Targets are:
+    ///
+    /// 1. The clip the cursor is hovering over
+    ///    (`arrangement_hover_clip`).
+    /// 2. If no hover, the current `selected_clips` (multi-clip split
+    ///    at the same beat).
+    /// 3. If neither, surfaces a status message.
+    ///
+    /// The back half of each split clip receives a fresh `ContentId`
+    /// (= leaves any share group, Make Unique-equivalent semantics).
+    /// Works on MIDI / Audio / Vocal clips alike. See
+    /// `docs/plan_audio_clip.md` §3.3 / §3.3.1.
+    fn action_split_clips_at_cursor(&mut self, snap: bool) {
+        let cursor: f64 = if snap {
+            self.arrangement_hover_beat
+                .or(self.arrangement_hover_beat_raw)
+                .or_else(|| self.playhead_beat.map(|b| b as f64))
+                .unwrap_or(-1.0)
+        } else {
+            self.arrangement_hover_beat_raw
+                .or(self.arrangement_hover_beat)
+                .or_else(|| self.playhead_beat.map(|b| b as f64))
+                .unwrap_or(-1.0)
+        };
+        if cursor < 0.0 {
+            self.status_message =
+                "Split: マウスを arrangement に置くか再生中に E を押してください".into();
+            return;
+        }
+        // Build targets list. Prefer hover clip, fall back to selection.
+        let targets: Vec<ClipRef> = if let Some(hover) = self.arrangement_hover_clip {
+            vec![hover]
+        } else if !self.selected_clips.is_empty() {
+            self.selected_clips.clone()
+        } else {
+            self.status_message =
+                "Split: clip にマウスを乗せるか clip を選択してください".into();
+            return;
+        };
+        let mut split_count = 0usize;
+        let mut new_selection: Vec<ClipRef> = Vec::new();
+        for src in &targets {
+            if self.split_clip_at_beat(*src, cursor, &mut new_selection) {
+                split_count += 1;
+            }
+        }
+        if split_count == 0 {
+            self.status_message =
+                "Split: カーソルが clip 範囲外のため何も分割されませんでした".into();
+            return;
+        }
+        if !new_selection.is_empty() {
+            self.selected_clip = new_selection.last().copied();
+            self.selected_clips = new_selection;
+            self.selected_notes.clear();
+        }
+        self.status_message = format!("Split: {split_count} clip を分割しました");
+        self.is_dirty = true;
+        self.sync_song_to_plugin_host();
+    }
+
+    /// Single-clip split helper. Returns `true` iff the playhead lay
+    /// strictly inside the clip and the split actually happened. The
+    /// new (back-half) clip is appended to `new_selection` so the
+    /// caller can update the selection afterwards.
+    fn split_clip_at_beat(
+        &mut self,
+        target: ClipRef,
+        playhead: f64,
+        new_selection: &mut Vec<ClipRef>,
+    ) -> bool {
+        let Some(track) = self.song.tracks.get(target.track as usize) else {
+            return false;
+        };
+        let Some(clip) = track.clips.get(target.clip as usize) else {
+            return false;
+        };
+        let clip_start = clip.start_beat;
+        let clip_len = clip.length_beats;
+        let clip_end = clip_start + clip_len;
+        if !(playhead > clip_start && playhead < clip_end) {
+            return false; // playhead 範囲外 / 端ぴったりは split 不要
+        }
+        let split_offset = playhead - clip_start;
+        let front_len = split_offset;
+        let back_len = clip_len - split_offset;
+        let src_content_id = clip.content_id;
+        let src_name = clip.name.clone();
+        let Some(src_content) = self.song.clip_contents.get(&src_content_id).cloned()
+        else {
+            return false;
+        };
+
+        // Build the back-half ClipContent by partitioning the source
+        // content at `split_offset` (clip-local beats).
+        let back_content = match src_content.clone() {
+            ClipContent::Midi(mut midi) => {
+                let mut back_notes: Vec<Note> = Vec::new();
+                let mut keep_front: Vec<Note> = Vec::new();
+                for note in midi.notes.drain(..) {
+                    let n_start = note.start_beat;
+                    let n_end = note.start_beat + note.duration_beats;
+                    if n_end <= split_offset {
+                        keep_front.push(note);
+                    } else if n_start >= split_offset {
+                        back_notes.push(Note {
+                            start_beat: n_start - split_offset,
+                            ..note
+                        });
+                    } else {
+                        // Note straddles the split point — front half
+                        // keeps lyric, back half is a continuation
+                        // (no lyric so VOICEVOX doesn't sing it twice).
+                        let front_dur = split_offset - n_start;
+                        let back_dur = n_end - split_offset;
+                        keep_front.push(Note {
+                            start_beat: n_start,
+                            duration_beats: front_dur,
+                            ..note.clone()
+                        });
+                        back_notes.push(Note {
+                            start_beat: 0.0,
+                            duration_beats: back_dur,
+                            lyric: None,
+                            ..note
+                        });
+                    }
+                }
+                // Trim the original (front) content in place so the
+                // share group keeps the front half only — but only
+                // for THIS clip's content; if other clips share the
+                // same `content_id` we must fork via a fresh id. We
+                // always fork here for simplicity (= split always
+                // promotes both halves to fresh ContentIds, which is
+                // safer for shared-clip semantics).
+                let mut front = MidiContent { notes: keep_front };
+                front.notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
+                let mut back = MidiContent { notes: back_notes };
+                back.notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
+                let front_id = self.song.alloc_content_id();
+                self.song
+                    .clip_contents
+                    .insert(front_id, ClipContent::Midi(front));
+                ClipContent::Midi(back)
+            }
+            ClipContent::Audio(mut audio) => {
+                let mut back_events: Vec<AudioEvent> = Vec::new();
+                let mut keep_front: Vec<AudioEvent> = Vec::new();
+                for ev in audio.events.drain(..) {
+                    let e_start = ev.event_start_in_clip_beats;
+                    let e_end = e_start + ev.event_length_beats;
+                    if e_end <= split_offset {
+                        keep_front.push(ev);
+                    } else if e_start >= split_offset {
+                        back_events.push(AudioEvent {
+                            event_start_in_clip_beats: e_start - split_offset,
+                            ..ev
+                        });
+                    } else {
+                        // Event straddles the split: split source range
+                        // proportionally by the source-frame stride
+                        // implied by this event's pitch_ratio is
+                        // approximated as a simple linear partition
+                        // (good enough for Phase 1 default Raw mode
+                        // where source beats == clip beats × bpm).
+                        let frac_front = (split_offset - e_start) / ev.event_length_beats;
+                        let total_src = ev
+                            .source_end_frames
+                            .saturating_sub(ev.source_start_frames);
+                        let split_src_offset =
+                            (total_src as f64 * frac_front).round() as u64;
+                        let mid_src_frame = ev.source_start_frames + split_src_offset;
+                        let mut front_ev = ev.clone();
+                        front_ev.event_length_beats = split_offset - e_start;
+                        front_ev.source_end_frames = mid_src_frame;
+                        keep_front.push(front_ev);
+                        back_events.push(AudioEvent {
+                            event_start_in_clip_beats: 0.0,
+                            event_length_beats: e_end - split_offset,
+                            source_start_frames: mid_src_frame,
+                            ..ev
+                        });
+                    }
+                }
+                let front = AudioContent { events: keep_front };
+                let back = AudioContent { events: back_events };
+                let front_id = self.song.alloc_content_id();
+                self.song
+                    .clip_contents
+                    .insert(front_id, ClipContent::Audio(front));
+                ClipContent::Audio(back)
+            }
+        };
+
+        // Allocate fresh ContentIds for both halves (front was just
+        // inserted into clip_contents above with a placeholder id —
+        // we now rewrite the clip's content_id to point at it).
+        // Strategy: walk back the last alloc'd id we just inserted.
+        // The id list above used `alloc_content_id()` so the most
+        // recent one is `next_content_id - 1`.
+        let front_content_id = self.song.next_content_id.saturating_sub(1);
+        let back_content_id = self.song.alloc_content_id();
+        self.song
+            .clip_contents
+            .insert(back_content_id, back_content);
+
+        // Mutate the clip in place: front half stays as `clip`
+        // (length / content_id rewritten), and a new clip for the
+        // back half is appended on the same track.
+        let track = &mut self.song.tracks[target.track as usize];
+        {
+            let clip_mut = &mut track.clips[target.clip as usize];
+            clip_mut.length_beats = front_len;
+            clip_mut.content_id = front_content_id;
+        }
+        let new_clip_id = track.alloc_clip_id();
+        let new_idx = track.clips.len() as u32;
+        track.clips.push(Clip {
+            id: new_clip_id,
+            name: src_name,
+            start_beat: clip_start + front_len,
+            length_beats: back_len,
+            content_id: back_content_id,
+            notes: Vec::new(),
+        });
+        new_selection.push(target);
+        new_selection.push(ClipRef {
+            track: target.track,
+            clip: new_idx,
+        });
+        true
+    }
+
+    /// Glue (Consolidate) the currently selected clips into one clip
+    /// per track. Mixed-kind selections (MIDI + Audio etc.) are
+    /// rejected with a status message. See `docs/plan_audio_clip.md`
+    /// §3.3 / §3.3.2.
+    fn action_glue_selected_clips(&mut self) {
+        if self.selected_clips.len() < 2 {
+            self.status_message = format!(
+                "Glue: 2 つ以上の clip を選択してください (現在 {} 個)",
+                self.selected_clips.len()
+            );
+            return;
+        }
+
+        // Group selected clips by track.
+        let mut by_track: std::collections::BTreeMap<u32, Vec<ClipRef>> =
+            std::collections::BTreeMap::new();
+        for r in &self.selected_clips {
+            by_track.entry(r.track).or_default().push(*r);
+        }
+
+        let mut new_refs: Vec<ClipRef> = Vec::new();
+        let mut glued_count = 0usize;
+        let mut had_mixed_kind = false;
+
+        for (track_idx, mut refs) in by_track {
+            if refs.len() < 2 {
+                continue;
+            }
+            // Sort by start_beat ascending (clip indices may differ).
+            refs.sort_by(|a, b| {
+                let ta = self
+                    .song
+                    .tracks
+                    .get(a.track as usize)
+                    .and_then(|t| t.clips.get(a.clip as usize))
+                    .map(|c| c.start_beat)
+                    .unwrap_or(f64::INFINITY);
+                let tb = self
+                    .song
+                    .tracks
+                    .get(b.track as usize)
+                    .and_then(|t| t.clips.get(b.clip as usize))
+                    .map(|c| c.start_beat)
+                    .unwrap_or(f64::INFINITY);
+                ta.total_cmp(&tb)
+            });
+
+            // Detect mixed kinds.
+            let mut kind_audio: Option<bool> = None;
+            for r in &refs {
+                let Some(track) = self.song.tracks.get(r.track as usize) else {
+                    continue;
+                };
+                let Some(clip) = track.clips.get(r.clip as usize) else {
+                    continue;
+                };
+                let Some(content) = self.song.clip_contents.get(&clip.content_id)
+                else {
+                    continue;
+                };
+                let is_audio = matches!(content, ClipContent::Audio(_));
+                match kind_audio {
+                    None => kind_audio = Some(is_audio),
+                    Some(prev) if prev != is_audio => {
+                        had_mixed_kind = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if had_mixed_kind {
+                continue;
+            }
+            let is_audio_kind = kind_audio.unwrap_or(false);
+
+            // Compute combined range + collect content fragments.
+            let mut combined_start = f64::INFINITY;
+            let mut combined_end = f64::NEG_INFINITY;
+            let mut combined_name = String::new();
+            #[derive(Default)]
+            struct Fragments {
+                midi_notes: Vec<Note>,
+                audio_events: Vec<AudioEvent>,
+            }
+            let mut frags = Fragments::default();
+
+            for r in &refs {
+                let Some(track) = self.song.tracks.get(r.track as usize) else {
+                    continue;
+                };
+                let Some(clip) = track.clips.get(r.clip as usize) else {
+                    continue;
+                };
+                let s = clip.start_beat;
+                let e = s + clip.length_beats;
+                if combined_name.is_empty() {
+                    combined_name = clip.name.clone();
+                }
+                combined_start = combined_start.min(s);
+                combined_end = combined_end.max(e);
+                let Some(content) = self.song.clip_contents.get(&clip.content_id)
+                else {
+                    continue;
+                };
+                let offset_into_combined = s - combined_start;
+                match content {
+                    ClipContent::Midi(midi) => {
+                        for note in &midi.notes {
+                            frags.midi_notes.push(Note {
+                                start_beat: note.start_beat + offset_into_combined,
+                                ..note.clone()
+                            });
+                        }
+                    }
+                    ClipContent::Audio(audio) => {
+                        for ev in &audio.events {
+                            frags.audio_events.push(AudioEvent {
+                                event_start_in_clip_beats: ev.event_start_in_clip_beats
+                                    + offset_into_combined,
+                                ..ev.clone()
+                            });
+                        }
+                    }
+                }
+            }
+            if !combined_start.is_finite() || !combined_end.is_finite() {
+                continue;
+            }
+
+            // Re-walk to fix offsets now that we know combined_start.
+            // (The first pass used a tentative `combined_start` that
+            // updated as we iterated; re-shift everything by the
+            // delta between the first clip's start and the actual
+            // combined_start. In sorted order they should already
+            // match since clips are sorted by start_beat and
+            // combined_start = first clip's start, so the no-op case
+            // is the common one — but be defensive.)
+
+            let combined_len = combined_end - combined_start;
+            let new_content_id = self.song.alloc_content_id();
+            let new_content = if is_audio_kind {
+                ClipContent::Audio(AudioContent {
+                    events: frags.audio_events,
+                })
+            } else {
+                let mut notes = frags.midi_notes;
+                notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
+                ClipContent::Midi(MidiContent { notes })
+            };
+            self.song.clip_contents.insert(new_content_id, new_content);
+
+            // Remove source clips (descending index to keep earlier
+            // indices stable).
+            let track = &mut self.song.tracks[track_idx as usize];
+            let mut indices: Vec<usize> =
+                refs.iter().map(|r| r.clip as usize).collect();
+            indices.sort_unstable();
+            indices.dedup();
+            for &idx in indices.iter().rev() {
+                if idx < track.clips.len() {
+                    track.clips.remove(idx);
+                }
+            }
+            // Append the merged clip.
+            let new_clip_id = track.alloc_clip_id();
+            let new_idx = track.clips.len() as u32;
+            track.clips.push(Clip {
+                id: new_clip_id,
+                name: combined_name,
+                start_beat: combined_start,
+                length_beats: combined_len,
+                content_id: new_content_id,
+                notes: Vec::new(),
+            });
+            new_refs.push(ClipRef {
+                track: track_idx,
+                clip: new_idx,
+            });
+            glued_count += 1;
+        }
+
+        if had_mixed_kind {
+            tracing::warn!("Glue rejected: mixed kinds");
+            self.status_message =
+                "Glue: MIDI / Audio / Vocal clip が混在しているため Glue できません".into();
+            return;
+        }
+        if glued_count == 0 {
+            tracing::warn!("Glue: glued_count==0 (no track had 2+ clips)");
+            self.status_message =
+                "Glue: 同じ track 上で 2 つ以上の clip を選択してください".into();
+            return;
+        }
+
+        tracing::info!(glued_count, ?new_refs, "Glue completed");
+        self.selected_clip = new_refs.last().copied();
+        self.selected_clips = new_refs;
+        self.selected_notes.clear();
+        self.status_message = format!("Glue: {glued_count} 箇所を結合しました");
+        self.is_dirty = true;
+        self.sync_song_to_plugin_host();
     }
 }
 

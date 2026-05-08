@@ -320,6 +320,25 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }));
     }
 
+    // ----- Split (E) / Glue (J) — Phase 1 PR7 -------------------------------
+    // MIDI / Audio / Vocal すべての clip kind に対して動作する統合操作。
+    // 詳細は `docs/plan_audio_clip.md` §3.3。
+    if ui.take_shortcut("daw.split_clip_at_cursor") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::SplitClipAtPlayhead { snap: true });
+        }));
+    }
+    if ui.take_shortcut("daw.split_clip_at_cursor_no_snap") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::SplitClipAtPlayhead { snap: false });
+        }));
+    }
+    if ui.take_shortcut("daw.glue_selected_clips") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::GlueSelectedClips);
+        }));
+    }
+
     // ----- Help -----
     if ui.take_shortcut("daw.toggle_help") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {

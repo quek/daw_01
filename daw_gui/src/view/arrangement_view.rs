@@ -271,13 +271,69 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             0.0,
         );
     }
-    if let Some(paths) = ui.take_file_drop_in_rect(canvas_area) {
-        // Phase 1 PR3: paths 経由で `ImportAudio` を発火。 drop 座標
-        // → (target_track, target_beat) の解決は PR4 で改善。 現状は
-        // handler 側で「最初の track の playhead 位置に縦並び配置」
-        // を default にしている (`docs/plan_audio_clip.md` §3.1)。
+    if let Some(drop) = ui.take_file_drop_in_rect(canvas_area) {
+        // gui_01 #023 (resolved): `take_file_drop_in_rect` の戻り値が
+        // `DroppedFiles { paths, position }` になったので drop position
+        // から (target_track, target_beat) を解決可能。 ただし現状の
+        // `AppEvent::ImportAudio { paths }` 経路は target を持たない
+        // (handler 側 cursor_track にフォールバック) ので、 まずは paths
+        // だけ取り出して既存挙動を維持。 PR4 範囲で target 解決を追加
+        // する際にここで position から (track, beat) を計算する。
+        let paths = drop.paths;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::ImportAudio { paths });
+        }));
+    }
+
+    // Phase 1 PR7 (`docs/plan_audio_clip.md` §3.3): Split (E) は
+    // 「マウスカーソル位置」 で分割するため、 毎フレーム mouse pos →
+    // beat と (track, clip) を計算して `AppData` に push する。
+    // - `arrangement_hover_beat` は snap 適用版 (E 用)
+    // - `arrangement_hover_beat_raw` は snap なし版 (Alt+E 用)
+    // - `arrangement_hover_clip` はマウスが乗っている clip の (track, clip)
+    //   index — Split が selection 不要で動くために使う
+    let raw_beat: Option<f64> = ui.pointer().pos.and_then(|(px, py)| {
+        if !canvas_area.contains(px, py) {
+            return None;
+        }
+        let beat =
+            view.start_beat + ((px - canvas_area.x) as f64 / zoom as f64);
+        Some(beat.max(0.0))
+    });
+    let snapped_beat: Option<f64> = raw_beat
+        .map(|raw| view.snap.snap_beat(raw, /* alt: */ false, zoom));
+    let hover_clip: Option<ClipRef> = raw_beat.and_then(|beat| {
+        // Mouse y → track index. arrangement widget uses
+        // `track_top + (track_idx - top) * track_row_h` for ruler-aware
+        // layout. We approximate via `(py - canvas_top) / row_h` since
+        // there's no scroll-y on Phase 1 (track_top is 0 for default).
+        let (_, py) = ui.pointer().pos?;
+        let row_h = row_h.max(1.0);
+        let canvas_top = canvas_area.y;
+        let local_y = py - canvas_top;
+        if local_y < 0.0 {
+            return None;
+        }
+        let track_idx = (local_y / row_h) as usize;
+        let track = app.song.tracks.get(track_idx)?;
+        for (clip_idx, clip) in track.clips.iter().enumerate() {
+            if beat >= clip.start_beat && beat < clip.start_beat + clip.length_beats {
+                return Some(ClipRef {
+                    track: track_idx as u32,
+                    clip: clip_idx as u32,
+                });
+            }
+        }
+        None
+    });
+    if app.arrangement_hover_beat != snapped_beat
+        || app.arrangement_hover_beat_raw != raw_beat
+        || app.arrangement_hover_clip != hover_clip
+    {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.arrangement_hover_beat = snapped_beat;
+            app.arrangement_hover_beat_raw = raw_beat;
+            app.arrangement_hover_clip = hover_clip;
         }));
     }
 }
