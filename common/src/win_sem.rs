@@ -6,7 +6,11 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::HSTRING;
 
-const INFINITE_MS: u32 = 0xFFFF_FFFF;
+/// `WaitForSingleObject` の「無期限待機」センチネル。 ミリ秒値ではなく、
+/// `0xFFFF_FFFF` (`INFINITE`) は「タイムアウトしない」を意味する Windows API
+/// の特殊値 (winbase.h)。 `wait_timeout_ms` の引数 (実数 ms) と混同しないよう
+/// 別名で保持する。
+const WAIT_INFINITE: u32 = 0xFFFF_FFFF;
 
 /// RAII wrapper around a Win32 named semaphore.
 pub struct Semaphore {
@@ -32,7 +36,7 @@ impl Semaphore {
     }
 
     pub fn wait(&self) -> Result<()> {
-        let r = unsafe { WaitForSingleObject(self.handle, INFINITE_MS) };
+        let r = unsafe { WaitForSingleObject(self.handle, WAIT_INFINITE) };
         anyhow::ensure!(r == WAIT_OBJECT_0, "WaitForSingleObject returned {r:?}");
         Ok(())
     }

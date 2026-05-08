@@ -38,13 +38,31 @@ pub fn ensure_recovery_dir() -> std::io::Result<PathBuf> {
 }
 
 /// recovery_dir 内の `*.autosave.daw` を列挙。 ディレクトリが無ければ空 vec。
-/// I/O エラーは log のみで握る (起動シーケンスを止めない)。
+/// I/O エラーは tracing::warn! で記録した上で空 vec を返し、起動シーケンスを止めない。
+/// `NotFound` (初回起動で recovery dir 未作成) は警告対象外。
 pub fn scan_recovery_files() -> Vec<PathBuf> {
-    let Some(dir) = recovery_dir() else { return Vec::new() };
-    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let Some(dir) = recovery_dir() else {
+        tracing::warn!("recovery scan skipped: could not resolve %LOCALAPPDATA%");
+        return Vec::new();
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(error = ?e, dir = ?dir, "recovery dir read failed");
+            return Vec::new();
+        }
+    };
     let mut out = Vec::new();
-    for e in entries.flatten() {
-        let p = e.path();
+    for e in entries {
+        let entry = match e {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!(error = ?e, dir = ?dir, "recovery dir entry read failed");
+                continue;
+            }
+        };
+        let p = entry.path();
         if p.is_file()
             && p.file_name()
                 .and_then(|n| n.to_str())

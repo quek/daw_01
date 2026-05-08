@@ -225,6 +225,15 @@ pub struct LocalState {
     /// `engine heartbeat` to once per second of audio time.
     #[cfg(debug_assertions)]
     pub last_heartbeat_playhead: u64,
+    /// Debug-only: pre-allocated scratch for the heartbeat log so the RT
+    /// path doesn't allocate when the throttle window opens. Cleared and
+    /// re-extended on each emit; capacity is sized at construction.
+    #[cfg(debug_assertions)]
+    pub heartbeat_track_peaks: Vec<(f32, f32, bool)>,
+    #[cfg(debug_assertions)]
+    pub heartbeat_plugin_ids: Vec<u32>,
+    #[cfg(debug_assertions)]
+    pub heartbeat_slot_keys: Vec<((u32, PluginSlot), u32)>,
 }
 
 impl LocalState {
@@ -245,6 +254,14 @@ impl LocalState {
             cached_song: None,
             #[cfg(debug_assertions)]
             last_heartbeat_playhead: 0,
+            #[cfg(debug_assertions)]
+            heartbeat_track_peaks: Vec::with_capacity(MAX_TRACKS),
+            // 上限は実態に合わせた hint。超えても Vec が伸びるだけだが、
+            // steady-state で MAX_TRACKS * 4 slot を超えるケースは稀。
+            #[cfg(debug_assertions)]
+            heartbeat_plugin_ids: Vec::with_capacity(MAX_TRACKS * 4),
+            #[cfg(debug_assertions)]
+            heartbeat_slot_keys: Vec::with_capacity(MAX_TRACKS * 4),
         }
     }
 
@@ -576,6 +593,11 @@ impl LocalState {
             // engine's view of the world so we can tell whether the
             // dispatch reached plugin.process(), what came back, and
             // why master might be silent.
+            // Debug-only heartbeat. RT 規約上 audio thread での tracing は
+            // 望ましくないが、開発時に engine 状態を可視化できる利点が
+            // 大きいので debug ビルド限定で残す。release では消える。
+            // pre-allocated buffer (`heartbeat_*`) を `clear()+extend()` で
+            // 再利用するので heap alloc は (capacity 内なら) 発生しない。
             #[cfg(debug_assertions)]
             {
                 let sr = sample_rate as u64;
@@ -587,22 +609,26 @@ impl LocalState {
                         .iter()
                         .chain(self.master_r[..n].iter())
                         .fold(0.0_f32, |a, &b| a.max(b.abs()));
-                    let track_peaks: Vec<(f32, f32, bool)> = self
-                        .scratch
-                        .iter()
-                        .take(n_tracks)
-                        .map(|s| (s.peak_l, s.peak_r, s.effective_mute))
-                        .collect();
-                    let plugin_ids: Vec<u32> = plugin_refs_g.keys().copied().collect();
-                    let slot_keys: Vec<((u32, PluginSlot), u32)> =
-                        slot_map_g.iter().map(|(k, v)| (*k, *v)).collect();
+                    self.heartbeat_track_peaks.clear();
+                    self.heartbeat_track_peaks.extend(
+                        self.scratch
+                            .iter()
+                            .take(n_tracks)
+                            .map(|s| (s.peak_l, s.peak_r, s.effective_mute)),
+                    );
+                    self.heartbeat_plugin_ids.clear();
+                    self.heartbeat_plugin_ids
+                        .extend(plugin_refs_g.keys().copied());
+                    self.heartbeat_slot_keys.clear();
+                    self.heartbeat_slot_keys
+                        .extend(slot_map_g.iter().map(|(k, v)| (*k, *v)));
                     tracing::info!(
                         playing,
                         playhead,
                         master_peak,
-                        ?track_peaks,
-                        ?plugin_ids,
-                        ?slot_keys,
+                        track_peaks = ?self.heartbeat_track_peaks,
+                        plugin_ids = ?self.heartbeat_plugin_ids,
+                        slot_keys = ?self.heartbeat_slot_keys,
                         n_workers = worker_syncs_g.len(),
                         worker_pool = pool_g.is_some(),
                         audio_clip_n_events = audio_renderer.schedule.len(),

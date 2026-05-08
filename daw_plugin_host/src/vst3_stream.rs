@@ -86,7 +86,14 @@ impl IBStreamTrait for Vst3WriteStream {
         }
         let n = num_bytes as usize;
         let inner = &mut *self.inner.get();
-        let end = inner.pos + n;
+        // pos + n は理論上 usize オーバーフロー可能 (n ≤ i32::MAX を繰り返すと
+        // 2GB stream で破綻)。checked_add で防御。
+        let Some(end) = inner.pos.checked_add(n) else {
+            if !num_bytes_written.is_null() {
+                *num_bytes_written = 0;
+            }
+            return kInvalidArgument;
+        };
         if end > inner.buf.len() {
             inner.buf.resize(end, 0);
         }
