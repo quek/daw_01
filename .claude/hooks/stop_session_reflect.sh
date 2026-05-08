@@ -25,7 +25,7 @@ SESSION_ID=$(printf '%s' "$INPUT" | sed -n 's/.*"session_id":[[:space:]]*"\([^"]
 [ -f "$TRANSCRIPT" ] || exit 0
 [ -d "$CWD" ] || exit 0
 
-LATEST_USER=$(tac "$TRANSCRIPT" 2>/dev/null | awk '/"(type|role)"[[:space:]]*:[[:space:]]*"user"/ {print; exit}' || true)
+LATEST_USER=$(tac "$TRANSCRIPT" 2>/dev/null | awk '/"role"[[:space:]]*:[[:space:]]*"user"/ && !/tool_use_id/ && !/tool_result/ {print; exit}' || true)
 [ -n "$LATEST_USER" ] || exit 0
 
 PATTERNS='違う|そうじゃ|間違|ではなく|でなく|ぎませんか|過ぎ|すぎ|ないんですか|じゃないですか|やめて|代わりに|wrong|incorrect|"no,|don'\''t|instead|actually'
