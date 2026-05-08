@@ -34,10 +34,13 @@
 //!   buffer) を埋め込む。 bincode v2 + struct field 追加は backward
 //!   compat なので migration なしで読める
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result, bail};
 use bincode::{Decode, Encode};
 use common::plugin_db::BUILTIN_ID_VOICEVOX;
 use common::plugin_format::PluginFormat;
+use common::plugin_metadata::NoteMetadata;
 use common::protocol::RenderMode;
 
 use crate::plugin_instance::{AuxInputBuf, LoadedPlugin, TimedNoteEvent};
@@ -72,6 +75,12 @@ pub struct VoicevoxBuiltin {
     out_r: Vec<f32>,
     sample_rate: f64,
     activated: bool,
+    /// `note_id → 歌詞`。 PR-V2.2 で host 側 `set_note_metadata` flush
+    /// から受信。 PR-V2.3 で `singing_query` payload を構築するときに
+    /// 参照。 lifetime は plugin instance と同じ (= deactivate / drop で
+    /// クリア)、 Bulk synth 完了後はそのまま保持し re-synth 時に diff を
+    /// 取る。
+    lyrics: HashMap<u32, String>,
 }
 
 impl VoicevoxBuiltin {
@@ -82,7 +91,14 @@ impl VoicevoxBuiltin {
             out_r: Vec::new(),
             sample_rate: 0.0,
             activated: false,
+            lyrics: HashMap::new(),
         }
+    }
+
+    /// テスト・debug 用に内部の lyrics map を読み出す。
+    #[cfg(test)]
+    pub fn lyrics_for_test(&self) -> &HashMap<u32, String> {
+        &self.lyrics
     }
 }
 
@@ -193,6 +209,21 @@ impl LoadedPlugin for VoicevoxBuiltin {
         Ok(())
     }
 
+    fn set_note_metadata(&mut self, entries: &[NoteMetadata]) {
+        // PR-V2.2: 内部 HashMap を完全置換 (= 「現在の clip 内 notes 全部」
+        // を毎回 flush する設計)。 差分追従は PR-V2.3 の bulk synth で
+        // 「diff があるなら re-synth、 同一なら cache hit」 という形で
+        // 行うので、 ここは単純に最新値を保持するだけ。
+        self.lyrics.clear();
+        for e in entries {
+            self.lyrics.insert(e.note_id, e.lyric.clone());
+        }
+        tracing::debug!(
+            count = self.lyrics.len(),
+            "VoicevoxBuiltin: lyrics buffer updated"
+        );
+    }
+
     // --- Embedded GUI (PR-V2.4 で speaker picker / progress bar を追加) ----
     fn gui_is_embed_supported(&self) -> bool {
         false
@@ -286,5 +317,32 @@ mod tests {
         let (s, _): (VoicevoxState, usize) =
             bincode::decode_from_slice(&bytes, cfg).unwrap();
         assert_eq!(s, VoicevoxState::default());
+    }
+
+    #[test]
+    fn set_note_metadata_replaces_lyrics_buffer() {
+        let mut p = VoicevoxBuiltin::new();
+        // 初回: 3 件 flush。
+        p.set_note_metadata(&[
+            NoteMetadata { note_id: 0, lyric: "あ".to_string() },
+            NoteMetadata { note_id: 1, lyric: "い".to_string() },
+            NoteMetadata { note_id: 2, lyric: "う".to_string() },
+        ]);
+        let lyrics = p.lyrics_for_test();
+        assert_eq!(lyrics.len(), 3);
+        assert_eq!(lyrics.get(&1).map(String::as_str), Some("い"));
+
+        // 2 回目: 完全置換 (= 既存 entry 消える)。
+        p.set_note_metadata(&[
+            NoteMetadata { note_id: 5, lyric: "え".to_string() },
+        ]);
+        let lyrics = p.lyrics_for_test();
+        assert_eq!(lyrics.len(), 1);
+        assert!(lyrics.get(&0).is_none());
+        assert_eq!(lyrics.get(&5).map(String::as_str), Some("え"));
+
+        // 空 flush で全消去。
+        p.set_note_metadata(&[]);
+        assert_eq!(p.lyrics_for_test().len(), 0);
     }
 }

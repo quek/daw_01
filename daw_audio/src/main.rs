@@ -401,6 +401,7 @@ async fn recv_loop(
             | Ok(MainToChild::CloseSlotGui { .. })
             | Ok(MainToChild::ResizeSlotGui { .. })
             | Ok(MainToChild::SetRenderMode(_))
+            | Ok(MainToChild::SetBuiltinPluginNoteMetadata { .. })
             | Ok(MainToChild::CloseWorkerPool) => {}
             Err(e) => {
                 tracing::info!(error = ?e, "receive loop ending");

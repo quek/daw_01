@@ -229,6 +229,15 @@ enum PluginCommand {
     /// Set every loaded plugin's CLAP render mode (Realtime ↔ Offline).
     /// Sent by daw_audio bookending an offline export.
     SetRenderMode(RenderMode),
+    /// Builtin plugin (`PluginFormat::Builtin`) に per-note metadata を
+    /// flush する (PR-V2.2)。 plugin-main thread で plugin instance に
+    /// `LoadedPlugin::set_note_metadata` を呼ぶ。 plugin_id に該当する
+    /// slot が無い / CLAP / VST3 plugin の場合は default no-op で吸収
+    /// (= warning も発生しない、 IPC 経路は format-neutral)。
+    SetBuiltinPluginNoteMetadata {
+        plugin_id: u32,
+        entries: Vec<common::plugin_metadata::NoteMetadata>,
+    },
     Shutdown,
 }
 
@@ -861,6 +870,30 @@ fn plugin_main_loop(
                 } => {
                     resize_gui(&mut tracks, track, slot, width, height);
                 }
+                PluginCommand::SetBuiltinPluginNoteMetadata {
+                    plugin_id,
+                    entries,
+                } => {
+                    // plugin_lookup は `(track, slot) -> plugin_id` の
+                    // forward map。 逆引きは O(n) walk。 同 frame に
+                    // 数件しか呼ばれない ので n ≤ 数十で問題なし。
+                    let target =
+                        plugin_lookup.iter().find_map(|(k, v)| {
+                            (*v == plugin_id).then_some(*k)
+                        });
+                    let Some((track, slot)) = target else {
+                        tracing::warn!(
+                            plugin_id,
+                            "SetBuiltinPluginNoteMetadata: plugin_id not found"
+                        );
+                        continue;
+                    };
+                    tracks.mutate(|t| {
+                        if let Some(plugin) = t.plugin_at_mut(track, slot) {
+                            plugin.set_note_metadata(&entries);
+                        }
+                    });
+                }
             }
         }
 
@@ -1270,6 +1303,17 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
         MainToChild::SetRenderMode(mode) => {
             tracing::info!(?mode, "received SetRenderMode");
             plugin.send(PluginCommand::SetRenderMode(mode));
+        }
+        MainToChild::SetBuiltinPluginNoteMetadata { plugin_id, entries } => {
+            tracing::debug!(
+                plugin_id,
+                count = entries.len(),
+                "received SetBuiltinPluginNoteMetadata"
+            );
+            plugin.send(PluginCommand::SetBuiltinPluginNoteMetadata {
+                plugin_id,
+                entries,
+            });
         }
         MainToChild::ExportWav { .. } => {
             // ExportWav is consumed by daw_audio (which freewheels the

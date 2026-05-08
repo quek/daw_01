@@ -27,6 +27,23 @@
     + warn ログのみ)
   - unit test 5 件追加 (default state / bincode roundtrip / id-format /
     silent process / state_save bytes)
+- ✅ **PR-V2.2**: 歌詞 IPC 経路完成
+  - `common::plugin_metadata::NoteMetadata { note_id, lyric }` 新設
+  - `MainToChild::SetBuiltinPluginNoteMetadata { plugin_id, entries }`
+    IPC variant 追加 (`common::protocol`)
+  - `LoadedPlugin::set_note_metadata(&mut self, &[NoteMetadata])` を
+    default no-op で trait 追加 (= CLAP / VST3 plugin は影響なし、 trait
+    の format-neutrality 維持)
+  - `VoicevoxBuiltin::set_note_metadata` で内部 `HashMap<u32, String>` を
+    完全置換 (= 「現在の clip 内 notes 全部」 を毎回 flush する設計)
+  - `daw_plugin_host` main: `MainToChild` → `PluginCommand::
+    SetBuiltinPluginNoteMetadata` に転送、 plugin-main thread で
+    `plugin_lookup` を walk して `(track, slot)` を逆引き → `set_note
+    _metadata` 呼び出し
+  - `daw_audio` main: `SetBuiltinPluginNoteMetadata` を ignore arm に
+    追加 (= 役割は plugin_host のみ)
+  - unit test 1 件追加 (set_note_metadata で lyrics buffer が完全置換、
+    空 flush で全消去)
 
 ## 動機 — なぜ専用 codepath を捨てるか
 

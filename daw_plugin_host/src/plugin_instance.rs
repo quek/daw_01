@@ -14,6 +14,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use common::plugin_format::PluginFormat;
+use common::plugin_metadata::NoteMetadata;
 use common::protocol::RenderMode;
 
 use crate::builtin;
@@ -129,6 +130,18 @@ pub trait LoadedPlugin: Send {
     // --- persistence (plugin-main thread) -------------------------------
     fn state_save(&self) -> Result<Option<Vec<u8>>>;
     fn state_load(&self, data: &[u8]) -> Result<()>;
+
+    // --- per-note metadata (Builtin plugin only, PR-V2.2) ---------------
+    /// Builtin plugin (`PluginFormat::Builtin`) 専用の per-note metadata
+    /// flush。 CLAP / VST3 plugin は default no-op (= 規格に存在しない
+    /// 概念なので)、 builtin plugin は `entries` を内部にバッファして
+    /// 次の synthesis pass で参照する。
+    ///
+    /// 呼び出しは plugin-main thread から、 GUI 側で歌詞 / phoneme が
+    /// 編集されるたびに実施。 `entries` は `note_id` ascending に並んで
+    /// いる必要は無い (= builtin が必要なら自分でソートする)。
+    /// `docs/plan_voicevox_synth.md` PR-V2.2 で導入。
+    fn set_note_metadata(&mut self, _entries: &[NoteMetadata]) {}
 
     // --- embedded Win32 GUI (plugin-main thread) ------------------------
     //

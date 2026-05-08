@@ -6,6 +6,7 @@ pub mod meter;
 pub mod model;
 pub mod plugin_db;
 pub mod plugin_format;
+pub mod plugin_metadata;
 pub mod plugin_ref;
 pub mod process_data;
 pub mod project;

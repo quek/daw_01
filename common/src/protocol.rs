@@ -206,6 +206,16 @@ pub enum MainToChild {
         start_frame: u64,
         end_frame: u64,
     },
+    /// Builtin plugin (`PluginFormat::Builtin`) に per-note metadata を
+    /// flush する。 daw_gui が plugin_id 別に、 「note_id → metadata」 の
+    /// 一括 vector を送る。 daw_plugin_host だけが consume (= daw_audio
+    /// は ignore)。 CLAP / VST3 plugin に対する flush は trait の default
+    /// no-op 実装で吸収するので、 plugin format をホスト側で気にする必要
+    /// はない (`docs/plan_voicevox_synth.md` PR-V2.2)。
+    SetBuiltinPluginNoteMetadata {
+        plugin_id: u32,
+        entries: Vec<crate::plugin_metadata::NoteMetadata>,
+    },
     /// Tell the plugin host to switch every loaded plugin's CLAP render
     /// mode (Realtime ↔ Offline). The audio side bookends an export
     /// with `Offline` / `Realtime` so plugins that implement the CLAP
