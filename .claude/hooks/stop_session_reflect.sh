@@ -35,8 +35,16 @@ SESSION_ID=$(printf '%s' "$INPUT" | sed -n 's/.*"session_id":[[:space:]]*"\([^"]
 [ -f "$TRANSCRIPT" ] || exit 0
 [ -d "$CWD" ] || exit 0
 
-PENDING="$CWD/.claude/.session_reflect_pending.md"
-SESSION_LOG="$CWD/.claude/.session_events.${SESSION_ID}.log"
+# AHE pending file は **main worktree の .claude/** に集約する。 各 worktree CWD に書くと、
+# 別 worktree (= main や別 branch worktree) で起動した次 session が pending file を見つけられず
+# 学びが silo 化する (2026-05-08 に判明、 cranky-wescoff worktree の pending が main session 起動時に
+# surface されなかった)。 main worktree path は `git worktree list --porcelain` の最初のエントリ。
+MAIN_WORKTREE=$(git -C "$CWD" worktree list --porcelain 2>/dev/null | awk '/^worktree / {print substr($0, 10); exit}')
+[ -z "$MAIN_WORKTREE" ] && MAIN_WORKTREE="$CWD"
+[ -d "$MAIN_WORKTREE/.claude" ] || mkdir -p "$MAIN_WORKTREE/.claude" 2>/dev/null
+
+PENDING="$MAIN_WORKTREE/.claude/.session_reflect_pending.md"
+SESSION_LOG="$MAIN_WORKTREE/.claude/.session_events.${SESSION_ID}.log"
 TIMESTAMP=$(date +%Y-%m-%dT%H:%M)
 
 # (A) user correction pattern detection — single line per turn

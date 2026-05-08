@@ -18,11 +18,17 @@ INPUT=$(cat || true)
 CWD=$(printf '%s' "$INPUT" | sed -n 's/.*"cwd":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
 [ -z "$CWD" ] && CWD="${CLAUDE_PROJECT_DIR:-$PWD}"
 
+# AHE pending file は **main worktree の .claude/** に集約 (stop_session_reflect.sh と一致)。
+# 各 worktree session の Stop hook が main worktree path に書き込み、 SessionStart hook も
+# 同 path から読む → worktree 跨ぎでも learning が共有される。
+MAIN_WORKTREE=$(git -C "$CWD" worktree list --porcelain 2>/dev/null | awk '/^worktree / {print substr($0, 10); exit}')
+[ -z "$MAIN_WORKTREE" ] && MAIN_WORKTREE="$CWD"
+
 # clean up previous sessions' per-session event logs (they're scoped per session id,
 # so once that session is done, the logs are dead weight). Best-effort, ignore errors.
-find "$CWD/.claude" -maxdepth 1 -name '.session_events.*.log' -mmin +60 -delete 2>/dev/null || true
+find "$MAIN_WORKTREE/.claude" -maxdepth 1 -name '.session_events.*.log' -mmin +60 -delete 2>/dev/null || true
 
-PENDING="$CWD/.claude/.session_reflect_pending.md"
+PENDING="$MAIN_WORKTREE/.claude/.session_reflect_pending.md"
 [ -s "$PENDING" ] || exit 0
 
 cat <<EOF
@@ -42,4 +48,4 @@ $(cat "$PENDING")
 
 EOF
 
-mv "$PENDING" "$CWD/.claude/.session_reflect_pending.md.last" 2>/dev/null || true
+mv "$PENDING" "$MAIN_WORKTREE/.claude/.session_reflect_pending.md.last" 2>/dev/null || true
