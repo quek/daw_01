@@ -42,6 +42,22 @@ struct DawClip {
     /// 本体では `content_id` (notes 共有 store の key) に対応する概念。 prototype では「同じ
     /// content を共有しているふり」 として gid だけ track する。
     share_group_id: Option<u32>,
+    /// M14 Phase 63k (#025): audio clip 編集 (gain / fade) の caller-side state。 `Some(...)` で
+    /// arrangement widget が dB handle line + fade 角 grip + envelope を描画 + drag handler を bind。
+    /// `None` で MIDI / Vocal clip の既存挙動 (audio 描画なし、 hit zone 全 disable)。
+    audio_edit: Option<DawAudioEdit>,
+}
+
+/// M14 Phase 63k (#025): caller-side の audio 編集 state。 `ArrangementClipAudioEdit` の prototype
+/// 版 (snap + clamp + 範囲制限を caller が責任を持つ部分含む)。 widget の `audio_edit: Some(...)`
+/// に詰めて gain / fade gesture を有効化する。
+#[derive(Clone, Copy, Debug)]
+struct DawAudioEdit {
+    gain_db: f32,
+    fade_in_beats: f64,
+    fade_out_beats: f64,
+    fade_in_curve: daw_ui_core::FadeCurve,
+    fade_out_curve: daw_ui_core::FadeCurve,
 }
 
 struct DawTrack {
@@ -108,6 +124,21 @@ impl DawModel {
         for ti in 0..N_TRACKS {
             let mut clips: Vec<DawClip> = Vec::with_capacity(2);
             for ci in 0..2 {
+                // M14 Phase 63k (#025) demo: track 3-5 (= "Track 4/5/6") に audio_edit を入れて、
+                // arrangement widget の dB handle line + fade 角 grip + envelope の動作確認を可能に。
+                // 残り track は MIDI clip 想定で None (既存挙動)。 値は user が「触ったら違いが分かる」
+                // ように初期 fade をやや長く + clip 4 (track 4) は gain +3 dB のオフセットで開始。
+                let audio_edit = if (3..=5).contains(&ti) {
+                    Some(DawAudioEdit {
+                        gain_db: if ti == 3 { 3.0 } else { 0.0 },
+                        fade_in_beats: if ci == 0 { 0.5 } else { 0.0 },
+                        fade_out_beats: if ci == 1 { 0.5 } else { 0.0 },
+                        fade_in_curve: daw_ui_core::FadeCurve::Linear,
+                        fade_out_curve: daw_ui_core::FadeCurve::Linear,
+                    })
+                } else {
+                    None
+                };
                 clips.push(DawClip {
                     id: ci as u32,
                     start_beat: ti as f64 * 1.5 + f64::from(ci) * 6.0,
@@ -115,18 +146,23 @@ impl DawModel {
                     name: Arc::from(format!("clip{}", ci + 1)),
                     color: None,
                     share_group_id: None,
+                    audio_edit,
                 });
             }
             // M14 Phase 63c (#016) demo: track 0 を group とし、 track 1-2 を子に。
             // 残り (3+) は top-level、 disclosure ▼/▶ + indent + collapsed 動作確認用。
             let parent_id = if ti == 1 || ti == 2 { Some(0_u32) } else { None };
+            // M14 Phase 63k (#025) demo: audio clip を持つ track 3-5 は「Audio N」 と名付けて user が識別しやすく。
+            let name = if ti == 0 {
+                "Group A".to_string()
+            } else if (3..=5).contains(&ti) {
+                format!("Audio {}", ti - 2)
+            } else {
+                format!("Track {}", ti + 1)
+            };
             tracks.push(DawTrack {
                 id: ti as u32,
-                name: Arc::from(if ti == 0 {
-                    "Group A".to_string()
-                } else {
-                    format!("Track {}", ti + 1)
-                }),
+                name: Arc::from(name),
                 muted: false,
                 solo: false,
                 next_clip_id: 2,
@@ -739,6 +775,16 @@ fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
                     share_group_color: c.share_group_id.map(|gid| {
                         ((gid as f32) * 0.618_034).rem_euclid(1.0)
                     }),
+                    // M14 Phase 63k (#025): caller-side `DawAudioEdit` を widget の
+                    // `ArrangementClipAudioEdit` にそのまま転送。 None の clip は MIDI/Vocal 扱いで
+                    // arrangement widget が audio gesture を起動しない。
+                    audio_edit: c.audio_edit.map(|e| daw_ui_core::ArrangementClipAudioEdit {
+                        gain_db: e.gain_db,
+                        fade_in_beats: e.fade_in_beats,
+                        fade_out_beats: e.fade_out_beats,
+                        fade_in_curve: e.fade_in_curve,
+                        fade_out_curve: e.fade_out_curve,
+                    }),
                 })
                 .collect(),
             parent_id: t.parent_id,
@@ -890,10 +936,10 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                             .and_then(|t| {
                                 t.clips.iter_mut().find(|c| c.id == d.from.clip).map(|c| {
                                     c.share_group_id = Some(group_id);
-                                    (Arc::clone(&c.name), c.color, c.len_beats)
+                                    (Arc::clone(&c.name), c.color, c.len_beats, c.audio_edit)
                                 })
                             });
-                        let Some((name, color, len_beats)) = src_info else { continue };
+                        let Some((name, color, len_beats, src_audio_edit)) = src_info else { continue };
                         // 3) to_track に新 clip を追加 (同 group_id)
                         if let Some(target) =
                             mm.arr_tracks.iter_mut().find(|t| t.id == d.to_track)
@@ -907,6 +953,9 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                                 name,
                                 color,
                                 share_group_id: Some(group_id),
+                                // M14 Phase 63k (#025): linked clone は source の audio_edit も継承する
+                                // (= 同 content をシェアする想定なので audio パラメータも一致)。
+                                audio_edit: src_audio_edit,
                             };
                             let pos = target
                                 .clips
@@ -932,8 +981,8 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                             .iter()
                             .find(|t| t.id == d.from.track)
                             .and_then(|t| t.clips.iter().find(|c| c.id == d.from.clip))
-                            .map(|c| (Arc::clone(&c.name), c.color, c.len_beats));
-                        let Some((name, color, len_beats)) = src_info else { continue };
+                            .map(|c| (Arc::clone(&c.name), c.color, c.len_beats, c.audio_edit));
+                        let Some((name, color, len_beats, src_audio_edit)) = src_info else { continue };
                         if let Some(target) =
                             mm.arr_tracks.iter_mut().find(|t| t.id == d.to_track)
                         {
@@ -946,6 +995,10 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                                 name,
                                 color,
                                 share_group_id: None,
+                                // M14 Phase 63k (#025): independent clone でも audio_edit を継承
+                                // (同 content の独立コピー = 同 audio パラメータで開始、 user は
+                                // その後個別に編集できる)。
+                                audio_edit: src_audio_edit,
                             };
                             let pos = target
                                 .clips
@@ -1000,6 +1053,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                             name: Arc::from(format!("new{new_id}")),
                             color: None,
                             share_group_id: None,
+                            audio_edit: None,
                         };
                         let pos = t
                             .clips
@@ -1172,6 +1226,86 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                     );
                 })
             }
+            // M14 Phase 63k (#025): audio clip の inline 編集 → 該当 clip の `audio_edit.{field}` を更新。
+            // daw_prototype は track 3-5 ("Audio 1/2/3") の clip に `Some(DawAudioEdit { ... })` を
+            // 持たせており、 widget が dB handle line / fade 角 grip を描画 + drag handler を bind。
+            // 実 daw_01 では `AppEvent::SetClipGainDb { target, gain_db }` 等に変換して audio engine に
+            // 転送するが、 prototype では caller-side state の直接 mutation で十分。
+            ArrangementEditRequest::SetClipGainDb(deltas) => Edit::mutate(move |mm: &mut DawModel| {
+                let n = deltas.len();
+                let mut summary = String::new();
+                for d in &deltas {
+                    if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == d.key.track)
+                        && let Some(c) = t.clips.iter_mut().find(|c| c.id == d.key.clip)
+                        && let Some(audio) = c.audio_edit.as_mut()
+                    {
+                        audio.gain_db = d.next_gain_db;
+                        if summary.is_empty() {
+                            summary = format!(
+                                "{}{:.1} dB (clip {}/{})",
+                                if d.next_gain_db >= 0.0 { "+" } else { "" },
+                                d.next_gain_db,
+                                d.key.track,
+                                d.key.clip
+                            );
+                        }
+                    }
+                }
+                mm.arr_view.data_generation += 1;
+                mm.last_action = format!("arr: SetClipGainDb ({n}) → {summary}");
+            }),
+            ArrangementEditRequest::SetClipFade(deltas) => Edit::mutate(move |mm: &mut DawModel| {
+                let n = deltas.len();
+                let mut summary = String::new();
+                for d in &deltas {
+                    if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == d.key.track)
+                        && let Some(c) = t.clips.iter_mut().find(|c| c.id == d.key.clip)
+                        && let Some(audio) = c.audio_edit.as_mut()
+                    {
+                        match d.edge {
+                            daw_ui_core::FadeEdge::In => audio.fade_in_beats = d.next_beats,
+                            daw_ui_core::FadeEdge::Out => audio.fade_out_beats = d.next_beats,
+                        }
+                        if summary.is_empty() {
+                            summary = format!(
+                                "{:?}={:.2} beats (clip {}/{})",
+                                d.edge,
+                                d.next_beats,
+                                d.key.track,
+                                d.key.clip
+                            );
+                        }
+                    }
+                }
+                mm.arr_view.data_generation += 1;
+                mm.last_action = format!("arr: SetClipFade ({n}) → {summary}");
+            }),
+            ArrangementEditRequest::SetClipFadeCurve(deltas) => Edit::mutate(move |mm: &mut DawModel| {
+                let n = deltas.len();
+                let mut summary = String::new();
+                for d in &deltas {
+                    if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == d.key.track)
+                        && let Some(c) = t.clips.iter_mut().find(|c| c.id == d.key.clip)
+                        && let Some(audio) = c.audio_edit.as_mut()
+                    {
+                        match d.edge {
+                            daw_ui_core::FadeEdge::In => audio.fade_in_curve = d.next_curve,
+                            daw_ui_core::FadeEdge::Out => audio.fade_out_curve = d.next_curve,
+                        }
+                        if summary.is_empty() {
+                            summary = format!(
+                                "{:?}={} (clip {}/{})",
+                                d.edge,
+                                d.next_curve.name(),
+                                d.key.track,
+                                d.key.clip
+                            );
+                        }
+                    }
+                }
+                mm.arr_view.data_generation += 1;
+                mm.last_action = format!("arr: SetClipFadeCurve ({n}) → {summary}");
+            }),
         },
     );
 

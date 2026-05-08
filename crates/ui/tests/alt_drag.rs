@@ -93,6 +93,7 @@ fn arr_model() -> ArrModel {
             name: Arc::from("c1"),
             color: None,
             share_group_color: None,
+            audio_edit: None,
         }],
         volume: 1.0,
         parent_id: None,

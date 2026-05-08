@@ -46,6 +46,61 @@ pub struct ClipKey {
     pub clip: u32,
 }
 
+/// M14 Phase 63k (#025): audio clip の inline 編集用フィールド (gain_db / fade_in/out)。
+/// `ArrangementClip.audio_edit = Some(...)` のとき widget が dB handle line + fade 角 grip +
+/// envelope を描画 + 当該 grip 領域に drag handler を bind。 MIDI / Vocal clip は `None` で
+/// 既存挙動 (audio 描画 / hit zone 完全に無効、 通常の Move/Resize のみ)。
+///
+/// 値は **caller が clamp 済**: gain_db は ±24 dB 想定、 fade_*_beats は 0..len_beats、
+/// fade_*_curve は描画用。 widget 側は drag commit 値も同範囲で clamp する (range 統一は caller
+/// の責務、 widget 側は描画 / hit-test の sanity guard のみ)。
+#[derive(Clone, Copy, Debug)]
+pub struct ArrangementClipAudioEdit {
+    pub gain_db: f32,
+    pub fade_in_beats: f64,
+    pub fade_out_beats: f64,
+    pub fade_in_curve: FadeCurve,
+    pub fade_out_curve: FadeCurve,
+}
+
+/// M14 Phase 63k (#025): fade のカーブ形状 (3 種、 Bitwig spec §3.5 と整合)。
+/// vertical drag で順送り (`Linear → Exponential → SCurve → Linear`)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FadeCurve {
+    Linear,
+    Exponential,
+    SCurve,
+}
+
+impl FadeCurve {
+    /// Vertical drag で次の curve に進める (`Linear → Exponential → SCurve → Linear`)。
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            FadeCurve::Linear => FadeCurve::Exponential,
+            FadeCurve::Exponential => FadeCurve::SCurve,
+            FadeCurve::SCurve => FadeCurve::Linear,
+        }
+    }
+
+    /// ghost label / debug 表示用の英語名 (Bitwig / Reaper と整合)。
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            FadeCurve::Linear => "Linear",
+            FadeCurve::Exponential => "Exponential",
+            FadeCurve::SCurve => "SCurve",
+        }
+    }
+}
+
+/// M14 Phase 63k (#025): fade の対象 edge (`In` = clip 左角、 `Out` = clip 右角)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FadeEdge {
+    In,
+    Out,
+}
+
 /// 1 つの clip。`Arc<str>` で複数 clip 間の name 共有可能。
 #[derive(Clone, Debug)]
 pub struct ArrangementClip {
@@ -61,6 +116,11 @@ pub struct ArrangementClip {
     /// caller は `content_id` を `[0.0, 1.0)` に hash して渡す想定 (refcount >= 2 のときだけ
     /// `Some` を入れれば、 同じ content を共有する clip 群が同色 + link icon になる)。
     pub share_group_color: Option<f32>,
+    /// M14 Phase 63k (#025): audio clip の inline 編集 (gain_db / fade)。 `Some` で widget が
+    /// dB handle / fade 角 / envelope を描画 + grip 領域に drag handler を bind し
+    /// `SetClipGainDb` / `SetClipFade` / `SetClipFadeCurve` を発行する。 MIDI / Vocal clip は
+    /// `None` で既存挙動 (clip 内 hit zone 全体が Move、 audio 描画なし)。
+    pub audio_edit: Option<ArrangementClipAudioEdit>,
 }
 
 /// 1 つの track。`clips` は `start_beat` 昇順前提。
@@ -179,6 +239,34 @@ pub struct ResizeClipDelta {
     pub next_len: f64,
 }
 
+/// M14 Phase 63k (#025): `SetClipGainDb` の delta 1 件 (release 時に発火)。
+/// `prev_gain_db` で undo を構築できる (caller は `Edit::with_inverse` で対称適用すれば良い)。
+#[derive(Clone, Copy, Debug)]
+pub struct ClipGainDelta {
+    pub key: ClipKey,
+    pub prev_gain_db: f32,
+    pub next_gain_db: f32,
+}
+
+/// M14 Phase 63k (#025): `SetClipFade` の delta 1 件 (length 変更、 release 時に発火)。
+/// `edge` で fade_in / fade_out を区別、 `prev_beats` / `next_beats` は当該 edge の length 拍数。
+#[derive(Clone, Copy, Debug)]
+pub struct ClipFadeDelta {
+    pub key: ClipKey,
+    pub edge: FadeEdge,
+    pub prev_beats: f64,
+    pub next_beats: f64,
+}
+
+/// M14 Phase 63k (#025): `SetClipFadeCurve` の delta 1 件 (curve 切替、 release 時に発火)。
+/// vertical drag で `next_curve` が `prev → next()` (Linear → Exp → SCurve → Linear) に進む。
+#[derive(Clone, Copy, Debug)]
+pub struct ClipFadeCurveDelta {
+    pub key: ClipKey,
+    pub edge: FadeEdge,
+    pub next_curve: FadeCurve,
+}
+
 /// M14 Phase 63c (#016): track header click 時の selection 変更 modifier (DAW 業界標準)。
 /// caller が `SelectTrack` Edit を受け取ったときに `(prev, next, modifier)` から動作意図を判別できる
 /// ようにするため、 widget 側で modifier を decoded して送る (caller boilerplate の削減)。
@@ -273,6 +361,21 @@ pub enum ArrangementEditRequest {
         parent: Option<u32>,
         anchor_after: Option<u32>,
     },
+    /// M14 Phase 63k (#025): clip 中央 dB handle 帯の縦 drag による gain_db 変更 (release
+    /// 時に 1 度発火)。 `Vec<ClipGainDelta>` shape は selection multi-clip 対応の余地を残す
+    /// ため (将来 `selected_clips` を一括移動する変種)。 単一 clip drag では `vec![delta]` の
+    /// 1 件で発火。 widget 側で ±24 dB に clamp 済 (caller の clamp 不要、 ただし caller 側で
+    /// 別 range を望む場合は再 clamp してよい)。
+    SetClipGainDb(Vec<ClipGainDelta>),
+    /// M14 Phase 63k (#025): clip 上端の角 drag (sticky horizontal) による fade length 変更
+    /// (release 時に 1 度発火)。 `edge` で fade_in / fade_out を区別、 `next_beats` は当該
+    /// edge の length 拍数 (widget 側で `0.0..=clip.len_beats` に clamp 済)。 同 release で
+    /// `SetClipFadeCurve` と同時発火することはない (sticky direction で必ず排他)。
+    SetClipFade(Vec<ClipFadeDelta>),
+    /// M14 Phase 63k (#025): clip 上端の角 drag (sticky vertical, |dy| > 10 px) による fade
+    /// curve トグル (release 時に 1 度発火)。 `next_curve` は `prev.next()` (Linear → Exp →
+    /// SCurve → Linear)。 同 release で `SetClipFade` と同時発火することはない。
+    SetClipFadeCurve(Vec<ClipFadeCurveDelta>),
 }
 
 /// `Ui::arrangement` の戻り値。
@@ -408,6 +511,40 @@ pub struct ArrangementStyle {
     /// share clip の name 左に描く link glyph (default = `'⇌'` U+21CC)。 font に存在しない場合は
     /// caller 側で ASCII (`'~'` 等) に差し替える。
     pub share_group_link_glyph: char,
+    // ---- M14 Phase 63k (#025): audio clip inline 編集 (dB handle / fade) ----
+    /// audio_edit が Some の clip に重ねる dB handle line の色 (default 半透明白)。
+    pub audio_db_handle_color: Color,
+    /// dB handle line の太さ (default 1.5 px)。
+    pub audio_db_handle_width_px: f32,
+    /// dB handle hit zone の縦帯 (handle line を中心に上下 ± half_band_h)。 default 8.0 = ±4 px。
+    pub audio_db_handle_band_h: f32,
+    /// dB handle 帯の左右 margin (clip 端から内側にこの px は除外、 端の resize/fade grip と
+    /// 被らないようにする)。 default 24.0。
+    pub audio_db_handle_x_margin: f32,
+    /// dB drag の感度 (1 px = この dB)。 default 0.25 dB/px (= 4 px/dB)。
+    /// negative dy = 上に drag = gain 増加。
+    pub audio_db_pixels_per_db: f32,
+    /// rect 上下端にマップする dB 範囲 (`±` この値)。 default 24.0 → 上端 = +24 dB、 下端 = -24 dB。
+    /// drag の commit 値もこの範囲に clamp される。
+    pub audio_db_range_db: f32,
+    /// fade 角 grip の正方形サイズ (px、 clip 上端の左右にこの size の正方形 hit zone)。 default 12.0。
+    pub audio_fade_corner_size_px: f32,
+    /// fade envelope (clip 上端から fade 末尾まで斜辺) と grip の描画色 (default 半透明白)。
+    pub audio_fade_overlay_color: Color,
+    /// fade envelope 線の太さ (default 1.0 px)。
+    pub audio_fade_overlay_width_px: f32,
+    /// audio grip / handle を表示する最小 clip 幅 (これ未満では hit zone 全 disable、 描画も
+    /// skip)。 default 32.0 → ResizeLeft + ResizeRight + 中央 = 32 px 必要、 短 clip は audio
+    /// gesture 起動しない。
+    pub audio_min_clip_w_for_handles_px: f32,
+    /// fade grip の sticky direction lock を確定する閾値 (drag 累積 |dx|/|dy| のうち大きい方が
+    /// この px を超えたら方向 lock)。 default 10.0 (要望文 §3.2 と整合)。
+    pub audio_fade_sticky_threshold_px: f32,
+    /// drag 中の ghost label (`+3.2 dB` / `Curve: Exponential`) の font_size。 default 11.0
+    /// (= clip_text_size と同等)。
+    pub audio_ghost_label_size: f32,
+    /// ghost label の color (default 白系)。
+    pub audio_ghost_label_color: Color,
 }
 
 impl Default for ArrangementStyle {
@@ -493,6 +630,22 @@ impl Default for ArrangementStyle {
             share_group_border_lightness: 0.75,
             share_group_alpha: 0.85,
             share_group_link_glyph: '⇌',
+            // M14 Phase 63k (#025): audio clip 編集 default — Bitwig spec §3.5/§3.6 と整合。
+            // dB handle: 半透明白の細線、 ±4 px hit 帯、 端から 24 px margin、 0.25 dB/px、 ±24 dB 範囲。
+            // fade 角: 12×12 grip、 半透明白の envelope 線。 sticky 閾値 10 px (要望文 §3.2)。
+            audio_db_handle_color: Color::rgba(1.0, 1.0, 1.0, 0.55),
+            audio_db_handle_width_px: 1.5,
+            audio_db_handle_band_h: 8.0,
+            audio_db_handle_x_margin: 24.0,
+            audio_db_pixels_per_db: 0.25,
+            audio_db_range_db: 24.0,
+            audio_fade_corner_size_px: 12.0,
+            audio_fade_overlay_color: Color::rgba(1.0, 1.0, 1.0, 0.65),
+            audio_fade_overlay_width_px: 1.0,
+            audio_min_clip_w_for_handles_px: 32.0,
+            audio_fade_sticky_threshold_px: 10.0,
+            audio_ghost_label_size: 11.0,
+            audio_ghost_label_color: Color::rgb(0.95, 0.95, 0.97),
         }
     }
 }
@@ -559,6 +712,88 @@ pub fn clip_to_rect(
     let row_top = lanes.y - view.track_top + track_index as f32 * view.track_row_h;
     let h = (view.track_row_h - 4.0).max(2.0);
     Rect { x, y: row_top + 2.0, w, h }
+}
+
+/// M14 Phase 63k (#025): audio_edit が Some の clip 上の audio gesture grip ヒット種別。
+/// 公開 `ClipDragKind` には足さず内部 enum で扱う (caller の hover/drag 報告は既存 3 variant
+/// のまま維持、 audio gesture は widget 内で完結)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioGripHit {
+    /// clip 上端の左角 (12×12 px)。 fade_in length / curve drag の起点。
+    FadeCornerIn,
+    /// clip 上端の右角 (12×12 px)。 fade_out length / curve drag の起点。
+    FadeCornerOut,
+    /// clip 中央 horizontal 帯 (handle line ±4 px、 端から x_margin 内側)。 gain dB drag の起点。
+    GainHandleBand,
+}
+
+/// M14 Phase 63k (#025): 単一 clip の audio_edit grip ヒット (priority: gain > fade corner)。
+/// `audio_edit` が None の clip ではヒット無し、 `r.w < min_w` の短 clip でも無効化。
+/// fade 角は resize handle (4 px) より priority 高 (= clip 内側の上端 12×12 を fade に振る)、
+/// resize は fade 角の外側 (clip rect の外側 ±4 px) で活きる。
+fn audio_grip_hit(
+    track_idx: usize,
+    clip: &ArrangementClip,
+    view: ArrangementView,
+    lanes: Rect,
+    cx: f32,
+    cy: f32,
+    style: &ArrangementStyle,
+) -> Option<AudioGripHit> {
+    clip.audio_edit?;
+    let r = clip_to_rect(track_idx, clip, view, lanes);
+    if r.w < style.audio_min_clip_w_for_handles_px {
+        return None;
+    }
+    if cy < r.y || cy >= r.y + r.h {
+        return None;
+    }
+    let corner = style.audio_fade_corner_size_px;
+    // priority 1: gain handle band — clip 中央 y ±half_band、 端から x_margin 内側のみ
+    let center_y = r.y + r.h * 0.5;
+    let half_band = style.audio_db_handle_band_h * 0.5;
+    let margin = style.audio_db_handle_x_margin;
+    if cx >= r.x + margin
+        && cx < r.x + r.w - margin
+        && cy >= center_y - half_band
+        && cy < center_y + half_band
+    {
+        return Some(AudioGripHit::GainHandleBand);
+    }
+    // priority 2: fade in 角 (top-left 12×12)
+    if cx >= r.x && cx < r.x + corner && cy >= r.y && cy < r.y + corner {
+        return Some(AudioGripHit::FadeCornerIn);
+    }
+    // priority 3: fade out 角 (top-right 12×12)
+    if cx >= r.x + r.w - corner && cx < r.x + r.w && cy >= r.y && cy < r.y + corner {
+        return Some(AudioGripHit::FadeCornerOut);
+    }
+    None
+}
+
+/// M14 Phase 63k (#025): lanes 内 cursor 位置から hit する `(ClipKey, AudioGripHit)` を返す
+/// (clip の `audio_edit = Some` のものだけが対象、 後勝ち)。 `clip_hit` の audio gesture 版。
+#[must_use]
+fn audio_grip_hit_in_lanes(
+    tracks: &[ArrangementTrack],
+    view: ArrangementView,
+    lanes: Rect,
+    cx: f32,
+    cy: f32,
+    style: &ArrangementStyle,
+) -> Option<(ClipKey, AudioGripHit)> {
+    if !lanes.contains(cx, cy) {
+        return None;
+    }
+    let track_idx = track_index_from_y(cy, lanes.y, view.track_top, view.track_row_h)?;
+    let track = tracks.get(track_idx)?;
+    let mut hit: Option<(ClipKey, AudioGripHit)> = None;
+    for clip in &track.clips {
+        if let Some(zone) = audio_grip_hit(track_idx, clip, view, lanes, cx, cy, style) {
+            hit = Some((ClipKey { track: track.id, clip: clip.id }, zone));
+        }
+    }
+    hit
 }
 
 /// 内部 helper: cursor 位置がこの clip のどの zone (Move / ResizeLeft / ResizeRight)
@@ -940,6 +1175,42 @@ struct TrackVolumeDragSession {
     last_emitted_volume: f32,
 }
 
+/// M14 Phase 63k (#025): audio_edit clip 上の inline 編集 drag session。
+/// press 時に grip 種別から `AudioDragKind` を確定、 sticky direction lock は continuation で
+/// 累積 |dx|/|dy| を比較して確定 (`locked_horizontal`)。 commit-by-release: drag 中は ghost
+/// overlay のみ、 release で 1 度だけ `SetClipGainDb` / `SetClipFade` / `SetClipFadeCurve` を発火。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioDragKind {
+    /// clip 中央 dB handle 帯 → 縦 drag のみ意味あり (gain_db 変更)。
+    Gain,
+    /// clip 上端左角 → sticky で length / curve に分岐。
+    FadeIn,
+    /// clip 上端右角 → 同上 (length / curve)。
+    FadeOut,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AudioDragSession {
+    /// 単一 clip の drag (multi-select 一括対応は将来拡張、 仕様 §scope 外)。
+    key: ClipKey,
+    kind: AudioDragKind,
+    /// drag 開始時の anchor 値 (release 時の commit / inverse 算出 + ghost preview に使う)。
+    anchor: ArrangementClipAudioEdit,
+    /// drag 開始時の clip rect (release 時にも参照、 view scroll 中も安定 — track 並び替えや
+    /// scroll で「rect が動いて」 も anchor の dB 0 ライン位置を変えない)。
+    clip_rect_anchor: Rect,
+    /// drag 開始時の clip len_beats (fade length の clamp 上限に使う)。
+    clip_len_beats_anchor: f64,
+    anchor_mouse: (f32, f32),
+    /// continuation で update、 release frame は pointer.pos ≠ anchor_mouse のときのみ update
+    /// (clip_drag と同じ pattern: winit が release で press 位置に戻すケースを回避)。
+    last_mouse: (f32, f32),
+    /// fade gesture の sticky direction lock。 `None` = 未確定 (drag 距離 < threshold)、
+    /// `Some(true)` = horizontal lock (length 編集)、 `Some(false)` = vertical lock (curve 切替)。
+    /// `Gain` では常に `Some(false)` (vertical lock 固定、 横 drag は無視)。
+    locked_horizontal: Option<bool>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ArrangementState {
     clip_drag: Option<ClipDragSession>,
@@ -949,11 +1220,97 @@ pub(crate) struct ArrangementState {
     /// M14 Phase 63j (#024): ruler plain click / drag による playhead seek セッション。
     /// `Shift` 修飾無しの ruler 内 press で開始、 release で `take()` して discard。
     playhead_drag: Option<PlayheadDragSession>,
+    /// M14 Phase 63k (#025): audio_edit grip 上の inline 編集 drag session (gain / fade)。
+    /// audio grip > clip drag の priority で起動するため、 既存 ResizeLeft/Right/Move とは
+    /// 排他的に動作する。 commit-by-release で release frame に 1 度だけ EditRequest を発火。
+    audio_drag: Option<AudioDragSession>,
     /// M14 Phase 63c (#016): 直前の `Single` クリック位置 (= Shift+click 範囲選択の起点)。
     /// caller には公開せず widget 内 SSoT として持つ (piano_roll の note multi-select は anchor
     /// なし設計だったが、 arrangement では daw_01 #009 / #016 で「widget 内 anchor」 が確認されている)。
     /// `Toggle` modifier では update しない、 `Single` / `RangeFromAnchor` で update。
     selection_anchor: Option<u32>,
+}
+
+/// M14 Phase 63k (#025): audio_drag の commit / overlay で共有する計算結果。
+/// `Gain` は dB のみ、 `FadeLength` は edge と新 length 拍数、 `FadeCurve` は edge と次 curve。
+/// `None` (= sticky direction 未確定 + drag 距離不足) は no-op (release で何も発火しない)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AudioDragOutcome {
+    Gain { next_db: f32 },
+    FadeLength { edge: FadeEdge, next_beats: f64 },
+    FadeCurve { edge: FadeEdge, next_curve: FadeCurve },
+}
+
+/// M14 Phase 63k (#025): drag delta から release commit 値を計算する pure helper (overlay と
+/// release で同一値を生成する SSoT)。 `None` 戻りは「commit すべき変化なし」 を意味し、 caller は
+/// EditRequest を発火しない。
+///
+/// - `Gain`: dy * pixels_per_db で dB delta を計算 → anchor + delta、 widget で ±range_db に clamp。
+///   anchor と等しいなら `None`。
+/// - `FadeIn / FadeOut` + horizontal lock: dx を beat 単位に変換、 anchor + delta を `0..clip_len` に
+///   clamp。 anchor と等しいなら `None`。
+/// - `FadeIn / FadeOut` + vertical lock: 既存 curve.next() を返す (dy 方向は「次 / 前」 を区別せず
+///   常に順送り、 ユーザは連続 click で SCurve → Linear へ進む)。 同じ curve なら `None`。
+/// - sticky lock 未確定 (= drag 距離が threshold 未満): `None` (release で no-op、 click 相当)。
+fn compute_audio_drag_outcome(
+    ad: &AudioDragSession,
+    beat_per_px: f64,
+    style: &ArrangementStyle,
+) -> Option<AudioDragOutcome> {
+    let dx = ad.last_mouse.0 - ad.anchor_mouse.0;
+    let dy = ad.last_mouse.1 - ad.anchor_mouse.1;
+    let range = style.audio_db_range_db.max(0.001);
+    match ad.kind {
+        AudioDragKind::Gain => {
+            // dy 上が負 → gain 増。 px → dB は `pixels_per_db` (default 0.25 dB/px = 4 px/dB)。
+            let delta_db = -dy * style.audio_db_pixels_per_db;
+            let next = (ad.anchor.gain_db + delta_db).clamp(-range, range);
+            if (next - ad.anchor.gain_db).abs() < 1e-3 {
+                None
+            } else {
+                Some(AudioDragOutcome::Gain { next_db: next })
+            }
+        }
+        AudioDragKind::FadeIn | AudioDragKind::FadeOut => {
+            let lock = ad.locked_horizontal?;
+            let edge = match ad.kind {
+                AudioDragKind::FadeIn => FadeEdge::In,
+                AudioDragKind::FadeOut => FadeEdge::Out,
+                AudioDragKind::Gain => unreachable!(),
+            };
+            if lock {
+                // length 編集: fade_in は dx 正で増、 fade_out は dx 負で増 (clip 右側から内側に伸びる)。
+                let raw_delta_beats = f64::from(dx) * beat_per_px;
+                let signed = match edge {
+                    FadeEdge::In => raw_delta_beats,
+                    FadeEdge::Out => -raw_delta_beats,
+                };
+                let prev = match edge {
+                    FadeEdge::In => ad.anchor.fade_in_beats,
+                    FadeEdge::Out => ad.anchor.fade_out_beats,
+                };
+                let max_beats = ad.clip_len_beats_anchor.max(0.0);
+                let next = (prev + signed).clamp(0.0, max_beats);
+                if (next - prev).abs() < 1e-6 {
+                    None
+                } else {
+                    Some(AudioDragOutcome::FadeLength { edge, next_beats: next })
+                }
+            } else {
+                // curve 切替: dy 方向問わず常に次 curve に順送り (1 release で 1 段階)。
+                let prev_curve = match edge {
+                    FadeEdge::In => ad.anchor.fade_in_curve,
+                    FadeEdge::Out => ad.anchor.fade_out_curve,
+                };
+                let next = prev_curve.next();
+                if next == prev_curve {
+                    None
+                } else {
+                    Some(AudioDragOutcome::FadeCurve { edge, next_curve: next })
+                }
+            }
+        }
+    }
 }
 
 /// 絶対位置 snap で計算した clip drag の beat delta (overlay と release commit で共有)。
@@ -1040,6 +1397,36 @@ fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
             h ^= c.start_beat.to_bits();
             h = h.wrapping_mul(PRIME);
             h ^= c.len_beats.to_bits();
+            h = h.wrapping_mul(PRIME);
+            // M14 Phase 63k (#025): audio_edit (gain_db / fade_in/out_beats / fade curve) も
+            // viewport_key に反映させて、 caller が gain / fade を更新したら cache が再構築されるよう保証。
+            // 旧設計で `audio_edit` を hash に入れない場合、 dB handle line / envelope の表示が
+            // 1 frame 遅れる (#011 と同根の cache miss 不在問題)。 None は固定 sentinel value
+            // (`u64::MAX`) で hash に混ぜて、 None ↔ Some 切替も検知。
+            let audio_marker = match c.audio_edit {
+                None => u64::MAX,
+                Some(audio) => {
+                    let mut a: u64 = 0xDEAD_BEEF_CAFE_BABE;
+                    a ^= u64::from(audio.gain_db.to_bits());
+                    a = a.wrapping_mul(PRIME);
+                    a ^= audio.fade_in_beats.to_bits();
+                    a = a.wrapping_mul(PRIME);
+                    a ^= audio.fade_out_beats.to_bits();
+                    a = a.wrapping_mul(PRIME);
+                    // FadeCurve は Hash 派生済 (Linear=0, Exp=1, SCurve=2 を使う)
+                    let curve_code = |c: FadeCurve| match c {
+                        FadeCurve::Linear => 0_u64,
+                        FadeCurve::Exponential => 1,
+                        FadeCurve::SCurve => 2,
+                    };
+                    a ^= curve_code(audio.fade_in_curve);
+                    a = a.wrapping_mul(PRIME);
+                    a ^= curve_code(audio.fade_out_curve);
+                    a = a.wrapping_mul(PRIME);
+                    a
+                }
+            };
+            h ^= audio_marker;
             h = h.wrapping_mul(PRIME);
         }
     }
@@ -1369,6 +1756,7 @@ fn draw_drag_preview<M: ?Sized + 'static>(
             name: Arc::from(""),
             color: None,
             share_group_color: None,
+            audio_edit: None,
         };
         let r = clip_to_rect(new_idx, &preview_clip, view, lanes);
         if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
@@ -1397,6 +1785,192 @@ fn draw_drag_preview<M: ?Sized + 'static>(
                 clip_rect: Some(r),
             });
         }
+    }
+}
+
+/// M14 Phase 63k (#025): gain_db を clip rect 内の handle line y 座標に変換する pure helper。
+/// `gain_db = 0` で rect 中央、 `+range_db` で上端、 `-range_db` で下端 (Bitwig spec 準拠)。
+/// 描画と hit-test の両方で使う SSoT (overlay と base 描画が同じ y で描かれる)。
+#[must_use]
+fn db_to_handle_y(rect: Rect, gain_db: f32, style: &ArrangementStyle) -> f32 {
+    let range = style.audio_db_range_db.max(0.001);
+    let normalized = (gain_db / range).clamp(-1.0, 1.0);
+    // gain=0 で rect 中央、 +range で rect 上端 (y 小さい)、 -range で rect 下端 (y 大きい)。
+    rect.y + rect.h * 0.5 - rect.h * 0.5 * normalized
+}
+
+/// M14 Phase 63k (#025): clip 上端の fade envelope を描画 (左角 / 右角)。
+/// `fade_beats > 0` のとき、 grip 角から fade 末尾まで斜辺を描く。 `fade_beats = 0` の場合は
+/// grip 正方形だけ ([clip 上端の角、 corner_size×corner_size]) を細く塗る (= 「掴める場所」 の hint)。
+fn draw_fade_envelope<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    clip_rect: Rect,
+    edge: FadeEdge,
+    fade_beats: f64,
+    clip_len_beats: f64,
+    style: &ArrangementStyle,
+) {
+    use daw_ui_renderer::{LineBatch, LineSegment};
+
+    let corner = style.audio_fade_corner_size_px;
+    let corner_rect = match edge {
+        FadeEdge::In => Rect { x: clip_rect.x, y: clip_rect.y, w: corner, h: corner },
+        FadeEdge::Out => Rect {
+            x: clip_rect.x + clip_rect.w - corner,
+            y: clip_rect.y,
+            w: corner,
+            h: corner,
+        },
+    };
+    // grip square (内部塗り、 hit zone hint)
+    push_filled_rect(hctx, corner_rect, style.audio_fade_overlay_color);
+
+    // envelope 斜辺は fade_beats > 0 のときのみ描画。
+    if fade_beats <= 0.0 || clip_len_beats <= 0.0 {
+        return;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let fade_w_px = ((fade_beats / clip_len_beats) * f64::from(clip_rect.w))
+        .min(f64::from(clip_rect.w)) as f32;
+    let (start_xy, end_xy) = match edge {
+        // FadeIn: clip 上端左から fade 末尾の clip 内部 (右下) まで斜め
+        FadeEdge::In => (
+            [clip_rect.x, clip_rect.y],
+            [clip_rect.x + fade_w_px, clip_rect.y + clip_rect.h],
+        ),
+        // FadeOut: clip 上端右から fade 末尾の clip 内部 (左下) まで斜め
+        FadeEdge::Out => (
+            [clip_rect.x + clip_rect.w, clip_rect.y],
+            [clip_rect.x + clip_rect.w - fade_w_px, clip_rect.y + clip_rect.h],
+        ),
+    };
+    let seg = LineSegment { a: start_xy, b: end_xy, color: style.audio_fade_overlay_color };
+    hctx.push_lines(LineBatch {
+        segments: Arc::<[LineSegment]>::from(vec![seg]),
+        line_width_px: style.audio_fade_overlay_width_px,
+        clip_rect: Some(clip_rect),
+    });
+}
+
+/// M14 Phase 63k (#025): audio_edit が Some の clip に対する base 描画 (dB handle line + 両端 fade envelope)。
+/// cached 内で呼ばれる (audio_edit / clip rect が変化したら viewport_key で cache 再生成)。
+fn draw_clip_audio_overlay<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    clip_rect: Rect,
+    audio: &ArrangementClipAudioEdit,
+    clip_len_beats: f64,
+    style: &ArrangementStyle,
+) {
+    use daw_ui_renderer::{LineBatch, LineSegment};
+
+    // dB handle line (横線 1 本、 audio_db_handle_width_px の太さ)。 端から margin 内側のみ。
+    let margin = style.audio_db_handle_x_margin;
+    let line_w = (clip_rect.w - margin * 2.0).max(0.0);
+    if line_w > 0.0 {
+        let y = db_to_handle_y(clip_rect, audio.gain_db, style);
+        let seg = LineSegment {
+            a: [clip_rect.x + margin, y],
+            b: [clip_rect.x + margin + line_w, y],
+            color: style.audio_db_handle_color,
+        };
+        hctx.push_lines(LineBatch {
+            segments: Arc::<[LineSegment]>::from(vec![seg]),
+            line_width_px: style.audio_db_handle_width_px,
+            clip_rect: Some(clip_rect),
+        });
+    }
+
+    // Fade In / Out 両 envelope を描画 (length 0 でも grip を描く = 「掴める場所」 hint)。
+    draw_fade_envelope(
+        hctx,
+        clip_rect,
+        FadeEdge::In,
+        audio.fade_in_beats,
+        clip_len_beats,
+        style,
+    );
+    draw_fade_envelope(
+        hctx,
+        clip_rect,
+        FadeEdge::Out,
+        audio.fade_out_beats,
+        clip_len_beats,
+        style,
+    );
+}
+
+/// M14 Phase 63k (#025): audio_drag 中の ghost overlay (cached 外、 drag 中の preview 値を最新表示)。
+/// `compute_audio_drag_outcome` の結果を視覚化:
+/// - `Gain { next_db }` → 新 dB position に handle line を 1 本 + ghost label「+3.2 dB」 を描く。
+/// - `FadeLength { edge, next_beats }` → 新 fade 範囲を `draw_fade_envelope` で描く + label 省略
+///   (envelope の長さ自体が visual feedback)。
+/// - `FadeCurve { edge, next_curve }` → curve 名を ghost label「Curve: Exponential」 で描く。
+/// - `None` (sticky 未確定) → label「Move」 (= drag が始まったが方向未確定の hint)、 描画は anchor 値の line。
+fn draw_audio_drag_ghost<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    ad: &AudioDragSession,
+    beat_per_px: f64,
+    style: &ArrangementStyle,
+) {
+    use daw_ui_renderer::{LineBatch, LineSegment};
+
+    let r = ad.clip_rect_anchor;
+    if r.w <= 0.0 || r.h <= 0.0 {
+        return;
+    }
+    let outcome = compute_audio_drag_outcome(ad, beat_per_px, style);
+    let label_text: Option<String> = match (ad.kind, outcome) {
+        (AudioDragKind::Gain, Some(AudioDragOutcome::Gain { next_db })) => {
+            // 新 handle line を preview 位置に重ね描き (cached 内の base line は anchor 値で残るが、
+            // ghost が上に乗って drag 中の最新値を user に見せる)。
+            let margin = style.audio_db_handle_x_margin;
+            let line_w = (r.w - margin * 2.0).max(0.0);
+            if line_w > 0.0 {
+                let y = db_to_handle_y(r, next_db, style);
+                let seg = LineSegment {
+                    a: [r.x + margin, y],
+                    b: [r.x + margin + line_w, y],
+                    color: style.audio_db_handle_color,
+                };
+                hctx.push_lines(LineBatch {
+                    segments: Arc::<[LineSegment]>::from(vec![seg]),
+                    line_width_px: style.audio_db_handle_width_px * 2.0,
+                    clip_rect: Some(r),
+                });
+            }
+            Some(format!(
+                "{}{:.1} dB",
+                if next_db >= 0.0 { "+" } else { "" },
+                next_db
+            ))
+        }
+        (_, Some(AudioDragOutcome::FadeLength { edge, next_beats })) => {
+            draw_fade_envelope(hctx, r, edge, next_beats, ad.clip_len_beats_anchor, style);
+            None
+        }
+        (_, Some(AudioDragOutcome::FadeCurve { edge: _, next_curve })) => {
+            Some(format!("Curve: {}", next_curve.name()))
+        }
+        // commit すべき変化なし (drag 距離不足 or anchor 同値) — anchor 値の preview を出さない。
+        // sticky 未確定の場合は label だけで「drag しているけど未確定」 を示す。
+        (AudioDragKind::FadeIn | AudioDragKind::FadeOut, None) if ad.locked_horizontal.is_none() => {
+            Some("Drag horizontally for length, vertically for curve".to_string())
+        }
+        _ => None,
+    };
+
+    if let Some(text) = label_text {
+        // ghost label は clip rect の中央上端に 1 行 (= 既存 clip name と被るが、 drag 中のみ表示で問題なし)。
+        let font_size = style.audio_ghost_label_size;
+        hctx.push_text(GlyphArea {
+            text: Arc::from(text),
+            left: r.x + 4.0,
+            top: r.y + r.h - font_size - 4.0,
+            font_size,
+            line_height: font_size * 1.2,
+            color: style.audio_ghost_label_color,
+            clip_rect: Some(r),
+        });
     }
 }
 
@@ -1516,7 +2090,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let is_group_set: HashSet<u32> =
             tracks.iter().filter_map(|t| t.parent_id).collect();
 
-        // ---- press 振り分け: clip_drag / loop_drag / playhead_drag を state に積む ----
+        // ---- press 振り分け: audio_drag / clip_drag / loop_drag / playhead_drag を state に積む ----
         // M14 Phase 63j (#024): ruler の plain click は press frame で `SetPlayheadBeat` を 1 度
         // 発火する (continuation は後段の per-frame block 経由)。 press block 内では state borrow が
         // 走るため `push_edit` は呼べず、 `press_seek_beat` に貯めて press block を抜けてから 1 度発行。
@@ -1528,10 +2102,47 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let in_ruler = ruler.contains(px, py);
             let shift = pointer.modifiers.shift;
             let ctrl = pointer.modifiers.ctrl;
-            // M14 Phase 63e (#019): Ctrl+Shift+drag は clone (Independent) 意図のため clip_drag に
-            // 流す。 Shift only (Ctrl なし) は従来通り rect select に流す (`!shift || ctrl` で
-            // 「Shift があっても Ctrl があれば clip_drag」)。
-            if in_lanes
+            // M14 Phase 63k (#025): audio gesture (gain handle / fade corner) を最優先で振り分ける。
+            // audio grip にヒットしたら clip_drag (Move/Resize) は起動しない (排他) — `audio_grip_hit_in_lanes`
+            // が先勝で priority 判定する。 modifier (Shift / Ctrl) は audio gesture では無視 (Bitwig spec
+            // §3.5/§3.6 と整合、 modifier-free な直感的操作)。 audio_edit が None の clip ではこの
+            // ブロックは即 None を返すため、 既存挙動 (MIDI / Vocal clip) は影響を受けない。
+            let audio_press = if in_lanes && !shift && !ctrl {
+                audio_grip_hit_in_lanes(&visible_tracks, view, lanes, px, py, style)
+            } else {
+                None
+            };
+            if let Some((hit_key, grip)) = audio_press {
+                if let Some((t_idx, t)) =
+                    visible_tracks.iter().enumerate().find(|(_, t)| t.id == hit_key.track)
+                    && let Some(c) = t.clips.iter().find(|c| c.id == hit_key.clip)
+                    && let Some(audio) = c.audio_edit
+                {
+                    let kind = match grip {
+                        AudioGripHit::GainHandleBand => AudioDragKind::Gain,
+                        AudioGripHit::FadeCornerIn => AudioDragKind::FadeIn,
+                        AudioGripHit::FadeCornerOut => AudioDragKind::FadeOut,
+                    };
+                    let r_anchor = clip_to_rect(t_idx, c, view, lanes);
+                    // Gain は常に vertical lock 確定 (横 drag は無視)、 Fade は press 時 `None` で
+                    // sticky direction 待ち (continuation で閾値超えた方向に lock)。
+                    let locked_horizontal = match kind {
+                        AudioDragKind::Gain => Some(false),
+                        _ => None,
+                    };
+                    let state: &mut ArrangementState = self.widget_state(wid);
+                    state.audio_drag = Some(AudioDragSession {
+                        key: hit_key,
+                        kind,
+                        anchor: audio,
+                        clip_rect_anchor: r_anchor,
+                        clip_len_beats_anchor: c.len_beats,
+                        anchor_mouse: (px, py),
+                        last_mouse: (px, py),
+                        locked_horizontal,
+                    });
+                }
+            } else if in_lanes
                 && (!shift || ctrl)
                 && let Some((hit_key, kind)) =
                     clip_hit(&visible_tracks, view, lanes, px, py, style.resize_handle_px)
@@ -1748,6 +2359,27 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 && !is_release
             {
                 pd.last_mouse_x = px;
+            }
+            // M14 Phase 63k (#025): audio_drag continuation で last_mouse + sticky direction lock を update。
+            // - last_mouse: continuation で常に update、 release frame は pointer.pos == anchor_mouse の
+            //   ときのみ skip (winit が release で press 位置に戻すケースを回避、 clip_drag と同 pattern)。
+            // - locked_horizontal: 未確定 (`None`) のとき、 累積 |dx| / |dy| のうちどちらかが
+            //   `audio_fade_sticky_threshold_px` を超えたら方向 lock。 一度 lock されたら release まで
+            //   切替不可 (要望文 §3.2: sticky direction)。
+            if let Some(ref mut ad) = state.audio_drag {
+                // continuation は常に update。 release frame は pointer.pos == anchor_mouse のときだけ skip
+                // (winit が release で press 位置に戻すケースを回避、 clip_drag と同 pattern)。
+                if !is_release || (px, py) != ad.anchor_mouse {
+                    ad.last_mouse = (px, py);
+                }
+                if ad.locked_horizontal.is_none() {
+                    let dx = (ad.last_mouse.0 - ad.anchor_mouse.0).abs();
+                    let dy = (ad.last_mouse.1 - ad.anchor_mouse.1).abs();
+                    let threshold = style.audio_fade_sticky_threshold_px;
+                    if dx >= threshold || dy >= threshold {
+                        ad.locked_horizontal = Some(dx >= dy);
+                    }
+                }
             }
         }
 
@@ -1978,6 +2610,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let _ = state.playhead_drag.take();
         }
 
+        // M14 Phase 63k (#025): audio_drag overlay 用 clone と release 取り出し。
+        let audio_drag_session: Option<AudioDragSession> = {
+            let state: &mut ArrangementState = self.widget_state(wid);
+            state.audio_drag
+        };
+        let audio_drag_release: Option<AudioDragSession> = if pointer.primary_just_released {
+            let state: &mut ArrangementState = self.widget_state(wid);
+            state.audio_drag.take()
+        } else {
+            None
+        };
+
         // drag overlay delta (last_mouse ベース、release と一貫)。
         // M14 Phase 63j (#024): `beat_per_px` / `zoom_x_px_per_beat` は関数頭で計算済 (press 振り分けの
         // playhead seek snap でも使うため)。 ここでは shadow せず再利用する。
@@ -2073,7 +2717,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         });
         let viewport_key = (
             (
-                b"arrangement_widget_v4" as &[u8],
+                b"arrangement_widget_v5" as &[u8],
                 rect.w.to_bits(),
                 rect.h.to_bits(),
                 view.start_beat.to_bits(),
@@ -2115,6 +2759,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // ため、 caller の full tracks から計算した HashSet を 'static に持ち込む。
         let is_group_set_for_heavy: HashSet<u32> = is_group_set.clone();
         let drag_overlay_clone = clip_drag_overlay.clone();
+        // M14 Phase 63k (#025): audio_drag overlay 用 clone (heavy closure に move)。
+        // ghost (drag 中の preview line / fade envelope / label) は cached 外で描画する。
+        let audio_drag_overlay = audio_drag_session;
         // M9 Phase 45f: drag overlay の Resize min_len は snap unit (snap_unit < 0.05 なら 0.05)。
         // release 側 min_len と一貫させるため、 alt 真値は drag session の `last_alt` を使う
         // (overlay と release commit が必ず同一 unit で確定する)。 overlay 不在時 (drag していない)
@@ -2194,6 +2841,35 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     grid_style,
                 );
                 draw_clips(hctx, &tracks_owned, view_copy, lanes, &style_copy);
+                // M14 Phase 63k (#025): audio_edit が Some の clip に dB handle line + fade envelope を重ねる。
+                // 描画は draw_clips 後 (clip rect の上に重なる)、 selection overlay より前 (selection の
+                // 黄色 fill が上書きしない、 selection 中も dB / fade が見える)。
+                let view_end_for_audio = view_copy.start_beat + view_copy.len_beats;
+                for (i, t) in tracks_owned.iter().enumerate() {
+                    #[allow(clippy::cast_precision_loss)]
+                    let row_y =
+                        lanes.y - view_copy.track_top + i as f32 * view_copy.track_row_h;
+                    if row_y + view_copy.track_row_h < lanes.y || row_y > lanes.y + lanes.h {
+                        continue;
+                    }
+                    for c in &t.clips {
+                        let Some(audio) = c.audio_edit else {
+                            continue;
+                        };
+                        let end = c.start_beat + c.len_beats;
+                        if end < view_copy.start_beat || c.start_beat > view_end_for_audio {
+                            continue;
+                        }
+                        let r = clip_to_rect(i, c, view_copy, lanes);
+                        if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
+                            continue;
+                        }
+                        if r.w < style_copy.audio_min_clip_w_for_handles_px {
+                            continue;
+                        }
+                        draw_clip_audio_overlay(hctx, r, &audio, c.len_beats, &style_copy);
+                    }
+                }
                 if view_copy.ruler_h > 0.0 {
                     hctx.time_ruler(
                         ("arr_ruler", id_for_inner),
@@ -2226,6 +2902,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     td,
                     drag_overlay_min_len,
                 );
+            }
+            // M14 Phase 63k (#025): audio_drag ghost overlay (drag 中の dB / fade preview + label)。
+            // commit-by-release のため clip_rect_anchor + 計算済 outcome から preview rect / line を
+            // 描き直す。 cached 外なので 1 frame 1 描画 (drag 中のみ)、 release frame で session が
+            // take されてから次 frame は ghost 消滅。 base 描画 (cached 内) も同 frame 表示されるが、
+            // ghost が上に重なって最新値を user に見せる。
+            if let Some(ad) = audio_drag_overlay {
+                draw_audio_drag_ghost(hctx, &ad, beat_per_px, &style_copy);
             }
             // loop band: drag preview がある場合は preview を描く、無ければ view.loop_range
             if let Some(range) = loop_preview_clone.or(view_copy.loop_range) {
@@ -2409,6 +3093,47 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     if !deltas.is_empty() {
                         self.push_edit(make_edit(ArrangementEditRequest::ResizeClips(deltas)));
                     }
+                }
+            }
+        }
+
+        // ---- M14 Phase 63k (#025): audio_drag release → SetClipGainDb / SetClipFade / SetClipFadeCurve ----
+        // commit-by-release: drag 中は ghost overlay のみ、 release で `compute_audio_drag_outcome` の
+        // 結果に応じて 1 件 emit する。 sticky direction 未確定 + drag 距離不足の場合は no-op
+        // (= click 相当、 caller 側で selection 等は変化しない、 既存挙動)。 単一 clip 限定の `vec![delta]`
+        // で発行 (multi-clip selection 一括は仕様 §scope 外、 将来拡張)。
+        if let Some(ad) = audio_drag_release
+            && let Some(out) = compute_audio_drag_outcome(&ad, beat_per_px, style)
+        {
+            match out {
+                AudioDragOutcome::Gain { next_db } => {
+                    let delta = ClipGainDelta {
+                        key: ad.key,
+                        prev_gain_db: ad.anchor.gain_db,
+                        next_gain_db: next_db,
+                    };
+                    self.push_edit(make_edit(ArrangementEditRequest::SetClipGainDb(vec![
+                        delta,
+                    ])));
+                }
+                AudioDragOutcome::FadeLength { edge, next_beats } => {
+                    let prev_beats = match edge {
+                        FadeEdge::In => ad.anchor.fade_in_beats,
+                        FadeEdge::Out => ad.anchor.fade_out_beats,
+                    };
+                    let delta = ClipFadeDelta {
+                        key: ad.key,
+                        edge,
+                        prev_beats,
+                        next_beats,
+                    };
+                    self.push_edit(make_edit(ArrangementEditRequest::SetClipFade(vec![delta])));
+                }
+                AudioDragOutcome::FadeCurve { edge, next_curve } => {
+                    let delta = ClipFadeCurveDelta { key: ad.key, edge, next_curve };
+                    self.push_edit(make_edit(ArrangementEditRequest::SetClipFadeCurve(vec![
+                        delta,
+                    ])));
                 }
             }
         }
@@ -2905,6 +3630,26 @@ mod tests {
             name: Arc::from(name),
             color: None,
             share_group_color: None,
+            audio_edit: None,
+        }
+    }
+
+    /// M14 Phase 63k (#025): audio_edit が Some の test clip helper。
+    fn audio_clip(
+        id: u32,
+        start: f64,
+        len: f64,
+        name: &str,
+        audio: ArrangementClipAudioEdit,
+    ) -> ArrangementClip {
+        ArrangementClip {
+            id,
+            start_beat: start,
+            len_beats: len,
+            name: Arc::from(name),
+            color: None,
+            share_group_color: None,
+            audio_edit: Some(audio),
         }
     }
 
@@ -4568,5 +5313,704 @@ mod tests {
             );
         });
         assert_eq!(*seek_count.lock().unwrap(), 0, "lanes 内 click は SetPlayheadBeat 非発火");
+    }
+
+    // -------- M14 Phase 63k (#025): audio_edit grip hit-test + drag commit -----------------------
+
+    /// audio_edit が None の clip では audio_grip_hit が常に None を返す (= MIDI / Vocal clip は
+    /// 既存挙動、 audio gesture は完全 disable)。
+    #[test]
+    fn audio_grip_hit_returns_none_when_audio_edit_is_none() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let style = ArrangementStyle::default();
+        // 通常 clip (audio_edit = None) は中央 click でも fade 角 click でも None
+        let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        // Get hit at clip middle
+        assert_eq!(
+            audio_grip_hit_in_lanes(&tracks, view, lanes, 80.0, 16.0, &style),
+            None,
+            "audio_edit None の clip は GainHandleBand を返さない"
+        );
+        // Get hit at top-left corner
+        assert_eq!(
+            audio_grip_hit_in_lanes(&tracks, view, lanes, 6.0, 6.0, &style),
+            None,
+            "audio_edit None の clip は FadeCornerIn を返さない"
+        );
+    }
+
+    /// audio_edit が Some の clip 中央 (handle band) は GainHandleBand を返す。
+    #[test]
+    fn audio_grip_hit_returns_gain_handle_at_clip_middle() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let style = ArrangementStyle::default();
+        // clip rect = (0, 2, 160, 28), 中央 (80, 16) は handle band 内
+        let audio = ArrangementClipAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
+        // clip 中央 y = r.y + r.h / 2 = 2 + 14 = 16
+        // x = 80 (clip 中央)、 端 (0/160) から 24 px margin 内
+        assert_eq!(
+            audio_grip_hit_in_lanes(&tracks, view, lanes, 80.0, 16.0, &style),
+            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::GainHandleBand))
+        );
+    }
+
+    /// fade in 角 (clip 上端左 12×12) は FadeCornerIn を返す。
+    #[test]
+    fn audio_grip_hit_returns_fade_corner_in_at_top_left() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let style = ArrangementStyle::default();
+        let audio = ArrangementClipAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
+        // clip rect = (0, 2, 160, 28), top-left 12×12 → cx=6, cy=6 (corner 内)
+        assert_eq!(
+            audio_grip_hit_in_lanes(&tracks, view, lanes, 6.0, 6.0, &style),
+            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerIn))
+        );
+    }
+
+    /// fade out 角 (clip 上端右 12×12) は FadeCornerOut を返す。
+    #[test]
+    fn audio_grip_hit_returns_fade_corner_out_at_top_right() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let style = ArrangementStyle::default();
+        let audio = ArrangementClipAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
+        // clip rect = (0, 2, 160, 28), top-right 12×12 → cx=155, cy=6 (corner 内)
+        assert_eq!(
+            audio_grip_hit_in_lanes(&tracks, view, lanes, 155.0, 6.0, &style),
+            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerOut))
+        );
+    }
+
+    /// 短 clip (`r.w < audio_min_clip_w_for_handles_px`) は audio grip 全 disable。
+    #[test]
+    fn audio_grip_hit_returns_none_for_short_clip() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let style = ArrangementStyle::default();
+        let audio = ArrangementClipAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        // len_beats=0.5 → w = 20px、 default min = 32 → grip disable
+        let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 0.5, "c", audio)])];
+        assert_eq!(
+            audio_grip_hit_in_lanes(&tracks, view, lanes, 10.0, 16.0, &style),
+            None
+        );
+        assert_eq!(
+            audio_grip_hit_in_lanes(&tracks, view, lanes, 2.0, 6.0, &style),
+            None
+        );
+    }
+
+    /// FadeCurve.next() は Linear → Exp → SCurve → Linear の cycle。
+    #[test]
+    fn fade_curve_next_cycles() {
+        assert_eq!(FadeCurve::Linear.next(), FadeCurve::Exponential);
+        assert_eq!(FadeCurve::Exponential.next(), FadeCurve::SCurve);
+        assert_eq!(FadeCurve::SCurve.next(), FadeCurve::Linear);
+    }
+
+    /// compute_audio_drag_outcome: Gain drag は dy 上で gain_db 増加 (pixels_per_db = 0.25 default)。
+    #[test]
+    fn compute_audio_drag_outcome_gain_changes_db_by_pixels() {
+        let style = ArrangementStyle::default();
+        let audio = ArrangementClipAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let ad = AudioDragSession {
+            key: ClipKey { track: 0, clip: 0 },
+            kind: AudioDragKind::Gain,
+            anchor: audio,
+            clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 100.0, h: 28.0 },
+            clip_len_beats_anchor: 4.0,
+            anchor_mouse: (50.0, 14.0),
+            // dy = -20 (上に 20 px) → next_db = 0 + (-(-20) * 0.25) = +5.0
+            last_mouse: (50.0, -6.0),
+            locked_horizontal: Some(false),
+        };
+        match compute_audio_drag_outcome(&ad, 0.025, &style) {
+            Some(AudioDragOutcome::Gain { next_db }) => {
+                assert!((next_db - 5.0).abs() < 1e-3, "+20px = +5dB: got {next_db}");
+            }
+            other => panic!("expected Gain, got {other:?}"),
+        }
+    }
+
+    /// compute_audio_drag_outcome: Gain drag は ±range_db に clamp される。
+    #[test]
+    fn compute_audio_drag_outcome_gain_clamps_to_range() {
+        let style = ArrangementStyle::default(); // range = 24 dB
+        let audio = ArrangementClipAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        // dy = -200 → +50 dB raw → clamped to +24
+        let ad = AudioDragSession {
+            key: ClipKey { track: 0, clip: 0 },
+            kind: AudioDragKind::Gain,
+            anchor: audio,
+            clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 100.0, h: 28.0 },
+            clip_len_beats_anchor: 4.0,
+            anchor_mouse: (50.0, 14.0),
+            last_mouse: (50.0, -186.0),
+            locked_horizontal: Some(false),
+        };
+        match compute_audio_drag_outcome(&ad, 0.025, &style) {
+            Some(AudioDragOutcome::Gain { next_db }) => {
+                assert!((next_db - 24.0).abs() < 1e-3, "clamped to +24 dB: got {next_db}");
+            }
+            other => panic!("expected Gain, got {other:?}"),
+        }
+    }
+
+    /// compute_audio_drag_outcome: FadeIn + horizontal lock は dx 正で fade_in_beats 増加。
+    /// beat_per_px = 0.025 (= 40 px/beat), dx = +40 px → +1 beat.
+    #[test]
+    fn compute_audio_drag_outcome_fade_in_horizontal_changes_length() {
+        let style = ArrangementStyle::default();
+        let audio = ArrangementClipAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.5,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let ad = AudioDragSession {
+            key: ClipKey { track: 0, clip: 0 },
+            kind: AudioDragKind::FadeIn,
+            anchor: audio,
+            clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
+            clip_len_beats_anchor: 4.0,
+            anchor_mouse: (0.0, 0.0),
+            last_mouse: (40.0, 0.0),
+            locked_horizontal: Some(true),
+        };
+        match compute_audio_drag_outcome(&ad, 0.025, &style) {
+            Some(AudioDragOutcome::FadeLength { edge, next_beats }) => {
+                assert_eq!(edge, FadeEdge::In);
+                // anchor 0.5 + delta 1.0 = 1.5
+                assert!((next_beats - 1.5).abs() < 1e-6, "got {next_beats}");
+            }
+            other => panic!("expected FadeLength, got {other:?}"),
+        }
+    }
+
+    /// FadeOut + horizontal lock は dx **負** で fade_out_beats 増加 (右側から内側に伸びる)。
+    #[test]
+    fn compute_audio_drag_outcome_fade_out_horizontal_uses_negative_dx() {
+        let style = ArrangementStyle::default();
+        let audio = ArrangementClipAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.5,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let ad = AudioDragSession {
+            key: ClipKey { track: 0, clip: 0 },
+            kind: AudioDragKind::FadeOut,
+            anchor: audio,
+            clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
+            clip_len_beats_anchor: 4.0,
+            anchor_mouse: (160.0, 0.0),
+            last_mouse: (120.0, 0.0), // dx = -40
+            locked_horizontal: Some(true),
+        };
+        match compute_audio_drag_outcome(&ad, 0.025, &style) {
+            Some(AudioDragOutcome::FadeLength { edge, next_beats }) => {
+                assert_eq!(edge, FadeEdge::Out);
+                // dx=-40 → -40 * 0.025 = -1.0、 FadeOut signed = -(-1) = +1
+                // anchor 0.5 + 1.0 = 1.5
+                assert!((next_beats - 1.5).abs() < 1e-6, "got {next_beats}");
+            }
+            other => panic!("expected FadeLength, got {other:?}"),
+        }
+    }
+
+    /// fade length は `0..=clip_len_beats` に clamp される。
+    #[test]
+    fn compute_audio_drag_outcome_fade_length_clamps_to_clip_len() {
+        let style = ArrangementStyle::default();
+        let audio = ArrangementClipAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.5,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        // dx = +400 px @ 0.025 beat/px = +10 beat → 0.5 + 10 = 10.5、 clamp to clip_len 4.0
+        let ad = AudioDragSession {
+            key: ClipKey { track: 0, clip: 0 },
+            kind: AudioDragKind::FadeIn,
+            anchor: audio,
+            clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
+            clip_len_beats_anchor: 4.0,
+            anchor_mouse: (0.0, 0.0),
+            last_mouse: (400.0, 0.0),
+            locked_horizontal: Some(true),
+        };
+        match compute_audio_drag_outcome(&ad, 0.025, &style) {
+            Some(AudioDragOutcome::FadeLength { next_beats, .. }) => {
+                assert!((next_beats - 4.0).abs() < 1e-6, "clamped to 4.0: got {next_beats}");
+            }
+            other => panic!("expected FadeLength, got {other:?}"),
+        }
+    }
+
+    /// FadeIn + vertical lock は curve 切替を返す (Linear → Exponential)。
+    #[test]
+    fn compute_audio_drag_outcome_fade_in_vertical_toggles_curve() {
+        let style = ArrangementStyle::default();
+        let audio = ArrangementClipAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.5,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let ad = AudioDragSession {
+            key: ClipKey { track: 0, clip: 0 },
+            kind: AudioDragKind::FadeIn,
+            anchor: audio,
+            clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
+            clip_len_beats_anchor: 4.0,
+            anchor_mouse: (0.0, 0.0),
+            last_mouse: (0.0, -20.0),
+            locked_horizontal: Some(false),
+        };
+        match compute_audio_drag_outcome(&ad, 0.025, &style) {
+            Some(AudioDragOutcome::FadeCurve { edge, next_curve }) => {
+                assert_eq!(edge, FadeEdge::In);
+                assert_eq!(next_curve, FadeCurve::Exponential);
+            }
+            other => panic!("expected FadeCurve, got {other:?}"),
+        }
+    }
+
+    /// sticky direction 未確定 (locked_horizontal = None) は no-op (None) を返す。
+    #[test]
+    fn compute_audio_drag_outcome_unlocked_returns_none() {
+        let style = ArrangementStyle::default();
+        let audio = ArrangementClipAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.5,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let ad = AudioDragSession {
+            key: ClipKey { track: 0, clip: 0 },
+            kind: AudioDragKind::FadeIn,
+            anchor: audio,
+            clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
+            clip_len_beats_anchor: 4.0,
+            anchor_mouse: (0.0, 0.0),
+            last_mouse: (3.0, 4.0), // < threshold 10 px
+            locked_horizontal: None,
+        };
+        assert_eq!(compute_audio_drag_outcome(&ad, 0.025, &style), None);
+    }
+
+    /// fold_arrangement_clip_hash: audio_edit の gain_db / fade を変えると hash が変わる。
+    #[test]
+    fn fold_arrangement_clip_hash_changes_on_gain_db() {
+        let audio_a = ArrangementClipAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let audio_b = ArrangementClipAudioEdit { gain_db: 3.0, ..audio_a };
+        let before = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio_a)])];
+        let after = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio_b)])];
+        assert_ne!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after),
+            "audio_edit.gain_db 変化で hash が変わる (cache 再構築保証)"
+        );
+    }
+
+    #[test]
+    fn fold_arrangement_clip_hash_changes_on_fade_curve() {
+        let audio_a = ArrangementClipAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.5,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let audio_b = ArrangementClipAudioEdit {
+            fade_in_curve: FadeCurve::Exponential,
+            ..audio_a
+        };
+        let before = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio_a)])];
+        let after = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio_b)])];
+        assert_ne!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after),
+            "audio_edit.fade_in_curve 変化で hash が変わる"
+        );
+    }
+
+    /// integration: 中央 dB handle を縦 drag → release で SetClipGainDb が発火する。
+    /// press at (80, 16) → drag to (80, -4) (dy = -20) → release。
+    /// 期待: next_gain_db = 0 + (20 * 0.25) = +5.0
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn audio_gain_drag_emits_set_clip_gain_db() {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        let audio = ArrangementClipAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let mut model = Model {
+            tracks: vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])],
+            view: ArrangementView { header_w: 0.0, ruler_h: 0.0, ..ArrangementView::default() },
+        };
+
+        let observed: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Frame 1: press at (80, 16) — clip 中央の handle band
+        let press_input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((80.0, 16.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        };
+        let observed_cb = Arc::clone(&observed);
+        let style = ArrangementStyle::default();
+        let edits = host.frame_to_edits(&model, &mut scene, screen, press_input, |m, ui| {
+            let observed_cb = Arc::clone(&observed_cb);
+            let _ = ui.arrangement(
+                "arr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &m.tracks,
+                m.view,
+                &[],
+                &[],
+                &style,
+                move |req| {
+                    if let ArrangementEditRequest::SetClipGainDb(deltas) = &req {
+                        for d in deltas {
+                            observed_cb.lock().unwrap().push(d.next_gain_db);
+                        }
+                    }
+                    Edit::mutate(|_: &mut Model| {})
+                },
+            );
+        });
+        for e in edits {
+            e.apply(&mut model);
+        }
+
+        // Frame 2: continuation at (80, -4)、 dy = -20 → next_db = +5
+        let drag_input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((80.0, -4.0)),
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        };
+        let observed_cb = Arc::clone(&observed);
+        let edits = host.frame_to_edits(&model, &mut scene, screen, drag_input, |m, ui| {
+            let observed_cb = Arc::clone(&observed_cb);
+            let _ = ui.arrangement(
+                "arr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &m.tracks,
+                m.view,
+                &[],
+                &[],
+                &style,
+                move |req| {
+                    if let ArrangementEditRequest::SetClipGainDb(deltas) = &req {
+                        for d in deltas {
+                            observed_cb.lock().unwrap().push(d.next_gain_db);
+                        }
+                    }
+                    Edit::mutate(|_: &mut Model| {})
+                },
+            );
+        });
+        for e in edits {
+            e.apply(&mut model);
+        }
+
+        // Frame 3: release at (80, -4)
+        let release_input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((80.0, -4.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        };
+        let observed_cb = Arc::clone(&observed);
+        let edits = host.frame_to_edits(&model, &mut scene, screen, release_input, |m, ui| {
+            let observed_cb = Arc::clone(&observed_cb);
+            let _ = ui.arrangement(
+                "arr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &m.tracks,
+                m.view,
+                &[],
+                &[],
+                &style,
+                move |req| {
+                    if let ArrangementEditRequest::SetClipGainDb(deltas) = &req {
+                        for d in deltas {
+                            observed_cb.lock().unwrap().push(d.next_gain_db);
+                        }
+                    }
+                    Edit::mutate(|_: &mut Model| {})
+                },
+            );
+        });
+        for e in edits {
+            e.apply(&mut model);
+        }
+
+        let log = observed.lock().unwrap();
+        assert_eq!(log.len(), 1, "release frame で 1 度だけ SetClipGainDb 発火: got {log:?}");
+        assert!((log[0] - 5.0).abs() < 1e-3, "next_gain_db = +5.0: got {}", log[0]);
+    }
+
+    /// integration: clip 上端の左角を click → 横 drag → release で SetClipFade が発火する。
+    /// press at (4, 4) → drag to (44, 4) (dx=+40, dy=0、 horizontal lock) → release。
+    /// 期待: SetClipFade { edge: In, next_beats: 1.0 } (anchor 0 + 1 beat)
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn audio_fade_in_horizontal_drag_emits_set_clip_fade() {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        let audio = ArrangementClipAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let mut model = Model {
+            tracks: vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])],
+            view: ArrangementView { header_w: 0.0, ruler_h: 0.0, ..ArrangementView::default() },
+        };
+
+        let observed: Arc<Mutex<Vec<(FadeEdge, f64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let curve_observed: Arc<Mutex<Vec<FadeCurve>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let style = ArrangementStyle::default();
+
+        // Frame 1: press at (4, 4) — clip 上端左角
+        let press_input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((4.0, 4.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        };
+        let observed_cb = Arc::clone(&observed);
+        let curve_cb = Arc::clone(&curve_observed);
+        let edits = host.frame_to_edits(&model, &mut scene, screen, press_input, |m, ui| {
+            let observed_cb = Arc::clone(&observed_cb);
+            let curve_cb = Arc::clone(&curve_cb);
+            let _ = ui.arrangement(
+                "arr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &m.tracks,
+                m.view,
+                &[],
+                &[],
+                &style,
+                move |req| {
+                    match &req {
+                        ArrangementEditRequest::SetClipFade(deltas) => {
+                            for d in deltas {
+                                observed_cb.lock().unwrap().push((d.edge, d.next_beats));
+                            }
+                        }
+                        ArrangementEditRequest::SetClipFadeCurve(deltas) => {
+                            for d in deltas {
+                                curve_cb.lock().unwrap().push(d.next_curve);
+                            }
+                        }
+                        _ => {}
+                    }
+                    Edit::mutate(|_: &mut Model| {})
+                },
+            );
+        });
+        for e in edits {
+            e.apply(&mut model);
+        }
+
+        // Frame 2: continuation at (44, 4) → dx = +40 px → 1 beat (40 px/beat)、 dy = 0
+        let drag_input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((44.0, 4.0)),
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        };
+        let observed_cb = Arc::clone(&observed);
+        let curve_cb = Arc::clone(&curve_observed);
+        let edits = host.frame_to_edits(&model, &mut scene, screen, drag_input, |m, ui| {
+            let observed_cb = Arc::clone(&observed_cb);
+            let curve_cb = Arc::clone(&curve_cb);
+            let _ = ui.arrangement(
+                "arr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &m.tracks,
+                m.view,
+                &[],
+                &[],
+                &style,
+                move |req| {
+                    match &req {
+                        ArrangementEditRequest::SetClipFade(deltas) => {
+                            for d in deltas {
+                                observed_cb.lock().unwrap().push((d.edge, d.next_beats));
+                            }
+                        }
+                        ArrangementEditRequest::SetClipFadeCurve(deltas) => {
+                            for d in deltas {
+                                curve_cb.lock().unwrap().push(d.next_curve);
+                            }
+                        }
+                        _ => {}
+                    }
+                    Edit::mutate(|_: &mut Model| {})
+                },
+            );
+        });
+        for e in edits {
+            e.apply(&mut model);
+        }
+
+        // Frame 3: release at (44, 4)
+        let release_input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((44.0, 4.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        };
+        let observed_cb = Arc::clone(&observed);
+        let curve_cb = Arc::clone(&curve_observed);
+        let edits = host.frame_to_edits(&model, &mut scene, screen, release_input, |m, ui| {
+            let observed_cb = Arc::clone(&observed_cb);
+            let curve_cb = Arc::clone(&curve_cb);
+            let _ = ui.arrangement(
+                "arr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &m.tracks,
+                m.view,
+                &[],
+                &[],
+                &style,
+                move |req| {
+                    match &req {
+                        ArrangementEditRequest::SetClipFade(deltas) => {
+                            for d in deltas {
+                                observed_cb.lock().unwrap().push((d.edge, d.next_beats));
+                            }
+                        }
+                        ArrangementEditRequest::SetClipFadeCurve(deltas) => {
+                            for d in deltas {
+                                curve_cb.lock().unwrap().push(d.next_curve);
+                            }
+                        }
+                        _ => {}
+                    }
+                    Edit::mutate(|_: &mut Model| {})
+                },
+            );
+        });
+        for e in edits {
+            e.apply(&mut model);
+        }
+
+        let log = observed.lock().unwrap();
+        let curve_log = curve_observed.lock().unwrap();
+        assert_eq!(log.len(), 1, "release frame で SetClipFade 1 度発火: got {log:?}");
+        assert_eq!(log[0].0, FadeEdge::In);
+        // dx=+40 px @ 800px/16beats = 50 px/beat → +40/50 = +0.8 beat
+        assert!((log[0].1 - 0.8).abs() < 1e-3, "next_beats = +0.8: got {}", log[0].1);
+        assert!(curve_log.is_empty(), "horizontal lock では SetClipFadeCurve 非発火");
     }
 }

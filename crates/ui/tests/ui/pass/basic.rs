@@ -202,6 +202,7 @@ fn main() {
                             name: std::sync::Arc::from("clip"),
                             color: None,
                             share_group_color: None,
+                            audio_edit: None,
                         };
                     }),
                     ArrangementEditRequest::CloneClipsLinked(_) => {
@@ -254,6 +255,15 @@ fn main() {
                         Edit::mutate(|_m: &mut Model| {})
                     }
                     ArrangementEditRequest::SetTrackParent { tracks: _, parent: _, anchor_after: _ } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::SetClipGainDb(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::SetClipFade(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::SetClipFadeCurve(_) => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
                 },
