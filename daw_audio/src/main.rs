@@ -545,13 +545,12 @@ fn build_stream(
                 local.process_buffer(&shared, &bridge, session_sample_rate, frames);
 
                 // A2: publish the engine's playhead to shmem so the GUI
-                // can draw the cursor. `u64::MAX` is the "not playing"
-                // sentinel the GUI already understands.
-                let published_ph = if local.playing {
-                    shared.playhead.load(Ordering::Acquire)
-                } else {
-                    u64::MAX
-                };
+                // can draw the cursor. 停止中も現在の playhead をそのまま
+                // publish する (= ruler click で動かした位置や、 Stop 直前
+                // の位置を GUI に反映、 業界標準の挙動)。 `u64::MAX` は
+                // bridge の未初期化値 (= audio thread が一度も書いてない
+                // 状態) として残す。
+                let published_ph = shared.playhead.load(Ordering::Acquire);
                 bridge.set_playhead_samples(published_ph);
 
                 let gain = f32::from_bits(master_gain.load(Ordering::Relaxed));

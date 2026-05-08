@@ -3151,7 +3151,10 @@ impl AppData {
     fn stop(&mut self) {
         self.send_audio(MainToChild::Stop);
         self.is_playing = false;
-        self.playhead_beat = None;
+        // playhead_beat はクリアしない (= 停止位置を保持して GUI に
+        // 表示し続ける、 ruler click 用)。 audio engine 側も stop 後の
+        // shared.playhead をそのまま publish するので、 on_tick で
+        // 最新値が同期される。
     }
 
     fn toggle_loop(&mut self) {
