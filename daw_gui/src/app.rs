@@ -1039,6 +1039,10 @@ impl AppData {
                 | AppEvent::SetClipFadeBeatsBatch(_)
                 | AppEvent::SetClipFadeCurveBatch(_)
                 | AppEvent::DuplicateAudioEditorEvent
+                | AppEvent::SetAudioEventStart { .. }
+                | AppEvent::SetAudioEventTrim { .. }
+                | AppEvent::AddAudioEventFromFile { .. }
+                | AppEvent::DeleteAudioEvent { .. }
                 | AppEvent::ImportAudio { .. }
                 | AppEvent::AddNote { .. }
                 | AppEvent::ResizeNote { .. }
@@ -1722,6 +1726,49 @@ pub enum AppEvent {
     /// 同 source + 同パラメータ。 clip.length_beats が足りなければ自動
     /// で伸ばす。 selection は新 event に移る。
     DuplicateAudioEditorEvent,
+
+    // ---- Audio Editor event 単位編集 (Phase 2 PR-D 段階 3) -----------
+    /// Audio Editor で event の clip 内 start position を変更
+    /// (= 中央 drag 移動)。 `clip` の `event_idx` 番目の event の
+    /// `event_start_in_clip_beats` を `new_start_beats` (clamp 0..) に
+    /// 設定。 範囲外 / 非 audio clip / event_idx 範囲外なら no-op。
+    /// clip.length_beats は新 event の終端を含むよう自動拡張。
+    SetAudioEventStart {
+        clip: ClipRef,
+        event_idx: usize,
+        new_start_beats: f64,
+    },
+    /// Audio Editor で event 端 trim (= 左右端 drag)。 `side == Left`
+    /// なら `event_start_in_clip_beats` + `event_length_beats` +
+    /// `source_start_frames` を delta で連動更新、 `side == Right` なら
+    /// `event_length_beats` + `source_end_frames` を更新。 source は
+    /// `audio_sources` から sample_rate を取って delta_beats → frames
+    /// 変換。 clip.length_beats は必要に応じて拡張。
+    SetAudioEventTrim {
+        clip: ClipRef,
+        event_idx: usize,
+        side: AudioEventTrimSide,
+        delta_beats: f64,
+    },
+    /// Audio Editor の空白領域に file system drag&drop された path を
+    /// decode + import し、 既存 audio clip の content に新 event として
+    /// `position_in_clip_beats` の位置に追加。 source 採番 + buffer cache
+    /// 登録は `import_audio::import_one` 経由 (= top-level Import Audio
+    /// と同 pipeline)。 失敗時は status_message にエラー、 selection は
+    /// 新 event に移す。 clip.length_beats は必要に応じて拡張。
+    AddAudioEventFromFile {
+        clip: ClipRef,
+        path: PathBuf,
+        position_in_clip_beats: f64,
+    },
+    /// Audio Editor で event を削除 (= Delete key / context menu)。
+    /// `clip` の `event_idx` 番目を `events.remove`。 残 event 0 個に
+    /// なっても content は保持 (= clip の placeholder)。 selection は
+    /// `event_idx` を最大に詰める (events 空なら None)。
+    DeleteAudioEvent {
+        clip: ClipRef,
+        event_idx: usize,
+    },
 }
 
 /// `*Batch` 系 AppEvent で fade in / out を区別するための marker。
@@ -1732,6 +1779,15 @@ pub enum AppEvent {
 pub enum FadeEdgeKind {
     In,
     Out,
+}
+
+/// Audio Editor の event trim 側 (左端 / 右端) marker。 `SetAudioEventTrim`
+/// AppEvent 用。 left = (event_start, source_start) 連動、 right =
+/// (event_length, source_end) 連動。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioEventTrimSide {
+    Left,
+    Right,
 }
 
 impl AppData {
@@ -2132,6 +2188,18 @@ impl AppData {
             }
             AppEvent::DuplicateAudioEditorEvent => {
                 self.duplicate_audio_editor_event();
+            }
+            AppEvent::SetAudioEventStart { clip, event_idx, new_start_beats } => {
+                self.set_audio_event_start(clip, event_idx, new_start_beats);
+            }
+            AppEvent::SetAudioEventTrim { clip, event_idx, side, delta_beats } => {
+                self.set_audio_event_trim(clip, event_idx, side, delta_beats);
+            }
+            AppEvent::AddAudioEventFromFile { clip, path, position_in_clip_beats } => {
+                self.add_audio_event_from_file(clip, path, position_in_clip_beats);
+            }
+            AppEvent::DeleteAudioEvent { clip, event_idx } => {
+                self.delete_audio_event(clip, event_idx);
             }
             AppEvent::ToggleClipReversed(target) => {
                 let cur = self.is_clip_audio_event_reversed(target);
@@ -4424,6 +4492,257 @@ impl AppData {
         }
     }
 
+    /// PR-D 段階 3: Audio Editor で event の clip 内位置を変更 (= 中央
+    /// drag 移動)。 `event_start_in_clip_beats` を `new_start_beats`
+    /// (clamp 0..) に設定。 範囲外 / 非 audio clip / event_idx 範囲外
+    /// なら no-op。 clip.length_beats は新 event 終端を含むよう自動拡張。
+    fn set_audio_event_start(
+        &mut self,
+        target: ClipRef,
+        event_idx: usize,
+        new_start_beats: f64,
+    ) {
+        let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(target.clip as usize) else {
+            return;
+        };
+        let content_id = clip.content_id;
+        let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+        else {
+            return;
+        };
+        let Some(event) = audio.events.get_mut(event_idx) else {
+            return;
+        };
+        let new_start = new_start_beats.max(0.0);
+        event.event_start_in_clip_beats = new_start;
+        let needed = new_start + event.event_length_beats;
+        if needed > clip.length_beats {
+            clip.length_beats = needed;
+        }
+        self.is_dirty = true;
+        self.sync_song_to_plugin_host();
+        if self.clip_edit_buffer_target == Some(target) {
+            self.resync_clip_audio_event_edit_buffers(target);
+        }
+    }
+
+    /// PR-D 段階 3: Audio Editor で event 端 trim (= 左右端 drag)。
+    /// `side == Left` で左端 trim (= event_start_in_clip_beats +
+    /// event_length_beats + source_start_frames を delta で連動)、
+    /// `side == Right` で右端 trim (= event_length_beats +
+    /// source_end_frames を連動)。 source の sample_rate で
+    /// delta_beats → frames 変換 (bpm = self.song.bpm)。 source 境界
+    /// (0..total_frames) と event_length_beats > 0 を保つ clamp 込み。
+    fn set_audio_event_trim(
+        &mut self,
+        target: ClipRef,
+        event_idx: usize,
+        side: AudioEventTrimSide,
+        delta_beats: f64,
+    ) {
+        let bpm = self.song.bpm.max(1.0) as f64;
+        // source 情報を先に snapshot (= 後の mut borrow と分離)。
+        let (sr_hz, total_frames) = {
+            let Some(track) = self.song.tracks.get(target.track as usize) else {
+                return;
+            };
+            let Some(clip) = track.clips.get(target.clip as usize) else {
+                return;
+            };
+            let Some(common::model::ClipContent::Audio(audio)) =
+                self.song.clip_contents.get(&clip.content_id)
+            else {
+                return;
+            };
+            let Some(event) = audio.events.get(event_idx) else {
+                return;
+            };
+            let Some(audio_source) = self.song.audio_sources.get(&event.source_id) else {
+                return;
+            };
+            (audio_source.sample_rate as f64, audio_source.frames)
+        };
+        let delta_frames = (delta_beats * 60.0 / bpm * sr_hz).round() as i64;
+
+        let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(target.clip as usize) else {
+            return;
+        };
+        let content_id = clip.content_id;
+        let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+        else {
+            return;
+        };
+        let Some(event) = audio.events.get_mut(event_idx) else {
+            return;
+        };
+
+        const MIN_LEN_BEATS: f64 = 1e-4;
+        match side {
+            AudioEventTrimSide::Left => {
+                // delta_beats > 0 で右に縮める (= start を遅らせる)、
+                // < 0 で左に伸ばす。 ただし event_length が MIN_LEN を
+                // 切らないよう先に clamp。
+                let max_inset = (event.event_length_beats - MIN_LEN_BEATS).max(0.0);
+                let dbeats = delta_beats.clamp(
+                    -event.event_start_in_clip_beats,
+                    max_inset,
+                );
+                let dframes = (dbeats * 60.0 / bpm * sr_hz).round() as i64;
+                let new_start_in_clip = event.event_start_in_clip_beats + dbeats;
+                let new_length = event.event_length_beats - dbeats;
+                let new_source_start = (event.source_start_frames as i64 + dframes)
+                    .max(0)
+                    .min(event.source_end_frames as i64) as u64;
+                event.event_start_in_clip_beats = new_start_in_clip;
+                event.event_length_beats = new_length.max(MIN_LEN_BEATS);
+                event.source_start_frames = new_source_start;
+                let _ = delta_frames;
+            }
+            AudioEventTrimSide::Right => {
+                // delta_beats > 0 で右に伸ばす、 < 0 で縮める。 縮める
+                // 側は event_length が MIN_LEN を切らないよう clamp、
+                // 伸ばす側は source_end_frames が total_frames を超え
+                // ないよう clamp。
+                let max_grow_frames = total_frames as i64 - event.source_end_frames as i64;
+                let max_grow_beats =
+                    (max_grow_frames as f64) / sr_hz * bpm / 60.0;
+                let min_shrink_beats = -(event.event_length_beats - MIN_LEN_BEATS).max(0.0);
+                let dbeats = delta_beats.clamp(min_shrink_beats, max_grow_beats);
+                let dframes = (dbeats * 60.0 / bpm * sr_hz).round() as i64;
+                let new_length = event.event_length_beats + dbeats;
+                let new_source_end = ((event.source_end_frames as i64 + dframes)
+                    .max(event.source_start_frames as i64)
+                    .min(total_frames as i64)) as u64;
+                event.event_length_beats = new_length.max(MIN_LEN_BEATS);
+                event.source_end_frames = new_source_end;
+            }
+        }
+
+        let needed = event.event_start_in_clip_beats + event.event_length_beats;
+        if needed > clip.length_beats {
+            clip.length_beats = needed;
+        }
+        self.is_dirty = true;
+        self.sync_song_to_plugin_host();
+        if self.clip_edit_buffer_target == Some(target) {
+            self.resync_clip_audio_event_edit_buffers(target);
+        }
+    }
+
+    /// PR-D 段階 3: Audio Editor の空白領域 file drop で新 event 追加。
+    /// `import_audio::import_one` で decode + audio source 登録、 既存
+    /// audio clip に新 event を `position_in_clip_beats` (clamp 0..) に
+    /// 配置。 失敗時は status_message にエラー、 selection は新 event に
+    /// 移す。 clip.length_beats は新 event 終端を含むよう自動拡張。
+    fn add_audio_event_from_file(
+        &mut self,
+        target: ClipRef,
+        path: PathBuf,
+        position_in_clip_beats: f64,
+    ) {
+        if !self.is_audio_clip(target) {
+            self.status_message = "Audio Editor: 対象 clip が audio ではないため event 追加できません".into();
+            return;
+        }
+        let project_dir: Option<PathBuf> = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.parent().map(Path::to_path_buf));
+        let imported = match import_audio::import_one(&path, project_dir.as_deref()) {
+            Ok(i) => i,
+            Err(e) => {
+                self.status_message = format!("Audio event 追加 失敗: {}: {e}", path.display());
+                return;
+            }
+        };
+        let bpm = self.song.bpm;
+        let length_beats =
+            frames_to_beats(imported.buffer.frames, imported.buffer.sample_rate, bpm);
+        let display_name = imported.display_name.clone();
+
+        let source_id = self.song.alloc_audio_source_id();
+        self.song.audio_sources.insert(source_id, imported.source);
+        self.audio_source_cache
+            .insert(source_id, imported.buffer.clone());
+
+        let position = position_in_clip_beats.max(0.0);
+        let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(target.clip as usize) else {
+            return;
+        };
+        let content_id = clip.content_id;
+        let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+        else {
+            return;
+        };
+        let new_event = AudioEvent {
+            source_id,
+            event_start_in_clip_beats: position,
+            event_length_beats: length_beats,
+            source_start_frames: 0,
+            source_end_frames: imported.buffer.frames,
+            ..AudioEvent::default()
+        };
+        audio.events.push(new_event);
+        let new_idx = audio.events.len() - 1;
+        let needed = position + length_beats;
+        if needed > clip.length_beats {
+            clip.length_beats = needed;
+        }
+        self.audio_editor_selected_event = Some(new_idx);
+        self.is_dirty = true;
+        self.sync_song_to_plugin_host();
+        if self.clip_edit_buffer_target == Some(target) {
+            self.resync_clip_audio_event_edit_buffers(target);
+        }
+        self.status_message = format!("Audio event 追加: {display_name}");
+    }
+
+    /// PR-D 段階 3: Audio Editor で event を削除 (= Delete key /
+    /// context menu)。 `events.remove(event_idx)`。 残 event 0 個でも
+    /// content は保持 (= clip placeholder)。 selection は event_idx を
+    /// `events.len() - 1` で詰める (events 空なら None)。
+    fn delete_audio_event(&mut self, target: ClipRef, event_idx: usize) {
+        let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get_mut(target.clip as usize) else {
+            return;
+        };
+        let content_id = clip.content_id;
+        let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+        else {
+            return;
+        };
+        if event_idx >= audio.events.len() {
+            return;
+        }
+        audio.events.remove(event_idx);
+        let new_sel = if audio.events.is_empty() {
+            None
+        } else {
+            Some(event_idx.min(audio.events.len() - 1))
+        };
+        self.audio_editor_selected_event = new_sel;
+        self.is_dirty = true;
+        self.sync_song_to_plugin_host();
+        if self.clip_edit_buffer_target == Some(target) {
+            self.resync_clip_audio_event_edit_buffers(target);
+        }
+    }
+
     /// 全選択 audio clip に短 fade を一括適用 (`docs/plan_audio_clip
     /// .md` §3.5 Auto-Fade)。 fade 長は 4 ms 相当 (= `0.004 * bpm / 60`
     /// beats)、 既存値は上書き。 audio 以外の clip (MIDI / Vocal) と
@@ -6275,6 +6594,31 @@ impl AppData {
             return;
         }
         self.action_import_audio(paths);
+    }
+
+    /// PR-D 段階 3: Audio Editor の context menu "Add From Source..."。
+    /// `rfd` で 1 ファイル選択 → `AddAudioEventFromFile` に転送 (= 内部
+    /// で `import_audio::import_one` 経由で decode + AudioSource 採番)。
+    /// `position_in_clip_beats` は呼び出し側 (= context menu 発火位置 =
+    /// 直前 event の右端) で決定。 `handle_event` 経由なので auto Undo
+    /// snapshot が積まれる。
+    pub fn action_open_audio_event_dialog(
+        &mut self,
+        target: ClipRef,
+        position_in_clip_beats: f64,
+    ) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("WAV", &["wav"])
+            .set_title("Add Audio Event")
+            .pick_file()
+        else {
+            return;
+        };
+        self.handle_event(AppEvent::AddAudioEventFromFile {
+            clip: target,
+            path,
+            position_in_clip_beats,
+        });
     }
 
     fn action_import_audio(&mut self, paths: Vec<PathBuf>) {

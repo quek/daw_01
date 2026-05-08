@@ -192,15 +192,18 @@ multi-event clip を作成する手段がないとテストもできないので
 - ✅ **PR-A**: `common::audio_render` 共通化 (commit `3a3826e`)
 - ✅ **PR-B**: multi-clip drag Undo 統合 (commit `4401d59`)
 - ✅ **PR-D 段階 1**: Audio Editor event selection + Duplicate (commit `38b0a9b`)
-- ✅ **gui_01 #026 [Open]**: rect-based pointer hit-test API 要望 (commit `2675218`)
+- ✅ **gui_01 #026 [Replied]**: rect-based pointer hit-test API 要望 (commit
+  `2675218`、 gui_01 側 M14 Phase 63l で `take_primary_press_in_rect` +
+  `take_drag_in_rect` 実装完了 → daw_01 path 依存再ビルドで利用可)
 - ✅ **PR-D 段階 2**: Inspector multi-event + Ctrl+] / Ctrl+[ navigation (commit `24dd71d`)
+- ✅ **PR-D 段階 3**: rect-based drag UI = 中央 drag 移動 / 左右端 trim
+  / 空白 drop で event 追加 / Delete shortcut / 右クリック context menu
+  (Duplicate / Delete / Add From Source...)。 AppEvent
+  `SetAudioEventStart` / `SetAudioEventTrim` / `AddAudioEventFromFile` /
+  `DeleteAudioEvent` + `AudioEventTrimSide` 新設、 全 undoable。
+  ghost preview (move = outline / trim = vertical line) 付き。
 
 次セッションで:
-- ⏳ **PR-D 段階 3**: drag UI = event 中央 drag 移動 / 左右端 drag trim
-  / 空白 drop で event 追加 / context menu の Duplicate / Delete。
-  gui_01 #026 (= `take_primary_press_in_rect` + `take_drag_in_rect`) の
-  main マージを待ってから着手 (= 待ちきれなければ自前 hit test を
-  audio_editor.rs に書くが、 widget 側の API 整備が clean)
 - ⏳ **PR-C**: plugin-FX Bounce (= 新 track + 新 Clip)。 規模大 (= IPC
   + state 管理 + WAV crop + 新 track 自動作成 + plugin の release tail
   扱い)。 1 セッション完結のリスクが高いため独立セッションで腰据えて

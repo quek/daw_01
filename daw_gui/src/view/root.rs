@@ -234,11 +234,20 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }));
     }
     if ui.take_shortcut("delete") {
-        // ノート選択があればノート削除、無ければ clip 削除。
-        // 両方 dispatch するとノート選択中でも clip が消えてしまう。
+        // 優先順:
+        //   1. Audio Editor 開いてて event 選択中 → DeleteAudioEvent
+        //   2. notes 選択あり → DeleteSelectedNotes
+        //   3. それ以外 → DeleteSelectedClip
+        // 同 frame 内で重複 dispatch しないよう排他にする (= ノート
+        // 選択中に Delete 押して clip も消える事故を防ぐ)。
+        let audio_event_target = app
+            .audio_editor_clip
+            .zip(app.audio_editor_selected_event);
         let has_notes = !app.selected_notes.is_empty();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            if has_notes {
+            if let Some((clip, event_idx)) = audio_event_target {
+                app.handle_event(AppEvent::DeleteAudioEvent { clip, event_idx });
+            } else if has_notes {
                 app.handle_event(AppEvent::DeleteSelectedNotes);
             } else {
                 app.handle_event(AppEvent::DeleteSelectedClip);

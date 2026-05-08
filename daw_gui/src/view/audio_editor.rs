@@ -13,17 +13,74 @@
 //! 編集機能は後続 PR (PR8 以降) で。 編集はそれまで Inspector 経由
 //! (Phase 2 PR1-3)。
 
+use std::sync::Arc;
+
 use daw_ui_core::{
-    ChannelLayout, Edit, SampleSlices, Ui, WaveformRenderMode, WaveformSource,
+    ChannelLayout, DragKind, Edit, SampleSlices, Ui, WaveformRenderMode, WaveformSource,
     WaveformStyle, WaveformView,
 };
 use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect};
 
-use crate::app::{AppData, AppEvent};
+use crate::app::{AppData, AppEvent, AudioEventTrimSide};
 
 const BG: Color = Color { r: 0.10, g: 0.11, b: 0.13, a: 1.0 };
 const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
 const TEXT_DIM: Color = Color { r: 0.62, g: 0.65, b: 0.70, a: 1.0 };
+const GHOST: Color = Color { r: 0.95, g: 0.78, b: 0.31, a: 0.85 };
+
+/// PR-D 段階 3: 中央 drag 中の event ghost (rectangle outline)。 dx は
+/// drag.delta.0 (px)。 描画は wf_area で clip。
+fn push_move_ghost(ui: &mut Ui<'_, AppData>, event_rect: Rect, wf_area: Rect, dx: f32) {
+    let g = Rect {
+        x: event_rect.x + dx,
+        y: event_rect.y,
+        w: event_rect.w,
+        h: event_rect.h,
+    };
+    ui.push_lines(LineBatch {
+        segments: Arc::from(vec![
+            LineSegment { a: [g.x, g.y], b: [g.x + g.w, g.y], color: GHOST },
+            LineSegment {
+                a: [g.x, g.y + g.h],
+                b: [g.x + g.w, g.y + g.h],
+                color: GHOST,
+            },
+            LineSegment { a: [g.x, g.y], b: [g.x, g.y + g.h], color: GHOST },
+            LineSegment {
+                a: [g.x + g.w, g.y],
+                b: [g.x + g.w, g.y + g.h],
+                color: GHOST,
+            },
+        ]),
+        line_width_px: 2.0,
+        clip_rect: Some(wf_area),
+    });
+}
+
+/// PR-D 段階 3: 端 trim drag 中の縦線 ghost (左 = event_rect.x + dx、
+/// 右 = event_rect.x + event_rect.w + dx)。
+fn push_trim_ghost(
+    ui: &mut Ui<'_, AppData>,
+    event_rect: Rect,
+    wf_area: Rect,
+    dx: f32,
+    is_left: bool,
+) {
+    let x = if is_left {
+        event_rect.x + dx
+    } else {
+        event_rect.x + event_rect.w + dx
+    };
+    ui.push_lines(LineBatch {
+        segments: Arc::from(vec![LineSegment {
+            a: [x, event_rect.y],
+            b: [x, event_rect.y + event_rect.h],
+            color: GHOST,
+        }]),
+        line_width_px: 2.0,
+        clip_rect: Some(wf_area),
+    });
+}
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     ui.panel("audio_editor_bg", area, BG, 0.0);
@@ -113,6 +170,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
     let selected_idx = app.audio_editor_selected_event.unwrap_or(0);
     let clip_len_beats = clip.length_beats.max(1e-6); // 0 div 防御
+    // PR-D 段階 3: rect-based hit-test 用に px → beats 換算係数を準備。
+    // wf_area.w (px) = clip_len_beats (beats) なので 1 px = beats_per_px。
+    let beats_per_px = (clip_len_beats / wf_area.w as f64).max(1e-9);
+    let target = match app.audio_editor_clip {
+        Some(t) => t,
+        None => return,
+    };
+    let clip_id = clip.id;
 
     for (idx, event) in audio.events.iter().enumerate() {
         let Some(buffer) = app.audio_source_cache.get(event.source_id) else {
@@ -179,7 +244,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         if is_selected {
             let border_color = Color::rgba(0.95, 0.78, 0.31, 0.85);
             ui.push_lines(LineBatch {
-                segments: std::sync::Arc::from(vec![
+                segments: Arc::from(vec![
                     // top
                     LineSegment {
                         a: [event_rect.x, event_rect.y],
@@ -209,6 +274,171 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 clip_rect: Some(wf_area),
             });
         }
+
+        // ----- Hit-test (PR-D 段階 3 / gui_01 #026) -----
+        // event_rect を [left grip, center, right grip] に分割。 left/right
+        // grip は trim drag、 center は move drag。 grip 幅は 6 px、 event
+        // が 18 px 未満なら grip を出さず center のみ (= 無理に trim
+        // しなくて良い、 操作性優先)。
+        const GRIP_W: f32 = 6.0;
+        let usable_w = event_rect.w.max(0.0);
+        let (lw, rw) = if usable_w >= GRIP_W * 3.0 {
+            (GRIP_W, GRIP_W)
+        } else {
+            (0.0, 0.0)
+        };
+        let left_grip = Rect {
+            x: event_rect.x,
+            y: event_rect.y,
+            w: lw,
+            h: event_rect.h,
+        };
+        let right_grip = Rect {
+            x: event_rect.x + event_rect.w - rw,
+            y: event_rect.y,
+            w: rw,
+            h: event_rect.h,
+        };
+        let center_band = Rect {
+            x: event_rect.x + lw,
+            y: event_rect.y,
+            w: (event_rect.w - lw - rw).max(0.0),
+            h: event_rect.h,
+        };
+
+        // 左端 trim
+        if lw > 0.0
+            && let Some(drag) =
+                ui.take_drag_in_rect(("audio_editor_trim_l", clip_id, idx), left_grip)
+        {
+            let dx = drag.delta.0;
+            let kind = drag.kind;
+            if kind == DragKind::Started {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SelectAudioEditorEvent(Some(idx)));
+                }));
+            } else if kind == DragKind::Continuing {
+                push_trim_ghost(ui, event_rect, wf_area, dx, true);
+            } else if kind == DragKind::Released {
+                let dbeats = (dx as f64) * beats_per_px;
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetAudioEventTrim {
+                        clip: target,
+                        event_idx: idx,
+                        side: AudioEventTrimSide::Left,
+                        delta_beats: dbeats,
+                    });
+                }));
+            }
+        }
+
+        // 右端 trim
+        if rw > 0.0
+            && let Some(drag) =
+                ui.take_drag_in_rect(("audio_editor_trim_r", clip_id, idx), right_grip)
+        {
+            let dx = drag.delta.0;
+            let kind = drag.kind;
+            if kind == DragKind::Started {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SelectAudioEditorEvent(Some(idx)));
+                }));
+            } else if kind == DragKind::Continuing {
+                push_trim_ghost(ui, event_rect, wf_area, dx, false);
+            } else if kind == DragKind::Released {
+                let dbeats = (dx as f64) * beats_per_px;
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetAudioEventTrim {
+                        clip: target,
+                        event_idx: idx,
+                        side: AudioEventTrimSide::Right,
+                        delta_beats: dbeats,
+                    });
+                }));
+            }
+        }
+
+        // 中央 drag = 移動 (start = select 切替、 continuing = ghost
+        // 表示、 released = SetAudioEventStart commit)。
+        if center_band.w > 0.0
+            && let Some(drag) =
+                ui.take_drag_in_rect(("audio_editor_move", clip_id, idx), center_band)
+        {
+            let dx = drag.delta.0;
+            let kind = drag.kind;
+            if kind == DragKind::Started {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SelectAudioEditorEvent(Some(idx)));
+                }));
+            } else if kind == DragKind::Continuing && dx.abs() > 1.0 {
+                push_move_ghost(ui, event_rect, wf_area, dx);
+            } else if kind == DragKind::Released {
+                let dbeats = (dx as f64) * beats_per_px;
+                let original_start = event.event_start_in_clip_beats;
+                let new_start = (original_start + dbeats).max(0.0);
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetAudioEventStart {
+                        clip: target,
+                        event_idx: idx,
+                        new_start_beats: new_start,
+                    });
+                }));
+            }
+        }
+
+        // 単発 click (drag 開始しなかった場合) = select。 take_drag_in_rect
+        // が press frame に consume_pointer_click を呼ぶので、 同 frame
+        // の take_primary_press_in_rect は None になり二重 select されない
+        // (= drag press から 1 px も動かず即 release した場合だけ反応)。
+        if let Some(_press) = ui.take_primary_press_in_rect(event_rect) {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SelectAudioEditorEvent(Some(idx)));
+            }));
+        }
+
+        // 右クリック context menu。 Duplicate / Delete / Add From Source...
+        let evt_end_beats = event.event_start_in_clip_beats + event.event_length_beats;
+        ui.context_menu_for(
+            event_rect,
+            &["Duplicate", "Delete", "Add From Source..."],
+            move |menu_idx, ui| {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| match menu_idx {
+                    0 => {
+                        app.handle_event(AppEvent::SelectAudioEditorEvent(Some(idx)));
+                        app.handle_event(AppEvent::DuplicateAudioEditorEvent);
+                    }
+                    1 => {
+                        app.handle_event(AppEvent::DeleteAudioEvent {
+                            clip: target,
+                            event_idx: idx,
+                        });
+                    }
+                    2 => {
+                        app.action_open_audio_event_dialog(target, evt_end_beats);
+                    }
+                    _ => {}
+                }));
+            },
+        );
+    }
+
+    // 空白領域 (= waveform area で event 上にない場所) への file drop
+    // で、 drop 位置を `position_in_clip_beats` に変換して
+    // AddAudioEventFromFile を発火。 1 path のみ採用 (= multi-drop は
+    // 先頭ファイルのみ; 残りは無視、 status_message に noted せず
+    // 静かにスキップ)。
+    if let Some(drop) = ui.take_file_drop_in_rect(wf_area)
+        && let Some(path) = drop.paths.into_iter().next()
+    {
+        let pos_beats =
+            ((drop.position.0 - wf_area.x).max(0.0) as f64) * beats_per_px;
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::AddAudioEventFromFile {
+                clip: target,
+                path,
+                position_in_clip_beats: pos_beats.max(0.0),
+            });
+        }));
     }
 
     // ----- Playhead 線 (Phase 2 PR7) -----
