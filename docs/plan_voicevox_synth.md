@@ -44,6 +44,19 @@
     追加 (= 役割は plugin_host のみ)
   - unit test 1 件追加 (set_note_metadata で lyrics buffer が完全置換、
     空 flush で全消去)
+- ✅ **PR-V2.5**: state save / restore 完全対応 (PR-V2.3 と並行で着手)
+  - `LoadedPlugin::state_load(&mut self, ...)` に trait method の signature
+    変更。 ClapPlugin / Vst3Plugin / Silence / VoicevoxBuiltin すべての
+    impl を `&mut self` に追従、 inherent fn (`ClapPlugin::state_load`)
+    も合わせて mutable 化
+  - `VoicevoxBuiltin::state_load` で `self.state` を decode 結果で実際に
+    更新 (= speaker_id / style_name が project file から復元される)。
+    合成 cache は state に含めず、 restore 直後は cache miss = 無音、
+    project load 完了後の `set_note_metadata` flush で synth が走り cache
+    が温まる
+  - `daw_plugin_host` main: `let mut plugin = ...` に変更 (= mutable
+    receiver の load_plugin 後 `plugin.state_load(&bytes)` 呼び出しに
+    対応)
 - ✅ **PR-V2.3**: HTTP synth + cache + process MVP 完成
   - `NoteMetadata` を `(note_id, start_beat, duration_beats, pitch,
     velocity, lyric)` に拡張、 IPC + trait method の signature に `bpm`

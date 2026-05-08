@@ -371,13 +371,15 @@ impl LoadedPlugin for VoicevoxBuiltin {
         Ok(Some(bytes))
     }
 
-    fn state_load(&self, data: &[u8]) -> Result<()> {
+    fn state_load(&mut self, data: &[u8]) -> Result<()> {
         let cfg = bincode::config::standard();
-        let _: (VoicevoxState, usize) = bincode::decode_from_slice(data, cfg)
-            .context("VoicevoxBuiltin: decode state (parse only — restore is PR-V2.5)")?;
-        tracing::warn!(
-            "VoicevoxBuiltin::state_load: PR-V2.5 待ちで state は default に戻ります (= 既存 speaker / style 選択が失われる)"
-        );
+        let (decoded, _): (VoicevoxState, usize) =
+            bincode::decode_from_slice(data, cfg)
+                .context("VoicevoxBuiltin: decode state")?;
+        self.state = decoded;
+        // 合成 cache は state に含まれないので、 restore 直後は cache miss
+        // = 無音再生。 次の set_note_metadata (= project load 完了後の
+        // initial flush) で synth が走り cache が温まる。
         Ok(())
     }
 

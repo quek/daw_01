@@ -187,7 +187,7 @@ impl LoadedPlugin for Silence {
         Ok(None)
     }
 
-    fn state_load(&self, _data: &[u8]) -> Result<()> {
+    fn state_load(&mut self, _data: &[u8]) -> Result<()> {
         Ok(())
     }
 
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn silence_state_roundtrip_is_empty() {
-        let p = Silence::new();
+        let mut p = Silence::new();
         assert!(p.state_save().unwrap().is_none());
         // Loading garbage bytes is still Ok (= stateless).
         p.state_load(&[]).unwrap();

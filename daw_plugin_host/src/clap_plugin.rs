@@ -732,7 +732,7 @@ impl ClapPlugin {
     /// Restores previously captured state via `clap_plugin_state.load`. No-op
     /// when the extension is missing (returns `Ok(())` silently so project
     /// loads tolerate plugin upgrades that dropped state support).
-    pub fn state_load(&self, data: &[u8]) -> Result<()> {
+    pub fn state_load(&mut self, data: &[u8]) -> Result<()> {
         let Some(state) = self.state_ext else {
             tracing::warn!("plugin has no state extension; skipping state restore");
             return Ok(());
@@ -1155,7 +1155,7 @@ impl LoadedPlugin for ClapPlugin {
         self.state_save()
     }
 
-    fn state_load(&self, data: &[u8]) -> Result<()> {
+    fn state_load(&mut self, data: &[u8]) -> Result<()> {
         self.state_load(data)
     }
 

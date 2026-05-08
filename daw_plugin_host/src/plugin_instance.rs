@@ -129,7 +129,11 @@ pub trait LoadedPlugin: Send {
 
     // --- persistence (plugin-main thread) -------------------------------
     fn state_save(&self) -> Result<Option<Vec<u8>>>;
-    fn state_load(&self, data: &[u8]) -> Result<()>;
+    /// PR-V2.5 で `&mut self` 化。 builtin plugin が parameter を実際に
+    /// 復元できるようにするための変更。 既存 CLAP / VST3 backend は内部
+    /// で `&self` ベース API (interior mutability) に forward していた
+    /// だけなので、 signature 変更だけで動作不変。
+    fn state_load(&mut self, data: &[u8]) -> Result<()>;
 
     // --- per-note metadata (Builtin plugin only, PR-V2.2 / V2.3) --------
     /// Builtin plugin (`PluginFormat::Builtin`) 専用の per-note metadata

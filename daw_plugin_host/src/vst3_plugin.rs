@@ -1032,7 +1032,7 @@ impl LoadedPlugin for Vst3Plugin {
         Ok(Some(write.take_buffer()))
     }
 
-    fn state_load(&self, data: &[u8]) -> Result<()> {
+    fn state_load(&mut self, data: &[u8]) -> Result<()> {
         let read = ComWrapper::new(Vst3ReadStream::new(data));
         let stream_ptr = read
             .to_com_ptr::<IBStream>()

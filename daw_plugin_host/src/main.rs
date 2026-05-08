@@ -534,7 +534,7 @@ fn plugin_main_loop(
                     // (1) 新 plugin の instantiate。 ここまでで失敗 ⇒
                     //     旧 plugin の状態は触らずに早期 return。
                     let callbacks = make_callbacks(track, slot);
-                    let plugin = match load_plugin(format, &path, &plugin_id, callbacks) {
+                    let mut plugin = match load_plugin(format, &path, &plugin_id, callbacks) {
                         Ok(p) => p,
                         Err(e) => {
                             tracing::error!(error = ?e, ?format, path = %path.display(), "load failed");
