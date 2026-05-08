@@ -7,15 +7,35 @@
 use std::sync::Arc;
 
 use daw_ui_core::{
-    ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack,
-    ArrangementView, ChannelLayout, ClipKey, Edit, SampleSlices, ToggleButtonStyle, Ui,
-    WaveformRenderMode, WaveformSource, WaveformStyle, WaveformView,
+    ArrangementClip, ArrangementClipAudioEdit, ArrangementEditRequest, ArrangementStyle,
+    ArrangementTrack, ArrangementView, ChannelLayout, ClipKey, Edit, FadeCurve as WidgetFadeCurve,
+    FadeEdge, SampleSlices, ToggleButtonStyle, Ui, WaveformRenderMode, WaveformSource,
+    WaveformStyle, WaveformView,
 };
 use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent, ClipRef};
 use crate::view::mixer_strips::{amp_to_fader, fader_to_amp};
 use crate::view::snap::{self, SNAP_LABELS};
+
+/// gui_01 widget の `FadeCurve` (#025) ↔ daw_01 model `FadeCurve` の
+/// 対応変換。 同 3 種を 1:1 で対応させているだけだが、 type が別 crate
+/// なので変換 helper を経由する。
+fn widget_curve_from_model(c: common::model::FadeCurve) -> WidgetFadeCurve {
+    match c {
+        common::model::FadeCurve::Linear => WidgetFadeCurve::Linear,
+        common::model::FadeCurve::Exponential => WidgetFadeCurve::Exponential,
+        common::model::FadeCurve::SCurve => WidgetFadeCurve::SCurve,
+    }
+}
+
+fn model_curve_from_widget(c: WidgetFadeCurve) -> common::model::FadeCurve {
+    match c {
+        WidgetFadeCurve::Linear => common::model::FadeCurve::Linear,
+        WidgetFadeCurve::Exponential => common::model::FadeCurve::Exponential,
+        WidgetFadeCurve::SCurve => common::model::FadeCurve::SCurve,
+    }
+}
 
 const TRACK_HEADER_W: f32 = 160.0;
 const RULER_H: f32 = 20.0;
@@ -91,6 +111,25 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     } else {
                         None
                     },
+                    // gui_01 #025 (M14 Phase 63k): audio clip のとき first event の
+                    // 値を渡して widget に dB handle / fade 角 grip / envelope を
+                    // 描かせる。 Phase 1 で 1 clip 1 event 前提なので first event
+                    // を「clip 全体の field」 として表示。 widget は drag release で
+                    // `SetClipGainDb` / `SetClipFade` / `SetClipFadeCurve` を発行
+                    // するので make_edit 側で受けて AppEvent に変換する。
+                    audio_edit: app
+                        .song
+                        .clip_contents
+                        .get(&c.content_id)
+                        .and_then(|ct| ct.audio_events())
+                        .and_then(|events| events.first())
+                        .map(|ev| ArrangementClipAudioEdit {
+                            gain_db: ev.gain_db,
+                            fade_in_beats: ev.fade_in_beats,
+                            fade_out_beats: ev.fade_out_beats,
+                            fade_in_curve: widget_curve_from_model(ev.fade_in_curve),
+                            fade_out_curve: widget_curve_from_model(ev.fade_out_curve),
+                        }),
                 })
                 .collect(),
             // gui_01 #016 で追加された group hierarchy fields:
@@ -632,6 +671,63 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
         ArrangementEditRequest::SetTrackTop(_) => {
             // 縦 scroll は本 view では未使用 (track row 全件表示)。
             Edit::mutate(|_| {})
+        }
+        // gui_01 #025 (M14 Phase 63k): clip 上 grip drag 経路。 widget は
+        // drag release で 1 度だけ delta を発行するので、 ここで既存
+        // AppEvent (Phase 2 PR2-3) に変換してそのまま undo step を取る。
+        // 各 delta は独立 Edit step ではなく 1 release = 1 batch なので、
+        // 全 delta を 1 Edit::mutate 内で順に発火させる (= ただし
+        // is_undoable は 1 AppEvent ごとに 1 step を取るので、 multi-clip
+        // 一括 drag のときは Undo 1 回で全 clip 戻る挙動にはならない、
+        // 小規模 issue なので future polish 対象)。
+        ArrangementEditRequest::SetClipGainDb(deltas) => {
+            Edit::mutate(move |app: &mut AppData| {
+                for d in &deltas {
+                    if let Some(target) = clip_key_to_ref(app, d.key) {
+                        app.handle_event(AppEvent::SetClipGainDb {
+                            target,
+                            gain_db: d.next_gain_db,
+                        });
+                    }
+                }
+            })
+        }
+        ArrangementEditRequest::SetClipFade(deltas) => {
+            Edit::mutate(move |app: &mut AppData| {
+                for d in &deltas {
+                    if let Some(target) = clip_key_to_ref(app, d.key) {
+                        match d.edge {
+                            FadeEdge::In => app.handle_event(AppEvent::SetClipFadeInBeats {
+                                target,
+                                beats: d.next_beats,
+                            }),
+                            FadeEdge::Out => app.handle_event(AppEvent::SetClipFadeOutBeats {
+                                target,
+                                beats: d.next_beats,
+                            }),
+                        }
+                    }
+                }
+            })
+        }
+        ArrangementEditRequest::SetClipFadeCurve(deltas) => {
+            Edit::mutate(move |app: &mut AppData| {
+                for d in &deltas {
+                    if let Some(target) = clip_key_to_ref(app, d.key) {
+                        let curve = model_curve_from_widget(d.next_curve);
+                        match d.edge {
+                            FadeEdge::In => app.handle_event(AppEvent::SetClipFadeInCurve {
+                                target,
+                                curve,
+                            }),
+                            FadeEdge::Out => app.handle_event(AppEvent::SetClipFadeOutCurve {
+                                target,
+                                curve,
+                            }),
+                        }
+                    }
+                }
+            })
         }
     }
 }

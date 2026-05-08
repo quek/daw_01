@@ -1333,3 +1333,407 @@ main 反映は user judgement (worktree branch `claude/compassionate-torvalds-08
 PR 経由)。 daw_01 側は path 依存ビルドなので main 反映後 `cargo build -p daw_gui` で compile error
 (SetVelocity arm 不足) が出るので、 上記 follow-up の 2 点を反映すれば動く。
 
+## #025 [Resolved] 2026-05-08 [要望] arrangement の audio clip に dB / fade 直接編集 gesture
+
+関連仕様:
+- [daw_01:docs/plan_audio_clip.md](daw_01:docs/plan_audio_clip.md) §3.5 Fade
+  In/Out (角 drag) / §3.6 Gain (clip 中央 handle、 ±24 dB 範囲)
+- 同 §14 Keyboard shortcut 一覧 (`Drag` (clip 角) / `Drag` (clip 角 上下方向) /
+  `Drag` (clip 中央 dB handle))
+
+### daw_01 →
+
+- 種別: [要望]
+- 関連 daw_01: 既に Inspector で同 field 編集は完成 (Phase 2 PR2 / PR3)、
+  arrangement の clip 上で **直接 grab して動かす** Bitwig / Reaper 流の
+  UX を gui_01 widget 内蔵で実現したい
+- 関連 gui_01: `crates/ui/src/widgets/arrangement.rs` の
+  `ArrangementEditRequest` enum + clip drag handler
+
+#### 背景
+
+Phase 2 PR1-3 で Inspector に audio event の全 field 編集 UI が揃った
+(Reverse / Mute / StretchMode / Gain / Pan / Pitch / Fade In/Out length
+& curve)。 ただし Bitwig spec §3.5 / §3.6 は **arrangement clip の上で
+直接編集できる** UX も求めており:
+
+- **Fade**: clip 上端の角を内側にドラッグ → fade length。 角を上下方向に
+  ドラッグ → fade curve トグル (Linear → Exp → SCurve → Linear)
+- **Gain**: clip 中央付近で水平 handle (= 横線、 ±24 dB を縦方向 drag で)
+
+これは clip の **rect 内のどこを掴むか** で gesture が分岐する設計で、
+caller (daw_01) 側で hit test を書くと既存 Move/Resize gesture と
+取り合いになる (= 競合する)。 widget 側で grip 領域を内蔵して、 既存
+`ArrangementEditRequest` に新 variant を出す形が一番クリーンだと思う。
+
+#### 期待 API イメージ
+
+##### `ArrangementClip` に gain_db + fade を追加
+
+`Ui::arrangement` の input model `ArrangementClip` に audio 編集対象 field
+を追加して、 widget 側が描画 + grip ヒット判定に使う。 MIDI clip では
+全部 `0.0` / `Linear` を渡せば既存どおり何も描かれない (= audio 表示用
+の専用 widget にする必要なし、 既存 clip と統合)。
+
+```rust
+pub struct ArrangementClip {
+    pub id: u32,
+    pub start_beat: f64,
+    pub len_beats: f64,
+    pub name: Arc<str>,
+    pub color: Option<Color>,
+    /// Phase 2 PR8 (gui_01 #025): audio clip のとき `Some` で渡すと
+    /// dB handle / fade 角 / curve indicator を描画 + 当該 grip 領域に
+    /// drag handler を bind。 MIDI / Vocal は `None` で従来挙動。
+    pub audio_edit: Option<ArrangementClipAudioEdit>,
+}
+
+pub struct ArrangementClipAudioEdit {
+    pub gain_db: f32,           // -24..+24 想定 (caller 側で clamp 済)
+    pub fade_in_beats: f64,
+    pub fade_out_beats: f64,
+    pub fade_in_curve: FadeCurve,
+    pub fade_out_curve: FadeCurve,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum FadeCurve {
+    Linear,
+    Exponential,
+    SCurve,
+}
+```
+
+##### `ArrangementEditRequest` に 3 新 variant
+
+```rust
+pub enum ArrangementEditRequest {
+    // 既存 ...
+
+    /// clip 中央 dB handle の縦 drag (release 時 1 度発火、 drag 中は
+    /// ghost overlay のみ)。 prev/next とも dB 単位、 clamp は caller
+    /// (daw_01) 責務でも widget 側でも OK (-24..+24 が業界標準)。
+    SetClipGainDb(Vec<ClipGainDelta>),
+
+    /// clip 角 drag → fade length 変更 (release 時 1 度発火)。
+    SetClipFade(Vec<ClipFadeDelta>),
+
+    /// 角の上下方向 drag → fade curve 段階トグル (release 時 1 度発火)。
+    /// 「上下方向」 の判定は widget 側で適当な閾値 (例: |dy| > 10 px)。
+    /// 同じ release で SetClipFade と同時発火することはない (= length /
+    /// curve のどちらかに振り分ける) — caller の handler を単純化するため。
+    SetClipFadeCurve(Vec<ClipFadeCurveDelta>),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ClipGainDelta {
+    pub key: ClipKey,
+    pub prev_gain_db: f32,
+    pub next_gain_db: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ClipFadeDelta {
+    pub key: ClipKey,
+    pub edge: FadeEdge,
+    pub prev_beats: f64,
+    pub next_beats: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ClipFadeCurveDelta {
+    pub key: ClipKey,
+    pub edge: FadeEdge,
+    pub next_curve: FadeCurve,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum FadeEdge {
+    In,
+    Out,
+}
+```
+
+#### 期待 UX
+
+`ArrangementClip.audio_edit = Some(...)` のとき、 widget は次を追加描画
++ 入力受付:
+
+##### 1. dB handle (clip 中央)
+
+- 描画: clip rect の縦中央付近に水平線 1 本 (1 px)、 ±24 dB を rect の
+  上端 / 下端にマッピング (= gain_db = 0 で中央、 +24 で上端、 -24 で下端)
+- ヒット領域: 線の上下 ±4 px の細長い帯 (clip の左右端 grip と重ならない
+  middle band、 例: clip 左端から 24 px 〜 右端から 24 px の中央領域)
+- gesture: 縦 drag で gain_db 変更 (1 px = 0.25 dB 程度)、 release で
+  `SetClipGainDb([ClipGainDelta { ... }])` 発火
+- visual feedback: drag 中は handle の現在 dB 値を ghost label で表示
+  (例 `+3.2 dB`)
+
+##### 2. Fade 角 (clip 上端 左右)
+
+- 描画: clip 上端の左右に 6×6 px の三角形 grip (現 fade_in/out_beats
+  に相当する位置)。 fade が 0 のときは grip だけ描画、 fade > 0 のときは
+  「斜辺」 を fade range 全幅に伸ばして可視化 (= envelope の実線を上端
+  境界に重ね描き)
+- ヒット領域: grip + 斜辺どちらでも掴めるが、 hit test 優先順は grip
+  (12×12 px の hit zone) > 斜辺 (clip 上端 ±4 px の細い帯) > clip 中央
+  (= dB handle 領域)
+- gesture A (横 drag): fade length 変更、 release で `SetClipFade(...)`
+- gesture B (縦 drag、 |dy| > 10 px): curve 段階トグル (Linear → Exp →
+  SCurve → Linear)、 release で `SetClipFadeCurve(...)`
+- 横 / 縦 の判定は drag 累積 dx / dy のうち大きい方 (= release 時の
+  ratio で振り分け)。 同 drag 内で複数 variant 発火しない
+- visual feedback: 横 drag 中は新 fade length を斜辺で ghost、 縦 drag
+  中は curve 名を ghost label で表示
+
+##### 3. 既存 gesture との優先度
+
+| 領域 | gesture | 結果 |
+|---|---|---|
+| clip 左端 grip | 横 drag | 既存 `ResizeClips` (左端 trim) — 変更なし |
+| clip 右端 grip | 横 drag | 既存 `ResizeClips` (右端 trim) — 変更なし |
+| clip 上端 左角 (12×12 px) | drag | **NEW** Fade In length / curve |
+| clip 上端 右角 (12×12 px) | drag | **NEW** Fade Out length / curve |
+| clip 中央 dB handle 帯 | 縦 drag | **NEW** Gain dB |
+| clip 中央 dB handle 帯 | 横 drag | 既存 `MoveClips` (clip 移動) — 変更なし |
+| clip 中央 dB handle 帯 | dbl-click | 既存 `DoubleClickClip` — 変更なし |
+
+縦 drag / 横 drag の振り分けは「最初に閾値超えた方向で固定」 する pattern
+(= sticky direction、 drag 開始から一度方向確定したら release まで切替不可)
+が UX として一番分かりやすい。 piano_roll velocity drag (gui_01 #018) と
+同じ思想。
+
+#### 受け入れ基準
+
+- arrangement 上で audio clip の上端角を drag → fade length が変わる、
+  release で `SetClipFade([{key, edge, prev_beats, next_beats}])` を caller
+  が受信できる
+- 角の縦方向 drag (10 px 超) → fade curve が次段階に切替、 release で
+  `SetClipFadeCurve` 発火
+- clip 中央 dB handle 帯を縦 drag → gain_db が変わる、 release で
+  `SetClipGainDb` 発火
+- 中央帯 横 drag は既存 `MoveClips` 動作を維持、 dbl-click は既存
+  `DoubleClickClip` 動作を維持
+- fade ghost / dB ghost が drag 中に visible (現在値 readout)
+- audio_edit が `None` の clip では何も描かない / hit zone も無し (=
+  MIDI / Vocal clip は既存挙動)
+
+#### 確認したい点
+
+1. `ArrangementClip.audio_edit` を **既存 `ArrangementClip` に追加**
+   する vs 別 widget に切り出す: 前者の方が描画の重なり / hit-test の
+   一元管理が楽 (= clip rect 1 つの hit test で全 gesture を分岐)。
+   gui_01 側の判断で OK
+2. dB の px ↔ dB マッピングは **rect の上下端を ±24 dB にマップ** で
+   良いか? (Bitwig 標準)。 ±48 dB 等の拡張時は別仕様
+3. fade curve トグル の **段階数 3** で OK か (Linear / Exp / SCurve)。
+   Bitwig は他 curve 種もあるが daw_01 では §3.5 で 3 種に絞り済
+4. Edit ペースの reorder: drag 中の ghost 描画は widget 内 state、 release
+   で **1 度だけ Edit::mutate を発火** (= 中間値で undo step が量産
+   されない)。 daw_01 PR4 (左端 trim) と同パターン
+
+#### scope 外 (将来 issue 候補、 別件)
+
+- multi-event clip (1 clip 内に複数 event) の event 単位 grip:
+  daw_01 Phase 4 の Audio Editor で `Ui::audio_editor` 等を別 widget で
+  要望予定
+- Pan の clip 上 handle (= dB と垂直に並べる pan slider): Bitwig も
+  Inspector のみなので Phase 4+
+- Pitch (semitones) の clip 上 handle: 同上、 Phase 4+ で検討
+- Selection 全体への drag 一括反映: gui_01 #018 と同 pattern (= 1 drag で
+  選択全 clip の delta を Vec で発行) を採用すれば自然に動くはず
+
+#### daw_01 側の対応 (本要望が main にマージされたら)
+
+`daw_gui/src/view/arrangement_view.rs::make_edit` に 3 arm を追加:
+- `SetClipGainDb(deltas)` → 各 delta を `AppEvent::SetClipGainDb { target,
+  gain_db: delta.next_gain_db }` に変換 (既存 AppEvent を流用)
+- `SetClipFade(deltas)` → `AppEvent::SetClipFadeIn/OutBeats { target,
+  beats }` を edge 別に振り分け (既存 AppEvent を流用)
+- `SetClipFadeCurve(deltas)` → `AppEvent::SetClipFadeIn/OutCurve { target,
+  curve }` (既存 AppEvent を流用)
+
+`ArrangementClip.audio_edit` は `app.song.tracks` を walk するときに
+ClipContent::Audio 判定 + first event の field を `Some(...)` で詰めれば
+良い (Phase 1 PR で 1 clip 1 event 前提なので first event = 全体)。
+
+### gui_01 →
+
+(2026-05-08、 gui_01 main 直、 user 目視確認待ち) **要望どおり実装した、 ただし Bitwig spec
+§3.5/§3.6 と整合する設計判断で確認したい点が 4 件あるので確認後に整合させたい点があれば追記
+してほしい**。
+
+#### 実装内容
+
+1. **`ArrangementClip` に `audio_edit: Option<ArrangementClipAudioEdit>` を追加**
+   ([crates/ui/src/widgets/arrangement.rs](gui_01:crates/ui/src/widgets/arrangement.rs))。
+   `Some(ArrangementClipAudioEdit { gain_db, fade_in_beats, fade_out_beats, fade_in_curve,
+   fade_out_curve })` で widget が dB handle line + fade 角 grip + envelope を描画 + 該当 grip 領域に
+   drag handler を bind。 `None` で既存挙動 (MIDI / Vocal clip — audio 描画なし、 hit zone 全 disable)。
+
+2. **新 enum/型**: `FadeCurve { Linear, Exponential, SCurve }` (vertical drag で `Linear → Exp → SCurve →
+   Linear` の cycle、 `next()` / `name()` helper 提供)、 `FadeEdge { In, Out }`、 `ClipGainDelta`、
+   `ClipFadeDelta`、 `ClipFadeCurveDelta` (delta 構造体 3 種)。 すべて `Clone + Copy`、 no-Clone 不変条件
+   と整合。
+
+3. **`ArrangementEditRequest` に 3 variant 追加**: `SetClipGainDb(Vec<ClipGainDelta>)` /
+   `SetClipFade(Vec<ClipFadeDelta>)` / `SetClipFadeCurve(Vec<ClipFadeCurveDelta>)`。 単一 clip drag では
+   `vec![delta]` の 1 件で発火 (multi-clip selection 一括対応は仕様 §scope 外、 将来拡張)。
+
+4. **`ArrangementStyle` に audio 関連 default field 13 件追加**: `audio_db_handle_color` /
+   `audio_db_handle_band_h` (8 px) / `audio_db_handle_x_margin` (24 px) / `audio_db_pixels_per_db` (0.25
+   dB/px = 4 px/dB) / `audio_db_range_db` (24 dB) / `audio_fade_corner_size_px` (12 px) /
+   `audio_fade_overlay_color` / `audio_min_clip_w_for_handles_px` (32 px) /
+   `audio_fade_sticky_threshold_px` (10 px、 仕様 §3.2 整合) / `audio_ghost_label_size` 他。 caller は
+   default で要望どおりの見た目 / 挙動が出る。
+
+5. **Hit-test 内部 enum `AudioGripHit`** + `audio_grip_hit_in_lanes()`: priority `gain handle > fade
+   corner` (clip 中央の 8 px 帯 + clip 上端の 12×12 角)、 audio_edit が None の clip では常に None、
+   short clip (`r.w < 32 px`) でも None で既存 ResizeLeft/Right/Move のみ active。 公開 `ClipDragKind` は
+   3 variant のまま維持 (caller の hover/drag 報告 API は影響なし、 audio gesture は widget 内で完結)。
+
+6. **`AudioDragSession` 新設**: `state.audio_drag` field 追加。 press 時に grip 種別から
+   `AudioDragKind { Gain, FadeIn, FadeOut }` を確定、 sticky direction lock (`locked_horizontal:
+   Option<bool>`) は continuation で累積 |dx|/|dy| を閾値と比較して確定 (一度 lock されたら release まで
+   切替不可)。 `Gain` は press 時から vertical lock 確定 (横 drag 無視)。 `last_mouse` / `last_alt`
+   pattern は既存 ClipDragSession と同じ (release frame の OS event 順序問題を回避)。
+
+7. **press 振り分けの priority**: audio grip > clip drag (Move/Resize) で audio_drag 起動時は clip_drag
+   を起動しない (排他)。 modifier (Shift / Ctrl) は audio gesture では無視 (Bitwig spec 整合、 modifier-
+   free な直感操作)。 旧 ResizeLeft/Right の hit zone は audio_edit が Some の clip でも維持 (clip rect
+   の外側 ±4 px は resize、 内側上端 12×12 が fade、 中央 8 px 帯が gain — 重なりなし)。
+
+8. **commit-by-release**: drag 中は ghost overlay のみ (cached 外で preview line / fade envelope / label
+   描画)、 release frame で `compute_audio_drag_outcome()` の結果に応じて 1 件だけ EditRequest を発火。
+   sticky 未確定 + drag 距離不足の場合は no-op (= click 相当、 caller は何も Edit を受け取らない)。
+   仕様 §4.4 の「中間値で undo step が量産されない」 を保証。
+
+9. **dB マッピング**: `gain_db = 0` で rect 中央、 `+24 dB` で rect 上端、 `-24 dB` で rect 下端 (Bitwig
+   仕様準拠)。 drag 中の dy → dB 変換は線形 (0.25 dB/px = 4 px/dB)、 ±24 dB に widget 内 clamp。 ghost
+   label に `+3.2 dB` 形式で現在値を表示。
+
+10. **fade envelope 描画**: clip 上端の角に 12×12 grip 正方形 + `fade_*_beats > 0` のとき grip 角から
+    fade 末尾まで斜辺を描画 (= envelope の visual feedback)。 clip 上端 left → 右下の斜め (FadeIn) /
+    clip 上端 right → 左下の斜め (FadeOut)。 fade curve は描画上は線形近似 (curve 種別の visual
+    feedback は curve drag 中の ghost label でのみ表示、 spec §3.5 で「3 種から選ぶ」 程度の精度で十分)。
+
+11. **`fold_arrangement_clip_hash` に `audio_edit` を fold + viewport_key v5 に bump**: caller が
+    `gain_db` / `fade_in_beats` / `fade_out_beats` / `fade_in_curve` / `fade_out_curve` を更新する
+    たびに cached buffer が再構築される (= 1 frame 遅延なく dB handle / envelope が更新される)。
+    旧 #011 と同根の cache miss 不在問題を予防。
+
+#### 受け入れ基準への対応
+
+- ✅ audio clip の上端角を drag → fade length が変わる、 release で `SetClipFade([{key, edge,
+  prev_beats, next_beats}])` を caller が受信 (regression test
+  `audio_fade_in_horizontal_drag_emits_set_clip_fade` で固定)
+- ✅ 角の縦方向 drag (10 px 超) → fade curve が次段階に切替、 release で `SetClipFadeCurve` 発火
+  (`compute_audio_drag_outcome_fade_in_vertical_toggles_curve` で固定)
+- ✅ clip 中央 dB handle 帯を縦 drag → gain_db が変わる、 release で `SetClipGainDb` 発火 (`audio_gain_drag_emits_set_clip_gain_db` で固定、 dy = -20 px → +5.0 dB)
+- ✅ 中央帯の横 drag は既存 `MoveClips` 動作を維持、 dbl-click は既存 `DoubleClickClip` 動作を維持
+  (中央帯の hit zone を端から `audio_db_handle_x_margin = 24 px` 内側 + 縦 ±4 px に限定して既存
+  Move 領域と独立、 横 drag は audio gesture 起動条件を満たさないため既存 clip_drag に流れる)
+- ✅ fade ghost / dB ghost が drag 中に visible (`+3.2 dB` / `Curve: Exponential` / fade preview
+  envelope を cached 外 overlay で 1 frame ずれなく表示)
+- ✅ audio_edit が None の clip では何も描かない / hit zone も無し
+  (`audio_grip_hit_returns_none_when_audio_edit_is_none` で固定)
+
+#### 仕様文の確認したい点 4 件への回答
+
+1. **`audio_edit` を `ArrangementClip` に統合 vs 別 widget**: **統合 (前者) を採用**。 描画と hit-test
+   が同じ rect ベースで一元管理可能、 caller は `ContentId::Audio` 判定で `Some(...)` を詰めるだけで
+   良く API 増殖を回避。 MIDI clip では `None` で既存挙動完全互換。
+
+2. **dB マッピング ±24 dB**: 仕様どおり実装、 ただし `style.audio_db_range_db` で caller 側変更可能
+   (将来 ±48 dB 等の拡張時は style 1 行で対応)。
+
+3. **fade curve 段階数 3**: 仕様どおり (Linear / Exponential / SCurve)、 `FadeCurve.next()` で順送り
+   実装。 4 種以上に拡張する場合は enum + `next()` を更新。
+
+4. **release 時 1 度だけ Edit::mutate 発火**: 仕様どおり、 drag 中は ghost overlay のみで EditRequest
+   は emit しない (`compute_audio_drag_outcome` を release frame の 1 度だけ呼ぶ pattern、 daw_01 PR4
+   と同じ)。
+
+#### multi-clip selection の現状仕様
+
+仕様 §scope 外として「将来拡張で自然対応」 と書かれていた選択全 clip 一括は **現状単一 clip 限定**
+で実装した (hit clip 単独に対する `vec![delta]` の 1 件発行)。 selection に hit clip が含まれていなくても
+hit clip 単独で drag 可能 (Bitwig / Reaper と整合)。 multi-clip 対応は `AudioDragSession.anchors:
+Vec<ClipDragAnchor>` に拡張 + selected_clips の audio_edit を全部 anchor に保存する形で自然に拡張可能、
+別 issue で要望が来たら対応する。
+
+#### test / 検証
+
+- 新 unit test +12 件 ([crates/ui/src/widgets/arrangement.rs](gui_01:crates/ui/src/widgets/arrangement.rs)
+  末尾):
+  - `audio_grip_hit_returns_none_when_audio_edit_is_none` (audio_edit = None で grip hit 完全無効)
+  - `audio_grip_hit_returns_gain_handle_at_clip_middle` (clip 中央 80, 16 で GainHandleBand)
+  - `audio_grip_hit_returns_fade_corner_in_at_top_left` (clip 6, 6 で FadeCornerIn)
+  - `audio_grip_hit_returns_fade_corner_out_at_top_right` (clip 155, 6 で FadeCornerOut)
+  - `audio_grip_hit_returns_none_for_short_clip` (`r.w < 32 px` で grip 全 disable)
+  - `fade_curve_next_cycles` (Linear → Exp → SCurve → Linear)
+  - `compute_audio_drag_outcome_gain_changes_db_by_pixels` (-20 px → +5 dB)
+  - `compute_audio_drag_outcome_gain_clamps_to_range` (-200 px → +24 dB clamp)
+  - `compute_audio_drag_outcome_fade_in_horizontal_changes_length` (+40 px @ 0.025 b/px → +1 beat)
+  - `compute_audio_drag_outcome_fade_out_horizontal_uses_negative_dx` (FadeOut は dx 負で増)
+  - `compute_audio_drag_outcome_fade_length_clamps_to_clip_len` (+400 px → clamp to clip_len)
+  - `compute_audio_drag_outcome_fade_in_vertical_toggles_curve` (Linear → Exponential)
+  - `compute_audio_drag_outcome_unlocked_returns_none` (sticky 未確定で no-op)
+  - `fold_arrangement_clip_hash_changes_on_gain_db` (cache invalidation 保証)
+  - `fold_arrangement_clip_hash_changes_on_fade_curve` (同上)
+  - `audio_gain_drag_emits_set_clip_gain_db` (UiHost integration: press → drag → release → 1 件発火)
+  - `audio_fade_in_horizontal_drag_emits_set_clip_fade` (UiHost integration: 横 drag → SetClipFade
+    発火、 縦 drag は同 release で発火しない sticky 排他確認)
+
+- `cargo test --workspace` 全 ✅ (377 + 16 + 10 + 9 + ...)
+- `cargo clippy --workspace --tests -- -D warnings` clean
+- `cargo build --bin daw_prototype` clean
+- `tests/ui/pass/basic.rs` の trybuild に `SetClipGainDb(_)` / `SetClipFade(_)` /
+  `SetClipFadeCurve(_)` arm 追加 + `ArrangementClip` リテラルに `audio_edit: None` 追加で
+  exhaustive match 担保
+
+#### daw_01 側 follow-up (path 依存再ビルド時に必要)
+
+1. **`ArrangementClip` リテラル追加**: 全 caller で `audio_edit: None` を追加 (or `..clip` spread)。
+   audio clip 編集を有効にしたい場合は `Some(ArrangementClipAudioEdit { gain_db, fade_in_beats,
+   fade_out_beats, fade_in_curve, fade_out_curve })` を詰める。 Phase 1 PR で 1 clip 1 event 前提なので
+   first event = 全体 (要望文どおり)。
+
+2. **`ArrangementEditRequest::*` arm 追加**: `make_edit` の exhaustive match に 3 arm を追加:
+   - `SetClipGainDb(deltas)` → 各 delta を `AppEvent::SetClipGainDb { target: delta.key, gain_db:
+     delta.next_gain_db }` 等の既存 AppEvent に変換
+   - `SetClipFade(deltas)` → `AppEvent::SetClipFadeIn/OutBeats { target, beats }` を edge 別に振り分け
+   - `SetClipFadeCurve(deltas)` → `AppEvent::SetClipFadeIn/OutCurve { target, curve }` を edge 別に
+     振り分け、 `next_curve` を `daw_01` の `FadeCurve` に変換 (型は別なので変換層が必要、 enum 値は
+     1:1 対応)
+
+#### commit / visual verify 状況
+
+gui_01 main で実装完了 + cargo test/clippy 緑 (path 依存先 daw_01 build は **breaking — daw_01 側
+で `audio_edit: None` 追加 + 3 arm 追加が必要**)。
+
+**`daw_prototype` example に audio_edit demo を組み込み済**: track 3-5 ("Audio 1/2/3") の clip に
+`Some(DawAudioEdit { ... })` を持たせており、 arrangement widget が dB handle line + fade 角 grip +
+envelope を描画 + drag handler を bind する。 MIDI clip (track 0/1/2/6+) は `audio_edit: None` で
+既存挙動。 visual verify 手順:
+
+1. `cargo run --bin daw_prototype` で起動
+2. Arrangement タブ (タブ 2) に切替
+3. **dB handle drag**: track 3-5 の clip 中央 (rect 中央 ± 4 px の細い帯、 端から 24 px 内側) を
+   縦 drag → release で `+3.2 dB` 等 ghost label 表示 + handle line が新位置に移動 + footer
+   `last_action` に `arr: SetClipGainDb (1) → +3.0 dB (clip 3/0)` 表示
+4. **Fade in length drag**: track 3-5 clip 上端の左角 (12×12 px grip 正方形) を **横方向に** drag →
+   release で envelope (斜辺) が伸びる + `last_action` に `arr: SetClipFade (1) → In=0.80 beats` 表示
+5. **Fade in curve toggle**: track 3-5 clip 上端の左角を **縦方向に 10 px 以上** drag → release で
+   ghost label `Curve: Exponential` → `last_action` に `arr: SetClipFadeCurve (1) → In=Exponential`
+   表示。 連続 drag で Linear → Exp → SCurve → Linear 順送り
+6. **既存挙動の non-regression**: track 3-5 clip の **resize 端 (左右 ±4 px)** や **clip 中央の
+   水平 drag** が既存どおり動作 (resize / move)、 audio gesture とは zone が独立
+7. **MIDI clip (track 0/1/2/6+)** は audio gesture 完全 disable (handle line / 角 grip 描画なし、
+   既存 Move/Resize のみ)、 `audio_edit: None` で既存挙動を確認
+
+main commit hash は本 entry の commit 後に追記する予定。 daw_01 path 依存再ビルド時は上記 follow-up
+(リテラル + arm 追加) が必要。
+
+---
