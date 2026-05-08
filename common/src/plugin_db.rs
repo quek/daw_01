@@ -100,16 +100,50 @@ pub fn default_cache_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|p| p.join("daw_01").join("plugin_database.json"))
 }
 
+/// Stable identifiers for daw_01-bundled (`PluginFormat::Builtin`) plugins.
+/// These URIs are used as both the descriptor `id` and the `path` field
+/// in the cached `PluginEntry`, mirroring how external plugins use a
+/// real filesystem path. The plugin host's `builtin` module dispatches
+/// on the URI to construct the Rust implementation.
+///
+/// PR-V1 ships a single `Silence` instrument as the reference impl;
+/// PR-V2 will add `builtin://daw_01.voicevox` next to it.
+pub const BUILTIN_ID_SILENCE: &str = "builtin://daw_01.silence";
+
+/// Returns the canonical list of daw_01-bundled plugin descriptors.
+/// `scan_system` appends these unconditionally so the picker UI sees
+/// them on every fresh scan. Order here is the order the picker
+/// receives them.
+pub fn builtin_descriptors() -> Vec<PluginEntry> {
+    vec![PluginEntry {
+        id: BUILTIN_ID_SILENCE.to_string(),
+        format: PluginFormat::Builtin,
+        name: "Silence (builtin)".to_string(),
+        vendor: "daw_01".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        // Mirror CLAP feature taxonomy so plugin pickers that filter by
+        // category route this to the instrument list.
+        features: vec!["instrument".to_string(), "synthesizer".to_string()],
+        path: PathBuf::from(BUILTIN_ID_SILENCE),
+        descriptor_index: 0,
+    }]
+}
+
 /// Scan every `.clap` under the system CLAP directory plus every `.vst3`
 /// bundle/DLL under the system VST3 directory, enumerating descriptors
 /// where cheap (CLAP) and falling back to file-name metadata otherwise
 /// (VST3 — scanning a VST3 bundle means loading the DLL + instantiating a
 /// component, which we defer to load-time to keep startup fast).
 ///
+/// daw_01-bundled plugins (`PluginFormat::Builtin`) are appended
+/// unconditionally from [`builtin_descriptors`] so the picker UI always
+/// shows them, even on a freshly-installed system with no external
+/// plugins.
+///
 /// Errors for individual files are logged and skipped so a single broken
 /// plugin doesn't block the whole database.
 pub fn scan_system() -> Result<PluginDatabase> {
-    let mut entries = Vec::new();
+    let mut entries = builtin_descriptors();
 
     // --- CLAP branch: full descriptor enumeration (cheap).
     match crate::clap_scan::scan_system_clap_directory() {

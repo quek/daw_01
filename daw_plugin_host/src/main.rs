@@ -1,3 +1,4 @@
+mod builtin;
 mod clap_host;
 mod clap_plugin;
 mod plugin_instance;

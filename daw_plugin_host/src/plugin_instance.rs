@@ -16,6 +16,7 @@ use anyhow::Result;
 use common::plugin_format::PluginFormat;
 use common::protocol::RenderMode;
 
+use crate::builtin;
 use crate::clap_plugin::ClapPlugin;
 use crate::vst3_plugin::Vst3Plugin;
 
@@ -164,6 +165,20 @@ pub fn load_plugin(
         PluginFormat::Vst3 => {
             let plugin = Vst3Plugin::load(path, plugin_id, callbacks)?;
             Ok(Box::new(plugin) as Box<dyn LoadedPlugin>)
+        }
+        PluginFormat::Builtin => {
+            // `path` here is a `builtin://...` URI (see plugin_format::
+            // PluginFormat docs). `plugin_id` is unused for builtins —
+            // the URI itself is the descriptor id, mirroring CLAP's
+            // single-id-per-descriptor convention. Some upstream
+            // call-sites may still pass a non-empty `plugin_id` (= the
+            // database entry's `id` field, which equals the URI); we
+            // simply ignore it. Future builtins with multiple
+            // descriptors per URI can switch to `plugin_id`-based
+            // dispatch without changing the protocol.
+            let _ = plugin_id;
+            let uri = path.to_string_lossy();
+            builtin::load_builtin(&uri, callbacks)
         }
     }
 }

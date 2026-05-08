@@ -1,8 +1,22 @@
 # VOICEVOX 合成の builtin instrument plugin 化 計画
 
-ステータス: **設計合意待ち** (2026-05-08)。 `plan_audio_followup.md`
+ステータス: **着手中** (2026-05-08、 PR-V1 完了)。 `plan_audio_followup.md`
 後回し 2「VOICEVOX → ClipContent::Audio 統合」 を「ゼロから作るなら」
-の観点で再設計したもの。 着手は別セッションで段階実装。
+の観点で再設計したもの。
+
+## 進捗
+
+- ✅ **PR-V1**: builtin plugin インフラ完了
+  - `PluginFormat::Builtin` variant 追加 (`common/src/plugin_format.rs`)
+  - `common::plugin_db::BUILTIN_ID_SILENCE` + `builtin_descriptors()`
+    新設、 `scan_system` で append (= picker UI が常に builtin を表示)
+  - `daw_plugin_host::builtin` module 新設、 `Silence` (= 無音 instrument
+    の reference impl) + `load_builtin(uri)` dispatcher 実装
+  - `plugin_instance::load_plugin` に Builtin 分岐 (= 既存 LoadedPlugin
+    trait をそのまま実装、 audio thread の codepath は CLAP / VST3 と
+    完全に同じ)
+  - unit test 5 件追加 (load 成功 / unknown / non-URI / process 無音 /
+    state roundtrip)
 
 ## 動機 — なぜ専用 codepath を捨てるか
 
