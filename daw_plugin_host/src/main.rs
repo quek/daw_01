@@ -231,11 +231,12 @@ enum PluginCommand {
     SetRenderMode(RenderMode),
     /// Builtin plugin (`PluginFormat::Builtin`) に per-note metadata を
     /// flush する (PR-V2.2)。 plugin-main thread で plugin instance に
-    /// `LoadedPlugin::set_note_metadata` を呼ぶ。 plugin_id に該当する
-    /// slot が無い / CLAP / VST3 plugin の場合は default no-op で吸収
-    /// (= warning も発生しない、 IPC 経路は format-neutral)。
+    /// `LoadedPlugin::set_note_metadata(bpm, entries)` を呼ぶ。 plugin_id
+    /// に該当する slot が無い / CLAP / VST3 plugin の場合は default
+    /// no-op で吸収 (= warning も発生しない、 IPC 経路は format-neutral)。
     SetBuiltinPluginNoteMetadata {
         plugin_id: u32,
+        bpm: f32,
         entries: Vec<common::plugin_metadata::NoteMetadata>,
     },
     Shutdown,
@@ -872,6 +873,7 @@ fn plugin_main_loop(
                 }
                 PluginCommand::SetBuiltinPluginNoteMetadata {
                     plugin_id,
+                    bpm,
                     entries,
                 } => {
                     // plugin_lookup は `(track, slot) -> plugin_id` の
@@ -890,7 +892,7 @@ fn plugin_main_loop(
                     };
                     tracks.mutate(|t| {
                         if let Some(plugin) = t.plugin_at_mut(track, slot) {
-                            plugin.set_note_metadata(&entries);
+                            plugin.set_note_metadata(bpm, &entries);
                         }
                     });
                 }
@@ -1304,14 +1306,16 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             tracing::info!(?mode, "received SetRenderMode");
             plugin.send(PluginCommand::SetRenderMode(mode));
         }
-        MainToChild::SetBuiltinPluginNoteMetadata { plugin_id, entries } => {
+        MainToChild::SetBuiltinPluginNoteMetadata { plugin_id, bpm, entries } => {
             tracing::debug!(
                 plugin_id,
+                bpm,
                 count = entries.len(),
                 "received SetBuiltinPluginNoteMetadata"
             );
             plugin.send(PluginCommand::SetBuiltinPluginNoteMetadata {
                 plugin_id,
+                bpm,
                 entries,
             });
         }

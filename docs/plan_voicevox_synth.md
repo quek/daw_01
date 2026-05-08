@@ -44,6 +44,26 @@
     追加 (= 役割は plugin_host のみ)
   - unit test 1 件追加 (set_note_metadata で lyrics buffer が完全置換、
     空 flush で全消去)
+- ✅ **PR-V2.3**: HTTP synth + cache + process MVP 完成
+  - `NoteMetadata` を `(note_id, start_beat, duration_beats, pitch,
+    velocity, lyric)` に拡張、 IPC + trait method の signature に `bpm`
+    引数を追加 (= note の frame offset 計算に必要)
+  - `common::voicevox::synthesize_notes_for_builtin(notes, bpm,
+    speaker_id) -> BuiltinSynthOutput { samples, sample_rate,
+    note_offsets }` 新設、 既存 `synthesize_sing_clip` を流用しつつ
+    `note_id → 合成 wav 内 frame offset` の対応表を返す。 `BuiltinNoteSpec`
+    も SDK 境界として `model::Note` から独立
+  - `VoicevoxBuiltin` に背景 synth thread (`voicevox-builtin-synth`) を
+    spawn、 `set_note_metadata` で job 投入 (= 連続 flush は coalesce
+    で最後の 1 件のみ synth)。 結果は `Arc<RwLock<Option<SynthResult>>>`
+    で audio thread と共有
+  - `process()` MVP: note_on event 受信 → synth_result から voice 生成
+    → mix。 1 voice 単位で wav 全体を流す (= per-note voice / global
+    transport sync は PR-V2.4)
+  - `Drop` 実装で synth thread を join、 deactivate でも同様
+  - unit test 2 件追加 (synth_result 無しで note_on 来ても無音、
+    synth_result 仕込みで voice が wav を drain する); 既存 test 含めて
+    合計 15 件 pass
 
 ## 動機 — なぜ専用 codepath を捨てるか
 

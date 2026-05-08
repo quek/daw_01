@@ -214,6 +214,7 @@ pub enum MainToChild {
     /// はない (`docs/plan_voicevox_synth.md` PR-V2.2)。
     SetBuiltinPluginNoteMetadata {
         plugin_id: u32,
+        bpm: f32,
         entries: Vec<crate::plugin_metadata::NoteMetadata>,
     },
     /// Tell the plugin host to switch every loaded plugin's CLAP render

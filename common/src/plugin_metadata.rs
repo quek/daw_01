@@ -20,23 +20,42 @@
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
-/// One per-note metadata entry. Currently only carries `lyric` for
-/// VOICEVOX; future builtins (formant shifters, vibrato controllers,
-/// etc.) can add fields here without changing the IPC variant — bincode
-/// struct expansion is backward compatible as long as new fields have
-/// `#[serde(default)]` and a meaningful `Default` impl.
+/// One per-note metadata entry. Carries the **complete sing-mode note
+/// description** (= start_beat / duration_beats / pitch / velocity) plus
+/// the lyric character. Builtin plugins use this to drive their own
+/// synthesis (= VOICEVOX builds a `singing_query` payload from these);
+/// CLAP / VST3 plugins ignore the entire metadata flush via the
+/// `LoadedPlugin::set_note_metadata` default no-op.
+///
+/// Fields mirror `common::model::Note` deliberately rather than
+/// embedding it: `plugin_metadata` is meant to stay model-agnostic so
+/// it can be hosted out-of-tree as a public plugin SDK in PR-V5
+/// (external VST3 build).
 #[derive(
-    Debug, Clone, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Default,
+    Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Default,
 )]
 pub struct NoteMetadata {
     /// MIDI note identifier shared between the audio engine's
-    /// `TimedNoteEvent` stream and the host-side metadata flush. PR-V2.1
-    /// uses the clip-internal note index (= position in `Clip.notes`)
-    /// as the value; PR-V2.4 wires this through the audio path.
+    /// `TimedNoteEvent` stream and the host-side metadata flush.
+    /// daw_gui uses the clip-internal note index (= position in
+    /// `Clip.notes` *of the same content*) as the value, so an audio
+    /// engine event with `note_id == 7` is the 8th note of whichever
+    /// clip is currently playing on this track.
     pub note_id: u32,
-    /// Lyric character for VOICEVOX `singing_query`. Empty string =
-    /// "use the previous note's lyric" (= sustained tail) or "no
-    /// lyric" depending on context. Other builtins ignore this.
+    /// Note start in beats relative to the song timeline (NOT clip-
+    /// relative). Builtins use this to compute frame offsets for the
+    /// synthesis output buffer.
+    pub start_beat: f64,
+    /// Note length in beats.
+    pub duration_beats: f64,
+    /// MIDI pitch (0–127). `0` = unpitched (= talk-mode lyric).
+    pub pitch: u8,
+    /// MIDI velocity (0–127).
+    pub velocity: u8,
+    /// Lyric character for VOICEVOX `singing_query`. Typically one
+    /// mora ("あ", "い", "っ"). Empty string = "use the previous
+    /// note's lyric" (= sustained tail) or "no lyric" depending on
+    /// context. Other builtins ignore this.
     pub lyric: String,
 }
 
@@ -48,6 +67,10 @@ mod tests {
     fn bincode_roundtrip() {
         let m = NoteMetadata {
             note_id: 42,
+            start_beat: 4.0,
+            duration_beats: 0.25,
+            pitch: 60,
+            velocity: 100,
             lyric: "あ".to_string(),
         };
         let cfg = bincode::config::standard();
@@ -61,6 +84,10 @@ mod tests {
     fn default_is_empty() {
         let m = NoteMetadata::default();
         assert_eq!(m.note_id, 0);
+        assert_eq!(m.start_beat, 0.0);
+        assert_eq!(m.duration_beats, 0.0);
+        assert_eq!(m.pitch, 0);
+        assert_eq!(m.velocity, 0);
         assert!(m.lyric.is_empty());
     }
 }

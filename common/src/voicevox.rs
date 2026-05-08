@@ -455,6 +455,106 @@ fn seconds_to_frames(s: f64) -> i64 {
 // WAV decode
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Builtin plugin wrapper (PR-V2.3)
+// ---------------------------------------------------------------------------
+
+/// Synthesise a single track's worth of notes for the VOICEVOX builtin
+/// plugin (`docs/plan_voicevox_synth.md` PR-V2.3). Wraps `synthesize_sing
+/// _clip` with the plumbing the builtin needs:
+///
+/// - `notes` is a flat list of all notes the plugin should sing; the
+///   plugin builds this from its `NoteMetadata` buffer (filled by
+///   `LoadedPlugin::set_note_metadata`).
+/// - returns the **mono** PCM samples + sample rate + per-note frame
+///   offsets within the synthesised buffer (= `note_id → start frame`).
+///
+/// The frame offset table lets `process()` look up where a freshly-
+/// arrived `note_on` event should start streaming from. Offsets are
+/// computed from `(note.start_beat - earliest_start_beat) ×
+/// samples_per_beat`, mirroring how the VOICEVOX engine renders a
+/// `sing_frame_audio_query` payload (frame 0 = first non-rest entry).
+///
+/// `notes` must NOT be empty — VOICEVOX rejects empty queries; callers
+/// should bail before reaching this function.
+pub fn synthesize_notes_for_builtin(
+    notes: &[BuiltinNoteSpec],
+    bpm: f32,
+    speaker_id: u32,
+) -> Result<BuiltinSynthOutput> {
+    anyhow::ensure!(
+        !notes.is_empty(),
+        "synthesize_notes_for_builtin called with no notes"
+    );
+    let model_notes: Vec<Note> = notes.iter().map(|n| n.to_model_note()).collect();
+
+    let client = reqwest::blocking::Client::new();
+    let wav_bytes = synthesize_sing_clip(&client, &model_notes, bpm, speaker_id)?;
+    let (samples, sample_rate) = decode_wav_to_f32(&wav_bytes)?;
+
+    // Note frame offsets relative to frame 0 of the rendered buffer.
+    // VOICEVOX renders the first non-rest entry at frame 0, so subtract
+    // the earliest start_beat across the input notes.
+    let earliest = notes
+        .iter()
+        .map(|n| n.start_beat)
+        .fold(f64::INFINITY, f64::min);
+    let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(bpm.max(0.001));
+    let mut note_offsets: std::collections::HashMap<u32, u64> =
+        std::collections::HashMap::with_capacity(notes.len());
+    for n in notes {
+        let frame =
+            (((n.start_beat - earliest) * samples_per_beat).max(0.0)) as u64;
+        note_offsets.insert(n.note_id, frame);
+    }
+
+    Ok(BuiltinSynthOutput {
+        samples,
+        sample_rate,
+        note_offsets,
+    })
+}
+
+/// One note in a `synthesize_notes_for_builtin` request. Kept distinct
+/// from `crate::model::Note` (which carries DAW-internal IDs and clip-
+/// scoped fields) so the plugin SDK boundary stays minimal — only the
+/// fields VOICEVOX actually needs.
+#[derive(Debug, Clone)]
+pub struct BuiltinNoteSpec {
+    pub note_id: u32,
+    pub start_beat: f64,
+    pub duration_beats: f64,
+    pub pitch: u8,
+    pub velocity: u8,
+    pub lyric: String,
+}
+
+impl BuiltinNoteSpec {
+    fn to_model_note(&self) -> Note {
+        Note {
+            start_beat: self.start_beat,
+            duration_beats: self.duration_beats,
+            pitch: self.pitch,
+            velocity: self.velocity,
+            lyric: if self.lyric.is_empty() {
+                None
+            } else {
+                Some(self.lyric.clone())
+            },
+        }
+    }
+}
+
+/// Result of `synthesize_notes_for_builtin`. `samples` is mono f32
+/// audio at `sample_rate` Hz; `note_offsets` lets `process()` look up
+/// where a `note_on` event for a given `note_id` starts streaming.
+#[derive(Debug, Clone)]
+pub struct BuiltinSynthOutput {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+    pub note_offsets: std::collections::HashMap<u32, u64>,
+}
+
 /// Decodes WAV bytes (as returned by VOICEVOX) into mono f32 samples.
 /// Supports PCM 16-bit and IEEE float 32-bit.
 pub fn decode_wav_to_f32(data: &[u8]) -> Result<(Vec<f32>, u32)> {

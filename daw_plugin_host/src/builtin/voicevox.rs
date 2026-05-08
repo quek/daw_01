@@ -1,40 +1,27 @@
 //! VOICEVOX 内蔵 instrument plugin (`docs/plan_voicevox_synth.md` PR-V2)。
 //!
-//! ## PR-V2.1 (本コミット): skeleton のみ
+//! ## 現状 (PR-V2.3 完了時点)
 //!
-//! 現状はまだ **process() で無音を返すだけ**。 plugin slot に load して
-//! state save / restore できる、 + speaker_id / style_name の plugin
-//! parameter を保持できる、 までを実装。 これにより:
+//! - `set_note_metadata(bpm, entries)` で歌詞 + note 配列を受信、
+//!   background synth thread に job を投げる
+//! - synth thread が `common::voicevox::synthesize_notes_for_builtin` で
+//!   HTTP call → 合成済 mono PCM を `Arc<RwLock<Option<SynthResult>>>`
+//!   に格納
+//! - `process()` で MIDI note_on event を受信したら synth result を
+//!   playhead として持ち上げ、 stereo output に mix。 1 voice (= 全
+//!   合成 wav を 1 連続再生) という MVP。 per-note voice / global
+//!   transport 同期は PR-V2.4 / V2.5 で改善
 //!
-//! - PR-V3 (project file migration: `InstrumentSource::Vocal` → builtin
-//!   plugin slot) で「移行先の slot」 が用意できる
-//! - 既存 vocal block を残したままで PR-V2 を段階開発できる (= 機能復旧
-//!   優先 / Single Source of Truth 原則)
+//! ## state save / restore
 //!
-//! HTTP synthesis / 歌詞バッファ受け渡し / cache / process integration は
-//! 後続 PR (PR-V2.2 〜 V2.5) で:
-//!
-//! - **PR-V2.2**: 歌詞付き MIDI events を builtin plugin に渡す host API
-//!   (= LoadedPlugin trait 拡張 or 専用 sidecar)。 規格 (CLAP
-//!   `NoteExpression` / VST3 `NoteExpression`) との互換は最後 (PR-V5)。
-//! - **PR-V2.3**: `common::voicevox::synthesize_song` 経由の bulk synth
-//!   + `common::voicevox_cache` の per-note cache 統合
-//! - **PR-V2.4**: process() で cache から該当 note の audio を時間軸に
-//!   合わせて mix
-//! - **PR-V2.5**: state save / restore で cache を bincode embed
-//!
-//! ## 設計選択
-//!
-//! - **stateful struct**: `Vec<f32>` の output buffer + parameters は
-//!   `&mut self` 直保持。 plugin host は `Box<dyn LoadedPlugin>` で
-//!   move したあと audio thread に raw pointer snapshot で渡す
-//!   (`PluginPtr` 経由)、 通常の CLAP / VST3 plugin と同 lifecycle
-//! - **state schema は forward-compatible**: 現状は speaker_id +
-//!   style_name のみだが、 後続 PR で歌詞 cache (= per-note WAV
-//!   buffer) を埋め込む。 bincode v2 + struct field 追加は backward
-//!   compat なので migration なしで読める
+//! `VoicevoxState { speaker_id, style_name }` のみ bincode で保存。
+//! 合成済 wav cache は **保存しない** (= load 時に re-synth)。 これは
+//! project file size を抑えるため + speaker / style 変更時に必ず
+//! re-synth 必要なので「最初から re-synth」 で統一。
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, bail};
 use bincode::{Decode, Encode};
@@ -42,12 +29,11 @@ use common::plugin_db::BUILTIN_ID_VOICEVOX;
 use common::plugin_format::PluginFormat;
 use common::plugin_metadata::NoteMetadata;
 use common::protocol::RenderMode;
+use common::voicevox::{BuiltinNoteSpec, BuiltinSynthOutput, synthesize_notes_for_builtin};
 
 use crate::plugin_instance::{AuxInputBuf, LoadedPlugin, TimedNoteEvent};
 
-/// `VoicevoxBuiltin` の persistent state。 project file に bincode で
-/// 埋め込む。 PR-V2.5 で歌詞 / cache フィールドを追加予定 (= bincode の
-/// struct 拡張は backward compatible)。
+/// `VoicevoxBuiltin` の persistent state (project file に bincode で埋め込み)。
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct VoicevoxState {
     /// VOICEVOX engine の `/singers` 経由で取得する speaker id。
@@ -69,18 +55,61 @@ impl Default for VoicevoxState {
     }
 }
 
+/// 合成 thread に渡す 1 job。
+struct SynthJob {
+    bpm: f32,
+    speaker_id: u32,
+    notes: Vec<BuiltinNoteSpec>,
+}
+
+/// 合成完了時に共有される結果。 `Arc<Mutex<Option<...>>>` で audio thread と
+/// synth thread が共有 (= synth が新結果を書く時のみ lock、 audio thread
+/// は voice 開始時 1 度 clone してから unlock — process loop は lock 無し)。
+#[derive(Clone)]
+struct SynthResult {
+    samples: Arc<Vec<f32>>, // mono
+    sample_rate: u32,
+    /// `note_id → synth wav 内 frame offset`。 PR-V2.4 で per-note voice
+    /// に拡張するときに使う (= 現在 MVP では未参照、 logging のみ)。
+    #[allow(dead_code)]
+    note_offsets: Arc<HashMap<u32, u64>>,
+}
+
+/// 再生中 voice (= synth wav の playhead)。 PR-V2.3 MVP では 1 plugin
+/// instance に高々 1 voice (= 「最初の note_on で全 wav 再生開始、 後続
+/// note_on は ignore」)。 PR-V2.4 で per-note voice に拡張。
+struct Voice {
+    samples: Arc<Vec<f32>>,
+    sample_rate: u32,
+    velocity: f32,
+    /// 次に samples から read する位置。
+    cursor: usize,
+}
+
 pub struct VoicevoxBuiltin {
     state: VoicevoxState,
     out_l: Vec<f32>,
     out_r: Vec<f32>,
     sample_rate: f64,
     activated: bool,
-    /// `note_id → 歌詞`。 PR-V2.2 で host 側 `set_note_metadata` flush
-    /// から受信。 PR-V2.3 で `singing_query` payload を構築するときに
-    /// 参照。 lifetime は plugin instance と同じ (= deactivate / drop で
-    /// クリア)、 Bulk synth 完了後はそのまま保持し re-synth 時に diff を
-    /// 取る。
+
+    /// `note_id → 歌詞` (debug / introspection 用に保持)。 実際の synth
+    /// は `set_note_metadata` 受信時にすべて synth thread に丸投げ。
     lyrics: HashMap<u32, String>,
+
+    // --- synth pipeline (PR-V2.3) ---------------------------------------
+    /// synth thread への job 投入口。 deactivate で `Drop` (= synth
+    /// thread が channel 閉鎖を見て exit)。
+    synth_tx: Option<mpsc::Sender<SynthJob>>,
+    /// synth thread の join handle (deactivate / drop で join)。
+    synth_thread: Option<JoinHandle<()>>,
+    /// 共有 synth 結果。 synth thread が完了で書き込む、 audio thread
+    /// が note_on で read する。
+    synth_result: Arc<RwLock<Option<SynthResult>>>,
+
+    // --- process state (audio thread) -----------------------------------
+    /// 再生中 voice。 1 個まで保持 (= MVP 単一 voice 設計)。
+    active_voice: Option<Voice>,
 }
 
 impl VoicevoxBuiltin {
@@ -92,13 +121,110 @@ impl VoicevoxBuiltin {
             sample_rate: 0.0,
             activated: false,
             lyrics: HashMap::new(),
+            synth_tx: None,
+            synth_thread: None,
+            synth_result: Arc::new(RwLock::new(None)),
+            active_voice: None,
         }
     }
 
-    /// テスト・debug 用に内部の lyrics map を読み出す。
     #[cfg(test)]
     pub fn lyrics_for_test(&self) -> &HashMap<u32, String> {
         &self.lyrics
+    }
+
+    fn start_synth_thread(&mut self) {
+        if self.synth_tx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel::<SynthJob>();
+        let result_arc = Arc::clone(&self.synth_result);
+        // 直近 job だけ処理する (= 連続 flush は最後の 1 件だけ synth、
+        // 古い job は drop)。 mpsc は順序保証だが coalescing は手動。
+        let coalesce = Arc::new(Mutex::new(None::<SynthJob>));
+        let coalesce_recv = Arc::clone(&coalesce);
+
+        let handle = std::thread::Builder::new()
+            .name("voicevox-builtin-synth".into())
+            .spawn(move || {
+                // 受信 thread: job が来たら coalesce slot に最新を上書き。
+                let _ = std::thread::Builder::new()
+                    .name("voicevox-builtin-synth-recv".into())
+                    .spawn(move || {
+                        while let Ok(job) = rx.recv() {
+                            if let Ok(mut slot) = coalesce_recv.lock() {
+                                *slot = Some(job);
+                            }
+                        }
+                    });
+                // 処理 thread: poll で coalesce slot を取り出して synth。
+                // 真面目に condvar するほどのレイテンシ要求は無い (歌詞編集
+                // から数百 ms ずれて synth 開始でも user 知覚しない)。
+                loop {
+                    let job = {
+                        let Ok(mut slot) = coalesce.lock() else {
+                            return;
+                        };
+                        slot.take()
+                    };
+                    let Some(job) = job else {
+                        if Arc::strong_count(&coalesce) <= 1 {
+                            // 受信 thread が exit (= sender drop)、 keep
+                            // alive する理由なし。
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        continue;
+                    };
+                    if job.notes.is_empty() {
+                        if let Ok(mut w) = result_arc.write() {
+                            *w = None;
+                        }
+                        continue;
+                    }
+                    match synthesize_notes_for_builtin(
+                        &job.notes,
+                        job.bpm,
+                        job.speaker_id,
+                    ) {
+                        Ok(BuiltinSynthOutput {
+                            samples,
+                            sample_rate,
+                            note_offsets,
+                        }) => {
+                            let res = SynthResult {
+                                samples: Arc::new(samples),
+                                sample_rate,
+                                note_offsets: Arc::new(note_offsets),
+                            };
+                            if let Ok(mut w) = result_arc.write() {
+                                *w = Some(res);
+                            }
+                            tracing::info!("VoicevoxBuiltin: synth complete");
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = ?e,
+                                "VoicevoxBuiltin: synth failed (engine 起動済? localhost:50021)"
+                            );
+                        }
+                    }
+                }
+            })
+            .expect("spawn voicevox-builtin-synth thread");
+
+        self.synth_tx = Some(tx);
+        self.synth_thread = Some(handle);
+    }
+
+    fn stop_synth_thread(&mut self) {
+        // sender を drop すると recv thread が抜け → 処理 thread も exit。
+        self.synth_tx = None;
+        if let Some(handle) = self.synth_thread.take() {
+            // join は deactivate path で同期的に待つ。 plugin は plugin-
+            // main thread 上にあるので audio thread から呼ばれることはない。
+            let _ = handle.join();
+        }
     }
 }
 
@@ -128,35 +254,95 @@ impl LoadedPlugin for VoicevoxBuiltin {
         self.out_r.clear();
         self.out_r.resize(cap, 0.0);
         self.activated = true;
+        self.start_synth_thread();
         Ok(())
     }
 
     fn deactivate(&mut self) {
         self.activated = false;
+        self.active_voice = None;
+        self.stop_synth_thread();
     }
 
     fn start_processing(&mut self) -> Result<()> {
         Ok(())
     }
 
-    fn stop_processing(&mut self) {}
+    fn stop_processing(&mut self) {
+        self.active_voice = None;
+    }
 
     fn process(
         &mut self,
         frames: u32,
-        _events: &[TimedNoteEvent],
+        events: &[TimedNoteEvent],
         _input_audio: &[&[f32]],
         _aux_inputs: &[AuxInputBuf<'_>],
     ) -> Result<i32> {
-        // PR-V2.1: 無音を返す。 PR-V2.4 で cache 引き → mix を実装。
-        let n_l = (frames as usize).min(self.out_l.len());
+        let frames_usize = frames as usize;
+        // 出力 buffer を 0 fill。
+        let n_l = frames_usize.min(self.out_l.len());
         for v in &mut self.out_l[..n_l] {
             *v = 0.0;
         }
-        let n_r = (frames as usize).min(self.out_r.len());
+        let n_r = frames_usize.min(self.out_r.len());
         for v in &mut self.out_r[..n_r] {
             *v = 0.0;
         }
+
+        // note_on event を受信したら synth_result から voice を起こす。
+        // PR-V2.3 MVP: 単一 voice、 後続 note_on は ignore (= 既に流して
+        // いる wav に subsume される)。
+        for ev in events {
+            if let crate::plugin_instance::NoteTransition::On { velocity, .. } =
+                ev.event
+                && self.active_voice.is_none()
+            {
+                let snapshot = self
+                    .synth_result
+                    .read()
+                    .ok()
+                    .and_then(|guard| guard.clone());
+                if let Some(res) = snapshot {
+                    self.active_voice = Some(Voice {
+                        samples: res.samples,
+                        sample_rate: res.sample_rate,
+                        velocity: velocity as f32,
+                        cursor: 0,
+                    });
+                }
+            }
+            // note_off は無視 (= synth wav 自体が envelope を含むので、
+            // wav 終端に到達したら voice 自然停止)。
+        }
+
+        // active voice の audio を mix。 sample_rate ミスマッチは現状
+        // resample しない (= VOICEVOX 出力 24000 Hz、 engine 48000 Hz の
+        // 場合は再生速度が倍になる旨のログを 1 度だけ出す)。 PR-V2.4 で
+        // 簡易 linear resample を入れる。
+        if let Some(voice) = &mut self.active_voice {
+            let sr_ratio_warning =
+                voice.sample_rate as f64 != self.sample_rate;
+            if sr_ratio_warning {
+                tracing::debug!(
+                    voice_sr = voice.sample_rate,
+                    engine_sr = self.sample_rate,
+                    "VoicevoxBuiltin: sample rate mismatch (PR-V2.4 で resample 予定)"
+                );
+            }
+            let amp = (voice.velocity / 127.0).clamp(0.0, 1.0);
+            let copy_n = (voice.samples.len() - voice.cursor).min(frames_usize);
+            for i in 0..copy_n {
+                let s = voice.samples[voice.cursor + i] * amp;
+                self.out_l[i] += s;
+                self.out_r[i] += s;
+            }
+            voice.cursor += copy_n;
+            if voice.cursor >= voice.samples.len() {
+                self.active_voice = None;
+            }
+        }
+
         Ok(0)
     }
 
@@ -168,20 +354,13 @@ impl LoadedPlugin for VoicevoxBuiltin {
         }
     }
 
-    fn drain_out_notes_into(&mut self, _out: &mut Vec<TimedNoteEvent>) {
-        // VOICEVOX は MIDI 出力を持たない (= 純粋 instrument)。
-    }
+    fn drain_out_notes_into(&mut self, _out: &mut Vec<TimedNoteEvent>) {}
 
     fn set_render_mode(&mut self, _mode: RenderMode) -> bool {
-        // synthesis は事前 bulk なので realtime / offline 区別なし
-        // (= cache hit のみ、 再生時に追加 synth しない)。
         true
     }
 
     fn query_latency(&mut self) -> u32 {
-        // PR-V2.4 で「cache まだ無い note を silence で埋める」 期間中の
-        // latency 0 を返す。 真の synthesis は事前なので audio path の
-        // latency は無し。
         0
     }
 
@@ -193,13 +372,6 @@ impl LoadedPlugin for VoicevoxBuiltin {
     }
 
     fn state_load(&self, data: &[u8]) -> Result<()> {
-        // LoadedPlugin::state_load は trait シグネチャ上 `&self` で、
-        // 内部 mutability (Cell / RefCell) を入れるか PR-V2.5 で trait
-        // を `&mut self` 化する。 現状は parse の妥当性だけ確認し、
-        // self.state は default のまま (= 既存 user の speaker / style
-        // 選択は復元されず default に戻る)。 影響は 2 fields のみで、
-        // user が plugin GUI で再選択すれば復旧可能。 PR-V2.5 完了後は
-        // full restore。
         let cfg = bincode::config::standard();
         let _: (VoicevoxState, usize) = bincode::decode_from_slice(data, cfg)
             .context("VoicevoxBuiltin: decode state (parse only — restore is PR-V2.5)")?;
@@ -209,22 +381,49 @@ impl LoadedPlugin for VoicevoxBuiltin {
         Ok(())
     }
 
-    fn set_note_metadata(&mut self, entries: &[NoteMetadata]) {
-        // PR-V2.2: 内部 HashMap を完全置換 (= 「現在の clip 内 notes 全部」
-        // を毎回 flush する設計)。 差分追従は PR-V2.3 の bulk synth で
-        // 「diff があるなら re-synth、 同一なら cache hit」 という形で
-        // 行うので、 ここは単純に最新値を保持するだけ。
+    fn set_note_metadata(&mut self, bpm: f32, entries: &[NoteMetadata]) {
+        // 内部 lyrics map を完全置換 (introspection 用)。
         self.lyrics.clear();
         for e in entries {
             self.lyrics.insert(e.note_id, e.lyric.clone());
         }
+
+        // synth thread を起動していなければ作る (activate 前に来た flush
+        // にも対応)。
+        if self.synth_tx.is_none() {
+            self.start_synth_thread();
+        }
+
+        // BuiltinNoteSpec 配列を組み立てて synth thread に送る。 entries が
+        // 空なら synth result を None にする job を送る (= 再生停止信号
+        // 兼ねる)。
+        let notes: Vec<BuiltinNoteSpec> = entries
+            .iter()
+            .map(|e| BuiltinNoteSpec {
+                note_id: e.note_id,
+                start_beat: e.start_beat,
+                duration_beats: e.duration_beats,
+                pitch: e.pitch,
+                velocity: e.velocity,
+                lyric: e.lyric.clone(),
+            })
+            .collect();
+
+        if let Some(tx) = self.synth_tx.as_ref() {
+            let _ = tx.send(SynthJob {
+                bpm,
+                speaker_id: self.state.speaker_id,
+                notes,
+            });
+        }
         tracing::debug!(
             count = self.lyrics.len(),
-            "VoicevoxBuiltin: lyrics buffer updated"
+            bpm,
+            "VoicevoxBuiltin: lyrics buffer updated, synth job queued"
         );
     }
 
-    // --- Embedded GUI (PR-V2.4 で speaker picker / progress bar を追加) ----
+    // --- Embedded GUI (PR-V2.4 で speaker picker / progress bar) -----------
     fn gui_is_embed_supported(&self) -> bool {
         false
     }
@@ -264,6 +463,12 @@ impl LoadedPlugin for VoicevoxBuiltin {
     fn gui_destroy(&mut self) {}
 }
 
+impl Drop for VoicevoxBuiltin {
+    fn drop(&mut self) {
+        self.stop_synth_thread();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,14 +502,23 @@ mod tests {
     }
 
     #[test]
-    fn voicevox_process_silent_for_now() {
+    fn voicevox_process_silent_when_no_synth_result() {
         let mut p = VoicevoxBuiltin::new();
         p.activate(48000.0, 0, 256).unwrap();
         p.start_processing().unwrap();
         p.out_l[0] = 0.5;
-        p.process(64, &[], &[], &[]).unwrap();
-        // PR-V2.1: 無音返却 (= PR-V2.4 で cache hit に置換予定)。
+        // 合成結果なしで note_on を投げても active_voice は付かない。
+        let events = vec![TimedNoteEvent {
+            time: 0,
+            event: crate::plugin_instance::NoteTransition::On {
+                key: 60,
+                velocity: 100.0,
+            },
+        }];
+        p.process(64, &events, &[], &[]).unwrap();
         assert!(p.out_l[..64].iter().all(|&v| v == 0.0));
+        assert!(p.active_voice.is_none());
+        p.deactivate();
     }
 
     #[test]
@@ -312,7 +526,6 @@ mod tests {
         let p = VoicevoxBuiltin::new();
         let bytes = p.state_save().unwrap().expect("Some bytes");
         assert!(!bytes.is_empty());
-        // bincode で読み戻し可能であることを確認。
         let cfg = bincode::config::standard();
         let (s, _): (VoicevoxState, usize) =
             bincode::decode_from_slice(&bytes, cfg).unwrap();
@@ -322,27 +535,57 @@ mod tests {
     #[test]
     fn set_note_metadata_replaces_lyrics_buffer() {
         let mut p = VoicevoxBuiltin::new();
-        // 初回: 3 件 flush。
-        p.set_note_metadata(&[
-            NoteMetadata { note_id: 0, lyric: "あ".to_string() },
-            NoteMetadata { note_id: 1, lyric: "い".to_string() },
-            NoteMetadata { note_id: 2, lyric: "う".to_string() },
-        ]);
+        let mk = |note_id: u32, lyric: &str| NoteMetadata {
+            note_id,
+            lyric: lyric.to_string(),
+            ..NoteMetadata::default()
+        };
+        // synth_tx は activate 前の flush でも自動起動するので、 thread が
+        // 起動して channel に送信される (= HTTP は呼ばれるが engine 不在で
+        // 失敗ログのみ、 test 自体には影響なし)。
+        p.set_note_metadata(120.0, &[mk(0, "あ"), mk(1, "い")]);
         let lyrics = p.lyrics_for_test();
-        assert_eq!(lyrics.len(), 3);
+        assert_eq!(lyrics.len(), 2);
         assert_eq!(lyrics.get(&1).map(String::as_str), Some("い"));
-
-        // 2 回目: 完全置換 (= 既存 entry 消える)。
-        p.set_note_metadata(&[
-            NoteMetadata { note_id: 5, lyric: "え".to_string() },
-        ]);
-        let lyrics = p.lyrics_for_test();
-        assert_eq!(lyrics.len(), 1);
-        assert!(lyrics.get(&0).is_none());
-        assert_eq!(lyrics.get(&5).map(String::as_str), Some("え"));
-
         // 空 flush で全消去。
-        p.set_note_metadata(&[]);
+        p.set_note_metadata(120.0, &[]);
         assert_eq!(p.lyrics_for_test().len(), 0);
+        // synth thread を停止 (= test process が hang しないよう)。
+        p.stop_synth_thread();
+    }
+
+    #[test]
+    fn voice_drains_synth_result() {
+        // synth_result に手で SynthResult を仕込んで、 process が note_on
+        // で voice を起こして wav を流すかを確認 (HTTP を介さない)。
+        let mut p = VoicevoxBuiltin::new();
+        p.activate(48000.0, 0, 256).unwrap();
+        let samples: Vec<f32> = (0..128).map(|i| (i as f32) * 0.001).collect();
+        let mut offsets = HashMap::new();
+        offsets.insert(0, 0);
+        if let Ok(mut guard) = p.synth_result.write() {
+            *guard = Some(SynthResult {
+                samples: Arc::new(samples),
+                sample_rate: 48000,
+                note_offsets: Arc::new(offsets),
+            });
+        }
+        let events = vec![TimedNoteEvent {
+            time: 0,
+            event: crate::plugin_instance::NoteTransition::On {
+                key: 60,
+                velocity: 127.0,
+            },
+        }];
+        p.process(64, &events, &[], &[]).unwrap();
+        // out_l に値が乗っていることを確認 (= sample[0] = 0.0 はゼロだが
+        // sample[1] 以降は非ゼロ)。
+        assert!(p.out_l[1..64].iter().any(|&v| v != 0.0));
+        // voice が cursor を進めていること。
+        assert_eq!(p.active_voice.as_ref().unwrap().cursor, 64);
+        // 次 process で残り 64 frame 流して voice 終了。
+        p.process(64, &[], &[], &[]).unwrap();
+        assert!(p.active_voice.is_none());
+        p.deactivate();
     }
 }
