@@ -918,6 +918,8 @@ impl AppData {
                 | AppEvent::SetClipFadeOutBeats { .. }
                 | AppEvent::SetClipFadeInCurve { .. }
                 | AppEvent::SetClipFadeOutCurve { .. }
+                | AppEvent::AutoFadeSelectedClips
+                | AppEvent::AutoCrossfadeSelectedClips
                 | AppEvent::ImportAudio { .. }
                 | AppEvent::AddNote { .. }
                 | AppEvent::ResizeNote { .. }
@@ -1530,6 +1532,21 @@ pub enum AppEvent {
     SetClipFadeOutBeats { target: ClipRef, beats: f64 },
     SetClipFadeInCurve { target: ClipRef, curve: common::model::FadeCurve },
     SetClipFadeOutCurve { target: ClipRef, curve: common::model::FadeCurve },
+
+    // ---- Auto-Fade / Auto-Crossfade (Phase 2 PR5) -----------------------
+    /// 全選択 audio clip に短 (≒4 ms 相当) fade を一括適用 (`docs
+    /// /plan_audio_clip.md` §3.5)。 既存 fade 値は上書き。 fade 長は
+    /// `0.004 * bpm / 60` beats = 4 ms 相当 (業界標準のクリック除去
+    /// 用 short fade)。
+    AutoFadeSelectedClips,
+
+    /// 隣接 audio clip 間で重なり区間に crossfade を作成 (= 前 clip の
+    /// 末尾 fade_out + 次 clip の先頭 fade_in を overlap 長で揃える、
+    /// `docs/plan_audio_clip.md` §3.5)。 同 track 内の clip 群を
+    /// start_beat 順に sort し、 ペアごとに `prev.start + prev.length >
+    /// next.start` を判定 → overlap_beats を両 fade に設定。 隙間がある
+    /// (= overlap が無い) ペアは no-op。
+    AutoCrossfadeSelectedClips,
 }
 
 impl AppData {
@@ -1912,6 +1929,12 @@ impl AppData {
             }
             AppEvent::SetClipFadeOutCurve { target, curve } => {
                 self.set_clip_audio_event_fade_out_curve(target, curve);
+            }
+            AppEvent::AutoFadeSelectedClips => {
+                self.auto_fade_selected_clips();
+            }
+            AppEvent::AutoCrossfadeSelectedClips => {
+                self.auto_crossfade_selected_clips();
             }
             AppEvent::SplitClipAtPlayhead { snap } => {
                 self.action_split_clips_at_cursor(snap);
@@ -3938,6 +3961,147 @@ impl AppData {
                 );
                 self.resync_clip_audio_event_edit_buffers(target);
             }
+        }
+    }
+
+    /// 全選択 audio clip に短 fade を一括適用 (`docs/plan_audio_clip
+    /// .md` §3.5 Auto-Fade)。 fade 長は 4 ms 相当 (= `0.004 * bpm / 60`
+    /// beats)、 既存値は上書き。 audio 以外の clip (MIDI / Vocal) と
+    /// `selected_clip` がない場合は no-op。
+    fn auto_fade_selected_clips(&mut self) {
+        let bpm = self.song.bpm.max(1.0) as f64;
+        let auto_fade_beats = 0.004 * bpm / 60.0; // 4 ms 相当
+        let mut applied = 0usize;
+        // borrow checker: target list を先に固める。
+        let targets: Vec<ClipRef> = if self.selected_clips.is_empty() {
+            self.selected_clip.into_iter().collect()
+        } else {
+            self.selected_clips.clone()
+        };
+        for target in targets {
+            let Some(content_id) = self
+                .song
+                .tracks
+                .get(target.track as usize)
+                .and_then(|t| t.clips.get(target.clip as usize))
+                .map(|c| c.content_id)
+            else {
+                continue;
+            };
+            let max_beats = self.clip_length_beats(target).unwrap_or(0.0);
+            let fade_beats = auto_fade_beats.min(max_beats);
+            if let Some(common::model::ClipContent::Audio(audio)) =
+                self.song.clip_contents.get_mut(&content_id)
+            {
+                for event in &mut audio.events {
+                    event.fade_in_beats = fade_beats;
+                    event.fade_out_beats = fade_beats;
+                }
+                applied += 1;
+            }
+        }
+        if applied > 0 {
+            self.sync_song_to_plugin_host();
+            // edit buffer (Inspector) も追従させる。
+            if let Some(target) = self.clip_edit_buffer_target {
+                self.resync_clip_audio_event_edit_buffers(target);
+            }
+            self.status_message = format!("Auto-Fade: {applied} 個のクリップに 4 ms fade を適用");
+        } else {
+            self.status_message = "Auto-Fade: 選択中の audio clip がありません".into();
+        }
+    }
+
+    /// 隣接 audio clip ペアに crossfade を作成 (`docs/plan_audio_clip
+    /// .md` §3.5 Auto-Crossfade)。 selected_clips のうち audio clip を
+    /// track 別に集めて start_beat 順に並べ、 ペアごとに `prev_end >
+    /// next_start` (= overlap 中) のみ overlap_beats を fade_out / fade_in
+    /// に設定する。 隙間ペアは no-op、 完全重なり (next が prev に
+    /// 内包される) はサポート対象外で skip + 警告。
+    fn auto_crossfade_selected_clips(&mut self) {
+        // (track_idx, clip_idx, start_beat, end_beat, content_id) を集める
+        let mut entries: Vec<(u32, u32, f64, f64, u32)> = Vec::new();
+        let targets: Vec<ClipRef> = if self.selected_clips.is_empty() {
+            self.selected_clip.into_iter().collect()
+        } else {
+            self.selected_clips.clone()
+        };
+        for target in &targets {
+            let Some(track) = self.song.tracks.get(target.track as usize) else {
+                continue;
+            };
+            let Some(clip) = track.clips.get(target.clip as usize) else {
+                continue;
+            };
+            let Some(common::model::ClipContent::Audio(_)) =
+                self.song.clip_contents.get(&clip.content_id)
+            else {
+                continue;
+            };
+            entries.push((
+                target.track,
+                target.clip,
+                clip.start_beat,
+                clip.start_beat + clip.length_beats,
+                clip.content_id,
+            ));
+        }
+        if entries.len() < 2 {
+            self.status_message =
+                "Auto-Crossfade: 隣接判定には audio clip が 2 つ以上必要です".into();
+            return;
+        }
+        // track ごとに sort して隣接ペアを抽出
+        entries.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        let mut applied = 0usize;
+        for window in entries.windows(2) {
+            let (prev_track, _, prev_start, prev_end, prev_content) = window[0];
+            let (next_track, _, next_start, next_end, next_content) = window[1];
+            if prev_track != next_track {
+                continue;
+            }
+            if next_start >= prev_end {
+                continue; // 隙間あり、 crossfade 対象外
+            }
+            if next_end <= prev_end {
+                tracing::warn!(
+                    prev_start, prev_end, next_start, next_end,
+                    "Auto-Crossfade: next clip が prev に内包されているため skip"
+                );
+                continue;
+            }
+            let overlap = (prev_end - next_start).max(0.0);
+            // prev clip の末尾 fade_out
+            if let Some(common::model::ClipContent::Audio(audio)) =
+                self.song.clip_contents.get_mut(&prev_content)
+            {
+                for event in &mut audio.events {
+                    event.fade_out_beats = overlap.min(event.event_length_beats);
+                }
+            }
+            // next clip の先頭 fade_in
+            if let Some(common::model::ClipContent::Audio(audio)) =
+                self.song.clip_contents.get_mut(&next_content)
+            {
+                for event in &mut audio.events {
+                    event.fade_in_beats = overlap.min(event.event_length_beats);
+                }
+            }
+            applied += 1;
+        }
+        if applied > 0 {
+            self.sync_song_to_plugin_host();
+            if let Some(target) = self.clip_edit_buffer_target {
+                self.resync_clip_audio_event_edit_buffers(target);
+            }
+            self.status_message =
+                format!("Auto-Crossfade: {applied} ペアに crossfade を適用");
+        } else {
+            self.status_message =
+                "Auto-Crossfade: 重なっている隣接ペアがありません".into();
         }
     }
 

@@ -190,18 +190,29 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // ContentId が `ClipContent::Audio` の場合だけ rect 内に波形を表示する。
     // gui_01 #023 で drop position が取れるようになったらここに resolve
     // ロジックも追加する (PR4 範囲外)。
+    // Phase 2 PR5: Auto-Fade / Auto-Crossfade を context_menu に追加
+    // (`docs/plan_audio_clip.md` §3.5)。 選択 clip 群に対して動くので、
+    // 右クリックされた clip 自体の selection を変える/変えないは handler
+    // 側に任せる (= MakeClipUnique も同 pattern)。
     for (clip_key, rect) in &resp.clip_rects {
         let key = *clip_key;
-        ui.context_menu_for(*rect, &["Make Unique"], move |idx, ui| {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                let Some(target) = clip_key_to_ref(app, key) else {
-                    return;
-                };
-                if idx == 0 {
-                    app.handle_event(AppEvent::MakeClipUnique(target));
-                }
-            }));
-        });
+        ui.context_menu_for(
+            *rect,
+            &["Make Unique", "Auto-Fade", "Auto-Crossfade"],
+            move |idx, ui| {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    let Some(target) = clip_key_to_ref(app, key) else {
+                        return;
+                    };
+                    match idx {
+                        0 => app.handle_event(AppEvent::MakeClipUnique(target)),
+                        1 => app.handle_event(AppEvent::AutoFadeSelectedClips),
+                        2 => app.handle_event(AppEvent::AutoCrossfadeSelectedClips),
+                        _ => {}
+                    }
+                }));
+            },
+        );
         draw_audio_clip_waveform(app, ui, *clip_key, *rect);
     }
 
