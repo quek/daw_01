@@ -101,6 +101,11 @@ fn draw_menu_bar(ui: &mut Ui<'_, AppData>, rect: Rect) {
             m.item("Save As...", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::SaveAs)));
             });
+            m.item("Import Audio...", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::OpenImportAudioDialog)
+                }));
+            });
             m.item("Export WAV...", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ExportWav)));
             });

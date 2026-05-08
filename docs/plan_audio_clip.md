@@ -1,6 +1,20 @@
 # WAV / Audio Clip 機能仕様 (Bitwig 流 + 共有コピー対応)
 
-ステータス: **仕様策定中** — 実装着手前。 段階分けは §11、 未確定事項は §13。
+ステータス: **Phase 1 完了** (2026-05-08)。 Phase 2 (編集機能拡張 + Audio Editor)
+着手前。 段階分けは §11、 未確定事項は §13。
+
+Phase 1 完了内容: AudioSource pool / `ClipContent` enum 化 / .daw v6→v7 migration、
+drag&drop + File menu からの WAV import + dedup + project bundle 化、 Clip 移動 /
+右端 trim (= length 縮め時に audio event を追従 clamp) / Delete、 共有コピー /
+独立コピー / `D` / `Alt+D` / Make Unique、 Repitch (linear interp)、 Raw mode
+playback + sample rate auto-resample、 arrangement 内波形描画 (gui_01
+WaveformView)、 `E` Split / `J` Glue (MIDI / Audio / Vocal 共通)、 VOICEVOX
+経路を `SetGeneratedAudio` に移行 (clip-keyed gen_id で multi-clip Vocal
+track 独立化)。
+
+Phase 1 残課題 (Phase 2 へ持ち越し): 左端 trim は gui_01 arrangement widget
+が `ResizeClips` delta に `next_start` を持たないため未対応 (gui_01 への要望
+が必要)。 Alt+drag time-stretch handle (§3.2) も同様。
 
 ## 0. 動機と現状
 

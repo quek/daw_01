@@ -1333,6 +1333,13 @@ pub enum AppEvent {
     /// to 4 GB §7.2) don't block the UI.
     ImportAudio { paths: Vec<PathBuf> },
 
+    /// File menu → "Import Audio..." entry. Opens an `rfd` file picker
+    /// (multi-select, WAV filter), then forwards the chosen paths to
+    /// `AppEvent::ImportAudio`. The dialog itself is `rfd`'s native
+    /// modal so we don't need our own ui state. `docs/plan_audio_clip.md`
+    /// §3.1 — File menu からの import 経路。
+    OpenImportAudioDialog,
+
     // -------- Split / Glue (Phase 1 PR7) -----------------------------------
     /// Split clip(s) at the **mouse cursor** (= `AppData
     /// .arrangement_hover_beat` snapped, or `_raw` when `snap == false`
@@ -1666,6 +1673,9 @@ impl AppData {
             }
             AppEvent::ImportAudio { paths } => {
                 self.action_import_audio(paths);
+            }
+            AppEvent::OpenImportAudioDialog => {
+                self.action_open_import_audio_dialog();
             }
             AppEvent::SplitClipAtPlayhead { snap } => {
                 self.action_split_clips_at_cursor(snap);
@@ -3390,13 +3400,39 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
+    /// 右端 trim ハンドラ。 `length_beats` を更新し、 audio clip では
+    /// 各 `AudioEvent.event_length_beats` を新しい clip 長 (= clip 内 beats
+    /// 軸) でクランプする。 これは Bitwig 流右端 trim 挙動 (`docs/plan
+    /// _audio_clip.md` §3.2 — `length_beats` 変更、 source 範囲は変えない、
+    /// source より長く伸ばすと残り無音) を実現するためで、 event 側を
+    /// 連動させないと `compile_audio_schedule` が clip 範囲を超えて event
+    /// を render し続ける (= UI で縮めたつもりの clip がスピーカーから鳴り
+    /// 続ける見た目とのズレ)。 left-edge trim は arrangement widget が
+    /// `ResizeClips` delta に `next_start` を持たないので Phase 2 で
+    /// gui_01 #025 として要望予定。
     fn resize_clip(&mut self, target: ClipRef, new_length_beats: f64) {
         let new_length_beats = new_length_beats.max(0.0625);
-        if let Some(track) = self.song.tracks.get_mut(target.track as usize)
-            && let Some(clip) = track.clips.get_mut(target.clip as usize)
-        {
+        let content_id = {
+            let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
+                return;
+            };
+            let Some(clip) = track.clips.get_mut(target.clip as usize) else {
+                return;
+            };
             clip.length_beats = new_length_beats;
+            clip.content_id
+        };
+
+        if let Some(ClipContent::Audio(audio)) = self.song.clip_contents.get_mut(&content_id) {
+            for event in &mut audio.events {
+                let max_event_len =
+                    (new_length_beats - event.event_start_in_clip_beats).max(0.0);
+                if event.event_length_beats > max_event_len {
+                    event.event_length_beats = max_event_len;
+                }
+            }
         }
+
         self.sync_song_to_plugin_host();
     }
 
@@ -4923,6 +4959,25 @@ impl AppData {
     /// Failures (unsupported format, oversize, decode error) surface
     /// in `status_message`; partial progress (= some files succeeded)
     /// is preserved.
+    /// File menu → "Import Audio..." 経路。 `rfd` の native file picker
+    /// (multi-select、 WAV filter) を開いて、 選択された path を
+    /// `action_import_audio` に転送するだけのラッパ。 dialog をキャンセル
+    /// した場合は no-op。 起点が違うだけで採番 / dedup / コピー / decode
+    /// は drag&drop と完全に同じ pipeline。
+    fn action_open_import_audio_dialog(&mut self) {
+        let Some(paths) = rfd::FileDialog::new()
+            .add_filter("WAV", &["wav"])
+            .set_title("Import Audio")
+            .pick_files()
+        else {
+            return;
+        };
+        if paths.is_empty() {
+            return;
+        }
+        self.action_import_audio(paths);
+    }
+
     fn action_import_audio(&mut self, paths: Vec<PathBuf>) {
         if paths.is_empty() {
             return;
