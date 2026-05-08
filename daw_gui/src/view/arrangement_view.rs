@@ -218,6 +218,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             },
         );
         draw_audio_clip_waveform(app, ui, *clip_key, *rect);
+        draw_audio_clip_value_overlay(app, ui, *clip_key, *rect);
     }
 
     // track header の右クリックメニュー (Rename / Delete) を widget 外で重ねる。
@@ -794,4 +795,106 @@ fn draw_audio_clip_waveform(
         view,
         style,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 PR8: audio clip rect 上に値ラベルを重ね描き (read-only feedback)
+// ---------------------------------------------------------------------------
+
+/// audio clip 上に「Gain dB / Fade In / Fade Out」 を small font で
+/// オーバーレイ表示する。 grip drag UI (gui_01 #025) が来るまでの
+/// 視覚 feedback として、 ユーザーが Inspector に行かなくても値が
+/// 確認できるようにする。 値が default (0 dB / 0 fade) の clip では
+/// 描かない (= 視覚ノイズを抑える)。 clip rect が 60 px より狭い場合も
+/// 描かない (= ラベルが入らない)。
+fn draw_audio_clip_value_overlay(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    clip_key: ClipKey,
+    clip_rect: Rect,
+) {
+    if clip_rect.w < 60.0 || clip_rect.h < 24.0 {
+        return;
+    }
+    let Some(t_idx) = app.song.tracks.iter().position(|t| t.id == clip_key.track) else {
+        return;
+    };
+    let Some(c_idx) = app.song.tracks[t_idx]
+        .clips
+        .iter()
+        .position(|c| c.id == clip_key.clip)
+    else {
+        return;
+    };
+    let clip = &app.song.tracks[t_idx].clips[c_idx];
+    let Some(content) = app.song.clip_contents.get(&clip.content_id) else {
+        return;
+    };
+    let Some(events) = content.audio_events() else {
+        return;
+    };
+    let Some(event) = events.first() else {
+        return;
+    };
+
+    // Default 値は無表示 (= clip 名で混雑するのを避ける)。
+    let show_gain = event.gain_db.abs() > 0.05;
+    let show_fade_in = event.fade_in_beats > 0.0;
+    let show_fade_out = event.fade_out_beats > 0.0;
+    if !(show_gain || show_fade_in || show_fade_out) {
+        return;
+    }
+
+    // 描画位置: clip rect の右下 (= name は左上、 重ならないように)。
+    let text_color = Color::rgba(0.85, 0.92, 1.0, 0.85);
+    let font_size = 9.0;
+    let pad = 3.0;
+    let mut x_right = clip_rect.x + clip_rect.w - pad;
+    let y = clip_rect.y + clip_rect.h - font_size - 2.0;
+
+    // 右から左に並べる: [Fade Out] [Fade In] [Gain]。 push_text を
+    // 使うと汎用 left-anchored だが、 ここでは y_baseline と x_left
+    // で十分 (右端揃えは label 幅推定で代替)。 簡易: 全部左揃えで
+    // 順に出す + 適当な width 推定で右端から逆配置。
+    if show_fade_out {
+        let s = format!("Fo {:.2}b", event.fade_out_beats);
+        let w = (s.chars().count() as f32) * (font_size * 0.55);
+        x_right -= w;
+        ui.label_at(
+            ("audio_clip_lbl_fo", clip_key.track, clip_key.clip),
+            &s,
+            x_right,
+            y,
+            font_size,
+            text_color,
+        );
+        x_right -= 6.0;
+    }
+    if show_fade_in {
+        let s = format!("Fi {:.2}b", event.fade_in_beats);
+        let w = (s.chars().count() as f32) * (font_size * 0.55);
+        x_right -= w;
+        ui.label_at(
+            ("audio_clip_lbl_fi", clip_key.track, clip_key.clip),
+            &s,
+            x_right,
+            y,
+            font_size,
+            text_color,
+        );
+        x_right -= 6.0;
+    }
+    if show_gain {
+        let s = format!("{:+.1} dB", event.gain_db);
+        let w = (s.chars().count() as f32) * (font_size * 0.55);
+        x_right -= w;
+        ui.label_at(
+            ("audio_clip_lbl_gain", clip_key.track, clip_key.clip),
+            &s,
+            x_right,
+            y,
+            font_size,
+            text_color,
+        );
+    }
 }
