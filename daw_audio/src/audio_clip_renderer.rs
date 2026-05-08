@@ -1,21 +1,24 @@
-//! Audio clip renderer skeleton (Phase 1 PR2).
+//! Audio clip renderer.
 //!
-//! Defines the data structures the live audio thread will read every
-//! buffer to mix audio events into per-track scratch buffers. The
-//! actual mixing loop is implemented in PR6 (Raw + Repitch playback);
-//! this PR only stands up the types and an empty default so
-//! `EngineShared::audio_clip_renderer` has a wait-free snapshot to
-//! `load()` from day one.
+//! Defines the data structures the live audio thread reads every buffer
+//! to mix audio events into per-track scratch buffers. PR2 stood up
+//! the types + an empty default so `EngineShared::audio_clip_renderer`
+//! has a wait-free snapshot to `load()` from day one; PR6 added the
+//! schedule compiler + Raw / Repitch render loop on top.
 //!
-//! Why a separate module from `vocal.rs`: the existing
-//! [`crate::vocal::VocalAudio`] is mono-only and pre-rendered for a
-//! single clip on a single track (VOICEVOX output). The audio clip
-//! renderer is the generalised replacement — multi-channel, multi-
-//! event, with stretch / pitch / fade per event. PR8 retires
-//! `VocalAudio` and routes VOICEVOX through `AudioSourceBuffer +
-//! AudioSourcePath::Generated` instead.
+//! VOICEVOX vocal output (the old `vocal.rs` / `VocalAudio`) shares the
+//! same `AudioSourceBuffer` shape — PR8 routed it through
+//! `MainToChild::SetGeneratedAudio` →
+//! `EngineShared::generated_audio_store`, keyed by
+//! `vocal_gen_id(track_id, clip_id)`. The actual per-clip vocal mix
+//! still lives in `engine::process_track_owned`'s vocal block (Vocal
+//! clips are MIDI-shaped with lyrics, so they don't appear in
+//! `AudioContent` and thus aren't picked up by `compile_audio_schedule`
+//! / `render_audio_events`); a future PR can migrate them onto
+//! `AudioContent::Audio` once the model can express
+//! "MIDI-with-baked-audio" cleanly.
 //!
-//! Spec: `docs/plan_audio_clip.md` §6.
+//! Spec: `docs/plan_audio_clip.md` §6 / §9.3.
 
 #![allow(dead_code)]
 

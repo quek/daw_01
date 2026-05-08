@@ -21,12 +21,11 @@ use std::sync::atomic::{
 use std::thread::JoinHandle;
 
 use anyhow::{Context, Result};
-use arc_swap::ArcSwapOption;
 use common::model::Song;
 use common::plugin_ref::{PluginRef, WorkerSyncRef};
 use common::protocol::PluginSlot;
 
-use crate::vocal::VocalAudio;
+use crate::audio_clip_renderer::AudioSourceBuffer;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Threading::{
     GetCurrentThread, INFINITE, SetEvent, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
@@ -55,7 +54,11 @@ pub struct DispatchShared {
     pub scratch_base: AtomicPtr<TrackScratch>,
     pub plugin_refs_ptr: AtomicPtr<HashMap<u32, PluginRef>>,
     pub slot_map_ptr: AtomicPtr<HashMap<(u32, PluginSlot), u32>>,
-    pub vocal_store_ptr: AtomicPtr<HashMap<u32, Arc<ArcSwapOption<VocalAudio>>>>,
+    /// PR8: VOICEVOX vocal samples + future render-in-place output.
+    /// Keyed by `vocal_gen_id(track_id, clip_id)` for vocal results.
+    /// Master snapshots `EngineShared::generated_audio_store` and
+    /// publishes the inner `&HashMap` pointer for the dispatch window.
+    pub generated_audio_ptr: AtomicPtr<HashMap<u64, Arc<AudioSourceBuffer>>>,
     /// PR6: per-buffer audio clip render snapshot. `null` ⇒ workers
     /// pass `None` to `process_track_owned` (= 旧挙動互換、 audio
     /// clip mix を skip)。
@@ -92,7 +95,7 @@ impl DispatchShared {
             scratch_base: AtomicPtr::new(std::ptr::null_mut()),
             plugin_refs_ptr: AtomicPtr::new(std::ptr::null_mut()),
             slot_map_ptr: AtomicPtr::new(std::ptr::null_mut()),
-            vocal_store_ptr: AtomicPtr::new(std::ptr::null_mut()),
+            generated_audio_ptr: AtomicPtr::new(std::ptr::null_mut()),
             audio_renderer_ptr: AtomicPtr::new(std::ptr::null_mut()),
             worker_syncs_base: AtomicPtr::new(std::ptr::null_mut()),
             n_worker_syncs: AtomicU32::new(0),
@@ -176,7 +179,7 @@ impl AudioWorkerPool {
         scratch: &mut [TrackScratch],
         plugin_refs: &HashMap<u32, PluginRef>,
         slot_map: &HashMap<(u32, PluginSlot), u32>,
-        vocal_store: &HashMap<u32, Arc<ArcSwapOption<VocalAudio>>>,
+        generated_audio: &HashMap<u64, Arc<AudioSourceBuffer>>,
         audio_renderer: &crate::audio_clip_renderer::AudioClipRenderer,
         worker_syncs: &[WorkerSyncRef],
         master_l: &mut [f32],
@@ -208,8 +211,8 @@ impl AudioWorkerPool {
         self.shared
             .slot_map_ptr
             .store(slot_map as *const _ as *mut _, Ordering::Release);
-        self.shared.vocal_store_ptr.store(
-            vocal_store as *const _ as *mut _,
+        self.shared.generated_audio_ptr.store(
+            generated_audio as *const _ as *mut _,
             Ordering::Release,
         );
         self.shared.audio_renderer_ptr.store(
@@ -346,7 +349,7 @@ fn run_work_loop(shared: &DispatchShared) {
     let scratch_base = shared.scratch_base.load(Ordering::Acquire);
     let plugin_refs_ptr = shared.plugin_refs_ptr.load(Ordering::Acquire);
     let slot_map_ptr = shared.slot_map_ptr.load(Ordering::Acquire);
-    let vocal_store_ptr = shared.vocal_store_ptr.load(Ordering::Acquire);
+    let generated_audio_ptr = shared.generated_audio_ptr.load(Ordering::Acquire);
     let audio_renderer_ptr = shared.audio_renderer_ptr.load(Ordering::Acquire);
     let worker_syncs_base = shared.worker_syncs_base.load(Ordering::Acquire);
     let n_worker_syncs = shared.n_worker_syncs.load(Ordering::Acquire);
@@ -364,7 +367,7 @@ fn run_work_loop(shared: &DispatchShared) {
     if scratch_base.is_null()
         || plugin_refs_ptr.is_null()
         || slot_map_ptr.is_null()
-        || vocal_store_ptr.is_null()
+        || generated_audio_ptr.is_null()
         || worker_syncs_base.is_null()
     {
         return;
@@ -379,7 +382,9 @@ fn run_work_loop(shared: &DispatchShared) {
     };
     let plugin_refs = unsafe { &*plugin_refs_ptr };
     let slot_map = unsafe { &*slot_map_ptr };
-    let vocal_store = unsafe { &*vocal_store_ptr };
+    // SAFETY: master holds the `generated_audio_store` Guard alive for
+    // the dispatch window so the inner HashMap pointer is valid here.
+    let generated_audio = unsafe { &*generated_audio_ptr };
     // PR6: audio_renderer_ptr が null のときは render を skip (= None)。
     let audio_renderer: Option<&crate::audio_clip_renderer::AudioClipRenderer> =
         if audio_renderer_ptr.is_null() {
@@ -412,8 +417,6 @@ fn run_work_loop(shared: &DispatchShared) {
             continue;
         };
 
-        let track_id = song_track.id;
-        let vocal = vocal_store.get(&track_id);
         // PR4.5: read this track's input_delay; falls back to 0 if the
         // master didn't publish a slice (= no sidechain wiring) or the
         // index is out of range (defensive, shouldn't happen).
@@ -434,7 +437,7 @@ fn run_work_loop(shared: &DispatchShared) {
             scratch,
             plugin_refs,
             slot_map,
-            vocal,
+            generated_audio,
             audio_renderer,
             worker_sync,
             sample_rate,

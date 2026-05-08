@@ -4704,24 +4704,27 @@ impl AppData {
         };
         self.status_message = msg;
 
+        // PR8: SetVocalAudio retired in favour of SetGeneratedAudio.
+        // The audio engine looks the per-clip vocal buffer up by
+        // `vocal_gen_id(track_id, clip_id) = (track_id << 32) | clip_id`
+        // — same encoding lives in `daw_audio::engine::vocal_gen_id`.
+        // Convert mono samples to planar 1-ch (`Vec<Vec<f32>>`) so the
+        // generic audio buffer layout used everywhere else applies.
         let song_snapshot = self.song.clone();
         for r in &ok_results {
-            let clip_start_beat = song_snapshot
+            let Some((track_id, clip_id)) = song_snapshot
                 .tracks
                 .get(r.track as usize)
-                .and_then(|t| t.clips.get(r.clip as usize))
-                .map(|c| c.start_beat)
-                .unwrap_or(0.0);
-            let samples_per_beat =
-                common::audio_bridge::SAMPLE_RATE as f64 * 60.0 / song_snapshot.bpm as f64;
-            let clip_start_samples = (clip_start_beat * samples_per_beat).max(0.0) as u64;
-
-            self.send_audio(MainToChild::SetVocalAudio {
-                track: r.track,
-                clip: r.clip,
-                clip_start_samples,
+                .and_then(|t| t.clips.get(r.clip as usize).map(|c| (t.id, c.id)))
+            else {
+                continue;
+            };
+            let id = ((track_id as u64) << 32) | (clip_id as u64);
+            self.send_audio(MainToChild::SetGeneratedAudio {
+                id,
                 sample_rate: r.sample_rate,
-                samples: r.samples.clone(),
+                channels: 1,
+                samples: vec![r.samples.clone()],
             });
         }
     }

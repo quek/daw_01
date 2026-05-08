@@ -20,6 +20,12 @@ const FRAMES = SR * 1; // 1 秒分の click (4096 sample より十分長い)
 // 回るので、 SetSlotPlugin で plugin_host に load しただけでは render 経路に
 // は乗らない。 production の `daw_gui::app::select_plugin_from_db` も song
 // と plugin_host の両方を更新する。
+//
+// PR8: vocal の inject 経路は `setGeneratedAudio(id, samples, sr)` に変わり、
+// `process_track_owned` の vocal block は **track が clip を持っている範囲**
+// しか mix しないので、 各 track に length 8 beats (= 1 sec @ 120 bpm × 4)
+// の clip を 1 つ置く。 click は sample 0 にしかパルスが立たないので長さは
+// 何でも良いが、 song.length_beats (=8) と揃えて全範囲カバー。
 const song = {
   bpm: 120.0,
   time_sig: [4, 4],
@@ -35,6 +41,7 @@ const song = {
       muted: false,
       solo: false,
       reported_latency_samples: 0,
+      clips: [{ id: 1, name: "click", start_beat: 0.0, length_beats: 8.0 }],
     },
     {
       id: 2,
@@ -44,6 +51,7 @@ const song = {
       muted: false,
       solo: false,
       reported_latency_samples: 0,
+      clips: [{ id: 1, name: "click", start_beat: 0.0, length_beats: 8.0 }],
       fx_chain: [
         {
           plugin_id: "MCenter",
@@ -73,7 +81,7 @@ daw.waitForPluginLoaded(2, 2, 0, 30000);
 // `LoadSong` を再送 → daw_audio が `compile_schedule` で PDC を再計算する。
 // `setTrackLatency` 手動 call は不要になった。
 //
-// 確実に最新 latency が schedule に反映されてから `setVocalAudio` する
+// 確実に最新 latency が schedule に反映されてから vocal を inject する
 // よう、 `waitForPluginLoaded` の後に明示的に IPC drain を 1 frame 挟む
 // のが理想だが、 `pump_until` 中に PluginLatencyChanged は同じ ack で
 // 届く (plugin_host が SlotPluginLoaded → PluginLatencyChanged の順で
@@ -82,7 +90,9 @@ daw.waitForPluginLoaded(2, 2, 0, 30000);
 const click = new Float32Array(FRAMES);
 click[0] = 1.0;
 
-daw.setVocalAudio(1, 0, 0, click, SR);
-daw.setVocalAudio(2, 0, 0, click, SR);
+// PR8: vocal_gen_id(track_id, clip_id) = (track_id << 32) | clip_id
+const genId = (track, clip) => track * 0x1_0000_0000 + clip;
+daw.setGeneratedAudio(genId(1, 1), click, SR);
+daw.setGeneratedAudio(genId(2, 1), click, SR);
 
 daw.exportWav(daw.scriptArgs.output, 60000);

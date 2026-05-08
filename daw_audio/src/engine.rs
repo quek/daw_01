@@ -36,7 +36,18 @@ use crate::audio_worker::AudioWorkerPool;
 use crate::graph::{BufRef, NodeOp, Schedule, compile_schedule};
 use crate::mixer::TrackScratch;
 use crate::sequencer::{NoteTransition, TimedNoteEvent, collect_events_for_buffer};
-use crate::vocal::VocalAudio;
+
+/// VOICEVOX synthesis result key. The GUI sends each freshly-rendered
+/// vocal clip via `MainToChild::SetGeneratedAudio` keyed with this id;
+/// `process_track_owned` looks the buffer up by the same key when it
+/// renders a Vocal track that has no instrument plugin. Encoding both
+/// `track_id` and `clip_id` into one `u64` lets a single Vocal track
+/// host multiple independent vocal clips without overwriting each
+/// other (= the old `vocal_store` was track-keyed only).
+#[inline]
+pub fn vocal_gen_id(track_id: u32, clip_id: u32) -> u64 {
+    ((track_id as u64) << 32) | (clip_id as u64)
+}
 
 /// Hard cap on tracks the audio engine can render in a single buffer.
 /// Picked to match `audio_bridge::MAX_TRACKS` so the per-track peak
@@ -72,14 +83,6 @@ pub enum AudioCommand {
     /// Drop a previously-opened plugin shmem mapping. Triggered on
     /// RemoveSlotPlugin / RemoveTrack from the GUI side.
     ClosePluginShmem { plugin_id: u32 },
-    /// Pre-rendered vocal audio for a single clip on a track. Hot-swapped
-    /// via `ArcSwapOption` so the audio thread picks up new samples on
-    /// the next buffer without restarting.
-    SetVocalAudio {
-        track: u32,
-        clip_start_samples: u64,
-        samples: Vec<f32>,
-    },
 }
 
 #[repr(u8)]
@@ -148,12 +151,6 @@ pub struct EngineShared {
     /// `(track, slot)` → `plugin_id`. New snapshot in lock-step with
     /// `plugin_refs`.
     pub slot_to_plugin_id: ArcSwap<HashMap<(u32, PluginSlot), u32>>,
-    /// Per-track pre-rendered vocal audio (VOICEVOX results). The outer
-    /// map is snapshotted on add/remove; the inner `ArcSwapOption` is
-    /// hot-swapped on `SetVocalAudio` so re-synthesis lands on the next
-    /// buffer. Retired in PR8 in favour of `audio_clip_renderer` +
-    /// `generated_audio_store` (Phase 1 spec §6.1).
-    pub vocal_store: ArcSwap<HashMap<u32, Arc<ArcSwapOption<VocalAudio>>>>,
     /// Worker pool that fans per-track work across N audio-engine
     /// workers. `None` until `OpenWorkerPool` arrives.
     pub worker_pool: ArcSwapOption<AudioWorkerPool>,
@@ -190,7 +187,6 @@ impl EngineShared {
             worker_syncs: ArcSwap::from_pointee(Vec::new()),
             plugin_refs: ArcSwap::from_pointee(HashMap::new()),
             slot_to_plugin_id: ArcSwap::from_pointee(HashMap::new()),
-            vocal_store: ArcSwap::from_pointee(HashMap::new()),
             worker_pool: ArcSwapOption::empty(),
             export_running: AtomicBool::new(false),
             audio_clip_renderer: ArcSwap::from_pointee(AudioClipRenderer::empty()),
@@ -419,32 +415,6 @@ impl LocalState {
                     self.shared.slot_to_plugin_id.store(Arc::new(new_slot));
                     tracing::info!(plugin_id, "plugin shmem dropped + slot shifted");
                 }
-                AudioCommand::SetVocalAudio {
-                    track,
-                    clip_start_samples,
-                    samples,
-                } => {
-                    let new_audio = Arc::new(VocalAudio {
-                        clip_start_samples,
-                        samples,
-                    });
-                    // Reuse an existing per-track ArcSwapOption if we
-                    // have one (so any clone the audio path is holding
-                    // sees the new sample), else mint one and publish a
-                    // new outer map snapshot.
-                    let cur = self.shared.vocal_store.load();
-                    if let Some(slot) = cur.get(&track) {
-                        slot.store(Some(new_audio));
-                    } else {
-                        let mut new_map: HashMap<u32, Arc<ArcSwapOption<VocalAudio>>> =
-                            (**cur).clone();
-                        let slot = Arc::new(ArcSwapOption::empty());
-                        slot.store(Some(new_audio));
-                        new_map.insert(track, slot);
-                        self.shared.vocal_store.store(Arc::new(new_map));
-                    }
-                    tracing::info!(track, "vocal audio updated");
-                }
             }
         }
     }
@@ -520,7 +490,7 @@ impl LocalState {
             // can safely deref them via the publish pointers.
             let plugin_refs_g = self.shared.plugin_refs.load();
             let slot_map_g = self.shared.slot_to_plugin_id.load();
-            let vocal_store_g = self.shared.vocal_store.load();
+            let generated_audio_g = self.shared.generated_audio_store.load();
             let worker_syncs_g = self.shared.worker_syncs.load();
             let pool_g = self.shared.worker_pool.load();
             // PR6: audio clip renderer snapshot for this buffer.
@@ -536,7 +506,7 @@ impl LocalState {
                     &mut self.scratch[..n_tracks],
                     &plugin_refs_g,
                     &slot_map_g,
-                    &vocal_store_g,
+                    &generated_audio_g,
                     audio_renderer,
                     &worker_syncs_g,
                     &mut self.master_l[..n],
@@ -553,8 +523,6 @@ impl LocalState {
                 for track_idx in 0..n_tracks {
                     let song_track = &song.tracks[track_idx];
                     let scratch = &mut self.scratch[track_idx];
-                    let track_id = song_track.id;
-                    let vocal = vocal_store_g.get(&track_id);
                     let input_delay = self
                         .cached_schedule
                         .input_delay_per_track
@@ -567,7 +535,7 @@ impl LocalState {
                         scratch,
                         &plugin_refs_g,
                         &slot_map_g,
-                        vocal,
+                        &generated_audio_g,
                         Some(audio_renderer),
                         worker_sync,
                         sample_rate,
@@ -717,7 +685,7 @@ pub fn process_track_owned(
     scratch: &mut TrackScratch,
     plugin_refs: &HashMap<u32, PluginRef>,
     slot_to_plugin_id: &HashMap<(u32, PluginSlot), u32>,
-    vocal: Option<&Arc<ArcSwapOption<VocalAudio>>>,
+    generated_audio_store: &HashMap<u64, Arc<AudioSourceBuffer>>,
     audio_renderer: Option<&AudioClipRenderer>,
     worker_sync: Option<&WorkerSyncRef>,
     sample_rate: u32,
@@ -832,26 +800,51 @@ pub fn process_track_owned(
     scratch.track_l[..n].fill(0.0);
     scratch.track_r[..n].fill(0.0);
 
-    // ---- Vocal: pre-rendered samples for tracks without an instrument ----
-    // VOICEVOX-style sample playback. The audio engine reads the
-    // hot-swapped buffer from `vocal_store` directly into the track
-    // scratch. Tracks that have an instrument plugin skip this — the
-    // instrument is the audio source.
-    if song_track.instrument.is_none() && playing
-        && let Some(slot) = vocal
-        && let Some(vocal_audio) = slot.load().as_deref()
-        && !vocal_audio.samples.is_empty()
+    // ---- Vocal: VOICEVOX-style pre-rendered samples per clip ----
+    // PR8: track-keyed `vocal_store` was retired in favour of clip-keyed
+    // `generated_audio_store`. For tracks without an instrument plugin,
+    // each Vocal clip's freshly-rendered buffer lives at
+    // `vocal_gen_id(track.id, clip.id)`; we mix it in at the clip's
+    // song-time range. Multiple Vocal clips on the same track are now
+    // independent (the old store overwrote per-track on every
+    // re-synth). Tracks with an instrument plugin skip this entirely
+    // — the instrument is the audio source.
+    if song_track.instrument.is_none()
+        && playing
+        && !generated_audio_store.is_empty()
+        && let Some(song_ref) = song
+        && song_ref.bpm > 0.0
+        && sample_rate > 0
     {
+        let samples_per_beat = sample_rate as f64 * 60.0 / song_ref.bpm as f64;
         let buf_start = playhead;
-        for i in 0..n {
-            let abs_sample = buf_start + i as u64;
-            if abs_sample >= vocal_audio.clip_start_samples {
-                let v_idx = (abs_sample - vocal_audio.clip_start_samples) as usize;
-                if v_idx < vocal_audio.samples.len() {
-                    let s = vocal_audio.samples[v_idx];
-                    scratch.track_l[i] = s;
-                    scratch.track_r[i] = s;
-                }
+        let buf_end = playhead + n as u64;
+        for clip in &song_track.clips {
+            let gen_id = vocal_gen_id(song_track.id, clip.id);
+            let Some(buffer) = generated_audio_store.get(&gen_id) else {
+                continue;
+            };
+            let mono: &[f32] = buffer
+                .samples
+                .first()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if mono.is_empty() {
+                continue;
+            }
+            let clip_start = (clip.start_beat * samples_per_beat).max(0.0) as u64;
+            let buffer_end = clip_start + mono.len() as u64;
+            let render_start = clip_start.max(buf_start);
+            let render_end = buffer_end.min(buf_end);
+            if render_end <= render_start {
+                continue;
+            }
+            for abs in render_start..render_end {
+                let buf_idx = (abs - buf_start) as usize;
+                let mono_idx = (abs - clip_start) as usize;
+                let s = mono[mono_idx];
+                scratch.track_l[buf_idx] += s;
+                scratch.track_r[buf_idx] += s;
             }
         }
     }

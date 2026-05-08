@@ -165,10 +165,6 @@ pub enum MainToChild {
     LoadSong(crate::model::Song),
     SetLoop(bool),
     SetMasterGain(f32),
-    /// Pre-rendered vocal audio for a single clip on a track. `samples`
-    /// is mono f32, `sample_rate` matches `AudioSession::sample_rate` (or
-    /// is resampled by the host). `clip_start_samples` is the absolute
-    /// sample offset within the song where this clip begins.
     /// Offline-render the entire song to a WAV file. Sent to daw_audio,
     /// which freewheels through the song using its existing AudioWorker
     /// pool + plugin handshake, then replies with
@@ -182,21 +178,14 @@ pub enum MainToChild {
     /// `render` extension can pick higher-quality algorithms during
     /// export and revert afterwards.
     SetRenderMode(RenderMode),
-    SetVocalAudio {
-        track: u32,
-        clip: u32,
-        clip_start_samples: u64,
-        sample_rate: u32,
-        samples: Vec<f32>,
-    },
-    /// Generic in-memory audio buffer keyed by `id` — the same `id`
-    /// embedded in `AudioSourcePath::Generated { id }`. Multi-channel
-    /// (planar `samples[channel][frame]`). Replaces `SetVocalAudio`
-    /// over PR8: any synthesised audio (VOICEVOX result, future
-    /// render-in-place output) goes through this variant. The audio
-    /// engine stores it in `EngineShared::generated_audio_store`
-    /// keyed by `id` and resolves `AudioSourcePath::Generated` lookups
-    /// against that map. Spec: `docs/plan_audio_clip.md` §9.3.
+    /// Generic in-memory audio buffer keyed by `id`. The same `id`
+    /// is embedded in `AudioSourcePath::Generated { id }` for
+    /// file-pool-style lookups, and is the per-clip key VOICEVOX
+    /// uses for its synthesised vocal audio (PR8: replaces the old
+    /// `SetVocalAudio`). Multi-channel (planar
+    /// `samples[channel][frame]`). The audio engine stores the buffer
+    /// in `EngineShared::generated_audio_store`. Spec:
+    /// `docs/plan_audio_clip.md` §9.3.
     SetGeneratedAudio {
         id: u64,
         sample_rate: u32,

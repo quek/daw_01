@@ -329,9 +329,9 @@ fn register_daw_globals(ctx: &mut Context) -> Result<()> {
             4,
         )
         .function(
-            NativeFunction::from_fn_ptr(daw_set_vocal_audio),
-            js_string!("setVocalAudio"),
-            5,
+            NativeFunction::from_fn_ptr(daw_set_generated_audio),
+            js_string!("setGeneratedAudio"),
+            3,
         )
         .function(
             NativeFunction::from_fn_ptr(daw_export_wav),
@@ -539,16 +539,19 @@ fn daw_wait_for_plugin_loaded(
     Ok(JsValue::undefined())
 }
 
-fn daw_set_vocal_audio(
+/// JS test API: `daw.setGeneratedAudio(id, samples, sample_rate)`. Mono-only
+/// (`channels = 1`) — multi-channel test injection can be added when a use
+/// case appears. `id` matches the IPC `MainToChild::SetGeneratedAudio { id }`
+/// keyspace; for VOICEVOX-style test payloads use
+/// `((track_id << 32) | clip_id)`.
+fn daw_set_generated_audio(
     _this: &JsValue,
     args: &[JsValue],
     ctx: &mut Context,
 ) -> JsResult<JsValue> {
-    let track = u32::try_from_js(args.get_or_undefined(0), ctx)?;
-    let clip = u32::try_from_js(args.get_or_undefined(1), ctx)?;
-    let clip_start_samples = u64::try_from_js(args.get_or_undefined(2), ctx)?;
-    let samples_value = args.get_or_undefined(3).clone();
-    let sample_rate = u32::try_from_js(args.get_or_undefined(4), ctx)?;
+    let id = u64::try_from_js(args.get_or_undefined(0), ctx)?;
+    let samples_value = args.get_or_undefined(1).clone();
+    let sample_rate = u32::try_from_js(args.get_or_undefined(2), ctx)?;
 
     let typed = JsTypedArray::from_object(samples_value.as_object().ok_or_else(|| {
         JsNativeError::typ().with_message("samples must be a Float32Array")
@@ -562,12 +565,11 @@ fn daw_set_vocal_audio(
     }
 
     with_host(|h| {
-        let _ = h.bootstrap.audio_tx.send(MainToChild::SetVocalAudio {
-            track,
-            clip,
-            clip_start_samples,
+        let _ = h.bootstrap.audio_tx.send(MainToChild::SetGeneratedAudio {
+            id,
             sample_rate,
-            samples,
+            channels: 1,
+            samples: vec![samples],
         });
     });
     Ok(JsValue::undefined())

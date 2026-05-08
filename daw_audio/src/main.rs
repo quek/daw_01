@@ -24,8 +24,6 @@ mod export;
 mod graph;
 mod mixer;
 mod sequencer;
-mod tracks;
-mod vocal;
 
 use engine::{EngineShared, LocalState, PlaybackCommand, SharedState};
 
@@ -213,50 +211,17 @@ async fn recv_loop(
                     }
                 });
             }
-            Ok(MainToChild::SetVocalAudio {
-                track,
-                clip: _,
-                clip_start_samples,
-                sample_rate: _,
-                samples,
-            }) => {
-                // Apply directly to `engine_shared.vocal_store` from the
-                // receive loop (instead of going through the audio thread's
-                // `cmd_rx`). During `ExportWav` the audio CPAL callback is
-                // silenced (`export_running == true`) and stops pumping
-                // its command queue, which would otherwise let
-                // `SetVocalAudio` arriving just before the export racy-
-                // miss the export thread's first `vocal_store.load()`.
-                // `ArcSwap.store` is wait-free thread-safe, so this stays
-                // RT-safe for the audio callback that's reading concurrently.
-                let new_audio = Arc::new(crate::vocal::VocalAudio {
-                    clip_start_samples,
-                    samples,
-                });
-                let cur = engine_shared.vocal_store.load();
-                if let Some(slot) = cur.get(&track) {
-                    slot.store(Some(new_audio));
-                } else {
-                    let mut new_map: std::collections::HashMap<
-                        u32,
-                        Arc<arc_swap::ArcSwapOption<crate::vocal::VocalAudio>>,
-                    > = (**cur).clone();
-                    new_map.insert(
-                        track,
-                        Arc::new(arc_swap::ArcSwapOption::from(Some(new_audio))),
-                    );
-                    engine_shared.vocal_store.store(Arc::new(new_map));
-                }
-                tracing::info!(track, "vocal audio updated (direct)");
-            }
-            // SetGeneratedAudio (Phase 1 PR2): in-memory audio buffer
-            // delivered by the GUI for `AudioSourcePath::Generated { id }`
-            // sources (VOICEVOX results from PR8 onward; future render-
-            // in-place output too). Stored in `EngineShared::
-            // generated_audio_store`; PR6's `compile_audio_schedule` will
-            // merge these into the renderer's `sources` map at compile
-            // time. Wait-free `ArcSwap.store` is RT-safe vs the audio
-            // callback that reads concurrently.
+            // SetGeneratedAudio (Phase 1 PR8): in-memory audio buffer
+            // delivered by the GUI. Used both for
+            // `AudioSourcePath::Generated { id }` (file-pool entries the
+            // user can wire into AudioContent events) and for
+            // VOICEVOX-style per-clip vocal output (gen_id =
+            // `(track_id as u64) << 32 | clip_id as u64`, picked up by
+            // `process_track_owned`'s vocal block). Applied directly
+            // from the receive loop with `ArcSwap.store` so the audio
+            // callback sees the new buffer on the next dispatch
+            // without going through `cmd_rx` — that channel is parked
+            // while `export_running` is set.
             Ok(MainToChild::SetGeneratedAudio {
                 id,
                 sample_rate,

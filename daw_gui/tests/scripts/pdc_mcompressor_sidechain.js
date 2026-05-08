@@ -14,6 +14,9 @@ const FRAMES = SR * 1;
 
 const wired = daw.scriptArgs.wireSidechain === "true";
 
+// PR8: vocal の inject 経路は `setGeneratedAudio` に変わり、 vocal mix は
+// track が clip を持つ範囲しか走らない。 各 track に length 8 beats の clip
+// を 1 つ用意して、 SR=48000 / 1 sec の buffer を全範囲カバーさせる。
 const song = {
   bpm: 120.0,
   time_sig: [4, 4],
@@ -29,6 +32,7 @@ const song = {
       muted: false,
       solo: false,
       reported_latency_samples: 0,
+      clips: [{ id: 1, name: "trigger", start_beat: 0.0, length_beats: 8.0 }],
     },
     {
       id: 2,
@@ -38,6 +42,7 @@ const song = {
       muted: false,
       solo: false,
       reported_latency_samples: 0,
+      clips: [{ id: 1, name: "bass", start_beat: 0.0, length_beats: 8.0 }],
       fx_chain: [
         {
           plugin_id: "MCompressor",
@@ -72,7 +77,9 @@ for (let i = 0; i < 100; i++) trigger[i] = 1.0;
 const bass = new Float32Array(FRAMES);
 for (let i = 0; i < FRAMES; i++) bass[i] = 0.5;
 
-daw.setVocalAudio(1, 0, 0, trigger, SR);
-daw.setVocalAudio(2, 0, 0, bass, SR);
+// PR8: vocal_gen_id(track_id, clip_id) = (track_id << 32) | clip_id
+const genId = (track, clip) => track * 0x1_0000_0000 + clip;
+daw.setGeneratedAudio(genId(1, 1), trigger, SR);
+daw.setGeneratedAudio(genId(2, 1), bass, SR);
 
 daw.exportWav(daw.scriptArgs.output, 60000);

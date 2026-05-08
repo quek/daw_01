@@ -152,7 +152,7 @@ fn render_loop(
         // Snapshot the same wait-free state the audio thread reads.
         let plugin_refs_g = engine_shared.plugin_refs.load();
         let slot_map_g = engine_shared.slot_to_plugin_id.load();
-        let vocal_store_g = engine_shared.vocal_store.load();
+        let generated_audio_g = engine_shared.generated_audio_store.load();
         let worker_syncs_g = engine_shared.worker_syncs.load();
         let pool_g = engine_shared.worker_pool.load();
         let audio_renderer_g = engine_shared.audio_clip_renderer.load();
@@ -165,7 +165,7 @@ fn render_loop(
                 &mut scratch[..n_tracks],
                 &plugin_refs_g,
                 &slot_map_g,
-                &vocal_store_g,
+                &generated_audio_g,
                 audio_renderer,
                 &worker_syncs_g,
                 &mut master_l[..frames],
@@ -182,8 +182,6 @@ fn render_loop(
             #[allow(clippy::needless_range_loop)]
             for track_idx in 0..n_tracks {
                 let song_track = &song.tracks[track_idx];
-                let track_id = song_track.id;
-                let vocal = vocal_store_g.get(&track_id);
                 let input_delay = schedule
                     .input_delay_per_track
                     .get(track_idx)
@@ -195,7 +193,7 @@ fn render_loop(
                     &mut scratch[track_idx],
                     &plugin_refs_g,
                     &slot_map_g,
-                    vocal,
+                    &generated_audio_g,
                     Some(audio_renderer),
                     worker_sync,
                     sample_rate,
