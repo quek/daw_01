@@ -237,28 +237,81 @@ pub fn migrate_unsaved_audio_sources_into(
     song: &mut common::model::Song,
     project_dir: &Path,
 ) -> Result<usize> {
-    let cache_root = unsaved_import_cache_dir();
-    let samples_dir = project_dir.join("samples");
+    migrate_unsaved_cache_into(
+        song,
+        project_dir,
+        &unsaved_import_cache_dir(),
+        "samples",
+    )
+}
+
+/// Where Bounce In Place / Bounce (with FX) write WAVs in unsaved
+/// projects. Mirror of [`unsaved_import_cache_dir`] for bounce output.
+/// Saving the project later moves the files into `<project_dir>/bounce/`
+/// (see [`migrate_unsaved_bounce_sources_into`]).
+pub fn unsaved_bounce_cache_dir() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("daw_01").join("bounce_cache")
+}
+
+/// Mirror of [`migrate_unsaved_audio_sources_into`] for the bounce
+/// cache: move every `AudioSource` whose path is an `Absolute`
+/// pointing into the unsaved-project bounce cache into
+/// `<project_dir>/bounce/` and rewrite the path to
+/// `ProjectRelative("bounce/<filename>")`. Called from the GUI save
+/// flow so that on first save every bounced WAV lands inside the
+/// project bundle (= same destination as bounces written when a
+/// project_dir was already known).
+///
+/// `Absolute` entries that point *outside* the bounce cache are left
+/// alone (e.g. import cache entries are migrated by the sibling
+/// `migrate_unsaved_audio_sources_into`).
+pub fn migrate_unsaved_bounce_sources_into(
+    song: &mut common::model::Song,
+    project_dir: &Path,
+) -> Result<usize> {
+    migrate_unsaved_cache_into(
+        song,
+        project_dir,
+        &unsaved_bounce_cache_dir(),
+        "bounce",
+    )
+}
+
+/// Shared implementation for the import_cache → samples/ and
+/// bounce_cache → bounce/ migrations. Walks every `AudioSource`,
+/// matches paths under `cache_root`, moves the file into
+/// `project_dir / dst_subdir / <filename>` and rewrites the path to
+/// `ProjectRelative(dst_subdir / <filename>)`.
+fn migrate_unsaved_cache_into(
+    song: &mut common::model::Song,
+    project_dir: &Path,
+    cache_root: &Path,
+    dst_subdir: &str,
+) -> Result<usize> {
+    let dst_dir = project_dir.join(dst_subdir);
     let mut moved = 0usize;
     for source in song.audio_sources.values_mut() {
         let abs = match &source.path {
             AudioSourcePath::Absolute(p) => p.clone(),
             _ => continue,
         };
-        if !abs.starts_with(&cache_root) {
+        if !abs.starts_with(cache_root) {
             continue;
         }
         let Some(filename) = abs.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        fs::create_dir_all(&samples_dir).with_context(|| {
-            format!("create_dir_all {}", samples_dir.display())
+        fs::create_dir_all(&dst_dir).with_context(|| {
+            format!("create_dir_all {}", dst_dir.display())
         })?;
-        let dst = samples_dir.join(filename);
+        let dst = dst_dir.join(filename);
         if dst.exists() {
-            // Same hash already present in samples/ (e.g. same file was
-            // imported twice and we already migrated once). Just drop
-            // the cache copy.
+            // Same content already present (= dedup hit or prior
+            // migration). Drop the cache copy and just rewrite the
+            // path.
             let _ = fs::remove_file(&abs);
         } else {
             // rename within the same volume is atomic; fall back to
@@ -271,7 +324,7 @@ pub fn migrate_unsaved_audio_sources_into(
             }
         }
         source.path = AudioSourcePath::ProjectRelative(
-            PathBuf::from("samples").join(filename),
+            PathBuf::from(dst_subdir).join(filename),
         );
         moved += 1;
     }

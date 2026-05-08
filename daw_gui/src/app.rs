@@ -3014,6 +3014,25 @@ impl AppData {
                 "Audio sources の samples/ 移行で一部失敗: {e}"
             );
         }
+        // Phase 2 PR-C follow-up: 未保存 project で Bounce In Place /
+        // Bounce (with FX) を実行した結果は user bounce_cache に置かれる。
+        // save 時に `<project_dir>/bounce/` へ移動 + path を ProjectRelative
+        // に書き換える (`docs/plan_audio_followup.md` 後回し 1)。 失敗
+        // しても save 続行 (= bounced source は missing として扱われる)。
+        if let Some(project_dir) = path.parent()
+            && let Err(e) = import_audio::migrate_unsaved_bounce_sources_into(
+                &mut self.song,
+                project_dir,
+            )
+        {
+            tracing::warn!(
+                error = ?e,
+                path = %path.display(),
+                "audio sources のうち bounce_cache → bounce/ への移行で一部失敗"
+            );
+            self.status_message =
+                format!("Audio sources の bounce/ 移行で一部失敗: {e}");
+        }
         match common::project::save(path, &self.song) {
             Ok(()) => {
                 tracing::info!(path = %path.display(), "saved project");
@@ -4037,10 +4056,10 @@ impl AppData {
     /// は `ContentId` 単位の pool)。
     ///
     /// 出力先: project_dir があれば `<project_dir>/bounce/<name>_<ts>.wav`、
-    /// 未保存 project は `%LOCALAPPDATA%/daw_01/bounce_cache/<random>.wav`
-    /// (= `import_cache` と同じ fallback、 save 時に `<project_dir>/bounce/`
-    /// へ移動するのは将来 PR で `migrate_unsaved_audio_sources_into` 相当の
-    /// helper を bounce 用にも追加)。
+    /// 未保存 project は `%LOCALAPPDATA%/daw_01/bounce_cache/<filename>.wav`
+    /// (= `import_cache` と同じ fallback、 save 時に
+    /// `migrate_unsaved_bounce_sources_into` が `<project_dir>/bounce/` へ
+    /// 移動 + path を ProjectRelative 化する)。
     ///
     /// Pre-FX なので plugin chain (instrument / fx_chain) は通さない。
     /// source の events を fade / gain / pan / pitch_ratio で mix した
@@ -4214,13 +4233,10 @@ impl AppData {
                 )
             }
             None => {
-                // 未保存 project は import_cache と同様、 user cache に
-                // 一時書き出し。 save 時の migration helper は将来追加。
-                let cache = std::env::var_os("LOCALAPPDATA")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(std::env::temp_dir)
-                    .join("daw_01")
-                    .join("bounce_cache");
+                // 未保存 project: user bounce_cache に一時書き出し。
+                // save 時に `migrate_unsaved_bounce_sources_into` で
+                // `<project_dir>/bounce/` へ移動 + ProjectRelative 化される。
+                let cache = import_audio::unsaved_bounce_cache_dir();
                 if let Err(e) = std::fs::create_dir_all(&cache) {
                     self.status_message =
                         format!("Bounce In Place: bounce_cache/ 作成失敗: {e}");
@@ -4398,11 +4414,10 @@ impl AppData {
                 )
             }
             None => {
-                let cache = std::env::var_os("LOCALAPPDATA")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(std::env::temp_dir)
-                    .join("daw_01")
-                    .join("bounce_cache");
+                // 未保存 project: bounce_cache に一時書き出し。 save 時に
+                // `migrate_unsaved_bounce_sources_into` で `<project_dir>
+                // /bounce/` へ移動 + ProjectRelative 化される。
+                let cache = import_audio::unsaved_bounce_cache_dir();
                 if let Err(e) = std::fs::create_dir_all(&cache) {
                     self.status_message =
                         format!("Bounce (with FX): bounce_cache/ 作成失敗: {e}");
