@@ -107,6 +107,22 @@ impl ChainEntry {
     }
 }
 
+/// Audio event 単位 field の inspector 表示用 read snapshot (Phase 2 PR1)。
+/// `selected_clip` が `ClipContent::Audio` の clip を指していて、 中に
+/// 少なくとも 1 event があれば `inspector_audio_event_summary()` が
+/// `Some` を返す。 view (`track_inspector::draw`) はこれを使って
+/// "Audio Event" section を出し、 toggle / dropdown 操作を `target`
+/// に向けて発火する。 Phase 1 で 1 clip = 1 event 前提なので first event
+/// を代表値として表示する。
+#[derive(Debug, Clone, Copy)]
+pub struct InspectorAudioEventSummary {
+    /// 編集 AppEvent (`SetClipReversed` 等) の宛先 clip。
+    pub target: ClipRef,
+    pub reversed: bool,
+    pub muted: bool,
+    pub stretch_mode: common::model::StretchMode,
+}
+
 /// Per-plugin sidechain wiring entry shown in the inspector. One row per
 /// chain plugin (MIDI FX / Instrument / Fx); the `current_source` field
 /// is the value of `PluginInstance::sidechain_sources[0]` (port 0; the
@@ -688,6 +704,32 @@ impl AppData {
         choices
     }
 
+    /// Audio event field の inspector 表示用ライト read snapshot。
+    /// 選択 clip (`selected_clip`) が `ClipContent::Audio` で、 中に少なくとも
+    /// 1 event ある場合に `Some` を返す。 それ以外 (no selection / MIDI clip
+    /// / Vocal clip / 空 events) は `None`。 Phase 1 では 1 clip 1 event 前提
+    /// なので first event の field を「clip 全体の field」 として表示する。
+    /// 編集 AppEvent (`SetClipReversed` / `SetClipMuted` / `SetClipStretchMode`)
+    /// は全 event に同じ値を broadcast するので、 multi-event clip でも
+    /// view は first event を「代表値」 として見せれば編集後に整合が取れる。
+    pub fn inspector_audio_event_summary(&self) -> Option<InspectorAudioEventSummary> {
+        let cref = self.selected_clip?;
+        let track = self.song.tracks.get(cref.track as usize)?;
+        let clip = track.clips.get(cref.clip as usize)?;
+        let common::model::ClipContent::Audio(audio) =
+            self.song.clip_contents.get(&clip.content_id)?
+        else {
+            return None;
+        };
+        let event = audio.events.first()?;
+        Some(InspectorAudioEventSummary {
+            target: cref,
+            reversed: event.reversed,
+            muted: event.muted,
+            stretch_mode: event.stretch_mode,
+        })
+    }
+
     pub fn inspector_chain(&self) -> Vec<ChainEntry> {
         let Some(idx) = self.cursor_track_index() else {
             return Vec::new();
@@ -829,6 +871,9 @@ impl AppData {
                 | AppEvent::MakeClipUnique(_)
                 | AppEvent::SplitClipAtPlayhead { .. }
                 | AppEvent::GlueSelectedClips
+                | AppEvent::SetClipReversed { .. }
+                | AppEvent::SetClipMuted { .. }
+                | AppEvent::SetClipStretchMode { .. }
                 | AppEvent::ImportAudio { .. }
                 | AppEvent::AddNote { .. }
                 | AppEvent::ResizeNote { .. }
@@ -1361,6 +1406,25 @@ pub enum AppEvent {
     /// note from the source clips with offsets re-aligned to the new
     /// clip start. Gaps between clips become silent ranges. Bound to `J`.
     GlueSelectedClips,
+
+    // -------- Audio event field edits (Phase 2 PR1) ------------------------
+    /// Toggle `AudioEvent.reversed` for every event in the selected
+    /// audio clip. Non-audio clips no-op. `docs/plan_audio_clip.md`
+    /// §3.8: Reverse は destructive ではなく、 再生時に source を逆方向
+    /// 走査する flag。
+    SetClipReversed { target: ClipRef, reversed: bool },
+
+    /// Toggle `AudioEvent.muted` for every event in the selected audio
+    /// clip. Mute は event 単位の silent flag (§3.7 / §3.9 AudioEvent
+    /// 選択時 Mute toggle)、 track-mute とは独立。 Phase 1 では 1 clip 1
+    /// event 前提なので「event mute = clip mute」 と同義。
+    SetClipMuted { target: ClipRef, muted: bool },
+
+    /// Set `AudioEvent.stretch_mode` for every event in the selected
+    /// audio clip. Phase 1 で再生に効くのは `Raw` / `Repitch` のみ;
+    /// `Stretch` / `Slice` は §3.7 に従って Raw 同等で再生される
+    /// (Phase 3+ で本実装)。
+    SetClipStretchMode { target: ClipRef, mode: common::model::StretchMode },
 }
 
 impl AppData {
@@ -1676,6 +1740,15 @@ impl AppData {
             }
             AppEvent::OpenImportAudioDialog => {
                 self.action_open_import_audio_dialog();
+            }
+            AppEvent::SetClipReversed { target, reversed } => {
+                self.set_clip_audio_event_reversed(target, reversed);
+            }
+            AppEvent::SetClipMuted { target, muted } => {
+                self.set_clip_audio_event_muted(target, muted);
+            }
+            AppEvent::SetClipStretchMode { target, mode } => {
+                self.set_clip_audio_event_stretch_mode(target, mode);
             }
             AppEvent::SplitClipAtPlayhead { snap } => {
                 self.action_split_clips_at_cursor(snap);
@@ -3398,6 +3471,80 @@ impl AppData {
             .collect();
         self.selected_clip = self.selected_clips.last().copied();
         self.sync_song_to_plugin_host();
+    }
+
+    /// 選択 audio clip の全 `AudioEvent.reversed` をまとめて更新する。
+    /// 非 audio clip (`ClipContent::Midi` / 未登録 content_id) は no-op。
+    /// `docs/plan_audio_clip.md` §3.8。
+    fn set_clip_audio_event_reversed(&mut self, target: ClipRef, reversed: bool) {
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return;
+        };
+        if let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+        {
+            for event in &mut audio.events {
+                event.reversed = reversed;
+            }
+            self.sync_song_to_plugin_host();
+        }
+    }
+
+    /// 選択 audio clip の全 `AudioEvent.muted` をまとめて更新する (event
+    /// 単位の silent flag、 track-mute とは独立)。
+    fn set_clip_audio_event_muted(&mut self, target: ClipRef, muted: bool) {
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return;
+        };
+        if let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+        {
+            for event in &mut audio.events {
+                event.muted = muted;
+            }
+            self.sync_song_to_plugin_host();
+        }
+    }
+
+    /// 選択 audio clip の全 `AudioEvent.stretch_mode` をまとめて更新する。
+    /// `compile_audio_schedule` (`daw_audio/src/audio_clip_renderer.rs`) が
+    /// 次の LoadSong で再 compile して、 Repitch の場合は pitch_ratio の
+    /// 再計算が走る。 Phase 1 で再生に効くのは `Raw` / `Repitch` のみ
+    /// (§3.7、 Stretch / Slice は Raw 同等で再生される)。
+    fn set_clip_audio_event_stretch_mode(
+        &mut self,
+        target: ClipRef,
+        mode: common::model::StretchMode,
+    ) {
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return;
+        };
+        if let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+        {
+            for event in &mut audio.events {
+                event.stretch_mode = mode;
+            }
+            self.sync_song_to_plugin_host();
+        }
     }
 
     /// 右端 trim ハンドラ。 `length_beats` を更新し、 audio clip では

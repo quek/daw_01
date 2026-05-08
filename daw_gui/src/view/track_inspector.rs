@@ -5,11 +5,12 @@
 //! - + Instrument / + Effect / + MIDI FX ボタン
 
 use daw_ui_core::{
-    Edit, ReorderableListEditRequest, ReorderableListStyle, Ui,
+    Edit, ReorderableListEditRequest, ReorderableListStyle, ToggleButtonStyle, Ui,
 };
 use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent, PickerTarget};
+use common::model::StretchMode;
 
 const BG: Color = Color { r: 0.16, g: 0.16, b: 0.20, a: 1.0 };
 const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
@@ -19,6 +20,43 @@ const ROW_BG_HOVER: Color = Color { r: 0.24, g: 0.24, b: 0.30, a: 1.0 };
 const ROW_BG_DRAGGING: Color = Color { r: 0.30, g: 0.40, b: 0.55, a: 0.85 };
 const SECTION_TEXT: Color = Color { r: 0.55, g: 0.62, b: 0.78, a: 1.0 };
 const DROP_INDICATOR: Color = Color { r: 0.55, g: 0.78, b: 0.95, a: 1.0 };
+
+// Audio event toggle (Reverse / Muted) 用 style。 mixer_strips の
+// STYLE_MUTE / STYLE_SOLO とほぼ同じだが、 inspector 側に独立して定義
+// (mixer の private const を import するより、 同 widget 並びの一覧性を
+// 優先)。 hint band は無し (= 単純トグル) にして、 文字 + ON/OFF 色だけで
+// 状態を伝える。
+const TOGGLE_AUDIO_BASE: ToggleButtonStyle = ToggleButtonStyle {
+    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
+    on_color: Color { r: 0.42, g: 0.55, b: 0.78, a: 1.0 },
+    hint_band: None,
+    hint_band_h: 2.0,
+    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    border_width: 1.0,
+    radius: 4.0,
+    font_size: 12.0,
+    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+};
+
+const STRETCH_MODE_LABELS: &[&str] = &["Raw", "Repitch", "Stretch", "Slice"];
+
+fn stretch_mode_to_index(m: StretchMode) -> usize {
+    match m {
+        StretchMode::Raw => 0,
+        StretchMode::Repitch => 1,
+        StretchMode::Stretch => 2,
+        StretchMode::Slice => 3,
+    }
+}
+
+fn stretch_mode_from_index(i: usize) -> StretchMode {
+    match i {
+        1 => StretchMode::Repitch,
+        2 => StretchMode::Stretch,
+        3 => StretchMode::Slice,
+        _ => StretchMode::Raw,
+    }
+}
 
 const CHAIN_LIST_STYLE: ReorderableListStyle = ReorderableListStyle {
     row_height: 26.0,
@@ -49,6 +87,103 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         TEXT,
     );
     y += 28.0;
+
+    // ---- Audio Event section (Phase 2 PR1) ---------------------------
+    // selected_clip が `ClipContent::Audio` のとき、 first event の field
+    // (Reverse / Mute / Stretch Mode) を編集できるトグル + ドロップダウン
+    // を表示。 編集 AppEvent は全 event に broadcast (Phase 1 で 1 clip
+    // 1 event 前提なので first event = clip 全体)。 `docs/plan_audio_clip
+    // .md` §3.7 / §3.8 / §3.9 (AudioEvent 選択時)。
+    if let Some(summary) = app.inspector_audio_event_summary() {
+        ui.label_at(
+            "inspector_audio_event_label",
+            "Audio Event",
+            area.x + pad,
+            y,
+            12.0,
+            TEXT_DIM,
+        );
+        y += 18.0;
+
+        // Reverse / Mute toggle 横並び (mixer_strips の M/S と同じ感覚)。
+        let toggle_h = 24.0;
+        let row_w = area.w - pad * 2.0;
+        let toggle_w = (row_w - 6.0) * 0.5;
+        let target_rev = summary.target;
+        let new_rev = !summary.reversed;
+        ui.toggle_button_at(
+            "inspector_audio_reverse",
+            "Reverse",
+            Rect { x: area.x + pad, y, w: toggle_w, h: toggle_h },
+            summary.reversed,
+            &TOGGLE_AUDIO_BASE,
+            move |_| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetClipReversed {
+                        target: target_rev,
+                        reversed: new_rev,
+                    })
+                })
+            },
+        );
+        let target_mute = summary.target;
+        let new_mute = !summary.muted;
+        ui.toggle_button_at(
+            "inspector_audio_mute",
+            "Mute",
+            Rect {
+                x: area.x + pad + toggle_w + 6.0,
+                y,
+                w: toggle_w,
+                h: toggle_h,
+            },
+            summary.muted,
+            &TOGGLE_AUDIO_BASE,
+            move |_| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetClipMuted {
+                        target: target_mute,
+                        muted: new_mute,
+                    })
+                })
+            },
+        );
+        y += toggle_h + 6.0;
+
+        // Stretch Mode dropdown (Raw / Repitch / Stretch / Slice)。
+        ui.label_at(
+            "inspector_audio_stretch_label",
+            "Stretch",
+            area.x + pad,
+            y,
+            11.0,
+            TEXT_DIM,
+        );
+        y += 16.0;
+        let dropdown_rect = Rect {
+            x: area.x + pad,
+            y,
+            w: row_w,
+            h: 24.0,
+        };
+        let cur_idx = stretch_mode_to_index(summary.stretch_mode);
+        if let Some(picked) = ui.dropdown(
+            "inspector_audio_stretch_dropdown",
+            dropdown_rect,
+            STRETCH_MODE_LABELS,
+            cur_idx,
+        ) {
+            let target_sm = summary.target;
+            let new_mode = stretch_mode_from_index(picked);
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetClipStretchMode {
+                    target: target_sm,
+                    mode: new_mode,
+                })
+            }));
+        }
+        y += 24.0 + 12.0;
+    }
 
     // Vocal source 編集 (Vocal track のときのみ)
     if let Some(track) = app.song.tracks.get(app.cursor_track_index().unwrap_or(0))
