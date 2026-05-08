@@ -1222,14 +1222,19 @@ impl LoadedPlugin for Vst3Plugin {
 
 fn encode_event(te: &TimedNoteEvent) -> Event {
     match te.event {
-        NoteTransition::On { key, velocity } => {
+        // PR-V2.4: VST3 NoteOn/Off の `noteId` 標準 field に `note_id` を
+        // 詰める (= host から plugin へ note 識別子を伝搬)。 `i32` 型で
+        // 0..i32::MAX に clamp、 越えたら `-1` (= "未指定") に fallback。
+        NoteTransition::On { note_id, key, velocity } => {
+            let vst_note_id =
+                if note_id <= i32::MAX as u32 { note_id as i32 } else { -1 };
             let note_on = NoteOnEvent {
                 channel: 0,
                 pitch: key as i16,
                 tuning: 0.0,
                 velocity: velocity as f32,
                 length: 0,
-                noteId: -1,
+                noteId: vst_note_id,
             };
             let mut ev = Event {
                 busIndex: 0,
@@ -1248,12 +1253,14 @@ fn encode_event(te: &TimedNoteEvent) -> Event {
             }
             ev
         }
-        NoteTransition::Off { key } => {
+        NoteTransition::Off { note_id, key } => {
+            let vst_note_id =
+                if note_id <= i32::MAX as u32 { note_id as i32 } else { -1 };
             let note_off = NoteOffEvent {
                 channel: 0,
                 pitch: key as i16,
                 velocity: 0.0,
-                noteId: -1,
+                noteId: vst_note_id,
                 tuning: 0.0,
             };
             let mut ev = Event {
@@ -1289,18 +1296,24 @@ pub(crate) fn decode_event(ev: &Event) -> Option<TimedNoteEvent> {
     let ty = ev.r#type as u32;
     if ty == Event_::EventTypes_::kNoteOnEvent as u32 {
         let note: &NoteOnEvent = unsafe { &*(&ev.__field0 as *const _ as *const NoteOnEvent) };
+        // 「未指定」 = -1 → 0 に丸める (= MIDI FX が note_id を返さない
+        // ケース)。
+        let note_id = note.noteId.max(0) as u32;
         Some(TimedNoteEvent {
             time: ev.sampleOffset.max(0) as u32,
             event: NoteTransition::On {
+                note_id,
                 key: note.pitch.clamp(0, 127) as u8,
                 velocity: note.velocity as f64,
             },
         })
     } else if ty == Event_::EventTypes_::kNoteOffEvent as u32 {
         let note: &NoteOffEvent = unsafe { &*(&ev.__field0 as *const _ as *const NoteOffEvent) };
+        let note_id = note.noteId.max(0) as u32;
         Some(TimedNoteEvent {
             time: ev.sampleOffset.max(0) as u32,
             event: NoteTransition::Off {
+                note_id,
                 key: note.pitch.clamp(0, 127) as u8,
             },
         })

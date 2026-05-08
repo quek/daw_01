@@ -75,14 +75,19 @@ struct SynthResult {
     note_offsets: Arc<HashMap<u32, u64>>,
 }
 
-/// 再生中 voice (= synth wav の playhead)。 PR-V2.3 MVP では 1 plugin
-/// instance に高々 1 voice (= 「最初の note_on で全 wav 再生開始、 後続
-/// note_on は ignore」)。 PR-V2.4 で per-note voice に拡張。
+/// PR-V2.4: 再生中 voice。 note_on event 受信時に synth_result.note_offsets
+/// から該当 note の wav 開始 frame を取得して push、 process() で mix、
+/// wav 終端で自動停止 (= note_off は無視、 VOICEVOX の出力は envelope を
+/// 内包するので wav 自体の終わり = 歌い終わりが自然)。 同 note_id の
+/// retrigger は voice を上書き (= 後勝ち、 「歌詞編集で同 note を再合成」
+/// した場合に古い voice を切って新 voice に差し替える挙動)。
 struct Voice {
+    note_id: u32,
     samples: Arc<Vec<f32>>,
     sample_rate: u32,
     velocity: f32,
-    /// 次に samples から read する位置。
+    /// 次に samples から read する位置 (samples の絶対 index、
+    /// `synth_offset` を起点に毎フレーム +1 する)。
     cursor: usize,
 }
 
@@ -108,8 +113,9 @@ pub struct VoicevoxBuiltin {
     synth_result: Arc<RwLock<Option<SynthResult>>>,
 
     // --- process state (audio thread) -----------------------------------
-    /// 再生中 voice。 1 個まで保持 (= MVP 単一 voice 設計)。
-    active_voice: Option<Voice>,
+    /// 再生中 voice 群 (PR-V2.4)。 note_on で push、 wav 終端で自動 drain、
+    /// 同 note_id の retrigger は既存 entry を上書き (後勝ち)。
+    active_voices: Vec<Voice>,
 }
 
 impl VoicevoxBuiltin {
@@ -124,7 +130,7 @@ impl VoicevoxBuiltin {
             synth_tx: None,
             synth_thread: None,
             synth_result: Arc::new(RwLock::new(None)),
-            active_voice: None,
+            active_voices: Vec::new(),
         }
     }
 
@@ -260,7 +266,7 @@ impl LoadedPlugin for VoicevoxBuiltin {
 
     fn deactivate(&mut self) {
         self.activated = false;
-        self.active_voice = None;
+        self.active_voices.clear();
         self.stop_synth_thread();
     }
 
@@ -269,7 +275,7 @@ impl LoadedPlugin for VoicevoxBuiltin {
     }
 
     fn stop_processing(&mut self) {
-        self.active_voice = None;
+        self.active_voices.clear();
     }
 
     fn process(
@@ -290,56 +296,83 @@ impl LoadedPlugin for VoicevoxBuiltin {
             *v = 0.0;
         }
 
-        // note_on event を受信したら synth_result から voice を起こす。
-        // PR-V2.3 MVP: 単一 voice、 後続 note_on は ignore (= 既に流して
-        // いる wav に subsume される)。
+        // PR-V2.4: per-note voice。 note_on を受信したら synth_result の
+        // note_offsets から該当 note_id の wav 開始 frame を引き、 既存
+        // voice (同 note_id) があれば置き換え、 無ければ push。 note_off
+        // は無視 (= VOICEVOX 出力は envelope を内包、 wav 終端まで自然停
+        // 止が歌唱として自然)。 同 buffer 内で event.time を考慮する
+        // resample は polish。
         for ev in events {
-            if let crate::plugin_instance::NoteTransition::On { velocity, .. } =
-                ev.event
-                && self.active_voice.is_none()
-            {
+            if let crate::plugin_instance::NoteTransition::On { note_id, velocity, .. } = ev.event {
                 let snapshot = self
                     .synth_result
                     .read()
                     .ok()
                     .and_then(|guard| guard.clone());
-                if let Some(res) = snapshot {
-                    self.active_voice = Some(Voice {
-                        samples: res.samples,
-                        sample_rate: res.sample_rate,
-                        velocity: velocity as f32,
-                        cursor: 0,
-                    });
+                let Some(res) = snapshot else {
+                    continue;
+                };
+                let synth_offset = res
+                    .note_offsets
+                    .get(&note_id)
+                    .copied()
+                    .unwrap_or(0) as usize;
+                if synth_offset >= res.samples.len() {
+                    // synth から note_id が外れている (= 歌詞数とずれた)
+                    // 場合は無視。
+                    continue;
+                }
+                let voice = Voice {
+                    note_id,
+                    samples: Arc::clone(&res.samples),
+                    sample_rate: res.sample_rate,
+                    velocity: velocity as f32,
+                    cursor: synth_offset,
+                };
+                if let Some(slot) = self
+                    .active_voices
+                    .iter_mut()
+                    .find(|v| v.note_id == note_id)
+                {
+                    *slot = voice;
+                } else {
+                    self.active_voices.push(voice);
                 }
             }
-            // note_off は無視 (= synth wav 自体が envelope を含むので、
-            // wav 終端に到達したら voice 自然停止)。
+            // note_off は無視。
         }
 
-        // active voice の audio を mix。 sample_rate ミスマッチは現状
-        // resample しない (= VOICEVOX 出力 24000 Hz、 engine 48000 Hz の
-        // 場合は再生速度が倍になる旨のログを 1 度だけ出す)。 PR-V2.4 で
-        // 簡易 linear resample を入れる。
-        if let Some(voice) = &mut self.active_voice {
-            let sr_ratio_warning =
-                voice.sample_rate as f64 != self.sample_rate;
-            if sr_ratio_warning {
-                tracing::debug!(
-                    voice_sr = voice.sample_rate,
-                    engine_sr = self.sample_rate,
-                    "VoicevoxBuiltin: sample rate mismatch (PR-V2.4 で resample 予定)"
-                );
-            }
-            let amp = (voice.velocity / 127.0).clamp(0.0, 1.0);
-            let copy_n = (voice.samples.len() - voice.cursor).min(frames_usize);
-            for i in 0..copy_n {
-                let s = voice.samples[voice.cursor + i] * amp;
-                self.out_l[i] += s;
-                self.out_r[i] += s;
-            }
-            voice.cursor += copy_n;
-            if voice.cursor >= voice.samples.len() {
-                self.active_voice = None;
+        // active voices ごとに audio を mix。 sample_rate ミスマッチは
+        // 現状 resample しない (PR-V2.4 polish で linear resample 予定)、
+        // 1 回 warn ログのみ。
+        let mut sr_warned = false;
+        let mut i = 0usize;
+        while i < self.active_voices.len() {
+            let drop = {
+                let voice = &mut self.active_voices[i];
+                if !sr_warned && voice.sample_rate as f64 != self.sample_rate {
+                    tracing::debug!(
+                        voice_sr = voice.sample_rate,
+                        engine_sr = self.sample_rate,
+                        "VoicevoxBuiltin: sample rate mismatch"
+                    );
+                    sr_warned = true;
+                }
+                let amp = (voice.velocity / 127.0).clamp(0.0, 1.0);
+                let remaining = voice.samples.len().saturating_sub(voice.cursor);
+                let copy_n = remaining.min(frames_usize);
+                for k in 0..copy_n {
+                    let s = voice.samples[voice.cursor + k] * amp;
+                    self.out_l[k] += s;
+                    self.out_r[k] += s;
+                }
+                voice.cursor += copy_n;
+                voice.cursor >= voice.samples.len()
+            };
+            if drop {
+                self.active_voices.swap_remove(i);
+            } else {
+                i += 1;
             }
         }
 
@@ -513,13 +546,14 @@ mod tests {
         let events = vec![TimedNoteEvent {
             time: 0,
             event: crate::plugin_instance::NoteTransition::On {
+                note_id: 0,
                 key: 60,
                 velocity: 100.0,
             },
         }];
         p.process(64, &events, &[], &[]).unwrap();
         assert!(p.out_l[..64].iter().all(|&v| v == 0.0));
-        assert!(p.active_voice.is_none());
+        assert!(p.active_voices.is_empty());
         p.deactivate();
     }
 
@@ -575,6 +609,7 @@ mod tests {
         let events = vec![TimedNoteEvent {
             time: 0,
             event: crate::plugin_instance::NoteTransition::On {
+                note_id: 0,
                 key: 60,
                 velocity: 127.0,
             },
@@ -584,10 +619,10 @@ mod tests {
         // sample[1] 以降は非ゼロ)。
         assert!(p.out_l[1..64].iter().any(|&v| v != 0.0));
         // voice が cursor を進めていること。
-        assert_eq!(p.active_voice.as_ref().unwrap().cursor, 64);
+        assert_eq!(p.active_voices[0].cursor, 64);
         // 次 process で残り 64 frame 流して voice 終了。
         p.process(64, &[], &[], &[]).unwrap();
-        assert!(p.active_voice.is_none());
+        assert!(p.active_voices.is_empty());
         p.deactivate();
     }
 }

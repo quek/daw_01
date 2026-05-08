@@ -354,13 +354,17 @@ fn run_worker(
                 EventKind::NoteOn => TimedNoteEvent {
                     time: ev.time,
                     event: NoteTransition::On {
+                        note_id: ev.note_id,
                         key: ev.key,
                         velocity: ev.velocity,
                     },
                 },
                 EventKind::NoteOff => TimedNoteEvent {
                     time: ev.time,
-                    event: NoteTransition::Off { key: ev.key },
+                    event: NoteTransition::Off {
+                        note_id: ev.note_id,
+                        key: ev.key,
+                    },
                 },
                 EventKind::ParamValue => continue,
             };
@@ -419,7 +423,7 @@ fn run_worker(
                 }
                 let i = pd.n_events_out as usize;
                 pd.events_out[i] = match tev.event {
-                    NoteTransition::On { key, velocity } => Event {
+                    NoteTransition::On { note_id, key, velocity } => Event {
                         kind: EventKind::NoteOn,
                         _pad: [0; 3],
                         time: tev.time,
@@ -428,10 +432,10 @@ fn run_worker(
                         _pad1: [0; 2],
                         velocity,
                         param_id: 0,
-                        _pad2: [0; 4],
+                        note_id,
                         value: 0.0,
                     },
-                    NoteTransition::Off { key } => Event {
+                    NoteTransition::Off { note_id, key } => Event {
                         kind: EventKind::NoteOff,
                         _pad: [0; 3],
                         time: tev.time,
@@ -440,7 +444,7 @@ fn run_worker(
                         _pad1: [0; 2],
                         velocity: 0.0,
                         param_id: 0,
-                        _pad2: [0; 4],
+                        note_id,
                         value: 0.0,
                     },
                 };

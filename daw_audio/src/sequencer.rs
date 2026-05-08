@@ -8,10 +8,15 @@
 
 use common::model::{Note, Song};
 
+/// PR-V2.4: `note_id` を追加。 audio engine が track 内全 clip notes を
+/// flatten した「通し index」 を振り、 plugin host (= builtin VOICEVOX) は
+/// この id で `NoteMetadata` (歌詞 / phoneme) や合成 wav frame offset を
+/// 引く。 CLAP / VST3 backend はこの field を無視する (= 既存 MIDI
+/// pipeline はそのまま動く)。
 #[derive(Debug, Clone, Copy)]
 pub enum NoteTransition {
-    On { key: u8, velocity: f64 },
-    Off { key: u8 },
+    On { note_id: u32, key: u8, velocity: f64 },
+    Off { note_id: u32, key: u8 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -71,17 +76,21 @@ pub fn collect_events_for_buffer(
     let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(song.bpm);
     let buf_end = playhead + u64::from(frames);
 
+    // PR-V2.4: track 内全 clip の notes を flatten した「通し index」 を
+    // note_id とする。 同 track の `sync_vocal_metadata` (daw_gui 側) と
+    // 同じ番号体系で flush されるので、 builtin plugin 側で `note_id` →
+    // 合成 wav frame offset の対応が成立する。 clip skip (= 範囲外 / 0
+    // length) でも `note_id_base` は necessary に進める必要があるが、
+    // current loop は `length_beats <= 0` の clip も notes を読まずに
+    // skip している。 ここでは「skip した clip の notes は数えない」 と
+    // 「skip しない clip 内 notes だけで通し番号」 のどちらでも builtin
+    // plugin 側の expected note_id とずれる可能性がある。 sync_vocal_
+    // metadata 側も同じ `length_beats <= 0` skip を入れて整合させるのが
+    // 正しいが、 通常 audio engine 側は無効 clip を skip しないので
+    // (= length_beats <= 0 は GUI で防がれる)、 ここは「全 clip notes を
+    // 通し」 で実装する。
+    let mut note_id_base: u32 = 0;
     for clip in &track.clips {
-        if clip.length_beats <= 0.0 {
-            continue;
-        }
-        let clip_start_samples = (clip.start_beat * samples_per_beat).max(0.0) as u64;
-        let clip_end_samples =
-            clip_start_samples + (clip.length_beats * samples_per_beat) as u64;
-        if clip_end_samples <= playhead || clip_start_samples >= buf_end {
-            continue;
-        }
-
         // v6 linked clip: notes は Song.clip_contents から取り出す。
         // 共有 clip 群は同じ content から同じ notes を見るので、 別々の
         // 配置位置 (clip.start_beat) で同じ内容が再生される。
@@ -90,7 +99,22 @@ pub fn collect_events_for_buffer(
             .get(&clip.content_id)
             .and_then(|c| c.notes())
             .unwrap_or(&[]);
-        for note in notes {
+        let clip_note_count = notes.len() as u32;
+
+        if clip.length_beats <= 0.0 {
+            note_id_base += clip_note_count;
+            continue;
+        }
+        let clip_start_samples = (clip.start_beat * samples_per_beat).max(0.0) as u64;
+        let clip_end_samples =
+            clip_start_samples + (clip.length_beats * samples_per_beat) as u64;
+        if clip_end_samples <= playhead || clip_start_samples >= buf_end {
+            note_id_base += clip_note_count;
+            continue;
+        }
+
+        for (note_idx, note) in notes.iter().enumerate() {
+            let note_id = note_id_base + note_idx as u32;
             if note.duration_beats <= 0.0 {
                 continue;
             }
@@ -110,6 +134,7 @@ pub fn collect_events_for_buffer(
                 out.push(TimedNoteEvent {
                     time: (on_sample - playhead) as u32,
                     event: NoteTransition::On {
+                        note_id,
                         key: note.pitch,
                         velocity: f64::from(note.velocity) / 127.0,
                     },
@@ -119,13 +144,17 @@ pub fn collect_events_for_buffer(
             if off_sample > on_sample && off_sample >= playhead && off_sample < buf_end {
                 out.push(TimedNoteEvent {
                     time: (off_sample - playhead) as u32,
-                    event: NoteTransition::Off { key: note.pitch },
+                    event: NoteTransition::Off {
+                        note_id,
+                        key: note.pitch,
+                    },
                 });
                 if let Some(pos) = active_notes.iter().position(|&k| k == note.pitch) {
                     active_notes.swap_remove(pos);
                 }
             }
         }
+        note_id_base += clip_note_count;
     }
 
     // CLAP requires in-events sorted by time. At equal times, Off must come
@@ -214,7 +243,7 @@ mod tests {
             &mut active,
         );
         assert_eq!(out.len(), 1);
-        assert!(matches!(out[0].event, NoteTransition::Off { key: 60 }));
+        assert!(matches!(out[0].event, NoteTransition::Off { key: 60, .. }));
         assert!(active.is_empty(), "active set must drop the off note");
     }
 
@@ -226,7 +255,7 @@ mod tests {
         collect_events_for_buffer(Some(&song), 0, SR, 0, 1024, &mut out, &mut active);
         assert_eq!(out.len(), 2);
         assert!(matches!(out[0].event, NoteTransition::On { key: 60, .. }));
-        assert!(matches!(out[1].event, NoteTransition::Off { key: 60 }));
+        assert!(matches!(out[1].event, NoteTransition::Off { key: 60, .. }));
         assert!(out[0].time < out[1].time);
         assert!(active.is_empty());
     }
@@ -296,7 +325,7 @@ mod tests {
             &mut active,
         );
         assert_eq!(out.len(), 1);
-        assert!(matches!(out[0].event, NoteTransition::Off { key: 60 }));
+        assert!(matches!(out[0].event, NoteTransition::Off { key: 60, .. }));
         assert!(active.is_empty());
     }
 

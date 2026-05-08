@@ -78,7 +78,14 @@ pub struct Event {
     pub velocity: f64,
     /// CLAP param id (Param events) — 0 for note events.
     pub param_id: u32,
-    pub _pad2: [u8; 4],
+    /// PR-V2.4: stable per-note identifier propagated from
+    /// `daw_audio::sequencer` to plugins. Builtin plugins
+    /// (`PluginFormat::Builtin`, e.g. VOICEVOX) use this to look up
+    /// per-note metadata (歌詞 / phoneme) and synthesised audio
+    /// caches. CLAP backends forward it to `clap_event_note.note_id`;
+    /// VST3 backends ignore it. `0` is a valid id (= first note in
+    /// the track), so consumers should not treat 0 as "unset".
+    pub note_id: u32,
     /// Param value (Param events) — ignored otherwise.
     pub value: f64,
 }
@@ -122,7 +129,17 @@ impl ProcessData {
     /// Push a NoteOn into `events_in`. Silently truncates if the buffer is
     /// full — at MAX_EVENTS=256 per buffer this should never happen for
     /// normal MIDI traffic, and panicking inside RT is worse than dropping.
-    pub fn push_note_on(&mut self, time: u32, key: u8, velocity: f64, channel: u8) {
+    /// PR-V2.4: `note_id` carries the per-note identifier so builtin
+    /// plugins (VOICEVOX) can look up `NoteMetadata` (歌詞) and
+    /// synthesised audio caches keyed by `note_id`.
+    pub fn push_note_on(
+        &mut self,
+        time: u32,
+        key: u8,
+        velocity: f64,
+        channel: u8,
+        note_id: u32,
+    ) {
         let i = self.n_events_in as usize;
         if i >= MAX_EVENTS {
             return;
@@ -136,13 +153,13 @@ impl ProcessData {
             _pad1: [0; 2],
             velocity,
             param_id: 0,
-            _pad2: [0; 4],
+            note_id,
             value: 0.0,
         };
         self.n_events_in += 1;
     }
 
-    pub fn push_note_off(&mut self, time: u32, key: u8, channel: u8) {
+    pub fn push_note_off(&mut self, time: u32, key: u8, channel: u8, note_id: u32) {
         let i = self.n_events_in as usize;
         if i >= MAX_EVENTS {
             return;
@@ -156,7 +173,7 @@ impl ProcessData {
             _pad1: [0; 2],
             velocity: 0.0,
             param_id: 0,
-            _pad2: [0; 4],
+            note_id,
             value: 0.0,
         };
         self.n_events_in += 1;
@@ -176,7 +193,7 @@ impl ProcessData {
             _pad1: [0; 2],
             velocity: 0.0,
             param_id,
-            _pad2: [0; 4],
+            note_id: 0,
             value,
         };
         self.n_events_in += 1;
@@ -192,7 +209,7 @@ const EMPTY_EVENT: Event = Event {
     _pad1: [0; 2],
     velocity: 0.0,
     param_id: 0,
-    _pad2: [0; 4],
+    note_id: 0,
     value: 0.0,
 };
 

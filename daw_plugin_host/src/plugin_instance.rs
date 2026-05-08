@@ -22,10 +22,18 @@ use crate::clap_plugin::ClapPlugin;
 use crate::vst3_plugin::Vst3Plugin;
 
 /// One MIDI-style transition pushed into the next `process()` call.
+///
+/// `note_id` (PR-V2.4) is the **stable per-note identifier** used to look
+/// up `NoteMetadata` (= 歌詞 / phoneme) and per-note synthesis cache in
+/// builtin plugins. CLAP / VST3 backends ignore the field — they map
+/// `On { key }` to the legacy MIDI note pipeline. For audio events
+/// emitted by `sequencer::collect_events_for_buffer`, the value is the
+/// note's flattened index across all clips on the track (same numbering
+/// `daw_gui::AppData::sync_vocal_metadata` uses on the host side).
 #[derive(Debug, Clone, Copy)]
 pub enum NoteTransition {
-    On { key: u8, velocity: f64 },
-    Off { key: u8 },
+    On { note_id: u32, key: u8, velocity: f64 },
+    Off { note_id: u32, key: u8 },
 }
 
 /// A note transition scheduled at a specific frame offset inside the next

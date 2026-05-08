@@ -722,9 +722,12 @@ pub fn process_track_owned(
     // ---- Sequencer: assemble this buffer's MIDI bus ----
     scratch.midi_bus_a.clear();
     for &k in &scratch.state.pending_offs {
+        // pending_offs は stuck note flush 用なので note_id 不明 → 0
+        // (= "未指定" 相当)。 builtin plugin は voice cleanup で key 一致
+        // で停止するので、 note_id 0 でも実害なし。
         scratch.midi_bus_a.push(TimedNoteEvent {
             time: 0,
-            event: NoteTransition::Off { key: k },
+            event: NoteTransition::Off { note_id: 0, key: k },
         });
     }
     scratch.state.pending_offs.clear();
@@ -762,10 +765,12 @@ pub fn process_track_owned(
         pd.sample_rate = sample_rate;
         for ev in &scratch.midi_bus_a {
             match ev.event {
-                NoteTransition::On { key, velocity } => {
-                    pd.push_note_on(ev.time, key, velocity, 0)
+                NoteTransition::On { note_id, key, velocity } => {
+                    pd.push_note_on(ev.time, key, velocity, 0, note_id)
                 }
-                NoteTransition::Off { key } => pd.push_note_off(ev.time, key, 0),
+                NoteTransition::Off { note_id, key } => {
+                    pd.push_note_off(ev.time, key, 0, note_id)
+                }
             }
         }
         if let Err(e) = ws.dispatch(plugin_id) {
@@ -780,13 +785,17 @@ pub fn process_track_owned(
                 EventKind::NoteOn => TimedNoteEvent {
                     time: ev.time,
                     event: NoteTransition::On {
+                        note_id: ev.note_id,
                         key: ev.key,
                         velocity: ev.velocity,
                     },
                 },
                 EventKind::NoteOff => TimedNoteEvent {
                     time: ev.time,
-                    event: NoteTransition::Off { key: ev.key },
+                    event: NoteTransition::Off {
+                        note_id: ev.note_id,
+                        key: ev.key,
+                    },
                 },
                 EventKind::ParamValue => continue,
             };
@@ -863,10 +872,12 @@ pub fn process_track_owned(
             pd.sample_rate = sample_rate;
             for ev in &scratch.midi_bus_a {
                 match ev.event {
-                    NoteTransition::On { key, velocity } => {
-                        pd.push_note_on(ev.time, key, velocity, 0)
+                    NoteTransition::On { note_id, key, velocity } => {
+                        pd.push_note_on(ev.time, key, velocity, 0, note_id)
                     }
-                    NoteTransition::Off { key } => pd.push_note_off(ev.time, key, 0),
+                    NoteTransition::Off { note_id, key } => {
+                        pd.push_note_off(ev.time, key, 0, note_id)
+                    }
                 }
             }
             if let Err(e) = ws.dispatch(plugin_id) {

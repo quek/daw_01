@@ -838,14 +838,20 @@ unsafe extern "C" fn collect_out_note_try_push(
     let transition = match header.type_ {
         t if t == CLAP_EVENT_NOTE_ON => {
             let note = unsafe { &*(event as *const clap_event_note) };
+            // CLAP `note_id` は i32 で `-1` = "未指定"。 0 にクランプして
+            // u32 に。 host から send した正の値はそのまま見える。
+            let note_id = note.note_id.max(0) as u32;
             Some(NoteTransition::On {
+                note_id,
                 key: note.key.clamp(0, 127) as u8,
                 velocity: note.velocity,
             })
         }
         t if t == CLAP_EVENT_NOTE_OFF => {
             let note = unsafe { &*(event as *const clap_event_note) };
+            let note_id = note.note_id.max(0) as u32;
             Some(NoteTransition::Off {
+                note_id,
                 key: note.key.clamp(0, 127) as u8,
             })
         }
@@ -886,9 +892,18 @@ unsafe extern "C" fn in_events_get(
 }
 
 fn encode_note(transition: NoteTransition) -> clap_event_note {
-    let (type_, key, velocity) = match transition {
-        NoteTransition::On { key, velocity } => (CLAP_EVENT_NOTE_ON, key, velocity),
-        NoteTransition::Off { key } => (CLAP_EVENT_NOTE_OFF, key, 0.0),
+    // PR-V2.4: `note_id` を取り出して CLAP `clap_event_note.note_id` に詰める。
+    // i32 で `-1` (= "未指定") を sentinel に使う仕様なので、 host 側 0 は
+    // そのまま 0 として送る (= 0 は valid な note_id)。
+    let (type_, key, velocity, note_id) = match transition {
+        NoteTransition::On { note_id, key, velocity } => {
+            let nid = if note_id <= i32::MAX as u32 { note_id as i32 } else { -1 };
+            (CLAP_EVENT_NOTE_ON, key, velocity, nid)
+        }
+        NoteTransition::Off { note_id, key } => {
+            let nid = if note_id <= i32::MAX as u32 { note_id as i32 } else { -1 };
+            (CLAP_EVENT_NOTE_OFF, key, 0.0, nid)
+        }
     };
     clap_event_note {
         header: clap_event_header {
@@ -898,7 +913,7 @@ fn encode_note(transition: NoteTransition) -> clap_event_note {
             type_,
             flags: 0,
         },
-        note_id: -1,
+        note_id,
         port_index: 0,
         channel: 0,
         key: key as i16,

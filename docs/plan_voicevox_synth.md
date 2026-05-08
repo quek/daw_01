@@ -44,6 +44,29 @@
     追加 (= 役割は plugin_host のみ)
   - unit test 1 件追加 (set_note_metadata で lyrics buffer が完全置換、
     空 flush で全消去)
+- ✅ **PR-V2.4**: per-note voice + note_id 経路完成
+  - `common::process_data::Event` に `note_id: u32` field 追加 (= 旧
+    `_pad2` 領域を昇格)、 `push_note_on` / `push_note_off` の signature
+    に `note_id` 引数追加
+  - `daw_plugin_host::plugin_instance::NoteTransition::On/Off` に
+    `note_id` field 追加 (`daw_audio::sequencer::NoteTransition` 側にも
+    並行追加)。 全 caller を `note_id, ..` で更新
+  - `daw_audio::sequencer::collect_events_for_buffer`: track 内全 clip の
+    notes を flatten した「通し index」 を `note_id` として振る (= daw_gui
+    `sync_vocal_metadata` と同じ番号体系で flush されるので builtin
+    plugin は note_id ↔ 歌詞 / 合成 wav frame offset を正しく引ける)
+  - `daw_plugin_host::clap_plugin`: `clap_event_note.note_id` field を
+    encode/decode で host ↔ plugin 間に伝搬 (`-1` = "未指定" sentinel
+    対応)
+  - `daw_plugin_host::vst3_plugin`: VST3 NoteOnEvent / NoteOffEvent の
+    `noteId` field に同様に伝搬
+  - `daw_plugin_host::builtin::voicevox::VoicevoxBuiltin`:
+    `active_voice: Option<Voice>` を `active_voices: Vec<Voice>` に
+    拡張、 process() で note_on event 受信時に
+    `synth_result.note_offsets[note_id]` から wav 開始 frame を取得して
+    voice 起動。 同 note_id 連続 trigger は voice 上書き (後勝ち)。
+    note_off は無視 (= VOICEVOX 出力は envelope を内包、 wav 終端で自然
+    停止)
 - ✅ **PR-V3 (前段)**: vocal track の builtin VOICEVOX auto-load + 歌詞
   flush 経路 (= 既存 vocal block と並列で動かせる、 二重再生は
   `track.instrument.is_some()` の audio engine 分岐で自動回避)
