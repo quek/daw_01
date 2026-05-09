@@ -380,6 +380,20 @@ pub struct ClipFadeCurveDelta {
     pub next_curve: FadeCurve,
 }
 
+/// M14 Phase 63n-2 (#028): `MoveAutomationPoints` の delta 1 件 (release 時に発火)。
+/// `point` の `point_idx` は **drag 開始時 frame の index** (= caller `clip.points` 配列の index)。
+/// caller は (1) `clip.points[delta.point.point_idx]` を `next_*` に更新、 (2) 必要に応じて
+/// `time_beat` 昇順を保つよう sort し直す (重複 time_beat を許すか tie-break するかは caller 仕様)。
+/// `prev_*` は Undoable 構築用 (caller が `Edit::with_inverse` で対称適用できる)。
+#[derive(Clone, Copy, Debug)]
+pub struct MoveAutomationPointDelta {
+    pub point: AutomationPointKey,
+    pub prev_time_beat: f64,
+    pub prev_value_norm: f32,
+    pub next_time_beat: f64,
+    pub next_value_norm: f32,
+}
+
 /// M14 Phase 63c (#016): track header click 時の selection 変更 modifier (DAW 業界標準)。
 /// caller が `SelectTrack` Edit を受け取ったときに `(prev, next, modifier)` から動作意図を判別できる
 /// ようにするため、 widget 側で modifier を decoded して送る (caller boilerplate の削減)。
@@ -494,6 +508,53 @@ pub enum ArrangementEditRequest {
     /// 上から積むかどうかをこのフラグで判定)。 `automation_lanes` が空の track では発火しない
     /// (disclosure を描画しないため)。
     ToggleTrackAutomationCollapsed { track: u32 },
+    /// M14 Phase 63n-2 (#028): lane header の `★` icon click。 caller は `lane.enabled = enabled`
+    /// を保存する (widget 側は次 frame 反映)。 widget は click 時に `!current` を渡すので、
+    /// caller は単純に上書きで OK。 disabled lane (`enabled = false`) は curve / clip rect が
+    /// 灰色描画 (bypass marker) になる (Phase 63n-1 から既存)。
+    SetLaneEnabled { lane: AutomationLaneKey, enabled: bool },
+    /// M14 Phase 63n-2 (#028): lane header の `👁` icon click。 caller は `lane.visible = visible`
+    /// を保存する。 `visible = false` で lane 行は描画しない + 高さに含めない (= 隣 lane が詰める)。
+    SetLaneVisible { lane: AutomationLaneKey, visible: bool },
+    /// M14 Phase 63n-2 (#028): lane header の default value horizontal slider 帯 drag による
+    /// `default_value_norm` 変更 (release 時に 1 度発火)。 `prev` / `next` で Undoable 構築容易
+    /// (`SetTrackVolume` と同 pattern)。 widget 側で `0.0..=1.0` に clamp 済。
+    SetLaneDefault { lane: AutomationLaneKey, prev: f32, next: f32 },
+    /// M14 Phase 63n-2 (#028): lane header の `✕` icon click。 caller は当該 lane を track の
+    /// `automation_lanes` から remove する。 lane 内の clip / point も同時に消える (caller 仕様)。
+    /// undo は caller 責務 (widget は単発の Edit を発行するだけ)。
+    DeleteLane(AutomationLaneKey),
+    /// M14 Phase 63n-2 (#028): lane body 内の空き領域 click による point 追加。 `time_beat` は
+    /// **clip-local** (clip start からのオフセット拍、 widget 側で snap 適用済 + `0.0..=clip.len_beats`
+    /// に clamp)、 `value_norm` は cy 座標から逆算した `0.0..=1.0`。 caller は (1) `clip.points` に
+    /// 新 point を `time_beat` 昇順で insert (curve は前 point の curve を継承するか default Linear、
+    /// caller 仕様)、 (2) 必要に応じて undo 履歴に push。 widget は同 frame 内の連続 click でも
+    /// 1 click = 1 Edit 発行 (重複 add は caller の dedup 仕様で吸収)。
+    AddAutomationPoint {
+        clip: AutomationClipKey,
+        time_beat: f64,
+        value_norm: f32,
+    },
+    /// M14 Phase 63n-2 (#028): lane 内 point の drag (release 時に 1 度発火)。 `point_idx` は
+    /// **drag 開始時 frame の index** (caller の `clip.points` 配列 index)。 release frame 時点で
+    /// caller の Vec が drag 開始時から再配列されていない前提 (drag 中に他 thread から変更が
+    /// 入る場合は caller 責務で sort)。 widget 側で `time_beat` snap + `0.0..=clip.len_beats` clamp、
+    /// `value_norm` は `0.0..=1.0` clamp 済。
+    MoveAutomationPoints(Vec<MoveAutomationPointDelta>),
+    /// M14 Phase 63n-2 (#028): Alt + click on point による point 削除 (即時発火、 commit-by-release
+    /// なし)。 `point_indices` は frame 内の index 列 (caller は降順 sort して `Vec::remove` で消す
+    /// idiom が安全)。 widget は単一 click で `vec![key]` の 1 件を発行するが、 将来 multi-select
+    /// 拡張で複数 point 同時削除に拡張可。
+    DeleteAutomationPoints(Vec<AutomationPointKey>),
+    /// M14 Phase 63n-2 (#028): point 右クリック popup から選択された curve 種別の commit。
+    /// widget 自身は popup を描画しない (`Response.automation_curve_popup_request` で anchor を
+    /// 返すだけ、 caller が `context_menu_for` で popup を開いて選択を `SetAutomationCurveType` に
+    /// 変換)。 `prev` は popup 表示時点の curve、 `next` は user 選択値 (caller 責務)。
+    SetAutomationCurveType {
+        point: AutomationPointKey,
+        prev: ArrangementCurveKind,
+        next: ArrangementCurveKind,
+    },
 }
 
 /// `Ui::arrangement` の戻り値。
@@ -521,12 +582,18 @@ pub struct ArrangementResponse {
     pub reordering: Option<u32>,
     /// M10 Phase 47b: drag 中の track id (`Some` なら header volume slider drag セッションが進行中)。
     pub dragging_track_volume: Option<u32>,
-    /// M14 Phase 63n-1 (#028): point 右クリックで開く curve type popup の anchor。 caller は
-    /// `Some((point_key, anchor_rect))` を受けたら既存 `context_menu_for(anchor_rect, ["Hold", "Linear",
-    /// "Bezier"], ...)` で popup を開き、 選択を `SetAutomationCurveType { point, prev, next }` に変換
-    /// する idiom (#005 track header rename の `track_header_rects` と同パターン)。
-    /// **Phase 63n-1 では常に `None`** (Phase 63n-2 で point 右クリック実装時に埋める予約)。
-    pub automation_curve_popup_request: Option<(AutomationPointKey, Rect)>,
+    /// M14 Phase 63n-2 (#028): 全 visible automation point の rect (caller の `context_menu_for`
+    /// 等で popup anchor として使用)。 `clip_rects` と同 semantics:
+    /// - `(AutomationPointKey, Rect)` のペアで描画順 (= 上から下、 左から右) で並ぶ
+    /// - **visible_tracks ベース**: collapsed group の子 track / collapsed automation lane / `lane.visible
+    ///   = false` の lane に属する point は含まれない
+    /// - 完全 off-screen (lane 行が viewport 外 / point が beat 範囲外) の point は除外
+    /// - rect は描画されている point dot の bounding box (= 半径 4px の正方形 = 8x8 px @ default radius)
+    ///
+    /// caller は `for (key, rect) in &resp.automation_point_rects { ui.context_menu_for(*rect,
+    /// &["Hold", "Linear", "Bezier"], ...) }` で右クリック context menu を毎 frame 呼ぶ idiom
+    /// (`clip_rects` と同 pattern、 daw_01 #028 §11.4 で確定)。 widget 自体は popup を描画しない。
+    pub automation_point_rects: Vec<(AutomationPointKey, Rect)>,
 }
 
 impl Default for ArrangementResponse {
@@ -544,7 +611,7 @@ impl Default for ArrangementResponse {
             ruler_rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             reordering: None,
             dragging_track_volume: None,
-            automation_curve_popup_request: None,
+            automation_point_rects: Vec::new(),
         }
     }
 }
@@ -1221,14 +1288,21 @@ pub fn apply_reorder<T: Clone>(items: &[T], anchor_index: usize, target_index: u
     v
 }
 
-/// track header 1 行内のレイアウト (Name button + 2 small buttons + 任意の volume band)。
+/// track header 1 行内のレイアウト (Name button + 2 small buttons + 任意の volume band + lane disclosure)。
 /// `name_rect` (= drag start zone & text area)、`buttons` (= [M, S]、Phase 47c で ↑/↓/× は drag&drop +
-/// Delete shortcut に置換され削除)、`volume_band` は inner 下部に band 用の余裕がある時のみ `Some` (Phase 47b)。
+/// Delete shortcut に置換され削除)、`volume_band` は inner 下部に band 用の余裕がある時のみ `Some` (Phase 47b)、
+/// `lane_disc_rect` は M14 Phase 63n-2 で S button の **右** に予約された lane disclosure
+/// (`+`/`-` icon) 用の rect (track_row 全体の右端、 automation_lanes が空でも常に layout に含めて
+/// 名前領域を一定にする)。
 struct HeaderRowLayout {
     name_rect: Rect,
     buttons: [Rect; 2],
     /// M10 Phase 47b: track volume band rect (`row_h` 余裕がある時のみ Some)。
     volume_band: Option<Rect>,
+    /// M14 Phase 63n-2 (#028): lane disclosure (`+`/`-` toggle) の hit zone + 描画 rect。
+    /// `automation_lanes` が空の track でも layout 上の幅は確保 (= 名前領域が track 間で一定)、
+    /// 空 lane の track では描画されないが click も反応しない (caller が `lanes.is_empty()` で判定)。
+    lane_disc_rect: Rect,
 }
 
 #[allow(clippy::similar_names)]
@@ -1247,8 +1321,12 @@ fn header_row_layout(row: Rect, volume_band_h: f32) -> HeaderRowLayout {
     // Phase 47c: M + S の 2 button (← Phase 45e の name + M + S + ↑ + ↓ + × の 6 button から削減)。
     // ↑/↓ は drag&drop reorder (Phase 46) で代替、× は Delete shortcut (Phase 47c) で代替。
     let n_btn = 2;
+    // M14 Phase 63n-2 (#028): lane disclosure 用の幅を予約 (= disc_size + gap)。 S button の右に
+    // 配置するため `total_right` に加算 → name_rect が縮む代わりに lane_disc が button と重ならない。
+    let lane_disc_size = 12.0_f32;
+    let lane_disc_extra = lane_disc_size + gap;
     #[allow(clippy::cast_precision_loss)]
-    let total_right = small * n_btn as f32 + gap * n_btn as f32;
+    let total_right = small * n_btn as f32 + gap * n_btn as f32 + lane_disc_extra;
     let name_w = (inner.w - total_right).max(20.0);
     let name_rect = Rect { x: inner.x, y: inner.y, w: name_w, h: btn_h };
     let mut x_cursor = inner.x + name_w + gap;
@@ -1257,6 +1335,13 @@ fn header_row_layout(row: Rect, volume_band_h: f32) -> HeaderRowLayout {
         *slot = Rect { x: x_cursor, y: inner.y, w: small, h: btn_h };
         x_cursor += small + gap;
     }
+    // S button の右に lane_disc rect (= ASCII `+`/`-` icon)。 行 vertical center に揃える。
+    let lane_disc_rect = Rect {
+        x: x_cursor,
+        y: inner.y + (btn_h - lane_disc_size).max(0.0) * 0.5,
+        w: lane_disc_size,
+        h: lane_disc_size,
+    };
     // band 表示条件: band_h > 0 && buttons の下に gap + band 分が収まる (progressive disclosure)。
     // default (`track_volume_band_h=4` / `gap=2`) なら inner.h >= 26 (= row_h >= 34) で表示。
     let band_h = volume_band_h.max(0.0);
@@ -1271,7 +1356,7 @@ fn header_row_layout(row: Rect, volume_band_h: f32) -> HeaderRowLayout {
     } else {
         None
     };
-    HeaderRowLayout { name_rect, buttons, volume_band }
+    HeaderRowLayout { name_rect, buttons, volume_band, lane_disc_rect }
 }
 
 /// M14 Phase 63c (#016): disclosure ▼ / ▶ アイコンの hit / 描画 rect。
@@ -1290,21 +1375,21 @@ fn disclosure_rect_for(name_rect: Rect, style: &ArrangementStyle, _depth: u8) ->
     }
 }
 
-/// M14 Phase 63n-1 (#028): track 行右端の **automation lane disclosure** ▶/▼ hit / 描画 rect。
-/// 既存の group disclosure (`disclosure_rect_for`) は `name_rect` の左端を使うのに対し、 こちらは
-/// **track 行の右端** に専用 hit zone (`automation_disclosure_size` 正方形、 行中央寄せ) を切り出す。
-/// `automation_lanes` が空の track では disclosure を描画しない (caller の描画 / hit-test 側で
-/// `lane.is_empty()` を判定して呼ぶ前提)。
+/// M14 Phase 63n-1 (#028) + M14 Phase 63n-2 (#028) 修正: track 行 header 内の **automation lane
+/// disclosure** (`+`/`-`) hit / 描画 rect。 `header_row_layout` の `lane_disc_rect` と一致する位置
+/// (= S button の **右**、 行中央 vertical 揃え)。 既存の group disclosure (`disclosure_rect_for`)
+/// は `name_rect` の左端を使うので disjoint。 `automation_lanes` が空の track では描画しない
+/// (caller の描画 / hit-test 側で `lane.is_empty()` を判定して呼ぶ前提)。
+///
+/// 旧設計 (Phase 63n-1 第 1 案、 `track_row.x + track_row.w - size - pad`) は track 行の **右端
+/// 内側** に rect を置いていたが、 既存 layout の S button rect (行右端から 4px 内側) と完全に
+/// 重なり、 後勝ち描画の S button が disclosure を覆い隠す bug があった (#028 user feedback で
+/// 「`+`/`-` が見えない」 = font 問題ではなく button overlap)。 修正で `header_row_layout` 側に
+/// lane_disc 用の幅 (= 12 + 2 = 14 px) を予約し、 S button の右に配置するよう全 layout を再計算。
 #[must_use]
 pub fn lane_disclosure_rect_for(track_row: Rect, style: &ArrangementStyle) -> Rect {
-    let size = style.automation_disclosure_size.max(8.0);
-    let pad = 4.0_f32;
-    Rect {
-        x: track_row.x + track_row.w - size - pad,
-        y: track_row.y + (track_row.h - size).max(0.0) * 0.5,
-        w: size,
-        h: size,
-    }
+    let _ = style; // size は header_row_layout 内 fixed (12px) を使う、 style.automation_disclosure_size は描画 font_size 用
+    header_row_layout(track_row, 0.0).lane_disc_rect
 }
 
 // ============================================================
@@ -1450,6 +1535,47 @@ struct AudioDragSession {
     locked_horizontal: Option<bool>,
 }
 
+/// M14 Phase 63n-2 (#028): lane 内 point の drag session。 release frame で `MoveAutomationPoints`
+/// を 1 件 (`vec![delta]`) 発火。 drag 中は `last_mouse` / `last_alt` を update して overlay の
+/// preview 位置を計算 (`AudioDragSession` と同 pattern)。 multi-point 同時 drag は仕様 §scope 外
+/// (将来拡張)、 ここでは単一 point に閉じる。
+#[derive(Clone, Copy, Debug)]
+struct AutomationPointDragSession {
+    /// drag 開始時の point identity (point_idx は frame 内のみ valid だが、 release frame の
+    /// caller 側 `clip.points[idx]` 解決で使う前提で保持)。
+    point: AutomationPointKey,
+    /// drag 開始時の clip-local time_beat (`prev_time_beat` の元、 release commit に乗せる)。
+    anchor_time_beat: f64,
+    /// drag 開始時の value_norm (`prev_value_norm` の元)。
+    anchor_value_norm: f32,
+    /// drag 開始時の clip rect (lane body 内、 縦 padding 適用済)。 overlay の y 軸計算 SSoT。
+    /// view scroll / lane 順序変化が起きても anchor は固定で、 release commit と一貫した値を生成。
+    clip_rect_anchor: Rect,
+    /// drag 開始時の lane body rect (= clip rect の x range parent、 beat_to_px 計算 SSoT)。
+    body_rect_anchor: Rect,
+    /// drag 開始時の clip 範囲 (clamp 用、 `time_beat` を `0.0..=clip.len_beats` に収める)。
+    clip_start_beat: f64,
+    clip_len_beats: f64,
+    anchor_mouse: (f32, f32),
+    last_mouse: (f32, f32),
+    /// drag 中の最終 alt 状態 (snap 一時無効、 `ClipDragSession.last_alt` と同 pattern)。
+    last_alt: bool,
+}
+
+/// M14 Phase 63n-2 (#028): lane header の default value horizontal slider 帯 drag session。
+/// `TrackVolumeDragSession` と同 pattern (per-frame Mutate emit + release Undoable wrap、 ただし
+/// Phase 63n-2 では release で `SetLaneDefault { prev, next }` の単発発火のみで undo は caller 責務)。
+#[derive(Clone, Copy, Debug)]
+struct AutomationLaneDefaultDragSession {
+    lane: AutomationLaneKey,
+    anchor_value_norm: f32,
+    /// drag 開始時の band rect (mouse_x → 0..1 マップ用、 view 変化耐性)。
+    band_rect: Rect,
+    last_mouse_x: f32,
+    /// drag 中に最後に発火した値 (毎 frame 同値発火を抑制、 SetTrackVolume と同 pattern)。
+    last_emitted_value: f32,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ArrangementState {
     clip_drag: Option<ClipDragSession>,
@@ -1463,6 +1589,11 @@ pub(crate) struct ArrangementState {
     /// audio grip > clip drag の priority で起動するため、 既存 ResizeLeft/Right/Move とは
     /// 排他的に動作する。 commit-by-release で release frame に 1 度だけ EditRequest を発火。
     audio_drag: Option<AudioDragSession>,
+    /// M14 Phase 63n-2 (#028): lane 内 point の drag session (release で MoveAutomationPoints 1 件)。
+    automation_point_drag: Option<AutomationPointDragSession>,
+    /// M14 Phase 63n-2 (#028): lane header default value band drag session
+    /// (release で SetLaneDefault 1 件)。
+    automation_lane_default_drag: Option<AutomationLaneDefaultDragSession>,
     /// M14 Phase 63c (#016): 直前の `Single` クリック位置 (= Shift+click 範囲選択の起点)。
     /// caller には公開せず widget 内 SSoT として持つ (piano_roll の note multi-select は anchor
     /// なし設計だったが、 arrangement では daw_01 #009 / #016 で「widget 内 anchor」 が確認されている)。
@@ -2283,6 +2414,291 @@ fn draw_audio_drag_ghost<M: ?Sized + 'static>(
 // M14 Phase 63n-1 (#028): automation lane 描画 helpers
 // ============================================================
 
+/// M14 Phase 63n-2 (#028): lane header の icon / band の rect 一式 (描画 + hit-test の SSoT)。
+/// `header_rect.w < style.automation_lane_header_min_w_px` の極狭幅では `None` (描画 + hit 共に skip)。
+/// icon は描画 push_text の `(left, top)` と一致した正方形 rect (icon_size 角)、 hit zone は
+/// 同 rect で `Rect::contains` 判定で OK (描画と hit の SSoT)。 `default_band_rect` は band_h > 0
+/// かつ header 行高に余裕がある場合のみ `Some`。
+#[derive(Clone, Copy, Debug)]
+pub struct AutomationLaneHeaderLayout {
+    /// `★`/`☆` icon (lane.enabled 切替用、 click で `SetLaneEnabled`)。
+    pub enabled_icon_rect: Rect,
+    /// `[V]` icon (lane.icon_glyph、 click 機能なし = visual only)。
+    pub icon_glyph_rect: Rect,
+    /// `👁` icon (lane.visible 切替用、 click で `SetLaneVisible`)。
+    pub visible_icon_rect: Rect,
+    /// `▣` icon (mute、 Phase 63n-2 では描画のみで click 機能なし)。
+    pub mute_icon_rect: Rect,
+    /// `✕` icon (lane 削除、 click で `DeleteLane`)。
+    pub delete_icon_rect: Rect,
+    /// horizontal slider 帯 (default_value_norm 編集、 drag で `SetLaneDefault`)。
+    /// header 行高が icon + band を載せられない場合は `None`。
+    pub default_band_rect: Option<Rect>,
+}
+
+/// M14 Phase 63n-2 (#028): lane header rect から icon / band の sub-rect 群を計算。
+/// `draw_automation_lane` と完全同一の配置式 (描画と hit の SSoT)。 widget 内部 hit-test と
+/// 外部 test の両方で使うため `pub`。
+#[must_use]
+pub fn automation_lane_header_layout(
+    header_rect: Rect,
+    style: &ArrangementStyle,
+) -> Option<AutomationLaneHeaderLayout> {
+    if header_rect.w < style.automation_lane_header_min_w_px {
+        return None;
+    }
+    let pad = 4.0_f32;
+    let icon_size = style.automation_lane_icon_size.max(4.0);
+    let cx = header_rect.x + pad;
+    let cy = header_rect.y + (header_rect.h - icon_size).max(0.0) * 0.5;
+    let enabled_icon_rect = Rect { x: cx, y: cy, w: icon_size, h: icon_size };
+    let icon_glyph_rect = Rect {
+        x: cx + icon_size + pad,
+        y: cy,
+        w: icon_size,
+        h: icon_size,
+    };
+    // 右寄せ: ✕ → ▣ → 👁 の順で右から左へ配置 (描画ループ `icons.iter().rev()` と同じ式)。
+    let step = icon_size + pad * 0.5;
+    let delete_x = header_rect.x + header_rect.w - pad - step;
+    let mute_x = delete_x - step;
+    let visible_x = mute_x - step;
+    let visible_icon_rect = Rect { x: visible_x, y: cy, w: icon_size, h: icon_size };
+    let mute_icon_rect = Rect { x: mute_x, y: cy, w: icon_size, h: icon_size };
+    let delete_icon_rect = Rect { x: delete_x, y: cy, w: icon_size, h: icon_size };
+
+    // band: header 行下端から pad だけ上、 cy + icon_size より下に band 自身が収まるなら Some。
+    let band_h = style.automation_default_band_h;
+    let band_y = header_rect.y + header_rect.h - band_h - pad;
+    let band_x = cx;
+    let band_w = (header_rect.w - pad * 2.0).max(0.0);
+    let default_band_rect = if band_h > 0.0 && band_w > 0.0 && band_y >= cy + icon_size {
+        Some(Rect { x: band_x, y: band_y, w: band_w, h: band_h })
+    } else {
+        None
+    };
+
+    Some(AutomationLaneHeaderLayout {
+        enabled_icon_rect,
+        icon_glyph_rect,
+        visible_icon_rect,
+        mute_icon_rect,
+        delete_icon_rect,
+        default_band_rect,
+    })
+}
+
+/// M14 Phase 63n-2 (#028): visible track の expanded automation lane を順に visit する pure helper。
+/// `header_pane_x` / `header_pane_w` は track header 領域の x 範囲 (= `view.header_w == 0` で
+/// header 無し)、 `lanes_x` / `lanes_w` は clip 描画域。 callback には `(track_idx, lane_idx,
+/// lane, header_rect, body_rect)` を渡す。 描画 / hit-test / drag press の SSoT (3 箇所が同じ式
+/// で同じ lane y 範囲を計算するための共有)。
+#[allow(clippy::too_many_arguments)]
+fn for_each_visible_lane<F>(
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
+    track_row_h: f32,
+    header_pane_x: f32,
+    header_pane_w: f32,
+    lanes_x: f32,
+    lanes_w: f32,
+    style: &ArrangementStyle,
+    mut f: F,
+) where
+    F: FnMut(usize, usize, &ArrangementAutomationLane, Rect, Rect),
+{
+    for (i, t) in visible_tracks.iter().enumerate() {
+        if t.automation_lanes_collapsed || t.automation_lanes.is_empty() {
+            continue;
+        }
+        let track_row_top = tops[i];
+        let mut lane_y = track_row_top + track_row_h;
+        let header_indent = f32::from(t.depth) * style.indent_px;
+        for (j, lane) in t.automation_lanes.iter().enumerate() {
+            if !lane.visible {
+                continue;
+            }
+            let lh = f32::from(lane.height_px);
+            let header_rect = Rect {
+                x: header_pane_x + header_indent,
+                y: lane_y,
+                w: (header_pane_w - header_indent).max(2.0),
+                h: lh,
+            };
+            let body_rect = Rect { x: lanes_x, y: lane_y, w: lanes_w, h: lh };
+            f(i, j, lane, header_rect, body_rect);
+            lane_y += lh;
+        }
+    }
+}
+
+/// M14 Phase 63n-2 (#028): lane body 内 cursor 位置から hit する point を返す (後勝ち、 描画順と整合)。
+/// 戻り値の `Rect` は popup anchor 用 point dot rect (= `lane_disclosure_rect_for` 同様)。
+/// hit zone は **point dot 半径の 2 倍** (= 8px @ default radius=4) で生成、 fingertip 操作の余裕を持たせる。
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn automation_point_at(
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
+    track_row_h: f32,
+    view: ArrangementView,
+    header_pane_x: f32,
+    header_pane_w: f32,
+    lanes: Rect,
+    cx: f32,
+    cy: f32,
+    style: &ArrangementStyle,
+) -> Option<(AutomationPointKey, Rect)> {
+    if !lanes.contains(cx, cy) {
+        return None;
+    }
+    let radius = style.automation_point_radius_px.max(2.0);
+    let hit_r2 = (radius * 2.0).powi(2);
+    let mut hit: Option<(AutomationPointKey, Rect)> = None;
+    for_each_visible_lane(
+        visible_tracks,
+        tops,
+        track_row_h,
+        header_pane_x,
+        header_pane_w,
+        lanes.x,
+        lanes.w,
+        style,
+        |t_idx, _l_idx, lane, _h_rect, body_rect| {
+            if cy < body_rect.y || cy >= body_rect.y + body_rect.h {
+                return;
+            }
+            let track_id = visible_tracks[t_idx].id;
+            let beat_to_px = f64::from(body_rect.w) / view.len_beats.max(1e-6);
+            let pad = style.automation_clip_v_pad_px;
+            let clip_y = body_rect.y + pad;
+            let clip_h = (body_rect.h - pad * 2.0).max(2.0);
+            for clip_in in &lane.clips {
+                for (p_idx, p) in clip_in.points.iter().enumerate() {
+                    let abs_beat = clip_in.start_beat + p.time_beat;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let px = body_rect.x + ((abs_beat - view.start_beat) * beat_to_px) as f32;
+                    let py = clip_y + (1.0 - p.value_norm.clamp(0.0, 1.0)) * clip_h;
+                    let dx = cx - px;
+                    let dy = cy - py;
+                    if dx * dx + dy * dy <= hit_r2 {
+                        let key = AutomationPointKey {
+                            clip: AutomationClipKey {
+                                track: track_id,
+                                lane: lane.id,
+                                clip: clip_in.id,
+                            },
+                            #[allow(clippy::cast_possible_truncation)]
+                            point_idx: p_idx as u32,
+                        };
+                        let r = Rect {
+                            x: px - radius,
+                            y: py - radius,
+                            w: radius * 2.0,
+                            h: radius * 2.0,
+                        };
+                        hit = Some((key, r));
+                    }
+                }
+            }
+        },
+    );
+    hit
+}
+
+/// M14 Phase 63n-2 (#028): lane body 内 cursor から該当する `(track_idx, lane_idx, header_rect,
+/// body_rect)` を返す。 `for_each_visible_lane` を 1 度走らせて y 範囲が合う最初の lane を採用
+/// (lane 群は y で disjoint なので「最初」 = 「唯一」)。 cursor が lane 内にいるかどうかの判定で
+/// header_rect / body_rect 共通の y 範囲だけを見る (x は header / body 跨ぎでも lane 1 つ)。
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn automation_lane_at(
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
+    track_row_h: f32,
+    header_pane_x: f32,
+    header_pane_w: f32,
+    lanes_x: f32,
+    lanes_w: f32,
+    style: &ArrangementStyle,
+    cy: f32,
+) -> Option<(usize, usize, Rect, Rect)> {
+    let mut found: Option<(usize, usize, Rect, Rect)> = None;
+    for_each_visible_lane(
+        visible_tracks,
+        tops,
+        track_row_h,
+        header_pane_x,
+        header_pane_w,
+        lanes_x,
+        lanes_w,
+        style,
+        |t_idx, l_idx, _lane, h_rect, b_rect| {
+            if found.is_some() {
+                return;
+            }
+            if cy >= h_rect.y && cy < h_rect.y + h_rect.h {
+                found = Some((t_idx, l_idx, h_rect, b_rect));
+            }
+        },
+    );
+    found
+}
+
+/// M14 Phase 63n-2 (#028): visible track 群から `(track_id, lane_id, clip_id)` 三つ組で対応する
+/// `(lane, clip)` 参照を取得する pure helper。 press / release で何度も lookup するため、 関数化
+/// しないと if let 連鎖が press block を膨らませる。
+#[must_use]
+fn find_lane_clip(
+    visible_tracks: &[ArrangementTrack],
+    key: AutomationClipKey,
+) -> Option<(&ArrangementAutomationLane, &ArrangementAutomationClip)> {
+    let track = visible_tracks.iter().find(|t| t.id == key.track)?;
+    let lane = track.automation_lanes.iter().find(|l| l.id == key.lane)?;
+    let clip = lane.clips.iter().find(|c| c.id == key.clip)?;
+    Some((lane, clip))
+}
+
+/// M14 Phase 63n-2 (#028): lane body 内 cursor から hit する automation clip を返す。
+/// 戻り値: `(clip_key, clip_local_time_beat, value_norm)` (clip_local_time_beat は clip start から
+/// のオフセット拍、 value_norm は cy 座標から逆算した `0.0..=1.0`)。 cursor が clip ギャップ内なら
+/// `None` (空き click では空気穴 = caller 側で `AddAutomationPoint` 発行しない)。
+fn automation_clip_at(
+    track_id: u32,
+    lane: &ArrangementAutomationLane,
+    body_rect: Rect,
+    view: ArrangementView,
+    style: &ArrangementStyle,
+    cx: f32,
+    cy: f32,
+) -> Option<(AutomationClipKey, f64, f32)> {
+    let beat_to_px = f64::from(body_rect.w) / view.len_beats.max(1e-6);
+    let pad = style.automation_clip_v_pad_px;
+    let clip_y = body_rect.y + pad;
+    let clip_h = (body_rect.h - pad * 2.0).max(2.0);
+    if cy < clip_y || cy >= clip_y + clip_h {
+        return None;
+    }
+    for clip in &lane.clips {
+        #[allow(clippy::cast_possible_truncation)]
+        let cx_clip = body_rect.x + ((clip.start_beat - view.start_beat) * beat_to_px) as f32;
+        #[allow(clippy::cast_possible_truncation)]
+        let cw = ((clip.len_beats * beat_to_px) as f32).max(2.0);
+        if cx >= cx_clip && cx < cx_clip + cw {
+            let abs_beat = view.start_beat + f64::from(cx - body_rect.x) / beat_to_px;
+            let local = (abs_beat - clip.start_beat).clamp(0.0, clip.len_beats);
+            let value_norm = (1.0 - (cy - clip_y) / clip_h).clamp(0.0, 1.0);
+            let key = AutomationClipKey {
+                track: track_id,
+                lane: lane.id,
+                clip: clip.id,
+            };
+            return Some((key, local, value_norm));
+        }
+    }
+    None
+}
+
 /// 単一 segment (前 point → 次 point) を Catmull-Rom + tension で flatten。
 /// `kind` が `Hold` なら階段 (前値で水平 → 次 point の x で垂直)、 `Linear` なら直線、
 /// `Bezier { tension }` なら Catmull-Rom (tension は端点の引き / 反り具合)。
@@ -2432,76 +2848,74 @@ fn draw_automation_lane<M: ?Sized + 'static>(
         style.automation_lane_bg,
     );
 
-    // ---- header: ★ icon label slider 帯 👁▣✕ (描画のみ、 hit-test は -2 以降) ----
+    // ---- header: ★ icon label slider 帯 👁▣✕ (描画 + Phase 63n-2 hit-test 対応) ----
+    // M14 Phase 63n-2 (#028): 描画と hit-test の SSoT を `automation_lane_header_layout` に集約。
+    // header_rect.w が極狭の場合 (`< automation_lane_header_min_w_px`) は layout が `None` で描画 skip。
     let curve_color = if lane.enabled {
         lane.color
     } else {
         style.automation_lane_disabled_color
     };
-    if header_rect.w >= style.automation_lane_header_min_w_px {
+    if let Some(layout) = automation_lane_header_layout(header_rect, style) {
+        let icon_size = style.automation_lane_icon_size.max(4.0);
         let pad = 4.0_f32;
-        let icon_size = style.automation_lane_icon_size;
-        let cx = header_rect.x + pad;
-        let cy = header_rect.y + (header_rect.h - icon_size).max(0.0) * 0.5;
-        // ★ enabled marker — 灰色で描く (Phase 63n-1 では click 不可、 visual のみ)
+        // ★ enabled marker (lane.enabled で星塗りつぶし切替)
         hctx.push_text(GlyphArea {
             text: Arc::from(if lane.enabled { "★" } else { "☆" }),
-            left: cx,
-            top: cy,
+            left: layout.enabled_icon_rect.x,
+            top: layout.enabled_icon_rect.y,
             font_size: icon_size,
             line_height: icon_size * 1.2,
             color: style.automation_lane_text_color,
             clip_rect: Some(header_rect),
         });
-        // [V] icon glyph
-        let icon_x = cx + icon_size + pad;
+        // [V] icon glyph (lane.icon_glyph、 lane 識別色)
         hctx.push_text(GlyphArea {
             text: Arc::from(lane.icon_glyph.to_string()),
-            left: icon_x,
-            top: cy,
+            left: layout.icon_glyph_rect.x,
+            top: layout.icon_glyph_rect.y,
             font_size: icon_size,
             line_height: icon_size * 1.2,
             color: lane.color,
             clip_rect: Some(header_rect),
         });
-        // label
-        let label_x = icon_x + icon_size + pad;
+        // label (icon_glyph の右、 visible_icon の左までの帯)
+        let label_x = layout.icon_glyph_rect.x + layout.icon_glyph_rect.w + pad;
+        let label_clip = Rect {
+            x: label_x,
+            y: header_rect.y,
+            w: (layout.visible_icon_rect.x - label_x - pad).max(0.0),
+            h: header_rect.h,
+        };
         hctx.push_text(GlyphArea {
             text: Arc::clone(&lane.label),
             left: label_x,
-            top: cy,
+            top: layout.icon_glyph_rect.y,
             font_size: icon_size,
             line_height: icon_size * 1.2,
             color: style.automation_lane_text_color,
-            clip_rect: Some(header_rect),
+            clip_rect: Some(label_clip),
         });
-        // default value slider 帯 (label の下、 horizontal、 Phase 63n-1 は描画のみ)
-        let band_h = style.automation_default_band_h;
-        let band_y = header_rect.y + header_rect.h - band_h - pad;
-        let band_x = cx;
-        let band_w = (header_rect.w - pad * 2.0).max(0.0);
-        if band_h > 0.0 && band_w > 0.0 && band_y >= cy + icon_size {
+        // default value slider 帯 (band_rect が `Some` の場合のみ、 行高に余裕がある時)
+        if let Some(band) = layout.default_band_rect {
+            push_filled_rect(hctx, band, style.track_volume_band_track);
+            let fill_w = band.w * lane.default_value_norm.clamp(0.0, 1.0);
             push_filled_rect(
                 hctx,
-                Rect { x: band_x, y: band_y, w: band_w, h: band_h },
-                style.track_volume_band_track,
-            );
-            let fill_w = band_w * lane.default_value_norm.clamp(0.0, 1.0);
-            push_filled_rect(
-                hctx,
-                Rect { x: band_x, y: band_y, w: fill_w, h: band_h },
+                Rect { x: band.x, y: band.y, w: fill_w, h: band.h },
                 style.track_volume_band_fill,
             );
         }
-        // 👁▣✕ icon 群 (右寄せ、 Phase 63n-1 は描画のみ — 真っ黒/grey で sketchy 表現)
-        let icons = ['👁', '▣', '✕'];
-        let mut rx = header_rect.x + header_rect.w - pad;
-        for &g in icons.iter().rev() {
-            rx -= icon_size + pad * 0.5;
+        // 右寄せ icon 群 (👁 ▣ ✕、 Phase 63n-2 で hit-test 対応)
+        for &(g, r) in &[
+            ('👁', layout.visible_icon_rect),
+            ('▣', layout.mute_icon_rect),
+            ('✕', layout.delete_icon_rect),
+        ] {
             hctx.push_text(GlyphArea {
                 text: Arc::from(g.to_string()),
-                left: rx,
-                top: cy,
+                left: r.x,
+                top: r.y,
                 font_size: icon_size,
                 line_height: icon_size * 1.2,
                 color: style.automation_lane_text_color,
@@ -2775,6 +3189,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // M14 Phase 63n-1 (#028): track 行右端の lane disclosure click 検出。 press block 終了後に
         // `ToggleTrackAutomationCollapsed { track }` を 1 度発行 (`press_seek_beat` と同パターン)。
         let mut press_lane_toggle: Option<u32> = None;
+        // M14 Phase 63n-2 (#028): lane header の icon click action。 press block 終了後に push_edit。
+        // None で何も起きず、 Some で 1 度発行 (重複 click は最初の lane を優先 = early break)。
+        let mut press_lane_button: Option<ArrangementEditRequest> = None;
+        // M14 Phase 63n-2 (#028): Alt+click on point → DeleteAutomationPoints の引数。
+        let mut press_delete_point: Option<ArrangementEditRequest> = None;
         if pointer.primary_just_pressed
             && let Some((px, py)) = pointer.pos
         {
@@ -2931,6 +3350,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             //  - volume band 内 → TrackVolumeDragSession (priority 最高)
             //  - 上記以外 + Name button area を含む row + M/S/Up/Dn/Del button rect 非 hit → reorder
             //  - 16px 未満 drag は release で click 格下げ (button_at の SelectTrack / ↑↓ button が代替)
+            // M14 Phase 63n-2 (#028): track 行 と lane 行 で分岐。 lane 行 (= track 行下、 expanded のみ)
+            // では lane header button (★/👁/✕) と default band drag を扱う。
             if header_w > 0.0
                 && header_pane.contains(px, py)
                 && let Some(idx) = track_index_from_y(py, header_pane.y, &press_tops)
@@ -2938,51 +3359,195 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             {
                 // header_pane.y と lanes.y は同じ値 (rect 分割で y 軸 origin 共通) なので press_tops を共有可。
                 let row_top = press_tops[idx];
-                let row =
-                    Rect { x: header_pane.x, y: row_top, w: header_pane.w, h: view.track_row_h };
-                let layout = header_row_layout(row, style.track_volume_band_h);
-                if let Some(band) = layout.volume_band
-                    && band.contains(px, py)
-                {
-                    let av = t.volume.clamp(0.0, 1.0);
-                    let state: &mut ArrangementState = self.widget_state(wid);
-                    state.track_volume_drag = Some(TrackVolumeDragSession {
-                        track_id: t.id,
-                        anchor_volume: av,
-                        band_rect: band,
-                        last_mouse_x: px,
-                        last_emitted_volume: av,
-                    });
-                } else {
-                    let in_small_button = layout.buttons.iter().any(|b| b.contains(px, py));
-                    // M14 Phase 63c (#016): disclosure rect の click は track_reorder セッションを
-                    // 起動しない (折り畳み toggle のみ、 release frame 別経路で Edit 発行)。
-                    let in_disclosure = is_group_set.contains(&t.id)
-                        && disclosure_rect_for(layout.name_rect, style, t.depth)
-                            .contains(px, py);
-                    // M14 Phase 63n-1 (#028): track 行右端の lane disclosure (▶/▼) hit zone。
-                    // `automation_lanes.is_empty()` の track は描画しない → click にも反応しない。
-                    // priority は group disclosure と同様 reorder セッションより高い (toggle 専用)。
-                    let in_lane_disclosure = !t.automation_lanes.is_empty()
-                        && lane_disclosure_rect_for(row, style).contains(px, py);
-                    if in_lane_disclosure {
-                        press_lane_toggle = Some(t.id);
-                    } else if !in_small_button && !in_disclosure {
-                        // M14 Phase 63c (#016): multi-select 中の drag は selected_tracks をまとめて
-                        // 移動するため、 source_track_ids に selected を全部入れる (clicked が selected
-                        // に含まれていなければ単独 drag = `vec![clicked]`)。
-                        let source_ids: Vec<u32> = if selected_tracks.contains(&t.id) {
-                            selected_tracks.to_vec()
-                        } else {
-                            vec![t.id]
-                        };
+                let track_row_bottom = row_top + view.track_row_h;
+                if py < track_row_bottom {
+                    // === track row press (既存ロジック) ===
+                    let row =
+                        Rect { x: header_pane.x, y: row_top, w: header_pane.w, h: view.track_row_h };
+                    let layout = header_row_layout(row, style.track_volume_band_h);
+                    if let Some(band) = layout.volume_band
+                        && band.contains(px, py)
+                    {
+                        let av = t.volume.clamp(0.0, 1.0);
                         let state: &mut ArrangementState = self.widget_state(wid);
-                        state.track_reorder = Some(TrackReorderSession {
-                            anchor_track_id: t.id,
-                            anchor_index: idx,
-                            source_track_ids: source_ids,
-                            anchor_mouse_y: py,
-                            last_mouse_y: py,
+                        state.track_volume_drag = Some(TrackVolumeDragSession {
+                            track_id: t.id,
+                            anchor_volume: av,
+                            band_rect: band,
+                            last_mouse_x: px,
+                            last_emitted_volume: av,
+                        });
+                    } else {
+                        let in_small_button = layout.buttons.iter().any(|b| b.contains(px, py));
+                        // M14 Phase 63c (#016): disclosure rect の click は track_reorder セッションを
+                        // 起動しない (折り畳み toggle のみ、 release frame 別経路で Edit 発行)。
+                        let in_disclosure = is_group_set.contains(&t.id)
+                            && disclosure_rect_for(layout.name_rect, style, t.depth)
+                                .contains(px, py);
+                        // M14 Phase 63n-1 (#028) + 63n-2 修正: lane disclosure hit zone は
+                        // **`layout.lane_disc_rect`** を使う (S button の **右**、 button と非 overlap)。
+                        // 旧 `lane_disclosure_rect_for(row, style)` (= track 行の右端内側) は S button
+                        // と完全 overlap して描画後勝ちで `+`/`-` が覆われる bug 持ちだった (#028 user
+                        // feedback で「`+`/`-` が見えない」)。 layout SSoT に統一して描画と hit-test
+                        // が同 rect を参照する。
+                        let in_lane_disclosure = !t.automation_lanes.is_empty()
+                            && layout.lane_disc_rect.contains(px, py);
+                        if in_lane_disclosure {
+                            press_lane_toggle = Some(t.id);
+                        } else if !in_small_button && !in_disclosure {
+                            // M14 Phase 63c (#016): multi-select 中の drag は selected_tracks をまとめて
+                            // 移動するため、 source_track_ids に selected を全部入れる (clicked が selected
+                            // に含まれていなければ単独 drag = `vec![clicked]`)。
+                            let source_ids: Vec<u32> = if selected_tracks.contains(&t.id) {
+                                selected_tracks.to_vec()
+                            } else {
+                                vec![t.id]
+                            };
+                            let state: &mut ArrangementState = self.widget_state(wid);
+                            state.track_reorder = Some(TrackReorderSession {
+                                anchor_track_id: t.id,
+                                anchor_index: idx,
+                                source_track_ids: source_ids,
+                                anchor_mouse_y: py,
+                                last_mouse_y: py,
+                            });
+                        }
+                    }
+                } else if !t.automation_lanes_collapsed && !t.automation_lanes.is_empty() {
+                    // === lane header press (新規 Phase 63n-2) ===
+                    // lane 群を上から積んで cursor py が当たる lane を見つけ、 button rect / default
+                    // band rect を判定する。 invisible lane は積まない。
+                    let header_indent = f32::from(t.depth) * style.indent_px;
+                    let mut lane_y = track_row_bottom;
+                    for lane in &t.automation_lanes {
+                        if !lane.visible {
+                            continue;
+                        }
+                        let lh = f32::from(lane.height_px);
+                        if py >= lane_y && py < lane_y + lh {
+                            let header_rect = Rect {
+                                x: header_pane.x + header_indent,
+                                y: lane_y,
+                                w: (header_pane.w - header_indent).max(2.0),
+                                h: lh,
+                            };
+                            let lane_key = AutomationLaneKey { track: t.id, lane: lane.id };
+                            if let Some(layout) = automation_lane_header_layout(header_rect, style)
+                            {
+                                if layout.enabled_icon_rect.contains(px, py) {
+                                    press_lane_button = Some(
+                                        ArrangementEditRequest::SetLaneEnabled {
+                                            lane: lane_key,
+                                            enabled: !lane.enabled,
+                                        },
+                                    );
+                                } else if layout.visible_icon_rect.contains(px, py) {
+                                    press_lane_button = Some(
+                                        ArrangementEditRequest::SetLaneVisible {
+                                            lane: lane_key,
+                                            visible: !lane.visible,
+                                        },
+                                    );
+                                } else if layout.delete_icon_rect.contains(px, py) {
+                                    press_lane_button =
+                                        Some(ArrangementEditRequest::DeleteLane(lane_key));
+                                } else if let Some(band) = layout.default_band_rect
+                                    && band.contains(px, py)
+                                {
+                                    let initial = volume_from_mouse_x(px, band.x, band.w);
+                                    let state: &mut ArrangementState = self.widget_state(wid);
+                                    state.automation_lane_default_drag =
+                                        Some(AutomationLaneDefaultDragSession {
+                                            lane: lane_key,
+                                            anchor_value_norm: lane
+                                                .default_value_norm
+                                                .clamp(0.0, 1.0),
+                                            band_rect: band,
+                                            last_mouse_x: px,
+                                            last_emitted_value: initial,
+                                        });
+                                }
+                            }
+                            break;
+                        }
+                        lane_y += lh;
+                    }
+                }
+            }
+
+            // M14 Phase 63n-2 (#028): lane body (= clip 描画域、 lanes rect 内) の press 振り分け。
+            // priority: point hit (Alt → 即時 delete / 通常 → drag session)。 single click on empty は
+            // selection clear / 空き選択用に確保 (Bitwig / Live と同 UX)。 AddAutomationPoint は
+            // **double click** 経由で発火 (既存 `take_double_click_in_rect` block で分岐)。
+            // audio_grip / clip_drag (上で MIDI/Audio 行を既に処理済) は track row の y range 内のみ
+            // 作動するため lane body と排他。
+            if in_lanes
+                && !shift
+                && !ctrl
+                && let Some((point_key, _r)) = automation_point_at(
+                    &visible_tracks,
+                    &press_tops,
+                    view.track_row_h,
+                    view,
+                    header_pane.x,
+                    header_pane.w,
+                    lanes,
+                    px,
+                    py,
+                    style,
+                )
+            {
+                if pointer.modifiers.alt {
+                    // Alt + click on point → 即時 DeleteAutomationPoints (commit-by-release なし)
+                    press_delete_point = Some(ArrangementEditRequest::DeleteAutomationPoints(
+                        vec![point_key],
+                    ));
+                } else if let Some((lane, clip_in)) =
+                    find_lane_clip(&visible_tracks, point_key.clip)
+                {
+                    // 通常 click on point → drag session 起動 (release で MoveAutomationPoints)
+                    let p_idx = point_key.point_idx as usize;
+                    if let Some(p) = lane
+                        .clips
+                        .iter()
+                        .find(|c| c.id == point_key.clip.clip)
+                        .and_then(|c| c.points.get(p_idx))
+                        && let Some((_t_idx, _l_idx, _h_rect, body_rect)) = automation_lane_at(
+                            &visible_tracks,
+                            &press_tops,
+                            view.track_row_h,
+                            header_pane.x,
+                            header_pane.w,
+                            lanes.x,
+                            lanes.w,
+                            style,
+                            py,
+                        )
+                    {
+                        let beat_to_px = f64::from(lanes.w) / view.len_beats.max(1e-6);
+                        let pad = style.automation_clip_v_pad_px;
+                        let clip_y = body_rect.y + pad;
+                        let clip_h = (body_rect.h - pad * 2.0).max(2.0);
+                        #[allow(clippy::cast_possible_truncation)]
+                        let cx_clip = body_rect.x
+                            + ((clip_in.start_beat - view.start_beat) * beat_to_px) as f32;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let cw = ((clip_in.len_beats * beat_to_px) as f32).max(2.0);
+                        let clip_rect_anchor =
+                            Rect { x: cx_clip, y: clip_y, w: cw, h: clip_h };
+                        let press_alt = pointer.modifiers.alt;
+                        let state: &mut ArrangementState = self.widget_state(wid);
+                        state.automation_point_drag = Some(AutomationPointDragSession {
+                            point: point_key,
+                            anchor_time_beat: p.time_beat,
+                            anchor_value_norm: p.value_norm,
+                            clip_rect_anchor,
+                            body_rect_anchor: body_rect,
+                            clip_start_beat: clip_in.start_beat,
+                            clip_len_beats: clip_in.len_beats,
+                            anchor_mouse: (px, py),
+                            last_mouse: (px, py),
+                            last_alt: press_alt,
                         });
                     }
                 }
@@ -2999,6 +3564,22 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 ArrangementEditRequest::ToggleTrackAutomationCollapsed { track },
             ));
         }
+        // M14 Phase 63n-2 (#028): lane header button (★/👁/✕) の click を 1 度発行。
+        if let Some(req) = press_lane_button {
+            self.push_edit(make_edit(req));
+        }
+        // M14 Phase 63n-2 (#028): Alt+click on point → DeleteAutomationPoints を 1 度発行 (即時)。
+        if let Some(req) = press_delete_point {
+            self.push_edit(make_edit(req));
+        }
+
+        // M14 Phase 63n-2 (#028): 右クリック on point の context menu は **caller 責務**。
+        // widget は `response.automation_point_rects: Vec<(AutomationPointKey, Rect)>` を毎 frame
+        // 返し (clip_rects と同 idiom)、 caller は loop で `context_menu_for(*rect, &["Hold",
+        // "Linear", "Bezier"], ...)` を呼ぶ。 widget 内で secondary press を消費する旧設計は popup の
+        // anchor_rect が **右クリック frame だけ Some** で次 frame 以降 caller が context_menu_for を
+        // 呼ばないため popup state が消える bug を持っていた (= 一瞬で popup が閉じる)。 #028 §11.4
+        // で確定した「caller が anchor を毎 frame 呼ぶ」 idiom に統一。
 
         // ---- drag continue / release 検出 ----
         // drag 中なら continuation frame で `last_mouse` / `last_alt` (および各 drag の last_*) を
@@ -3073,6 +3654,50 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         ad.locked_horizontal = Some(dx >= dy);
                     }
                 }
+            }
+            // M14 Phase 63n-2 (#028): automation_point_drag continuation で last_mouse + last_alt を update。
+            // release frame は last_mouse は pointer.pos != anchor_mouse のときのみ update (clip_drag と
+            // 同 pattern: winit が release で press 位置に戻すケースを回避)、 last_alt は release では
+            // 保持 (ModifiersChanged が MouseInput より先に届く race を回避)。
+            if let Some(ref mut ad) = state.automation_point_drag {
+                if !is_release {
+                    ad.last_mouse = (px, py);
+                    ad.last_alt = alt_now;
+                } else if (px, py) != ad.anchor_mouse {
+                    ad.last_mouse = (px, py);
+                }
+            }
+            // M14 Phase 63n-2 (#028): automation_lane_default_drag continuation で last_mouse_x を update
+            // (TrackVolumeDragSession と同 pattern、 release frame は per-frame emit ブロックで処理)。
+            if let Some(ref mut ld) = state.automation_lane_default_drag
+                && !is_release
+            {
+                ld.last_mouse_x = px;
+            }
+        }
+
+        // M14 Phase 63n-2 (#028): automation_lane_default_drag の per-frame live update
+        // (TrackVolumeDragSession と同 pattern)。 drag 中は live preview を caller に流す + 同値抑制。
+        if let Some((px, _py)) = pointer.pos
+            && !pointer.primary_just_released
+        {
+            let mut emit: Option<(AutomationLaneKey, f32, f32)> = None;
+            {
+                let state: &mut ArrangementState = self.widget_state(wid);
+                if let Some(ref mut ld) = state.automation_lane_default_drag {
+                    let next = volume_from_mouse_x(px, ld.band_rect.x, ld.band_rect.w);
+                    if (next - ld.last_emitted_value).abs() > 1e-4 {
+                        emit = Some((ld.lane, ld.anchor_value_norm, next));
+                        ld.last_emitted_value = next;
+                    }
+                }
+            }
+            if let Some((lane, prev, next)) = emit {
+                self.push_edit(make_edit(ArrangementEditRequest::SetLaneDefault {
+                    lane,
+                    prev,
+                    next,
+                }));
             }
         }
 
@@ -3311,6 +3936,33 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             None
         };
 
+        // M14 Phase 63n-2 (#028): automation_point_drag overlay clone + release take。
+        let point_drag_session: Option<AutomationPointDragSession> = {
+            let state: &mut ArrangementState = self.widget_state(wid);
+            state.automation_point_drag
+        };
+        let point_drag_release: Option<AutomationPointDragSession> =
+            if pointer.primary_just_released {
+                let state: &mut ArrangementState = self.widget_state(wid);
+                state.automation_point_drag.take()
+            } else {
+                None
+            };
+
+        // M14 Phase 63n-2 (#028): automation_lane_default_drag overlay clone + release take。
+        // overlay は draw_automation_lane の band fill を上書きする (cached 外、 drag 中のみ)。
+        let lane_default_drag_session: Option<AutomationLaneDefaultDragSession> = {
+            let state: &mut ArrangementState = self.widget_state(wid);
+            state.automation_lane_default_drag
+        };
+        let lane_default_drag_release: Option<AutomationLaneDefaultDragSession> =
+            if pointer.primary_just_released {
+                let state: &mut ArrangementState = self.widget_state(wid);
+                state.automation_lane_default_drag.take()
+            } else {
+                None
+            };
+
         // drag overlay delta (last_mouse ベース、release と一貫)。
         // M14 Phase 63j (#024): `beat_per_px` / `zoom_x_px_per_beat` は関数頭で計算済 (press 振り分けの
         // playhead seek snap でも使うため)。 ここでは shadow せず再利用する。
@@ -3453,6 +4105,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // M14 Phase 63k (#025): audio_drag overlay 用 clone (heavy closure に move)。
         // ghost (drag 中の preview line / fade envelope / label) は cached 外で描画する。
         let audio_drag_overlay = audio_drag_session;
+        // M14 Phase 63n-2 (#028): point_drag / lane_default_drag の overlay 用 clone (heavy closure
+        // に move)。 point ghost は drag 中の preview を新位置に上書き、 band fill は drag 中の
+        // last_emitted_value で塗り直し (cached 内描画は anchor 値のままなので cached 外で被せる)。
+        let point_drag_overlay = point_drag_session;
+        let lane_default_drag_overlay = lane_default_drag_session;
         // M9 Phase 45f: drag overlay の Resize min_len は snap unit (snap_unit < 0.05 なら 0.05)。
         // release 側 min_len と一貫させるため、 alt 真値は drag session の `last_alt` を使う
         // (overlay と release commit が必ず同一 unit で確定する)。 overlay 不在時 (drag していない)
@@ -3669,6 +4326,56 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // ghost が上に重なって最新値を user に見せる。
             if let Some(ad) = audio_drag_overlay {
                 draw_audio_drag_ghost(hctx, &ad, beat_per_px, &style_copy);
+            }
+            // M14 Phase 63n-2 (#028): automation_lane_default_drag overlay (band fill width 上書き)。
+            // cached 内で描画される base band fill は `lane.default_value_norm` の anchor 値、 drag 中は
+            // `last_emitted_value` で塗り直して live preview を user に見せる (TrackVolumeDragSession の
+            // header band と同 pattern)。 trough は cached 内のままで、 fill rect だけ上書き。
+            if let Some(ld) = lane_default_drag_overlay {
+                let preview = volume_from_mouse_x(ld.last_mouse_x, ld.band_rect.x, ld.band_rect.w);
+                push_filled_rect(
+                    hctx,
+                    Rect {
+                        x: ld.band_rect.x,
+                        y: ld.band_rect.y,
+                        w: ld.band_rect.w * preview,
+                        h: ld.band_rect.h,
+                    },
+                    style_copy.track_volume_band_fill,
+                );
+            }
+            // M14 Phase 63n-2 (#028): automation_point_drag ghost (新位置の point dot を半透明で重ねる)。
+            // anchor 固定の `body_rect_anchor` / `clip_rect_anchor` で beat_to_px / y 軸を計算 (drag
+            // 中の view scroll 耐性)。 release commit と同じ式で next position を出すため SSoT を
+            // 共有 (commit と overlay が同一値で確定)。 alt は session の `last_alt` を真値とする。
+            if let Some(pd) = point_drag_overlay {
+                let dx = pd.last_mouse.0 - pd.anchor_mouse.0;
+                let dy = pd.last_mouse.1 - pd.anchor_mouse.1;
+                let beat_to_px =
+                    f64::from(pd.body_rect_anchor.w) / view_copy.len_beats.max(1e-6);
+                let raw_dt = f64::from(dx) / beat_to_px;
+                let raw_abs = pd.clip_start_beat + pd.anchor_time_beat + raw_dt;
+                let snapped_abs =
+                    view_copy.snap.snap_beat(raw_abs, pd.last_alt, zoom_x_px_per_beat);
+                let next_local =
+                    (snapped_abs - pd.clip_start_beat).clamp(0.0, pd.clip_len_beats.max(0.0));
+                let next_value = (pd.anchor_value_norm
+                    - dy / pd.clip_rect_anchor.h.max(1.0))
+                .clamp(0.0, 1.0);
+                let abs_beat = pd.clip_start_beat + next_local;
+                #[allow(clippy::cast_possible_truncation)]
+                let px = pd.body_rect_anchor.x
+                    + ((abs_beat - view_copy.start_beat) * beat_to_px) as f32;
+                let py = pd.clip_rect_anchor.y + (1.0 - next_value) * pd.clip_rect_anchor.h;
+                let r = style_copy.automation_point_radius_px;
+                hctx.push_rect(RectCommand {
+                    rect: Rect { x: px - r, y: py - r, w: r * 2.0, h: r * 2.0 },
+                    fill: style_copy.clip_selected_fill,
+                    border: Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+                    border_width: 1.5,
+                    radius: [r; 4],
+                    clip_rect: Some(pd.body_rect_anchor),
+                });
             }
             // loop band: drag preview がある場合は preview を描く、無ければ view.loop_range
             if let Some(range) = loop_preview_clone.or(view_copy.loop_range) {
@@ -3897,6 +4604,59 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
+        // ---- M14 Phase 63n-2 (#028): automation_point_drag release → MoveAutomationPoints ----
+        // commit-by-release: 4px jitter 閾値で短 click 化 (= release で何も発火しない、 click 相当)。
+        // anchor からの delta が閾値未満なら no-op (point の selection 等は仕様外で変化しない)。
+        // alt は drag session の `last_alt` を真値とし、 `pointer.modifiers.alt` を直接見ない
+        // (clip_drag と同じ pattern: ModifiersChanged が MouseInput より先に届く race を回避)。
+        if let Some(ad) = point_drag_release {
+            let dx = ad.last_mouse.0 - ad.anchor_mouse.0;
+            let dy = ad.last_mouse.1 - ad.anchor_mouse.1;
+            let dist = dx.abs() + dy.abs();
+            if dist >= 4.0 {
+                // body_rect / clip_rect は anchor 固定 (drag 中の view scroll / lane 順序変化に強い)。
+                let beat_to_px =
+                    f64::from(ad.body_rect_anchor.w) / view.len_beats.max(1e-6);
+                let raw_dt = f64::from(dx) / beat_to_px;
+                let raw_abs = ad.clip_start_beat + ad.anchor_time_beat + raw_dt;
+                let snapped_abs =
+                    view.snap.snap_beat(raw_abs, ad.last_alt, zoom_x_px_per_beat);
+                let next_local =
+                    (snapped_abs - ad.clip_start_beat).clamp(0.0, ad.clip_len_beats.max(0.0));
+                let next_value = (ad.anchor_value_norm
+                    - dy / ad.clip_rect_anchor.h.max(1.0))
+                .clamp(0.0, 1.0);
+                if (next_local - ad.anchor_time_beat).abs() > 1e-9
+                    || (next_value - ad.anchor_value_norm).abs() > 1e-6
+                {
+                    let delta = MoveAutomationPointDelta {
+                        point: ad.point,
+                        prev_time_beat: ad.anchor_time_beat,
+                        prev_value_norm: ad.anchor_value_norm,
+                        next_time_beat: next_local,
+                        next_value_norm: next_value,
+                    };
+                    self.push_edit(make_edit(ArrangementEditRequest::MoveAutomationPoints(
+                        vec![delta],
+                    )));
+                }
+            }
+        }
+
+        // ---- M14 Phase 63n-2 (#028): automation_lane_default_drag release → SetLaneDefault ----
+        // drag 中は per-frame Mutate emit で live update 済 (TrackVolumeDragSession と同 pattern)。
+        // release frame は 1 度だけ最終値を `SetLaneDefault { prev: anchor, next: end }` で発行。
+        if let Some(ld) = lane_default_drag_release {
+            let end = volume_from_mouse_x(ld.last_mouse_x, ld.band_rect.x, ld.band_rect.w);
+            if (end - ld.anchor_value_norm).abs() > 1e-4 {
+                self.push_edit(make_edit(ArrangementEditRequest::SetLaneDefault {
+                    lane: ld.lane,
+                    prev: ld.anchor_value_norm,
+                    next: end,
+                }));
+            }
+        }
+
         // ---- short click on lanes (drag<16px) → SelectClips ----
         if let Some((cx, cy)) = clip_short_click_pos
             && lanes.contains(cx, cy)
@@ -4095,29 +4855,73 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
-        // ---- double-click (lanes 内で clip / 空白) ----
+        // ---- double-click (lanes 内で clip / lane body / 空白 track row) ----
+        // M14 Phase 63n-2 (#028): priority 順:
+        //  1. clip hit (track row 内 clip rect) → DoubleClickClip
+        //  2. lane body 内 clip 内 (curve 描画域) → AddAutomationPoint (snap 適用)
+        //  3. track row の空き → DoubleClickEmpty
+        //  lane row の空き (clip ギャップ) は no-op (= 描画はあるが何も発火しない、
+        //  既存 DoubleClickEmpty が発火しないよう lane row を track row と区別する)。
         if let Some((cx, cy)) = self.take_double_click_in_rect(lanes) {
             if let Some((hit_key, _)) =
                 clip_hit(&visible_tracks, &press_tops, view, lanes, cx, cy, style.resize_handle_px)
             {
                 self.push_edit(make_edit(ArrangementEditRequest::DoubleClickClip(hit_key)));
-            } else if let Some(idx) =
-                track_index_from_y(cy, lanes.y, &press_tops)
+            } else if let Some((t_idx, lane_idx, _h_rect, body_rect)) = automation_lane_at(
+                &visible_tracks,
+                &press_tops,
+                view.track_row_h,
+                header_pane.x,
+                header_pane.w,
+                lanes.x,
+                lanes.w,
+                style,
+                cy,
+            ) {
+                // lane body dblclick: clip 内のみ AddAutomationPoint 発火 (clip ギャップは no-op)。
+                let track_id = visible_tracks[t_idx].id;
+                let lane = &visible_tracks[t_idx].automation_lanes[lane_idx];
+                if let Some((clip_key, time_local, value_norm)) =
+                    automation_clip_at(track_id, lane, body_rect, view, style, cx, cy)
+                {
+                    let clip_ref = lane.clips.iter().find(|c| c.id == clip_key.clip);
+                    let clip_start = clip_ref.map_or(0.0, |c| c.start_beat);
+                    let clip_len = clip_ref.map_or(0.0, |c| c.len_beats);
+                    let raw_abs = clip_start + time_local;
+                    let snapped_abs = view.snap.snap_beat(
+                        raw_abs,
+                        pointer.modifiers.alt,
+                        zoom_x_px_per_beat,
+                    );
+                    let snapped_local =
+                        (snapped_abs - clip_start).clamp(0.0, clip_len.max(0.0));
+                    self.push_edit(make_edit(ArrangementEditRequest::AddAutomationPoint {
+                        clip: clip_key,
+                        time_beat: snapped_local,
+                        value_norm,
+                    }));
+                }
+            } else if let Some(idx) = track_index_from_y(cy, lanes.y, &press_tops)
                 && let Some(t) = visible_tracks.get(idx)
             {
-                let raw_beat = px_to_beat(cx, lanes.x, lanes.w, view);
-                // M9 Phase 45f: dblclick beat も widget 内 snap (#010 [Replied])。 daw_01 側で
-                // `beat.floor()` を消せるようになる。 single frame の click なので drag state は
-                // 関与せず、 直接 `pointer.modifiers.alt` を読んでよい。
-                let beat = view.snap.snap_beat(
-                    raw_beat,
-                    pointer.modifiers.alt,
-                    zoom_x_px_per_beat,
-                );
-                self.push_edit(make_edit(ArrangementEditRequest::DoubleClickEmpty {
-                    track: t.id,
-                    beat,
-                }));
+                // track row の空き dblclick (lane row では automation_lane_at が Some を返して
+                // 上の分岐で吸収済 → ここに来るのは track row のみ)。
+                let track_row_top = press_tops[idx];
+                if cy < track_row_top + view.track_row_h {
+                    let raw_beat = px_to_beat(cx, lanes.x, lanes.w, view);
+                    // M9 Phase 45f: dblclick beat も widget 内 snap (#010 [Replied])。 daw_01 側で
+                    // `beat.floor()` を消せるようになる。 single frame の click なので drag state は
+                    // 関与せず、 直接 `pointer.modifiers.alt` を読んでよい。
+                    let beat = view.snap.snap_beat(
+                        raw_beat,
+                        pointer.modifiers.alt,
+                        zoom_x_px_per_beat,
+                    );
+                    self.push_edit(make_edit(ArrangementEditRequest::DoubleClickEmpty {
+                        track: t.id,
+                        beat,
+                    }));
+                }
             }
         }
 
@@ -4223,12 +5027,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         disclosure_clicked = Some(t.id);
                     }
                 }
-                // M14 Phase 63n-1 (#028): track 行右端の lane disclosure ▶/▼ — `automation_lanes` が
-                // 空でない track のみ描画 (immediate)。 click 検出は press block で行う (= state borrow
-                // との衝突を避けるため、 描画のみ immediate ループで実行)。
+                // M14 Phase 63n-1 (#028) + 63n-2 修正: track 行 header の lane disclosure (S button の
+                // 右、 `layout.lane_disc_rect`) を **`+` / `-`** で描画。 旧 `▽`/`▷` (U+25BD/U+25B7) は
+                // font 不在で不可視 click target になる、 旧 `▼`/`▶` は group disclosure と同 glyph で
+                // user が混同する両方の問題を解消した最終形 (#028 follow-up user feedback で確定)。
+                // `automation_lanes.is_empty()` の track は描画しない (= layout 上は rect 確保するが
+                // visual には何も出ない、 click もメッセージにならない)。 click 検出は press block で
+                // 同じ `layout.lane_disc_rect` を使うので描画と hit-test の SSoT が完全一致。
                 if !t.automation_lanes.is_empty() {
-                    let lane_disc = lane_disclosure_rect_for(row, style);
-                    let label = if t.automation_lanes_collapsed { "▶" } else { "▼" };
+                    let lane_disc = layout.lane_disc_rect;
+                    let label = if t.automation_lanes_collapsed { "+" } else { "-" };
                     self.push_text(GlyphArea {
                         text: label.into(),
                         left: lane_disc.x,
@@ -4386,6 +5194,66 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 response.clip_rects.push((ClipKey { track: t.id, clip: c.id }, r));
             }
         }
+
+        // ---- M14 Phase 63n-2 (#028): automation_point_rects を毎 frame 積む ----
+        // for_each_visible_lane で SSoT を共有し、 各 visible point を screen 座標に変換した
+        // 半径 8px 正方形 rect を返す (= caller の context_menu_for で右クリック anchor として使う)。
+        // collapsed group 内 / collapsed lane / invisible lane / view beat 範囲外の point は除外。
+        let radius = style.automation_point_radius_px.max(2.0);
+        for_each_visible_lane(
+            &visible_tracks,
+            &press_tops,
+            view.track_row_h,
+            header_pane.x,
+            header_pane.w,
+            lanes.x,
+            lanes.w,
+            style,
+            |t_idx, _l_idx, lane, _h_rect, body_rect| {
+                if body_rect.y + body_rect.h < lanes.y || body_rect.y > lanes.y + lanes.h {
+                    return;
+                }
+                let track_id = visible_tracks[t_idx].id;
+                let beat_to_px = f64::from(body_rect.w) / view.len_beats.max(1e-6);
+                let pad = style.automation_clip_v_pad_px;
+                let clip_y = body_rect.y + pad;
+                let clip_h = (body_rect.h - pad * 2.0).max(2.0);
+                for clip_in in &lane.clips {
+                    let end = clip_in.start_beat + clip_in.len_beats;
+                    if end < view.start_beat || clip_in.start_beat > view_end {
+                        continue;
+                    }
+                    for (p_idx, p) in clip_in.points.iter().enumerate() {
+                        let abs_beat = clip_in.start_beat + p.time_beat;
+                        if abs_beat < view.start_beat - 1e-6
+                            || abs_beat > view.start_beat + view.len_beats + 1e-6
+                        {
+                            continue;
+                        }
+                        #[allow(clippy::cast_possible_truncation)]
+                        let px = body_rect.x
+                            + ((abs_beat - view.start_beat) * beat_to_px) as f32;
+                        let py = clip_y + (1.0 - p.value_norm.clamp(0.0, 1.0)) * clip_h;
+                        let key = AutomationPointKey {
+                            clip: AutomationClipKey {
+                                track: track_id,
+                                lane: lane.id,
+                                clip: clip_in.id,
+                            },
+                            #[allow(clippy::cast_possible_truncation)]
+                            point_idx: p_idx as u32,
+                        };
+                        let r = Rect {
+                            x: px - radius,
+                            y: py - radius,
+                            w: radius * 2.0,
+                            h: radius * 2.0,
+                        };
+                        response.automation_point_rects.push((key, r));
+                    }
+                }
+            },
+        );
 
         response
     }

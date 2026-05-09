@@ -105,6 +105,12 @@ struct DawModel {
     /// M14 Phase 63n-1 (#028): automation lane を畳んでいる track id 集合。 widget の
     /// `track.automation_lanes_collapsed` field の SSoT。 `ToggleTrackAutomationCollapsed { track }` 受信で toggle。
     arr_track_automation_collapsed: std::collections::HashSet<u32>,
+    /// M14 Phase 63n-2 (#028): automation lane の永続 store (`track_id -> Vec<lane>`)。
+    /// `DawModel::new()` で初期 sample lane を入れて (track_id == 1 のみ Volume/Pan)、 user の
+    /// 編集 (Add / Move / Delete point、 SetLaneEnabled 等) を直接この HashMap に mutate する。
+    /// arrangement に渡すときは `m.arr_automation_lanes.get(&t.id).cloned().unwrap_or_default()`。
+    arr_automation_lanes:
+        std::collections::HashMap<u32, Vec<daw_ui_core::ArrangementAutomationLane>>,
     /// M14 Phase 63e (#019): linked clone で発番する group id の counter。
     /// `CloneClipsLinked` 受信時、 source に group_id がなければ新採番、 source / dst 両方に
     /// 同じ id を assign。 `arr_tracks_for_widget` で `(gid as f32 * 0.618034).rem_euclid(1.0)`
@@ -208,6 +214,14 @@ impl DawModel {
             arr_selected_tracks: Vec::new(),
             arr_collapsed_groups: std::collections::HashSet::new(),
             arr_track_automation_collapsed: std::collections::HashSet::new(),
+            // M14 Phase 63n-2 (#028): track_id == 0 (= "Group A"、 表示 1 番目) のみ sample lane
+            // (Volume / Pan) を初期化。 group track にも automation lane を持たせる Bitwig 流。
+            // 他 track は空 Vec で「lane なし」 (= 既存挙動互換、 disclosure 描画なし)。
+            arr_automation_lanes: {
+                let mut h = std::collections::HashMap::new();
+                h.insert(0, build_sample_automation_lanes(0));
+                h
+            },
             arr_next_share_group_id: 0,
             arr_rename_target: None,
             demo_chain: vec![
@@ -794,21 +808,28 @@ fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
             parent_id: t.parent_id,
             depth: depth_of(t.id),
             collapsed: m.arr_collapsed_groups.contains(&t.id),
-            // M14 Phase 63n-1 (#028): daw_prototype は実 automation 機能を持たないので、
-            // 視覚確認用に `t.id == 1` (= 1 番目の track) のみ sample lane を 2 個ぶら下げる。
-            // 実 daw_01 では `daw_gui::view::arrangement_view` で本来の lane / clip / point を
-            // 構築する想定。
+            // M14 Phase 63n-2 (#028): caller-side store (`arr_automation_lanes`) から取得 (clone)。
+            // 初回 frame で `DawModel::new()` が track_id == 1 のみ sample lane (Volume / Pan) を
+            // seed 済 (= 既存挙動互換、 disclosure 描画なし for 他 track)。 user 編集 (Add /
+            // Move / Delete point、 SetLaneEnabled 等) は EditRequest arm が直接 store を mutate。
             automation_lanes_collapsed: m.arr_track_automation_collapsed.contains(&t.id),
-            automation_lanes: build_sample_automation_lanes(t.id),
+            automation_lanes: m
+                .arr_automation_lanes
+                .get(&t.id)
+                .cloned()
+                .unwrap_or_default(),
         })
         .collect()
 }
 
 /// M14 Phase 63n-1 (#028): daw_prototype 視覚確認用の sample lane 生成。
-/// `track_id == 1` のときだけ Volume / Pan の 2 lane を返す (= 1 track だけが ▶/▼ で開閉できる)。
-/// 各 lane は単純な curve preview と clip rect の見た目確認のため、 短い point 列を持つ 1 clip 構成。
+/// M14 Phase 63n-2 (#028): `track_id == 0` (= "Group A"、 表示 1 番目) で Volume / Pan の 2 lane
+/// を返す (group track にも automation lane を持たせる Bitwig 流、 caller の意図で任意 track id
+/// に lane を付けられることを示す。 旧 Phase 63n-1 では `track_id == 1` だったが 「最初の track の
+/// 下に lane」 が直感的な配置として user feedback で確定)。 各 lane は単純な curve preview と
+/// clip rect の見た目確認のため、 短い point 列を持つ 1 clip 構成。
 fn build_sample_automation_lanes(track_id: u32) -> Vec<daw_ui_core::ArrangementAutomationLane> {
-    if track_id != 1 {
+    if track_id != 0 {
         return Vec::new();
     }
     let volume_clip = daw_ui_core::ArrangementAutomationClip {
@@ -897,17 +918,24 @@ fn build_sample_automation_lanes(track_id: u32) -> Vec<daw_ui_core::ArrangementA
 
 #[allow(clippy::too_many_lines)]
 fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pane: Rect) {
+    // M14 Phase 63n-2 (#028): arrangement の上に **lane visibility inspector** を追加。
+    // arrangement widget の `👁` click で lane を hide すると lane 行が完全に消えるため
+    // (= daw_01 仕様: prefix sum から外す + 隣 lane が詰まる)、 caller 側で「再表示」 する手段が
+    // 必要。 daw_01 本体では `track_inspector.rs` に lane list + visible toggle を出す設計、
+    // daw_prototype は最小実装としてタブ上端に 1 行で track 1 の lane visible toggle を並べる。
     // M10 Phase 49 検証用: 下部に mini mixer strip (各 track の vertical fader、DAW 慣習で
     // mixer は arrangement の下)。arrangement の volume band と **同じ `arr_tracks[i].volume`
     // source-of-truth** に bind するので、片方を drag すると drag 中もリアルタイムで他方が
     // 追従することを 1 画面で確認できる。
     let strip_h = 96.0_f32;
     let strip_pad = 8.0_f32;
+    let inspector_h = 26.0_f32;
+    let inspector_rect = Rect { x: pane.x, y: pane.y, w: pane.w, h: inspector_h };
     let arr_pane = Rect {
         x: pane.x,
-        y: pane.y,
+        y: pane.y + inspector_h,
         w: pane.w,
-        h: (pane.h - strip_h).max(100.0),
+        h: (pane.h - inspector_h - strip_h).max(100.0),
     };
     let strip_rect = Rect {
         x: pane.x,
@@ -915,6 +943,77 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
         w: pane.w,
         h: strip_h,
     };
+
+    // ---- M14 Phase 63n-2 (#028): lane visibility inspector ----
+    // sample lane は track_id == 0 (= "Group A") に紐ついている。 widget の `👁` click で hide した
+    // lane をここから再表示できる (= daw_01 仕様の `track_inspector.rs` 相当の最小実装)。
+    let inspector_target_track: u32 = 0;
+    ui.panel(
+        "arr_lane_inspector_bg",
+        inspector_rect,
+        Color::rgb(0.10, 0.11, 0.13),
+        0.0,
+    );
+    let label_text = m
+        .arr_tracks
+        .iter()
+        .find(|t| t.id == inspector_target_track)
+        .map_or_else(
+            || "(no track) lanes:".to_string(),
+            |t| format!("{} lanes:", t.name),
+        );
+    ui.push_text(daw_ui_renderer::GlyphArea {
+        text: Arc::from(label_text),
+        left: inspector_rect.x + 8.0,
+        top: inspector_rect.y + 7.0,
+        font_size: 12.0,
+        line_height: 14.0,
+        color: Color::rgb(0.85, 0.85, 0.88),
+        clip_rect: Some(inspector_rect),
+    });
+    let mut bx = inspector_rect.x + 110.0;
+    let btn_h = (inspector_h - 4.0).max(16.0);
+    let btn_w = 100.0_f32;
+    let btn_pad = 4.0_f32;
+    let lanes_snapshot: Vec<(u32, bool, Arc<str>)> = m
+        .arr_automation_lanes
+        .get(&inspector_target_track)
+        .map(|v| {
+            v.iter()
+                .map(|l| (l.id, l.visible, l.label.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    for (lane_id, visible, label) in lanes_snapshot {
+        let glyph = if visible { "👁" } else { "🚫" };
+        let label_str = format!("{glyph} {label}");
+        let btn_rect = Rect {
+            x: bx,
+            y: inspector_rect.y + 2.0,
+            w: btn_w,
+            h: btn_h,
+        };
+        if bx + btn_w > inspector_rect.x + inspector_rect.w {
+            break;
+        }
+        if ui.button_at_clicked(
+            ("arr_lane_vis", inspector_target_track, lane_id),
+            &label_str,
+            btn_rect,
+        ) {
+            ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
+                if let Some(lanes) = mm.arr_automation_lanes.get_mut(&inspector_target_track)
+                    && let Some(l) = lanes.iter_mut().find(|l| l.id == lane_id)
+                {
+                    l.visible = !l.visible;
+                }
+                mm.arr_view.data_generation += 1;
+                mm.last_action =
+                    format!("inspector: lane {lane_id} visible toggle (caller-side)");
+            }));
+        }
+        bx += btn_w + btn_pad;
+    }
 
     // strip 背景
     ui.panel("arr_minimix_bg", strip_rect, Color::rgb(0.12, 0.13, 0.16), 0.0);
@@ -1418,6 +1517,154 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                     mm.last_action = format!("arr: ToggleTrackAutomationCollapsed {track}");
                 })
             }
+            // M14 Phase 63n-2 (#028): lane header button (★/👁/✕) + default band drag。
+            ArrangementEditRequest::SetLaneEnabled { lane, enabled } => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(lanes) = mm.arr_automation_lanes.get_mut(&lane.track)
+                        && let Some(l) = lanes.iter_mut().find(|l| l.id == lane.lane)
+                    {
+                        l.enabled = enabled;
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action =
+                        format!("arr: SetLaneEnabled t{} l{} → {}", lane.track, lane.lane, enabled);
+                })
+            }
+            ArrangementEditRequest::SetLaneVisible { lane, visible } => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(lanes) = mm.arr_automation_lanes.get_mut(&lane.track)
+                        && let Some(l) = lanes.iter_mut().find(|l| l.id == lane.lane)
+                    {
+                        l.visible = visible;
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action =
+                        format!("arr: SetLaneVisible t{} l{} → {}", lane.track, lane.lane, visible);
+                })
+            }
+            ArrangementEditRequest::SetLaneDefault { lane, prev: _, next } => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(lanes) = mm.arr_automation_lanes.get_mut(&lane.track)
+                        && let Some(l) = lanes.iter_mut().find(|l| l.id == lane.lane)
+                    {
+                        l.default_value_norm = next.clamp(0.0, 1.0);
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action =
+                        format!("arr: SetLaneDefault t{} l{} → {:.2}", lane.track, lane.lane, next);
+                })
+            }
+            ArrangementEditRequest::DeleteLane(lane) => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(lanes) = mm.arr_automation_lanes.get_mut(&lane.track) {
+                        lanes.retain(|l| l.id != lane.lane);
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!("arr: DeleteLane t{} l{}", lane.track, lane.lane);
+                })
+            }
+            // M14 Phase 63n-2 (#028): lane body 内 point の add / move / delete / curve 切替。
+            ArrangementEditRequest::AddAutomationPoint {
+                clip,
+                time_beat,
+                value_norm,
+            } => Edit::mutate(move |mm: &mut DawModel| {
+                if let Some(lanes) = mm.arr_automation_lanes.get_mut(&clip.track)
+                    && let Some(l) = lanes.iter_mut().find(|l| l.id == clip.lane)
+                    && let Some(c) = l.clips.iter_mut().find(|c| c.id == clip.clip)
+                {
+                    // Linear curve で point を挿入 (caller 仕様、 daw_01 では last-touched curve を継承
+                    // する案もあるが、 prototype では Linear で固定)。 time_beat 昇順を保つよう insert 位置を計算。
+                    let pos = c.points.iter().position(|p| p.time_beat > time_beat).unwrap_or(c.points.len());
+                    c.points.insert(
+                        pos,
+                        daw_ui_core::ArrangementAutomationPoint {
+                            time_beat,
+                            value_norm,
+                            curve: daw_ui_core::ArrangementCurveKind::Linear,
+                        },
+                    );
+                }
+                mm.arr_view.data_generation += 1;
+                mm.last_action = format!(
+                    "arr: AddAutomationPoint t{} l{} c{} @{:.2} v={:.2}",
+                    clip.track, clip.lane, clip.clip, time_beat, value_norm
+                );
+            }),
+            ArrangementEditRequest::MoveAutomationPoints(deltas) => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    let n = deltas.len();
+                    for d in &deltas {
+                        if let Some(lanes) = mm.arr_automation_lanes.get_mut(&d.point.clip.track)
+                            && let Some(l) = lanes.iter_mut().find(|l| l.id == d.point.clip.lane)
+                            && let Some(c) = l.clips.iter_mut().find(|c| c.id == d.point.clip.clip)
+                            && let Some(p) = c.points.get_mut(d.point.point_idx as usize)
+                        {
+                            p.time_beat = d.next_time_beat;
+                            p.value_norm = d.next_value_norm;
+                        }
+                    }
+                    // time_beat 昇順を維持するため lane の clip.points を再 sort
+                    // (frame 内の point_idx は変動しうる、 caller 仕様 §11.2)。
+                    for d in &deltas {
+                        if let Some(lanes) = mm.arr_automation_lanes.get_mut(&d.point.clip.track)
+                            && let Some(l) = lanes.iter_mut().find(|l| l.id == d.point.clip.lane)
+                            && let Some(c) = l.clips.iter_mut().find(|c| c.id == d.point.clip.clip)
+                        {
+                            c.points
+                                .sort_by(|a, b| a.time_beat.partial_cmp(&b.time_beat).unwrap_or(std::cmp::Ordering::Equal));
+                        }
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!("arr: MoveAutomationPoints ({n})");
+                })
+            }
+            ArrangementEditRequest::DeleteAutomationPoints(keys) => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    let n = keys.len();
+                    // 同じ clip 内の複数 point 削除に対応するため、 削除 index を **降順** sort して remove。
+                    let mut grouped: std::collections::BTreeMap<(u32, u32, u32), Vec<u32>> =
+                        std::collections::BTreeMap::new();
+                    for k in &keys {
+                        grouped
+                            .entry((k.clip.track, k.clip.lane, k.clip.clip))
+                            .or_default()
+                            .push(k.point_idx);
+                    }
+                    for ((track, lane_id, clip_id), mut indices) in grouped {
+                        indices.sort_by(|a, b| b.cmp(a)); // 降順
+                        if let Some(lanes) = mm.arr_automation_lanes.get_mut(&track)
+                            && let Some(l) = lanes.iter_mut().find(|l| l.id == lane_id)
+                            && let Some(c) = l.clips.iter_mut().find(|c| c.id == clip_id)
+                        {
+                            for idx in indices {
+                                let i = idx as usize;
+                                if i < c.points.len() {
+                                    c.points.remove(i);
+                                }
+                            }
+                        }
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!("arr: DeleteAutomationPoints ({n})");
+                })
+            }
+            ArrangementEditRequest::SetAutomationCurveType { point, prev: _, next } => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(lanes) = mm.arr_automation_lanes.get_mut(&point.clip.track)
+                        && let Some(l) = lanes.iter_mut().find(|l| l.id == point.clip.lane)
+                        && let Some(c) = l.clips.iter_mut().find(|c| c.id == point.clip.clip)
+                        && let Some(p) = c.points.get_mut(point.point_idx as usize)
+                    {
+                        p.curve = next;
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!(
+                        "arr: SetAutomationCurveType t{} l{} c{} p{} → {:?}",
+                        point.clip.track, point.clip.lane, point.clip.clip, point.point_idx, next
+                    );
+                })
+            }
         },
     );
 
@@ -1445,6 +1692,48 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 _ => {}
             }
         });
+    }
+
+    // ---- M14 Phase 63n-2 (#028): automation point 右クリック → curve type popup ----
+    // `resp.automation_point_rects` を毎 frame loop して context_menu_for を呼ぶ (= clip_rects と同
+    // idiom)。 anchor_rect は point dot の周辺 (8x8 px @ default radius=4)、 caller の右クリックを
+    // context_menu_for が anchor_rect.contains で判定 → popup を立ち上げる。 prev curve は popup
+    // open 時点の `clip.points[point_idx].curve` を retrieve (#028 [Resolved] と同 idiom)。
+    let point_rects_clone = resp.automation_point_rects.clone();
+    for (point_key, anchor_rect) in point_rects_clone {
+        let prev_curve = m
+            .arr_automation_lanes
+            .get(&point_key.clip.track)
+            .and_then(|lanes| lanes.iter().find(|l| l.id == point_key.clip.lane))
+            .and_then(|l| l.clips.iter().find(|c| c.id == point_key.clip.clip))
+            .and_then(|c| c.points.get(point_key.point_idx as usize))
+            .map_or(daw_ui_core::ArrangementCurveKind::Linear, |p| p.curve);
+        ui.context_menu_for(
+            anchor_rect,
+            &["Hold", "Linear", "Bezier"],
+            move |idx, ui| {
+                let next = match idx {
+                    0 => daw_ui_core::ArrangementCurveKind::Hold,
+                    1 => daw_ui_core::ArrangementCurveKind::Linear,
+                    2 => daw_ui_core::ArrangementCurveKind::Bezier { tension: 0.0 },
+                    _ => return,
+                };
+                ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(lanes) = mm.arr_automation_lanes.get_mut(&point_key.clip.track)
+                        && let Some(l) = lanes.iter_mut().find(|l| l.id == point_key.clip.lane)
+                        && let Some(c) = l.clips.iter_mut().find(|c| c.id == point_key.clip.clip)
+                        && let Some(p) = c.points.get_mut(point_key.point_idx as usize)
+                    {
+                        p.curve = next;
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!(
+                        "arr: SetAutomationCurveType (popup) p{} → {:?} (prev {:?})",
+                        point_key.point_idx, next, prev_curve
+                    );
+                }));
+            },
+        );
     }
 
     // ---- M14 Phase 63f (#020): clip 右クリック context_menu (Make Unique / Delete) ----

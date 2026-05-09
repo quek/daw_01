@@ -53,6 +53,22 @@ fn make_track(id: u32, lanes: Vec<ArrangementAutomationLane>) -> ArrangementTrac
     }
 }
 
+fn make_track_expanded(id: u32, lanes: Vec<ArrangementAutomationLane>) -> ArrangementTrack {
+    ArrangementTrack {
+        id,
+        name: Arc::from(format!("t{id}")),
+        muted: false,
+        solo: false,
+        clips: Vec::<ArrangementClip>::new(),
+        volume: 1.0,
+        parent_id: None,
+        depth: 0,
+        collapsed: false,
+        automation_lanes_collapsed: false, // expanded で start
+        automation_lanes: lanes,
+    }
+}
+
 fn make_view() -> ArrangementView {
     ArrangementView {
         start_beat: 0.0,
@@ -232,4 +248,45 @@ fn disclosure_click_targets_clicked_track_only() {
         },
     );
     assert_eq!(m.last_toggle, Some(20), "track 1 (id=20) の disclosure click が発火する");
+}
+
+/// **expanded** 状態 (= ▼ 表示) の disclosure を click → collapse 方向の `ToggleTrackAutomationCollapsed`
+/// が発火する (= 双方向に動作する)。 user feedback で「▼ で lane が畳まれない」 報告があった bug の
+/// 回帰テスト (Phase 63n-2 follow-up)。
+#[test]
+fn lane_disclosure_click_in_expanded_state_emits_toggle() {
+    let mut host: UiHost<LaneToggleModel> = UiHost::no_redraw();
+    let mut m = LaneToggleModel {
+        // expanded で start (= ▼ が表示されている状態)
+        tracks: vec![make_track_expanded(1, vec![make_lane(1, "Volume")])],
+        last_toggle: None,
+    };
+    let style = ArrangementStyle::default();
+    let view = make_view();
+    // disclosure rect は track 行右端の正方形 (lane が expanded でも track row の y range 内、 track_row_h)
+    let row0 = Rect { x: 0.0, y: 0.0, w: view.header_w, h: view.track_row_h };
+    let disc = lane_disclosure_rect_for(row0, &style);
+    let cx = disc.x + disc.w * 0.5;
+    let cy = disc.y + disc.h * 0.5;
+    run_arrangement_frame(
+        &mut host,
+        &mut m,
+        FrameInput {
+            pointer: pointer_press(cx, cy),
+            ..FrameInput::default()
+        },
+    );
+    run_arrangement_frame(
+        &mut host,
+        &mut m,
+        FrameInput {
+            pointer: pointer_release(cx, cy),
+            ..FrameInput::default()
+        },
+    );
+    assert_eq!(
+        m.last_toggle,
+        Some(1),
+        "expanded 状態 (▼) の disclosure click が collapse 方向の toggle を発火する"
+    );
 }

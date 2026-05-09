@@ -269,6 +269,31 @@ fn main() {
                     ArrangementEditRequest::ToggleTrackAutomationCollapsed { .. } => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
+                    // M14 Phase 63n-2 (#028): point edit + lane button の 8 variant。
+                    ArrangementEditRequest::SetLaneEnabled { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::SetLaneVisible { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::SetLaneDefault { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::DeleteLane(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::AddAutomationPoint { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::MoveAutomationPoints(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::DeleteAutomationPoints(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::SetAutomationCurveType { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
                 },
             );
             // M11 Phase 51: reorderable_list widget が non-Clone Model でコンパイルする。
