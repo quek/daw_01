@@ -59,7 +59,8 @@ pub use widgets::arrangement::{
     automation_lane_header_layout, automation_lane_key_at_y,
     automation_lane_resize_splitter_at, automation_lanes_total_h, automation_point_at,
     clip_hit, clip_to_rect, lane_disclosure_rect_for, loop_band_hit_kind,
-    track_index_from_y, track_row_height, visible_track_row_tops,
+    track_index_from_y, track_row_height, track_row_resize_splitter_at,
+    visible_track_row_tops,
 };
 pub use widgets::automation::{AutomationCurveResponse, AutomationCurveStyle};
 pub use widgets::checkbox::CheckboxResponse;

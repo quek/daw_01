@@ -164,6 +164,14 @@ pub struct ArrangementTrack {
     /// 確定 schema に従う。 各 lane は `target` を持たず (= caller 責務、 widget は label / icon の
     /// 表示しか必要としない)、 内部に `clips: Vec<ArrangementAutomationClip>` を持つ。
     pub automation_lanes: Vec<ArrangementAutomationLane>,
+    /// M14 Phase 63n-6 (#031): per-track row 高さ override (px)。 `None` で `view.track_row_h` を使用、
+    /// `Some(h)` で **このトラックのみ** が `h` px の row 高さで描画される (= Bitwig per-track zoom と
+    /// 同 idiom)。 新 splitter / Alt+drag gesture で `SetSingleTrackRowH { track, prev, next }` を発行
+    /// → caller が `t.row_h = Some(next)` で反映 → 次 frame で「そのトラックだけ」 が伸び縮みする。
+    /// 既存 Alt+wheel (`SetTrackRowH(f32)`) は引き続き **global** で `view.track_row_h` を update —
+    /// override 済 (`Some`) track は global zoom に追従しない (per-track 自由度を尊重)。
+    /// `lane.height_px` (lane 個別高さ) と独立で、 expanded 時の総高さは `row_h + Σ visible_lane.height_px`。
+    pub row_h: Option<u16>,
 }
 
 // ============================================================
@@ -493,8 +501,15 @@ pub enum ArrangementEditRequest {
     SetScrollX(f64),
     SetTrackTop(f32),
     /// M10 Phase 48: 縦ズーム (`track_row_h` を絶対値で更新、`Alt+wheel` で発火)。
-    /// min/max の clamp は app 側で実施 (目安 16..96 px)。
+    /// min/max の clamp は app 側で実施 (目安 16..96 px)。 **global** (`view.track_row_h` を更新)、
+    /// `ArrangementTrack.row_h: Some(_)` の override 済 track には影響しない (#031 per-track と独立)。
     SetTrackRowH(f32),
+    /// M14 Phase 63n-6 (#031): **per-track** row 高さ resize (新 splitter / Alt+drag gesture で発火)。
+    /// `prev` は session anchor (drag 開始時の effective row 高さ)、 `next` は drag 中 cursor 位置から
+    /// 計算した新 height (px)。 caller は `track` に対応する `ArrangementTrack.row_h = Some(next)` で
+    /// 反映する (= 「そのトラックだけ」 が伸び縮みする per-track zoom)。 widget は floor 1 px のみ
+    /// (= 異常入力 safety)、 caller side で `[min, max]` clamp する idiom (`SetTrackRowH(f32)` と整合)。
+    SetSingleTrackRowH { track: u32, prev: u16, next: u16 },
     /// M14 Phase 63c (#016): group 折り畳み toggle (▼/▶ disclosure click)。
     /// caller は `track.collapsed` を反転した値を保存する (widget 側は描画時に親 chain の
     /// collapsed を辿って子孫 row を skip)。
@@ -862,9 +877,12 @@ pub struct ArrangementStyle {
     /// M14 Phase 63n-5 (#030): lane 高さ drag の **下限 px** (`SetLaneHeight.next` clamp 用)。 default 30。
     /// 30 px は header の icon row + label が 1 段で読める最小 (Bitwig "small" preset 相当)。
     pub automation_lane_min_height_px: u16,
-    /// M14 Phase 63n-5 (#030): lane 高さ drag の **上限 px**。 default 200。
-    /// 200 px は curve の細部編集が見やすい余裕量 (Bitwig "large" 程度、 さらに大きく取りたい場合は
-    /// caller が style override で広げる)。
+    /// M14 Phase 63n-5 (#030) / 63n-6 (#031): lane 高さ drag の **上限 px**。 default 2000。
+    /// 実効 max は **`min(style.automation_lane_max_height_px, lanes.h.round())`** (= 描画 pane の
+    /// 縦サイズ以下に runtime clamp される、 daw_01 #031 の「最大は画面いっぱいまで」 要望対応)。
+    /// style 値は「絶対 cap」 として、 lanes.h が極端に小さい場合 (= overflow scroll 中) でも lane が
+    /// 過剰に伸びないようにする safety net。 default 2000 は典型 desktop の縦サイズ (1080〜1440 px) を
+    /// 上回るため事実上無制限。
     pub automation_lane_max_height_px: u16,
     /// disclosure ▶ / ▼ glyph の描画 font size。 default = `track_text_size`。
     pub automation_disclosure_size: f32,
@@ -987,7 +1005,7 @@ impl Default for ArrangementStyle {
             automation_default_band_h: 4.0,
             automation_lane_resize_handle_px: 4.0,
             automation_lane_min_height_px: 30,
-            automation_lane_max_height_px: 200,
+            automation_lane_max_height_px: 2000,
             automation_disclosure_size: 12.0,
             automation_lane_icon_size: 12.0,
             automation_lane_text_color: Color::rgb(0.92, 0.92, 0.94),
@@ -1042,12 +1060,24 @@ pub fn compute_visible_indices(tracks: &[ArrangementTrack]) -> Vec<usize> {
         .collect()
 }
 
-/// M14 Phase 63n-1 (#028): 単一 visible track の expanded 高さ (= `track_row_h` + lane 群高さ合計)。
-/// `automation_lanes_collapsed = true` または `automation_lanes` 空 / 全 invisible で `track_row_h` を返す
-/// (= 既存挙動完全互換)。 widget 内 row_y prefix sum と hit-test の SSoT。
+/// M14 Phase 63n-1 (#028) / 63n-6 (#031): 単一 visible track の expanded 高さ (= `effective_row_h` +
+/// lane 群高さ合計)。 `automation_lanes_collapsed = true` または `automation_lanes` 空 / 全 invisible で
+/// `effective_row_h` を返す (= 既存挙動完全互換)。 widget 内 row_y prefix sum と hit-test の SSoT。
+/// `track_row_h` は **caller の global default** (= `view.track_row_h`) で、 `track.row_h` が `Some`
+/// なら override される (per-track row 高さ、 #031 で導入)。
 #[must_use]
 pub fn track_row_height(track: &ArrangementTrack, track_row_h: f32) -> f32 {
-    track_row_h + automation_lanes_total_h(track)
+    effective_track_row_h(track, track_row_h) + automation_lanes_total_h(track)
+}
+
+/// M14 Phase 63n-6 (#031): track の effective row body 高さ (px、 lane 部は含まない)。
+/// `track.row_h.map_or(default, f32::from)` の thin wrapper — caller の view default を SSoT で
+/// override 適用する場所として **全 hit-test / 描画 path がこの helper 経由で row 高さを取得する**
+/// (= `view.track_row_h` を直接 `+ row_top` する code は禁止、 必ず `effective_track_row_h(t, ...)` を経由)。
+#[inline]
+#[must_use]
+pub fn effective_track_row_h(track: &ArrangementTrack, default_row_h: f32) -> f32 {
+    track.row_h.map_or(default_row_h, f32::from)
 }
 
 /// M14 Phase 63n-1 (#028): track の expanded 状態の visible automation lane 高さ合計 (px)。
@@ -1341,6 +1371,20 @@ fn clamp_height_px(raw: f32, min: u16, max: u16) -> u16 {
     let lo = f32::from(min);
     let hi = f32::from(max).max(lo);
     raw.round().clamp(lo, hi) as u16
+}
+
+/// M14 Phase 63n-6 (#031): lane 高さ drag の **実効 max** = `min(style.max, lanes.h.round())`。
+/// 「最大は画面いっぱいまで」 (= lane が描画 pane より高くならない) を runtime clamp で表現。
+/// `lanes.h` が style.max を超えても style 値が absolute cap として作用 (= 異常入力 safety)。
+/// `lanes.h` が極端に小さい (= overflow scroll 中で pane が 30 px 未満等) 場合は `min_height` 以上に
+/// なるよう clamp_height_px 側で補正されるため、 ここでは `lanes.h.round() as u16` を返すだけで OK。
+#[inline]
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn effective_lane_max_height(style: &ArrangementStyle, lanes: Rect) -> u16 {
+    let style_cap = style.automation_lane_max_height_px;
+    let pane_cap = lanes.h.round().max(0.0) as u32; // u16 overflow 防止に u32 経由で min 計算
+    style_cap.min(u16::try_from(pane_cap).unwrap_or(u16::MAX))
 }
 
 /// M10 Phase 46: drag 中の `mouse_y` から **drop target index** (anchor 抜き取り後に挿入する位置) を計算。
@@ -1720,6 +1764,26 @@ struct AutomationLaneResizeDragSession {
     last_emitted_height: u16,
 }
 
+/// M14 Phase 63n-6 (#031): MIDI track row 下端 splitter / Alt+drag による **per-track** row 高さ
+/// resize session。 `track: u32` で対象トラックを保持し、 release frame までの per-frame emit はその
+/// トラックのみを resize する `SetSingleTrackRowH { track, prev, next }` を発行 — 既存 Alt+wheel の
+/// global `SetTrackRowH(f32)` とは別経路で「そのトラックだけ伸び縮み」 (Bitwig per-track zoom と同 idiom)。
+/// per-frame emit + release で `take()` discard (per-frame で final 済、 anchor 同値なら no-op)。
+/// `last_emitted_height` 同値抑制は 0.5 px 閾値 (f32 連続値、 1 px 未満の jitter で spam しない)。
+#[derive(Clone, Copy, Debug)]
+struct TrackRowResizeDragSession {
+    /// drag 対象 track の id (= `SetSingleTrackRowH.track` に渡す)。
+    track: u32,
+    /// drag 開始時の effective row 高さ (`t.row_h.unwrap_or(view.track_row_h)`)、 dy 計算の base。
+    anchor_row_h: f32,
+    /// drag 開始時の cursor y。
+    anchor_mouse_y: f32,
+    /// 最後に観測した cursor y (continuation で update、 release frame は skip して直前値を保持)。
+    last_mouse_y: f32,
+    /// 最後に emit した height (毎 frame 同値発火を 0.5 px 閾値で抑制)。
+    last_emitted_height: f32,
+}
+
 /// M14 Phase 63n-3 (#028): lane 内 automation clip の Move / ResizeLeft / ResizeRight drag session。
 /// 既存 `ClipDragSession` (MIDI / Audio clip 用) と同 pattern だが key 型 / lane 跨ぎ semantics が
 /// 異なるため別 struct 化。 単一 clip 限定 (multi-select は仕様 §scope 外)、 `last_*` で OS event
@@ -1771,6 +1835,9 @@ pub(crate) struct ArrangementState {
     /// M14 Phase 63n-5 (#030): lane 下端 splitter drag session
     /// (release で `SetLaneHeight { prev: anchor, next: final }` 1 件)。
     automation_lane_resize_drag: Option<AutomationLaneResizeDragSession>,
+    /// M14 Phase 63n-6 (#031): MIDI track row 下端 splitter / Alt+drag resize session。
+    /// `SetTrackRowH(f32)` を per-frame emit (Alt+wheel と同 idiom)、 release は take 廃棄。
+    track_row_resize_drag: Option<TrackRowResizeDragSession>,
     /// M14 Phase 63n-3 (#028): lane 内 automation clip の Move / Resize drag session
     /// (release で `MoveAutomationClips` / `CloneAutomationClipsLinked` /
     /// `CloneAutomationClipsIndependent` / `ResizeAutomationClips` のいずれか 1 件、
@@ -2061,10 +2128,12 @@ fn push_filled_rect<M: ?Sized + 'static>(hctx: &mut HeavyCtx<'_, '_, M>, r: Rect
 // M13 Phase 55: ruler / lanes grid の bar/beat 縦線 + 小節番号テキスト描画は library
 // `Ui::time_ruler` / `Ui::bar_beat_grid` (heavy.rs delegate 経由) に統合した。
 // この関数は lanes 背景 + per-row 背景 (selection / mute/solo hint / lane separator) のみ。
+#[allow(clippy::too_many_arguments)]
 fn draw_lanes_bg<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     lanes: Rect,
     tracks: &[ArrangementTrack],
+    visible_tops: &[f32],
     view: ArrangementView,
     selected_tracks: &[u32],
     is_group_set: &HashSet<u32>,
@@ -2074,12 +2143,15 @@ fn draw_lanes_bg<M: ?Sized + 'static>(
 
     // 各 track row 背景 (selection ハイライト + mute/solo hint band + group_bg)。
     // M14 Phase 63c (#016): collapsed 親配下は描画 skip (visible 列のみ index で row を計算)。
+    // M14 Phase 63n-6 (#031): per-track row 高さ override 反映のため `visible_tops` (prefix sum) を
+    // 受け取り、 row_y / row_h を per-track で算出する (= override 済 track の backdrop fill が正しく
+    // 行高さに追従)。
     let visible_indices = compute_visible_indices(tracks);
     for (visible_i, &i) in visible_indices.iter().enumerate() {
         let t = &tracks[i];
-        #[allow(clippy::cast_precision_loss)]
-        let row_y = lanes.y - view.track_top + visible_i as f32 * view.track_row_h;
-        let row = Rect { x: lanes.x, y: row_y, w: lanes.w, h: view.track_row_h };
+        let row_y = visible_tops.get(visible_i).copied().unwrap_or(lanes.y);
+        let row_h = effective_track_row_h(t, view.track_row_h);
+        let row = Rect { x: lanes.x, y: row_y, w: lanes.w, h: row_h };
         if row.y + row.h < lanes.y || row.y > lanes.y + lanes.h {
             continue;
         }
@@ -2255,7 +2327,8 @@ fn draw_clips<M: ?Sized + 'static>(
     let view_end = view.start_beat + view.len_beats;
     for (i, t) in visible_tracks.iter().enumerate() {
         let row_top = tops[i];
-        if row_top + view.track_row_h < lanes.y || row_top > lanes.y + lanes.h {
+        let row_h = effective_track_row_h(t, view.track_row_h);
+        if row_top + row_h < lanes.y || row_top > lanes.y + lanes.h {
             continue;
         }
         for c in &t.clips {
@@ -2263,7 +2336,7 @@ fn draw_clips<M: ?Sized + 'static>(
             if end < view.start_beat || c.start_beat > view_end {
                 continue;
             }
-            let r = clip_to_rect(row_top, view.track_row_h, c, view, lanes);
+            let r = clip_to_rect(row_top, row_h, c, view, lanes);
             draw_clip(hctx, r, c, style, lanes, false);
         }
     }
@@ -2285,7 +2358,8 @@ fn draw_selection_overlay<M: ?Sized + 'static>(
     }
     for (i, t) in visible_tracks.iter().enumerate() {
         let row_top = tops[i];
-        if row_top + view.track_row_h < lanes.y || row_top > lanes.y + lanes.h {
+        let row_h = effective_track_row_h(t, view.track_row_h);
+        if row_top + row_h < lanes.y || row_top > lanes.y + lanes.h {
             continue;
         }
         for c in &t.clips {
@@ -2293,7 +2367,7 @@ fn draw_selection_overlay<M: ?Sized + 'static>(
             if !selected.contains(&key) {
                 continue;
             }
-            let r = clip_to_rect(row_top, view.track_row_h, c, view, lanes);
+            let r = clip_to_rect(row_top, row_h, c, view, lanes);
             draw_clip(hctx, r, c, style, lanes, true);
         }
     }
@@ -2694,7 +2768,8 @@ fn for_each_visible_lane<F>(
             continue;
         }
         let track_row_top = tops[i];
-        let mut lane_y = track_row_top + track_row_h;
+        // M14 Phase 63n-6 (#031): per-track row 高さ override 反映 (lane y 起点 = row_top + effective row_h)。
+        let mut lane_y = track_row_top + effective_track_row_h(t, track_row_h);
         let header_indent = f32::from(t.depth) * style.indent_px;
         for (j, lane) in t.automation_lanes.iter().enumerate() {
             if !lane.visible {
@@ -2760,6 +2835,45 @@ pub fn automation_lane_resize_splitter_at(
         },
     );
     found
+}
+
+/// M14 Phase 63n-6 (#031): track row 下端 splitter hot zone (= row body bottom edge ±`handle_px` の
+/// y range × body x range) に cursor が当たっているか判定。 当たった visible track index を返す
+/// (= cursor 形状切替 + caller のテストで rect 中心 px を導出する用途)。 row 高さは global なので
+/// track index は意味的に「どの行で trigger したか」 のみ示す参考値で、 drag 自体は全 row 一斉。
+/// splitter zone は **track row body の最下端 4 px** (= `tops[i] + track_row_h - handle .. + track_row_h`)
+/// — 行の下に automation lane がある場合は「最初の lane の上端」 と一致するが、 lane splitter は
+/// **lane bottom edge** を見るので排他 (= 別エッジで衝突しない)。
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn track_row_resize_splitter_at(
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
+    track_row_h: f32,
+    lanes_x: f32,
+    lanes_w: f32,
+    style: &ArrangementStyle,
+    cx: f32,
+    cy: f32,
+) -> Option<usize> {
+    let handle = style.automation_lane_resize_handle_px;
+    if handle <= 0.0 || track_row_h <= 0.0 || cx < lanes_x || cx >= lanes_x + lanes_w {
+        return None;
+    }
+    for i in 0..visible_tracks.len() {
+        if i + 1 >= tops.len() {
+            break;
+        }
+        let t = &visible_tracks[i];
+        let row_top = tops[i];
+        // M14 Phase 63n-6 (#031): per-track row 高さで row_bottom を計算 (override 済 track の splitter
+        // zone がそのトラックの下端に追従)。
+        let row_bottom = row_top + effective_track_row_h(t, track_row_h);
+        if cy >= row_bottom - handle && cy < row_bottom {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// M14 Phase 63n-2 (#028): lane body 内 cursor 位置から hit する point を返す (後勝ち、 描画順と整合)。
@@ -3622,6 +3736,33 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 } else {
                     false
                 }
+            } else if let Some(row_idx) = track_row_resize_splitter_at(
+                &visible_tracks,
+                &press_tops,
+                view.track_row_h,
+                lanes.x,
+                lanes.w,
+                style,
+                px,
+                py,
+            ) {
+                // M14 Phase 63n-6 (#031): track row 下端 splitter hit (lane splitter 不在の場合のみ)
+                // → **per-track** row resize session 起動 (= splitter で hit した track のみが伸び縮み)。
+                let t = &visible_tracks[row_idx];
+                let anchor_row_h = effective_track_row_h(t, view.track_row_h);
+                if anchor_row_h > 0.0 {
+                    let state: &mut ArrangementState = self.widget_state(wid);
+                    state.track_row_resize_drag = Some(TrackRowResizeDragSession {
+                        track: t.id,
+                        anchor_row_h,
+                        anchor_mouse_y: py,
+                        last_mouse_y: py,
+                        last_emitted_height: anchor_row_h,
+                    });
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
             };
@@ -3785,7 +3926,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             {
                 // header_pane.y と lanes.y は同じ値 (rect 分割で y 軸 origin 共通) なので press_tops を共有可。
                 let row_top = press_tops[idx];
-                let track_row_bottom = row_top + view.track_row_h;
+                // M14 Phase 63n-6 (#031): per-track row 高さで track row 範囲を判定。
+                let row_h_eff = effective_track_row_h(t, view.track_row_h);
+                let track_row_bottom = row_top + row_h_eff;
                 if py < track_row_bottom {
                     // === track row press (既存ロジック) ===
                     let row =
@@ -3879,7 +4022,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                                         Some(ArrangementEditRequest::DeleteLane(lane_key));
                                 } else if let Some(band) = layout.default_band_rect
                                     && band.contains(px, py)
+                                    && !pointer.modifiers.alt
                                 {
+                                    // M14 Phase 63n-6 (#031): Alt 修飾は **lane resize gesture に予約**
+                                    // (= 後段の Alt+drag fallback で lane resize 起動)。 Alt+press on
+                                    // default band は default value の sub-grid 微調整用途より lane
+                                    // resize 優先 (= user feedback)。
                                     let initial = volume_from_mouse_x(px, band.x, band.w);
                                     let state: &mut ArrangementState = self.widget_state(wid);
                                     state.automation_lane_default_drag =
@@ -3988,9 +4136,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let state: &ArrangementState = self.widget_state(wid);
                 state.automation_point_drag.is_some()
             };
+            // M14 Phase 63n-6 (#031 follow-up): Alt 修飾は **lane Alt+drag for resize に予約** する
+            // ため、 Alt+press on automation clip は session を起動しない。 これによって lane body 内の
+            // 任意位置 (clip 上を含む) で Alt+drag → lane resize が動作する (= user expectation 1:1)。
+            // 既存 automation clip Alt-snap-off 機能は失われるが、 automation 編集で sub-grid 位置を
+            // 細かく調整する用途は稀で、 lane resize の優先度の方が高いと判断 (= user feedback 反映)。
+            // MIDI / audio clip の Alt-snap-off (= clip_drag press) は **track row のみ** に作用するため
+            // この変更の影響を受けない (track row は別 priority でこの後 row Alt+drag fallback と排他)。
             if !splitter_press
                 && !already_taken_by_point
                 && in_lanes
+                && !pointer.modifiers.alt
                 && (!shift || ctrl)
                 && let Some((clip_key, kind, _clip_rect, body_rect_anchor)) =
                     automation_clip_zone_at(
@@ -4025,6 +4181,92 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     last_ctrl: press_ctrl,
                     last_shift: press_shift,
                 });
+            }
+
+            // M14 Phase 63n-6 (#031): Alt+drag detection — splitter / 既存 press logic で session が
+            // 起動しなかった場合のみ動作 (Alt+click on point / Alt+drag on clip 等は既に上で処理済 →
+            // 該当 session が立っていれば skip する)。 lane body hit なら lane resize、 そうでなく
+            // track row body hit なら row resize。 cursor が lanes 領域 (= clip 描画域) でも
+            // header_pane (= lane label 列) でも動く — lane label 上 Alt+drag を「lane を伸ばす」 と
+            // 期待する user 直感に合わせる (= 「lane の上で Alt+drag」 = lane resize)。
+            let in_arr = in_lanes || (header_w > 0.0 && header_pane.contains(px, py));
+            if pointer.modifiers.alt
+                && !shift
+                && !ctrl
+                && !splitter_press
+                && in_arr
+            {
+                let no_session = {
+                    let s: &ArrangementState = self.widget_state(wid);
+                    s.track_volume_drag.is_none()
+                        && s.track_reorder.is_none()
+                        && s.audio_drag.is_none()
+                        && s.clip_drag.is_none()
+                        && s.automation_lane_default_drag.is_none()
+                        && s.automation_point_drag.is_none()
+                        && s.automation_clip_drag.is_none()
+                        && s.automation_lane_resize_drag.is_none()
+                        && s.track_row_resize_drag.is_none()
+                        && s.playhead_drag.is_none()
+                        && s.loop_drag.is_none()
+                };
+                let no_press_action = press_seek_beat.is_none()
+                    && press_lane_toggle.is_none()
+                    && press_lane_button.is_none()
+                    && press_delete_point.is_none();
+                if no_session && no_press_action {
+                    let lane_at = automation_lane_at(
+                        &visible_tracks,
+                        &press_tops,
+                        view.track_row_h,
+                        header_pane.x,
+                        header_pane.w,
+                        lanes.x,
+                        lanes.w,
+                        style,
+                        py,
+                    );
+                    if let Some((t_idx, l_idx, _h_rect, _b_rect)) = lane_at {
+                        let lane = &visible_tracks[t_idx].automation_lanes[l_idx];
+                        let lane_key = AutomationLaneKey {
+                            track: visible_tracks[t_idx].id,
+                            lane: lane.id,
+                        };
+                        let anchor_h = lane.height_px;
+                        if anchor_h > 0 {
+                            let state: &mut ArrangementState = self.widget_state(wid);
+                            state.automation_lane_resize_drag =
+                                Some(AutomationLaneResizeDragSession {
+                                    lane: lane_key,
+                                    anchor_height_px: anchor_h,
+                                    anchor_mouse_y: py,
+                                    last_mouse_y: py,
+                                    last_emitted_height: anchor_h,
+                                });
+                        }
+                    } else if let Some(t_idx) = track_index_from_y(py, lanes.y, &press_tops)
+                        && t_idx + 1 < press_tops.len()
+                    {
+                        // lane が無い (or collapsed) で track row body の中の Alt+drag → per-track row resize。
+                        // row body 範囲 = `[tops[t_idx], tops[t_idx] + effective_row_h(t))`、 それ以遠は
+                        // lane 領域 (= `lane_at` で既に拾われる前提) — y check は collapsed track / 末尾
+                        // track の「lane 無し領域」 まで含めて row body と認定するための明示判定。
+                        let t = &visible_tracks[t_idx];
+                        let row_top = press_tops[t_idx];
+                        let anchor_row_h = effective_track_row_h(t, view.track_row_h);
+                        let row_bottom = row_top + anchor_row_h;
+                        if py >= row_top && py < row_bottom && anchor_row_h > 0.0 {
+                            let state: &mut ArrangementState = self.widget_state(wid);
+                            state.track_row_resize_drag = Some(TrackRowResizeDragSession {
+                                track: t.id,
+                                anchor_row_h,
+                                anchor_mouse_y: py,
+                                last_mouse_y: py,
+                                last_emitted_height: anchor_row_h,
+                            });
+                        }
+                    }
+                }
             }
         }
 
@@ -4155,6 +4397,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             {
                 rd.last_mouse_y = py;
             }
+            // M14 Phase 63n-6 (#031): track_row_resize_drag continuation で last_mouse_y を update
+            // (lane_resize_drag と同 pattern、 release frame は per-frame 内で final 済 + take 廃棄)。
+            if let Some(ref mut rd) = state.track_row_resize_drag
+                && !is_release
+            {
+                rd.last_mouse_y = py;
+            }
             // M14 Phase 63n-3 (#028): automation_clip_drag continuation で last_mouse +
             // last_alt / last_ctrl / last_shift を update (`ClipDragSession` と同 pattern)。
             // release frame の `last_mouse` は pointer.pos != anchor のときのみ update、 modifier は
@@ -4202,8 +4451,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         if let Some((_px, py)) = pointer.pos
             && !pointer.primary_just_released
         {
+            // M14 Phase 63n-6 (#031): max は `min(style.max, lanes.h)` で runtime clamp。
+            // style 値は絶対 cap、 lanes.h は描画 pane の現在縦サイズ (= 「画面いっぱい」)。
+            let max_h = effective_lane_max_height(style, lanes);
             let min_h = style.automation_lane_min_height_px;
-            let max_h = style.automation_lane_max_height_px;
             let mut emit: Option<(AutomationLaneKey, u16, u16)> = None;
             {
                 let state: &mut ArrangementState = self.widget_state(wid);
@@ -4220,6 +4471,39 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             if let Some((lane, prev, next)) = emit {
                 self.push_edit(make_edit(ArrangementEditRequest::SetLaneHeight {
                     lane,
+                    prev,
+                    next,
+                }));
+            }
+        }
+
+        // M14 Phase 63n-6 (#031): track_row_resize_drag の per-frame live update。
+        // drag 中は **対象 track の `t.row_h`** が変わる度に caller が `SetSingleTrackRowH` を mutate
+        // する (= per-track override 化、 Bitwig per-track zoom と同 idiom)。 widget は floor 1 px の
+        // u16 で発火 (caller-side で `[min, max]` clamp)、 同値抑制 0.5 px 閾値で u16 quantization 込み。
+        if let Some((_px, py)) = pointer.pos
+            && !pointer.primary_just_released
+        {
+            let mut row_emit: Option<(u32, u16, u16)> = None;
+            {
+                let state: &mut ArrangementState = self.widget_state(wid);
+                if let Some(ref mut rd) = state.track_row_resize_drag {
+                    let dy = py - rd.anchor_mouse_y;
+                    let next_f = (rd.anchor_row_h + dy).max(1.0);
+                    if (next_f - rd.last_emitted_height).abs() >= 0.5 {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let next = next_f.round().clamp(1.0, f32::from(u16::MAX)) as u16;
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let prev =
+                            rd.anchor_row_h.round().clamp(1.0, f32::from(u16::MAX)) as u16;
+                        row_emit = Some((rd.track, prev, next));
+                        rd.last_emitted_height = next_f;
+                    }
+                }
+            }
+            if let Some((track, prev, next)) = row_emit {
+                self.push_edit(make_edit(ArrangementEditRequest::SetSingleTrackRowH {
+                    track,
                     prev,
                     next,
                 }));
@@ -4388,12 +4672,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                                 .or(Some(target.id));
                             (Some(target.id), last_descendant)
                         } else {
-                            // 通常 track: top/bottom half で挿入位置を決定
-                            #[allow(clippy::cast_precision_loss)]
-                            let row_y = header_pane.y - view.track_top
-                                + visible_drop_idx.unwrap_or(0) as f32 * view.track_row_h;
+                            // 通常 track: top/bottom half で挿入位置を決定。
+                            // M14 Phase 63n-6 (#031): per-track row 高さ override を反映するため
+                            // `press_tops` (prefix sum) から該当 visible_idx の row_top を取得、
+                            // row_h は target の effective 値を使用 (= override 済 track の半分判定が
+                            // そのトラック自身の高さに追従)。
+                            let v_idx = visible_drop_idx.unwrap_or(0);
+                            let row_y = press_tops.get(v_idx).copied().unwrap_or(header_pane.y);
+                            let row_h = effective_track_row_h(target, view.track_row_h);
                             let local_y = tr.last_mouse_y - row_y;
-                            let top_half = local_y < view.track_row_h * 0.5;
+                            let top_half = local_y < row_h * 0.5;
                             let prev_id = if top_half {
                                 let prev_visible_i = visible_drop_idx
                                     .and_then(|i| i.checked_sub(1));
@@ -4499,6 +4787,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 None
             };
 
+        // M14 Phase 63n-6 (#031): track_row_resize_drag release take + discard。 per-frame emit で
+        // 既に最終値が発火済 (= `last_emitted_height`)、 release で追加 emit は不要 (lane と異なる)。
+        // session を `take()` して廃棄 (cursor 形状 / hover 判定が release 後すぐ解除される)。
+        if pointer.primary_just_released {
+            let state: &mut ArrangementState = self.widget_state(wid);
+            state.track_row_resize_drag.take();
+        }
+
         // M14 Phase 63n-3 (#028): automation_clip_drag overlay clone + release take。
         // overlay は ghost clip rect を cached 外で重ねる、 release で 1 度だけ
         // `MoveAutomationClips` / `CloneAutomationClipsLinked` / `CloneAutomationClipsIndependent` /
@@ -4575,14 +4871,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // M14 Phase 63n-5 (#030): lane resize drag 中は NsResize (cursor 移動の縦軸を強調)、 hover 時も
         // splitter hot zone なら NsResize にして discoverability を確保。 lane resize > clip drag > hover の
         // priority (= 同時に成立しないが、 万一重なっても resize を優先)。
-        let lane_resize_active = {
+        // M14 Phase 63n-6 (#031): row resize drag 中も NsResize (lane resize と同じ)。 lane / row の
+        // 両 session を同 priority で扱い、 同時に立たない (press 時に一方しか起動しない)。
+        let resize_active = {
             let state: &mut ArrangementState = self.widget_state(wid);
-            state.automation_lane_resize_drag.is_some()
+            state.automation_lane_resize_drag.is_some() || state.track_row_resize_drag.is_some()
         };
         let dragging_kind = response
             .dragging
             .or(automation_clip_drag_session.as_ref().map(|acd| acd.kind));
-        if lane_resize_active {
+        if resize_active {
             self.set_cursor(CursorIcon::NsResize);
         } else if let Some(kind) = dragging_kind {
             let cur = match kind {
@@ -4601,7 +4899,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             };
             self.set_cursor(cur);
         } else if let Some((cx, cy)) = pointer.pos
-            && automation_lane_resize_splitter_at(
+            && (automation_lane_resize_splitter_at(
                 &visible_tracks,
                 &press_tops,
                 view.track_row_h,
@@ -4614,6 +4912,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 cy,
             )
             .is_some()
+                || track_row_resize_splitter_at(
+                    &visible_tracks,
+                    &press_tops,
+                    view.track_row_h,
+                    lanes.x,
+                    lanes.w,
+                    style,
+                    cx,
+                    cy,
+                )
+                .is_some())
         {
             self.set_cursor(CursorIcon::NsResize);
         } else if let Some((px, py)) = pointer.pos
@@ -4790,6 +5099,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     hctx,
                     lanes,
                     &tracks_owned,
+                    &tops_owned_for_heavy,
                     view_copy,
                     &selected_tracks_for_heavy,
                     &is_group_set_for_heavy,
@@ -4856,7 +5166,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     if track_total_bottom < lanes.y || track_row_top > lanes.y + lanes.h {
                         continue;
                     }
-                    let mut lane_y = track_row_top + view_copy.track_row_h;
+                    let mut lane_y = track_row_top + effective_track_row_h(t, view_copy.track_row_h);
                     // M14 Phase 63n-1 (#028) follow-up: lane 行 header は親 track と同じ indent に揃える
                     // (= 親 track の depth * indent_px)。 group 配下の track の lane が「どの track の
                     // lane か」 を視覚的に追えるようにするため (#028 user 指摘 1)。
@@ -5378,10 +5688,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         if let Some(rd) = lane_resize_drag_release {
             let dy = rd.last_mouse_y - rd.anchor_mouse_y;
             let raw = f32::from(rd.anchor_height_px) + dy;
+            // M14 Phase 63n-6 (#031): release も runtime clamp (style.max ∧ lanes.h)。
             let end = clamp_height_px(
                 raw,
                 style.automation_lane_min_height_px,
-                style.automation_lane_max_height_px,
+                effective_lane_max_height(style, lanes),
             );
             if end != rd.anchor_height_px {
                 self.push_edit(make_edit(ArrangementEditRequest::SetLaneHeight {
@@ -5699,12 +6010,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 }
                 self.push_edit(make_edit(ArrangementEditRequest::SetZoomX(new_zoom)));
             } else if pointer.modifiers.alt {
-                // M10 Phase 48: Alt+wheel で row_h 縦ズーム (zoom_x と同じ exp curve)。
-                // app 側で 16..96 px 等の clamp を実施。
-                // M14 Phase 61a (#011): 符号反転 + 係数 0.005→0.0015 (Ctrl+wheel と一貫、
-                // wheel up = zoom in、 row 大きく)。
-                // M14 Phase 61a follow-up: マウス y 位置を anchor に zoom、 SetTrackTop を同
-                // frame で発行して mouse 下の track が画面上で動かないようにする (Cubase 標準)。
+                // M10 Phase 48 / M14 Phase 61a (#011): Alt+wheel で row_h 縦ズーム (exp curve、
+                // wheel up = zoom in)、 マウス y 位置を anchor に SetTrackTop で画面位置維持。
+                // M14 Phase 63n-6 (#031): 加えて **automation lane の height_px も同 factor で scale** —
+                // user feedback「Alt+wheel で MIDI track と automation lane が同時に変わってほしい」 を
+                // 反映。 visible track の visible lane に `SetLaneHeight` を 1 件ずつ発行 (= caller が
+                // 各 lane を update、 lane.height_px は per-track row_h と独立に持つので並列で OK)。
                 let factor = (dy * 0.0015).exp();
                 let new_h = view.track_row_h * factor;
                 if let Some((_, my)) = pointer.pos
@@ -5718,6 +6029,52 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     self.push_edit(make_edit(ArrangementEditRequest::SetTrackTop(new_top)));
                 }
                 self.push_edit(make_edit(ArrangementEditRequest::SetTrackRowH(new_h)));
+
+                // M14 Phase 63n-6 (#031): visible lane / per-track row override も同 factor で scale。
+                // user feedback「Track 4 を drag で大きくした後 Alt+wheel で縮めても override が
+                // 残ったまま」 → 各 override を factor 倍する。 個別差は scale 中保持 (lane1=100,
+                // lane2=60 → lane1=70, lane2=42)、 enough wheel で min に収束 (= 個別差は残るが、
+                // ユーザは引き続き wheel で全体を縮められる)。
+                let lane_min = style.automation_lane_min_height_px;
+                let lane_max = effective_lane_max_height(style, lanes);
+                for t in &visible_tracks {
+                    // per-track row 高さ override (= `t.row_h.is_some()`) も factor 倍。 None
+                    // (= view default 追従) は SetTrackRowH 経由で既に追従するので scale 不要。
+                    if let Some(row_h) = t.row_h {
+                        let scaled = f32::from(row_h) * factor;
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let new_t_h = scaled.round().clamp(1.0, f32::from(u16::MAX)) as u16;
+                        if new_t_h != row_h {
+                            self.push_edit(make_edit(
+                                ArrangementEditRequest::SetSingleTrackRowH {
+                                    track: t.id,
+                                    prev: row_h,
+                                    next: new_t_h,
+                                },
+                            ));
+                        }
+                    }
+                    if t.automation_lanes_collapsed {
+                        continue;
+                    }
+                    for lane in &t.automation_lanes {
+                        if !lane.visible || lane.height_px == 0 {
+                            continue;
+                        }
+                        let scaled = f32::from(lane.height_px) * factor;
+                        let new_lane_h = clamp_height_px(scaled, lane_min, lane_max);
+                        if new_lane_h != lane.height_px {
+                            self.push_edit(make_edit(ArrangementEditRequest::SetLaneHeight {
+                                lane: AutomationLaneKey {
+                                    track: t.id,
+                                    lane: lane.id,
+                                },
+                                prev: lane.height_px,
+                                next: new_lane_h,
+                            }));
+                        }
+                    }
+                }
             } else if pointer.modifiers.shift {
                 let delta = -f64::from(dy) * beat_per_px * 4.0;
                 self.push_edit(make_edit(ArrangementEditRequest::SetScrollX(
@@ -5810,7 +6167,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 // track row の空き dblclick (lane row では automation_lane_at が Some を返して
                 // 上の分岐で吸収済 → ここに来るのは track row のみ)。
                 let track_row_top = press_tops[idx];
-                if cy < track_row_top + view.track_row_h {
+                if cy < track_row_top + effective_track_row_h(t, view.track_row_h) {
                     let raw_beat = px_to_beat(cx, lanes.x, lanes.w, view);
                     // M9 Phase 45f: dblclick beat も widget 内 snap (#010 [Replied])。 daw_01 側で
                     // `beat.floor()` を消せるようになる。 single frame の click なので drag state は
@@ -6085,7 +6442,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let view_end = view.start_beat + view.len_beats;
         for (i, t) in visible_tracks.iter().enumerate() {
             let row_top = press_tops[i];
-            if row_top + view.track_row_h < lanes.y || row_top > lanes.y + lanes.h {
+            let row_h = effective_track_row_h(t, view.track_row_h);
+            if row_top + row_h < lanes.y || row_top > lanes.y + lanes.h {
                 continue;
             }
             for c in &t.clips {
@@ -6093,7 +6451,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 if end < view.start_beat || c.start_beat > view_end {
                     continue;
                 }
-                let r = clip_to_rect(row_top, view.track_row_h, c, view, lanes);
+                let r = clip_to_rect(row_top, row_h, c, view, lanes);
                 response.clip_rects.push((ClipKey { track: t.id, clip: c.id }, r));
             }
         }
@@ -6270,6 +6628,7 @@ mod tests {
             automation_lanes_collapsed: true,
             automation_lanes: Vec::new(),
             collapsed: false,
+            row_h: None,
         }
     }
 
@@ -7291,6 +7650,7 @@ mod tests {
             collapsed,
             automation_lanes_collapsed: true,
             automation_lanes: Vec::new(),
+            row_h: None,
         }
     }
 

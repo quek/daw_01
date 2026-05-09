@@ -324,6 +324,10 @@ fn main() {
                     ArrangementEditRequest::SetLaneHeight { .. } => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
+                    // M14 Phase 63n-6 (#031): per-track row 下端 splitter / Alt+drag → SetSingleTrackRowH。
+                    ArrangementEditRequest::SetSingleTrackRowH { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
                 },
             );
             // M11 Phase 51: reorderable_list widget が non-Clone Model でコンパイルする。

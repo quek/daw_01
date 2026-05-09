@@ -80,6 +80,7 @@ fn make_track(id: u32, lanes: Vec<ArrangementAutomationLane>) -> ArrangementTrac
         collapsed: false,
         automation_lanes_collapsed: false,
         automation_lanes: lanes,
+        row_h: None,
     }
 }
 

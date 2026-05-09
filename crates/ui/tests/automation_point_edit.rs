@@ -38,6 +38,10 @@ struct ObsModel {
     created_clips: Vec<(AutomationLaneKey, f64, f64)>,
     /// M14 Phase 63n-5 (#030): lane 下端 splitter drag → SetLaneHeight 観測 (per-frame + release 全列)。
     lane_heights: Vec<(AutomationLaneKey, u16, u16)>,
+    /// M14 Phase 63n-6 (#031): per-track row 下端 splitter / Alt+drag → SetSingleTrackRowH 観測
+    /// (per-frame 全列、 (track_id, height_px) の tuple)。 caller として該当 track の `row_h = Some(h)`
+    /// を mutate するため `tracks` 自身が live preview の SSoT。
+    row_heights: Vec<(u32, u16)>,
 }
 
 fn make_lane(id: u32, enabled: bool) -> ArrangementAutomationLane {
@@ -91,6 +95,7 @@ fn make_track(id: u32, lanes: Vec<ArrangementAutomationLane>) -> ArrangementTrac
         // **expanded** で start (Phase 63n-2 の lane 内 hit-test を試すため)
         automation_lanes_collapsed: false,
         automation_lanes: lanes,
+        row_h: None,
     }
 }
 
@@ -209,6 +214,17 @@ fn run_arrangement_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: F
                                 t.automation_lanes.iter_mut().find(|l| l.id == lane.lane)
                         {
                             l.height_px = next;
+                        }
+                    })
+                }
+                ArrangementEditRequest::SetSingleTrackRowH { track, prev: _, next } => {
+                    Edit::mutate(move |mm: &mut ObsModel| {
+                        // M14 Phase 63n-6 (#031): per-track row 高さ override 観測。 caller-side
+                        // clamp 16..1000 (daw_prototype と同 idiom)、 該当 track の `row_h = Some(h)` を更新。
+                        let new_h = next.clamp(16, 1000);
+                        mm.row_heights.push((track, new_h));
+                        if let Some(t) = mm.tracks.iter_mut().find(|t| t.id == track) {
+                            t.row_h = Some(new_h);
                         }
                     })
                 }
@@ -509,6 +525,146 @@ fn lane_bottom_splitter_drag_clamps_to_style_min_max() {
     }
     // 最後の emit は min ぴったり (release 時点で raw が min を大きく下回っている)
     assert_eq!(m.lane_heights.last().expect("non-empty").2, 30);
+}
+
+/// M14 Phase 63n-6 (#031): lane body 内の **任意位置** で Alt+drag → `SetLaneHeight` 発火 (= splitter
+/// と Alt+drag の両方併用)。 splitter (= lane bottom 4px hot zone) の外 + clip / point 上でも無い
+/// 位置で Alt+vertical drag が動くことを検証。
+#[test]
+fn lane_body_alt_drag_emits_set_lane_height() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    // make_lane(10, true) は clip [0..16] の 1 lane。 cursor を beat 16 より右の **clip 外** + lane
+    // 上端 (= padding zone を避けて splitter の外) に置く。 lane body x range = [200, 800]、 beat_to_px
+    // = 600/16 = 37.5、 beat 16 = lane の右端で screen x = 200+600 = 800。 lane の clip 範囲は [0, 16]
+    // = body 全幅なので、 「clip 外 x range」 が無い。 そこで clip を短縮 ([0..6] beats) して beat 10 を
+    // 「clip 外 + lane body」 にする。
+    let mut lane = make_lane(10, true);
+    lane.clips[0].len_beats = 6.0;
+    m.tracks = vec![make_track(1, vec![lane])];
+
+    // beat 10 = screen x = 200 + 10*37.5 = 575、 lane body の cy mid (= 32 + 30 = 62) — splitter zone
+    // (88..92) の外、 clip 外、 point の半径 (8px) からも離れている。
+    let cx = 575.0;
+    let press_y = 62.0;
+    let drag_y = 80.0; // press から +18 px (= height 60→78)
+
+    let alt = Modifiers { alt: true, ..Modifiers::default() };
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_press(cx, press_y, alt),
+        ..FrameInput::default()
+    });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: PointerFrame {
+            pos: Some((cx, drag_y)),
+            primary_pressed: true,
+            modifiers: alt,
+            ..PointerFrame::default()
+        },
+        ..FrameInput::default()
+    });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_release(cx, drag_y, alt),
+        ..FrameInput::default()
+    });
+
+    assert!(
+        m.lane_heights.len() >= 2,
+        "Alt+drag で per-frame + release ≥2 件、 actual {}",
+        m.lane_heights.len()
+    );
+    let final_emit = *m.lane_heights.last().expect("≥ 2 件あるので非空");
+    assert_eq!(final_emit.0, AutomationLaneKey { track: 1, lane: 10 });
+    assert_eq!(final_emit.1, 60, "prev = anchor (= 60 px)");
+    assert_eq!(final_emit.2, 78, "next = 60 + 18 = 78 px");
+}
+
+/// M14 Phase 63n-6 (#031): track row 下端 splitter drag → `SetTrackRowH(f32)` 発火 (per-frame
+/// live update + caller-side clamp 16..1000)。 lane 無し track の row (高さ 32 px) の下端 ±4 px
+/// hot zone (= y in [28, 32)) を press → drag → release で 1 件以上 emit、 final ≈ 52 (= 32 + 20)。
+#[test]
+fn track_row_bottom_splitter_drag_emits_set_track_row_h() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    // lane 無し track 1 個 (row 高さ = view.track_row_h = 32 px)。
+    m.tracks = vec![make_track(1, vec![])];
+
+    // splitter hot zone: row_bottom - handle .. row_bottom = 28..32 (handle=4.0)
+    // x は lanes range 内の任意位置 (header_w=200, lanes=200..800)。
+    let cx = 400.0;
+    let press_y = 30.0; // 中央 of [28, 32)
+    let drag_y = 50.0; // press から +20 px → row_h = 32 + 20 = 52
+
+    let none = Modifiers::empty();
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_press(cx, press_y, none),
+        ..FrameInput::default()
+    });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: PointerFrame {
+            pos: Some((cx, drag_y)),
+            primary_pressed: true,
+            modifiers: none,
+            ..PointerFrame::default()
+        },
+        ..FrameInput::default()
+    });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_release(cx, drag_y, none),
+        ..FrameInput::default()
+    });
+
+    assert!(
+        !m.row_heights.is_empty(),
+        "splitter drag で per-frame SetSingleTrackRowH ≥1 件、 actual {}",
+        m.row_heights.len()
+    );
+    let (track_id, final_h) = *m.row_heights.last().expect("non-empty");
+    assert_eq!(track_id, 1, "press した track 1 のみが emit 対象");
+    assert_eq!(final_h, 52, "final row_h = 32 + 20 = 52 px");
+}
+
+/// M14 Phase 63n-6 (#031): track row body 内の **任意位置** で Alt+drag → `SetSingleTrackRowH` 発火
+/// (= splitter と Alt+drag の両方併用、 per-track のみ resize)。 splitter zone (= row 下端 4 px) の外で
+/// Alt+vertical drag が動くことを検証。
+#[test]
+fn track_row_body_alt_drag_emits_set_single_track_row_h() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![])];
+
+    // splitter zone (28..32) の外、 row body 中央 y=16 に cursor を置く。 lanes range 内の任意 x。
+    let cx = 400.0;
+    let press_y = 16.0;
+    let drag_y = 36.0; // +20 px → row_h = 32 + 20 = 52
+
+    let alt = Modifiers { alt: true, ..Modifiers::default() };
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_press(cx, press_y, alt),
+        ..FrameInput::default()
+    });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: PointerFrame {
+            pos: Some((cx, drag_y)),
+            primary_pressed: true,
+            modifiers: alt,
+            ..PointerFrame::default()
+        },
+        ..FrameInput::default()
+    });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_release(cx, drag_y, alt),
+        ..FrameInput::default()
+    });
+
+    assert!(
+        !m.row_heights.is_empty(),
+        "Alt+drag で per-frame SetSingleTrackRowH ≥1 件、 actual {}",
+        m.row_heights.len()
+    );
+    let (track_id, final_h) = *m.row_heights.last().expect("non-empty");
+    assert_eq!(track_id, 1, "press した track 1 のみが emit 対象");
+    assert_eq!(final_h, 52, "final row_h = 32 + 20 = 52 px");
 }
 
 /// M14 Phase 63n-5 (#030): splitter 外 (= lane body の上方 / 縦 padding) を click しても

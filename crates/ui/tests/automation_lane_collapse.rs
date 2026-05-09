@@ -50,6 +50,7 @@ fn make_track(id: u32, lanes: Vec<ArrangementAutomationLane>) -> ArrangementTrac
         collapsed: false,
         automation_lanes_collapsed: true, // 起動時は全 collapsed
         automation_lanes: lanes,
+        row_h: None,
     }
 }
 
@@ -66,6 +67,7 @@ fn make_track_expanded(id: u32, lanes: Vec<ArrangementAutomationLane>) -> Arrang
         collapsed: false,
         automation_lanes_collapsed: false, // expanded で start
         automation_lanes: lanes,
+        row_h: None,
     }
 }
 

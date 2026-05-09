@@ -114,6 +114,11 @@ struct DawModel {
     /// M14 Phase 63n-3 (#028): 選択中の automation clip key 集合 (短 click on clip で SelectAutomationClips
     /// を受信し、 widget へ毎 frame 渡して selected_fill / selected_border 表示を駆動する SSoT)。
     arr_selected_automation_clips: Vec<daw_ui_core::AutomationClipKey>,
+    /// M14 Phase 63n-6 (#031): per-track row 高さ override の永続 store (`track_id -> u16`)。
+    /// `SetSingleTrackRowH { track, prev: _, next }` 受信で `insert(track, next)`、 widget へ渡すときは
+    /// `t.row_h = m.arr_track_row_h.get(&t.id).copied()` で `Some(h)` / `None` を反映。 None で `view.track_row_h`
+    /// global default にフォールバック (= override されていない track は既存 Alt+wheel global zoom に追従)。
+    arr_track_row_h: std::collections::HashMap<u32, u16>,
     /// M14 Phase 63e (#019): linked clone で発番する group id の counter。
     /// `CloneClipsLinked` 受信時、 source に group_id がなければ新採番、 source / dst 両方に
     /// 同じ id を assign。 `arr_tracks_for_widget` で `(gid as f32 * 0.618034).rem_euclid(1.0)`
@@ -226,6 +231,7 @@ impl DawModel {
                 h
             },
             arr_selected_automation_clips: Vec::new(),
+            arr_track_row_h: std::collections::HashMap::new(),
             arr_next_share_group_id: 0,
             arr_rename_target: None,
             demo_chain: vec![
@@ -822,6 +828,9 @@ fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
                 .get(&t.id)
                 .cloned()
                 .unwrap_or_default(),
+            // M14 Phase 63n-6 (#031): per-track row 高さ override (新 splitter / Alt+drag 経由で
+            // `SetSingleTrackRowH` を受信したら `Some(next)` に格納される)。 caller の store から取得。
+            row_h: m.arr_track_row_h.get(&t.id).copied(),
         })
         .collect()
 }
@@ -1417,9 +1426,12 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 mm.arr_view.track_top = top.clamp(0.0, max_top);
             }),
             ArrangementEditRequest::SetTrackRowH(h) => Edit::mutate(move |mm: &mut DawModel| {
-                let new_h = h.clamp(16.0, 96.0);
+                // M10 Phase 48 / M14 Phase 63n-6 (#031): global row 高さ zoom (Alt+wheel)。
+                // floor 16 / cap 1000 は readability + 画面いっぱい拡張 (#031)。 per-track override
+                // (`arr_track_row_h: HashMap<u32, u16>`) は別経路 (= `SetSingleTrackRowH`) なのでここでは
+                // 触らない (= override 済 track は global zoom に追従しない、 Bitwig per-track と同 idiom)。
+                let new_h = h.clamp(16.0, 1000.0);
                 mm.arr_view.track_row_h = new_h;
-                // row_h 変化に伴う track_top の上限再計算 (拡大時に下端が空かないように)。
                 let max_top = (mm.arr_tracks.len() as f32 - mm.arr_view.tracks_visible)
                     .max(0.0)
                     * new_h;
@@ -1427,6 +1439,17 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 mm.arr_view.data_generation += 1;
                 mm.last_action = format!("arr: SetTrackRowH → {new_h:.1}");
             }),
+            ArrangementEditRequest::SetSingleTrackRowH { track, prev: _, next } => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    // M14 Phase 63n-6 (#031): per-track row 高さ override。 caller-side clamp は
+                    // `[16, 1000]` (global と同 range)、 widget は floor 1 px のみで raw u16 を渡す。
+                    let new_h = next.clamp(16, 1000);
+                    mm.arr_track_row_h.insert(track, new_h);
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action =
+                        format!("arr: SetSingleTrackRowH t{track} → {new_h} px");
+                })
+            }
             ArrangementEditRequest::ToggleGroupCollapsed(id) => Edit::mutate(move |mm: &mut DawModel| {
                 if mm.arr_collapsed_groups.contains(&id) {
                     mm.arr_collapsed_groups.remove(&id);
