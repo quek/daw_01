@@ -559,6 +559,17 @@ pub enum ArrangementEditRequest {
         time_beat: f64,
         value_norm: f32,
     },
+    /// M14 Phase 63n-4 (#029): lane body 内 clip ギャップ (= 既存 clip と x 範囲が重ならない empty zone)
+    /// での dblclick による automation clip 新規作成。 MIDI `DoubleClickEmpty { track, beat }` の lane 版
+    /// idiom: `start_beat` は widget 側で snap 適用済 (Alt+dblclick で snap 一時無効、 既存 dblclick と
+    /// 同 idiom)、 `len_beats` は `style.automation_clip_default_len_beats` (default 4.0) を渡す suggestion。
+    /// caller は自前ポリシー (project 既定長 / 次 clip 直前まで cap / 既存 clip と overlap 拒否) で
+    /// 上書き可能。 既存 clip 上の dblclick は引き続き `AddAutomationPoint` (widget 内 priority 排他)。
+    CreateAutomationClip {
+        lane: AutomationLaneKey,
+        start_beat: f64,
+        len_beats: f64,
+    },
     /// M14 Phase 63n-2 (#028): lane 内 point の drag (release 時に 1 度発火)。 `point_idx` は
     /// **drag 開始時 frame の index** (caller の `clip.points` 配列 index)。 release frame 時点で
     /// caller の Vec が drag 開始時から再配列されていない前提 (drag 中に他 thread から変更が
@@ -822,6 +833,12 @@ pub struct ArrangementStyle {
     pub automation_default_line_width_px: f32,
     /// lane 内 clip rect の縦 padding (px、 上下にこの px を確保した残りを clip rect の高さに)。 default 6.0。
     pub automation_clip_v_pad_px: f32,
+    /// M14 Phase 63n-4 (#029): lane body 空き領域の dblclick で発行する `CreateAutomationClip`
+    /// の既定長 (拍)。 default 4.0 (= 1 bar @ 4/4)。 caller は受信時に自前のポリシー (例えば「次 clip
+    /// 直前まで cap」 / 「project 既定 length」) で上書き可能、 widget は単に既定値を suggestion として
+    /// 渡すのみ。 MIDI `DoubleClickEmpty` は caller が len を決める idiom だが、 lane は zoom / snap に
+    /// 合わせた賢い default を widget 側で持てる余地があるため style 経由で expose (#029 §A 参照)。
+    pub automation_clip_default_len_beats: f64,
     /// lane header の slider 帯 (default_value_norm 表示) の縦幅 (px)。 default 4.0。
     pub automation_default_band_h: f32,
     /// disclosure ▶ / ▼ glyph の描画 font size。 default = `track_text_size`。
@@ -941,6 +958,7 @@ impl Default for ArrangementStyle {
             automation_default_line_color: Color::rgba(1.0, 1.0, 1.0, 0.18),
             automation_default_line_width_px: 1.0,
             automation_clip_v_pad_px: 6.0,
+            automation_clip_default_len_beats: 4.0,
             automation_default_band_h: 4.0,
             automation_disclosure_size: 12.0,
             automation_lane_icon_size: 12.0,
@@ -5465,12 +5483,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ---- double-click (lanes 内で clip / lane body / 空白 track row) ----
-        // M14 Phase 63n-2 (#028): priority 順:
+        // M14 Phase 63n-2 (#028) + Phase 63n-4 (#029): priority 順:
         //  1. clip hit (track row 内 clip rect) → DoubleClickClip
         //  2. lane body 内 clip 内 (curve 描画域) → AddAutomationPoint (snap 適用)
-        //  3. track row の空き → DoubleClickEmpty
-        //  lane row の空き (clip ギャップ) は no-op (= 描画はあるが何も発火しない、
-        //  既存 DoubleClickEmpty が発火しないよう lane row を track row と区別する)。
+        //  3. lane body 内 clip ギャップ (= cursor の絶対 beat が既存 clip の x 範囲に重ならない) →
+        //     CreateAutomationClip (snap 適用、 default len は style.automation_clip_default_len_beats)
+        //  4. track row の空き → DoubleClickEmpty
+        //  lane padding 内 (clip と x overlap するが clip の縦 padding zone) は no-op (= ユーザの意図が
+        //  add-point か create-clip か判別できないため、 既存挙動を維持して何も発行しない)。
         if let Some((cx, cy)) = self.take_double_click_in_rect(lanes) {
             if let Some((hit_key, _)) =
                 clip_hit(&visible_tracks, &press_tops, view, lanes, cx, cy, style.resize_handle_px)
@@ -5487,12 +5507,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 style,
                 cy,
             ) {
-                // lane body dblclick: clip 内のみ AddAutomationPoint 発火 (clip ギャップは no-op)。
                 let track_id = visible_tracks[t_idx].id;
                 let lane = &visible_tracks[t_idx].automation_lanes[lane_idx];
                 if let Some((clip_key, time_local, value_norm)) =
                     automation_clip_at(track_id, lane, body_rect, view, style, cx, cy)
                 {
+                    // (2) lane body 内 clip 内 → AddAutomationPoint
                     let clip_ref = lane.clips.iter().find(|c| c.id == clip_key.clip);
                     let clip_start = clip_ref.map_or(0.0, |c| c.start_beat);
                     let clip_len = clip_ref.map_or(0.0, |c| c.len_beats);
@@ -5509,6 +5529,33 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         time_beat: snapped_local,
                         value_norm,
                     }));
+                } else if cx >= body_rect.x && cx < body_rect.x + body_rect.w {
+                    // (3) lane body 内 clip ギャップ → CreateAutomationClip。
+                    // beat-domain で「cursor の絶対 beat が既存 clip と重なるか」 を判定し、
+                    // 重ならない場合のみ発行する (= clip の縦 padding zone でも x が clip と重なって
+                    // いれば抑止、 ユーザの意図が「padding を狙った add-point」 なのか「new clip」 なのか
+                    // 判別できないため安全側 = no-op)。 cursor が clip の縦 padding 外で、 かつ x が
+                    // 任意の clip と重ならない場合のみ「真の empty」 と判定。
+                    let cursor_beat = px_to_beat(cx, lanes.x, lanes.w, view);
+                    let on_existing_clip = lane.clips.iter().any(|c| {
+                        cursor_beat >= c.start_beat && cursor_beat < c.start_beat + c.len_beats
+                    });
+                    if !on_existing_clip {
+                        let snapped_start = view.snap.snap_beat(
+                            cursor_beat,
+                            pointer.modifiers.alt,
+                            zoom_x_px_per_beat,
+                        );
+                        let lane_key = AutomationLaneKey {
+                            track: track_id,
+                            lane: lane.id,
+                        };
+                        self.push_edit(make_edit(ArrangementEditRequest::CreateAutomationClip {
+                            lane: lane_key,
+                            start_beat: snapped_start,
+                            len_beats: style.automation_clip_default_len_beats,
+                        }));
+                    }
                 }
             } else if let Some(idx) = track_index_from_y(cy, lanes.y, &press_tops)
                 && let Some(t) = visible_tracks.get(idx)

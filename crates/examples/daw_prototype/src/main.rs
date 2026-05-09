@@ -1635,6 +1635,48 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                     clip.track, clip.lane, clip.clip, time_beat, value_norm
                 );
             }),
+            // M14 Phase 63n-4 (#029): lane body 内 clip ギャップでの dblclick → 新規 automation clip 作成。
+            // widget は snap 適用済 start_beat と style 既定 len_beats を渡す。 prototype は単純に lane に
+            // 新 clip を追加 (新 id = 既存 max+1、 share_group なし、 Linear curve の point 1 個 [0.0, default])。
+            // 「次 clip 直前まで cap」 等の高度 policy は daw_01 本体実装で扱う想定 (prototype は最小実装)。
+            ArrangementEditRequest::CreateAutomationClip {
+                lane,
+                start_beat,
+                len_beats,
+            } => Edit::mutate(move |mm: &mut DawModel| {
+                if let Some(lanes) = mm.arr_automation_lanes.get_mut(&lane.track)
+                    && let Some(l) = lanes.iter_mut().find(|l| l.id == lane.lane)
+                {
+                    let new_id =
+                        l.clips.iter().map(|c| c.id).max().unwrap_or(0).wrapping_add(1);
+                    let default_norm = l.default_value_norm.clamp(0.0, 1.0);
+                    let new_clip = daw_ui_core::ArrangementAutomationClip {
+                        id: new_id,
+                        start_beat: start_beat.max(0.0),
+                        len_beats: len_beats.max(0.25),
+                        name: Arc::from(format!("auto{new_id}")),
+                        // 新 clip は default_value_norm を持つ 1 point から始める (= flat curve)。
+                        // user が dblclick で point を追加して curve を肉付けしていく想定。
+                        points: vec![daw_ui_core::ArrangementAutomationPoint {
+                            time_beat: 0.0,
+                            value_norm: default_norm,
+                            curve: daw_ui_core::ArrangementCurveKind::Linear,
+                        }],
+                        share_group_color: None,
+                    };
+                    let pos = l
+                        .clips
+                        .iter()
+                        .position(|c| c.start_beat > new_clip.start_beat)
+                        .unwrap_or(l.clips.len());
+                    l.clips.insert(pos, new_clip);
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!(
+                        "arr: CreateAutomationClip t{} l{} @{:.2} len={:.2}",
+                        lane.track, lane.lane, start_beat, len_beats
+                    );
+                }
+            }),
             ArrangementEditRequest::MoveAutomationPoints(deltas) => {
                 Edit::mutate(move |mm: &mut DawModel| {
                     let n = deltas.len();

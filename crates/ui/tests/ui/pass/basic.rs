@@ -316,6 +316,10 @@ fn main() {
                     ArrangementEditRequest::SelectAutomationClips { .. } => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
+                    // M14 Phase 63n-4 (#029): lane body 空き dblclick → CreateAutomationClip。
+                    ArrangementEditRequest::CreateAutomationClip { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
                 },
             );
             // M11 Phase 51: reorderable_list widget が non-Clone Model でコンパイルする。
