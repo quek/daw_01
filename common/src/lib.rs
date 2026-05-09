@@ -1,5 +1,6 @@
 pub mod audio_bridge;
 pub mod audio_render;
+pub mod automation;
 pub mod clap_scan;
 pub mod logging;
 pub mod meter;

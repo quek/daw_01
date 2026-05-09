@@ -333,6 +333,19 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }));
     }
 
+    // ----- Automation: A キー (gui_01 #028 §7.3) ----------------------------
+    // last-touched parameter (volume / pan / lane default knob 操作で更新) の
+    // lane を所有 track に追加。 既存の lane は visible / enabled = true で
+    // 復活、 該当 track の automation lane 群を即時展開。 `last_touched_param`
+    // が None / stale な場合は handler 内で status_message を出して no-op。
+    // gui_01 が text_input focus 中は自動 skip するので、 編集中に `a` を
+    // 打っても発火しない。
+    if ui.take_shortcut("daw.add_automation_from_last_touched") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::AddAutomationFromLastTouched);
+        }));
+    }
+
     // ----- Split (E) / Glue (J) — Phase 1 PR7 -------------------------------
     // MIDI / Audio / Vocal すべての clip kind に対して動作する統合操作。
     // 詳細は `docs/plan_audio_clip.md` §3.3。

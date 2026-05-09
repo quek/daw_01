@@ -580,6 +580,7 @@ impl LocalState {
                 n as u32,
                 playing,
                 any_solo,
+                playhead,
             );
 
             // Publish per-track peak meters into the shared AudioBridge
@@ -927,8 +928,6 @@ pub fn process_track_owned(
     }
 
     // ---- Mixer strip + master accumulate ----
-    let volume = song_track.volume;
-    let pan = song_track.pan.clamp(-1.0, 1.0);
     let muted = song_track.muted;
     let solo = song_track.solo;
     let effective_mute = muted || (any_solo && !solo);
@@ -942,14 +941,31 @@ pub fn process_track_owned(
         scratch.peak_l = 0.0;
         scratch.peak_r = 0.0;
     } else {
-        let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
-        let gain_l = angle.cos() * volume;
-        let gain_r = angle.sin() * volume;
+        // Fill the per-sample volume / pan ramps. With no automation
+        // lane this fills both buffers with the constant track strip
+        // values; with a `Volume` / `Pan` lane each sample gets the
+        // curve value. RT-safe: in-place writes only.
+        let bpm = song.map(|s| s.bpm).unwrap_or(120.0);
+        crate::automation::fill_track_param_ramps(
+            song,
+            track_idx,
+            sample_rate,
+            bpm,
+            playhead,
+            frames,
+            &mut scratch.volume_per_sample,
+            &mut scratch.pan_per_sample,
+        );
         let mut peak_l = 0.0_f32;
         let mut peak_r = 0.0_f32;
-        // Apply the strip in-place so the master reducer can accumulate
-        // raw track samples. No global write here — race-free.
+        // Apply the strip per-sample so volume / pan automation lands
+        // sample-accurately. No global write — race-free.
         for i in 0..n {
+            let pan = scratch.pan_per_sample[i].clamp(-1.0, 1.0);
+            let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+            let vol = scratch.volume_per_sample[i];
+            let gain_l = angle.cos() * vol;
+            let gain_r = angle.sin() * vol;
             let l = scratch.track_l[i] * gain_l;
             let r = scratch.track_r[i] * gain_r;
             scratch.track_l[i] = l;
@@ -1014,6 +1030,7 @@ pub fn execute_schedule_post_dispatch(
     frames: u32,
     playing: bool,
     any_solo: bool,
+    playhead: u64,
 ) {
     // `nodes` の不変参照と `delay_lines` の可変参照を同時に取りたい
     // (ApplyDelay で line を引きながら nodes を回すため)。 `Schedule`
@@ -1056,6 +1073,7 @@ pub fn execute_schedule_post_dispatch(
                     continue;
                 };
                 run_group_fx_chain(
+                    *track_idx,
                     track,
                     song,
                     target,
@@ -1063,6 +1081,7 @@ pub fn execute_schedule_post_dispatch(
                     slot_to_plugin_id,
                     worker_sync,
                     sample_rate,
+                    playhead,
                     frames,
                     playing,
                     any_solo,
@@ -1253,6 +1272,7 @@ fn has_soloed_descendant(song: &Song, track_id: u32) -> bool {
 /// have no clips of their own.
 #[allow(clippy::too_many_arguments)]
 fn run_group_fx_chain(
+    track_idx: u32,
     song_track: &Track,
     song: &Song,
     scratch: &mut TrackScratch,
@@ -1260,6 +1280,7 @@ fn run_group_fx_chain(
     slot_to_plugin_id: &HashMap<(u32, PluginSlot), u32>,
     worker_sync: Option<&WorkerSyncRef>,
     sample_rate: u32,
+    playhead: u64,
     frames: u32,
     playing: bool,
     any_solo: bool,
@@ -1294,8 +1315,6 @@ fn run_group_fx_chain(
         scratch.track_r[..n].copy_from_slice(&pd.buffer_out[1][..n]);
     }
 
-    let volume = song_track.volume;
-    let pan = song_track.pan.clamp(-1.0, 1.0);
     let muted = song_track.muted;
     let solo = song_track.solo;
     // Live 互換: 子のいずれかが solo されている場合、 group 自身は
@@ -1312,12 +1331,24 @@ fn run_group_fx_chain(
         scratch.peak_l = 0.0;
         scratch.peak_r = 0.0;
     } else {
-        let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
-        let gain_l = angle.cos() * volume;
-        let gain_r = angle.sin() * volume;
+        crate::automation::fill_track_param_ramps(
+            Some(song),
+            track_idx,
+            sample_rate,
+            song.bpm,
+            playhead,
+            frames,
+            &mut scratch.volume_per_sample,
+            &mut scratch.pan_per_sample,
+        );
         let mut peak_l = 0.0_f32;
         let mut peak_r = 0.0_f32;
         for i in 0..n {
+            let pan = scratch.pan_per_sample[i].clamp(-1.0, 1.0);
+            let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+            let vol = scratch.volume_per_sample[i];
+            let gain_l = angle.cos() * vol;
+            let gain_r = angle.sin() * vol;
             let l = scratch.track_l[i] * gain_l;
             let r = scratch.track_r[i] * gain_r;
             scratch.track_l[i] = l;
@@ -1403,6 +1434,7 @@ mod sidechain_tests {
             FRAMES as u32,
             true,
             false,
+            0,
         );
 
         for i in 0..FRAMES {

@@ -162,6 +162,95 @@ pub struct ClipRef {
     pub clip: u32,
 }
 
+/// gui_01 #028: 1 point の addressing。daw_01 側は `(track_id, lane_id,
+/// clip_id, point_idx)` 4-tuple で持つ (gui_01 の `AutomationPointKey`
+/// と 1:1 対応)。`AppEvent::DeleteAutomationPoints` などの batch event
+/// で複数受ける。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AutomationPointKeyRef {
+    pub track_id: u32,
+    pub lane_id: u32,
+    pub clip_id: u32,
+    pub point_idx: u32,
+}
+
+/// gui_01 #028: `MoveAutomationPoints` 用の 1 point delta。`value_norm`
+/// は normalized 0..1 (widget が cursor 座標から計算した値)、handler が
+/// `lane.target` を引いて plain 単位に逆変換する。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MoveAutomationPointEntry {
+    pub key: AutomationPointKeyRef,
+    pub prev_time_beat: f64,
+    pub prev_value_norm: f32,
+    pub next_time_beat: f64,
+    pub next_value_norm: f32,
+}
+
+/// gui_01 #028 (Phase 63n-3): `MoveAutomationClips` /
+/// `CloneAutomationClipsLinked` / `CloneAutomationClipsIndependent` 用
+/// の 1 clip delta。`from` source clip → `to_lane` の `next_start_beat`
+/// 位置へ移動 / 共有コピー / 独立コピー。lane 跨ぎは target 不一致でも
+/// 全 accept (Bitwig 流、`docs/plan_automation.md` §5.4)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MoveAutomationClipEntry {
+    pub from: common::model::AutomationClipKey,
+    pub to_lane: common::model::AutomationLaneKey,
+    pub prev_start_beat: f64,
+    pub next_start_beat: f64,
+}
+
+/// gui_01 #028 (Phase 63n-3): `ResizeAutomationClips` 用の 1 clip delta。
+/// 左 edge drag は `next_start` + `next_len` 両方変動、右 edge drag は
+/// `next_len` のみ変動 (`prev_start == next_start`)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResizeAutomationClipEntry {
+    pub key: common::model::AutomationClipKey,
+    pub prev_start: f64,
+    pub prev_len: f64,
+    pub next_start: f64,
+    pub next_len: f64,
+}
+
+/// gui_01 #028 §7.3: `AutomationTarget` に対する人間可読 display name。
+/// Inspector の knob hint や status_message で使う。`Plugin Param N` は
+/// Phase 2 で IPC 経由で実 plugin の param name に置換する。
+pub fn automation_target_display_name(
+    target: &common::model::AutomationTarget,
+) -> String {
+    use common::model::{AutomationTarget, TrackBuiltinParam};
+    match target {
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => "Volume".into(),
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan) => "Pan".into(),
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute) => "Mute".into(),
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_idx }) => {
+            format!("Send {}", send_idx + 1)
+        }
+        AutomationTarget::PluginParam { param_id, .. } => format!("Param {param_id}"),
+        AutomationTarget::SongTempo => "Tempo".into(),
+        AutomationTarget::SongTimeSigNumerator => "Time Sig".into(),
+    }
+}
+
+/// gui_01 #028 §7.3: 最後にユーザーが触った parameter。`A` キー
+/// shortcut で「現在 selected_track の lane に追加」 する際の source。
+/// session-only (起動時 None、Undo / save 対象外)。
+///
+/// `track_id` は Bitwig 流に「touched parameter が **属する track**」
+/// (selected_track ではなく)。これにより別 track のプラグインを
+/// inspector で触った後 `A` を押すと、その plugin が乗る track 上に
+/// lane ができる (= 期待動作)。
+#[derive(Debug, Clone)]
+pub struct TouchedParam {
+    pub track_id: u32,
+    pub target: common::model::AutomationTarget,
+    /// inspector の hint 表示や status_message で使う名前
+    /// ("Volume" / "Pan" / "Cutoff (Serum)" 等)。
+    pub display_name: String,
+    /// 設定時刻。stale 判定 (= track / plugin が削除されたあとの自動
+    /// クリア) 用。
+    pub touched_at: std::time::Instant,
+}
+
 pub const ARRANGE_PX_PER_BEAT: f32 = 24.0;
 pub const ARRANGE_TRACK_HEIGHT: f32 = 88.0;
 pub const DEFAULT_NOTE_DURATION: f64 = 0.25;
@@ -228,6 +317,31 @@ pub struct AppData {
     /// 折り畳み中の group track id 集合。 group 自身が `kind == Group`
     /// (= 子を持つ) かつこの set に含まれていれば子孫の row を hide。
     pub collapsed_groups: std::collections::HashSet<u32>,
+    /// gui_01 #028 (M14 Phase 63n-1): automation lane 群を **展開中** の
+    /// track id 集合 (Bitwig 流: 既定は折り畳み)。 含まれない track の
+    /// `automation_lanes_collapsed = true` を widget へ渡す。 ▶/▼ click
+    /// で `ToggleTrackAutomationCollapsed` イベント経由に insert/remove。
+    /// プロジェクト保存対象ではない (= session-only): UI 状態は再起動で
+    /// 既定 (全 collapsed) に戻る。
+    pub expanded_automation_tracks: std::collections::HashSet<u32>,
+    /// gui_01 #028 (M14 Phase 63n-3): 選択中の automation clip。 MIDI
+    /// clip 用 `selected_clips` と直交 (= 同時に両方を持てる、 他 DAW
+    /// 互換)。 widget の `SelectAutomationClips` で上書き、 widget へは
+    /// 毎フレーム `&[AutomationClipKey]` で渡して selected highlight を
+    /// 描画させる。 session-only。
+    pub selected_automation_clips: Vec<common::model::AutomationClipKey>,
+    /// gui_01 #028 §7.3: 最後にユーザーが触った parameter。`A` キー
+    /// shortcut で「対応 lane を所有 track に追加」 する source。
+    /// session-only (起動 None、Undo / save 対象外)。
+    pub last_touched_param: Option<TouchedParam>,
+    /// gui_01 #031 (M14 Phase 63n-6): track ごとの row 高さ override。
+    /// `Some(px)` で個別 track 高さ、`None` (= map に entry なし) で
+    /// global default `arrange_track_row_h` を使う。 widget の Alt+drag
+    /// or 下端 splitter drag で `SetSingleTrackRowH` 発火 → ここに反映。
+    /// Alt+wheel は引き続き global を変える (`SetTrackRowH`)。
+    /// session-only (= save / Undo 対象外、 必要になったら `Track.row_h`
+    /// として model 化する)。
+    pub track_row_overrides: std::collections::HashMap<u32, u16>,
     /// `track_id → 現在ロード済の plugin_id 列`。 plugin_host から
     /// `SlotPluginLoaded` を受信したときに register、 `SlotPluginUnloaded`
     /// で drain。 `RemoveTrack` を plugin_host に送る前に audio engine
@@ -522,6 +636,10 @@ impl AppData {
             arrangement_hover_clip: None,
             selected_track_ids: Vec::new(),
             collapsed_groups: std::collections::HashSet::new(),
+            expanded_automation_tracks: std::collections::HashSet::new(),
+            selected_automation_clips: Vec::new(),
+            last_touched_param: None,
+            track_row_overrides: std::collections::HashMap::new(),
             track_plugin_ids: std::collections::HashMap::new(),
             loaded_slots: std::collections::HashMap::new(),
             plugin_latencies: std::collections::HashMap::new(),
@@ -1116,6 +1234,26 @@ impl AppData {
                 | AppEvent::CommitBpmEdit
                 | AppEvent::CommitTimeSigNumEdit
                 | AppEvent::SetSongTimeSigDenominator(_)
+                // gui_01 #028 (Phase 63n-1/-2/-3): automation lane / point / clip 編集。
+                // SetLaneDefault / SetLaneEnabled / SetLaneVisible 等の knob / toggle 系
+                // は drag 中の連続発火 (live preview) を考慮すると個別に Undo step 化
+                // するのは UX 過多なので、 構造変化系 (lane add / delete / clip 追加削除
+                // / point 追加削除 / curve type 変更) のみ undoable に登録する。
+                // SetLaneDefault と SetAutomationCurveType は { prev, next } を持つので
+                // 後で snapshotless Undo に置換できるが、 当面は Song snapshot 経由。
+                | AppEvent::AddAutomationFromLastTouched
+                | AppEvent::CreateAutomationClip { .. }
+                | AppEvent::DeleteLane { .. }
+                | AppEvent::AddAutomationPoint { .. }
+                | AppEvent::MoveAutomationPoints { .. }
+                | AppEvent::DeleteAutomationPoints { .. }
+                | AppEvent::SetAutomationCurveType { .. }
+                | AppEvent::MoveAutomationClips { .. }
+                | AppEvent::CloneAutomationClipsLinked { .. }
+                | AppEvent::CloneAutomationClipsIndependent { .. }
+                | AppEvent::ResizeAutomationClips { .. }
+                | AppEvent::DeleteAutomationClips { .. }
+                | AppEvent::MakeAutomationClipUnique(_)
         )
     }
 
@@ -1361,6 +1499,166 @@ pub enum AppEvent {
     /// unbounded).
     GroupSelectedTracks {
         track_ids: Vec<u32>,
+    },
+    /// gui_01 #028 (M14 Phase 63n-1): track 行の disclosure ▶/▼ click。
+    /// `expanded_automation_tracks` の `track_id` を反転し、 widget が
+    /// 次フレームで lane 群を展開 / 折り畳む。 session-only な UI 状態
+    /// なので Undo / save 対象外。
+    ToggleTrackAutomationCollapsed {
+        track_id: u32,
+    },
+    // ----------------------------------------------------------------
+    // gui_01 #028 (M14 Phase 63n-2) — automation lane / point 編集
+    // ----------------------------------------------------------------
+    /// Lane 全体の bypass。`★`/`☆` icon click。
+    SetLaneEnabled {
+        track_id: u32,
+        lane_id: u32,
+        enabled: bool,
+    },
+    /// Lane の表示 / 非表示。`👁` icon click。
+    SetLaneVisible {
+        track_id: u32,
+        lane_id: u32,
+        visible: bool,
+    },
+    /// Lane header の default value slider drag。`prev` / `next` は
+    /// 共に **normalized 0..1** (widget の slider 帯と同単位)。handler
+    /// 側で `lane.target` を引いて plain 単位に逆変換してから格納する。
+    /// drag 中は per-frame で発火 (live preview)、release で 1 度確定。
+    SetLaneDefault {
+        track_id: u32,
+        lane_id: u32,
+        prev_norm: f32,
+        next_norm: f32,
+    },
+    /// Lane の `✕` icon click → `Track.automation_lanes` から該当 lane
+    /// を除去。lane 内 clip の `content_id` が他 clip と共有されてい
+    /// なければ `clip_contents` の該当 entry も `gc_clip_contents`
+    /// 次サイクルで GC される (このイベント自体は触らない)。
+    DeleteLane {
+        track_id: u32,
+        lane_id: u32,
+    },
+    /// gui_01 #030 (M14 Phase 63n-5): lane 高さ drag (Alt+drag or
+    /// 下端 splitter)。`prev` / `next` は px、widget 側で
+    /// `[automation_lane_min_height_px, automation_lane_max_height_px]`
+    /// に clamp 済。drag 中は per-frame 発火 (live preview)、release で
+    /// 1 件確定。`SetLaneDefault` と同パターン。
+    SetLaneHeight {
+        track_id: u32,
+        lane_id: u32,
+        prev_px: u16,
+        next_px: u16,
+    },
+    /// gui_01 #031 (M14 Phase 63n-6): MIDI track row 高さの個別 override。
+    /// Alt+drag or 下端 splitter drag で発火。 既存 `Alt+wheel`
+    /// (`SetTrackRowH(f32)` = global default) と独立、 個別 track は
+    /// override map に保存。 drag 中は per-frame 発火、 release で確定。
+    SetSingleTrackRowH {
+        track_id: u32,
+        prev_px: u16,
+        next_px: u16,
+    },
+    /// Lane body 内 dblclick で 1 point 追加。`time_beat` は clip-local、
+    /// `value_norm` は normalized 0..1 (widget が clip rect 内 cursor
+    /// 座標から計算済)。handler は norm → plain 変換 + `time_beat` 昇順
+    /// 維持を担当。
+    AddAutomationPoint {
+        track_id: u32,
+        lane_id: u32,
+        clip_id: u32,
+        time_beat: f64,
+        value_norm: f32,
+    },
+    /// 1 つ以上の point の position 更新 (release 時に 1 度発火)。
+    /// `MoveAutomationPointEntry` の `value_norm` は normalized、handler
+    /// 側で plain 化。`point_idx` は **同 frame 内のみ valid** なので、
+    /// drag session 内では gui_01 widget が prev_index を保持する前提
+    /// (本 event 受信時はそのフレームの index で OK)。
+    MoveAutomationPoints {
+        deltas: Vec<MoveAutomationPointEntry>,
+    },
+    /// Alt+click on point → 即時削除 (1 件)、もしくは将来の rect select
+    /// → 一括削除を batch で受ける。`Vec<AutomationPointKey>` を
+    /// daw_01 内部型 (`(track_id, lane_id, clip_id, point_idx)` 4-tuple
+    /// 相当) で運ぶ。
+    DeleteAutomationPoints {
+        points: Vec<AutomationPointKeyRef>,
+    },
+    /// 右クリック popup → curve type 選択 → 1 point の `curve` 更新。
+    /// `prev` / `next` は Undo 構築用に両方持たせる (gui_01 §11.4 と
+    /// 同 idiom、`SetTrackVolume` 等と同じ pattern)。
+    SetAutomationCurveType {
+        track_id: u32,
+        lane_id: u32,
+        clip_id: u32,
+        point_idx: u32,
+        prev: common::model::AutomationCurve,
+        next: common::model::AutomationCurve,
+    },
+    // ----------------------------------------------------------------
+    // gui_01 #028 (M14 Phase 63n-3) — automation clip drag / select
+    // ----------------------------------------------------------------
+    /// 修飾なし drag release → source lane から clip を remove + `to_lane`
+    /// に start_beat 昇順 insert。lane 跨ぎ accept (target 不一致も OK)。
+    MoveAutomationClips {
+        deltas: Vec<MoveAutomationClipEntry>,
+    },
+    /// Ctrl+drag release → source 残置 + 同一 `ContentId` を持つ新 clip
+    /// を `to_lane` に追加 (linked、curve を共有)。
+    CloneAutomationClipsLinked {
+        deltas: Vec<MoveAutomationClipEntry>,
+    },
+    /// Ctrl+Shift+drag release → source 残置 + content を deep clone (新
+    /// `ContentId` 採番) した独立 clip を `to_lane` に追加。
+    CloneAutomationClipsIndependent {
+        deltas: Vec<MoveAutomationClipEntry>,
+    },
+    /// 左右 edge drag release → 各 clip の start / len 上書き。
+    ResizeAutomationClips {
+        deltas: Vec<ResizeAutomationClipEntry>,
+    },
+    /// caller-driven (右クリック menu / shortcut から発火、 widget は
+    /// 提供せず) → 該当 lane から `clip_id` で除去。content の GC は次の
+    /// save / `gc_clip_contents` で行う。
+    DeleteAutomationClips {
+        keys: Vec<common::model::AutomationClipKey>,
+    },
+    /// 短 click on automation clip → `selected_automation_clips` を
+    /// `next` で上書き。MIDI 用 `selected_clips` は触らない (= 共存)。
+    SelectAutomationClips {
+        prev: Vec<common::model::AutomationClipKey>,
+        next: Vec<common::model::AutomationClipKey>,
+    },
+    /// 右クリック menu「Make Unique」 → 共有中 (`refcount >= 2`) の
+    /// automation clip の content を deep clone (新 `ContentId`)、独立化。
+    /// 既に独立 clip の場合は status_message で通知。MIDI clip 用
+    /// `MakeClipUnique(ClipRef)` と同 idiom の lane 版。
+    MakeAutomationClipUnique(common::model::AutomationClipKey),
+    /// gui_01 #028 §7.3: parameter touch 通知。inspector の knob drag /
+    /// plugin GUI の knob 操作 (Phase 2+ で IPC 経由) で発火し、
+    /// `last_touched_param` を更新。`A` キー shortcut の source になる。
+    /// session-only / Undo 不要。
+    TouchParam {
+        track_id: u32,
+        target: common::model::AutomationTarget,
+        display_name: String,
+    },
+    /// `A` キー shortcut。`last_touched_param` の lane を該当 track に
+    /// 追加。既に同 target の lane があれば visible = true で復活、なけ
+    /// れば新規作成 (default = 現在の plain 値)。`expanded_automation_tracks`
+    /// にも所有 track を insert して即時展開。
+    AddAutomationFromLastTouched,
+    /// gui_01 #029 (M14 Phase 63n-4): lane body 内 clip ギャップ
+    /// dblclick で発行される clip 作成イベント。MIDI clip の
+    /// `DoubleClickEmpty → CreateClip` と同 idiom の lane 版。
+    /// `start_beat` は widget が snap 適用済、`len_beats` は widget
+    /// style の `automation_clip_default_len_beats` (default 4.0)。
+    CreateAutomationClip {
+        lane: common::model::AutomationLaneKey,
+        start_beat: f64,
+        len_beats: f64,
     },
     /// Ungroup the selected group tracks. Children are reparented to
     /// the group's own parent (master or upper group), then the group
@@ -1953,6 +2251,105 @@ impl AppData {
             AppEvent::GroupSelectedTracks { track_ids } => {
                 self.action_group_selected_tracks(&track_ids);
             }
+            AppEvent::ToggleTrackAutomationCollapsed { track_id } => {
+                if !self.expanded_automation_tracks.insert(track_id) {
+                    self.expanded_automation_tracks.remove(&track_id);
+                }
+            }
+            AppEvent::SetLaneEnabled {
+                track_id,
+                lane_id,
+                enabled,
+            } => self.set_lane_enabled(track_id, lane_id, enabled),
+            AppEvent::SetLaneVisible {
+                track_id,
+                lane_id,
+                visible,
+            } => self.set_lane_visible(track_id, lane_id, visible),
+            AppEvent::SetLaneDefault {
+                track_id,
+                lane_id,
+                prev_norm: _,
+                next_norm,
+            } => self.set_lane_default(track_id, lane_id, next_norm),
+            AppEvent::DeleteLane { track_id, lane_id } => {
+                self.delete_lane(track_id, lane_id)
+            }
+            AppEvent::SetLaneHeight {
+                track_id,
+                lane_id,
+                prev_px: _,
+                next_px,
+            } => self.set_lane_height(track_id, lane_id, next_px),
+            AppEvent::SetSingleTrackRowH {
+                track_id,
+                prev_px: _,
+                next_px,
+            } => {
+                self.track_row_overrides.insert(track_id, next_px);
+            }
+            AppEvent::AddAutomationPoint {
+                track_id,
+                lane_id,
+                clip_id,
+                time_beat,
+                value_norm,
+            } => self.add_automation_point(track_id, lane_id, clip_id, time_beat, value_norm),
+            AppEvent::MoveAutomationPoints { deltas } => {
+                self.move_automation_points(&deltas)
+            }
+            AppEvent::DeleteAutomationPoints { points } => {
+                self.delete_automation_points(&points)
+            }
+            AppEvent::SetAutomationCurveType {
+                track_id,
+                lane_id,
+                clip_id,
+                point_idx,
+                prev: _,
+                next,
+            } => self.set_automation_curve_type(track_id, lane_id, clip_id, point_idx, next),
+            AppEvent::MoveAutomationClips { deltas } => {
+                self.move_automation_clips(&deltas)
+            }
+            AppEvent::CloneAutomationClipsLinked { deltas } => {
+                self.clone_automation_clips_linked(&deltas)
+            }
+            AppEvent::CloneAutomationClipsIndependent { deltas } => {
+                self.clone_automation_clips_independent(&deltas)
+            }
+            AppEvent::ResizeAutomationClips { deltas } => {
+                self.resize_automation_clips(&deltas)
+            }
+            AppEvent::DeleteAutomationClips { keys } => {
+                self.delete_automation_clips(&keys)
+            }
+            AppEvent::SelectAutomationClips { prev: _, next } => {
+                self.selected_automation_clips = next;
+            }
+            AppEvent::MakeAutomationClipUnique(key) => {
+                self.make_automation_clip_unique(key);
+            }
+            AppEvent::TouchParam {
+                track_id,
+                target,
+                display_name,
+            } => {
+                self.last_touched_param = Some(TouchedParam {
+                    track_id,
+                    target,
+                    display_name,
+                    touched_at: std::time::Instant::now(),
+                });
+            }
+            AppEvent::AddAutomationFromLastTouched => {
+                self.add_automation_from_last_touched();
+            }
+            AppEvent::CreateAutomationClip {
+                lane,
+                start_beat,
+                len_beats,
+            } => self.create_automation_clip(lane, start_beat, len_beats),
             AppEvent::UngroupTracks { track_ids } => {
                 self.action_ungroup_tracks(&track_ids);
             }
@@ -3725,6 +4122,598 @@ impl AppData {
     /// their immediate parent pointer is rewritten. If a selected
     /// track was a group itself, it ends up nested under the new
     /// group (depth unbounded).
+    // ----------------------------------------------------------------
+    // gui_01 #028 (M14 Phase 63n-2) — automation lane / point handlers
+    // ----------------------------------------------------------------
+
+    fn set_lane_enabled(&mut self, track_id: u32, lane_id: u32, enabled: bool) {
+        if let Some(track) = self.song.track_by_id_mut(track_id)
+            && let Some(lane) = track.lane_by_id_mut(lane_id)
+        {
+            lane.enabled = enabled;
+            self.sync_song_to_plugin_host();
+        }
+    }
+
+    fn set_lane_visible(&mut self, track_id: u32, lane_id: u32, visible: bool) {
+        if let Some(track) = self.song.track_by_id_mut(track_id)
+            && let Some(lane) = track.lane_by_id_mut(lane_id)
+        {
+            lane.visible = visible;
+            // visible は再生に影響しないが、Song 構造の変化なので同期。
+            self.sync_song_to_plugin_host();
+        }
+    }
+
+    /// Lane header default slider drag (release / live preview)。
+    /// `next_norm` は normalized 0..=1、target に応じて plain 単位に
+    /// 逆変換してから格納する。同時に last-touched param も更新する
+    /// (lane default knob を回した後 `A` を押すと同 lane が visible
+    /// 復活する閉ループ)。
+    fn set_lane_default(&mut self, track_id: u32, lane_id: u32, next_norm: f32) {
+        let Some(track) = self.song.track_by_id_mut(track_id) else {
+            return;
+        };
+        let Some(lane) = track.lane_by_id_mut(lane_id) else {
+            return;
+        };
+        let target = lane.target.clone();
+        lane.default_value = common::automation::norm_to_plain(&target, next_norm);
+        let display_name = automation_target_display_name(&target);
+        self.last_touched_param = Some(TouchedParam {
+            track_id,
+            target,
+            display_name,
+            touched_at: std::time::Instant::now(),
+        });
+        self.sync_song_to_plugin_host();
+    }
+
+    /// gui_01 #030 (M14 Phase 63n-5): lane 高さ drag。`next_px` は
+    /// widget 側で min/max に clamp 済なのでそのまま反映。
+    fn set_lane_height(&mut self, track_id: u32, lane_id: u32, next_px: u16) {
+        if let Some(track) = self.song.track_by_id_mut(track_id)
+            && let Some(lane) = track.lane_by_id_mut(lane_id)
+        {
+            lane.height_px = next_px;
+            // 高さは描画状態のみで再生に影響しないが、 Song 構造の
+            // 変化なので同期 (= 他 process が song を読むときに矛盾
+            // しないよう)。
+            self.sync_song_to_plugin_host();
+        }
+    }
+
+    fn delete_lane(&mut self, track_id: u32, lane_id: u32) {
+        if let Some(track) = self.song.track_by_id_mut(track_id)
+            && let Some(idx) = track.lane_index_by_id(lane_id)
+        {
+            track.automation_lanes.remove(idx);
+            // 共有先のなくなった clip_contents は次の save / GC で
+            // 自動回収。
+            self.sync_song_to_plugin_host();
+        }
+    }
+
+    /// dblclick on lane body → 1 point 追加。clip-local `time_beat`
+    /// 昇順を保つよう挿入位置を二分探索で決める。
+    fn add_automation_point(
+        &mut self,
+        track_id: u32,
+        lane_id: u32,
+        clip_id: u32,
+        time_beat: f64,
+        value_norm: f32,
+    ) {
+        let Some(track) = self.song.track_by_id_mut(track_id) else {
+            return;
+        };
+        let Some(lane) = track.lane_by_id_mut(lane_id) else {
+            return;
+        };
+        let target = lane.target.clone();
+        let Some(clip) = lane.clip_by_id(clip_id) else {
+            return;
+        };
+        let content_id = clip.content_id;
+        let plain = common::automation::norm_to_plain(&target, value_norm);
+        let entry = self
+            .song
+            .clip_contents
+            .entry(content_id)
+            .or_insert_with(|| {
+                common::model::ClipContent::Automation(
+                    common::model::AutomationContent::default(),
+                )
+            });
+        let points = match entry {
+            common::model::ClipContent::Automation(a) => &mut a.points,
+            _ => {
+                tracing::warn!(
+                    content_id,
+                    "AddAutomationPoint: content variant is not Automation, skipping"
+                );
+                return;
+            }
+        };
+        let new_point = common::model::AutomationPoint {
+            time_beat,
+            value: plain,
+            curve: common::model::AutomationCurve::Linear,
+        };
+        let insert_at = points.partition_point(|p| p.time_beat <= time_beat);
+        points.insert(insert_at, new_point);
+        self.sync_song_to_plugin_host();
+    }
+
+    fn move_automation_points(&mut self, deltas: &[MoveAutomationPointEntry]) {
+        if deltas.is_empty() {
+            return;
+        }
+        // 各 delta の lane.target を引いて plain 化、同 clip 内の point
+        // を一括更新後に sort で昇順を保つ。同一 clip 複数 point は
+        // group して 1 度の sort で済ませる。
+        let mut touched: std::collections::HashSet<common::model::ContentId> =
+            std::collections::HashSet::new();
+        for delta in deltas {
+            let Some(track) = self.song.track_by_id_mut(delta.key.track_id) else {
+                continue;
+            };
+            let Some(lane) = track.lane_by_id_mut(delta.key.lane_id) else {
+                continue;
+            };
+            let target = lane.target.clone();
+            let Some(clip) = lane.clip_by_id(delta.key.clip_id) else {
+                continue;
+            };
+            let content_id = clip.content_id;
+            let plain = common::automation::norm_to_plain(&target, delta.next_value_norm);
+            let Some(entry) = self.song.clip_contents.get_mut(&content_id) else {
+                continue;
+            };
+            let common::model::ClipContent::Automation(a) = entry else {
+                continue;
+            };
+            if let Some(p) = a.points.get_mut(delta.key.point_idx as usize) {
+                p.time_beat = delta.next_time_beat;
+                p.value = plain;
+                touched.insert(content_id);
+            }
+        }
+        for cid in touched {
+            if let Some(common::model::ClipContent::Automation(a)) =
+                self.song.clip_contents.get_mut(&cid)
+            {
+                a.points.sort_by(|p1, p2| {
+                    p1.time_beat
+                        .partial_cmp(&p2.time_beat)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+        }
+        self.sync_song_to_plugin_host();
+    }
+
+    fn delete_automation_points(&mut self, points: &[AutomationPointKeyRef]) {
+        if points.is_empty() {
+            return;
+        }
+        // 同じ content_id でまとめて、index 降順で削除 (前から消すと
+        // 後の index がずれるため)。
+        let mut by_content: std::collections::HashMap<
+            common::model::ContentId,
+            Vec<u32>,
+        > = std::collections::HashMap::new();
+        for k in points {
+            let Some(track) = self.song.track_by_id(k.track_id) else {
+                continue;
+            };
+            let Some(lane) = track.lane_by_id(k.lane_id) else {
+                continue;
+            };
+            let Some(clip) = lane.clip_by_id(k.clip_id) else {
+                continue;
+            };
+            by_content.entry(clip.content_id).or_default().push(k.point_idx);
+        }
+        for (cid, mut indices) in by_content {
+            indices.sort_unstable_by(|a, b| b.cmp(a));
+            indices.dedup();
+            if let Some(common::model::ClipContent::Automation(a)) =
+                self.song.clip_contents.get_mut(&cid)
+            {
+                for idx in indices {
+                    if (idx as usize) < a.points.len() {
+                        a.points.remove(idx as usize);
+                    }
+                }
+            }
+        }
+        self.sync_song_to_plugin_host();
+    }
+
+    fn set_automation_curve_type(
+        &mut self,
+        track_id: u32,
+        lane_id: u32,
+        clip_id: u32,
+        point_idx: u32,
+        next: common::model::AutomationCurve,
+    ) {
+        let Some(track) = self.song.track_by_id_mut(track_id) else {
+            return;
+        };
+        let Some(lane) = track.lane_by_id_mut(lane_id) else {
+            return;
+        };
+        let Some(clip) = lane.clip_by_id(clip_id) else {
+            return;
+        };
+        let content_id = clip.content_id;
+        let Some(common::model::ClipContent::Automation(a)) =
+            self.song.clip_contents.get_mut(&content_id)
+        else {
+            return;
+        };
+        if let Some(p) = a.points.get_mut(point_idx as usize) {
+            p.curve = next;
+            self.sync_song_to_plugin_host();
+        }
+    }
+
+    /// 修飾なし drag release。source lane から取り出して target lane へ
+    /// `start_beat` 昇順 insert。lane 跨ぎ可、target 不一致でも accept
+    /// (curve は normalized なので意味温存、`docs/plan_automation.md`
+    /// §5.4)。
+    fn move_automation_clips(&mut self, deltas: &[MoveAutomationClipEntry]) {
+        if deltas.is_empty() {
+            return;
+        }
+        for d in deltas {
+            let mut taken: Option<common::model::AutomationClip> = None;
+            if let Some(source_track) = self.song.track_by_id_mut(d.from.track)
+                && let Some(source_lane) = source_track.lane_by_id_mut(d.from.lane)
+                && let Some(idx) = source_lane.clip_index_by_id(d.from.clip)
+            {
+                taken = Some(source_lane.clips.remove(idx));
+            }
+            let Some(mut clip) = taken else { continue };
+            clip.start_beat = d.next_start_beat;
+            if let Some(target_track) = self.song.track_by_id_mut(d.to_lane.track)
+                && let Some(target_lane) = target_track.lane_by_id_mut(d.to_lane.lane)
+            {
+                let start = clip.start_beat;
+                let pos = target_lane
+                    .clips
+                    .partition_point(|c| c.start_beat < start);
+                target_lane.clips.insert(pos, clip);
+            }
+        }
+        self.sync_song_to_plugin_host();
+    }
+
+    /// Ctrl+drag release。source は残置、同じ `ContentId` を持つ新 clip
+    /// を `to_lane` に追加 (linked: curve を共有)。target が source と
+    /// 同じ lane でも問題なく動く。
+    fn clone_automation_clips_linked(&mut self, deltas: &[MoveAutomationClipEntry]) {
+        if deltas.is_empty() {
+            return;
+        }
+        for d in deltas {
+            let template = {
+                let Some(source_track) = self.song.track_by_id(d.from.track) else {
+                    continue;
+                };
+                let Some(source_lane) = source_track.lane_by_id(d.from.lane) else {
+                    continue;
+                };
+                let Some(source_clip) = source_lane.clip_by_id(d.from.clip) else {
+                    continue;
+                };
+                (
+                    source_clip.content_id,
+                    source_clip.name.clone(),
+                    source_clip.length_beats,
+                )
+            };
+            let Some(target_track) = self.song.track_by_id_mut(d.to_lane.track) else {
+                continue;
+            };
+            let Some(target_lane) = target_track.lane_by_id_mut(d.to_lane.lane) else {
+                continue;
+            };
+            let new_id = target_lane.alloc_clip_id();
+            let new_clip = common::model::AutomationClip {
+                id: new_id,
+                name: template.1,
+                start_beat: d.next_start_beat,
+                length_beats: template.2,
+                content_id: template.0,
+            };
+            let start = new_clip.start_beat;
+            let pos = target_lane
+                .clips
+                .partition_point(|c| c.start_beat < start);
+            target_lane.clips.insert(pos, new_clip);
+        }
+        self.sync_song_to_plugin_host();
+    }
+
+    /// Ctrl+Shift+drag release。source は残置、content を deep clone (新
+    /// `ContentId` 採番) して独立 clip を追加。共有グループには入らない。
+    fn clone_automation_clips_independent(
+        &mut self,
+        deltas: &[MoveAutomationClipEntry],
+    ) {
+        if deltas.is_empty() {
+            return;
+        }
+        for d in deltas {
+            let template = {
+                let Some(source_track) = self.song.track_by_id(d.from.track) else {
+                    continue;
+                };
+                let Some(source_lane) = source_track.lane_by_id(d.from.lane) else {
+                    continue;
+                };
+                let Some(source_clip) = source_lane.clip_by_id(d.from.clip) else {
+                    continue;
+                };
+                (
+                    source_clip.content_id,
+                    source_clip.name.clone(),
+                    source_clip.length_beats,
+                )
+            };
+            // Content を deep clone (`ClipContent` enum 全体の clone なので
+            // Midi/Audio/Automation いずれも対応)。content が無い場合は空
+            // Automation で作成。
+            let cloned_content = self
+                .song
+                .clip_contents
+                .get(&template.0)
+                .cloned()
+                .unwrap_or_else(|| {
+                    common::model::ClipContent::Automation(
+                        common::model::AutomationContent::default(),
+                    )
+                });
+            let new_content_id = self.song.alloc_content_id();
+            self.song.clip_contents.insert(new_content_id, cloned_content);
+            let Some(target_track) = self.song.track_by_id_mut(d.to_lane.track) else {
+                continue;
+            };
+            let Some(target_lane) = target_track.lane_by_id_mut(d.to_lane.lane) else {
+                continue;
+            };
+            let new_id = target_lane.alloc_clip_id();
+            let new_clip = common::model::AutomationClip {
+                id: new_id,
+                name: template.1,
+                start_beat: d.next_start_beat,
+                length_beats: template.2,
+                content_id: new_content_id,
+            };
+            let start = new_clip.start_beat;
+            let pos = target_lane
+                .clips
+                .partition_point(|c| c.start_beat < start);
+            target_lane.clips.insert(pos, new_clip);
+        }
+        self.sync_song_to_plugin_host();
+    }
+
+    fn resize_automation_clips(&mut self, deltas: &[ResizeAutomationClipEntry]) {
+        if deltas.is_empty() {
+            return;
+        }
+        for d in deltas {
+            let Some(track) = self.song.track_by_id_mut(d.key.track) else {
+                continue;
+            };
+            let Some(lane) = track.lane_by_id_mut(d.key.lane) else {
+                continue;
+            };
+            if let Some(clip) = lane.clip_by_id_mut(d.key.clip) {
+                clip.start_beat = d.next_start;
+                clip.length_beats = d.next_len;
+            }
+        }
+        self.sync_song_to_plugin_host();
+    }
+
+    /// `refcount >= 2` の共有 automation clip を独立化。content を deep
+    /// clone + 新 `ContentId` 採番、当該 clip だけ新 id を指す。`refcount
+    /// == 1` のときは no-op + status_message で通知 (= MIDI 用
+    /// `MakeClipUnique` と同 UX)。
+    fn make_automation_clip_unique(&mut self, key: common::model::AutomationClipKey) {
+        let content_id = {
+            let Some(track) = self.song.track_by_id(key.track) else {
+                return;
+            };
+            let Some(lane) = track.lane_by_id(key.lane) else {
+                return;
+            };
+            let Some(clip) = lane.clip_by_id(key.clip) else {
+                return;
+            };
+            clip.content_id
+        };
+        if self.song.clip_content_refcount(content_id) <= 1 {
+            self.status_message = "すでに独立 clip です".into();
+            return;
+        }
+        let Some(cloned_content) = self.song.clip_contents.get(&content_id).cloned()
+        else {
+            return;
+        };
+        let new_content_id = self.song.alloc_content_id();
+        self.song.clip_contents.insert(new_content_id, cloned_content);
+        if let Some(track) = self.song.track_by_id_mut(key.track)
+            && let Some(lane) = track.lane_by_id_mut(key.lane)
+            && let Some(clip) = lane.clip_by_id_mut(key.clip)
+        {
+            clip.content_id = new_content_id;
+        }
+        self.sync_song_to_plugin_host();
+    }
+
+    /// gui_01 #029 (M14 Phase 63n-4): lane body 空き領域 dblclick で
+    /// automation clip を新規作成。`docs/plan_automation.md` §5.5。
+    /// 初期 `points` は **空** (= `lane.default_value` 引きずり)、
+    /// user が dblclick で point を追加していく Bitwig 流。
+    fn create_automation_clip(
+        &mut self,
+        lane_key: common::model::AutomationLaneKey,
+        start_beat: f64,
+        len_beats: f64,
+    ) {
+        // 新 ContentId を先に採番 + 空 Automation content を登録。
+        let new_content_id = self.song.alloc_content_id();
+        self.song.clip_contents.insert(
+            new_content_id,
+            common::model::ClipContent::Automation(
+                common::model::AutomationContent::default(),
+            ),
+        );
+        let Some(track) = self.song.track_by_id_mut(lane_key.track) else {
+            return;
+        };
+        let Some(lane) = track.lane_by_id_mut(lane_key.lane) else {
+            return;
+        };
+        let display = automation_target_display_name(&lane.target);
+        let clip_id = lane.alloc_clip_id();
+        let new_clip = common::model::AutomationClip {
+            id: clip_id,
+            name: format!("{display} curve"),
+            start_beat,
+            length_beats: len_beats,
+            content_id: new_content_id,
+        };
+        let pos = lane.clips.partition_point(|c| c.start_beat < start_beat);
+        lane.clips.insert(pos, new_clip);
+        self.sync_song_to_plugin_host();
+    }
+
+    /// `A` キー shortcut の handler。`last_touched_param` の lane を
+    /// 該当 track に追加 (or 既存があれば visible = true で復活)。
+    /// 仕様: `docs/plan_automation.md` §7.3。
+    fn add_automation_from_last_touched(&mut self) {
+        let Some(touched) = self.last_touched_param.clone() else {
+            self.status_message =
+                "No parameter touched yet — drag any knob first".into();
+            return;
+        };
+        // touched track が削除済 → clear + 通知。
+        if self.song.track_by_id(touched.track_id).is_none() {
+            self.last_touched_param = None;
+            self.status_message =
+                "Last-touched parameter's track was removed".into();
+            return;
+        }
+        // 既存 lane を find (target 一致で同 track 内)。
+        let existing_lane_id: Option<u32> = self
+            .song
+            .track_by_id(touched.track_id)
+            .map(|t| {
+                t.automation_lanes
+                    .iter()
+                    .find(|l| l.target == touched.target)
+                    .map(|l| l.id)
+            })
+            .unwrap_or(None);
+        if let Some(lane_id) = existing_lane_id {
+            // 既存 lane を visible / enabled = true に戻して expand。
+            if let Some(track) = self.song.track_by_id_mut(touched.track_id)
+                && let Some(lane) = track.lane_by_id_mut(lane_id)
+            {
+                lane.visible = true;
+                lane.enabled = true;
+            }
+            self.expanded_automation_tracks.insert(touched.track_id);
+            self.status_message = format!(
+                "Automation lane '{}' は既に存在します",
+                touched.display_name
+            );
+            self.sync_song_to_plugin_host();
+            return;
+        }
+        // 新規 lane を作成。default_value は target に応じて現在値を引く。
+        let default_value = self.lane_default_for_target(&touched);
+        let Some(track) = self.song.track_by_id_mut(touched.track_id) else {
+            return;
+        };
+        let lane_id = track.alloc_lane_id();
+        let new_lane = common::model::AutomationLane {
+            id: lane_id,
+            target: touched.target.clone(),
+            default_value,
+            enabled: true,
+            visible: true,
+            height_px: 60,
+            clips: Vec::new(),
+            next_clip_id: 1,
+        };
+        track.automation_lanes.push(new_lane);
+        self.expanded_automation_tracks.insert(touched.track_id);
+        self.status_message = format!(
+            "Added automation lane: {}",
+            touched.display_name
+        );
+        self.sync_song_to_plugin_host();
+    }
+
+    /// `AddAutomationFromLastTouched` の補助。target の現在値を plain
+    /// 単位で取得 (lane.default_value 初期化用)。 track-builtin は
+    /// track の strip 値、 plugin param は 0.0 (Phase 2 で IPC lookup)、
+    /// song-level は `song.bpm` / `song.time_sig.0`。
+    fn lane_default_for_target(&self, touched: &TouchedParam) -> f64 {
+        use common::model::{AutomationTarget, TrackBuiltinParam};
+        match &touched.target {
+            AutomationTarget::TrackBuiltin(param) => {
+                let Some(track) = self.song.track_by_id(touched.track_id) else {
+                    return 0.0;
+                };
+                match param {
+                    TrackBuiltinParam::Volume => f64::from(track.volume),
+                    TrackBuiltinParam::Pan => f64::from(track.pan),
+                    TrackBuiltinParam::Mute => {
+                        if track.muted {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    TrackBuiltinParam::SendGain { .. } => 0.0,
+                }
+            }
+            AutomationTarget::PluginParam { .. } => 0.0,
+            AutomationTarget::SongTempo => f64::from(self.song.bpm),
+            AutomationTarget::SongTimeSigNumerator => f64::from(self.song.time_sig.0),
+        }
+    }
+
+    fn delete_automation_clips(&mut self, keys: &[common::model::AutomationClipKey]) {
+        if keys.is_empty() {
+            return;
+        }
+        for k in keys {
+            let Some(track) = self.song.track_by_id_mut(k.track) else {
+                continue;
+            };
+            let Some(lane) = track.lane_by_id_mut(k.lane) else {
+                continue;
+            };
+            if let Some(idx) = lane.clip_index_by_id(k.clip) {
+                lane.clips.remove(idx);
+            }
+        }
+        // 選択中だった clip があれば selection からも除く。
+        self.selected_automation_clips
+            .retain(|sel| !keys.iter().any(|k| k == sel));
+        self.sync_song_to_plugin_host();
+    }
+
     fn action_group_selected_tracks(&mut self, track_ids: &[u32]) {
         if track_ids.is_empty() {
             tracing::info!("group request ignored: empty selection");
@@ -6975,20 +7964,44 @@ impl AppData {
 
     fn set_track_volume(&mut self, track: u32, volume: f32) {
         let v = volume.clamp(0.0, 1.0);
+        let track_id = self.song.tracks.get(track as usize).map(|t| t.id);
         if let Some(t) = self.song.tracks.get_mut(track as usize) {
             t.volume = v;
         }
         let msg = MainToChild::SetTrackVolume { track, volume: v };
         self.send_audio(msg);
+        // gui_01 #028 §7.3: knob 操作で last-touched param を更新。
+        // `A` キー shortcut の source になる。
+        if let Some(track_id) = track_id {
+            self.last_touched_param = Some(TouchedParam {
+                track_id,
+                target: common::model::AutomationTarget::TrackBuiltin(
+                    common::model::TrackBuiltinParam::Volume,
+                ),
+                display_name: "Volume".to_string(),
+                touched_at: std::time::Instant::now(),
+            });
+        }
     }
 
     fn set_track_pan(&mut self, track: u32, pan: f32) {
         let p = pan.clamp(-1.0, 1.0);
+        let track_id = self.song.tracks.get(track as usize).map(|t| t.id);
         if let Some(t) = self.song.tracks.get_mut(track as usize) {
             t.pan = p;
         }
         let msg = MainToChild::SetTrackPan { track, pan: p };
         self.send_audio(msg);
+        if let Some(track_id) = track_id {
+            self.last_touched_param = Some(TouchedParam {
+                track_id,
+                target: common::model::AutomationTarget::TrackBuiltin(
+                    common::model::TrackBuiltinParam::Pan,
+                ),
+                display_name: "Pan".to_string(),
+                touched_at: std::time::Instant::now(),
+            });
+        }
     }
 
     fn toggle_track_mute(&mut self, track: u32) {
@@ -7601,6 +8614,11 @@ impl AppData {
                     .insert(front_id, ClipContent::Audio(front));
                 ClipContent::Audio(back)
             }
+            // Automation clips live on `Track.automation_lanes`, not in
+            // `Track.clips`. Reaching here means the content store has
+            // a stale Automation entry referenced from a MIDI/Audio
+            // clip — refuse to split rather than guess.
+            ClipContent::Automation(_) => return false,
         };
 
         // Allocate fresh ContentIds for both halves (front was just
@@ -7765,6 +8783,10 @@ impl AppData {
                             });
                         }
                     }
+                    // Same as the split path above: an Automation
+                    // variant referenced from `Track.clips` is a
+                    // stale link, skip silently.
+                    ClipContent::Automation(_) => {}
                 }
             }
             if !combined_start.is_finite() || !combined_end.is_finite() {

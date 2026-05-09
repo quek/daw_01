@@ -262,6 +262,7 @@ fn render_loop(
             frames as u32,
             true,
             any_solo,
+            playhead,
         );
 
         // Compute block peak across the full block (for tail-silence

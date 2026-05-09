@@ -54,6 +54,11 @@ pub fn daw_shortcut_map() -> ShortcutMap {
     // - E: cursor (= マウスホバー位置) で選択 clip を 2 つに split (snap 適用)
     // - Alt+E: 同上だが snap 一時無効
     // - J: 選択中の隣接 clip を 1 つに glue (Consolidate)
+    // gui_01 #028 §7.3: `A` キーで last-touched parameter の lane を
+    // 所有 track に追加 (Bitwig / Live 流の last-touched workflow)。
+    // text_input フォーカス中は gui_01 が自動 skip するので、 編集中に
+    // `a` を打っても発火しない。
+    m.bind("daw.add_automation_from_last_touched", "A");
     m.bind("daw.split_clip_at_cursor", "E");
     m.bind("daw.split_clip_at_cursor_no_snap", "Alt+E");
     m.bind("daw.glue_selected_clips", "J");

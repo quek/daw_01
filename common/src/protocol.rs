@@ -1,4 +1,5 @@
 use bincode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
 
 use crate::plugin_format::PluginFormat;
 
@@ -9,7 +10,9 @@ use crate::plugin_format::PluginFormat;
 ///
 /// Indices within `MidiFx` / `Fx` are stable while the chain is unchanged;
 /// explicit `MoveSlot` messages rewrite them after a reorder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode, Serialize, Deserialize,
+)]
 pub enum PluginSlot {
     MidiFx(u32),
     Instrument,

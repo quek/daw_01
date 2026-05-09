@@ -39,6 +39,18 @@ pub struct TrackScratch {
     /// input_delay_per_track[track_idx] + 1` (DelayLine spec requires
     /// capacity ≥ delay + 1).
     pub input_delay_line: DelayLine,
+    /// Per-sample volume gain ramp for the buffer about to be processed.
+    /// `MAX_FRAMES` long, allocated once at construction and overwritten
+    /// in place every buffer by `fill_track_param_ramps`. The fx-chain
+    /// post-process loop reads this to apply sample-accurate volume
+    /// automation. When the track has no `Volume` lane (or the lane is
+    /// disabled), the buffer is filled with the constant
+    /// `track.volume`.
+    pub volume_per_sample: Vec<f32>,
+    /// Per-sample pan ramp, same lifecycle as `volume_per_sample`.
+    /// Range `-1.0..=1.0` (left..right). Default constant fill is
+    /// `track.pan`.
+    pub pan_per_sample: Vec<f32>,
 }
 
 impl TrackScratch {
@@ -53,6 +65,8 @@ impl TrackScratch {
             peak_r: 0.0,
             effective_mute: false,
             input_delay_line: DelayLine::with_capacity(0),
+            volume_per_sample: vec![1.0; MAX_FRAMES],
+            pan_per_sample: vec![0.0; MAX_FRAMES],
         }
     }
 }

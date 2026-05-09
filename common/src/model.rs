@@ -5,22 +5,26 @@ use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 use crate::plugin_format::PluginFormat;
+use crate::protocol::PluginSlot;
 
-/// Bumped to `7` for audio clip / WAV import support: `ClipContent`
-/// becomes an `enum { Midi(MidiContent), Audio(AudioContent) }` so the
-/// same shared-content store can hold MIDI notes or audio events, and
-/// `Song.audio_sources` is added as a pool of imported WAV references.
-/// v6 `.daw` files still load — the old struct form `{notes: [...]}`
-/// deserializes into `Midi(MidiContent { notes })` via
-/// `#[serde(untagged)]` because `MidiContent` and `AudioContent` have
-/// disjoint field sets. See `docs/plan_audio_clip.md`.
+/// Bumped to `8` for parameter automation: `Track.automation_lanes`
+/// is added (per-target lane with a default value, an enabled toggle
+/// and clip-shaped point lists) and `ClipContent` gains an
+/// `Automation(AutomationContent { points })` variant. v7 `.daw`
+/// files still load — `automation_lanes` defaults to empty (per
+/// `#[serde(default)]`), and existing `Midi` / `Audio` variants of
+/// `ClipContent` are unaffected because the new `Automation` variant
+/// has a disjoint field set (`points` vs `notes` / `events`) under
+/// `#[serde(untagged)]`. See `docs/plan_automation.md`.
 ///
-/// Previously: `6` (shared/linked clip — notes moved into
-/// `Song.clip_contents` keyed by `Clip.content_id`, REAPER pooled MIDI
-/// model — see `docs/plan_clip_share_clone.md`); `5` (routing graph +
-/// plugin latency cache); `4` (per-`Clip` `volume` moved onto
-/// `Track::volume`); `3` was a brief detour.
-pub const CURRENT_VERSION: u32 = 7;
+/// Previously:
+///   `7` audio clip / WAV import (`ClipContent` enum `{ Midi, Audio }`
+///   and `Song.audio_sources`); `6` shared/linked clip (notes moved
+///   into `Song.clip_contents` keyed by `Clip.content_id`, REAPER
+///   pooled MIDI model); `5` routing graph + plugin latency cache;
+///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
+///   brief detour.
+pub const CURRENT_VERSION: u32 = 8;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -165,6 +169,7 @@ impl Song {
                 self.next_track_id = track.id + 1;
             }
             track.ensure_clip_ids();
+            track.ensure_lane_ids();
         }
         if self.next_track_id == 0 {
             self.next_track_id = 1;
@@ -240,11 +245,19 @@ impl Song {
     pub fn ensure_clip_contents(&mut self) {
         // Collect all live content_ids first so we can bump the counter
         // above the highest one before allocating new ids for sentinels.
+        // Walks both main `clips` and every `automation_lanes[].clips`.
         let mut max_seen: ContentId = 0;
         for track in &self.tracks {
             for clip in &track.clips {
                 if clip.content_id != 0 {
                     max_seen = max_seen.max(clip.content_id);
+                }
+            }
+            for lane in &track.automation_lanes {
+                for clip in &lane.clips {
+                    if clip.content_id != 0 {
+                        max_seen = max_seen.max(clip.content_id);
+                    }
                 }
             }
         }
@@ -291,18 +304,52 @@ impl Song {
                     self.clip_contents.entry(cid).or_default();
                 }
             }
+            for l_idx in 0..self.tracks[t_idx].automation_lanes.len() {
+                let lane_clip_count =
+                    self.tracks[t_idx].automation_lanes[l_idx].clips.len();
+                for c_idx in 0..lane_clip_count {
+                    let needs_new_id =
+                        self.tracks[t_idx].automation_lanes[l_idx].clips[c_idx].content_id
+                            == 0;
+                    if needs_new_id {
+                        let new_id = self.alloc_content_id();
+                        self.tracks[t_idx].automation_lanes[l_idx].clips[c_idx]
+                            .content_id = new_id;
+                    }
+                    let cid = self.tracks[t_idx].automation_lanes[l_idx].clips[c_idx]
+                        .content_id;
+                    // Automation clips have no legacy in-place payload
+                    // (v8-introduced) — just make sure the content
+                    // store has an entry so audio thread / GUI lookups
+                    // never miss. Default is `Midi(empty)`; writers
+                    // promote to `Automation` on first edit.
+                    self.clip_contents.entry(cid).or_insert_with(|| {
+                        ClipContent::Automation(AutomationContent::default())
+                    });
+                }
+            }
         }
     }
 
     /// Refcount of a `ContentId` = number of clips across all tracks
-    /// referencing it. Used by the GUI to switch the visual style
-    /// between "shared" (>=2) and "regular" (==1) and by GC.
+    /// referencing it, **including automation clips** inside
+    /// `Track.automation_lanes`. Used by the GUI to switch the visual
+    /// style between "shared" (>=2) and "regular" (==1) and by GC.
     pub fn clip_content_refcount(&self, content_id: ContentId) -> usize {
-        self.tracks
+        let main_clips = self
+            .tracks
             .iter()
             .flat_map(|t| t.clips.iter())
             .filter(|c| c.content_id == content_id)
-            .count()
+            .count();
+        let auto_clips = self
+            .tracks
+            .iter()
+            .flat_map(|t| t.automation_lanes.iter())
+            .flat_map(|l| l.clips.iter())
+            .filter(|c| c.content_id == content_id)
+            .count();
+        main_clips + auto_clips
     }
 
     /// Resolve a `Clip`'s shared notes via its `content_id`. Returns
@@ -336,13 +383,24 @@ impl Song {
     /// before save so disk files stay tidy. In-memory we keep zero-ref
     /// entries around briefly (e.g. between a delete and the next
     /// frame) — Undo restores from the snapshot regardless.
+    ///
+    /// Walks both the main per-track `clips` and every
+    /// `automation_lanes[].clips` entry — automation clips share the
+    /// same content store as MIDI / audio clips.
     pub fn gc_clip_contents(&mut self) {
-        let live: std::collections::HashSet<ContentId> = self
+        let mut live: std::collections::HashSet<ContentId> = self
             .tracks
             .iter()
             .flat_map(|t| t.clips.iter())
             .map(|c| c.content_id)
             .collect();
+        for track in &self.tracks {
+            for lane in &track.automation_lanes {
+                for clip in &lane.clips {
+                    live.insert(clip.content_id);
+                }
+            }
+        }
         self.clip_contents.retain(|id, _| live.contains(id));
     }
 
@@ -361,7 +419,7 @@ impl Song {
             .values()
             .filter_map(|c| match c {
                 ClipContent::Audio(a) => Some(a.events.iter()),
-                ClipContent::Midi(_) => None,
+                ClipContent::Midi(_) | ClipContent::Automation(_) => None,
             })
             .flatten()
             .filter(|ev| ev.source_id == source_id)
@@ -378,7 +436,7 @@ impl Song {
             .values()
             .filter_map(|c| match c {
                 ClipContent::Audio(a) => Some(a.events.iter()),
-                ClipContent::Midi(_) => None,
+                ClipContent::Midi(_) | ClipContent::Automation(_) => None,
             })
             .flatten()
             .map(|ev| ev.source_id)
@@ -476,6 +534,21 @@ pub struct Track {
     /// recompile PDC compensation. Not user-editable.
     #[serde(default)]
     pub reported_latency_samples: u32,
+    /// Per-target automation lanes attached to this track. Each lane
+    /// carries a `default_value` (used outside any clip / when
+    /// `enabled = false`) and a list of `AutomationClip` whose
+    /// `content_id` resolves into `Song.clip_contents` like MIDI /
+    /// Audio clips do. Order is the display order in the inspector
+    /// and arrangement (drag-reorderable). Empty for tracks without
+    /// any automation. See `docs/plan_automation.md`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub automation_lanes: Vec<AutomationLane>,
+    /// Per-track stable id allocator for `AutomationLane`. Bumped each
+    /// time a new lane is created; never reused even after deletion.
+    /// `0` is the sentinel — `Track::ensure_lane_ids` reassigns it on
+    /// load.
+    #[serde(default)]
+    pub next_lane_id: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
@@ -504,6 +577,8 @@ impl Default for Track {
             next_clip_id: 1,
             parent_group_id: None,
             reported_latency_samples: 0,
+            automation_lanes: Vec::new(),
+            next_lane_id: 1,
         }
     }
 }
@@ -542,6 +617,43 @@ impl Track {
 
     pub fn clip_by_id_mut(&mut self, clip_id: u32) -> Option<&mut Clip> {
         self.clips.iter_mut().find(|c| c.id == clip_id)
+    }
+
+    /// Allocate a new stable lane id, bumping the per-track counter.
+    pub fn alloc_lane_id(&mut self) -> u32 {
+        let id = self.next_lane_id.max(1);
+        self.next_lane_id = id + 1;
+        id
+    }
+
+    /// Re-assign stable ids to all automation lanes and the clips
+    /// inside each lane. Idempotent (lanes / clips with non-zero ids
+    /// are left alone, counters are bumped above the max seen).
+    pub fn ensure_lane_ids(&mut self) {
+        for lane in &mut self.automation_lanes {
+            if lane.id == 0 {
+                lane.id = self.next_lane_id.max(1);
+                self.next_lane_id = lane.id + 1;
+            } else if lane.id >= self.next_lane_id {
+                self.next_lane_id = lane.id + 1;
+            }
+            lane.ensure_clip_ids();
+        }
+        if self.next_lane_id == 0 {
+            self.next_lane_id = 1;
+        }
+    }
+
+    pub fn lane_index_by_id(&self, lane_id: u32) -> Option<usize> {
+        self.automation_lanes.iter().position(|l| l.id == lane_id)
+    }
+
+    pub fn lane_by_id(&self, lane_id: u32) -> Option<&AutomationLane> {
+        self.automation_lanes.iter().find(|l| l.id == lane_id)
+    }
+
+    pub fn lane_by_id_mut(&mut self, lane_id: u32) -> Option<&mut AutomationLane> {
+        self.automation_lanes.iter_mut().find(|l| l.id == lane_id)
     }
 }
 
@@ -632,6 +744,7 @@ pub struct Clip {
 pub enum ClipContent {
     Midi(MidiContent),
     Audio(AudioContent),
+    Automation(AutomationContent),
 }
 
 impl Default for ClipContent {
@@ -641,22 +754,22 @@ impl Default for ClipContent {
 }
 
 impl ClipContent {
-    /// Borrow the notes slice if this is a `Midi` variant. `Audio`
-    /// variants return `None`. Used by `Song::clip_notes` and other
-    /// helpers that previously read `clip.notes` directly.
+    /// Borrow the notes slice if this is a `Midi` variant. `Audio` /
+    /// `Automation` variants return `None`. Used by `Song::clip_notes`
+    /// and other helpers that previously read `clip.notes` directly.
     pub fn notes(&self) -> Option<&[Note]> {
         match self {
             ClipContent::Midi(m) => Some(m.notes.as_slice()),
-            ClipContent::Audio(_) => None,
+            ClipContent::Audio(_) | ClipContent::Automation(_) => None,
         }
     }
 
-    /// Mutably borrow the notes vec for a `Midi` variant. `Audio`
+    /// Mutably borrow the notes vec for a `Midi` variant. Other
     /// variants return `None`.
     pub fn notes_mut(&mut self) -> Option<&mut Vec<Note>> {
         match self {
             ClipContent::Midi(m) => Some(&mut m.notes),
-            ClipContent::Audio(_) => None,
+            ClipContent::Audio(_) | ClipContent::Automation(_) => None,
         }
     }
 
@@ -664,7 +777,7 @@ impl ClipContent {
     pub fn audio_events(&self) -> Option<&[AudioEvent]> {
         match self {
             ClipContent::Audio(a) => Some(a.events.as_slice()),
-            ClipContent::Midi(_) => None,
+            ClipContent::Midi(_) | ClipContent::Automation(_) => None,
         }
     }
 
@@ -672,13 +785,40 @@ impl ClipContent {
     pub fn audio_events_mut(&mut self) -> Option<&mut Vec<AudioEvent>> {
         match self {
             ClipContent::Audio(a) => Some(&mut a.events),
-            ClipContent::Midi(_) => None,
+            ClipContent::Midi(_) | ClipContent::Automation(_) => None,
+        }
+    }
+
+    /// Borrow the automation point slice if this is an `Automation`
+    /// variant. Other variants return `None`.
+    pub fn automation_points(&self) -> Option<&[AutomationPoint]> {
+        match self {
+            ClipContent::Automation(a) => Some(a.points.as_slice()),
+            ClipContent::Midi(_) | ClipContent::Audio(_) => None,
+        }
+    }
+
+    /// Mutably borrow the automation point vec for an `Automation`
+    /// variant.
+    pub fn automation_points_mut(&mut self) -> Option<&mut Vec<AutomationPoint>> {
+        match self {
+            ClipContent::Automation(a) => Some(&mut a.points),
+            ClipContent::Midi(_) | ClipContent::Audio(_) => None,
         }
     }
 }
 
 /// MIDI clip content — a bag of notes positioned in clip-local beats.
+///
+/// `deny_unknown_fields` is required: `ClipContent` is `#[serde(untagged)]`
+/// so the deserializer tries each variant in order until one succeeds.
+/// Without `deny_unknown_fields`, a JSON object with only an `events`
+/// or `points` key would happily deserialize into `MidiContent { notes:
+/// vec![] }` (because every field has a default), making it impossible
+/// to disambiguate variants. With `deny_unknown_fields`, only the
+/// matching variant succeeds.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[serde(deny_unknown_fields)]
 pub struct MidiContent {
     /// Notes are in arbitrary order — readers that care about time
     /// order must sort by `Note::start_beat`.
@@ -693,6 +833,7 @@ pub struct MidiContent {
 /// defined by each event's `event_start_in_clip_beats` /
 /// `event_length_beats`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[serde(deny_unknown_fields)]
 pub struct AudioContent {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<AudioEvent>,
@@ -838,6 +979,293 @@ pub struct Note {
     pub velocity: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lyric: Option<String>,
+}
+
+// =============================================================================
+// Automation
+// =============================================================================
+//
+// See `docs/plan_automation.md` for the full design. The summary:
+//
+// - Each `Track` carries `automation_lanes: Vec<AutomationLane>`. A lane has a
+//   `target` (track-builtin volume / pan / mute, or a plugin parameter), a
+//   `default_value` used outside any clip, and a list of `AutomationClip`.
+// - `AutomationClip` is positioned along the track timeline and references a
+//   `ContentId` in `Song.clip_contents` — the same shared store MIDI / Audio
+//   clips use, so linked / independent copy machinery transparently applies.
+// - `ClipContent::Automation(AutomationContent { points })` stores the actual
+//   curve data. `#[serde(untagged)]` dispatch on `ClipContent` picks the
+//   variant based on the disjoint field set (`notes` / `events` / `points`).
+
+/// What an `AutomationLane` automates.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
+pub enum AutomationTarget {
+    /// Built-in track parameter (volume / pan / mute / send).
+    TrackBuiltin(TrackBuiltinParam),
+    /// Plugin parameter on this track. `slot` identifies which plugin
+    /// inside the track's chain. `param_id` is the CLAP `clap_id` /
+    /// VST3 `ParamID` (both `u32`); the format is recovered through
+    /// `Track.{instrument,midi_fx_chain[idx],fx_chain[idx]}.format`.
+    PluginParam {
+        slot: PluginSlot,
+        param_id: u32,
+    },
+    /// Song-wide parameters. Lanes targeting these only make sense on
+    /// a designated "master" track. M5 scope.
+    SongTempo,
+    SongTimeSigNumerator,
+}
+
+/// Built-in track parameter selector for `AutomationTarget::TrackBuiltin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
+pub enum TrackBuiltinParam {
+    Volume,
+    Pan,
+    Mute,
+    /// Reserved for the future Send routing work
+    /// (`docs/plan_routing_graph.md`). `send_idx` is the position
+    /// inside the track's `sends` array.
+    SendGain { send_idx: u8 },
+}
+
+/// Per-segment interpolation between two adjacent automation points.
+/// The `curve` is an *incoming* attribute on a point — i.e. the curve
+/// describing the line from the previous point to *this* one. The
+/// first point's `curve` is unused.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, Encode, Decode,
+)]
+pub enum AutomationCurve {
+    /// Step jump. The previous point's value holds until this point,
+    /// then snaps to the new value.
+    Hold,
+    /// Straight line from the previous point to this one.
+    #[default]
+    Linear,
+    /// Cubic Bezier with a Catmull-Rom-derived control polygon. `tension`
+    /// is `-1.0..=1.0`: `0.0` reproduces gui_01's `automation_curve`
+    /// default Catmull-Rom flatten; `+1.0` softens both endpoints
+    /// (S-curve), `-1.0` reverses to an accelerate/decelerate shape.
+    Bezier { tension: f32 },
+    /// Exponential / power curve. `bend` is `-1.0..=1.0`: `0.0` is
+    /// linear, positive values hold near the start and ramp toward the
+    /// end, negative values invert.
+    Exponential { bend: f32 },
+}
+
+/// One control point inside an `AutomationContent`. Ordered by
+/// `time_beat` ascending; insertion code MUST keep this invariant.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct AutomationPoint {
+    /// Clip-local beat (`0.0` = clip start, `Clip.length_beats` = clip
+    /// end). Negative or out-of-range values are clamped on read; the
+    /// editor should never produce them.
+    pub time_beat: f64,
+    /// Plain (non-normalized) value in the target's native units. For
+    /// volume that's `0.0..=2.0` (or whatever the GUI exposes), for a
+    /// CLAP plugin parameter it's `min_value..=max_value`. The audio
+    /// engine converts to `0.0..=1.0` per format right before sending
+    /// to the plugin.
+    pub value: f64,
+    /// Interpolation strategy for the line *into* this point from the
+    /// previous one. The first point's curve is meaningless.
+    pub curve: AutomationCurve,
+}
+
+impl Default for AutomationPoint {
+    fn default() -> Self {
+        Self {
+            time_beat: 0.0,
+            value: 0.0,
+            curve: AutomationCurve::Linear,
+        }
+    }
+}
+
+/// `ClipContent::Automation` payload. The actual curve sits inside the
+/// shared content store (`Song.clip_contents`) so multiple
+/// `AutomationClip`s with the same `content_id` share the curve
+/// (linked-clip pattern, mirroring MIDI clips).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationContent {
+    /// Sorted by `AutomationPoint::time_beat` ascending.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub points: Vec<AutomationPoint>,
+}
+
+/// One automation lane attached to a `Track`. Each lane targets one
+/// parameter (`AutomationTarget`) and contains a list of clips holding
+/// the actual point data plus a `default_value` used everywhere the
+/// clips don't cover (gaps, before the first clip, after the last,
+/// or whenever `enabled = false`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct AutomationLane {
+    /// Stable id within the owning track. `0` is the "未採番" sentinel —
+    /// reassigned by `Track::ensure_lane_ids` on load.
+    #[serde(default)]
+    pub id: u32,
+    pub target: AutomationTarget,
+    /// Constant value used outside any clip and whenever
+    /// `enabled = false`. Two-way bound to the track inspector knob:
+    /// twisting the knob edits this field, and editing this field
+    /// updates the knob display. Stored in the target's plain units
+    /// (same convention as `AutomationPoint::value`).
+    pub default_value: f64,
+    /// When `false` the entire lane is bypassed: the target is driven
+    /// purely by `default_value` and the curve is rendered greyed-out
+    /// in the arrangement (Bitwig "Disable Automation" / Reaper
+    /// "Bypass envelope").
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// When `false` the lane row is hidden in the arrangement (still
+    /// listed in the inspector). Independent of `enabled` — a lane
+    /// can be active but visually collapsed away.
+    #[serde(default = "default_true")]
+    pub visible: bool,
+    /// Lane row height in pixels. Default 60. User-resizable in
+    /// Phase 1+.
+    #[serde(default = "default_lane_height_px")]
+    pub height_px: u16,
+    /// Automation clips placed along the track timeline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clips: Vec<AutomationClip>,
+    /// Per-lane stable id allocator for `AutomationClip`. `0` is the
+    /// sentinel; valid allocations start at `1`.
+    #[serde(default)]
+    pub next_clip_id: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_lane_height_px() -> u16 {
+    60
+}
+
+impl AutomationLane {
+    pub fn new(target: AutomationTarget, default_value: f64) -> Self {
+        Self {
+            id: 0,
+            target,
+            default_value,
+            enabled: true,
+            visible: true,
+            height_px: default_lane_height_px(),
+            clips: Vec::new(),
+            next_clip_id: 1,
+        }
+    }
+
+    /// Allocate a new stable clip id within this lane.
+    pub fn alloc_clip_id(&mut self) -> u32 {
+        let id = self.next_clip_id.max(1);
+        self.next_clip_id = id + 1;
+        id
+    }
+
+    /// Re-assign stable ids to all clips inside the lane. Idempotent.
+    pub fn ensure_clip_ids(&mut self) {
+        for clip in &mut self.clips {
+            if clip.id == 0 {
+                clip.id = self.next_clip_id.max(1);
+                self.next_clip_id = clip.id + 1;
+            } else if clip.id >= self.next_clip_id {
+                self.next_clip_id = clip.id + 1;
+            }
+        }
+        if self.next_clip_id == 0 {
+            self.next_clip_id = 1;
+        }
+    }
+
+    pub fn clip_index_by_id(&self, clip_id: u32) -> Option<usize> {
+        self.clips.iter().position(|c| c.id == clip_id)
+    }
+
+    pub fn clip_by_id(&self, clip_id: u32) -> Option<&AutomationClip> {
+        self.clips.iter().find(|c| c.id == clip_id)
+    }
+
+    pub fn clip_by_id_mut(&mut self, clip_id: u32) -> Option<&mut AutomationClip> {
+        self.clips.iter_mut().find(|c| c.id == clip_id)
+    }
+}
+
+/// One automation clip inside an `AutomationLane`. Same shape as `Clip`
+/// (id / start / length / shared content via `content_id`) — the
+/// payload variant just happens to be `ClipContent::Automation`. Two
+/// `AutomationClip`s sharing a `content_id` are linked (REAPER pooled
+/// MIDI / linked-clip pattern), mirroring MIDI/Audio clips.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct AutomationClip {
+    /// Stable id within the owning lane. `0` is the sentinel —
+    /// reassigned by `AutomationLane::ensure_clip_ids` on load.
+    #[serde(default)]
+    pub id: u32,
+    pub name: String,
+    pub start_beat: f64,
+    pub length_beats: f64,
+    /// Reference into `Song.clip_contents`. `0` is the "未採番" sentinel
+    /// (reassigned by `Song::ensure_clip_contents` on load). Multiple
+    /// clips with the same `content_id` share their curve. The
+    /// referenced `ClipContent` MUST be the `Automation` variant —
+    /// loaders log a warning and treat foreign variants as empty.
+    #[serde(default)]
+    pub content_id: ContentId,
+}
+
+// ---------------------------------------------------------------------------
+// Stable address keys (gui_01 #028 §11.2 と 1:1 対応)
+// ---------------------------------------------------------------------------
+//
+// Edit-request 系 (`AppEvent::MoveAutomationPoints`, `MoveAutomationClips` 等)
+// で使う "どの track のどの lane のどの clip / point" を指す構造化キー。
+// 旧案の `(track_id, lane_id, clip_id, point_idx)` 4-tuple をフラットに渡す
+// より、 hit-test と Edit/Undo 構築の両側で型違反を compile error で検出
+// できる利点がある。
+
+/// Address of an `AutomationLane` inside the song.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode,
+)]
+pub struct AutomationLaneKey {
+    pub track: u32,
+    pub lane: u32,
+}
+
+/// Address of an `AutomationClip` (= one clip inside one lane).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode,
+)]
+pub struct AutomationClipKey {
+    pub track: u32,
+    pub lane: u32,
+    pub clip: u32,
+}
+
+impl AutomationClipKey {
+    /// Drop the clip part to address the owning lane.
+    #[inline]
+    pub fn lane_key(self) -> AutomationLaneKey {
+        AutomationLaneKey {
+            track: self.track,
+            lane: self.lane,
+        }
+    }
+}
+
+/// Address of one `AutomationPoint` inside a clip. `point_idx` is **only
+/// valid within the same frame** — point add / delete renumbers indices,
+/// so a drag session that spans frames must keep the previous index in
+/// the session struct, not in this key.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode,
+)]
+pub struct AutomationPointKey {
+    pub clip: AutomationClipKey,
+    pub point_idx: u32,
 }
 
 #[cfg(test)]
@@ -1001,15 +1429,12 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_seven() {
-        // Bumped to 7 for audio clip / WAV import support: `ClipContent`
-        // becomes an `enum { Midi(MidiContent), Audio(AudioContent) }`
-        // and `Song.audio_sources` is added. v6 files forward-migrate
-        // automatically — `#[serde(untagged)]` on `ClipContent` makes
-        // the legacy struct form `{notes: [...]}` deserialize into
-        // `Midi(MidiContent { notes })`. Pinning the constant catches
-        // accidental rollback.
-        assert_eq!(CURRENT_VERSION, 7);
+    fn current_version_is_eight() {
+        // Bumped to 8 for parameter automation: `Track.automation_lanes`
+        // and `ClipContent::Automation` are added. v7 files forward-
+        // migrate via `#[serde(default)]` on `automation_lanes`. Pinning
+        // the constant catches accidental rollback.
+        assert_eq!(CURRENT_VERSION, 8);
     }
 
     #[test]
@@ -1054,5 +1479,209 @@ mod tests {
         };
         let restored: Song = json_roundtrip(&song);
         assert_eq!(restored, song);
+    }
+
+    // ====================================================================
+    // Automation (v8) — `Track.automation_lanes` + `ClipContent::Automation`
+    // ====================================================================
+
+    #[test]
+    fn v7_track_loads_with_empty_automation_lanes() {
+        // A v7 .daw file has no `automation_lanes` / `next_lane_id` keys.
+        // Forward-migration via `#[serde(default)]` must populate empty
+        // Vec / 0 without losing other fields.
+        let v7_json = r#"{
+            "id": 3,
+            "name": "Lead",
+            "volume": 0.9,
+            "pan": 0.0,
+            "next_clip_id": 1
+        }"#;
+        let track: Track = serde_json::from_str(v7_json).unwrap();
+        assert_eq!(track.id, 3);
+        assert!(track.automation_lanes.is_empty());
+        assert_eq!(track.next_lane_id, 0);
+    }
+
+    #[test]
+    fn ensure_lane_ids_assigns_sentinel() {
+        // Lane id 0 (sentinel) gets a fresh id; non-zero lane ids are
+        // left alone but bump `next_lane_id` above the highest seen.
+        let mut track = Track {
+            id: 1,
+            name: "T".into(),
+            automation_lanes: vec![
+                AutomationLane {
+                    id: 0,
+                    ..AutomationLane::new(
+                        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                        1.0,
+                    )
+                },
+                AutomationLane {
+                    id: 5,
+                    ..AutomationLane::new(
+                        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan),
+                        0.0,
+                    )
+                },
+            ],
+            next_lane_id: 0,
+            ..Track::default()
+        };
+        track.ensure_lane_ids();
+        // Sentinel got reassigned; counter is bumped above max seen.
+        assert_ne!(track.automation_lanes[0].id, 0);
+        assert_eq!(track.automation_lanes[1].id, 5);
+        assert!(track.next_lane_id > 5);
+    }
+
+    #[test]
+    fn automation_clip_content_roundtrip() {
+        // A song with one automation lane + one clip + one point
+        // round-trips through serde_json bit-for-bit. Exercises
+        // `ClipContent::Automation` untagged dispatch.
+        let mut song = Song::default();
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Automation(AutomationContent {
+                points: vec![
+                    AutomationPoint {
+                        time_beat: 0.0,
+                        value: 0.5,
+                        curve: AutomationCurve::Linear,
+                    },
+                    AutomationPoint {
+                        time_beat: 4.0,
+                        value: 1.0,
+                        curve: AutomationCurve::Bezier { tension: 0.25 },
+                    },
+                ],
+            }),
+        );
+        song.tracks.push(Track {
+            id: 1,
+            name: "T".into(),
+            automation_lanes: vec![AutomationLane {
+                id: 1,
+                clips: vec![AutomationClip {
+                    id: 1,
+                    name: "auto1".into(),
+                    start_beat: 0.0,
+                    length_beats: 4.0,
+                    content_id: cid,
+                }],
+                next_clip_id: 2,
+                ..AutomationLane::new(
+                    AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                    0.85,
+                )
+            }],
+            next_lane_id: 2,
+            ..Track::default()
+        });
+
+        let restored: Song = json_roundtrip(&song);
+        assert_eq!(restored, song);
+        assert!(matches!(
+            restored.clip_contents[&cid],
+            ClipContent::Automation(_)
+        ));
+    }
+
+    #[test]
+    fn automation_clip_counts_toward_clip_content_refcount() {
+        // Same `content_id` shared by a MIDI clip *and* an automation
+        // clip should refcount as 2 — `clip_content_refcount` walks
+        // both `Track.clips` and `automation_lanes[].clips`.
+        let mut song = Song::default();
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Automation(AutomationContent::default()),
+        );
+        song.tracks.push(Track {
+            id: 1,
+            name: "T".into(),
+            clips: vec![Clip {
+                id: 1,
+                name: "main".into(),
+                start_beat: 0.0,
+                length_beats: 4.0,
+                content_id: cid,
+                notes: Vec::new(),
+            }],
+            automation_lanes: vec![AutomationLane {
+                id: 1,
+                clips: vec![AutomationClip {
+                    id: 1,
+                    name: "auto1".into(),
+                    start_beat: 0.0,
+                    length_beats: 4.0,
+                    content_id: cid,
+                }],
+                ..AutomationLane::new(
+                    AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                    1.0,
+                )
+            }],
+            ..Track::default()
+        });
+        assert_eq!(song.clip_content_refcount(cid), 2);
+    }
+
+    #[test]
+    fn gc_clip_contents_keeps_automation_clip_references() {
+        // A content_id only referenced by an automation clip must
+        // survive `gc_clip_contents` — earlier impl walked only
+        // `Track.clips` and would drop it.
+        let mut song = Song::default();
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Automation(AutomationContent::default()),
+        );
+        song.tracks.push(Track {
+            id: 1,
+            name: "T".into(),
+            automation_lanes: vec![AutomationLane {
+                id: 1,
+                clips: vec![AutomationClip {
+                    id: 1,
+                    name: "auto1".into(),
+                    start_beat: 0.0,
+                    length_beats: 4.0,
+                    content_id: cid,
+                }],
+                ..AutomationLane::new(
+                    AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                    1.0,
+                )
+            }],
+            ..Track::default()
+        });
+        song.gc_clip_contents();
+        assert!(song.clip_contents.contains_key(&cid));
+    }
+
+    #[test]
+    fn automation_target_hashes_distinguish_variants() {
+        // Targets are used as HashMap keys (e.g. last-touched param
+        // bookkeeping). Same-shape variants with different payloads
+        // must produce different hashes.
+        use std::collections::HashSet;
+        let mut s = HashSet::new();
+        s.insert(AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume));
+        s.insert(AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan));
+        s.insert(AutomationTarget::PluginParam {
+            slot: PluginSlot::Instrument,
+            param_id: 7,
+        });
+        s.insert(AutomationTarget::PluginParam {
+            slot: PluginSlot::Fx(0),
+            param_id: 7,
+        });
+        assert_eq!(s.len(), 4);
     }
 }

@@ -19,6 +19,7 @@ use tokio::net::windows::named_pipe::NamedPipeClient;
 
 mod audio_clip_renderer;
 mod audio_worker;
+mod automation;
 mod engine;
 mod export;
 mod graph;

@@ -7,8 +7,10 @@
 use std::sync::Arc;
 
 use daw_ui_core::{
-    ArrangementClip, ArrangementClipAudioEdit, ArrangementEditRequest, ArrangementStyle,
-    ArrangementTrack, ArrangementView, ChannelLayout, ClipKey, Edit, FadeCurve as WidgetFadeCurve,
+    ArrangementAutomationClip, ArrangementAutomationLane, ArrangementAutomationPoint,
+    ArrangementClip, ArrangementClipAudioEdit, ArrangementCurveKind, ArrangementEditRequest,
+    ArrangementStyle, ArrangementTrack, ArrangementView, AutomationClipKey,
+    AutomationLaneKey, ChannelLayout, ClipKey, Edit, FadeCurve as WidgetFadeCurve,
     FadeEdge, SampleSlices, ToggleButtonStyle, Ui, WaveformRenderMode, WaveformSource,
     WaveformStyle, WaveformView,
 };
@@ -136,6 +138,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             parent_id: t.parent_group_id,
             depth: app.compute_track_depth(t),
             collapsed: app.collapsed_groups.contains(&t.id),
+            // gui_01 #028 (M14 Phase 63n-1): automation lane 行。 daw_01 は
+            // 「展開中の track id 集合」 を `expanded_automation_tracks` に持ち、
+            // 含まれない track は collapsed。 default 全 collapsed (Bitwig 流)。
+            // lane が空の track でも collapsed flag は設定するが、 widget は
+            // 「lane 0 件 → disclosure ▶/▼ 非表示」 で扱う。
+            automation_lanes_collapsed: !app.expanded_automation_tracks.contains(&t.id),
+            automation_lanes: build_arrangement_automation_lanes(t, &app.song),
+            // gui_01 #031 (M14 Phase 63n-6): 個別 track row 高さ override。
+            // None なら global `view.track_row_h` (= Alt+wheel で動く既存値) を
+            // 使う。Some(px) なら override (Alt+drag / 下端 splitter drag で
+            // SetSingleTrackRowH を発火 → AppData.track_row_overrides に反映)。
+            row_h: app.track_row_overrides.get(&t.id).copied(),
         })
         .collect();
 
@@ -203,8 +217,24 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // で clip 中央を貫通する細い水平線) は、 視覚的には波形と被って邪魔になる。
     // hit zone (`audio_db_handle_band_h`) は色と無関係なので、 線色を完全透明に
     // して描画だけ抑制する (drag は引き続き機能する)。
+    //
+    // gui_01 #028 / #029 直後の visual feedback (2026-05-09):
+    // automation clip が CloneLinked された後 (refcount >= 2) に widget が
+    // share_group_color の hue + default lightness 0.55 で塗ると、 clip 上の
+    // 名前文字 (default text color = (0.92,0.92,0.94)) との contrast が低く
+    // 読みづらい。 fill / border lightness を暗めに override して contrast
+    // を上げる。 (MIDI clip の linked 表示にも同 style が適用される。)
     let style = ArrangementStyle {
         audio_db_handle_color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+        share_group_fill_lightness: 0.30,
+        share_group_border_lightness: 0.55,
+        // selected clip の塗り (default = (1.0, 0.85, 0.30) yellow) は default
+        // text color (0.92, 0.92, 0.94 白系) との contrast が低く、 selected
+        // automation clip 名「Volume curve」 が読みづらい (visual feedback
+        // 2026-05-09)。 暗めの blue-grey で contrast 確保。 border は明るめ
+        // で selection マーカー視認性を維持。
+        clip_selected_fill: Color::rgb(0.20, 0.30, 0.50),
+        clip_selected_border: Color::rgb(0.95, 0.95, 1.00),
         ..ArrangementStyle::default()
     };
 
@@ -213,6 +243,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // delta は widget 内で snap 済み (Alt 一時無効化も内部処理) なので、daw_01 側で
     // post-process は不要。
 
+    // gui_01 #028 (M14 Phase 63n-3): 選択中の automation clip を widget 型
+    // にそのまま渡す (daw_01 model と field 名一致なので 1:1 cast)。
+    let selected_automation_clips_widget: Vec<daw_ui_core::AutomationClipKey> = app
+        .selected_automation_clips
+        .iter()
+        .map(|k| daw_ui_core::AutomationClipKey {
+            track: k.track,
+            lane: k.lane,
+            clip: k.clip,
+        })
+        .collect();
+
     let resp = ui.arrangement(
         "arrangement",
         area,
@@ -220,6 +262,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         view,
         &selected_clips,
         selected_tracks,
+        &selected_automation_clips_widget,
         &style,
         make_edit,
     );
@@ -284,6 +327,102 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let is_selected = selected_clips.contains(clip_key);
         draw_audio_clip_waveform(app, ui, *clip_key, *rect, lanes_x, is_selected);
         draw_audio_clip_value_overlay(app, ui, *clip_key, *rect);
+    }
+
+    // gui_01 #028 (M14 Phase 63n-2): automation point 上の右クリック →
+    // Hold / Linear / Bezier の curve type popup。 widget が
+    // `automation_point_rects: Vec<(AutomationPointKey, Rect)>` を返すので
+    // clip_rects と同 idiom で `context_menu_for` を毎 frame 重ねる。
+    // popup 選択 → ArrangementCurveKind を `SetAutomationCurveType` に
+    // 変換、 prev は popup open 時点の `clip.points[idx].curve` を retrieve。
+    //
+    // **重要 (visual feedback fix 2026-05-09)**: automation_point_rects は
+    // automation_clip_rects と空間的に overlap している (= point は clip
+    // 内に居る)。 `context_menu_for` は rect 内右クリックで popup を open
+    // するため、 同位置に **両方の popup が同 frame で open される**
+    // bug があった。 user が point の "Linear" (idx=1) を click すると
+    // clip popup の "Delete" (idx=1) も同時発火 → clip 消失。
+    //
+    // 対策: point popup を **先に** ループで register し、 同 frame で
+    // 右クリックが point rect 上で起きていたら clip popup ループを **skip**
+    // する。 これで point popup だけが新規 open され、 clip popup の
+    // open_popup が呼ばれない。
+    for (point_key, rect) in &resp.automation_point_rects {
+        let key = *point_key;
+        ui.context_menu_for(
+            *rect,
+            &["Hold", "Linear", "Bezier"],
+            move |idx, ui| {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    let next = match idx {
+                        0 => ArrangementCurveKind::Hold,
+                        1 => ArrangementCurveKind::Linear,
+                        2 => ArrangementCurveKind::Bezier { tension: 0.0 },
+                        _ => return,
+                    };
+                    // prev curve を retrieve (Undo 用)。 lookup できなかった
+                    // ら no-op で抜ける (= 編集中に lane / clip が削除された
+                    // race を防ぐ)。
+                    let prev = app
+                        .song
+                        .track_by_id(key.clip.track)
+                        .and_then(|t| t.lane_by_id(key.clip.lane))
+                        .and_then(|l| l.clip_by_id(key.clip.clip))
+                        .and_then(|c| app.song.clip_contents.get(&c.content_id))
+                        .and_then(|cc| cc.automation_points())
+                        .and_then(|pts| pts.get(key.point_idx as usize))
+                        .map(|p| p.curve);
+                    let Some(prev) = prev else { return };
+                    app.handle_event(AppEvent::SetAutomationCurveType {
+                        track_id: key.clip.track,
+                        lane_id: key.clip.lane,
+                        clip_id: key.clip.clip,
+                        point_idx: key.point_idx,
+                        prev,
+                        next: widget_curve_to_model(next),
+                    });
+                }));
+            },
+        );
+    }
+
+    // gui_01 #028 (M14 Phase 63n-3): automation clip 上の右クリック →
+    // Make Unique / Delete。 ただし上で point popup を先に register してい
+    // て、 同 frame で右クリックが **point rect 上** だったら clip popup の
+    // 登録を skip する (= 同位置で 2 つの popup が同時 open する bug 回避)。
+    let pointer = ui.pointer();
+    let suppress_clip_menu = pointer.secondary_just_pressed
+        && pointer.pos.is_some_and(|(px, py)| {
+            resp.automation_point_rects
+                .iter()
+                .any(|(_, r)| r.contains(px, py))
+        });
+    if !suppress_clip_menu {
+        for (auto_key, rect) in &resp.automation_clip_rects {
+            let widget_key = *auto_key;
+            ui.context_menu_for(
+                *rect,
+                &["Make Unique", "Delete"],
+                move |idx, ui| {
+                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                        let model_key = common::model::AutomationClipKey {
+                            track: widget_key.track,
+                            lane: widget_key.lane,
+                            clip: widget_key.clip,
+                        };
+                        match idx {
+                            0 => app.handle_event(AppEvent::MakeAutomationClipUnique(
+                                model_key,
+                            )),
+                            1 => app.handle_event(AppEvent::DeleteAutomationClips {
+                                keys: vec![model_key],
+                            }),
+                            _ => {}
+                        }
+                    }));
+                },
+            );
+        }
     }
 
     // track header の右クリックメニュー (Rename / Delete) を widget 外で重ねる。
@@ -467,6 +606,251 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
                 // selected_clip / selected_clips も末尾の cursor track
                 // 上の clip だけ残す形で同期したいが、 multi-select 中は
                 // clip 選択の優先度が低いので暫定的に変更しない。
+            })
+        }
+        // gui_01 #029 (M14 Phase 63n-4): lane body 内 clip ギャップで dblclick
+        // → 新規 automation clip 作成。MIDI clip の `DoubleClickEmpty →
+        // CreateClip` と同 idiom の lane 版。`start_beat` は widget が snap
+        // 適用済、`len_beats` は widget の `automation_clip_default_len_beats`
+        // (default 4.0) — caller 側で自前ポリシーに上書きしたければ
+        // `ArrangementStyle` を変える。
+        ArrangementEditRequest::CreateAutomationClip {
+            lane,
+            start_beat,
+            len_beats,
+        } => Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::CreateAutomationClip {
+                lane: common::model::AutomationLaneKey {
+                    track: lane.track,
+                    lane: lane.lane,
+                },
+                start_beat,
+                len_beats,
+            });
+        }),
+        // gui_01 #028 (M14 Phase 63n-1): track 行右端の disclosure ▶/▼ click。
+        // automation lane 行の表示・折り畳み toggle を AppEvent に変換。
+        ArrangementEditRequest::ToggleTrackAutomationCollapsed { track } => {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ToggleTrackAutomationCollapsed {
+                    track_id: track,
+                });
+            })
+        }
+        // gui_01 #028 (M14 Phase 63n-2): lane header `★` click。
+        ArrangementEditRequest::SetLaneEnabled { lane, enabled } => {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetLaneEnabled {
+                    track_id: lane.track,
+                    lane_id: lane.lane,
+                    enabled,
+                });
+            })
+        }
+        ArrangementEditRequest::SetLaneVisible { lane, visible } => {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetLaneVisible {
+                    track_id: lane.track,
+                    lane_id: lane.lane,
+                    visible,
+                });
+            })
+        }
+        // lane header default slider drag (live preview + release 確定)。
+        // prev / next は normalized、handler 側で plain 化。
+        ArrangementEditRequest::SetLaneDefault { lane, prev, next } => {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetLaneDefault {
+                    track_id: lane.track,
+                    lane_id: lane.lane,
+                    prev_norm: prev,
+                    next_norm: next,
+                });
+            })
+        }
+        ArrangementEditRequest::DeleteLane(lane) => {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::DeleteLane {
+                    track_id: lane.track,
+                    lane_id: lane.lane,
+                });
+            })
+        }
+        // gui_01 #030 (M14 Phase 63n-5): lane 高さ drag (Alt+drag or
+        // 下端 splitter)。 widget 側で min/max clamp 済。
+        ArrangementEditRequest::SetLaneHeight { lane, prev, next } => {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetLaneHeight {
+                    track_id: lane.track,
+                    lane_id: lane.lane,
+                    prev_px: prev,
+                    next_px: next,
+                });
+            })
+        }
+        // gui_01 #031 (M14 Phase 63n-6): MIDI track row 高さの個別 drag。
+        // Alt+drag or 下端 splitter drag。 既存 Alt+wheel (= SetTrackRowH
+        // global) とは独立。 widget 側で min/max clamp 済。
+        ArrangementEditRequest::SetSingleTrackRowH { track, prev, next } => {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetSingleTrackRowH {
+                    track_id: track,
+                    prev_px: prev,
+                    next_px: next,
+                });
+            })
+        }
+        // lane body 内 dblclick で 1 point 追加。time_beat は clip-local、
+        // value_norm は normalized。
+        ArrangementEditRequest::AddAutomationPoint {
+            clip,
+            time_beat,
+            value_norm,
+        } => Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::AddAutomationPoint {
+                track_id: clip.track,
+                lane_id: clip.lane,
+                clip_id: clip.clip,
+                time_beat,
+                value_norm,
+            });
+        }),
+        // point drag release。同 frame 内 valid な point_idx を gui_01
+        // から受け、handler 側で sort 維持しつつ更新。
+        ArrangementEditRequest::MoveAutomationPoints(widget_deltas) => {
+            Edit::mutate(move |app: &mut AppData| {
+                let entries: Vec<crate::app::MoveAutomationPointEntry> = widget_deltas
+                    .into_iter()
+                    .map(|d| crate::app::MoveAutomationPointEntry {
+                        key: crate::app::AutomationPointKeyRef {
+                            track_id: d.point.clip.track,
+                            lane_id: d.point.clip.lane,
+                            clip_id: d.point.clip.clip,
+                            point_idx: d.point.point_idx,
+                        },
+                        prev_time_beat: d.prev_time_beat,
+                        prev_value_norm: d.prev_value_norm,
+                        next_time_beat: d.next_time_beat,
+                        next_value_norm: d.next_value_norm,
+                    })
+                    .collect();
+                if !entries.is_empty() {
+                    app.handle_event(AppEvent::MoveAutomationPoints { deltas: entries });
+                }
+            })
+        }
+        // Alt+click on point → 即時 1 件削除 (将来は rect select で N 件)。
+        ArrangementEditRequest::DeleteAutomationPoints(keys) => {
+            Edit::mutate(move |app: &mut AppData| {
+                let refs: Vec<crate::app::AutomationPointKeyRef> = keys
+                    .into_iter()
+                    .map(|k| crate::app::AutomationPointKeyRef {
+                        track_id: k.clip.track,
+                        lane_id: k.clip.lane,
+                        clip_id: k.clip.clip,
+                        point_idx: k.point_idx,
+                    })
+                    .collect();
+                if !refs.is_empty() {
+                    app.handle_event(AppEvent::DeleteAutomationPoints { points: refs });
+                }
+            })
+        }
+        // Right-click curve type popup の選択結果。caller 側で
+        // `automation_point_rects` を `context_menu_for` で表示し、
+        // 選んだ index → ArrangementCurveKind を gui_01 が返してくる。
+        ArrangementEditRequest::SetAutomationCurveType { point, prev, next } => {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetAutomationCurveType {
+                    track_id: point.clip.track,
+                    lane_id: point.clip.lane,
+                    clip_id: point.clip.clip,
+                    point_idx: point.point_idx,
+                    prev: widget_curve_to_model(prev),
+                    next: widget_curve_to_model(next),
+                });
+            })
+        }
+        // gui_01 #028 (M14 Phase 63n-3): automation clip drag。修飾子の
+        // 違いで Move / Linked / Independent の 3 系統。lane 跨ぎは
+        // target 不一致でも widget 側は accept、daw_01 側でも
+        // §5.4 の通り全 accept (reject / demote しない)。
+        ArrangementEditRequest::MoveAutomationClips(widget_deltas) => {
+            Edit::mutate(move |app: &mut AppData| {
+                let entries = widget_deltas
+                    .into_iter()
+                    .map(widget_to_model_clip_delta)
+                    .collect::<Vec<_>>();
+                if !entries.is_empty() {
+                    app.handle_event(AppEvent::MoveAutomationClips { deltas: entries });
+                }
+            })
+        }
+        ArrangementEditRequest::CloneAutomationClipsLinked(widget_deltas) => {
+            Edit::mutate(move |app: &mut AppData| {
+                let entries = widget_deltas
+                    .into_iter()
+                    .map(widget_to_model_clip_delta)
+                    .collect::<Vec<_>>();
+                if !entries.is_empty() {
+                    app.handle_event(AppEvent::CloneAutomationClipsLinked {
+                        deltas: entries,
+                    });
+                }
+            })
+        }
+        ArrangementEditRequest::CloneAutomationClipsIndependent(widget_deltas) => {
+            Edit::mutate(move |app: &mut AppData| {
+                let entries = widget_deltas
+                    .into_iter()
+                    .map(widget_to_model_clip_delta)
+                    .collect::<Vec<_>>();
+                if !entries.is_empty() {
+                    app.handle_event(AppEvent::CloneAutomationClipsIndependent {
+                        deltas: entries,
+                    });
+                }
+            })
+        }
+        ArrangementEditRequest::ResizeAutomationClips(widget_deltas) => {
+            Edit::mutate(move |app: &mut AppData| {
+                let entries = widget_deltas
+                    .into_iter()
+                    .map(|d| crate::app::ResizeAutomationClipEntry {
+                        key: widget_to_model_clip_key(d.key),
+                        prev_start: d.prev_start,
+                        prev_len: d.prev_len,
+                        next_start: d.next_start,
+                        next_len: d.next_len,
+                    })
+                    .collect::<Vec<_>>();
+                if !entries.is_empty() {
+                    app.handle_event(AppEvent::ResizeAutomationClips { deltas: entries });
+                }
+            })
+        }
+        ArrangementEditRequest::DeleteAutomationClips(keys) => {
+            Edit::mutate(move |app: &mut AppData| {
+                let model_keys: Vec<common::model::AutomationClipKey> =
+                    keys.into_iter().map(widget_to_model_clip_key).collect();
+                if !model_keys.is_empty() {
+                    app.handle_event(AppEvent::DeleteAutomationClips {
+                        keys: model_keys,
+                    });
+                }
+            })
+        }
+        // 短 click on automation clip → selection 上書き。
+        ArrangementEditRequest::SelectAutomationClips { prev, next } => {
+            Edit::mutate(move |app: &mut AppData| {
+                let prev_model: Vec<common::model::AutomationClipKey> =
+                    prev.into_iter().map(widget_to_model_clip_key).collect();
+                let next_model: Vec<common::model::AutomationClipKey> =
+                    next.into_iter().map(widget_to_model_clip_key).collect();
+                app.handle_event(AppEvent::SelectAutomationClips {
+                    prev: prev_model,
+                    next: next_model,
+                });
             })
         }
         ArrangementEditRequest::ToggleGroupCollapsed(track_id) => {
@@ -773,6 +1157,216 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
 fn content_id_to_hue(content_id: common::model::ContentId) -> f32 {
     const GOLDEN_RATIO_CONJUGATE: f32 = 0.618_034;
     (content_id as f32 * GOLDEN_RATIO_CONJUGATE).fract()
+}
+
+/// gui_01 #028 (M14 Phase 63n-1): `Track.automation_lanes` を widget が
+/// 受け取れる `ArrangementAutomationLane` 列に変換。 各 lane の
+/// `target` から label / icon_glyph / color / default_value_norm を導出
+/// し、 clip ごとに `Song.clip_contents` から `AutomationContent` を
+/// 解決して point 列を normalize する。
+///
+/// Phase 1 は track-builtin Volume / Pan / Mute のみ実装。 Plugin
+/// param / Song-level (tempo / time_sig) は Phase 2+ で IPC 経由の
+/// param info を受け取れるようになってから extend する。
+fn build_arrangement_automation_lanes(
+    track: &common::model::Track,
+    song: &common::model::Song,
+) -> Vec<ArrangementAutomationLane> {
+    track
+        .automation_lanes
+        .iter()
+        .map(|lane| {
+            let display = lane_target_display(&lane.target);
+            let default_value_norm = plain_to_norm(&lane.target, lane.default_value);
+            let clips: Vec<ArrangementAutomationClip> = lane
+                .clips
+                .iter()
+                .map(|c| {
+                    let points: Vec<ArrangementAutomationPoint> = song
+                        .clip_contents
+                        .get(&c.content_id)
+                        .and_then(|cc| cc.automation_points())
+                        .unwrap_or(&[])
+                        .iter()
+                        .map(|p| ArrangementAutomationPoint {
+                            time_beat: p.time_beat,
+                            value_norm: plain_to_norm(&lane.target, p.value),
+                            curve: model_curve_to_widget(p.curve),
+                        })
+                        .collect();
+                    ArrangementAutomationClip {
+                        id: c.id,
+                        start_beat: c.start_beat,
+                        len_beats: c.length_beats,
+                        name: Arc::from(c.name.as_str()),
+                        points,
+                        share_group_color: if song.clip_content_refcount(c.content_id) >= 2 {
+                            Some(content_id_to_hue(c.content_id))
+                        } else {
+                            None
+                        },
+                    }
+                })
+                .collect();
+            ArrangementAutomationLane {
+                id: lane.id,
+                label: display.label,
+                icon_glyph: display.icon_glyph,
+                color: display.color,
+                enabled: lane.enabled,
+                visible: lane.visible,
+                height_px: lane.height_px,
+                default_value_norm,
+                clips,
+            }
+        })
+        .collect()
+}
+
+struct LaneDisplay {
+    label: Arc<str>,
+    icon_glyph: char,
+    color: Color,
+}
+
+/// `AutomationTarget` ごとの label / icon / 識別色。 label 文字列は
+/// `Arc::from` で都度生成 (per-frame だが lane 数は片手で数える程度なので
+/// allocation コストは無視できる)。
+fn lane_target_display(target: &common::model::AutomationTarget) -> LaneDisplay {
+    use common::model::{AutomationTarget, TrackBuiltinParam};
+    match target {
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => LaneDisplay {
+            label: Arc::from("Volume"),
+            icon_glyph: 'V',
+            color: Color::rgb(0.42, 0.78, 0.95),
+        },
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan) => LaneDisplay {
+            label: Arc::from("Pan"),
+            icon_glyph: 'P',
+            color: Color::rgb(0.55, 0.92, 0.55),
+        },
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute) => LaneDisplay {
+            label: Arc::from("Mute"),
+            icon_glyph: 'M',
+            color: Color::rgb(0.92, 0.45, 0.40),
+        },
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_idx }) => {
+            LaneDisplay {
+                label: Arc::from(format!("Send {}", send_idx + 1)),
+                icon_glyph: 'S',
+                color: Color::rgb(0.85, 0.75, 0.40),
+            }
+        }
+        AutomationTarget::PluginParam { param_id, .. } => LaneDisplay {
+            // Phase 2 で IPC param info を受けたら "Cutoff (Serum)" 等に書き換え。
+            label: Arc::from(format!("Param {}", param_id)),
+            icon_glyph: 'F',
+            color: Color::rgb(0.78, 0.55, 0.92),
+        },
+        AutomationTarget::SongTempo => LaneDisplay {
+            label: Arc::from("Tempo"),
+            icon_glyph: 'T',
+            color: Color::rgb(0.95, 0.85, 0.55),
+        },
+        AutomationTarget::SongTimeSigNumerator => LaneDisplay {
+            label: Arc::from("Time Sig"),
+            icon_glyph: 'T',
+            color: Color::rgb(0.95, 0.85, 0.55),
+        },
+    }
+}
+
+/// Plain (target's native unit) → normalized 0..1 で widget に渡すため
+/// の変換。 Phase 1 で必要な範囲のみ実装。 plugin param は min/max を
+/// 知らないと正規化できないので、 とりあえず `clamp(0, 1)` で渡す
+/// (Phase 2 で `AppData.plugin_params` lookup に置換)。
+fn plain_to_norm(target: &common::model::AutomationTarget, plain: f64) -> f32 {
+    use common::model::{AutomationTarget, TrackBuiltinParam};
+    let v = match target {
+        // Track.volume は通常 0.0..=2.0 で扱う (1.0 = unity、 amp_to_fader
+        // を通せば dB 表現)。 widget の slider band も 0..1 範囲なので
+        // 1/2 で normalize。 fader 表示としては不正確だが、 lane の
+        // default_value_norm は単に slider 帯の位置決めなので OK。
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => plain / 2.0,
+        // Pan は -1..=1 → 0..1。
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan) => (plain + 1.0) / 2.0,
+        // Mute は bool 相当 (0 or 1)。
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute) => {
+            if plain >= 0.5 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        // SendGain も 0..2 と仮定。
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { .. }) => plain / 2.0,
+        // PluginParam は min/max 不明 → そのまま clamp。
+        AutomationTarget::PluginParam { .. } => plain,
+        // Song-level: Phase 5 で実装。 適当に 0 を返す。
+        AutomationTarget::SongTempo | AutomationTarget::SongTimeSigNumerator => 0.0,
+    };
+    v.clamp(0.0, 1.0) as f32
+}
+
+/// `common::model::AutomationCurve` (incoming curve) → widget
+/// `ArrangementCurveKind` の対応変換。 同 3 種を 1:1 で対応させる。
+/// `Exponential` は Phase 3+ で widget 側にも variant を追加してから
+/// 扱う想定だが、 暫定で `Bezier { tension: 0.0 }` (= Catmull-Rom) に
+/// fallback する。
+fn model_curve_to_widget(c: common::model::AutomationCurve) -> ArrangementCurveKind {
+    use common::model::AutomationCurve;
+    match c {
+        AutomationCurve::Hold => ArrangementCurveKind::Hold,
+        AutomationCurve::Linear => ArrangementCurveKind::Linear,
+        AutomationCurve::Bezier { tension } => ArrangementCurveKind::Bezier { tension },
+        AutomationCurve::Exponential { .. } => {
+            ArrangementCurveKind::Bezier { tension: 0.0 }
+        }
+    }
+}
+
+/// 逆変換。 widget が popup で返してきた `ArrangementCurveKind` を
+/// model の `AutomationCurve` に戻す。 widget には `Exponential` が
+/// 無いので 1:1 で安全。
+fn widget_curve_to_model(c: ArrangementCurveKind) -> common::model::AutomationCurve {
+    use common::model::AutomationCurve;
+    match c {
+        ArrangementCurveKind::Hold => AutomationCurve::Hold,
+        ArrangementCurveKind::Linear => AutomationCurve::Linear,
+        ArrangementCurveKind::Bezier { tension } => AutomationCurve::Bezier { tension },
+    }
+}
+
+/// widget の `AutomationClipKey { track, lane, clip }` → model の同名
+/// 構造体。field 名が一致するので 1:1 cast。
+fn widget_to_model_clip_key(k: AutomationClipKey) -> common::model::AutomationClipKey {
+    common::model::AutomationClipKey {
+        track: k.track,
+        lane: k.lane,
+        clip: k.clip,
+    }
+}
+
+/// widget の `AutomationLaneKey { track, lane }` → model の同名構造体。
+fn widget_to_model_lane_key(k: AutomationLaneKey) -> common::model::AutomationLaneKey {
+    common::model::AutomationLaneKey {
+        track: k.track,
+        lane: k.lane,
+    }
+}
+
+/// gui_01 #028 (Phase 63n-3): widget の `MoveAutomationClipDelta` を
+/// daw_01 内部の `MoveAutomationClipEntry` に変換。 field 名はほぼ
+/// 同形なので逐一 copy するだけ。
+fn widget_to_model_clip_delta(
+    d: daw_ui_core::MoveAutomationClipDelta,
+) -> crate::app::MoveAutomationClipEntry {
+    crate::app::MoveAutomationClipEntry {
+        from: widget_to_model_clip_key(d.from),
+        to_lane: widget_to_model_lane_key(d.to_lane),
+        prev_start_beat: d.prev_start_beat,
+        next_start_beat: d.next_start_beat,
+    }
 }
 
 fn clip_key_to_ref(app: &AppData, key: ClipKey) -> Option<ClipRef> {
