@@ -34,6 +34,8 @@ struct ObsModel {
     set_curves: Vec<(AutomationPointKey, ArrangementCurveKind, ArrangementCurveKind)>,
     /// `automation_point_rects` を観測 (毎 frame、 描画順に並ぶ)。
     point_rects: Vec<(AutomationPointKey, Rect)>,
+    /// M14 Phase 63n-4 (#029): lane body 空き dblclick → CreateAutomationClip 観測。
+    created_clips: Vec<(AutomationLaneKey, f64, f64)>,
 }
 
 fn make_lane(id: u32, enabled: bool) -> ArrangementAutomationLane {
@@ -187,6 +189,13 @@ fn run_arrangement_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: F
                         mm.set_curves.push((point, prev, next));
                     })
                 }
+                ArrangementEditRequest::CreateAutomationClip {
+                    lane,
+                    start_beat,
+                    len_beats,
+                } => Edit::mutate(move |mm: &mut ObsModel| {
+                    mm.created_clips.push((lane, start_beat, len_beats));
+                }),
                 _ => Edit::mutate(|_| {}),
             },
         );
@@ -310,6 +319,97 @@ fn lane_body_double_click_emits_add_automation_point() {
     assert!((time_beat - 6.0).abs() < 0.05, "time_beat ≈ 6.0、 actual {time_beat}");
     // value_norm ≈ 0.5 (lane mid)
     assert!((value_norm - 0.5).abs() < 0.05, "value_norm ≈ 0.5、 actual {value_norm}");
+}
+
+/// M14 Phase 63n-4 (#029): lane body 内 clip ギャップ (= 既存 clip と x 範囲が重ならない) で
+/// dblclick → CreateAutomationClip 発火。 既存 clip 上 dblclick は priority 排他で
+/// AddAutomationPoint のまま、 CreateAutomationClip は発火しない (regression check)。
+#[test]
+fn lane_body_dblclick_in_clip_gap_emits_create_automation_clip() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    // clip を [0..6] に短縮 (= len_beats=6) して beat 10 を「lane body 内 + clip ギャップ」 にする。
+    let mut lane = make_lane(10, true);
+    lane.clips[0].len_beats = 6.0;
+    m.tracks = vec![make_track(1, vec![lane])];
+
+    // beat 10 = screen x = 200 + 10*37.5 = 575、 lane body の cy mid (= 32 + 30 = 62)
+    let cx = 575.0;
+    let cy = 32.0 + 30.0;
+
+    // 1 click 目: single click では発火しない (clip ギャップでも AddAutomationPoint と同様 dblclick 必須)。
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_press(cx, cy, Modifiers::empty()),
+        ..FrameInput::default()
+    });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_release(cx, cy, Modifiers::empty()),
+        ..FrameInput::default()
+    });
+    assert_eq!(m.created_clips.len(), 0, "single click では CreateAutomationClip 発火しない");
+
+    // 2 click 目 (UiHost が dblclick 判定) → CreateAutomationClip が発火。
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_press(cx, cy, Modifiers::empty()),
+        ..FrameInput::default()
+    });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_release(cx, cy, Modifiers::empty()),
+        ..FrameInput::default()
+    });
+
+    assert_eq!(m.created_clips.len(), 1, "dblclick で CreateAutomationClip を 1 度発火");
+    let (lane_key, start_beat, len_beats) = m.created_clips[0];
+    assert_eq!(lane_key, AutomationLaneKey { track: 1, lane: 10 });
+    // SnapConfig::OFF なので raw beat 10 がそのまま入る。
+    assert!((start_beat - 10.0).abs() < 0.05, "start_beat ≈ 10.0、 actual {start_beat}");
+    // len_beats は style 既定値 (= 4.0)。
+    assert!((len_beats - 4.0).abs() < 1e-6, "style 既定 len_beats=4.0、 actual {len_beats}");
+    // AddAutomationPoint は **発火しない** (priority 排他)。
+    assert_eq!(
+        m.added_points.len(),
+        0,
+        "clip ギャップ dblclick では AddAutomationPoint は発火しない"
+    );
+}
+
+/// M14 Phase 63n-4 (#029) regression: 既存 clip 上の dblclick は priority 1 (clip hit)
+/// で `DoubleClickClip` が、 priority 2 (lane body 内 clip 内) で `AddAutomationPoint` が
+/// 発火する path のまま、 `CreateAutomationClip` は発火しない。 priority 1 (clip_hit) は
+/// track row 内の clip rect だけを見るため、 lane body 内 clip は priority 2 の
+/// `AddAutomationPoint` に行く。
+#[test]
+fn lane_body_dblclick_on_existing_clip_does_not_emit_create() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lane(10, true)])];
+    // 既存 point の中間 (beat 6) で lane body 内、 clip 内。
+    let cx = 425.0;
+    let cy = 32.0 + 6.0 + 24.0;
+
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_press(cx, cy, Modifiers::empty()),
+        ..FrameInput::default()
+    });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_release(cx, cy, Modifiers::empty()),
+        ..FrameInput::default()
+    });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_press(cx, cy, Modifiers::empty()),
+        ..FrameInput::default()
+    });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_release(cx, cy, Modifiers::empty()),
+        ..FrameInput::default()
+    });
+
+    assert_eq!(m.added_points.len(), 1, "既存 clip 内 dblclick は AddAutomationPoint を発火");
+    assert_eq!(
+        m.created_clips.len(),
+        0,
+        "既存 clip 上 dblclick では CreateAutomationClip は発火しない (priority 排他)"
+    );
 }
 
 /// Alt + click on point → DeleteAutomationPoints (即時発火、 commit-by-release なし)。
