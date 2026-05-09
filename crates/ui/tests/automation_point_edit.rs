@@ -144,6 +144,7 @@ fn run_arrangement_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: F
             view,
             &[],
             &[],
+            &[],
             &style,
             |req| match req {
                 ArrangementEditRequest::SetLaneEnabled { lane, enabled } => {

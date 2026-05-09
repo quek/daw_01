@@ -6,8 +6,8 @@
 
 use daw_ui_core::{
     ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView,
-    ClipKey, Edit, Note, NoteId, NotesEditRequest, PianoRollStyle, PianoRollView, PointerFrame,
-    ReorderableListEditRequest, ReorderableListStyle, UiHost,
+    AutomationClipKey, ClipKey, Edit, Note, NoteId, NotesEditRequest, PianoRollStyle,
+    PianoRollView, PointerFrame, ReorderableListEditRequest, ReorderableListStyle, UiHost,
 };
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{Rect, Scene};
@@ -29,6 +29,7 @@ struct Model {
     arr_tracks: Vec<ArrangementTrack>,
     arr_selected_clips: Vec<ClipKey>,
     arr_selected_tracks: Vec<u32>,
+    arr_selected_automation_clips: Vec<AutomationClipKey>,
     // M11 Phase 51: reorderable_list widget 用 (non-Clone Model でも呼べることを担保)
     chain: Vec<String>,
 }
@@ -48,6 +49,7 @@ fn main() {
         arr_tracks: Vec::new(),
         arr_selected_clips: Vec::new(),
         arr_selected_tracks: Vec::new(),
+        arr_selected_automation_clips: Vec::new(),
         chain: Vec::new(),
     };
 
@@ -186,6 +188,7 @@ fn main() {
                 arr_view,
                 &m.arr_selected_clips,
                 &m.arr_selected_tracks,
+                &m.arr_selected_automation_clips,
                 &arr_style,
                 |req| match req {
                     ArrangementEditRequest::SelectClips { .. } => {
@@ -292,6 +295,25 @@ fn main() {
                         Edit::mutate(|_m: &mut Model| {})
                     }
                     ArrangementEditRequest::SetAutomationCurveType { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    // M14 Phase 63n-3 (#028): automation clip drag の 5 variant。
+                    ArrangementEditRequest::MoveAutomationClips(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::CloneAutomationClipsLinked(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::CloneAutomationClipsIndependent(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::ResizeAutomationClips(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::DeleteAutomationClips(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::SelectAutomationClips { .. } => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
                 },

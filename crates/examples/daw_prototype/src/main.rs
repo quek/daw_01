@@ -111,6 +111,9 @@ struct DawModel {
     /// arrangement に渡すときは `m.arr_automation_lanes.get(&t.id).cloned().unwrap_or_default()`。
     arr_automation_lanes:
         std::collections::HashMap<u32, Vec<daw_ui_core::ArrangementAutomationLane>>,
+    /// M14 Phase 63n-3 (#028): 選択中の automation clip key 集合 (短 click on clip で SelectAutomationClips
+    /// を受信し、 widget へ毎 frame 渡して selected_fill / selected_border 表示を駆動する SSoT)。
+    arr_selected_automation_clips: Vec<daw_ui_core::AutomationClipKey>,
     /// M14 Phase 63e (#019): linked clone で発番する group id の counter。
     /// `CloneClipsLinked` 受信時、 source に group_id がなければ新採番、 source / dst 両方に
     /// 同じ id を assign。 `arr_tracks_for_widget` で `(gid as f32 * 0.618034).rem_euclid(1.0)`
@@ -222,6 +225,7 @@ impl DawModel {
                 h.insert(0, build_sample_automation_lanes(0));
                 h
             },
+            arr_selected_automation_clips: Vec::new(),
             arr_next_share_group_id: 0,
             arr_rename_target: None,
             demo_chain: vec![
@@ -828,6 +832,43 @@ fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
 /// に lane を付けられることを示す。 旧 Phase 63n-1 では `track_id == 1` だったが 「最初の track の
 /// 下に lane」 が直感的な配置として user feedback で確定)。 各 lane は単純な curve preview と
 /// clip rect の見た目確認のため、 短い point 列を持つ 1 clip 構成。
+/// M14 Phase 63n-3 (#028) follow-up: src clip と同じ `share_group_color` hue を持つ全 clip に対して
+/// `f` を適用する。 None (= 共有グループ未所属) のときは src clip のみに適用。 daw_01 main では
+/// `Song.clip_contents` map 経由で content を共有するため content 編集が全 clip に自動波及するが、
+/// daw_prototype は points を各 clip に inline で持つ簡易実装なので、 user の point edit (Add / Move /
+/// Delete / Curve) で linked clone 兄弟 clip にも同じ編集を波及させる必要がある。
+fn for_each_linked_clip<F>(
+    lanes_map: &mut std::collections::HashMap<u32, Vec<daw_ui_core::ArrangementAutomationLane>>,
+    src: daw_ui_core::AutomationClipKey,
+    mut f: F,
+) where
+    F: FnMut(&mut daw_ui_core::ArrangementAutomationClip),
+{
+    let src_hue = lanes_map
+        .get(&src.track)
+        .and_then(|lanes| lanes.iter().find(|l| l.id == src.lane))
+        .and_then(|l| l.clips.iter().find(|c| c.id == src.clip))
+        .and_then(|c| c.share_group_color);
+    if let Some(hue) = src_hue {
+        for lanes in lanes_map.values_mut() {
+            for l in &mut *lanes {
+                for c in &mut l.clips {
+                    if let Some(other) = c.share_group_color
+                        && (other - hue).abs() < 1e-6
+                    {
+                        f(c);
+                    }
+                }
+            }
+        }
+    } else if let Some(lanes) = lanes_map.get_mut(&src.track)
+        && let Some(l) = lanes.iter_mut().find(|l| l.id == src.lane)
+        && let Some(c) = l.clips.iter_mut().find(|c| c.id == src.clip)
+    {
+        f(c);
+    }
+}
+
 fn build_sample_automation_lanes(track_id: u32) -> Vec<daw_ui_core::ArrangementAutomationLane> {
     if track_id != 0 {
         return Vec::new();
@@ -1065,6 +1106,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
         m.arr_view,
         &m.arr_selected_clips,
         &m.arr_selected_tracks,
+        &m.arr_selected_automation_clips,
         &style,
         move |req| match req {
             ArrangementEditRequest::SelectClips { next, .. } => {
@@ -1564,18 +1606,20 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 })
             }
             // M14 Phase 63n-2 (#028): lane body 内 point の add / move / delete / curve 切替。
+            // M14 Phase 63n-3 (#028) follow-up: share_group_color 一致 (= linked clone 兄弟) 全 clip に
+            // 編集を波及させる (daw_01 main の `Song.clip_contents` 共有と同等の動作を prototype 内で再現)。
             ArrangementEditRequest::AddAutomationPoint {
                 clip,
                 time_beat,
                 value_norm,
             } => Edit::mutate(move |mm: &mut DawModel| {
-                if let Some(lanes) = mm.arr_automation_lanes.get_mut(&clip.track)
-                    && let Some(l) = lanes.iter_mut().find(|l| l.id == clip.lane)
-                    && let Some(c) = l.clips.iter_mut().find(|c| c.id == clip.clip)
-                {
-                    // Linear curve で point を挿入 (caller 仕様、 daw_01 では last-touched curve を継承
-                    // する案もあるが、 prototype では Linear で固定)。 time_beat 昇順を保つよう insert 位置を計算。
-                    let pos = c.points.iter().position(|p| p.time_beat > time_beat).unwrap_or(c.points.len());
+                for_each_linked_clip(&mut mm.arr_automation_lanes, clip, |c| {
+                    // Linear curve で point を挿入。 time_beat 昇順を保つよう insert 位置を計算。
+                    let pos = c
+                        .points
+                        .iter()
+                        .position(|p| p.time_beat > time_beat)
+                        .unwrap_or(c.points.len());
                     c.points.insert(
                         pos,
                         daw_ui_core::ArrangementAutomationPoint {
@@ -1584,7 +1628,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                             curve: daw_ui_core::ArrangementCurveKind::Linear,
                         },
                     );
-                }
+                });
                 mm.arr_view.data_generation += 1;
                 mm.last_action = format!(
                     "arr: AddAutomationPoint t{} l{} c{} @{:.2} v={:.2}",
@@ -1595,25 +1639,21 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 Edit::mutate(move |mm: &mut DawModel| {
                     let n = deltas.len();
                     for d in &deltas {
-                        if let Some(lanes) = mm.arr_automation_lanes.get_mut(&d.point.clip.track)
-                            && let Some(l) = lanes.iter_mut().find(|l| l.id == d.point.clip.lane)
-                            && let Some(c) = l.clips.iter_mut().find(|c| c.id == d.point.clip.clip)
-                            && let Some(p) = c.points.get_mut(d.point.point_idx as usize)
-                        {
-                            p.time_beat = d.next_time_beat;
-                            p.value_norm = d.next_value_norm;
-                        }
-                    }
-                    // time_beat 昇順を維持するため lane の clip.points を再 sort
-                    // (frame 内の point_idx は変動しうる、 caller 仕様 §11.2)。
-                    for d in &deltas {
-                        if let Some(lanes) = mm.arr_automation_lanes.get_mut(&d.point.clip.track)
-                            && let Some(l) = lanes.iter_mut().find(|l| l.id == d.point.clip.lane)
-                            && let Some(c) = l.clips.iter_mut().find(|c| c.id == d.point.clip.clip)
-                        {
-                            c.points
-                                .sort_by(|a, b| a.time_beat.partial_cmp(&b.time_beat).unwrap_or(std::cmp::Ordering::Equal));
-                        }
+                        let idx = d.point.point_idx as usize;
+                        let next_t = d.next_time_beat;
+                        let next_v = d.next_value_norm;
+                        for_each_linked_clip(&mut mm.arr_automation_lanes, d.point.clip, |c| {
+                            if let Some(p) = c.points.get_mut(idx) {
+                                p.time_beat = next_t;
+                                p.value_norm = next_v;
+                            }
+                            // 同 frame 内で sort も実行 (frame 内の point_idx は変動しうる、 caller 仕様 §11.2)。
+                            c.points.sort_by(|a, b| {
+                                a.time_beat
+                                    .partial_cmp(&b.time_beat)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                        });
                     }
                     mm.arr_view.data_generation += 1;
                     mm.last_action = format!("arr: MoveAutomationPoints ({n})");
@@ -1633,17 +1673,19 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                     }
                     for ((track, lane_id, clip_id), mut indices) in grouped {
                         indices.sort_by(|a, b| b.cmp(a)); // 降順
-                        if let Some(lanes) = mm.arr_automation_lanes.get_mut(&track)
-                            && let Some(l) = lanes.iter_mut().find(|l| l.id == lane_id)
-                            && let Some(c) = l.clips.iter_mut().find(|c| c.id == clip_id)
-                        {
-                            for idx in indices {
-                                let i = idx as usize;
+                        let src_key = daw_ui_core::AutomationClipKey {
+                            track,
+                            lane: lane_id,
+                            clip: clip_id,
+                        };
+                        for_each_linked_clip(&mut mm.arr_automation_lanes, src_key, |c| {
+                            for idx in &indices {
+                                let i = *idx as usize;
                                 if i < c.points.len() {
                                     c.points.remove(i);
                                 }
                             }
-                        }
+                        });
                     }
                     mm.arr_view.data_generation += 1;
                     mm.last_action = format!("arr: DeleteAutomationPoints ({n})");
@@ -1651,18 +1693,188 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
             }
             ArrangementEditRequest::SetAutomationCurveType { point, prev: _, next } => {
                 Edit::mutate(move |mm: &mut DawModel| {
-                    if let Some(lanes) = mm.arr_automation_lanes.get_mut(&point.clip.track)
-                        && let Some(l) = lanes.iter_mut().find(|l| l.id == point.clip.lane)
-                        && let Some(c) = l.clips.iter_mut().find(|c| c.id == point.clip.clip)
-                        && let Some(p) = c.points.get_mut(point.point_idx as usize)
-                    {
-                        p.curve = next;
-                    }
+                    let idx = point.point_idx as usize;
+                    for_each_linked_clip(&mut mm.arr_automation_lanes, point.clip, |c| {
+                        if let Some(p) = c.points.get_mut(idx) {
+                            p.curve = next;
+                        }
+                    });
                     mm.arr_view.data_generation += 1;
                     mm.last_action = format!(
                         "arr: SetAutomationCurveType t{} l{} c{} p{} → {:?}",
                         point.clip.track, point.clip.lane, point.clip.clip, point.point_idx, next
                     );
+                })
+            }
+            // M14 Phase 63n-3 (#028): automation clip drag の 5 variant。 source lane から clip を
+            // 取り出して `next_start_beat` に更新後 target lane に挿入 (start_beat 昇順)、 lane 跨ぎ
+            // 不一致は accept (Bitwig 流、 #028 [Resolved] follow-up 1)。 Linked / Independent clone は
+            // source clip 残置 + 同 / 新 share_group hue で複製 (MIDI clip clone 同 idiom)、
+            // ただし daw_prototype では points だけ deep clone する (content store は持たない簡易実装)。
+            ArrangementEditRequest::MoveAutomationClips(deltas) => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    let n = deltas.len();
+                    for d in &deltas {
+                        // (1) source lane から clip を取り出す
+                        let removed = mm.arr_automation_lanes.get_mut(&d.from.track).and_then(|lanes| {
+                            lanes.iter_mut().find(|l| l.id == d.from.lane).and_then(|l| {
+                                let pos = l.clips.iter().position(|c| c.id == d.from.clip)?;
+                                Some(l.clips.remove(pos))
+                            })
+                        });
+                        if let Some(mut clip) = removed {
+                            clip.start_beat = d.next_start_beat;
+                            // (2) target lane に挿入 (start_beat 昇順)
+                            if let Some(lanes) = mm.arr_automation_lanes.get_mut(&d.to_lane.track)
+                                && let Some(l) = lanes.iter_mut().find(|l| l.id == d.to_lane.lane)
+                            {
+                                let pos = l
+                                    .clips
+                                    .iter()
+                                    .position(|c| c.start_beat > clip.start_beat)
+                                    .unwrap_or(l.clips.len());
+                                l.clips.insert(pos, clip);
+                            }
+                        }
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!("arr: MoveAutomationClips ({n})");
+                })
+            }
+            ArrangementEditRequest::CloneAutomationClipsLinked(deltas) => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    let n = deltas.len();
+                    for d in &deltas {
+                        // source の現在の share_group_color を取得 (None なら新採番、 既にあれば流用)。
+                        let existing_hue = mm
+                            .arr_automation_lanes
+                            .get(&d.from.track)
+                            .and_then(|lanes| lanes.iter().find(|l| l.id == d.from.lane))
+                            .and_then(|l| l.clips.iter().find(|c| c.id == d.from.clip))
+                            .and_then(|c| c.share_group_color);
+                        let hue = existing_hue.unwrap_or_else(|| {
+                            // golden ratio で hue 採番 (= 隣接 group が色相的に十分離れる)
+                            let id = mm.arr_next_share_group_id;
+                            mm.arr_next_share_group_id += 1;
+                            (f32::from(u16::try_from(id).unwrap_or(u16::MAX)) * 0.618_034)
+                                .rem_euclid(1.0)
+                        });
+                        // source clip に hue を assign + name / len / points を取得
+                        let src_info = mm
+                            .arr_automation_lanes
+                            .get_mut(&d.from.track)
+                            .and_then(|lanes| lanes.iter_mut().find(|l| l.id == d.from.lane))
+                            .and_then(|l| {
+                                l.clips.iter_mut().find(|c| c.id == d.from.clip).map(|c| {
+                                    c.share_group_color = Some(hue);
+                                    (
+                                        Arc::clone(&c.name),
+                                        c.len_beats,
+                                        c.points.clone(),
+                                    )
+                                })
+                            });
+                        let Some((name, len_beats, points)) = src_info else { continue };
+                        // target lane に新 clip 追加 (新 id 採番、 同 hue を共有)
+                        if let Some(lanes) = mm.arr_automation_lanes.get_mut(&d.to_lane.track)
+                            && let Some(l) = lanes.iter_mut().find(|l| l.id == d.to_lane.lane)
+                        {
+                            // 新 clip id = lane 内 max + 1 (簡易採番、 conflict なし)
+                            let new_id =
+                                l.clips.iter().map(|c| c.id).max().unwrap_or(0).wrapping_add(1);
+                            let new_clip = daw_ui_core::ArrangementAutomationClip {
+                                id: new_id,
+                                start_beat: d.next_start_beat,
+                                len_beats,
+                                name,
+                                points,
+                                share_group_color: Some(hue),
+                            };
+                            let pos = l
+                                .clips
+                                .iter()
+                                .position(|c| c.start_beat > new_clip.start_beat)
+                                .unwrap_or(l.clips.len());
+                            l.clips.insert(pos, new_clip);
+                        }
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!("arr: CloneAutomationClipsLinked ({n})");
+                })
+            }
+            ArrangementEditRequest::CloneAutomationClipsIndependent(deltas) => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    let n = deltas.len();
+                    for d in &deltas {
+                        let src_info = mm
+                            .arr_automation_lanes
+                            .get(&d.from.track)
+                            .and_then(|lanes| lanes.iter().find(|l| l.id == d.from.lane))
+                            .and_then(|l| l.clips.iter().find(|c| c.id == d.from.clip))
+                            .map(|c| (Arc::clone(&c.name), c.len_beats, c.points.clone()));
+                        let Some((name, len_beats, points)) = src_info else { continue };
+                        if let Some(lanes) = mm.arr_automation_lanes.get_mut(&d.to_lane.track)
+                            && let Some(l) = lanes.iter_mut().find(|l| l.id == d.to_lane.lane)
+                        {
+                            let new_id =
+                                l.clips.iter().map(|c| c.id).max().unwrap_or(0).wrapping_add(1);
+                            let new_clip = daw_ui_core::ArrangementAutomationClip {
+                                id: new_id,
+                                start_beat: d.next_start_beat,
+                                len_beats,
+                                name,
+                                points,
+                                share_group_color: None, // independent clone は share group に入れない
+                            };
+                            let pos = l
+                                .clips
+                                .iter()
+                                .position(|c| c.start_beat > new_clip.start_beat)
+                                .unwrap_or(l.clips.len());
+                            l.clips.insert(pos, new_clip);
+                        }
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!("arr: CloneAutomationClipsIndependent ({n})");
+                })
+            }
+            ArrangementEditRequest::ResizeAutomationClips(deltas) => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    let n = deltas.len();
+                    for d in &deltas {
+                        if let Some(lanes) = mm.arr_automation_lanes.get_mut(&d.key.track)
+                            && let Some(l) = lanes.iter_mut().find(|l| l.id == d.key.lane)
+                            && let Some(c) = l.clips.iter_mut().find(|c| c.id == d.key.clip)
+                        {
+                            c.start_beat = d.next_start;
+                            c.len_beats = d.next_len;
+                        }
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!("arr: ResizeAutomationClips ({n})");
+                })
+            }
+            ArrangementEditRequest::DeleteAutomationClips(keys) => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    let n = keys.len();
+                    for k in &keys {
+                        if let Some(lanes) = mm.arr_automation_lanes.get_mut(&k.track)
+                            && let Some(l) = lanes.iter_mut().find(|l| l.id == k.lane)
+                        {
+                            l.clips.retain(|c| c.id != k.clip);
+                        }
+                    }
+                    mm.arr_selected_automation_clips.retain(|k| !keys.contains(k));
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!("arr: DeleteAutomationClips ({n})");
+                })
+            }
+            ArrangementEditRequest::SelectAutomationClips { next, .. } => {
+                let next_v = next;
+                Edit::mutate(move |mm: &mut DawModel| {
+                    let n = next_v.len();
+                    mm.arr_selected_automation_clips = next_v;
+                    mm.last_action = format!("arr: SelectAutomationClips ({n})");
                 })
             }
         },
@@ -1720,13 +1932,12 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                     _ => return,
                 };
                 ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
-                    if let Some(lanes) = mm.arr_automation_lanes.get_mut(&point_key.clip.track)
-                        && let Some(l) = lanes.iter_mut().find(|l| l.id == point_key.clip.lane)
-                        && let Some(c) = l.clips.iter_mut().find(|c| c.id == point_key.clip.clip)
-                        && let Some(p) = c.points.get_mut(point_key.point_idx as usize)
-                    {
-                        p.curve = next;
-                    }
+                    let idx = point_key.point_idx as usize;
+                    for_each_linked_clip(&mut mm.arr_automation_lanes, point_key.clip, |c| {
+                        if let Some(p) = c.points.get_mut(idx) {
+                            p.curve = next;
+                        }
+                    });
                     mm.arr_view.data_generation += 1;
                     mm.last_action = format!(
                         "arr: SetAutomationCurveType (popup) p{} → {:?} (prev {:?})",
@@ -1735,6 +1946,45 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 }));
             },
         );
+    }
+
+    // ---- M14 Phase 63n-3 (#028): automation clip 右クリック context_menu (Make Unique / Delete) ----
+    // `resp.automation_clip_rects` は visible-tracks / lane 順 / 描画順で並ぶ (collapsed group 内 /
+    // collapsed lane / invisible lane / off-screen は除外)。 Make Unique は share_group_color を
+    // None にして共有グループから外す (Linked clone から独立させる、 daw_01 #028 仕様縮約版)、
+    // Delete は `DeleteAutomationClips` 経由で発火 (widget は trigger を提供しないため caller-driven)。
+    for (clip_key, clip_rect) in &resp.automation_clip_rects {
+        let key = *clip_key;
+        ui.context_menu_for(*clip_rect, &["Make Unique", "Delete"], move |idx, ui| {
+            match idx {
+                0 => ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(lanes) = mm.arr_automation_lanes.get_mut(&key.track)
+                        && let Some(l) = lanes.iter_mut().find(|l| l.id == key.lane)
+                        && let Some(c) = l.clips.iter_mut().find(|c| c.id == key.clip)
+                    {
+                        c.share_group_color = None;
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!(
+                        "arr: Make Unique automation t{} l{} c{} (context)",
+                        key.track, key.lane, key.clip
+                    );
+                })),
+                1 => ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(lanes) = mm.arr_automation_lanes.get_mut(&key.track)
+                        && let Some(l) = lanes.iter_mut().find(|l| l.id == key.lane)
+                    {
+                        l.clips.retain(|c| c.id != key.clip);
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!(
+                        "arr: Delete automation t{} l{} c{} (context)",
+                        key.track, key.lane, key.clip
+                    );
+                })),
+                _ => {}
+            }
+        });
     }
 
     // ---- M14 Phase 63f (#020): clip 右クリック context_menu (Make Unique / Delete) ----

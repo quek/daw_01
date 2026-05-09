@@ -394,6 +394,30 @@ pub struct MoveAutomationPointDelta {
     pub next_value_norm: f32,
 }
 
+/// M14 Phase 63n-3 (#028): `MoveAutomationClips` / `CloneAutomationClipsLinked` /
+/// `CloneAutomationClipsIndependent` の delta 1 件 (lane 跨ぎ可、 release 時に発火)。
+/// `MoveClipDelta` と同 shape の lane 版 (caller の dispatch ロジックを 1:1 で踏襲できる)。
+/// `to_lane` は drop 先 lane key (= 同一 track 内 lane 跨ぎ + track 跨ぎ both 可)。
+#[derive(Clone, Copy, Debug)]
+pub struct MoveAutomationClipDelta {
+    pub from: AutomationClipKey,
+    pub to_lane: AutomationLaneKey,
+    pub prev_start_beat: f64,
+    pub next_start_beat: f64,
+}
+
+/// M14 Phase 63n-3 (#028): `ResizeAutomationClips` の delta 1 件 (release 時に発火)。
+/// `ResizeClipDelta` と完全同 shape。 `ResizeLeft` で `next_start != prev_start` + `next_len != prev_len`、
+/// `ResizeRight` で `next_start == prev_start` + `next_len != prev_len`。
+#[derive(Clone, Copy, Debug)]
+pub struct ResizeAutomationClipDelta {
+    pub key: AutomationClipKey,
+    pub prev_start: f64,
+    pub prev_len: f64,
+    pub next_start: f64,
+    pub next_len: f64,
+}
+
 /// M14 Phase 63c (#016): track header click 時の selection 変更 modifier (DAW 業界標準)。
 /// caller が `SelectTrack` Edit を受け取ったときに `(prev, next, modifier)` から動作意図を判別できる
 /// ようにするため、 widget 側で modifier を decoded して送る (caller boilerplate の削減)。
@@ -555,6 +579,39 @@ pub enum ArrangementEditRequest {
         prev: ArrangementCurveKind,
         next: ArrangementCurveKind,
     },
+    /// M14 Phase 63n-3 (#028): lane 内 automation clip の Move drag (release 時に発火)。 既存 MIDI
+    /// clip の `MoveClips` と semantics 1:1 対応 (= caller dispatch ロジックを 1:1 で踏襲できる、
+    /// ただし key 型 / lane 跨ぎ semantics が異なるため別 variant 化、 #028 [Resolved] §11.2 で確定)。
+    /// drag 中は描画 overlay のみ、 release で 1 度だけ発火。 単一 clip 限定 (multi-select は仕様 §scope 外)。
+    MoveAutomationClips(Vec<MoveAutomationClipDelta>),
+    /// M14 Phase 63n-3 (#028): Ctrl + drag による automation clip 共有コピー (release 時に発火)。
+    /// `MoveAutomationClips` と同 shape、 semantics は MIDI clip の `CloneClipsLinked` と同じ:
+    /// source は残置、 同一 content (= 同一 share_group_color hue) を持つ新 clip を `to_lane` の
+    /// `next_start_beat` に追加する意図。 caller は ContentId 共有 + Song.clip_contents map 経由で
+    /// points を共有 (daw_01 #028 §5 と整合)。
+    CloneAutomationClipsLinked(Vec<MoveAutomationClipDelta>),
+    /// M14 Phase 63n-3 (#028): Ctrl+Shift + drag による automation clip 独立コピー (release 時に発火)。
+    /// `MoveAutomationClips` と同 shape、 semantics は MIDI clip の `CloneClipsIndependent` と同じ:
+    /// source は残置、 内容を deep clone した新 clip (新 ContentId 採番) を追加する意図。
+    CloneAutomationClipsIndependent(Vec<MoveAutomationClipDelta>),
+    /// M14 Phase 63n-3 (#028): lane 内 automation clip の Resize drag (release 時に発火)。
+    /// 既存 MIDI clip の `ResizeClips` と semantics 1:1 対応、 単一 clip 限定。
+    ResizeAutomationClips(Vec<ResizeAutomationClipDelta>),
+    /// M14 Phase 63n-3 (#028): automation clip の delete (caller-driven、 widget は trigger を提供
+    /// しない)。 caller は context menu / keyboard shortcut から発火する想定 (widget は
+    /// `Response.automation_clip_rects` で全 clip rect を毎 frame 返すため、 caller が
+    /// `context_menu_for(rect, &["Delete", ...], ...)` で右クリック menu を毎 frame 呼ぶ idiom)。
+    /// API 完全性のため variant は定義するが、 widget 内部からは現状 emit しない。
+    DeleteAutomationClips(Vec<AutomationClipKey>),
+    /// M14 Phase 63n-3 (#028): automation clip の selection 変更 (短 click on clip で発火)。
+    /// `prev` / `next` は順序保持 `Vec` (= 1 click は `next = vec![hit_key]` の単一選択)。
+    /// caller は単純に上書きで OK。 既存 MIDI clip `SelectClips` と independence: caller 側で
+    /// `selected_automation_clips` と `selected_clips` を別 collection で持ち、 必要なら一方の click
+    /// で他方を clear するかは caller 仕様 (Bitwig は mutually exclusive、 他 DAW は coexist)。
+    SelectAutomationClips {
+        prev: Vec<AutomationClipKey>,
+        next: Vec<AutomationClipKey>,
+    },
 }
 
 /// `Ui::arrangement` の戻り値。
@@ -594,6 +651,15 @@ pub struct ArrangementResponse {
     /// &["Hold", "Linear", "Bezier"], ...) }` で右クリック context menu を毎 frame 呼ぶ idiom
     /// (`clip_rects` と同 pattern、 daw_01 #028 §11.4 で確定)。 widget 自体は popup を描画しない。
     pub automation_point_rects: Vec<(AutomationPointKey, Rect)>,
+    /// M14 Phase 63n-3 (#028): 全 visible automation clip の rect (lane body 内、 縦 padding 適用済)。
+    /// caller は `for (key, rect) in &resp.automation_clip_rects { ui.context_menu_for(*rect,
+    /// &["Make Unique", "Delete", ...], ...) }` で右クリック context menu を毎 frame 呼ぶ idiom
+    /// (`clip_rects` / `automation_point_rects` と同 pattern)。 collapsed group / hidden lane / 完全
+    /// off-screen の clip は除外。
+    pub automation_clip_rects: Vec<(AutomationClipKey, Rect)>,
+    /// M14 Phase 63n-3 (#028): drag 中の automation clip kind (`Some` なら lane 内 clip drag セッション
+    /// 進行中)。 既存 `dragging` (MIDI clip 用) と直交、 同 frame 内で両方 `Some` にならない (排他)。
+    pub dragging_automation_clip: Option<ClipDragKind>,
 }
 
 impl Default for ArrangementResponse {
@@ -612,6 +678,8 @@ impl Default for ArrangementResponse {
             reordering: None,
             dragging_track_volume: None,
             automation_point_rects: Vec::new(),
+            automation_clip_rects: Vec::new(),
+            dragging_automation_clip: None,
         }
     }
 }
@@ -1576,6 +1644,36 @@ struct AutomationLaneDefaultDragSession {
     last_emitted_value: f32,
 }
 
+/// M14 Phase 63n-3 (#028): lane 内 automation clip の Move / ResizeLeft / ResizeRight drag session。
+/// 既存 `ClipDragSession` (MIDI / Audio clip 用) と同 pattern だが key 型 / lane 跨ぎ semantics が
+/// 異なるため別 struct 化。 単一 clip 限定 (multi-select は仕様 §scope 外)、 `last_*` で OS event
+/// 順序による modifier false 化 race を回避 (ClipDragSession と同 pattern)。
+#[derive(Clone, Copy, Debug)]
+struct AutomationClipDragSession {
+    kind: ClipDragKind,
+    /// drag 対象 clip の identity (lane 跨ぎ後も不変)。
+    key: AutomationClipKey,
+    /// drag 開始時の `clip.start_beat` (release commit の `prev_start_beat`)。
+    anchor_start_beat: f64,
+    /// drag 開始時の `clip.len_beats` (release commit の `prev_len`、 Resize の min_len 計算用)。
+    anchor_len_beats: f64,
+    /// drag 開始時の所属 lane key (lane 跨ぎ無し時の `to_lane` default、 release frame で
+    /// `automation_lane_key_at_y(last_mouse.1)` が `None` のとき (= cursor が lane 外) この値を採用)。
+    anchor_lane: AutomationLaneKey,
+    /// drag 開始時の lane body rect (= 当該 lane の body_rect、 beat_to_px 計算 + ghost rect の y/h
+    /// 計算 SSoT、 view 変動耐性)。 ghost rect は `body_rect_anchor.y + pad` から `body_rect.h - pad*2`
+    /// の縦範囲で描画 (clip rect は lane body 内 padding 適用済範囲、 cached 内描画と同 SSoT)。
+    body_rect_anchor: Rect,
+    anchor_mouse: (f32, f32),
+    last_mouse: (f32, f32),
+    /// drag 中の最終 alt 状態 (snap 一時無効、 `ClipDragSession.last_alt` と同 pattern)。
+    last_alt: bool,
+    /// drag 中の最終 ctrl 状態 (CloneLinked 判定、 `ClipDragSession.last_ctrl` と同 pattern)。
+    last_ctrl: bool,
+    /// drag 中の最終 shift 状態 (CloneIndependent 判定、 `ClipDragSession.last_shift` と同 pattern)。
+    last_shift: bool,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ArrangementState {
     clip_drag: Option<ClipDragSession>,
@@ -1594,6 +1692,11 @@ pub(crate) struct ArrangementState {
     /// M14 Phase 63n-2 (#028): lane header default value band drag session
     /// (release で SetLaneDefault 1 件)。
     automation_lane_default_drag: Option<AutomationLaneDefaultDragSession>,
+    /// M14 Phase 63n-3 (#028): lane 内 automation clip の Move / Resize drag session
+    /// (release で `MoveAutomationClips` / `CloneAutomationClipsLinked` /
+    /// `CloneAutomationClipsIndependent` / `ResizeAutomationClips` のいずれか 1 件、
+    /// 短 click は `SelectAutomationClips` に demote)。
+    automation_clip_drag: Option<AutomationClipDragSession>,
     /// M14 Phase 63c (#016): 直前の `Single` クリック位置 (= Shift+click 範囲選択の起点)。
     /// caller には公開せず widget 内 SSoT として持つ (piano_roll の note multi-select は anchor
     /// なし設計だったが、 arrangement では daw_01 #009 / #016 で「widget 内 anchor」 が確認されている)。
@@ -2699,6 +2802,128 @@ fn automation_clip_at(
     None
 }
 
+/// M14 Phase 63n-3 (#028): lane body 内の automation clip 上で hit する
+/// `(AutomationClipKey, ClipDragKind, clip_rect, body_rect)` を返す。
+/// `clip_zone_at` と完全同 仕様: clip rect 左右 edge から内外 ±`edge` px が Resize、 内側中央が Move、
+/// 短 clip (`r.w <= edge * 2`) は rect 内全 Move (rect 外側のみ resize)。 後勝ち順 (描画順と整合)。
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn automation_clip_zone_at(
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
+    track_row_h: f32,
+    view: ArrangementView,
+    header_pane_x: f32,
+    header_pane_w: f32,
+    lanes: Rect,
+    style: &ArrangementStyle,
+    cx: f32,
+    cy: f32,
+    edge: f32,
+) -> Option<(AutomationClipKey, ClipDragKind, Rect, Rect)> {
+    if !lanes.contains(cx, cy) {
+        return None;
+    }
+    let mut hit: Option<(AutomationClipKey, ClipDragKind, Rect, Rect)> = None;
+    for_each_visible_lane(
+        visible_tracks,
+        tops,
+        track_row_h,
+        header_pane_x,
+        header_pane_w,
+        lanes.x,
+        lanes.w,
+        style,
+        |t_idx, _l_idx, lane, _h_rect, body_rect| {
+            if cy < body_rect.y || cy >= body_rect.y + body_rect.h {
+                return;
+            }
+            let track_id = visible_tracks[t_idx].id;
+            let beat_to_px = f64::from(body_rect.w) / view.len_beats.max(1e-6);
+            let pad = style.automation_clip_v_pad_px;
+            let clip_y = body_rect.y + pad;
+            let clip_h = (body_rect.h - pad * 2.0).max(2.0);
+            if cy < clip_y || cy >= clip_y + clip_h {
+                return;
+            }
+            for clip in &lane.clips {
+                #[allow(clippy::cast_possible_truncation)]
+                let cx_clip = body_rect.x
+                    + ((clip.start_beat - view.start_beat) * beat_to_px) as f32;
+                #[allow(clippy::cast_possible_truncation)]
+                let cw = ((clip.len_beats * beat_to_px) as f32).max(2.0);
+                let r = Rect { x: cx_clip, y: clip_y, w: cw, h: clip_h };
+                if cx < r.x - edge || cx >= r.x + r.w + edge {
+                    continue;
+                }
+                let in_rect = cx >= r.x && cx < r.x + r.w;
+                let near_left = cx < r.x + edge;
+                let near_right = cx >= r.x + r.w - edge;
+                let short_clip = r.w <= edge * 2.0;
+                let kind = if short_clip && in_rect {
+                    ClipDragKind::Move
+                } else if near_left && (!in_rect || cx - r.x < edge) {
+                    ClipDragKind::ResizeLeft
+                } else if near_right && (!in_rect || (r.x + r.w) - cx < edge) {
+                    ClipDragKind::ResizeRight
+                } else {
+                    ClipDragKind::Move
+                };
+                let key = AutomationClipKey {
+                    track: track_id,
+                    lane: lane.id,
+                    clip: clip.id,
+                };
+                hit = Some((key, kind, r, body_rect));
+            }
+        },
+    );
+    hit
+}
+
+/// M14 Phase 63n-3 (#028): cursor y から該当する `(AutomationLaneKey, body_rect)` を返す
+/// (`automation_lane_at` の lane_key 抽出版、 cross-lane drag の release frame で `last_mouse.1` から
+/// drop 先 lane を確定する用途)。 cursor が lane 群の y 範囲外なら `None`。
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn automation_lane_key_at_y(
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
+    track_row_h: f32,
+    header_pane_x: f32,
+    header_pane_w: f32,
+    lanes_x: f32,
+    lanes_w: f32,
+    style: &ArrangementStyle,
+    cy: f32,
+) -> Option<(AutomationLaneKey, Rect)> {
+    let mut found: Option<(AutomationLaneKey, Rect)> = None;
+    for_each_visible_lane(
+        visible_tracks,
+        tops,
+        track_row_h,
+        header_pane_x,
+        header_pane_w,
+        lanes_x,
+        lanes_w,
+        style,
+        |t_idx, _l_idx, lane, _h_rect, body_rect| {
+            if found.is_some() {
+                return;
+            }
+            if cy >= body_rect.y && cy < body_rect.y + body_rect.h {
+                let track_id = visible_tracks[t_idx].id;
+                found = Some((
+                    AutomationLaneKey { track: track_id, lane: lane.id },
+                    body_rect,
+                ));
+            }
+        },
+    );
+    found
+}
+
+
 /// 単一 segment (前 point → 次 point) を Catmull-Rom + tension で flatten。
 /// `kind` が `Hold` なら階段 (前値で水平 → 次 point の x で垂直)、 `Linear` なら直線、
 /// `Bezier { tension }` なら Catmull-Rom (tension は端点の引き / 反り具合)。
@@ -2826,15 +3051,20 @@ fn flatten_lane_curve(
 /// len_beats / track_top 等を渡す、 lane 描画では `start_beat` / `len_beats` のみ参照)。
 /// disabled lane (`enabled = false`) は curve / clip / point を `automation_lane_disabled_color` で描画、
 /// share_group_color が `Some(hue)` の clip は audio clip と同 hsl 変換で fill / border を上書き。
+/// M14 Phase 63n-3 (#028): `selected_clips_set` に含まれる `AutomationClipKey` は `clip_selected_fill` /
+/// `clip_selected_border` で描画 (selected priority 最高)、 share_group_color = Some の clip は名前の左に
+/// `share_group_link_glyph` (`⇌`) を 1 文字描画 (MIDI clip と同 idiom)。 `track_id` は selection lookup 用。
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn draw_automation_lane<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
+    track_id: u32,
     lane: &ArrangementAutomationLane,
     header_rect: Rect,
     body_rect: Rect,
     view: ArrangementView,
     style: &ArrangementStyle,
     lanes_clip: Rect,
+    selected_clips_set: &HashSet<AutomationClipKey>,
 ) {
     // ---- 背景 (lane 行 全幅) ----
     push_filled_rect(
@@ -2957,10 +3187,16 @@ fn draw_automation_lane<M: ?Sized + 'static>(
         let ch = (body_rect.h - pad * 2.0).max(2.0);
         let clip_rect = Rect { x, y: cy, w, h: ch };
 
+        // M14 Phase 63n-3 (#028): selected な automation clip は selected_fill / selected_border で
+        // 描画 (priority: selected > disabled > share_group > lane.color)。
+        let clip_key = AutomationClipKey { track: track_id, lane: lane.id, clip: c.id };
+        let is_selected = selected_clips_set.contains(&clip_key);
         // share_group_color (linked tint) — audio clip と同 hsl 変換。 disabled lane は **clip rect の
         // fill / border のみ灰色** (= bypass marker)、 中身 (curve / point / clip 名) は元の lane.color
         // のままにして可読性を保つ (Bitwig / Live と同パターン、 #028 user 指摘 3)。
-        let (fill, border) = if lane.enabled {
+        let (fill, border) = if is_selected {
+            (style.clip_selected_fill, style.clip_selected_border)
+        } else if lane.enabled {
             if let Some(hue) = c.share_group_color {
                 (
                     hsl_to_rgb(
@@ -3001,18 +3237,38 @@ fn draw_automation_lane<M: ?Sized + 'static>(
             clip_rect: Some(lanes_clip),
         });
 
-        // clip name (上端、 lane なので小さめ)
+        // clip name + share group link glyph (⇌) — MIDI clip と同 idiom (`draw_clip` と対称)。
+        // share_group_color = Some(hue) のとき名前の左に link glyph を 1 文字描画 + name を glyph 幅 +
+        // 2px gap 分ずらす。 selection / disabled とは独立に描画 (link 関係は bypass / 選択と直交)。
         if w >= 28.0 {
             let glyph_color = if lane.enabled {
                 style.automation_lane_text_color
             } else {
                 style.automation_lane_disabled_color
             };
+            let font_size = style.clip_text_size * 0.85;
+            let has_link = c.share_group_color.is_some();
+            let text_left = if has_link {
+                clip_rect.x + 4.0 + font_size + 2.0
+            } else {
+                clip_rect.x + 4.0
+            };
+            if has_link {
+                hctx.push_text(GlyphArea {
+                    text: Arc::from(style.share_group_link_glyph.to_string()),
+                    left: clip_rect.x + 4.0,
+                    top: clip_rect.y + 2.0,
+                    font_size,
+                    line_height: style.clip_text_size,
+                    color: glyph_color,
+                    clip_rect: Some(clip_rect),
+                });
+            }
             hctx.push_text(GlyphArea {
                 text: Arc::clone(&c.name),
-                left: clip_rect.x + 4.0,
+                left: text_left,
                 top: clip_rect.y + 2.0,
-                font_size: style.clip_text_size * 0.85,
+                font_size,
                 line_height: style.clip_text_size,
                 color: glyph_color,
                 clip_rect: Some(clip_rect),
@@ -3123,6 +3379,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         view: ArrangementView,
         selected_clips: &[ClipKey],
         selected_tracks: &[u32],
+        selected_automation_clips: &[AutomationClipKey],
         style: &ArrangementStyle,
         make_edit: F,
     ) -> ArrangementResponse
@@ -3552,6 +3809,52 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     }
                 }
             }
+
+            // M14 Phase 63n-3 (#028): lane body 内 automation clip の press 振り分け。 priority:
+            // **point hit より低い** (= 上の point block で point drag / Alt+delete が起動済なら skip)。
+            // modifier 付き (Ctrl / Ctrl+Shift) でも起動 (= MIDI clip drag と完全対称な policy)、
+            // Shift only は rect_select に温存して起動せず。
+            let already_taken_by_point = {
+                let state: &ArrangementState = self.widget_state(wid);
+                state.automation_point_drag.is_some()
+            };
+            if !already_taken_by_point
+                && in_lanes
+                && (!shift || ctrl)
+                && let Some((clip_key, kind, _clip_rect, body_rect_anchor)) =
+                    automation_clip_zone_at(
+                        &visible_tracks,
+                        &press_tops,
+                        view.track_row_h,
+                        view,
+                        header_pane.x,
+                        header_pane.w,
+                        lanes,
+                        style,
+                        px,
+                        py,
+                        style.resize_handle_px,
+                    )
+                && let Some((_lane, clip_in)) = find_lane_clip(&visible_tracks, clip_key)
+            {
+                let press_alt = pointer.modifiers.alt;
+                let press_ctrl = pointer.modifiers.ctrl;
+                let press_shift = pointer.modifiers.shift;
+                let state: &mut ArrangementState = self.widget_state(wid);
+                state.automation_clip_drag = Some(AutomationClipDragSession {
+                    kind,
+                    key: clip_key,
+                    anchor_start_beat: clip_in.start_beat,
+                    anchor_len_beats: clip_in.len_beats,
+                    anchor_lane: clip_key.lane_key(),
+                    body_rect_anchor,
+                    anchor_mouse: (px, py),
+                    last_mouse: (px, py),
+                    last_alt: press_alt,
+                    last_ctrl: press_ctrl,
+                    last_shift: press_shift,
+                });
+            }
         }
 
         // M14 Phase 63j (#024): press block で貯めた playhead seek を 1 度発行 (state borrow 終了後)。
@@ -3673,6 +3976,20 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 && !is_release
             {
                 ld.last_mouse_x = px;
+            }
+            // M14 Phase 63n-3 (#028): automation_clip_drag continuation で last_mouse +
+            // last_alt / last_ctrl / last_shift を update (`ClipDragSession` と同 pattern)。
+            // release frame の `last_mouse` は pointer.pos != anchor のときのみ update、 modifier は
+            // release では保持 (ModifiersChanged が MouseInput より先に届く race を回避)。
+            if let Some(ref mut acd) = state.automation_clip_drag {
+                if !is_release {
+                    acd.last_mouse = (px, py);
+                    acd.last_alt = alt_now;
+                    acd.last_ctrl = ctrl_now;
+                    acd.last_shift = shift_now;
+                } else if (px, py) != acd.anchor_mouse {
+                    acd.last_mouse = (px, py);
+                }
             }
         }
 
@@ -3963,6 +4280,22 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 None
             };
 
+        // M14 Phase 63n-3 (#028): automation_clip_drag overlay clone + release take。
+        // overlay は ghost clip rect を cached 外で重ねる、 release で 1 度だけ
+        // `MoveAutomationClips` / `CloneAutomationClipsLinked` / `CloneAutomationClipsIndependent` /
+        // `ResizeAutomationClips` / (短 click 時) `SelectAutomationClips` のいずれかを発行。
+        let automation_clip_drag_session: Option<AutomationClipDragSession> = {
+            let state: &mut ArrangementState = self.widget_state(wid);
+            state.automation_clip_drag
+        };
+        let automation_clip_drag_release: Option<AutomationClipDragSession> =
+            if pointer.primary_just_released {
+                let state: &mut ArrangementState = self.widget_state(wid);
+                state.automation_clip_drag.take()
+            } else {
+                None
+            };
+
         // drag overlay delta (last_mouse ベース、release と一貫)。
         // M14 Phase 63j (#024): `beat_per_px` / `zoom_x_px_per_beat` は関数頭で計算済 (press 振り分けの
         // playhead seek snap でも使うため)。 ここでは shadow せず再利用する。
@@ -4019,7 +4352,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // ---- cursor ----
         // drag 中 / hover 中の clip 上 / それ以外で arrangement 内なら明示的に Default
         // にリセット (`set_cursor` を呼ばないと OS 側に前フレームの形が残る、winit は state-full)。
-        if let Some(kind) = response.dragging {
+        // M14 Phase 63n-3 (#028): automation clip drag 中も MIDI と同じ cursor 形状 (排他で `Some` 判定)。
+        let dragging_kind = response
+            .dragging
+            .or(automation_clip_drag_session.as_ref().map(|acd| acd.kind));
+        if let Some(kind) = dragging_kind {
             let cur = match kind {
                 ClipDragKind::Move => CursorIcon::Move,
                 ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => CursorIcon::EwResize,
@@ -4056,9 +4393,22 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let selected_tracks_hash: u64 = selected_tracks.iter().fold(0xCBF2_9CE4_8422_2325_u64, |a, &x| {
             a.wrapping_mul(0x100_0000_01B3).wrapping_add(u64::from(x))
         });
+        // M14 Phase 63n-3 (#028): selected_automation_clips を fold して cache 再構築を保証 (= 選択
+        // 変化時に lane の clip rect 描画が selected_fill / selected_border に切り替わる)。
+        let selected_automation_clips_hash: u64 = selected_automation_clips.iter().fold(
+            0xCBF2_9CE4_8422_2325_u64,
+            |a, k| {
+                a.wrapping_mul(0x100_0000_01B3)
+                    .wrapping_add(u64::from(k.track))
+                    .wrapping_mul(0x100_0000_01B3)
+                    .wrapping_add(u64::from(k.lane))
+                    .wrapping_mul(0x100_0000_01B3)
+                    .wrapping_add(u64::from(k.clip))
+            },
+        );
         let viewport_key = (
             (
-                b"arrangement_widget_v5" as &[u8],
+                b"arrangement_widget_v6" as &[u8],
                 rect.w.to_bits(),
                 rect.h.to_bits(),
                 view.start_beat.to_bits(),
@@ -4074,6 +4424,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             pending_reorder_hash,
             (view.bpm.to_bits(), u32::from(view.time_sig.0), u32::from(view.time_sig.1)),
             internal_clip_hash,
+            selected_automation_clips_hash,
         );
 
         // M14 Phase 63c (#016): SetTrackParent に統合した結果、 release frame の optimistic
@@ -4093,6 +4444,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // M14 Phase 63n-1 (#028): cached / cached-外 の prefix sum tops は heavy closure 内で
         // 再計算する (`'static` 制約で外側 borrow を持ち込めないため)。 caller scope では持たない。
         let selected_set: HashSet<ClipKey> = selected_clips.iter().copied().collect();
+        // M14 Phase 63n-3 (#028): automation clip selection set (heavy closure 用)。
+        let selected_automation_clips_set_for_heavy: HashSet<AutomationClipKey> =
+            selected_automation_clips.iter().copied().collect();
         // M14 Phase 63c (#016): heavy closure は `'static` 要求なので owned Vec<u32> で渡す
         // (selected_set と同パターン)。 loop 側の hit-test では `selected_tracks` slice (borrowed)
         // を直接 contains で参照するため、 ここで cloned heavy 用 vector を別に持って move 衝突を回避。
@@ -4110,6 +4464,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // last_emitted_value で塗り直し (cached 内描画は anchor 値のままなので cached 外で被せる)。
         let point_drag_overlay = point_drag_session;
         let lane_default_drag_overlay = lane_default_drag_session;
+        // M14 Phase 63n-3 (#028): automation_clip_drag overlay (heavy closure に move)。
+        // ghost rect は drag 中の preview (新位置 / 新長さ、 cross-lane drop なら新 lane の body 内) を
+        // cached 外で重ねる。 base 描画 (cached 内) も同 frame 表示されるが、 ghost が上に重なる。
+        let automation_clip_drag_overlay = automation_clip_drag_session;
         // M9 Phase 45f: drag overlay の Resize min_len は snap unit (snap_unit < 0.05 なら 0.05)。
         // release 側 min_len と一貫させるため、 alt 真値は drag session の `last_alt` を使う
         // (overlay と release commit が必ず同一 unit で確定する)。 overlay 不在時 (drag していない)
@@ -4283,12 +4641,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         };
                         draw_automation_lane(
                             hctx,
+                            t.id,
                             lane,
                             header_rect,
                             body_rect,
                             view_copy,
                             &style_copy,
                             lanes,
+                            &selected_automation_clips_set_for_heavy,
                         );
                         lane_y += lh;
                     }
@@ -4376,6 +4736,130 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     radius: [r; 4],
                     clip_rect: Some(pd.body_rect_anchor),
                 });
+            }
+            // M14 Phase 63n-3 (#028): automation_clip_drag ghost (drag 中の preview rect、 cross-lane
+            // drop 解決込み)。 fill / border / badge は MIDI clip drag preview と完全対称。
+            if let Some(acd) = automation_clip_drag_overlay {
+                let is_move_clone =
+                    matches!(acd.kind, ClipDragKind::Move) && acd.last_ctrl;
+                let (fill, border, badge_glyph) = if is_move_clone {
+                    if acd.last_shift {
+                        (
+                            style_copy.clip_clone_indep_fill,
+                            style_copy.clip_clone_indep_border,
+                            Some('+'),
+                        )
+                    } else {
+                        (
+                            style_copy.clip_clone_linked_fill,
+                            style_copy.clip_clone_linked_border,
+                            Some('⇌'),
+                        )
+                    }
+                } else {
+                    (
+                        style_copy.clip_selected_fill,
+                        style_copy.clip_selected_border,
+                        None,
+                    )
+                };
+                let beat_to_px =
+                    f64::from(acd.body_rect_anchor.w) / view_copy.len_beats.max(1e-6);
+                let raw_beat_delta = if beat_to_px > 1e-9 {
+                    f64::from(acd.last_mouse.0 - acd.anchor_mouse.0) / beat_to_px
+                } else {
+                    0.0
+                };
+                let pivot = match acd.kind {
+                    ClipDragKind::Move | ClipDragKind::ResizeLeft => acd.anchor_start_beat,
+                    ClipDragKind::ResizeRight => {
+                        acd.anchor_start_beat + acd.anchor_len_beats
+                    }
+                };
+                let snapped_pivot = view_copy.snap.snap_beat(
+                    pivot + raw_beat_delta,
+                    acd.last_alt,
+                    zoom_x_px_per_beat,
+                );
+                let beat_delta = snapped_pivot - pivot;
+                let min_len = if view_copy.snap.is_active(acd.last_alt) {
+                    view_copy
+                        .snap
+                        .beat_unit(zoom_x_px_per_beat)
+                        .map_or(0.05, |u| u.max(0.05))
+                } else {
+                    0.05
+                };
+                let (g_start, g_len) = match acd.kind {
+                    ClipDragKind::Move => {
+                        let new_start =
+                            (acd.anchor_start_beat + beat_delta).max(0.0);
+                        (new_start, acd.anchor_len_beats)
+                    }
+                    ClipDragKind::ResizeRight => (
+                        acd.anchor_start_beat,
+                        (acd.anchor_len_beats + beat_delta).max(min_len),
+                    ),
+                    ClipDragKind::ResizeLeft => {
+                        let max_start =
+                            acd.anchor_start_beat + acd.anchor_len_beats - min_len;
+                        let new_start =
+                            (acd.anchor_start_beat + beat_delta).clamp(0.0, max_start);
+                        let actual = new_start - acd.anchor_start_beat;
+                        (new_start, (acd.anchor_len_beats - actual).max(min_len))
+                    }
+                };
+                let target_body = if matches!(acd.kind, ClipDragKind::Move) {
+                    automation_lane_key_at_y(
+                        &tracks_owned,
+                        &tops_owned_for_heavy,
+                        view_copy.track_row_h,
+                        header_pane_copy.x,
+                        header_pane_copy.w,
+                        lanes.x,
+                        lanes.w,
+                        &style_copy,
+                        acd.last_mouse.1,
+                    )
+                    .map_or(acd.body_rect_anchor, |(_, body)| body)
+                } else {
+                    acd.body_rect_anchor
+                };
+                let pad = style_copy.automation_clip_v_pad_px;
+                let g_clip_y = target_body.y + pad;
+                let g_clip_h = (target_body.h - pad * 2.0).max(2.0);
+                #[allow(clippy::cast_possible_truncation)]
+                let g_x = target_body.x
+                    + ((g_start - view_copy.start_beat) * beat_to_px) as f32;
+                #[allow(clippy::cast_possible_truncation)]
+                let g_w = ((g_len * beat_to_px) as f32).max(2.0);
+                let ghost_rect = Rect { x: g_x, y: g_clip_y, w: g_w, h: g_clip_h };
+                if ghost_rect.x + ghost_rect.w >= lanes.x
+                    && ghost_rect.x <= lanes.x + lanes.w
+                {
+                    hctx.push_rect(RectCommand {
+                        rect: ghost_rect,
+                        fill,
+                        border,
+                        border_width: style_copy.clip_selected_border_w,
+                        radius: [style_copy.clip_radius; 4],
+                        clip_rect: Some(lanes),
+                    });
+                    if let Some(g) = badge_glyph
+                        && ghost_rect.w > style_copy.clip_clone_badge_size + 4.0
+                        && ghost_rect.h > style_copy.clip_clone_badge_size + 2.0
+                    {
+                        hctx.push_text(GlyphArea {
+                            text: Arc::from(g.to_string()),
+                            left: ghost_rect.x + 4.0,
+                            top: ghost_rect.y + 2.0,
+                            font_size: style_copy.clip_clone_badge_size,
+                            line_height: style_copy.clip_clone_badge_size * 1.2,
+                            color: style_copy.clip_clone_badge_color,
+                            clip_rect: Some(ghost_rect),
+                        });
+                    }
+                }
             }
             // loop band: drag preview がある場合は preview を描く、無ければ view.loop_range
             if let Some(range) = loop_preview_clone.or(view_copy.loop_range) {
@@ -4654,6 +5138,131 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     prev: ld.anchor_value_norm,
                     next: end,
                 }));
+            }
+        }
+
+        // ---- M14 Phase 63n-3 (#028): automation_clip_drag release ----
+        // commit-by-release: 短 click (Move + !Alt + dist < 4px) は **`SelectAutomationClips` に demote**
+        // (= 既存 MIDI clip の `clip_short_click_pos` 経路と同 idiom、 lane body 上 click は automation
+        // 選択に振る)。 それ以外は MoveAutomationClips / CloneAutomationClipsLinked /
+        // CloneAutomationClipsIndependent / ResizeAutomationClips を発行。 modifier は session の
+        // `last_*` を真値とし pointer.modifiers を直接見ない (race 回避、 ClipDragSession と同 pattern)。
+        // beat_to_px は anchor 固定 `body_rect_anchor` から計算 (view scroll 耐性)、 absolute snap で
+        // grid 吸着、 cross-lane Move は release y から `automation_lane_key_at_y` で drop lane 解決。
+        if let Some(acd) = automation_clip_drag_release {
+            let release_alt = acd.last_alt;
+            let dx = acd.last_mouse.0 - acd.anchor_mouse.0;
+            let dy = acd.last_mouse.1 - acd.anchor_mouse.1;
+            let dist = dx.abs() + dy.abs();
+            let demote =
+                matches!(acd.kind, ClipDragKind::Move) && !release_alt && dist < 4.0;
+            if demote {
+                // short click on automation clip → 単一選択を要求
+                let prev = selected_automation_clips.to_vec();
+                let next = vec![acd.key];
+                if prev != next {
+                    self.push_edit(make_edit(
+                        ArrangementEditRequest::SelectAutomationClips { prev, next },
+                    ));
+                    response.selection_changed = true;
+                }
+            } else {
+                let beat_to_px = f64::from(acd.body_rect_anchor.w) / view.len_beats.max(1e-6);
+                let raw_beat_delta = if beat_to_px > 1e-9 {
+                    f64::from(dx) / beat_to_px
+                } else {
+                    0.0
+                };
+                let pivot = match acd.kind {
+                    ClipDragKind::Move | ClipDragKind::ResizeLeft => acd.anchor_start_beat,
+                    ClipDragKind::ResizeRight => {
+                        acd.anchor_start_beat + acd.anchor_len_beats
+                    }
+                };
+                let snapped_pivot = view.snap.snap_beat(
+                    pivot + raw_beat_delta,
+                    release_alt,
+                    zoom_x_px_per_beat,
+                );
+                let beat_delta = snapped_pivot - pivot;
+                let min_len = if view.snap.is_active(release_alt) {
+                    view.snap
+                        .beat_unit(zoom_x_px_per_beat)
+                        .map_or(0.05, |u| u.max(0.05))
+                } else {
+                    0.05
+                };
+                match acd.kind {
+                    ClipDragKind::Move => {
+                        let new_start = (acd.anchor_start_beat + beat_delta).max(0.0);
+                        let to_lane = automation_lane_key_at_y(
+                            &visible_tracks,
+                            &press_tops,
+                            view.track_row_h,
+                            header_pane.x,
+                            header_pane.w,
+                            lanes.x,
+                            lanes.w,
+                            style,
+                            acd.last_mouse.1,
+                        )
+                        .map_or(acd.anchor_lane, |(lk, _body)| lk);
+                        let moved = (new_start - acd.anchor_start_beat).abs() > 1e-6
+                            || to_lane != acd.anchor_lane;
+                        if moved {
+                            let delta = MoveAutomationClipDelta {
+                                from: acd.key,
+                                to_lane,
+                                prev_start_beat: acd.anchor_start_beat,
+                                next_start_beat: new_start,
+                            };
+                            let req = if acd.last_ctrl && acd.last_shift {
+                                ArrangementEditRequest::CloneAutomationClipsIndependent(vec![delta])
+                            } else if acd.last_ctrl {
+                                ArrangementEditRequest::CloneAutomationClipsLinked(vec![delta])
+                            } else {
+                                ArrangementEditRequest::MoveAutomationClips(vec![delta])
+                            };
+                            self.push_edit(make_edit(req));
+                        }
+                    }
+                    ClipDragKind::ResizeRight => {
+                        let new_len = (acd.anchor_len_beats + beat_delta).max(min_len);
+                        if (new_len - acd.anchor_len_beats).abs() > 1e-6 {
+                            let delta = ResizeAutomationClipDelta {
+                                key: acd.key,
+                                prev_start: acd.anchor_start_beat,
+                                prev_len: acd.anchor_len_beats,
+                                next_start: acd.anchor_start_beat,
+                                next_len: new_len,
+                            };
+                            self.push_edit(make_edit(
+                                ArrangementEditRequest::ResizeAutomationClips(vec![delta]),
+                            ));
+                        }
+                    }
+                    ClipDragKind::ResizeLeft => {
+                        let max_start = acd.anchor_start_beat + acd.anchor_len_beats - min_len;
+                        let new_start =
+                            (acd.anchor_start_beat + beat_delta).clamp(0.0, max_start);
+                        let actual = new_start - acd.anchor_start_beat;
+                        let new_len = (acd.anchor_len_beats - actual).max(min_len);
+                        if (new_start - acd.anchor_start_beat).abs() > 1e-6
+                            || (new_len - acd.anchor_len_beats).abs() > 1e-6
+                        {
+                            let delta = ResizeAutomationClipDelta {
+                                key: acd.key,
+                                prev_start: acd.anchor_start_beat,
+                                prev_len: acd.anchor_len_beats,
+                                next_start: new_start,
+                                next_len: new_len,
+                            };
+                            self.push_edit(make_edit(
+                                ArrangementEditRequest::ResizeAutomationClips(vec![delta]),
+                            ));
+                        }
+                    }
+                }
             }
         }
 
@@ -5255,6 +5864,56 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             },
         );
 
+        // ---- M14 Phase 63n-3 (#028): automation_clip_rects を毎 frame 積む ----
+        // for_each_visible_lane で SSoT を共有 (= 描画 / hit-test と同じ式)、 visible automation
+        // clip の lane body 内 rect (縦 padding 適用済) を返す。 collapsed group / hidden lane / view
+        // beat 範囲外の clip は除外。 caller は右クリック context menu (Make Unique / Delete) の
+        // anchor として使う想定。
+        for_each_visible_lane(
+            &visible_tracks,
+            &press_tops,
+            view.track_row_h,
+            header_pane.x,
+            header_pane.w,
+            lanes.x,
+            lanes.w,
+            style,
+            |t_idx, _l_idx, lane, _h_rect, body_rect| {
+                if body_rect.y + body_rect.h < lanes.y || body_rect.y > lanes.y + lanes.h {
+                    return;
+                }
+                let track_id = visible_tracks[t_idx].id;
+                let beat_to_px = f64::from(body_rect.w) / view.len_beats.max(1e-6);
+                let pad = style.automation_clip_v_pad_px;
+                let clip_y = body_rect.y + pad;
+                let clip_h = (body_rect.h - pad * 2.0).max(2.0);
+                for clip_in in &lane.clips {
+                    let end = clip_in.start_beat + clip_in.len_beats;
+                    if end < view.start_beat || clip_in.start_beat > view_end {
+                        continue;
+                    }
+                    #[allow(clippy::cast_possible_truncation)]
+                    let cx_clip = body_rect.x
+                        + ((clip_in.start_beat - view.start_beat) * beat_to_px) as f32;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let cw = ((clip_in.len_beats * beat_to_px) as f32).max(2.0);
+                    let key = AutomationClipKey {
+                        track: track_id,
+                        lane: lane.id,
+                        clip: clip_in.id,
+                    };
+                    response.automation_clip_rects.push((
+                        key,
+                        Rect { x: cx_clip, y: clip_y, w: cw, h: clip_h },
+                    ));
+                }
+            },
+        );
+
+        // M14 Phase 63n-3 (#028): drag 中の automation clip kind を response に反映 (cursor /
+        // status indicator 用)。 既存 `dragging` (MIDI clip 用) と直交。
+        response.dragging_automation_clip = automation_clip_drag_session.map(|acd| acd.kind);
+
         response
     }
 }
@@ -5736,6 +6395,7 @@ mod tests {
                     m.view,
                     &[],
                     &[],
+                    &[],
                     &style,
                     |_| Edit::mutate(|_: &mut Model| {}),
                 );
@@ -5797,6 +6457,7 @@ mod tests {
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &m.tracks,
                     m.view,
+                    &[],
                     &[],
                     &[],
                     &style,
@@ -5861,6 +6522,7 @@ mod tests {
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &m.tracks,
                     m.view,
+                    &[],
                     &[],
                     &[],
                     &style,
@@ -6066,6 +6728,7 @@ mod tests {
                 m.view,
                 &[],
                 &[],
+                &[],
                 &style,
                 move |req| match req {
                     ArrangementEditRequest::SetTrackRowH(h) => {
@@ -6147,6 +6810,7 @@ mod tests {
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &tracks,
                 view,
+                &[],
                 &[],
                 &[],
                 &style,
@@ -6500,6 +7164,7 @@ mod tests {
                 m.view,
                 &[],
                 &[],
+                &[],
                 &style,
                 move |req| {
                     if let ArrangementEditRequest::SetPlayheadBeat(b) = req {
@@ -6560,6 +7225,7 @@ mod tests {
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
                 m.view,
+                &[],
                 &[],
                 &[],
                 &style,
@@ -6631,6 +7297,7 @@ mod tests {
                 m.view,
                 &[],
                 &[],
+                &[],
                 &style,
                 move |req| {
                     if let ArrangementEditRequest::SetPlayheadBeat(b) = req {
@@ -6691,6 +7358,7 @@ mod tests {
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &m.tracks,
                     m.view,
+                    &[],
                     &[],
                     &[],
                     &style,
@@ -6952,6 +7620,7 @@ mod tests {
                     m.view,
                     &[],
                     &[],
+                    &[],
                     &style,
                     move |req| {
                         if let ArrangementEditRequest::SetLoopRange { start, end } = req {
@@ -7072,6 +7741,7 @@ mod tests {
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
                 m.view,
+                &[],
                 &[],
                 &[],
                 &style,
@@ -7516,6 +8186,7 @@ mod tests {
                 m.view,
                 &[],
                 &[],
+                &[],
                 &style,
                 move |req| {
                     if let ArrangementEditRequest::SetClipGainDb(deltas) = &req {
@@ -7550,6 +8221,7 @@ mod tests {
                 m.view,
                 &[],
                 &[],
+                &[],
                 &style,
                 move |req| {
                     if let ArrangementEditRequest::SetClipGainDb(deltas) = &req {
@@ -7582,6 +8254,7 @@ mod tests {
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
                 m.view,
+                &[],
                 &[],
                 &[],
                 &style,
@@ -7665,6 +8338,7 @@ mod tests {
                 m.view,
                 &[],
                 &[],
+                &[],
                 &style,
                 move |req| {
                     match &req {
@@ -7709,6 +8383,7 @@ mod tests {
                 m.view,
                 &[],
                 &[],
+                &[],
                 &style,
                 move |req| {
                     match &req {
@@ -7751,6 +8426,7 @@ mod tests {
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
                 m.view,
+                &[],
                 &[],
                 &[],
                 &style,

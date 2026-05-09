@@ -139,6 +139,7 @@ fn arr_frame(host: &mut UiHost<ArrModel>, m: &mut ArrModel, input: FrameInput, s
             view,
             &model.selected,
             &[],
+            &[],
             &style,
             |req| match req {
                 ArrangementEditRequest::SelectClips { next, .. } => {
