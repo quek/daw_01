@@ -102,6 +102,9 @@ struct DawModel {
     /// M14 Phase 63c (#016): 折り畳み中の group track id 集合。 widget の `track.collapsed` field
     /// を caller 側で computed して渡す source-of-truth。 `ToggleGroupCollapsed(id)` Edit 受信で toggle。
     arr_collapsed_groups: std::collections::HashSet<u32>,
+    /// M14 Phase 63n-1 (#028): automation lane を畳んでいる track id 集合。 widget の
+    /// `track.automation_lanes_collapsed` field の SSoT。 `ToggleTrackAutomationCollapsed { track }` 受信で toggle。
+    arr_track_automation_collapsed: std::collections::HashSet<u32>,
     /// M14 Phase 63e (#019): linked clone で発番する group id の counter。
     /// `CloneClipsLinked` 受信時、 source に group_id がなければ新採番、 source / dst 両方に
     /// 同じ id を assign。 `arr_tracks_for_widget` で `(gid as f32 * 0.618034).rem_euclid(1.0)`
@@ -204,6 +207,7 @@ impl DawModel {
             arr_selected_clips: Vec::new(),
             arr_selected_tracks: Vec::new(),
             arr_collapsed_groups: std::collections::HashSet::new(),
+            arr_track_automation_collapsed: std::collections::HashSet::new(),
             arr_next_share_group_id: 0,
             arr_rename_target: None,
             demo_chain: vec![
@@ -790,8 +794,105 @@ fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
             parent_id: t.parent_id,
             depth: depth_of(t.id),
             collapsed: m.arr_collapsed_groups.contains(&t.id),
+            // M14 Phase 63n-1 (#028): daw_prototype は実 automation 機能を持たないので、
+            // 視覚確認用に `t.id == 1` (= 1 番目の track) のみ sample lane を 2 個ぶら下げる。
+            // 実 daw_01 では `daw_gui::view::arrangement_view` で本来の lane / clip / point を
+            // 構築する想定。
+            automation_lanes_collapsed: m.arr_track_automation_collapsed.contains(&t.id),
+            automation_lanes: build_sample_automation_lanes(t.id),
         })
         .collect()
+}
+
+/// M14 Phase 63n-1 (#028): daw_prototype 視覚確認用の sample lane 生成。
+/// `track_id == 1` のときだけ Volume / Pan の 2 lane を返す (= 1 track だけが ▶/▼ で開閉できる)。
+/// 各 lane は単純な curve preview と clip rect の見た目確認のため、 短い point 列を持つ 1 clip 構成。
+fn build_sample_automation_lanes(track_id: u32) -> Vec<daw_ui_core::ArrangementAutomationLane> {
+    if track_id != 1 {
+        return Vec::new();
+    }
+    let volume_clip = daw_ui_core::ArrangementAutomationClip {
+        id: 1,
+        start_beat: 0.0,
+        len_beats: 16.0,
+        name: Arc::from("Volume Auto"),
+        points: vec![
+            daw_ui_core::ArrangementAutomationPoint {
+                time_beat: 0.0,
+                value_norm: 0.85,
+                curve: daw_ui_core::ArrangementCurveKind::Linear,
+            },
+            daw_ui_core::ArrangementAutomationPoint {
+                time_beat: 4.0,
+                value_norm: 0.30,
+                curve: daw_ui_core::ArrangementCurveKind::Linear,
+            },
+            daw_ui_core::ArrangementAutomationPoint {
+                time_beat: 8.0,
+                value_norm: 0.95,
+                curve: daw_ui_core::ArrangementCurveKind::Bezier { tension: 0.0 },
+            },
+            daw_ui_core::ArrangementAutomationPoint {
+                time_beat: 12.0,
+                value_norm: 0.50,
+                curve: daw_ui_core::ArrangementCurveKind::Hold,
+            },
+            daw_ui_core::ArrangementAutomationPoint {
+                time_beat: 16.0,
+                value_norm: 0.70,
+                curve: daw_ui_core::ArrangementCurveKind::Linear,
+            },
+        ],
+        share_group_color: None,
+    };
+    let pan_clip = daw_ui_core::ArrangementAutomationClip {
+        id: 2,
+        start_beat: 4.0,
+        len_beats: 8.0,
+        name: Arc::from("Pan Auto"),
+        points: vec![
+            daw_ui_core::ArrangementAutomationPoint {
+                time_beat: 0.0,
+                value_norm: 0.50,
+                curve: daw_ui_core::ArrangementCurveKind::Linear,
+            },
+            daw_ui_core::ArrangementAutomationPoint {
+                time_beat: 4.0,
+                value_norm: 0.20,
+                curve: daw_ui_core::ArrangementCurveKind::Bezier { tension: 0.5 },
+            },
+            daw_ui_core::ArrangementAutomationPoint {
+                time_beat: 8.0,
+                value_norm: 0.80,
+                curve: daw_ui_core::ArrangementCurveKind::Bezier { tension: -0.3 },
+            },
+        ],
+        share_group_color: None,
+    };
+    vec![
+        daw_ui_core::ArrangementAutomationLane {
+            id: 1,
+            label: Arc::from("Volume"),
+            icon_glyph: 'V',
+            color: daw_ui_renderer::Color::rgb(0.55, 0.85, 1.0),
+            enabled: true,
+            visible: true,
+            height_px: 60,
+            default_value_norm: 0.80,
+            clips: vec![volume_clip],
+        },
+        daw_ui_core::ArrangementAutomationLane {
+            id: 2,
+            label: Arc::from("Pan"),
+            icon_glyph: 'P',
+            color: daw_ui_renderer::Color::rgb(1.0, 0.75, 0.45),
+            enabled: false,
+            visible: true,
+            height_px: 60,
+            default_value_norm: 0.50,
+            clips: vec![pan_clip],
+        },
+    ]
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1306,6 +1407,17 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 mm.arr_view.data_generation += 1;
                 mm.last_action = format!("arr: SetClipFadeCurve ({n}) → {summary}");
             }),
+            ArrangementEditRequest::ToggleTrackAutomationCollapsed { track } => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    if mm.arr_track_automation_collapsed.contains(&track) {
+                        mm.arr_track_automation_collapsed.remove(&track);
+                    } else {
+                        mm.arr_track_automation_collapsed.insert(track);
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action = format!("arr: ToggleTrackAutomationCollapsed {track}");
+                })
+            }
         },
     );
 

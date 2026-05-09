@@ -124,6 +124,11 @@ pub struct ArrangementClip {
 }
 
 /// 1 つの track。`clips` は `start_beat` 昇順前提。
+///
+/// `muted` / `solo` / `collapsed` / `automation_lanes_collapsed` は意味的に独立した bool 状態
+/// (集約の余地がない、 Bitwig / Reaper の track schema と整合) なので `clippy::struct_excessive_bools`
+/// を allow する。
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug)]
 pub struct ArrangementTrack {
     pub id: u32,
@@ -149,6 +154,114 @@ pub struct ArrangementTrack {
     /// state と整合)。 caller は collapsed フラグを各 track に set して渡すだけ (state は caller 側で
     /// `HashSet<u32>` 等に保持)。
     pub collapsed: bool,
+    /// M14 Phase 63n-1 (#028): track の automation lane 群を折り畳むか (▶ = collapsed / ▼ = expanded)。
+    /// `automation_lanes.is_empty()` の track は disclosure を描画しないので、 この値は意味を持たない。
+    /// `true` で track 行高さは `track_row_h` のまま (= 既存挙動互換)。 `false` で expanded =
+    /// `automation_lanes.iter().filter(|l| l.visible)` を上から積む (各 `lane.height_px` を加算)。
+    pub automation_lanes_collapsed: bool,
+    /// M14 Phase 63n-1 (#028): track 配下の automation lane 群 (Volume / Pan / plugin parameter 等)。
+    /// 空 `Vec` で **既存挙動完全互換** (lane 行非表示 + disclosure 非描画)。 daw_01 conversation #028 の
+    /// 確定 schema に従う。 各 lane は `target` を持たず (= caller 責務、 widget は label / icon の
+    /// 表示しか必要としない)、 内部に `clips: Vec<ArrangementAutomationClip>` を持つ。
+    pub automation_lanes: Vec<ArrangementAutomationLane>,
+}
+
+// ============================================================
+// M14 Phase 63n-1 (#028): automation lane schema
+// ============================================================
+
+/// M14 Phase 63n-1 (#028): automation lane の identity (track id + lane id)。
+/// daw_01 conversation #028 で確定した key 型 (caller 側 mirror と shape 一致)。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct AutomationLaneKey {
+    pub track: u32,
+    pub lane: u32,
+}
+
+/// M14 Phase 63n-1 (#028): automation clip の identity (lane key + clip id)。
+/// `lane_key()` helper で `AutomationLaneKey` に降格できる。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct AutomationClipKey {
+    pub track: u32,
+    pub lane: u32,
+    pub clip: u32,
+}
+
+impl AutomationClipKey {
+    /// `(track, lane)` 部分を抽出 (lane 操作 EditRequest と clip 操作 EditRequest の混在 dispatch 用)。
+    #[must_use]
+    pub fn lane_key(self) -> AutomationLaneKey {
+        AutomationLaneKey { track: self.track, lane: self.lane }
+    }
+}
+
+/// M14 Phase 63n-1 (#028): automation point の identity (clip key + point index)。
+/// **point の index は同 frame 内のみ valid** (point の add / delete で再採番される)。 widget は
+/// hit-test 結果としてこの key を返し、 caller は `clip.points[point_idx]` で値を取得する。 drag 中は
+/// session 内に持ち越して frame 跨ぎで stable に追跡する設計 (Phase 63n-2 で実装)。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct AutomationPointKey {
+    pub clip: AutomationClipKey,
+    pub point_idx: u32,
+}
+
+/// M14 Phase 63n-1 (#028): automation point の incoming curve 種別 (= 直前の point からこの point に
+/// 至る曲線形状)。 daw_01 conversation #028 §11.1 と整合。
+/// - `Hold`: 階段 (前の値を保持して垂直立ち上がり)
+/// - `Linear`: 直線
+/// - `Bezier { tension }`: Catmull-Rom スプライン + tension (`-1.0..=1.0`、 `0.0` で標準 Catmull-Rom)
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ArrangementCurveKind {
+    Hold,
+    Linear,
+    Bezier { tension: f32 },
+}
+
+/// M14 Phase 63n-1 (#028): automation point の clip-local 座標 + curve 種別。
+/// `time_beat` は clip-local (clip start からのオフセット拍)、 `value_norm` は `0.0..=1.0` 正規化。
+#[derive(Clone, Copy, Debug)]
+pub struct ArrangementAutomationPoint {
+    pub time_beat: f64,
+    pub value_norm: f32,
+    pub curve: ArrangementCurveKind,
+}
+
+/// M14 Phase 63n-1 (#028): lane 内の automation clip。 MIDI / Audio clip と意味的に独立した型として
+/// 扱う (= ClipKey 階層化ではなく別 schema、 #028 [Resolved] で確定)。
+/// `share_group_color` は #019 の audio clip 用 hue (`[0.0, 1.0)`) と同 helper を流用。
+#[derive(Clone, Debug)]
+pub struct ArrangementAutomationClip {
+    pub id: u32,
+    pub start_beat: f64,
+    pub len_beats: f64,
+    pub name: Arc<str>,
+    /// clip-local 座標 (clip start = 0)、 `time_beat` 昇順前提 (caller 責務)。
+    pub points: Vec<ArrangementAutomationPoint>,
+    /// linked clip 識別 hue (`[0.0, 1.0)`)。 `Some(hue)` で widget が hsl_to_rgb で fill / border を
+    /// 上書き + clip 名の左に link glyph を描く (audio clip と同 path)。
+    pub share_group_color: Option<f32>,
+}
+
+/// M14 Phase 63n-1 (#028): automation lane (target を持たず、 widget は label / icon の表示しか扱わない)。
+/// caller (daw_01) が `target` (Track の volume/pan、 plugin parameter 等) を別途保持する。
+#[derive(Clone, Debug)]
+pub struct ArrangementAutomationLane {
+    pub id: u32,
+    pub label: Arc<str>,
+    /// lane header の icon 用 1 文字 ('V' / 'P' / 'F' 等)。 caller が parameter 種別から決める。
+    pub icon_glyph: char,
+    /// lane 識別色 (curve 線 + アクセント)。
+    pub color: Color,
+    /// `false` で curve / clip / point を灰色描画 (bypass 表示)。
+    pub enabled: bool,
+    /// `false` で lane 行を描画しない + prefix sum にも含めない (= 隣 lane が詰める)。
+    pub visible: bool,
+    /// 行高さ (px、 default 60、 widget は読むだけで mutate しない)。
+    /// Phase 63n-1 では splitter drag UX を入れない (#028 [Resolved] で確定)。
+    pub height_px: u16,
+    /// `0.0..=1.0` の knob 表示 / curve 範囲外で表示する水平線。 plain ↔ normalized 変換は caller 責務。
+    pub default_value_norm: f32,
+    pub clips: Vec<ArrangementAutomationClip>,
 }
 
 /// arrangement の view 状態 (pan / zoom / playhead / loop)。値渡し (Copy)。
@@ -376,6 +489,11 @@ pub enum ArrangementEditRequest {
     /// curve トグル (release 時に 1 度発火)。 `next_curve` は `prev.next()` (Linear → Exp →
     /// SCurve → Linear)。 同 release で `SetClipFade` と同時発火することはない。
     SetClipFadeCurve(Vec<ClipFadeCurveDelta>),
+    /// M14 Phase 63n-1 (#028): track の automation lane 群を折り畳み・展開する。 caller は
+    /// `track.automation_lanes_collapsed` を反転した値を保存する (widget は描画時に lane 行を
+    /// 上から積むかどうかをこのフラグで判定)。 `automation_lanes` が空の track では発火しない
+    /// (disclosure を描画しないため)。
+    ToggleTrackAutomationCollapsed { track: u32 },
 }
 
 /// `Ui::arrangement` の戻り値。
@@ -403,6 +521,12 @@ pub struct ArrangementResponse {
     pub reordering: Option<u32>,
     /// M10 Phase 47b: drag 中の track id (`Some` なら header volume slider drag セッションが進行中)。
     pub dragging_track_volume: Option<u32>,
+    /// M14 Phase 63n-1 (#028): point 右クリックで開く curve type popup の anchor。 caller は
+    /// `Some((point_key, anchor_rect))` を受けたら既存 `context_menu_for(anchor_rect, ["Hold", "Linear",
+    /// "Bezier"], ...)` で popup を開き、 選択を `SetAutomationCurveType { point, prev, next }` に変換
+    /// する idiom (#005 track header rename の `track_header_rects` と同パターン)。
+    /// **Phase 63n-1 では常に `None`** (Phase 63n-2 で point 右クリック実装時に埋める予約)。
+    pub automation_curve_popup_request: Option<(AutomationPointKey, Rect)>,
 }
 
 impl Default for ArrangementResponse {
@@ -420,6 +544,7 @@ impl Default for ArrangementResponse {
             ruler_rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             reordering: None,
             dragging_track_volume: None,
+            automation_curve_popup_request: None,
         }
     }
 }
@@ -545,9 +670,35 @@ pub struct ArrangementStyle {
     pub audio_ghost_label_size: f32,
     /// ghost label の color (default 白系)。
     pub audio_ghost_label_color: Color,
+    // ---- M14 Phase 63n-1 (#028): automation lane 描画パラメータ ----
+    /// automation lane 行の左 header 領域の最低幅 (px、 これ未満で label / icon / slider 帯を skip)。
+    pub automation_lane_header_min_w_px: f32,
+    /// lane 行の背景色 (track 行と差別化、 default は track_group_bg より暗め)。
+    pub automation_lane_bg: Color,
+    /// disabled lane (= `enabled = false`) の curve / clip / point 描画色 (灰色 bypass 表現)。
+    pub automation_lane_disabled_color: Color,
+    /// lane curve 線の太さ (px)。 default 1.5。
+    pub automation_curve_line_width_px: f32,
+    /// lane 内 point の半径 (px)。 default 4.0。
+    pub automation_point_radius_px: f32,
+    /// lane 内 default_value 水平線の色 (clip ギャップ / curve 範囲外の値表示)。
+    pub automation_default_line_color: Color,
+    /// default_value 水平線の太さ (px)。 default 1.0。
+    pub automation_default_line_width_px: f32,
+    /// lane 内 clip rect の縦 padding (px、 上下にこの px を確保した残りを clip rect の高さに)。 default 6.0。
+    pub automation_clip_v_pad_px: f32,
+    /// lane header の slider 帯 (default_value_norm 表示) の縦幅 (px)。 default 4.0。
+    pub automation_default_band_h: f32,
+    /// disclosure ▶ / ▼ glyph の描画 font size。 default = `track_text_size`。
+    pub automation_disclosure_size: f32,
+    /// lane header に描く icon glyph (`★` / `[V]` / `👁` / `▣` / `✕`) の font size。 default = `track_text_size`。
+    pub automation_lane_icon_size: f32,
+    /// lane header の text color (label + icon、 default = `track_text_color`)。
+    pub automation_lane_text_color: Color,
 }
 
 impl Default for ArrangementStyle {
+    #[allow(clippy::too_many_lines)]
     fn default() -> Self {
         let mute_button = ToggleButtonStyle {
             off_color: Color::rgb(0.18, 0.20, 0.24),
@@ -646,6 +797,19 @@ impl Default for ArrangementStyle {
             audio_fade_sticky_threshold_px: 10.0,
             audio_ghost_label_size: 11.0,
             audio_ghost_label_color: Color::rgb(0.95, 0.95, 0.97),
+            // M14 Phase 63n-1 (#028): automation lane defaults — Bitwig "Volume" lane の見た目に近づける。
+            automation_lane_header_min_w_px: 80.0,
+            automation_lane_bg: Color::rgb(0.08, 0.09, 0.11),
+            automation_lane_disabled_color: Color::rgba(0.55, 0.56, 0.60, 0.65),
+            automation_curve_line_width_px: 1.5,
+            automation_point_radius_px: 4.0,
+            automation_default_line_color: Color::rgba(1.0, 1.0, 1.0, 0.18),
+            automation_default_line_width_px: 1.0,
+            automation_clip_v_pad_px: 6.0,
+            automation_default_band_h: 4.0,
+            automation_disclosure_size: 12.0,
+            automation_lane_icon_size: 12.0,
+            automation_lane_text_color: Color::rgb(0.92, 0.92, 0.94),
         }
     }
 }
@@ -697,11 +861,59 @@ pub fn compute_visible_indices(tracks: &[ArrangementTrack]) -> Vec<usize> {
         .collect()
 }
 
-/// (track_index, clip) → screen rect (lanes 範囲、horizontal clip 形状)。
+/// M14 Phase 63n-1 (#028): 単一 visible track の expanded 高さ (= `track_row_h` + lane 群高さ合計)。
+/// `automation_lanes_collapsed = true` または `automation_lanes` 空 / 全 invisible で `track_row_h` を返す
+/// (= 既存挙動完全互換)。 widget 内 row_y prefix sum と hit-test の SSoT。
+#[must_use]
+pub fn track_row_height(track: &ArrangementTrack, track_row_h: f32) -> f32 {
+    track_row_h + automation_lanes_total_h(track)
+}
+
+/// M14 Phase 63n-1 (#028): track の expanded 状態の visible automation lane 高さ合計 (px)。
+/// `collapsed` または lane なしで `0.0`。
+#[must_use]
+pub fn automation_lanes_total_h(track: &ArrangementTrack) -> f32 {
+    if track.automation_lanes_collapsed || track.automation_lanes.is_empty() {
+        return 0.0;
+    }
+    track
+        .automation_lanes
+        .iter()
+        .filter(|l| l.visible)
+        .map(|l| f32::from(l.height_px))
+        .sum()
+}
+
+/// M14 Phase 63n-1 (#028): visible track 群の prefix sum row top (`tops.len() == visible_tracks.len() + 1`)。
+/// `tops[i]` = i 番目 track 上端 = (i-1) 番目 track 下端、 `tops[i+1] - tops[i]` で i 番目の expanded
+/// 高さ (= `track_row_height(visible_tracks[i], track_row_h)`)。 lane 0 個 = `tops[i] = lanes_y -
+/// track_top + i * track_row_h` と等価 (= 既存挙動完全互換)。 描画 / hit-test 全箇所が共有する SSoT。
+#[must_use]
+pub fn visible_track_row_tops(
+    visible_tracks: &[ArrangementTrack],
+    lanes_y: f32,
+    track_top: f32,
+    track_row_h: f32,
+) -> Vec<f32> {
+    let mut tops = Vec::with_capacity(visible_tracks.len() + 1);
+    let mut y = lanes_y - track_top;
+    tops.push(y);
+    for t in visible_tracks {
+        y += track_row_height(t, track_row_h);
+        tops.push(y);
+    }
+    tops
+}
+
+/// (track_row_top, track_row_h, clip) → screen rect (lanes 範囲、horizontal clip 形状)。
+/// M14 Phase 63n-1 (#028): row_top は caller が `tops[visible_idx]` で渡す前提
+/// (lane 込みの prefix sum)。 `track_row_h` は **MIDI/Audio clip 行の高さのみ** (= `view.track_row_h`、
+/// lane 高さは含まない)。
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 pub fn clip_to_rect(
-    track_index: usize,
+    track_row_top: f32,
+    track_row_h: f32,
     clip: &ArrangementClip,
     view: ArrangementView,
     lanes: Rect,
@@ -709,9 +921,8 @@ pub fn clip_to_rect(
     let beat_to_px = f64::from(lanes.w) / view.len_beats.max(1e-6);
     let x = lanes.x + ((clip.start_beat - view.start_beat) * beat_to_px) as f32;
     let w = ((clip.len_beats * beat_to_px) as f32).max(2.0);
-    let row_top = lanes.y - view.track_top + track_index as f32 * view.track_row_h;
-    let h = (view.track_row_h - 4.0).max(2.0);
-    Rect { x, y: row_top + 2.0, w, h }
+    let h = (track_row_h - 4.0).max(2.0);
+    Rect { x, y: track_row_top + 2.0, w, h }
 }
 
 /// M14 Phase 63k (#025): audio_edit が Some の clip 上の audio gesture grip ヒット種別。
@@ -731,8 +942,10 @@ enum AudioGripHit {
 /// `audio_edit` が None の clip ではヒット無し、 `r.w < min_w` の短 clip でも無効化。
 /// fade 角は resize handle (4 px) より priority 高 (= clip 内側の上端 12×12 を fade に振る)、
 /// resize は fade 角の外側 (clip rect の外側 ±4 px) で活きる。
+#[allow(clippy::too_many_arguments)]
 fn audio_grip_hit(
-    track_idx: usize,
+    track_row_top: f32,
+    track_row_h: f32,
     clip: &ArrangementClip,
     view: ArrangementView,
     lanes: Rect,
@@ -741,7 +954,7 @@ fn audio_grip_hit(
     style: &ArrangementStyle,
 ) -> Option<AudioGripHit> {
     clip.audio_edit?;
-    let r = clip_to_rect(track_idx, clip, view, lanes);
+    let r = clip_to_rect(track_row_top, track_row_h, clip, view, lanes);
     if r.w < style.audio_min_clip_w_for_handles_px {
         return None;
     }
@@ -775,7 +988,8 @@ fn audio_grip_hit(
 /// (clip の `audio_edit = Some` のものだけが対象、 後勝ち)。 `clip_hit` の audio gesture 版。
 #[must_use]
 fn audio_grip_hit_in_lanes(
-    tracks: &[ArrangementTrack],
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
     view: ArrangementView,
     lanes: Rect,
     cx: f32,
@@ -785,11 +999,12 @@ fn audio_grip_hit_in_lanes(
     if !lanes.contains(cx, cy) {
         return None;
     }
-    let track_idx = track_index_from_y(cy, lanes.y, view.track_top, view.track_row_h)?;
-    let track = tracks.get(track_idx)?;
+    let visible_idx = track_index_from_y(cy, lanes.y, tops)?;
+    let track = visible_tracks.get(visible_idx)?;
+    let row_top = tops[visible_idx];
     let mut hit: Option<(ClipKey, AudioGripHit)> = None;
     for clip in &track.clips {
-        if let Some(zone) = audio_grip_hit(track_idx, clip, view, lanes, cx, cy, style) {
+        if let Some(zone) = audio_grip_hit(row_top, view.track_row_h, clip, view, lanes, cx, cy, style) {
             hit = Some((ClipKey { track: track.id, clip: clip.id }, zone));
         }
     }
@@ -804,8 +1019,10 @@ fn audio_grip_hit_in_lanes(
 ///
 /// 短 clip (`r.w <= edge * 2.0`) は rect 内では Move 強制 (左右 edge 領域が重なって
 /// 判別不能なため)、rect 外側のみ ResizeLeft / ResizeRight として扱う。
+#[allow(clippy::too_many_arguments)]
 fn clip_zone_at(
-    track_idx: usize,
+    track_row_top: f32,
+    track_row_h: f32,
     clip: &ArrangementClip,
     view: ArrangementView,
     lanes: Rect,
@@ -813,7 +1030,7 @@ fn clip_zone_at(
     cy: f32,
     edge: f32,
 ) -> Option<ClipDragKind> {
-    let r = clip_to_rect(track_idx, clip, view, lanes);
+    let r = clip_to_rect(track_row_top, track_row_h, clip, view, lanes);
     // y は clip rect 内のみ (Rect::contains の半開区間と整合)
     if cy < r.y || cy >= r.y + r.h {
         return None;
@@ -845,7 +1062,8 @@ fn clip_zone_at(
 /// rect 外側のみ resize 判定。
 #[must_use]
 pub fn clip_hit(
-    tracks: &[ArrangementTrack],
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
     view: ArrangementView,
     lanes: Rect,
     cx: f32,
@@ -855,12 +1073,13 @@ pub fn clip_hit(
     if !lanes.contains(cx, cy) {
         return None;
     }
-    let track_idx = track_index_from_y(cy, lanes.y, view.track_top, view.track_row_h)?;
-    let track = tracks.get(track_idx)?;
+    let visible_idx = track_index_from_y(cy, lanes.y, tops)?;
+    let track = visible_tracks.get(visible_idx)?;
+    let row_top = tops[visible_idx];
     let mut hit: Option<(ClipKey, ClipDragKind)> = None;
     for clip in &track.clips {
         if let Some(kind) =
-            clip_zone_at(track_idx, clip, view, lanes, cx, cy, resize_handle_px)
+            clip_zone_at(row_top, view.track_row_h, clip, view, lanes, cx, cy, resize_handle_px)
         {
             hit = Some((ClipKey { track: track.id, clip: clip.id }, kind));
         }
@@ -868,23 +1087,26 @@ pub fn clip_hit(
     hit
 }
 
-/// y 座標から track index を計算 (smooth scroll `track_top` を考慮)。範囲外なら None。
+/// y 座標から **visible track index** を計算 (M14 Phase 63n-1: prefix-sum 化)。
+/// `tops` は `visible_track_row_tops` の戻り値 (= len = visible_tracks.len() + 1、 prefix sum
+/// of expanded heights)。 lane 0 個 = `tops[i] = lanes_y - track_top + i * track_row_h` と等価で
+/// 既存の `(local / track_row_h).floor()` と同じ index を返す (= 既存挙動完全互換)。
+/// `tops.len() < 2` または y が範囲外なら `None`。
 #[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub fn track_index_from_y(
-    y: f32,
-    lanes_y: f32,
-    track_top: f32,
-    track_row_h: f32,
-) -> Option<usize> {
-    if track_row_h <= 0.0 {
+pub fn track_index_from_y(y: f32, _lanes_y: f32, tops: &[f32]) -> Option<usize> {
+    if tops.len() < 2 {
         return None;
     }
-    let local = y - lanes_y + track_top;
-    if local < 0.0 {
+    if y < tops[0] {
         return None;
     }
-    Some((local / track_row_h).floor() as usize)
+    // tops は単調増加。 y が tops[i] <= y < tops[i+1] となる i を返す。
+    // partition_point(|&t| t <= y) - 1 = i (binary search で O(log N))。
+    let i = tops.partition_point(|&t| t <= y);
+    if i == 0 || i > tops.len() - 1 {
+        return None;
+    }
+    Some(i - 1)
 }
 
 /// loop band の hit 種別 (start handle / end handle / 中央 / 範囲外)。
@@ -1065,6 +1287,23 @@ fn disclosure_rect_for(name_rect: Rect, style: &ArrangementStyle, _depth: u8) ->
         y: name_rect.y + (name_rect.h - h) * 0.5,
         w,
         h,
+    }
+}
+
+/// M14 Phase 63n-1 (#028): track 行右端の **automation lane disclosure** ▶/▼ hit / 描画 rect。
+/// 既存の group disclosure (`disclosure_rect_for`) は `name_rect` の左端を使うのに対し、 こちらは
+/// **track 行の右端** に専用 hit zone (`automation_disclosure_size` 正方形、 行中央寄せ) を切り出す。
+/// `automation_lanes` が空の track では disclosure を描画しない (caller の描画 / hit-test 側で
+/// `lane.is_empty()` を判定して呼ぶ前提)。
+#[must_use]
+pub fn lane_disclosure_rect_for(track_row: Rect, style: &ArrangementStyle) -> Rect {
+    let size = style.automation_disclosure_size.max(8.0);
+    let pad = 4.0_f32;
+    Rect {
+        x: track_row.x + track_row.w - size - pad,
+        y: track_row.y + (track_row.h - size).max(0.0) * 0.5,
+        w: size,
+        h: size,
     }
 }
 
@@ -1429,6 +1668,64 @@ fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
             h ^= audio_marker;
             h = h.wrapping_mul(PRIME);
         }
+        // M14 Phase 63n-1 (#028): automation lanes も viewport_key に反映 (caller が collapse / lane
+        // 追加 / point 追加 を行ったら cached が再構築される)。 旧設計で lane 関連を hash に入れない
+        // と disclosure 切替 / lane 切替後の再描画が 1 frame 遅れる (#011 と同根)。
+        h ^= u64::from(t.automation_lanes_collapsed);
+        h = h.wrapping_mul(PRIME);
+        h ^= t.automation_lanes.len() as u64;
+        h = h.wrapping_mul(PRIME);
+        for lane in &t.automation_lanes {
+            h ^= u64::from(lane.id);
+            h = h.wrapping_mul(PRIME);
+            h ^= u64::from(lane.visible);
+            h = h.wrapping_mul(PRIME);
+            h ^= u64::from(lane.enabled);
+            h = h.wrapping_mul(PRIME);
+            h ^= u64::from(lane.height_px);
+            h = h.wrapping_mul(PRIME);
+            h ^= u64::from(lane.default_value_norm.to_bits());
+            h = h.wrapping_mul(PRIME);
+            // lane.color は描画にしか使わないが、 caller が lane の色だけ変えても再描画を保証
+            h ^= u64::from(lane.color.r.to_bits());
+            h = h.wrapping_mul(PRIME);
+            h ^= u64::from(lane.color.g.to_bits());
+            h = h.wrapping_mul(PRIME);
+            h ^= u64::from(lane.color.b.to_bits());
+            h = h.wrapping_mul(PRIME);
+            h ^= u64::from(lane.icon_glyph as u32);
+            h = h.wrapping_mul(PRIME);
+            h ^= lane.label.len() as u64; // label の文字列内容変更は label.len() で簡易検知
+            h = h.wrapping_mul(PRIME);
+            for ac in &lane.clips {
+                h ^= u64::from(ac.id);
+                h = h.wrapping_mul(PRIME);
+                h ^= ac.start_beat.to_bits();
+                h = h.wrapping_mul(PRIME);
+                h ^= ac.len_beats.to_bits();
+                h = h.wrapping_mul(PRIME);
+                h ^= ac.share_group_color.map_or(u64::MAX, |hue| u64::from(hue.to_bits()));
+                h = h.wrapping_mul(PRIME);
+                h ^= ac.points.len() as u64;
+                h = h.wrapping_mul(PRIME);
+                for p in &ac.points {
+                    h ^= p.time_beat.to_bits();
+                    h = h.wrapping_mul(PRIME);
+                    h ^= u64::from(p.value_norm.to_bits());
+                    h = h.wrapping_mul(PRIME);
+                    let curve_code = match p.curve {
+                        ArrangementCurveKind::Hold => 0_u64,
+                        ArrangementCurveKind::Linear => 1,
+                        ArrangementCurveKind::Bezier { tension } => {
+                            // tension の bits を加味して 2_u64 + bits
+                            2_u64 ^ u64::from(tension.to_bits())
+                        }
+                    };
+                    h ^= curve_code;
+                    h = h.wrapping_mul(PRIME);
+                }
+            }
+        }
     }
     h
 }
@@ -1636,15 +1933,16 @@ fn draw_clip<M: ?Sized + 'static>(
 
 fn draw_clips<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
-    tracks: &[ArrangementTrack],
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
     view: ArrangementView,
     lanes: Rect,
     style: &ArrangementStyle,
 ) {
     let view_end = view.start_beat + view.len_beats;
-    for (i, t) in tracks.iter().enumerate() {
-        let row_y = lanes.y - view.track_top + i as f32 * view.track_row_h;
-        if row_y + view.track_row_h < lanes.y || row_y > lanes.y + lanes.h {
+    for (i, t) in visible_tracks.iter().enumerate() {
+        let row_top = tops[i];
+        if row_top + view.track_row_h < lanes.y || row_top > lanes.y + lanes.h {
             continue;
         }
         for c in &t.clips {
@@ -1652,7 +1950,7 @@ fn draw_clips<M: ?Sized + 'static>(
             if end < view.start_beat || c.start_beat > view_end {
                 continue;
             }
-            let r = clip_to_rect(i, c, view, lanes);
+            let r = clip_to_rect(row_top, view.track_row_h, c, view, lanes);
             draw_clip(hctx, r, c, style, lanes, false);
         }
     }
@@ -1660,7 +1958,8 @@ fn draw_clips<M: ?Sized + 'static>(
 
 fn draw_selection_overlay<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
-    tracks: &[ArrangementTrack],
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
     selected: &HashSet<ClipKey>,
     view: ArrangementView,
     lanes: Rect,
@@ -1671,9 +1970,9 @@ fn draw_selection_overlay<M: ?Sized + 'static>(
     if selected.is_empty() {
         return;
     }
-    for (i, t) in tracks.iter().enumerate() {
-        let row_y = lanes.y - view.track_top + i as f32 * view.track_row_h;
-        if row_y + view.track_row_h < lanes.y || row_y > lanes.y + lanes.h {
+    for (i, t) in visible_tracks.iter().enumerate() {
+        let row_top = tops[i];
+        if row_top + view.track_row_h < lanes.y || row_top > lanes.y + lanes.h {
             continue;
         }
         for c in &t.clips {
@@ -1681,7 +1980,7 @@ fn draw_selection_overlay<M: ?Sized + 'static>(
             if !selected.contains(&key) {
                 continue;
             }
-            let r = clip_to_rect(i, c, view, lanes);
+            let r = clip_to_rect(row_top, view.track_row_h, c, view, lanes);
             draw_clip(hctx, r, c, style, lanes, true);
         }
     }
@@ -1723,6 +2022,7 @@ fn drag_preview_geometry(
 fn draw_drag_preview<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     nd: &ClipDragSession,
+    tops: &[f32],
     view: ArrangementView,
     lanes: Rect,
     style: &ArrangementStyle,
@@ -1758,7 +2058,12 @@ fn draw_drag_preview<M: ?Sized + 'static>(
             share_group_color: None,
             audio_edit: None,
         };
-        let r = clip_to_rect(new_idx, &preview_clip, view, lanes);
+        // drag_preview_geometry が n_tracks 範囲内に clamp 済なので tops から必ず取れる前提。
+        // 万一範囲外なら preview を skip (clip 描画消失だけで panic はしない、 defensive)。
+        let Some(row_top) = tops.get(new_idx).copied() else {
+            continue;
+        };
+        let r = clip_to_rect(row_top, view.track_row_h, &preview_clip, view, lanes);
         if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
             continue;
         }
@@ -1974,6 +2279,373 @@ fn draw_audio_drag_ghost<M: ?Sized + 'static>(
     }
 }
 
+// ============================================================
+// M14 Phase 63n-1 (#028): automation lane 描画 helpers
+// ============================================================
+
+/// 単一 segment (前 point → 次 point) を Catmull-Rom + tension で flatten。
+/// `kind` が `Hold` なら階段 (前値で水平 → 次 point の x で垂直)、 `Linear` なら直線、
+/// `Bezier { tension }` なら Catmull-Rom (tension は端点の引き / 反り具合)。
+/// 出力点列は `out` に push (caller が始点を 1 度 push 済の前提、 終点 (= 次 point) を含む)。
+/// `prev_pt` / `next_next_pt` は端点処理の virtual 点 (Phase 63n-1 では neighbor が無い場合
+/// 自分自身で代用 = `automation_curve` widget と同 idiom、 端点の出入り角は直角)。
+fn flatten_lane_segment(
+    p0: (f32, f32),
+    p1: (f32, f32),
+    p2: (f32, f32),
+    p3: (f32, f32),
+    kind: ArrangementCurveKind,
+    max_segment_px: f32,
+    out: &mut Vec<(f32, f32)>,
+) {
+    match kind {
+        ArrangementCurveKind::Hold => {
+            // 階段: 前値 (p1.y) を p2.x まで水平に保ち、 p2 で垂直に立ち上がる。
+            // out には始点 (p1) は積み済の前提なので、 (p2.x, p1.y) → (p2.x, p2.y) の 2 点を追加。
+            out.push((p2.0, p1.1));
+            out.push(p2);
+        }
+        ArrangementCurveKind::Linear => {
+            out.push(p2);
+        }
+        ArrangementCurveKind::Bezier { tension } => {
+            // Catmull-Rom → cubic Bezier (B1 = P1 + (P2-P0) * (1-tension)/6、 B2 = P2 - (P3-P1) * (1-tension)/6)。
+            // tension = 1.0 で直線化、 tension = 0.0 で標準 Catmull-Rom、 tension = -1.0 で振り増し (over-shoot)。
+            let scale = (1.0 - tension.clamp(-1.0, 1.0)) / 6.0;
+            let b1 = (p1.0 + (p2.0 - p0.0) * scale, p1.1 + (p2.1 - p0.1) * scale);
+            let b2 = (p2.0 - (p3.0 - p1.0) * scale, p2.1 - (p3.1 - p1.1) * scale);
+            // 自前 de Casteljau (automation widget の flatten_cubic と同戦略、 chord 距離で再帰分割)。
+            flatten_lane_cubic(p1, b1, b2, p2, max_segment_px, 0, out);
+        }
+    }
+}
+
+const MAX_LANE_FLATTEN_DEPTH: u32 = 14;
+
+/// 点 `p` と直線 `a-b` の垂直距離 (`automation_curve` widget の `perpendicular_dist` と同戦略)。
+/// chord 距離 (`p0`-`p3`) で判定すると control points (p1, p2) が始終点直線から大きく離れていても
+/// chord が小さければ flatten 終了 → curve がポイントを通らず直線化する bug の原因 (#028 user 指摘 2)。
+/// 控制点と直線の **垂直距離** で判定すれば curve が正確にポイントを通る。
+#[inline]
+fn perpendicular_dist_lane(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    let len = dx.hypot(dy);
+    if len < 1e-6 {
+        return ((p.0 - a.0).powi(2) + (p.1 - a.1).powi(2)).sqrt();
+    }
+    ((p.0 - a.0) * dy - (p.1 - a.1) * dx).abs() / len
+}
+
+fn flatten_lane_cubic(
+    p0: (f32, f32),
+    p1: (f32, f32),
+    p2: (f32, f32),
+    p3: (f32, f32),
+    max_dist: f32,
+    depth: u32,
+    out: &mut Vec<(f32, f32)>,
+) {
+    // 終了条件: control points (p1, p2) の始終点直線 (p0-p3) からの垂直距離が max_dist 以下なら
+    // 直線で近似可能 (= curve が直線に収束)。 depth limit はガード。
+    let d1 = perpendicular_dist_lane(p1, p0, p3);
+    let d2 = perpendicular_dist_lane(p2, p0, p3);
+    if d1.max(d2) < max_dist || depth >= MAX_LANE_FLATTEN_DEPTH {
+        out.push(p3);
+        return;
+    }
+    // de Casteljau の中点分割
+    let q0 = ((p0.0 + p1.0) * 0.5, (p0.1 + p1.1) * 0.5);
+    let q1 = ((p1.0 + p2.0) * 0.5, (p1.1 + p2.1) * 0.5);
+    let q2 = ((p2.0 + p3.0) * 0.5, (p2.1 + p3.1) * 0.5);
+    let r0 = ((q0.0 + q1.0) * 0.5, (q0.1 + q1.1) * 0.5);
+    let r1 = ((q1.0 + q2.0) * 0.5, (q1.1 + q2.1) * 0.5);
+    let s = ((r0.0 + r1.0) * 0.5, (r0.1 + r1.1) * 0.5);
+    flatten_lane_cubic(p0, q0, r0, s, max_dist, depth + 1, out);
+    flatten_lane_cubic(s, r1, q2, p3, max_dist, depth + 1, out);
+}
+
+/// lane 内 1 clip の curve を flatten 後の screen 座標点列で返す。 `clip_rect` は clip の
+/// 描画域 (lane body 内、 縦 padding 適用済)、 `body_origin_x` / `body_w` は lane body 全体の
+/// x 範囲 (= clip 越しに spans する curve 位置計算の base)、 `beat_to_px` は **screen-wide な拍 →
+/// px 換算** (= `body_w / view.len_beats`)。 旧設計で `clip_rect.w / view_len_beats` を使うと
+/// clip 長 ≠ view 長のとき curve x が point dot 描画 (`body_w / view.len_beats` で計算) と
+/// ずれる bug の根本原因 (#028 user 指摘 2)。 caller が同 `beat_to_px` を渡すことで両者が一致。
+fn flatten_lane_curve(
+    clip: &ArrangementAutomationClip,
+    clip_rect: Rect,
+    view_start_beat: f64,
+    body_origin_x: f32,
+    beat_to_px: f64,
+    max_segment_px: f32,
+) -> Vec<(f32, f32)> {
+    if clip.points.is_empty() {
+        return Vec::new();
+    }
+    let to_screen = |p: &ArrangementAutomationPoint| -> (f32, f32) {
+        // clip-local time → arrangement absolute beat → screen x (body_origin_x ベース)
+        let abs_beat = clip.start_beat + p.time_beat;
+        #[allow(clippy::cast_possible_truncation)]
+        let x = body_origin_x + ((abs_beat - view_start_beat) * beat_to_px) as f32;
+        let y = clip_rect.y + (1.0 - p.value_norm.clamp(0.0, 1.0)) * clip_rect.h;
+        (x, y)
+    };
+    let n = clip.points.len();
+    let mut out = Vec::with_capacity(n * 4);
+    out.push(to_screen(&clip.points[0]));
+    for i in 0..(n - 1) {
+        let p0 = to_screen(&clip.points[i.saturating_sub(1)]); // i==0 で自分自身
+        let p1 = to_screen(&clip.points[i]);
+        let p2 = to_screen(&clip.points[i + 1]);
+        let p3 = to_screen(&clip.points[(i + 2).min(n - 1)]); // 最終 segment では自分自身
+        // 各 segment の curve は **次 point** の `curve` を使う (= incoming curve、 #028 §11.1 と整合)。
+        let kind = clip.points[i + 1].curve;
+        flatten_lane_segment(p0, p1, p2, p3, kind, max_segment_px, &mut out);
+    }
+    out
+}
+
+/// lane row (= header + body) を 1 つ描画。 `header_rect` は左 (track header と同 x 範囲)、
+/// `body_rect` は右 (clip 描画域と同 x 範囲)。 `view` は arrangement の global view (start_beat /
+/// len_beats / track_top 等を渡す、 lane 描画では `start_beat` / `len_beats` のみ参照)。
+/// disabled lane (`enabled = false`) は curve / clip / point を `automation_lane_disabled_color` で描画、
+/// share_group_color が `Some(hue)` の clip は audio clip と同 hsl 変換で fill / border を上書き。
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn draw_automation_lane<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    lane: &ArrangementAutomationLane,
+    header_rect: Rect,
+    body_rect: Rect,
+    view: ArrangementView,
+    style: &ArrangementStyle,
+    lanes_clip: Rect,
+) {
+    // ---- 背景 (lane 行 全幅) ----
+    push_filled_rect(
+        hctx,
+        Rect {
+            x: header_rect.x,
+            y: header_rect.y,
+            w: header_rect.w + body_rect.w,
+            h: header_rect.h,
+        },
+        style.automation_lane_bg,
+    );
+
+    // ---- header: ★ icon label slider 帯 👁▣✕ (描画のみ、 hit-test は -2 以降) ----
+    let curve_color = if lane.enabled {
+        lane.color
+    } else {
+        style.automation_lane_disabled_color
+    };
+    if header_rect.w >= style.automation_lane_header_min_w_px {
+        let pad = 4.0_f32;
+        let icon_size = style.automation_lane_icon_size;
+        let cx = header_rect.x + pad;
+        let cy = header_rect.y + (header_rect.h - icon_size).max(0.0) * 0.5;
+        // ★ enabled marker — 灰色で描く (Phase 63n-1 では click 不可、 visual のみ)
+        hctx.push_text(GlyphArea {
+            text: Arc::from(if lane.enabled { "★" } else { "☆" }),
+            left: cx,
+            top: cy,
+            font_size: icon_size,
+            line_height: icon_size * 1.2,
+            color: style.automation_lane_text_color,
+            clip_rect: Some(header_rect),
+        });
+        // [V] icon glyph
+        let icon_x = cx + icon_size + pad;
+        hctx.push_text(GlyphArea {
+            text: Arc::from(lane.icon_glyph.to_string()),
+            left: icon_x,
+            top: cy,
+            font_size: icon_size,
+            line_height: icon_size * 1.2,
+            color: lane.color,
+            clip_rect: Some(header_rect),
+        });
+        // label
+        let label_x = icon_x + icon_size + pad;
+        hctx.push_text(GlyphArea {
+            text: Arc::clone(&lane.label),
+            left: label_x,
+            top: cy,
+            font_size: icon_size,
+            line_height: icon_size * 1.2,
+            color: style.automation_lane_text_color,
+            clip_rect: Some(header_rect),
+        });
+        // default value slider 帯 (label の下、 horizontal、 Phase 63n-1 は描画のみ)
+        let band_h = style.automation_default_band_h;
+        let band_y = header_rect.y + header_rect.h - band_h - pad;
+        let band_x = cx;
+        let band_w = (header_rect.w - pad * 2.0).max(0.0);
+        if band_h > 0.0 && band_w > 0.0 && band_y >= cy + icon_size {
+            push_filled_rect(
+                hctx,
+                Rect { x: band_x, y: band_y, w: band_w, h: band_h },
+                style.track_volume_band_track,
+            );
+            let fill_w = band_w * lane.default_value_norm.clamp(0.0, 1.0);
+            push_filled_rect(
+                hctx,
+                Rect { x: band_x, y: band_y, w: fill_w, h: band_h },
+                style.track_volume_band_fill,
+            );
+        }
+        // 👁▣✕ icon 群 (右寄せ、 Phase 63n-1 は描画のみ — 真っ黒/grey で sketchy 表現)
+        let icons = ['👁', '▣', '✕'];
+        let mut rx = header_rect.x + header_rect.w - pad;
+        for &g in icons.iter().rev() {
+            rx -= icon_size + pad * 0.5;
+            hctx.push_text(GlyphArea {
+                text: Arc::from(g.to_string()),
+                left: rx,
+                top: cy,
+                font_size: icon_size,
+                line_height: icon_size * 1.2,
+                color: style.automation_lane_text_color,
+                clip_rect: Some(header_rect),
+            });
+        }
+    }
+
+    // ---- body 背景 (header と区切り線) ----
+    push_filled_rect(hctx, body_rect, style.automation_lane_bg);
+    // default_value 水平線
+    let default_y = body_rect.y + (1.0 - lane.default_value_norm.clamp(0.0, 1.0)) * body_rect.h;
+    hctx.push_lines(daw_ui_renderer::LineBatch {
+        segments: vec![daw_ui_renderer::LineSegment {
+            a: [body_rect.x, default_y],
+            b: [body_rect.x + body_rect.w, default_y],
+            color: style.automation_default_line_color,
+        }]
+        .into(),
+        line_width_px: style.automation_default_line_width_px,
+        clip_rect: Some(body_rect),
+    });
+
+    // ---- clips: rect + curve flatten + point dots ----
+    let view_end = view.start_beat + view.len_beats;
+    let beat_to_px = f64::from(body_rect.w) / view.len_beats.max(1e-6);
+    for c in &lane.clips {
+        let end = c.start_beat + c.len_beats;
+        if end < view.start_beat || c.start_beat > view_end {
+            continue;
+        }
+        // clip rect (lane body 内、 縦 padding 適用)
+        #[allow(clippy::cast_possible_truncation)]
+        let x = body_rect.x + ((c.start_beat - view.start_beat) * beat_to_px) as f32;
+        #[allow(clippy::cast_possible_truncation)]
+        let w = ((c.len_beats * beat_to_px) as f32).max(2.0);
+        let pad = style.automation_clip_v_pad_px;
+        let cy = body_rect.y + pad;
+        let ch = (body_rect.h - pad * 2.0).max(2.0);
+        let clip_rect = Rect { x, y: cy, w, h: ch };
+
+        // share_group_color (linked tint) — audio clip と同 hsl 変換。 disabled lane は **clip rect の
+        // fill / border のみ灰色** (= bypass marker)、 中身 (curve / point / clip 名) は元の lane.color
+        // のままにして可読性を保つ (Bitwig / Live と同パターン、 #028 user 指摘 3)。
+        let (fill, border) = if lane.enabled {
+            if let Some(hue) = c.share_group_color {
+                (
+                    hsl_to_rgb(
+                        hue,
+                        style.share_group_saturation,
+                        style.share_group_fill_lightness,
+                        style.share_group_alpha * 0.55, // automation clip は lane 上 overlay なので fill を更に薄く
+                    ),
+                    hsl_to_rgb(
+                        hue,
+                        style.share_group_saturation,
+                        style.share_group_border_lightness,
+                        1.0,
+                    ),
+                )
+            } else {
+                (
+                    Color { r: lane.color.r, g: lane.color.g, b: lane.color.b, a: 0.20 },
+                    lane.color,
+                )
+            }
+        } else {
+            // disabled: fill = 灰色 alpha 0.10 (lane_bg がほぼ透ける、 中身可読) + border = 灰色
+            // alpha 1.0 (識別 marker、 不透明で確実に見える)。 fill alpha 0 だと renderer が rect 全体を
+            // skip する可能性があるので非ゼロを保つ (#028 user 指摘 3 = 配色で見えない)。
+            let dc = style.automation_lane_disabled_color;
+            (
+                Color { r: dc.r, g: dc.g, b: dc.b, a: 0.10 },
+                Color { r: dc.r, g: dc.g, b: dc.b, a: 1.0 },
+            )
+        };
+        hctx.push_rect(RectCommand {
+            rect: clip_rect,
+            fill,
+            border,
+            border_width: style.clip_border_w,
+            radius: [style.clip_radius; 4],
+            clip_rect: Some(lanes_clip),
+        });
+
+        // clip name (上端、 lane なので小さめ)
+        if w >= 28.0 {
+            let glyph_color = if lane.enabled {
+                style.automation_lane_text_color
+            } else {
+                style.automation_lane_disabled_color
+            };
+            hctx.push_text(GlyphArea {
+                text: Arc::clone(&c.name),
+                left: clip_rect.x + 4.0,
+                top: clip_rect.y + 2.0,
+                font_size: style.clip_text_size * 0.85,
+                line_height: style.clip_text_size,
+                color: glyph_color,
+                clip_rect: Some(clip_rect),
+            });
+        }
+
+        // curve flatten (clip 内描画域 = clip_rect 全体)。 caller の screen-wide な beat_to_px
+        // (= body_rect.w / view.len_beats) を渡すことで、 curve x 座標が point dot 描画と完全一致。
+        let flat = flatten_lane_curve(c, clip_rect, view.start_beat, body_rect.x, beat_to_px, 2.0);
+        if flat.len() >= 2 {
+            let segments: Vec<daw_ui_renderer::LineSegment> = flat
+                .windows(2)
+                .map(|w| daw_ui_renderer::LineSegment {
+                    a: [w[0].0, w[0].1],
+                    b: [w[1].0, w[1].1],
+                    color: curve_color,
+                })
+                .collect();
+            hctx.push_lines(daw_ui_renderer::LineBatch {
+                segments: segments.into(),
+                line_width_px: style.automation_curve_line_width_px,
+                clip_rect: Some(clip_rect),
+            });
+        }
+        // 各 point を 角丸円 (= 正方形 + 大 radius) で描画。 x の origin は **body_rect.x** (= 0
+        // beat の screen x)、 そこから abs_beat * beat_to_px で point 位置を出す。 旧設計は
+        // `clip_rect.x + (abs_beat - view.start_beat) * beat_to_px` で c.start_beat を 2 度足して
+        // (clip_rect.x が既に c.start_beat 反映済) point dot が curve からずれる bug の根本原因
+        // (#028 user 指摘 2 = curve 線が point を通らない)。
+        let r = style.automation_point_radius_px;
+        for p in &c.points {
+            let abs_beat = c.start_beat + p.time_beat;
+            #[allow(clippy::cast_possible_truncation)]
+            let px = body_rect.x + ((abs_beat - view.start_beat) * beat_to_px) as f32;
+            let py = clip_rect.y + (1.0 - p.value_norm.clamp(0.0, 1.0)) * clip_rect.h;
+            hctx.push_rect(RectCommand {
+                rect: Rect { x: px - r, y: py - r, w: r * 2.0, h: r * 2.0 },
+                fill: curve_color,
+                border: Color { r: 1.0, g: 1.0, b: 1.0, a: if lane.enabled { 0.85 } else { 0.4 } },
+                border_width: 1.0,
+                radius: [r; 4],
+                clip_rect: Some(clip_rect),
+            });
+        }
+    }
+}
+
 fn draw_loop_band<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     range: (f64, f64),
@@ -2084,6 +2756,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             .iter()
             .map(|&i| tracks[i].clone())
             .collect();
+        // M14 Phase 63n-1 (#028): visible track の prefix-sum row tops。 lane 0 個 (= 既存挙動)
+        // では `tops[i] = lanes.y - track_top + i * track_row_h` と等価。 expand 中の lane 群が
+        // ある track 以降は次 track 以降の row top が下にずれる (= 描画 / hit-test SSoT)。
+        let press_tops =
+            visible_track_row_tops(&visible_tracks, lanes.y, view.track_top, view.track_row_h);
         // M14 Phase 63c (#016): collapsed 後でも「Group A は子を持つ track」 と判定するため、
         // **caller の full `tracks`** から「他 track の parent_id として参照されている id 集合」 を 1 度計算。
         // `is_group_track(id, visible_tracks)` だと collapsed で children が filter outされ false 化する罠を回避。
@@ -2095,6 +2772,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // 発火する (continuation は後段の per-frame block 経由)。 press block 内では state borrow が
         // 走るため `push_edit` は呼べず、 `press_seek_beat` に貯めて press block を抜けてから 1 度発行。
         let mut press_seek_beat: Option<f64> = None;
+        // M14 Phase 63n-1 (#028): track 行右端の lane disclosure click 検出。 press block 終了後に
+        // `ToggleTrackAutomationCollapsed { track }` を 1 度発行 (`press_seek_beat` と同パターン)。
+        let mut press_lane_toggle: Option<u32> = None;
         if pointer.primary_just_pressed
             && let Some((px, py)) = pointer.pos
         {
@@ -2108,7 +2788,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // §3.5/§3.6 と整合、 modifier-free な直感的操作)。 audio_edit が None の clip ではこの
             // ブロックは即 None を返すため、 既存挙動 (MIDI / Vocal clip) は影響を受けない。
             let audio_press = if in_lanes && !shift && !ctrl {
-                audio_grip_hit_in_lanes(&visible_tracks, view, lanes, px, py, style)
+                audio_grip_hit_in_lanes(&visible_tracks, &press_tops, view, lanes, px, py, style)
             } else {
                 None
             };
@@ -2123,7 +2803,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         AudioGripHit::FadeCornerIn => AudioDragKind::FadeIn,
                         AudioGripHit::FadeCornerOut => AudioDragKind::FadeOut,
                     };
-                    let r_anchor = clip_to_rect(t_idx, c, view, lanes);
+                    let r_anchor = clip_to_rect(press_tops[t_idx], view.track_row_h, c, view, lanes);
                     // Gain は常に vertical lock 確定 (横 drag は無視)、 Fade は press 時 `None` で
                     // sticky direction 待ち (continuation で閾値超えた方向に lock)。
                     let locked_horizontal = match kind {
@@ -2145,7 +2825,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             } else if in_lanes
                 && (!shift || ctrl)
                 && let Some((hit_key, kind)) =
-                    clip_hit(&visible_tracks, view, lanes, px, py, style.resize_handle_px)
+                    clip_hit(&visible_tracks, &press_tops, view, lanes, px, py, style.resize_handle_px)
             {
                 let drag_keys: Vec<ClipKey> = if selected_clips.contains(&hit_key) {
                     selected_clips.to_vec()
@@ -2253,13 +2933,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             //  - 16px 未満 drag は release で click 格下げ (button_at の SelectTrack / ↑↓ button が代替)
             if header_w > 0.0
                 && header_pane.contains(px, py)
-                && let Some(idx) =
-                    track_index_from_y(py, header_pane.y, view.track_top, view.track_row_h)
+                && let Some(idx) = track_index_from_y(py, header_pane.y, &press_tops)
                 && let Some(t) = visible_tracks.get(idx)
             {
-                let row_y = header_pane.y - view.track_top + idx as f32 * view.track_row_h;
+                // header_pane.y と lanes.y は同じ値 (rect 分割で y 軸 origin 共通) なので press_tops を共有可。
+                let row_top = press_tops[idx];
                 let row =
-                    Rect { x: header_pane.x, y: row_y, w: header_pane.w, h: view.track_row_h };
+                    Rect { x: header_pane.x, y: row_top, w: header_pane.w, h: view.track_row_h };
                 let layout = header_row_layout(row, style.track_volume_band_h);
                 if let Some(band) = layout.volume_band
                     && band.contains(px, py)
@@ -2280,7 +2960,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     let in_disclosure = is_group_set.contains(&t.id)
                         && disclosure_rect_for(layout.name_rect, style, t.depth)
                             .contains(px, py);
-                    if !in_small_button && !in_disclosure {
+                    // M14 Phase 63n-1 (#028): track 行右端の lane disclosure (▶/▼) hit zone。
+                    // `automation_lanes.is_empty()` の track は描画しない → click にも反応しない。
+                    // priority は group disclosure と同様 reorder セッションより高い (toggle 専用)。
+                    let in_lane_disclosure = !t.automation_lanes.is_empty()
+                        && lane_disclosure_rect_for(row, style).contains(px, py);
+                    if in_lane_disclosure {
+                        press_lane_toggle = Some(t.id);
+                    } else if !in_small_button && !in_disclosure {
                         // M14 Phase 63c (#016): multi-select 中の drag は selected_tracks をまとめて
                         // 移動するため、 source_track_ids に selected を全部入れる (clicked が selected
                         // に含まれていなければ単独 drag = `vec![clicked]`)。
@@ -2305,6 +2992,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // M14 Phase 63j (#024): press block で貯めた playhead seek を 1 度発行 (state borrow 終了後)。
         if let Some(beat) = press_seek_beat {
             self.push_edit(make_edit(ArrangementEditRequest::SetPlayheadBeat(beat)));
+        }
+        // M14 Phase 63n-1 (#028): track 行右端の lane disclosure click を 1 度発行 (同上)。
+        if let Some(track) = press_lane_toggle {
+            self.push_edit(make_edit(
+                ArrangementEditRequest::ToggleTrackAutomationCollapsed { track },
+            ));
         }
 
         // ---- drag continue / release 検出 ----
@@ -2516,12 +3209,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             if let Some(ref tr) = track_reorder_release_raw {
                 let dy = (tr.last_mouse_y - tr.anchor_mouse_y).abs();
                 if dy >= 16.0 {
-                    let visible_drop_idx = track_index_from_y(
-                        tr.last_mouse_y,
-                        header_pane.y,
-                        view.track_top,
-                        view.track_row_h,
-                    );
+                    let visible_drop_idx =
+                        track_index_from_y(tr.last_mouse_y, header_pane.y, &press_tops);
                     let drop_target = visible_drop_idx.and_then(|i| visible_tracks.get(i));
                     let (parent, anchor_after) = if let Some(target) = drop_target {
                         if is_group_set.contains(&target.id) {
@@ -2662,10 +3351,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         if let Some((cx, cy)) = pointer.pos
             && lanes.contains(cx, cy)
         {
-            response.hovered_track = track_index_from_y(cy, lanes.y, view.track_top, view.track_row_h)
+            response.hovered_track = track_index_from_y(cy, lanes.y, &press_tops)
                 .and_then(|idx| visible_tracks.get(idx).map(|t| t.id));
             if let Some((hit_key, hit_kind)) =
-                clip_hit(&visible_tracks, view, lanes, cx, cy, style.resize_handle_px)
+                clip_hit(&visible_tracks, &press_tops, view, lanes, cx, cy, style.resize_handle_px)
             {
                 response.hovered_clip = Some(hit_key);
                 response.hovered_zone = Some(hit_kind);
@@ -2749,6 +3438,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let tracks_owned: Arc<[ArrangementTrack]> = Arc::clone(&tracks_for_draw);
         let style_copy = *style;
         let view_copy = view;
+        // M14 Phase 63n-1 (#028): cached / cached-外 の prefix sum tops は heavy closure 内で
+        // 再計算する (`'static` 制約で外側 borrow を持ち込めないため)。 caller scope では持たない。
         let selected_set: HashSet<ClipKey> = selected_clips.iter().copied().collect();
         // M14 Phase 63c (#016): heavy closure は `'static` 要求なので owned Vec<u32> で渡す
         // (selected_set と同パターン)。 loop 側の hit-test では `selected_tracks` slice (borrowed)
@@ -2825,6 +3516,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let id_for_inner: u64 = hash_inputs(&id);
 
         self.heavy(("arrangement_inner", &id), move |hctx| {
+            // M14 Phase 63n-1 (#028): heavy closure 内でも prefix sum tops を計算 ('static borrow が
+            // 必要なため caller scope の tops_for_draw は持ち込めない、 同一 visibility を再計算)。
+            let tops_owned_for_heavy = visible_track_row_tops(
+                &tracks_owned,
+                lanes.y,
+                view_copy.track_top,
+                view_copy.track_row_h,
+            );
             // === cached: viewport_key 一致時 skip ===
             hctx.cached(viewport_key, |hctx| {
                 push_filled_rect(hctx, header_pane, style_copy.header_bg);
@@ -2844,16 +3543,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     sample_viewport,
                     grid_style,
                 );
-                draw_clips(hctx, &tracks_owned, view_copy, lanes, &style_copy);
+                draw_clips(hctx, &tracks_owned, &tops_owned_for_heavy, view_copy, lanes, &style_copy);
                 // M14 Phase 63k (#025): audio_edit が Some の clip に dB handle line + fade envelope を重ねる。
                 // 描画は draw_clips 後 (clip rect の上に重なる)、 selection overlay より前 (selection の
                 // 黄色 fill が上書きしない、 selection 中も dB / fade が見える)。
                 let view_end_for_audio = view_copy.start_beat + view_copy.len_beats;
                 for (i, t) in tracks_owned.iter().enumerate() {
-                    #[allow(clippy::cast_precision_loss)]
-                    let row_y =
-                        lanes.y - view_copy.track_top + i as f32 * view_copy.track_row_h;
-                    if row_y + view_copy.track_row_h < lanes.y || row_y > lanes.y + lanes.h {
+                    let row_top = tops_owned_for_heavy[i];
+                    if row_top + view_copy.track_row_h < lanes.y || row_top > lanes.y + lanes.h {
                         continue;
                     }
                     for c in &t.clips {
@@ -2864,7 +3561,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         if end < view_copy.start_beat || c.start_beat > view_end_for_audio {
                             continue;
                         }
-                        let r = clip_to_rect(i, c, view_copy, lanes);
+                        let r = clip_to_rect(row_top, view_copy.track_row_h, c, view_copy, lanes);
                         if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
                             continue;
                         }
@@ -2883,12 +3580,69 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         ruler_style,
                     );
                 }
+
+                // M14 Phase 63n-1 (#028): automation lane 行群の描画 (track 行の下、 expand されたもののみ)。
+                // 各 visible track の `automation_lanes_collapsed = false` のとき、 visible lane を上から
+                // 順に積む (header = lane 左端 / body = lane 右端 = clip 描画域と同 x)。 lane の y 範囲は
+                // `tops[i] + track_row_h` から `tops[i+1]` (= 次 track 上端) の間。
+                // 描画は cached 内: viewport_key に lane 関連 hash が入る前提 (fold_arrangement_clip_hash
+                // を後ほど lane も含むように拡張する)。 現状は clip hash で大方の変化を検出可能。
+                for (i, t) in tracks_owned.iter().enumerate() {
+                    if t.automation_lanes_collapsed || t.automation_lanes.is_empty() {
+                        continue;
+                    }
+                    let track_row_top = tops_owned_for_heavy[i];
+                    // viewport culling: track 領域全体 (track + lanes) が viewport 外なら skip
+                    let track_total_bottom = tops_owned_for_heavy[i + 1];
+                    if track_total_bottom < lanes.y || track_row_top > lanes.y + lanes.h {
+                        continue;
+                    }
+                    let mut lane_y = track_row_top + view_copy.track_row_h;
+                    // M14 Phase 63n-1 (#028) follow-up: lane 行 header は親 track と同じ indent に揃える
+                    // (= 親 track の depth * indent_px)。 group 配下の track の lane が「どの track の
+                    // lane か」 を視覚的に追えるようにするため (#028 user 指摘 1)。
+                    let header_indent = f32::from(t.depth) * style_copy.indent_px;
+                    for lane in &t.automation_lanes {
+                        if !lane.visible {
+                            continue;
+                        }
+                        let lh = f32::from(lane.height_px);
+                        // lane 行 viewport culling
+                        if lane_y + lh < lanes.y || lane_y > lanes.y + lanes.h {
+                            lane_y += lh;
+                            continue;
+                        }
+                        let header_rect = Rect {
+                            x: header_pane_copy.x + header_indent,
+                            y: lane_y,
+                            w: (header_pane_copy.w - header_indent).max(2.0),
+                            h: lh,
+                        };
+                        let body_rect = Rect {
+                            x: lanes.x,
+                            y: lane_y,
+                            w: lanes.w,
+                            h: lh,
+                        };
+                        draw_automation_lane(
+                            hctx,
+                            lane,
+                            header_rect,
+                            body_rect,
+                            view_copy,
+                            &style_copy,
+                            lanes,
+                        );
+                        lane_y += lh;
+                    }
+                }
             });
 
             // === cached 外: selection / drag preview / playhead / loop band ===
             draw_selection_overlay(
                 hctx,
                 &tracks_owned,
+                &tops_owned_for_heavy,
                 &selected_set,
                 view_copy,
                 lanes,
@@ -2898,6 +3652,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 draw_drag_preview(
                     hctx,
                     &nd,
+                    &tops_owned_for_heavy,
                     view_copy,
                     lanes,
                     &style_copy,
@@ -3148,7 +3903,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         {
             let prev = selected_clips.to_vec();
             let next: Vec<ClipKey> =
-                if let Some((hit_key, _)) = clip_hit(&visible_tracks, view, lanes, cx, cy, style.resize_handle_px) {
+                if let Some((hit_key, _)) = clip_hit(&visible_tracks, &press_tops, view, lanes, cx, cy, style.resize_handle_px) {
                     vec![hit_key]
                 } else {
                     Vec::new()
@@ -3157,8 +3912,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 self.push_edit(make_edit(ArrangementEditRequest::SelectClips { prev, next }));
                 response.selection_changed = true;
             }
-            if let Some(idx) = track_index_from_y(cy, lanes.y, view.track_top, view.track_row_h)
-                && let Some(t) = tracks.get(idx)
+            if let Some(idx) = track_index_from_y(cy, lanes.y, &press_tops)
+                && let Some(t) = visible_tracks.get(idx)
             {
                 let beat = px_to_beat(cx, lanes.x, lanes.w, view);
                 response.clicked_at_track_beat = Some((t.id, beat));
@@ -3173,7 +3928,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             && !pointer.modifiers.shift
             && let Some((cx, cy)) = pointer.pos
             && lanes.contains(cx, cy)
-            && clip_hit(tracks, view, lanes, cx, cy, style.resize_handle_px).is_none()
+            && clip_hit(&visible_tracks, &press_tops, view, lanes, cx, cy, style.resize_handle_px).is_none()
             && !selected_clips.is_empty()
         {
             self.push_edit(make_edit(ArrangementEditRequest::SelectClips {
@@ -3263,9 +4018,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             if drag.modifiers.shift && drag.finished {
                 let drag_rect = drag.rect();
                 let mut set: HashSet<ClipKey> = selected_clips.iter().copied().collect();
-                for (i, t) in tracks.iter().enumerate() {
+                for (i, t) in visible_tracks.iter().enumerate() {
+                    let row_top = press_tops[i];
                     for c in &t.clips {
-                        let r = clip_to_rect(i, c, view, lanes);
+                        let r = clip_to_rect(row_top, view.track_row_h, c, view, lanes);
                         if rects_intersect(r, drag_rect) {
                             set.insert(ClipKey { track: t.id, clip: c.id });
                         }
@@ -3342,12 +4098,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // ---- double-click (lanes 内で clip / 空白) ----
         if let Some((cx, cy)) = self.take_double_click_in_rect(lanes) {
             if let Some((hit_key, _)) =
-                clip_hit(tracks, view, lanes, cx, cy, style.resize_handle_px)
+                clip_hit(&visible_tracks, &press_tops, view, lanes, cx, cy, style.resize_handle_px)
             {
                 self.push_edit(make_edit(ArrangementEditRequest::DoubleClickClip(hit_key)));
             } else if let Some(idx) =
-                track_index_from_y(cy, lanes.y, view.track_top, view.track_row_h)
-                && let Some(t) = tracks.get(idx)
+                track_index_from_y(cy, lanes.y, &press_tops)
+                && let Some(t) = visible_tracks.get(idx)
             {
                 let raw_beat = px_to_beat(cx, lanes.x, lanes.w, view);
                 // M9 Phase 45f: dblclick beat も widget 内 snap (#010 [Replied])。 daw_01 側で
@@ -3374,13 +4130,21 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // 1 frame 内で最初に click された track id を `clicked_track` に蓄え、 loop 後に modifier-aware
         // SelectTrack を 1 度発行する (loop 内で複数発行しないため)。
         let visible_idx_for_headers = compute_visible_indices(&tracks_for_draw);
+        // M14 Phase 63n-1 (#028): track headers loop 用 prefix sum tops (immediate mode、 cached 外)。
+        // `tracks_for_draw` は既に visible-only な Vec を Arc 化したものなので、 そのまま slice 経由で
+        // 渡せば clone 不要 (header_pane.y == lanes.y は rect 分割 origin 共通)。
+        let header_tops = visible_track_row_tops(
+            &tracks_for_draw,
+            header_pane.y,
+            view.track_top,
+            view.track_row_h,
+        );
         let mut clicked_track_for_select: Option<u32> = None;
         let mut disclosure_clicked: Option<u32> = None;
         if header_w > 0.0 {
             for (visible_i, &i) in visible_idx_for_headers.iter().enumerate() {
                 let t = &tracks_for_draw[i];
-                #[allow(clippy::cast_precision_loss)]
-                let row_y = header_pane.y - view.track_top + visible_i as f32 * view.track_row_h;
+                let row_y = header_tops[visible_i];
                 let row =
                     Rect { x: header_pane.x, y: row_y, w: header_pane.w, h: view.track_row_h };
                 if row.y + row.h < header_pane.y || row.y > header_pane.y + header_pane.h {
@@ -3458,6 +4222,22 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     {
                         disclosure_clicked = Some(t.id);
                     }
+                }
+                // M14 Phase 63n-1 (#028): track 行右端の lane disclosure ▶/▼ — `automation_lanes` が
+                // 空でない track のみ描画 (immediate)。 click 検出は press block で行う (= state borrow
+                // との衝突を避けるため、 描画のみ immediate ループで実行)。
+                if !t.automation_lanes.is_empty() {
+                    let lane_disc = lane_disclosure_rect_for(row, style);
+                    let label = if t.automation_lanes_collapsed { "▶" } else { "▼" };
+                    self.push_text(GlyphArea {
+                        text: label.into(),
+                        left: lane_disc.x,
+                        top: lane_disc.y + (lane_disc.h - style.automation_disclosure_size * 1.2) * 0.5,
+                        font_size: style.automation_disclosure_size,
+                        line_height: style.automation_disclosure_size * 1.2,
+                        color: style.disclosure_color,
+                        clip_rect: Some(lane_disc),
+                    });
                 }
                 // disclosure を除いた name 領域 (group の場合は disclosure 分削る)
                 let name_rect_visible = if is_group {
@@ -3593,9 +4373,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // 画面外はみ出しを吸収するため、 視野内に少しでも見えていれば十分操作可能)。
         let view_end = view.start_beat + view.len_beats;
         for (i, t) in visible_tracks.iter().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
-            let row_y = lanes.y - view.track_top + i as f32 * view.track_row_h;
-            if row_y + view.track_row_h < lanes.y || row_y > lanes.y + lanes.h {
+            let row_top = press_tops[i];
+            if row_top + view.track_row_h < lanes.y || row_top > lanes.y + lanes.h {
                 continue;
             }
             for c in &t.clips {
@@ -3603,7 +4382,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 if end < view.start_beat || c.start_beat > view_end {
                     continue;
                 }
-                let r = clip_to_rect(i, c, view, lanes);
+                let r = clip_to_rect(row_top, view.track_row_h, c, view, lanes);
                 response.clip_rects.push((ClipKey { track: t.id, clip: c.id }, r));
             }
         }
@@ -3667,6 +4446,8 @@ mod tests {
             volume: 1.0,
             parent_id: None,
             depth: 0,
+            automation_lanes_collapsed: true,
+            automation_lanes: Vec::new(),
             collapsed: false,
         }
     }
@@ -3694,15 +4475,29 @@ mod tests {
         Rect { x: 0.0, y: 0.0, w: 640.0, h: 256.0 }
     }
 
+    /// M14 Phase 63n-1 (#028): test 用 prefix-sum tops 生成 helper。
+    /// lane を持たない tracks (= 既存挙動) では `tops[i] = lanes_y - track_top + i * track_row_h` と等価。
+    fn make_tops(tracks: &[ArrangementTrack], lanes: Rect, view: ArrangementView) -> Vec<f32> {
+        visible_track_row_tops(tracks, lanes.y, view.track_top, view.track_row_h)
+    }
+
+    /// 簡易 tops (test_view + test_lanes と同条件で N track ぶん、 lane なし)。
+    /// `lanes_y=0, track_top=0, row_h=32` → `tops = [0.0, 32.0, 64.0, 96.0, ...]`。
+    fn legacy_tops(n: usize) -> Vec<f32> {
+        #[allow(clippy::cast_precision_loss)]
+        (0..=n).map(|i| i as f32 * 32.0).collect()
+    }
+
     #[test]
     fn clip_to_rect_basic_position() {
         let view = test_view();
         let lanes = test_lanes();
         let c = clip(0, 4.0, 4.0, "x");
-        let r = clip_to_rect(2, &c, view, lanes);
+        // visible_idx 2 → row_top = lanes.y - track_top + 2 * track_row_h = 0 - 0 + 64 = 64
+        let r = clip_to_rect(64.0, view.track_row_h, &c, view, lanes);
         // beat_to_px = 640/16 = 40
         // x = 0 + 4*40 = 160, w = 4*40 = 160
-        // row_top = 0 - 0 + 2*32 = 64, y = 64+2 = 66, h = 32-4 = 28
+        // row_top = 64, y = 64+2 = 66, h = 32-4 = 28
         assert!((r.x - 160.0).abs() < 1e-3);
         assert!((r.w - 160.0).abs() < 1e-3);
         assert!((r.y - 66.0).abs() < 1e-3);
@@ -3711,18 +4506,110 @@ mod tests {
 
     #[test]
     fn track_index_from_y_basic() {
-        // lanes_y=10, track_top=0, row_h=32 → y=10 → idx 0, y=42 → idx 1, y=74 → idx 2
-        assert_eq!(track_index_from_y(10.0, 10.0, 0.0, 32.0), Some(0));
-        assert_eq!(track_index_from_y(42.0, 10.0, 0.0, 32.0), Some(1));
-        assert_eq!(track_index_from_y(74.0, 10.0, 0.0, 32.0), Some(2));
-        assert_eq!(track_index_from_y(5.0, 10.0, 0.0, 32.0), None);
+        // lanes_y=0, row_h=32 → y=0 → idx 0, y=32 → idx 1, y=64 → idx 2
+        let tops = legacy_tops(3);
+        assert_eq!(track_index_from_y(0.0, 0.0, &tops), Some(0));
+        assert_eq!(track_index_from_y(32.0, 0.0, &tops), Some(1));
+        assert_eq!(track_index_from_y(64.0, 0.0, &tops), Some(2));
+        // y < tops[0] = 範囲外
+        assert_eq!(track_index_from_y(-5.0, 0.0, &tops), None);
+        // y > tops[3] = 範囲外
+        assert_eq!(track_index_from_y(200.0, 0.0, &tops), None);
     }
 
     #[test]
     fn track_index_from_y_with_scroll() {
-        // track_top=16 で 1 row 半分上にスクロール → y=10 + 16 = 26 → idx 0 のまま (>16 で idx 1)
-        assert_eq!(track_index_from_y(10.0, 10.0, 16.0, 32.0), Some(0));
-        assert_eq!(track_index_from_y(26.0, 10.0, 16.0, 32.0), Some(1));
+        // track_top=16 を反映した tops: y=lanes_y-16+i*32 → tops = [-16, 16, 48, 80, 112]
+        let view = ArrangementView { track_top: 16.0, ..test_view() };
+        let lanes = test_lanes();
+        let tracks: Vec<ArrangementTrack> = (0..4).map(|i| track(i, "t", vec![])).collect();
+        let tops = make_tops(&tracks, lanes, view);
+        // y=10 → -16 <= 10 < 16 → idx 0、 y=26 → 16 <= 26 < 48 → idx 1
+        assert_eq!(track_index_from_y(10.0, 0.0, &tops), Some(0));
+        assert_eq!(track_index_from_y(26.0, 0.0, &tops), Some(1));
+    }
+
+    #[test]
+    fn visible_track_row_tops_with_no_lanes_matches_legacy_layout() {
+        // M14 Phase 63n-1 (#028) regression: lane 0 個では legacy 式 `tops[i] = lanes_y - track_top
+        // + i * track_row_h` と完全一致 (= 既存挙動完全互換)。
+        let view = test_view();
+        let lanes = test_lanes();
+        let tracks: Vec<ArrangementTrack> = (0..4).map(|i| track(i, "t", vec![])).collect();
+        let tops = make_tops(&tracks, lanes, view);
+        assert_eq!(tops, vec![0.0, 32.0, 64.0, 96.0, 128.0]);
+    }
+
+    #[test]
+    fn visible_track_row_tops_with_expanded_lane_grows_track_height() {
+        // M14 Phase 63n-1 (#028): expanded lane (visible) を持つ track 以降は次 track の row_top が
+        // 下にずれる。 collapsed もしくは invisible lane は加算しない。
+        let view = test_view();
+        let lanes = test_lanes();
+        let mut t1 = track(1, "t1", vec![]);
+        t1.automation_lanes_collapsed = false;
+        t1.automation_lanes = vec![ArrangementAutomationLane {
+            id: 1,
+            label: Arc::from("Volume"),
+            icon_glyph: 'V',
+            color: Color::rgb(1.0, 1.0, 1.0),
+            enabled: true,
+            visible: true,
+            height_px: 60,
+            default_value_norm: 0.5,
+            clips: Vec::new(),
+        }];
+        let t2 = track(2, "t2", vec![]);
+        let tracks = vec![t1, t2];
+        let tops = make_tops(&tracks, lanes, view);
+        // tops[0] = 0、 tops[1] = 0 + (32 + 60) = 92 (t1 expanded)、 tops[2] = 92 + 32 = 124 (t2 collapsed)
+        assert_eq!(tops, vec![0.0, 92.0, 124.0]);
+    }
+
+    #[test]
+    fn visible_track_row_tops_collapsed_lane_does_not_extend_height() {
+        // M14 Phase 63n-1 (#028): `automation_lanes_collapsed = true` で lane を持っていても加算しない。
+        let view = test_view();
+        let lanes = test_lanes();
+        let mut t1 = track(1, "t1", vec![]);
+        t1.automation_lanes_collapsed = true; // 既存挙動
+        t1.automation_lanes = vec![ArrangementAutomationLane {
+            id: 1,
+            label: Arc::from("Volume"),
+            icon_glyph: 'V',
+            color: Color::rgb(1.0, 1.0, 1.0),
+            enabled: true,
+            visible: true,
+            height_px: 60,
+            default_value_norm: 0.5,
+            clips: Vec::new(),
+        }];
+        let tracks = vec![t1];
+        let tops = make_tops(&tracks, lanes, view);
+        assert_eq!(tops, vec![0.0, 32.0]); // collapsed = legacy と同じ
+    }
+
+    #[test]
+    fn visible_track_row_tops_invisible_lane_does_not_extend_height() {
+        // M14 Phase 63n-1 (#028): `lane.visible = false` の lane は expanded でも加算しない。
+        let view = test_view();
+        let lanes = test_lanes();
+        let mut t1 = track(1, "t1", vec![]);
+        t1.automation_lanes_collapsed = false;
+        t1.automation_lanes = vec![ArrangementAutomationLane {
+            id: 1,
+            label: Arc::from("Volume"),
+            icon_glyph: 'V',
+            color: Color::rgb(1.0, 1.0, 1.0),
+            enabled: true,
+            visible: false, // hidden
+            height_px: 60,
+            default_value_norm: 0.5,
+            clips: Vec::new(),
+        }];
+        let tracks = vec![t1];
+        let tops = make_tops(&tracks, lanes, view);
+        assert_eq!(tops, vec![0.0, 32.0]); // invisible lane = legacy と同じ
     }
 
     #[test]
@@ -3730,8 +4617,9 @@ mod tests {
         let view = test_view();
         let lanes = test_lanes();
         let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        let tops = make_tops(&tracks, lanes, view);
         // clip rect at (0, 2, 160, 28), center = (80, 16)
-        let hit = clip_hit(&tracks, view, lanes, 80.0, 16.0, 4.0);
+        let hit = clip_hit(&tracks, &tops, view, lanes, 80.0, 16.0, 4.0);
         assert_eq!(
             hit,
             Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::Move))
@@ -3743,7 +4631,8 @@ mod tests {
         let view = test_view();
         let lanes = test_lanes();
         let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
-        let hit = clip_hit(&tracks, view, lanes, 1.0, 16.0, 4.0);
+        let tops = make_tops(&tracks, lanes, view);
+        let hit = clip_hit(&tracks, &tops, view, lanes, 1.0, 16.0, 4.0);
         assert_eq!(
             hit,
             Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeLeft))
@@ -3755,7 +4644,8 @@ mod tests {
         let view = test_view();
         let lanes = test_lanes();
         let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
-        let hit = clip_hit(&tracks, view, lanes, 159.0, 16.0, 4.0);
+        let tops = make_tops(&tracks, lanes, view);
+        let hit = clip_hit(&tracks, &tops, view, lanes, 159.0, 16.0, 4.0);
         assert_eq!(
             hit,
             Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeRight))
@@ -3767,7 +4657,8 @@ mod tests {
         let view = test_view();
         let lanes = test_lanes();
         let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
-        let hit = clip_hit(&tracks, view, lanes, -10.0, -10.0, 4.0);
+        let tops = make_tops(&tracks, lanes, view);
+        let hit = clip_hit(&tracks, &tops, view, lanes, -10.0, -10.0, 4.0);
         assert_eq!(hit, None);
     }
 
@@ -3783,7 +4674,8 @@ mod tests {
         // clip rect x∈[0,160]、edge=4 で拡張範囲 x∈[-4,164)。lanes の左端 0 で外側左を表現できないので
         // clip start=2 (x=80) の clip を使い、cx=77 で外側左 (x=80-3) を確認。
         let tracks = vec![track(10, "t0", vec![clip(100, 2.0, 4.0, "c")])];
-        let hit = clip_hit(&tracks, view, lanes, 77.0, 16.0, 4.0);
+        let tops = make_tops(&tracks, lanes, view);
+        let hit = clip_hit(&tracks, &tops, view, lanes, 77.0, 16.0, 4.0);
         assert_eq!(
             hit,
             Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeLeft))
@@ -3796,7 +4688,8 @@ mod tests {
         let lanes = test_lanes();
         // clip rect x∈[0,160]、cx=162 = rect 右端(160) + 2 → 外側右
         let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
-        let hit = clip_hit(&tracks, view, lanes, 162.0, 16.0, 4.0);
+        let tops = make_tops(&tracks, lanes, view);
+        let hit = clip_hit(&tracks, &tops, view, lanes, 162.0, 16.0, 4.0);
         assert_eq!(
             hit,
             Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeRight))
@@ -3809,7 +4702,8 @@ mod tests {
         let lanes = test_lanes();
         // clip rect x∈[0,160]。cx=165 = rect 右端 + 5 → 拡張範囲 [-4,164) の外
         let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
-        let hit = clip_hit(&tracks, view, lanes, 165.0, 16.0, 4.0);
+        let tops = make_tops(&tracks, lanes, view);
+        let hit = clip_hit(&tracks, &tops, view, lanes, 165.0, 16.0, 4.0);
         assert_eq!(hit, None);
     }
 
@@ -3820,7 +4714,8 @@ mod tests {
         // 短 clip (len=0.1 → w=4px、edge*2=8px 以下) の rect 内中央は Move 強制
         // start=2, len=0.1 → x=80, w=4
         let tracks = vec![track(10, "t0", vec![clip(100, 2.0, 0.1, "c")])];
-        let hit = clip_hit(&tracks, view, lanes, 81.0, 16.0, 4.0);
+        let tops = make_tops(&tracks, lanes, view);
+        let hit = clip_hit(&tracks, &tops, view, lanes, 81.0, 16.0, 4.0);
         assert_eq!(
             hit,
             Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::Move))
@@ -3834,7 +4729,8 @@ mod tests {
         // 短 clip でも rect 外側左は ResizeLeft
         // start=2, len=0.1 → x=80。cx=78 = x - 2 → 外側左
         let tracks = vec![track(10, "t0", vec![clip(100, 2.0, 0.1, "c")])];
-        let hit = clip_hit(&tracks, view, lanes, 78.0, 16.0, 4.0);
+        let tops = make_tops(&tracks, lanes, view);
+        let hit = clip_hit(&tracks, &tops, view, lanes, 78.0, 16.0, 4.0);
         assert_eq!(
             hit,
             Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeLeft))
@@ -3853,7 +4749,8 @@ mod tests {
             "t0",
             vec![clip(100, 0.0, 4.0, "a"), clip(101, 4.0, 4.0, "b")],
         )];
-        let hit = clip_hit(&tracks, view, lanes, 161.0, 16.0, 4.0);
+        let tops = make_tops(&tracks, lanes, view);
+        let hit = clip_hit(&tracks, &tops, view, lanes, 161.0, 16.0, 4.0);
         assert_eq!(
             hit,
             Some((ClipKey { track: 10, clip: 101 }, ClipDragKind::ResizeLeft))
@@ -4566,6 +5463,8 @@ mod tests {
             parent_id,
             depth,
             collapsed,
+            automation_lanes_collapsed: true,
+            automation_lanes: Vec::new(),
         }
     }
 
@@ -5332,13 +6231,13 @@ mod tests {
         let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
         // Get hit at clip middle
         assert_eq!(
-            audio_grip_hit_in_lanes(&tracks, view, lanes, 80.0, 16.0, &style),
+            audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 80.0, 16.0, &style),
             None,
             "audio_edit None の clip は GainHandleBand を返さない"
         );
         // Get hit at top-left corner
         assert_eq!(
-            audio_grip_hit_in_lanes(&tracks, view, lanes, 6.0, 6.0, &style),
+            audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 6.0, 6.0, &style),
             None,
             "audio_edit None の clip は FadeCornerIn を返さない"
         );
@@ -5362,7 +6261,7 @@ mod tests {
         // clip 中央 y = r.y + r.h / 2 = 2 + 14 = 16
         // x = 80 (clip 中央)、 端 (0/160) から 24 px margin 内
         assert_eq!(
-            audio_grip_hit_in_lanes(&tracks, view, lanes, 80.0, 16.0, &style),
+            audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 80.0, 16.0, &style),
             Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::GainHandleBand))
         );
     }
@@ -5383,7 +6282,7 @@ mod tests {
         let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
         // clip rect = (0, 2, 160, 28), top-left 12×12 → cx=6, cy=6 (corner 内)
         assert_eq!(
-            audio_grip_hit_in_lanes(&tracks, view, lanes, 6.0, 6.0, &style),
+            audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 6.0, 6.0, &style),
             Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerIn))
         );
     }
@@ -5404,7 +6303,7 @@ mod tests {
         let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
         // clip rect = (0, 2, 160, 28), top-right 12×12 → cx=155, cy=6 (corner 内)
         assert_eq!(
-            audio_grip_hit_in_lanes(&tracks, view, lanes, 155.0, 6.0, &style),
+            audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 155.0, 6.0, &style),
             Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerOut))
         );
     }
@@ -5425,11 +6324,11 @@ mod tests {
         // len_beats=0.5 → w = 20px、 default min = 32 → grip disable
         let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 0.5, "c", audio)])];
         assert_eq!(
-            audio_grip_hit_in_lanes(&tracks, view, lanes, 10.0, 16.0, &style),
+            audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 10.0, 16.0, &style),
             None
         );
         assert_eq!(
-            audio_grip_hit_in_lanes(&tracks, view, lanes, 2.0, 6.0, &style),
+            audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 2.0, 6.0, &style),
             None
         );
     }

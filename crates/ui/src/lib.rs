@@ -49,11 +49,13 @@ pub use widgets::level_meter::{LevelMeterStyle, MeterBallistic};
 pub use widgets::split_view::Orientation;
 pub use widgets::time_grid::{BarBeatGridStyle, TimeRulerStyle};
 pub use widgets::arrangement::{
-    ArrangementClip, ArrangementClipAudioEdit, ArrangementEditRequest, ArrangementResponse,
-    ArrangementStyle, ArrangementTrack, ArrangementView, ClipDragKind, ClipFadeCurveDelta,
-    ClipFadeDelta, ClipGainDelta, ClipKey, FadeCurve, FadeEdge, LoopBandHit, MoveClipDelta,
-    ResizeClipDelta, SelectModifier, clip_hit, clip_to_rect, loop_band_hit_kind,
-    track_index_from_y,
+    ArrangementAutomationClip, ArrangementAutomationLane, ArrangementAutomationPoint,
+    ArrangementClip, ArrangementClipAudioEdit, ArrangementCurveKind, ArrangementEditRequest,
+    ArrangementResponse, ArrangementStyle, ArrangementTrack, ArrangementView, AutomationClipKey,
+    AutomationLaneKey, AutomationPointKey, ClipDragKind, ClipFadeCurveDelta, ClipFadeDelta,
+    ClipGainDelta, ClipKey, FadeCurve, FadeEdge, LoopBandHit, MoveClipDelta, ResizeClipDelta,
+    SelectModifier, automation_lanes_total_h, clip_hit, clip_to_rect, lane_disclosure_rect_for,
+    loop_band_hit_kind, track_index_from_y, track_row_height, visible_track_row_tops,
 };
 pub use widgets::automation::{AutomationCurveResponse, AutomationCurveStyle};
 pub use widgets::checkbox::CheckboxResponse;

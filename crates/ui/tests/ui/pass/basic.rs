@@ -266,6 +266,9 @@ fn main() {
                     ArrangementEditRequest::SetClipFadeCurve(_) => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
+                    ArrangementEditRequest::ToggleTrackAutomationCollapsed { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
                 },
             );
             // M11 Phase 51: reorderable_list widget が non-Clone Model でコンパイルする。

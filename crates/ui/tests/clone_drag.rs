@@ -96,6 +96,8 @@ fn arr_model() -> ArrModel {
         parent_id: None,
         depth: 0,
         collapsed: false,
+        automation_lanes_collapsed: true,
+        automation_lanes: Vec::new(),
     };
     ArrModel {
         tracks: vec![track],
