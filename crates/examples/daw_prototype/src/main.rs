@@ -1699,8 +1699,9 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
     // idiom)。 anchor_rect は point dot の周辺 (8x8 px @ default radius=4)、 caller の右クリックを
     // context_menu_for が anchor_rect.contains で判定 → popup を立ち上げる。 prev curve は popup
     // open 時点の `clip.points[point_idx].curve` を retrieve (#028 [Resolved] と同 idiom)。
-    let point_rects_clone = resp.automation_point_rects.clone();
-    for (point_key, anchor_rect) in point_rects_clone {
+    // resp は owned value (ArrangementResponse は Clone) で ui への borrow を持たないので、
+    // `&resp.automation_point_rects` で iter しつつ closure 内 `ui.push_edit` 可能 (clone 不要)。
+    for &(point_key, anchor_rect) in &resp.automation_point_rects {
         let prev_curve = m
             .arr_automation_lanes
             .get(&point_key.clip.track)
