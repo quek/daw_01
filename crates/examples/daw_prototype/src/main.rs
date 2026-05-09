@@ -1596,6 +1596,22 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                         format!("arr: SetLaneDefault t{} l{} → {:.2}", lane.track, lane.lane, next);
                 })
             }
+            // M14 Phase 63n-5 (#030): lane 下端 splitter drag による高さ変更。 widget 側で
+            // [min, max] = [30, 200] (style 既定) に clamp 済 — caller は別 clamp 不要。
+            // drag 中は per-frame 受信 → caller が `lane.height_px = next` で反映 → 次 frame で
+            // lane 行高さが伸び縮みする様子が cached 描画にそのまま乗る。
+            ArrangementEditRequest::SetLaneHeight { lane, prev: _, next } => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(lanes) = mm.arr_automation_lanes.get_mut(&lane.track)
+                        && let Some(l) = lanes.iter_mut().find(|l| l.id == lane.lane)
+                    {
+                        l.height_px = next;
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.last_action =
+                        format!("arr: SetLaneHeight t{} l{} → {} px", lane.track, lane.lane, next);
+                })
+            }
             ArrangementEditRequest::DeleteLane(lane) => {
                 Edit::mutate(move |mm: &mut DawModel| {
                     if let Some(lanes) = mm.arr_automation_lanes.get_mut(&lane.track) {

@@ -36,6 +36,8 @@ struct ObsModel {
     point_rects: Vec<(AutomationPointKey, Rect)>,
     /// M14 Phase 63n-4 (#029): lane body 空き dblclick → CreateAutomationClip 観測。
     created_clips: Vec<(AutomationLaneKey, f64, f64)>,
+    /// M14 Phase 63n-5 (#030): lane 下端 splitter drag → SetLaneHeight 観測 (per-frame + release 全列)。
+    lane_heights: Vec<(AutomationLaneKey, u16, u16)>,
 }
 
 fn make_lane(id: u32, enabled: bool) -> ArrangementAutomationLane {
@@ -196,6 +198,20 @@ fn run_arrangement_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: F
                 } => Edit::mutate(move |mm: &mut ObsModel| {
                     mm.created_clips.push((lane, start_beat, len_beats));
                 }),
+                ArrangementEditRequest::SetLaneHeight { lane, prev, next } => {
+                    Edit::mutate(move |mm: &mut ObsModel| {
+                        mm.lane_heights.push((lane, prev, next));
+                        // caller として lane.height_px を即座に反映 (drag 中の live preview を再現、
+                        // widget の anchor は press 時 height_px を保持しているので drag 継続中に
+                        // height を更新しても anchor 計算は壊れない)。
+                        if let Some(t) = mm.tracks.iter_mut().find(|t| t.id == lane.track)
+                            && let Some(l) =
+                                t.automation_lanes.iter_mut().find(|l| l.id == lane.lane)
+                        {
+                            l.height_px = next;
+                        }
+                    })
+                }
                 _ => Edit::mutate(|_| {}),
             },
         );
@@ -409,6 +425,123 @@ fn lane_body_dblclick_on_existing_clip_does_not_emit_create() {
         m.created_clips.len(),
         0,
         "既存 clip 上 dblclick では CreateAutomationClip は発火しない (priority 排他)"
+    );
+}
+
+/// M14 Phase 63n-5 (#030): lane 下端 splitter drag で `SetLaneHeight` が drag 中 per-frame +
+/// release で発火。 widget は [min, max] (style 既定 30/200) に clamp 済の `next` を渡す。
+#[test]
+fn lane_bottom_splitter_drag_emits_set_lane_height() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lane(10, true)])];
+
+    // lane の bottom edge: track row 32 + lane height 60 = y=92。 hot zone は [92-handle, 92) =
+    // [88, 92)。 px は body x range の中央付近 (lanes.x = 200、 lanes.w = 600 → cx=400)。
+    let cx = 400.0;
+    let press_y = 90.0; // splitter 内
+    let drag_y = 110.0; // press から +20 px (= 高さ +20 → 60→80)
+
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_press(cx, press_y, Modifiers::empty()),
+        ..FrameInput::default()
+    });
+    // drag 中の continuation frame (primary_pressed のまま position 移動)
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: PointerFrame {
+            pos: Some((cx, drag_y)),
+            primary_pressed: true,
+            ..PointerFrame::default()
+        },
+        ..FrameInput::default()
+    });
+    // release frame (primary_just_released)
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_release(cx, drag_y, Modifiers::empty()),
+        ..FrameInput::default()
+    });
+
+    // 少なくとも 1 度は per-frame emit、 最後 1 回は release で発火 (合計 ≥ 2 件)。
+    assert!(
+        m.lane_heights.len() >= 2,
+        "drag 中 per-frame + release で 2 件以上発火、 actual {} 件",
+        m.lane_heights.len()
+    );
+    let final_emit = *m.lane_heights.last().expect("≥ 2 件あるので非空");
+    assert_eq!(final_emit.0, AutomationLaneKey { track: 1, lane: 10 });
+    assert_eq!(final_emit.1, 60, "prev は drag 開始時の anchor (= 60 px)");
+    assert_eq!(final_emit.2, 80, "next は anchor + dy = 60 + 20 = 80 px");
+}
+
+/// M14 Phase 63n-5 (#030): drag を min より低く / max より高く引っ張っても widget が clamp する。
+#[test]
+fn lane_bottom_splitter_drag_clamps_to_style_min_max() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lane(10, true)])];
+
+    let cx = 400.0;
+    // press 位置は splitter (lane bottom = 92)
+    let press_y = 90.0;
+    // 上に 200 px 引っ張る (height = 60 - 200 = -140 → clamp で min=30 に)
+    let drag_up_y = press_y - 200.0;
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_press(cx, press_y, Modifiers::empty()),
+        ..FrameInput::default()
+    });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: PointerFrame {
+            pos: Some((cx, drag_up_y)),
+            primary_pressed: true,
+            ..PointerFrame::default()
+        },
+        ..FrameInput::default()
+    });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_release(cx, drag_up_y, Modifiers::empty()),
+        ..FrameInput::default()
+    });
+
+    // 全 emit は min (= 30) 以上に clamp 済
+    assert!(!m.lane_heights.is_empty(), "drag で SetLaneHeight が発火");
+    for (_, _, next) in &m.lane_heights {
+        assert!(*next >= 30, "next ({next} px) は min=30 以上に clamp");
+    }
+    // 最後の emit は min ぴったり (release 時点で raw が min を大きく下回っている)
+    assert_eq!(m.lane_heights.last().expect("non-empty").2, 30);
+}
+
+/// M14 Phase 63n-5 (#030): splitter 外 (= lane body の上方 / 縦 padding) を click しても
+/// resize drag は起動せず、 既存挙動が維持される。
+#[test]
+fn lane_body_press_outside_splitter_does_not_emit_set_lane_height() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lane(10, true)])];
+
+    // lane body 中央 (= y=62) で press → splitter (y=88..92) 外なので resize 発火しない
+    let cx = 400.0;
+    let cy = 62.0;
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_press(cx, cy, Modifiers::empty()),
+        ..FrameInput::default()
+    });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: PointerFrame {
+            pos: Some((cx, cy + 20.0)),
+            primary_pressed: true,
+            ..PointerFrame::default()
+        },
+        ..FrameInput::default()
+    });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_release(cx, cy + 20.0, Modifiers::empty()),
+        ..FrameInput::default()
+    });
+    assert_eq!(
+        m.lane_heights.len(),
+        0,
+        "splitter 外 press では SetLaneHeight 発火しない"
     );
 }
 

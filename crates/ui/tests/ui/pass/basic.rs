@@ -320,6 +320,10 @@ fn main() {
                     ArrangementEditRequest::CreateAutomationClip { .. } => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
+                    // M14 Phase 63n-5 (#030): lane 下端 splitter drag → SetLaneHeight。
+                    ArrangementEditRequest::SetLaneHeight { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
                 },
             );
             // M11 Phase 51: reorderable_list widget が non-Clone Model でコンパイルする。

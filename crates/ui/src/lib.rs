@@ -56,8 +56,9 @@ pub use widgets::arrangement::{
     ClipFadeCurveDelta, ClipFadeDelta, ClipGainDelta, ClipKey, FadeCurve, FadeEdge, LoopBandHit,
     MoveAutomationClipDelta, MoveAutomationPointDelta, MoveClipDelta, ResizeAutomationClipDelta,
     ResizeClipDelta, SelectModifier, automation_clip_zone_at, automation_lane_at,
-    automation_lane_header_layout, automation_lane_key_at_y, automation_lanes_total_h,
-    automation_point_at, clip_hit, clip_to_rect, lane_disclosure_rect_for, loop_band_hit_kind,
+    automation_lane_header_layout, automation_lane_key_at_y,
+    automation_lane_resize_splitter_at, automation_lanes_total_h, automation_point_at,
+    clip_hit, clip_to_rect, lane_disclosure_rect_for, loop_band_hit_kind,
     track_index_from_y, track_row_height, visible_track_row_tops,
 };
 pub use widgets::automation::{AutomationCurveResponse, AutomationCurveStyle};

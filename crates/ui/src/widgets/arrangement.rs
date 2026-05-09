@@ -544,6 +544,19 @@ pub enum ArrangementEditRequest {
     /// `default_value_norm` 変更 (release 時に 1 度発火)。 `prev` / `next` で Undoable 構築容易
     /// (`SetTrackVolume` と同 pattern)。 widget 側で `0.0..=1.0` に clamp 済。
     SetLaneDefault { lane: AutomationLaneKey, prev: f32, next: f32 },
+    /// M14 Phase 63n-5 (#030): lane 下端 splitter (高さ ±`automation_lane_resize_handle_px` の hot zone)
+    /// drag による `lane.height_px` 変更。 widget 側で `style.automation_lane_min_height_px` /
+    /// `style.automation_lane_max_height_px` に clamp 済 (caller は `next` を信用して別 clamp しない)。
+    /// drag 中は per-frame `next` 更新で live preview (`SetLaneDefault` と同 pattern)、 release frame
+    /// で 1 度だけ `prev = anchor_height_px` で発火 (Undoable 構築容易)。 Alt+drag は採用せず —
+    /// Alt は既存 widget で point 削除 / clip snap 一時無効に重く使われており、 lane resize に
+    /// 重ねると意図不明な gesture が増えるため。 Bitwig / Live / Reaper と同じ NsResize cursor 付き
+    /// splitter を採用 (要望 §A 案 2、 daw_01 #030 で best practice 委譲済)。
+    SetLaneHeight {
+        lane: AutomationLaneKey,
+        prev: u16,
+        next: u16,
+    },
     /// M14 Phase 63n-2 (#028): lane header の `✕` icon click。 caller は当該 lane を track の
     /// `automation_lanes` から remove する。 lane 内の clip / point も同時に消える (caller 仕様)。
     /// undo は caller 責務 (widget は単発の Edit を発行するだけ)。
@@ -841,6 +854,18 @@ pub struct ArrangementStyle {
     pub automation_clip_default_len_beats: f64,
     /// lane header の slider 帯 (default_value_norm 表示) の縦幅 (px)。 default 4.0。
     pub automation_default_band_h: f32,
+    /// M14 Phase 63n-5 (#030): lane 下端 splitter drag の hot zone 高さ (px)。 default 4.0。
+    /// `lane_y + lh - handle ≤ py < lane_y + lh` の y 範囲 + body x 範囲が hit zone。
+    /// `automation_clip_v_pad_px` (= 6.0) の bottom padding 内に収まるよう小さめに設定 (clip rect とは
+    /// 衝突しない: clip 縦範囲は body.y+pad..body.y+h-pad)。
+    pub automation_lane_resize_handle_px: f32,
+    /// M14 Phase 63n-5 (#030): lane 高さ drag の **下限 px** (`SetLaneHeight.next` clamp 用)。 default 30。
+    /// 30 px は header の icon row + label が 1 段で読める最小 (Bitwig "small" preset 相当)。
+    pub automation_lane_min_height_px: u16,
+    /// M14 Phase 63n-5 (#030): lane 高さ drag の **上限 px**。 default 200。
+    /// 200 px は curve の細部編集が見やすい余裕量 (Bitwig "large" 程度、 さらに大きく取りたい場合は
+    /// caller が style override で広げる)。
+    pub automation_lane_max_height_px: u16,
     /// disclosure ▶ / ▼ glyph の描画 font size。 default = `track_text_size`。
     pub automation_disclosure_size: f32,
     /// lane header に描く icon glyph (`★` / `[V]` / `👁` / `▣` / `✕`) の font size。 default = `track_text_size`。
@@ -960,6 +985,9 @@ impl Default for ArrangementStyle {
             automation_clip_v_pad_px: 6.0,
             automation_clip_default_len_beats: 4.0,
             automation_default_band_h: 4.0,
+            automation_lane_resize_handle_px: 4.0,
+            automation_lane_min_height_px: 30,
+            automation_lane_max_height_px: 200,
             automation_disclosure_size: 12.0,
             automation_lane_icon_size: 12.0,
             automation_lane_text_color: Color::rgb(0.92, 0.92, 0.94),
@@ -1301,6 +1329,18 @@ pub fn loop_band_hit_kind(
 fn px_to_beat(px: f32, lanes_x: f32, lanes_w: f32, view: ArrangementView) -> f64 {
     let beat_per_px = view.len_beats / f64::from(lanes_w.max(1.0));
     view.start_beat + f64::from(px - lanes_x) * beat_per_px
+}
+
+/// M14 Phase 63n-5 (#030): lane height drag で raw px (= anchor_h + dy) を `[min, max]` に clamp して
+/// `u16` に丸める。 round で整数化 (= drag 中の 0.5 px 揺れで height がカクつかないよう)、 min/max が
+/// 逆転していたら max を min 以上に補正 (style 異常入力に対する safety、 panic しない)。
+#[inline]
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn clamp_height_px(raw: f32, min: u16, max: u16) -> u16 {
+    let lo = f32::from(min);
+    let hi = f32::from(max).max(lo);
+    raw.round().clamp(lo, hi) as u16
 }
 
 /// M10 Phase 46: drag 中の `mouse_y` から **drop target index** (anchor 抜き取り後に挿入する位置) を計算。
@@ -1662,6 +1702,24 @@ struct AutomationLaneDefaultDragSession {
     last_emitted_value: f32,
 }
 
+/// M14 Phase 63n-5 (#030): lane 下端 splitter drag session (lane height 変更)。
+/// `AutomationLaneDefaultDragSession` と同 pattern (per-frame `SetLaneHeight` emit + release で
+/// 最終値 1 度発火) — `last_emitted_height` で同値発火を抑制し、 `anchor_height_px` (= press 時の
+/// `lane.height_px`) と `anchor_mouse_y` で view scroll 耐性を確保 (anchor 固定なので caller が
+/// `lane.height_px = next` を反映しても drag 中 cursor 追従が壊れない)。
+#[derive(Clone, Copy, Debug)]
+struct AutomationLaneResizeDragSession {
+    lane: AutomationLaneKey,
+    /// drag 開始時の `lane.height_px` (release commit の `prev`、 dy 計算の base)。
+    anchor_height_px: u16,
+    /// drag 開始時の cursor y (= `lane_y + lh` 付近)。
+    anchor_mouse_y: f32,
+    /// 最後に観測した cursor y (continuation で update、 release で最終 height 計算に使用)。
+    last_mouse_y: f32,
+    /// 最後に emit した height (毎 frame 同値発火を抑制)。
+    last_emitted_height: u16,
+}
+
 /// M14 Phase 63n-3 (#028): lane 内 automation clip の Move / ResizeLeft / ResizeRight drag session。
 /// 既存 `ClipDragSession` (MIDI / Audio clip 用) と同 pattern だが key 型 / lane 跨ぎ semantics が
 /// 異なるため別 struct 化。 単一 clip 限定 (multi-select は仕様 §scope 外)、 `last_*` で OS event
@@ -1710,6 +1768,9 @@ pub(crate) struct ArrangementState {
     /// M14 Phase 63n-2 (#028): lane header default value band drag session
     /// (release で SetLaneDefault 1 件)。
     automation_lane_default_drag: Option<AutomationLaneDefaultDragSession>,
+    /// M14 Phase 63n-5 (#030): lane 下端 splitter drag session
+    /// (release で `SetLaneHeight { prev: anchor, next: final }` 1 件)。
+    automation_lane_resize_drag: Option<AutomationLaneResizeDragSession>,
     /// M14 Phase 63n-3 (#028): lane 内 automation clip の Move / Resize drag session
     /// (release で `MoveAutomationClips` / `CloneAutomationClipsLinked` /
     /// `CloneAutomationClipsIndependent` / `ResizeAutomationClips` のいずれか 1 件、
@@ -2653,6 +2714,54 @@ fn for_each_visible_lane<F>(
     }
 }
 
+/// M14 Phase 63n-5 (#030): lane 下端 splitter hot zone (= lane bottom edge ±`handle_px` の y range
+/// × body x range) に cursor が当たっているか判定。 当たった lane の `AutomationLaneKey` を返す
+/// (= cursor 形状切替 + caller のテストで rect 中心 px を導出する用途)。 splitter は body x range のみ
+/// — header 側は button / band と排他。 splitter hit > 他の hover priority (cursor は最優先で NsResize)。
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn automation_lane_resize_splitter_at(
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
+    track_row_h: f32,
+    header_pane_x: f32,
+    header_pane_w: f32,
+    lanes_x: f32,
+    lanes_w: f32,
+    style: &ArrangementStyle,
+    cx: f32,
+    cy: f32,
+) -> Option<AutomationLaneKey> {
+    let handle = style.automation_lane_resize_handle_px;
+    if handle <= 0.0 || cx < lanes_x || cx >= lanes_x + lanes_w {
+        return None;
+    }
+    let mut found: Option<AutomationLaneKey> = None;
+    for_each_visible_lane(
+        visible_tracks,
+        tops,
+        track_row_h,
+        header_pane_x,
+        header_pane_w,
+        lanes_x,
+        lanes_w,
+        style,
+        |i, _j, lane, _h_rect, b_rect| {
+            if found.is_some() {
+                return;
+            }
+            let bottom = b_rect.y + b_rect.h;
+            if cy >= bottom - handle && cy < bottom {
+                found = Some(AutomationLaneKey {
+                    track: visible_tracks[i].id,
+                    lane: lane.id,
+                });
+            }
+        },
+    );
+    found
+}
+
 /// M14 Phase 63n-2 (#028): lane body 内 cursor 位置から hit する point を返す (後勝ち、 描画順と整合)。
 /// 戻り値の `Rect` は popup anchor 用 point dot rect (= `lane_disclosure_rect_for` 同様)。
 /// hit zone は **point dot 半径の 2 倍** (= 8px @ default radius=4) で生成、 fingertip 操作の余裕を持たせる。
@@ -3476,12 +3585,53 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let in_ruler = ruler.contains(px, py);
             let shift = pointer.modifiers.shift;
             let ctrl = pointer.modifiers.ctrl;
+
+            // M14 Phase 63n-5 (#030): lane 下端 splitter hit (= body x range × lane bottom edge ±handle)
+            // を **最優先** で判定。 hit したら resize drag session を起動して以降の press logic を skip
+            // (= audio grip / clip drag / point hit / track header と排他)。 modifier 無視 (Shift+drag /
+            // Ctrl+drag でも resize は同じ意味で、 既存 modifier semantics と衝突する余地が無い)。
+            let splitter_lane = automation_lane_resize_splitter_at(
+                &visible_tracks,
+                &press_tops,
+                view.track_row_h,
+                header_pane.x,
+                header_pane.w,
+                lanes.x,
+                lanes.w,
+                style,
+                px,
+                py,
+            );
+            let splitter_press = if let Some(lane_key) = splitter_lane {
+                let anchor_h = visible_tracks
+                    .iter()
+                    .find(|t| t.id == lane_key.track)
+                    .and_then(|t| t.automation_lanes.iter().find(|l| l.id == lane_key.lane))
+                    .map_or(0_u16, |l| l.height_px);
+                if anchor_h > 0 {
+                    let state: &mut ArrangementState = self.widget_state(wid);
+                    state.automation_lane_resize_drag =
+                        Some(AutomationLaneResizeDragSession {
+                            lane: lane_key,
+                            anchor_height_px: anchor_h,
+                            anchor_mouse_y: py,
+                            last_mouse_y: py,
+                            last_emitted_height: anchor_h,
+                        });
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
             // M14 Phase 63k (#025): audio gesture (gain handle / fade corner) を最優先で振り分ける。
             // audio grip にヒットしたら clip_drag (Move/Resize) は起動しない (排他) — `audio_grip_hit_in_lanes`
             // が先勝で priority 判定する。 modifier (Shift / Ctrl) は audio gesture では無視 (Bitwig spec
             // §3.5/§3.6 と整合、 modifier-free な直感的操作)。 audio_edit が None の clip ではこの
             // ブロックは即 None を返すため、 既存挙動 (MIDI / Vocal clip) は影響を受けない。
-            let audio_press = if in_lanes && !shift && !ctrl {
+            let audio_press = if !splitter_press && in_lanes && !shift && !ctrl {
                 audio_grip_hit_in_lanes(&visible_tracks, &press_tops, view, lanes, px, py, style)
             } else {
                 None
@@ -3516,7 +3666,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         locked_horizontal,
                     });
                 }
-            } else if in_lanes
+            } else if !splitter_press
+                && in_lanes
                 && (!shift || ctrl)
                 && let Some((hit_key, kind)) =
                     clip_hit(&visible_tracks, &press_tops, view, lanes, px, py, style.resize_handle_px)
@@ -3700,13 +3851,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         }
                         let lh = f32::from(lane.height_px);
                         if py >= lane_y && py < lane_y + lh {
+                            let lane_key = AutomationLaneKey { track: t.id, lane: lane.id };
                             let header_rect = Rect {
                                 x: header_pane.x + header_indent,
                                 y: lane_y,
                                 w: (header_pane.w - header_indent).max(2.0),
                                 h: lh,
                             };
-                            let lane_key = AutomationLaneKey { track: t.id, lane: lane.id };
                             if let Some(layout) = automation_lane_header_layout(header_rect, style)
                             {
                                 if layout.enabled_icon_rect.contains(px, py) {
@@ -3756,7 +3907,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // **double click** 経由で発火 (既存 `take_double_click_in_rect` block で分岐)。
             // audio_grip / clip_drag (上で MIDI/Audio 行を既に処理済) は track row の y range 内のみ
             // 作動するため lane body と排他。
-            if in_lanes
+            if !splitter_press
+                && in_lanes
                 && !shift
                 && !ctrl
                 && let Some((point_key, _r)) = automation_point_at(
@@ -3836,7 +3988,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let state: &ArrangementState = self.widget_state(wid);
                 state.automation_point_drag.is_some()
             };
-            if !already_taken_by_point
+            if !splitter_press
+                && !already_taken_by_point
                 && in_lanes
                 && (!shift || ctrl)
                 && let Some((clip_key, kind, _clip_rect, body_rect_anchor)) =
@@ -3995,6 +4148,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             {
                 ld.last_mouse_x = px;
             }
+            // M14 Phase 63n-5 (#030): automation_lane_resize_drag continuation で last_mouse_y を update
+            // (lane_default_drag と同 pattern、 release frame は release block で処理)。
+            if let Some(ref mut rd) = state.automation_lane_resize_drag
+                && !is_release
+            {
+                rd.last_mouse_y = py;
+            }
             // M14 Phase 63n-3 (#028): automation_clip_drag continuation で last_mouse +
             // last_alt / last_ctrl / last_shift を update (`ClipDragSession` と同 pattern)。
             // release frame の `last_mouse` は pointer.pos != anchor のときのみ update、 modifier は
@@ -4029,6 +4189,36 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
             if let Some((lane, prev, next)) = emit {
                 self.push_edit(make_edit(ArrangementEditRequest::SetLaneDefault {
+                    lane,
+                    prev,
+                    next,
+                }));
+            }
+        }
+
+        // M14 Phase 63n-5 (#030): automation_lane_resize_drag の per-frame live update。
+        // drag 中は user に「lane が伸び縮みする様子」 を見せたいので、 height 変化を毎 frame 発行する
+        // (lane_default_drag と同 pattern)。 release frame は release block で最終値を発行するためここでは skip。
+        if let Some((_px, py)) = pointer.pos
+            && !pointer.primary_just_released
+        {
+            let min_h = style.automation_lane_min_height_px;
+            let max_h = style.automation_lane_max_height_px;
+            let mut emit: Option<(AutomationLaneKey, u16, u16)> = None;
+            {
+                let state: &mut ArrangementState = self.widget_state(wid);
+                if let Some(ref mut rd) = state.automation_lane_resize_drag {
+                    let dy = py - rd.anchor_mouse_y;
+                    let raw = f32::from(rd.anchor_height_px) + dy;
+                    let next = clamp_height_px(raw, min_h, max_h);
+                    if next != rd.last_emitted_height {
+                        emit = Some((rd.lane, rd.anchor_height_px, next));
+                        rd.last_emitted_height = next;
+                    }
+                }
+            }
+            if let Some((lane, prev, next)) = emit {
+                self.push_edit(make_edit(ArrangementEditRequest::SetLaneHeight {
                     lane,
                     prev,
                     next,
@@ -4298,6 +4488,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 None
             };
 
+        // M14 Phase 63n-5 (#030): automation_lane_resize_drag release take (overlay は不要 — caller が
+        // per-frame 受信した SetLaneHeight で `lane.height_px` を update することで lane が伸び縮みする
+        // 様子が cached 描画に直接反映される)。 release frame で session を take し、 final height を発行。
+        let lane_resize_drag_release: Option<AutomationLaneResizeDragSession> =
+            if pointer.primary_just_released {
+                let state: &mut ArrangementState = self.widget_state(wid);
+                state.automation_lane_resize_drag.take()
+            } else {
+                None
+            };
+
         // M14 Phase 63n-3 (#028): automation_clip_drag overlay clone + release take。
         // overlay は ghost clip rect を cached 外で重ねる、 release で 1 度だけ
         // `MoveAutomationClips` / `CloneAutomationClipsLinked` / `CloneAutomationClipsIndependent` /
@@ -4371,10 +4572,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // drag 中 / hover 中の clip 上 / それ以外で arrangement 内なら明示的に Default
         // にリセット (`set_cursor` を呼ばないと OS 側に前フレームの形が残る、winit は state-full)。
         // M14 Phase 63n-3 (#028): automation clip drag 中も MIDI と同じ cursor 形状 (排他で `Some` 判定)。
+        // M14 Phase 63n-5 (#030): lane resize drag 中は NsResize (cursor 移動の縦軸を強調)、 hover 時も
+        // splitter hot zone なら NsResize にして discoverability を確保。 lane resize > clip drag > hover の
+        // priority (= 同時に成立しないが、 万一重なっても resize を優先)。
+        let lane_resize_active = {
+            let state: &mut ArrangementState = self.widget_state(wid);
+            state.automation_lane_resize_drag.is_some()
+        };
         let dragging_kind = response
             .dragging
             .or(automation_clip_drag_session.as_ref().map(|acd| acd.kind));
-        if let Some(kind) = dragging_kind {
+        if lane_resize_active {
+            self.set_cursor(CursorIcon::NsResize);
+        } else if let Some(kind) = dragging_kind {
             let cur = match kind {
                 ClipDragKind::Move => CursorIcon::Move,
                 ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => CursorIcon::EwResize,
@@ -4390,6 +4600,22 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => CursorIcon::EwResize,
             };
             self.set_cursor(cur);
+        } else if let Some((cx, cy)) = pointer.pos
+            && automation_lane_resize_splitter_at(
+                &visible_tracks,
+                &press_tops,
+                view.track_row_h,
+                header_pane.x,
+                header_pane.w,
+                lanes.x,
+                lanes.w,
+                style,
+                cx,
+                cy,
+            )
+            .is_some()
+        {
+            self.set_cursor(CursorIcon::NsResize);
         } else if let Some((px, py)) = pointer.pos
             && (lanes.contains(px, py) || ruler.contains(px, py) || header_pane.contains(px, py))
         {
@@ -5142,6 +5368,27 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         vec![delta],
                     )));
                 }
+            }
+        }
+
+        // ---- M14 Phase 63n-5 (#030): automation_lane_resize_drag release → SetLaneHeight ----
+        // drag 中は per-frame emit で live update 済 (lane_default_drag と同 pattern)。
+        // release frame は 1 度だけ最終値を `SetLaneHeight { prev: anchor, next: end }` で発行。
+        // anchor と同値なら no-op (= ユーザが splitter を click したけど drag しなかったケース)。
+        if let Some(rd) = lane_resize_drag_release {
+            let dy = rd.last_mouse_y - rd.anchor_mouse_y;
+            let raw = f32::from(rd.anchor_height_px) + dy;
+            let end = clamp_height_px(
+                raw,
+                style.automation_lane_min_height_px,
+                style.automation_lane_max_height_px,
+            );
+            if end != rd.anchor_height_px {
+                self.push_edit(make_edit(ArrangementEditRequest::SetLaneHeight {
+                    lane: rd.lane,
+                    prev: rd.anchor_height_px,
+                    next: end,
+                }));
             }
         }
 
