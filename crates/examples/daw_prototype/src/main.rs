@@ -114,6 +114,11 @@ struct DawModel {
     /// M14 Phase 63n-3 (#028): 選択中の automation clip key 集合 (短 click on clip で SelectAutomationClips
     /// を受信し、 widget へ毎 frame 渡して selected_fill / selected_border 表示を駆動する SSoT)。
     arr_selected_automation_clips: Vec<daw_ui_core::AutomationClipKey>,
+    /// M14 Phase 63n-8 (#033): 選択中の automation point key 集合 (空き lane zone 内 lasso + point 短 click
+    /// で `SelectAutomationPoints` を受信し、 widget へ毎 frame 渡して selected point の白色 + 大 dot 描画を
+    /// 駆動する SSoT)。 `MoveAutomationPoints` の multi-batch も widget が `selected_automation_points`
+    /// を読んで自動分岐するため caller 側追加処理は不要。
+    arr_selected_automation_points: Vec<daw_ui_core::AutomationPointKey>,
     /// M14 Phase 63n-6 (#031): per-track row 高さ override の永続 store (`track_id -> u16`)。
     /// `SetSingleTrackRowH { track, prev: _, next }` 受信で `insert(track, next)`、 widget へ渡すときは
     /// `t.row_h = m.arr_track_row_h.get(&t.id).copied()` で `Some(h)` / `None` を反映。 None で `view.track_row_h`
@@ -231,6 +236,7 @@ impl DawModel {
                 h
             },
             arr_selected_automation_clips: Vec::new(),
+            arr_selected_automation_points: Vec::new(),
             arr_track_row_h: std::collections::HashMap::new(),
             arr_next_share_group_id: 0,
             arr_rename_target: None,
@@ -1120,6 +1126,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
         &m.arr_selected_clips,
         &m.arr_selected_tracks,
         &m.arr_selected_automation_clips,
+        &m.arr_selected_automation_points,
         &style,
         move |req| match req {
             ArrangementEditRequest::SelectClips { next, .. } => {
@@ -1960,6 +1967,16 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                     let n = next_v.len();
                     mm.arr_selected_automation_clips = next_v;
                     mm.last_action = format!("arr: SelectAutomationClips ({n})");
+                })
+            }
+            // M14 Phase 63n-8 (#033): lasso + point 短 click による point selection の更新。
+            // 単純に上書き — caller 側の追加処理 (例: undo 履歴に push) は別 commit でも対応可。
+            ArrangementEditRequest::SelectAutomationPoints { next, .. } => {
+                let next_v = next;
+                Edit::mutate(move |mm: &mut DawModel| {
+                    let n = next_v.len();
+                    mm.arr_selected_automation_points = next_v;
+                    mm.last_action = format!("arr: SelectAutomationPoints ({n})");
                 })
             }
         },

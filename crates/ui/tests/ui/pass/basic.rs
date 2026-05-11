@@ -30,6 +30,7 @@ struct Model {
     arr_selected_clips: Vec<ClipKey>,
     arr_selected_tracks: Vec<u32>,
     arr_selected_automation_clips: Vec<AutomationClipKey>,
+    arr_selected_automation_points: Vec<daw_ui_core::AutomationPointKey>,
     // M11 Phase 51: reorderable_list widget 用 (non-Clone Model でも呼べることを担保)
     chain: Vec<String>,
 }
@@ -50,6 +51,7 @@ fn main() {
         arr_selected_clips: Vec::new(),
         arr_selected_tracks: Vec::new(),
         arr_selected_automation_clips: Vec::new(),
+        arr_selected_automation_points: Vec::new(),
         chain: Vec::new(),
     };
 
@@ -189,6 +191,7 @@ fn main() {
                 &m.arr_selected_clips,
                 &m.arr_selected_tracks,
                 &m.arr_selected_automation_clips,
+                &m.arr_selected_automation_points,
                 &arr_style,
                 |req| match req {
                     ArrangementEditRequest::SelectClips { .. } => {
@@ -314,6 +317,10 @@ fn main() {
                         Edit::mutate(|_m: &mut Model| {})
                     }
                     ArrangementEditRequest::SelectAutomationClips { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    // M14 Phase 63n-8 (#033): lasso + 短 click による point selection の更新。
+                    ArrangementEditRequest::SelectAutomationPoints { .. } => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
                     // M14 Phase 63n-4 (#029): lane body 空き dblclick → CreateAutomationClip。

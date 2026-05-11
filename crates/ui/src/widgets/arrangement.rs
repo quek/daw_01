@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::Arc;
 
-use daw_ui_platform::CursorIcon;
+use daw_ui_platform::{CursorIcon, Modifiers};
 use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
 
 use crate::edit::Edit;
@@ -657,6 +657,34 @@ pub enum ArrangementEditRequest {
         prev: Vec<AutomationClipKey>,
         next: Vec<AutomationClipKey>,
     },
+    /// M14 Phase 63n-8 (#033): automation point の selection 変更。 lasso 矩形 drag 完了時 + point 短 click
+    /// (= drag < 4px の release) の 2 経路で発火。 `prev` / `next` は順序保持 `Vec` で `SelectAutomationClips`
+    /// と同 idiom (caller は単純に `selected_automation_points = next` で上書き、 必要なら undo 履歴に push)。
+    ///
+    /// **発火条件と next 計算** (Q2=A の zone 排他 lasso + 短 click select):
+    /// - lane body の **空き zone** (= clip / point / lane resize splitter / lane header の **外**) で drag:
+    ///   - 修飾なし → `next = lasso 内 points` (= 旧 selection 破棄)
+    ///   - Shift+drag → `next = prev ∪ lasso 内 points` (union)
+    ///   - Ctrl+drag → `next = prev XOR lasso 内 points` (toggle)
+    /// - point 上の **短 click** (= drag<4px の release、 Alt なし):
+    ///   - 修飾なし → `next = vec![clicked]` (single select、 prev 破棄)
+    ///   - Shift / Ctrl → `next = prev XOR vec![clicked]` (toggle)
+    /// - 空き zone の **短 click** (= drag<4px の release):
+    ///   - 修飾なし → `next = vec![]` (clear)
+    ///   - Shift / Ctrl → no-op (selection 維持、 = 誤操作回避)
+    ///
+    /// point 上の **長 drag** (>=4px) は selection を変えず `MoveAutomationPoints` を発火する
+    /// (= drag した点が prev に含まれるなら全 selected を batch、 含まれないなら単独 move、 widget 側で
+    /// `selected_automation_points` を見て自動分岐)。 Alt+click は引き続き即時 `DeleteAutomationPoints`
+    /// (selection は変化しない)。
+    ///
+    /// lasso 中の hit 判定: point の **中心** が lasso rect に含まれるか (= rect の中心 / 端ではなく point 位置)、
+    /// daw_01 #033 仕様文面と整合。 invisible lane の points は対象外 (= 既存 `automation_point_at` の
+    /// visible scope と一致)。
+    SelectAutomationPoints {
+        prev: Vec<AutomationPointKey>,
+        next: Vec<AutomationPointKey>,
+    },
 }
 
 /// `Ui::arrangement` の戻り値。
@@ -705,6 +733,10 @@ pub struct ArrangementResponse {
     /// M14 Phase 63n-3 (#028): drag 中の automation clip kind (`Some` なら lane 内 clip drag セッション
     /// 進行中)。 既存 `dragging` (MIDI clip 用) と直交、 同 frame 内で両方 `Some` にならない (排他)。
     pub dragging_automation_clip: Option<ClipDragKind>,
+    /// M14 Phase 63n-8 (#033): automation point の lasso 矩形 drag セッションが進行中なら `true`
+    /// (= 空き automation lane zone で drag 開始 → release までの間)。 caller の cursor / status
+    /// indicator 用 (既存 `rect_select_active` (MIDI clip 用) と直交、 同 frame で両方 true にならない)。
+    pub automation_lasso_active: bool,
 }
 
 impl Default for ArrangementResponse {
@@ -725,6 +757,7 @@ impl Default for ArrangementResponse {
             automation_point_rects: Vec::new(),
             automation_clip_rects: Vec::new(),
             dragging_automation_clip: None,
+            automation_lasso_active: false,
         }
     }
 }
@@ -861,6 +894,21 @@ pub struct ArrangementStyle {
     pub automation_curve_line_width_px: f32,
     /// lane 内 point の半径 (px)。 default 4.0。
     pub automation_point_radius_px: f32,
+    /// M14 Phase 63n-8 (#033): selected automation point の半径 (px)。 default 5.0 (= 通常 4.0 から +25%)。
+    /// `automation_point_radius_px` より大きい値を期待 (= 視認性、 「selected の方が大きく / 明るく見える」 SSoT)。
+    pub automation_point_radius_selected_px: f32,
+    /// M14 Phase 63n-8 (#033): selected automation point の fill。 default 白 (= 通常の curve_color から
+    /// 大きく外して selected を強調)、 lane が disabled でも変えない (= selected を見失わないため)。
+    pub automation_point_selected_fill: Color,
+    /// M14 Phase 63n-8 (#033): selected automation point の border。 default 白 (上書き fill と同色 +
+    /// `automation_point_radius_px` の border_w で枠線扱い)、 widget 側で `border_w = 1.5` (= 通常 1.0 から +50%)
+    /// で「枠線が太い」 visual を作る。
+    pub automation_point_selected_border: Color,
+    /// M14 Phase 63n-8 (#033): lasso 矩形 (空き automation lane zone での drag) の fill (半透明)。
+    /// default は cyan 系 12% alpha。 widget は drag 中 cached 外で overlay 描画する。
+    pub automation_lasso_fill: Color,
+    /// M14 Phase 63n-8 (#033): lasso 矩形の border。 default cyan 60% alpha + 1px。
+    pub automation_lasso_border: Color,
     /// lane 内 default_value 水平線の色 (clip ギャップ / curve 範囲外の値表示)。
     pub automation_default_line_color: Color,
     /// default_value 水平線の太さ (px)。 default 1.0。
@@ -1004,6 +1052,15 @@ impl Default for ArrangementStyle {
             automation_lane_disabled_color: Color::rgba(0.55, 0.56, 0.60, 0.65),
             automation_curve_line_width_px: 1.5,
             automation_point_radius_px: 4.0,
+            // M14 Phase 63n-8 (#033): selected point は半径 +25% (= 通常 4 → 5)、 fill / border 共に白で
+            // 「明らかに大きく / 明るく見える」 を実現 (daw_01 #033 §D 仕様)。 lane disabled でも色維持。
+            automation_point_radius_selected_px: 5.0,
+            automation_point_selected_fill: Color::rgb(1.0, 1.0, 1.0),
+            automation_point_selected_border: Color::rgb(1.0, 1.0, 1.0),
+            // M14 Phase 63n-8 (#033): lasso 矩形は cyan 系で MIDI rect_select (= 既存 cyan rect select) と
+            // 視覚的に共通の言語、 ただし fill alpha 12% で透明感を強め overlay と分かりやすく。
+            automation_lasso_fill: Color::rgba(0.40, 0.85, 1.0, 0.12),
+            automation_lasso_border: Color::rgba(0.40, 0.85, 1.0, 0.60),
             automation_default_line_color: Color::rgba(1.0, 1.0, 1.0, 0.18),
             automation_default_line_width_px: 1.0,
             automation_clip_v_pad_px: 6.0,
@@ -1736,6 +1793,10 @@ struct AutomationPointDragSession {
     last_mouse: (f32, f32),
     /// drag 中の最終 alt 状態 (snap 一時無効、 `ClipDragSession.last_alt` と同 pattern)。
     last_alt: bool,
+    /// M14 Phase 63n-8 (#033): drag 開始時の修飾キー snapshot (release 時の短 click select 分岐用)。
+    /// release frame で `start_modifiers.shift` / `.ctrl` を読んで toggle / replace を判定する
+    /// (= continuation 中の modifier 状態は使わず、 press 時の意図を SSoT として固定)。
+    start_modifiers: Modifiers,
 }
 
 /// M14 Phase 63n-2 (#028): lane header の default value horizontal slider 帯 drag session。
@@ -1788,6 +1849,25 @@ struct TrackRowResizeDragSession {
     last_mouse_y: f32,
     /// 最後に emit した height (毎 frame 同値発火を 0.5 px 閾値で抑制)。
     last_emitted_height: f32,
+}
+
+/// M14 Phase 63n-8 (#033): automation point の lasso (= 空き automation lane zone から drag による
+/// 矩形選択) session。 既存 MIDI rect_select (`take_drag_rect_in_rect`) は library 全 widget 共用の
+/// cyan 描画固定なので、 lasso 用に **arrangement 内部 SSoT** を別 struct 化 (color / 起動条件 / 解放
+/// 時 emit の 3 軸全てが MIDI rect_select と異なる)。 press 時の modifier snapshot を保持して release
+/// commit で next 計算分岐 (修飾なし=replace / Shift=union / Ctrl=XOR、 #033 Q2=A の zone 排他 lasso)。
+/// 起動条件 (= press の zone): lane body && !clip && !point && !lane_resize_splitter && !lane_header。
+/// release は session を take し、 lasso rect 内に **point の中心** が含まれる points を集めて next 計算。
+#[derive(Clone, Copy, Debug)]
+struct AutomationLassoSession {
+    /// drag 開始時の cursor 座標 (lasso rect の anchor、 view scroll 中も固定)。
+    anchor: (f32, f32),
+    /// drag 開始時の cursor 座標 (現在位置、 continuation frame で update)。
+    last_mouse: (f32, f32),
+    /// drag 開始時の修飾キー (release commit 時の next 計算分岐 = replace / union / XOR)。
+    /// continuation で update しない (= 「lasso 開始時に Shift だったが drag 中に離した」 場合も union)。
+    /// 既存 `take_drag_rect_in_rect` の `start_modifiers` と同 pattern。
+    start_modifiers: Modifiers,
 }
 
 /// M14 Phase 63n-3 (#028): lane 内 automation clip の Move / ResizeLeft / ResizeRight drag session。
@@ -1849,6 +1929,10 @@ pub(crate) struct ArrangementState {
     /// `CloneAutomationClipsIndependent` / `ResizeAutomationClips` のいずれか 1 件、
     /// 短 click は `SelectAutomationClips` に demote)。
     automation_clip_drag: Option<AutomationClipDragSession>,
+    /// M14 Phase 63n-8 (#033): 空き automation lane zone から drag による point lasso session。
+    /// release で `SelectAutomationPoints { prev, next }` 1 件発火、 next は press 時の modifier で
+    /// replace / union / XOR を分岐 (#033 Q2=A の zone 排他 lasso)。
+    automation_lasso_drag: Option<AutomationLassoSession>,
     /// M14 Phase 63c (#016): 直前の `Single` クリック位置 (= Shift+click 範囲選択の起点)。
     /// caller には公開せず widget 内 SSoT として持つ (piano_roll の note multi-select は anchor
     /// なし設計だったが、 arrangement では daw_01 #009 / #016 で「widget 内 anchor」 が確認されている)。
@@ -3014,6 +3098,90 @@ fn find_lane_clip(
     Some((lane, clip))
 }
 
+/// M14 Phase 63n-8 (#033): point key から `(time_beat, value_norm, clip_start, clip_len)` を取得。
+/// multi-select drag の release commit で各 selected point の anchor を再 lookup するために使う
+/// (drag 中は Edit が流れないので model 不変、 visible_tracks がそのまま使える前提)。
+#[must_use]
+fn find_automation_point_data(
+    visible_tracks: &[ArrangementTrack],
+    key: AutomationPointKey,
+) -> Option<(f64, f32, f64, f64)> {
+    let track = visible_tracks.iter().find(|t| t.id == key.clip.track)?;
+    let lane = track.automation_lanes.iter().find(|l| l.id == key.clip.lane)?;
+    let clip = lane.clips.iter().find(|c| c.id == key.clip.clip)?;
+    let p = clip.points.get(key.point_idx as usize)?;
+    Some((p.time_beat, p.value_norm, clip.start_beat, clip.len_beats))
+}
+
+/// M14 Phase 63n-8 (#033): 短 click on point の Shift / Ctrl 押下時の toggle 計算。 prev の順序を保ち、
+/// `key` が含まれていれば除去、 無ければ末尾に追加する idiom (= UI で「最後に touched された点」 が
+/// list 末尾に来る、 Bitwig / Live と同 UX)。
+#[must_use]
+fn toggle_selection(prev: &[AutomationPointKey], key: AutomationPointKey) -> Vec<AutomationPointKey> {
+    if prev.contains(&key) {
+        prev.iter().copied().filter(|k| *k != key).collect()
+    } else {
+        let mut out = prev.to_vec();
+        out.push(key);
+        out
+    }
+}
+
+/// M14 Phase 63n-8 (#033): lasso rect 内に **中心が含まれる** visible automation point を集める。
+/// visible_tracks scope (collapsed track / `automation_lanes_collapsed=true` の lane 群 / `lane.visible=false`
+/// の lane は除外)、 既存 `automation_point_at` の hit-test scope と整合。 点中心 (= `(px, py)`) は
+/// 描画と同 SSoT (`body_origin_x + (abs_beat - view.start_beat) * beat_to_px`、 `clip_y + (1 - value) * clip_h`)。
+#[must_use]
+fn collect_points_in_rect(
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
+    view: ArrangementView,
+    lanes: Rect,
+    rect: Rect,
+) -> Vec<AutomationPointKey> {
+    // 描画と同じ縦 padding (= `automation_clip_v_pad_px` default 6.0、 `draw_automation_lane` SSoT)。
+    const PAD: f32 = 6.0;
+    let beat_to_px = f64::from(lanes.w) / view.len_beats.max(1e-6);
+    let mut out: Vec<AutomationPointKey> = Vec::new();
+    for (i, t) in visible_tracks.iter().enumerate() {
+        if t.automation_lanes_collapsed || t.automation_lanes.is_empty() {
+            continue;
+        }
+        let row_top = tops[i];
+        let row_h = effective_track_row_h(t, view.track_row_h);
+        let mut lane_y = row_top + row_h;
+        for lane in &t.automation_lanes {
+            if !lane.visible {
+                continue;
+            }
+            let lh = f32::from(lane.height_px);
+            // 描画と同じ縦 padding 適用 (`draw_automation_lane` SSoT)。
+            let clip_y = lane_y + PAD;
+            let clip_h = (lh - PAD * 2.0).max(2.0);
+            for c in &lane.clips {
+                for (p_idx, p) in c.points.iter().enumerate() {
+                    let abs_beat = c.start_beat + p.time_beat;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let px = lanes.x + ((abs_beat - view.start_beat) * beat_to_px) as f32;
+                    let py = clip_y + (1.0 - p.value_norm.clamp(0.0, 1.0)) * clip_h;
+                    if rect.contains(px, py) {
+                        out.push(AutomationPointKey {
+                            clip: AutomationClipKey {
+                                track: t.id,
+                                lane: lane.id,
+                                clip: c.id,
+                            },
+                            point_idx: p_idx as u32,
+                        });
+                    }
+                }
+            }
+            lane_y += lh;
+        }
+    }
+    out
+}
+
 /// M14 Phase 63n-2 (#028): lane body 内 cursor から hit する automation clip を返す。
 /// 戻り値: `(clip_key, clip_local_time_beat, value_norm)` (clip_local_time_beat は clip start から
 /// のオフセット拍、 value_norm は cy 座標から逆算した `0.0..=1.0`)。 cursor が clip ギャップ内なら
@@ -3667,6 +3835,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         selected_clips: &[ClipKey],
         selected_tracks: &[u32],
         selected_automation_clips: &[AutomationClipKey],
+        selected_automation_points: &[AutomationPointKey],
         style: &ArrangementStyle,
         make_edit: F,
     ) -> ArrangementResponse
@@ -4101,10 +4270,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // **double click** 経由で発火 (既存 `take_double_click_in_rect` block で分岐)。
             // audio_grip / clip_drag (上で MIDI/Audio 行を既に処理済) は track row の y range 内のみ
             // 作動するため lane body と排他。
+            // M14 Phase 63n-8 (#033): point press は **Shift / Ctrl 修飾も accept** (release 時 短 click
+            // 化で toggle / replace を判定する)。 旧 Phase 63n-2 は `!shift && !ctrl` で除外していたが、
+            // それだと Shift+click on point が何の session も起動せず toggle が発火しない bug を持っていた。
+            // Shift+click on point は drag>=4px なら通常 move (= MoveAutomationPoints、 modifier 無視で
+            // pressed が selection に含まれていれば multi)、 短 click なら toggle。 Ctrl 同様。
             if !splitter_press
                 && in_lanes
-                && !shift
-                && !ctrl
                 && let Some((point_key, _r)) = automation_point_at(
                     &visible_tracks,
                     &press_tops,
@@ -4157,6 +4329,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         let clip_rect_anchor =
                             Rect { x: cx_clip, y: clip_y, w: cw, h: clip_h };
                         let press_alt = pointer.modifiers.alt;
+                        let press_modifiers = pointer.modifiers;
                         let state: &mut ArrangementState = self.widget_state(wid);
                         state.automation_point_drag = Some(AutomationPointDragSession {
                             point: point_key,
@@ -4169,6 +4342,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                             anchor_mouse: (px, py),
                             last_mouse: (px, py),
                             last_alt: press_alt,
+                            start_modifiers: press_modifiers,
                         });
                     }
                 }
@@ -4311,6 +4485,67 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                                 last_emitted_height: anchor_row_h,
                             });
                         }
+                    }
+                }
+            }
+
+            // M14 Phase 63n-8 (#033): automation point の lasso press — **空き automation lane zone**
+            // (= lane body && !clip && !point && !lane resize splitter) の drag で起動。 Q2=A の zone 排他
+            // 設計: clip / point / splitter 上は既存 drag (move / move-points / resize) を最優先で起動済、
+            // ここはそれら全てが起動しなかった場合の lane body fallback。 既存 MIDI clip rect_select は
+            // automation lane 内では起動しない (= 後段の rect_select block で `!in_automation_lane` で
+            // guard)、 automation lane では空き zone drag が **修飾なしで lasso** (= Shift / Ctrl は
+            // release 時 next 計算で union / XOR 分岐)、 #033 Q2 回答 A と整合。 Alt は lane resize に
+            // 予約済 (上の Alt+drag fallback で先勝) なので `!pointer.modifiers.alt` で除外。
+            if pointer.primary_just_pressed
+                && let Some((px, py)) = pointer.pos
+                && !pointer.modifiers.alt
+                && !splitter_press
+                && in_lanes
+            {
+                let no_session = {
+                    let s: &ArrangementState = self.widget_state(wid);
+                    s.track_volume_drag.is_none()
+                        && s.track_reorder.is_none()
+                        && s.audio_drag.is_none()
+                        && s.clip_drag.is_none()
+                        && s.automation_lane_default_drag.is_none()
+                        && s.automation_point_drag.is_none()
+                        && s.automation_clip_drag.is_none()
+                        && s.automation_lane_resize_drag.is_none()
+                        && s.track_row_resize_drag.is_none()
+                        && s.playhead_drag.is_none()
+                        && s.loop_drag.is_none()
+                };
+                let no_press_action = press_seek_beat.is_none()
+                    && press_lane_toggle.is_none()
+                    && press_lane_button.is_none()
+                    && press_delete_point.is_none();
+                if no_session && no_press_action {
+                    let lane_at = automation_lane_at(
+                        &visible_tracks,
+                        &press_tops,
+                        view.track_row_h,
+                        header_pane.x,
+                        header_pane.w,
+                        lanes.x,
+                        lanes.w,
+                        style,
+                        py,
+                    );
+                    if let Some((_t_idx, _l_idx, _h_rect, body_rect)) = lane_at
+                        && px >= body_rect.x
+                        && px < body_rect.x + body_rect.w
+                    {
+                        // body x range 内 (= lane header 外)、 clip / point / splitter は上で先勝で
+                        // 既に session 起動 (no_session で除外済) なので、 lane body の **真の空き zone**
+                        // で press したことが確定。 lasso session 起動。
+                        let state: &mut ArrangementState = self.widget_state(wid);
+                        state.automation_lasso_drag = Some(AutomationLassoSession {
+                            anchor: (px, py),
+                            last_mouse: (px, py),
+                            start_modifiers: pointer.modifiers,
+                        });
                     }
                 }
             }
@@ -4463,6 +4698,15 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 } else if (px, py) != acd.anchor_mouse {
                     acd.last_mouse = (px, py);
                 }
+            }
+            // M14 Phase 63n-8 (#033): automation_lasso_drag continuation で last_mouse を update。
+            // `start_modifiers` は press 時固定 (= 「lasso 開始時に Shift だったが drag 中に離した」 でも
+            // union 動作、 既存 `DragRectState.start_modifiers` と同 idiom)。 release frame の last_mouse
+            // は release pos が anchor と異なる場合のみ update (clip_drag と同 pattern)。
+            if let Some(ref mut ls) = state.automation_lasso_drag
+                && (!is_release || (px, py) != ls.anchor)
+            {
+                ls.last_mouse = (px, py);
             }
         }
 
@@ -4857,6 +5101,25 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 None
             };
 
+        // M14 Phase 63n-8 (#033): automation_lasso_drag overlay clone + release take。
+        // overlay は drag 中の lasso rect を cached 外で描画 (style.automation_lasso_fill / border)、
+        // release で 1 度だけ `SelectAutomationPoints` を発行 (next 計算は anchor 時の modifier で
+        // replace / union / XOR 分岐)。 `response.automation_lasso_active = session.is_some()` を後で set。
+        let automation_lasso_session: Option<AutomationLassoSession> = {
+            let state: &mut ArrangementState = self.widget_state(wid);
+            state.automation_lasso_drag
+        };
+        let automation_lasso_release: Option<AutomationLassoSession> =
+            if pointer.primary_just_released {
+                let state: &mut ArrangementState = self.widget_state(wid);
+                state.automation_lasso_drag.take()
+            } else {
+                None
+            };
+        if automation_lasso_session.is_some() {
+            response.automation_lasso_active = true;
+        }
+
         // drag overlay delta (last_mouse ベース、release と一貫)。
         // M14 Phase 63j (#024): `beat_per_px` / `zoom_x_px_per_beat` は関数頭で計算済 (press 振り分けの
         // playhead seek snap でも使うため)。 ここでは shadow せず再利用する。
@@ -5067,6 +5330,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // ghost rect は drag 中の preview (新位置 / 新長さ、 cross-lane drop なら新 lane の body 内) を
         // cached 外で重ねる。 base 描画 (cached 内) も同 frame 表示されるが、 ghost が上に重なる。
         let automation_clip_drag_overlay = automation_clip_drag_session;
+        // M14 Phase 63n-8 (#033): selected automation points (overlay 描画用、 cached 外で selected 点だけ
+        // 白色 + 大 dot で上書き)。 cached layer の base draw は selection 不問の grey dot を描く、 overlay は
+        // selection の差分のみを上書きする (= `data_generation` bump なしで selection 変化が反映される、
+        // piano_roll の selection overlay と同 idiom)。
+        let selected_automation_points_for_heavy: HashSet<AutomationPointKey> =
+            selected_automation_points.iter().copied().collect();
+        // M14 Phase 63n-8 (#033): lasso session の overlay clone (cached 外で lasso rect を描画)。
+        let lasso_overlay = automation_lasso_session;
         // M9 Phase 45f: drag overlay の Resize min_len は snap unit (snap_unit < 0.05 なら 0.05)。
         // release 側 min_len と一貫させるため、 alt 真値は drag session の `last_alt` を使う
         // (overlay と release commit が必ず同一 unit で確定する)。 overlay 不在時 (drag していない)
@@ -5461,6 +5732,101 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     }
                 }
             }
+            // M14 Phase 63n-8 (#033): selected automation points overlay (cached 外、 selection 変化のみで
+            // 全 lane 再キャッシュは走らない設計)。 base draw (cached 内) は selection 不問の通常 dot を
+            // 描く、 ここで selected な点だけを白色 + 大 dot で上書き (= base dot を完全に覆って差し替え)。
+            // 描画式は `draw_automation_lane` の point dot と同 SSoT (`body_origin_x + abs_beat * beat_to_px`、
+            // `clip_y + (1 - value_norm) * clip_h`)、 collapsed track / invisible lane は skip。
+            if !selected_automation_points_for_heavy.is_empty() {
+                let beat_to_px = f64::from(lanes.w) / view_copy.len_beats.max(1e-6);
+                let r_sel = style_copy.automation_point_radius_selected_px;
+                let pad = style_copy.automation_clip_v_pad_px;
+                for (i, t) in tracks_owned.iter().enumerate() {
+                    if t.automation_lanes_collapsed || t.automation_lanes.is_empty() {
+                        continue;
+                    }
+                    let row_top = tops_owned_for_heavy[i];
+                    let row_total_bottom = tops_owned_for_heavy[i + 1];
+                    if row_total_bottom < lanes.y || row_top > lanes.y + lanes.h {
+                        continue;
+                    }
+                    let mut lane_y =
+                        row_top + effective_track_row_h(t, view_copy.track_row_h);
+                    for lane in &t.automation_lanes {
+                        if !lane.visible {
+                            continue;
+                        }
+                        let lh = f32::from(lane.height_px);
+                        if lane_y + lh < lanes.y || lane_y > lanes.y + lanes.h {
+                            lane_y += lh;
+                            continue;
+                        }
+                        let clip_y = lane_y + pad;
+                        let clip_h = (lh - pad * 2.0).max(2.0);
+                        for c in &lane.clips {
+                            for (p_idx, p) in c.points.iter().enumerate() {
+                                #[allow(clippy::cast_possible_truncation)]
+                                let key = AutomationPointKey {
+                                    clip: AutomationClipKey {
+                                        track: t.id,
+                                        lane: lane.id,
+                                        clip: c.id,
+                                    },
+                                    point_idx: p_idx as u32,
+                                };
+                                if !selected_automation_points_for_heavy.contains(&key) {
+                                    continue;
+                                }
+                                let abs_beat = c.start_beat + p.time_beat;
+                                #[allow(clippy::cast_possible_truncation)]
+                                let px = lanes.x
+                                    + ((abs_beat - view_copy.start_beat) * beat_to_px) as f32;
+                                let py =
+                                    clip_y + (1.0 - p.value_norm.clamp(0.0, 1.0)) * clip_h;
+                                hctx.push_rect(RectCommand {
+                                    rect: Rect {
+                                        x: px - r_sel,
+                                        y: py - r_sel,
+                                        w: r_sel * 2.0,
+                                        h: r_sel * 2.0,
+                                    },
+                                    fill: style_copy.automation_point_selected_fill,
+                                    border: style_copy.automation_point_selected_border,
+                                    border_width: 1.5,
+                                    radius: [r_sel; 4],
+                                    clip_rect: Some(Rect {
+                                        x: lanes.x,
+                                        y: lane_y,
+                                        w: lanes.w,
+                                        h: lh,
+                                    }),
+                                });
+                            }
+                        }
+                        lane_y += lh;
+                    }
+                }
+            }
+            // M14 Phase 63n-8 (#033): lasso 矩形 overlay (drag 中のみ、 cached 外で半透明 cyan 系を描画)。
+            // anchor から last_mouse の bounding rect を style.automation_lasso_fill / border で 1 度描画。
+            // press と release が同 frame で起きる超短 click の場合、 session は release frame で take 済
+            // = `lasso_overlay = None` で overlay 不描画 (= 即時消失、 user 視点で「click だけ」 と認識される)。
+            if let Some(ls) = lasso_overlay {
+                let rect = Rect {
+                    x: ls.anchor.0.min(ls.last_mouse.0),
+                    y: ls.anchor.1.min(ls.last_mouse.1),
+                    w: (ls.anchor.0 - ls.last_mouse.0).abs(),
+                    h: (ls.anchor.1 - ls.last_mouse.1).abs(),
+                };
+                hctx.push_rect(RectCommand {
+                    rect,
+                    fill: style_copy.automation_lasso_fill,
+                    border: style_copy.automation_lasso_border,
+                    border_width: 1.0,
+                    radius: [0.0; 4],
+                    clip_rect: Some(lanes),
+                });
+            }
             // loop band: drag preview がある場合は preview を描く、無ければ view.loop_range
             if let Some(range) = loop_preview_clone.or(view_copy.loop_range) {
                 draw_loop_band(hctx, range, view_copy, ruler, &style_copy);
@@ -5688,11 +6054,26 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
-        // ---- M14 Phase 63n-2 (#028): automation_point_drag release → MoveAutomationPoints ----
-        // commit-by-release: 4px jitter 閾値で短 click 化 (= release で何も発火しない、 click 相当)。
-        // anchor からの delta が閾値未満なら no-op (point の selection 等は仕様外で変化しない)。
-        // alt は drag session の `last_alt` を真値とし、 `pointer.modifiers.alt` を直接見ない
-        // (clip_drag と同じ pattern: ModifiersChanged が MouseInput より先に届く race を回避)。
+        // ---- M14 Phase 63n-2 / 63n-8 (#028 / #033): automation_point_drag release ----
+        // 旧 Phase 63n-2: 4px jitter 閾値で短 click → no-op (selection 変化なし)。
+        // M14 Phase 63n-8 (#033): 短 click は **`SelectAutomationPoints`** に化け、 long drag (>=4px)
+        // は selection に含まれていれば **全 selected 点を batch move**、 含まれなければ単独 move。
+        //
+        // 短 click 仕様 (#033 §C):
+        //   - 修飾なし + drag<4px → `next = vec![pressed]` (single select、 旧 selection 破棄)
+        //   - Shift / Ctrl + drag<4px → `next = prev XOR vec![pressed]` (toggle)
+        //   - Alt + click は既に上の press block で `DeleteAutomationPoints` 即時発火済 (= ここに来ない)
+        //
+        // long drag 仕様 (#033 §E):
+        //   - pressed point が `selected_automation_points` に含まれる → 全 selected の `MoveAutomationPointDelta`
+        //     を 1 vec で発行 (各 delta の prev は **release 時点の caller データ** から再 lookup、 next は
+        //     pressed point の anchor 位置を round して算出した adjusted_dt を適用)
+        //   - 含まれない → 単独 move (旧挙動互換、 selection は変化しない)
+        //
+        // **absolute 位置 snap** (CLAUDE.md「drag 系 widget の snap」 と同 idiom): anchor の絶対 beat
+        // (`clip_start + anchor_time` ) に raw_dt を足して `snap_beat` で round、 差分 `adjusted_dt`
+        // を全 anchor に適用。 これで (a) 単一 / 多重で grid 吸着挙動が一致、 (b) anchor が grid 外でも
+        // 最終位置 grid に着地。 alt は session の `last_alt` を真値 (race 回避)。
         if let Some(ad) = point_drag_release {
             let dx = ad.last_mouse.0 - ad.anchor_mouse.0;
             let dy = ad.last_mouse.1 - ad.anchor_mouse.1;
@@ -5705,25 +6086,124 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let raw_abs = ad.clip_start_beat + ad.anchor_time_beat + raw_dt;
                 let snapped_abs =
                     view.snap.snap_beat(raw_abs, ad.last_alt, zoom_x_px_per_beat);
-                let next_local =
-                    (snapped_abs - ad.clip_start_beat).clamp(0.0, ad.clip_len_beats.max(0.0));
-                let next_value = (ad.anchor_value_norm
-                    - dy / ad.clip_rect_anchor.h.max(1.0))
-                .clamp(0.0, 1.0);
-                if (next_local - ad.anchor_time_beat).abs() > 1e-9
-                    || (next_value - ad.anchor_value_norm).abs() > 1e-6
-                {
-                    let delta = MoveAutomationPointDelta {
-                        point: ad.point,
-                        prev_time_beat: ad.anchor_time_beat,
-                        prev_value_norm: ad.anchor_value_norm,
-                        next_time_beat: next_local,
-                        next_value_norm: next_value,
+                let adjusted_dt = snapped_abs - (ad.clip_start_beat + ad.anchor_time_beat);
+                let dv = -dy / ad.clip_rect_anchor.h.max(1.0);
+                // pressed が selection に含まれていれば multi、 そうでなければ single
+                let drag_set: Vec<AutomationPointKey> =
+                    if selected_automation_points.contains(&ad.point) {
+                        selected_automation_points.to_vec()
+                    } else {
+                        vec![ad.point]
                     };
+                let mut deltas: Vec<MoveAutomationPointDelta> = Vec::new();
+                for key in &drag_set {
+                    // release 時の caller データから anchor を再 lookup (drag 中は Edit 流れないので
+                    // model 不変、 visible_tracks がそのまま使える)。
+                    if let Some((t_b, v_n, _c_start, c_len)) =
+                        find_automation_point_data(&visible_tracks, *key)
+                    {
+                        let next_t = (t_b + adjusted_dt).clamp(0.0, c_len.max(0.0));
+                        let next_v = (v_n + dv).clamp(0.0, 1.0);
+                        if (next_t - t_b).abs() > 1e-9 || (next_v - v_n).abs() > 1e-6 {
+                            deltas.push(MoveAutomationPointDelta {
+                                point: *key,
+                                prev_time_beat: t_b,
+                                prev_value_norm: v_n,
+                                next_time_beat: next_t,
+                                next_value_norm: next_v,
+                            });
+                        }
+                    }
+                }
+                if !deltas.is_empty() {
                     self.push_edit(make_edit(ArrangementEditRequest::MoveAutomationPoints(
-                        vec![delta],
+                        deltas,
                     )));
                 }
+            } else if !ad.last_alt {
+                // 短 click (drag < 4px) → SelectAutomationPoints。 Alt は上 press block で delete 済なので
+                // ここで Alt 真値の path は来ない前提だが、 防衛的に `!ad.last_alt` で除外する。
+                let press_shift = ad.start_modifiers.shift;
+                let press_ctrl = ad.start_modifiers.ctrl;
+                let prev = selected_automation_points.to_vec();
+                let next: Vec<AutomationPointKey> = if press_shift || press_ctrl {
+                    // toggle: prev XOR {pressed}
+                    toggle_selection(&prev, ad.point)
+                } else {
+                    // replace: vec![pressed] (pressed が既に唯一の selection なら同値 → no-op)
+                    vec![ad.point]
+                };
+                if next != prev {
+                    self.push_edit(make_edit(
+                        ArrangementEditRequest::SelectAutomationPoints { prev, next },
+                    ));
+                    response.selection_changed = true;
+                }
+            }
+        }
+
+        // ---- M14 Phase 63n-8 (#033): automation_lasso_drag release → SelectAutomationPoints ----
+        // 空き lane zone で press → drag → release で発火。 next 計算は **press 時 modifier** で分岐:
+        // - 修飾なし → replace (next = lasso 内 points、 旧 selection 破棄)
+        // - Shift   → union  (next = prev ∪ lasso 内 points)
+        // - Ctrl    → XOR    (next = prev XOR lasso 内 points = toggle inclusion)
+        //
+        // **dist < 4px の空き click 短 click 化**:
+        // - 修飾なし → `next = vec![]` (clear、 空き click = selection clear、 既存 MIDI lanes_click と同 UX)
+        // - Shift / Ctrl → no-op (selection 維持、 = 誤クリック保護)
+        //
+        // 「lasso rect 内に point の **中心** が含まれる」 を hit 判定 (#033 §C 仕様)。 visible_tracks
+        // ベースで collapsed / invisible lane は対象外 (= 既存 `automation_point_at` の visible scope と整合)。
+        if let Some(ls) = automation_lasso_release {
+            let abs_w = (ls.last_mouse.0 - ls.anchor.0).abs();
+            let abs_h = (ls.last_mouse.1 - ls.anchor.1).abs();
+            let dist_lasso = abs_w + abs_h;
+            let lasso_rect = Rect {
+                x: ls.anchor.0.min(ls.last_mouse.0),
+                y: ls.anchor.1.min(ls.last_mouse.1),
+                w: abs_w,
+                h: abs_h,
+            };
+            let prev = selected_automation_points.to_vec();
+            let next: Vec<AutomationPointKey> = if dist_lasso < 4.0 {
+                // 空き短 click — 修飾なしで clear、 Shift / Ctrl は no-op
+                if ls.start_modifiers.shift || ls.start_modifiers.ctrl {
+                    prev.clone()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                // lasso の点中心 hit 判定 (visible_tracks + visible lane scope)
+                let inside =
+                    collect_points_in_rect(&visible_tracks, &press_tops, view, lanes, lasso_rect);
+                if ls.start_modifiers.shift {
+                    // union (prev order を保持 + lasso 由来の新規だけ append)
+                    let mut out = prev.clone();
+                    for k in inside {
+                        if !out.contains(&k) {
+                            out.push(k);
+                        }
+                    }
+                    out
+                } else if ls.start_modifiers.ctrl {
+                    // XOR (toggle inclusion): prev に在って lasso にも在る点を除く + prev に無くて lasso に在る点を追加
+                    let mut out: Vec<AutomationPointKey> =
+                        prev.iter().copied().filter(|k| !inside.contains(k)).collect();
+                    for k in inside {
+                        if !prev.contains(&k) {
+                            out.push(k);
+                        }
+                    }
+                    out
+                } else {
+                    inside // replace
+                }
+            };
+            if next != prev {
+                self.push_edit(make_edit(
+                    ArrangementEditRequest::SelectAutomationPoints { prev, next },
+                ));
+                response.selection_changed = true;
             }
         }
 
@@ -5993,6 +6473,26 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         //   - ここで rect select 起動 → cyan overlay 描画 + release 時 `SelectClips` push
         //   両方走って `CloneClipsIndependent` の後 `SelectClips` で selection が上書きされ、
         //   user 視点「rect select に化けて clone が起きない」 症状になる。
+        // M14 Phase 63n-8 (#033): **automation lane 内 press の Shift+drag は lasso 専用** (Q2=A の
+        // zone 排他)、 MIDI rect_select は **MIDI/Audio track row のみ** で起動する。 press が automation
+        // lane 内なら shift_press を false にして session 起動を抑制 — lasso session は上の press 振り分け
+        // で既に立っているので、 こちらは抑止だけで OK。 `press_in_automation_lane` は press frame のみ
+        // 評価する (continuation / release は session で追跡)、 `automation_lane_at` の y 判定で十分。
+        let press_in_automation_lane = pointer.primary_just_pressed
+            && pointer.pos.is_some_and(|(_, py)| {
+                automation_lane_at(
+                    &visible_tracks,
+                    &press_tops,
+                    view.track_row_h,
+                    header_pane.x,
+                    header_pane.w,
+                    lanes.x,
+                    lanes.w,
+                    style,
+                    py,
+                )
+                .is_some()
+            });
         let drag_rect_wid = wid.child(b"rect_select");
         let shift_rect_active = {
             let state: &mut crate::widgets::drag_rect::DragRectState =
@@ -6001,7 +6501,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         };
         let shift_press = pointer.primary_just_pressed
             && pointer.modifiers.shift
-            && !pointer.modifiers.ctrl;
+            && !pointer.modifiers.ctrl
+            && !press_in_automation_lane;
         if (shift_press || shift_rect_active)
             && let Some(drag) = self.take_drag_rect_in_rect(drag_rect_wid, lanes)
         {
@@ -7095,6 +7596,7 @@ mod tests {
                     &[],
                     &[],
                     &[],
+                    &[],
                     &style,
                     |_| Edit::mutate(|_: &mut Model| {}),
                 );
@@ -7156,6 +7658,7 @@ mod tests {
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &m.tracks,
                     m.view,
+                    &[],
                     &[],
                     &[],
                     &[],
@@ -7221,6 +7724,7 @@ mod tests {
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &m.tracks,
                     m.view,
+                    &[],
                     &[],
                     &[],
                     &[],
@@ -7428,6 +7932,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 &style,
                 move |req| match req {
                     ArrangementEditRequest::SetTrackRowH(h) => {
@@ -7509,6 +8014,7 @@ mod tests {
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &tracks,
                 view,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -7865,6 +8371,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 &style,
                 move |req| {
                     if let ArrangementEditRequest::SetPlayheadBeat(b) = req {
@@ -7925,6 +8432,7 @@ mod tests {
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
                 m.view,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -7998,6 +8506,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 &style,
                 move |req| {
                     if let ArrangementEditRequest::SetPlayheadBeat(b) = req {
@@ -8058,6 +8567,7 @@ mod tests {
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &m.tracks,
                     m.view,
+                    &[],
                     &[],
                     &[],
                     &[],
@@ -8321,6 +8831,7 @@ mod tests {
                     &[],
                     &[],
                     &[],
+                    &[],
                     &style,
                     move |req| {
                         if let ArrangementEditRequest::SetLoopRange { start, end } = req {
@@ -8441,6 +8952,7 @@ mod tests {
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
                 m.view,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -8887,6 +9399,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 &style,
                 move |req| {
                     if let ArrangementEditRequest::SetClipGainDb(deltas) = &req {
@@ -8922,6 +9435,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 &style,
                 move |req| {
                     if let ArrangementEditRequest::SetClipGainDb(deltas) = &req {
@@ -8954,6 +9468,7 @@ mod tests {
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
                 m.view,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -9039,6 +9554,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 &style,
                 move |req| {
                     match &req {
@@ -9084,6 +9600,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 &style,
                 move |req| {
                     match &req {
@@ -9126,6 +9643,7 @@ mod tests {
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
                 m.view,
+                &[],
                 &[],
                 &[],
                 &[],

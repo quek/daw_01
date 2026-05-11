@@ -42,6 +42,13 @@ struct ObsModel {
     /// (per-frame 全列、 (track_id, height_px) の tuple)。 caller として該当 track の `row_h = Some(h)`
     /// を mutate するため `tracks` 自身が live preview の SSoT。
     row_heights: Vec<(u32, u16)>,
+    /// M14 Phase 63n-8 (#033): point selection の永続 SSoT (widget へ毎 frame 渡す、 SelectAutomationPoints
+    /// 受信時に `selected_points = next` で上書き)。 lasso test では事前に push、 short click test では空。
+    selected_points: Vec<AutomationPointKey>,
+    /// M14 Phase 63n-8 (#033): 観測した `SelectAutomationPoints` の (prev, next) 列。
+    select_points_events: Vec<(Vec<AutomationPointKey>, Vec<AutomationPointKey>)>,
+    /// M14 Phase 63n-8 (#033): 観測した `automation_lasso_active` (drag 中 true)。
+    lasso_active_frames: Vec<bool>,
 }
 
 fn make_lane(id: u32, enabled: bool) -> ArrangementAutomationLane {
@@ -137,6 +144,7 @@ fn pointer_release(x: f32, y: f32, modifiers: Modifiers) -> PointerFrame {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_arrangement_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: FrameInput) {
     let mut scene = Scene::new();
     let screen = PhysicalSize {
@@ -154,6 +162,7 @@ fn run_arrangement_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: F
             &[],
             &[],
             &[],
+            &model.selected_points,
             &style,
             |req| match req {
                 ArrangementEditRequest::SetLaneEnabled { lane, enabled } => {
@@ -228,13 +237,22 @@ fn run_arrangement_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: F
                         }
                     })
                 }
+                // M14 Phase 63n-8 (#033): SelectAutomationPoints 観測 + selected_points 更新 (= caller idiom)。
+                ArrangementEditRequest::SelectAutomationPoints { prev, next } => {
+                    Edit::mutate(move |mm: &mut ObsModel| {
+                        mm.select_points_events.push((prev, next.clone()));
+                        mm.selected_points = next;
+                    })
+                }
                 _ => Edit::mutate(|_| {}),
             },
         );
         // automation_point_rects を観測 (毎 frame、 caller が context_menu_for で popup anchor 用に使う)
         let rects = resp.automation_point_rects.clone();
+        let lasso_active = resp.automation_lasso_active;
         ui.push_edit(Edit::mutate(move |mm: &mut ObsModel| {
             mm.point_rects = rects;
+            mm.lasso_active_frames.push(lasso_active);
         }));
     });
 }
@@ -865,4 +883,337 @@ fn invisible_lane_point_is_not_hit_tested() {
         &tracks, &tops, view.track_row_h, view, 0.0, view.header_w, lanes, cx, cy, &style,
     );
     assert!(hit.is_none(), "invisible lane の point は hit しない");
+}
+
+// ============================================================
+// M14 Phase 63n-8 (#033): lasso + selection visual + multi-select drag
+// ============================================================
+
+/// lasso 試験用 lane: 短い clip (4..10 beat) + 3 points (abs 4, 6, 9)。 clip 前後に空き zone がある。
+/// - 空き zone 前: x = 200..350 (= beat 0..4)
+/// - clip 内: x = 350..575 (= beat 4..10)
+/// - 空き zone 後: x = 575..800 (= beat 10..16)
+/// - point 中心 x: 350 (idx 0, abs 4)、 425 (idx 1, abs 6)、 537.5 (idx 2, abs 9)
+/// - point 中心 y: 47.6 (val 0.8)、 71.6 (val 0.3)、 57.2 (val 0.6) — make_lane と同 value 構成
+fn make_lasso_lane(id: u32) -> ArrangementAutomationLane {
+    ArrangementAutomationLane {
+        id,
+        label: Arc::from(format!("Lane{id}")),
+        icon_glyph: 'V',
+        color: Color::rgb(0.55, 0.85, 1.0),
+        enabled: true,
+        visible: true,
+        height_px: 60,
+        default_value_norm: 0.5,
+        clips: vec![ArrangementAutomationClip {
+            id: 100,
+            start_beat: 4.0,
+            len_beats: 6.0,
+            name: Arc::from("clip"),
+            points: vec![
+                ArrangementAutomationPoint {
+                    time_beat: 0.0,
+                    value_norm: 0.8,
+                    curve: ArrangementCurveKind::Linear,
+                },
+                ArrangementAutomationPoint {
+                    time_beat: 2.0,
+                    value_norm: 0.3,
+                    curve: ArrangementCurveKind::Linear,
+                },
+                ArrangementAutomationPoint {
+                    time_beat: 5.0,
+                    value_norm: 0.6,
+                    curve: ArrangementCurveKind::Bezier { tension: 0.0 },
+                },
+            ],
+            share_group_color: None,
+        }],
+    }
+}
+
+/// 空き lane zone から drag → release で `SelectAutomationPoints` を発火する。
+/// 修飾なし lasso → next = lasso 内 points (replace)。
+///
+/// `make_lasso_lane`: 空き zone (x>575、 beat>10) で drag 開始、 clip 内まで戻して point 2 (x=537.5) を拾う。
+#[test]
+fn lasso_empty_zone_drag_emits_select_automation_points() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lasso_lane(10)])];
+
+    // press at (600, 50) = clip 後の空き zone (clip ends at x=575)、 point 上ではない
+    let press = pointer_press(600.0, 50.0, Modifiers::empty());
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: press,
+        ..FrameInput::default()
+    });
+    // drag continuation で session を維持、 clip 内まで戻して point 2 (537.5, 57.2) を拾う
+    let cont = PointerFrame {
+        pos: Some((500.0, 80.0)),
+        primary_pressed: true,
+        modifiers: Modifiers::empty(),
+        ..PointerFrame::default()
+    };
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: cont,
+        ..FrameInput::default()
+    });
+    // release at (500, 80) — lasso rect は (500, 50, 100, 30)、 point 2 (537.5, 57.2) が中に入る
+    let release = pointer_release(500.0, 80.0, Modifiers::empty());
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: release,
+        ..FrameInput::default()
+    });
+
+    assert_eq!(
+        m.select_points_events.len(),
+        1,
+        "lasso release で SelectAutomationPoints 1 件: events={:?}",
+        m.select_points_events
+    );
+    let (prev, next) = &m.select_points_events[0];
+    assert!(prev.is_empty(), "prev は空");
+    assert_eq!(next.len(), 1, "lasso 内に point 2 が含まれる: {next:?}");
+    assert_eq!(
+        next[0],
+        AutomationPointKey {
+            clip: AutomationClipKey { track: 1, lane: 10, clip: 100 },
+            point_idx: 2,
+        }
+    );
+}
+
+/// Shift+lasso → next = prev ∪ lasso 内 points (union)、 旧 selection は保持。
+#[test]
+fn lasso_with_shift_unions_selection() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lasso_lane(10)])];
+    // 事前に point 0 を選択済として渡す
+    m.selected_points = vec![AutomationPointKey {
+        clip: AutomationClipKey { track: 1, lane: 10, clip: 100 },
+        point_idx: 0,
+    }];
+
+    let shift = Modifiers { shift: true, ..Modifiers::empty() };
+    let press = pointer_press(600.0, 50.0, shift);
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: press,
+        ..FrameInput::default()
+    });
+    let release = pointer_release(500.0, 80.0, shift);
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: release,
+        ..FrameInput::default()
+    });
+
+    assert_eq!(m.select_points_events.len(), 1, "Shift+lasso で 1 件発火");
+    let (_prev, next) = &m.select_points_events[0];
+    assert_eq!(next.len(), 2, "prev (point 0) ∪ lasso (point 2): {next:?}");
+    assert!(
+        next.contains(&AutomationPointKey {
+            clip: AutomationClipKey { track: 1, lane: 10, clip: 100 },
+            point_idx: 0
+        }) && next.contains(&AutomationPointKey {
+            clip: AutomationClipKey { track: 1, lane: 10, clip: 100 },
+            point_idx: 2
+        }),
+        "union に point 0 と point 2 が含まれる: {next:?}"
+    );
+}
+
+/// Ctrl+lasso → next = prev XOR lasso (toggle)、 lasso 内で prev に在った点は除外。
+#[test]
+fn lasso_with_ctrl_toggles_selection() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lasso_lane(10)])];
+    // 事前に point 2 を選択済 (lasso が拾う予定の点)
+    m.selected_points = vec![AutomationPointKey {
+        clip: AutomationClipKey { track: 1, lane: 10, clip: 100 },
+        point_idx: 2,
+    }];
+
+    let ctrl = Modifiers { ctrl: true, ..Modifiers::empty() };
+    let press = pointer_press(600.0, 50.0, ctrl);
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: press,
+        ..FrameInput::default()
+    });
+    let release = pointer_release(500.0, 80.0, ctrl);
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: release,
+        ..FrameInput::default()
+    });
+
+    assert_eq!(m.select_points_events.len(), 1, "Ctrl+lasso で 1 件発火");
+    let (_prev, next) = &m.select_points_events[0];
+    assert!(next.is_empty(), "XOR で point 2 が除外され空: {next:?}");
+}
+
+/// point 上の短 click (drag<4px) で `SelectAutomationPoints` を single select として発火。
+#[test]
+fn short_click_on_point_replaces_selection() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lane(10, true)])];
+
+    let press = pointer_press(350.0, 71.6, Modifiers::empty());
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: press,
+        ..FrameInput::default()
+    });
+    // release at almost same point (drag<4px)
+    let release = pointer_release(351.0, 72.0, Modifiers::empty());
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: release,
+        ..FrameInput::default()
+    });
+
+    assert!(
+        m.moved_points.is_empty(),
+        "短 click で MoveAutomationPoints は発火しない"
+    );
+    assert_eq!(
+        m.select_points_events.len(),
+        1,
+        "短 click で SelectAutomationPoints 1 件"
+    );
+    let (prev, next) = &m.select_points_events[0];
+    assert!(prev.is_empty(), "prev 空");
+    assert_eq!(next.len(), 1, "single select");
+    assert_eq!(next[0].point_idx, 1);
+}
+
+/// Shift+短 click on point → toggle (XOR)、 prev に在った点を除く。
+#[test]
+fn short_click_on_point_with_shift_toggles_selection() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lane(10, true)])];
+    m.selected_points = vec![AutomationPointKey {
+        clip: AutomationClipKey { track: 1, lane: 10, clip: 100 },
+        point_idx: 1,
+    }];
+
+    let press = pointer_press(350.0, 71.6, Modifiers { shift: true, ..Modifiers::empty() });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: press,
+        ..FrameInput::default()
+    });
+    let release = pointer_release(351.0, 72.0, Modifiers { shift: true, ..Modifiers::empty() });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: release,
+        ..FrameInput::default()
+    });
+
+    assert_eq!(m.select_points_events.len(), 1);
+    let (_prev, next) = &m.select_points_events[0];
+    assert!(next.is_empty(), "Shift+短 click で point 1 が除外され空");
+}
+
+/// 空き zone の短 click (drag<4px、 修飾なし) → selection clear (next = vec![])。
+#[test]
+fn short_click_on_empty_clears_selection() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lasso_lane(10)])];
+    m.selected_points = vec![AutomationPointKey {
+        clip: AutomationClipKey { track: 1, lane: 10, clip: 100 },
+        point_idx: 2,
+    }];
+
+    // 空き zone (clip 後ろの empty zone)
+    let press = pointer_press(600.0, 50.0, Modifiers::empty());
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: press,
+        ..FrameInput::default()
+    });
+    let release = pointer_release(601.0, 51.0, Modifiers::empty());
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: release,
+        ..FrameInput::default()
+    });
+
+    assert_eq!(m.select_points_events.len(), 1);
+    let (_prev, next) = &m.select_points_events[0];
+    assert!(next.is_empty(), "空き短 click で clear: {next:?}");
+}
+
+/// 複数選択中の 1 point を drag → 全 selected 点が同 delta で move。
+#[test]
+fn multi_select_drag_moves_all_selected_points() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lane(10, true)])];
+    // point 0 と point 1 の 2 つを選択済として渡す
+    m.selected_points = vec![
+        AutomationPointKey {
+            clip: AutomationClipKey { track: 1, lane: 10, clip: 100 },
+            point_idx: 0,
+        },
+        AutomationPointKey {
+            clip: AutomationClipKey { track: 1, lane: 10, clip: 100 },
+            point_idx: 1,
+        },
+    ];
+
+    // press at point[1] (350, 71.6)、 drag +30px / -10px
+    let press = pointer_press(350.0, 71.6, Modifiers::empty());
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: press,
+        ..FrameInput::default()
+    });
+    let release = pointer_release(380.0, 61.6, Modifiers::empty());
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: release,
+        ..FrameInput::default()
+    });
+
+    // 2 deltas 期待 (= multi-select drag、 selected 2 件分)
+    assert_eq!(
+        m.moved_points.len(),
+        2,
+        "multi-select drag で 2 deltas: got {:?}",
+        m.moved_points
+    );
+    // 各 delta の x/y delta が同じ (= 同 (adjusted_dt, dv) で全選択が動く)
+    let dt_0 = m.moved_points[0].next_time_beat - m.moved_points[0].prev_time_beat;
+    let dt_1 = m.moved_points[1].next_time_beat - m.moved_points[1].prev_time_beat;
+    assert!((dt_0 - dt_1).abs() < 1e-6, "全選択点で同 dt: {dt_0} vs {dt_1}");
+}
+
+/// drag 中は `response.automation_lasso_active = true` (release frame までは active)。
+#[test]
+fn lasso_active_flag_set_during_drag() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lasso_lane(10)])];
+
+    // press 空き zone
+    let press = pointer_press(600.0, 50.0, Modifiers::empty());
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: press,
+        ..FrameInput::default()
+    });
+    // continuation frame
+    let cont = PointerFrame {
+        pos: Some((550.0, 60.0)),
+        primary_pressed: true,
+        modifiers: Modifiers::empty(),
+        ..PointerFrame::default()
+    };
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: cont,
+        ..FrameInput::default()
+    });
+
+    // press frame と continuation frame の 2 回、 lasso_active = true が観測される
+    // (press frame は automation_lasso_session が Some なので true、 continuation も同様)
+    assert!(
+        m.lasso_active_frames.iter().filter(|&&a| a).count() >= 2,
+        "press + continuation で active=true が 2 回以上観測される: {:?}",
+        m.lasso_active_frames
+    );
 }

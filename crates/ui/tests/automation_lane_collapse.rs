@@ -130,6 +130,7 @@ fn run_arrangement_frame(
             &[],
             &[],
             &[],
+            &[],
             &style,
             |req| match req {
                 ArrangementEditRequest::ToggleTrackAutomationCollapsed { track } => {
