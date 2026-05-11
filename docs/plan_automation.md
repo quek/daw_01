@@ -957,15 +957,38 @@ C-2 で行う (= sync 頻度を減らす最適化)。
 - [x] worker pool 経路: `DispatchShared.recording_lanes_ptr` を追加し、
       `dispatch_and_wait` で master が ptr を store、 worker が
       `load(Acquire)` で deref → `process_track_owned` に渡す
-- [ ] CLAP plugin GUI gesture END IPC (Phase 2c follow-up) と組み合わせて
-      plugin param の audio bypass にも対応 (= Step C-3 と同期に作業)
+- [x] CLAP plugin GUI gesture END IPC (Step C-3 で同時 landing、 下記参照)
 
-##### Step C-3: plugin param recording (deferred)
+##### Step C-3: plugin param recording ✅ (2026-05-11)
 
-- [ ] `PluginParam` target の `current_plain_value` を `plugin_params` cache
-      + `PluginParamValueChangedFromChild` (Phase 2c) から取得
-- [ ] plugin GUI の knob 操作 → `PluginParamValueChangedFromChild` →
-      上記の current_plain_value 解決経路を経て recording に乗る
+CLAP plugin GUI 経由の gesture recording を mixer knob と同経路に統一。
+
+- [x] CLAP `CLAP_EVENT_PARAM_GESTURE_END` 用 OutEventCollector field
+      `param_releases: *mut Vec<u32>` を追加、 try_push handler で
+      gesture_end 受信時に push (ClapPlugin.collected_out_param_releases)
+- [x] `LoadedPlugin trait` に `drain_out_param_releases_into` を default no-op
+      で追加、 ClapPlugin impl で本実装
+- [x] `process_server::process_loop` で param_touches / values と同列に
+      param_releases を drain、 `PluginEvent::PluginParamGestureEnd` を emit
+- [x] `ChildToMain::PluginParamGestureEnd { track, slot, param_id }` IPC
+      variant 追加、 plugin-host main.rs の `From<PluginEvent>` で変換
+- [x] daw_gui main.rs IPC handler で `AppEvent::PluginParamGestureEndFromChild`
+      に変換 (handle_event 経由)
+- [x] AppData.plugin_param_values: HashMap<(u32, PluginSlot, u32), f64>
+      cache 追加 (= plugin GUI knob の最新 plain 値)
+- [x] `PluginParamValueChangedFromChild` handler で plugin_param_values を
+      更新 (= 旧 no-op を埋める)
+- [x] `PluginParamTouchedFromChild` handler を `ParamGestureBegin` 自己発火 に
+      変更 (= last_touched_param 更新 + active/latched 反映 + audio bypass
+      sync が mixer knob と完全同経路)
+- [x] `PluginParamGestureEndFromChild` handler を `ParamGestureEnd` 自己発火 に
+      (= mixer release と同経路)
+- [x] `current_plain_value(PluginParam)` を plugin_param_values cache から
+      lookup する実装に
+- [ ] **smoke test (Step C-3)**: CLAP plugin (例 Surge XT) を track に load、
+      A キーで last_touched_param の lane を作成、 lane body 内に clip
+      作成、 Touch mode + Play、 plugin GUI を開いて knob を操作 → 自動で
+      curve に point が刻まれる + audio もリアルタイムに反映される
 
 #### Step D: thinning algorithm ✅ (2026-05-11)
 

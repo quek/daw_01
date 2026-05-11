@@ -110,6 +110,15 @@ pub enum PluginEvent {
         param_id: u32,
         value: f64,
     },
+    /// Phase 4 Step C-3: plugin GUI で knob を release した通知 (CLAP
+    /// PARAM_GESTURE_END out event 経由)。 daw_gui で
+    /// `active_param_gestures` から該当 PluginParam target を remove する。
+    PluginParamGestureEnd {
+        track: u32,
+        slot: PluginSlot,
+        plugin_id: u32,
+        param_id: u32,
+    },
     /// `SetSlotPlugin` の load が失敗した (`load_plugin` Err か
     /// `ProcessDataHandle::create` Err)。 daw_gui の `pending_plugin_loads`
     /// を解放するために emit する。 emit せずに `continue` だけで戻ると
@@ -195,6 +204,16 @@ impl From<PluginEvent> for ChildToMain {
                 slot,
                 param_id,
                 value,
+            },
+            PluginEvent::PluginParamGestureEnd {
+                track,
+                slot,
+                plugin_id: _,
+                param_id,
+            } => ChildToMain::PluginParamGestureEnd {
+                track,
+                slot,
+                param_id,
             },
             PluginEvent::PluginLoadFailed {
                 track,

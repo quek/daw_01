@@ -304,6 +304,9 @@ fn run_worker(
     // evt_tx へ送る。
     let mut out_param_touches: Vec<u32> = Vec::with_capacity(64);
     let mut out_param_values: Vec<(u32, f64)> = Vec::with_capacity(common::process_data::MAX_EVENTS);
+    // Phase 4 Step C-3: PARAM_GESTURE_END collector。 plugin GUI で knob を
+    // release した瞬間に 1 entry。
+    let mut out_param_releases: Vec<u32> = Vec::with_capacity(64);
 
     loop {
         unsafe {
@@ -458,9 +461,14 @@ fn run_worker(
             // floods するケースが出たら別 lock-free queue に切替。
             out_param_touches.clear();
             out_param_values.clear();
+            out_param_releases.clear();
             plugin.drain_out_param_touches_into(&mut out_param_touches);
             plugin.drain_out_param_values_into(&mut out_param_values);
-            if !out_param_touches.is_empty() || !out_param_values.is_empty() {
+            plugin.drain_out_param_releases_into(&mut out_param_releases);
+            if !out_param_touches.is_empty()
+                || !out_param_values.is_empty()
+                || !out_param_releases.is_empty()
+            {
                 let track = entry.track;
                 let slot = entry.slot;
                 for param_id in out_param_touches.drain(..) {
@@ -478,6 +486,14 @@ fn run_worker(
                         plugin_id,
                         param_id,
                         value,
+                    });
+                }
+                for param_id in out_param_releases.drain(..) {
+                    let _ = evt_tx.send(crate::PluginEvent::PluginParamGestureEnd {
+                        track,
+                        slot,
+                        plugin_id,
+                        param_id,
                     });
                 }
             }

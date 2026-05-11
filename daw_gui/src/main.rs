@@ -261,6 +261,15 @@ fn spawn_incoming_bridge(
                     param_id,
                     value,
                 }),
+                ChildToMain::PluginParamGestureEnd {
+                    track,
+                    slot,
+                    param_id,
+                } => Some(AppEvent::PluginParamGestureEndFromChild {
+                    track,
+                    slot,
+                    param_id,
+                }),
             };
             if let Some(event) = event
                 && proxy.send_event(event).is_err()

@@ -17,7 +17,8 @@ use clap_sys::ext::gui::{
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
 use clap_sys::ext::note_ports::{CLAP_EXT_NOTE_PORTS, clap_plugin_note_ports};
 use clap_sys::events::{
-    CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_VALUE, clap_event_param_value,
+    CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_GESTURE_END,
+    CLAP_EVENT_PARAM_VALUE, clap_event_param_value,
 };
 use clap_sys::ext::params::{
     CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_HIDDEN,
@@ -89,6 +90,11 @@ pub struct ClapPlugin {
     /// mode で point 生成 source として使う、 Phase 2 では daw_gui の
     /// last value cache に積むのみ。
     collected_out_param_values: Vec<(u32, f64)>,
+    /// Phase 4 Step C-3 (`docs/plan_automation.md` §6): plugin GUI で knob
+    /// release した瞬間の `CLAP_EVENT_PARAM_GESTURE_END` param_id 列。
+    /// host は drain して `PluginParamGestureEnd` IPC で daw_gui に通知し、
+    /// `active_param_gestures` から該当 PluginParam target を remove する。
+    collected_out_param_releases: Vec<u32>,
     /// `clap_plugin_gui` vtable pointer, looked up once after init.
     /// `None` means the plugin does not declare the gui extension.
     gui_ext: Option<*const clap_plugin_gui>,
@@ -319,6 +325,7 @@ impl ClapPlugin {
             pending_param_events: Vec::with_capacity(256),
             collected_out_param_touches: Vec::with_capacity(64),
             collected_out_param_values: Vec::with_capacity(256),
+            collected_out_param_releases: Vec::with_capacity(64),
             collected_out_notes: Vec::with_capacity(256),
             gui_ext,
             gui_created: false,
@@ -616,6 +623,13 @@ impl ClapPlugin {
         out.append(&mut self.collected_out_param_values);
     }
 
+    /// Phase 4 Step C-3: drain plugin-emitted gesture releases
+    /// (PARAM_GESTURE_END) into `out`。 daw_gui で
+    /// `active_param_gestures` から該当 PluginParam target を remove する。
+    pub fn drain_out_param_releases_into(&mut self, out: &mut Vec<u32>) {
+        out.append(&mut self.collected_out_param_releases);
+    }
+
     pub fn start_processing(&mut self) -> Result<()> {
         anyhow::ensure!(self.active, "plugin not active");
         anyhow::ensure!(!self.processing, "plugin already processing");
@@ -806,10 +820,12 @@ impl ClapPlugin {
         // 渡す。 plugin.process() 中だけ存続するローカル変数。
         self.collected_out_param_touches.clear();
         self.collected_out_param_values.clear();
+        self.collected_out_param_releases.clear();
         let mut out_collector = OutEventCollector {
             notes: std::ptr::from_mut(&mut self.collected_out_notes),
             param_touches: std::ptr::from_mut(&mut self.collected_out_param_touches),
             param_values: std::ptr::from_mut(&mut self.collected_out_param_values),
+            param_releases: std::ptr::from_mut(&mut self.collected_out_param_releases),
         };
         let out_events = clap_output_events {
             ctx: std::ptr::from_mut(&mut out_collector) as *mut c_void,
@@ -989,6 +1005,9 @@ struct OutEventCollector {
     notes: *mut Vec<TimedNoteEvent>,
     param_touches: *mut Vec<u32>,
     param_values: *mut Vec<(u32, f64)>,
+    /// Phase 4 Step C-3: PARAM_GESTURE_END collector。 plugin GUI で knob を
+    /// release した瞬間に push される。
+    param_releases: *mut Vec<u32>,
 }
 
 /// `try_push` callback shared by all CLAP plugins. `ctx` points at an
@@ -1052,6 +1071,23 @@ unsafe extern "C" fn collect_out_note_try_push(
             };
             if !collector.param_touches.is_null() {
                 let out = unsafe { &mut *collector.param_touches };
+                out.push(param_id);
+            }
+        }
+        t if t == CLAP_EVENT_PARAM_GESTURE_END => {
+            // Phase 4 Step C-3: plugin GUI 内で knob を release した瞬間。
+            // host は drain して `PluginParamGestureEnd` IPC で daw_gui に
+            // 通知し、 `active_param_gestures` から該当 PluginParam target
+            // を remove する (= Touch mode で curve 復帰、 Latch / Write で
+            // 引き続き latched は維持)。
+            let param_id = unsafe {
+                let body = event as *const u8;
+                let id_ptr = body.add(std::mem::size_of::<clap_event_header>())
+                    as *const u32;
+                *id_ptr
+            };
+            if !collector.param_releases.is_null() {
+                let out = unsafe { &mut *collector.param_releases };
                 out.push(param_id);
             }
         }
@@ -1391,6 +1427,10 @@ impl LoadedPlugin for ClapPlugin {
 
     fn drain_out_param_values_into(&mut self, out: &mut Vec<(u32, f64)>) {
         ClapPlugin::drain_out_param_values_into(self, out);
+    }
+
+    fn drain_out_param_releases_into(&mut self, out: &mut Vec<u32>) {
+        ClapPlugin::drain_out_param_releases_into(self, out);
     }
 
     fn state_save(&self) -> Result<Option<Vec<u8>>> {

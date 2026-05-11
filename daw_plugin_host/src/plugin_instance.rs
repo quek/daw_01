@@ -142,6 +142,11 @@ pub trait LoadedPlugin: Send {
     /// knob value changes). Default no-op.
     fn drain_out_param_values_into(&mut self, _out: &mut Vec<(u32, f64)>) {}
 
+    /// Phase 4 Step C-3: drain plugin-emitted PARAM_GESTURE_END events
+    /// (= plugin GUI knob release)。 Default no-op (= Silence /
+    /// VoicevoxBuiltin / VST3 はまだ対応していない)。
+    fn drain_out_param_releases_into(&mut self, _out: &mut Vec<u32>) {}
+
     // --- render-mode hint (CLAP `render` ext) ---------------------------
     /// Tell the plugin whether the next `process()` calls are realtime
     /// or offline (during WAV export). Returns `true` if the plugin

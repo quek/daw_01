@@ -185,6 +185,16 @@ pub enum ChildToMain {
         param_id: u32,
         value: f64,
     },
+    /// Phase 4 Step C-3 (`docs/plan_automation.md` §6): plugin GUI で knob を
+    /// release した通知 (CLAP `CLAP_EVENT_PARAM_GESTURE_END` out event
+    /// 経由)。 daw_gui は `AppEvent::ParamGestureEnd` に変換して
+    /// `active_param_gestures` から該当 PluginParam target を remove する
+    /// (= Touch mode で recording 終了 + curve eval bypass 解除)。
+    PluginParamGestureEnd {
+        track: u32,
+        slot: PluginSlot,
+        param_id: u32,
+    },
 }
 
 /// Phase 2 (`docs/plan_automation.md` §7.5): 1 parameter のメタデータ。

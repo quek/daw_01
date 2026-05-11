@@ -385,6 +385,18 @@ pub struct AppData {
     /// eval に戻るときに最新 points を読ませる)。 session-only / Undo 対象外。
     pub last_sent_recording_lanes:
         std::collections::HashSet<(u32, common::model::AutomationTarget)>,
+    /// Phase 4 Step C-3 (`docs/plan_automation.md` §6): plugin GUI で knob 値が
+    /// 変更されるたびに `PluginParamValueChangedFromChild` で受け取る最新値の
+    /// cache。 `(track_id, slot, param_id) -> plain value`。 audio bridge tick
+    /// で `current_plain_value(PluginParam)` がここから plain 値を引いて
+    /// `AutomationPoint` を生成する。 session-only / Undo 対象外。 plugin
+    /// reload で古い entry が残るが、 lane.target も同 plugin_id を持つので
+    /// stale 値が誤って record されるリスクは低い (= 念のため Step C-3
+    /// follow-up で plugin unload 時に該当 entry を消す)。
+    pub plugin_param_values: std::collections::HashMap<
+        (u32, common::protocol::PluginSlot, u32),
+        f64,
+    >,
     /// Phase 2 (`docs/plan_automation.md` §7.5): plugin parameter
     /// 一覧キャッシュ。 plugin host が `PluginParamList` IPC で送って
     /// くるたびに上書き。 `(track_id, slot)` で identify、 Parameter
@@ -705,6 +717,7 @@ impl AppData {
             latched_param_gestures: std::collections::HashSet::new(),
             recording_last_beat: std::collections::HashMap::new(),
             last_sent_recording_lanes: std::collections::HashSet::new(),
+            plugin_param_values: std::collections::HashMap::new(),
             plugin_params: std::collections::HashMap::new(),
             track_row_overrides: std::collections::HashMap::new(),
             track_plugin_ids: std::collections::HashMap::new(),
@@ -1814,6 +1827,15 @@ pub enum AppEvent {
         param_id: u32,
         value: f64,
     },
+    /// Phase 4 Step C-3: plugin GUI で knob を release した通知 (CLAP
+    /// PARAM_GESTURE_END 経由)。 daw_gui の `active_param_gestures` から
+    /// 対応 PluginParam target を remove する (= Touch mode の recording
+    /// 停止 + audio bypass 解除)。
+    PluginParamGestureEndFromChild {
+        track: u32,
+        slot: common::protocol::PluginSlot,
+        param_id: u32,
+    },
     /// gui_01 #029 (M14 Phase 63n-4): lane body 内 clip ギャップ
     /// dblclick で発行される clip 作成イベント。MIDI clip の
     /// `DoubleClickEmpty → CreateClip` と同 idiom の lane 版。
@@ -2602,19 +2624,42 @@ impl AppData {
                     .and_then(|params| params.iter().find(|p| p.id == param_id))
                     .map(|info| info.name.clone())
                     .unwrap_or(display_name);
-                self.last_touched_param = Some(TouchedParam {
+                let target = common::model::AutomationTarget::PluginParam { slot, param_id };
+                // Phase 4 Step C-3: ParamGestureBegin として同経路で active /
+                // latched に反映する (= mixer knob と同 idiom、 audio thread
+                // 側 bypass も統一)。 last_touched_param は handler 内で更新。
+                self.handle_event(AppEvent::ParamGestureBegin {
                     track_id: track,
-                    target: common::model::AutomationTarget::PluginParam {
-                        slot,
-                        param_id,
-                    },
+                    target,
                     display_name: resolved_name,
-                    touched_at: std::time::Instant::now(),
                 });
             }
-            AppEvent::PluginParamValueChangedFromChild { .. } => {
-                // Phase 2: cache のみ (Phase 4 で recording mode の
-                // point 生成 source として使う)。 当面 no-op。
+            AppEvent::PluginParamValueChangedFromChild {
+                track,
+                slot,
+                param_id,
+                value,
+            } => {
+                // Phase 4 Step C-3: plugin GUI knob の最新値を per-(track, slot,
+                // param_id) cache に保存。 `current_plain_value(PluginParam)`
+                // が record tick でこの値を read して point を生成する。
+                self.plugin_param_values
+                    .insert((track, slot, param_id), value);
+            }
+            AppEvent::PluginParamGestureEndFromChild {
+                track,
+                slot,
+                param_id,
+            } => {
+                // Phase 4 Step C-3: plugin GUI knob release。 mixer の
+                // ParamGestureEnd と同経路に流す (= active_param_gestures
+                // から remove + sync_recording_lanes_with_audio で bypass
+                // 解除)。
+                let target = common::model::AutomationTarget::PluginParam { slot, param_id };
+                self.handle_event(AppEvent::ParamGestureEnd {
+                    track_id: track,
+                    target,
+                });
             }
             AppEvent::CreateAutomationClip {
                 lane,
@@ -8525,9 +8570,13 @@ impl AppData {
         self.last_sent_recording_lanes = next;
     }
 
-    /// Phase 4 Step C: target に対応する現在 plain 値を返す。 TrackBuiltin
-    /// Volume / Pan のみ実装。 PluginParam は plugin host 側 cache が必要なため
-    /// Step C follow-up。 Mute / Send は M5 scope 外。
+    /// Phase 4 Step C: target に対応する現在 plain 値を返す。
+    /// - `TrackBuiltin(Volume / Pan)`: Song の track field から直接
+    /// - `PluginParam { slot, param_id }`: `plugin_param_values` cache (= plugin
+    ///   GUI からの `PluginParamValueChangedFromChild` で更新される最新値) を
+    ///   引く。 cache に entry が無い場合は `None` (= 一度も plugin GUI から
+    ///   value 通知が来ていない、 record skip)
+    /// - Mute / Send は M5 scope 外で `None`
     fn current_plain_value(
         &self,
         track_id: u32,
@@ -8541,6 +8590,10 @@ impl AppData {
             common::model::AutomationTarget::TrackBuiltin(
                 common::model::TrackBuiltinParam::Pan,
             ) => Some(f64::from(track.pan)),
+            common::model::AutomationTarget::PluginParam { slot, param_id } => self
+                .plugin_param_values
+                .get(&(track_id, *slot, *param_id))
+                .copied(),
             _ => None,
         }
     }
