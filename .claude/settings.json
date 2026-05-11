@@ -33,6 +33,10 @@
           {
             "type": "command",
             "command": "bash F:/dev/gui_01/.claude/hooks/stop_session_reflect.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash F:/dev/gui_01/.claude/hooks/stop_daw01_open_check.sh"
           }
         ]
       }
