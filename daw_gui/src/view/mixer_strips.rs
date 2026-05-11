@@ -7,6 +7,7 @@
 //!   - Pan knob
 //!   - Volume fader (縦) + L/R peak meter
 
+use common::model::{AutomationTarget, TrackBuiltinParam};
 use daw_ui_core::{Edit, LevelMeterStyle, MeterBallistic, ToggleButtonStyle, Ui};
 use daw_ui_renderer::{Color, Rect};
 
@@ -110,6 +111,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             } else {
                 entry.name.clone()
             };
+            // Phase 4 Step B: AutomationTarget::TrackBuiltin(Volume / Pan)
+            // が現在 active gesture 中かを app から読み出して、 widget の
+            // dragging 状態と diff を取る (= edge 検知)。
+            let track_id = entry.index;
+            let was_dragging_vol = app
+                .active_param_gestures
+                .contains(&(track_id, AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume)));
+            let was_dragging_pan = app
+                .active_param_gestures
+                .contains(&(track_id, AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan)));
             draw_strip(
                 ui,
                 entry.index as usize,
@@ -124,10 +135,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 bg,
                 entry.index,
                 false,
+                was_dragging_vol,
+                was_dragging_pan,
             );
         }
     });
 
+    // Master strip は track ではないので gesture 対象外 (= 渡す flag は false)。
     draw_strip(
         ui,
         usize::MAX,
@@ -142,6 +156,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         COLOR_MASTER_BG,
         u32::MAX,
         true,
+        false,
+        false,
     );
 }
 
@@ -160,6 +176,12 @@ fn draw_strip(
     bg: Color,
     track_idx: u32,
     is_master: bool,
+    // Phase 4 Step B: 前フレーム時点での「この track の Volume / Pan が
+    // active gesture か」 を caller (= draw) が AppData から読んだ値。 widget
+    // の dragging 結果と diff して ParamGestureBegin / End を発火する。
+    // master strip は automation target を持たないので常に false を渡す。
+    was_dragging_vol: bool,
+    was_dragging_pan: bool,
 ) {
     ui.panel(("mixer_strip_bg", layout_idx), rect, bg, 4.0);
 
@@ -209,7 +231,7 @@ fn draw_strip(
         let knob_x = rect.x + (rect.w - KNOB_SIZE) * 0.5;
         let knob_value = (pan + 1.0) * 0.5;
         let track_idx_for_pan = track_idx;
-        ui.knob_at(
+        let pan_resp = ui.knob_at(
             ("mixer_strip_pan", layout_idx),
             Rect { x: knob_x, y, w: KNOB_SIZE, h: KNOB_SIZE },
             knob_value,
@@ -224,6 +246,14 @@ fn draw_strip(
                     })
                 })
             },
+        );
+        push_param_gesture_edges(
+            ui,
+            track_idx,
+            AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan),
+            "Pan",
+            was_dragging_pan,
+            pan_resp.dragging,
         );
         y += KNOB_SIZE + 4.0;
     }
@@ -240,7 +270,7 @@ fn draw_strip(
     let track_idx_for_vol = track_idx;
     let is_master_for_vol = is_master;
     let fader_label: &'static str = if is_master_for_vol { "Master Volume" } else { "Track Volume" };
-    ui.fader_at(
+    let vol_resp = ui.fader_at(
         ("mixer_strip_fader", layout_idx),
         Rect { x: group_x, y: fader_top, w: FADER_W, h: fader_h },
         fader_value,
@@ -260,6 +290,17 @@ fn draw_strip(
             })
         },
     );
+    // Phase 4 Step B: master strip は automation target を持たないので skip。
+    if !is_master {
+        push_param_gesture_edges(
+            ui,
+            track_idx,
+            AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+            "Volume",
+            was_dragging_vol,
+            vol_resp.dragging,
+        );
+    }
 
     let mx = group_x + FADER_W + METER_GAP;
     let meter_style = LevelMeterStyle::default();
@@ -282,4 +323,37 @@ fn draw_strip(
         MeterBallistic::Peak,
         meter_style,
     );
+}
+
+/// Phase 4 Step B: knob / fader の drag edge (= was_dragging → is_dragging
+/// の変化) を見て `ParamGestureBegin` / `ParamGestureEnd` を push する
+/// helper。 `was_dragging` は caller が `app.active_param_gestures` から
+/// 引いて渡す。 同 frame で widget が `Edit::mutate` を push → 次 frame の
+/// app.active_param_gestures が反映 → was_dragging が更新、 という 1 frame
+/// 遅延 chain で edge が安定検知される。 race なし (= immediate-mode 各
+/// frame 間で edit queue が必ず drain される)。
+fn push_param_gesture_edges(
+    ui: &mut Ui<'_, AppData>,
+    track_id: u32,
+    target: AutomationTarget,
+    display_name: &'static str,
+    was_dragging: bool,
+    is_dragging: bool,
+) {
+    if is_dragging == was_dragging {
+        return;
+    }
+    if is_dragging {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::ParamGestureBegin {
+                track_id,
+                target,
+                display_name: display_name.to_string(),
+            })
+        }));
+    } else {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::ParamGestureEnd { track_id, target })
+        }));
+    }
 }

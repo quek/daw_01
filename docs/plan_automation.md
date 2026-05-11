@@ -873,16 +873,34 @@ commit を回し、 各 Step landing 後に user 目視確認を挟む。
       4 way toggle が出る → 各 button click で active 1 個が切り替わる →
       Read 起動デフォルト → 再生 / 停止 / loop 等の既存挙動に regression なし
 
-#### Step B: ParamGesture wire (inspector knobs + last_touched_param 連携)
+#### Step B: ParamGesture wire (mixer knobs + last_touched_param 連携) ✅ (2026-05-11)
 
-- [ ] inspector の volume / pan knob drag を `ParamGestureBegin / End` AppEvent
-      に流す (current は drag 中の `TouchParam` のみ、 begin/end の event 化が
-      Phase 4 で必要)
-- [ ] `AppData.active_param_gestures: HashSet<(track_id, target)>` で
-      「現在 touch 中の param 集合」 を管理 (Touch / Latch 判定の source)
-- [ ] CLAP plugin GUI の `CLAP_EVENT_PARAM_GESTURE_BEGIN / END` IPC は
-      Phase 2c で `PluginParamTouchedFromChild` まで届いているので、 ここから
-      ParamGesture の begin / end として再 dispatch
+- [x] `AppEvent::ParamGestureBegin { track_id, target, display_name }` /
+      `ParamGestureEnd { track_id, target }` 追加 (`is_undoable` 未登録 =
+      session-only)
+- [x] `AppData.active_param_gestures: HashSet<(u32, AutomationTarget)>`
+      field 追加。 起動時は空、 ParamGestureBegin / End で更新。
+      Step C で audio thread がこの set を読んで該当 lane の curve eval を
+      bypass する予定
+- [x] `daw_gui/src/view/mixer_strips.rs`: per-track strip の volume fader
+      (`fader_at`) と pan knob (`knob_at`) の `dragging` 状態と
+      `app.active_param_gestures` 内 membership を diff して、 edge
+      transition (= drag 開始 / drag 終了) で `ParamGestureBegin` /
+      `ParamGestureEnd` を push。 master strip は automation target を
+      持たないので skip。 helper: `push_param_gesture_edges`
+- [x] `ParamGestureBegin` handler は `last_touched_param` も同時に更新
+      (= 既存 `TouchParam` の subsume idiom、 gesture begin の瞬間が touch)
+- [ ] inspector lane default knob の wire (lane.default_value も automation
+      target を持つので gesture 対象。 Step B follow-up で `arrangement_view.rs`
+      / `track_inspector.rs` の lane knob にも `push_param_gesture_edges`
+      を仕込む)
+- [ ] CLAP plugin GUI の `CLAP_EVENT_PARAM_GESTURE_END` IPC 追加
+      (Phase 2c で BEGIN のみ送信中、 END も同 idiom で plugin host →
+      daw_gui へ。 Step B follow-up)
+- [ ] **smoke test (Step B)**: `cargo run -p daw_gui` で起動 → mixer strip の
+      volume fader / pan knob を drag → tracing log 等で
+      `ParamGestureBegin / End` の発火を確認 (Step C で audio 影響が出るまで
+      visual には反映なし、 invisible wire の確認のみ)
 
 #### Step C: Audio thread recording sampling + IPC
 

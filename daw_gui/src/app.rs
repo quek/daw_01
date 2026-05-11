@@ -348,6 +348,18 @@ pub struct AppData {
     /// curve eval をバイパスし、 GUI からの knob 値を `playhead_beat`
     /// 起点に point として書き込む。
     pub recording_mode: common::model::RecordingMode,
+    /// Phase 4 Step B (`docs/plan_automation.md` §6): 現在 user が触っている
+    /// (= dragging) parameter の集合。 mixer / inspector / lane default knob
+    /// の press で insert、 release で remove。 plugin GUI 経由の gesture も
+    /// CLAP `CLAP_EVENT_PARAM_GESTURE_BEGIN/END` IPC からここに反映する
+    /// (Phase 2c の `PluginParamTouchedFromChild` は begin のみ送るので
+    /// end の IPC 追加は Step B follow-up)。 session-only / Undo 対象外。
+    /// Step C で audio thread はこの set を読んで該当 lane の curve eval
+    /// を bypass する。 `latched_param_gestures` (= Latch mode 用に保持する
+    /// "1 度触れた parameter") と組み合わせて、 Read/Touch/Latch/Write の
+    /// 4 mode の挙動差を audio thread 側で実現する。
+    pub active_param_gestures:
+        std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     /// Phase 2 (`docs/plan_automation.md` §7.5): plugin parameter
     /// 一覧キャッシュ。 plugin host が `PluginParamList` IPC で送って
     /// くるたびに上書き。 `(track_id, slot)` で identify、 Parameter
@@ -664,6 +676,7 @@ impl AppData {
             selected_automation_points: Vec::new(),
             last_touched_param: None,
             recording_mode: common::model::RecordingMode::default(),
+            active_param_gestures: std::collections::HashSet::new(),
             plugin_params: std::collections::HashMap::new(),
             track_row_overrides: std::collections::HashMap::new(),
             track_plugin_ids: std::collections::HashMap::new(),
@@ -1727,6 +1740,26 @@ pub enum AppEvent {
     /// Phase 4 (`docs/plan_automation.md` §6): automation recording mode の
     /// transport 4 way toggle。 session-only / Undo 対象外。
     SetRecordingMode(common::model::RecordingMode),
+    /// Phase 4 Step B (`docs/plan_automation.md` §6): mixer / inspector /
+    /// plugin GUI で parameter knob の drag が **開始** した瞬間に発火。
+    /// `active_param_gestures` に insert + `last_touched_param` を更新
+    /// (= 既存 `TouchParam` の subsume)。 audio thread は Step C で
+    /// `recording_mode != Read` 時に該当 lane の curve eval を bypass する。
+    /// session-only / Undo 対象外 (= mutation は全て session field)。
+    ParamGestureBegin {
+        track_id: u32,
+        target: common::model::AutomationTarget,
+        display_name: String,
+    },
+    /// Phase 4 Step B: parameter knob の drag が **終了** した瞬間に発火。
+    /// `active_param_gestures` から remove。 Touch mode では これで該当
+    /// lane の recording が止まる (Latch / Write mode は別の latched set
+    /// が transport stop まで持続するので、 本イベントだけでは止まらない)。
+    /// session-only / Undo 対象外。
+    ParamGestureEnd {
+        track_id: u32,
+        target: common::model::AutomationTarget,
+    },
     /// Phase 2 (`docs/plan_automation.md` §7.5): plugin から param 一覧を
     /// 受信。 plugin_params にキャッシュ。 plugin reload / `params.changed`
     /// 経由で送られるたびに上書き。
@@ -2476,6 +2509,25 @@ impl AppData {
             }
             AppEvent::SetRecordingMode(mode) => {
                 self.recording_mode = mode;
+            }
+            AppEvent::ParamGestureBegin {
+                track_id,
+                target,
+                display_name,
+            } => {
+                self.active_param_gestures.insert((track_id, target.clone()));
+                // `TouchParam` を発火し続けるより、 gesture begin で `last_touched_param`
+                // を更新する idiom に統一する。 (= drag 開始の瞬間が touch、 drag 中
+                // の値変化は touch を再発火しない)
+                self.last_touched_param = Some(TouchedParam {
+                    track_id,
+                    target,
+                    display_name,
+                    touched_at: std::time::Instant::now(),
+                });
+            }
+            AppEvent::ParamGestureEnd { track_id, target } => {
+                self.active_param_gestures.remove(&(track_id, target));
             }
             AppEvent::PluginParamListFromChild {
                 track,
