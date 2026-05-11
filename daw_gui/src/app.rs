@@ -8499,12 +8499,23 @@ impl AppData {
     /// `time_beat` は **clip-local** (caller が `playhead_beat - clip.start_beat`
     /// に変換済を渡す)。 content_id の entry が `Automation` variant でない場合は
     /// false を返す。
+    ///
+    /// **Step D thinning**: insert 直前に「直前の record point が prev_prev と
+    /// new_point の線形補間上にある (= 不要な中間点)」 ならその直前 point を
+    /// 削除してから new_point を入れる。 これで「knob を一定方向に滑らかに動かす」
+    /// シーンで点列は 1/64 beat 間隔の dense な集合ではなく、 始点 + 終点 +
+    /// 変曲点 だけ残る (= Live / Reaper 流の online thinning)。 ε は plain 単位
+    /// で固定 0.005 (Volume 範囲 0..=2 / Pan 範囲 -1..=1 のいずれでも 0.25% 程度)。
+    /// user が事前に置いた既存 point も collinear なら removed されるが、 MVP の
+    /// scope では許容 (= recording session 中の curve は user の意図する形に
+    /// 収束する idiom)。
     fn insert_recording_point(
         &mut self,
         content_id: common::model::ContentId,
         time_beat: f64,
         plain_value: f64,
     ) -> bool {
+        const THIN_EPSILON_PLAIN: f64 = 0.005;
         let entry = self
             .song
             .clip_contents
@@ -8516,12 +8527,30 @@ impl AppData {
             common::model::ClipContent::Automation(a) => &mut a.points,
             _ => return false,
         };
+        let mut insert_at = points.partition_point(|p| p.time_beat <= time_beat);
+        // Step D thinning: prev_prev (= insert_at - 2) → prev (= insert_at - 1) →
+        // new_point の 3 点で、 prev の y が prev_prev と new_point を結ぶ線分
+        // 上にあれば prev を消す。 prev / prev_prev は両方とも本 insert より時間
+        // 的に前 (= partition_point の <= 比較で前段の要素) なので、 削除しても
+        // sort 順は保たれる。 collinear 判定は plain 単位の ε で行う。
+        if insert_at >= 2 {
+            let prev = &points[insert_at - 1];
+            let prev_prev = &points[insert_at - 2];
+            let dt_full = time_beat - prev_prev.time_beat;
+            if dt_full > f64::EPSILON {
+                let alpha = (prev.time_beat - prev_prev.time_beat) / dt_full;
+                let interp_y = prev_prev.value + (plain_value - prev_prev.value) * alpha;
+                if (prev.value - interp_y).abs() < THIN_EPSILON_PLAIN {
+                    points.remove(insert_at - 1);
+                    insert_at -= 1;
+                }
+            }
+        }
         let new_point = common::model::AutomationPoint {
             time_beat,
             value: plain_value,
             curve: common::model::AutomationCurve::Linear,
         };
-        let insert_at = points.partition_point(|p| p.time_beat <= time_beat);
         points.insert(insert_at, new_point);
         true
     }

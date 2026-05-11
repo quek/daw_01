@@ -956,12 +956,25 @@ C-2 で行う (= sync 頻度を減らす最適化)。
 - [ ] plugin GUI の knob 操作 → `PluginParamValueChangedFromChild` →
       上記の current_plain_value 解決経路を経て recording に乗る
 
-#### Step D: thinning algorithm
+#### Step D: thinning algorithm ✅ (2026-05-11)
 
-- [ ] Live / Reaper 流の tolerance ε 削減: 直前 point からの y 変化が ε 内で
-      かつ x 距離が 1/64 beat 未満なら間引き
-- [ ] recording stop (Touch=knob release / Latch=Stop / Write=Stop) で発火、
-      1 step Undo で全 inserted point を覆う
+Step C-1 で 1/64 beat 間隔で dense に打たれる point を、 online で間引く。
+post-session 一括 thinning (= recording 終了後にまとめて削除) は user が
+visual feedback で「点が多すぎる」 と感じる原因になるので不採用、 insert 時に
+1 個ずつ collinearity check で削減する RDP 風 idiom を採用。
+
+- [x] `insert_recording_point` の中で「prev_prev → prev → new_point の 3 点で
+      prev が線形補間上 (= 不要な中間点) なら prev を削除してから insert」 を
+      実装。 ε は plain 単位で固定 0.005 (Volume 範囲 0..=2 / Pan 範囲 -1..=1
+      のいずれでも 0.25% 程度)
+- [x] 結果: 「knob を一定方向に滑らかに動かす」 場面では dense な dotscape
+      ではなく 始点 + 変曲点 + 終点 だけ残る (Live / Reaper / Bitwig が後 thin
+      で得る形状を online で実現)
+- [ ] **smoke test (Step D)**: Touch mode で 1 拍ぶん volume fader を直線的に
+      drag → 終了後の lane の point 数が ~5 個程度 (= 始点 / 終点 + 中間の
+      curve 変曲点) になる。 急激な knob 反転 (sin 波状の drag) では変曲点
+      ごとに点が打たれる。 thin が攻撃的すぎる場合は `THIN_EPSILON_PLAIN`
+      を 0.005 → 0.003 等に下げて再 smoke test。
 
 ### Phase 5: Tempo / TimeSig / Transport event
 
