@@ -12,8 +12,8 @@ use daw_ui_core::{
     ArrangementAutomationClip, ArrangementAutomationLane, ArrangementAutomationPoint,
     ArrangementClip, ArrangementCurveKind, ArrangementEditRequest, ArrangementStyle,
     ArrangementTrack, ArrangementView, AutomationClipKey, AutomationLaneKey, AutomationPointKey,
-    Edit, FrameInput, MoveAutomationPointDelta, PointerFrame, SnapConfig, UiHost,
-    automation_lane_header_layout, automation_point_at, visible_track_row_tops,
+    Edit, FrameInput, MoveAutomationPointDelta, PointerFrame, SetAutomationCurveParamKind,
+    SnapConfig, UiHost, automation_lane_header_layout, automation_point_at, visible_track_row_tops,
 };
 use daw_ui_platform::{Modifiers, PhysicalSize};
 use daw_ui_renderer::{Color, Rect, Scene};
@@ -49,6 +49,8 @@ struct ObsModel {
     select_points_events: Vec<(Vec<AutomationPointKey>, Vec<AutomationPointKey>)>,
     /// M14 Phase 63n-8 (#033): 観測した `automation_lasso_active` (drag 中 true)。
     lasso_active_frames: Vec<bool>,
+    /// M14 Phase 63n-9 (#033): 観測した SetAutomationCurveParam の (point, kind, prev, next) 列。
+    curve_param_events: Vec<(AutomationPointKey, SetAutomationCurveParamKind, f32, f32)>,
 }
 
 fn make_lane(id: u32, enabled: bool) -> ArrangementAutomationLane {
@@ -244,6 +246,34 @@ fn run_arrangement_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: F
                         mm.selected_points = next;
                     })
                 }
+                // M14 Phase 63n-9 (#033): handle drag release で SetAutomationCurveParam 観測。
+                ArrangementEditRequest::SetAutomationCurveParam {
+                    point,
+                    kind,
+                    prev_value,
+                    next_value,
+                } => Edit::mutate(move |mm: &mut ObsModel| {
+                    mm.curve_param_events.push((point, kind, prev_value, next_value));
+                    // tracks 側 curve を即座に反映 (= caller idiom)、 次 frame で drag overlay の base に
+                    // 反映されないと test の連続発火が壊れる。
+                    if let Some(t) = mm.tracks.iter_mut().find(|t| t.id == point.clip.track)
+                        && let Some(l) = t
+                            .automation_lanes
+                            .iter_mut()
+                            .find(|l| l.id == point.clip.lane)
+                        && let Some(c) = l.clips.iter_mut().find(|c| c.id == point.clip.clip)
+                        && let Some(p) = c.points.get_mut(point.point_idx as usize)
+                    {
+                        p.curve = match kind {
+                            SetAutomationCurveParamKind::BezierTension => {
+                                ArrangementCurveKind::Bezier { tension: next_value }
+                            }
+                            SetAutomationCurveParamKind::ExponentialBend => {
+                                ArrangementCurveKind::Exponential { bend: next_value }
+                            }
+                        };
+                    }
+                }),
                 _ => Edit::mutate(|_| {}),
             },
         );
@@ -1182,6 +1212,189 @@ fn multi_select_drag_moves_all_selected_points() {
     let dt_0 = m.moved_points[0].next_time_beat - m.moved_points[0].prev_time_beat;
     let dt_1 = m.moved_points[1].next_time_beat - m.moved_points[1].prev_time_beat;
     assert!((dt_0 - dt_1).abs() < 1e-6, "全選択点で同 dt: {dt_0} vs {dt_1}");
+}
+
+// ============================================================
+// M14 Phase 63n-9 (#033): tension/bend handle press / drag / release
+// ============================================================
+
+/// `make_lane` の point idx 2 (time=8, val=0.6, Bezier { 0.0 }) の handle 位置を計算する helper。
+/// midpoint x = (350+500)/2 = 425、 mid_y = evaluate_bezier_y(71.6, 57.2, 0.0, 0.5) ≈ 64.4、
+/// handle y = mid_y - offset 10 ≈ 54.4。 selected_points に point idx 2 が含まれている前提。
+fn handle_pos_for_point_idx_2() -> (f32, f32) {
+    // Linear midpoint of y (tension=0 → linear): (71.6 + 57.2) / 2 = 64.4
+    (425.0, 64.4 - 10.0)
+}
+
+/// selected point の Bezier 入射 segment 中央 handle を press → drag → release で
+/// `SetAutomationCurveParam { kind: BezierTension }` 1 件発火。
+/// 下方向 30px drag → value delta = -30 * 2 / 60 = -1.0、 clamp で -1.0 (= overshoot 反転)。
+#[test]
+fn handle_drag_release_emits_set_automation_curve_param() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lane(10, true)])];
+    // point idx 2 (Bezier { 0.0 }) を選択
+    m.selected_points = vec![AutomationPointKey {
+        clip: AutomationClipKey { track: 1, lane: 10, clip: 100 },
+        point_idx: 2,
+    }];
+
+    let (hx, hy) = handle_pos_for_point_idx_2();
+    let press = pointer_press(hx, hy, Modifiers::empty());
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: press,
+        ..FrameInput::default()
+    });
+    // drag down 30px (= value -1.0 with default sensitivity)
+    let release = pointer_release(hx, hy + 30.0, Modifiers::empty());
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: release,
+        ..FrameInput::default()
+    });
+
+    assert_eq!(
+        m.curve_param_events.len(),
+        1,
+        "handle drag release で SetAutomationCurveParam 1 件: {:?}",
+        m.curve_param_events
+    );
+    let (point, kind, prev, next) = &m.curve_param_events[0];
+    assert_eq!(point.point_idx, 2);
+    assert_eq!(*kind, SetAutomationCurveParamKind::BezierTension);
+    assert!((prev - 0.0).abs() < 1e-6, "prev=0.0");
+    assert!((next - (-1.0)).abs() < 1e-3, "next ≈ -1.0 (overshoot 反転): got {next}");
+}
+
+/// Alt 押下 drag は × 0.2 sensitivity (= 5x 精細)。 30px drag → -0.2。
+#[test]
+fn handle_drag_alt_sensitivity_is_one_fifth() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lane(10, true)])];
+    m.selected_points = vec![AutomationPointKey {
+        clip: AutomationClipKey { track: 1, lane: 10, clip: 100 },
+        point_idx: 2,
+    }];
+
+    let (hx, hy) = handle_pos_for_point_idx_2();
+    let alt = Modifiers { alt: true, ..Modifiers::empty() };
+    let press = pointer_press(hx, hy, alt);
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: press,
+        ..FrameInput::default()
+    });
+    // continuation で Alt 状態を session に伝える (release frame は update skip pattern)
+    let cont = PointerFrame {
+        pos: Some((hx, hy + 30.0)),
+        primary_pressed: true,
+        modifiers: alt,
+        ..PointerFrame::default()
+    };
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: cont,
+        ..FrameInput::default()
+    });
+    let release = pointer_release(hx, hy + 30.0, alt);
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: release,
+        ..FrameInput::default()
+    });
+
+    assert_eq!(m.curve_param_events.len(), 1);
+    let (_, _, _prev, next) = &m.curve_param_events[0];
+    // 30 * 2 / 60 * 0.2 = 0.2 (下方向 = - value)
+    assert!(
+        (next - (-0.2)).abs() < 1e-2,
+        "Alt 30px drag → -0.2: got {next}"
+    );
+}
+
+/// 同位置で release (drag<1e-4 value) → SetAutomationCurveParam **非発火** (= click 相当 no-op)。
+#[test]
+fn handle_click_without_drag_does_not_emit() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lane(10, true)])];
+    m.selected_points = vec![AutomationPointKey {
+        clip: AutomationClipKey { track: 1, lane: 10, clip: 100 },
+        point_idx: 2,
+    }];
+
+    let (hx, hy) = handle_pos_for_point_idx_2();
+    let press = pointer_press(hx, hy, Modifiers::empty());
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: press,
+        ..FrameInput::default()
+    });
+    let release = pointer_release(hx, hy, Modifiers::empty());
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: release,
+        ..FrameInput::default()
+    });
+
+    assert!(
+        m.curve_param_events.is_empty(),
+        "0px drag で SetAutomationCurveParam 非発火: {:?}",
+        m.curve_param_events
+    );
+}
+
+/// 未選択 point の handle は hit しない (= curve param drag 起動しない、 lasso か click にフォールバック)。
+#[test]
+fn handle_not_hit_when_point_not_selected() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lane(10, true)])];
+    // selected_points 空 (= handle 描画も hit 対象も無い)
+    let (hx, hy) = handle_pos_for_point_idx_2();
+    let press = pointer_press(hx, hy, Modifiers::empty());
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: press,
+        ..FrameInput::default()
+    });
+    let release = pointer_release(hx, hy + 30.0, Modifiers::empty());
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: release,
+        ..FrameInput::default()
+    });
+
+    assert!(
+        m.curve_param_events.is_empty(),
+        "未選択 point の handle 位置 click では curve param event 非発火"
+    );
+}
+
+/// Hold / Linear curve の point は handle が無い (= 入射 segment が直線/階段で param なし)。
+/// selected であっても press at handle position は別 zone (clip 内空き) 扱い、 curve param event 非発火。
+#[test]
+fn handle_not_shown_for_hold_or_linear_curve() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lane(10, true)])];
+    // point 0/1 は Linear、 point 1 (Linear) を選択 — 入射 segment は Linear で handle なし
+    m.selected_points = vec![AutomationPointKey {
+        clip: AutomationClipKey { track: 1, lane: 10, clip: 100 },
+        point_idx: 1,
+    }];
+
+    // point 0 から point 1 への中点付近で handle 想定位置を試す (実際には Linear なので handle なし)
+    // midpoint x = (200+350)/2 = 275、 y mid = (47.6+71.6)/2 = 59.6、 handle y = 59.6 - 10 = 49.6
+    let press = pointer_press(275.0, 49.6, Modifiers::empty());
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: press,
+        ..FrameInput::default()
+    });
+    let release = pointer_release(275.0, 79.6, Modifiers::empty());
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: release,
+        ..FrameInput::default()
+    });
+
+    assert!(
+        m.curve_param_events.is_empty(),
+        "Linear point の入射 segment は handle なし → SetAutomationCurveParam 非発火"
+    );
 }
 
 /// drag 中は `response.automation_lasso_active = true` (release frame までは active)。

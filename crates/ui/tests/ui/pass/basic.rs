@@ -323,6 +323,10 @@ fn main() {
                     ArrangementEditRequest::SelectAutomationPoints { .. } => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
+                    // M14 Phase 63n-9 (#033): tension/bend handle drag release → curve param 更新。
+                    ArrangementEditRequest::SetAutomationCurveParam { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
                     // M14 Phase 63n-4 (#029): lane body 空き dblclick → CreateAutomationClip。
                     ArrangementEditRequest::CreateAutomationClip { .. } => {
                         Edit::mutate(|_m: &mut Model| {})

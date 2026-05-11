@@ -231,6 +231,15 @@ pub enum ArrangementCurveKind {
     Exponential { bend: f32 },
 }
 
+/// M14 Phase 63n-9 (#033): `SetAutomationCurveParam` の対象種別 (Bezier tension / Exponential bend)。
+/// daw_01 #033 §B 仕様の `BezierTension` / `ExponentialBend` 2 variant 1 対 1 対応。 caller は match で
+/// `point.curve` の対応 variant を更新する idiom (Bezier { tension: next_value } / Exponential { bend: next_value })。
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum SetAutomationCurveParamKind {
+    BezierTension,
+    ExponentialBend,
+}
+
 /// M14 Phase 63n-1 (#028): automation point の clip-local 座標 + curve 種別。
 /// `time_beat` は clip-local (clip start からのオフセット拍)、 `value_norm` は `0.0..=1.0` 正規化。
 #[derive(Clone, Copy, Debug)]
@@ -657,6 +666,25 @@ pub enum ArrangementEditRequest {
         prev: Vec<AutomationClipKey>,
         next: Vec<AutomationClipKey>,
     },
+    /// M14 Phase 63n-9 (#033): Bezier `tension` / Exponential `bend` の連続変更 (handle drag release で
+    /// 1 度発火、 drag 中は widget 内部 preview state で live 描画のみ → release で commit)。 daw_01 #033
+    /// §B 仕様の `SetAutomationCurveParam` を、 caller の AppEvent dispatch を簡潔にするため **1 variant +
+    /// kind enum** で表現 (= `SetAutomationCurveBezierTension` / `SetAutomationCurveExponentialBend` を別
+    /// variant に分けず、 `kind: SetAutomationCurveParamKind` で discriminate)。 daw_01 側で
+    /// `match kind { BezierTension => ..., ExponentialBend => ... }` で 2 分岐するだけで処理可能。
+    ///
+    /// 値域: `prev_value` / `next_value` は **`-1.0..=1.0` clamp 済** (widget 側で clamp)、 caller は再 clamp
+    /// 不要。 `BezierTension` は Bezier `tension`、 `ExponentialBend` は Exponential `bend` に対応。
+    ///
+    /// 発火条件: handle (`selected_automation_points` 内 point の Bezier / Exponential 入射 segment に出る
+    /// 8x8 px 円) を press → drag (`-1.0..=1.0` 連続値) → release。 prev_value と等しいまま release なら
+    /// no-op (= 1e-4 閾値、 caller は同値を受信した場合無視で OK)。
+    SetAutomationCurveParam {
+        point: AutomationPointKey,
+        kind: SetAutomationCurveParamKind,
+        prev_value: f32,
+        next_value: f32,
+    },
     /// M14 Phase 63n-8 (#033): automation point の selection 変更。 lasso 矩形 drag 完了時 + point 短 click
     /// (= drag < 4px の release) の 2 経路で発火。 `prev` / `next` は順序保持 `Vec` で `SelectAutomationClips`
     /// と同 idiom (caller は単純に `selected_automation_points = next` で上書き、 必要なら undo 履歴に push)。
@@ -894,6 +922,22 @@ pub struct ArrangementStyle {
     pub automation_curve_line_width_px: f32,
     /// lane 内 point の半径 (px)。 default 4.0。
     pub automation_point_radius_px: f32,
+    /// M14 Phase 63n-9 (#033): tension/bend handle (= selected point の Bezier / Exponential 入射 segment
+    /// 中央に出る dot) の半径 (px)。 default 4.0 (= 8x8 px 円、 selection の point dot と同サイズ)。
+    pub automation_curve_param_handle_radius_px: f32,
+    /// M14 Phase 63n-9 (#033): tension/bend handle の fill。 default 黄色系 (curve / point とは異なる色相
+    /// で「これは handle」 と user に明示)。
+    pub automation_curve_param_handle_fill: Color,
+    /// M14 Phase 63n-9 (#033): tension/bend handle の border。 default 黒 (= handle を背景から分離)。
+    pub automation_curve_param_handle_border: Color,
+    /// M14 Phase 63n-9 (#033): handle を curve から上方向 (= y - offset) に offset させる px。 default 10.0
+    /// (= curve 線 (1.5px) と完全に分離して click target が curve と紛れない)。
+    pub automation_curve_param_handle_offset_px: f32,
+    /// M14 Phase 63n-9 (#033): handle drag 中の preview curve line (= 新しい tension/bend で描き直した
+    /// segment) の色。 default 黄色系 (cached curve の lane.color と区別して「これは preview」 と user に
+    /// 明示)。 line_width は `automation_curve_line_width_px * 1.5` (= 通常 1.5 → 2.25px、 +50%) で cached
+    /// curve を視覚的に上書き。
+    pub automation_curve_param_preview_color: Color,
     /// M14 Phase 63n-8 (#033): selected automation point の半径 (px)。 default 5.0 (= 通常 4.0 から +25%)。
     /// `automation_point_radius_px` より大きい値を期待 (= 視認性、 「selected の方が大きく / 明るく見える」 SSoT)。
     pub automation_point_radius_selected_px: f32,
@@ -1052,6 +1096,13 @@ impl Default for ArrangementStyle {
             automation_lane_disabled_color: Color::rgba(0.55, 0.56, 0.60, 0.65),
             automation_curve_line_width_px: 1.5,
             automation_point_radius_px: 4.0,
+            // M14 Phase 63n-9 (#033): tension/bend handle はオレンジ系 (lane.color の青/橙 と差別化、
+            // 「触ると curve param が変わる handle」 を user に明示)、 size は selection dot と同 4.0。
+            automation_curve_param_handle_radius_px: 4.0,
+            automation_curve_param_handle_fill: Color::rgb(1.0, 0.85, 0.30),
+            automation_curve_param_handle_border: Color::rgb(0.10, 0.10, 0.12),
+            automation_curve_param_handle_offset_px: 10.0,
+            automation_curve_param_preview_color: Color::rgb(1.0, 0.85, 0.30),
             // M14 Phase 63n-8 (#033): selected point は半径 +25% (= 通常 4 → 5)、 fill / border 共に白で
             // 「明らかに大きく / 明るく見える」 を実現 (daw_01 #033 §D 仕様)。 lane disabled でも色維持。
             automation_point_radius_selected_px: 5.0,
@@ -1851,6 +1902,35 @@ struct TrackRowResizeDragSession {
     last_emitted_height: f32,
 }
 
+/// M14 Phase 63n-9 (#033): tension/bend handle drag session。 selected point の Bezier / Exponential
+/// 入射 segment 中央に出る 8x8 px 円を上下 drag → release で `SetAutomationCurveParam` 1 件発火。
+/// drag 中は internal preview state で curve を live update (cached 外で preview line overlay 描画)、
+/// release で final value を caller に送信。 anchor 固定 (`anchor_value` / `anchor_mouse_y` /
+/// `effective_lane_height_px`) で view scroll 耐性、 sensitivity は Q3=A の `effective_lane_height_px`
+/// drag で full range (`-1.0..=1.0`)、 Alt × 0.2 で微調整 (1 px ≈ `2.0 / lane_height` の value delta、
+/// alt = `0.4 / lane_height` で 5x 精細)。
+#[derive(Clone, Copy, Debug)]
+struct AutomationCurveParamDragSession {
+    /// drag 対象 point identity (release commit に乗せる)。
+    point: AutomationPointKey,
+    /// `BezierTension` or `ExponentialBend` (drag 中 invariant、 press 時 curve から決定)。
+    kind: SetAutomationCurveParamKind,
+    /// drag 開始時の tension / bend 値 (`prev_value` の元、 sensitivity delta 計算の base)。
+    anchor_value: f32,
+    /// drag 開始時の cursor y (dy 計算の anchor)。
+    anchor_mouse_y: f32,
+    /// 最後に観測した cursor y (continuation で update、 release で final value 計算に使用)。
+    last_mouse_y: f32,
+    /// drag 中の最終 alt 状態 (× 0.2 sensitivity、 既存 drag session と同 race 回避 pattern)。
+    last_alt: bool,
+    /// drag 開始時の effective lane height (`max(lane.height_px, 40)`、 sensitivity の SSoT)。
+    /// caller が drag 中 lane.height_px を変えても sensitivity は drag 開始時値で固定。
+    effective_lane_height_px: f32,
+    /// drag 中の preview value (continuation で update、 overlay 描画 + release commit に使用)。
+    /// `-1.0..=1.0` clamp 済。 anchor と同値なら release で no-op (= click 相当)。
+    preview_value: f32,
+}
+
 /// M14 Phase 63n-8 (#033): automation point の lasso (= 空き automation lane zone から drag による
 /// 矩形選択) session。 既存 MIDI rect_select (`take_drag_rect_in_rect`) は library 全 widget 共用の
 /// cyan 描画固定なので、 lasso 用に **arrangement 内部 SSoT** を別 struct 化 (color / 起動条件 / 解放
@@ -1933,6 +2013,10 @@ pub(crate) struct ArrangementState {
     /// release で `SelectAutomationPoints { prev, next }` 1 件発火、 next は press 時の modifier で
     /// replace / union / XOR を分岐 (#033 Q2=A の zone 排他 lasso)。
     automation_lasso_drag: Option<AutomationLassoSession>,
+    /// M14 Phase 63n-9 (#033): selected point の Bezier/Exponential 入射 segment 中央 handle drag session。
+    /// release で `SetAutomationCurveParam { point, kind, prev_value, next_value }` 1 件発火、 drag 中は
+    /// preview_value を継続更新して curve を live preview (cached 外で overlay 描画)。
+    automation_curve_param_drag: Option<AutomationCurveParamDragSession>,
     /// M14 Phase 63c (#016): 直前の `Single` クリック位置 (= Shift+click 範囲選択の起点)。
     /// caller には公開せず widget 内 SSoT として持つ (piano_roll の note multi-select は anchor
     /// なし設計だったが、 arrangement では daw_01 #009 / #016 で「widget 内 anchor」 が確認されている)。
@@ -3096,6 +3180,150 @@ fn find_lane_clip(
     let lane = track.automation_lanes.iter().find(|l| l.id == key.lane)?;
     let clip = lane.clips.iter().find(|c| c.id == key.clip)?;
     Some((lane, clip))
+}
+
+/// M14 Phase 63n-9 (#033): S 字 cubic Bezier (制御点 x=(1/3, 2/3) 固定) の y(t) を評価。
+/// `flatten_lane_segment` の Bezier 分岐と同 SSoT。 t=0 で a、 t=1 で b、 tension=0 で線形等価、
+/// `tension=+1.0` で c1y=a, c2y=b (滑らかな S 字)、 `tension=-1.0` で c1y=b, c2y=a (overshoot 反転)。
+#[must_use]
+fn evaluate_bezier_y(a: f32, b: f32, tension: f32, t: f32) -> f32 {
+    let t_clamped = tension.clamp(-1.0, 1.0);
+    let diag1 = a + (b - a) * (1.0 / 3.0);
+    let diag2 = a + (b - a) * (2.0 / 3.0);
+    let mix = t_clamped.abs();
+    let (target1, target2) = if t_clamped >= 0.0 { (a, b) } else { (b, a) };
+    let c1y = diag1 * (1.0 - mix) + target1 * mix;
+    let c2y = diag2 * (1.0 - mix) + target2 * mix;
+    let omt = 1.0 - t;
+    omt.powi(3) * a + 3.0 * omt.powi(2) * t * c1y + 3.0 * omt * t.powi(2) * c2y + t.powi(3) * b
+}
+
+/// M14 Phase 63n-9 (#033): tension/bend handle の screen 座標を計算。
+/// `(prev_x, prev_y)` と `(cur_x, cur_y)` は curve 端点の screen 座標、 `kind` + `param_value` で
+/// segment 中央 (= t=0.5) の y を curve 評価値から算出。 handle は curve から上方向に `offset_px`
+/// 飛び出させて click target を curve 線 (1.5px) と分離。 daw_01 #033 §B Q3=A 仕様。
+#[must_use]
+fn compute_curve_handle_pos(
+    prev_x: f32,
+    prev_y: f32,
+    cur_x: f32,
+    cur_y: f32,
+    kind: SetAutomationCurveParamKind,
+    param_value: f32,
+    offset_px: f32,
+) -> (f32, f32) {
+    let x = (prev_x + cur_x) * 0.5;
+    let mid_y = match kind {
+        SetAutomationCurveParamKind::BezierTension => {
+            evaluate_bezier_y(prev_y, cur_y, param_value, 0.5)
+        }
+        SetAutomationCurveParamKind::ExponentialBend => {
+            let exponent = 2.0_f32.powf(param_value.clamp(-1.0, 1.0));
+            prev_y + (cur_y - prev_y) * (0.5_f32).powf(exponent)
+        }
+    };
+    (x, mid_y - offset_px)
+}
+
+/// M14 Phase 63n-9 (#033): cursor 座標から hit する curve param handle を返す。 `selected_points`
+/// に含まれる point の **Bezier / Exponential 入射 segment** にのみ handle が存在 (= Hold / Linear は
+/// handle なし、 first point (= idx 0) も入射 segment なしで除外)。 hit zone は handle の **半径 2 倍**
+/// (= 8px @ default radius=4)、 描画と同 SSoT (`compute_curve_handle_pos`)。
+/// 戻り値: `(point_key, kind, current_value, lane_height_px)` — current_value は drag session の
+/// `anchor_value`、 lane_height_px は sensitivity 計算用 (`effective_lane_height_px` = max(_, 40))。
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+fn find_curve_param_handle_at(
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
+    view: ArrangementView,
+    lanes: Rect,
+    selected_points: &[AutomationPointKey],
+    style: &ArrangementStyle,
+    cx: f32,
+    cy: f32,
+) -> Option<(AutomationPointKey, SetAutomationCurveParamKind, f32, u16)> {
+    if selected_points.is_empty() {
+        return None;
+    }
+    let handle_r = style.automation_curve_param_handle_radius_px.max(2.0);
+    let hit_r_sq = (handle_r * 2.0).powi(2);
+    let offset = style.automation_curve_param_handle_offset_px;
+    let pad = style.automation_clip_v_pad_px;
+    let beat_to_px = f64::from(lanes.w) / view.len_beats.max(1e-6);
+    for (i, t) in visible_tracks.iter().enumerate() {
+        if t.automation_lanes_collapsed || t.automation_lanes.is_empty() {
+            continue;
+        }
+        let row_top = tops[i];
+        let row_h = effective_track_row_h(t, view.track_row_h);
+        let mut lane_y = row_top + row_h;
+        for lane in &t.automation_lanes {
+            if !lane.visible {
+                continue;
+            }
+            let lh = f32::from(lane.height_px);
+            let clip_y = lane_y + pad;
+            let clip_h = (lh - pad * 2.0).max(2.0);
+            for c in &lane.clips {
+                for p_idx in 1..c.points.len() {
+                    let key = AutomationPointKey {
+                        clip: AutomationClipKey {
+                            track: t.id,
+                            lane: lane.id,
+                            clip: c.id,
+                        },
+                        #[allow(clippy::cast_possible_truncation)]
+                        point_idx: p_idx as u32,
+                    };
+                    if !selected_points.contains(&key) {
+                        continue;
+                    }
+                    let p = &c.points[p_idx];
+                    let (kind, value) = match p.curve {
+                        ArrangementCurveKind::Bezier { tension } => {
+                            (SetAutomationCurveParamKind::BezierTension, tension)
+                        }
+                        ArrangementCurveKind::Exponential { bend } => {
+                            (SetAutomationCurveParamKind::ExponentialBend, bend)
+                        }
+                        _ => continue, // Hold / Linear: handle なし
+                    };
+                    let prev = &c.points[p_idx - 1];
+                    let prev_abs = c.start_beat + prev.time_beat;
+                    let cur_abs = c.start_beat + p.time_beat;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let prev_x = lanes.x + ((prev_abs - view.start_beat) * beat_to_px) as f32;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let cur_x = lanes.x + ((cur_abs - view.start_beat) * beat_to_px) as f32;
+                    let prev_y =
+                        clip_y + (1.0 - prev.value_norm.clamp(0.0, 1.0)) * clip_h;
+                    let cur_y =
+                        clip_y + (1.0 - p.value_norm.clamp(0.0, 1.0)) * clip_h;
+                    let (hx, hy) = compute_curve_handle_pos(
+                        prev_x, prev_y, cur_x, cur_y, kind, value, offset,
+                    );
+                    let dx = cx - hx;
+                    let dy = cy - hy;
+                    if dx * dx + dy * dy <= hit_r_sq {
+                        return Some((key, kind, value, lane.height_px));
+                    }
+                }
+            }
+            lane_y += lh;
+        }
+    }
+    None
+}
+
+/// M14 Phase 63n-9 (#033): handle drag の sensitivity 計算。 dy → value delta。
+/// Q3=A 仕様: `effective_lane_height = max(lane_height_px, 40)` drag で full range (`-2.0`)、 つまり
+/// `1 px = 2.0 / effective_h` の value delta。 Alt 押下で × 0.2 (= 5x 精細)。 y は screen 軸で上が
+/// 負なので上 drag = + value (符号反転)。
+#[must_use]
+fn curve_param_delta_from_dy(dy: f32, effective_h: f32, alt: bool) -> f32 {
+    let raw = -dy * 2.0 / effective_h.max(1.0);
+    if alt { raw * 0.2 } else { raw }
 }
 
 /// M14 Phase 63n-8 (#033): point key から `(time_beat, value_norm, clip_start, clip_len)` を取得。
@@ -4270,12 +4498,52 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // **double click** 経由で発火 (既存 `take_double_click_in_rect` block で分岐)。
             // audio_grip / clip_drag (上で MIDI/Audio 行を既に処理済) は track row の y range 内のみ
             // 作動するため lane body と排他。
+            // M14 Phase 63n-9 (#033): tension/bend handle press 検出 — **point press より先勝** で
+            // selected point の Bezier / Exponential 入射 segment 中央 handle に当たった場合、 curve
+            // param drag を起動。 handle は curve から 10px 上方向 offset で描画されるので point dot
+            // 位置とは交差しないが、 priority 上 handle > point > lasso にする (= curve param 編集が
+            // 最も狙った操作のため)。 modifier (Shift / Ctrl / Alt) は handle press では無視 (= Alt
+            // は drag continuation で × 0.2 sensitivity に使う、 Shift/Ctrl は将来 multi-handle 編集に
+            // 予約) — handle 上 click は **常に curve param drag 起動**。
+            let mut handle_press_started = false;
+            if !splitter_press
+                && in_lanes
+                && let Some((handle_point, handle_kind, handle_value, lane_h)) =
+                    find_curve_param_handle_at(
+                        &visible_tracks,
+                        &press_tops,
+                        view,
+                        lanes,
+                        selected_automation_points,
+                        style,
+                        px,
+                        py,
+                    )
+            {
+                let effective_h = f32::from(lane_h.max(40));
+                let state: &mut ArrangementState = self.widget_state(wid);
+                state.automation_curve_param_drag = Some(AutomationCurveParamDragSession {
+                    point: handle_point,
+                    kind: handle_kind,
+                    anchor_value: handle_value,
+                    anchor_mouse_y: py,
+                    last_mouse_y: py,
+                    last_alt: pointer.modifiers.alt,
+                    effective_lane_height_px: effective_h,
+                    preview_value: handle_value,
+                });
+                handle_press_started = true;
+            }
+
             // M14 Phase 63n-8 (#033): point press は **Shift / Ctrl 修飾も accept** (release 時 短 click
             // 化で toggle / replace を判定する)。 旧 Phase 63n-2 は `!shift && !ctrl` で除外していたが、
             // それだと Shift+click on point が何の session も起動せず toggle が発火しない bug を持っていた。
             // Shift+click on point は drag>=4px なら通常 move (= MoveAutomationPoints、 modifier 無視で
             // pressed が selection に含まれていれば multi)、 短 click なら toggle。 Ctrl 同様。
+            // M14 Phase 63n-9 (#033): handle press が先勝した場合 (= `handle_press_started=true`) は
+            // point press を skip (= 同 frame で 2 session が起動するのを回避)。
             if !splitter_press
+                && !handle_press_started
                 && in_lanes
                 && let Some((point_key, _r)) = automation_point_at(
                     &visible_tracks,
@@ -4363,8 +4631,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // 細かく調整する用途は稀で、 lane resize の優先度の方が高いと判断 (= user feedback 反映)。
             // MIDI / audio clip の Alt-snap-off (= clip_drag press) は **track row のみ** に作用するため
             // この変更の影響を受けない (track row は別 priority でこの後 row Alt+drag fallback と排他)。
+            // M14 Phase 63n-9 (#033): handle press (curve param drag) が先勝した場合 clip drag も skip。
             if !splitter_press
                 && !already_taken_by_point
+                && !handle_press_started
                 && in_lanes
                 && !pointer.modifiers.alt
                 && (!shift || ctrl)
@@ -4429,6 +4699,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         && s.track_row_resize_drag.is_none()
                         && s.playhead_drag.is_none()
                         && s.loop_drag.is_none()
+                        && s.automation_curve_param_drag.is_none()
                 };
                 let no_press_action = press_seek_beat.is_none()
                     && press_lane_toggle.is_none()
@@ -4516,6 +4787,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         && s.track_row_resize_drag.is_none()
                         && s.playhead_drag.is_none()
                         && s.loop_drag.is_none()
+                        && s.automation_curve_param_drag.is_none()
                 };
                 let no_press_action = press_seek_beat.is_none()
                     && press_lane_toggle.is_none()
@@ -4707,6 +4979,23 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 && (!is_release || (px, py) != ls.anchor)
             {
                 ls.last_mouse = (px, py);
+            }
+            // M14 Phase 63n-9 (#033): automation_curve_param_drag continuation で last_mouse_y / last_alt /
+            // preview_value を update。 release frame は last_alt update を skip (= 既存 OS event 順序
+            // race 回避 pattern、 ModifiersChanged が MouseInput より先に届く現象への対応)、 last_mouse_y は
+            // release pos が anchor と異なる場合のみ update。 preview_value は anchor + sensitivity 計算で
+            // 毎 frame 算出 (= live preview の SSoT、 release で final 値として使用)。
+            if let Some(ref mut cd) = state.automation_curve_param_drag {
+                if !is_release {
+                    cd.last_mouse_y = py;
+                    cd.last_alt = alt_now;
+                } else if (py - cd.anchor_mouse_y).abs() > f32::EPSILON {
+                    cd.last_mouse_y = py;
+                }
+                let dy = cd.last_mouse_y - cd.anchor_mouse_y;
+                let delta =
+                    curve_param_delta_from_dy(dy, cd.effective_lane_height_px, cd.last_alt);
+                cd.preview_value = (cd.anchor_value + delta).clamp(-1.0, 1.0);
             }
         }
 
@@ -5120,6 +5409,23 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             response.automation_lasso_active = true;
         }
 
+        // M14 Phase 63n-9 (#033): automation_curve_param_drag overlay clone + release take。
+        // overlay は drag 中 handle + preview curve segment を cached 外で描画 (handle 位置は preview_value
+        // 由来、 curve は preview_value で再 flatten した polyline を `automation_curve_param_preview_color`
+        // で重ねる)、 release で 1 度だけ `SetAutomationCurveParam { point, kind, prev_value, next_value }`
+        // を発行 (anchor == preview なら 1e-4 閾値で no-op)。
+        let automation_curve_param_session: Option<AutomationCurveParamDragSession> = {
+            let state: &mut ArrangementState = self.widget_state(wid);
+            state.automation_curve_param_drag
+        };
+        let automation_curve_param_release: Option<AutomationCurveParamDragSession> =
+            if pointer.primary_just_released {
+                let state: &mut ArrangementState = self.widget_state(wid);
+                state.automation_curve_param_drag.take()
+            } else {
+                None
+            };
+
         // drag overlay delta (last_mouse ベース、release と一貫)。
         // M14 Phase 63j (#024): `beat_per_px` / `zoom_x_px_per_beat` は関数頭で計算済 (press 振り分けの
         // playhead seek snap でも使うため)。 ここでは shadow せず再利用する。
@@ -5338,6 +5644,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             selected_automation_points.iter().copied().collect();
         // M14 Phase 63n-8 (#033): lasso session の overlay clone (cached 外で lasso rect を描画)。
         let lasso_overlay = automation_lasso_session;
+        // M14 Phase 63n-9 (#033): curve param drag session の overlay clone (cached 外で handle + preview
+        // curve segment を描画、 drag 中のみ true value で live update)。
+        let curve_param_overlay = automation_curve_param_session;
         // M9 Phase 45f: drag overlay の Resize min_len は snap unit (snap_unit < 0.05 なら 0.05)。
         // release 側 min_len と一貫させるため、 alt 真値は drag session の `last_alt` を使う
         // (overlay と release commit が必ず同一 unit で確定する)。 overlay 不在時 (drag していない)
@@ -5807,6 +6116,161 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     }
                 }
             }
+            // M14 Phase 63n-9 (#033): selected point の Bezier / Exponential 入射 segment に handle を描画。
+            // 描画式は `compute_curve_handle_pos` で SSoT、 drag 中は preview_value で handle 位置 + curve
+            // segment を上書き (= cached layer の base curve を `automation_curve_param_preview_color` の
+            // thicker line で覆って live preview)、 release frame で session take 済なら drag 終了。
+            if !selected_automation_points_for_heavy.is_empty() {
+                let beat_to_px = f64::from(lanes.w) / view_copy.len_beats.max(1e-6);
+                let pad = style_copy.automation_clip_v_pad_px;
+                let handle_r = style_copy.automation_curve_param_handle_radius_px;
+                let handle_offset = style_copy.automation_curve_param_handle_offset_px;
+                for (i, t) in tracks_owned.iter().enumerate() {
+                    if t.automation_lanes_collapsed || t.automation_lanes.is_empty() {
+                        continue;
+                    }
+                    let row_top = tops_owned_for_heavy[i];
+                    let row_total_bottom = tops_owned_for_heavy[i + 1];
+                    if row_total_bottom < lanes.y || row_top > lanes.y + lanes.h {
+                        continue;
+                    }
+                    let mut lane_y =
+                        row_top + effective_track_row_h(t, view_copy.track_row_h);
+                    for lane in &t.automation_lanes {
+                        if !lane.visible {
+                            continue;
+                        }
+                        let lh = f32::from(lane.height_px);
+                        if lane_y + lh < lanes.y || lane_y > lanes.y + lanes.h {
+                            lane_y += lh;
+                            continue;
+                        }
+                        let clip_y = lane_y + pad;
+                        let clip_h = (lh - pad * 2.0).max(2.0);
+                        let lane_clip = Rect {
+                            x: lanes.x,
+                            y: lane_y,
+                            w: lanes.w,
+                            h: lh,
+                        };
+                        for c in &lane.clips {
+                            for p_idx in 1..c.points.len() {
+                                #[allow(clippy::cast_possible_truncation)]
+                                let key = AutomationPointKey {
+                                    clip: AutomationClipKey {
+                                        track: t.id,
+                                        lane: lane.id,
+                                        clip: c.id,
+                                    },
+                                    point_idx: p_idx as u32,
+                                };
+                                if !selected_automation_points_for_heavy.contains(&key) {
+                                    continue;
+                                }
+                                let p = &c.points[p_idx];
+                                let (kind, base_value) = match p.curve {
+                                    ArrangementCurveKind::Bezier { tension } => (
+                                        SetAutomationCurveParamKind::BezierTension,
+                                        tension,
+                                    ),
+                                    ArrangementCurveKind::Exponential { bend } => (
+                                        SetAutomationCurveParamKind::ExponentialBend,
+                                        bend,
+                                    ),
+                                    _ => continue,
+                                };
+                                // drag 中 (= curve_param_overlay の point == 当該 key) なら preview_value、
+                                // そうでなければ point の現在値 (= base_value)。 drag 中の handle のみが
+                                // 動く (他の selected の handle は静止)。
+                                let value = curve_param_overlay
+                                    .as_ref()
+                                    .filter(|cd| cd.point == key && cd.kind == kind)
+                                    .map_or(base_value, |cd| cd.preview_value);
+                                let prev = &c.points[p_idx - 1];
+                                let prev_abs = c.start_beat + prev.time_beat;
+                                let cur_abs = c.start_beat + p.time_beat;
+                                #[allow(clippy::cast_possible_truncation)]
+                                let prev_x = lanes.x
+                                    + ((prev_abs - view_copy.start_beat) * beat_to_px) as f32;
+                                #[allow(clippy::cast_possible_truncation)]
+                                let cur_x = lanes.x
+                                    + ((cur_abs - view_copy.start_beat) * beat_to_px) as f32;
+                                let prev_y =
+                                    clip_y + (1.0 - prev.value_norm.clamp(0.0, 1.0)) * clip_h;
+                                let cur_y =
+                                    clip_y + (1.0 - p.value_norm.clamp(0.0, 1.0)) * clip_h;
+                                // drag 中の preview curve segment を上書き描画 (= cached の base curve を
+                                // 視覚的に置換、 line_width を +50% にして元線を覆う)。 drag 中の selected
+                                // のみ 1 件描画 (他 selected の base curve は cached のまま)。
+                                if curve_param_overlay
+                                    .as_ref()
+                                    .is_some_and(|cd| cd.point == key)
+                                {
+                                    let preview_kind_value = match kind {
+                                        SetAutomationCurveParamKind::BezierTension => {
+                                            ArrangementCurveKind::Bezier { tension: value }
+                                        }
+                                        SetAutomationCurveParamKind::ExponentialBend => {
+                                            ArrangementCurveKind::Exponential { bend: value }
+                                        }
+                                    };
+                                    let mut pts: Vec<(f32, f32)> = Vec::with_capacity(32);
+                                    pts.push((prev_x, prev_y));
+                                    flatten_lane_segment(
+                                        (prev_x, prev_y),
+                                        (prev_x, prev_y),
+                                        (cur_x, cur_y),
+                                        (cur_x, cur_y),
+                                        preview_kind_value,
+                                        2.0,
+                                        &mut pts,
+                                    );
+                                    let segs: Vec<daw_ui_renderer::LineSegment> = pts
+                                        .windows(2)
+                                        .map(|w| daw_ui_renderer::LineSegment {
+                                            a: [w[0].0, w[0].1],
+                                            b: [w[1].0, w[1].1],
+                                            color: style_copy
+                                                .automation_curve_param_preview_color,
+                                        })
+                                        .collect();
+                                    hctx.push_lines(daw_ui_renderer::LineBatch {
+                                        segments: segs.into(),
+                                        line_width_px: style_copy
+                                            .automation_curve_line_width_px
+                                            * 1.5,
+                                        clip_rect: Some(lane_clip),
+                                    });
+                                }
+                                // handle dot 描画 (compute_curve_handle_pos と同 SSoT)。
+                                let (hx, hy) = compute_curve_handle_pos(
+                                    prev_x,
+                                    prev_y,
+                                    cur_x,
+                                    cur_y,
+                                    kind,
+                                    value,
+                                    handle_offset,
+                                );
+                                hctx.push_rect(RectCommand {
+                                    rect: Rect {
+                                        x: hx - handle_r,
+                                        y: hy - handle_r,
+                                        w: handle_r * 2.0,
+                                        h: handle_r * 2.0,
+                                    },
+                                    fill: style_copy.automation_curve_param_handle_fill,
+                                    border: style_copy.automation_curve_param_handle_border,
+                                    border_width: 1.5,
+                                    radius: [handle_r; 4],
+                                    clip_rect: Some(lane_clip),
+                                });
+                            }
+                        }
+                        lane_y += lh;
+                    }
+                }
+            }
             // M14 Phase 63n-8 (#033): lasso 矩形 overlay (drag 中のみ、 cached 外で半透明 cyan 系を描画)。
             // anchor から last_mouse の bounding rect を style.automation_lasso_fill / border で 1 度描画。
             // press と release が同 frame で起きる超短 click の場合、 session は release frame で take 済
@@ -6140,6 +6604,22 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     response.selection_changed = true;
                 }
             }
+        }
+
+        // ---- M14 Phase 63n-9 (#033): automation_curve_param_drag release → SetAutomationCurveParam ----
+        // anchor と preview の差分が 1e-4 未満なら no-op (= handle を click したけど drag しなかったケース、
+        // = user 意図的に値を変えていない)。 そうでなければ `SetAutomationCurveParam { point, kind, prev, next }`
+        // を 1 件発行 (caller の AppEvent は kind で `BezierTension` / `ExponentialBend` を分岐して
+        // `clip.points[idx].curve = Bezier { tension: next }` or `Exponential { bend: next }` で commit)。
+        if let Some(cd) = automation_curve_param_release
+            && (cd.preview_value - cd.anchor_value).abs() > 1e-4
+        {
+            self.push_edit(make_edit(ArrangementEditRequest::SetAutomationCurveParam {
+                point: cd.point,
+                kind: cd.kind,
+                prev_value: cd.anchor_value,
+                next_value: cd.preview_value,
+            }));
         }
 
         // ---- M14 Phase 63n-8 (#033): automation_lasso_drag release → SelectAutomationPoints ----

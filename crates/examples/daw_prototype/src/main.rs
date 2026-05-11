@@ -1979,6 +1979,39 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                     mm.last_action = format!("arr: SelectAutomationPoints ({n})");
                 })
             }
+            // M14 Phase 63n-9 (#033): tension/bend handle drag release → curve param 更新。
+            // kind で `Bezier { tension }` / `Exponential { bend }` を分岐、 該当 point の curve を新値で
+            // 上書き。 linked clips (share_group_color 一致) 全部に伝播 (= for_each_linked_clip)、 既存
+            // SetAutomationCurveType と同 idiom。
+            ArrangementEditRequest::SetAutomationCurveParam {
+                point,
+                kind,
+                next_value,
+                ..
+            } => Edit::mutate(move |mm: &mut DawModel| {
+                let idx = point.point_idx as usize;
+                for_each_linked_clip(&mut mm.arr_automation_lanes, point.clip, |c| {
+                    if let Some(p) = c.points.get_mut(idx) {
+                        p.curve = match kind {
+                            daw_ui_core::SetAutomationCurveParamKind::BezierTension => {
+                                daw_ui_core::ArrangementCurveKind::Bezier { tension: next_value }
+                            }
+                            daw_ui_core::SetAutomationCurveParamKind::ExponentialBend => {
+                                daw_ui_core::ArrangementCurveKind::Exponential { bend: next_value }
+                            }
+                        };
+                    }
+                });
+                mm.arr_view.data_generation += 1;
+                let kind_str = match kind {
+                    daw_ui_core::SetAutomationCurveParamKind::BezierTension => "tension",
+                    daw_ui_core::SetAutomationCurveParamKind::ExponentialBend => "bend",
+                };
+                mm.last_action = format!(
+                    "arr: SetAutomationCurveParam p{} {} → {:+.2}",
+                    point.point_idx, kind_str, next_value
+                );
+            }),
         },
     );
 
