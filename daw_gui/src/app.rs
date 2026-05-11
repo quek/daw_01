@@ -360,6 +360,23 @@ pub struct AppData {
     /// 4 mode の挙動差を audio thread 側で実現する。
     pub active_param_gestures:
         std::collections::HashSet<(u32, common::model::AutomationTarget)>,
+    /// Phase 4 Step C (`docs/plan_automation.md` §6): `Latch` / `Write` mode
+    /// で「再生中に 1 度でも触れた parameter」 を transport stop まで保持する
+    /// set。 `ParamGestureBegin` が `is_playing == true` 中に発火すると
+    /// 即時 insert され、 `stop()` で clear される。 `Touch` mode では使われ
+    /// ない (= active_param_gestures だけが「現在 recording 中」 を意味する)。
+    /// audio thread への通知は active ∪ latched の和集合を毎 tick 送る (Step
+    /// C-2 で IPC `SetRecordingLanes` が landing したら lock-free 化、 当面
+    /// は per-tick LoadSong で済ます)。 session-only / Undo 対象外。
+    pub latched_param_gestures:
+        std::collections::HashSet<(u32, common::model::AutomationTarget)>,
+    /// Phase 4 Step C: parameter ごとの「直近 record した beat」 を保持する
+    /// throttle 用 map。 audio bridge tick は ~60Hz、 BPM=120 で 1/64 beat
+    /// は ~31ms。 同 tick 内で同じ playhead に何度も point insert しない
+    /// よう、 `playhead - last_beat >= 1/64` のときだけ insert する。
+    /// `stop()` で clear。 session-only / Undo 対象外。
+    pub recording_last_beat:
+        std::collections::HashMap<(u32, common::model::AutomationTarget), f64>,
     /// Phase 2 (`docs/plan_automation.md` §7.5): plugin parameter
     /// 一覧キャッシュ。 plugin host が `PluginParamList` IPC で送って
     /// くるたびに上書き。 `(track_id, slot)` で identify、 Parameter
@@ -677,6 +694,8 @@ impl AppData {
             last_touched_param: None,
             recording_mode: common::model::RecordingMode::default(),
             active_param_gestures: std::collections::HashSet::new(),
+            latched_param_gestures: std::collections::HashSet::new(),
+            recording_last_beat: std::collections::HashMap::new(),
             plugin_params: std::collections::HashMap::new(),
             track_row_overrides: std::collections::HashMap::new(),
             track_plugin_ids: std::collections::HashMap::new(),
@@ -2516,6 +2535,17 @@ impl AppData {
                 display_name,
             } => {
                 self.active_param_gestures.insert((track_id, target.clone()));
+                // Phase 4 Step C: Latch / Write mode で 再生中の gesture begin は
+                // latched_param_gestures にも入れる。 stop まで「触れた事実」 を
+                // 保持し、 release 後も curve 上書きを継続する。 Touch mode では
+                // latched は使わない (= release で recording 完全停止)。
+                if matches!(
+                    self.recording_mode,
+                    common::model::RecordingMode::Latch | common::model::RecordingMode::Write
+                ) && self.is_playing
+                {
+                    self.latched_param_gestures.insert((track_id, target.clone()));
+                }
                 // `TouchParam` を発火し続けるより、 gesture begin で `last_touched_param`
                 // を更新する idiom に統一する。 (= drag 開始の瞬間が touch、 drag 中
                 // の値変化は touch を再発火しない)
@@ -2527,7 +2557,14 @@ impl AppData {
                 });
             }
             AppEvent::ParamGestureEnd { track_id, target } => {
-                self.active_param_gestures.remove(&(track_id, target));
+                self.active_param_gestures.remove(&(track_id, target.clone()));
+                // Phase 4 Step C: Touch mode の場合、 release で recording 完全停止 →
+                // recording_last_beat からも 該当 entry を消す (= 次の gesture begin
+                // で改めて throttle 開始)。 Latch / Write は stop まで latched 継続
+                // なので last_beat も保持する (= 連続 record)。
+                if self.recording_mode == common::model::RecordingMode::Touch {
+                    self.recording_last_beat.remove(&(track_id, target));
+                }
             }
             AppEvent::PluginParamListFromChild {
                 track,
@@ -3848,6 +3885,12 @@ impl AppData {
             let samples = (origin as f64 * 60.0 / bpm * sr).max(0.0) as u64;
             self.send_audio(MainToChild::SeekTo { samples });
         }
+        // Phase 4 Step C: recording session を transport stop でクローズ。
+        // Latch / Write の latched set + per-param 直近 record 位置を全て
+        // clear。 これで次の Play 時には latched / last_beat が空からスタート、
+        // touching しない限り何も record されない (Touch / Latch / Write 共通)。
+        self.latched_param_gestures.clear();
+        self.recording_last_beat.clear();
     }
 
     fn toggle_loop(&mut self) {
@@ -8299,6 +8342,23 @@ impl AppData {
             self.playhead_beat = next_beat;
         }
 
+        // Phase 4 Step C: recording tick。 is_playing 中で recording_mode が
+        // Read 以外、 かつ active ∪ latched gesture が non-empty なら、 各
+        // gesture の現在 plain 値を AutomationPoint として playhead 位置に
+        // 書き込む (1/64 beat throttle)。 point insert が発生したら
+        // sync_song_to_plugin_host で audio thread に LoadSong (= curve に
+        // 反映)。 Step C-2 で audio bypass IPC が landing したら、 per-tick
+        // LoadSong を「on gesture end / on stop」 の sync に置き換える。
+        if self.is_playing
+            && self.recording_mode != common::model::RecordingMode::Read
+            && let Some(ph) = self.playhead_beat
+        {
+            let inserted = self.record_automation_points_for_tick(f64::from(ph));
+            if inserted > 0 {
+                self.sync_song_to_plugin_host();
+            }
+        }
+
         #[cfg(windows)]
         {
             let mut to_close: Vec<(u32, PluginSlot)> = Vec::new();
@@ -8319,6 +8379,151 @@ impl AppData {
         self.peak_r_display = new_r;
         self.peak_l_norm = common::meter::db_to_norm(common::meter::linear_to_db(new_l));
         self.peak_r_norm = common::meter::db_to_norm(common::meter::linear_to_db(new_r));
+    }
+
+    /// Phase 4 Step C: tick ごとの automation recording。 `is_playing` と
+    /// `recording_mode != Read` が caller で確認済の前提。 各 active ∪ latched
+    /// gesture について、 該当 track に同 target を持つ lane を探し、 lane 内
+    /// で playhead を含む clip を探し、 1/64 beat throttle で AutomationPoint
+    /// を insert する。
+    ///
+    /// Touch mode は active のみ、 Latch / Write は active ∪ latched (latched は
+    /// `ParamGestureBegin` 時に再生中なら自動で insert 済)。
+    ///
+    /// 戻り値は今 tick で insert した点の総数 (= 0 なら sync skip)。 lane / clip
+    /// が見つからない gesture は silently skip (= MVP: lane / clip は事前に user
+    /// が作成する。 Bitwig 流 auto-create は Step C follow-up)。
+    fn record_automation_points_for_tick(&mut self, playhead_beat: f64) -> usize {
+        if self.recording_mode == common::model::RecordingMode::Read {
+            return 0;
+        }
+        // active ∪ latched (Touch mode は latched が常に空なので active のみ)。
+        let mut recording: Vec<(u32, common::model::AutomationTarget)> = Vec::new();
+        for key in self.active_param_gestures.iter() {
+            recording.push(key.clone());
+        }
+        if matches!(
+            self.recording_mode,
+            common::model::RecordingMode::Latch | common::model::RecordingMode::Write
+        ) {
+            for key in self.latched_param_gestures.iter() {
+                if !self.active_param_gestures.contains(key) {
+                    recording.push(key.clone());
+                }
+            }
+        }
+        if recording.is_empty() {
+            return 0;
+        }
+
+        const THIN_INTERVAL_BEATS: f64 = 1.0 / 64.0;
+        let mut inserted = 0usize;
+        for (track_id, target) in recording {
+            let last = self
+                .recording_last_beat
+                .get(&(track_id, target.clone()))
+                .copied();
+            if let Some(prev) = last
+                && playhead_beat - prev < THIN_INTERVAL_BEATS
+            {
+                continue;
+            }
+            // 現在 plain 値を取得 (= live knob 位置)。 TrackBuiltin のみ MVP。
+            // PluginParam は Step C follow-up で plugin_params cache + IPC で
+            // 取得 (= 現状未配線、 skip)。
+            let plain_value = match self.current_plain_value(track_id, &target) {
+                Some(v) => v,
+                None => continue,
+            };
+            // lane + clip を探す。
+            let (clip_start, content_id) =
+                match self.find_recording_lane(track_id, &target, playhead_beat) {
+                    Some(ids) => ids,
+                    None => continue,
+                };
+            // AutomationPoint は clip-local 時間で保存するので、 playhead から
+            // clip.start_beat を引いて local 化する。
+            let clip_local_beat = playhead_beat - clip_start;
+            if self.insert_recording_point(content_id, clip_local_beat, plain_value) {
+                self.recording_last_beat
+                    .insert((track_id, target.clone()), playhead_beat);
+                inserted += 1;
+            }
+        }
+        inserted
+    }
+
+    /// Phase 4 Step C: target に対応する現在 plain 値を返す。 TrackBuiltin
+    /// Volume / Pan のみ実装。 PluginParam は plugin host 側 cache が必要なため
+    /// Step C follow-up。 Mute / Send は M5 scope 外。
+    fn current_plain_value(
+        &self,
+        track_id: u32,
+        target: &common::model::AutomationTarget,
+    ) -> Option<f64> {
+        let track = self.song.tracks.iter().find(|t| t.id == track_id)?;
+        match target {
+            common::model::AutomationTarget::TrackBuiltin(
+                common::model::TrackBuiltinParam::Volume,
+            ) => Some(f64::from(track.volume)),
+            common::model::AutomationTarget::TrackBuiltin(
+                common::model::TrackBuiltinParam::Pan,
+            ) => Some(f64::from(track.pan)),
+            _ => None,
+        }
+    }
+
+    /// Phase 4 Step C: track の lane の中から、 同 target を持ち、 かつ playhead
+    /// を含む clip を持つ lane を返す。 戻り値は `(clip.start_beat, content_id)`
+    /// (clip-local 時間化に必要)。 lane が無い / clip が無い場合 `None`
+    /// (= record skip)。
+    fn find_recording_lane(
+        &self,
+        track_id: u32,
+        target: &common::model::AutomationTarget,
+        playhead_beat: f64,
+    ) -> Option<(f64, common::model::ContentId)> {
+        let track = self.song.tracks.iter().find(|t| t.id == track_id)?;
+        let lane = track
+            .automation_lanes
+            .iter()
+            .find(|l| l.enabled && l.target == *target)?;
+        let clip = lane.clips.iter().find(|c| {
+            playhead_beat >= c.start_beat && playhead_beat < c.start_beat + c.length_beats
+        })?;
+        Some((clip.start_beat, clip.content_id))
+    }
+
+    /// Phase 4 Step C: 指定 content (= shared automation curve) に
+    /// `(time_beat, value, Linear)` point を sort 順を保って insert する。
+    /// `time_beat` は **clip-local** (caller が `playhead_beat - clip.start_beat`
+    /// に変換済を渡す)。 content_id の entry が `Automation` variant でない場合は
+    /// false を返す。
+    fn insert_recording_point(
+        &mut self,
+        content_id: common::model::ContentId,
+        time_beat: f64,
+        plain_value: f64,
+    ) -> bool {
+        let entry = self
+            .song
+            .clip_contents
+            .entry(content_id)
+            .or_insert_with(|| {
+                common::model::ClipContent::Automation(common::model::AutomationContent::default())
+            });
+        let points = match entry {
+            common::model::ClipContent::Automation(a) => &mut a.points,
+            _ => return false,
+        };
+        let new_point = common::model::AutomationPoint {
+            time_beat,
+            value: plain_value,
+            curve: common::model::AutomationCurve::Linear,
+        };
+        let insert_at = points.partition_point(|p| p.time_beat <= time_beat);
+        points.insert(insert_at, new_point);
+        true
     }
 
     /// BPM 入力欄を Enter で commit。 parse 成功なら 1.0..=400.0 に clamp して

@@ -904,17 +904,57 @@ commit を回し、 各 Step landing 後に user 目視確認を挟む。
 
 #### Step C: Audio thread recording sampling + IPC
 
-- [ ] `ChildToMain::AutomationPointRecord { track_id, lane_id, time_beat, value }`
-      IPC variant 追加 (audio thread → daw_gui)
-- [ ] daw_audio: `recording_mode != Read` かつ playback 中で、 lane の target が
-      `active_param_gestures` に含まれる場合、 該当 lane の curve eval を bypass
-      し、 GUI から流れてきた knob 値を `playhead_beat` 起点 (1/64 beat 刻み)
-      で point として書き戻す
-- [ ] daw_gui: `AutomationPointRecord` 受信 → 該当 lane の playhead 位置に
-      `AutomationPoint` を insert (`SetLaneDefault` と同 idiom、 ただし
-      session 中の連続 insert なので Undo は recording stop で 1 step)
-- [ ] CLAP plugin GUI の out param value (Phase 2c の `PluginParamValueChangedFromChild`)
-      を上記の point insert source にも使う
+MVP は **GUI 側 tick 駆動 + per-tick LoadSong** で実装。 audio bypass 経路
+(`SetRecordingLanes` IPC で audio thread が curve eval を skip する) は Step
+C-2 で行う (= sync 頻度を減らす最適化)。
+
+##### Step C-1: GUI tick で point 書き込み + per-tick LoadSong ✅ (2026-05-11)
+
+- [x] `AppData.recording_last_beat: HashMap<(u32, AutomationTarget), f64>`
+      (= per-param の直近 record 位置で 1/64 beat throttle)
+- [x] `AppData.latched_param_gestures: HashSet<(u32, AutomationTarget)>`
+      (= Latch / Write の「1 度触れた」 set、 transport stop で clear)
+- [x] `ParamGestureBegin` handler を Latch / Write mode 対応に拡張 (= 再生中
+      の begin は latched にも insert、 Touch では latched は使わない)
+- [x] `ParamGestureEnd` handler で Touch mode のときだけ `recording_last_beat`
+      から該当 entry を消す (= Latch / Write は stop まで連続 record)
+- [x] `stop()` で `latched_param_gestures` / `recording_last_beat` を clear
+- [x] `on_tick` で is_playing && recording_mode != Read && playhead_beat
+      Some の条件下、 `record_automation_points_for_tick(playhead_beat)`
+      を呼び出して point を insert、 inserted > 0 のとき
+      `sync_song_to_plugin_host` で audio thread に LoadSong
+- [x] `record_automation_points_for_tick`: active ∪ latched (mode 依存) を
+      iterate、 各 param について `current_plain_value` (TrackBuiltin
+      Volume / Pan のみ MVP、 PluginParam は Step C follow-up) を取得、
+      `find_recording_lane` で同 target 持ち playhead 含み clip 持ち lane を
+      探し、 1/64 beat throttle で `insert_recording_point` (clip-local 時間化)
+- [ ] **smoke test (Step C-1)**: lane + clip 既存の track で recording_mode
+      = Touch にして Play → mixer の volume fader を drag → 自動で lane の
+      curve に point が打たれる (Bitwig 流に visualize される、 ~1/64 beat
+      間隔)。 release で recording 停止。 stop で latched/last_beat 全 clear。
+      Latch / Write mode でも同 wire、 mode の差は release 後 / stop までの
+      record 継続有無。
+
+##### Step C-2: audio bypass IPC で per-tick LoadSong を削減 (deferred)
+
+- [ ] `MainToChild::SetRecordingLanes { lanes: Vec<(u32, AutomationTarget)> }`
+      IPC variant 追加
+- [ ] daw_audio `SharedState.recording_lanes: ArcSwap<HashSet<...>>` 追加
+- [ ] `daw_audio::automation::fill_track_param_ramps` で
+      `recording_lanes.contains(&(track_id, lane.target))` のとき curve eval
+      を skip し、 track.volume / track.pan の constant fallback を維持
+- [ ] daw_gui で recording_mode / active / latched の変化 (= currently
+      recording set 変化) の edge で IPC を送る (= per-tick LoadSong を
+      gesture end / stop のときだけにする)
+- [ ] CLAP plugin GUI gesture END IPC (Phase 2c follow-up) と組み合わせて
+      plugin param の audio bypass にも対応
+
+##### Step C-3: plugin param recording (deferred)
+
+- [ ] `PluginParam` target の `current_plain_value` を `plugin_params` cache
+      + `PluginParamValueChangedFromChild` (Phase 2c) から取得
+- [ ] plugin GUI の knob 操作 → `PluginParamValueChangedFromChild` →
+      上記の current_plain_value 解決経路を経て recording に乗る
 
 #### Step D: thinning algorithm
 
