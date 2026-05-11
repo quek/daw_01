@@ -855,11 +855,55 @@ gui_01 #033 (Phase 63n-7 / -8 / -9) と daw_01 wire 全て land。 全項目達�
 
 ### Phase 4: Recording (Touch / Latch / Write)
 
-- [ ] Transport bar 4 way mode toggle
-- [ ] AppEvent::ParamGestureBegin / End
-- [ ] Audio thread → daw_gui への ChildToMain::AutomationPointRecord 通知
-- [ ] thinning アルゴリズム (Live / Reaper 流の tolerance ε 削減)
-- [ ] CLAP plugin GUI からの gesture event 経由 recording
+Phase 3 (#033) 完結後 (2026-05-11) より着手。 Step 単位で実装 → smoke test →
+commit を回し、 各 Step landing 後に user 目視確認を挟む。
+
+#### Step A: 足場 — RecordingMode enum + transport 4 way toggle ✅ (2026-05-11)
+
+- [x] `common::model::RecordingMode { Read, Touch, Latch, Write }` 定義
+      (`Default = Read`、 `Serialize / Deserialize / Encode / Decode` 付き、
+      session-only で Song には埋め込まない方針)
+- [x] `AppData.recording_mode: RecordingMode` field 追加、 起動時 `Read`
+- [x] `AppEvent::SetRecordingMode(RecordingMode)` + handler 追加
+      (`is_undoable` に登録せず、 session-only / Undo 対象外)
+- [x] `daw_gui/src/view/transport.rs`: Loop button の右に `toggle_button_at`
+      × 4 (Read / Touch / Latch / Write) を配置、 active 1 個だけ on_color
+      (橙) + hint band で recording 状態を強調
+- [ ] **smoke test (Step A)**: `cargo run -p daw_gui` で起動 → transport bar に
+      4 way toggle が出る → 各 button click で active 1 個が切り替わる →
+      Read 起動デフォルト → 再生 / 停止 / loop 等の既存挙動に regression なし
+
+#### Step B: ParamGesture wire (inspector knobs + last_touched_param 連携)
+
+- [ ] inspector の volume / pan knob drag を `ParamGestureBegin / End` AppEvent
+      に流す (current は drag 中の `TouchParam` のみ、 begin/end の event 化が
+      Phase 4 で必要)
+- [ ] `AppData.active_param_gestures: HashSet<(track_id, target)>` で
+      「現在 touch 中の param 集合」 を管理 (Touch / Latch 判定の source)
+- [ ] CLAP plugin GUI の `CLAP_EVENT_PARAM_GESTURE_BEGIN / END` IPC は
+      Phase 2c で `PluginParamTouchedFromChild` まで届いているので、 ここから
+      ParamGesture の begin / end として再 dispatch
+
+#### Step C: Audio thread recording sampling + IPC
+
+- [ ] `ChildToMain::AutomationPointRecord { track_id, lane_id, time_beat, value }`
+      IPC variant 追加 (audio thread → daw_gui)
+- [ ] daw_audio: `recording_mode != Read` かつ playback 中で、 lane の target が
+      `active_param_gestures` に含まれる場合、 該当 lane の curve eval を bypass
+      し、 GUI から流れてきた knob 値を `playhead_beat` 起点 (1/64 beat 刻み)
+      で point として書き戻す
+- [ ] daw_gui: `AutomationPointRecord` 受信 → 該当 lane の playhead 位置に
+      `AutomationPoint` を insert (`SetLaneDefault` と同 idiom、 ただし
+      session 中の連続 insert なので Undo は recording stop で 1 step)
+- [ ] CLAP plugin GUI の out param value (Phase 2c の `PluginParamValueChangedFromChild`)
+      を上記の point insert source にも使う
+
+#### Step D: thinning algorithm
+
+- [ ] Live / Reaper 流の tolerance ε 削減: 直前 point からの y 変化が ε 内で
+      かつ x 距離が 1/64 beat 未満なら間引き
+- [ ] recording stop (Touch=knob release / Latch=Stop / Write=Stop) で発火、
+      1 step Undo で全 inserted point を覆う
 
 ### Phase 5: Tempo / TimeSig / Transport event
 

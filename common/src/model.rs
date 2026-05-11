@@ -1084,6 +1084,29 @@ impl Default for AutomationPoint {
     }
 }
 
+/// Phase 4 (`docs/plan_automation.md` §6): automation recording mode
+/// selected from the transport bar 4-way toggle. Bitwig / Ableton Live
+/// / Reaper の慣例に従う。 session-only (project 保存対象外、 起動時
+/// `Read`)。 audio thread もこの enum を読んで recording lane の
+/// curve eval をバイパスする予定 (Phase 4 Step C+)。
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode,
+)]
+pub enum RecordingMode {
+    /// Curve を読むだけ (default)。 knob 操作は `lane.default_value`
+    /// を更新するのみで、 point は生成されない。
+    #[default]
+    Read,
+    /// knob を触っている間だけ点を打ち、 release で curve に戻る
+    /// (Bitwig / Live `Touch`)。
+    Touch,
+    /// 1 度触れたら playback 停止まで上書きし続ける (`Latch`)。
+    Latch,
+    /// playback 再生中ずっと knob 値で curve を上書きする
+    /// (`Write` = overdub)。
+    Write,
+}
+
 /// `ClipContent::Automation` payload. The actual curve sits inside the
 /// shared content store (`Song.clip_contents`) so multiple
 /// `AutomationClip`s with the same `content_id` share the curve

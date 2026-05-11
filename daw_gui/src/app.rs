@@ -340,6 +340,14 @@ pub struct AppData {
     /// shortcut で「対応 lane を所有 track に追加」 する source。
     /// session-only (起動 None、Undo / save 対象外)。
     pub last_touched_param: Option<TouchedParam>,
+    /// Phase 4 (`docs/plan_automation.md` §6): automation recording mode。
+    /// transport bar の 4 way toggle (Read / Touch / Latch / Write) で切替。
+    /// session-only / Undo 対象外 (= 起動時 `Read`、 project 保存対象外)。
+    /// 起動時の値は Bitwig / Ableton Live / Reaper と同じく `Read`。
+    /// Phase 4 Step C+ で audio thread もこの値を読んで recording lane の
+    /// curve eval をバイパスし、 GUI からの knob 値を `playhead_beat`
+    /// 起点に point として書き込む。
+    pub recording_mode: common::model::RecordingMode,
     /// Phase 2 (`docs/plan_automation.md` §7.5): plugin parameter
     /// 一覧キャッシュ。 plugin host が `PluginParamList` IPC で送って
     /// くるたびに上書き。 `(track_id, slot)` で identify、 Parameter
@@ -655,6 +663,7 @@ impl AppData {
             selected_automation_clips: Vec::new(),
             selected_automation_points: Vec::new(),
             last_touched_param: None,
+            recording_mode: common::model::RecordingMode::default(),
             plugin_params: std::collections::HashMap::new(),
             track_row_overrides: std::collections::HashMap::new(),
             track_plugin_ids: std::collections::HashMap::new(),
@@ -1715,6 +1724,9 @@ pub enum AppEvent {
     /// れば新規作成 (default = 現在の plain 値)。`expanded_automation_tracks`
     /// にも所有 track を insert して即時展開。
     AddAutomationFromLastTouched,
+    /// Phase 4 (`docs/plan_automation.md` §6): automation recording mode の
+    /// transport 4 way toggle。 session-only / Undo 対象外。
+    SetRecordingMode(common::model::RecordingMode),
     /// Phase 2 (`docs/plan_automation.md` §7.5): plugin から param 一覧を
     /// 受信。 plugin_params にキャッシュ。 plugin reload / `params.changed`
     /// 経由で送られるたびに上書き。
@@ -2461,6 +2473,9 @@ impl AppData {
             }
             AppEvent::AddAutomationFromLastTouched => {
                 self.add_automation_from_last_touched();
+            }
+            AppEvent::SetRecordingMode(mode) => {
+                self.recording_mode = mode;
             }
             AppEvent::PluginParamListFromChild {
                 track,
