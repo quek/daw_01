@@ -217,37 +217,78 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             app.handle_event(AppEvent::Redo)
         }));
     }
-    if ui.take_shortcut("copy")
-        && let Some((json, count)) = app.copy_selected_notes_as_json()
-    {
-        ui.set_clipboard_text(json);
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.status_message = format!("コピー: {count} ノート");
-        }));
+    // Copy: automation point 選択 → note 選択 の優先順。 同フレームに
+    // 両方の selection が居ても、 直近で触っていそうな automation point
+    // 側を優先する (= 後で UX に応じて pointer 位置や focus view で
+    // 切り替える可能性あり、 まずは Phase 3 では automation 優先で固定)。
+    if ui.take_shortcut("copy") {
+        if let Some((json, count)) = app.copy_selected_automation_points_as_json() {
+            ui.set_clipboard_text(json);
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.status_message = format!("コピー: {count} オートメーションポイント");
+            }));
+        } else if let Some((json, count)) = app.copy_selected_notes_as_json() {
+            ui.set_clipboard_text(json);
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.status_message = format!("コピー: {count} ノート");
+            }));
+        }
     }
+    // Paste: clipboard text を view まず note JSON として decode、 失敗
+    // したら automation JSON として decode を試みる。 順序が逆だと
+    // 「note paste 中なのに automation 側に行く」 ような微妙な事故が
+    // 起きづらいので、 note を先に試す。 paste 側の decode は
+    // `paste_*_from_json` が無効 JSON を silently 落とすので、 試行は
+    // 安全。
+    //
+    // ただし「現在 automation clip / point が selected」 のときは
+    // automation 優先で decode を試みる (= note JSON は受け付けない方が
+    // user 期待に近い)。
     if ui.take_shortcut("paste")
         && let Some(text) = ui.take_clipboard_paste()
     {
+        let prefer_automation =
+            !app.selected_automation_clips.is_empty() || !app.selected_automation_points.is_empty();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.paste_notes_from_json(&text);
+            if prefer_automation {
+                app.paste_automation_points_from_json(&text);
+            } else {
+                app.paste_notes_from_json(&text);
+            }
         }));
     }
     if ui.take_shortcut("delete") {
         // 優先順:
         //   1. Audio Editor 開いてて event 選択中 → DeleteAudioEvent
-        //   2. notes 選択あり → DeleteSelectedNotes
-        //   3. それ以外 → DeleteSelectedClip
+        //   2. automation point 選択あり → DeleteAutomationPoints (Phase 3)
+        //   3. notes 選択あり → DeleteSelectedNotes
+        //   4. automation clip 選択あり → DeleteAutomationClips (Phase 3)
+        //   5. それ以外 → DeleteSelectedClip
         // 同 frame 内で重複 dispatch しないよう排他にする (= ノート
         // 選択中に Delete 押して clip も消える事故を防ぐ)。
         let audio_event_target = app
             .audio_editor_clip
             .zip(app.audio_editor_selected_event);
         let has_notes = !app.selected_notes.is_empty();
+        let auto_points = if app.selected_automation_points.is_empty() {
+            None
+        } else {
+            Some(app.selected_automation_points.clone())
+        };
+        let auto_clips = if app.selected_automation_clips.is_empty() {
+            None
+        } else {
+            Some(app.selected_automation_clips.clone())
+        };
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             if let Some((clip, event_idx)) = audio_event_target {
                 app.handle_event(AppEvent::DeleteAudioEvent { clip, event_idx });
+            } else if let Some(points) = auto_points {
+                app.handle_event(AppEvent::DeleteAutomationPoints { points });
             } else if has_notes {
                 app.handle_event(AppEvent::DeleteSelectedNotes);
+            } else if let Some(keys) = auto_clips {
+                app.handle_event(AppEvent::DeleteAutomationClips { keys });
             } else {
                 app.handle_event(AppEvent::DeleteSelectedClip);
             }

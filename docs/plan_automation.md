@@ -785,12 +785,36 @@ SSOT 遵守)。
 
 ### Phase 3: Curve / 編集機能拡張
 
-- [ ] AutomationCurve: Bezier tension / Exponential bend 詳細実装
-- [ ] gui_01 自体の `automation_curve` widget の curve 種別対応 (gui_01 #029 として
-      別途依頼) — 現行は単一カーブ (Catmull-Rom 固定)
-- [ ] Lasso 矩形選択 + 複数 point 移動 / 削除
-- [ ] Point copy / paste (clipboard with internal MIME)
-- [ ] Quantize point time_beat to grid
+daw_01 側で完結する部分は本 phase で完了。 widget 側 (lasso 選択 / curve 種別描画 /
+tension+bend handle) は gui_01 #033 として依頼済 (3 phase 分割提案)。
+
+- [x] AutomationCurve: Bezier tension / Exponential bend 評価関数 (Phase 1 で
+      実装済、 `common/src/automation.rs::apply_curve`)
+- [x] Curve type popup を **4 択化** (`["Hold", "Linear", "Bezier", "Exponential"]`、
+      `daw_gui/src/view/arrangement_view.rs::automation_point_rects` ループ)。
+      popup で Exponential を選んだ point は `AutomationCurve::Exponential { bend: 0.0 }`
+      として model に書き込まれ、 audio thread は exponential 評価で再生する。
+      widget の描画は #033 完了まで Bezier { 0.0 } fallback 表示
+- [x] `AppData.selected_automation_points: Vec<AutomationPointKeyRef>` 追加 +
+      `AppEvent::SelectAutomationPoints { prev, next }` (widget は #033 で発火)
+- [x] Point copy / paste — `copy_selected_automation_points_as_json` /
+      `paste_automation_points_from_json` (Note copy/paste と同 idiom、 normalized
+      0..=1 で JSON 化 → paste 先 target に応じて plain 復元、 lane 跨ぎ可)
+- [x] Quantize point time_beat to grid —
+      `AppEvent::QuantizeSelectedAutomationPoints(div)` + handler。 sort 維持で
+      selection も `(snapped_time, value)` で再 lookup して新 idx に更新
+- [x] shortcut: Ctrl+C / Ctrl+V / Delete を automation point 選択優先に拡張
+      (`daw_gui/src/view/root.rs::dispatch_shortcuts`)
+- [ ] gui_01 #033 reply 受領: curve 4 種描画 + tension/bend handle + lasso 選択 +
+      selected point visual feedback (= widget 側 schema 拡張 +
+      `SelectAutomationPoints` / `SetAutomationCurveParam` EditRequest 発火)
+- [ ] gui_01 #033 完了後の wire:
+      (a) `model_curve_to_widget` の Exponential fallback を削除して完全変換に
+      (b) `SetAutomationCurveParam` 対応 AppEvent (`SetAutomationCurveBezierTension`
+          / `SetAutomationCurveExponentialBend`) + handler
+      (c) `is_undoable` に追加
+- [ ] smoke test (gui_01 #033 完了後): lasso で複数 point 選択 → Move /
+      Delete / Copy / Paste / Quantize / curve type change が batch で動作する
 
 ### Phase 4: Recording (Touch / Latch / Write)
 
@@ -1093,6 +1117,18 @@ pub fn automation_curve<F>(
       (10) clip 短 click で selection
       (11) clip 右クリック → Make Unique / Delete
       (12) Volume sweep 再生で出音が ramp する
+- [x] Phase 3 daw_01 側完了 (2026-05-11):
+      curve popup 4 択化 (Exponential 追加) /
+      `selected_automation_points` AppData field /
+      `AppEvent::SelectAutomationPoints { prev, next }` +
+      `AppEvent::QuantizeSelectedAutomationPoints(div)` + handler /
+      copy / paste 実装 (Note 同 idiom、 norm 0..=1 で JSON 化) /
+      shortcut: Ctrl+C / Ctrl+V / Delete を automation point 選択優先に拡張 /
+      is_undoable に `QuantizeSelectedAutomationPoints` 追加
+- [ ] gui_01 #033 (2026-05-11 起票): widget 側の curve 4 種描画 +
+      tension/bend handle + lasso 矩形選択 + selected point visual feedback。
+      reply 受領後に `model_curve_to_widget` Exponential fallback 削除 +
+      `SetAutomationCurveParam` 対応 AppEvent + handler を追加
 
 ## 14. 主要ファイル変更点
 

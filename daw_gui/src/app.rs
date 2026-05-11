@@ -330,6 +330,12 @@ pub struct AppData {
     /// 毎フレーム `&[AutomationClipKey]` で渡して selected highlight を
     /// 描画させる。 session-only。
     pub selected_automation_clips: Vec<common::model::AutomationClipKey>,
+    /// Phase 3 (`docs/plan_automation.md` §10): 選択中の automation point。
+    /// gui_01 #033 で widget 側の lasso 矩形選択が landing するまで空のまま
+    /// だが、 copy / paste / quantize / delete のハンドラは selection を
+    /// 入力として動くので先行実装する。 widget からは
+    /// `SelectAutomationPoints` (#033) で上書き。 session-only。
+    pub selected_automation_points: Vec<AutomationPointKeyRef>,
     /// gui_01 #028 §7.3: 最後にユーザーが触った parameter。`A` キー
     /// shortcut で「対応 lane を所有 track に追加」 する source。
     /// session-only (起動 None、Undo / save 対象外)。
@@ -450,8 +456,8 @@ pub struct AppData {
     /// Pro Tools 流の「Stop で再生開始位置に戻す」 用、 直前の play()
     /// 開始時点の playhead を保持。 stop() で playhead_beat に書き戻し
     /// + SeekTo IPC で audio engine も同位置にリセットする。 None の
-    /// 間 (= まだ一度も play していない or stop 済みで restore 完了) は
-    /// stop() は何もしない。
+    ///   間 (= まだ一度も play していない or stop 済みで restore 完了) は
+    ///   stop() は何もしない。
     pub playback_origin_beat: Option<f32>,
     pub master_gain: f32,
     pub peak_l_display: f32,
@@ -647,6 +653,7 @@ impl AppData {
             collapsed_groups: std::collections::HashSet::new(),
             expanded_automation_tracks: std::collections::HashSet::new(),
             selected_automation_clips: Vec::new(),
+            selected_automation_points: Vec::new(),
             last_touched_param: None,
             plugin_params: std::collections::HashMap::new(),
             track_row_overrides: std::collections::HashMap::new(),
@@ -1264,6 +1271,9 @@ impl AppData {
                 | AppEvent::ResizeAutomationClips { .. }
                 | AppEvent::DeleteAutomationClips { .. }
                 | AppEvent::MakeAutomationClipUnique(_)
+                // Phase 3: point quantize は構造変化系として Undo step
+                // 化。 SelectAutomationPoints は session-only なので除外。
+                | AppEvent::QuantizeSelectedAutomationPoints(_)
         )
     }
 
@@ -1641,6 +1651,19 @@ pub enum AppEvent {
         prev: Vec<common::model::AutomationClipKey>,
         next: Vec<common::model::AutomationClipKey>,
     },
+    /// Phase 3 (gui_01 #033 widget 側 lasso 完了後に発火される想定):
+    /// `selected_automation_points` を `next` で上書き。 `prev` は Undo 用
+    /// (selection 自体は session state なので Undo 非対象だが、 `SelectClips`
+    /// と同じ idiom で signature を揃える)。
+    SelectAutomationPoints {
+        prev: Vec<AutomationPointKeyRef>,
+        next: Vec<AutomationPointKeyRef>,
+    },
+    /// Phase 3: `selected_automation_points` を grid (`1/div` beat) に snap。
+    /// piano roll の `QuantizeSelectedNotes` と同 idiom。 同 clip 内の
+    /// point は sort 維持のためまとめて sort し直し、 selection も新 idx に
+    /// 再採番する。 `div = 1` で 1 beat 単位、 `4` で 1/4 beat 単位。
+    QuantizeSelectedAutomationPoints(u8),
     /// 右クリック menu「Make Unique」 → 共有中 (`refcount >= 2`) の
     /// automation clip の content を deep clone (新 `ContentId`)、独立化。
     /// 既に独立 clip の場合は status_message で通知。MIDI clip 用
@@ -2362,6 +2385,12 @@ impl AppData {
             }
             AppEvent::SelectAutomationClips { prev: _, next } => {
                 self.selected_automation_clips = next;
+            }
+            AppEvent::SelectAutomationPoints { prev: _, next } => {
+                self.selected_automation_points = next;
+            }
+            AppEvent::QuantizeSelectedAutomationPoints(div) => {
+                self.quantize_selected_automation_points(div);
             }
             AppEvent::MakeAutomationClipUnique(key) => {
                 self.make_automation_clip_unique(key);
@@ -4184,18 +4213,6 @@ impl AppData {
         tracing::info!(index, "added instrument track");
     }
 
-    /// Ableton Live's Cmd/Ctrl+G: wrap the listed `track_ids` in a
-    /// fresh `kind == Group` track. The selected tracks become the
-    /// group's children (their `parent_group_id` is rewritten), and
-    /// the new group is inserted just after the highest-indexed
-    /// selected track so it visually sits at the top of its
-    /// children's "block" (Live convention). Empty selections are
-    /// silently ignored — Live forbids empty groups.
-    ///
-    /// Already-grouped tracks keep their old parent's settings; only
-    /// their immediate parent pointer is rewritten. If a selected
-    /// track was a group itself, it ends up nested under the new
-    /// group (depth unbounded).
     // ----------------------------------------------------------------
     // gui_01 #028 (M14 Phase 63n-2) — automation lane / point handlers
     // ----------------------------------------------------------------
@@ -4432,6 +4449,308 @@ impl AppData {
             p.curve = next;
             self.sync_song_to_plugin_host();
         }
+    }
+
+    /// Phase 3: `selected_automation_points` を grid (`1/div` beat) に snap。
+    /// piano roll の [`Self::quantize_selected_notes`] と同 idiom。 sort
+    /// invariant を維持するため snap 後に各 clip 内 point 列を sort し直し、
+    /// `selected_automation_points` も新 idx で再構築する。 selection 再
+    /// 構築は `(snapped_time, value)` で lookup する (point に stable id
+    /// が無いので、 同 frame 内の値ペアで identify)。 同 clip 内に snap
+    /// 結果が同位置になる point が複数いれば最初の一致を採用。
+    fn quantize_selected_automation_points(&mut self, div: u8) {
+        if self.selected_automation_points.is_empty() {
+            return;
+        }
+        let div = div.max(1) as f64;
+        let snap = |b: f64| ((b * div).round() / div).max(0.0);
+        let selected = self.selected_automation_points.clone();
+
+        // `content_id` ごとに、 quantize 対象 idx 群と、 selection lookup 用の
+        // `(snapped_time, value)` ペア群を集める。 ペアは selection の現順序
+        // を維持するため Vec で持つ。
+        #[derive(Clone, Copy)]
+        struct Owner {
+            track_id: u32,
+            lane_id: u32,
+            clip_id: u32,
+        }
+        struct ContentBuckets {
+            owner: Owner,
+            idxs: Vec<u32>,
+            lookups: Vec<(f64, f64)>,
+        }
+        let mut by_content: std::collections::HashMap<
+            common::model::ContentId,
+            ContentBuckets,
+        > = std::collections::HashMap::new();
+        for k in &selected {
+            let Some(track) = self.song.track_by_id(k.track_id) else {
+                continue;
+            };
+            let Some(lane) = track.lane_by_id(k.lane_id) else {
+                continue;
+            };
+            let Some(clip) = lane.clip_by_id(k.clip_id) else {
+                continue;
+            };
+            let content_id = clip.content_id;
+            let Some(common::model::ClipContent::Automation(a)) =
+                self.song.clip_contents.get(&content_id)
+            else {
+                continue;
+            };
+            let Some(p) = a.points.get(k.point_idx as usize) else {
+                continue;
+            };
+            let entry = by_content.entry(content_id).or_insert_with(|| ContentBuckets {
+                owner: Owner {
+                    track_id: k.track_id,
+                    lane_id: k.lane_id,
+                    clip_id: k.clip_id,
+                },
+                idxs: Vec::new(),
+                lookups: Vec::new(),
+            });
+            entry.idxs.push(k.point_idx);
+            entry.lookups.push((snap(p.time_beat), p.value));
+        }
+
+        let mut new_selection: Vec<AutomationPointKeyRef> = Vec::with_capacity(selected.len());
+        for (content_id, bucket) in by_content {
+            let ContentBuckets {
+                owner,
+                idxs,
+                lookups,
+            } = bucket;
+            let Some(common::model::ClipContent::Automation(a)) =
+                self.song.clip_contents.get_mut(&content_id)
+            else {
+                continue;
+            };
+            // snap 対象 point の time_beat を書き換え。 重複 idx は HashSet
+            // で除去せず、 set_mut が冪等なのでそのまま再代入。
+            for idx in &idxs {
+                if let Some(p) = a.points.get_mut(*idx as usize) {
+                    p.time_beat = snap(p.time_beat);
+                }
+            }
+            a.points.sort_by(|p1, p2| {
+                p1.time_beat
+                    .partial_cmp(&p2.time_beat)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            // 新 idx を `(snapped_time, value)` で lookup。
+            for (st, sv) in &lookups {
+                if let Some(new_idx) = a.points.iter().position(|p| {
+                    (p.time_beat - st).abs() < 1e-9 && (p.value - sv).abs() < 1e-9
+                }) {
+                    new_selection.push(AutomationPointKeyRef {
+                        track_id: owner.track_id,
+                        lane_id: owner.lane_id,
+                        clip_id: owner.clip_id,
+                        point_idx: new_idx as u32,
+                    });
+                }
+            }
+        }
+
+        self.selected_automation_points = new_selection;
+        self.sync_song_to_plugin_host();
+    }
+
+    /// Phase 3: 選択中 automation point を JSON 化して OS clipboard に
+    /// 出せるよう text を返す。 [`Self::copy_selected_notes_as_json`] と同
+    /// idiom。 point の `value` は target ごとに値域が違う (Volume:
+    /// 0..=2.0、 Pan: -1..=1 等) ので、 lane の `target` を引いて
+    /// **normalized 0..=1** で serialize する。 paste 側でも target を
+    /// 引いて plain に戻す (= target が違う lane に貼っても curve の
+    /// shape を保てる、 Bitwig 流)。
+    ///
+    /// 戻り値は `(json, count)`。 何も copy できない (選択無し / lookup
+    /// 失敗) 場合は `None`。
+    pub fn copy_selected_automation_points_as_json(&self) -> Option<(String, usize)> {
+        if self.selected_automation_points.is_empty() {
+            return None;
+        }
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct CopiedPoint {
+            time_beat: f64,
+            value_norm: f32,
+            curve: common::model::AutomationCurve,
+        }
+        let mut copied: Vec<CopiedPoint> = Vec::with_capacity(self.selected_automation_points.len());
+        for k in &self.selected_automation_points {
+            let Some(track) = self.song.track_by_id(k.track_id) else {
+                continue;
+            };
+            let Some(lane) = track.lane_by_id(k.lane_id) else {
+                continue;
+            };
+            let Some(clip) = lane.clip_by_id(k.clip_id) else {
+                continue;
+            };
+            let Some(common::model::ClipContent::Automation(a)) =
+                self.song.clip_contents.get(&clip.content_id)
+            else {
+                continue;
+            };
+            let Some(p) = a.points.get(k.point_idx as usize) else {
+                continue;
+            };
+            let value_norm = common::automation::plain_to_norm(&lane.target, p.value);
+            copied.push(CopiedPoint {
+                time_beat: p.time_beat,
+                value_norm,
+                curve: p.curve,
+            });
+        }
+        if copied.is_empty() {
+            return None;
+        }
+        // earliest time_beat を anchor として 0.0 にシフト (Note と同じ)。
+        let earliest = copied
+            .iter()
+            .map(|p| p.time_beat)
+            .fold(f64::INFINITY, f64::min);
+        if earliest.is_finite() {
+            for p in &mut copied {
+                p.time_beat -= earliest;
+            }
+        }
+        let count = copied.len();
+        let json = serde_json::to_string(&copied).ok()?;
+        Some((json, count))
+    }
+
+    /// Phase 3: clipboard 文字列を `Vec<CopiedPoint>` として deserialize
+    /// し、 現在「paste 先 clip」 に挿入する。 paste 先の決定順:
+    ///
+    /// 1. `selected_automation_clips` が単一なら、 その clip
+    /// 2. それ以外で `selected_automation_points` が非空なら、 最初の point
+    ///    が指す clip
+    /// 3. それ以外なら status_message で通知して no-op
+    ///
+    /// anchor: playhead が paste 先 clip の範囲内なら playhead 相対位置、
+    /// それ以外は clip 先頭 (= 0.0)。 各 point は target に応じて norm →
+    /// plain 変換して `insert_at = partition_point` で sort 維持 insert。
+    /// 完了後、 新規挿入 point の idx を `selected_automation_points` に
+    /// 上書き (= 直後に Delete / Move 等が selection 経由で効くように)。
+    pub fn paste_automation_points_from_json(&mut self, json: &str) {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct CopiedPoint {
+            time_beat: f64,
+            value_norm: f32,
+            curve: common::model::AutomationCurve,
+        }
+        let Ok(clipboard) = serde_json::from_str::<Vec<CopiedPoint>>(json) else {
+            return;
+        };
+        if clipboard.is_empty() {
+            return;
+        }
+
+        // paste 先 clip を決定。
+        let dest_key: common::model::AutomationClipKey =
+            if let [only] = self.selected_automation_clips.as_slice() {
+                *only
+            } else if let Some(first) = self.selected_automation_points.first() {
+                common::model::AutomationClipKey {
+                    track: first.track_id,
+                    lane: first.lane_id,
+                    clip: first.clip_id,
+                }
+            } else {
+                self.status_message =
+                    "貼り付け先の automation clip が選択されていません".to_string();
+                return;
+            };
+
+        let Some(track) = self.song.track_by_id(dest_key.track) else {
+            return;
+        };
+        let Some(lane) = track.lane_by_id(dest_key.lane) else {
+            return;
+        };
+        let target = lane.target.clone();
+        let Some(clip) = lane.clip_by_id(dest_key.clip) else {
+            return;
+        };
+        let content_id = clip.content_id;
+        let clip_start = clip.start_beat;
+        let clip_len = clip.length_beats;
+
+        // anchor: playhead が clip 範囲内なら clip-local playhead、 それ以外
+        // は clip 先頭。 playhead 未設定 (= 停止中で初期位置) なら 0.0。
+        let anchor = self
+            .playhead_beat
+            .map(|ph| {
+                let local = ph as f64 - clip_start;
+                if local >= 0.0 && local < clip_len {
+                    local
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+
+        let entry = self
+            .song
+            .clip_contents
+            .entry(content_id)
+            .or_insert_with(|| {
+                common::model::ClipContent::Automation(
+                    common::model::AutomationContent::default(),
+                )
+            });
+        let points = match entry {
+            common::model::ClipContent::Automation(a) => &mut a.points,
+            _ => {
+                self.status_message =
+                    "貼り付け先 clip が automation でない (型不整合)".to_string();
+                return;
+            }
+        };
+
+        // 挿入後の新 idx は sort のたび変動するので、 全 point を挿入し
+        // 終えてから「挿入した値ペア」 で再 lookup する。
+        let mut inserted_pairs: Vec<(f64, f64)> = Vec::with_capacity(clipboard.len());
+        let count = clipboard.len();
+        for src in &clipboard {
+            let plain = common::automation::norm_to_plain(&target, src.value_norm);
+            let t = (src.time_beat + anchor).max(0.0);
+            let new_point = common::model::AutomationPoint {
+                time_beat: t,
+                value: plain,
+                curve: src.curve,
+            };
+            let insert_at = points.partition_point(|p| p.time_beat <= t);
+            points.insert(insert_at, new_point);
+            inserted_pairs.push((t, plain));
+        }
+
+        // 挿入後の idx を retrieve。 idiom は quantize 側と同じ。
+        let new_indices: Vec<u32> = inserted_pairs
+            .iter()
+            .filter_map(|(t, v)| {
+                points
+                    .iter()
+                    .position(|p| (p.time_beat - t).abs() < 1e-9 && (p.value - v).abs() < 1e-9)
+                    .map(|i| i as u32)
+            })
+            .collect();
+
+        self.selected_automation_points = new_indices
+            .into_iter()
+            .map(|i| AutomationPointKeyRef {
+                track_id: dest_key.track,
+                lane_id: dest_key.lane,
+                clip_id: dest_key.clip,
+                point_idx: i,
+            })
+            .collect();
+        self.sync_song_to_plugin_host();
+        self.status_message = format!("貼り付け: {count} オートメーションポイント");
     }
 
     /// 修飾なし drag release。source lane から取り出して target lane へ

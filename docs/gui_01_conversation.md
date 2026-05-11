@@ -1279,4 +1279,154 @@ AppEvent::SetSingleTrackRowH { track_id, prev_px: _, next_px } => {
 
 ---
 
+## #033 [Open] 2026-05-11 [要望] automation 編集機能拡張 (curve 4 種描画 + tension/bend handle + lasso point 選択)
+
+### daw_01 →
+
+- 種別: [要望]
+- 関連 gui_01: `crates/ui/src/widgets/arrangement.rs` (#028 で導入された automation lane 描画 + EditRequest)
+- 関連 gui_01: `crates/ui/src/widgets/automation.rs` (#028 で arrangement widget が curve 描画 / hit-test を担うようになったため現状未使用、 もしくは流用候補)
+- 関連 daw_01: `daw_gui/src/view/arrangement_view.rs`、 `daw_gui/src/app.rs`、 `common/src/model.rs`、 `common/src/automation.rs`
+- 関連仕様: [`daw_01/docs/plan_automation.md`](daw_01/docs/plan_automation.md) §10 Phase 3 (curve / 編集機能拡張)
+
+#### 背景
+
+automation Phase 1 / 2 で **3 種 curve (Hold / Linear / Bezier)** + **point edit / clip drag** + **CLAP plugin parameter 連携** までは land 済。 #028 / #029 / #030 で arrangement widget の lane 行・curve type popup・clip drag は完成。
+
+Phase 3 では **curve 種別の充実 + 多 point 編集** を実装したい。 daw_01 内部 (model + curve evaluator + popup) はすでに以下を完了済 (本セッションでコミット予定):
+
+- `common::model::AutomationCurve` enum に `Exponential { bend: f32 }` variant を追加済 (Phase 1 完了時点)
+- `common::automation::apply_curve` で Bezier tension / Exponential bend を完全評価 (Phase 1)
+- `daw_gui/src/view/arrangement_view.rs` の curve type popup を **`["Hold", "Linear", "Bezier", "Exponential"]` の 4 択化** (本セッション)
+- `daw_gui/src/app.rs` に `selected_automation_points: Vec<AutomationPointKeyRef>` 追加 + copy / paste / quantize / delete handler 実装 (本セッション)
+- shortcut: Ctrl+C / Ctrl+V / Delete を automation point 選択優先に拡張 (本セッション)
+
+未解決なのは **gui_01 widget 側の描画 / 入力**:
+
+1. arrangement widget が curve 種別ごとに描画を分けていない (現状は Catmull-Rom Bezier 固定で全 curve を描画)
+2. Bezier `tension` / Exponential `bend` を変える UI が無い (popup で type は選べるが値は 0.0 固定)
+3. point の **lasso 矩形選択** が無い (= 複数 point の選択 → batch move / delete / copy / quantize ができない)
+4. point の **複数選択時の visual feedback** (selected highlight) が無い
+
+これらを `crates/ui/src/widgets/arrangement.rs` (lane 内 curve / point 描画 + hit-test) で対応してほしい。
+
+#### 期待挙動 (= 最終形態)
+
+##### A. Curve 4 種描画
+
+`ArrangementCurveKind` を 4 variant に拡張、 各 point の `curve` (= incoming curve) に応じて直前 point からの線分形状を切り替える:
+
+```rust
+// gui_01 公開型
+pub enum ArrangementCurveKind {
+    Hold,                              // step jump
+    Linear,                            // 直線
+    Bezier { tension: f32 },           // -1.0..=1.0、 0.0=Catmull-Rom
+    Exponential { bend: f32 },         // -1.0..=1.0、 0.0=linear、 +で前半遅・後半速
+}
+```
+
+描画式 (daw_01 `common::automation::apply_curve` と一致):
+
+- `Hold`: 直前 point の y で水平線、 当該 point で step jump (vertical)
+- `Linear`: 直前 point と当該 point の直線
+- `Bezier { tension }`: cubic Bezier。 制御点 `p1 = prev + (next - prev) * bias`、 `p2 = next - (next - prev) * bias`、 `bias = 1/3 - tension/6`
+- `Exponential { bend }`: `value = prev + (next - prev) * t.powf(2^bend)` の polyline flatten (1/64 beat 刻みで 16 segment 程度の polyline で十分)
+
+##### B. Tension / Bend handle
+
+選択中の **1 point** の incoming segment 中央付近に **1 つの handle** (small circle、 8x8 px) を出し、 上下 drag で `tension` or `bend` を `-1.0..=1.0` で連続変更。 release 時に EditRequest を発火:
+
+```rust
+// 新 EditRequest variant 案
+SetAutomationCurveParam {
+    point: AutomationPointKey,
+    kind: SetAutomationCurveParamKind,
+    prev_value: f32,
+    next_value: f32,
+}
+pub enum SetAutomationCurveParamKind {
+    BezierTension,
+    ExponentialBend,
+}
+```
+
+handle の位置:
+- segment 中央 (= prev と next の中点) に置く
+- y は curve 評価値の高さ + offset (10 px) で curve から飛び出させる (line と区別)
+- handle drag 中は curve も live preview で更新 (= widget が internal preview state を持つ)
+- release 時、 final value を `SetAutomationCurveParam` で発火
+
+Hold / Linear curve では handle 非表示 (= 値を持たない)。
+
+handle 表示の条件:
+- `point` が `selected_automation_points` に含まれている (= selected) → 当該 point の incoming segment に handle 表示
+- 複数選択時は **各 selected point の incoming segment に handle** (= 同じ操作で「選択中 point の curve param をまとめて編集」 もできる、 ただし MVP では単一 point only でも OK)
+
+##### C. Lasso 矩形選択
+
+arrangement widget の lane 内 (= curve / point 描画域) で **空き領域から drag** すると lasso rect を描画。 release 時に rect 内に **中心が含まれる** point を `Vec<AutomationPointKey>` で返す:
+
+```rust
+// 既存 ArrangementEditRequest::SelectAutomationClips と同 idiom
+SelectAutomationPoints {
+    prev: Vec<AutomationPointKey>,
+    next: Vec<AutomationPointKey>,
+}
+```
+
+Modifier:
+- 修飾なし lasso → `next = lasso 内 points` (= 旧 selection 破棄)
+- Shift+lasso → `next = prev ∪ lasso 内 points`
+- Ctrl+lasso → `next = prev XOR lasso 内 points` (= toggle)
+
+短 click (drag 量 < 4 px) は既存の point click と分けて handle:
+- point 上で短 click → 当該 point を single select (= `next = vec![clicked]`)、 Shift で toggle
+- 空き領域で短 click → selection clear (= `next = vec![]`)
+
+##### D. 選択中 point の visual feedback
+
+`ArrangementAutomationLane` (もしくは widget 内 state) に `selected_points: &[AutomationPointKey]` を毎フレーム渡せるよう公開:
+
+```rust
+pub struct ArrangementAutomationLane {
+    // 既存全フィールド維持
+    pub selected_points: Arc<[AutomationPointKey]>,    // NEW
+}
+```
+
+selected point は描画時に:
+- 通常 point: 4x4 px 灰色 dot
+- selected: 6x6 px 白色 dot + 細い枠線
+
+(色 / サイズの具体値は `arrangement_widget_palette` 既定で OK、 user カスタマイズは Phase 4+)
+
+##### E. 既存 EditRequest との関係
+
+- `MoveAutomationPoints(Vec<MoveAutomationPointDelta>)` は **既存のまま** で OK (= lasso で複数選択 → 1 point drag で全選択点を同 delta で move、 widget は selection 全件分の delta を 1 batch で発行)
+- `DeleteAutomationPoints(Vec<AutomationPointKey>)` も既存のまま (delete は daw_01 shortcut Ctrl+Delete で発火、 widget は selection 配列を持つだけ)
+- 新規 EditRequest は **`SelectAutomationPoints`** + **`SetAutomationCurveParam`** の 2 つのみ
+
+#### 想定 Phase 分割
+
+gui_01 内部での着手順序の提案:
+
+- **Phase 63n-7**: Curve 4 種描画 (A) + `ArrangementCurveKind::Exponential` variant 追加。 既存 `Bezier { tension: 0.0 }` fallback はそのまま動く想定。 daw_01 はこの phase で `model_curve_to_widget` を完全変換に置換 (現状の Exponential → Bezier { 0.0 } fallback を削除)
+- **Phase 63n-8**: Lasso 選択 (C) + 選択 visual (D) + `SelectAutomationPoints` EditRequest 発火。 daw_01 はこの phase で `selected_automation_points` への wire 完成 (= lasso → move / delete / copy / paste / quantize が動く)
+- **Phase 63n-9**: Tension / Bend handle (B) + `SetAutomationCurveParam` EditRequest 発火。 daw_01 はこの phase で対応 AppEvent + handler を追加
+
+各 phase は独立 commit + visual check 後 daw_01 に reply 形式で進捗共有。
+
+#### 受け入れ基準
+
+- popup で Exponential を選んだ point の curve が、 実際に exponential として描画される (= visually 直線でなくなる、 bend = 0.0 ならほぼ直線、 daw_01 側で bend を +0.5 / -0.5 にセットすれば曲がる)
+- lasso 矩形 drag で範囲内 point が **白色強調 + 枠線** で複数 selected 表示
+- 複数選択中の **1 point** を drag すると、 同 batch で全 selected point が同 delta で move (daw_01 既存 `MoveAutomationPoints` ハンドラに乗る)
+- Delete 押下で全 selected point が一括削除 (daw_01 既存 `DeleteAutomationPoints` ハンドラに乗る)
+- Ctrl+C で全 selected point が clipboard に JSON 化 (daw_01 `copy_selected_automation_points_as_json` 経由、 本セッションで実装済)
+- Ctrl+V で paste 先 clip (= 唯一の selected automation clip、 もしくは selected point の所属 clip) の playhead 位置に anchored insert (daw_01 `paste_automation_points_from_json` 経由、 本セッションで実装済)
+
+### gui_01 →
+（reply 待ち）
+
 ---

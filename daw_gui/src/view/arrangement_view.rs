@@ -347,17 +347,25 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 右クリックが point rect 上で起きていたら clip popup ループを **skip**
     // する。 これで point popup だけが新規 open され、 clip popup の
     // open_popup が呼ばれない。
+    // popup は daw_01 側で完結する (= widget の `ArrangementCurveKind` を
+    // 介さず直接 `common::model::AutomationCurve` を構築する)。 widget には
+    // まだ `Exponential` variant が無い (gui_01 #033 で対応予定) が、
+    // model layer + curve evaluator は Exponential を完全サポートするので、
+    // popup で Exponential を選んだ point は再生時に Exponential として
+    // 評価される。 widget 側の描画は Bezier { 0.0 } fallback (= 線形に近い
+    // 形) になるが、 #033 完了後に正しく描画される。
     for (point_key, rect) in &resp.automation_point_rects {
         let key = *point_key;
         ui.context_menu_for(
             *rect,
-            &["Hold", "Linear", "Bezier"],
+            &["Hold", "Linear", "Bezier", "Exponential"],
             move |idx, ui| {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     let next = match idx {
-                        0 => ArrangementCurveKind::Hold,
-                        1 => ArrangementCurveKind::Linear,
-                        2 => ArrangementCurveKind::Bezier { tension: 0.0 },
+                        0 => common::model::AutomationCurve::Hold,
+                        1 => common::model::AutomationCurve::Linear,
+                        2 => common::model::AutomationCurve::Bezier { tension: 0.0 },
+                        3 => common::model::AutomationCurve::Exponential { bend: 0.0 },
                         _ => return,
                     };
                     // prev curve を retrieve (Undo 用)。 lookup できなかった
@@ -379,7 +387,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         clip_id: key.clip.clip,
                         point_idx: key.point_idx,
                         prev,
-                        next: widget_curve_to_model(next),
+                        next,
                     });
                 }));
             },
