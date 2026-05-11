@@ -16,6 +16,12 @@ use clap_sys::ext::gui::{
 };
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
 use clap_sys::ext::note_ports::{CLAP_EXT_NOTE_PORTS, clap_plugin_note_ports};
+use clap_sys::ext::params::{
+    CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_HIDDEN,
+    CLAP_PARAM_IS_MODULATABLE, CLAP_PARAM_IS_PERIODIC, CLAP_PARAM_IS_READONLY,
+    CLAP_PARAM_IS_STEPPED, CLAP_PARAM_REQUIRES_PROCESS, clap_param_info,
+    clap_plugin_params,
+};
 use clap_sys::ext::render::{
     CLAP_EXT_RENDER, CLAP_RENDER_OFFLINE, CLAP_RENDER_REALTIME, clap_plugin_render,
 };
@@ -76,6 +82,10 @@ pub struct ClapPlugin {
     /// `clap_plugin_latency` vtable pointer (PR3.3). `None` when the
     /// plugin doesn't implement the latency extension.
     latency_ext: Option<*const clap_plugin_latency>,
+    /// Phase 2: `clap_plugin_params` vtable pointer. `None` when the
+    /// plugin doesn't implement the params extension. Looked up once
+    /// during init, used by `enumerate_params()`.
+    params_ext: Option<*const clap_plugin_params>,
     /// PR4 sidechain: per-aux-input-port channel counts in the plugin's
     /// declared port order. Length capped at `MAX_AUX_IN`. Empty when
     /// the plugin has no `is_main=false` input ports.
@@ -255,6 +265,17 @@ impl ClapPlugin {
         };
         tracing::info!(has_latency = latency_ext.is_some(), "plugin latency extension");
 
+        // Phase 2: Look up optional clap.params extension. Plugins without
+        // it (= no automatable parameters) return an empty param list.
+        let params_ptr = unsafe { get_ext(plugin_ptr, CLAP_EXT_PARAMS.as_ptr()) }
+            as *const clap_plugin_params;
+        let params_ext = if params_ptr.is_null() {
+            None
+        } else {
+            Some(params_ptr)
+        };
+        tracing::info!(has_params = params_ext.is_some(), "plugin params extension");
+
         Ok(Some(Self {
             _library: library,
             entry: entry_ptr,
@@ -284,7 +305,71 @@ impl ClapPlugin {
             aux_input_channels,
             aux_input_buffers: Vec::new(),
             aux_input_ptrs: Vec::new(),
+            params_ext,
         }))
+    }
+
+    /// Phase 2 (`docs/plan_automation.md` §7.5): enumerate every
+    /// parameter the plugin exposes. Calls `clap_plugin_params.count`
+    /// then `get_info` for each index, mapping CLAP flag bits to the
+    /// host's `plugin_param_flags::*`. Names that aren't UTF-8 are
+    /// passed through `from_utf8_lossy`.
+    pub fn enumerate_params(&self) -> Vec<common::protocol::PluginParamInfo> {
+        let Some(params) = self.params_ext else {
+            return Vec::new();
+        };
+        let count_fn = unsafe { (*params).count };
+        let get_info_fn = unsafe { (*params).get_info };
+        let (Some(count_fn), Some(get_info_fn)) = (count_fn, get_info_fn) else {
+            return Vec::new();
+        };
+        let count = unsafe { count_fn(self.plugin) };
+        let mut out: Vec<common::protocol::PluginParamInfo> = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            // SAFETY: clap_param_info is plain old data; zeroed start is
+            // legal because get_info fully overwrites the fields it
+            // populates (CLAP plugins must.)
+            let mut info: clap_param_info = unsafe { std::mem::zeroed() };
+            let ok = unsafe { get_info_fn(self.plugin, i, &raw mut info) };
+            if !ok {
+                tracing::warn!(index = i, "clap_plugin_params.get_info returned false");
+                continue;
+            }
+            let name = c_str_to_string(info.name.as_ptr());
+            let module = c_str_to_string(info.module.as_ptr());
+            let mut flags: u32 = 0;
+            if info.flags & CLAP_PARAM_IS_STEPPED != 0 {
+                flags |= common::protocol::plugin_param_flags::STEPPED;
+            }
+            if info.flags & CLAP_PARAM_IS_PERIODIC != 0 {
+                flags |= common::protocol::plugin_param_flags::PERIODIC;
+            }
+            if info.flags & CLAP_PARAM_IS_READONLY != 0 {
+                flags |= common::protocol::plugin_param_flags::READONLY;
+            }
+            if info.flags & CLAP_PARAM_IS_HIDDEN != 0 {
+                flags |= common::protocol::plugin_param_flags::HIDDEN;
+            }
+            if info.flags & CLAP_PARAM_IS_AUTOMATABLE != 0 {
+                flags |= common::protocol::plugin_param_flags::AUTOMATABLE;
+            }
+            if info.flags & CLAP_PARAM_IS_MODULATABLE != 0 {
+                flags |= common::protocol::plugin_param_flags::MODULATABLE;
+            }
+            if info.flags & CLAP_PARAM_REQUIRES_PROCESS != 0 {
+                flags |= common::protocol::plugin_param_flags::REQUIRES_PROCESS;
+            }
+            out.push(common::protocol::PluginParamInfo {
+                id: info.id,
+                name,
+                module,
+                min_value: info.min_value,
+                max_value: info.max_value,
+                default_value: info.default_value,
+                flags,
+            });
+        }
+        out
     }
 
     pub fn id(&self) -> &str {
@@ -1164,6 +1249,10 @@ impl LoadedPlugin for ClapPlugin {
 
     fn query_latency(&mut self) -> u32 {
         self.query_latency_samples()
+    }
+
+    fn enumerate_params(&self) -> Vec<common::protocol::PluginParamInfo> {
+        ClapPlugin::enumerate_params(self)
     }
 
     fn state_save(&self) -> Result<Option<Vec<u8>>> {

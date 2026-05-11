@@ -15,7 +15,7 @@ use anyhow::Result;
 
 use common::plugin_format::PluginFormat;
 use common::plugin_metadata::NoteMetadata;
-use common::protocol::RenderMode;
+use common::protocol::{PluginParamInfo, RenderMode};
 
 use crate::builtin;
 use crate::clap_plugin::ClapPlugin;
@@ -134,6 +134,18 @@ pub trait LoadedPlugin: Send {
     /// getLatencySamples` requires Setup Done state). Backends without
     /// the extension or that don't expose latency return 0.
     fn query_latency(&mut self) -> u32;
+
+    /// Phase 2 (`daw_01/docs/plan_automation.md` §7.5): enumerate every
+    /// parameter the plugin exposes. Called from the plugin-main thread
+    /// once right after `activate()` succeeds. CLAP / VST3 backends walk
+    /// `clap_plugin_params.{count,get_info}` / `IEditController::
+    /// {getParameterCount, getParameterInfo}` respectively. Default impl
+    /// returns empty (= builtin plugins / Silence). Names that don't fit
+    /// in `String::from_utf8_lossy` are truncated at the first invalid
+    /// byte.
+    fn enumerate_params(&self) -> Vec<PluginParamInfo> {
+        Vec::new()
+    }
 
     // --- persistence (plugin-main thread) -------------------------------
     fn state_save(&self) -> Result<Option<Vec<u8>>>;

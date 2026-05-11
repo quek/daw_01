@@ -47,7 +47,7 @@ impl ChildKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub enum ChildToMain {
     Hello {
         kind: ChildKind,
@@ -152,6 +152,73 @@ pub enum ChildToMain {
         plugin_id: u32,
         samples: u32,
     },
+    /// Phase 2 (`docs/plan_automation.md` §7.5): plugin の parameter
+    /// 一覧。 plugin activate 完了直後に 1 度送信、 `clap_plugin_params
+    /// .changed` 等で rescan 要求が来たら再送。 daw_gui は
+    /// `AppData.plugin_params` にキャッシュして parameter automation
+    /// lane の label / min/max / display 用に使う。
+    PluginParamList {
+        track: u32,
+        slot: PluginSlot,
+        plugin_id: u32,
+        params: Vec<PluginParamInfo>,
+    },
+    /// Phase 2: plugin GUI で knob を **touch** した通知 (= CLAP
+    /// `CLAP_EVENT_PARAM_GESTURE_BEGIN` / VST3 `IComponentHandler
+    /// ::beginEdit` 経由)。 daw_gui の `last_touched_param` を更新し、
+    /// `A` キー shortcut の source にする。 `display_name` は host が
+    /// PluginParamInfo lookup で補完して送る。
+    PluginParamTouched {
+        track: u32,
+        slot: PluginSlot,
+        param_id: u32,
+        display_name: String,
+    },
+    /// Phase 2: plugin GUI 内で parameter 値が変更された通知 (= CLAP
+    /// out_events の `CLAP_EVENT_PARAM_VALUE` / VST3 `performEdit`
+    /// 経由)。 Phase 4 recording mode で point 生成に使う。 Phase 2 で
+    /// は IPC 路を整備するのみ (daw_gui 側は受け取って no-op、 last
+    /// value cache に保存)。
+    PluginParamValueChanged {
+        track: u32,
+        slot: PluginSlot,
+        param_id: u32,
+        value: f64,
+    },
+}
+
+/// Phase 2 (`docs/plan_automation.md` §7.5): 1 parameter のメタデータ。
+/// CLAP `clap_param_info` / VST3 `ParameterInfo` の host 側
+/// representation。 `id` の解釈は plugin format ごと:
+/// - CLAP: `clap_param_info.id` (`clap_id` = `u32`)
+/// - VST3: `Steinberg::Vst::ParamID` = `uint32`
+///
+/// `min_value` / `max_value` / `default_value` は plain 単位 (= plugin
+/// の native スケール)。 VST3 は IEditController が normalized 0..=1 で
+/// 扱うため、 plugin_host 側で `getParamNormalized` → plain 変換
+/// (`plainParamToNormalized` の逆 = `normalizedParamToPlain`) を済ませて
+/// 送る。
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct PluginParamInfo {
+    pub id: u32,
+    pub name: String,
+    pub module: String,
+    pub min_value: f64,
+    pub max_value: f64,
+    pub default_value: f64,
+    pub flags: u32,
+}
+
+/// `PluginParamInfo.flags` のビット定数。 CLAP `clap_param_info_flags`
+/// と 1:1 対応 (VST3 backend も同 bitset に正規化して送る)。
+pub mod plugin_param_flags {
+    pub const STEPPED: u32 = 1 << 0;
+    pub const PERIODIC: u32 = 1 << 1;
+    pub const READONLY: u32 = 1 << 2;
+    pub const HIDDEN: u32 = 1 << 3;
+    pub const AUTOMATABLE: u32 = 1 << 4;
+    pub const MODULATABLE: u32 = 1 << 5;
+    pub const REQUIRES_PROCESS: u32 = 1 << 6;
 }
 
 /// Single entry in the `AllPluginStates` reply.

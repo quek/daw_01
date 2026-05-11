@@ -84,6 +84,14 @@ pub enum PluginEvent {
         plugin_id: u32,
         samples: u32,
     },
+    /// Phase 2 (`docs/plan_automation.md` §7.5): plugin の parameter
+    /// 一覧。 activate / state restore 完了後に 1 度 emit。
+    PluginParamList {
+        track: u32,
+        slot: PluginSlot,
+        plugin_id: u32,
+        params: Vec<common::protocol::PluginParamInfo>,
+    },
     /// `SetSlotPlugin` の load が失敗した (`load_plugin` Err か
     /// `ProcessDataHandle::create` Err)。 daw_gui の `pending_plugin_loads`
     /// を解放するために emit する。 emit せずに `continue` だけで戻ると
@@ -133,6 +141,17 @@ impl From<PluginEvent> for ChildToMain {
             PluginEvent::PluginLatencyChanged { plugin_id, samples } => {
                 ChildToMain::PluginLatencyChanged { plugin_id, samples }
             }
+            PluginEvent::PluginParamList {
+                track,
+                slot,
+                plugin_id,
+                params,
+            } => ChildToMain::PluginParamList {
+                track,
+                slot,
+                plugin_id,
+                params,
+            },
             PluginEvent::PluginLoadFailed {
                 track,
                 slot,
@@ -678,6 +697,27 @@ fn plugin_main_loop(
                                 let _ = evt_tx.send(PluginEvent::PluginLatencyChanged {
                                     plugin_id: new_plugin_id,
                                     samples,
+                                });
+                                // Phase 2 (`docs/plan_automation.md` §7.5):
+                                // activate 完了直後 (CLAP `[main-thread &
+                                // active]` / VST3 `[UI-thread & Setup Done]`)
+                                // で param 一覧を query して daw_gui へ送る。
+                                // daw_gui は `AppData.plugin_params` に
+                                // キャッシュして Parameter Picker / lane の
+                                // label 解決に使う。
+                                let params = unsafe { (*p).enumerate_params() };
+                                if !params.is_empty() {
+                                    tracing::info!(
+                                        plugin_id = new_plugin_id,
+                                        count = params.len(),
+                                        "plugin enumerated params"
+                                    );
+                                }
+                                let _ = evt_tx.send(PluginEvent::PluginParamList {
+                                    track,
+                                    slot,
+                                    plugin_id: new_plugin_id,
+                                    params,
                                 });
                             }
                         }

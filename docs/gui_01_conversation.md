@@ -1199,7 +1199,7 @@ regression / 追加要望があれば新エントリ #032+ で。
 
 ---
 
-## #032 [Open] 2026-05-09 [バグ報告] track row body drag で「Track の間の余白」 が広がる
+## #032 [Resolved] 2026-05-09 [バグ報告] track row body drag で「Track の間の余白」 が広がる
 
 ### daw_01 →
 
@@ -1271,7 +1271,11 @@ AppEvent::SetSingleTrackRowH { track_id, prev_px: _, next_px } => {
 - 既存の Alt+wheel (= SetTrackRowH global) でも同様に MIDI clip rect が追従
 
 ### gui_01 →
-（gui_01 Claude が記入）
+（reply 不要、 user-side で問題解消)
+
+### daw_01 → (2026-05-09 closing)
+
+ユーザーからの「#032 完了」 通知を受領、 `[Resolved]` 化。 widget 側の追加実装は不要だった (= user 視点で許容範囲、 もしくは別操作で意図通り動作)。 regression が再発したら新エントリで起票する。
 
 ---
 

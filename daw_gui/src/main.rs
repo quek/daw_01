@@ -225,6 +225,42 @@ fn spawn_incoming_bridge(
                     frames,
                 }),
                 ChildToMain::Hello { .. } => None,
+                // Phase 2 (`docs/plan_automation.md` §7.5): plugin の
+                // parameter 一覧 / touch / value change を AppEvent に
+                // 変換して app に流す。 詳細 handler は app.rs 側。
+                ChildToMain::PluginParamList {
+                    track,
+                    slot,
+                    plugin_id,
+                    params,
+                } => Some(AppEvent::PluginParamListFromChild {
+                    track,
+                    slot,
+                    plugin_id,
+                    params,
+                }),
+                ChildToMain::PluginParamTouched {
+                    track,
+                    slot,
+                    param_id,
+                    display_name,
+                } => Some(AppEvent::PluginParamTouchedFromChild {
+                    track,
+                    slot,
+                    param_id,
+                    display_name,
+                }),
+                ChildToMain::PluginParamValueChanged {
+                    track,
+                    slot,
+                    param_id,
+                    value,
+                } => Some(AppEvent::PluginParamValueChangedFromChild {
+                    track,
+                    slot,
+                    param_id,
+                    value,
+                }),
             };
             if let Some(event) = event
                 && proxy.send_event(event).is_err()

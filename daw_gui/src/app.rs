@@ -334,6 +334,15 @@ pub struct AppData {
     /// shortcut で「対応 lane を所有 track に追加」 する source。
     /// session-only (起動 None、Undo / save 対象外)。
     pub last_touched_param: Option<TouchedParam>,
+    /// Phase 2 (`docs/plan_automation.md` §7.5): plugin parameter
+    /// 一覧キャッシュ。 plugin host が `PluginParamList` IPC で送って
+    /// くるたびに上書き。 `(track_id, slot)` で identify、 Parameter
+    /// Picker (Phase 3+) / lane の label 解決 / norm↔plain 変換に
+    /// 使う。 session-only (save 対象外、 plugin reload で再取得)。
+    pub plugin_params: std::collections::HashMap<
+        (u32, common::protocol::PluginSlot),
+        Vec<common::protocol::PluginParamInfo>,
+    >,
     /// gui_01 #031 (M14 Phase 63n-6): track ごとの row 高さ override。
     /// `Some(px)` で個別 track 高さ、`None` (= map に entry なし) で
     /// global default `arrange_track_row_h` を使う。 widget の Alt+drag
@@ -639,6 +648,7 @@ impl AppData {
             expanded_automation_tracks: std::collections::HashSet::new(),
             selected_automation_clips: Vec::new(),
             last_touched_param: None,
+            plugin_params: std::collections::HashMap::new(),
             track_row_overrides: std::collections::HashMap::new(),
             track_plugin_ids: std::collections::HashMap::new(),
             loaded_slots: std::collections::HashMap::new(),
@@ -1650,6 +1660,32 @@ pub enum AppEvent {
     /// れば新規作成 (default = 現在の plain 値)。`expanded_automation_tracks`
     /// にも所有 track を insert して即時展開。
     AddAutomationFromLastTouched,
+    /// Phase 2 (`docs/plan_automation.md` §7.5): plugin から param 一覧を
+    /// 受信。 plugin_params にキャッシュ。 plugin reload / `params.changed`
+    /// 経由で送られるたびに上書き。
+    PluginParamListFromChild {
+        track: u32,
+        slot: common::protocol::PluginSlot,
+        plugin_id: u32,
+        params: Vec<common::protocol::PluginParamInfo>,
+    },
+    /// Phase 2: plugin GUI で knob touch (CLAP gesture begin / VST3
+    /// beginEdit)。 last_touched_param を plugin param で更新する。
+    PluginParamTouchedFromChild {
+        track: u32,
+        slot: common::protocol::PluginSlot,
+        param_id: u32,
+        display_name: String,
+    },
+    /// Phase 2: plugin GUI 内で value 変更 (CLAP out_event PARAM_VALUE
+    /// / VST3 performEdit)。 Phase 2 では cache 用、 Phase 4 で recording
+    /// mode の point 生成 source。
+    PluginParamValueChangedFromChild {
+        track: u32,
+        slot: common::protocol::PluginSlot,
+        param_id: u32,
+        value: f64,
+    },
     /// gui_01 #029 (M14 Phase 63n-4): lane body 内 clip ギャップ
     /// dblclick で発行される clip 作成イベント。MIDI clip の
     /// `DoubleClickEmpty → CreateClip` と同 idiom の lane 版。
@@ -2344,6 +2380,34 @@ impl AppData {
             }
             AppEvent::AddAutomationFromLastTouched => {
                 self.add_automation_from_last_touched();
+            }
+            AppEvent::PluginParamListFromChild {
+                track,
+                slot,
+                plugin_id: _,
+                params,
+            } => {
+                self.plugin_params.insert((track, slot), params);
+            }
+            AppEvent::PluginParamTouchedFromChild {
+                track,
+                slot,
+                param_id,
+                display_name,
+            } => {
+                self.last_touched_param = Some(TouchedParam {
+                    track_id: track,
+                    target: common::model::AutomationTarget::PluginParam {
+                        slot,
+                        param_id,
+                    },
+                    display_name,
+                    touched_at: std::time::Instant::now(),
+                });
+            }
+            AppEvent::PluginParamValueChangedFromChild { .. } => {
+                // Phase 2: cache のみ (Phase 4 で recording mode の
+                // point 生成 source として使う)。 当面 no-op。
             }
             AppEvent::CreateAutomationClip {
                 lane,
