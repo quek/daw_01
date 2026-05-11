@@ -791,10 +791,9 @@ SSOT 遵守)。
       knob を回す → `A` キー → Cutoff lane が出来て default = 直前値、再生時に
       cutoff が curve 通りに動く + plugin GUI の knob も同期して動く
 
-### Phase 3: Curve / 編集機能拡張
+### Phase 3: Curve / 編集機能拡張 ✅ **完了** (2026-05-11)
 
-daw_01 側で完結する部分は本 phase で完了。 widget 側 (lasso 選択 / curve 種別描画 /
-tension+bend handle) は gui_01 #033 として依頼済 (3 phase 分割提案)。
+gui_01 #033 (Phase 63n-7 / -8 / -9) と daw_01 wire 全て land。 全項目達成。
 
 - [x] AutomationCurve: Bezier tension / Exponential bend 評価関数 (Phase 1 で
       実装済、 `common/src/automation.rs::apply_curve`)
@@ -836,10 +835,21 @@ tension+bend handle) は gui_01 #033 として依頼済 (3 phase 分割提案)�
           `AppEvent::SelectAutomationPoints` dispatch
       (c) lasso → copy / paste / delete / quantize batch が即動作
           (selection 配線 + shortcut 優先順は #033 第 1 reply で先行配線済)
-- [ ] gui_01 #033 Phase 63n-9 reply 待ち: tension/bend handle drag +
-      `SetAutomationCurveParam` EditRequest
-- [ ] Phase 63n-9 land 後の wire: `SetAutomationCurveBezierTension` /
-      `SetAutomationCurveExponentialBend` AppEvent + handler + `is_undoable`
+- [x] gui_01 #033 Phase 63n-9 reply 受領 (2026-05-11): Bezier/Exponential
+      curve 中央 handle drag (lane 高さ連動 30 px = full range / Alt × 0.2
+      微調整) + live preview + `SetAutomationCurveParam { point, kind:
+      SetAutomationCurveParamKind, prev_value, next_value }` EditRequest
+- [x] Phase 63n-9 wire (本セッション):
+      (a) `AppEvent::SetAutomationCurveBezierTension` /
+          `SetAutomationCurveExponentialBend` 2 variant 追加 (既存
+          `SetLaneEnabled` / `SetLaneVisible` 等の per-field 別 variant idiom)
+      (b) `set_automation_curve_bezier_tension` / `set_automation_curve_exponential_bend`
+          handler 追加 (`matches!` で current curve type と一致するときのみ更新、
+          race 防止、 defensive で `clamp(-1.0, 1.0)`)
+      (c) `arrangement_view.rs::make_edit` に `SetAutomationCurveParam` arm
+          追加、 kind で 2 AppEvent に分岐 dispatch
+      (d) `is_undoable` に 2 AppEvent 登録
+- [x] **#033 完結** (Phase 63n-7 / -8 / -9 all wired)。 Phase 3 全項目達成。
 - [ ] smoke test (gui_01 #033 完了後): lasso で複数 point 選択 → Move /
       Delete / Copy / Paste / Quantize / curve type change が batch で動作する
 

@@ -886,6 +886,46 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
                 });
             })
         }
+        // gui_01 #033 (M14 Phase 63n-9): Bezier / Exponential curve の中央
+        // handle drag release で 1 件発火。 widget は `kind` で 2 種を
+        // discriminate するが、 daw_01 側は AppEvent dispatch を簡潔化する
+        // ため kind ごとに **別 AppEvent** に分けて変換 (= 既存
+        // `SetLaneEnabled` / `SetLaneVisible` 等の「per-field 別 variant」
+        // idiom と一致)。 widget で `-1.0..=1.0` clamp 済 (handler 側も
+        // defensive で再 clamp)。
+        ArrangementEditRequest::SetAutomationCurveParam {
+            point,
+            kind,
+            prev_value,
+            next_value,
+        } => Edit::mutate(move |app: &mut AppData| {
+            let track_id = point.clip.track;
+            let lane_id = point.clip.lane;
+            let clip_id = point.clip.clip;
+            let point_idx = point.point_idx;
+            match kind {
+                daw_ui_core::SetAutomationCurveParamKind::BezierTension => {
+                    app.handle_event(AppEvent::SetAutomationCurveBezierTension {
+                        track_id,
+                        lane_id,
+                        clip_id,
+                        point_idx,
+                        prev: prev_value,
+                        next: next_value,
+                    });
+                }
+                daw_ui_core::SetAutomationCurveParamKind::ExponentialBend => {
+                    app.handle_event(AppEvent::SetAutomationCurveExponentialBend {
+                        track_id,
+                        lane_id,
+                        clip_id,
+                        point_idx,
+                        prev: prev_value,
+                        next: next_value,
+                    });
+                }
+            }
+        }),
         // gui_01 #033 (M14 Phase 63n-8): lasso 矩形 / 短 click による
         // automation point selection 変更。 widget は zone 排他 lasso (空き
         // zone のみ起動) と modifier 分岐 (修飾なし=replace / Shift=union /

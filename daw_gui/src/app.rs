@@ -1274,6 +1274,12 @@ impl AppData {
                 // Phase 3: point quantize は構造変化系として Undo step
                 // 化。 SelectAutomationPoints は session-only なので除外。
                 | AppEvent::QuantizeSelectedAutomationPoints(_)
+                // gui_01 #033 Phase 63n-9: tension/bend handle drag は
+                // release frame の 1 件のみ発火 (widget 内仕様、 連続発火
+                // による Undo 履歴爆発はない)。 値 1 件で point の curve
+                // を上書きする structural change なので Undo step 化。
+                | AppEvent::SetAutomationCurveBezierTension { .. }
+                | AppEvent::SetAutomationCurveExponentialBend { .. }
         )
     }
 
@@ -1616,6 +1622,32 @@ pub enum AppEvent {
         point_idx: u32,
         prev: common::model::AutomationCurve,
         next: common::model::AutomationCurve,
+    },
+    /// gui_01 #033 Phase 63n-9: Bezier curve 中央 handle drag (lane 高さ
+    /// 連動 sensitivity、 Alt × 0.2 微調整) の release で 1 件発火。
+    /// 当該 point の `curve` を `AutomationCurve::Bezier { tension: next }`
+    /// で上書きする。 widget 側で `-1.0..=1.0` clamp 済。 type が Bezier
+    /// 以外だった場合 (= race) は no-op (handler 内で current curve を
+    /// 確認、 異なれば skip)。
+    SetAutomationCurveBezierTension {
+        track_id: u32,
+        lane_id: u32,
+        clip_id: u32,
+        point_idx: u32,
+        prev: f32,
+        next: f32,
+    },
+    /// gui_01 #033 Phase 63n-9: Exponential curve 中央 handle drag の
+    /// release で 1 件発火。 当該 point の `curve` を `Exponential { bend:
+    /// next }` で上書き。 値域 / race 扱いは `SetAutomationCurveBezierTension`
+    /// と同。
+    SetAutomationCurveExponentialBend {
+        track_id: u32,
+        lane_id: u32,
+        clip_id: u32,
+        point_idx: u32,
+        prev: f32,
+        next: f32,
     },
     // ----------------------------------------------------------------
     // gui_01 #028 (M14 Phase 63n-3) — automation clip drag / select
@@ -2368,6 +2400,26 @@ impl AppData {
                 prev: _,
                 next,
             } => self.set_automation_curve_type(track_id, lane_id, clip_id, point_idx, next),
+            AppEvent::SetAutomationCurveBezierTension {
+                track_id,
+                lane_id,
+                clip_id,
+                point_idx,
+                prev: _,
+                next,
+            } => self.set_automation_curve_bezier_tension(
+                track_id, lane_id, clip_id, point_idx, next,
+            ),
+            AppEvent::SetAutomationCurveExponentialBend {
+                track_id,
+                lane_id,
+                clip_id,
+                point_idx,
+                prev: _,
+                next,
+            } => self.set_automation_curve_exponential_bend(
+                track_id, lane_id, clip_id, point_idx, next,
+            ),
             AppEvent::MoveAutomationClips { deltas } => {
                 self.move_automation_clips(&deltas)
             }
@@ -4447,6 +4499,79 @@ impl AppData {
         };
         if let Some(p) = a.points.get_mut(point_idx as usize) {
             p.curve = next;
+            self.sync_song_to_plugin_host();
+        }
+    }
+
+    /// gui_01 #033 Phase 63n-9: Bezier curve handle drag release で 1 件
+    /// 発火される `SetAutomationCurveBezierTension` の handler。 既存
+    /// curve type が `Bezier` でない場合は no-op (= race / 仕様外発火)。
+    /// `next` は widget で `-1.0..=1.0` clamp 済だが、 defensive で再 clamp。
+    fn set_automation_curve_bezier_tension(
+        &mut self,
+        track_id: u32,
+        lane_id: u32,
+        clip_id: u32,
+        point_idx: u32,
+        next: f32,
+    ) {
+        let Some(track) = self.song.track_by_id_mut(track_id) else {
+            return;
+        };
+        let Some(lane) = track.lane_by_id_mut(lane_id) else {
+            return;
+        };
+        let Some(clip) = lane.clip_by_id(clip_id) else {
+            return;
+        };
+        let content_id = clip.content_id;
+        let Some(common::model::ClipContent::Automation(a)) =
+            self.song.clip_contents.get_mut(&content_id)
+        else {
+            return;
+        };
+        if let Some(p) = a.points.get_mut(point_idx as usize)
+            && matches!(p.curve, common::model::AutomationCurve::Bezier { .. })
+        {
+            p.curve = common::model::AutomationCurve::Bezier {
+                tension: next.clamp(-1.0, 1.0),
+            };
+            self.sync_song_to_plugin_host();
+        }
+    }
+
+    /// gui_01 #033 Phase 63n-9: Exponential curve handle drag release で
+    /// 発火される `SetAutomationCurveExponentialBend` の handler。 既存
+    /// curve type が `Exponential` でない場合は no-op。
+    fn set_automation_curve_exponential_bend(
+        &mut self,
+        track_id: u32,
+        lane_id: u32,
+        clip_id: u32,
+        point_idx: u32,
+        next: f32,
+    ) {
+        let Some(track) = self.song.track_by_id_mut(track_id) else {
+            return;
+        };
+        let Some(lane) = track.lane_by_id_mut(lane_id) else {
+            return;
+        };
+        let Some(clip) = lane.clip_by_id(clip_id) else {
+            return;
+        };
+        let content_id = clip.content_id;
+        let Some(common::model::ClipContent::Automation(a)) =
+            self.song.clip_contents.get_mut(&content_id)
+        else {
+            return;
+        };
+        if let Some(p) = a.points.get_mut(point_idx as usize)
+            && matches!(p.curve, common::model::AutomationCurve::Exponential { .. })
+        {
+            p.curve = common::model::AutomationCurve::Exponential {
+                bend: next.clamp(-1.0, 1.0),
+            };
             self.sync_song_to_plugin_host();
         }
     }
