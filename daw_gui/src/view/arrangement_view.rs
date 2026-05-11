@@ -255,6 +255,23 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         })
         .collect();
 
+    // gui_01 #033 (M14 Phase 63n-8): 選択中の automation point を widget 型
+    // (`AutomationPointKey { clip: AutomationClipKey, point_idx }`) に変換。
+    // daw_01 内部は flat な `AutomationPointKeyRef { track_id, lane_id,
+    // clip_id, point_idx }`、 widget は構造化 key を持つので 1:1 写像。
+    let selected_automation_points_widget: Vec<daw_ui_core::AutomationPointKey> = app
+        .selected_automation_points
+        .iter()
+        .map(|k| daw_ui_core::AutomationPointKey {
+            clip: daw_ui_core::AutomationClipKey {
+                track: k.track_id,
+                lane: k.lane_id,
+                clip: k.clip_id,
+            },
+            point_idx: k.point_idx,
+        })
+        .collect();
+
     let resp = ui.arrangement(
         "arrangement",
         area,
@@ -263,6 +280,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         &selected_clips,
         selected_tracks,
         &selected_automation_clips_widget,
+        &selected_automation_points_widget,
         &style,
         make_edit,
     );
@@ -863,6 +881,37 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
                 let next_model: Vec<common::model::AutomationClipKey> =
                     next.into_iter().map(widget_to_model_clip_key).collect();
                 app.handle_event(AppEvent::SelectAutomationClips {
+                    prev: prev_model,
+                    next: next_model,
+                });
+            })
+        }
+        // gui_01 #033 (M14 Phase 63n-8): lasso 矩形 / 短 click による
+        // automation point selection 変更。 widget は zone 排他 lasso (空き
+        // zone のみ起動) と modifier 分岐 (修飾なし=replace / Shift=union /
+        // Ctrl=XOR) を内包済、 daw_01 側は `prev` / `next` をそのまま
+        // `selected_automation_points` に上書きするだけ。
+        ArrangementEditRequest::SelectAutomationPoints { prev, next } => {
+            Edit::mutate(move |app: &mut AppData| {
+                let prev_model: Vec<crate::app::AutomationPointKeyRef> = prev
+                    .into_iter()
+                    .map(|k| crate::app::AutomationPointKeyRef {
+                        track_id: k.clip.track,
+                        lane_id: k.clip.lane,
+                        clip_id: k.clip.clip,
+                        point_idx: k.point_idx,
+                    })
+                    .collect();
+                let next_model: Vec<crate::app::AutomationPointKeyRef> = next
+                    .into_iter()
+                    .map(|k| crate::app::AutomationPointKeyRef {
+                        track_id: k.clip.track,
+                        lane_id: k.clip.lane,
+                        clip_id: k.clip.clip,
+                        point_idx: k.point_idx,
+                    })
+                    .collect();
+                app.handle_event(AppEvent::SelectAutomationPoints {
                     prev: prev_model,
                     next: next_model,
                 });

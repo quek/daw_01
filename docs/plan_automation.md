@@ -822,12 +822,22 @@ tension+bend handle) は gui_01 #033 として依頼済 (3 phase 分割提案)�
       (b) popup 選択時 default を `Bezier { tension: 0.5 }` /
           `Exponential { bend: 0.5 }` に変更 (0.0 は新式で Linear 等価、
           選択後 visually 形状変化を保証)
-- [ ] gui_01 #033 Phase 63n-8 reply 待ち: lasso 矩形選択 + selected point
-      visual feedback + `SelectAutomationPoints` EditRequest
+- [x] gui_01 #033 Phase 63n-8 reply 受領 (2026-05-11): lasso 矩形選択 +
+      multi-select point drag + selection visual feedback +
+      `SelectAutomationPoints` EditRequest + widget API 第 8 引数
+      `selected_automation_points: &[AutomationPointKey]` + Response
+      field `automation_lasso_active: bool`
+- [x] Phase 63n-8 wire (本セッション):
+      (a) `arrangement_view.rs::draw` で `selected_automation_points` を
+          widget 型 (`AutomationPointKey { clip, point_idx }`) に変換して
+          widget 第 8 引数として渡す
+      (b) `arrangement_view.rs::make_edit` に `SelectAutomationPoints { prev,
+          next }` arm を追加、 widget key → `AutomationPointKeyRef` 変換して
+          `AppEvent::SelectAutomationPoints` dispatch
+      (c) lasso → copy / paste / delete / quantize batch が即動作
+          (selection 配線 + shortcut 優先順は #033 第 1 reply で先行配線済)
 - [ ] gui_01 #033 Phase 63n-9 reply 待ち: tension/bend handle drag +
       `SetAutomationCurveParam` EditRequest
-- [ ] Phase 63n-8 land 後の wire: `SelectAutomationPoints` EditRequest arm
-      を `arrangement_view.rs::make_edit` に追加、 widget Response → AppEvent
 - [ ] Phase 63n-9 land 後の wire: `SetAutomationCurveBezierTension` /
       `SetAutomationCurveExponentialBend` AppEvent + handler + `is_undoable`
 - [ ] smoke test (gui_01 #033 完了後): lasso で複数 point 選択 → Move /
