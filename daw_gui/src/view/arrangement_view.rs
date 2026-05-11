@@ -348,12 +348,19 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // する。 これで point popup だけが新規 open され、 clip popup の
     // open_popup が呼ばれない。
     // popup は daw_01 側で完結する (= widget の `ArrangementCurveKind` を
-    // 介さず直接 `common::model::AutomationCurve` を構築する)。 widget には
-    // まだ `Exponential` variant が無い (gui_01 #033 で対応予定) が、
-    // model layer + curve evaluator は Exponential を完全サポートするので、
-    // popup で Exponential を選んだ point は再生時に Exponential として
-    // 評価される。 widget 側の描画は Bezier { 0.0 } fallback (= 線形に近い
-    // 形) になるが、 #033 完了後に正しく描画される。
+    // 介さず直接 `common::model::AutomationCurve` を構築する)。 gui_01 #033
+    // Phase 63n-7 で widget に Exponential variant が追加されたので 4 種
+    // 完全描画 + 評価。
+    //
+    // popup 選択時 default 値:
+    //  - Bezier { tension: 0.5 } — 新式 SSoT で `tension=0.0` は Linear と
+    //    完全に同じ直線、 「Bezier を選んだのに直線のまま」 という bug-like
+    //    UX を避けるため 0.5 (= 中程度の S 字) を default に。
+    //  - Exponential { bend: 0.5 } — 同様に、 `bend=0.0` は Linear 等価。
+    //    +0.5 で前半遅・後半速 default (Exponential らしい形状をすぐ視認)。
+    //
+    // 数値を ±1.0 まで動かす UI は Phase 63n-9 (tension/bend handle) で
+    // landing 予定。 それまでは popup で curve type を選んで default で固定。
     for (point_key, rect) in &resp.automation_point_rects {
         let key = *point_key;
         ui.context_menu_for(
@@ -364,8 +371,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     let next = match idx {
                         0 => common::model::AutomationCurve::Hold,
                         1 => common::model::AutomationCurve::Linear,
-                        2 => common::model::AutomationCurve::Bezier { tension: 0.0 },
-                        3 => common::model::AutomationCurve::Exponential { bend: 0.0 },
+                        2 => common::model::AutomationCurve::Bezier { tension: 0.5 },
+                        3 => common::model::AutomationCurve::Exponential { bend: 0.5 },
                         _ => return,
                     };
                     // prev curve を retrieve (Undo 用)。 lookup できなかった
@@ -1317,31 +1324,27 @@ fn plain_to_norm(target: &common::model::AutomationTarget, plain: f64) -> f32 {
 }
 
 /// `common::model::AutomationCurve` (incoming curve) → widget
-/// `ArrangementCurveKind` の対応変換。 同 3 種を 1:1 で対応させる。
-/// `Exponential` は Phase 3+ で widget 側にも variant を追加してから
-/// 扱う想定だが、 暫定で `Bezier { tension: 0.0 }` (= Catmull-Rom) に
-/// fallback する。
+/// `ArrangementCurveKind` の対応変換。 gui_01 #033 Phase 63n-7 で widget
+/// 側に `Exponential` variant が追加されたので 4 種完全変換。
 fn model_curve_to_widget(c: common::model::AutomationCurve) -> ArrangementCurveKind {
     use common::model::AutomationCurve;
     match c {
         AutomationCurve::Hold => ArrangementCurveKind::Hold,
         AutomationCurve::Linear => ArrangementCurveKind::Linear,
         AutomationCurve::Bezier { tension } => ArrangementCurveKind::Bezier { tension },
-        AutomationCurve::Exponential { .. } => {
-            ArrangementCurveKind::Bezier { tension: 0.0 }
-        }
+        AutomationCurve::Exponential { bend } => ArrangementCurveKind::Exponential { bend },
     }
 }
 
 /// 逆変換。 widget が popup で返してきた `ArrangementCurveKind` を
-/// model の `AutomationCurve` に戻す。 widget には `Exponential` が
-/// 無いので 1:1 で安全。
+/// model の `AutomationCurve` に戻す。 4 種 1:1。
 fn widget_curve_to_model(c: ArrangementCurveKind) -> common::model::AutomationCurve {
     use common::model::AutomationCurve;
     match c {
         ArrangementCurveKind::Hold => AutomationCurve::Hold,
         ArrangementCurveKind::Linear => AutomationCurve::Linear,
         ArrangementCurveKind::Bezier { tension } => AutomationCurve::Bezier { tension },
+        ArrangementCurveKind::Exponential { bend } => AutomationCurve::Exponential { bend },
     }
 }
 

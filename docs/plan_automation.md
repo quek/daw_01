@@ -166,7 +166,8 @@ pub enum AutomationCurve {
     ///   - 制御点 y は対角線と end-hold の lerp:
     ///       tension >= 0: c1y = lerp(diag1, a, tension), c2y = lerp(diag2, b, tension)
     ///       tension <  0: c1y = lerp(diag1, b, |tension|), c2y = lerp(diag2, a, |tension|)
-    ///   - 時間軸 u → Bezier parameter t は Newton iter 8 回 (RT 安全)
+    ///   - x(t) は Bernstein 基底で打ち消し合って `x(t) = t` に縮退、
+    ///     時間軸 u から Bezier parameter t は `t = u` で即決定 (Newton 不要)
     ///   - tension=0 で 4 制御点が対角線上 → 直線 (= Linear と一致)
     ///   - tension=+1.0 で S 字 (両端緩い)
     ///   - tension=-1.0 で inverse S 字 (overshoot 系)
@@ -812,14 +813,23 @@ tension+bend handle) は gui_01 #033 として依頼済 (3 phase 分割提案)�
       selection も `(snapped_time, value)` で再 lookup して新 idx に更新
 - [x] shortcut: Ctrl+C / Ctrl+V / Delete を automation point 選択優先に拡張
       (`daw_gui/src/view/root.rs::dispatch_shortcuts`)
-- [ ] gui_01 #033 reply 受領: curve 4 種描画 + tension/bend handle + lasso 選択 +
-      selected point visual feedback (= widget 側 schema 拡張 +
-      `SelectAutomationPoints` / `SetAutomationCurveParam` EditRequest 発火)
-- [ ] gui_01 #033 完了後の wire:
-      (a) `model_curve_to_widget` の Exponential fallback を削除して完全変換に
-      (b) `SetAutomationCurveParam` 対応 AppEvent (`SetAutomationCurveBezierTension`
-          / `SetAutomationCurveExponentialBend`) + handler
-      (c) `is_undoable` に追加
+- [x] gui_01 #033 Phase 63n-7 reply 受領 (2026-05-11):
+      curve 4 種描画 + `ArrangementCurveKind::Exponential { bend }` variant
+      追加 + Bezier 描画式を daw_01 SSoT (新 S 字 cubic) と完全同期
+- [x] Phase 63n-7 wire (本セッション):
+      (a) `model_curve_to_widget` / `widget_curve_to_model` を 4 種完全変換に
+          (Exponential fallback 撤廃)
+      (b) popup 選択時 default を `Bezier { tension: 0.5 }` /
+          `Exponential { bend: 0.5 }` に変更 (0.0 は新式で Linear 等価、
+          選択後 visually 形状変化を保証)
+- [ ] gui_01 #033 Phase 63n-8 reply 待ち: lasso 矩形選択 + selected point
+      visual feedback + `SelectAutomationPoints` EditRequest
+- [ ] gui_01 #033 Phase 63n-9 reply 待ち: tension/bend handle drag +
+      `SetAutomationCurveParam` EditRequest
+- [ ] Phase 63n-8 land 後の wire: `SelectAutomationPoints` EditRequest arm
+      を `arrangement_view.rs::make_edit` に追加、 widget Response → AppEvent
+- [ ] Phase 63n-9 land 後の wire: `SetAutomationCurveBezierTension` /
+      `SetAutomationCurveExponentialBend` AppEvent + handler + `is_undoable`
 - [ ] smoke test (gui_01 #033 完了後): lasso で複数 point 選択 → Move /
       Delete / Copy / Paste / Quantize / curve type change が batch で動作する
 

@@ -137,9 +137,10 @@ pub fn evaluate_clip(content: &AutomationContent, t: f64) -> f64 {
 /// 滑らかな S 字。 `tension = -1.0` で制御点 y が反対 end で hold される
 /// inverse S 字 (overshoot 系)。
 ///
-/// 時間軸 `u` (clip-local 比、 0..=1) から Bezier parameter `t` を Newton
-/// 法で逆算する (`c1x < c2x` かつ ∈ `(0, 1)` なので `x(t)` は monotonic、
-/// 高々 8 iter で 1e-9 まで収束)。 RT 安全 (heap alloc / I/O なし)。
+/// 制御点 x が (1/3, 2/3) 固定なので Bernstein 基底で打ち消し合って
+/// `x(t) = t` に縮退、 時間軸 `u` から Bezier parameter `t` は `t = u`
+/// で即決定 (Newton iter 不要)。 RT 安全 (O(1) operations、 heap alloc
+/// / I/O なし)。 詳細は `eval_bezier` の docstring。
 #[inline]
 pub fn apply_curve(a: f64, b: f64, u: f64, curve: AutomationCurve) -> f64 {
     let u = u.clamp(0.0, 1.0);
@@ -158,50 +159,34 @@ pub fn apply_curve(a: f64, b: f64, u: f64, curve: AutomationCurve) -> f64 {
     }
 }
 
-/// Bezier curve 評価 (`apply_curve` 内で SSoT)。 module 公開で gui_01
-/// widget からのミラー実装の単体テストに使えるよう pub(crate)。
-const BEZIER_C1X: f64 = 1.0 / 3.0;
-const BEZIER_C2X: f64 = 2.0 / 3.0;
-
+/// Bezier curve 評価 (`apply_curve` 内で SSoT)。
+///
+/// 制御点 x = (1/3, 2/3) 固定なので、 Bernstein 基底で打ち消し合って
+/// **`x(t) = t` に縮退**する (gui_01 #033 reply で指摘された数学的観察):
+///
+/// ```text
+///   x(t) = (1-t)^3 * 0 + 3(1-t)^2*t * (1/3) + 3(1-t)*t^2 * (2/3) + t^3 * 1
+///        = (1-t)^2 * t + 2(1-t) * t^2 + t^3
+///        = t * ((1-t) + t)^2
+///        = t
+/// ```
+///
+/// よって時間軸 `u` から Bezier parameter `t` への逆算は不要 (`t = u`)。
+/// y のみ 4 制御点 Bernstein 形で評価。 RT 安全 (O(1) operations、 ヒープ
+/// alloc / I/O なし)。
 #[inline]
 fn eval_bezier(a: f64, b: f64, u: f64, tension: f64) -> f64 {
     // tension で制御点 y を対角線 (linear) と end-hold の間で blend。
-    let diag1 = a + (b - a) * BEZIER_C1X;
-    let diag2 = a + (b - a) * BEZIER_C2X;
+    let diag1 = a + (b - a) * (1.0 / 3.0);
+    let diag2 = a + (b - a) * (2.0 / 3.0);
     let mix = tension.abs().min(1.0);
     let (target1, target2) = if tension >= 0.0 { (a, b) } else { (b, a) };
     let c1y = diag1 * (1.0 - mix) + target1 * mix;
     let c2y = diag2 * (1.0 - mix) + target2 * mix;
-    let t = solve_bezier_t(u);
+    // x(t) = t に縮退するので t = u をそのまま使う (Newton iter 不要)。
+    let t = u;
     let omt = 1.0 - t;
     omt.powi(3) * a + 3.0 * omt.powi(2) * t * c1y + 3.0 * omt * t.powi(2) * c2y + t.powi(3) * b
-}
-
-/// `x(t) = u` を Newton 法で解いて Bezier parameter `t` を返す。 制御点
-/// x が `(1/3, 2/3)` 固定 (`tension` で動かさない) なので `x(t)` は
-/// strictly increasing、 Newton は確実に収束する。 RT 安全。
-#[inline]
-fn solve_bezier_t(u: f64) -> f64 {
-    let mut t = u; // 初期推定: linear 近似
-    for _ in 0..8 {
-        let omt = 1.0 - t;
-        let x = 3.0 * omt * omt * t * BEZIER_C1X
-            + 3.0 * omt * t * t * BEZIER_C2X
-            + t * t * t;
-        let err = x - u;
-        if err.abs() < 1e-9 {
-            break;
-        }
-        let dx = 3.0 * omt * omt * BEZIER_C1X
-            + 6.0 * omt * t * (BEZIER_C2X - BEZIER_C1X)
-            + 3.0 * t * t * (1.0 - BEZIER_C2X);
-        if dx.abs() < 1e-12 {
-            break;
-        }
-        t -= err / dx;
-        t = t.clamp(0.0, 1.0);
-    }
-    t
 }
 
 /// Resolve `lane` at `song_beat` (song timeline). Walks the lane's
