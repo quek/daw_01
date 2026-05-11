@@ -703,6 +703,25 @@ impl LocalState {
     }
 }
 
+/// Phase 5 Step 5.3 (`docs/plan_automation.md` §10): populate the
+/// transport fields on `ProcessData` from the current `Song` so the
+/// plugin host can build a `clap_event_transport` for each
+/// `plugin.process()` call. `song = None` (engine init / no song
+/// loaded) leaves the default constants set by `ProcessData::empty()`
+/// (120 BPM / 4/4 / no loop).
+pub fn set_pd_transport(pd: &mut common::process_data::ProcessData, song: Option<&Song>) {
+    let Some(song) = song else { return };
+    pd.bpm = song.bpm.max(1.0);
+    pd.tsig_num = song.time_sig.0 as u16;
+    pd.tsig_denom = song.time_sig.1 as u16;
+    pd.loop_start_beats = song.loop_start_beat;
+    pd.loop_end_beats = song.loop_end_beat;
+    // Loop は user の loop button 状態を別 IPC で渡したいが、 当面は
+    // 「loop region が定義済」 (= end > start) を heuristic で IS_LOOPING
+    // とする。 Bitwig / Live も同じ (= region 定義時のみ loop active)。
+    pd.looping = if song.loop_end_beat > song.loop_start_beat { 1 } else { 0 };
+}
+
 /// Render one track's contribution into its `TrackScratch`. Walks the
 /// MIDI FX → instrument (or Vocal) → audio FX chain, dispatches every
 /// plugin via the assigned worker pair, then applies the mixer strip
@@ -808,6 +827,7 @@ pub fn process_track_owned(
         pd.frames = frames;
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
+        set_pd_transport(pd, song);
         // Phase 2b: MIDI FX 宛 PluginParam automation を ParamValue event 化。
         if let Some(song) = song {
             crate::automation::fill_pd_param_events(
@@ -969,6 +989,7 @@ pub fn process_track_owned(
         pd.frames = frames;
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
+        set_pd_transport(pd, song);
         // Phase 2b: automation の PluginParam target を ParamValue event 化。
         if let Some(song) = song {
             crate::automation::fill_pd_param_events(
@@ -1374,6 +1395,7 @@ fn run_group_fx_chain(
         pd.frames = frames;
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
+        set_pd_transport(pd, Some(song));
         // Phase 2b: group fx 宛 PluginParam automation。
         crate::automation::fill_pd_param_events(
             pd,

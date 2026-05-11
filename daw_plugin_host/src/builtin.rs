@@ -147,6 +147,7 @@ impl LoadedPlugin for Silence {
         _param_events: &[crate::plugin_instance::TimedParamEvent],
         _input_audio: &[&[f32]],
         _aux_inputs: &[AuxInputBuf<'_>],
+        _transport: &crate::plugin_instance::TransportContext,
     ) -> Result<i32> {
         // Capacity was sized at activate(); zero-fill the live window.
         let n_l = (frames as usize).min(self.out_l.len());
@@ -263,7 +264,10 @@ mod tests {
         // Pretend prior process polluted the buffer.
         p.out_l[0] = 0.7;
         p.out_r[1] = -0.4;
-        p.process(128, &[], &[], &[], &[]).unwrap();
+        let transport = crate::plugin_instance::TransportContext::from_process_data(
+            &common::process_data::ProcessData::empty(),
+        );
+        p.process(128, &[], &[], &[], &[], &transport).unwrap();
         assert!(p.out_l[..128].iter().all(|&v| v == 0.0));
         assert!(p.out_r[..128].iter().all(|&v| v == 0.0));
     }

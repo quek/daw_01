@@ -18,8 +18,12 @@ use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
 use clap_sys::ext::note_ports::{CLAP_EXT_NOTE_PORTS, clap_plugin_note_ports};
 use clap_sys::events::{
     CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_GESTURE_END,
-    CLAP_EVENT_PARAM_VALUE, clap_event_param_value,
+    CLAP_EVENT_PARAM_VALUE, CLAP_EVENT_TRANSPORT, CLAP_TRANSPORT_HAS_BEATS_TIMELINE,
+    CLAP_TRANSPORT_HAS_SECONDS_TIMELINE, CLAP_TRANSPORT_HAS_TEMPO,
+    CLAP_TRANSPORT_HAS_TIME_SIGNATURE, CLAP_TRANSPORT_IS_LOOP_ACTIVE,
+    CLAP_TRANSPORT_IS_PLAYING, clap_event_param_value, clap_event_transport,
 };
+use clap_sys::fixedpoint::{CLAP_BEATTIME_FACTOR, CLAP_SECTIME_FACTOR};
 use clap_sys::ext::params::{
     CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_HIDDEN,
     CLAP_PARAM_IS_MODULATABLE, CLAP_PARAM_IS_PERIODIC, CLAP_PARAM_IS_READONLY,
@@ -684,6 +688,7 @@ impl ClapPlugin {
         param_events: &[crate::plugin_instance::TimedParamEvent],
         input_audio: &[&[f32]],
         aux_inputs: &[crate::plugin_instance::AuxInputBuf<'_>],
+        transport: &crate::plugin_instance::TransportContext,
     ) -> Result<i32> {
         anyhow::ensure!(self.processing, "plugin not processing");
 
@@ -843,10 +848,19 @@ impl ClapPlugin {
             (&raw mut audio_out, 1)
         };
 
+        // Phase 5 Step 5.3 (`docs/plan_automation.md` §10): build
+        // `clap_event_transport` from the per-buffer `TransportContext` so
+        // tempo-sync plugins (Delay sync to beat, Arp etc.) see the host
+        // BPM / time-signature / playhead. `song_pos_*` are fixed-point
+        // (1 << 31 per beat / sec). `bar_*` are populated from the
+        // current tsig_num (= bar starts at `bar_number * tsig_num`
+        // beats since song start)。 loop fields are zeroed when not in
+        // loop mode to avoid plugins acting on stale ranges.
+        let transport_event = build_clap_transport_event(transport, frames);
         let process_ctx = clap_process {
             steady_time: -1,
             frames_count: frames,
-            transport: std::ptr::null(),
+            transport: &transport_event,
             audio_inputs,
             audio_outputs,
             audio_inputs_count,
@@ -1101,6 +1115,72 @@ unsafe extern "C" fn collect_out_note_try_push(
         _ => {}
     }
     true
+}
+
+/// Phase 5 Step 5.3 (`docs/plan_automation.md` §10): build a
+/// `clap_event_transport` from the host-side `TransportContext` at the
+/// start of every `process()` call. Plugins read this via
+/// `clap_process.transport` and use it for tempo-sync (Delay sync to
+/// beat, Arp tempo, etc.). `frames` is unused for the per-buffer
+/// transport (= we set song_pos_* to the buffer-start values); CLAP
+/// plugins increment internally for sub-buffer interpolation.
+///
+/// `song_pos_beats` = playhead_samples * bpm / (60 * SR) * (1 << 31)
+/// `song_pos_seconds` = playhead_samples / SR * (1 << 31)
+/// `bar_start` / `bar_number`: compute current bar index from beats
+/// using tsig_num (= beats_per_bar). Bar start in beats is
+/// `bar_number * tsig_num` (= integer beats since song start).
+fn build_clap_transport_event(
+    transport: &crate::plugin_instance::TransportContext,
+    _frames: u32,
+) -> clap_event_transport {
+    let bpm = f64::from(transport.bpm).max(1.0);
+    let sample_rate = f64::from(transport.sample_rate).max(1.0);
+    let playhead_samples = transport.playhead_samples as f64;
+    let song_pos_seconds_f64 = playhead_samples / sample_rate;
+    let song_pos_beats_f64 = song_pos_seconds_f64 * bpm / 60.0;
+    let song_pos_beats: i64 = (song_pos_beats_f64 * CLAP_BEATTIME_FACTOR as f64) as i64;
+    let song_pos_seconds: i64 = (song_pos_seconds_f64 * CLAP_SECTIME_FACTOR as f64) as i64;
+    let tsig_num = transport.tsig_num.max(1) as f64;
+    let bar_number = (song_pos_beats_f64 / tsig_num).floor();
+    let bar_start_beats_f64 = bar_number * tsig_num;
+    let bar_start: i64 = (bar_start_beats_f64 * CLAP_BEATTIME_FACTOR as f64) as i64;
+    let mut flags = CLAP_TRANSPORT_HAS_TEMPO
+        | CLAP_TRANSPORT_HAS_BEATS_TIMELINE
+        | CLAP_TRANSPORT_HAS_SECONDS_TIMELINE
+        | CLAP_TRANSPORT_HAS_TIME_SIGNATURE;
+    if transport.is_playing {
+        flags |= CLAP_TRANSPORT_IS_PLAYING;
+    }
+    if transport.is_looping && transport.loop_end_beats > transport.loop_start_beats {
+        flags |= CLAP_TRANSPORT_IS_LOOP_ACTIVE;
+    }
+    let loop_start_beats: i64 =
+        (transport.loop_start_beats * CLAP_BEATTIME_FACTOR as f64) as i64;
+    let loop_end_beats: i64 =
+        (transport.loop_end_beats * CLAP_BEATTIME_FACTOR as f64) as i64;
+    clap_event_transport {
+        header: clap_event_header {
+            size: std::mem::size_of::<clap_event_transport>() as u32,
+            time: 0,
+            space_id: CLAP_CORE_EVENT_SPACE_ID,
+            type_: CLAP_EVENT_TRANSPORT,
+            flags: 0,
+        },
+        flags,
+        song_pos_beats,
+        song_pos_seconds,
+        tempo: bpm,
+        tempo_inc: 0.0,
+        loop_start_beats,
+        loop_end_beats,
+        loop_start_seconds: 0,
+        loop_end_seconds: 0,
+        bar_start,
+        bar_number: bar_number as i32,
+        tsig_num: transport.tsig_num,
+        tsig_denom: transport.tsig_denom,
+    }
 }
 
 /// Phase 2b: 1 buffer 分の note + param event を 1 つの list として
@@ -1377,8 +1457,9 @@ impl LoadedPlugin for ClapPlugin {
         param_events: &[crate::plugin_instance::TimedParamEvent],
         input_audio: &[&[f32]],
         aux_inputs: &[crate::plugin_instance::AuxInputBuf<'_>],
+        transport: &crate::plugin_instance::TransportContext,
     ) -> Result<i32> {
-        self.process(frames, events, param_events, input_audio, aux_inputs)
+        self.process(frames, events, param_events, input_audio, aux_inputs, transport)
     }
 
     fn output_buffer(&self, channel: usize) -> Option<&[f32]> {

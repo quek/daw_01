@@ -61,6 +61,28 @@ pub struct ProcessData {
     /// data layout for shmem). Sum: `MAX_AUX_IN * sizeof(u8) + pad`
     /// reaches the next u32 boundary.
     pub _pad_aux: [u8; 2],
+    /// Phase 5 Step 5.3 (`docs/plan_automation.md` §10): CLAP plugin の
+    /// `clap_event_transport` 構築に使う song-level transport state。
+    /// daw_audio が buffer 頭で song 情報から populate。 plugin host は
+    /// `bpm` / `tsig_num` / `tsig_denom` と既存の `steady_time` (sample
+    /// 単位 playhead) + `sample_rate` から `clap_event_transport` を組み立て、
+    /// `clap_process.transport` に渡す。 plugin の tempo-sync 機能
+    /// (sync to beat delay / arp 等) が動作する基盤。
+    pub bpm: f32,
+    pub tsig_num: u16,
+    pub tsig_denom: u16,
+    /// Phase 5 Step 5.3: loop 区間 (beats)。 audio engine の loop state を
+    /// plugin に伝えて CLAP `CLAP_TRANSPORT_IS_LOOP_ACTIVE` の判定に使う。
+    /// 旧 v 互換性のため `f64` で stable layout を保つ。 `loop_end_beats >
+    /// loop_start_beats` なら loop active と解釈。
+    pub loop_start_beats: f64,
+    pub loop_end_beats: f64,
+    /// Phase 5 Step 5.3: `clap_event_transport.flags` の `IS_LOOPING` ビット
+    /// に使う「user が loop button を押している」 状態。 `loop_end_beats >
+    /// loop_start_beats` だけでは「loop region は設定したが loop button は
+    /// off」 ケースと区別できないので独立フラグで持つ。
+    pub looping: u8,
+    pub _pad_transport: [u8; 5],
 }
 
 #[repr(C)]
@@ -115,6 +137,13 @@ impl ProcessData {
             buffer_aux_in: [[[0.0; MAX_FRAMES]; MAX_CHANNELS]; MAX_AUX_IN],
             aux_in_active: [0; MAX_AUX_IN],
             _pad_aux: [0; 2],
+            bpm: 120.0,
+            tsig_num: 4,
+            tsig_denom: 4,
+            loop_start_beats: 0.0,
+            loop_end_beats: 0.0,
+            looping: 0,
+            _pad_transport: [0; 5],
         }
     }
 

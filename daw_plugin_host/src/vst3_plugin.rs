@@ -841,6 +841,7 @@ impl LoadedPlugin for Vst3Plugin {
         _param_events: &[crate::plugin_instance::TimedParamEvent],
         input_audio: &[&[f32]],
         aux_inputs: &[crate::plugin_instance::AuxInputBuf<'_>],
+        _transport: &crate::plugin_instance::TransportContext,
     ) -> Result<i32> {
         anyhow::ensure!(self.processing, "VST3 plugin not processing");
 

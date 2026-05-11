@@ -1060,13 +1060,38 @@ Phase 5 は Step で分解して進める:
 - [ ] recording 中の SongTempo lane は `recording_lanes` で curve eval bypass
       → live BPM input が即時聞こえる (Step C-2 と同 idiom)
 
-#### Step 5.3: CLAP_EVENT_TRANSPORT
+#### Step 5.3: CLAP_EVENT_TRANSPORT ✅ (2026-05-11)
 
-- [ ] `daw_plugin_host::process_server` で buffer 頭に `clap_event_transport`
-      を `events_in` に push (= 現在 BPM + time_sig + bar/beat position +
-      flags { is_playing, is_recording, has_tempo, has_time_signature })
-- [ ] plugin の tempo-sync 機能 (Delay sync to beat / Arp tempo-based 等)
-      が動作することを smoke test
+CLAP plugin に transport state を 1 buffer 毎に届け、 tempo-sync 機能を有効化。
+`clap_process.transport` (= events_in ではなく専用 field) を使う点が CLAP spec
+通り。
+
+- [x] `common::process_data::ProcessData` に transport fields を追加:
+      `bpm: f32` / `tsig_num: u16` / `tsig_denom: u16` / `loop_start_beats: f64`
+      / `loop_end_beats: f64` / `looping: u8` + pad
+- [x] `daw_audio::engine::set_pd_transport(pd, song)` helper を追加、
+      `process_track_owned` / `run_group_fx_chain` / その他 dispatch 直前の
+      4 callsite で `pd.frames = ...` 直後に call (= song 情報から populate)
+- [x] `daw_plugin_host::plugin_instance::TransportContext` 型を導入 (=
+      `ProcessData` を borrow せず copy-on-extract できる plain struct)、
+      `from_process_data(pd)` で構築
+- [x] `LoadedPlugin::process` に `transport: &TransportContext` 引数追加、
+      `ClapPlugin` / `Silence` / `VoicevoxBuiltin` / `Vst3Plugin` の 4 impl
+      を update (CLAP のみ実体使用、 他は `_transport` で無視)
+- [x] `daw_plugin_host::clap_plugin::build_clap_transport_event` helper で
+      `clap_event_transport` を構築 + `clap_process.transport` に渡す。
+      bpm / tsig_num / tsig_denom / song_pos_beats (fixed-point i64) /
+      song_pos_seconds / bar_start / bar_number / loop_start_beats /
+      loop_end_beats を populate、 flags は `HAS_TEMPO | HAS_BEATS_TIMELINE
+      | HAS_SECONDS_TIMELINE | HAS_TIME_SIGNATURE | IS_PLAYING (条件) |
+      IS_LOOP_ACTIVE (条件)`
+- [x] `process_server::process_loop` で `transport = TransportContext::
+      from_process_data(pd)` し、 `plugin.process(..., &transport)` に渡す
+- [ ] **smoke test (Step 5.3)**: tempo-sync 系 CLAP plugin (e.g., ValhallaSpaceModulator
+      の sync delay、 Vital arp) を track に load し、 host BPM を 60 / 120 /
+      180 と切り替えて plugin の delay 時間 / arp テンポが追随することを確認
+- [ ] **smoke test (Step 5.3 transport flag)**: Play / Stop の切替で plugin
+      の playing 状態表示が変化することを確認 (Surge XT 等の表示で見える)
 
 各 Phase で:
 

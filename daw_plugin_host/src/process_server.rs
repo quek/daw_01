@@ -426,12 +426,14 @@ fn run_worker(
             *flag = 0;
         }
 
+        let transport = crate::plugin_instance::TransportContext::from_process_data(pd);
         if let Err(e) = plugin.process(
             frames,
             &events_in,
             &param_events_in,
             &input_audio,
             &aux_inputs,
+            &transport,
         ) {
             tracing::error!(error = ?e, plugin_id, "plugin.process() failed");
         } else {

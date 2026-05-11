@@ -97,6 +97,52 @@ impl HostCallbacks {
 /// thread; `process()` / `start_processing()` / `stop_processing()` are
 /// invoked from the audio thread via raw-pointer snapshots (see
 /// `PluginPtr` in `main.rs`).
+/// Phase 5 Step 5.3 (`docs/plan_automation.md` §10): per-buffer transport
+/// snapshot fed into `LoadedPlugin::process` so CLAP backends can build
+/// `clap_event_transport` and set `clap_process.transport`. VST3
+/// backends consume the same fields via `IProcessContext`. VoicevoxBuiltin
+/// / Silence backends ignore everything except `playhead_samples`
+/// (= they already use steady_time for sample positioning).
+///
+/// `bpm` etc. are populated from `ProcessData.bpm` etc. which daw_audio
+/// fills via `engine::set_pd_transport` at buffer head. The fields live
+/// in `ProcessData` (= shmem-portable) so the plugin host only needs to
+/// repackage them into the CLAP / VST3 transport struct.
+#[derive(Debug, Clone, Copy)]
+pub struct TransportContext {
+    pub bpm: f32,
+    pub sample_rate: u32,
+    /// Sample-domain playhead. Convertible to `song_pos_seconds` via
+    /// `playhead_samples / sample_rate` and to `song_pos_beats` via
+    /// `playhead_samples * bpm / (60 * sample_rate)`.
+    pub playhead_samples: u64,
+    pub tsig_num: u16,
+    pub tsig_denom: u16,
+    pub is_playing: bool,
+    pub is_looping: bool,
+    pub loop_start_beats: f64,
+    pub loop_end_beats: f64,
+}
+
+impl TransportContext {
+    /// Phase 5 Step 5.3: build from a `ProcessData` populated by daw_audio.
+    /// `pd.playing` u8 → bool conversion + clamp `bpm` to a sane minimum
+    /// (= 1.0) for divide safety in downstream computations.
+    pub fn from_process_data(pd: &common::process_data::ProcessData) -> Self {
+        Self {
+            bpm: pd.bpm.max(1.0),
+            sample_rate: pd.sample_rate.max(1),
+            playhead_samples: pd.steady_time,
+            tsig_num: pd.tsig_num.max(1),
+            tsig_denom: pd.tsig_denom.max(1),
+            is_playing: pd.playing != 0,
+            is_looping: pd.looping != 0,
+            loop_start_beats: pd.loop_start_beats,
+            loop_end_beats: pd.loop_end_beats,
+        }
+    }
+}
+
 #[allow(dead_code)] // `format()` is wired up for future UI display.
 pub trait LoadedPlugin: Send {
     fn id(&self) -> &str;
@@ -123,6 +169,7 @@ pub trait LoadedPlugin: Send {
         param_events: &[TimedParamEvent],
         input_audio: &[&[f32]],
         aux_inputs: &[AuxInputBuf<'_>],
+        transport: &TransportContext,
     ) -> Result<i32>;
     /// Planar output. `None` means "no such channel" (e.g. mono plugin
     /// queried for channel 1).

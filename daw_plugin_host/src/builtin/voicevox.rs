@@ -319,6 +319,7 @@ impl LoadedPlugin for VoicevoxBuiltin {
         _param_events: &[crate::plugin_instance::TimedParamEvent],
         _input_audio: &[&[f32]],
         _aux_inputs: &[AuxInputBuf<'_>],
+        _transport: &crate::plugin_instance::TransportContext,
     ) -> Result<i32> {
         let frames_usize = frames as usize;
         // 出力 buffer を 0 fill。
@@ -607,7 +608,10 @@ mod tests {
                 velocity: 100.0,
             },
         }];
-        p.process(64, &events, &[], &[], &[]).unwrap();
+        let transport = crate::plugin_instance::TransportContext::from_process_data(
+            &common::process_data::ProcessData::empty(),
+        );
+        p.process(64, &events, &[], &[], &[], &transport).unwrap();
         assert!(p.out_l[..64].iter().all(|&v| v == 0.0));
         assert!(p.active_voices.is_empty());
         p.deactivate();
@@ -670,14 +674,17 @@ mod tests {
                 velocity: 127.0,
             },
         }];
-        p.process(64, &events, &[], &[], &[]).unwrap();
+        let transport = crate::plugin_instance::TransportContext::from_process_data(
+            &common::process_data::ProcessData::empty(),
+        );
+        p.process(64, &events, &[], &[], &[], &transport).unwrap();
         // out_l に値が乗っていることを確認 (= sample[0] = 0.0 はゼロだが
         // sample[1] 以降は非ゼロ)。
         assert!(p.out_l[1..64].iter().any(|&v| v != 0.0));
         // voice が cursor を進めていること。
         assert_eq!(p.active_voices[0].cursor, 64);
         // 次 process で残り 64 frame 流して voice 終了。
-        p.process(64, &[], &[], &[], &[]).unwrap();
+        p.process(64, &[], &[], &[], &[], &transport).unwrap();
         assert!(p.active_voices.is_empty());
         p.deactivate();
     }
