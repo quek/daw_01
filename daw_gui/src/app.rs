@@ -377,6 +377,14 @@ pub struct AppData {
     /// `stop()` で clear。 session-only / Undo 対象外。
     pub recording_last_beat:
         std::collections::HashMap<(u32, common::model::AutomationTarget), f64>,
+    /// Phase 4 Step C-2: 直近 `MainToChild::SetRecordingLanes` で audio thread
+    /// に送った recording lane set のスナップショット。 GUI の currently
+    /// recording set (= active ∪ latched, mode 依存) と diff を取って、 変化
+    /// したときだけ IPC を送信する。 LoadSong は set が「縮んだ」 (= 1 度
+    /// recording 終了した lane が出た) ときに送る (= audio thread が curve
+    /// eval に戻るときに最新 points を読ませる)。 session-only / Undo 対象外。
+    pub last_sent_recording_lanes:
+        std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     /// Phase 2 (`docs/plan_automation.md` §7.5): plugin parameter
     /// 一覧キャッシュ。 plugin host が `PluginParamList` IPC で送って
     /// くるたびに上書き。 `(track_id, slot)` で identify、 Parameter
@@ -696,6 +704,7 @@ impl AppData {
             active_param_gestures: std::collections::HashSet::new(),
             latched_param_gestures: std::collections::HashSet::new(),
             recording_last_beat: std::collections::HashMap::new(),
+            last_sent_recording_lanes: std::collections::HashSet::new(),
             plugin_params: std::collections::HashMap::new(),
             track_row_overrides: std::collections::HashMap::new(),
             track_plugin_ids: std::collections::HashMap::new(),
@@ -2528,6 +2537,7 @@ impl AppData {
             }
             AppEvent::SetRecordingMode(mode) => {
                 self.recording_mode = mode;
+                self.sync_recording_lanes_with_audio();
             }
             AppEvent::ParamGestureBegin {
                 track_id,
@@ -2555,6 +2565,7 @@ impl AppData {
                     display_name,
                     touched_at: std::time::Instant::now(),
                 });
+                self.sync_recording_lanes_with_audio();
             }
             AppEvent::ParamGestureEnd { track_id, target } => {
                 self.active_param_gestures.remove(&(track_id, target.clone()));
@@ -2565,6 +2576,7 @@ impl AppData {
                 if self.recording_mode == common::model::RecordingMode::Touch {
                     self.recording_last_beat.remove(&(track_id, target));
                 }
+                self.sync_recording_lanes_with_audio();
             }
             AppEvent::PluginParamListFromChild {
                 track,
@@ -3888,9 +3900,14 @@ impl AppData {
         // Phase 4 Step C: recording session を transport stop でクローズ。
         // Latch / Write の latched set + per-param 直近 record 位置を全て
         // clear。 これで次の Play 時には latched / last_beat が空からスタート、
-        // touching しない限り何も record されない (Touch / Latch / Write 共通)。
+        // touching しない limit 何も record されない (Touch / Latch / Write 共通)。
         self.latched_param_gestures.clear();
         self.recording_last_beat.clear();
+        // Phase 4 Step C-2: audio thread の recording bypass を解除 +
+        // 最新 song を送る (= curve eval に戻る瞬間に正しい point sequence
+        // が反映される)。 currently_recording_lanes は !is_playing なので
+        // 必ず empty に解決する。
+        self.sync_recording_lanes_with_audio();
     }
 
     fn toggle_loop(&mut self) {
@@ -8345,18 +8362,16 @@ impl AppData {
         // Phase 4 Step C: recording tick。 is_playing 中で recording_mode が
         // Read 以外、 かつ active ∪ latched gesture が non-empty なら、 各
         // gesture の現在 plain 値を AutomationPoint として playhead 位置に
-        // 書き込む (1/64 beat throttle)。 point insert が発生したら
-        // sync_song_to_plugin_host で audio thread に LoadSong (= curve に
-        // 反映)。 Step C-2 で audio bypass IPC が landing したら、 per-tick
-        // LoadSong を「on gesture end / on stop」 の sync に置き換える。
+        // 書き込む (1/64 beat throttle)。 Step C-2: audio thread は
+        // `SetRecordingLanes` で受け取った set の lane の curve eval を bypass
+        // しているので、 per-tick LoadSong は不要 (= recording 中は audio が
+        // track.volume / track.pan の live value をそのまま鳴らす、 recording
+        // 終了の瞬間に sync_recording_lanes_with_audio が LoadSong を送る)。
         if self.is_playing
             && self.recording_mode != common::model::RecordingMode::Read
             && let Some(ph) = self.playhead_beat
         {
-            let inserted = self.record_automation_points_for_tick(f64::from(ph));
-            if inserted > 0 {
-                self.sync_song_to_plugin_host();
-            }
+            let _inserted = self.record_automation_points_for_tick(f64::from(ph));
         }
 
         #[cfg(windows)]
@@ -8451,6 +8466,63 @@ impl AppData {
             }
         }
         inserted
+    }
+
+    /// Phase 4 Step C-2: GUI の currently recording set (= active ∪ latched
+    /// based on mode) を計算する。 audio thread に送る IPC の payload と、
+    /// `record_automation_points_for_tick` の iter source の両方で使う。
+    pub(crate) fn currently_recording_lanes(
+        &self,
+    ) -> std::collections::HashSet<(u32, common::model::AutomationTarget)> {
+        let mut set: std::collections::HashSet<(u32, common::model::AutomationTarget)> =
+            std::collections::HashSet::new();
+        if !self.is_playing || self.recording_mode == common::model::RecordingMode::Read {
+            return set;
+        }
+        for k in &self.active_param_gestures {
+            set.insert(k.clone());
+        }
+        if matches!(
+            self.recording_mode,
+            common::model::RecordingMode::Latch | common::model::RecordingMode::Write
+        ) {
+            for k in &self.latched_param_gestures {
+                set.insert(k.clone());
+            }
+        }
+        set
+    }
+
+    /// Phase 4 Step C-2: GUI の currently recording set が前回 audio thread
+    /// に送った snapshot と異なる場合、 `SetRecordingLanes` IPC を送る。 set が
+    /// 縮んだ (= recording 終了した lane が出た) 場合は、 audio thread が
+    /// curve eval に戻るタイミングで最新 points を反映させるため、 LoadSong
+    /// も送る (= `sync_song_to_plugin_host`)。
+    ///
+    /// 呼び出し場所:
+    /// - `ParamGestureBegin` handler (set が拡大する可能性)
+    /// - `ParamGestureEnd` handler (Touch mode で set が縮む)
+    /// - `stop()` (Latch / Write で latched 全 clear、 set が縮む)
+    /// - `SetRecordingMode(_)` handler (mode 変化で latched 寄与が変わる)
+    fn sync_recording_lanes_with_audio(&mut self) {
+        let next = self.currently_recording_lanes();
+        if next == self.last_sent_recording_lanes {
+            return;
+        }
+        let shrunk = self
+            .last_sent_recording_lanes
+            .iter()
+            .any(|k| !next.contains(k));
+        let lanes_vec: Vec<(u32, common::model::AutomationTarget)> =
+            next.iter().cloned().collect();
+        self.send_audio(MainToChild::SetRecordingLanes { lanes: lanes_vec });
+        if shrunk {
+            // recording 終了した lane の最新 points を audio thread に流す
+            // (= bypass が解除されて curve eval に戻る瞬間に、 record session
+            // 中に insert した点列で正しい curve が引かれるよう保証する)。
+            self.sync_song_to_plugin_host();
+        }
+        self.last_sent_recording_lanes = next;
     }
 
     /// Phase 4 Step C: target に対応する現在 plain 値を返す。 TrackBuiltin

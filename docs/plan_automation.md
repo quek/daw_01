@@ -935,19 +935,30 @@ C-2 で行う (= sync 頻度を減らす最適化)。
       Latch / Write mode でも同 wire、 mode の差は release 後 / stop までの
       record 継続有無。
 
-##### Step C-2: audio bypass IPC で per-tick LoadSong を削減 (deferred)
+##### Step C-2: audio bypass IPC で per-tick LoadSong を削減 ✅ (2026-05-11)
 
-- [ ] `MainToChild::SetRecordingLanes { lanes: Vec<(u32, AutomationTarget)> }`
+- [x] `MainToChild::SetRecordingLanes { lanes: Vec<(u32, AutomationTarget)> }`
       IPC variant 追加
-- [ ] daw_audio `SharedState.recording_lanes: ArcSwap<HashSet<...>>` 追加
-- [ ] `daw_audio::automation::fill_track_param_ramps` で
+- [x] daw_audio `SharedState.recording_lanes: ArcSwap<HashSet<...>>` 追加
+- [x] `daw_audio::automation::fill_track_param_ramps` で
       `recording_lanes.contains(&(track_id, lane.target))` のとき curve eval
       を skip し、 track.volume / track.pan の constant fallback を維持
-- [ ] daw_gui で recording_mode / active / latched の変化 (= currently
-      recording set 変化) の edge で IPC を送る (= per-tick LoadSong を
-      gesture end / stop のときだけにする)
+      (新 test 2 件: `recording_lane_bypasses_curve_eval` /
+      `non_recording_lane_still_uses_curve` で挙動を pin)
+- [x] daw_gui で recording_mode / active / latched の変化 (= currently
+      recording set 変化) の edge で `SetRecordingLanes` IPC を送る
+      (`sync_recording_lanes_with_audio` helper、 ParamGestureBegin / End /
+      stop / SetRecordingMode handler から呼ぶ)
+- [x] set が「縮んだ」 (= recording 終了した lane が出た) ときに
+      `sync_song_to_plugin_host` で audio thread に最新 points を流す
+      (= bypass 解除 → curve eval 再開のタイミングで正しい curve が見える)
+- [x] `record_automation_points_for_tick` から per-tick LoadSong を削除
+      (= recording 中は SetRecordingLanes で bypass、 終了時のみ LoadSong)
+- [x] worker pool 経路: `DispatchShared.recording_lanes_ptr` を追加し、
+      `dispatch_and_wait` で master が ptr を store、 worker が
+      `load(Acquire)` で deref → `process_track_owned` に渡す
 - [ ] CLAP plugin GUI gesture END IPC (Phase 2c follow-up) と組み合わせて
-      plugin param の audio bypass にも対応
+      plugin param の audio bypass にも対応 (= Step C-3 と同期に作業)
 
 ##### Step C-3: plugin param recording (deferred)
 

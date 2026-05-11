@@ -197,6 +197,13 @@ fn render_loop(
         let audio_renderer: &crate::audio_clip_renderer::AudioClipRenderer =
             &audio_renderer_g;
 
+        // Phase 4 Step C-2: offline export 中は recording lane なし
+        // (= GUI が active gesture を持たない、 transport が freewheel)。
+        // empty set を渡して bypass disabled に統一。
+        let empty_recording_lanes: std::collections::HashSet<
+            (u32, common::model::AutomationTarget),
+        > = std::collections::HashSet::new();
+
         if let Some(pool) = pool_g.as_deref() {
             pool.dispatch_and_wait(
                 Some(song),
@@ -213,6 +220,7 @@ fn render_loop(
                 true,
                 any_solo,
                 &schedule.input_delay_per_track,
+                &empty_recording_lanes,
             );
         } else {
             let worker_sync = worker_syncs_g.first();
@@ -239,6 +247,7 @@ fn render_loop(
                     Some(song),
                     any_solo,
                     input_delay,
+                    &empty_recording_lanes,
                 );
             }
         }
@@ -263,6 +272,7 @@ fn render_loop(
             true,
             any_solo,
             playhead,
+            &empty_recording_lanes,
         );
 
         // Compute block peak across the full block (for tail-silence

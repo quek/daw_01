@@ -74,6 +74,13 @@ pub struct DispatchShared {
     /// yet wired); workers treat that as 0 delay for every track.
     pub input_delays_base: AtomicPtr<u32>,
     pub n_input_delays: AtomicU32,
+    /// Phase 4 Step C-2: 「現在 recording 中の lane」 set への ptr
+    /// (= `SharedState.recording_lanes.load()` 結果)。 master が dispatch
+    /// 前に store、 workers + master が `fill_track_param_ramps` の引数に
+    /// 渡して curve eval を bypass する判定に使う。 null → 空 set 相当
+    /// (= 全 lane eval、 旧挙動)。
+    pub recording_lanes_ptr:
+        AtomicPtr<std::collections::HashSet<(u32, common::model::AutomationTarget)>>,
 }
 
 unsafe impl Send for DispatchShared {}
@@ -102,6 +109,7 @@ impl DispatchShared {
             any_solo: AtomicU8::new(0),
             input_delays_base: AtomicPtr::new(std::ptr::null_mut()),
             n_input_delays: AtomicU32::new(0),
+            recording_lanes_ptr: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 }
@@ -182,6 +190,7 @@ impl AudioWorkerPool {
         playing: bool,
         any_solo: bool,
         input_delay_per_track: &[u32],
+        recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     ) {
         let n_tracks = song.map(|s| s.tracks.len() as u32).unwrap_or(0);
         let n_tracks = n_tracks.min(scratch.len() as u32);
@@ -232,6 +241,10 @@ impl AudioWorkerPool {
         self.shared
             .any_solo
             .store(if any_solo { 1 } else { 0 }, Ordering::Release);
+        self.shared.recording_lanes_ptr.store(
+            recording_lanes as *const _ as *mut _,
+            Ordering::Release,
+        );
         // PR4.5: publish per-track input delay slice so workers can read
         // their track's value without locking. Empty slice (= no
         // sidechain wiring anywhere) → null pointer + len 0.
@@ -350,6 +363,20 @@ fn run_work_loop(shared: &DispatchShared) {
     // in which case every track gets 0 delay.
     let input_delays_base = shared.input_delays_base.load(Ordering::Acquire);
     let n_input_delays = shared.n_input_delays.load(Ordering::Acquire);
+    // Phase 4 Step C-2: recording lane snapshot ptr。 null なら 旧挙動互換
+    // (= empty set、 全 lane の curve eval する)。 master が
+    // `dispatch_and_wait` 内で store、 ここでは &HashSet として復元する。
+    let recording_lanes_ptr = shared.recording_lanes_ptr.load(Ordering::Acquire);
+    let empty_recording_lanes: std::collections::HashSet<(u32, common::model::AutomationTarget)> =
+        std::collections::HashSet::new();
+    let recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)> =
+        if recording_lanes_ptr.is_null() {
+            &empty_recording_lanes
+        } else {
+            // SAFETY: master holds the ArcSwap Guard / Arc snapshot alive
+            // for the dispatch window via `dispatch_and_wait` 's local var.
+            unsafe { &*recording_lanes_ptr }
+        };
 
     if scratch_base.is_null()
         || plugin_refs_ptr.is_null()
@@ -429,6 +456,7 @@ fn run_work_loop(shared: &DispatchShared) {
             Some(song),
             any_solo,
             input_delay,
+            recording_lanes,
         );
     }
 }

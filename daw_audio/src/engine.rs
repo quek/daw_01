@@ -111,6 +111,15 @@ pub struct SharedState {
     /// Last published playhead in samples. Mirrored to shmem for the GUI
     /// playhead cursor.
     pub playhead: AtomicU64,
+    /// Phase 4 Step C-2 (`docs/plan_automation.md` §6): currently recording
+    /// lane set (= GUI が `SetRecordingLanes` で更新)。 audio thread は
+    /// 各 buffer の頭で `load()` し、 `fill_track_param_ramps` で該当 lane
+    /// の curve eval を bypass する。 `(track_id, AutomationTarget)` の
+    /// 2 つ組で identify (lane_id を使わないのは GUI 側で lane を削除して
+    /// から audio に通知が届くまでの race を避けるため = target 一致なら
+    /// bypass で済む)。 起動時は空。
+    pub recording_lanes:
+        arc_swap::ArcSwap<std::collections::HashSet<(u32, common::model::AutomationTarget)>>,
 }
 
 impl SharedState {
@@ -120,6 +129,9 @@ impl SharedState {
             playback: AtomicU8::new(PlaybackCommand::Stop as u8),
             looping: AtomicBool::new(false),
             playhead: AtomicU64::new(0),
+            recording_lanes: arc_swap::ArcSwap::from_pointee(
+                std::collections::HashSet::new(),
+            ),
         }
     }
 }
@@ -495,6 +507,15 @@ impl LocalState {
         let song_ref = song_snapshot.as_deref();
         let playhead = shared.playhead.load(Ordering::Acquire);
 
+        // Phase 4 Step C-2: 「現在 recording 中の lane」 を SharedState から
+        // 1 buffer 分の lifetime で借りる。 dispatch / process_track_owned /
+        // run_group_fx_chain に &HashSet で渡す。 `_recording_lanes_g` の
+        // Guard が生きている間は Arc が drop されないので audio thread から
+        // 安全に deref できる。
+        let recording_lanes_g = shared.recording_lanes.load();
+        let recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)> =
+            &recording_lanes_g;
+
         if let Some(song) = song_ref {
             let any_solo = song.tracks.iter().any(|t| t.solo);
             let n_tracks = song.tracks.len().min(MAX_TRACKS);
@@ -529,6 +550,7 @@ impl LocalState {
                     playing,
                     any_solo,
                     &self.cached_schedule.input_delay_per_track,
+                    recording_lanes,
                 );
             } else {
                 let worker_sync = worker_syncs_g.first();
@@ -556,6 +578,7 @@ impl LocalState {
                         Some(song),
                         any_solo,
                         input_delay,
+                        recording_lanes,
                     );
                 }
             }
@@ -581,6 +604,7 @@ impl LocalState {
                 playing,
                 any_solo,
                 playhead,
+                recording_lanes,
             );
 
             // Publish per-track peak meters into the shared AudioBridge
@@ -715,6 +739,7 @@ pub fn process_track_owned(
     song: Option<&Song>,
     any_solo: bool,
     input_delay_samples: u32,
+    recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
 ) {
     let n = frames as usize;
 
@@ -995,6 +1020,7 @@ pub fn process_track_owned(
             frames,
             &mut scratch.volume_per_sample,
             &mut scratch.pan_per_sample,
+            recording_lanes,
         );
         let mut peak_l = 0.0_f32;
         let mut peak_r = 0.0_f32;
@@ -1071,6 +1097,7 @@ pub fn execute_schedule_post_dispatch(
     playing: bool,
     any_solo: bool,
     playhead: u64,
+    recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
 ) {
     // `nodes` の不変参照と `delay_lines` の可変参照を同時に取りたい
     // (ApplyDelay で line を引きながら nodes を回すため)。 `Schedule`
@@ -1125,6 +1152,7 @@ pub fn execute_schedule_post_dispatch(
                     frames,
                     playing,
                     any_solo,
+                    recording_lanes,
                 );
             }
             NodeOp::ApplyDelay {
@@ -1324,6 +1352,7 @@ fn run_group_fx_chain(
     frames: u32,
     playing: bool,
     any_solo: bool,
+    recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
 ) {
     let n = frames as usize;
     let track_id = song_track.id;
@@ -1391,6 +1420,7 @@ fn run_group_fx_chain(
             frames,
             &mut scratch.volume_per_sample,
             &mut scratch.pan_per_sample,
+            recording_lanes,
         );
         let mut peak_l = 0.0_f32;
         let mut peak_r = 0.0_f32;
@@ -1486,6 +1516,7 @@ mod sidechain_tests {
             true,
             false,
             0,
+            &std::collections::HashSet::new(),
         );
 
         for i in 0..FRAMES {

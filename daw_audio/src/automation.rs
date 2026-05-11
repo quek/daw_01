@@ -28,6 +28,13 @@ use common::protocol::PluginSlot;
 ///
 /// Lanes targeting plugin parameters are silently skipped: those are
 /// converted into `TimedParamEvent`s elsewhere (Phase 2).
+///
+/// Phase 4 Step C-2: `recording_lanes` に `(track_id, lane.target)` が含まれて
+/// いる lane は curve eval を **skip** し、 track.volume / track.pan の constant
+/// fallback がそのまま buffer に残る。 これで GUI 側の knob 操作 (=
+/// SetTrackVolume / SetTrackPan IPC) が即時に audio に反映される (Live /
+/// Bitwig の Touch / Latch / Write の "you hear what you do" UX)。 set は
+/// audio thread が buffer 頭で `load()` する snapshot (ArcSwap、 lock-free)。
 #[allow(clippy::too_many_arguments)]
 pub fn fill_track_param_ramps(
     song: Option<&Song>,
@@ -38,6 +45,7 @@ pub fn fill_track_param_ramps(
     frames: u32,
     volume_per_sample: &mut [f32],
     pan_per_sample: &mut [f32],
+    recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
 ) {
     let frames = (frames as usize).min(volume_per_sample.len()).min(pan_per_sample.len());
     if frames == 0 {
@@ -58,6 +66,7 @@ pub fn fill_track_param_ramps(
     let Some(track) = song.tracks.get(track_idx as usize) else {
         return;
     };
+    let track_id = track.id;
     if bpm <= 0.0 || sample_rate == 0 {
         return;
     }
@@ -68,6 +77,11 @@ pub fn fill_track_param_ramps(
 
     for lane in &track.automation_lanes {
         if !lane.enabled {
+            continue;
+        }
+        // Phase 4 Step C-2: 現在 recording 中の lane なら curve eval skip。
+        // 上で fill した track.volume / track.pan の constant が残る。
+        if recording_lanes.contains(&(track_id, lane.target.clone())) {
             continue;
         }
         // Borrow the right buffer for this lane's target. Plugin
@@ -203,11 +217,19 @@ mod tests {
     /// 120 BPM at 48 kHz → 24000 samples/beat.
     const SR: u32 = 48000;
 
+    /// Phase 4 Step C-2: 既存テストは recording 中ではないので、 共通 helper
+    /// で empty set を borrow する。
+    fn empty_recording_lanes()
+    -> std::collections::HashSet<(u32, common::model::AutomationTarget)> {
+        std::collections::HashSet::new()
+    }
+
     #[test]
     fn no_song_falls_back_to_unity_volume_zero_pan() {
         let mut vol = vec![0.0_f32; 8];
         let mut pan = vec![0.5_f32; 8];
-        fill_track_param_ramps(None, 0, SR, 120.0, 0, 8, &mut vol, &mut pan);
+        let empty = empty_recording_lanes();
+        fill_track_param_ramps(None, 0, SR, 120.0, 0, 8, &mut vol, &mut pan, &empty);
         assert!(vol.iter().all(|&v| (v - 1.0).abs() < 1e-6));
         assert!(pan.iter().all(|&p| p.abs() < 1e-6));
     }
@@ -227,7 +249,18 @@ mod tests {
         });
         let mut vol = vec![0.0_f32; 16];
         let mut pan = vec![0.0_f32; 16];
-        fill_track_param_ramps(Some(&song), 0, SR, 120.0, 0, 16, &mut vol, &mut pan);
+        let empty = empty_recording_lanes();
+        fill_track_param_ramps(
+            Some(&song),
+            0,
+            SR,
+            120.0,
+            0,
+            16,
+            &mut vol,
+            &mut pan,
+            &empty,
+        );
         assert!(vol.iter().all(|&v| (v - 0.7).abs() < 1e-6));
         assert!(pan.iter().all(|&p| (p - -0.25).abs() < 1e-6));
     }
@@ -237,10 +270,21 @@ mod tests {
         let song = one_volume_lane_song();
         let mut vol = vec![0.0_f32; 16];
         let mut pan = vec![0.0_f32; 16];
+        let empty = empty_recording_lanes();
         // Buffer of 16 samples starting at playhead 0 → first 16 samples
         // out of 24000 samples-per-beat × 4 = 96000 total. Volume should
         // ramp from 0.0 toward ~16/96000 ≈ 0.000167.
-        fill_track_param_ramps(Some(&song), 0, SR, 120.0, 0, 16, &mut vol, &mut pan);
+        fill_track_param_ramps(
+            Some(&song),
+            0,
+            SR,
+            120.0,
+            0,
+            16,
+            &mut vol,
+            &mut pan,
+            &empty,
+        );
         assert!(vol[0].abs() < 1e-6);
         assert!(vol[15] > 0.0 && vol[15] < 0.001, "vol[15]={}", vol[15]);
         // Pan untouched (no Pan lane) → falls back to track.pan = 0.
@@ -252,9 +296,20 @@ mod tests {
         let song = one_volume_lane_song();
         let mut vol = vec![0.0_f32; 4];
         let mut pan = vec![0.0_f32; 4];
+        let empty = empty_recording_lanes();
         // Beat 2.0 = 48000 samples in. Curve linear 0→1 over beats 0..4
         // → value 0.5 at beat 2.
-        fill_track_param_ramps(Some(&song), 0, SR, 120.0, 48_000, 4, &mut vol, &mut pan);
+        fill_track_param_ramps(
+            Some(&song),
+            0,
+            SR,
+            120.0,
+            48_000,
+            4,
+            &mut vol,
+            &mut pan,
+            &empty,
+        );
         for &v in vol.iter() {
             assert!((v - 0.5).abs() < 0.001, "expected ~0.5, got {}", v);
         }
@@ -267,7 +322,18 @@ mod tests {
         // default_value is 0.5 from one_volume_lane_song.
         let mut vol = vec![0.0_f32; 4];
         let mut pan = vec![0.0_f32; 4];
-        fill_track_param_ramps(Some(&song), 0, SR, 120.0, 0, 4, &mut vol, &mut pan);
+        let empty = empty_recording_lanes();
+        fill_track_param_ramps(
+            Some(&song),
+            0,
+            SR,
+            120.0,
+            0,
+            4,
+            &mut vol,
+            &mut pan,
+            &empty,
+        );
         // Bypass returns the lane's default — but `fill_track_param_ramps`
         // only writes the lane buffer when `enabled = true`. With the
         // lane disabled the constant fallback (track.volume = 0.5)
@@ -284,9 +350,87 @@ mod tests {
         // lane_value_at returns lane.default_value = 0.5.
         let mut vol = vec![0.0_f32; 4];
         let mut pan = vec![0.0_f32; 4];
-        fill_track_param_ramps(Some(&song), 0, SR, 120.0, 240_000, 4, &mut vol, &mut pan);
+        let empty = empty_recording_lanes();
+        fill_track_param_ramps(
+            Some(&song),
+            0,
+            SR,
+            120.0,
+            240_000,
+            4,
+            &mut vol,
+            &mut pan,
+            &empty,
+        );
         for &v in vol.iter() {
             assert!((v - 0.5).abs() < 1e-6, "got {}", v);
+        }
+    }
+
+    /// Phase 4 Step C-2: `recording_lanes` に含まれる lane は curve eval を
+    /// skip し、 track.volume の constant が残るべき (= live knob 値で audio
+    /// が鳴る挙動の基盤)。 track.volume を 0.9、 curve は beat 2.0 で 0.5 に
+    /// なる構成にし、 bypass で vol[i] が 0.9 になることを確認する。
+    #[test]
+    fn recording_lane_bypasses_curve_eval() {
+        let mut song = one_volume_lane_song();
+        song.tracks[0].volume = 0.9; // 区別のため curve mid (0.5) と違う値に
+        let track_id = song.tracks[0].id;
+        let mut vol = vec![0.0_f32; 4];
+        let mut pan = vec![0.0_f32; 4];
+        let mut recording = std::collections::HashSet::new();
+        recording.insert((
+            track_id,
+            common::model::AutomationTarget::TrackBuiltin(
+                common::model::TrackBuiltinParam::Volume,
+            ),
+        ));
+        // Beat 2.0 の curve eval は 0.5 だが、 recording bypass で track.volume
+        // (= 0.9) がそのまま残る。
+        fill_track_param_ramps(
+            Some(&song),
+            0,
+            SR,
+            120.0,
+            48_000,
+            4,
+            &mut vol,
+            &mut pan,
+            &recording,
+        );
+        for &v in vol.iter() {
+            assert!(
+                (v - 0.9).abs() < 1e-6,
+                "expected track.volume bypass (0.9), got {}",
+                v
+            );
+        }
+    }
+
+    /// Phase 4 Step C-2: recording set にない lane は通常通り curve eval する。
+    /// recording bypass test と pair の sanity check (= bypass が必要なときだけ
+    /// 効いて、 不要なときは無回帰)。
+    #[test]
+    fn non_recording_lane_still_uses_curve() {
+        let mut song = one_volume_lane_song();
+        song.tracks[0].volume = 0.9;
+        let mut vol = vec![0.0_f32; 4];
+        let mut pan = vec![0.0_f32; 4];
+        let empty = empty_recording_lanes();
+        // Beat 2.0 の curve eval は 0.5、 bypass されないので vol[i] = 0.5。
+        fill_track_param_ramps(
+            Some(&song),
+            0,
+            SR,
+            120.0,
+            48_000,
+            4,
+            &mut vol,
+            &mut pan,
+            &empty,
+        );
+        for &v in vol.iter() {
+            assert!((v - 0.5).abs() < 0.001, "expected curve eval (0.5), got {}", v);
         }
     }
 }

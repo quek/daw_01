@@ -315,6 +315,17 @@ pub enum MainToChild {
     SetTrackPan { track: u32, pan: f32 },
     SetTrackMuted { track: u32, muted: bool },
     SetTrackSolo { track: u32, solo: bool },
+    /// Phase 4 Step C-2 (`docs/plan_automation.md` §6): GUI が現在 recording
+    /// 中の lane (track + target の 2 つ組) を audio thread に通知する。
+    /// audio thread は受信時 SharedState 上の HashSet を ArcSwap で更新し、
+    /// `fill_track_param_ramps` で該当 lane の curve eval を bypass する
+    /// (= track.volume / track.pan の live value をそのまま出力)。 空 Vec は
+    /// 「現在 recording 中の lane なし = 全 curve eval する」 を意味する。
+    /// daw_gui は recording_mode / active / latched gesture の変化 (= currently
+    /// recording set の edge) と stop / Read 遷移で送る。
+    SetRecordingLanes {
+        lanes: Vec<(u32, crate::model::AutomationTarget)>,
+    },
     // --- Per-track plugin slot management -----------------------------
     /// Load / replace the plugin in `(track, slot)`. `format` routes the
     /// request to the CLAP or VST3 backend. Empty `plugin_id` picks the

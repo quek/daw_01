@@ -219,6 +219,17 @@ async fn recv_loop(
                     }
                 });
             }
+            Ok(MainToChild::SetRecordingLanes { lanes }) => {
+                // Phase 4 Step C-2: GUI が「現在 recording 中の lane」 セットを
+                // 送ってきた。 ArcSwap で snapshot を replace し、 audio thread
+                // は次 buffer から `fill_track_param_ramps` で該当 lane の
+                // curve eval を skip する (= track.volume / track.pan の live
+                // value がそのまま出力される、 user の knob 操作がそのまま
+                // 聞こえる)。 lock-free / 0 allocation on audio thread。
+                let set: std::collections::HashSet<(u32, common::model::AutomationTarget)> =
+                    lanes.into_iter().collect();
+                shared.recording_lanes.store(std::sync::Arc::new(set));
+            }
             // SetGeneratedAudio (Phase 1 PR8): in-memory audio buffer
             // delivered by the GUI. Used both for
             // PR-V4: `MainToChild::SetGeneratedAudio` 削除済 (= VOICEVOX
