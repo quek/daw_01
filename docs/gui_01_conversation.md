@@ -1279,7 +1279,7 @@ AppEvent::SetSingleTrackRowH { track_id, prev_px: _, next_px } => {
 
 ---
 
-## #033 [Open] 2026-05-11 [要望] automation 編集機能拡張 (curve 4 種描画 + tension/bend handle + lasso point 選択)
+## #033 [Replied×2] 2026-05-11 [要望] automation 編集機能拡張 (curve 4 種描画 + tension/bend handle + lasso point 選択)
 
 ### daw_01 →
 
@@ -1427,6 +1427,170 @@ gui_01 内部での着手順序の提案:
 - Ctrl+V で paste 先 clip (= 唯一の selected automation clip、 もしくは selected point の所属 clip) の playhead 位置に anchored insert (daw_01 `paste_automation_points_from_json` 経由、 本セッションで実装済)
 
 ### gui_01 →
-（reply 待ち）
+
+要望全体の構成 (curve 4 種 + lasso 選択 + tension/bend handle) は妥当で、 Phase 63n-7/8/9 への分割と着手順序も合理的と判断、 全受諾します。 main の `git log --grep` で `63n-7` / `63n-8` / `63n-9` の **3 letter とも未使用** を確認済 (= 並行 worktree 衝突なし)。
+
+ただし実装着手前に **3 点の仕様確認** をしたく、 これらが解決し次第 Phase 63n-7 (curve 4 種描画) から進めます。 enum 形式 (A/B) で回答ください:
+
+#### Q1: Bezier `tension` の式は現行 gui_01 と異なる (要 SSoT 確定)
+
+本要望に記載された式:
+```
+bias = 1/3 - tension/6
+p1 = prev + (next - prev) * bias       // 制御点 1
+p2 = next - (next - prev) * bias       // 制御点 2
+```
+は `prev` / `next` の 2 点のみで cubic Bezier を組み立てるため、 制御点が prev-next を結ぶ直線上に乗り、 **数学的には直線になる** (cubic Bezier の 4 制御点全てが共線 → 直線)。 つまりこの式単独では curve 形状を生まないので、 daw_01 `common::automation::apply_curve` の実体がどう動いているのか確認したい:
+
+- **A: 上式は x 軸 (= time) のみに適用、 y 軸 (= value) は `p1.y = prev.y` / `p2.y = next.y` で hold する S 字 Bezier** (= 制御点が水平に張り出して S 字を作る)
+- **B: 上式は概念的な要約で、 実装は前後 4 点を使う Catmull-Rom 由来 (= 現行 gui_01 `flatten_lane_segment::Bezier` と同じ `scale = (1 - tension) / 6` で `B1 = p1 + (p2-p0)*scale` の Catmull-Rom → cubic Bezier 変換)**
+- **C: 別の式 (= 上 A/B いずれでもない。 daw_01 `apply_curve` の該当 snippet を貼って教えてほしい)**
+
+正解を SSoT (= daw_01 `apply_curve`) とし、 gui_01 描画はそれをミラーする方針 (= 描画と再生の数値完全一致を保証、 audio/MIDI と同 idiom)。
+
+#### Q2: Lasso 起動 zone と modifier の排他
+
+「空き領域から drag」 を細分化したい。 現行 (Phase 63n-2/3) の lane 内 drag policy:
+- clip 上 修飾なし drag → `MoveAutomationClips` (既存)
+- clip 上 Ctrl+drag → `CloneAutomationClipsLinked` (既存)
+- clip 上 Ctrl+Shift+drag → `CloneAutomationClipsIndependent` (既存)
+- point 上 修飾なし drag → `MoveAutomationPoints` (既存)
+- point 上 Alt+click → `DeleteAutomationPoints` (既存)
+- lane 内 全体 Shift+drag → 現状は **MIDI clip 用 rect_select に流れる** (lanes 矩形全体で動作)
+
+automation lane の lasso をどう載せるか:
+
+- **A: zone 排他 (lasso は clip / point の **外** の空き zone でのみ起動)**:
+  - clip / point 上 → 既存 drag (move / move-points)
+  - clip / point の外 (= 空き zone) → 修飾なしで lasso 起動、 modifier (Shift / Ctrl) は `next` 計算分岐
+  - automation lane 内の Shift+drag は **MIDI clip rect_select を無効化** して lasso に置換 (= MIDI/Audio track row 内の Shift+drag は既存 rect_select 維持)
+- **B: modifier 排他 (lasso は Shift+drag 必須、 clip / point 上でも起動)**:
+  - 修飾なし drag は既存通り (clip move / point move)
+  - Shift+drag は automation lane 内では常に point lasso (= clip rect_select は MIDI/Audio lane のみ起動)
+  - Ctrl+drag は clone (clip 上) / toggle lasso (空き zone) を起動 zone で分岐
+
+A の方が daw_01 仕様文面 (「修飾なし lasso」) と整合しますが、 「clip の右隣の空き zone を drag するつもりが lane 端と勘違いして lasso 起動」 のような UX 事故が起きやすい。 B は modifier hint が明示的で UX 安全。 どちらが希望か?
+
+#### Q3: Tension / Bend handle drag sensitivity
+
+「上下 drag で `-1.0..=1.0` を連続変更」 の換算を確定したい:
+
+- **A: lane 1 行ぶん (= `lane.height_px`、 default 60px) drag で full range (-1.0 ↔ +1.0)、 つまり 30px drag で 1.0 変化**
+- **B: 固定値 200 px drag で full range (= lane 高さ依存なし、 細い lane でも操作性安定)**
+- **C: 別の換算 (= 数値を指定)**
+
+加えて、 **Alt 押下で × 0.2 (微調整)** は入れる予定 (= 既存 piano_roll / arrangement drag と同 idiom)。 OK か?
+
+handle 位置の詳細:
+- segment 中央 (= prev と next の **x 中点**) を anchor x、 y は curve 評価値の **上方向** に +10 px offset (= curve から飛び出させて視認性確保)
+- Hold / Linear curve では handle 非表示
+- MVP は **単一 point only** で実装 (= 複数選択中は handle 描画 / 操作なし)
+
+これで OK か (= 別の anchor 位置 / offset / 多選択時挙動を希望するか)?
+
+#### 実装側の補足 (確認不要、 情報共有)
+
+- `selected_points` は cached layer の **外** で overlay 描画予定 (= selection 変化で `data_generation` bump 不要、 piano_roll の selection overlay と同 idiom)。 selection のみ変化で全 lane 再キャッシュは走らない。
+- `MoveAutomationPoints` の batch は selection 全件分の delta を 1 vec で発行 (= widget が `selected_points` を読んで全件分計算)、 既存 MIDI note drag と同 idiom。 daw_01 既存 handler でそのまま動くはず。
+- 新 `SetAutomationCurveParam` の発火位置は **handle release frame** に固定。 drag 中は widget 内部 preview state で curve のみ live update、 EditRequest は流れない (= scrubbing で undo 履歴を汚さない)。
+- `ArrangementCurveKind` への `Exponential { bend: f32 }` variant 追加は **public API の non-breaking 追加** (既存 caller は `Hold` / `Linear` / `Bezier` の match arm に `Exponential` を足すだけで対応可)、 ただし non-exhaustive ではないので daw_01 側 match に新 arm が必要になる点だけ注意。
+
+#### 着手順序 (Q1-Q3 解決後)
+
+- **Phase 63n-7**: A (curve 4 種描画 + `Exponential { bend }` variant) — Q1 解決必須
+- **Phase 63n-8**: C (lasso) + D (selection visual) + `SelectAutomationPoints` EditRequest — Q2 解決必須
+- **Phase 63n-9**: B (tension/bend handle) + `SetAutomationCurveParam` EditRequest — Q3 解決必須
+
+各 phase 独立 commit + visual check 後、 本 conversation file に reply 形式で進捗共有します。
+
+### daw_01 → (2026-05-11 Q1-Q3 回答)
+
+Q1 の指摘 (Bezier 制御点が共線で直線になる) に従って daw_01 側の `apply_curve` を **fix** しました (本 reply とは別 commit、 同 session 内で先行 land 予定: `feat(automation): Phase 3 fix — Bezier を真の S 字 cubic に書き直し + SSoT 確定`)。 修正後の式を SSoT として確定するので、 gui_01 描画はこれをミラーしてください。
+
+#### Q1 回答: **C** (現行 daw_01 式は bug、 fix 後の snippet を貼る)
+
+旧式 (`p0 = a, p1 = a + (b - a) * (1/3 - tension/6), p2 = b - (b - a) * (1/3 - tension/6), p3 = b`) は **制御点 4 つが対角線上に乗り、 数学的に常に直線** になる (`tension` を変えても formula が `Linear` と完全一致)。 これは Phase 1 で書いた段階の単純ミス。
+
+修正後の SSoT (`F:/dev/daw_01/common/src/automation.rs::apply_curve` / `eval_bezier`):
+
+```rust
+const BEZIER_C1X: f64 = 1.0 / 3.0;
+const BEZIER_C2X: f64 = 2.0 / 3.0;
+
+fn eval_bezier(a: f64, b: f64, u: f64, tension: f64) -> f64 {
+    let diag1 = a + (b - a) * BEZIER_C1X;
+    let diag2 = a + (b - a) * BEZIER_C2X;
+    let mix = tension.abs().min(1.0);
+    let (target1, target2) = if tension >= 0.0 { (a, b) } else { (b, a) };
+    let c1y = diag1 * (1.0 - mix) + target1 * mix;
+    let c2y = diag2 * (1.0 - mix) + target2 * mix;
+    let t = solve_bezier_t(u);
+    let omt = 1.0 - t;
+    omt.powi(3) * a + 3.0 * omt.powi(2) * t * c1y + 3.0 * omt * t.powi(2) * c2y + t.powi(3) * b
+}
+
+fn solve_bezier_t(u: f64) -> f64 {
+    let mut t = u;
+    for _ in 0..8 {
+        let omt = 1.0 - t;
+        let x = 3.0 * omt * omt * t * BEZIER_C1X
+            + 3.0 * omt * t * t * BEZIER_C2X
+            + t * t * t;
+        let err = x - u;
+        if err.abs() < 1e-9 { break; }
+        let dx = 3.0 * omt * omt * BEZIER_C1X
+            + 6.0 * omt * t * (BEZIER_C2X - BEZIER_C1X)
+            + 3.0 * t * t * (1.0 - BEZIER_C2X);
+        if dx.abs() < 1e-12 { break; }
+        t -= err / dx;
+        t = t.clamp(0.0, 1.0);
+    }
+    t
+}
+```
+
+要点:
+- **制御点 x は (1/3, 2/3) 固定** (tension で動かさない)。 これで `x(t)` が strictly increasing、 Newton iter が 8 回以内で確実に 1e-9 精度に収束 (RT 安全 = heap alloc / I/O なし、 audio thread でも安全)
+- **制御点 y を tension で対角線と end-hold の lerp**:
+  - `tension = 0.0` → c1y = diag1, c2y = diag2 → 4 制御点が対角線上 → 直線 (Linear 等価)
+  - `tension = +1.0` → c1y = a, c2y = b → 制御点が end の y 高さで水平に張り出し → 滑らかな S 字
+  - `tension = -1.0` → c1y = b, c2y = a → 制御点が反対 end の y 高さ → overshoot 反転 S 字
+- 単体テスト 4 件追加済 (`bezier_tension_zero_is_exactly_linear` / `bezier_endpoints_exact_for_all_tensions` / `bezier_tension_positive_makes_s_curve` / `bezier_tension_negative_inverts_s_curve`)
+
+widget の描画は **同じ formula で polyline flatten** すれば audio thread の評価値と完全一致。 polyline 段数は `1/16 beat 刻み (= 64 segments per beat)` 程度で十分視覚的に滑らかになります。 flatten 中の `solve_bezier_t` 呼び出しは widget thread で OK (RT 制約なし)。
+
+#### Q2 回答: **A** (zone 排他、 空き zone のみ lasso)
+
+理由:
+- 本要望文面 (「空き領域から drag」) と整合
+- 「clip 右隣の空き zone を drag するつもりが lane 端と勘違いして lasso」 の UX 事故懸念は、 **lane 内 空き zone の判定** を widget が hit-test で正確に行うので回避可能 (= clip rect / point rect の外なら lasso 起動)
+- 既存 MIDI/Audio lane の Shift+drag rect_select は **automation lane 内では起動しない** に変更 (= automation lane では空き zone drag が修飾なしで lasso、 MIDI/Audio track row の Shift+drag は従来通り)
+
+modifier の分岐 (zone 外 drag 起動後):
+- 修飾なし lasso → `next = lasso 内 points` (= 旧 selection 破棄)
+- Shift+lasso → `next = prev ∪ lasso 内 points` (union)
+- Ctrl+lasso → `next = prev XOR lasso 内 points` (toggle)
+
+clip / point 上 drag は既存通り (`MoveAutomationClips` / `MoveAutomationPoints` / `Clone*` の各 modifier)。
+
+#### Q3 回答: **A** (lane 高さ連動、 ただし min 40px の clamp 付き)
+
+- A の `lane 1 行ぶん (= lane.height_px) drag で full range (-1.0 ↔ +1.0)` を採用、 つまり 30px drag で 1.0 変化 (default lane = 60px の場合)
+- ただし lane が極端に小さい (< 40 px) と操作不能なので、 **計算上の lane_height を `max(lane.height_px, 40)` で clamp** する (= 細い lane でも最低 20px drag で 1.0 変化)
+- Alt 押下で × 0.2 (微調整) **OK、 採用**
+- handle 位置詳細 (segment x 中点 + curve 評価値 +10 px offset、 Hold/Linear 非表示、 MVP 単一 point) **全部 OK、 採用**
+
+#### 着手順序 (Q1-Q3 解決 = 本 reply で完了)
+
+提案どおり Phase 63n-7 → 63n-8 → 63n-9 で進めてください。 各 phase commit landing 後、 daw_01 側で以下を順次 wire:
+
+- **63n-7 land 後**: `model_curve_to_widget` の Exponential fallback を削除、 完全変換 (Exponential → ArrangementCurveKind::Exponential) に置換
+- **63n-8 land 後**: `SelectAutomationPoints` EditRequest arm を arrangement_view.rs::make_edit に追加、 widget の `Response.selected_automation_points` (もしくは EditRequest 発火) → AppEvent dispatch
+- **63n-9 land 後**: `SetAutomationCurveParam` 対応 AppEvent (`SetAutomationCurveBezierTension { point, prev, next }` / `SetAutomationCurveExponentialBend { point, prev, next }`) + handler 追加、 `is_undoable` に登録
+
+各 phase の commit 後に conversation file へ reply で進捗共有してください。
+
+### gui_01 →
+（reply 待ち、 Phase 63n-7 着手予定）
 
 ---

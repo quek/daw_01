@@ -160,12 +160,19 @@ pub enum AutomationCurve {
     Hold,
     /// 直前 point からこの point へ直線。
     Linear,
-    /// cubic Bezier。tension は -1.0..=1.0:
-    ///   0.0 → Catmull-Rom (gui_01 `automation_curve` 既定)
-    ///   +1.0 → S 字 (両端緩い)
-    ///   -1.0 → 加速減速反転
+    /// 2D cubic Bezier。tension は -1.0..=1.0。 SSoT は
+    /// `common/src/automation.rs::apply_curve` の `eval_bezier`:
+    ///   - 制御点 x は固定 (`c1x = 1/3`, `c2x = 2/3`)
+    ///   - 制御点 y は対角線と end-hold の lerp:
+    ///       tension >= 0: c1y = lerp(diag1, a, tension), c2y = lerp(diag2, b, tension)
+    ///       tension <  0: c1y = lerp(diag1, b, |tension|), c2y = lerp(diag2, a, |tension|)
+    ///   - 時間軸 u → Bezier parameter t は Newton iter 8 回 (RT 安全)
+    ///   - tension=0 で 4 制御点が対角線上 → 直線 (= Linear と一致)
+    ///   - tension=+1.0 で S 字 (両端緩い)
+    ///   - tension=-1.0 で inverse S 字 (overshoot 系)
     Bezier { tension: f32 },
     /// 指数。bend は -1.0..=1.0、0.0 で linear、正で前半遅く後半速い、負で逆。
+    /// `value = a + (b - a) * u^(2^bend)`。
     Exponential { bend: f32 },
 }
 ```

@@ -1042,14 +1042,16 @@ pub enum AutomationCurve {
     /// Straight line from the previous point to this one.
     #[default]
     Linear,
-    /// Cubic Bezier with a Catmull-Rom-derived control polygon. `tension`
-    /// is `-1.0..=1.0`: `0.0` reproduces gui_01's `automation_curve`
-    /// default Catmull-Rom flatten; `+1.0` softens both endpoints
-    /// (S-curve), `-1.0` reverses to an accelerate/decelerate shape.
+    /// 2D cubic Bezier。 `tension` は -1.0..=1.0、 数式 SSoT は
+    /// [`crate::automation::apply_curve`] の `eval_bezier`。
+    /// 制御点 x は固定 (1/3, 2/3)、 y は対角線と end-hold の lerp:
+    /// `tension = 0.0` で 4 制御点が対角線上 → 直線 (Linear 等価)、
+    /// `tension = +1.0` で滑らかな S 字 (両端緩い)、
+    /// `tension = -1.0` で inverse S 字 (overshoot 系)。
     Bezier { tension: f32 },
     /// Exponential / power curve. `bend` is `-1.0..=1.0`: `0.0` is
     /// linear, positive values hold near the start and ramp toward the
-    /// end, negative values invert.
+    /// end, negative values invert. `value = a + (b - a) * u^(2^bend)`.
     Exponential { bend: f32 },
 }
 

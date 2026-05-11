@@ -119,29 +119,34 @@ pub fn evaluate_clip(content: &AutomationContent, t: f64) -> f64 {
 /// Apply `curve` to interpolate from `a` to `b` with parameter
 /// `u ∈ [0, 1]`. The curve attribute lives on the *incoming* point so
 /// the caller passes `next.curve`.
+///
+/// `Bezier { tension }` 数式 (SSoT、 gui_01 widget もこれをミラー):
+///
+/// 2D cubic Bezier。 制御点 4 つの x 座標は固定 (`c1x = 1/3`, `c2x = 2/3`)、
+/// y 座標を `tension` で対角線から hold 方向へ離す。
+///
+/// ```text
+///   diag1 = a + (b - a) * (1/3)
+///   diag2 = a + (b - a) * (2/3)
+///   tension >= 0 (S 字):  c1y = lerp(diag1, a, tension), c2y = lerp(diag2, b, tension)
+///   tension <  0 (反転): c1y = lerp(diag1, b, |tension|), c2y = lerp(diag2, a, |tension|)
+/// ```
+///
+/// `tension = 0.0` で制御点 4 つが対角線上に乗り、 Bezier は直線 (=
+/// `Linear` と一致)。 `tension = +1.0` で制御点 y が end y で hold される
+/// 滑らかな S 字。 `tension = -1.0` で制御点 y が反対 end で hold される
+/// inverse S 字 (overshoot 系)。
+///
+/// 時間軸 `u` (clip-local 比、 0..=1) から Bezier parameter `t` を Newton
+/// 法で逆算する (`c1x < c2x` かつ ∈ `(0, 1)` なので `x(t)` は monotonic、
+/// 高々 8 iter で 1e-9 まで収束)。 RT 安全 (heap alloc / I/O なし)。
 #[inline]
 pub fn apply_curve(a: f64, b: f64, u: f64, curve: AutomationCurve) -> f64 {
     let u = u.clamp(0.0, 1.0);
     match curve {
         AutomationCurve::Hold => a, // step jump happens at u = 1.0 (handled by next segment)
         AutomationCurve::Linear => a + (b - a) * u,
-        AutomationCurve::Bezier { tension } => {
-            // 1D cubic Bezier with control points derived to mimic
-            // gui_01's `automation_curve` Catmull-Rom flatten at
-            // tension == 0.0:
-            //   p0 = a, p1 = a + (b - a) * (1/3 - tension/6)
-            //   p2 = b - (b - a) * (1/3 - tension/6), p3 = b
-            // Positive tension softens both endpoints (S-shape),
-            // negative tension steepens the middle.
-            let bias = (1.0 / 3.0) - f64::from(tension) / 6.0;
-            let p1 = a + (b - a) * bias;
-            let p2 = b - (b - a) * bias;
-            let one_minus = 1.0 - u;
-            (one_minus.powi(3)) * a
-                + 3.0 * one_minus.powi(2) * u * p1
-                + 3.0 * one_minus * u.powi(2) * p2
-                + u.powi(3) * b
-        }
+        AutomationCurve::Bezier { tension } => eval_bezier(a, b, u, f64::from(tension)),
         AutomationCurve::Exponential { bend } => {
             // value = a + (b - a) * u^k, where k = 2^bend.
             //   bend == 0 → k=1 (linear)
@@ -151,6 +156,52 @@ pub fn apply_curve(a: f64, b: f64, u: f64, curve: AutomationCurve) -> f64 {
             a + (b - a) * u.powf(k)
         }
     }
+}
+
+/// Bezier curve 評価 (`apply_curve` 内で SSoT)。 module 公開で gui_01
+/// widget からのミラー実装の単体テストに使えるよう pub(crate)。
+const BEZIER_C1X: f64 = 1.0 / 3.0;
+const BEZIER_C2X: f64 = 2.0 / 3.0;
+
+#[inline]
+fn eval_bezier(a: f64, b: f64, u: f64, tension: f64) -> f64 {
+    // tension で制御点 y を対角線 (linear) と end-hold の間で blend。
+    let diag1 = a + (b - a) * BEZIER_C1X;
+    let diag2 = a + (b - a) * BEZIER_C2X;
+    let mix = tension.abs().min(1.0);
+    let (target1, target2) = if tension >= 0.0 { (a, b) } else { (b, a) };
+    let c1y = diag1 * (1.0 - mix) + target1 * mix;
+    let c2y = diag2 * (1.0 - mix) + target2 * mix;
+    let t = solve_bezier_t(u);
+    let omt = 1.0 - t;
+    omt.powi(3) * a + 3.0 * omt.powi(2) * t * c1y + 3.0 * omt * t.powi(2) * c2y + t.powi(3) * b
+}
+
+/// `x(t) = u` を Newton 法で解いて Bezier parameter `t` を返す。 制御点
+/// x が `(1/3, 2/3)` 固定 (`tension` で動かさない) なので `x(t)` は
+/// strictly increasing、 Newton は確実に収束する。 RT 安全。
+#[inline]
+fn solve_bezier_t(u: f64) -> f64 {
+    let mut t = u; // 初期推定: linear 近似
+    for _ in 0..8 {
+        let omt = 1.0 - t;
+        let x = 3.0 * omt * omt * t * BEZIER_C1X
+            + 3.0 * omt * t * t * BEZIER_C2X
+            + t * t * t;
+        let err = x - u;
+        if err.abs() < 1e-9 {
+            break;
+        }
+        let dx = 3.0 * omt * omt * BEZIER_C1X
+            + 6.0 * omt * t * (BEZIER_C2X - BEZIER_C1X)
+            + 3.0 * t * t * (1.0 - BEZIER_C2X);
+        if dx.abs() < 1e-12 {
+            break;
+        }
+        t -= err / dx;
+        t = t.clamp(0.0, 1.0);
+    }
+    t
 }
 
 /// Resolve `lane` at `song_beat` (song timeline). Walks the lane's
@@ -289,19 +340,90 @@ mod tests {
     }
 
     #[test]
-    fn bezier_tension_zero_matches_endpoints_and_midpoint() {
+    fn bezier_tension_zero_is_exactly_linear() {
+        // tension=0 で制御点 4 つが対角線上に乗り、 Bezier は直線になる
+        // (SSoT: `apply_curve` Bezier コメント参照)。 数 sample 取って
+        // linear と一致を確認。
         let c = AutomationContent {
             points: vec![
                 pt(0.0, 0.0, AutomationCurve::Linear),
                 pt(4.0, 1.0, AutomationCurve::Bezier { tension: 0.0 }),
             ],
         };
-        // Endpoints exact.
-        assert!((evaluate_clip(&c, 0.0) - 0.0).abs() < 1e-9);
-        assert!((evaluate_clip(&c, 4.0) - 1.0).abs() < 1e-9);
-        // Midpoint: with bias = 1/3 the cubic reduces to plain linear.
+        for k in 0..=8 {
+            let t = (k as f64) / 8.0 * 4.0;
+            let expected = t / 4.0;
+            let got = evaluate_clip(&c, t);
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "t={t} expected linear {expected}, got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn bezier_endpoints_exact_for_all_tensions() {
+        for tension in [-1.0, -0.5, 0.0, 0.5, 1.0] {
+            let c = AutomationContent {
+                points: vec![
+                    pt(0.0, 0.0, AutomationCurve::Linear),
+                    pt(4.0, 1.0, AutomationCurve::Bezier { tension }),
+                ],
+            };
+            assert!(
+                (evaluate_clip(&c, 0.0) - 0.0).abs() < 1e-9,
+                "tension={tension} start"
+            );
+            assert!(
+                (evaluate_clip(&c, 4.0) - 1.0).abs() < 1e-9,
+                "tension={tension} end"
+            );
+        }
+    }
+
+    #[test]
+    fn bezier_tension_positive_makes_s_curve() {
+        // tension=+1.0 で制御点 y が end y で hold → S 字。 中点 (u=0.5) は
+        // 対称 ((y=a+b)/2 = 0.5)、 quarter 点 (u=0.25) は linear (0.25) より
+        // **小さい** (= 前半が緩い、 S 字の凹み)、 three-quarter 点 (u=0.75)
+        // は linear (0.75) より **大きい**。
+        let c = AutomationContent {
+            points: vec![
+                pt(0.0, 0.0, AutomationCurve::Linear),
+                pt(4.0, 1.0, AutomationCurve::Bezier { tension: 1.0 }),
+            ],
+        };
         let mid = evaluate_clip(&c, 2.0);
-        assert!((mid - 0.5).abs() < 1e-6, "expected 0.5, got {}", mid);
+        assert!((mid - 0.5).abs() < 1e-6, "midpoint expected 0.5, got {mid}");
+        let q = evaluate_clip(&c, 1.0);
+        assert!(
+            q < 0.25 - 1e-3,
+            "quarter expected < 0.25 (concave), got {q}"
+        );
+        let tq = evaluate_clip(&c, 3.0);
+        assert!(
+            tq > 0.75 + 1e-3,
+            "three-quarter expected > 0.75 (convex), got {tq}"
+        );
+    }
+
+    #[test]
+    fn bezier_tension_negative_inverts_s_curve() {
+        // tension=-1.0 で制御点 y が反対 end で hold → inverse S 字。
+        // 中点で対称、 quarter 点は linear より **大きい**、 3/4 点は
+        // linear より **小さい**。
+        let c = AutomationContent {
+            points: vec![
+                pt(0.0, 0.0, AutomationCurve::Linear),
+                pt(4.0, 1.0, AutomationCurve::Bezier { tension: -1.0 }),
+            ],
+        };
+        let mid = evaluate_clip(&c, 2.0);
+        assert!((mid - 0.5).abs() < 1e-6, "midpoint expected 0.5, got {mid}");
+        let q = evaluate_clip(&c, 1.0);
+        assert!(q > 0.25 + 1e-3, "quarter expected > 0.25, got {q}");
+        let tq = evaluate_clip(&c, 3.0);
+        assert!(tq < 0.75 - 1e-3, "three-quarter expected < 0.75, got {tq}");
     }
 
     #[test]
