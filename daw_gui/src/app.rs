@@ -8582,14 +8582,28 @@ impl AppData {
         track_id: u32,
         target: &common::model::AutomationTarget,
     ) -> Option<f64> {
-        let track = self.song.tracks.iter().find(|t| t.id == track_id)?;
         match target {
+            // Phase 5: song-level target は track_id 無関係、 Song の現在値を返す
+            common::model::AutomationTarget::SongTempo => Some(f64::from(self.song.bpm)),
+            common::model::AutomationTarget::SongTimeSigNumerator => {
+                Some(f64::from(self.song.time_sig.0))
+            }
             common::model::AutomationTarget::TrackBuiltin(
                 common::model::TrackBuiltinParam::Volume,
-            ) => Some(f64::from(track.volume)),
+            ) => self
+                .song
+                .tracks
+                .iter()
+                .find(|t| t.id == track_id)
+                .map(|t| f64::from(t.volume)),
             common::model::AutomationTarget::TrackBuiltin(
                 common::model::TrackBuiltinParam::Pan,
-            ) => Some(f64::from(track.pan)),
+            ) => self
+                .song
+                .tracks
+                .iter()
+                .find(|t| t.id == track_id)
+                .map(|t| f64::from(t.pan)),
             common::model::AutomationTarget::PluginParam { slot, param_id } => self
                 .plugin_param_values
                 .get(&(track_id, *slot, *param_id))
@@ -8608,11 +8622,23 @@ impl AppData {
         target: &common::model::AutomationTarget,
         playhead_beat: f64,
     ) -> Option<(f64, common::model::ContentId)> {
-        let track = self.song.tracks.iter().find(|t| t.id == track_id)?;
-        let lane = track
-            .automation_lanes
-            .iter()
-            .find(|l| l.enabled && l.target == *target)?;
+        // Phase 5: SongTempo / SongTimeSigNumerator は song_lanes を参照、
+        // track_id は ignore (= song-level lane は track に紐付かない)。
+        let lane = match target {
+            common::model::AutomationTarget::SongTempo
+            | common::model::AutomationTarget::SongTimeSigNumerator => self
+                .song
+                .song_lanes
+                .iter()
+                .find(|l| l.enabled && l.target == *target)?,
+            _ => {
+                let track = self.song.tracks.iter().find(|t| t.id == track_id)?;
+                track
+                    .automation_lanes
+                    .iter()
+                    .find(|l| l.enabled && l.target == *target)?
+            }
+        };
         let clip = lane.clips.iter().find(|c| {
             playhead_beat >= c.start_beat && playhead_beat < c.start_beat + c.length_beats
         })?;

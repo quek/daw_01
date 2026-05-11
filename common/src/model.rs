@@ -114,6 +114,20 @@ pub struct Song {
     /// allocations start at `1`.
     #[serde(default)]
     pub next_audio_source_id: AudioSourceId,
+    /// Phase 5 (`docs/plan_automation.md` §10 Phase 5): song-level
+    /// automation lanes (`AutomationTarget::SongTempo` /
+    /// `SongTimeSigNumerator`)。 master lane に相当し、 track ではなく
+    /// Song 自身に紐付く。 既存 `Track.automation_lanes` と同 schema
+    /// (= 同 `AutomationLane` struct を再利用) を使い、 clip 内 points も
+    /// `clip_contents` map を共有する。 audio engine は SongTempo lane
+    /// を per-buffer 評価して `playhead → beat` 換算に使う (Step 5.2)。
+    /// 未設定なら従来通り `Song.bpm` を constant tempo として使う。
+    #[serde(default)]
+    pub song_lanes: Vec<AutomationLane>,
+    /// Stable id allocator for `AutomationLane` ids in `song_lanes`。 0 は
+    /// "未採番" sentinel、 1 から採番。
+    #[serde(default)]
+    pub next_song_lane_id: u32,
 }
 
 impl Default for Song {
@@ -130,6 +144,8 @@ impl Default for Song {
             next_content_id: 1,
             audio_sources: HashMap::new(),
             next_audio_source_id: 1,
+            song_lanes: Vec::new(),
+            next_song_lane_id: 1,
         }
     }
 }
@@ -140,6 +156,32 @@ impl Song {
         let id = self.next_track_id.max(1);
         self.next_track_id = id + 1;
         id
+    }
+
+    /// Phase 5: allocate a new song-level automation lane id (`song_lanes`)。
+    /// `next_song_lane_id` を bump して返す。
+    pub fn alloc_song_lane_id(&mut self) -> u32 {
+        let id = self.next_song_lane_id.max(1);
+        self.next_song_lane_id = id + 1;
+        id
+    }
+
+    /// Phase 5: find a song-level lane (mutable) by id。 Track の
+    /// `lane_by_id_mut` と同 idiom。
+    pub fn song_lane_by_id_mut(&mut self, lane_id: u32) -> Option<&mut AutomationLane> {
+        self.song_lanes.iter_mut().find(|l| l.id == lane_id)
+    }
+
+    /// Phase 5: find a song-level lane (immutable) by id.
+    pub fn song_lane_by_id(&self, lane_id: u32) -> Option<&AutomationLane> {
+        self.song_lanes.iter().find(|l| l.id == lane_id)
+    }
+
+    /// Phase 5: find a song-level lane (immutable) whose target matches.
+    /// SongTempo / SongTimeSigNumerator は同 song に最大 1 lane の前提
+    /// (= multi-lane で同 target に複数置く意味がない、 Bitwig も 1 lane)。
+    pub fn song_lane_by_target(&self, target: &AutomationTarget) -> Option<&AutomationLane> {
+        self.song_lanes.iter().find(|l| &l.target == target)
     }
 
     /// Re-assign stable ids to all tracks / clips after loading an older
@@ -211,6 +253,35 @@ impl Song {
                 }
             }
             remap_chain(&mut track.fx_chain);
+        }
+
+        // Phase 5: song-level lane の id も同様に採番。 sentinel (0) のみ
+        // 上書き、 既存非 0 id は触らず counter を bump するだけ。
+        for lane in &mut self.song_lanes {
+            if lane.id == 0 {
+                let new_id = self.next_song_lane_id.max(1);
+                self.next_song_lane_id = new_id + 1;
+                lane.id = new_id;
+            } else if lane.id >= self.next_song_lane_id {
+                self.next_song_lane_id = lane.id + 1;
+            }
+            // lane 内 clip ids も担保 (Track の ensure_lane_ids 同 idiom、
+            // ただし song_lanes は track field を持たないので per-lane で展開)
+            for clip in &mut lane.clips {
+                if clip.id == 0 {
+                    let new_id = lane.next_clip_id.max(1);
+                    lane.next_clip_id = new_id + 1;
+                    clip.id = new_id;
+                } else if clip.id >= lane.next_clip_id {
+                    lane.next_clip_id = clip.id + 1;
+                }
+            }
+            if lane.next_clip_id == 0 {
+                lane.next_clip_id = 1;
+            }
+        }
+        if self.next_song_lane_id == 0 {
+            self.next_song_lane_id = 1;
         }
     }
 

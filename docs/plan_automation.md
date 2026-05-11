@@ -1018,9 +1018,55 @@ visual feedback で「点が多すぎる」 と感じる原因になるので不
 
 ### Phase 5: Tempo / TimeSig / Transport event
 
-- [ ] AutomationTarget::SongTempo / SongTimeSigNumerator
-- [ ] Master lane (Song level) の表示 (transport 上 or 専用行)
-- [ ] CLAP_EVENT_TRANSPORT 実装 (現状 0%)、tempo を毎 buffer 通知
+Phase 5 は Step で分解して進める:
+
+#### Step 5.0: Song-level lanes データモデル ✅ (2026-05-11)
+
+- [x] `Song.song_lanes: Vec<AutomationLane>` + `next_song_lane_id: u32` field を
+      追加 (= 既存 `Track.automation_lanes` と同 schema、 track ではなく Song
+      自身に紐付く Bitwig 流 master lane)
+- [x] `Song::alloc_song_lane_id` / `song_lane_by_id(_mut)` / `song_lane_by_target`
+      helpers 追加
+- [x] `Song::ensure_ids` 末尾に `song_lanes` の id 採番 + 内部 clip ids
+      bumping を追加
+- [x] `daw_gui::AppData::current_plain_value` に `SongTempo` (= self.song.bpm)
+      / `SongTimeSigNumerator` (= self.song.time_sig.0) の case を追加
+- [x] `daw_gui::AppData::find_recording_lane` を song-level target で `song_lanes`
+      を引くように分岐 (track-level の従来挙動は維持)
+- [x] AutomationTarget::SongTempo / SongTimeSigNumerator は既存 enum で
+      Phase 1 から存在 (= 新規追加なし、 wire のみ)
+
+検証: cargo build / clippy --workspace --tests / test (common 140 + daw_audio
+39 + 既存 group_lifecycle 1 fail は別 task) all clean。
+
+#### Step 5.1: Master lane UI (= arrangement 上に song-level row を表示)
+
+- [ ] arrangement widget に master row 追加要望を gui_01 に出す
+      (= `ArrangementSongLanes` 型 / 第 N+1 引数 / lane header 描画方針)
+- [ ] daw_gui で `arrangement_view::draw` に song_lanes を渡し、 widget
+      response → `AppEvent::AddSongLane / SetLaneDefault / AddAutomationPoint`
+      に変換
+- [ ] transport の BPM input drag / TimeSig num input drag が
+      `ParamGestureBegin/End { target: SongTempo / SongTimeSigNumerator }`
+      を発火する
+
+#### Step 5.2: Audio engine tempo eval (= per-buffer での SongTempo lane 評価)
+
+- [ ] `daw_audio::engine::process_buffer` で SongTempo lane を現在 beat 位置
+      で評価し、 次 buffer の sample → beat 変換に使う (= 現状 constant
+      `song.bpm` を per-buffer evaluated bpm に置換)
+- [ ] `playhead_to_beat` / `beat_to_sample` ヘルパに tempo lane を渡す形に
+      refactor
+- [ ] recording 中の SongTempo lane は `recording_lanes` で curve eval bypass
+      → live BPM input が即時聞こえる (Step C-2 と同 idiom)
+
+#### Step 5.3: CLAP_EVENT_TRANSPORT
+
+- [ ] `daw_plugin_host::process_server` で buffer 頭に `clap_event_transport`
+      を `events_in` に push (= 現在 BPM + time_sig + bar/beat position +
+      flags { is_playing, is_recording, has_tempo, has_time_signature })
+- [ ] plugin の tempo-sync 機能 (Delay sync to beat / Arp tempo-based 等)
+      が動作することを smoke test
 
 各 Phase で:
 
