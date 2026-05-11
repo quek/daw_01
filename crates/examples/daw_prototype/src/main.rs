@@ -901,7 +901,8 @@ fn build_sample_automation_lanes(track_id: u32) -> Vec<daw_ui_core::ArrangementA
             daw_ui_core::ArrangementAutomationPoint {
                 time_beat: 8.0,
                 value_norm: 0.95,
-                curve: daw_ui_core::ArrangementCurveKind::Bezier { tension: 0.0 },
+                // M14 Phase 63n-7 (daw_01 #033): S 字 cubic Bezier (tension=+0.7 で滑らかな S 字)。
+                curve: daw_ui_core::ArrangementCurveKind::Bezier { tension: 0.7 },
             },
             daw_ui_core::ArrangementAutomationPoint {
                 time_beat: 12.0,
@@ -911,7 +912,8 @@ fn build_sample_automation_lanes(track_id: u32) -> Vec<daw_ui_core::ArrangementA
             daw_ui_core::ArrangementAutomationPoint {
                 time_beat: 16.0,
                 value_norm: 0.70,
-                curve: daw_ui_core::ArrangementCurveKind::Linear,
+                // M14 Phase 63n-7 (daw_01 #033): 指数 curve (bend=+0.6 で前半遅・後半速)。
+                curve: daw_ui_core::ArrangementCurveKind::Exponential { bend: 0.6 },
             },
         ],
         share_group_color: None,
@@ -930,12 +932,14 @@ fn build_sample_automation_lanes(track_id: u32) -> Vec<daw_ui_core::ArrangementA
             daw_ui_core::ArrangementAutomationPoint {
                 time_beat: 4.0,
                 value_norm: 0.20,
-                curve: daw_ui_core::ArrangementCurveKind::Bezier { tension: 0.5 },
+                // M14 Phase 63n-7 (daw_01 #033): tension=+0.8 で強い S 字 (端点で水平接線に近い)。
+                curve: daw_ui_core::ArrangementCurveKind::Bezier { tension: 0.8 },
             },
             daw_ui_core::ArrangementAutomationPoint {
                 time_beat: 8.0,
                 value_norm: 0.80,
-                curve: daw_ui_core::ArrangementCurveKind::Bezier { tension: -0.3 },
+                // M14 Phase 63n-7 (daw_01 #033): bend=-0.6 で前半速・後半遅 (平方根系)。
+                curve: daw_ui_core::ArrangementCurveKind::Exponential { bend: -0.6 },
             },
         ],
         share_group_color: None,
@@ -2004,12 +2008,13 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
             .map_or(daw_ui_core::ArrangementCurveKind::Linear, |p| p.curve);
         ui.context_menu_for(
             anchor_rect,
-            &["Hold", "Linear", "Bezier"],
+            &["Hold", "Linear", "Bezier", "Exponential"],
             move |idx, ui| {
                 let next = match idx {
                     0 => daw_ui_core::ArrangementCurveKind::Hold,
                     1 => daw_ui_core::ArrangementCurveKind::Linear,
-                    2 => daw_ui_core::ArrangementCurveKind::Bezier { tension: 0.0 },
+                    2 => daw_ui_core::ArrangementCurveKind::Bezier { tension: 0.5 },
+                    3 => daw_ui_core::ArrangementCurveKind::Exponential { bend: 0.5 },
                     _ => return,
                 };
                 ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {

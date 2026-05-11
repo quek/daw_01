@@ -214,15 +214,21 @@ pub struct AutomationPointKey {
 }
 
 /// M14 Phase 63n-1 (#028): automation point の incoming curve 種別 (= 直前の point からこの point に
-/// 至る曲線形状)。 daw_01 conversation #028 §11.1 と整合。
+/// 至る曲線形状)。 daw_01 conversation #033 で `apply_curve` の式を更新済 (Bezier は真の S 字 cubic
+/// に書き直し、 Exponential variant を追加)。 描画は daw_01 `common::automation::apply_curve` を SSoT
+/// として完全ミラー (描画と再生の数値完全一致を保証、 audio/MIDI と同 idiom)。
 /// - `Hold`: 階段 (前の値を保持して垂直立ち上がり)
 /// - `Linear`: 直線
-/// - `Bezier { tension }`: Catmull-Rom スプライン + tension (`-1.0..=1.0`、 `0.0` で標準 Catmull-Rom)
+/// - `Bezier { tension }`: 制御点 x = (1/3, 2/3) 固定、 y を `tension` で対角線 ↔ end-hold lerp した
+///   cubic Bezier (`-1.0..=1.0`、 `0.0` で直線等価、 `+1.0` で滑らかな S 字、 `-1.0` で overshoot 反転 S 字)。
+/// - `Exponential { bend }`: `value = prev + (next - prev) * t.powf(2^bend)` の polyline (`-1.0..=1.0`、
+///   `0.0` で直線、 `+1.0` で前半遅・後半速 (二次曲線)、 `-1.0` で前半速・後半遅 (平方根))。
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ArrangementCurveKind {
     Hold,
     Linear,
     Bezier { tension: f32 },
+    Exponential { bend: f32 },
 }
 
 /// M14 Phase 63n-1 (#028): automation point の clip-local 座標 + curve 種別。
@@ -2100,6 +2106,11 @@ fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
                             // tension の bits を加味して 2_u64 + bits
                             2_u64 ^ u64::from(tension.to_bits())
                         }
+                        ArrangementCurveKind::Exponential { bend } => {
+                            // M14 Phase 63n-7 (daw_01 #033): Exponential variant の bend bits を
+                            // 3_u64 と XOR (discriminant 衝突を防ぐ、 Bezier と独立に変化検知)。
+                            3_u64 ^ u64::from(bend.to_bits())
+                        }
                     };
                     h ^= curve_code;
                     h = h.wrapping_mul(PRIME);
@@ -3165,17 +3176,17 @@ pub fn automation_lane_key_at_y(
 }
 
 
-/// 単一 segment (前 point → 次 point) を Catmull-Rom + tension で flatten。
+/// 単一 segment (前 point → 次 point) を flatten。
 /// `kind` が `Hold` なら階段 (前値で水平 → 次 point の x で垂直)、 `Linear` なら直線、
-/// `Bezier { tension }` なら Catmull-Rom (tension は端点の引き / 反り具合)。
+/// `Bezier { tension }` なら S 字 cubic Bezier、 `Exponential { bend }` なら指数 curve の polyline。
 /// 出力点列は `out` に push (caller が始点を 1 度 push 済の前提、 終点 (= 次 point) を含む)。
-/// `prev_pt` / `next_next_pt` は端点処理の virtual 点 (Phase 63n-1 では neighbor が無い場合
-/// 自分自身で代用 = `automation_curve` widget と同 idiom、 端点の出入り角は直角)。
+/// `p0` / `p3` は前後 segment 用の virtual 点だが、 `Bezier` の S 字 cubic は `p1`/`p2` のみで決まり
+/// `Exponential` も同様なので両者では参照されない (= signature は M14 Phase 63n-1 互換維持)。
 fn flatten_lane_segment(
-    p0: (f32, f32),
+    _p0: (f32, f32),
     p1: (f32, f32),
     p2: (f32, f32),
-    p3: (f32, f32),
+    _p3: (f32, f32),
     kind: ArrangementCurveKind,
     max_segment_px: f32,
     out: &mut Vec<(f32, f32)>,
@@ -3191,13 +3202,48 @@ fn flatten_lane_segment(
             out.push(p2);
         }
         ArrangementCurveKind::Bezier { tension } => {
-            // Catmull-Rom → cubic Bezier (B1 = P1 + (P2-P0) * (1-tension)/6、 B2 = P2 - (P3-P1) * (1-tension)/6)。
-            // tension = 1.0 で直線化、 tension = 0.0 で標準 Catmull-Rom、 tension = -1.0 で振り増し (over-shoot)。
-            let scale = (1.0 - tension.clamp(-1.0, 1.0)) / 6.0;
-            let b1 = (p1.0 + (p2.0 - p0.0) * scale, p1.1 + (p2.1 - p0.1) * scale);
-            let b2 = (p2.0 - (p3.0 - p1.0) * scale, p2.1 - (p3.1 - p1.1) * scale);
-            // 自前 de Casteljau (automation widget の flatten_cubic と同戦略、 chord 距離で再帰分割)。
-            flatten_lane_cubic(p1, b1, b2, p2, max_segment_px, 0, out);
+            // M14 Phase 63n-7 (daw_01 #033): S 字 cubic Bezier。 daw_01 `apply_curve` SSoT と
+            // 完全同一の制御点配置:
+            //   - 制御点 x は (1/3, 2/3) 固定で x(t) = t (4 制御点の x が 0, 1/3, 2/3, 1 の等差列で
+            //     Bernstein 基底が打ち消し合うため、 cubic Bezier x 成分は **恒等関数** に縮退)
+            //   - 制御点 y を `tension` で対角線 ↔ end-hold を lerp:
+            //       diag1 = p1.y + (p2.y - p1.y) * 1/3   (端点で linear)
+            //       diag2 = p1.y + (p2.y - p1.y) * 2/3
+            //       mix = |tension|, target1/2 = (p1.y, p2.y) if tension >= 0 else (p2.y, p1.y)
+            //       c1.y = lerp(diag1, target1, mix), c2.y = lerp(diag2, target2, mix)
+            // tension = 0.0 で 4 制御点が対角線上 (= 直線)、 +1.0 で滑らかな S 字、 -1.0 で overshoot 反転。
+            let t_clamped = tension.clamp(-1.0, 1.0);
+            let a = p1.1;
+            let b = p2.1;
+            let dx = p2.0 - p1.0;
+            let c1x = p1.0 + dx * (1.0 / 3.0);
+            let c2x = p1.0 + dx * (2.0 / 3.0);
+            let diag1 = a + (b - a) * (1.0 / 3.0);
+            let diag2 = a + (b - a) * (2.0 / 3.0);
+            let mix = t_clamped.abs();
+            let (target1, target2) = if t_clamped >= 0.0 { (a, b) } else { (b, a) };
+            let c1y = diag1 * (1.0 - mix) + target1 * mix;
+            let c2y = diag2 * (1.0 - mix) + target2 * mix;
+            // 既存の adaptive de Casteljau (perpendicular distance 判定) を新制御点で呼ぶ。
+            flatten_lane_cubic(p1, (c1x, c1y), (c2x, c2y), p2, max_segment_px, 0, out);
+        }
+        ArrangementCurveKind::Exponential { bend } => {
+            // M14 Phase 63n-7 (daw_01 #033): value = a + (b - a) * t^(2^bend) の polyline。
+            // bend=0 で linear、 +1 で前半遅・後半速 (t^2、 二次曲線)、 -1 で前半速・後半遅 (t^0.5、 平方根)。
+            // segment が滑らかな単調関数なので uniform sampling で十分 (adaptive 不要)、
+            // sample 数は `dx / max_segment_px` を切り上げ + min 16 (短 segment でも形状を視認できる最小段数)。
+            let bend_clamped = bend.clamp(-1.0, 1.0);
+            let exponent = 2.0_f32.powf(bend_clamped);
+            let dx_abs = (p2.0 - p1.0).abs();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let samples = (dx_abs / max_segment_px.max(1e-3)).ceil().max(16.0) as usize;
+            for i in 1..=samples {
+                #[allow(clippy::cast_precision_loss)]
+                let t = i as f32 / samples as f32;
+                let x = p1.0 + (p2.0 - p1.0) * t;
+                let y = p1.1 + (p2.1 - p1.1) * t.powf(exponent);
+                out.push((x, y));
+            }
         }
     }
 }
@@ -9113,5 +9159,220 @@ mod tests {
         // dx=+40 px @ 800px/16beats = 50 px/beat → +40/50 = +0.8 beat
         assert!((log[0].1 - 0.8).abs() < 1e-3, "next_beats = +0.8: got {}", log[0].1);
         assert!(curve_log.is_empty(), "horizontal lock では SetClipFadeCurve 非発火");
+    }
+
+    // ============================================================
+    // M14 Phase 63n-7 (daw_01 #033): Bezier S 字 cubic + Exponential variant の flatten 検証
+    // ============================================================
+
+    /// 出力点列から (画面 x=cx) に最も近い点の y を線形補間で求める。 polyline 内挿。
+    fn sample_polyline_y(pts: &[(f32, f32)], cx: f32) -> f32 {
+        assert!(pts.len() >= 2);
+        for w in pts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let (lo_x, hi_x) = if a.0 <= b.0 { (a.0, b.0) } else { (b.0, a.0) };
+            if cx >= lo_x && cx <= hi_x {
+                if (b.0 - a.0).abs() < 1e-6 {
+                    return a.1; // 垂直 segment は始点 y を返す (Hold の立ち上がり等は test 対象外)
+                }
+                let t = (cx - a.0) / (b.0 - a.0);
+                return a.1 + (b.1 - a.1) * t;
+            }
+        }
+        // 端 fallback
+        if cx <= pts.first().unwrap().0 {
+            pts.first().unwrap().1
+        } else {
+            pts.last().unwrap().1
+        }
+    }
+
+    /// 端点 (p1, p2) を常に通る (= 描画ズレなし) ことを確認。
+    #[test]
+    fn flatten_segment_endpoints_exact_for_all_curve_kinds() {
+        let p1 = (10.0_f32, 100.0_f32);
+        let p2 = (50.0_f32, 40.0_f32);
+        for kind in [
+            ArrangementCurveKind::Hold,
+            ArrangementCurveKind::Linear,
+            ArrangementCurveKind::Bezier { tension: 0.0 },
+            ArrangementCurveKind::Bezier { tension: 0.5 },
+            ArrangementCurveKind::Bezier { tension: -0.5 },
+            ArrangementCurveKind::Exponential { bend: 0.0 },
+            ArrangementCurveKind::Exponential { bend: 0.8 },
+            ArrangementCurveKind::Exponential { bend: -0.8 },
+        ] {
+            let mut out = vec![p1];
+            flatten_lane_segment(p1, p1, p2, p2, kind, 2.0, &mut out);
+            let last = *out.last().expect("at least 1 point pushed");
+            assert!(
+                (last.0 - p2.0).abs() < 1e-3 && (last.1 - p2.1).abs() < 1e-3,
+                "{kind:?}: 出力末尾 = p2 を期待 (got {last:?})"
+            );
+        }
+    }
+
+    /// Bezier { tension: 0.0 } は **直線**に縮退する (制御点 4 つが対角線上 = daw_01 SSoT の数値性質)。
+    /// 中央 (x=p1.x + dx/2) で y = (p1.y + p2.y) / 2 ± 0.5 px 以内。
+    #[test]
+    fn bezier_tension_zero_is_linear() {
+        let p1 = (0.0_f32, 0.0_f32);
+        let p2 = (100.0_f32, 60.0_f32);
+        let mut out = vec![p1];
+        flatten_lane_segment(
+            p1,
+            p1,
+            p2,
+            p2,
+            ArrangementCurveKind::Bezier { tension: 0.0 },
+            2.0,
+            &mut out,
+        );
+        let mid_y = sample_polyline_y(&out, 50.0);
+        let linear_mid = (p1.1 + p2.1) * 0.5;
+        assert!(
+            (mid_y - linear_mid).abs() < 0.5,
+            "tension=0 で中央は線形中点 = {linear_mid}: got {mid_y}"
+        );
+    }
+
+    /// Bezier { tension: +1.0 } で中央 y が **prev に偏る** (= 滑らかな S 字、 前半 prev に張り付く)。
+    /// daw_01 SSoT: tension=+1 で c1y=p1.y, c2y=p2.y (end-hold)、 cubic Bezier の中点 y は
+    /// `1/8*p1.y + 3/8*c1y + 3/8*c2y + 1/8*p2.y = 1/8*p1 + 3/8*p1 + 3/8*p2 + 1/8*p2 = 1/2*p1 + 1/2*p2`
+    /// ではなく、 x(t)=t なので t=0.5 で y(0.5) = (1/2)(p1 + p2)。 ふむ、 これは中点が線形と同じか?
+    ///
+    /// 実際には c1y=p1.y で c2y=p2.y のとき、 y(t) = (1-t)^3*p1 + 3(1-t)^2*t*p1 + 3(1-t)*t^2*p2 + t^3*p2
+    /// = p1 * [(1-t)^3 + 3(1-t)^2*t] + p2 * [3(1-t)*t^2 + t^3]
+    /// = p1 * (1-t)^2 * [(1-t) + 3t] + p2 * t^2 * [3(1-t) + t]
+    /// = p1 * (1-t)^2 * (1 + 2t) + p2 * t^2 * (3 - 2t)
+    /// t=0.5 で y = p1 * 0.25 * 2 + p2 * 0.25 * 2 = 0.5*p1 + 0.5*p2 (= 線形中点)
+    ///
+    /// したがって中点は線形と同じだが、 **t=0.25 / 0.75** で差が出る。 t=0.25 で:
+    /// y(0.25) = p1 * 0.5625 * 1.5 + p2 * 0.0625 * 2.5 = p1 * 0.84375 + p2 * 0.15625
+    /// (線形は p1 * 0.75 + p2 * 0.25、 = +0.09375 だけ p1 寄り)
+    #[test]
+    fn bezier_tension_positive_pulls_toward_endpoints() {
+        let p1 = (0.0_f32, 0.0_f32);
+        let p2 = (100.0_f32, 100.0_f32);
+        let mut out = vec![p1];
+        flatten_lane_segment(
+            p1,
+            p1,
+            p2,
+            p2,
+            ArrangementCurveKind::Bezier { tension: 1.0 },
+            2.0,
+            &mut out,
+        );
+        // t=0.25 (= x=25) で y は線形 25 より小さい (= p1 寄り = 0 寄り)
+        let y_at_25 = sample_polyline_y(&out, 25.0);
+        assert!(
+            y_at_25 < 25.0 - 5.0,
+            "tension=+1 で x=25 の y は線形 25 より明確に小さい (got {y_at_25})"
+        );
+        // t=0.75 (= x=75) で y は線形 75 より大きい (= p2 寄り = 100 寄り)
+        let y_at_75 = sample_polyline_y(&out, 75.0);
+        assert!(
+            y_at_75 > 75.0 + 5.0,
+            "tension=+1 で x=75 の y は線形 75 より明確に大きい (got {y_at_75})"
+        );
+    }
+
+    /// Bezier { tension: -1.0 } で overshoot 反転 S 字 (= 前半 p2 側、 後半 p1 側に張り出す)。
+    /// daw_01 SSoT: tension=-1 で c1y=p2.y, c2y=p1.y (反転 end-hold)。
+    /// x=25 で y は線形 25 より大きい (= p2=100 寄り)、 x=75 で y は線形 75 より小さい (= p1=0 寄り)。
+    #[test]
+    fn bezier_tension_negative_inverts_s_curve() {
+        let p1 = (0.0_f32, 0.0_f32);
+        let p2 = (100.0_f32, 100.0_f32);
+        let mut out = vec![p1];
+        flatten_lane_segment(
+            p1,
+            p1,
+            p2,
+            p2,
+            ArrangementCurveKind::Bezier { tension: -1.0 },
+            2.0,
+            &mut out,
+        );
+        let y_at_25 = sample_polyline_y(&out, 25.0);
+        assert!(
+            y_at_25 > 25.0 + 5.0,
+            "tension=-1 で x=25 の y は線形 25 より明確に大きい (overshoot、 got {y_at_25})"
+        );
+        let y_at_75 = sample_polyline_y(&out, 75.0);
+        assert!(
+            y_at_75 < 75.0 - 5.0,
+            "tension=-1 で x=75 の y は線形 75 より明確に小さい (overshoot、 got {y_at_75})"
+        );
+    }
+
+    /// Exponential { bend: +1.0 } は t^2 (二次曲線、 前半遅・後半速)、 t=0.5 で y = 0.25 * (p2 - p1) + p1。
+    /// daw_01 SSoT と完全一致。
+    #[test]
+    fn exponential_bend_positive_is_quadratic() {
+        let p1 = (0.0_f32, 0.0_f32);
+        let p2 = (100.0_f32, 100.0_f32);
+        let mut out = vec![p1];
+        flatten_lane_segment(
+            p1,
+            p1,
+            p2,
+            p2,
+            ArrangementCurveKind::Exponential { bend: 1.0 },
+            2.0,
+            &mut out,
+        );
+        // t=0.5 で y = 0.5^2 * 100 = 25
+        let y_at_50 = sample_polyline_y(&out, 50.0);
+        assert!(
+            (y_at_50 - 25.0).abs() < 1.0,
+            "bend=+1 で x=50 の y = 25 (t^2): got {y_at_50}"
+        );
+    }
+
+    /// Exponential { bend: -1.0 } は t^0.5 (平方根、 前半速・後半遅)、 t=0.5 で y ≈ 0.707 * (p2 - p1) + p1。
+    #[test]
+    fn exponential_bend_negative_is_sqrt() {
+        let p1 = (0.0_f32, 0.0_f32);
+        let p2 = (100.0_f32, 100.0_f32);
+        let mut out = vec![p1];
+        flatten_lane_segment(
+            p1,
+            p1,
+            p2,
+            p2,
+            ArrangementCurveKind::Exponential { bend: -1.0 },
+            2.0,
+            &mut out,
+        );
+        // t=0.5 で y = 0.5^0.5 * 100 ≈ 70.71
+        let y_at_50 = sample_polyline_y(&out, 50.0);
+        assert!(
+            (y_at_50 - 70.71).abs() < 1.5,
+            "bend=-1 で x=50 の y ≈ 70.71 (sqrt(t)): got {y_at_50}"
+        );
+    }
+
+    /// Exponential { bend: 0.0 } は **直線** (t^1)。
+    #[test]
+    fn exponential_bend_zero_is_linear() {
+        let p1 = (0.0_f32, 0.0_f32);
+        let p2 = (100.0_f32, 100.0_f32);
+        let mut out = vec![p1];
+        flatten_lane_segment(
+            p1,
+            p1,
+            p2,
+            p2,
+            ArrangementCurveKind::Exponential { bend: 0.0 },
+            2.0,
+            &mut out,
+        );
+        let y_at_50 = sample_polyline_y(&out, 50.0);
+        assert!(
+            (y_at_50 - 50.0).abs() < 1.0,
+            "bend=0 で x=50 の y = 50 (linear): got {y_at_50}"
+        );
     }
 }
