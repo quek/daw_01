@@ -226,6 +226,64 @@ pub fn song_lane_value_at(song: &Song, lane: &AutomationLane, song_beat: f64) ->
     lane_value_at(lane, &song.clip_contents, song_beat)
 }
 
+/// Phase 4 Step D (`docs/plan_automation.md` §6): recording 中の point 列に
+/// 新しい `(time_beat, plain_value, Linear)` を online で挿入し、 直前の
+/// point が collinear (= prev_prev → new_point の直線上にある) なら削除する
+/// helper。 RDP 風の単純化を 1 ステップずつ実行する形で、 「knob を一定
+/// 方向に滑らかに動かす」 と dense な 1/64 beat 刻みの点列が「始点 + 終点
+/// + 変曲点」 だけに収束する。
+///
+/// 戻り値: `(insert_at, removed_prev)`
+/// - `insert_at`: new_point を挿入した位置 (`points[insert_at] == new`)
+/// - `removed_prev`: collinear で prev が削除されたかどうか
+///
+/// 不変条件: 呼び出し前後で `points` は `time_beat` 昇順を保つ。 新規 point
+/// は `partition_point(|p| p.time_beat <= time_beat)` 位置に挿入される (=
+/// 同時刻 point が複数ある場合は **末尾** に追加)。
+///
+/// `epsilon` は plain 単位 (= target の native スケール) の許容誤差。 例:
+/// Volume 範囲 0..=2 なら 0.005 で 0.25% 程度、 Pan 範囲 -1..=1 でも同程度。
+///
+/// `points.len() < 2` (= 始点 or 1 点のみ) のときは collinear 判定する prev が
+/// 取れないので thinning なしで insert のみ。 `dt_full` が 0 (= prev_prev と
+/// new_point が同時刻) のときも安全側で thinning skip (= divide by 0 回避)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThinInsertResult {
+    pub insert_at: usize,
+    pub removed_prev: bool,
+}
+
+pub fn thin_collinear_and_insert(
+    points: &mut Vec<crate::model::AutomationPoint>,
+    time_beat: f64,
+    plain_value: f64,
+    epsilon: f64,
+) -> ThinInsertResult {
+    let mut insert_at = points.partition_point(|p| p.time_beat <= time_beat);
+    let mut removed_prev = false;
+    if insert_at >= 2 {
+        let prev = &points[insert_at - 1];
+        let prev_prev = &points[insert_at - 2];
+        let dt_full = time_beat - prev_prev.time_beat;
+        if dt_full > f64::EPSILON {
+            let alpha = (prev.time_beat - prev_prev.time_beat) / dt_full;
+            let interp_y = prev_prev.value + (plain_value - prev_prev.value) * alpha;
+            if (prev.value - interp_y).abs() < epsilon {
+                points.remove(insert_at - 1);
+                insert_at -= 1;
+                removed_prev = true;
+            }
+        }
+    }
+    let new_point = crate::model::AutomationPoint {
+        time_beat,
+        value: plain_value,
+        curve: crate::model::AutomationCurve::Linear,
+    };
+    points.insert(insert_at, new_point);
+    ThinInsertResult { insert_at, removed_prev }
+}
+
 /// Find the `AutomationClip` whose half-open range
 /// `[start_beat, start_beat + length_beats)` contains `song_beat`.
 /// Returns the *first* match — overlapping clips on the same lane are
@@ -525,5 +583,127 @@ mod tests {
             )
         };
         assert!((lane_value_at(&lane, &store, 1.0) - 0.42).abs() < 1e-9);
+    }
+
+    // ---- Phase 4 Step D: thin_collinear_and_insert tests ----
+
+    /// ε は plain 単位 0.005 (Volume / Pan の Live 規定 0.5% に相当)。
+    const TEST_EPS: f64 = 0.005;
+
+    /// 直線的に valueを上げる drag を sim: 各 tick で linear に増える値を
+    /// 連続 insert すると、 thinning が中間点を削除して 最初と最後だけ残す。
+    #[test]
+    fn thin_linear_drag_collapses_to_endpoints() {
+        let mut pts: Vec<AutomationPoint> = vec![pt(0.0, 0.0, AutomationCurve::Linear)];
+        // beat 0.0 (= start), 0.1, 0.2, ..., 1.0 で y = beat を insert
+        for i in 1..=10 {
+            let t = i as f64 / 10.0;
+            thin_collinear_and_insert(&mut pts, t, t, TEST_EPS);
+        }
+        // 始点 (0,0) と直近 insert された点 (1.0, 1.0) の 2 点だけ残るはず。
+        // 中間は collinear なので毎回 prev が削除される。
+        assert_eq!(pts.len(), 2, "expected 2 points after linear thinning, got {pts:?}");
+        assert!((pts[0].time_beat - 0.0).abs() < 1e-9);
+        assert!((pts[0].value - 0.0).abs() < 1e-9);
+        assert!((pts[1].time_beat - 1.0).abs() < 1e-9);
+        assert!((pts[1].value - 1.0).abs() < 1e-9);
+    }
+
+    /// 折り返し drag (= V 字形): 上昇 → 下降 すると変曲点 (peak) が残る。
+    /// 直線部分は thin されるが、 折り返しの瞬間は collinear でないので残る。
+    #[test]
+    fn thin_v_shape_drag_keeps_inflection_point() {
+        let mut pts: Vec<AutomationPoint> = vec![pt(0.0, 0.0, AutomationCurve::Linear)];
+        // 上昇: t=0.1..0.5, y=t (直線で 0→0.5)
+        for i in 1..=5 {
+            let t = i as f64 / 10.0;
+            thin_collinear_and_insert(&mut pts, t, t, TEST_EPS);
+        }
+        // 下降: t=0.6..1.0, y = 1.0 - t (peak 0.5 から 0→0.0)
+        for i in 6..=10 {
+            let t = i as f64 / 10.0;
+            let y = 1.0 - t;
+            thin_collinear_and_insert(&mut pts, t, y, TEST_EPS);
+        }
+        // 期待: (0,0) + (0.5, 0.5) peak + (1.0, 0.0) の 3 点に収束する想定。
+        // (0,0) と (0.5, 0.5) の間は collinear で thin、 (0.5, 0.5) は折り返し
+        // 直後の (0.6, 0.4) が collinear 検査されると prev_prev=(0,0) と new=
+        // (0.6, 0.4) を結ぶ線上に (0.5, 0.5) は乗らない → 残る。
+        assert!(
+            pts.len() >= 3,
+            "expected at least start + peak + end, got {pts:?}"
+        );
+        // peak が含まれていること (y >= 0.49 の点が 1 つ以上)
+        assert!(
+            pts.iter().any(|p| p.value > 0.49),
+            "peak point ~0.5 not found in {pts:?}"
+        );
+        // 末尾は (1.0, 0.0)
+        let last = pts.last().unwrap();
+        assert!((last.time_beat - 1.0).abs() < 1e-9);
+        assert!(last.value.abs() < 1e-9);
+    }
+
+    /// points.len() < 2 (= 始点のみ) のとき thinning skip、 普通に insert される。
+    #[test]
+    fn thin_skips_when_fewer_than_two_points() {
+        let mut pts: Vec<AutomationPoint> = vec![];
+        let r = thin_collinear_and_insert(&mut pts, 0.0, 0.5, TEST_EPS);
+        assert_eq!(pts.len(), 1);
+        assert!(!r.removed_prev);
+
+        let r2 = thin_collinear_and_insert(&mut pts, 0.5, 0.7, TEST_EPS);
+        assert_eq!(pts.len(), 2);
+        assert!(!r2.removed_prev);
+    }
+
+    /// 同値連続 insert (= knob を動かさず drag): 直線 y=const なので、 中間
+    /// 点は collinear で削除される。 結果 2 点。
+    #[test]
+    fn thin_constant_value_collapses_to_two_points() {
+        let mut pts: Vec<AutomationPoint> = vec![];
+        for i in 0..=10 {
+            let t = i as f64 / 10.0;
+            thin_collinear_and_insert(&mut pts, t, 0.7, TEST_EPS);
+        }
+        assert_eq!(pts.len(), 2, "expected 2 endpoints after constant thinning, got {pts:?}");
+        assert!((pts[0].value - 0.7).abs() < 1e-9);
+        assert!((pts[1].value - 0.7).abs() < 1e-9);
+    }
+
+    /// ε 境界: prev の y が補間値 ± ε 外 (= ε より大きく逸脱) なら thin
+    /// されない。 ε ぎりぎり内なら thin される。
+    #[test]
+    fn thin_epsilon_boundary() {
+        // ε = 0.005、 prev=(0.5, 0.502) ← interp は 0.5、 逸脱は 0.002 < ε → thin
+        let mut pts_thin: Vec<AutomationPoint> = vec![
+            pt(0.0, 0.0, AutomationCurve::Linear),
+            pt(0.5, 0.502, AutomationCurve::Linear),
+        ];
+        thin_collinear_and_insert(&mut pts_thin, 1.0, 1.0, TEST_EPS);
+        assert_eq!(pts_thin.len(), 2, "should have removed middle point");
+
+        // ε = 0.005、 prev=(0.5, 0.51) ← interp は 0.5、 逸脱は 0.01 > ε → keep
+        let mut pts_keep: Vec<AutomationPoint> = vec![
+            pt(0.0, 0.0, AutomationCurve::Linear),
+            pt(0.5, 0.51, AutomationCurve::Linear),
+        ];
+        thin_collinear_and_insert(&mut pts_keep, 1.0, 1.0, TEST_EPS);
+        assert_eq!(pts_keep.len(), 3, "should NOT have removed middle point");
+    }
+
+    /// dt_full == 0 (= prev_prev と new_point が同時刻) のときは divide
+    /// by 0 を避けて thinning skip。 sort 順は保たれ、 単に末尾に append。
+    #[test]
+    fn thin_skips_when_dt_zero() {
+        let mut pts: Vec<AutomationPoint> = vec![
+            pt(0.5, 0.0, AutomationCurve::Linear),
+            pt(0.5, 0.3, AutomationCurve::Linear),
+        ];
+        let r = thin_collinear_and_insert(&mut pts, 0.5, 0.5, TEST_EPS);
+        assert_eq!(pts.len(), 3);
+        assert!(!r.removed_prev);
+        // partition_point の <= 比較で末尾に挿入される
+        assert_eq!(r.insert_at, 2);
     }
 }

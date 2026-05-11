@@ -1009,6 +1009,12 @@ visual feedback で「点が多すぎる」 と感じる原因になるので不
       curve 変曲点) になる。 急激な knob 反転 (sin 波状の drag) では変曲点
       ごとに点が打たれる。 thin が攻撃的すぎる場合は `THIN_EPSILON_PLAIN`
       を 0.005 → 0.003 等に下げて再 smoke test。
+- [x] **Step D follow-up (2026-05-11)**: thinning ロジックを
+      `common::automation::thin_collinear_and_insert` に pure fn として
+      抽出 + unit test 6 件追加 (直線 drag → 2 点 / V 字 drag → 変曲点
+      保持 / points.len()<2 で skip / 同値連続 → 2 点 / ε 境界 (in / out) /
+      dt_full=0 で skip)。 daw_gui caller は helper 呼び出しに refactor、
+      ε は plain 単位 0.005 で固定 (= Volume / Pan ともに 0.5% 程度)。
 
 ### Phase 5: Tempo / TimeSig / Transport event
 
