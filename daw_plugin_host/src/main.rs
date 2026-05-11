@@ -92,6 +92,24 @@ pub enum PluginEvent {
         plugin_id: u32,
         params: Vec<common::protocol::PluginParamInfo>,
     },
+    /// Phase 2c: plugin GUI で knob を touch した通知 (CLAP
+    /// PARAM_GESTURE_BEGIN out event 経由)。 process_server で drain
+    /// して emit、 daw_gui に転送して last_touched_param を更新させる。
+    PluginParamTouched {
+        track: u32,
+        slot: PluginSlot,
+        plugin_id: u32,
+        param_id: u32,
+    },
+    /// Phase 2c: plugin GUI で knob 値を変更した通知 (CLAP PARAM_VALUE
+    /// out event 経由)。 Phase 4 recording mode で point 生成 source。
+    PluginParamValueChanged {
+        track: u32,
+        slot: PluginSlot,
+        plugin_id: u32,
+        param_id: u32,
+        value: f64,
+    },
     /// `SetSlotPlugin` の load が失敗した (`load_plugin` Err か
     /// `ProcessDataHandle::create` Err)。 daw_gui の `pending_plugin_loads`
     /// を解放するために emit する。 emit せずに `continue` だけで戻ると
@@ -152,6 +170,32 @@ impl From<PluginEvent> for ChildToMain {
                 plugin_id,
                 params,
             },
+            PluginEvent::PluginParamTouched {
+                track,
+                slot,
+                plugin_id: _,
+                param_id,
+            } => ChildToMain::PluginParamTouched {
+                track,
+                slot,
+                param_id,
+                // display_name は daw_gui 側で AppData.plugin_params から
+                // 引いて解決する (= host で文字列構築は不要、 IPC
+                // payload も短くなる)。
+                display_name: format!("Param {param_id}"),
+            },
+            PluginEvent::PluginParamValueChanged {
+                track,
+                slot,
+                plugin_id: _,
+                param_id,
+                value,
+            } => ChildToMain::PluginParamValueChanged {
+                track,
+                slot,
+                param_id,
+                value,
+            },
             PluginEvent::PluginLoadFailed {
                 track,
                 slot,
@@ -181,6 +225,8 @@ fn publish_plugin_registry(
         .map(|opt| opt.as_ref().map(|e| PluginEntry {
             plugin: PluginPtr(e.plugin.0),
             process_data: e.process_data,
+            track: e.track,
+            slot: e.slot,
         }))
         .collect();
     let idx = plugin_id as usize;
@@ -467,6 +513,7 @@ fn plugin_main_loop(
                         &wake_event_names,
                         &done_event_names,
                         Arc::clone(&plugin_registry),
+                        evt_tx.clone(),
                     ) {
                         Ok(pool) => worker_pool = Some(pool),
                         Err(e) => {
@@ -670,6 +717,8 @@ fn plugin_main_loop(
                                     Some(PluginEntry {
                                         plugin: PluginPtr(p),
                                         process_data: pd_ptr,
+                                        track,
+                                        slot,
                                     }),
                                 );
                             }
@@ -1415,6 +1464,11 @@ unsafe impl Sync for PluginPtr {}
 pub struct PluginEntry {
     pub plugin: PluginPtr,
     pub process_data: *mut common::process_data::ProcessData,
+    /// Phase 2c: process_server (audio thread) が plugin GUI 発の
+    /// param events を `PluginEvent::PluginParamTouched / ValueChanged`
+    /// に詰めるための逆引き。 register / publish 時に固定。
+    pub track: u32,
+    pub slot: PluginSlot,
 }
 unsafe impl Send for PluginEntry {}
 unsafe impl Sync for PluginEntry {}

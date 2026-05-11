@@ -16,7 +16,9 @@ use clap_sys::ext::gui::{
 };
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
 use clap_sys::ext::note_ports::{CLAP_EXT_NOTE_PORTS, clap_plugin_note_ports};
-use clap_sys::events::{CLAP_EVENT_PARAM_VALUE, clap_event_param_value};
+use clap_sys::events::{
+    CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_VALUE, clap_event_param_value,
+};
 use clap_sys::ext::params::{
     CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_HIDDEN,
     CLAP_PARAM_IS_MODULATABLE, CLAP_PARAM_IS_PERIODIC, CLAP_PARAM_IS_READONLY,
@@ -76,6 +78,17 @@ pub struct ClapPlugin {
     /// Populated by the `out_events.try_push` callback and drained by the
     /// caller (e.g. MIDI FX chain) before the next process().
     collected_out_notes: Vec<TimedNoteEvent>,
+    /// Phase 2c (`docs/plan_automation.md` §7.5 / CLAP gesture spec):
+    /// plugin GUI で knob を touch したとき発火する
+    /// `CLAP_EVENT_PARAM_GESTURE_BEGIN` の param_id 列。 host は
+    /// drain して `PluginParamTouched` IPC で daw_gui に通知し、
+    /// `last_touched_param` を plugin param で更新させる。
+    collected_out_param_touches: Vec<u32>,
+    /// Phase 2c: plugin GUI で knob 値を変更したとき発火する
+    /// `CLAP_EVENT_PARAM_VALUE` の (param_id, value)。 Phase 4 recording
+    /// mode で point 生成 source として使う、 Phase 2 では daw_gui の
+    /// last value cache に積むのみ。
+    collected_out_param_values: Vec<(u32, f64)>,
     /// `clap_plugin_gui` vtable pointer, looked up once after init.
     /// `None` means the plugin does not declare the gui extension.
     gui_ext: Option<*const clap_plugin_gui>,
@@ -304,6 +317,8 @@ impl ClapPlugin {
             // re-alloc; we log on the audio side if it happens.
             pending_events: Vec::with_capacity(256),
             pending_param_events: Vec::with_capacity(256),
+            collected_out_param_touches: Vec::with_capacity(64),
+            collected_out_param_values: Vec::with_capacity(256),
             collected_out_notes: Vec::with_capacity(256),
             gui_ext,
             gui_created: false,
@@ -589,6 +604,18 @@ impl ClapPlugin {
         out.append(&mut self.collected_out_notes);
     }
 
+    /// Phase 2c: drain plugin-emitted parameter gestures (PARAM_GESTURE_BEGIN)
+    /// into `out`. Like `drain_out_notes_into`, preserves capacity.
+    pub fn drain_out_param_touches_into(&mut self, out: &mut Vec<u32>) {
+        out.append(&mut self.collected_out_param_touches);
+    }
+
+    /// Phase 2c: drain plugin-emitted parameter value changes
+    /// (PARAM_VALUE) into `out`.
+    pub fn drain_out_param_values_into(&mut self, out: &mut Vec<(u32, f64)>) {
+        out.append(&mut self.collected_out_param_values);
+    }
+
     pub fn start_processing(&mut self) -> Result<()> {
         anyhow::ensure!(self.active, "plugin not active");
         anyhow::ensure!(!self.processing, "plugin already processing");
@@ -774,8 +801,18 @@ impl ClapPlugin {
             size: Some(in_events_size),
             get: Some(in_events_get),
         };
+        // Phase 2c: collector points at ClapPlugin の 3 vec を per-process
+        // でリセット (clear) してから raw pointer を OutEventCollector に
+        // 渡す。 plugin.process() 中だけ存続するローカル変数。
+        self.collected_out_param_touches.clear();
+        self.collected_out_param_values.clear();
+        let mut out_collector = OutEventCollector {
+            notes: std::ptr::from_mut(&mut self.collected_out_notes),
+            param_touches: std::ptr::from_mut(&mut self.collected_out_param_touches),
+            param_values: std::ptr::from_mut(&mut self.collected_out_param_values),
+        };
         let out_events = clap_output_events {
-            ctx: std::ptr::from_mut(&mut self.collected_out_notes) as *mut c_void,
+            ctx: std::ptr::from_mut(&mut out_collector) as *mut c_void,
             try_push: Some(collect_out_note_try_push),
         };
 
@@ -941,9 +978,22 @@ unsafe extern "C" fn stream_read(
     n as i64
 }
 
-/// `try_push` callback for the MIDI FX chain. `ctx` is a
-/// `*mut Vec<TimedNoteEvent>`; we decode `NOTE_ON`/`NOTE_OFF` events and
-/// append them for the next plugin to consume. Unknown types are accepted
+/// Phase 2c: ctx for `out_events.try_push` — gathers note transitions
+/// (existing MIDI FX path) **and** plugin-initiated parameter gestures
+/// (PARAM_GESTURE_BEGIN) + parameter value changes (PARAM_VALUE) into
+/// 3 separate vectors. Built on the stack at the top of every
+/// `process()` call; the raw pointers point at fields on the
+/// `ClapPlugin` instance and are valid for the duration of the FFI
+/// call.
+struct OutEventCollector {
+    notes: *mut Vec<TimedNoteEvent>,
+    param_touches: *mut Vec<u32>,
+    param_values: *mut Vec<(u32, f64)>,
+}
+
+/// `try_push` callback shared by all CLAP plugins. `ctx` points at an
+/// `OutEventCollector`. Note transitions and param events get routed
+/// to the appropriate collector vector; unknown types are accepted
 /// (return `true`) but not recorded.
 unsafe extern "C" fn collect_out_note_try_push(
     list: *const clap_output_events,
@@ -952,42 +1002,67 @@ unsafe extern "C" fn collect_out_note_try_push(
     if list.is_null() || event.is_null() {
         return false;
     }
-    let ctx = unsafe { (*list).ctx } as *mut Vec<TimedNoteEvent>;
+    let ctx = unsafe { (*list).ctx } as *mut OutEventCollector;
     if ctx.is_null() {
         return true;
     }
+    let collector = unsafe { &*ctx };
     let header = unsafe { &*event };
     if header.space_id != CLAP_CORE_EVENT_SPACE_ID {
         return true;
     }
-    let transition = match header.type_ {
+    match header.type_ {
         t if t == CLAP_EVENT_NOTE_ON => {
             let note = unsafe { &*(event as *const clap_event_note) };
-            // CLAP `note_id` は i32 で `-1` = "未指定"。 0 にクランプして
-            // u32 に。 host から send した正の値はそのまま見える。
             let note_id = note.note_id.max(0) as u32;
-            Some(NoteTransition::On {
+            let transition = NoteTransition::On {
                 note_id,
                 key: note.key.clamp(0, 127) as u8,
                 velocity: note.velocity,
-            })
+            };
+            if !collector.notes.is_null() {
+                let out = unsafe { &mut *collector.notes };
+                out.push(TimedNoteEvent { time: header.time, event: transition });
+            }
         }
         t if t == CLAP_EVENT_NOTE_OFF => {
             let note = unsafe { &*(event as *const clap_event_note) };
             let note_id = note.note_id.max(0) as u32;
-            Some(NoteTransition::Off {
+            let transition = NoteTransition::Off {
                 note_id,
                 key: note.key.clamp(0, 127) as u8,
-            })
+            };
+            if !collector.notes.is_null() {
+                let out = unsafe { &mut *collector.notes };
+                out.push(TimedNoteEvent { time: header.time, event: transition });
+            }
         }
-        _ => None,
-    };
-    if let Some(transition) = transition {
-        let out = unsafe { &mut *ctx };
-        out.push(TimedNoteEvent {
-            time: header.time,
-            event: transition,
-        });
+        t if t == CLAP_EVENT_PARAM_GESTURE_BEGIN => {
+            // Phase 2c: plugin GUI 内で knob を touch した瞬間。 host は
+            // 同 param に最も近い PluginParamInfo を引いて
+            // `PluginParamTouched` を daw_gui に送り、 `last_touched_param`
+            // を更新させる。 `clap_event_param_gesture` は param_id を
+            // 持つ (header 直後の u32)。 clap_sys に struct がない場合は
+            // raw offset で読む。
+            let param_id = unsafe {
+                let body = event as *const u8;
+                let id_ptr = body.add(std::mem::size_of::<clap_event_header>())
+                    as *const u32;
+                *id_ptr
+            };
+            if !collector.param_touches.is_null() {
+                let out = unsafe { &mut *collector.param_touches };
+                out.push(param_id);
+            }
+        }
+        t if t == CLAP_EVENT_PARAM_VALUE => {
+            let pv = unsafe { &*(event as *const clap_event_param_value) };
+            if !collector.param_values.is_null() {
+                let out = unsafe { &mut *collector.param_values };
+                out.push((pv.param_id, pv.value));
+            }
+        }
+        _ => {}
     }
     true
 }
@@ -1308,6 +1383,14 @@ impl LoadedPlugin for ClapPlugin {
 
     fn enumerate_params(&self) -> Vec<common::protocol::PluginParamInfo> {
         ClapPlugin::enumerate_params(self)
+    }
+
+    fn drain_out_param_touches_into(&mut self, out: &mut Vec<u32>) {
+        ClapPlugin::drain_out_param_touches_into(self, out);
+    }
+
+    fn drain_out_param_values_into(&mut self, out: &mut Vec<(u32, f64)>) {
+        ClapPlugin::drain_out_param_values_into(self, out);
     }
 
     fn state_save(&self) -> Result<Option<Vec<u8>>> {

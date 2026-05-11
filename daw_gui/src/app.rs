@@ -2395,13 +2395,23 @@ impl AppData {
                 param_id,
                 display_name,
             } => {
+                // Phase 2c: host から来る `display_name` は placeholder
+                // (= "Param N")。 `plugin_params` cache から param の
+                // 本来の name を引いて上書きする。 cache に該当 entry
+                // がなければ host から送られてきた placeholder をそのまま。
+                let resolved_name = self
+                    .plugin_params
+                    .get(&(track, slot))
+                    .and_then(|params| params.iter().find(|p| p.id == param_id))
+                    .map(|info| info.name.clone())
+                    .unwrap_or(display_name);
                 self.last_touched_param = Some(TouchedParam {
                     track_id: track,
                     target: common::model::AutomationTarget::PluginParam {
                         slot,
                         param_id,
                     },
-                    display_name,
+                    display_name: resolved_name,
                     touched_at: std::time::Instant::now(),
                 });
             }

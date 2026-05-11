@@ -132,6 +132,16 @@ pub trait LoadedPlugin: Send {
     /// capacity preserved).
     fn drain_out_notes_into(&mut self, out: &mut Vec<TimedNoteEvent>);
 
+    /// Phase 2c (`docs/plan_automation.md` §7.5): drain plugin-emitted
+    /// PARAM_GESTURE_BEGIN events from the last `process()` call.
+    /// Default no-op for backends that don't emit them (Silence /
+    /// VoicevoxBuiltin / VST3 backend until Phase 3+).
+    fn drain_out_param_touches_into(&mut self, _out: &mut Vec<u32>) {}
+
+    /// Phase 2c: drain plugin-emitted PARAM_VALUE events (= plugin GUI
+    /// knob value changes). Default no-op.
+    fn drain_out_param_values_into(&mut self, _out: &mut Vec<(u32, f64)>) {}
+
     // --- render-mode hint (CLAP `render` ext) ---------------------------
     /// Tell the plugin whether the next `process()` calls are realtime
     /// or offline (during WAV export). Returns `true` if the plugin

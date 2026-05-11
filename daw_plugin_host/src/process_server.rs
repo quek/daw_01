@@ -132,6 +132,7 @@ impl WorkerPool {
         wake_event_names: &[String],
         done_event_names: &[String],
         registry: PluginRegistry,
+        evt_tx: tokio::sync::mpsc::UnboundedSender<crate::PluginEvent>,
     ) -> Result<Self> {
         anyhow::ensure!(
             wake_event_names.len() == n_workers as usize,
@@ -170,11 +171,13 @@ impl WorkerPool {
             let idx = i as u32;
             let wake_s = SendableHandle(wake);
             let done_s = SendableHandle(done);
+            let evt_tx_w = evt_tx.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("plugin-worker-{i}"))
                 .spawn(move || {
                     run_worker(
                         idx, bridge_w, shutdown_w, registry_w, dispatch_w, wake_s, done_s,
+                        evt_tx_w,
                     )
                 })?;
             workers.push(handle);
@@ -254,6 +257,7 @@ impl WorkerPool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_worker(
     idx: u32,
     bridge: Arc<WorkerBridgeHandle>,
@@ -262,6 +266,7 @@ fn run_worker(
     dispatch: Arc<DispatchCounter>,
     wake: SendableHandle,
     done: SendableHandle,
+    evt_tx: tokio::sync::mpsc::UnboundedSender<crate::PluginEvent>,
 ) {
     // Best-effort priority boost so we don't lose the CPAL buffer
     // deadline. Failure is logged but non-fatal.
@@ -293,6 +298,12 @@ fn run_worker(
     let mut param_events_in: Vec<crate::plugin_instance::TimedParamEvent> =
         Vec::with_capacity(common::process_data::MAX_EVENTS);
     let mut events_out: Vec<TimedNoteEvent> = Vec::with_capacity(common::process_data::MAX_EVENTS);
+    // Phase 2c (`docs/plan_automation.md` §7.5): plugin GUI 発の
+    // PARAM_GESTURE_BEGIN / PARAM_VALUE を出力 events から拾うための
+    // pre-allocated buffer。 plugin.process() 終了後に drain して
+    // evt_tx へ送る。
+    let mut out_param_touches: Vec<u32> = Vec::with_capacity(64);
+    let mut out_param_values: Vec<(u32, f64)> = Vec::with_capacity(common::process_data::MAX_EVENTS);
 
     loop {
         unsafe {
@@ -436,6 +447,40 @@ fn run_worker(
             // Drain plugin output events back into the shmem.
             events_out.clear();
             plugin.drain_out_notes_into(&mut events_out);
+            // Phase 2c: drain plugin-emitted param touches / values。
+            // 各 event を evt_tx 経由で plugin-main → daw_gui に流す。
+            // RT 安全性: drain は内部 vec の `append` で alloc なし
+            // (capacity 維持)、 send は std::sync::mpsc の unbounded
+            // 等価で alloc あり (channel 末尾の Node 確保)。 daw_audio
+            // から直接呼ぶケースでは PARAM_GESTURE_BEGIN / VALUE 発火
+            // は plugin GUI 操作時のみ (通常再生では 0 件)、 alloc が
+            // 走る頻度は実用上 NoteOn と同等以下。 plugin GUI が
+            // floods するケースが出たら別 lock-free queue に切替。
+            out_param_touches.clear();
+            out_param_values.clear();
+            plugin.drain_out_param_touches_into(&mut out_param_touches);
+            plugin.drain_out_param_values_into(&mut out_param_values);
+            if !out_param_touches.is_empty() || !out_param_values.is_empty() {
+                let track = entry.track;
+                let slot = entry.slot;
+                for param_id in out_param_touches.drain(..) {
+                    let _ = evt_tx.send(crate::PluginEvent::PluginParamTouched {
+                        track,
+                        slot,
+                        plugin_id,
+                        param_id,
+                    });
+                }
+                for (param_id, value) in out_param_values.drain(..) {
+                    let _ = evt_tx.send(crate::PluginEvent::PluginParamValueChanged {
+                        track,
+                        slot,
+                        plugin_id,
+                        param_id,
+                        value,
+                    });
+                }
+            }
             pd.n_events_out = 0;
             for tev in &events_out {
                 if pd.n_events_out as usize >= common::process_data::MAX_EVENTS {
