@@ -45,6 +45,18 @@ pub struct TimedNoteEvent {
     pub event: NoteTransition,
 }
 
+/// Phase 2 (`docs/plan_automation.md` §8.3): plugin parameter automation
+/// 用の 1 イベント。`time` は buffer 内 sample offset、`param_id` は
+/// CLAP `clap_id` / VST3 `ParamID` (共に u32)、`value` は plain 単位
+/// (= plugin の `min_value..=max_value` スケール)。 plugin host 内で
+/// CLAP `clap_event_param_value` / VST3 `IParameterChanges` に変換。
+#[derive(Debug, Clone, Copy)]
+pub struct TimedParamEvent {
+    pub time: u32,
+    pub param_id: u32,
+    pub value: f64,
+}
+
 /// PR4 sidechain: one aux input port worth of buffers handed to
 /// `LoadedPlugin::process`. Mirrors `pd.buffer_aux_in[port]` /
 /// `pd.aux_in_active[port]` from the shmem `ProcessData`. Stereo only
@@ -108,6 +120,7 @@ pub trait LoadedPlugin: Send {
         &mut self,
         frames: u32,
         events: &[TimedNoteEvent],
+        param_events: &[TimedParamEvent],
         input_audio: &[&[f32]],
         aux_inputs: &[AuxInputBuf<'_>],
     ) -> Result<i32>;

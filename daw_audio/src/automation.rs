@@ -13,6 +13,8 @@
 
 use common::automation::lane_value_at;
 use common::model::{AutomationTarget, Song, TrackBuiltinParam};
+use common::process_data::ProcessData;
+use common::protocol::PluginSlot;
 
 /// Fill `volume_per_sample` / `pan_per_sample` (each at least `frames`
 /// long, but typically `MAX_FRAMES`) for the given track and buffer.
@@ -83,6 +85,59 @@ pub fn fill_track_param_ramps(
             let beat = sample_pos as f64 / samples_per_beat;
             *slot = lane_value_at(lane, &song.clip_contents, beat) as f32;
         }
+    }
+}
+
+/// Phase 2b (`docs/plan_automation.md` §8.3): push automation events for
+/// the specified plugin slot into `pd.events_in` as `EventKind::
+/// ParamValue` entries. plugin_host's `process_server` decodes them into
+/// `TimedParamEvent` and forwards to `LoadedPlugin::process(..,
+/// param_events, ..)` which converts them to CLAP `clap_event_param_value`
+/// / VST3 `IParameterChanges`.
+///
+/// Phase 2 では「1 buffer = 1 update」 (frame 0 でのみ curve 値を 1 度
+/// push) として簡素実装。 frame 単位 sample (= 64 frame 刻みで複数
+/// push) は Phase 3+ でカーブの滑らかさが必要になったときに拡張。
+///
+/// RT 安全性: `push_param` は固定 capacity の `events_in` 配列に書く
+/// だけ、 allocation なし。 `lane_value_at` は curve evaluator のみ
+/// (allocation なし、 浮動小数演算のみ)。
+#[allow(clippy::too_many_arguments)]
+pub fn fill_pd_param_events(
+    pd: &mut ProcessData,
+    song: &Song,
+    track_id: u32,
+    slot: PluginSlot,
+    sample_rate: u32,
+    bpm: f32,
+    playhead: u64,
+    frames: u32,
+) {
+    if frames == 0 || bpm <= 0.0 || sample_rate == 0 {
+        return;
+    }
+    let Some(track) = song.tracks.iter().find(|t| t.id == track_id) else {
+        return;
+    };
+    let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(bpm);
+    if samples_per_beat <= 0.0 {
+        return;
+    }
+    let beat = playhead as f64 / samples_per_beat;
+    for lane in &track.automation_lanes {
+        if !lane.enabled {
+            continue;
+        }
+        let param_id = match &lane.target {
+            AutomationTarget::PluginParam { slot: s, param_id }
+                if *s == slot =>
+            {
+                *param_id
+            }
+            _ => continue,
+        };
+        let value = lane_value_at(lane, &song.clip_contents, beat);
+        pd.push_param(0, param_id, value);
     }
 }
 

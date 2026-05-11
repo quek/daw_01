@@ -316,6 +316,7 @@ impl LoadedPlugin for VoicevoxBuiltin {
         &mut self,
         frames: u32,
         events: &[TimedNoteEvent],
+        _param_events: &[crate::plugin_instance::TimedParamEvent],
         _input_audio: &[&[f32]],
         _aux_inputs: &[AuxInputBuf<'_>],
     ) -> Result<i32> {
@@ -606,7 +607,7 @@ mod tests {
                 velocity: 100.0,
             },
         }];
-        p.process(64, &events, &[], &[]).unwrap();
+        p.process(64, &events, &[], &[], &[]).unwrap();
         assert!(p.out_l[..64].iter().all(|&v| v == 0.0));
         assert!(p.active_voices.is_empty());
         p.deactivate();
@@ -669,14 +670,14 @@ mod tests {
                 velocity: 127.0,
             },
         }];
-        p.process(64, &events, &[], &[]).unwrap();
+        p.process(64, &events, &[], &[], &[]).unwrap();
         // out_l に値が乗っていることを確認 (= sample[0] = 0.0 はゼロだが
         // sample[1] 以降は非ゼロ)。
         assert!(p.out_l[1..64].iter().any(|&v| v != 0.0));
         // voice が cursor を進めていること。
         assert_eq!(p.active_voices[0].cursor, 64);
         // 次 process で残り 64 frame 流して voice 終了。
-        p.process(64, &[], &[], &[]).unwrap();
+        p.process(64, &[], &[], &[], &[]).unwrap();
         assert!(p.active_voices.is_empty());
         p.deactivate();
     }

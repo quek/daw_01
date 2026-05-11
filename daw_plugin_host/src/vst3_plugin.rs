@@ -838,6 +838,7 @@ impl LoadedPlugin for Vst3Plugin {
         &mut self,
         frames: u32,
         events: &[TimedNoteEvent],
+        _param_events: &[crate::plugin_instance::TimedParamEvent],
         input_audio: &[&[f32]],
         aux_inputs: &[crate::plugin_instance::AuxInputBuf<'_>],
     ) -> Result<i32> {

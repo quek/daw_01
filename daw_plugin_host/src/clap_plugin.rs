@@ -16,6 +16,7 @@ use clap_sys::ext::gui::{
 };
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
 use clap_sys::ext::note_ports::{CLAP_EXT_NOTE_PORTS, clap_plugin_note_ports};
+use clap_sys::events::{CLAP_EVENT_PARAM_VALUE, clap_event_param_value};
 use clap_sys::ext::params::{
     CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_HIDDEN,
     CLAP_PARAM_IS_MODULATABLE, CLAP_PARAM_IS_PERIODIC, CLAP_PARAM_IS_READONLY,
@@ -64,8 +65,13 @@ pub struct ClapPlugin {
     output_channels: u32,
     output_buffers: Vec<Vec<f32>>,
     output_ptrs: Vec<*mut f32>,
-    /// Pre-allocated input event buffer; filled by process() per call.
+    /// Pre-allocated input note event buffer; filled by process() per call.
     pending_events: Vec<clap_event_note>,
+    /// Phase 2b (`docs/plan_automation.md` §8.3): pre-allocated input
+    /// parameter event buffer; filled by process() per call from the
+    /// caller's `param_events` slice. Merged with `pending_events` into
+    /// the plugin's `in_events` via `EventListView`.
+    pending_param_events: Vec<clap_event_param_value>,
     /// Notes emitted by the plugin during the previous `process()` call.
     /// Populated by the `out_events.try_push` callback and drained by the
     /// caller (e.g. MIDI FX chain) before the next process().
@@ -297,6 +303,7 @@ impl ClapPlugin {
             // allocation in the audio thread. Plugins exceeding this just
             // re-alloc; we log on the audio side if it happens.
             pending_events: Vec::with_capacity(256),
+            pending_param_events: Vec::with_capacity(256),
             collected_out_notes: Vec::with_capacity(256),
             gui_ext,
             gui_created: false,
@@ -633,6 +640,7 @@ impl ClapPlugin {
         &mut self,
         frames: u32,
         events: &[TimedNoteEvent],
+        param_events: &[crate::plugin_instance::TimedParamEvent],
         input_audio: &[&[f32]],
         aux_inputs: &[crate::plugin_instance::AuxInputBuf<'_>],
     ) -> Result<i32> {
@@ -643,6 +651,30 @@ impl ClapPlugin {
             let mut e = encode_note(ev.event);
             e.header.time = ev.time;
             self.pending_events.push(e);
+        }
+        // Phase 2b: param events → clap_event_param_value (CLAP_EVENT_PARAM_VALUE)。
+        // `cookie: null_mut` で OK (CLAP spec: 「Some plugin's may not use
+        // cookies and instead require the id, this is the case for plugins
+        // that share parameters between instances」)、 host が cookie cache
+        // を持たないので nullを渡して param_id 直引き。
+        self.pending_param_events.clear();
+        for ev in param_events {
+            self.pending_param_events.push(clap_event_param_value {
+                header: clap_event_header {
+                    size: std::mem::size_of::<clap_event_param_value>() as u32,
+                    time: ev.time,
+                    space_id: CLAP_CORE_EVENT_SPACE_ID,
+                    type_: CLAP_EVENT_PARAM_VALUE,
+                    flags: 0,
+                },
+                param_id: ev.param_id,
+                cookie: std::ptr::null_mut(),
+                note_id: -1,
+                port_index: -1,
+                channel: -1,
+                key: -1,
+                value: ev.value,
+            });
         }
         self.collected_out_notes.clear();
 
@@ -729,8 +761,16 @@ impl ClapPlugin {
             constant_mask: 0,
         };
 
+        // Phase 2b: note + param events を 1 view にまとめて vtable に
+        // 渡す。 EventListView は process() の lifetime 内だけ存続する
+        // local 変数で、 plugin.process() が return するまで生きている
+        // ので raw pointer cast は安全。
+        let event_view = EventListView {
+            notes: &self.pending_events,
+            params: &self.pending_param_events,
+        };
         let in_events = clap_input_events {
-            ctx: std::ptr::from_ref(&self.pending_events) as *mut c_void,
+            ctx: std::ptr::from_ref(&event_view) as *mut c_void,
             size: Some(in_events_size),
             get: Some(in_events_get),
         };
@@ -952,28 +992,42 @@ unsafe extern "C" fn collect_out_note_try_push(
     true
 }
 
-/// `ctx` of the in_events vtable points to `&Vec<clap_event_note>`.
+/// Phase 2b: 1 buffer 分の note + param event を 1 つの list として
+/// plugin に渡すための view。 `process()` のローカル変数として作られ、
+/// `clap_input_events.ctx` が `*const Self` を指す。 plugin.process()
+/// 呼び出しの間だけ存続する短命オブジェクト。
+struct EventListView<'a> {
+    notes: &'a [clap_event_note],
+    params: &'a [clap_event_param_value],
+}
+
+/// `ctx` of the in_events vtable points to `&EventListView`.
 unsafe extern "C" fn in_events_size(list: *const clap_input_events) -> u32 {
-    let ctx = unsafe { (*list).ctx } as *const Vec<clap_event_note>;
+    let ctx = unsafe { (*list).ctx } as *const EventListView<'_>;
     if ctx.is_null() {
         return 0;
     }
-    unsafe { (*ctx).len() as u32 }
+    let view = unsafe { &*ctx };
+    (view.notes.len() + view.params.len()) as u32
 }
 
 unsafe extern "C" fn in_events_get(
     list: *const clap_input_events,
     index: u32,
 ) -> *const clap_event_header {
-    let ctx = unsafe { (*list).ctx } as *const Vec<clap_event_note>;
+    let ctx = unsafe { (*list).ctx } as *const EventListView<'_>;
     if ctx.is_null() {
         return std::ptr::null();
     }
-    let events = unsafe { &*ctx };
-    let Some(ev) = events.get(index as usize) else {
-        return std::ptr::null();
-    };
-    std::ptr::from_ref(&ev.header)
+    let view = unsafe { &*ctx };
+    let idx = index as usize;
+    if idx < view.notes.len() {
+        std::ptr::from_ref(&view.notes[idx].header)
+    } else if idx < view.notes.len() + view.params.len() {
+        std::ptr::from_ref(&view.params[idx - view.notes.len()].header)
+    } else {
+        std::ptr::null()
+    }
 }
 
 fn encode_note(transition: NoteTransition) -> clap_event_note {
@@ -1209,10 +1263,11 @@ impl LoadedPlugin for ClapPlugin {
         &mut self,
         frames: u32,
         events: &[TimedNoteEvent],
+        param_events: &[crate::plugin_instance::TimedParamEvent],
         input_audio: &[&[f32]],
         aux_inputs: &[crate::plugin_instance::AuxInputBuf<'_>],
     ) -> Result<i32> {
-        self.process(frames, events, input_audio, aux_inputs)
+        self.process(frames, events, param_events, input_audio, aux_inputs)
     }
 
     fn output_buffer(&self, channel: usize) -> Option<&[f32]> {

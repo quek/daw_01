@@ -286,6 +286,12 @@ fn run_worker(
     // Pre-allocated event-conversion buffer so the RT path doesn't
     // touch the allocator during dispatch.
     let mut events_in: Vec<TimedNoteEvent> = Vec::with_capacity(common::process_data::MAX_EVENTS);
+    // Phase 2b: parameter events extracted from `pd.events_in` (= EventKind::
+    // ParamValue) and passed to `LoadedPlugin::process` as a second event
+    // stream. Pre-allocated like `events_in` so the audio thread never
+    // allocates inside the dispatch loop.
+    let mut param_events_in: Vec<crate::plugin_instance::TimedParamEvent> =
+        Vec::with_capacity(common::process_data::MAX_EVENTS);
     let mut events_out: Vec<TimedNoteEvent> = Vec::with_capacity(common::process_data::MAX_EVENTS);
 
     loop {
@@ -345,32 +351,42 @@ fn run_worker(
         let frames = pd.frames;
         let n = frames as usize;
 
-        // Decode events_in → TimedNoteEvent. Param events are dropped
-        // here — `LoadedPlugin::process` doesn't take them today.
+        // Decode events_in → TimedNoteEvent / TimedParamEvent.
+        // Phase 2b (`docs/plan_automation.md` §8.3): ParamValue events
+        // are no longer dropped — they go through to the plugin as
+        // CLAP_EVENT_PARAM_VALUE / VST3 IParameterChanges via
+        // `LoadedPlugin::process(.., param_events, ..)`.
         events_in.clear();
+        param_events_in.clear();
         let n_events_in = pd.n_events_in as usize;
         for ev in &pd.events_in[..n_events_in.min(pd.events_in.len())] {
-            let timed = match ev.kind {
-                EventKind::NoteOn => TimedNoteEvent {
+            match ev.kind {
+                EventKind::NoteOn => events_in.push(TimedNoteEvent {
                     time: ev.time,
                     event: NoteTransition::On {
                         note_id: ev.note_id,
                         key: ev.key,
                         velocity: ev.velocity,
                     },
-                },
-                EventKind::NoteOff => TimedNoteEvent {
+                }),
+                EventKind::NoteOff => events_in.push(TimedNoteEvent {
                     time: ev.time,
                     event: NoteTransition::Off {
                         note_id: ev.note_id,
                         key: ev.key,
                     },
-                },
-                EventKind::ParamValue => continue,
-            };
-            events_in.push(timed);
+                }),
+                EventKind::ParamValue => {
+                    param_events_in.push(crate::plugin_instance::TimedParamEvent {
+                        time: ev.time,
+                        param_id: ev.param_id,
+                        value: ev.value,
+                    });
+                }
+            }
         }
         events_in.sort_unstable_by_key(|e| e.time);
+        param_events_in.sort_unstable_by_key(|e| e.time);
 
         let (in_a, in_b) = pd.buffer_in.split_at(1);
         let input_audio: [&[f32]; 2] = [&in_a[0][..n], &in_b[0][..n]];
@@ -396,9 +412,13 @@ fn run_worker(
             *flag = 0;
         }
 
-        if let Err(e) =
-            plugin.process(frames, &events_in, &input_audio, &aux_inputs)
-        {
+        if let Err(e) = plugin.process(
+            frames,
+            &events_in,
+            &param_events_in,
+            &input_audio,
+            &aux_inputs,
+        ) {
             tracing::error!(error = ?e, plugin_id, "plugin.process() failed");
         } else {
             // Copy output audio into the shmem.

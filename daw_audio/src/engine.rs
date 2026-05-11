@@ -783,6 +783,19 @@ pub fn process_track_owned(
         pd.frames = frames;
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
+        // Phase 2b: MIDI FX 宛 PluginParam automation を ParamValue event 化。
+        if let Some(song) = song {
+            crate::automation::fill_pd_param_events(
+                pd,
+                song,
+                track_id,
+                PluginSlot::MidiFx(i as u32),
+                sample_rate,
+                song.bpm,
+                playhead,
+                frames,
+            );
+        }
         for ev in &scratch.midi_bus_a {
             match ev.event {
                 NoteTransition::On { note_id, key, velocity } => {
@@ -847,6 +860,20 @@ pub fn process_track_owned(
             pd.frames = frames;
             pd.playing = if playing { 1 } else { 0 };
             pd.sample_rate = sample_rate;
+            // Phase 2b: automation lane の PluginParam target で
+            // Instrument 宛のものを ParamValue event として push。
+            if let Some(song) = song {
+                crate::automation::fill_pd_param_events(
+                    pd,
+                    song,
+                    track_id,
+                    PluginSlot::Instrument,
+                    sample_rate,
+                    song.bpm,
+                    playhead,
+                    frames,
+                );
+            }
             for ev in &scratch.midi_bus_a {
                 match ev.event {
                     NoteTransition::On { note_id, key, velocity } => {
@@ -917,6 +944,19 @@ pub fn process_track_owned(
         pd.frames = frames;
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
+        // Phase 2b: automation の PluginParam target を ParamValue event 化。
+        if let Some(song) = song {
+            crate::automation::fill_pd_param_events(
+                pd,
+                song,
+                track_id,
+                PluginSlot::Fx(i as u32),
+                sample_rate,
+                song.bpm,
+                playhead,
+                frames,
+            );
+        }
         pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
         pd.buffer_in[1][..n].copy_from_slice(&scratch.track_r[..n]);
         if let Err(e) = ws.dispatch(plugin_id) {
@@ -1305,6 +1345,17 @@ fn run_group_fx_chain(
         pd.frames = frames;
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
+        // Phase 2b: group fx 宛 PluginParam automation。
+        crate::automation::fill_pd_param_events(
+            pd,
+            song,
+            track_id,
+            PluginSlot::Fx(i as u32),
+            sample_rate,
+            song.bpm,
+            playhead,
+            frames,
+        );
         pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
         pd.buffer_in[1][..n].copy_from_slice(&scratch.track_r[..n]);
         if let Err(e) = ws.dispatch(plugin_id) {

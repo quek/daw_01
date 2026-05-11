@@ -144,6 +144,7 @@ impl LoadedPlugin for Silence {
         &mut self,
         frames: u32,
         _events: &[TimedNoteEvent],
+        _param_events: &[crate::plugin_instance::TimedParamEvent],
         _input_audio: &[&[f32]],
         _aux_inputs: &[AuxInputBuf<'_>],
     ) -> Result<i32> {
@@ -262,7 +263,7 @@ mod tests {
         // Pretend prior process polluted the buffer.
         p.out_l[0] = 0.7;
         p.out_r[1] = -0.4;
-        p.process(128, &[], &[], &[]).unwrap();
+        p.process(128, &[], &[], &[], &[]).unwrap();
         assert!(p.out_l[..128].iter().all(|&v| v == 0.0));
         assert!(p.out_r[..128].iter().all(|&v| v == 0.0));
     }

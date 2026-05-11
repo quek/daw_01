@@ -25,6 +25,19 @@ pub struct TimedNoteEvent {
     pub event: NoteTransition,
 }
 
+/// Phase 2 (`docs/plan_automation.md` §8.3): plugin parameter automation
+/// 用の 1 イベント。`time` は buffer 内 sample offset、`param_id` は
+/// CLAP `clap_id` / VST3 `ParamID` (共に u32)、`value` は plain 単位
+/// (= plugin の `min_value..=max_value` スケール)。 plugin host 側で
+/// CLAP `clap_event_param_value` / VST3 `IParameterChanges` に変換して
+/// `plugin.process()` の input events に流す。
+#[derive(Debug, Clone, Copy)]
+pub struct TimedParamEvent {
+    pub time: u32,
+    pub param_id: u32,
+    pub value: f64,
+}
+
 /// Per-track state owned exclusively by the audio worker that processes
 /// the track. Survives across buffers so notes don't get cut on Stop /
 /// loop-wrap.
