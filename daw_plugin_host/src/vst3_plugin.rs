@@ -93,6 +93,12 @@ pub struct Vst3Plugin {
     aux_input_buffers: Vec<Vec<Vec<f32>>>,
     /// Per-aux-bus channel pointer scratch (refreshed each process()).
     aux_input_ptrs: Vec<Vec<*mut f32>>,
+    /// Phase 6 review (RT 安全): VST3 `process()` の hot path で毎 buffer に
+    /// `Vec<AudioBusBuffers>::with_capacity(1 + aux)` を確保 → drop して
+    /// いた。 audio thread の heap alloc/free は RT 違反。 `activate()` で
+    /// pre-allocate、 `process()` 入口で `clear()` + `push()` で reuse 化。
+    /// CLAP 側の `process_input_bufs` と同 pattern。
+    process_input_bufs: Vec<AudioBusBuffers>,
 
     /// Scratch buffer for input events fed to the plugin this tick. Cleared
     /// and re-filled on every `process()`.
@@ -337,6 +343,7 @@ impl Vst3Plugin {
             aux_input_channels,
             aux_input_buffers: Vec::new(),
             aux_input_ptrs: Vec::new(),
+            process_input_bufs: Vec::new(),
             in_event_buffer: Vec::with_capacity(256),
             collected_out_notes: Vec::with_capacity(256),
             in_event_list: ComWrapper::new(Vst3InEventList::new()),
@@ -790,6 +797,11 @@ impl LoadedPlugin for Vst3Plugin {
             .iter()
             .map(|&ch| vec![std::ptr::null_mut(); ch as usize])
             .collect();
+        // Phase 6 review (RT 安全): process() で毎 buffer 確保していた
+        // Vec<AudioBusBuffers> を pre-allocate。 capacity = 1 (main) +
+        // aux bus 数。 process() 入口で clear() + push() で reuse する。
+        self.process_input_bufs =
+            Vec::with_capacity(1 + self.aux_input_channels.len());
         self.active = true;
         tracing::info!(name = %self.name, sample_rate, max_frames, "VST3 plugin activated");
         Ok(())
@@ -914,10 +926,12 @@ impl LoadedPlugin for Vst3Plugin {
             .context("Vst3OutEventList has no IEventList")?;
 
         // --- Assemble AudioBusBuffers (main + aux inputs).
-        let mut in_buses: Vec<AudioBusBuffers> =
-            Vec::with_capacity(1 + self.aux_input_channels.len());
+        // Phase 6 review (RT 安全): 毎 buffer `Vec::with_capacity` → drop
+        // していた hot path alloc を pre-allocated field の clear/push reuse
+        // に置換。 CLAP 側の `ClapPlugin::process_input_bufs` と同 pattern。
+        self.process_input_bufs.clear();
         if self.input_channels > 0 {
-            in_buses.push(AudioBusBuffers {
+            self.process_input_bufs.push(AudioBusBuffers {
                 numChannels: self.input_channels as i32,
                 silenceFlags: 0,
                 __field0: AudioBusBuffers__type0 {
@@ -926,7 +940,7 @@ impl LoadedPlugin for Vst3Plugin {
             });
         }
         for bus_idx in 0..self.aux_input_channels.len() {
-            in_buses.push(AudioBusBuffers {
+            self.process_input_bufs.push(AudioBusBuffers {
                 numChannels: self.aux_input_channels[bus_idx] as i32,
                 silenceFlags: 0,
                 __field0: AudioBusBuffers__type0 {
@@ -951,17 +965,19 @@ impl LoadedPlugin for Vst3Plugin {
             .projectTimeSamples
             .saturating_add(frames as i64);
 
+        let num_inputs = self.process_input_bufs.len() as i32;
+        let inputs_ptr = if self.process_input_bufs.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            self.process_input_bufs.as_mut_ptr()
+        };
         let mut data = ProcessData {
             processMode: ProcessModes_::kRealtime,
             symbolicSampleSize: SymbolicSampleSizes_::kSample32,
             numSamples: frames as i32,
-            numInputs: in_buses.len() as i32,
+            numInputs: num_inputs,
             numOutputs: if self.output_channels > 0 { 1 } else { 0 },
-            inputs: if in_buses.is_empty() {
-                std::ptr::null_mut()
-            } else {
-                in_buses.as_mut_ptr()
-            },
+            inputs: inputs_ptr,
             outputs: if self.output_channels > 0 {
                 &mut out_bus
             } else {
