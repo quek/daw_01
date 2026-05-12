@@ -878,20 +878,29 @@ fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
 /// `Song.clip_contents` map 経由で content を共有するため content 編集が全 clip に自動波及するが、
 /// daw_prototype は points を各 clip に inline で持つ簡易実装なので、 user の point edit (Add / Move /
 /// Delete / Curve) で linked clone 兄弟 clip にも同じ編集を波及させる必要がある。
+/// M14 Phase 63n-10b (#034 follow-up): `master_lanes` (= `arr_master_row.automation_lanes`) も
+/// 走査対象に含める (= master row 内 clip も linked group の hue 一致で波及対象になる)、 src が
+/// `MASTER_TRACK_ID` の lookup も同経路で OK。
 fn for_each_linked_clip<F>(
     lanes_map: &mut std::collections::HashMap<u32, Vec<daw_ui_core::ArrangementAutomationLane>>,
+    master_lanes: &mut Vec<daw_ui_core::ArrangementAutomationLane>,
     src: daw_ui_core::AutomationClipKey,
     mut f: F,
 ) where
     F: FnMut(&mut daw_ui_core::ArrangementAutomationClip),
 {
-    let src_hue = lanes_map
-        .get(&src.track)
+    let src_lanes_ref = if src.track == MASTER_TRACK_ID {
+        Some(&*master_lanes)
+    } else {
+        lanes_map.get(&src.track)
+    };
+    let src_hue = src_lanes_ref
         .and_then(|lanes| lanes.iter().find(|l| l.id == src.lane))
         .and_then(|l| l.clips.iter().find(|c| c.id == src.clip))
         .and_then(|c| c.share_group_color);
     if let Some(hue) = src_hue {
-        for lanes in lanes_map.values_mut() {
+        // master + 通常 track 全 lane 群を chain で走査 (= linked group の hue 一致 clip 全部に f 適用)。
+        for lanes in lanes_map.values_mut().chain(std::iter::once(&mut *master_lanes)) {
             for l in &mut *lanes {
                 for c in &mut l.clips {
                     if let Some(other) = c.share_group_color
@@ -902,11 +911,35 @@ fn for_each_linked_clip<F>(
                 }
             }
         }
-    } else if let Some(lanes) = lanes_map.get_mut(&src.track)
-        && let Some(l) = lanes.iter_mut().find(|l| l.id == src.lane)
-        && let Some(c) = l.clips.iter_mut().find(|c| c.id == src.clip)
-    {
-        f(c);
+    } else {
+        let target_lanes = if src.track == MASTER_TRACK_ID {
+            Some(&mut *master_lanes)
+        } else {
+            lanes_map.get_mut(&src.track)
+        };
+        if let Some(lanes) = target_lanes
+            && let Some(l) = lanes.iter_mut().find(|l| l.id == src.lane)
+            && let Some(c) = l.clips.iter_mut().find(|c| c.id == src.clip)
+        {
+            f(c);
+        }
+    }
+}
+
+/// M14 Phase 63n-10b (#034 follow-up): `track_id` から該当の lane 群への `&mut` を返す。
+/// `MASTER_TRACK_ID` (= `u32::MAX`) で `arr_master_row.automation_lanes`、 それ以外で
+/// `arr_automation_lanes.get_mut(&track_id)` を返す。 単一 lane 操作 (SetLaneEnabled / Visible /
+/// Default / Height / DeleteLane / CreateAutomationClip / ResizeAutomationClips / DeleteAutomationClips
+/// 等) の lookup で master / 通常 track の HashMap vs struct field の振り分けを 1 箇所に閉じ込める。
+/// linked-group 波及 (= hue 一致で全 clip 編集) は別 helper `for_each_linked_clip` を使う。
+fn lanes_mut_for_track(
+    mm: &mut DawModel,
+    track_id: u32,
+) -> Option<&mut Vec<daw_ui_core::ArrangementAutomationLane>> {
+    if track_id == MASTER_TRACK_ID {
+        Some(&mut mm.arr_master_row.automation_lanes)
+    } else {
+        mm.arr_automation_lanes.get_mut(&track_id)
     }
 }
 
@@ -1483,7 +1516,14 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                     // M14 Phase 63n-6 (#031): per-track row 高さ override。 caller-side clamp は
                     // `[16, 1000]` (global と同 range)、 widget は floor 1 px のみで raw u16 を渡す。
                     let new_h = next.clamp(16, 1000);
-                    mm.arr_track_row_h.insert(track, new_h);
+                    // M14 Phase 63n-10b (#034 follow-up): MASTER_TRACK_ID は `arr_master_row.height_px_override`
+                    // を mutate (= 通常 track の `arr_track_row_h: HashMap<u32, u16>` 経路と独立、 sentinel
+                    // 規約で master_row SSoT を flip)。
+                    if track == MASTER_TRACK_ID {
+                        mm.arr_master_row.height_px_override = Some(new_h);
+                    } else {
+                        mm.arr_track_row_h.insert(track, new_h);
+                    }
                     mm.arr_view.data_generation += 1;
                     mm.last_action =
                         format!("arr: SetSingleTrackRowH t{track} → {new_h} px");
@@ -1629,7 +1669,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
             // M14 Phase 63n-2 (#028): lane header button (★/👁/✕) + default band drag。
             ArrangementEditRequest::SetLaneEnabled { lane, enabled } => {
                 Edit::mutate(move |mm: &mut DawModel| {
-                    if let Some(lanes) = mm.arr_automation_lanes.get_mut(&lane.track)
+                    if let Some(lanes) = lanes_mut_for_track(mm, lane.track)
                         && let Some(l) = lanes.iter_mut().find(|l| l.id == lane.lane)
                     {
                         l.enabled = enabled;
@@ -1641,7 +1681,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
             }
             ArrangementEditRequest::SetLaneVisible { lane, visible } => {
                 Edit::mutate(move |mm: &mut DawModel| {
-                    if let Some(lanes) = mm.arr_automation_lanes.get_mut(&lane.track)
+                    if let Some(lanes) = lanes_mut_for_track(mm, lane.track)
                         && let Some(l) = lanes.iter_mut().find(|l| l.id == lane.lane)
                     {
                         l.visible = visible;
@@ -1653,7 +1693,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
             }
             ArrangementEditRequest::SetLaneDefault { lane, prev: _, next } => {
                 Edit::mutate(move |mm: &mut DawModel| {
-                    if let Some(lanes) = mm.arr_automation_lanes.get_mut(&lane.track)
+                    if let Some(lanes) = lanes_mut_for_track(mm, lane.track)
                         && let Some(l) = lanes.iter_mut().find(|l| l.id == lane.lane)
                     {
                         l.default_value_norm = next.clamp(0.0, 1.0);
@@ -1669,7 +1709,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
             // lane 行高さが伸び縮みする様子が cached 描画にそのまま乗る。
             ArrangementEditRequest::SetLaneHeight { lane, prev: _, next } => {
                 Edit::mutate(move |mm: &mut DawModel| {
-                    if let Some(lanes) = mm.arr_automation_lanes.get_mut(&lane.track)
+                    if let Some(lanes) = lanes_mut_for_track(mm, lane.track)
                         && let Some(l) = lanes.iter_mut().find(|l| l.id == lane.lane)
                     {
                         l.height_px = next;
@@ -1681,7 +1721,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
             }
             ArrangementEditRequest::DeleteLane(lane) => {
                 Edit::mutate(move |mm: &mut DawModel| {
-                    if let Some(lanes) = mm.arr_automation_lanes.get_mut(&lane.track) {
+                    if let Some(lanes) = lanes_mut_for_track(mm, lane.track) {
                         lanes.retain(|l| l.id != lane.lane);
                     }
                     mm.arr_view.data_generation += 1;
@@ -1696,7 +1736,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 time_beat,
                 value_norm,
             } => Edit::mutate(move |mm: &mut DawModel| {
-                for_each_linked_clip(&mut mm.arr_automation_lanes, clip, |c| {
+                for_each_linked_clip(&mut mm.arr_automation_lanes, &mut mm.arr_master_row.automation_lanes, clip, |c| {
                     // Linear curve で point を挿入。 time_beat 昇順を保つよう insert 位置を計算。
                     let pos = c
                         .points
@@ -1727,7 +1767,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 start_beat,
                 len_beats,
             } => Edit::mutate(move |mm: &mut DawModel| {
-                if let Some(lanes) = mm.arr_automation_lanes.get_mut(&lane.track)
+                if let Some(lanes) = lanes_mut_for_track(mm, lane.track)
                     && let Some(l) = lanes.iter_mut().find(|l| l.id == lane.lane)
                 {
                     let new_id =
@@ -1767,7 +1807,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                         let idx = d.point.point_idx as usize;
                         let next_t = d.next_time_beat;
                         let next_v = d.next_value_norm;
-                        for_each_linked_clip(&mut mm.arr_automation_lanes, d.point.clip, |c| {
+                        for_each_linked_clip(&mut mm.arr_automation_lanes, &mut mm.arr_master_row.automation_lanes, d.point.clip, |c| {
                             if let Some(p) = c.points.get_mut(idx) {
                                 p.time_beat = next_t;
                                 p.value_norm = next_v;
@@ -1803,7 +1843,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                             lane: lane_id,
                             clip: clip_id,
                         };
-                        for_each_linked_clip(&mut mm.arr_automation_lanes, src_key, |c| {
+                        for_each_linked_clip(&mut mm.arr_automation_lanes, &mut mm.arr_master_row.automation_lanes, src_key, |c| {
                             for idx in &indices {
                                 let i = *idx as usize;
                                 if i < c.points.len() {
@@ -1819,7 +1859,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
             ArrangementEditRequest::SetAutomationCurveType { point, prev: _, next } => {
                 Edit::mutate(move |mm: &mut DawModel| {
                     let idx = point.point_idx as usize;
-                    for_each_linked_clip(&mut mm.arr_automation_lanes, point.clip, |c| {
+                    for_each_linked_clip(&mut mm.arr_automation_lanes, &mut mm.arr_master_row.automation_lanes, point.clip, |c| {
                         if let Some(p) = c.points.get_mut(idx) {
                             p.curve = next;
                         }
@@ -1841,7 +1881,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                     let n = deltas.len();
                     for d in &deltas {
                         // (1) source lane から clip を取り出す
-                        let removed = mm.arr_automation_lanes.get_mut(&d.from.track).and_then(|lanes| {
+                        let removed = lanes_mut_for_track(mm, d.from.track).and_then(|lanes| {
                             lanes.iter_mut().find(|l| l.id == d.from.lane).and_then(|l| {
                                 let pos = l.clips.iter().position(|c| c.id == d.from.clip)?;
                                 Some(l.clips.remove(pos))
@@ -1850,7 +1890,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                         if let Some(mut clip) = removed {
                             clip.start_beat = d.next_start_beat;
                             // (2) target lane に挿入 (start_beat 昇順)
-                            if let Some(lanes) = mm.arr_automation_lanes.get_mut(&d.to_lane.track)
+                            if let Some(lanes) = lanes_mut_for_track(mm, d.to_lane.track)
                                 && let Some(l) = lanes.iter_mut().find(|l| l.id == d.to_lane.lane)
                             {
                                 let pos = l
@@ -1901,7 +1941,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                             });
                         let Some((name, len_beats, points)) = src_info else { continue };
                         // target lane に新 clip 追加 (新 id 採番、 同 hue を共有)
-                        if let Some(lanes) = mm.arr_automation_lanes.get_mut(&d.to_lane.track)
+                        if let Some(lanes) = lanes_mut_for_track(mm, d.to_lane.track)
                             && let Some(l) = lanes.iter_mut().find(|l| l.id == d.to_lane.lane)
                         {
                             // 新 clip id = lane 内 max + 1 (簡易採番、 conflict なし)
@@ -1938,7 +1978,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                             .and_then(|l| l.clips.iter().find(|c| c.id == d.from.clip))
                             .map(|c| (Arc::clone(&c.name), c.len_beats, c.points.clone()));
                         let Some((name, len_beats, points)) = src_info else { continue };
-                        if let Some(lanes) = mm.arr_automation_lanes.get_mut(&d.to_lane.track)
+                        if let Some(lanes) = lanes_mut_for_track(mm, d.to_lane.track)
                             && let Some(l) = lanes.iter_mut().find(|l| l.id == d.to_lane.lane)
                         {
                             let new_id =
@@ -1967,7 +2007,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 Edit::mutate(move |mm: &mut DawModel| {
                     let n = deltas.len();
                     for d in &deltas {
-                        if let Some(lanes) = mm.arr_automation_lanes.get_mut(&d.key.track)
+                        if let Some(lanes) = lanes_mut_for_track(mm, d.key.track)
                             && let Some(l) = lanes.iter_mut().find(|l| l.id == d.key.lane)
                             && let Some(c) = l.clips.iter_mut().find(|c| c.id == d.key.clip)
                         {
@@ -1983,7 +2023,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 Edit::mutate(move |mm: &mut DawModel| {
                     let n = keys.len();
                     for k in &keys {
-                        if let Some(lanes) = mm.arr_automation_lanes.get_mut(&k.track)
+                        if let Some(lanes) = lanes_mut_for_track(mm, k.track)
                             && let Some(l) = lanes.iter_mut().find(|l| l.id == k.lane)
                         {
                             l.clips.retain(|c| c.id != k.clip);
@@ -2023,7 +2063,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 ..
             } => Edit::mutate(move |mm: &mut DawModel| {
                 let idx = point.point_idx as usize;
-                for_each_linked_clip(&mut mm.arr_automation_lanes, point.clip, |c| {
+                for_each_linked_clip(&mut mm.arr_automation_lanes, &mut mm.arr_master_row.automation_lanes, point.clip, |c| {
                     if let Some(p) = c.points.get_mut(idx) {
                         p.curve = match kind {
                             daw_ui_core::SetAutomationCurveParamKind::BezierTension => {
@@ -2102,7 +2142,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 };
                 ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
                     let idx = point_key.point_idx as usize;
-                    for_each_linked_clip(&mut mm.arr_automation_lanes, point_key.clip, |c| {
+                    for_each_linked_clip(&mut mm.arr_automation_lanes, &mut mm.arr_master_row.automation_lanes, point_key.clip, |c| {
                         if let Some(p) = c.points.get_mut(idx) {
                             p.curve = next;
                         }
@@ -2127,7 +2167,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
         ui.context_menu_for(*clip_rect, &["Make Unique", "Delete"], move |idx, ui| {
             match idx {
                 0 => ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
-                    if let Some(lanes) = mm.arr_automation_lanes.get_mut(&key.track)
+                    if let Some(lanes) = lanes_mut_for_track(mm, key.track)
                         && let Some(l) = lanes.iter_mut().find(|l| l.id == key.lane)
                         && let Some(c) = l.clips.iter_mut().find(|c| c.id == key.clip)
                     {
@@ -2140,7 +2180,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                     );
                 })),
                 1 => ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
-                    if let Some(lanes) = mm.arr_automation_lanes.get_mut(&key.track)
+                    if let Some(lanes) = lanes_mut_for_track(mm, key.track)
                         && let Some(l) = lanes.iter_mut().find(|l| l.id == key.lane)
                     {
                         l.clips.retain(|c| c.id != key.clip);
