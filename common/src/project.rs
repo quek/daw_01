@@ -90,6 +90,13 @@ pub fn load(path: impl AsRef<Path>) -> Result<Song> {
     // (serde default), but we still bump `next_audio_source_id` above
     // any sentinel just in case. Idempotent.
     song.ensure_audio_source_ids();
+    // Phase 6 review (SSOT 違反 fix): 旧コードは `ensure_ids()` 呼出を
+    // caller (= `daw_gui::app::open_project` / `script::open` 等) に依存
+    // していて、 invariant が caller 依存だった。 ここで呼ぶことで
+    // `common::project::load` の戻り値が常に「track_id / clip_id / parent_
+    // group_id が consistent」 という不変条件を満たす。 idempotent なので
+    // caller 側が再呼び出ししても安全。
+    song.ensure_ids();
     Ok(song)
 }
 
@@ -159,6 +166,13 @@ mod tests {
             }],
             ..Track::default()
         });
+        // Phase 6 review: ensure_ids() を load 内で呼ぶようになったので、
+        // assert する original 側でも同じ normalization を適用する (= idempotent
+        // なので両方かけると 1 回 + 0 回 = 同じ最終状態)。 元データは
+        // `next_track_id == track.id` という不変条件違反の状態で構築されて
+        // いて、 ensure_ids が `next_id > max_existing_id` を強制する仕様
+        // どおりに修正する。
+        song.ensure_ids();
         save(&path, &song).unwrap();
         assert_eq!(load(&path).unwrap(), song);
     }
