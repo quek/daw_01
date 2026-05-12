@@ -4,7 +4,7 @@
 //! build_root の末尾で `Ui::take_shortcut` を順に消費し、AppEvent (or
 //! `Ui::request_undo` 等) に変換する。global shortcut の dispatch はここに集約。
 
-use daw_ui_core::{Edit, Ui};
+use daw_ui_core::{Edit, Orientation, Ui};
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{Color, Rect};
 
@@ -17,8 +17,14 @@ use crate::view::{
 pub const MENU_H: f32 = 24.0;
 pub const TRANSPORT_H: f32 = 44.0;
 pub const STATUS_H: f32 = 24.0;
-pub const BOTTOM_H: f32 = 240.0;
 pub const INSPECTOR_W: f32 = 280.0;
+
+/// arrangement (top) と bottom_panel (= piano_roll / mixer / audio_editor) の
+/// 初期分割比率。 上が `default_ratio`、 下が `1.0 - default_ratio`。 0.65 で
+/// 旧 BOTTOM_H = 240 / 典型 sh = 720 とおおよそ等価。 ユーザーが境界 handle
+/// を drag すると gui_01 `split_view` widget が state に新比率を持って frame
+/// 越しに保持する (= session 内のみ persist、 project save 不対応は別 phase)。
+const ARRANGEMENT_SPLIT_DEFAULT_RATIO: f32 = 0.65;
 
 pub fn build_root(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
     let sw = screen.width as f32;
@@ -36,25 +42,11 @@ pub fn build_root(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize)
     let menu_rect = Rect { x: 0.0, y: 0.0, w: sw, h: MENU_H };
     let transport_rect = Rect { x: 0.0, y: MENU_H, w: sw, h: TRANSPORT_H };
     let header_h = MENU_H + TRANSPORT_H;
-    let bottom_rect_h = BOTTOM_H.min((sh - header_h - STATUS_H - 100.0).max(120.0));
-    let center_h = (sh - header_h - bottom_rect_h - STATUS_H).max(0.0);
-    let inspector_rect = Rect {
+    let center_bottom_rect = Rect {
         x: 0.0,
         y: header_h,
-        w: INSPECTOR_W,
-        h: center_h,
-    };
-    let arrangement_rect = Rect {
-        x: INSPECTOR_W,
-        y: header_h,
-        w: (sw - INSPECTOR_W).max(0.0),
-        h: center_h,
-    };
-    let bottom_rect = Rect {
-        x: 0.0,
-        y: header_h + center_h,
         w: sw,
-        h: bottom_rect_h,
+        h: (sh - header_h - STATUS_H).max(0.0),
     };
     let status_rect = Rect {
         x: 0.0,
@@ -63,16 +55,45 @@ pub fn build_root(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize)
         h: STATUS_H,
     };
 
-    // gui_01 widget (piano_roll 等) は `take_shortcut` を消費する側面があるため、
-    // 先に root レベルで shortcut を捌いて広域の挙動を確定させる。widget 描画時には
-    // 消費済みになり、widget 内蔵の同名 shortcut handler は no-op に縮退する。
-    dispatch_shortcuts(app, ui, bottom_rect);
-
     draw_menu_bar(ui, menu_rect);
     transport::draw(app, ui, transport_rect);
-    track_inspector::draw(app, ui, inspector_rect);
-    arrangement_view::draw(app, ui, arrangement_rect);
-    bottom_panel::draw(app, ui, bottom_rect);
+
+    // arrangement (上) と bottom_panel (下) を縦分割。 gui_01 `split_view`
+    // が 6px の handle を描画して drag 入力を扱う。 inspector は top pane
+    // 内の左帯として配置 (= 旧レイアウトと互換、 bottom panel は full width
+    // を維持)。 shortcut dispatch は bottom_rect を確定させてから呼びたいので
+    // closure 内で実行。
+    ui.split_view(
+        "root_arrange_bottom",
+        center_bottom_rect,
+        Orientation::Vertical,
+        ARRANGEMENT_SPLIT_DEFAULT_RATIO,
+        |ui, top_rect, bottom_rect| {
+            let inspector_rect = Rect {
+                x: top_rect.x,
+                y: top_rect.y,
+                w: INSPECTOR_W,
+                h: top_rect.h,
+            };
+            let arrangement_rect = Rect {
+                x: top_rect.x + INSPECTOR_W,
+                y: top_rect.y,
+                w: (top_rect.w - INSPECTOR_W).max(0.0),
+                h: top_rect.h,
+            };
+
+            // gui_01 widget (piano_roll 等) は `take_shortcut` を消費する側面が
+            // あるため、 先に root レベルで shortcut を捌いて広域の挙動を確定
+            // させる。 widget 描画時には消費済みになり、 widget 内蔵の同名
+            // shortcut handler は no-op に縮退する。
+            dispatch_shortcuts(app, ui, bottom_rect);
+
+            track_inspector::draw(app, ui, inspector_rect);
+            arrangement_view::draw(app, ui, arrangement_rect);
+            bottom_panel::draw(app, ui, bottom_rect);
+        },
+    );
+
     status_bar::draw(app, ui, status_rect);
 
     // Modal: plugin picker。draw 関数内で modal の open/close を app.is_plugin_picker_open
