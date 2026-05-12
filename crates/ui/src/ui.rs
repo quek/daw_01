@@ -877,12 +877,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             return;
         };
 
-        // outside-click 検出 (closure 実行前に判定 / 自動 close)
+        // outside-click 検出 (closure 実行前に判定 / 自動 close)。
+        // daw_01 #038 fix: 「outside」 = 自分の anchor 外 **かつ 他の open popup の anchor 外**。
+        // cascade menu / context_menu_for は親 popup_layer の closure 内で子 popup_layer を
+        // 呼ぶ構造で、 cascade item (= 子 anchor 内 / 親 anchor 外) の click を親が outside
+        // 扱いで握りつぶし子 closure が走らない致命的 bug があった。 全 open popup の集合を
+        // 1 つの「popup 領域」 として扱う形に緩める。
         let outside_click = self.pointer.primary_just_pressed
-            && self
-                .pointer
-                .pos
-                .is_some_and(|(px, py)| !state.anchor.contains(px, py));
+            && self.pointer.pos.is_some_and(|(px, py)| {
+                !self
+                    .open_popups
+                    .values()
+                    .any(|s| s.anchor.contains(px, py))
+            });
         if outside_click {
             // popup を閉じる + クリック消費 (modal なら他 widget に流さない)
             self.open_popups.remove(&wid);

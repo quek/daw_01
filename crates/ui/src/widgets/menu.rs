@@ -318,6 +318,28 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
 
     let mut return_action: Option<MenuItemAction<'a, M>> = None;
     let arrow_color = Color::rgb(0.65, 0.68, 0.74);
+    let entries_len = entries.len();
+
+    // 兄弟 sub-popup 排他 (daw_01 #037 fix): hover している item を loop 前に確定し、
+    // 他 sibling の sub-popup を全 close する。 loop 内で close すると i=0 の
+    // popup_layer 描画が i=1 の close より先に走り cascade が重なるため、 loop 前に
+    // 一括処理する。
+    let hovered_index: Option<usize> = (0..entries_len).find(|&i| {
+        let item_rect = Rect {
+            x: popup_rect.x,
+            y: popup_rect.y + i as f32 * MENU_ITEM_H,
+            w: popup_rect.w,
+            h: MENU_ITEM_H,
+        };
+        pointer.pos.is_some_and(|(px, py)| item_rect.contains(px, py))
+    });
+    if let Some(idx) = hovered_index {
+        for j in 0..entries_len {
+            if j != idx {
+                ui.close_popup(format!("{id_path}/{j}"));
+            }
+        }
+    }
 
     for (i, entry) in entries.iter_mut().enumerate() {
         let item_rect = Rect {
@@ -684,5 +706,218 @@ mod tests {
             });
         });
         assert!(model.fired, "短縮形 item は enabled デフォルト → click で fire");
+    }
+
+    /// 兄弟 sub_menu に hover が移ったとき、 旧 cascade は close され、 新 cascade のみ open
+    /// になる (daw_01 #037 root cause regression test)。
+    #[test]
+    fn sibling_sub_menus_are_mutually_exclusive_on_hover() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let bar_rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 32.0 };
+
+        // Frame 1: "File" を click して top-level popup を open
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((20.0, 16.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| {
+                ui.menu_bar(bar_rect, |bar| {
+                    bar.menu("File", |menu| {
+                        menu.sub_menu("Open Recent", |sub| {
+                            sub.item("wav01", |_| {});
+                        });
+                        menu.sub_menu("Recently Saved", |sub| {
+                            sub.item("saved01", |_| {});
+                        });
+                    });
+                });
+            },
+        );
+
+        // Frame 2: "Open Recent" (popup item 0、 y = 32 + 12 = 44) に hover → cascade A open
+        scene.clear();
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((20.0, 44.0)),
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| {
+                ui.menu_bar(bar_rect, |bar| {
+                    bar.menu("File", |menu| {
+                        menu.sub_menu("Open Recent", |sub| {
+                            sub.item("wav01", |_| {});
+                        });
+                        menu.sub_menu("Recently Saved", |sub| {
+                            sub.item("saved01", |_| {});
+                        });
+                    });
+                });
+            },
+        );
+        let texts: Vec<&str> =
+            scene.iter_popup_glyphs().map(|g| g.text.as_ref()).collect();
+        assert!(
+            texts.contains(&"wav01"),
+            "Open Recent cascade が open し sub item text が描画される: {texts:?}"
+        );
+
+        // Frame 3: "Recently Saved" (popup item 1、 y = 32 + 24 + 12 = 68) に hover →
+        // cascade A は close、 cascade B のみ open
+        scene.clear();
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((20.0, 68.0)),
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| {
+                ui.menu_bar(bar_rect, |bar| {
+                    bar.menu("File", |menu| {
+                        menu.sub_menu("Open Recent", |sub| {
+                            sub.item("wav01", |_| {});
+                        });
+                        menu.sub_menu("Recently Saved", |sub| {
+                            sub.item("saved01", |_| {});
+                        });
+                    });
+                });
+            },
+        );
+        let texts: Vec<&str> =
+            scene.iter_popup_glyphs().map(|g| g.text.as_ref()).collect();
+        assert!(
+            texts.contains(&"saved01"),
+            "Recently Saved cascade が open に切り替わる: {texts:?}"
+        );
+        assert!(
+            !texts.contains(&"wav01"),
+            "旧 Open Recent cascade は close される (兄弟排他): {texts:?}"
+        );
+    }
+
+    /// sub_menu cascade item を click すると action が発火する (daw_01 #038 root cause
+    /// regression test、 親 popup の outside_click 判定で握りつぶされていた bug)。
+    #[test]
+    fn cascade_item_click_fires_action() {
+        struct M {
+            fired: bool,
+        }
+        let mut host: UiHost<M> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let mut model = M { fired: false };
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let bar_rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 32.0 };
+
+        // Frame 1: "File" を click して top-level popup を open
+        host.frame(
+            &mut model,
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((20.0, 16.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |_, ui| {
+                ui.menu_bar(bar_rect, |bar| {
+                    bar.menu("File", |menu| {
+                        menu.sub_menu("Open Recent", |sub| {
+                            sub.item("wav01", |ui_inner| {
+                                ui_inner.push_edit(Edit::mutate(|m: &mut M| {
+                                    m.fired = true;
+                                }));
+                            });
+                        });
+                    });
+                });
+            },
+        );
+
+        // Frame 2: "Open Recent" に hover (popup item 0、 y = 44) → cascade open
+        host.frame(
+            &mut model,
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((20.0, 44.0)),
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |_, ui| {
+                ui.menu_bar(bar_rect, |bar| {
+                    bar.menu("File", |menu| {
+                        menu.sub_menu("Open Recent", |sub| {
+                            sub.item("wav01", |ui_inner| {
+                                ui_inner.push_edit(Edit::mutate(|m: &mut M| {
+                                    m.fired = true;
+                                }));
+                            });
+                        });
+                    });
+                });
+            },
+        );
+
+        // Frame 3: cascade item "wav01" を click。 sub-popup は親 popup の右隣 (=
+        // popup_rect.x + MENU_W_DEFAULT 以降) に開くので x を cascade 内に取る。
+        let cascade_x = MENU_W_DEFAULT + 20.0;
+        host.frame(
+            &mut model,
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((cascade_x, 44.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |_, ui| {
+                ui.menu_bar(bar_rect, |bar| {
+                    bar.menu("File", |menu| {
+                        menu.sub_menu("Open Recent", |sub| {
+                            sub.item("wav01", |ui_inner| {
+                                ui_inner.push_edit(Edit::mutate(|m: &mut M| {
+                                    m.fired = true;
+                                }));
+                            });
+                        });
+                    });
+                });
+            },
+        );
+
+        assert!(
+            model.fired,
+            "cascade item の click で action が発火する (= 親 popup の outside_click で\
+             握りつぶされない)"
+        );
     }
 }
