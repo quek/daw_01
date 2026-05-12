@@ -2887,3 +2887,90 @@ waveform / cursor / checkbox / knob 等) で中心 alpha=1 保証、 線が薄�
 方向の regression なし、 API 変更なし、 caller 側更新不要。 user 目視確認済
 (2026-05-12)。
 
+
+## #037 [バグ報告] 2026-05-12 menu_bar の sub_menu cascade 兄弟排他性が無い (= 重なって描画される)
+
+関連仕様: gui_01 `crates/ui/src/widgets/menu.rs::draw_menu_entries` (line 405-438)
+
+### 症状
+
+daw_01 File メニューに 2 つの sub_menu (= 「Open Recent ►」 + 「Recently Saved ►」) を
+並べて配置したところ、 user が両方の sub_menu に順次 hover すると、 **両方の cascade が
+同時に open 状態のまま** 残り、 後から描画される cascade が前に描画される cascade
+の **同じ y 位置** に **重ね描き** される。
+
+スクリーンショット (user 報告): Open Recent (= 8 entries) の cascade 内、 上から
+4 行目 (= y 位置で Recently Saved の cascade の親 y と一致) に Recently Saved の
+内容 "(empty)" が overlay されて、 Open Recent の本来 4 行目 "wav02.daw" を
+隠している。
+
+再現条件:
+- top-level menu に 2 個以上の sub_menu を並べる
+- 1 つ目 sub_menu に hover → cascade A open
+- 2 つ目 sub_menu に hover → cascade B open (= A はそのまま)
+- 親 menu の visual 上、 cascade A と B が x 軸同じ・ y 軸親 item に応じてずれた位置に
+  同時描画される → cascade B の rect が cascade A の rect 内に侵入する場合、 overlay
+
+### 調査結果
+
+`draw_menu_entries` (line 405-438) の SubMenu arm:
+```rust
+if hovered && !ui.is_popup_open(&sub_id) {
+    ui.open_popup(&sub_id, sub_anchor, true);
+}
+// sub-popup 描画
+ui.popup_layer(&sub_id, |ui_inner| {
+    if let Some(rect) = ui_inner.popup_anchor(&sub_id_for_anchor) {
+        sub_action = draw_menu_entries(ui_inner, sub_entries, sub_rect, &sub_id);
+    }
+});
+```
+
+- 同じ parent menu の SubMenu 間で popup_id が排他化されていない (= 各 sub_id は
+  `{id_path}/{i}` で独立)
+- hover trigger で open するが、 **「他の sibling sub_menu が open なら閉じる」**
+  ロジックが無い → 兄弟 cascade が同時 open のまま
+- popup_layer は scene buffer に push 順で描画、 後勝ち overlay
+
+### 期待動作
+
+DAW / 一般 OS の menu 標準動作: 同じ parent menu 内で sub_menu cascade は **1 つだけ
+open**。 別の sub_menu に hover が移ったら旧 cascade を close、 新 cascade を open。
+これにより視覚的にも論理的にも常に「現在 cascade 中の sub_menu はこれ 1 つ」 が
+明示される。
+
+### 修正案
+
+draw_menu_entries の SubMenu arm で、 hover 検出時に「同 id_path 配下の他 sub-popup を
+close」 する処理を追加。 擬似コード:
+```rust
+if hovered && !ui.is_popup_open(&sub_id) {
+    // 兄弟 sub-popup を close (= exclusivity)
+    for j in 0..entries.len() {
+        if j != i {
+            let sibling_id = format!("{id_path}/{j}");
+            ui.close_popup(&sibling_id);
+        }
+    }
+    ui.open_popup(&sub_id, sub_anchor, true);
+}
+```
+
+もしくは hover 状態が変化したフレームで close → open のトランザクション化。
+
+### daw_01 側の workaround (本 commit)
+
+要望文脈 (= 「最近開いたファイル」 / 「最近保存したファイル」 を File メニューに) が
+2 sub_menu 並列で本 bug の影響を受けるので、 daw_01 では暫定的に「リスト空のとき
+sub_menu を作らず disabled item_with に置換」 する workaround を入れた (= cascade
+自体を出さなければ overlap 不可能)。 両 list 非空のときは依然 bug の影響を受けるが、
+ユーザーが「両方を順次 hover する」 操作頻度は低いと判断。
+
+### 関連情報
+
+- 影響: menu_bar の sub_menu を 2 個以上並べる全 caller。 視覚的混乱 + クリック ターゲット
+  ずれ (= overlay された方の item を click すると本来別 cascade の action が発火する
+  リスク)。
+- daw_prototype の Edit menu sub_menu (= "Recent" / "Older") は単一階層なので発現
+  しないと思われる。
+

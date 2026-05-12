@@ -127,16 +127,20 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Open)));
             });
             // Open Recent: 「最近開いた」 履歴 (= AppData.recent_files)。
-            // 空のときは disabled item を 1 つ出して「履歴なし」 を示す。
-            m.sub_menu("Open Recent", |sub| {
-                if app.recent_files_labels.is_empty() {
-                    sub.item_with(daw_ui_core::MenuItemSpec {
-                        label: "(empty)",
-                        on_click: Box::new(|_ui| {}),
-                        enabled: false,
-                        shortcut_hint: None,
-                    });
-                } else {
+            // 空のときは sub_menu を作らず disabled top-level item に置換
+            // (= cascade を出さない)。 gui_01 cascade exclusivity bug
+            // (= 兄弟 sub_menu の cascade が同時 open のまま重なる) の
+            // workaround。 空 cascade を出さなければ他の sub_menu cascade
+            // を上書きする事故も起きない。
+            if app.recent_files_labels.is_empty() {
+                m.item_with(daw_ui_core::MenuItemSpec {
+                    label: "Open Recent (empty)",
+                    on_click: Box::new(|_ui| {}),
+                    enabled: false,
+                    shortcut_hint: None,
+                });
+            } else {
+                m.sub_menu("Open Recent", |sub| {
                     for (label, path) in app
                         .recent_files_labels
                         .iter()
@@ -149,8 +153,8 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                             }));
                         });
                     }
-                }
-            });
+                });
+            }
             m.item("Save", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Save)));
             });
@@ -159,16 +163,17 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
             });
             // Recently Saved: 「最近保存した」 履歴 (= AppData.recent_saved)。
             // クリックで OpenRecent と同じ経路で開く (= 保存先 path はそのまま
-            // 開けるはず)。 空のときは disabled。
-            m.sub_menu("Recently Saved", |sub| {
-                if app.recent_saved_labels.is_empty() {
-                    sub.item_with(daw_ui_core::MenuItemSpec {
-                        label: "(empty)",
-                        on_click: Box::new(|_ui| {}),
-                        enabled: false,
-                        shortcut_hint: None,
-                    });
-                } else {
+            // 開けるはず)。 同上 workaround で空のときは disabled top-level
+            // item に置換。
+            if app.recent_saved_labels.is_empty() {
+                m.item_with(daw_ui_core::MenuItemSpec {
+                    label: "Recently Saved (empty)",
+                    on_click: Box::new(|_ui| {}),
+                    enabled: false,
+                    shortcut_hint: None,
+                });
+            } else {
+                m.sub_menu("Recently Saved", |sub| {
                     for (label, path) in app
                         .recent_saved_labels
                         .iter()
@@ -181,8 +186,8 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                             }));
                         });
                     }
-                }
-            });
+                });
+            }
             m.item("Import Audio...", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
                     app.handle_event(AppEvent::OpenImportAudioDialog)
