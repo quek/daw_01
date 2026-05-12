@@ -2774,13 +2774,12 @@ scrubable_number widget の wire 経路が完成。 transport で数値そのも
 
 ---
 
-## #036 [Resolved 自己解決] 2026-05-12 piano_roll の bar grid 線が一部の bar で抜ける
+## #036 [Resolved] 2026-05-12 piano_roll の bar grid 線が一部の bar で抜ける
 
-**結論**: 報告投稿後に再起動して確認したところ、 グリッド線は正常に描画されて
-いた。 直前に取り込んだ gui_01 `bebd575 (M14 Phase 65 P0+P1 一括 fix)` の中で
-解消された可能性が高い (= 当該 commit に piano_roll 関連の bug fix が複数含
-まれる、 e.g. lyric font_size clamp / drag continue div-by-zero / dropdown
-popup_id 衝突)。
+**結論 (初版、 後日訂正)**: 報告投稿後に再起動して確認したところ、 グリッド線は
+正常に描画されているように見えた。 直前に取り込んだ gui_01 `bebd575 (M14 Phase
+65 P0+P1 一括 fix)` の中で解消された可能性が高いと判断したが **これは誤り**
+(下記 ### gui_01 → 参照)。
 
 以下、 投稿時の調査メモは記録として残す (=同種の報告が再発したときの
 出発点として参照)。
@@ -2868,4 +2867,23 @@ let view = PianoRollView {
     snap: snap::piano_roll_snap_config(app),
 };
 ```
+
+### gui_01 → daw_01 (Phase 66、 2026-05-12)
+
+root cause は **renderer 側 AA shader bug** (`crates/renderer/src/pipelines/line.wgsl`)。
+旧 `smoothstep(half_w - 1.0, half_w, abs_dist)` が 1px 線 (half_w=0.5) のとき
+中心 abs_dist=0 でも alpha=0.5 までしか出ず、 さらに geometry extent `±half_w`
+で線中心が integer pixel boundary に乗ると fragment center が edge 上で
+raster されず alpha 0 になる組合せ。 viewport 偏移 (zoom / window size / scroll)
+で線中心 x の小数部分が変化し「全 bar 薄い / 特定 bar 完全消失」 が条件依存で
+発現していた (= 「再起動で直った」 は線中心が偶発的に整数 pixel から半 pixel
+ずれてマシな位置に乗っただけ、 bug 自体は健在)。
+
+fix: geometry extent を `half_w + 0.5` に拡張 + alpha curve を
+`1 - smoothstep(half_w - 0.5, half_w + 0.5, abs_dist)` (中心 plateau + 対称
+1px AA fade) に変更。 abs_dist=0 で alpha=1、 abs_dist=half_w で 0.5、
+abs_dist=half_w+0.5 で 0 の業界標準形。 `LineBatch` 経由の全描画 (grid /
+waveform / cursor / checkbox / knob 等) で中心 alpha=1 保証、 線が薄くなる
+方向の regression なし、 API 変更なし、 caller 側更新不要。 user 目視確認済
+(2026-05-12)。
 
