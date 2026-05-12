@@ -2774,7 +2774,18 @@ scrubable_number widget の wire 経路が完成。 transport で数値そのも
 
 ---
 
-## #036 [バグ報告] 2026-05-12 piano_roll の bar grid 線が一部の bar で抜ける
+## #036 [Resolved 自己解決] 2026-05-12 piano_roll の bar grid 線が一部の bar で抜ける
+
+**結論**: 報告投稿後に再起動して確認したところ、 グリッド線は正常に描画されて
+いた。 直前に取り込んだ gui_01 `bebd575 (M14 Phase 65 P0+P1 一括 fix)` の中で
+解消された可能性が高い (= 当該 commit に piano_roll 関連の bug fix が複数含
+まれる、 e.g. lyric font_size clamp / drag continue div-by-zero / dropdown
+popup_id 衝突)。
+
+以下、 投稿時の調査メモは記録として残す (=同種の報告が再発したときの
+出発点として参照)。
+
+---
 
 関連仕様: gui_01 `crates/ui/src/widgets/time_grid.rs::bar_beat_grid`
 
