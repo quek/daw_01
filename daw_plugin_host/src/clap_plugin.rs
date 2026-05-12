@@ -1094,6 +1094,23 @@ unsafe extern "C" fn collect_out_note_try_push(
             // を更新させる。 `clap_event_param_gesture` は param_id を
             // 持つ (header 直後の u32)。 clap_sys に struct がない場合は
             // raw offset で読む。
+            //
+            // Phase 6 review (FFI 安全): plugin が malformed event を
+            // try_push してきたケースに備えて `header.size` を必ず検証
+            // (= header + u32 以上)。 検証せず deref すると 1-byte OOB
+            // read。 spec: clap/events.h, header.size はイベント本体総 byte。
+            const REQUIRED: u32 =
+                (std::mem::size_of::<clap_event_header>() + std::mem::size_of::<u32>()) as u32;
+            if header.size < REQUIRED {
+                tracing::warn!(
+                    size = header.size,
+                    required = REQUIRED,
+                    "clap_event_param_gesture: header.size too small, skipping (= malformed plugin event)"
+                );
+                // 「accepted but not recorded」 path と同じく true で抜ける
+                // (= plugin に try_push の retry を促さない、 不正 event は破棄)。
+                return true;
+            }
             let param_id = unsafe {
                 let body = event as *const u8;
                 let id_ptr = body.add(std::mem::size_of::<clap_event_header>())
@@ -1111,6 +1128,19 @@ unsafe extern "C" fn collect_out_note_try_push(
             // 通知し、 `active_param_gestures` から該当 PluginParam target
             // を remove する (= Touch mode で curve 復帰、 Latch / Write で
             // 引き続き latched は維持)。
+            //
+            // Phase 6 review (FFI 安全): GESTURE_BEGIN と同様、 header.size
+            // を検証してから raw offset を deref する (= OOB 防御)。
+            const REQUIRED: u32 =
+                (std::mem::size_of::<clap_event_header>() + std::mem::size_of::<u32>()) as u32;
+            if header.size < REQUIRED {
+                tracing::warn!(
+                    size = header.size,
+                    required = REQUIRED,
+                    "clap_event_param_gesture (END): header.size too small, skipping"
+                );
+                return true;
+            }
             let param_id = unsafe {
                 let body = event as *const u8;
                 let id_ptr = body.add(std::mem::size_of::<clap_event_header>())
