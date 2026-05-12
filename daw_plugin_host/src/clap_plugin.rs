@@ -122,6 +122,11 @@ pub struct ClapPlugin {
     /// Pre-allocated planar buffers for each aux input port. Outer:
     /// aux port idx. Middle: channel idx within port. Inner: per-frame
     /// f32 (capped at `max_frames`).
+    /// Phase 5 follow-up review: process() の hot path で毎 buffer に
+    /// allocate していた `Vec<clap_audio_buffer>` を pre-allocated field
+    /// に re-use 化。 capacity は activate 時に `1 (main) + aux 数` で確保、
+    /// 毎 buffer 頭で `clear()` + `push()` で reuse する (= RT 安全)。
+    process_input_bufs: Vec<clap_audio_buffer>,
     aux_input_buffers: Vec<Vec<Vec<f32>>>,
     /// Per-aux-port channel pointer scratch (filled each `process` call).
     aux_input_ptrs: Vec<Vec<*mut f32>>,
@@ -336,6 +341,7 @@ impl ClapPlugin {
             state_ext,
             latency_ext,
             aux_input_channels,
+            process_input_bufs: Vec::new(),
             aux_input_buffers: Vec::new(),
             aux_input_ptrs: Vec::new(),
             params_ext,
@@ -592,6 +598,11 @@ impl ClapPlugin {
             .iter()
             .map(|&ch_count| vec![std::ptr::null_mut(); ch_count as usize])
             .collect();
+        // Phase 5 follow-up review: process() で毎 buffer 確保していた
+        // `Vec<clap_audio_buffer>` を pre-allocate して reuse 化。 capacity =
+        // 1 (main) + aux port 数。
+        self.process_input_bufs =
+            Vec::with_capacity(1 + self.aux_input_channels.len());
         tracing::info!(sample_rate, max_frames, "plugin activated");
         Ok(())
     }
@@ -779,10 +790,12 @@ impl ClapPlugin {
         // input first (matching CLAP convention that port 0 is main),
         // then each aux port. Length = 1 (main) + aux count when main is
         // present, else 0 (instrument with no audio input + no aux).
-        let mut input_bufs: Vec<clap_audio_buffer> =
-            Vec::with_capacity(1 + self.aux_input_channels.len());
+        // Phase 5 follow-up review: 旧 `Vec::with_capacity` を pre-allocated
+        // `self.process_input_bufs` に置換。 RT 安全 (= heap alloc なし、
+        // `clear()` + `push()` で容量再利用)。
+        self.process_input_bufs.clear();
         if self.input_channels > 0 {
-            input_bufs.push(clap_audio_buffer {
+            self.process_input_bufs.push(clap_audio_buffer {
                 data32: self.input_ptrs.as_mut_ptr(),
                 data64: std::ptr::null_mut(),
                 channel_count: self.input_channels,
@@ -791,7 +804,7 @@ impl ClapPlugin {
             });
         }
         for port_idx in 0..self.aux_input_channels.len() {
-            input_bufs.push(clap_audio_buffer {
+            self.process_input_bufs.push(clap_audio_buffer {
                 data32: self.aux_input_ptrs[port_idx].as_mut_ptr(),
                 data64: std::ptr::null_mut(),
                 channel_count: self.aux_input_channels[port_idx],
@@ -837,10 +850,13 @@ impl ClapPlugin {
             try_push: Some(collect_out_note_try_push),
         };
 
-        let (audio_inputs, audio_inputs_count) = if input_bufs.is_empty() {
+        let (audio_inputs, audio_inputs_count) = if self.process_input_bufs.is_empty() {
             (std::ptr::null(), 0)
         } else {
-            (input_bufs.as_ptr(), input_bufs.len() as u32)
+            (
+                self.process_input_bufs.as_ptr(),
+                self.process_input_bufs.len() as u32,
+            )
         };
         let (audio_outputs, audio_outputs_count) = if self.output_channels == 0 {
             (std::ptr::null_mut(), 0)
@@ -871,9 +887,10 @@ impl ClapPlugin {
 
         let process = unsafe { (*self.plugin).process }.context("plugin.process is null")?;
         let status = unsafe { process(self.plugin, &process_ctx) };
-        // input_bufs lives until end of scope here, so the data32
-        // pointers it stored stay valid through the FFI call above.
-        drop(input_bufs);
+        // self.process_input_bufs lives across calls (pre-allocated on
+        // activate). data32 pointers it stored remain valid through the
+        // FFI call above because input_buffers / aux_input_buffers (=
+        // backing storage) are themselves stable in self.
         Ok(status)
     }
 
