@@ -730,4 +730,175 @@ mod tests {
         // partition_point の <= 比較で末尾に挿入される
         assert_eq!(r.insert_at, 2);
     }
+
+    // ---- Phase 5 Step 5.2: evaluate_song_tempo tests ----
+
+    /// Phase 5 Step 5.2: helper を build する Song fixture。 base bpm 120、
+    /// SongTempo lane (curve 60..240) を持たせる。 single SongTempo lane
+    /// (= Bitwig も typical に 1 lane) を assumption。
+    fn song_with_tempo_curve(
+        start_value: f64,
+        end_value: f64,
+        clip_length: f64,
+    ) -> crate::model::Song {
+        use crate::model::{
+            AutomationClip, AutomationContent, AutomationLane, AutomationPoint,
+            AutomationTarget, ClipContent, Song,
+        };
+        let mut song = Song {
+            bpm: 120.0,
+            ..Song::default()
+        };
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Automation(AutomationContent {
+                points: vec![
+                    AutomationPoint {
+                        time_beat: 0.0,
+                        value: start_value,
+                        curve: AutomationCurve::Linear,
+                    },
+                    AutomationPoint {
+                        time_beat: clip_length,
+                        value: end_value,
+                        curve: AutomationCurve::Linear,
+                    },
+                ],
+            }),
+        );
+        let lane_id = song.alloc_song_lane_id();
+        let mut lane = AutomationLane::new(AutomationTarget::SongTempo, 120.0);
+        lane.id = lane_id;
+        lane.clips.push(AutomationClip {
+            id: 1,
+            name: "Tempo".into(),
+            start_beat: 0.0,
+            length_beats: clip_length,
+            content_id: cid,
+        });
+        lane.next_clip_id = 2;
+        song.song_lanes.push(lane);
+        song
+    }
+
+    /// SongTempo lane が無い場合は `song.bpm` を返す (= constant fallback)。
+    #[test]
+    fn evaluate_song_tempo_falls_back_to_song_bpm_when_no_lane() {
+        let song = crate::model::Song {
+            bpm: 140.0,
+            ..crate::model::Song::default()
+        };
+        assert_eq!(evaluate_song_tempo(&song, 0.0), 140.0);
+        assert_eq!(evaluate_song_tempo(&song, 100.0), 140.0);
+    }
+
+    /// SongTempo lane が disabled の場合も song.bpm にフォールバック。
+    #[test]
+    fn evaluate_song_tempo_disabled_lane_falls_back() {
+        let mut song = song_with_tempo_curve(80.0, 160.0, 4.0);
+        song.song_lanes[0].enabled = false;
+        // curve 評価で beat=2 なら 120.0 になるはずだが、 disabled で 120.0
+        // (= song.bpm = base) に戻る。 たまたま同値なので分かりにくいが、
+        // base を変えて確認。
+        song.bpm = 90.0;
+        assert!((evaluate_song_tempo(&song, 2.0) - 90.0).abs() < 1e-6);
+    }
+
+    /// SongTempo curve の midpoint 評価 (= linear で 60→180 なら beat 2 で 120)。
+    #[test]
+    fn evaluate_song_tempo_linear_midpoint() {
+        let song = song_with_tempo_curve(60.0, 180.0, 4.0);
+        let v = evaluate_song_tempo(&song, 2.0);
+        assert!((v - 120.0).abs() < 0.01, "expected ~120 at beat 2, got {v}");
+    }
+
+    /// curve 範囲外 (= clip 外) は `lane.default_value` = 120.0 を返す。
+    #[test]
+    fn evaluate_song_tempo_out_of_clip_returns_default() {
+        let song = song_with_tempo_curve(60.0, 180.0, 4.0);
+        // beat = 10 は clip [0, 4) の外。 default_value (= 120.0) が返る。
+        let v = evaluate_song_tempo(&song, 10.0);
+        assert!((v - 120.0).abs() < 0.01, "expected default 120, got {v}");
+    }
+
+    /// 上限 clamp: SongTempo curve の値が異常に大きい場合 1000 BPM で clamp。
+    #[test]
+    fn evaluate_song_tempo_clamps_high() {
+        let song = song_with_tempo_curve(5000.0, 5000.0, 4.0);
+        let v = evaluate_song_tempo(&song, 2.0);
+        assert!((v - 1000.0).abs() < 1e-6, "expected clamp to 1000, got {v}");
+    }
+
+    /// 下限 clamp: SongTempo curve の値が 1 BPM 未満なら 1 で clamp
+    /// (= divide by zero リスク回避)。
+    #[test]
+    fn evaluate_song_tempo_clamps_low() {
+        let song = song_with_tempo_curve(0.0, 0.0, 4.0);
+        let v = evaluate_song_tempo(&song, 2.0);
+        assert!((v - 1.0).abs() < 1e-6, "expected clamp to 1, got {v}");
+    }
+
+    /// Bezier curve でも tempo eval が curve 評価結果を返すことを確認
+    /// (= curve type が変わっても evaluate_song_tempo が透過に lane_value_at
+    /// を呼んでいる、 regression 防止)。
+    #[test]
+    fn evaluate_song_tempo_with_bezier_curve() {
+        use crate::model::{
+            AutomationClip, AutomationContent, AutomationLane, AutomationPoint,
+            AutomationTarget, ClipContent, Song,
+        };
+        let mut song = Song {
+            bpm: 120.0,
+            ..Song::default()
+        };
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Automation(AutomationContent {
+                points: vec![
+                    AutomationPoint {
+                        time_beat: 0.0,
+                        value: 60.0,
+                        curve: AutomationCurve::Linear,
+                    },
+                    AutomationPoint {
+                        time_beat: 4.0,
+                        value: 180.0,
+                        curve: AutomationCurve::Bezier { tension: 0.5 },
+                    },
+                ],
+            }),
+        );
+        let lane_id = song.alloc_song_lane_id();
+        let mut lane = AutomationLane::new(AutomationTarget::SongTempo, 120.0);
+        lane.id = lane_id;
+        lane.clips.push(AutomationClip {
+            id: 1,
+            name: "Tempo".into(),
+            start_beat: 0.0,
+            length_beats: 4.0,
+            content_id: cid,
+        });
+        lane.next_clip_id = 2;
+        song.song_lanes.push(lane);
+
+        // beat=0 は始点 (= 60)、 beat=2 は中央 (60..180 範囲内)、 beat=3 は
+        // 終端近傍 (= clip 内で 180 に近い)。 clip 末端 beat=4 は半開区間
+        // `[0, 4)` で clip 外扱いなので、 evaluate_song_tempo は
+        // `lane.default_value = 120.0` を返す (= eval を確認するなら範囲内
+        // beat を使う)。
+        let v_start = evaluate_song_tempo(&song, 0.0);
+        let v_mid = evaluate_song_tempo(&song, 2.0);
+        let v_near_end = evaluate_song_tempo(&song, 3.9);
+        assert!((v_start - 60.0).abs() < 0.1, "start = 60, got {v_start}");
+        assert!(
+            v_mid > 60.0 && v_mid < 180.0,
+            "mid in (60, 180), got {v_mid}"
+        );
+        assert!(
+            v_near_end > 150.0 && v_near_end < 180.0,
+            "near_end in (150, 180), got {v_near_end}"
+        );
+    }
 }
