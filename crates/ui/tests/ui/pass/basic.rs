@@ -7,7 +7,8 @@
 use daw_ui_core::{
     ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView,
     AutomationClipKey, ClipKey, Edit, Note, NoteId, NotesEditRequest, PianoRollStyle,
-    PianoRollView, PointerFrame, ReorderableListEditRequest, ReorderableListStyle, UiHost,
+    PianoRollView, PointerFrame, ReorderableListEditRequest, ReorderableListStyle,
+    ScrubableNumberFormat, ScrubableNumberStyle, UiHost,
 };
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{Rect, Scene};
@@ -354,6 +355,17 @@ fn main() {
                     ReorderableListEditRequest::Reorder(_) => Edit::mutate(|_m: &mut Model| {}),
                 },
                 |_ui, _name: &String, _i, _row, _sel, _drag| {},
+            );
+            // M14 Phase 64a (daw_01 #035): scrubable_number widget が non-Clone Model でコンパイルする。
+            let scn_style = ScrubableNumberStyle::default();
+            let _ = ui.scrubable_number_at(
+                "scn",
+                Rect { x: 0.0, y: 0.0, w: 80.0, h: 28.0 },
+                120.0,
+                120.0,
+                ScrubableNumberFormat::Decimal(1),
+                &scn_style,
+                |_v: f64| Edit::mutate(|_m: &mut Model| {}),
             );
         },
     );

@@ -78,6 +78,9 @@ pub use widgets::piano_roll::{
 pub use widgets::reorderable_list::{
     ReorderableListEditRequest, ReorderableListResponse, ReorderableListStyle,
 };
+pub use widgets::scrubable_number::{
+    ScrubableNumberFormat, ScrubableNumberResponse, ScrubableNumberStyle,
+};
 pub use widgets::text_input::TextInputResponse;
 pub use widgets::toggle_button::{ToggleButtonResponse, ToggleButtonStyle};
 pub use widgets::waveform::{

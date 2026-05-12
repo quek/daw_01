@@ -1134,6 +1134,53 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
         bx += btn_w + btn_pad;
     }
 
+    // ---- M14 Phase 64a (daw_01 #035): scrubable_number widget の visual verify ----
+    // inspector 行の右端に「Tempo: [scrubable BPM]」 を配置。 press + 縦 drag (= 0.5 BPM/px) で
+    // scrub、 Ctrl + drag で fine (= 0.05 BPM/px)、 dblclick で 120.0 リセット、 single click で
+    // text input mode (Enter で commit、 Esc で rollback)。 daw_01 #035 spec Q1=B / Q2=A / Q3=yes /
+    // Q4=yes で確定済の動作を全部触れる。
+    let scn_w = 70.0_f32;
+    let scn_pad_right = 8.0_f32;
+    let scn_rect = Rect {
+        x: inspector_rect.x + inspector_rect.w - scn_w - scn_pad_right,
+        y: inspector_rect.y + 2.0,
+        w: scn_w,
+        h: btn_h,
+    };
+    let scn_label_w = 50.0_f32;
+    ui.push_text(daw_ui_renderer::GlyphArea {
+        text: Arc::from("Tempo:"),
+        left: scn_rect.x - scn_label_w - 4.0,
+        top: inspector_rect.y + 7.0,
+        font_size: 12.0,
+        line_height: 14.0,
+        color: Color::rgb(0.85, 0.85, 0.88),
+        clip_rect: Some(inspector_rect),
+    });
+    let scn_style = daw_ui_core::ScrubableNumberStyle {
+        sensitivity: 0.5, // 1 px = 0.5 BPM (Ableton 風)
+        range: Some((20.0, 240.0)),
+        font_size: 12.0,
+        ..daw_ui_core::ScrubableNumberStyle::default()
+    };
+    let _ = ui.scrubable_number_at(
+        "transport_bpm",
+        scn_rect,
+        f64::from(m.arr_view.bpm),
+        120.0,
+        daw_ui_core::ScrubableNumberFormat::Decimal(1),
+        &scn_style,
+        |v: f64| {
+            Edit::mutate(move |mm: &mut DawModel| {
+                #[allow(clippy::cast_possible_truncation)]
+                let v_f32 = v as f32;
+                mm.arr_view.bpm = v_f32;
+                mm.arr_view.data_generation += 1;
+                mm.last_action = format!("transport: scrubable BPM → {v_f32:.1}");
+            })
+        },
+    );
+
     // strip 背景
     ui.panel("arr_minimix_bg", strip_rect, Color::rgb(0.12, 0.13, 0.16), 0.0);
     // 各 track の mini fader (volume のみ)

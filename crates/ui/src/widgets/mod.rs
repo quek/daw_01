@@ -23,6 +23,7 @@ pub mod piano_roll;
 pub mod playhead;
 pub mod reorderable_list;
 pub mod scroll_area;
+pub mod scrubable_number;
 pub mod split_view;
 pub mod tab_view;
 pub mod text_input;
