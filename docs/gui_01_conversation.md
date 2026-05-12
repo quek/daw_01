@@ -1981,3 +1981,155 @@ Phase 63n-9 wire を land しました (本 reply とは別 commit、 同 sessio
 （#033 完結、 次の要望 entry 待ち）
 
 ---
+
+## #034 [Open] 2026-05-11 [要望] arrangement に Master row (song-level automation lane) を表示
+
+### daw_01 →
+
+- 種別: [要望]
+- 関連 gui_01: `crates/ui/src/widgets/arrangement.rs` (#028 で導入された automation lane / #029-#033 の派生機能)
+- 関連 daw_01: `daw_gui/src/view/arrangement_view.rs`、 `daw_gui/src/app.rs`、 `common/src/model.rs`
+- 関連仕様: [`daw_01/docs/plan_automation.md`](daw_01/docs/plan_automation.md) §10 Phase 5 (Tempo / TimeSig / Transport event)
+
+#### 背景
+
+Phase 5 (Tempo / TimeSig automation) の data model + audio engine 実装 (daw_01 側
+274d27b / d06a8f1 / fe61c63) が完了し、 `Song.song_lanes: Vec<AutomationLane>`
+で song-level automation curve を持てるようになった。 audio thread は per-buffer
+で `evaluate_song_tempo` を呼び、 plugin に届く `clap_event_transport.tempo` と
+built-in volume/pan の curve eval が SongTempo lane に追随する。 残るは **UI で
+master row として song_lanes を表示・編集できるようにする** こと。
+
+Bitwig / Reaper / Live のいずれも arrangement の上端 (Live は右端、 Bitwig /
+Reaper は上端) に "Master" / "Mix" track があり、 通常 track と同じく折り畳み
+可能な automation lane を持つ。 daw_01 は Reaper / Bitwig 流に **arrangement の
+上端に固定の master row** を 1 つ置きたい。
+
+`SongTempo` (curve 値 = BPM) と `SongTimeSigNumerator` (curve 値 = 拍子分子) が
+master row の lane として並ぶ想定。 通常 track と異なり master row 自体には
+clip (MIDI / audio) が無い (= Song は単一 timeline で main row body は不要)。
+
+#### 期待挙動 (= 最終形態)
+
+##### A. arrangement 上端に Master row を 1 行固定表示
+
+- track 行群の **上に** master row が 1 行常時表示される
+- 行高さは折り畳み時 (collapsed) は track header と同じ程度 (= 既存
+  `style.track_header_h` を流用)、 展開時 (expanded) は `header_h +
+  sum(visible_lane.height_px)` で伸びる
+- 横スクロール / 横 zoom は通常 track 行と同期 (= 同 ruler の下に並ぶ)
+- 縦スクロールでは **scroll 範囲の最上部に固定** ではなく、 通常 track と同じ
+  ように一緒にスクロールする (= Reaper 流 master at top、 縦 scroll でリストの
+  一部として動く)。 「常時 viewport 最上部に貼り付け」 は不採用 (= Live 風 mixer
+  master との混同を避ける)。
+
+##### B. Master row のヘッダー
+
+通常 track header (#024 で構築済) と同じ x 範囲・同じ並びで:
+
+- track 名の代わりに **"Master" ラベル** (caller がローカライズ可能、 当面英語固定)
+- track color の代わりに **固定の neutral gray** (= `style.master_row_color`、
+  default `rgb(0.45, 0.45, 0.48)`)
+- Mute / Solo / Arm 等の toggle は **無し** (= master は常に通る、 mute すると
+  全てが消える、 不要)
+- automation 展開 `▶`/`▼` toggle は通常 track と同 idiom で表示
+- volume / pan slider 等の mixer 操作は表示 **無し** (= master volume は mixer
+  strip の MASTER で別管理、 ここに重ねない)
+
+##### C. Master row 展開時の lane 群
+
+通常 track の automation_lanes と完全に同 schema:
+
+```rust
+pub struct ArrangementMasterRow {
+    /// 展開 / 折り畳み状態 (track の `automation_lanes_collapsed` と同 idiom)。
+    pub automation_lanes_collapsed: bool,
+    /// SongTempo / SongTimeSigNumerator 等の song-level lane (Vec)。
+    /// 既存 `ArrangementAutomationLane` 型を re-use、 lane.target は
+    /// 区別の必要なし (= widget はただ描画するだけ、 daw_01 が target で
+    /// 何を意味するかを管理)。
+    pub automation_lanes: Vec<ArrangementAutomationLane>,
+    /// row 高さの override (= `Some(px)` で固定、 None で global default)。
+    /// 通常 track の per-track height override (#031) と同 idiom。
+    pub height_px_override: Option<u16>,
+}
+```
+
+##### D. Widget API 第 N+1 引数
+
+既存 `ui.arrangement(..., tracks, view, selected_clips, selected_tracks,
+selected_automation_clips, selected_automation_points, style, make_edit)` に
+**`master_row: Option<&ArrangementMasterRow>` を第 N+1 引数として追加** したい。
+`None` で旧挙動 (= master row 無し、 通常 track 群のみ表示)。
+
+##### E. Key 型での master の識別
+
+既存 `AutomationLaneKey { track_id: u32, lane_id: u32 }` で master lane を
+identify するため、 **`track_id: u32::MAX` を sentinel** として扱う規約を導入
+したい。 daw_01 caller は EditRequest 受信時に `track_id == u32::MAX` で
+master か通常 track かを分岐する。 widget は単に track_id を passthrough する
+だけ (= 「Master の lane も結局 `AutomationLaneKey` を共有する key 体系」)。
+
+別案として `AutomationLaneKey::Master { lane_id: u32 }` のような enum 化も
+可能だが、 既存 #028..#033 の全 EditRequest variant が `AutomationLaneKey` の
+struct shape で固まっており migration cost が高いため、 sentinel が現実的。
+
+##### F. EditRequest の流用
+
+既存 `EditRequest::ToggleTrackAutomationCollapsed { track_id }` /
+`SetLaneDefault { lane, prev, next }` / `AddAutomationPoint { ... }` /
+`MoveAutomationPoints { ... }` / `DeleteAutomationPoints { ... }` /
+`SetAutomationCurveType { ... }` / `SetAutomationCurveParam { ... }` /
+`SelectAutomationPoints { ... }` / `CreateAutomationClip { ... }` /
+`MoveAutomationClips { ... }` /
+`CloneAutomationClipsLinked / Independent` / `MakeAutomationClipUnique` /
+`SetLaneEnabled / SetLaneVisible` /
+`DeleteLane { lane }` は **そのまま再利用** したい。
+key の `track_id == u32::MAX` で master lane を表現する規約のみ追加。
+
+新 EditRequest は **不要** (= 上記既存群で完結する想定)。 ただし以下を
+確認したい:
+
+##### G. master row clip 削除挙動 (確認)
+
+master row には main row body の clip (MIDI / Audio) が無いので、
+clip drag (`MoveClips` 等) や clip 作成 (`CreateClip` / `DoubleClickEmpty`)
+は **master row 上で発火しない** はず (= 通常 track の本体 click 経路)。
+master row の body 部分は **automation_lanes の clip のみ受け付け** で良いか?
+
+##### H. 縦 scroll での master row 取扱
+
+master row は通常 track 群と同じく一緒に縦 scroll される。 仮想化対象に含めて
+描画 skip するか、 常時描画するかは widget の最適化 policy に任せる。
+
+#### 受け入れ基準
+
+- arrangement の上端 (= 全 track の上) に Master row が 1 行表示される
+- Master ラベルが見える、 neutral gray の細い header
+- `▶` toggle で展開、 `▼` で折り畳み (`ToggleTrackAutomationCollapsed
+  { track_id: u32::MAX }` 発火)
+- 展開時、 daw_01 が渡した `automation_lanes` が縦に積まれる (= SongTempo /
+  SongTimeSigNumerator の curve がそれぞれ 1 行ずつ描画)
+- lane 内 dblclick で point 追加、 既存 EditRequest 経路と完全互換
+- regression なし (= master_row = None で従来 arrangement と同挙動)
+
+#### 想定 Phase
+
+1 commit で全部 land 可能と想定 (= 既存 automation lane 描画コードを reuse
+できる規模)。 sentinel `u32::MAX` 採用なら型変更は最小。
+
+#### daw_01 側準備状況
+
+- `Song.song_lanes: Vec<AutomationLane>` data model ✅ (274d27b)
+- `evaluate_song_tempo` + audio engine wire ✅ (fe61c63)
+- daw_gui の find_recording_lane / current_plain_value は song-level
+  target に対応済 ✅
+- gui_01 の master_row landing 後、 daw_gui::arrangement_view::draw に
+  `master_row = Some(...)` で SongTempo / SongTimeSigNumerator lane を渡し、
+  `make_edit` の既存 EditRequest arm に `track_id == u32::MAX` 分岐を
+  追加すれば wire 完了
+
+### gui_01 →
+（gui_01 Claude が記入）
+
+---
