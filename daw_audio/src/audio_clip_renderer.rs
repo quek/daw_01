@@ -333,6 +333,12 @@ pub fn render_audio_events(
     current_bpm: f32,
     sample_rate: u32,
     frames: u32,
+    // Phase 5 follow-up (granular DSP click 抑制): LP smoothed tempo_ratio
+    // (= current_bpm / song.bpm)。 audio thread が per-buffer に 1-pole LP
+    // 更新した値で、 Stretch mode の granular_sample_at に渡す。 Repitch /
+    // Raw / Slice mode は instantaneous な per-event `tempo_ratio` を使う
+    // (= pitch / slice trigger の追随性を優先)。
+    granular_tempo_smoothed: f64,
 ) {
     if frames == 0 || current_bpm <= 0.0 || sample_rate == 0 {
         return;
@@ -475,7 +481,15 @@ pub fn render_audio_events(
             let (s_l, s_r) = match event.stretch_mode {
                 StretchMode::Stretch => granular_sample_at(
                     event_local,
-                    tempo_ratio,
+                    // Phase 5 follow-up (click 抑制): per-event の instant
+                    // tempo_ratio ではなく LP smoothed 版を渡す。 nominal_bpm
+                    // == song.bpm の前提下で `granular_tempo_smoothed` =
+                    // `current_bpm / song.bpm` の LP smoothed 値、 即 ratio
+                    // と一致する。 buffer 境界の Δratio が抑制され、 grain
+                    // life (= ~2*HOP samples) 内での source pos jump が
+                    // 小さくなる (= click 振幅低減)。 完全 click-free には
+                    // per-event grain-trigger lock-in が必要 (= 別 phase)。
+                    granular_tempo_smoothed,
                     l_plane,
                     r_plane,
                     event.source_start_frames,
@@ -545,9 +559,19 @@ pub fn render_audio_events(
 /// - 50% overlap (= hop = len / 2)、 Hann window で 2 grain 和が常時 1.0
 /// - linear interpolation 無し (= source 整数 index 直読、 grain 内 pitch
 ///   不変なので aliasing 影響小)
-/// - tempo_ratio が per-buffer constant、 buffer 境界での tempo 変化は grain
-///   index 不連続が起きうる (= MVP scope、 click 抑制は別 phase)
+/// - tempo_ratio は caller 側で LP smoothing 済 (= LocalState の
+///   `granular_tempo_smoothed`)。 buffer 境界での tempo 変化はここに来た
+///   時点で per-buffer 0.3 coef の 1-pole LP で抑えられている。 grain life
+///   (= ~2*HOP samples ≒ 1 buffer @ 512) 中の Δratio は十分小さく、 通常
+///   tempo curve では click が顕著に抑制される
 /// - reversed なら source を末尾から読む
+///
+/// 残課題 (= 別 phase): 完全 click-free は per-event grain-trigger lock-in が
+/// 必要。 各 grain k が triggered した瞬間の source position を per-event 状態
+/// として保存し、 後続 buffer でもその値を使う。 worker pool に `&mut` 状態を
+/// 通す refactor + LocalState に Vec<EventGrainState> 追加 + AudioClipRenderer
+/// schedule 変更時の状態 invalidate が必要。 本 commit は LP smoothing で
+/// 一般的 tempo curve の click を低減する partial mitigation。
 ///
 /// RT 安全: heap 確保なし、 浮動小数演算のみ。
 #[allow(clippy::too_many_arguments)]

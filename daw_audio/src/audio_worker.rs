@@ -89,6 +89,11 @@ pub struct DispatchShared {
     /// playhead を f64 bits で atomic 配信。 workers が
     /// `f64::from_bits(load())` で復元、 `collect_events_for_buffer` に渡す。
     pub playhead_beats_bits: std::sync::atomic::AtomicU64,
+    /// Phase 5 follow-up (granular DSP click 抑制): LP smoothed tempo_ratio
+    /// (= current_bpm / song.bpm)。 audio_clip_renderer::render_audio_events
+    /// の Stretch mode で granular_sample_at に渡す。 f64 bits で atomic
+    /// 配信、 init = 1.0 (= nominal)。
+    pub granular_tempo_smoothed_bits: std::sync::atomic::AtomicU64,
 }
 
 unsafe impl Send for DispatchShared {}
@@ -121,6 +126,9 @@ impl DispatchShared {
             current_bpm_bits: AtomicU32::new(120.0_f32.to_bits()),
             playhead_beats_bits: std::sync::atomic::AtomicU64::new(
                 0.0_f64.to_bits(),
+            ),
+            granular_tempo_smoothed_bits: std::sync::atomic::AtomicU64::new(
+                1.0_f64.to_bits(),
             ),
         }
     }
@@ -205,6 +213,9 @@ impl AudioWorkerPool {
         recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
         current_bpm: f32,
         playhead_beats: f64,
+        // Phase 5 follow-up (granular DSP click 抑制): LP smoothed tempo_ratio
+        // を atomic 経由で workers に伝える。 process_track_owned に渡す。
+        granular_tempo_smoothed: f64,
     ) {
         let n_tracks = song.map(|s| s.tracks.len() as u32).unwrap_or(0);
         let n_tracks = n_tracks.min(scratch.len() as u32);
@@ -265,6 +276,9 @@ impl AudioWorkerPool {
         self.shared
             .playhead_beats_bits
             .store(playhead_beats.to_bits(), Ordering::Release);
+        self.shared
+            .granular_tempo_smoothed_bits
+            .store(granular_tempo_smoothed.to_bits(), Ordering::Release);
         // PR4.5: publish per-track input delay slice so workers can read
         // their track's value without locking. Empty slice (= no
         // sidechain wiring anywhere) → null pointer + len 0.
@@ -405,6 +419,10 @@ fn run_work_loop(shared: &DispatchShared) {
     // で配信。 f64 bits を Acquire で load。
     let playhead_beats =
         f64::from_bits(shared.playhead_beats_bits.load(Ordering::Acquire));
+    // Phase 5 follow-up (granular DSP click 抑制): LP smoothed tempo_ratio。
+    let granular_tempo_smoothed = f64::from_bits(
+        shared.granular_tempo_smoothed_bits.load(Ordering::Acquire),
+    );
 
     if scratch_base.is_null()
         || plugin_refs_ptr.is_null()
@@ -487,6 +505,7 @@ fn run_work_loop(shared: &DispatchShared) {
             recording_lanes,
             current_bpm,
             playhead_beats,
+            granular_tempo_smoothed,
         );
     }
 }

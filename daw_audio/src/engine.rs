@@ -232,6 +232,18 @@ pub struct LocalState {
     /// 再生できないので song.bpm で linear 推定)。 初期値 `u64::MAX` は
     /// 「未確定」 (= 最初の buffer は必ず seek 扱いで初期化される)。
     pub last_known_playhead: u64,
+    /// Phase 5 follow-up (granular DSP click 抑制): LP smoothed tempo_ratio
+    /// (= current_bpm / song.bpm)。 audio_clip_renderer の granular_sample_at
+    /// で grain の source 内 offset を計算するときに使う。 instantaneous な
+    /// tempo_ratio を直接使うと、 buffer 越しに tempo が変わったとき
+    /// `grain_source_offset = k * HOP * tempo_ratio` が past grain でも更新
+    /// されてしまい、 grain 中で source pos が discontinuous → click。
+    /// LP smoothing で per-buffer の `Δtempo_ratio` を小さく抑え、 active
+    /// grain (= life 2*HOP ~ 1024 samples ≒ 1 buffer @ 512) 内での source
+    /// pos jump を低減する。 完全な stateful grain-trigger lock-in は別 phase
+    /// (= per-event state 必要、 worker pool に &mut を通す refactor が要)。
+    /// 初期値 1.0 (= nominal)、 LP coef は process_buffer で `~50ms TC` 相当。
+    pub granular_tempo_smoothed: f64,
     /// Pending IPC commands from the receive loop. Drained at the top
     /// of every `process_buffer` so `EngineShared` snapshots are fresh
     /// before dispatch.
@@ -276,6 +288,7 @@ impl LocalState {
             playing: false,
             playhead_beats: 0.0,
             last_known_playhead: u64::MAX,
+            granular_tempo_smoothed: 1.0,
             cmd_rx,
             shared,
             cached_schedule: Schedule::empty(),
@@ -557,6 +570,28 @@ impl LocalState {
             None => 120.0,
         };
 
+        // Phase 5 follow-up (granular DSP click 抑制): tempo_ratio (= current /
+        // nominal) を LP smoothing して granular_sample_at に渡す。 nominal =
+        // song.bpm (= compile 時に event.nominal_bpm にコピーされる shared
+        // 値)。 song = None なら ratio = 1.0 (= 安全な nominal)。 LP coef は
+        // ~50ms time constant 相当の固定値 (buffer = 11.6 ms @ 44100/512 で
+        // coef ~ 0.3)、 完全な per-event grain-trigger lock-in 無しでも
+        // 一般的な tempo curve では click が顕著に低減する。
+        let target_granular_ratio = song_ref
+            .map(|s| f64::from(current_bpm) / f64::from(s.bpm.max(1.0)))
+            .unwrap_or(1.0);
+        // Play edge 検出 (= last_known_playhead != playhead で seek) と同 frame
+        // で smoothed を target に snap-reset し、 旧 tempo 履歴を持ち越さない。
+        // これで Stop → 別位置から Play した直後でも granular が新 tempo に
+        // 即座に追随する (= LP lag を抑える)。
+        if playhead != self.last_known_playhead {
+            self.granular_tempo_smoothed = target_granular_ratio;
+        } else {
+            const GRANULAR_LP_COEF: f64 = 0.3;
+            self.granular_tempo_smoothed +=
+                GRANULAR_LP_COEF * (target_granular_ratio - self.granular_tempo_smoothed);
+        }
+
         if let Some(song) = song_ref {
             let any_solo = song.tracks.iter().any(|t| t.solo);
             let n_tracks = song.tracks.len().min(MAX_TRACKS);
@@ -594,6 +629,7 @@ impl LocalState {
                     recording_lanes,
                     current_bpm,
                     self.playhead_beats,
+                    self.granular_tempo_smoothed,
                 );
             } else {
                 let worker_sync = worker_syncs_g.first();
@@ -624,6 +660,7 @@ impl LocalState {
                         recording_lanes,
                         current_bpm,
                         self.playhead_beats,
+                        self.granular_tempo_smoothed,
                     );
                 }
             }
@@ -850,6 +887,12 @@ pub fn process_track_owned(
     // playhead。 collect_events_for_buffer に渡して beat-domain で note 配置
     // を判定する。 変動 tempo でも note 位置が正しく追随する。
     playhead_beats: f64,
+    // Phase 5 follow-up (granular DSP click 抑制): LP smoothed tempo_ratio
+    // (= current_bpm / song.bpm)。 audio_clip_renderer::render_audio_events
+    // に渡して、 Stretch mode の granular sampler が source 内 offset を
+    // 計算するときの ratio として使う。 LocalState 側で per-buffer に
+    // 1-pole LP で更新される値。
+    granular_tempo_smoothed: f64,
 ) {
     let n = frames as usize;
 
@@ -1049,6 +1092,7 @@ pub fn process_track_owned(
             current_bpm,
             sample_rate,
             frames,
+            granular_tempo_smoothed,
         );
     }
 
