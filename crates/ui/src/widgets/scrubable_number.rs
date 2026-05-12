@@ -191,7 +191,7 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub fn scrubable_number_at<F>(
         &mut self,
-        id: impl Hash + Clone,
+        id: impl Hash,
         rect: Rect,
         value: f64,
         default_value: f64,
@@ -203,6 +203,11 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
         F: Fn(f64) -> Edit<M> + Clone + Send + Sync + 'static,
     {
         let wid = WidgetId::ROOT.child((b"scrubable_number", &id));
+        // 内部 `text_input_at_focused` の inner widget id を construct するため、 outer id を
+        // 1 度 hash 化して u64 seed として保持。 `id: impl Hash + Clone` の `Clone` 要求を回避
+        // (= 既存 widget の `impl Hash` のみと API 統一)、 hash 衝突は WidgetId のドメインで
+        // unique 化された outer id に紐つくため実用上 zero。
+        let id_seed: u64 = hash_inputs((b"scrubable_number_id_seed", &id));
         let pointer = self.pointer;
         let inside = pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
 
@@ -334,8 +339,8 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
         // focus loss (Esc / outside click) で editing 解除 (= 静かに rollback)。
         if was_editing {
             let value_str = format_value(value, format);
-            // inner text_input の id は outer id + suffix で unique 化。
-            let inner_id = ("scrubable_number_inner", id.clone());
+            // inner text_input の id は outer id を hash 化した seed で unique 化 (= `Clone` 要求回避)。
+            let inner_id = ("scrubable_number_inner", id_seed);
             let inner_resp = self.text_input_at_focused(
                 inner_id,
                 rect,
