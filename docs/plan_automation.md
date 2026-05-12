@@ -1116,9 +1116,20 @@ scope 外 (= 旧 song.bpm 定数のまま、 別 phase で対応)。
       `sample_rate: u32` 引数追加、 per-buffer で beat → sample 換算。
       **Repitch mode は `pitch_ratio * current_bpm / nominal_bpm` で再生レートが
       tempo に追随** (= vinyl 流の pitch shift も同時、 Bitwig / Ableton 流)。
-      Raw / Stretch / Slice mode は pitch_ratio 不変 (= 再生速度固定だが
-      trigger / end は beat 追随、 真の time-stretch DSP は別 phase)。
       engine.rs / export.rs callsite を更新済
+- [x] **`StretchMode::Stretch` の granular time-stretch DSP** ✅ (2026-05-12):
+      pitch を保持しつつ tempo に追随する granular synthesis を実装。 grain
+      hop 512 samples (~12ms@44.1k) / grain length 1024 samples (50% overlap) /
+      Hann window で常時 grain 和 = 1.0。 各 grain は native rate で source を
+      読む (= pitch 不変)、 grain の source 内 offset は出力時刻 ×
+      `tempo_ratio` でスケール (= tempo 上昇時 source 進行も速まる)。 stretch
+      モード分岐は render_audio_events の inner loop 内に match で実装、
+      Raw / Repitch / Slice は旧経路 (= linear interp で直接 source 読み)、
+      Stretch のみ granular DSP へ。 MVP scope (= buffer 境界での tempo 変化
+      は grain index 不連続が起きうる、 click 抑制は別 phase で stateful
+      grain 管理)
+- [ ] `StretchMode::Slice` の transient-based slicing は別 phase で onset 検出 +
+      slice 単位再生として実装
 - [ ] recording 中の SongTempo lane bypass は Step 5.1 で transport BPM
       input が gesture 発火するようになったら追加 wire (= 現状 BPM input は
       gesture 経路に乗っていない)

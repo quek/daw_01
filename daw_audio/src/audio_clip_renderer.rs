@@ -444,36 +444,156 @@ pub fn render_audio_events(
                 continue;
             }
 
-            // Source position with linear interpolation. effective_pitch_ratio
-            // は Repitch mode で tempo ratio スケール済、 他 mode は不変。
-            let source_pos = event_local as f64 * effective_pitch_ratio;
-            let source_pos = if event.reversed {
-                source_len as f64 - 1.0 - source_pos
-            } else {
-                source_pos
+            // Phase 5 follow-up (Stretch time-stretch DSP): stretch_mode
+            // ごとに source sample 取得経路を分岐する。
+            // - Raw / Repitch: 直接 source を読む (linear interp、 Repitch は
+            //   effective_pitch_ratio に tempo_ratio 込み)
+            // - Stretch: granular synthesis で pitch を保持しつつ tempo に
+            //   追随 (= grain hop を tempo_ratio でスケール、 各 grain は
+            //   native rate で再生 = pitch 不変)
+            // - Slice: transient slicing 未実装、 Raw と同じ挙動 (= 別 phase で
+            //   onset 検出 + slice-based 再生に拡張予定)
+            let (s_l, s_r) = match event.stretch_mode {
+                StretchMode::Stretch => granular_sample_at(
+                    event_local,
+                    tempo_ratio,
+                    l_plane,
+                    r_plane,
+                    event.source_start_frames,
+                    event.source_end_frames,
+                    buffer.frames,
+                    event.reversed,
+                ),
+                _ => {
+                    // Source position with linear interpolation. effective_pitch_ratio
+                    // は Repitch mode で tempo ratio スケール済、 他 mode は不変。
+                    let source_pos = event_local as f64 * effective_pitch_ratio;
+                    let source_pos = if event.reversed {
+                        source_len as f64 - 1.0 - source_pos
+                    } else {
+                        source_pos
+                    };
+                    if source_pos < 0.0 {
+                        continue;
+                    }
+                    let i0 = source_pos.floor() as i64;
+                    let frac = (source_pos - i0 as f64) as f32;
+                    if i0 < 0 {
+                        continue;
+                    }
+                    #[allow(clippy::cast_sign_loss)]
+                    let abs_idx0 = event.source_start_frames + i0 as u64;
+                    let abs_idx1 = abs_idx0 + 1;
+                    if abs_idx0 >= event.source_end_frames || abs_idx0 >= buffer.frames {
+                        continue;
+                    }
+                    let s_l0 = l_plane.get(abs_idx0 as usize).copied().unwrap_or(0.0);
+                    let s_r0 = r_plane.get(abs_idx0 as usize).copied().unwrap_or(0.0);
+                    let s_l1 = l_plane.get(abs_idx1 as usize).copied().unwrap_or(s_l0);
+                    let s_r1 = r_plane.get(abs_idx1 as usize).copied().unwrap_or(s_r0);
+                    let s_l = s_l0 + (s_l1 - s_l0) * frac;
+                    let s_r = s_r0 + (s_r1 - s_r0) * frac;
+                    (s_l, s_r)
+                }
             };
-            if source_pos < 0.0 {
-                continue;
-            }
-            let i0 = source_pos.floor() as i64;
-            let frac = (source_pos - i0 as f64) as f32;
-            if i0 < 0 {
-                continue;
-            }
-            let abs_idx0 = event.source_start_frames + i0 as u64;
-            let abs_idx1 = abs_idx0 + 1;
-            if abs_idx0 >= event.source_end_frames || abs_idx0 >= buffer.frames {
-                continue;
-            }
-            let s_l0 = l_plane.get(abs_idx0 as usize).copied().unwrap_or(0.0);
-            let s_r0 = r_plane.get(abs_idx0 as usize).copied().unwrap_or(0.0);
-            let s_l1 = l_plane.get(abs_idx1 as usize).copied().unwrap_or(s_l0);
-            let s_r1 = r_plane.get(abs_idx1 as usize).copied().unwrap_or(s_r0);
-            let s_l = s_l0 + (s_l1 - s_l0) * frac;
-            let s_r = s_r0 + (s_r1 - s_r0) * frac;
 
             track_l[i] += s_l * env * pan_l * std::f32::consts::SQRT_2;
             track_r[i] += s_r * env * pan_r * std::f32::consts::SQRT_2;
         }
     }
+}
+
+/// Phase 5 follow-up (Stretch time-stretch DSP): granular synthesis で
+/// pitch を保持しつつ tempo (= `tempo_ratio`) に追随する。 grain は
+/// `GRAIN_LEN_SAMPLES` 幅 + `GRAIN_HOP_SAMPLES` ステップで Hann window を
+/// かけて重ね合わせ (50% overlap)、 各 grain は native rate で source を読む
+/// (= pitch 不変)。 grain の起点 (= source 内 offset) は出力時刻 × tempo_ratio
+/// でスケール → tempo 上昇時に source 進行も速まる (= elastic 流の time
+/// stretch、 grain 同士が overlap して時間軸だけ伸縮)。
+///
+/// MVP scope:
+/// - 50% overlap (= hop = len / 2)、 Hann window で 2 grain 和が常時 1.0
+/// - linear interpolation 無し (= source 整数 index 直読、 grain 内 pitch
+///   不変なので aliasing 影響小)
+/// - tempo_ratio が per-buffer constant、 buffer 境界での tempo 変化は grain
+///   index 不連続が起きうる (= MVP scope、 click 抑制は別 phase)
+/// - reversed なら source を末尾から読む
+///
+/// RT 安全: heap 確保なし、 浮動小数演算のみ。
+#[allow(clippy::too_many_arguments)]
+fn granular_sample_at(
+    event_local: u64,
+    tempo_ratio: f64,
+    l_plane: &[f32],
+    r_plane: &[f32],
+    source_start: u64,
+    source_end: u64,
+    buffer_frames: u64,
+    reversed: bool,
+) -> (f32, f32) {
+    /// grain hop (sample 単位)。 ~12 ms @ 44.1 kHz。 短すぎると metallic、
+    /// 長すぎると transient が smear する。 512 で MVP 適正。
+    const GRAIN_HOP_SAMPLES: u64 = 512;
+    /// grain length (= 2 * hop で 50% overlap)。 Hann window の和が常時 1.0 と
+    /// なるための条件。
+    const GRAIN_LEN_SAMPLES: u64 = GRAIN_HOP_SAMPLES * 2;
+
+    let source_len = source_end.saturating_sub(source_start);
+    if source_len == 0 {
+        return (0.0, 0.0);
+    }
+
+    // event_local が含まれる grain は最大 2 個 (50% overlap):
+    // - k_hi: 直近に開始した grain (= event_local / HOP)
+    // - k_lo: 前の grain (= event_local が grain 後半に来ている場合)
+    let k_hi = event_local / GRAIN_HOP_SAMPLES;
+    let k_lo = k_hi.saturating_sub(1);
+
+    let mut sum_l = 0.0_f32;
+    let mut sum_r = 0.0_f32;
+
+    for k in k_lo..=k_hi {
+        let grain_start_out = k * GRAIN_HOP_SAMPLES;
+        if event_local < grain_start_out {
+            continue;
+        }
+        let in_grain = event_local - grain_start_out;
+        if in_grain >= GRAIN_LEN_SAMPLES {
+            continue;
+        }
+        // grain の source 内 offset (= 出力時刻 × tempo_ratio)。
+        let grain_source_offset = (grain_start_out as f64 * tempo_ratio).max(0.0) as u64;
+        let source_pos_in_event = grain_source_offset + in_grain;
+        if source_pos_in_event >= source_len {
+            continue;
+        }
+        let abs_idx = if reversed {
+            // reversed: source の末尾から読む
+            let from_end = source_pos_in_event;
+            if from_end >= source_len {
+                continue;
+            }
+            source_start + (source_len - 1 - from_end)
+        } else {
+            source_start + source_pos_in_event
+        };
+        if abs_idx >= source_end || abs_idx >= buffer_frames {
+            continue;
+        }
+        // Hann window: 0.5 * (1 - cos(2π * t / (LEN - 1)))。 (LEN-1) は
+        // window の最後の点を 0 にするための慣例 (= symmetric Hann)。
+        #[allow(clippy::cast_precision_loss)]
+        let t = in_grain as f32;
+        #[allow(clippy::cast_precision_loss)]
+        let len_f = (GRAIN_LEN_SAMPLES - 1) as f32;
+        let env_win = 0.5
+            * (1.0 - (std::f32::consts::TAU * t / len_f).cos());
+
+        let s_l = l_plane.get(abs_idx as usize).copied().unwrap_or(0.0);
+        let s_r = r_plane.get(abs_idx as usize).copied().unwrap_or(0.0);
+        sum_l += s_l * env_win;
+        sum_r += s_r * env_win;
+    }
+
+    (sum_l, sum_r)
 }
