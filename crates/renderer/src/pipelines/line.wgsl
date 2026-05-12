@@ -48,8 +48,12 @@ fn vs_main(@builtin(vertex_index) vid: u32, in: VsIn) -> VsOut {
     let perp = vec2<f32>(-dir.y, dir.x);
 
     let half_w = max(in.line_width * 0.5, 0.5);
+    // AA fade 領域 (= half pixel) を geometry の外側に余分に確保し、 線中心が integer
+    // pixel boundary に乗っても fragment が必ず raster されるようにする (= bar grid の
+    // 「特定 bar だけ消える」 症状の root cause)。
+    let extent = half_w + 0.5;
     let center = mix(in.a, in.b, along);
-    let pos_px = center + perp * (side * half_w);
+    let pos_px = center + perp * (side * extent);
 
     // 物理ピクセル -> NDC (左上原点 -> NDC は左下原点)
     let ndc_x = (pos_px.x / screen.size.x) * 2.0 - 1.0;
@@ -58,16 +62,18 @@ fn vs_main(@builtin(vertex_index) vid: u32, in: VsIn) -> VsOut {
     var out: VsOut;
     out.clip_pos   = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
     out.color      = in.color;
-    out.edge_dist  = side * half_w;
+    out.edge_dist  = side * extent;
     out.half_width = half_w;
     return out;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // 線中心からの距離で 1px のアンチエイリアス。
-    let aa = 1.0;
+    // 線中心から half_width ± 0.5 px の対称な AA fade。 中心 plateau (abs_dist <
+    // half_width - 0.5) で alpha = 1、 端 (abs_dist > half_width + 0.5) で alpha = 0。
+    // 旧 shader は smoothstep(half_w - 1.0, half_w) で半 pixel 線では中心まで AA が
+    // 食い込み中心 alpha が 0.5 までしか出なかった (=「線が薄い / 消える」 の原因)。
     let abs_dist = abs(in.edge_dist);
-    let alpha = 1.0 - smoothstep(in.half_width - aa, in.half_width, abs_dist);
+    let alpha = 1.0 - smoothstep(in.half_width - 0.5, in.half_width + 0.5, abs_dist);
     return vec4<f32>(in.color.rgb, in.color.a * alpha);
 }
