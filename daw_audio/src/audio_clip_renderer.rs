@@ -96,6 +96,12 @@ pub struct RenderedEvent {
     pub fade_out_curve: FadeCurve,
     pub reversed: bool,
     pub stretch_mode: StretchMode,
+    /// Phase 5 follow-up (StretchMode::Slice): source 内の transient sample
+    /// 位置 (`AudioEvent.onsets` の clone)。 Slice mode の render path で、
+    /// 各 slice は native rate で再生され、 slice の trigger 位置は
+    /// `onsets[i] / tempo_ratio` で出力 sample 位置にマップされる。 Slice 以外
+    /// の mode では参照されない。 通常 ~10..100 件の小さな Vec。
+    pub onsets: Vec<u64>,
 }
 
 /// Wait-free snapshot of "what audio events should the audio thread
@@ -286,6 +292,7 @@ pub fn compile_audio_schedule(
                     fade_out_curve: event.fade_out_curve,
                     reversed: event.reversed,
                     stretch_mode: event.stretch_mode,
+                    onsets: event.onsets.clone(),
                 });
             }
         }
@@ -464,6 +471,17 @@ pub fn render_audio_events(
                     buffer.frames,
                     event.reversed,
                 ),
+                StretchMode::Slice => slice_sample_at(
+                    event_local,
+                    tempo_ratio,
+                    l_plane,
+                    r_plane,
+                    event.source_start_frames,
+                    event.source_end_frames,
+                    buffer.frames,
+                    &event.onsets,
+                    event.reversed,
+                ),
                 _ => {
                     // Source position with linear interpolation. effective_pitch_ratio
                     // は Repitch mode で tempo ratio スケール済、 他 mode は不変。
@@ -596,4 +614,114 @@ fn granular_sample_at(
     }
 
     (sum_l, sum_r)
+}
+
+/// Phase 5 follow-up (StretchMode::Slice): transient-based slice 再生。
+/// `onsets` (= source 内 transient sample 位置) で分割した slice を、 各 slice
+/// の trigger beat 位置で出力に流す。 slice は **native rate で再生** (= pitch
+/// 保持、 source 整数 index 直読)、 slice の trigger 位置は
+/// `onsets[i] / tempo_ratio` で出力 sample 位置にマップされる (= 拍子に
+/// ロック)。
+///
+/// MVP scope (Ableton / Live 流の Slice mode):
+/// - tempo 上昇 (= ratio > 1): slice が出力上で詰まる → 1 つ前の slice が
+///   終了前に次 slice が triggered (= cut)。 出力に「gap が無く詰まる」 感
+/// - tempo 下降 (= ratio < 1): slice 間に gap が出る (= silence)。 transient
+///   は kept、 slice 末尾の余韻が伸びる
+/// - onsets が空: source 全体を 1 slice として再生 (= Raw に近い挙動)
+/// - linear interp 無し (= 整数 index 直読、 grain 内 native rate のため
+///   aliasing 影響小)
+/// - reversed: source 末尾から読む (= slice 内 source position を反転)
+///
+/// RT 安全: heap 確保なし、 onsets slice の binary search のみ。
+#[allow(clippy::too_many_arguments)]
+fn slice_sample_at(
+    event_local: u64,
+    tempo_ratio: f64,
+    l_plane: &[f32],
+    r_plane: &[f32],
+    source_start: u64,
+    source_end: u64,
+    buffer_frames: u64,
+    onsets: &[u64],
+    reversed: bool,
+) -> (f32, f32) {
+    let source_len = source_end.saturating_sub(source_start);
+    if source_len == 0 {
+        return (0.0, 0.0);
+    }
+
+    // onsets が空 / 不足の場合は source 全体を 1 slice (= Raw 等価)。
+    if onsets.is_empty() {
+        let source_pos = event_local;
+        if source_pos >= source_len {
+            return (0.0, 0.0);
+        }
+        let abs_idx = if reversed {
+            source_start + (source_len - 1 - source_pos)
+        } else {
+            source_start + source_pos
+        };
+        if abs_idx >= source_end || abs_idx >= buffer_frames {
+            return (0.0, 0.0);
+        }
+        let s_l = l_plane.get(abs_idx as usize).copied().unwrap_or(0.0);
+        let s_r = r_plane.get(abs_idx as usize).copied().unwrap_or(0.0);
+        return (s_l, s_r);
+    }
+
+    // 出力 sample 位置 event_local が含まれる slice を探す。 slice i の trigger
+    // 出力位置 = `onsets[i] / tempo_ratio` (= nominal で onsets[i] sample 後、
+    // tempo 比でスケール)。 binary search で「`onsets[i] / tempo_ratio <=
+    // event_local` を満たす最大 i」 を求める。 tempo_ratio が安全な範囲なら
+    // `onsets[i] / tempo_ratio` は monotonically increasing。
+    if tempo_ratio <= 0.0 {
+        return (0.0, 0.0);
+    }
+    // event_local * tempo_ratio に対応する onsets index を比較で探す
+    // (= `onsets[i] <= event_local * tempo_ratio` を満たす最大 i)。
+    let threshold = (event_local as f64 * tempo_ratio) as u64;
+    // partition_point: onsets[i] <= threshold な要素数 = i のとき返る。 i-1
+    // が「該当 slice index」 (= i == 0 なら slice 開始前で silence)。
+    let count = onsets.partition_point(|&o| o <= threshold);
+    if count == 0 {
+        // event_local が onsets[0] / tempo_ratio より前 (= まだ最初の slice 前)
+        // の場合は silence。 これは onsets[0] > 0 のときのみ起き、 通常は
+        // onsets[0] = 0 で event 開始と同時に最初の slice が triggered。
+        return (0.0, 0.0);
+    }
+    let slice_idx = count - 1;
+    let slice_source_start = onsets[slice_idx];
+    let slice_source_end = onsets
+        .get(slice_idx + 1)
+        .copied()
+        .unwrap_or(source_len);
+    // slice trigger 出力位置 (sample 単位):
+    // `onsets[i] / tempo_ratio` の floor。 整数化で 1 sample 単位の誤差。
+    let slice_trigger_output = (slice_source_start as f64 / tempo_ratio) as u64;
+    if event_local < slice_trigger_output {
+        return (0.0, 0.0);
+    }
+    // slice 内 elapsed (= 出力上の sample 数、 = source 上の sample 数 *
+    // 1.0、 native rate なので)
+    let slice_local = event_local - slice_trigger_output;
+    let source_pos_in_event = slice_source_start + slice_local;
+    if source_pos_in_event >= slice_source_end {
+        // slice 末尾を越えた (= tempo 下降で gap、 silence で次 slice 待ち)
+        return (0.0, 0.0);
+    }
+    if source_pos_in_event >= source_len {
+        return (0.0, 0.0);
+    }
+    let abs_idx = if reversed {
+        source_start + (source_len - 1 - source_pos_in_event)
+    } else {
+        source_start + source_pos_in_event
+    };
+    if abs_idx >= source_end || abs_idx >= buffer_frames {
+        return (0.0, 0.0);
+    }
+    let s_l = l_plane.get(abs_idx as usize).copied().unwrap_or(0.0);
+    let s_r = r_plane.get(abs_idx as usize).copied().unwrap_or(0.0);
+    (s_l, s_r)
 }

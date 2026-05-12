@@ -1128,8 +1128,16 @@ scope 外 (= 旧 song.bpm 定数のまま、 別 phase で対応)。
       Stretch のみ granular DSP へ。 MVP scope (= buffer 境界での tempo 変化
       は grain index 不連続が起きうる、 click 抑制は別 phase で stateful
       grain 管理)
-- [ ] `StretchMode::Slice` の transient-based slicing は別 phase で onset 検出 +
-      slice 単位再生として実装
+- [x] **`StretchMode::Slice` transient-based slicing** ✅ (2026-05-12):
+      `RenderedEvent.onsets: Vec<u64>` (= AudioEvent.onsets を compile 時に
+      clone) を追加し、 `slice_sample_at` fn を実装。 各 slice の trigger 出力
+      位置 = `onsets[i] / tempo_ratio` で計算、 slice は native rate で source
+      を読む (= pitch 保持)。 tempo 上昇で slice が詰まる (= 前 slice cut)、
+      tempo 下降で slice 間 silence gap、 onsets が空なら source 全体を 1
+      slice (= Raw 等価)。 reversed 対応、 `partition_point` で slice index
+      lookup (RT 安全、 heap 確保なし)。 onset 自動検出 (= AudioEvent.onsets
+      の生成) は別 phase (= transient analysis tool が必要)、 user が手動で
+      onsets を渡すまでは Raw 等価挙動
 - [ ] recording 中の SongTempo lane bypass は Step 5.1 で transport BPM
       input が gesture 発火するようになったら追加 wire (= 現状 BPM input は
       gesture 経路に乗っていない)
