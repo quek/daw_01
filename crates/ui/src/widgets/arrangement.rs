@@ -287,6 +287,50 @@ pub struct ArrangementAutomationLane {
     pub clips: Vec<ArrangementAutomationClip>,
 }
 
+// ============================================================
+// M14 Phase 63n-10 (#034): master row (song-level automation)
+// ============================================================
+
+/// M14 Phase 63n-10 (#034): `AutomationLaneKey::track` が **master row** 由来の lane を指す sentinel。
+/// caller (daw_01) は `AutomationLaneKey { track: MASTER_TRACK_ID, lane }` で master lane を identify、
+/// EditRequest 受信側は `key.track == MASTER_TRACK_ID` で master / 通常 track を分岐する。
+/// 値は `u32::MAX` (= 通常 track id がここに到達することは現実的に無い)。 daw_01 conversation
+/// #034 で確定した「sentinel 規約 + 既存 EditRequest 全流用」 設計の基幹。
+pub const MASTER_TRACK_ID: u32 = u32::MAX;
+
+/// M14 Phase 63n-10 (#034): arrangement の上端に常時表示される **master row** (song-level automation)。
+/// daw_01 `Song.song_lanes` (= SongTempo / SongTimeSigNumerator 等) の widget 側 representation。
+/// 通常 `ArrangementTrack` と異なり `clips` (MIDI / Audio) / `muted` / `solo` / `parent_id` / `volume`
+/// は持たず、 **automation lane の Vec のみ** を保持する (= master 行は clip drag や mute/solo gesture を
+/// 発火しない、 daw_01 #034 §G で確定)。
+///
+/// `arrangement()` に `Some(&master)` で渡すと上端 1 行 ("Master" ラベル + 折り畳み可能な automation lane 群)
+/// として描画され、 `None` で旧挙動 (master row 無し) と完全互換。 縦 scroll では通常 track と一緒に
+/// 動く (= 上端 sticky にしない、 Reaper 流 master at top、 daw_01 #034 §H)。
+///
+/// lane 群は `ArrangementAutomationLane` を re-use (= label / icon / color / clips / 等は通常 track と
+/// 同 schema、 daw_01 が lane.target で SongTempo / SongTimeSigNumerator を識別)。 既存 `AddAutomationPoint`
+/// `MoveAutomationPoints` `SetLaneEnabled` 等の EditRequest は `lane.track = MASTER_TRACK_ID` の形で
+/// そのまま発火する (= 新 variant 不要、 #034 §F で確定)。
+#[derive(Clone, Debug)]
+pub struct ArrangementMasterRow {
+    /// 展開 / 折り畳み状態 (通常 track の `automation_lanes_collapsed` と同 idiom)。
+    /// `▶` (collapsed = true) / `▼` (expanded = false) を toggle すると
+    /// `ToggleTrackAutomationCollapsed { track: MASTER_TRACK_ID }` が発火する。
+    /// `automation_lanes.is_empty()` で disclosure 非描画 (= toggle 不可)。
+    pub automation_lanes_collapsed: bool,
+    /// SongTempo / SongTimeSigNumerator 等の song-level lane。 既存 `ArrangementAutomationLane` 型を
+    /// re-use、 lane.target は区別の必要なし (= widget はただ描画するだけ、 daw_01 が target で
+    /// 何を意味するかを管理)。 各 lane の `AutomationLaneKey { track: MASTER_TRACK_ID, lane: lane.id }`
+    /// で EditRequest を発火する。
+    pub automation_lanes: Vec<ArrangementAutomationLane>,
+    /// row 高さの override (= `Some(px)` で固定、 None で global default = `view.track_row_h`)。
+    /// 通常 track の `row_h: Option<u16>` (Phase 63n-6) と完全同 idiom。 expanded 時の総高さは
+    /// `effective_h + Σ visible_lane.height_px`、 collapsed 時は `effective_h` のみ
+    /// (= 通常 track と同じ式、 #034 §Q3 (A) で確定)。
+    pub height_px_override: Option<u16>,
+}
+
 /// arrangement の view 状態 (pan / zoom / playhead / loop)。値渡し (Copy)。
 #[derive(Clone, Copy, Debug)]
 pub struct ArrangementView {
@@ -988,6 +1032,16 @@ pub struct ArrangementStyle {
     pub automation_lane_icon_size: f32,
     /// lane header の text color (label + icon、 default = `track_text_color`)。
     pub automation_lane_text_color: Color,
+    // ---- M14 Phase 63n-10 (#034): master row 描画パラメータ ----
+    /// master row header の背景塗り (track.color の代わりに使う neutral gray、 default
+    /// `rgb(0.45, 0.45, 0.48)`)。 daw_01 #034 §B 仕様。 track 色と differentiate しつつ track header_bg
+    /// より暗くないようにして「特殊だが視認可能」 を保つ。
+    pub master_row_color: Color,
+    /// master row header の "Master" label に使う font size (default = `track_text_size`)。
+    /// 通常 track と並んだとき揃って見えるよう同サイズが既定。
+    pub master_row_label_size: f32,
+    /// master row header の "Master" label の文字色 (default = `track_text_color`)。
+    pub master_row_label_color: Color,
 }
 
 impl Default for ArrangementStyle {
@@ -1123,6 +1177,10 @@ impl Default for ArrangementStyle {
             automation_disclosure_size: 12.0,
             automation_lane_icon_size: 12.0,
             automation_lane_text_color: Color::rgb(0.92, 0.92, 0.94),
+            // M14 Phase 63n-10 (#034): master row default (neutral gray + track と同 font / 色)。
+            master_row_color: Color::rgb(0.45, 0.45, 0.48),
+            master_row_label_size: 12.0,
+            master_row_label_color: Color::rgb(0.95, 0.95, 0.97),
         }
     }
 }
@@ -1207,6 +1265,68 @@ pub fn automation_lanes_total_h(track: &ArrangementTrack) -> f32 {
         .filter(|l| l.visible)
         .map(|l| f32::from(l.height_px))
         .sum()
+}
+
+/// M14 Phase 63n-10 (#034): master row の effective row body 高さ (px、 lane 部含まない)。
+/// `master.height_px_override.map_or(default_row_h, f32::from)` の thin wrapper。 通常 track の
+/// `effective_track_row_h` と同 idiom (daw_01 #034 §Q3 (A) で確定)。
+#[inline]
+#[must_use]
+pub fn effective_master_row_h(master: &ArrangementMasterRow, default_row_h: f32) -> f32 {
+    master.height_px_override.map_or(default_row_h, f32::from)
+}
+
+/// M14 Phase 63n-10 (#034): master row の expanded 状態の visible automation lane 高さ合計 (px)。
+/// `automation_lanes_collapsed` または lane なし / 全 invisible で `0.0`。 通常 track の
+/// `automation_lanes_total_h` と同 idiom (daw_01 #034 §Q2 (A) で確定 — visible 0 個でも disclosure
+/// state は触らず、 単に行が「effective_h だけ」 に潰れる)。
+#[must_use]
+pub fn master_row_lanes_total_h(master: &ArrangementMasterRow) -> f32 {
+    if master.automation_lanes_collapsed || master.automation_lanes.is_empty() {
+        return 0.0;
+    }
+    master
+        .automation_lanes
+        .iter()
+        .filter(|l| l.visible)
+        .map(|l| f32::from(l.height_px))
+        .sum()
+}
+
+/// M14 Phase 63n-10 (#034): master row の expanded 総高さ (= effective + lanes 合計)。
+/// 通常 track の `track_row_height` と同 idiom。 lanes_y の shift 量 / hit-test の y 範囲決定 / 縦
+/// scroll 計算で参照する SSoT。 `master = None` の caller は 0.0 を使う想定 (= `lanes.y` shift なし)。
+#[must_use]
+pub fn master_row_total_h(master: &ArrangementMasterRow, default_row_h: f32) -> f32 {
+    effective_master_row_h(master, default_row_h) + master_row_lanes_total_h(master)
+}
+
+/// M14 Phase 63n-10 (#034): master row を synthetic `ArrangementTrack` に変換 (widget 内部の `visible_tracks[0]`
+/// として prepend する用)。 既存 hit-test / 描画 / row 高さ helper を **そのまま reuse** するための adapter で、
+/// `id = MASTER_TRACK_ID`、 `clips = []`、 `muted/solo = false`、 `parent_id = None`、 `depth = 0`、
+/// `volume = 1.0` 固定 (= 通常 track 経路で「mute / solo / clip drag」 が自然に no-op になる)。
+/// `automation_lanes` / `automation_lanes_collapsed` / `row_h = height_px_override` は master_row から複製。
+/// 描画 / press path で `t.id == MASTER_TRACK_ID` を見て「Master ラベル + neutral gray header + mute/solo
+/// 非表示 + clip 系 EditRequest 抑制」 を追加する責務は **呼び出し側** (= `arrangement()` 本体)。
+///
+/// name フィールドは "Master" を入れるが、 描画 path は `t.id == MASTER_TRACK_ID` を見て label を直接
+/// "Master" で描く (= caller がローカライズを差し替える余地は別 entry で議論、 #034 でも当面英語固定で確定)。
+#[must_use]
+fn synthesize_master_track(master: &ArrangementMasterRow) -> ArrangementTrack {
+    ArrangementTrack {
+        id: MASTER_TRACK_ID,
+        name: Arc::from("Master"),
+        muted: false,
+        solo: false,
+        clips: Vec::new(),
+        volume: 1.0,
+        parent_id: None,
+        depth: 0,
+        collapsed: false,
+        automation_lanes_collapsed: master.automation_lanes_collapsed,
+        automation_lanes: master.automation_lanes.clone(),
+        row_h: master.height_px_override,
+    }
 }
 
 /// M14 Phase 63n-1 (#028): visible track 群の prefix sum row top (`tops.len() == visible_tracks.len() + 1`)。
@@ -4065,6 +4185,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         selected_automation_clips: &[AutomationClipKey],
         selected_automation_points: &[AutomationPointKey],
         style: &ArrangementStyle,
+        // M14 Phase 63n-10 (#034): arrangement 上端に表示する master row (song-level automation)。
+        // `None` で旧挙動完全互換 (= master row 無し、 通常 track 群のみ)。 `Some(&master)` で上端 1 行
+        // ("Master" 固定 label + 折り畳み可能な automation lane 群) を描画 / 編集対象に加える。 master の
+        // automation lane は通常 track と同じ `ArrangementEditRequest` (`AddAutomationPoint` 等) を発火
+        // するが、 `lane.track = MASTER_TRACK_ID` (= u32::MAX) で master と通常 track を識別する規約
+        // (daw_01 conversation #034 で確定)。
+        master_row: Option<&ArrangementMasterRow>,
         make_edit: F,
     ) -> ArrangementResponse
     where
@@ -4107,13 +4234,27 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // `clip_to_rect` / `track_index_from_y` の `track_index` 引数は visible-idx と解釈される。
         // tracks_for_draw (heavy() / 描画用、 後述 optimistic reorder 適用版) も同じ visibility 集合。
         let visible_indices_press: Vec<usize> = compute_visible_indices(tracks);
-        let visible_tracks: Vec<ArrangementTrack> = visible_indices_press
+        // M14 Phase 63n-10 (#034): master_row を synthetic `ArrangementTrack` (id = `MASTER_TRACK_ID`、
+        // clips 空、 mute/solo false、 automation_lanes は master_row から複製) として `visible_tracks[0]`
+        // に prepend。 既存 hit-test / 描画コードを **そのまま reuse** できる (= clips が空なので
+        // MIDI/Audio clip drag は自然に no-op、 automation_lanes は通常 track と同 schema)。 「Master」
+        // ラベル描画 / mute/solo button 非表示 / clip 系 EditRequest 抑制は描画 / 押下 path で
+        // `t.id == MASTER_TRACK_ID` 分岐を入れて対処。
+        //
+        // `visible_indices_press` は **caller's tracks の index 列**で master の caller index は無いため
+        // この Vec は変更しない (= 後段の clone source は `tracks` だが master 経路は別ロジック)。
+        let mut visible_tracks: Vec<ArrangementTrack> = visible_indices_press
             .iter()
             .map(|&i| tracks[i].clone())
             .collect();
+        if let Some(master) = master_row {
+            visible_tracks.insert(0, synthesize_master_track(master));
+        }
         // M14 Phase 63n-1 (#028): visible track の prefix-sum row tops。 lane 0 個 (= 既存挙動)
         // では `tops[i] = lanes.y - track_top + i * track_row_h` と等価。 expand 中の lane 群が
         // ある track 以降は次 track 以降の row top が下にずれる (= 描画 / hit-test SSoT)。
+        // M14 Phase 63n-10 (#034): `visible_tracks[0]` に master_row が prepend されていれば、 master の
+        // 高さ + lanes 高さ込みの prefix sum が自動で組まれる (= 通常 track と同じ helper を再利用)。
         let press_tops =
             visible_track_row_tops(&visible_tracks, lanes.y, view.track_top, view.track_row_h);
         // M14 Phase 63c (#016): collapsed 後でも「Group A は子を持つ track」 と判定するため、
@@ -4406,10 +4547,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                             && layout.lane_disc_rect.contains(px, py);
                         if in_lane_disclosure {
                             press_lane_toggle = Some(t.id);
-                        } else if !in_small_button && !in_disclosure {
+                        } else if !in_small_button && !in_disclosure && t.id != MASTER_TRACK_ID {
                             // M14 Phase 63c (#016): multi-select 中の drag は selected_tracks をまとめて
                             // 移動するため、 source_track_ids に selected を全部入れる (clicked が selected
                             // に含まれていなければ単独 drag = `vec![clicked]`)。
+                            // M14 Phase 63n-10 (#034): master row は reorder 対象外 (= 上端固定、 daw_01
+                            // #034 §A 仕様)。 anchor_track_id に MASTER_TRACK_ID が入ると `arr_tracks` に
+                            // 該当 id が存在しない → caller の reorder 実装が空振りする (= 結果 no-op だが
+                            // session 立ち上げ自体が無駄、 明示的に skip)。
                             let source_ids: Vec<u32> = if selected_tracks.contains(&t.id) {
                                 selected_tracks.to_vec()
                             } else {
@@ -7190,6 +7335,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 }
             } else if let Some(idx) = track_index_from_y(cy, lanes.y, &press_tops)
                 && let Some(t) = visible_tracks.get(idx)
+                // M14 Phase 63n-10 (#034): master row 上で MIDI clip 作成 (`DoubleClickEmpty`) を発火しない
+                // (= daw_01 #034 §G 確認、 master row の body 部は automation lane の clip dblclick のみ
+                // 受け付け、 main row body は clip 概念を持たない)。
+                && t.id != MASTER_TRACK_ID
             {
                 // track row の空き dblclick (lane row では automation_lane_at が Some を返して
                 // 上の分岐で吸収済 → ここに来るのは track row のみ)。
@@ -7239,6 +7388,57 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let row =
                     Rect { x: header_pane.x, y: row_y, w: header_pane.w, h: view.track_row_h };
                 if row.y + row.h < header_pane.y || row.y > header_pane.y + header_pane.h {
+                    continue;
+                }
+
+                // M14 Phase 63n-10 (#034): master row 専用 header 描画。 mute/solo button / volume band /
+                // group disclosure / row click → SelectTrack の全 path を skip し、 neutral gray 背景 +
+                // "Master" label + lane disclosure (`▶`/`▼`) のみを描画する (daw_01 #034 §B 仕様)。
+                // 通常 track 経路の `selected_tracks` / `is_group_set` 判定とは独立 (master は selection
+                // 対象外、 group でもない、 = 「特殊な行」 として描画分岐)。
+                if t.id == MASTER_TRACK_ID {
+                    self.panel(("arr_master_thbg", 0_u32), row, style.master_row_color, 0.0);
+                    let indent = f32::from(t.depth) * style.indent_px; // 0 固定だが既存 idiom 維持
+                    let row_for_layout = Rect {
+                        x: row.x + indent,
+                        y: row.y,
+                        w: (row.w - indent).max(2.0),
+                        h: row.h,
+                    };
+                    let layout = header_row_layout(row_for_layout, 0.0); // volume band 無し
+                    // "Master" label を name_rect に push_text (button にはしない = click は selection 経路に
+                    // 流さない)。 font_size は style.master_row_label_size、 色は master_row_label_color。
+                    let label_rect = layout.name_rect;
+                    self.push_text(GlyphArea {
+                        text: Arc::from("Master"),
+                        left: label_rect.x + 4.0,
+                        top: label_rect.y
+                            + (label_rect.h - style.master_row_label_size * 1.2) * 0.5,
+                        font_size: style.master_row_label_size,
+                        line_height: style.master_row_label_size * 1.2,
+                        color: style.master_row_label_color,
+                        clip_rect: Some(label_rect),
+                    });
+                    // M14 Phase 63n-10 (#034): lane disclosure (`+` / `-`) を master row でも描画 (= 通常
+                    // track と同 idiom)。 click 検出は press block 経由で `press_lane_toggle = Some(t.id)`
+                    // (= `MASTER_TRACK_ID`) が立ち、 loop 後に `ToggleTrackAutomationCollapsed
+                    // { track: MASTER_TRACK_ID }` が発火する SSoT。
+                    if !t.automation_lanes.is_empty() {
+                        let lane_disc = layout.lane_disc_rect;
+                        let label = if t.automation_lanes_collapsed { "+" } else { "-" };
+                        self.push_text(GlyphArea {
+                            text: label.into(),
+                            left: lane_disc.x,
+                            top: lane_disc.y
+                                + (lane_disc.h - style.automation_disclosure_size * 1.2) * 0.5,
+                            font_size: style.automation_disclosure_size,
+                            line_height: style.automation_disclosure_size * 1.2,
+                            color: style.disclosure_color,
+                            clip_rect: Some(lane_disc),
+                        });
+                    }
+                    // Response.track_header_rects に積む (caller が master row の rect 領域を識別可能に)。
+                    response.track_header_rects.push((t.id, row));
                     continue;
                 }
 
@@ -8078,6 +8278,7 @@ mod tests {
                     &[],
                     &[],
                     &style,
+                    None,
                     |_| Edit::mutate(|_: &mut Model| {}),
                 );
                 *observed_cb.lock().unwrap() = resp.clip_rects.clone();
@@ -8143,6 +8344,7 @@ mod tests {
                     &[],
                     &[],
                     &style,
+                    None,
                     |_| Edit::mutate(|_: &mut Model| {}),
                 );
                 *observed_cb.lock().unwrap() = resp.clip_rects.clone();
@@ -8209,6 +8411,7 @@ mod tests {
                     &[],
                     &[],
                     &style,
+                    None,
                     |_| Edit::mutate(|_: &mut Model| {}),
                 );
                 *observed_cb.lock().unwrap() = resp.clip_rects.clone();
@@ -8414,6 +8617,7 @@ mod tests {
                 &[],
                 &[],
                 &style,
+                None,
                 move |req| match req {
                     ArrangementEditRequest::SetTrackRowH(h) => {
                         observed_cb.lock().unwrap().push("SetTrackRowH");
@@ -8499,6 +8703,7 @@ mod tests {
                 &[],
                 &[],
                 &style,
+                None,
                 |_| Edit::mutate(|()| {}),
             );
         });
@@ -8853,6 +9058,7 @@ mod tests {
                 &[],
                 &[],
                 &style,
+                None,
                 move |req| {
                     if let ArrangementEditRequest::SetPlayheadBeat(b) = req {
                         observed_cb.lock().unwrap().push(b);
@@ -8917,6 +9123,7 @@ mod tests {
                 &[],
                 &[],
                 &style,
+                None,
                 move |req| {
                     if matches!(req, ArrangementEditRequest::SetPlayheadBeat(_)) {
                         *seek_log_cb.lock().unwrap() += 1;
@@ -8988,6 +9195,7 @@ mod tests {
                 &[],
                 &[],
                 &style,
+                None,
                 move |req| {
                     if let ArrangementEditRequest::SetPlayheadBeat(b) = req {
                         observed_cb.lock().unwrap().push(b);
@@ -9052,6 +9260,7 @@ mod tests {
                     &[],
                     &[],
                     &style,
+                    None,
                     move |req| {
                         if let ArrangementEditRequest::SetPlayheadBeat(b) = req {
                             observed_cb.lock().unwrap().push(b);
@@ -9313,6 +9522,7 @@ mod tests {
                     &[],
                     &[],
                     &style,
+                    None,
                     move |req| {
                         if let ArrangementEditRequest::SetLoopRange { start, end } = req {
                             observed_cb.lock().unwrap().push((start, end));
@@ -9437,6 +9647,7 @@ mod tests {
                 &[],
                 &[],
                 &style,
+                None,
                 move |req| {
                     if matches!(req, ArrangementEditRequest::SetPlayheadBeat(_)) {
                         *seek_count_cb.lock().unwrap() += 1;
@@ -9881,6 +10092,7 @@ mod tests {
                 &[],
                 &[],
                 &style,
+                None,
                 move |req| {
                     if let ArrangementEditRequest::SetClipGainDb(deltas) = &req {
                         for d in deltas {
@@ -9917,6 +10129,7 @@ mod tests {
                 &[],
                 &[],
                 &style,
+                None,
                 move |req| {
                     if let ArrangementEditRequest::SetClipGainDb(deltas) = &req {
                         for d in deltas {
@@ -9953,6 +10166,7 @@ mod tests {
                 &[],
                 &[],
                 &style,
+                None,
                 move |req| {
                     if let ArrangementEditRequest::SetClipGainDb(deltas) = &req {
                         for d in deltas {
@@ -10036,6 +10250,7 @@ mod tests {
                 &[],
                 &[],
                 &style,
+                None,
                 move |req| {
                     match &req {
                         ArrangementEditRequest::SetClipFade(deltas) => {
@@ -10082,6 +10297,7 @@ mod tests {
                 &[],
                 &[],
                 &style,
+                None,
                 move |req| {
                     match &req {
                         ArrangementEditRequest::SetClipFade(deltas) => {
@@ -10128,6 +10344,7 @@ mod tests {
                 &[],
                 &[],
                 &style,
+                None,
                 move |req| {
                     match &req {
                         ArrangementEditRequest::SetClipFade(deltas) => {

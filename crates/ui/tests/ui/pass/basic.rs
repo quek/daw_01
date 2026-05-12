@@ -193,6 +193,7 @@ fn main() {
                 &m.arr_selected_automation_clips,
                 &m.arr_selected_automation_points,
                 &arr_style,
+                None,
                 |req| match req {
                     ArrangementEditRequest::SelectClips { .. } => {
                         Edit::mutate(|_m: &mut Model| {})

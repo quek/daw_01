@@ -166,6 +166,7 @@ fn run_arrangement_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: F
             &[],
             &model.selected_points,
             &style,
+            None,
             |req| match req {
                 ArrangementEditRequest::SetLaneEnabled { lane, enabled } => {
                     Edit::mutate(move |mm: &mut ObsModel| {

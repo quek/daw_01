@@ -149,6 +149,7 @@ fn run_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: FrameInput) {
             &[],
             &[],
             &style,
+            None,
             |req| match req {
                 ArrangementEditRequest::MoveAutomationClips(deltas) => {
                     Edit::mutate(move |mm: &mut ObsModel| {

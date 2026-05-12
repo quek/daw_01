@@ -51,17 +51,16 @@ pub use widgets::time_grid::{BarBeatGridStyle, TimeRulerStyle};
 pub use widgets::arrangement::{
     ArrangementAutomationClip, ArrangementAutomationLane, ArrangementAutomationPoint,
     ArrangementClip, ArrangementClipAudioEdit, ArrangementCurveKind, ArrangementEditRequest,
-    ArrangementResponse, ArrangementStyle, ArrangementTrack, ArrangementView, AutomationClipKey,
-    AutomationLaneHeaderLayout, AutomationLaneKey, AutomationPointKey, ClipDragKind,
-    ClipFadeCurveDelta, ClipFadeDelta, ClipGainDelta, ClipKey, FadeCurve, FadeEdge, LoopBandHit,
-    MoveAutomationClipDelta, MoveAutomationPointDelta, MoveClipDelta, ResizeAutomationClipDelta,
-    ResizeClipDelta, SelectModifier, SetAutomationCurveParamKind,
-    automation_clip_zone_at, automation_lane_at,
-    automation_lane_header_layout, automation_lane_key_at_y,
-    automation_lane_resize_splitter_at, automation_lanes_total_h, automation_point_at,
-    clip_hit, clip_to_rect, lane_disclosure_rect_for, loop_band_hit_kind,
-    track_index_from_y, track_row_height, track_row_resize_splitter_at,
-    visible_track_row_tops,
+    ArrangementMasterRow, ArrangementResponse, ArrangementStyle, ArrangementTrack, ArrangementView,
+    AutomationClipKey, AutomationLaneHeaderLayout, AutomationLaneKey, AutomationPointKey,
+    ClipDragKind, ClipFadeCurveDelta, ClipFadeDelta, ClipGainDelta, ClipKey, FadeCurve, FadeEdge,
+    LoopBandHit, MASTER_TRACK_ID, MoveAutomationClipDelta, MoveAutomationPointDelta, MoveClipDelta,
+    ResizeAutomationClipDelta, ResizeClipDelta, SelectModifier, SetAutomationCurveParamKind,
+    automation_clip_zone_at, automation_lane_at, automation_lane_header_layout,
+    automation_lane_key_at_y, automation_lane_resize_splitter_at, automation_lanes_total_h,
+    automation_point_at, clip_hit, clip_to_rect, effective_master_row_h, lane_disclosure_rect_for,
+    loop_band_hit_kind, master_row_lanes_total_h, master_row_total_h, track_index_from_y,
+    track_row_height, track_row_resize_splitter_at, visible_track_row_tops,
 };
 pub use widgets::automation::{AutomationCurveResponse, AutomationCurveStyle};
 pub use widgets::checkbox::CheckboxResponse;

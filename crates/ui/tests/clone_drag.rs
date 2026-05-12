@@ -145,6 +145,7 @@ fn arr_frame(host: &mut UiHost<ArrModel>, m: &mut ArrModel, input: FrameInput, s
             &[],
             &[],
             &style,
+            None,
             |req| match req {
                 ArrangementEditRequest::SelectClips { next, .. } => {
                     Edit::mutate(move |mm: &mut ArrModel| {

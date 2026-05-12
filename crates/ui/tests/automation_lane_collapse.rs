@@ -132,6 +132,7 @@ fn run_arrangement_frame(
             &[],
             &[],
             &style,
+            None,
             |req| match req {
                 ArrangementEditRequest::ToggleTrackAutomationCollapsed { track } => {
                     Edit::mutate(move |mm: &mut LaneToggleModel| {

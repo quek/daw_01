@@ -17,11 +17,11 @@
 use std::sync::Arc;
 
 use daw_ui_core::{
-    ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView,
-    BarBeatGridStyle, ClipKey, DialogResult, Edit, FaderResponse, FileDialogFilter,
-    InputAccumulator, LevelMeterStyle, ListViewStyle, MenuItemSpec, MeterBallistic, ModalStyle,
-    Orientation, ReorderableListEditRequest, ReorderableListStyle, SnapConfig, TimeMapping,
-    TimeRulerStyle, UiHost, ViewportState1D,
+    ArrangementClip, ArrangementEditRequest, ArrangementMasterRow, ArrangementStyle,
+    ArrangementTrack, ArrangementView, BarBeatGridStyle, ClipKey, DialogResult, Edit, FaderResponse,
+    FileDialogFilter, InputAccumulator, LevelMeterStyle, ListViewStyle, MASTER_TRACK_ID,
+    MenuItemSpec, MeterBallistic, ModalStyle, Orientation, ReorderableListEditRequest,
+    ReorderableListStyle, SnapConfig, TimeMapping, TimeRulerStyle, UiHost, ViewportState1D,
 };
 use daw_ui_platform::{AppEvent, AppHost, WindowBackend, winit_backend};
 use daw_ui_renderer::{Color, Rect, RectCommand, Renderer, Scene};
@@ -130,6 +130,12 @@ struct DawModel {
     /// で hue 化して `ArrangementClip.share_group_color` に渡す (golden-ratio で隣接 group が
     /// 色相的に十分離れる、 well-known hash trick)。
     arr_next_share_group_id: u32,
+    /// M14 Phase 63n-10 (#034): song-level automation を表す master row (SongTempo / SongTimeSigNumerator
+    /// 模擬)。 daw_01 の `Song.song_lanes: Vec<AutomationLane>` の widget 側 representation。
+    /// `arrangement()` に `Some(&model.arr_master_row)` で渡すと上端 1 行として描画される。
+    /// EditRequest の `track_id == MASTER_TRACK_ID` 経路は master 専用の lane store を mutate する
+    /// (= 通常 track の `arr_automation_lanes` HashMap と独立、 SSoT 分離)。
+    arr_master_row: ArrangementMasterRow,
     /// `BeginRenameTrack(id)` 受信時にセット。`Some(id)` 中は該当 track header 上に
     /// `text_input_at_focused` を重ね描画 (M11 Phase 52 で `text_input_at` から差し替え、
     /// 「初回 show 自動 focus」が widget 内蔵で boilerplate ゼロ)。Enter / blur / ESC で
@@ -141,6 +147,7 @@ struct DawModel {
 }
 
 impl DawModel {
+    #[allow(clippy::too_many_lines)]
     fn new() -> Self {
         let mut tracks: Vec<DawTrack> = Vec::with_capacity(N_TRACKS);
         for ti in 0..N_TRACKS {
@@ -240,6 +247,25 @@ impl DawModel {
             arr_track_row_h: std::collections::HashMap::new(),
             arr_next_share_group_id: 0,
             arr_rename_target: None,
+            // M14 Phase 63n-10 (#034): SongTempo 模擬の lane 1 つで起動 (= 上端 master row が "Master" と
+            // tempo curve を 1 行で表示)。 daw_01 conversation #034 §C 仕様に従う初期値。 ▶/▼ disclosure
+            // で折り畳み確認、 dblclick で point 追加 (既存 EditRequest 流用 + `track == MASTER_TRACK_ID`
+            // 経路) を visual verify する。
+            arr_master_row: ArrangementMasterRow {
+                automation_lanes_collapsed: false,
+                automation_lanes: vec![daw_ui_core::ArrangementAutomationLane {
+                    id: 0,
+                    label: Arc::from("Tempo"),
+                    icon_glyph: 'T',
+                    color: Color::rgb(0.95, 0.55, 0.20),
+                    enabled: true,
+                    visible: true,
+                    height_px: 60,
+                    default_value_norm: 0.5,
+                    clips: Vec::new(),
+                }],
+                height_px_override: None,
+            },
             demo_chain: vec![
                 "MIDI Quantize".to_string(),
                 "Synth".to_string(),
@@ -1128,6 +1154,8 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
         &m.arr_selected_automation_clips,
         &m.arr_selected_automation_points,
         &style,
+        // M14 Phase 63n-10 (#034): SongTempo 模擬の master row を上端に表示。
+        Some(&m.arr_master_row),
         move |req| match req {
             ArrangementEditRequest::SelectClips { next, .. } => {
                 let next_v = next;
@@ -1584,7 +1612,12 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
             }),
             ArrangementEditRequest::ToggleTrackAutomationCollapsed { track } => {
                 Edit::mutate(move |mm: &mut DawModel| {
-                    if mm.arr_track_automation_collapsed.contains(&track) {
+                    if track == MASTER_TRACK_ID {
+                        // M14 Phase 63n-10 (#034): master row 専用 toggle (= 通常 track の HashSet 経路と
+                        // 独立、 master_row.automation_lanes_collapsed SSoT を直接 flip)。
+                        mm.arr_master_row.automation_lanes_collapsed =
+                            !mm.arr_master_row.automation_lanes_collapsed;
+                    } else if mm.arr_track_automation_collapsed.contains(&track) {
                         mm.arr_track_automation_collapsed.remove(&track);
                     } else {
                         mm.arr_track_automation_collapsed.insert(track);
