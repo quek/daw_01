@@ -162,17 +162,21 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         "instrument plugin_id should register in track_plugin_ids"
     );
 
-    // Step 2: Play。 audio_tx に LoadSong + Play が出るはず。
+    // Step 2: Play。 audio_tx に Play のみが出るはず。
+    // dbca77f 以降、 play() は LoadSong を再送しない (= 旧バグ: 大量 WAV の
+    // とき audio engine の compile_audio_schedule = decode + schedule build
+    // が同期で 2 秒以上かかり再生開始が遅延)。 LoadSong は
+    // sync_song_to_plugin_host 経由で都度 audio engine に届いている前提。
     app.handle_event(AppEvent::Play);
     let audio_msgs = drain(&mut audio_rx);
     assert!(
-        audio_msgs.iter().any(|m| matches!(m, MainToChild::LoadSong(_))),
-        "Play should send LoadSong to audio: {:?}",
+        audio_msgs.iter().any(|m| matches!(m, MainToChild::Play)),
+        "Play should send Play to audio: {:?}",
         audio_msgs
     );
     assert!(
-        audio_msgs.iter().any(|m| matches!(m, MainToChild::Play)),
-        "Play should send Play to audio: {:?}",
+        !audio_msgs.iter().any(|m| matches!(m, MainToChild::LoadSong(_))),
+        "Play does NOT re-send LoadSong (dbca77f): {:?}",
         audio_msgs
     );
     assert!(app.is_playing, "is_playing should be true after Play");
