@@ -329,6 +329,50 @@ enum PluginCommand {
     Shutdown,
 }
 
+/// Phase 6 review fix: `shared_memory` crate は Windows で
+/// `%TEMP%/shared_memory-rs/<unique_id>` を `create_new(true)` で作り、
+/// 重複名 (= 別プロセス / 過去残骸) を弾く設計。 daw_01 plugin_host が
+/// 異常終了で leftover を残すと、 Windows の PID 再利用で次セッションが
+/// 同 PID + plugin_id=1 で衝突して plugin load 失敗。
+///
+/// 起動時に「自分の PID 配下」 の leftover (= `daw_01_pd_<my_pid>_*`) を
+/// 削除する。 自分の PID 配下なら過去オーナーは確実に死亡 (= Windows は
+/// PID 再利用前に旧 process を完全 reap する)、 安全に削除可能。 他 PID
+/// 配下の leftover は触らない (= 他 daw_01 plugin_host が現役の可能性)。
+///
+/// 失敗は warn ログのみ (= 起動を妨げず、 実際の plugin load で
+/// `failed to create shmem` が再発したら user に見える)。
+fn cleanup_leftover_shmems(my_pid: u32) {
+    let dir = std::env::temp_dir().join("shared_memory-rs");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let prefix = format!("daw_01_pd_{my_pid}_");
+    let mut removed = 0usize;
+    let mut failed = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else { continue };
+        if !name_str.starts_with(&prefix) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(e) => {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    error = %e,
+                    "cleanup_leftover_shmems: failed to remove (= 別プロセスがまだ open している可能性)"
+                );
+                failed += 1;
+            }
+        }
+    }
+    if removed > 0 || failed > 0 {
+        tracing::info!(my_pid, removed, failed, "cleanup_leftover_shmems: done");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     common::logging::init_tracing();
@@ -451,6 +495,16 @@ fn plugin_main_loop(
     //   - `plugin_registry` is the lock-free `plugin_id` → entry table
     //     read by the worker pool during dispatch.
     let plugin_host_pid = std::process::id();
+    // Phase 6 review fix: `shared_memory` crate (Windows) は temp dir に
+    // persistent file (`%TEMP%/shared_memory-rs/daw_01_pd_<pid>_<id>`) を作り、
+    // `create_new(true)` で重複を弾く。 daw_01 が crash / 異常終了で
+    // クリーンアップしそびれると leftover が残り続け、 Windows が PID を
+    // 再利用したときに新セッションが「自分の名前空間」 の leftover と衝突して
+    // plugin load が失敗する (user 報告: ERROR failed to create shmem
+    // daw_01_pd_<pid>_1)。 起動時に自分の PID 配下の leftover を一掃する。
+    // 別 PID 配下の leftover は他プロセスが現役の可能性があるので触らない
+    // (= 過去 PID 由来でも、 同 PID の新プロセスがあれば共有中)。
+    cleanup_leftover_shmems(plugin_host_pid);
     let mut next_plugin_id: u32 = 1;
     let mut plugin_shmems: HashMap<u32, common::process_data::ProcessDataHandle> = HashMap::new();
     let mut plugin_lookup: HashMap<(u32, PluginSlot), u32> = HashMap::new();
