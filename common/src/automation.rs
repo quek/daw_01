@@ -284,6 +284,30 @@ pub fn thin_collinear_and_insert(
     ThinInsertResult { insert_at, removed_prev }
 }
 
+/// Phase 5 Step 5.2 (`docs/plan_automation.md` §10): evaluate the song-level
+/// tempo at the given `beat` position。 SongTempo lane が存在し enabled なら
+/// その curve eval 結果を return、 無ければ `song.bpm` を constant として
+/// return。 audio thread が buffer 頭で呼び、 結果を `current_bpm` として
+/// 当該 buffer の sample-to-beat 変換 / set_pd_transport / automation ramp
+/// 等に渡す。 RT 安全 (= heap alloc 無し、 lane_value_at の浮動小数演算のみ)。
+///
+/// `beat` は累積 beat-domain playhead (= engine が integrate 維持)。
+pub fn evaluate_song_tempo(song: &Song, beat: f64) -> f32 {
+    for lane in &song.song_lanes {
+        if !lane.enabled {
+            continue;
+        }
+        if matches!(lane.target, AutomationTarget::SongTempo) {
+            let v = lane_value_at(lane, &song.clip_contents, beat);
+            // SongTempo の plain value は BPM (= song.bpm と同単位)。 sanity
+            // clamp: 1 BPM 未満は不正 (divide by zero リスク)、 上限 1000 BPM
+            // で防御 (= 通常 user は 20..=300 程度)。
+            return (v as f32).clamp(1.0, 1000.0);
+        }
+    }
+    song.bpm
+}
+
 /// Find the `AutomationClip` whose half-open range
 /// `[start_beat, start_beat + length_beats)` contains `song_beat`.
 /// Returns the *first* match — overlapping clips on the same lane are

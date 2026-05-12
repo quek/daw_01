@@ -218,6 +218,20 @@ pub struct LocalState {
     /// detect Play/Stop transitions and reset the playhead / queue
     /// note-offs cleanly.
     pub playing: bool,
+    /// Phase 5 Step 5.2 (`docs/plan_automation.md` §10): accumulated
+    /// beat-domain playhead。 audio thread が buffer 頭で
+    /// `evaluate_song_tempo(song, playhead_beats)` を呼んで current_bpm を
+    /// 引き、 buffer 末で `playhead_beats += frames * current_bpm / (60 * SR)`
+    /// で advance する。 Play edge / SeekTo IPC では sample-domain playhead +
+    /// 現 song.bpm で初期推定 (過去の tempo 履歴を再生できないので average
+    /// 線形換算)、 user 体感での timing drift は小さい。
+    pub playhead_beats: f64,
+    /// Phase 5 Step 5.2: 前 buffer 末の sample-domain playhead。 次 buffer 頭
+    /// で `shared.playhead != last_known_playhead` のとき seek が発生したと
+    /// 判定し、 `playhead_beats` を再初期化する (= 過去の tempo 履歴を
+    /// 再生できないので song.bpm で linear 推定)。 初期値 `u64::MAX` は
+    /// 「未確定」 (= 最初の buffer は必ず seek 扱いで初期化される)。
+    pub last_known_playhead: u64,
     /// Pending IPC commands from the receive loop. Drained at the top
     /// of every `process_buffer` so `EngineShared` snapshots are fresh
     /// before dispatch.
@@ -260,6 +274,8 @@ impl LocalState {
             master_l: vec![0.0; max_frames],
             master_r: vec![0.0; max_frames],
             playing: false,
+            playhead_beats: 0.0,
+            last_known_playhead: u64::MAX,
             cmd_rx,
             shared,
             cached_schedule: Schedule::empty(),
@@ -516,6 +532,31 @@ impl LocalState {
         let recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)> =
             &recording_lanes_g;
 
+        // Phase 5 Step 5.2: seek 検出 + playhead_beats 同期。 前 buffer 末で
+        // 記録した `last_known_playhead` と current playhead を比較し、 一致
+        // していなければ (= IPC SeekTo / Play edge / loop wrap / 起動直後)
+        // 過去の tempo 履歴を再生できないので、 song.bpm を constant とした
+        // linear 推定で playhead_beats を再初期化する。
+        if playhead != self.last_known_playhead {
+            let song_bpm =
+                song_ref.map(|s| s.bpm.max(1.0)).unwrap_or(120.0) as f64;
+            let sr = sample_rate as f64;
+            self.playhead_beats = if sr > 0.0 {
+                playhead as f64 * song_bpm / (60.0 * sr)
+            } else {
+                0.0
+            };
+        }
+        // 今 buffer の effective bpm を SongTempo lane から評価する。
+        // song = None なら 120.0 default、 SongTempo lane 無しなら song.bpm。
+        // 当該 buffer 内では tempo 定数として扱う (= sub-buffer の tempo
+        // change は scope 外、 1 buffer = ~5..20ms なので user 体感には
+        // 影響なし)。
+        let current_bpm: f32 = match song_ref {
+            Some(s) => common::automation::evaluate_song_tempo(s, self.playhead_beats),
+            None => 120.0,
+        };
+
         if let Some(song) = song_ref {
             let any_solo = song.tracks.iter().any(|t| t.solo);
             let n_tracks = song.tracks.len().min(MAX_TRACKS);
@@ -551,6 +592,7 @@ impl LocalState {
                     any_solo,
                     &self.cached_schedule.input_delay_per_track,
                     recording_lanes,
+                    current_bpm,
                 );
             } else {
                 let worker_sync = worker_syncs_g.first();
@@ -579,6 +621,7 @@ impl LocalState {
                         any_solo,
                         input_delay,
                         recording_lanes,
+                        current_bpm,
                     );
                 }
             }
@@ -605,6 +648,7 @@ impl LocalState {
                 any_solo,
                 playhead,
                 recording_lanes,
+                current_bpm,
             );
 
             // Publish per-track peak meters into the shared AudioBridge
@@ -677,6 +721,17 @@ impl LocalState {
             } else {
                 song_ended(song_ref, sample_rate, new_ph)
             };
+            // Phase 5 Step 5.2: playhead_beats を current_bpm で 1 buffer 分
+            // advance する。 loop wrap は下で new_ph を上書きするので、
+            // wrap 後に last_known_playhead = new_ph を記録すれば次 buffer
+            // 頭で seek 扱いになり playhead_beats が再初期化される (= loop
+            // start の beat 位置から再開、 tempo 履歴は失うが loop 内で
+            // accumulate し直す)。
+            let sr = sample_rate as f64;
+            if sr > 0.0 {
+                self.playhead_beats +=
+                    n as f64 * f64::from(current_bpm) / (60.0 * sr);
+            }
             if reached_end {
                 for s in self.scratch.iter_mut() {
                     for &k in &s.state.active_notes {
@@ -699,6 +754,14 @@ impl LocalState {
                 }
             }
             shared.playhead.store(new_ph, Ordering::Release);
+            self.last_known_playhead = new_ph;
+        } else {
+            // Stop 中は audio thread が playhead を進めないが、 GUI からの
+            // SeekTo IPC は shared.playhead を書き換える可能性がある。
+            // last_known_playhead を current 値で同期して、 次 Play 開始
+            // 時の seek 検出ロジックを誤発火させない (= stop 中の seek は
+            // 単に位置を変えるだけで playhead_beats 再計算が必要)。
+            self.last_known_playhead = playhead;
         }
     }
 }
@@ -709,9 +772,17 @@ impl LocalState {
 /// `plugin.process()` call. `song = None` (engine init / no song
 /// loaded) leaves the default constants set by `ProcessData::empty()`
 /// (120 BPM / 4/4 / no loop).
-pub fn set_pd_transport(pd: &mut common::process_data::ProcessData, song: Option<&Song>) {
+/// Phase 5 Step 5.2: `effective_bpm` is the SongTempo lane evaluated
+/// at the buffer-start beat (= what the plugin sees as `clap_event_transport
+/// .tempo`)。 引数で受け取るのは song-domain の `song.bpm` (= constant
+/// base BPM) と区別するため。
+pub fn set_pd_transport(
+    pd: &mut common::process_data::ProcessData,
+    song: Option<&Song>,
+    effective_bpm: f32,
+) {
     let Some(song) = song else { return };
-    pd.bpm = song.bpm.max(1.0);
+    pd.bpm = effective_bpm.max(1.0);
     pd.tsig_num = song.time_sig.0 as u16;
     pd.tsig_denom = song.time_sig.1 as u16;
     pd.loop_start_beats = song.loop_start_beat;
@@ -759,6 +830,10 @@ pub fn process_track_owned(
     any_solo: bool,
     input_delay_samples: u32,
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
+    // Phase 5 Step 5.2: 当該 buffer の effective bpm (= SongTempo lane 評価
+    // or song.bpm fallback)。 set_pd_transport / fill_track_param_ramps /
+    // fill_pd_param_events の sample-to-beat 変換に使う。
+    current_bpm: f32,
 ) {
     let n = frames as usize;
 
@@ -827,7 +902,7 @@ pub fn process_track_owned(
         pd.frames = frames;
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
-        set_pd_transport(pd, song);
+        set_pd_transport(pd, song, current_bpm);
         // Phase 2b: MIDI FX 宛 PluginParam automation を ParamValue event 化。
         if let Some(song) = song {
             crate::automation::fill_pd_param_events(
@@ -989,7 +1064,7 @@ pub fn process_track_owned(
         pd.frames = frames;
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
-        set_pd_transport(pd, song);
+        set_pd_transport(pd, song, current_bpm);
         // Phase 2b: automation の PluginParam target を ParamValue event 化。
         if let Some(song) = song {
             crate::automation::fill_pd_param_events(
@@ -1031,12 +1106,14 @@ pub fn process_track_owned(
         // lane this fills both buffers with the constant track strip
         // values; with a `Volume` / `Pan` lane each sample gets the
         // curve value. RT-safe: in-place writes only.
-        let bpm = song.map(|s| s.bpm).unwrap_or(120.0);
+        // Phase 5 Step 5.2: master が当該 buffer の effective bpm を
+        // current_bpm として渡してくる。 song.bpm fallback はもはや不要
+        // (= song = None なら process_buffer 側で current_bpm = 120.0)。
         crate::automation::fill_track_param_ramps(
             song,
             track_idx,
             sample_rate,
-            bpm,
+            current_bpm,
             playhead,
             frames,
             &mut scratch.volume_per_sample,
@@ -1119,6 +1196,7 @@ pub fn execute_schedule_post_dispatch(
     any_solo: bool,
     playhead: u64,
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
+    current_bpm: f32,
 ) {
     // `nodes` の不変参照と `delay_lines` の可変参照を同時に取りたい
     // (ApplyDelay で line を引きながら nodes を回すため)。 `Schedule`
@@ -1174,6 +1252,7 @@ pub fn execute_schedule_post_dispatch(
                     playing,
                     any_solo,
                     recording_lanes,
+                    current_bpm,
                 );
             }
             NodeOp::ApplyDelay {
@@ -1374,6 +1453,7 @@ fn run_group_fx_chain(
     playing: bool,
     any_solo: bool,
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
+    current_bpm: f32,
 ) {
     let n = frames as usize;
     let track_id = song_track.id;
@@ -1395,7 +1475,7 @@ fn run_group_fx_chain(
         pd.frames = frames;
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
-        set_pd_transport(pd, Some(song));
+        set_pd_transport(pd, Some(song), current_bpm);
         // Phase 2b: group fx 宛 PluginParam automation。
         crate::automation::fill_pd_param_events(
             pd,
@@ -1539,6 +1619,7 @@ mod sidechain_tests {
             false,
             0,
             &std::collections::HashSet::new(),
+            song.bpm,
         );
 
         for i in 0..FRAMES {

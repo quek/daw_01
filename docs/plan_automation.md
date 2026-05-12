@@ -1050,15 +1050,41 @@ Phase 5 は Step で分解して進める:
       `ParamGestureBegin/End { target: SongTempo / SongTimeSigNumerator }`
       を発火する
 
-#### Step 5.2: Audio engine tempo eval (= per-buffer での SongTempo lane 評価)
+#### Step 5.2: Audio engine tempo eval (= per-buffer での SongTempo lane 評価) ✅ (2026-05-11)
 
-- [ ] `daw_audio::engine::process_buffer` で SongTempo lane を現在 beat 位置
-      で評価し、 次 buffer の sample → beat 変換に使う (= 現状 constant
-      `song.bpm` を per-buffer evaluated bpm に置換)
-- [ ] `playhead_to_beat` / `beat_to_sample` ヘルパに tempo lane を渡す形に
-      refactor
-- [ ] recording 中の SongTempo lane は `recording_lanes` で curve eval bypass
-      → live BPM input が即時聞こえる (Step C-2 と同 idiom)
+per-buffer で SongTempo lane を評価して effective bpm を引き、 plugin の
+transport event / track param ramp / param event の sample-to-beat 変換に
+渡す。 sequencer / audio_clip_renderer (= MIDI / 音声 clip の tempo 追随) は
+scope 外 (= 旧 song.bpm 定数のまま、 別 phase で対応)。
+
+- [x] `common::automation::evaluate_song_tempo(song, beat) -> f32` helper:
+      SongTempo lane があれば curve eval 結果を 1..=1000 BPM で clamp、 無い
+      / disabled なら song.bpm fallback
+- [x] `LocalState.playhead_beats: f64` + `last_known_playhead: u64` field
+      追加。 process_buffer 頭で seek 検出 (= playhead != last_known) なら
+      `playhead_beats = playhead * song.bpm / (60 * SR)` で再初期化
+- [x] process_buffer で `current_bpm = evaluate_song_tempo(song,
+      playhead_beats)` を 1 度引き、 dispatch / process_track_owned /
+      run_group_fx_chain / execute_schedule_post_dispatch に `current_bpm:
+      f32` 引数として伝搬
+- [x] DispatchShared.current_bpm_bits (AtomicU32 of f32 bits) を追加、
+      master が `dispatch_and_wait` 内で store、 worker が `load(Acquire)` +
+      `f32::from_bits` で復元 → process_track_owned に渡す
+- [x] set_pd_transport に `effective_bpm` 引数を追加、 pd.bpm を current_bpm
+      で上書き (= plugin transport event の tempo が SongTempo 追随)
+- [x] fill_track_param_ramps の bpm param に current_bpm を渡す (= track
+      builtin Volume / Pan の curve eval が tempo 追随)
+- [x] buffer 末で `playhead_beats += frames * current_bpm / (60 * SR)`、
+      `last_known_playhead = new_ph` を記録 (loop wrap 後 / Stop 時の seek
+      検出にも対応)
+- [ ] **smoke test (Step 5.2)**: master lane (Step 5.1 完了後) に SongTempo
+      の curve を設置、 Play 中に curve に従って tempo 変化を聴覚で確認。
+      tempo-sync plugin (Step 5.3) の delay 時間 / arp 速度が curve に追随
+- [ ] sequencer (MIDI note tempo 追随) / audio_clip_renderer (audio clip
+      time-stretch) は scope 外 → Phase 5 follow-up で別途
+- [ ] recording 中の SongTempo lane bypass は Step 5.1 で transport BPM
+      input が gesture 発火するようになったら追加 wire (= 現状 BPM input は
+      gesture 経路に乗っていない)
 
 #### Step 5.3: CLAP_EVENT_TRANSPORT ✅ (2026-05-11)
 

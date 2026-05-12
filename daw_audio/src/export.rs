@@ -221,6 +221,7 @@ fn render_loop(
                 any_solo,
                 &schedule.input_delay_per_track,
                 &empty_recording_lanes,
+                song.bpm,
             );
         } else {
             let worker_sync = worker_syncs_g.first();
@@ -248,6 +249,7 @@ fn render_loop(
                     any_solo,
                     input_delay,
                     &empty_recording_lanes,
+                    song.bpm,
                 );
             }
         }
@@ -273,6 +275,7 @@ fn render_loop(
             any_solo,
             playhead,
             &empty_recording_lanes,
+            song.bpm,
         );
 
         // Compute block peak across the full block (for tail-silence

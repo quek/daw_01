@@ -81,6 +81,10 @@ pub struct DispatchShared {
     /// (= 全 lane eval、 旧挙動)。
     pub recording_lanes_ptr:
         AtomicPtr<std::collections::HashSet<(u32, common::model::AutomationTarget)>>,
+    /// Phase 5 Step 5.2: 当該 buffer の effective bpm (= SongTempo lane 評価
+    /// or song.bpm fallback) を f32 bits で atomic 配信。 workers が
+    /// `f32::from_bits(load())` で復元。
+    pub current_bpm_bits: AtomicU32,
 }
 
 unsafe impl Send for DispatchShared {}
@@ -110,6 +114,7 @@ impl DispatchShared {
             input_delays_base: AtomicPtr::new(std::ptr::null_mut()),
             n_input_delays: AtomicU32::new(0),
             recording_lanes_ptr: AtomicPtr::new(std::ptr::null_mut()),
+            current_bpm_bits: AtomicU32::new(120.0_f32.to_bits()),
         }
     }
 }
@@ -191,6 +196,7 @@ impl AudioWorkerPool {
         any_solo: bool,
         input_delay_per_track: &[u32],
         recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
+        current_bpm: f32,
     ) {
         let n_tracks = song.map(|s| s.tracks.len() as u32).unwrap_or(0);
         let n_tracks = n_tracks.min(scratch.len() as u32);
@@ -245,6 +251,9 @@ impl AudioWorkerPool {
             recording_lanes as *const _ as *mut _,
             Ordering::Release,
         );
+        self.shared
+            .current_bpm_bits
+            .store(current_bpm.to_bits(), Ordering::Release);
         // PR4.5: publish per-track input delay slice so workers can read
         // their track's value without locking. Empty slice (= no
         // sidechain wiring anywhere) → null pointer + len 0.
@@ -377,6 +386,10 @@ fn run_work_loop(shared: &DispatchShared) {
             // for the dispatch window via `dispatch_and_wait` 's local var.
             unsafe { &*recording_lanes_ptr }
         };
+    // Phase 5 Step 5.2: master が当該 buffer の effective bpm を atomic で
+    // 配信。 f32 bits を Acquire で load して復元する。
+    let current_bpm =
+        f32::from_bits(shared.current_bpm_bits.load(Ordering::Acquire));
 
     if scratch_base.is_null()
         || plugin_refs_ptr.is_null()
@@ -457,6 +470,7 @@ fn run_work_loop(shared: &DispatchShared) {
             any_solo,
             input_delay,
             recording_lanes,
+            current_bpm,
         );
     }
 }
