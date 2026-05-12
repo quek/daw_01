@@ -2,3 +2,7 @@
 /.claude/settings.local.json
 /.claude/scheduled_tasks.lock
 /.claude/worktrees/
+# session-internal transient files (PostToolUse / Stop hook が書き出す)。
+# session UUID が混ざるので glob で除外。
+/.claude/.session_events.*.log
+/.claude/.session_reflect_pending.md
