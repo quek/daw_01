@@ -1035,7 +1035,9 @@ pub fn process_track_owned(
             track_idx as usize,
             &mut scratch.track_l[..n],
             &mut scratch.track_r[..n],
-            playhead,
+            playhead_beats,
+            current_bpm,
+            sample_rate,
             frames,
         );
     }

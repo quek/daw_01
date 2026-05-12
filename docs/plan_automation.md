@@ -1107,7 +1107,18 @@ scope 外 (= 旧 song.bpm 定数のまま、 別 phase で対応)。
       beat + `current_bpm: f32`)、 process_track_owned に `playhead_beats: f64`
       引数を thread、 DispatchShared.playhead_beats_bits で worker に AtomicU64
       配信。 SongTempo curve に従って MIDI note の発音 / 終了タイミングが追随
-- [ ] audio_clip_renderer (audio clip time-stretch) は scope 外 → 別 phase で
+- [x] audio_clip_renderer beat-domain refactor ✅ (2026-05-12): `RenderedEvent`
+      を `start_frame/end_frame/fade_in_frames/fade_out_frames` (sample) から
+      `start_beat/end_beat/fade_in_beats/fade_out_beats` (beat) に置換 +
+      `nominal_bpm: f32` field 追加 (= compile 時の base bpm)。
+      `compile_audio_schedule` は beat-domain で events を保持 (sort も beat 基準)。
+      `render_audio_events` に `playhead_beats: f64` + `current_bpm: f32` +
+      `sample_rate: u32` 引数追加、 per-buffer で beat → sample 換算。
+      **Repitch mode は `pitch_ratio * current_bpm / nominal_bpm` で再生レートが
+      tempo に追随** (= vinyl 流の pitch shift も同時、 Bitwig / Ableton 流)。
+      Raw / Stretch / Slice mode は pitch_ratio 不変 (= 再生速度固定だが
+      trigger / end は beat 追随、 真の time-stretch DSP は別 phase)。
+      engine.rs / export.rs callsite を更新済
 - [ ] recording 中の SongTempo lane bypass は Step 5.1 で transport BPM
       input が gesture 発火するようになったら追加 wire (= 現状 BPM input は
       gesture 経路に乗っていない)
