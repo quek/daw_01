@@ -184,6 +184,36 @@ impl Song {
         self.song_lanes.iter().find(|l| &l.target == target)
     }
 
+    /// Phase 5 Step 5.1 (`docs/plan_automation.md` §10、 gui_01 #034): track と
+    /// master row を統一的に走査する mut accessor。 `track_id == MASTER_TRACK_ID`
+    /// なら `song_lanes` を、 そうでなければ該当 track の `automation_lanes`
+    /// を引く。 全 automation EditRequest handler から呼ばれる。
+    pub fn automation_lane_by_key_mut(
+        &mut self,
+        track_id: u32,
+        lane_id: u32,
+    ) -> Option<&mut AutomationLane> {
+        if track_id == MASTER_TRACK_ID {
+            self.song_lane_by_id_mut(lane_id)
+        } else {
+            self.track_by_id_mut(track_id)
+                .and_then(|t| t.lane_by_id_mut(lane_id))
+        }
+    }
+
+    /// Phase 5 Step 5.1: read-only counterpart of `automation_lane_by_key_mut`。
+    pub fn automation_lane_by_key(
+        &self,
+        track_id: u32,
+        lane_id: u32,
+    ) -> Option<&AutomationLane> {
+        if track_id == MASTER_TRACK_ID {
+            self.song_lane_by_id(lane_id)
+        } else {
+            self.track_by_id(track_id).and_then(|t| t.lane_by_id(lane_id))
+        }
+    }
+
     /// Re-assign stable ids to all tracks / clips after loading an older
     /// project file (or any save predating the id schema). Idempotent:
     /// records that already have non-zero ids are left untouched, and
@@ -1067,6 +1097,16 @@ pub struct Note {
 // - `ClipContent::Automation(AutomationContent { points })` stores the actual
 //   curve data. `#[serde(untagged)]` dispatch on `ClipContent` picks the
 //   variant based on the disjoint field set (`notes` / `events` / `points`).
+
+/// Phase 5 Step 5.1 (`docs/plan_automation.md` §10、 gui_01 #034): master row
+/// 由来の automation lane を identify する sentinel track id。 widget crate
+/// (`daw_ui_core::arrangement::MASTER_TRACK_ID`) と同値で mirror、 grep で
+/// 両 crate を追跡可能にする。 `AutomationLaneKey { track: MASTER_TRACK_ID,
+/// lane }` で master lane を表現、 EditRequest dispatch 側で
+/// `track == MASTER_TRACK_ID` で `Song.song_lanes` か `Track.automation_lanes`
+/// かを分岐する規約。 値は `u32::MAX` (= 通常 track id が 2^32 - 1 まで到達
+/// する現実的なシナリオは無い)。
+pub const MASTER_TRACK_ID: u32 = u32::MAX;
 
 /// What an `AutomationLane` automates.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]

@@ -324,6 +324,13 @@ pub struct AppData {
     /// プロジェクト保存対象ではない (= session-only): UI 状態は再起動で
     /// 既定 (全 collapsed) に戻る。
     pub expanded_automation_tracks: std::collections::HashSet<u32>,
+    /// gui_01 #034 (Phase 63n-10): master row の automation 展開状態。
+    /// `expanded_automation_tracks` と直交した 1 bool で持つ (= track id
+    /// 集合に MASTER_TRACK_ID を入れる方式は sentinel が混ざって SSoT が
+    /// 曖昧、 master 専用 field の方が intent が明瞭)。 起動時 false、
+    /// `ToggleTrackAutomationCollapsed { track_id: MASTER_TRACK_ID }` で flip。
+    /// session-only / Undo / save 対象外。
+    pub master_row_automation_expanded: bool,
     /// gui_01 #028 (M14 Phase 63n-3): 選択中の automation clip。 MIDI
     /// clip 用 `selected_clips` と直交 (= 同時に両方を持てる、 他 DAW
     /// 互換)。 widget の `SelectAutomationClips` で上書き、 widget へは
@@ -709,6 +716,7 @@ impl AppData {
             selected_track_ids: Vec::new(),
             collapsed_groups: std::collections::HashSet::new(),
             expanded_automation_tracks: std::collections::HashSet::new(),
+            master_row_automation_expanded: false,
             selected_automation_clips: Vec::new(),
             selected_automation_points: Vec::new(),
             last_touched_param: None,
@@ -2438,7 +2446,12 @@ impl AppData {
                 self.action_group_selected_tracks(&track_ids);
             }
             AppEvent::ToggleTrackAutomationCollapsed { track_id } => {
-                if !self.expanded_automation_tracks.insert(track_id) {
+                // gui_01 #034 (Phase 63n-10): master row の expansion は
+                // 通常 track の set とは別 SSoT。
+                if track_id == common::model::MASTER_TRACK_ID {
+                    self.master_row_automation_expanded =
+                        !self.master_row_automation_expanded;
+                } else if !self.expanded_automation_tracks.insert(track_id) {
                     self.expanded_automation_tracks.remove(&track_id);
                 }
             }
@@ -4442,18 +4455,14 @@ impl AppData {
     // ----------------------------------------------------------------
 
     fn set_lane_enabled(&mut self, track_id: u32, lane_id: u32, enabled: bool) {
-        if let Some(track) = self.song.track_by_id_mut(track_id)
-            && let Some(lane) = track.lane_by_id_mut(lane_id)
-        {
+        if let Some(lane) = self.song.automation_lane_by_key_mut(track_id, lane_id) {
             lane.enabled = enabled;
             self.sync_song_to_plugin_host();
         }
     }
 
     fn set_lane_visible(&mut self, track_id: u32, lane_id: u32, visible: bool) {
-        if let Some(track) = self.song.track_by_id_mut(track_id)
-            && let Some(lane) = track.lane_by_id_mut(lane_id)
-        {
+        if let Some(lane) = self.song.automation_lane_by_key_mut(track_id, lane_id) {
             lane.visible = visible;
             // visible は再生に影響しないが、Song 構造の変化なので同期。
             self.sync_song_to_plugin_host();
@@ -4466,10 +4475,7 @@ impl AppData {
     /// (lane default knob を回した後 `A` を押すと同 lane が visible
     /// 復活する閉ループ)。
     fn set_lane_default(&mut self, track_id: u32, lane_id: u32, next_norm: f32) {
-        let Some(track) = self.song.track_by_id_mut(track_id) else {
-            return;
-        };
-        let Some(lane) = track.lane_by_id_mut(lane_id) else {
+        let Some(lane) = self.song.automation_lane_by_key_mut(track_id, lane_id) else {
             return;
         };
         let target = lane.target.clone();
@@ -4487,9 +4493,7 @@ impl AppData {
     /// gui_01 #030 (M14 Phase 63n-5): lane 高さ drag。`next_px` は
     /// widget 側で min/max に clamp 済なのでそのまま反映。
     fn set_lane_height(&mut self, track_id: u32, lane_id: u32, next_px: u16) {
-        if let Some(track) = self.song.track_by_id_mut(track_id)
-            && let Some(lane) = track.lane_by_id_mut(lane_id)
-        {
+        if let Some(lane) = self.song.automation_lane_by_key_mut(track_id, lane_id) {
             lane.height_px = next_px;
             // 高さは描画状態のみで再生に影響しないが、 Song 構造の
             // 変化なので同期 (= 他 process が song を読むときに矛盾
@@ -4499,7 +4503,14 @@ impl AppData {
     }
 
     fn delete_lane(&mut self, track_id: u32, lane_id: u32) {
-        if let Some(track) = self.song.track_by_id_mut(track_id)
+        // gui_01 #034 (Phase 63n-10): master row sentinel 対応。 song_lanes
+        // の方にあれば該当 idx を探して remove、 通常 track なら従来通り。
+        if track_id == common::model::MASTER_TRACK_ID {
+            if let Some(idx) = self.song.song_lanes.iter().position(|l| l.id == lane_id) {
+                self.song.song_lanes.remove(idx);
+                self.sync_song_to_plugin_host();
+            }
+        } else if let Some(track) = self.song.track_by_id_mut(track_id)
             && let Some(idx) = track.lane_index_by_id(lane_id)
         {
             track.automation_lanes.remove(idx);
@@ -4519,10 +4530,7 @@ impl AppData {
         time_beat: f64,
         value_norm: f32,
     ) {
-        let Some(track) = self.song.track_by_id_mut(track_id) else {
-            return;
-        };
-        let Some(lane) = track.lane_by_id_mut(lane_id) else {
+        let Some(lane) = self.song.automation_lane_by_key_mut(track_id, lane_id) else {
             return;
         };
         let target = lane.target.clone();
@@ -4570,10 +4578,10 @@ impl AppData {
         let mut touched: std::collections::HashSet<common::model::ContentId> =
             std::collections::HashSet::new();
         for delta in deltas {
-            let Some(track) = self.song.track_by_id_mut(delta.key.track_id) else {
-                continue;
-            };
-            let Some(lane) = track.lane_by_id_mut(delta.key.lane_id) else {
+            let Some(lane) = self
+                .song
+                .automation_lane_by_key_mut(delta.key.track_id, delta.key.lane_id)
+            else {
                 continue;
             };
             let target = lane.target.clone();
@@ -4619,10 +4627,7 @@ impl AppData {
             Vec<u32>,
         > = std::collections::HashMap::new();
         for k in points {
-            let Some(track) = self.song.track_by_id(k.track_id) else {
-                continue;
-            };
-            let Some(lane) = track.lane_by_id(k.lane_id) else {
+            let Some(lane) = self.song.automation_lane_by_key(k.track_id, k.lane_id) else {
                 continue;
             };
             let Some(clip) = lane.clip_by_id(k.clip_id) else {
@@ -4654,10 +4659,7 @@ impl AppData {
         point_idx: u32,
         next: common::model::AutomationCurve,
     ) {
-        let Some(track) = self.song.track_by_id_mut(track_id) else {
-            return;
-        };
-        let Some(lane) = track.lane_by_id_mut(lane_id) else {
+        let Some(lane) = self.song.automation_lane_by_key_mut(track_id, lane_id) else {
             return;
         };
         let Some(clip) = lane.clip_by_id(clip_id) else {
@@ -4687,10 +4689,7 @@ impl AppData {
         point_idx: u32,
         next: f32,
     ) {
-        let Some(track) = self.song.track_by_id_mut(track_id) else {
-            return;
-        };
-        let Some(lane) = track.lane_by_id_mut(lane_id) else {
+        let Some(lane) = self.song.automation_lane_by_key_mut(track_id, lane_id) else {
             return;
         };
         let Some(clip) = lane.clip_by_id(clip_id) else {
@@ -4723,10 +4722,7 @@ impl AppData {
         point_idx: u32,
         next: f32,
     ) {
-        let Some(track) = self.song.track_by_id_mut(track_id) else {
-            return;
-        };
-        let Some(lane) = track.lane_by_id_mut(lane_id) else {
+        let Some(lane) = self.song.automation_lane_by_key_mut(track_id, lane_id) else {
             return;
         };
         let Some(clip) = lane.clip_by_id(clip_id) else {
@@ -4782,10 +4778,7 @@ impl AppData {
             ContentBuckets,
         > = std::collections::HashMap::new();
         for k in &selected {
-            let Some(track) = self.song.track_by_id(k.track_id) else {
-                continue;
-            };
-            let Some(lane) = track.lane_by_id(k.lane_id) else {
+            let Some(lane) = self.song.automation_lane_by_key(k.track_id, k.lane_id) else {
                 continue;
             };
             let Some(clip) = lane.clip_by_id(k.clip_id) else {
@@ -4878,10 +4871,7 @@ impl AppData {
         }
         let mut copied: Vec<CopiedPoint> = Vec::with_capacity(self.selected_automation_points.len());
         for k in &self.selected_automation_points {
-            let Some(track) = self.song.track_by_id(k.track_id) else {
-                continue;
-            };
-            let Some(lane) = track.lane_by_id(k.lane_id) else {
+            let Some(lane) = self.song.automation_lane_by_key(k.track_id, k.lane_id) else {
                 continue;
             };
             let Some(clip) = lane.clip_by_id(k.clip_id) else {
@@ -4963,10 +4953,7 @@ impl AppData {
                 return;
             };
 
-        let Some(track) = self.song.track_by_id(dest_key.track) else {
-            return;
-        };
-        let Some(lane) = track.lane_by_id(dest_key.lane) else {
+        let Some(lane) = self.song.automation_lane_by_key(dest_key.track, dest_key.lane) else {
             return;
         };
         let target = lane.target.clone();
@@ -5060,16 +5047,17 @@ impl AppData {
         }
         for d in deltas {
             let mut taken: Option<common::model::AutomationClip> = None;
-            if let Some(source_track) = self.song.track_by_id_mut(d.from.track)
-                && let Some(source_lane) = source_track.lane_by_id_mut(d.from.lane)
+            if let Some(source_lane) =
+                self.song.automation_lane_by_key_mut(d.from.track, d.from.lane)
                 && let Some(idx) = source_lane.clip_index_by_id(d.from.clip)
             {
                 taken = Some(source_lane.clips.remove(idx));
             }
             let Some(mut clip) = taken else { continue };
             clip.start_beat = d.next_start_beat;
-            if let Some(target_track) = self.song.track_by_id_mut(d.to_lane.track)
-                && let Some(target_lane) = target_track.lane_by_id_mut(d.to_lane.lane)
+            if let Some(target_lane) = self
+                .song
+                .automation_lane_by_key_mut(d.to_lane.track, d.to_lane.lane)
             {
                 let start = clip.start_beat;
                 let pos = target_lane
@@ -5090,10 +5078,9 @@ impl AppData {
         }
         for d in deltas {
             let template = {
-                let Some(source_track) = self.song.track_by_id(d.from.track) else {
-                    continue;
-                };
-                let Some(source_lane) = source_track.lane_by_id(d.from.lane) else {
+                let Some(source_lane) =
+                    self.song.automation_lane_by_key(d.from.track, d.from.lane)
+                else {
                     continue;
                 };
                 let Some(source_clip) = source_lane.clip_by_id(d.from.clip) else {
@@ -5105,10 +5092,10 @@ impl AppData {
                     source_clip.length_beats,
                 )
             };
-            let Some(target_track) = self.song.track_by_id_mut(d.to_lane.track) else {
-                continue;
-            };
-            let Some(target_lane) = target_track.lane_by_id_mut(d.to_lane.lane) else {
+            let Some(target_lane) = self
+                .song
+                .automation_lane_by_key_mut(d.to_lane.track, d.to_lane.lane)
+            else {
                 continue;
             };
             let new_id = target_lane.alloc_clip_id();
@@ -5139,10 +5126,9 @@ impl AppData {
         }
         for d in deltas {
             let template = {
-                let Some(source_track) = self.song.track_by_id(d.from.track) else {
-                    continue;
-                };
-                let Some(source_lane) = source_track.lane_by_id(d.from.lane) else {
+                let Some(source_lane) =
+                    self.song.automation_lane_by_key(d.from.track, d.from.lane)
+                else {
                     continue;
                 };
                 let Some(source_clip) = source_lane.clip_by_id(d.from.clip) else {
@@ -5169,10 +5155,10 @@ impl AppData {
                 });
             let new_content_id = self.song.alloc_content_id();
             self.song.clip_contents.insert(new_content_id, cloned_content);
-            let Some(target_track) = self.song.track_by_id_mut(d.to_lane.track) else {
-                continue;
-            };
-            let Some(target_lane) = target_track.lane_by_id_mut(d.to_lane.lane) else {
+            let Some(target_lane) = self
+                .song
+                .automation_lane_by_key_mut(d.to_lane.track, d.to_lane.lane)
+            else {
                 continue;
             };
             let new_id = target_lane.alloc_clip_id();
@@ -5197,10 +5183,10 @@ impl AppData {
             return;
         }
         for d in deltas {
-            let Some(track) = self.song.track_by_id_mut(d.key.track) else {
-                continue;
-            };
-            let Some(lane) = track.lane_by_id_mut(d.key.lane) else {
+            let Some(lane) = self
+                .song
+                .automation_lane_by_key_mut(d.key.track, d.key.lane)
+            else {
                 continue;
             };
             if let Some(clip) = lane.clip_by_id_mut(d.key.clip) {
@@ -5217,10 +5203,7 @@ impl AppData {
     /// `MakeClipUnique` と同 UX)。
     fn make_automation_clip_unique(&mut self, key: common::model::AutomationClipKey) {
         let content_id = {
-            let Some(track) = self.song.track_by_id(key.track) else {
-                return;
-            };
-            let Some(lane) = track.lane_by_id(key.lane) else {
+            let Some(lane) = self.song.automation_lane_by_key(key.track, key.lane) else {
                 return;
             };
             let Some(clip) = lane.clip_by_id(key.clip) else {
@@ -5238,8 +5221,7 @@ impl AppData {
         };
         let new_content_id = self.song.alloc_content_id();
         self.song.clip_contents.insert(new_content_id, cloned_content);
-        if let Some(track) = self.song.track_by_id_mut(key.track)
-            && let Some(lane) = track.lane_by_id_mut(key.lane)
+        if let Some(lane) = self.song.automation_lane_by_key_mut(key.track, key.lane)
             && let Some(clip) = lane.clip_by_id_mut(key.clip)
         {
             clip.content_id = new_content_id;
@@ -5265,10 +5247,10 @@ impl AppData {
                 common::model::AutomationContent::default(),
             ),
         );
-        let Some(track) = self.song.track_by_id_mut(lane_key.track) else {
-            return;
-        };
-        let Some(lane) = track.lane_by_id_mut(lane_key.lane) else {
+        let Some(lane) = self
+            .song
+            .automation_lane_by_key_mut(lane_key.track, lane_key.lane)
+        else {
             return;
         };
         let display = automation_target_display_name(&lane.target);
@@ -5294,33 +5276,56 @@ impl AppData {
                 "No parameter touched yet — drag any knob first".into();
             return;
         };
-        // touched track が削除済 → clear + 通知。
-        if self.song.track_by_id(touched.track_id).is_none() {
+        // Phase 5 Step 5.1 (gui_01 #034): song-level target は master row の
+        // `song_lanes` に追加 (= track 紐付け無し)。 TrackBuiltin / PluginParam
+        // は従来通り該当 track の automation_lanes に追加。
+        let is_song_level = matches!(
+            touched.target,
+            common::model::AutomationTarget::SongTempo
+                | common::model::AutomationTarget::SongTimeSigNumerator
+        );
+        // song-level でない場合のみ touched track が削除済か検査。
+        if !is_song_level && self.song.track_by_id(touched.track_id).is_none() {
             self.last_touched_param = None;
             self.status_message =
                 "Last-touched parameter's track was removed".into();
             return;
         }
-        // 既存 lane を find (target 一致で同 track 内)。
-        let existing_lane_id: Option<u32> = self
-            .song
-            .track_by_id(touched.track_id)
-            .map(|t| {
-                t.automation_lanes
-                    .iter()
-                    .find(|l| l.target == touched.target)
-                    .map(|l| l.id)
-            })
-            .unwrap_or(None);
+        // 既存 lane を find (target 一致)。 master か track かで lookup 経路が分岐。
+        let existing_lane_id: Option<u32> = if is_song_level {
+            self.song
+                .song_lanes
+                .iter()
+                .find(|l| l.target == touched.target)
+                .map(|l| l.id)
+        } else {
+            self.song
+                .track_by_id(touched.track_id)
+                .and_then(|t| {
+                    t.automation_lanes
+                        .iter()
+                        .find(|l| l.target == touched.target)
+                        .map(|l| l.id)
+                })
+        };
         if let Some(lane_id) = existing_lane_id {
             // 既存 lane を visible / enabled = true に戻して expand。
-            if let Some(track) = self.song.track_by_id_mut(touched.track_id)
-                && let Some(lane) = track.lane_by_id_mut(lane_id)
+            let lookup_track_id = if is_song_level {
+                common::model::MASTER_TRACK_ID
+            } else {
+                touched.track_id
+            };
+            if let Some(lane) =
+                self.song.automation_lane_by_key_mut(lookup_track_id, lane_id)
             {
                 lane.visible = true;
                 lane.enabled = true;
             }
-            self.expanded_automation_tracks.insert(touched.track_id);
+            if is_song_level {
+                self.master_row_automation_expanded = true;
+            } else {
+                self.expanded_automation_tracks.insert(touched.track_id);
+            }
             self.status_message = format!(
                 "Automation lane '{}' は既に存在します",
                 touched.display_name
@@ -5330,22 +5335,38 @@ impl AppData {
         }
         // 新規 lane を作成。default_value は target に応じて現在値を引く。
         let default_value = self.lane_default_for_target(&touched);
-        let Some(track) = self.song.track_by_id_mut(touched.track_id) else {
-            return;
-        };
-        let lane_id = track.alloc_lane_id();
-        let new_lane = common::model::AutomationLane {
-            id: lane_id,
-            target: touched.target.clone(),
-            default_value,
-            enabled: true,
-            visible: true,
-            height_px: 60,
-            clips: Vec::new(),
-            next_clip_id: 1,
-        };
-        track.automation_lanes.push(new_lane);
-        self.expanded_automation_tracks.insert(touched.track_id);
+        if is_song_level {
+            let lane_id = self.song.alloc_song_lane_id();
+            let new_lane = common::model::AutomationLane {
+                id: lane_id,
+                target: touched.target.clone(),
+                default_value,
+                enabled: true,
+                visible: true,
+                height_px: 60,
+                clips: Vec::new(),
+                next_clip_id: 1,
+            };
+            self.song.song_lanes.push(new_lane);
+            self.master_row_automation_expanded = true;
+        } else {
+            let Some(track) = self.song.track_by_id_mut(touched.track_id) else {
+                return;
+            };
+            let lane_id = track.alloc_lane_id();
+            let new_lane = common::model::AutomationLane {
+                id: lane_id,
+                target: touched.target.clone(),
+                default_value,
+                enabled: true,
+                visible: true,
+                height_px: 60,
+                clips: Vec::new(),
+                next_clip_id: 1,
+            };
+            track.automation_lanes.push(new_lane);
+            self.expanded_automation_tracks.insert(touched.track_id);
+        }
         self.status_message = format!(
             "Added automation lane: {}",
             touched.display_name
@@ -5388,10 +5409,7 @@ impl AppData {
             return;
         }
         for k in keys {
-            let Some(track) = self.song.track_by_id_mut(k.track) else {
-                continue;
-            };
-            let Some(lane) = track.lane_by_id_mut(k.lane) else {
+            let Some(lane) = self.song.automation_lane_by_key_mut(k.track, k.lane) else {
                 continue;
             };
             if let Some(idx) = lane.clip_index_by_id(k.clip) {

@@ -272,6 +272,19 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         })
         .collect();
 
+    // gui_01 #034 (Phase 63n-10): master row を組み立てる。 `Song.song_lanes`
+    // (= SongTempo / SongTimeSigNumerator 等) を ArrangementAutomationLane に
+    // 変換、 折り畳み状態は `AppData.master_row_automation_expanded` (= UI
+    // session state、 negation で widget 側 `automation_lanes_collapsed` に
+    // map)。 song_lanes が空でも master_row 自体は表示するため、 常に
+    // `Some(...)` を渡す idiom (= None は本機能未使用時用)。
+    let master_row_lanes = build_arrangement_lanes_from_slice(&app.song.song_lanes, &app.song);
+    let master_row = daw_ui_core::ArrangementMasterRow {
+        automation_lanes_collapsed: !app.master_row_automation_expanded,
+        automation_lanes: master_row_lanes,
+        height_px_override: None,
+    };
+
     let resp = ui.arrangement(
         "arrangement",
         area,
@@ -282,6 +295,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         &selected_automation_clips_widget,
         &selected_automation_points_widget,
         &style,
+        Some(&master_row),
         make_edit,
     );
 
@@ -1276,8 +1290,17 @@ fn build_arrangement_automation_lanes(
     track: &common::model::Track,
     song: &common::model::Song,
 ) -> Vec<ArrangementAutomationLane> {
-    track
-        .automation_lanes
+    build_arrangement_lanes_from_slice(&track.automation_lanes, song)
+}
+
+/// gui_01 #034 (Phase 63n-10): `Track.automation_lanes` でも `Song.song_lanes`
+/// でも共通に使える slice-based helper。 caller が track 由来か song-level
+/// 由来かに関わらず、 同じ idiom で widget input を組み立てる。
+fn build_arrangement_lanes_from_slice(
+    lanes: &[common::model::AutomationLane],
+    song: &common::model::Song,
+) -> Vec<ArrangementAutomationLane> {
+    lanes
         .iter()
         .map(|lane| {
             let display = lane_target_display(&lane.target);

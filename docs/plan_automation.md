@@ -1039,16 +1039,34 @@ Phase 5 は Step で分解して進める:
 検証: cargo build / clippy --workspace --tests / test (common 140 + daw_audio
 39 + 既存 group_lifecycle 1 fail は別 task) all clean。
 
-#### Step 5.1: Master lane UI (= arrangement 上に song-level row を表示)
+#### Step 5.1: Master lane UI (= arrangement 上に song-level row を表示) ✅ 主要部 (2026-05-12)
 
-- [ ] arrangement widget に master row 追加要望を gui_01 に出す
-      (= `ArrangementSongLanes` 型 / 第 N+1 引数 / lane header 描画方針)
-- [ ] daw_gui で `arrangement_view::draw` に song_lanes を渡し、 widget
-      response → `AppEvent::AddSongLane / SetLaneDefault / AddAutomationPoint`
-      に変換
+gui_01 #034 で要望、 Phase 63n-10 として widget landing 完了 (gui_01 commit `6074db6`)、
+daw_01 側 wire も landing。 master row が arrangement 上端に表示され、 SongTempo /
+SongTimeSigNumerator lane が curve / point / clip と full feature で編集可能。
+
+- [x] gui_01 widget #034: `ArrangementMasterRow` + `MASTER_TRACK_ID = u32::MAX`
+      sentinel + 既存 EditRequest 17 variant を sentinel で sentinel reuse
+- [x] daw_01 `common::model`: `MASTER_TRACK_ID` mirror const + `Song::
+      automation_lane_by_key(_mut)` 統一 accessor を追加 (= EditRequest
+      handler が sentinel を意識せず動く)
+- [x] daw_01 `app.rs` handler refactor: 19 automation 関数を統一 accessor
+      経由に変換。 `delete_lane` / `ToggleTrackAutomationCollapsed` /
+      `add_automation_from_last_touched` に sentinel 分岐を明示追加
+- [x] `AppData.master_row_automation_expanded` field 追加 (session-only
+      UI state)
+- [x] `arrangement_view::draw` で master_row 組み立て + 第 N+1 引数として
+      widget へ渡す。 `build_arrangement_lanes_from_slice` を新設 (track /
+      song_lanes 共通)
 - [ ] transport の BPM input drag / TimeSig num input drag が
       `ParamGestureBegin/End { target: SongTempo / SongTimeSigNumerator }`
-      を発火する
+      を発火する — Step 5.1 follow-up (= 別 commit、 transport.rs に drag
+      handle + gesture wire を入れる)
+- [ ] **smoke test (Step 5.1)**: `cargo run -p daw_gui` で起動 → arrangement
+      上端に Master row が見える → `A` キー (BPM input touch 後) で
+      SongTempo lane が master row に追加 → master row body dblclick で clip
+      作成 → clip 内 dblclick で point 追加 → 既存 Phase 3 機能 (curve type
+      / tension / lasso / etc.) がそのまま動く
 
 #### Step 5.2: Audio engine tempo eval (= per-buffer での SongTempo lane 評価) ✅ (2026-05-11)
 
