@@ -2447,6 +2447,12 @@ impl AppData {
                     self.song.bpm = clamped;
                     self.bpm_edit_text = format!("{:.1}", clamped);
                     self.send_audio(MainToChild::SetSongBpm { bpm: clamped });
+                    // Phase 6 review (dirty flag fix): scrub 中の連続 commit
+                    // は Undo step を増やさない方針なので `push_undo_snapshot`
+                    // は呼ばないが、 `is_dirty` は立てる。 立てないと autosave
+                    // が走らず、 BPM scrub だけで crash した場合に変更が消える
+                    // (= silent data loss)。
+                    self.is_dirty = true;
                 }
             }
             AppEvent::SetSongTimeSigNumFromScrub(next) => {
@@ -2455,6 +2461,8 @@ impl AppData {
                     self.song.time_sig.0 = clamped;
                     self.time_sig_num_edit_text = clamped.to_string();
                     self.send_audio(MainToChild::SetSongTimeSigNumerator { num: clamped });
+                    // 上と同じ理由で autosave 用に dirty flag を立てる。
+                    self.is_dirty = true;
                 }
             }
             AppEvent::TimeSigNumEditChanged(s) => {
