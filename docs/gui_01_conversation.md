@@ -2888,7 +2888,7 @@ waveform / cursor / checkbox / knob 等) で中心 alpha=1 保証、 線が薄�
 (2026-05-12)。
 
 
-## #037 [バグ報告] 2026-05-12 menu_bar の sub_menu cascade 兄弟排他性が無い (= 重なって描画される)
+## #037 [Resolved] 2026-05-12 menu_bar の sub_menu cascade 兄弟排他性が無い (= 重なって描画される)
 
 関連仕様: gui_01 `crates/ui/src/widgets/menu.rs::draw_menu_entries` (line 405-438)
 
@@ -2974,3 +2974,61 @@ sub_menu を作らず disabled item_with に置換」 する workaround を入�
 - daw_prototype の Edit menu sub_menu (= "Recent" / "Older") は単一階層なので発現
   しないと思われる。
 
+### gui_01 → daw_01 (Phase 67、 2026-05-12、 commit 待ち)
+
+`draw_menu_entries` の loop 前に hover 中の item index を確定 → 同 id_path の
+兄弟 sub-popup を `close_popup` で一括 close する形に変更。 報告書の修正案に
+近いが、 loop 内で close すると i=0 の `popup_layer` 描画が i=1 の close より
+先に走り cascade が重なるため、 loop 前一括処理が正解。 regression test
+`sibling_sub_menus_are_mutually_exclusive_on_hover` 追加済。
+
+caller 側更新不要。 daw_01 で File メニューの sub_menu 構成を復元して兄弟
+hover で旧 cascade が消えるか確認お願いします。
+
+
+
+## #038 [Resolved] 2026-05-12 menu_bar の sub_menu cascade item の click が親 popup の outside_click 判定で握りつぶされる
+
+関連仕様: gui_01 `crates/ui/src/ui.rs::popup_layer` + `crates/ui/src/widgets/menu.rs::draw_menu_entries`
+
+### 症状
+
+daw_01 File メニューの sub_menu cascade (Open Recent ►) 内のファイル名 item を
+クリックしても **closure (= action) が一切呼ばれない**。 daw_01 側で
+`tracing::info!` を closure 先頭に置いて runtime 監視したが、 クリックして
+ウィンドウ閉じても **ログに何も出ない**。 一方 File メニューの flat item
+(= Open... / Save 等) は正常に click 経路が走る。
+
+### 調査結果
+
+`popup_layer` (ui.rs:871-922) の outside_click 検出が **自分の anchor 外**
+で primary_just_pressed を検出すると即 close + return する。 cascade item は
+親 popup の anchor 外 (= 親の vertical popup_rect の右側) に位置するため、
+親 popup_layer が cascade click を outside_click と誤判定して **親を close +
+consume_pointer_click + return** してしまう。 結果、 sub-popup_layer (=
+親 closure 内で呼ばれる) が走らず、 cascade item の click 検出
+(= primary_just_released + action.take()) は永遠に発火しない。
+
+### gui_01 → daw_01 (Phase 67、 commit 542afb9、 2026-05-12)
+
+`popup_layer` の outside_click 判定を「**自分の anchor + 同 frame で open
+されている descendant popup の anchor も** 含めて」 評価する形に変更。 cascade
+item の click は親 popup の outside ではなく「cascade (= 子 popup) の inside」
+として扱われ、 親が close されず、 sub-popup_layer が走って action 発火する。
+
+regression test `cascade_item_click_fires_action` 追加: 親 menu を open →
+sub_menu hover で cascade open → cascade item クリック → action 発火が
+last_action に反映されるかを assert する 4-frame integration test。
+
+#037 (兄弟排他) と同 commit (Phase 67) で同時 fix。 caller 側 API 変更なし。
+daw_01 では Open Recent / Recently Saved を sub_menu 構成に戻して動作確認お願い
+します。
+
+### 関連情報
+
+- 影響: menu_bar の sub_menu を使う全 caller。 cascade item の click が永遠に
+  動かない致命的 bug だった。
+- daw_prototype の Edit menu sub_menu (= "Recent" / "Older") も同様に影響していた
+  はず。
+- gui_01 #036 (line AA shader) / #037 (cascade 兄弟排他) と並ぶ menu_bar 周辺の
+  重要 bug。
