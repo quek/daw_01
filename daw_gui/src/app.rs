@@ -1603,6 +1603,10 @@ pub enum AppEvent {
     Stop,
     PlayToggle,
     ToggleLoop,
+    /// `R` キー: 選択中 clip(s) の bounding range を loop 範囲に設定して
+    /// loop ON + 再生開始。 既に loop ON かつ範囲が選択 clip と一致するなら
+    /// loop を OFF にする (再生は維持)。 選択 clip が無ければ no-op。
+    LoopSelectedClipToggle,
     /// Transport BPM 入力欄の文字列が変わった (commit ではなく途中入力)。
     /// Undo 対象外。
     BpmEditChanged(String),
@@ -2467,6 +2471,9 @@ impl AppData {
             }
             AppEvent::ToggleLoop => {
                 self.toggle_loop();
+            }
+            AppEvent::LoopSelectedClipToggle => {
+                self.loop_selected_clip_toggle();
             }
             AppEvent::BpmEditChanged(s) => {
                 self.bpm_edit_text = s;
@@ -4078,6 +4085,72 @@ impl AppData {
         self.song.loop_start_beat = start;
         self.song.loop_end_beat = end;
         self.sync_song_to_plugin_host();
+    }
+
+    /// `R` キー: 選択中 clip(s) の bounding range (= 最小 `start_beat` 〜
+    /// 最大 `start_beat + length_beats`) を loop 範囲に設定し、 loop ON +
+    /// 再生開始。 既に loop ON かつ現在の loop 範囲が同じ bounding range
+    /// と一致するなら loop を OFF にする (再生は維持)。
+    ///
+    /// 「選択 clip」 は `selected_clips` を優先し、空なら `selected_clip`
+    /// (単数 fallback) を使う。 両方とも空 / 全 ref が無効なら no-op。
+    fn loop_selected_clip_toggle(&mut self) {
+        let Some((start, end)) = self.selected_clips_range() else {
+            return;
+        };
+
+        const EPS: f64 = 1e-9;
+        let same_range = (self.song.loop_start_beat - start).abs() < EPS
+            && (self.song.loop_end_beat - end).abs() < EPS;
+
+        if self.is_looping && same_range {
+            self.is_looping = false;
+            self.send_audio(MainToChild::SetLoop(false));
+            return;
+        }
+
+        self.set_loop_range(start, end);
+        if !self.is_looping {
+            self.is_looping = true;
+            self.send_audio(MainToChild::SetLoop(true));
+        }
+        if !self.is_playing {
+            self.play();
+        }
+    }
+
+    /// 選択中 clip 群の bounding beat range を返す。 `selected_clips` を
+    /// 優先し、空なら `selected_clip` を 1 件として扱う。 全 ref が
+    /// 無効 (track / clip が見つからない) or 長さ 0 の場合は `None`。
+    fn selected_clips_range(&self) -> Option<(f64, f64)> {
+        let refs: &[ClipRef] = if !self.selected_clips.is_empty() {
+            &self.selected_clips
+        } else if let Some(r) = self.selected_clip.as_ref() {
+            std::slice::from_ref(r)
+        } else {
+            return None;
+        };
+
+        let mut min_start = f64::INFINITY;
+        let mut max_end = f64::NEG_INFINITY;
+        for r in refs {
+            let Some(track) = self.song.tracks.get(r.track as usize) else {
+                continue;
+            };
+            let Some(clip) = track.clips.get(r.clip as usize) else {
+                continue;
+            };
+            let s = clip.start_beat;
+            let e = clip.start_beat + clip.length_beats;
+            if s < min_start {
+                min_start = s;
+            }
+            if e > max_end {
+                max_end = e;
+            }
+        }
+
+        (min_start.is_finite() && max_end > min_start).then_some((min_start, max_end))
     }
 
     // -------- Track operations ---------------------------------------------

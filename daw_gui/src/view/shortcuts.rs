@@ -23,6 +23,10 @@ pub fn daw_shortcut_map() -> ShortcutMap {
     let mut m = ShortcutMap::with_default_bindings();
     m.bind("daw.play_toggle", "Space");
     m.bind("daw.toggle_loop", "P");
+    // 選択 clip の bounding range を loop に設定して loop ON + 再生開始。
+    // 再押下で範囲一致 + loop ON なら loop OFF にトグル (Reaper 流の
+    // "Loop to selected items" を 1 キーに集約したもの)。
+    m.bind("daw.loop_selected_clip", "R");
     m.bind("daw.synthesize_vocal", "V");
     m.bind("daw.export_wav", "Ctrl+E");
     m.bind("daw.toggle_help", "F1");
