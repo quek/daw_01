@@ -7,6 +7,7 @@ pub mod arrangement_view;
 pub mod audio_editor;
 pub mod bottom_panel;
 pub mod mixer_strips;
+pub mod param_gesture;
 pub mod piano_roll_view;
 pub mod plugin_picker;
 pub mod recovery_modal;

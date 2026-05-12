@@ -274,6 +274,14 @@ pub fn compile_audio_schedule(
                 if event.muted {
                     continue;
                 }
+                // Phase 5 follow-up (StretchMode::Slice) bug fix: onsets が
+                // sort 済の不変条件は model に明示されておらず、 user / import
+                // 経路次第で未 sort のまま入る可能性がある。 audio thread の
+                // `slice_sample_at` は `partition_point` 前提で sorted を期待
+                // するので、 compile 時 (off-RT) に一度 sort し直して保証する。
+                let mut onsets_sorted = event.onsets.clone();
+                onsets_sorted.sort_unstable();
+                onsets_sorted.dedup();
                 schedule.push(RenderedEvent {
                     track_idx,
                     clip_idx,
@@ -292,7 +300,7 @@ pub fn compile_audio_schedule(
                     fade_out_curve: event.fade_out_curve,
                     reversed: event.reversed,
                     stretch_mode: event.stretch_mode,
-                    onsets: event.onsets.clone(),
+                    onsets: onsets_sorted,
                 });
             }
         }
@@ -384,13 +392,11 @@ pub fn render_audio_events(
             _ => event.pitch_ratio,
         };
 
-        // event_total_frames は元実装では「event の音域 sample 数」 として
-        // fade envelope の tail 計算に使われていた。 beat-domain 化で
-        // 「buffer 内 sample 数」 ベースに置き換えた fade を考えると、 event の
-        // 「総 buffer 内 sample 数」 = `event 長 beats × samples_per_beat` だが、
-        // fade 計算は per-buffer の event-local sample offset で完結するので
-        // この値は不要。 削除 (= 元 sample-domain ロジックの再現に必要だった
-        // tail 計算は per-sample の event_local + fade_*_samples で行う)。
+        // beat-domain fade を per-buffer の current_bpm で sample 換算する。
+        // `event_total_samples` は fade-out の tail (= event 末尾からの距離)
+        // を計算するために必要 (= 旧 sample-domain `event_total_frames` の
+        // beat-domain 同等値)。 event 全長を current_bpm で換算するので、
+        // tempo 変化で fade duration もスケールする。
         let fade_in_samples =
             (event.fade_in_beats * samples_per_beat).max(0.0) as u64;
         let fade_out_samples =
@@ -400,9 +406,15 @@ pub fn render_audio_events(
             * samples_per_beat)
             .max(0.0) as u64;
         // event 開始からの absolute sample offset を求めるための起点 (= event
-        // start を sample 単位で表現した値、 playhead_beats 基準)。
-        let event_start_offset_in_buf =
-            ((event.start_beat - playhead_beats) * samples_per_beat) as i64;
+        // start を sample 単位で表現した値、 playhead_beats 基準)。 通常 |.| <
+        // 1 buffer worth of samples (= 数千)、 cast overflow 心配なし。
+        // 念のため `clamp` で i64 全範囲に収める (= 異常な beat 値で NaN /
+        // Inf になる事故を防ぐ defensive)。
+        #[allow(clippy::cast_possible_truncation)]
+        let event_start_offset_in_buf = ((event.start_beat - playhead_beats)
+            * samples_per_beat)
+            .clamp(i64::MIN as f64, i64::MAX as f64)
+            as i64;
         let source_len = event
             .source_end_frames
             .saturating_sub(event.source_start_frames);

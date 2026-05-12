@@ -9,6 +9,8 @@
 
 use common::model::{AutomationTarget, TrackBuiltinParam};
 use daw_ui_core::{Edit, LevelMeterStyle, MeterBallistic, ToggleButtonStyle, Ui};
+
+use crate::view::param_gesture::push_param_gesture_edges;
 use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent};
@@ -325,35 +327,6 @@ fn draw_strip(
     );
 }
 
-/// Phase 4 Step B: knob / fader の drag edge (= was_dragging → is_dragging
-/// の変化) を見て `ParamGestureBegin` / `ParamGestureEnd` を push する
-/// helper。 `was_dragging` は caller が `app.active_param_gestures` から
-/// 引いて渡す。 同 frame で widget が `Edit::mutate` を push → 次 frame の
-/// app.active_param_gestures が反映 → was_dragging が更新、 という 1 frame
-/// 遅延 chain で edge が安定検知される。 race なし (= immediate-mode 各
-/// frame 間で edit queue が必ず drain される)。
-fn push_param_gesture_edges(
-    ui: &mut Ui<'_, AppData>,
-    track_id: u32,
-    target: AutomationTarget,
-    display_name: &'static str,
-    was_dragging: bool,
-    is_dragging: bool,
-) {
-    if is_dragging == was_dragging {
-        return;
-    }
-    if is_dragging {
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::ParamGestureBegin {
-                track_id,
-                target,
-                display_name: display_name.to_string(),
-            })
-        }));
-    } else {
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::ParamGestureEnd { track_id, target })
-        }));
-    }
-}
+// Phase 4 Step B の `push_param_gesture_edges` は共通 helper として
+// `view::param_gesture` に抽出 (Phase 5 follow-up review、 transport.rs と
+// 重複していたため)。

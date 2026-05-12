@@ -724,11 +724,8 @@ impl LocalState {
                 song_ended(song_ref, sample_rate, new_ph)
             };
             // Phase 5 Step 5.2: playhead_beats を current_bpm で 1 buffer 分
-            // advance する。 loop wrap は下で new_ph を上書きするので、
-            // wrap 後に last_known_playhead = new_ph を記録すれば次 buffer
-            // 頭で seek 扱いになり playhead_beats が再初期化される (= loop
-            // start の beat 位置から再開、 tempo 履歴は失うが loop 内で
-            // accumulate し直す)。
+            // advance する。 sub-buffer の tempo 変化は scope 外 (= 1 buffer
+            // ~5..20ms 内 constant)。
             let sr = sample_rate as f64;
             if sr > 0.0 {
                 self.playhead_beats +=
@@ -748,6 +745,19 @@ impl LocalState {
                 };
                 if let Some(start) = wrap_to {
                     new_ph = start;
+                    // Phase 5 Step 5.2 bug fix: loop wrap 時に playhead_beats
+                    // を sample-domain new_ph に合わせて再計算する (= 上の
+                    // `+=` で advance させた値は loop end 直後の beat 位置
+                    // であって、 loop start に rewind されない)。 次 buffer
+                    // の seek 検知では `playhead == last_known_playhead` で
+                    // 反応しないため、 ここで直接 reset する必要がある。
+                    // current_bpm を constant とした linear 推定で OK (= tempo
+                    // automation 中の loop boundary は MVP scope 外で、 通常
+                    // の constant tempo loop なら精度問題なし)。
+                    if sr > 0.0 {
+                        self.playhead_beats =
+                            new_ph as f64 * f64::from(current_bpm) / (60.0 * sr);
+                    }
                 } else {
                     self.playing = false;
                     shared

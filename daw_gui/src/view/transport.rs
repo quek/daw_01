@@ -11,6 +11,7 @@ use daw_ui_core::{
 use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent};
+use crate::view::param_gesture::push_param_gesture_edges;
 
 const BG: Color = Color { r: 0.16, g: 0.16, b: 0.20, a: 1.0 };
 const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
@@ -139,28 +140,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // Phase 4 Step B 流 ParamGesture edge 検知: drag 開始 (= dragging
     // false→true) で `ParamGestureBegin`、 終了で `ParamGestureEnd` を発火。
     // target = SongTempo、 track_id = MASTER_TRACK_ID (= master row 配下の
-    // song-level lane を指す sentinel)。
+    // song-level lane を指す sentinel)。 mixer_strips と同 helper 使用。
     let songtempo_was_dragging = app
         .active_param_gestures
         .contains(&(MASTER_TRACK_ID, AutomationTarget::SongTempo));
-    if bpm_resp.dragging != songtempo_was_dragging {
-        if bpm_resp.dragging {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::ParamGestureBegin {
-                    track_id: MASTER_TRACK_ID,
-                    target: AutomationTarget::SongTempo,
-                    display_name: "Tempo".to_string(),
-                })
-            }));
-        } else {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::ParamGestureEnd {
-                    track_id: MASTER_TRACK_ID,
-                    target: AutomationTarget::SongTempo,
-                })
-            }));
-        }
-    }
+    push_param_gesture_edges(
+        ui,
+        MASTER_TRACK_ID,
+        AutomationTarget::SongTempo,
+        "Tempo",
+        songtempo_was_dragging,
+        bpm_resp.dragging,
+    );
     x += bpm_w + 12.0;
 
     // Phase 5 Step 5.1 follow-up: TimeSig numerator scrubable_number。
@@ -186,24 +177,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let tsig_was_dragging = app
         .active_param_gestures
         .contains(&(MASTER_TRACK_ID, AutomationTarget::SongTimeSigNumerator));
-    if ts_resp.dragging != tsig_was_dragging {
-        if ts_resp.dragging {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::ParamGestureBegin {
-                    track_id: MASTER_TRACK_ID,
-                    target: AutomationTarget::SongTimeSigNumerator,
-                    display_name: "TimeSig Num".to_string(),
-                })
-            }));
-        } else {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::ParamGestureEnd {
-                    track_id: MASTER_TRACK_ID,
-                    target: AutomationTarget::SongTimeSigNumerator,
-                })
-            }));
-        }
-    }
+    push_param_gesture_edges(
+        ui,
+        MASTER_TRACK_ID,
+        AutomationTarget::SongTimeSigNumerator,
+        "TimeSig Num",
+        tsig_was_dragging,
+        ts_resp.dragging,
+    );
     x += ts_num_w + 4.0;
 
     // "/" セパレータ

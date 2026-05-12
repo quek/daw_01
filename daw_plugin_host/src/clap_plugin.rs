@@ -1177,7 +1177,11 @@ fn build_clap_transport_event(
         loop_start_seconds: 0,
         loop_end_seconds: 0,
         bar_start,
-        bar_number: bar_number as i32,
+        // bar_number i32: 長時間再生で overflow リスク (= 2 billion 拍以上で
+        // wrap-around)。 通常使用では到達不能だが defensive で clamp。
+        #[allow(clippy::cast_possible_truncation)]
+        bar_number: bar_number.clamp(f64::from(i32::MIN), f64::from(i32::MAX))
+            as i32,
         tsig_num: transport.tsig_num,
         tsig_denom: transport.tsig_denom,
     }
