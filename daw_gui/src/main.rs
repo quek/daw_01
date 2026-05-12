@@ -171,6 +171,7 @@ fn spawn_incoming_bridge(
                     name,
                     plugin_id,
                     shmem_id,
+                    state_load_error,
                 } => {
                     let _ = audio_tx.send(MainToChild::OpenPluginShmem {
                         plugin_id,
@@ -184,6 +185,7 @@ fn spawn_incoming_bridge(
                         id,
                         name,
                         plugin_id,
+                        state_load_error,
                     })
                 }
                 ChildToMain::SlotPluginState { .. } => None,

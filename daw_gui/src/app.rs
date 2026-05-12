@@ -2020,6 +2020,12 @@ pub enum AppEvent {
         /// daw_gui 側は `track_plugin_ids` に登録して、 後続の delete /
         /// ungroup で先に ClosePluginShmem を audio に直接送るのに使う。
         plugin_id: u32,
+        /// saved state を `state_load(&bytes)` で復元しようとして失敗した
+        /// 場合の理由文字列。 `None` = state_load が呼ばれなかった
+        /// (= 新規 add)、 or 復元成功。 plugin 自体は default 状態で chain
+        /// に挿さっているので「load 失敗」 ではなく「設定が復元されなかった」
+        /// 旨を status_message でユーザーに伝える (silent corruption 防止)。
+        state_load_error: Option<String>,
     },
     /// plugin_host が plugin destroy したことの通知。 `track_plugin_ids`
     /// から該当 plugin_id を取り除き、 もし audio engine 側で未削除
@@ -2917,8 +2923,8 @@ impl AppData {
             AppEvent::GuiClosedFromChild { track, slot } => {
                 self.on_gui_closed(track, slot);
             }
-            AppEvent::SlotPluginLoadedFromChild { track, slot, id, name, plugin_id } => {
-                self.on_plugin_loaded_from_child(track, slot, id, name, plugin_id);
+            AppEvent::SlotPluginLoadedFromChild { track, slot, id, name, plugin_id, state_load_error } => {
+                self.on_plugin_loaded_from_child(track, slot, id, name, plugin_id, state_load_error);
             }
             AppEvent::SlotPluginUnloadedFromChild { plugin_id } => {
                 self.on_plugin_unloaded_from_child(plugin_id);
@@ -3792,6 +3798,21 @@ impl AppData {
     /// 並び替わっていると壊れるため改めた。
     fn apply_plugin_states(&mut self, states: &[SlotState]) {
         for s in states {
+            // Phase 6 review (silent corruption fix): plugin_host が
+            // `state_save()` で `Err` を返したエントリは `error` 付きで
+            // 来る。 そのとき `s.data` は None なので、 既存 state を
+            // 上書きすると **過去 save 時に保存された state が消える**
+            // (= 旧バグ: save 失敗 → 次 save で空 state 確定)。 error あり
+            // のエントリは skip して既存 state を保つ。
+            if s.error.is_some() {
+                tracing::warn!(
+                    track = s.track,
+                    ?s.slot,
+                    error = s.error.as_deref(),
+                    "apply_plugin_states: state save errored, preserving previous state",
+                );
+                continue;
+            }
             let Some(track) = self.song.tracks.iter_mut().find(|t| t.id == s.track) else {
                 tracing::warn!(track = s.track, ?s.slot, "apply_plugin_states: track id not found");
                 continue;
@@ -7906,7 +7927,20 @@ impl AppData {
         id: String,
         _name: String,
         plugin_id: u32,
+        // Phase 6 review (silent corruption fix): plugin_host が saved state
+        // を `state_load(&bytes)` で適用しようとして失敗したときの理由。
+        // `Some(reason)` のとき plugin は default 状態で chain に居る ⇒
+        // ユーザーには「設定が復元されなかった」 ことを status_message で
+        // 知らせて、 必要なら再 load / preset 適用してもらう。
+        state_load_error: Option<String>,
     ) {
+        if let Some(reason) = state_load_error {
+            let msg = format!(
+                "Plugin state 復元失敗 (track {track_id} {slot:?}, id={id}): {reason}"
+            );
+            tracing::error!(track = track_id, ?slot, %id, %reason, "state_load failed (notified by plugin host)");
+            self.status_message = msg;
+        }
         // PR2.1: ChildToMain `track` is now a `Track::id`. Resolve to
         // a Vec position only for the local `song.tracks` mutation;
         // the plugin host stores chains by id directly.
@@ -8400,6 +8434,36 @@ impl AppData {
         // ここで一律書き戻す。 pending が None だった場合 (= 想定外
         // タイミングの応答) でも害はない。
         self.apply_plugin_states(&states);
+        // Phase 6 review (silent corruption fix): plugin_host 側で
+        // `state_save()` が `Err` を返したエントリは `SlotState.error`
+        // 経由で報告される。 旧コードはこれを `.ok().flatten()` で握り
+        // つぶしていて、 保存 file に空 state を書き → 次回開いたとき
+        // plugin が default 状態に戻る silent corruption になっていた。
+        // 集計して status_message に表示し、 ユーザーが「N 個の plugin
+        // state が保存されなかった」 と認識できるようにする。 件数が多い
+        // と message が長くなりすぎるので、 先頭 3 件のみ詳細を出し
+        // 残りは件数集約。
+        let failed: Vec<&SlotState> = states
+            .iter()
+            .filter(|s| s.error.is_some())
+            .collect();
+        if !failed.is_empty() {
+            let mut msg = format!("Plugin state 保存失敗 ({} 件): ", failed.len());
+            for (i, s) in failed.iter().take(3).enumerate() {
+                if i > 0 {
+                    msg.push_str(", ");
+                }
+                msg.push_str(&format!(
+                    "track {} {:?}",
+                    s.track, s.slot
+                ));
+            }
+            if failed.len() > 3 {
+                msg.push_str(&format!(" ... +{}", failed.len() - 3));
+            }
+            tracing::error!(failed_count = failed.len(), %msg, "plugin state save failures");
+            self.status_message = msg;
+        }
         let Some(req) = self.pending_state_request.take() else {
             return;
         };

@@ -118,6 +118,9 @@ fn fake_plugin_loaded(
         id: id.into(),
         name: id.into(),
         plugin_id,
+        // テストは state 復元 path をシミュレートしない (= initial_state =
+        // None でロードしたのと等価)。
+        state_load_error: None,
     });
 }
 

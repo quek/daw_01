@@ -78,6 +78,14 @@ pub enum ChildToMain {
     /// instance; `shmem_id` names the `ProcessData` shared memory the
     /// host created so daw_audio can `OpenShared` it and use the
     /// worker-pool dispatch to drive `plugin.process()`.
+    ///
+    /// `state_load_error` は saved project の plugin state を
+    /// `state_load(&bytes)` で復元しようとして失敗したときの理由文字列。
+    /// この場合 plugin は default 状態で chain に挿さる (= load 自体は成功
+    /// しているので silent に進めるのは UX 上の silent corruption)。 daw_gui
+    /// は status_message でユーザーに伝えて「設定が復元されなかった」 と
+    /// 認識可能にする。 `None` = state_load が呼ばれなかった (= 新規追加)
+    /// or 復元成功。
     SlotPluginLoaded {
         track: u32,
         slot: PluginSlot,
@@ -85,6 +93,7 @@ pub enum ChildToMain {
         name: String,
         plugin_id: u32,
         shmem_id: String,
+        state_load_error: Option<String>,
     },
     /// Reply to `RequestSlotState`. `None` = plugin unavailable or state
     /// extension missing.
@@ -232,11 +241,22 @@ pub mod plugin_param_flags {
 }
 
 /// Single entry in the `AllPluginStates` reply.
+///
+/// `data` is the plugin's serialized state (= bytes blob), `None` if:
+/// - plugin doesn't implement the state extension (= state save unsupported)
+/// - state save returned `Ok(None)` (= plugin opted out)
+/// - `error` is `Some(...)` (= state save failed)
+///
+/// `error` is set when `state_save()` returned `Err(...)`. daw_gui surfaces
+/// the aggregated error list in `status_message` so the user notices that
+/// their saved project will reload with default plugin state for the
+/// affected slot(s) (= silent corruption fix). `None` = save succeeded.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct SlotState {
     pub track: u32,
     pub slot: PluginSlot,
     pub data: Option<Vec<u8>>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]

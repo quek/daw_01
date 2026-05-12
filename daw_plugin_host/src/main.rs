@@ -62,6 +62,7 @@ pub enum PluginEvent {
         name: String,
         plugin_id: u32,
         shmem_id: String,
+        state_load_error: Option<String>,
     },
     SlotPluginState {
         track: u32,
@@ -150,6 +151,7 @@ impl From<PluginEvent> for ChildToMain {
                 name,
                 plugin_id,
                 shmem_id,
+                state_load_error,
             } => ChildToMain::SlotPluginLoaded {
                 track,
                 slot,
@@ -157,6 +159,7 @@ impl From<PluginEvent> for ChildToMain {
                 name,
                 plugin_id,
                 shmem_id,
+                state_load_error,
             },
             PluginEvent::SlotPluginState { track, slot, data } => {
                 ChildToMain::SlotPluginState { track, slot, data }
@@ -599,6 +602,9 @@ fn plugin_main_loop(
                                 name: cached_name.clone(),
                                 plugin_id: new_plugin_id,
                                 shmem_id,
+                                // 同 plugin の re-emit path。 state_load
+                                // を呼んでいないので error は常に None。
+                                state_load_error: None,
                             });
                         } else {
                             tracing::warn!(
@@ -637,11 +643,35 @@ fn plugin_main_loop(
                             continue;
                         }
                     };
-                    if let Some(bytes) = initial_state
-                        && let Err(e) = plugin.state_load(&bytes)
+                    // Phase 6 review (silent corruption fix): state_load
+                    // 失敗を `tracing::error!` だけで握りつぶしていたので、
+                    // ユーザーは saved project を開いて plugin が default
+                    // 状態になっていることに気付けなかった。 失敗理由を
+                    // `state_load_error` に格納し SlotPluginLoaded に同梱
+                    // して daw_gui の status_message へ伝える。 plugin
+                    // 自体は default 状態で chain に挿さる (= 旧挙動と
+                    // 互換、 partial recovery)。
+                    let state_load_error: Option<String> = if let Some(bytes) =
+                        initial_state
                     {
-                        tracing::error!(error = ?e, "state_load failed");
-                    }
+                        match plugin.state_load(&bytes) {
+                            Ok(()) => None,
+                            Err(e) => {
+                                let reason = format!("{e:#}");
+                                tracing::error!(
+                                    track,
+                                    ?slot,
+                                    plugin = %plugin_id,
+                                    error = %reason,
+                                    "state_load failed (= plugin は default 状態で進む、 \
+                                     daw_gui に SlotPluginLoaded.state_load_error で通知)",
+                                );
+                                Some(reason)
+                            }
+                        }
+                    } else {
+                        None
+                    };
 
                     // (2) 旧 plugin を chain から detach (DLL call なし)。
                     let old_pid = plugin_lookup.get(&(track, slot)).copied();
@@ -748,6 +778,7 @@ fn plugin_main_loop(
                                 name: loaded_name,
                                 plugin_id: new_plugin_id,
                                 shmem_id,
+                                state_load_error,
                             });
                             // PR3.3: activate 直後 (CLAP `[main-thread &
                             // active]` / VST3 `[UI-thread & Setup Done]`
@@ -1132,6 +1163,34 @@ fn move_plugin(chain: &mut Chain, from: PluginSlot, to: PluginSlot) {
     }
 }
 
+/// Wrap `plugin.state_save()` with explicit error logging + error string
+/// extraction. Mirror of the inline pattern in `RequestSlotState` handler
+/// (line 935-941) so silent corruption (= `Err → None`) is surfaced both
+/// in logs (= plugin name + track/slot で trace) と IPC (= `SlotState
+/// .error` で daw_gui status_message へ伝播) で見えるようになる。
+fn save_plugin_state_with_err(
+    plugin: &mut dyn crate::plugin_instance::LoadedPlugin,
+    track_id: u32,
+    slot: PluginSlot,
+) -> (Option<Vec<u8>>, Option<String>) {
+    match plugin.state_save() {
+        Ok(s) => (s, None),
+        Err(e) => {
+            let reason = format!("{e:#}");
+            tracing::error!(
+                track = track_id,
+                ?slot,
+                plugin = plugin.name(),
+                error = %reason,
+                "state_save failed (= project save 時に plugin 状態が \
+                 silent に欠落するのを防ぐため、 SlotState.error 経由で \
+                 daw_gui に通知)",
+            );
+            (None, Some(reason))
+        }
+    }
+}
+
 fn collect_all_states(handle: &mut TracksHandle) -> Vec<SlotState> {
     let mut out = Vec::new();
     // Iterate tracks in deterministic id order so save files diff cleanly.
@@ -1151,33 +1210,39 @@ fn collect_all_states(handle: &mut TracksHandle) -> Vec<SlotState> {
         for i in 0..mfx_count {
             let slot = PluginSlot::MidiFx(i as u32);
             if let Some(plugin) = handle.plugin_at_mut(track_id, slot) {
-                let data = plugin.state_save().ok().flatten();
+                let (data, error) =
+                    save_plugin_state_with_err(plugin, track_id, slot);
                 out.push(SlotState {
                     track: track_id,
                     slot,
                     data,
+                    error,
                 });
             }
         }
         if has_inst {
             let slot = PluginSlot::Instrument;
             if let Some(plugin) = handle.plugin_at_mut(track_id, slot) {
-                let data = plugin.state_save().ok().flatten();
+                let (data, error) =
+                    save_plugin_state_with_err(plugin, track_id, slot);
                 out.push(SlotState {
                     track: track_id,
                     slot,
                     data,
+                    error,
                 });
             }
         }
         for i in 0..fx_count {
             let slot = PluginSlot::Fx(i as u32);
             if let Some(plugin) = handle.plugin_at_mut(track_id, slot) {
-                let data = plugin.state_save().ok().flatten();
+                let (data, error) =
+                    save_plugin_state_with_err(plugin, track_id, slot);
                 out.push(SlotState {
                     track: track_id,
                     slot,
                     data,
+                    error,
                 });
             }
         }
