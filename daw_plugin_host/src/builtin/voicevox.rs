@@ -5,8 +5,9 @@
 //! - `set_note_metadata(bpm, entries)` で歌詞 + note 配列を受信、
 //!   background synth thread に job を投げる
 //! - synth thread が `common::voicevox::synthesize_notes_for_builtin` で
-//!   HTTP call → 合成済 mono PCM を `Arc<RwLock<Option<SynthResult>>>`
-//!   に格納
+//!   HTTP call → 合成済 mono PCM を `Arc<ArcSwapOption<SynthResult>>`
+//!   に格納 (= audio thread は lock-free `load()` で snapshot 取得、
+//!   write contention で blocking しない)
 //! - `process()` で MIDI note_on event を受信したら synth result を
 //!   playhead として持ち上げ、 stereo output に mix。 1 voice (= 全
 //!   合成 wav を 1 連続再生) という MVP。 per-note voice / global
@@ -20,10 +21,11 @@
 //! re-synth 必要なので「最初から re-synth」 で統一。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, bail};
+use arc_swap::ArcSwapOption;
 use bincode::{Decode, Encode};
 use common::plugin_db::BUILTIN_ID_VOICEVOX;
 use common::plugin_format::PluginFormat;
@@ -118,9 +120,12 @@ pub struct VoicevoxBuiltin {
     synth_tx: Option<mpsc::Sender<SynthJob>>,
     /// synth thread の join handle (deactivate / drop で join)。
     synth_thread: Option<JoinHandle<()>>,
-    /// 共有 synth 結果。 synth thread が完了で書き込む、 audio thread
-    /// が note_on で read する。
-    synth_result: Arc<RwLock<Option<SynthResult>>>,
+    /// 共有 synth 結果。 synth thread が完了で `store(Some(...))`、 audio
+    /// thread が note_on で `load()` する。 `ArcSwapOption` は lock-free
+    /// (= 内部は atomic ptr + RCU-style epoch reclamation)、 audio thread
+    /// が write contention で blocking しない (旧 `Arc<RwLock<_>>` は
+    /// write 中に read が block する RT 違反だった)。
+    synth_result: Arc<ArcSwapOption<SynthResult>>,
 
     // --- process state (audio thread) -----------------------------------
     /// 再生中 voice 群 (PR-V2.4)。 note_on で push、 wav 終端で自動 drain、
@@ -139,7 +144,7 @@ impl VoicevoxBuiltin {
             lyrics: HashMap::new(),
             synth_tx: None,
             synth_thread: None,
-            synth_result: Arc::new(RwLock::new(None)),
+            synth_result: Arc::new(ArcSwapOption::from(None)),
             active_voices: Vec::new(),
         }
     }
@@ -204,9 +209,7 @@ impl VoicevoxBuiltin {
                         continue;
                     };
                     if job.notes.is_empty() {
-                        if let Ok(mut w) = result_arc.write() {
-                            *w = None;
-                        }
+                        result_arc.store(None);
                         continue;
                     }
                     match synthesize_notes_for_builtin(
@@ -224,9 +227,7 @@ impl VoicevoxBuiltin {
                                 sample_rate,
                                 note_offsets: Arc::new(note_offsets),
                             };
-                            if let Ok(mut w) = result_arc.write() {
-                                *w = Some(res);
-                            }
+                            result_arc.store(Some(Arc::new(res)));
                             tracing::info!("VoicevoxBuiltin: synth complete");
                         }
                         Err(e) => {
@@ -340,11 +341,12 @@ impl LoadedPlugin for VoicevoxBuiltin {
         // resample は polish。
         for ev in events {
             if let crate::plugin_instance::NoteTransition::On { note_id, velocity, key } = ev.event {
-                let snapshot = self
-                    .synth_result
-                    .read()
-                    .ok()
-                    .and_then(|guard| guard.clone());
+                // Phase 6 review (RT 安全性): 旧 `Arc<RwLock<_>>` の
+                // `.read()` は write 競合で audio thread を blocking
+                // させる可能性があった。 `ArcSwapOption::load_full()` は
+                // lock-free な atomic load + Arc clone (= refcount bump)
+                // で snapshot を取得、 heap 確保 / lock なし。
+                let snapshot = self.synth_result.load_full();
                 tracing::debug!(
                     note_id, key, velocity,
                     has_synth = snapshot.is_some(),
@@ -659,13 +661,11 @@ mod tests {
         let samples: Vec<f32> = (0..128).map(|i| (i as f32) * 0.001).collect();
         let mut offsets = HashMap::new();
         offsets.insert(0, 0);
-        if let Ok(mut guard) = p.synth_result.write() {
-            *guard = Some(SynthResult {
-                samples: Arc::new(samples),
-                sample_rate: 48000,
-                note_offsets: Arc::new(offsets),
-            });
-        }
+        p.synth_result.store(Some(Arc::new(SynthResult {
+            samples: Arc::new(samples),
+            sample_rate: 48000,
+            note_offsets: Arc::new(offsets),
+        })));
         let events = vec![TimedNoteEvent {
             time: 0,
             event: crate::plugin_instance::NoteTransition::On {
