@@ -4,8 +4,10 @@
 //! Master fader / L-R peak meter は Mixer の MASTER ストリップで一本化したため、
 //! ここでは持たない。
 
-use common::model::RecordingMode;
-use daw_ui_core::{Edit, ToggleButtonStyle, Ui};
+use common::model::{AutomationTarget, MASTER_TRACK_ID, RecordingMode};
+use daw_ui_core::{
+    Edit, ScrubableNumberFormat, ScrubableNumberStyle, ToggleButtonStyle, Ui,
+};
 use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent};
@@ -14,6 +16,41 @@ const BG: Color = Color { r: 0.16, g: 0.16, b: 0.20, a: 1.0 };
 const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
 
 const TS_DEN_ITEMS: &[&str] = &["2", "4", "8", "16"];
+
+/// Phase 5 Step 5.1 follow-up (gui_01 #035): BPM scrubable_number style。
+/// sensitivity 0.5 = `1 px drag で 0.5 BPM 変化` (Ableton 流の感度)、
+/// range は SetSongBpmFromScrub handler の clamp と同じ 1..=400。
+/// drag 中の hint band 風に bg_color_dragging が transport の overall
+/// オレンジ tinge に合うよう薄橙系を選ぶ。
+const SCRUB_STYLE_BPM: ScrubableNumberStyle = ScrubableNumberStyle {
+    bg_color: Color { r: 0.13, g: 0.13, b: 0.18, a: 1.0 },
+    bg_color_hovered: Color { r: 0.18, g: 0.18, b: 0.23, a: 1.0 },
+    bg_color_dragging: Color { r: 0.45, g: 0.30, b: 0.20, a: 1.0 },
+    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    border_width: 1.0,
+    radius: 3.0,
+    font_size: 13.0,
+    sensitivity: 0.5,
+    range: Some((1.0, 400.0)),
+};
+
+/// Phase 5 Step 5.1 follow-up: TimeSig numerator scrubable_number style。
+/// 1 px drag で 0.1 だけ変化 (= 整数値だが widget は f64 値で内部保持、 表示は
+/// `Integer` で int 切り捨て)。 これで 10 px drag = 1 拍子変化、 ユーザーの
+/// 慎重さが必要な操作 (= 拍子変更は楽曲の構造変化なので飛ばすと混乱)。
+const SCRUB_STYLE_TSIG_NUM: ScrubableNumberStyle = ScrubableNumberStyle {
+    bg_color: Color { r: 0.13, g: 0.13, b: 0.18, a: 1.0 },
+    bg_color_hovered: Color { r: 0.18, g: 0.18, b: 0.23, a: 1.0 },
+    bg_color_dragging: Color { r: 0.45, g: 0.30, b: 0.20, a: 1.0 },
+    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    border_width: 1.0,
+    radius: 3.0,
+    font_size: 13.0,
+    sensitivity: 0.1,
+    range: Some((1.0, 32.0)),
+};
 
 /// Phase 4 (`docs/plan_automation.md` §6): transport bar の automation
 /// recording mode 4 way toggle のラベル列。 enum 並びは UI 並びと一致。
@@ -78,36 +115,94 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     );
     x += 28.0;
 
+    // Phase 5 Step 5.1 follow-up (gui_01 #035): BPM scrubable_number。
+    // press + 縦 drag (= 0.5 BPM/px) で連続変化、 release で確定、 single-click
+    // で text input mode、 dblclick で 120 BPM reset。 widget は per-frame
+    // on_change を発火するので、 daw_01 が `SetSongBpmFromScrub` 経由で
+    // song.bpm 更新 + 軽量 IPC で audio engine に即時伝搬する。
     let bpm_w = 64.0;
-    let bpm_resp = ui.text_input_at(
+    let bpm_resp = ui.scrubable_number_at(
         "transport_bpm_input",
         Rect { x, y: cy, w: bpm_w, h: bh },
-        &app.bpm_edit_text,
-        |s| Edit::mutate(move |app: &mut AppData| app.handle_event(AppEvent::BpmEditChanged(s))),
-    );
-    if bpm_resp.committed {
-        ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.handle_event(AppEvent::CommitBpmEdit)
-        }));
-    }
-    x += bpm_w + 12.0;
-
-    // time_sig (numerator) 入力欄
-    let ts_num_w = 36.0;
-    let ts_num_resp = ui.text_input_at(
-        "transport_time_sig_num",
-        Rect { x, y: cy, w: ts_num_w, h: bh },
-        &app.time_sig_num_edit_text,
-        |s| {
+        f64::from(app.song.bpm),
+        120.0,
+        ScrubableNumberFormat::Decimal(1),
+        &SCRUB_STYLE_BPM,
+        move |v| {
+            #[allow(clippy::cast_possible_truncation)]
+            let next = v as f32;
             Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::TimeSigNumEditChanged(s))
+                app.handle_event(AppEvent::SetSongBpmFromScrub(next))
             })
         },
     );
-    if ts_num_resp.committed {
-        ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.handle_event(AppEvent::CommitTimeSigNumEdit)
-        }));
+    // Phase 4 Step B 流 ParamGesture edge 検知: drag 開始 (= dragging
+    // false→true) で `ParamGestureBegin`、 終了で `ParamGestureEnd` を発火。
+    // target = SongTempo、 track_id = MASTER_TRACK_ID (= master row 配下の
+    // song-level lane を指す sentinel)。
+    let songtempo_was_dragging = app
+        .active_param_gestures
+        .contains(&(MASTER_TRACK_ID, AutomationTarget::SongTempo));
+    if bpm_resp.dragging != songtempo_was_dragging {
+        if bpm_resp.dragging {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ParamGestureBegin {
+                    track_id: MASTER_TRACK_ID,
+                    target: AutomationTarget::SongTempo,
+                    display_name: "Tempo".to_string(),
+                })
+            }));
+        } else {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ParamGestureEnd {
+                    track_id: MASTER_TRACK_ID,
+                    target: AutomationTarget::SongTempo,
+                })
+            }));
+        }
+    }
+    x += bpm_w + 12.0;
+
+    // Phase 5 Step 5.1 follow-up: TimeSig numerator scrubable_number。
+    // 整数表示 (= 4 / 5 / 7 等)、 widget は内部 f64 で scrub、 表示は Integer
+    // で round して整数化。 target = SongTimeSigNumerator で master row へ
+    // 同 idiom で gesture / recording 経路を通す。
+    let ts_num_w = 36.0;
+    let ts_resp = ui.scrubable_number_at(
+        "transport_time_sig_num",
+        Rect { x, y: cy, w: ts_num_w, h: bh },
+        f64::from(app.song.time_sig.0),
+        4.0,
+        ScrubableNumberFormat::Integer,
+        &SCRUB_STYLE_TSIG_NUM,
+        move |v| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let next = v.round().clamp(1.0, 32.0) as u8;
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetSongTimeSigNumFromScrub(next))
+            })
+        },
+    );
+    let tsig_was_dragging = app
+        .active_param_gestures
+        .contains(&(MASTER_TRACK_ID, AutomationTarget::SongTimeSigNumerator));
+    if ts_resp.dragging != tsig_was_dragging {
+        if ts_resp.dragging {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ParamGestureBegin {
+                    track_id: MASTER_TRACK_ID,
+                    target: AutomationTarget::SongTimeSigNumerator,
+                    display_name: "TimeSig Num".to_string(),
+                })
+            }));
+        } else {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ParamGestureEnd {
+                    track_id: MASTER_TRACK_ID,
+                    target: AutomationTarget::SongTimeSigNumerator,
+                })
+            }));
+        }
     }
     x += ts_num_w + 4.0;
 

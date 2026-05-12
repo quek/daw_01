@@ -1058,10 +1058,14 @@ SongTimeSigNumerator lane が curve / point / clip と full feature で編集可
 - [x] `arrangement_view::draw` で master_row 組み立て + 第 N+1 引数として
       widget へ渡す。 `build_arrangement_lanes_from_slice` を新設 (track /
       song_lanes 共通)
-- [ ] transport の BPM input drag / TimeSig num input drag が
+- [x] transport の BPM input drag / TimeSig num input drag が
       `ParamGestureBegin/End { target: SongTempo / SongTimeSigNumerator }`
-      を発火する — Step 5.1 follow-up (= 別 commit、 transport.rs に drag
-      handle + gesture wire を入れる)
+      を発火する — gui_01 #035 で `scrubable_number_at` widget 要望、
+      Phase 64a で landing (gui_01 commit 59c3101 + 7a03c14)、 daw_01 側で
+      transport.rs を `text_input_at` → `scrubable_number_at` 置換 + edge
+      検知 ParamGesture wire + `AppEvent::SetSongBpmFromScrub` /
+      `SetSongTimeSigNumFromScrub` + 軽量 IPC `MainToChild::SetSongBpm` /
+      `SetSongTimeSigNumerator` を 1 commit で完了 (2026-05-12)
 - [ ] **smoke test (Step 5.1)**: `cargo run -p daw_gui` で起動 → arrangement
       上端に Master row が見える → `A` キー (BPM input touch 後) で
       SongTempo lane が master row に追加 → master row body dblclick で clip

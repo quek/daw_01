@@ -325,6 +325,17 @@ pub enum MainToChild {
     SetTrackPan { track: u32, pan: f32 },
     SetTrackMuted { track: u32, muted: bool },
     SetTrackSolo { track: u32, solo: bool },
+    /// Phase 5 Step 5.1 follow-up (gui_01 #035 + daw_01 transport scrub):
+    /// BPM 軽量更新。 transport の scrubable_number drag 中に毎 frame 流れ
+    /// うる想定なので、 `LoadSong` (= 全 Song serialize) ではなく単 field の
+    /// 更新のみで済むよう新 variant 化。 audio engine は `shared.song` を
+    /// ArcSwap で clone-mutate-store して反映 (= 1 frame 内で SongTempo lane
+    /// があっても `evaluate_song_tempo` が new bpm を引く)。 1.0..=400.0 で
+    /// clamp 想定。
+    SetSongBpm { bpm: f32 },
+    /// Phase 5 Step 5.1 follow-up: TimeSig 分子 (numerator) の軽量更新。
+    /// 1..=32 で clamp 想定。 `SetSongBpm` と同 idiom。
+    SetSongTimeSigNumerator { num: u8 },
     /// Phase 4 Step C-2 (`docs/plan_automation.md` §6): GUI が現在 recording
     /// 中の lane (track + target の 2 つ組) を audio thread に通知する。
     /// audio thread は受信時 SharedState 上の HashSet を ArcSwap で更新し、

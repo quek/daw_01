@@ -219,6 +219,22 @@ async fn recv_loop(
                     }
                 });
             }
+            Ok(MainToChild::SetSongBpm { bpm }) => {
+                // Phase 5 Step 5.1 follow-up: BPM 軽量更新。 LoadSong を回避
+                // して shared.song の inner bpm のみ swap。 ArcSwap で clone →
+                // mutate → store の atomic publish。 BPM scrub drag 中の毎
+                // frame 入力で audio engine が即時追随する。
+                let clamped = bpm.clamp(1.0, 400.0);
+                update_song_track(&shared, |s| {
+                    s.bpm = clamped;
+                });
+            }
+            Ok(MainToChild::SetSongTimeSigNumerator { num }) => {
+                let clamped = num.clamp(1, 32);
+                update_song_track(&shared, |s| {
+                    s.time_sig.0 = clamped;
+                });
+            }
             Ok(MainToChild::SetRecordingLanes { lanes }) => {
                 // Phase 4 Step C-2: GUI が「現在 recording 中の lane」 セットを
                 // 送ってきた。 ArcSwap で snapshot を replace し、 audio thread

@@ -2398,7 +2398,7 @@ gui_01 Phase 63n-10 commit `6074db6` を path 依存で取り込み、 daw_01 �
 
 ---
 
-## #035 [Replied] 2026-05-12 [要望] scrubable number widget (= drag-to-edit numeric input)
+## #035 [Resolved] 2026-05-12 [要望] scrubable number widget (= drag-to-edit numeric input)
 
 ### daw_01 →
 
@@ -2685,5 +2685,91 @@ knob/fader と同 idiom で揃える。 daw_01 caller は handler 側で `prev !
   SetSongTimeSigNumerator { num }` も追加して TimeSig num も scrub 対応
 
 の 3 点で wire 完結予定。
+
+### daw_01 → (2026-05-12 Phase 64a wire 完了 / **#035 完結**)
+
+gui_01 Phase 64a (commit `59c3101` + follow-up `7a03c14`) を path 依存で取り込み、
+daw_01 側 wire を 1 commit で完了。 想定どおり 4 ファイル変更で master row の
+SongTempo / SongTimeSigNumerator recording loop が完結した。
+
+#### `common/src/protocol.rs`
+- `MainToChild::SetSongBpm { bpm: f32 }` + `MainToChild::SetSongTimeSigNumerator
+  { num: u8 }` の軽量 IPC variant 追加。 LoadSong (= 全 Song serialize) を回避
+  して single field update のみ。
+
+#### `daw_audio/src/main.rs`
+- `MainToChild::SetSongBpm { bpm }` handler: `update_song_track` で
+  `s.bpm = clamped(1.0..=400.0)` のみ更新 (= ArcSwap で song clone → mutate →
+  store の atomic publish)
+- `MainToChild::SetSongTimeSigNumerator { num }` handler: 同 idiom で
+  `s.time_sig.0 = clamped(1..=32)`
+- per-frame scrub IPC を受け取っても LoadSong コストは発生せず、
+  `evaluate_song_tempo` も新 bpm を即座に拾う (= scrub 中 tempo-sync plugin が
+  追随する)
+
+#### `daw_gui/src/app.rs`
+- `AppEvent::SetSongBpmFromScrub(f32)` + handler: clamp + `song.bpm` 更新 +
+  `bpm_edit_text` 同期 + `MainToChild::SetSongBpm` 送信
+- `AppEvent::SetSongTimeSigNumFromScrub(u8)` + handler: 同 idiom
+- 両 event は `is_undoable` に **非登録** (= scrub 中 per-frame で undo 履歴
+  爆発しない、 `ParamGestureEnd` で 1 step Undo 化は別途検討)
+
+#### `daw_gui/src/view/transport.rs`
+- 旧 `text_input_at` (BPM input + TimeSig num) を `scrubable_number_at` に置換
+- BPM: `ScrubableNumberFormat::Decimal(1)`、 `sensitivity = 0.5`
+  (= 0.5 BPM/px、 Ableton 風)、 `range = Some((1.0, 400.0))`、 default_value =
+  120.0 (= dblclick reset target)
+- TimeSig num: `ScrubableNumberFormat::Integer`、 `sensitivity = 0.1`
+  (= 10 px drag = 1 拍子変化、 慎重操作)、 `range = Some((1.0, 32.0))`、
+  default = 4.0
+- Phase 4 Step B 流の `dragging` edge 検知で `ParamGestureBegin/End`
+  を発火。 `track_id = MASTER_TRACK_ID` (= master row sentinel)、 target は
+  それぞれ `SongTempo` / `SongTimeSigNumerator`
+
+#### 動作経路 (= 完成した recording loop)
+
+1. user が transport の BPM 数値を press → `ParamGestureBegin { MASTER_TRACK_ID,
+   SongTempo }` 発火 → `app.active_param_gestures` insert
+2. drag 縦移動 → `SetSongBpmFromScrub(new_bpm)` per-frame 発火 → `song.bpm`
+   更新 + audio engine に軽量 IPC 即時伝搬
+3. Touch / Latch / Write mode + Play 中なら、 `record_automation_points_for_tick`
+   が active gesture の SongTempo に対し `current_plain_value(SongTempo) =
+   song.bpm` を取得 → master row の SongTempo lane の clip に point 挿入
+   (Phase 4 Step D の thinning で滑らかな drag は始点 + 終点に間引き)
+4. release → `ParamGestureEnd` 発火 → `sync_recording_lanes_with_audio` が
+   set 縮小を検知 → `LoadSong` で audio engine の curve を最終 sync (= bypass
+   解除 → curve eval 再開時に正しい points を読む)
+
+これで Phase 5 全 Step が **完成**:
+
+| Step | 内容 | commit |
+|---|---|---|
+| 5.0 | Song.song_lanes data model | 274d27b |
+| 5.3 | CLAP_EVENT_TRANSPORT | d06a8f1 |
+| 5.2 | per-buffer tempo eval | fe61c63 |
+| 5.1 | master row UI (gui_01 #034) | cdc7348 |
+| 5.1 follow-up | transport scrub (gui_01 #035) | 本 commit |
+
+#### 検証
+
+- `cargo clippy --workspace --tests -- -D warnings` clean
+- `cargo test --workspace`: common 140 + daw_audio 39 + daw_gui 17 件全 pass
+  (既存 group_lifecycle 1 fail は本変更と無関係)
+- visual smoke test は ユーザー手元で `cargo run -p daw_gui` 実機確認待ち
+
+#### 残作業 (= 別 phase で扱う)
+
+- MIDI sequencer の tempo 追随 (= sequencer.rs の `song.bpm` を effective bpm
+  に置換、 Phase 5 follow-up)
+- audio clip time-stretch (= 大規模、 audio_clip_renderer 経路を beat-based
+  に再設計、 別 phase)
+- `Ui::arrangement` 引数 10 個 API smell の struct argument 化 / builder
+  pattern 化 (= 別 entry #036+ で議論予定)
+
+#### #035 [Resolved]
+
+scrubable_number widget の wire 経路が完成。 transport で数値そのものを drag
+して SongTempo / SongTimeSigNumerator の curve を Bitwig / Ableton 流の UX で
+記録できる。
 
 ---

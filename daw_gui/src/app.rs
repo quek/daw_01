@@ -1574,6 +1574,16 @@ pub enum AppEvent {
     CommitTimeSigNumEdit,
     /// time_sig denominator dropdown で選択された (2/4/8/16 のみ valid)。 Undo 対象。
     SetSongTimeSigDenominator(u8),
+    /// Phase 5 Step 5.1 follow-up (gui_01 #035): transport の BPM
+    /// scrubable_number drag 中に流れる連続 BPM 変化。 widget 内で 1.0..=400.0
+    /// に clamp 済前提だが defensive で再 clamp。 `bpm_edit_text` も同期して
+    /// text input mode の表示を追随させる。 Undo 対象外 (= 連続発火、
+    /// release edge の ParamGestureEnd で 1 step Undo 化を別途検討)。
+    /// 軽量 IPC `MainToChild::SetSongBpm` で audio engine 即時反映。
+    SetSongBpmFromScrub(f32),
+    /// Phase 5 Step 5.1 follow-up: TimeSig numerator scrub。 1..=32 clamp、
+    /// `time_sig_num_edit_text` 同期、 軽量 IPC `MainToChild::SetSongTimeSigNumerator`。
+    SetSongTimeSigNumFromScrub(u8),
     Undo,
     Redo,
     PushUndoSnapshot,
@@ -2416,6 +2426,22 @@ impl AppData {
             }
             AppEvent::CommitBpmEdit => {
                 self.commit_bpm_edit();
+            }
+            AppEvent::SetSongBpmFromScrub(next) => {
+                let clamped = next.clamp(1.0, 400.0);
+                if (self.song.bpm - clamped).abs() > f32::EPSILON {
+                    self.song.bpm = clamped;
+                    self.bpm_edit_text = format!("{:.1}", clamped);
+                    self.send_audio(MainToChild::SetSongBpm { bpm: clamped });
+                }
+            }
+            AppEvent::SetSongTimeSigNumFromScrub(next) => {
+                let clamped = next.clamp(1, 32);
+                if self.song.time_sig.0 != clamped {
+                    self.song.time_sig.0 = clamped;
+                    self.time_sig_num_edit_text = clamped.to_string();
+                    self.send_audio(MainToChild::SetSongTimeSigNumerator { num: clamped });
+                }
             }
             AppEvent::TimeSigNumEditChanged(s) => {
                 self.time_sig_num_edit_text = s;
