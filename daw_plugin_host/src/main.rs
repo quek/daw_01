@@ -1517,8 +1517,35 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
                 "ClosePluginShmem reached plugin_host (should be daw_audio only)"
             );
         }
-        other => {
-            tracing::info!(?other, "received (no handler)");
+        // Phase 6 review (enum exhaustiveness fix): 旧コードは `other =>` で
+        // 無視していて、 `MainToChild` に新 variant を追加してもコンパイラ
+        // が警告してくれず、 取りこぼし easy だった。 audio-engine 専属の
+        // command 群を明示的に列挙して、 plugin_host では no-op であることを
+        // doc 化する。 これで新 variant 追加時に rustc が match arm 不足を
+        // 強制してくれる。
+        //
+        // 以下は全て daw_audio が consume するもの (= plugin_host で受け取って
+        // も意味がない / 過剰ログを避けるため silent ignore)。 daw_gui の
+        // broadcaster が両 child に等しく fan-out する設計のため plugin_host
+        // にも届く。
+        MainToChild::Ack
+        | MainToChild::Play
+        | MainToChild::Stop
+        | MainToChild::Session(_)
+        | MainToChild::LoadSong(_)
+        | MainToChild::SetLoop(_)
+        | MainToChild::SetMasterGain(_)
+        | MainToChild::BounceClipFxOnline { .. }
+        | MainToChild::SeekTo { .. }
+        | MainToChild::SetProjectDir(_)
+        | MainToChild::SetTrackVolume { .. }
+        | MainToChild::SetTrackPan { .. }
+        | MainToChild::SetTrackMuted { .. }
+        | MainToChild::SetTrackSolo { .. }
+        | MainToChild::SetSongBpm { .. }
+        | MainToChild::SetSongTimeSigNumerator { .. }
+        | MainToChild::SetRecordingLanes { .. } => {
+            // daw_audio 専属、 plugin_host では no-op (silent)。
         }
     }
 }
