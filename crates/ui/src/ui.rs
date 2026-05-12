@@ -89,12 +89,17 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// M8 Phase 30: 前フレームに登場した focusable widget の (id, rect) 一覧。
     /// Tab / arrow nav の対象決定用。
     last_focusable: Vec<(WidgetId, Rect)>,
-    /// M8: `frame_to_edits` で Ui が書いた transient な request 群。`frame` の後半で読まれる。
-    /// `frame_to_edits` 単独で low-level に使う場合は `take_frame_outputs()` で取り出せる。
+    /// M8: `frame_to_edits` で Ui が書いた transient な request 群。`frame()` の後半で
+    /// drain される (undo/redo apply, clipboard write, dialog 同期実行, cursor flush)。
+    ///
+    /// **`frame_to_edits` 単独で使う場合の挙動**: 各 transient フィールドは `frame_to_edits`
+    /// 冒頭で `clear()` されるため、 累積 leak はない (call N+1 で N 件目の transient は捨てられる)。
+    /// ただし undo/redo / clipboard write / dialog 同期実行 は **発火しない**。
+    /// edits を audio thread に送る用途では transient は通常不要だが、 必要なら
+    /// `frame()` を使う (内部で `frame_to_edits` + transient drain + 自動 request_redraw を実行)。
     transient_undo_requested: bool,
     transient_redo_requested: bool,
     transient_clipboard_writes: Vec<String>,
-    transient_clipboard_writes_bytes: Vec<(&'static str, Vec<u8>)>,
     transient_dialog_requests: Vec<DialogRequest>,
     transient_consumed_dialog_results: HashSet<&'static str>,
     /// M9 Phase 41b: 今フレームに `Ui::set_cursor` で要求された cursor (last call wins)。
@@ -181,7 +186,6 @@ impl<M: ?Sized + 'static> UiHost<M> {
             transient_undo_requested: false,
             transient_redo_requested: false,
             transient_clipboard_writes: Vec::new(),
-            transient_clipboard_writes_bytes: Vec::new(),
             transient_dialog_requests: Vec::new(),
             transient_consumed_dialog_results: HashSet::new(),
             transient_cursor: None,
@@ -356,13 +360,9 @@ impl<M: ?Sized + 'static> UiHost<M> {
             for s in self.transient_clipboard_writes.drain(..) {
                 c.set_text(s);
             }
-            for (mime, bytes) in self.transient_clipboard_writes_bytes.drain(..) {
-                c.set_bytes(mime, bytes);
-            }
         } else {
             // provider 無しなら捨てる
             self.transient_clipboard_writes.clear();
-            self.transient_clipboard_writes_bytes.clear();
         }
 
         // M8 Phase 34: file dialog 同期実行。結果は次フレームで `take_dialog_result` から取り出される。
@@ -403,11 +403,13 @@ impl<M: ?Sized + 'static> UiHost<M> {
     /// `Edit<M>` の apply タイミングを自前で制御したい場合 (audio thread に送る、
     /// batch apply、undo stack 等) のみ使用する。通常は [`Self::frame`] を使うこと。
     ///
-    /// 注: この API では **自動 `request_redraw` は呼ばれない**。利用者が edits 検出時に
-    /// 手動で `WindowBackend::request_redraw` を呼ぶ責任を負う。
-    /// undo/redo / clipboard write / dialog 同期実行など `Edit` 以外の副作用は `UiHost` の
-    /// transient フィールドに格納され、`take_frame_outputs()` で取り出すか、`frame()` で
-    /// 自動処理される。
+    /// 挙動の特徴:
+    /// - 戻り値の `Vec<Edit<M>>` は **apply されていない**。 caller が `apply` を呼ぶ責任を負う。
+    /// - **自動 `request_redraw` は呼ばれない**。 caller が edits 検出時に手動で
+    ///   `WindowBackend::request_redraw` を呼ぶ責任を負う。
+    /// - undo/redo / clipboard write / dialog 同期実行 など `Edit` 以外の副作用は
+    ///   **発火しない** (transient フィールドは累積せず冒頭で `clear()` されるので leak はないが、
+    ///   ユーザに伝わらない)。 これらを使いたい場合は [`Self::frame`] を使うこと。
     #[allow(clippy::too_many_lines)]
     pub fn frame_to_edits<F>(
         &mut self,
@@ -474,7 +476,6 @@ impl<M: ?Sized + 'static> UiHost<M> {
         self.transient_undo_requested = false;
         self.transient_redo_requested = false;
         self.transient_clipboard_writes.clear();
-        self.transient_clipboard_writes_bytes.clear();
         self.transient_dialog_requests.clear();
         self.transient_consumed_dialog_results.clear();
         self.transient_cursor = None;
@@ -546,8 +547,6 @@ impl<M: ?Sized + 'static> UiHost<M> {
             history_redo_label,
             pending_clipboard_paste,
             pending_clipboard_writes: &mut self.transient_clipboard_writes,
-            pending_clipboard_paste_bytes: HashMap::new(),
-            pending_clipboard_writes_bytes: &mut self.transient_clipboard_writes_bytes,
             pending_dialog_requests: &mut self.transient_dialog_requests,
             consumed_dialog_results: &mut self.transient_consumed_dialog_results,
             dialog_results: &self.pending_dialog_results,
@@ -726,9 +725,6 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     pub(crate) pending_clipboard_paste: Option<String>,
     /// `set_clipboard_text` で積まれる write リクエスト (frame 末尾に provider.set_text)。
     pub(crate) pending_clipboard_writes: &'a mut Vec<String>,
-    /// MIME bytes の paste/write (M8 では skeleton 経由のみ、provider default は no-op)。
-    pub(crate) pending_clipboard_paste_bytes: HashMap<&'static str, Vec<u8>>,
-    pub(crate) pending_clipboard_writes_bytes: &'a mut Vec<(&'static str, Vec<u8>)>,
     // ---- M8 Phase 34 dialog ----
     pub(crate) pending_dialog_requests: &'a mut Vec<DialogRequest>,
     pub(crate) consumed_dialog_results: &'a mut HashSet<&'static str>,
@@ -1376,16 +1372,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // 最後勝ちの semantics を維持するため、既存を clear して push。
         self.pending_clipboard_writes.clear();
         self.pending_clipboard_writes.push(s);
-    }
-
-    /// MIME bytes の paste を取り出す (M8 では skeleton、provider default は no-op)。
-    pub fn take_clipboard_paste_bytes(&mut self, mime: &'static str) -> Option<Vec<u8>> {
-        self.pending_clipboard_paste_bytes.remove(mime)
-    }
-
-    /// MIME bytes を clipboard に書き込む (M8 では skeleton)。
-    pub fn set_clipboard_bytes(&mut self, mime: &'static str, bytes: Vec<u8>) {
-        self.pending_clipboard_writes_bytes.push((mime, bytes));
     }
 
     // ============================================================

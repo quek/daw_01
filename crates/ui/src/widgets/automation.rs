@@ -196,6 +196,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         response.hovered_point_index = hovered_idx;
 
         // drag state 更新 (scope を分けて borrow を early release)
+        // press 時に points.len() を確認し、 drag 開始可否を確定。 release 後または points が
+        // 外部削除されて stale idx を持つ場合は drag = None にリセット (idx が範囲外なら
+        // on_change を呼ばない)。
         let drag = {
             let state: &mut AutomationCurveState = self.widget_state(wid);
             if pointer.primary_just_pressed
@@ -207,11 +210,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             if pointer.primary_just_released {
                 state.drag = None;
             }
+            // stale idx (caller が点を削除等で points.len() が縮んだ) の defensive clear
+            if let Some((idx, _)) = state.drag
+                && idx >= points.len()
+            {
+                state.drag = None;
+            }
             state.drag
         };
 
         // drag 中なら Edit 発行 (1 フレームに 1 回呼ばれる on_change はその場で消費)
         if let Some((idx, _initial)) = drag
+            && idx < points.len()
             && let Some((px, py)) = pointer.pos
         {
             response.dragging = true;

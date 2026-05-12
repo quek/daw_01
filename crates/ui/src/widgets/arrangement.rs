@@ -1849,6 +1849,8 @@ struct LoopDragSession {
     kind: LoopDragKind,
     anchor_loop: (f64, f64),
     anchor_press_beat: f64,
+    /// press 時 mouse x (release frame の巻き戻し検知用、 `ClipDragSession.anchor_mouse` と同 idiom)。
+    anchor_mouse_x: f32,
     /// drag 中の最終 mouse x 位置 (release frame の `pointer.pos` に頼らないための保険、
     /// `ClipDragSession.last_mouse` と同じ理由)。
     last_mouse_x: f32,
@@ -1896,6 +1898,8 @@ struct TrackVolumeDragSession {
     anchor_volume: f32,
     /// drag 開始時の band rect (mouse_x → 0..1 マップに使用、release frame に view が変化しても安定)。
     band_rect: Rect,
+    /// press 時 mouse x (release frame の巻き戻し検知用、 `ClipDragSession.anchor_mouse` と同 idiom)。
+    anchor_mouse_x: f32,
     /// drag 中の最終 mouse x 位置 (release frame の `pointer.pos` に頼らない保険)。
     last_mouse_x: f32,
     /// M10 Phase 49: drag 中に最後に発火した volume 値 (毎 frame 同値発火を抑制)。
@@ -2298,6 +2302,7 @@ fn compute_loop_drag_endpoints(
 /// FNV-1a 風 fold (大きな素数倍 + xor)。 100 clip × 4 fold step = ~100ns @ 4GHz、 16ms 予算
 /// の 0.001%。 `ArrangementClip` は gui_01 公開型なので widget が hash する権利あり (no-Clone
 /// 不変条件にも触れない、 `u32`/`f64` は Copy)。
+#[allow(clippy::too_many_lines)]
 fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
     const PRIME: u64 = 0x100_0000_01B3; // FNV-1a 64bit prime
     let mut h: u64 = 0xCBF2_9CE4_8422_2325; // FNV-1a 64bit offset basis
@@ -2310,6 +2315,30 @@ fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
             h ^= c.start_beat.to_bits();
             h = h.wrapping_mul(PRIME);
             h ^= c.len_beats.to_bits();
+            h = h.wrapping_mul(PRIME);
+            // name: Arc<str> の ptr で簡易検知 (refcount bump は同 ptr、 rename / replace で
+            // new Arc → ptr 変化)。 内容 hash は O(n) で過剰、 ptr 比較で十分。
+            h ^= c.name.as_ptr() as u64;
+            h = h.wrapping_mul(PRIME);
+            // color / share_group_color: 描画色変化を検知 (automation clip arm と対称、
+            // None は u64::MAX sentinel)。
+            let color_marker = match c.color {
+                None => u64::MAX,
+                Some(col) => {
+                    let mut a: u64 = 0xA5A5_5A5A_A5A5_5A5A;
+                    a ^= u64::from(col.r.to_bits());
+                    a = a.wrapping_mul(PRIME);
+                    a ^= u64::from(col.g.to_bits());
+                    a = a.wrapping_mul(PRIME);
+                    a ^= u64::from(col.b.to_bits());
+                    a = a.wrapping_mul(PRIME);
+                    a ^= u64::from(col.a.to_bits());
+                    a
+                }
+            };
+            h ^= color_marker;
+            h = h.wrapping_mul(PRIME);
+            h ^= c.share_group_color.map_or(u64::MAX, |hue| u64::from(hue.to_bits()));
             h = h.wrapping_mul(PRIME);
             // M14 Phase 63k (#025): audio_edit (gain_db / fade_in/out_beats / fade curve) も
             // viewport_key に反映させて、 caller が gain / fade を更新したら cache が再構築されるよう保証。
@@ -4480,6 +4509,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         kind,
                         anchor_loop,
                         anchor_press_beat: anchor_press_beat_for_session,
+                        anchor_mouse_x: px,
                         last_mouse_x: px,
                         last_alt: press_alt,
                     });
@@ -4527,6 +4557,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                             track_id: t.id,
                             anchor_volume: av,
                             band_rect: band,
+                            anchor_mouse_x: px,
                             last_mouse_x: px,
                             last_emitted_volume: av,
                         });
@@ -5023,21 +5054,27 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     nd.last_mouse = (px, py);
                 }
             }
-            if let Some(ref mut ld) = state.loop_drag
-                && !is_release
-            {
-                ld.last_mouse_x = px;
-                // M14 Phase 63j (#024): last_alt は continuation で update、 release は
-                // skip (clip_drag と同じ pattern、 OS event 順序による false 化 race を回避)。
-                ld.last_alt = alt_now;
+            if let Some(ref mut ld) = state.loop_drag {
+                if !is_release {
+                    ld.last_mouse_x = px;
+                    // M14 Phase 63j (#024): last_alt は continuation で update、 release は
+                    // skip (clip_drag と同じ pattern、 OS event 順序による false 化 race を回避)。
+                    ld.last_alt = alt_now;
+                } else if (px - ld.anchor_mouse_x).abs() > f32::EPSILON {
+                    // release frame で pointer.pos が press 位置と異なる = winit が press 位置に
+                    // 巻き戻していない → 真値として update (clip_drag と同 pattern)。
+                    ld.last_mouse_x = px;
+                }
             }
             if let Some(ref mut tr) = state.track_reorder
-                && !is_release
+                // continuation は常に update。 release 時は winit 巻き戻し検知のため
+                // anchor と differ する場合のみ update (clip_drag と同 pattern)。
+                && (!is_release || (py - tr.anchor_mouse_y).abs() > f32::EPSILON)
             {
                 tr.last_mouse_y = py;
             }
             if let Some(ref mut tv) = state.track_volume_drag
-                && !is_release
+                && (!is_release || (px - tv.anchor_mouse_x).abs() > f32::EPSILON)
             {
                 tv.last_mouse_x = px;
             }
@@ -6540,12 +6577,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     // press_i32 + track_delta も visible domain で clamp する。
                     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                     let max_idx_i32 = (visible_tracks.len().saturating_sub(1)) as i32;
+                    // master_row 有りなら visible_tracks[0] は synthetic master (id=MASTER_TRACK_ID)。
+                    // clip drop 先から master を除外 (track_header drag / DoubleClickEmpty と
+                    // 同じ guard、 ここだけ漏れていた)。 visible_tracks に通常 track が無い退化
+                    // ケース (master のみ) は max < min となり clamp が panic するので max を
+                    // min まで底上げして fallback (visible_tracks.get(1) = None → 元 track id)。
+                    let min_idx_i32 = i32::from(master_row.is_some());
+                    let clamp_max = max_idx_i32.max(min_idx_i32);
                     let mut deltas: Vec<MoveClipDelta> = Vec::new();
                     for a in &nd.anchors {
                         let new_start = (a.start_beat + beat_delta).max(0.0);
                         #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
                         let press_i32 = a.track_index as i32;
-                        let new_idx = (press_i32 + track_delta).clamp(0, max_idx_i32);
+                        let new_idx = (press_i32 + track_delta).clamp(min_idx_i32, clamp_max);
                         #[allow(clippy::cast_sign_loss)]
                         let new_idx_u = new_idx.max(0) as usize;
                         let new_track_id = visible_tracks
@@ -8863,6 +8907,45 @@ mod tests {
         );
     }
 
+    /// MIDI clip arm の hash gap fix (share_group_color / color / name) regression test。
+    /// caller が share_group / clip color を変更した frame で viewport_key も更新されることを保証。
+    #[test]
+    fn fold_arrangement_clip_hash_changes_on_share_group_color() {
+        let before = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        let mut c_after = clip(100, 0.0, 4.0, "c");
+        c_after.share_group_color = Some(0.5);
+        let after = vec![track(10, "t0", vec![c_after])];
+        assert_ne!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after),
+            "clip.share_group_color None→Some で hash が変わる",
+        );
+    }
+
+    #[test]
+    fn fold_arrangement_clip_hash_changes_on_clip_color() {
+        let before = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        let mut c_after = clip(100, 0.0, 4.0, "c");
+        c_after.color = Some(daw_ui_renderer::Color::rgb(0.8, 0.2, 0.2));
+        let after = vec![track(10, "t0", vec![c_after])];
+        assert_ne!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after),
+            "clip.color 変化で hash が変わる",
+        );
+    }
+
+    #[test]
+    fn fold_arrangement_clip_hash_changes_on_clip_rename() {
+        let before = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "old name")])];
+        let after = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "new name")])];
+        assert_ne!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after),
+            "clip.name (Arc<str>) ptr 変化で hash が変わる",
+        );
+    }
+
     // ============================================================
     // M14 Phase 63c (#016): group hierarchy + multi-select + reparent
     // ============================================================
@@ -9345,6 +9428,7 @@ mod tests {
             kind: LoopDragKind::Start,
             anchor_loop: (4.0, 12.0),
             anchor_press_beat: 4.0,
+            anchor_mouse_x: 0.0,
             last_mouse_x: 0.0,
             last_alt: false,
         };
@@ -9362,6 +9446,7 @@ mod tests {
             kind: LoopDragKind::End,
             anchor_loop: (4.0, 12.0),
             anchor_press_beat: 12.0,
+            anchor_mouse_x: 0.0,
             last_mouse_x: 0.0,
             last_alt: false,
         };
@@ -9380,6 +9465,7 @@ mod tests {
             kind: LoopDragKind::Middle,
             anchor_loop: (4.0, 12.0),
             anchor_press_beat: 6.0, // press 位置 (anchor_loop 内側のどこか)
+            anchor_mouse_x: 0.0,
             last_mouse_x: 0.0,
             last_alt: false,
         };
@@ -9406,6 +9492,7 @@ mod tests {
             kind: LoopDragKind::NewRange,
             anchor_loop: (2.0, 2.0),
             anchor_press_beat: 2.0,
+            anchor_mouse_x: 0.0,
             last_mouse_x: 0.0,
             last_alt: false,
         };
@@ -9423,6 +9510,7 @@ mod tests {
             kind: LoopDragKind::NewRange,
             anchor_loop: (8.0, 8.0),
             anchor_press_beat: 8.0,
+            anchor_mouse_x: 0.0,
             last_mouse_x: 0.0,
             last_alt: false,
         };
@@ -9441,6 +9529,7 @@ mod tests {
             kind: LoopDragKind::End,
             anchor_loop: (4.0, 12.0),
             anchor_press_beat: 12.0,
+            anchor_mouse_x: 0.0,
             last_mouse_x: 0.0,
             last_alt: true, // alt 押下中は snap 無効
         };
@@ -9458,6 +9547,7 @@ mod tests {
             kind: LoopDragKind::Start,
             anchor_loop: (4.0, 12.0),
             anchor_press_beat: 4.0,
+            anchor_mouse_x: 0.0,
             last_mouse_x: 0.0,
             last_alt: false,
         };

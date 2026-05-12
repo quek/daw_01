@@ -201,7 +201,7 @@ pub struct PianoRollResponse {
     /// このフレームで `NotesEditRequest::Select` を push_edit したか (= 次フレームで
     /// `selected` が変わる予定であることを app 側 UI に伝える、selection 連動 UI のトリガー)。
     pub selection_changed: bool,
-    /// drag<16px の short click の grid 上 (beat: f64, pitch: f32) (snap 前)。Insert 等の代替起点に使える。
+    /// drag<4px の short click の grid 上 (beat: f64, pitch: f32) (snap 前)。Insert 等の代替起点に使える。
     pub clicked_at_beat_pitch: Option<(f64, f32)>,
     /// (M14 Phase 59 / daw_01 #017) 歌詞編集 mode 中の note id。`Some(_)` のとき
     /// piano_roll 内に text_input overlay が出ており、drag/resize/wheel/click は全て
@@ -799,7 +799,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// # 操作
     /// - **note 中央 drag** = move (release で `NotesEditRequest::Move` 発行、Undoable)
     /// - **note 左右端 drag** = resize (release で `NotesEditRequest::Resize` 発行、Undoable)
-    /// - **note click** (drag<16px) = selection 1 個 (`NotesEditRequest::Select` 発行)
+    /// - **note click** (drag<4px) = selection 1 個 (`NotesEditRequest::Select` 発行)
     /// - **空白 click** = selection clear (同上)
     /// - **Shift+drag** = rect multi-select、**加算** (release で `NotesEditRequest::Select` 発行、
     ///   既存 `selected` ∪ rect 内の note ids)。排他にしたい場合は空白 click で clear してから drag
@@ -1006,9 +1006,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ----- drag continue (描画用 delta を計算) + release 検出 -----
-        // 拍は f64、pixel は f32 なので変換を 1 箇所で吸収。
-        let beat_per_px: f64 = view.len_beats / f64::from(grid.w.max(1.0));
-        // SnapConfig::Adaptive 用 zoom = grid.w / view.len_beats。 0 除算は beat_per_px 側で対処済み。
+        // 拍は f64、pixel は f32 なので変換を 1 箇所で吸収。 view.len_beats==0 は他の helper
+        // ([:369, :651]) と同じく 1e-6 floor で防御 (0 除算で inf が伝播するのを回避)。
+        let safe_len_beats = view.len_beats.max(1e-6);
+        let beat_per_px: f64 = safe_len_beats / f64::from(grid.w.max(1.0));
+        // SnapConfig::Adaptive 用 zoom = grid.w / view.len_beats。
         let zoom_x_px_per_beat: f32 = (1.0 / beat_per_px) as f32;
         let pitch_per_px = view.pitch_visible / grid.h.max(1.0);
         // drag 継続中は毎 continuation frame で `last_mouse` / `last_alt` を update。
@@ -1865,7 +1867,10 @@ fn draw_lyrics<M: ?Sized + 'static>(
             h: y_bot - y_top,
         };
         // note 高さに比例した font (cap = lyric_font_px_max)、 最低 7px 以上で描画。
-        let font_size = (clipped.h * 0.75).clamp(7.0, lyric_font_px_max);
+        // caller が lyric_font_px < 7.0 を style に設定した場合、 floor を cap まで下げて
+        // `f32::clamp(min > max)` の panic を防ぐ (cap が勝つ動作)。
+        let floor = 7.0_f32.min(lyric_font_px_max);
+        let font_size = (clipped.h * 0.75).clamp(floor, lyric_font_px_max);
         if clipped.h < font_size + 1.0 || clipped.w < font_size {
             continue;
         }
@@ -2616,7 +2621,7 @@ mod tests {
         assert!(model.notes.is_empty(), "id 1, 2 が削除された");
     }
 
-    /// short click (drag<16px) on note → Select request、Response.selection_changed = true。
+    /// short click (drag<4px) on note → Select request、Response.selection_changed = true。
     #[test]
     fn piano_roll_response_emits_selection_changed_on_note_click() {
         let mut host: UiHost<TestModel> = UiHost::no_redraw();
@@ -4514,6 +4519,41 @@ mod tests {
         assert_ne!(
             fold_piano_roll_note_hash(std::slice::from_ref(&n1)),
             fold_piano_roll_note_hash(std::slice::from_ref(&n2)),
+        );
+    }
+
+    /// `PianoRollStyle::lyric_font_px` を 7.0 未満に設定しても `f32::clamp(min > max)` で
+    /// panic しないことを保証する regression test。 caller が極小 cap を設定したら、 cap が
+    /// 勝つ動作 (note 高さ比例に関わらず cap を上限) に正規化される。
+    #[test]
+    fn piano_roll_lyric_draw_does_not_panic_with_tiny_lyric_font_px_cap() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        // 歌詞付き note を 1 つ持つ model + lyric_font_px = 6.0 (= floor 7.0 未満) の style。
+        let mut n = note(1, 0.0, 1.0, 60);
+        n.lyric = Some(Arc::<str>::from("a"));
+        let model = TestModel::new(vec![n]);
+        let view = test_view();
+        let style = PianoRollStyle { lyric_font_px: 6.0, ..PianoRollStyle::default() };
+        let mut scene = daw_ui_renderer::Scene::new();
+        let screen = PhysicalSize { width: 800, height: 400 };
+        let sel: Vec<NoteId> = Vec::new();
+        // panic しなければ pass (戻り値は使わない)。
+        host.frame_to_edits(
+            &model,
+            &mut scene,
+            screen,
+            FrameInput::default(),
+            |m, ui| {
+                let _ = ui.piano_roll(
+                    "test_lyric_cap",
+                    Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                    &m.notes,
+                    view,
+                    &sel,
+                    &style,
+                    |_| Edit::mutate(|_: &mut TestModel| {}),
+                );
+            },
         );
     }
 }

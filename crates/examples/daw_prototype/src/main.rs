@@ -1170,6 +1170,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
         120.0,
         daw_ui_core::ScrubableNumberFormat::Decimal(1),
         &scn_style,
+        "scrub bpm",
         |v: f64| {
             Edit::mutate(move |mm: &mut DawModel| {
                 #[allow(clippy::cast_possible_truncation)]

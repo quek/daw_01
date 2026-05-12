@@ -187,7 +187,9 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
     /// `default_value`: dblclick リセット時の値。 `style.range` の clamp は widget 側で実施。
     /// `format`: 表示書式 (Integer / Decimal(N))。 text input mode の parse もこれを SSoT に。
     /// `style`: 色 / sensitivity (units_per_pixel) / 任意 range など。
-    /// `on_change`: 値変化時の Edit を作る closure (knob_at と同形)。
+    /// `label`: drag scrub の history label (= Ctrl+Z で表示される undo 単位名)。 dblclick reset /
+    ///   text commit も同 label を共有 (drag 中含む user 操作はすべて 1 undo step に集約)。
+    /// `on_change`: 値変化時の Edit を作る closure (knob_at と同形、 `Edit::Mutate` 限定で渡すこと)。
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub fn scrubable_number_at<F>(
         &mut self,
@@ -197,6 +199,7 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
         default_value: f64,
         format: ScrubableNumberFormat,
         style: &ScrubableNumberStyle,
+        label: &'static str,
         on_change: F,
     ) -> ScrubableNumberResponse
     where
@@ -310,12 +313,21 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
         let mut edit_text: Option<String> = None;
         let dragging_now = drag_anchor.is_some() && drag_distance_y >= DRAG_THRESHOLD_PX;
 
-        // reset: dblclick で default にリセット (1 frame)。
+        // reset: dblclick で default にリセット (1 frame、 Undoable で Ctrl+Z 戻し可)。
         if reset_fired && (default_value - value).abs() > f64::EPSILON {
-            self.push_edit(on_change.clone()(default_value));
+            let on_change_fwd = on_change.clone();
+            let on_change_inv = on_change.clone();
+            let start = value;
+            let end = default_value;
+            self.push_edit(Edit::with_inverse(
+                label,
+                move |m: &mut M| on_change_fwd(end).apply(m),
+                move |m: &mut M| on_change_inv(start).apply(m),
+            ));
         }
 
-        // drag 中の per-frame 発火 (= short-click release は除外、 reset は別経路で済)。
+        // drag 中の per-frame 発火 (= short-click release は除外、 reset は別経路で済、
+        // release frame も skip — release frame は下の Undoable wrap で 1 度 commit する)。
         if !short_click_release
             && !reset_fired
             && release_initial_value.is_none()
@@ -324,13 +336,20 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
             self.push_edit(on_change.clone()(displayed_value));
         }
 
-        // release 時の最終値 (= drag scrub 完了)。 knob/fader と同 idiom で undoable な final commit。
-        if let Some(start) = release_initial_value
-            && (start - displayed_value).abs() > f64::EPSILON
+        // release 時の最終値 (= drag scrub 完了)。 fader/knob と同 idiom で Undoable wrap、
+        // forward = on_change(end) / inverse = on_change(start) で 1 undo step。
+        if let Some(start_value) = release_initial_value
+            && (start_value - displayed_value).abs() > f64::EPSILON
             && !short_click_release
         {
-            // drag scrub の最終値を 1 度 push (release frame の per-frame 発火は上で skip 済)。
-            self.push_edit(on_change.clone()(displayed_value));
+            let on_change_fwd = on_change.clone();
+            let on_change_inv = on_change.clone();
+            let end = displayed_value;
+            self.push_edit(Edit::with_inverse(
+                label,
+                move |m: &mut M| on_change_fwd(end).apply(m),
+                move |m: &mut M| on_change_inv(start_value).apply(m),
+            ));
         }
 
         // ---- text input mode (editing) の内蔵 delegate ----
@@ -494,6 +513,7 @@ mod tests {
                     default_value,
                     format,
                     style,
+                    "scrub bpm",
                     |v| Edit::mutate(move |m: &mut BpmModel| m.bpm = v),
                 );
             },

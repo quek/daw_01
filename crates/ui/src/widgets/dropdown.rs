@@ -28,9 +28,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         items: &[&str],
         selected: usize,
     ) -> Option<usize> {
-        let _wid = WidgetId::ROOT.child((b"dropdown", &id));
         let pointer = self.pointer;
-        let popup_id = ("dropdown_popup", rect.x.to_bits(), rect.y.to_bits());
+        // popup state は caller-id ベース (rect 座標を入れると 1px 動いて state 蒸発 / 同位置別
+        // dropdown で衝突する)。
+        let popup_id = ("dropdown_popup", WidgetId::ROOT.child((b"dropdown", &id)));
         let inside = pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
         let already_open = self.is_popup_open(popup_id);
 

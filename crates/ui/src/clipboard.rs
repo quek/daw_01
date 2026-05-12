@@ -20,15 +20,6 @@ pub trait ClipboardProvider: Send {
 
     /// clipboard に text を書き込む。失敗は内部で握りつぶす (no-op に degrade)。
     fn set_text(&mut self, text: String);
-
-    /// MIME 付き byte slice を取得 (DAW 内 note / clip 切り貼り用)。
-    /// M8 では default 実装は no-op (skeleton 提供のみ)。M10 で audio buffer の clipboard で活用予定。
-    fn get_bytes(&mut self, _mime: &str) -> Option<Vec<u8>> {
-        None
-    }
-
-    /// MIME 付き byte slice を書き込む。M8 では default 実装 no-op。
-    fn set_bytes(&mut self, _mime: &str, _bytes: Vec<u8>) {}
 }
 
 /// 動作不能な環境用 (test / clipboard 無効化したい environment / Linux で xclip 不在等) の
@@ -113,7 +104,5 @@ mod tests {
         assert!(c.get_text().is_none());
         c.set_text("hello".into());
         assert!(c.get_text().is_none());
-        assert!(c.get_bytes("text/plain").is_none());
-        c.set_bytes("text/plain", vec![1, 2, 3]);
     }
 }

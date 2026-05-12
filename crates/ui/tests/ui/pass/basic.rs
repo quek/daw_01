@@ -365,6 +365,7 @@ fn main() {
                 120.0,
                 ScrubableNumberFormat::Decimal(1),
                 &scn_style,
+                "scrub",
                 |_v: f64| Edit::mutate(|_m: &mut Model| {}),
             );
         },
