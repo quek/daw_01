@@ -2773,3 +2773,88 @@ scrubable_number widget の wire 経路が完成。 transport で数値そのも
 記録できる。
 
 ---
+
+## #036 [バグ報告] 2026-05-12 piano_roll の bar grid 線が一部の bar で抜ける
+
+関連仕様: gui_01 `crates/ui/src/widgets/time_grid.rs::bar_beat_grid`
+
+### 症状
+
+daw_01 の piano_roll を起動して 4 bar 程度がフィットする zoom (= 1 bar ~300 px、
+zoom_x ~75 px/beat、 BPM=120 / 4/4) で表示すると、 ruler の bar label "1",
+"2", "3", "4" のうち **bar 3 の位置だけ grid 縦線が抜ける** ように見える
+(bar 1 / 2 / 4 は線あり)。
+
+スクリーンショット (user 報告): https://_screenshot_[添付不可、 user が
+直接送付済] — Snap "1/16" toolbar、 grid 中央に notes、 下部 velocity lane
+で確認。
+
+再現条件:
+- BPM = 120, time_sig = (4, 4)
+- view_start ≒ 0、 view_len ≒ 16 beats (= 4 bar)
+- pitch_top = (デフォルト周辺)、 zoom_x ~75 px/beat
+
+### 調査結果 (daw_01 側読み)
+
+`bar_beat_grid` のアルゴリズム (time_grid.rs:236-309) は概ね正しく見えます。
+擬似コード:
+```
+for bi in beat_index_start..=beat_index_end {
+    s = bi * spb
+    if s < view_start || s > view_end: continue
+    x = rect.x + viewport.unit_to_px(s, rect.w)
+    if x < rect.x || x > rect.x + rect.w: continue
+    is_bar = bi.rem_euclid(beats_per_bar).abs() < 1e-6
+    if is_bar: push_to_bar_segs
+    elif draw_beat_lines: push_to_beat_segs
+}
+```
+
+4/4 / BPM=120 / view_start=0:
+- bi=0 (bar 1): is_bar=true, x=0
+- bi=4 (bar 2): is_bar=true, x=rect.w/4
+- bi=8 (bar 3): is_bar=true, x=rect.w/2
+- bi=12 (bar 4): is_bar=true, x=3*rect.w/4
+- bi=16: is_bar=true, x=rect.w (= boundary、 `x > rect.x + rect.w` で skip 可能?)
+
+仮説:
+1. `is_bar` 判定の `< 1e-6` が浮動小数精度ぎりぎりで一部 bar を false にする
+   (= rem_euclid の f64 精度誤差で 8.0 % 4.0 が ε 出る可能性)。
+2. 「`x > rect.x + rect.w`」 boundary check で bi=8 等の特定 bar が 1 px 外に
+   弾かれている (= viewport.view_start に微小負値が混入していれば起きうる、
+   daw_01 側 scroll は f32→f64 cast で 0.0 を保てるが要確認)。
+3. cached LOD で先 frame の primitives が re-use されている path で、 input_hash
+   collision が bi=8 だけ起きている (= 確率低いが不在を否定できず)。
+
+### 期待動作
+
+ruler の bar label と同一 x 位置に bar grid 線が必ず描画される (= 全 bar)。
+
+### 関連情報
+
+- daw_01 側で書ける workaround 無し (= widget 内で完結する描画 path)。
+- 影響: piano_roll の視覚的整合性、 user 知覚 (= 「bar 3 だけ抜けて見える」
+  の心理負荷)。 機能影響なし (= snap / hit-test / playhead 等は独立 path)。
+- 同 widget は arrangement_view でも使われるので、 アレンジビュー側でも
+  同症状が出るか要確認。
+
+### 再現用 daw_01 コード (参考)
+
+```rust
+// daw_gui/src/view/piano_roll_view.rs:88-101
+let view = PianoRollView {
+    start_beat: app.pianoroll_scroll_beat as f64,
+    len_beats: (grid_rect.w / zoom_x) as f64,
+    pitch_top: app.pianoroll_top_pitch as f32,
+    pitch_visible: grid_h / zoom_y,
+    keyboard_w: KEYBOARD_W,
+    notes_generation: app.pianoroll_notes_generation,
+    velocity_lane_h: VEL_LANE_H,
+    playhead_beat: app.playhead_beat.map(|b| b as f64),
+    ruler_h: RULER_H,
+    bpm: app.song.bpm,            // = 120.0 (f32→f64 cast 経由)
+    time_sig: app.song.time_sig,  // = (4, 4)
+    snap: snap::piano_roll_snap_config(app),
+};
+```
+
