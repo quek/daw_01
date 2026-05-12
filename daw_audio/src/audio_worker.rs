@@ -85,6 +85,10 @@ pub struct DispatchShared {
     /// or song.bpm fallback) を f32 bits で atomic 配信。 workers が
     /// `f32::from_bits(load())` で復元。
     pub current_bpm_bits: AtomicU32,
+    /// Phase 5 follow-up (MIDI tempo follow): buffer 開始時の累積 beat-domain
+    /// playhead を f64 bits で atomic 配信。 workers が
+    /// `f64::from_bits(load())` で復元、 `collect_events_for_buffer` に渡す。
+    pub playhead_beats_bits: std::sync::atomic::AtomicU64,
 }
 
 unsafe impl Send for DispatchShared {}
@@ -115,6 +119,9 @@ impl DispatchShared {
             n_input_delays: AtomicU32::new(0),
             recording_lanes_ptr: AtomicPtr::new(std::ptr::null_mut()),
             current_bpm_bits: AtomicU32::new(120.0_f32.to_bits()),
+            playhead_beats_bits: std::sync::atomic::AtomicU64::new(
+                0.0_f64.to_bits(),
+            ),
         }
     }
 }
@@ -197,6 +204,7 @@ impl AudioWorkerPool {
         input_delay_per_track: &[u32],
         recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
         current_bpm: f32,
+        playhead_beats: f64,
     ) {
         let n_tracks = song.map(|s| s.tracks.len() as u32).unwrap_or(0);
         let n_tracks = n_tracks.min(scratch.len() as u32);
@@ -254,6 +262,9 @@ impl AudioWorkerPool {
         self.shared
             .current_bpm_bits
             .store(current_bpm.to_bits(), Ordering::Release);
+        self.shared
+            .playhead_beats_bits
+            .store(playhead_beats.to_bits(), Ordering::Release);
         // PR4.5: publish per-track input delay slice so workers can read
         // their track's value without locking. Empty slice (= no
         // sidechain wiring anywhere) → null pointer + len 0.
@@ -390,6 +401,10 @@ fn run_work_loop(shared: &DispatchShared) {
     // 配信。 f32 bits を Acquire で load して復元する。
     let current_bpm =
         f32::from_bits(shared.current_bpm_bits.load(Ordering::Acquire));
+    // Phase 5 follow-up (MIDI tempo follow): playhead_beats も同様に atomic
+    // で配信。 f64 bits を Acquire で load。
+    let playhead_beats =
+        f64::from_bits(shared.playhead_beats_bits.load(Ordering::Acquire));
 
     if scratch_base.is_null()
         || plugin_refs_ptr.is_null()
@@ -471,6 +486,7 @@ fn run_work_loop(shared: &DispatchShared) {
             input_delay,
             recording_lanes,
             current_bpm,
+            playhead_beats,
         );
     }
 }

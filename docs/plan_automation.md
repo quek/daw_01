@@ -1102,8 +1102,12 @@ scope 外 (= 旧 song.bpm 定数のまま、 別 phase で対応)。
 - [ ] **smoke test (Step 5.2)**: master lane (Step 5.1 完了後) に SongTempo
       の curve を設置、 Play 中に curve に従って tempo 変化を聴覚で確認。
       tempo-sync plugin (Step 5.3) の delay 時間 / arp 速度が curve に追随
-- [ ] sequencer (MIDI note tempo 追随) / audio_clip_renderer (audio clip
-      time-stretch) は scope 外 → Phase 5 follow-up で別途
+- [x] sequencer (MIDI note tempo 追随) ✅ (2026-05-12): `collect_events_for_buffer`
+      を beat-domain refactor (= `playhead: u64` sample → `playhead_beats: f64`
+      beat + `current_bpm: f32`)、 process_track_owned に `playhead_beats: f64`
+      引数を thread、 DispatchShared.playhead_beats_bits で worker に AtomicU64
+      配信。 SongTempo curve に従って MIDI note の発音 / 終了タイミングが追随
+- [ ] audio_clip_renderer (audio clip time-stretch) は scope 外 → 別 phase で
 - [ ] recording 中の SongTempo lane bypass は Step 5.1 で transport BPM
       input が gesture 発火するようになったら追加 wire (= 現状 BPM input は
       gesture 経路に乗っていない)

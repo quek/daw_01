@@ -204,6 +204,14 @@ fn render_loop(
             (u32, common::model::AutomationTarget),
         > = std::collections::HashSet::new();
 
+        // Phase 5 follow-up (MIDI tempo follow): offline export は constant
+        // song.bpm で freewheel するので、 playhead_beats を sample-domain
+        // から linear 換算で求める (= playhead * bpm / (60 * SR))。 SongTempo
+        // lane を offline export で評価して time-stretch するのは別 phase
+        // のスコープ。
+        let playhead_beats = playhead as f64 * song.bpm as f64
+            / (60.0 * sample_rate as f64);
+
         if let Some(pool) = pool_g.as_deref() {
             pool.dispatch_and_wait(
                 Some(song),
@@ -222,6 +230,7 @@ fn render_loop(
                 &schedule.input_delay_per_track,
                 &empty_recording_lanes,
                 song.bpm,
+                playhead_beats,
             );
         } else {
             let worker_sync = worker_syncs_g.first();
@@ -250,6 +259,7 @@ fn render_loop(
                     input_delay,
                     &empty_recording_lanes,
                     song.bpm,
+                    playhead_beats,
                 );
             }
         }

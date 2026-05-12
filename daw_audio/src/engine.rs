@@ -593,6 +593,7 @@ impl LocalState {
                     &self.cached_schedule.input_delay_per_track,
                     recording_lanes,
                     current_bpm,
+                    self.playhead_beats,
                 );
             } else {
                 let worker_sync = worker_syncs_g.first();
@@ -622,6 +623,7 @@ impl LocalState {
                         input_delay,
                         recording_lanes,
                         current_bpm,
+                        self.playhead_beats,
                     );
                 }
             }
@@ -834,6 +836,10 @@ pub fn process_track_owned(
     // or song.bpm fallback)。 set_pd_transport / fill_track_param_ramps /
     // fill_pd_param_events の sample-to-beat 変換に使う。
     current_bpm: f32,
+    // Phase 5 follow-up (MIDI tempo follow): buffer 開始時の累積 beat-domain
+    // playhead。 collect_events_for_buffer に渡して beat-domain で note 配置
+    // を判定する。 変動 tempo でも note 位置が正しく追随する。
+    playhead_beats: f64,
 ) {
     let n = frames as usize;
 
@@ -875,7 +881,8 @@ pub fn process_track_owned(
             song,
             track_idx,
             sample_rate,
-            playhead,
+            playhead_beats,
+            current_bpm,
             frames,
             &mut scratch.midi_bus_a,
             &mut scratch.state.active_notes,

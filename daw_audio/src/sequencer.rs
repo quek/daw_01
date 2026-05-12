@@ -61,7 +61,14 @@ impl PerTrackState {
 }
 
 /// Walk every clip on `track_idx` and emit `On` / `Off` events that fall
-/// inside the half-open buffer `[playhead, playhead + frames)`.
+/// inside the half-open buffer `[playhead_beats, playhead_beats + buf_len_beats)`.
+///
+/// Phase 5 follow-up (MIDI tempo follow): beat-domain comparison。 caller の
+/// engine が SongTempo lane を評価した `current_bpm` と、 累積 `playhead_beats`
+/// を渡す。 sample-domain の `playhead: u64` は使わず (= 変動 tempo で sample
+/// ↔ beat の線形変換が破綻するため)、 buffer 内の time offset (= note の sample
+/// 位置) は `current_bpm` で beat → sample 換算する。 sub-buffer の tempo
+/// 変化は scope 外 (= 1 buffer 内 constant tempo、 ~5..20ms なので user 体感 OK)。
 ///
 /// `active_notes` is the audio worker's running set of pitches currently
 /// sounding for this track — the caller maintains it across buffers so it
@@ -69,11 +76,13 @@ impl PerTrackState {
 ///
 /// RT-safe: pushes into the caller-provided `out` (pre-allocated capacity)
 /// and uses `sort_unstable_by_key` (in-place pdqsort).
+#[allow(clippy::too_many_arguments)]
 pub fn collect_events_for_buffer(
     song: Option<&Song>,
     track_idx: u32,
     sample_rate: u32,
-    playhead: u64,
+    playhead_beats: f64,
+    current_bpm: f32,
     frames: u32,
     out: &mut Vec<TimedNoteEvent>,
     active_notes: &mut Vec<u8>,
@@ -82,12 +91,15 @@ pub fn collect_events_for_buffer(
     let Some(track) = song.tracks.get(track_idx as usize) else {
         return;
     };
-    if song.bpm <= 0.0 {
+    if current_bpm <= 0.0 {
         return;
     }
 
-    let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(song.bpm);
-    let buf_end = playhead + u64::from(frames);
+    let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(current_bpm);
+    // buffer 終端 beat (= playhead_beats + 1 buffer 分の beat 経過)。
+    let buf_len_beats =
+        f64::from(frames) * f64::from(current_bpm) / (60.0 * f64::from(sample_rate));
+    let buf_end_beats = playhead_beats + buf_len_beats;
 
     // PR-V2.4: track 内全 clip の notes を flatten した「通し index」 を
     // note_id とする。 同 track の `sync_vocal_metadata` (daw_gui 側) と
@@ -118,10 +130,11 @@ pub fn collect_events_for_buffer(
             note_id_base += clip_note_count;
             continue;
         }
-        let clip_start_samples = (clip.start_beat * samples_per_beat).max(0.0) as u64;
-        let clip_end_samples =
-            clip_start_samples + (clip.length_beats * samples_per_beat) as u64;
-        if clip_end_samples <= playhead || clip_start_samples >= buf_end {
+        let clip_end_beats = clip.start_beat + clip.length_beats;
+        // beat-domain で「clip が buffer 範囲外」 を判定 (= 旧 sample 比較を
+        // 不要に)。 [clip.start_beat, clip.start_beat + length_beats) が
+        // [playhead_beats, buf_end_beats) と重ならなければ skip。
+        if clip_end_beats <= playhead_beats || clip.start_beat >= buf_end_beats {
             note_id_base += clip_note_count;
             continue;
         }
@@ -136,16 +149,23 @@ pub fn collect_events_for_buffer(
             if note.start_beat < 0.0 || note.start_beat >= clip.length_beats {
                 continue;
             }
-            let on_offset = (note.start_beat * samples_per_beat).max(0.0) as u64;
-            let raw_off_offset =
-                ((note.start_beat + note.duration_beats) * samples_per_beat).max(0.0) as u64;
-            let on_sample = clip_start_samples + on_offset;
-            // Notes extending past the clip end are clamped to the boundary.
-            let off_sample = (clip_start_samples + raw_off_offset).min(clip_end_samples);
+            // beat-domain で note の絶対 beat 位置を求める。 Off は clip 末端
+            // で clamp (= 旧 sample-domain ロジックと同 idiom)。
+            let on_abs_beat = clip.start_beat + note.start_beat;
+            let raw_off_abs_beat =
+                clip.start_beat + (note.start_beat + note.duration_beats);
+            let off_abs_beat = raw_off_abs_beat.min(clip_end_beats);
 
-            if on_sample >= playhead && on_sample < buf_end {
+            if on_abs_beat >= playhead_beats && on_abs_beat < buf_end_beats {
+                let time_samples =
+                    ((on_abs_beat - playhead_beats) * samples_per_beat).max(0.0);
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss
+                )]
+                let time = time_samples as u32;
                 out.push(TimedNoteEvent {
-                    time: (on_sample - playhead) as u32,
+                    time,
                     event: NoteTransition::On {
                         note_id,
                         key: note.pitch,
@@ -154,9 +174,19 @@ pub fn collect_events_for_buffer(
                 });
                 active_notes.push(note.pitch);
             }
-            if off_sample > on_sample && off_sample >= playhead && off_sample < buf_end {
+            if off_abs_beat > on_abs_beat
+                && off_abs_beat >= playhead_beats
+                && off_abs_beat < buf_end_beats
+            {
+                let time_samples =
+                    ((off_abs_beat - playhead_beats) * samples_per_beat).max(0.0);
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss
+                )]
+                let time = time_samples as u32;
                 out.push(TimedNoteEvent {
-                    time: (off_sample - playhead) as u32,
+                    time,
                     event: NoteTransition::Off {
                         note_id,
                         key: note.pitch,
@@ -234,7 +264,16 @@ mod tests {
         let song = one_note_song(0.0, 1.0, 60);
         let mut out = Vec::new();
         let mut active = Vec::new();
-        collect_events_for_buffer(Some(&song), 0, SR, 0, 1024, &mut out, &mut active);
+        collect_events_for_buffer(
+            Some(&song),
+            0,
+            SR,
+            0.0,
+            120.0,
+            1024,
+            &mut out,
+            &mut active,
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].time, 0);
         assert!(matches!(out[0].event, NoteTransition::On { key: 60, .. }));
@@ -246,11 +285,15 @@ mod tests {
         let song = one_note_song(0.0, 1.0, 60);
         let mut out = Vec::new();
         let mut active = vec![60u8];
+        // SPB-100 samples ≈ beat 0.9958 (= 1 beat 直前)、 buffer 200 frames で
+        // beat 1.0 の note off を捕まえる。 sample→beat 換算は `samples / SPB`。
+        let playhead_beats = (SPB - 100) as f64 / SPB as f64;
         collect_events_for_buffer(
             Some(&song),
             0,
             SR,
-            SPB - 100,
+            playhead_beats,
+            120.0,
             200,
             &mut out,
             &mut active,
@@ -265,7 +308,16 @@ mod tests {
         let song = one_note_song(0.0, 0.01, 60);
         let mut out = Vec::new();
         let mut active = Vec::new();
-        collect_events_for_buffer(Some(&song), 0, SR, 0, 1024, &mut out, &mut active);
+        collect_events_for_buffer(
+            Some(&song),
+            0,
+            SR,
+            0.0,
+            120.0,
+            1024,
+            &mut out,
+            &mut active,
+        );
         assert_eq!(out.len(), 2);
         assert!(matches!(out[0].event, NoteTransition::On { key: 60, .. }));
         assert!(matches!(out[1].event, NoteTransition::Off { key: 60, .. }));
@@ -291,7 +343,16 @@ mod tests {
             });
         let mut out = Vec::new();
         let mut active = Vec::new();
-        collect_events_for_buffer(Some(&song), 0, SR, 0, 1024, &mut out, &mut active);
+        collect_events_for_buffer(
+            Some(&song),
+            0,
+            SR,
+            0.0,
+            120.0,
+            1024,
+            &mut out,
+            &mut active,
+        );
         assert_eq!(out.len(), 2);
         for e in &out {
             assert_eq!(e.time, 0);
@@ -305,7 +366,16 @@ mod tests {
     fn no_song_returns_empty() {
         let mut out = Vec::new();
         let mut active = Vec::new();
-        collect_events_for_buffer(None, 0, SR, 0, 1024, &mut out, &mut active);
+        collect_events_for_buffer(
+            None,
+            0,
+            SR,
+            0.0,
+            120.0,
+            1024,
+            &mut out,
+            &mut active,
+        );
         assert!(out.is_empty());
         assert!(active.is_empty());
     }
@@ -315,7 +385,16 @@ mod tests {
         let song = one_note_song(2.0, 1.0, 60);
         let mut out = Vec::new();
         let mut active = Vec::new();
-        collect_events_for_buffer(Some(&song), 0, SR, 0, 1000, &mut out, &mut active);
+        collect_events_for_buffer(
+            Some(&song),
+            0,
+            SR,
+            0.0,
+            120.0,
+            1000,
+            &mut out,
+            &mut active,
+        );
         assert!(out.is_empty());
         assert!(active.is_empty());
     }
@@ -328,11 +407,14 @@ mod tests {
         let frames = 200u32;
         let mut out = Vec::new();
         let mut active = vec![60u8];
+        // playhead (samples) を beat に変換: samples / SPB。
+        let playhead_beats = playhead as f64 / SPB as f64;
         collect_events_for_buffer(
             Some(&song),
             0,
             SR,
-            playhead,
+            playhead_beats,
+            120.0,
             frames,
             &mut out,
             &mut active,
@@ -348,11 +430,13 @@ mod tests {
         song.tracks[0].clips[0].length_beats = 4.0;
         let mut out = Vec::new();
         let mut active = Vec::new();
+        let playhead_beats = (10 * SPB - 100) as f64 / SPB as f64;
         collect_events_for_buffer(
             Some(&song),
             0,
             SR,
-            10 * SPB - 100,
+            playhead_beats,
+            120.0,
             200,
             &mut out,
             &mut active,
@@ -408,7 +492,8 @@ mod tests {
             Some(&song),
             0,
             SR,
-            0,
+            0.0,
+            120.0,
             (2 * SPB) as u32,
             &mut out,
             &mut active,
