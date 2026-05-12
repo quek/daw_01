@@ -2397,3 +2397,154 @@ gui_01 Phase 63n-10 commit `6074db6` を path 依存で取り込み、 daw_01 �
 (transport gesture wire が landing するまで 2 以降は手動入力で確認可能)
 
 ---
+
+## #035 [Open] 2026-05-12 [要望] scrubable number widget (= drag-to-edit numeric input)
+
+### daw_01 →
+
+- 種別: [要望]
+- 関連 gui_01: `crates/ui/src/widgets/text_input.rs` (= 既存 `text_input_at`、 keyboard 入力のみ) / `crates/ui/src/widgets/knob.rs` (= 既存 drag scrub idiom)
+- 関連 daw_01: `daw_gui/src/view/transport.rs` (= BPM / TimeSig num 入力欄を text_input_at で実装中)
+- 関連仕様: [`daw_01/docs/plan_automation.md`](daw_01/docs/plan_automation.md) Phase 5 Step 5.1 follow-up (= master row SongTempo lane への recording 経路)
+
+#### 背景
+
+Phase 5 Step 5.1 (#034) で master row が landing し、 SongTempo / SongTimeSigNumerator lane が arrangement に表示できるようになった。 残作業: **transport bar の BPM 表示を drag scrub して `ParamGestureBegin/End { target: SongTempo }` を発火** し、 Touch / Latch / Write mode + Play 中に master row の SongTempo lane へ自動的に point が刻まれる UX を完成させる。
+
+Bitwig / Ableton Live / Reaper / Cubase / Studio One の transport BPM 表示は全て同じ pattern:
+
+- **数値そのもの (= text-style display) を mouse で press して縦方向 drag** で値が連続変化
+- **release で確定** (= drag 中は live preview、 release で undoable Edit 発火)
+- **値表示を click のみ** だと cursor が text input mode に入り、 キーボードで直接編集可能
+- 「knob を別に置く」 のは UX として劣る (= 視覚的過密、 「数値そのものが操作可能である」 という DAW 慣習に反する)
+
+daw_01 では既存の `text_input_at` (= keyboard only) と `knob_at` (= 円形 knob で drag scrub) しか無く、 「**数値を表示しつつ drag で scrub できる widget**」 が欠けている。
+
+#### 期待挙動 (= 最終形態)
+
+##### A. 新 widget: `scrubable_number_at` (仮称、 名前は gui_01 命名で OK)
+
+```rust
+pub fn scrubable_number_at<F>(
+    &mut self,
+    id: impl Hash,
+    rect: Rect,
+    value: f64,               // 表示 / scrub の plain 値 (f64 で精度確保)
+    default_value: f64,       // double-click でリセットされる値
+    format: ScrubableNumberFormat,  // 表示書式 (例: "{:.1}", "{}")
+    style: &ScrubableNumberStyle,
+    on_change: F,             // drag scrub の連続変化 + release commit を載せる
+) -> ScrubableNumberResponse
+where
+    F: Fn(f64) -> Edit<M> + Clone + Send + Sync + 'static
+```
+
+`ScrubableNumberFormat` enum 案 (= 表示書式の最小集合):
+
+```rust
+pub enum ScrubableNumberFormat {
+    /// 整数表示 (= "120")
+    Integer,
+    /// 小数 N 桁 (= "120.0" for Decimal(1))
+    Decimal(u8),
+}
+```
+
+`ScrubableNumberStyle` 案 (= 既存 `KnobStyle` / `FaderStyle` と同方針):
+
+```rust
+pub struct ScrubableNumberStyle {
+    pub bg_color: Color,
+    pub bg_color_hovered: Color,
+    pub bg_color_dragging: Color,
+    pub text_color: Color,
+    pub border: Color,
+    pub border_width: f32,
+    pub radius: f32,
+    pub font_size: f32,
+    /// scrub sensitivity: rect.h 1 行ぶん drag で `(max - min) * sensitivity` の
+    /// 値変化。 default 1.0 (= rect.h drag = full range)。 Ctrl 押下で 0.1 (= 1/10
+    /// fine、 既存 knob / fader と同 idiom)。
+    pub sensitivity: f32,
+    /// Optional 値範囲 (clamp 用、 widget は drag で範囲外に行かないよう抑制)。
+    /// `None` = clamp 無し (caller 責任で on_change 内で clamp)。
+    pub range: Option<(f64, f64)>,
+}
+```
+
+`ScrubableNumberResponse`:
+
+```rust
+pub struct ScrubableNumberResponse {
+    pub displayed_value: f64,
+    pub hovered: bool,
+    /// drag scrub 中 (= mixer knob_at の `dragging` と同 semantics)。
+    /// caller は edge を見て `ParamGestureBegin/End` を発火する。
+    pub dragging: bool,
+    /// keyboard 入力モードに入っているか (= rect 上を click → cursor 表示 →
+    /// キーボード入力可能)。 後述の text-input 統合に使う。
+    pub editing_text: bool,
+    /// 文字入力 commit (Enter or focus loss) の瞬間 true、 1 frame だけ。
+    pub committed: bool,
+    /// editing_text == true のときの現在のテキストバッファ (caller が parse して
+    /// on_change を発火する責任、 widget は文字 buffer の管理のみ)。
+    pub edit_text: Option<String>,
+}
+```
+
+##### B. 操作 binding (= DAW 慣習)
+
+| 操作 | 動作 |
+|---|---|
+| rect 上で **single press + drag (vertical)** | scrub: 連続 `on_change(new_value)` 発火、 `dragging = true` |
+| Ctrl + drag | sensitivity × 0.1 (= fine scrub、 既存 knob と同 idiom) |
+| **double-click** (300ms / 5px) | `default_value` にリセット、 `on_change(default_value)` 発火 |
+| **single-click (drag < 4px、 release 短時間)** | text input mode 切替 (= cursor 表示、 keyboard 入力受付) |
+| text input mode 中の **Enter** | `committed = true` + 1 frame、 caller は `edit_text` を parse して on_change |
+| text input mode 中の **Esc / focus loss** | text input mode 解除 + 現在の display value にロールバック |
+
+press + drag だけで scrub、 click + release は text edit mode へ。 既存 knob_at / fader_at の double-click reset + Ctrl fine drag と完全に同 idiom で揃える。
+
+##### C. text input 統合 (= 既存 `text_input_at` の置換)
+
+`scrubable_number_at` は **`text_input_at` の上位互換** として位置付け:
+
+- click のみ → text input (= `text_input_at` 互換挙動)
+- drag → scrub (新)
+- double-click → reset (新)
+
+caller は単一 widget で「数値表示 + scrub + 直接編集」 が完結する。 daw_01 transport.rs の BPM / TimeSig num input は `scrubable_number_at` 1 行で置換可能。
+
+##### D. 既存 widget との関係
+
+- `text_input_at` は **string 入力** が主目的 (= track name など)、 そのまま残す
+- `knob_at` は **円形 knob 表示** が主目的 (= mixer のような視覚的 knob)、 そのまま残す
+- `scrubable_number_at` は **数値テキスト表示 + drag scrub** という独立の use case
+
+#### 受け入れ基準
+
+- `scrubable_number_at(rect, value=120.0, default=120.0, Decimal(1), style, on_change)` で rect 内に「120.0」 が表示される
+- press + 縦 drag で「120.0 → 121.5 → 123.7 → …」 と連続変化、 release で confirm
+- Ctrl + drag で fine (1/10) scrub
+- double-click で default に戻る
+- single-click → text input mode → "150" 打鍵 → Enter で `on_change(150.0)`
+- `dragging` field が press → release で true → false 推移 (= caller が `ParamGesture` edge 検知可能)
+- visually、 daw_01 transport bar の既存 `text_input_at` (= BPM input 64x28 px) と同じ寸法・同じ font_size に揃えられる
+
+#### 想定 Phase
+
+`crates/ui/src/widgets/scrubable_number.rs` (新規ファイル) + 既存 `lib.rs` の `pub use`。 widget 1 個 + style / response struct で ~300 行想定。 既存 `text_input_at` の press / drag state machine と `knob_at` の drag scrub idiom を組み合わせる感じで実装可能。
+
+daw_prototype example に既存 BPM 表示模擬 + 試験操作を追加。
+
+#### daw_01 側着手予定 (gui_01 #035 landing 後)
+
+- `daw_gui/src/view/transport.rs` の BPM input + TimeSig num input を `text_input_at` → `scrubable_number_at` に置換
+- press / release edge を見て `ParamGestureBegin/End { track_id: MASTER_TRACK_ID, target: SongTempo }` (BPM 用) / `SongTimeSigNumerator` (TimeSig 用) を発火
+- `AppEvent::SetSongBpmFromScrub(f32)` + 軽量 IPC `MainToChild::SetSongBpm` を追加し、 drag scrub 中も audio engine が即時追随 (= LoadSong 不要)
+- これで Touch / Latch / Write mode + Play 中に BPM scrub → master row の SongTempo lane に curve が自動記録される完全ループが完成
+
+### gui_01 →
+（gui_01 Claude が記入）
+
+---
