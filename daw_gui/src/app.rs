@@ -3362,6 +3362,80 @@ impl AppData {
         self.action_open_path(path);
     }
 
+    /// Phase 6 review fix: project load 直後に `self.song.audio_sources` 全件
+    /// を WAV decode して `self.audio_source_cache` に詰める。 旧コードでは
+    /// この path が欠落していて、 saved project を開いた audio clip の波形が
+    /// 表示されなかった (= `arrangement_view::draw_audio_clip_waveform` で
+    /// `audio_source_cache.get(event.source_id) → None`)。 import 経由 (=
+    /// drag&drop / Open Import Audio) で session 中に追加した source は import_one
+    /// が即 decode + cache 投入していたので、 そちらだけ波形が出るという
+    /// intermittent な見え方になっていた。
+    ///
+    /// caller は `self.file_path` と `self.song` をセット済の前提。
+    /// ProjectRelative は file_path.parent() で resolve、 Generated は廃止
+    /// 仕様で skip。 decode 失敗は warn ログのみ (= waveform が出ないだけで
+    /// 他機能は動く defensive)。
+    fn decode_audio_sources_into_cache(&mut self) {
+        use common::model::AudioSourcePath;
+        // file_path = None (= 未保存 project の sidecar 復元) の場合、
+        // ProjectRelative は resolve できないので skip 扱い。
+        let project_dir: Option<PathBuf> = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.parent().map(Path::to_path_buf));
+        let mut decoded = 0usize;
+        let mut skipped = 0usize;
+        let mut failed = 0usize;
+        for (&source_id, source) in &self.song.audio_sources {
+            // 既に cache にあるなら skip (= idempotent、 二重呼出しでも OK)。
+            if self.audio_source_cache.contains(source_id) {
+                continue;
+            }
+            let abs: PathBuf = match &source.path {
+                AudioSourcePath::Absolute(abs) => abs.clone(),
+                AudioSourcePath::ProjectRelative(rel) => {
+                    let Some(dir) = project_dir.as_ref() else {
+                        tracing::warn!(
+                            source_id,
+                            ?rel,
+                            "decode_audio_sources_into_cache: ProjectRelative but project_dir unset"
+                        );
+                        skipped += 1;
+                        continue;
+                    };
+                    dir.join(rel)
+                }
+                AudioSourcePath::Generated { id: gen_id } => {
+                    // PR-V4 で廃止 (builtin VOICEVOX plugin 経由に変わった)。
+                    tracing::debug!(
+                        source_id,
+                        gen_id,
+                        "decode_audio_sources_into_cache: skipping retired Generated source"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+            match crate::import_audio::decode_wav(&abs) {
+                Ok(buffer) => {
+                    self.audio_source_cache
+                        .insert(source_id, std::sync::Arc::new(buffer));
+                    decoded += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        source_id,
+                        path = %abs.display(),
+                        error = %e,
+                        "decode_audio_sources_into_cache: decode failed"
+                    );
+                    failed += 1;
+                }
+            }
+        }
+        tracing::info!(decoded, skipped, failed, "decoded audio sources into cache");
+    }
+
     fn action_open_path(&mut self, path: PathBuf) {
         // Recursive open を防ぐ: autosave file を直接開いた場合は弾く
         // (RecoveryRestore で開くべきもの)。
@@ -3380,6 +3454,14 @@ impl AppData {
                 self.restore_plugin_from_song(&song);
                 self.song = song;
                 self.file_path = Some(path.clone());
+                // Phase 6 review fix: load では audio source の WAV を decode
+                // して `audio_source_cache` に詰める path が抜けていた。
+                // 結果、 saved project を開いたあと audio clip の波形が
+                // 表示されない (arrangement_view::draw_audio_clip_waveform で
+                // `audio_source_cache.get(event.source_id) → None`) 状態に
+                // なっていた。 user 報告「やっぱり波形が表示されないことが
+                // あります」 の root cause。
+                self.decode_audio_sources_into_cache();
                 self.selected_track_ids.clear();
                 self.collapsed_groups.clear();
                 self.selected_clip = None;
@@ -3482,6 +3564,10 @@ impl AppData {
         self.restore_plugin_from_song(&song);
         self.song = song;
         self.file_path = common::recovery::original_file_for_sidecar(&autosave_path);
+        // Phase 6 review fix: 同 load path と同じく audio source decode を
+        // 呼ぶ。 `file_path` を先にセットしてから呼ぶことで ProjectRelative
+        // path も resolve できる (= sidecar の元 file が分かっている場合)。
+        self.decode_audio_sources_into_cache();
         self.selected_track_ids.clear();
         self.collapsed_groups.clear();
         self.selected_clip = None;

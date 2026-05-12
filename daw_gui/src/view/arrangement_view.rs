@@ -1619,7 +1619,11 @@ fn draw_audio_clip_waveform(
     lanes_x: f32,
     is_selected: bool,
 ) {
+    // Phase 6 review (debug): user 報告「波形が表示されないクリップがある」
+    // の原因特定のため、 早期 return パスに warn ログを置く。 原因が分かっ
+    // たら downgrade / 削除する。
     let Some(t_idx) = app.song.tracks.iter().position(|t| t.id == clip_key.track) else {
+        tracing::warn!(?clip_key, "draw_audio_clip_waveform: track not found");
         return;
     };
     let Some(c_idx) = app.song.tracks[t_idx]
@@ -1627,20 +1631,38 @@ fn draw_audio_clip_waveform(
         .iter()
         .position(|c| c.id == clip_key.clip)
     else {
+        tracing::warn!(?clip_key, "draw_audio_clip_waveform: clip not found");
         return;
     };
     let clip = &app.song.tracks[t_idx].clips[c_idx];
     let Some(content) = app.song.clip_contents.get(&clip.content_id) else {
+        tracing::warn!(
+            ?clip_key,
+            content_id = clip.content_id,
+            "draw_audio_clip_waveform: content not found"
+        );
         return;
     };
     let Some(events) = content.audio_events() else {
-        return; // MIDI / Vocal clip は対象外
+        // MIDI / Vocal clip は対象外 (= normal、 log しない)
+        return;
     };
     let Some(event) = events.first() else {
-        return; // 空の audio content (= 起こらないはずだが defensive)
+        tracing::warn!(
+            ?clip_key,
+            content_id = clip.content_id,
+            "draw_audio_clip_waveform: audio content has empty events"
+        );
+        return;
     };
     let Some(buffer) = app.audio_source_cache.get(event.source_id) else {
-        return; // まだ decode されていない / missing source — silent display
+        tracing::warn!(
+            ?clip_key,
+            content_id = clip.content_id,
+            source_id = event.source_id,
+            "draw_audio_clip_waveform: source not in audio_source_cache (decode 未実行 / failed?)"
+        );
+        return;
     };
 
     // clip rect は widget が border + name 領域を含めて描画している。
@@ -1665,7 +1687,13 @@ fn draw_audio_clip_waveform(
     if view_rect.x < lanes_x {
         let cut_px = lanes_x - view_rect.x;
         if cut_px >= view_rect.w {
-            return; // 完全に lanes 外
+            tracing::debug!(
+                ?clip_key,
+                cut_px,
+                w = view_rect.w,
+                "draw_audio_clip_waveform: clip 完全に lanes 外"
+            );
+            return;
         }
         let frames_per_px = (event_len_frames as f64 / clip_rect.w.max(1.0) as f64).max(0.0);
         let skip_frames = (cut_px as f64 * frames_per_px) as u64;
@@ -1675,6 +1703,14 @@ fn draw_audio_clip_waveform(
         view_rect.w -= cut_px;
     }
     if view_rect.w <= 0.0 || view_rect.h <= 0.0 {
+        tracing::warn!(
+            ?clip_key,
+            w = view_rect.w,
+            h = view_rect.h,
+            clip_w = clip_rect.w,
+            clip_h = clip_rect.h,
+            "draw_audio_clip_waveform: view_rect 寸法 0 以下 (= 描画スキップ)"
+        );
         return;
     }
 
