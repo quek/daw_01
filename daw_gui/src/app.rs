@@ -877,6 +877,39 @@ impl AppData {
     }
 
     pub fn track_mix(&self) -> Vec<TrackMixEntry> {
+        // Phase 6 review perf (E10): 旧コードは各 track ごとに
+        // `is_group_track(t.id)` (= O(N) all-tracks scan) +
+        // `compute_track_depth(t)` (= O(depth) parent chain walk) を呼び、
+        // 合計 O(N²) per frame だった。 大型 song で 60fps drop。
+        // 単一 pass で is_group_set / depths を batch 計算して O(N) に。
+        let n_tracks = self.song.tracks.len();
+        let mut is_group_set: std::collections::HashSet<u32> =
+            std::collections::HashSet::with_capacity(n_tracks);
+        let mut id_to_parent: std::collections::HashMap<u32, Option<u32>> =
+            std::collections::HashMap::with_capacity(n_tracks);
+        for t in &self.song.tracks {
+            id_to_parent.insert(t.id, t.parent_group_id);
+            if let Some(pid) = t.parent_group_id {
+                is_group_set.insert(pid);
+            }
+        }
+        // depth は parent chain を walk するが、 lookup を `id_to_parent`
+        // HashMap で O(1) 化 (= 旧 `track_by_id` の line search O(N) を削減)。
+        // 32 hops で saturate (= cycle 防御は schedule compiler 側にもある)。
+        let compute_depth = |track_id: u32| -> u8 {
+            let mut cursor = id_to_parent.get(&track_id).copied().flatten();
+            let mut depth: u8 = 0;
+            let mut hops = 0u8;
+            while let Some(pid) = cursor {
+                depth = depth.saturating_add(1);
+                hops = hops.saturating_add(1);
+                if hops > 32 {
+                    break;
+                }
+                cursor = id_to_parent.get(&pid).copied().flatten();
+            }
+            depth
+        };
         self.song
             .tracks
             .iter()
@@ -897,8 +930,8 @@ impl AppData {
                     solo: t.solo,
                     peak_l_raw: l,
                     peak_r_raw: r,
-                    is_group: self.is_group_track(t.id),
-                    depth: self.compute_track_depth(t),
+                    is_group: is_group_set.contains(&t.id),
+                    depth: compute_depth(t.id),
                 }
             })
             .collect()

@@ -78,6 +78,45 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }));
     }
 
+    // Phase 6 review perf (E11): 旧コードは毎フレーム per track で
+    // `compute_track_depth` (= O(depth*N) parent chain walk) と per clip で
+    // `clip_content_refcount` (= O(全クリップ数)) を呼んでいて、 N=50 tracks
+    // × 20 clips で N² 級の line scan。 ここで 1 度だけ batch 計算する:
+    //   - `id_to_parent`: track_id → parent_id (= depth 計算 O(1) lookup)
+    //   - `refcount_by_content`: ContentId → 出現回数 (= refcount O(1) lookup)
+    let n_tracks = app.song.tracks.len();
+    let mut id_to_parent: std::collections::HashMap<u32, Option<u32>> =
+        std::collections::HashMap::with_capacity(n_tracks);
+    for t in &app.song.tracks {
+        id_to_parent.insert(t.id, t.parent_group_id);
+    }
+    let compute_depth = |track_id: u32| -> u8 {
+        let mut cursor = id_to_parent.get(&track_id).copied().flatten();
+        let mut depth: u8 = 0;
+        let mut hops = 0u8;
+        while let Some(pid) = cursor {
+            depth = depth.saturating_add(1);
+            hops = hops.saturating_add(1);
+            if hops > 32 {
+                break;
+            }
+            cursor = id_to_parent.get(&pid).copied().flatten();
+        }
+        depth
+    };
+    let mut refcount_by_content: std::collections::HashMap<common::model::ContentId, usize> =
+        std::collections::HashMap::new();
+    for t in &app.song.tracks {
+        for c in &t.clips {
+            *refcount_by_content.entry(c.content_id).or_insert(0) += 1;
+        }
+        for lane in &t.automation_lanes {
+            for c in &lane.clips {
+                *refcount_by_content.entry(c.content_id).or_insert(0) += 1;
+            }
+        }
+    }
+
     let tracks: Vec<ArrangementTrack> = app
         .song
         .tracks
@@ -104,9 +143,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     // で HSL→RGB 変換してアクセント色 + link glyph を描画。
                     // hue は content_id の golden-ratio hash で `[0.0, 1.0)` に
                     // 一様分布させ、 共有グループ間で色が衝突しにくいようにする。
-                    share_group_color: if app
-                        .song
-                        .clip_content_refcount(c.content_id)
+                    // Phase 6 review perf: 旧 `clip_content_refcount` (= 全 clip
+                    // scan) を batch 計算済 `refcount_by_content` の O(1) lookup へ。
+                    share_group_color: if refcount_by_content
+                        .get(&c.content_id)
+                        .copied()
+                        .unwrap_or(0)
                         >= 2
                     {
                         Some(content_id_to_hue(c.content_id))
@@ -135,8 +177,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 })
                 .collect(),
             // gui_01 #016 で追加された group hierarchy fields:
+            // Phase 6 review perf: depth は batch 計算済 `id_to_parent` lookup へ。
             parent_id: t.parent_group_id,
-            depth: app.compute_track_depth(t),
+            depth: compute_depth(t.id),
             collapsed: app.collapsed_groups.contains(&t.id),
             // gui_01 #028 (M14 Phase 63n-1): automation lane 行。 daw_01 は
             // 「展開中の track id 集合」 を `expanded_automation_tracks` に持ち、
