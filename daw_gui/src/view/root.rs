@@ -127,48 +127,33 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Open)));
             });
             // Open Recent: 「最近開いた」 履歴 (= AppData.recent_files)。
-            // gui_01 #038 bug (= sub_menu cascade item の click が親 popup の
-            // outside_click 判定で握りつぶされて closure に届かない) の
-            // workaround: sub_menu を使わず File メニュー直下に flat item
-            // として平坦に並べる。 視覚的に「Open Recent:」 ヘッダ disabled
-            // item + 各 file item で区切る。
-            m.item_with(daw_ui_core::MenuItemSpec {
-                label: "── Open Recent ──",
-                on_click: Box::new(|_ui| {}),
-                enabled: false,
-                shortcut_hint: None,
-            });
+            // 空のときは sub_menu を作らず disabled top-level item に置換
+            // (= cascade を出さない)。 gui_01 cascade exclusivity bug
+            // (= 兄弟 sub_menu の cascade が同時 open のまま重なる) の
+            // workaround。 空 cascade を出さなければ他の sub_menu cascade
+            // を上書きする事故も起きない。
             if app.recent_files_labels.is_empty() {
                 m.item_with(daw_ui_core::MenuItemSpec {
-                    label: "  (empty)",
+                    label: "Open Recent (empty)",
                     on_click: Box::new(|_ui| {}),
                     enabled: false,
                     shortcut_hint: None,
                 });
             } else {
-                for (label, path) in app
-                    .recent_files_labels
-                    .iter()
-                    .zip(app.recent_files.paths.iter())
-                {
-                    let path_clone = path.clone();
-                    // gui_01 #038 fix 後に sub_menu に戻す。 inline 表示なので
-                    // label に prefix「  」 を入れて視覚的に sub-item と分かる
-                    // ようにする (= 2 space で indent)。
-                    let prefixed = format!("  {label}");
-                    // label は &'a str 要求なので、 prefixed の所有を持続させる
-                    // 必要があるが flat item 経路では label が item_with 内で
-                    // copy / clone されないので String → leak の妥協は最終手段。
-                    // 暫定: prefix を入れず元 label のまま渡す (= sub-item を
-                    // インデント表示できないが click は届く)。 ただしユーザー
-                    // 体感は 「(empty)」 と同等で OK。
-                    let _ = prefixed;
-                    m.item(label.as_str(), move |ui| {
-                        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                            app.handle_event(AppEvent::OpenRecent(path_clone.clone()))
-                        }));
-                    });
-                }
+                m.sub_menu("Open Recent", |sub| {
+                    for (label, path) in app
+                        .recent_files_labels
+                        .iter()
+                        .zip(app.recent_files.paths.iter())
+                    {
+                        let path_clone = path.clone();
+                        sub.item(label.as_str(), move |ui| {
+                            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                                app.handle_event(AppEvent::OpenRecent(path_clone.clone()))
+                            }));
+                        });
+                    }
+                });
             }
             m.item("Save", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Save)));
@@ -177,33 +162,31 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::SaveAs)));
             });
             // Recently Saved: 「最近保存した」 履歴 (= AppData.recent_saved)。
-            // 同上 gui_01 #038 workaround で flat item list 化。
-            m.item_with(daw_ui_core::MenuItemSpec {
-                label: "── Recently Saved ──",
-                on_click: Box::new(|_ui| {}),
-                enabled: false,
-                shortcut_hint: None,
-            });
+            // クリックで OpenRecent と同じ経路で開く (= 保存先 path はそのまま
+            // 開けるはず)。 同上 workaround で空のときは disabled top-level
+            // item に置換。
             if app.recent_saved_labels.is_empty() {
                 m.item_with(daw_ui_core::MenuItemSpec {
-                    label: "  (empty)",
+                    label: "Recently Saved (empty)",
                     on_click: Box::new(|_ui| {}),
                     enabled: false,
                     shortcut_hint: None,
                 });
             } else {
-                for (label, path) in app
-                    .recent_saved_labels
-                    .iter()
-                    .zip(app.recent_saved.paths.iter())
-                {
-                    let path_clone = path.clone();
-                    m.item(label.as_str(), move |ui| {
-                        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                            app.handle_event(AppEvent::OpenRecent(path_clone.clone()))
-                        }));
-                    });
-                }
+                m.sub_menu("Recently Saved", |sub| {
+                    for (label, path) in app
+                        .recent_saved_labels
+                        .iter()
+                        .zip(app.recent_saved.paths.iter())
+                    {
+                        let path_clone = path.clone();
+                        sub.item(label.as_str(), move |ui| {
+                            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                                app.handle_event(AppEvent::OpenRecent(path_clone.clone()))
+                            }));
+                        });
+                    }
+                });
             }
             m.item("Import Audio...", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
