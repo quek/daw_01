@@ -37,8 +37,17 @@ impl RecentFiles {
 /// `%LOCALAPPDATA%\daw_01\recent.json` (or the analogous local dir on
 /// non-Windows). Returns `None` when the platform's local data dir
 /// cannot be resolved — the caller treats that as "no recent list".
+///
+/// 「最近開いたファイル」 (= Open ダイアログ / OpenRecent 経由) 用。
 pub fn default_path() -> Option<PathBuf> {
     Some(dirs::data_local_dir()?.join("daw_01").join("recent.json"))
+}
+
+/// 「最近保存したファイル」 (= Save / Save As 経由で書き込んだ先) 用。
+/// 開いた履歴と分離することで「保存先候補だけを再開く」 / 「最後に開いた
+/// project とは別に最後に保存した先を覚えておく」 という UX を提供する。
+pub fn default_saved_path() -> Option<PathBuf> {
+    Some(dirs::data_local_dir()?.join("daw_01").join("recent_saved.json"))
 }
 
 pub fn load(path: impl AsRef<Path>) -> Result<RecentFiles> {

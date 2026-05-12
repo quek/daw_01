@@ -26,7 +26,7 @@ pub const INSPECTOR_W: f32 = 280.0;
 /// 越しに保持する (= session 内のみ persist、 project save 不対応は別 phase)。
 const ARRANGEMENT_SPLIT_DEFAULT_RATIO: f32 = 0.65;
 
-pub fn build_root(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
+pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: PhysicalSize) {
     let sw = screen.width as f32;
     let sh = screen.height as f32;
 
@@ -55,7 +55,7 @@ pub fn build_root(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize)
         h: STATUS_H,
     };
 
-    draw_menu_bar(ui, menu_rect);
+    draw_menu_bar(app, ui, menu_rect);
     transport::draw(app, ui, transport_rect);
 
     // arrangement (上) と bottom_panel (下) を縦分割。 gui_01 `split_view`
@@ -106,7 +106,17 @@ pub fn build_root(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize)
 }
 
 /// 上部 menu bar (File / Edit / View) を library widget で描画。
-fn draw_menu_bar(ui: &mut Ui<'_, AppData>, rect: Rect) {
+/// `Ui<'a, AppData>` の `'a` は `&AppData` borrow 寿命と同一なので、
+/// `app: &'a AppData` を明示して menu の dynamic label (= `&app.recent_files_labels[i]`)
+/// が `'a` に乗ることを borrow checker に伝える。
+fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
+    // 「最近開いた / 保存した」 ファイルの label / path は AppData に
+    // キャッシュ済 (= `recent_files_labels` / `recent_saved_labels` /
+    // `recent_files.paths` / `recent_saved.paths`)。 menu_bar API が
+    // `label: &'a str` を要求し 'a が `&AppData` の borrow と一致するため、
+    // AppData 側で String を持つことで lifetime が解決する (= 別解として
+    // String::leak で 'static 化する手もあるが per-frame leak になるので不可)。
+
     // M9 P1-5 (gui_01 側 breaking 変更): on_click closure に &mut Ui が渡る形に。
     ui.menu_bar(rect, |mb| {
         mb.menu("File", |m| {
@@ -116,11 +126,62 @@ fn draw_menu_bar(ui: &mut Ui<'_, AppData>, rect: Rect) {
             m.item("Open...", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Open)));
             });
+            // Open Recent: 「最近開いた」 履歴 (= AppData.recent_files)。
+            // 空のときは disabled item を 1 つ出して「履歴なし」 を示す。
+            m.sub_menu("Open Recent", |sub| {
+                if app.recent_files_labels.is_empty() {
+                    sub.item_with(daw_ui_core::MenuItemSpec {
+                        label: "(empty)",
+                        on_click: Box::new(|_ui| {}),
+                        enabled: false,
+                        shortcut_hint: None,
+                    });
+                } else {
+                    for (label, path) in app
+                        .recent_files_labels
+                        .iter()
+                        .zip(app.recent_files.paths.iter())
+                    {
+                        let path_clone = path.clone();
+                        sub.item(label.as_str(), move |ui| {
+                            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                                app.handle_event(AppEvent::OpenRecent(path_clone.clone()))
+                            }));
+                        });
+                    }
+                }
+            });
             m.item("Save", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Save)));
             });
             m.item("Save As...", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::SaveAs)));
+            });
+            // Recently Saved: 「最近保存した」 履歴 (= AppData.recent_saved)。
+            // クリックで OpenRecent と同じ経路で開く (= 保存先 path はそのまま
+            // 開けるはず)。 空のときは disabled。
+            m.sub_menu("Recently Saved", |sub| {
+                if app.recent_saved_labels.is_empty() {
+                    sub.item_with(daw_ui_core::MenuItemSpec {
+                        label: "(empty)",
+                        on_click: Box::new(|_ui| {}),
+                        enabled: false,
+                        shortcut_hint: None,
+                    });
+                } else {
+                    for (label, path) in app
+                        .recent_saved_labels
+                        .iter()
+                        .zip(app.recent_saved.paths.iter())
+                    {
+                        let path_clone = path.clone();
+                        sub.item(label.as_str(), move |ui| {
+                            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                                app.handle_event(AppEvent::OpenRecent(path_clone.clone()))
+                            }));
+                        });
+                    }
+                }
             });
             m.item("Import Audio...", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {

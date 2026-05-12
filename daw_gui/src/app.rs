@@ -636,7 +636,24 @@ pub struct AppData {
 
     pub is_help_open: bool,
 
+    /// 「最近開いたファイル」 (= Open ダイアログ / OpenRecent 経由で読み込んだ
+    /// .daw)。 File メニュー「Open Recent ►」 に表示。 永続化先は
+    /// `common::recent::default_path()` (= `%LOCALAPPDATA%/daw_01/recent.json`)。
     pub recent_files: common::recent::RecentFiles,
+    /// 「最近保存したファイル」 (= Save / Save As で書き込んだ先)。 File
+    /// メニュー「Recently Saved ►」 に表示。 永続化先は
+    /// `common::recent::default_saved_path()` (=
+    /// `%LOCALAPPDATA%/daw_01/recent_saved.json`)。 開いた履歴と分離して
+    /// 「保存先だけ覚えておく」 UX を提供する。
+    pub recent_saved: common::recent::RecentFiles,
+    /// `recent_files` の filename だけ抽出したキャッシュ。 gui_01 `menu_bar`
+    /// API が label に `&'a str` を要求し、 'a が `Ui` の borrow 寿命
+    /// (= `&AppData` の寿命) と一致するため、 label 文字列も AppData 内に
+    /// 持っておく必要がある。 frame 内で `&app.recent_files_labels[i]` を
+    /// 渡せば lifetime が解決する。 `push_recent` / load 時に更新。
+    pub recent_files_labels: Vec<String>,
+    /// `recent_saved` の filename キャッシュ。 同じ理由。
+    pub recent_saved_labels: Vec<String>,
 
     pub is_dirty: bool,
     pub last_autosave: std::time::Instant,
@@ -713,7 +730,7 @@ impl AppData {
             })
             .unwrap_or_default();
 
-        Self {
+        let app = Self {
             song,
             file_path: None,
             audio_source_cache: AudioSourceCache::new(),
@@ -807,6 +824,14 @@ impl AppData {
             redo_stack: VecDeque::new(),
             is_help_open: false,
             recent_files: load_recent_files(),
+            recent_saved: load_recent_saved(),
+            // 初期 label cache は new() の末尾でまとめて初期化する。 Self
+            // literal の途中で他 field を参照できないので、 一旦 empty で
+            // 構築し、 caller 側で `init_recent_labels` を呼ばずに済むよう
+            // make_app! / fn new の末尾で埋める (= line ~810 付近の
+            // 「app.init_recent_labels()」 を見よ)。
+            recent_files_labels: Vec::new(),
+            recent_saved_labels: Vec::new(),
             is_dirty: false,
             last_autosave: std::time::Instant::now(),
             recovery_session_id: common::recovery::new_session_id(),
@@ -817,8 +842,15 @@ impl AppData {
             step_cursor_beat: 0.0,
             step_size_beats: DEFAULT_NOTE_DURATION,
             event_proxy,
-        }
+        };
+        // recent_files / recent_saved の path 列から filename label cache を
+        // 1 回構築。 push_recent / push_recent_saved 経由の更新でも自動的に
+        // 同期されるので、 初回のみここで初期化する。
+        let mut app = app;
+        app.init_recent_labels();
+        app
     }
+
 
     // -------- Derived snapshots (毎フレーム計算; cache が必要なら view 側で持つ) -----
 
@@ -3491,8 +3523,39 @@ impl AppData {
         }
     }
 
+    /// File メニュー「Open Recent」 / 「Recently Saved」 用の display label
+    /// を再計算。 `RecentFiles.paths` (= PathBuf 列) から basename を抽出
+    /// した String 列を返す。 lifetime 都合上、 menu widget の `&'a str`
+    /// label として渡すために AppData field に持つ必要があるので、 push 時に
+    /// 呼ぶ。 起動時 (= `new`) では `init_recent_labels` の方で 1 回呼ぶ。
+    fn rebuild_recent_labels(paths: &[PathBuf]) -> Vec<String> {
+        paths
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| p.display().to_string())
+            })
+            .collect()
+    }
+
+    /// 起動直後 / load 直後に label cache を 1 度更新する helper。
+    /// `AppData::new` が `recent_files: load_recent_files()` で paths を
+    /// 復元するため、 同時に label cache も復元したい。 caller (= bootstrap)
+    /// が `app.init_recent_labels()` を 1 回呼ぶ。
+    pub fn init_recent_labels(&mut self) {
+        self.recent_files_labels =
+            Self::rebuild_recent_labels(&self.recent_files.paths);
+        self.recent_saved_labels =
+            Self::rebuild_recent_labels(&self.recent_saved.paths);
+    }
+
+    /// 「最近開いたファイル」 履歴に追加。 `recent.json` に永続化。
     fn push_recent(&mut self, path: PathBuf) {
         self.recent_files.push(path);
+        self.recent_files_labels =
+            Self::rebuild_recent_labels(&self.recent_files.paths);
         if let Some(disk) = common::recent::default_path()
             && let Err(e) = common::recent::save(&disk, &self.recent_files)
         {
@@ -3500,6 +3563,24 @@ impl AppData {
                 error = ?e,
                 path = %disk.display(),
                 "failed to persist recent files"
+            );
+        }
+    }
+
+    /// 「最近保存したファイル」 履歴に追加。 `recent_saved.json` に永続化。
+    /// 開いた履歴 (`recent_files`) と完全に独立。 Save / Save As の両 path
+    /// で実 file 書き込み成功後に呼ぶ。
+    fn push_recent_saved(&mut self, path: PathBuf) {
+        self.recent_saved.push(path);
+        self.recent_saved_labels =
+            Self::rebuild_recent_labels(&self.recent_saved.paths);
+        if let Some(disk) = common::recent::default_saved_path()
+            && let Err(e) = common::recent::save(&disk, &self.recent_saved)
+        {
+            tracing::warn!(
+                error = ?e,
+                path = %disk.display(),
+                "failed to persist recent saved files"
             );
         }
     }
@@ -4053,7 +4134,11 @@ impl AppData {
             Ok(()) => {
                 tracing::info!(path = %path.display(), "saved project");
                 self.is_dirty = false;
+                // 「最近開いたファイル」 にも入れる (= save した file は次回
+                // 開きたい候補なので、 user 期待としては自然)。 さらに
+                // 「最近保存したファイル」 別 list にも記録する。
                 self.push_recent(path.to_path_buf());
+                self.push_recent_saved(path.to_path_buf());
                 // PR6: Save の中で audio_sources の path が
                 // `Absolute(import_cache)` → `ProjectRelative(samples/)`
                 // に書き換わり、 さらに project_dir も新たに確定した。
@@ -10153,6 +10238,19 @@ fn load_recent_files() -> common::recent::RecentFiles {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(error = ?e, path = %path.display(), "no recent.json");
+            Default::default()
+        }
+    }
+}
+
+fn load_recent_saved() -> common::recent::RecentFiles {
+    let Some(path) = common::recent::default_saved_path() else {
+        return Default::default();
+    };
+    match common::recent::load(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = ?e, path = %path.display(), "no recent_saved.json");
             Default::default()
         }
     }
