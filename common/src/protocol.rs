@@ -341,6 +341,11 @@ pub enum MainToChild {
     /// and the corresponding clip plays silence with a "missing
     /// source" badge in the GUI. Spec: §9.2.
     SetProjectDir(Option<std::path::PathBuf>),
+    /// `track` は stable な `Track::id` (= Phase 6 review で Vec index 由来の
+    /// race risk を取り除いた)。 audio engine 側は `s.tracks.iter_mut().find(
+    /// |t| t.id == track)` で look up する。 reorder / delete 中に楽勝で
+    /// 通っていた race (= GUI が新 idx で送るが audio が旧 LoadSong 直前
+    /// で旧 Vec position 解釈) を防ぐ。
     SetTrackVolume { track: u32, volume: f32 },
     SetTrackPan { track: u32, pan: f32 },
     SetTrackMuted { track: u32, muted: bool },

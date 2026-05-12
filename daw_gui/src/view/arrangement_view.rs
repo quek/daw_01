@@ -1127,17 +1127,15 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
             })
         }
         ArrangementEditRequest::ToggleTrackMute(track_id) => {
+            // Phase 6 review: AppEvent / IPC は stable な track_id で識別
+            // するように統一済 (= 旧コードは Vec idx を作って渡していた)。
             Edit::mutate(move |app: &mut AppData| {
-                if let Some(idx) = app.song.tracks.iter().position(|t| t.id == track_id) {
-                    app.handle_event(AppEvent::ToggleTrackMute(idx as u32));
-                }
+                app.handle_event(AppEvent::ToggleTrackMute(track_id));
             })
         }
         ArrangementEditRequest::ToggleTrackSolo(track_id) => {
             Edit::mutate(move |app: &mut AppData| {
-                if let Some(idx) = app.song.tracks.iter().position(|t| t.id == track_id) {
-                    app.handle_event(AppEvent::ToggleTrackSolo(idx as u32));
-                }
+                app.handle_event(AppEvent::ToggleTrackSolo(track_id));
             })
         }
         ArrangementEditRequest::DeleteTrack(track_id) => {
@@ -1169,14 +1167,14 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
         ArrangementEditRequest::SetTrackVolume { track: track_id, prev: _, next } => {
             // band は dB スケールで表示しているので、widget からは fader-scale value
             // (0..1) が来る。fader_to_amp で linear amp に戻して反映する。
+            // Phase 6 review: track_id をそのまま AppEvent に通す (= 旧 idx
+            // 経由は不要)。
             let amp = fader_to_amp(next.clamp(0.0, 1.0));
             Edit::mutate(move |app: &mut AppData| {
-                if let Some(idx) = app.song.tracks.iter().position(|t| t.id == track_id) {
-                    app.handle_event(AppEvent::SetTrackVolume {
-                        track: idx as u32,
-                        amp,
-                    });
-                }
+                app.handle_event(AppEvent::SetTrackVolume {
+                    track: track_id,
+                    amp,
+                });
             })
         }
         ArrangementEditRequest::SetTrackRowH(h) => Edit::mutate(move |app: &mut AppData| {

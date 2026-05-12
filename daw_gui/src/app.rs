@@ -44,7 +44,13 @@ pub enum TrackRemovalIpc {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackMixEntry {
+    /// Vec position in `song.tracks`。 widget layout (= sequential x 位置 +
+    /// peak display lookup) 用。 IPC / AppEvent では track_id を使うこと
+    /// (= Phase 6 review で SSOT 違反を解消、 reorder race 防止)。
     pub index: u32,
+    /// stable な Track::id。 mixer strip → AppEvent → MainToChild まで
+    /// 一貫してこれで track を識別する。
+    pub track_id: u32,
     pub name: String,
     pub volume: f32,
     pub pan: f32,
@@ -66,6 +72,7 @@ impl Default for TrackMixEntry {
     fn default() -> Self {
         Self {
             index: u32::MAX,
+            track_id: u32::MAX,
             name: String::new(),
             volume: 1.0,
             pan: 0.0,
@@ -878,6 +885,7 @@ impl AppData {
                 let (l, r) = self.track_peak_display.get(i).copied().unwrap_or((0.0, 0.0));
                 TrackMixEntry {
                     index: i as u32,
+                    track_id: t.id,
                     name: if t.name.is_empty() {
                         format!("Track {}", i + 1)
                     } else {
@@ -9015,65 +9023,65 @@ impl AppData {
 
     // -------- Mixer --------------------------------------------------------
 
-    fn set_track_volume(&mut self, track: u32, volume: f32) {
+    // Phase 6 review (SSOT fix): `track_id` は stable な Track::id。 旧 GUI
+    // 側は Vec index を受け取って `self.song.tracks.get_mut(idx)` していたが、
+    // IPC を通すと audio engine 側の Vec 順序とずれて race を起こすため、
+    // ここから IPC まで一貫して id で識別する。
+    fn set_track_volume(&mut self, track_id: u32, volume: f32) {
         let v = volume.clamp(0.0, 1.0);
-        let track_id = self.song.tracks.get(track as usize).map(|t| t.id);
-        if let Some(t) = self.song.tracks.get_mut(track as usize) {
-            t.volume = v;
-        }
-        let msg = MainToChild::SetTrackVolume { track, volume: v };
+        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+            return;
+        };
+        t.volume = v;
+        let msg = MainToChild::SetTrackVolume { track: track_id, volume: v };
         self.send_audio(msg);
         // gui_01 #028 §7.3: knob 操作で last-touched param を更新。
         // `A` キー shortcut の source になる。
-        if let Some(track_id) = track_id {
-            self.last_touched_param = Some(TouchedParam {
-                track_id,
-                target: common::model::AutomationTarget::TrackBuiltin(
-                    common::model::TrackBuiltinParam::Volume,
-                ),
-                display_name: "Volume".to_string(),
-                touched_at: std::time::Instant::now(),
-            });
-        }
+        self.last_touched_param = Some(TouchedParam {
+            track_id,
+            target: common::model::AutomationTarget::TrackBuiltin(
+                common::model::TrackBuiltinParam::Volume,
+            ),
+            display_name: "Volume".to_string(),
+            touched_at: std::time::Instant::now(),
+        });
     }
 
-    fn set_track_pan(&mut self, track: u32, pan: f32) {
+    fn set_track_pan(&mut self, track_id: u32, pan: f32) {
         let p = pan.clamp(-1.0, 1.0);
-        let track_id = self.song.tracks.get(track as usize).map(|t| t.id);
-        if let Some(t) = self.song.tracks.get_mut(track as usize) {
-            t.pan = p;
-        }
-        let msg = MainToChild::SetTrackPan { track, pan: p };
+        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+            return;
+        };
+        t.pan = p;
+        let msg = MainToChild::SetTrackPan { track: track_id, pan: p };
         self.send_audio(msg);
-        if let Some(track_id) = track_id {
-            self.last_touched_param = Some(TouchedParam {
-                track_id,
-                target: common::model::AutomationTarget::TrackBuiltin(
-                    common::model::TrackBuiltinParam::Pan,
-                ),
-                display_name: "Pan".to_string(),
-                touched_at: std::time::Instant::now(),
-            });
-        }
+        self.last_touched_param = Some(TouchedParam {
+            track_id,
+            target: common::model::AutomationTarget::TrackBuiltin(
+                common::model::TrackBuiltinParam::Pan,
+            ),
+            display_name: "Pan".to_string(),
+            touched_at: std::time::Instant::now(),
+        });
     }
 
-    fn toggle_track_mute(&mut self, track: u32) {
-        let Some(t) = self.song.tracks.get_mut(track as usize) else {
+    fn toggle_track_mute(&mut self, track_id: u32) {
+        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
             return;
         };
         t.muted = !t.muted;
         let muted = t.muted;
-        let msg = MainToChild::SetTrackMuted { track, muted };
+        let msg = MainToChild::SetTrackMuted { track: track_id, muted };
         self.send_audio(msg);
     }
 
-    fn toggle_track_solo(&mut self, track: u32) {
-        let Some(t) = self.song.tracks.get_mut(track as usize) else {
+    fn toggle_track_solo(&mut self, track_id: u32) {
+        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
             return;
         };
         t.solo = !t.solo;
         let solo = t.solo;
-        let msg = MainToChild::SetTrackSolo { track, solo };
+        let msg = MainToChild::SetTrackSolo { track: track_id, solo };
         self.send_audio(msg);
     }
 

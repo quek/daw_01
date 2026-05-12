@@ -115,8 +115,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             };
             // Phase 4 Step B: AutomationTarget::TrackBuiltin(Volume / Pan)
             // が現在 active gesture 中かを app から読み出して、 widget の
-            // dragging 状態と diff を取る (= edge 検知)。
-            let track_id = entry.index;
+            // dragging 状態と diff を取る (= edge 検知)。 Phase 6 review:
+            // gesture key も AppEvent / IPC も全て stable な `entry.track_id`
+            // に統一 (旧コードは `entry.index` (Vec 位置) を track_id だと
+            // 思い込んでいて SSOT 違反)。
+            let track_id = entry.track_id;
             let was_dragging_vol = app
                 .active_param_gestures
                 .contains(&(track_id, AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume)));
@@ -125,7 +128,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 .contains(&(track_id, AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan)));
             draw_strip(
                 ui,
-                entry.index as usize,
+                // layout_idx は widget id stability 用 (= Vec 位置でも track_id
+                // でも構わないが、 track_id の方が reorder 跨ぎで widget state
+                // が一貫する)。
+                track_id as usize,
                 &display_name,
                 entry.volume,
                 entry.pan,
@@ -135,7 +141,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 entry.peak_r_raw,
                 Rect { x, y: strip_y, w: STRIP_WIDTH, h: strip_h },
                 bg,
-                entry.index,
+                track_id,
                 false,
                 was_dragging_vol,
                 was_dragging_pan,

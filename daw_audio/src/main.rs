@@ -191,30 +191,34 @@ async fn recv_loop(
             Ok(MainToChild::ClosePluginShmem { plugin_id }) => {
                 let _ = cmd_tx.send(engine::AudioCommand::ClosePluginShmem { plugin_id });
             }
+            // Phase 6 review (SSOT fix): `track` field を Track::id (stable)
+            // に統一。 旧コードは `s.tracks.get_mut(track as usize)` で Vec
+            // index 解釈していて、 GUI 側との順序ずれで違う track を操作する
+            // race リスクがあった。 id lookup で stable 化。
             Ok(MainToChild::SetTrackVolume { track, volume }) => {
                 update_song_track(&shared, |s| {
-                    if let Some(t) = s.tracks.get_mut(track as usize) {
+                    if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
                         t.volume = volume.clamp(0.0, 1.0);
                     }
                 });
             }
             Ok(MainToChild::SetTrackPan { track, pan }) => {
                 update_song_track(&shared, |s| {
-                    if let Some(t) = s.tracks.get_mut(track as usize) {
+                    if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
                         t.pan = pan.clamp(-1.0, 1.0);
                     }
                 });
             }
             Ok(MainToChild::SetTrackMuted { track, muted }) => {
                 update_song_track(&shared, |s| {
-                    if let Some(t) = s.tracks.get_mut(track as usize) {
+                    if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
                         t.muted = muted;
                     }
                 });
             }
             Ok(MainToChild::SetTrackSolo { track, solo }) => {
                 update_song_track(&shared, |s| {
-                    if let Some(t) = s.tracks.get_mut(track as usize) {
+                    if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
                         t.solo = solo;
                     }
                 });
