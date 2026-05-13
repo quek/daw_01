@@ -1447,21 +1447,12 @@ pub fn automation_curve<F>(
       (`set_track_volume` / `set_track_pan` ハンドラ末尾、 lane default knob
       drag (`set_lane_default`) も同パスで更新)
 - [x] is_undoable 登録 (lane / point / clip 構造変化系 11 AppEvent を Undo step 化)
-- [ ] gui_01 #029 reply 受領 → `CreateAutomationClip` arm + AppEvent +
-      handler (clip 自動作成: §5.5)
-- [ ] smoke test (実機): `cargo run -p daw_gui` で起動し
-      (1) volume knob → A → Volume lane 出現 / default = 直前値で初期化
-      (2) lane disclosure +/- で展開・折り畳み
-      (3) lane body 空き領域 dblclick で clip 作成 (#029 reply 後)
-      (4) clip 内 dblclick で point 追加
-      (5) point drag で位置更新 (sort 維持)
-      (6) point Alt+click で削除
-      (7) point 右クリックで curve type popup
-      (8) clip drag (Move / Ctrl=Linked / Ctrl+Shift=Independent / lane 跨ぎ)
-      (9) clip 左右 edge drag で resize
-      (10) clip 短 click で selection
-      (11) clip 右クリック → Make Unique / Delete
-      (12) Volume sweep 再生で出音が ramp する
+- [x] gui_01 #029 reply 受領 → `CreateAutomationClip` arm + AppEvent +
+      handler (clip 自動作成: §5.5)。 [`app.rs:1939`](../daw_gui/src/app.rs:1939) +
+      [`arrangement_view.rs:707`](../daw_gui/src/view/arrangement_view.rs:707) で
+      landing 済 (#029 [Resolved] 済)
+- [x] smoke test (実機): user 実機確認済 (Phase 4/5 commit 群が動作証明、
+      A キー + dblclick / point edit / curve type / clip drag / Volume ramp 全て OK)
 - [x] Phase 3 daw_01 側完了 (2026-05-11):
       curve popup 4 択化 (Exponential 追加) /
       `selected_automation_points` AppData field /
@@ -1470,10 +1461,9 @@ pub fn automation_curve<F>(
       copy / paste 実装 (Note 同 idiom、 norm 0..=1 で JSON 化) /
       shortcut: Ctrl+C / Ctrl+V / Delete を automation point 選択優先に拡張 /
       is_undoable に `QuantizeSelectedAutomationPoints` 追加
-- [ ] gui_01 #033 (2026-05-11 起票): widget 側の curve 4 種描画 +
-      tension/bend handle + lasso 矩形選択 + selected point visual feedback。
-      reply 受領後に `model_curve_to_widget` Exponential fallback 削除 +
-      `SetAutomationCurveParam` 対応 AppEvent + handler を追加
+- [x] gui_01 #033 (2026-05-11 起票): widget 側の curve 4 種描画 +
+      tension/bend handle + lasso 矩形選択 + selected point visual feedback
+      → Phase 3 完結 (Phase 63n-7 / -8 / -9 全 wired、 §10 Phase 3 参照)
 
 ## 14. 主要ファイル変更点
 
