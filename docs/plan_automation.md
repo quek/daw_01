@@ -1043,7 +1043,7 @@ Phase 5 は Step で分解して進める:
 検証: cargo build / clippy --workspace --tests / test (common 140 + daw_audio
 39 + 既存 group_lifecycle 1 fail は別 task) all clean。
 
-#### Step 5.1: Master lane UI (= arrangement 上に song-level row を表示) ✅ 主要部 (2026-05-12)
+#### Step 5.1: Master lane UI (= arrangement 上に song-level row を表示) ✅ 完了 (2026-05-13、 smoke skip)
 
 gui_01 #034 で要望、 Phase 63n-10 として widget landing 完了 (gui_01 commit `6074db6`)、
 daw_01 側 wire も landing。 master row が arrangement 上端に表示され、 SongTempo /
@@ -1070,11 +1070,8 @@ SongTimeSigNumerator lane が curve / point / clip と full feature で編集可
       検知 ParamGesture wire + `AppEvent::SetSongBpmFromScrub` /
       `SetSongTimeSigNumFromScrub` + 軽量 IPC `MainToChild::SetSongBpm` /
       `SetSongTimeSigNumerator` を 1 commit で完了 (2026-05-12)
-- [ ] **smoke test (Step 5.1)**: `cargo run -p daw_gui` で起動 → arrangement
-      上端に Master row が見える → `A` キー (BPM input touch 後) で
-      SongTempo lane が master row に追加 → master row body dblclick で clip
-      作成 → clip 内 dblclick で point 追加 → 既存 Phase 3 機能 (curve type
-      / tension / lasso / etc.) がそのまま動く
+- [x] **smoke test (Step 5.1)**: user 判断で skip (2026-05-13、 master lane
+      は Phase 64a 取り込み + arrangement_view wire の commit 群で動作証明済)。
 
 #### Step 5.2: Audio engine tempo eval (= per-buffer での SongTempo lane 評価) ✅ (2026-05-11)
 
@@ -1103,9 +1100,9 @@ scope 外 (= 旧 song.bpm 定数のまま、 別 phase で対応)。
 - [x] buffer 末で `playhead_beats += frames * current_bpm / (60 * SR)`、
       `last_known_playhead = new_ph` を記録 (loop wrap 後 / Stop 時の seek
       検出にも対応)
-- [ ] **smoke test (Step 5.2)**: master lane (Step 5.1 完了後) に SongTempo
-      の curve を設置、 Play 中に curve に従って tempo 変化を聴覚で確認。
-      tempo-sync plugin (Step 5.3) の delay 時間 / arp 速度が curve に追随
+- [x] **smoke test (Step 5.2)**: user 判断で skip (2026-05-13、 sequencer /
+      audio_clip_renderer beat-domain refactor + granular DSP / Slice の commit
+      群で audio path は動作証明済)。
 - [x] sequencer (MIDI note tempo 追随) ✅ (2026-05-12): `collect_events_for_buffer`
       を beat-domain refactor (= `playhead: u64` sample → `playhead_beats: f64`
       beat + `current_bpm: f32`)、 process_track_owned に `playhead_beats: f64`
@@ -1142,9 +1139,11 @@ scope 外 (= 旧 song.bpm 定数のまま、 別 phase で対応)。
       lookup (RT 安全、 heap 確保なし)。 onset 自動検出 (= AudioEvent.onsets
       の生成) は別 phase (= transient analysis tool が必要)、 user が手動で
       onsets を渡すまでは Raw 等価挙動
-- [ ] recording 中の SongTempo lane bypass は Step 5.1 で transport BPM
-      input が gesture 発火するようになったら追加 wire (= 現状 BPM input は
-      gesture 経路に乗っていない)
+- [x] recording 中の SongTempo lane bypass wire (commit `8f8f730`、
+      2026-05-13): `daw_audio::engine::process_buffer` の `current_bpm` 計算で
+      `recording_lanes.contains(&(MASTER_TRACK_ID, AutomationTarget::SongTempo))`
+      を判定、 該当中は `evaluate_song_tempo` を skip して `song.bpm` constant
+      fallback。 transport BPM input drag 時の curve / drag 値の二重反映を抑止。
 
 #### Step 5.3: CLAP_EVENT_TRANSPORT ✅ (2026-05-11)
 
@@ -1173,11 +1172,8 @@ CLAP plugin に transport state を 1 buffer 毎に届け、 tempo-sync 機能�
       IS_LOOP_ACTIVE (条件)`
 - [x] `process_server::process_loop` で `transport = TransportContext::
       from_process_data(pd)` し、 `plugin.process(..., &transport)` に渡す
-- [ ] **smoke test (Step 5.3)**: tempo-sync 系 CLAP plugin (e.g., ValhallaSpaceModulator
-      の sync delay、 Vital arp) を track に load し、 host BPM を 60 / 120 /
-      180 と切り替えて plugin の delay 時間 / arp テンポが追随することを確認
-- [ ] **smoke test (Step 5.3 transport flag)**: Play / Stop の切替で plugin
-      の playing 状態表示が変化することを確認 (Surge XT 等の表示で見える)
+- [x] **smoke test (Step 5.3)**: user 判断で skip (2026-05-13)。
+- [x] **smoke test (Step 5.3 transport flag)**: user 判断で skip (2026-05-13)。
 
 各 Phase で:
 
