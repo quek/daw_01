@@ -565,7 +565,22 @@ impl LocalState {
         // 当該 buffer 内では tempo 定数として扱う (= sub-buffer の tempo
         // change は scope 外、 1 buffer = ~5..20ms なので user 体感には
         // 影響なし)。
+        //
+        // Phase 5 Step 5.2 follow-up (2026-05-13): SongTempo lane が
+        // recording 中 (= GUI 側で transport BPM input が gesture begin、
+        // `MainToChild::SetRecordingLanes` で set に追加) なら curve eval を
+        // **skip** し、 `song.bpm` constant fallback を維持する。 これで
+        // transport BPM input drag が即時に audio に反映され、 直前 frame
+        // に curve へ記録された point との二重反映 (= 階段状カクつき / 微小
+        // ズレ) を防ぐ。 mixer fader の Volume / Pan と同 idiom
+        // (`fill_track_param_ramps` の `recording_lanes.contains(...)` 分岐
+        // 参照)。 set は 1 buffer の lifetime で borrow 済みなので RT 安全。
+        let tempo_recording = recording_lanes.contains(&(
+            common::model::MASTER_TRACK_ID,
+            common::model::AutomationTarget::SongTempo,
+        ));
         let current_bpm: f32 = match song_ref {
+            Some(s) if tempo_recording => s.bpm,
             Some(s) => common::automation::evaluate_song_tempo(s, self.playhead_beats),
             None => 120.0,
         };
