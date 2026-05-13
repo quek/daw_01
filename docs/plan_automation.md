@@ -890,10 +890,14 @@ commit を回し、 各 Step landing 後に user 目視確認を挟む。
       持たないので skip。 helper: `push_param_gesture_edges`
 - [x] `ParamGestureBegin` handler は `last_touched_param` も同時に更新
       (= 既存 `TouchParam` の subsume idiom、 gesture begin の瞬間が touch)
-- [ ] inspector lane default knob の wire (lane.default_value も automation
-      target を持つので gesture 対象。 Step B follow-up で `arrangement_view.rs`
-      / `track_inspector.rs` の lane knob にも `push_param_gesture_edges`
-      を仕込む)
+- [x] inspector lane default knob の wire は **不要** と判断 (2026-05-13):
+      `AutomationLane.default_value_norm` は curve fallback の constant 値
+      (clip 範囲外 / disabled lane / clip gap で使われる base 値) であり、
+      automation recording の対象ではない (= default を drag しても curve に
+      point は生成されない、 `record_automation_points_for_tick` は curve
+      の `points` のみを対象とする)。 gesture wire は意味的に空回り、 mixer
+      fader / pan knob / CLAP plugin GUI knob の既存 wire のみで Phase 4 は
+      完結。
 - [ ] CLAP plugin GUI の `CLAP_EVENT_PARAM_GESTURE_END` IPC 追加
       (Phase 2c で BEGIN のみ送信中、 END も同 idiom で plugin host →
       daw_gui へ。 Step B follow-up)
