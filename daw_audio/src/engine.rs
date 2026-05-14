@@ -120,6 +120,11 @@ pub struct SharedState {
     /// bypass で済む)。 起動時は空。
     pub recording_lanes:
         arc_swap::ArcSwap<std::collections::HashSet<(u32, common::model::AutomationTarget)>>,
+    /// Phase 7 B3 (2026-05-13): メトロノーム on/off。 GUI が
+    /// `MainToChild::SetMetronomeEnabled(bool)` で更新、 audio thread が
+    /// `render_metronome` で読む。 false なら click 生成を skip (= 無音)。
+    /// 起動時 default false。
+    pub metronome_enabled: AtomicBool,
 }
 
 impl SharedState {
@@ -132,6 +137,7 @@ impl SharedState {
             recording_lanes: arc_swap::ArcSwap::from_pointee(
                 std::collections::HashSet::new(),
             ),
+            metronome_enabled: AtomicBool::new(false),
         }
     }
 }
@@ -207,6 +213,27 @@ impl Default for EngineShared {
 
 /// Audio-thread-private engine state. Lives in the CPAL closure for the
 /// whole stream lifetime.
+/// Phase 7 B3 (2026-05-13): メトロノーム click voice (sine + linear envelope
+/// decay)。 1 voice mono。 beat 境界で trigger され、 `samples_remaining` が
+/// 0 になるまで sine を mix。 連続 beat で前 voice が decay 中なら新 voice
+/// で overwrite (= 短 decay の業界標準 idiom)。
+///
+/// パラメータ default: decay 40 ms / amplitude peak 0.25 (-12 dB) / freq
+/// downbeat 880 Hz 他 440 Hz。 すべて `render_metronome` で hardcode。
+pub struct ClickVoice {
+    /// remaining samples until envelope reaches 0 (= voice expires)
+    pub samples_remaining: u32,
+    /// total decay length in samples (envelope = remaining / decay_total)
+    pub decay_samples: u32,
+    /// oscillator frequency (Hz)
+    pub freq: f32,
+    /// phase accumulator (radians, 0..=TAU)
+    pub phase: f32,
+    /// 次 buffer 内で voice を再開する sample offset (= trigger frame)。
+    /// 0 なら buffer の最初から再開 (= 前 buffer から続いている voice)。
+    pub start_offset: u32,
+}
+
 pub struct LocalState {
     /// Pre-allocated scratch buffers (MAX_TRACKS entries). The audio
     /// loop indexes into this with the current Song's track index — no
@@ -244,6 +271,14 @@ pub struct LocalState {
     /// (= per-event state 必要、 worker pool に &mut を通す refactor が要)。
     /// 初期値 1.0 (= nominal)、 LP coef は process_buffer で `~50ms TC` 相当。
     pub granular_tempo_smoothed: f64,
+    /// Phase 7 B3 (2026-05-13): metronome click voice 状態 (mono single-voice、
+    /// per-buffer で beat 境界を検出して trigger、 sine + linear envelope decay)。
+    /// `Some` なら active (= まだ decay 中)、 `None` なら idle。 連続 beat で
+    /// 前 voice が decay 中なら overwrite (= 短 decay の 1 voice のみ持続、
+    /// 業界標準の click と同 idiom)。 master mix 後に `render_metronome` で
+    /// 反映。 export 中 / playing でない / `metronome_enabled = false` のいずれ
+    /// でも render skip。
+    pub metronome_voice: Option<ClickVoice>,
     /// Pending IPC commands from the receive loop. Drained at the top
     /// of every `process_buffer` so `EngineShared` snapshots are fresh
     /// before dispatch.
@@ -289,6 +324,7 @@ impl LocalState {
             playhead_beats: 0.0,
             last_known_playhead: u64::MAX,
             granular_tempo_smoothed: 1.0,
+            metronome_voice: None,
             cmd_rx,
             shared,
             cached_schedule: Schedule::empty(),
@@ -704,6 +740,31 @@ impl LocalState {
                 recording_lanes,
                 current_bpm,
             );
+
+            // Phase 7 B3 (2026-05-13): metronome click を master mix に追加。
+            // export 中 / playing でない / metronome_enabled false のいずれ
+            // でも skip (= mix 自体が走らないので CPU 0)。 enable 時は beat
+            // 境界 (current_bpm + tsig 由来) ごとに voice を trigger、 既存
+            // voice があれば overwrite (= 短 decay 1 voice だけ持続、 業界
+            // 標準の click)。 master mix の最後に重ねる (= track の mute /
+            // solo / volume の影響を受けない、 「常に聞こえる guide」 が
+            // metronome の規範動作)。
+            if !self.shared.export_running.load(Ordering::Acquire)
+                && playing
+                && shared.metronome_enabled.load(Ordering::Acquire)
+            {
+                let tsig_num = i64::from(song.time_sig.0.max(1));
+                render_metronome(
+                    &mut self.metronome_voice,
+                    &mut self.master_l[..n],
+                    &mut self.master_r[..n],
+                    n,
+                    playhead,
+                    sample_rate,
+                    current_bpm,
+                    tsig_num,
+                );
+            }
 
             // Publish per-track peak meters into the shared AudioBridge
             // so the GUI mixer strips animate. Atomic stores, RT-safe.
@@ -1623,6 +1684,93 @@ fn run_group_fx_chain(
         }
         scratch.peak_l = peak_l;
         scratch.peak_r = peak_r;
+    }
+}
+
+/// Phase 7 B3 (2026-05-13): メトロノーム click を 1 buffer 分 master_l/r に
+/// 重ねる。 buffer 範囲内の全 beat 境界 (current_bpm + sample_rate から算出)
+/// で click voice を trigger、 既存 voice が decay 中なら overwrite (= 短
+/// decay 1 voice の業界標準 idiom)。 voice の sample 生成は sine + linear
+/// envelope decay で hardcode (decay 40 ms / amp peak 0.25 = -12 dB / freq
+/// downbeat 880 Hz, 他 440 Hz)。 stereo は同 sample を L/R に均等 mix
+/// (= mono click)。
+///
+/// RT 安全: heap 確保なし、 浮動小数演算と sin() 呼び出しのみ。 bpm = 0 /
+/// sample_rate = 0 / tsig_num < 1 で no-op (defensive)。
+///
+/// 同 buffer 内に 2 個以上 beat 境界が含まれる場合 (= 高速 tempo / 大 buffer)、
+/// 後の trigger が voice を overwrite し前の voice の残響は失われる。 通常
+/// 使用範囲 (~600 BPM @ 11.6 ms buffer = 1.16 beat/buffer) では起きない。
+#[allow(clippy::too_many_arguments)]
+fn render_metronome(
+    voice: &mut Option<ClickVoice>,
+    master_l: &mut [f32],
+    master_r: &mut [f32],
+    frames: usize,
+    playhead_samples: u64,
+    sample_rate: u32,
+    bpm: f32,
+    tsig_num: i64,
+) {
+    if frames == 0 || sample_rate == 0 || bpm <= 0.0 || tsig_num < 1 {
+        return;
+    }
+    let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(bpm);
+    if samples_per_beat <= 0.0 {
+        return;
+    }
+    let buffer_start = playhead_samples as f64;
+    let buffer_end = buffer_start + frames as f64;
+    // この buffer 内に含まれる beat 境界 (= sample 位置 = beat_index *
+    // samples_per_beat) を順次 trigger。 連続なら最後の trigger が voice を
+    // overwrite (KISS: 同 buffer 多重 voice なし)。
+    let first_beat_in_buf = (buffer_start / samples_per_beat).ceil() as i64;
+    let mut beat_index = first_beat_in_buf.max(0);
+    loop {
+        let boundary_sample = beat_index as f64 * samples_per_beat;
+        if boundary_sample >= buffer_end {
+            break;
+        }
+        if boundary_sample >= buffer_start {
+            let buf_offset = (boundary_sample - buffer_start).floor() as u32;
+            if (buf_offset as usize) < frames {
+                let downbeat = beat_index.rem_euclid(tsig_num) == 0;
+                let decay = ((sample_rate as f32) * 0.04) as u32;
+                let freq = if downbeat { 880.0 } else { 440.0 };
+                *voice = Some(ClickVoice {
+                    samples_remaining: decay.max(1),
+                    decay_samples: decay.max(1),
+                    freq,
+                    phase: 0.0,
+                    start_offset: buf_offset,
+                });
+            }
+        }
+        beat_index += 1;
+    }
+    // active voice の sample 生成 + mix。 start_offset から frames 末まで
+    // sine + linear envelope decay。 voice 終端で None に戻す。
+    if let Some(v) = voice.as_mut() {
+        let mut i = v.start_offset as usize;
+        v.start_offset = 0;
+        let two_pi = std::f32::consts::TAU;
+        let amp_peak: f32 = 0.25;
+        let freq_per_sr = v.freq / sample_rate as f32;
+        while i < frames && v.samples_remaining > 0 {
+            let env = v.samples_remaining as f32 / v.decay_samples as f32;
+            let s = v.phase.sin() * env * amp_peak;
+            master_l[i] += s;
+            master_r[i] += s;
+            v.phase += two_pi * freq_per_sr;
+            if v.phase > two_pi {
+                v.phase -= two_pi;
+            }
+            v.samples_remaining -= 1;
+            i += 1;
+        }
+        if v.samples_remaining == 0 {
+            *voice = None;
+        }
     }
 }
 

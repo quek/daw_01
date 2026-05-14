@@ -262,6 +262,28 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
     x += 8.0;
 
+    // Phase 7 B3 (2026-05-13): メトロノーム on/off toggle。 audio thread
+    // が beat 境界ごとに internal click 音 (sine, accent: downbeat 880Hz /
+    // 他 440Hz, 40ms decay, peak -12 dB) を master mix に重ねる。 default
+    // off、 session-only state (project save には含めない)。 既存 recording
+    // mode toggle と同 STYLE で active 時 橙、 visual で「現在 click が鳴る」
+    // 状態が一目で分かる。
+    let metro_w = 60.0;
+    let metro_active = app.metronome_enabled;
+    ui.toggle_button_at(
+        "transport_metronome",
+        "Click",
+        Rect { x, y: cy, w: metro_w, h: bh },
+        metro_active,
+        &STYLE_REC_MODE,
+        move |_| {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetMetronomeEnabled(!metro_active))
+            })
+        },
+    );
+    x += metro_w + 12.0;
+
     // PR-V4: 旧「Synth (V)」 ボタンは削除。 builtin VOICEVOX plugin が
     // 歌詞 / notes 変更時に自動 synth する (= sync_vocal_metadata 経由)。
 

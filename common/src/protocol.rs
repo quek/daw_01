@@ -372,6 +372,12 @@ pub enum MainToChild {
     SetRecordingLanes {
         lanes: Vec<(u32, crate::model::AutomationTarget)>,
     },
+    /// Phase 7 B3 (2026-05-13): メトロノーム on/off。 `true` で audio thread
+    /// が beat 境界ごとに internal click 音 (sine, accent: downbeat 880Hz /
+    /// 他 440Hz, 40ms linear decay, peak -12 dB) を master mix に重ねる。
+    /// `false` で無音 (= mix step を skip)。 起動時 default false。
+    /// session-only state (project save には含めない)。
+    SetMetronomeEnabled(bool),
     // --- Per-track plugin slot management -----------------------------
     /// Load / replace the plugin in `(track, slot)`. `format` routes the
     /// request to the CLAP or VST3 backend. Empty `plugin_id` picks the

@@ -362,6 +362,13 @@ pub struct AppData {
     /// curve eval をバイパスし、 GUI からの knob 値を `playhead_beat`
     /// 起点に point として書き込む。
     pub recording_mode: common::model::RecordingMode,
+    /// Phase 7 B3 (2026-05-13): メトロノーム on/off。 transport bar の
+    /// toggle button で切り替え、 `AppEvent::SetMetronomeEnabled(bool)` で
+    /// 更新 → `MainToChild::SetMetronomeEnabled(bool)` を audio に送信。
+    /// audio thread は内蔵 click 音 (sine + linear envelope decay、 accent:
+    /// downbeat 880Hz / 他 440Hz) を master mix に重ねる。 起動時 default
+    /// false。 session-only (project save には含めない)。
+    pub metronome_enabled: bool,
     /// Phase 4 Step B (`docs/plan_automation.md` §6): 現在 user が触っている
     /// (= dragging) parameter の集合。 mixer / inspector / lane default knob
     /// の press で insert、 release で remove。 plugin GUI 経由の gesture も
@@ -745,6 +752,7 @@ impl AppData {
             selected_automation_points: Vec::new(),
             last_touched_param: None,
             recording_mode: common::model::RecordingMode::default(),
+            metronome_enabled: false,
             active_param_gestures: std::collections::HashSet::new(),
             latched_param_gestures: std::collections::HashSet::new(),
             recording_last_beat: std::collections::HashMap::new(),
@@ -1876,6 +1884,10 @@ pub enum AppEvent {
     /// Phase 4 (`docs/plan_automation.md` §6): automation recording mode の
     /// transport 4 way toggle。 session-only / Undo 対象外。
     SetRecordingMode(common::model::RecordingMode),
+    /// Phase 7 B3 (2026-05-13): メトロノーム on/off。 transport bar の toggle
+    /// で発火、 `AppData.metronome_enabled` を更新 + `MainToChild::Set
+    /// MetronomeEnabled(bool)` を audio に送信。 session-only / Undo 対象外。
+    SetMetronomeEnabled(bool),
     /// Phase 4 Step B (`docs/plan_automation.md` §6): mixer / inspector /
     /// plugin GUI で parameter knob の drag が **開始** した瞬間に発火。
     /// `active_param_gestures` に insert + `last_touched_param` を更新
@@ -2693,6 +2705,14 @@ impl AppData {
             AppEvent::SetRecordingMode(mode) => {
                 self.recording_mode = mode;
                 self.sync_recording_lanes_with_audio();
+            }
+            AppEvent::SetMetronomeEnabled(enabled) => {
+                // Phase 7 B3 (2026-05-13): metronome on/off。 audio thread は
+                // 次 buffer から `render_metronome` の有無を切り替える (= 無効
+                // 時は mix step 自体 skip = CPU 0)。 GUI 側は transport bar の
+                // toggle UI 更新のみ。
+                self.metronome_enabled = enabled;
+                self.send_audio(MainToChild::SetMetronomeEnabled(enabled));
             }
             AppEvent::ParamGestureBegin {
                 track_id,

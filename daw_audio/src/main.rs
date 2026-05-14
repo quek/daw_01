@@ -239,6 +239,17 @@ async fn recv_loop(
                     s.time_sig.0 = clamped;
                 });
             }
+            Ok(MainToChild::SetMetronomeEnabled(enabled)) => {
+                // Phase 7 B3 (2026-05-13): GUI が transport bar の metronome
+                // toggle を切り替え。 SharedState 上の AtomicBool を replace し、
+                // audio thread は次 buffer から `render_metronome` の有効無効を
+                // 切り替える (= 無効時は mix step を skip)。 lock-free / 0
+                // allocation on audio thread。
+                shared.metronome_enabled.store(
+                    enabled,
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
             Ok(MainToChild::SetRecordingLanes { lanes }) => {
                 // Phase 4 Step C-2: GUI が「現在 recording 中の lane」 セットを
                 // 送ってきた。 ArcSwap で snapshot を replace し、 audio thread
