@@ -321,8 +321,14 @@ fn spawn_playhead_poller(bridge: Arc<AudioBridgeHandle>, proxy: EventLoopProxy<A
             std::thread::sleep(Duration::from_millis(33));
             let samples = bridge.playhead_samples();
             let (peak_l, peak_r) = bridge.peaks();
+            let preroll = bridge.preroll_remaining();
             if proxy
-                .send_event(AppEvent::Tick { samples, peak_l, peak_r })
+                .send_event(AppEvent::Tick {
+                    samples,
+                    peak_l,
+                    peak_r,
+                    preroll,
+                })
                 .is_err()
             {
                 break;

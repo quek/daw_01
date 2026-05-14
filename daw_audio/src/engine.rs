@@ -188,6 +188,16 @@ pub struct EngineShared {
     /// caller is expected to use `Absolute` (import_cache fallback).
     /// Updated by `MainToChild::SetProjectDir`.
     pub project_dir: ArcSwapOption<PathBuf>,
+    /// Phase 7 B4 Step C (2026-05-13): count-in 用 preroll の合計 samples
+    /// (= count-in 開始時に GUI が `StartCountIn { samples }` で立てた値の
+    /// snapshot)。 `process_buffer` で `elapsed = total - remaining` を
+    /// 計算して metronome の click trigger 用 playhead として使う。 0 で
+    /// count-in 中ではない。
+    pub preroll_total_samples: AtomicU64,
+    /// Phase 7 B4 Step C: count-in 残り samples。 audio thread が毎 buffer
+    /// `frames` だけ deduct + audio_bridge mirror 経由で GUI に publish。
+    /// 0 到達で通常再生に戻る (= dispatch / clip render 復帰)。
+    pub preroll_remaining_samples: AtomicU64,
 }
 
 impl EngineShared {
@@ -201,6 +211,8 @@ impl EngineShared {
             export_running: AtomicBool::new(false),
             audio_clip_renderer: ArcSwap::from_pointee(AudioClipRenderer::empty()),
             project_dir: ArcSwapOption::empty(),
+            preroll_total_samples: AtomicU64::new(0),
+            preroll_remaining_samples: AtomicU64::new(0),
         }
     }
 }
@@ -532,6 +544,50 @@ impl LocalState {
         // and plugin instances are exclusively driven by the export
         // render loop.
         if self.shared.export_running.load(Ordering::Acquire) {
+            return;
+        }
+
+        // Phase 7 B4 Step C (2026-05-13): count-in モード — preroll > 0 なら
+        // 通常 dispatch / clip render を skip し、 metronome のみ render +
+        // preroll counter を deduct + audio_bridge に mirror。 0 到達で通常
+        // 再生に戻る (= 次 buffer で本 if が false になり、 既存 dispatch
+        // 経路に進む)。 GUI 側 on_tick が audio_bridge の preroll mirror を
+        // poll、 0 検出で midi_recording_pending → midi_recording 遷移。
+        let preroll =
+            self.shared.preroll_remaining_samples.load(Ordering::Acquire);
+        if preroll > 0 {
+            let total =
+                self.shared.preroll_total_samples.load(Ordering::Acquire);
+            let elapsed = total.saturating_sub(preroll);
+            let bpm = song_snapshot
+                .as_ref()
+                .map(|s| s.bpm)
+                .unwrap_or(120.0)
+                .max(1.0);
+            let tsig_num = i64::from(
+                song_snapshot
+                    .as_ref()
+                    .map(|s| s.time_sig.0)
+                    .unwrap_or(4)
+                    .max(1),
+            );
+            if shared.metronome_enabled.load(Ordering::Acquire) {
+                render_metronome(
+                    &mut self.metronome_voice,
+                    &mut self.master_l[..n],
+                    &mut self.master_r[..n],
+                    n,
+                    elapsed,
+                    sample_rate,
+                    bpm,
+                    tsig_num,
+                );
+            }
+            let new_preroll = preroll.saturating_sub(n as u64);
+            self.shared
+                .preroll_remaining_samples
+                .store(new_preroll, Ordering::Release);
+            bridge.set_preroll_remaining(new_preroll);
             return;
         }
 

@@ -38,6 +38,13 @@ pub struct AudioBridge {
     /// Written by daw_plugin_host after summing each track into the master
     /// bus; read by daw_gui on its UI tick.
     pub track_peaks: [[AtomicU32; 2]; MAX_TRACKS],
+    /// Phase 7 B4 Step C (2026-05-13): count-in 残り samples mirror (audio
+    /// thread が `process_buffer` で書く、 GUI が on_tick で poll)。 GUI 側は
+    /// `midi_recording_pending` 中だけ参照、 0 検出で `midi_recording` に昇格。
+    /// 0 = count-in 中ではない / 完了済。 通常再生中は audio thread が更新
+    /// しないので、 `StartCountIn` 受信時に audio thread が値を立てる。
+    pub preroll_remaining_samples: AtomicU64,
+    _pad_preroll: u32,
     pub samples: [f32; SAMPLE_BUFFER_LEN],
 }
 
@@ -146,6 +153,23 @@ impl AudioBridgeHandle {
 
     /// Fills `out` with `(L, R)` peaks for tracks 0..`out.len()`.
     /// Out-of-range tracks are reported as `(0.0, 0.0)`.
+    /// Phase 7 B4 Step C: count-in 残り samples を audio thread が更新。
+    /// `StartCountIn` 受信時は GUI 側の `app.rs` が `MainToChild` 経由で
+    /// 流す → audio thread の `process_buffer` が preroll > 0 ループ内で
+    /// 毎 buffer `set_preroll_remaining(new_value)` を呼ぶ。 0 到達で
+    /// 通常再生に戻る。
+    pub fn set_preroll_remaining(&self, n: u64) {
+        self.bridge()
+            .preroll_remaining_samples
+            .store(n, Ordering::Release);
+    }
+
+    pub fn preroll_remaining(&self) -> u64 {
+        self.bridge()
+            .preroll_remaining_samples
+            .load(Ordering::Acquire)
+    }
+
     pub fn track_peaks(&self, out: &mut Vec<(f32, f32)>) {
         out.clear();
         for i in 0..MAX_TRACKS {

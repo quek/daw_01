@@ -383,6 +383,14 @@ pub enum MainToChild {
     /// `false` で無音 (= mix step を skip)。 起動時 default false。
     /// session-only state (project save には含めない)。
     SetMetronomeEnabled(bool),
+    /// Phase 7 B4 Step C (2026-05-13): count-in 開始 IPC。 audio engine が
+    /// `EngineShared::preroll_total_samples` / `preroll_remaining_samples` を
+    /// `samples` で store、 `process_buffer` で preroll > 0 のとき dispatch /
+    /// clip render を skip + metronome のみ render。 0 到達で normal 再生に
+    /// 戻る。 GUI 側は audio_bridge の preroll mirror を on_tick で poll、
+    /// 0 検出で midi_recording_pending → midi_recording 遷移。 `samples = 0`
+    /// で count-in を即時 cancel (= stop_recording 中の preroll キャンセル用)。
+    StartCountIn { samples: u64 },
     // --- Per-track plugin slot management -----------------------------
     /// Load / replace the plugin in `(track, slot)`. `format` routes the
     /// request to the CLAP or VST3 backend. Empty `plugin_id` picks the

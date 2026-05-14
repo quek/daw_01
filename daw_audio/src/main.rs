@@ -250,6 +250,23 @@ async fn recv_loop(
                     s.time_sig.0 = clamped;
                 });
             }
+            Ok(MainToChild::StartCountIn { samples }) => {
+                // Phase 7 B4 Step C (2026-05-13): GUI が Record toggle ON +
+                // count_in_bars > 0 で発火。 EngineShared に preroll を立てて、
+                // process_buffer 頭で「dispatch / clip render skip + metronome
+                // のみ render」 ループに入る。 0 到達で通常再生復帰、 GUI 側は
+                // audio_bridge mirror 経由で midi_recording_pending 解除。
+                // samples = 0 で count-in 即時 cancel (= stop_recording 中の
+                // preroll 中断)。
+                use std::sync::atomic::Ordering;
+                engine_shared
+                    .preroll_total_samples
+                    .store(samples, Ordering::Release);
+                engine_shared
+                    .preroll_remaining_samples
+                    .store(samples, Ordering::Release);
+                tracing::info!(samples, "received StartCountIn");
+            }
             Ok(MainToChild::SetMetronomeEnabled(enabled)) => {
                 // Phase 7 B3 (2026-05-13): GUI が transport bar の metronome
                 // toggle を切り替え。 SharedState 上の AtomicBool を replace し、

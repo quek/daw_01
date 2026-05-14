@@ -260,9 +260,32 @@ count-in 中の audio thread: 既存 `playhead < 0` を `playing && !cmd_to_rend
       3 段独立) が landing 済、 daw_01 caller は `arrangement_view.rs` で
       `ArrangementTrack { ..., armed: t.armed, .. }` + `ToggleTrackArmed(track_id)
       → AppEvent::ToggleTrackArmed` の 2 行 wire のみで完了
-- [ ] Step B (midir input listener)
-- [ ] Step C (count-in + Record button + audio engine 拡張)
-- [ ] Step D (録音書き込み)
+- [x] Step B (midir input listener) — 既存実装で完了。 `daw_gui/src/midi.rs`
+      で `open_default_input` + `dispatch` が `AppEvent::MidiNoteOn / MidiNoteOff
+      / MidiInputOpened` を発火、 `main.rs:287-303` で起動済 (Phase 7 B4 実装
+      開始前から存在)。 listener 経路の追加実装は不要 — Step D で
+      `handle_midi_note_on/off` に「録音 mode 分岐」 を入れるだけで完結。
+- [x] Step C (count-in + Record button + audio engine 拡張) — 本 commit。
+      transport bar に Record toggle button (record red、 active 時 「● Rec」
+      / count-in 中 「Count-in...」) + Count-in dropdown ("No count-in" / "1 bar"
+      / "2 bars") を追加。 `MainToChild::StartCountIn { samples }` IPC、
+      `EngineShared::preroll_total_samples` / `preroll_remaining_samples` +
+      `audio_bridge::preroll_remaining_samples` mirror、 audio engine の
+      `process_buffer` 頭で preroll > 0 ブランチ (= 通常 dispatch / clip
+      render skip + metronome のみ render + preroll deduct)。 GUI 側 on_tick が
+      preroll mirror を 0 検出で `midi_recording_pending → midi_recording`
+      遷移。 metronome は count-in 中だけ強制 ON (`metronome_enabled_pre_recording`
+      で snap、 stop_recording で復元)。 stop 時に `StartCountIn { samples: 0 }`
+      で preroll を即時 cancel。
+- [x] Step D (録音書き込み) — 本 commit。 `handle_midi_note_on/off` を 2 mode
+      化 (= 既存 `step_input_note_on` を抽出、 `record_midi_note_on/off` を新設)。
+      録音 mode では armed track 全てに対し `ensure_midi_clip_at_playhead`
+      で「playhead 内の MIDI clip があれば再利用、 末尾 1 beat 以内なら延長、
+      それ以外は新規 4 beat clip 作成」、 note_on で仮 length 0.05 で push
+      (= live preview)、 note_off で `length = playhead - start` を確定 (`active_notes`
+      cache 経由)。 `find_midi_clip_at_playhead` / `find_midi_clip_containing_beat`
+      helper 追加 (= 内部実装は同一だが意味的区別)。 既存 `Track.armed`
+      (Step A) を armed track 検索に使用。
 - [ ] Step E (MIDI export)
 
 ## 13. 主要ファイル変更点

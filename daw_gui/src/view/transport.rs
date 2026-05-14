@@ -62,6 +62,23 @@ const RECORDING_MODES: &[(RecordingMode, &str)] = &[
     (RecordingMode::Write, "Write"),
 ];
 
+/// Phase 7 B4 Step C/D (2026-05-13): MIDI Record toggle button のスタイル。
+/// active 時 record red (= 業界標準) + hint band で「録音中」 を強調。
+/// count-in 中も同 active state で描画 (label 側で「Count-in...」 表示と
+/// 切り替え)。 STYLE_REC_MODE (橙、 automation recording) と意図的に
+/// 区別 (= MIDI 録音は別概念)。
+const STYLE_RECORD: ToggleButtonStyle = ToggleButtonStyle {
+    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
+    on_color: Color { r: 0.85, g: 0.20, b: 0.20, a: 1.0 },
+    hint_band: Some(Color { r: 1.0, g: 0.30, b: 0.30, a: 1.0 }),
+    hint_band_h: 2.0,
+    border: Color { r: 0.45, g: 0.30, b: 0.30, a: 1.0 },
+    border_width: 1.0,
+    radius: 4.0,
+    font_size: 12.0,
+    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+};
+
 /// Phase 4: recording mode toggle の見た目。 active 時 off_color (灰)
 /// → on_color (橙) + 下端の hint band で「writing」 状態を強調する。
 /// Bitwig の Touch/Latch/Write ボタンに準拠 (Read 含めて 4 つすべて同 style)。
@@ -283,6 +300,51 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         },
     );
     x += metro_w + 12.0;
+
+    // Phase 7 B4 Step C (2026-05-13): count-in bars dropdown (Off / 1 / 2 bars)。
+    // 録音 trigger 時に preroll bars 分 click のみ流して 0 拍到達で正規録音
+    // 開始。 0 で count-in 無し (= 即時録音)。 transport の Record button
+    // とセットで業界標準 (Bitwig / Live / Reaper)。
+    let count_in_w = 90.0;
+    let count_in_items: &[&str] = &["No count-in", "1 bar", "2 bars"];
+    let cur_count_in_idx = (app.count_in_bars.min(2)) as usize;
+    if let Some(idx) = ui.dropdown(
+        "transport_count_in",
+        Rect { x, y: cy, w: count_in_w, h: bh },
+        count_in_items,
+        cur_count_in_idx,
+    ) {
+        let bars = idx as u8;
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::SetCountInBars(bars))
+        }));
+    }
+    x += count_in_w + 8.0;
+
+    // Phase 7 B4 Step C/D (2026-05-13): MIDI 録音 toggle。 active で armed
+    // track への MIDI input が clip に書き込まれる。 count-in 中は label を
+    // 「Count-in...」 に切り替えて「待機中」 を可視化。 STYLE_RECORD は
+    // 業界標準どおり record red 系。
+    let rec_w = 86.0;
+    let rec_active = app.midi_recording || app.midi_recording_pending;
+    let rec_label = if app.midi_recording_pending {
+        "Count-in..."
+    } else {
+        "● Rec"
+    };
+    ui.toggle_button_at(
+        "transport_record",
+        rec_label,
+        Rect { x, y: cy, w: rec_w, h: bh },
+        rec_active,
+        &STYLE_RECORD,
+        move |_| {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ToggleMidiRecording)
+            })
+        },
+    );
+    x += rec_w + 12.0;
 
     // PR-V4: 旧「Synth (V)」 ボタンは削除。 builtin VOICEVOX plugin が
     // 歌詞 / notes 変更時に自動 synth する (= sync_vocal_metadata 経由)。

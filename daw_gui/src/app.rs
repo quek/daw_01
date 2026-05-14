@@ -369,6 +369,30 @@ pub struct AppData {
     /// downbeat 880Hz / 他 440Hz) を master mix に重ねる。 起動時 default
     /// false。 session-only (project save には含めない)。
     pub metronome_enabled: bool,
+    /// Phase 7 B4 Step D (2026-05-13): MIDI 録音中 flag。 Record toggle ON
+    /// で true、 Stop / OFF で false。 true のとき handle_midi_note_on/off
+    /// は armed track の MIDI clip に書き込む (= 既存 step-input mode は
+    /// midi_recording == false のときのみ動作)。 session-only / Undo 対象外。
+    pub midi_recording: bool,
+    /// Phase 7 B4 Step C (2026-05-13): count-in 中で「0 拍到達まで preroll
+    /// 待ち」 状態。 `start_recording` で `count_in_bars > 0` なら true、
+    /// audio engine の `preroll_remaining_samples` mirror が 0 に達したら
+    /// `on_tick` が `midi_recording_pending → midi_recording` 遷移させる。
+    /// metronome は pending 中だけ強制 ON で click guide を流す。
+    pub midi_recording_pending: bool,
+    /// Phase 7 B4 Step C (2026-05-13): count-in bars (0 / 1 / 2)。 transport
+    /// bar の dropdown で設定、 default 0。 session-only state。
+    pub count_in_bars: u8,
+    /// Phase 7 B4 Step D (2026-05-13): 直近 note_on の `(track_id, key) →
+    /// start_beat`。 note_off 受信時に start_beat 取り出して `length_beats =
+    /// playhead - start` を確定する。 stop / midi_recording 解除で clear。
+    pub midi_recording_active_notes:
+        std::collections::HashMap<(u32, u8), f64>,
+    /// Phase 7 B4 Step C (2026-05-13): count-in 開始前の metronome_enabled
+    /// 状態 snapshot。 count-in 中だけ強制 ON にし、 `stop_recording` 時に
+    /// 元の値へ戻す (= user の「click off」 設定を尊重しつつ count-in 中は
+    /// guide が聞こえる)。 None なら recording 開始前 = 復元不要。
+    pub metronome_enabled_pre_recording: Option<bool>,
     /// Phase 4 Step B (`docs/plan_automation.md` §6): 現在 user が触っている
     /// (= dragging) parameter の集合。 mixer / inspector / lane default knob
     /// の press で insert、 release で remove。 plugin GUI 経由の gesture も
@@ -753,6 +777,11 @@ impl AppData {
             last_touched_param: None,
             recording_mode: common::model::RecordingMode::default(),
             metronome_enabled: false,
+            midi_recording: false,
+            midi_recording_pending: false,
+            count_in_bars: 0,
+            midi_recording_active_notes: std::collections::HashMap::new(),
+            metronome_enabled_pre_recording: None,
             active_param_gestures: std::collections::HashSet::new(),
             latched_param_gestures: std::collections::HashSet::new(),
             recording_last_beat: std::collections::HashMap::new(),
@@ -1888,6 +1917,13 @@ pub enum AppEvent {
     /// で発火、 `AppData.metronome_enabled` を更新 + `MainToChild::Set
     /// MetronomeEnabled(bool)` を audio に送信。 session-only / Undo 対象外。
     SetMetronomeEnabled(bool),
+    /// Phase 7 B4 Step C/D (2026-05-13): MIDI 録音 toggle。 Record button
+    /// click で発火。 `count_in_bars > 0` なら preroll 開始、 0 なら即時
+    /// recording 開始。 既に走行中なら stop。 session-only / Undo 対象外。
+    ToggleMidiRecording,
+    /// Phase 7 B4 Step C (2026-05-13): count-in bars (0 / 1 / 2) 設定。
+    /// transport bar dropdown で発火。 session-only / Undo 対象外。
+    SetCountInBars(u8),
     /// Phase 4 Step B (`docs/plan_automation.md` §6): mixer / inspector /
     /// plugin GUI で parameter knob の drag が **開始** した瞬間に発火。
     /// `active_param_gestures` に insert + `last_touched_param` を更新
@@ -2096,7 +2132,7 @@ pub enum AppEvent {
     SetMasterGain(f32),
 
     // -------- IPC events from plugin_host ---------------------------------
-    Tick { samples: u64, peak_l: f32, peak_r: f32 },
+    Tick { samples: u64, peak_l: f32, peak_r: f32, preroll: u64 },
     GuiOpenedFromChild { track: u32, slot: PluginSlot, width: u32, height: u32 },
     GuiRequestResizeFromChild { track: u32, slot: PluginSlot, width: u32, height: u32 },
     GuiClosedFromChild { track: u32, slot: PluginSlot },
@@ -2719,6 +2755,12 @@ impl AppData {
                 self.metronome_enabled = enabled;
                 self.send_audio(MainToChild::SetMetronomeEnabled(enabled));
             }
+            AppEvent::ToggleMidiRecording => {
+                self.toggle_midi_recording();
+            }
+            AppEvent::SetCountInBars(bars) => {
+                self.count_in_bars = bars.min(2);
+            }
             AppEvent::ParamGestureBegin {
                 track_id,
                 target,
@@ -2879,8 +2921,11 @@ impl AppData {
             AppEvent::MidiNoteOn { pitch, velocity } => {
                 self.handle_midi_note_on(pitch, velocity);
             }
-            AppEvent::MidiNoteOff { pitch: _ } => {
-                // step-input mode は note end を追跡しない。
+            AppEvent::MidiNoteOff { pitch } => {
+                // Phase 7 B4 Step D (2026-05-13): 録音中は note_off で
+                // length_beats を確定。 step-input mode は note end を追跡
+                // しないので無視。
+                self.handle_midi_note_off(pitch);
             }
             AppEvent::MidiInputOpened(name) => {
                 let label = name.clone().unwrap_or_default();
@@ -3024,7 +3069,16 @@ impl AppData {
             AppEvent::SetMasterGain(amp) => {
                 self.set_master_gain(amp);
             }
-            AppEvent::Tick { samples, peak_l, peak_r } => {
+            AppEvent::Tick { samples, peak_l, peak_r, preroll } => {
+                // Phase 7 B4 Step C: preroll mirror で count-in 完了を検知。
+                // midi_recording_pending == true かつ preroll == 0 なら、
+                // midi_recording に昇格して以後の MIDI input を armed track に
+                // 書き込む。
+                if self.midi_recording_pending && preroll == 0 {
+                    self.midi_recording_pending = false;
+                    self.midi_recording = true;
+                }
+                let _ = preroll;  // 上で消費
                 self.on_tick(samples, peak_l, peak_r);
             }
             AppEvent::GuiOpenedFromChild { track, slot, width, height } => {
@@ -6114,7 +6168,27 @@ impl AppData {
 
     // -------- Clip / note / midi -------------------------------------------
 
+    /// Phase 7 B4 Step D (2026-05-13): MIDI input note_on dispatcher。
+    /// `midi_recording` で arm 録音 path、 そうでなければ既存 step-input mode。
     fn handle_midi_note_on(&mut self, pitch: u8, velocity: u8) {
+        if self.midi_recording {
+            self.record_midi_note_on(pitch, velocity);
+        } else {
+            self.step_input_note_on(pitch, velocity);
+        }
+    }
+
+    /// Phase 7 B4 Step D: MIDI input note_off dispatcher。 録音中は length 確定、
+    /// step-input mode は no-op (既存挙動)。
+    fn handle_midi_note_off(&mut self, pitch: u8) {
+        if self.midi_recording {
+            self.record_midi_note_off(pitch);
+        }
+    }
+
+    /// 既存 step-input mode (= selected_clip + step_cursor_beat に固定 length
+    /// で 1 note ずつ手動入力)。 midi_recording == false のときだけ走る。
+    fn step_input_note_on(&mut self, pitch: u8, velocity: u8) {
         let Some(target) = self.selected_clip else {
             return;
         };
@@ -6153,6 +6227,244 @@ impl AppData {
         self.selected_notes = vec![new_idx];
         self.step_cursor_beat = next_cursor;
         self.sync_song_to_plugin_host();
+    }
+
+    /// Phase 7 B4 Step D: 録音中の note_on 処理。 armed track 全てに対して
+    /// playhead 位置の MIDI clip (無ければ新規作成 / 末尾近ければ延長) に
+    /// 仮 length 0.05 beat の note を push + active_notes に start_beat
+    /// 記録 (= note_off で length 上書き)。 既存 clip の content_id 共有
+    /// (linked clip) の場合、 sibling にも自動反映 (= ContentId 共有の意図、
+    /// 録音書き込みでも同じ動作、 不都合なら別 phase で「録音前に
+    /// make_unique」 を検討)。
+    fn record_midi_note_on(&mut self, pitch: u8, velocity: u8) {
+        let playhead =
+            self.playhead_beat.map(f64::from).unwrap_or(0.0);
+        if playhead < 0.0 {
+            return;
+        }
+        let armed_ids: Vec<u32> = self
+            .song
+            .tracks
+            .iter()
+            .filter(|t| t.armed)
+            .map(|t| t.id)
+            .collect();
+        for track_id in armed_ids {
+            self.midi_recording_active_notes
+                .insert((track_id, pitch), playhead);
+            self.ensure_midi_clip_at_playhead(track_id, playhead);
+            let Some((track_idx, clip_idx)) =
+                self.find_midi_clip_at_playhead(track_id, playhead)
+            else {
+                continue;
+            };
+            let clip_start =
+                self.song.tracks[track_idx].clips[clip_idx].start_beat;
+            let local_start = playhead - clip_start;
+            if let Some(notes) =
+                self.song.notes_in_clip_mut(track_idx, clip_idx)
+            {
+                notes.push(common::model::Note {
+                    start_beat: local_start,
+                    duration_beats: 0.05,
+                    pitch,
+                    velocity,
+                    lyric: None,
+                });
+            }
+        }
+        self.sync_song_to_plugin_host();
+    }
+
+    /// Phase 7 B4 Step D: 録音中の note_off 処理。 active_notes から start
+    /// を取り出し、 length = playhead - start で確定。 該当 note を
+    /// `start_beat` (clip-local) + `pitch` で再 search (= note_on 時に
+    /// active_notes に track-domain start を保存しているので、 clip-local
+    /// に戻して check)。
+    fn record_midi_note_off(&mut self, pitch: u8) {
+        let playhead =
+            self.playhead_beat.map(f64::from).unwrap_or(0.0);
+        let armed_ids: Vec<u32> = self
+            .song
+            .tracks
+            .iter()
+            .filter(|t| t.armed)
+            .map(|t| t.id)
+            .collect();
+        for track_id in armed_ids {
+            let Some(start) = self
+                .midi_recording_active_notes
+                .remove(&(track_id, pitch))
+            else {
+                continue;
+            };
+            let Some((track_idx, clip_idx)) =
+                self.find_midi_clip_containing_beat(track_id, start)
+            else {
+                continue;
+            };
+            let clip_start =
+                self.song.tracks[track_idx].clips[clip_idx].start_beat;
+            let local_start = start - clip_start;
+            let length = (playhead - start).max(0.05);
+            if let Some(notes) =
+                self.song.notes_in_clip_mut(track_idx, clip_idx)
+                && let Some(n) = notes.iter_mut().find(|n| {
+                    (n.start_beat - local_start).abs() < 1e-6
+                        && n.pitch == pitch
+                })
+            {
+                n.duration_beats = length;
+            }
+        }
+        self.sync_song_to_plugin_host();
+    }
+
+    /// playhead 位置に armed track 用 MIDI clip があれば何もしない、 末尾
+    /// 直近 (= 1 beat 以内) なら延長、 それ以外なら新規 clip を playhead
+    /// 位置に作成 (length 4 beat、 ContentId 新規採番 + clip_contents 登録)。
+    fn ensure_midi_clip_at_playhead(
+        &mut self,
+        track_id: u32,
+        playhead: f64,
+    ) {
+        let Some(track_idx) =
+            self.song.tracks.iter().position(|t| t.id == track_id)
+        else {
+            return;
+        };
+        // 既存 clip 内ならそのまま。
+        if self.song.tracks[track_idx].clips.iter().any(|c| {
+            playhead >= c.start_beat
+                && playhead < c.start_beat + c.length_beats
+        }) {
+            return;
+        }
+        // 末尾の直近 1 beat 以内なら延長。
+        if let Some(clip) = self.song.tracks[track_idx]
+            .clips
+            .iter_mut()
+            .find(|c| {
+                let end = c.start_beat + c.length_beats;
+                playhead >= end && playhead - end <= 1.0
+            })
+        {
+            clip.length_beats = playhead - clip.start_beat + 4.0;
+            return;
+        }
+        // 新規 clip 作成。
+        let cid = self.song.alloc_content_id();
+        self.song.clip_contents.insert(
+            cid,
+            common::model::ClipContent::Midi(common::model::MidiContent {
+                notes: vec![],
+            }),
+        );
+        let track = &mut self.song.tracks[track_idx];
+        let new_clip_id = track.next_clip_id;
+        track.next_clip_id += 1;
+        let new_clip = common::model::Clip {
+            id: new_clip_id,
+            start_beat: playhead,
+            length_beats: 4.0,
+            name: format!("Recorded {new_clip_id}"),
+            content_id: cid,
+            ..Default::default()
+        };
+        track.clips.push(new_clip);
+    }
+
+    /// playhead が clip 範囲 `[start_beat, start_beat + length_beats)` に
+    /// 含まれる MIDI clip の (track_idx, clip_idx) を返す。 無ければ None。
+    fn find_midi_clip_at_playhead(
+        &self,
+        track_id: u32,
+        playhead: f64,
+    ) -> Option<(usize, usize)> {
+        let track_idx =
+            self.song.tracks.iter().position(|t| t.id == track_id)?;
+        let track = &self.song.tracks[track_idx];
+        let clip_idx = track.clips.iter().position(|c| {
+            playhead >= c.start_beat
+                && playhead < c.start_beat + c.length_beats
+        })?;
+        Some((track_idx, clip_idx))
+    }
+
+    /// 指定 beat 位置を含む MIDI clip の (track_idx, clip_idx)。
+    /// `find_midi_clip_at_playhead` と同等だが、 引数を意味的に区別する
+    /// (= note_off 時は note_on 時刻、 note_on 時は playhead を渡す)。
+    fn find_midi_clip_containing_beat(
+        &self,
+        track_id: u32,
+        beat: f64,
+    ) -> Option<(usize, usize)> {
+        self.find_midi_clip_at_playhead(track_id, beat)
+    }
+
+    /// Phase 7 B4 Step C/D: Record toggle button click。 既に recording
+    /// (含 pending) なら stop、 idle なら start。
+    fn toggle_midi_recording(&mut self) {
+        if self.midi_recording || self.midi_recording_pending {
+            self.stop_recording();
+        } else {
+            self.start_recording();
+        }
+    }
+
+    /// Phase 7 B4 Step C: 録音開始。 `count_in_bars > 0` なら preroll +
+    /// metronome 強制 ON、 0 なら即時 recording。 いずれも `Play` を audio に
+    /// 送る。 metronome の元状態は `metronome_enabled_pre_recording` に snap。
+    fn start_recording(&mut self) {
+        if self.midi_recording || self.midi_recording_pending {
+            return;
+        }
+        self.midi_recording_active_notes.clear();
+        let bars = self.count_in_bars;
+        self.metronome_enabled_pre_recording = Some(self.metronome_enabled);
+        if bars > 0 {
+            if !self.metronome_enabled {
+                // count-in 強制 ON。 既存 SetMetronomeEnabled handler を
+                // 呼び出して audio engine への IPC 送信もまとめて。
+                self.handle_event(AppEvent::SetMetronomeEnabled(true));
+            }
+            let beats_per_bar = f64::from(self.song.time_sig.0.max(1));
+            let preroll_beats = f64::from(bars) * beats_per_bar;
+            let sr = f64::from(common::audio_bridge::SAMPLE_RATE);
+            let bpm = f64::from(self.song.bpm.max(1.0));
+            let preroll_samples =
+                (preroll_beats * 60.0 / bpm * sr).round().max(0.0) as u64;
+            self.send_audio(MainToChild::StartCountIn {
+                samples: preroll_samples,
+            });
+            self.midi_recording_pending = true;
+        } else {
+            self.midi_recording = true;
+        }
+        self.send_audio(MainToChild::Play);
+    }
+
+    /// Phase 7 B4 Step C/D: 録音停止 / cancel。 active_notes 全 clear、
+    /// metronome を recording 開始前の状態に戻す、 audio engine の preroll を
+    /// `StartCountIn { samples: 0 }` で cancel (= count-in 中の stop に対応)。
+    fn stop_recording(&mut self) {
+        let was_active =
+            self.midi_recording || self.midi_recording_pending;
+        self.midi_recording = false;
+        self.midi_recording_pending = false;
+        self.midi_recording_active_notes.clear();
+        if let Some(prev) =
+            self.metronome_enabled_pre_recording.take()
+            && prev != self.metronome_enabled
+        {
+            self.handle_event(AppEvent::SetMetronomeEnabled(prev));
+        }
+        if was_active {
+            // count-in 中の cancel もしくは録音終了。 audio engine 側 preroll
+            // を 0 で上書きして count-in 即時終了。 normal 録音終了の場合は
+            // preroll は既に 0 なので no-op。
+            self.send_audio(MainToChild::StartCountIn { samples: 0 });
+        }
     }
 
     fn select_clip(&mut self, target: ClipRef, additive: bool) {
