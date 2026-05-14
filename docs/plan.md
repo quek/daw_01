@@ -236,25 +236,48 @@ setBusArrangements 改善で解消、 再現性なし。
 
 着手時 `docs/plan_a3_wav_export.md` を切り出し推奨 (engine の resource 共有化が大規模変更のため)。
 
-## Phase 7: M2 = DAW としての表現力 (未着手)
+## Phase 7: M2 = DAW としての表現力 (進行中)
 
 M1 で土台 (3 プロセス + IPC + CLAP/VST3 host + sidechain/PDC + Undo/Redo + VOICEVOX
 + WAV export + autosave) が揃ったので、 M2 は **再生できる DAW から制作できる
 DAW へ** のステップ。
 
-### B1: オートメーション + transport 通知
+進捗サマリ:
 
-最大の機能追加。 plugin パラメータの時間変化を扱う。
+- **B1** (オートメーション + transport 通知): **大半完了**。 残: VST3 経路 3 項目のみ
+- **B2** (オーディオ録音): 未着手
+- **B3** (メトロノーム / count-in): 未着手
+- **B4** (MIDI 録音 / export): 未着手
+- **B5** (Linux 対応): 未着手
+- **Undo/Redo 残リスク (B/D/E)**: クッションタスク、 未着手
 
-- パラメータオートメーション (lane 表示 + clip 同期 + plugin への送信)
-- tempo / time_sig オートメーション
-- CLAP `clap_event_param_value` / `clap_event_transport_t` で plugin に通知
+### B1: オートメーション + transport 通知 (大半完了)
+
+plugin パラメータの時間変化を扱う M2 最大の機能追加。 [`plan_automation.md`](plan_automation.md)
+で詳細管理、 Phase 1〜5 が landing 済 (本 plan.md 進捗ログの 2026-05-08 〜
+2026-05-13 行を参照)。
+
+**完了**:
+
+- パラメータオートメーション (lane 表示 / clip 同期 / `Hold` / `Linear` / `Bezier` / `Exponential` curve / lasso / multi-clip drag) → Phase 1〜3
+- recording mode (Read / Touch / Latch / Write) + thinning algorithm + plugin GUI gesture sync → Phase 4
+- tempo / time_sig オートメーション (`Song.song_lanes` + master row UI + audio engine tempo eval + sequencer / audio_clip_renderer beat-domain refactor + granular DSP / Slice) → Phase 5 Step 5.0〜5.2
+- CLAP `clap_event_param_value` (param 送信) → Phase 2
+- CLAP `clap_event_transport_t` (transport / tempo 通知) → Phase 5 Step 5.3
+- SongTempo lane recording 中の engine 側 curve bypass (drag 値 / curve point 二重反映抑止) → Phase 5 Step 5.2 follow-up
+
+**残** (VST3 経路補完のみ):
+
 - VST3 `IAudioProcessor::ProcessData::processContext` で transport / tempo を送る
-- VST3 `IMidiMapping` (MIDI controller → plugin パラメータ)
+  (= CLAP `clap_event_transport_t` の VST3 版、 現状 transport 情報が VST3
+  plugin に届いていない = tempo-sync 系 VST3 plugin が host テンポ追随しない)
+- VST3 `IMidiMapping` (MIDI controller → plugin parameter、 = MIDI 経由の
+  パラメータ自動マップ。 別途 MIDI input が必要なので B4 と一部 overlap)
 - VST3 `IComponent::setIoMode(kOfflineProcessing)` (export 高品質モード切替、
-  現状 `set_render_mode` no-op)
+  現状 `Vst3Plugin::set_render_mode` は no-op = export 中の VST3 plugin が
+  realtime mode のまま動く)
 
-着手時 `docs/plan_b1_automation.md` を切り出し。
+着手時 `docs/plan_b1_vst3_completion.md` を切り出し。
 
 ### B2: オーディオ録音
 
