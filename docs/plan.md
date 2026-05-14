@@ -244,7 +244,7 @@ DAW へ** のステップ。
 
 進捗サマリ:
 
-- **B1** (オートメーション + transport 通知): **大半完了**。 残: VST3 経路 3 項目のみ
+- **B1** (オートメーション + transport 通知): **ほぼ完了**。 残: B1-M (VST3 IMidiMapping、 B4 依存) のみ
 - **B2** (オーディオ録音): 未着手
 - **B3** (メトロノーム / count-in): 未着手
 - **B4** (MIDI 録音 / export): 未着手
@@ -266,18 +266,20 @@ plugin パラメータの時間変化を扱う M2 最大の機能追加。 [`pla
 - CLAP `clap_event_transport_t` (transport / tempo 通知) → Phase 5 Step 5.3
 - SongTempo lane recording 中の engine 側 curve bypass (drag 値 / curve point 二重反映抑止) → Phase 5 Step 5.2 follow-up
 
-**残** (VST3 経路補完のみ):
+**残** (B1-M、 B4 依存):
 
-- VST3 `IAudioProcessor::ProcessData::processContext` で transport / tempo を送る
-  (= CLAP `clap_event_transport_t` の VST3 版、 現状 transport 情報が VST3
-  plugin に届いていない = tempo-sync 系 VST3 plugin が host テンポ追随しない)
-- VST3 `IMidiMapping` (MIDI controller → plugin parameter、 = MIDI 経由の
-  パラメータ自動マップ。 別途 MIDI input が必要なので B4 と一部 overlap)
-- VST3 `IComponent::setIoMode(kOfflineProcessing)` (export 高品質モード切替、
-  現状 `Vst3Plugin::set_render_mode` は no-op = export 中の VST3 plugin が
-  realtime mode のまま動く)
-
-着手時 `docs/plan_b1_vst3_completion.md` を切り出し。
+- ~~B1-T~~ ✅ VST3 `IAudioProcessor::ProcessData::processContext` で transport /
+  tempo / time_sig / bar position / cycle 範囲 / playing flag を per-buffer
+  populate (commit `1520977`、 2026-05-13)
+- ~~B1-R~~ ✅ VST3 export 高品質モード切替 — `IComponent::setIoMode` は spec 上
+  initialize 前にしか呼べない (= active 中の動的切替は spec 違反) ため、
+  `ProcessData::processMode` の `kRealtime` / `kOffline` 切替で代替 (commit
+  `7a58e2c`、 2026-05-13)
+- **B1-M**: VST3 `IMidiMapping` (MIDI controller → plugin parameter、 = MIDI 経由の
+  パラメータ自動マップ)。 MIDI input が前提なので **B4 (MIDI 録音) 後** に
+  着手するのが自然。 spec 上 `IMidiMapping::getMidiControllerAssignment` で plugin
+  から CC# → param_id mapping を query、 host が MIDI CC を受信したら該当 param
+  に IParameterChanges 経由で送る形。
 
 ### B2: オーディオ録音
 
@@ -400,3 +402,5 @@ A8 で A (load 失敗 → pending stuck) は解消したが、 reconcile 経由�
 | 2026-05-08 | 2675218 | gui_01 #026 [Open] | caller 側 view 用 rect-based pointer hit-test API 要望投稿。 `Ui::take_primary_press_in_rect(rect)` (= single click 検出) と `Ui::take_drag_in_rect(id, rect)` (= drag session、 anchor / current / delta + Started/Continuing/Released kind) の 2 つを既存 `take_double_click_in_rect` の並びに追加してほしい。 Audio Editor の event click 選択 / 中央 drag 移動 / 左右端 drag trim / 空白領域 file drop で event 追加に必要、 PR-D 段階 2 / 3 のうち drag UI 部分は本要望マージ後に再開予定 |
 | 2026-05-08 | (this commit) | PR-D 段階 2 | Inspector multi-event 対応 + event 選択 keyboard navigation。 `inspector_audio_event_summary` を「audio_editor_clip == selected_clip なら audio_editor_selected_event idx の event を返す、 さもなくば first event」 に拡張。 `audio_event_target_indices(target, n_events) -> Range<usize>` helper + `mutate_audio_events_in_clip(target, f)` 集約 helper を新設、 既存 10 件の `set_clip_audio_event_*` (reversed / muted / stretch_mode / gain_db / pan / pitch_semitones / fade_in/out_beats / fade_in/out_curve) を helper 経由に書き換え (= audio_editor で event 選択中は 1 event のみ更新、 さもなくば全 event broadcast = 既存挙動互換)。 `next_audio_editor_event_idx(delta)` helper + shortcut `daw.next_audio_event = Ctrl+]` / `daw.prev_audio_event = Ctrl+[` を追加 (audio_editor_clip is Some 時のみ消費)、 wrap-around で event 選択を巡回。 これで Inspector 経由の個別 event 編集が動く。 drag UI 系は gui_01 #026 マージ後の段階 3 で。 build / clippy / test --features rt-assert all clean |
 | 2026-05-13 | 8f8f730 | Phase 5 完結 | Step 5.2 SongTempo lane recording bypass wire — `daw_audio::engine::process_buffer` の `current_bpm` 計算で `recording_lanes.contains(&(MASTER_TRACK_ID, AutomationTarget::SongTempo))` を判定、 該当中は `evaluate_song_tempo` を skip して `song.bpm` constant fallback。 transport BPM input drag 時の curve / drag 値の二重反映を抑止、 mixer fader Volume / Pan の `fill_track_param_ramps` bypass と同 idiom を Song-level に展開。 plan_automation.md §10 Phase 5 の残 smoke test 4 件 + bypass wire 1 件を整理 (smoke は user 判断で skip)、 Step 5.0 / 5.1 / 5.2 / 5.3 の全項目 [x] 化で Phase 5 (Tempo / TimeSig / Transport event) 完結 |
+| 2026-05-13 | 1520977 | B1-T | VST3 `ProcessContext` per-buffer populate — `Vst3Plugin::process` が今まで `_transport: &TransportContext` を無視 + `projectTimeSamples` を free-running していた問題を解消。 CLAP `build_clap_transport_event` と同 semantics で `TransportContext` から `tempo` / `timeSigNumerator` / `timeSigDenominator` / `projectTimeSamples` / `continousTimeSamples` / `projectTimeMusic` (拍位置) / `barPositionMusic` (直近 bar 開始拍) / `cycleStartMusic` / `cycleEndMusic` / `state` flags を populate。 state は `kTempoValid` / `kTimeSigValid` / `kProjectTimeMusicValid` / `kBarPositionValid` / `kCycleValid` / `kContTimeValid` 常時 ON、 `kPlaying` / `kCycleActive` を transport 状態依存。 これで FabFilter / Vital / Avenger 等の sync 系 VST3 plugin が host テンポ + bar position に追随 |
+| 2026-05-13 | 7a58e2c | B1-R | VST3 `set_render_mode` の no-op を解消 — VST3 spec の `IComponent::setIoMode` が `initialize` 前にしか呼べない (= active 中の動的切替は spec 違反) ため、 spec 準拠の代替として `ProcessData::processMode` を per-buffer で `kRealtime` / `kOffline` に切替。 `Vst3Plugin` に `render_mode: RenderMode` field 追加 (default Realtime)、 `set_render_mode` で field 更新 + tracing log + return true、 `process()` の `ProcessData` 構築時に match で processMode 切替。 多くの reverb / convolution / lookahead 系 plugin は process() の processMode を尊重 (= effect が plugin 依存で出る、 害は無い)。 残 B1 は B1-M (VST3 IMidiMapping、 B4 依存) のみ |
