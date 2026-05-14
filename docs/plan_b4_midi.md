@@ -1,7 +1,7 @@
 # B4: MIDI 録音 / MIDI export 計画
 
 ステータス: **着手中** (2026-05-13)。 Phase 7 (M2) B4 の minimum スコープを
-実装する。 詳細は [plan.md §B4](plan.md) と本ファイル参照。
+実装する。 詳細は [plan.html §B4](plan.html) と本ファイル参照。
 
 ## 1. 全体方針
 

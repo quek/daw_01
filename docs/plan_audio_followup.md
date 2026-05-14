@@ -235,4 +235,4 @@ multi-event clip を作成する手段がないとテストもできないので
   保留。
 
 各 PR ごとに `cargo build / clippy / test --features rt-assert` clean を
-確認、 `docs/plan.md` 進捗ログにエントリ追加 + commit する運用は維持。
+確認、 `docs/plan.html` 進捗ログにエントリ追加 + commit する運用は維持。

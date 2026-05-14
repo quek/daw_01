@@ -212,7 +212,7 @@ pub struct WorkerBridge {
 - `daw_audio/Cargo.toml` — `atomic-wait`, `thread-priority`, `assert_no_alloc` (optional), `arc-swap` 追加
 - `daw_plugin_host/Cargo.toml` — `arc-swap` / `hound` 削除可、handshake 用に `windows` の Event API feature 確認、`thread-priority` 追加
 - `Cargo.toml` (workspace) — 上記 crate 追加
-- `docs/plan.md` — A2 セクション全面書き換え + 進捗ログ追記
+- `docs/plan.html` — A2 セクション全面書き換え + 進捗ログ追記
 
 ---
 
@@ -342,7 +342,7 @@ debug feature `rt-assert` で worker body を `assert_no_alloc!` で wrap、CI �
 | **PR5** | `daw_audio/src/plugin_client.rs` で worker_sync 実装、`process_track` 内で実際に plugin.process() を呼ぶ。serial 動作 (audio engine の worker pool 未使用) | 1 track / 1 instrument で音が出る |
 | **PR6** | `daw_audio/src/worker_pool.rs` を実装、`run_audio` から `pool.dispatch_and_wait()` を呼ぶ。N audio worker × N plugin_host worker の 1:1 ペアで track 並列化 | 2-4 track 同時鳴動、CPU 使用率測定 |
 | **PR7** | thread priority + MMCSS + CLAP `thread_check` ext (host 側) | Surge XT / VCV Rack で warning 無し、underrun 減少 |
-| **PR8** | `daw_plugin_host/src/main.rs` から `run_audio()` / `collect_events_for_buffer()` / `Tracks` / `VocalAudio` / `TrackAudioParams` / `export_wav_offline()` 全削除 (= 旧コード除去)。`assert_no_alloc` feature 追加。`docs/plan.md` 書き換え | full regression、release ビルドで underrun 無し |
+| **PR8** | `daw_plugin_host/src/main.rs` から `run_audio()` / `collect_events_for_buffer()` / `Tracks` / `VocalAudio` / `TrackAudioParams` / `export_wav_offline()` 全削除 (= 旧コード除去)。`assert_no_alloc` feature 追加。`docs/plan.html` 書き換え | full regression、release ビルドで underrun 無し |
 
 各 PR は revert 可能、smoke test を経てから次へ。
 

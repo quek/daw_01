@@ -2,7 +2,7 @@
 
 ## Context
 
-`docs/plan.md` Phase 6 の A1。 M1 (= 「VOICEVOX 歌唱 + Clip ベース DAW」) の本丸。
+`docs/plan.html` Phase 6 の A1。 M1 (= 「VOICEVOX 歌唱 + Clip ベース DAW」) の本丸。
 
 調査の結果、 統合は当初想定より遥かに進んでいることが判明:
 

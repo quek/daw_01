@@ -6,7 +6,7 @@
 
 ## Context
 
-`docs/plan.md` の Phase 6 における 4 タスク中、A2 / A3 / A7 が完了し、次が **A6 (tempo / time_sig 変更 UI)**。
+`docs/plan.html` の Phase 6 における 4 タスク中、A2 / A3 / A7 が完了し、次が **A6 (tempo / time_sig 変更 UI)**。
 
 - `Song { bpm: f32, time_sig: (u8, u8) }` schema は既に完備
 - ruler / arrangement_view / piano_roll_view は **既に `app.song.bpm` / `app.song.time_sig` を毎フレーム参照** (gui_01 #014 で対応済) → モデル更新だけで表示は自動追従
@@ -28,7 +28,7 @@
 
 - **BPM**: `text_input_at` で 1..=400.0 範囲 (commit 時に clamp)、 表示は `format!("{:.1}", v)` (小数 1 桁)
 - **time_sig numerator**: `text_input_at` で 1..=32 範囲 (commit 時 clamp)
-   - → 設計判断: plan.md は範囲のみ規定 (UI 種別は曖昧)。 `dropdown(1..=16)` だと項目過多 + 31/16 等の異常拍子が打てない。 BPM と同じ text_input 方式で統一
+   - → 設計判断: plan.html は範囲のみ規定 (UI 種別は曖昧)。 `dropdown(1..=16)` だと項目過多 + 31/16 等の異常拍子が打てない。 BPM と同じ text_input 方式で統一
 - **time_sig denominator**: `dropdown(["2","4","8","16"])` (gui_01 dropdown widget、 4 項目固定)
 
 ### 2. AppData フィールド追加 ([daw_gui/src/app.rs](daw_gui/src/app.rs:117 周辺の AppData struct))

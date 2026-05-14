@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>daw_01 master plan</title>
+<style>
+  body {
+    font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Meiryo", -apple-system,
+                 "Segoe UI", system-ui, sans-serif;
+    max-width: 1100px;
+    margin: 1em auto;
+    padding: 0 1em 4em;
+    line-height: 1.65;
+    color: #1c1c1c;
+    background: #fafafa;
+  }
+  h1 { font-size: 1.8em; border-bottom: 2px solid #444; padding-bottom: .25em; margin-top: 1.2em; }
+  h2 { font-size: 1.4em; border-bottom: 1px solid #bbb; padding-bottom: .2em; margin-top: 1.8em; }
+  h3 { font-size: 1.15em; margin-top: 1.6em; color: #2a4a7a; }
+  h4 { font-size: 1.0em; margin-top: 1.3em; color: #555; }
+  code { background: #eee; padding: 1px 4px; border-radius: 3px; font-family: "Consolas", "Courier New", monospace; font-size: .92em; }
+  pre { background: #2b2b2b; color: #e8e8e8; padding: 1em; border-radius: 4px; overflow-x: auto; font-size: .9em; line-height: 1.4; }
+  pre code { background: transparent; padding: 0; color: inherit; }
+  a { color: #1a5fb4; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  ul { padding-left: 1.6em; }
+  li { margin: .25em 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: .92em; }
+  th, td { border: 1px solid #ccc; padding: .4em .6em; text-align: left; vertical-align: top; }
+  th { background: #efefef; }
+  td:first-child { white-space: nowrap; color: #555; }
+  td:nth-child(2) { font-family: "Consolas", "Courier New", monospace; white-space: nowrap; }
+  td:nth-child(3) { white-space: nowrap; color: #2a4a7a; font-weight: 500; }
+  blockquote { border-left: 4px solid #bbb; padding: .3em .8em; color: #555; margin: .8em 0; background: #f0f0f0; }
+  strong { color: #000; }
+  .note { font-size: .9em; color: #666; }
+</style>
+</head>
+<body>
+
+<h1>daw_01 master plan</h1>
+
+<p>このファイルは daw_01 の中期作業計画。<code>/clear</code> 後でもこの 1 枚を読めば「次に何をやるか」が分かるように維持する。</p>
+
+<h2>運用ルール</h2>
+<ul>
+  <li>このファイル = master plan。日々の作業順を決める起点。</li>
+  <li>大きい個別タスクは <code>docs/plan_&lt;feature&gt;.md</code> に切り出し、本ファイルからリンク。</li>
+  <li>各 Phase が完了したら本ファイル末尾の「進捗ログ」に commit hash + 1 行サマリを追記。</li>
+  <li>gui_01 への要望は <code>docs/gui_01_conversation.md</code> にエントリ追加 → 返信受領 → 対応完了で <code>_archive_NNN.md</code> へ。</li>
+  <li>スコープが変わったらこのファイルを書き換える。古い計画を残して別 phase を増やすより、上書きで always-current を保つ。</li>
+</ul>
+
+<h2>大方針</h2>
+
+<p><strong>Phase 1-5 (UI を gui_01 widget で再構築) と Phase 6 (M1 完成) はすべて完了</strong>。M1 で着手予定だった VST3 / sidechain / PDC / グループトラック / Undo/Redo / plugin GUI embed もすべて実装済。 次は <strong>M2 = DAW としての表現力</strong> (オートメーション / 録音 / メトロノーム / Linux 対応) を進める。</p>
+
+<p>これまでに達成済みの土台:</p>
+<ul>
+  <li>3 プロセス分離 + IPC (named pipe + shared memory)</li>
+  <li>CLAP / VST3 統一 plugin host (scan / load / activate / process / GUI embed / sidechain / PDC)</li>
+  <li>track-parallel スレッドプール + MMCSS + RT 違反検出 (A2)</li>
+  <li>gui_01 widget による全 view 構築 (arrangement / piano_roll / mixer / inspector / transport)</li>
+  <li>VOICEVOX 統合 (engine 自動起動 + per-track speaker + WAV cache + 拗音結合)</li>
+  <li>WAV export (freewheel offline render)</li>
+  <li>autosave + 起動時 recovery modal</li>
+  <li>Undo/Redo (plugin instance reconcile + state snapshot 同期)</li>
+  <li>plugin load 失敗通知 (<code>SlotPluginLoadFailed</code>、 A8)</li>
+</ul>
+
+<h2>Phase 6: M1 完成 (完了)</h2>
+
+<p>DESIGN.md M1 残項目を Axx タスクに分解 + 派生で routing_graph / Undo/Redo plugin sync chain を実装。 着手順マップ (実態):</p>
+
+<pre><code>A2 audio engine        ─┐
+A3 WAV export          ─┤
+A6 tempo/timesig       ─┼─→ A4 autosave ─┬─→ A5 lyric UI ─→ A1 VOICEVOX ─┐
+A7 plugin load 同期    ─┘                │                                 ├─→ M1 完成
+                                          ↓                                 │
+                              routing_graph PR1-4 (group / PDC / sidechain / paraout)
+                              + plugin_host stability (UAF / crash fix)
+                              + Undo/Redo plugin sync chain
+                              + A8 plugin load 失敗通知                    ─┘</code></pre>
+
+<p>各タスクの詳細は <code>docs/plan_&lt;feature&gt;.md</code> を参照:</p>
+<ul>
+  <li><a href="plan_a1_voicevox.md">plan_a1_voicevox.md</a> (A1)</li>
+  <li><a href="plan_a2_audio_engine.md">plan_a2_audio_engine.md</a> (A2)</li>
+  <li><a href="plan_a3_wav_export.md">plan_a3_wav_export.md</a> (A3)</li>
+  <li><a href="plan_a4_autosave_recovery.md">plan_a4_autosave_recovery.md</a> (A4)</li>
+  <li><a href="plan_a6_tempo_timesig.md">plan_a6_tempo_timesig.md</a> (A6)</li>
+  <li><a href="plan_a7_plugin_load_sync.md">plan_a7_plugin_load_sync.md</a> (A7)</li>
+  <li><a href="plan_a8_plugin_load_failure.md">plan_a8_plugin_load_failure.md</a> (A8)</li>
+  <li><a href="plan_routing_graph.md">plan_routing_graph.md</a> (group / PDC / sidechain / paraout)</li>
+  <li><a href="plan_group_track.md">plan_group_track.md</a> (routing_graph PR2 詳細)</li>
+  <li><a href="plan_piano_roll_widget_rewrite.md">plan_piano_roll_widget_rewrite.md</a></li>
+  <li><a href="plan_smart_note_length.md">plan_smart_note_length.md</a></li>
+  <li><a href="plan_audio_followup.md">plan_audio_followup.md</a> (Phase 2 polish + §3.8/§3.10 後段)</li>
+</ul>
+
+<h3>既知の残 bug</h3>
+
+<p>無し (blocking なし)。 MSoundFactory の GUI 黒画面 + 無音は VST3 bus enumeration / setBusArrangements 改善で解消、 再現性なし。</p>
+
+<h3>完了タスクの要約</h3>
+
+<h4>A2: 責務分担正常化 + track-parallel スレッドプール化 [完了]</h4>
+
+<p>詳細は <a href="plan_a2_audio_engine.md">docs/plan_a2_audio_engine.md</a>。</p>
+
+<p><strong>完了内容 (PR1-7 + cleanup PR、 build / clippy / test clean、 ユーザー smoke test OK)</strong>:</p>
+
+<ol>
+  <li><strong>責務分担の正常化</strong> — DESIGN.md の規定どおり <code>daw_audio = シーケンサー / mixer / オーディオ出力</code>、<code>daw_plugin_host = プラグインのロード / process</code> に整理</li>
+  <li><strong>新しい IPC layer</strong> — per-plugin <code>ProcessData</code> shmem (16 KB / plugin)、per-worker <code>WorkerBridge</code> shmem + Win32 named auto-reset events</li>
+  <li><strong>track-parallel スレッドプール (両プロセス N worker、 1:1 ペア)</strong> — <code>audio_worker::AudioWorkerPool</code> が work-stealing で track を fan-out、<code>process_server::WorkerPool</code> が各 plugin を wake/done event で dispatch</li>
+  <li><strong>plugin_id registry</strong> — plugin_host が SetSlotPlugin で発行 + shmem create + <code>Arc&lt;ArcSwap&lt;Vec&lt;Option&lt;PluginEntry&gt;&gt;&gt;&gt;</code> で publish、daw_audio は <code>slot_to_plugin_id</code> map で引く</li>
+  <li><strong>TIME_CRITICAL priority + MMCSS</strong> — 両プロセスの worker が <code>SetThreadPriority(TIME_CRITICAL)</code> + <code>AvSetMmThreadCharacteristicsW("Pro Audio")</code> (Drop で revert)</li>
+  <li><strong>CLAP <code>thread_check</code> ext</strong> — host 側で <code>clap_host_thread_check</code> を提供、TLS フラグで is_audio_thread を判定</li>
+  <li><strong>assert_no_alloc</strong> — <code>[features] rt-assert</code> 追加、<code>cargo test --features rt-assert</code> で RT 違反検出可能</li>
+  <li><strong>旧 audio thread コード完全撤去</strong> — <code>run_audio</code>, <code>collect_events_for_buffer</code>, <code>Tracks::params/vocal</code>, <code>TrackAudioParams (旧)</code>, <code>VocalAudio (旧)</code>, <code>PerTrackState</code>, <code>start_audio_legacy</code>, <code>AudioThread</code>, <code>TrackRouting</code>, <code>AudioRouting</code> を全削除 (~1500 行減)、tests を <code>daw_audio/src/sequencer.rs</code> に移植</li>
+</ol>
+
+<p><strong>未完: WAV export</strong> — A2 残タスクとしてあったが、daw_audio 側 LocalState 共有設計が大規模変更のため A3 で本格実装に切り出し。本フェーズでは plugin_host の旧 export_wav_offline + GUI Export メニューを削除のみ (機能は一時停止状態で A3 まで持ち越し)。</p>
+
+<h4>A6: tempo / time_sig 変更 UI [完了]</h4>
+
+<p>詳細は <a href="plan_a6_tempo_timesig.md">docs/plan_a6_tempo_timesig.md</a>。</p>
+
+<p><strong>完了内容 (build / clippy / test --features rt-assert all clean、 ユーザー smoke test OK)</strong>:</p>
+<ul>
+  <li>transport bar に BPM <code>text_input</code> (1.0..=400.0 clamp、 commit で audio engine に LoadSong 再送)</li>
+  <li>同じく time_sig numerator <code>text_input</code> (1..=32 clamp) と denominator <code>dropdown</code> (2/4/8/16)</li>
+  <li>AppData に <code>bpm_edit_text</code> / <code>time_sig_num_edit_text</code> 編集 buffer、 <code>AppEvent::BpmEditChanged</code> / <code>CommitBpmEdit</code> / <code>TimeSigNumEditChanged</code> / <code>CommitTimeSigNumEdit</code> / <code>SetSongTimeSigDenominator</code> を追加</li>
+  <li>commit 系 3 種を <code>is_undoable</code> に登録 → handle_event 冒頭の <code>push_undo_snapshot</code> で自動 undo 対応</li>
+  <li><code>resync_song_edit_texts</code> helper で song 差し替え時 (after_undo_redo / action_new / action_open_path) に表示 buffer を現値に書き戻す</li>
+  <li>再生テンポは sequencer の <code>samples_per_beat = sample_rate * 60 / song.bpm</code> (sequencer.rs:71) が ArcSwap publish された Song を毎フレーム参照 → 変更が次フレームから即時反映</li>
+</ul>
+
+<p><strong>スコープ外 (M2 範囲)</strong>: CLAP/VST3 plugin への transport / tempo 通知 (<code>clap_event_transport_t</code>)、 tempo automation、 拍子 automation、 bar 番号 offset。</p>
+
+<h4>A4: autosave + 起動時復元 [完了]</h4>
+
+<p>詳細は <a href="plan_a4_autosave_recovery.md">docs/plan_a4_autosave_recovery.md</a>。</p>
+
+<p><strong>完了内容 (build / clippy / test --workspace clean、 ユーザー smoke test OK)</strong>:</p>
+<ul>
+  <li>新規 <code>common/src/recovery.rs</code>: recovery_dir / sidecar / session_id / scan helpers + uuid v4 生成 (5 unit test)</li>
+  <li>AppData に <code>recovery_session_id</code> (uuid v4) / <code>recovery_candidates</code> / <code>show_recovery_modal</code> 追加</li>
+  <li><code>maybe_autosave</code> を改修: file_path Some なら sidecar (<code>&lt;file&gt;.daw.autosave.daw</code>)、 None なら <code>%LOCALAPPDATA%\daw_01\recovery\&lt;session_id&gt;.autosave.daw</code> に save</li>
+  <li><code>AppEvent::RecoveryRestore / RecoveryDiscard / RecoveryDismiss</code> + handler 実装。 復元時は sidecar なら元 .daw を file_path に、 recovery_dir 内 file なら file_path=None で新規プロジェクト扱い</li>
+  <li><code>action_open_path</code>: Open 時に sidecar 存在チェック → 候補に push</li>
+  <li>新規 <code>daw_gui/src/view/recovery_modal.rs</code>: gui_01 <code>Ui::modal</code> + <code>button_at_clicked + close_modal</code> パターン (modal 内で各候補に「復元 / 破棄」、 下部に「閉じる」)</li>
+  <li><code>runner.rs::CloseRequested</code>: <code>AppData::on_shutdown</code> で当セッションの recovery file (recovery_dir / sidecar 両方) を削除</li>
+  <li>smoke 確認: × 閉じで cleanup ✅、 PowerShell <code>Stop-Process -Force</code> 経由の真の kill 後に file 残存 ✅、 再起動で modal 表示 ✅、 「復元 / 破棄 / 閉じる」 全て expected</li>
+</ul>
+
+<p><strong>スコープ外 (将来課題)</strong>:</p>
+<ul>
+  <li>古い recovery file の自動 GC (現状ユーザー操作で破棄)</li>
+  <li>multi-instance での同時 recovery 衝突対策 (uuid v4 で衝突確率は実用上ゼロ)</li>
+  <li>conflict 解決 UI (sidecar と元 file の自動 diff / merge)</li>
+</ul>
+
+<h4>A5: piano_roll note 歌詞編集 UI [完了]</h4>
+
+<p>詳細は本ファイル「完了タスクの要約」 と進捗ログ参照。 以下は元計画。</p>
+
+<p><strong>現状</strong>: <code>Note { lyric: Option&lt;String&gt; }</code> schema あり、piano_roll widget の表示も M9 Phase 44c で済 (歌詞文字を note 上にレイアウト)。<strong>入力 UI が無い</strong>。</p>
+
+<p><strong>やること</strong>:</p>
+<ol>
+  <li><strong>gui_01 conversation #015 起こす</strong>: piano_roll widget 内で note を選択 → F2 / Enter / dbl-click で text_input overlay 起動 → Enter commit / Esc cancel / Tab で次 note へ。編集中は drag/resize/wheel zoom を抑制 (modal-ish)</li>
+  <li>gui_01 reply 受領後、daw_01 側で <code>NotesEditRequest::SetLyric { id, text }</code> ハンドリング、<code>AppEvent::SetNoteLyric { clip_ref, note_id, text }</code> 追加</li>
+  <li>IME 入力対応 (CJK モーラ単位、既存 <code>text_input_at</code> の IME 機構に乗る)</li>
+</ol>
+
+<p><strong>主な変更ファイル</strong>:</p>
+<ul>
+  <li><code>docs/gui_01_conversation.md</code> #015 起こし</li>
+  <li>gui_01 reply 後: <a href="../daw_gui/src/view/piano_roll_view.rs">daw_gui/src/view/piano_roll_view.rs</a>、<a href="../daw_gui/src/app.rs">daw_gui/src/app.rs</a></li>
+</ul>
+
+<p><strong>受け入れ基準</strong>:</p>
+<ul>
+  <li>piano_roll で note を選択 → F2 / Enter で inline 編集</li>
+  <li>Tab で次の note (start_beat 順) へ移動</li>
+  <li>入力した歌詞が JSON プロジェクトファイルに保存される</li>
+  <li>IME 入力で CJK が正しく入る (commit 時のみ反映、preedit は表示)</li>
+</ul>
+
+<h4>A1: VOICEVOX 統合 [完了]</h4>
+
+<p>詳細は <a href="plan_a1_voicevox.md">plan_a1_voicevox.md</a> と進捗ログ参照。 以下は元計画。</p>
+
+<p><strong>現状</strong>: <code>daw_audio/voicevox.rs</code> プレースホルダ (<a href="../common/src/model.rs">common/src/model.rs</a> の <code>InstrumentSource::Vocal</code> schema は完備)。</p>
+
+<p><strong>やること</strong> (REAPER VOICEVOX スクリプト = <code>%APPDATA%\REAPER\Scripts\yoshino\voicevox\</code> を参照実装に):</p>
+<ol>
+  <li><strong>HTTP client</strong> (<code>reqwest</code> async): <code>/sing_frame_audio_query</code> / <code>/frame_synthesis</code> / <code>/audio_query</code> / <code>/synthesis</code> / <code>/speakers</code></li>
+  <li><strong>Engine 自動起動</strong>: 設定 (<code>%APPDATA%/daw_01/voicevox_engine_path</code>) から実行ファイルパスを読み、subprocess + Job Object で寿命管理 (DESIGN.md の手法を流用)</li>
+  <li><strong>歌詞分割</strong>: 小書きかな (ぁぃぅぇぉゃゅょっ) は直前と結合して 1 モーラ化</li>
+  <li><strong>Sing pipeline</strong>:
+    <ul>
+      <li>Clip notes → <code>{"notes":[{"id","key","frame_length","lyric"}, ...]}</code> JSON</li>
+      <li><code>POST /sing_frame_audio_query?speaker=6000</code> (波音リツ固定) → audio_query</li>
+      <li><code>outputSamplingRate=48000</code> 書き換え</li>
+      <li><code>POST /frame_synthesis?speaker={singer_id}</code> → WAV bytes</li>
+    </ul>
+  </li>
+  <li><strong>WAV cache</strong>: <code>clip_id + content_hash → Vec&lt;f32&gt;</code> を <code>daw_audio</code> 側で保持。同 clip 同内容は再合成しない</li>
+  <li><strong>Vocal track の audio mix</strong>: audio thread は cache から該当時刻の f32 を読んで master へ mix。track の plugin chain (<code>fx_chain</code>) は通すが <code>instrument</code> は使わない (Vocal は WAV 直挿し)</li>
+  <li><strong>Track Inspector の Vocal source UI</strong>: speaker / style 選択 dropdown ([speakers] API レスポンス + cache)</li>
+  <li><strong>失敗時の resilience</strong>: Engine 起動失敗 / HTTP 失敗時は track を mute 扱い、エラーメッセージ表示、他 track は影響受けず再生続行</li>
+</ol>
+
+<p><strong>主な変更ファイル</strong>:</p>
+<ul>
+  <li><a href="../daw_audio/src/voicevox.rs">daw_audio/src/voicevox.rs</a> (現状プレースホルダ → 実装)</li>
+  <li>新規 <code>daw_audio/src/voicevox_cache.rs</code> (clip_id → Vec&lt;f32&gt;)</li>
+  <li>新規 <code>daw_audio/src/voicevox_engine.rs</code> (subprocess 起動 + ヘルスチェック)</li>
+  <li><a href="../daw_audio/src/engine.rs">daw_audio/src/engine.rs</a> (Vocal track の mix-in)</li>
+  <li><a href="../daw_gui/src/view/track_inspector.rs">daw_gui/src/view/track_inspector.rs</a> (Vocal source 編集)</li>
+  <li><a href="../common/src/protocol.rs">common/src/protocol.rs</a> (Vocal track 内容変更を audio に伝達するメッセージが必要なら追加)</li>
+</ul>
+
+<p><strong>受け入れ基準</strong>:</p>
+<ul>
+  <li>新規 Vocal track 作成 → speaker 選択 → clip 内 note に歌詞入力 → 再生で歌う</li>
+  <li>同 clip の 2 度目の再生はキャッシュヒット (合成 1 回のみ)</li>
+  <li>Engine 起動失敗時はエラー表示 + 他 track は再生継続</li>
+  <li>Vocal track の <code>volume</code> / <code>pan</code> / <code>muted</code> / <code>solo</code> が反映 (A2 完了が前提)</li>
+</ul>
+
+<p>着手時 <code>docs/plan_a1_voicevox.md</code> を切り出し必須 (大規模)。</p>
+
+<h4>A3: WAV 書き出し / mixdown (freewheel offline render) [完了]</h4>
+
+<p>詳細は <a href="plan_a3_wav_export.md">docs/plan_a3_wav_export.md</a>。</p>
+
+<p><strong>完了内容 (PR1-5、 build / clippy / test --features rt-assert all clean)</strong>:</p>
+<ul>
+  <li>engine resource 共有化: <code>LocalState</code> の <code>worker_bridge</code> / <code>worker_syncs</code> / <code>plugin_refs</code> / <code>slot_to_plugin_id</code> / <code>vocal_store</code> / <code>worker_pool</code> を <code>Arc&lt;EngineShared&gt;</code> に移管 (ArcSwap で wait-free 共有)</li>
+  <li>CLAP <code>clap_plugin_render</code> ext: <code>LoadedPlugin::set_render_mode(mode)</code> を追加、 ClapPlugin で <code>clap_plugin_render::set</code> 呼び出し</li>
+  <li>protocol: <code>MainToChild::ExportWav { path }</code> / <code>SetRenderMode(RenderMode)</code> 追加、 <code>ChildToMain::ExportWavComplete { error }</code> 復活</li>
+  <li>daw_audio: <code>daw_audio/src/export.rs</code> で freewheel offline render を実装。 同 AudioWorkerPool で track-parallel + plugin handshake を駆動、 hound::WavWriter で出力。 <code>export_running</code> フラグで CPAL callback を silence</li>
+  <li>IPC: audio pipe を tokio::io::split で双方向化、 export 完了通知を ChildToMain::ExportWavComplete で送信</li>
+  <li>GUI: File → Export WAV / Ctrl+E / status bar 表示復活、 SetRenderMode(Offline/Realtime) を export bookend で plugin host に送る</li>
+</ul>
+
+<p><strong>残課題 (M1 完成後の検討、 必要なら別 plan)</strong>:</p>
+<ul>
+  <li>進捗 modal (cancel button、 export thread を中断する mechanism)</li>
+  <li>Selection / Loop range のみの export</li>
+  <li>VST3 の render mode サポート (現状 no-op、 IComponent::setIoMode へのマップは M2)</li>
+  <li>has_hard_realtime_requirement() を返す plugin (hardware proxy 等) のサポートは M2 で realtime export 検討</li>
+</ul>
+
+<h4>A3 (旧版): WAV 書き出し / mixdown [優先度 6 — 完了済、 以下は元計画]</h4>
+
+<p><strong>現状</strong>: A2 で plugin_host 側の旧 export_wav_offline を削除し、GUI Export メニューも一旦無効化済。daw_audio 側に新規実装する。</p>
+
+<p><strong>設計方針</strong> (Ardour <a href="https://manual.ardour.org/exporting/export-dialog/">Export Dialog manual</a> と CLAP <a href="https://github.com/free-audio/clap/blob/main/include/clap/ext/render.h">render ext spec</a> を一次情報根拠):</p>
+<ul>
+  <li><strong>freewheel mode 採用</strong>: export 中は通常再生を停止、CPAL callback は無音、export thread が同じ AudioWorkerPool / plugin shmem を使って CPU 限界速度で render</li>
+  <li><strong>plugin instance は複製しない</strong>: Ardour / REAPER とも標準は同 instance 流用、複製案はメモリ 2 倍化で非現実的</li>
+  <li><strong>CLAP <code>clap_plugin_render</code> ext</strong>: export 開始前に全 plugin に <code>set(CLAP_RENDER_OFFLINE)</code>、完了で <code>CLAP_RENDER_REALTIME</code></li>
+</ul>
+
+<p><strong>やること</strong>:</p>
+<ol>
+  <li><strong>engine の resource 共有化</strong>: <code>LocalState</code> の <code>plugin_refs</code> / <code>slot_to_plugin_id</code> / <code>vocal_store</code> / <code>worker_syncs</code> / <code>worker_pool</code> を <code>SharedState</code> に Arc 化して移管 (CPAL closure と export thread で共有可能に)</li>
+  <li><strong>新規 <code>daw_audio/src/export.rs</code></strong>: offline render loop + WAV writer。export thread が <code>process_track_owned</code> を <code>Song.length_beats</code> 分ループ呼び出し、 <code>hound::WavWriter</code> で出力</li>
+  <li>CPAL callback は <code>shared.export_running</code> 中、<code>process_buffer</code> を skip し無音出力</li>
+  <li><code>MainToChild::ExportWav { path }</code> を再導入 (or <code>MainToAudio::ExportWav</code>)、daw_audio で受信</li>
+  <li><code>ChildToMain::ExportWavComplete { error }</code> を audio から送信</li>
+  <li><code>LoadedPlugin</code> trait に <code>set_render_mode(mode)</code> 追加、ClapPlugin で <code>clap_plugin_render</code> ext を取得 / set 呼び出し</li>
+  <li>GUI File menu / <code>Ctrl+E</code> shortcut / <code>action_export_wav</code> 復活</li>
+  <li>UI: export 中は status bar に「Export 中」表示、Play ボタンを無効化</li>
+</ol>
+
+<p><strong>主な変更ファイル</strong>:</p>
+<ul>
+  <li>新規 <code>daw_audio/src/export.rs</code></li>
+  <li><a href="../daw_audio/src/engine.rs">daw_audio/src/engine.rs</a> (resource 共有化、export hook)</li>
+  <li><a href="../daw_audio/src/main.rs">daw_audio/src/main.rs</a> (ExportWav handler + writer thread)</li>
+  <li><a href="../daw_plugin_host/src/plugin_instance.rs">daw_plugin_host/src/plugin_instance.rs</a> (<code>set_render_mode</code>)</li>
+  <li><a href="../daw_plugin_host/src/clap_plugin.rs">daw_plugin_host/src/clap_plugin.rs</a> (<code>clap_plugin_render</code> 実装)</li>
+  <li><a href="../common/src/protocol.rs">common/src/protocol.rs</a> (ExportWav / ExportWavComplete 再追加)</li>
+  <li><a href="../daw_gui/src/app.rs">daw_gui/src/app.rs</a> (action_export_wav 復活)</li>
+  <li><a href="../daw_gui/src/view/root.rs">daw_gui/src/view/root.rs</a> (File menu / shortcut)</li>
+</ul>
+
+<p><strong>受け入れ基準</strong>:</p>
+<ul>
+  <li>File → Export WAV → パス選択 → 再生中は自動停止 → freewheel offline render → WAV ファイルが書き出される</li>
+  <li>書き出した WAV を別アプリで再生 → DAW 内の再生と聴感上一致</li>
+  <li>export 中は CPAL は無音、 完了後通常再生に復帰可能</li>
+  <li>VOICEVOX cache を併用 (再合成しない、A1 完成後)</li>
+</ul>
+
+<p>着手時 <code>docs/plan_a3_wav_export.md</code> を切り出し推奨 (engine の resource 共有化が大規模変更のため)。</p>
+
+<h2>Phase 7: M2 = DAW としての表現力 (進行中)</h2>
+
+<p>M1 で土台 (3 プロセス + IPC + CLAP/VST3 host + sidechain/PDC + Undo/Redo + VOICEVOX + WAV export + autosave) が揃ったので、 M2 は <strong>再生できる DAW から制作できる DAW へ</strong> のステップ。</p>
+
+<p>進捗サマリ:</p>
+<ul>
+  <li><strong>B1</strong> (オートメーション + transport 通知): <strong>ほぼ完了</strong>。 残: B1-M extended (= MIDI → plugin parameter actual injection + IMidiMapping query UI)</li>
+  <li><strong>B2</strong> (オーディオ録音): 未着手</li>
+  <li><strong>B3</strong> (メトロノーム / count-in): <strong>完了</strong>。 count-in は B4 と一体実装 (commit 56213f8)</li>
+  <li><strong>B4</strong> (MIDI 録音 / export): <strong>Minimum 完了</strong> (Step A-E)。 B3 残 (count-in) も同時 landing。 残: B1-M (VST3 IMidiMapping)、 device 選択 / punch in/out / per-track export 等は extended</li>
+  <li><strong>B5</strong> (Linux 対応): 未着手</li>
+  <li><strong>Undo/Redo 残リスク (B/D/E)</strong>: 完了 (2026-05-14)</li>
+</ul>
+
+<h3>B1: オートメーション + transport 通知 (大半完了)</h3>
+
+<p>plugin パラメータの時間変化を扱う M2 最大の機能追加。 <a href="plan_automation.md"><code>plan_automation.md</code></a> で詳細管理、 Phase 1〜5 が landing 済 (本 plan の進捗ログの 2026-05-08 〜 2026-05-13 行を参照)。</p>
+
+<p><strong>完了</strong>:</p>
+<ul>
+  <li>パラメータオートメーション (lane 表示 / clip 同期 / <code>Hold</code> / <code>Linear</code> / <code>Bezier</code> / <code>Exponential</code> curve / lasso / multi-clip drag) → Phase 1〜3</li>
+  <li>recording mode (Read / Touch / Latch / Write) + thinning algorithm + plugin GUI gesture sync → Phase 4</li>
+  <li>tempo / time_sig オートメーション (<code>Song.song_lanes</code> + master row UI + audio engine tempo eval + sequencer / audio_clip_renderer beat-domain refactor + granular DSP / Slice) → Phase 5 Step 5.0〜5.2</li>
+  <li>CLAP <code>clap_event_param_value</code> (param 送信) → Phase 2</li>
+  <li>CLAP <code>clap_event_transport_t</code> (transport / tempo 通知) → Phase 5 Step 5.3</li>
+  <li>SongTempo lane recording 中の engine 側 curve bypass (drag 値 / curve point 二重反映抑止) → Phase 5 Step 5.2 follow-up</li>
+</ul>
+
+<p><strong>残</strong> (B1-M、 B4 依存):</p>
+<ul>
+  <li><del>B1-T</del> ✅ VST3 <code>IAudioProcessor::ProcessData::processContext</code> で transport / tempo / time_sig / bar position / cycle 範囲 / playing flag を per-buffer populate (commit <code>1520977</code>、 2026-05-13)</li>
+  <li><del>B1-R</del> ✅ VST3 export 高品質モード切替 — <code>IComponent::setIoMode</code> は spec 上 initialize 前にしか呼べない (= active 中の動的切替は spec 違反) ため、 <code>ProcessData::processMode</code> の <code>kRealtime</code> / <code>kOffline</code> 切替で代替 (commit <code>7a58e2c</code>、 2026-05-13)</li>
+  <li><del>B1-M</del> ✅ <strong>Minimum 完了</strong> (commits <code>976ba22</code> / <code>99e4fc3</code> / 本 commit、 Step 1-4)。 業界標準 MIDI Learn UI: track header の Learn button で「次の CC を bind」、 <code>Song.midi_bindings: Vec&lt;MidiBinding&gt;</code> を project に永続化、 <code>BindingTarget::TrackVolume</code> / <code>TrackPan</code> / <code>SongTempo</code> / <code>PluginParam</code> の 4 種。 <code>MidiBinding::channel = 16</code> で any-channel 対応。
+    <ul>
+      <li><strong>残 (extended scope)</strong>:
+        <ol>
+          <li><strong>PluginParam の actual injection</strong> — 現状 bind data は永続化されるが、 CC 受信時は tracing::warn のみで音には反映されない。 GUI → audio thread → plugin host への RT-safe IPC + IParameterChanges (VST3) / CLAP_EVENT_PARAM_VALUE injection の整備が必要。</li>
+          <li><strong>VST3 <code>IMidiMapping::getMidiControllerAssignment</code> query</strong> — plugin が提供する default mapping (CC# → param_id) を取得して inspector に表示 (= user override 可能な suggested binding)。</li>
+          <li><strong>per-knob Learn UI</strong> — mixer / inspector の各 knob に「Learn MIDI」 メニュー (= 段階 2 の transport bar Learn button は selected_track Volume fix、 各 knob から個別に Learn 開始できる)。</li>
+          <li><strong>MIDI Binding list view</strong> — inspector に既存 binding 一覧 + delete UI。</li>
+        </ol>
+      </li>
+    </ul>
+  </li>
+</ul>
+
+<h3>B2: オーディオ録音</h3>
+<ul>
+  <li>CPAL input stream (WASAPI 共有モード)</li>
+  <li>オーディオクリップ (.wav 直挿し) + arrangement 表示</li>
+  <li>録音 → クリップ書き込み → ディスクに <code>.daw</code> と並んで save</li>
+</ul>
+
+<h3>B3: メトロノーム / count-in (Minimum 完了)</h3>
+
+<p>B2 録音の前提 (録音時のテンポ guide)。 既存 audio engine の master mix 後段に乗せる軽量実装。</p>
+
+<p><strong>Minimum 完了 (commit <code>e6d76c9</code>、 2026-05-13)</strong>:</p>
+<ul>
+  <li>内蔵 click 音 (sine + linear envelope decay、 accent: downbeat 880Hz / 他 440Hz、 40ms decay、 amp peak 0.25 = -12 dB、 mono → L/R 均等 mix)</li>
+  <li>transport bar に "Click" toggle button (既存 STYLE_REC_MODE 流用、 active で橙)</li>
+  <li>audio engine で beat 境界ごとに voice trigger + master mix 最終段に重ねる (track mute / solo / volume の影響を受けず常に guide が聞こえる)</li>
+  <li>export 中 / playing でない / disabled で skip = CPU 0</li>
+  <li>session-only state (project save には含めない)</li>
+</ul>
+
+<p><strong>残</strong>:</p>
+<ul>
+  <li><strong>count-in 1 / 2 小節 オプション</strong> — B2 (オーディオ録音) の trigger 機構と一体運用なので <strong>B2 と同時実装</strong>。 録音 trigger と切り離した状態で count-in だけ実装しても使い道がない (= 再生は SeekTo で任意位置開始できる)。</li>
+</ul>
+
+<h3>B4: MIDI 録音 / export (Minimum 完了)</h3>
+
+<p>詳細は <a href="plan_b4_midi.md"><code>plan_b4_midi.md</code></a>。 minimum スコープ完了 (commits <code>08ffa94</code> Step A schema / <code>10d6f3f</code> Step A wire / <code>56213f8</code> Step C+D / 本 commit Step E):</p>
+<ul>
+  <li>MIDI input (<code>midir</code>、 cross-platform) から note を arrangement の MIDI clip に録音 (Step B/D)</li>
+  <li>track header の R (Record-arm) button + transport bar の Record toggle (Step A/C)</li>
+  <li>count-in 0 / 1 / 2 bars (B3 残を本フェーズで一体実装、 audio engine の preroll 経路) (Step C)</li>
+  <li><code>.mid</code> 形式 (<code>midly</code>、 SMF format 1、 全 MIDI track 一括) で export (Step E)</li>
+</ul>
+
+<p><strong>残 (extended)</strong>: MIDI device 選択 dropdown / punch in / out / per-track export / B1-M (VST3 IMidiMapping、 MIDI 入力で plugin parameter map)。</p>
+
+<h3>B5: Linux 対応</h3>
+<ul>
+  <li>CPAL ALSA backend</li>
+  <li>X11 / Wayland window (winit が対応済)</li>
+  <li>CLAP Linux GUI embed (<code>gtk</code> API、 現状 Win32 専用)</li>
+  <li>VST3 Linux GUI embed (<code>X11EmbedWindow</code>、 同様)</li>
+  <li>Job Object 相当 (Linux は prctl <code>PR_SET_PDEATHSIG</code>)</li>
+</ul>
+
+<h3>Undo/Redo plugin sync polish (完了)</h3>
+
+<p>A8 で A (load 失敗 → pending stuck) は解消、 4dc982c で reconcile が slot 粒度に拡張、 本セッションで B / D / E を closure。 詳細は <a href="plan_undo_reconcile_polish.md"><code>plan_undo_reconcile_polish.md</code></a>:</p>
+<ul>
+  <li><strong>B</strong> ✅ <code>pending_state_request: Option&lt;_&gt;</code> → <code>pending_state_queue: VecDeque&lt;_&gt;</code> 化。 連続 deferred edit は queue で順次処理され、 各々が自前の最新 state snapshot を持つ。 test <code>pending_state_queue.rs</code>。</li>
+  <li><strong>D</strong> ✅ <code>reconcile_plugins_with_song</code> Phase B を <code>compute_slot_reconcile_actions</code> 純粋関数に抽出 + <code>SlotReconcileAction</code> enum。 5 unit tests (<code>reconcile_slot_diff.rs</code>)。</li>
+  <li><strong>E</strong> ✅ <code>after_undo_redo</code> の <code>reconcile_plugins_with_song</code> を <code>Instant</code> で計測 → <code>tracing::info!(target: "daw_gui::app::undo_perf", ...)</code>。 Plan-B の slot-level diff が plugin chain 不変の Undo を no-op に落とすので、 通常使用での cost は無視できる。 実運用で問題化したら追加 PR で coalesce 検討。</li>
+</ul>
+
+<h2>進捗ログ</h2>
+
+<table>
+<thead>
+<tr><th>日付</th><th>commit</th><th>Phase</th><th>内容</th></tr>
+</thead>
+<tbody>
+<tr><td>2026-05-03</td><td>(plan.md 初版)</td><td>-</td><td>master plan 作成</td></tr>
+<tr><td>2026-05-03</td><td>2625255</td><td>Phase 0</td><td>要望 #005-#009 を gui_01_conversation.md に投稿</td></tr>
+<tr><td>2026-05-03</td><td>c46df37</td><td>Phase 1-1</td><td>bottom_panel を <code>tab_view_with_state</code> 化 (98 → 49 LOC)</td></tr>
+<tr><td>2026-05-03</td><td>f280274</td><td>Phase 1-2</td><td>plugin_picker のリストを <code>scroll_area</code> 化 (truncation 廃止)</td></tr>
+<tr><td>2026-05-03</td><td>(gui_01)</td><td>Phase 0</td><td>gui_01 から #005-#009 全件 [Replied] 受領、API 確定</td></tr>
+<tr><td>2026-05-03</td><td>2d6d70e</td><td>Phase 1-3</td><td>mixer/inspector を scroll_area 化、scrollbar drag bug を gui_01 #010 で報告</td></tr>
+<tr><td>2026-05-04</td><td>(gui_01)</td><td>Phase 0</td><td>gui_01 から #006 (Phase 45c API) と #010 (Phase 45g 修正済) の返信受領</td></tr>
+<tr><td>2026-05-04</td><td>8aebba3</td><td>Phase 3c</td><td>piano_roll の velocity / playhead を gui_01 widget 内蔵に移譲 (#006 解決、320 → ~210 LOC)</td></tr>
+<tr><td>2026-05-04</td><td>ad26af5</td><td>Phase 0</td><td>gui_01 #006 / #010 を Resolved 化、archive_001.md へ移動</td></tr>
+<tr><td>2026-05-04</td><td>51ff532</td><td>Phase 3a</td><td>背景塗りを Ui::panel / panel_with_border に置換 (10 箇所、heavy+cached boilerplate を 1 行化)</td></tr>
+<tr><td>2026-05-04</td><td>bbda445</td><td>Phase 3b</td><td>mixer の M/S を Ui::toggle_button_at に置換 (button + 自前 hint band の 2 段構えを 1 呼び出しに)</td></tr>
+<tr><td>2026-05-04</td><td>59c93ec</td><td>Phase 3d</td><td>plugin_picker.rs を Ui::modal + Ui::list_view で rewrite (167 → 145 LOC)</td></tr>
+<tr><td>2026-05-04</td><td>73e3504</td><td>Phase 2</td><td>Track / Clip に stable id を追加 (next_*_id 採番、ensure_ids、CURRENT_VERSION 2→3)</td></tr>
+<tr><td>2026-05-04</td><td>eda8954</td><td>Phase 3e</td><td>arrangement_view を Ui::arrangement widget で rewrite (614 → 322 LOC、id ↔ index 変換層)</td></tr>
+<tr><td>2026-05-04</td><td>b7b9def</td><td>M10 取り込み</td><td>gui_01 #010 (Phase 46-48 + 47b/c) build 追従 + #011 (UX 非対称 2 件) を gui_01 に相談</td></tr>
+<tr><td>2026-05-04</td><td>(gui_01)</td><td>-</td><td>gui_01 が #011 に Phase 49 (volume live update) + Phase 50 (reorder optimistic preview) で対応、daw_01 側は make_edit が fn 自由関数なので追従不要</td></tr>
+<tr><td>2026-05-04</td><td>da0bdf5</td><td>Phase 5</td><td>dead_code 清掃 (ClipBox/NoteBox/TrackHeader 構造体 + 派生メソッド削除、AppEvent に <code>#[allow(dead_code)]</code>) + clippy fix 4 件</td></tr>
+<tr><td>2026-05-04</td><td>b12adff</td><td>Phase 4</td><td>track rename / chain reorder / reorder IPC 取り込み</td></tr>
+<tr><td>2026-05-04</td><td>d832627</td><td>Phase 4 仕上げ</td><td>gui_01 #013 (M11 Phase 52) <code>text_input_at_focused</code> 取り込み、track Rename → 即タイプ可能</td></tr>
+<tr><td>2026-05-04</td><td>b9a3fe2</td><td>Phase 0</td><td>gui_01 #013 を Resolved 化、archive へ移動</td></tr>
+<tr><td>2026-05-04</td><td>ce08095</td><td>bug fix</td><td><code>UiHost::with_window</code> で cursor 配線、hover/drag のカーソル形状が変化しない問題を解消</td></tr>
+<tr><td>2026-05-04</td><td>22ffa56</td><td>Phase 0</td><td>gui_01 #014 [Open] ルーラー &amp; time_sig 対応 grid 要望</td></tr>
+<tr><td>2026-05-04</td><td>a2117cb</td><td>chore</td><td>.gitignore に /.claude/scheduled_tasks.lock を追加</td></tr>
+<tr><td>2026-05-04</td><td>af44c46</td><td>M13 取り込み</td><td>gui_01 #014 (M13 Phase 55) を取り込み — アレンジビュー小節番号 ruler + ピアノロール ruler 領域 + time_sig 対応 grid</td></tr>
+<tr><td>2026-05-04</td><td>12be490</td><td>Phase 0</td><td>gui_01 #014 を Resolved 化、archive へ移動</td></tr>
+<tr><td>2026-05-04</td><td>8954bed</td><td>A2 PR1-7</td><td>責務分担正常化 + track-parallel スレッドプール化 (build/clippy clean): plan_a2_audio_engine.md 参照</td></tr>
+<tr><td>2026-05-05</td><td>d7a7575</td><td>A2 完了</td><td>残 cleanup + audio quality: 旧 audio thread コード全削除 (~1500 行)、tests を daw_audio/src/sequencer.rs に移植、MMCSS / CLAP thread_check ext / assert_no_alloc 追加。 CLAUDE.md に「まず調べる」 ルール追記。 WAV export は A3 で本格実装に切り出し</td></tr>
+<tr><td>2026-05-05</td><td>82f7e54</td><td>A3 PR1</td><td>LocalState から EngineShared を抽出 (Arc + ArcSwap で wait-free 共有)、 機能変化なし</td></tr>
+<tr><td>2026-05-05</td><td>c10141d</td><td>A3 PR2</td><td>LoadedPlugin::set_render_mode trait method 追加、 ClapPlugin で clap_plugin_render::set 呼び出し、 Vst3Plugin は no-op</td></tr>
+<tr><td>2026-05-05</td><td>4ace2a5</td><td>A3 PR3</td><td>protocol 拡張: MainToChild::ExportWav / SetRenderMode + ChildToMain::ExportWavComplete 復活、 plugin_host で全 plugin に render mode broadcast</td></tr>
+<tr><td>2026-05-05</td><td>9607660</td><td>A3 PR4</td><td>daw_audio/src/export.rs 新規: freewheel offline render + WavWriter。 export_running フラグで CPAL callback を silence、 同 worker pool / plugin shmem を export thread が独占駆動</td></tr>
+<tr><td>2026-05-05</td><td>e8b3d6e</td><td>A3 完了</td><td>GUI で File→Export WAV / Ctrl+E / status bar 復活。 audio pipe を read/write 双方向化し、 export 完了通知を ChildToMain::ExportWavComplete で daw_gui へ。 SetRenderMode(Offline/Realtime) bookend で plugin に CLAP render hint</td></tr>
+<tr><td>2026-05-05</td><td>469acd7</td><td>A3 smoke fix</td><td>smoke test で発見した 3 件 (Play/Stop/SetLoop の plugin_host 重複送信、 Ctrl+E shortcut 漏れ、 メーター peak の publish 漏れ) を修正</td></tr>
+<tr><td>2026-05-05</td><td>02fe061</td><td>A7 完了</td><td>plugin ロード race の同期化: AppData::pending_plugin_loads + track_pending_load helper で SetSlotPlugin 送信時に再生中なら自動 Stop、 全 SlotPluginLoaded 受信完了で自動 Play 再開</td></tr>
+<tr><td>2026-05-05</td><td>77cc7c5</td><td>A6 完了</td><td>transport bar に BPM / time_sig 編集 UI: text_input + dropdown、 commit で song 更新 + LoadSong 再送 + Undo/Redo 対応。 numpad Enter 不対応は gui_01 #016 で対応依頼</td></tr>
+<tr><td>2026-05-05</td><td>4211315</td><td>gui_01 #015 解決</td><td>gui_01 M14 Phase 56 (button_at_clicked + take_*_in_rect の modal 透過抑制) を取り込み、 plugin_picker.rs の ✕ ボタンを button_at_clicked + close_modal に置換。 ✕ click / wheel scroll / Esc / outside click 全 expected。 plan.md 既知 bug クリア</td></tr>
+<tr><td>2026-05-05</td><td>9648aba</td><td>gui_01 #016 解決</td><td>gui_01 M14 Phase 57 (PhysicalKey::NumpadEnter 追加 + text_input commit 拡張) を取り込み + daw_gui/src/view/runner.rs::map_phys_key にも NumpadEnter マッピング追加 (gui_01 winit_backend と二重実装の都合)。 BPM 入力欄でテンキー Enter による commit を実機確認</td></tr>
+<tr><td>2026-05-05</td><td>(A4 commit)</td><td>A4 完了</td><td>autosave 拡充 (file_path None でも recovery_dir に save) + 起動時 recovery_modal + 「復元 / 破棄 / 閉じる」 + 正常終了時 cleanup + Open 時 sidecar 検出。 真の kill (PowerShell Stop-Process -Force) 後の file 残存 + 再起動 modal 表示まで実機確認</td></tr>
+<tr><td>2026-05-05</td><td>6df6f55 ... e23ecd7</td><td>A1 完了</td><td>VOICEVOX 統合 Phase A/B/C/D 全完了: engine 自動起動 + JobObject + per-track speaker dropdown + /singers fetch + WAV cache + split_into_morae (拗音結合)</td></tr>
+<tr><td>2026-05-05</td><td>5311564</td><td>A5 完了</td><td>piano_roll L キー歌詞編集 wire (gui_01 #017 取り込み) + 旧 lyric_panel 削除</td></tr>
+<tr><td>2026-05-06</td><td>f3d35e1 / ef8588c / 70ff180 / 4992d38</td><td>piano_roll polish</td><td>ノートのコピペ + 量子化、 velocity lane、 任意トラック削除/並び替え、 Undo/Redo (Ctrl+Z) を Song snapshot で実装</td></tr>
+<tr><td>2026-05-06</td><td>52cab33</td><td>piano_roll widget</td><td>piano_roll_view を gui_01 Ui::piano_roll widget で書き換え</td></tr>
+<tr><td>2026-05-06</td><td>6e4e558 / a359f7b / 85b705d</td><td>piano_roll snap</td><td>snap toolbar (Bars / Straight) + auto-fit zoom + smart note length + AHE 自律改善ループ稼働</td></tr>
+<tr><td>2026-05-06</td><td>d454bd6</td><td>routing_graph 基盤</td><td>共通 schedule + group track (Reaper folder 流) + nest 無制限 + gui_01 #016 追従</td></tr>
+<tr><td>2026-05-06</td><td>9b44d2a</td><td>PR2.1</td><td>plugin_host を track_id ベース化 + GUI lifecycle 修正 (delete/ungroup race 対策)</td></tr>
+<tr><td>2026-05-06</td><td>9816b15 / af63880 / 4828d27</td><td>PR3 PDC 完成</td><td>graph layer に PDC 補償 + JS scripting + headless mode + 実 VST3 (MCenter) integration test + plugin auto-latency IPC (CLAP + VST3)</td></tr>
+<tr><td>2026-05-06</td><td>134cc9f / e8c0b3d / b37354d / 19870b0 / e94dd7e</td><td>PR4 sidechain</td><td>compile_schedule に sidechain edge + ProcessData::buffer_aux_in + engine SidechainTap + plugin_host で aux input を CLAP/VST3 process() に渡す + PDC × sidechain integration</td></tr>
+<tr><td>2026-05-06</td><td>a4c8d51 / 9fa9810 / 1d58167 / 8fc09d2 / 6bb8a98</td><td>PR4.5 follow-up</td><td>track_inspector に Sidechain section + plugin-internal main vs aux alignment + ensure_ids() の sidechain 参照 dangle 修正 + reload で sidechain_sources 保持 + duplicate SetSlotPlugin で SlotPluginLoaded 再 emit</td></tr>
+<tr><td>2026-05-06</td><td>d049060 / 9ee2dca</td><td>plugin_host 安定化</td><td>VST3/CLAP の <code>_library</code> を struct 末尾に移動 (Drop 順序 crash fix) + DispatchCounter + WorkerPool::quiesce で plugin Drop を audio worker と同期 (UAF fix)</td></tr>
+<tr><td>2026-05-07</td><td>22d7a9e / 5a9df06 / 4dc982c</td><td>Undo/Redo plugin sync</td><td>track-level reconcile (削除 → Undo で plugin 再 load) + Undo snapshot 直前に最新 state を Song に書き戻し (knob 値復元) + slot 粒度の reconcile (同 track 内 plugin 追加/削除/切替を同期)</td></tr>
+<tr><td>2026-05-07</td><td>88bf3dc</td><td>A8 完了</td><td>plugin load 失敗通知 (<code>SlotPluginLoadFailed</code>) を新設、 plugin_host 2 失敗 path で emit (orphan cleanup 含む)、 daw_gui で pending 解放 + queue Play flush + status 表示。 integration test 2 件</td></tr>
+<tr><td>2026-05-07</td><td>aa0bb7a</td><td>M1 達成</td><td>DESIGN.md M1 マイルストーンの全項目完了。 plan.md / DESIGN.md を実態に追従更新 (VST3 GUI embed / sidechain / PDC / グループトラック / Undo/Redo を M1 に取り込み、 M2 候補を細分化)</td></tr>
+<tr><td>2026-05-07</td><td>2f60f2e</td><td>gui_01 #018 [Open]</td><td>piano_roll velocity lane の drag 編集を内蔵要望 (NotesEditRequest::SetVelocity 新設、 multi-select 一括変更、 click&lt;3px no-op、 release frame で 1 batch)</td></tr>
+<tr><td>2026-05-07</td><td>(commit)</td><td>gui_01 #018 [Resolved]</td><td>gui_01 main を fast-forward (5632b41 = M14 Phase 64) で取り込み、 daw_01 側で <code>NotesEditRequest::SetVelocity</code> arm + <code>AppEvent::SetNoteVelocities(Vec&lt;(u32, u8)&gt;)</code> + handler <code>set_note_velocities</code> を追加。 1 drag = 1 Undo step (<code>is_undoable</code> に登録)。 conversation.md の #018 entry は archive_001.md に移動</td></tr>
+<tr><td>2026-05-08</td><td>a04cc3b</td><td>Phase 1 PR8</td><td>VOICEVOX 経路を <code>SetGeneratedAudio</code> に移行: protocol から <code>SetVocalAudio</code> 削除、 <code>vocal_store</code> / <code>VocalAudio</code> 廃止、 <code>EngineShared::generated_audio_store</code> を vocal の唯一の sink に。 <code>vocal_gen_id(track_id, clip_id) = (track_id &lt;&lt; 32) | clip_id</code> で per-clip 独立 buffer (= multi-clip Vocal track が overwrite し合わない)。 <code>process_track_owned</code> の vocal block は <code>song_track.clips</code> を walk して該当 buffer を clip range で mix。 daw_gui の <code>finish_vocal_synth</code> / JS <code>setGeneratedAudio</code> API も移行、 PDC / sidechain integration tests (pdc_mcenter / pdc_mcompressor_sidechain) も新 API に書き換え (clips: [{...}] を test song に追加)。 build / clippy / test --features rt-assert all clean。 audio_clip_renderer 経由の本格統合 (Vocal clip → ClipContent::Audio 化) は後続 PR</td></tr>
+<tr><td>2026-05-08</td><td>9692c72</td><td>Phase 1 仕上げ</td><td>File menu に "Import Audio..." エントリ追加 (<code>AppEvent::OpenImportAudioDialog</code> + rfd <code>pick_files</code> で multi-select WAV → 既存 <code>action_import_audio</code> に転送)。 <code>resize_clip</code> を audio clip 対応化 — 右端 trim で <code>clip.length_beats</code> 縮小時に各 <code>AudioEvent.event_length_beats</code> を clip 内 beats 軸でクランプ (compile_audio_schedule が clip 範囲を超えて event を render し続ける問題を解消)。 plan_audio_clip.md ステータスを「仕様策定中」 → 「Phase 1 完了」 に更新。 左端 trim と Alt+drag time-stretch handle は arrangement widget が <code>ResizeClips</code> delta に <code>next_start</code> を持たないので Phase 2 で gui_01 #025 として要望予定</td></tr>
+<tr><td>2026-05-08</td><td>9d1a0c0</td><td>Phase 2 PR1</td><td>Inspector に audio event 編集 section を追加。 selected_clip が <code>ClipContent::Audio</code> のとき "Audio Event" 見出しと共に Reverse / Mute toggle (gui_01 <code>toggle_button_at</code> + 専用 <code>ToggleButtonStyle</code>) と Stretch Mode dropdown (Raw/Repitch/Stretch/Slice) を表示。 AppEvent: <code>SetClipReversed</code> / <code>SetClipMuted</code> / <code>SetClipStretchMode</code> を追加し、 handler は当該 ClipContent::Audio の全 event に値を broadcast (Phase 1 で 1 clip 1 event 前提なので first event = clip 全体)。 <code>is_undoable</code> 登録済 = 1 操作 1 Undo step。 AppData::<code>inspector_audio_event_summary</code> で view 側 read snapshot を分離。 数値 field (Gain / Pan / Pitch) は edit buffer 設計が要るので別 PR。 build / clippy / test --features rt-assert all clean</td></tr>
+<tr><td>2026-05-08</td><td>4b5c7dd</td><td>Phase 2 PR2</td><td>Inspector の audio event section に数値 field 編集 (Gain dB / Pan / Pitch semitones) を追加。 既存 <code>bpm_edit_text</code> パターンを踏襲: AppData に <code>clip_edit_buffer_target</code> / <code>clip_*_edit_text</code> 4 field、 AppEvent: <code>Clip*EditChanged(String)</code> / <code>CommitClip*Edit</code> / <code>SetClip*</code> (3 種 × 3 = 9 variants) + <code>ResyncClipEditBuffers(target)</code>。 handler は Bitwig spec §3.6 の値範囲で clamp (Gain -80..+24 dB / Pan -1..1 / Pitch -96..+96 semitones)、 commit 失敗時は status_message + buffer を formatted な現値に書き戻し。 <code>resync_song_edit_texts</code> を audio event buffer も含むよう拡張 (open / new / undo / redo で resync)、 view 側でも buffer.target が selected_clip と違ければ <code>Edit::mutate</code> で <code>ResyncClipEditBuffers</code> を発火 (1 frame だけ古い buffer 表示後に書き戻る)。 <code>CommitClip*Edit</code> / <code>SetClip*</code> を <code>is_undoable</code> 登録 = 1 commit 1 Undo step。 build / clippy / test --features rt-assert all clean</td></tr>
+<tr><td>2026-05-08</td><td>507be91</td><td>Phase 2 PR3</td><td>Inspector の audio event section に Fade In / Fade Out 編集 (length + curve) を追加。 audio_clip_renderer の fade envelope は既存 (PR4 で実装済) なので即音に効く。 AppEvent: <code>ClipFadeIn/OutEditChanged(String)</code> / <code>CommitClipFadeIn/OutEdit</code> (2 + 2 = 4)、 <code>SetClipFadeIn/OutBeats { target, beats }</code> (2)、 <code>SetClipFadeIn/OutCurve { target, curve }</code> (2) の合計 8 variants。 handler は length を <code>0..clip.length_beats</code> で clamp (= fade が clip より長くならない、 spec §3.5)、 curve は Linear / Exponential / SCurve dropdown 選択。 全 event broadcast。 <code>clip_fade_in/out_edit_text</code> 2 buffer を AppData に追加、 <code>resync_clip_audio_event_edit_buffers</code> も追従。 InspectorAudioEventSummary に <code>fade_in_curve</code> / <code>fade_out_curve</code> 追加。 Inspector view で「Fade In: length text_input + curve dropdown」 「Fade Out: length text_input + curve dropdown」 の 2 行表示。 build / clippy / test --features rt-assert all clean</td></tr>
+<tr><td>2026-05-08</td><td>dcf23dd</td><td>Phase 2 PR4</td><td>左端 trim 対応 (Bitwig spec §3.2)。 <code>AppEvent::ResizeClip { target, length }</code> を <code>{ target, start_beat, length }</code> に拡張、 <code>arrangement_view::make_edit::ResizeClips</code> で <code>ResizeClipDelta.next_start</code> も読んで AppEvent に流す (gui_01 widget は左端 / 右端 grip drag を別 delta で emit していたが、 daw_01 は <code>next_len</code> だけ読んで左端 trim を捨てていた問題)。 handler は <code>delta_start = next_start - prev_start</code> から audio event の追従計算: 左端 trim (delta_start&gt;0) は event を delta 手前にスライド + event が削れた場合 source_start_frames を進める / event_length_beats を縮める、 左端を伸ばす (delta_start&lt;0) は event を後方スライド (source は触らず追加範囲は無音)、 右端 trim (delta_start==0) は既存どおり length clamp。 Phase 2 PR4 では Raw mode 前提 (Repitch 中の左端 trim は pitch_ratio 補正必要だが将来 PR スコープ)。 build / clippy / test --features rt-assert all clean</td></tr>
+<tr><td>2026-05-08</td><td>a277191</td><td>Phase 2 PR5</td><td>Auto-Fade / Auto-Crossfade (<code>docs/plan_audio_clip.md</code> §3.5) を実装。 AppEvent: <code>AutoFadeSelectedClips</code> / <code>AutoCrossfadeSelectedClips</code> を追加 (両方 undoable)、 <code>arrangement_view</code> の clip 右クリックメニューに「Make Unique」 「Auto-Fade」 「Auto-Crossfade」 の 3 項目を表示。 Auto-Fade: 選択 audio clip 全部の fade_in/out_beats を <code>0.004 * bpm / 60</code> beats (= 4 ms 相当) に上書き、 業界標準のクリック除去 fade。 Auto-Crossfade: 選択 audio clip を track 別に start_beat sort し、 隣接ペアで <code>prev_end &gt; next_start</code> を判定 → overlap 長を prev の fade_out + next の fade_in に設定 (隙間ペアと内包ペアは skip)。 status_message で適用件数を report。 inspector の clip_edit_buffer も追従 resync。 build / clippy / test --features rt-assert all clean</td></tr>
+<tr><td>2026-05-08</td><td>57e89f9</td><td>Phase 2 PR6</td><td>Audio Editor (<code>docs/plan_audio_clip.md</code> §3.10) の minimal viewer を新設。 audio clip ダブルクリックで <code>audio_editor_clip = Some(target)</code> 化、 bottom_panel の Piano Roll タブが Audio Editor view に切り替わる (= タブ名も "Audio Editor"、 §3.10「piano_roll の領域を流用」)。 Esc で Close (root.rs::dispatch_shortcuts に分岐追加)。 view/audio_editor.rs 新規: ヘッダ (clip 名 + length + Close ボタン)、 first event の波形を <code>Ui::waveform</code> で全幅描画 (<code>ChannelLayout::Stack</code> で channel 別表示)、 source 情報メタラベル。 Phase 2 PR6 は read-only viewer のみ — event 単位 trim / 移動 / 追加 / 削除 / dB handle / 角 fade drag は後続 PR。 編集はそれまで Inspector 経由 (PR1-3)。 AppEvent: <code>OpenAudioEditor(ClipRef)</code> / <code>CloseAudioEditor</code> を追加 (どちらも非 undoable: view state)。 <code>is_audio_clip</code> helper を pub 化して <code>arrangement_view::DoubleClickClip</code> から利用、 audio / MIDI で分岐。 build / clippy / test --features rt-assert all clean</td></tr>
+<tr><td>2026-05-08</td><td>3666f10</td><td>Phase 2 PR7</td><td>(1) Reverse 右クリックメニュー追加 + (2) Audio Editor に再生 playhead 線表示。 (1) <code>AppEvent::ToggleClipReversed(ClipRef)</code> を新設 (undoable)、 first event の reversed を読んで <code>set_clip_audio_event_reversed(target, !cur)</code> で全 event broadcast。 arrangement の clip 右クリックメニューに「Reverse」 を 4 項目目として追加 (Make Unique / Auto-Fade / Auto-Crossfade / Reverse)、 Auto-Fade と違って selection 全体ではなく当該 clip のみ toggle (Bitwig clip メニュー流)。 (2) audio_editor.rs に push_lines (<code>LineBatch</code>) で playhead を vertical 線として overlay、 clip range 内のときのみ表示 (= 曲全体のどこを再生中か Audio Editor 内で視認可能)、 wf_area で clip_rect 切り。 build / clippy / test --features rt-assert all clean</td></tr>
+<tr><td>2026-05-08</td><td>d22d5c6</td><td>gui_01 #025 [Open]</td><td>arrangement の audio clip に dB / fade 直接編集 gesture 要望投稿 (Bitwig spec §3.5 / §3.6)。 <code>ArrangementClip</code> に <code>audio_edit: Option&lt;ArrangementClipAudioEdit&gt;</code> field、 新 <code>ArrangementEditRequest</code> variant 3 つ (<code>SetClipGainDb</code> / <code>SetClipFade</code> / <code>SetClipFadeCurve</code>)、 中央帯縦 drag = Gain、 角横 drag = fade length、 角縦 drag (&gt;10 px) = curve トグル、 sticky direction で振り分け。 daw_01 側は AppEvent (<code>SetClipGainDb</code> / <code>SetClipFadeIn/OutBeats</code> / <code>SetClipFadeIn/OutCurve</code>) を Phase 2 PR2-3 で既に持っているので、 main マージ後は <code>arrangement_view::make_edit</code> に 3 arm 追加するだけで wire 完了</td></tr>
+<tr><td>2026-05-08</td><td>3d1664e</td><td>Phase 2 PR8</td><td>audio clip rect 上に gain_db / fade_in / fade_out 値の overlay label を small font で表示 (read-only)。 grip drag UI (gui_01 #025 マージ待ち) が来るまでの視覚 feedback として、 ユーザーが Inspector を開かなくても値が確認できるようにする。 default 値 (0 dB / 0 fade) の clip ではラベル無し (= 視覚ノイズ抑制)、 clip 幅 60 px 未満 / 高さ 24 px 未満も無描画。 描画位置は clip rect の右下 (= name は左上、 重ならない)、 右から <code>Fo / Fi / Gain</code> の順。 build / clippy / test --features rt-assert all clean</td></tr>
+<tr><td>2026-05-08</td><td>0f2409e</td><td>Phase 2 PR9</td><td>Bounce In Place (Pre-FX、 <code>docs/plan_audio_clip.md</code> §3.8 / §13 Q8) を実装。 audio clip 右クリックメニューに「Bounce In Place」 項目を追加 (5 項目目)、 selected clip 内の全 events を engine sample_rate (48 kHz) で stereo 32-bit float mix → WAV ファイルに書き出し → 新 <code>AudioSource</code> 採番 + <code>Song.audio_sources</code> insert + <code>audio_source_cache</code> 登録 + <code>ClipContent::Audio { events: [新 1 event] }</code> で置換 + <code>sync_song_to_plugin_host</code> で audio engine に LoadSong 再送。 出力先: project_dir があれば <code>&lt;project_dir&gt;/bounce/&lt;safe_name&gt;_&lt;ts8&gt;.wav</code>、 未保存 project は <code>%LOCALAPPDATA%/daw_01/bounce_cache/...</code> にフォールバック (= import_cache と同じ pattern、 save 時 migration helper は将来 PR)。 mix loop は audio_clip_renderer のロジックを portion-wise port (fade / gain / pan / pitch_ratio / reversed)、 fade_envelope は AppData 側に bounce_fade_env として重複定義 (= Phase 3+ で共通 crate に切り出し予定)。 Pre-FX なので plugin chain は通さない (Bitwig spec 通り)。 build / clippy / test --features rt-assert all clean</td></tr>
+<tr><td>2026-05-08</td><td>dd7f6b9</td><td>gui_01 #025 [Resolved]</td><td>gui_01 main を fast-forward (M14 Phase 63k = audio_edit + 3 EditRequest variant + grip drag handler) で取り込み、 daw_01 側で <code>ArrangementClip.audio_edit</code> を <code>ClipContent::Audio</code> の first event 値で詰め、 <code>arrangement_view::make_edit</code> に <code>SetClipGainDb</code> / <code>SetClipFade</code> / <code>SetClipFadeCurve</code> 3 arm を追加。 各 delta は既存 AppEvent (<code>SetClipGainDb</code> / <code>SetClipFadeIn/OutBeats</code> / <code>SetClipFadeIn/OutCurve</code>、 Phase 2 PR2-3) に変換 → handler が全 event broadcast + Undo step を取る。 widget 側 FadeCurve / FadeEdge と daw_01 model FadeCurve の 1:1 変換 helper (<code>widget_curve_from_model</code> / <code>model_curve_from_widget</code>) を追加。 conversation.md の #025 entry は <code>[Resolved]</code> 化して archive_001.md に移動。 これで Bitwig 流の clip 中央 dB drag / 角 fade drag / 角縦 drag curve トグルが動く</td></tr>
+<tr><td>2026-05-08</td><td>2e58cd2</td><td>docs cleanup</td><td><code>docs/gui_01_conversation.md</code> に [Replied] / [Resolved] のまま残っていた 16 件 (#005 / #007-#015 / #017 / #019-#024) を監査 → daw_01 で取り込み済確認 → archive_001.md 末尾へ移動。 conversation.md は header + テンプレートのみ。 残作業エントリは [Open] / [Replied] 共に 0 件</td></tr>
+<tr><td>2026-05-08</td><td>c164391</td><td>docs cleanup</td><td>gui_01 #015 (snap mode 単位修正) もユーザー実機確認で完了判断、 archive へ移動</td></tr>
+<tr><td>2026-05-08</td><td>(main merge)</td><td>release</td><td><code>c70194f..c164391</code> を main へ fast-forward merge (16 commits)。 Phase 1 PR8 + Phase 1 仕上げ + Phase 2 PR1-9 + gui_01 #025 wire + conversation 整理が main にランディング</td></tr>
+<tr><td>2026-05-08</td><td>b050d81</td><td>docs</td><td><a href="plan_audio_followup.md">plan_audio_followup.md</a> 新設。 Phase 2 完了後に残る audio clip 関連の polish / 機能追加を 4 PR (DRY 化 → multi-clip Undo 統合 → plugin-FX Bounce → Audio Editor event 編集) + 後回し 2 件 (bounce_cache migration / VOICEVOX ClipContent::Audio 統合) で計画</td></tr>
+<tr><td>2026-05-08</td><td>3a3826e</td><td>PR-A</td><td><code>common/src/audio_render.rs</code> を新設し、 <code>fade_envelope</code> / <code>pitch_ratio_for</code> を共通化。 <code>daw_audio::audio_clip_renderer</code> の 2 関数 (fade_envelope ローカル定義 + compile_audio_schedule 内 pitch 計算) と <code>daw_gui::AppData</code> の bounce_fade_env / bounce_clip_in_place 内 pitch 計算をすべて共通 helper に置換 (= PR9 で portion-wise port した重複を解消)。 12 件の unit test を <code>common::audio_render::tests</code> に追加 (Linear / Exp / SCurve fade、 Raw / Repitch / Stretch / Slice pitch、 endpoint / SR-mismatch 境界)。 build / clippy / test --features rt-assert all clean (= 既存 PDC / sidechain / split-glue integration test が pass、 ロジック不変の証明)</td></tr>
+<tr><td>2026-05-08</td><td>4401d59</td><td>PR-B</td><td>multi-clip drag の Undo step 統合。 batch AppEvent (<code>SetClipGainDbBatch(Vec&lt;(ClipRef, f32)&gt;)</code> / <code>SetClipFadeBeatsBatch(Vec&lt;(ClipRef, FadeEdgeKind, f64)&gt;)</code> / <code>SetClipFadeCurveBatch(Vec&lt;(ClipRef, FadeEdgeKind, FadeCurve)&gt;)</code>) を新設、 <code>is_undoable</code> 登録 = 1 release 1 Undo step。 <code>arrangement_view::make_edit::SetClipGainDb / SetClipFade / SetClipFadeCurve</code> を delta 列を Vec で集めて batch AppEvent 1 発に変換するよう書き換え。 単発 AppEvent (<code>SetClipGainDb</code> / <code>SetClipFadeIn/OutBeats</code> / <code>SetClipFadeIn/OutCurve</code>) は Inspector commit 経路で引き続き使用 (= 別系統)。 <code>FadeEdgeKind</code> enum を AppEvent module に追加 (widget 側 <code>FadeEdge</code> と 1:1)。 build / clippy / test --features rt-assert all clean</td></tr>
+<tr><td>2026-05-08</td><td>38b0a9b</td><td>PR-D 段階 1</td><td>Audio Editor の event 単位編集の基盤 (= multi-event clip を作る path)。 AppData に <code>audio_editor_selected_event: Option&lt;usize&gt;</code> 追加 (= clip 内 events Vec への index)、 AppEvent: <code>SelectAudioEditorEvent(Option&lt;usize&gt;)</code> (非 undoable view state) と <code>DuplicateAudioEditorEvent</code> (undoable) を追加。 handler <code>duplicate_audio_editor_event</code> は選択中 event を <code>event_start + event_length</code> の位置に複製、 同 source / 同パラメータ、 clip.length_beats を必要に応じて拡張 + selection を新 event に進める。 audio_editor.rs を multi-event 対応に書き換え (events.iter().enumerate() で各 event の rect を時間比で分割 + 選択中は <code>LineBatch</code> で 4 辺 border highlight)、 footer の source meta も選択中 event 参照 + event 数表示。 shortcuts.rs に <code>daw.duplicate_audio_event = Ctrl+D</code> を追加、 root.rs::dispatch_shortcuts で audio_editor_clip is Some のときだけ消費 (= 既存 D / Alt+D の clip duplicate と紛らわしくないよう gate)。 close_audio_editor は <code>audio_editor_selected_event = None</code> も clear。 段階 2 (event drag) / 段階 3 (event add / delete + context menu) は別 PR。 build / clippy / test --features rt-assert all clean</td></tr>
+<tr><td>2026-05-08</td><td>2675218</td><td>gui_01 #026 [Open]</td><td>caller 側 view 用 rect-based pointer hit-test API 要望投稿。 <code>Ui::take_primary_press_in_rect(rect)</code> (= single click 検出) と <code>Ui::take_drag_in_rect(id, rect)</code> (= drag session、 anchor / current / delta + Started/Continuing/Released kind) の 2 つを既存 <code>take_double_click_in_rect</code> の並びに追加してほしい。 Audio Editor の event click 選択 / 中央 drag 移動 / 左右端 drag trim / 空白領域 file drop で event 追加に必要、 PR-D 段階 2 / 3 のうち drag UI 部分は本要望マージ後に再開予定</td></tr>
+<tr><td>2026-05-08</td><td>(commit)</td><td>PR-D 段階 2</td><td>Inspector multi-event 対応 + event 選択 keyboard navigation。 <code>inspector_audio_event_summary</code> を「audio_editor_clip == selected_clip なら audio_editor_selected_event idx の event を返す、 さもなくば first event」 に拡張。 <code>audio_event_target_indices(target, n_events) -&gt; Range&lt;usize&gt;</code> helper + <code>mutate_audio_events_in_clip(target, f)</code> 集約 helper を新設、 既存 10 件の <code>set_clip_audio_event_*</code> (reversed / muted / stretch_mode / gain_db / pan / pitch_semitones / fade_in/out_beats / fade_in/out_curve) を helper 経由に書き換え (= audio_editor で event 選択中は 1 event のみ更新、 さもなくば全 event broadcast = 既存挙動互換)。 <code>next_audio_editor_event_idx(delta)</code> helper + shortcut <code>daw.next_audio_event = Ctrl+]</code> / <code>daw.prev_audio_event = Ctrl+[</code> を追加 (audio_editor_clip is Some 時のみ消費)、 wrap-around で event 選択を巡回。 これで Inspector 経由の個別 event 編集が動く。 drag UI 系は gui_01 #026 マージ後の段階 3 で。 build / clippy / test --features rt-assert all clean</td></tr>
+<tr><td>2026-05-13</td><td>8f8f730</td><td>Phase 5 完結</td><td>Step 5.2 SongTempo lane recording bypass wire — <code>daw_audio::engine::process_buffer</code> の <code>current_bpm</code> 計算で <code>recording_lanes.contains(&amp;(MASTER_TRACK_ID, AutomationTarget::SongTempo))</code> を判定、 該当中は <code>evaluate_song_tempo</code> を skip して <code>song.bpm</code> constant fallback。 transport BPM input drag 時の curve / drag 値の二重反映を抑止、 mixer fader Volume / Pan の <code>fill_track_param_ramps</code> bypass と同 idiom を Song-level に展開。 plan_automation.md §10 Phase 5 の残 smoke test 4 件 + bypass wire 1 件を整理 (smoke は user 判断で skip)、 Step 5.0 / 5.1 / 5.2 / 5.3 の全項目 [x] 化で Phase 5 (Tempo / TimeSig / Transport event) 完結</td></tr>
+<tr><td>2026-05-13</td><td>1520977</td><td>B1-T</td><td>VST3 <code>ProcessContext</code> per-buffer populate — <code>Vst3Plugin::process</code> が今まで <code>_transport: &amp;TransportContext</code> を無視 + <code>projectTimeSamples</code> を free-running していた問題を解消。 CLAP <code>build_clap_transport_event</code> と同 semantics で <code>TransportContext</code> から <code>tempo</code> / <code>timeSigNumerator</code> / <code>timeSigDenominator</code> / <code>projectTimeSamples</code> / <code>continousTimeSamples</code> / <code>projectTimeMusic</code> (拍位置) / <code>barPositionMusic</code> (直近 bar 開始拍) / <code>cycleStartMusic</code> / <code>cycleEndMusic</code> / <code>state</code> flags を populate。 state は <code>kTempoValid</code> / <code>kTimeSigValid</code> / <code>kProjectTimeMusicValid</code> / <code>kBarPositionValid</code> / <code>kCycleValid</code> / <code>kContTimeValid</code> 常時 ON、 <code>kPlaying</code> / <code>kCycleActive</code> を transport 状態依存。 これで FabFilter / Vital / Avenger 等の sync 系 VST3 plugin が host テンポ + bar position に追随</td></tr>
+<tr><td>2026-05-13</td><td>7a58e2c</td><td>B1-R</td><td>VST3 <code>set_render_mode</code> の no-op を解消 — VST3 spec の <code>IComponent::setIoMode</code> が <code>initialize</code> 前にしか呼べない (= active 中の動的切替は spec 違反) ため、 spec 準拠の代替として <code>ProcessData::processMode</code> を per-buffer で <code>kRealtime</code> / <code>kOffline</code> に切替。 <code>Vst3Plugin</code> に <code>render_mode: RenderMode</code> field 追加 (default Realtime)、 <code>set_render_mode</code> で field 更新 + tracing log + return true、 <code>process()</code> の <code>ProcessData</code> 構築時に match で processMode 切替。 多くの reverb / convolution / lookahead 系 plugin は process() の processMode を尊重 (= effect が plugin 依存で出る、 害は無い)。 残 B1 は B1-M (VST3 IMidiMapping、 B4 依存) のみ</td></tr>
+<tr><td>2026-05-13</td><td>e6d76c9</td><td>B3 Minimum</td><td>メトロノーム実装 — transport bar に "Click" toggle button (active 時 橙)、 audio engine で beat 境界ごとに internal click 音 (sine + linear envelope decay、 accent: downbeat 880Hz / 他 440Hz、 40ms decay、 amp peak 0.25 = -12 dB、 mono → L/R 均等 mix) を master mix 最終段に重ねる。 <code>MainToChild::SetMetronomeEnabled(bool)</code> IPC + <code>SharedState.metronome_enabled: AtomicBool</code> + <code>LocalState.metronome_voice: Option&lt;ClickVoice&gt;</code> + <code>engine::render_metronome</code> (buffer 範囲内の全 beat 境界で voice trigger、 既存 voice overwrite の業界標準 idiom)。 master mix 最終段なので track の mute / solo / volume の影響を受けず常に guide が聞こえる。 export 中 / playing でない / disabled で skip = CPU 0。 session-only state。 count-in 1 / 2 小節 は B2 (録音) と同時実装に分離</td></tr>
+<tr><td>2026-05-13</td><td>08ffa94</td><td>B4 Step A</td><td>Track.armed schema + IPC + handler。 <code>common::model::Track.armed: bool</code> (CURRENT_VERSION 8 → 9、 v8 forward-migrate で false default)、 <code>MainToChild::SetTrackArmed { track, armed }</code> + daw_audio handler、 <code>AppEvent::ToggleTrackArmed(u32)</code> + <code>fn toggle_track_armed</code> (mute/solo と同 idiom)。 R button widget は gui_01 #040 で要望</td></tr>
+<tr><td>2026-05-13</td><td>10d6f3f</td><td>B4 Step A 完結</td><td>gui_01 #040 reply 取り込み + arrangement_view wire 2 行 (<code>armed: t.armed</code> + <code>ToggleTrackArmed</code> arm) で R button 動作。 widget M14 Phase 68 で R button + armed_button style + track header layout (M / S / R 並び) + 3 段独立 hint 帯 が landing。 plan_b4_midi §12 Step A を [x] 化、 #040 を archive_001.md に切り出し</td></tr>
+<tr><td>2026-05-13</td><td>56213f8</td><td>B4 Step C + D</td><td>count-in + Record button + audio engine preroll + 録音書き込み。 <code>MainToChild::StartCountIn { samples }</code> IPC、 <code>EngineShared.preroll_total/remaining_samples</code> + <code>audio_bridge::preroll_remaining_samples</code> mirror、 audio engine の <code>process_buffer</code> 頭で preroll &gt; 0 ブランチ (= 通常 dispatch / clip render skip + metronome のみ render)、 GUI on_tick で midi_recording_pending &amp;&amp; preroll == 0 で midi_recording 昇格、 metronome は count-in 中だけ強制 ON で <code>metronome_enabled_pre_recording</code> snapshot 経由復元。 <code>handle_midi_note_on/off</code> を 2 mode 化 (= 既存 step_input_note_on 抽出、 録音 mode は <code>record_midi_note_on/off</code> で armed track 全てに対し note_on で仮 length 0.05 で push / note_off で length 確定)、 <code>ensure_midi_clip_at_playhead</code> で MIDI clip auto-extend / 新規 4 beat clip 作成。 transport bar に Count-in dropdown + Record toggle button (record red、 active 時 「● Rec」 / count-in 中 「Count-in...」)。 Step B (midir listener) は既存実装で完結確認のみ</td></tr>
+<tr><td>2026-05-13</td><td>a67c3fb</td><td>B4 Step E + Minimum 完了</td><td>MIDI export (SMF format 1)。 <code>midly = "0.5"</code> 依存追加、 <code>daw_gui::midi_export::export_midi(song, path)</code> で PPQ 480 / 全 MIDI track 並列出力 / track 0 = tempo + time_sig meta。 <code>MidiContent</code> clip だけ events 化、 audio / automation clip は skip、 同 tick 内は NoteOff → NoteOn 順に sort。 <code>AppEvent::ExportMidi</code> + <code>action_export_midi</code> (rfd <code>.mid</code> save dialog)、 File menu に "Export MIDI..." 項目追加。 4 件 unit test (empty SMF / 1 note roundtrip / audio-only skip / beat→tick / denom→log2)。 plan_b4_midi.md §12 Step E [x] 化、 plan.md Phase 7 B4 を「Minimum 完了」 化。 残 (extended): MIDI device 選択 / punch in/out / per-track export / B1-M (VST3 IMidiMapping)</td></tr>
+<tr><td>2026-05-13</td><td>976ba22</td><td>B1-M Step 1</td><td>MIDI CC dispatch + AppEvent::MidiControlChange + dummy CC1→TrackVolume binding。 <code>daw_gui/src/midi.rs::dispatch</code> を MIDI CC (0xB0..0xBF) 対応に拡張、 channel (0..15) 抽出。 <code>AppEvent::MidiControlChange { channel, controller, value }</code> 追加。 <code>handle_midi_control_change</code> 段階 1 dummy = CC 1 → 最初の selected_track の Volume にマップ</td></tr>
+<tr><td>2026-05-13</td><td>99e4fc3</td><td>B1-M Step 2 + 3</td><td>MidiBinding データ型 + Learn UI + Project 永続化 (CURRENT_VERSION 9→10)。 <code>common::model::BindingTarget</code> enum (TrackVolume / TrackPan / SongTempo) + <code>MidiBinding { channel, controller, target }</code> + <code>Song.midi_bindings</code> 追加 (v9 forward-migrate で空 Vec)。 <code>AppData.midi_learn_target</code> + <code>AppEvent::StartMidiLearn</code> / <code>CancelMidiLearn</code> / <code>RemoveMidiBinding</code> + handler 拡張 (Learn mode で binding push / 通常 lookup で apply_midi_value_to_target 経由値送信)。 transport bar に MIDI Learn toggle button (active 時 「Learning...」、 click で selected_track の Volume を Learn target に or Cancel)。 channel = 16 は any-channel match</td></tr>
+<tr><td>2026-05-13</td><td>5ac26d7</td><td>B1-M Step 4 minimum 完了</td><td><code>BindingTarget::PluginParam { track, slot, param_id }</code> 追加 (CURRENT_VERSION 10 維持、 enum variant 追加は project 互換)、 <code>apply_midi_value_to_target</code> で PluginParam case = tracing::warn (= bind data は永続化されるが actual injection は extended scope)。 plan.md B1 セクション update — B1-M minimum 完了マーク + extended scope 4 項目 (Plugin actual injection / IMidiMapping query / per-knob Learn UI / Binding list view) を明記。 残 extended は別フェーズで実装、 audio thread への RT-safe IPC + IParameterChanges integration が必要</td></tr>
+<tr><td>2026-05-14</td><td>08bfc31</td><td>Undo polish</td><td><a href="plan_undo_reconcile_polish.md">plan_undo_reconcile_polish.md</a> 新設 + 3 PR 完了。 PR-1 (Risk B): <code>pending_state_request: Option&lt;_&gt;</code> → <code>pending_state_queue: VecDeque&lt;_&gt;</code>、 <code>enqueue_state_request</code> helper で連続 deferred edit を queue 経由でシリアライズ (= 2 番目以降も自前 state snapshot を持つ)、 <code>on_all_states_from_child</code> で pop_front + 残り queue 用に再 <code>RequestAllStates</code>。 test <code>pending_state_queue.rs</code>。 PR-2 (Risk D): reconcile Phase B を <code>compute_slot_reconcile_actions(&amp;Song, &amp;HashMap) -&gt; Vec&lt;SlotReconcileAction&gt;</code> 純粋関数に抽出、 <code>SlotReconcileAction::{RemoveSlot, LoadSlot}</code> enum、 5 unit test (<code>reconcile_slot_diff.rs</code>)。 PR-3 (Risk E): <code>after_undo_redo</code> の reconcile に <code>Instant</code> 計測 + <code>tracing::info!(target: "daw_gui::app::undo_perf", elapsed_us = ...)</code>、 plugin chain 不変の Undo は slot-level diff で no-op に落ちることを test <code>matching_slot_produces_no_action</code> で保証</td></tr>
+</tbody>
+</table>
+
+</body>
+</html>

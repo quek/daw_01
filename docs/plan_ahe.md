@@ -41,7 +41,7 @@
 - **status line** 未設定
 - **slash command** は Anthropic 標準のみ
 - **scheduled task** 未活用
-- **plan.md ↔ git log ↔ gui_01_conversation.md** の三者同期が手動
+- **plan.html ↔ git log ↔ gui_01_conversation.md** の三者同期が手動
 - **メトリクス計測**ゼロ（何が効いているか定量データなし）
 - **reflection / 自己改善ループ**ゼロ
 
@@ -173,7 +173,7 @@
 | Permissions | `.claude/settings.local.json` | 83 | ◎ | 84 項目 |
 | Cross-repo | `.claude/settings.json` | 5 | ○ | gui_01 への additionalDirectories のみ |
 | User memory | `~/.claude/projects/.../memory/` | 26 entries | ◎ | language / feedback / project / reference |
-| Master plan | `docs/plan.md` | 23 KB | ◎ | M1 完成までの phase マップ |
+| Master plan | `docs/plan.html` | 23 KB | ◎ | M1 完成までの phase マップ |
 | Phase plan | `docs/plan_a1〜a7_*.md` | 計 1300+ 行 | ◎ | a1 のみ進行中 |
 | Cross-AI 会話 | `docs/gui_01_conversation.md` | 802 | ◎ | `#NNN [Open/Replied/Resolved]` 双方向 |
 | Anthropic 系 skill | `~/.claude/skills/anthropic-skills/{consolidate-memory, skill-creator, ...}` | (provided) | ◎ | 自己改善の素材として活用候補 |
@@ -243,7 +243,7 @@ L0 ──────● L1 ──────── L2 ────────
 - **差分**: gui_01 が即座に新規 Open 認識
 - **注意**: gui_01 側との合意が必要
 
-### H3. PostToolUse hook: plan.md 進捗自動追記
+### H3. PostToolUse hook: plan.html 進捗自動追記
 
 - **一言**: `Edit`/`Write` で対応 phase 領域を変更したら checklist 自動更新
 - **主目的**: 認知負荷削減 + 再現性
@@ -281,7 +281,7 @@ L0 ──────● L1 ──────── L2 ────────
 
 ### H7. sub-agent: docs-syncer
 
-- **一言**: plan.md / plan_aN_*.md / CLAUDE.md / conversation の整合性チェック専任
+- **一言**: plan.html / plan_aN_*.md / CLAUDE.md / conversation の整合性チェック専任
 - **主目的**: 再現性
 - **触る対象**: `.claude/agents/docs-syncer.md`
 - **現状**: 整合性は手動で気を付ける
@@ -302,7 +302,7 @@ L0 ──────● L1 ──────── L2 ────────
 - **一言**: 全 phase の checklist 完了率を一覧出力
 - **主目的**: 認知負荷削減
 - **触る対象**: `.claude/commands/plan-status.md`
-- **現状**: plan.md を毎回 grep / read
+- **現状**: plan.html を毎回 grep / read
 - **差分**: 1 コマンドで全 phase 進捗が見える
 - **注意**: 完了率の定義を一意に
 
@@ -453,7 +453,7 @@ Priority = Impact × 1.0
 | **H9** | slash `/plan-status` | 3 | 1 | 1 | 5 | 2 | **4.6** |
 | **H11** | MCP: rust-analyzer | 5 | 4 | 2 | 4 | 5 | **4.5** |
 | **H1** | pre-commit hook | 5 | 2 | 3 | 5 | 3 | **4.4** |
-| **H3** | PostToolUse: plan.md 進捗 | 4 | 3 | 2 | 5 | 4 | **4.2** |
+| **H3** | PostToolUse: plan.html 進捗 | 4 | 3 | 2 | 5 | 4 | **4.2** |
 | **H4** | UserPromptSubmit: VOICEVOX 死活 | 2 | 1 | 1 | 5 | 3 | **3.9** |
 | **H12** | scheduled: cargo audit | 2 | 2 | 1 | 5 | 3 | **3.4** |
 | **H7** | sub-agent: docs-syncer | 3 | 3 | 2 | 5 | 4 | **3.2** |
@@ -540,7 +540,7 @@ graph LR
 |---|---|---|---|
 | H5 status line | いつでも | プロンプト時に engine / phase 表示 | script + statusLine 行削除 |
 | H10 /conv-poll | gui_01 と Open/Reply が滞ったとき | `/conv-poll` で Replied 一覧 | commands/conv-poll.md 削除 |
-| H9 /plan-status | plan.md が 5 ファイル超えたら | `/plan-status` で完了率出る | commands/plan-status.md 削除 |
+| H9 /plan-status | plan.html が 5 ファイル超えたら | `/plan-status` で完了率出る | commands/plan-status.md 削除 |
 | H1 pre-commit (warn) | RT-audio commit で clippy 漏れがあったとき | `git commit` で `cargo clippy` 自動、warn モード | settings.json から hooks 削除 |
 
 **Phase 1 完了基準**: 4 つが動作、1 週間使って実用感得る。
@@ -663,7 +663,7 @@ graph LR
 | GitHub Actions 大規模 CI matrix | 個人開発、Windows 単一環境で十分 | コラボ参加者 2 人以上 |
 | PR review bot | PR を開いていない | `gh pr` workflow 移行 |
 | Telemetry collector（外部送信） | 個人 PC のローカル log で十分（H13 の代替） | チーム化で集約必要 |
-| Issue tracker 連携 MCP (Jira / Linear) | docs/plan*.md で十分 | plan.md が 50 ファイル超 |
+| Issue tracker 連携 MCP (Jira / Linear) | docs/plan*.md で十分 | plan.html が 50 ファイル超 |
 | Vector DB / 全文検索 MCP | Grep / Glob で十分 | repo 100k 行超 |
 | **L4 完全自律（自己 permission 拡張、自己 agent 削除）** | reliability / debug 性 / 安全性で個人開発に不適 | reliability 研究の breakthrough、もしくは Anthropic 公式の self-modify framework が成熟 |
 | **gui_01 への autonomous push** | 双方向 autonomous loop は干渉リスク高 | 双方の autonomy が L3 で安定し、衝突 protocol が成熟 |
@@ -738,7 +738,7 @@ graph LR
 - 候補: status line (H5) / hook (H4) / sub-agent / 独立 daemon
 - 暫定: H5 表示 + H4 注入の両方持つ
 
-### Q3. plan.md 進捗更新（H3）の自動判定基準
+### Q3. plan.html 進捗更新（H3）の自動判定基準
 - 候補: commit message 解析 / file path から phase 推定 / 手動確認 prompt
 - 暫定: Phase 2 で「候補表示のみ、commit は手動」で開始
 
@@ -787,7 +787,7 @@ graph LR
 - daw_01 CLAUDE.md: `F:\dev\daw_01\CLAUDE.md`
 - daw_01 既存 skill: `F:\dev\daw_01\.claude\skills\`
 - gui_01 対応資産: `F:\dev\gui_01\.claude\skills\`, `F:\dev\gui_01\docs\`
-- Master plan: `F:\dev\daw_01\docs\plan.md`
+- Master plan: `F:\dev\daw_01\docs\plan.html`
 - Cross-AI conversation: `F:\dev\daw_01\docs\gui_01_conversation.md`
 - Anthropic skill (reflection 道具): `~/.claude/skills/anthropic-skills/{skill-creator, consolidate-memory}`
 

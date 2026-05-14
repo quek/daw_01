@@ -1,6 +1,6 @@
 # Undo/Redo plugin sync polish 計画
 
-ステータス: **着手中** (2026-05-14)。 [`plan.md`](plan.md) §「Undo/Redo plugin
+ステータス: **着手中** (2026-05-14)。 [`plan.html`](plan.html) §「Undo/Redo plugin
 sync の残リスク」 で挙げた残 3 件 (B / D / E) を片付ける小規模 polish。 機能
 追加なし、 既存挙動の堅牢化と test 整備のみ。
 

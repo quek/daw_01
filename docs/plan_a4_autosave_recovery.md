@@ -2,7 +2,7 @@
 
 ## Context
 
-`docs/plan.md` Phase 6 の A4。 既存の autosave (30s tick → 60s throttle で `<file_path>.autosave.daw` に save) は **file_path が Some のときだけ動作**、 未保存ファイルは autosave されない。 また起動時の復元 modal、 正常終了時の autosave 削除が未実装。
+`docs/plan.html` Phase 6 の A4。 既存の autosave (30s tick → 60s throttle で `<file_path>.autosave.daw` に save) は **file_path が Some のときだけ動作**、 未保存ファイルは autosave されない。 また起動時の復元 modal、 正常終了時の autosave 削除が未実装。
 
 `maybe_autosave` (app.rs:1121-1152) と `spawn_autosave_timer` (main.rs:434-443) は既にあるので、 不足分の追加が中心。
 

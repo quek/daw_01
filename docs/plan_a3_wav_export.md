@@ -218,7 +218,7 @@ status bar に「Export 中」 表示 + 完了メッセージ。
 
 ## 参照
 
-- master plan: [docs/plan.md](plan.md) A3 セクション
+- master plan: [docs/plan.html](plan.html) A3 セクション
 - A2 完了 commit: d7a7575
 - Ardour Export Dialog manual: https://manual.ardour.org/exporting/export-dialog/
 - CLAP render ext: https://github.com/free-audio/clap/blob/main/include/clap/ext/render.h
