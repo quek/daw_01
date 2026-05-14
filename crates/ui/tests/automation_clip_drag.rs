@@ -73,6 +73,7 @@ fn make_track(id: u32, lanes: Vec<ArrangementAutomationLane>) -> ArrangementTrac
         name: Arc::from(format!("t{id}")),
         muted: false,
         solo: false,
+        armed: false,
         clips: Vec::<ArrangementClip>::new(),
         volume: 1.0,
         parent_id: None,

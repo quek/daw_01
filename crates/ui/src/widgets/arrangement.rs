@@ -125,7 +125,7 @@ pub struct ArrangementClip {
 
 /// 1 つの track。`clips` は `start_beat` 昇順前提。
 ///
-/// `muted` / `solo` / `collapsed` / `automation_lanes_collapsed` は意味的に独立した bool 状態
+/// `muted` / `solo` / `armed` / `collapsed` / `automation_lanes_collapsed` は意味的に独立した bool 状態
 /// (集約の余地がない、 Bitwig / Reaper の track schema と整合) なので `clippy::struct_excessive_bools`
 /// を allow する。
 #[allow(clippy::struct_excessive_bools)]
@@ -135,6 +135,12 @@ pub struct ArrangementTrack {
     pub name: Arc<str>,
     pub muted: bool,
     pub solo: bool,
+    /// M14 Phase 68 (#040): Record-arm 状態。 `true` で track header に R button が active 描画され、
+    /// caller (audio engine) は armed track のみを録音入力 (MIDI device / audio input) の対象とする
+    /// (Bitwig / Live / Reaper と同 idiom)。 mute / solo と独立 (排他なし、 任意数の track を armed に
+    /// できる)。 widget は R button の click で `ArrangementEditRequest::ToggleTrackArmed(track_id)` を
+    /// 発行し、 caller が `track.armed = !track.armed` で反転する (mute / solo と完全同 idiom)。
+    pub armed: bool,
     pub clips: Vec<ArrangementClip>,
     /// M10 Phase 47b: track volume (`0.0..=1.0`、`1.0` で unity)。
     /// track header rect 内 buttons の下に horizontal slider band として描画される (`row_h` 余裕がある時のみ)。
@@ -544,6 +550,11 @@ pub enum ArrangementEditRequest {
     SetTrackVolume { track: u32, prev: f32, next: f32 },
     ToggleTrackMute(u32),
     ToggleTrackSolo(u32),
+    /// M14 Phase 68 (#040): track header の R button click。 caller は `track.armed = !track.armed` で
+    /// 反転する (mute / solo と完全同 idiom、 任意数の track を armed にできる排他なしの toggle)。
+    /// armed track のみが audio engine の録音入力 (MIDI device / audio input) 対象 (Bitwig / Live /
+    /// Reaper と同 idiom)。
+    ToggleTrackArmed(u32),
     SetLoopRange { start: f64, end: f64 },
     /// M14 Phase 63j (#024): ruler 上 click / drag による playhead seek 要求。 caller は
     /// (a) `view.playhead_beat = Some(beat)` 更新 (b) audio engine への seek IPC 送信に変換する。
@@ -860,6 +871,10 @@ pub struct ArrangementStyle {
     pub track_text_size: f32,
     pub mute_hint: Color,
     pub solo_hint: Color,
+    /// M14 Phase 68 (#040): R button が active な track 行下端に積まれる 1px 帯の色。 mute_hint (赤系) /
+    /// solo_hint (黄系) と視覚区別するため業界標準の record red (= 鮮やかな赤) を default。
+    /// mute / solo と独立した独自帯として `mute_solo_hint_h` 帯の更に上に積まれる。
+    pub armed_hint: Color,
     pub mute_solo_hint_h: f32,
     pub playhead_color: Color,
     pub playhead_width_px: f32,
@@ -872,6 +887,9 @@ pub struct ArrangementStyle {
     pub resize_handle_px: f32,
     pub mute_button: ToggleButtonStyle,
     pub solo_button: ToggleButtonStyle,
+    /// M14 Phase 68 (#040): R button (Record-arm toggle) のスタイル。 mute_button / solo_button と
+    /// 同 1:1 idiom、 default は active 時 record red (鮮やかな赤)、 hint_band は更に明るい赤系。
+    pub armed_button: ToggleButtonStyle,
     /// M10 Phase 46: track header drag&drop 時に drop 位置 (target row の上 edge) に描く横 line の色。
     pub reorder_drop_indicator: Color,
     /// drop indicator の縦幅 (px)。
@@ -1069,6 +1087,19 @@ impl Default for ArrangementStyle {
             font_size: 11.0,
             text_color: Color::rgb(0.95, 0.95, 0.97),
         };
+        // M14 Phase 68 (#040): R button (Record-arm)。 default は record red (active = 鮮やかな赤、
+        // off = mute / solo と同 neutral 灰)。 hint_band は更に明るい赤で「録音中」 を強調。
+        let armed_button = ToggleButtonStyle {
+            off_color: Color::rgb(0.18, 0.20, 0.24),
+            on_color: Color::rgb(0.65, 0.18, 0.18),
+            hint_band: Some(Color::rgb(1.0, 0.30, 0.30)),
+            hint_band_h: 3.0,
+            border: Color::rgb(0.30, 0.32, 0.36),
+            border_width: 1.0,
+            radius: 3.0,
+            font_size: 11.0,
+            text_color: Color::rgb(0.95, 0.95, 0.97),
+        };
         Self {
             bg: Color::rgb(0.10, 0.11, 0.13),
             header_bg: Color::rgb(0.14, 0.15, 0.18),
@@ -1093,6 +1124,9 @@ impl Default for ArrangementStyle {
             track_text_size: 12.0,
             mute_hint: Color::rgba(1.0, 0.30, 0.20, 0.60),
             solo_hint: Color::rgba(1.0, 0.85, 0.20, 0.60),
+            // M14 Phase 68 (#040): R button active 時の track 行下端帯。 mute_hint (オレンジ赤) / solo_hint
+            // (黄) と色相を分け、 鮮やかな record red (= 業界標準) で「録音 arm」 を強調。
+            armed_hint: Color::rgba(1.0, 0.15, 0.15, 0.70),
             mute_solo_hint_h: 3.0,
             playhead_color: Color::rgb(1.0, 0.25, 0.10),
             playhead_width_px: 2.5,
@@ -1102,6 +1136,7 @@ impl Default for ArrangementStyle {
             resize_handle_px: 4.0,
             mute_button,
             solo_button,
+            armed_button,
             reorder_drop_indicator: Color::rgb(0.50, 0.85, 1.0),
             reorder_drop_indicator_h: 2.0,
             reorder_drag_alpha: 0.6,
@@ -1318,6 +1353,10 @@ fn synthesize_master_track(master: &ArrangementMasterRow) -> ArrangementTrack {
         name: Arc::from("Master"),
         muted: false,
         solo: false,
+        // M14 Phase 68 (#040): master row は録音対象になり得ない (audio engine 仕様 + Bitwig / Reaper 流)、
+        // 強制 `false` 固定。 widget 側で master 行の R button hit は通常 track と同様に発火するが、
+        // caller (daw_01) 側が master_id を弾く idiom (mute / solo と同じ取り扱い)。
+        armed: false,
         clips: Vec::new(),
         volume: 1.0,
         parent_id: None,
@@ -1692,15 +1731,15 @@ pub fn apply_reorder<T: Clone>(items: &[T], anchor_index: usize, target_index: u
     v
 }
 
-/// track header 1 行内のレイアウト (Name button + 2 small buttons + 任意の volume band + lane disclosure)。
-/// `name_rect` (= drag start zone & text area)、`buttons` (= [M, S]、Phase 47c で ↑/↓/× は drag&drop +
-/// Delete shortcut に置換され削除)、`volume_band` は inner 下部に band 用の余裕がある時のみ `Some` (Phase 47b)、
-/// `lane_disc_rect` は M14 Phase 63n-2 で S button の **右** に予約された lane disclosure
-/// (`+`/`-` icon) 用の rect (track_row 全体の右端、 automation_lanes が空でも常に layout に含めて
-/// 名前領域を一定にする)。
+/// track header 1 行内のレイアウト (Name button + 3 small buttons + 任意の volume band + lane disclosure)。
+/// `name_rect` (= drag start zone & text area)、`buttons` (= [M, S, R]、Phase 68 で R button = Record-arm 追加。
+/// Phase 47c で ↑/↓/× は drag&drop + Delete shortcut に置換され削除済)、`volume_band` は inner 下部に band 用の
+/// 余裕がある時のみ `Some` (Phase 47b)、`lane_disc_rect` は M14 Phase 63n-2 で R button の **右** に予約された
+/// lane disclosure (`+`/`-` icon) 用の rect (track_row 全体の右端、 automation_lanes が空でも常に layout に
+/// 含めて名前領域を一定にする)。
 struct HeaderRowLayout {
     name_rect: Rect,
-    buttons: [Rect; 2],
+    buttons: [Rect; 3],
     /// M10 Phase 47b: track volume band rect (`row_h` 余裕がある時のみ Some)。
     volume_band: Option<Rect>,
     /// M14 Phase 63n-2 (#028): lane disclosure (`+`/`-` toggle) の hit zone + 描画 rect。
@@ -1722,10 +1761,10 @@ fn header_row_layout(row: Rect, volume_band_h: f32) -> HeaderRowLayout {
     let btn_h = inner.h.min(20.0);
     let small = 22.0_f32;
     let gap = 2.0_f32;
-    // Phase 47c: M + S の 2 button (← Phase 45e の name + M + S + ↑ + ↓ + × の 6 button から削減)。
-    // ↑/↓ は drag&drop reorder (Phase 46) で代替、× は Delete shortcut (Phase 47c) で代替。
-    let n_btn = 2;
-    // M14 Phase 63n-2 (#028): lane disclosure 用の幅を予約 (= disc_size + gap)。 S button の右に
+    // Phase 68 (#040): M + S + R の 3 button (← Phase 47c の M + S 2 button 構成から R = Record-arm を追加)。
+    // 並び順は業界標準の M / S / R (Bitwig / Live / Reaper と同じ、 左→右)。
+    let n_btn = 3;
+    // M14 Phase 63n-2 (#028): lane disclosure 用の幅を予約 (= disc_size + gap)。 R button の右に
     // 配置するため `total_right` に加算 → name_rect が縮む代わりに lane_disc が button と重ならない。
     let lane_disc_size = 12.0_f32;
     let lane_disc_extra = lane_disc_size + gap;
@@ -1734,7 +1773,7 @@ fn header_row_layout(row: Rect, volume_band_h: f32) -> HeaderRowLayout {
     let name_w = (inner.w - total_right).max(20.0);
     let name_rect = Rect { x: inner.x, y: inner.y, w: name_w, h: btn_h };
     let mut x_cursor = inner.x + name_w + gap;
-    let mut buttons = [Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }; 2];
+    let mut buttons = [Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }; 3];
     for slot in &mut buttons {
         *slot = Rect { x: x_cursor, y: inner.y, w: small, h: btn_h };
         x_cursor += small + gap;
@@ -2513,6 +2552,20 @@ fn draw_lanes_bg<M: ?Sized + 'static>(
                     h: style.mute_solo_hint_h,
                 },
                 style.solo_hint,
+            );
+        }
+        // M14 Phase 68 (#040): armed 帯 (= R button active 時)。 mute / solo の hint 帯の上に
+        // 同 1px gap で積み、 3 段すべてが独立 toggle で見えるようにする (Bitwig / Live と同 idiom)。
+        if t.armed {
+            push_filled_rect(
+                hctx,
+                Rect {
+                    x: row.x,
+                    y: row.y + row.h - style.mute_solo_hint_h * 3.0 - 2.0,
+                    w: row.w,
+                    h: style.mute_solo_hint_h,
+                },
+                style.armed_hint,
             );
         }
         // row 下端 separator
@@ -7506,7 +7559,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 };
                 let layout = header_row_layout(row_for_layout, style.track_volume_band_h);
                 let name_rect = layout.name_rect;
-                let [m_rect, s_rect] = layout.buttons;
+                let [m_rect, s_rect, r_rect] = layout.buttons;
 
                 // M10 Phase 47b: track volume band 描画。
                 // drag 中の track はその drag session の last_mouse_x で preview volume を計算 (リアルタイム feedback)。
@@ -7589,15 +7642,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 } else {
                     name_rect
                 };
-                let button_zones: [Rect; 3] = [name_rect_visible, m_rect, s_rect];
+                let button_zones: [Rect; 4] = [name_rect_visible, m_rect, s_rect, r_rect];
 
                 let id_name = ("arr_tname", t.id);
                 let id_mute = ("arr_tmute", t.id);
                 let id_solo = ("arr_tsolo", t.id);
+                let id_armed = ("arr_tarmed", t.id);
 
                 let track_id = t.id;
                 let muted = t.muted;
                 let solo = t.solo;
+                let armed = t.armed;
 
                 let name_text = t.name.clone();
                 // M14 Phase 63c (#016): name 領域 click は modifier-aware SelectTrack を loop 後に
@@ -7614,6 +7669,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 });
                 self.toggle_button_at(id_solo, "S", s_rect, solo, &style.solo_button, |_| {
                     make_edit(ArrangementEditRequest::ToggleTrackSolo(track_id))
+                });
+                // M14 Phase 68 (#040): R button (Record-arm)。 mute / solo と完全同 idiom、
+                // armed track のみが audio engine の録音入力対象 (caller 仕様)。
+                self.toggle_button_at(id_armed, "R", r_rect, armed, &style.armed_button, |_| {
+                    make_edit(ArrangementEditRequest::ToggleTrackArmed(track_id))
                 });
                 // Phase 47c: ↑/↓/× button は削除 (drag&drop reorder + Delete shortcut で代替)。
                 // `MoveTrackUp/Down` / `DeleteTrack` Edit variants は context menu / keyboard 用に残す。
@@ -7892,6 +7952,7 @@ mod tests {
             name: Arc::from(name),
             muted: false,
             solo: false,
+            armed: false,
             clips,
             volume: 1.0,
             parent_id: None,
@@ -8963,6 +9024,7 @@ mod tests {
             name: Arc::from(name),
             muted: false,
             solo: false,
+            armed: false,
             clips: Vec::new(),
             volume: 1.0,
             parent_id,

@@ -247,6 +247,9 @@ fn main() {
                     ArrangementEditRequest::ToggleTrackSolo(_) => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
+                    ArrangementEditRequest::ToggleTrackArmed(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
                     ArrangementEditRequest::SetLoopRange { .. } => {
                         Edit::mutate(|_m: &mut Model| {})
                     }

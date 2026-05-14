@@ -65,6 +65,9 @@ struct DawTrack {
     name: Arc<str>,
     muted: bool,
     solo: bool,
+    /// M14 Phase 68 (#040): Record-arm 状態。 audio engine を持たない prototype では純粋に
+    /// `track.armed` の toggle を model 側に反映するだけ (= ArrangementTrack の R button 動作 demo)。
+    armed: bool,
     next_clip_id: u32,
     clips: Vec<DawClip>,
     /// M10 Phase 47b: track volume (`0.0..=1.0`、`1.0` で unity)。
@@ -194,6 +197,7 @@ impl DawModel {
                 name: Arc::from(name),
                 muted: false,
                 solo: false,
+                armed: false,
                 next_clip_id: 2,
                 clips,
                 volume: 0.75,
@@ -819,6 +823,7 @@ fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
             name: Arc::clone(&t.name),
             muted: t.muted,
             solo: t.solo,
+            armed: t.armed,
             volume: t.volume,
             clips: t
                 .clips
@@ -1511,6 +1516,13 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 }
                 mm.arr_view.data_generation += 1;
                 mm.last_action = format!("arr: ToggleSolo {id}");
+            }),
+            ArrangementEditRequest::ToggleTrackArmed(id) => Edit::mutate(move |mm: &mut DawModel| {
+                if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == id) {
+                    t.armed = !t.armed;
+                }
+                mm.arr_view.data_generation += 1;
+                mm.last_action = format!("arr: ToggleArmed {id}");
             }),
             ArrangementEditRequest::SetLoopRange { start, end } => Edit::mutate(move |mm: &mut DawModel| {
                 let (lo, hi) = if start <= end { (start, end) } else { (end, start) };

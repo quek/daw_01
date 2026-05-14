@@ -86,6 +86,7 @@ fn arr_model() -> ArrModel {
         name: Arc::from("t1"),
         muted: false,
         solo: false,
+        armed: false,
         clips: vec![ArrangementClip {
             id: 100,
             start_beat: 4.0,
