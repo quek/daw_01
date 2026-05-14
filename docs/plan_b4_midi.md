@@ -253,7 +253,13 @@ count-in 中の audio thread: 既存 `playhead < 0` を `playing && !cmd_to_rend
 
 ## 12. 進捗
 
-- [ ] Step A (Track.armed + R button UI)
+- [x] Step A (Track.armed + R button UI) — commit `08ffa94` (schema + IPC +
+      handler) + 本 commit (gui_01 #040 [Resolved]、 caller wire の 2 行追加)。
+      gui_01 widget M14 Phase 68 で R button + `armed_button` style + track
+      header layout (M / S / R 並び) + 行下端 hint 帯 (mute / solo / armed の
+      3 段独立) が landing 済、 daw_01 caller は `arrangement_view.rs` で
+      `ArrangementTrack { ..., armed: t.armed, .. }` + `ToggleTrackArmed(track_id)
+      → AppEvent::ToggleTrackArmed` の 2 行 wire のみで完了
 - [ ] Step B (midir input listener)
 - [ ] Step C (count-in + Record button + audio engine 拡張)
 - [ ] Step D (録音書き込み)

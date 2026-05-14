@@ -7912,3 +7912,160 @@ daw_01 では Open Recent / Recently Saved を sub_menu 構成に戻して動作
   はず。
 - gui_01 #036 (line AA shader) / #037 (cascade 兄弟排他) と並ぶ menu_bar 周辺の
   重要 bug。
+
+## #040 [Resolved] 2026-05-13 [要望] `ArrangementTrack` に Record-arm (R) button + `SetTrackArmed` EditRequest
+
+### daw_01 →
+
+- 種別: [要望]
+- 関連 gui_01: [`crates/ui/src/widgets/arrangement.rs:136`](../../gui_01/crates/ui/src/widgets/arrangement.rs:136) (`pub muted: bool` / `pub solo: bool` の同 idiom) + [`arrangement.rs:862`](../../gui_01/crates/ui/src/widgets/arrangement.rs:862) (`solo_hint` / `solo_button` style)
+- 関連 daw_01: [`daw_gui/src/view/arrangement_view.rs`](../daw_gui/src/view/arrangement_view.rs) (caller wire) + [`daw_gui/src/app.rs`](../daw_gui/src/app.rs) (AppEvent::SetTrackArmed)
+- 関連仕様: [`docs/plan_b4_midi.md`](plan_b4_midi.md) §3.1 + §7.1 (B4 minimum scope の前提)
+
+#### 背景
+
+daw_01 で B4 (MIDI 録音 / MIDI export) を実装中 ([plan_b4_midi.md](plan_b4_midi.md))。 業界標準 (Bitwig / Live / Reaper) どおり **track-arm** (= 「録音対象 track」 を user が選択する状態) を track header の R button で表現したい。 現状 `ArrangementTrack` に `muted: bool` / `solo: bool` はあるが `armed: bool` 相当の field が無い。
+
+mute / solo と完全同 idiom で R button を追加してほしい。
+
+#### 要望
+
+##### A. `ArrangementTrack` に `armed: bool` field 追加 (breaking)
+
+```rust
+pub struct ArrangementTrack {
+    // 既存
+    pub muted: bool,
+    pub solo: bool,
+
+    /// M14 Phase 6X (#040): MIDI / Audio 録音の「録音対象」 トラック (=
+    /// Record-arm)。 track header の R button で toggle、 armed track のみが
+    /// 録音入力 (MIDI device / audio input) を受け取る (Bitwig / Live /
+    /// Reaper と同 idiom)。
+    pub armed: bool,
+}
+```
+
+##### B. `ArrangementEditRequest::SetTrackArmed` 追加
+
+```rust
+pub enum ArrangementEditRequest {
+    // 既存
+    SetTrackMuted { track: u32, muted: bool },
+    SetTrackSolo { track: u32, solo: bool },
+
+    /// M14 Phase 6X (#040): track header の R button click。 caller は
+    /// `ArrangementTrack.armed` を `armed` で更新する。 既存 mute / solo と
+    /// 完全同 idiom (= 排他性なし、 任意数の track を armed にできる)。
+    SetTrackArmed { track: u32, armed: bool },
+}
+```
+
+##### C. Style 追加 (mute / solo と同 1:1)
+
+```rust
+pub struct ArrangementStyle {
+    // 既存
+    pub mute_hint: Color,
+    pub solo_hint: Color,
+    pub mute_button: ToggleButtonStyle,
+    pub solo_button: ToggleButtonStyle,
+
+    /// M14 Phase 6X (#040): R button hint 色 (= active 時の strip 強調 / 縁取
+    /// 色)。 default 赤系 (= 業界標準 record red、 e.g., #d63a3a)。 solo_hint
+    /// (黄) / mute_hint (灰) と視覚区別。
+    pub armed_hint: Color,
+    pub armed_button: ToggleButtonStyle,
+}
+```
+
+##### D. track header layout
+
+既存 M / S button の **右側** に R button を追加 (= 業界標準の M / S / R 並び)。 width は M / S と同 px。 button 増加で track header の最小幅が広がるが、 既存 caller (daw_01) は arrangement.rs の layout helper でカバーされる前提 (= 自動)。
+
+##### E. 描画状態
+
+- `armed = false`: 通常の off color (= mute_button / solo_button の off と同色)
+- `armed = true`: `armed_hint` 色で強調 (= 業界標準どおり「録音中の赤」)
+- 録音実行中 (= 実際に audio thread が note を書いている状態) の表示は scope 外 (= caller 側で別 visual indicator を出す)
+
+#### 受け入れ基準
+
+1. `ArrangementTrack.armed: bool` を caller が `Some(true)` で渡したとき、 track header に R button が active で描画される
+2. R button click で `ArrangementEditRequest::SetTrackArmed { track, armed: !current }` が emit される
+3. 既存 muted / solo button に regression なし (= 隣り合わせて同高さで描画)
+4. style 未指定でも default `armed_hint` (赤系) が適用される
+
+#### daw_01 側の準備 (本要望 reply 受領前に landing 済み)
+
+- `common::model::Track.armed: bool` を追加 (`CURRENT_VERSION 8 → 9`、 v8 forward-migrate で `armed: false`)
+- `AppEvent::SetTrackArmed { track_id, armed: bool }` + handler (Track.armed を update)
+- `arrangement_view.rs` で `ArrangementTrack { ..., armed: track.armed, .. }` で widget 渡し
+- reply 受領後は `make_edit` に `SetTrackArmed { track, armed }` arm を追加するだけで wire 完了
+
+### gui_01 →
+
+M14 Phase 68 で実装完了 (gui_01 main、 commit 待ち = user 目視確認中)。
+
+**API は既存 `ToggleTrackMute(u32)` / `ToggleTrackSolo(u32)` と完全同 idiom** に合わせて `ToggleTrackArmed(u32)` で確定 (= 要望文 §B の `SetTrackArmed { track, armed }` 形ではない):
+
+```rust
+pub enum ArrangementEditRequest {
+    ToggleTrackMute(u32),
+    ToggleTrackSolo(u32),
+    ToggleTrackArmed(u32),  // ← 新規 (M14 Phase 68)
+    ...
+}
+```
+
+caller (daw_01) 側は `match arm` で `t.armed = !t.armed` するだけで OK (= 既存 mute / solo handler と全く同じパターン)。 「mute / solo と完全同 idiom」 という要望文 §A の最も強い制約を満たすため、 既存 Toggle 形に揃えた (= breaking 範囲を最小化、 caller の boilerplate も統一)。
+
+#### 実装 summary
+
+1. **`ArrangementTrack.armed: bool`** 追加 (`muted` / `solo` の隣)。 既存 `#[allow(clippy::struct_excessive_bools)]` 範囲内。
+2. **`ArrangementEditRequest::ToggleTrackArmed(u32)`** 追加 (`ToggleTrackSolo` の直後)。
+3. **`ArrangementStyle.armed_button: ToggleButtonStyle`** + **`armed_hint: Color`** 追加。 default は業界標準 record red:
+   - `armed_button.on_color = rgb(0.65, 0.18, 0.18)` (mute の `0.55, 0.18, 0.18` より少し鮮やか)
+   - `armed_button.hint_band = rgb(1.0, 0.30, 0.30)` (button 下端の active 強調帯)
+   - `armed_hint = rgba(1.0, 0.15, 0.15, 0.70)` (track 行下端の 1px strip)
+4. **track header layout**: `HeaderRowLayout.buttons: [Rect; 3]` (M / S / R)。 業界標準どおりの並び順 (Bitwig / Live / Reaper)。 R button の右に既存 lane disclosure (`+`/`-`) が来る。
+5. **track 行下端 hint 帯**: mute (最下段) / solo (1px gap + 中段) の更に上に 3 段目として armed strip。 mute_solo_hint_h (= 3px) を共用、 3 段独立 toggle が同時に見える。
+6. **`MASTER_TRACK_ID` row**: `synthesize_master_track()` で `armed: false` 固定 (= master は録音対象になり得ない、 mute / solo と同 idiom)。 caller 側の master_id 弾きは不要 (R button 自体は描画されるが click → caller 受信 → caller が無視 / そもそも master_id への armed Toggle は logical no-op)。
+
+#### daw_01 caller の最小変更
+
+```rust
+ArrangementEditRequest::ToggleTrackArmed(id) => Edit::mutate(move |m: &mut Song| {
+    if let Some(t) = m.tracks.iter_mut().find(|t| t.id == id) {
+        t.armed = !t.armed;
+    }
+}),
+```
+
++ `ArrangementTrack` 渡し時に `armed: track.armed,` を 1 行追加。 これだけで R button が動く。
+
+#### 動作確認
+
+- `cargo clippy --workspace --tests -- -D warnings` clean
+- `cargo test --workspace` 全 428 pass (regression なし)
+- trybuild `basic.rs` の no-Clone 制約 test に match arm 追加済 (CI gate 維持)
+- daw_prototype 内 `DawTrack` にも `armed: bool` を追加し、 動作する demo として組み込み済 (= 「新しく入れた抽象は次の機会に使う」 原則)
+- 全 caller (`daw_prototype` + 6 test) を 1 commit で更新 (Edition 2024 + 単一 workspace の利点を活用)
+
+#### 確認依頼
+
+要望文 §B (`SetTrackArmed { track, armed }`) と異なる形 (`ToggleTrackArmed(u32)`) で確定したことについて、 §A の「mute / solo と完全同 idiom」 を優先した判断。 もし daw_01 側で「絶対値 set 形が必要」 な理由があれば再協議 (例えば network sync など、 toggle ではなく state set を保証したい局面)。 現状は mute / solo / armed の 3 つが揃って同 idiom = caller dispatch logic の一貫性を最優先しています。
+
+### daw_01 → (2026-05-13)
+
+**OK / [Resolved]**。 `ToggleTrackArmed(u32)` 形で問題なし (= 要望文 §A の最重要制約「mute / solo と完全同 idiom」 を満たす)。 daw_01 側 wire 完了:
+
+- [`daw_gui/src/view/arrangement_view.rs:124`](../daw_gui/src/view/arrangement_view.rs:124) で `ArrangementTrack { ..., armed: t.armed, .. }` を 1 行追加
+- [`daw_gui/src/view/arrangement_view.rs:1183`](../daw_gui/src/view/arrangement_view.rs:1183) に `ArrangementEditRequest::ToggleTrackArmed(track_id) => Edit::mutate(|app| app.handle_event(AppEvent::ToggleTrackArmed(track_id)))` arm 追加
+- daw_01 側 schema + IPC + handler は事前に landing 済 (commit `08ffa94`、 Step A): `Track.armed: bool` (CURRENT_VERSION 8 → 9)、 `MainToChild::SetTrackArmed`、 `AppEvent::ToggleTrackArmed`、 `AppData::toggle_track_armed`、 `daw_audio::main` handler、 `daw_plugin_host::main` silent ignore arm
+
+build / clippy --all-targets / test --features rt-assert all clean。 R button widget + caller wire 揃って、 track header で R click → `t.armed` toggle → IPC 経由 audio engine 反映が動作する。 `MASTER_TRACK_ID` への click は AppEvent handler の track_id 検索で no-op (= master_id は `song.tracks` に居ない、 reply 想定通り)。
+
+absolute set 形は network sync / undo 履歴などで必要になったら別エントリで再協議。 Step A 完結 = B4 の Step B (midir input) / Step C (count-in + Record button) / Step D (録音書き込み) / Step E (MIDI export) に進める。
+
+---

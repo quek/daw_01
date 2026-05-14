@@ -126,6 +126,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             name: Arc::from(t.name.as_str()),
             muted: t.muted,
             solo: t.solo,
+            armed: t.armed,
             // mixer fader と同じ dB スケール (DB_MIN..DB_MAX) で表示する。
             // 編集 callback で受け取った値は fader_to_amp で linear に戻す。
             volume: amp_to_fader(t.volume),
@@ -1179,6 +1180,16 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
         ArrangementEditRequest::ToggleTrackSolo(track_id) => {
             Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::ToggleTrackSolo(track_id));
+            })
+        }
+        ArrangementEditRequest::ToggleTrackArmed(track_id) => {
+            // Phase 7 B4 / gui_01 #040 (M14 Phase 68): R button click。
+            // mute / solo と完全同 idiom。 master_id への click も widget は
+            // 描画するが (= synthesize_master_track で armed: false 固定なので
+            // off 表示)、 click が来た場合は AppEvent 経由で track_id 検索 →
+            // 一致 track 無し (master_id は song.tracks に居ない) で no-op。
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ToggleTrackArmed(track_id));
             })
         }
         ArrangementEditRequest::DeleteTrack(track_id) => {
