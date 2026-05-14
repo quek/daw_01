@@ -8,6 +8,7 @@ common = { path = "../common" }
 anyhow.workspace = true
 boa_engine = "0.21"
 midir.workspace = true
+midly.workspace = true
 rfd.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true

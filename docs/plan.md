@@ -246,8 +246,8 @@ DAW へ** のステップ。
 
 - **B1** (オートメーション + transport 通知): **ほぼ完了**。 残: B1-M (VST3 IMidiMapping、 B4 依存) のみ
 - **B2** (オーディオ録音): 未着手
-- **B3** (メトロノーム / count-in): Minimum 完了。 残: count-in は B2 同時実装
-- **B4** (MIDI 録音 / export): 未着手
+- **B3** (メトロノーム / count-in): **完了**。 count-in は B4 と一体実装 (commit 56213f8)
+- **B4** (MIDI 録音 / export): **Minimum 完了** (Step A-E)。 B3 残 (count-in) も同時 landing。 残: B1-M (VST3 IMidiMapping)、 device 選択 / punch in/out / per-track export 等は extended
 - **B5** (Linux 対応): 未着手
 - **Undo/Redo 残リスク (B/D/E)**: クッションタスク、 未着手
 
@@ -308,14 +308,19 @@ B2 録音の前提 (録音時のテンポ guide)。 既存 audio engine の mast
   一体運用なので **B2 と同時実装**。 録音 trigger と切り離した状態で count-in
   だけ実装しても使い道がない (= 再生は SeekTo で任意位置開始できる)。
 
-### B4: MIDI 録音 / export (着手中)
+### B4: MIDI 録音 / export (Minimum 完了)
 
-詳細は [`plan_b4_midi.md`](plan_b4_midi.md)。 minimum スコープ:
+詳細は [`plan_b4_midi.md`](plan_b4_midi.md)。 minimum スコープ完了 (commits
+`08ffa94` Step A schema / `10d6f3f` Step A wire / `56213f8` Step C+D /
+本 commit Step E):
 
-- MIDI input (`midir`、 cross-platform) から note を arrangement の MIDI clip に録音
-- track header の R (Record-arm) button + transport bar の Record toggle
-- count-in 0 / 1 / 2 bars (B3 残を本フェーズで一体実装)
-- `.mid` 形式 (`midly`、 SMF format 1、 全 MIDI track 一括) で export
+- MIDI input (`midir`、 cross-platform) から note を arrangement の MIDI clip に録音 (Step B/D)
+- track header の R (Record-arm) button + transport bar の Record toggle (Step A/C)
+- count-in 0 / 1 / 2 bars (B3 残を本フェーズで一体実装、 audio engine の preroll 経路) (Step C)
+- `.mid` 形式 (`midly`、 SMF format 1、 全 MIDI track 一括) で export (Step E)
+
+**残 (extended)**: MIDI device 選択 dropdown / punch in / out / per-track
+export / B1-M (VST3 IMidiMapping、 MIDI 入力で plugin parameter map)。
 
 ### B5: Linux 対応
 
@@ -422,3 +427,7 @@ A8 で A (load 失敗 → pending stuck) は解消したが、 reconcile 経由�
 | 2026-05-13 | 1520977 | B1-T | VST3 `ProcessContext` per-buffer populate — `Vst3Plugin::process` が今まで `_transport: &TransportContext` を無視 + `projectTimeSamples` を free-running していた問題を解消。 CLAP `build_clap_transport_event` と同 semantics で `TransportContext` から `tempo` / `timeSigNumerator` / `timeSigDenominator` / `projectTimeSamples` / `continousTimeSamples` / `projectTimeMusic` (拍位置) / `barPositionMusic` (直近 bar 開始拍) / `cycleStartMusic` / `cycleEndMusic` / `state` flags を populate。 state は `kTempoValid` / `kTimeSigValid` / `kProjectTimeMusicValid` / `kBarPositionValid` / `kCycleValid` / `kContTimeValid` 常時 ON、 `kPlaying` / `kCycleActive` を transport 状態依存。 これで FabFilter / Vital / Avenger 等の sync 系 VST3 plugin が host テンポ + bar position に追随 |
 | 2026-05-13 | 7a58e2c | B1-R | VST3 `set_render_mode` の no-op を解消 — VST3 spec の `IComponent::setIoMode` が `initialize` 前にしか呼べない (= active 中の動的切替は spec 違反) ため、 spec 準拠の代替として `ProcessData::processMode` を per-buffer で `kRealtime` / `kOffline` に切替。 `Vst3Plugin` に `render_mode: RenderMode` field 追加 (default Realtime)、 `set_render_mode` で field 更新 + tracing log + return true、 `process()` の `ProcessData` 構築時に match で processMode 切替。 多くの reverb / convolution / lookahead 系 plugin は process() の processMode を尊重 (= effect が plugin 依存で出る、 害は無い)。 残 B1 は B1-M (VST3 IMidiMapping、 B4 依存) のみ |
 | 2026-05-13 | e6d76c9 | B3 Minimum | メトロノーム実装 — transport bar に "Click" toggle button (active 時 橙)、 audio engine で beat 境界ごとに internal click 音 (sine + linear envelope decay、 accent: downbeat 880Hz / 他 440Hz、 40ms decay、 amp peak 0.25 = -12 dB、 mono → L/R 均等 mix) を master mix 最終段に重ねる。 `MainToChild::SetMetronomeEnabled(bool)` IPC + `SharedState.metronome_enabled: AtomicBool` + `LocalState.metronome_voice: Option<ClickVoice>` + `engine::render_metronome` (buffer 範囲内の全 beat 境界で voice trigger、 既存 voice overwrite の業界標準 idiom)。 master mix 最終段なので track の mute / solo / volume の影響を受けず常に guide が聞こえる。 export 中 / playing でない / disabled で skip = CPU 0。 session-only state。 count-in 1 / 2 小節 は B2 (録音) と同時実装に分離 |
+| 2026-05-13 | 08ffa94 | B4 Step A | Track.armed schema + IPC + handler。 `common::model::Track.armed: bool` (CURRENT_VERSION 8 → 9、 v8 forward-migrate で false default)、 `MainToChild::SetTrackArmed { track, armed }` + daw_audio handler、 `AppEvent::ToggleTrackArmed(u32)` + `fn toggle_track_armed` (mute/solo と同 idiom)。 R button widget は gui_01 #040 で要望 |
+| 2026-05-13 | 10d6f3f | B4 Step A 完結 | gui_01 #040 reply 取り込み + arrangement_view wire 2 行 (`armed: t.armed` + `ToggleTrackArmed` arm) で R button 動作。 widget M14 Phase 68 で R button + armed_button style + track header layout (M / S / R 並び) + 3 段独立 hint 帯 が landing。 plan_b4_midi §12 Step A を [x] 化、 #040 を archive_001.md に切り出し |
+| 2026-05-13 | 56213f8 | B4 Step C + D | count-in + Record button + audio engine preroll + 録音書き込み。 `MainToChild::StartCountIn { samples }` IPC、 `EngineShared.preroll_total/remaining_samples` + `audio_bridge::preroll_remaining_samples` mirror、 audio engine の `process_buffer` 頭で preroll > 0 ブランチ (= 通常 dispatch / clip render skip + metronome のみ render)、 GUI on_tick で midi_recording_pending && preroll == 0 で midi_recording 昇格、 metronome は count-in 中だけ強制 ON で `metronome_enabled_pre_recording` snapshot 経由復元。 `handle_midi_note_on/off` を 2 mode 化 (= 既存 step_input_note_on 抽出、 録音 mode は `record_midi_note_on/off` で armed track 全てに対し note_on で仮 length 0.05 で push / note_off で length 確定)、 `ensure_midi_clip_at_playhead` で MIDI clip auto-extend / 新規 4 beat clip 作成。 transport bar に Count-in dropdown + Record toggle button (record red、 active 時 「● Rec」 / count-in 中 「Count-in...」)。 Step B (midir listener) は既存実装で完結確認のみ |
+| 2026-05-13 | (this commit) | B4 Step E + Minimum 完了 | MIDI export (SMF format 1)。 `midly = "0.5"` 依存追加、 `daw_gui::midi_export::export_midi(song, path)` で PPQ 480 / 全 MIDI track 並列出力 / track 0 = tempo + time_sig meta。 `MidiContent` clip だけ events 化、 audio / automation clip は skip、 同 tick 内は NoteOff → NoteOn 順に sort。 `AppEvent::ExportMidi` + `action_export_midi` (rfd `.mid` save dialog)、 File menu に "Export MIDI..." 項目追加。 4 件 unit test (empty SMF / 1 note roundtrip / audio-only skip / beat→tick / denom→log2)。 plan_b4_midi.md §12 Step E [x] 化、 plan.md Phase 7 B4 を「Minimum 完了」 化。 残 (extended): MIDI device 選択 / punch in/out / per-track export / B1-M (VST3 IMidiMapping) |

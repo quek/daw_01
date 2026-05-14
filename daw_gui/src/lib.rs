@@ -17,6 +17,7 @@ pub mod dispatcher;
 pub mod import_audio;
 pub mod job;
 pub mod midi;
+pub mod midi_export;
 pub mod script;
 pub mod subprocess;
 pub mod view;

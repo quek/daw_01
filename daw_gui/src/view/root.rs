@@ -196,6 +196,9 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
             m.item("Export WAV...", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ExportWav)));
             });
+            m.item("Export MIDI...", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ExportMidi)));
+            });
         });
         mb.menu("Edit", |m| {
             m.item("Undo", |ui| {

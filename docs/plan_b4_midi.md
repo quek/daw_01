@@ -286,7 +286,14 @@ count-in 中の audio thread: 既存 `playhead < 0` を `playing && !cmd_to_rend
       cache 経由)。 `find_midi_clip_at_playhead` / `find_midi_clip_containing_beat`
       helper 追加 (= 内部実装は同一だが意味的区別)。 既存 `Track.armed`
       (Step A) を armed track 検索に使用。
-- [ ] Step E (MIDI export)
+- [x] Step E (MIDI export) — 本 commit。 `midly = "0.5"` 依存追加、
+      `daw_gui::midi_export::export_midi(song, path)` で SMF format 1 (PPQ
+      = 480、 全 MIDI track を並列 track として出力、 track 0 = tempo +
+      time_sig meta)。 `MidiContent` (= ClipContent::Midi) を持つ clip
+      だけ events 化、 audio / automation clip は skip。 `AppEvent::ExportMidi`
+      + `action_export_midi` (rfd で `.mid` save dialog → midly::Smf::write_std)、
+      File menu に "Export MIDI..." 項目追加 (Export WAV... の隣)。 4 件の
+      unit test (empty SMF / 1 note roundtrip / audio-only skip / beat→tick)。
 
 ## 13. 主要ファイル変更点
 

@@ -2240,6 +2240,10 @@ pub enum AppEvent {
     // -------- WAV export -------------------------------------------------
     ExportWav,
     ExportWavComplete { error: Option<String> },
+    /// Phase 7 B4 Step E (2026-05-13): MIDI export menu trigger。 rfd で
+    /// path 取得 → `midi_export::export_midi(&song, &path)` で SMF1 書き出し。
+    /// 失敗時は status_message に error を出すのみ (= モーダル無し)。
+    ExportMidi,
 
     // -------- Audio clip import (Phase 1 PR3) ----------------------------
     /// Import one or more audio files into the song. Triggered by
@@ -3130,6 +3134,9 @@ impl AppData {
             }
             AppEvent::ExportWav => {
                 self.action_export_wav();
+            }
+            AppEvent::ExportMidi => {
+                self.action_export_midi();
             }
             AppEvent::ImportAudio { paths, target_track_idx } => {
                 self.action_import_audio(paths, target_track_idx);
@@ -9812,6 +9819,29 @@ impl AppData {
             common::protocol::RenderMode::Offline,
         ));
         self.send_audio(MainToChild::ExportWav { path });
+    }
+
+    /// Phase 7 B4 Step E (2026-05-13): File → Export MIDI...
+    /// `rfd` で .mid ファイル保存先を選択 → `midi_export::export_midi`
+    /// で SMF1 書き出し。 audio engine への IPC 不要 (= GUI process 単独で
+    /// `Song` snapshot を SMF に変換)。 失敗時は status_message に error。
+    fn action_export_midi(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("MIDI", &["mid", "midi"])
+            .save_file()
+        else {
+            return;
+        };
+        match crate::midi_export::export_midi(&self.song, &path) {
+            Ok(()) => {
+                self.status_message =
+                    format!("MIDI 書き出し完了: {}", path.display());
+            }
+            Err(e) => {
+                self.status_message = format!("MIDI 書き出し失敗: {e}");
+                tracing::error!(error = %e, path = %path.display(), "MIDI export failed");
+            }
+        }
     }
 
     /// Import one or more audio files into the song (Phase 1 PR3).
