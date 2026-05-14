@@ -582,11 +582,11 @@ pub struct AppData {
     pub plugin_picker_target: PickerTarget,
 
     // -------- Save flow / IPC --------
-    /// 現在 plugin_host へ `RequestAllStates` を投げて返答待ち中の理由。
-    /// `None` の間は新規 request を発行できる。 `Some` の間に来た新規
-    /// request は fallback (state 同期なし) で即時実行する。
+    /// `RequestAllStates` を発行した順に保持するキュー。 front が現在 in-flight
+    /// の request、 後続は先行 request の応答後に順次 dispatch される。 空の
+    /// 間は新規 request を発行するときに即時 `RequestAllStates` を送る。
     /// 詳細は [`PendingStateRequest`] / [`DeferredEdit`]。
-    pub pending_state_request: Option<PendingStateRequest>,
+    pub pending_state_queue: VecDeque<PendingStateRequest>,
     pub audio_tx: Option<UnboundedSender<MainToChild>>,
     pub plugin_tx: Option<UnboundedSender<MainToChild>>,
 
@@ -838,7 +838,7 @@ impl AppData {
             plugin_picker_visible: Vec::new(),
             is_plugin_picker_open: false,
             plugin_picker_target: PickerTarget::Instrument,
-            pending_state_request: None,
+            pending_state_queue: VecDeque::new(),
             audio_tx: Some(audio_tx),
             plugin_tx: Some(plugin_tx),
             pending_clip_fx_bounce: None,
@@ -1367,7 +1367,21 @@ impl AppData {
         // `track_plugin_ids` を diff して同期させる。 さもなければ
         // 「Bass track 削除 → Undo で track は復活するが plugin は
         // load されない (= 音が出ない)」 となる。
+        //
+        // Risk E (plan_undo_reconcile_polish.md): 多段 Undo で reconcile
+        // が毎 step 走る cost を測定するための timing log。 plan B 完了で
+        // diff は slot 単位の最小 set に絞られているので、 plugin chain
+        // が変わらない Undo は HashMap iter のみで終わる。 変わる場合の
+        // RemoveSlot/SetSlot IPC コストを観測したい場合は trace level を
+        // `daw_gui::app::undo_perf=info` で見る。
+        let reconcile_started = std::time::Instant::now();
         self.reconcile_plugins_with_song();
+        let reconcile_elapsed = reconcile_started.elapsed();
+        tracing::info!(
+            target: "daw_gui::app::undo_perf",
+            elapsed_us = reconcile_elapsed.as_micros() as u64,
+            "reconcile_plugins_with_song after Undo/Redo"
+        );
         self.resync_song_edit_texts();
         self.pianoroll_notes_generation += 1;
     }
@@ -1639,13 +1653,106 @@ pub struct LoadedSlotInfo {
     pub plugin_id_str: String,
 }
 
+/// `reconcile_plugins_with_song` の Phase B が計算する action。
+/// IPC dispatch から独立した純粋データ型にすることで unit test しやすく
+/// する (4dc982c で導入した slot-level diff の regression 防止)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum SlotReconcileAction {
+    /// host にあるが Song に無い slot を host から消す
+    /// (= `MainToChild::RemoveSlotPlugin` 相当)。
+    RemoveSlot { track_id: u32, slot: PluginSlot },
+    /// Song にあるが host に無い、 もしくは plugin_id_str が違う slot を
+    /// (再) load する (= `MainToChild::SetSlotPlugin` 相当)。 caller が
+    /// `plugin_db` から format / path を解決して IPC を組み立てる。
+    LoadSlot {
+        track_id: u32,
+        slot: PluginSlot,
+        plugin_id_str: String,
+        initial_state: Option<Vec<u8>>,
+    },
+}
+
+/// Phase B 純粋関数化。 song と現在の loaded_slots cache を見て、 host
+/// と Song を揃えるための action 列を返す。 副作用なし (IPC は呼ばない、
+/// AppData にも触らない)。
+pub fn compute_slot_reconcile_actions(
+    song: &common::model::Song,
+    loaded_slots: &HashMap<(u32, PluginSlot), LoadedSlotInfo>,
+) -> Vec<SlotReconcileAction> {
+    let mut actions = Vec::new();
+    for track in &song.tracks {
+        let track_id = track.id;
+
+        // Song 側 (slot, &PluginInstance) 列を midi_fx → instrument →
+        // fx の順で組み立て。 `reconcile_plugins_with_song` の従来動作と
+        // 同じ順序を維持する (= load 順が音にも影響するため変えない)。
+        let mut song_slots: Vec<(PluginSlot, &common::model::PluginInstance)> = Vec::new();
+        for (i, p) in track.midi_fx_chain.iter().enumerate() {
+            song_slots.push((PluginSlot::MidiFx(i as u32), p));
+        }
+        if let Some(inst) = track.instrument.as_ref() {
+            song_slots.push((PluginSlot::Instrument, inst));
+        }
+        for (i, p) in track.fx_chain.iter().enumerate() {
+            song_slots.push((PluginSlot::Fx(i as u32), p));
+        }
+        let song_slot_set: std::collections::HashSet<PluginSlot> =
+            song_slots.iter().map(|(s, _)| *s).collect();
+
+        // (1) host にあるが Song に無い slot → RemoveSlot
+        // 順序を安定にするため slot を sort してから push する (= test の
+        // assertion が決定的になる)。 production の挙動は HashMap iter
+        // 順依存だが、 RemoveSlot 同士は独立操作なので順序は無関係。
+        let mut host_extra_slots: Vec<PluginSlot> = loaded_slots
+            .iter()
+            .filter(|((tid, _), _)| *tid == track_id)
+            .map(|((_, s), _)| *s)
+            .filter(|s| !song_slot_set.contains(s))
+            .collect();
+        host_extra_slots.sort_by_key(|s| slot_sort_key(*s));
+        for slot in host_extra_slots {
+            actions.push(SlotReconcileAction::RemoveSlot { track_id, slot });
+        }
+
+        // (2) Song にあるが host に無い、 もしくは plugin_id_str が違う slot → LoadSlot
+        for (slot, inst) in song_slots {
+            let need_load = match loaded_slots.get(&(track_id, slot)) {
+                None => true,
+                Some(info) => info.plugin_id_str != inst.plugin_id,
+            };
+            if !need_load {
+                continue;
+            }
+            actions.push(SlotReconcileAction::LoadSlot {
+                track_id,
+                slot,
+                plugin_id_str: inst.plugin_id.clone(),
+                initial_state: inst.state.clone(),
+            });
+        }
+    }
+    actions
+}
+
+/// `PluginSlot` を安定に sort するためのキー。 RemoveSlot 列の順序を
+/// 決定的にする (test 用)。 production 動作には影響しない (= RemoveSlot
+/// 同士は独立)。
+fn slot_sort_key(slot: PluginSlot) -> (u8, u32) {
+    match slot {
+        PluginSlot::MidiFx(i) => (0, i),
+        PluginSlot::Instrument => (1, 0),
+        PluginSlot::Fx(i) => (2, i),
+    }
+}
+
 /// `RequestAllStates` の発行理由。 plugin_host から `AllPluginStates`
-/// が返ってくるまで [`AppData::pending_state_request`] に保持し、
-/// 受信時に対応する完了処理 (save または deferred edit) を実行する。
+/// が返ってくるまで [`AppData::pending_state_queue`] に保持し、 応答時に
+/// 対応する完了処理 (save または deferred edit) を実行する。
 ///
-/// 「同時に複数の理由」 は持てない (`Option<PendingStateRequest>` が
-/// 1 つのため)。 すでに `Some` のときに来た新規 request は state 同期
-/// 無しで即時実行する fallback ロジックが各 dispatcher 側にある。
+/// 連続した編集 (例: 2 連続 delete_track) は queue に積まれ、 各々が
+/// 自前の `RequestAllStates` 応答を待ってから順次実行される。 これで
+/// 「先行 edit の応答待ち中に来た 2 番目の edit が state 同期なしで
+/// 走り、 Undo で knob 値が復元されない」 race を回避する。
 #[derive(Debug, Clone)]
 pub enum PendingStateRequest {
     /// project save。 ファイル書き出し完了で消費される。
@@ -3911,89 +4018,61 @@ impl AppData {
             }
         }
 
-        // Phase B: 各 track について Song の slot 列と host の slot 列
-        // (= `loaded_slots` の対応 entries) を diff する。
-        let song = self.song.clone();
+        // Phase B: 各 track の slot 列を diff。 純粋関数で action 列を
+        // 計算し、 順に IPC を dispatch する (test しやすさのため切り出し)。
         let Some(db) = self.plugin_db.clone() else {
             // plugin DB が未ロードなら SetSlotPlugin の組み立て不可。
             // RemoveSlotPlugin 単体は db 不要だが、 Phase B はまとめて
             // skip する (= db ロード待ち)。
-            if !song.tracks.is_empty() {
+            if !self.song.tracks.is_empty() {
                 tracing::warn!("reconcile: plugin database not loaded; phase B skipped");
             }
             return;
         };
-
-        for track in &song.tracks {
-            let track_id = track.id;
-
-            // Song 側の (slot, plugin_id_str, &PluginInstance) 列。
-            let mut song_slots: Vec<(PluginSlot, &common::model::PluginInstance)> = Vec::new();
-            for (i, p) in track.midi_fx_chain.iter().enumerate() {
-                song_slots.push((PluginSlot::MidiFx(i as u32), p));
-            }
-            if let Some(inst) = track.instrument.as_ref() {
-                song_slots.push((PluginSlot::Instrument, inst));
-            }
-            for (i, p) in track.fx_chain.iter().enumerate() {
-                song_slots.push((PluginSlot::Fx(i as u32), p));
-            }
-            let song_slot_set: std::collections::HashSet<PluginSlot> =
-                song_slots.iter().map(|(s, _)| *s).collect();
-
-            // (1) host にあるが Song に無い slot → RemoveSlotPlugin
-            let host_extra_slots: Vec<PluginSlot> = self
-                .loaded_slots
-                .iter()
-                .filter(|((tid, _), _)| *tid == track_id)
-                .map(|((_, s), _)| *s)
-                .filter(|s| !song_slot_set.contains(s))
-                .collect();
-            for slot in host_extra_slots {
-                tracing::info!(track_id, ?slot, "reconcile: removing extra host slot");
-                self.send_plugin(MainToChild::RemoveSlotPlugin {
-                    track: track_id,
-                    slot,
-                });
-                self.cleanup_slot_gui(track_id, slot);
-                self.loaded_slots.remove(&(track_id, slot));
-                self.pending_plugin_loads.remove(&(track_id, slot));
-            }
-
-            // (2) Song にあるが host に無い、 または plugin_id_str が
-            // 違う slot → SetSlotPlugin
-            for (slot, inst) in song_slots {
-                let need_load = match self.loaded_slots.get(&(track_id, slot)) {
-                    None => true,
-                    Some(info) => info.plugin_id_str != inst.plugin_id,
-                };
-                if !need_load {
-                    continue;
+        let actions = compute_slot_reconcile_actions(&self.song, &self.loaded_slots);
+        for action in actions {
+            match action {
+                SlotReconcileAction::RemoveSlot { track_id, slot } => {
+                    tracing::info!(track_id, ?slot, "reconcile: removing extra host slot");
+                    self.send_plugin(MainToChild::RemoveSlotPlugin {
+                        track: track_id,
+                        slot,
+                    });
+                    self.cleanup_slot_gui(track_id, slot);
+                    self.loaded_slots.remove(&(track_id, slot));
+                    self.pending_plugin_loads.remove(&(track_id, slot));
                 }
-                let Some(entry) = db.find_by_id(&inst.plugin_id) else {
-                    tracing::error!(
-                        id = %inst.plugin_id,
-                        track = track_id,
-                        ?slot,
-                        "reconcile: plugin id not in database"
-                    );
-                    continue;
-                };
-                tracing::info!(
+                SlotReconcileAction::LoadSlot {
                     track_id,
-                    ?slot,
-                    plugin_id = %inst.plugin_id,
-                    "reconcile: loading slot from song"
-                );
-                self.track_pending_load(track_id, slot);
-                self.send_plugin(MainToChild::SetSlotPlugin {
-                    track: track_id,
                     slot,
-                    format: entry.format,
-                    path: entry.path.clone(),
-                    plugin_id: entry.id.clone(),
-                    initial_state: inst.state.clone(),
-                });
+                    plugin_id_str,
+                    initial_state,
+                } => {
+                    let Some(entry) = db.find_by_id(&plugin_id_str) else {
+                        tracing::error!(
+                            id = %plugin_id_str,
+                            track = track_id,
+                            ?slot,
+                            "reconcile: plugin id not in database"
+                        );
+                        continue;
+                    };
+                    tracing::info!(
+                        track_id,
+                        ?slot,
+                        plugin_id = %plugin_id_str,
+                        "reconcile: loading slot from song"
+                    );
+                    self.track_pending_load(track_id, slot);
+                    self.send_plugin(MainToChild::SetSlotPlugin {
+                        track: track_id,
+                        slot,
+                        format: entry.format,
+                        path: entry.path.clone(),
+                        plugin_id: entry.id.clone(),
+                        initial_state,
+                    });
+                }
             }
         }
     }
@@ -4190,26 +4269,29 @@ impl AppData {
         }
     }
 
+    /// `RequestAllStates` 待ちの request を [`AppData::pending_state_queue`]
+    /// に積む。 queue が空 (= 現在 in-flight なし) なら同時に
+    /// `RequestAllStates` を 1 発送る。 既に in-flight なら積むだけで
+    /// IPC は発行しない (= 先行 request の応答処理時に次の `RequestAllStates`
+    /// が改めて送られる、 [`AppData::on_all_states_from_child`] 参照)。
+    fn enqueue_state_request(&mut self, req: PendingStateRequest) {
+        let was_idle = self.pending_state_queue.is_empty();
+        self.pending_state_queue.push_back(req);
+        if was_idle {
+            self.send_plugin(MainToChild::RequestAllStates);
+        }
+    }
+
     /// project save の trigger。 plugin がある場合は plugin_host から
     /// 最新 state を取って Song に書き戻してから save する。 plugin が
-    /// 1 つもなければ即 save。
-    ///
-    /// 既に `RequestAllStates` を発行中 (= 別の deferred edit の sync を
-    /// 待っている) なら、 fallback として state 同期なしで即時 save する
-    /// (= 古い save 挙動)。 これは「 plugin を消そうとしたタイミングで
-    /// Ctrl+S」 のような狭い race のための妥協で、 実用上の問題は無い。
+    /// 1 つもなければ即 save。 既に `RequestAllStates` 在線中なら queue
+    /// に積んで先行 request の応答後に処理させる (= 順序保持)。
     fn begin_save(&mut self, path: PathBuf) {
-        if self.pending_state_request.is_some() {
-            tracing::warn!("begin_save: pending state request already in flight; saving without state sync");
-            self.save_after_states(path);
-            return;
-        }
         if !self.song_has_plugin() {
             self.save_after_states(path);
             return;
         }
-        self.pending_state_request = Some(PendingStateRequest::Save { path });
-        self.send_plugin(MainToChild::RequestAllStates);
+        self.enqueue_state_request(PendingStateRequest::Save { path });
     }
 
     /// state 適用 (save flow なら `apply_plugin_states` 済み、 plugin が
@@ -4460,21 +4542,20 @@ impl AppData {
     /// 場合は `RequestAllStates` を投げて、 受信時に最新 plugin state
     /// を Song に書き込んでから [`Self::push_undo_snapshot`] + 削除を
     /// 実行する。 これで「knob を回した状態で track 削除 → Undo」 で
-    /// knob 値が復元される。 plugin 無しの song / 既に pending 中の
-    /// 場合は state 同期なしで即時実行。
+    /// knob 値が復元される。 plugin 無しの song は即時実行 (= state を
+    /// 取りに行く相手が居ない)。
     fn delete_track(&mut self, idx: u32) {
         let Some(track_id) = self.song.tracks.get(idx as usize).map(|t| t.id) else {
             return;
         };
-        if !self.song_has_plugin() || self.pending_state_request.is_some() {
+        if !self.song_has_plugin() {
             self.push_undo_snapshot();
             self.delete_track_inner(track_id);
             return;
         }
-        self.pending_state_request = Some(PendingStateRequest::Deferred(
+        self.enqueue_state_request(PendingStateRequest::Deferred(
             DeferredEdit::DeleteTrack { track_id },
         ));
-        self.send_plugin(MainToChild::RequestAllStates);
     }
 
     /// 実際の削除処理。 [`Self::on_all_states_from_child`] か上の
@@ -6012,17 +6093,16 @@ impl AppData {
         if track_ids.is_empty() {
             return;
         }
-        if !self.song_has_plugin() || self.pending_state_request.is_some() {
+        if !self.song_has_plugin() {
             self.push_undo_snapshot();
             self.action_ungroup_tracks_inner(track_ids);
             return;
         }
-        self.pending_state_request = Some(PendingStateRequest::Deferred(
+        self.enqueue_state_request(PendingStateRequest::Deferred(
             DeferredEdit::UngroupTracks {
                 track_ids: track_ids.to_vec(),
             },
         ));
-        self.send_plugin(MainToChild::RequestAllStates);
     }
 
     fn action_ungroup_tracks_inner(&mut self, track_ids: &[u32]) {
@@ -9099,15 +9179,14 @@ impl AppData {
         };
         let track_id = self.song.tracks[track_idx].id;
 
-        if !self.song_has_plugin() || self.pending_state_request.is_some() {
+        if !self.song_has_plugin() {
             self.push_undo_snapshot();
             self.remove_slot_inner(track_id, slot);
             return;
         }
-        self.pending_state_request = Some(PendingStateRequest::Deferred(
+        self.enqueue_state_request(PendingStateRequest::Deferred(
             DeferredEdit::RemoveSlot { track_id, slot },
         ));
-        self.send_plugin(MainToChild::RequestAllStates);
     }
 
     fn remove_slot_inner(&mut self, track_id: u32, slot: PluginSlot) {
@@ -9204,12 +9283,14 @@ impl AppData {
     }
 
     /// `plugin_host` から `AllPluginStates` 受信。 全 plugin の最新
-    /// state を Song に書き戻したあと、 [`AppData::pending_state_request`]
-    /// に応じた完了処理 (save または deferred edit) を実行する。
+    /// state を Song に書き戻したあと、 [`AppData::pending_state_queue`]
+    /// の front を取り出して完了処理 (save または deferred edit) を実行する。
+    /// queue に後続がある場合は次の `RequestAllStates` を改めて発行し、
+    /// 連続 deferred edit が個別に最新 state を捕まえられるようにする。
     fn on_all_states_from_child(&mut self, states: Vec<SlotState>) {
         // Save / Deferred どちらでも Song の state は最新化したいので
-        // ここで一律書き戻す。 pending が None だった場合 (= 想定外
-        // タイミングの応答) でも害はない。
+        // ここで一律書き戻す。 queue が空だった場合 (= 想定外タイミング
+        // の応答) でも害はない。
         self.apply_plugin_states(&states);
         // Phase 6 review (silent corruption fix): plugin_host 側で
         // `state_save()` が `Err` を返したエントリは `SlotState.error`
@@ -9241,7 +9322,7 @@ impl AppData {
             tracing::error!(failed_count = failed.len(), %msg, "plugin state save failures");
             self.status_message = msg;
         }
-        let Some(req) = self.pending_state_request.take() else {
+        let Some(req) = self.pending_state_queue.pop_front() else {
             return;
         };
         match req {
@@ -9253,6 +9334,13 @@ impl AppData {
                 self.push_undo_snapshot();
                 self.execute_deferred_edit(edit);
             }
+        }
+        // 後続の request が積まれていれば、 改めて `RequestAllStates`
+        // を発行して次の応答待ちに入る。 ここで「直前の edit が走った
+        // あとの最新 state」 を再取得することで、 各 deferred edit が
+        // 自前の knob snapshot を持つ。
+        if !self.pending_state_queue.is_empty() {
+            self.send_plugin(MainToChild::RequestAllStates);
         }
     }
 

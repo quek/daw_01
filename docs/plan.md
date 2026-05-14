@@ -342,18 +342,23 @@ export / B1-M (VST3 IMidiMapping、 MIDI 入力で plugin parameter map)。
 - VST3 Linux GUI embed (`X11EmbedWindow`、 同様)
 - Job Object 相当 (Linux は prctl `PR_SET_PDEATHSIG`)
 
-### Undo/Redo plugin sync の残リスク (B/D/E)
+### Undo/Redo plugin sync polish (完了)
 
-A8 で A (load 失敗 → pending stuck) は解消したが、 reconcile 経由で残るリスク:
+A8 で A (load 失敗 → pending stuck) は解消、 4dc982c で reconcile が slot
+粒度に拡張、 本セッションで B / D / E を closure。 詳細は
+[`plan_undo_reconcile_polish.md`](plan_undo_reconcile_polish.md):
 
-- **B** 連続 deferred edit の race: `pending_state_request.is_some()` 即時 fallback
-  で 2 番目以降の knob 値が Undo で復元されない (`app.rs:2225,2699,3684`)
-- **D** Test カバレッジ不足: 4dc982c (slot-level diff) の integration test なし
-- **E** 多段 Undo パフォーマンス未検証: `after_undo_redo` で reconcile が毎 step
-  走る (機能正しさは OK、 連続 load/unload のコスト未測定)
-
-着手時 `docs/plan_undo_reconcile_polish.md` を切り出し。 規模が小さいので B5
-着手前のクッションタスクとしても可。
+- **B** ✅ `pending_state_request: Option<_>` → `pending_state_queue:
+  VecDeque<_>` 化。 連続 deferred edit は queue で順次処理され、 各々が
+  自前の最新 state snapshot を持つ。 test `pending_state_queue.rs`。
+- **D** ✅ `reconcile_plugins_with_song` Phase B を `compute_slot_reconcile_
+  actions` 純粋関数に抽出 + `SlotReconcileAction` enum。 5 unit tests
+  (`reconcile_slot_diff.rs`)。
+- **E** ✅ `after_undo_redo` の `reconcile_plugins_with_song` を `Instant`
+  で計測 → `tracing::info!(target: "daw_gui::app::undo_perf", ...)`。
+  Plan-B の slot-level diff が plugin chain 不変の Undo を no-op に
+  落とすので、 通常使用での cost は無視できる。 実運用で問題化したら
+  追加 PR で coalesce 検討。
 
 ## 進捗ログ
 
@@ -446,3 +451,4 @@ A8 で A (load 失敗 → pending stuck) は解消したが、 reconcile 経由�
 | 2026-05-13 | 976ba22 | B1-M Step 1 | MIDI CC dispatch + AppEvent::MidiControlChange + dummy CC1→TrackVolume binding。 `daw_gui/src/midi.rs::dispatch` を MIDI CC (0xB0..0xBF) 対応に拡張、 channel (0..15) 抽出。 `AppEvent::MidiControlChange { channel, controller, value }` 追加。 `handle_midi_control_change` 段階 1 dummy = CC 1 → 最初の selected_track の Volume にマップ |
 | 2026-05-13 | 99e4fc3 | B1-M Step 2 + 3 | MidiBinding データ型 + Learn UI + Project 永続化 (CURRENT_VERSION 9→10)。 `common::model::BindingTarget` enum (TrackVolume / TrackPan / SongTempo) + `MidiBinding { channel, controller, target }` + `Song.midi_bindings` 追加 (v9 forward-migrate で空 Vec)。 `AppData.midi_learn_target` + `AppEvent::StartMidiLearn` / `CancelMidiLearn` / `RemoveMidiBinding` + handler 拡張 (Learn mode で binding push / 通常 lookup で apply_midi_value_to_target 経由値送信)。 transport bar に MIDI Learn toggle button (active 時 「Learning...」、 click で selected_track の Volume を Learn target に or Cancel)。 channel = 16 は any-channel match |
 | 2026-05-13 | (this commit) | B1-M Step 4 minimum 完了 | `BindingTarget::PluginParam { track, slot, param_id }` 追加 (CURRENT_VERSION 10 維持、 enum variant 追加は project 互換)、 `apply_midi_value_to_target` で PluginParam case = tracing::warn (= bind data は永続化されるが actual injection は extended scope)。 plan.md B1 セクション update — B1-M minimum 完了マーク + extended scope 4 項目 (Plugin actual injection / IMidiMapping query / per-knob Learn UI / Binding list view) を明記。 残 extended は別フェーズで実装、 audio thread への RT-safe IPC + IParameterChanges integration が必要 |
+| 2026-05-14 | (this commit) | Undo polish | [plan_undo_reconcile_polish.md](plan_undo_reconcile_polish.md) 新設 + 3 PR 完了。 PR-1 (Risk B): `pending_state_request: Option<_>` → `pending_state_queue: VecDeque<_>`、 `enqueue_state_request` helper で連続 deferred edit を queue 経由でシリアライズ (= 2 番目以降も自前 state snapshot を持つ)、 `on_all_states_from_child` で pop_front + 残り queue 用に再 `RequestAllStates`。 test `pending_state_queue.rs`。 PR-2 (Risk D): reconcile Phase B を `compute_slot_reconcile_actions(&Song, &HashMap) -> Vec<SlotReconcileAction>` 純粋関数に抽出、 `SlotReconcileAction::{RemoveSlot, LoadSlot}` enum、 5 unit test (`reconcile_slot_diff.rs`)。 PR-3 (Risk E): `after_undo_redo` の reconcile に `Instant` 計測 + `tracing::info!(target: "daw_gui::app::undo_perf", elapsed_us = ...)`、 plugin chain 不変の Undo は slot-level diff で no-op に落ちることを test `matching_slot_produces_no_action` で保証 |
