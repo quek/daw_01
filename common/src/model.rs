@@ -24,7 +24,7 @@ use crate::protocol::PluginSlot;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 9;
+pub const CURRENT_VERSION: u32 = 10;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -128,6 +128,14 @@ pub struct Song {
     /// "未採番" sentinel、 1 から採番。
     #[serde(default)]
     pub next_song_lane_id: u32,
+    /// Phase 7 B1-M Step 2-3 (`docs/plan_b1_vst3_completion.md`): MIDI Learn の
+    /// CC → param バインディング table。 GUI 側で「MIDI Learn」 button 経由
+    /// で user が CC を bind、 audio engine 側は使わない (= GUI の
+    /// `handle_midi_control_change` が lookup → set_track_volume 等の既存
+    /// path で値送信する)。 Project save 対象 (= 起動間で永続化)。 v9 file は
+    /// 空 Vec で forward-migrate。
+    #[serde(default)]
+    pub midi_bindings: Vec<MidiBinding>,
 }
 
 impl Default for Song {
@@ -146,8 +154,38 @@ impl Default for Song {
             next_audio_source_id: 1,
             song_lanes: Vec::new(),
             next_song_lane_id: 1,
+            midi_bindings: Vec::new(),
         }
     }
+}
+
+/// Phase 7 B1-M Step 2 (2026-05-13): MIDI Learn binding 1 件 (= CC → target)。
+/// `channel = 16` は any-channel (= channel-agnostic、 全 16 channel にマッチ)。
+/// 同じ `(channel, controller)` の重複は許容しない (= GUI 側 handler が
+/// 新規 bind 時に既存 entry を replace する)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct MidiBinding {
+    /// MIDI channel 0..15、 または 16 = any-channel (= channel 無視で match)。
+    pub channel: u8,
+    /// MIDI CC 番号 0..127。
+    pub controller: u8,
+    /// CC 値が変化したときに更新する parameter。
+    pub target: BindingTarget,
+}
+
+/// Phase 7 B1-M Step 2 (2026-05-13): MIDI Learn の bind 先。 段階 2 では
+/// TrackVolume / TrackPan / SongTempo の 3 種、 段階 4 で PluginParam を
+/// 追加して plugin parameter binding + IMidiMapping query 対応。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub enum BindingTarget {
+    /// `Track.volume` (0.0..=1.0、 CC 0..127 を linear マップ)。
+    TrackVolume(u32),
+    /// `Track.pan` (-1.0..=1.0、 CC 0..127 を `value*2/127 - 1` で linear マップ)。
+    TrackPan(u32),
+    /// `Song.bpm` (60.0..=180.0、 CC 0..127 を linear マップ)。 SongTempo
+    /// curve とは独立 (= curve がある場合は curve が優先、 CC は base bpm を
+    /// 動かすイメージ)。
+    SongTempo,
 }
 
 impl Song {
@@ -1578,7 +1616,7 @@ mod tests {
         // and `ClipContent::Automation` are added. v7 files forward-
         // migrate via `#[serde(default)]` on `automation_lanes`. Pinning
         // the constant catches accidental rollback.
-        assert_eq!(CURRENT_VERSION, 9);
+        assert_eq!(CURRENT_VERSION, 10);
     }
 
     #[test]

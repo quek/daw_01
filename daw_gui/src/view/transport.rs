@@ -346,6 +346,40 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     );
     x += rec_w + 12.0;
 
+    // Phase 7 B1-M Step 2 (2026-05-13): MIDI Learn toggle button。 inactive
+    // 時 click で「次の MIDI CC を selected_track の Volume に bind」 (=
+    // 段階 2 minimum scope、 Pan / Tempo / Plugin Param target は段階 4 で
+    // dropdown 化予定)。 active 時は Cancel。 selected_track が無ければ
+    // no-op。 既存 STYLE_REC_MODE (橙) を再利用 (= recording mode と同じく
+    // 「現在 user 操作待ちの mode」 強調)。
+    let learn_w = 90.0;
+    let learn_active = app.midi_learn_target.is_some();
+    let learn_label = if learn_active {
+        "Learning..."
+    } else {
+        "Learn Vol"
+    };
+    let armed_track_for_learn = app.selected_track_ids.first().copied();
+    ui.toggle_button_at(
+        "transport_midi_learn",
+        learn_label,
+        Rect { x, y: cy, w: learn_w, h: bh },
+        learn_active,
+        &STYLE_REC_MODE,
+        move |_| {
+            Edit::mutate(move |app: &mut AppData| {
+                if app.midi_learn_target.is_some() {
+                    app.handle_event(AppEvent::CancelMidiLearn);
+                } else if let Some(track_id) = armed_track_for_learn {
+                    app.handle_event(AppEvent::StartMidiLearn(
+                        common::model::BindingTarget::TrackVolume(track_id),
+                    ));
+                }
+            })
+        },
+    );
+    x += learn_w + 12.0;
+
     // PR-V4: 旧「Synth (V)」 ボタンは削除。 builtin VOICEVOX plugin が
     // 歌詞 / notes 変更時に自動 synth する (= sync_vocal_metadata 経由)。
 

@@ -393,6 +393,13 @@ pub struct AppData {
     /// 元の値へ戻す (= user の「click off」 設定を尊重しつつ count-in 中は
     /// guide が聞こえる)。 None なら recording 開始前 = 復元不要。
     pub metronome_enabled_pre_recording: Option<bool>,
+    /// Phase 7 B1-M Step 2 (2026-05-13): MIDI Learn の bind 待ち target。
+    /// `Some` なら次に来る MIDI CC をこの target に bind (= `Song.midi_bindings`
+    /// に追加 + None に戻す)。 `None` (default) なら CC は既存 binding lookup
+    /// で target に値を流す (= 通常モード)。 transport bar の「MIDI Learn」
+    /// button で `StartMidiLearn(target)` 経由で Some 化、 `CancelMidiLearn`
+    /// or 1 度の CC 受信 (= bind 確定) で None に戻る。
+    pub midi_learn_target: Option<common::model::BindingTarget>,
     /// Phase 4 Step B (`docs/plan_automation.md` §6): 現在 user が触っている
     /// (= dragging) parameter の集合。 mixer / inspector / lane default knob
     /// の press で insert、 release で remove。 plugin GUI 経由の gesture も
@@ -782,6 +789,7 @@ impl AppData {
             count_in_bars: 0,
             midi_recording_active_notes: std::collections::HashMap::new(),
             metronome_enabled_pre_recording: None,
+            midi_learn_target: None,
             active_param_gestures: std::collections::HashSet::new(),
             latched_param_gestures: std::collections::HashSet::new(),
             recording_last_beat: std::collections::HashMap::new(),
@@ -2035,10 +2043,19 @@ pub enum AppEvent {
     MidiNoteOn { pitch: u8, velocity: u8 },
     MidiNoteOff { pitch: u8 },
     /// Phase 7 B1-M Step 1 (2026-05-13): MIDI Control Change (CC)。 MIDI Learn
-    /// 機能の入力。 段階 1 では dummy binding (CC 1 → selected_track の Volume
-    /// で動作確認)、 段階 2+ で persistable な MidiBinding 経由で柔軟な
-    /// routing。
+    /// 経路の入力。 GUI handler で midi_learn_target Some なら新規 binding
+    /// 追加、 None なら既存 binding lookup → target に値送信。
     MidiControlChange { channel: u8, controller: u8, value: u8 },
+    /// Phase 7 B1-M Step 2 (2026-05-13): MIDI Learn 開始 (= 「次の CC を
+    /// この target に bind」 の意思表示)。 transport bar の Learn button で
+    /// 発火、 midi_learn_target = Some(target)。
+    StartMidiLearn(common::model::BindingTarget),
+    /// Phase 7 B1-M Step 2 (2026-05-13): Learn cancel (= midi_learn_target を
+    /// None に戻す)。 user が誤って Learn を始めた場合の取り消し用。
+    CancelMidiLearn,
+    /// Phase 7 B1-M Step 2 (2026-05-13): 既存 MIDI binding の削除。 inspector
+    /// の binding list 等から発火 (= 段階 4 で UI 拡張、 段階 2 では未使用)。
+    RemoveMidiBinding(usize),
     MidiInputOpened(Option<String>),
 
     // -------- Bottom panel -------------------------------------------------
@@ -2937,11 +2954,23 @@ impl AppData {
                 self.handle_midi_note_off(pitch);
             }
             AppEvent::MidiControlChange { channel, controller, value } => {
-                // Phase 7 B1-M Step 1 (2026-05-13): MIDI Learn 入力。 段階 1
-                // dummy: CC 1 → selected_track の Volume を 0..1 範囲にマップ。
-                // 段階 2+ で MidiBinding lookup table 経由に拡張、 plugin
-                // parameter binding は段階 4 で IParameterChanges 統合。
+                // Phase 7 B1-M Step 2 (2026-05-13): Learn mode なら binding 追加、
+                // 通常モードなら既存 binding lookup で target に値送信。
                 self.handle_midi_control_change(channel, controller, value);
+            }
+            AppEvent::StartMidiLearn(target) => {
+                self.midi_learn_target = Some(target);
+                self.status_message =
+                    "MIDI Learn: 次の CC を bind します...".to_string();
+            }
+            AppEvent::CancelMidiLearn => {
+                self.midi_learn_target = None;
+                self.status_message = "MIDI Learn cancel".to_string();
+            }
+            AppEvent::RemoveMidiBinding(idx) => {
+                if idx < self.song.midi_bindings.len() {
+                    self.song.midi_bindings.remove(idx);
+                }
             }
             AppEvent::MidiInputOpened(name) => {
                 let label = name.clone().unwrap_or_default();
@@ -6205,25 +6234,77 @@ impl AppData {
         }
     }
 
-    /// Phase 7 B1-M Step 1 (2026-05-13): MIDI Learn の dummy 動作。
-    /// CC 1 (Modulation Wheel、 業界標準) を最初の `selected_track_ids` の
-    /// Volume にマップ (= 0..127 → 0..1 の linear)、 他 CC は無視。 段階 2+
-    /// で persistable な MidiBinding lookup table 経由に拡張、 channel 別
-    /// binding / Plugin parameter target / IMidiMapping query を順次追加する。
+    /// Phase 7 B1-M Step 2 (2026-05-13): MIDI Learn 経路 + 通常 lookup 経路。
+    /// `midi_learn_target` Some なら新規 binding 追加 (= 同じ
+    /// `(channel, controller)` 既存 entry は replace、 1 度の CC 受信で None
+    /// に戻る)、 None なら `Song.midi_bindings` を lookup して match した
+    /// 全 target に値を送る。 channel = 16 は any-channel match。
     fn handle_midi_control_change(
         &mut self,
-        _channel: u8,
+        channel: u8,
         controller: u8,
         value: u8,
     ) {
-        if controller != 1 {
+        if let Some(target) = self.midi_learn_target.take() {
+            // Learn mode: 既存 同 (channel, controller) を retain で除外 +
+            // 新 binding push。 status_message は次 frame の通常 status に上書き
+            // されるが「bind 完了」 を一瞬表示。
+            self.song.midi_bindings.retain(|b| {
+                !(b.controller == controller && b.channel == channel)
+            });
+            self.song.midi_bindings.push(common::model::MidiBinding {
+                channel,
+                controller,
+                target,
+            });
+            self.status_message =
+                format!("MIDI bind: CC {controller} (ch {channel}) → {target:?}");
             return;
         }
-        let Some(&track_id) = self.selected_track_ids.first() else {
-            return;
-        };
-        let amp = (f32::from(value.min(127)) / 127.0).clamp(0.0, 1.0);
-        self.set_track_volume(track_id, amp);
+        // 通常 lookup: 該当 binding 全てに値送信 (= 同 CC を複数 target に
+        // bind する usage を許容)。 channel = 16 は any-channel match。
+        let targets: Vec<common::model::BindingTarget> = self
+            .song
+            .midi_bindings
+            .iter()
+            .filter(|b| {
+                b.controller == controller
+                    && (b.channel == channel || b.channel == 16)
+            })
+            .map(|b| b.target)
+            .collect();
+        for target in targets {
+            self.apply_midi_value_to_target(target, value);
+        }
+    }
+
+    /// Phase 7 B1-M Step 2: CC 値 (0..127) を target に適用。 normalization は
+    /// target ごとに違う (= TrackVolume は 0..1、 TrackPan は -1..1、
+    /// SongTempo は 60..180 BPM linear)。 既存 setter (set_track_volume /
+    /// set_track_pan / song.bpm + IPC) を経由するので audio engine 反映も
+    /// automatic。
+    fn apply_midi_value_to_target(
+        &mut self,
+        target: common::model::BindingTarget,
+        value: u8,
+    ) {
+        let v_norm = f32::from(value.min(127)) / 127.0;
+        match target {
+            common::model::BindingTarget::TrackVolume(track_id) => {
+                self.set_track_volume(track_id, v_norm.clamp(0.0, 1.0));
+            }
+            common::model::BindingTarget::TrackPan(track_id) => {
+                let pan = (v_norm * 2.0 - 1.0).clamp(-1.0, 1.0);
+                self.set_track_pan(track_id, pan);
+            }
+            common::model::BindingTarget::SongTempo => {
+                // CC 0..127 → 60..180 BPM linear。 SetSongBpm 軽量 IPC で
+                // audio engine の song.bpm を即時更新 (= LoadSong 不要)。
+                let bpm = (60.0 + v_norm * 120.0).clamp(1.0, 400.0);
+                self.song.bpm = bpm;
+                self.send_audio(MainToChild::SetSongBpm { bpm });
+            }
+        }
     }
 
     /// 既存 step-input mode (= selected_clip + step_cursor_beat に固定 length
