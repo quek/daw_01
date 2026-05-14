@@ -308,10 +308,14 @@ B2 録音の前提 (録音時のテンポ guide)。 既存 audio engine の mast
   一体運用なので **B2 と同時実装**。 録音 trigger と切り離した状態で count-in
   だけ実装しても使い道がない (= 再生は SeekTo で任意位置開始できる)。
 
-### B4: MIDI 録音 / export
+### B4: MIDI 録音 / export (着手中)
 
-- MIDI input から note を arrangement の MIDI clip に録音
-- `.mid` 形式 (midly) で export
+詳細は [`plan_b4_midi.md`](plan_b4_midi.md)。 minimum スコープ:
+
+- MIDI input (`midir`、 cross-platform) から note を arrangement の MIDI clip に録音
+- track header の R (Record-arm) button + transport bar の Record toggle
+- count-in 0 / 1 / 2 bars (B3 残を本フェーズで一体実装)
+- `.mid` 形式 (`midly`、 SMF format 1、 全 MIDI track 一括) で export
 
 ### B5: Linux 対応
 
