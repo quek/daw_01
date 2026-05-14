@@ -118,6 +118,17 @@ pub struct Vst3Plugin {
     /// `kPlaying`. Updated in `process()` with the current playhead.
     process_context: ProcessContext,
 
+    /// Phase 7 B1-R (2026-05-13): export 中 (= `set_render_mode(Offline)`
+    /// 受信後) は `ProcessData::processMode` を `kOffline` に切り替える。
+    /// VST3 spec の `IComponent::setIoMode` は `initialize` 前にしか呼べ
+    /// ない (= 既に active な plugin への動的切替は spec 違反 + plugin 依存
+    /// で動かない) ため、 spec 準拠の代替として process 毎の `processMode`
+    /// を切替える方式を採用。 plugin が process() 毎の processMode を尊重
+    /// するか `setupProcessing` 時の値を固定するかは plugin 実装依存だが、
+    /// 多くの reverb / convolution / lookahead 系 plugin は process 毎を
+    /// 読んで「offline = 高品質 algo に切替」 等を判定する。
+    render_mode: RenderMode,
+
     // --- GUI state -----------------------------------------------------
     view: Option<ComPtr<IPlugView>>,
     /// Plug-frame used to relay resize requests back to daw_gui.
@@ -349,6 +360,7 @@ impl Vst3Plugin {
             in_event_list: ComWrapper::new(Vst3InEventList::new()),
             out_event_list: ComWrapper::new(Vst3OutEventList::new()),
             process_context: unsafe { std::mem::zeroed() },
+            render_mode: RenderMode::Realtime,
             view: None,
             plug_frame,
             gui_attached: std::cell::Cell::new(false),
@@ -1017,7 +1029,14 @@ impl LoadedPlugin for Vst3Plugin {
             self.process_input_bufs.as_mut_ptr()
         };
         let mut data = ProcessData {
-            processMode: ProcessModes_::kRealtime,
+            // Phase 7 B1-R (2026-05-13): per-buffer の processMode は
+            // `set_render_mode` で更新される `self.render_mode` から引く
+            // (= export 中は kOffline、 通常再生は kRealtime)。 詳細は
+            // `set_render_mode` の comment 参照。
+            processMode: match self.render_mode {
+                RenderMode::Realtime => ProcessModes_::kRealtime,
+                RenderMode::Offline => ProcessModes_::kOffline,
+            },
             symbolicSampleSize: SymbolicSampleSizes_::kSample32,
             numSamples: frames as i32,
             numInputs: num_inputs,
@@ -1062,12 +1081,21 @@ impl LoadedPlugin for Vst3Plugin {
         out.append(&mut self.collected_out_notes);
     }
 
-    fn set_render_mode(&mut self, _mode: RenderMode) -> bool {
-        // VST3 has `IComponent::setIoMode` and `ProcessSetup::processMode`
-        // for offline rendering, but mapping our `RenderMode` to those is
-        // M2 work. M1: no-op. CLAP plugins still get the proper signal
-        // because they're the only backend exporting now.
-        false
+    fn set_render_mode(&mut self, mode: RenderMode) -> bool {
+        // Phase 7 B1-R (2026-05-13): VST3 spec の `IComponent::setIoMode` は
+        // `initialize` 前にしか呼べない (= 既に active な plugin への動的
+        // 切替は spec 違反 + plugin 依存で動かない) ため、 spec 準拠の代替
+        // として `ProcessData::processMode` を per-buffer で
+        // `kRealtime` / `kOffline` に切り替える。 plugin が process() 毎の
+        // processMode を尊重するか `setupProcessing` 時の値を固定するかは
+        // plugin 実装依存だが、 多くの reverb / convolution / lookahead 系
+        // plugin は process 毎を読んで「offline = 高品質 algo に切替」 等を
+        // 判定する (= effect が plugin 依存で出る、 害は無い)。 daw_audio の
+        // export 経路 (= freewheel offline render) で SetRenderMode IPC を
+        // 送ると本 setter が呼ばれ、 次 process() から `processMode = kOffline`。
+        self.render_mode = mode;
+        tracing::info!(name = %self.name, ?mode, "VST3 render mode updated");
+        true
     }
 
     fn query_latency(&mut self) -> u32 {
