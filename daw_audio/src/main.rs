@@ -223,6 +223,17 @@ async fn recv_loop(
                     }
                 });
             }
+            Ok(MainToChild::SetTrackArmed { track, armed }) => {
+                // Phase 7 B4 (2026-05-13): track.armed を Song に反映するのみ。
+                // 録音書き込み自体は GUI process で行うため audio thread 側
+                // は schema 一貫性のために値を持つだけ。 将来の audio input
+                // 録音で audio thread 側書き込みに使う想定。
+                update_song_track(&shared, |s| {
+                    if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
+                        t.armed = armed;
+                    }
+                });
+            }
             Ok(MainToChild::SetSongBpm { bpm }) => {
                 // Phase 5 Step 5.1 follow-up: BPM 軽量更新。 LoadSong を回避
                 // して shared.song の inner bpm のみ swap。 ArcSwap で clone →

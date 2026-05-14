@@ -2179,6 +2179,11 @@ pub enum AppEvent {
     SetTrackPan { track: u32, pan: f32 },
     ToggleTrackMute(u32),
     ToggleTrackSolo(u32),
+    /// Phase 7 B4 (2026-05-13): track Record-arm を toggle。 業界標準どおり
+    /// caller 側で前状態を反転、 audio engine には `MainToChild::SetTrackArmed`
+    /// で確定値を送る。 session-only / Undo 対象外 (= 業界標準は arm を Undo
+    /// 履歴に積まない、 mute / solo と同 idiom)。
+    ToggleTrackArmed(u32),
     TrackPeaksTick(Vec<(f32, f32)>),
 
     // -------- VOICEVOX ----------------------------------------------------
@@ -3062,6 +3067,9 @@ impl AppData {
             }
             AppEvent::ToggleTrackSolo(track) => {
                 self.toggle_track_solo(track);
+            }
+            AppEvent::ToggleTrackArmed(track) => {
+                self.toggle_track_armed(track);
             }
             AppEvent::TrackPeaksTick(peaks) => {
                 self.on_track_peaks_tick(&peaks);
@@ -9387,6 +9395,16 @@ impl AppData {
         t.solo = !t.solo;
         let solo = t.solo;
         let msg = MainToChild::SetTrackSolo { track: track_id, solo };
+        self.send_audio(msg);
+    }
+
+    fn toggle_track_armed(&mut self, track_id: u32) {
+        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+            return;
+        };
+        t.armed = !t.armed;
+        let armed = t.armed;
+        let msg = MainToChild::SetTrackArmed { track: track_id, armed };
         self.send_audio(msg);
     }
 

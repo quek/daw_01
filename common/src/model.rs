@@ -24,7 +24,7 @@ use crate::protocol::PluginSlot;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 8;
+pub const CURRENT_VERSION: u32 = 9;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -611,6 +611,13 @@ pub struct Track {
     /// for the duration of playback (classic mixer-strip behaviour).
     #[serde(default)]
     pub solo: bool,
+    /// Phase 7 B4 (`docs/plan_b4_midi.md` §3.1): Record-arm 状態。 armed track
+    /// のみが MIDI input (および将来の audio input) を受け取り、 録音中は
+    /// 該当 track の MIDI clip に note が書き込まれる。 業界標準 (Bitwig /
+    /// Live / Reaper) と同 idiom (= 排他性なし、 任意数の track を同時 armed
+    /// にできる)。 v8 file は `false` で forward-migrate (serde default)。
+    #[serde(default)]
+    pub armed: bool,
     /// Future use: VOICEVOX speaker / style etc. Kept distinct from the
     /// `instrument` slot because it selects a rendering backend, not a CLAP
     /// plugin.
@@ -673,6 +680,7 @@ impl Default for Track {
             pan: 0.0,
             muted: false,
             solo: false,
+            armed: false,
             source: InstrumentSource::None,
             clips: Vec::new(),
             next_clip_id: 1,
@@ -1570,7 +1578,7 @@ mod tests {
         // and `ClipContent::Automation` are added. v7 files forward-
         // migrate via `#[serde(default)]` on `automation_lanes`. Pinning
         // the constant catches accidental rollback.
-        assert_eq!(CURRENT_VERSION, 8);
+        assert_eq!(CURRENT_VERSION, 9);
     }
 
     #[test]

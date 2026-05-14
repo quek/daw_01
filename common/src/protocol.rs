@@ -350,6 +350,11 @@ pub enum MainToChild {
     SetTrackPan { track: u32, pan: f32 },
     SetTrackMuted { track: u32, muted: bool },
     SetTrackSolo { track: u32, solo: bool },
+    /// Phase 7 B4 (2026-05-13): Record-arm 状態を audio engine に伝達。
+    /// audio thread は track.armed を Song に反映するのみ (= 録音書き込み
+    /// 自体は GUI process で行うため audio 側は値を保持するだけ、 将来の
+    /// audio input 録音で audio thread 側書き込みに使う)。
+    SetTrackArmed { track: u32, armed: bool },
     /// Phase 5 Step 5.1 follow-up (gui_01 #035 + daw_01 transport scrub):
     /// BPM 軽量更新。 transport の scrubable_number drag 中に毎 frame 流れ
     /// うる想定なので、 `LoadSong` (= 全 Song serialize) ではなく単 field の
