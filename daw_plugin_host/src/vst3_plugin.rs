@@ -853,7 +853,7 @@ impl LoadedPlugin for Vst3Plugin {
         _param_events: &[crate::plugin_instance::TimedParamEvent],
         input_audio: &[&[f32]],
         aux_inputs: &[crate::plugin_instance::AuxInputBuf<'_>],
-        _transport: &crate::plugin_instance::TransportContext,
+        transport: &crate::plugin_instance::TransportContext,
     ) -> Result<i32> {
         anyhow::ensure!(self.processing, "VST3 plugin not processing");
 
@@ -956,14 +956,59 @@ impl LoadedPlugin for Vst3Plugin {
             },
         };
 
-        // Advance the transport block. `projectTimeSamples` is left
-        // free-running (+= frames each call) until the host plumbs a real
-        // playhead through — most plugins only need the `kPlaying` flag
-        // plus a monotonically-increasing counter.
-        self.process_context.projectTimeSamples = self
-            .process_context
-            .projectTimeSamples
-            .saturating_add(frames as i64);
+        // Phase 7 B1-T (2026-05-13): per-buffer transport snapshot を VST3
+        // `ProcessContext` に populate。 CLAP `build_clap_transport_event`
+        // と同 semantics (= tempo / time_sig / bar_position / cycle 範囲 /
+        // playing flag / project time の VST3 版)。 旧来は
+        // `projectTimeSamples` を free-running で `+= frames` するだけだった
+        // ため、 host の実 playhead と同期せず tempo-sync 系 VST3 plugin
+        // (delay / arp / LFO) が host テンポを追随できなかった問題を解消。
+        // VST3 spec: ProcessContext は `processContext` field 経由で plugin
+        // に届き、 plugin は `state` flag を見て個別 field の有効性を判定する
+        // (= flag の立っていない field は plugin 側で無視)。 musical time は
+        // 拍 (= TQuarterNotes f64) 単位、 sample time は absolute samples。
+        let bpm_f = f64::from(transport.bpm.max(1.0));
+        let sr_f = f64::from(transport.sample_rate.max(1));
+        let tsig_num_f = f64::from(transport.tsig_num.max(1));
+        let song_pos_seconds = transport.playhead_samples as f64 / sr_f;
+        let song_pos_beats = song_pos_seconds * bpm_f / 60.0;
+        let bar_number = (song_pos_beats / tsig_num_f).floor();
+        let bar_start_beats = bar_number * tsig_num_f;
+        self.process_context.sampleRate = self.sample_rate;
+        self.process_context.tempo = bpm_f;
+        self.process_context.timeSigNumerator =
+            i32::from(transport.tsig_num.max(1));
+        self.process_context.timeSigDenominator =
+            i32::from(transport.tsig_denom.max(1));
+        // VST3 spec: `TSamples` は i64 absolute sample position。
+        // playhead_samples は u64 だが通常使用範囲では i64 に収まる
+        // (= 2^63-1 sample @ 96 kHz で約 3 千年)。 saturating で防御。
+        let playhead_i64 = i64::try_from(transport.playhead_samples)
+            .unwrap_or(i64::MAX);
+        self.process_context.projectTimeSamples = playhead_i64;
+        self.process_context.continousTimeSamples = playhead_i64;
+        self.process_context.projectTimeMusic = song_pos_beats;
+        self.process_context.barPositionMusic = bar_start_beats;
+        self.process_context.cycleStartMusic = transport.loop_start_beats;
+        self.process_context.cycleEndMusic = transport.loop_end_beats;
+        // State flags: kTempoValid / kTimeSigValid / kProjectTimeMusicValid /
+        // kBarPositionValid / kCycleValid は常時 valid。 kPlaying /
+        // kCycleActive のみ transport 状態依存で動的設定。
+        let mut state = (StatesAndFlags_::kTempoValid
+            | StatesAndFlags_::kTimeSigValid
+            | StatesAndFlags_::kProjectTimeMusicValid
+            | StatesAndFlags_::kBarPositionValid
+            | StatesAndFlags_::kCycleValid
+            | StatesAndFlags_::kContTimeValid) as u32;
+        if transport.is_playing {
+            state |= StatesAndFlags_::kPlaying as u32;
+        }
+        if transport.is_looping
+            && transport.loop_end_beats > transport.loop_start_beats
+        {
+            state |= StatesAndFlags_::kCycleActive as u32;
+        }
+        self.process_context.state = state;
 
         let num_inputs = self.process_input_bufs.len() as i32;
         let inputs_ptr = if self.process_input_bufs.is_empty() {
