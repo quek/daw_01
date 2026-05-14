@@ -53,7 +53,7 @@
 
 <h2>大方針</h2>
 
-<p><strong>Phase 1-5 (UI を gui_01 widget で再構築) と Phase 6 (M1 完成) はすべて完了</strong>。M1 で着手予定だった VST3 / sidechain / PDC / グループトラック / Undo/Redo / plugin GUI embed もすべて実装済。 次は <strong>M2 = DAW としての表現力</strong> (オートメーション / 録音 / メトロノーム / Linux 対応) を進める。</p>
+<p><strong>Phase 1-5 (UI を gui_01 widget で再構築) と Phase 6 (M1 完成) はすべて完了</strong>。M1 で着手予定だった VST3 / sidechain / PDC / グループトラック / Undo/Redo / plugin GUI embed もすべて実装済。 次は <strong>M2 = DAW としての表現力</strong> (オートメーション / 録音 / メトロノーム) を進める。</p>
 
 <p>これまでに達成済みの土台:</p>
 <ul>
@@ -80,7 +80,6 @@
   <li><strong>B2</strong> (オーディオ録音): 未着手</li>
   <li><strong>B3</strong> (メトロノーム / count-in): <strong>完了</strong>。 count-in は B4 と一体実装 (commit 56213f8)</li>
   <li><strong>B4</strong> (MIDI 録音 / export): <strong>Minimum 完了</strong> (Step A-E)。 B3 残 (count-in) も同時 landing。 残: B1-M (VST3 IMidiMapping)、 device 選択 / punch in/out / per-track export 等は extended</li>
-  <li><strong>B5</strong> (Linux 対応): 未着手</li>
   <li><strong>Undo/Redo 残リスク (B/D/E)</strong>: 完了 (2026-05-14)</li>
 </ul>
 
@@ -152,15 +151,6 @@
 </ul>
 
 <p><strong>残 (extended)</strong>: MIDI device 選択 dropdown / punch in / out / per-track export / B1-M (VST3 IMidiMapping、 MIDI 入力で plugin parameter map)。</p>
-
-<h3>B5: Linux 対応</h3>
-<ul>
-  <li>CPAL ALSA backend</li>
-  <li>X11 / Wayland window (winit が対応済)</li>
-  <li>CLAP Linux GUI embed (<code>gtk</code> API、 現状 Win32 専用)</li>
-  <li>VST3 Linux GUI embed (<code>X11EmbedWindow</code>、 同様)</li>
-  <li>Job Object 相当 (Linux は prctl <code>PR_SET_PDEATHSIG</code>)</li>
-</ul>
 
 <h3>Undo/Redo plugin sync polish (完了)</h3>
 
