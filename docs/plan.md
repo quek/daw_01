@@ -246,7 +246,7 @@ DAW へ** のステップ。
 
 - **B1** (オートメーション + transport 通知): **ほぼ完了**。 残: B1-M (VST3 IMidiMapping、 B4 依存) のみ
 - **B2** (オーディオ録音): 未着手
-- **B3** (メトロノーム / count-in): 未着手
+- **B3** (メトロノーム / count-in): Minimum 完了。 残: count-in は B2 同時実装
 - **B4** (MIDI 録音 / export): 未着手
 - **B5** (Linux 対応): 未着手
 - **Undo/Redo 残リスク (B/D/E)**: クッションタスク、 未着手
@@ -287,13 +287,26 @@ plugin パラメータの時間変化を扱う M2 最大の機能追加。 [`pla
 - オーディオクリップ (.wav 直挿し) + arrangement 表示
 - 録音 → クリップ書き込み → ディスクに `.daw` と並んで save
 
-### B3: メトロノーム / count-in
+### B3: メトロノーム / count-in (Minimum 完了)
 
-B2 録音の前提 (録音時のテンポ guide)。 既存 sequencer に乗せる軽量実装。
+B2 録音の前提 (録音時のテンポ guide)。 既存 audio engine の master mix 後段
+に乗せる軽量実装。
 
-- 内蔵 click 音 (短い square wave)
-- count-in 1 / 2 小節 オプション
-- transport bar に on/off ボタン
+**Minimum 完了 (commit `e6d76c9`、 2026-05-13)**:
+
+- 内蔵 click 音 (sine + linear envelope decay、 accent: downbeat 880Hz / 他
+  440Hz、 40ms decay、 amp peak 0.25 = -12 dB、 mono → L/R 均等 mix)
+- transport bar に "Click" toggle button (既存 STYLE_REC_MODE 流用、 active で橙)
+- audio engine で beat 境界ごとに voice trigger + master mix 最終段に重ねる
+  (track mute / solo / volume の影響を受けず常に guide が聞こえる)
+- export 中 / playing でない / disabled で skip = CPU 0
+- session-only state (project save には含めない)
+
+**残**:
+
+- **count-in 1 / 2 小節 オプション** — B2 (オーディオ録音) の trigger 機構と
+  一体運用なので **B2 と同時実装**。 録音 trigger と切り離した状態で count-in
+  だけ実装しても使い道がない (= 再生は SeekTo で任意位置開始できる)。
 
 ### B4: MIDI 録音 / export
 
@@ -404,3 +417,4 @@ A8 で A (load 失敗 → pending stuck) は解消したが、 reconcile 経由�
 | 2026-05-13 | 8f8f730 | Phase 5 完結 | Step 5.2 SongTempo lane recording bypass wire — `daw_audio::engine::process_buffer` の `current_bpm` 計算で `recording_lanes.contains(&(MASTER_TRACK_ID, AutomationTarget::SongTempo))` を判定、 該当中は `evaluate_song_tempo` を skip して `song.bpm` constant fallback。 transport BPM input drag 時の curve / drag 値の二重反映を抑止、 mixer fader Volume / Pan の `fill_track_param_ramps` bypass と同 idiom を Song-level に展開。 plan_automation.md §10 Phase 5 の残 smoke test 4 件 + bypass wire 1 件を整理 (smoke は user 判断で skip)、 Step 5.0 / 5.1 / 5.2 / 5.3 の全項目 [x] 化で Phase 5 (Tempo / TimeSig / Transport event) 完結 |
 | 2026-05-13 | 1520977 | B1-T | VST3 `ProcessContext` per-buffer populate — `Vst3Plugin::process` が今まで `_transport: &TransportContext` を無視 + `projectTimeSamples` を free-running していた問題を解消。 CLAP `build_clap_transport_event` と同 semantics で `TransportContext` から `tempo` / `timeSigNumerator` / `timeSigDenominator` / `projectTimeSamples` / `continousTimeSamples` / `projectTimeMusic` (拍位置) / `barPositionMusic` (直近 bar 開始拍) / `cycleStartMusic` / `cycleEndMusic` / `state` flags を populate。 state は `kTempoValid` / `kTimeSigValid` / `kProjectTimeMusicValid` / `kBarPositionValid` / `kCycleValid` / `kContTimeValid` 常時 ON、 `kPlaying` / `kCycleActive` を transport 状態依存。 これで FabFilter / Vital / Avenger 等の sync 系 VST3 plugin が host テンポ + bar position に追随 |
 | 2026-05-13 | 7a58e2c | B1-R | VST3 `set_render_mode` の no-op を解消 — VST3 spec の `IComponent::setIoMode` が `initialize` 前にしか呼べない (= active 中の動的切替は spec 違反) ため、 spec 準拠の代替として `ProcessData::processMode` を per-buffer で `kRealtime` / `kOffline` に切替。 `Vst3Plugin` に `render_mode: RenderMode` field 追加 (default Realtime)、 `set_render_mode` で field 更新 + tracing log + return true、 `process()` の `ProcessData` 構築時に match で processMode 切替。 多くの reverb / convolution / lookahead 系 plugin は process() の processMode を尊重 (= effect が plugin 依存で出る、 害は無い)。 残 B1 は B1-M (VST3 IMidiMapping、 B4 依存) のみ |
+| 2026-05-13 | e6d76c9 | B3 Minimum | メトロノーム実装 — transport bar に "Click" toggle button (active 時 橙)、 audio engine で beat 境界ごとに internal click 音 (sine + linear envelope decay、 accent: downbeat 880Hz / 他 440Hz、 40ms decay、 amp peak 0.25 = -12 dB、 mono → L/R 均等 mix) を master mix 最終段に重ねる。 `MainToChild::SetMetronomeEnabled(bool)` IPC + `SharedState.metronome_enabled: AtomicBool` + `LocalState.metronome_voice: Option<ClickVoice>` + `engine::render_metronome` (buffer 範囲内の全 beat 境界で voice trigger、 既存 voice overwrite の業界標準 idiom)。 master mix 最終段なので track の mute / solo / volume の影響を受けず常に guide が聞こえる。 export 中 / playing でない / disabled で skip = CPU 0。 session-only state。 count-in 1 / 2 小節 は B2 (録音) と同時実装に分離 |
