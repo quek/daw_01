@@ -173,9 +173,12 @@ pub struct MidiBinding {
     pub target: BindingTarget,
 }
 
-/// Phase 7 B1-M Step 2 (2026-05-13): MIDI Learn の bind 先。 段階 2 では
+/// Phase 7 B1-M Step 2-4 (2026-05-13): MIDI Learn の bind 先。 段階 2 で
 /// TrackVolume / TrackPan / SongTempo の 3 種、 段階 4 で PluginParam を
-/// 追加して plugin parameter binding + IMidiMapping query 対応。
+/// 追加。 `PluginParam` の actual injection (= GUI → audio thread → plugin
+/// host → IParameterChanges で plugin に送信) は IPC + RT 安全性整備が
+/// 大規模なため extended scope (別フェーズ)、 段階 4 では「データ型 +
+/// tracing 経由の警告」 のみで bind だけは可能。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub enum BindingTarget {
     /// `Track.volume` (0.0..=1.0、 CC 0..127 を linear マップ)。
@@ -186,6 +189,17 @@ pub enum BindingTarget {
     /// curve とは独立 (= curve がある場合は curve が優先、 CC は base bpm を
     /// 動かすイメージ)。
     SongTempo,
+    /// Phase 7 B1-M Step 4: plugin parameter bind。 `track` / `slot` で
+    /// plugin instance を特定、 `param_id` は format ごと (CLAP `clap_id` /
+    /// VST3 `ParamID`)。 actual な injection は extended scope (= GUI →
+    /// audio thread → plugin host への RT-safe IPC + IParameterChanges /
+    /// CLAP_EVENT_PARAM_VALUE injection)。 段階 4 では bind data の永続化
+    /// と GUI side `apply_midi_value_to_target` での tracing log まで。
+    PluginParam {
+        track: u32,
+        slot: crate::protocol::PluginSlot,
+        param_id: u32,
+    },
 }
 
 impl Song {

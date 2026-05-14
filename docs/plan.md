@@ -244,7 +244,7 @@ DAW へ** のステップ。
 
 進捗サマリ:
 
-- **B1** (オートメーション + transport 通知): **ほぼ完了**。 残: B1-M (VST3 IMidiMapping、 B4 依存) のみ
+- **B1** (オートメーション + transport 通知): **ほぼ完了**。 残: B1-M extended (= MIDI → plugin parameter actual injection + IMidiMapping query UI)
 - **B2** (オーディオ録音): 未着手
 - **B3** (メトロノーム / count-in): **完了**。 count-in は B4 と一体実装 (commit 56213f8)
 - **B4** (MIDI 録音 / export): **Minimum 完了** (Step A-E)。 B3 残 (count-in) も同時 landing。 残: B1-M (VST3 IMidiMapping)、 device 選択 / punch in/out / per-track export 等は extended
@@ -275,11 +275,23 @@ plugin パラメータの時間変化を扱う M2 最大の機能追加。 [`pla
   initialize 前にしか呼べない (= active 中の動的切替は spec 違反) ため、
   `ProcessData::processMode` の `kRealtime` / `kOffline` 切替で代替 (commit
   `7a58e2c`、 2026-05-13)
-- **B1-M**: VST3 `IMidiMapping` (MIDI controller → plugin parameter、 = MIDI 経由の
-  パラメータ自動マップ)。 MIDI input が前提なので **B4 (MIDI 録音) 後** に
-  着手するのが自然。 spec 上 `IMidiMapping::getMidiControllerAssignment` で plugin
-  から CC# → param_id mapping を query、 host が MIDI CC を受信したら該当 param
-  に IParameterChanges 経由で送る形。
+- ~~B1-M~~ ✅ **Minimum 完了** (commits `976ba22` / `99e4fc3` / 本 commit、
+  Step 1-4)。 業界標準 MIDI Learn UI: track header の Learn button で「次の CC
+  を bind」、 `Song.midi_bindings: Vec<MidiBinding>` を project に永続化、
+  `BindingTarget::TrackVolume` / `TrackPan` / `SongTempo` / `PluginParam` の 4 種。
+  `MidiBinding::channel = 16` で any-channel 対応。
+  - **残 (extended scope)**:
+    1. **PluginParam の actual injection** — 現状 bind data は永続化されるが、
+       CC 受信時は tracing::warn のみで音には反映されない。 GUI → audio thread
+       → plugin host への RT-safe IPC + IParameterChanges (VST3) /
+       CLAP_EVENT_PARAM_VALUE injection の整備が必要。
+    2. **VST3 `IMidiMapping::getMidiControllerAssignment` query** — plugin が
+       提供する default mapping (CC# → param_id) を取得して inspector に表示
+       (= user override 可能な suggested binding)。
+    3. **per-knob Learn UI** — mixer / inspector の各 knob に「Learn MIDI」
+       メニュー (= 段階 2 の transport bar Learn button は selected_track Volume
+       fix、 各 knob から個別に Learn 開始できる)。
+    4. **MIDI Binding list view** — inspector に既存 binding 一覧 + delete UI。
 
 ### B2: オーディオ録音
 
@@ -430,4 +442,7 @@ A8 で A (load 失敗 → pending stuck) は解消したが、 reconcile 経由�
 | 2026-05-13 | 08ffa94 | B4 Step A | Track.armed schema + IPC + handler。 `common::model::Track.armed: bool` (CURRENT_VERSION 8 → 9、 v8 forward-migrate で false default)、 `MainToChild::SetTrackArmed { track, armed }` + daw_audio handler、 `AppEvent::ToggleTrackArmed(u32)` + `fn toggle_track_armed` (mute/solo と同 idiom)。 R button widget は gui_01 #040 で要望 |
 | 2026-05-13 | 10d6f3f | B4 Step A 完結 | gui_01 #040 reply 取り込み + arrangement_view wire 2 行 (`armed: t.armed` + `ToggleTrackArmed` arm) で R button 動作。 widget M14 Phase 68 で R button + armed_button style + track header layout (M / S / R 並び) + 3 段独立 hint 帯 が landing。 plan_b4_midi §12 Step A を [x] 化、 #040 を archive_001.md に切り出し |
 | 2026-05-13 | 56213f8 | B4 Step C + D | count-in + Record button + audio engine preroll + 録音書き込み。 `MainToChild::StartCountIn { samples }` IPC、 `EngineShared.preroll_total/remaining_samples` + `audio_bridge::preroll_remaining_samples` mirror、 audio engine の `process_buffer` 頭で preroll > 0 ブランチ (= 通常 dispatch / clip render skip + metronome のみ render)、 GUI on_tick で midi_recording_pending && preroll == 0 で midi_recording 昇格、 metronome は count-in 中だけ強制 ON で `metronome_enabled_pre_recording` snapshot 経由復元。 `handle_midi_note_on/off` を 2 mode 化 (= 既存 step_input_note_on 抽出、 録音 mode は `record_midi_note_on/off` で armed track 全てに対し note_on で仮 length 0.05 で push / note_off で length 確定)、 `ensure_midi_clip_at_playhead` で MIDI clip auto-extend / 新規 4 beat clip 作成。 transport bar に Count-in dropdown + Record toggle button (record red、 active 時 「● Rec」 / count-in 中 「Count-in...」)。 Step B (midir listener) は既存実装で完結確認のみ |
-| 2026-05-13 | (this commit) | B4 Step E + Minimum 完了 | MIDI export (SMF format 1)。 `midly = "0.5"` 依存追加、 `daw_gui::midi_export::export_midi(song, path)` で PPQ 480 / 全 MIDI track 並列出力 / track 0 = tempo + time_sig meta。 `MidiContent` clip だけ events 化、 audio / automation clip は skip、 同 tick 内は NoteOff → NoteOn 順に sort。 `AppEvent::ExportMidi` + `action_export_midi` (rfd `.mid` save dialog)、 File menu に "Export MIDI..." 項目追加。 4 件 unit test (empty SMF / 1 note roundtrip / audio-only skip / beat→tick / denom→log2)。 plan_b4_midi.md §12 Step E [x] 化、 plan.md Phase 7 B4 を「Minimum 完了」 化。 残 (extended): MIDI device 選択 / punch in/out / per-track export / B1-M (VST3 IMidiMapping) |
+| 2026-05-13 | a67c3fb | B4 Step E + Minimum 完了 | MIDI export (SMF format 1)。 `midly = "0.5"` 依存追加、 `daw_gui::midi_export::export_midi(song, path)` で PPQ 480 / 全 MIDI track 並列出力 / track 0 = tempo + time_sig meta。 `MidiContent` clip だけ events 化、 audio / automation clip は skip、 同 tick 内は NoteOff → NoteOn 順に sort。 `AppEvent::ExportMidi` + `action_export_midi` (rfd `.mid` save dialog)、 File menu に "Export MIDI..." 項目追加。 4 件 unit test (empty SMF / 1 note roundtrip / audio-only skip / beat→tick / denom→log2)。 plan_b4_midi.md §12 Step E [x] 化、 plan.md Phase 7 B4 を「Minimum 完了」 化。 残 (extended): MIDI device 選択 / punch in/out / per-track export / B1-M (VST3 IMidiMapping) |
+| 2026-05-13 | 976ba22 | B1-M Step 1 | MIDI CC dispatch + AppEvent::MidiControlChange + dummy CC1→TrackVolume binding。 `daw_gui/src/midi.rs::dispatch` を MIDI CC (0xB0..0xBF) 対応に拡張、 channel (0..15) 抽出。 `AppEvent::MidiControlChange { channel, controller, value }` 追加。 `handle_midi_control_change` 段階 1 dummy = CC 1 → 最初の selected_track の Volume にマップ |
+| 2026-05-13 | 99e4fc3 | B1-M Step 2 + 3 | MidiBinding データ型 + Learn UI + Project 永続化 (CURRENT_VERSION 9→10)。 `common::model::BindingTarget` enum (TrackVolume / TrackPan / SongTempo) + `MidiBinding { channel, controller, target }` + `Song.midi_bindings` 追加 (v9 forward-migrate で空 Vec)。 `AppData.midi_learn_target` + `AppEvent::StartMidiLearn` / `CancelMidiLearn` / `RemoveMidiBinding` + handler 拡張 (Learn mode で binding push / 通常 lookup で apply_midi_value_to_target 経由値送信)。 transport bar に MIDI Learn toggle button (active 時 「Learning...」、 click で selected_track の Volume を Learn target に or Cancel)。 channel = 16 は any-channel match |
+| 2026-05-13 | (this commit) | B1-M Step 4 minimum 完了 | `BindingTarget::PluginParam { track, slot, param_id }` 追加 (CURRENT_VERSION 10 維持、 enum variant 追加は project 互換)、 `apply_midi_value_to_target` で PluginParam case = tracing::warn (= bind data は永続化されるが actual injection は extended scope)。 plan.md B1 セクション update — B1-M minimum 完了マーク + extended scope 4 項目 (Plugin actual injection / IMidiMapping query / per-knob Learn UI / Binding list view) を明記。 残 extended は別フェーズで実装、 audio thread への RT-safe IPC + IParameterChanges integration が必要 |

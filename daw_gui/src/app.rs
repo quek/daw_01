@@ -6304,6 +6304,29 @@ impl AppData {
                 self.song.bpm = bpm;
                 self.send_audio(MainToChild::SetSongBpm { bpm });
             }
+            common::model::BindingTarget::PluginParam {
+                track,
+                slot,
+                param_id,
+            } => {
+                // Phase 7 B1-M Step 4 (2026-05-13): bind データは永続化されて
+                // いるが、 actual な injection (= GUI → audio thread → plugin
+                // host で IParameterChanges / CLAP_EVENT_PARAM_VALUE 送信) は
+                // extended scope (別フェーズ = plan_b1_vst3_completion.md
+                // 参照)。 RT-safe IPC + audio thread への queue + plugin
+                // host での event injection が必要なため。 現状は bind 完了
+                // は status_message に表示されるが、 CC 受信時は warning log
+                // のみで音には反映されない。 user に「bind 自体は保存される
+                // が CC 受信は次フェーズで動く」 を可視化。
+                tracing::warn!(
+                    track,
+                    ?slot,
+                    param_id,
+                    cc_norm = v_norm,
+                    "MIDI binding to PluginParam is stored but injection \
+                     is not yet implemented (extended scope)"
+                );
+            }
         }
     }
 
