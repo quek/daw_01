@@ -49,6 +49,7 @@ pub fn open_default_input(proxy: EventLoopProxy<AppEvent>) -> Result<Option<Midi
 fn dispatch(msg: &[u8], proxy: &EventLoopProxy<AppEvent>) {
     let Some(&status) = msg.first() else { return };
     let kind = status & 0xF0;
+    let channel = status & 0x0F;
     match kind {
         0x90 => {
             let (Some(&pitch), Some(&velocity)) = (msg.get(1), msg.get(2)) else {
@@ -64,6 +65,22 @@ fn dispatch(msg: &[u8], proxy: &EventLoopProxy<AppEvent>) {
         0x80 => {
             let Some(&pitch) = msg.get(1) else { return };
             let _ = proxy.send_event(AppEvent::MidiNoteOff { pitch });
+        }
+        // Phase 7 B1-M Step 1 (2026-05-13): MIDI Control Change (CC)。 status
+        // 0xB0..0xBF (= channel 0..15)、 data[0] = controller# (0..127)、
+        // data[1] = value (0..127)。 GUI 側で MIDI Learn binding lookup +
+        // 該当 BindingTarget へ値送信 (= 段階 1 では dummy で TrackVolume[0]
+        // にだけ流す、 段階 2+ で persistable な MidiBinding 経由)。
+        0xB0 => {
+            let (Some(&controller), Some(&value)) = (msg.get(1), msg.get(2))
+            else {
+                return;
+            };
+            let _ = proxy.send_event(AppEvent::MidiControlChange {
+                channel,
+                controller,
+                value,
+            });
         }
         _ => {}
     }

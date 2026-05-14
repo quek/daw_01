@@ -2034,6 +2034,11 @@ pub enum AppEvent {
     EndDrag,
     MidiNoteOn { pitch: u8, velocity: u8 },
     MidiNoteOff { pitch: u8 },
+    /// Phase 7 B1-M Step 1 (2026-05-13): MIDI Control Change (CC)。 MIDI Learn
+    /// 機能の入力。 段階 1 では dummy binding (CC 1 → selected_track の Volume
+    /// で動作確認)、 段階 2+ で persistable な MidiBinding 経由で柔軟な
+    /// routing。
+    MidiControlChange { channel: u8, controller: u8, value: u8 },
     MidiInputOpened(Option<String>),
 
     // -------- Bottom panel -------------------------------------------------
@@ -2930,6 +2935,13 @@ impl AppData {
                 // length_beats を確定。 step-input mode は note end を追跡
                 // しないので無視。
                 self.handle_midi_note_off(pitch);
+            }
+            AppEvent::MidiControlChange { channel, controller, value } => {
+                // Phase 7 B1-M Step 1 (2026-05-13): MIDI Learn 入力。 段階 1
+                // dummy: CC 1 → selected_track の Volume を 0..1 範囲にマップ。
+                // 段階 2+ で MidiBinding lookup table 経由に拡張、 plugin
+                // parameter binding は段階 4 で IParameterChanges 統合。
+                self.handle_midi_control_change(channel, controller, value);
             }
             AppEvent::MidiInputOpened(name) => {
                 let label = name.clone().unwrap_or_default();
@@ -6191,6 +6203,27 @@ impl AppData {
         if self.midi_recording {
             self.record_midi_note_off(pitch);
         }
+    }
+
+    /// Phase 7 B1-M Step 1 (2026-05-13): MIDI Learn の dummy 動作。
+    /// CC 1 (Modulation Wheel、 業界標準) を最初の `selected_track_ids` の
+    /// Volume にマップ (= 0..127 → 0..1 の linear)、 他 CC は無視。 段階 2+
+    /// で persistable な MidiBinding lookup table 経由に拡張、 channel 別
+    /// binding / Plugin parameter target / IMidiMapping query を順次追加する。
+    fn handle_midi_control_change(
+        &mut self,
+        _channel: u8,
+        controller: u8,
+        value: u8,
+    ) {
+        if controller != 1 {
+            return;
+        }
+        let Some(&track_id) = self.selected_track_ids.first() else {
+            return;
+        };
+        let amp = (f32::from(value.min(127)) / 127.0).clamp(0.0, 1.0);
+        self.set_track_volume(track_id, amp);
     }
 
     /// 既存 step-input mode (= selected_clip + step_cursor_beat に固定 length
