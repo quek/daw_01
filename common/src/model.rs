@@ -6,25 +6,32 @@ use serde::{Deserialize, Serialize};
 
 use crate::plugin_format::PluginFormat;
 use crate::protocol::PluginSlot;
+use crate::scale::ScaleChange;
 
-/// Bumped to `8` for parameter automation: `Track.automation_lanes`
-/// is added (per-target lane with a default value, an enabled toggle
-/// and clip-shaped point lists) and `ClipContent` gains an
-/// `Automation(AutomationContent { points })` variant. v7 `.daw`
-/// files still load — `automation_lanes` defaults to empty (per
-/// `#[serde(default)]`), and existing `Midi` / `Audio` variants of
-/// `ClipContent` are unaffected because the new `Automation` variant
-/// has a disjoint field set (`points` vs `notes` / `events`) under
-/// `#[serde(untagged)]`. See `docs/plan_automation.md`.
+/// Bumped to `11` for Scale &amp; Root: `Song.scale_changes:
+/// Vec<ScaleChange>` is added. v10 `.daw` files still load — the
+/// field defaults to an empty Vec (per `#[serde(default)]`), which is
+/// the "Scale feature OFF / chromatic" mode and matches the legacy
+/// behavior exactly. See `docs/plan_scale.html`.
 ///
 /// Previously:
+///   `8` parameter automation: `Track.automation_lanes` is added
+///   (per-target lane with a default value, an enabled toggle and
+///   clip-shaped point lists) and `ClipContent` gains an
+///   `Automation(AutomationContent { points })` variant. v7 `.daw`
+///   files still load — `automation_lanes` defaults to empty (per
+///   `#[serde(default)]`), and existing `Midi` / `Audio` variants of
+///   `ClipContent` are unaffected because the new `Automation` variant
+///   has a disjoint field set (`points` vs `notes` / `events`) under
+///   `#[serde(untagged)]`. See `docs/plan_automation.md`.
+///
 ///   `7` audio clip / WAV import (`ClipContent` enum `{ Midi, Audio }`
 ///   and `Song.audio_sources`); `6` shared/linked clip (notes moved
 ///   into `Song.clip_contents` keyed by `Clip.content_id`, REAPER
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 10;
+pub const CURRENT_VERSION: u32 = 11;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -136,6 +143,13 @@ pub struct Song {
     /// 空 Vec で forward-migrate。
     #[serde(default)]
     pub midi_bindings: Vec<MidiBinding>,
+    /// Phase 7 B5 (`docs/plan_scale.html`): タイムライン上の root + scale 変化点。
+    /// `beat` 昇順で保持 (= `scale_at(beat)` が rev-find で動く invariant)。
+    /// 空 Vec なら Scale 機能 OFF (chromatic 互換、 既存 project と完全互換)。
+    /// 単一キーの楽曲なら `beat = 0` の event 1 件、 転調は 2 件目以降を追加。
+    /// v10 file は `#[serde(default)]` で空 Vec で forward-migrate。
+    #[serde(default)]
+    pub scale_changes: Vec<ScaleChange>,
 }
 
 impl Default for Song {
@@ -155,6 +169,7 @@ impl Default for Song {
             song_lanes: Vec::new(),
             next_song_lane_id: 1,
             midi_bindings: Vec::new(),
+            scale_changes: Vec::new(),
         }
     }
 }
@@ -216,6 +231,25 @@ impl Song {
         let id = self.next_song_lane_id.max(1);
         self.next_song_lane_id = id + 1;
         id
+    }
+
+    /// Phase 7 B5 (`docs/plan_scale.html`): 指定 beat における active な
+    /// `ScaleChange` を返す。 該当 event が無ければ `None` (= Scale 機能 OFF /
+    /// chromatic 扱い)。 `scale_changes` は beat 昇順 invariant 前提で、
+    /// `rev().find()` で「該当 beat 直前の最新 event」 を取る。
+    pub fn scale_at(&self, beat: f64) -> Option<&ScaleChange> {
+        self.scale_changes
+            .iter()
+            .rev()
+            .find(|c| c.beat <= beat)
+    }
+
+    /// Phase 7 B5: `scale_changes` を beat 昇順に保つ。 同 beat の
+    /// duplicate は許容 (上書きするかは caller 判断)。 scale_changes を
+    /// 変更したあと (event 追加 / move) に呼ぶ。
+    pub fn ensure_scale_changes_sorted(&mut self) {
+        self.scale_changes
+            .sort_by(|a, b| a.beat.partial_cmp(&b.beat).unwrap_or(std::cmp::Ordering::Equal));
     }
 
     /// Phase 5: find a song-level lane (mutable) by id。 Track の
@@ -1625,12 +1659,13 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_eight() {
-        // Bumped to 8 for parameter automation: `Track.automation_lanes`
-        // and `ClipContent::Automation` are added. v7 files forward-
-        // migrate via `#[serde(default)]` on `automation_lanes`. Pinning
-        // the constant catches accidental rollback.
-        assert_eq!(CURRENT_VERSION, 10);
+    fn current_version_is_pinned() {
+        // Bumped to 11 for Scale & Root: `Song.scale_changes:
+        // Vec<ScaleChange>` is added. v10 files forward-migrate via
+        // `#[serde(default)]` on `scale_changes` (= empty Vec = Scale
+        // feature OFF / chromatic = legacy behavior). Pinning the
+        // constant catches accidental rollback.
+        assert_eq!(CURRENT_VERSION, 11);
     }
 
     #[test]

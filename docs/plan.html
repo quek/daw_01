@@ -80,6 +80,7 @@
   <li><strong>B2</strong> (オーディオ録音): 未着手</li>
   <li><strong>B3</strong> (メトロノーム / count-in): <strong>完了</strong>。 count-in は B4 と一体実装 (commit 56213f8)</li>
   <li><strong>B4</strong> (MIDI 録音 / export): <strong>Minimum 完了</strong> (Step A-E)。 B3 残 (count-in) も同時 landing。 残: B1-M (VST3 IMidiMapping)、 device 選択 / punch in/out / per-track export 等は extended</li>
+  <li><strong>B5</strong> (Scale &amp; Root): <strong>設計済 / 着手前</strong>。 詳細は <a href="plan_scale.html"><code>plan_scale.html</code></a>。 Cubase 流の時間軸 scale event SSoT + 3 軸 constrain (Snap on Draw / Snap Live / Quantize Pitches) + Ableton 流 Fold to Scale を採用</li>
   <li><strong>Undo/Redo 残リスク (B/D/E)</strong>: 完了 (2026-05-14)</li>
 </ul>
 
@@ -151,6 +152,22 @@
 </ul>
 
 <p><strong>残 (extended)</strong>: MIDI device 選択 dropdown / punch in / out / per-track export / B1-M (VST3 IMidiMapping、 MIDI 入力で plugin parameter map)。</p>
+
+<h3>B5: Scale &amp; Root (設計済 / 着手前)</h3>
+
+<p>楽曲のキー (root + scale) を Song に持たせ、 ピアノロールの行ハイライト / 入力の制約 / ノートの一括補正 / VOICEVOX 歌唱の pitch snap に活用する。 詳細は <a href="plan_scale.html"><code>plan_scale.html</code></a>。</p>
+
+<p>設計判断 (要点):</p>
+<ul>
+  <li><strong>SSoT は <code>Song.scale_changes: Vec&lt;ScaleChange&gt;</code></strong> (Cubase 流の時間軸 scale event)。 Clip/Track/Project の 3 層に分けず、 Song 直下 1 本のタイムラインで「<code>beat = 0</code> から最初の event」 → 「次の event でルート変更」 と表現。 転調は 2 件目以降を追加。 空 Vec = 機能 OFF / chromatic 互換 (既存 project と完全互換)。</li>
+  <li><strong>3 軸 constrain は独立 toggle</strong> (Cubase 流): Snap on Draw (描画時) / Snap Live Input (録音時) / Quantize Pitches (一括補正)。 全 default OFF。 step input は scale 拘束外 (= pitch を「聞いて」 決める用途)。</li>
+  <li><strong>ピアノロール表現は 2 モード</strong>: <code>Highlight</code> (root 強調 + in-scale 通常 + out-of-scale dim) と <code>Fold</code> (Ableton K キー相当、 out 行を非表示)。 度数別カラー (Bitwig) は scope 外。</li>
+  <li><strong>Scale 内蔵 22 種</strong> + Custom (12-bit mask)。 Bitwig 23 / Cubase 22 の合集合をベース。</li>
+  <li><strong>audio engine / plugin host への影響なし</strong> (= GUI 層の概念、 note は既に snap 済 pitch で送信される)。 IPC protocol 変更不要。</li>
+  <li><strong>段階実装 S1-S6</strong>: データモデル → Transport 表示 → piano_roll Highlight/Fold (gui_01 #042 要望) → 3 軸 constrain wire → Arrangement Scale Lane (gui_01 #043 要望) → Custom scale エディタ / Quantize モード拡張。</li>
+</ul>
+
+<p>CURRENT_VERSION 10 → 11 へ bump (= <code>scale_changes</code> 追加)。 v10 ファイルは <code>#[serde(default)]</code> で空 Vec で forward-migrate。</p>
 
 <h3>Undo/Redo plugin sync polish (完了)</h3>
 

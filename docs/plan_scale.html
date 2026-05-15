@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>daw_01 plan — Scale &amp; Root</title>
+<style>
+  body {
+    font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Meiryo", -apple-system,
+                 "Segoe UI", system-ui, sans-serif;
+    max-width: 1100px;
+    margin: 1em auto;
+    padding: 0 1em 4em;
+    line-height: 1.65;
+    color: #1c1c1c;
+    background: #fafafa;
+  }
+  h1 { font-size: 1.8em; border-bottom: 2px solid #444; padding-bottom: .25em; margin-top: 1.2em; }
+  h2 { font-size: 1.4em; border-bottom: 1px solid #bbb; padding-bottom: .2em; margin-top: 1.8em; }
+  h3 { font-size: 1.15em; margin-top: 1.6em; color: #2a4a7a; }
+  h4 { font-size: 1.0em; margin-top: 1.3em; color: #555; }
+  code { background: #eee; padding: 1px 4px; border-radius: 3px; font-family: "Consolas", "Courier New", monospace; font-size: .92em; }
+  pre { background: #2b2b2b; color: #e8e8e8; padding: 1em; border-radius: 4px; overflow-x: auto; font-size: .9em; line-height: 1.4; }
+  pre code { background: transparent; padding: 0; color: inherit; }
+  a { color: #1a5fb4; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  ul { padding-left: 1.6em; }
+  li { margin: .25em 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: .92em; }
+  th, td { border: 1px solid #ccc; padding: .4em .6em; text-align: left; vertical-align: top; }
+  th { background: #efefef; }
+  td:first-child { white-space: nowrap; color: #555; }
+  blockquote { border-left: 4px solid #bbb; padding: .3em .8em; color: #555; margin: .8em 0; background: #f0f0f0; }
+  strong { color: #000; }
+  .nav { font-size: .9em; color: #666; margin: 1em 0; }
+  .note { font-size: .9em; color: #666; }
+  .ref { font-size: .85em; color: #666; }
+</style>
+</head>
+<body>
+
+<h1>daw_01 plan — Scale &amp; Root</h1>
+
+<p class="nav"><a href="plan.html">← plan.html (master plan) に戻る</a></p>
+
+<p>楽曲のキー (root + scale) を Song に持たせ、 ピアノロールのハイライト / 入力の制約 / ノートの一括補正 / VOICEVOX 歌唱の pitch snap に活用する機能を新設する。 設計は Ableton Live 12 / Bitwig Studio 6 / Cubase Pro の挙動を一次情報から読み、 daw_01 の SSoT 原則 (CLAUDE.md "Single Source of Truth") に合わせて統合した。</p>
+
+<h2>1. 参考 DAW の挙動差分 (一次情報サマリ)</h2>
+
+<table>
+<thead>
+<tr><th>観点</th><th>Ableton Live 12</th><th>Bitwig Studio 6</th><th>Cubase Pro</th></tr>
+</thead>
+<tbody>
+<tr><td>SSoT の置き場所</td><td>Clip 単位 (Control Bar は selected clip 反映)</td><td>Project global (Transport bar) + Local override</td><td>Chord Track 上の Scale Event (時間軸)</td></tr>
+<tr><td>時間軸での転調</td><td>×（Arrangement 中の動的切替不可、 M4L 要）</td><td>◯ root / scale を automation で変更可</td><td>◯ Scale Event を時間軸に複数並べる</td></tr>
+<tr><td>描画時 constrain</td><td>×（Scale device で代替）</td><td>◯ Snap to Key (Pencil / Spray Can が in-key だけ生成)</td><td>◯ Snap Pitch Editing</td></tr>
+<tr><td>Live 入力 constrain</td><td>Scale device 経由</td><td>Note FX の "Use Global Key"</td><td>◯ Snap Live Input</td></tr>
+<tr><td>既存ノート一括補正</td><td>×（Scale device は実時間処理）</td><td>◯ Quantize to Key (Smart / Quantize Up)</td><td>◯ Quantize Pitches</td></tr>
+<tr><td>ピアノロール表現</td><td>鍵盤ハイライト + Fold to Scale</td><td>度数別カラー + Adapt to Key 背景モード</td><td>scale 外 dim 背景 + 色分け</td></tr>
+<tr><td>内蔵 scale 数</td><td>〜30 + User scale</td><td>23 固定</td><td>〜22 固定</td></tr>
+<tr><td>連携機能</td><td>Scale device (per track MIDI FX)</td><td>6 デバイス + Grid モジュールが Global Key 受信</td><td>Chord Track が全 MIDI 編集に作用</td></tr>
+</tbody>
+</table>
+
+<p class="ref">出典: <a href="https://www.ableton.com/en/live-manual/12/editing-midi/">Ableton Live 12 Manual — Editing MIDI</a>、 <a href="https://help.ableton.com/hc/en-us/articles/11425083250972-Keys-and-Scales-in-Live-12-FAQ">Keys and Scales in Live 12 FAQ</a>、 <a href="https://www.bitwig.com/userguide/latest/note_fx/">Bitwig Studio Note FX</a>、 <a href="https://polarity.me/posts/polarity-music/2025-08-31-bitwig-6-how-to-use-scales-and-modes/">Bitwig 6 Scale Highlighting</a>、 <a href="https://archive.steinberg.help/cubase_pro/v11/en/cubase_nuendo/topics/midi_editors/midi_editors_scales_in_key_editor_r.html">Cubase Pro 11 Scale Assistant in Key Editor</a>、 <a href="https://archive.steinberg.help/cubase_ai/v12/en/cubase_nuendo/topics/chord_functions/chord_functions_scale_events_c.html">Cubase Scale Events</a>、 <a href="https://www.soundonsound.com/techniques/cubase-11-scale-assistant">Sound on Sound — Cubase 11 Scale Assistant</a>。</p>
+
+<h2>2. 大方針</h2>
+
+<p>daw_01 は「<strong>時間軸上の scale change event</strong> (Cubase 流) を Song 直下に持つ」 + 「<strong>3 軸で独立に scale 拘束を ON/OFF</strong> (Cubase 流: 描画時 / Live 入力 / 一括補正)」 + 「<strong>Fold to Scale</strong> (Ableton 流)」 を採用する。 度数別カラー (Bitwig) と Chord Track / Scale Suggestions (Cubase) は <strong>scope 外</strong>。</p>
+
+<ul>
+  <li><strong>SSoT は <code>Song.scale_changes: Vec&lt;ScaleChange&gt;</code></strong>。 Clip 単位 / Track 単位 / プロジェクト global を別々に持つと SSoT 違反 (CLAUDE.md)。 1 本のタイムラインで「<code>beat = 0</code> から最初の event」 → 「次の event でルート変更」 ... と表現する。</li>
+  <li>転調 (key change) は <code>scale_changes</code> に 2 件目以降を追加するだけ。 Cubase の Scale Event と同じく次の event 開始まで有効。</li>
+  <li>無設定 (<code>scale_changes</code> 空) = constraint OFF / chromatic 互換 = <strong>既存の挙動と完全互換</strong>。 新規ユーザは Scale 機能を意識せず使える。</li>
+  <li>UI は<strong>段階的に増やす</strong>。 最初は Transport の「現在の root + scale 表示 + dropdown」 と Piano Roll の鍵盤ハイライト + Fold だけで十分実用。 Arrangement の Scale Lane (Chord Track 風) は後段で追加。</li>
+  <li><strong>3 軸 constrain は完全に独立 toggle</strong> (Snap on Draw / Snap Live Input / Quantize Pitches)。 Cubase の三分法が最も明快で、 「描画は scale 拘束したいが Live 入力は半音単位で record したい」 等の運用にも対応できる。</li>
+</ul>
+
+<h2>3. データモデル</h2>
+
+<h3>3.1 Scale enum</h3>
+
+<p>業界標準で実用十分な <strong>22 種類 + User</strong> を内蔵。 daw_01 側は <code>enum Scale</code> 1 個と「ルート起点 12-bit pitch class mask」 への変換 1 個で扱う (= Scale ごとの値はテーブルから取る、 SSoT)。 Bitwig 23 種類と Cubase 22 種類の合集合をベースに、 ジャズ / ワールド系を一部刈り込む。</p>
+
+<pre><code>// common/src/scale.rs (新設)
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
+pub enum Scale {
+    // 教会旋法 (Ionian/Aeolian は Major/NaturalMinor として後段に置く)
+    Major,            // = Ionian
+    NaturalMinor,     // = Aeolian
+    Dorian,
+    Phrygian,
+    Lydian,
+    Mixolydian,
+    Locrian,
+
+    // マイナー系
+    HarmonicMinor,
+    MelodicMinor,     // 上行のみ (ジャズで一般的な扱い)
+
+    // ペンタトニック / ブルース
+    MajorPentatonic,
+    MinorPentatonic,
+    Blues,            // minor pentatonic + b5
+
+    // 限定的だが業界標準
+    WholeTone,
+    Diminished,       // whole-half (8 音)
+    HalfWholeDim,     // half-whole (8 音、 ドミナント上で頻出)
+    Chromatic,        // = 12 全部 in-scale (= snap 効かないが Highlight は root のみ強調)
+
+    // ジャズ / ワールド系
+    HarmonicMajor,
+    DoubleHarmonic,   // Byzantine
+    LydianDominant,   // = MelodicMinor の 4 度
+    MixolydianBflat9, // Phrygian Dominant (Spanish)
+    Hungarian,        // Hungarian Minor
+    Japanese,         // In-Sen (都節)
+
+    // ユーザ定義: ルート起点の 12-bit pitch class mask
+    Custom(u16),
+}
+
+impl Scale {
+    /// ルート起点で「半音 d (0..=11) が in-scale か」を返す 12-bit mask。
+    /// 例: Major = 0b0000_1010_1011_0101 (C, D, E, F, G, A, B = bits {0,2,4,5,7,9,11})
+    pub fn pitch_class_mask(self) -&gt; u16 {
+        match self {
+            Scale::Major =&gt; 0b1010_1011_0101,
+            Scale::NaturalMinor =&gt; 0b0101_1010_1101,
+            // ... テーブル化、 Bitwig / Cubase 公開仕様に従う
+            Scale::Custom(m) =&gt; m &amp; 0x0FFF,
+            // ...
+        }
+    }
+
+    /// 表示名 ("Major" 等)。 i18n は当面英語固定。
+    pub fn display_name(self) -&gt; &amp;'static str { ... }
+}</code></pre>
+
+<h3>3.2 ScaleChange と Song への組み込み</h3>
+
+<pre><code>// common/src/scale.rs
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct ScaleChange {
+    /// タイムライン位置 (beat、 song-global)。 0.0 を最初の event とする慣習。
+    pub beat: f64,
+    /// ルート pitch class (0..=11、 0 = C)。
+    pub root: u8,
+    /// スケール種別。
+    pub scale: Scale,
+}
+
+// common/src/model.rs (既存 Song に field 追加)
+
+pub struct Song {
+    // ... existing fields ...
+
+    /// Phase 7 B5 (`docs/plan_scale.html`): タイムライン上の root + scale 変化点。
+    /// `beat` 昇順で保持。 空 Vec なら Scale 機能 OFF (chromatic 互換)。
+    /// 単一キーの楽曲なら `beat = 0` の event 1 件だけ。 転調は 2 件目以降を追加。
+    /// v10 file は空 Vec で forward-migrate (= 既存 project 完全互換)。
+    #[serde(default)]
+    pub scale_changes: Vec&lt;ScaleChange&gt;,
+}</code></pre>
+
+<h3>3.3 query API</h3>
+
+<p>「playhead 位置 / 任意 beat / 任意 Note の scale」 は 1 関数で取れるようにする。 audio engine / piano_roll / VOICEVOX いずれも同じ entry point を経由。</p>
+
+<pre><code>// common/src/scale.rs
+
+impl Song {
+    /// 指定 beat における active な scale を返す。 該当 event が無ければ None
+    /// (= 機能 OFF、 chromatic 扱い)。
+    pub fn scale_at(&amp;self, beat: f64) -&gt; Option&lt;&amp;ScaleChange&gt; {
+        self.scale_changes
+            .iter()
+            .rev()
+            .find(|c| c.beat &lt;= beat)
+    }
+}
+
+impl ScaleChange {
+    /// 指定 MIDI pitch (0..=127) が in-scale か。
+    pub fn contains(&amp;self, pitch: u8) -&gt; bool {
+        let d = (pitch as i32 - self.root as i32).rem_euclid(12) as u16;
+        (self.scale.pitch_class_mask() &gt;&gt; d) &amp; 1 == 1
+    }
+
+    /// 最寄りの in-scale な pitch を返す。 同距離なら上向きを優先 (Cubase 流)。
+    pub fn snap(&amp;self, pitch: u8) -&gt; u8 { ... }
+
+    /// scale 度の整数 (0 = root、 1 = 2nd、 ...) で pitch を transpose。
+    /// Bitwig の "Shift by Scale Steps" 相当 (将来の Note FX で利用)。
+    pub fn step_transpose(&amp;self, pitch: u8, steps: i32) -&gt; u8 { ... }
+}</code></pre>
+
+<h3>3.4 互換性 (CURRENT_VERSION)</h3>
+
+<ul>
+  <li><strong>CURRENT_VERSION 10 → 11</strong> に bump。 schema 変化 = <code>Song.scale_changes</code> 追加 + <code>Scale</code> enum 新設。</li>
+  <li><code>#[serde(default)]</code> で v10 ファイルは空 Vec で forward-migrate (= Scale 機能 OFF、 既存挙動完全互換)。</li>
+  <li>Migration は<strong>不要</strong>。 「最初に Scale UI を触ったとき <code>beat = 0</code> の event を 1 件追加」 が自然な lazy initialization。</li>
+  <li><code>Scale</code> enum に variant 追加するときは bincode が tag-based なので新 variant が末尾に居れば前方互換可。 末尾追加を idiom とする (Rust 標準慣習)。</li>
+</ul>
+
+<h2>4. UI</h2>
+
+<p>UI は <strong>4 箇所</strong>。 段階実装 (§9) の順で増やす。</p>
+
+<h3>4.1 Transport bar — 現在位置の root + scale 表示 + dropdown</h3>
+
+<ul>
+  <li>BPM / time_sig の隣に「<code>C Major</code>」 形式の small label を追加。 click で root + scale dropdown を開く。</li>
+  <li>表示する値は <strong>playhead 位置の scale_at(playhead_beat)</strong>。 Cubase 流 (Chord Track event は playhead に追随)。 再生中は自動で current scale が変わるので転調が視覚的に追える。</li>
+  <li>dropdown commit = <code>scale_changes</code> に対する変更:
+    <ul>
+      <li>scale_changes が空 → <code>beat = 0</code> の event を新規追加</li>
+      <li>scale_changes が 1 件 → その event の root / scale を更新</li>
+      <li>scale_changes が複数 → <strong>playhead 直前の event</strong> (= <code>scale_at(playhead_beat)</code>) を更新。 「ここで転調を変更したい」 を直感的に達成 (Cubase Transport の Chord Track edit と同じ)</li>
+    </ul>
+  </li>
+  <li>右クリックで <code>"Insert key change here"</code> / <code>"Remove key change here"</code> menu。 細かい時間軸編集は Arrangement Scale Lane (§4.2) 経由。</li>
+  <li>scale_changes が空のときは「<code>No Key</code>」 表示 (Bitwig 流の「無設定」 を明示)。 click で初期 scale (C Major) を提案する dropdown。</li>
+</ul>
+
+<h3>4.2 Arrangement Scale Lane (Cubase Chord Track 風、 後段)</h3>
+
+<ul>
+  <li>arrangement view の上端 (ruler 直下、 既存の Master row があれば直下) に「Scale」 という<strong>専用 lane</strong> を 1 本挟む。 toggle で表示/非表示 (default ON、 scale_changes が空でも lane は出る)。</li>
+  <li>Scale event は <strong>ピン</strong>のような UI (Cubase の Scale Event と同 idiom)。 横位置 = <code>beat</code>、 ラベル = <code>"C Major"</code>。 隣の event 開始まで背景 band を薄い tint で塗る (= どこからどこまでが C Major か視覚化)。</li>
+  <li>操作:
+    <ul>
+      <li>左クリック → event 選択 + dropdown popup で root / scale 編集</li>
+      <li>左ドラッグ → event を時間軸方向に移動 (snap 適用)</li>
+      <li>右クリック → "Delete" / "Duplicate"</li>
+      <li>lane 空白部 dbl-click → 該当 beat に新 event 追加 (直前の event の root/scale を継承)</li>
+    </ul>
+  </li>
+  <li>これは <code>arrangement</code> widget の lane 概念拡張になるので gui_01 widget 側に拡張要望が必要 (§8 参照)。</li>
+</ul>
+
+<h3>4.3 Piano Roll header — 現在 scale 表示 + toggle 群</h3>
+
+<ul>
+  <li>piano_roll widget の header (snap toolbar の右、 既存空き領域) に以下を追加:
+    <ul>
+      <li>「<code>C Major</code>」 label (Transport と同期、 click で同 dropdown)</li>
+      <li><strong>Highlight</strong> toggle (鍵盤レーンの scale 行ハイライトを ON/OFF、 default ON)</li>
+      <li><strong>Fold</strong> toggle (Ableton K キー相当、 out-of-scale 行を非表示、 default OFF)</li>
+      <li><strong>Snap on Draw</strong> toggle (§5.1)</li>
+    </ul>
+  </li>
+  <li>Live 入力 snap / 一括 quantize は piano_roll ヘッダではなく、 Live 入力 = transport bar の Record 周辺、 一括 quantize = 右クリック menu (§5)。</li>
+  <li>表示する scale は piano_roll の <strong>view start_beat</strong> (= clip start_beat + scroll) ではなく <strong>playhead 位置</strong>。 ただし piano_roll で編集中の clip が playhead と離れているときは「<code>clip.start_beat</code> 位置の scale」 を表示するほうが直感的 (= 編集中の場所の scale を出す)。 段階 S2 では simply playhead で開始、 ユーザフィードバックで切替。</li>
+</ul>
+
+<h3>4.4 Piano Roll 鍵盤レーン — 行ハイライト / dim / fold</h3>
+
+<p>piano_roll widget の左端鍵盤レーンと、 ノート描画領域の背景の両方に、 scale 情報を反映する。</p>
+
+<ul>
+  <li><strong>Root 行</strong>: 鍵盤の C / C# / ... ラベル背景を強調色 (Bitwig 流: 黄み or 暖色 tint)。 ノート領域も同じ y 位置に薄い tint。</li>
+  <li><strong>In-scale 行</strong>: 通常の白鍵 / 黒鍵 表示 (= 既存挙動)。 ただし黒鍵が in-scale (例: D♭ Major の D♭) なら少し明るく、 白鍵が out-of-scale (例: D♭ Major の F) なら少し暗く。</li>
+  <li><strong>Out-of-scale 行</strong>: alpha 50% 程度に dim、 もしくは灰色 overlay (Cubase "Show Scale Note Guides" 風)。</li>
+  <li><strong>Fold mode</strong> (toggle ON): out-of-scale 行を行リストから除外し、 ピアノロール全体が in-scale 行のみで構成される。 7 音 scale なら 12 行 → 7 行になり、 縦に圧縮されたコンパクト表示。 既存ノートが out-of-scale なら fold mode 中も「上下隣の in-scale 行の間」 にはみ出して表示する (Ableton と同じく、 fold mode は描画だけの変更で実データは触らない)。</li>
+  <li>Fold mode は<strong>視覚専用</strong>。 マウスでの note 追加 / drag / 既存ノートの編集は依然 in-scale 行ベースで動く (fold 中に Alt 押下で out-of-scale 行に「割り込む」 等は段階 S6 以降の拡張)。</li>
+</ul>
+
+<h2>5. 入力 constrain (3 軸)</h2>
+
+<p>Cubase の三分法を採用。 <strong>3 軸とも独立 toggle</strong>、 全 default OFF (= 既存挙動互換)。 toggle 状態は session-only (project save しない)。 各軸の責務:</p>
+
+<table>
+<thead>
+<tr><th>軸</th><th>対象</th><th>UI 位置</th><th>挙動</th></tr>
+</thead>
+<tbody>
+<tr><td>S-Draw</td><td>マウスでの note 追加</td><td>Piano Roll header の「Snap on Draw」 toggle</td><td><code>add_note(pitch)</code> 直前で <code>scale_at(beat).snap(pitch)</code> を当てる。 描画中の drag-resize / drag-move でも適用</td></tr>
+<tr><td>S-Live</td><td>MIDI 録音 中の note_on</td><td>Transport bar の Record button 隣に「Snap Live」 toggle</td><td><code>record_midi_note_on(pitch)</code> 直前で snap。 録音前 step input (= キーボード / MIDI で listen 中) は <strong>適用しない</strong> (= ピッチを「聞いて」決めるため。 Cubase は Snap Live Input は recording 時のみ)</td></tr>
+<tr><td>Q-Pitch</td><td>既存 note の一括補正</td><td>piano_roll の note 右クリック menu「Quantize Pitches to Scale」</td><td>選択中 note (or clip 全 note) を <code>ScaleChange::snap</code> で書き換える。 1 操作 1 Undo step</td></tr>
+</tbody>
+</table>
+
+<h3>5.1 Snap on Draw</h3>
+
+<ul>
+  <li>適用箇所: <code>AppEvent::AddNote { pitch, ... }</code> handler (daw_01 では <code>app.rs::add_note</code>)。 handler 冒頭で <code>scale_at(beat).snap(pitch)</code> を経由。</li>
+  <li>drag-resize / drag-move でも適用したい (= note の y 軸 drag で pitch 変更)。 piano_roll widget が emit する <code>PianoRollEditRequest::Move</code> / <code>Add</code> の pitch 値を caller (daw_01) 側で受け取った直後に snap。 widget 側で snap させる必要は無い (= widget は scale を知らなくて済む)。</li>
+  <li>Alt 押下中は snap 一時無効 (gui_01 既存の Alt = snap bypass の idiom を踏襲)。</li>
+</ul>
+
+<h3>5.2 Snap Live Input</h3>
+
+<ul>
+  <li>適用箇所: <code>daw_gui::app::record_midi_note_on(track_id, pitch, velocity)</code> 冒頭で <code>scale_at(playhead_beat).snap(pitch)</code>。</li>
+  <li>note_off は note_on の pitch を <code>active_recording_notes</code> map で参照する作りなので、 note_on で snap した値を保存しておく。</li>
+  <li>step input (= recording 停止中の MIDI 入力 / キーボードで note 追加) には<strong>適用しない</strong>。 step input は pitch を「聞きながら選ぶ」 用途で、 強制 snap すると意図しない音が出る (Cubase / Bitwig も同じ判断、 step input は scale 拘束外)。</li>
+</ul>
+
+<h3>5.3 Quantize Pitches</h3>
+
+<ul>
+  <li>適用箇所: 新 <code>AppEvent::QuantizePitchesToScale { target: PitchTarget }</code> (undoable)。 PitchTarget は <code>SelectedNotes</code> / <code>ClipAllNotes(ClipRef)</code> / <code>SongAllNotes</code>。</li>
+  <li>handler: 対象 note の <code>pitch</code> を <code>scale_at(note.start_beat).snap(pitch)</code> で書き換える。 <strong>note の start_beat 時点の scale</strong> を使う (= 転調をまたぐ note も自然に補正される)。</li>
+  <li>UI 経路 (段階的に増やす):
+    <ul>
+      <li>piano_roll で note を右クリック → "Quantize Pitches to Scale" (選択 note)</li>
+      <li>piano_roll header のメニューに "Quantize all to Scale" (clip 全 note)</li>
+      <li>arrangement の clip 右クリックに「Quantize Pitches」 (MIDI clip のみ表示)</li>
+    </ul>
+  </li>
+  <li>Bitwig の "Quantize Up" (= 最寄り上の in-scale) vs "Smart Quantize" (= 音楽的方向の最寄り) は 段階 S6 以降。 S5 では single mode (最寄り / 同距離なら上) で開始。</li>
+</ul>
+
+<h2>6. VOICEVOX 連携</h2>
+
+<p>VOICEVOX は <code>Note.pitch: u8</code> をそのまま VOICEVOX engine の <code>FrameAudioQuery.notes[].key</code> に渡している (= 微分音は持たない)。 つまり <strong>Note.pitch 自体が in-scale ならそのまま正しく歌う</strong>。</p>
+
+<ul>
+  <li>S-Draw / S-Live / Q-Pitch が note.pitch を in-scale に keep していれば、 VOICEVOX 経路に追加のロジックは不要 (= シンプル)。</li>
+  <li>VOICEVOX synth 経路で<strong>追加で適用すべき変換は無い</strong>。 「ピアノロールで scale 拘束を外した状態で out-of-scale な note を打ち込んだ」 ユーザは、 意図して out-of-scale を入力している (= 装飾音 / 経過音 / ブルーノート 等) ので、 synth で勝手に snap すると意図に反する。</li>
+  <li>ただし<strong>歌詞 → ノート割り当て</strong>のような将来的な機能 (= 自動でメロディを生成する系) を入れるなら、 そこで scale を query するのは自然。 S6 以降の検討。</li>
+</ul>
+
+<h2>7. audio engine / plugin host への影響</h2>
+
+<ul>
+  <li>scale は<strong>純粋に GUI 層の概念</strong>。 audio engine / plugin host / MIDI 出力には影響しない (= note は既に snap 済の pitch で送信される、 host 側で再 snap する必要なし)。</li>
+  <li>plugin に scale 情報を渡す経路 (= CLAP <code>clap_event_transport_t</code> や VST3 <code>ProcessContext</code> に scale info 拡張) は<strong>標準で無い</strong>。 Bitwig の Note FX は Bitwig 内部 protocol で global key を購読する独自仕様。 標準 plugin はそもそも scale を解釈しないので IPC で送る必要なし。</li>
+  <li>= IPC protocol (MainToChild / ChildToMain) には<strong>追加変更不要</strong>。 daw_audio / daw_plugin_host のコードは触らない。</li>
+</ul>
+
+<h2>8. gui_01 widget 拡張要望</h2>
+
+<p>下記 3 つを gui_01 #042+ で要望提出 (関連仕様: <code>daw_01/docs/plan_scale.html</code>)。 memory: <a href="#">feedback_gui_01_scope_review</a> に従い<strong>最終形態をまとめて</strong>伝える。 §9 S4 (piano_roll widget の scale highlight + fold) を最初に出し、 S3 (arrangement scale lane) は別エントリで後段に。</p>
+
+<h3>8.1 piano_roll widget に Scale highlight / Fold サポート</h3>
+
+<p>新 struct <code>PianoRollScale</code> を <code>PianoRollView</code> に追加。 widget 内で行ハイライトと fold を完結させる。 daw_01 側は <code>ScaleChange</code> を 1:1 で渡すだけ。</p>
+
+<pre><code>// gui_01 提案 API
+
+pub struct PianoRollScale {
+    /// ルート pitch class (0..=11)。
+    pub root: u8,
+    /// ルート起点の 12-bit in-scale mask。 0 ビット = root、 1〜11 = +1〜+11 半音。
+    pub in_scale_mask: u16,
+    /// 表示モード。
+    pub mode: PianoRollScaleMode,
+}
+
+pub enum PianoRollScaleMode {
+    /// 鍵盤レーンの root 行 / in-scale 行 / out-of-scale 行を色分け。
+    /// note 描画領域も背景 tint。
+    Highlight,
+    /// out-of-scale 行を行リストから完全に除外 (Ableton K キー相当)。
+    /// 12 行 → 7 (or scale 音数) 行に圧縮される。 既存 note が out-of-scale
+    /// なら上下隣の in-scale 行の中間に描画。
+    Fold,
+}
+
+pub struct PianoRollView {
+    // ... existing ...
+    /// `None` なら scale 機能 OFF (既存挙動互換、 v0 default)。
+    pub scale: Option&lt;PianoRollScale&gt;,
+}</code></pre>
+
+<p>color スキーマは <code>PianoRollStyle</code> 側に追加 (<code>root_row_bg</code> / <code>in_scale_row_bg</code> / <code>out_of_scale_row_bg</code> + key label color)、 caller がカスタマイズ可能にしたい。 ただし <code>Default::default()</code> で適切な配色 (Bitwig 黄み + 灰 dim 風) が出るように。</p>
+
+<h3>8.2 piano_roll の note y-drag が caller に渡す pitch を <strong>scale snap helper 経由化</strong></h3>
+
+<p>note y-drag で pitch を変えるとき、 widget 側で「最寄りの in-scale 行に snap」 する option があると、 §5.1 Snap on Draw が widget 内で完結する。 ただし caller 側で snap してもよい (= widget は raw pitch を push、 daw_01 が <code>Snap on Draw</code> toggle ON 時に <code>ScaleChange::snap</code>)。 後者のほうが widget の責務がシンプル。</p>
+
+<p>= <strong>caller 側 snap でよい</strong>と判断 (gui_01 への要望なし)。 widget は raw pitch を push、 daw_01 が必要に応じて snap。</p>
+
+<h3>8.3 arrangement widget に Scale Lane (Chord Track 風) 専用 lane</h3>
+
+<p>段階 S6 で要望提出予定 (= S4 終わってから)。 arrangement の現行 lane 概念 (track header + clip lane) を「scale lane」 用に拡張。 widget 内に <code>Vec&lt;ArrangementScaleEvent { beat, label }&gt;</code> を持たせ、 click / drag / dbl-click を <code>ArrangementEditRequest</code> 経由で push。 詳細仕様は別 issue。</p>
+
+<h2>9. 段階実装ロードマップ (Phase 7 B5)</h2>
+
+<table>
+<thead>
+<tr><th>段階</th><th>内容</th><th>規模</th><th>依存</th></tr>
+</thead>
+<tbody>
+<tr><td>S1</td><td>データモデル: <code>common/src/scale.rs</code> 新設 + <code>Song.scale_changes</code> + <code>Scale</code> enum + <code>ScaleChange</code> + query API (<code>scale_at</code> / <code>contains</code> / <code>snap</code>) + 22 種テーブル + unit test (各 scale の mask 検証、 snap の上下対称性、 転調境界での scale_at)。 CURRENT_VERSION 10 → 11。</td><td>1 PR</td><td>—</td></tr>
+<tr><td>S2</td><td>Transport bar に scale 表示 + dropdown (root × scale picker)。 click で <code>scale_changes</code> 更新、 playhead 追随で表示。 scale_changes が空のとき「No Key」 表示 + click で C Major 提案。 1 操作 1 Undo step。</td><td>1 PR</td><td>S1</td></tr>
+<tr><td>S3</td><td>gui_01 #042 [Open] を <code>docs/gui_01_conversation.md</code> に追加 (§8.1 piano_roll の <code>PianoRollScale</code> / <code>PianoRollScaleMode::{Highlight, Fold}</code> + <code>PianoRollStyle</code> color スキーマ)。 gui_01 側 PR が main にマージされたら daw_01 側で wire (memory: feedback_gui_01_auto_resume)。 piano_roll header に「Highlight」 「Fold」 「現在 scale label」 toggle 群を追加。</td><td>2 PR (daw_01: 要望 → wire)</td><td>S1 + gui_01 反映</td></tr>
+<tr><td>S4</td><td>3 軸 constrain wire: §5.1 Snap on Draw (piano_roll header toggle + <code>add_note</code> 経路 + note y-drag snap)、 §5.2 Snap Live Input (transport toggle + <code>record_midi_note_on</code> 経路)、 §5.3 Quantize Pitches (note 右クリック menu + <code>AppEvent::QuantizePitchesToScale</code>)。</td><td>1 PR</td><td>S1</td></tr>
+<tr><td>S5</td><td>Arrangement Scale Lane: gui_01 #043 [Open] (§8.3) → wire。 専用 lane で scale change event を時間軸編集 (click edit / drag / dbl-click add / right-click delete)。 転調が必要な楽曲で本格的に使えるようになる。</td><td>2 PR (daw_01: 要望 → wire)</td><td>S2 + gui_01 反映</td></tr>
+<tr><td>S6 (optional polish)</td><td>Custom scale エディタ (12-bit mask を click で組む UI、 Bitwig User scale 相当) + Quantize の Smart / Up モード + 度数 transpose helper (Bitwig "Shift by Scale Steps")。 ユーザ要望が出てから着手。</td><td>1-2 PR</td><td>S1-5</td></tr>
+</tbody>
+</table>
+
+<p class="note">S1-S4 で「単一キーの楽曲で日常的に使える」 機能が完成。 S5 で「転調 / モーダルインターチェンジ」 が時間軸上で扱える。 S6 は user-driven。</p>
+
+<h2>10. Out of scope (明示的に作らないもの)</h2>
+
+<ul>
+  <li><strong>Chord Track</strong> (Cubase): scale event とは別に「コード進行」 を時間軸に持つ機能。 daw_01 では当面 scale 機能で十分、 Chord Track は別 plan で検討。</li>
+  <li><strong>Scale Suggestions / 自動検出</strong> (Cubase): MIDI clip から最有力 scale を統計推定。 後付けで価値はあるが S1-5 と独立。</li>
+  <li><strong>Bitwig の Note FX 連携</strong> (per-device "Use Global Key"): daw_01 は MIDI FX チェーン concept をまだ持たない (M2 では plugin chain は audio FX のみ)。 MIDI FX 導入時に再検討。</li>
+  <li><strong>度数別カラー</strong> (Bitwig "Adapt to Key" 背景モード): root / 3rd / 5th 等を別色表示する高度な視覚化。 §4.4 の root / in / out 三段階で実用十分、 度数別は将来の polish。</li>
+  <li><strong>Scale device / 強制 fold MIDI plugin</strong> (Ableton Live Scale device 相当): daw_01 では <strong>input constrain で十分</strong>と判断 (= note 追加時点で snap する、 リアルタイムにフィルタする必要なし)。 ライブ演奏 (= 既存の MIDI input + dawの外部 MIDI ルート) で強制 fold したい用途が出てきたら別 plan。</li>
+  <li><strong>VOICEVOX 歌詞自動メロディ</strong>: 歌詞だけ入れて自動でメロディが scale から決まる、 のような生成系。 別 plan。</li>
+</ul>
+
+<h2>11. 参考リンク</h2>
+
+<ul>
+  <li><a href="https://www.ableton.com/en/live-manual/12/editing-midi/">Ableton Live 12 Manual — Editing MIDI</a> (Key &amp; Scale, Fold to Scale, Highlight Scale)</li>
+  <li><a href="https://help.ableton.com/hc/en-us/articles/11425083250972-Keys-and-Scales-in-Live-12-FAQ">Ableton — Keys and Scales in Live 12 FAQ</a></li>
+  <li><a href="https://www.ableton.com/en/manual/live-midi-effect-reference/">Ableton — Live MIDI Effect Reference (Scale device)</a></li>
+  <li><a href="https://www.bitwig.com/userguide/latest/note_fx/">Bitwig Studio — Note FX User Guide</a></li>
+  <li><a href="https://downloads.bitwig.com/6.0/Release-Notes-6.0.html">Bitwig Studio 6.0 Release Notes</a> (Global Scale)</li>
+  <li><a href="https://polarity.me/posts/polarity-music/2025-08-31-bitwig-6-how-to-use-scales-and-modes/">Polarity — Bitwig 6 Scale Highlighting</a></li>
+  <li><a href="https://archive.steinberg.help/cubase_pro/v11/en/cubase_nuendo/topics/midi_editors/midi_editors_scales_in_key_editor_r.html">Steinberg — Scale Assistant in the Key Editor (Cubase Pro 11)</a></li>
+  <li><a href="https://archive.steinberg.help/cubase_pro/v11/en/cubase_nuendo/topics/midi_editors/midi_editors_musical_scales_chord_track_finding_t.html">Steinberg — Using the Chord Track to Match Note Events to a Musical Scale</a></li>
+  <li><a href="https://archive.steinberg.help/cubase_ai/v12/en/cubase_nuendo/topics/chord_functions/chord_functions_scale_events_c.html">Steinberg — Scale Events (Cubase AI 12)</a></li>
+  <li><a href="https://www.soundonsound.com/techniques/cubase-11-scale-assistant">Sound on Sound — Cubase 11 Scale Assistant</a></li>
+  <li><a href="https://www.soundonsound.com/techniques/scale-correction">Sound on Sound — Scale Correction (Cubase 内蔵 scale 一覧)</a></li>
+  <li><a href="https://support.apple.com/guide/logicpro/quantize-the-pitch-of-notes-lgcpf4f544d2/mac">Apple — Logic Pro: Quantize pitch in the Piano Roll Editor</a></li>
+  <li><a href="https://www.image-line.com/fl-studio-learning/fl-studio-online-manual/html/pianoroll.htm">Image-Line — FL Studio Piano Roll Manual (Scale Highlighting / Stamp tool)</a></li>
+</ul>
+
+</body>
+</html>
