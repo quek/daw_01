@@ -108,6 +108,134 @@ pub enum NoteDragKind {
     ResizeRight,
 }
 
+/// (M14 Phase 70 / daw_01 #042) piano_roll に渡す scale 情報。
+///
+/// `PianoRollView.scale = None` で旧 API 完全互換 (scale 機能 OFF)、 `Some(_)` で Highlight / Fold
+/// の各 mode に応じた行ハイライト + (Fold のみ) y↔pitch 写像の再構成が走る。 caller (daw_01) は
+/// `ScaleChange { root, scale }` から `PianoRollScale { root, in_scale_mask, mode }` を 1:1 で詰めて
+/// 渡す前提。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PianoRollScale {
+    /// ルート pitch class (0..=11、 0 = C、 1 = C#、 ..)。`root % 12` で正規化されることを期待。
+    pub root: u8,
+    /// ルート起点の 12-bit in-scale mask。 bit 0 = root、 bit d (1..=11) が立っていれば root から
+    /// d 半音上が in-scale。 例: Major = `0b0000_1010_1011_0101` (bits {0,2,4,5,7,9,11})。
+    pub in_scale_mask: u16,
+    /// 表示モード。 Highlight は行リスト不変 + 背景 tint、 Fold は in-scale 行のみで構成。
+    pub mode: PianoRollScaleMode,
+}
+
+/// (M14 Phase 70 / daw_01 #042) `PianoRollScale.mode` の取り得る値。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PianoRollScaleMode {
+    /// 12 行すべて表示 (= 旧 grid と同じ y↔pitch 写像)、 root / in-scale / out-of-scale を
+    /// 背景 overlay + ラベル色で塗り分ける。 既存 note の描画 / drag / hit-test は完全に変わらない
+    /// (= 純粋な視覚 augmentation)。
+    Highlight,
+    /// out-of-scale 行を行リストから完全除外 (Ableton K キー相当)。 12 行 → in-scale 音数 + 上端
+    /// octave root に圧縮されて、 row 0 = pitch_top **以下** の最も近い in-scale pitch。 既存 note が
+    /// out-of-scale なら上下隣の in-scale 行の中間に 0.5 row 高さで描画 (= データは触らず描画のみ変換、
+    /// Ableton 流)。 click / drag y → pitch は in-scale 行 only に snap (= widget が emit する
+    /// `MoveDelta.next_pitch` は必ず in-scale)。
+    Fold,
+}
+
+impl PianoRollScale {
+    /// `pitch` が in-scale か判定 (= root を 0 とする mask 上で対応 bit が立っているか)。
+    #[must_use]
+    pub fn is_in_scale(&self, pitch: u8) -> bool {
+        let pc = i32::from(pitch).rem_euclid(12) - i32::from(self.root % 12);
+        let d = pc.rem_euclid(12) as u8;
+        (self.in_scale_mask >> d) & 1 == 1
+    }
+
+    /// MIDI pitch → 「scale degree」 (= MIDI 0 から数えた in-scale pitch の連番)。
+    /// out-of-scale pitch は **直下の in-scale pitch** の degree を返す (= Fold mode で
+    /// out 行を上下隣 in-scale の中間に描画するときの「上隣」 を degree で揃える定義)。
+    /// `is_in_scale(pitch)` が true のときは「自分自身の degree」、 false のときは「直下 in-scale
+    /// の degree」 を返す。
+    #[must_use]
+    pub fn pitch_to_scale_degree(&self, pitch: u8) -> i32 {
+        let mut d = 0_i32;
+        let mut last_in = 0_i32;
+        for p in 0..=pitch {
+            if self.is_in_scale(p) {
+                last_in = d;
+                d += 1;
+            }
+        }
+        if self.is_in_scale(pitch) { d - 1 } else { last_in }
+    }
+
+    /// scale degree → in-scale MIDI pitch。 degree が範囲外 (負 / 上限超え) は MIDI 0..=127 に
+    /// clamp + 上限 127 を返す。 `pitch_to_scale_degree` の逆関数 (in-scale pitch に対しては
+    /// 厳密 round-trip、 out-of-scale pitch は経由できない = 必ず in-scale が返る)。
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn scale_degree_to_pitch(&self, degree: i32) -> u8 {
+        if degree < 0 {
+            // 最低 in-scale pitch
+            for p in 0_u8..=127 {
+                if self.is_in_scale(p) {
+                    return p;
+                }
+            }
+            return 0;
+        }
+        let mut d = 0_i32;
+        for p in 0_u8..=127 {
+            if self.is_in_scale(p) {
+                if d == degree {
+                    return p;
+                }
+                d += 1;
+            }
+        }
+        // 上限超え: 最高 in-scale pitch
+        for p in (0_u8..=127).rev() {
+            if self.is_in_scale(p) {
+                return p;
+            }
+        }
+        127
+    }
+}
+
+/// (M14 Phase 70 / daw_01 #042) drag dy (px) から pitch delta (i32) を計算する mode-aware helper。
+///
+/// - Linear / Highlight: 旧式 `dy * (pitch_visible / grid.h)` = 半音単位 delta。
+/// - Fold: `dy / row_h` = scale degree 単位 delta (= 可視 in-scale 行の数で割る)。
+///
+/// 返り値は `apply_pitch_drag_delta` で anchor pitch に適用される。
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+fn compute_pitch_drag_delta(view: PianoRollView, grid: Rect, dy: f32) -> i32 {
+    if matches!(view.scale.map(|s| s.mode), Some(PianoRollScaleMode::Fold)) {
+        let geom = RowGeometry::compute(view, grid);
+        return (-(dy / geom.row_h.max(1.0))).round() as i32;
+    }
+    let pitch_per_px = view.pitch_visible / grid.h.max(1.0);
+    (-(dy * pitch_per_px)).round() as i32
+}
+
+/// (M14 Phase 70 / daw_01 #042) anchor pitch に drag delta を適用、 新 pitch を返す mode-aware helper。
+///
+/// - Linear / Highlight: `anchor + delta` を 0..=127 に clamp して u8 化。
+/// - Fold: anchor を scale degree に変換 → delta 加算 → in-scale pitch に逆変換 (= 必ず in-scale 出力)。
+///
+/// out-of-scale anchor (Fold 中に既存 out note を drag) は「直下 in-scale」 の degree を基点に。
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn apply_pitch_drag_delta(anchor_pitch: u8, delta: i32, view: PianoRollView) -> u8 {
+    if let Some(sc) = view.scale
+        && matches!(sc.mode, PianoRollScaleMode::Fold)
+    {
+        let d = sc.pitch_to_scale_degree(anchor_pitch);
+        return sc.scale_degree_to_pitch(d + delta);
+    }
+    (i32::from(anchor_pitch) + delta).clamp(0, 127) as u8
+}
+
 /// piano roll の view 状態 (pan / zoom)。値渡し (Copy) で widget に渡す。
 /// pan/zoom の更新は user 側 (widget は描画と drag のみ担う)。
 ///
@@ -158,6 +286,10 @@ pub struct PianoRollView {
     /// ときのみ active (`ruler_h = 0.0` では描画 / hit-test ともに skip = 旧 API 完全互換)。
     /// arrangement `view.loop_range` と完全同形 (caller は両 widget で同じ value を渡せる)。
     pub loop_range: Option<(f64, f64)>,
+    /// (M14 Phase 70 / daw_01 #042) scale 情報。 `None` で scale 機能 OFF + 旧 API 完全互換、
+    /// `Some(PianoRollScale { root, in_scale_mask, mode })` で Highlight / Fold の各動作が active 化。
+    /// 詳細は `PianoRollScale` doc 参照。
+    pub scale: Option<PianoRollScale>,
 }
 
 /// piano roll が user に発行する Edit 要求の種別。
@@ -318,6 +450,26 @@ pub struct PianoRollStyle {
     pub loop_handle: Color,
     /// (M14 Phase 69 / daw_01 #041) loop band handle bar の幅 (px)。
     pub loop_handle_w: f32,
+    /// (M14 Phase 70 / daw_01 #042) `PianoRollView.scale = Some(_)` のとき、 root pitch class の
+    /// 行 (grid + keyboard 両方) に重ね描く半透明 tint。 Bitwig 風 warm-yellow default。
+    /// `bg` + `black_row_overlay` の 2-pass の **上に** 重ね描く 3rd pass (= in-scale 行は
+    /// overlay なしで通常表示)。 mode が Highlight でも Fold でも適用 (Fold では in-scale 行
+    /// のみ描画されるので root 行のみ tint される)。
+    pub root_row_overlay: Color,
+    /// (M14 Phase 70 / daw_01 #042) Highlight mode で out-of-scale 行 (grid + keyboard) に重ね描く
+    /// 半透明 dim。 Fold mode では out 行は表示されないので使われない。
+    pub out_of_scale_row_overlay: Color,
+    /// (M14 Phase 70 / daw_01 #042) 鍵盤レーンの root pitch class ラベル色 (`scale = Some(_)` の
+    /// とき active、 Highlight / Fold 共通)。 `scale = None` 時は `c_label_color` を使う旧挙動。
+    pub root_label_fg: Color,
+    /// (M14 Phase 70 / daw_01 #042) 鍵盤レーンの in-scale (root 以外) ラベル色。 Fold mode で
+    /// 全 in-scale 行に label が出るときに使用 (Highlight では root 以外は label を描かないので
+    /// 通常使われない)。
+    pub in_scale_label_fg: Color,
+    /// (M14 Phase 70 / daw_01 #042) 鍵盤レーンの out-of-scale ラベル色 (Highlight でのみ可視、
+    /// Fold では out 行は非表示)。 ただし v0 では Highlight mode で out 行に label を描かない
+    /// (root 行のみ label) ので、 将来「全 12 行に label」 拡張が来たときの為の予約 field。
+    pub out_of_scale_label_fg: Color,
 }
 
 /// デフォルト velocity color (青系の濃淡 0.5..0.95)。`PianoRollStyle::note_fill_fn` の初期値。
@@ -375,6 +527,18 @@ impl Default for PianoRollStyle {
             loop_band: Color::rgba(0.50, 0.85, 1.0, 0.20),
             loop_handle: Color::rgb(0.50, 0.85, 1.0),
             loop_handle_w: 2.0,
+            // M14 Phase 70 / daw_01 #042: Bitwig 風 warm-yellow tint (root 行) + 黒 dim (out 行)。
+            // root_row_overlay: alpha 0.18 で bg (0.18) と乗算後 ≈ (0.30, 0.27, 0.18) 程度の warm
+            // (= 白鍵レーンに馴染む暖色)。 黒鍵レーン (0.13 程度) に重ねても tint が見える強度。
+            root_row_overlay: Color::rgba(1.0, 0.80, 0.30, 0.18),
+            // out_of_scale_row_overlay: alpha 0.32 で bg (0.18) を ≈ (0.12) 程度に dim。 dim 強度は
+            // 「在ることが分かる程度」 でやりすぎないのが Bitwig / Ableton 流。
+            out_of_scale_row_overlay: Color::rgba(0.0, 0.0, 0.0, 0.32),
+            // 鍵盤レーンラベル色: root は warm-yellow を強調 (0.95, 0.78, 0.40)、 in-scale は通常
+            // (= 既存 c_label_color と同色、 0.30 程度)、 out-of-scale は dim (0.20 程度)。
+            root_label_fg: Color::rgb(0.95, 0.78, 0.40),
+            in_scale_label_fg: Color::rgb(0.30, 0.30, 0.35),
+            out_of_scale_label_fg: Color::rgb(0.45, 0.45, 0.50),
         }
     }
 }
@@ -402,12 +566,155 @@ fn note_geometry_to_rect(
     grid: Rect,
 ) -> Rect {
     let beat_to_px = f64::from(grid.w) / view.len_beats.max(1e-6);
-    let pitch_to_px = grid.h / view.pitch_visible.max(1e-6);
     let x = grid.x + ((start_beat - view.start_beat) * beat_to_px) as f32;
     let w = ((len_beats * beat_to_px) as f32).max(1.5);
-    let y = grid.y + (view.pitch_top - f32::from(pitch)) * pitch_to_px;
-    let h = (pitch_to_px - 1.0).max(2.0);
+    // (M14 Phase 70 / daw_01 #042) Fold mode は y↔pitch 写像が in-scale 行 only に圧縮される。
+    // RowGeometry::compute で linear / fold どちらの mode でも統一的に y 座標を返せる。
+    let geom = RowGeometry::compute(view, grid);
+    let (y, h) = geom.pitch_to_y_and_h(pitch);
     Rect { x, y, w, h }
+}
+
+/// (M14 Phase 70 / daw_01 #042) y↔pitch 写像の統合 helper。
+///
+/// Highlight (scale=None / scale.mode=Highlight): 旧 linear 写像と完全同一
+/// (`pitch_to_px = grid.h / pitch_visible`、 12 行 1 octave)。
+///
+/// Fold (scale.mode=Fold): 可視 MIDI pitch 範囲 `[pitch_top - pitch_visible, pitch_top]` 内の
+/// in-scale pitch のみを enumerate、 等高で並べる。 row 0 = pitch_top **以下** の最も近い
+/// in-scale pitch。 out-of-scale な pitch を query すると nearest in-scale above / below の
+/// **中間** に 0.5 row 高さで配置 (= Ableton 流の挟まる描画)。
+struct RowGeometry {
+    /// Fold mode 中の可視 in-scale pitches (top→bottom 順、 row 0 が先頭)。 linear mode では空。
+    fold_rows: Vec<u8>,
+    /// 行高 (px): linear なら `grid.h / pitch_visible`、 Fold なら `grid.h / fold_rows.len()`。
+    row_h: f32,
+    /// linear mode で使う `view.pitch_top` (fold mode では row 0 の pitch が代替役なので未使用)。
+    pitch_top: f32,
+    /// grid 上端 y。
+    grid_y: f32,
+    /// Fold mode が active か。
+    fold: bool,
+    /// scale 情報 (Fold 中の in-scale 判定 + 中間描画位置算出に使う)。
+    scale: Option<PianoRollScale>,
+}
+
+impl RowGeometry {
+    fn compute(view: PianoRollView, grid: Rect) -> Self {
+        let fold = matches!(view.scale.map(|s| s.mode), Some(PianoRollScaleMode::Fold));
+        if fold {
+            let sc = view.scale.expect("fold => scale is Some");
+            // 可視 MIDI pitch 範囲 [floor(pitch_top - pitch_visible), ceil(pitch_top)] 内の
+            // in-scale pitch を上→下 (= pitch desc) で enumerate。
+            // 可視 MIDI pitch 範囲 `[pitch_top - pitch_visible, pitch_top]` を **両端 inclusive** で
+            // 解釈、 in-scale pitch を上→下で enumerate。 `floor(pitch_top)` を上限、
+            // `ceil(pitch_top - pitch_visible)` を下限とすると整数境界 (e.g., 72/60) で off-by-one
+            // にならず、 1 octave 表示 (pitch_visible=12) でちょうど 1 octave 分が拾える。
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let hi_pitch = view.pitch_top.floor() as i32;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let lo_pitch = (view.pitch_top - view.pitch_visible).ceil() as i32;
+            let mut rows: Vec<u8> = Vec::new();
+            let mut p = hi_pitch;
+            while p >= lo_pitch.max(0) {
+                if (0..=127).contains(&p) && sc.is_in_scale(p as u8) {
+                    rows.push(p as u8);
+                }
+                p -= 1;
+            }
+            let n = rows.len().max(1);
+            let row_h = grid.h / n as f32;
+            Self {
+                fold_rows: rows,
+                row_h,
+                pitch_top: view.pitch_top,
+                grid_y: grid.y,
+                fold: true,
+                scale: view.scale,
+            }
+        } else {
+            let row_h = grid.h / view.pitch_visible.max(1e-6);
+            Self {
+                fold_rows: Vec::new(),
+                row_h,
+                pitch_top: view.pitch_top,
+                grid_y: grid.y,
+                fold: false,
+                scale: view.scale,
+            }
+        }
+    }
+
+    /// pitch → (y_top, height) を返す。 Fold mode で out-of-scale の場合は中間描画位置 + 半行高。
+    fn pitch_to_y_and_h(&self, pitch: u8) -> (f32, f32) {
+        if !self.fold {
+            let y = self.grid_y + (self.pitch_top - f32::from(pitch)) * self.row_h;
+            return (y, (self.row_h - 1.0).max(2.0));
+        }
+        // Fold: pitch が in-scale なら直接 row index を引く
+        if let Some(idx) = self.fold_rows.iter().position(|&p| p == pitch) {
+            let y = self.grid_y + idx as f32 * self.row_h;
+            return (y, (self.row_h - 1.0).max(2.0));
+        }
+        // out-of-scale: nearest in-scale above (= row index 小、 pitch 大) / below (= row 大、 pitch 小)
+        // を探して中間 y。 高さは 0.5 row。
+        let above_idx = self.fold_rows.iter().position(|&p| p < pitch);
+        match above_idx {
+            None => {
+                // 全 in-scale が pitch 以下 (= 自身がほぼ最上端より上)、 row 0 の少し上に描画
+                let y = self.grid_y - self.row_h * 0.25;
+                (y, (self.row_h * 0.5 - 1.0).max(2.0))
+            }
+            Some(0) => {
+                // pitch が row 0 の上、 row 0 の少し上に描画
+                let y = self.grid_y - self.row_h * 0.25;
+                (y, (self.row_h * 0.5 - 1.0).max(2.0))
+            }
+            Some(below_i) => {
+                // 上隣 = fold_rows[below_i - 1] (pitch 大、 row 上)
+                // 下隣 = fold_rows[below_i]     (pitch 小、 row 下)
+                let above_i = below_i - 1;
+                let y_above = self.grid_y + above_i as f32 * self.row_h;
+                let y_below = self.grid_y + below_i as f32 * self.row_h;
+                let y_mid = (y_above + y_below) * 0.5;
+                (y_mid + self.row_h * 0.25, (self.row_h * 0.5 - 1.0).max(2.0))
+            }
+        }
+    }
+
+    /// cursor y → pitch (f32)。 Highlight (linear) では `pitch_top - (y - grid_y) / row_h` 同等、
+    /// Fold では row index に近い in-scale pitch を返す (= 必ず in-scale)。
+    fn y_to_pitch_f(&self, y: f32) -> f32 {
+        if !self.fold || self.fold_rows.is_empty() {
+            return self.pitch_top - (y - self.grid_y) / self.row_h.max(1e-6);
+        }
+        let raw = ((y - self.grid_y) / self.row_h).floor();
+        // fold_rows.len() は MIDI 0..=127 範囲なので 128 を超えない、 i32 wrap は実用上発生しない。
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_possible_wrap
+        )]
+        let last_i = (self.fold_rows.len() - 1) as i32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let idx = (raw as i32).clamp(0, last_i) as usize;
+        f32::from(self.fold_rows[idx])
+    }
+
+    /// scale が Some なら root pitch class を返す。
+    fn root_pc(&self) -> Option<u8> {
+        self.scale.map(|sc| sc.root % 12)
+    }
+}
+
+/// (M14 Phase 70 / daw_01 #042) pitch class (0..=11) → 表記文字列 (sharp 固定 v0)。
+/// `0 = C、 1 = C#、 ... 11 = B`。 enharmonic spelling (Db / Eb / 等) は将来 caller-side カスタム
+/// API で対応する scope 外 (conversation #042 §4 参照)。
+#[must_use]
+pub fn pitch_class_name(pc: u8) -> &'static str {
+    const NAMES: [&str; 12] =
+        ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    NAMES[(pc % 12) as usize]
 }
 
 /// 内部 helper: cursor 位置がこの note のどの zone (Move / ResizeLeft / ResizeRight)
@@ -800,12 +1107,13 @@ fn drag_preview_geometry(
     beat_delta: f64,
     pitch_delta: i32,
     min_len: f64,
+    view: PianoRollView,
 ) -> (f64, f64, u8) {
     match kind {
         NoteDragKind::Move => (
             (anchor.start_beat + beat_delta).max(0.0),
             anchor.len_beats,
-            (i32::from(anchor.pitch) + pitch_delta).clamp(0, 127) as u8,
+            apply_pitch_drag_delta(anchor.pitch, pitch_delta, view),
         ),
         NoteDragKind::ResizeRight => (
             anchor.start_beat,
@@ -1288,7 +1596,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 (None, None)
             };
 
-        // drag 中の delta (pointer から計算)。beat_delta は f64、pitch_delta は i32 (整数 pitch 単位)。
+        // drag 中の delta (pointer から計算)。beat_delta は f64、pitch_delta は i32 (Highlight/Linear:
+        // 半音単位、 Fold: scale degree 単位 — `apply_pitch_drag_delta` で吸収)。
         // M9 Phase 45f: anchor 0 の delta を `view.snap.snap_beat_delta` で round → 全 anchor に
         // 同 delta 適用 (相対関係維持)。 alt 押下で snap 一時無効化。
         // alt は drag state の `last_alt` を真値とし、 `pointer.modifiers.alt` を直接見ない
@@ -1307,7 +1616,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     &view.snap,
                     zoom_x_px_per_beat,
                 );
-                let pitch_delta = (-(dy * pitch_per_px)).round() as i32;
+                let pitch_delta = compute_pitch_drag_delta(view, grid, dy);
                 (nd, beat_delta, pitch_delta)
             });
 
@@ -1385,6 +1694,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // clip drag 残像と同根の予防、 caller の notes_generation は note 数や編集 epoch のみで
         // 不十分なケースを吸収)。
         let internal_note_hash = fold_piano_roll_note_hash(visible);
+        // (M14 Phase 70 / daw_01 #042) `view.scale` を hash に含めて、 scale 切替 (root / mask / mode)
+        // が起きたとき cache invalidate されるようにする。 None は (0, 0, 0) で表現 (= scale OFF
+        // が連続するときは同じ hash 寄与で cache hit、 None ↔ Some の遷移時は差分が出る)。
+        let scale_key = view.scale.map_or((0_u8, 0_u16, 0_u8), |sc| {
+            let mode_tag: u8 = match sc.mode {
+                PianoRollScaleMode::Highlight => 1,
+                PianoRollScaleMode::Fold => 2,
+            };
+            (sc.root, sc.in_scale_mask, mode_tag)
+        });
         let viewport_key = (
             (
                 b"piano_roll_widget_v3" as &[u8],
@@ -1398,7 +1717,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 view.notes_generation,
                 vel_h.to_bits(),
                 ruler_h.to_bits(),
-                (view.bpm.to_bits(), u32::from(view.time_sig.0), u32::from(view.time_sig.1)),
+                (
+                    view.bpm.to_bits(),
+                    u32::from(view.time_sig.0),
+                    u32::from(view.time_sig.1),
+                    scale_key,
+                ),
             ),
             internal_note_hash,
         );
@@ -1602,7 +1926,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             && grid.contains(cx, cy)
         {
             let beat_to_px = f64::from(grid.w) / view.len_beats.max(1e-6);
-            let pitch_to_px = grid.h / view.pitch_visible.max(1e-6);
             let raw_start = (view.start_beat + f64::from(cx - grid.x) / beat_to_px).max(0.0);
             // M9 Phase 45f: Insert は widget 内発火、grid 吸着が UX 自然 (#010 [Replied])。
             // single frame の click なので drag state は関与せず、 直接 `pointer.modifiers.alt` を読む。
@@ -1610,11 +1933,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 .snap
                 .snap_beat(raw_start, pointer.modifiers.alt, zoom_x_px_per_beat)
                 .max(0.0);
-            let pitch_f = view.pitch_top - (cy - grid.y) / pitch_to_px;
+            // M14 Phase 70 / daw_01 #042: RowGeometry 経由で Fold mode も対応 (Fold では
+            // y_to_pitch_f が在 row index → in-scale pitch を返すので、 ceil で確実に in-scale)。
+            let geom = RowGeometry::compute(view, grid);
+            let pitch_f = geom.y_to_pitch_f(cy);
             // M14 Phase 61d (#012): 描画式 `y = grid.y + (pitch_top - pitch) * pitch_to_px` の
             // 逆関数として ceil() を使う (pitch P の視覚行 y ∈ [(top-P)*pt, (top-P+1)*pt) なので
             // 逆引きは pitch_f ∈ (P-1, P] のとき P を返す = ceil)。 round() だと判定領域が視覚行
             // に対して半行ぶん上にずれて、 行の下半分にカーソルがあると 1 つ下のピッチに化ける。
+            // (Fold mode では y_to_pitch_f が既に in-scale pitch を整数で返すので ceil は no-op)。
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let pitch = (pitch_f.ceil() as i32).clamp(0, 127) as u8;
             // note id は user 側で next_note_id を bump して上書き。
             // ここでは placeholder id=0 で渡す (user は make_edit closure 内で bump 済 id を使う)。
@@ -1662,9 +1990,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // grid 内の short click なら beat/pitch も Response に載せる
             if grid.contains(cx, cy) {
                 let beat_to_px = f64::from(grid.w) / view.len_beats.max(1e-6);
-                let pitch_to_px = grid.h / view.pitch_visible.max(1e-6);
                 let beat = view.start_beat + f64::from(cx - grid.x) / beat_to_px;
-                let pitch = view.pitch_top - (cy - grid.y) / pitch_to_px;
+                // M14 Phase 70 / daw_01 #042: Fold mode 中も「視覚的な行 → in-scale pitch」 で返す。
+                let pitch = RowGeometry::compute(view, grid).y_to_pitch_f(cy);
                 response.clicked_at_beat_pitch = Some((beat, pitch));
             }
         }
@@ -1701,7 +2029,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     for a in &nd.anchors {
                         let new_start = (a.start_beat + beat_delta).max(0.0);
                         let new_pitch =
-                            (i32::from(a.pitch) + pitch_delta).clamp(0, 127) as u8;
+                            apply_pitch_drag_delta(a.pitch, pitch_delta, view);
                         if (new_start - a.start_beat).abs() > 1e-6 || new_pitch != a.pitch
                         {
                             deltas.push((a.id, a.start_beat, a.pitch, new_start, new_pitch));
@@ -1946,7 +2274,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 // Internal drawing helpers
 // ============================================================
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::too_many_lines)]
 fn draw_grid_background<M: ?Sized + 'static>(
     hctx: &mut crate::widgets::heavy::HeavyCtx<'_, '_, M>,
     grid: Rect,
@@ -1964,25 +2292,83 @@ fn draw_grid_background<M: ?Sized + 'static>(
         clip_rect: None,
     });
 
-    // (b) 黒鍵 row 帯
-    let pitch_to_px = grid.h / view.pitch_visible.max(1e-6);
-    let pitch_top_int = view.pitch_top.floor() as i32;
-    let pitch_visible_int = view.pitch_visible.ceil() as i32;
-    for i in 0..=pitch_visible_int {
-        let pitch = pitch_top_int - i;
-        if !(0..=127).contains(&pitch) {
-            continue;
+    let geom = RowGeometry::compute(view, grid);
+    let scale = view.scale;
+    let root_pc_opt = geom.root_pc();
+
+    // Per-row 背景 (黒鍵 overlay + scale overlay 3rd pass)。 mode で iter 方法が変わる。
+    if geom.fold {
+        // (b') Fold: in-scale 行のみ、 等高 row_h
+        for (idx, &pitch) in geom.fold_rows.iter().enumerate() {
+            let y = grid.y + idx as f32 * geom.row_h;
+            // 黒鍵 row overlay (in-scale 行のうち黒鍵 = root が黒鍵 / pentatonic 等で発生)
+            if is_black_key(pitch) {
+                hctx.push_rect(RectCommand {
+                    rect: Rect { x: grid.x, y, w: grid.w, h: geom.row_h },
+                    fill: style.black_row_overlay,
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [0.0; 4],
+                    clip_rect: None,
+                });
+            }
+            // root row overlay
+            if Some(pitch % 12) == root_pc_opt {
+                hctx.push_rect(RectCommand {
+                    rect: Rect { x: grid.x, y, w: grid.w, h: geom.row_h },
+                    fill: style.root_row_overlay,
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [0.0; 4],
+                    clip_rect: None,
+                });
+            }
         }
-        if is_black_key(pitch as u8) {
-            let y = grid.y + (view.pitch_top - pitch as f32) * pitch_to_px;
-            hctx.push_rect(RectCommand {
-                rect: Rect { x: grid.x, y, w: grid.w, h: pitch_to_px },
-                fill: style.black_row_overlay,
-                border: Color::TRANSPARENT,
-                border_width: 0.0,
-                radius: [0.0; 4],
-                clip_rect: None,
-            });
+    } else {
+        // (b) Linear (None / Highlight): 12 行 1 octave、 旧 iteration
+        let pitch_top_int = view.pitch_top.floor() as i32;
+        let pitch_visible_int = view.pitch_visible.ceil() as i32;
+        for i in 0..=pitch_visible_int {
+            let pitch_i = pitch_top_int - i;
+            if !(0..=127).contains(&pitch_i) {
+                continue;
+            }
+            let pitch = pitch_i as u8;
+            let y = grid.y + (view.pitch_top - pitch_i as f32) * geom.row_h;
+            // (b-1) 黒鍵 row overlay
+            if is_black_key(pitch) {
+                hctx.push_rect(RectCommand {
+                    rect: Rect { x: grid.x, y, w: grid.w, h: geom.row_h },
+                    fill: style.black_row_overlay,
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [0.0; 4],
+                    clip_rect: None,
+                });
+            }
+            // (b-2) M14 Phase 70 / daw_01 #042: scale overlay 3rd pass (Highlight mode)
+            if let Some(sc) = scale {
+                let pc = pitch % 12;
+                if pc == sc.root % 12 {
+                    hctx.push_rect(RectCommand {
+                        rect: Rect { x: grid.x, y, w: grid.w, h: geom.row_h },
+                        fill: style.root_row_overlay,
+                        border: Color::TRANSPARENT,
+                        border_width: 0.0,
+                        radius: [0.0; 4],
+                        clip_rect: None,
+                    });
+                } else if !sc.is_in_scale(pitch) {
+                    hctx.push_rect(RectCommand {
+                        rect: Rect { x: grid.x, y, w: grid.w, h: geom.row_h },
+                        fill: style.out_of_scale_row_overlay,
+                        border: Color::TRANSPARENT,
+                        border_width: 0.0,
+                        radius: [0.0; 4],
+                        clip_rect: None,
+                    });
+                }
+            }
         }
     }
 
@@ -1990,34 +2376,31 @@ fn draw_grid_background<M: ?Sized + 'static>(
     // この関数の caller (piano_roll cached layer) で `hctx.bar_beat_grid` を呼ぶ。
 
     // (d) keyboard widget (左端、kbd.w > 0 のみ)
-    if kbd.w > 0.0 {
-        // 背景
-        hctx.push_rect(RectCommand {
-            rect: kbd,
-            fill: style.keyboard_bg,
-            border: Color::TRANSPARENT,
-            border_width: 0.0,
-            radius: [0.0; 4],
-            clip_rect: None,
-        });
-        // 各 pitch を rect で描画
-        for i in 0..=pitch_visible_int {
-            let pitch = pitch_top_int - i;
-            if !(0..=127).contains(&pitch) {
-                continue;
-            }
-            let y = grid.y + (view.pitch_top - pitch as f32) * pitch_to_px;
+    if kbd.w == 0.0 {
+        return;
+    }
+    // 背景
+    hctx.push_rect(RectCommand {
+        rect: kbd,
+        fill: style.keyboard_bg,
+        border: Color::TRANSPARENT,
+        border_width: 0.0,
+        radius: [0.0; 4],
+        clip_rect: None,
+    });
+
+    if geom.fold {
+        // Fold: in-scale 行のみ、 全行にラベル
+        for (idx, &pitch) in geom.fold_rows.iter().enumerate() {
+            let y = grid.y + idx as f32 * geom.row_h;
             let key_rect = Rect {
                 x: kbd.x,
                 y,
                 w: (kbd.w - 1.0).max(0.0),
-                h: (pitch_to_px - 1.0).max(0.0),
+                h: (geom.row_h - 1.0).max(0.0),
             };
-            let fill = if is_black_key(pitch as u8) {
-                style.black_key
-            } else {
-                style.white_key
-            };
+            let fill =
+                if is_black_key(pitch) { style.black_key } else { style.white_key };
             hctx.push_rect(RectCommand {
                 rect: key_rect,
                 fill,
@@ -2026,18 +2409,119 @@ fn draw_grid_background<M: ?Sized + 'static>(
                 radius: [0.0; 4],
                 clip_rect: None,
             });
-            // C のオクターブのみラベル
-            if (pitch as u8).is_multiple_of(12) && pitch_to_px >= 8.0 {
-                let octave = (pitch / 12) - 1;
+            // root row overlay
+            if Some(pitch % 12) == root_pc_opt {
+                hctx.push_rect(RectCommand {
+                    rect: key_rect,
+                    fill: style.root_row_overlay,
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [0.0; 4],
+                    clip_rect: None,
+                });
+            }
+            // Label: 全 in-scale 行に
+            if geom.row_h >= 8.0 {
+                let pc = pitch % 12;
+                let name = pitch_class_name(pc);
+                let is_root = Some(pc) == root_pc_opt;
+                let (text, color) = if is_root {
+                    let octave = (i32::from(pitch) / 12) - 1;
+                    (format!("{name}{octave}"), style.root_label_fg)
+                } else {
+                    (name.to_string(), style.in_scale_label_fg)
+                };
                 hctx.push_text(GlyphArea {
-                    text: format!("C{octave}").into(),
+                    text: text.into(),
                     left: kbd.x + 4.0,
                     top: y,
                     font_size: style.c_label_font_px,
                     line_height: style.c_label_font_px * 1.2,
-                    color: style.c_label_color,
+                    color,
                     clip_rect: None,
                 });
+            }
+        }
+    } else {
+        // Linear (None / Highlight)
+        let pitch_top_int = view.pitch_top.floor() as i32;
+        let pitch_visible_int = view.pitch_visible.ceil() as i32;
+        for i in 0..=pitch_visible_int {
+            let pitch_i = pitch_top_int - i;
+            if !(0..=127).contains(&pitch_i) {
+                continue;
+            }
+            let pitch = pitch_i as u8;
+            let y = grid.y + (view.pitch_top - pitch_i as f32) * geom.row_h;
+            let key_rect = Rect {
+                x: kbd.x,
+                y,
+                w: (kbd.w - 1.0).max(0.0),
+                h: (geom.row_h - 1.0).max(0.0),
+            };
+            let fill =
+                if is_black_key(pitch) { style.black_key } else { style.white_key };
+            hctx.push_rect(RectCommand {
+                rect: key_rect,
+                fill,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: None,
+            });
+            // scale overlay (Highlight)
+            if let Some(sc) = scale {
+                let pc = pitch % 12;
+                if pc == sc.root % 12 {
+                    hctx.push_rect(RectCommand {
+                        rect: key_rect,
+                        fill: style.root_row_overlay,
+                        border: Color::TRANSPARENT,
+                        border_width: 0.0,
+                        radius: [0.0; 4],
+                        clip_rect: None,
+                    });
+                } else if !sc.is_in_scale(pitch) {
+                    hctx.push_rect(RectCommand {
+                        rect: key_rect,
+                        fill: style.out_of_scale_row_overlay,
+                        border: Color::TRANSPARENT,
+                        border_width: 0.0,
+                        radius: [0.0; 4],
+                        clip_rect: None,
+                    });
+                }
+            }
+            // Label
+            if geom.row_h >= 8.0 {
+                if let Some(root_pc) = root_pc_opt {
+                    // Highlight mode: root pitch class のオクターブだけ label
+                    if pitch % 12 == root_pc {
+                        let octave = (pitch_i / 12) - 1;
+                        let name = pitch_class_name(root_pc);
+                        hctx.push_text(GlyphArea {
+                            text: format!("{name}{octave}").into(),
+                            left: kbd.x + 4.0,
+                            top: y,
+                            font_size: style.c_label_font_px,
+                            line_height: style.c_label_font_px * 1.2,
+                            color: style.root_label_fg,
+                            clip_rect: None,
+                        });
+                    }
+                } else if pitch.is_multiple_of(12) {
+                    // 旧挙動: C オクターブだけ
+                    let octave = (pitch_i / 12) - 1;
+                    hctx.push_text(GlyphArea {
+                        text: format!("C{octave}").into(),
+                        left: kbd.x + 4.0,
+                        top: y,
+                        font_size: style.c_label_font_px,
+                        line_height: style.c_label_font_px * 1.2,
+                        color: style.c_label_color,
+                        clip_rect: None,
+                    });
+                }
             }
         }
     }
@@ -2177,7 +2661,7 @@ fn draw_drag_preview<M: ?Sized + 'static>(
 ) {
     for a in &nd.anchors {
         let (start_beat, len_beats, pitch) =
-            drag_preview_geometry(*a, nd.kind, beat_delta, pitch_delta, min_len);
+            drag_preview_geometry(*a, nd.kind, beat_delta, pitch_delta, min_len, view);
         let r = note_geometry_to_rect(start_beat, len_beats, pitch, view, grid);
         let x_left = r.x.max(grid.x);
         let x_right = (r.x + r.w).min(grid.x + grid.w);
@@ -2293,6 +2777,7 @@ mod tests {
             // 数値検証 test は raw beat 値を期待するので明示 OFF。
             snap: SnapConfig::OFF,
             loop_range: None,
+            scale: None,
         }
     }
 
@@ -5149,6 +5634,341 @@ mod tests {
             (model.playhead_beats[0] - 1.75).abs() < 1e-6,
             "Alt 押下で snap 一時無効、 raw 1.75 が pass-through: got {:?}",
             model.playhead_beats[0]
+        );
+    }
+
+    // ============================================================
+    // M14 Phase 70 / daw_01 #042: Scale Highlight / Fold tests
+    // ============================================================
+
+    /// C Major scale mask (bit 0,2,4,5,7,9,11)。
+    const MAJOR_MASK: u16 = 0b0000_1010_1011_0101;
+
+    fn scale_c_major(mode: PianoRollScaleMode) -> PianoRollScale {
+        PianoRollScale { root: 0, in_scale_mask: MAJOR_MASK, mode }
+    }
+
+    fn scale_d_major(mode: PianoRollScaleMode) -> PianoRollScale {
+        // D Major: 同 mask、 root = D (pc 2)。 in-scale = D, E, F#, G, A, B, C# (pitch class 2,4,6,7,9,11,1)。
+        PianoRollScale { root: 2, in_scale_mask: MAJOR_MASK, mode }
+    }
+
+    #[test]
+    fn is_in_scale_c_major_root_0() {
+        let sc = scale_c_major(PianoRollScaleMode::Highlight);
+        // C major = pc 0,2,4,5,7,9,11 (C D E F G A B)
+        for (pc, expect) in (0_u8..12).zip([
+            true, false, true, false, true, true, false, true, false, true, false, true,
+        ]) {
+            // pitch 60 + pc (= middle C 系)
+            let pitch = 60 + pc;
+            assert_eq!(
+                sc.is_in_scale(pitch),
+                expect,
+                "pc={pc} pitch={pitch} expected in_scale={expect}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_in_scale_d_major_root_2() {
+        let sc = scale_d_major(PianoRollScaleMode::Highlight);
+        // D major = pc 2,4,6,7,9,11,1 (D E F# G A B C#)
+        let in_pcs = [1_u8, 2, 4, 6, 7, 9, 11];
+        for pc in 0_u8..12 {
+            let expected = in_pcs.contains(&pc);
+            assert_eq!(
+                sc.is_in_scale(60 + pc),
+                expected,
+                "pc={pc} expected in_scale={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn scale_degree_round_trip_c_major() {
+        let sc = scale_c_major(PianoRollScaleMode::Highlight);
+        // 全 in-scale pitch で round-trip 厳密一致
+        for p in 0_u8..=127 {
+            if sc.is_in_scale(p) {
+                let d = sc.pitch_to_scale_degree(p);
+                assert_eq!(
+                    sc.scale_degree_to_pitch(d),
+                    p,
+                    "round-trip mismatch at pitch {p}, degree {d}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scale_degree_out_of_scale_returns_below_in_scale_degree() {
+        let sc = scale_c_major(PianoRollScaleMode::Highlight);
+        // C# (pitch 61) は out、 直下 C (pitch 60) の degree と同じ
+        let d_cs = sc.pitch_to_scale_degree(61);
+        let d_c = sc.pitch_to_scale_degree(60);
+        assert_eq!(d_cs, d_c, "out-of-scale pitch 61 should share degree with pitch 60");
+        // D (pitch 62) の degree は C より +1
+        let d_d = sc.pitch_to_scale_degree(62);
+        assert_eq!(d_d, d_c + 1, "D should be C degree + 1");
+    }
+
+    #[test]
+    fn pitch_class_name_table() {
+        let names: Vec<&str> = (0_u8..12).map(pitch_class_name).collect();
+        assert_eq!(
+            names,
+            vec!["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+        );
+    }
+
+    #[test]
+    fn row_geometry_linear_when_scale_none() {
+        let v = test_view();
+        let g = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        let geom = RowGeometry::compute(v, g);
+        assert!(!geom.fold);
+        // row_h = h / pitch_visible = 400 / 24 ≈ 16.67
+        let expected = 400.0 / 24.0;
+        assert!((geom.row_h - expected).abs() < 1e-3, "row_h: {} vs {}", geom.row_h, expected);
+    }
+
+    #[test]
+    fn row_geometry_fold_visible_in_scale_pitches() {
+        let v = PianoRollView {
+            // pitch_top=72 (C5), pitch_visible=12 → range [60..72] = C4..C5
+            pitch_top: 72.0,
+            pitch_visible: 12.0,
+            scale: Some(scale_c_major(PianoRollScaleMode::Fold)),
+            ..test_view()
+        };
+        let g = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        let geom = RowGeometry::compute(v, g);
+        assert!(geom.fold);
+        // 期待: [72, 71, 69, 67, 65, 64, 62, 60] (C, B, A, G, F, E, D, C) top→bottom
+        // C5(72) は in (pc 0), B4(71) in (pc 11), Bb4(70) out, A4(69) in, ...
+        assert_eq!(
+            geom.fold_rows,
+            vec![72, 71, 69, 67, 65, 64, 62, 60],
+            "C major fold visible pitches"
+        );
+        // row_h = h / 8 = 50
+        assert!((geom.row_h - 50.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn row_geometry_pitch_to_y_fold_in_scale() {
+        let v = PianoRollView {
+            pitch_top: 72.0,
+            pitch_visible: 12.0,
+            scale: Some(scale_c_major(PianoRollScaleMode::Fold)),
+            ..test_view()
+        };
+        let g = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        let geom = RowGeometry::compute(v, g);
+        // C5 (in-scale, row 0): y = 0
+        let (y0, _) = geom.pitch_to_y_and_h(72);
+        assert!((y0 - 0.0).abs() < 1e-3, "C5 should be at top: y={y0}");
+        // D4 (pitch 62, row 6): y = 6 * 50 = 300
+        let (y6, _) = geom.pitch_to_y_and_h(62);
+        assert!((y6 - 300.0).abs() < 1e-3, "D4 at row 6: y={y6}");
+    }
+
+    #[test]
+    fn row_geometry_pitch_to_y_fold_out_of_scale_midpoint() {
+        let v = PianoRollView {
+            pitch_top: 72.0,
+            pitch_visible: 12.0,
+            scale: Some(scale_c_major(PianoRollScaleMode::Fold)),
+            ..test_view()
+        };
+        let g = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        let geom = RowGeometry::compute(v, g);
+        // C#5 (pitch 73): out, 視界外 (pitch_top=72)、 上 nothing → row 0 の上に描画
+        // Bb4 (pitch 70): out (D# のフラット側、 A♭4 でなく Bb4 = B♭ = pitch 70)
+        // 直上 B4 (row 1), 直下 A4 (row 2) → y_mid = (50 + 100) / 2 = 75
+        // 中間描画 (高さ 0.5 row) → y = 75 + 12.5 = 87.5 ?? Let me check.
+        // pitch_to_y_and_h for out: y_mid + row_h * 0.25 = 75 + 50*0.25 = 87.5、 h = 50*0.5 - 1 = 24
+        let (y_bb, h_bb) = geom.pitch_to_y_and_h(70);
+        assert!((y_bb - 87.5).abs() < 1e-3, "Bb4 midpoint y: {y_bb}");
+        assert!((h_bb - 24.0).abs() < 1e-3, "Bb4 half-row h: {h_bb}");
+    }
+
+    #[test]
+    fn y_to_pitch_fold_snaps_to_in_scale() {
+        let v = PianoRollView {
+            pitch_top: 72.0,
+            pitch_visible: 12.0,
+            scale: Some(scale_c_major(PianoRollScaleMode::Fold)),
+            ..test_view()
+        };
+        let g = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        let geom = RowGeometry::compute(v, g);
+        // row_h = 50、 fold_rows = [72, 71, 69, 67, 65, 64, 62, 60]。
+        // y_to_pitch_f は in-scale pitch を整数で返す (= row 写像) ので == 比較で安全。
+        #[allow(clippy::float_cmp)]
+        {
+            // y=0 → row 0 → pitch 72 (C5)
+            assert_eq!(geom.y_to_pitch_f(0.0), 72.0);
+            // y=300 → row 6 → pitch 62 (D4)
+            assert_eq!(geom.y_to_pitch_f(300.0), 62.0);
+            // y=399 (下端) → row 7 → pitch 60 (C4)
+            assert_eq!(geom.y_to_pitch_f(399.0), 60.0);
+        }
+    }
+
+    #[test]
+    fn compute_pitch_drag_delta_linear() {
+        let v = PianoRollView { pitch_top: 72.0, pitch_visible: 24.0, ..test_view() };
+        let g = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        // pitch_per_px = 24/400 = 0.06、 dy = 17 (= 約 1 半音下) → -1
+        let d = compute_pitch_drag_delta(v, g, 17.0);
+        assert_eq!(d, -1, "linear: 17px ≈ 1 semitone");
+    }
+
+    #[test]
+    fn compute_pitch_drag_delta_fold() {
+        let v = PianoRollView {
+            pitch_top: 72.0,
+            pitch_visible: 12.0,
+            scale: Some(scale_c_major(PianoRollScaleMode::Fold)),
+            ..test_view()
+        };
+        let g = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        // row_h = 50、 dy = 50 (= 1 row 下) → -1 (= 1 scale degree 下)
+        let d = compute_pitch_drag_delta(v, g, 50.0);
+        assert_eq!(d, -1, "fold: 1 row = -1 scale degree");
+        // dy = 150 (= 3 rows) → -3
+        let d3 = compute_pitch_drag_delta(v, g, 150.0);
+        assert_eq!(d3, -3);
+    }
+
+    #[test]
+    fn apply_pitch_drag_delta_fold_always_in_scale() {
+        let v = PianoRollView {
+            scale: Some(scale_c_major(PianoRollScaleMode::Fold)),
+            ..test_view()
+        };
+        // C5 (in-scale) を -1 scale degree → B4 (in-scale)
+        assert_eq!(apply_pitch_drag_delta(72, -1, v), 71);
+        // E4 (in-scale, pitch 64) を -2 → C4 (degree 2 - 2 = degree of C4)
+        // C major degrees: C=0, D=1, E=2, F=3, G=4, A=5, B=6, C5=7
+        // 64 = E4 = degree 23 (count from MIDI 0)? wait, this is global degree
+        // Let me just verify it's in-scale
+        let result = apply_pitch_drag_delta(64, -2, v);
+        let sc = scale_c_major(PianoRollScaleMode::Fold);
+        assert!(sc.is_in_scale(result), "fold delta result {result} should be in-scale");
+    }
+
+    #[test]
+    fn apply_pitch_drag_delta_linear_semitone() {
+        let v = test_view(); // scale = None
+        // pitch 60 + (-1) = 59 (B、 = 半音下)
+        assert_eq!(apply_pitch_drag_delta(60, -1, v), 59);
+        // pitch 60 + (+5) = 65 (F)
+        assert_eq!(apply_pitch_drag_delta(60, 5, v), 65);
+        // clamp test: 0 - 1 = 0
+        assert_eq!(apply_pitch_drag_delta(0, -1, v), 0);
+    }
+
+    #[test]
+    fn scale_none_view_compiles_and_renders() {
+        // scale = None で旧 API 完全互換 (regression check)
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![Note {
+            id: 0,
+            start_beat: 0.5,
+            len_beats: 0.5,
+            pitch: 60,
+            velocity: 96,
+            lyric: None,
+        }]);
+        let view = test_view(); // scale = None
+        let style = PianoRollStyle::default();
+        let sel: Vec<NoteId> = vec![];
+        host.frame(
+            &mut model,
+            &mut Scene::new(),
+            PhysicalSize { width: 800, height: 400 },
+            FrameInput::default(),
+            |m, ui| {
+                let _ = ui.piano_roll(
+                    "pr",
+                    Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                    &m.notes,
+                    view,
+                    &sel,
+                    &style,
+                    |_| Edit::mutate(|_m: &mut TestModel| {}),
+                );
+            },
+        );
+        // frame が panic しないこと
+    }
+
+    #[test]
+    fn highlight_mode_view_compiles_and_renders() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![]);
+        let view = PianoRollView {
+            scale: Some(scale_c_major(PianoRollScaleMode::Highlight)),
+            ..test_view()
+        };
+        let style = PianoRollStyle::default();
+        let sel: Vec<NoteId> = vec![];
+        host.frame(
+            &mut model,
+            &mut Scene::new(),
+            PhysicalSize { width: 800, height: 400 },
+            FrameInput::default(),
+            |m, ui| {
+                let _ = ui.piano_roll(
+                    "pr",
+                    Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                    &m.notes,
+                    view,
+                    &sel,
+                    &style,
+                    |_| Edit::mutate(|_m: &mut TestModel| {}),
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn fold_mode_view_compiles_and_renders() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![Note {
+            // pitch 61 (C#、 out-of-scale) を fold mode で描画して中間描画 path を hit させる
+            id: 0,
+            start_beat: 1.0,
+            len_beats: 0.5,
+            pitch: 61,
+            velocity: 96,
+            lyric: None,
+        }]);
+        let view = PianoRollView {
+            scale: Some(scale_c_major(PianoRollScaleMode::Fold)),
+            ..test_view()
+        };
+        let style = PianoRollStyle::default();
+        let sel: Vec<NoteId> = vec![];
+        host.frame(
+            &mut model,
+            &mut Scene::new(),
+            PhysicalSize { width: 800, height: 400 },
+            FrameInput::default(),
+            |m, ui| {
+                let _ = ui.piano_roll(
+                    "pr",
+                    Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                    &m.notes,
+                    view,
+                    &sel,
+                    &style,
+                    |_| Edit::mutate(|_m: &mut TestModel| {}),
+                );
+            },
         );
     }
 }

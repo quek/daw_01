@@ -57,6 +57,10 @@ struct PianoRollModel {
     /// `None` で loop band 非表示 (起動時のデフォルト)。 Shift+drag NewRange で新規作成、
     /// 既存 range の Start/End/Middle handle drag で edit、 Alt 押下で snap 一時無効化。
     loop_range: Option<(f64, f64)>,
+    /// (M14 Phase 70 / daw_01 #042) scale 状態。 起動時 `None`、 Tab で Highlight → Fold → None を
+    /// 順送り、 数字キー (1=C 〜 9=G#) で root pitch class を切替 (Shift+数字で半音上)。 Bitwig
+    /// と同じく Major scale 固定の demo (= `in_scale_mask = 0b0000_1010_1011_0101`)。
+    scale: Option<daw_ui_core::PianoRollScale>,
 
     last_frame_ms: f32,
     last_action: String,
@@ -76,6 +80,7 @@ impl PianoRollModel {
             pitch_visible: 24.0,
             playhead_beat: 2.0,
             loop_range: None,
+            scale: None,
             last_frame_ms: 0.0,
             last_action: "起動 (Drag = pan / Wheel = zoom / Click = select / Insert / Delete)"
                 .to_string(),
@@ -105,6 +110,9 @@ impl PianoRollModel {
             // M14 Phase 69 / daw_01 #041: ruler 上 Shift+drag で edit するための loop range。
             // demo では `None` で起動 (Shift+drag で新規 NewRange を作成可能)、 user 操作で更新される。
             loop_range: self.loop_range,
+            // M14 Phase 70 / daw_01 #042: scale 機能。 例では起動時 None、 Tab / Shift+Tab で
+            // Highlight ↔ Fold ↔ None を遷移、 1〜9 で root pitch class を変えられる (下記 build_ui)。
+            scale: self.scale,
         }
     }
 }
@@ -420,6 +428,11 @@ impl App {
         // PianoRollStyle::default().lyric_edit_shortcut == Some("piano_roll.edit_lyric") と
         // 整合する name を bind する。caller opt-in のため with_default_bindings には含めない。
         ui.shortcut_map_mut().bind("piano_roll.edit_lyric", "L");
+        // M14 Phase 70 / daw_01 #042: scale mode / root の demo shortcut。
+        // K (= Ableton "Fold to Scale" 同 key) で Highlight → Fold → None を順送り、
+        // R で root pitch class を +1 (C → C# → D → ...) cycle。 demo 用、 caller が独自に bind 可能。
+        ui.shortcut_map_mut().bind("piano_roll.demo_scale_mode_cycle", "K");
+        ui.shortcut_map_mut().bind("piano_roll.demo_scale_root_cycle", "R");
         Self {
             ui,
 
@@ -589,6 +602,50 @@ impl App {
                     ui.request_redo();
                 }
 
+                // M14 Phase 70 / daw_01 #042: scale demo shortcuts。
+                // K で mode cycle (None → Highlight → Fold → None)、 R で root cycle (C → C# → ...)。
+                // Major scale 固定 demo。 caller が ScaleChange 経由で実 scale を渡す本番は daw_01 側。
+                if ui.take_shortcut("piano_roll.demo_scale_mode_cycle") {
+                    ui.push_edit(Edit::mutate(|m: &mut PianoRollModel| {
+                        const MAJOR_MASK: u16 = 0b0000_1010_1011_0101;
+                        m.scale = match m.scale {
+                            None => Some(daw_ui_core::PianoRollScale {
+                                root: 0,
+                                in_scale_mask: MAJOR_MASK,
+                                mode: daw_ui_core::PianoRollScaleMode::Highlight,
+                            }),
+                            Some(sc) => match sc.mode {
+                                daw_ui_core::PianoRollScaleMode::Highlight => {
+                                    Some(daw_ui_core::PianoRollScale {
+                                        mode: daw_ui_core::PianoRollScaleMode::Fold,
+                                        ..sc
+                                    })
+                                }
+                                daw_ui_core::PianoRollScaleMode::Fold => None,
+                            },
+                        };
+                        m.last_action = format!("scale mode → {:?}", m.scale.map(|s| s.mode));
+                    }));
+                }
+                if ui.take_shortcut("piano_roll.demo_scale_root_cycle") {
+                    ui.push_edit(Edit::mutate(|m: &mut PianoRollModel| {
+                        const MAJOR_MASK: u16 = 0b0000_1010_1011_0101;
+                        let cur =
+                            m.scale.unwrap_or(daw_ui_core::PianoRollScale {
+                                root: 0,
+                                in_scale_mask: MAJOR_MASK,
+                                mode: daw_ui_core::PianoRollScaleMode::Highlight,
+                            });
+                        let new_root = (cur.root + 1) % 12;
+                        m.scale = Some(daw_ui_core::PianoRollScale { root: new_root, ..cur });
+                        const NAMES: [&str; 12] = [
+                            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+                        ];
+                        m.last_action =
+                            format!("scale root → {} ({:?})", NAMES[new_root as usize], cur.mode);
+                    }));
+                }
+
                 // Header HUD
                 ui.label_at(
                     "title",
@@ -718,7 +775,7 @@ impl App {
                 let footer_y = (screen.height as f32 - 44.0).max(0.0);
                 ui.label_at(
                     "footer1",
-                    "Drag = pan / Wheel = X zoom / Ctrl+Wheel = Y zoom / Click = select / Insert = add / Delete / Shift+drag = rect-select (加算) / Ctrl+Z = undo",
+                    "Drag = pan / Wheel = X zoom / Ctrl+Wheel = Y zoom / Click = select / Insert = add / Delete / Shift+drag = rect-select / K = scale mode / R = scale root / Ctrl+Z = undo",
                     16.0, footer_y, 12.0,
                     Color::rgb(0.65, 0.68, 0.72),
                 );

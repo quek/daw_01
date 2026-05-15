@@ -153,6 +153,8 @@ fn main() {
                 snap: daw_ui_core::SnapConfig::DEFAULT,
                 // M14 Phase 69 / daw_01 #041: loop_range も Option<(f64,f64)> (Copy) で no-Clone 互換。
                 loop_range: None,
+                // M14 Phase 70 / daw_01 #042: scale も Option<PianoRollScale> (Copy) で no-Clone 互換。
+                scale: None,
             };
             let style = PianoRollStyle::default();
             let _ = ui.piano_roll(

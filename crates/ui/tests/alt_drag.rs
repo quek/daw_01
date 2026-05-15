@@ -469,6 +469,7 @@ fn pr_view(snap: SnapConfig) -> PianoRollView {
         time_sig: (4, 4),
         snap,
         loop_range: None,
+        scale: None,
     }
 }
 
