@@ -80,7 +80,7 @@
   <li><strong>B2</strong> (オーディオ録音): 未着手</li>
   <li><strong>B3</strong> (メトロノーム / count-in): <strong>完了</strong>。 count-in は B4 と一体実装 (commit 56213f8)</li>
   <li><strong>B4</strong> (MIDI 録音 / export): <strong>Minimum 完了</strong> (Step A-E)。 B3 残 (count-in) も同時 landing。 残: B1-M (VST3 IMidiMapping)、 device 選択 / punch in/out / per-track export 等は extended</li>
-  <li><strong>B5</strong> (Scale &amp; Root): <strong>設計済 / 着手前</strong>。 詳細は <a href="plan_scale.html"><code>plan_scale.html</code></a>。 Cubase 流の時間軸 scale event SSoT + 3 軸 constrain (Snap on Draw / Snap Live / Quantize Pitches) + Ableton 流 Fold to Scale を採用</li>
+  <li><strong>B5</strong> (Scale &amp; Root): <strong>完了</strong>。 詳細は <a href="plan_scale.html"><code>plan_scale.html</code></a>。 Cubase 流の時間軸 scale event SSoT + 3 軸 constrain (Snap on Draw / Snap Live / Quantize Pitches) + Ableton 流 Fold to Scale + gui_01 widget Highlight/Fold + Bitwig 流 drag preview snap までを S1-S3 で完結。 S5 (arrangement Scale Lane = 転調 UI) と S6 (polish) は scope 外</li>
   <li><strong>Undo/Redo 残リスク (B/D/E)</strong>: 完了 (2026-05-14)</li>
 </ul>
 
@@ -153,7 +153,7 @@
 
 <p><strong>残 (extended)</strong>: MIDI device 選択 dropdown / punch in / out / per-track export / B1-M (VST3 IMidiMapping、 MIDI 入力で plugin parameter map)。</p>
 
-<h3>B5: Scale &amp; Root (設計済 / 着手前)</h3>
+<h3>B5: Scale &amp; Root (完了)</h3>
 
 <p>楽曲のキー (root + scale) を Song に持たせ、 ピアノロールの行ハイライト / 入力の制約 / ノートの一括補正 / VOICEVOX 歌唱の pitch snap に活用する。 詳細は <a href="plan_scale.html"><code>plan_scale.html</code></a>。</p>
 
