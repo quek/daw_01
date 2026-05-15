@@ -218,22 +218,91 @@ fn compute_pitch_drag_delta(view: PianoRollView, grid: Rect, dy: f32) -> i32 {
     (-(dy * pitch_per_px)).round() as i32
 }
 
-/// (M14 Phase 70 / daw_01 #042) anchor pitch に drag delta を適用、 新 pitch を返す mode-aware helper。
+/// (M14 Phase 70 / daw_01 #042 + 70b follow-up) anchor pitch に drag delta を適用、 新 pitch を
+/// 返す mode-aware helper。
 ///
-/// - Linear / Highlight: `anchor + delta` を 0..=127 に clamp して u8 化。
-/// - Fold: anchor を scale degree に変換 → delta 加算 → in-scale pitch に逆変換 (= 必ず in-scale 出力)。
+/// - **Fold mode**: anchor を scale degree に変換 → delta 加算 → in-scale pitch に逆変換 (= 必ず
+///   in-scale 出力、 `last_alt` 関係なし、 元々 scale degree 単位の drag なので Alt で raw 化する
+///   意味がない)。
+/// - **Linear (None / Highlight, `snap_pitch_during_drag = false`)**: `anchor + delta` を 0..=127
+///   に clamp して u8 化 (= 旧挙動)。
+/// - **Linear + Highlight + `snap_pitch_during_drag = true` + `!last_alt`**: clamp 後、
+///   `snap_to_nearest_in_scale` で最寄り in-scale に吸着 (= Bitwig / Cubase 流の drag preview snap)。
+/// - **Linear + `last_alt = true`**: `snap_pitch_during_drag` 無視で raw clamp (= Alt で snap 一時無効)。
 ///
 /// out-of-scale anchor (Fold 中に既存 out note を drag) は「直下 in-scale」 の degree を基点に。
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn apply_pitch_drag_delta(anchor_pitch: u8, delta: i32, view: PianoRollView) -> u8 {
+fn apply_pitch_drag_delta(
+    anchor_pitch: u8,
+    delta: i32,
+    view: PianoRollView,
+    last_alt: bool,
+) -> u8 {
     if let Some(sc) = view.scale
         && matches!(sc.mode, PianoRollScaleMode::Fold)
     {
         let d = sc.pitch_to_scale_degree(anchor_pitch);
         return sc.scale_degree_to_pitch(d + delta);
     }
-    (i32::from(anchor_pitch) + delta).clamp(0, 127) as u8
+    let raw = (i32::from(anchor_pitch) + delta).clamp(0, 127) as u8;
+    if let Some(sc) = view.scale
+        && matches!(sc.mode, PianoRollScaleMode::Highlight)
+        && view.snap_pitch_during_drag
+        && !last_alt
+    {
+        return snap_to_nearest_in_scale(raw, sc);
+    }
+    raw
+}
+
+/// (M14 Phase 70b / daw_01 #042 follow-up) `pitch` を最寄り in-scale pitch に snap する。
+///
+/// `pitch` が既に in-scale ならそのまま返す。 そうでなければ、 上下に向かって最短距離の in-scale
+/// pitch を探し、 距離 tie は **上を優先** (Cubase 流の tie-breaker、 daw_01 一次情報リンクと一致)。
+///
+/// 必ず in-scale pitch (0..=127) を返す。 `in_scale_mask = 0` (= 全 out-of-scale) の degenerate
+/// caller には input `pitch` をそのまま返す (= 上下 12 半音以内に in-scale が無いケース)。
+#[must_use]
+fn snap_to_nearest_in_scale(pitch: u8, scale: PianoRollScale) -> u8 {
+    if scale.is_in_scale(pitch) {
+        return pitch;
+    }
+    // 半音単位で上下を同時探索、 in-scale を見つけたら距離記録。 全 12 半音 範囲 (= 1 octave 以内
+    // に必ず in-scale がある、 mask が 0 で無い限り) なら必ず見つかる。
+    let mut above: Option<(u8, u8)> = None; // (pitch, distance)
+    let mut below: Option<(u8, u8)> = None;
+    for d in 1_u8..=12 {
+        if above.is_none() {
+            let p_up_i = i32::from(pitch) + i32::from(d);
+            if p_up_i <= 127 {
+                let p_up = p_up_i as u8;
+                if scale.is_in_scale(p_up) {
+                    above = Some((p_up, d));
+                }
+            }
+        }
+        if below.is_none() {
+            let p_dn_i = i32::from(pitch) - i32::from(d);
+            if p_dn_i >= 0 {
+                let p_dn = p_dn_i as u8;
+                if scale.is_in_scale(p_dn) {
+                    below = Some((p_dn, d));
+                }
+            }
+        }
+        if above.is_some() && below.is_some() {
+            break;
+        }
+    }
+    match (above, below) {
+        (Some((a_p, a_d)), Some((b_p, b_d))) => {
+            if a_d <= b_d { a_p } else { b_p }
+        }
+        (Some((a_p, _)), None) => a_p,
+        (None, Some((b_p, _))) => b_p,
+        (None, None) => pitch, // degenerate: mask=0、 input をそのまま
+    }
 }
 
 /// piano roll の view 状態 (pan / zoom)。値渡し (Copy) で widget に渡す。
@@ -290,6 +359,13 @@ pub struct PianoRollView {
     /// `Some(PianoRollScale { root, in_scale_mask, mode })` で Highlight / Fold の各動作が active 化。
     /// 詳細は `PianoRollScale` doc 参照。
     pub scale: Option<PianoRollScale>,
+    /// (M14 Phase 70b / daw_01 #042 follow-up) `scale.is_some()` かつ `mode = Highlight` の
+    /// とき、 既存 note の y-drag preview / release commit を最寄り in-scale pitch に snap する。
+    /// `false` (default) で旧挙動完全互換 (raw pitch)、 `true` で業界標準 (Bitwig / Cubase) の
+    /// 「drag 中も snap される行に jump」 動作。 `mode = Fold` のときは無視 (= 元々 in-scale)、
+    /// `scale = None` でも無視。 drag 中 `pointer.modifiers.alt` (= `nd.last_alt`) で snap 一時
+    /// 無効 (= `snap_beat` と同 policy)。 距離 tie は **上を優先** (Cubase 流)。
+    pub snap_pitch_during_drag: bool,
 }
 
 /// piano roll が user に発行する Edit 要求の種別。
@@ -1111,12 +1187,13 @@ fn drag_preview_geometry(
     pitch_delta: i32,
     min_len: f64,
     view: PianoRollView,
+    last_alt: bool,
 ) -> (f64, f64, u8) {
     match kind {
         NoteDragKind::Move => (
             (anchor.start_beat + beat_delta).max(0.0),
             anchor.len_beats,
-            apply_pitch_drag_delta(anchor.pitch, pitch_delta, view),
+            apply_pitch_drag_delta(anchor.pitch, pitch_delta, view, last_alt),
         ),
         NoteDragKind::ResizeRight => (
             anchor.start_beat,
@@ -1700,6 +1777,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // (M14 Phase 70 / daw_01 #042) `view.scale` を hash に含めて、 scale 切替 (root / mask / mode)
         // が起きたとき cache invalidate されるようにする。 None は (0, 0, 0) で表現 (= scale OFF
         // が連続するときは同じ hash 寄与で cache hit、 None ↔ Some の遷移時は差分が出る)。
+        // (M14 Phase 70 / daw_01 #042) scale 切替 (root / mask / mode) で cache invalidate。
+        // (M14 Phase 70b / daw_01 #042 follow-up) snap_pitch_during_drag toggle も cache key に
+        // 含める (= drag preview の経路は cached 内には含まれないが、 future-proof と test 容易さ
+        // のため含める判断、 cost は u8 1 byte 増加のみ)。
         let scale_key = view.scale.map_or((0_u8, 0_u16, 0_u8), |sc| {
             let mode_tag: u8 = match sc.mode {
                 PianoRollScaleMode::Highlight => 1,
@@ -1707,6 +1788,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             };
             (sc.root, sc.in_scale_mask, mode_tag)
         });
+        let snap_drag_key: u8 = u8::from(view.snap_pitch_during_drag);
         let viewport_key = (
             (
                 b"piano_roll_widget_v3" as &[u8],
@@ -1725,6 +1807,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     u32::from(view.time_sig.0),
                     u32::from(view.time_sig.1),
                     scale_key,
+                    snap_drag_key,
                 ),
             ),
             internal_note_hash,
@@ -2031,8 +2114,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     let mut deltas: Vec<MoveDelta> = Vec::new();
                     for a in &nd.anchors {
                         let new_start = (a.start_beat + beat_delta).max(0.0);
+                        // M14 Phase 70b / daw_01 #042 follow-up: release commit も `nd.last_alt` を
+                        // 渡して overlay と完全同 helper 経由。 alt で snap 無効も両者一致。
                         let new_pitch =
-                            apply_pitch_drag_delta(a.pitch, pitch_delta, view);
+                            apply_pitch_drag_delta(a.pitch, pitch_delta, view, release_alt);
                         if (new_start - a.start_beat).abs() > 1e-6 || new_pitch != a.pitch
                         {
                             deltas.push((a.id, a.start_beat, a.pitch, new_start, new_pitch));
@@ -2664,7 +2749,7 @@ fn draw_drag_preview<M: ?Sized + 'static>(
 ) {
     for a in &nd.anchors {
         let (start_beat, len_beats, pitch) =
-            drag_preview_geometry(*a, nd.kind, beat_delta, pitch_delta, min_len, view);
+            drag_preview_geometry(*a, nd.kind, beat_delta, pitch_delta, min_len, view, nd.last_alt);
         let r = note_geometry_to_rect(start_beat, len_beats, pitch, view, grid);
         let x_left = r.x.max(grid.x);
         let x_right = (r.x + r.w).min(grid.x + grid.w);
@@ -2781,6 +2866,7 @@ mod tests {
             snap: SnapConfig::OFF,
             loop_range: None,
             scale: None,
+            snap_pitch_during_drag: false,
         }
     }
 
@@ -5852,13 +5938,10 @@ mod tests {
             scale: Some(scale_c_major(PianoRollScaleMode::Fold)),
             ..test_view()
         };
-        // C5 (in-scale) を -1 scale degree → B4 (in-scale)
-        assert_eq!(apply_pitch_drag_delta(72, -1, v), 71);
-        // E4 (in-scale, pitch 64) を -2 → C4 (degree 2 - 2 = degree of C4)
-        // C major degrees: C=0, D=1, E=2, F=3, G=4, A=5, B=6, C5=7
-        // 64 = E4 = degree 23 (count from MIDI 0)? wait, this is global degree
-        // Let me just verify it's in-scale
-        let result = apply_pitch_drag_delta(64, -2, v);
+        // C5 (in-scale) を -1 scale degree → B4 (in-scale)。 last_alt=false (Fold mode は無関係)
+        assert_eq!(apply_pitch_drag_delta(72, -1, v, false), 71);
+        // E4 (in-scale, pitch 64) を -2 → 必ず in-scale
+        let result = apply_pitch_drag_delta(64, -2, v, false);
         let sc = scale_c_major(PianoRollScaleMode::Fold);
         assert!(sc.is_in_scale(result), "fold delta result {result} should be in-scale");
     }
@@ -5866,12 +5949,115 @@ mod tests {
     #[test]
     fn apply_pitch_drag_delta_linear_semitone() {
         let v = test_view(); // scale = None
-        // pitch 60 + (-1) = 59 (B、 = 半音下)
-        assert_eq!(apply_pitch_drag_delta(60, -1, v), 59);
+        // pitch 60 + (-1) = 59 (B、 = 半音下)、 last_alt=false (scale None なので影響なし)
+        assert_eq!(apply_pitch_drag_delta(60, -1, v, false), 59);
         // pitch 60 + (+5) = 65 (F)
-        assert_eq!(apply_pitch_drag_delta(60, 5, v), 65);
+        assert_eq!(apply_pitch_drag_delta(60, 5, v, false), 65);
         // clamp test: 0 - 1 = 0
-        assert_eq!(apply_pitch_drag_delta(0, -1, v), 0);
+        assert_eq!(apply_pitch_drag_delta(0, -1, v, false), 0);
+    }
+
+    // -------- Phase 70b / daw_01 #042 follow-up: snap_pitch_during_drag tests --------
+
+    #[test]
+    fn snap_to_nearest_in_scale_returns_input_when_already_in_scale() {
+        let sc = scale_c_major(PianoRollScaleMode::Highlight);
+        // C, D, E, F, G, A, B (= in-scale) は変化なし
+        for &p in &[60_u8, 62, 64, 65, 67, 69, 71] {
+            assert_eq!(snap_to_nearest_in_scale(p, sc), p);
+        }
+    }
+
+    #[test]
+    fn snap_to_nearest_in_scale_picks_nearest() {
+        let sc = scale_c_major(PianoRollScaleMode::Highlight);
+        // C# (61) は 上 D(62) / 下 C(60) で同距離 → 上優先 = 62
+        assert_eq!(snap_to_nearest_in_scale(61, sc), 62);
+        // D# (63) も 上 E(64) / 下 D(62) で同距離 → 上優先 = 64
+        assert_eq!(snap_to_nearest_in_scale(63, sc), 64);
+        // F# (66) は 上 G(67) / 下 F(65) → 上優先 = 67
+        assert_eq!(snap_to_nearest_in_scale(66, sc), 67);
+    }
+
+    #[test]
+    fn apply_pitch_drag_delta_highlight_snap_when_flag_on() {
+        let v = PianoRollView {
+            scale: Some(scale_c_major(PianoRollScaleMode::Highlight)),
+            snap_pitch_during_drag: true,
+            ..test_view()
+        };
+        // pitch 60 (C) + (-1) = 59 (B、 in-scale) → snap 後 59 (= そのまま)
+        assert_eq!(apply_pitch_drag_delta(60, -1, v, false), 59);
+        // pitch 60 (C) + (-2) = 58 (Bb、 out-of-scale) → 上 B(59) と下 A(57) は同距離 → 上 = 59
+        assert_eq!(apply_pitch_drag_delta(60, -2, v, false), 59);
+        // pitch 60 + (+1) = 61 (C#、 out) → 上 D(62) / 下 C(60) 同距離 → 上 = 62
+        assert_eq!(apply_pitch_drag_delta(60, 1, v, false), 62);
+        // pitch 60 + (+3) = 63 (D#、 out) → 上 E(64) / 下 D(62) 同距離 → 上 = 64
+        assert_eq!(apply_pitch_drag_delta(60, 3, v, false), 64);
+    }
+
+    #[test]
+    fn apply_pitch_drag_delta_highlight_snap_disabled_when_alt() {
+        let v = PianoRollView {
+            scale: Some(scale_c_major(PianoRollScaleMode::Highlight)),
+            snap_pitch_during_drag: true,
+            ..test_view()
+        };
+        // alt=true で snap 無効、 raw clamp が走る
+        // pitch 60 + (-2) = 58 (raw、 Bb)、 alt で snap 無効なので 58 のまま
+        assert_eq!(apply_pitch_drag_delta(60, -2, v, true), 58);
+        assert_eq!(apply_pitch_drag_delta(60, 1, v, true), 61);
+    }
+
+    #[test]
+    fn apply_pitch_drag_delta_highlight_no_snap_when_flag_off() {
+        let v = PianoRollView {
+            scale: Some(scale_c_major(PianoRollScaleMode::Highlight)),
+            snap_pitch_during_drag: false, // 旧挙動
+            ..test_view()
+        };
+        // flag off で旧挙動 (raw clamp)
+        assert_eq!(apply_pitch_drag_delta(60, -2, v, false), 58);
+        assert_eq!(apply_pitch_drag_delta(60, 1, v, false), 61);
+    }
+
+    #[test]
+    fn apply_pitch_drag_delta_fold_ignores_snap_flag() {
+        // Fold は元々 scale degree 単位、 flag 関係なく in-scale 出力
+        let v = PianoRollView {
+            scale: Some(scale_c_major(PianoRollScaleMode::Fold)),
+            snap_pitch_during_drag: false,
+            ..test_view()
+        };
+        let sc = scale_c_major(PianoRollScaleMode::Fold);
+        for delta in [-3_i32, -1, 0, 1, 2, 5] {
+            let r = apply_pitch_drag_delta(60, delta, v, false);
+            assert!(sc.is_in_scale(r), "Fold flag=off: delta={delta} → {r} must be in-scale");
+        }
+        let v_on = PianoRollView { snap_pitch_during_drag: true, ..v };
+        for delta in [-3_i32, -1, 0, 1, 2, 5] {
+            let r = apply_pitch_drag_delta(60, delta, v_on, false);
+            assert!(sc.is_in_scale(r), "Fold flag=on: delta={delta} → {r} must be in-scale");
+        }
+    }
+
+    #[test]
+    fn apply_pitch_drag_delta_highlight_snap_multi_anchor_relative_preserved() {
+        // multi-select drag で全 anchor が同じ delta を適用される。 anchor 間の相対位置が
+        // 「同 scale degree 差」 を保つことを確認 (= Bitwig 流 multi-drag)。
+        let v = PianoRollView {
+            scale: Some(scale_c_major(PianoRollScaleMode::Highlight)),
+            snap_pitch_during_drag: true,
+            ..test_view()
+        };
+        // anchor 1: C (60), anchor 2: E (64) (= 3 semitones above C)
+        // delta = +2 半音 (raw)、 snap 後:
+        //   C(60) + 2 = D(62) (in-scale そのまま)
+        //   E(64) + 2 = F#(66) → snap → 上G(67) / 下F(65) 同距離 → 上 = 67
+        // 結果: D(62) と G(67) で「scale degree 差 3」 維持 (= 元の C/E 差と等価ではないが
+        // raw 半音差 2 を delta としたときの自然な結果)。
+        assert_eq!(apply_pitch_drag_delta(60, 2, v, false), 62);
+        assert_eq!(apply_pitch_drag_delta(64, 2, v, false), 67);
     }
 
     #[test]

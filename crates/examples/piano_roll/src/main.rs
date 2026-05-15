@@ -61,6 +61,9 @@ struct PianoRollModel {
     /// 順送り、 数字キー (1=C 〜 9=G#) で root pitch class を切替 (Shift+数字で半音上)。 Bitwig
     /// と同じく Major scale 固定の demo (= `in_scale_mask = 0b0000_1010_1011_0101`)。
     scale: Option<daw_ui_core::PianoRollScale>,
+    /// (M14 Phase 70b / daw_01 #042 follow-up) drag preview snap toggle。 S key で flip。
+    /// `scale = Some(Highlight)` + `true` で y-drag 中 preview が in-scale 行に jump (= Bitwig 流)。
+    snap_pitch_during_drag: bool,
 
     last_frame_ms: f32,
     last_action: String,
@@ -81,6 +84,7 @@ impl PianoRollModel {
             playhead_beat: 2.0,
             loop_range: None,
             scale: None,
+            snap_pitch_during_drag: false,
             last_frame_ms: 0.0,
             last_action: "起動 (Drag = pan / Wheel = zoom / Click = select / Insert / Delete)"
                 .to_string(),
@@ -113,6 +117,9 @@ impl PianoRollModel {
             // M14 Phase 70 / daw_01 #042: scale 機能。 例では起動時 None、 Tab / Shift+Tab で
             // Highlight ↔ Fold ↔ None を遷移、 1〜9 で root pitch class を変えられる (下記 build_ui)。
             scale: self.scale,
+            // M14 Phase 70b / daw_01 #042 follow-up: Highlight + Snap on Draw 相当の drag preview snap。
+            // S key で flip (下記 build_ui)。 demo 用、 daw_01 では `app.snap_on_draw` を流す想定。
+            snap_pitch_during_drag: self.snap_pitch_during_drag,
         }
     }
 }
@@ -433,6 +440,11 @@ impl App {
         // R で root pitch class を +1 (C → C# → D → ...) cycle。 demo 用、 caller が独自に bind 可能。
         ui.shortcut_map_mut().bind("piano_roll.demo_scale_mode_cycle", "K");
         ui.shortcut_map_mut().bind("piano_roll.demo_scale_root_cycle", "R");
+        // M14 Phase 70b / daw_01 #042 follow-up: Highlight + Snap on Draw 相当の demo toggle。
+        // S で snap_pitch_during_drag を flip。 Highlight mode で note y-drag 中 preview が
+        // in-scale 行へ jump する Bitwig / Cubase 流 UX を確認できる。 daw_01 では
+        // app.snap_on_draw を流す想定。
+        ui.shortcut_map_mut().bind("piano_roll.demo_snap_drag_toggle", "S");
         Self {
             ui,
 
@@ -645,6 +657,15 @@ impl App {
                         );
                     }));
                 }
+                if ui.take_shortcut("piano_roll.demo_snap_drag_toggle") {
+                    ui.push_edit(Edit::mutate(|m: &mut PianoRollModel| {
+                        m.snap_pitch_during_drag = !m.snap_pitch_during_drag;
+                        m.last_action = format!(
+                            "snap_pitch_during_drag → {} (Highlight + drag で in-scale snap)",
+                            m.snap_pitch_during_drag
+                        );
+                    }));
+                }
 
                 // Header HUD
                 ui.label_at(
@@ -775,7 +796,7 @@ impl App {
                 let footer_y = (screen.height as f32 - 44.0).max(0.0);
                 ui.label_at(
                     "footer1",
-                    "Drag = pan / Wheel = X zoom / Ctrl+Wheel = Y zoom / Click = select / Insert = add / Delete / Shift+drag = rect-select / K = scale mode / R = scale root / Ctrl+Z = undo",
+                    "Drag = pan / Wheel = X zoom / Ctrl+Wheel = Y zoom / Click = select / Insert = add / Delete / Shift+drag = rect-select / K = scale mode / R = scale root / S = snap drag / Ctrl+Z = undo",
                     16.0, footer_y, 12.0,
                     Color::rgb(0.65, 0.68, 0.72),
                 );

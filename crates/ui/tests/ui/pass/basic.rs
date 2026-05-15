@@ -155,6 +155,8 @@ fn main() {
                 loop_range: None,
                 // M14 Phase 70 / daw_01 #042: scale も Option<PianoRollScale> (Copy) で no-Clone 互換。
                 scale: None,
+                // M14 Phase 70b / daw_01 #042 follow-up: drag preview snap toggle (Copy bool)。
+                snap_pitch_during_drag: false,
             };
             let style = PianoRollStyle::default();
             let _ = ui.piano_roll(
