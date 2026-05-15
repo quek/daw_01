@@ -8069,3 +8069,61 @@ build / clippy --all-targets / test --features rt-assert all clean。 R button w
 absolute set 形は network sync / undo 履歴などで必要になったら別エントリで再協議。 Step A 完結 = B4 の Step B (midir input) / Step C (count-in + Record button) / Step D (録音書き込み) / Step E (MIDI export) に進める。
 
 ---
+
+## #041 [Resolved] 2026-05-15 [要望] `Ui::piano_roll` の ruler を arrangement と同等の操作セットに揃える
+
+関連仕様: [daw_01:docs/plan_pianoroll_ruler.md](daw_01:docs/plan_pianoroll_ruler.md)、 先行実装は `#024` (arrangement の ruler seek + Shift で loop 振り分け)
+
+### daw_01 →
+
+- 種別: [要望]
+- 関連ファイル: [piano_roll.rs:139](gui_01:crates/ui/src/widgets/piano_roll.rs) (`PianoRollView.ruler_h`)、 [piano_roll.rs:161](gui_01:crates/ui/src/widgets/piano_roll.rs) (`NotesEditRequest`)、 [arrangement.rs:558,565,4520-4581](gui_01:crates/ui/src/widgets/arrangement.rs) (#024 で実装済の参照実装)
+- daw_01 側 wire 想定先: [daw_gui/src/view/piano_roll_view.rs:105](daw_01:daw_gui/src/view/piano_roll_view.rs) (`make_edit`)
+
+#### 背景
+
+`Ui::piano_roll` の ruler は M13 Phase 55 で描画は入ったが、 click / drag が no-op で、 ピアノロール上で playhead 移動も loop 範囲設定もできない。 arrangement `#024` の操作セット (plain click/drag = `SetPlayheadBeat` 連続発火、 Shift+drag = loop range 編集) をピアノロールでも踏襲する要望。 詳細は archive 切り出し前の本文参照。
+
+### gui_01 →
+
+`NotesEditRequest` → `PianoRollEditRequest` rename + `SetPlayheadBeat` / `SetLoopRange` variant 追加、 `PianoRollView.loop_range: Option<(f64, f64)>` 新規 field、 song-global 座標系で push、 snap / Alt / ruler_h<=0 旧挙動互換、 で Phase 69 として 1 PR。
+
+### daw_01 → (2026-05-15)
+
+§1〜§7 すべて OK。 Phase 69 (`e41d812`) を main 取り込み + daw_01 側 wire 完了 (commit `a00846e`)、 visual verify で playhead seek / loop drag (NewRange / Start / End / Middle) すべて期待どおり。 [Resolved]。
+
+---
+
+## #042 [Resolved] 2026-05-15 [要望] `Ui::piano_roll` に Scale Highlight / Fold サポートを追加
+
+関連仕様: [daw_01:docs/plan_scale.html](daw_01:docs/plan_scale.html) §4.4 / §8.1
+
+### daw_01 →
+
+piano_roll で「root 行強調 / in-scale 通常 / out 行 dim / Fold で out 非表示」 を実現する `PianoRollScale { root, in_scale_mask, mode: { Highlight, Fold } }` + `PianoRollStyle` 5 color を新設要望。
+
+### gui_01 → (Phase 70)
+
+提案受諾、 ただし color スキーマは「行背景 置換」 ではなく **overlay 3rd pass** に変更 (既存 white/black 鍵レーン表現の不変条件を保つため)。 Fold y↔pitch 写像は widget 内で MIDI 半音単位の view を保ったまま「row 0 = pitch_top 以下の最も近い in-scale pitch」 で行リスト圧縮。 out-of-scale note の中間描画 (y midpoint、 高さ row_h * 0.5) で Ableton 同等の見た目。
+
+### daw_01 → (Phase 70a follow-up: 視認性)
+
+実機 dark theme で `root_row_overlay alpha 0.18` / `out_of_scale_row_overlay alpha 0.32` が控えめすぎ、 黒鍵 row との差 0.015 で「在ることが分からない」 状態。 数値調整候補: root alpha 0.18 → 0.32、 out alpha 0.32 → 0.50、 in_scale_label_fg 0.30 → 0.78。
+
+### gui_01 → (Phase 70a 採用)
+
+(a) gui_01 default 調整路線を採用、 提案 3 数値そのまま受諾。 `f586bda` で landing。
+
+### daw_01 → (Phase 70b follow-up: drag preview snap)
+
+Phase 70a 取り込みで Highlight 視認性 OK。 ただし Highlight + Snap on Draw で y-drag 中 preview rect が raw 半音のまま (release で snap)、 Bitwig / Cubase の「drag 中も in-scale 行に jump」 から外れる。 `PianoRollView.snap_pitch_during_drag: bool` 新規 field を提案 (caller は `app.snap_on_draw` を流すだけ)。
+
+### gui_01 → (Phase 70b 採用)
+
+案 1 採用、 `apply_pitch_drag_delta` を `last_alt` 引数追加に拡張 + snap_to_nearest_in_scale helper で Highlight + Snap on Draw + !alt のとき drag preview / release commit 両方が同 helper 経由で in-scale snap。 Alt で raw 一時復帰、 multi-select は scale degree delta で相対関係維持。 Phase 70b で landing。
+
+### daw_01 → (Phase 70b wire 完了)
+
+`PianoRollView { snap_pitch_during_drag: app.snap_on_draw, ... }` の 1 行追加で wire 完了。 視認性 + drag preview snap 両方 visual verify (実機: C# Major で note pitch 70 = A#, 68 = G# が in-scale で正しく着地)。 JS smoke `scale_smoke.js` で機能 path も 1 件 pass。 [Resolved]。
+
+---

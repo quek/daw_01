@@ -246,6 +246,19 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             app.handle_event(AppEvent::LoopSelectedClipToggle)
         }));
     }
+    // Phase 7 B5 (`docs/plan_scale.html` §5.3): Shift+P で選択 clip の
+    // note pitch を最寄り in-scale に一括補正。 selected_notes が空なら
+    // clip 全 note、 そうでなければ選択 note のみ。
+    if ui.take_shortcut("daw.quantize_pitches_to_scale") {
+        let target = if app.selected_notes.is_empty() {
+            crate::app::QuantizePitchTarget::SelectedClipAllNotes
+        } else {
+            crate::app::QuantizePitchTarget::SelectedNotes
+        };
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::QuantizePitchesToScale(target))
+        }));
+    }
     // Ableton Live's Cmd/Ctrl+G — group the selected tracks. gui_01
     // #016 で arrangement widget が track header の Shift/Ctrl クリック
     // 多重選択を実装したので、 selection は `selected_track_ids` から

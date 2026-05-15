@@ -397,6 +397,8 @@ pub struct PianoRollView {
 
 <p>cache hash key に <code>scale</code> の <code>(root, mask, mode)</code> を含めるので、 scale 変更で cache invalidate される (gui_01 側で対応)。 <code>view.scale</code> を 1 frame mutate するだけで Highlight ↔ Fold ↔ None を遷移可能。</p>
 
+<p><strong>視認性 (2026-05-15 実機テスト後追記)</strong>: 当初は「<code>Default::default()</code> の Bitwig 風配色のまま採用」 と計画したが、 実機 (daw_01 dark theme bg ≈ 0.10) で Highlight mode の root 行 / out 行 overlay が薄すぎて視覚順序が立たない症状を確認。 gui_01 #042 に follow-up 投稿し、 (a) gui_01 default の alpha 値調整 (Phase 70 follow-up) or (b) daw_01 側 caller override (struct update syntax で alpha 上書き) のどちらが best か判断を仰ぐ。 結果が来たら本節に反映する。</p>
+
 <h4>note y-drag の snap 責務</h4>
 
 <p>widget は raw pitch を push (Highlight mode) / in-scale pitch を push (Fold mode)。 「Snap on Draw」 toggle に応じて caller 側で追加 snap (Highlight mode で Snap on Draw ON のとき <code>ScaleChange::snap</code>) は daw_01 責務。 widget 内に scale snap helper は置かない (= widget は描画 + Fold 写像のみ)。</p>

@@ -66,6 +66,10 @@ pub fn daw_shortcut_map() -> ShortcutMap {
     m.bind("daw.split_clip_at_cursor", "E");
     m.bind("daw.split_clip_at_cursor_no_snap", "Alt+E");
     m.bind("daw.glue_selected_clips", "J");
+    // Phase 7 B5 (`docs/plan_scale.html` §5.3): 選択 clip の note pitch を
+    // 最寄りの in-scale pitch に一括補正。 Bitwig の "Quantize Pitches" 相当。
+    // selected_notes が空のときは clip 全 note、 そうでなければ選択 note のみ。
+    m.bind("daw.quantize_pitches_to_scale", "Shift+P");
     // Phase 2 PR-D 段階 1: Audio Editor で開いている clip 内 event を
     // Duplicate (spec §3.10.2 の `Ctrl+D`)。 root.rs::dispatch_shortcuts
     // で `audio_editor_clip is Some` のときだけ消費するよう gate。

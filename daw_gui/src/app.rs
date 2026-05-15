@@ -712,10 +712,16 @@ pub struct AppData {
 
     /// Phase 7 B5 (`docs/plan_scale.html` §5.1): Snap on Draw toggle。 ON のとき
     /// piano_roll で note 追加時の pitch を `Song.scale_at(beat).snap(pitch)` で
-    /// in-scale に寄せる。 piano_roll header の toggle で切替 (S3 wire 後)、
-    /// session-only state (project save しない)。 Highlight mode が前提
-    /// (Fold mode は widget 側で既に in-scale pitch を push する)。
+    /// in-scale に寄せる。 piano_roll header の toggle で切替、 session-only
+    /// state (project save しない)。 Highlight mode が前提 (Fold mode は
+    /// widget 側で既に in-scale pitch を push する)。
     pub snap_on_draw: bool,
+    /// Phase 7 B5 (`docs/plan_scale.html` §4.4): piano_roll が Fold mode か。
+    /// `true` で out-of-scale 行を非表示 (Ableton K キー Fold to Scale 相当)、
+    /// `false` で Highlight mode (root 行強調 + in-scale 通常 + out 行 dim)。
+    /// piano_roll snap toolbar の「Fold」 toggle で切替、 session-only state。
+    /// `Song.scale_changes` が空のときは `view.scale = None` で機能 OFF。
+    pub piano_roll_fold: bool,
     /// Phase 7 B5 (`docs/plan_scale.html` §5.2): Snap Live Input toggle。 ON
     /// のとき MIDI 録音中の note_on pitch を `Song.scale_at(playhead).snap(pitch)`
     /// で in-scale に寄せる。 transport bar の toggle で切替、 session-only
@@ -901,6 +907,7 @@ impl AppData {
             step_size_beats: DEFAULT_NOTE_DURATION,
             snap_on_draw: false,
             snap_live_input: false,
+            piano_roll_fold: false,
             event_proxy,
         };
         // recent_files / recent_saved の path 列から filename label cache を
@@ -2683,6 +2690,9 @@ pub enum AppEvent {
     /// Snap Live Input toggle (session-only)。 transport bar の toggle で
     /// 切替。 Undo 非対象。
     ToggleSnapLiveInput,
+    /// piano_roll の Fold to Scale toggle (session-only)。 piano_roll snap
+    /// toolbar の「Fold」 button で切替。 Undo 非対象。
+    ToggleFoldToScale,
 }
 
 /// Phase 7 B5: `QuantizePitchesToScale` の対象スコープ。
@@ -3613,6 +3623,9 @@ impl AppData {
             }
             AppEvent::ToggleSnapLiveInput => {
                 self.snap_live_input = !self.snap_live_input;
+            }
+            AppEvent::ToggleFoldToScale => {
+                self.piano_roll_fold = !self.piano_roll_fold;
             }
         }
     }
@@ -8809,13 +8822,40 @@ impl AppData {
         let Some(r) = self.selected_clip else {
             return;
         };
+        // Phase 7 B5 (`docs/plan_scale.html` §5.1): Snap on Draw を note 移動
+        // (y-drag で pitch 変更) にも適用。 borrow checker のため snap 計算は
+        // immutable phase で済ませる。 Fold mode のときは widget が既に
+        // in-scale pitch を push しているので idempotent (snap が no-op)。
+        let snapped: Vec<(u32, f64, u8)> = if self.snap_on_draw {
+            let clip_start_beat = self
+                .song
+                .tracks
+                .get(r.track as usize)
+                .and_then(|t| t.clips.get(r.clip as usize))
+                .map(|c| c.start_beat)
+                .unwrap_or(0.0);
+            entries
+                .iter()
+                .map(|&(idx, beat, pitch)| {
+                    let global_beat = clip_start_beat + beat.max(0.0);
+                    let new_pitch = self
+                        .song
+                        .scale_at(global_beat)
+                        .map(|sc| sc.snap(pitch))
+                        .unwrap_or(pitch);
+                    (idx, beat, new_pitch)
+                })
+                .collect()
+        } else {
+            entries.to_vec()
+        };
         let Some(notes) = self
             .song
             .notes_in_clip_mut(r.track as usize, r.clip as usize)
         else {
             return;
         };
-        for &(idx, beat, pitch) in entries {
+        for &(idx, beat, pitch) in &snapped {
             let Some(note) = notes.get_mut(idx as usize) else {
                 continue;
             };

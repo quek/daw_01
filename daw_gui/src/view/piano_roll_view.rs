@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use daw_ui_core::{
-    Edit, MoveDelta, Note, PianoRollEditRequest, PianoRollStyle, PianoRollView, ResizeDelta,
-    ToggleButtonStyle, Ui, note_hit,
+    Edit, MoveDelta, Note, PianoRollEditRequest, PianoRollScale, PianoRollScaleMode,
+    PianoRollStyle, PianoRollView, ResizeDelta, ToggleButtonStyle, Ui, note_hit,
 };
 use daw_ui_renderer::{Color, Rect};
 
@@ -90,6 +90,28 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     } else {
         None
     };
+    // Phase 7 B5 (`docs/plan_scale.html` §4.4, gui_01 #042): 編集中 clip の
+    // `start_beat` 位置の scale を採用する (= 単一 view 内で動的に scale
+    // が変わらないため、 piano_roll が安定して編集できる)。 scale_changes が
+    // 空 / 該当 event 無し / selected_clip None なら view.scale = None で旧
+    // 挙動互換 (= 機能 OFF、 既存 .daw file の regression なし)。
+    let scale_beat = app
+        .song
+        .tracks
+        .get(target.track as usize)
+        .and_then(|t| t.clips.get(target.clip as usize))
+        .map(|c| c.start_beat)
+        .unwrap_or(0.0);
+    let scale = app.song.scale_at(scale_beat).map(|sc| PianoRollScale {
+        root: sc.root,
+        in_scale_mask: sc.scale.pitch_class_mask(),
+        mode: if app.piano_roll_fold {
+            PianoRollScaleMode::Fold
+        } else {
+            PianoRollScaleMode::Highlight
+        },
+    });
+
     let view = PianoRollView {
         start_beat: app.pianoroll_scroll_beat as f64,
         len_beats: (grid_rect.w / zoom_x) as f64,
@@ -104,9 +126,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         time_sig: app.song.time_sig,
         snap: snap::piano_roll_snap_config(app),
         loop_range,
-        // Phase 7 B5 (gui_01 #042 Phase 70 WIP): scale highlight/fold wire は
-        // 別 PR (S3) で実装。 ここでは旧挙動互換に保つために None 固定。
-        scale: None,
+        scale,
+        // Phase 7 B5 follow-up (gui_01 #042 Phase 70b): Highlight mode + Snap
+        // on Draw で widget の drag preview pitch も最寄り in-scale に snap。
+        // Fold mode / scale = None / Snap on Draw OFF では無関係。
+        snap_pitch_during_drag: app.snap_on_draw,
     };
     let style = PianoRollStyle::default();
     let resize_handle_px = style.resize_handle_px;
@@ -303,7 +327,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 }
 
 /// 上部 24 px の Snap toolbar を描画。
-/// 配置: [Snap toggle 60px] [snap unit dropdown 90px] [Fit button 50px]
+/// 配置: [Snap toggle][snap unit dropdown][Fit] [Fold][Snap on Draw]。
+/// Fold / Snap on Draw は Phase 7 B5 (Scale &amp; Root)。
 fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
     ui.panel("pr_toolbar_bg", rect, COLOR_BG, 0.0);
 
@@ -314,25 +339,15 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
     let toggle_w = 60.0;
     let dropdown_w = 90.0;
     let fit_w = 50.0;
+    let fold_w = 50.0;
+    let snap_draw_w = 100.0;
 
-    let toggle_rect = Rect { x: rect.x + pad, y, w: toggle_w, h };
-    let dropdown_rect = Rect {
-        x: toggle_rect.x + toggle_rect.w + pad,
-        y,
-        w: dropdown_w,
-        h,
-    };
-    let fit_rect = Rect {
-        x: dropdown_rect.x + dropdown_rect.w + pad,
-        y,
-        w: fit_w,
-        h,
-    };
+    let mut x = rect.x + pad;
 
     ui.toggle_button_at(
         "pr_snap_toggle",
         "Snap",
-        toggle_rect,
+        Rect { x, y, w: toggle_w, h },
         app.pianoroll_snap_enabled,
         &SNAP_TOGGLE_STYLE,
         |new| {
@@ -341,10 +356,11 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
             })
         },
     );
+    x += toggle_w + pad;
 
     if let Some(idx) = ui.dropdown(
         "pr_snap_unit",
-        dropdown_rect,
+        Rect { x, y, w: dropdown_w, h },
         SNAP_LABELS,
         app.pianoroll_snap_choice as usize,
     ) {
@@ -353,12 +369,49 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
             app.handle_event(AppEvent::SetPianoRollSnapChoice(new));
         }));
     }
+    x += dropdown_w + pad;
 
-    ui.button_at("pr_fit", "Fit", fit_rect, || {
+    ui.button_at("pr_fit", "Fit", Rect { x, y, w: fit_w, h }, || {
         Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::FitPianoRollToClip);
         })
     });
+    x += fit_w + pad * 2.0;
+
+    // Phase 7 B5 (`docs/plan_scale.html` §4.4): Fold to Scale toggle。
+    // ON で out-of-scale 行を非表示 (Ableton K キー Fold to Scale 相当)。
+    // Song.scale_changes が空のときも toggle 自体は active 化できるが、
+    // PianoRollView.scale = None なので visual には影響しない。
+    ui.toggle_button_at(
+        "pr_fold_to_scale",
+        "Fold",
+        Rect { x, y, w: fold_w, h },
+        app.piano_roll_fold,
+        &SNAP_TOGGLE_STYLE,
+        |_| {
+            Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::ToggleFoldToScale);
+            })
+        },
+    );
+    x += fold_w + pad;
+
+    // Phase 7 B5 (`docs/plan_scale.html` §5.1): Snap on Draw toggle。
+    // ON で note 追加時の pitch を Song.scale_at(beat).snap(pitch) で
+    // in-scale に寄せる (Highlight mode 前提、 Fold mode は widget 側で
+    // 既に in-scale)。
+    ui.toggle_button_at(
+        "pr_snap_on_draw",
+        "Snap Draw",
+        Rect { x, y, w: snap_draw_w, h },
+        app.snap_on_draw,
+        &SNAP_TOGGLE_STYLE,
+        |_| {
+            Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::ToggleSnapOnDraw);
+            })
+        },
+    );
 }
 
 /// `daw_ui_core::Note` 形式に変換 (毎フレーム alloc、widget 内 cached で性能 OK)。
