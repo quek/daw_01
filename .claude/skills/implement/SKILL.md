@@ -156,9 +156,9 @@ cargo run --bin waveform_validation    # 128 widgets グリッド
 
 `cargo clippy` / `cargo check` / `cargo test` だけでは exe は更新されない (or test 用)。
 
-#### docs/plan.md の更新
+#### docs/plan.html の更新
 
-マイルストーン進捗を変える実装は `docs/plan.md` の Phase 表 / 残作業マーク / 履歴を **同じ commit に含めて更新** する
+マイルストーン進捗を変える実装は `docs/plan.html` の Phase 表 / 残作業マーク / 履歴を **同じ commit に含めて更新** する
 ([memory: feedback_docs_with_code](~/.claude/projects/F--dev-gui-01/memory/feedback_docs_with_code.md))。
 
 ### 7. リファクタリング (必要に応じて)
@@ -183,7 +183,7 @@ git commit -m "feat(M3): Phase X — ○○を実装"
 
 - コミットメッセージは日本語
 - テストと実装は 1 コミットにまとめる
-- `docs/plan.md` 更新を同 commit に含める (進捗を変えた場合)
+- `docs/plan.html` 更新を同 commit に含める (進捗を変えた場合)
 - コンパイル警告を残さない
 
 ## テストが間違っていると気づいた場合

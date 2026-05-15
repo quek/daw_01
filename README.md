@@ -24,5 +24,5 @@ cargo run --release -p daw-ui-example-waveform-validation  # M2 128 widgets 波�
 cargo bench -p daw-ui-core                           # waveform LOD ベンチ
 ```
 
-設計の詳細は [docs/plan.md](docs/plan.md) を参照 (正本)。
+設計の詳細は [docs/plan.html](docs/plan.html) を参照 (正本)。
 不変条件と毎セッション参照すべき制約は [CLAUDE.md](CLAUDE.md)。

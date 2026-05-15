@@ -10,7 +10,7 @@
 //! - modal: M7 では popup の anchor 外クリックを popup_layer 自身が消費する形 (他 widget は
 //!   `pointer.primary_just_*` がそのまま見えるので、利用者が popup_layer を user closure の
 //!   早い段階に置くこと。この前提は `feedback_pursue_best_practice` の妥協ポイントとして
-//!   `docs/history.md` に記録)
+//!   `docs/history.html` に記録)
 
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::Rect;

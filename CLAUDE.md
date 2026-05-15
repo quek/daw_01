@@ -20,7 +20,7 @@ session 開始時、 system context に `=== Required Action: 前 session の re
 
 Rust 製・モデルを Clone しない DAW 向け GUI ライブラリ。GUI のみを扱い、audio / IPC には一切関知しない。
 
-設計の詳細は [docs/plan.md](docs/plan.md) を参照 (正本)。
+設計の詳細は [docs/plan.html](docs/plan.html) を参照 (正本)。
 
 ## クレート構成
 
@@ -168,7 +168,7 @@ example を実機検証する前に必ず `cargo run --bin <name>` または `ca
 
 ## 参考リソース
 
-- 設計の正本: [docs/plan.md](docs/plan.md)
+- 設計の正本: [docs/plan.html](docs/plan.html)
 - フィードバック / 過去知見: `~/.claude/projects/F--dev-gui-01/memory/`
 - skill 一式: [.claude/skills/](.claude/skills) (`implement` / `debug-ui` / `research-similar-impl` / `review`)
 

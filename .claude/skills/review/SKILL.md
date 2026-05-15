@@ -39,7 +39,7 @@ CLAUDE.md「設計上の不変条件」を破っていないか厳密にチェ�
 | library に audio / IPC | `crates/platform/` / `crates/renderer/` / `crates/ui/` 内で `cpal` / `bincode` / `tokio::net` 等を import | `Edit<M>` を返すところで責務を切る、audio は別 crate (本ライブラリ外) |
 | `crates/ui/tests/no_clone_required.rs` の trybuild 回帰 | 新 API 追加時に trybuild の pass test を更新していない | 新 widget / API を `tests/ui/pass/basic.rs` に呼び出し追加、no-Clone Model でコンパイル確認 |
 
-設計不変条件は CLAUDE.md / `docs/plan.md` の「設計上の不変条件」が正本。**緩めない**。
+設計不変条件は CLAUDE.md / `docs/plan.html` の「設計上の不変条件」が正本。**緩めない**。
 
 ### 3. パフォーマンスレビュー
 
@@ -75,7 +75,7 @@ UI スレッドの描画ループ / 1 秒に 60 回以上呼ばれる経路を�
 
 | チェック項目 | 問題パターン | 修正方針 |
 |---|---|---|
-| `docs/plan.md` の進捗表更新漏れ | コードを変えたが Phase 表 / 履歴が更新されていない | 同 commit で更新 ([memory: feedback_docs_with_code](~/.claude/projects/F--dev-gui-01/memory/feedback_docs_with_code.md)) |
+| `docs/plan.html` の進捗表更新漏れ | コードを変えたが Phase 表 / 履歴が更新されていない | 同 commit で更新 ([memory: feedback_docs_with_code](~/.claude/projects/F--dev-gui-01/memory/feedback_docs_with_code.md)) |
 | 設計判断の記録漏れ | 非自明な選択 (例: `Dimension::percent(1.0)` を選んだ理由) を doc コメントや plan.md に書いていない | コードに doc コメント追加、または plan.md の設計判断セクションに追記 |
 | 新しく入れた抽象が使われていない | API / 型 / モジュールを新設したのに次のタスクで使っていない | 同タスク内で実用例を 1 つ用意、またはなぜ後回しかを明示 ([memory: feedback_use_new_abstractions](~/.claude/projects/F--dev-gui-01/memory/feedback_use_new_abstractions.md)) |
 | skill / CLAUDE.md の整合 | 新しい知見 / 罠を memory にだけ書いて CLAUDE.md「既知の罠」に統合していない | 横断的に発火しそうなものは CLAUDE.md にも一行追加 |

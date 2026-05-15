@@ -2,7 +2,7 @@
 //! `SampleSlices` の **3 variant すべて** (Mono / Planar / Interleaved) でコンパイルする
 //! ことを確認する。
 //!
-//! 「波形ウィジェット固有の不変条件」 (`docs/plan.md` 末尾):
+//! 「波形ウィジェット固有の不変条件」 (`docs/plan.html` 末尾):
 //! - `WaveformSource` は借用のみ
 //! - `samples: &[f32]` の Clone は禁止
 //! - 再構築判定は `generation: u64` のみ

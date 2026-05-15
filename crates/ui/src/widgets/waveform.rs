@@ -1,6 +1,6 @@
 //! 波形表示ウィジェット (`Ui::waveform`)。
 //!
-//! 設計の要点 (詳細は `docs/plan.md`「波形表示 UI 詳細設計」):
+//! 設計の要点 (詳細は `docs/plan.html`「波形表示 UI 詳細設計」):
 //! - 入力は **生サンプルの借用** (`SampleSlices<'s>`) と `valid_len` + `generation`。
 //!   `generation` が一致すれば内部 LOD ピラミッドを再利用する。
 //! - LOD ピラミッド (`WaveformPyramid`) は `WidgetState` の blanket impl 経由で

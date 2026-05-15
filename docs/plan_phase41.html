@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Plan: M9 Phase 41 — piano_roll note edit + multi-select 統合 (7 commits)</title>
+<style>
+:root { color-scheme: light dark; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Kaku Gothic ProN",
+    "Yu Gothic", Meiryo, sans-serif;
+  line-height: 1.6;
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 32px 24px 80px;
+  color: #1f2328;
+  background: #fff;
+}
+@media (prefers-color-scheme: dark) {
+  body { color: #e6edf3; background: #0d1117; }
+  a { color: #58a6ff; }
+  code, pre { background: #161b22; }
+  hr { border-color: #30363d; }
+  blockquote { color: #8b949e; border-left-color: #30363d; }
+  th, td { border-color: #30363d; }
+  tr:nth-child(2n) { background: #161b22; }
+}
+h1, h2, h3, h4 { line-height: 1.25; margin: 1.6em 0 0.6em; }
+h1 { font-size: 2em; border-bottom: 1px solid #d1d9e0; padding-bottom: 0.3em; }
+h2 { font-size: 1.5em; border-bottom: 1px solid #d1d9e0; padding-bottom: 0.3em; }
+h3 { font-size: 1.25em; }
+h4 { font-size: 1em; }
+a { color: #0969da; text-decoration: none; }
+a:hover { text-decoration: underline; }
+code {
+  font-family: "HackGen Console NF", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  background: #eff1f3;
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+pre {
+  background: #eff1f3;
+  padding: 12px 16px;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-size: 0.88em;
+}
+pre code { background: transparent; padding: 0; font-size: inherit; }
+blockquote {
+  margin: 0 0 1em;
+  padding: 0 1em;
+  color: #59636e;
+  border-left: 4px solid #d1d9e0;
+}
+ul, ol { padding-left: 2em; }
+li { margin: 0.15em 0; }
+hr { border: 0; border-top: 1px solid #d1d9e0; margin: 2em 0; }
+table { border-collapse: collapse; margin: 1em 0; width: 100%; }
+th, td { border: 1px solid #d1d9e0; padding: 6px 12px; text-align: left; }
+th { background: #eff1f3; font-weight: 600; }
+tr:nth-child(2n) { background: #f6f8fa; }
+.note {
+  margin-top: 3em;
+  padding: 12px 16px;
+  border-radius: 6px;
+  background: #eff1f3;
+  font-size: 0.85em;
+  color: #59636e;
+}
+@media (prefers-color-scheme: dark) {
+  .note { background: #161b22; color: #8b949e; }
+}
+</style>
+</head>
+<body>
+<h1 id="plan-m9-phase-41-piano_roll-note-edit-multi-select-7-commits">Plan: M9 Phase 41 — piano_roll note edit + multi-select 統合 (7 commits)</h1>
+<h2 id="context">Context</h2>
+<p><a href="plan.html">docs/plan.md</a> M9 (Real DAW Validation) の主軸 Phase。<code>Edit::with_inverse</code> の ergonomic を実コードで実証し、boilerplate が出れば library helper / widget 化で吸収する。</p>
+<p>並行プラン <a href="plan_daw01_feedback.html">docs/plan_daw01_feedback.md</a> (P0-P3 11 項目) のうち P1-3 (HeavyCtx delegate) を Phase 41pre として先行実施する (rect multi-select が heavy 内で必要)。P1-4 (double-click) は Phase 41 外、P1-5 (menu 拡張) は Phase 41 完了後に挟む。</p>
+<h3 id="_1">全体方針</h3>
+<ul>
+<li><strong>breaking change を恐れない</strong>: 1 workspace + Edition 2024 の利点を活かし、library API 変更は全 example / test / docs を 1 commit で一括更新する (CLAUDE.md「理想とベストプラクティスを追求」)</li>
+<li><strong>note 操作は最初から複数対応</strong>: DAW では multi-select が常態。helper は最初から <code>Arc&lt;[Note]&gt;</code> ベースで <code>make_*_notes_edit</code> (複数形) で実装。single note は <code>Arc::from([note])</code> で呼ぶ</li>
+<li><strong><code>begin_group / end_group</code> は Phase 41 では実装しない</strong>: 複数対応 helper なら multi-delete = 1 個の Edit で完結し、group が不要。group が必要になるのは「異なる種類の Edit を 1 step に」(例: add → select → move)。Phase 42 以降で実需が出たら別途実装</li>
+<li><strong>library widget 化は Phase 41e で完了させる</strong>: validation 中の API ロックを恐れず、Phase 42-43 で発見した改善は widget API を breaking 変更で逐次反映する。daw_01 が Phase 42 開始時点で widget を直接使える状態にしておくとフィードバックサイクルが速い</li>
+</ul>
+<h3 id="dod-commit">共通 DoD (各 commit で同じ)</h3>
+<ul>
+<li><code>cargo build --workspace</code> ✅</li>
+<li><code>cargo test --workspace</code> ✅ (新規 tests + 既存 tests pass)</li>
+<li><code>cargo clippy --workspace --tests -- -D warnings</code> ✅</li>
+<li>影響する example で <code>cargo run --bin &lt;name&gt;</code> 動作確認 (UI 系は目視)</li>
+<li><code>cd ../daw_01 &amp;&amp; cargo build</code> で path 依存先の build が壊れていないこと (breaking change を入れた場合は daw_01 側も同 commit で更新する)</li>
+<li>1 commit、message prefix: <code>feat(M9 Phase 41&lt;x&gt;): &lt;短い概要&gt;</code> または P1-3 のみ <code>feat(M9): P1-3 — &lt;概要&gt;</code></li>
+</ul>
+<hr>
+<h2 id="_2">設計判断の結論</h2>
+<h3 id="1-history-group-api-phase-41">1. history group の API 形 → <strong>Phase 41 では実装しない</strong></h3>
+<p>複数対応 helper で multi-delete / multi-move が 1 Edit に集約されるため、<code>begin_group / end_group</code> の need が Phase 41 では発生しない。Phase 42 以降で「異なる種類の Edit を 1 step」の実需が出たら別途実装。</p>
+<h3 id="2-uiset_cursor-a-uiset_cursorcursoricon-1-semantics">2. <code>Ui::set_cursor</code> の最小公開範囲 → <strong>A: <code>Ui::set_cursor(CursorIcon)</code> 1 関数 + 「最後勝ち」semantics</strong></h3>
+<p><code>UiHost</code> の <code>redraw_request: Box&lt;dyn Fn()&gt;</code> と同じパターンで <code>set_cursor_request: Box&lt;dyn Fn(CursorIcon)&gt;</code> を追加。<code>with_window</code> で内部生成。<code>Ui</code> に transient な <code>pending_cursor: Option&lt;CursorIcon&gt;</code> を持ち、frame 末尾で flush。</p>
+<p>cursor stack 風 (push/pop) は不要 (DAW UX で同 frame 複数 widget の cursor 競合は実用上発生しない)。</p>
+<h3 id="3-multi-delete-move-resize-inverse-capture-arct-snapshot-capture-phase-41a-c-5-phase-41d-editsnapshot_inverse-library">3. multi-delete / move / resize の inverse capture 戦略 → <strong><code>Arc&lt;[T]&gt;</code> snapshot を直接 capture (Phase 41a-c で 5 ペア)、Phase 41d で <code>Edit::snapshot_inverse</code> library 化</strong></h3>
+<ul>
+<li><code>Arc&lt;[Note]&gt;: Send + Sync + Clone</code> で <code>Fn</code> の中で <code>arc.clone()</code> して値復元する pattern が最も素直</li>
+<li>Phase 41a-c で 5 ペアの Arc capture を書いてから Phase 41d で <code>Edit::snapshot_inverse(label, fwd, restore_from)</code> helper に統合 (CLAUDE.md「3 回繰り返されたら抽象化」の閾値超え)</li>
+</ul>
+<h3 id="4-piano_roll-library-widget-phase-41e-widget-breaking">4. piano_roll の library widget 化 → <strong>Phase 41e で widget 化 (breaking 容認方針)</strong></h3>
+<p>example で 41a-d まで書き心地確認した直後に library widget 化。<code>crates/ui/src/widgets/piano_roll.rs</code> 新設、<code>PianoRoll</code>, <code>PianoRollResponse</code>, <code>Note</code> (library 型) を pub。Phase 42-43 で発見した改善は breaking 変更で widget API に随時反映 (CLAUDE.md「破壊的変更を恐れない」)。</p>
+<h3 id="5-p1-3-heavyctx-delegate-41pre-14-method-delegate">5. P1-3 (HeavyCtx delegate) のタイミング → <strong>41pre で包括 14 method delegate</strong></h3>
+<p>rect-select は heavy 内必須。最小限ではなく包括版採用 (heavy 抽象の漏れを 1 commit で塞ぐ)。各 method は 1 行 forward なので LOC コストは低い。</p>
+<h3 id="6-p1-4-double-click-phase-41">6. P1-4 (double-click) のタイミング → <strong>Phase 41 外</strong></h3>
+<p>note の double-click UX (velocity edit popup 等) は basic 編集完成後の拡張。Phase 41 のスコープ (basic 編集 + multi-select) には不要。Phase 41 完了直後または Phase 42 と並行で実装。</p>
+<h3 id="7-note-identity-id-u32">7. note の identity 戦略 → <strong><code>id: u32</code> 不変</strong></h3>
+<p>natural key <code>(start_beat, pitch)</code> は move で identity が変わる、index は delete で ずれる。<code>id: u32</code> (生成時 unique、編集中も保持) のみが multi-select の identity を安定させる。daw_01 の <code>NoteBox::note: u32</code> も同じ判断。</p>
+<p><code>PianoRollModel</code> に <code>next_note_id: u32</code> を持ち、<code>add_notes</code> で fetch_add 風に increment。selected は Model 側 <code>Vec&lt;u32&gt; selected_note_ids</code> (Note 自身は selected を持たない、single source of truth)。</p>
+<h3 id="8-note-schema-id-u32-start_beat-f32-len_beats-f32-pitch-u8-velocity-u8-id-copy">8. <code>Note</code> の最小 schema → <strong><code>{ id: u32, start_beat: f32, len_beats: f32, pitch: u8, velocity: u8 }</code> (id 追加のみ、Copy)</strong></h3>
+<p>memory: 14 bytes + padding = 16 bytes/note。100k notes = 1.6MB (現状と微増 only)。</p>
+<p>pan / lyric / channel / midi raw は Phase 41 では追加しない (boilerplate 計測の S/N を上げるため)。</p>
+<hr>
+<h2 id="commit-7-commits">Commit 分解 (7 commits、依存順)</h2>
+<h3 id="41pre-featm9-p1-3-heavyctx-inputpopup-pull-api-delegate-done-63b361f">41pre — <code>feat(M9): P1-3 — HeavyCtx に input/popup pull API を包括 delegate</code> ✅ done (63b361f)</h3>
+<p><strong>着手契機</strong>: 41a の context_menu / shortcut も heavy 内で書きたいため最先行。</p>
+<p><strong>Files</strong>:
+- 修正: <a href="../crates/ui/src/widgets/heavy.rs">crates/ui/src/widgets/heavy.rs</a> (+~150 LOC、各 1 行 forward × 14 method)</p>
+<p><strong>新規 delegate</strong>:</p>
+<pre><code class="language-rust">impl&lt;'b, 'a, M: ?Sized + 'static&gt; HeavyCtx&lt;'b, 'a, M&gt; {
+    pub fn take_drag_rect_in_rect(&amp;mut self, wid: WidgetId, bounds: Rect) -&gt; Option&lt;DragRect&gt;;
+    pub fn take_file_drop_in_rect(&amp;mut self, rect: Rect) -&gt; Option&lt;DroppedFiles&gt;;
+    pub fn is_file_hovering_in_rect(&amp;self, rect: Rect) -&gt; bool;
+    pub fn take_clipboard_paste(&amp;mut self) -&gt; Option&lt;String&gt;;
+    pub fn set_clipboard_text(&amp;mut self, s: String);
+    pub fn take_shortcut(&amp;mut self, name: &amp;'static str) -&gt; bool;
+    pub fn shortcut_for(&amp;self, name: &amp;'static str) -&gt; Option&lt;String&gt;;
+    pub fn take_scroll_in_rect(&amp;mut self, rect: Rect) -&gt; (f32, f32);
+    pub fn context_menu_for&lt;F&gt;(&amp;mut self, rect: Rect, items: &amp;[&amp;str], on_select: F)
+        where F: FnOnce(usize) -&gt; Edit&lt;M&gt;;
+    pub fn request_redraw(&amp;mut self);
+    pub fn request_undo(&amp;mut self);
+    pub fn request_redo(&amp;mut self);
+    pub fn can_undo(&amp;self) -&gt; bool;
+    pub fn can_redo(&amp;self) -&gt; bool;
+}
+</code></pre>
+<p><strong>Tests</strong>:
+- <code>heavy_take_drag_rect_in_rect_inside_cached</code>
+- <code>heavy_take_shortcut_consume_outside_cached</code>
+- <code>heavy_context_menu_for_opens_popup</code></p>
+<p><strong>LOC</strong>: +~150 source、+~80 tests</p>
+<p><strong>依存</strong>: なし</p>
+<hr>
+<h3 id="41a-featm9-phase-41a-piano_roll-note-id-adddelete-editwith_inverse-done-8c2c49e">41a — <code>feat(M9 Phase 41a): piano_roll に Note id 導入 + 複数対応 add/delete を Edit::with_inverse 化</code> ✅ done (8c2c49e)</h3>
+<p><strong>Files</strong>:
+- 修正: <a href="../crates/examples/piano_roll/src/main.rs">crates/examples/piano_roll/src/main.rs</a>
+  - <code>Note</code> に <code>id: u32</code> 追加
+  - <code>PianoRollModel</code> に <code>next_note_id: u32</code>, <code>selected_note_ids: Vec&lt;u32&gt;</code> 追加 (<code>selected_note_index: Option&lt;usize&gt;</code> 削除 = breaking、example 内のみ)
+  - heavy() 内で <code>context_menu_for</code> 経由「Add note here / Delete selected」実装
+  - <code>take_shortcut("delete")</code> で selected を delete edit に投げる (single-select 段階)</p>
+<p><strong>新規 helper (example local)</strong>:</p>
+<pre><code class="language-rust">fn make_add_notes_edit(notes: Arc&lt;[Note]&gt;) -&gt; Edit&lt;PianoRollModel&gt; {
+    let n_fwd = Arc::clone(&amp;notes);
+    let n_inv = notes;
+    Edit::with_inverse(
+        if n_fwd.len() == 1 { &quot;add note&quot; } else { &quot;add notes&quot; },
+        move |m: &amp;mut PianoRollModel| {
+            for note in n_fwd.iter() { m.notes.push(*note); }
+            m.notes.sort_by(|a, b| a.start_beat.partial_cmp(&amp;b.start_beat).unwrap());
+            m.notes_generation += 1;
+        },
+        move |m: &amp;mut PianoRollModel| {
+            let ids: HashSet&lt;u32&gt; = n_inv.iter().map(|n| n.id).collect();
+            m.notes.retain(|x| !ids.contains(&amp;x.id));
+            m.notes_generation += 1;
+        },
+    )
+}
+
+fn make_delete_notes_edit(notes: Arc&lt;[Note]&gt;) -&gt; Edit&lt;PianoRollModel&gt; {
+    let n_fwd = Arc::clone(&amp;notes);
+    let n_inv = notes;
+    Edit::with_inverse(
+        if n_fwd.len() == 1 { &quot;delete note&quot; } else { &quot;delete notes&quot; },
+        move |m: &amp;mut PianoRollModel| {
+            let ids: HashSet&lt;u32&gt; = n_fwd.iter().map(|n| n.id).collect();
+            m.notes.retain(|x| !ids.contains(&amp;x.id));
+            m.notes_generation += 1;
+        },
+        move |m: &amp;mut PianoRollModel| {
+            for note in n_inv.iter() { m.notes.push(*note); }
+            m.notes.sort_by(|a, b| a.start_beat.partial_cmp(&amp;b.start_beat).unwrap());
+            m.notes_generation += 1;
+        },
+    )
+}
+</code></pre>
+<p><strong>Tests</strong>:
+- <code>add_notes_then_undo_round_trip</code> — 単数 / 複数両方
+- <code>delete_notes_then_undo_round_trip</code> — 単数 / 複数両方
+- <code>delete_then_add_inverse_orderings</code> — 削除 → undo で元位置に戻る (sort 効いている)
+- <code>notes_generation_advances_on_forward_and_inverse</code></p>
+<p><strong>LOC</strong>: 修正 +~80, helper +~80, test +~120 = <strong>+~280 total</strong></p>
+<p><strong>依存</strong>: 41pre</p>
+<p><strong>Arc capture</strong>: 2 ペア (add/delete 各 1 ペア)</p>
+<hr>
+<h3 id="41b-featm9-phase-41b-piano_roll-moveresize-uiset_cursor-ewresizemove-done-c81e685">41b — <code>feat(M9 Phase 41b): piano_roll に複数対応 move/resize + Ui::set_cursor (EwResize/Move)</code> ✅ done (c81e685)</h3>
+<p><strong>Files</strong>:
+- 修正: <a href="../crates/ui/src/ui.rs">crates/ui/src/ui.rs</a> (<code>Ui::set_cursor</code> + <code>pending_cursor</code>、<code>UiHost::with_window</code> 内部拡張)
+- 修正: <a href="../crates/ui/src/lib.rs">crates/ui/src/lib.rs</a> (<code>CursorIcon</code> re-export)
+- 修正: <a href="../crates/examples/piano_roll/src/main.rs">crates/examples/piano_roll/src/main.rs</a>
+  - hit-test 拡張: note rect の左右 4px = resize handle, 中央 = move 領域
+  - hover で <code>Ui::set_cursor(CursorIcon::EwResize/Move)</code>
+  - drag 開始時に anchor 保存 → 中は <code>Edit::mutate</code> で値更新 → release で <code>make_move_notes_edit</code> / <code>make_resize_notes_edit</code> を発行</p>
+<p><strong>新規 library API</strong>:</p>
+<pre><code class="language-rust">impl&lt;'a, M: ?Sized + 'static&gt; Ui&lt;'a, M&gt; {
+    /// このフレームの cursor 形状を要求。同 frame 内で複数回呼ばれた場合は最後勝ち。
+    /// `WindowBackend::set_cursor` callback が registered されていなければ no-op。
+    pub fn set_cursor(&amp;mut self, cursor: CursorIcon);
+}
+</code></pre>
+<p><strong>新規 helper (example local)</strong>:</p>
+<pre><code class="language-rust">type NoteId = u32;
+
+fn make_move_notes_edit(deltas: Arc&lt;[(NoteId, f32, u8, f32, u8)]&gt;) -&gt; Edit&lt;PianoRollModel&gt; {
+    // (id, prev_start, prev_pitch, next_start, next_pitch)
+    let d_fwd = Arc::clone(&amp;deltas);
+    let d_inv = deltas;
+    Edit::with_inverse(
+        if d_fwd.len() == 1 { &quot;move note&quot; } else { &quot;move notes&quot; },
+        move |m: &amp;mut PianoRollModel| {
+            for (id, _, _, ns, np) in d_fwd.iter().copied() {
+                if let Some(n) = m.notes.iter_mut().find(|x| x.id == id) {
+                    n.start_beat = ns; n.pitch = np;
+                }
+            }
+            m.notes.sort_by(|a, b| a.start_beat.partial_cmp(&amp;b.start_beat).unwrap());
+            m.notes_generation += 1;
+        },
+        move |m: &amp;mut PianoRollModel| {
+            for (id, ps, pp, _, _) in d_inv.iter().copied() {
+                if let Some(n) = m.notes.iter_mut().find(|x| x.id == id) {
+                    n.start_beat = ps; n.pitch = pp;
+                }
+            }
+            m.notes.sort_by(|a, b| a.start_beat.partial_cmp(&amp;b.start_beat).unwrap());
+            m.notes_generation += 1;
+        },
+    )
+}
+
+fn make_resize_notes_edit(deltas: Arc&lt;[(NoteId, f32, f32)]&gt;) -&gt; Edit&lt;PianoRollModel&gt; {
+    // (id, prev_len, next_len)
+    let d_fwd = Arc::clone(&amp;deltas);
+    let d_inv = deltas;
+    Edit::with_inverse(
+        if d_fwd.len() == 1 { &quot;resize note&quot; } else { &quot;resize notes&quot; },
+        move |m: &amp;mut PianoRollModel| {
+            for (id, _, nl) in d_fwd.iter().copied() {
+                if let Some(n) = m.notes.iter_mut().find(|x| x.id == id) {
+                    n.len_beats = nl;
+                }
+            }
+            m.notes_generation += 1;
+        },
+        move |m: &amp;mut PianoRollModel| {
+            for (id, pl, _) in d_inv.iter().copied() {
+                if let Some(n) = m.notes.iter_mut().find(|x| x.id == id) {
+                    n.len_beats = pl;
+                }
+            }
+            m.notes_generation += 1;
+        },
+    )
+}
+</code></pre>
+<p><strong>Tests</strong>:
+- (library) <code>ui_set_cursor_calls_callback_on_frame_end</code>
+- (library) <code>ui_set_cursor_no_op_when_callback_unset</code>
+- (library) <code>ui_set_cursor_last_call_wins_within_frame</code>
+- (example) <code>move_notes_then_undo_restores_positions</code>
+- (example) <code>resize_notes_then_undo_restores_lengths</code></p>
+<p><strong>LOC</strong>: library +~120, example +~150, test +~150 = <strong>+~420 total</strong></p>
+<p><strong>依存</strong>: 41a</p>
+<p><strong>Arc capture</strong>: 2 ペア追加 (move/resize 各 1 ペア) → 41pre 終了時点で計 4 ペア</p>
+<hr>
+<h3 id="41c-featm9-phase-41c-piano_roll-rect-multi-select-selection-state-undoable-done-b0ac62d">41c — <code>feat(M9 Phase 41c): piano_roll に rect multi-select + selection state Undoable 化</code> ✅ done (b0ac62d)</h3>
+<p><strong>Files</strong>:
+- 修正: <a href="../crates/examples/piano_roll/src/main.rs">crates/examples/piano_roll/src/main.rs</a>
+  - heavy 内で <code>take_drag_rect_in_rect</code> (P1-3 経由) → 中の note を id で collect → <code>make_select_notes_edit</code> 発行
+  - Shift+drag で selected 全体を平行 move (<code>make_move_notes_edit</code> に複数 delta を渡す)
+  - Delete shortcut で selected を <code>make_delete_notes_edit</code> に投げる (multi-select 対応)</p>
+<p><strong>新規 helper (example local)</strong>:</p>
+<pre><code class="language-rust">fn make_select_notes_edit(prev: Arc&lt;[NoteId]&gt;, next: Arc&lt;[NoteId]&gt;) -&gt; Edit&lt;PianoRollModel&gt; {
+    let p_fwd = Arc::clone(&amp;prev);
+    let p_inv = prev;
+    let n_fwd = Arc::clone(&amp;next);
+    let n_inv = next;
+    Edit::with_inverse(
+        &quot;select notes&quot;,
+        move |m: &amp;mut PianoRollModel| { m.selected_note_ids = n_fwd.to_vec(); },
+        move |m: &amp;mut PianoRollModel| { m.selected_note_ids = p_inv.to_vec(); },
+    )
+}
+</code></pre>
+<p>待って、上記は forward でも prev を使う必要があるので、書き直し:</p>
+<pre><code class="language-rust">fn make_select_notes_edit(prev: Arc&lt;[NoteId]&gt;, next: Arc&lt;[NoteId]&gt;) -&gt; Edit&lt;PianoRollModel&gt; {
+    Edit::with_inverse(
+        &quot;select notes&quot;,
+        {
+            let next = Arc::clone(&amp;next);
+            move |m: &amp;mut PianoRollModel| { m.selected_note_ids = next.to_vec(); }
+        },
+        {
+            let prev = Arc::clone(&amp;prev);
+            move |m: &amp;mut PianoRollModel| { m.selected_note_ids = prev.to_vec(); }
+        },
+    )
+}
+</code></pre>
+<p><strong>Tests</strong>:
+- <code>rect_select_then_delete_undo_restores_all_with_selection</code>
+- <code>rect_select_then_drag_move_undo_restores_positions</code>
+- <code>select_notes_then_undo_restores_prev_selection</code></p>
+<p><strong>LOC</strong>: example +~250, test +~120 = <strong>+~370 total</strong></p>
+<p><strong>依存</strong>: 41a + 41b + 41pre</p>
+<p><strong>Arc capture</strong>: 1 ペア追加 (select_notes) → <strong>41c 終了時点で計 5 ペア</strong></p>
+<hr>
+<h3 id="41d-featm9-phase-41d-editsnapshot_inverse-helper-library-arc-capture-pattern-done-c0fe6b6">41d — <code>feat(M9 Phase 41d): Edit::snapshot_inverse helper を library 化 (Arc capture pattern を吸収)</code> ✅ done (c0fe6b6)</h3>
+<p><strong>Files</strong>:
+- 修正: <a href="../crates/ui/src/edit.rs">crates/ui/src/edit.rs</a> (<code>Edit::snapshot_inverse</code> 追加)
+- 修正: <a href="../crates/examples/piano_roll/src/main.rs">crates/examples/piano_roll/src/main.rs</a> (<code>make_*_notes_edit</code> 5 個を <code>Edit::snapshot_inverse</code> 経由に書き換え、Arc capture boilerplate を削減)</p>
+<p><strong>新規 library API</strong>:</p>
+<pre><code class="language-rust">impl&lt;M: ?Sized + 'static&gt; Edit&lt;M&gt; {
+    /// snapshot ベースの inverse を簡潔に作る helper。
+    /// `forward` と `restore_from(snapshot)` を渡すと、`restore_from` を inverse 用 closure に
+    /// wrap し、`Arc` で snapshot を共有する形で `Edit::with_inverse` を構築する。
+    ///
+    /// 主用途: `Vec&lt;Note&gt;` / `Vec&lt;f32&gt;` 級の重いデータの inverse capture で
+    /// `Arc::clone` の boilerplate を吸収する。
+    pub fn snapshot_inverse&lt;S, F, R&gt;(label: &amp;'static str, snapshot: S, forward: F, restore_from: R) -&gt; Self
+    where
+        S: Send + Sync + 'static,
+        F: Fn(&amp;mut M) + Send + Sync + 'static,
+        R: Fn(&amp;mut M, &amp;S) + Send + Sync + 'static,
+    {
+        let snap = Arc::new(snapshot);
+        let snap_inv = Arc::clone(&amp;snap);
+        Self::with_inverse(
+            label,
+            forward,
+            move |m| restore_from(m, &amp;snap_inv),
+        )
+    }
+}
+</code></pre>
+<p><strong>helper 書き換え例</strong> (41a の <code>make_delete_notes_edit</code>):</p>
+<pre><code class="language-rust">fn make_delete_notes_edit(notes: Arc&lt;[Note]&gt;) -&gt; Edit&lt;PianoRollModel&gt; {
+    let label = if notes.len() == 1 { &quot;delete note&quot; } else { &quot;delete notes&quot; };
+    let ids: Vec&lt;u32&gt; = notes.iter().map(|n| n.id).collect();
+    let ids_for_fwd = ids.clone();
+    Edit::snapshot_inverse(
+        label,
+        notes,  // snapshot (Arc&lt;[Note]&gt;)
+        move |m: &amp;mut PianoRollModel| {
+            let id_set: HashSet&lt;u32&gt; = ids_for_fwd.iter().copied().collect();
+            m.notes.retain(|x| !id_set.contains(&amp;x.id));
+            m.notes_generation += 1;
+        },
+        |m: &amp;mut PianoRollModel, snap: &amp;Arc&lt;[Note]&gt;| {
+            for note in snap.iter() { m.notes.push(*note); }
+            m.notes.sort_by(|a, b| a.start_beat.partial_cmp(&amp;b.start_beat).unwrap());
+            m.notes_generation += 1;
+        },
+    )
+}
+</code></pre>
+<p>(注: forward の方で snapshot を使わないケースは <code>with_inverse</code> 直書きでも良い、ergonomic 上必要なら <code>snapshot_inverse_pair(snap_prev, snap_next, fwd, inv)</code> の対称版も検討)</p>
+<p><strong>Tests</strong> (library):
+- <code>edit_snapshot_inverse_round_trip</code>
+- <code>edit_snapshot_inverse_send_sync</code> (compile time check via trait bound)</p>
+<p><strong>LOC</strong>: library +~80, test +~50, example refactor net +~30 = <strong>+~160 total</strong></p>
+<p><strong>依存</strong>: 41a + 41b + 41c</p>
+<p><strong>Arc capture pattern</strong>: example 側の boilerplate が約 5 箇所 × 4 行 = 20 行削減</p>
+<hr>
+<h3 id="41e-featm9-phase-41e-piano_roll-library-widget-cratesuisrcwidgetspiano_rollrs-done-8878388">41e — <code>feat(M9 Phase 41e): piano_roll を library widget 化 (crates/ui/src/widgets/piano_roll.rs 新設)</code> ✅ done (8878388)</h3>
+<p><strong>breaking 容認</strong>: 既存 example は library widget を使う形に書き換え。daw_01 が path 依存で取り込んでいる場合、daw_01 側も同 commit で更新する。</p>
+<p><strong>Files</strong>:
+- 新規: <code>crates/ui/src/widgets/piano_roll.rs</code> (~+400 LOC)
+  - <code>Note</code> (library 型、<code>{ id: u32, start_beat: f32, len_beats: f32, pitch: u8, velocity: u8 }</code>)
+  - <code>NoteId = u32</code> type alias
+  - <code>PianoRollState</code> (selected_note_ids 等の state、widget 内部保持 or 外部 borrow か検討)
+  - <code>PianoRollResponse</code> (selection 変化、edit 発行有無)
+  - <code>PianoRollStyle</code> (色、サイズ等)
+  - public <code>Ui::piano_roll(id, rect, notes, style) -&gt; PianoRollResponse</code> または builder pattern
+- 修正: <a href="../crates/ui/src/widgets/mod.rs">crates/ui/src/widgets/mod.rs</a> (<code>pub mod piano_roll;</code>)
+- 修正: <a href="../crates/ui/src/lib.rs">crates/ui/src/lib.rs</a> (re-export <code>Note</code>, <code>NoteId</code>, <code>PianoRollResponse</code> 等)
+- 修正: <a href="../crates/examples/piano_roll/src/main.rs">crates/examples/piano_roll/src/main.rs</a> (library widget を使う形に書き換え、example 内の Note 定義 / make_*_notes_edit helper 等を library 化された型に置換 / 独自 hit-test code 削除)
+- 修正 (もしあれば): <code>F:/dev/daw_01/...</code> の piano_roll 関連 (path 依存先、breaking)</p>
+<p><strong>設計判断 (41e 内 sub-decision)</strong>:</p>
+<ul>
+<li>(a) <code>PianoRollState</code> の保持場所: 「内部 widget_state」+「外部 selected_note_ids: &amp;mut Vec<NoteId>」のハイブリッド (P0-2 の tab_view_with_state と同じパターン)</li>
+<li>(b) Edit 発行は widget 内部で <code>push_edit</code> 呼ぶ vs <code>PianoRollResponse</code> に Edit を載せて return: 後者 (ユーザが apply タイミング制御)。fader と同じ pattern</li>
+<li>(c) hit-test (resize handle 4px / move 領域) は widget 内部に閉じる、ユーザは note の表示色のみ Style で制御</li>
+</ul>
+<p><strong>Tests</strong>:
+- <code>piano_roll_widget_renders_notes_in_viewport_only</code>
+- <code>piano_roll_widget_emits_select_edit_on_rect_drag</code>
+- <code>piano_roll_widget_emits_delete_edit_on_delete_shortcut</code>
+- (LOC test 機能実装後に確定)</p>
+<p><strong>LOC</strong>: library +~400, example refactor -~600 (元 600 行から widget 利用版に縮小)、test +~200 = <strong>net +~0 (例の refactor で相殺)</strong></p>
+<p><strong>依存</strong>: 41a + 41b + 41c + 41d</p>
+<p><strong>breaking change 影響</strong>:
+- <code>crates/examples/piano_roll/</code> の Note 型は library 側の <code>daw_ui_core::Note</code> に統合 (重複削除)
+- daw_01 側で gui_01 の Note 型を直接使っている箇所があれば移行 (daw_01 は自前 NoteBox 使用なので影響軽微の見込み、要確認)</p>
+<hr>
+<h3 id="41f-docsm9-phase-41-phase-44-done-this-commit">41f — <code>docs(M9 Phase 41): 完了記録 + Phase 44 評価項目更新</code> ✅ done (this commit)</h3>
+<p><strong>Files</strong>:
+- 修正: <a href="plan.html">docs/plan.md</a> (M9 Phase 41 完了マーク、Phase 41 で得た学びを Phase 44 評価項目に反映)
+- 修正: <a href="history.html">docs/history.md</a> (M9 Phase 41 完了 1 ブロック追記、6 commits まとめ + 主な学び)</p>
+<p><strong>LOC</strong>: docs +~120</p>
+<p><strong>依存</strong>: 41a-e の merge 後</p>
+<hr>
+<h2 id="_3">全体まとめ</h2>
+<table>
+<thead>
+<tr>
+<th>commit</th>
+<th>概要</th>
+<th>主 LOC</th>
+<th>Arc capture</th>
+<th>依存</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>41pre</td>
+<td>P1-3 HeavyCtx 包括 delegate</td>
+<td>+230</td>
+<td>-</td>
+<td>なし</td>
+</tr>
+<tr>
+<td>41a</td>
+<td>Note id + 複数対応 add/delete helper</td>
+<td>+280</td>
+<td>2 ペア</td>
+<td>41pre</td>
+</tr>
+<tr>
+<td>41b</td>
+<td>複数対応 move/resize + Ui::set_cursor</td>
+<td>+420</td>
+<td>+2 ペア (計 4)</td>
+<td>41a</td>
+</tr>
+<tr>
+<td>41c</td>
+<td>rect multi-select + select_notes Undoable</td>
+<td>+370</td>
+<td>+1 ペア (計 5)</td>
+<td>41a/b/pre</td>
+</tr>
+<tr>
+<td>41d</td>
+<td>Edit::snapshot_inverse library 化</td>
+<td>+160 (refactor 含)</td>
+<td>helper で吸収</td>
+<td>41a/b/c</td>
+</tr>
+<tr>
+<td>41e</td>
+<td>piano_roll を library widget 化</td>
+<td>net +0</td>
+<td>(widget 内に閉込)</td>
+<td>41a/b/c/d</td>
+</tr>
+<tr>
+<td>41f</td>
+<td>docs 完了記録</td>
+<td>+120</td>
+<td>-</td>
+<td>41a-e</td>
+</tr>
+<tr>
+<td><strong>計</strong></td>
+<td></td>
+<td><strong>+~1580</strong></td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="api">新 API 一覧</h2>
+<h3 id="library-cratesui">library (crates/ui/) で追加</h3>
+<table>
+<thead>
+<tr>
+<th>API</th>
+<th>Signature</th>
+<th>file</th>
+<th>出る commit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Ui::set_cursor</code></td>
+<td><code>pub fn set_cursor(&amp;mut self, cursor: CursorIcon)</code></td>
+<td><code>ui.rs</code></td>
+<td>41b</td>
+</tr>
+<tr>
+<td><code>UiHost::with_window</code> 内部</td>
+<td><code>set_cursor_request</code> callback も同時セット (signature 不変)</td>
+<td><code>ui.rs</code></td>
+<td>41b</td>
+</tr>
+<tr>
+<td><code>Edit::snapshot_inverse</code></td>
+<td><code>pub fn snapshot_inverse&lt;S, F, R&gt;(label, snap, fwd, restore) -&gt; Self</code></td>
+<td><code>edit.rs</code></td>
+<td>41d</td>
+</tr>
+<tr>
+<td><code>HeavyCtx</code> 包括 delegate (14 method)</td>
+<td>(P1-3 リスト参照)</td>
+<td><code>widgets/heavy.rs</code></td>
+<td>41pre</td>
+</tr>
+<tr>
+<td><code>daw_ui_core::Note</code></td>
+<td><code>pub struct Note { id, start_beat, len_beats, pitch, velocity }</code></td>
+<td><code>widgets/piano_roll.rs</code></td>
+<td>41e</td>
+</tr>
+<tr>
+<td><code>daw_ui_core::NoteId</code></td>
+<td><code>pub type NoteId = u32;</code></td>
+<td>同上</td>
+<td>41e</td>
+</tr>
+<tr>
+<td><code>Ui::piano_roll</code></td>
+<td><code>pub fn piano_roll(&amp;mut self, id, rect, notes, &amp;mut state, style) -&gt; PianoRollResponse</code></td>
+<td>同上</td>
+<td>41e</td>
+</tr>
+<tr>
+<td><code>PianoRollResponse</code></td>
+<td>edit 列 + selection 変化情報</td>
+<td>同上</td>
+<td>41e</td>
+</tr>
+<tr>
+<td><code>PianoRollStyle</code></td>
+<td>色 / サイズ等</td>
+<td>同上</td>
+<td>41e</td>
+</tr>
+</tbody>
+</table>
+<h3 id="re-export-cratesuisrclibrs">re-export (crates/ui/src/lib.rs) で追加</h3>
+<ul>
+<li><code>CursorIcon</code> (現状 <code>daw_ui_platform::CursorIcon</code> のみ pub)</li>
+<li><code>Note</code>, <code>NoteId</code>, <code>PianoRollResponse</code>, <code>PianoRollStyle</code></li>
+</ul>
+<hr>
+<h2 id="ergonomic-phase-44">ergonomic 評価ポイント (Phase 44 で総括)</h2>
+<h3 id="41-pattern">41 で観測する pattern</h3>
+<ol>
+<li><strong>Arc&lt;[T]&gt; snapshot capture</strong> → 41a-c で 5 ペア → <strong>41d で <code>Edit::snapshot_inverse</code> 化</strong>で吸収済</li>
+<li><strong>id-based field set helper</strong> (move / resize) → 41b で 2 個の helper、library 化は不要 (skeleton が深い、generic 化のコスト &gt; local helper のコスト)</li>
+<li><strong><code>begin_group / end_group</code> の need</strong> → Phase 41 で 0 (複数対応 helper で 1 Edit に集約済)。Phase 42 (audio buffer trim → fade) で発生したら別途実装</li>
+</ol>
+<h3 id="phase-44">Phase 44 への引き継ぎ</h3>
+<ul>
+<li><code>Edit::snapshot_inverse</code> の使い心地を Phase 42 (sample_edit_ops) で再検証 (Vec<f32> = <code>Arc&lt;[f32]&gt;</code> snapshot で同 helper が再利用できるか)</li>
+<li><code>PianoRollStyle</code> / <code>PianoRollResponse</code> API の改善余地を Phase 42-43 で発見次第 breaking 変更 (容認方針)</li>
+<li><code>begin_group / end_group</code> を Phase 42 で実装する場合、本 plan の設計判断 1 を更新</li>
+</ul>
+<hr>
+<h2 id="back-out-plan">リスクと back-out plan</h2>
+<h3 id="r1-uiset_cursor-race-condition">R1: <code>Ui::set_cursor</code> の race condition</h3>
+<p><strong>症状</strong>: 同 frame 内で複数 widget が cursor 要求して順序依存 (例: rect-select 中に move handle hover で flickering)。</p>
+<p><strong>back-out</strong>: pending_cursor を <code>Option&lt;(priority: u8, cursor: CursorIcon)&gt;</code> に拡張、後方互換維持。コスト: ui.rs 数十行。</p>
+<h3 id="r2-heavyctx-delegate-api">R2: HeavyCtx 包括 delegate が API 表面を膨張させすぎ</h3>
+<p><strong>症状</strong>: rustdoc が長い、利用率の低い method がある。</p>
+<p><strong>back-out</strong>: 利用率の低い method を <code>#[doc(hidden)]</code> で隠す (削除はしない、heavy 抽象の漏れを塞ぐ目的を優先)。</p>
+<h3 id="r3-editsnapshot_inverse-generic-example">R3: <code>Edit::snapshot_inverse</code> が generic 制約で example の書き心地を悪化</h3>
+<p><strong>症状</strong>: <code>S: Send + Sync + 'static</code> の trait bound で型推論失敗、利用者が Arc を明示する必要が出る。</p>
+<p><strong>back-out</strong>: signature を simplify (<code>S: Send + Sync + Clone + 'static</code> に格上げして Arc を内部で取らない、等)、または helper を non-generic な per-type 版 (<code>Edit::snapshot_inverse_arc&lt;T: Send + Sync + ?Sized&gt;</code>) に分割。</p>
+<h3 id="r4-piano_roll-widget-api">R4: piano_roll widget 化で API が読みづらい</h3>
+<p><strong>症状</strong>: builder pattern が複雑 / Style の field 数が多い / Response の variant が多い。</p>
+<p><strong>back-out</strong>: Phase 42-43 で発見次第 breaking 変更 (容認方針)。Phase 44 で総括して widget API を 1 度大きく整理する commit を入れる。</p>
+<h3 id="r5-daw_01-path-breaking">R5: daw_01 (path 依存先) の breaking 影響</h3>
+<p><strong>症状</strong>: 41e の library widget 化で daw_01 の build が壊れる。</p>
+<p><strong>back-out</strong>: 41e の commit 内で daw_01 側も更新 (同 commit、CLAUDE.md の「全 example / test / docs を 1 commit で一括更新」方針)。daw_01 が gui_01 の Note 型を直接 import していなければ影響軽微。</p>
+<hr>
+<h2 id="_4">進捗管理</h2>
+<p>各 commit 完了時に本ファイルの該当節先頭に <code>✅ done (commit &lt;hash&gt;)</code> を追記する。</p>
+<p><a href="history.html">docs/history.md</a> には Phase 41 全体の完了概要を 41f で 1 ブロック追記。</p>
+<p><code>docs/plan.md</code> の M9 Phase 41 進捗マークも 41f で更新。</p>
+<p class="note">本ドキュメントは <code>docs/*.md</code> から HTML 化された (M14 Phase 70)。 編集は HTML 側のみ。</p>
+</body>
+</html>
