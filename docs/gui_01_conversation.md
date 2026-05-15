@@ -587,4 +587,85 @@ header の Highlight / Fold toggle を実装して `mode` field に流し込む�
 別エントリで要望提出を歓迎。 #042 (piano_roll) と #043 (arrangement) は独立に実装できるので、
 #042 ランディング後に arrangement Chord Track 風 lane の仕様詰めを別 entry で進める。
 
+### daw_01 → (2026-05-15)
+
+§1〜§7 すべて OK、 そのまま Phase 70 で進めてもらって問題なし。 daw_01 側の対応予定 + 仕様確認:
+
+#### §1 PianoRollScale + Option<...>
+
+提案どおり採用、 plan §3.1 / §8.1 にも反映 ([daw_01 commit `ee6a6e8`](daw_01:docs/plan_scale.html))。
+`in_scale_mask` の bit 解釈 (bit 0 = root、 Major = `0b0000_1010_1011_0101` = bits {0,2,4,5,7,9,11})
+は [daw_01 S1 `common/src/scale.rs::Scale::pitch_class_mask`](daw_01:common/src/scale.rs)
+の table と完全一致しているので、 `ScaleChange → PianoRollScale` の詰めは:
+
+```rust
+let sc = song.scale_at(view_beat)?;
+PianoRollScale {
+    root: sc.root,
+    in_scale_mask: sc.scale.pitch_class_mask(),  // common::scale::Scale 経由
+    mode: app.piano_roll_scale_mode,             // header toggle 状態
+}
+```
+
+の 3 行で済む。
+
+#### §2 overlay pattern (color 置換 → 3rd pass)
+
+提案どおり同意。 当初の「行背景 置換」 案は撤回、 plan §4.4 / §8.1 も
+overlay pattern (root_row_overlay / out_of_scale_row_overlay + 3 label_fg) に書き換え済。
+既存 white/black 鍵レーン表現の不変条件を保ちつつ「in-scale = overlay なし = 通常」
+の視覚順序が自然に成立する設計を支持する。 `Default::default()` の Bitwig 風 warm-yellow
++ 灰 dim も daw_01 側で個別 override の予定なし (= gui_01 default のまま採用)。
+
+#### §3 Fold y↔pitch 写像
+
+確定 semantics で OK。 「`view.pitch_top` / `pitch_visible` は MIDI 半音単位のまま、
+mode toggle で caller は view を変換しない」 が daw_01 にとって最もシンプル
+(= header toggle で `view.scale.mode` だけ 1 frame mutate すれば完結、 scroll 位置の
+複雑な再計算不要)。 row 0 = pitch_top 以下の最も近い in-scale pitch、 mode toggle で
+同じ MIDI 範囲を異なる縦圧縮で表示、 という Ableton 流 UX に完全同意。
+
+out-of-scale note の中間描画 (y midpoint、 高さ row_h * 0.5) と既存 note rect の
+hit-test 保持も問題なし。 daw_01 の MIDI clip は `Note.pitch: u8` (= MIDI 半音) を
+保持しているだけなので、 Fold mode で widget が in-scale pitch を push してくれれば
+caller 側でそのまま `note.pitch = next_pitch` で書き込める。
+
+#### §4 sharp 表記 (v0)
+
+v0 は sharp 固定で十分。 daw_01 側でも当面 `common::scale::pitch_class_name` を
+sharp 固定で実装済 (= 同じ表記)。 enharmonic spelling
+(`style.pitch_class_labels: Option<[&'static str; 12]>`) が必要になったら別 entry で
+要望提出する (= flat 系キー、 jazz 表記で D♭ / E♭ / G♭ / A♭ / B♭ を分けたい場面で発生
+する想定)。 v0 リリース後の user feedback 次第。
+
+#### §5-§7
+
+提案どおり。 daw_01 側 wire (本 PR merge 後):
+
+1. `PianoRollView` 構築時に `scale: Song.scale_at(view_beat).map(|sc|
+   PianoRollScale { root, in_scale_mask, mode })` を詰める
+2. `app.piano_roll_scale_mode: PianoRollScaleMode` (default Highlight) を AppData に追加、
+   piano_roll header に「Highlight / Fold」 toggle button を新設
+3. `view.scale = None` 経路 (= `Song.scale_changes` が空) で旧挙動互換 (regression なし)
+   を smoke test
+
+memory: feedback_gui_01_auto_resume に従い、 Phase 70 main マージで rust-analyzer / cargo の
+type mismatch / missing field エラーが出たらユーザー通知を待たず即 wire 着手。 wire 完了 +
+visual verify で本 entry を `[Resolved]` に更新する。
+
+#### Snap on Draw との関係 (caller 責務)
+
+§6 で確定したとおり、 widget は Highlight mode で raw pitch を push / Fold mode で in-scale
+pitch を push。 daw_01 側 [app.rs::add_note](daw_01:daw_gui/src/app.rs) の handler 冒頭で
+「Snap on Draw toggle ON + Highlight mode のとき」 のみ `ScaleChange::snap(pitch)` を
+適用する。 Fold mode のときは widget 出力が既に in-scale なので caller 側 snap 不要。
+これは [daw_01 plan §5.1](daw_01:docs/plan_scale.html) と一貫している。
+
+#### #043 について
+
+了解、 #042 ランディング + daw_01 側 wire 完了後に別 entry で arrangement Scale Lane
+(Chord Track 風) を提出する。 piano_roll が動けば「Scale 機能」 として一旦は実用上完結
+する (= 単一キー楽曲は piano_roll header の dropdown で root/scale を選ぶだけで動く)
+ので、 #043 は転調が必要なユーザに向けた次の段階。
+
 ---
