@@ -260,14 +260,16 @@ impl ScaleChange {
 
 <h3>4.4 Piano Roll 鍵盤レーン — 行ハイライト / dim / fold</h3>
 
-<p>piano_roll widget の左端鍵盤レーンと、 ノート描画領域の背景の両方に、 scale 情報を反映する。</p>
+<p>piano_roll widget の左端鍵盤レーンと、 ノート描画領域の背景の両方に、 scale 情報を反映する。 描画方式は gui_01 #042 reply (§2) で <strong>overlay 3rd pass</strong> 方式に確定: 既存の white/black 鍵レーン表現 (bg + black_row_overlay の 2 pass) は不変に保ち、 その上に root 行 / out 行の半透明 tint を 3rd pass で重ね描く。 In-scale 行は overlay なしで「既存表現がそのまま見える = in-scale = 通常」 の自然な視覚順序が成立する。</p>
 
 <ul>
-  <li><strong>Root 行</strong>: 鍵盤の C / C# / ... ラベル背景を強調色 (Bitwig 流: 黄み or 暖色 tint)。 ノート領域も同じ y 位置に薄い tint。</li>
-  <li><strong>In-scale 行</strong>: 通常の白鍵 / 黒鍵 表示 (= 既存挙動)。 ただし黒鍵が in-scale (例: D♭ Major の D♭) なら少し明るく、 白鍵が out-of-scale (例: D♭ Major の F) なら少し暗く。</li>
-  <li><strong>Out-of-scale 行</strong>: alpha 50% 程度に dim、 もしくは灰色 overlay (Cubase "Show Scale Note Guides" 風)。</li>
-  <li><strong>Fold mode</strong> (toggle ON): out-of-scale 行を行リストから除外し、 ピアノロール全体が in-scale 行のみで構成される。 7 音 scale なら 12 行 → 7 行になり、 縦に圧縮されたコンパクト表示。 既存ノートが out-of-scale なら fold mode 中も「上下隣の in-scale 行の間」 にはみ出して表示する (Ableton と同じく、 fold mode は描画だけの変更で実データは触らない)。</li>
-  <li>Fold mode は<strong>視覚専用</strong>。 マウスでの note 追加 / drag / 既存ノートの編集は依然 in-scale 行ベースで動く (fold 中に Alt 押下で out-of-scale 行に「割り込む」 等は段階 S6 以降の拡張)。</li>
+  <li><strong>Root 行</strong>: <code>root_row_overlay</code> (Bitwig 風 warm-yellow 半透明) を 3rd pass で重ね描く。 鍵盤レーンのラベルは <code>root_label_fg</code> で「{root_name}{octave}」 を全 root pitch class オクターブに表示 (例: root=D → "D4", "D5"...)。</li>
+  <li><strong>In-scale 行 (root 以外)</strong>: overlay なし = 既存の white/black 鍵レーン表現がそのまま見える。 鍵盤ラベルは <code>in_scale_label_fg</code>。</li>
+  <li><strong>Out-of-scale 行</strong> (Highlight mode のみ): <code>out_of_scale_row_overlay</code> (半透明 dim) を 3rd pass で重ね描く。 鍵盤ラベルは <code>out_of_scale_label_fg</code>。</li>
+  <li><strong>Fold mode</strong> (out-of-scale 行を非表示): 行リストから out 行を除外し、 in-scale 音数 + octave root 分のみ表示。 7 音 scale なら 12 行 → 7 行になり、 縦に圧縮されたコンパクト表示。 既存ノートが out-of-scale なら隣接 in-scale 行の中間 (y = (y_of(p_hi) + y_of(p_lo)) / 2、 高さ row_h * 0.5) に薄く挟まれて描画 (Ableton と同等の見た目、 描画パラメータは gui_01 確定)。 Fold mode の鍵盤レーンは全 row にラベル ({pitch_class} 直書き、 octave 番号は root 行のみ付加で「C4」「C5」)。</li>
+  <li><strong>Fold mode の y↔pitch 写像</strong>: gui_01 #042 reply (§3) で確定。 <code>view.pitch_top</code> / <code>pitch_visible</code> は <strong>MIDI 半音単位のまま</strong> (= caller は mode toggle で view を変換しない)、 widget 内で「可視 MIDI 範囲 [pitch_top - pitch_visible, pitch_top] から in-scale pitch を enumerate → 行数 N → row_h = grid.h / N → row 0 = pitch_top 以下の最も近い in-scale pitch」 の semantics で y↔pitch を決定。 mode toggle で同じ MIDI 範囲を異なる縦圧縮で表示できる (Ableton と同一 UX)。</li>
+  <li>Fold mode の click / drag は cursor y → row index → in-scale pitch で widget が解決し、 <code>MoveDelta.next_pitch</code> は<strong>必ず in-scale</strong>。 caller 側で追加 snap は不要。 既存 note の hit-test (rect 内 click) はそのまま動く (out-of-scale note の中間描画 rect 内も click 可)。</li>
+  <li><strong>pitch class 表記は v0 では sharp のみ</strong> (C, C#, D, D#, ...)。 enharmonic spelling (C# Major vs Db Major) は将来 <code>style.pitch_class_labels: Option&lt;[&amp;'static str; 12]&gt;</code> で対応 (gui_01 #042 §4)。</li>
 </ul>
 
 <h2>5. 入力 constrain (3 軸)</h2>
@@ -336,30 +338,33 @@ impl ScaleChange {
 
 <h2>8. gui_01 widget 拡張要望</h2>
 
-<p>下記 3 つを gui_01 #042+ で要望提出 (関連仕様: <code>daw_01/docs/plan_scale.html</code>)。 memory: <a href="#">feedback_gui_01_scope_review</a> に従い<strong>最終形態をまとめて</strong>伝える。 §9 S4 (piano_roll widget の scale highlight + fold) を最初に出し、 S3 (arrangement scale lane) は別エントリで後段に。</p>
+<p>下記 2 つを gui_01 #042 / #043 で要望提出。 §8.1 (piano_roll Highlight / Fold) は <strong>gui_01 #042 で仕様確定済</strong> (Phase 70 着手中)、 §8.2 (arrangement Scale Lane) は #042 ランディング後に別エントリで提出。</p>
 
-<h3>8.1 piano_roll widget に Scale highlight / Fold サポート</h3>
+<h3>8.1 piano_roll widget に Scale Highlight / Fold サポート (gui_01 #042、 仕様確定)</h3>
 
-<p>新 struct <code>PianoRollScale</code> を <code>PianoRollView</code> に追加。 widget 内で行ハイライトと fold を完結させる。 daw_01 側は <code>ScaleChange</code> を 1:1 で渡すだけ。</p>
+<p>新 struct <code>PianoRollScale</code> を <code>PianoRollView</code> に追加。 widget 内で行ハイライトと Fold を完結させる。 daw_01 側は <code>ScaleChange</code> を 1:1 で渡すだけ。</p>
 
-<pre><code>// gui_01 提案 API
+<pre><code>// gui_01 #042 reply で確定した API
 
 pub struct PianoRollScale {
     /// ルート pitch class (0..=11)。
     pub root: u8,
-    /// ルート起点の 12-bit in-scale mask。 0 ビット = root、 1〜11 = +1〜+11 半音。
+    /// ルート起点の 12-bit in-scale mask。 bit 0 = root、 bit d = root + d 半音。
+    /// 例: Major = 0b0000_1010_1011_0101 (bits {0,2,4,5,7,9,11})。
     pub in_scale_mask: u16,
     /// 表示モード。
     pub mode: PianoRollScaleMode,
 }
 
 pub enum PianoRollScaleMode {
-    /// 鍵盤レーンの root 行 / in-scale 行 / out-of-scale 行を色分け。
-    /// note 描画領域も背景 tint。
+    /// 既存 white/black 鍵レーン表現の上に root 行 / out 行の半透明 overlay
+    /// を 3rd pass で重ね描く。 In-scale 行 (root 以外) は overlay なし =
+    /// 既存表現がそのまま見える。 12 半音すべて表示、 y↔pitch 写像不変。
     Highlight,
     /// out-of-scale 行を行リストから完全に除外 (Ableton K キー相当)。
-    /// 12 行 → 7 (or scale 音数) 行に圧縮される。 既存 note が out-of-scale
-    /// なら上下隣の in-scale 行の中間に描画。
+    /// 行数 N = 可視 MIDI 範囲内の in-scale 音数。 既存 note が out-of-scale
+    /// なら隣接 in-scale 行の中間 (y = midpoint、 高さ row_h * 0.5) に描画。
+    /// click / drag y → pitch は widget が in-scale pitch を解決して push。
     Fold,
 }
 
@@ -369,17 +374,40 @@ pub struct PianoRollView {
     pub scale: Option&lt;PianoRollScale&gt;,
 }</code></pre>
 
-<p>color スキーマは <code>PianoRollStyle</code> 側に追加 (<code>root_row_bg</code> / <code>in_scale_row_bg</code> / <code>out_of_scale_row_bg</code> + key label color)、 caller がカスタマイズ可能にしたい。 ただし <code>Default::default()</code> で適切な配色 (Bitwig 黄み + 灰 dim 風) が出るように。</p>
+<p><code>PianoRollStyle</code> には<strong>overlay/label 5 color</strong>を追加 (= 既存の white/black 鍵レーン表現は不変、 3rd pass で重ね描く形式)。 In-scale 行は overlay なしで「in-scale = 通常」 の視覚順序が自然に成立する。</p>
 
-<h3>8.2 piano_roll の note y-drag が caller に渡す pitch を <strong>scale snap helper 経由化</strong></h3>
+<pre><code>pub struct PianoRollStyle {
+    // ... existing (bg / keyboard_bg / white_key / black_key / black_row_overlay) ...
 
-<p>note y-drag で pitch を変えるとき、 widget 側で「最寄りの in-scale 行に snap」 する option があると、 §5.1 Snap on Draw が widget 内で完結する。 ただし caller 側で snap してもよい (= widget は raw pitch を push、 daw_01 が <code>Snap on Draw</code> toggle ON 時に <code>ScaleChange::snap</code>)。 後者のほうが widget の責務がシンプル。</p>
+    /// Highlight / Fold mode 時、 root pitch class の行に重ね描く半透明 tint。
+    /// scale.is_some() のときのみ適用。 Bitwig 風 warm-yellow default。
+    pub root_row_overlay: Color,
+    /// Highlight mode 時、 out-of-scale 行に重ね描く半透明 dim。
+    /// Fold mode では out 行は表示されないので使われない。
+    pub out_of_scale_row_overlay: Color,
+    /// 鍵盤レーンの root pitch class ラベル色 (Highlight / Fold 共通)。
+    pub root_label_fg: Color,
+    /// 鍵盤レーンの in-scale ラベル色 (root 以外、 Highlight / Fold 共通)。
+    pub in_scale_label_fg: Color,
+    /// 鍵盤レーンの out-of-scale ラベル色 (Highlight でのみ可視)。
+    pub out_of_scale_label_fg: Color,
+}</code></pre>
 
-<p>= <strong>caller 側 snap でよい</strong>と判断 (gui_01 への要望なし)。 widget は raw pitch を push、 daw_01 が必要に応じて snap。</p>
+<p>描画順は (1) bg、 (2) black_row_overlay、 (3) root_row_overlay (root 行) / out_of_scale_row_overlay (out 行)。 既存の bg 不変条件 (黒鍵 row が白鍵 row より暗い) は壊さない。 既存 <code>c_label_color</code> / <code>c_label_font_px</code> は <code>scale = None</code> のときの legacy field として保持。</p>
 
-<h3>8.3 arrangement widget に Scale Lane (Chord Track 風) 専用 lane</h3>
+<p>cache hash key に <code>scale</code> の <code>(root, mask, mode)</code> を含めるので、 scale 変更で cache invalidate される (gui_01 側で対応)。 <code>view.scale</code> を 1 frame mutate するだけで Highlight ↔ Fold ↔ None を遷移可能。</p>
 
-<p>段階 S6 で要望提出予定 (= S4 終わってから)。 arrangement の現行 lane 概念 (track header + clip lane) を「scale lane」 用に拡張。 widget 内に <code>Vec&lt;ArrangementScaleEvent { beat, label }&gt;</code> を持たせ、 click / drag / dbl-click を <code>ArrangementEditRequest</code> 経由で push。 詳細仕様は別 issue。</p>
+<h4>note y-drag の snap 責務</h4>
+
+<p>widget は raw pitch を push (Highlight mode) / in-scale pitch を push (Fold mode)。 「Snap on Draw」 toggle に応じて caller 側で追加 snap (Highlight mode で Snap on Draw ON のとき <code>ScaleChange::snap</code>) は daw_01 責務。 widget 内に scale snap helper は置かない (= widget は描画 + Fold 写像のみ)。</p>
+
+<h4>pitch class 表記</h4>
+
+<p>v0 では sharp のみ (C, C#, D, D#, E, F, F#, G, G#, A, A#, B)。 enharmonic spelling (C# Major で C# vs Db Major で Db) は将来 <code>style.pitch_class_labels: Option&lt;[&amp;'static str; 12]&gt;</code> を別 entry で追加可能 (gui_01 #042 §4 で合意)。</p>
+
+<h3>8.2 arrangement widget に Scale Lane (Chord Track 風) 専用 lane (gui_01 #043 予定)</h3>
+
+<p>#042 ランディング後に提出予定。 arrangement の現行 lane 概念 (track header + clip lane) を「scale lane」 用に拡張。 widget 内に <code>Vec&lt;ArrangementScaleEvent { beat, label }&gt;</code> を持たせ、 click / drag / dbl-click を <code>ArrangementEditRequest</code> 経由で push。 詳細仕様は #043 で詰める。</p>
 
 <h2>9. 段階実装ロードマップ (Phase 7 B5)</h2>
 
