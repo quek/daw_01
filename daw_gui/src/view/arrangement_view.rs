@@ -14,7 +14,7 @@ use daw_ui_core::{
     FadeEdge, SampleSlices, ToggleButtonStyle, Ui, WaveformRenderMode, WaveformSource,
     WaveformStyle, WaveformView,
 };
-use daw_ui_renderer::{Color, Rect};
+use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent, ClipRef, FadeEdgeKind};
 use crate::view::mixer_strips::{amp_to_fader, fader_to_amp};
@@ -403,6 +403,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let is_selected = selected_clips.contains(clip_key);
         draw_audio_clip_waveform(app, ui, *clip_key, *rect, lanes_x, is_selected);
         draw_audio_clip_value_overlay(app, ui, *clip_key, *rect);
+        draw_midi_clip_notes(app, ui, *clip_key, *rect, lanes_x, is_selected);
     }
 
     // gui_01 #028 (M14 Phase 63n-2): automation point 上の右クリック →
@@ -1870,5 +1871,135 @@ fn draw_audio_clip_value_overlay(
             font_size,
             text_color,
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MIDI clip mini piano-roll overlay
+// ---------------------------------------------------------------------------
+
+/// MIDI clip rect 内に各ノートを小さな矩形で重ね描き (Ardour / REAPER /
+/// Bitwig 等の標準的な mini piano-roll プレビュー)。 Audio waveform overlay
+/// と同じ pattern で `Ui::push_rect` を per-note 呼ぶ。
+///
+/// - 横軸: clip-local beats → px (clip 全幅を `length_beats` で割る)
+/// - 縦軸: pitch、 表示 range は clip 内 notes の min/max を 2 半音 padding
+///   した auto-fit (空クリップは無描画)。 上に行くほど高音。
+/// - 色: 共通の light-blue。 velocity は alpha (0.5..1.0) に反映。
+/// - lanes_x で左端 clamp、 clip 右端で右端 trim。 hit-test は ArrangementView
+///   側の clip rect が担当するので、 ここはピュア描画のみ。
+fn draw_midi_clip_notes(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    clip_key: ClipKey,
+    clip_rect: Rect,
+    lanes_x: f32,
+    is_selected: bool,
+) {
+    let Some(t_idx) = app.song.tracks.iter().position(|t| t.id == clip_key.track) else {
+        return;
+    };
+    let Some(c_idx) = app.song.tracks[t_idx]
+        .clips
+        .iter()
+        .position(|c| c.id == clip_key.clip)
+    else {
+        return;
+    };
+    let clip = &app.song.tracks[t_idx].clips[c_idx];
+    let Some(content) = app.song.clip_contents.get(&clip.content_id) else {
+        return;
+    };
+    let Some(notes) = content.notes() else {
+        // Audio / Automation: 対象外。
+        return;
+    };
+    if notes.is_empty() {
+        return;
+    }
+
+    // clip 名 (上端) を avoid して内側 padding を取る。 audio waveform と
+    // 同じ inset (top 14 / lr 2 / bottom 2) で視覚的に一致させる。
+    let inset_top: f32 = 14.0;
+    let inset_lr: f32 = 2.0;
+    let inset_bottom: f32 = 2.0;
+    let view_rect = Rect {
+        x: clip_rect.x + inset_lr,
+        y: clip_rect.y + inset_top,
+        w: (clip_rect.w - inset_lr * 2.0).max(0.0),
+        h: (clip_rect.h - inset_top - inset_bottom).max(0.0),
+    };
+    if view_rect.w <= 0.0 || view_rect.h <= 0.0 {
+        return;
+    }
+
+    // 左端クリップ (track header 領域へのはみ出し防止)。 上下のはみ出しは
+    // ArrangementView の track row で既にクリップされているので不要。
+    let visible_left = lanes_x.max(view_rect.x);
+    let visible_right = view_rect.x + view_rect.w;
+    if visible_right <= visible_left {
+        return;
+    }
+
+    // pitch auto-fit: clip 内 notes の min/max + 2 半音 padding。 全ノート
+    // 同 pitch のときも row_h が 0 にならないよう span は 1 でクランプ。
+    let mut min_pitch: u8 = 127;
+    let mut max_pitch: u8 = 0;
+    for n in notes {
+        if n.pitch < min_pitch {
+            min_pitch = n.pitch;
+        }
+        if n.pitch > max_pitch {
+            max_pitch = n.pitch;
+        }
+    }
+    let pad: u8 = 2;
+    let min_p = min_pitch.saturating_sub(pad);
+    let max_p = max_pitch.saturating_add(pad).min(127);
+    let pitch_span = (max_p as i32 - min_p as i32).max(1) as f32;
+    let row_h = (view_rect.h / pitch_span).max(1.0);
+
+    let base_fill = if is_selected {
+        Color::rgba(0.10, 0.15, 0.30, 1.0)
+    } else {
+        Color::rgba(0.55, 0.85, 0.95, 1.0)
+    };
+
+    let clip_len_beats = clip.length_beats.max(0.0001) as f32;
+    let px_per_beat = view_rect.w / clip_len_beats;
+
+    for n in notes {
+        let nx = view_rect.x + (n.start_beat as f32) * px_per_beat;
+        let nw = ((n.duration_beats as f32) * px_per_beat).max(1.0);
+        let drawn_x = nx.max(visible_left);
+        let drawn_x_end = (nx + nw).min(visible_right);
+        if drawn_x_end <= drawn_x {
+            continue;
+        }
+        let row_from_top = (max_p as i32 - n.pitch as i32).clamp(0, pitch_span as i32) as f32;
+        let ny = view_rect.y + row_from_top * row_h;
+        if ny + row_h <= view_rect.y || ny >= view_rect.y + view_rect.h {
+            continue;
+        }
+
+        let mut fill = base_fill;
+        // velocity 0..=127 → alpha 0.5..=1.0。 0 (rest) は可視性最小、
+        // 最大は不透明。
+        let v = (n.velocity as f32 / 127.0).clamp(0.0, 1.0);
+        fill.a = 0.5 + v * 0.5;
+
+        ui.push_rect(RectCommand {
+            rect: Rect {
+                x: drawn_x,
+                y: ny,
+                w: (drawn_x_end - drawn_x).max(1.0),
+                h: row_h.max(1.0),
+            },
+            fill,
+            border: Color::TRANSPARENT,
+            border_width: 0.0,
+            radius: [0.0; 4],
+            clip_rect: None,
+        });
     }
 }
