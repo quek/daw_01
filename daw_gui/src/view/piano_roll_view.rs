@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use daw_ui_core::{
-    Edit, MoveDelta, Note, NotesEditRequest, PianoRollStyle, PianoRollView, ResizeDelta,
+    Edit, MoveDelta, Note, PianoRollEditRequest, PianoRollStyle, PianoRollView, ResizeDelta,
     ToggleButtonStyle, Ui, note_hit,
 };
 use daw_ui_renderer::{Color, Rect};
@@ -85,6 +85,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let widget_notes = build_widget_notes(app, target);
     let zoom_x = app.pianoroll_zoom_x.max(4.0);
     let zoom_y = app.pianoroll_zoom_y.max(6.0);
+    let loop_range = if app.song.loop_end_beat > app.song.loop_start_beat {
+        Some((app.song.loop_start_beat, app.song.loop_end_beat))
+    } else {
+        None
+    };
     let view = PianoRollView {
         start_beat: app.pianoroll_scroll_beat as f64,
         len_beats: (grid_rect.w / zoom_x) as f64,
@@ -98,13 +103,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         bpm: app.song.bpm,
         time_sig: app.song.time_sig,
         snap: snap::piano_roll_snap_config(app),
+        loop_range,
     };
     let style = PianoRollStyle::default();
     let resize_handle_px = style.resize_handle_px;
 
-    let make_edit = move |req: NotesEditRequest| -> Edit<AppData> {
+    let make_edit = move |req: PianoRollEditRequest| -> Edit<AppData> {
         match req {
-            NotesEditRequest::Add(notes) => {
+            PianoRollEditRequest::Add(notes) => {
                 let Some(n) = notes.into_iter().next() else {
                     return Edit::mutate(|_| {});
                 };
@@ -118,21 +124,21 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     });
                 })
             }
-            NotesEditRequest::Delete(notes) => {
+            PianoRollEditRequest::Delete(notes) => {
                 let ids: Vec<u32> = notes.iter().map(|n| n.id).collect();
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SetNoteSelection(ids.clone()));
                     app.handle_event(AppEvent::DeleteSelectedNotes);
                 })
             }
-            NotesEditRequest::Move(deltas) => {
+            PianoRollEditRequest::Move(deltas) => {
                 let entries: Vec<(u32, f64, u8)> =
                     deltas.iter().map(|d: &MoveDelta| (d.0, d.3, d.4)).collect();
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SetNotePositions(entries.clone()));
                 })
             }
-            NotesEditRequest::Resize(deltas) => {
+            PianoRollEditRequest::Resize(deltas) => {
                 let entries: Vec<(u32, f64, f64)> = deltas
                     .iter()
                     .map(|d: &ResizeDelta| (d.0, d.3, d.4))
@@ -141,10 +147,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     app.handle_event(AppEvent::ResizeNotes(entries.clone()));
                 })
             }
-            NotesEditRequest::Select { next, .. } => Edit::mutate(move |app: &mut AppData| {
+            PianoRollEditRequest::Select { next, .. } => Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::SetNoteSelection(next.clone()));
             }),
-            NotesEditRequest::SetLyrics(updates) => {
+            PianoRollEditRequest::SetLyrics(updates) => {
                 // gui_01 #017 (M14 Phase 59): widget が L キー編集 → Enter
                 // commit 時に 1 batch で発行する歌詞分配 request。 widget は
                 // 編集対象 clip を context として知らないので、 piano_roll_view
@@ -157,7 +163,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     });
                 })
             }
-            NotesEditRequest::SetVelocity(updates) => {
+            PianoRollEditRequest::SetVelocity(updates) => {
                 // gui_01 #018 (M14 Phase 64): velocity lane 内 drag の release
                 // frame で 1 batch 発行される `Vec<(NoteId, u8)>`。 multi-select
                 // 中はすべての selected note が同じ絶対値、 単独 hit は単一
@@ -165,6 +171,29 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 let entries: Vec<(u32, u8)> = updates.into_iter().collect();
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SetNoteVelocities(entries.clone()));
+                })
+            }
+            // gui_01 #041 (M14 Phase 69): ruler 上 plain click / drag の press +
+            // continuation frame で逐次発火する seek 要求。 arrangement
+            // `SetPlayheadBeat` と完全同形 idiom: playhead_beat 更新 + audio
+            // engine への seek IPC 送信。 clip 内 clamp は意図的に行わない
+            // (= song-global で自由に動かせる、 arrangement との挙動整合)。
+            PianoRollEditRequest::SetPlayheadBeat(beat) => {
+                Edit::mutate(move |app: &mut AppData| {
+                    let beat = beat.max(0.0);
+                    app.playhead_beat = Some(beat as f32);
+                    let sr = common::audio_bridge::SAMPLE_RATE as f64;
+                    let bpm = app.song.bpm.max(1.0) as f64;
+                    let samples = (beat * 60.0 / bpm * sr).max(0.0) as u64;
+                    app.send_audio(common::protocol::MainToChild::SeekTo { samples });
+                })
+            }
+            // gui_01 #041 (M14 Phase 69): Shift + ruler drag release で 1 度
+            // だけ発火する loop range commit。 既存 AppEvent::SetLoopRange
+            // (arrangement / audio_editor と共通) にそのまま流す。
+            PianoRollEditRequest::SetLoopRange { start, end } => {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetLoopRange { start, end });
                 })
             }
         }
