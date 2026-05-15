@@ -6,7 +6,7 @@
 
 use daw_ui_core::{
     ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView,
-    AutomationClipKey, ClipKey, Edit, Note, NoteId, NotesEditRequest, PianoRollStyle,
+    AutomationClipKey, ClipKey, Edit, Note, NoteId, PianoRollEditRequest, PianoRollStyle,
     PianoRollView, PointerFrame, ReorderableListEditRequest, ReorderableListStyle,
     ScrubableNumberFormat, ScrubableNumberStyle, UiHost,
 };
@@ -151,6 +151,8 @@ fn main() {
                 time_sig: (4, 4),
                 // M9 Phase 45f: SnapConfig も non-Clone Model でコンパイル可能。
                 snap: daw_ui_core::SnapConfig::DEFAULT,
+                // M14 Phase 69 / daw_01 #041: loop_range も Option<(f64,f64)> (Copy) で no-Clone 互換。
+                loop_range: None,
             };
             let style = PianoRollStyle::default();
             let _ = ui.piano_roll(
@@ -161,7 +163,7 @@ fn main() {
                 &m.selected_note_ids,
                 &style,
                 |req| match req {
-                    NotesEditRequest::Add(_) => Edit::mutate(|_m: &mut Model| {
+                    PianoRollEditRequest::Add(_) => Edit::mutate(|_m: &mut Model| {
                         // Note を作る場合は lyric: None も渡す (M9 Phase 44c で追加)
                         let _new = Note {
                             id: 0,
@@ -172,12 +174,16 @@ fn main() {
                             lyric: None,
                         };
                     }),
-                    NotesEditRequest::Delete(_) => Edit::mutate(|_m: &mut Model| {}),
-                    NotesEditRequest::Move(_) => Edit::mutate(|_m: &mut Model| {}),
-                    NotesEditRequest::Resize(_) => Edit::mutate(|_m: &mut Model| {}),
-                    NotesEditRequest::Select { .. } => Edit::mutate(|_m: &mut Model| {}),
-                    NotesEditRequest::SetLyrics(_) => Edit::mutate(|_m: &mut Model| {}),
-                    NotesEditRequest::SetVelocity(_) => Edit::mutate(|_m: &mut Model| {}),
+                    PianoRollEditRequest::Delete(_) => Edit::mutate(|_m: &mut Model| {}),
+                    PianoRollEditRequest::Move(_) => Edit::mutate(|_m: &mut Model| {}),
+                    PianoRollEditRequest::Resize(_) => Edit::mutate(|_m: &mut Model| {}),
+                    PianoRollEditRequest::Select { .. } => Edit::mutate(|_m: &mut Model| {}),
+                    PianoRollEditRequest::SetLyrics(_) => Edit::mutate(|_m: &mut Model| {}),
+                    PianoRollEditRequest::SetVelocity(_) => Edit::mutate(|_m: &mut Model| {}),
+                    // M14 Phase 69 / daw_01 #041: ruler 上 click / Shift+drag で発火する 2 variant も
+                    // non-Clone Model で `make_edit` を組み立てられることを担保。
+                    PianoRollEditRequest::SetPlayheadBeat(_) => Edit::mutate(|_m: &mut Model| {}),
+                    PianoRollEditRequest::SetLoopRange { .. } => Edit::mutate(|_m: &mut Model| {}),
                 },
             );
             // M9 Phase 45e: arrangement widget が non-Clone Model でコンパイルする。

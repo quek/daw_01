@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use daw_ui_core::{
-    Edit, InputAccumulator, MoveDelta, Note, NoteId, NotesEditRequest, PianoRollResponse,
+    Edit, InputAccumulator, MoveDelta, Note, NoteId, PianoRollEditRequest, PianoRollResponse,
     PianoRollStyle, PianoRollView, ResizeDelta, SnapConfig, UiHost, VelocityUpdate, hash_inputs,
 };
 use daw_ui_platform::{
@@ -51,6 +51,13 @@ struct PianoRollModel {
     pitch_top: f32,
     pitch_visible: f32,
 
+    /// (M14 Phase 69 / daw_01 #041) ruler 上 click / drag で動かす playhead 位置 (song-global beat)。
+    playhead_beat: f64,
+    /// (M14 Phase 69 / daw_01 #041) ruler 上 Shift+drag で edit する loop range (`(start, end)`)。
+    /// `None` で loop band 非表示 (起動時のデフォルト)。 Shift+drag NewRange で新規作成、
+    /// 既存 range の Start/End/Middle handle drag で edit、 Alt 押下で snap 一時無効化。
+    loop_range: Option<(f64, f64)>,
+
     last_frame_ms: f32,
     last_action: String,
 }
@@ -67,6 +74,8 @@ impl PianoRollModel {
             view_len_beats: 4.0,
             pitch_top: 72.0,
             pitch_visible: 24.0,
+            playhead_beat: 2.0,
+            loop_range: None,
             last_frame_ms: 0.0,
             last_action: "起動 (Drag = pan / Wheel = zoom / Click = select / Insert / Delete)"
                 .to_string(),
@@ -85,7 +94,7 @@ impl PianoRollModel {
             // M9 Phase 45c: velocity lane の描画 + M14 Phase 64: lane 内 drag で velocity 編集。
             // 60.0 px で表示 (drag→ release で SetVelocity 発行 / multi-select で同値更新)。
             velocity_lane_h: 60.0,
-            playhead_beat: Some(2.0),
+            playhead_beat: Some(self.playhead_beat),
             // M13 Phase 55: ruler 領域 + bpm + time_sig (デモのため ruler_h: 20.0 で
             // 上端に小節番号テキスト表示)。
             ruler_h: 20.0,
@@ -93,6 +102,9 @@ impl PianoRollModel {
             time_sig: (4, 4),
             // M9 Phase 45f (#010 [Replied]): デフォルト Adaptive snap で grid 吸着の動作確認。
             snap: SnapConfig::DEFAULT,
+            // M14 Phase 69 / daw_01 #041: ruler 上 Shift+drag で edit するための loop range。
+            // demo では `None` で起動 (Shift+drag で新規 NewRange を作成可能)、 user 操作で更新される。
+            loop_range: self.loop_range,
         }
     }
 }
@@ -622,20 +634,20 @@ impl App {
                     &m.selected_note_ids,
                     &style,
                     move |req| match req {
-                        NotesEditRequest::Add(mut notes) => {
+                        PianoRollEditRequest::Add(mut notes) => {
                             // library widget は id=0 placeholder で渡す → user が next_note_id で上書き
                             for note in &mut notes {
                                 note.id = next_id_for_add;
                             }
                             make_add_notes_edit(notes)
                         }
-                        NotesEditRequest::Delete(notes) => make_delete_notes_edit(notes),
-                        NotesEditRequest::Move(deltas) => make_move_notes_edit(deltas),
-                        NotesEditRequest::Resize(deltas) => make_resize_notes_edit(deltas),
-                        NotesEditRequest::Select { prev, next } => {
+                        PianoRollEditRequest::Delete(notes) => make_delete_notes_edit(notes),
+                        PianoRollEditRequest::Move(deltas) => make_move_notes_edit(deltas),
+                        PianoRollEditRequest::Resize(deltas) => make_resize_notes_edit(deltas),
+                        PianoRollEditRequest::Select { prev, next } => {
                             make_select_notes_edit(prev, next)
                         }
-                        NotesEditRequest::SetLyrics(updates) => {
+                        PianoRollEditRequest::SetLyrics(updates) => {
                             // updates = Vec<(NoteId, Option<String>)>。snapshot から prev を引く。
                             let with_prev: Vec<(NoteId, Option<String>, Option<String>)> = updates
                                 .into_iter()
@@ -649,7 +661,7 @@ impl App {
                                 .collect();
                             make_set_lyrics_edit(with_prev)
                         }
-                        NotesEditRequest::SetVelocity(updates) => {
+                        PianoRollEditRequest::SetVelocity(updates) => {
                             // updates: Vec<VelocityUpdate> = Vec<(NoteId, u8)>。snapshot から prev velocity を引いて
                             // (id, prev, next) tuple に変換 → make_set_velocity_edit へ (undo 復元用)。
                             let with_prev: Vec<(NoteId, u8, u8)> = updates
@@ -663,6 +675,27 @@ impl App {
                                 })
                                 .collect();
                             make_set_velocity_edit(with_prev)
+                        }
+                        // (M14 Phase 69 / daw_01 #041) ruler 上 click/drag で発火する playhead seek を
+                        // model.playhead_beat に反映 (= 次 frame の view() で `playhead_beat: Some(...)` が
+                        // 更新される)。 daw_01 では更に `MainToChild::SeekTo` 等の audio engine seek IPC を
+                        // 連動させるが、 demo では Model 値の更新のみ (playhead 線が ruler に追従して動く)。
+                        PianoRollEditRequest::SetPlayheadBeat(beat) => {
+                            Edit::mutate(move |m: &mut PianoRollModel| {
+                                m.playhead_beat = beat;
+                                m.last_action = format!("playhead seek → {beat:.3} beat");
+                            })
+                        }
+                        // (M14 Phase 69 / daw_01 #041) Shift+ruler drag → loop range edit を model に反映。
+                        // demo では Model の loop_range field を更新するだけで、 daw_01 側では
+                        // `app.song.loop_start_beat` / `loop_end_beat` 等への反映 + 必要なら audio engine
+                        // への loop IPC 連動が caller 責務。
+                        PianoRollEditRequest::SetLoopRange { start, end } => {
+                            Edit::mutate(move |m: &mut PianoRollModel| {
+                                m.loop_range = Some((start, end));
+                                m.last_action =
+                                    format!("loop range → ({start:.3}, {end:.3}) beat");
+                            })
                         }
                     },
                 );

@@ -5,33 +5,33 @@
 //!   id は `u32` で生成時に割り当て、move/delete でも不変 (multi-select identity 安定)。
 //! - **描画 + drag state machine + hit-test + shortcut + rect select** は widget 内に閉じる。
 //!   heavy() ブロック + cached(viewport_key) で背景描画を粗粒度キャッシュ。
-//! - **Edit 構築は callback** で user に委譲 (`make_edit: Fn(NotesEditRequest) -> Edit<M>`)。
+//! - **Edit 構築は callback** で user に委譲 (`make_edit: Fn(PianoRollEditRequest) -> Edit<M>`)。
 //!   widget 自身は ユーザ Model 型を知らないので no-Clone 不変条件と整合する。
-//! - **drag 中は library が overlay 描画、release frame で初めて `NotesEditRequest::Move`
+//! - **drag 中は library が overlay 描画、release frame で初めて `PianoRollEditRequest::Move`
 //!   / `Resize` を発行** (commit-by-release pattern)。drag 中の Mutate Edit は発行せず、
-//!   user の Model.notes は release まで不変。これにより `NotesEditRequest` は 5 variants
+//!   user の Model.notes は release まで不変。これにより `PianoRollEditRequest` は 5 variants
 //!   で完結し、Mutate/Undoable 区別の boilerplate を排除。
 //! - **state 配置**: drag anchor / pending_click は内部 `WidgetState` (ephemeral)、
 //!   selected_note_ids は外部 `&[NoteId]` (immutable borrow、Model 側 single source of truth)。
-//!   selection 変更は `NotesEditRequest::Select` Edit を push_edit で発行し、frame 末で
+//!   selection 変更は `PianoRollEditRequest::Select` Edit を push_edit で発行し、frame 末で
 //!   model に apply される (= 次フレームで反映)。`UiHost::frame` の closure が `&M` 制約
 //!   のため `&mut` borrow は不可、push_edit ベースが no-Clone 不変条件と整合する設計。
 //!
 //! # 使い方 (example/piano_roll/src/main.rs を参照)
 //!
 //! ```ignore
-//! use daw_ui_core::{Note, NoteId, NotesEditRequest, PianoRollStyle, PianoRollView};
+//! use daw_ui_core::{Note, NoteId, PianoRollEditRequest, PianoRollStyle, PianoRollView};
 //!
 //! ui.piano_roll(
 //!     id, rect,
 //!     &model.notes, view, &model.selected_note_ids,
 //!     &PianoRollStyle::default(),
 //!     |req| match req {
-//!         NotesEditRequest::Add(notes)        => make_add_notes_edit(notes),
-//!         NotesEditRequest::Delete(notes)     => make_delete_notes_edit(notes),
-//!         NotesEditRequest::Move(d)           => make_move_notes_edit(d),
-//!         NotesEditRequest::Resize(d)         => make_resize_notes_edit(d),
-//!         NotesEditRequest::Select { prev, next } => make_select_notes_edit(prev, next),
+//!         PianoRollEditRequest::Add(notes)        => make_add_notes_edit(notes),
+//!         PianoRollEditRequest::Delete(notes)     => make_delete_notes_edit(notes),
+//!         PianoRollEditRequest::Move(d)           => make_move_notes_edit(d),
+//!         PianoRollEditRequest::Resize(d)         => make_resize_notes_edit(d),
+//!         PianoRollEditRequest::Select { prev, next } => make_select_notes_edit(prev, next),
 //!     },
 //! );
 //! ```
@@ -51,6 +51,10 @@ use crate::time::{TimeDisplay, TimeMapping};
 use crate::ui::Ui;
 use crate::viewport::ViewportState1D;
 use crate::widgets::playhead::draw_playhead_line;
+use crate::widgets::ruler_ops::{
+    LoopBandHit, LoopDragKind, LoopDragSession, PlayheadDragSession,
+    compute_loop_drag_endpoints, loop_band_hit_kind,
+};
 use crate::widgets::time_grid::{BarBeatGridStyle, TimeRulerStyle};
 
 // ============================================================
@@ -148,6 +152,12 @@ pub struct PianoRollView {
     /// `Default::default()` は `Adaptive` ON。 raw 動作を保ちたい caller は `SnapConfig::OFF` を渡す。
     /// drag 中 `pointer.modifiers.alt` で一時無効化。
     pub snap: SnapConfig,
+    /// (M14 Phase 69 / daw_01 #041) loop range `(start_beat, end_beat)` の song-global beat。
+    /// `Some((s, e))` で ruler に loop band overlay を描画 + Shift+drag による edit (Start/End/Middle
+    /// handle drag) を受け付ける。 `None` で loop band 非表示 + edit 不可。 `view.ruler_h > 0.0` の
+    /// ときのみ active (`ruler_h = 0.0` では描画 / hit-test ともに skip = 旧 API 完全互換)。
+    /// arrangement `view.loop_range` と完全同形 (caller は両 widget で同じ value を渡せる)。
+    pub loop_range: Option<(f64, f64)>,
 }
 
 /// piano roll が user に発行する Edit 要求の種別。
@@ -158,7 +168,7 @@ pub struct PianoRollView {
 /// drag 中の連続更新は library が overlay 描画で実現し、release frame でのみ
 /// `Move` / `Resize` を発行する (commit-by-release pattern)。`MoveContinue` 等は持たない。
 #[derive(Debug)]
-pub enum NotesEditRequest {
+pub enum PianoRollEditRequest {
     /// note を追加 (Insert shortcut)。Undoable。
     Add(Vec<Note>),
     /// 選択中 note を削除 (Delete shortcut)。Undoable。
@@ -180,6 +190,20 @@ pub enum NotesEditRequest {
     /// 同じ絶対値に set される (Live / Cubase 流の絶対値 mode)。値は `0..=127` clamp 済。
     /// drag<3px の release は no-op (Edit 発行されない、誤操作防止)。
     SetVelocity(Vec<VelocityUpdate>),
+    /// (M14 Phase 69 / daw_01 #041) ruler 上 plain (= Shift 非保持) click / drag による
+    /// playhead seek 要求。 caller は (a) `view.playhead_beat = Some(beat)` 更新 (b) audio engine への
+    /// seek IPC 送信に変換する。 widget は press frame と continuation frame (drag 中) で発火し、
+    /// release frame では emit しない (drag 中の最後の値が確定値、 release 専用 commit は無し)。 同
+    /// frame 内で同値を 2 回送らないよう session 側で `last_emitted_beat` を保持。
+    /// **snap 適用済 + `0.0` 以上に clamp** (`view.snap.snap_beat(raw, alt, zoom)`)。
+    /// arrangement `ArrangementEditRequest::SetPlayheadBeat` と完全同形。
+    SetPlayheadBeat(f64),
+    /// (M14 Phase 69 / daw_01 #041) ruler 上 Shift + drag による loop range edit 要求。
+    /// release frame で 1 度だけ発火 (commit-by-release pattern)、 drag 中は overlay 描画のみ。
+    /// `(start, end)` は **snap 適用済**、 `compute_loop_drag_endpoints` で overlay と同一値を
+    /// 計算 (「release で grid に飛ぶ」 不整合を構造的に回避)。
+    /// arrangement `ArrangementEditRequest::SetLoopRange` と完全同形。
+    SetLoopRange { start: f64, end: f64 },
 }
 
 /// `Ui::piano_roll` の戻り値。app 側で connection / hover state の表示に使う。
@@ -198,7 +222,7 @@ pub struct PianoRollResponse {
     pub dragging: Option<NoteDragKind>,
     /// Shift+drag rect select (加算) が active か (HUD / status bar 表示用)。
     pub rect_select_active: bool,
-    /// このフレームで `NotesEditRequest::Select` を push_edit したか (= 次フレームで
+    /// このフレームで `PianoRollEditRequest::Select` を push_edit したか (= 次フレームで
     /// `selected` が変わる予定であることを app 側 UI に伝える、selection 連動 UI のトリガー)。
     pub selection_changed: bool,
     /// drag<4px の short click の grid 上 (beat: f64, pitch: f32) (snap 前)。Insert 等の代替起点に使える。
@@ -287,6 +311,13 @@ pub struct PianoRollStyle {
     pub ruler_bg: Color,
     /// (M13 Phase 55) ruler の小節番号テキスト色 (`time_ruler` の `label_color` に渡す)。
     pub ruler_label_color: Color,
+    /// (M14 Phase 69 / daw_01 #041) ruler 上の loop band (背景帯) 色。 半透明 cyan 系 default。
+    /// `view.loop_range == Some(_)` かつ `view.ruler_h > 0.0` のときに描画される。 arrangement と完全同 default。
+    pub loop_band: Color,
+    /// (M14 Phase 69 / daw_01 #041) loop band 両端 handle bar の色 (不透明 cyan 系 default)。
+    pub loop_handle: Color,
+    /// (M14 Phase 69 / daw_01 #041) loop band handle bar の幅 (px)。
+    pub loop_handle_w: f32,
 }
 
 /// デフォルト velocity color (青系の濃淡 0.5..0.95)。`PianoRollStyle::note_fill_fn` の初期値。
@@ -340,6 +371,10 @@ impl Default for PianoRollStyle {
             // M13 Phase 55: ruler 領域 (`view.ruler_h > 0` のときのみ描画)
             ruler_bg: Color::rgb(0.13, 0.14, 0.17),
             ruler_label_color: Color::rgb(0.85, 0.88, 0.92),
+            // M14 Phase 69 / daw_01 #041: arrangement と同 default 値 (cyan ~0.20 alpha 帯 + 不透明 handle)。
+            loop_band: Color::rgba(0.50, 0.85, 1.0, 0.20),
+            loop_handle: Color::rgb(0.50, 0.85, 1.0),
+            loop_handle_w: 2.0,
         }
     }
 }
@@ -729,6 +764,14 @@ pub(crate) struct PianoRollState {
     /// (M14 Phase 64 / daw_01 #018) velocity lane 内 drag session。
     /// vel_area での press → release で完結。 note_drag と同時には active にならない。
     velocity_drag: Option<VelocityDragSession>,
+    /// (M14 Phase 69 / daw_01 #041) ruler 上の plain (= Shift 非保持) click / drag による
+    /// playhead seek session。 press / continuation で `SetPlayheadBeat` を逐次発火、
+    /// release で take して discard (commit-by-release 無し、 arrangement #024 と同 idiom)。
+    playhead_drag: Option<PlayheadDragSession>,
+    /// (M14 Phase 69 / daw_01 #041) ruler 上の Shift + drag による loop range edit session。
+    /// release frame で `compute_loop_drag_endpoints` 経由で snap 適用済 endpoints を計算し、
+    /// `SetLoopRange` を 1 度だけ発火 (arrangement #024 と同 idiom)。
+    loop_drag: Option<LoopDragSession>,
 }
 
 // ============================================================
@@ -797,17 +840,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 戻り値 `PianoRollResponse` で hover / drag / selection 変化を取得できる。
     ///
     /// # 操作
-    /// - **note 中央 drag** = move (release で `NotesEditRequest::Move` 発行、Undoable)
-    /// - **note 左右端 drag** = resize (release で `NotesEditRequest::Resize` 発行、Undoable)
-    /// - **note click** (drag<4px) = selection 1 個 (`NotesEditRequest::Select` 発行)
+    /// - **note 中央 drag** = move (release で `PianoRollEditRequest::Move` 発行、Undoable)
+    /// - **note 左右端 drag** = resize (release で `PianoRollEditRequest::Resize` 発行、Undoable)
+    /// - **note click** (drag<4px) = selection 1 個 (`PianoRollEditRequest::Select` 発行)
     /// - **空白 click** = selection clear (同上)
-    /// - **Shift+drag** = rect multi-select、**加算** (release で `NotesEditRequest::Select` 発行、
+    /// - **Shift+drag** = rect multi-select、**加算** (release で `PianoRollEditRequest::Select` 発行、
     ///   既存 `selected` ∪ rect 内の note ids)。排他にしたい場合は空白 click で clear してから drag
-    /// - **Insert** shortcut = pointer 位置に新規 note 追加 (`NotesEditRequest::Add`)。
+    /// - **Insert** shortcut = pointer 位置に新規 note 追加 (`PianoRollEditRequest::Add`)。
     ///   `id` は user 側で `next_note_id` 等で割り当て、`make_edit` callback 内で参照する
     ///   ため、widget は **id=0 placeholder で `Add(vec![note_with_id_0])` を渡す**。
     ///   user 側で id を上書きしてから push (= user 側で `m.next_note_id` を bump)。
-    /// - **Delete** shortcut = selected を一括削除 (`NotesEditRequest::Delete`)
+    /// - **Delete** shortcut = selected を一括削除 (`PianoRollEditRequest::Delete`)
     /// - **note hover** で cursor を `Move` / `EwResize` に切替
     ///
     /// # pan/zoom について
@@ -828,7 +871,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         make_edit: F,
     ) -> PianoRollResponse
     where
-        F: Fn(NotesEditRequest) -> Edit<M> + Send + Sync + 'static,
+        F: Fn(PianoRollEditRequest) -> Edit<M> + Send + Sync + 'static,
     {
         let wid = WidgetId::ROOT.child((b"piano_roll_widget", &id));
         let pointer = self.pointer;
@@ -1013,6 +1056,86 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // SnapConfig::Adaptive 用 zoom = grid.w / view.len_beats。
         let zoom_x_px_per_beat: f32 = (1.0 / beat_per_px) as f32;
         let pitch_per_px = view.pitch_visible / grid.h.max(1.0);
+
+        // ----- ruler press 振り分け (M14 Phase 69 / daw_01 #041) -----
+        // arrangement #024 と完全同 idiom: plain (= Shift 非保持) は playhead seek、
+        // Shift 押下で loop range edit (NewRange / Start/End/Middle drag)。
+        // editing_mode 中 / ruler_h <= 0 のときは一切処理しない (= 既存挙動完全互換)。
+        // grid / vel_area とは y 軸で完全分離されているので note_drag / velocity_drag と
+        // 競合せず、 振り分け順序の制約はない (= 独立 block)。
+        //
+        // `view.ruler_h <= 0.0` のとき `ruler_h = view.ruler_h.max(0.0).min(rect.h * 0.5)` が
+        // 0.0 になり ruler.h も 0、 ruler.contains は y 1 行を判定するが帯がないので普通の
+        // pointer.pos は決して入らない (= defensive で skip しなくても安全)。 ただし明示的に
+        // gate しておく方が読みやすいので `ruler_h > 0.0` 条件を入れる。
+        let mut press_seek_beat: Option<f64> = None;
+        if !editing_mode
+            && ruler_h > 0.0
+            && pointer.primary_just_pressed
+            && let Some((px, py)) = pointer.pos
+            && ruler.contains(px, py)
+        {
+            let press_beat =
+                view.start_beat + f64::from(px - ruler.x) * beat_per_px;
+            let press_alt = pointer.modifiers.alt;
+            if pointer.modifiers.shift {
+                // Shift + ruler drag → loop range edit (NewRange / Start/End/Middle handle)。
+                let kind = if let Some(range) = view.loop_range {
+                    match loop_band_hit_kind(
+                        range,
+                        view.start_beat,
+                        view.len_beats,
+                        ruler,
+                        px,
+                        4.0,
+                    ) {
+                        Some(LoopBandHit::Start) => LoopDragKind::Start,
+                        Some(LoopBandHit::End) => LoopDragKind::End,
+                        Some(LoopBandHit::Middle) => LoopDragKind::Middle,
+                        None => LoopDragKind::NewRange,
+                    }
+                } else {
+                    LoopDragKind::NewRange
+                };
+                // NewRange の anchor 端点は press 時 snap で grid に着地 (release 端点も
+                // `compute_loop_drag_endpoints` で snap される、 arrangement #024 と同 idiom)。
+                let anchor_press_beat_for_session = match kind {
+                    LoopDragKind::NewRange => view
+                        .snap
+                        .snap_beat(press_beat, press_alt, zoom_x_px_per_beat),
+                    _ => press_beat,
+                };
+                let anchor_loop = view.loop_range.unwrap_or((
+                    anchor_press_beat_for_session,
+                    anchor_press_beat_for_session,
+                ));
+                let state: &mut PianoRollState = self.widget_state(wid);
+                state.loop_drag = Some(LoopDragSession {
+                    kind,
+                    anchor_loop,
+                    anchor_press_beat: anchor_press_beat_for_session,
+                    anchor_mouse_x: px,
+                    last_mouse_x: px,
+                    last_alt: press_alt,
+                });
+            } else {
+                // plain (Shift 非保持) ruler click/drag → playhead seek session。
+                let snapped = view
+                    .snap
+                    .snap_beat(press_beat, press_alt, zoom_x_px_per_beat)
+                    .max(0.0);
+                let state: &mut PianoRollState = self.widget_state(wid);
+                state.playhead_drag = Some(PlayheadDragSession {
+                    last_mouse_x: px,
+                    last_emitted_beat: snapped,
+                });
+                press_seek_beat = Some(snapped);
+            }
+        }
+        if let Some(beat) = press_seek_beat {
+            self.push_edit(make_edit(PianoRollEditRequest::SetPlayheadBeat(beat)));
+        }
+
         // drag 継続中は毎 continuation frame で `last_mouse` / `last_alt` を update。
         // **release frame の `last_alt` は update しない** — 同 frame に ModifiersChanged(alt=false)
         // が先行する現象 (alt が一瞬 false に化ける) を回避するため、 release 直前 frame の値を保持する。
@@ -1041,7 +1164,68 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             {
                 vd.last_mouse = (px, py);
             }
+            // (M14 Phase 69 / daw_01 #041) loop_drag continuation:
+            // last_mouse_x / last_alt を update (arrangement と完全同 idiom)。 release frame で alt を
+            // 上書きしないのは ModifiersChanged 先行の race 回避 (note_drag と同根)。
+            if let Some(ref mut ld) = state.loop_drag {
+                if pointer.primary_just_released {
+                    // release frame は winit が pointer.pos を press 位置に巻き戻す場合があるため、
+                    // anchor_mouse_x と同値 (= exact f32 equality) のときは update を skip し、
+                    // continuation 由来の last_mouse_x を保持する (note_drag の `(px, py) != nd.anchor_mouse`
+                    // tuple 比較と同 idiom)。 ここは exact equality が意味を持つ (winit の巻き戻しは
+                    // bit-perfect な復元なので f32::EPSILON より厳しい比較を要求するわけではない)。
+                    #[allow(clippy::float_cmp)]
+                    let pos_moved = px != ld.anchor_mouse_x;
+                    if pos_moved {
+                        ld.last_mouse_x = px;
+                    }
+                } else {
+                    ld.last_mouse_x = px;
+                    ld.last_alt = alt_now;
+                }
+            }
+            // playhead_drag は release では emit しないので last_mouse_x の release frame 巻き戻し
+            // を気にする必要が無い (continuation の最後の `last_emitted_beat` が真値)。 ただし
+            // continuation frame では update して将来の visual debug を可能にする。
+            if let Some(ref mut pd) = state.playhead_drag
+                && !pointer.primary_just_released
+            {
+                pd.last_mouse_x = px;
+            }
         }
+
+        // (M14 Phase 69 / daw_01 #041) playhead_drag continuation の per-frame live update。
+        // press frame は press block 内で発火済 (`press_seek_beat`)、 ここは continuation のみ。
+        // release frame は emit せず、 後段で take して discard する (commit-by-release 無し)。
+        // `last_emitted_beat` で同値発火を抑制 (1e-6 拍 = ~10μs @ 120BPM 以下は ignore)。
+        // editing_mode 中は press block 自体が skip されているので playhead_drag が立つことは無く、
+        // ここも naturally skip。
+        if !editing_mode
+            && let Some((px, _py)) = pointer.pos
+            && !pointer.primary_just_pressed
+            && !pointer.primary_just_released
+        {
+            let alt = pointer.modifiers.alt;
+            let mut emit_beat: Option<f64> = None;
+            {
+                let state: &mut PianoRollState = self.widget_state(wid);
+                if let Some(ref mut pd) = state.playhead_drag {
+                    let raw = view.start_beat + f64::from(px - ruler.x) * beat_per_px;
+                    let next = view
+                        .snap
+                        .snap_beat(raw, alt, zoom_x_px_per_beat)
+                        .max(0.0);
+                    if (next - pd.last_emitted_beat).abs() > 1e-6 {
+                        emit_beat = Some(next);
+                        pd.last_emitted_beat = next;
+                    }
+                }
+            }
+            if let Some(beat) = emit_beat {
+                self.push_edit(make_edit(PianoRollEditRequest::SetPlayheadBeat(beat)));
+            }
+        }
+
         let drag_session: Option<NoteDragSession> = {
             let state: &mut PianoRollState = self.widget_state(wid);
             state.note_drag.clone()
@@ -1050,6 +1234,22 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let state: &mut PianoRollState = self.widget_state(wid);
             state.velocity_drag.clone()
         };
+        // (M14 Phase 69 / daw_01 #041) loop_drag overlay & release 用 clone / take。
+        let loop_drag_session: Option<LoopDragSession> = {
+            let state: &mut PianoRollState = self.widget_state(wid);
+            state.loop_drag
+        };
+        let loop_drag_release: Option<LoopDragSession> = if pointer.primary_just_released {
+            let state: &mut PianoRollState = self.widget_state(wid);
+            state.loop_drag.take()
+        } else {
+            None
+        };
+        // playhead_drag は release frame で take して discard (commit-by-release 無し)。
+        if pointer.primary_just_released {
+            let state: &mut PianoRollState = self.widget_state(wid);
+            let _ = state.playhead_drag.take();
+        }
         // drag release で取り出すが、drag 距離が 16px 未満なら **click に格下げ** する
         // (= 短い「press → release」は note 中央上の click として selection 切替に振り向ける)。
         let drag_release_raw: Option<NoteDragSession> = if pointer.primary_just_released {
@@ -1260,6 +1460,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 (vd.target_ids.clone(), new_vel)
             });
 
+        // (M14 Phase 69 / daw_01 #041) loop drag overlay の preview range も snap 適用済
+        // (commit と同一値で確定、 release 時の「カクッ」 ずれを回避)。 alt は session の `last_alt`
+        // を真値とし、 `pointer.modifiers.alt` を直接見ない (clip_drag / loop_drag in arrangement と
+        // 同 pattern)。
+        let loop_drag_preview_range: Option<(f64, f64)> = loop_drag_session.map(|ld| {
+            let cur_beat =
+                view.start_beat + f64::from(ld.last_mouse_x - ruler.x) * beat_per_px;
+            compute_loop_drag_endpoints(&ld, cur_beat, &view.snap, zoom_x_px_per_beat)
+        });
+        let loop_band_color = style.loop_band;
+        let loop_handle_color = style.loop_handle;
+        let loop_handle_w = style.loop_handle_w;
+
         self.heavy(("piano_roll_inner", &id), move |hctx| {
             // === cached(): viewport_key 一致時に skip される背景レイヤ ===
             hctx.cached(viewport_key, |hctx| {
@@ -1340,6 +1553,25 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 style_copy.lyric_font_px,
                 lyric_editing_for_draw,
             );
+            // (M14 Phase 69 / daw_01 #041) loop band overlay (ruler 上、 cached の外で毎 frame 描画)。
+            // drag preview range があれば preview を、 無ければ `view.loop_range` を描画。 ruler_h <= 0
+            // のときは `ruler.h = 0` なので描画 helper 内で band_w = 0 となり no-op (= 旧 API 互換)。
+            // arrangement と完全同 helper (`crate::widgets::ruler_ops::draw_loop_band`)、 daw_01 が
+            // ruler_h > 0 + loop_range Some を渡したときのみ表示される。
+            if ruler_h > 0.0
+                && let Some(range) = loop_drag_preview_range.or(view_copy.loop_range)
+            {
+                crate::widgets::ruler_ops::draw_loop_band(
+                    hctx,
+                    range,
+                    view_copy.start_beat,
+                    view_copy.len_beats,
+                    ruler,
+                    loop_band_color,
+                    loop_handle_color,
+                    loop_handle_w,
+                );
+            }
             // M9 Phase 45c: playhead 線 (time で動くので cache 対象外、毎フレーム描画)。
             // 範囲外なら描画スキップ。grid と vel_area を縦断する 1 本。
             if let Some(b) = view_copy.playhead_beat
@@ -1394,7 +1626,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 velocity: 96,
                 lyric: None,
             };
-            self.push_edit(make_edit(NotesEditRequest::Add(vec![new_note])));
+            self.push_edit(make_edit(PianoRollEditRequest::Add(vec![new_note])));
         }
 
         if !editing_mode && self.take_shortcut("delete") && !selected.is_empty() {
@@ -1402,7 +1634,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let to_delete: Vec<Note> =
                 notes.iter().filter(|n| sel_set.contains(&n.id)).cloned().collect();
             if !to_delete.is_empty() {
-                self.push_edit(make_edit(NotesEditRequest::Delete(to_delete)));
+                self.push_edit(make_edit(PianoRollEditRequest::Delete(to_delete)));
             }
         }
 
@@ -1421,7 +1653,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 Vec::new()
             };
             if prev != new_sel {
-                self.push_edit(make_edit(NotesEditRequest::Select {
+                self.push_edit(make_edit(PianoRollEditRequest::Select {
                     prev,
                     next: new_sel,
                 }));
@@ -1476,7 +1708,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         }
                     }
                     if !deltas.is_empty() {
-                        self.push_edit(make_edit(NotesEditRequest::Move(deltas)));
+                        self.push_edit(make_edit(PianoRollEditRequest::Move(deltas)));
                     }
                 }
                 NoteDragKind::ResizeRight => {
@@ -1494,7 +1726,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         }
                     }
                     if !deltas.is_empty() {
-                        self.push_edit(make_edit(NotesEditRequest::Resize(deltas)));
+                        self.push_edit(make_edit(PianoRollEditRequest::Resize(deltas)));
                     }
                 }
                 NoteDragKind::ResizeLeft => {
@@ -1517,7 +1749,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         }
                     }
                     if !deltas.is_empty() {
-                        self.push_edit(make_edit(NotesEditRequest::Resize(deltas)));
+                        self.push_edit(make_edit(PianoRollEditRequest::Resize(deltas)));
                     }
                 }
             }
@@ -1541,9 +1773,21 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     }
                 }
                 if !updates.is_empty() {
-                    self.push_edit(make_edit(NotesEditRequest::SetVelocity(updates)));
+                    self.push_edit(make_edit(PianoRollEditRequest::SetVelocity(updates)));
                 }
             }
+        }
+
+        // ----- loop drag release → SetLoopRange (M14 Phase 69 / daw_01 #041) -----
+        // snap 適用済 endpoints を overlay と共通の helper で計算 (release frame で grid に飛ぶ
+        // 不整合を構造的に回避、 arrangement #024 と同 idiom)。 alt は `ld.last_alt` を真値とし、
+        // release frame の `pointer.modifiers.alt` を直接見ない (ModifiersChanged 先行 race 回避)。
+        if let Some(ld) = loop_drag_release {
+            let cur_beat =
+                view.start_beat + f64::from(ld.last_mouse_x - ruler.x) * beat_per_px;
+            let (start, end) =
+                compute_loop_drag_endpoints(&ld, cur_beat, &view.snap, zoom_x_px_per_beat);
+            self.push_edit(make_edit(PianoRollEditRequest::SetLoopRange { start, end }));
         }
 
         // ----- Shift+drag rect multi-select (加算) -----
@@ -1583,7 +1827,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let mut prev_sorted = prev.clone();
                 prev_sorted.sort_unstable();
                 if prev_sorted != new_ids {
-                    self.push_edit(make_edit(NotesEditRequest::Select {
+                    self.push_edit(make_edit(PianoRollEditRequest::Select {
                         prev,
                         next: new_ids,
                     }));
@@ -1659,7 +1903,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         response.lyric_overflow_morae =
                             morae.len().saturating_sub(target_ids.len());
                         if !updates.is_empty() {
-                            self.push_edit(make_edit(NotesEditRequest::SetLyrics(updates)));
+                            self.push_edit(make_edit(PianoRollEditRequest::SetLyrics(updates)));
                         }
                         // 次 note へ移動 (= 分配し終わった先の note id、無ければ None)
                         let all_sorted =
@@ -1672,7 +1916,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                             && selected != [nid].as_slice()
                         {
                             let prev = selected.to_vec();
-                            self.push_edit(make_edit(NotesEditRequest::Select {
+                            self.push_edit(make_edit(PianoRollEditRequest::Select {
                                 prev,
                                 next: vec![nid],
                             }));
@@ -2048,6 +2292,7 @@ mod tests {
             time_sig: (4, 4),
             // 数値検証 test は raw beat 値を期待するので明示 OFF。
             snap: SnapConfig::OFF,
+            loop_range: None,
         }
     }
 
@@ -2395,6 +2640,11 @@ mod tests {
         last_added_pitch: Option<u8>,
         /// (M14 Phase 64 / daw_01 #018) 最後に発行された `SetVelocity` の内容。
         last_set_velocity: Option<Vec<VelocityUpdate>>,
+        /// (M14 Phase 69 / daw_01 #041) ruler 上 click / drag で発行された全 `SetPlayheadBeat` の
+        /// beat 列 (press 即発行 + continuation の連続発火を検証するため log 化)。
+        playhead_beats: Vec<f64>,
+        /// (M14 Phase 69 / daw_01 #041) 最後に発行された `SetLoopRange { start, end }`。
+        last_set_loop_range: Option<(f64, f64)>,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2406,6 +2656,8 @@ mod tests {
         Select,
         SetLyrics,
         SetVelocity,
+        SetPlayheadBeat,
+        SetLoopRange,
     }
 
     impl TestModel {
@@ -2419,33 +2671,35 @@ mod tests {
                 last_set_lyrics: None,
                 last_added_pitch: None,
                 last_set_velocity: None,
+                playhead_beats: Vec::new(),
+                last_set_loop_range: None,
             }
         }
     }
 
     fn make_dispatch(
-    ) -> impl Fn(NotesEditRequest) -> Edit<TestModel> + Send + Sync + 'static + Clone {
-        |req: NotesEditRequest| -> Edit<TestModel> {
+    ) -> impl Fn(PianoRollEditRequest) -> Edit<TestModel> + Send + Sync + 'static + Clone {
+        |req: PianoRollEditRequest| -> Edit<TestModel> {
             match req {
-                NotesEditRequest::Add(notes) => {
+                PianoRollEditRequest::Add(notes) => {
                     let pitch = notes.first().map(|n| n.pitch);
                     Edit::mutate(move |m: &mut TestModel| {
                         m.last_request = Some(RequestKind::Add);
                         m.last_added_pitch = pitch;
                     })
                 }
-                NotesEditRequest::Delete(notes) => Edit::mutate(move |m: &mut TestModel| {
+                PianoRollEditRequest::Delete(notes) => Edit::mutate(move |m: &mut TestModel| {
                     m.last_request = Some(RequestKind::Delete);
                     let ids: HashSet<NoteId> = notes.iter().map(|n| n.id).collect();
                     m.notes.retain(|x| !ids.contains(&x.id));
                 }),
-                NotesEditRequest::Move(_) => {
+                PianoRollEditRequest::Move(_) => {
                     Edit::mutate(|m: &mut TestModel| m.last_request = Some(RequestKind::Move))
                 }
-                NotesEditRequest::Resize(_) => {
+                PianoRollEditRequest::Resize(_) => {
                     Edit::mutate(|m: &mut TestModel| m.last_request = Some(RequestKind::Resize))
                 }
-                NotesEditRequest::Select { prev, next } => {
+                PianoRollEditRequest::Select { prev, next } => {
                     let prev_clone = prev.clone();
                     let next_clone = next.clone();
                     Edit::mutate(move |m: &mut TestModel| {
@@ -2455,7 +2709,7 @@ mod tests {
                         m.selected.clone_from(&next_clone);
                     })
                 }
-                NotesEditRequest::SetLyrics(updates) => {
+                PianoRollEditRequest::SetLyrics(updates) => {
                     let updates_clone = updates.clone();
                     Edit::mutate(move |m: &mut TestModel| {
                         m.last_request = Some(RequestKind::SetLyrics);
@@ -2468,7 +2722,7 @@ mod tests {
                         m.last_set_lyrics = Some(updates_clone.clone());
                     })
                 }
-                NotesEditRequest::SetVelocity(updates) => {
+                PianoRollEditRequest::SetVelocity(updates) => {
                     let updates_clone = updates.clone();
                     Edit::mutate(move |m: &mut TestModel| {
                         m.last_request = Some(RequestKind::SetVelocity);
@@ -2479,6 +2733,18 @@ mod tests {
                             }
                         }
                         m.last_set_velocity = Some(updates_clone.clone());
+                    })
+                }
+                PianoRollEditRequest::SetPlayheadBeat(beat) => {
+                    Edit::mutate(move |m: &mut TestModel| {
+                        m.last_request = Some(RequestKind::SetPlayheadBeat);
+                        m.playhead_beats.push(beat);
+                    })
+                }
+                PianoRollEditRequest::SetLoopRange { start, end } => {
+                    Edit::mutate(move |m: &mut TestModel| {
+                        m.last_request = Some(RequestKind::SetLoopRange);
+                        m.last_set_loop_range = Some((start, end));
                     })
                 }
             }
@@ -4554,6 +4820,335 @@ mod tests {
                     |_| Edit::mutate(|_: &mut TestModel| {}),
                 );
             },
+        );
+    }
+
+    // ============================================================
+    // M14 Phase 69 / daw_01 #041: ruler 上 click/drag による playhead seek +
+    // Shift+drag による loop range edit
+    // ============================================================
+
+    /// ruler_h=20 で snap OFF の test view (raw beat 値を期待値で検証する)。
+    /// `test_view()` の `ruler_h=0` 既存挙動と分離。
+    fn ruler_view() -> PianoRollView {
+        PianoRollView { ruler_h: 20.0, ..test_view() }
+    }
+
+    /// rect (0,0)-(800,400)、 ruler_h=20 → grid 1 beat = 200 px (len_beats=4)。
+    /// y=10 は ruler 内、 y >= 20 は grid。
+    const PR_RULER_Y: f32 = 10.0;
+
+    /// plain (Shift 非保持) ruler click → press frame で `SetPlayheadBeat` を 1 度発火。
+    /// snap OFF なので raw beat 値が直接送られる、 0.0 以上 clamp の確認も兼ねる。
+    #[test]
+    fn ruler_click_emits_set_playhead_beat() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![]);
+        let view = ruler_view();
+        let style = PianoRollStyle::default();
+        // press at x=400, y=10 → ruler 内、 beat = 400/200 = 2.0
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((400.0, PR_RULER_Y)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel: Vec<NoteId> = vec![];
+        run_frame(&mut host, &mut model, input, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &[],
+                view,
+                &sel,
+                &style,
+                dispatch,
+            );
+        });
+        assert_eq!(model.last_request, Some(RequestKind::SetPlayheadBeat));
+        assert_eq!(
+            model.playhead_beats.len(),
+            1,
+            "press frame で 1 度だけ emit: {:?}",
+            model.playhead_beats
+        );
+        assert!(
+            (model.playhead_beats[0] - 2.0).abs() < 1e-6,
+            "x=400 → beat 2.0: {:?}",
+            model.playhead_beats[0]
+        );
+    }
+
+    /// `view.ruler_h == 0.0` のとき ruler 内 press は一切 SetPlayheadBeat を emit しない
+    /// (旧 piano_roll API 完全互換、 ruler.h=0 で `ruler.contains` が false になる)。
+    #[test]
+    fn ruler_h_zero_does_not_emit_set_playhead_beat() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![]);
+        let view = test_view(); // ruler_h: 0.0
+        let style = PianoRollStyle::default();
+        // y=10 は ruler_h=0 のときは grid 領域 (= 通常の click として selection clear 等が走るが
+        // SetPlayheadBeat は発火しない)。
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((400.0, 10.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let sel: Vec<NoteId> = vec![];
+        run_frame(&mut host, &mut model, input, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &[],
+                view,
+                &sel,
+                &style,
+                dispatch,
+            );
+        });
+        assert!(
+            model.playhead_beats.is_empty(),
+            "ruler_h=0 では SetPlayheadBeat は発火しない: {:?}",
+            model.playhead_beats
+        );
+    }
+
+    /// plain ruler drag は press + continuation で連続発火、 release frame では emit しない。
+    /// 同値発火抑制で連続同 beat は 1 度のみ。
+    #[test]
+    fn ruler_drag_emits_continuation_beats_until_release() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![]);
+        let view = ruler_view();
+        let style = PianoRollStyle::default();
+        let sel: Vec<NoteId> = vec![];
+
+        // Frame 1: press at x=400 (beat 2.0) → emit
+        let input1 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((400.0, PR_RULER_Y)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, input1, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &[],
+                view,
+                &sel,
+                &style,
+                dispatch,
+            );
+        });
+
+        // Frame 2: continuation at x=600 (beat 3.0) → emit
+        let input2 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((600.0, PR_RULER_Y)),
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, input2, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &[],
+                view,
+                &sel,
+                &style,
+                dispatch,
+            );
+        });
+
+        // Frame 3: release at x=600 (beat 3.0) → release frame は emit しない
+        let input3 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((600.0, PR_RULER_Y)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, input3, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &[],
+                view,
+                &sel,
+                &style,
+                dispatch,
+            );
+        });
+
+        // press (beat 2.0) + continuation (beat 3.0) で 2 emit、 release は emit せず。
+        assert_eq!(
+            model.playhead_beats.len(),
+            2,
+            "press + 1 continuation で 2 emit (release は emit せず): {:?}",
+            model.playhead_beats
+        );
+        assert!((model.playhead_beats[0] - 2.0).abs() < 1e-6);
+        assert!((model.playhead_beats[1] - 3.0).abs() < 1e-6);
+    }
+
+    /// Shift + ruler drag → release frame で `SetLoopRange` を 1 度だけ発火 (snap 適用済 endpoints)。
+    /// drag 中の continuation で SetPlayheadBeat は発火しない (Shift で loop edit に振り分け済)。
+    #[test]
+    fn shift_ruler_drag_emits_set_loop_range_on_release() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![]);
+        let view = ruler_view();
+        let style = PianoRollStyle::default();
+        let sel: Vec<NoteId> = vec![];
+
+        // Frame 1: Shift + press at x=200 (beat 1.0) → NewRange anchor 1.0
+        let input1 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, PR_RULER_Y)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                modifiers: Modifiers { shift: true, ..Modifiers::empty() },
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, input1, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &[],
+                view,
+                &sel,
+                &style,
+                dispatch,
+            );
+        });
+
+        // Frame 2: drag at x=600 (beat 3.0、 continuation)
+        let input2 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((600.0, PR_RULER_Y)),
+                primary_pressed: true,
+                modifiers: Modifiers { shift: true, ..Modifiers::empty() },
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, input2, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &[],
+                view,
+                &sel,
+                &style,
+                dispatch,
+            );
+        });
+
+        // Frame 3: release at x=600 → SetLoopRange (start=1.0, end=3.0) 発火
+        let input3 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((600.0, PR_RULER_Y)),
+                primary_just_released: true,
+                modifiers: Modifiers { shift: true, ..Modifiers::empty() },
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, input3, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &[],
+                view,
+                &sel,
+                &style,
+                dispatch,
+            );
+        });
+
+        assert!(
+            model.playhead_beats.is_empty(),
+            "Shift+drag は loop edit に振り分け、 SetPlayheadBeat は発火しない: {:?}",
+            model.playhead_beats
+        );
+        assert_eq!(model.last_request, Some(RequestKind::SetLoopRange));
+        let (s, e) = model.last_set_loop_range.expect("SetLoopRange 発火");
+        assert!((s - 1.0).abs() < 1e-6, "loop start = beat 1.0: {s}");
+        assert!((e - 3.0).abs() < 1e-6, "loop end = beat 3.0: {e}");
+    }
+
+    /// Alt + ruler click → snap 一時無効、 raw beat 値が pass-through される
+    /// (snap ON の view で alt 無しと有りの比較)。
+    #[test]
+    fn alt_ruler_click_disables_snap() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![]);
+        let view = PianoRollView {
+            ruler_h: 20.0,
+            // 1 beat snap (SnapMode::Straight { div: 4 })
+            snap: SnapConfig {
+                mode: crate::snap::SnapMode::Straight { div: 4 },
+                enabled: true,
+                min_beat_unit: 1.0 / 128.0,
+                time_sig: (4, 4),
+            },
+            ..test_view()
+        };
+        let style = PianoRollStyle::default();
+        let sel: Vec<NoteId> = vec![];
+
+        // x=350 → raw beat 1.75、 snap (1 beat unit) → 2.0、 alt で snap 一時無効 → 1.75 (raw)
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((350.0, PR_RULER_Y)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                modifiers: Modifiers { alt: true, ..Modifiers::empty() },
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, input, |ui| {
+            let dispatch = make_dispatch();
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &[],
+                view,
+                &sel,
+                &style,
+                dispatch,
+            );
+        });
+        assert_eq!(model.playhead_beats.len(), 1);
+        assert!(
+            (model.playhead_beats[0] - 1.75).abs() < 1e-6,
+            "Alt 押下で snap 一時無効、 raw 1.75 が pass-through: got {:?}",
+            model.playhead_beats[0]
         );
     }
 }

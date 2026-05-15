@@ -54,13 +54,17 @@ pub use widgets::arrangement::{
     ArrangementMasterRow, ArrangementResponse, ArrangementStyle, ArrangementTrack, ArrangementView,
     AutomationClipKey, AutomationLaneHeaderLayout, AutomationLaneKey, AutomationPointKey,
     ClipDragKind, ClipFadeCurveDelta, ClipFadeDelta, ClipGainDelta, ClipKey, FadeCurve, FadeEdge,
-    LoopBandHit, MASTER_TRACK_ID, MoveAutomationClipDelta, MoveAutomationPointDelta, MoveClipDelta,
+    MASTER_TRACK_ID, MoveAutomationClipDelta, MoveAutomationPointDelta, MoveClipDelta,
     ResizeAutomationClipDelta, ResizeClipDelta, SelectModifier, SetAutomationCurveParamKind,
     automation_clip_zone_at, automation_lane_at, automation_lane_header_layout,
     automation_lane_key_at_y, automation_lane_resize_splitter_at, automation_lanes_total_h,
     automation_point_at, clip_hit, clip_to_rect, effective_master_row_h, lane_disclosure_rect_for,
-    loop_band_hit_kind, master_row_lanes_total_h, master_row_total_h, track_index_from_y,
+    master_row_lanes_total_h, master_row_total_h, track_index_from_y,
     track_row_height, track_row_resize_splitter_at, visible_track_row_tops,
+};
+pub use widgets::ruler_ops::{
+    LoopBandHit, LoopDragKind, LoopDragSession, PlayheadDragSession,
+    compute_loop_drag_endpoints, loop_band_hit_kind,
 };
 pub use widgets::automation::{AutomationCurveResponse, AutomationCurveStyle};
 pub use widgets::checkbox::CheckboxResponse;
@@ -71,7 +75,7 @@ pub use widgets::menu::MenuItemSpec;
 pub use widgets::modal::ModalStyle;
 pub use widgets::knob::KnobResponse;
 pub use widgets::piano_roll::{
-    Note, NoteDragKind, NoteFillFn, NoteId, NotesEditRequest, MoveDelta, PianoRollResponse,
+    Note, NoteDragKind, NoteFillFn, NoteId, MoveDelta, PianoRollEditRequest, PianoRollResponse,
     PianoRollStyle, PianoRollView, ResizeDelta, VelocityUpdate, default_velocity_color,
     is_black_key, note_hit, note_hover_cursor, note_to_rect, rects_intersect, split_into_morae,
 };

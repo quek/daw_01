@@ -32,6 +32,10 @@ use crate::ui::Ui;
 use crate::viewport::ViewportState1D;
 use crate::widgets::heavy::HeavyCtx;
 use crate::widgets::playhead::draw_playhead_line;
+use crate::widgets::ruler_ops::{
+    LoopBandHit, LoopDragKind, LoopDragSession, PlayheadDragSession,
+    compute_loop_drag_endpoints, draw_loop_band, loop_band_hit_kind,
+};
 use crate::widgets::time_grid::{BarBeatGridStyle, TimeRulerStyle};
 use crate::widgets::toggle_button::ToggleButtonStyle;
 
@@ -1593,40 +1597,8 @@ pub fn track_index_from_y(y: f32, _lanes_y: f32, tops: &[f32]) -> Option<usize> 
     Some(i - 1)
 }
 
-/// loop band の hit 種別 (start handle / end handle / 中央 / 範囲外)。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LoopBandHit {
-    Start,
-    End,
-    Middle,
-}
-
-#[must_use]
-#[allow(clippy::cast_possible_truncation)]
-pub fn loop_band_hit_kind(
-    range: (f64, f64),
-    view: ArrangementView,
-    ruler: Rect,
-    px: f32,
-    handle_radius_px: f32,
-) -> Option<LoopBandHit> {
-    if !ruler.contains(px, ruler.y + ruler.h * 0.5) {
-        return None;
-    }
-    let beat_to_px = f64::from(ruler.w) / view.len_beats.max(1e-6);
-    let start_x = ruler.x + ((range.0 - view.start_beat) * beat_to_px) as f32;
-    let end_x = ruler.x + ((range.1 - view.start_beat) * beat_to_px) as f32;
-    let edge = handle_radius_px.max(1.0);
-    if (px - start_x).abs() <= edge {
-        Some(LoopBandHit::Start)
-    } else if (px - end_x).abs() <= edge {
-        Some(LoopBandHit::End)
-    } else if px > start_x && px < end_x {
-        Some(LoopBandHit::Middle)
-    } else {
-        None
-    }
-}
+// `LoopBandHit` / `loop_band_hit_kind` は M14 Phase 69 (#041) で
+// `crate::widgets::ruler_ops` に extract (piano_roll と共有)。
 
 #[inline]
 fn px_to_beat(px: f32, lanes_x: f32, lanes_w: f32, view: ArrangementView) -> f64 {
@@ -1875,29 +1847,8 @@ struct ClipDragSession {
     anchors: Vec<ClipDragAnchor>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LoopDragKind {
-    Start,
-    End,
-    Middle,
-    NewRange,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct LoopDragSession {
-    kind: LoopDragKind,
-    anchor_loop: (f64, f64),
-    anchor_press_beat: f64,
-    /// press 時 mouse x (release frame の巻き戻し検知用、 `ClipDragSession.anchor_mouse` と同 idiom)。
-    anchor_mouse_x: f32,
-    /// drag 中の最終 mouse x 位置 (release frame の `pointer.pos` に頼らないための保険、
-    /// `ClipDragSession.last_mouse` と同じ理由)。
-    last_mouse_x: f32,
-    /// M14 Phase 63j (#024): drag 中の最終 alt 状態。 `ClipDragSession.last_alt` と
-    /// 同じ仕組みで track (continuation で update、 release で skip)。 release frame の
-    /// `pointer.modifiers.alt` が ModifiersChanged 先行で false 化する race を回避。
-    last_alt: bool,
-}
+// `LoopDragKind` / `LoopDragSession` は M14 Phase 69 (#041) で
+// `crate::widgets::ruler_ops` に extract (piano_roll と共有)。
 
 /// M10 Phase 46 / M14 Phase 63c (#016): track header drag&drop session。 release frame で
 /// **drop target に応じて `ReorderTracks` (sibling) と `SetTrackParent` (parent 変更) を振り分け** る。
@@ -1915,20 +1866,8 @@ struct TrackReorderSession {
     last_mouse_y: f32,
 }
 
-/// M14 Phase 63j (#024): ruler 上の plain (= Shift 非保持) click / drag による
-/// playhead seek セッション。 press frame で `state.playhead_drag = Some(...)` し、
-/// continuation frame で毎 frame `SetPlayheadBeat` を発行 (`last_emitted_beat` で重複抑制)。
-/// release frame で `take()` して discard (commit-by-release 無し、 既に逐次発行済)。
-#[derive(Clone, Copy, Debug)]
-struct PlayheadDragSession {
-    /// drag 中の最終 mouse x 位置 (release frame の `pointer.pos` に頼らない保険、
-    /// `ClipDragSession.last_mouse` と同理由)。 release では emit しないので現状未使用だが、
-    /// 他 drag session と field 構成を揃えて将来の visual debug を容易にする。
-    last_mouse_x: f32,
-    /// drag 中に最後に発火した snap 適用済 beat 値 (毎 frame 同値発火を抑制)。
-    /// press frame で初期化済み (= press 即発行値)、 continuation で differ 時のみ更新 + emit。
-    last_emitted_beat: f64,
-}
+// `PlayheadDragSession` は M14 Phase 69 (#041) で
+// `crate::widgets::ruler_ops` に extract (piano_roll と共有)。
 
 /// M10 Phase 47b: track header の bottom band slider drag による volume 編集セッション。
 #[derive(Clone, Copy, Debug)]
@@ -2291,46 +2230,8 @@ fn compute_clip_drag_beat_delta(
     snapped_pivot - pivot
 }
 
-/// M14 Phase 63j (#024): loop drag の overlay と release commit で共有する snap 適用済
-/// `(start, end)` 計算。 clip drag と同じ pattern (overlay と commit が必ず同一値で確定):
-/// - **Start drag**: 端点 (cur_beat) を grid に round → `min(snapped, anchor_loop.1)` で start 確定
-/// - **End drag**: 端点 (cur_beat) を grid に round → `max(snapped, anchor_loop.0)` で end 確定
-/// - **Middle drag**: 絶対位置 snap (Cubase / Live の Move pattern と同じ)。 `anchor_loop.0` を pivot
-///   として grid に round → その差分 (delta) を両端に適用、 duration 維持。
-/// - **NewRange**: `anchor_press_beat` は press 時に snap 済 (caller 側責務)、 ここは cur_beat だけ
-///   snap。 両端を独立に snap してから順序正規化。 duration 0 でも問題なし (caller 側で扱う)。
-///
-/// `last_alt = true` で snap 一時無効 (raw 通過、 `MoveClips` と同じ alt 直交 policy)。
-fn compute_loop_drag_endpoints(
-    ld: &LoopDragSession,
-    cur_beat_raw: f64,
-    snap: &SnapConfig,
-    zoom_x_px_per_beat: f32,
-) -> (f64, f64) {
-    let alt = ld.last_alt;
-    match ld.kind {
-        LoopDragKind::Start => {
-            let s = snap.snap_beat(cur_beat_raw, alt, zoom_x_px_per_beat);
-            (s.min(ld.anchor_loop.1), ld.anchor_loop.1)
-        }
-        LoopDragKind::End => {
-            let e = snap.snap_beat(cur_beat_raw, alt, zoom_x_px_per_beat);
-            (ld.anchor_loop.0, e.max(ld.anchor_loop.0))
-        }
-        LoopDragKind::Middle => {
-            let raw_delta = cur_beat_raw - ld.anchor_press_beat;
-            let pivot = ld.anchor_loop.0;
-            let snapped_pivot =
-                snap.snap_beat(pivot + raw_delta, alt, zoom_x_px_per_beat);
-            let delta = snapped_pivot - pivot;
-            (ld.anchor_loop.0 + delta, ld.anchor_loop.1 + delta)
-        }
-        LoopDragKind::NewRange => {
-            let other = snap.snap_beat(cur_beat_raw, alt, zoom_x_px_per_beat);
-            (ld.anchor_press_beat.min(other), ld.anchor_press_beat.max(other))
-        }
-    }
-}
+// `compute_loop_drag_endpoints` は M14 Phase 69 (#041) で
+// `crate::widgets::ruler_ops` に extract (piano_roll と共有)。
 
 /// M14 Phase 61b (#011): caller の `data_generation` は track 構成 (順序 / mute / solo /
 /// volume / name / clip 個数) のみの責務に整理し、 clip 個別の `(id, start_beat, len_beats)`
@@ -4201,44 +4102,8 @@ fn draw_automation_lane<M: ?Sized + 'static>(
     }
 }
 
-fn draw_loop_band<M: ?Sized + 'static>(
-    hctx: &mut HeavyCtx<'_, '_, M>,
-    range: (f64, f64),
-    view: ArrangementView,
-    ruler: Rect,
-    style: &ArrangementStyle,
-) {
-    let (lo, hi) = (range.0.min(range.1), range.0.max(range.1));
-    let beat_to_px = f64::from(ruler.w) / view.len_beats.max(1e-6);
-    #[allow(clippy::cast_possible_truncation)]
-    let x0 = ruler.x + ((lo - view.start_beat) * beat_to_px) as f32;
-    #[allow(clippy::cast_possible_truncation)]
-    let x1 = ruler.x + ((hi - view.start_beat) * beat_to_px) as f32;
-    let band_x = x0.max(ruler.x);
-    let band_w = (x1.min(ruler.x + ruler.w) - band_x).max(0.0);
-    if band_w > 0.0 {
-        push_filled_rect(
-            hctx,
-            Rect { x: band_x, y: ruler.y, w: band_w, h: ruler.h },
-            style.loop_band,
-        );
-    }
-    let hw = style.loop_handle_w * 0.5;
-    if x0 >= ruler.x - hw && x0 <= ruler.x + ruler.w + hw {
-        push_filled_rect(
-            hctx,
-            Rect { x: x0 - hw, y: ruler.y, w: style.loop_handle_w, h: ruler.h },
-            style.loop_handle,
-        );
-    }
-    if x1 >= ruler.x - hw && x1 <= ruler.x + ruler.w + hw {
-        push_filled_rect(
-            hctx,
-            Rect { x: x1 - hw, y: ruler.y, w: style.loop_handle_w, h: ruler.h },
-            style.loop_handle,
-        );
-    }
-}
+// `draw_loop_band` は M14 Phase 69 (#041) で `crate::widgets::ruler_ops::draw_loop_band` に extract
+// (view / style に依存しない汎用形に generalize、 piano_roll と共有)。
 
 // ============================================================
 // Public widget API
@@ -4533,7 +4398,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 // 単一軸で Shift の他用途が無いので loop ops 専用 modifier として再利用する。
                 if shift {
                     let kind = if let Some(range) = view.loop_range {
-                        match loop_band_hit_kind(range, view, ruler, px, 4.0) {
+                        match loop_band_hit_kind(range, view.start_beat, view.len_beats, ruler, px, 4.0) {
                             Some(LoopBandHit::Start) => LoopDragKind::Start,
                             Some(LoopBandHit::End) => LoopDragKind::End,
                             Some(LoopBandHit::Middle) => LoopDragKind::Middle,
@@ -6528,7 +6393,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
             // loop band: drag preview がある場合は preview を描く、無ければ view.loop_range
             if let Some(range) = loop_preview_clone.or(view_copy.loop_range) {
-                draw_loop_band(hctx, range, view_copy, ruler, &style_copy);
+                draw_loop_band(
+                    hctx,
+                    range,
+                    view_copy.start_beat,
+                    view_copy.len_beats,
+                    ruler,
+                    style_copy.loop_band,
+                    style_copy.loop_handle,
+                    style_copy.loop_handle_w,
+                );
             }
             if let Some(b) = view_copy.playhead_beat
                 && b >= view_copy.start_beat
@@ -8269,38 +8143,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn loop_band_hit_kind_start_handle() {
-        let view = test_view();
-        let ruler = Rect { x: 0.0, y: 0.0, w: 640.0, h: 24.0 };
-        // beat_to_px = 40, range=(2, 6) → start_x=80, end_x=240
-        let hit = loop_band_hit_kind((2.0, 6.0), view, ruler, 80.0, 4.0);
-        assert_eq!(hit, Some(LoopBandHit::Start));
-    }
-
-    #[test]
-    fn loop_band_hit_kind_end_handle() {
-        let view = test_view();
-        let ruler = Rect { x: 0.0, y: 0.0, w: 640.0, h: 24.0 };
-        let hit = loop_band_hit_kind((2.0, 6.0), view, ruler, 240.0, 4.0);
-        assert_eq!(hit, Some(LoopBandHit::End));
-    }
-
-    #[test]
-    fn loop_band_hit_kind_middle() {
-        let view = test_view();
-        let ruler = Rect { x: 0.0, y: 0.0, w: 640.0, h: 24.0 };
-        let hit = loop_band_hit_kind((2.0, 6.0), view, ruler, 160.0, 4.0);
-        assert_eq!(hit, Some(LoopBandHit::Middle));
-    }
-
-    #[test]
-    fn loop_band_hit_kind_outside() {
-        let view = test_view();
-        let ruler = Rect { x: 0.0, y: 0.0, w: 640.0, h: 24.0 };
-        let hit = loop_band_hit_kind((2.0, 6.0), view, ruler, 400.0, 4.0);
-        assert_eq!(hit, None);
-    }
+    // `loop_band_hit_kind_*` の test は M14 Phase 69 (#041) で
+    // `crate::widgets::ruler_ops::tests` に extract (piano_roll と共有)。
 
     #[test]
     fn rects_intersect_basic() {
@@ -9472,152 +9316,10 @@ mod tests {
     // ============================================================
     // M14 Phase 63j (#024): loop range edit に snap 適用
     // ============================================================
-
-    fn snap_quarter_beat() -> SnapConfig {
-        // 1 beat snap = SnapMode::Straight { div: 4 }
-        SnapConfig {
-            mode: SnapMode::Straight { div: 4 },
-            enabled: true,
-            min_beat_unit: 1.0 / 128.0,
-            time_sig: (4, 4),
-        }
-    }
-
-    /// `compute_loop_drag_endpoints` の Start drag は moving 端点を grid に snap、 fixed 端点は不変。
-    #[test]
-    fn loop_endpoints_start_drag_snaps_moving_endpoint() {
-        let ld = LoopDragSession {
-            kind: LoopDragKind::Start,
-            anchor_loop: (4.0, 12.0),
-            anchor_press_beat: 4.0,
-            anchor_mouse_x: 0.0,
-            last_mouse_x: 0.0,
-            last_alt: false,
-        };
-        let snap = snap_quarter_beat();
-        // cur_beat raw = 1.7 → snap → 2.0 (1 beat grid に round)、 end は 12.0 不変
-        let (s, e) = compute_loop_drag_endpoints(&ld, 1.7, &snap, 50.0);
-        assert!((s - 2.0).abs() < 1e-6, "Start drag で raw 1.7 → snap 2.0: got {s}");
-        assert!((e - 12.0).abs() < 1e-6, "End は不変 12.0: got {e}");
-    }
-
-    /// End drag は end 端点を grid に snap、 start 端点は不変。
-    #[test]
-    fn loop_endpoints_end_drag_snaps_moving_endpoint() {
-        let ld = LoopDragSession {
-            kind: LoopDragKind::End,
-            anchor_loop: (4.0, 12.0),
-            anchor_press_beat: 12.0,
-            anchor_mouse_x: 0.0,
-            last_mouse_x: 0.0,
-            last_alt: false,
-        };
-        let snap = snap_quarter_beat();
-        // cur_beat raw = 13.4 → snap → 13.0、 start は 4.0 不変
-        let (s, e) = compute_loop_drag_endpoints(&ld, 13.4, &snap, 50.0);
-        assert!((s - 4.0).abs() < 1e-6, "Start は不変 4.0: got {s}");
-        assert!((e - 13.0).abs() < 1e-6, "End drag で raw 13.4 → snap 13.0: got {e}");
-    }
-
-    /// Middle drag は両端点を同 delta で平行移動 (duration 維持)、 delta は anchor_loop.0 が
-    /// grid に着地するよう計算 (Cubase Move 流の絶対位置 snap)。
-    #[test]
-    fn loop_endpoints_middle_drag_preserves_duration_with_snap() {
-        let ld = LoopDragSession {
-            kind: LoopDragKind::Middle,
-            anchor_loop: (4.0, 12.0),
-            anchor_press_beat: 6.0, // press 位置 (anchor_loop 内側のどこか)
-            anchor_mouse_x: 0.0,
-            last_mouse_x: 0.0,
-            last_alt: false,
-        };
-        let snap = snap_quarter_beat();
-        // cur_beat raw = 7.7 → raw_delta = 1.7 → pivot = 4.0、 4.0 + 1.7 = 5.7 → snap → 6.0
-        // → delta = 6.0 - 4.0 = 2.0 → new_range = (4.0+2.0, 12.0+2.0) = (6.0, 14.0)
-        // duration = 14.0 - 6.0 = 8.0 = 元 duration 維持
-        let (s, e) = compute_loop_drag_endpoints(&ld, 7.7, &snap, 50.0);
-        assert!((s - 6.0).abs() < 1e-6, "Middle drag で start は snap 6.0: got {s}");
-        assert!((e - 14.0).abs() < 1e-6, "Middle drag で end も同 delta 移動 14.0: got {e}");
-        assert!(
-            ((e - s) - 8.0).abs() < 1e-6,
-            "duration 8.0 維持: got {}",
-            e - s
-        );
-    }
-
-    /// NewRange は 両端点を independent に snap (anchor_press_beat は press 時 snap 済前提、
-    /// helper は cur_beat だけ snap)、 順序 (min, max) で正規化。
-    #[test]
-    fn loop_endpoints_newrange_snaps_both_endpoints() {
-        // anchor_press_beat = 2.0 (press 時 snap 済の値を caller が渡してくる)
-        let ld = LoopDragSession {
-            kind: LoopDragKind::NewRange,
-            anchor_loop: (2.0, 2.0),
-            anchor_press_beat: 2.0,
-            anchor_mouse_x: 0.0,
-            last_mouse_x: 0.0,
-            last_alt: false,
-        };
-        let snap = snap_quarter_beat();
-        // cur_beat raw = 9.4 → snap → 9.0、 anchor_press = 2.0、 → (2.0, 9.0)
-        let (s, e) = compute_loop_drag_endpoints(&ld, 9.4, &snap, 50.0);
-        assert!((s - 2.0).abs() < 1e-6, "NewRange start = anchor_press 2.0: got {s}");
-        assert!((e - 9.0).abs() < 1e-6, "NewRange end = snap(9.4) = 9.0: got {e}");
-    }
-
-    /// NewRange で cur_beat < anchor_press_beat の場合、 (min, max) 順序で正規化される。
-    #[test]
-    fn loop_endpoints_newrange_normalizes_reversed_drag() {
-        let ld = LoopDragSession {
-            kind: LoopDragKind::NewRange,
-            anchor_loop: (8.0, 8.0),
-            anchor_press_beat: 8.0,
-            anchor_mouse_x: 0.0,
-            last_mouse_x: 0.0,
-            last_alt: false,
-        };
-        let snap = snap_quarter_beat();
-        // 右から左に drag: cur_beat raw = 3.4 → snap → 3.0、 anchor_press = 8.0
-        // → (3.0, 8.0) (min, max で正規化)
-        let (s, e) = compute_loop_drag_endpoints(&ld, 3.4, &snap, 50.0);
-        assert!((s - 3.0).abs() < 1e-6, "右→左 drag でも min が start: got {s}");
-        assert!((e - 8.0).abs() < 1e-6, "max が end: got {e}");
-    }
-
-    /// `last_alt = true` で snap 一時無効、 raw 値が通る (`MoveClips` 同 policy)。
-    #[test]
-    fn loop_endpoints_alt_bypasses_snap() {
-        let ld = LoopDragSession {
-            kind: LoopDragKind::End,
-            anchor_loop: (4.0, 12.0),
-            anchor_press_beat: 12.0,
-            anchor_mouse_x: 0.0,
-            last_mouse_x: 0.0,
-            last_alt: true, // alt 押下中は snap 無効
-        };
-        let snap = snap_quarter_beat();
-        // cur_beat raw = 13.4 → alt bypass → 13.4 そのまま
-        let (s, e) = compute_loop_drag_endpoints(&ld, 13.4, &snap, 50.0);
-        assert!((s - 4.0).abs() < 1e-6, "Start は不変 4.0: got {s}");
-        assert!((e - 13.4).abs() < 1e-6, "alt bypass で raw 13.4 そのまま: got {e}");
-    }
-
-    /// snap OFF 時は raw 値が通る (regression: 既存の non-snap caller を壊さない)。
-    #[test]
-    fn loop_endpoints_snap_off_returns_raw() {
-        let ld = LoopDragSession {
-            kind: LoopDragKind::Start,
-            anchor_loop: (4.0, 12.0),
-            anchor_press_beat: 4.0,
-            anchor_mouse_x: 0.0,
-            last_mouse_x: 0.0,
-            last_alt: false,
-        };
-        // cur_beat raw = 2.345 → snap OFF なので 2.345 そのまま
-        let (s, e) = compute_loop_drag_endpoints(&ld, 2.345, &SnapConfig::OFF, 50.0);
-        assert!((s - 2.345).abs() < 1e-6, "snap OFF で raw 通過: got {s}");
-        assert!((e - 12.0).abs() < 1e-6, "End は不変: got {e}");
-    }
+    //
+    // `compute_loop_drag_endpoints` の unit test 7 件 (Start/End/Middle/NewRange の
+    // snap 適用 / alt bypass / snap OFF) は M14 Phase 69 (#041) で
+    // `crate::widgets::ruler_ops::tests` に extract (piano_roll と共有)。
 
     /// Shift+ruler drag → SetLoopRange が release frame で snap 適用済 endpoints で発火する
     /// (整合性確認: NewRange、 press → drag → release の 3 frame 経由)。

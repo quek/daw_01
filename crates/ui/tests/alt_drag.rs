@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use daw_ui_core::{
     ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView,
-    Edit, FrameInput, MoveClipDelta, MoveDelta, Note, NotesEditRequest, PianoRollStyle,
+    Edit, FrameInput, MoveClipDelta, MoveDelta, Note, PianoRollEditRequest, PianoRollStyle,
     PianoRollView, PointerFrame, SnapConfig, SnapMode, UiHost,
 };
 use daw_ui_platform::{Modifiers, PhysicalSize};
@@ -468,6 +468,7 @@ fn pr_view(snap: SnapConfig) -> PianoRollView {
         bpm: 120.0,
         time_sig: (4, 4),
         snap,
+        loop_range: None,
     }
 }
 
@@ -488,10 +489,10 @@ fn pr_frame(host: &mut UiHost<PrModel>, m: &mut PrModel, input: FrameInput, snap
     host.frame(m, &mut scene, screen, input, |model, ui| {
         ui.piano_roll("pr", WIDGET_RECT, &model.notes, view, &model.selected, &style, |req| {
             match req {
-                NotesEditRequest::Select { next, .. } => Edit::mutate(move |mm: &mut PrModel| {
+                PianoRollEditRequest::Select { next, .. } => Edit::mutate(move |mm: &mut PrModel| {
                     mm.selected = next;
                 }),
-                NotesEditRequest::Move(deltas) => Edit::mutate(move |mm: &mut PrModel| {
+                PianoRollEditRequest::Move(deltas) => Edit::mutate(move |mm: &mut PrModel| {
                     mm.last_move = Some(deltas);
                 }),
                 _ => Edit::mutate(|_| {}),

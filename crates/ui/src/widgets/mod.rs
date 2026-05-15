@@ -22,6 +22,7 @@ pub mod panel;
 pub mod piano_roll;
 pub mod playhead;
 pub mod reorderable_list;
+pub mod ruler_ops;
 pub mod scroll_area;
 pub mod scrubable_number;
 pub mod split_view;
