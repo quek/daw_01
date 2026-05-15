@@ -710,6 +710,19 @@ pub struct AppData {
     pub step_cursor_beat: f64,
     pub step_size_beats: f64,
 
+    /// Phase 7 B5 (`docs/plan_scale.html` §5.1): Snap on Draw toggle。 ON のとき
+    /// piano_roll で note 追加時の pitch を `Song.scale_at(beat).snap(pitch)` で
+    /// in-scale に寄せる。 piano_roll header の toggle で切替 (S3 wire 後)、
+    /// session-only state (project save しない)。 Highlight mode が前提
+    /// (Fold mode は widget 側で既に in-scale pitch を push する)。
+    pub snap_on_draw: bool,
+    /// Phase 7 B5 (`docs/plan_scale.html` §5.2): Snap Live Input toggle。 ON
+    /// のとき MIDI 録音中の note_on pitch を `Song.scale_at(playhead).snap(pitch)`
+    /// で in-scale に寄せる。 transport bar の toggle で切替、 session-only
+    /// state。 step input (recording 停止中の MIDI input) には適用しない
+    /// (= pitch を「聞いて」 決める用途、 Cubase / Bitwig も同方針)。
+    pub snap_live_input: bool,
+
     /// 背景スレッド (autosave / playhead poll / MIDI / IPC bridge / VOICEVOX
     /// 合成 / plugin DB rescan) からメインスレッドへ `AppEvent` を送るための
     /// dispatcher。 production は `WinitDispatcher` (winit `EventLoopProxy`
@@ -886,6 +899,8 @@ impl AppData {
             midi_input_label: String::new(),
             step_cursor_beat: 0.0,
             step_size_beats: DEFAULT_NOTE_DURATION,
+            snap_on_draw: false,
+            snap_live_input: false,
             event_proxy,
         };
         // recent_files / recent_saved の path 列から filename label cache を
@@ -1483,6 +1498,12 @@ impl AppData {
                 // を上書きする structural change なので Undo step 化。
                 | AppEvent::SetAutomationCurveBezierTension { .. }
                 | AppEvent::SetAutomationCurveExponentialBend { .. }
+                // Phase 7 B5 (`docs/plan_scale.html`): scale event 編集と
+                // pitch quantize は構造変化系として Undo step 化。 Snap on
+                // Draw / Snap Live Input toggle は session-only で除外。
+                | AppEvent::SetScaleAtPlayhead { .. }
+                | AppEvent::ClearScaleChanges
+                | AppEvent::QuantizePitchesToScale(_)
         )
     }
 
@@ -2636,6 +2657,43 @@ pub enum AppEvent {
         clip: ClipRef,
         event_idx: usize,
     },
+
+    // -------- Phase 7 B5 (`docs/plan_scale.html`): Scale & Root ------------
+    /// 現在 playhead 位置で active な scale event を `(root, scale)` で更新。
+    /// `scale_changes` が空なら beat=0 の event を新規追加 (`plan §4.1`)。
+    /// 空でなければ `Song::scale_at(playhead)` で見つかる event を update。
+    /// undoable (= 1 dropdown commit = 1 Undo step)。
+    SetScaleAtPlayhead {
+        root: u8,
+        scale: common::scale::Scale,
+    },
+    /// 全 scale event を削除 (= Scale 機能 OFF / chromatic に戻す)。
+    /// Transport bar の root dropdown で「— (No Key)」 を選んだとき発火。
+    /// undoable。
+    ClearScaleChanges,
+    /// 既存ノートの pitch を最寄りの in-scale pitch に一括補正。
+    /// 対象は `QuantizePitchTarget`。 各 note の `pitch = scale_at(note の
+    /// song-global beat).snap(pitch)` で書き換え (note の start_beat 時点の
+    /// scale を尊重 = 転調をまたぐ note も自然に補正される)。 1 操作 1 Undo
+    /// step。 piano_roll の右クリック menu / inspector ボタン経由で発火。
+    QuantizePitchesToScale(QuantizePitchTarget),
+    /// Snap on Draw toggle (session-only)。 piano_roll header の toggle で
+    /// 切替。 Undo 非対象 (= session 設定)。
+    ToggleSnapOnDraw,
+    /// Snap Live Input toggle (session-only)。 transport bar の toggle で
+    /// 切替。 Undo 非対象。
+    ToggleSnapLiveInput,
+}
+
+/// Phase 7 B5: `QuantizePitchesToScale` の対象スコープ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantizePitchTarget {
+    /// `selected_clip` + `selected_notes` の note を quantize。 piano_roll で
+    /// 範囲選択した note の一括補正。
+    SelectedNotes,
+    /// `selected_clip` の全 note を quantize (note 選択不要)。 piano_roll header
+    /// or arrangement clip 右クリック「Quantize all to Scale」 等から発火。
+    SelectedClipAllNotes,
 }
 
 /// `*Batch` 系 AppEvent で fade in / out を区別するための marker。
@@ -3540,6 +3598,21 @@ impl AppData {
             }
             AppEvent::MakeClipUnique(target) => {
                 self.make_clip_unique(target);
+            }
+            AppEvent::SetScaleAtPlayhead { root, scale } => {
+                self.set_scale_at_playhead(root, scale);
+            }
+            AppEvent::ClearScaleChanges => {
+                self.song.scale_changes.clear();
+            }
+            AppEvent::QuantizePitchesToScale(target) => {
+                self.quantize_pitches_to_scale(target);
+            }
+            AppEvent::ToggleSnapOnDraw => {
+                self.snap_on_draw = !self.snap_on_draw;
+            }
+            AppEvent::ToggleSnapLiveInput => {
+                self.snap_live_input = !self.snap_live_input;
             }
         }
     }
@@ -6466,6 +6539,18 @@ impl AppData {
         if playhead < 0.0 {
             return;
         }
+        // Phase 7 B5 (`docs/plan_scale.html` §5.2): Snap Live Input。
+        // note_off も同じ snap を適用するので、 deterministic snap で
+        // (track_id, pitch) lookup が整合する。 step input は別 path
+        // (`step_input_note_on`) を経由するのでここの snap は録音時のみ。
+        let pitch = if self.snap_live_input {
+            self.song
+                .scale_at(playhead)
+                .map(|sc| sc.snap(pitch))
+                .unwrap_or(pitch)
+        } else {
+            pitch
+        };
         let armed_ids: Vec<u32> = self
             .song
             .tracks
@@ -6508,6 +6593,17 @@ impl AppData {
     fn record_midi_note_off(&mut self, pitch: u8) {
         let playhead =
             self.playhead_beat.map(f64::from).unwrap_or(0.0);
+        // Phase 7 B5: note_on 側で snap した pitch で active_notes に登録して
+        // いるので、 note_off の lookup key も同じ snap を適用。 snap は
+        // deterministic なので転調を跨がない note なら lookup は必ず hit する。
+        let pitch = if self.snap_live_input {
+            self.song
+                .scale_at(playhead)
+                .map(|sc| sc.snap(pitch))
+                .unwrap_or(pitch)
+        } else {
+            pitch
+        };
         let armed_ids: Vec<u32> = self
             .song
             .tracks
@@ -8547,6 +8643,111 @@ impl AppData {
         }
     }
 
+    // -------- Phase 7 B5 (`docs/plan_scale.html`): Scale operations -------
+
+    /// Transport bar の root / scale dropdown commit handler。
+    /// `scale_changes` が空なら beat=0 で新規追加、 そうでなければ
+    /// `scale_at(playhead)` で見つかる event を update。 plan §4.1 と一致。
+    fn set_scale_at_playhead(&mut self, root: u8, scale: common::scale::Scale) {
+        let playhead = self
+            .playhead_beat
+            .map(f64::from)
+            .unwrap_or(0.0)
+            .max(0.0);
+        let root = root.min(11);
+        if self.song.scale_changes.is_empty() {
+            self.song.scale_changes.push(common::scale::ScaleChange {
+                beat: 0.0,
+                root,
+                scale,
+            });
+            return;
+        }
+        // `scale_at` の semantics に合わせて「playhead 以下の最新 event」
+        // を update。 playhead 未満の event が無ければ最初の event を update
+        // (Cubase Transport の Chord Track edit と同じ idiom)。
+        let target_idx = self
+            .song
+            .scale_changes
+            .iter()
+            .rposition(|c| c.beat <= playhead)
+            .unwrap_or(0);
+        if let Some(ev) = self.song.scale_changes.get_mut(target_idx) {
+            ev.root = root;
+            ev.scale = scale;
+        }
+    }
+
+    /// `selected_clip` の note の pitch を最寄り in-scale に一括補正。
+    /// 各 note の start_beat 時点の scale を尊重 (転調をまたぐ note は
+    /// それぞれの local scale で snap される)。
+    fn quantize_pitches_to_scale(&mut self, target: QuantizePitchTarget) {
+        let Some(r) = self.selected_clip else {
+            return;
+        };
+        if self.song.scale_changes.is_empty() {
+            self.status_message =
+                "Scale が設定されていません (Transport bar の Key dropdown で設定)".to_string();
+            return;
+        }
+        let Some(track) = self.song.tracks.get(r.track as usize) else {
+            return;
+        };
+        let Some(clip) = track.clips.get(r.clip as usize) else {
+            return;
+        };
+        let clip_start_beat = clip.start_beat;
+        // immutable borrow で snap 計算を済ませてから可変借用に切り替える
+        // (= borrow checker 衝突回避)。 `Song::clip_notes` は `Clip` を経由する
+        // shared note 取得 helper、 mutable 版は `notes_in_clip_mut`。
+        let snaps: Vec<(u32, u8)> = {
+            let notes = self.song.clip_notes(clip);
+            let target_indices: Vec<u32> = match target {
+                QuantizePitchTarget::SelectedNotes => self.selected_notes.clone(),
+                QuantizePitchTarget::SelectedClipAllNotes => {
+                    (0..notes.len() as u32).collect()
+                }
+            };
+            target_indices
+                .iter()
+                .filter_map(|&i| {
+                    let n = notes.get(i as usize)?;
+                    let global_beat = clip_start_beat + n.start_beat;
+                    let new_pitch = self
+                        .song
+                        .scale_at(global_beat)
+                        .map(|sc| sc.snap(n.pitch))
+                        .unwrap_or(n.pitch);
+                    if new_pitch != n.pitch {
+                        Some((i, new_pitch))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        let count = snaps.len();
+        if count == 0 {
+            self.status_message =
+                "対象 note は既に in-scale です".to_string();
+            return;
+        }
+        if let Some(notes) = self
+            .song
+            .notes_in_clip_mut(r.track as usize, r.clip as usize)
+        {
+            for (i, new_pitch) in snaps {
+                if let Some(n) = notes.get_mut(i as usize) {
+                    n.pitch = new_pitch;
+                }
+            }
+        }
+        self.status_message =
+            format!("{count} 件の note を scale に補正しました");
+        self.sync_song_to_plugin_host();
+        self.pianoroll_notes_generation += 1;
+    }
+
     fn add_note(
         &mut self,
         track_idx: u32,
@@ -8557,6 +8758,25 @@ impl AppData {
     ) {
         let start_beat = start_beat.max(0.0);
         let duration = duration.max(0.0625);
+        // Phase 7 B5 (`docs/plan_scale.html` §5.1): Snap on Draw。
+        // scale_changes が空なら scale_at が None → unwrap_or で raw pitch
+        // 維持 = 機能 OFF と同じ挙動。
+        let pitch = if self.snap_on_draw {
+            let clip_start_beat = self
+                .song
+                .tracks
+                .get(track_idx as usize)
+                .and_then(|t| t.clips.get(clip_idx as usize))
+                .map(|c| c.start_beat)
+                .unwrap_or(0.0);
+            let global_beat = clip_start_beat + start_beat;
+            self.song
+                .scale_at(global_beat)
+                .map(|sc| sc.snap(pitch))
+                .unwrap_or(pitch)
+        } else {
+            pitch
+        };
         let Some(notes) = self
             .song
             .notes_in_clip_mut(track_idx as usize, clip_idx as usize)

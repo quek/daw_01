@@ -233,6 +233,89 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
     x += ts_den_w + 12.0;
 
+    // Phase 7 B5 (`docs/plan_scale.html` §4.1): Key (root + scale) dropdown。
+    // playhead 位置の `Song::scale_at` を表示、 root を "—" にすると
+    // `ClearScaleChanges` で機能 OFF。 root + scale 別 dropdown は Bitwig /
+    // Cubase と同 idiom (root: 12 pitch class + Off、 scale: 22 内蔵)。
+    ui.label_at(
+        "transport_key_label",
+        "Key",
+        x,
+        area.y + (area.h - 12.0) * 0.5,
+        12.0,
+        TEXT,
+    );
+    x += 28.0;
+
+    let playhead_for_scale = app.playhead_beat.map(f64::from).unwrap_or(0.0).max(0.0);
+    let cur_scale_change = app.song.scale_at(playhead_for_scale).copied();
+    let cur_root_idx = cur_scale_change
+        .map(|sc| sc.root.min(11) as usize + 1)
+        .unwrap_or(0); // 0 = "—" (OFF)
+    let cur_scale_idx = cur_scale_change
+        .and_then(|sc| {
+            common::scale::Scale::ALL_PRESETS
+                .iter()
+                .position(|&s| s == sc.scale)
+        })
+        .unwrap_or(0);
+
+    const ROOT_ITEMS: &[&str] = &[
+        "—", "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    let root_w = 50.0;
+    if let Some(idx) = ui.dropdown(
+        "transport_key_root",
+        Rect { x, y: cy, w: root_w, h: bh },
+        ROOT_ITEMS,
+        cur_root_idx,
+    ) {
+        if idx == 0 {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::ClearScaleChanges)
+            }));
+        } else {
+            let new_root = (idx - 1) as u8;
+            // 既存 scale を維持 (= 空なら Major default)
+            let scale = cur_scale_change
+                .map(|sc| sc.scale)
+                .unwrap_or(common::scale::Scale::Major);
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetScaleAtPlayhead {
+                    root: new_root,
+                    scale,
+                })
+            }));
+        }
+    }
+    x += root_w + 4.0;
+
+    let scale_names: Vec<&str> = common::scale::Scale::ALL_PRESETS
+        .iter()
+        .map(|s| s.display_name())
+        .collect();
+    let scale_w = 124.0;
+    if let Some(idx) = ui.dropdown(
+        "transport_key_scale",
+        Rect { x, y: cy, w: scale_w, h: bh },
+        &scale_names,
+        cur_scale_idx,
+    ) {
+        let new_scale = common::scale::Scale::ALL_PRESETS
+            .get(idx)
+            .copied()
+            .unwrap_or(common::scale::Scale::Major);
+        // 既存 root を維持 (= 空なら C default)
+        let root = cur_scale_change.map(|sc| sc.root).unwrap_or(0);
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::SetScaleAtPlayhead {
+                root,
+                scale: new_scale,
+            })
+        }));
+    }
+    x += scale_w + 12.0;
+
     // Play/Stop
     let play_w = 64.0;
     ui.button_at(
@@ -344,7 +427,26 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             })
         },
     );
-    x += rec_w + 12.0;
+    x += rec_w + 6.0;
+
+    // Phase 7 B5 (`docs/plan_scale.html` §5.2): Snap Live Input toggle。
+    // ON で MIDI 録音中の note_on pitch を Song.scale_at(playhead).snap(pitch)
+    // で in-scale に寄せる。 session-only state、 step input は適用外。
+    let snap_live_w = 90.0;
+    let snap_live_active = app.snap_live_input;
+    ui.toggle_button_at(
+        "transport_snap_live",
+        "Snap Live",
+        Rect { x, y: cy, w: snap_live_w, h: bh },
+        snap_live_active,
+        &STYLE_REC_MODE,
+        move |_| {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ToggleSnapLiveInput)
+            })
+        },
+    );
+    x += snap_live_w + 12.0;
 
     // Phase 7 B1-M Step 2 (2026-05-13): MIDI Learn toggle button。 inactive
     // 時 click で「次の MIDI CC を selected_track の Volume に bind」 (=

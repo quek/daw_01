@@ -104,6 +104,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         time_sig: app.song.time_sig,
         snap: snap::piano_roll_snap_config(app),
         loop_range,
+        // Phase 7 B5 (gui_01 #042 Phase 70 WIP): scale highlight/fold wire は
+        // 別 PR (S3) で実装。 ここでは旧挙動互換に保つために None 固定。
+        scale: None,
     };
     let style = PianoRollStyle::default();
     let resize_handle_px = style.resize_handle_px;
