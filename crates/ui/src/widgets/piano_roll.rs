@@ -527,17 +527,20 @@ impl Default for PianoRollStyle {
             loop_band: Color::rgba(0.50, 0.85, 1.0, 0.20),
             loop_handle: Color::rgb(0.50, 0.85, 1.0),
             loop_handle_w: 2.0,
-            // M14 Phase 70 / daw_01 #042: Bitwig 風 warm-yellow tint (root 行) + 黒 dim (out 行)。
-            // root_row_overlay: alpha 0.18 で bg (0.18) と乗算後 ≈ (0.30, 0.27, 0.18) 程度の warm
-            // (= 白鍵レーンに馴染む暖色)。 黒鍵レーン (0.13 程度) に重ねても tint が見える強度。
-            root_row_overlay: Color::rgba(1.0, 0.80, 0.30, 0.18),
-            // out_of_scale_row_overlay: alpha 0.32 で bg (0.18) を ≈ (0.12) 程度に dim。 dim 強度は
-            // 「在ることが分かる程度」 でやりすぎないのが Bitwig / Ableton 流。
-            out_of_scale_row_overlay: Color::rgba(0.0, 0.0, 0.0, 0.32),
-            // 鍵盤レーンラベル色: root は warm-yellow を強調 (0.95, 0.78, 0.40)、 in-scale は通常
-            // (= 既存 c_label_color と同色、 0.30 程度)、 out-of-scale は dim (0.20 程度)。
+            // M14 Phase 70 / daw_01 #042 + 70a (follow-up): Bitwig 風 warm-yellow tint (root 行)
+            // + 黒 dim (out 行)。 alpha は daw_01 実機 smoke test (#042 follow-up) で「白鍵 row 上
+            // の root tint が見えない / 黒鍵 row との dim 差が 0.015 で out 認識が立たない」 指摘
+            // を受けて引き上げ済。 control: dark theme (widget bg 0.18、 黒鍵 row ≈ 0.135) で
+            // 「在ることが分かる」 を最低基準にする。 alpha 0.18 / 0.32 だと不可視レベル。
+            root_row_overlay: Color::rgba(1.0, 0.80, 0.30, 0.32),
+            // out_of_scale_row_overlay: alpha 0.50 で 黒鍵 row との差が ≈ 0.045 に拡大、 dim 認識成立。
+            out_of_scale_row_overlay: Color::rgba(0.0, 0.0, 0.0, 0.50),
+            // 鍵盤レーンラベル色: root は warm-yellow を強調 (0.95, 0.78, 0.40)、 in-scale は Fold
+            // mode で全行に label が出るため keyboard_bg (0.22) 上で読める明度 (0.78〜0.85)、
+            // out-of-scale は dim (0.45 程度、 Highlight mode で root 行以外の label 描画は v0 では
+            // 出ないが、 将来「全 12 行 label」 拡張用に予約)。
             root_label_fg: Color::rgb(0.95, 0.78, 0.40),
-            in_scale_label_fg: Color::rgb(0.30, 0.30, 0.35),
+            in_scale_label_fg: Color::rgb(0.78, 0.80, 0.85),
             out_of_scale_label_fg: Color::rgb(0.45, 0.45, 0.50),
         }
     }
