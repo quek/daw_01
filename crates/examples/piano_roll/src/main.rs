@@ -638,11 +638,11 @@ impl App {
                             });
                         let new_root = (cur.root + 1) % 12;
                         m.scale = Some(daw_ui_core::PianoRollScale { root: new_root, ..cur });
-                        const NAMES: [&str; 12] = [
-                            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-                        ];
-                        m.last_action =
-                            format!("scale root → {} ({:?})", NAMES[new_root as usize], cur.mode);
+                        m.last_action = format!(
+                            "scale root → {} ({:?})",
+                            daw_ui_core::pitch_class_name(new_root),
+                            cur.mode
+                        );
                     }));
                 }
 
