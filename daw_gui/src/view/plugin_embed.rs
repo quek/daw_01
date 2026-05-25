@@ -207,7 +207,10 @@ unsafe fn register_class() -> windows::core::Result<(u16, Vec<u16>)> {
     };
     let atom = unsafe { windows::Win32::UI::WindowsAndMessaging::RegisterClassExW(&wc) };
     if atom == 0 {
-        return Err(windows::core::Error::from_win32());
+        // windows-result 0.4 (= windows 0.62) renamed `from_win32` to
+        // `from_thread` (= reads the calling thread's last-error code
+        // via `GetLastError`, same semantics).
+        return Err(windows::core::Error::from_thread());
     }
     Ok((atom, name))
 }

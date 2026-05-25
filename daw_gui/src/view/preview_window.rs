@@ -102,36 +102,89 @@ impl PreviewWindowState {
         })
     }
 
-    /// Upload a freshly-decoded RGBA frame for `source_id`. Reuses
-    /// the existing `TextureHandle` when the dimensions match (=
-    /// hot path during playback / scrub); destroys + re-creates only
-    /// when the source's native size changed (= rare, would mean
-    /// the project's video sources were re-imported).
+    /// Upload (or `Shared` import) a freshly-decoded frame for
+    /// `source_id`. Reuses the existing `TextureHandle` when the
+    /// dimensions match (= hot path during playback / scrub); on a
+    /// dimension change (= rare, would mean the project's video
+    /// sources were re-imported) destroys and re-creates the texture.
+    ///
+    /// docs/plan_video_perf.md P3 (2026-05-25): two paths, dispatched
+    /// on the `DecodedFrame` variant:
+    ///
+    /// - `Shared` (zero-copy): on first frame for a `source_id`, calls
+    ///   `Renderer::create_texture_from_d3d11_shared_handle` and
+    ///   caches the resulting wgpu `TextureHandle`. Subsequent frames
+    ///   for the same source do nothing (= the underlying D3D11
+    ///   resource is overwritten in place by the worker; wgpu samples
+    ///   the latest content automatically).
+    /// - `Bgra` (CPU fallback, P2): uses gui_01 Phase 73's
+    ///   `create_texture_bgra` + `upload_texture_bgra` so the WMF
+    ///   decoder's BGRA bytes go straight to a `Bgra8UnormSrgb` wgpu
+    ///   texture — no CPU channel swap.
     pub fn upload_frame(
         &mut self,
         source_id: common::model::VideoSourceId,
-        width: u32,
-        height: u32,
-        rgba: &[u8],
-    ) -> TextureHandle {
-        let recreate = match self.frame_textures.get(&source_id) {
-            Some((_, w, h)) => *w != width || *h != height,
-            None => true,
-        };
-        if recreate {
-            if let Some((old, _, _)) = self.frame_textures.remove(&source_id) {
-                self.renderer.destroy_texture(old);
+        frame: &crate::video_playback::DecodedFrame,
+    ) -> Option<TextureHandle> {
+        use crate::video_playback::DecodedFrame;
+        match frame {
+            DecodedFrame::Shared { width, height, handle } => {
+                if let Some((_, w, h)) = self.frame_textures.get(&source_id)
+                    && *w == *width
+                    && *h == *height
+                {
+                    // Already imported — the worker writes new content
+                    // into the same underlying D3D11 resource on every
+                    // frame, so nothing for us to do here.
+                    return self.frame_textures.get(&source_id).map(|(h, _, _)| *h);
+                }
+                // First frame for this source (or dimensions changed):
+                // import the DXGI shared NT handle into wgpu's texture
+                // pool exactly once.
+                if let Some((old, _, _)) = self.frame_textures.remove(&source_id) {
+                    self.renderer.destroy_texture(old);
+                }
+                match self.renderer.create_texture_from_d3d11_shared_handle(
+                    handle.0,
+                    wgpu::TextureFormat::Bgra8UnormSrgb,
+                    *width,
+                    *height,
+                ) {
+                    Ok(tex) => {
+                        self.frame_textures.insert(source_id, (tex, *width, *height));
+                        Some(tex)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            video_source_id = source_id,
+                            "create_texture_from_d3d11_shared_handle failed"
+                        );
+                        None
+                    }
+                }
             }
-            let h = self.renderer.create_texture(width, height);
-            self.frame_textures.insert(source_id, (h, width, height));
+            DecodedFrame::Bgra { width, height, bgra } => {
+                let recreate = match self.frame_textures.get(&source_id) {
+                    Some((_, w, h)) => *w != *width || *h != *height,
+                    None => true,
+                };
+                if recreate {
+                    if let Some((old, _, _)) = self.frame_textures.remove(&source_id) {
+                        self.renderer.destroy_texture(old);
+                    }
+                    let h = self.renderer.create_texture_bgra(*width, *height);
+                    self.frame_textures.insert(source_id, (h, *width, *height));
+                }
+                let handle = self
+                    .frame_textures
+                    .get(&source_id)
+                    .map(|(h, _, _)| *h)
+                    .expect("just inserted");
+                self.renderer.upload_texture_bgra(handle, bgra);
+                Some(handle)
+            }
         }
-        let handle = self
-            .frame_textures
-            .get(&source_id)
-            .map(|(h, _, _)| *h)
-            .expect("just inserted");
-        self.renderer.upload_texture_rgba(handle, rgba);
-        handle
     }
 
     /// Drop every cached frame texture and clear the composite list

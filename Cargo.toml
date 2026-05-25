@@ -32,9 +32,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 reqwest = { version = "0.12", features = ["blocking"] }
 vst3 = "0.3"
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media_MediaFoundation", "Win32_Security", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Variant", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D10", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Media_MediaFoundation", "Win32_Security", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Variant", "Win32_UI_WindowsAndMessaging"] }
 daw-ui-platform = { path = "../gui_01/crates/platform" }
 daw-ui-renderer = { path = "../gui_01/crates/renderer" }
 daw-ui-core = { path = "../gui_01/crates/ui" }
 winit = "0.30.13"
 raw-window-handle = "0.6.2"
+# Match gui_01 (crates/renderer/Cargo.toml) — passing `wgpu::TextureFormat`
+# across the API boundary needs the same crate version, otherwise the
+# nominal types are incompatible at the language level.
+wgpu = "29.0.1"

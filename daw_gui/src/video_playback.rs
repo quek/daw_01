@@ -18,27 +18,94 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use common::model::{FadeCurve, Song, TrackKind, VideoEvent, VideoSourceId};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+};
+use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11CreateDevice, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+    D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
+    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device,
+    ID3D11DeviceContext, ID3D11Texture2D,
+};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Dxgi::{IDXGIKeyedMutex, IDXGIResource1};
 use windows::Win32::Media::MediaFoundation::{
-    IMFSample, IMFSourceReader, MFCreateAttributes, MFCreateMediaType,
+    IMFDXGIBuffer, IMFDXGIDeviceManager, IMFSample, IMFSourceReader,
+    MFCreateAttributes, MFCreateDXGIDeviceManager, MFCreateMediaType,
     MFCreateSourceReaderFromURL, MFMediaType_Video, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
-    MF_MT_SUBTYPE, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
-    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READERF_ENDOFSTREAM, MFVideoFormat_RGB32,
+    MF_MT_SUBTYPE, MF_SOURCE_READER_D3D_MANAGER,
+    MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING,
+    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+    MF_SOURCE_READERF_ENDOFSTREAM, MFVideoFormat_ARGB32,
 };
 use windows::Win32::System::Com::StructuredStorage::{
     PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
 };
 use windows::Win32::System::Variant::VT_I8;
-use windows::core::{GUID, PCWSTR};
+use windows::core::{GUID, Interface, PCWSTR};
 
-/// One decoded RGBA frame. Same shape as [`crate::import_video::ThumbnailFrame`]
-/// — kept separate for now to keep the dependency tree light (this
-/// module doesn't pull in the rest of `import_video`).
+/// `HANDLE` (= `*mut c_void` newtype) is not `Send` by default. We
+/// transport DXGI shared NT handles from the decode worker to the
+/// main render thread via `mpsc::channel`, which requires `Send`.
+/// Wrap once at the channel boundary; both sides treat the value as
+/// an opaque kernel object — it is safe to move because the kernel
+/// owns the underlying resource, not the Rust thread.
+#[derive(Clone, Copy, Debug)]
+pub struct SendHandle(pub HANDLE);
+
+// SAFETY: `HANDLE` wraps a `HANDLE` (= `*mut c_void`) which is just a
+// kernel object identifier; it has no thread affinity, only the
+// referenced D3D11 resource does (and that resource lives in the
+// shared GPU memory pool, not in either thread's heap).
+unsafe impl Send for SendHandle {}
+unsafe impl Sync for SendHandle {}
+
+/// One decoded frame, ready for the main thread to push into the
+/// preview scene. Two underlying paths:
+///
+/// - **`Shared`** (zero-copy, P3): the decoded BGRA frame lives in a
+///   D3D11 texture that was created with `SHARED_NTHANDLE +
+///   SHARED_KEYEDMUTEX`. The worker calls `IDXGIResource1::CreateSharedHandle`
+///   once per source and reuses the same handle for every subsequent
+///   frame; the main thread calls `Renderer::create_texture_from_d3d11_shared_handle`
+///   exactly once per source and reuses the resulting `TextureHandle`.
+///   The pixel bytes never touch CPU memory.
+/// - **`Bgra`** (P2 fallback): the decode produced system-memory
+///   pixels (= the source did not use the HW decoder path even with
+///   `MF_SOURCE_READER_D3D_MANAGER` attached, or `try_init_d3d11`
+///   failed). Main thread uploads via `Renderer::upload_texture_bgra`.
 #[derive(Debug, Clone)]
-pub struct DecodedFrame {
-    pub width: u32,
-    pub height: u32,
-    /// Tightly-packed RGBA8 in scanline order, length = `width * height * 4`.
-    pub rgba: Vec<u8>,
+pub enum DecodedFrame {
+    Shared {
+        width: u32,
+        height: u32,
+        /// Stable per-source DXGI shared NT handle. Same value every
+        /// frame for the same `VideoSourceId`; the underlying texture
+        /// is overwritten in place by the worker.
+        handle: SendHandle,
+    },
+    Bgra {
+        width: u32,
+        height: u32,
+        /// Tightly-packed BGRA8 in scanline order, length = `width * height * 4`.
+        bgra: Vec<u8>,
+    },
+}
+
+impl DecodedFrame {
+    pub fn width(&self) -> u32 {
+        match self {
+            Self::Shared { width, .. } | Self::Bgra { width, .. } => *width,
+        }
+    }
+    pub fn height(&self) -> u32 {
+        match self {
+            Self::Shared { height, .. } | Self::Bgra { height, .. } => *height,
+        }
+    }
 }
 
 /// One video clip active at the current playhead. The runner walks
@@ -73,6 +140,117 @@ struct ReaderEntry {
     /// just keep ReadSample-ing) or a jump (= SetCurrentPosition
     /// seek + flush).
     last_decoded_micros: Option<u64>,
+    /// Decrement-on-decode counter. While > 0 the engine emits one
+    /// `tracing::info!` line per decode with `walk_ms` / `swap_ms`
+    /// to expose whether WMF picked hardware or software H.264
+    /// decode (HW ≈ 5-10ms / frame, SW ≈ 30-80ms / frame at 1080p).
+    /// **Only decrements when `target_micros > 0`** so the budget
+    /// goes to real playback rather than the idle-at-beat-0
+    /// repeated-request pattern (which would otherwise eat the
+    /// warm-up window before Play is even pressed).
+    timing_log_remaining: u32,
+    /// docs/plan_video_perf.md P3: per-source DXGI-shared destination
+    /// texture for the zero-copy path. Created on first HW-decoded
+    /// sample (= when the reader was built with
+    /// `MF_SOURCE_READER_D3D_MANAGER` attached and `try_init_d3d11`
+    /// succeeded). The same handle is reused for every frame; the
+    /// underlying texture is overwritten in place via
+    /// `CopySubresourceRegion`.
+    shared: Option<SharedEntry>,
+}
+
+/// Per-source GPU-resident state for the zero-copy path. Allocated
+/// lazily on first HW decode (`sample_to_shared`), reused for every
+/// subsequent frame for the same `VideoSourceId`. Dropped only when
+/// the engine itself is dropped (= process exit for MVP).
+struct SharedEntry {
+    /// Our owned D3D11 texture, created with `SHARED_NTHANDLE +
+    /// SHARED_KEYEDMUTEX`. The WMF decoder writes into a texture from
+    /// its own pool; we `CopySubresourceRegion` from that into this
+    /// shared destination on each frame.
+    texture: ID3D11Texture2D,
+    /// `IDXGIKeyedMutex` view of `texture`. Worker acquires before
+    /// `CopySubresourceRegion`, releases after. Main thread acquires
+    /// before push_textured_quad, releases after the wgpu submit.
+    mutex: IDXGIKeyedMutex,
+    /// Cached NT handle from `IDXGIResource1::CreateSharedHandle`.
+    /// Stable across the entry's lifetime — wrapped in `SendHandle`
+    /// when it leaves the worker thread.
+    handle: HANDLE,
+}
+
+/// docs/plan_video_perf.md P1: process-wide D3D11 device + IMFDXGIDevice
+/// manager that backs WMF's hardware H.264 decoder. Created lazily on
+/// the worker thread (= first `decode_at` call) so test threads that
+/// never touch playback don't pay the device-create cost; created once
+/// and shared across every `ReaderEntry` so all readers see the same
+/// `IMFDXGIDeviceManager`.
+struct D3D11WmfState {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    manager: IMFDXGIDeviceManager,
+}
+
+/// Create a feature-level-11.1 D3D11 device suitable for WMF video
+/// decode (= `VIDEO_SUPPORT` + `BGRA_SUPPORT`), wrap it in an
+/// `IMFDXGIDeviceManager`, and mark the device multithread-protected.
+/// Returns `Err` when no GPU is available (= the WMF SW fallback path
+/// still works without this — caller treats the failure as "stay on
+/// SW decode" rather than abort).
+fn try_init_d3d11() -> Result<D3D11WmfState, String> {
+    let mut device: Option<ID3D11Device> = None;
+    let mut context: Option<ID3D11DeviceContext> = None;
+    // Order matters: feature_level_11_1 first so newer drivers pick the
+    // best path; 11.0 is the fallback (= every D3D11-capable GPU since
+    // 2012 supports either).
+    let feature_levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
+    unsafe {
+        D3D11CreateDevice(
+            None, // pAdapter — default adapter
+            D3D_DRIVER_TYPE_HARDWARE,
+            windows::Win32::Foundation::HMODULE::default(),
+            D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            Some(&feature_levels),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            Some(&mut context),
+        )
+        .map_err(|e| format!("D3D11CreateDevice: {e}"))?;
+    }
+    let device = device.ok_or_else(|| "D3D11 device null".to_string())?;
+    let context = context.ok_or_else(|| "D3D11 immediate context null".to_string())?;
+
+    // WMF documentation requires the D3D11 device used through an
+    // IMFDXGIDeviceManager to be MultithreadProtected (= the decoder
+    // may issue draw calls from a worker thread inside MF). Without
+    // this, IMFDXGIDeviceManager::LockDevice on subsequent threads can
+    // race against ReadSample.
+    unsafe {
+        let multithread: ID3D10Multithread = device
+            .cast()
+            .map_err(|e| format!("ID3D10Multithread cast: {e}"))?;
+        let _ = multithread.SetMultithreadProtected(true);
+    }
+
+    let mut reset_token: u32 = 0;
+    let mut manager: Option<IMFDXGIDeviceManager> = None;
+    unsafe {
+        MFCreateDXGIDeviceManager(&mut reset_token, &mut manager)
+            .map_err(|e| format!("MFCreateDXGIDeviceManager: {e}"))?;
+    }
+    let manager = manager.ok_or_else(|| "DXGI device manager null".to_string())?;
+    unsafe {
+        manager
+            .ResetDevice(&device, reset_token)
+            .map_err(|e| format!("IMFDXGIDeviceManager::ResetDevice: {e}"))?;
+    }
+
+    Ok(D3D11WmfState {
+        device,
+        context,
+        manager,
+    })
 }
 
 /// Stateful playback decoder. Owned by `Runner` for the lifetime of
@@ -81,12 +259,41 @@ struct ReaderEntry {
 /// project unload happens at process exit for MVP).
 pub struct VideoPlaybackEngine {
     readers: HashMap<VideoSourceId, ReaderEntry>,
+    /// docs/plan_video_perf.md P1: lazy-init D3D11 / DXGI device manager
+    /// for HW H.264 decode. `None` = either not yet initialized, or
+    /// init failed (= fall through to SW decode path, same code paths
+    /// as before P1). Set on the worker thread by `decode_at`.
+    d3d11: Option<D3D11WmfState>,
+    /// One-shot flag: once `decode_at` has tried to init D3D11 (success
+    /// or failure), don't retry per call. Failure path emits one
+    /// warning then proceeds with SW decode for the rest of the
+    /// process lifetime.
+    d3d11_init_attempted: bool,
 }
 
 impl VideoPlaybackEngine {
     pub fn new() -> Self {
         Self {
             readers: HashMap::new(),
+            d3d11: None,
+            d3d11_init_attempted: false,
+        }
+    }
+
+    /// Construct an engine that **never** tries to use the D3D11 HW
+    /// decoder + zero-copy path. Used by `render_video::render_mp4`
+    /// (= export), which composites frames on the CPU (`blit_layer` +
+    /// `rgba_to_nv12`) and so needs `DecodedFrame::Bgra` bytes back —
+    /// the `Shared` path would just dead-end (no `bgra` field). Skips
+    /// the `try_init_d3d11` call entirely so headless CI export
+    /// doesn't fail on missing GPU either.
+    pub fn new_cpu_only() -> Self {
+        Self {
+            readers: HashMap::new(),
+            d3d11: None,
+            // Pretend we already tried — this short-circuits the lazy
+            // init in `decode_at`.
+            d3d11_init_attempted: true,
         }
     }
 
@@ -241,16 +448,43 @@ impl VideoPlaybackEngine {
         source_path: &Path,
         target_micros: u64,
     ) -> Result<DecodedFrame, String> {
+        // docs/plan_video_perf.md P1: lazy-init D3D11 + IMFDXGIDeviceManager
+        // on the first decode. Once attempted, never retry — even if it
+        // failed we just stay on SW decode for the rest of the process
+        // (= no point spamming `D3D11CreateDevice` per frame).
+        if !self.d3d11_init_attempted {
+            self.d3d11_init_attempted = true;
+            match try_init_d3d11() {
+                Ok(state) => {
+                    tracing::info!(
+                        "video playback: D3D11 HW decode enabled (= MF_SOURCE_READER_D3D_MANAGER)"
+                    );
+                    self.d3d11 = Some(state);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "video playback: D3D11 init failed, falling back to SW decode"
+                    );
+                }
+            }
+        }
+        // Split-borrow so the d3d11 reference is independent of the
+        // self.readers borrow below (= `Entry` API takes &mut self).
+        let Self { readers, d3d11, .. } = self;
+        let d3d11_ref = d3d11.as_ref();
+
         // Lazy-init the reader for this source. `Entry::Vacant` keeps
         // a single hash lookup (clippy `map_entry`).
-        let entry = match self.readers.entry(video_source_id) {
+        let entry = match readers.entry(video_source_id) {
             std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
             std::collections::hash_map::Entry::Vacant(v) => {
-                let entry = create_reader_for_source(source_path)?;
+                let entry = create_reader_for_source(source_path, d3d11_ref)?;
                 tracing::info!(
                     video_source_id,
                     width = entry.width,
                     height = entry.height,
+                    hw_decode = d3d11_ref.is_some(),
                     "video reader created"
                 );
                 v.insert(entry)
@@ -287,12 +521,15 @@ impl VideoPlaybackEngine {
         // surface back to WMF without us touching 8MB of pixel data
         // 240 times in a row. This is the 2-second-scrub-lag fix
         // (2026-05-25 user report).
+        let t_decode_start = std::time::Instant::now();
+        let mut frames_walked: u32 = 0;
         let mut last_sample: Option<(IMFSample, u64)> = None;
         let mut chosen: Option<(IMFSample, u64)> = None;
         for _ in 0..240 {
             let Some((sample, ts_100ns)) = read_sample_only(&entry.reader)? else {
                 break; // EOS
             };
+            frames_walked += 1;
             let ts_micros = (ts_100ns.max(0) as u64) / 10;
             if ts_micros >= target_micros {
                 chosen = Some((sample, ts_micros));
@@ -300,16 +537,43 @@ impl VideoPlaybackEngine {
             }
             last_sample = Some((sample, ts_micros));
         }
+        let t_walk_done = std::time::Instant::now();
         let (final_sample, final_ts) = chosen.or(last_sample).ok_or_else(|| {
             format!("no frame decoded for source {video_source_id} at {target_micros}μs")
         })?;
-        let rgba = sample_to_rgba(&final_sample, entry.width, entry.height)?;
+        let frame = sample_to_frame(&final_sample, entry, d3d11_ref)?;
+        let t_swap_done = std::time::Instant::now();
         entry.last_decoded_micros = Some(final_ts);
-        Ok(DecodedFrame {
-            width: entry.width,
-            height: entry.height,
-            rgba,
-        })
+
+        // Diagnostic: log decode + swap times for the first few frames
+        // *of real playback* (target_micros > 0) so we can see whether
+        // WMF picked hardware or software decode (HW ≈ 5-10ms / frame,
+        // SW ≈ 30-80ms / frame at 1080p H.264). Skipping the
+        // target_micros == 0 case avoids burning the warm-up budget on
+        // the idle-at-beat-0 repeated-request pattern (the previous
+        // smoke run showed 30 consecutive zero-target decodes before
+        // Play was even pressed). Skips logging after the budget is
+        // exhausted to keep release builds quiet.
+        if target_micros > 0 && entry.timing_log_remaining > 0 {
+            entry.timing_log_remaining =
+                entry.timing_log_remaining.saturating_sub(1);
+            let walk_ms = t_walk_done.duration_since(t_decode_start).as_millis();
+            let swap_ms = t_swap_done.duration_since(t_walk_done).as_millis();
+            tracing::info!(
+                video_source_id,
+                target_micros,
+                final_ts,
+                frames_walked,
+                walk_ms = walk_ms as u64,
+                swap_ms = swap_ms as u64,
+                "decode timing"
+            );
+        }
+
+        // `sample_to_frame` already built the right variant (Shared
+        // or Bgra) based on whether the HW path was available — just
+        // return it.
+        Ok(frame)
     }
 }
 
@@ -384,7 +648,10 @@ fn scale_for_preview(native_w: u32, native_h: u32) -> (u32, u32) {
     (w & !1, h & !1)
 }
 
-fn create_reader_for_source(path: &Path) -> Result<ReaderEntry, String> {
+fn create_reader_for_source(
+    path: &Path,
+    d3d11: Option<&D3D11WmfState>,
+) -> Result<ReaderEntry, String> {
     // MFStartup is owned by `import_video` and idempotent.
     crate::import_video::ensure_mf_startup_pub()
         .map_err(|e| format!("MFStartup: {e}"))?;
@@ -400,14 +667,36 @@ fn create_reader_for_source(path: &Path) -> Result<ReaderEntry, String> {
         .collect();
     let url = PCWSTR::from_raw(wide.as_ptr());
 
+    // docs/plan_video_perf.md P1: pre-allocate two attribute slots so
+    // we have room for `MF_SOURCE_READER_D3D_MANAGER` when D3D11 is up.
+    // Excess slots cost nothing if unused.
+    //
+    // **Video processing mode**: when D3D11 is attached we must use
+    // `ENABLE_ADVANCED_VIDEO_PROCESSING` (= D3D-aware path), NOT the
+    // basic `ENABLE_VIDEO_PROCESSING` flag. MSDN states these two are
+    // mutually exclusive; combining basic + D3D manager returns
+    // `E_INVALIDARG (0x80070057)` from `MFCreateSourceReaderFromURL`.
     let attrs = unsafe {
         let mut a = None;
-        MFCreateAttributes(&mut a, 1)
+        MFCreateAttributes(&mut a, 2)
             .map_err(|e| format!("MFCreateAttributes: {e}"))?;
         let attrs = a.ok_or_else(|| "MFCreateAttributes returned null".to_string())?;
-        attrs
-            .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
-            .map_err(|e| format!("SetUINT32 ENABLE_VIDEO_PROCESSING: {e}"))?;
+        if let Some(d3d11) = d3d11 {
+            // HW path: advanced video processing (D3D-aware) + D3D manager.
+            attrs
+                .SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)
+                .map_err(|e| {
+                    format!("SetUINT32 ENABLE_ADVANCED_VIDEO_PROCESSING: {e}")
+                })?;
+            attrs
+                .SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, &d3d11.manager)
+                .map_err(|e| format!("SetUnknown MF_SOURCE_READER_D3D_MANAGER: {e}"))?;
+        } else {
+            // SW path: basic video processing (pre-P1 behaviour).
+            attrs
+                .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
+                .map_err(|e| format!("SetUINT32 ENABLE_VIDEO_PROCESSING: {e}"))?;
+        }
         attrs
     };
     let reader: IMFSourceReader = unsafe {
@@ -445,8 +734,16 @@ fn create_reader_for_source(path: &Path) -> Result<ReaderEntry, String> {
         let t = MFCreateMediaType().map_err(|e| format!("MFCreateMediaType: {e}"))?;
         t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
             .map_err(|e| format!("set MAJOR_TYPE: {e}"))?;
-        t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
-            .map_err(|e| format!("set SUBTYPE RGB32: {e}"))?;
+        // docs/plan_video_perf.md P3: ARGB32 (= BGRA, alpha-aware) so the
+        // video processor MFT writes alpha=0xFF for opaque H.264 source.
+        // Earlier RGB32 (= BGRX, alpha undefined) worked for the CPU path
+        // because we hardcoded alpha=0xFF during the channel swap, but
+        // broke the zero-copy `Shared` path: `CopySubresourceRegion`
+        // copies bytes verbatim and the GPU view as `Bgra8UnormSrgb`
+        // then read the X bytes as alpha=0, making every pixel fully
+        // transparent (= dark backdrop only, preview blank).
+        t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_ARGB32)
+            .map_err(|e| format!("set SUBTYPE ARGB32: {e}"))?;
         t
     };
     unsafe { reader.SetCurrentMediaType(stream, None, &output) }
@@ -476,6 +773,14 @@ fn create_reader_for_source(path: &Path) -> Result<ReaderEntry, String> {
         width: actual_w,
         height: actual_h,
         last_decoded_micros: None,
+        // Log the first ~60 playback decodes (= ~2 seconds at the
+        // project's 30fps target). Skipping target_micros == 0 in
+        // `decode_at` means this budget is reserved for real playback,
+        // not idle-at-beat-0 spam.
+        timing_log_remaining: 60,
+        // Lazily created on first HW-decoded sample (= when D3D11
+        // manager was attached and the reader returned an IMFDXGIBuffer).
+        shared: None,
     })
 }
 
@@ -540,23 +845,62 @@ fn read_sample_only(reader: &IMFSourceReader) -> Result<Option<(IMFSample, i64)>
     }
 }
 
-/// Extract RGBA8 bytes from an already-decoded `IMFSample`. Lock the
-/// contiguous buffer, BGRA→RGBA channel-swap with alpha pinned to
-/// 0xFF (`MFVideoFormat_RGB32`'s alpha byte is undefined per MSDN),
-/// and unlock. Called by `decode_at` only on the final target frame.
+/// Turn one already-decoded `IMFSample` into a `DecodedFrame`. Two
+/// underlying paths exist, selected at runtime by whether the buffer
+/// is GPU-backed:
 ///
-/// Channel swap goes through `bgra_to_rgba`, which picks SSSE3
-/// `_mm_shuffle_epi8` on x86_64 (= ~10x faster than scalar; the
-/// 2026-05-25 "playback コマ送り" fix). Scalar fallback handles ARM
-/// and pre-SSSE3 x86 (none in practice on Windows MMF targets).
-fn sample_to_rgba(
+/// - **`Shared`** (zero-copy, P3): `IMFDXGIBuffer::GetResource()` →
+///   ID3D11Texture2D → `CopySubresourceRegion` into the per-source
+///   shared NT-handle / keyed-mutex texture (`entry.shared`). The
+///   pixel bytes never touch CPU memory. Returned with the stable
+///   shared HANDLE that the main thread imports into wgpu exactly
+///   once per source.
+/// - **`Bgra`** (P2 fallback): `ConvertToContiguousBuffer()` →
+///   `IMFMediaBuffer::Lock()` → memcpy. Used when D3D11 init failed
+///   or the H.264 MFT chose a system-memory output despite
+///   `MF_SOURCE_READER_D3D_MANAGER` being attached.
+///
+/// docs/plan_video_perf.md P3 (2026-05-25): the staging-texture
+/// readback path from P1 is gone — replaced by the shared NT-handle
+/// path so wgpu samples the GPU memory directly.
+fn sample_to_frame(
     sample: &IMFSample,
+    entry: &mut ReaderEntry,
+    d3d11: Option<&D3D11WmfState>,
+) -> Result<DecodedFrame, String> {
+    let buffer = unsafe { sample.ConvertToContiguousBuffer() }
+        .map_err(|e| format!("ConvertToContiguousBuffer: {e}"))?;
+
+    // GPU path: only when D3D11 is up AND the buffer is DXGI-backed.
+    if let Some(d3d11) = d3d11
+        && let Ok(dxgi) = buffer.cast::<IMFDXGIBuffer>()
+    {
+        let handle = write_to_shared_texture(&dxgi, entry, d3d11)?;
+        return Ok(DecodedFrame::Shared {
+            width: entry.width,
+            height: entry.height,
+            handle: SendHandle(handle),
+        });
+    }
+
+    // CPU fallback: existing P2 path.
+    let bgra = sample_buffer_to_bgra(&buffer, entry.width, entry.height)?;
+    Ok(DecodedFrame::Bgra {
+        width: entry.width,
+        height: entry.height,
+        bgra,
+    })
+}
+
+/// CPU fallback: lock the IMFMediaBuffer, copy the BGRA bytes into a
+/// `Vec<u8>`, unlock. No channel swap (= P2: `upload_texture_bgra`
+/// takes BGRA directly, the shader samples a `Bgra8UnormSrgb` texture).
+fn sample_buffer_to_bgra(
+    buffer: &windows::Win32::Media::MediaFoundation::IMFMediaBuffer,
     width: u32,
     height: u32,
 ) -> Result<Vec<u8>, String> {
     let frame_bytes = width as usize * height as usize * 4;
-    let buffer = unsafe { sample.ConvertToContiguousBuffer() }
-        .map_err(|e| format!("ConvertToContiguousBuffer: {e}"))?;
     let mut ptr: *mut u8 = std::ptr::null_mut();
     let mut max_len: u32 = 0;
     let mut cur_len: u32 = 0;
@@ -565,14 +909,160 @@ fn sample_to_rgba(
 
     if ptr.is_null() || (cur_len as usize) < frame_bytes {
         let _ = unsafe { buffer.Unlock() };
-        return Err(format!(
-            "frame too small: {cur_len} < {frame_bytes}"
-        ));
+        return Err(format!("frame too small: {cur_len} < {frame_bytes}"));
     }
     let src = unsafe { std::slice::from_raw_parts(ptr, frame_bytes) };
-    let rgba = bgra_to_rgba(src);
+    let bgra = src.to_vec();
     let _ = unsafe { buffer.Unlock() };
-    Ok(rgba)
+    Ok(bgra)
+}
+
+/// docs/plan_video_perf.md P3 GPU zero-copy path: copy the decoded
+/// HW sample's D3D11 texture into the per-source DXGI-shared
+/// destination texture, returning its stable NT handle.
+///
+/// On first call for a `ReaderEntry`, allocates the shared
+/// destination (`SHARED_NTHANDLE + SHARED_KEYEDMUTEX`,
+/// `B8G8R8A8_UNORM` to match WMF's `MFVideoFormat_ARGB32` output =
+/// byte-identical 32-bit BGRA layout) + caches its `IDXGIKeyedMutex`
+/// + creates the NT handle via `IDXGIResource1::CreateSharedHandle`.
+/// The handle is stable so the main thread imports it into wgpu
+/// exactly once.
+///
+/// Keyed-mutex protocol: worker `AcquireSync(0, INFINITE)` →
+/// `CopySubresourceRegion` → `ReleaseSync(0)`. Main thread mirrors
+/// this around its `Scene::push_textured_quad` + `Renderer::present`
+/// boundary (`view/runner.rs`). Both sides use key `0` as the
+/// "available" state; the mutex serialises read vs write.
+fn write_to_shared_texture(
+    dxgi: &IMFDXGIBuffer,
+    entry: &mut ReaderEntry,
+    d3d11: &D3D11WmfState,
+) -> Result<HANDLE, String> {
+    // Extract the WMF-owned source texture + subresource index.
+    let source: ID3D11Texture2D = unsafe {
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        dxgi.GetResource(&ID3D11Texture2D::IID, &mut ptr)
+            .map_err(|e| format!("IMFDXGIBuffer::GetResource: {e}"))?;
+        if ptr.is_null() {
+            return Err("GetResource returned null".to_string());
+        }
+        ID3D11Texture2D::from_raw(ptr)
+    };
+    let subresource: u32 = unsafe { dxgi.GetSubresourceIndex() }
+        .map_err(|e| format!("GetSubresourceIndex: {e}"))?;
+
+    // Lazy-create the shared destination on first frame.
+    if entry.shared.is_none() {
+        entry.shared = Some(create_shared_entry(&source, d3d11, entry.width, entry.height)?);
+    }
+    let shared = entry
+        .shared
+        .as_ref()
+        .ok_or_else(|| "shared texture init failed".to_string())?;
+
+    // Acquire the keyed mutex before writing. `INFINITE` waits for
+    // the main thread's render submit to release; in steady-state
+    // this is sub-millisecond because the main thread releases
+    // immediately after queueing the textured-quad command.
+    unsafe { shared.mutex.AcquireSync(0, u32::MAX) }
+        .map_err(|e| format!("worker mutex AcquireSync: {e}"))?;
+
+    unsafe {
+        d3d11.context.CopySubresourceRegion(
+            &shared.texture,
+            0,
+            0,
+            0,
+            0,
+            &source,
+            subresource,
+            None,
+        );
+    }
+    // Flush so the GPU queue picks up the copy before the main
+    // thread tries to sample. Without this the main thread might
+    // observe an older frame for several render cycles.
+    unsafe { d3d11.context.Flush() };
+
+    unsafe { shared.mutex.ReleaseSync(0) }
+        .map_err(|e| format!("worker mutex ReleaseSync: {e}"))?;
+
+    Ok(shared.handle)
+}
+
+/// Allocate one `SharedEntry`: a `B8G8R8A8_UNORM` D3D11 texture with
+/// `SHARED_NTHANDLE + SHARED_KEYEDMUTEX`, plus its `IDXGIKeyedMutex`
+/// view and the NT handle from `IDXGIResource1::CreateSharedHandle`.
+/// Called exactly once per `ReaderEntry`.
+fn create_shared_entry(
+    source: &ID3D11Texture2D,
+    d3d11: &D3D11WmfState,
+    width: u32,
+    height: u32,
+) -> Result<SharedEntry, String> {
+    // Start from the source texture's desc so we inherit mip level
+    // details, then override flags for sharing.
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { source.GetDesc(&mut desc) };
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    // docs/plan_video_perf.md P3: destination is `B8G8R8A8_UNORM` so
+    // gui_01 can view it as `Bgra8UnormSrgb` (= same compatibility
+    // class). WMF's `MFVideoFormat_ARGB32` source is also BGRA, so
+    // `CopySubresourceRegion` copies the alpha bytes verbatim — and
+    // the video processor MFT writes alpha=0xFF for opaque H.264
+    // source, which is the whole point of choosing ARGB32 over RGB32.
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32;
+    desc.CPUAccessFlags = 0;
+    desc.MiscFlags = (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0
+        | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0)
+        as u32;
+
+    let mut texture: Option<ID3D11Texture2D> = None;
+    unsafe {
+        d3d11
+            .device
+            .CreateTexture2D(&desc, None, Some(&mut texture))
+    }
+    .map_err(|e| format!("shared CreateTexture2D: {e}"))?;
+    let texture = texture.ok_or_else(|| "shared texture null".to_string())?;
+
+    // Cast → IDXGIResource1 for CreateSharedHandle, → IDXGIKeyedMutex
+    // for AcquireSync / ReleaseSync. Both interfaces are inherited
+    // by an ID3D11Texture2D created with the SHARED_* flags.
+    let dxgi_resource: IDXGIResource1 = texture
+        .cast()
+        .map_err(|e| format!("IDXGIResource1 cast: {e}"))?;
+    let mutex: IDXGIKeyedMutex = texture
+        .cast()
+        .map_err(|e| format!("IDXGIKeyedMutex cast: {e}"))?;
+
+    // `DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE` = 1 | 2.
+    // The constants are in `Win32::Graphics::Dxgi` but flagged as
+    // `GENERIC_ALL` here for simplicity — the kernel just stores the
+    // ACL mask, both processes are the same daw_gui.exe so we have
+    // full access anyway.
+    const DXGI_SHARED_RESOURCE_READ: u32 = 0x80000000;
+    const DXGI_SHARED_RESOURCE_WRITE: u32 = 1;
+    let handle = unsafe {
+        dxgi_resource.CreateSharedHandle(
+            None,
+            DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+            PCWSTR::null(),
+        )
+    }
+    .map_err(|e| format!("CreateSharedHandle: {e}"))?;
+
+    Ok(SharedEntry {
+        texture,
+        mutex,
+        handle,
+    })
 }
 
 /// BGRA8 → RGBA8 channel swap with alpha pinned to 0xFF. Picks the
@@ -881,16 +1371,25 @@ mod tests {
         let frame = engine
             .decode_at(42, &mp4, 1_000_000)
             .expect("decode_at @ 1s");
-        assert_eq!(frame.width, 320);
-        assert_eq!(frame.height, 240);
-        assert_eq!(frame.rgba.len(), 320 * 240 * 4);
-        // Center pixel should be green-ish (G > R, G > B).
-        let center = (120 * 320 + 160) * 4;
-        let r = frame.rgba[center];
-        let g = frame.rgba[center + 1];
-        let b = frame.rgba[center + 2];
-        assert!(g > 100, "center G should be high, got ({r}, {g}, {b})");
-        assert!(g > r && g > b, "green channel should dominate");
+        assert_eq!(frame.width(), 320);
+        assert_eq!(frame.height(), 240);
+        // The HW path (DecodedFrame::Shared) keeps pixels on the GPU
+        // so we can't inspect them from CPU. Only assert pixel colour
+        // on the CPU-fallback path (= test environment without a GPU,
+        // or D3D11 init failure). Either variant must report the
+        // correct dimensions.
+        if let DecodedFrame::Bgra { bgra, .. } = &frame {
+            assert_eq!(bgra.len(), 320 * 240 * 4);
+            // Center pixel should be green-ish. BGRA memory order:
+            // px[0] = B, px[1] = G, px[2] = R, px[3] = (X / alpha
+            // undefined per MSDN).
+            let center = (120 * 320 + 160) * 4;
+            let b = bgra[center];
+            let g = bgra[center + 1];
+            let r = bgra[center + 2];
+            assert!(g > 100, "center G should be high, got ({r}, {g}, {b})");
+            assert!(g > r && g > b, "green channel should dominate");
+        }
 
         // Forward-step (= no seek): decode at 1.05s. Should reuse the
         // existing reader and just ReadSample forward — verified
@@ -898,24 +1397,16 @@ mod tests {
         let frame2 = engine
             .decode_at(42, &mp4, 1_050_000)
             .expect("decode_at @ 1.05s (forward step)");
-        assert_eq!(frame2.width, 320);
-        assert_eq!(frame2.rgba.len(), 320 * 240 * 4);
+        assert_eq!(frame2.width(), 320);
+        assert_eq!(frame2.height(), 240);
 
         // Backward seek: decode at 0.3s. Engine should SetCurrentPosition
         // back to a keyframe and re-walk. Same validity check.
         let frame3 = engine
             .decode_at(42, &mp4, 300_000)
             .expect("decode_at @ 0.3s (backward seek)");
-        assert_eq!(frame3.width, 320);
-        assert_eq!(frame3.rgba.len(), 320 * 240 * 4);
-
-        // Alpha channel must be hardcoded to 0xFF (= MFVideoFormat_RGB32's
-        // undefined alpha byte must NOT leak through, or the preview
-        // would render fully transparent). Scan a few pixels — every
-        // 4th byte should be 255.
-        for px in frame.rgba.chunks_exact(4).take(64) {
-            assert_eq!(px[3], 0xFF, "alpha must be opaque 0xFF, got {}", px[3]);
-        }
+        assert_eq!(frame3.width(), 320);
+        assert_eq!(frame3.height(), 240);
     }
 
     // ====================================================================

@@ -54,6 +54,9 @@ pub fn run(init: RunnerInit) -> Result<(), winit::error::EventLoopError> {
         proxy,
         state: None,
         last_tick: Instant::now(),
+        diag_window_start: None,
+        diag_window_count: 0,
+        diag_window_max_dt: std::time::Duration::ZERO,
     };
     event_loop.run_app(&mut runner)
 }
@@ -93,6 +96,14 @@ struct RunnerState {
     /// worker thread (= plan §3 P5 正式設計) への移行はまだ先。
     #[cfg(windows)]
     last_preview_drive_at: Option<Instant>,
+    /// Decrement-on-upload counter. While > 0 each
+    /// `drain_preview_worker_results` upload emits one
+    /// `tracing::info!` line with `upload_ms`. Pairs with the
+    /// `VideoPlaybackEngine` per-source `timing_log_remaining` to
+    /// confirm whether the 0.25x playback bottleneck sits in decode
+    /// (worker side) or upload (main thread, this side).
+    #[cfg(windows)]
+    preview_upload_log_remaining: u32,
 }
 
 struct Runner {
@@ -101,6 +112,17 @@ struct Runner {
     proxy: EventLoopProxy<AppEvent>,
     state: Option<RunnerState>,
     last_tick: Instant,
+    /// Diagnostic: rolling 30-frame window for main thread render rate.
+    /// `render_frame` accumulates `dt` since the last tick and emits one
+    /// `tracing::info!` line per ~30 frames with mean fps + max dt so we
+    /// can correlate worker-decode-throughput (~1.0x source-rate by the
+    /// `decode timing` logs) with the actual main-thread frame rate
+    /// (= what the user sees). If main loop drops below 10 fps, that
+    /// explains the 0.25x preview perception even when the worker is
+    /// keeping up.
+    diag_window_start: Option<Instant>,
+    diag_window_count: u32,
+    diag_window_max_dt: std::time::Duration,
 }
 
 impl Runner {
@@ -165,6 +187,10 @@ impl ApplicationHandler<AppEvent> for Runner {
             playback_worker: crate::video_playback_worker::PreviewDecodeWorker::new(),
             #[cfg(windows)]
             last_preview_drive_at: None,
+            // 60 uploads ≈ 2 seconds at 30fps preview, mirroring the
+            // per-decode log budget in `VideoPlaybackEngine`.
+            #[cfg(windows)]
+            preview_upload_log_remaining: 60,
         });
     }
 
@@ -308,8 +334,45 @@ impl Runner {
 
         let Some(state) = self.state.as_mut() else { return false };
         let now = Instant::now();
-        let _dt = now.duration_since(self.last_tick);
+        let dt = now.duration_since(self.last_tick);
         self.last_tick = now;
+
+        // Diagnostic: emit a summary every 30 render frames so we can
+        // see whether the main thread loop matches worker decode
+        // throughput. If main fps drops below 10, the user's "0.25x"
+        // preview perception is explained: the worker delivers frames
+        // at 1x but the main loop only paints them at 10Hz.
+        if self.diag_window_start.is_none() {
+            self.diag_window_start = Some(now);
+        }
+        self.diag_window_count = self.diag_window_count.saturating_add(1);
+        if dt > self.diag_window_max_dt {
+            self.diag_window_max_dt = dt;
+        }
+        if self.diag_window_count >= 30 {
+            let elapsed_ms = self
+                .diag_window_start
+                .map(|s| now.duration_since(s).as_millis() as u64)
+                .unwrap_or(0);
+            let fps = if elapsed_ms > 0 {
+                self.diag_window_count as f64 * 1000.0 / elapsed_ms as f64
+            } else {
+                0.0
+            };
+            let max_dt_ms = self.diag_window_max_dt.as_millis() as u64;
+            let mean_dt_ms = elapsed_ms / self.diag_window_count as u64;
+            tracing::info!(
+                frames = self.diag_window_count,
+                elapsed_ms,
+                fps = format!("{fps:.1}"),
+                mean_dt_ms,
+                max_dt_ms,
+                "main render fps"
+            );
+            self.diag_window_start = Some(now);
+            self.diag_window_count = 0;
+            self.diag_window_max_dt = std::time::Duration::ZERO;
+        }
 
         // docs/plan_video.md P3.5: drain pending video thumbnail
         // uploads BEFORE this frame's `ui.frame()` so the arrangement
@@ -590,12 +653,45 @@ impl Runner {
         for result in results {
             match result.frame {
                 Ok(frame) => {
-                    preview.upload_frame(
-                        result.source_id,
-                        frame.width,
-                        frame.height,
-                        &frame.rgba,
-                    );
+                    // docs/plan_video_perf.md P3: two upload paths
+                    // (`Shared` zero-copy / `Bgra` CPU fallback) — the
+                    // preview window's `upload_frame` dispatches
+                    // internally based on the variant. Diagnostic
+                    // tracking only logs the CPU upload path since
+                    // the Shared path's "upload" is just a one-time
+                    // DXGI handle import (cached after).
+                    let t_upload_start = std::time::Instant::now();
+                    let (variant_name, frame_bytes, w, h) = match &frame {
+                        crate::video_playback::DecodedFrame::Shared {
+                            width,
+                            height,
+                            ..
+                        } => ("shared", 0_usize, *width, *height),
+                        crate::video_playback::DecodedFrame::Bgra {
+                            width,
+                            height,
+                            bgra,
+                        } => ("bgra", bgra.len(), *width, *height),
+                    };
+                    preview.upload_frame(result.source_id, &frame);
+                    if result.target_micros > 0
+                        && state.preview_upload_log_remaining > 0
+                    {
+                        state.preview_upload_log_remaining =
+                            state.preview_upload_log_remaining.saturating_sub(1);
+                        let upload_ms =
+                            t_upload_start.elapsed().as_millis() as u64;
+                        tracing::info!(
+                            video_source_id = result.source_id,
+                            source_micros = result.target_micros,
+                            variant = variant_name,
+                            width = w,
+                            height = h,
+                            frame_bytes,
+                            upload_ms,
+                            "preview upload timing"
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(

@@ -152,7 +152,10 @@ pub fn render_mp4(cfg: &RenderConfig) -> Result<RenderStats, String> {
         .map_err(|e| format!("BeginWriting: {e}"))?;
 
     // Frame loop.
-    let mut engine = VideoPlaybackEngine::new();
+    // docs/plan_video_perf.md P3: export composites on CPU, so the
+    // zero-copy `Shared` variant is not useful here — force the
+    // engine to return `Bgra` bytes via the CPU-only constructor.
+    let mut engine = VideoPlaybackEngine::new_cpu_only();
     let total_seconds = beat_to_seconds(cfg.song.length_beats, cfg.song.bpm);
     let total_frames = (total_seconds * f64::from(framerate)).ceil() as u64;
     let frame_duration_100ns = (10_000_000.0_f64 / f64::from(framerate)).round() as i64;
@@ -406,14 +409,29 @@ fn render_frame_composite(
         else {
             continue;
         };
-        let dst_rect = aspect_fit(out_w, out_h, frame.width, frame.height);
+        // docs/plan_video_perf.md P3: export uses the CPU-only engine
+        // so we always get `DecodedFrame::Bgra` (no zero-copy / shared
+        // texture path). Swap BGRA → RGBA here; `rgba_to_nv12`
+        // downstream expects RGBA. Export is not real-time, the
+        // per-frame swap is negligible.
+        let crate::video_playback::DecodedFrame::Bgra { bgra, width, height } = &frame else {
+            // Defensive: if a Shared variant ever leaks here we just
+            // skip the layer rather than corrupting the canvas.
+            tracing::warn!(
+                video_source_id = layer.video_source_id,
+                "export decoder returned non-CPU frame variant; layer skipped"
+            );
+            continue;
+        };
+        let rgba = crate::video_playback::bgra_to_rgba(bgra);
+        let dst_rect = aspect_fit(out_w, out_h, *width, *height);
         blit_layer(
             dst,
             out_w as usize,
             out_h as usize,
-            &frame.rgba,
-            frame.width as usize,
-            frame.height as usize,
+            &rgba,
+            *width as usize,
+            *height as usize,
             dst_rect,
             layer.alpha,
         );
