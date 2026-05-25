@@ -275,27 +275,36 @@ impl VideoPlaybackEngine {
         }
 
         // Walk forward until we have a sample whose timestamp is at
-        // or past target_micros. Bound the walk so a malformed stream
-        // doesn't spin forever (= ~1 second worth of frames at 30fps).
-        let mut last_frame: Option<(u64, Vec<u8>)> = None;
-        for _ in 0..60 {
-            let Some((timestamp_100ns, bytes)) =
-                read_one_frame(&entry.reader, entry.width, entry.height)?
-            else {
-                break; // EOS — keep the last decoded sample.
+        // or past target_micros. Bound the walk to ~4 seconds of source
+        // at 60fps (= 240 frames) so a malformed stream doesn't spin
+        // forever — typical H.264 keyframe intervals are 1-4 sec so
+        // post-seek catch-up should always finish within this budget.
+        //
+        // **Skip the BGRA→RGBA copy for non-target frames**: the
+        // intermediate samples are read just to advance the decoder
+        // (= H.264 P-frames have to be decoded sequentially to get to
+        // the target). Dropping the `IMFSample` releases the GPU/CPU
+        // surface back to WMF without us touching 8MB of pixel data
+        // 240 times in a row. This is the 2-second-scrub-lag fix
+        // (2026-05-25 user report).
+        let mut last_sample: Option<(IMFSample, u64)> = None;
+        let mut chosen: Option<(IMFSample, u64)> = None;
+        for _ in 0..240 {
+            let Some((sample, ts_100ns)) = read_sample_only(&entry.reader)? else {
+                break; // EOS
             };
-            let timestamp_micros = timestamp_100ns / 10;
-            last_frame = Some((timestamp_micros, bytes));
-            if timestamp_micros >= target_micros {
+            let ts_micros = (ts_100ns.max(0) as u64) / 10;
+            if ts_micros >= target_micros {
+                chosen = Some((sample, ts_micros));
                 break;
             }
+            last_sample = Some((sample, ts_micros));
         }
-        let Some((ts, rgba)) = last_frame else {
-            return Err(format!(
-                "no frame decoded for source {video_source_id} at {target_micros}μs"
-            ));
-        };
-        entry.last_decoded_micros = Some(ts);
+        let (final_sample, final_ts) = chosen.or(last_sample).ok_or_else(|| {
+            format!("no frame decoded for source {video_source_id} at {target_micros}μs")
+        })?;
+        let rgba = sample_to_rgba(&final_sample, entry.width, entry.height)?;
+        entry.last_decoded_micros = Some(final_ts);
         Ok(DecodedFrame {
             width: entry.width,
             height: entry.height,
@@ -498,8 +507,78 @@ fn seek_reader(reader: &IMFSourceReader, target_micros: u64) -> Result<(), Strin
     Ok(())
 }
 
+/// Pull one decoded sample and return the `(IMFSample, timestamp)`
+/// pair without copying its pixel content. Returns `Ok(None)` on EOS.
+/// Skips STREAMTICK gaps internally. Used by `decode_at`'s forward
+/// walk so intermediate P-frames don't pay the 8 MB BGRA→RGBA copy.
+fn read_sample_only(reader: &IMFSourceReader) -> Result<Option<(IMFSample, i64)>, String> {
+    let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+    loop {
+        let mut flags: u32 = 0;
+        let mut timestamp: i64 = 0;
+        let mut sample: Option<IMFSample> = None;
+        unsafe {
+            reader.ReadSample(
+                stream,
+                0,
+                None,
+                Some(&mut flags),
+                Some(&mut timestamp),
+                Some(&mut sample),
+            )
+        }
+        .map_err(|e| format!("ReadSample: {e}"))?;
+
+        if (flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32) != 0 {
+            return Ok(None);
+        }
+        let Some(sample) = sample else {
+            // STREAMTICK or format change — drain again.
+            continue;
+        };
+        return Ok(Some((sample, timestamp)));
+    }
+}
+
+/// Extract RGBA8 bytes from an already-decoded `IMFSample`. Lock the
+/// contiguous buffer, BGRA→RGBA channel-swap with alpha pinned to
+/// 0xFF (`MFVideoFormat_RGB32`'s alpha byte is undefined per MSDN),
+/// and unlock. Called by `decode_at` only on the final target frame.
+fn sample_to_rgba(
+    sample: &IMFSample,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, String> {
+    let frame_bytes = width as usize * height as usize * 4;
+    let buffer = unsafe { sample.ConvertToContiguousBuffer() }
+        .map_err(|e| format!("ConvertToContiguousBuffer: {e}"))?;
+    let mut ptr: *mut u8 = std::ptr::null_mut();
+    let mut max_len: u32 = 0;
+    let mut cur_len: u32 = 0;
+    unsafe { buffer.Lock(&mut ptr, Some(&mut max_len), Some(&mut cur_len)) }
+        .map_err(|e| format!("Lock: {e}"))?;
+
+    if ptr.is_null() || (cur_len as usize) < frame_bytes {
+        let _ = unsafe { buffer.Unlock() };
+        return Err(format!(
+            "frame too small: {cur_len} < {frame_bytes}"
+        ));
+    }
+    let src = unsafe { std::slice::from_raw_parts(ptr, frame_bytes) };
+    let mut rgba = Vec::with_capacity(frame_bytes);
+    for px in src.chunks_exact(4) {
+        rgba.push(px[2]);
+        rgba.push(px[1]);
+        rgba.push(px[0]);
+        rgba.push(0xFF);
+    }
+    let _ = unsafe { buffer.Unlock() };
+    Ok(rgba)
+}
+
 /// Pull one decoded sample. Returns `Ok(None)` on EOS, `Ok(Some(...))`
 /// for a real sample. Skips STREAMTICK gaps internally.
+#[allow(dead_code)]
 fn read_one_frame(
     reader: &IMFSourceReader,
     width: u32,
