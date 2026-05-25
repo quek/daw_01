@@ -69,6 +69,12 @@ struct RunnerState {
     ime_enabled: bool,
     /// 直近に OS ウィンドウへ反映したタイトル。AppData の状態と差分を見て set_title。
     last_title: String,
+    /// docs/plan_video.md P4: video preview window 用の第二 winit::Window
+    /// および Renderer。 `AppData.preview_window_visible` が true の間
+    /// だけ Some。 メインウィンドウとは独立して redraw / resize / close
+    /// を受け付ける。 P5 で video frame、 P7 で composite texture を
+    /// `scene` に push する経路がここに繋がる。
+    preview: Option<crate::view::preview_window::PreviewWindowState>,
 }
 
 struct Runner {
@@ -136,15 +142,30 @@ impl ApplicationHandler<AppEvent> for Runner {
             input: InputAccumulator::new(),
             ime_enabled: false,
             last_title: "daw_01".to_string(),
+            preview: None,
         });
     }
 
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
+        // docs/plan_video.md P4: events from the preview window are
+        // dispatched separately — we don't want main window input
+        // accumulators or AppData edit-paths to receive pointer / key
+        // events that happened over the preview surface.
+        let is_preview = self
+            .state
+            .as_ref()
+            .and_then(|s| s.preview.as_ref())
+            .map(|p| p.window_id() == window_id)
+            .unwrap_or(false);
+        if is_preview {
+            self.handle_preview_window_event(event);
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 tracing::info!("window close requested");
@@ -236,7 +257,7 @@ impl ApplicationHandler<AppEvent> for Runner {
                 self.dispatch_platform_event(PlatformEvent::Keyboard(key));
             }
             WindowEvent::RedrawRequested => {
-                let request_more = self.render_frame();
+                let request_more = self.render_frame(event_loop);
                 if request_more
                     && let Some(rs) = self.state.as_ref()
                 {
@@ -255,7 +276,14 @@ impl ApplicationHandler<AppEvent> for Runner {
 }
 
 impl Runner {
-    fn render_frame(&mut self) -> bool {
+    fn render_frame(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        // docs/plan_video.md P4: sync the preview window lifecycle
+        // with `AppData.preview_window_visible` BEFORE everything
+        // else — creating the window requires an ActiveEventLoop which
+        // is only available here, and destroying it has to happen
+        // before we lock other parts of state.
+        self.sync_preview_window(event_loop);
+
         let Some(state) = self.state.as_mut() else { return false };
         let now = Instant::now();
         let _dt = now.duration_since(self.last_tick);
@@ -268,6 +296,13 @@ impl Runner {
         // frame's latency (= imports landing during a frame are
         // queued for the next frame's drain).
         Self::drain_video_thumbnail_uploads(&mut state.app, &mut state.renderer);
+
+        // P4: render the preview window's placeholder if it exists.
+        // Cheap when the placeholder hasn't changed (wgpu vsync /
+        // swapchain handles the no-op case).
+        if let Some(preview) = state.preview.as_mut() {
+            preview.render_placeholder();
+        }
 
         let screen = state.renderer.size();
         state.scene.clear();
@@ -322,6 +357,82 @@ impl Runner {
         }
 
         state.app.is_playing
+    }
+
+    /// docs/plan_video.md P4: handle a WindowEvent dispatched against
+    /// the preview window. Limited to lifecycle / display events —
+    /// CloseRequested flips `AppData.preview_window_visible` to false
+    /// so the next frame's lifecycle pass destroys the OS window;
+    /// Resized synchronises the wgpu surface; RedrawRequested re-runs
+    /// the placeholder (or, post P5/P7, the composited frame).
+    fn handle_preview_window_event(&mut self, event: WindowEvent) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let Some(preview) = state.preview.as_mut() else {
+            return;
+        };
+        match event {
+            WindowEvent::CloseRequested => {
+                state.app.preview_window_visible = false;
+                // Lifecycle pass on the next render_frame drops the
+                // preview state; nothing else to do here.
+            }
+            WindowEvent::Resized(size) => {
+                preview.resize(daw_ui_platform::PhysicalSize {
+                    width: size.width,
+                    height: size.height,
+                });
+            }
+            WindowEvent::RedrawRequested => {
+                preview.render_placeholder();
+            }
+            _ => {}
+        }
+    }
+
+    /// docs/plan_video.md P4: keep the preview window in sync with
+    /// `AppData.preview_window_visible`. Called once per frame from
+    /// `render_frame`. Creating the window requires an
+    /// `&ActiveEventLoop`, which is only available inside winit
+    /// callbacks — `render_frame` is reached via `RedrawRequested`
+    /// (a window_event with an active loop), so we pass the loop
+    /// through.
+    fn sync_preview_window(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let visible = state.app.preview_window_visible;
+        match (visible, state.preview.is_some()) {
+            (true, false) => {
+                let initial_size = state.app.song.video_resolution;
+                match crate::view::preview_window::PreviewWindowState::create(
+                    event_loop,
+                    initial_size,
+                ) {
+                    Ok(p) => {
+                        // Immediately request a redraw so the placeholder
+                        // appears without waiting for the next OS event.
+                        p.window.request_redraw();
+                        state.preview = Some(p);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "preview window create failed");
+                        state.app.preview_window_visible = false;
+                        state.app.status_message =
+                            format!("Video preview の作成に失敗: {e}");
+                    }
+                }
+            }
+            (false, true) => {
+                // Dropping `PreviewWindowState` releases the wgpu
+                // Renderer first (struct field order) then the Arc
+                // chain — winit closes the OS window when the last
+                // Arc<Window> reference drops.
+                state.preview = None;
+            }
+            _ => {}
+        }
     }
 
     /// docs/plan_video.md P3.5: drain `AppData.pending_thumbnail_uploads`

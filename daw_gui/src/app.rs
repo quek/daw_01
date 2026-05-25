@@ -317,6 +317,12 @@ pub struct AppData {
     /// `ArrangementClip.thumbnail`.
     pub video_texture_cache:
         std::collections::HashMap<common::model::VideoSourceId, daw_ui_renderer::TextureHandle>,
+    /// docs/plan_video.md P4: video preview window の表示フラグ。 menu
+    /// "View → Video Preview" / shortcut で toggle、 runner が毎フレーム
+    /// この値を見て第二 winit::Window を create / destroy する。 false で
+    /// 起動するので video import 前は preview は出ない (= MV 開始時は
+    /// preview 不要、 user が import 後に明示的に開く)。
+    pub preview_window_visible: bool,
     /// Snapped mouse hover beat inside the arrangement canvas. `None`
     /// outside the canvas. `arrangement_view::draw` updates it every
     /// frame using the current `SnapConfig`. Used by Split (E) so the
@@ -812,6 +818,7 @@ impl AppData {
             video_thumbnail_rgba: std::collections::HashMap::new(),
             pending_thumbnail_uploads: Vec::new(),
             video_texture_cache: std::collections::HashMap::new(),
+            preview_window_visible: false,
             arrangement_hover_beat: None,
             arrangement_hover_beat_raw: None,
             arrangement_hover_clip: None,
@@ -2467,6 +2474,14 @@ pub enum AppEvent {
     /// `AppEvent::ImportVideo`.
     OpenImportVideoDialog,
 
+    /// Toggle the video preview window's visibility (`docs/plan_video.md`
+    /// P4). When `AppData.preview_window_visible` flips to `true` the
+    /// runner creates a second `winit::Window` + `Renderer` pair; flipping
+    /// back to `false` (= user closed the window or re-toggled the menu)
+    /// destroys it. P4 only opens an empty placeholder window — actual
+    /// video frame composite arrives in P5/P7.
+    TogglePreviewWindow,
+
     // -------- Split / Glue (Phase 1 PR7) -----------------------------------
     /// Split clip(s) at the **mouse cursor** (= `AppData
     /// .arrangement_hover_beat` snapped, or `_raw` when `snap == false`
@@ -3416,6 +3431,14 @@ impl AppData {
                     self.status_message =
                         "Video import は Windows 専用 (WMF 経由) です".into();
                 }
+            }
+            AppEvent::TogglePreviewWindow => {
+                self.preview_window_visible = !self.preview_window_visible;
+                self.status_message = if self.preview_window_visible {
+                    "Video preview: 表示".into()
+                } else {
+                    "Video preview: 非表示".into()
+                };
             }
             AppEvent::SetClipReversed { target, reversed } => {
                 self.set_clip_audio_event_reversed(target, reversed);

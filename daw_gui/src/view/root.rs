@@ -223,6 +223,11 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
             m.item("Toggle Help", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ToggleHelp)));
             });
+            m.item("Toggle Video Preview", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::TogglePreviewWindow)
+                }));
+            });
         });
     });
 }

@@ -10,6 +10,7 @@ pub mod mixer_strips;
 pub mod param_gesture;
 pub mod piano_roll_view;
 pub mod plugin_picker;
+pub mod preview_window;
 pub mod recovery_modal;
 pub mod root;
 pub mod runner;
