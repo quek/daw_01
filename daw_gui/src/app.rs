@@ -11106,11 +11106,57 @@ impl AppData {
             // a stale Automation entry referenced from a MIDI/Audio
             // clip — refuse to split rather than guess.
             ClipContent::Automation(_) => return false,
-            // Video Split is wired in P6 (`docs/plan_video.md` §4 P6).
-            // Until then the E shortcut is a no-op on video clips —
-            // matches the Automation rationale (refuse rather than
-            // guess).
-            ClipContent::Video(_) => return false,
+            // Video clip split (docs/plan_video.md §4 P6). Mirrors the
+            // Audio path: partition events front/back by split_offset,
+            // straddling events get source_micros range proportionally
+            // bisected (= linear partition; CFR assumption holds since
+            // MVP doesn't expose time-stretch). Both halves allocate
+            // fresh content_ids so the linked-clip semantics of the
+            // source clip don't follow the split.
+            ClipContent::Video(mut video) => {
+                let mut back_events: Vec<common::model::VideoEvent> = Vec::new();
+                let mut keep_front: Vec<common::model::VideoEvent> = Vec::new();
+                for ev in video.events.drain(..) {
+                    let e_start = ev.event_start_in_clip_beats;
+                    let e_end = e_start + ev.event_length_beats;
+                    if e_end <= split_offset {
+                        keep_front.push(ev);
+                    } else if e_start >= split_offset {
+                        back_events.push(common::model::VideoEvent {
+                            event_start_in_clip_beats: e_start - split_offset,
+                            ..ev
+                        });
+                    } else {
+                        let frac_front = (split_offset - e_start) / ev.event_length_beats;
+                        let total_src =
+                            ev.source_end_micros.saturating_sub(ev.source_start_micros);
+                        let split_src_offset =
+                            (total_src as f64 * frac_front).round() as u64;
+                        let mid_src_micros = ev.source_start_micros + split_src_offset;
+                        let mut front_ev = ev.clone();
+                        front_ev.event_length_beats = split_offset - e_start;
+                        front_ev.source_end_micros = mid_src_micros;
+                        keep_front.push(front_ev);
+                        back_events.push(common::model::VideoEvent {
+                            event_start_in_clip_beats: 0.0,
+                            event_length_beats: e_end - split_offset,
+                            source_start_micros: mid_src_micros,
+                            ..ev
+                        });
+                    }
+                }
+                let front = common::model::VideoContent {
+                    events: keep_front,
+                };
+                let back = common::model::VideoContent {
+                    events: back_events,
+                };
+                let front_id = self.song.alloc_content_id();
+                self.song
+                    .clip_contents
+                    .insert(front_id, ClipContent::Video(front));
+                ClipContent::Video(back)
+            }
         };
 
         // Allocate fresh ContentIds for both halves (front was just
@@ -11199,8 +11245,18 @@ impl AppData {
                 ta.total_cmp(&tb)
             });
 
-            // Detect mixed kinds.
-            let mut kind_audio: Option<bool> = None;
+            // Detect mixed kinds. Glue is only valid within a single
+            // ClipContent variant (= can't merge audio + video). The 3-way
+            // enum extends the old `Option<bool>` (= Audio vs MIDI) so
+            // Video clips are also eligible for Glue (docs/plan_video.md
+            // §4 P6).
+            #[derive(Clone, Copy, PartialEq, Eq)]
+            enum GlueKind {
+                Midi,
+                Audio,
+                Video,
+            }
+            let mut glue_kind: Option<GlueKind> = None;
             for r in &refs {
                 let Some(track) = self.song.tracks.get(r.track as usize) else {
                     continue;
@@ -11212,10 +11268,21 @@ impl AppData {
                 else {
                     continue;
                 };
-                let is_audio = matches!(content, ClipContent::Audio(_));
-                match kind_audio {
-                    None => kind_audio = Some(is_audio),
-                    Some(prev) if prev != is_audio => {
+                let this_kind = match content {
+                    ClipContent::Midi(_) => GlueKind::Midi,
+                    ClipContent::Audio(_) => GlueKind::Audio,
+                    ClipContent::Video(_) => GlueKind::Video,
+                    // Automation clips don't live in `Track.clips` so a
+                    // stale link here is unreachable, but be defensive
+                    // and treat as a kind change to abort.
+                    ClipContent::Automation(_) => {
+                        had_mixed_kind = true;
+                        break;
+                    }
+                };
+                match glue_kind {
+                    None => glue_kind = Some(this_kind),
+                    Some(prev) if prev != this_kind => {
                         had_mixed_kind = true;
                         break;
                     }
@@ -11225,7 +11292,10 @@ impl AppData {
             if had_mixed_kind {
                 continue;
             }
-            let is_audio_kind = kind_audio.unwrap_or(false);
+            let glue_kind = match glue_kind {
+                Some(k) => k,
+                None => continue,
+            };
 
             // Compute combined range + collect content fragments.
             let mut combined_start = f64::INFINITY;
@@ -11235,6 +11305,7 @@ impl AppData {
             struct Fragments {
                 midi_notes: Vec<Note>,
                 audio_events: Vec<AudioEvent>,
+                video_events: Vec<common::model::VideoEvent>,
             }
             let mut frags = Fragments::default();
 
@@ -11279,11 +11350,21 @@ impl AppData {
                     // variant referenced from `Track.clips` is a
                     // stale link, skip silently.
                     ClipContent::Automation(_) => {}
-                    // Video Glue is wired in P6 (`docs/plan_video.md`
-                    // §4 P6). Until then, silently skip — combining
-                    // video clips needs source range partitioning
-                    // (micros) that P6 will own.
-                    ClipContent::Video(_) => {}
+                    // Video Glue (docs/plan_video.md §4 P6): same shift
+                    // logic as Audio. source_micros range stays as-is
+                    // per event since Glue doesn't change content
+                    // mapping, only repositions the events on the
+                    // combined timeline.
+                    ClipContent::Video(video) => {
+                        for ev in &video.events {
+                            frags.video_events.push(common::model::VideoEvent {
+                                event_start_in_clip_beats: ev
+                                    .event_start_in_clip_beats
+                                    + offset_into_combined,
+                                ..ev.clone()
+                            });
+                        }
+                    }
                 }
             }
             if !combined_start.is_finite() || !combined_end.is_finite() {
@@ -11301,14 +11382,18 @@ impl AppData {
 
             let combined_len = combined_end - combined_start;
             let new_content_id = self.song.alloc_content_id();
-            let new_content = if is_audio_kind {
-                ClipContent::Audio(AudioContent {
+            let new_content = match glue_kind {
+                GlueKind::Audio => ClipContent::Audio(AudioContent {
                     events: frags.audio_events,
-                })
-            } else {
-                let mut notes = frags.midi_notes;
-                notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
-                ClipContent::Midi(MidiContent { notes })
+                }),
+                GlueKind::Video => ClipContent::Video(common::model::VideoContent {
+                    events: frags.video_events,
+                }),
+                GlueKind::Midi => {
+                    let mut notes = frags.midi_notes;
+                    notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
+                    ClipContent::Midi(MidiContent { notes })
+                }
             };
             self.song.clip_contents.insert(new_content_id, new_content);
 
