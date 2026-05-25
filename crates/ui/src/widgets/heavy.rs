@@ -119,7 +119,7 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
     /// M14 Phase 71 (daw_01 #043): textured quad を scene に積む。
     ///
     /// UV 全域 + clip なし の convenience。 部分 UV / クリップが必要なら
-    /// [`Ui::push_textured_quad`] を直接呼ぶ。 video frame thumbnail (arrangement) や
+    /// [`Self::push_textured_quad`] を直接呼ぶ。 video frame thumbnail (arrangement) や
     /// preview window composite で使用する。 destroy 済 handle は描画 no-op。
     pub fn push_texture(&mut self, rect: Rect, texture: TextureHandle, alpha: f32) {
         self.ui.push_textured_quad(TexturedQuad {
@@ -130,6 +130,13 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
             uv_max: (1.0, 1.0),
             clip_rect: None,
         });
+    }
+
+    /// M14 Phase 71/72: 部分 UV / クリップ rect 指定が必要な textured quad 用の delegate。
+    /// arrangement の video clip thumbnail (rect 内 aspect-fit + lanes intersect clip) や
+    /// preview window 内の crop 描画で使用。
+    pub fn push_textured_quad(&mut self, quad: TexturedQuad) {
+        self.ui.push_textured_quad(quad);
     }
 
     /// Edit を発行する。ヒットテストで click を検出したらここから流す。

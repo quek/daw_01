@@ -221,6 +221,7 @@ fn main() {
                             color: None,
                             share_group_color: None,
                             audio_edit: None,
+                            thumbnail: None,
                         };
                     }),
                     ArrangementEditRequest::CloneClipsLinked(_) => {

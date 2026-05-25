@@ -57,6 +57,7 @@ pub use widgets::arrangement::{
     ClipDragKind, ClipFadeCurveDelta, ClipFadeDelta, ClipGainDelta, ClipKey, FadeCurve, FadeEdge,
     MASTER_TRACK_ID, MoveAutomationClipDelta, MoveAutomationPointDelta, MoveClipDelta,
     ResizeAutomationClipDelta, ResizeClipDelta, SelectModifier, SetAutomationCurveParamKind,
+    TrackKind,
     automation_clip_zone_at, automation_lane_at, automation_lane_header_layout,
     automation_lane_key_at_y, automation_lane_resize_splitter_at, automation_lanes_total_h,
     automation_point_at, clip_hit, clip_to_rect, effective_master_row_h, lane_disclosure_rect_for,

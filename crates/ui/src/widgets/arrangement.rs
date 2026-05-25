@@ -21,7 +21,7 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use daw_ui_platform::{CursorIcon, Modifiers};
-use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
+use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand, TextureHandle, TexturedQuad};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
@@ -105,6 +105,22 @@ pub enum FadeEdge {
     Out,
 }
 
+/// M14 Phase 72 (daw_01 #044): track 種別 (Audio = 既存挙動、 Video = video frame thumbnail 描画 +
+/// header layout 簡略化)。 default = `Audio` で既存 caller の breaking を最小化。
+///
+/// - **Audio**: 既存挙動完全互換 — header に instrument / fx_chain / volume / pan slot を描画、
+///   clip rect は waveform / MIDI note。
+/// - **Video**: header から instrument / fx_chain / volume / pan を **非描画** (M/S/R + name +
+///   lane disclosure のみ)、 行背景を [`ArrangementStyle::track_background_video`] で塗る、
+///   clip rect 内に `clip.thumbnail` が `Some` なら texture を aspect-fit (黒帯 letterbox) で
+///   描画、 `None` なら [`ArrangementStyle::video_clip_loading`] 単色 rect。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TrackKind {
+    #[default]
+    Audio,
+    Video,
+}
+
 /// 1 つの clip。`Arc<str>` で複数 clip 間の name 共有可能。
 #[derive(Clone, Debug)]
 pub struct ArrangementClip {
@@ -125,6 +141,14 @@ pub struct ArrangementClip {
     /// `SetClipGainDb` / `SetClipFade` / `SetClipFadeCurve` を発行する。 MIDI / Vocal clip は
     /// `None` で既存挙動 (clip 内 hit zone 全体が Move、 audio 描画なし)。
     pub audio_edit: Option<ArrangementClipAudioEdit>,
+    /// M14 Phase 72 (daw_01 #044): video clip 用 thumbnail。 `Some((handle, width, height))` で
+    /// widget が clip rect 内に texture を aspect-fit (黒帯 letterbox) で描画する。 `(width, height)`
+    /// は texture の native size (= [`daw_ui_renderer::Renderer::texture_size`] と同じ値)。 widget が
+    /// Renderer 参照を持たない設計と整合させるため caller が同梱で渡す前提
+    /// (daw_01 は ffmpeg-next decode 時の `VideoFrame.width/height` を流用すれば boilerplate ゼロ)。
+    /// `None` のときは `track.kind == Video` なら [`ArrangementStyle::video_clip_loading`] 単色 rect
+    /// 描画、 `Audio` なら field 自体が無視される (= caller が kind と clip 種別を一致させる責任)。
+    pub thumbnail: Option<(TextureHandle, u32, u32)>,
 }
 
 /// 1 つの track。`clips` は `start_beat` 昇順前提。
@@ -182,6 +206,10 @@ pub struct ArrangementTrack {
     /// override 済 (`Some`) track は global zoom に追従しない (per-track 自由度を尊重)。
     /// `lane.height_px` (lane 個別高さ) と独立で、 expanded 時の総高さは `row_h + Σ visible_lane.height_px`。
     pub row_h: Option<u16>,
+    /// M14 Phase 72 (daw_01 #044): track 種別 (Audio / Video)。 default = `Audio` で既存 caller 互換。
+    /// `Video` のとき: 行背景を `track_background_video` で塗る + header から instrument/fx_chain/
+    /// volume/pan slot を非描画 + clip 描画を thumbnail / loading 色に切り替える ([`TrackKind`] 参照)。
+    pub kind: TrackKind,
 }
 
 // ============================================================
@@ -855,6 +883,13 @@ pub struct ArrangementStyle {
     pub bg: Color,
     pub header_bg: Color,
     pub ruler_bg: Color,
+    /// M14 Phase 72 (daw_01 #044): video track の行背景 (audio track は既存 `bg` のまま)。
+    /// 推奨 default = 暗青 `rgb(0.13, 0.14, 0.18)` で audio 背景 (`rgb(0.10, 0.11, 0.13)`) と
+    /// 視覚区別。 lane 描画前に `track.kind == Video` のとき 1 度塗る。
+    pub track_background_video: Color,
+    /// M14 Phase 72 (daw_01 #044): video clip 内 `thumbnail = None` のときの fallback fill
+    /// (= decode 失敗 / loading 中)。 推奨 default = 暗グレー `rgb(0.18, 0.18, 0.20)`。
+    pub video_clip_loading: Color,
     pub bar_line: Color,
     pub beat_line: Color,
     pub bar_line_width_px: f32,
@@ -1108,6 +1143,10 @@ impl Default for ArrangementStyle {
             bg: Color::rgb(0.10, 0.11, 0.13),
             header_bg: Color::rgb(0.14, 0.15, 0.18),
             ruler_bg: Color::rgb(0.16, 0.17, 0.20),
+            // M14 Phase 72 (#044): 暗青で audio bg (rgb(0.10, 0.11, 0.13)) と視覚区別。
+            track_background_video: Color::rgb(0.13, 0.14, 0.18),
+            // M14 Phase 72 (#044): 暗グレーで「loading 中」 を控えめに表現。
+            video_clip_loading: Color::rgb(0.18, 0.18, 0.20),
             bar_line: Color::rgba(1.0, 1.0, 1.0, 0.30),
             beat_line: Color::rgba(1.0, 1.0, 1.0, 0.10),
             bar_line_width_px: 1.5,
@@ -1361,6 +1400,9 @@ fn synthesize_master_track(master: &ArrangementMasterRow) -> ArrangementTrack {
         // 強制 `false` 固定。 widget 側で master 行の R button hit は通常 track と同様に発火するが、
         // caller (daw_01) 側が master_id を弾く idiom (mute / solo と同じ取り扱い)。
         armed: false,
+        // M14 Phase 72 (#044): master row は audio 経路 (= 強制 Audio)。 video 編集中も master は
+        // automation lane のみで意味を持つ row なので kind 差別化なし。
+        kind: TrackKind::Audio,
         clips: Vec::new(),
         volume: 1.0,
         parent_id: None,
@@ -2430,6 +2472,10 @@ fn draw_lanes_bg<M: ?Sized + 'static>(
             push_filled_rect(hctx, row, style.track_selected_bg);
         } else if is_group_set.contains(&t.id) {
             push_filled_rect(hctx, row, style.track_group_bg);
+        } else if matches!(t.kind, TrackKind::Video) {
+            // M14 Phase 72 (#044): video track の行背景は暗青で audio と視覚区別 (selection /
+            // group は優先度高いまま、 通常 audio 行は base bg のまま)。
+            push_filled_rect(hctx, row, style.track_background_video);
         }
         if t.muted {
             push_filled_rect(
@@ -2512,7 +2558,43 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32, a: f32) -> Color {
     Color::rgba(r1 + m, g1 + m, b1 + m, a)
 }
 
-fn draw_clip<M: ?Sized + 'static>(
+/// M14 Phase 72 (daw_01 #044): `rect` 内に `(tex_w, tex_h)` の native aspect を保ったまま
+/// 中央 letterbox 配置した sub-rect を返す。 余白 (黒帯) は呼び出し側の base fill (= video
+/// clip では `video_clip_loading`) で見える。
+///
+/// - `tex_w` / `tex_h` = 0 は 1 に clamp (`u32` の 0 を許容しつつ ZeroDiv を回避)
+/// - `rect.h` 0 近傍も 0.001 に clamp (= rect 自身が 0 px 高さの異常 case で fit_h を 0 に押さえる)
+#[must_use]
+fn aspect_fit_rect(rect: Rect, tex_width: u32, tex_height: u32) -> Rect {
+    #[allow(clippy::cast_precision_loss)]
+    let texture_width = tex_width.max(1) as f32;
+    #[allow(clippy::cast_precision_loss)]
+    let texture_height = tex_height.max(1) as f32;
+    let tex_aspect = texture_width / texture_height;
+    let rect_aspect = (rect.w / rect.h.max(0.001)).max(0.001);
+    let (fit_w, fit_h) = if tex_aspect > rect_aspect {
+        // texture が rect より横長 → 上下 letterbox
+        (rect.w, rect.w / tex_aspect)
+    } else {
+        // texture が rect より縦長 (or 同 aspect) → 左右 letterbox
+        (rect.h * tex_aspect, rect.h)
+    };
+    let fit_x = rect.x + (rect.w - fit_w) * 0.5;
+    let fit_y = rect.y + (rect.h - fit_h) * 0.5;
+    Rect::new(fit_x, fit_y, fit_w, fit_h)
+}
+
+/// M14 Phase 72 (daw_01 #044): video track の clip 描画 (audio path とは別 helper)。
+///
+/// 描画順:
+/// 1. base fill: selected なら `clip_selected_fill`、 そうでなければ `video_clip_loading`
+///    (= letterbox の黒帯背景としても兼用、 selection 中は audio と同色で hint)
+/// 2. thumbnail = Some なら aspect-fit (黒帯 letterbox) で texture overlay (`HeavyCtx::push_textured_quad`)
+/// 3. name 描画 (audio 経路と同 idiom)
+///
+/// share_group_color / audio_edit overlay は video clip では描画しない (= caller 責任で audio 用
+/// field を video clip に詰めない前提、 widget は素直に skip)。
+fn draw_video_clip<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     r: Rect,
     clip: &ArrangementClip,
@@ -2520,7 +2602,69 @@ fn draw_clip<M: ?Sized + 'static>(
     lanes: Rect,
     selected: bool,
 ) {
+    let (fill, border, border_w, text_color) = if selected {
+        (
+            style.clip_selected_fill,
+            style.clip_selected_border,
+            style.clip_selected_border_w,
+            Color::rgb(0.10, 0.10, 0.15),
+        )
+    } else {
+        (
+            style.video_clip_loading,
+            style.clip_border,
+            style.clip_border_w,
+            style.clip_text_color,
+        )
+    };
+    hctx.push_rect(RectCommand {
+        rect: r,
+        fill,
+        border,
+        border_width: border_w,
+        radius: [style.clip_radius; 4],
+        clip_rect: Some(lanes),
+    });
+    if let Some((handle, tex_w_u, tex_h_u)) = clip.thumbnail {
+        hctx.push_textured_quad(TexturedQuad {
+            rect: aspect_fit_rect(r, tex_w_u, tex_h_u),
+            texture: handle,
+            alpha: 1.0,
+            uv_min: (0.0, 0.0),
+            uv_max: (1.0, 1.0),
+            // clip rect 内に閉じる (= drag 中の lanes 端で thumbnail がはみ出ない)。
+            clip_rect: Some(r.intersect(lanes)),
+        });
+    }
+    if r.w > 24.0 && r.h > style.clip_text_size + 2.0 {
+        hctx.push_text(GlyphArea {
+            text: clip.name.clone(),
+            left: r.x + 4.0,
+            top: r.y + 2.0,
+            font_size: style.clip_text_size,
+            line_height: style.clip_text_size * 1.2,
+            color: text_color,
+            clip_rect: Some(r),
+        });
+    }
+}
+
+fn draw_clip<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    r: Rect,
+    clip: &ArrangementClip,
+    style: &ArrangementStyle,
+    lanes: Rect,
+    selected: bool,
+    track_kind: TrackKind,
+) {
     if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
+        return;
+    }
+    // M14 Phase 72 (daw_01 #044): video track の clip は thumbnail + loading 色の専用 path。
+    // share_group_color / audio_edit は無視 (video clip では意味を持たない、 caller 責任)。
+    if matches!(track_kind, TrackKind::Video) {
+        draw_video_clip(hctx, r, clip, style, lanes, selected);
         return;
     }
     // M14 Phase 63e (#019) + Phase 63f (#022): 描画状態は (selected, share_group_color) の
@@ -2619,7 +2763,7 @@ fn draw_clips<M: ?Sized + 'static>(
                 continue;
             }
             let r = clip_to_rect(row_top, row_h, c, view, lanes);
-            draw_clip(hctx, r, c, style, lanes, false);
+            draw_clip(hctx, r, c, style, lanes, false, t.kind);
         }
     }
 }
@@ -2650,7 +2794,7 @@ fn draw_selection_overlay<M: ?Sized + 'static>(
                 continue;
             }
             let r = clip_to_rect(row_top, row_h, c, view, lanes);
-            draw_clip(hctx, r, c, style, lanes, true);
+            draw_clip(hctx, r, c, style, lanes, true, t.kind);
         }
     }
 }
@@ -2726,6 +2870,9 @@ fn draw_drag_preview<M: ?Sized + 'static>(
             color: None,
             share_group_color: None,
             audio_edit: None,
+            // M14 Phase 72 (#044): drag preview は overlay 用 (実 clip データを表示しない)、
+            // thumbnail は元 clip 側で描画済 (cached 内)、 preview は color + border のみ。
+            thumbnail: None,
         };
         // drag_preview_geometry が n_tracks 範囲内に clamp 済なので tops から必ず取れる前提。
         // 万一範囲外なら preview を skip (clip 描画消失だけで panic はしない、 defensive)。
@@ -4465,7 +4612,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     // === track row press (既存ロジック) ===
                     let row =
                         Rect { x: header_pane.x, y: row_top, w: header_pane.w, h: view.track_row_h };
-                    let layout = header_row_layout(row, style.track_volume_band_h);
+                    let band_h = if matches!(t.kind, TrackKind::Video) {
+                        // M14 Phase 72 (#044): video track では volume slider band を非表示
+                        // (volume / pan は video には意味を持たない、 instrument / fx_chain と同様)。
+                        0.0
+                    } else {
+                        style.track_volume_band_h
+                    };
+                    let layout = header_row_layout(row, band_h);
                     if let Some(band) = layout.volume_band
                         && band.contains(px, py)
                     {
@@ -7431,7 +7585,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     w: (row.w - indent).max(2.0),
                     h: row.h,
                 };
-                let layout = header_row_layout(row_for_layout, style.track_volume_band_h);
+                let band_h = if matches!(t.kind, TrackKind::Video) {
+                    // M14 Phase 72 (#044): video track は volume band を非描画。
+                    0.0
+                } else {
+                    style.track_volume_band_h
+                };
+                let layout = header_row_layout(row_for_layout, band_h);
                 let name_rect = layout.name_rect;
                 let [m_rect, s_rect, r_rect] = layout.buttons;
 
@@ -7798,6 +7958,7 @@ mod tests {
             color: None,
             share_group_color: None,
             audio_edit: None,
+            thumbnail: None,
         }
     }
 
@@ -7817,6 +7978,7 @@ mod tests {
             color: None,
             share_group_color: None,
             audio_edit: Some(audio),
+            thumbnail: None,
         }
     }
 
@@ -7835,6 +7997,7 @@ mod tests {
             automation_lanes: Vec::new(),
             collapsed: false,
             row_h: None,
+            kind: TrackKind::Audio,
         }
     }
 
@@ -8373,6 +8536,97 @@ mod tests {
         assert_eq!(rects[0].0, ClipKey { track: 1, clip: 11 });
     }
 
+    // ============================================================
+    // M14 Phase 72 (daw_01 #044): video track / thumbnail
+    // ============================================================
+
+    #[test]
+    fn track_kind_default_is_audio() {
+        assert_eq!(TrackKind::default(), TrackKind::Audio);
+    }
+
+    #[test]
+    fn aspect_fit_rect_letterbox_for_wide_texture() {
+        // 100x100 rect に 16:9 (= 1920x1080) texture → fit_w=100, fit_h=100*(9/16)=56.25
+        let fit = aspect_fit_rect(Rect::new(0.0, 0.0, 100.0, 100.0), 1920, 1080);
+        assert!((fit.w - 100.0).abs() < 1e-3);
+        assert!((fit.h - 56.25).abs() < 1e-3);
+        // 中央 letterbox: 上下に (100-56.25)/2 = 21.875 px の黒帯
+        assert!((fit.x - 0.0).abs() < 1e-3);
+        assert!((fit.y - 21.875).abs() < 1e-3);
+    }
+
+    #[test]
+    fn aspect_fit_rect_letterbox_for_tall_texture() {
+        // 100x100 rect に 9:16 (= 1080x1920) texture → fit_w=100*(9/16)=56.25, fit_h=100
+        let fit = aspect_fit_rect(Rect::new(10.0, 20.0, 100.0, 100.0), 1080, 1920);
+        assert!((fit.w - 56.25).abs() < 1e-3);
+        assert!((fit.h - 100.0).abs() < 1e-3);
+        // 左右に letterbox: x = 10 + (100-56.25)/2 = 31.875
+        assert!((fit.x - 31.875).abs() < 1e-3);
+        assert!((fit.y - 20.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn aspect_fit_rect_same_aspect_no_letterbox() {
+        // 100x50 rect に 2:1 (= 1920x960) texture → fit 全面で letterbox なし
+        let fit = aspect_fit_rect(Rect::new(0.0, 0.0, 100.0, 50.0), 1920, 960);
+        assert!((fit.w - 100.0).abs() < 1e-3);
+        assert!((fit.h - 50.0).abs() < 1e-3);
+        assert!(fit.x.abs() < 1e-3);
+        assert!(fit.y.abs() < 1e-3);
+    }
+
+    #[test]
+    fn aspect_fit_rect_zero_texture_clamped_to_one() {
+        // tex_w = tex_h = 0 で panic / div-by-zero しない (1:1 aspect で正方形 fit)
+        let fit = aspect_fit_rect(Rect::new(0.0, 0.0, 100.0, 200.0), 0, 0);
+        // 1:1 aspect で rect の短辺 (= 100) に合わせる → fit_w=fit_h=100、 縦に letterbox
+        assert!((fit.w - 100.0).abs() < 1e-3);
+        assert!((fit.h - 100.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn arrangement_track_kind_field_round_trip() {
+        let t = ArrangementTrack {
+            id: 99,
+            name: Arc::from("video1"),
+            muted: false,
+            solo: false,
+            armed: false,
+            clips: Vec::new(),
+            volume: 1.0,
+            parent_id: None,
+            depth: 0,
+            collapsed: false,
+            kind: TrackKind::Video,
+            automation_lanes_collapsed: true,
+            automation_lanes: Vec::new(),
+            row_h: None,
+        };
+        assert_eq!(t.kind, TrackKind::Video);
+    }
+
+    #[test]
+    fn arrangement_clip_thumbnail_field_round_trip() {
+        use std::num::NonZeroU32;
+        let h = TextureHandle::from_raw(NonZeroU32::new(7).unwrap());
+        let c = ArrangementClip {
+            id: 1,
+            start_beat: 0.0,
+            len_beats: 4.0,
+            name: Arc::from("v_clip"),
+            color: None,
+            share_group_color: None,
+            audio_edit: None,
+            thumbnail: Some((h, 1920, 1080)),
+        };
+        let (got_h, w, ht) = c.thumbnail.unwrap();
+        assert_eq!(got_h.raw(), 7);
+        assert_eq!(w, 1920);
+        assert_eq!(ht, 1080);
+    }
+
     #[test]
     fn drag_preview_geometry_move_clamps_track() {
         let anchor = ClipDragAnchor {
@@ -8874,6 +9128,7 @@ mod tests {
             parent_id,
             depth,
             collapsed,
+            kind: TrackKind::Audio,
             automation_lanes_collapsed: true,
             automation_lanes: Vec::new(),
             row_h: None,

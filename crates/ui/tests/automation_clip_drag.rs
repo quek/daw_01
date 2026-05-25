@@ -13,7 +13,7 @@ use daw_ui_core::{
     ArrangementClip, ArrangementCurveKind, ArrangementEditRequest, ArrangementStyle,
     ArrangementTrack, ArrangementView, AutomationClipKey, AutomationLaneKey, ClipDragKind, Edit,
     FrameInput, MoveAutomationClipDelta, PointerFrame, ResizeAutomationClipDelta, SnapConfig,
-    UiHost, automation_clip_zone_at, automation_lane_key_at_y, visible_track_row_tops,
+    TrackKind, UiHost, automation_clip_zone_at, automation_lane_key_at_y, visible_track_row_tops,
 };
 use daw_ui_platform::{Modifiers, PhysicalSize};
 use daw_ui_renderer::{Color, Rect, Scene};
@@ -79,6 +79,7 @@ fn make_track(id: u32, lanes: Vec<ArrangementAutomationLane>) -> ArrangementTrac
         parent_id: None,
         depth: 0,
         collapsed: false,
+        kind: TrackKind::Audio,
         automation_lanes_collapsed: false,
         automation_lanes: lanes,
         row_h: None,

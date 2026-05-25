@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use daw_ui_core::{
     ArrangementAutomationLane, ArrangementClip, ArrangementEditRequest, ArrangementStyle,
-    ArrangementTrack, ArrangementView, Edit, FrameInput, PointerFrame, SnapConfig, UiHost,
-    lane_disclosure_rect_for,
+    ArrangementTrack, ArrangementView, Edit, FrameInput, PointerFrame, SnapConfig, TrackKind,
+    UiHost, lane_disclosure_rect_for,
 };
 use daw_ui_platform::{Modifiers, PhysicalSize};
 use daw_ui_renderer::{Color, Rect, Scene};
@@ -49,6 +49,7 @@ fn make_track(id: u32, lanes: Vec<ArrangementAutomationLane>) -> ArrangementTrac
         parent_id: None,
         depth: 0,
         collapsed: false,
+        kind: TrackKind::Audio,
         automation_lanes_collapsed: true, // 起動時は全 collapsed
         automation_lanes: lanes,
         row_h: None,
@@ -67,6 +68,7 @@ fn make_track_expanded(id: u32, lanes: Vec<ArrangementAutomationLane>) -> Arrang
         parent_id: None,
         depth: 0,
         collapsed: false,
+        kind: TrackKind::Audio,
         automation_lanes_collapsed: false, // expanded で start
         automation_lanes: lanes,
         row_h: None,

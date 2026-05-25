@@ -850,11 +850,17 @@ fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
                         fade_in_curve: e.fade_in_curve,
                         fade_out_curve: e.fade_out_curve,
                     }),
+                    // M14 Phase 72 (#044): daw_prototype は全 clip を audio として扱う (= 既存挙動互換)。
+                    // video 編集機能の demo は daw_01 本体側で wire (gui_01 example で video frame
+                    // decode しない方針、 KISS)。
+                    thumbnail: None,
                 })
                 .collect(),
             parent_id: t.parent_id,
             depth: depth_of(t.id),
             collapsed: m.arr_collapsed_groups.contains(&t.id),
+            // M14 Phase 72 (#044): daw_prototype は audio track のみ (= 既存挙動互換)。
+            kind: daw_ui_core::TrackKind::Audio,
             // M14 Phase 63n-2 (#028): caller-side store (`arr_automation_lanes`) から取得 (clone)。
             // 初回 frame で `DawModel::new()` が track_id == 1 のみ sample lane (Volume / Pan) を
             // seed 済 (= 既存挙動互換、 disclosure 描画なし for 他 track)。 user 編集 (Add /

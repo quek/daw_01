@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use daw_ui_core::{
     ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView,
-    Edit, FrameInput, MoveClipDelta, PointerFrame, SnapConfig, SnapMode, UiHost,
+    Edit, FrameInput, MoveClipDelta, PointerFrame, SnapConfig, SnapMode, TrackKind, UiHost,
 };
 use daw_ui_platform::{Modifiers, PhysicalSize};
 use daw_ui_renderer::{Rect, Scene};
@@ -92,11 +92,13 @@ fn arr_model() -> ArrModel {
             color: None,
             share_group_color: None,
             audio_edit: None,
+            thumbnail: None,
         }],
         volume: 1.0,
         parent_id: None,
         depth: 0,
         collapsed: false,
+        kind: TrackKind::Audio,
         automation_lanes_collapsed: true,
         automation_lanes: Vec::new(),
         row_h: None,
