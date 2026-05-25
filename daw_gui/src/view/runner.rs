@@ -75,12 +75,16 @@ struct RunnerState {
     /// を受け付ける。 P5 で video frame、 P7 で composite texture を
     /// `scene` に push する経路がここに繋がる。
     preview: Option<crate::view::preview_window::PreviewWindowState>,
-    /// docs/plan_video.md P5: per-source IMFSourceReader を抱える
-    /// playback decoder。 process 起動時に作成、 各 render_frame で
-    /// playhead を元に active video clip の current frame を decode
-    /// → preview window の `frame_texture` に upload する。
+    /// docs/plan_video.md §3 P5: background worker thread that owns
+    /// the per-source IMFSourceReader pool. The GUI thread sends
+    /// decode requests via `worker.request(...)` (= non-blocking,
+    /// latest-target-wins coalescing per source) and drains finished
+    /// frames via `worker.drain_results()` each main-loop iteration.
+    /// Replaces the previous synchronous `VideoPlaybackEngine` field
+    /// — that path froze the GUI for 30-100ms per frame at 1080p60
+    /// (= the user's "Stop button 5 sec freeze" pathology).
     #[cfg(windows)]
-    playback: crate::video_playback::VideoPlaybackEngine,
+    playback_worker: crate::video_playback_worker::PreviewDecodeWorker,
     /// docs/plan_video.md P5 perf: 直近に preview decode を駆動した時刻。
     /// `drive_preview_playback` を `Song.video_framerate` Hz に throttle
     /// する基準。 main loop は vsync で 60fps+ 回るが、 video preview は
@@ -158,7 +162,7 @@ impl ApplicationHandler<AppEvent> for Runner {
             last_title: "daw_01".to_string(),
             preview: None,
             #[cfg(windows)]
-            playback: crate::video_playback::VideoPlaybackEngine::new(),
+            playback_worker: crate::video_playback_worker::PreviewDecodeWorker::new(),
             #[cfg(windows)]
             last_preview_drive_at: None,
         });
@@ -464,26 +468,35 @@ impl Runner {
         }
     }
 
-    /// docs/plan_video.md P7: drive multi-clip playback decode +
-    /// upload + composite for the preview window. Asks the engine
-    /// for every active video clip at the playhead, decodes each one,
-    /// uploads to per-source GPU textures, and hands the bottom→top
-    /// composite list to the preview. When the playhead is outside
-    /// every video clip, clears the composite list so the placeholder
-    /// shows. Per-source decode failures log at warn level and skip
-    /// just that layer — the rest of the composite still draws.
+    /// docs/plan_video.md §3 P5: drive multi-clip playback for the
+    /// preview window via the background decode worker.
     ///
-    /// Throttled to `Song.video_framerate` (typical 30fps). The
-    /// main loop redraws at vsync (60+fps), but decoding faster than
-    /// the project's video framerate doesn't change what's on screen
-    /// — frame buckets repeat. Skipping the redundant calls halves
-    /// CPU pressure for 60Hz monitors with a 30fps project.
+    /// Each call:
+    ///   1. Drains any decoded frames the worker has finished since
+    ///      last cycle and uploads them into per-source GPU textures.
+    ///   2. Computes the currently-active source list at the playhead.
+    ///   3. Sends a decode request to the worker for each active
+    ///      source (= latest-target-wins coalescing inside the worker).
+    ///   4. Builds the composite layer list from whatever textures
+    ///      are currently in `preview.frame_textures` — that's the
+    ///      newest decoded frame per source, possibly slightly behind
+    ///      the playhead if the worker hasn't caught up yet. The user
+    ///      sees a held frame instead of a stutter.
+    ///
+    /// Throttled to `Song.video_framerate` (typical 30fps). The main
+    /// loop runs at vsync; throttling avoids spamming the worker with
+    /// requests that would just overwrite each other.
     #[cfg(windows)]
     fn drive_preview_playback(state: &mut RunnerState) {
+        // Step 1: always drain results first, even on throttled
+        // frames. Decoded frames are precious — uploading them is
+        // cheap (GPU memcpy) and keeps the texture fresh.
+        Self::drain_preview_worker_results(state);
+
         let Some(preview) = state.preview.as_mut() else {
             return;
         };
-        // Throttle to project framerate. Use a small floor (24fps =
+        // Throttle the request side. Use a small floor (24fps =
         // ~41ms) so a malformed project framerate (0 / NaN) still
         // permits some decoding.
         let frame_interval_ms = {
@@ -497,6 +510,7 @@ impl Runner {
             return;
         }
         state.last_preview_drive_at = Some(now);
+
         let Some(playhead_beat) = state.app.playhead_beat.map(f64::from) else {
             preview.set_composite_layers(Vec::new());
             return;
@@ -514,9 +528,11 @@ impl Runner {
             .file_path
             .as_ref()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
-        let mut layers: Vec<crate::view::preview_window::CompositeLayer> =
-            Vec::with_capacity(active.len());
-        for frame_info in active {
+
+        // Step 3: enqueue a decode for each active source. The worker
+        // coalesces multiple requests for the same source — only the
+        // latest target is decoded.
+        for frame_info in &active {
             let Some(abs_path) = resolve_video_path(
                 &state.app.song,
                 frame_info.video_source_id,
@@ -529,36 +545,68 @@ impl Runner {
                 );
                 continue;
             };
-            match state.playback.decode_at(
+            state.playback_worker.request(
                 frame_info.video_source_id,
-                &abs_path,
+                abs_path,
                 frame_info.source_micros,
-            ) {
+            );
+        }
+
+        // Step 4: build composite layers from whatever textures are
+        // currently cached. If the worker hasn't produced a frame for
+        // a particular source yet (= first frame after import), we
+        // skip that layer this cycle and the preview shows whatever
+        // other layers are ready (or placeholder if none).
+        let mut layers: Vec<crate::view::preview_window::CompositeLayer> =
+            Vec::with_capacity(active.len());
+        for frame_info in active {
+            if let Some((handle, w, h)) =
+                preview.frame_textures.get(&frame_info.video_source_id).copied()
+            {
+                layers.push(crate::view::preview_window::CompositeLayer {
+                    texture: handle,
+                    width: w,
+                    height: h,
+                    alpha: frame_info.alpha,
+                });
+            }
+        }
+        preview.set_composite_layers(layers);
+    }
+
+    /// docs/plan_video.md §3 P5: drain the worker's result channel
+    /// and upload each successfully decoded frame into the preview
+    /// window's per-source texture. Idempotent / cheap when the worker
+    /// is idle (= empty drain returns immediately).
+    #[cfg(windows)]
+    fn drain_preview_worker_results(state: &mut RunnerState) {
+        let results = state.playback_worker.drain_results();
+        if results.is_empty() {
+            return;
+        }
+        let Some(preview) = state.preview.as_mut() else {
+            return; // preview window closed; drop the results.
+        };
+        for result in results {
+            match result.frame {
                 Ok(frame) => {
-                    let handle = preview.upload_frame(
-                        frame_info.video_source_id,
+                    preview.upload_frame(
+                        result.source_id,
                         frame.width,
                         frame.height,
                         &frame.rgba,
                     );
-                    layers.push(crate::view::preview_window::CompositeLayer {
-                        texture: handle,
-                        width: frame.width,
-                        height: frame.height,
-                        alpha: frame_info.alpha,
-                    });
                 }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        video_source_id = frame_info.video_source_id,
-                        source_micros = frame_info.source_micros,
-                        "preview decode failed, layer skipped"
+                        video_source_id = result.source_id,
+                        source_micros = result.target_micros,
+                        "preview decode failed (worker), layer skipped"
                     );
                 }
             }
         }
-        preview.set_composite_layers(layers);
     }
 
     /// docs/plan_video.md P3.5: drain `AppData.pending_thumbnail_uploads`

@@ -21,6 +21,8 @@ pub mod import_video;
 pub mod render_video;
 #[cfg(windows)]
 pub mod video_playback;
+#[cfg(windows)]
+pub mod video_playback_worker;
 pub mod job;
 pub mod midi;
 pub mod midi_export;
