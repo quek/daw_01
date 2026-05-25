@@ -20,9 +20,8 @@ use std::path::Path;
 use common::model::{FadeCurve, Song, TrackKind, VideoEvent, VideoSourceId};
 use windows::Win32::Media::MediaFoundation::{
     IMFSample, IMFSourceReader, MFCreateAttributes, MFCreateMediaType,
-    MFCreateSourceReaderFromURL, MFMediaType_Video, MFVideoInterlace_Progressive,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
+    MFCreateSourceReaderFromURL, MFMediaType_Video, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
+    MF_MT_SUBTYPE, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
     MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READERF_ENDOFSTREAM, MFVideoFormat_RGB32,
 };
 use windows::Win32::System::Com::StructuredStorage::{
@@ -411,43 +410,37 @@ fn create_reader_for_source(path: &Path) -> Result<ReaderEntry, String> {
     if native_w == 0 || native_h == 0 {
         return Err(format!("invalid frame size {native_w}x{native_h}"));
     }
-    let (target_w, target_h) = scale_for_preview(native_w, native_h);
-    // Pull native FRAME_RATE / PIXEL_ASPECT_RATIO so the output type
-    // we build below is a complete + consistent description that the
-    // video processor MFT will accept. Missing FRAME_RATE in particular
-    // returns `MF_E_INVALIDMEDIATYPE` (0xC00D36B4) for H.264 sources;
-    // `CopyAllItems` looked attractive but drags in H.264-specific
-    // attributes (MPEG2_PROFILE / SEQUENCE_HEADER / ...) that are then
-    // incompatible with the RGB32 subtype. Fresh + minimal is the
-    // robust path.
-    let native_frame_rate =
-        unsafe { native.GetUINT64(&MF_MT_FRAME_RATE) }.unwrap_or((30_u64 << 32) | 1_u64);
-    let native_par = unsafe { native.GetUINT64(&MF_MT_PIXEL_ASPECT_RATIO) }
-        .unwrap_or((1_u64 << 32) | 1_u64);
 
+    // Minimal output type — request only RGB32 subtype + the major
+    // type. Empirically WMF's video processor MFT accepts this on
+    // every H.264 / HEVC source we tested and falls back to native
+    // dimensions automatically.
+    //
+    // **NB**: Earlier attempts to ask WMF to scale down at decode time
+    // (by also setting `MF_MT_FRAME_SIZE` to a target like 960x540)
+    // returned `MF_E_INVALIDMEDIATYPE` (0xC00D36B4) on the user's
+    // 1920x1080 60fps source even with INTERLACE_MODE + FRAME_RATE +
+    // PIXEL_ASPECT_RATIO populated — the video processor MFT seems to
+    // accept format conversion but not arbitrary scaling for this
+    // codec/driver combination. Preview throughput is therefore
+    // limited by native-resolution decode; the proper fix is the
+    // background worker thread described in `docs/plan_video.md` §3
+    // (= lookahead ring buffer), which sits above this layer.
     let output = unsafe {
         let t = MFCreateMediaType().map_err(|e| format!("MFCreateMediaType: {e}"))?;
         t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
             .map_err(|e| format!("set MAJOR_TYPE: {e}"))?;
         t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
             .map_err(|e| format!("set SUBTYPE RGB32: {e}"))?;
-        t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
-            .map_err(|e| format!("set INTERLACE_MODE: {e}"))?;
-        let packed = ((target_w as u64) << 32) | (target_h as u64);
-        t.SetUINT64(&MF_MT_FRAME_SIZE, packed)
-            .map_err(|e| format!("set output FRAME_SIZE: {e}"))?;
-        t.SetUINT64(&MF_MT_FRAME_RATE, native_frame_rate)
-            .map_err(|e| format!("set output FRAME_RATE: {e}"))?;
-        t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, native_par)
-            .map_err(|e| format!("set output PIXEL_ASPECT_RATIO: {e}"))?;
         t
     };
     unsafe { reader.SetCurrentMediaType(stream, None, &output) }
         .map_err(|e| format!("SetCurrentMediaType RGB32: {e}"))?;
 
-    // Read back the actual delivered frame size — if WMF couldn't honor
-    // our request it may have picked a different size. Trust the
-    // post-Set output type, not our expectation.
+    // Read back the delivered frame size — even when we don't request
+    // scaling, WMF may pad e.g. 1080→1088 to satisfy H.264 macroblock
+    // alignment. Trust the post-Set output type so the buffer math
+    // below uses the actual delivered dimensions.
     let actual_size = unsafe {
         let cur = reader
             .GetCurrentMediaType(stream)
@@ -457,6 +450,11 @@ fn create_reader_for_source(path: &Path) -> Result<ReaderEntry, String> {
     };
     let actual_w = (actual_size >> 32) as u32;
     let actual_h = (actual_size & 0xFFFF_FFFF) as u32;
+
+    // `scale_for_preview` is kept as a pure helper for future use
+    // (e.g. once we have an explicit video processor MFT) — silence
+    // the unused-fn warning by referencing it here.
+    let _ = scale_for_preview;
 
     Ok(ReaderEntry {
         reader,
