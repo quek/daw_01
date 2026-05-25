@@ -20,8 +20,9 @@ use std::path::Path;
 use common::model::{FadeCurve, Song, TrackKind, VideoEvent, VideoSourceId};
 use windows::Win32::Media::MediaFoundation::{
     IMFSample, IMFSourceReader, MFCreateAttributes, MFCreateMediaType,
-    MFCreateSourceReaderFromURL, MFMediaType_Video, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
-    MF_MT_SUBTYPE, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
+    MFCreateSourceReaderFromURL, MFMediaType_Video, MFVideoInterlace_Progressive,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
     MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READERF_ENDOFSTREAM, MFVideoFormat_RGB32,
 };
 use windows::Win32::System::Com::StructuredStorage::{
@@ -410,7 +411,19 @@ fn create_reader_for_source(path: &Path) -> Result<ReaderEntry, String> {
     if native_w == 0 || native_h == 0 {
         return Err(format!("invalid frame size {native_w}x{native_h}"));
     }
-    let (width, height) = scale_for_preview(native_w, native_h);
+    let (target_w, target_h) = scale_for_preview(native_w, native_h);
+    // Pull native FRAME_RATE / PIXEL_ASPECT_RATIO so the output type
+    // we build below is a complete + consistent description that the
+    // video processor MFT will accept. Missing FRAME_RATE in particular
+    // returns `MF_E_INVALIDMEDIATYPE` (0xC00D36B4) for H.264 sources;
+    // `CopyAllItems` looked attractive but drags in H.264-specific
+    // attributes (MPEG2_PROFILE / SEQUENCE_HEADER / ...) that are then
+    // incompatible with the RGB32 subtype. Fresh + minimal is the
+    // robust path.
+    let native_frame_rate =
+        unsafe { native.GetUINT64(&MF_MT_FRAME_RATE) }.unwrap_or((30_u64 << 32) | 1_u64);
+    let native_par = unsafe { native.GetUINT64(&MF_MT_PIXEL_ASPECT_RATIO) }
+        .unwrap_or((1_u64 << 32) | 1_u64);
 
     let output = unsafe {
         let t = MFCreateMediaType().map_err(|e| format!("MFCreateMediaType: {e}"))?;
@@ -418,24 +431,37 @@ fn create_reader_for_source(path: &Path) -> Result<ReaderEntry, String> {
             .map_err(|e| format!("set MAJOR_TYPE: {e}"))?;
         t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
             .map_err(|e| format!("set SUBTYPE RGB32: {e}"))?;
-        // Explicitly request a downscaled output frame size — WMF's
-        // video processor MFT inserts a scaler when this differs from
-        // the native input dimensions. Saves CPU+GPU upload bandwidth
-        // at preview (= the visible target maxes at 960px), while
-        // export still goes through the separate `render_video`
-        // pipeline that decodes at native via its own reader.
-        let packed = ((width as u64) << 32) | (height as u64);
+        t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
+            .map_err(|e| format!("set INTERLACE_MODE: {e}"))?;
+        let packed = ((target_w as u64) << 32) | (target_h as u64);
         t.SetUINT64(&MF_MT_FRAME_SIZE, packed)
             .map_err(|e| format!("set output FRAME_SIZE: {e}"))?;
+        t.SetUINT64(&MF_MT_FRAME_RATE, native_frame_rate)
+            .map_err(|e| format!("set output FRAME_RATE: {e}"))?;
+        t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, native_par)
+            .map_err(|e| format!("set output PIXEL_ASPECT_RATIO: {e}"))?;
         t
     };
     unsafe { reader.SetCurrentMediaType(stream, None, &output) }
         .map_err(|e| format!("SetCurrentMediaType RGB32: {e}"))?;
 
+    // Read back the actual delivered frame size — if WMF couldn't honor
+    // our request it may have picked a different size. Trust the
+    // post-Set output type, not our expectation.
+    let actual_size = unsafe {
+        let cur = reader
+            .GetCurrentMediaType(stream)
+            .map_err(|e| format!("GetCurrentMediaType after Set: {e}"))?;
+        cur.GetUINT64(&MF_MT_FRAME_SIZE)
+            .map_err(|e| format!("output MF_MT_FRAME_SIZE: {e}"))?
+    };
+    let actual_w = (actual_size >> 32) as u32;
+    let actual_h = (actual_size & 0xFFFF_FFFF) as u32;
+
     Ok(ReaderEntry {
         reader,
-        width,
-        height,
+        width: actual_w,
+        height: actual_h,
         last_decoded_micros: None,
     })
 }
