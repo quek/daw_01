@@ -31,7 +31,7 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11DeviceContext, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::Graphics::Dxgi::{IDXGIKeyedMutex, IDXGIResource1};
+use windows::Win32::Graphics::Dxgi::IDXGIResource1;
 use windows::Win32::Media::MediaFoundation::{
     IMFDXGIBuffer, IMFDXGIDeviceManager, IMFSample, IMFSourceReader,
     MFCreateAttributes, MFCreateDXGIDeviceManager, MFCreateMediaType,
@@ -163,16 +163,45 @@ struct ReaderEntry {
 /// lazily on first HW decode (`sample_to_shared`), reused for every
 /// subsequent frame for the same `VideoSourceId`. Dropped only when
 /// the engine itself is dropped (= process exit for MVP).
+///
+/// # Cross-API synchronisation (read this before adding mutex code)
+///
+/// The texture is created with `SHARED_KEYEDMUTEX` because the gui_01
+/// Vulkan / DX12 importer drivers expect that flag on the source
+/// resource — without it the import is rejected on some drivers. **We
+/// do not actually use the keyed mutex** for serialisation:
+///
+/// - Worker (this file) writes via D3D11 `CopySubresourceRegion`.
+/// - Main thread (`view/runner.rs`) samples via wgpu (DX12 or Vulkan
+///   command queue), which is a *different* GPU command queue from
+///   D3D11.
+/// - `IDXGIKeyedMutex::AcquireSync` / `ReleaseSync` are CPU-side
+///   blocking calls; they do **not** insert cross-queue GPU fences.
+///   Calling them on the worker side only would just be a self-lock
+///   (= worker re-acquires immediately, no actual sync), and wgpu
+///   29.0.1 does not expose `VULKAN_EXTERNAL_SEMAPHORE_WIN32` so the
+///   main thread cannot import the matching semaphore to do real
+///   cross-queue handoff.
+///
+/// Current code therefore relies on the **driver-level implicit
+/// barriers** that NVIDIA / Intel / AMD Windows drivers insert around
+/// imported shared memory accesses. Empirically this works
+/// (no tearing observed on NVIDIA Vulkan, 2026-05-25); other drivers
+/// may need explicit sync.
+///
+/// Proper fix lives in gui_01 / wgpu (= `Renderer` API to import a
+/// D3D11 keyed-mutex semaphore on Vulkan / DX12 — would be a separate
+/// gui_01 phase request); the worker would then signal a semaphore
+/// after `Flush` and the main thread would wait on it before queuing
+/// the sample command. Until that API exists, do not re-add the
+/// useless worker-side Acquire/Release pair — it gives a false sense
+/// of safety.
 struct SharedEntry {
     /// Our owned D3D11 texture, created with `SHARED_NTHANDLE +
     /// SHARED_KEYEDMUTEX`. The WMF decoder writes into a texture from
     /// its own pool; we `CopySubresourceRegion` from that into this
     /// shared destination on each frame.
     texture: ID3D11Texture2D,
-    /// `IDXGIKeyedMutex` view of `texture`. Worker acquires before
-    /// `CopySubresourceRegion`, releases after. Main thread acquires
-    /// before push_textured_quad, releases after the wgpu submit.
-    mutex: IDXGIKeyedMutex,
     /// Cached NT handle from `IDXGIResource1::CreateSharedHandle`.
     /// Stable across the entry's lifetime — wrapped in `SendHandle`
     /// when it leaves the worker thread.
@@ -924,16 +953,19 @@ fn sample_buffer_to_bgra(
 /// On first call for a `ReaderEntry`, allocates the shared
 /// destination (`SHARED_NTHANDLE + SHARED_KEYEDMUTEX`,
 /// `B8G8R8A8_UNORM` to match WMF's `MFVideoFormat_ARGB32` output =
-/// byte-identical 32-bit BGRA layout) + caches its `IDXGIKeyedMutex`
-/// + creates the NT handle via `IDXGIResource1::CreateSharedHandle`.
-/// The handle is stable so the main thread imports it into wgpu
-/// exactly once.
+/// byte-identical 32-bit BGRA layout) + creates the NT handle via
+/// `IDXGIResource1::CreateSharedHandle`. The handle is stable so the
+/// main thread imports it into wgpu exactly once.
 ///
-/// Keyed-mutex protocol: worker `AcquireSync(0, INFINITE)` →
-/// `CopySubresourceRegion` → `ReleaseSync(0)`. Main thread mirrors
-/// this around its `Scene::push_textured_quad` + `Renderer::present`
-/// boundary (`view/runner.rs`). Both sides use key `0` as the
-/// "available" state; the mutex serialises read vs write.
+/// **No explicit cross-queue synchronisation.** `CopySubresourceRegion`
+/// is queued on the D3D11 context and submitted via `Flush`; the main
+/// thread samples the same texture from a separate wgpu command queue
+/// (DX12 or Vulkan). The driver inserts implicit barriers around
+/// imported shared resources on NVIDIA / Intel / AMD Windows, so
+/// tearing has not been observed in practice. See `SharedEntry` doc
+/// for why we do **not** call `IDXGIKeyedMutex::AcquireSync` here
+/// (= it would be a self-lock; wgpu 29.0.1 cannot import the matching
+/// Vulkan semaphore).
 fn write_to_shared_texture(
     dxgi: &IMFDXGIBuffer,
     entry: &mut ReaderEntry,
@@ -961,13 +993,6 @@ fn write_to_shared_texture(
         .as_ref()
         .ok_or_else(|| "shared texture init failed".to_string())?;
 
-    // Acquire the keyed mutex before writing. `INFINITE` waits for
-    // the main thread's render submit to release; in steady-state
-    // this is sub-millisecond because the main thread releases
-    // immediately after queueing the textured-quad command.
-    unsafe { shared.mutex.AcquireSync(0, u32::MAX) }
-        .map_err(|e| format!("worker mutex AcquireSync: {e}"))?;
-
     unsafe {
         d3d11.context.CopySubresourceRegion(
             &shared.texture,
@@ -985,16 +1010,15 @@ fn write_to_shared_texture(
     // observe an older frame for several render cycles.
     unsafe { d3d11.context.Flush() };
 
-    unsafe { shared.mutex.ReleaseSync(0) }
-        .map_err(|e| format!("worker mutex ReleaseSync: {e}"))?;
-
     Ok(shared.handle)
 }
 
 /// Allocate one `SharedEntry`: a `B8G8R8A8_UNORM` D3D11 texture with
-/// `SHARED_NTHANDLE + SHARED_KEYEDMUTEX`, plus its `IDXGIKeyedMutex`
-/// view and the NT handle from `IDXGIResource1::CreateSharedHandle`.
-/// Called exactly once per `ReaderEntry`.
+/// `SHARED_NTHANDLE + SHARED_KEYEDMUTEX` flags + the NT handle from
+/// `IDXGIResource1::CreateSharedHandle`. Called exactly once per
+/// `ReaderEntry`. The keyed-mutex flag is required by gui_01's
+/// Vulkan / DX12 importer drivers; we never `AcquireSync` it
+/// ourselves (see `SharedEntry` doc).
 fn create_shared_entry(
     source: &ID3D11Texture2D,
     d3d11: &D3D11WmfState,
@@ -1032,15 +1056,11 @@ fn create_shared_entry(
     .map_err(|e| format!("shared CreateTexture2D: {e}"))?;
     let texture = texture.ok_or_else(|| "shared texture null".to_string())?;
 
-    // Cast → IDXGIResource1 for CreateSharedHandle, → IDXGIKeyedMutex
-    // for AcquireSync / ReleaseSync. Both interfaces are inherited
-    // by an ID3D11Texture2D created with the SHARED_* flags.
+    // Cast → IDXGIResource1 for CreateSharedHandle. Inherited by any
+    // ID3D11Texture2D created with the SHARED_NTHANDLE flag.
     let dxgi_resource: IDXGIResource1 = texture
         .cast()
         .map_err(|e| format!("IDXGIResource1 cast: {e}"))?;
-    let mutex: IDXGIKeyedMutex = texture
-        .cast()
-        .map_err(|e| format!("IDXGIKeyedMutex cast: {e}"))?;
 
     // `DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE` = 1 | 2.
     // The constants are in `Win32::Graphics::Dxgi` but flagged as
@@ -1058,11 +1078,7 @@ fn create_shared_entry(
     }
     .map_err(|e| format!("CreateSharedHandle: {e}"))?;
 
-    Ok(SharedEntry {
-        texture,
-        mutex,
-        handle,
-    })
+    Ok(SharedEntry { texture, handle })
 }
 
 /// BGRA8 → RGBA8 channel swap with alpha pinned to 0xFF. Picks the
