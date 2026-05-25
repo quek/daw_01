@@ -58,10 +58,17 @@ pub struct Renderer<W: WindowBackend + Send + Sync + 'static> {
     /// caller (daw_01 daw_gui) が `create_texture` / `upload_texture_rgba` / `destroy_texture`
     /// で lifecycle 管理する (GUI 側 LRU 等は持たない、 #043 設計判断)。
     texture_store: TextureStore,
-    /// M14 Phase 74 (daw_01 #045 §B): adapter の backend を保存。
-    /// `create_texture_from_d3d11_shared_handle` が DX12 限定 API なので、 呼び出し時に
-    /// `Backend::Dx12` 判定で `RendererError::WrongBackend` を返す。
+    /// M14 Phase 74 (daw_01 #045 §B) / Phase 75 (#046): adapter の backend を保存。
+    /// `create_texture_from_d3d11_shared_handle` が DX12 + Vulkan dispatch するため、
+    /// 呼び出し時に `Backend` で path を選ぶ。 Metal / GL では `WrongBackend` で fail-soft。
     backend: wgpu::Backend,
+    /// M14 Phase 75 (daw_01 #046): Vulkan backend で `VULKAN_EXTERNAL_MEMORY_WIN32` feature を
+    /// adapter がサポート + `request_device` で要求した結果 enable された場合のみ `true`。
+    /// `false` のときは `create_texture_from_d3d11_shared_handle` (Vulkan path) で
+    /// [`RendererError::FeatureUnsupported`] で fail-soft する。 AMD / Intel 一部 driver で
+    /// `D3D11_TEXTURE` handle type を report しない既知の罠への対応 (= renderer 初期化は成功、
+    /// zero-copy 経路が使えない時だけ caller に伝える)。
+    vulkan_external_memory_supported: bool,
     /// 現在の物理ピクセルサイズ。
     size: PhysicalSize,
     /// Window の所有権 (drop 順序のため最後)
@@ -94,12 +101,24 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
             force_fallback_adapter: false,
         }))
         .map_err(|_| RendererInitError::NoAdapter)?;
-        // M14 Phase 74 (daw_01 #045 §B): backend を保存 (DX12 限定 API の guard で使用)。
+        // M14 Phase 74 (daw_01 #045 §B): backend を保存 (DX12 / Vulkan dispatch で使用)。
         let backend = adapter.get_info().backend;
+
+        // M14 Phase 75 (daw_01 #046): Backend::Vulkan + adapter サポート時のみ
+        // VULKAN_EXTERNAL_MEMORY_WIN32 を required_features に conditional 追加。
+        // adapter 非対応の Vulkan 環境 (AMD / Intel 一部 driver) では feature を要求せずに
+        // device 取得 = renderer 初期化は成功、 `create_texture_from_d3d11_shared_handle`
+        // 呼び出し時のみ `FeatureUnsupported` で fail-soft (= caller protect、 SSoT を守る)。
+        let vulkan_external_memory_supported = backend == wgpu::Backend::Vulkan
+            && adapter.features().contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32);
+        let mut required_features = wgpu::Features::empty();
+        if vulkan_external_memory_supported {
+            required_features |= wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32;
+        }
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("daw-ui device"),
-            required_features: wgpu::Features::empty(),
+            required_features,
             required_limits: wgpu::Limits::default(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
@@ -150,6 +169,7 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
             texture,
             texture_store,
             backend,
+            vulkan_external_memory_supported,
             size,
             _window: window,
         })
@@ -269,16 +289,20 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
     ///
     /// # Errors
     ///
-    /// - [`RendererError::WrongBackend`]: non-DX12 backend (Vulkan / GL / Metal)
-    /// - [`RendererError::OpenSharedHandle`]: `ID3D12Device::OpenSharedHandle` が HRESULT 失敗
-    ///   (invalid handle / ACL / resource 既 release 等)
+    /// - [`RendererError::WrongBackend`]: DX12 / Vulkan 以外の backend (Metal / GL)
+    /// - [`RendererError::OpenSharedHandle`]: DX12 path で `ID3D12Device::OpenSharedHandle` が
+    ///   HRESULT 失敗 (invalid handle / ACL / resource 既 release 等)
+    /// - [`RendererError::VulkanImportFailed`]: Vulkan path で `texture_from_d3d11_shared_handle`
+    ///   が失敗 (= driver が `D3D11_TEXTURE` handle type を report しない、 invalid handle 等)
+    /// - [`RendererError::FeatureUnsupported`]: Vulkan adapter が `VULKAN_EXTERNAL_MEMORY_WIN32`
+    ///   を report しない (= AMD / Intel 一部 driver の既知の罠)
     ///
     /// # Safety
     ///
     /// 本 method は `pub` だが **caller responsibilities** を満たす前提で動く。 violated な
-    /// `shared_handle` を渡すと OpenSharedHandle が HRESULT で fail-soft する想定だが、
-    /// driver / OS によっては process crash の可能性もある (= raw NT handle の宿命)。
-    /// caller は WMF / D3D11 経路で確実に正しい handle を生成すること。
+    /// `shared_handle` を渡すと OpenSharedHandle / Vulkan import が HRESULT / VkResult で
+    /// fail-soft する想定だが、 driver / OS によっては process crash の可能性もある
+    /// (= raw NT handle の宿命)。 caller は WMF / D3D11 経路で確実に正しい handle を生成すること。
     #[cfg(windows)]
     pub fn create_texture_from_d3d11_shared_handle(
         &mut self,
@@ -287,26 +311,47 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
         width: u32,
         height: u32,
     ) -> Result<TextureHandle, RendererError> {
+        // M14 Phase 75 (daw_01 #046): backend dispatch (DX12 / Vulkan 透過、 caller boilerplate ゼロ)。
+        match self.backend {
+            wgpu::Backend::Dx12 => self.import_d3d11_shared_handle_dx12(
+                shared_handle,
+                format,
+                width,
+                height,
+            ),
+            wgpu::Backend::Vulkan => {
+                if !self.vulkan_external_memory_supported {
+                    return Err(RendererError::FeatureUnsupported(
+                        "VULKAN_EXTERNAL_MEMORY_WIN32",
+                    ));
+                }
+                self.import_d3d11_shared_handle_vulkan(shared_handle, format, width, height)
+            }
+            other => Err(RendererError::WrongBackend(other)),
+        }
+    }
+
+    /// M14 Phase 74 (DX12 path、 daw_01 #045 §B): 3-step pattern。
+    /// 1) `as_hal::<dx12::Api>` → `raw_device()` で `&ID3D12Device`
+    /// 2) `ID3D12Device::OpenSharedHandle::<ID3D12Resource>` で NT handle → COM resource
+    /// 3) `wgpu::hal::dx12::Device::texture_from_raw` で hal::Texture (static 風 fn、 D3D12 API 不発)
+    /// 4) `create_texture_from_hal` で wgpu::Texture 化 → `TextureStore::import_texture`
+    ///
+    /// SAFETY: 全 unsafe block は親 method の caller responsibility 文書に依拠。
+    /// shared_handle が valid な NT handle で、 format/size が実体一致している前提。
+    #[cfg(windows)]
+    fn import_d3d11_shared_handle_dx12(
+        &mut self,
+        shared_handle: windows::Win32::Foundation::HANDLE,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> Result<TextureHandle, RendererError> {
         use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
-        if self.backend != wgpu::Backend::Dx12 {
-            return Err(RendererError::WrongBackend(self.backend));
-        }
-
-        // M14 Phase 74: 3-step pattern (as_hal → OpenSharedHandle → texture_from_raw → create_texture_from_hal)。
-        // 1) as_hal で wgpu::Device 内部の wgpu::hal::dx12::Device 参照を取り、 raw_device() で ID3D12Device 取得。
-        // 2) ID3D12Device::OpenSharedHandle(HANDLE) で ID3D12Resource 取得 (NT handle → COM resource)。
-        // 3) wgpu::hal::dx12::Device::texture_from_raw(resource, ..) で hal::Texture 構築。
-        //    (static 風 associated fn なので Device 不要、 D3D12 API も叩かない、 構造体 wrap のみ)
-        // 4) wgpu::Device::create_texture_from_hal で wgpu::Texture に昇格 → TextureStore::import_texture。
-        //
-        // SAFETY: 全 unsafe block は caller responsibility 文書 (上の doc コメント) に依拠。
-        // shared_handle が valid な NT handle で、 format/size が実体一致している前提。
         let hal_texture: wgpu::hal::dx12::Texture = unsafe {
             let hal_device_guard = self.device.as_hal::<wgpu::hal::dx12::Api>();
             let Some(hal_device) = hal_device_guard else {
-                // backend check は上で済んでいるので通常到達しないが、 wgpu 内部状態が変わった
-                // (= driver 切替 hot-swap 等) に備えた defensive。
                 return Err(RendererError::WrongBackend(self.backend));
             };
             let d3d12_device = hal_device.raw_device();
@@ -340,7 +385,88 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
             self.device.create_texture_from_hal::<wgpu::hal::dx12::Api>(
                 hal_texture,
                 &wgpu::TextureDescriptor {
-                    label: Some("d3d11 shared texture"),
+                    label: Some("d3d11 shared texture (dx12)"),
+                    size: wgpu::Extent3d {
+                        width: width.max(1),
+                        height: height.max(1),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                },
+            )
+        };
+
+        Ok(self.texture_store.import_texture(
+            &self.device,
+            self.texture.sampler(),
+            self.texture.texture_bind_group_layout(),
+            wgpu_texture,
+            format,
+            width,
+            height,
+        ))
+    }
+
+    /// M14 Phase 75 (Vulkan path、 daw_01 #046): 2-step pattern (DX12 より 1 段少ない、
+    /// wgpu_hal が `OpenSharedHandle` 同等の `VkImportMemoryWin32HandleInfoKHR` を内製)。
+    /// 1) `as_hal::<vulkan::Api>` で `&wgpu::hal::vulkan::Device` 取得
+    /// 2) `wgpu::hal::vulkan::Device::texture_from_d3d11_shared_handle(handle, desc)` で
+    ///    hal::Texture (`VK_KHR_external_memory_win32` 経由で内部 import)
+    /// 3) `create_texture_from_hal::<vulkan::Api>` で wgpu::Texture 化 → `TextureStore::import_texture`
+    ///
+    /// SAFETY: 全 unsafe block は親 method の caller responsibility 文書に依拠。
+    /// `vulkan_external_memory_supported` は事前に Renderer::new で確認済 (= `request_device` で
+    /// `VULKAN_EXTERNAL_MEMORY_WIN32` feature が enable された)、 device は対応している前提。
+    #[cfg(windows)]
+    fn import_d3d11_shared_handle_vulkan(
+        &mut self,
+        shared_handle: windows::Win32::Foundation::HANDLE,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> Result<TextureHandle, RendererError> {
+        let desc = wgpu::hal::TextureDescriptor {
+            label: Some("d3d11 shared texture (vulkan)"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            // wgpu 29.0.1: `wgpu::hal::TextureDescriptor.usage` の型は `wgpu_types::TextureUses`
+            // (= `wgpu::wgt::TextureUses` で参照、 wgpu 内で `pub extern crate wgpu_types as wgt`)。
+            usage: wgpu::wgt::TextureUses::RESOURCE,
+            memory_flags: wgpu::hal::MemoryFlags::empty(),
+            view_formats: vec![],
+        };
+
+        let hal_texture: wgpu::hal::vulkan::Texture = unsafe {
+            let hal_device_guard = self.device.as_hal::<wgpu::hal::vulkan::Api>();
+            let Some(hal_device) = hal_device_guard else {
+                // backend check は親で済んでいるので通常到達しないが、 wgpu 内部状態が変わった
+                // (= driver 切替 hot-swap 等) に備えた defensive。
+                return Err(RendererError::WrongBackend(self.backend));
+            };
+            hal_device
+                .texture_from_d3d11_shared_handle(shared_handle, &desc)
+                .map_err(|e| RendererError::VulkanImportFailed(format!("{e:?}")))?
+        };
+
+        // SAFETY: hal_texture は texture_from_d3d11_shared_handle で構築済、 同 device の HAL なので
+        // bound 一致。
+        let wgpu_texture = unsafe {
+            self.device.create_texture_from_hal::<wgpu::hal::vulkan::Api>(
+                hal_texture,
+                &wgpu::TextureDescriptor {
+                    label: Some("d3d11 shared texture (vulkan)"),
                     size: wgpu::Extent3d {
                         width: width.max(1),
                         height: height.max(1),
@@ -592,6 +718,14 @@ impl std::error::Error for RenderError {}
 pub enum RendererError {
     WrongBackend(wgpu::Backend),
     OpenSharedHandle(String),
+    /// M14 Phase 75 (daw_01 #046): Vulkan path での `wgpu_hal::vulkan::Device::
+    /// texture_from_d3d11_shared_handle` 失敗。 driver が `D3D11_TEXTURE` handle type を
+    /// report しない / invalid handle 等。 string は wgpu HAL error を含む。
+    VulkanImportFailed(String),
+    /// M14 Phase 75 (daw_01 #046): Vulkan adapter が `VULKAN_EXTERNAL_MEMORY_WIN32` feature を
+    /// サポートしていない (= AMD / Intel 一部 driver の既知の罠)。 caller は fallback 経路に
+    /// 切替えるべき。
+    FeatureUnsupported(&'static str),
     FormatMismatch { requested: wgpu::TextureFormat },
 }
 
@@ -599,9 +733,15 @@ impl std::fmt::Display for RendererError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::WrongBackend(b) => {
-                write!(f, "D3D11 shared handle import requires DX12 backend, current = {b:?}")
+                write!(f, "D3D11 shared handle import requires DX12 or Vulkan backend, current = {b:?}")
             }
             Self::OpenSharedHandle(s) => write!(f, "DX12 OpenSharedHandle failed: {s}"),
+            Self::VulkanImportFailed(s) => {
+                write!(f, "Vulkan texture_from_d3d11_shared_handle failed: {s}")
+            }
+            Self::FeatureUnsupported(name) => {
+                write!(f, "wgpu feature unsupported on this adapter: {name}")
+            }
             Self::FormatMismatch { requested } => {
                 write!(f, "imported texture format mismatch: requested {requested:?}")
             }
