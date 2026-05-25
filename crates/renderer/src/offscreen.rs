@@ -114,14 +114,44 @@ impl OffscreenRenderer {
             &self.device,
             self.texture.sampler(),
             self.texture.texture_bind_group_layout(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
             width,
             height,
         )
     }
 
-    /// RGBA8 で texture content を上書き。 destroy 済 / size 不一致は no-op。
+    /// M14 Phase 73 (daw_01 #045): 指定サイズの空 BGRA8UnormSrgb texture を確保 (snapshot test 用)。
+    /// 詳細は `Renderer::create_texture_bgra` 参照。
+    pub fn create_texture_bgra(&mut self, width: u32, height: u32) -> TextureHandle {
+        self.texture_store.create(
+            &self.device,
+            self.texture.sampler(),
+            self.texture.texture_bind_group_layout(),
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            width,
+            height,
+        )
+    }
+
+    /// RGBA8 で texture content を上書き。 destroy 済 / size 不一致 / format 不一致は no-op。
     pub fn upload_texture_rgba(&mut self, handle: TextureHandle, data: &[u8]) {
-        self.texture_store.upload(&self.queue, handle, data);
+        self.texture_store.upload_with_format(
+            &self.queue,
+            handle,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            data,
+        );
+    }
+
+    /// M14 Phase 73 (daw_01 #045): BGRA8 で texture content を上書き。 詳細は
+    /// `Renderer::upload_texture_bgra` 参照。
+    pub fn upload_texture_bgra(&mut self, handle: TextureHandle, bgra: &[u8]) {
+        self.texture_store.upload_with_format(
+            &self.queue,
+            handle,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            bgra,
+        );
     }
 
     /// texture を解放。 既に解放済 / 未知の handle は no-op。
@@ -133,6 +163,12 @@ impl OffscreenRenderer {
     #[must_use]
     pub fn texture_size(&self, handle: TextureHandle) -> Option<(u32, u32)> {
         self.texture_store.size(handle)
+    }
+
+    /// M14 Phase 73 (daw_01 #045): texture の format。 destroy 済は `None`。
+    #[must_use]
+    pub fn texture_format(&self, handle: TextureHandle) -> Option<wgpu::TextureFormat> {
+        self.texture_store.format(handle)
     }
 
     /// Scene を 1 フレーム分 render し、RGBA bytes (sRGB encoded) を返す。

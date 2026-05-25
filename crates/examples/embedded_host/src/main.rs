@@ -144,6 +144,32 @@ fn main() -> Result<(), Box<dyn Error>> {
         clip_rect: None,
     });
 
+    // ============================================================
+    // M14 Phase 73 (daw_01 #045): BGRA8UnormSrgb texture smoke test
+    // ============================================================
+    //
+    // RGBA checker (上で作成) と **同じ色** を BGRA bytes (= channel swap して) で渡す。
+    // BGRA path が正しく実装されていれば widget 側で再 swap が起きないので、 PNG snapshot 上で
+    // BGRA tile が RGBA tile と完全同色になる (= channel swap が widget 側で起きない実証)。
+    // 失敗例: RGBA path 経由で誤って BGRA bytes を upload した場合、 red と blue が入れ替わる。
+    let bgra_tex = renderer.create_texture_bgra(4, 4);
+    let bgra_bytes = make_checker_bgra();
+    renderer.upload_texture_bgra(bgra_tex, &bgra_bytes);
+    // format 確認は `Renderer::texture_format` で可能だが、 wgpu 直接依存を増やさないため
+    // embedded_host では skip。 visual snapshot で「BGRA tile と RGBA tile が同色」 を見れば
+    // BGRA path 正常動作が分かる。
+    let bgra_rect = Rect::new(width as f32 - 290.0, height as f32 - 150.0, 120.0, 120.0);
+    scene.push_textured_quad(TexturedQuad::new(bgra_rect, bgra_tex));
+    scene.push_text(GlyphArea {
+        text: "Phase 73 (#045): BGRA path (左) ↔ Phase 71 RGBA path (右、 同色のはず)".into(),
+        left: width as f32 - 540.0,
+        top: height as f32 - 165.0,
+        font_size: 12.0,
+        line_height: 14.0,
+        color: Color::rgb(0.85, 0.95, 0.7),
+        clip_rect: None,
+    });
+
     // 1 フレーム render → RGBA bytes (sRGB encoded、行 stride = width * 4)
     let rgba = renderer.render_to_rgba(&scene)?;
     assert_eq!(rgba.len(), (width as usize) * (height as usize) * 4);
@@ -176,6 +202,27 @@ fn make_checker_rgba() -> Vec<u8> {
         [0x40, 0xE0, 0x40, 0xFF], // green
         [0x40, 0x40, 0xE0, 0xFF], // blue
         [0xE0, 0xE0, 0x40, 0xFF], // yellow
+    ];
+    let mut out = Vec::with_capacity(4 * 4 * 4);
+    for y in 0..4 {
+        for x in 0..4 {
+            let tile = ((y / 2) * 2 + (x / 2)) as usize;
+            out.extend_from_slice(&colors[tile]);
+        }
+    }
+    out
+}
+
+/// M14 Phase 73 (daw_01 #045): 4x4 の BGRA8 チェック柄。 `make_checker_rgba` と **同じ色**
+/// (red / green / blue / yellow) を表現するが、 各 pixel の byte 順を B G R A に swap。
+/// = PNG snapshot 上で RGBA tile と完全同色になることが BGRA path 正常動作の証明。
+fn make_checker_bgra() -> Vec<u8> {
+    // RGBA から B G R A 順への swap (= 同じ色を BGRA で表現)。
+    let colors: [[u8; 4]; 4] = [
+        [0x40, 0x40, 0xE0, 0xFF], // red    (B=40, G=40, R=E0)
+        [0x40, 0xE0, 0x40, 0xFF], // green  (B=40, G=E0, R=40)
+        [0xE0, 0x40, 0x40, 0xFF], // blue   (B=E0, G=40, R=40)
+        [0x40, 0xE0, 0xE0, 0xFF], // yellow (B=40, G=E0, R=E0)
     ];
     let mut out = Vec::with_capacity(4 * 4 * 4);
     for y in 0..4 {

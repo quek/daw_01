@@ -2,14 +2,21 @@
 //!
 //! - **Renderer-local**: `Renderer<W>` / `OffscreenRenderer` 各 instance が独自の Store を持つ
 //!   (= 別 Renderer 間で `TextureHandle` を共有してはならない)。
-//! - **lifecycle = caller 管理**: `create_texture` で得た handle を `upload_texture_rgba` で
-//!   毎フレーム更新し、 不要になったら `destroy_texture` で解放。 GUI 側 LRU 等は持たない
-//!   (caller が clip-aware にライフサイクル管理する設計、 #043 reply 参照)。
-//! - **format 固定**: `Rgba8UnormSrgb`。 fragment 出力が sRGB → linear → blend → sRGB の
-//!   正しいパスで composite される (memory: project_overview.md / wgpu 29 既知の罠ノート)。
+//! - **lifecycle = caller 管理**: `create` で得た handle を `upload_*` で毎フレーム更新し、
+//!   不要になったら `destroy` で解放。 GUI 側 LRU 等は持たない (caller が clip-aware に
+//!   ライフサイクル管理する設計、 #043 reply 参照)。
+//! - **format**: M14 Phase 73 (daw_01 #045) で **per-entry format** 化。 `Rgba8UnormSrgb`
+//!   (既存 #043 経路) と `Bgra8UnormSrgb` (新規 #045 経路、 CPU swap 除去) を同 store 内で混在可。
+//!   sampling pipeline (`pipelines::texture`) の bind layout (`Float { filterable: true }` +
+//!   `Filtering` sampler) は format 不問なので、 binding は共通で OK。 fragment 出力経路は
+//!   sRGB → linear → blend → sRGB で正しく composite される (memory: wgpu 29 既知の罠ノート)。
 //! - **upload 経路**: `Queue::write_texture` 直接呼び (staging buffer 不要、 wgpu の内部
 //!   staging belt が 60fps 毎フレーム update を吸収)。 `bytes_per_row` の 256 倍数制約は
 //!   `write_texture` には適用されない。
+//! - **format mismatch on upload**: caller が `upload_with_format(handle, RGBA, ...)` を呼ぶ
+//!   ところ handle 自体は BGRA で作成済 (or 逆) のとき、 **debug build では panic、 release
+//!   では silent no-op** (= caller protect の defensive、 production で予期せぬ channel swap
+//!   描画を起こさない方針)。
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -21,6 +28,9 @@ struct TextureEntry {
     bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
+    /// M14 Phase 73 (daw_01 #045): 1 entry = 1 format。 `Rgba8UnormSrgb` / `Bgra8UnormSrgb`
+    /// が当面の値域、 将来 Phase 74 (D3D11 import) / NV12 (#046+) で追加候補。
+    format: wgpu::TextureFormat,
 }
 
 /// `TextureHandle` → `wgpu::Texture` + `BindGroup` の lookup table。
@@ -39,15 +49,19 @@ impl TextureStore {
         }
     }
 
-    /// 指定サイズの空 RGBA8UnormSrgb texture を確保し、 `(texture_view, sampler)` の
-    /// bind_group を `layout` で作って store する。
+    /// 指定サイズ + format の空 texture を確保し、 `(texture_view, sampler)` の bind_group を
+    /// `layout` で作って store する。
     ///
     /// `width` / `height` が 0 のときは 1 に clamp (wgpu が panic するため)。
+    /// `format` は M14 Phase 73 (#045) 時点で `Rgba8UnormSrgb` / `Bgra8UnormSrgb` を想定。
+    /// 他の format も技術的には受け付けるが、 binding layout (`Float filterable`) で sampleable
+    /// である前提 (= depth / integer formats は NG)。
     pub fn create(
         &mut self,
         device: &wgpu::Device,
         sampler: &wgpu::Sampler,
         layout: &wgpu::BindGroupLayout,
+        format: wgpu::TextureFormat,
         width: u32,
         height: u32,
     ) -> TextureHandle {
@@ -65,7 +79,7 @@ impl TextureStore {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -91,26 +105,44 @@ impl TextureStore {
                 bind_group,
                 width: w,
                 height: h,
+                format,
             },
         );
         TextureHandle::from_raw(id)
     }
 
-    /// RGBA8 (= `width * height * 4` bytes) で texture content を上書き。
+    /// `width * height * 4` bytes で texture content を上書き。 caller は `expected_format` を
+    /// 渡して、 entry が同 format で作成されているかを内部 check する (= cross-format upload を
+    /// 静かに描画破綻させない defensive)。
     ///
-    /// - destroy 済 handle / size 不一致は no-op (panic しない)
+    /// - destroy 済 handle: no-op (panic しない)
+    /// - size 不一致: no-op + debug_assert! (debug 時 panic)
+    /// - format 不一致 (entry.format != expected_format): no-op + debug_assert! (同上)
     /// - 部分 update は MVP 非対応 (#043 reply 参照)
-    pub fn upload(&self, queue: &wgpu::Queue, handle: TextureHandle, data: &[u8]) {
+    pub fn upload_with_format(
+        &self,
+        queue: &wgpu::Queue,
+        handle: TextureHandle,
+        expected_format: wgpu::TextureFormat,
+        data: &[u8],
+    ) {
         let Some(entry) = self.entries.get(&handle.raw_id()) else {
             return;
         };
+        if entry.format != expected_format {
+            debug_assert_eq!(
+                entry.format, expected_format,
+                "upload_with_format: handle format {:?} != caller-asserted {:?}",
+                entry.format, expected_format,
+            );
+            return;
+        }
         let expected = (entry.width as usize) * (entry.height as usize) * 4;
         if data.len() != expected {
-            // size 不一致はサイレント no-op。 debug build では panic させたいなら debug_assert を入れる。
             debug_assert_eq!(
                 data.len(),
                 expected,
-                "upload_texture_rgba: data.len() {} != width*height*4 {}",
+                "upload_with_format: data.len() {} != width*height*4 {}",
                 data.len(),
                 expected,
             );
@@ -147,6 +179,14 @@ impl TextureStore {
     #[must_use]
     pub fn size(&self, handle: TextureHandle) -> Option<(u32, u32)> {
         self.entries.get(&handle.raw_id()).map(|e| (e.width, e.height))
+    }
+
+    /// M14 Phase 73 (#045): entry の format を返す。 destroy 済は `None`。
+    /// debug / test 用 (`Renderer::texture_size` と対の helper)、 描画 path では使わない
+    /// (sampling は bind_group 経由で format-agnostic)。
+    #[must_use]
+    pub fn format(&self, handle: TextureHandle) -> Option<wgpu::TextureFormat> {
+        self.entries.get(&handle.raw_id()).map(|e| e.format)
     }
 
     /// render pipeline の `set_bind_group(1, ..)` で参照する bind_group。

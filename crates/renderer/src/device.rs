@@ -152,14 +152,32 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
     // M14 Phase 71 (daw_01 #043): texture pool public API
     // ============================================================
 
-    /// 指定サイズの空 RGBA8 texture を確保し、 `TextureHandle` を返す。
-    /// format は `Rgba8UnormSrgb` 固定 (sRGB encoded RGBA8 入力前提)。
+    /// 指定サイズの空 RGBA8UnormSrgb texture を確保し、 `TextureHandle` を返す。
+    /// sRGB encoded RGBA8 入力前提 (= PNG decode 結果 / FFmpeg sws_scale RGBA 出力)。
     /// `width` / `height` = 0 は 1 に clamp。
     pub fn create_texture(&mut self, width: u32, height: u32) -> TextureHandle {
         self.texture_store.create(
             &self.device,
             self.texture.sampler(),
             self.texture.texture_bind_group_layout(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            width,
+            height,
+        )
+    }
+
+    /// M14 Phase 73 (daw_01 #045): 指定サイズの空 BGRA8UnormSrgb texture を確保。
+    /// WMF / DXVA 系 decoder が直接吐く `MFVideoFormat_ARGB32` (= little-endian で BGRA8) を
+    /// **CPU swap 不要で直接 upload** できるようにする (= daw_01 P2、 1080p60 で ~3ms/frame の
+    /// release-build coast を除去)。 sampling は format-transparent (= 既存
+    /// `Scene::push_textured_quad` で OK、 GPU 内 sampling shader が format を見て channel を
+    /// 正しく取り出す)。
+    pub fn create_texture_bgra(&mut self, width: u32, height: u32) -> TextureHandle {
+        self.texture_store.create(
+            &self.device,
+            self.texture.sampler(),
+            self.texture.texture_bind_group_layout(),
+            wgpu::TextureFormat::Bgra8UnormSrgb,
             width,
             height,
         )
@@ -167,8 +185,27 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
 
     /// RGBA8 (`width * height * 4` bytes) で texture content を上書き。
     /// destroy 済 handle / size 不一致は no-op (debug build では panic)。
+    /// handle が BGRA texture で作成済の場合も no-op + debug panic (cross-format protect)。
     pub fn upload_texture_rgba(&mut self, handle: TextureHandle, data: &[u8]) {
-        self.texture_store.upload(&self.queue, handle, data);
+        self.texture_store.upload_with_format(
+            &self.queue,
+            handle,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            data,
+        );
+    }
+
+    /// M14 Phase 73 (daw_01 #045): BGRA8 (`width * height * 4` bytes、 B G R A 順) で texture
+    /// content を上書き。 RGBA upload と同 byte layout だが channel 順だけ違う (= caller の
+    /// `bgra` slice を sRGB blue → green → red → alpha で読み取る)。
+    /// destroy 済 / size 不一致 / format 不一致は no-op + debug_assert (RGBA 版と同 policy)。
+    pub fn upload_texture_bgra(&mut self, handle: TextureHandle, bgra: &[u8]) {
+        self.texture_store.upload_with_format(
+            &self.queue,
+            handle,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            bgra,
+        );
     }
 
     /// texture を解放。 既に解放された handle に対する操作は no-op。 以後 `texture_size` は `None`、
@@ -182,6 +219,14 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
     #[must_use]
     pub fn texture_size(&self, handle: TextureHandle) -> Option<(u32, u32)> {
         self.texture_store.size(handle)
+    }
+
+    /// M14 Phase 73 (daw_01 #045): texture の format を返す (debug / test 用)。
+    /// destroy 済は `None`。 通常 caller は handle 発行時の format を覚えていれば良いので、
+    /// production path で参照する必要はない (= sampling は bind_group 経由で format-agnostic)。
+    #[must_use]
+    pub fn texture_format(&self, handle: TextureHandle) -> Option<wgpu::TextureFormat> {
+        self.texture_store.format(handle)
     }
 
     /// 物理サイズが変わったとき呼ぶ。
