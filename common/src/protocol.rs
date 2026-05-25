@@ -269,6 +269,14 @@ pub struct AudioSession {
     pub channels: u16,
 }
 
+/// IPC messages from the host (daw_gui) to children (daw_audio /
+/// daw_plugin_host). `LoadSong(Song)` is the dominant size driver
+/// (~304 bytes incl. v12 video_* fields), but the message is sent at
+/// most once per project load — boxing the `Song` would push every
+/// IPC frame through a heap allocation just to soothe clippy. Accept
+/// the size disparity here; if a future IPC variant grows even larger
+/// we can revisit per-variant boxing then.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub enum MainToChild {
     Ack,

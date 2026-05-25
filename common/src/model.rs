@@ -8,13 +8,27 @@ use crate::plugin_format::PluginFormat;
 use crate::protocol::PluginSlot;
 use crate::scale::ScaleChange;
 
-/// Bumped to `11` for Scale &amp; Root: `Song.scale_changes:
-/// Vec<ScaleChange>` is added. v10 `.daw` files still load — the
-/// field defaults to an empty Vec (per `#[serde(default)]`), which is
-/// the "Scale feature OFF / chromatic" mode and matches the legacy
-/// behavior exactly. See `docs/plan_scale.html`.
+/// Bumped to `12` for Video editing: `Track.kind: TrackKind { Audio,
+/// Video }` discriminator, `Song.video_sources` pool +
+/// `next_video_source_id` + `video_resolution` + `video_framerate`,
+/// and `ClipContent::Video(VideoContent { events: Vec<VideoEvent> })`
+/// variant are added. v11 `.daw` files still load — `Track.kind`
+/// defaults to `Audio` (per `#[serde(default)]`), `video_sources` is
+/// empty, `video_resolution` defaults to `(1920, 1080)`, and
+/// `video_framerate` defaults to `30.0`. `ClipContent::Video` is
+/// distinguished from `Audio` under `#[serde(untagged)]` by the
+/// disjoint required-field pair `source_start_micros` (Video) vs
+/// `source_start_frames` (Audio) inside the inner event struct — a
+/// JSON missing one's required field falls through to the other.
+/// See `docs/plan_video.md`.
 ///
 /// Previously:
+///   `11` Scale &amp; Root: `Song.scale_changes: Vec<ScaleChange>` is
+///   added. v10 `.daw` files still load — the field defaults to an
+///   empty Vec (per `#[serde(default)]`), which is the "Scale feature
+///   OFF / chromatic" mode and matches the legacy behavior exactly.
+///   See `docs/plan_scale.html`.
+///
 ///   `8` parameter automation: `Track.automation_lanes` is added
 ///   (per-target lane with a default value, an enabled toggle and
 ///   clip-shaped point lists) and `ClipContent` gains an
@@ -31,7 +45,7 @@ use crate::scale::ScaleChange;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 11;
+pub const CURRENT_VERSION: u32 = 12;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -150,6 +164,40 @@ pub struct Song {
     /// v10 file は `#[serde(default)]` で空 Vec で forward-migrate。
     #[serde(default)]
     pub scale_changes: Vec<ScaleChange>,
+    /// v12 (`docs/plan_video.md` §2.3): pool of imported video file
+    /// references, keyed by `VideoSourceId`. Decoded frames are NOT
+    /// stored here — only metadata (path / width / height / framerate /
+    /// duration / codec). Frames are decoded on demand by daw_gui's
+    /// video worker thread. Entries with refcount == 0 are GC'd by
+    /// `Song::gc_video_sources` before save. v11 file forward-migrates
+    /// to an empty map.
+    #[serde(default)]
+    pub video_sources: HashMap<VideoSourceId, VideoSource>,
+    /// v12: stable id allocator for `VideoSourceId`. `0` is the
+    /// sentinel; valid allocations start at `1`. v11 file forward-
+    /// migrates to `0`, then `ensure_video_source_ids` lifts it.
+    #[serde(default)]
+    pub next_video_source_id: VideoSourceId,
+    /// v12 (`docs/plan_video.md` §2.3): project-level video output
+    /// resolution `(width, height)` in pixels. Drives preview window
+    /// scale + render output dimensions. All imports are letterboxed
+    /// onto this canvas (preview composites at this size; render
+    /// encodes at this size). v11 file forward-migrates to
+    /// `(1920, 1080)` (= 1080p default).
+    #[serde(default = "default_video_resolution")]
+    pub video_resolution: (u32, u32),
+    /// v12: project-level video output framerate in Hz. v11 file
+    /// forward-migrates to `30.0`.
+    #[serde(default = "default_video_framerate")]
+    pub video_framerate: f32,
+}
+
+fn default_video_resolution() -> (u32, u32) {
+    (1920, 1080)
+}
+
+fn default_video_framerate() -> f32 {
+    30.0
 }
 
 impl Default for Song {
@@ -170,6 +218,10 @@ impl Default for Song {
             next_song_lane_id: 1,
             midi_bindings: Vec::new(),
             scale_changes: Vec::new(),
+            video_sources: HashMap::new(),
+            next_video_source_id: 1,
+            video_resolution: default_video_resolution(),
+            video_framerate: default_video_framerate(),
         }
     }
 }
@@ -600,13 +652,18 @@ impl Song {
 
     /// Refcount of an `AudioSourceId` = total `AudioEvent.source_id`
     /// references across every audio `ClipContent` in the song. Used by
-    /// `gc_audio_sources` and Inspector display.
+    /// `gc_audio_sources` and Inspector display. `Video` clips do not
+    /// reference AudioSource directly — the auto-extracted WAV is wired
+    /// via the paired audio track's `AudioEvent`, which is counted here
+    /// like any other audio reference.
     pub fn audio_source_refcount(&self, source_id: AudioSourceId) -> usize {
         self.clip_contents
             .values()
             .filter_map(|c| match c {
                 ClipContent::Audio(a) => Some(a.events.iter()),
-                ClipContent::Midi(_) | ClipContent::Automation(_) => None,
+                ClipContent::Midi(_)
+                | ClipContent::Automation(_)
+                | ClipContent::Video(_) => None,
             })
             .flatten()
             .filter(|ev| ev.source_id == source_id)
@@ -623,7 +680,9 @@ impl Song {
             .values()
             .filter_map(|c| match c {
                 ClipContent::Audio(a) => Some(a.events.iter()),
-                ClipContent::Midi(_) | ClipContent::Automation(_) => None,
+                ClipContent::Midi(_)
+                | ClipContent::Automation(_)
+                | ClipContent::Video(_) => None,
             })
             .flatten()
             .map(|ev| ev.source_id)
@@ -658,6 +717,96 @@ impl Song {
             self.audio_sources.insert(new_id, orphan);
         }
     }
+
+    /// v12 (`docs/plan_video.md` §2.4): allocate a fresh
+    /// `VideoSourceId`, bumping the song-level counter. Mirrors
+    /// `alloc_audio_source_id`.
+    pub fn alloc_video_source_id(&mut self) -> VideoSourceId {
+        let id = self.next_video_source_id.max(1);
+        self.next_video_source_id = id + 1;
+        id
+    }
+
+    /// v12: refcount of a `VideoSourceId` = total `VideoEvent.source_id`
+    /// references across every `Video` `ClipContent` in the song. Used
+    /// by `gc_video_sources` and (future) inspector display.
+    pub fn video_source_refcount(&self, source_id: VideoSourceId) -> usize {
+        self.clip_contents
+            .values()
+            .filter_map(|c| match c {
+                ClipContent::Video(v) => Some(v.events.iter()),
+                ClipContent::Midi(_)
+                | ClipContent::Audio(_)
+                | ClipContent::Automation(_) => None,
+            })
+            .flatten()
+            .filter(|ev| ev.source_id == source_id)
+            .count()
+    }
+
+    /// v12: drop `video_sources` entries no `VideoEvent` references.
+    /// Mirrors `gc_audio_sources` — called before save so the on-disk
+    /// pool stays tidy. In-memory entries with refcount==0 are kept
+    /// briefly so Undo can restore them.
+    pub fn gc_video_sources(&mut self) {
+        let live: std::collections::HashSet<VideoSourceId> = self
+            .clip_contents
+            .values()
+            .filter_map(|c| match c {
+                ClipContent::Video(v) => Some(v.events.iter()),
+                ClipContent::Midi(_)
+                | ClipContent::Audio(_)
+                | ClipContent::Automation(_) => None,
+            })
+            .flatten()
+            .map(|ev| ev.source_id)
+            .collect();
+        self.video_sources.retain(|id, _| live.contains(id));
+    }
+
+    /// v12: re-assign fresh `VideoSourceId` to any source whose id is
+    /// the `0` sentinel and bump `next_video_source_id` above the
+    /// highest seen. Mirrors `ensure_audio_source_ids` semantics; v11
+    /// files load with all-default fields so this only matters once
+    /// v12 sources start being saved with sentinel ids (= shouldn't
+    /// happen in practice, but the invariant is cheap to enforce).
+    pub fn ensure_video_source_ids(&mut self) {
+        let mut max_seen: VideoSourceId = 0;
+        for id in self.video_sources.keys() {
+            if *id != 0 {
+                max_seen = max_seen.max(*id);
+            }
+        }
+        if self.next_video_source_id <= max_seen {
+            self.next_video_source_id = max_seen + 1;
+        }
+        if self.next_video_source_id == 0 {
+            self.next_video_source_id = 1;
+        }
+        if let Some(orphan) = self.video_sources.remove(&0) {
+            let new_id = self.alloc_video_source_id();
+            self.video_sources.insert(new_id, orphan);
+        }
+    }
+}
+
+/// Discriminator selecting how a `Track` participates in the timeline.
+/// v12 addition (`docs/plan_video.md` §2.1). `Audio` (default) preserves
+/// the historical track shape — `instrument` / `midi_fx_chain` /
+/// `fx_chain` / `volume` / `pan` / `armed` / `source` all apply. `Video`
+/// ignores those fields (= caller / audio engine treats them as nominal,
+/// non-functional) and only honours `muted` / `parent_group_id` /
+/// `clips`; the clip payloads must be `ClipContent::Video`. The audio
+/// engine never sees `Video` tracks (= GUI skips them when building the
+/// IPC project snapshot, daw_audio iterates only `Audio` rows). v11
+/// `.daw` files forward-migrate via `#[serde(default)]` = `Audio`.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode,
+)]
+pub enum TrackKind {
+    #[default]
+    Audio,
+    Video,
 }
 
 /// A track owns a full CLAP signal chain in three sections:
@@ -672,6 +821,11 @@ impl Song {
 /// Clips on the track feed the MIDI FX chain at the top of the buffer. The
 /// final audio flows into the parent — either a `Group` track (when
 /// `parent_group_id == Some(id)`) or the master bus (when `None`).
+///
+/// v12 (`docs/plan_video.md`): `kind: TrackKind` discriminates audio vs
+/// video. A `Video` track shares the struct but ignores the audio-only
+/// fields (`instrument` / `*_fx_chain` / `volume` / `pan` / `armed` /
+/// `source`); its `clips` carry `ClipContent::Video` payloads.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Track {
     /// Stable id assigned by `Song::alloc_track_id`. `0` is "未採番"
@@ -680,6 +834,11 @@ pub struct Track {
     /// widget addresses tracks by this id, not by index.
     #[serde(default)]
     pub id: u32,
+    /// v12 (`docs/plan_video.md` §2.1): track の種別。 `Audio` (default) は
+    /// 既存全 field が有効、 `Video` は audio-only field を無視する。 v11
+    /// 以前の file は `#[serde(default)]` で `Audio` に migrate される。
+    #[serde(default)]
+    pub kind: TrackKind,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instrument: Option<PluginInstance>,
@@ -758,6 +917,7 @@ impl Default for Track {
     fn default() -> Self {
         Self {
             id: 0,
+            kind: TrackKind::Audio,
             name: String::new(),
             instrument: None,
             midi_fx_chain: Vec::new(),
@@ -940,6 +1100,13 @@ pub enum ClipContent {
     Midi(MidiContent),
     Audio(AudioContent),
     Automation(AutomationContent),
+    /// v12 (`docs/plan_video.md` §2.2): video clip payload. Untagged
+    /// disambiguation from `Audio` works because `VideoEvent` requires
+    /// `source_start_micros` while `AudioEvent` requires
+    /// `source_start_frames` — neither field has a serde default, so
+    /// a JSON shaped for one variant fails inner deserialization for
+    /// the other and serde falls through to the matching variant.
+    Video(VideoContent),
 }
 
 impl Default for ClipContent {
@@ -950,12 +1117,15 @@ impl Default for ClipContent {
 
 impl ClipContent {
     /// Borrow the notes slice if this is a `Midi` variant. `Audio` /
-    /// `Automation` variants return `None`. Used by `Song::clip_notes`
-    /// and other helpers that previously read `clip.notes` directly.
+    /// `Automation` / `Video` variants return `None`. Used by
+    /// `Song::clip_notes` and other helpers that previously read
+    /// `clip.notes` directly.
     pub fn notes(&self) -> Option<&[Note]> {
         match self {
             ClipContent::Midi(m) => Some(m.notes.as_slice()),
-            ClipContent::Audio(_) | ClipContent::Automation(_) => None,
+            ClipContent::Audio(_)
+            | ClipContent::Automation(_)
+            | ClipContent::Video(_) => None,
         }
     }
 
@@ -964,7 +1134,9 @@ impl ClipContent {
     pub fn notes_mut(&mut self) -> Option<&mut Vec<Note>> {
         match self {
             ClipContent::Midi(m) => Some(&mut m.notes),
-            ClipContent::Audio(_) | ClipContent::Automation(_) => None,
+            ClipContent::Audio(_)
+            | ClipContent::Automation(_)
+            | ClipContent::Video(_) => None,
         }
     }
 
@@ -972,7 +1144,9 @@ impl ClipContent {
     pub fn audio_events(&self) -> Option<&[AudioEvent]> {
         match self {
             ClipContent::Audio(a) => Some(a.events.as_slice()),
-            ClipContent::Midi(_) | ClipContent::Automation(_) => None,
+            ClipContent::Midi(_)
+            | ClipContent::Automation(_)
+            | ClipContent::Video(_) => None,
         }
     }
 
@@ -980,7 +1154,9 @@ impl ClipContent {
     pub fn audio_events_mut(&mut self) -> Option<&mut Vec<AudioEvent>> {
         match self {
             ClipContent::Audio(a) => Some(&mut a.events),
-            ClipContent::Midi(_) | ClipContent::Automation(_) => None,
+            ClipContent::Midi(_)
+            | ClipContent::Automation(_)
+            | ClipContent::Video(_) => None,
         }
     }
 
@@ -989,7 +1165,9 @@ impl ClipContent {
     pub fn automation_points(&self) -> Option<&[AutomationPoint]> {
         match self {
             ClipContent::Automation(a) => Some(a.points.as_slice()),
-            ClipContent::Midi(_) | ClipContent::Audio(_) => None,
+            ClipContent::Midi(_)
+            | ClipContent::Audio(_)
+            | ClipContent::Video(_) => None,
         }
     }
 
@@ -998,7 +1176,30 @@ impl ClipContent {
     pub fn automation_points_mut(&mut self) -> Option<&mut Vec<AutomationPoint>> {
         match self {
             ClipContent::Automation(a) => Some(&mut a.points),
-            ClipContent::Midi(_) | ClipContent::Audio(_) => None,
+            ClipContent::Midi(_)
+            | ClipContent::Audio(_)
+            | ClipContent::Video(_) => None,
+        }
+    }
+
+    /// Borrow the video events slice if this is a `Video` variant. v12
+    /// (`docs/plan_video.md` §2.2).
+    pub fn video_events(&self) -> Option<&[VideoEvent]> {
+        match self {
+            ClipContent::Video(v) => Some(v.events.as_slice()),
+            ClipContent::Midi(_)
+            | ClipContent::Audio(_)
+            | ClipContent::Automation(_) => None,
+        }
+    }
+
+    /// Mutably borrow the events vec for a `Video` variant. v12.
+    pub fn video_events_mut(&mut self) -> Option<&mut Vec<VideoEvent>> {
+        match self {
+            ClipContent::Video(v) => Some(&mut v.events),
+            ClipContent::Midi(_)
+            | ClipContent::Audio(_)
+            | ClipContent::Automation(_) => None,
         }
     }
 }
@@ -1072,6 +1273,57 @@ pub enum AudioSourcePath {
     ProjectRelative(PathBuf),
     Absolute(PathBuf),
     Generated { id: u64 },
+}
+
+/// Stable id for an entry in `Song.video_sources`. `0` is the "未採番"
+/// sentinel — `Song::ensure_video_source_ids` reassigns it on load.
+/// v12 (`docs/plan_video.md` §2.3).
+pub type VideoSourceId = u32;
+
+/// Reference to an imported video file (mp4 / mov / mkv / webm). Path
+/// resolution mirrors `AudioSource` — normal imports copy the file into
+/// `<project_dir>/samples/<basename>_<hash8>.<ext>` and store
+/// `ProjectRelative`. The decoded frames are NOT stored on the model:
+/// each frame is decoded on demand by `daw_gui`'s video worker thread
+/// from the path (= same SSoT pattern as `AudioSource`). The audio
+/// stream is extracted to a sibling `.wav` at import time and exposed
+/// via `audio_source_id` for the auto-generated pair audio track. v12
+/// (`docs/plan_video.md` §2.3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct VideoSource {
+    pub path: VideoSourcePath,
+    /// Native pixel width / height as reported by the decoder. Project
+    /// preview scales these to `Song.video_resolution`.
+    pub width: u32,
+    pub height: u32,
+    /// Frames per second as reported by the decoder (= source FPS, not
+    /// project FPS). Used for thumbnail seek and frame timing. Variable
+    /// framerate (VFR) sources report their nominal FPS here; MVP
+    /// assumes CFR.
+    pub framerate: f32,
+    /// Total duration in microseconds (= libav `AV_TIME_BASE` units).
+    pub duration_micros: u64,
+    /// FFmpeg codec name (`"h264"` / `"hevc"` / `"vp9"` / `"av1"` etc.).
+    /// Free-form string; consumers use it only for display and
+    /// diagnostics.
+    pub codec: String,
+    /// AudioSource holding the audio stream extracted from the video at
+    /// import time. `None` when the source video had no audio stream or
+    /// extraction was skipped. The audio is NOT played back through this
+    /// link — `daw_audio` plays from `AudioEvent.source_id` in the
+    /// auto-generated pair audio track. This back-reference exists for
+    /// diagnostics and future "re-extract audio" operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_source_id: Option<AudioSourceId>,
+}
+
+/// Path resolution strategy for a `VideoSource`. Mirrors
+/// `AudioSourcePath` minus the `Generated` variant — video frames are
+/// always backed by an on-disk file. v12 (`docs/plan_video.md` §2.3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub enum VideoSourcePath {
+    ProjectRelative(PathBuf),
+    Absolute(PathBuf),
 }
 
 /// One playable audio event inside an `AudioContent`. Maps a slice of
@@ -1160,6 +1412,83 @@ pub struct BeatMarker {
     /// Position inside the event (event-local beats) where the source
     /// frame is locked to land.
     pub locked_beat: f64,
+}
+
+// =============================================================================
+// Video (v12, docs/plan_video.md §2.2)
+// =============================================================================
+
+/// Video clip content — an ordered list of video events that play within
+/// the clip. Mirrors the Bitwig-style `Clip ⊃ Event` hierarchy used by
+/// `AudioContent`; each `VideoEvent` maps a slice of a `VideoSource` to a
+/// position in the clip. Events on the same clip can overlap (= the
+/// preview composite alpha-blends them per #043 wgpu pipeline) or sit
+/// side by side (= split clip).
+///
+/// `#[serde(deny_unknown_fields)]` is required so the `#[serde(untagged)]`
+/// dispatch on `ClipContent` distinguishes `Audio` vs `Video` when the
+/// outer field name (`events`) collides — disjoint inner required fields
+/// (`source_start_frames` vs `source_start_micros`) handle the actual
+/// disambiguation, but denying unknowns here prevents a future field
+/// addition from accidentally widening the match.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[serde(deny_unknown_fields)]
+pub struct VideoContent {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<VideoEvent>,
+}
+
+/// One playable video event inside a `VideoContent`. Maps a slice of a
+/// `VideoSource` (`source_*_micros`) to a position in the clip
+/// (`event_start_in_clip_beats` + `event_length_beats`) and applies
+/// per-event playback parameters (mute / fade).
+///
+/// **Required-field invariant**: `source_start_micros` MUST stay as a
+/// required (no `#[serde(default)]`) field of distinct name from any
+/// required field of `AudioEvent`. The untagged `ClipContent` dispatch
+/// relies on this to disambiguate Video vs Audio JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct VideoEvent {
+    pub source_id: VideoSourceId,
+    /// Clip-local beat at which the event starts.
+    pub event_start_in_clip_beats: f64,
+    /// Duration of the event in clip-local beats. The source range
+    /// (`source_end_micros - source_start_micros`) maps onto this
+    /// duration at project tempo; tempo changes are not interpolated
+    /// for MVP (= CFR assumption).
+    pub event_length_beats: f64,
+    /// Source-relative start position in microseconds (libav
+    /// `AV_TIME_BASE` units). Disjoint from `AudioEvent`'s
+    /// `source_start_frames` so untagged `ClipContent` can dispatch
+    /// unambiguously.
+    pub source_start_micros: u64,
+    pub source_end_micros: u64,
+
+    /// When `true` the event renders as a solid clear color (= black
+    /// frame, no `VideoSource` decode). Useful for "blank" placeholders
+    /// without removing the event.
+    pub muted: bool,
+    pub fade_in_beats: f64,
+    pub fade_out_beats: f64,
+    pub fade_in_curve: FadeCurve,
+    pub fade_out_curve: FadeCurve,
+}
+
+impl Default for VideoEvent {
+    fn default() -> Self {
+        Self {
+            source_id: 0,
+            event_start_in_clip_beats: 0.0,
+            event_length_beats: 0.0,
+            source_start_micros: 0,
+            source_end_micros: 0,
+            muted: false,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        }
+    }
 }
 
 /// A free-time note inside a clip. `start_beat` is relative to the clip
@@ -1660,12 +1989,14 @@ mod tests {
 
     #[test]
     fn current_version_is_pinned() {
-        // Bumped to 11 for Scale & Root: `Song.scale_changes:
-        // Vec<ScaleChange>` is added. v10 files forward-migrate via
-        // `#[serde(default)]` on `scale_changes` (= empty Vec = Scale
-        // feature OFF / chromatic = legacy behavior). Pinning the
-        // constant catches accidental rollback.
-        assert_eq!(CURRENT_VERSION, 11);
+        // Bumped to 12 for Video editing: `Track.kind: TrackKind`,
+        // `Song.video_sources` + `next_video_source_id` +
+        // `video_resolution` + `video_framerate`, and
+        // `ClipContent::Video(VideoContent { events: Vec<VideoEvent> })`
+        // are added. v11 files forward-migrate via `#[serde(default)]`.
+        // Pinning the constant catches accidental rollback. See
+        // `docs/plan_video.md`.
+        assert_eq!(CURRENT_VERSION, 12);
     }
 
     #[test]
@@ -1914,5 +2245,255 @@ mod tests {
             param_id: 7,
         });
         assert_eq!(s.len(), 4);
+    }
+
+    // ====================================================================
+    // Video (v12) — `Track.kind`, `Song.video_sources`,
+    // `ClipContent::Video`, project-level resolution / framerate.
+    // See `docs/plan_video.md`.
+    // ====================================================================
+
+    #[test]
+    fn v11_track_loads_forward_with_default_kind() {
+        // A v11 `.daw` file has no `kind` key on `Track`. Forward-
+        // migration via `#[serde(default)]` must populate `Audio`.
+        let v11_json = r#"{
+            "id": 4,
+            "name": "Lead",
+            "volume": 0.9,
+            "pan": 0.0,
+            "next_clip_id": 1
+        }"#;
+        let track: Track = serde_json::from_str(v11_json).unwrap();
+        assert_eq!(track.id, 4);
+        assert_eq!(track.kind, TrackKind::Audio);
+    }
+
+    #[test]
+    fn v11_song_loads_forward_with_default_video_fields() {
+        // A v11 `.daw` file has no `video_sources` / `next_video_source_id`
+        // / `video_resolution` / `video_framerate` keys. Forward-migration
+        // via `#[serde(default)]` must populate empty / 1080p / 30fps.
+        let v11_json = r#"{
+            "bpm": 120.0,
+            "time_sig": [4, 4],
+            "length_beats": 64.0
+        }"#;
+        let song: Song = serde_json::from_str(v11_json).unwrap();
+        assert!(song.video_sources.is_empty());
+        assert_eq!(song.next_video_source_id, 0);
+        assert_eq!(song.video_resolution, (1920, 1080));
+        assert!((song.video_framerate - 30.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn video_track_with_clip_content_roundtrip() {
+        // A song with one video track + one video clip + one event
+        // round-trips through serde_json bit-for-bit. Exercises
+        // `ClipContent::Video` untagged dispatch against the existing
+        // `Midi` / `Audio` / `Automation` variants.
+        let mut song = Song::default();
+        let vsrc_id = song.alloc_video_source_id();
+        song.video_sources.insert(
+            vsrc_id,
+            VideoSource {
+                path: VideoSourcePath::ProjectRelative("samples/clip.mp4".into()),
+                width: 1920,
+                height: 1080,
+                framerate: 30.0,
+                duration_micros: 10_000_000,
+                codec: "h264".into(),
+                audio_source_id: None,
+            },
+        );
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Video(VideoContent {
+                events: vec![VideoEvent {
+                    source_id: vsrc_id,
+                    event_start_in_clip_beats: 0.0,
+                    event_length_beats: 4.0,
+                    source_start_micros: 0,
+                    source_end_micros: 2_000_000,
+                    muted: false,
+                    fade_in_beats: 0.25,
+                    fade_out_beats: 0.5,
+                    fade_in_curve: FadeCurve::Linear,
+                    fade_out_curve: FadeCurve::SCurve,
+                }],
+            }),
+        );
+        song.tracks.push(Track {
+            id: 1,
+            kind: TrackKind::Video,
+            name: "Vid".into(),
+            clips: vec![Clip {
+                id: 1,
+                name: "intro".into(),
+                start_beat: 0.0,
+                length_beats: 4.0,
+                content_id: cid,
+                notes: Vec::new(),
+            }],
+            next_clip_id: 2,
+            ..Track::default()
+        });
+
+        let restored: Song = json_roundtrip(&song);
+        assert_eq!(restored, song);
+        assert!(matches!(
+            restored.clip_contents[&cid],
+            ClipContent::Video(_)
+        ));
+        assert_eq!(restored.tracks[0].kind, TrackKind::Video);
+    }
+
+    #[test]
+    fn untagged_dispatch_disambiguates_audio_vs_video_events() {
+        // Regression test: `ClipContent::Audio` and `ClipContent::Video`
+        // both serialize their inner list under `"events"`, so the
+        // untagged dispatch falls back to inner-struct required-field
+        // presence. AudioEvent requires `source_start_frames`,
+        // VideoEvent requires `source_start_micros`; a JSON shaped for
+        // one variant must NOT silently match the other.
+        let audio_json = r#"{
+            "events": [{
+                "source_id": 1,
+                "event_start_in_clip_beats": 0.0,
+                "event_length_beats": 1.0,
+                "source_start_frames": 0,
+                "source_end_frames": 44100,
+                "gain_db": 0.0,
+                "pan": 0.0,
+                "pitch_semitones": 0.0,
+                "formant_semitones": 0.0,
+                "stretch_mode": "Raw",
+                "fade_in_beats": 0.0,
+                "fade_out_beats": 0.0,
+                "fade_in_curve": "Linear",
+                "fade_out_curve": "Linear",
+                "reversed": false,
+                "muted": false
+            }]
+        }"#;
+        let video_json = r#"{
+            "events": [{
+                "source_id": 1,
+                "event_start_in_clip_beats": 0.0,
+                "event_length_beats": 1.0,
+                "source_start_micros": 0,
+                "source_end_micros": 1000000,
+                "muted": false,
+                "fade_in_beats": 0.0,
+                "fade_out_beats": 0.0,
+                "fade_in_curve": "Linear",
+                "fade_out_curve": "Linear"
+            }]
+        }"#;
+        let audio: ClipContent = serde_json::from_str(audio_json).unwrap();
+        let video: ClipContent = serde_json::from_str(video_json).unwrap();
+        assert!(matches!(audio, ClipContent::Audio(_)));
+        assert!(matches!(video, ClipContent::Video(_)));
+    }
+
+    #[test]
+    fn alloc_video_source_id_bumps_counter() {
+        let mut song = Song::default();
+        let a = song.alloc_video_source_id();
+        let b = song.alloc_video_source_id();
+        assert_eq!(a, 1);
+        assert_eq!(b, 2);
+        assert_eq!(song.next_video_source_id, 3);
+    }
+
+    #[test]
+    fn video_source_refcount_counts_events() {
+        let mut song = Song::default();
+        let vid = song.alloc_video_source_id();
+        song.video_sources.insert(
+            vid,
+            VideoSource {
+                path: VideoSourcePath::Absolute("/tmp/v.mp4".into()),
+                width: 640,
+                height: 480,
+                framerate: 30.0,
+                duration_micros: 1_000_000,
+                codec: "h264".into(),
+                audio_source_id: None,
+            },
+        );
+        let cid_a = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid_a,
+            ClipContent::Video(VideoContent {
+                events: vec![
+                    VideoEvent {
+                        source_id: vid,
+                        ..VideoEvent::default()
+                    },
+                    VideoEvent {
+                        source_id: vid,
+                        ..VideoEvent::default()
+                    },
+                ],
+            }),
+        );
+        let cid_b = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid_b,
+            ClipContent::Video(VideoContent {
+                events: vec![VideoEvent {
+                    source_id: vid,
+                    ..VideoEvent::default()
+                }],
+            }),
+        );
+        assert_eq!(song.video_source_refcount(vid), 3);
+    }
+
+    #[test]
+    fn gc_video_sources_drops_orphans() {
+        let mut song = Song::default();
+        let live_id = song.alloc_video_source_id();
+        let orphan_id = song.alloc_video_source_id();
+        song.video_sources.insert(
+            live_id,
+            VideoSource {
+                path: VideoSourcePath::Absolute("/tmp/live.mp4".into()),
+                width: 640,
+                height: 480,
+                framerate: 30.0,
+                duration_micros: 1_000_000,
+                codec: "h264".into(),
+                audio_source_id: None,
+            },
+        );
+        song.video_sources.insert(
+            orphan_id,
+            VideoSource {
+                path: VideoSourcePath::Absolute("/tmp/orphan.mp4".into()),
+                width: 640,
+                height: 480,
+                framerate: 30.0,
+                duration_micros: 1_000_000,
+                codec: "h264".into(),
+                audio_source_id: None,
+            },
+        );
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Video(VideoContent {
+                events: vec![VideoEvent {
+                    source_id: live_id,
+                    ..VideoEvent::default()
+                }],
+            }),
+        );
+
+        song.gc_video_sources();
+        assert!(song.video_sources.contains_key(&live_id));
+        assert!(!song.video_sources.contains_key(&orphan_id));
     }
 }

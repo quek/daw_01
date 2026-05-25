@@ -10830,6 +10830,11 @@ impl AppData {
             // a stale Automation entry referenced from a MIDI/Audio
             // clip — refuse to split rather than guess.
             ClipContent::Automation(_) => return false,
+            // Video Split is wired in P6 (`docs/plan_video.md` §4 P6).
+            // Until then the E shortcut is a no-op on video clips —
+            // matches the Automation rationale (refuse rather than
+            // guess).
+            ClipContent::Video(_) => return false,
         };
 
         // Allocate fresh ContentIds for both halves (front was just
@@ -10998,6 +11003,11 @@ impl AppData {
                     // variant referenced from `Track.clips` is a
                     // stale link, skip silently.
                     ClipContent::Automation(_) => {}
+                    // Video Glue is wired in P6 (`docs/plan_video.md`
+                    // §4 P6). Until then, silently skip — combining
+                    // video clips needs source range partitioning
+                    // (micros) that P6 will own.
+                    ClipContent::Video(_) => {}
                 }
             }
             if !combined_start.is_finite() || !combined_end.is_finite() {
