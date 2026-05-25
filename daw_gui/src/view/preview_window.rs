@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use daw_ui_platform::WindowBackend;
-use daw_ui_renderer::{Color, GlyphArea, Renderer, Scene};
+use daw_ui_renderer::{Color, GlyphArea, Renderer, Scene, TextureHandle, TexturedQuad};
 use winit::dpi::LogicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{WindowAttributes, WindowId};
@@ -35,6 +35,16 @@ pub struct PreviewWindowState {
     pub window: Arc<DawGuiWindow>,
     pub renderer: Renderer<DawGuiWindow>,
     pub scene: Scene,
+    /// docs/plan_video.md P5: the texture the runner re-uploads each
+    /// frame with the current playhead's decoded video. Created
+    /// lazily on first decode (so the placeholder still renders
+    /// before any video clip is in scope) and reused for every
+    /// subsequent frame to avoid GPU allocator churn at 30fps. The
+    /// `(width, height)` is the source's native size; the preview
+    /// window may differ and `render_frame` aspect-fits into its own
+    /// dimensions.
+    pub frame_texture: Option<TextureHandle>,
+    pub frame_size: (u32, u32),
 }
 
 impl PreviewWindowState {
@@ -62,7 +72,37 @@ impl PreviewWindowState {
             window: dwin,
             renderer,
             scene: Scene::new(),
+            frame_texture: None,
+            frame_size: (0, 0),
         })
+    }
+
+    /// Upload (or create + upload) the latest decoded video frame into
+    /// the preview window's dedicated texture. The handle is reused
+    /// every frame; the texture is recreated only when the source's
+    /// dimensions change (= switching between video clips with
+    /// different resolutions).
+    pub fn upload_frame(&mut self, width: u32, height: u32, rgba: &[u8]) {
+        if self.frame_size != (width, height) {
+            if let Some(old) = self.frame_texture.take() {
+                self.renderer.destroy_texture(old);
+            }
+            self.frame_texture = Some(self.renderer.create_texture(width, height));
+            self.frame_size = (width, height);
+        }
+        if let Some(h) = self.frame_texture {
+            self.renderer.upload_texture_rgba(h, rgba);
+        }
+    }
+
+    /// Drop the cached video frame texture (= preview falls back to
+    /// the placeholder until the next `upload_frame`). Called when the
+    /// playhead leaves all video clips so a stale frame doesn't linger.
+    pub fn clear_frame(&mut self) {
+        if let Some(old) = self.frame_texture.take() {
+            self.renderer.destroy_texture(old);
+        }
+        self.frame_size = (0, 0);
     }
 
     /// `winit::WindowId` for routing `WindowEvent`s in the runner.
@@ -78,8 +118,11 @@ impl PreviewWindowState {
         self.window.request_redraw();
     }
 
-    /// Build the placeholder scene + render. P5/P7 will overwrite the
-    /// scene contents with the actual frame composite.
+    /// Build the scene + render. When `frame_texture` is `Some` (=
+    /// the runner has uploaded a decoded video frame for this
+    /// playhead position, P5) the scene draws an aspect-fit textured
+    /// quad over the dark backdrop; otherwise it falls back to the
+    /// "Video Preview" placeholder text (P4 baseline).
     pub fn render_placeholder(&mut self) {
         self.scene.clear();
         let screen = self.renderer.size();
@@ -99,23 +142,64 @@ impl PreviewWindowState {
             radius: [0.0; 4],
             clip_rect: None,
         });
-        // Centered "Video Preview" label so users can tell the window
-        // is intentional (vs. a render bug). Replaced by the composite
-        // texture quad in P5/P7.
-        let text = "Video Preview";
-        let approx_w = text.len() as f32 * 9.0; // monospace fudge
-        self.scene.push_text(GlyphArea {
-            text: text.into(),
-            left: (screen.width as f32 - approx_w) * 0.5,
-            top: (screen.height as f32 - 16.0) * 0.5,
-            font_size: 16.0,
-            line_height: 20.0,
-            color: Color::rgb(0.65, 0.7, 0.8),
-            clip_rect: None,
-        });
+
+        match self.frame_texture {
+            Some(handle) if self.frame_size.0 > 0 && self.frame_size.1 > 0 => {
+                let dst = aspect_fit_rect(
+                    (screen.width as f32, screen.height as f32),
+                    (self.frame_size.0 as f32, self.frame_size.1 as f32),
+                );
+                self.scene.push_textured_quad(TexturedQuad {
+                    rect: daw_ui_renderer::Rect::new(dst.0, dst.1, dst.2, dst.3),
+                    texture: handle,
+                    alpha: 1.0,
+                    uv_min: (0.0, 0.0),
+                    uv_max: (1.0, 1.0),
+                    clip_rect: None,
+                });
+            }
+            _ => {
+                // No frame available — show the P4 placeholder text so
+                // the user knows the window is alive but waiting on a
+                // video clip / playhead.
+                let text = "Video Preview";
+                let approx_w = text.len() as f32 * 9.0;
+                self.scene.push_text(GlyphArea {
+                    text: text.into(),
+                    left: (screen.width as f32 - approx_w) * 0.5,
+                    top: (screen.height as f32 - 16.0) * 0.5,
+                    font_size: 16.0,
+                    line_height: 20.0,
+                    color: Color::rgb(0.65, 0.7, 0.8),
+                    clip_rect: None,
+                });
+            }
+        }
+
         if let Err(e) = self.renderer.render(&self.scene) {
             tracing::error!(error = ?e, "preview render error");
         }
+    }
+}
+
+/// Letterbox `src` into `dst`, centering with black bars on whichever
+/// axis has slack. Returns `(x, y, w, h)` in destination coordinates.
+fn aspect_fit_rect(dst: (f32, f32), src: (f32, f32)) -> (f32, f32, f32, f32) {
+    let (dw, dh) = dst;
+    let (sw, sh) = src;
+    if sw <= 0.0 || sh <= 0.0 || dw <= 0.0 || dh <= 0.0 {
+        return (0.0, 0.0, dw.max(0.0), dh.max(0.0));
+    }
+    let dst_aspect = dw / dh;
+    let src_aspect = sw / sh;
+    if src_aspect >= dst_aspect {
+        // Source is wider — pillar-fit (top/bottom black bars).
+        let h = dw / src_aspect;
+        (0.0, (dh - h) * 0.5, dw, h)
+    } else {
+        // Source is taller — letterbox (left/right black bars).
+        let w = dh * src_aspect;
+        ((dw - w) * 0.5, 0.0, w, dh)
     }
 }
 

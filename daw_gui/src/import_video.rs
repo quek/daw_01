@@ -87,6 +87,10 @@ impl std::error::Error for VideoImportError {}
 /// Lazy-init `MFStartup` exactly once per process. Returns the cached
 /// result on every subsequent call. `CoInitializeEx(MTA)` is also
 /// invoked once; subsequent thread inits are independent.
+///
+/// Sibling `video_playback` module reuses this via
+/// [`ensure_mf_startup_pub`] so the same process-wide guard covers
+/// both import-time decode and playback-time decode.
 fn ensure_mf_startup() -> Result<(), VideoImportError> {
     static MF_INIT: OnceLock<Result<(), String>> = OnceLock::new();
     let result = MF_INIT.get_or_init(|| {
@@ -119,6 +123,14 @@ fn to_wide(path: &Path) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+/// `pub` wrapper around the module-private `ensure_mf_startup` so
+/// sibling `video_playback` can share the same `OnceLock`. Returns
+/// a stringified error so callers can format it without picking up
+/// this module's error enum.
+pub fn ensure_mf_startup_pub() -> Result<(), String> {
+    ensure_mf_startup().map_err(|e| e.to_string())
 }
 
 /// Best-effort PROPVARIANT → u64 extractor for VT_UI8 values (= the

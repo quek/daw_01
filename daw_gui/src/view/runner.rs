@@ -75,6 +75,12 @@ struct RunnerState {
     /// を受け付ける。 P5 で video frame、 P7 で composite texture を
     /// `scene` に push する経路がここに繋がる。
     preview: Option<crate::view::preview_window::PreviewWindowState>,
+    /// docs/plan_video.md P5: per-source IMFSourceReader を抱える
+    /// playback decoder。 process 起動時に作成、 各 render_frame で
+    /// playhead を元に active video clip の current frame を decode
+    /// → preview window の `frame_texture` に upload する。
+    #[cfg(windows)]
+    playback: crate::video_playback::VideoPlaybackEngine,
 }
 
 struct Runner {
@@ -143,6 +149,8 @@ impl ApplicationHandler<AppEvent> for Runner {
             ime_enabled: false,
             last_title: "daw_01".to_string(),
             preview: None,
+            #[cfg(windows)]
+            playback: crate::video_playback::VideoPlaybackEngine::new(),
         });
     }
 
@@ -297,11 +305,22 @@ impl Runner {
         // queued for the next frame's drain).
         Self::drain_video_thumbnail_uploads(&mut state.app, &mut state.renderer);
 
-        // P4: render the preview window's placeholder if it exists.
-        // Cheap when the placeholder hasn't changed (wgpu vsync /
-        // swapchain handles the no-op case).
+        // P5: drive playback decode + upload into the preview
+        // window's frame_texture. When the playhead lands inside a
+        // video clip, decode the corresponding source_micros frame
+        // and re-upload; otherwise clear so the placeholder shows.
+        #[cfg(windows)]
+        if state.preview.is_some() {
+            Self::drive_preview_playback(state);
+        }
+
+        // P4 baseline / P5 hand-off: render the preview window each
+        // frame. `render_placeholder` picks between the placeholder
+        // text and the textured-quad path internally based on whether
+        // `frame_texture` is Some.
         if let Some(preview) = state.preview.as_mut() {
             preview.render_placeholder();
+            preview.window.request_redraw();
         }
 
         let screen = state.renderer.size();
@@ -435,6 +454,63 @@ impl Runner {
         }
     }
 
+    /// docs/plan_video.md P5: drive a single playback decode +
+    /// upload cycle for the preview window. Resolves the
+    /// `VideoSourcePath` to an on-disk path, decodes the frame at
+    /// the playhead-derived `source_micros`, and uploads into the
+    /// preview's `frame_texture`. When no clip is active or the
+    /// path can't be resolved, clears the texture so the placeholder
+    /// shows. Errors are logged at warn level — preview never panics
+    /// the GUI on a bad video.
+    #[cfg(windows)]
+    fn drive_preview_playback(state: &mut RunnerState) {
+        let Some(preview) = state.preview.as_mut() else {
+            return;
+        };
+        let playhead_beat = state.app.playhead_beat.map(f64::from);
+        let Some(playhead_beat) = playhead_beat else {
+            preview.clear_frame();
+            return;
+        };
+        let Some((video_source_id, source_micros)) =
+            crate::video_playback::VideoPlaybackEngine::active_source_at(
+                &state.app.song,
+                playhead_beat,
+            )
+        else {
+            preview.clear_frame();
+            return;
+        };
+        let project_dir = state
+            .app
+            .file_path
+            .as_ref()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+        let Some(abs_path) =
+            resolve_video_path(&state.app.song, video_source_id, project_dir.as_deref())
+        else {
+            tracing::warn!(
+                video_source_id,
+                "video path unresolved (unsaved project + ProjectRelative?), \
+                 preview cleared"
+            );
+            preview.clear_frame();
+            return;
+        };
+        match state
+            .playback
+            .decode_at(video_source_id, &abs_path, source_micros)
+        {
+            Ok(frame) => {
+                preview.upload_frame(frame.width, frame.height, &frame.rgba);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, video_source_id, source_micros, "preview decode failed");
+                preview.clear_frame();
+            }
+        }
+    }
+
     /// docs/plan_video.md P3.5: drain `AppData.pending_thumbnail_uploads`
     /// by creating GPU textures via the live `Renderer`. Each successful
     /// upload populates `video_texture_cache` for arrangement_view to
@@ -461,6 +537,27 @@ impl Runner {
             let handle = renderer.create_texture(w, h);
             renderer.upload_texture_rgba(handle, rgba.as_slice());
             app.video_texture_cache.insert(video_source_id, handle);
+        }
+    }
+}
+
+/// docs/plan_video.md P5: turn a `VideoSourcePath` into an on-disk
+/// path the WMF reader can open. `Absolute` is direct; `ProjectRelative`
+/// needs the saved project dir — unsaved projects with
+/// `ProjectRelative` paths return None (= shouldn't happen since
+/// `import_one_video` writes `Absolute` for unsaved projects, but be
+/// defensive).
+#[cfg(windows)]
+fn resolve_video_path(
+    song: &common::model::Song,
+    video_source_id: common::model::VideoSourceId,
+    project_dir: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let src = song.video_sources.get(&video_source_id)?;
+    match &src.path {
+        common::model::VideoSourcePath::Absolute(p) => Some(p.clone()),
+        common::model::VideoSourcePath::ProjectRelative(rel) => {
+            project_dir.map(|d| d.join(rel))
         }
     }
 }
