@@ -2482,6 +2482,21 @@ pub enum AppEvent {
     /// video frame composite arrives in P5/P7.
     TogglePreviewWindow,
 
+    /// File menu → "Export Video..." (`docs/plan_video.md` P8). Opens
+    /// a save dialog for the output mp4 path + a second open dialog
+    /// (cancelable) for an optional audio WAV to mux in. Forwards to
+    /// `AppEvent::ExportMp4` once the user picks paths.
+    OpenExportMp4Dialog,
+
+    /// Synchronous mp4 render at `output_path`, optionally muxing the
+    /// PCM Float32 WAV at `audio_wav` as an AAC stream. Blocks the
+    /// GUI thread for the duration (= MVP simplicity). v12
+    /// (`docs/plan_video.md` P8).
+    ExportMp4 {
+        output_path: PathBuf,
+        audio_wav: Option<PathBuf>,
+    },
+
     // -------- Split / Glue (Phase 1 PR7) -----------------------------------
     /// Split clip(s) at the **mouse cursor** (= `AppData
     /// .arrangement_hover_beat` snapped, or `_raw` when `snap == false`
@@ -3439,6 +3454,25 @@ impl AppData {
                 } else {
                     "Video preview: 非表示".into()
                 };
+            }
+            AppEvent::OpenExportMp4Dialog => {
+                #[cfg(windows)]
+                self.action_open_export_mp4_dialog();
+                #[cfg(not(windows))]
+                {
+                    self.status_message =
+                        "Video export は Windows 専用 (WMF 経由) です".into();
+                }
+            }
+            AppEvent::ExportMp4 { output_path, audio_wav } => {
+                #[cfg(windows)]
+                self.action_export_mp4(output_path, audio_wav);
+                #[cfg(not(windows))]
+                {
+                    let _ = (output_path, audio_wav);
+                    self.status_message =
+                        "Video export は Windows 専用 (WMF 経由) です".into();
+                }
             }
             AppEvent::SetClipReversed { target, reversed } => {
                 self.set_clip_audio_event_reversed(target, reversed);
@@ -10763,6 +10797,78 @@ impl AppData {
             return;
         }
         self.action_import_video(paths);
+    }
+
+    /// File menu → "Export Video..." (`docs/plan_video.md` P8).
+    /// 1. Save dialog for the output mp4 (defaults to project name +
+    ///    `.mp4`).
+    /// 2. Optional second dialog: pick a WAV produced by Export WAV
+    ///    to mux as the AAC track. Cancel = video-only mp4.
+    /// 3. Forward to `AppEvent::ExportMp4`.
+    #[cfg(windows)]
+    fn action_open_export_mp4_dialog(&mut self) {
+        let default_name = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .map(|s| format!("{s}.mp4"))
+            .unwrap_or_else(|| "untitled.mp4".into());
+        let Some(output_path) = rfd::FileDialog::new()
+            .add_filter("MP4 Video", &["mp4"])
+            .set_file_name(&default_name)
+            .set_title("Export Video to MP4...")
+            .save_file()
+        else {
+            return;
+        };
+        let audio_wav = rfd::FileDialog::new()
+            .add_filter("WAV Audio (optional)", &["wav"])
+            .set_title("Optional: audio WAV to mux (Cancel for video-only)")
+            .pick_file();
+        self.handle_event(AppEvent::ExportMp4 {
+            output_path,
+            audio_wav,
+        });
+    }
+
+    /// Synchronous mp4 render (`docs/plan_video.md` P8). Blocks the
+    /// GUI thread for the duration — typical 1-minute MV at 1080p30
+    /// finishes in ~10s on a recent laptop (CPU NV12 conversion is
+    /// the bottleneck). Surface progress / completion via
+    /// `status_message`; failure surfaces the error there too.
+    #[cfg(windows)]
+    fn action_export_mp4(
+        &mut self,
+        output_path: PathBuf,
+        audio_wav: Option<PathBuf>,
+    ) {
+        let project_dir = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.parent().map(Path::to_path_buf));
+        self.status_message = format!("Video export 開始: {}", output_path.display());
+        let cfg = crate::render_video::RenderConfig::new(&self.song, &output_path)
+            .with_project_dir(project_dir.as_deref())
+            .with_audio_wav(audio_wav.as_deref());
+        match crate::render_video::render_mp4(&cfg) {
+            Ok(stats) => {
+                self.status_message = format!(
+                    "Video export 完了: {} ({} frames)",
+                    stats.output_path.display(),
+                    stats.frames_written
+                );
+            }
+            Err(e) => {
+                self.status_message =
+                    format!("Video export 失敗: {}: {e}", output_path.display());
+                tracing::error!(
+                    error = %e,
+                    path = %output_path.display(),
+                    "render_mp4 failed"
+                );
+            }
+        }
     }
 
     /// Split clip(s) at the cursor (= mouse hover beat).

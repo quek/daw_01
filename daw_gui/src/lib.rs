@@ -18,6 +18,8 @@ pub mod import_audio;
 #[cfg(windows)]
 pub mod import_video;
 #[cfg(windows)]
+pub mod render_video;
+#[cfg(windows)]
 pub mod video_playback;
 pub mod job;
 pub mod midi;
