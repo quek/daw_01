@@ -344,6 +344,31 @@ fn fade_curve_value(progress: f32, curve: FadeCurve) -> f32 {
     }
 }
 
+/// docs/plan_video.md P5 perf: scale the WMF output down to this
+/// long-edge before the sample reaches the CPU. The preview window
+/// caps at 960px in width by default ([`view::preview_window::
+/// scale_to_fit_on_screen`]), so a 1920x1080 source decoded at native
+/// would upload 8 MB / frame and waste ~4x more CPU + GPU bandwidth
+/// than the eye ever consumes. 960 also keeps decode under ~5 ms /
+/// frame on modern Intel iGPUs, which is the budget the GUI thread
+/// has at 30fps preview without going chunky. Sources whose long
+/// edge is already ≤ 960 are passed through native (= no upscale).
+const PREVIEW_MAX_LONG_EDGE: u32 = 960;
+
+fn scale_for_preview(native_w: u32, native_h: u32) -> (u32, u32) {
+    let long = native_w.max(native_h);
+    if long <= PREVIEW_MAX_LONG_EDGE {
+        return (native_w.max(1), native_h.max(1));
+    }
+    let scale = PREVIEW_MAX_LONG_EDGE as f64 / long as f64;
+    let w = ((native_w as f64) * scale).round().max(1.0) as u32;
+    let h = ((native_h as f64) * scale).round().max(1.0) as u32;
+    // Round to even so 4:2:0 / NV12 downstream consumers don't trip
+    // on odd dimensions. Preview pipeline is RGB so this is just
+    // hygienic.
+    (w & !1, h & !1)
+}
+
 fn create_reader_for_source(path: &Path) -> Result<ReaderEntry, String> {
     // MFStartup is owned by `import_video` and idempotent.
     crate::import_video::ensure_mf_startup_pub()
@@ -380,11 +405,12 @@ fn create_reader_for_source(path: &Path) -> Result<ReaderEntry, String> {
         .map_err(|e| format!("GetNativeMediaType: {e}"))?;
     let frame_size = unsafe { native.GetUINT64(&MF_MT_FRAME_SIZE) }
         .map_err(|e| format!("MF_MT_FRAME_SIZE: {e}"))?;
-    let width = (frame_size >> 32) as u32;
-    let height = (frame_size & 0xFFFF_FFFF) as u32;
-    if width == 0 || height == 0 {
-        return Err(format!("invalid frame size {width}x{height}"));
+    let native_w = (frame_size >> 32) as u32;
+    let native_h = (frame_size & 0xFFFF_FFFF) as u32;
+    if native_w == 0 || native_h == 0 {
+        return Err(format!("invalid frame size {native_w}x{native_h}"));
     }
+    let (width, height) = scale_for_preview(native_w, native_h);
 
     let output = unsafe {
         let t = MFCreateMediaType().map_err(|e| format!("MFCreateMediaType: {e}"))?;
@@ -392,6 +418,15 @@ fn create_reader_for_source(path: &Path) -> Result<ReaderEntry, String> {
             .map_err(|e| format!("set MAJOR_TYPE: {e}"))?;
         t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
             .map_err(|e| format!("set SUBTYPE RGB32: {e}"))?;
+        // Explicitly request a downscaled output frame size — WMF's
+        // video processor MFT inserts a scaler when this differs from
+        // the native input dimensions. Saves CPU+GPU upload bandwidth
+        // at preview (= the visible target maxes at 960px), while
+        // export still goes through the separate `render_video`
+        // pipeline that decodes at native via its own reader.
+        let packed = ((width as u64) << 32) | (height as u64);
+        t.SetUINT64(&MF_MT_FRAME_SIZE, packed)
+            .map_err(|e| format!("set output FRAME_SIZE: {e}"))?;
         t
     };
     unsafe { reader.SetCurrentMediaType(stream, None, &output) }
@@ -482,11 +517,18 @@ fn read_one_frame(
         }
         let src = unsafe { std::slice::from_raw_parts(ptr, frame_bytes) };
         let mut rgba = Vec::with_capacity(frame_bytes);
+        // BGRA → RGBA channel swap. The alpha byte in WMF's
+        // `MFVideoFormat_RGB32` is documented as undefined (per MSDN:
+        // "Media Foundation might or might not preserve its value")
+        // — we hardcode 0xFF here so the texture renders opaque. If
+        // we used `px[3]` instead, the alpha would often be 0 and the
+        // entire preview would be invisibly blended out (= the exact
+        // "preview shows nothing" bug 2026-05-25).
         for px in src.chunks_exact(4) {
             rgba.push(px[2]);
             rgba.push(px[1]);
             rgba.push(px[0]);
-            rgba.push(px[3]);
+            rgba.push(0xFF);
         }
         let _ = unsafe { buffer.Unlock() };
         return Ok(Some((timestamp.max(0) as u64, rgba)));
@@ -660,6 +702,30 @@ mod tests {
             .expect("decode_at @ 0.3s (backward seek)");
         assert_eq!(frame3.width, 320);
         assert_eq!(frame3.rgba.len(), 320 * 240 * 4);
+
+        // Alpha channel must be hardcoded to 0xFF (= MFVideoFormat_RGB32's
+        // undefined alpha byte must NOT leak through, or the preview
+        // would render fully transparent). Scan a few pixels — every
+        // 4th byte should be 255.
+        for px in frame.rgba.chunks_exact(4).take(64) {
+            assert_eq!(px[3], 0xFF, "alpha must be opaque 0xFF, got {}", px[3]);
+        }
+    }
+
+    #[test]
+    fn scale_for_preview_caps_long_edge() {
+        // 1920x1080 → scaled to 960x540 (= long-edge 960, aspect kept).
+        assert_eq!(scale_for_preview(1920, 1080), (960, 540));
+        // 4K → 960x540 too (1920/3840 = 0.5).
+        assert_eq!(scale_for_preview(3840, 2160), (960, 540));
+        // Already small → identity (with even-round hygiene).
+        assert_eq!(scale_for_preview(640, 480), (640, 480));
+        assert_eq!(scale_for_preview(960, 540), (960, 540));
+        // Portrait → long-edge cap on height.
+        assert_eq!(scale_for_preview(1080, 1920), (540, 960));
+        // Odd dimensions get rounded to even (NV12 hygiene).
+        let (w, h) = scale_for_preview(1921, 1081);
+        assert!(w % 2 == 0 && h % 2 == 0, "even-aligned, got {w}x{h}");
     }
 
     fn locate_ffmpeg() -> Option<std::path::PathBuf> {

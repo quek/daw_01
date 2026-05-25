@@ -445,16 +445,19 @@ pub fn extract_thumbnail(path: &Path) -> Result<ThumbnailFrame, VideoImportError
         // larger than width*4 (= row padding) — for RGB32 in WMF it's
         // almost always exactly width*4 but we defensively only read
         // `frame_bytes`. A more robust implementation would query
-        // MF_MT_DEFAULT_STRIDE and copy row-by-row.
+        // MF_MT_DEFAULT_STRIDE and copy row-by-row. The alpha byte in
+        // `MFVideoFormat_RGB32` is undefined per MSDN, so we hardcode
+        // 0xFF — without this the thumbnail texture renders with
+        // arbitrary alpha (often 0) and disappears.
         let src = unsafe { std::slice::from_raw_parts(ptr, frame_bytes) };
         rgba.clear();
         rgba.reserve_exact(frame_bytes);
         for px in src.chunks_exact(4) {
-            // src order: B, G, R, A → push R, G, B, A
+            // src order: B, G, R, _ → push R, G, B, 0xFF
             rgba.push(px[2]);
             rgba.push(px[1]);
             rgba.push(px[0]);
-            rgba.push(px[3]);
+            rgba.push(0xFF);
         }
 
         let _ = unsafe { buffer.Unlock() };
