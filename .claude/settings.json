@@ -1,5 +1,19 @@
 {
   "permissions": {
     "additionalDirectories": ["F:/dev/gui_01"]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -ExecutionPolicy Bypass -File F:/dev/daw_01/scripts/check_antipattern.ps1",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
   }
 }

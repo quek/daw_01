@@ -153,6 +153,26 @@ cargo clippy --workspace -- -D warnings
 - 既存の挙動を勝手に変えない
 - バグ修正ついでのリファクタリングは別コミット
 
+### 妥協を選択肢に上げない
+
+冒頭の **「理想とベストプラクティスを追求する。 そのためは大胆に破壊して作り直す。」** は、 **実測してから妥協を選ぶ** ではない。 **そもそも妥協を選ばない**。
+
+選択肢を比較する時に出すべき問い:
+- どれが **理想** か?
+- 理想を実現するには何を破壊する必要があるか?
+
+出してはいけない問い (= principle 違反):
+- どれが **実装コストが低い** か?
+- どれが **影響範囲が狭い** か?
+- どれが **caller boilerplate が少ない** か?
+- どれが **現実的** か?
+
+「実装コスト」「影響範囲」「連鎖する」「許容範囲」「現実的に」「妥協」 — これらが思考に出てきた**時点で**、 理想以外の選択肢を比較対象に上げてしまっている。 PreToolUse hook (`scripts/check_antipattern.ps1`) がこれらのキーワードを Edit / Write の対象 string に見つけたら、 警告を emit する (block はしない、 思考の中断点として作用)。
+
+#### 実例 (2026-05-25, この principle を破った)
+
+gui_01 #045 Phase 74 で `isize` raw vs `HANDLE` 型受け の選択時、 「workspace windows bump は連鎖、 caller boilerplate +1 行は許容範囲」 と書いて raw 値受けを推奨。 ユーザーから 「実装コストは考えずに理想的なものを」 と明示的に指示があったのに違反した。 正しい思考: 理想 = `HANDLE` 型受け、 破壊 = workspace bump、 終わり。 詳細: `~/.claude/projects/F--dev-daw-01/memory/feedback_pursue_ideal_only.md`。
+
 ## Real-Time Audio の制約（最重要）
 
 オーディオコールバック（daw_audio の再生スレッド、および CLAP process() に至るパス）
