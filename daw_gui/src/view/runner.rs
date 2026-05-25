@@ -454,61 +454,81 @@ impl Runner {
         }
     }
 
-    /// docs/plan_video.md P5: drive a single playback decode +
-    /// upload cycle for the preview window. Resolves the
-    /// `VideoSourcePath` to an on-disk path, decodes the frame at
-    /// the playhead-derived `source_micros`, and uploads into the
-    /// preview's `frame_texture`. When no clip is active or the
-    /// path can't be resolved, clears the texture so the placeholder
-    /// shows. Errors are logged at warn level — preview never panics
-    /// the GUI on a bad video.
+    /// docs/plan_video.md P7: drive multi-clip playback decode +
+    /// upload + composite for the preview window. Asks the engine
+    /// for every active video clip at the playhead, decodes each one,
+    /// uploads to per-source GPU textures, and hands the bottom→top
+    /// composite list to the preview. When the playhead is outside
+    /// every video clip, clears the composite list so the placeholder
+    /// shows. Per-source decode failures log at warn level and skip
+    /// just that layer — the rest of the composite still draws.
     #[cfg(windows)]
     fn drive_preview_playback(state: &mut RunnerState) {
         let Some(preview) = state.preview.as_mut() else {
             return;
         };
-        let playhead_beat = state.app.playhead_beat.map(f64::from);
-        let Some(playhead_beat) = playhead_beat else {
-            preview.clear_frame();
+        let Some(playhead_beat) = state.app.playhead_beat.map(f64::from) else {
+            preview.set_composite_layers(Vec::new());
             return;
         };
-        let Some((video_source_id, source_micros)) =
-            crate::video_playback::VideoPlaybackEngine::active_source_at(
-                &state.app.song,
-                playhead_beat,
-            )
-        else {
-            preview.clear_frame();
+        let active = crate::video_playback::VideoPlaybackEngine::active_sources_at(
+            &state.app.song,
+            playhead_beat,
+        );
+        if active.is_empty() {
+            preview.set_composite_layers(Vec::new());
             return;
-        };
+        }
         let project_dir = state
             .app
             .file_path
             .as_ref()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
-        let Some(abs_path) =
-            resolve_video_path(&state.app.song, video_source_id, project_dir.as_deref())
-        else {
-            tracing::warn!(
-                video_source_id,
-                "video path unresolved (unsaved project + ProjectRelative?), \
-                 preview cleared"
-            );
-            preview.clear_frame();
-            return;
-        };
-        match state
-            .playback
-            .decode_at(video_source_id, &abs_path, source_micros)
-        {
-            Ok(frame) => {
-                preview.upload_frame(frame.width, frame.height, &frame.rgba);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, video_source_id, source_micros, "preview decode failed");
-                preview.clear_frame();
+        let mut layers: Vec<crate::view::preview_window::CompositeLayer> =
+            Vec::with_capacity(active.len());
+        for frame_info in active {
+            let Some(abs_path) = resolve_video_path(
+                &state.app.song,
+                frame_info.video_source_id,
+                project_dir.as_deref(),
+            ) else {
+                tracing::warn!(
+                    video_source_id = frame_info.video_source_id,
+                    "video path unresolved (unsaved project + ProjectRelative?), \
+                     skipping layer"
+                );
+                continue;
+            };
+            match state.playback.decode_at(
+                frame_info.video_source_id,
+                &abs_path,
+                frame_info.source_micros,
+            ) {
+                Ok(frame) => {
+                    let handle = preview.upload_frame(
+                        frame_info.video_source_id,
+                        frame.width,
+                        frame.height,
+                        &frame.rgba,
+                    );
+                    layers.push(crate::view::preview_window::CompositeLayer {
+                        texture: handle,
+                        width: frame.width,
+                        height: frame.height,
+                        alpha: frame_info.alpha,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        video_source_id = frame_info.video_source_id,
+                        source_micros = frame_info.source_micros,
+                        "preview decode failed, layer skipped"
+                    );
+                }
             }
         }
+        preview.set_composite_layers(layers);
     }
 
     /// docs/plan_video.md P3.5: drain `AppData.pending_thumbnail_uploads`

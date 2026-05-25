@@ -35,16 +35,41 @@ pub struct PreviewWindowState {
     pub window: Arc<DawGuiWindow>,
     pub renderer: Renderer<DawGuiWindow>,
     pub scene: Scene,
-    /// docs/plan_video.md P5: the texture the runner re-uploads each
-    /// frame with the current playhead's decoded video. Created
-    /// lazily on first decode (so the placeholder still renders
-    /// before any video clip is in scope) and reused for every
-    /// subsequent frame to avoid GPU allocator churn at 30fps. The
-    /// `(width, height)` is the source's native size; the preview
-    /// window may differ and `render_frame` aspect-fits into its own
-    /// dimensions.
-    pub frame_texture: Option<TextureHandle>,
-    pub frame_size: (u32, u32),
+    /// docs/plan_video.md P7: per-VideoSourceId GPU textures the
+    /// runner re-uploads each frame with the active clip's decoded
+    /// pixels. Multiple entries when more than one video clip is
+    /// active at the playhead (= crossfade between adjacent clips on
+    /// the same track, or stacked video tracks). `(handle, width,
+    /// height)`; widths/heights are source-native, the composite
+    /// pass aspect-fits each layer into the preview window
+    /// independently. Entries are kept across frames so re-uploads
+    /// reuse the same `TextureHandle` (= no GPU allocator churn at
+    /// 30fps); `clear_all` is called when the preview window
+    /// destructs to release them.
+    pub frame_textures: std::collections::HashMap<
+        common::model::VideoSourceId,
+        (TextureHandle, u32, u32),
+    >,
+    /// docs/plan_video.md P7: composite layer list the runner pushes
+    /// each frame, ordered bottom→top (= lowest video track first,
+    /// crossfade-partner clip on top of fading-out clip). Each entry
+    /// references a `frame_textures` handle. Cleared at the start of
+    /// every frame and refilled by the runner before
+    /// `render_placeholder`. Empty = the placeholder text appears.
+    pub composite_layers: Vec<CompositeLayer>,
+}
+
+/// One textured layer in the preview composite. The runner builds a
+/// `Vec<CompositeLayer>` ordered bottom→top each frame; the render
+/// pass calls `push_textured_quad` in that order so gui_01's
+/// call-order interleave lays the top track / crossfade-target on
+/// top.
+#[derive(Debug, Clone, Copy)]
+pub struct CompositeLayer {
+    pub texture: TextureHandle,
+    pub width: u32,
+    pub height: u32,
+    pub alpha: f32,
 }
 
 impl PreviewWindowState {
@@ -72,37 +97,60 @@ impl PreviewWindowState {
             window: dwin,
             renderer,
             scene: Scene::new(),
-            frame_texture: None,
-            frame_size: (0, 0),
+            frame_textures: std::collections::HashMap::new(),
+            composite_layers: Vec::new(),
         })
     }
 
-    /// Upload (or create + upload) the latest decoded video frame into
-    /// the preview window's dedicated texture. The handle is reused
-    /// every frame; the texture is recreated only when the source's
-    /// dimensions change (= switching between video clips with
-    /// different resolutions).
-    pub fn upload_frame(&mut self, width: u32, height: u32, rgba: &[u8]) {
-        if self.frame_size != (width, height) {
-            if let Some(old) = self.frame_texture.take() {
+    /// Upload a freshly-decoded RGBA frame for `source_id`. Reuses
+    /// the existing `TextureHandle` when the dimensions match (=
+    /// hot path during playback / scrub); destroys + re-creates only
+    /// when the source's native size changed (= rare, would mean
+    /// the project's video sources were re-imported).
+    pub fn upload_frame(
+        &mut self,
+        source_id: common::model::VideoSourceId,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> TextureHandle {
+        let recreate = match self.frame_textures.get(&source_id) {
+            Some((_, w, h)) => *w != width || *h != height,
+            None => true,
+        };
+        if recreate {
+            if let Some((old, _, _)) = self.frame_textures.remove(&source_id) {
                 self.renderer.destroy_texture(old);
             }
-            self.frame_texture = Some(self.renderer.create_texture(width, height));
-            self.frame_size = (width, height);
+            let h = self.renderer.create_texture(width, height);
+            self.frame_textures.insert(source_id, (h, width, height));
         }
-        if let Some(h) = self.frame_texture {
-            self.renderer.upload_texture_rgba(h, rgba);
-        }
+        let handle = self
+            .frame_textures
+            .get(&source_id)
+            .map(|(h, _, _)| *h)
+            .expect("just inserted");
+        self.renderer.upload_texture_rgba(handle, rgba);
+        handle
     }
 
-    /// Drop the cached video frame texture (= preview falls back to
-    /// the placeholder until the next `upload_frame`). Called when the
-    /// playhead leaves all video clips so a stale frame doesn't linger.
-    pub fn clear_frame(&mut self) {
-        if let Some(old) = self.frame_texture.take() {
-            self.renderer.destroy_texture(old);
+    /// Drop every cached frame texture and clear the composite list
+    /// (= called when the preview window is about to be destroyed so
+    /// the GPU side releases everything cleanly).
+    pub fn clear_all(&mut self) {
+        for (_, (h, _, _)) in self.frame_textures.drain() {
+            self.renderer.destroy_texture(h);
         }
-        self.frame_size = (0, 0);
+        self.composite_layers.clear();
+    }
+
+    /// Refresh the per-frame composite layer list. Called by the
+    /// runner each frame BEFORE `render_placeholder` with the
+    /// bottom→top stack of (texture, dimensions, alpha) tuples.
+    /// Replaces any previous frame's layers so the preview never
+    /// shows stale content.
+    pub fn set_composite_layers(&mut self, layers: Vec<CompositeLayer>) {
+        self.composite_layers = layers;
     }
 
     /// `winit::WindowId` for routing `WindowEvent`s in the runner.
@@ -118,11 +166,13 @@ impl PreviewWindowState {
         self.window.request_redraw();
     }
 
-    /// Build the scene + render. When `frame_texture` is `Some` (=
-    /// the runner has uploaded a decoded video frame for this
-    /// playhead position, P5) the scene draws an aspect-fit textured
-    /// quad over the dark backdrop; otherwise it falls back to the
-    /// "Video Preview" placeholder text (P4 baseline).
+    /// Build the scene + render. docs/plan_video.md P7: walks
+    /// `composite_layers` bottom→top and pushes one aspect-fit
+    /// textured quad per layer on top of the dark backdrop. gui_01's
+    /// call-order interleave gives standard "src over dst" blending
+    /// so the topmost track wins at `alpha=1.0` and crossfades mix
+    /// at intermediate alphas. Empty layer list falls back to the
+    /// P4 placeholder text.
     pub fn render_placeholder(&mut self) {
         self.scene.clear();
         let screen = self.renderer.size();
@@ -143,34 +193,36 @@ impl PreviewWindowState {
             clip_rect: None,
         });
 
-        match self.frame_texture {
-            Some(handle) if self.frame_size.0 > 0 && self.frame_size.1 > 0 => {
+        if self.composite_layers.is_empty() {
+            // No frame available — show the P4 placeholder text so the
+            // user knows the window is alive but waiting on a video
+            // clip / playhead.
+            let text = "Video Preview";
+            let approx_w = text.len() as f32 * 9.0;
+            self.scene.push_text(GlyphArea {
+                text: text.into(),
+                left: (screen.width as f32 - approx_w) * 0.5,
+                top: (screen.height as f32 - 16.0) * 0.5,
+                font_size: 16.0,
+                line_height: 20.0,
+                color: Color::rgb(0.65, 0.7, 0.8),
+                clip_rect: None,
+            });
+        } else {
+            for layer in &self.composite_layers {
+                if layer.width == 0 || layer.height == 0 || layer.alpha <= 0.0 {
+                    continue;
+                }
                 let dst = aspect_fit_rect(
                     (screen.width as f32, screen.height as f32),
-                    (self.frame_size.0 as f32, self.frame_size.1 as f32),
+                    (layer.width as f32, layer.height as f32),
                 );
                 self.scene.push_textured_quad(TexturedQuad {
                     rect: daw_ui_renderer::Rect::new(dst.0, dst.1, dst.2, dst.3),
-                    texture: handle,
-                    alpha: 1.0,
+                    texture: layer.texture,
+                    alpha: layer.alpha,
                     uv_min: (0.0, 0.0),
                     uv_max: (1.0, 1.0),
-                    clip_rect: None,
-                });
-            }
-            _ => {
-                // No frame available — show the P4 placeholder text so
-                // the user knows the window is alive but waiting on a
-                // video clip / playhead.
-                let text = "Video Preview";
-                let approx_w = text.len() as f32 * 9.0;
-                self.scene.push_text(GlyphArea {
-                    text: text.into(),
-                    left: (screen.width as f32 - approx_w) * 0.5,
-                    top: (screen.height as f32 - 16.0) * 0.5,
-                    font_size: 16.0,
-                    line_height: 20.0,
-                    color: Color::rgb(0.65, 0.7, 0.8),
                     clip_rect: None,
                 });
             }

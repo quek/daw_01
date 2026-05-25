@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
-use common::model::{Song, TrackKind, VideoSourceId};
+use common::model::{FadeCurve, Song, TrackKind, VideoEvent, VideoSourceId};
 use windows::Win32::Media::MediaFoundation::{
     IMFSample, IMFSourceReader, MFCreateAttributes, MFCreateMediaType,
     MFCreateSourceReaderFromURL, MFMediaType_Video, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
@@ -39,6 +39,27 @@ pub struct DecodedFrame {
     pub height: u32,
     /// Tightly-packed RGBA8 in scanline order, length = `width * height * 4`.
     pub rgba: Vec<u8>,
+}
+
+/// One video clip active at the current playhead. The runner walks
+/// the returned list bottom-up (= `z_index` ascending) and pushes one
+/// textured quad per layer with the per-event `alpha`; gui_01's
+/// call-order interleave then blends them via standard "src OVER
+/// dst" semantics (= top track wins when alpha=1, crossfade
+/// midpoint mixes at alpha=0.5/0.5). v12 (`docs/plan_video.md` §4 P7).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ActiveVideoFrame {
+    pub video_source_id: VideoSourceId,
+    pub source_micros: u64,
+    /// Per-event alpha derived from `fade_in_beats` / `fade_out_beats`
+    /// and the matching curve. `1.0` is fully opaque, `0.0` invisible.
+    /// Caller pushes the quad directly with this value.
+    pub alpha: f32,
+    /// Bottom-up draw order. `0` is the lowest video track (drawn
+    /// first), each higher track increments. Within the same track
+    /// adjacent / overlapping events share the same `z_index`; their
+    /// individual `alpha`s do the crossfade.
+    pub z_index: u32,
 }
 
 /// One `IMFSourceReader` plus a few cached attributes that don't
@@ -69,14 +90,93 @@ impl VideoPlaybackEngine {
         }
     }
 
-    /// Pure helper: walk the song top-down and return the
-    /// `(VideoSourceId, source_micros)` of the topmost video clip
-    /// whose extent covers `playhead_beat`. `None` when no video clip
-    /// is active.
+    /// Pure helper: walk the song bottom-up and return every video
+    /// clip active at `playhead_beat`, with a per-event `alpha`
+    /// derived from the clip's `fade_in_beats` / `fade_out_beats` (=
+    /// MVP crossfade behaviour). Returns a `Vec<ActiveVideoFrame>`
+    /// ordered from lowest to topmost track so the caller can
+    /// composite by call-order (= last pushed quad ends up on top).
+    /// v12 (`docs/plan_video.md` §4 P7).
     ///
-    /// MVP scope (P5): single active clip wins. P7 will replace this
-    /// with a "stack of active clips" walker that the wgpu composite
-    /// pass blends.
+    /// Muted events are dropped from the result entirely (= same as
+    /// the singular `active_source_at` MVP behaviour).
+    pub fn active_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveVideoFrame> {
+        let bpm = song.bpm as f64;
+        if bpm <= 0.0 {
+            return Vec::new();
+        }
+        let mut out: Vec<ActiveVideoFrame> = Vec::new();
+        // `song.tracks[0]` is the top of the arrangement, so iterating
+        // `.rev()` yields bottom-most → topmost. Each video track gets
+        // a contiguous `z_index` counter so events on the same track
+        // share a layer (= their alphas blend within layer instead of
+        // creating a third layer between clip A and clip B during
+        // crossfade).
+        let mut z_index: u32 = 0;
+        for track in song.tracks.iter().rev() {
+            if track.kind != TrackKind::Video {
+                continue;
+            }
+            let mut track_emitted = false;
+            for clip in &track.clips {
+                let clip_start = clip.start_beat;
+                let clip_end = clip.start_beat + clip.length_beats;
+                if playhead_beat < clip_start || playhead_beat >= clip_end {
+                    continue;
+                }
+                let clip_local = playhead_beat - clip_start;
+                let Some(content) = song.clip_contents.get(&clip.content_id) else {
+                    continue;
+                };
+                let Some(events) = content.video_events() else {
+                    continue;
+                };
+                for event in events {
+                    let event_end =
+                        event.event_start_in_clip_beats + event.event_length_beats;
+                    if clip_local < event.event_start_in_clip_beats
+                        || clip_local >= event_end
+                    {
+                        continue;
+                    }
+                    if event.muted {
+                        continue;
+                    }
+                    let event_progress_beats =
+                        clip_local - event.event_start_in_clip_beats;
+                    let event_progress_secs = event_progress_beats * 60.0 / bpm;
+                    let event_progress_micros =
+                        (event_progress_secs * 1_000_000.0).round() as u64;
+                    let source_micros = event
+                        .source_start_micros
+                        .saturating_add(event_progress_micros)
+                        .min(event.source_end_micros);
+                    let alpha = event_alpha(event, clip_local);
+                    if alpha <= 0.0 {
+                        continue;
+                    }
+                    out.push(ActiveVideoFrame {
+                        video_source_id: event.source_id,
+                        source_micros,
+                        alpha,
+                        z_index,
+                    });
+                    track_emitted = true;
+                }
+            }
+            if track_emitted {
+                z_index += 1;
+            }
+        }
+        out
+    }
+
+    /// Backwards-compatible singular accessor (`docs/plan_video.md`
+    /// P5 baseline). Equivalent to `active_sources_at(...).last()` —
+    /// the topmost active layer wins, with its alpha taken into
+    /// account so a faded-out top clip with alpha < threshold defers
+    /// to whatever is underneath. Kept around for callers that don't
+    /// composite (= e.g. arrangement thumbnail picker).
     pub fn active_source_at(
         song: &Song,
         playhead_beat: f64,
@@ -201,6 +301,46 @@ impl VideoPlaybackEngine {
 impl Default for VideoPlaybackEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Per-event alpha at the given clip-local beat, derived from
+/// `fade_in_beats` / `fade_out_beats` with the event's own
+/// `fade_in_curve` / `fade_out_curve`. Range `0.0..=1.0`. Outside
+/// both fade regions returns `1.0` (= fully opaque).
+///
+/// docs/plan_video.md §4 P7: linear / s-curve / exp formulae match
+/// `common::audio_render::fade_envelope` (the audio sibling), so
+/// crossfade visuals stay in step with the audio engine's gain
+/// envelope when the user fades both halves of a clip together.
+fn event_alpha(event: &VideoEvent, clip_local_beat: f64) -> f32 {
+    let event_local = clip_local_beat - event.event_start_in_clip_beats;
+    if event_local < 0.0 {
+        return 0.0;
+    }
+    let mut alpha = 1.0_f32;
+    if event.fade_in_beats > 0.0 && event_local < event.fade_in_beats {
+        let progress = (event_local / event.fade_in_beats) as f32;
+        alpha *= fade_curve_value(progress, event.fade_in_curve);
+    }
+    let event_remaining = event.event_length_beats - event_local;
+    if event.fade_out_beats > 0.0 && event_remaining > 0.0
+        && event_remaining < event.fade_out_beats
+    {
+        let progress = (event_remaining / event.fade_out_beats) as f32;
+        alpha *= fade_curve_value(progress, event.fade_out_curve);
+    }
+    alpha.clamp(0.0, 1.0)
+}
+
+/// Single fade-curve evaluator. `progress` is `0..=1`, output is
+/// `0..=1`. Mirrors `common::audio_render::fade_envelope` math.
+fn fade_curve_value(progress: f32, curve: FadeCurve) -> f32 {
+    let x = progress.clamp(0.0, 1.0);
+    match curve {
+        FadeCurve::Linear => x,
+        FadeCurve::Exponential => x * x,
+        FadeCurve::SCurve => 0.5 - 0.5 * (std::f32::consts::PI * x).cos(),
     }
 }
 
@@ -529,6 +669,159 @@ mod tests {
                 .map(|dir| dir.join(exe))
                 .find(|p| p.is_file())
         })
+    }
+
+    // ====================================================================
+    // P7: multi-clip composite (active_sources_at) + per-event alpha.
+    // ====================================================================
+
+    #[test]
+    fn active_sources_at_returns_empty_when_no_video_active() {
+        let song = song_with_video_clip(120.0, 1);
+        // playhead outside clip → empty
+        assert!(VideoPlaybackEngine::active_sources_at(&song, 0.0).is_empty());
+        assert!(VideoPlaybackEngine::active_sources_at(&song, 100.0).is_empty());
+    }
+
+    #[test]
+    fn active_sources_at_returns_single_with_alpha_one_outside_fades() {
+        // No fade_in / fade_out → alpha == 1.0 everywhere inside the clip.
+        let song = song_with_video_clip(120.0, 5);
+        let active = VideoPlaybackEngine::active_sources_at(&song, 5.0);
+        assert_eq!(active.len(), 1);
+        let frame = active[0];
+        assert_eq!(frame.video_source_id, 5);
+        assert_eq!(frame.z_index, 0);
+        assert!(
+            (frame.alpha - 1.0).abs() < 1e-6,
+            "outside-fade alpha = 1.0, got {}",
+            frame.alpha
+        );
+    }
+
+    #[test]
+    fn active_sources_at_applies_linear_fade_in() {
+        // 8-beat event with fade_in=2 beats. At clip-local 1 beat
+        // (half through the fade), Linear curve → alpha == 0.5.
+        let mut song = song_with_video_clip(120.0, 1);
+        let cid = song.tracks[0].clips[0].content_id;
+        if let Some(ClipContent::Video(c)) = song.clip_contents.get_mut(&cid) {
+            c.events[0].fade_in_beats = 2.0;
+            c.events[0].fade_in_curve = common::model::FadeCurve::Linear;
+        }
+        // clip starts at beat 4, playhead at 5 → clip-local = 1 beat
+        let active = VideoPlaybackEngine::active_sources_at(&song, 5.0);
+        assert_eq!(active.len(), 1);
+        assert!(
+            (active[0].alpha - 0.5).abs() < 1e-3,
+            "linear fade-in midpoint should be 0.5, got {}",
+            active[0].alpha
+        );
+    }
+
+    #[test]
+    fn active_sources_at_applies_scurve_fade_out() {
+        // 8-beat event with fade_out=2 beats. clip ends at beat 12,
+        // playhead at 11 → 1 beat remaining → SCurve mid → 0.5.
+        let mut song = song_with_video_clip(120.0, 1);
+        let cid = song.tracks[0].clips[0].content_id;
+        if let Some(ClipContent::Video(c)) = song.clip_contents.get_mut(&cid) {
+            c.events[0].fade_out_beats = 2.0;
+            c.events[0].fade_out_curve = common::model::FadeCurve::SCurve;
+        }
+        let active = VideoPlaybackEngine::active_sources_at(&song, 11.0);
+        assert_eq!(active.len(), 1);
+        assert!(
+            (active[0].alpha - 0.5).abs() < 1e-3,
+            "scurve fade-out midpoint should be 0.5, got {}",
+            active[0].alpha
+        );
+    }
+
+    #[test]
+    fn active_sources_at_composites_multi_track_bottom_up() {
+        // Stack 2 video tracks with clips covering the same playhead.
+        // Bottom track gets z_index=0, top gets z_index=1.
+        let mut song = song_with_video_clip(120.0, 1);
+        // Add a second video track at the top with its own source.
+        let cid2 = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid2,
+            ClipContent::Video(VideoContent {
+                events: vec![VideoEvent {
+                    source_id: 2,
+                    event_start_in_clip_beats: 0.0,
+                    event_length_beats: 8.0,
+                    source_start_micros: 0,
+                    source_end_micros: 4_000_000,
+                    ..VideoEvent::default()
+                }],
+            }),
+        );
+        song.video_sources.insert(
+            2,
+            VideoSource {
+                path: VideoSourcePath::Absolute("/dev/null2".into()),
+                width: 640,
+                height: 480,
+                framerate: 30.0,
+                duration_micros: 4_000_000,
+                codec: "h264".into(),
+                audio_source_id: None,
+            },
+        );
+        let top_track = Track {
+            id: 2,
+            kind: TrackKind::Video,
+            name: "VTop".into(),
+            clips: vec![Clip {
+                id: 1,
+                name: "vclip2".into(),
+                start_beat: 4.0,
+                length_beats: 8.0,
+                content_id: cid2,
+                notes: Vec::new(),
+            }],
+            next_clip_id: 2,
+            ..Track::default()
+        };
+        // Insert at position 0 = top of arrangement.
+        song.tracks.insert(0, top_track);
+
+        let active = VideoPlaybackEngine::active_sources_at(&song, 5.0);
+        assert_eq!(active.len(), 2, "both tracks should be active at 5.0");
+        // z_index=0 is the bottom track (original source_id=1),
+        // z_index=1 is the top (source_id=2). Caller renders in
+        // ascending z_index so the source_id=2 layer ends up on top.
+        assert_eq!(active[0].video_source_id, 1, "bottom track first");
+        assert_eq!(active[0].z_index, 0);
+        assert_eq!(active[1].video_source_id, 2, "top track second");
+        assert_eq!(active[1].z_index, 1);
+    }
+
+    #[test]
+    fn active_sources_at_drops_muted_events() {
+        let mut song = song_with_video_clip(120.0, 1);
+        let cid = song.tracks[0].clips[0].content_id;
+        if let Some(ClipContent::Video(c)) = song.clip_contents.get_mut(&cid) {
+            c.events[0].muted = true;
+        }
+        let active = VideoPlaybackEngine::active_sources_at(&song, 5.0);
+        assert!(active.is_empty(), "muted event should be dropped");
+    }
+
+    #[test]
+    fn active_sources_at_drops_zero_alpha_events() {
+        // fade_in=2, position right at clip start → progress=0 →
+        // alpha=0 → drop the frame entirely.
+        let mut song = song_with_video_clip(120.0, 1);
+        let cid = song.tracks[0].clips[0].content_id;
+        if let Some(ClipContent::Video(c)) = song.clip_contents.get_mut(&cid) {
+            c.events[0].fade_in_beats = 2.0;
+        }
+        // clip starts at beat 4 — playhead exactly at 4 = clip-local 0
+        let active = VideoPlaybackEngine::active_sources_at(&song, 4.0);
+        assert!(active.is_empty(), "alpha=0 frame should be dropped");
     }
 
     #[test]
