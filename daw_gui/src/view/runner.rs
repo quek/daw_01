@@ -261,6 +261,14 @@ impl Runner {
         let _dt = now.duration_since(self.last_tick);
         self.last_tick = now;
 
+        // docs/plan_video.md P3.5: drain pending video thumbnail
+        // uploads BEFORE this frame's `ui.frame()` so the arrangement
+        // view can read the resulting `TextureHandle` immediately.
+        // First frame after import shows the thumbnail with one
+        // frame's latency (= imports landing during a frame are
+        // queued for the next frame's drain).
+        Self::drain_video_thumbnail_uploads(&mut state.app, &mut state.renderer);
+
         let screen = state.renderer.size();
         state.scene.clear();
         let input = state.input.take_input();
@@ -314,6 +322,35 @@ impl Runner {
         }
 
         state.app.is_playing
+    }
+
+    /// docs/plan_video.md P3.5: drain `AppData.pending_thumbnail_uploads`
+    /// by creating GPU textures via the live `Renderer`. Each successful
+    /// upload populates `video_texture_cache` for arrangement_view to
+    /// read in the same frame (P3.6). The staged RGBA bytes are dropped
+    /// from `video_thumbnail_rgba` once on GPU — no need to keep the
+    /// CPU-side copy.
+    fn drain_video_thumbnail_uploads(
+        app: &mut AppData,
+        renderer: &mut Renderer<DawGuiWindow>,
+    ) {
+        if app.pending_thumbnail_uploads.is_empty() {
+            return;
+        }
+        let pending: Vec<_> = app.pending_thumbnail_uploads.drain(..).collect();
+        for video_source_id in pending {
+            // It's possible the source was unloaded between the
+            // import and the next frame (= rapid undo path). Just
+            // skip — the GPU is the source of truth and a missing
+            // RGBA staging means there's nothing to upload.
+            let Some((w, h, rgba)) = app.video_thumbnail_rgba.remove(&video_source_id)
+            else {
+                continue;
+            };
+            let handle = renderer.create_texture(w, h);
+            renderer.upload_texture_rgba(handle, rgba.as_slice());
+            app.video_texture_cache.insert(video_source_id, handle);
+        }
     }
 }
 

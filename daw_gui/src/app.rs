@@ -299,6 +299,24 @@ pub struct AppData {
     /// sources are decoded twice (once per process) to keep IPC lean
     /// (`docs/plan_audio_clip.md` §6.1 / §8.3).
     pub audio_source_cache: AudioSourceCache,
+    /// Video thumbnail RGBA8 staging area, keyed by `VideoSourceId`.
+    /// Populated by `action_import_video` (P3.4); drained by the
+    /// runner (P3.5) which calls `Renderer::create_texture` +
+    /// `upload_texture_rgba` and inserts the resulting `TextureHandle`
+    /// into [`Self::video_texture_cache`]. After a successful upload
+    /// the entry here is dropped (= the texture lives in GPU memory).
+    /// `(width, height, rgba)`; rgba length is `width * height * 4`.
+    pub video_thumbnail_rgba:
+        std::collections::HashMap<common::model::VideoSourceId, (u32, u32, std::sync::Arc<Vec<u8>>)>,
+    /// `VideoSourceId`s queued for GPU texture upload. The runner
+    /// drains this each frame.
+    pub pending_thumbnail_uploads: Vec<common::model::VideoSourceId>,
+    /// GPU-side video thumbnail textures keyed by `VideoSourceId`.
+    /// Written by the runner (P3.5) after a successful texture upload;
+    /// read by `arrangement_view.rs` (P3.6) and passed to
+    /// `ArrangementClip.thumbnail`.
+    pub video_texture_cache:
+        std::collections::HashMap<common::model::VideoSourceId, daw_ui_renderer::TextureHandle>,
     /// Snapped mouse hover beat inside the arrangement canvas. `None`
     /// outside the canvas. `arrangement_view::draw` updates it every
     /// frame using the current `SnapConfig`. Used by Split (E) so the
@@ -791,6 +809,9 @@ impl AppData {
             song,
             file_path: None,
             audio_source_cache: AudioSourceCache::new(),
+            video_thumbnail_rgba: std::collections::HashMap::new(),
+            pending_thumbnail_uploads: Vec::new(),
+            video_texture_cache: std::collections::HashMap::new(),
             arrangement_hover_beat: None,
             arrangement_hover_beat_raw: None,
             arrangement_hover_clip: None,
@@ -10593,6 +10614,19 @@ impl AppData {
             let mut vs = imported.video_source;
             vs.audio_source_id = audio_source_id;
             self.song.video_sources.insert(video_source_id, vs);
+
+            // 2b) Stash the thumbnail RGBA (if extracted) and queue
+            //     a GPU upload. The runner picks this up next frame
+            //     (P3.5) and writes the resulting TextureHandle into
+            //     `video_texture_cache` for the arrangement view to
+            //     read.
+            if let Some(thumb) = imported.thumbnail {
+                self.video_thumbnail_rgba.insert(
+                    video_source_id,
+                    (thumb.width, thumb.height, std::sync::Arc::new(thumb.rgba)),
+                );
+                self.pending_thumbnail_uploads.push(video_source_id);
+            }
 
             // 3) Video clip content + auto track.
             let v_content_id = self.song.alloc_content_id();

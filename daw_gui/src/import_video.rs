@@ -27,12 +27,14 @@ use common::model::{VideoSource, VideoSourcePath};
 
 use windows::Win32::Media::MediaFoundation::{
     IMFSourceReader, MFAudioFormat_Float, MFCreateAttributes, MFCreateMediaType,
-    MFCreateSourceReaderFromURL, MFMediaType_Audio, MFSTARTUP_FULL, MFStartup,
-    MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
-    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
-    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE, MF_SOURCE_READERF_ENDOFSTREAM,
-    MF_VERSION, MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_VP90,
+    MFCreateSourceReaderFromURL, MFMediaType_Audio, MFMediaType_Video, MFSTARTUP_FULL,
+    MFStartup, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_NUM_CHANNELS,
+    MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
+    MF_MT_SUBTYPE, MF_PD_DURATION, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
+    MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+    MF_SOURCE_READER_MEDIASOURCE, MF_SOURCE_READERF_ENDOFSTREAM, MF_VERSION,
+    MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_RGB32,
+    MFVideoFormat_VP90,
 };
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::core::{GUID, PCWSTR};
@@ -259,6 +261,201 @@ pub fn extract_metadata(path: &Path) -> Result<VideoMetadata, VideoImportError> 
     })
 }
 
+/// One-frame thumbnail returned by [`extract_thumbnail`]. `rgba` is
+/// `width * height * 4` bytes in scanline order, ready to upload to
+/// gui_01's texture pipeline (`Renderer::upload_texture_rgba` →
+/// `HeavyCtx::push_texture`).
+#[derive(Debug, Clone)]
+pub struct ThumbnailFrame {
+    pub width: u32,
+    pub height: u32,
+    /// Tightly-packed RGBA8 (R, G, B, A, ...). Length is
+    /// `width * height * 4`.
+    pub rgba: Vec<u8>,
+}
+
+/// Decode a single representative frame from a video and return it as
+/// RGBA8. Used at import time to build the arrangement-view clip
+/// thumbnail (gui_01 #044 `ArrangementClip.thumbnail`). The reader is
+/// configured to deliver `MFVideoFormat_RGB32` (= BGRA byte order
+/// under WMF's little-endian DIB convention); we swap channels into
+/// RGBA at copy time so callers downstream get the standard layout
+/// `Renderer::upload_texture_rgba` expects.
+///
+/// We don't seek — the first decodable frame is good enough for an
+/// arrangement-view thumbnail (= a few seconds in is more "scene"-y
+/// but adds seek complexity that the MVP doesn't need yet).
+pub fn extract_thumbnail(path: &Path) -> Result<ThumbnailFrame, VideoImportError> {
+    ensure_mf_startup()?;
+
+    if !path.exists() {
+        return Err(VideoImportError::IoError(format!(
+            "file not found: {}",
+            path.display()
+        )));
+    }
+
+    let wide = to_wide(path);
+    let url = PCWSTR::from_raw(wide.as_ptr());
+
+    // ENABLE_VIDEO_PROCESSING lets the reader insert MFTs to convert
+    // native (e.g. NV12 / YUV420P) to RGB32 transparently.
+    let attrs = unsafe {
+        let mut a = None;
+        MFCreateAttributes(&mut a, 1).map_err(|e| {
+            VideoImportError::DecodeFailed(format!("MFCreateAttributes: {e}"))
+        })?;
+        let attrs = a.ok_or_else(|| {
+            VideoImportError::DecodeFailed("MFCreateAttributes returned null".into())
+        })?;
+        attrs
+            .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
+            .map_err(|e| {
+                VideoImportError::DecodeFailed(format!(
+                    "SetUINT32 ENABLE_VIDEO_PROCESSING: {e}"
+                ))
+            })?;
+        attrs
+    };
+    let reader: IMFSourceReader = unsafe {
+        MFCreateSourceReaderFromURL(url, &attrs).map_err(|e| {
+            VideoImportError::DecodeFailed(format!(
+                "MFCreateSourceReaderFromURL({}): {e}",
+                path.display()
+            ))
+        })?
+    };
+
+    let video_stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+
+    // Read native FRAME_SIZE so we know what the converted RGB32
+    // frame's dimensions will be. WMF preserves the native size unless
+    // the output type explicitly sets a different one.
+    let native_type = unsafe { reader.GetNativeMediaType(video_stream, 0) }
+        .map_err(|e| {
+            VideoImportError::DecodeFailed(format!(
+                "thumbnail GetNativeMediaType: {e}"
+            ))
+        })?;
+    let frame_size = unsafe { native_type.GetUINT64(&MF_MT_FRAME_SIZE) }
+        .map_err(|e| {
+            VideoImportError::DecodeFailed(format!("thumbnail FRAME_SIZE: {e}"))
+        })?;
+    let width = (frame_size >> 32) as u32;
+    let height = (frame_size & 0xFFFF_FFFF) as u32;
+    if width == 0 || height == 0 {
+        return Err(VideoImportError::DecodeFailed(format!(
+            "thumbnail invalid frame size {width}x{height}"
+        )));
+    }
+
+    // Request RGB32 output. The reader inserts a video processor MFT
+    // to convert native (likely NV12) → BGRA8. We swap to RGBA below.
+    let output_type = unsafe {
+        let t = MFCreateMediaType().map_err(|e| {
+            VideoImportError::DecodeFailed(format!("thumbnail MFCreateMediaType: {e}"))
+        })?;
+        t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
+            .map_err(|e| {
+                VideoImportError::DecodeFailed(format!(
+                    "thumbnail set MAJOR_TYPE Video: {e}"
+                ))
+            })?;
+        t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
+            .map_err(|e| {
+                VideoImportError::DecodeFailed(format!(
+                    "thumbnail set SUBTYPE RGB32: {e}"
+                ))
+            })?;
+        t
+    };
+    unsafe { reader.SetCurrentMediaType(video_stream, None, &output_type) }
+        .map_err(|e| {
+            VideoImportError::DecodeFailed(format!(
+                "thumbnail SetCurrentMediaType RGB32: {e}"
+            ))
+        })?;
+
+    // Drain ReadSample until we get a real sample (skip STREAMTICK
+    // gaps). Bail with an error if we reach EOS without any sample.
+    let frame_bytes = width as usize * height as usize * 4;
+    let mut rgba: Vec<u8> = Vec::with_capacity(frame_bytes);
+
+    loop {
+        let mut flags: u32 = 0;
+        let mut sample: Option<windows::Win32::Media::MediaFoundation::IMFSample> =
+            None;
+        unsafe {
+            reader.ReadSample(
+                video_stream,
+                0,
+                None,
+                Some(&mut flags),
+                None,
+                Some(&mut sample),
+            )
+        }
+        .map_err(|e| {
+            VideoImportError::DecodeFailed(format!("thumbnail ReadSample: {e}"))
+        })?;
+
+        if (flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32) != 0 {
+            return Err(VideoImportError::DecodeFailed(
+                "thumbnail: end of stream before any frame decoded".into(),
+            ));
+        }
+        let Some(sample) = sample else {
+            continue;
+        };
+
+        let buffer = unsafe { sample.ConvertToContiguousBuffer() }
+            .map_err(|e| {
+                VideoImportError::DecodeFailed(format!(
+                    "thumbnail ConvertToContiguousBuffer: {e}"
+                ))
+            })?;
+        let mut ptr: *mut u8 = std::ptr::null_mut();
+        let mut max_len: u32 = 0;
+        let mut cur_len: u32 = 0;
+        unsafe { buffer.Lock(&mut ptr, Some(&mut max_len), Some(&mut cur_len)) }
+            .map_err(|e| {
+                VideoImportError::DecodeFailed(format!("thumbnail Lock: {e}"))
+            })?;
+
+        if ptr.is_null() || (cur_len as usize) < frame_bytes {
+            let _ = unsafe { buffer.Unlock() };
+            return Err(VideoImportError::DecodeFailed(format!(
+                "thumbnail frame too small: {cur_len} < {frame_bytes}"
+            )));
+        }
+
+        // BGRA8 → RGBA8 swap. MF_MT_DEFAULT_STRIDE could in theory be
+        // larger than width*4 (= row padding) — for RGB32 in WMF it's
+        // almost always exactly width*4 but we defensively only read
+        // `frame_bytes`. A more robust implementation would query
+        // MF_MT_DEFAULT_STRIDE and copy row-by-row.
+        let src = unsafe { std::slice::from_raw_parts(ptr, frame_bytes) };
+        rgba.clear();
+        rgba.reserve_exact(frame_bytes);
+        for px in src.chunks_exact(4) {
+            // src order: B, G, R, A → push R, G, B, A
+            rgba.push(px[2]);
+            rgba.push(px[1]);
+            rgba.push(px[0]);
+            rgba.push(px[3]);
+        }
+
+        let _ = unsafe { buffer.Unlock() };
+        break;
+    }
+
+    Ok(ThumbnailFrame {
+        width,
+        height,
+        rgba,
+    })
+}
+
 /// Metadata returned by [`extract_audio_to_wav`] when the source has
 /// an audio stream. Mirrors the relevant subset of
 /// [`common::model::AudioSource`].
@@ -482,6 +679,11 @@ pub struct ImportedVideo {
     /// Paired audio extracted from the source. `None` when the input
     /// had no audio stream (= `extract_audio_to_wav` returned `None`).
     pub audio: Option<crate::import_audio::ImportedAudio>,
+    /// First-frame RGBA8 thumbnail. `None` when WMF could not decode a
+    /// representative frame (= rare; we accept import success without
+    /// a thumbnail rather than fail the whole import). The caller
+    /// queues this for GPU texture upload in `Runner` (P3.5).
+    pub thumbnail: Option<ThumbnailFrame>,
 }
 
 /// One-shot import helper: hash → copy video into samples/ → metadata
@@ -616,10 +818,23 @@ pub fn import_one_video(
         .unwrap_or("Video Clip")
         .to_string();
 
+    // Thumbnail is best-effort: a decode failure here shouldn't abort
+    // the whole import (audio is already extracted, video metadata is
+    // valid). The arrangement view falls back to a solid color when
+    // `thumbnail = None`.
+    let thumbnail = match extract_thumbnail(src) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %src.display(), "thumbnail extract failed");
+            None
+        }
+    };
+
     Ok(ImportedVideo {
         video_source,
         display_name,
         audio,
+        thumbnail,
     })
 }
 
@@ -834,6 +1049,15 @@ mod tests {
             other => panic!("expected ProjectRelative, got {other:?}"),
         }
 
+        // Thumbnail decoded at native dimensions (P3.2).
+        let thumb = imported
+            .thumbnail
+            .as_ref()
+            .expect("thumbnail should be present");
+        assert_eq!(thumb.width, 160);
+        assert_eq!(thumb.height, 120);
+        assert_eq!(thumb.rgba.len(), 160 * 120 * 4);
+
         // Audio extracted, decoded, and the WAV exists on disk.
         let audio = imported.audio.expect("audio should be present");
         assert_eq!(audio.source.sample_rate, 48_000);
@@ -848,6 +1072,49 @@ mod tests {
             }
             other => panic!("expected ProjectRelative, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn extract_thumbnail_reads_first_frame_as_rgba() {
+        let Some(ffmpeg) = locate_ffmpeg() else {
+            eprintln!("extract_thumbnail: ffmpeg not on PATH, skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mp4 = dir.path().join("thumb.mp4");
+        let status = std::process::Command::new(&ffmpeg)
+            .args([
+                "-f", "lavfi",
+                "-i", "color=c=red:size=160x120:duration=1:rate=30",
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-y",
+                mp4.to_str().unwrap(),
+            ])
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("ffmpeg run");
+        assert!(status.success(), "ffmpeg failed to build red fixture");
+
+        let thumb = extract_thumbnail(&mp4).expect("extract_thumbnail");
+        assert_eq!(thumb.width, 160);
+        assert_eq!(thumb.height, 120);
+        assert_eq!(thumb.rgba.len(), 160 * 120 * 4);
+
+        // The center pixel should be near-red (R ~ 0xFF, G ~ 0x00,
+        // B ~ 0x00) regardless of YUV→RGB rounding error. Pick a
+        // sample away from the frame edges where libx264 sometimes
+        // leaves a couple of ringing rows after the keyframe.
+        let center = (60 * 160 + 80) * 4;
+        let r = thumb.rgba[center];
+        let g = thumb.rgba[center + 1];
+        let b = thumb.rgba[center + 2];
+        let a = thumb.rgba[center + 3];
+        assert!(
+            r > 200 && g < 80 && b < 80,
+            "center pixel should be red, got RGBA ({r}, {g}, {b}, {a})"
+        );
     }
 
     #[test]

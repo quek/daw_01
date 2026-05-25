@@ -190,12 +190,26 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                             fade_in_curve: widget_curve_from_model(ev.fade_in_curve),
                             fade_out_curve: widget_curve_from_model(ev.fade_out_curve),
                         }),
-                    // gui_01 #044 (M14 Phase 72): video clip thumbnail。
-                    // P3 で `track.kind == Video` のクリップに対し
-                    // VideoSource の中間 frame を `TextureHandle` で渡す
-                    // 想定。 P1/P2 時点では video clip 自体がまだ無いので
-                    // 常に `None` (= waveform / MIDI 描画は既存通り)。
-                    thumbnail: None,
+                    // gui_01 #044 (M14 Phase 72) + docs/plan_video.md P3.6:
+                    // ClipContent::Video のクリップなら最初の VideoEvent の
+                    // source_id を引いて video_texture_cache から
+                    // TextureHandle を、 video_sources から native
+                    // (width, height) を取り出す。 widget は dimensions を
+                    // aspect-fit 計算に使う (= video_clip_loading 単色描画
+                    // からの差分)。 import 直後の 1 フレーム目は cache に
+                    // 未登録 (= None で video_clip_loading 単色)、 P3.5 の
+                    // runner drain 完了次フレームから thumbnail が出る。
+                    thumbnail: app
+                        .song
+                        .clip_contents
+                        .get(&c.content_id)
+                        .and_then(|ct| ct.video_events())
+                        .and_then(|events| events.first())
+                        .and_then(|ev| {
+                            let handle = *app.video_texture_cache.get(&ev.source_id)?;
+                            let src = app.song.video_sources.get(&ev.source_id)?;
+                            Some((handle, src.width, src.height))
+                        }),
                 })
                 .collect(),
             // gui_01 #016 で追加された group hierarchy fields:
