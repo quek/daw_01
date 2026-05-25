@@ -123,6 +123,21 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         .iter()
         .map(|t| ArrangementTrack {
             id: t.id,
+            // gui_01 #044 (M14 Phase 72): track kind 表示分岐。 Audio
+            // (既存挙動) と Video (`docs/plan_video.md` §2.1) を widget
+            // に伝達。 Video の row 背景 / header layout / thumbnail
+            // 描画は widget 側で kind 判定して切り替わる。
+            // NOTE: `daw_ui_core` の lib.rs に `TrackKind` の re-export が
+            // 無いため、 full path で参照する。 gui_01 側で flat re-export
+            // 追加してくれたら `use daw_ui_core::TrackKind;` に整理する。
+            kind: match t.kind {
+                common::model::TrackKind::Audio => {
+                    daw_ui_core::widgets::arrangement::TrackKind::Audio
+                }
+                common::model::TrackKind::Video => {
+                    daw_ui_core::widgets::arrangement::TrackKind::Video
+                }
+            },
             name: Arc::from(t.name.as_str()),
             muted: t.muted,
             solo: t.solo,
@@ -175,6 +190,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                             fade_in_curve: widget_curve_from_model(ev.fade_in_curve),
                             fade_out_curve: widget_curve_from_model(ev.fade_out_curve),
                         }),
+                    // gui_01 #044 (M14 Phase 72): video clip thumbnail。
+                    // P3 で `track.kind == Video` のクリップに対し
+                    // VideoSource の中間 frame を `TextureHandle` で渡す
+                    // 想定。 P1/P2 時点では video clip 自体がまだ無いので
+                    // 常に `None` (= waveform / MIDI 描画は既存通り)。
+                    thumbnail: None,
                 })
                 .collect(),
             // gui_01 #016 で追加された group hierarchy fields:
@@ -589,7 +610,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // index を計算し、 `ImportAudio` の `target_track_idx` で渡す。
         // 同 widget の hover_clip 計算 (= 数行下) と同じ
         // `(local_y / row_h)` 式。 canvas 外なら None で fallback。
-        let paths = drop.paths;
+        //
+        // docs/plan_video.md P2: 同じ drop 内で audio file と video file が
+        // 混在する場合は extension で partition して個別 AppEvent を発火する。
+        // `import_video::looks_like_video` が `mp4 / mov / mkv / webm / m4v /
+        // avi` を判定 (= P2.7 wire)。 マッチしない path は従来通り Audio
+        // import パイプラインに流す (= hound の WAV 判定で再度はじかれる)。
         let drop_y = drop.position.1;
         let canvas_top = canvas_area.y;
         let local_y = drop_y - canvas_top;
@@ -598,12 +624,29 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         } else {
             None
         };
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::ImportAudio {
-                paths,
-                target_track_idx,
-            });
-        }));
+        #[cfg(windows)]
+        let (video_paths, audio_paths): (Vec<_>, Vec<_>) = drop
+            .paths
+            .into_iter()
+            .partition(|p| crate::import_video::looks_like_video(p));
+        #[cfg(not(windows))]
+        let (video_paths, audio_paths): (Vec<std::path::PathBuf>, Vec<_>) =
+            (Vec::new(), drop.paths);
+        if !audio_paths.is_empty() {
+            let paths = audio_paths;
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ImportAudio {
+                    paths,
+                    target_track_idx,
+                });
+            }));
+        }
+        if !video_paths.is_empty() {
+            let paths = video_paths;
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ImportVideo { paths });
+            }));
+        }
     }
 
     // Phase 1 PR7 (`docs/plan_audio_clip.md` §3.3): Split (E) は

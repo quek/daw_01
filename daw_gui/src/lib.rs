@@ -15,6 +15,8 @@ pub mod audio_source_cache;
 pub mod bootstrap;
 pub mod dispatcher;
 pub mod import_audio;
+#[cfg(windows)]
+pub mod import_video;
 pub mod job;
 pub mod midi;
 pub mod midi_export;

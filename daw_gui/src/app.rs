@@ -1463,6 +1463,7 @@ impl AppData {
                 | AppEvent::AddAudioEventFromFile { .. }
                 | AppEvent::DeleteAudioEvent { .. }
                 | AppEvent::ImportAudio { .. }
+                | AppEvent::ImportVideo { .. }
                 | AppEvent::AddNote { .. }
                 | AppEvent::ResizeNote { .. }
                 | AppEvent::ResizeNotes(_)
@@ -2429,6 +2430,22 @@ pub enum AppEvent {
     /// §3.1 — File menu からの import 経路。
     OpenImportAudioDialog,
 
+    /// Video file import (`docs/plan_video.md` P2). For each path:
+    /// copies the video into `<project_dir>/samples/<hash>.<ext>`,
+    /// extracts the audio stream to a paired `.wav` via WMF,
+    /// registers a `VideoSource` and (when present) the paired
+    /// `AudioSource`, and appends a new video track + paired audio
+    /// track to `Song.tracks` with one clip each starting at the
+    /// playhead. Runs synchronously on the GUI thread — typical MV
+    /// clips finish in 1-3s, slow imports leave the user with a
+    /// momentary stall instead of a complex completion dispatch.
+    ImportVideo { paths: Vec<PathBuf> },
+
+    /// File menu → "Import Video..." entry. Opens an `rfd` file
+    /// picker (mp4 / mov / mkv / webm filter) and forwards to
+    /// `AppEvent::ImportVideo`.
+    OpenImportVideoDialog,
+
     // -------- Split / Glue (Phase 1 PR7) -----------------------------------
     /// Split clip(s) at the **mouse cursor** (= `AppData
     /// .arrangement_hover_beat` snapped, or `_raw` when `snap == false`
@@ -3359,6 +3376,25 @@ impl AppData {
             }
             AppEvent::OpenImportAudioDialog => {
                 self.action_open_import_audio_dialog();
+            }
+            AppEvent::ImportVideo { paths } => {
+                #[cfg(windows)]
+                self.action_import_video(paths);
+                #[cfg(not(windows))]
+                {
+                    let _ = paths;
+                    self.status_message =
+                        "Video import は Windows 専用 (WMF 経由) です".into();
+                }
+            }
+            AppEvent::OpenImportVideoDialog => {
+                #[cfg(windows)]
+                self.action_open_import_video_dialog();
+                #[cfg(not(windows))]
+                {
+                    self.status_message =
+                        "Video import は Windows 専用 (WMF 経由) です".into();
+                }
             }
             AppEvent::SetClipReversed { target, reversed } => {
                 self.set_clip_audio_event_reversed(target, reversed);
@@ -10489,6 +10525,189 @@ impl AppData {
         };
     }
 
+    /// Video import (docs/plan_video.md P2). For each path:
+    ///   1. `import_one_video` does the WMF metadata read + audio
+    ///      extract + decode (on the GUI thread; typical phone-video
+    ///      imports finish in 1-3s).
+    ///   2. Allocate `AudioSourceId` for the extracted audio (if any),
+    ///      register it on `Song.audio_sources`, cache the decoded
+    ///      buffer.
+    ///   3. Allocate `VideoSourceId`, link it to the audio id, register
+    ///      on `Song.video_sources`.
+    ///   4. Build one `VideoEvent` covering the whole source and wrap
+    ///      it in a fresh `ClipContent::Video`.
+    ///   5. Append a new `TrackKind::Video` track and (when audio is
+    ///      present) a paired `TrackKind::Audio` track. Each carries a
+    ///      single clip starting at the playhead.
+    ///
+    /// Subsequent imports stack at the end of the timeline by bumping
+    /// `next_start_beat`. Failures are collected per path and surfaced
+    /// in `status_message` along with the success count.
+    #[cfg(windows)]
+    fn action_import_video(&mut self, paths: Vec<PathBuf>) {
+        use common::model::{
+            AudioContent, AudioEvent, ClipContent, Track, TrackKind, VideoContent,
+            VideoEvent,
+        };
+
+        if paths.is_empty() {
+            return;
+        }
+        let project_dir: Option<PathBuf> = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.parent().map(Path::to_path_buf));
+
+        let start_beat_seed: f64 = self.playhead_beat.unwrap_or(0.0) as f64;
+        let bpm = self.song.bpm;
+        let mut imported_ok = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        let mut next_start_beat = start_beat_seed.max(0.0);
+
+        for path in paths {
+            let imported = match crate::import_video::import_one_video(
+                &path,
+                project_dir.as_deref(),
+            ) {
+                Ok(i) => i,
+                Err(e) => {
+                    errors.push(format!("{}: {e}", path.display()));
+                    continue;
+                }
+            };
+            let display_name = imported.display_name.clone();
+            let duration_micros = imported.video_source.duration_micros;
+            let video_length_beats = micros_to_beats(duration_micros, bpm);
+
+            // 1) Register paired audio (if present) before video so we
+            //    have the AudioSourceId for the video back-link.
+            let audio_source_id = imported.audio.as_ref().map(|audio| {
+                let id = self.song.alloc_audio_source_id();
+                self.song.audio_sources.insert(id, audio.source.clone());
+                self.audio_source_cache.insert(id, audio.buffer.clone());
+                id
+            });
+
+            // 2) Register video source with the audio back-link.
+            let video_source_id = self.song.alloc_video_source_id();
+            let mut vs = imported.video_source;
+            vs.audio_source_id = audio_source_id;
+            self.song.video_sources.insert(video_source_id, vs);
+
+            // 3) Video clip content + auto track.
+            let v_content_id = self.song.alloc_content_id();
+            self.song.clip_contents.insert(
+                v_content_id,
+                ClipContent::Video(VideoContent {
+                    events: vec![VideoEvent {
+                        source_id: video_source_id,
+                        event_start_in_clip_beats: 0.0,
+                        event_length_beats: video_length_beats,
+                        source_start_micros: 0,
+                        source_end_micros: duration_micros,
+                        ..VideoEvent::default()
+                    }],
+                }),
+            );
+            let video_track_id = self.song.alloc_track_id();
+            let mut video_track = Track {
+                id: video_track_id,
+                kind: TrackKind::Video,
+                name: format!("{display_name} (Video)"),
+                ..Track::default()
+            };
+            let v_clip_id = video_track.alloc_clip_id();
+            video_track.clips.push(Clip {
+                id: v_clip_id,
+                name: display_name.clone(),
+                start_beat: next_start_beat,
+                length_beats: video_length_beats,
+                content_id: v_content_id,
+                notes: Vec::new(),
+            });
+            self.song.tracks.push(video_track);
+
+            // 4) Paired audio clip + audio track (only when audio is
+            //    present in the source).
+            if let (Some(audio), Some(audio_src_id)) =
+                (imported.audio, audio_source_id)
+            {
+                let audio_length_beats = frames_to_beats(
+                    audio.buffer.frames,
+                    audio.buffer.sample_rate,
+                    bpm,
+                );
+                let a_content_id = self.song.alloc_content_id();
+                self.song.clip_contents.insert(
+                    a_content_id,
+                    ClipContent::Audio(AudioContent {
+                        events: vec![AudioEvent {
+                            source_id: audio_src_id,
+                            event_start_in_clip_beats: 0.0,
+                            event_length_beats: audio_length_beats,
+                            source_start_frames: 0,
+                            source_end_frames: audio.buffer.frames,
+                            ..AudioEvent::default()
+                        }],
+                    }),
+                );
+                let audio_track_id = self.song.alloc_track_id();
+                let mut audio_track = Track {
+                    id: audio_track_id,
+                    kind: TrackKind::Audio,
+                    name: format!("{display_name} (Audio)"),
+                    ..Track::default()
+                };
+                let a_clip_id = audio_track.alloc_clip_id();
+                audio_track.clips.push(Clip {
+                    id: a_clip_id,
+                    name: format!("{display_name} (audio)"),
+                    start_beat: next_start_beat,
+                    length_beats: audio_length_beats,
+                    content_id: a_content_id,
+                    notes: Vec::new(),
+                });
+                self.song.tracks.push(audio_track);
+            }
+
+            next_start_beat += video_length_beats;
+            imported_ok += 1;
+        }
+
+        if imported_ok > 0 {
+            self.is_dirty = true;
+            self.sync_song_to_plugin_host();
+        }
+
+        self.status_message = match (imported_ok, errors.is_empty()) {
+            (0, false) => format!("Video import 失敗: {}", errors.join(" / ")),
+            (n, true) => format!("Video import 完了: {n} ファイル (V + A track 追加)"),
+            (n, false) => format!(
+                "Video import: {n} ファイル成功、 {} 件エラー: {}",
+                errors.len(),
+                errors.join(" / ")
+            ),
+        };
+    }
+
+    /// File menu → "Import Video..." 経路。 `rfd` の native file picker
+    /// (multi-select、 mp4/mov/mkv/webm filter) を開いて、 選択された
+    /// path を `action_import_video` に転送する。
+    #[cfg(windows)]
+    fn action_open_import_video_dialog(&mut self) {
+        let Some(paths) = rfd::FileDialog::new()
+            .add_filter("Video", &["mp4", "mov", "mkv", "webm", "m4v", "avi"])
+            .set_title("Import Video...")
+            .pick_files()
+        else {
+            return;
+        };
+        if paths.is_empty() {
+            return;
+        }
+        self.action_import_video(paths);
+    }
+
     /// Split clip(s) at the cursor (= mouse hover beat).
     ///
     /// If `snap` is `true`, uses the snapped beat; otherwise the raw
@@ -11101,6 +11320,17 @@ fn frames_to_beats(frames: u64, sample_rate: u32, bpm: f32) -> f64 {
         return 0.0;
     }
     let secs = frames as f64 / sample_rate as f64;
+    secs * (bpm as f64) / 60.0
+}
+
+/// `docs/plan_video.md`: μs duration → project beats. Used by
+/// `action_import_video` to set the visual length of the auto-created
+/// video clip to its native duration at the project's current tempo.
+fn micros_to_beats(micros: u64, bpm: f32) -> f64 {
+    if bpm <= 0.0 {
+        return 0.0;
+    }
+    let secs = micros as f64 / 1_000_000.0;
     secs * (bpm as f64) / 60.0
 }
 

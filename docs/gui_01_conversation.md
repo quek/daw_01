@@ -221,6 +221,10 @@ Phase 71 として 1 PR で着地予定 (新 TexturePipeline + Primitive::Textur
 
 **GO**。 提案 API + 設計判断 (1)-(6) 全て採用、 特に `Renderer::texture_size(handle)` の追加に同意 (= aspect-fit を caller 側で重複実装せずに済む)。 daw_01 側は P1 (data model `TrackKind` / `ClipContent::Video` / `Song.video_sources`、 v11→v12 migration) を並行着手中。 Phase 71 landing 後に video import (P2) → preview window (P4) で wire 開始する。
 
+### gui_01 → (2026-05-25, landing)
+
+Phase 71 landed (commit `c139482`)。 全 API は reply 設計どおり: [`crates/renderer/src/scene.rs`](../../gui_01/crates/renderer/src/scene.rs) の `TextureHandle` / `TexturedQuad` / `Primitive::Texture` / `Scene::push_textured_quad`、 [`crates/renderer/src/device.rs`](../../gui_01/crates/renderer/src/device.rs) の `Renderer::{create_texture, upload_texture_rgba, destroy_texture, texture_size}` 4 件、 [`crates/ui/src/widgets/heavy.rs`](../../gui_01/crates/ui/src/widgets/heavy.rs) の `HeavyCtx::push_texture`、 `OffscreenRenderer` も同 4 件 public API 提供。 popup pass は texture pipeline を持たない (`enqueue_runs` / `render_runs` の `Option` 引数で skip)。 `cargo test --workspace` 全 pass、 `cargo clippy --workspace --tests -- -D warnings` clean、 embedded_host example に 4x4 RGBA checker + 0.5 alpha 青 overlay の smoke を追加して PNG snapshot で alpha blend / linear filter 動作確認済。 続けて Phase 72 (#044 = `ArrangementTrack.kind` + `ArrangementClip.thumbnail`) に着手します。
+
 ---
 
 ## #044 [In progress] 2026-05-25 [要望] `ArrangementTrack` に `kind: TrackKind` + video clip thumbnail field 追加

@@ -29,7 +29,9 @@
 - **Multi-track interleave** (audio/video 両方を同 `tracks: Vec<Track>` に並べる、
   `Track.kind: TrackKind { Audio, Video }` で discriminate)
 - **別 top-level window で preview** (REAPER 方式、 `plugin_embed.rs` と同 idiom)
-- **FFmpeg decode / encode** (`ffmpeg-next` crate)
+- **Windows Media Foundation で decode / encode** (`windows` crate の
+  `Win32::Media::MediaFoundation`、 P2 設計時点で `ffmpeg-next` から pivot ——
+  §1.4 参照)
 - **Cut / split / trim** (既存 audio clip の `E`/`J` shortcut を踏襲)
 - **Crossfade** (隣接 clip overlap で alpha ramp)
 - **Multi-track composite** (wgpu render pass で blend)
@@ -40,11 +42,44 @@
 - 色補正 / LUT / トランジション effect
 - Text overlay / title generator
 - Time-stretch video
-- Hardware decode (DXVA / NVDEC) — software で MVP は十分
+- 明示的な Hardware decode tuning (= WMF は default で DXVA / D3D11 / NVDEC を
+  driver 対応範囲で自動使用するので、 MVP は WMF の自動選択に任せる。
+  fallback / preset 切替 UI は post-MVP)
 - Picture-in-picture / multi-cam sync
 - Proxy file (低解像度 cache)
 - Color management (sRGB / Rec.709)
 - Variable framerate (VFR) handling
+- Linux / macOS 対応 — WMF は Windows 専用 API。 Linux で動かす場合は別 backend
+  (= FFmpeg or GStreamer) を `import_video.rs` の trait 抽象に差し込む形が
+  想定だが、 MVP では Windows 専用とする (CLAUDE.md "Windows 優先、 Linux 配慮"
+  と整合)。
+
+### 1.4 ffmpeg-next からの pivot 経緯 (2026-05-25)
+
+設計初稿 (§1.2) は `ffmpeg-next` (FFmpeg 8.1 ネイティブ binding) を committed
+していたが、 P2 着手時に build 環境で:
+
+- `ffmpeg-sys-next` の build script が `bindgen` で FFmpeg ヘッダから Rust
+  binding を再生成する → `libclang.dll` を要求 → user 環境に LLVM が無く
+  ~500MB の追加 install が必要
+- ldev 環境の `FFMPEG_DIR` env var を全 cargo 起動で維持する必要 (PATH
+  汚染 / `.cargo/config.toml` のパス hardcode 問題)
+- LGPL DLL 配布要件 (avcodec/avformat/avutil 等を release bundle に同梱、
+  注釈表示要)
+
+3 つのセットアップ手間をユーザーが嫌い、 同等の MV 用途 codec (H.264/HEVC/AAC
+mp4 + VP9 webm + AV1 = MVP 必要範囲) を OS 標準で提供する Windows Media
+Foundation に pivot した。 既存 `windows` crate を流用 (`Win32_Media_
+MediaFoundation` feature を追加するだけ) で、 新規 dep / LLVM / env var /
+DLL 配布注意 はすべて 0。
+
+trade-off: Linux 対応が崩れた (§1.3 末尾を参照)、 API が COM ベース (`unsafe`
+散発)。 ただし daw_01 は既に CLAP host の `plugin_embed.rs` で Win32 COM
+ベタ叩きを書いているので、 メンテ知識の連続性は高い。
+
+§2 のデータモデル (TrackKind / ClipContent::Video / VideoSource 等) は decoder
+非依存なので変更不要。 gui_01 要望 (#043 texture pipeline / #044 arrangement
+video track) も decoder 非依存なので変更不要。
 
 ## 2. データモデル変更 (v11 → v12 migration)
 
@@ -152,19 +187,22 @@ pub enum VideoSourcePath {
 │  ┌─────────────────────────────────────────────────────────────┐ │
 │  │ video worker thread (lookahead decode)                      │ │
 │  │  - audio playhead を atomic で poll                         │ │
-│  │  - 各 active video clip の frame を 200-500ms 先読み         │ │
+│  │  - 各 active video clip について WMF IMFSourceReader::      │ │
+│  │    ReadSample で 200-500ms 先読み (D3D11 hardware accel 自動)│ │
 │  │  - decoded RGBA frame を ring buffer に push                │ │
 │  └─────────────────────────────────────────────────────────────┘ │
 │  ┌─────────────────────────────────────────────────────────────┐ │
 │  │ import worker thread (per import)                           │ │
-│  │  - FFmpeg で video metadata + audio extract                 │ │
-│  │  - .wav を `<project>/samples/<hash>.wav` に書き出す        │ │
+│  │  - WMF IMFSourceReader で video metadata + audio extract    │ │
+│  │  - .wav (PCM 48k stereo f32) を `<project>/samples/<hash>.  │ │
+│  │    wav` に書き出す (hound writer)                            │ │
 │  └─────────────────────────────────────────────────────────────┘ │
 │  ┌─────────────────────────────────────────────────────────────┐ │
 │  │ render thread (export 中だけ起動)                            │ │
 │  │  - pass 1: 既存 audio WAV freewheel を kick                  │ │
-│  │  - pass 2: video freewheel → wgpu composite → H.264 encode   │ │
-│  │  - pass 3: ffmpeg-next muxer で WAV + H.264 → mp4            │ │
+│  │  - pass 2: video freewheel → wgpu composite → IMFSinkWriter  │ │
+│  │           で H.264 + AAC mp4 を書く                          │ │
+│  │  - mux も IMFSinkWriter が一括で扱うので 3 段目 step は無し   │ │
 │  └─────────────────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────────────┘
 ┌──────────────────────────────────────────────────────────────────┐
@@ -179,6 +217,10 @@ pub enum VideoSourcePath {
 
 - IPC 追加なし (= video は GUI ↔ disk のみで完結、 daw_audio は WAV だけ見る)
 - 既存 `AudioPlayhead` atomic ([daw_audio/src/...] 要確認) を video worker thread から poll
+- WMF は **`MFStartup` を プロセス起動時に 1 度** 呼ぶ必要 (`MFShutdown` を
+  終了時に対応で呼ぶ)。 thread 単位の `CoInitializeEx(COINIT_MULTITHREADED)`
+  も各 worker thread の冒頭で呼ぶ (= IMFSourceReader / IMFSinkWriter は MTA
+  apartment 前提)。 plugin_embed.rs (CLAP host) の Win32 初期化と同 idiom。
 
 ## 4. Phase 分け (= 実装順序)
 
@@ -199,13 +241,17 @@ pub enum VideoSourcePath {
 ### P2. Video import path
 - daw_gui の File menu / drag&drop で .mp4/.mov/.mkv/.webm を受け取る
 - `import_video.rs` 新設:
-  - FFmpeg で metadata 取得 (width/height/duration/framerate/codec)
-  - audio stream demux + decode → `<project>/samples/<basename>_<hash8>.wav`
+  - WMF `IMFSourceReader` で metadata 取得 (width/height/duration_micros/
+    framerate/codec)
+  - audio stream を `SetStreamSelection` + `ReadSample` で demux + decode、
+    `hound` で `<project>/samples/<basename>_<hash8>.wav` (PCM 48k stereo
+    f32) に書き出す
   - `VideoSource` 登録 + `AudioSource` 登録 (`audio_source_id` で bind)
   - 自動で pair audio track (`TrackKind::Audio`) を video track の下に追加
   - 自動で video track (`TrackKind::Video`) を最上段に追加
-- Error path: 非対応 codec / 破損 file / extract 失敗 → status_message に表示
-- `Cargo.toml`: `ffmpeg-next = "8.x"` 追加 (要 FFmpeg DLL 同梱、 LGPL 配布要件確認)
+- Error path: 非対応 codec / 破損 file / MFStartup 失敗 → status_message に表示
+- workspace `Cargo.toml` の `windows` crate features に
+  `"Win32_Media_MediaFoundation"` を追加 (新規 crate dep は無し)
 
 ### P3. Arrangement view 上の Video track 表現
 - `daw_gui/src/view/arrangement_view.rs`: `track.kind` で row 描画分岐
@@ -253,12 +299,16 @@ pub enum VideoSourcePath {
 ### P8. Render (export to mp4)
 - Render dialog (output path / codec選択 = MVP は H.264 only / bitrate or CRF)
 - Pass 1: 既存の WAV freewheel export を呼ぶ (= `daw_audio` の render mode)
-- Pass 2: video freewheel
+- Pass 2: video freewheel + 同一 mp4 への mux
+  - `IMFSinkWriter` を作成 (出力 mp4 path、 video stream は H.264、 audio
+    stream は AAC)
   - `1.0 / project_framerate` 秒刻みで playhead を進める
   - 各刻みで active video clips を decode + composite (P7 と同じ wgpu pass)
-  - rendered RGBA frame を ffmpeg-next encoder (H.264) に push
-  - encoded stream を一時 .mp4 (video-only) に書く
-- Pass 3: ffmpeg-next muxer で video + WAV を 1 つの mp4 にまとめる
+  - rendered RGBA frame を NV12 に変換 (`IMFTransform` Color Converter MFT)
+    → `IMFSinkWriter::WriteSample` で video stream に push
+  - Pass 1 の WAV を audio stream に同 sink writer で push (= WMF が
+    audio + video を 1 つの mp4 に mux してくれる、 別 muxer pass 不要)
+  - `IMFSinkWriter::Finalize` で write complete
 - Progress callback で GUI に進捗 bar (= 既存 `Worker::report_progress` 経路)
 
 ## 5. gui_01 への要望リスト (= 別紙 docs/gui_01_conversation.md に entry を起こす)
@@ -303,22 +353,26 @@ pub enum VideoSourcePath {
 
 ## 7. 未確定事項
 
-- **ClipContent::Video の serde 互換性**: `#[serde(untagged)]` の field-set
-  disjoint 性を維持するには、 `VideoContent` の `events` 名が `AudioContent.
-  events` と衝突しないか確認が必要。 衝突するなら field 名を変える
-  (`video_events`) か、 untagged を捨てて `#[serde(tag = "kind")]` に移行
-  (= v6 以降全 ClipContent file の migration が必要、 大事になる)
 - **VideoEvent の time unit**: μs (mp4 timestamp の native) vs frame index。
-  μs 採択予定だが、 seek 精度との trade-off
-- **Render codec**: MVP は H.264 only、 H.265 / ProRes は post-MVP
+  μs 採択 (P1 で landing 済) だが、 seek 精度との trade-off
+- **Render codec**: MVP は H.264 + AAC (WMF 標準 H264 encoder MFT)、
+  H.265 / ProRes は post-MVP
 - **Frame cache size**: 200ms / 500ms / project setting? defaults 300ms 案
 - **Crossfade curve**: MVP は linear 固定、 s-curve / exp は post-MVP
 - **Clip の timebase**: `start_beat` + `length_beats` (= 既存 Clip 流) で揃え
   るが、 tempo 変化時の挙動は要詰め (= MV は fixed tempo 前提と仮置き)
 - **Preview window の独立した play/pause**: REAPER は preview だけ scrub 可、
   daw_01 は transport 一元で MVP 進める想定 (= preview window は表示のみ)
-- **FFmpeg DLL 配布**: LGPL 動的リンクで shared DLL を `target/release/` に
-  同梱する必要、 Windows installer 段階で対応
+- **WMF codec 拡張**: VP9 / AV1 を扱う場合 Win10/11 の拡張機能 (Microsoft
+  Store free package) インストールが要る可能性。 import エラーで status_bar
+  に「拡張機能が要る」 と案内する UX を P2 で着地予定
+- **Linux backend**: WMF は Windows 専用。 Linux 対応する場合は
+  `import_video.rs` / `video_worker.rs` を trait 抽象化して FFmpeg backend を
+  差し込む。 MVP では trait 化はせず、 直接 WMF 呼び (= 後で trait 化する際の
+  refactor コストを許容)
+- **WMF MFStartup の lifecycle**: process 起動時 1 度 `MFStartup`、 終了時
+  `MFShutdown`。 daw_gui の main() に置くか lazy init するか — `OnceLock` で
+  lazy init + Drop guard で MFShutdown が綺麗
 
 ## 8. 関連 plan / 参照
 
