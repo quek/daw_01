@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use daw_ui_platform::{CursorIcon, KeyEvent, PhysicalSize};
 use daw_ui_renderer::{
-    Color, GlyphArea, LineBatch, LineSegment, Primitive, Rect, RectCommand, Scene,
+    Color, GlyphArea, LineBatch, LineSegment, Primitive, Rect, RectCommand, Scene, TexturedQuad,
 };
 
 use crate::clipboard::ClipboardProvider;
@@ -790,6 +790,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.popup_primitives.push(Primitive::Line(batch));
         } else {
             self.scene.push_lines(batch);
+        }
+    }
+
+    /// M14 Phase 71 (daw_01 #043): textured quad を Scene に積む。
+    /// `current_clip` (with_clip_rect スタック) と quad.clip_rect を交差させる。
+    /// popup 内で呼ぶと popup_primitives に入るが、 popup pass では texture pipeline を
+    /// 持たないため render されない (#043 reply: 「video preview は popup ではない」)。
+    pub fn push_textured_quad(&mut self, mut quad: TexturedQuad) {
+        quad.clip_rect = merge_clip(self.current_clip, quad.clip_rect);
+        if self.drawing_in_popup {
+            self.popup_primitives.push(Primitive::Texture(quad));
+        } else {
+            self.scene.push_textured_quad(quad);
         }
     }
 

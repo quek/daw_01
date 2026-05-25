@@ -33,7 +33,7 @@
 use std::hash::Hash;
 
 use daw_ui_platform::{CursorIcon, PhysicalSize};
-use daw_ui_renderer::{Color, GlyphArea, LineBatch, Rect, RectCommand};
+use daw_ui_renderer::{Color, GlyphArea, LineBatch, Rect, RectCommand, TextureHandle, TexturedQuad};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
@@ -114,6 +114,22 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
     /// 線分バッチを scene に積む。
     pub fn push_lines(&mut self, batch: LineBatch) {
         self.ui.push_lines(batch);
+    }
+
+    /// M14 Phase 71 (daw_01 #043): textured quad を scene に積む。
+    ///
+    /// UV 全域 + clip なし の convenience。 部分 UV / クリップが必要なら
+    /// [`Ui::push_textured_quad`] を直接呼ぶ。 video frame thumbnail (arrangement) や
+    /// preview window composite で使用する。 destroy 済 handle は描画 no-op。
+    pub fn push_texture(&mut self, rect: Rect, texture: TextureHandle, alpha: f32) {
+        self.ui.push_textured_quad(TexturedQuad {
+            rect,
+            texture,
+            alpha,
+            uv_min: (0.0, 0.0),
+            uv_max: (1.0, 1.0),
+            clip_rect: None,
+        });
     }
 
     /// Edit を発行する。ヒットテストで click を検出したらここから流す。

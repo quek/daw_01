@@ -21,8 +21,10 @@ use daw_ui_platform::PhysicalSize;
 use crate::device::{RenderError, RendererInitError};
 use crate::pipelines::{
     enqueue_runs, glyph::GlyphPipeline, line::LinePipeline, rect::RectPipeline, render_runs,
+    texture::TexturePipeline,
 };
-use crate::scene::Scene;
+use crate::scene::{Scene, TextureHandle};
+use crate::texture_store::TextureStore;
 
 /// surface を使わない wgpu レンダラ。
 ///
@@ -35,6 +37,10 @@ pub struct OffscreenRenderer {
     rect: RectPipeline,
     line: LinePipeline,
     glyph: GlyphPipeline,
+    /// M14 Phase 71 (daw_01 #043): textured-quad pipeline (offscreen でも base pass で texture 描画可能)。
+    texture: TexturePipeline,
+    /// M14 Phase 71: texture handle → wgpu::Texture + bind_group の lookup table。
+    texture_store: TextureStore,
     size: PhysicalSize,
 }
 
@@ -74,6 +80,8 @@ impl OffscreenRenderer {
         let rect = RectPipeline::new(&device, target_format);
         let line = LinePipeline::new(&device, target_format);
         let glyph = GlyphPipeline::new(&device, &queue, target_format);
+        let texture = TexturePipeline::new(&device, target_format);
+        let texture_store = TextureStore::new();
 
         Ok(Self {
             device,
@@ -82,6 +90,8 @@ impl OffscreenRenderer {
             rect,
             line,
             glyph,
+            texture,
+            texture_store,
             size: PhysicalSize { width: width.max(1), height: height.max(1) },
         })
     }
@@ -92,6 +102,37 @@ impl OffscreenRenderer {
 
     pub fn target_format(&self) -> wgpu::TextureFormat {
         self.target_format
+    }
+
+    // ============================================================
+    // M14 Phase 71 (daw_01 #043): texture pool public API (Renderer<W> と同 idiom)
+    // ============================================================
+
+    /// 指定サイズの空 RGBA8UnormSrgb texture を確保。
+    pub fn create_texture(&mut self, width: u32, height: u32) -> TextureHandle {
+        self.texture_store.create(
+            &self.device,
+            self.texture.sampler(),
+            self.texture.texture_bind_group_layout(),
+            width,
+            height,
+        )
+    }
+
+    /// RGBA8 で texture content を上書き。 destroy 済 / size 不一致は no-op。
+    pub fn upload_texture_rgba(&mut self, handle: TextureHandle, data: &[u8]) {
+        self.texture_store.upload(&self.queue, handle, data);
+    }
+
+    /// texture を解放。 既に解放済 / 未知の handle は no-op。
+    pub fn destroy_texture(&mut self, handle: TextureHandle) {
+        self.texture_store.destroy(handle);
+    }
+
+    /// texture の native (width, height)。 destroy 済は `None`。
+    #[must_use]
+    pub fn texture_size(&self, handle: TextureHandle) -> Option<(u32, u32)> {
+        self.texture_store.size(handle)
     }
 
     /// Scene を 1 フレーム分 render し、RGBA bytes (sRGB encoded) を返す。
@@ -134,21 +175,27 @@ impl OffscreenRenderer {
         self.rect.begin_frame();
         self.line.begin_frame();
         self.glyph.begin_frame(&self.queue, self.size);
+        self.texture.begin_frame();
 
         let base_runs = enqueue_runs(
             &scene.primitives,
             &mut self.rect,
             &mut self.line,
             &mut self.glyph,
+            Some(&mut self.texture),
             &self.device,
             &self.queue,
             self.size,
         );
+        // popup pass: OffscreenRenderer は pipeline instance を base / popup で共有するが、
+        // upload の最終値が popup data になる干渉を避けるため、 device.rs と異なり同一 pipeline を
+        // 流用 (offscreen は popup primitives 利用が少ないので許容)。 texture は base のみ (#043)。
         let popup_runs = enqueue_runs(
             &scene.popup_primitives,
             &mut self.rect,
             &mut self.line,
             &mut self.glyph,
+            None,
             &self.device,
             &self.queue,
             self.size,
@@ -156,6 +203,7 @@ impl OffscreenRenderer {
 
         self.rect.upload(&self.queue, self.size);
         self.line.upload(&self.queue, self.size);
+        self.texture.upload(&self.queue, self.size);
 
         // 4. encode: base pass + (popup pass) + copy_texture_to_buffer
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -183,6 +231,7 @@ impl OffscreenRenderer {
                 &self.rect,
                 &self.line,
                 &self.glyph,
+                Some((&self.texture, &self.texture_store)),
                 &mut pass,
                 self.size,
             );
@@ -209,6 +258,7 @@ impl OffscreenRenderer {
                 &self.rect,
                 &self.line,
                 &self.glyph,
+                None,
                 &mut pass,
                 self.size,
             );

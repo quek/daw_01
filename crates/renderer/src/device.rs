@@ -23,8 +23,10 @@ use daw_ui_platform::{PhysicalSize, WindowBackend};
 
 use crate::pipelines::{
     enqueue_runs, glyph::GlyphPipeline, line::LinePipeline, rect::RectPipeline, render_runs,
+    texture::TexturePipeline,
 };
-use crate::scene::Scene;
+use crate::scene::{Scene, TextureHandle};
+use crate::texture_store::TextureStore;
 
 /// 描画器本体。アプリ層が1つ持ち、フレーム毎に `render(&Scene)` を呼ぶ。
 pub struct Renderer<W: WindowBackend + Send + Sync + 'static> {
@@ -49,6 +51,13 @@ pub struct Renderer<W: WindowBackend + Send + Sync + 'static> {
     popup_rect: RectPipeline,
     popup_line: LinePipeline,
     popup_glyph: GlyphPipeline,
+    /// M14 Phase 71 (daw_01 #043): video frame / thumbnail 用 textured-quad pipeline。
+    /// base pass のみ (popup pass からは push されない、 #043 reply 参照)。
+    texture: TexturePipeline,
+    /// M14 Phase 71: texture handle → wgpu::Texture + bind_group の lookup table。
+    /// caller (daw_01 daw_gui) が `create_texture` / `upload_texture_rgba` / `destroy_texture`
+    /// で lifecycle 管理する (GUI 側 LRU 等は持たない、 #043 設計判断)。
+    texture_store: TextureStore,
     /// 現在の物理ピクセルサイズ。
     size: PhysicalSize,
     /// Window の所有権 (drop 順序のため最後)
@@ -118,6 +127,8 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
         let popup_rect = RectPipeline::new(&device, format);
         let popup_line = LinePipeline::new(&device, format);
         let popup_glyph = GlyphPipeline::new(&device, &queue, format);
+        let texture = TexturePipeline::new(&device, format);
+        let texture_store = TextureStore::new();
 
         Ok(Self {
             surface,
@@ -130,9 +141,47 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
             popup_rect,
             popup_line,
             popup_glyph,
+            texture,
+            texture_store,
             size,
             _window: window,
         })
+    }
+
+    // ============================================================
+    // M14 Phase 71 (daw_01 #043): texture pool public API
+    // ============================================================
+
+    /// 指定サイズの空 RGBA8 texture を確保し、 `TextureHandle` を返す。
+    /// format は `Rgba8UnormSrgb` 固定 (sRGB encoded RGBA8 入力前提)。
+    /// `width` / `height` = 0 は 1 に clamp。
+    pub fn create_texture(&mut self, width: u32, height: u32) -> TextureHandle {
+        self.texture_store.create(
+            &self.device,
+            self.texture.sampler(),
+            self.texture.texture_bind_group_layout(),
+            width,
+            height,
+        )
+    }
+
+    /// RGBA8 (`width * height * 4` bytes) で texture content を上書き。
+    /// destroy 済 handle / size 不一致は no-op (debug build では panic)。
+    pub fn upload_texture_rgba(&mut self, handle: TextureHandle, data: &[u8]) {
+        self.texture_store.upload(&self.queue, handle, data);
+    }
+
+    /// texture を解放。 既に解放された handle に対する操作は no-op。 以後 `texture_size` は `None`、
+    /// `push_textured_quad` で render しても描画 skip (panic しない)。
+    pub fn destroy_texture(&mut self, handle: TextureHandle) {
+        self.texture_store.destroy(handle);
+    }
+
+    /// texture の native (width, height) を返す。 destroy 済は `None`。
+    /// arrangement clip thumbnail の aspect-fit 計算 (daw_01 #044) で widget 内部から参照される。
+    #[must_use]
+    pub fn texture_size(&self, handle: TextureHandle) -> Option<(u32, u32)> {
+        self.texture_store.size(handle)
     }
 
     /// 物理サイズが変わったとき呼ぶ。
@@ -205,6 +254,7 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
         self.popup_rect.begin_frame();
         self.popup_line.begin_frame();
         self.popup_glyph.begin_frame(&self.queue, self.size);
+        self.texture.begin_frame();
 
         // 3. base pass: scene.primitives を call order で walk、同 type 連続を 1 run に enqueue
         let base_runs = enqueue_runs(
@@ -212,25 +262,28 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
             &mut self.rect,
             &mut self.line,
             &mut self.glyph,
+            Some(&mut self.texture),
             &self.device,
             &self.queue,
             self.size,
         );
 
-        // 4. popup pass: scene.popup_primitives を同様に enqueue
+        // 4. popup pass: scene.popup_primitives を同様に enqueue (texture は base のみ、 #043)
         let popup_runs = enqueue_runs(
             &scene.popup_primitives,
             &mut self.popup_rect,
             &mut self.popup_line,
             &mut self.popup_glyph,
+            None,
             &self.device,
             &self.queue,
             self.size,
         );
 
-        // 5. upload (rect/line の instance buffer を 1 度に GPU へ転送、glyph は enqueue 内で済)
+        // 5. upload (rect/line/texture の instance buffer を 1 度に GPU へ転送、glyph は enqueue 内で済)
         self.rect.upload(&self.queue, self.size);
         self.line.upload(&self.queue, self.size);
+        self.texture.upload(&self.queue, self.size);
         self.popup_rect.upload(&self.queue, self.size);
         self.popup_line.upload(&self.queue, self.size);
 
@@ -260,6 +313,7 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
                 &self.rect,
                 &self.line,
                 &self.glyph,
+                Some((&self.texture, &self.texture_store)),
                 &mut pass,
                 self.size,
             );
@@ -291,6 +345,7 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
                 &self.popup_rect,
                 &self.popup_line,
                 &self.popup_glyph,
+                None,
                 &mut pass,
                 self.size,
             );

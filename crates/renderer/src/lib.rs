@@ -3,7 +3,7 @@
 //! 提供:
 //! - `Renderer`: wgpu デバイス・キュー・サーフェス・パイプラインを束ねた高レベル入口
 //! - `pipelines::rect`: instanced 角丸矩形パイプライン (ボタン・ノブ・ノート等)
-//! - `pipelines::quad`: textured quad (アイコン・サムネ)
+//! - `pipelines::texture`: textured quad (video frame / thumbnail、 M14 Phase 71)
 //! - `pipelines::line`: line strip (波形・メータ・グリッド)
 //! - `pipelines::glyph`: glyphon 統合 (テキスト)
 //!
@@ -11,8 +11,9 @@
 
 pub mod device;
 pub mod offscreen;
-pub mod scene;
 pub mod pipelines;
+pub mod scene;
+pub mod texture_store;
 
 pub use device::*;
 pub use offscreen::*;

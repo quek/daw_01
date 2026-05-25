@@ -169,12 +169,80 @@ pub struct LineBatch {
     pub clip_rect: Option<Rect>,
 }
 
+/// Renderer-local な texture identifier (M14 Phase 71 / daw_01 #043)。
+///
+/// [`Renderer::create_texture`](crate::Renderer::create_texture) /
+/// [`OffscreenRenderer::create_texture`](crate::OffscreenRenderer::create_texture) で発行され、
+/// 同 Renderer instance 内でのみ valid (= 別 Renderer / 別 window 間で共有してはならない)。
+/// destroy 済 handle に対する push は描画 no-op (panic しない)。
+///
+/// `Copy + Eq + Hash` なので daw_01 側で `HashMap<ClipId, TextureHandle>` 等を持ちやすい。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TextureHandle(std::num::NonZeroU32);
+
+impl TextureHandle {
+    /// `TextureStore` 内部用コンストラクタ (renderer crate のみが呼ぶ)。
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_raw(id: std::num::NonZeroU32) -> Self {
+        Self(id)
+    }
+
+    /// `TextureStore` の内部 lookup 用 (renderer crate のみが呼ぶ)。
+    #[doc(hidden)]
+    #[must_use]
+    pub fn raw_id(self) -> std::num::NonZeroU32 {
+        self.0
+    }
+
+    /// debug / test 用の raw 値。 `from_raw` の逆。
+    #[must_use]
+    pub fn raw(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// 1 つの textured quad (M14 Phase 71 / daw_01 #043)。 video frame thumbnail / preview
+/// composite で使用。 `texture` が destroy 済なら描画 no-op (panic しない)。
+#[derive(Debug, Clone, Copy)]
+pub struct TexturedQuad {
+    /// 物理ピクセル座標 (rect / line / glyph と同 idiom)。
+    pub rect: Rect,
+    /// `Renderer::create_texture` で得た handle。
+    pub texture: TextureHandle,
+    /// `0.0` = 完全透明、 `1.0` = 完全不透明。 standard alpha blend (OVER) で composite。
+    pub alpha: f32,
+    /// texture 内サンプル領域 (UV `0.0..=1.0`)。 `(0,0)-(1,1)` で全 texture。 crop 用途で
+    /// 部分表示する場合に絞り込む (= thumbnail で frame の一部だけ表示)。
+    pub uv_min: (f32, f32),
+    pub uv_max: (f32, f32),
+    /// `Some` ならこの矩形外を scissor で切り捨てる。 `Ui::with_clip_rect` が自動設定する。
+    pub clip_rect: Option<Rect>,
+}
+
+impl TexturedQuad {
+    /// UV 全域 + alpha=1.0 + clip なし の最短コンストラクタ。
+    #[must_use]
+    pub fn new(rect: Rect, texture: TextureHandle) -> Self {
+        Self {
+            rect,
+            texture,
+            alpha: 1.0,
+            uv_min: (0.0, 0.0),
+            uv_max: (1.0, 1.0),
+            clip_rect: None,
+        }
+    }
+}
+
 /// 描画 primitive 1 つ分。`Scene::primitives` は **call order** でこれを並べる。
 #[derive(Debug, Clone)]
 pub enum Primitive {
     Rect(RectCommand),
     Glyph(GlyphArea),
     Line(LineBatch),
+    /// M14 Phase 71 (daw_01 #043): video frame / thumbnail 用 textured quad。
+    Texture(TexturedQuad),
 }
 
 /// 1 フレームの全描画コマンド (call-order interleave)。
@@ -219,6 +287,12 @@ impl Scene {
         self.primitives.push(Primitive::Line(batch));
     }
 
+    /// M14 Phase 71 (daw_01 #043): textured quad を base pass に積む。
+    /// popup pass には MVP 非対応 (= popup から呼んでも safety net で skip される)。
+    pub fn push_textured_quad(&mut self, quad: TexturedQuad) {
+        self.primitives.push(Primitive::Texture(quad));
+    }
+
     // ---- Test / debug helpers (旧 `scene.rects.len()` 等の代替) ----
 
     /// base pass の rect primitive の数。
@@ -259,6 +333,20 @@ impl Scene {
     pub fn iter_lines(&self) -> impl Iterator<Item = &LineBatch> {
         self.primitives.iter().filter_map(|p| match p {
             Primitive::Line(l) => Some(l),
+            _ => None,
+        })
+    }
+
+    /// M14 Phase 71: base pass の textured quad の数。
+    #[must_use]
+    pub fn texture_count(&self) -> usize {
+        self.primitives.iter().filter(|p| matches!(p, Primitive::Texture(_))).count()
+    }
+
+    /// M14 Phase 71: base pass の textured quad を call order で iterate。
+    pub fn iter_textures(&self) -> impl Iterator<Item = &TexturedQuad> {
+        self.primitives.iter().filter_map(|p| match p {
+            Primitive::Texture(q) => Some(q),
             _ => None,
         })
     }
@@ -313,5 +401,66 @@ impl Scene {
 impl Default for Scene {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU32;
+
+    fn handle(id: u32) -> TextureHandle {
+        TextureHandle::from_raw(NonZeroU32::new(id).unwrap())
+    }
+
+    #[test]
+    fn push_textured_quad_adds_texture_primitive() {
+        let mut s = Scene::new();
+        let h = handle(1);
+        s.push_textured_quad(TexturedQuad::new(Rect::new(0.0, 0.0, 10.0, 10.0), h));
+        assert_eq!(s.texture_count(), 1);
+        assert_eq!(s.rect_count(), 0);
+        assert_eq!(s.glyph_count(), 0);
+        assert_eq!(s.line_count(), 0);
+    }
+
+    #[test]
+    fn textured_quad_default_uv_full_and_alpha_one() {
+        let q = TexturedQuad::new(Rect::new(1.0, 2.0, 3.0, 4.0), handle(7));
+        // literal 1.0 / 0.0 を入れて取り出すだけなので bit-exact 比較で OK (clippy::float_cmp 不要)
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(q.alpha, 1.0);
+            assert_eq!(q.uv_min, (0.0, 0.0));
+            assert_eq!(q.uv_max, (1.0, 1.0));
+        }
+        assert!(q.clip_rect.is_none());
+    }
+
+    #[test]
+    fn texture_handle_raw_round_trip() {
+        let h = handle(42);
+        assert_eq!(h.raw(), 42);
+        assert_eq!(h.raw_id().get(), 42);
+    }
+
+    /// M14 Phase 71 (#043): primitives は call order で interleave、 type 跨ぎでも保たれる。
+    #[test]
+    fn texture_primitive_preserves_call_order_with_other_kinds() {
+        let mut s = Scene::new();
+        s.push_rect(RectCommand::uniform_radius(
+            Rect::new(0.0, 0.0, 1.0, 1.0),
+            Color::WHITE,
+            0.0,
+        ));
+        s.push_textured_quad(TexturedQuad::new(Rect::new(0.0, 0.0, 1.0, 1.0), handle(1)));
+        s.push_rect(RectCommand::uniform_radius(
+            Rect::new(0.0, 0.0, 1.0, 1.0),
+            Color::BLACK,
+            0.0,
+        ));
+        assert!(matches!(s.primitives[0], Primitive::Rect(_)));
+        assert!(matches!(s.primitives[1], Primitive::Texture(_)));
+        assert!(matches!(s.primitives[2], Primitive::Rect(_)));
     }
 }

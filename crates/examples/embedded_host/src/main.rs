@@ -19,7 +19,7 @@ use raw_window_handle::{
 };
 
 use daw_ui_platform::{CursorIcon, PhysicalSize, WindowBackend};
-use daw_ui_renderer::{Color, GlyphArea, OffscreenRenderer, Rect, RectCommand, Scene};
+use daw_ui_renderer::{Color, GlyphArea, OffscreenRenderer, Rect, RectCommand, Scene, TexturedQuad};
 
 /// 自前 `WindowBackend` 実装の例。実 DAW プラグイン環境では親プロセスから受け取った
 /// `RawWindowHandle` を保持する型になり、`window_handle` で
@@ -105,6 +105,45 @@ fn main() -> Result<(), Box<dyn Error>> {
         clip_rect: None,
     });
 
+    // ============================================================
+    // M14 Phase 71 (daw_01 #043): texture pipeline smoke test
+    // ============================================================
+    //
+    // 4x4 RGBA8 のチェック柄 texture を作り、 fader 群の右側に 120x120 px で拡大描画。
+    // PNG snapshot 右下にチェック柄が見えれば texture pipeline は動作している。
+    // 続けて crossfade を模擬: 同 rect に alpha=0.5 の単色 texture を重ねて混色確認。
+    let checker_tex = renderer.create_texture(4, 4);
+    let checker_rgba = make_checker_rgba();
+    renderer.upload_texture_rgba(checker_tex, &checker_rgba);
+    assert_eq!(renderer.texture_size(checker_tex), Some((4, 4)));
+
+    let crossfade_tex = renderer.create_texture(2, 2);
+    let solid_blue = [
+        0x10, 0x60, 0xFF, 0xFF, 0x10, 0x60, 0xFF, 0xFF,
+        0x10, 0x60, 0xFF, 0xFF, 0x10, 0x60, 0xFF, 0xFF,
+    ];
+    renderer.upload_texture_rgba(crossfade_tex, &solid_blue);
+
+    let texture_rect = Rect::new(width as f32 - 150.0, height as f32 - 150.0, 120.0, 120.0);
+    scene.push_textured_quad(TexturedQuad::new(texture_rect, checker_tex));
+    scene.push_textured_quad(TexturedQuad {
+        rect: texture_rect,
+        texture: crossfade_tex,
+        alpha: 0.5,
+        uv_min: (0.0, 0.0),
+        uv_max: (1.0, 1.0),
+        clip_rect: None,
+    });
+    scene.push_text(GlyphArea {
+        text: "Phase 71 (#043): texture pipeline (4x4 checker + 0.5 blue overlay)".into(),
+        left: width as f32 - 540.0,
+        top: height as f32 - 30.0,
+        font_size: 12.0,
+        line_height: 14.0,
+        color: Color::rgb(0.7, 0.85, 1.0),
+        clip_rect: None,
+    });
+
     // 1 フレーム render → RGBA bytes (sRGB encoded、行 stride = width * 4)
     let rgba = renderer.render_to_rgba(&scene)?;
     assert_eq!(rgba.len(), (width as usize) * (height as usize) * 4);
@@ -127,4 +166,23 @@ fn save_png(path: &Path, rgba: &[u8], width: u32, height: u32) -> Result<(), Box
     let mut writer = encoder.write_header()?;
     writer.write_image_data(rgba)?;
     Ok(())
+}
+
+/// 4x4 の RGBA8 チェック柄 (red / green / blue / yellow を 2x2 タイル状に並べる)。
+/// linear filter で拡大すると色の補間が見える = pipeline 動作 + sampler 動作の確認。
+fn make_checker_rgba() -> Vec<u8> {
+    let colors: [[u8; 4]; 4] = [
+        [0xE0, 0x40, 0x40, 0xFF], // red
+        [0x40, 0xE0, 0x40, 0xFF], // green
+        [0x40, 0x40, 0xE0, 0xFF], // blue
+        [0xE0, 0xE0, 0x40, 0xFF], // yellow
+    ];
+    let mut out = Vec::with_capacity(4 * 4 * 4);
+    for y in 0..4 {
+        for x in 0..4 {
+            let tile = ((y / 2) * 2 + (x / 2)) as usize;
+            out.extend_from_slice(&colors[tile]);
+        }
+    }
+    out
 }
