@@ -81,6 +81,14 @@ struct RunnerState {
     /// → preview window の `frame_texture` に upload する。
     #[cfg(windows)]
     playback: crate::video_playback::VideoPlaybackEngine,
+    /// docs/plan_video.md P5 perf: 直近に preview decode を駆動した時刻。
+    /// `drive_preview_playback` を `Song.video_framerate` Hz に throttle
+    /// する基準。 main loop は vsync で 60fps+ 回るが、 video preview は
+    /// project framerate (typically 30fps) を超えて更新する意味がないので、
+    /// 余剰呼び出しを skip して同期 decode の負荷を半減する。 background
+    /// worker thread (= plan §3 P5 正式設計) への移行はまだ先。
+    #[cfg(windows)]
+    last_preview_drive_at: Option<Instant>,
 }
 
 struct Runner {
@@ -151,6 +159,8 @@ impl ApplicationHandler<AppEvent> for Runner {
             preview: None,
             #[cfg(windows)]
             playback: crate::video_playback::VideoPlaybackEngine::new(),
+            #[cfg(windows)]
+            last_preview_drive_at: None,
         });
     }
 
@@ -462,11 +472,31 @@ impl Runner {
     /// every video clip, clears the composite list so the placeholder
     /// shows. Per-source decode failures log at warn level and skip
     /// just that layer — the rest of the composite still draws.
+    ///
+    /// Throttled to `Song.video_framerate` (typical 30fps). The
+    /// main loop redraws at vsync (60+fps), but decoding faster than
+    /// the project's video framerate doesn't change what's on screen
+    /// — frame buckets repeat. Skipping the redundant calls halves
+    /// CPU pressure for 60Hz monitors with a 30fps project.
     #[cfg(windows)]
     fn drive_preview_playback(state: &mut RunnerState) {
         let Some(preview) = state.preview.as_mut() else {
             return;
         };
+        // Throttle to project framerate. Use a small floor (24fps =
+        // ~41ms) so a malformed project framerate (0 / NaN) still
+        // permits some decoding.
+        let frame_interval_ms = {
+            let fps = state.app.song.video_framerate.max(1.0);
+            (1000.0 / fps).round().max(33.0) as u64
+        };
+        let now = Instant::now();
+        if let Some(last) = state.last_preview_drive_at
+            && now.duration_since(last).as_millis() < frame_interval_ms as u128
+        {
+            return;
+        }
+        state.last_preview_drive_at = Some(now);
         let Some(playhead_beat) = state.app.playhead_beat.map(f64::from) else {
             preview.set_composite_layers(Vec::new());
             return;

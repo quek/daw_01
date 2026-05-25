@@ -247,6 +247,12 @@ impl VideoPlaybackEngine {
             std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
             std::collections::hash_map::Entry::Vacant(v) => {
                 let entry = create_reader_for_source(source_path)?;
+                tracing::info!(
+                    video_source_id,
+                    width = entry.width,
+                    height = entry.height,
+                    "video reader created"
+                );
                 v.insert(entry)
             }
         };
