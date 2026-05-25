@@ -24,6 +24,24 @@
             "command": "bash F:/dev/gui_01/.claude/hooks/pretooluse_git_commit_review_reminder.sh"
           }
         ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash F:/dev/gui_01/.claude/hooks/pretooluse_daw_01_conversation_best_practice_reminder.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash F:/dev/gui_01/.claude/hooks/pretooluse_ask_user_question_best_practice_reminder.sh"
+          }
+        ]
       }
     ],
     "Stop": [
