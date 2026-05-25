@@ -831,6 +831,7 @@ dependencies = [
  "glyphon",
  "pollster",
  "wgpu",
+ "windows",
 ]
 
 [[package]]

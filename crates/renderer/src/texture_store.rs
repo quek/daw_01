@@ -169,6 +169,54 @@ impl TextureStore {
         );
     }
 
+    /// M14 Phase 74 (daw_01 #045 §B): 外部で構築済の `wgpu::Texture` を import して entry 化。
+    /// `create` は内部で `device.create_texture(...)` を呼ぶが、 こちらは caller が既に持っている
+    /// wgpu::Texture (e.g. `wgpu::Device::create_texture_from_hal` で D3D11 shared handle から構築
+    /// 済の texture) を所有移譲で受け取り、 同じ bind_group / format / size 管理に乗せる。
+    ///
+    /// `width` / `height` / `format` は caller が知っている前提で渡す (= imported texture を
+    /// `wgpu::Texture::format()` / `size()` 等で取り出すこともできるが、 caller 側で
+    /// 既に shared handle import 時に把握しているので boilerplate を避けて引数受けにする)。
+    pub fn import_texture(
+        &mut self,
+        device: &wgpu::Device,
+        sampler: &wgpu::Sampler,
+        layout: &wgpu::BindGroupLayout,
+        texture: wgpu::Texture,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> TextureHandle {
+        self.next_id += 1;
+        let id = NonZeroU32::new(self.next_id).expect("texture id overflow at 1");
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("texture pool bg (imported)"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+        self.entries.insert(
+            id,
+            TextureEntry {
+                texture,
+                bind_group,
+                width: width.max(1),
+                height: height.max(1),
+                format,
+            },
+        );
+        TextureHandle::from_raw(id)
+    }
+
     /// handle を解放。 既に解放済 / 未知の handle は no-op。 以後 `bind_group` / `size` は `None`。
     pub fn destroy(&mut self, handle: TextureHandle) {
         self.entries.remove(&handle.raw_id());
