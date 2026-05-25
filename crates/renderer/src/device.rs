@@ -249,15 +249,16 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
     ///
     /// # Arguments
     ///
-    /// - `shared_handle_raw`: D3D11 で生成した shared NT handle の `isize` raw 値
-    ///   (= `windows::Win32::Foundation::HANDLE.0`)。 caller の windows crate version と
-    ///   gui_01 内部 (= 0.62 pin) が不一致でも raw `isize` 経由なので型衝突しない。
+    /// - `shared_handle`: D3D11 で生成した shared NT handle (`windows = "0.62"` の `HANDLE`、
+    ///   = `*mut c_void` の newtype)。 daw_01 workspace も `windows = "0.62"` に揃える設計で、
+    ///   newtype のまま渡し、 raw 値展開を caller に強要しない (= 型システムが境界を守る、
+    ///   #045 reply の Q (B) で確定)。
     /// - `format`: imported texture の wgpu format (e.g. `Bgra8UnormSrgb` for WMF ARGB32)
     /// - `width` / `height`: native pixel size
     ///
     /// # Caller responsibilities
     ///
-    /// - `shared_handle_raw` は **valid な NT handle** (= `D3D11_RESOURCE_MISC_SHARED_NTHANDLE +
+    /// - `shared_handle` は **valid な NT handle** (= `D3D11_RESOURCE_MISC_SHARED_NTHANDLE +
     ///   KEYED_MUTEX` 付きで生成済) でなければならない
     /// - 返ってきた `TextureHandle` を [`Self::destroy_texture`] で release するまで、
     ///   underlying shared handle / D3D11 resource は **valid なまま保持** する責務 (gui_01 は
@@ -275,18 +276,17 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
     /// # Safety
     ///
     /// 本 method は `pub` だが **caller responsibilities** を満たす前提で動く。 violated な
-    /// `shared_handle_raw` を渡すと OpenSharedHandle が HRESULT で fail-soft する想定だが、
+    /// `shared_handle` を渡すと OpenSharedHandle が HRESULT で fail-soft する想定だが、
     /// driver / OS によっては process crash の可能性もある (= raw NT handle の宿命)。
     /// caller は WMF / D3D11 経路で確実に正しい handle を生成すること。
     #[cfg(windows)]
     pub fn create_texture_from_d3d11_shared_handle(
         &mut self,
-        shared_handle_raw: isize,
+        shared_handle: windows::Win32::Foundation::HANDLE,
         format: wgpu::TextureFormat,
         width: u32,
         height: u32,
     ) -> Result<TextureHandle, RendererError> {
-        use windows::Win32::Foundation::HANDLE;
         use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
         if self.backend != wgpu::Backend::Dx12 {
@@ -301,7 +301,7 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
         // 4) wgpu::Device::create_texture_from_hal で wgpu::Texture に昇格 → TextureStore::import_texture。
         //
         // SAFETY: 全 unsafe block は caller responsibility 文書 (上の doc コメント) に依拠。
-        // shared_handle_raw が valid な NT handle で、 format/size が実体一致している前提。
+        // shared_handle が valid な NT handle で、 format/size が実体一致している前提。
         let hal_texture: wgpu::hal::dx12::Texture = unsafe {
             let hal_device_guard = self.device.as_hal::<wgpu::hal::dx12::Api>();
             let Some(hal_device) = hal_device_guard else {
@@ -310,11 +310,10 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
                 return Err(RendererError::WrongBackend(self.backend));
             };
             let d3d12_device = hal_device.raw_device();
-            let handle = HANDLE(shared_handle_raw as *mut core::ffi::c_void);
             // windows 0.62.x の OpenSharedHandle は out-param 形式 (= `*mut Option<T>`)。
             let mut resource_out: Option<ID3D12Resource> = None;
             d3d12_device
-                .OpenSharedHandle::<ID3D12Resource>(handle, &mut resource_out)
+                .OpenSharedHandle::<ID3D12Resource>(shared_handle, &mut resource_out)
                 .map_err(|e| RendererError::OpenSharedHandle(format!("{e}")))?;
             let resource = resource_out.ok_or_else(|| {
                 RendererError::OpenSharedHandle(
