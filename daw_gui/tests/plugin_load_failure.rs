@@ -59,6 +59,7 @@ fn build_app() -> (
         Some(make_plugin_db()),
         event_dispatcher,
         job_dispatcher,
+        None,
     );
     (app, audio_rx, plugin_rx)
 }

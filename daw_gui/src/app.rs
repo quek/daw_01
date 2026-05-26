@@ -669,6 +669,12 @@ pub struct AppData {
     pub pending_state_queue: VecDeque<PendingStateRequest>,
     pub audio_tx: Option<UnboundedSender<MainToChild>>,
     pub plugin_tx: Option<UnboundedSender<MainToChild>>,
+    /// 子プロセス自動再起動 supervisor (`bootstrap::ChildSupervisor`)。
+    /// production (GUI mode) では `Some`、 script / test 経路では `None`。
+    /// `ChildDisconnected` event 受信時に `respawn(kind)` で新 child を
+    /// spawn + handshake + Session/OpenWorkerPool 再送し、 新 tx で
+    /// `audio_tx` / `plugin_tx` を差し替える。
+    pub supervisor: Option<Arc<crate::bootstrap::ChildSupervisor>>,
 
     /// Phase 2 PR-C: plugin-FX bounce が進行中なら `Some`。 `None` で
     /// 新規 bounce を受け付ける。 同時 1 件のみ。 `MainToChild::
@@ -844,6 +850,7 @@ impl AppData {
         plugin_db: Option<Arc<PluginDatabase>>,
         event_proxy: Arc<dyn BackgroundDispatcher>,
         voicevox_job: Arc<dyn JobDispatcher>,
+        supervisor: Option<Arc<crate::bootstrap::ChildSupervisor>>,
     ) -> Self {
         let song = Song {
             tracks: vec![Track {
@@ -977,6 +984,7 @@ impl AppData {
             singers: Vec::new(),
             voicevox_cache: Arc::new(Mutex::new(common::voicevox_cache::VoiceVoxCache::new())),
             voicevox_job,
+            supervisor,
             voicevox_launch_attempted: false,
             is_rescanning: false,
             status_message: String::new(),
@@ -2350,6 +2358,15 @@ pub enum AppEvent {
         slot: common::protocol::PluginSlot,
         param_id: u32,
     },
+    /// 子プロセス (daw_audio / daw_plugin_host) が exit したことを
+    /// `audio_pipe_loop` / `plugin_pipe_loop` が検知して synthetic に
+    /// 流す。 handler は re-spawn + Session / OpenWorkerPool 再送 +
+    /// state restore (`SetProjectDir` / `LoadSong` / plugin slots) を
+    /// 走らせ、 `is_playing = false` でユーザーに「再起動しました」 を
+    /// status_message で通知する。 non-undoable。
+    ChildDisconnected {
+        kind: common::protocol::ChildKind,
+    },
     /// gui_01 #029 (M14 Phase 63n-4): lane body 内 clip ギャップ
     /// dblclick で発行される clip 作成イベント。MIDI clip の
     /// `DoubleClickEmpty → CreateClip` と同 idiom の lane 版。
@@ -3385,6 +3402,9 @@ impl AppData {
                 // が record tick でこの値を read して point を生成する。
                 self.plugin_param_values
                     .insert((track, slot, param_id), value);
+            }
+            AppEvent::ChildDisconnected { kind } => {
+                self.handle_child_disconnected(kind);
             }
             AppEvent::PluginParamGestureEndFromChild {
                 track,
@@ -6604,6 +6624,78 @@ impl AppData {
             automation_target_display_name(&target)
         );
         self.sync_song_to_plugin_host();
+    }
+
+    /// 子プロセス (daw_audio / daw_plugin_host) の pipe loop が break
+    /// したときに呼ばれる。 `ChildSupervisor.respawn(kind)` で新 child を
+    /// spawn + handshake + Session/OpenWorkerPool 再送し、 成功なら
+    /// `audio_tx` / `plugin_tx` を新 sender に差し替え、 SetProjectDir +
+    /// LoadSong + restore_plugin_from_song で state restore。 失敗時は
+    /// tx を None のまま status_message でユーザーに通知 (= sync_song
+    /// _to_plugin_host を呼ぶと send が捨てられるが panic しない)。
+    ///
+    /// `is_playing` は false に戻す (= ユーザーが Play を押し直す前提)。
+    /// audio engine が再起動した直後の playhead は 0 で、 旧 playhead に
+    /// 自動 seek すると意図しない位置から再生になるので、 user に明示
+    /// 操作してもらう方が安全。
+    fn handle_child_disconnected(&mut self, kind: common::protocol::ChildKind) {
+        use common::protocol::ChildKind;
+        let was_playing = self.is_playing;
+        self.is_playing = false;
+        self.pending_play = false;
+        self.active_param_gestures.clear();
+        self.latched_param_gestures.clear();
+        match kind {
+            ChildKind::Audio => {
+                self.audio_tx = None;
+                tracing::warn!("daw_audio child disconnected");
+            }
+            ChildKind::PluginHost => {
+                self.plugin_tx = None;
+                self.pending_plugin_loads.clear();
+                self.loaded_slots.clear();
+                tracing::warn!("daw_plugin_host child disconnected");
+            }
+        }
+
+        // supervisor 経由で respawn を試みる。 supervisor が None
+        // (= script / test 経路) なら通知だけで終わる。
+        let Some(supervisor) = self.supervisor.clone() else {
+            self.status_message = format!(
+                "{}が切断されました{} — supervisor 無効",
+                kind.as_str(),
+                if was_playing { " (再生停止)" } else { "" }
+            );
+            return;
+        };
+        match supervisor.respawn(kind) {
+            Ok(new_tx) => {
+                match kind {
+                    ChildKind::Audio => self.audio_tx = Some(new_tx),
+                    ChildKind::PluginHost => self.plugin_tx = Some(new_tx),
+                }
+                // state restore: project_dir + LoadSong (= sync_song_to
+                // _plugin_host 経路)、 plugin slots は restore_plugin_from
+                // _song で SetSlotPlugin 再送。
+                let song_snapshot = self.song.clone();
+                self.restore_plugin_from_song(&song_snapshot);
+                self.sync_song_to_plugin_host();
+                self.status_message = format!(
+                    "{}を再起動しました{}",
+                    kind.as_str(),
+                    if was_playing { " (再生は手動で再開してください)" } else { "" }
+                );
+                tracing::info!(?kind, "child respawn + state restore completed");
+            }
+            Err(e) => {
+                self.status_message = format!(
+                    "{}の再起動に失敗しました: {} — アプリ再起動が必要です",
+                    kind.as_str(),
+                    e
+                );
+                tracing::error!(error = %e, ?kind, "child respawn failed");
+            }
+        }
     }
 
     fn add_automation_from_last_touched(&mut self) {

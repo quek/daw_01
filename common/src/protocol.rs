@@ -53,6 +53,15 @@ pub enum ChildToMain {
         kind: ChildKind,
         pid: u32,
     },
+    /// 子プロセスとの IPC pipe が切断された (= 子プロセスが exit、 panic、
+    /// あるいは bincode decode 失敗で receive loop が終了した)。 daw_gui
+    /// 内部で `audio_pipe_loop` / `plugin_pipe_loop` が pipe break を
+    /// 検知したときに incoming channel へ自前で送出する synthetic event。
+    /// AppData は受け取って該当 kind の child を re-spawn し、 Session /
+    /// OpenWorkerPool / LoadSong / plugin slots を再構築する。
+    ChildDisconnected {
+        kind: ChildKind,
+    },
     /// Offline WAV export finished (or failed). Sent by daw_audio when
     /// the export thread finalises (or hits an error). `error == None`
     /// means the WAV file at the requested path is fully written.

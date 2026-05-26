@@ -124,6 +124,10 @@ impl ScriptHost {
             None,
             RecordingDispatcher::new(),
             Arc::new(NoopJobDispatcher),
+            // script mode は同 process 内の bootstrap が握る supervisor を
+            // 渡しても安全だが、 script 中に子プロセスが死ぬケースは
+            // テスト・録画用途では発生しない前提なので None で十分。
+            None,
         );
         Self {
             bootstrap,

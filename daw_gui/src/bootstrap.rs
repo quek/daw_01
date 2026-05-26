@@ -54,7 +54,12 @@ pub struct Bootstrap {
     /// 子プロセス kill のために生かす tokio runtime + 子プロセス Handle。
     /// drop 順序が大事 (children → runtime の順)。
     pub rt: Runtime,
-    _children: (Child, Child),
+    /// 子プロセス自動再起動用 supervisor。 `audio_pipe_loop` /
+    /// `plugin_pipe_loop` が break して `ChildToMain::ChildDisconnected`
+    /// を発火したら、 AppData が `supervisor.respawn(kind)` で新 child
+    /// を spawn + handshake + Session/OpenWorkerPool 再送し、 新 tx を
+    /// 受け取って AppData の `audio_tx` / `plugin_tx` を差し替える。
+    pub supervisor: Arc<ChildSupervisor>,
     _request_sem: Semaphore,
     _ready_sem: Semaphore,
     _worker_bridge: common::worker_bridge::WorkerBridgeHandle,
@@ -62,6 +67,118 @@ pub struct Bootstrap {
     _wake_handles: Vec<windows::Win32::Foundation::HANDLE>,
     #[cfg(windows)]
     _done_handles: Vec<windows::Win32::Foundation::HANDLE>,
+}
+
+/// 子プロセス re-spawn 用の context。 daw_audio / daw_plugin_host が
+/// pipe break で死亡したとき、 `respawn(kind)` で新 child を spawn +
+/// handshake + Session/OpenWorkerPool 再送し、 新 `UnboundedSender<
+/// MainToChild>` を返す。
+///
+/// 子プロセスは `Mutex<Option<Child>>` で保持 (= Drop で自動 kill、
+/// 再 spawn 時は古い child を `start_kill` してから置換)。 OS 上の
+/// shared memory / semaphore は `Bootstrap` 側で保持し続けるので、
+/// 新 child は OpenShared で join できる。
+pub struct ChildSupervisor {
+    pid: u32,
+    rt_handle: tokio::runtime::Handle,
+    job: Arc<JobHandle>,
+    session: AudioSession,
+    n_workers: u32,
+    worker_bridge_shmem_id: String,
+    wake_event_names: Vec<String>,
+    done_event_names: Vec<String>,
+    incoming_tx: UnboundedSender<ChildToMain>,
+    audio_child: std::sync::Mutex<Option<Child>>,
+    plugin_child: std::sync::Mutex<Option<Child>>,
+}
+
+impl ChildSupervisor {
+    /// 指定 kind の子プロセスを再起動し、 新しい IPC 送信用 channel
+    /// (`UnboundedSender<MainToChild>`) を返す。 失敗時は元の child は
+    /// 既に消えている (= caller が status_message で通知すれば user が
+    /// 手動でリトライ or 再起動できる)。
+    pub fn respawn(&self, kind: ChildKind) -> Result<UnboundedSender<MainToChild>> {
+        // 1) 既存 child を kill / drop。 OS pipe の解放を待つ前提で、
+        // 同 pipe_path を再利用する (= new ServerOptions.create を回す)。
+        let child_slot = match kind {
+            ChildKind::Audio => &self.audio_child,
+            ChildKind::PluginHost => &self.plugin_child,
+        };
+        if let Ok(mut guard) = child_slot.lock()
+            && let Some(mut c) = guard.take()
+        {
+            // start_kill は async ではないので即返る。 status は最後に
+            // wait されないが、 Job Object 経由でも回収される。
+            let _ = c.start_kill();
+        }
+
+        let pipe = pipe_path(self.pid, kind);
+        let binary = match kind {
+            ChildKind::Audio => "daw_audio",
+            ChildKind::PluginHost => "daw_plugin_host",
+        };
+
+        // 2) 新 server を作成 → 子 spawn → handshake → Session +
+        // OpenWorkerPool 送信、 を tokio runtime 内で実行。
+        let session = self.session.clone();
+        let n_workers = self.n_workers;
+        let worker_bridge_shmem_id = self.worker_bridge_shmem_id.clone();
+        let wake_event_names = self.wake_event_names.clone();
+        let done_event_names = self.done_event_names.clone();
+        let job = self.job.clone();
+        let pipe_for_spawn = pipe.clone();
+        let (server, child) = self
+            .rt_handle
+            .block_on(async move {
+                let server = ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create(&pipe_for_spawn)
+                    .with_context(|| format!("failed to create pipe {pipe_for_spawn}"))?;
+                let child = crate::subprocess::spawn_sibling(binary, [&pipe_for_spawn])?;
+                job.assign(&child)?;
+                let (_hello, server) = handshake(server, kind).await?;
+                anyhow::Ok((server, child))
+            })?;
+
+        // 3) Session + OpenWorkerPool を新 pipe に流す。 既存 caller
+        // (= AppData) は state restore で SetProjectDir + LoadSong を
+        // 続けて送ってくる前提なので、 ここでは「engine が再生可能な
+        // 最小限の state」 だけを再構築する。
+        let open_pool = MainToChild::OpenWorkerPool {
+            n_workers,
+            worker_bridge_shmem_id,
+            wake_event_names,
+            done_event_names,
+        };
+        let mut server = server;
+        self.rt_handle.block_on(async {
+            write_msg(&mut server, &MainToChild::Session(session)).await?;
+            write_msg(&mut server, &open_pool).await?;
+            anyhow::Ok(())
+        })?;
+
+        // 4) 新 channel + pipe loop spawn。 incoming_tx は既存
+        // (= AppEvent 経路に紐づいた) のを clone して渡す。 古い pipe
+        // loop が drop されているので、 新 loop だけが流す。
+        let (tx, rx) = unbounded_channel::<MainToChild>();
+        let incoming_tx = self.incoming_tx.clone();
+        match kind {
+            ChildKind::Audio => {
+                self.rt_handle.spawn(audio_pipe_loop(server, rx, incoming_tx));
+            }
+            ChildKind::PluginHost => {
+                self.rt_handle.spawn(plugin_pipe_loop(server, rx, incoming_tx));
+            }
+        }
+
+        // 5) child を slot に保存 (= 次回 respawn まで生かし、 Drop で
+        // kill される)。
+        if let Ok(mut guard) = child_slot.lock() {
+            *guard = Some(child);
+        }
+        tracing::info!(?kind, "child respawned");
+        Ok(tx)
+    }
 }
 
 /// 子プロセスを spawn → handshake → Session / OpenWorkerPool 配信 →
@@ -119,9 +236,23 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
     let (plugin_tx, plugin_rx) = unbounded_channel::<MainToChild>();
     let (incoming_tx, incoming_rx) = unbounded_channel::<ChildToMain>();
     rt.spawn(audio_pipe_loop(audio_server, audio_rx, incoming_tx.clone()));
-    rt.spawn(plugin_pipe_loop(plugin_server, plugin_rx, incoming_tx));
+    rt.spawn(plugin_pipe_loop(plugin_server, plugin_rx, incoming_tx.clone()));
 
     let plugin_db = load_or_build_plugin_db();
+
+    let supervisor = Arc::new(ChildSupervisor {
+        pid,
+        rt_handle: rt.handle().clone(),
+        job: job.clone(),
+        session: session.clone(),
+        n_workers,
+        worker_bridge_shmem_id: worker_bridge_shmem_id.clone(),
+        wake_event_names: wake_event_names.clone(),
+        done_event_names: done_event_names.clone(),
+        incoming_tx,
+        audio_child: std::sync::Mutex::new(Some(audio_child)),
+        plugin_child: std::sync::Mutex::new(Some(plugin_child)),
+    });
 
     Ok(Bootstrap {
         audio_tx,
@@ -131,7 +262,7 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
         job,
         plugin_db,
         rt,
-        _children: (audio_child, plugin_child),
+        supervisor,
         _request_sem: request_sem,
         _ready_sem: ready_sem,
         _worker_bridge: worker_bridge,
@@ -289,6 +420,9 @@ async fn audio_pipe_loop(
             else => break,
         }
     }
+    // 子プロセス側 (or 自前 write) が die / decode 失敗で抜けたケース。
+    // 上位 (AppData::handle_event) で respawn + state restore に拾ってもらう。
+    let _ = incoming_tx.send(ChildToMain::ChildDisconnected { kind: ChildKind::Audio });
     tracing::info!("audio pipe loop ended");
 }
 
@@ -322,6 +456,7 @@ async fn plugin_pipe_loop(
             else => break,
         }
     }
+    let _ = incoming_tx.send(ChildToMain::ChildDisconnected { kind: ChildKind::PluginHost });
     tracing::info!("plugin pipe loop ended");
 }
 

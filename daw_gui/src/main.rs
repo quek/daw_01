@@ -126,6 +126,7 @@ fn run_gui(mut bootstrap: Bootstrap, smoke_test_fixture: Option<PathBuf>) -> Res
     let bridge = Arc::clone(&bootstrap.bridge);
     let job = Arc::clone(&bootstrap.job);
     let plugin_db = bootstrap.plugin_db.clone();
+    let supervisor = Arc::clone(&bootstrap.supervisor);
 
     let init = RunnerInit {
         window_attrs: WindowAttributes::default()
@@ -145,6 +146,7 @@ fn run_gui(mut bootstrap: Bootstrap, smoke_test_fixture: Option<PathBuf>) -> Res
                 plugin_db,
                 event_dispatcher,
                 job_dispatcher,
+                Some(supervisor),
             );
 
             spawn_playhead_poller(bridge, proxy.clone());
@@ -305,6 +307,9 @@ fn spawn_incoming_bridge(
                     slot,
                     param_id,
                 }),
+                ChildToMain::ChildDisconnected { kind } => {
+                    Some(AppEvent::ChildDisconnected { kind })
+                }
             };
             if let Some(event) = event
                 && proxy.send_event(event).is_err()
