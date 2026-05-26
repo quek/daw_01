@@ -692,7 +692,8 @@ impl Song {
                 ClipContent::Midi(_)
                 | ClipContent::Automation(_)
                 | ClipContent::Video(_)
-            | ClipContent::Image(_) => None,
+                | ClipContent::Image(_)
+                | ClipContent::Text(_) => None,
             })
             .flatten()
             .filter(|ev| ev.source_id == source_id)
@@ -712,7 +713,8 @@ impl Song {
                 ClipContent::Midi(_)
                 | ClipContent::Automation(_)
                 | ClipContent::Video(_)
-            | ClipContent::Image(_) => None,
+                | ClipContent::Image(_)
+                | ClipContent::Text(_) => None,
             })
             .flatten()
             .map(|ev| ev.source_id)
@@ -768,7 +770,8 @@ impl Song {
                 ClipContent::Midi(_)
                 | ClipContent::Audio(_)
                 | ClipContent::Automation(_)
-                | ClipContent::Image(_) => None,
+                | ClipContent::Image(_)
+                | ClipContent::Text(_) => None,
             })
             .flatten()
             .filter(|ev| ev.source_id == source_id)
@@ -788,7 +791,8 @@ impl Song {
                 ClipContent::Midi(_)
                 | ClipContent::Audio(_)
                 | ClipContent::Automation(_)
-                | ClipContent::Image(_) => None,
+                | ClipContent::Image(_)
+                | ClipContent::Text(_) => None,
             })
             .flatten()
             .map(|ev| ev.source_id)
@@ -841,7 +845,8 @@ impl Song {
                 ClipContent::Midi(_)
                 | ClipContent::Audio(_)
                 | ClipContent::Automation(_)
-                | ClipContent::Video(_) => None,
+                | ClipContent::Video(_)
+                | ClipContent::Text(_) => None,
             })
             .flatten()
             .filter(|ev| ev.source_id == source_id)
@@ -859,7 +864,8 @@ impl Song {
                 ClipContent::Midi(_)
                 | ClipContent::Audio(_)
                 | ClipContent::Automation(_)
-                | ClipContent::Video(_) => None,
+                | ClipContent::Video(_)
+                | ClipContent::Text(_) => None,
             })
             .flatten()
             .map(|ev| ev.source_id)
@@ -1195,6 +1201,15 @@ pub enum ClipContent {
     /// carrying `opacity` fails the Audio / Video inner deserialize
     /// and falls through to `Image`.
     Image(ImageContent),
+    /// v16 (`docs/plan_text_overlay.md` §2.2): text overlay (title /
+    /// 字幕 / credits) clip payload。 untagged disambiguation:
+    /// `TextEvent.text: String` + `font_family: String` を持ち、 他
+    /// variant の inner struct には `String` の required field 無し
+    /// (Image は `opacity` 数値、 Video は `source_start_micros`、
+    /// Audio は `source_start_frames`、 Midi は `notes`、 Automation
+    /// は `points`)。 `deny_unknown_fields` で意図しない fallthrough
+    /// を防止。
+    Text(TextContent),
 }
 
 impl Default for ClipContent {
@@ -1214,7 +1229,8 @@ impl ClipContent {
             ClipContent::Audio(_)
             | ClipContent::Automation(_)
             | ClipContent::Video(_)
-            | ClipContent::Image(_) => None,
+            | ClipContent::Image(_)
+            | ClipContent::Text(_) => None,
         }
     }
 
@@ -1226,7 +1242,8 @@ impl ClipContent {
             ClipContent::Audio(_)
             | ClipContent::Automation(_)
             | ClipContent::Video(_)
-            | ClipContent::Image(_) => None,
+            | ClipContent::Image(_)
+            | ClipContent::Text(_) => None,
         }
     }
 
@@ -1237,7 +1254,8 @@ impl ClipContent {
             ClipContent::Midi(_)
             | ClipContent::Automation(_)
             | ClipContent::Video(_)
-            | ClipContent::Image(_) => None,
+            | ClipContent::Image(_)
+            | ClipContent::Text(_) => None,
         }
     }
 
@@ -1248,7 +1266,8 @@ impl ClipContent {
             ClipContent::Midi(_)
             | ClipContent::Automation(_)
             | ClipContent::Video(_)
-            | ClipContent::Image(_) => None,
+            | ClipContent::Image(_)
+            | ClipContent::Text(_) => None,
         }
     }
 
@@ -1260,7 +1279,8 @@ impl ClipContent {
             ClipContent::Midi(_)
             | ClipContent::Audio(_)
             | ClipContent::Video(_)
-            | ClipContent::Image(_) => None,
+            | ClipContent::Image(_)
+            | ClipContent::Text(_) => None,
         }
     }
 
@@ -1272,7 +1292,8 @@ impl ClipContent {
             ClipContent::Midi(_)
             | ClipContent::Audio(_)
             | ClipContent::Video(_)
-            | ClipContent::Image(_) => None,
+            | ClipContent::Image(_)
+            | ClipContent::Text(_) => None,
         }
     }
 
@@ -1284,7 +1305,8 @@ impl ClipContent {
             ClipContent::Midi(_)
             | ClipContent::Audio(_)
             | ClipContent::Automation(_)
-            | ClipContent::Image(_) => None,
+            | ClipContent::Image(_)
+            | ClipContent::Text(_) => None,
         }
     }
 
@@ -1295,7 +1317,8 @@ impl ClipContent {
             ClipContent::Midi(_)
             | ClipContent::Audio(_)
             | ClipContent::Automation(_)
-            | ClipContent::Image(_) => None,
+            | ClipContent::Image(_)
+            | ClipContent::Text(_) => None,
         }
     }
 
@@ -1307,7 +1330,8 @@ impl ClipContent {
             ClipContent::Midi(_)
             | ClipContent::Audio(_)
             | ClipContent::Automation(_)
-            | ClipContent::Video(_) => None,
+            | ClipContent::Video(_)
+            | ClipContent::Text(_) => None,
         }
     }
 
@@ -1318,7 +1342,8 @@ impl ClipContent {
             ClipContent::Midi(_)
             | ClipContent::Audio(_)
             | ClipContent::Automation(_)
-            | ClipContent::Video(_) => None,
+            | ClipContent::Video(_)
+            | ClipContent::Text(_) => None,
         }
     }
 }
@@ -1745,6 +1770,116 @@ impl Default for ImageEvent {
     }
 }
 
+/// Text clip content — `docs/plan_text_overlay.md` §2.2 (v16)。 単一行
+/// の text overlay。 1 clip = 1 text、 複数行は禁止 (\n を含む `text`
+/// は描画時に最初の改行で truncate するか、 model 側で reject する)。
+///
+/// `#[serde(deny_unknown_fields)]` は `ClipContent` の `#[serde(untagged)]`
+/// dispatch のため必須。 `TextEvent.text` 等の disjoint required field で
+/// Audio / Video / Image / Automation / MIDI と判別される。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[serde(deny_unknown_fields)]
+pub struct TextContent {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<TextEvent>,
+}
+
+/// `TextEvent.align` 用 enum。 horizontal alignment 3 選択
+/// (`docs/plan_text_overlay.md` §1.5)。 vertical は単一行 text のため
+/// 常に center (= box の縦中央 baseline) 固定。
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode,
+)]
+pub enum TextAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+/// One playable text event inside a `TextContent` (`docs/plan_text_overlay
+/// .md` §2.2)。 単一行 text、 PiP rect + font + color + outline + shadow
+/// + rotation 等の描画属性を持つ。 image PiP の `(x, y, w, h)` は
+/// project resolution の letterbox 内 normalized 0..=1 で展開される
+/// (= 画像 PiP と同 idiom、 window resize で aspect 維持)。
+///
+/// **JSON disambiguation required field**: `text: String` と
+/// `font_family: String` の同時保持で他 variant と disjoint。 ただし
+/// `ImageEvent` も `String` field を間接保持していないので衝突無し。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct TextEvent {
+    /// 表示する文字列 (単一行、 UTF-8、 改行禁止)。
+    pub text: String,
+    /// system font 名 (例 `"Yu Gothic"` / `""` で default)。 glyphon が
+    /// 解決失敗時は fallback chain で代替。
+    pub font_family: String,
+    /// project resolution 基準 px (= 1920x1080 で 48 px なら 48.0)。
+    pub font_size_px: f32,
+    /// 塗り色 RGBA (0.0..=1.0)。
+    pub fill_color: [f32; 4],
+    /// アウトライン色 RGBA。 `outline_width_px == 0.0` ならアウトライン無効。
+    pub outline_color: [f32; 4],
+    /// アウトライン太さ (project resolution 基準 px、 0.0 で無効)。
+    pub outline_width_px: f32,
+    /// ドロップシャドウ色 RGBA。 `shadow_offset == (0, 0)` && `shadow_blur
+    /// == 0.0` && color alpha == 0.0 のとき shadow 無し。
+    pub shadow_color: [f32; 4],
+    /// シャドウオフセット (project resolution 基準 px、 (dx, dy))。
+    pub shadow_offset_px: (f32, f32),
+    /// シャドウぼかし半径 (project resolution 基準 px、 0.0 で hard shadow)。
+    pub shadow_blur_px: f32,
+    /// horizontal alignment (vertical は単一行 text で center 固定)。
+    pub align: TextAlign,
+    /// Clip-local beat (image / audio event と同 idiom)。
+    pub event_start_in_clip_beats: f64,
+    pub event_length_beats: f64,
+    /// PiP rect in normalized 0-1 letterbox coordinates (image と同 idiom)。
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// 全体 opacity (0..=1)。 fade envelope と multiply。
+    pub opacity: f32,
+    /// box 中心を旋回中心とする 2D 回転 (radians、 clockwise positive)。
+    pub rotation_radians: f32,
+    pub muted: bool,
+    pub fade_in_beats: f64,
+    pub fade_out_beats: f64,
+    pub fade_in_curve: FadeCurve,
+    pub fade_out_curve: FadeCurve,
+}
+
+impl Default for TextEvent {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            font_family: String::new(),
+            font_size_px: 64.0,
+            fill_color: [1.0, 1.0, 1.0, 1.0],
+            outline_color: [0.0, 0.0, 0.0, 1.0],
+            outline_width_px: 0.0,
+            shadow_color: [0.0, 0.0, 0.0, 0.5],
+            shadow_offset_px: (0.0, 0.0),
+            shadow_blur_px: 0.0,
+            align: TextAlign::Center,
+            event_start_in_clip_beats: 0.0,
+            event_length_beats: 0.0,
+            // 既定 PiP rect = 「中央付近の横帯」 (= 標準 title 位置)。
+            x: 0.0,
+            y: 0.4,
+            w: 1.0,
+            h: 0.2,
+            opacity: 1.0,
+            rotation_radians: 0.0,
+            muted: false,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        }
+    }
+}
+
 /// A free-time note inside a clip. `start_beat` is relative to the clip
 /// start; `duration_beats` is the note length. `pitch` is a MIDI key
 /// (0..=127), `velocity` is 0..=127. `lyric` is attached for VOICEVOX
@@ -1809,6 +1944,12 @@ pub enum AutomationTarget {
     /// clip が同一 lane で駆動される (`docs/plan_image_automation.md`
     /// §1.1 / §1.2)。
     ImageBuiltin(ImageBuiltinParam),
+    /// v16 (`docs/plan_text_overlay.md` §2.3): text overlay の各 field を
+    /// automation。 計 23 lane (位置 4 + 形 3 + fill RGBA + outline RGBA
+    /// + width + shadow RGBA + offset xy + blur)。 image と同じく track-
+    /// level、 text clip が存在する時間範囲だけ lane 値が `TextEvent.
+    /// <field>` を override。
+    TextBuiltin(TextBuiltinParam),
 }
 
 /// Built-in track parameter selector for `AutomationTarget::TrackBuiltin`.
@@ -1821,6 +1962,26 @@ pub enum TrackBuiltinParam {
     /// (`docs/plan_routing_graph.md`). `send_idx` is the position
     /// inside the track's `sends` array.
     SendGain { send_idx: u8 },
+}
+
+/// v16 (`docs/plan_text_overlay.md` §2.3): text overlay の各 field
+/// selector。 計 23 variants で TextEvent 全描画属性 + 位置 + 形を
+/// automation 可能。 lane の値は plain (= TextEvent field と同単位)、
+/// normalize 経路 (= UI 表示の 0..=1) は target ごとに plain_to_norm で
+/// 定義 (Color channel は 0..=1 そのまま、 size / offset / blur は
+/// project px なので plain そのまま使用)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
+pub enum TextBuiltinParam {
+    /// 位置 / サイズ (normalized 0..=1、 image と同 idiom)
+    X, Y, W, H,
+    /// 形 (Opacity / Rotation は image と同 idiom、 FontSize は px)
+    Opacity, Rotation, FontSize,
+    /// 塗り色 RGBA (各 channel 0..=1)
+    FillR, FillG, FillB, FillA,
+    /// アウトライン RGBA + Width (px)
+    OutlineR, OutlineG, OutlineB, OutlineA, OutlineWidth,
+    /// ドロップシャドウ RGBA + Offset XY + Blur (px)
+    ShadowR, ShadowG, ShadowB, ShadowA, ShadowOffsetX, ShadowOffsetY, ShadowBlur,
 }
 
 /// v14: image track の PiP 数値 field selector (`docs/plan_image_automation

@@ -53,6 +53,14 @@ pub fn plain_to_norm(target: &AutomationTarget, plain: f64) -> f32 {
             (plain + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)
         }
         AutomationTarget::ImageBuiltin(_) => plain,
+        // Text Builtin: image と同じく Rotation のみ Pan idiom、 残りは
+        // plain と norm が同単位 (= color/x/y/w/h は 0..=1、 font_size /
+        // outline_width / shadow_offset / shadow_blur は px だが
+        // automation lane の値域は plain 直接、 UI 側で範囲を整える)。
+        AutomationTarget::TextBuiltin(crate::model::TextBuiltinParam::Rotation) => {
+            (plain + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)
+        }
+        AutomationTarget::TextBuiltin(_) => plain,
     };
     v.clamp(0.0, 1.0) as f32
 }
@@ -80,6 +88,10 @@ pub fn norm_to_plain(target: &AutomationTarget, norm: f32) -> f64 {
             n * 2.0 * std::f64::consts::PI - std::f64::consts::PI
         }
         AutomationTarget::ImageBuiltin(_) => n,
+        AutomationTarget::TextBuiltin(crate::model::TextBuiltinParam::Rotation) => {
+            n * 2.0 * std::f64::consts::PI - std::f64::consts::PI
+        }
+        AutomationTarget::TextBuiltin(_) => n,
     }
 }
 

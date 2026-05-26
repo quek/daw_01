@@ -1579,6 +1579,41 @@ fn lane_target_display(target: &common::model::AutomationTarget) -> LaneDisplay 
             icon_glyph: 'R',
             color: Color::rgb(0.75, 0.92, 0.92),
         },
+        AutomationTarget::TextBuiltin(p) => {
+            use common::model::TextBuiltinParam as T;
+            // text 系 lane 全 23 variant 用 display。 色は「位置 4 / 形 3
+            // / fill 4 / outline 5 / shadow 7」 を section ごとに統一。
+            let (label, icon, color): (&'static str, char, Color) = match p {
+                T::X => ("Text X", 'X', Color::rgb(0.85, 0.85, 0.65)),
+                T::Y => ("Text Y", 'Y', Color::rgb(0.85, 0.85, 0.65)),
+                T::W => ("Text W", 'W', Color::rgb(0.80, 0.80, 0.60)),
+                T::H => ("Text H", 'H', Color::rgb(0.80, 0.80, 0.60)),
+                T::Opacity => ("Text Opacity", 'O', Color::rgb(0.92, 0.85, 0.60)),
+                T::Rotation => ("Text Rotation", 'R', Color::rgb(0.65, 0.92, 0.92)),
+                T::FontSize => ("Text Size", 'S', Color::rgb(0.88, 0.78, 0.55)),
+                T::FillR => ("Text Fill R", 'r', Color::rgb(0.95, 0.55, 0.55)),
+                T::FillG => ("Text Fill G", 'g', Color::rgb(0.55, 0.95, 0.55)),
+                T::FillB => ("Text Fill B", 'b', Color::rgb(0.55, 0.55, 0.95)),
+                T::FillA => ("Text Fill A", 'a', Color::rgb(0.85, 0.85, 0.85)),
+                T::OutlineR => ("Text Out R", 'r', Color::rgb(0.85, 0.45, 0.45)),
+                T::OutlineG => ("Text Out G", 'g', Color::rgb(0.45, 0.85, 0.45)),
+                T::OutlineB => ("Text Out B", 'b', Color::rgb(0.45, 0.45, 0.85)),
+                T::OutlineA => ("Text Out A", 'a', Color::rgb(0.75, 0.75, 0.75)),
+                T::OutlineWidth => ("Text Out W", 'w', Color::rgb(0.78, 0.65, 0.55)),
+                T::ShadowR => ("Text Sh R", 'r', Color::rgb(0.65, 0.40, 0.40)),
+                T::ShadowG => ("Text Sh G", 'g', Color::rgb(0.40, 0.65, 0.40)),
+                T::ShadowB => ("Text Sh B", 'b', Color::rgb(0.40, 0.40, 0.65)),
+                T::ShadowA => ("Text Sh A", 'a', Color::rgb(0.55, 0.55, 0.55)),
+                T::ShadowOffsetX => ("Text Sh X", 'x', Color::rgb(0.55, 0.45, 0.45)),
+                T::ShadowOffsetY => ("Text Sh Y", 'y', Color::rgb(0.55, 0.45, 0.45)),
+                T::ShadowBlur => ("Text Sh Blur", 'B', Color::rgb(0.60, 0.55, 0.50)),
+            };
+            LaneDisplay {
+                label: Arc::from(label),
+                icon_glyph: icon,
+                color,
+            }
+        }
     }
 }
 
@@ -1615,6 +1650,12 @@ fn plain_to_norm(target: &common::model::AutomationTarget, plain: f64) -> f32 {
             (plain + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)
         }
         AutomationTarget::ImageBuiltin(_) => plain,
+        // Text Builtin: Rotation のみ Pan idiom、 残りは plain と norm が
+        // 同単位 (= image と同 idiom)。
+        AutomationTarget::TextBuiltin(common::model::TextBuiltinParam::Rotation) => {
+            (plain + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)
+        }
+        AutomationTarget::TextBuiltin(_) => plain,
     };
     v.clamp(0.0, 1.0) as f32
 }

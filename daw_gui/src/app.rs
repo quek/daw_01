@@ -266,8 +266,34 @@ pub fn automation_target_display_name(
         AutomationTarget::ImageBuiltin(ImageBuiltinParam::W) => "Image W".into(),
         AutomationTarget::ImageBuiltin(ImageBuiltinParam::H) => "Image H".into(),
         AutomationTarget::ImageBuiltin(ImageBuiltinParam::Opacity) => "Image Opacity".into(),
-        AutomationTarget::ImageBuiltin(ImageBuiltinParam::Rotation) => {
-            "Image Rotation".into()
+        AutomationTarget::ImageBuiltin(ImageBuiltinParam::Rotation) => "Image Rotation".into(),
+        AutomationTarget::TextBuiltin(p) => {
+            use common::model::TextBuiltinParam as T;
+            match p {
+                T::X => "Text X".into(),
+                T::Y => "Text Y".into(),
+                T::W => "Text W".into(),
+                T::H => "Text H".into(),
+                T::Opacity => "Text Opacity".into(),
+                T::Rotation => "Text Rotation".into(),
+                T::FontSize => "Text FontSize".into(),
+                T::FillR => "Text Fill R".into(),
+                T::FillG => "Text Fill G".into(),
+                T::FillB => "Text Fill B".into(),
+                T::FillA => "Text Fill A".into(),
+                T::OutlineR => "Text Outline R".into(),
+                T::OutlineG => "Text Outline G".into(),
+                T::OutlineB => "Text Outline B".into(),
+                T::OutlineA => "Text Outline A".into(),
+                T::OutlineWidth => "Text Outline Width".into(),
+                T::ShadowR => "Text Shadow R".into(),
+                T::ShadowG => "Text Shadow G".into(),
+                T::ShadowB => "Text Shadow B".into(),
+                T::ShadowA => "Text Shadow A".into(),
+                T::ShadowOffsetX => "Text Shadow OffsetX".into(),
+                T::ShadowOffsetY => "Text Shadow OffsetY".into(),
+                T::ShadowBlur => "Text Shadow Blur".into(),
+            }
         }
     }
 }
@@ -6944,6 +6970,70 @@ impl AppData {
                     ImageBuiltinParam::Rotation => ev.rotation_radians,
                 })
             }
+            // Text default: 同 track の first text event の field 値。
+            // text clip が無い (= lane を空 track で先行追加) は field
+            // ごとの常識値 (色 RGBA は (1,1,1,1) や (0,0,0,1) 等)。
+            AutomationTarget::TextBuiltin(field) => {
+                use common::model::{ClipContent, TextBuiltinParam as T};
+                let Some(track) = self.song.track_by_id(touched.track_id) else {
+                    return 0.0;
+                };
+                let event = track.clips.iter().find_map(|c| {
+                    self.song
+                        .clip_contents
+                        .get(&c.content_id)
+                        .and_then(|content| match content {
+                            ClipContent::Text(t) => t.events.first(),
+                            _ => None,
+                        })
+                });
+                let Some(ev) = event else {
+                    // text clip 無し → default 値 (= TextEvent::default
+                    // の常識値と整合させる)。
+                    return match field {
+                        T::X => 0.0,
+                        T::Y => 0.4,
+                        T::W => 1.0,
+                        T::H => 0.2,
+                        T::Opacity => 1.0,
+                        T::Rotation => 0.0,
+                        T::FontSize => 64.0,
+                        T::FillR | T::FillG | T::FillB | T::FillA => 1.0,
+                        T::OutlineR | T::OutlineG | T::OutlineB => 0.0,
+                        T::OutlineA => 1.0,
+                        T::OutlineWidth => 0.0,
+                        T::ShadowR | T::ShadowG | T::ShadowB => 0.0,
+                        T::ShadowA => 0.5,
+                        T::ShadowOffsetX | T::ShadowOffsetY => 0.0,
+                        T::ShadowBlur => 0.0,
+                    };
+                };
+                f64::from(match field {
+                    T::X => ev.x,
+                    T::Y => ev.y,
+                    T::W => ev.w,
+                    T::H => ev.h,
+                    T::Opacity => ev.opacity,
+                    T::Rotation => ev.rotation_radians,
+                    T::FontSize => ev.font_size_px,
+                    T::FillR => ev.fill_color[0],
+                    T::FillG => ev.fill_color[1],
+                    T::FillB => ev.fill_color[2],
+                    T::FillA => ev.fill_color[3],
+                    T::OutlineR => ev.outline_color[0],
+                    T::OutlineG => ev.outline_color[1],
+                    T::OutlineB => ev.outline_color[2],
+                    T::OutlineA => ev.outline_color[3],
+                    T::OutlineWidth => ev.outline_width_px,
+                    T::ShadowR => ev.shadow_color[0],
+                    T::ShadowG => ev.shadow_color[1],
+                    T::ShadowB => ev.shadow_color[2],
+                    T::ShadowA => ev.shadow_color[3],
+                    T::ShadowOffsetX => ev.shadow_offset_px.0,
+                    T::ShadowOffsetY => ev.shadow_offset_px.1,
+                    T::ShadowBlur => ev.shadow_blur_px,
+                })
+            }
         }
     }
 
@@ -12542,6 +12632,13 @@ impl AppData {
                     .insert(front_id, ClipContent::Image(front));
                 ClipContent::Image(back)
             }
+            // Text clip Split (`docs/plan_text_overlay.md` §2.2)。 image
+            // split と同 idiom: event を split_offset で前後に振り分け。
+            // text 内容 / font / color 等は両半が共有 (= 同 text の 2 つ
+            // の時間 region で表示)、 fade_out (前半) / fade_in (後半) は
+            // 0 リセット。 後 commit で実装、 まずは split skip で
+            // build を通す。
+            ClipContent::Text(_) => return false,
         };
 
         // Allocate fresh ContentIds for both halves (front was just
@@ -12666,6 +12763,13 @@ impl AppData {
                         had_mixed_kind = true;
                         break;
                     }
+                    // Text clip Glue は後 commit で実装。 まずは「混在」
+                    // 扱いで abort、 Image / Video / Audio / MIDI 同士は
+                    // 動作維持。
+                    ClipContent::Text(_) => {
+                        had_mixed_kind = true;
+                        break;
+                    }
                 };
                 match glue_kind {
                     None => glue_kind = Some(this_kind),
@@ -12767,6 +12871,10 @@ impl AppData {
                             });
                         }
                     }
+                    // Text clip Glue は後 commit で実装。 abort 済み
+                    // (had_mixed_kind = true) なので reach 不能、 防衛的
+                    // に no-op。
+                    ClipContent::Text(_) => {}
                 }
             }
             if !combined_start.is_finite() || !combined_end.is_finite() {
