@@ -31,7 +31,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey as WinitPhysKey};
 use winit::window::{WindowAttributes, WindowId};
 
-use crate::app::{AppData, AppEvent};
+use crate::app::{AppData, AppEvent, ClipRef};
 use crate::view::shortcuts::daw_shortcut_map;
 use crate::view::window::DawGuiWindow;
 
@@ -352,45 +352,95 @@ fn handle_preview_drag(
             let new_rotation = drag.start_rotation_radians
                 + (cur_angle - drag.start_cursor_angle);
             // 値が変わったときだけ発火 (= 0.001 rad ≒ 0.057° 未満は skip)。
+            // 同 idiom で image / text どちらかの SetClip*Rotation を撃つ。
             let cur_rot = drag.start_rotation_radians;
             if (new_rotation - cur_rot).abs() > 1e-3 {
-                let _ = proxy.send_event(AppEvent::SetClipImageRotation {
-                    target: drag.target,
-                    value: new_rotation,
-                });
+                let ev = match preview_drag_target_kind(app, drag.target) {
+                    PreviewDragTargetKind::Text => AppEvent::SetClipTextRotation {
+                        target: drag.target,
+                        value: new_rotation,
+                    },
+                    _ => AppEvent::SetClipImageRotation {
+                        target: drag.target,
+                        value: new_rotation,
+                    },
+                };
+                let _ = proxy.send_event(ev);
             }
             return;
         }
     };
     // 値が変わった field だけ AppEvent を発火 (= 無駄な undo step を
-    // 発生させない)。 first event 比較。
-    let current = app
+    // 発生させない)。 first event 比較。 image / text どちらかの events
+    // を持つ clip を見つけ、 同 idiom の現値 (x, y, w, h) を返す。
+    let target = drag.target;
+    let content = app
         .song
         .tracks
-        .get(drag.target.track as usize)
-        .and_then(|t| t.clips.get(drag.target.clip as usize))
-        .and_then(|c| app.song.clip_contents.get(&c.content_id))
-        .and_then(|content| content.image_events())
-        .and_then(|ev| ev.first())
-        .map(|ev| (ev.x, ev.y, ev.w, ev.h));
+        .get(target.track as usize)
+        .and_then(|t| t.clips.get(target.clip as usize))
+        .and_then(|c| app.song.clip_contents.get(&c.content_id));
+    let kind = preview_drag_target_kind(app, target);
+    let current = match content {
+        Some(c) if matches!(kind, PreviewDragTargetKind::Text) => {
+            c.text_events().and_then(|ev| ev.first()).map(|ev| (ev.x, ev.y, ev.w, ev.h))
+        }
+        Some(c) => {
+            c.image_events().and_then(|ev| ev.first()).map(|ev| (ev.x, ev.y, ev.w, ev.h))
+        }
+        None => None,
+    };
     let Some((cx, cy, cw, ch)) = current else {
         return;
     };
-    let target = drag.target;
     let send = |ev: AppEvent| {
         let _ = proxy.send_event(ev);
     };
     if (nx - cx).abs() > 1e-5 {
-        send(AppEvent::SetClipImageX { target, value: nx });
+        send(match kind {
+            PreviewDragTargetKind::Text => AppEvent::SetClipTextX { target, value: nx },
+            _ => AppEvent::SetClipImageX { target, value: nx },
+        });
     }
     if (ny - cy).abs() > 1e-5 {
-        send(AppEvent::SetClipImageY { target, value: ny });
+        send(match kind {
+            PreviewDragTargetKind::Text => AppEvent::SetClipTextY { target, value: ny },
+            _ => AppEvent::SetClipImageY { target, value: ny },
+        });
     }
     if (nw - cw).abs() > 1e-5 {
-        send(AppEvent::SetClipImageW { target, value: nw });
+        send(match kind {
+            PreviewDragTargetKind::Text => AppEvent::SetClipTextW { target, value: nw },
+            _ => AppEvent::SetClipImageW { target, value: nw },
+        });
     }
     if (nh - ch).abs() > 1e-5 {
-        send(AppEvent::SetClipImageH { target, value: nh });
+        send(match kind {
+            PreviewDragTargetKind::Text => AppEvent::SetClipTextH { target, value: nh },
+            _ => AppEvent::SetClipImageH { target, value: nh },
+        });
+    }
+}
+
+/// docs/plan_text_overlay.md §4 P6: preview drag target の clip kind
+/// (image / text)。 `BeginImagePiPDrag` vs `BeginTextPiPDrag` 等、 同
+/// idiom の event を分岐するのに使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewDragTargetKind {
+    Image,
+    Text,
+}
+
+fn preview_drag_target_kind(app: &AppData, target: ClipRef) -> PreviewDragTargetKind {
+    let content = app
+        .song
+        .tracks
+        .get(target.track as usize)
+        .and_then(|t| t.clips.get(target.clip as usize))
+        .and_then(|c| app.song.clip_contents.get(&c.content_id));
+    match content {
+        Some(common::model::ClipContent::Text(_)) => PreviewDragTargetKind::Text,
+        _ => PreviewDragTargetKind::Image,
     }
 }
 
@@ -843,16 +893,26 @@ impl Runner {
                                 target,
                             });
                             // drag begin: snapshot 1 個 + lane recording
-                            // seed (`docs/plan_image_automation.md` §5)
-                            let _ = self
-                                .proxy
-                                .send_event(AppEvent::BeginImagePiPDrag);
+                            // seed。 image / text で別 marker event を
+                            // 撃つ (= 後者は `docs/plan_text_overlay.md`
+                            // §4 P6)。 target の clip kind で振り分ける。
+                            let drag_target_kind =
+                                preview_drag_target_kind(&state.app, target);
+                            let begin_ev = match drag_target_kind {
+                                PreviewDragTargetKind::Text => AppEvent::BeginTextPiPDrag,
+                                _ => AppEvent::BeginImagePiPDrag,
+                            };
+                            let _ = self.proxy.send_event(begin_ev);
                         }
                     }
-                } else if state.preview_drag.is_some() {
-                    state.preview_drag = None;
-                    // drag end: lane recording seed のクリア。
-                    let _ = self.proxy.send_event(AppEvent::EndImagePiPDrag);
+                } else if let Some(drag) = state.preview_drag.take() {
+                    // drag end: lane recording seed のクリア。 begin と同
+                    // kind の End event を送る。
+                    let end_ev = match preview_drag_target_kind(&state.app, drag.target) {
+                        PreviewDragTargetKind::Text => AppEvent::EndTextPiPDrag,
+                        _ => AppEvent::EndImagePiPDrag,
+                    };
+                    let _ = self.proxy.send_event(end_ev);
                 }
             }
             _ => {}
@@ -1152,6 +1212,8 @@ impl Runner {
         // 理想だが、 frame collect は既に終わっており、 ここでは event
         // の生値ベースで縁取りを置く (= lane drag P5.3 で recording に
         // 切り替えた瞬間に event 値が override される動作で OK)。
+        // docs/plan_text_overlay.md §4 P6: text clip も同 idiom で
+        // overlay 縁取り + handle を出す。 image / text を順に try。
         let overlay_info = state
             .app
             .selected_clip
@@ -1159,9 +1221,15 @@ impl Runner {
                 let track = state.app.song.tracks.get(cref.track as usize)?;
                 let clip = track.clips.get(cref.clip as usize)?;
                 let content = state.app.song.clip_contents.get(&clip.content_id)?;
-                let events = content.image_events()?;
-                let ev = events.first()?;
-                Some(((ev.x, ev.y, ev.w, ev.h), ev.rotation_radians))
+                if let Some(events) = content.image_events() {
+                    let ev = events.first()?;
+                    Some(((ev.x, ev.y, ev.w, ev.h), ev.rotation_radians))
+                } else if let Some(events) = content.text_events() {
+                    let ev = events.first()?;
+                    Some(((ev.x, ev.y, ev.w, ev.h), ev.rotation_radians))
+                } else {
+                    None
+                }
             });
         let (overlay_rect, rotation) = match overlay_info {
             Some((r, rot)) => (Some(r), rot),

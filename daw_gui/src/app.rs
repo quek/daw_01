@@ -1680,6 +1680,7 @@ impl AppData {
                 | AppEvent::CommitClipImageOpacityEdit
                 | AppEvent::CommitClipImageRotationEdit
                 | AppEvent::BeginImagePiPDrag
+                | AppEvent::BeginTextPiPDrag
                 // EndImagePiPDrag は非 undoable (begin 側に snapshot あり)
                 // 注: SetClipImage{X,Y,W,H,Opacity} は preview drag で
                 // 毎フレーム発火するので非 undoable。 drag begin の
@@ -2323,6 +2324,16 @@ pub enum AppEvent {
     /// undoable。
     RemoveTextAutomationLane { field: common::model::TextBuiltinParam },
 
+    /// docs/plan_text_overlay.md §4 P6: text PiP rect drag で発火する
+    /// `SetClipText{X,Y,W,H,Rotation}` 群 (= image と同 idiom)。 lane が
+    /// effective なら handler 側で「TextEvent.field を直接書く」 動作で、
+    /// lane override が drag を隠す挙動も同様。
+    SetClipTextX { target: ClipRef, value: f32 },
+    SetClipTextY { target: ClipRef, value: f32 },
+    SetClipTextW { target: ClipRef, value: f32 },
+    SetClipTextH { target: ClipRef, value: f32 },
+    SetClipTextRotation { target: ClipRef, value: f32 },
+
     /// preview window で PiP rect の drag 操作を始めた瞬間に発火する
     /// marker event (`docs/plan_image_overlay.md` §4 P5)。 handler 本体
     /// は no-op、 is_undoable に含まれるので handle_event 冒頭の
@@ -2338,6 +2349,14 @@ pub enum AppEvent {
     /// _gestures に登録した image field を全て remove する。 non-
     /// undoable (= drag begin 側に snapshot がある)。
     EndImagePiPDrag,
+
+    /// docs/plan_text_overlay.md §4 P6: text PiP rect の drag を開始 /
+    /// 終了する marker (`BeginImagePiPDrag` と同 idiom)。 Begin で
+    /// `TextBuiltin(_)` lane を `active_param_gestures` に seed、 End で
+    /// 全 remove。 Begin は undoable (= drag 1 stroke = 1 undo)、 End は
+    /// non-undoable。
+    BeginTextPiPDrag,
+    EndTextPiPDrag,
     /// Phase 4 (`docs/plan_automation.md` §6): automation recording mode の
     /// transport 4 way toggle。 session-only / Undo 対象外。
     SetRecordingMode(common::model::RecordingMode),
@@ -3977,6 +3996,27 @@ impl AppData {
             }
             AppEvent::SetClipImageRotation { target, value } => {
                 self.set_clip_image_event_rotation_radians(target, value);
+            }
+            AppEvent::SetClipTextX { target, value } => {
+                self.set_clip_text_event_x(target, value);
+            }
+            AppEvent::SetClipTextY { target, value } => {
+                self.set_clip_text_event_y(target, value);
+            }
+            AppEvent::SetClipTextW { target, value } => {
+                self.set_clip_text_event_w(target, value);
+            }
+            AppEvent::SetClipTextH { target, value } => {
+                self.set_clip_text_event_h(target, value);
+            }
+            AppEvent::SetClipTextRotation { target, value } => {
+                self.set_clip_text_event_rotation_radians(target, value);
+            }
+            AppEvent::BeginTextPiPDrag => {
+                self.begin_text_pip_drag_recording();
+            }
+            AppEvent::EndTextPiPDrag => {
+                self.end_text_pip_drag_recording();
             }
             AppEvent::AutoFadeSelectedClips => {
                 self.auto_fade_selected_clips();
@@ -6742,6 +6782,85 @@ impl AppData {
         }
     }
 
+    /// docs/plan_text_overlay.md §4 P6: 選択中 text clip の track 上で
+    /// `TextBuiltin(_)` lane を持つ全 field を `active_param_gestures` に
+    /// 登録 (= image PiP drag と同 idiom)。 lane が無い field は drag が
+    /// TextEvent.field を直接書くだけ (= lane override 無し時の単純経路)。
+    fn begin_text_pip_drag_recording(&mut self) {
+        use common::model::{AutomationTarget, TextBuiltinParam};
+        let Some(target_clip) = self.selected_clip else {
+            return;
+        };
+        let Some(track) = self.song.tracks.get(target_clip.track as usize) else {
+            return;
+        };
+        let track_id = track.id;
+        let fields = [
+            TextBuiltinParam::X,
+            TextBuiltinParam::Y,
+            TextBuiltinParam::W,
+            TextBuiltinParam::H,
+            TextBuiltinParam::Rotation,
+        ];
+        let mut seeded = false;
+        for field in fields {
+            let target = AutomationTarget::TextBuiltin(field);
+            let has_lane = track
+                .automation_lanes
+                .iter()
+                .any(|l| l.enabled && l.target == target);
+            if has_lane {
+                self.active_param_gestures.insert((track_id, target.clone()));
+                if matches!(
+                    self.recording_mode,
+                    common::model::RecordingMode::Latch
+                        | common::model::RecordingMode::Write
+                ) && self.is_playing
+                {
+                    self.latched_param_gestures.insert((track_id, target));
+                }
+                seeded = true;
+            }
+        }
+        if seeded {
+            self.sync_recording_lanes_with_audio();
+        }
+    }
+
+    /// docs/plan_text_overlay.md §4 P6: text PiP drag end で seed した
+    /// `TextBuiltin(_)` gesture を `active_param_gestures` から remove
+    /// (= image PiP drag end と同 idiom)。
+    fn end_text_pip_drag_recording(&mut self) {
+        use common::model::AutomationTarget;
+        let to_remove: Vec<(u32, AutomationTarget)> = self
+            .active_param_gestures
+            .iter()
+            .filter(|(_, t)| matches!(t, AutomationTarget::TextBuiltin(_)))
+            .cloned()
+            .collect();
+        let any = !to_remove.is_empty();
+        for key in to_remove {
+            self.active_param_gestures.remove(&key);
+            if self.recording_mode == common::model::RecordingMode::Touch {
+                self.recording_last_beat.remove(&key);
+            }
+        }
+        if any {
+            self.sync_recording_lanes_with_audio();
+        }
+    }
+
+    /// text PiP drag が active (= `TextBuiltin(_)` lane gesture を保持)
+    /// なら true。 停止中の drag-while-stopped auto-keyframe を image と
+    /// 同様に許可するため、 `record_automation_points_for_tick` の gate
+    /// で `image_pip_drag_active() || text_pip_drag_active()` の OR で
+    /// 使う。
+    fn text_pip_drag_active(&self) -> bool {
+        self.active_param_gestures
+            .iter()
+            .any(|(_, t)| matches!(t, common::model::AutomationTarget::TextBuiltin(_)))
+    }
+
     /// 選択中 image clip の track から `ImageBuiltin(field)` lane を
     /// 削除 (= override 解除)。 lane が見つからない場合は no-op + status
     /// 表示。 削除後は ImageEvent.field がふたたび effective。
@@ -8860,6 +8979,64 @@ impl AppData {
 
     fn set_clip_image_event_muted(&mut self, target: ClipRef, muted: bool) {
         self.mutate_image_events_in_clip(target, |e| e.muted = muted);
+    }
+
+    /// docs/plan_text_overlay.md §4 P6: image と同 idiom の text event
+    /// setter 群。 drag / inspector commit / lane override 経由のいずれも
+    /// このパスで TextEvent.field を直接書く。
+    fn mutate_text_events_in_clip<F>(&mut self, target: ClipRef, mut f: F) -> bool
+    where
+        F: FnMut(&mut common::model::TextEvent),
+    {
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return false;
+        };
+        if let Some(common::model::ClipContent::Text(t)) =
+            self.song.clip_contents.get_mut(&content_id)
+        {
+            if t.events.is_empty() {
+                return false;
+            }
+            for event in &mut t.events {
+                f(event);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn set_clip_text_event_x(&mut self, target: ClipRef, value: f32) {
+        let value = value.clamp(0.0, 1.0);
+        self.mutate_text_events_in_clip(target, |e| e.x = value);
+    }
+
+    fn set_clip_text_event_y(&mut self, target: ClipRef, value: f32) {
+        let value = value.clamp(0.0, 1.0);
+        self.mutate_text_events_in_clip(target, |e| e.y = value);
+    }
+
+    fn set_clip_text_event_w(&mut self, target: ClipRef, value: f32) {
+        let value = value.clamp(0.0, 1.0);
+        self.mutate_text_events_in_clip(target, |e| e.w = value);
+    }
+
+    fn set_clip_text_event_h(&mut self, target: ClipRef, value: f32) {
+        let value = value.clamp(0.0, 1.0);
+        self.mutate_text_events_in_clip(target, |e| e.h = value);
+    }
+
+    fn set_clip_text_event_rotation_radians(&mut self, target: ClipRef, value: f32) {
+        let two_pi = std::f32::consts::TAU;
+        let wrapped =
+            ((value + std::f32::consts::PI).rem_euclid(two_pi)) - std::f32::consts::PI;
+        self.mutate_text_events_in_clip(target, |e| e.rotation_radians = wrapped);
     }
 
     fn set_clip_image_event_fade_in_beats(&mut self, target: ClipRef, beats: f64) {
@@ -11084,12 +11261,12 @@ impl AppData {
     /// が見つからない gesture は silently skip (= MVP: lane / clip は事前に user
     /// が作成する。 Bitwig 流 auto-create は Step C follow-up)。
     fn record_automation_points_for_tick(&mut self, playhead_beat: f64) -> usize {
-        // recording_mode = Read でも image PiP drag 中だけは continue
+        // recording_mode = Read でも image / text PiP drag 中だけは continue
         // (= 「停止中の drag が AE/Premiere 流の auto-keyframe を打つ」
-        // 仕様。 audio gesture には影響しない、 drag が active な image
-        // lane だけが record される)。
-        let image_dragging = self.image_pip_drag_active();
-        if self.recording_mode == common::model::RecordingMode::Read && !image_dragging {
+        // 仕様。 audio gesture には影響しない、 drag が active な image /
+        // text lane だけが record される)。
+        let visual_dragging = self.image_pip_drag_active() || self.text_pip_drag_active();
+        if self.recording_mode == common::model::RecordingMode::Read && !visual_dragging {
             return 0;
         }
         // active ∪ latched (Touch mode は latched が常に空なので active のみ)。
@@ -11266,6 +11443,47 @@ impl AppData {
                     ImageBuiltinParam::H => event.h,
                     ImageBuiltinParam::Opacity => event.opacity,
                     ImageBuiltinParam::Rotation => event.rotation_radians,
+                }))
+            }
+            // Text PiP: 同 track の first text event の field 値 (image と同
+            // idiom)。 23 field 全部を返す (= color / shadow も lane に流す
+            // ため)。
+            common::model::AutomationTarget::TextBuiltin(field) => {
+                use common::model::TextBuiltinParam as T;
+                let track = self.song.tracks.iter().find(|t| t.id == track_id)?;
+                let event = track.clips.iter().find_map(|c| {
+                    self.song
+                        .clip_contents
+                        .get(&c.content_id)
+                        .and_then(|content| match content {
+                            ClipContent::Text(t) => t.events.first(),
+                            _ => None,
+                        })
+                })?;
+                Some(f64::from(match field {
+                    T::X => event.x,
+                    T::Y => event.y,
+                    T::W => event.w,
+                    T::H => event.h,
+                    T::Opacity => event.opacity,
+                    T::Rotation => event.rotation_radians,
+                    T::FontSize => event.font_size_px,
+                    T::FillR => event.fill_color[0],
+                    T::FillG => event.fill_color[1],
+                    T::FillB => event.fill_color[2],
+                    T::FillA => event.fill_color[3],
+                    T::OutlineR => event.outline_color[0],
+                    T::OutlineG => event.outline_color[1],
+                    T::OutlineB => event.outline_color[2],
+                    T::OutlineA => event.outline_color[3],
+                    T::OutlineWidth => event.outline_width_px,
+                    T::ShadowR => event.shadow_color[0],
+                    T::ShadowG => event.shadow_color[1],
+                    T::ShadowB => event.shadow_color[2],
+                    T::ShadowA => event.shadow_color[3],
+                    T::ShadowOffsetX => event.shadow_offset_px.0,
+                    T::ShadowOffsetY => event.shadow_offset_px.1,
+                    T::ShadowBlur => event.shadow_blur_px,
                 }))
             }
             _ => None,
