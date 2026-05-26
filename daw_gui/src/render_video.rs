@@ -1,24 +1,34 @@
-//! MP4 render via Windows Media Foundation (`docs/plan_video.md` P8).
+//! MP4 render via Windows Media Foundation (`docs/plan_video.md` P8,
+//! `docs/plan_text_overlay.md` P2).
 //!
-//! Iterates output frames at `Song.video_framerate`, composites every
-//! active `VideoEvent` at the corresponding playhead beat (same logic
-//! as `video_playback::active_sources_at`), CPU-blends layers into
-//! one RGBA buffer, converts to NV12, and writes through
-//! `IMFSinkWriter` to an on-disk H.264 mp4. When an `audio_wav_path`
-//! is provided, also opens it via `hound`, encodes PCM Float32 to AAC
-//! via the same sink writer, and muxes a single output mp4.
+//! Iterates output frames at `Song.video_framerate`, builds a
+//! `daw_ui_renderer::Scene` for each playhead by uploading the active
+//! video frame + image PiP layers as wgpu textured quads, asks the
+//! `OffscreenRenderer` to composite at project resolution, reads the
+//! RGBA back, converts to NV12, and writes through `IMFSinkWriter` to
+//! an on-disk H.264 mp4. When an `audio_wav_path` is provided, also
+//! opens it via `hound`, encodes PCM Float32 to AAC via the same sink
+//! writer, and muxes a single output mp4.
+//!
+//! `plan_text_overlay.md` P2 swapped the CPU `blit_layer` pipeline for
+//! the GPU OffscreenRenderer so:
+//! - preview + export use the exact same composite shader
+//! - image rotation (gui_01 #047) renders identically in both paths
+//! - text overlays (P3) plug into the same `Scene::push_text` path
 //!
 //! MVP scope (simplest viable):
 //! - H.264 video at project resolution / framerate, ~5 Mbit/s
 //! - AAC stereo audio at 192 Kbit/s (when wav supplied)
-//! - Synchronous render on the GUI thread (= UI hangs for the
+//! - Synchronous render on the caller thread (= UI hangs for the
 //!   duration). Real-time hiccup acceptable for offline render.
-//! - Linear / s-curve alpha blend identical to preview composite.
+//! - wgpu sRGB linear blend (matches preview).
 
+use std::collections::HashMap;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use common::model::{Song, VideoSourceId, VideoSourcePath};
+use common::model::{ImageSourceId, Song, VideoSourceId, VideoSourcePath};
+use daw_ui_renderer::{OffscreenRenderer, Rect, Scene, TextureHandle, TexturedQuad};
 use windows::Win32::Media::MediaFoundation::{
     IMFSinkWriter, MFAudioFormat_AAC, MFAudioFormat_Float, MFCreateMediaType,
     MFCreateMemoryBuffer, MFCreateSample, MFCreateSinkWriterFromURL, MFMediaType_Audio,
@@ -30,7 +40,7 @@ use windows::Win32::Media::MediaFoundation::{
 };
 use windows::core::PCWSTR;
 
-use crate::video_playback::VideoPlaybackEngine;
+use crate::video_playback::{DecodedFrame, VideoPlaybackEngine};
 
 /// Render configuration. All fields are derived from `Song` except
 /// `output_path` / `audio_wav_path` which the caller supplies from
@@ -151,26 +161,23 @@ pub fn render_mp4(cfg: &RenderConfig) -> Result<RenderStats, String> {
     unsafe { writer.BeginWriting() }
         .map_err(|e| format!("BeginWriting: {e}"))?;
 
-    // Frame loop.
-    // docs/plan_video_perf.md P3: export composites on CPU, so the
-    // zero-copy `Shared` variant is not useful here — force the
-    // engine to return `Bgra` bytes via the CPU-only constructor.
-    let mut engine = VideoPlaybackEngine::new_cpu_only();
-    let total_seconds = beat_to_seconds(cfg.song.length_beats, cfg.song.bpm);
-    let total_frames = (total_seconds * f64::from(framerate)).ceil() as u64;
-    let frame_duration_100ns = (10_000_000.0_f64 / f64::from(framerate)).round() as i64;
-    let mut composite = vec![0u8; out_w as usize * out_h as usize * 4];
-    let mut nv12 = vec![0u8; out_w as usize * out_h as usize * 3 / 2];
+    // OffscreenRenderer: own its wgpu device + pipelines independent
+    // from the main daw_gui window. Canvas is exactly project
+    // resolution so video / image layer rects map 1:1 to output px.
+    let mut offscreen = OffscreenRenderer::new(out_w, out_h)
+        .map_err(|e| format!("OffscreenRenderer::new({out_w}x{out_h}): {e:?}"))?;
+    // Per-source GPU texture caches. Video texture is uploaded fresh
+    // each frame (= BGRA bytes from the CPU decoder); image texture is
+    // uploaded once at startup and reused for every frame the layer is
+    // visible.
+    let mut video_textures: HashMap<VideoSourceId, (TextureHandle, u32, u32)> = HashMap::new();
+    let mut image_textures: HashMap<ImageSourceId, (TextureHandle, u32, u32)> = HashMap::new();
 
     // docs/plan_image_overlay.md §P3: decode each project image once
-    // up-front (= keyed by ImageSourceId), keep RGBA8 bytes in memory
-    // for the duration of the export, hand the cache to
-    // `render_frame_composite`. Skipping per-frame decode is fine —
-    // the typical MV has < 10 images and each is < 4 MB at 1080p.
-    let mut image_cache: std::collections::HashMap<
-        common::model::ImageSourceId,
-        (u32, u32, Vec<u8>),
-    > = std::collections::HashMap::new();
+    // up-front (= keyed by ImageSourceId), upload to a persistent
+    // wgpu texture, then push a textured-quad per frame the image is
+    // visible. The typical MV has < 10 images, each < 4 MB at 1080p,
+    // so keeping all of them resident in GPU memory is fine.
     for (image_source_id, source) in &cfg.song.image_sources {
         let abs = match &source.path {
             common::model::ImageSourcePath::Absolute(p) => p.clone(),
@@ -190,8 +197,9 @@ pub fn render_mp4(cfg: &RenderConfig) -> Result<RenderStats, String> {
             Ok(dynamic) => {
                 let rgba = dynamic.into_rgba8();
                 let (w, h) = rgba.dimensions();
-                image_cache
-                    .insert(*image_source_id, (w, h, rgba.into_raw()));
+                let handle = offscreen.create_texture(w, h);
+                offscreen.upload_texture_rgba(handle, rgba.as_raw());
+                image_textures.insert(*image_source_id, (handle, w, h));
             }
             Err(e) => tracing::warn!(
                 image_source_id,
@@ -202,20 +210,40 @@ pub fn render_mp4(cfg: &RenderConfig) -> Result<RenderStats, String> {
         }
     }
 
+    // docs/plan_video_perf.md P3: export composites on the GPU but
+    // uses the CPU video decoder (= the shared-D3D11 zero-copy path
+    // belongs to the preview window's wgpu device, not ours).
+    let mut engine = VideoPlaybackEngine::new_cpu_only();
+    let total_seconds = beat_to_seconds(cfg.song.length_beats, cfg.song.bpm);
+    let total_frames = (total_seconds * f64::from(framerate)).ceil() as u64;
+    let frame_duration_100ns = (10_000_000.0_f64 / f64::from(framerate)).round() as i64;
+    let mut nv12 = vec![0u8; out_w as usize * out_h as usize * 3 / 2];
+    let mut scene = Scene::new();
+    // Opaque black backdrop — matches the pre-P2 CPU path (= the canvas
+    // was cleared to (0,0,0,255) before any blit). Letterboxed video
+    // layers leave bars; uncovered regions read as black.
+    scene.clear_color = wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+
     for frame_index in 0..total_frames {
         let frame_seconds = frame_index as f64 / f64::from(framerate);
         let playhead_beat = seconds_to_beat(frame_seconds, cfg.song.bpm);
-        render_frame_composite(
+        scene.primitives.clear();
+        build_frame_scene(
             cfg.song,
             cfg.project_dir,
             &mut engine,
-            &image_cache,
+            &mut offscreen,
+            &mut video_textures,
+            &image_textures,
             playhead_beat,
             out_w,
             out_h,
-            &mut composite,
+            &mut scene,
         );
-        rgba_to_nv12(&composite, out_w as usize, out_h as usize, &mut nv12);
+        let rgba = offscreen
+            .render_to_rgba(&scene)
+            .map_err(|e| format!("offscreen render frame {frame_index}: {e:?}"))?;
+        rgba_to_nv12(&rgba, out_w as usize, out_h as usize, &mut nv12);
         write_video_sample(
             &writer,
             video_stream,
@@ -232,6 +260,15 @@ pub fn render_mp4(cfg: &RenderConfig) -> Result<RenderStats, String> {
 
     unsafe { writer.Finalize() }
         .map_err(|e| format!("Finalize: {e}"))?;
+
+    // Release every cached GPU texture before `offscreen` drops, so
+    // the wgpu device shutdown sees a clean texture store.
+    for (_, (handle, _, _)) in video_textures.drain() {
+        offscreen.destroy_texture(handle);
+    }
+    for (_, (handle, _, _)) in image_textures.drain() {
+        offscreen.destroy_texture(handle);
+    }
 
     Ok(RenderStats {
         frames_written: total_frames,
@@ -416,32 +453,27 @@ fn set_pixel_aspect_ratio(
         .map_err(|e| format!("PIXEL_ASPECT_RATIO: {e}"))
 }
 
-/// Build a composite RGBA buffer for the given playhead. Layers are
-/// alpha-blended bottom-up by per-layer alpha. Each source frame is
-/// nearest-neighbor scaled to the output canvas — fast but visually
-/// chunky for big resolution mismatches. P9+ can replace with a wgpu
-/// pass that uses the existing preview composite shader.
+/// Build the `Scene` for one playhead beat by walking active video +
+/// image layers and pushing one textured-quad per layer. Bottom-up
+/// order (= `active_*_sources_at` returns `z_index` ascending) drives
+/// gui_01's call-order interleave so the top track wins at
+/// `alpha = 1.0` and crossfades blend at intermediate alphas. Image
+/// rotation is preserved through `TexturedQuad.rotation_radians`
+/// (gui_01 #047) so the export now matches preview rotation byte-for-
+/// byte.
 #[allow(clippy::too_many_arguments)]
-fn render_frame_composite(
+fn build_frame_scene(
     song: &Song,
     project_dir: Option<&Path>,
     engine: &mut VideoPlaybackEngine,
-    image_cache: &std::collections::HashMap<
-        common::model::ImageSourceId,
-        (u32, u32, Vec<u8>),
-    >,
+    offscreen: &mut OffscreenRenderer,
+    video_textures: &mut HashMap<VideoSourceId, (TextureHandle, u32, u32)>,
+    image_textures: &HashMap<ImageSourceId, (TextureHandle, u32, u32)>,
     playhead_beat: f64,
     out_w: u32,
     out_h: u32,
-    dst: &mut [u8],
+    scene: &mut Scene,
 ) {
-    // Clear to opaque black (= letterbox / no-clip background).
-    for px in dst.chunks_exact_mut(4) {
-        px[0] = 0;
-        px[1] = 0;
-        px[2] = 0;
-        px[3] = 255;
-    }
     let video_layers = VideoPlaybackEngine::active_sources_at(song, playhead_beat);
     for layer in video_layers {
         let Some(path) =
@@ -449,74 +481,79 @@ fn render_frame_composite(
         else {
             continue;
         };
-        // Export uses `VideoPlaybackEngine::new_cpu_only()` so the HW
-        // ring (= `slot_idx` routed to a `SharedPool` slot) is unused;
-        // the engine returns `DecodedFrame::Bgra` regardless and the
-        // slot index is ignored. Pass `0` as a placeholder.
+        // Export uses `VideoPlaybackEngine::new_cpu_only()`, so the
+        // `slot_idx` (HW ring index) is unused — pass 0 as a stable
+        // placeholder. The engine returns `DecodedFrame::Bgra`.
         let Ok(frame) =
             engine.decode_at(layer.video_source_id, &path, layer.source_micros, 0)
         else {
             continue;
         };
-        // docs/plan_video_perf.md P3: export uses the CPU-only engine
-        // so we always get `DecodedFrame::Bgra` (no zero-copy / shared
-        // texture path). Swap BGRA → RGBA here; `rgba_to_nv12`
-        // downstream expects RGBA. Export is not real-time, the
-        // per-frame swap is negligible.
-        let crate::video_playback::DecodedFrame::Bgra { bgra, width, height } = &frame else {
-            // Defensive: if a Shared variant ever leaks here we just
-            // skip the layer rather than corrupting the canvas.
+        let DecodedFrame::Bgra { bgra, width, height } = &frame else {
+            // Defensive: if a Shared variant ever leaks from the
+            // CPU-only engine we skip the layer rather than try to
+            // import the D3D11 handle into our offscreen wgpu device.
             tracing::warn!(
                 video_source_id = layer.video_source_id,
                 "export decoder returned non-CPU frame variant; layer skipped"
             );
             continue;
         };
-        let rgba = crate::video_playback::bgra_to_rgba(bgra);
-        let dst_rect = aspect_fit(out_w, out_h, *width, *height);
-        blit_layer(
-            dst,
-            out_w as usize,
-            out_h as usize,
-            &rgba,
-            *width as usize,
-            *height as usize,
-            dst_rect,
-            layer.alpha,
-        );
+        // Get-or-create the per-source BGRA texture, recreating when
+        // the source dimensions change (= shouldn't, but defensive).
+        let recreate = match video_textures.get(&layer.video_source_id) {
+            Some((_, w, h)) => *w != *width || *h != *height,
+            None => true,
+        };
+        if recreate {
+            if let Some((old, _, _)) = video_textures.remove(&layer.video_source_id) {
+                offscreen.destroy_texture(old);
+            }
+            let handle = offscreen.create_texture_bgra(*width, *height);
+            video_textures.insert(layer.video_source_id, (handle, *width, *height));
+        }
+        let texture = video_textures
+            .get(&layer.video_source_id)
+            .map(|(h, _, _)| *h)
+            .expect("just inserted");
+        offscreen.upload_texture_bgra(texture, bgra);
+        let (rx, ry, rw, rh) = aspect_fit(out_w, out_h, *width, *height);
+        scene.push_textured_quad(TexturedQuad {
+            rect: Rect::new(rx as f32, ry as f32, rw as f32, rh as f32),
+            texture,
+            alpha: layer.alpha,
+            uv_min: (0.0, 0.0),
+            uv_max: (1.0, 1.0),
+            clip_rect: None,
+            rotation_radians: 0.0,
+        });
     }
 
-    // docs/plan_image_overlay.md §P3: image overlay layers drawn on
-    // top of any video layers (= MV ロゴ / ジャケット の上乗せ ユースケース).
-    // `active_image_sources_at` returns frames bottom-up by `z_index`;
-    // each frame's normalized PiP rect is converted to canvas pixels
-    // before blit.
+    // docs/plan_image_overlay.md §P3: image overlay layers on top of
+    // video. Normalized [0, 1] PiP rect maps to canvas pixels (= the
+    // canvas IS the project resolution, so `x * out_w` is exact).
     let image_layers =
         crate::image_compose::active_image_sources_at(song, playhead_beat);
     for layer in image_layers {
-        let Some((src_w, src_h, src_rgba)) = image_cache.get(&layer.image_source_id)
-        else {
-            continue; // not decoded (= missing file / decode error)
+        let Some((texture, _, _)) = image_textures.get(&layer.image_source_id) else {
+            continue; // not decoded / failed import
         };
-        // Normalized [0, 1] PiP → canvas pixels. Clamp to canvas
-        // bounds defensively; `blit_layer` itself also clips.
-        let rx = (layer.x * out_w as f32).round() as i32;
-        let ry = (layer.y * out_h as f32).round() as i32;
-        let rw = (layer.w * out_w as f32).round().max(0.0) as u32;
-        let rh = (layer.h * out_h as f32).round().max(0.0) as u32;
-        if rw == 0 || rh == 0 {
+        let rx = layer.x * out_w as f32;
+        let ry = layer.y * out_h as f32;
+        let rw = (layer.w * out_w as f32).max(0.0);
+        let rh = (layer.h * out_h as f32).max(0.0);
+        if rw == 0.0 || rh == 0.0 {
             continue;
         }
-        blit_layer(
-            dst,
-            out_w as usize,
-            out_h as usize,
-            src_rgba,
-            *src_w as usize,
-            *src_h as usize,
-            (rx, ry, rw, rh),
-            layer.alpha,
-        );
+        scene.push_textured_quad(TexturedQuad {
+            rect: Rect::new(rx, ry, rw, rh),
+            texture: *texture,
+            alpha: layer.alpha,
+            uv_min: (0.0, 0.0),
+            uv_max: (1.0, 1.0),
+            clip_rect: None,
+            rotation_radians: layer.rotation_radians,
+        });
     }
 }
 
@@ -548,60 +585,6 @@ fn aspect_fit(dst_w: u32, dst_h: u32, src_w: u32, src_h: u32) -> (i32, i32, u32,
         let w = (dst_h as f64 * src_aspect).round() as u32;
         let x = ((dst_w - w.min(dst_w)) / 2) as i32;
         (x, 0, w.min(dst_w), dst_h)
-    }
-}
-
-/// Alpha-blend a single source layer onto `dst`. Nearest-neighbor
-/// scale (no interpolation) — fast and good enough for MVP. The
-/// output canvas is `dst_w x dst_h`, the layer lands at the
-/// `(rx, ry, rw, rh)` rect with the given `alpha`.
-#[allow(clippy::too_many_arguments)]
-fn blit_layer(
-    dst: &mut [u8],
-    dst_w: usize,
-    _dst_h: usize,
-    src: &[u8],
-    src_w: usize,
-    src_h: usize,
-    rect: (i32, i32, u32, u32),
-    alpha: f32,
-) {
-    let (rx, ry, rw, rh) = rect;
-    if rw == 0 || rh == 0 {
-        return;
-    }
-    let alpha = alpha.clamp(0.0, 1.0);
-    let one_minus = 1.0 - alpha;
-    let rw_us = rw as usize;
-    let rh_us = rh as usize;
-    for dy in 0..rh_us {
-        let dst_y = ry + dy as i32;
-        if dst_y < 0 {
-            continue;
-        }
-        let sy = (dy as u64 * src_h as u64 / rh as u64).min(src_h as u64 - 1) as usize;
-        for dx in 0..rw_us {
-            let dst_x = rx + dx as i32;
-            if dst_x < 0 {
-                continue;
-            }
-            let sx = (dx as u64 * src_w as u64 / rw as u64).min(src_w as u64 - 1) as usize;
-            let s_idx = (sy * src_w + sx) * 4;
-            let d_idx = (dst_y as usize * dst_w + dst_x as usize) * 4;
-            if d_idx + 4 > dst.len() {
-                continue;
-            }
-            let sr = src[s_idx] as f32;
-            let sg = src[s_idx + 1] as f32;
-            let sb = src[s_idx + 2] as f32;
-            let dr = dst[d_idx] as f32;
-            let dg = dst[d_idx + 1] as f32;
-            let db = dst[d_idx + 2] as f32;
-            dst[d_idx] = (sr * alpha + dr * one_minus).clamp(0.0, 255.0) as u8;
-            dst[d_idx + 1] = (sg * alpha + dg * one_minus).clamp(0.0, 255.0) as u8;
-            dst[d_idx + 2] = (sb * alpha + db * one_minus).clamp(0.0, 255.0) as u8;
-            dst[d_idx + 3] = 255;
-        }
     }
 }
 
