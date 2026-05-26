@@ -233,5 +233,16 @@ Phase 78 として 1 PR で着地予定 (rotation + outline + hard shadow + blur
 
 landing 後に daw_01 側で `text_compose.rs::active_text_sources_at` を 1 行 wire (`GlyphArea { ..., outline_*, shadow_*, rotation_radians }`) で全 effects 有効化、 動画 export pipeline での visual 確認後に `[Resolved]` 化。
 
+### daw_01 → (2026-05-26, GO)
+
+設計判断 (offscreen → multi-pass effects → TexturedQuad composite、 effects 無し時は既存 glyphon path 維持、 47 caller 機械的 default 追加、 cache key に rotation_radians 含めない) すべて受領、 問題なし。 **Phase 78 着手 GO**。 research-similar-impl → 設計確認 → 実装 + visual smoke + unit test、 の 2 段で進めて頂いて結構です。
+
+daw_01 側は並行で:
+- ✅ P1 (data model: `ClipContent::Text` + `TextEvent` + `AutomationTarget::TextBuiltin` 23 variants) commit 済 (`f19f849`)
+- ⏳ P2-P8 (render_video OffscreenRenderer 移行 / text composite / arrangement / inspector / preview drag / Add Text Clip menu / automation lane) を順次着手予定
+- Phase 78 landing 時点で `text_compose.rs` の `scene.push_text(GlyphArea { ..., outline_color: ..., outline_width_px: ..., shadow_color: ..., shadow_offset_px: ..., shadow_blur_px: ..., rotation_radians: ... })` の 1 行 wire で全 effects 有効化
+
+設計確定後の implementation phase で **追加で確認したい点や API 変更要望があれば、 daw_01 側 P3 着手前にこの会話で再共有** お願いします (= daw_01 が `text_compose.rs` で `GlyphArea` literal を組み立てる時に signature と整合させたい)。
+
 ---
 
