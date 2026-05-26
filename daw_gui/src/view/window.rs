@@ -27,6 +27,20 @@ impl DawGuiWindow {
     pub fn inner(&self) -> &Arc<Window> {
         &self.inner
     }
+
+    /// Windows 上で `HWND` を `isize` として返す (winit
+    /// `WindowAttributesExtWindows::with_owner_window` 引数用)。 preview
+    /// window を main window の owned-window として登録するための取得経路。
+    /// raw-window-handle が Win32 variant でなければ `None`。
+    #[cfg(windows)]
+    pub fn hwnd_isize(&self) -> Option<isize> {
+        use raw_window_handle::RawWindowHandle;
+        let handle = self.inner.window_handle().ok()?;
+        match handle.as_raw() {
+            RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+            _ => None,
+        }
+    }
 }
 
 impl HasWindowHandle for DawGuiWindow {

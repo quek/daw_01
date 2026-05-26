@@ -119,11 +119,26 @@ impl PreviewWindowState {
     pub fn create(
         event_loop: &ActiveEventLoop,
         initial_size: (u32, u32),
+        owner_hwnd: Option<isize>,
     ) -> Result<Self, String> {
         let (w, h) = scale_to_fit_on_screen(initial_size);
         let attrs = WindowAttributes::default()
             .with_title("daw_01 — Video Preview")
             .with_inner_size(LogicalSize::new(w, h));
+        // Windows: owner window を設定すると preview は main より常に前面、
+        // main 最小化で preview も最小化、 タスクバーには出ない (= MV
+        // プレビューを別ウィンドウで常時見えるようにする UX)。 winit の
+        // `with_owner_window` は `isize` (= HWND alias) を直接受ける。
+        #[cfg(windows)]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            match owner_hwnd {
+                Some(h) if h != 0 => attrs.with_owner_window(h),
+                _ => attrs,
+            }
+        };
+        #[cfg(not(windows))]
+        let _ = owner_hwnd;
         let window = event_loop
             .create_window(attrs)
             .map_err(|e| format!("create preview window: {e}"))?;

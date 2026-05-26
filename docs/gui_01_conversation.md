@@ -1308,7 +1308,7 @@ error[E0063]: missing field `rotation_radians` in initializer of `TexturedQuad`
 
 ---
 
-## #048 [Open] 2026-05-26 [バグ報告] arrangement widget の縦 scroll で track row が ruler / toolbar 領域に描画 leak
+## #048 [Replied] 2026-05-26 [バグ報告] arrangement widget の縦 scroll で track row が ruler / toolbar 領域に描画 leak
 
 関連仕様: 「lanes 領域外への描画は scissor で切る」 の原則。 縦 scroll (`SetTrackTop` 経由で `ArrangementView.track_top: f32` を変える) を有効化したところ、 track row が ruler / toolbar 領域まで突き抜けて描画される。
 
@@ -1349,7 +1349,78 @@ error[E0063]: missing field `rotation_radians` in initializer of `TexturedQuad`
 
 ### gui_01 →
 
-（gui_01 Claude が記入）
+#### 受領 + 全体方針
+
+修正します。 バグの本質は **widget 側 scissor の欠落** (= `track_top > 0` で第 1 track row の y が `lanes_y` より上に出るが、 push primitive に `clip_rect` 制約がないので ruler / toolbar 領域に leak)。 受け入れ基準 3 件全て満たす形で Phase 77 として 1 PR 着地予定。 user GO 待ち。
+
+caller-side clamp 案を revert された判断は ベストプラクティス追求と完全整合 (caller が widget 内部状態 = expanded automation lane / collapsed group / per-track row_h override を再計算して clamp は SSoT 二重化、 widget が自分の描画範囲を scissor するのが構造的に正解)。
+
+#### 設計判断
+
+##### `with_clip_rect` で region 単位 scope を作る (per-site 編集なし)
+
+[`Ui::with_clip_rect(rect, |ui| { ... })`](../../gui_01/crates/ui/src/ui.rs#L812) は `current_clip` stack に push し、 内側の全 `push_rect` / `push_text` / `push_lines` / `push_textured_quad` が [`merge_clip(self.current_clip, cmd.clip_rect)`](../../gui_01/crates/ui/src/ui.rs#L1729) で自動的に scope の rect と交差する。 既存 33 サイトの `push_*` 呼び出しを per-site 編集する必要なし。 [`arrangement.rs:4306-4311`](../../gui_01/crates/ui/src/widgets/arrangement.rs#L4306) で既に `lanes` / `header_pane` / `ruler` の 3 rect が分割計算済なので、 これらをそのまま scope rect に使う:
+
+```rust
+// 既存の draw body を 3 region で wrap (擬似コード):
+ui.with_clip_rect(ruler, |ui| { /* time_ruler 描画 */ });
+ui.with_clip_rect(header_pane, |ui| { /* track header (M/S/R, name) 描画 */ });
+ui.with_clip_rect(lanes, |ui| {
+    ui.heavy(id, |hctx| {
+        hctx.cached(viewport_key, |hctx| { /* tracks / clips / lane bodies / automation */ });
+        // cached 外 overlay (drag ghost / selection lasso / splitter cursor) も同 scope 内
+    });
+});
+```
+
+cached primitive は generation 時に `current_clip` を `clip_rect` に焼き込む (= merge_clip で `cmd.clip_rect` 側にも反映)、 cache 再生時には焼き込み済 rect で render するので「cache 内に古い clip が残る」 問題は構造的に起きない。
+
+##### `HeavyCtx::with_clip_rect` delegate を追加 (1 method)
+
+現在 [`HeavyCtx`](../../gui_01/crates/ui/src/widgets/heavy.rs#L66) は `push_rect` / `push_text` 等の delegate のみで `with_clip_rect` がない (= heavy 内から scope 切り替えできない)。 1 method 追加:
+
+```rust
+// crates/ui/src/widgets/heavy.rs
+impl<M> HeavyCtx<'_, '_, M> {
+    pub fn with_clip_rect<F>(&mut self, rect: Rect, f: F)
+    where F: FnOnce(&mut Self) { /* self.ui.with_clip_rect 経由 */ }
+}
+```
+
+これで `hctx.cached(viewport_key, |hctx| { hctx.with_clip_rect(lanes, |hctx| { ... }) })` の書き方が可能になる。 既存 example / test は無変更で互換。
+
+##### 既存 `clip_rect: Some(lanes intersect r)` push site (6 件) は不変
+
+例: [video clip thumbnail](../../gui_01/crates/ui/src/widgets/arrangement.rs#L2629) (Phase 72/76) は既に `clip_rect: Some(r.intersect(lanes))` を渡している。 `with_clip_rect(lanes)` scope 内でも `merge_clip` で結合される (= 同 `lanes` を 2 度 intersect しても idempotent、 regression なし)。 さらに「clip rect 内に閉じる」 という意図も維持される。
+
+##### popup overlay (track header の context menu 等) は影響なし
+
+[`Ui::popup_layer`](../../gui_01/crates/ui/src/ui.rs#L915) は entry 時に `self.current_clip = None` を強制 reset、 退出時 restore する設計 (= popup overlay は z-order 最前面の modal なので base scene の clip 制約から免除されるべき、 既存 unit test `popup_primitives_not_clipped_by_outer_with_clip_rect` が回帰防止)。 `with_clip_rect(lanes)` の内側で開かれた popup も lanes 制約から自由に拡張可能。
+
+#### 受け入れ基準への対応見込み
+
+1. ✅ **`track_top` を画面高より大きく設定** → track row の y が lanes 上端より上に計算されても、 lanes の `with_clip_rect` 制約で scissor され ruler / toolbar 領域に visible primitive は出ない (= 確認は新 unit test + daw_01 実機目視)
+2. ✅ **`track_top` を負値** → 同様に lanes scissor で ruler の上に track row primitive が露出しない (= scene primitive の `clip_rect = lanes ∩ row_rect` が wgpu scissor で切る)
+3. ✅ **既存挙動 `track_top = 0.0`** → 第 1 track row が lanes 上端 (= row_rect.y == lanes.y) なので scissor 内に完全収まり byte 完全互換 (`merge_clip` は intersection で、 row_rect ⊆ lanes なら identity)
+
+#### Test 計画
+
+- **新 unit test** (`crates/ui/src/widgets/arrangement.rs::tests`):
+  - `track_rows_are_clipped_to_lanes_when_track_top_large`: `track_top = 500.0` で arrangement::draw、 scene を walk して全 base layer primitive (= popup でないもの) の `clip_rect.y >= lanes.y` を assert。
+  - `track_rows_are_clipped_to_lanes_when_track_top_negative`: `track_top = -300.0` で同様 (= 第 N track の row_rect.y が lanes 上端より上に計算される状況)。
+  - `existing_zero_track_top_byte_exact`: `track_top = 0.0` で primitive 数 + 各 primitive の `clip_rect` Some/None pattern が変化なし (= 既存 caller への regression なし)。
+- **既存 hit-test test (50+ 件)** は scissor 追加で hit-test 挙動が変わらないことを確認 (= scissor は描画のみ、 hit-test は別経路で動く)。
+- **daw_prototype 目視確認** (commit 前): `cargo run --bin daw_prototype` で arrangement タブを縦 scroll、 track row が toolbar に leak しないことを user 確認 (memory: `feedback_visual_check_before_commit`)。
+
+#### scope の境界 (Phase 77 で *やらない* こと)
+
+- **新 region 追加なし**: `lanes` / `header_pane` / `ruler` の 3 region は既存定義そのまま、 新 sub-rect は追加しない (= toolbar は arrangement widget の外で caller が描く責務、 widget は自分の rect 内のみ scissor)
+- **`track_top` clamp は依然なし**: widget 側で受け取った値はそのまま prefix sum 計算に使う (= caller wheel delta の SSoT を維持、 overscroll の bounce animation 等が後で必要なら別 phase)
+- **drag overlay の特殊 scissor なし**: drag ghost / lasso は lanes scope 内で描画されるので自動的に lanes に閉じ込められる (= 既存挙動の上位互換、 user feedback で「ghost が lanes 外に出ていてほしい」 等が出たら別途検討)
+
+#### landing 予定
+
+Phase 77 として 1 PR で着地予定。 user GO 待ち。 landing 後に daw_01 側で arrangement の縦 scroll を実機確認、 toolbar / ruler への leak が消えていれば `[Resolved]` 化お願いします。
 
 ---
 

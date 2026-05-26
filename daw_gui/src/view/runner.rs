@@ -829,9 +829,18 @@ impl Runner {
         match (visible, state.preview.is_some()) {
             (true, false) => {
                 let initial_size = state.app.song.video_resolution;
+                // main window の HWND を owner として渡して preview を
+                // main の owned-window に。 Win32 仕様で owned は owner
+                // の常に前面、 owner 最小化で owned も最小化、 タスクバー
+                // にも乗らない (= MV プレビュー用の従属ウィンドウ動作)。
+                #[cfg(windows)]
+                let owner_hwnd = state.window.hwnd_isize();
+                #[cfg(not(windows))]
+                let owner_hwnd: Option<isize> = None;
                 match crate::view::preview_window::PreviewWindowState::create(
                     event_loop,
                     initial_size,
+                    owner_hwnd,
                 ) {
                     Ok(p) => {
                         // Immediately request a redraw so the placeholder
