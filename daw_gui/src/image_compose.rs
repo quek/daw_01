@@ -78,6 +78,11 @@ pub fn active_image_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveIma
         if track.kind != TrackKind::Video {
             continue;
         }
+        // track.muted (= mixer M トグル) で image overlay も無効化。
+        // preview / render の両方で track 単位 SSoT として扱う。
+        if track.muted {
+            continue;
+        }
         let mut track_emitted = false;
         for clip in &track.clips {
             let clip_start = clip.start_beat;

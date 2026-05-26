@@ -371,6 +371,12 @@ impl VideoPlaybackEngine {
             if track.kind != TrackKind::Video {
                 continue;
             }
+            // track.muted な video track は preview / render の両方で
+            // skip (= 音声と同 idiom)。 visible 切替などのフラグを別途
+            // 設けず、 mixer の M トグルを一意の SSoT とする。
+            if track.muted {
+                continue;
+            }
             let mut track_emitted = false;
             for clip in &track.clips {
                 let clip_start = clip.start_beat;
@@ -441,6 +447,10 @@ impl VideoPlaybackEngine {
         }
         for track in &song.tracks {
             if track.kind != TrackKind::Video {
+                continue;
+            }
+            // track.muted は preview / render と同 idiom で SSoT として扱う。
+            if track.muted {
                 continue;
             }
             for clip in &track.clips {

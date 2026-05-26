@@ -610,6 +610,11 @@ pub struct AppData {
     pub audio_editor_view_len_beats: f64,
     pub arrange_zoom_x: f32,
     pub arrange_scroll_beat: f32,
+    /// arrangement の縦 scroll offset (px、 smooth)。 `0.0` で first track
+    /// が lanes 上端、 wheel scroll で増減。 widget 側で `SetTrackTop` を
+    /// 発火するので handler がここに書き込む。 overscroll (lanes 領域
+    /// 外への描画) の scissor は widget 側 (gui_01 #048) の責務。
+    pub arrange_track_top: f32,
     /// arrangement の 1 track row 高さ (px)。Alt+wheel で 16..96 に縦ズーム。
     /// default は `ARRANGE_TRACK_HEIGHT`。
     pub arrange_track_row_h: f32,
@@ -943,6 +948,7 @@ impl AppData {
             audio_editor_view_len_beats: 0.0,
             arrange_zoom_x: ARRANGE_PX_PER_BEAT,
             arrange_scroll_beat: 0.0,
+            arrange_track_top: 0.0,
             arrange_track_row_h: ARRANGE_TRACK_HEIGHT,
             pianoroll_zoom_x: 64.0,
             pianoroll_zoom_y: 14.0,
@@ -4280,6 +4286,83 @@ impl AppData {
         tracing::info!(decoded, skipped, failed, "decoded audio sources into cache");
     }
 
+    /// 既存 .daw を開いたとき / autosave から復元したとき、 song の
+    /// `image_sources` を walk して各 PNG/JPEG/WebP/etc. を再 decode
+    /// し、 `image_source_bgra` に BGRA8 を staging する。 `pending_image
+    /// _uploads` にも push されるので runner が次フレームで GPU texture
+    /// に upload する。 import 経路 (`action_import_image`) と同 idiom で、
+    /// preview composite (`image_compose::active_image_sources_at`) が
+    /// 機能する前提を満たす。
+    fn decode_image_sources_into_cache(&mut self) {
+        use common::model::ImageSourcePath;
+        let project_dir: Option<PathBuf> = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.parent().map(Path::to_path_buf));
+        let mut decoded = 0usize;
+        let mut skipped = 0usize;
+        let mut failed = 0usize;
+        // 既に staging 済みの id はスキップ (= idempotent)。
+        let source_ids: Vec<common::model::ImageSourceId> =
+            self.song.image_sources.keys().copied().collect();
+        for source_id in source_ids {
+            if self.image_source_bgra.contains_key(&source_id) {
+                continue;
+            }
+            let Some(source) = self.song.image_sources.get(&source_id) else {
+                continue;
+            };
+            let abs: PathBuf = match &source.path {
+                ImageSourcePath::Absolute(abs) => abs.clone(),
+                ImageSourcePath::ProjectRelative(rel) => {
+                    let Some(dir) = project_dir.as_ref() else {
+                        tracing::warn!(
+                            source_id,
+                            ?rel,
+                            "decode_image_sources_into_cache: ProjectRelative but project_dir unset"
+                        );
+                        skipped += 1;
+                        continue;
+                    };
+                    dir.join(rel)
+                }
+            };
+            match image::open(&abs) {
+                Ok(dynamic) => {
+                    let rgba = dynamic.into_rgba8();
+                    let (w, h) = rgba.dimensions();
+                    if w == 0 || h == 0 {
+                        tracing::warn!(
+                            source_id,
+                            path = %abs.display(),
+                            "decode_image_sources_into_cache: zero-sized image"
+                        );
+                        failed += 1;
+                        continue;
+                    }
+                    let mut bytes = rgba.into_raw();
+                    for px in bytes.chunks_exact_mut(4) {
+                        px.swap(0, 2); // RGBA → BGRA
+                    }
+                    self.image_source_bgra
+                        .insert(source_id, (w, h, std::sync::Arc::new(bytes)));
+                    self.pending_image_uploads.push(source_id);
+                    decoded += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        source_id,
+                        path = %abs.display(),
+                        error = %e,
+                        "decode_image_sources_into_cache: decode failed"
+                    );
+                    failed += 1;
+                }
+            }
+        }
+        tracing::info!(decoded, skipped, failed, "decoded image sources into cache");
+    }
+
     fn action_open_path(&mut self, path: PathBuf) {
         // Recursive open を防ぐ: autosave file を直接開いた場合は弾く
         // (RecoveryRestore で開くべきもの)。
@@ -4306,6 +4389,9 @@ impl AppData {
                 // なっていた。 user 報告「やっぱり波形が表示されないことが
                 // あります」 の root cause。
                 self.decode_audio_sources_into_cache();
+                // 同 idiom で image sources も BGRA decode + GPU upload
+                // staging。 これが無いと image preview が黒帯のまま。
+                self.decode_image_sources_into_cache();
                 self.selected_track_ids.clear();
                 self.collapsed_groups.clear();
                 self.selected_clip = None;
@@ -4461,6 +4547,8 @@ impl AppData {
         // 呼ぶ。 `file_path` を先にセットしてから呼ぶことで ProjectRelative
         // path も resolve できる (= sidecar の元 file が分かっている場合)。
         self.decode_audio_sources_into_cache();
+        // image source も同 idiom (= recovery 復元時に preview を再構築)。
+        self.decode_image_sources_into_cache();
         self.selected_track_ids.clear();
         self.collapsed_groups.clear();
         self.selected_clip = None;

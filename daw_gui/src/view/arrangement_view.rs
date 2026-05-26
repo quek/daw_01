@@ -296,7 +296,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let view = ArrangementView {
         start_beat: app.arrange_scroll_beat as f64,
         len_beats: (lanes_w / zoom) as f64,
-        track_top: 0.0,
+        track_top: app.arrange_track_top,
         tracks_visible: ((area.h - RULER_H) / row_h).max(1.0),
         track_row_h: row_h,
         header_w: TRACK_HEADER_W,
@@ -1343,9 +1343,13 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
                 app.handle_event(AppEvent::SetArrangeScroll(beat as f32));
             })
         }
-        ArrangementEditRequest::SetTrackTop(_) => {
-            // 縦 scroll は本 view では未使用 (track row 全件表示)。
-            Edit::mutate(|_| {})
+        ArrangementEditRequest::SetTrackTop(top) => {
+            // mouse wheel / scroll bar 経由で widget が発行する縦 scroll。
+            // widget が overscroll の scissor も含めて担当 (gui_01 #048
+            // で対応依頼)、 daw_01 側は受け取った値をそのまま書き戻す。
+            Edit::mutate(move |app: &mut AppData| {
+                app.arrange_track_top = top.max(0.0);
+            })
         }
         // gui_01 #025 (M14 Phase 63k): clip 上 grip drag 経路。 widget は
         // drag release で 1 度だけ delta 群を発行する。 Phase 2 PR-B で

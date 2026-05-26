@@ -1308,6 +1308,51 @@ error[E0063]: missing field `rotation_radians` in initializer of `TexturedQuad`
 
 ---
 
+## #048 [Open] 2026-05-26 [バグ報告] arrangement widget の縦 scroll で track row が ruler / toolbar 領域に描画 leak
+
+関連仕様: 「lanes 領域外への描画は scissor で切る」 の原則。 縦 scroll (`SetTrackTop` 経由で `ArrangementView.track_top: f32` を変える) を有効化したところ、 track row が ruler / toolbar 領域まで突き抜けて描画される。
+
+### daw_01 →
+
+- 種別: [バグ報告]
+- 関連 gui_01: [`crates/ui/src/widgets/arrangement.rs:1429`](../../gui_01/crates/ui/src/widgets/arrangement.rs#L1429) (`y = lanes_y - track_top` の prefix sum 計算)、 [`crates/ui/src/widgets/arrangement.rs:415`](../../gui_01/crates/ui/src/widgets/arrangement.rs#L415) (`ArrangementView::default::track_top: 0.0`)
+- 関連 daw_01: [`daw_gui/src/view/arrangement_view.rs`](../daw_gui/src/view/arrangement_view.rs) (`ArrangementEditRequest::SetTrackTop` handler が `app.arrange_track_top` に書き戻す経路)
+
+#### 再現
+
+1. daw_01 で `ArrangementView { track_top: app.arrange_track_top, .. }` を渡し、 `ArrangementEditRequest::SetTrackTop(top)` で `app.arrange_track_top = top.max(0.0)` を書き込む (= overscroll 値も許容)。
+2. arrangement 上で mouse wheel 縦 scroll → widget は `lanes_y - track_top` で第 1 track の y を計算 → `track_top` が大きいと **第 1 track の上端が ruler / 上方 toolbar の領域に重なる**。
+3. daw_01 のスクリーンショット: ツールバー (BPM / Loop / Play 等の row) の **下** に位置すべき「Track 1」 行ヘッダ + M/S/R ボタン + track 名が、 ツールバーと完全に重なって描画される (画像添付済)。
+
+#### 期待挙動
+
+`ArrangementView` 描画は **lanes / header_pane / ruler の rect 内に閉じ込める** べきです。 つまり:
+- track row + lane + clip 等の描画 primitive は `clip_rect = Some(lanes 領域)` を必ず付与する
+- track header (M/S/R ボタン、 track 名) も `clip_rect = Some(header_pane 領域)` で切る
+- ruler は ruler 自身の rect 内のみ
+
+そうすれば `track_top` を caller がどう設定しても (= overscroll でも、 負値でも、 0 でも) 描画 leak が起きません。
+
+#### 提案 / 推奨実装
+
+`arrangement::draw` の内部で 4 つの sub-rect (`lanes`, `header_pane`, `ruler_pane`, `toolbar_pane` (if any)) を計算し、 各 widget 描画呼び出しに `clip_rect` を必ず付与する pattern。 scene primitive (`RectCommand` / `GlyphArea` / `LineBatch` / `TexturedQuad`) は全部 `clip_rect: Option<Rect>` を既に持っているので、 既存 API への変更は無く、 widget の `push_*` 呼び出しに 1 引数足すだけのはず。
+
+#### 関連: clamp を caller に押し付けない
+
+最初 daw_01 側で `arrange_track_top.clamp(0.0, total_h - visible_h)` の clamp 実装を入れて回避を試みましたが、 これは「妥協を選択肢に上げない」 (`CLAUDE.md` / `memory/feedback_pursue_ideal_only.md`) に反するので revert しました。 「caller が clamp する」 という規約は scroll 量計算を caller 側に重複させ、 expanded automation lane / track group など widget が知る情報を caller 側にも持たせる必要があるため理想ではありません。 widget が描画範囲を自分で scissor すれば caller は受け取った wheel delta をそのまま書き戻すだけで済みます。
+
+#### 受け入れ基準
+
+1. ✅ `track_top` を画面高より大きく設定しても、 track row / lane が ruler や上部 toolbar 領域に描画されない
+2. ✅ `track_top` を負値にしても、 ruler の上に track row が出ない (= scissor で切られる)
+3. ✅ 既存挙動 (`track_top = 0.0` で第 1 track が lanes 上端) は完全互換
+
+### gui_01 →
+
+（gui_01 Claude が記入）
+
+---
+
 
 
 
