@@ -356,9 +356,10 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
             };
             let d3d12_device = hal_device.raw_device();
             // windows 0.62.x の OpenSharedHandle は out-param 形式 (= `*mut Option<T>`)。
+            // `&raw mut` で明示的に raw pointer 化 (clippy::borrow_as_ptr、 rust 1.95+ の lint)。
             let mut resource_out: Option<ID3D12Resource> = None;
             d3d12_device
-                .OpenSharedHandle::<ID3D12Resource>(shared_handle, &mut resource_out)
+                .OpenSharedHandle::<ID3D12Resource>(shared_handle, &raw mut resource_out)
                 .map_err(|e| RendererError::OpenSharedHandle(format!("{e}")))?;
             let resource = resource_out.ok_or_else(|| {
                 RendererError::OpenSharedHandle(

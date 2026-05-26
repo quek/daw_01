@@ -36,8 +36,18 @@ struct TextureInstance {
     pos: [f32; 4],
     /// uv_min.x, uv_min.y, uv_max.x, uv_max.y (0.0..=1.0)
     uv: [f32; 4],
-    /// alpha, _pad, _pad, _pad
+    /// alpha, rotation_radians, _pad, _pad
+    /// rotation_radians: rect 中心 pivot で clockwise positive、 NaN/Inf は CPU 側で
+    /// 0.0 に正規化済 (= `enqueue_run` で `is_finite()` ガード)。
     misc: [f32; 4],
+}
+
+/// rotation 値の正規化 (`NaN` / ±Infinity → `0.0`)。 GPU driver の sin/cos 非有限挙動が
+/// vendor 毎に分かれる可能性を回避し、 ロジックを caller 側に押し付けない (M14 Phase 76)。
+#[inline]
+#[must_use]
+fn normalize_rotation(r: f32) -> f32 {
+    if r.is_finite() { r } else { 0.0 }
 }
 
 #[repr(C)]
@@ -243,10 +253,11 @@ impl TexturePipeline {
         let count = quads.len().min(avail);
         for q in quads.iter().take(count) {
             let inst_idx = self.instances.len() as u32;
+            let theta = normalize_rotation(q.rotation_radians);
             self.instances.push(TextureInstance {
                 pos: [q.rect.x, q.rect.y, q.rect.w, q.rect.h],
                 uv: [q.uv_min.0, q.uv_min.1, q.uv_max.0, q.uv_max.1],
-                misc: [q.alpha, 0.0, 0.0, 0.0],
+                misc: [q.alpha, theta, 0.0, 0.0],
             });
             self.calls.push(DrawCall {
                 instance_idx: inst_idx,
@@ -308,5 +319,35 @@ impl TexturePipeline {
             pass.draw(0..6, call.instance_idx..call.instance_idx + 1);
         }
         pass.set_scissor_rect(0, 0, screen.width, screen.height);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_rotation;
+
+    #[test]
+    fn normalize_rotation_passes_through_finite_values() {
+        // bit-exact 比較で OK (passthrough なので)
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(normalize_rotation(0.0), 0.0);
+            assert_eq!(normalize_rotation(1.5), 1.5);
+            assert_eq!(normalize_rotation(-std::f32::consts::PI), -std::f32::consts::PI);
+            // typical use ケースの ±π を 1 周期分超えても finite ならそのまま (sin/cos の周期性に任せる)
+            assert_eq!(normalize_rotation(7.5), 7.5);
+        }
+    }
+
+    #[test]
+    fn normalize_rotation_maps_nan_and_infinity_to_zero() {
+        // M14 Phase 76 (daw_01 #047): caller が NaN/Inf を渡しても callee で 0.0 に正規化
+        // = GPU sin/cos の vendor 毎の非有限挙動差を回避し、 axis-aligned 描画にフォールバック
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(normalize_rotation(f32::NAN), 0.0);
+            assert_eq!(normalize_rotation(f32::INFINITY), 0.0);
+            assert_eq!(normalize_rotation(f32::NEG_INFINITY), 0.0);
+        }
     }
 }

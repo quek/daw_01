@@ -218,10 +218,15 @@ pub struct TexturedQuad {
     pub uv_max: (f32, f32),
     /// `Some` ならこの矩形外を scissor で切り捨てる。 `Ui::with_clip_rect` が自動設定する。
     pub clip_rect: Option<Rect>,
+    /// M14 Phase 76 (daw_01 #047): rect 中心を旋回中心とする 2D 回転 (radians、 clockwise
+    /// positive)。 `0.0` で既存の axis-aligned 描画と byte 完全互換。 NaN / ±Infinity は
+    /// renderer 側で `0.0` に正規化 (caller 責務にしない)。 回転は **pixel 空間** で実施
+    /// するため non-square rect (w ≠ h) でも aspect 維持で正しく回転する。
+    pub rotation_radians: f32,
 }
 
 impl TexturedQuad {
-    /// UV 全域 + alpha=1.0 + clip なし の最短コンストラクタ。
+    /// UV 全域 + alpha=1.0 + clip なし + rotation 0 の最短コンストラクタ。
     #[must_use]
     pub fn new(rect: Rect, texture: TextureHandle) -> Self {
         Self {
@@ -231,6 +236,7 @@ impl TexturedQuad {
             uv_min: (0.0, 0.0),
             uv_max: (1.0, 1.0),
             clip_rect: None,
+            rotation_radians: 0.0,
         }
     }
 }
@@ -433,6 +439,8 @@ mod tests {
             assert_eq!(q.alpha, 1.0);
             assert_eq!(q.uv_min, (0.0, 0.0));
             assert_eq!(q.uv_max, (1.0, 1.0));
+            // M14 Phase 76 (daw_01 #047): default 0.0 で既存 axis-aligned 描画と byte 互換
+            assert_eq!(q.rotation_radians, 0.0);
         }
         assert!(q.clip_rect.is_none());
     }

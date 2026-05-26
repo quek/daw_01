@@ -65,6 +65,9 @@ fn assert_embedded_window_backend() {
     check(&w);
 }
 
+// 各 Phase の smoke を flat に並べる demo なので helper 抽出より直線的な scene 構築の方が
+// 例として読みやすい (Phase 71 RGBA / 73 BGRA / 76 rotation の 3 demo で 100 行超過)。
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<(), Box<dyn Error>> {
     // 外部 crate (= この example crate) でも `WindowBackend` を自前実装できることを
     // compile-time に確認 (= raw-window-handle 受け渡し API が公開されている実証)。
@@ -133,6 +136,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         uv_min: (0.0, 0.0),
         uv_max: (1.0, 1.0),
         clip_rect: None,
+        rotation_radians: 0.0,
     });
     scene.push_text(GlyphArea {
         text: "Phase 71 (#043): texture pipeline (4x4 checker + 0.5 blue overlay)".into(),
@@ -161,12 +165,42 @@ fn main() -> Result<(), Box<dyn Error>> {
     let bgra_rect = Rect::new(width as f32 - 290.0, height as f32 - 150.0, 120.0, 120.0);
     scene.push_textured_quad(TexturedQuad::new(bgra_rect, bgra_tex));
     scene.push_text(GlyphArea {
-        text: "Phase 73 (#045): BGRA path (左) ↔ Phase 71 RGBA path (右、 同色のはず)".into(),
+        text: "Phase 73 (#045): BGRA path (中) ↔ Phase 71 RGBA path (右、 同色のはず)".into(),
         left: width as f32 - 540.0,
         top: height as f32 - 165.0,
         font_size: 12.0,
         line_height: 14.0,
         color: Color::rgb(0.85, 0.95, 0.7),
+        clip_rect: None,
+    });
+
+    // ============================================================
+    // M14 Phase 76 (daw_01 #047): rotated TexturedQuad smoke test
+    // ============================================================
+    //
+    // 同じ checker texture を 30° clockwise 回転して描画。 PNG snapshot 上で:
+    //  - rect 中心が回転前と一致 (= pivot は rect 中心)
+    //  - 4 角が axis-aligned rect の外に膨らみ AABB が拡大している (= 回転が pixel 空間で実施)
+    //  - texture の red/green/blue/yellow tile が rect 4 隅に "stuck" して一緒に回る
+    //    (= UV mapping は un-rotated corner で計算)
+    // が確認できれば pipeline が期待通り動作している。
+    let rotated_rect = Rect::new(width as f32 - 430.0, height as f32 - 150.0, 120.0, 120.0);
+    scene.push_textured_quad(TexturedQuad {
+        rect: rotated_rect,
+        texture: checker_tex,
+        alpha: 1.0,
+        uv_min: (0.0, 0.0),
+        uv_max: (1.0, 1.0),
+        clip_rect: None,
+        rotation_radians: std::f32::consts::FRAC_PI_6, // 30°
+    });
+    scene.push_text(GlyphArea {
+        text: "Phase 76 (#047): rotation π/6 (30° clockwise, pivot=rect center)".into(),
+        left: width as f32 - 540.0,
+        top: height as f32 - 300.0,
+        font_size: 12.0,
+        line_height: 14.0,
+        color: Color::rgb(0.95, 0.85, 0.6),
         clip_rect: None,
     });
 

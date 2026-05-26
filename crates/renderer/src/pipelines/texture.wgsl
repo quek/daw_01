@@ -1,6 +1,16 @@
-// Instanced textured-quad shader (M14 Phase 71 / daw_01 #043)。
-// 入力 instance: pos(left,top,w,h) / uv(uv_min.x, uv_min.y, uv_max.x, uv_max.y) / misc(alpha, _, _, _)
+// Instanced textured-quad shader (M14 Phase 71 / daw_01 #043, Phase 76 で rotation 拡張)。
+// 入力 instance: pos(left,top,w,h) / uv(uv_min.x, uv_min.y, uv_max.x, uv_max.y)
+//              / misc(alpha, rotation_radians, _, _)
 // 出力: texture sample × vec4(rgb, alpha) (standard alpha blend OVER で composite)
+//
+// rotation_radians:
+//   rect 中心 (cx = left + w/2, cy = top + h/2) を pivot とした 2D 回転 (clockwise
+//   positive in screen-down y)。 0.0 で sin=0/cos=1 の恒等変換 → 既存挙動と完全互換。
+//   NaN / ±Infinity は CPU 側 (`enqueue_run`) で 0.0 に正規化済。
+//   非 0 の場合は pixel 空間で `[cos -sin; sin cos]` 行列を適用 (= normalized 空間で
+//   回転すると non-square rect w≠h で aspect 歪みが起こるため、 必ず pixel 空間で実施)。
+//   UV mapping は rotation 適用前の corner で計算する (= texture content は rect 4 隅に
+//   "stuck" し、 rect 自体が rigid に回転する After Effects / Premiere セマンティクス)。
 
 struct ScreenUniform {
     size: vec4<f32>,  // (width, height, _, _)
@@ -17,7 +27,7 @@ var src_sampler: sampler;
 struct VsIn {
     @location(0) pos:  vec4<f32>,  // left, top, w, h
     @location(1) uv:   vec4<f32>,  // uv_min.x, uv_min.y, uv_max.x, uv_max.y
-    @location(2) misc: vec4<f32>,  // alpha, _, _, _
+    @location(2) misc: vec4<f32>,  // alpha, rotation_radians, _, _
 };
 
 struct VsOut {
@@ -46,13 +56,27 @@ fn vs_main(@builtin(vertex_index) vid: u32, in: VsIn) -> VsOut {
     let w = in.pos.z;
     let h = in.pos.w;
 
-    let px = left + corner.x * w;
-    let py = top + corner.y * h;
+    // 1) 未回転の pixel 座標を計算。
+    let px0 = left + corner.x * w;
+    let py0 = top + corner.y * h;
 
-    // 物理ピクセル -> NDC (左上原点 -> 左下原点)
+    // 2) rect 中心 (pivot) を基準に rotation 行列を適用 (pixel 空間 = aspect 維持)。
+    //    theta = 0 のときは sin=0/cos=1 で恒等変換 → Phase 71 と byte 完全互換。
+    let theta = in.misc.y;
+    let cx = left + w * 0.5;
+    let cy = top + h * 0.5;
+    let rel_x = px0 - cx;
+    let rel_y = py0 - cy;
+    let s = sin(theta);
+    let co = cos(theta);
+    let px = cx + rel_x * co - rel_y * s;
+    let py = cy + rel_x * s + rel_y * co;
+
+    // 3) 物理ピクセル -> NDC (左上原点 -> 左下原点)。
     let ndc_x = (px / screen.size.x) * 2.0 - 1.0;
     let ndc_y = 1.0 - (py / screen.size.y) * 2.0;
 
+    // 4) UV は rotation 適用前の corner で計算 (texture content は rect 4 隅に "stuck")。
     let uv_min = in.uv.xy;
     let uv_max = in.uv.zw;
     let uv = uv_min + corner * (uv_max - uv_min);

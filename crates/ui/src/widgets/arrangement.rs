@@ -2634,6 +2634,7 @@ fn draw_video_clip<M: ?Sized + 'static>(
             uv_max: (1.0, 1.0),
             // clip rect 内に閉じる (= drag 中の lanes 端で thumbnail がはみ出ない)。
             clip_rect: Some(r.intersect(lanes)),
+            rotation_radians: 0.0,
         });
     }
     if r.w > 24.0 && r.h > style.clip_text_size + 2.0 {

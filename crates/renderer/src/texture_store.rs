@@ -177,6 +177,11 @@ impl TextureStore {
     /// `width` / `height` / `format` は caller が知っている前提で渡す (= imported texture を
     /// `wgpu::Texture::format()` / `size()` 等で取り出すこともできるが、 caller 側で
     /// 既に shared handle import 時に把握しているので boilerplate を避けて引数受けにする)。
+    ///
+    /// 引数 8 件は wgpu init で得る不可分の resource bundle (device / sampler / layout) +
+    /// imported texture + 3 metadata から成り、 struct 化しても caller 側で構築 boilerplate が
+    /// 増えるだけなので flat 受けのまま `#[allow(too_many_arguments)]` で抑止する。
+    #[allow(clippy::too_many_arguments)]
     pub fn import_texture(
         &mut self,
         device: &wgpu::Device,
