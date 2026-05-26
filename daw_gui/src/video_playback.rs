@@ -63,29 +63,50 @@ pub struct SendHandle(pub HANDLE);
 unsafe impl Send for SendHandle {}
 unsafe impl Sync for SendHandle {}
 
+/// docs/plan_video_perf.md P4: ring buffer size. 6 frames at 30fps =
+/// 200ms of lookahead, which absorbs the typical 4-6 frame burst from
+/// `IMFSourceReader::ReadSample` returning a contiguous run of decoded
+/// samples after a single HW decode kick. Each `VideoSourceId` owns
+/// `PREVIEW_RING_SIZE` independent D3D11 destination textures (=
+/// `SharedPool::slots`) so the worker can write into slot N+1 without
+/// invalidating the wgpu sample of slot N that the main thread is
+/// presenting this frame.
+pub const PREVIEW_RING_SIZE: usize = 6;
+
 /// One decoded frame, ready for the main thread to push into the
 /// preview scene. Two underlying paths:
 ///
 /// - **`Shared`** (zero-copy, P3): the decoded BGRA frame lives in a
 ///   D3D11 texture that was created with `SHARED_NTHANDLE +
 ///   SHARED_KEYEDMUTEX`. The worker calls `IDXGIResource1::CreateSharedHandle`
-///   once per source and reuses the same handle for every subsequent
-///   frame; the main thread calls `Renderer::create_texture_from_d3d11_shared_handle`
-///   exactly once per source and reuses the resulting `TextureHandle`.
-///   The pixel bytes never touch CPU memory.
+///   once per `(source_id, slot_idx)` and reuses the same handle for
+///   every subsequent frame that lands in that slot; the main thread
+///   calls `Renderer::create_texture_from_d3d11_shared_handle` exactly
+///   once per `(source_id, slot_idx)` and reuses the resulting
+///   `TextureHandle`. The pixel bytes never touch CPU memory.
 /// - **`Bgra`** (P2 fallback): the decode produced system-memory
 ///   pixels (= the source did not use the HW decoder path even with
 ///   `MF_SOURCE_READER_D3D_MANAGER` attached, or `try_init_d3d11`
 ///   failed). Main thread uploads via `Renderer::upload_texture_bgra`.
+///   Ring buffering is disabled for this path (slot_idx is always 0);
+///   the fallback exists for HW-less environments where pacing matters
+///   less than basic playback.
 #[derive(Debug, Clone)]
 pub enum DecodedFrame {
     Shared {
         width: u32,
         height: u32,
-        /// Stable per-source DXGI shared NT handle. Same value every
-        /// frame for the same `VideoSourceId`; the underlying texture
-        /// is overwritten in place by the worker.
+        /// DXGI shared NT handle of the `SharedSlot` this frame was
+        /// written into. Stable for the lifetime of the `(source_id,
+        /// slot_idx)` pair — main thread imports each unique slot
+        /// exactly once into wgpu.
         handle: SendHandle,
+        /// Index into `SharedPool::slots` that this frame occupies. The
+        /// worker round-robins through `0..PREVIEW_RING_SIZE` when
+        /// building a ring snapshot; the main thread keys its
+        /// `(VideoSourceId, slot_idx)` texture cache off this so each
+        /// slot's handle is imported into wgpu exactly once.
+        slot_idx: u8,
     },
     Bgra {
         width: u32,
@@ -149,21 +170,23 @@ struct ReaderEntry {
     /// repeated-request pattern (which would otherwise eat the
     /// warm-up window before Play is even pressed).
     timing_log_remaining: u32,
-    /// docs/plan_video_perf.md P3: per-source DXGI-shared destination
-    /// texture for the zero-copy path. Created on first HW-decoded
+    /// docs/plan_video_perf.md P4: per-source pool of
+    /// `PREVIEW_RING_SIZE` independent DXGI-shared destination textures
+    /// for the zero-copy ring buffer path. Created on first HW-decoded
     /// sample (= when the reader was built with
     /// `MF_SOURCE_READER_D3D_MANAGER` attached and `try_init_d3d11`
-    /// succeeded). The same handle is reused for every frame; the
-    /// underlying texture is overwritten in place via
-    /// `CopySubresourceRegion`.
-    shared: Option<SharedEntry>,
+    /// succeeded). The worker round-robins through `slots[slot_idx]`
+    /// when filling a ring snapshot; the main thread imports each
+    /// slot's handle into wgpu exactly once.
+    shared_pool: Option<SharedPool>,
 }
 
-/// Per-source GPU-resident state for the zero-copy path. Allocated
-/// lazily on first HW decode (`sample_to_shared`), reused for every
-/// subsequent frame for the same `VideoSourceId`. Dropped only when
-/// the engine itself is dropped (= process exit for MVP).
-struct SharedEntry {
+/// One slot in a per-source ring buffer of D3D11-backed destination
+/// textures. Each slot is independent (= its own NT handle, its own
+/// keyed mutex, its own texture) so the worker can be writing into
+/// slot N+1 while wgpu is sampling slot N for the present pass —
+/// without the slot's handle being "the latest" requiring any sync.
+struct SharedSlot {
     /// Our owned D3D11 texture, created with `SHARED_NTHANDLE +
     /// SHARED_KEYEDMUTEX`. The WMF decoder writes into a texture from
     /// its own pool; we `CopySubresourceRegion` from that into this
@@ -184,9 +207,23 @@ struct SharedEntry {
     /// thread does NOT need to call mutex APIs itself.
     mutex: IDXGIKeyedMutex,
     /// Cached NT handle from `IDXGIResource1::CreateSharedHandle`.
-    /// Stable across the entry's lifetime — wrapped in `SendHandle`
+    /// Stable across the slot's lifetime — wrapped in `SendHandle`
     /// when it leaves the worker thread.
     handle: HANDLE,
+}
+
+/// Per-source pool of `PREVIEW_RING_SIZE` `SharedSlot`s. Allocated
+/// lazily on first HW decode (= `write_to_shared_pool`), reused for
+/// every subsequent frame for the same `VideoSourceId`. Dropped only
+/// when the engine itself is dropped (= process exit for MVP).
+///
+/// docs/plan_video_perf.md P4: the ring buffer's storage layer. The
+/// worker writes into `slots[slot_idx]` in round-robin order; the
+/// main thread keys its `(VideoSourceId, slot_idx)` `TextureHandle`
+/// cache off the slot index so each slot's handle is imported into
+/// wgpu exactly once across the source's lifetime.
+struct SharedPool {
+    slots: [SharedSlot; PREVIEW_RING_SIZE],
 }
 
 /// docs/plan_video_perf.md P1: process-wide D3D11 device + IMFDXGIDevice
@@ -452,11 +489,23 @@ impl VideoPlaybackEngine {
     /// `VideoSourceId` hasn't been created yet — caller resolves the
     /// `VideoSourcePath` (ProjectRelative vs Absolute) before passing
     /// in.
+    ///
+    /// docs/plan_video_perf.md P4: `slot_idx` is the worker's
+    /// round-robin index into the per-source `SharedPool` (=
+    /// `0..PREVIEW_RING_SIZE`). On the HW path the resulting
+    /// `DecodedFrame::Shared` carries this index back so the main
+    /// thread can key its `(VideoSourceId, slot_idx)` texture cache.
+    /// On the Bgra fallback path `slot_idx` is preserved by the
+    /// returned `DecodedFrame::Bgra`'s outer position in the worker's
+    /// ring (= the variant itself has no slot field; the ring entry
+    /// preserves order so the main thread sees a 1-frame-latest
+    /// snapshot, identical to the pre-P4 behavior in HW-less envs).
     pub fn decode_at(
         &mut self,
         video_source_id: VideoSourceId,
         source_path: &Path,
         target_micros: u64,
+        slot_idx: u8,
     ) -> Result<DecodedFrame, String> {
         // docs/plan_video_perf.md P1: lazy-init D3D11 + IMFDXGIDeviceManager
         // on the first decode. Once attempted, never retry — even if it
@@ -551,7 +600,7 @@ impl VideoPlaybackEngine {
         let (final_sample, final_ts) = chosen.or(last_sample).ok_or_else(|| {
             format!("no frame decoded for source {video_source_id} at {target_micros}μs")
         })?;
-        let frame = sample_to_frame(&final_sample, entry, d3d11_ref)?;
+        let frame = sample_to_frame(&final_sample, entry, d3d11_ref, slot_idx)?;
         let t_swap_done = std::time::Instant::now();
         entry.last_decoded_micros = Some(final_ts);
 
@@ -790,7 +839,7 @@ fn create_reader_for_source(
         timing_log_remaining: 60,
         // Lazily created on first HW-decoded sample (= when D3D11
         // manager was attached and the reader returned an IMFDXGIBuffer).
-        shared: None,
+        shared_pool: None,
     })
 }
 
@@ -861,22 +910,26 @@ fn read_sample_only(reader: &IMFSourceReader) -> Result<Option<(IMFSample, i64)>
 ///
 /// - **`Shared`** (zero-copy, P3): `IMFDXGIBuffer::GetResource()` →
 ///   ID3D11Texture2D → `CopySubresourceRegion` into the per-source
-///   shared NT-handle / keyed-mutex texture (`entry.shared`). The
-///   pixel bytes never touch CPU memory. Returned with the stable
-///   shared HANDLE that the main thread imports into wgpu exactly
-///   once per source.
+///   pool slot (`entry.shared_pool.slots[slot_idx]`). The pixel
+///   bytes never touch CPU memory. Returned with the stable shared
+///   HANDLE for that slot that the main thread imports into wgpu
+///   exactly once per `(source_id, slot_idx)`.
 /// - **`Bgra`** (P2 fallback): `ConvertToContiguousBuffer()` →
 ///   `IMFMediaBuffer::Lock()` → memcpy. Used when D3D11 init failed
 ///   or the H.264 MFT chose a system-memory output despite
-///   `MF_SOURCE_READER_D3D_MANAGER` being attached.
+///   `MF_SOURCE_READER_D3D_MANAGER` being attached. Bgra ignores
+///   `slot_idx` (= the ring buffer is HW-path only; HW-less fallback
+///   keeps the original 1-frame-latest semantics).
 ///
-/// docs/plan_video_perf.md P3 (2026-05-25): the staging-texture
-/// readback path from P1 is gone — replaced by the shared NT-handle
-/// path so wgpu samples the GPU memory directly.
+/// docs/plan_video_perf.md P4: `slot_idx` selects which slot of the
+/// per-source `SharedPool` receives the decoded pixels. The worker
+/// round-robins through `0..PREVIEW_RING_SIZE` when filling a ring
+/// snapshot so consecutive frames land in independent textures.
 fn sample_to_frame(
     sample: &IMFSample,
     entry: &mut ReaderEntry,
     d3d11: Option<&D3D11WmfState>,
+    slot_idx: u8,
 ) -> Result<DecodedFrame, String> {
     let buffer = unsafe { sample.ConvertToContiguousBuffer() }
         .map_err(|e| format!("ConvertToContiguousBuffer: {e}"))?;
@@ -885,11 +938,12 @@ fn sample_to_frame(
     if let Some(d3d11) = d3d11
         && let Ok(dxgi) = buffer.cast::<IMFDXGIBuffer>()
     {
-        let handle = write_to_shared_texture(&dxgi, entry, d3d11)?;
+        let handle = write_to_shared_pool_slot(&dxgi, entry, d3d11, slot_idx)?;
         return Ok(DecodedFrame::Shared {
             width: entry.width,
             height: entry.height,
             handle: SendHandle(handle),
+            slot_idx,
         });
     }
 
@@ -927,29 +981,35 @@ fn sample_buffer_to_bgra(
     Ok(bgra)
 }
 
-/// docs/plan_video_perf.md P3 GPU zero-copy path: copy the decoded
-/// HW sample's D3D11 texture into the per-source DXGI-shared
-/// destination texture, returning its stable NT handle.
+/// docs/plan_video_perf.md P4 GPU zero-copy ring path: copy the
+/// decoded HW sample's D3D11 texture into the per-source pool slot
+/// at `slot_idx`, returning its stable NT handle.
 ///
-/// On first call for a `ReaderEntry`, allocates the shared destination
-/// (`SHARED_NTHANDLE + SHARED_KEYEDMUTEX`, `B8G8R8A8_UNORM` to match
-/// WMF's `MFVideoFormat_ARGB32` output = byte-identical 32-bit BGRA
-/// layout), caches its `IDXGIKeyedMutex`, and creates the NT handle
-/// via `IDXGIResource1::CreateSharedHandle`. The handle is stable so
-/// the main thread imports it into wgpu exactly once.
+/// On first call for a `ReaderEntry`, allocates the entire
+/// `SharedPool` (= `PREVIEW_RING_SIZE` independent slots) via
+/// `create_shared_pool`. Subsequent frames pick the slot indexed by
+/// the caller (= worker's round-robin counter) and overwrite its
+/// contents in place.
 ///
 /// Keyed-mutex protocol: worker `AcquireSync(0, INFINITE)` →
-/// `CopySubresourceRegion` → `ReleaseSync(0)`. **The matching half is
-/// inside wgpu's DX12 / Vulkan importer**, not in daw_01 code —
-/// proven empirically by removing the worker pair (`c2ae697`) and
-/// observing the imported texture render as fully transparent
-/// (reverted in `6b5eebd`, 2026-05-26). The daw_01 main thread does
-/// NOT need to call `IDXGIKeyedMutex` APIs.
-fn write_to_shared_texture(
+/// `CopySubresourceRegion` → `ReleaseSync(0)` **on the targeted
+/// slot only**. **The matching half is inside wgpu's DX12 / Vulkan
+/// importer**, not in daw_01 code — proven empirically by removing
+/// the worker pair (`c2ae697`) and observing the imported texture
+/// render as fully transparent (reverted in `6b5eebd`, 2026-05-26).
+/// The daw_01 main thread does NOT need to call `IDXGIKeyedMutex`
+/// APIs.
+fn write_to_shared_pool_slot(
     dxgi: &IMFDXGIBuffer,
     entry: &mut ReaderEntry,
     d3d11: &D3D11WmfState,
+    slot_idx: u8,
 ) -> Result<HANDLE, String> {
+    if (slot_idx as usize) >= PREVIEW_RING_SIZE {
+        return Err(format!(
+            "slot_idx {slot_idx} out of range (PREVIEW_RING_SIZE = {PREVIEW_RING_SIZE})"
+        ));
+    }
     // Extract the WMF-owned source texture + subresource index.
     let source: ID3D11Texture2D = unsafe {
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -963,25 +1023,30 @@ fn write_to_shared_texture(
     let subresource: u32 = unsafe { dxgi.GetSubresourceIndex() }
         .map_err(|e| format!("GetSubresourceIndex: {e}"))?;
 
-    // Lazy-create the shared destination on first frame.
-    if entry.shared.is_none() {
-        entry.shared = Some(create_shared_entry(&source, d3d11, entry.width, entry.height)?);
+    // Lazy-create the per-source pool on first HW frame for this
+    // reader.
+    if entry.shared_pool.is_none() {
+        entry.shared_pool =
+            Some(create_shared_pool(&source, d3d11, entry.width, entry.height)?);
     }
-    let shared = entry
-        .shared
+    let pool = entry
+        .shared_pool
         .as_ref()
-        .ok_or_else(|| "shared texture init failed".to_string())?;
+        .ok_or_else(|| "shared pool init failed".to_string())?;
+    let slot = &pool.slots[slot_idx as usize];
 
-    // Acquire the keyed mutex before writing. `INFINITE` waits for
-    // the main thread's render submit to release; in steady-state
-    // this is sub-millisecond because the main thread releases
-    // immediately after queueing the textured-quad command.
-    unsafe { shared.mutex.AcquireSync(0, u32::MAX) }
+    // Acquire the keyed mutex on **this slot only** before writing.
+    // `INFINITE` waits for the main thread's render submit to
+    // release; in steady-state this is sub-millisecond because the
+    // main thread releases immediately after queueing the
+    // textured-quad command, and slots not currently being presented
+    // are simply free.
+    unsafe { slot.mutex.AcquireSync(0, u32::MAX) }
         .map_err(|e| format!("worker mutex AcquireSync: {e}"))?;
 
     unsafe {
         d3d11.context.CopySubresourceRegion(
-            &shared.texture,
+            &slot.texture,
             0,
             0,
             0,
@@ -996,22 +1061,23 @@ fn write_to_shared_texture(
     // observe an older frame for several render cycles.
     unsafe { d3d11.context.Flush() };
 
-    unsafe { shared.mutex.ReleaseSync(0) }
+    unsafe { slot.mutex.ReleaseSync(0) }
         .map_err(|e| format!("worker mutex ReleaseSync: {e}"))?;
 
-    Ok(shared.handle)
+    Ok(slot.handle)
 }
 
-/// Allocate one `SharedEntry`: a `B8G8R8A8_UNORM` D3D11 texture with
+/// Allocate one `SharedSlot`: a `B8G8R8A8_UNORM` D3D11 texture with
 /// `SHARED_NTHANDLE + SHARED_KEYEDMUTEX`, plus its `IDXGIKeyedMutex`
 /// view and the NT handle from `IDXGIResource1::CreateSharedHandle`.
-/// Called exactly once per `ReaderEntry`.
-fn create_shared_entry(
+/// Called `PREVIEW_RING_SIZE` times per `ReaderEntry` (= once per
+/// pool slot during `create_shared_pool`).
+fn create_shared_slot(
     source: &ID3D11Texture2D,
     d3d11: &D3D11WmfState,
     width: u32,
     height: u32,
-) -> Result<SharedEntry, String> {
+) -> Result<SharedSlot, String> {
     // Start from the source texture's desc so we inherit mip level
     // details, then override flags for sharing.
     let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -1069,11 +1135,37 @@ fn create_shared_entry(
     }
     .map_err(|e| format!("CreateSharedHandle: {e}"))?;
 
-    Ok(SharedEntry {
+    Ok(SharedSlot {
         texture,
         mutex,
         handle,
     })
+}
+
+/// Allocate a fresh `SharedPool` with `PREVIEW_RING_SIZE` independent
+/// `SharedSlot`s. Each slot is sized to the source frame's actual
+/// dimensions (= `ReaderEntry.width / height`); the worker's
+/// `CopySubresourceRegion` writes into one of these on each decoded
+/// sample, round-robin'd by `slot_idx`.
+fn create_shared_pool(
+    source: &ID3D11Texture2D,
+    d3d11: &D3D11WmfState,
+    width: u32,
+    height: u32,
+) -> Result<SharedPool, String> {
+    // Build all N slots up front so the worker never has to allocate
+    // mid-decode. `std::array::try_from_fn` is unstable on stable Rust,
+    // so we collect into a Vec then convert — `PREVIEW_RING_SIZE` is a
+    // const so the conversion is bounded and any size mismatch is a
+    // compile-time invariant violation surfaced at the `try_into`.
+    let mut slots: Vec<SharedSlot> = Vec::with_capacity(PREVIEW_RING_SIZE);
+    for _ in 0..PREVIEW_RING_SIZE {
+        slots.push(create_shared_slot(source, d3d11, width, height)?);
+    }
+    let slots: [SharedSlot; PREVIEW_RING_SIZE] = slots
+        .try_into()
+        .map_err(|_| "SharedPool slot count mismatch".to_string())?;
+    Ok(SharedPool { slots })
 }
 
 /// BGRA8 → RGBA8 channel swap with alpha pinned to 0xFF. Picks the
@@ -1380,7 +1472,7 @@ mod tests {
         let mut engine = VideoPlaybackEngine::new();
         // Decode the frame at 1 second (= middle of the clip).
         let frame = engine
-            .decode_at(42, &mp4, 1_000_000)
+            .decode_at(42, &mp4, 1_000_000, 0)
             .expect("decode_at @ 1s");
         assert_eq!(frame.width(), 320);
         assert_eq!(frame.height(), 240);
@@ -1406,7 +1498,7 @@ mod tests {
         // existing reader and just ReadSample forward — verified
         // implicitly by the result being a valid frame (no error).
         let frame2 = engine
-            .decode_at(42, &mp4, 1_050_000)
+            .decode_at(42, &mp4, 1_050_000, 0)
             .expect("decode_at @ 1.05s (forward step)");
         assert_eq!(frame2.width(), 320);
         assert_eq!(frame2.height(), 240);
@@ -1414,7 +1506,7 @@ mod tests {
         // Backward seek: decode at 0.3s. Engine should SetCurrentPosition
         // back to a keyframe and re-walk. Same validity check.
         let frame3 = engine
-            .decode_at(42, &mp4, 300_000)
+            .decode_at(42, &mp4, 300_000, 0)
             .expect("decode_at @ 0.3s (backward seek)");
         assert_eq!(frame3.width(), 320);
         assert_eq!(frame3.height(), 240);

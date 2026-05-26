@@ -88,6 +88,19 @@ struct RunnerState {
     /// (= the user's "Stop button 5 sec freeze" pathology).
     #[cfg(windows)]
     playback_worker: crate::video_playback_worker::PreviewDecodeWorker,
+    /// docs/plan_video_perf.md P4: latest decoded ring snapshot per
+    /// source. Populated by `drain_preview_worker_results` from the
+    /// worker's `DecodedRing` messages; consulted by
+    /// `drive_preview_playback` to pick the ring slot whose
+    /// `target_micros` is nearest to the current playhead. Frames are
+    /// not stored here directly — only `(target_micros, slot_idx)`
+    /// pairs — because the actual GPU textures live in
+    /// `preview.frame_textures` keyed by `(source_id, slot_idx)`.
+    #[cfg(windows)]
+    cached_rings: std::collections::HashMap<
+        common::model::VideoSourceId,
+        Vec<CachedRingSlot>,
+    >,
     /// docs/plan_video.md P5 perf: 直近に preview decode を駆動した時刻。
     /// `drive_preview_playback` を `Song.video_framerate` Hz に throttle
     /// する基準。 main loop は vsync で 60fps+ 回るが、 video preview は
@@ -104,6 +117,39 @@ struct RunnerState {
     /// (worker side) or upload (main thread, this side).
     #[cfg(windows)]
     preview_upload_log_remaining: u32,
+}
+
+/// docs/plan_video_perf.md P4: metadata for one slot in a cached ring
+/// snapshot. The decoded frame's actual GPU texture lives in
+/// `PreviewWindowState::frame_textures` keyed by
+/// `(source_id, slot_idx)` — this struct is the lookup index the
+/// composite pass uses to find it.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct CachedRingSlot {
+    /// Source-side time the slot was decoded for. Used by
+    /// `nearest_ring_slot` to pick the slot closest to the current
+    /// playhead's `source_micros`.
+    target_micros: u64,
+    /// Index into `SharedPool::slots` for HW path, or the worker's
+    /// round-robin counter on the Bgra fallback path. Either way,
+    /// pairs with `source_id` to key the GPU texture cache.
+    slot_idx: u8,
+    /// Cached for the composite pass — avoids round-trip to
+    /// `frame_textures` just to read width/height.
+    width: u32,
+    height: u32,
+}
+
+/// docs/plan_video_perf.md P4: pick the slot whose `target_micros` is
+/// closest to the requested `target`. `slots` is assumed
+/// `target_micros`-ascending (= `drain_preview_worker_results`
+/// sort-by-keys before insert). Returns `None` for an empty slice;
+/// the composite pass treats that as "no frame available, skip
+/// layer".
+#[cfg(windows)]
+fn nearest_ring_slot(slots: &[CachedRingSlot], target: u64) -> Option<CachedRingSlot> {
+    slots.iter().min_by_key(|s| s.target_micros.abs_diff(target)).copied()
 }
 
 struct Runner {
@@ -185,6 +231,8 @@ impl ApplicationHandler<AppEvent> for Runner {
             preview: None,
             #[cfg(windows)]
             playback_worker: crate::video_playback_worker::PreviewDecodeWorker::new(),
+            #[cfg(windows)]
+            cached_rings: std::collections::HashMap::new(),
             #[cfg(windows)]
             last_preview_drive_at: None,
             // 60 uploads ≈ 2 seconds at 30fps preview, mirroring the
@@ -592,9 +640,19 @@ impl Runner {
             .as_ref()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
 
-        // Step 3: enqueue a decode for each active source. The worker
-        // coalesces multiple requests for the same source — only the
-        // latest target is decoded.
+        // docs/plan_video_perf.md P4: ring lookahead. step is derived
+        // from the project framerate; the worker decodes
+        // `PREVIEW_RING_SIZE` consecutive frames at
+        // `center + i * step` and writes each into an independent
+        // `SharedPool` slot.
+        let step_micros = {
+            let fps = state.app.song.video_framerate.max(1.0) as f64;
+            (1_000_000.0 / fps).round() as u64
+        };
+
+        // Step 3: enqueue a ring decode for each active source. The
+        // worker coalesces multiple requests for the same source —
+        // only the latest center wins.
         for frame_info in &active {
             let Some(abs_path) = resolve_video_path(
                 &state.app.song,
@@ -612,96 +670,112 @@ impl Runner {
                 frame_info.video_source_id,
                 abs_path,
                 frame_info.source_micros,
+                step_micros,
             );
         }
 
-        // Step 4: build composite layers from whatever textures are
-        // currently cached. If the worker hasn't produced a frame for
-        // a particular source yet (= first frame after import), we
-        // skip that layer this cycle and the preview shows whatever
-        // other layers are ready (or placeholder if none).
+        // Step 4: build composite layers by picking the cached ring
+        // slot nearest to each active source's current `source_micros`.
+        // docs/plan_video_perf.md P4: this is where the lookahead pays
+        // off — when the worker is mid-decode for the next ring, the
+        // composite still has the previous ring's nearest slot to show,
+        // so frame-pacing is smooth even under decode jitter.
         let mut layers: Vec<crate::view::preview_window::CompositeLayer> =
             Vec::with_capacity(active.len());
         for frame_info in active {
-            if let Some((handle, w, h)) =
-                preview.frame_textures.get(&frame_info.video_source_id).copied()
-            {
-                layers.push(crate::view::preview_window::CompositeLayer {
-                    texture: handle,
-                    width: w,
-                    height: h,
-                    alpha: frame_info.alpha,
-                });
-            }
+            let Some(ring) = state.cached_rings.get(&frame_info.video_source_id) else {
+                continue; // worker hasn't produced a ring yet
+            };
+            let Some(slot) = nearest_ring_slot(ring, frame_info.source_micros) else {
+                continue; // ring is empty (= all slots failed to decode)
+            };
+            let key = (frame_info.video_source_id, slot.slot_idx);
+            let Some((handle, w, h)) = preview.frame_textures.get(&key).copied() else {
+                continue; // texture not yet imported for this slot
+            };
+            // Sanity: dimensions in the cached ring slot must match
+            // the texture's. If they diverge the texture got
+            // re-created underneath us — fall back to ring-slot dims.
+            let _ = (w, h);
+            layers.push(crate::view::preview_window::CompositeLayer {
+                texture: handle,
+                width: slot.width,
+                height: slot.height,
+                alpha: frame_info.alpha,
+            });
         }
         preview.set_composite_layers(layers);
     }
 
-    /// docs/plan_video.md §3 P5: drain the worker's result channel
-    /// and upload each successfully decoded frame into the preview
-    /// window's per-source texture. Idempotent / cheap when the worker
-    /// is idle (= empty drain returns immediately).
+    /// docs/plan_video_perf.md P4: drain the worker's ring snapshots
+    /// and upload each ring slot into the preview window's
+    /// per-`(source_id, slot_idx)` texture cache, then record the
+    /// ring slot metadata in `state.cached_rings` so the composite
+    /// pass can pick the slot nearest to the current playhead.
+    /// Idempotent / cheap when the worker is idle.
     #[cfg(windows)]
     fn drain_preview_worker_results(state: &mut RunnerState) {
-        let results = state.playback_worker.drain_results();
-        if results.is_empty() {
+        let rings = state.playback_worker.drain_results();
+        if rings.is_empty() {
             return;
         }
         let Some(preview) = state.preview.as_mut() else {
             return; // preview window closed; drop the results.
         };
-        for result in results {
-            match result.frame {
-                Ok(frame) => {
-                    // docs/plan_video_perf.md P3: two upload paths
-                    // (`Shared` zero-copy / `Bgra` CPU fallback) — the
-                    // preview window's `upload_frame` dispatches
-                    // internally based on the variant. Diagnostic
-                    // tracking only logs the CPU upload path since
-                    // the Shared path's "upload" is just a one-time
-                    // DXGI handle import (cached after).
-                    let t_upload_start = std::time::Instant::now();
-                    let (variant_name, frame_bytes, w, h) = match &frame {
-                        crate::video_playback::DecodedFrame::Shared {
-                            width,
-                            height,
-                            ..
-                        } => ("shared", 0_usize, *width, *height),
-                        crate::video_playback::DecodedFrame::Bgra {
-                            width,
-                            height,
-                            bgra,
-                        } => ("bgra", bgra.len(), *width, *height),
-                    };
-                    preview.upload_frame(result.source_id, &frame);
-                    if result.target_micros > 0
-                        && state.preview_upload_log_remaining > 0
-                    {
-                        state.preview_upload_log_remaining =
-                            state.preview_upload_log_remaining.saturating_sub(1);
-                        let upload_ms =
-                            t_upload_start.elapsed().as_millis() as u64;
-                        tracing::info!(
-                            video_source_id = result.source_id,
-                            source_micros = result.target_micros,
-                            variant = variant_name,
-                            width = w,
-                            height = h,
-                            frame_bytes,
-                            upload_ms,
-                            "preview upload timing"
-                        );
+        for ring in rings {
+            let source_id = ring.source_id;
+            let mut cached: Vec<CachedRingSlot> = Vec::with_capacity(ring.slots.len());
+            for slot in &ring.slots {
+                let t_upload_start = std::time::Instant::now();
+                let (variant_name, frame_bytes, w, h, slot_idx) = match &slot.frame {
+                    crate::video_playback::DecodedFrame::Shared {
+                        width,
+                        height,
+                        slot_idx,
+                        ..
+                    } => ("shared", 0_usize, *width, *height, *slot_idx),
+                    crate::video_playback::DecodedFrame::Bgra {
+                        width,
+                        height,
+                        bgra,
+                    } => {
+                        // CPU fallback: the variant has no slot field,
+                        // so the worker writes all ring slots into the
+                        // same `(source_id, 0)` texture. The composite
+                        // pass treats this as "1-frame-latest" rather
+                        // than a true ring (acceptable for HW-less
+                        // environments — see plan §P4).
+                        ("bgra", bgra.len(), *width, *height, 0_u8)
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        video_source_id = result.source_id,
-                        source_micros = result.target_micros,
-                        "preview decode failed (worker), layer skipped"
+                };
+                preview.upload_frame(source_id, slot_idx, &slot.frame);
+                cached.push(CachedRingSlot {
+                    target_micros: slot.target_micros,
+                    slot_idx,
+                    width: w,
+                    height: h,
+                });
+                if slot.target_micros > 0 && state.preview_upload_log_remaining > 0 {
+                    state.preview_upload_log_remaining =
+                        state.preview_upload_log_remaining.saturating_sub(1);
+                    let upload_ms = t_upload_start.elapsed().as_millis() as u64;
+                    tracing::info!(
+                        video_source_id = source_id,
+                        source_micros = slot.target_micros,
+                        variant = variant_name,
+                        slot_idx,
+                        width = w,
+                        height = h,
+                        frame_bytes,
+                        upload_ms,
+                        "preview upload timing"
                     );
                 }
             }
+            // Keep cached slots ordered by `target_micros` so the
+            // nearest-slot binary search in `nearest_ring_slot` works.
+            cached.sort_by_key(|s| s.target_micros);
+            state.cached_rings.insert(source_id, cached);
         }
     }
 

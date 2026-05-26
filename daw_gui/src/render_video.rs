@@ -405,7 +405,12 @@ fn render_frame_composite(
         else {
             continue;
         };
-        let Ok(frame) = engine.decode_at(layer.video_source_id, &path, layer.source_micros)
+        // Export uses `VideoPlaybackEngine::new_cpu_only()` so the HW
+        // ring (= `slot_idx` routed to a `SharedPool` slot) is unused;
+        // the engine returns `DecodedFrame::Bgra` regardless and the
+        // slot index is ignored. Pass `0` as a placeholder.
+        let Ok(frame) =
+            engine.decode_at(layer.video_source_id, &path, layer.source_micros, 0)
         else {
             continue;
         };

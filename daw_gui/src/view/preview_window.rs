@@ -35,19 +35,20 @@ pub struct PreviewWindowState {
     pub window: Arc<DawGuiWindow>,
     pub renderer: Renderer<DawGuiWindow>,
     pub scene: Scene,
-    /// docs/plan_video.md P7: per-VideoSourceId GPU textures the
-    /// runner re-uploads each frame with the active clip's decoded
-    /// pixels. Multiple entries when more than one video clip is
-    /// active at the playhead (= crossfade between adjacent clips on
-    /// the same track, or stacked video tracks). `(handle, width,
-    /// height)`; widths/heights are source-native, the composite
-    /// pass aspect-fits each layer into the preview window
-    /// independently. Entries are kept across frames so re-uploads
-    /// reuse the same `TextureHandle` (= no GPU allocator churn at
-    /// 30fps); `clear_all` is called when the preview window
-    /// destructs to release them.
+    /// docs/plan_video_perf.md P4: per-`(VideoSourceId, slot_idx)`
+    /// GPU textures backing the lookahead ring. The worker
+    /// round-robins decoded frames through `PREVIEW_RING_SIZE`
+    /// independent `SharedPool` slots; the main thread imports each
+    /// slot's stable NT handle (zero-copy path) or uploads BGRA bytes
+    /// (CPU fallback path) into its own `TextureHandle` here exactly
+    /// once per slot, then re-uses that handle for every subsequent
+    /// frame the worker writes into the same slot. `(handle, width,
+    /// height)`; widths/heights are source-native, the composite pass
+    /// aspect-fits each layer into the preview window independently.
+    /// `clear_all` releases everything when the preview window
+    /// destructs.
     pub frame_textures: std::collections::HashMap<
-        common::model::VideoSourceId,
+        (common::model::VideoSourceId, u8),
         (TextureHandle, u32, u32),
     >,
     /// docs/plan_video.md P7: composite layer list the runner pushes
@@ -102,46 +103,59 @@ impl PreviewWindowState {
         })
     }
 
-    /// Upload (or `Shared` import) a freshly-decoded frame for
-    /// `source_id`. Reuses the existing `TextureHandle` when the
-    /// dimensions match (= hot path during playback / scrub); on a
-    /// dimension change (= rare, would mean the project's video
-    /// sources were re-imported) destroys and re-creates the texture.
+    /// Upload (or `Shared` import) a freshly-decoded frame into the
+    /// `(source_id, slot_idx)` cache entry. Reuses the existing
+    /// `TextureHandle` when the dimensions match (= hot path during
+    /// playback); on a dimension change (= rare, would mean the
+    /// project's video sources were re-imported) destroys and re-creates
+    /// the texture for that specific slot.
     ///
-    /// docs/plan_video_perf.md P3 (2026-05-25): two paths, dispatched
-    /// on the `DecodedFrame` variant:
+    /// docs/plan_video_perf.md P4: per-slot caching. Each
+    /// `VideoSourceId` owns `PREVIEW_RING_SIZE` distinct slots; their
+    /// shared NT handles (HW path) are stable for the slot's lifetime
+    /// so import happens exactly once per `(source_id, slot_idx)`
+    /// pair. Subsequent frames the worker writes into the same slot
+    /// reuse the cached `TextureHandle`.
     ///
-    /// - `Shared` (zero-copy): on first frame for a `source_id`, calls
-    ///   `Renderer::create_texture_from_d3d11_shared_handle` and
-    ///   caches the resulting wgpu `TextureHandle`. Subsequent frames
-    ///   for the same source do nothing (= the underlying D3D11
-    ///   resource is overwritten in place by the worker; wgpu samples
-    ///   the latest content automatically).
-    /// - `Bgra` (CPU fallback, P2): uses gui_01 Phase 73's
-    ///   `create_texture_bgra` + `upload_texture_bgra` so the WMF
-    ///   decoder's BGRA bytes go straight to a `Bgra8UnormSrgb` wgpu
-    ///   texture — no CPU channel swap.
+    /// Two paths, dispatched on the `DecodedFrame` variant:
+    ///
+    /// - `Shared` (zero-copy, P3): the variant's own `slot_idx` is
+    ///   used as the cache key; we ignore the caller's `slot_idx`
+    ///   argument and read the one embedded in the frame to avoid
+    ///   mismatch.
+    /// - `Bgra` (CPU fallback, P2): the variant has no slot field
+    ///   (the ring is HW-path only); we use the caller's `slot_idx`
+    ///   verbatim so the worker can still write all N ring slots
+    ///   into independent CPU textures, though the gains are limited
+    ///   compared to the GPU path.
     pub fn upload_frame(
         &mut self,
         source_id: common::model::VideoSourceId,
+        slot_idx: u8,
         frame: &crate::video_playback::DecodedFrame,
     ) -> Option<TextureHandle> {
         use crate::video_playback::DecodedFrame;
         match frame {
-            DecodedFrame::Shared { width, height, handle } => {
-                if let Some((_, w, h)) = self.frame_textures.get(&source_id)
+            DecodedFrame::Shared {
+                width,
+                height,
+                handle,
+                slot_idx: frame_slot,
+            } => {
+                let key = (source_id, *frame_slot);
+                if let Some((_, w, h)) = self.frame_textures.get(&key)
                     && *w == *width
                     && *h == *height
                 {
                     // Already imported — the worker writes new content
                     // into the same underlying D3D11 resource on every
                     // frame, so nothing for us to do here.
-                    return self.frame_textures.get(&source_id).map(|(h, _, _)| *h);
+                    return self.frame_textures.get(&key).map(|(h, _, _)| *h);
                 }
-                // First frame for this source (or dimensions changed):
-                // import the DXGI shared NT handle into wgpu's texture
-                // pool exactly once.
-                if let Some((old, _, _)) = self.frame_textures.remove(&source_id) {
+                // First frame for this (source, slot) (or dimensions
+                // changed): import the DXGI shared NT handle into
+                // wgpu's texture pool exactly once.
+                if let Some((old, _, _)) = self.frame_textures.remove(&key) {
                     self.renderer.destroy_texture(old);
                 }
                 match self.renderer.create_texture_from_d3d11_shared_handle(
@@ -151,13 +165,14 @@ impl PreviewWindowState {
                     *height,
                 ) {
                     Ok(tex) => {
-                        self.frame_textures.insert(source_id, (tex, *width, *height));
+                        self.frame_textures.insert(key, (tex, *width, *height));
                         Some(tex)
                     }
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
                             video_source_id = source_id,
+                            slot_idx = *frame_slot,
                             "create_texture_from_d3d11_shared_handle failed"
                         );
                         None
@@ -165,20 +180,21 @@ impl PreviewWindowState {
                 }
             }
             DecodedFrame::Bgra { width, height, bgra } => {
-                let recreate = match self.frame_textures.get(&source_id) {
+                let key = (source_id, slot_idx);
+                let recreate = match self.frame_textures.get(&key) {
                     Some((_, w, h)) => *w != *width || *h != *height,
                     None => true,
                 };
                 if recreate {
-                    if let Some((old, _, _)) = self.frame_textures.remove(&source_id) {
+                    if let Some((old, _, _)) = self.frame_textures.remove(&key) {
                         self.renderer.destroy_texture(old);
                     }
                     let h = self.renderer.create_texture_bgra(*width, *height);
-                    self.frame_textures.insert(source_id, (h, *width, *height));
+                    self.frame_textures.insert(key, (h, *width, *height));
                 }
                 let handle = self
                     .frame_textures
-                    .get(&source_id)
+                    .get(&key)
                     .map(|(h, _, _)| *h)
                     .expect("just inserted");
                 self.renderer.upload_texture_bgra(handle, bgra);
