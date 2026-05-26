@@ -196,6 +196,30 @@ fn nearest_ring_slot(slots: &[CachedRingSlot], target: u64) -> Option<CachedRing
     slots.iter().min_by_key(|s| s.target_micros.abs_diff(target)).copied()
 }
 
+/// preview window 内で `project_resolution` を letterbox 配置したときの
+/// 描画区域 `(x, y, w, h)` (= aspect-fit、 px 単位)。 PiP rect の
+/// normalized 0..=1 はこの box 内で展開する。 描画 / hit-test / drag delta
+/// が同 box を使うので window resize でも一致が保たれる。
+fn preview_project_box(
+    screen: (f32, f32),
+    project_resolution: (u32, u32),
+) -> (f32, f32, f32, f32) {
+    let (sw, sh) = screen;
+    let (pw, ph) = project_resolution;
+    if sw <= 0.0 || sh <= 0.0 || pw == 0 || ph == 0 {
+        return (0.0, 0.0, sw.max(0.0), sh.max(0.0));
+    }
+    let dst_aspect = sw / sh;
+    let src_aspect = pw as f32 / ph as f32;
+    if src_aspect >= dst_aspect {
+        let h = sw / src_aspect;
+        (0.0, (sh - h) * 0.5, sw, h)
+    } else {
+        let w = sh * src_aspect;
+        ((sw - w) * 0.5, 0.0, w, sh)
+    }
+}
+
 /// `docs/plan_image_overlay.md` §4 P5: 5 個の handle (NW/NE/SW/SE +
 /// 中央) と PiP rect 内部に対し hit-test を行い、 drag mode を返す。
 /// rect 外 / handle 外なら `None`。 corner handle の hit-box 半径は
@@ -205,13 +229,16 @@ fn hit_test_handles(
     rotation_radians: f32,
     cursor: (f32, f32),
     screen: (f32, f32),
+    project_resolution: (u32, u32),
 ) -> Option<PreviewDragMode> {
     let (nx, ny, nw, nh) = overlay;
-    let (sw, sh) = screen;
-    let rx = nx * sw;
-    let ry = ny * sh;
-    let rw = nw * sw;
-    let rh = nh * sh;
+    // PiP rect は project_resolution の letterbox 内座標で展開
+    // (= 描画と同 idiom)。 window resize で hit box がズレない。
+    let project_box = preview_project_box(screen, project_resolution);
+    let rx = project_box.0 + nx * project_box.2;
+    let ry = project_box.1 + ny * project_box.3;
+    let rw = nw * project_box.2;
+    let rh = nh * project_box.3;
     let cx0 = rx + rw * 0.5;
     let cy0 = ry + rh * 0.5;
     let (sin_r, cos_r) = rotation_radians.sin_cos();
@@ -262,10 +289,14 @@ fn handle_preview_drag(
     drag: &PreviewDragState,
     cursor: (f32, f32),
     screen: (f32, f32),
+    project_resolution: (u32, u32),
 ) {
     let (sx, sy) = drag.start_cursor;
-    let dx = (cursor.0 - sx) / screen.0.max(1.0);
-    let dy = (cursor.1 - sy) / screen.1.max(1.0);
+    // cursor delta も project_box の幅 / 高さで normalize (= 描画と同 idiom、
+    // window resize でも drag 量が画像座標と一致する)。
+    let project_box = preview_project_box(screen, project_resolution);
+    let dx = (cursor.0 - sx) / project_box.2.max(1.0);
+    let dy = (cursor.1 - sy) / project_box.3.max(1.0);
     let (sx0, sy0, sw0, sh0) = drag.start_rect;
     let (nx, ny, nw, nh) = match drag.mode {
         PreviewDragMode::Move => {
@@ -313,11 +344,10 @@ fn handle_preview_drag(
         }
         PreviewDragMode::Rotate => {
             // Rotate mode: cursor の rect 中心からの角度差分で rotation
-            // を更新。 rect そのもの (x/y/w/h) は不変。 SetClipImage
-            // Rotation だけ発火する経路で別 return する。
+            // を更新。 rect 中心は project_box 内座標で計算 (描画と同 idiom)。
             let (nx0, ny0, nw0, nh0) = drag.start_rect;
-            let cx0 = nx0 * screen.0 + nw0 * screen.0 * 0.5;
-            let cy0 = ny0 * screen.1 + nh0 * screen.1 * 0.5;
+            let cx0 = project_box.0 + nx0 * project_box.2 + nw0 * project_box.2 * 0.5;
+            let cy0 = project_box.1 + ny0 * project_box.3 + nh0 * project_box.3 * 0.5;
             let cur_angle = (cursor.1 - cy0).atan2(cursor.0 - cx0);
             let new_rotation = drag.start_rotation_radians
                 + (cur_angle - drag.start_cursor_angle);
@@ -754,12 +784,14 @@ impl Runner {
                 state.preview_cursor = Some(cursor);
                 if let Some(drag) = state.preview_drag {
                     let size = preview.renderer.size();
+                    let project_resolution = state.app.song.video_resolution;
                     handle_preview_drag(
                         &state.app,
                         &self.proxy,
                         &drag,
                         cursor,
                         (size.width as f32, size.height as f32),
+                        project_resolution,
                     );
                 }
             }
@@ -780,13 +812,26 @@ impl Runner {
                         let size = preview.renderer.size();
                         let screen = (size.width as f32, size.height as f32);
                         let rotation = preview.selection_rotation_radians;
-                        let mode = hit_test_handles(overlay, rotation, cursor, screen);
+                        let project_resolution = state.app.song.video_resolution;
+                        let mode = hit_test_handles(
+                            overlay,
+                            rotation,
+                            cursor,
+                            screen,
+                            project_resolution,
+                        );
                         if let Some(mode) = mode {
-                            // rect 中心 (screen px) を計算し、 cursor との
-                            // 角度を保存 (Rotate mode の delta 計算で使う)。
+                            // rect 中心 (letterbox 内座標) を計算し、 cursor
+                            // との角度を保存 (Rotate mode の delta 計算で使う)。
                             let (nx, ny, nw, nh) = overlay;
-                            let cx0 = nx * screen.0 + nw * screen.0 * 0.5;
-                            let cy0 = ny * screen.1 + nh * screen.1 * 0.5;
+                            let project_box =
+                                preview_project_box(screen, project_resolution);
+                            let cx0 = project_box.0
+                                + nx * project_box.2
+                                + nw * project_box.2 * 0.5;
+                            let cy0 = project_box.1
+                                + ny * project_box.3
+                                + nh * project_box.3 * 0.5;
                             let start_cursor_angle =
                                 (cursor.1 - cy0).atan2(cursor.0 - cx0);
                             state.preview_drag = Some(PreviewDragState {
@@ -1086,6 +1131,10 @@ impl Runner {
         // image-on-top convention covers the MV-overlay use case.
         let _ = ();
         preview.set_composite_layers(layers);
+        // PiP rect の normalized 座標は project_resolution の letterbox
+        // 内で展開される (= window resize しても画像 aspect が崩れない)。
+        // Song.video_resolution を毎 frame 同期。
+        preview.set_project_resolution(state.app.song.video_resolution);
 
         // `docs/plan_image_overlay.md` §4 P5: 選択中 image event の
         // PiP rect を preview window 上に縁取り + handle で描画する。

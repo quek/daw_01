@@ -77,6 +77,13 @@ pub struct PreviewWindowState {
     /// 描画時に rect を回転させて表示する)。 lane override 値が乗った
     /// 結果が入る (= runner 経由)。
     pub selection_rotation_radians: f32,
+    /// `Song.video_resolution` の最新値 (width, height)。 PiP rect の
+    /// normalized 0..=1 座標を「window 全体」 ではなく「project
+    /// resolution が letterbox 配置された区域」 内で展開するために使う。
+    /// runner が毎 frame で `set_project_resolution` を呼んで更新。
+    /// preview window がリサイズされても画像 PiP の aspect ratio は
+    /// project resolution に固定される (= 動画と同じ aspect-fit 動作)。
+    pub project_resolution: (u32, u32),
 }
 
 /// One textured layer in the preview composite. The runner builds a
@@ -155,7 +162,20 @@ impl PreviewWindowState {
             composite_layers: Vec::new(),
             selection_overlay: None,
             selection_rotation_radians: 0.0,
+            // 初期値は scale_to_fit_on_screen に渡された initial_size。
+            // runner が `set_project_resolution` で `Song.video_resolution`
+            // に同期させる前に preview window が描画されても、 1920x1080
+            // 既定値があれば最初の 1 frame だけ少しズレるだけで以降は
+            // 正しい aspect になる。
+            project_resolution: initial_size,
         })
+    }
+
+    /// `Song.video_resolution` を毎 frame 同期。 preview composite が
+    /// 画像 PiP の normalized 座標をこの解像度比で letterbox 配置するため、
+    /// runner が `set_composite_layers` の隣で呼ぶ。
+    pub fn set_project_resolution(&mut self, resolution: (u32, u32)) {
+        self.project_resolution = resolution;
     }
 
     /// Update the PiP selection overlay (= 縁取り + corner / center
@@ -371,6 +391,14 @@ impl PreviewWindowState {
             });
             self.draw_selection_overlay(screen.width as f32, screen.height as f32);
         } else {
+            // PiP rect の normalized 0..=1 は「project_resolution が preview
+            // window 内で letterbox 配置された区域」 内の座標として扱う。
+            // これで window resize しても画像 aspect ratio は project 比
+            // (= 動画 letterbox と同じ) に固定される。
+            let project_box = aspect_fit_rect(
+                (screen.width as f32, screen.height as f32),
+                (self.project_resolution.0 as f32, self.project_resolution.1 as f32),
+            );
             for layer in &self.composite_layers {
                 if layer.width == 0 || layer.height == 0 || layer.alpha <= 0.0 {
                     continue;
@@ -378,17 +406,17 @@ impl PreviewWindowState {
                 // docs/plan_image_overlay.md §P3: PiP rect handling.
                 // Video clips (`pip_rect = None`) letterbox; image
                 // overlays (`pip_rect = Some(x,y,w,h)` in normalized
-                // 0-1) map to a sub-rect of the preview surface.
+                // 0-1) map to a sub-rect inside `project_box`.
                 let dst = match layer.pip_rect {
                     None => aspect_fit_rect(
                         (screen.width as f32, screen.height as f32),
                         (layer.width as f32, layer.height as f32),
                     ),
                     Some((nx, ny, nw, nh)) => (
-                        nx * screen.width as f32,
-                        ny * screen.height as f32,
-                        nw * screen.width as f32,
-                        nh * screen.height as f32,
+                        project_box.0 + nx * project_box.2,
+                        project_box.1 + ny * project_box.3,
+                        nw * project_box.2,
+                        nh * project_box.3,
                     ),
                 };
                 self.scene.push_textured_quad(TexturedQuad {
@@ -419,11 +447,16 @@ impl PreviewWindowState {
         let Some((nx, ny, nw, nh)) = self.selection_overlay else {
             return;
         };
-        // PiP rect (= 画像の表示領域) を screen px に変換。
-        let rx = nx * sw;
-        let ry = ny * sh;
-        let rw = nw * sw;
-        let rh = nh * sh;
+        // PiP rect は project_resolution の letterbox 内座標系 (画像
+        // 描画と同 idiom)。 window resize しても画像と縁取りが一致する。
+        let project_box = aspect_fit_rect(
+            (sw, sh),
+            (self.project_resolution.0 as f32, self.project_resolution.1 as f32),
+        );
+        let rx = project_box.0 + nx * project_box.2;
+        let ry = project_box.1 + ny * project_box.3;
+        let rw = nw * project_box.2;
+        let rh = nh * project_box.3;
         let cx = rx + rw * 0.5;
         let cy = ry + rh * 0.5;
         let rot = self.selection_rotation_radians;
