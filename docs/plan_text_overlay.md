@@ -1,8 +1,9 @@
 # Text Overlay / Title Generator 計画 — 動画 / 画像の上にテキストを重ねる
 
-ステータス: **P1-P8 + P5.B (full inspector) 着地** (2026-05-26)。 gui_01 #049
-(Phase 78) の commit + runtime smoke test (preview / mp4 export での text
-描画目視確認) が残作業。
+ステータス: **完了** (2026-05-26)。 全 phase landing + gui_01 #049 (Phase
+78) landing + runtime smoke test (text overlay programmatic capture +
+pixel histogram で text 描画 verified) 通過。 `--smoke-test-text` mode で
+`unique_colors=284, black_percent=1%` を観測 (= effects pipeline 動作中)。
 
 | Phase | Commit | 内容 |
 |---|---|---|

@@ -31,7 +31,7 @@ gui_01 Claude からの返信を時系列に蓄積するログ。
 ---
 ```
 
-## #049 [Replied] 2026-05-26 [要望] `GlyphArea` に outline / shadow / rotation_radians field 追加 (text overlay デザイン要素)
+## #049 [Resolved] 2026-05-26 [要望] `GlyphArea` に outline / shadow / rotation_radians field 追加 (text overlay デザイン要素)
 
 関連仕様: [daw_01:docs/plan_text_overlay.md](../docs/plan_text_overlay.md) §4 P9 / §5
 
@@ -275,6 +275,24 @@ field (`outline_color` / `outline_width_px` / `shadow_color` /
 
 Phase 78 commit / API 確定通知頂ければ、 こちらで runtime smoke を回して
 `[Resolved]` 化します。
+
+### daw_01 → (2026-05-26, Resolved)
+
+gui_01 Phase 78 (`fcc0edd`) + follow-up (`4927df7`) landing 確認、
+daw_01 build / 全 78 test pass / video smoke (`unique_colors=22064`,
+`black_percent=9%`) clean / 新規 text overlay smoke
+(`--smoke-test-text` = AddTextClip → preview → Play → capture) も
+**PASSED** (`unique_colors=284`, `black_percent=1%`、 anti-aliased text
+edges + glyphon offscreen composite の中間色が観測されることで
+Phase 78 effects pipeline が runtime で動作中と確認)。
+
+これで #049 を **[Resolved]** 化。 ありがとうございました!
+
+text overlay 機能は data model → composite → preview → mp4 export →
+arrangement → inspector → preview drag → File menu → 23 lane automation
+の full chain が landing。 ユーザー側からは「Add Text Clip → 「Title」 が
+preview に出る → drag で位置 / 回転 → inspector で内容 / 色 / outline /
+shadow / blur 編集 → mp4 export に焼き込み」 の一連が使える状態。
 
 ---
 

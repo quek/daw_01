@@ -29,6 +29,12 @@ struct CliArgs {
     /// pixel histogram assertion → process::exit(0/1) する。
     /// `--script` とは相互排他。
     smoke_test: Option<PathBuf>,
+    /// `--smoke-test-text` 引数なし flag。 true のとき
+    /// [`daw_gui::smoke_test::spawn_text_overlay_orchestrator`] が
+    /// AddTextClip → preview → Play → capture → text 描画 histogram で
+    /// assertion → process::exit(0/1)。 gui_01 Phase 78 runtime 検証用。
+    /// 他の smoke / script 系と相互排他。
+    smoke_test_text: bool,
 }
 
 fn parse_args() -> Result<CliArgs> {
@@ -37,6 +43,7 @@ fn parse_args() -> Result<CliArgs> {
     let mut output: Option<PathBuf> = None;
     let mut extra: Vec<(String, String)> = Vec::new();
     let mut smoke_test: Option<PathBuf> = None;
+    let mut smoke_test_text = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -71,10 +78,13 @@ fn parse_args() -> Result<CliArgs> {
                     .ok_or_else(|| anyhow::anyhow!("--smoke-test needs a path"))?;
                 smoke_test = Some(PathBuf::from(v));
             }
+            "--smoke-test-text" => {
+                smoke_test_text = true;
+            }
             "--help" | "-h" => {
                 println!(
                     "daw_gui [--script <path.js>] [--output <path.wav>] [--arg KEY=VALUE]... \
-                     [--smoke-test <fixture.mp4>]"
+                     [--smoke-test <fixture.mp4>] [--smoke-test-text]"
                 );
                 std::process::exit(0);
             }
@@ -84,14 +94,18 @@ fn parse_args() -> Result<CliArgs> {
         }
         i += 1;
     }
-    if script.is_some() && smoke_test.is_some() {
-        anyhow::bail!("--script and --smoke-test are mutually exclusive");
+    if script.is_some() && (smoke_test.is_some() || smoke_test_text) {
+        anyhow::bail!("--script and --smoke-test[-text] are mutually exclusive");
+    }
+    if smoke_test.is_some() && smoke_test_text {
+        anyhow::bail!("--smoke-test and --smoke-test-text are mutually exclusive");
     }
     Ok(CliArgs {
         script,
         output,
         extra,
         smoke_test,
+        smoke_test_text,
     })
 }
 
@@ -107,10 +121,14 @@ fn main() -> Result<()> {
         return run_scripted(bootstrap, script_path, cli.output.as_deref(), &cli.extra);
     }
 
-    run_gui(bootstrap, cli.smoke_test)
+    run_gui(bootstrap, cli.smoke_test, cli.smoke_test_text)
 }
 
-fn run_gui(mut bootstrap: Bootstrap, smoke_test_fixture: Option<PathBuf>) -> Result<()> {
+fn run_gui(
+    mut bootstrap: Bootstrap,
+    smoke_test_fixture: Option<PathBuf>,
+    #[cfg_attr(not(windows), allow(unused_variables))] smoke_test_text: bool,
+) -> Result<()> {
     tracing::info!("opening main window");
 
     // GUI mode で必要な channel/handle を `Bootstrap` から取り出す。
@@ -166,6 +184,18 @@ fn run_gui(mut bootstrap: Bootstrap, smoke_test_fixture: Option<PathBuf>) -> Res
                     "smoke test mode — orchestrator will exit the process on completion"
                 );
                 daw_gui::smoke_test::spawn_orchestrator(fixture, proxy.clone());
+            }
+
+            // `--smoke-test-text` → text overlay orchestrator drives
+            // AddTextClip → TogglePreviewWindow → Play and asserts the
+            // preview shows visible text. Mutually exclusive with the
+            // fixture-based smoke (= CLI parser rejects the combination).
+            #[cfg(windows)]
+            if smoke_test_text {
+                tracing::info!(
+                    "text overlay smoke test mode — orchestrator will exit the process on completion"
+                );
+                daw_gui::smoke_test::spawn_text_overlay_orchestrator(proxy.clone());
             }
 
             app
