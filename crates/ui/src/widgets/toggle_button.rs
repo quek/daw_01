@@ -201,6 +201,7 @@ fn draw_toggle_button<M: ?Sized + 'static>(
         line_height: line_h,
         color: style.text_color,
         clip_rect: None,
+        ..GlyphArea::default()
     });
 
     // hint band: value=true && Some && hint_band_h > 0 のとき rect 下端に塗る。

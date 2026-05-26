@@ -22,7 +22,8 @@ use std::sync::Arc;
 use daw_ui_platform::{PhysicalSize, WindowBackend};
 
 use crate::pipelines::{
-    enqueue_runs, glyph::GlyphPipeline, line::LinePipeline, rect::RectPipeline, render_runs,
+    enqueue_runs, glyph::GlyphPipeline, line::LinePipeline, prepare_text_effects,
+    rect::RectPipeline, render_runs, text_effect::TextEffectCompositor,
     texture::TexturePipeline,
 };
 use crate::scene::{Scene, TextureHandle};
@@ -58,6 +59,10 @@ pub struct Renderer<W: WindowBackend + Send + Sync + 'static> {
     /// caller (daw_01 daw_gui) が `create_texture` / `upload_texture_rgba` / `destroy_texture`
     /// で lifecycle 管理する (GUI 側 LRU 等は持たない、 #043 設計判断)。
     texture_store: TextureStore,
+    /// M14 Phase 78 (daw_01 #049): GlyphArea outline / shadow / blur / rotation 効果 compositor。
+    /// effect 付き area を offscreen RGBA texture に焼いて、 base scene の TexturedQuad
+    /// (Phase 71/76 rotation 込み) として push する。 effect 無し path は既存 GlyphPipeline 直接。
+    text_effect: TextEffectCompositor,
     /// M14 Phase 74 (daw_01 #045 §B) / Phase 75 (#046): adapter の backend を保存。
     /// `create_texture_from_d3d11_shared_handle` が DX12 + Vulkan dispatch するため、
     /// 呼び出し時に `Backend` で path を選ぶ。 Metal / GL では `WrongBackend` で fail-soft。
@@ -154,6 +159,7 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
         let popup_glyph = GlyphPipeline::new(&device, &queue, format);
         let texture = TexturePipeline::new(&device, format);
         let texture_store = TextureStore::new();
+        let text_effect = TextEffectCompositor::new(&device, &queue);
 
         Ok(Self {
             surface,
@@ -168,6 +174,7 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
             popup_glyph,
             texture,
             texture_store,
+            text_effect,
             backend,
             vulkan_external_memory_supported,
             size,
@@ -565,10 +572,33 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
         self.popup_line.begin_frame();
         self.popup_glyph.begin_frame(&self.queue, self.size);
         self.texture.begin_frame();
+        self.text_effect.begin_frame();
 
-        // 3. base pass: scene.primitives を call order で walk、同 type 連続を 1 run に enqueue
-        let base_runs = enqueue_runs(
+        // 3. encoder を **先に** 作る (M14 Phase 78): text effect の pre-pass (offscreen
+        //    glyph + blur H/V + composite) を base pass より前に同 encoder に積むため。
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("daw-ui frame encoder"),
+        });
+
+        // 4. M14 Phase 78 (daw_01 #049): effect 付き Glyph primitive を offscreen で render → texture
+        //    に焼いて Primitive::Texture に substitute。 effect 無し / 他 type は pass-through。
+        let (font_system, swash_cache) = self.glyph.font_system_and_swash();
+        let base_primitives_substituted = prepare_text_effects(
             &scene.primitives,
+            &mut self.text_effect,
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            font_system,
+            swash_cache,
+            &mut self.texture_store,
+            self.texture.sampler(),
+            self.texture.texture_bind_group_layout(),
+        );
+
+        // 5. base pass: substituted primitives を call order で walk、同 type 連続を 1 run に enqueue
+        let base_runs = enqueue_runs(
+            &base_primitives_substituted,
             &mut self.rect,
             &mut self.line,
             &mut self.glyph,
@@ -578,7 +608,8 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
             self.size,
         );
 
-        // 4. popup pass: scene.popup_primitives を同様に enqueue (texture は base のみ、 #043)
+        // 6. popup pass: scene.popup_primitives を同様に enqueue (texture は base のみ、 #043、
+        //    popup には text effect 適用なし — popup 用途では outline / shadow / blur 不要)
         let popup_runs = enqueue_runs(
             &scene.popup_primitives,
             &mut self.popup_rect,
@@ -590,17 +621,14 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
             self.size,
         );
 
-        // 5. upload (rect/line/texture の instance buffer を 1 度に GPU へ転送、glyph は enqueue 内で済)
+        // 7. upload (rect/line/texture の instance buffer を 1 度に GPU へ転送、glyph は enqueue 内で済)
         self.rect.upload(&self.queue, self.size);
         self.line.upload(&self.queue, self.size);
         self.texture.upload(&self.queue, self.size);
         self.popup_rect.upload(&self.queue, self.size);
         self.popup_line.upload(&self.queue, self.size);
 
-        // 6. encode (base pass: clear + 全 base run を call order で render)
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("daw-ui frame encoder"),
-        });
+        // 8. encode (base pass: clear + 全 base run を call order で render)
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("daw-ui base pass"),
@@ -661,9 +689,11 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
             );
         }
 
-        // 8. end_frame: glyph cache eviction を進める
+        // end_frame: glyph cache eviction を進める + text_effect も同様に eviction (= 5sec 未使用で
+        // composite texture を destroy、 既存 GlyphPipeline と同 idiom)
         self.glyph.end_frame();
         self.popup_glyph.end_frame();
+        self.text_effect.end_frame(&mut self.texture_store);
 
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();

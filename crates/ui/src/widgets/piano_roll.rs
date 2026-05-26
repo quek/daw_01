@@ -2527,6 +2527,7 @@ fn draw_grid_background<M: ?Sized + 'static>(
                     line_height: style.c_label_font_px * 1.2,
                     color,
                     clip_rect: None,
+                    ..GlyphArea::default()
                 });
             }
         }
@@ -2595,6 +2596,7 @@ fn draw_grid_background<M: ?Sized + 'static>(
                             line_height: style.c_label_font_px * 1.2,
                             color: style.root_label_fg,
                             clip_rect: None,
+                            ..GlyphArea::default()
                         });
                     }
                 } else if pitch.is_multiple_of(12) {
@@ -2608,6 +2610,7 @@ fn draw_grid_background<M: ?Sized + 'static>(
                         line_height: style.c_label_font_px * 1.2,
                         color: style.c_label_color,
                         clip_rect: None,
+                        ..GlyphArea::default()
                     });
                 }
             }
@@ -2700,6 +2703,7 @@ fn draw_lyrics<M: ?Sized + 'static>(
             line_height: font_size * 1.1,
             color: lyric_color,
             clip_rect: Some(clipped),
+            ..GlyphArea::default()
         });
     }
 }

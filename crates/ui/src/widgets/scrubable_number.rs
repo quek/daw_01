@@ -466,6 +466,7 @@ fn draw_scrubable_number<M: ?Sized + 'static>(
         line_height: line_h,
         color: style.text_color,
         clip_rect: Some(rect),
+        ..GlyphArea::default()
     });
 }
 

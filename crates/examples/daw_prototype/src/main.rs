@@ -1100,6 +1100,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
         line_height: 14.0,
         color: Color::rgb(0.85, 0.85, 0.88),
         clip_rect: Some(inspector_rect),
+        ..daw_ui_renderer::GlyphArea::default()
     });
     let mut bx = inspector_rect.x + 110.0;
     let btn_h = (inspector_h - 4.0).max(16.0);
@@ -1167,6 +1168,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
         line_height: 14.0,
         color: Color::rgb(0.85, 0.85, 0.88),
         clip_rect: Some(inspector_rect),
+        ..daw_ui_renderer::GlyphArea::default()
     });
     let scn_style = daw_ui_core::ScrubableNumberStyle {
         sensitivity: 0.5, // 1 px = 0.5 BPM (Ableton 風)

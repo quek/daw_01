@@ -125,6 +125,7 @@ pub(crate) fn draw_items_popup<'a, M: ?Sized + 'static>(
             line_height: MENU_FONT * 1.2,
             color: Color::rgb(0.92, 0.92, 0.94),
             clip_rect: None,
+            ..GlyphArea::default()
         });
         if hovered && pointer.primary_just_released {
             clicked = Some(i);
@@ -273,6 +274,7 @@ impl<'b, 'a, M: ?Sized + 'static> MenuBarBuilder<'b, 'a, M> {
             line_height: MENU_FONT * 1.2,
             color: Color::rgb(0.92, 0.94, 0.97),
             clip_rect: None,
+            ..GlyphArea::default()
         });
 
         // popup 描画 (popup_layer 経由、sub-menu cascade を draw_menu_entries 内で再帰処理)
@@ -386,6 +388,7 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
             line_height: MENU_FONT * 1.2,
             color: text_color,
             clip_rect: None,
+            ..GlyphArea::default()
         });
         // shortcut hint を右端に灰色で
         if let Some(hint) = item_hint {
@@ -398,6 +401,7 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
                 line_height: MENU_FONT * 1.2,
                 color: arrow_color,
                 clip_rect: None,
+                ..GlyphArea::default()
             });
         }
         if is_sub {
@@ -410,6 +414,7 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
                 line_height: MENU_FONT * 1.2,
                 color: arrow_color,
                 clip_rect: None,
+                ..GlyphArea::default()
             });
         }
 

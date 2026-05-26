@@ -242,6 +242,14 @@ impl GlyphPipeline {
     pub fn cache_size(&self) -> usize {
         self.cache.len()
     }
+
+    /// M14 Phase 78 (daw_01 #049): `TextEffectCompositor` が offscreen text render で
+    /// 同じ font / glyph rasterization を共有するための disjoint-field borrow accessor。
+    /// `Cache` (= glyphon pipeline cache、 Arc<Inner> で cheap) は別 instance を持つが、
+    /// font_system / swash_cache は重い (font 全 load + glyph raster cache) なので共有する。
+    pub fn font_system_and_swash(&mut self) -> (&mut FontSystem, &mut SwashCache) {
+        (&mut self.font_system, &mut self.swash_cache)
+    }
 }
 
 #[cfg(test)]
@@ -262,6 +270,7 @@ mod tests {
             line_height: lh,
             color: Color::rgb(1.0, 1.0, 1.0),
             clip_rect: None,
+            ..GlyphArea::default()
         }
     }
 

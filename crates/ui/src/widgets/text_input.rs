@@ -605,6 +605,7 @@ fn draw_text_input<M: ?Sized + 'static>(
             line_height: line_h,
             color: Color::rgb(0.92, 0.92, 0.94),
             clip_rect: None,
+            ..GlyphArea::default()
         });
     }
 

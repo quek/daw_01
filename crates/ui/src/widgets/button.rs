@@ -123,6 +123,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 line_height: line_h,
                 color: Color::rgb(0.95, 0.95, 0.97),
                 clip_rect: None,
+                ..GlyphArea::default()
             });
         });
 

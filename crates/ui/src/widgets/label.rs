@@ -39,6 +39,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 line_height: font_size * 1.2,
                 color,
                 clip_rect: None,
+                ..GlyphArea::default()
             });
         });
     }
@@ -68,6 +69,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 line_height: line_h,
                 color: Color::rgb(0.92, 0.92, 0.94),
                 clip_rect: None,
+                ..GlyphArea::default()
             });
         });
         self.next_y += line_h + pad;

@@ -169,6 +169,77 @@ impl TextureStore {
         );
     }
 
+    /// M14 Phase 78 (daw_01 #049): **render target** として使える texture を作成して entry 化。
+    ///
+    /// 既存 `create` との違い: usage に `RENDER_ATTACHMENT` を追加 (= caller が
+    /// `begin_render_pass` の `color_attachments[].view` で書き出し可能)、 `COPY_DST` は不要
+    /// なので外す (CPU upload しない、 GPU 内 stay 用途)。 text effect composite (Phase 78)、
+    /// post-process pass の中間 / 最終 target で使う想定。
+    ///
+    /// 戻り値の `TextureView` は `color_attachments` で渡すための view (caller が encoder 発行
+    /// 時に使い、 use 後は drop して OK)。 sampling 用 bind_group は store 内に別 view で
+    /// 保持されているので、 戻り値の view を消費しても後段 sample に影響しない。
+    pub fn create_render_target(
+        &mut self,
+        device: &wgpu::Device,
+        sampler: &wgpu::Sampler,
+        layout: &wgpu::BindGroupLayout,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> (TextureHandle, wgpu::TextureView) {
+        self.next_id += 1;
+        let id = NonZeroU32::new(self.next_id).expect("texture id overflow at 1");
+        let w = width.max(1);
+        let h = height.max(1);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("texture pool entry (render target)"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        // sampling 用 view (store の bind_group 内、 寿命 = entry と同じ)
+        let sample_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("texture pool bg (render target)"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&sample_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+        // color_attachments 用 view (caller が use して drop する別 view)
+        let target_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("texture pool render target view"),
+            ..wgpu::TextureViewDescriptor::default()
+        });
+        self.entries.insert(
+            id,
+            TextureEntry {
+                texture,
+                bind_group,
+                width: w,
+                height: h,
+                format,
+            },
+        );
+        (TextureHandle::from_raw(id), target_view)
+    }
+
     /// M14 Phase 74 (daw_01 #045 §B): 外部で構築済の `wgpu::Texture` を import して entry 化。
     /// `create` は内部で `device.create_texture(...)` を呼ぶが、 こちらは caller が既に持っている
     /// wgpu::Texture (e.g. `wgpu::Device::create_texture_from_hal` で D3D11 shared handle から構築
@@ -247,6 +318,15 @@ impl TextureStore {
     #[must_use]
     pub fn bind_group(&self, handle: TextureHandle) -> Option<&wgpu::BindGroup> {
         self.entries.get(&handle.raw_id()).map(|e| &e.bind_group)
+    }
+
+    /// M14 Phase 78 (daw_01 #049): handle から `&wgpu::Texture` を取り出す。 text_effect の
+    /// blur / composite pass で独自 BindGroupLayout (= 2 texture binding 等) を新規 bind_group
+    /// するため、 source texture へのアクセスが必要 (= 既存 `bind_group()` は texture pipeline
+    /// 専用 layout 用なので、 異なる layout に対しては再 bind 必要)。
+    #[must_use]
+    pub fn raw_texture(&self, handle: TextureHandle) -> Option<&wgpu::Texture> {
+        self.entries.get(&handle.raw_id()).map(|e| &e.texture)
     }
 }
 

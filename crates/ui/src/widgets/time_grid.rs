@@ -224,6 +224,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     line_height: RULER_FONT * 1.2,
                     color: style.label_color,
                     clip_rect: Some(rect),
+                    ..GlyphArea::default()
                 });
             }
         });

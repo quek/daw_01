@@ -1169,6 +1169,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 line_height: line_h,
                 color: Color::rgb(0.85, 0.95, 0.85),
                 clip_rect: None,
+                ..GlyphArea::default()
             });
         }
         self.drawing_in_popup = prev_in_popup;

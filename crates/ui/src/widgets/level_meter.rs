@@ -207,6 +207,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 line_height: 12.0,
                 color: Color::rgba(0.85, 0.88, 0.92, 0.85),
                 clip_rect: Some(rect),
+                ..GlyphArea::default()
             });
         }
     }

@@ -2646,6 +2646,7 @@ fn draw_video_clip<M: ?Sized + 'static>(
             line_height: style.clip_text_size * 1.2,
             color: text_color,
             clip_rect: Some(r),
+            ..GlyphArea::default()
         });
     }
 }
@@ -2729,6 +2730,7 @@ fn draw_clip<M: ?Sized + 'static>(
                 line_height: style.clip_text_size * 1.2,
                 color: text_color,
                 clip_rect: Some(r),
+                ..GlyphArea::default()
             });
         }
         hctx.push_text(GlyphArea {
@@ -2739,6 +2741,7 @@ fn draw_clip<M: ?Sized + 'static>(
             line_height: style.clip_text_size * 1.2,
             color: text_color,
             clip_rect: Some(r),
+            ..GlyphArea::default()
         });
     }
 }
@@ -2905,6 +2908,7 @@ fn draw_drag_preview<M: ?Sized + 'static>(
                 line_height: style.clip_clone_badge_size * 1.2,
                 color: style.clip_clone_badge_color,
                 clip_rect: Some(r),
+                ..GlyphArea::default()
             });
         }
     }
@@ -3092,6 +3096,7 @@ fn draw_audio_drag_ghost<M: ?Sized + 'static>(
             line_height: font_size * 1.2,
             color: style.audio_ghost_label_color,
             clip_rect: Some(r),
+            ..GlyphArea::default()
         });
     }
 }
@@ -4032,6 +4037,7 @@ fn draw_automation_lane<M: ?Sized + 'static>(
             line_height: icon_size * 1.2,
             color: style.automation_lane_text_color,
             clip_rect: Some(header_rect),
+            ..GlyphArea::default()
         });
         // [V] icon glyph (lane.icon_glyph、 lane 識別色)
         hctx.push_text(GlyphArea {
@@ -4042,6 +4048,7 @@ fn draw_automation_lane<M: ?Sized + 'static>(
             line_height: icon_size * 1.2,
             color: lane.color,
             clip_rect: Some(header_rect),
+            ..GlyphArea::default()
         });
         // label (icon_glyph の右、 visible_icon の左までの帯)
         let label_x = layout.icon_glyph_rect.x + layout.icon_glyph_rect.w + pad;
@@ -4059,6 +4066,7 @@ fn draw_automation_lane<M: ?Sized + 'static>(
             line_height: icon_size * 1.2,
             color: style.automation_lane_text_color,
             clip_rect: Some(label_clip),
+            ..GlyphArea::default()
         });
         // default value slider 帯 (band_rect が `Some` の場合のみ、 行高に余裕がある時)
         if let Some(band) = layout.default_band_rect {
@@ -4084,6 +4092,7 @@ fn draw_automation_lane<M: ?Sized + 'static>(
                 line_height: icon_size * 1.2,
                 color: style.automation_lane_text_color,
                 clip_rect: Some(header_rect),
+                ..GlyphArea::default()
             });
         }
     }
@@ -4196,6 +4205,7 @@ fn draw_automation_lane<M: ?Sized + 'static>(
                     line_height: style.clip_text_size,
                     color: glyph_color,
                     clip_rect: Some(clip_rect),
+                    ..GlyphArea::default()
                 });
             }
             hctx.push_text(GlyphArea {
@@ -4206,6 +4216,7 @@ fn draw_automation_lane<M: ?Sized + 'static>(
                 line_height: style.clip_text_size,
                 color: glyph_color,
                 clip_rect: Some(clip_rect),
+                ..GlyphArea::default()
             });
         }
 
@@ -6318,6 +6329,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                             line_height: style_copy.clip_clone_badge_size * 1.2,
                             color: style_copy.clip_clone_badge_color,
                             clip_rect: Some(ghost_rect),
+                            ..GlyphArea::default()
                         });
                     }
                 }
@@ -7585,6 +7597,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         line_height: style.master_row_label_size * 1.2,
                         color: style.master_row_label_color,
                         clip_rect: Some(label_rect),
+                        ..GlyphArea::default()
                     });
                     // M14 Phase 63n-10 (#034): lane disclosure (`+` / `-`) を master row でも描画 (= 通常
                     // track と同 idiom)。 click 検出は press block 経由で `press_lane_toggle = Some(t.id)`
@@ -7602,6 +7615,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                             line_height: style.automation_disclosure_size * 1.2,
                             color: style.disclosure_color,
                             clip_rect: Some(lane_disc),
+                            ..GlyphArea::default()
                         });
                     }
                     // Response.track_header_rects に積む (caller が master row の rect 領域を識別可能に)。
@@ -7679,6 +7693,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         line_height: style.track_text_size * 1.2,
                         color: style.disclosure_color,
                         clip_rect: Some(disclosure_rect),
+                        ..GlyphArea::default()
                     });
                     if pointer.primary_just_released
                         && let Some((rx, ry)) = pointer.pos
@@ -7705,6 +7720,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         line_height: style.automation_disclosure_size * 1.2,
                         color: style.disclosure_color,
                         clip_rect: Some(lane_disc),
+                        ..GlyphArea::default()
                     });
                 }
                 // disclosure を除いた name 領域 (group の場合は disclosure 分削る)

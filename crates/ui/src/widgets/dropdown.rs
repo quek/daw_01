@@ -65,6 +65,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 line_height: DROPDOWN_FONT * 1.2,
                 color: Color::rgb(0.92, 0.92, 0.94),
                 clip_rect: None,
+                ..GlyphArea::default()
             });
         }
 

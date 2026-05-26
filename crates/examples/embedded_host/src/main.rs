@@ -106,6 +106,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         line_height: 20.0,
         color: Color::WHITE,
         clip_rect: None,
+        ..GlyphArea::default()
     });
 
     // ============================================================
@@ -146,6 +147,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         line_height: 14.0,
         color: Color::rgb(0.7, 0.85, 1.0),
         clip_rect: None,
+        ..GlyphArea::default()
     });
 
     // ============================================================
@@ -172,6 +174,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         line_height: 14.0,
         color: Color::rgb(0.85, 0.95, 0.7),
         clip_rect: None,
+        ..GlyphArea::default()
     });
 
     // ============================================================
@@ -202,6 +205,108 @@ fn main() -> Result<(), Box<dyn Error>> {
         line_height: 14.0,
         color: Color::rgb(0.95, 0.85, 0.6),
         clip_rect: None,
+        ..GlyphArea::default()
+    });
+
+    // ============================================================
+    // M14 Phase 78 (daw_01 #049): text effect smoke (outline / shadow / blur / rotation)
+    // ============================================================
+    //
+    // 4 種の text effect を縦に並べて PNG snapshot で目視確認:
+    //  (a) effect なし baseline (= byte 完全互換確認)
+    //  (b) outline 2px (= 黒い縁取り)
+    //  (c) shadow offset(4,4) blur=0 (= hard shadow)
+    //  (d) shadow offset(0,0) blur=8 (= soft blur shadow)
+    //  (e) rotation π/6 + outline + soft shadow (= 全 effect combine)
+    let effect_x = 20.0_f32;
+    let mut effect_y = 350.0_f32;
+    let effect_font = 24.0_f32;
+    let effect_line_h = 30.0_f32;
+    let label = |y, text: &str| GlyphArea {
+        text: text.into(),
+        left: effect_x,
+        top: y,
+        font_size: 10.0,
+        line_height: 12.0,
+        color: Color::rgb(0.6, 0.6, 0.7),
+        clip_rect: None,
+        ..GlyphArea::default()
+    };
+    // (a) baseline (effect なし) — Phase 71 と同じ既存 path で描画される (has_effects = false)
+    scene.push_text(label(effect_y, "(a) baseline:"));
+    scene.push_text(GlyphArea {
+        text: "Hello".into(),
+        left: effect_x + 100.0,
+        top: effect_y - 5.0,
+        font_size: effect_font,
+        line_height: effect_line_h,
+        color: Color::WHITE,
+        clip_rect: None,
+        ..GlyphArea::default()
+    });
+    effect_y += 36.0;
+    // (b) outline 2px (= 黒い縁取り)
+    scene.push_text(label(effect_y, "(b) outline 2px:"));
+    scene.push_text(GlyphArea {
+        text: "Hello".into(),
+        left: effect_x + 100.0,
+        top: effect_y - 5.0,
+        font_size: effect_font,
+        line_height: effect_line_h,
+        color: Color::WHITE,
+        clip_rect: None,
+        outline_color: Color::BLACK,
+        outline_width_px: 2.0,
+        ..GlyphArea::default()
+    });
+    effect_y += 36.0;
+    // (c) hard shadow (offset=(4,4) blur=0)
+    scene.push_text(label(effect_y, "(c) hard shadow:"));
+    scene.push_text(GlyphArea {
+        text: "Hello".into(),
+        left: effect_x + 100.0,
+        top: effect_y - 5.0,
+        font_size: effect_font,
+        line_height: effect_line_h,
+        color: Color::WHITE,
+        clip_rect: None,
+        shadow_color: Color::rgba(0.0, 0.0, 0.0, 0.5),
+        shadow_offset_px: (4.0, 4.0),
+        ..GlyphArea::default()
+    });
+    effect_y += 36.0;
+    // (d) soft (blurred) shadow (= separable gaussian 5-tap @ blur=8)
+    scene.push_text(label(effect_y, "(d) soft shadow blur=8:"));
+    scene.push_text(GlyphArea {
+        text: "Hello".into(),
+        left: effect_x + 130.0,
+        top: effect_y - 5.0,
+        font_size: effect_font,
+        line_height: effect_line_h,
+        color: Color::WHITE,
+        clip_rect: None,
+        shadow_color: Color::rgba(0.0, 0.0, 0.0, 0.7),
+        shadow_offset_px: (0.0, 0.0),
+        shadow_blur_px: 8.0,
+        ..GlyphArea::default()
+    });
+    effect_y += 36.0;
+    // (e) combine: rotation + outline + soft shadow
+    scene.push_text(label(effect_y, "(e) rot π/6 + outline + shadow:"));
+    scene.push_text(GlyphArea {
+        text: "Hello".into(),
+        left: effect_x + 160.0,
+        top: effect_y - 5.0,
+        font_size: effect_font,
+        line_height: effect_line_h,
+        color: Color::WHITE,
+        clip_rect: None,
+        outline_color: Color::BLACK,
+        outline_width_px: 2.0,
+        shadow_color: Color::rgba(0.0, 0.0, 0.0, 0.5),
+        shadow_offset_px: (3.0, 3.0),
+        shadow_blur_px: 4.0,
+        rotation_radians: std::f32::consts::FRAC_PI_6,
     });
 
     // 1 フレーム render → RGBA bytes (sRGB encoded、行 stride = width * 4)

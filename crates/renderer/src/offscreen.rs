@@ -20,7 +20,8 @@ use daw_ui_platform::PhysicalSize;
 
 use crate::device::{RenderError, RendererInitError};
 use crate::pipelines::{
-    enqueue_runs, glyph::GlyphPipeline, line::LinePipeline, rect::RectPipeline, render_runs,
+    enqueue_runs, glyph::GlyphPipeline, line::LinePipeline, prepare_text_effects,
+    rect::RectPipeline, render_runs, text_effect::TextEffectCompositor,
     texture::TexturePipeline,
 };
 use crate::scene::{Scene, TextureHandle};
@@ -41,6 +42,9 @@ pub struct OffscreenRenderer {
     texture: TexturePipeline,
     /// M14 Phase 71: texture handle → wgpu::Texture + bind_group の lookup table。
     texture_store: TextureStore,
+    /// M14 Phase 78 (daw_01 #049): text effect compositor (Renderer<W> と同 idiom、 PNG
+    /// snapshot test でも outline / shadow / blur / rotation 効果を捉えるために必要)。
+    text_effect: TextEffectCompositor,
     size: PhysicalSize,
 }
 
@@ -82,6 +86,7 @@ impl OffscreenRenderer {
         let glyph = GlyphPipeline::new(&device, &queue, target_format);
         let texture = TexturePipeline::new(&device, target_format);
         let texture_store = TextureStore::new();
+        let text_effect = TextEffectCompositor::new(&device, &queue);
 
         Ok(Self {
             device,
@@ -92,6 +97,7 @@ impl OffscreenRenderer {
             glyph,
             texture,
             texture_store,
+            text_effect,
             size: PhysicalSize { width: width.max(1), height: height.max(1) },
         })
     }
@@ -212,9 +218,30 @@ impl OffscreenRenderer {
         self.line.begin_frame();
         self.glyph.begin_frame(&self.queue, self.size);
         self.texture.begin_frame();
+        self.text_effect.begin_frame();
+
+        // M14 Phase 78: encoder を **先に** 作り、 text effect pre-pass を同 encoder に積む
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("daw-ui offscreen encoder"),
+        });
+
+        // M14 Phase 78 (daw_01 #049): effect 付き Glyph を offscreen で焼いて Primitive::Texture に substitute
+        let (font_system, swash_cache) = self.glyph.font_system_and_swash();
+        let base_primitives_substituted = prepare_text_effects(
+            &scene.primitives,
+            &mut self.text_effect,
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            font_system,
+            swash_cache,
+            &mut self.texture_store,
+            self.texture.sampler(),
+            self.texture.texture_bind_group_layout(),
+        );
 
         let base_runs = enqueue_runs(
-            &scene.primitives,
+            &base_primitives_substituted,
             &mut self.rect,
             &mut self.line,
             &mut self.glyph,
@@ -242,9 +269,6 @@ impl OffscreenRenderer {
         self.texture.upload(&self.queue, self.size);
 
         // 4. encode: base pass + (popup pass) + copy_texture_to_buffer
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("daw-ui offscreen encoder"),
-        });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("daw-ui offscreen base pass"),
@@ -300,6 +324,8 @@ impl OffscreenRenderer {
             );
         }
         self.glyph.end_frame();
+        // M14 Phase 78: text effect cache eviction (= 5sec 未使用 composite texture を destroy)
+        self.text_effect.end_frame(&mut self.texture_store);
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &target,

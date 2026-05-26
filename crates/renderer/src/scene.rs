@@ -127,6 +127,14 @@ impl RectCommand {
 /// `text` は `Arc<str>` で持つ (M12 Phase 53)。`Primitive::clone()` (scenegraph cache
 /// hit 経路で毎フレーム発火) を refcount のみに圧縮するため。構築側は `&str` /
 /// `String` から `.into()` で渡せる。
+///
+/// # M14 Phase 78 (daw_01 #049): text effects (outline / shadow / blur / rotation)
+///
+/// `outline_*` / `shadow_*` / `rotation_radians` を「**no-op default**」 に揃えてあるため、
+/// 既存 caller は 6 field を追加するだけで挙動互換 (= byte 完全互換は `has_effects` が
+/// false 化される条件で保証)。 effect ありの area は内部で offscreen RGBA texture に
+/// glyphon で焼いて → blur / outline / fill を 1 composite pass で合成 → Phase 71/76 の
+/// `TexturedQuad` (rotation_radians 込み) で base scene に push する 4-5 pass pipeline。
 #[derive(Debug, Clone)]
 pub struct GlyphArea {
     /// 表示する文字列 (UTF-8)。
@@ -142,6 +150,93 @@ pub struct GlyphArea {
     /// `Some` ならこの矩形外をクリップ (glyphon の `TextBounds` で適用)。
     /// `None` で全画面描画。`Ui::with_clip_rect` が自動設定する。
     pub clip_rect: Option<Rect>,
+    /// M14 Phase 78 (daw_01 #049): アウトライン色 RGBA。 `outline_width_px == 0.0` なら
+    /// アウトライン無し (= `outline_color` の値は無視)。
+    pub outline_color: Color,
+    /// アウトライン太さ (px、 `0.0` で無効)。 NaN / ±Infinity は renderer 側で `0.0` に
+    /// 正規化 (caller 責務にしない)。 軽量 9-sample 法を採用するため実用 range は 1-4 px。
+    pub outline_width_px: f32,
+    /// ドロップシャドウ色 RGBA。 `shadow_color.a == 0.0` なら shadow 無し (= offset / blur
+    /// が non-zero でも無視)。
+    pub shadow_color: Color,
+    /// シャドウオフセット (`(dx, dy)` px)。 `(0, 0)` で本体真下、 `(4, 4)` で右下 4px。 NaN /
+    /// ±Infinity は renderer 側で `0.0` に正規化。
+    pub shadow_offset_px: (f32, f32),
+    /// シャドウぼかし半径 (px、 `0.0` で hard shadow)。 `> 0.0` で separable gaussian blur
+    /// (= 2-pass)。 NaN / ±Infinity は renderer 側で `0.0` に正規化。
+    pub shadow_blur_px: f32,
+    /// rect 中心 (`(left + width/2, top + line_height/2)`) を旋回中心とする 2D 回転
+    /// (radians、 clockwise positive in screen-down y)。 `0.0` で既存挙動と byte 完全互換。
+    /// NaN / ±Infinity は renderer 側で `0.0` に正規化 (Phase 76 の `TexturedQuad.
+    /// rotation_radians` と同 idiom)。
+    pub rotation_radians: f32,
+}
+
+impl GlyphArea {
+    /// 必須 field (`text` / `left` / `top` / `font_size` / `line_height` / `color`) のみ指定で
+    /// effect 無しの GlyphArea を作る最短コンストラクタ。 clip_rect / outline / shadow /
+    /// rotation はすべて no-op default。 既存挙動 byte 完全互換。
+    #[must_use]
+    pub fn new(
+        text: std::sync::Arc<str>,
+        left: f32,
+        top: f32,
+        font_size: f32,
+        line_height: f32,
+        color: Color,
+    ) -> Self {
+        Self {
+            text,
+            left,
+            top,
+            font_size,
+            line_height,
+            color,
+            clip_rect: None,
+            outline_color: Color::TRANSPARENT,
+            outline_width_px: 0.0,
+            shadow_color: Color::TRANSPARENT,
+            shadow_offset_px: (0.0, 0.0),
+            shadow_blur_px: 0.0,
+            rotation_radians: 0.0,
+        }
+    }
+
+    /// M14 Phase 78 (daw_01 #049): effect 有効判定。 全 field が no-op default なら `false`
+    /// (= 既存 glyphon 直接 path を使う)、 いずれかが有効なら `true` (= offscreen composite
+    /// path を使う)。 `has_effects(area) == false` の場合は既存挙動と byte 完全互換。
+    #[must_use]
+    pub fn has_effects(&self) -> bool {
+        self.outline_width_px > 0.0
+            || self.shadow_color.a > 0.0
+            || self.rotation_radians != 0.0
+    }
+}
+
+impl Default for GlyphArea {
+    /// M14 Phase 78 (daw_01 #049): `..GlyphArea::default()` で effect 系 field の no-op 補完
+    /// を可能にする。 既存 47 caller (clip_rect / 必須 fields は explicit に設定) の 6 field
+    /// 追加を 1 行 (`..Default::default()`) で済ませるための idiom。
+    ///
+    /// `text` は `Arc::from("")` の空文字列、 numeric 0、 colors TRANSPARENT。 `Arc<str>` の
+    /// `Default` impl は stable Rust に存在しないため手書き。
+    fn default() -> Self {
+        Self {
+            text: std::sync::Arc::from(""),
+            left: 0.0,
+            top: 0.0,
+            font_size: 0.0,
+            line_height: 0.0,
+            color: Color::TRANSPARENT,
+            clip_rect: None,
+            outline_color: Color::TRANSPARENT,
+            outline_width_px: 0.0,
+            shadow_color: Color::TRANSPARENT,
+            shadow_offset_px: (0.0, 0.0),
+            shadow_blur_px: 0.0,
+            rotation_radians: 0.0,
+        }
+    }
 }
 
 /// 線分 1 本分。物理ピクセル単位。

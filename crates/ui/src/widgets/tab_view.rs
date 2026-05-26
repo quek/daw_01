@@ -87,6 +87,7 @@ impl<'b, 'a, M: ?Sized + 'static> TabBuilder<'b, 'a, M> {
                 Color::rgb(0.65, 0.68, 0.74)
             },
             clip_rect: None,
+            ..GlyphArea::default()
         });
 
         // 選択中なら pane を描画 (clip 適用)
