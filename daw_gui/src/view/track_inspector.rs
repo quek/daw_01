@@ -9,8 +9,8 @@ use daw_ui_core::{
 };
 use daw_ui_renderer::{Color, Rect};
 
-use crate::app::{AppData, AppEvent, PickerTarget};
-use common::model::{FadeCurve, ImageBuiltinParam, StretchMode};
+use crate::app::{text_num_to_builtin, AppData, AppEvent, PickerTarget, TextNumField};
+use common::model::{FadeCurve, ImageBuiltinParam, StretchMode, TextAlign};
 
 const BG: Color = Color { r: 0.16, g: 0.16, b: 0.20, a: 1.0 };
 const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
@@ -837,11 +837,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         y += input_h + 12.0;
     }
 
-    // ---- Text Event section (`docs/plan_text_overlay.md` §4 P5) -------
-    // selected_clip が `ClipContent::Text` のとき、 first event の
-    // text 内容 / font / font_size / opacity / mute を MVP UI で expose。
-    // outline / shadow / x/y/w/h/rotation は preview drag + automation
-    // lane で代替可能、 follow-up phase で inspector に追加予定。
+    // ---- Text Event section (`docs/plan_text_overlay.md` §4 P5 + P5.B) --
+    // selected_clip が `ClipContent::Text` のとき、 first event の全 field
+    // (text / font / align / 23 numeric + 2 fade beats / fade curves / mute)
+    // を expose。 numeric field は `TextNumField` discriminator で
+    // `ClipTextNumEditChanged` / `CommitClipTextNumEdit` に dispatch。
     if let Some(summary) = app.inspector_text_event_summary() {
         if app.clip_edit_buffer_target != Some(summary.target) {
             let target = summary.target;
@@ -943,101 +943,192 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
         y += input_h + 4.0;
 
-        // Font size (project resolution 基準 px) + automate
+        // Align dropdown (Left / Center / Right)
         ui.label_at(
-            "inspector_text_size_label",
-            "Size (px)",
+            "inspector_text_align_label",
+            "Align",
             area.x + pad,
             y + 5.0,
             11.0,
             TEXT_DIM,
         );
-        let size_resp = ui.text_input_at(
-            "inspector_text_size_input",
-            Rect { x: input_x, y, w: numeric_input_w, h: input_h },
-            &app.clip_text_font_size_edit_text,
-            |s| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ClipTextFontSizeEditChanged(s))
+        const ALIGN_LABELS: &[&str] = &["Left", "Center", "Right"];
+        let align_idx = match summary.align {
+            TextAlign::Left => 0,
+            TextAlign::Center => 1,
+            TextAlign::Right => 2,
+        };
+        if let Some(picked) = ui.dropdown(
+            "inspector_text_align_dropdown",
+            Rect { x: input_x, y, w: string_input_w, h: input_h },
+            ALIGN_LABELS,
+            align_idx,
+        ) {
+            let target_align = summary.target;
+            let new_align = match picked {
+                0 => TextAlign::Left,
+                2 => TextAlign::Right,
+                _ => TextAlign::Center,
+            };
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetClipTextAlign {
+                    target: target_align,
+                    value: new_align,
                 })
-            },
-        );
-        if size_resp.committed {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::CommitClipTextFontSizeEdit)
             }));
         }
-        let size_auto_on = summary.font_size_automated;
-        ui.toggle_button_at(
-            "inspector_text_size_automate",
-            "A",
-            Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
-            size_auto_on,
-            &TOGGLE_IMAGE_AUTOMATE,
-            move |_| {
-                Edit::mutate(move |app: &mut AppData| {
-                    let ev = if size_auto_on {
-                        AppEvent::RemoveTextAutomationLane {
-                            field: common::model::TextBuiltinParam::FontSize,
-                        }
-                    } else {
-                        AppEvent::AddTextAutomationLane {
-                            field: common::model::TextBuiltinParam::FontSize,
-                        }
-                    };
-                    app.handle_event(ev);
-                })
-            },
-        );
-        y += input_h + 4.0;
+        y += input_h + 8.0;
 
-        // Opacity (0..=1) + automate
+        // 23 numeric rows + 2 fade beats を 1 closure 化した helper で
+        // 順次 emit。 Hash-able な `(field, &'static str)` を id にし、
+        // 各 field 用の widget 識別子を per-field ユニークにする。
+        let emit_num_row = |ui: &mut Ui<'_, AppData>,
+                            label: &str,
+                            field: TextNumField,
+                            row_y: &mut f32| {
+            let buffer = app
+                .clip_text_num_edits
+                .get(&field)
+                .cloned()
+                .unwrap_or_default();
+            ui.label_at(
+                (field, "label"),
+                label,
+                area.x + pad,
+                *row_y + 5.0,
+                11.0,
+                TEXT_DIM,
+            );
+            let resp = ui.text_input_at(
+                (field, "input"),
+                Rect { x: input_x, y: *row_y, w: numeric_input_w, h: input_h },
+                &buffer,
+                move |s| {
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::ClipTextNumEditChanged {
+                            field,
+                            value: s,
+                        })
+                    })
+                },
+            );
+            if resp.committed {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::CommitClipTextNumEdit { field })
+                }));
+            }
+            if let Some(builtin) = text_num_to_builtin(field) {
+                let auto_on = summary.automated.contains(&builtin);
+                ui.toggle_button_at(
+                    (field, "auto"),
+                    "A",
+                    Rect { x: auto_btn_x, y: *row_y, w: auto_btn_w, h: input_h },
+                    auto_on,
+                    &TOGGLE_IMAGE_AUTOMATE,
+                    move |_| {
+                        Edit::mutate(move |app: &mut AppData| {
+                            let ev = if auto_on {
+                                AppEvent::RemoveTextAutomationLane { field: builtin }
+                            } else {
+                                AppEvent::AddTextAutomationLane { field: builtin }
+                            };
+                            app.handle_event(ev);
+                        })
+                    },
+                );
+            }
+            *row_y += input_h + 4.0;
+        };
+
+        emit_num_row(ui, "X", TextNumField::X, &mut y);
+        emit_num_row(ui, "Y", TextNumField::Y, &mut y);
+        emit_num_row(ui, "W", TextNumField::W, &mut y);
+        emit_num_row(ui, "H", TextNumField::H, &mut y);
+        emit_num_row(ui, "Rot (°)", TextNumField::Rotation, &mut y);
+        emit_num_row(ui, "Size (px)", TextNumField::FontSize, &mut y);
+        emit_num_row(ui, "Opacity", TextNumField::Opacity, &mut y);
+        emit_num_row(ui, "Fill R", TextNumField::FillR, &mut y);
+        emit_num_row(ui, "Fill G", TextNumField::FillG, &mut y);
+        emit_num_row(ui, "Fill B", TextNumField::FillB, &mut y);
+        emit_num_row(ui, "Fill A", TextNumField::FillA, &mut y);
+        emit_num_row(ui, "Out R", TextNumField::OutlineR, &mut y);
+        emit_num_row(ui, "Out G", TextNumField::OutlineG, &mut y);
+        emit_num_row(ui, "Out B", TextNumField::OutlineB, &mut y);
+        emit_num_row(ui, "Out A", TextNumField::OutlineA, &mut y);
+        emit_num_row(ui, "Out W (px)", TextNumField::OutlineWidth, &mut y);
+        emit_num_row(ui, "Sh R", TextNumField::ShadowR, &mut y);
+        emit_num_row(ui, "Sh G", TextNumField::ShadowG, &mut y);
+        emit_num_row(ui, "Sh B", TextNumField::ShadowB, &mut y);
+        emit_num_row(ui, "Sh A", TextNumField::ShadowA, &mut y);
+        emit_num_row(ui, "Sh X (px)", TextNumField::ShadowOffsetX, &mut y);
+        emit_num_row(ui, "Sh Y (px)", TextNumField::ShadowOffsetY, &mut y);
+        emit_num_row(ui, "Sh Blur (px)", TextNumField::ShadowBlur, &mut y);
+        emit_num_row(ui, "Fade In", TextNumField::FadeInBeats, &mut y);
+        emit_num_row(ui, "Fade Out", TextNumField::FadeOutBeats, &mut y);
+
+        // Fade curve dropdowns (2 個)。 FADE_CURVE_LABELS / curve <-> index
+        // は image fade と同 idiom。
+        const FADE_CURVE_LABELS: &[&str] = &["Linear", "Exp", "S-Curve"];
+        let curve_to_idx = |c: FadeCurve| match c {
+            FadeCurve::Linear => 0,
+            FadeCurve::Exponential => 1,
+            FadeCurve::SCurve => 2,
+        };
+        let idx_to_curve = |i: usize| match i {
+            1 => FadeCurve::Exponential,
+            2 => FadeCurve::SCurve,
+            _ => FadeCurve::Linear,
+        };
         ui.label_at(
-            "inspector_text_opacity_label",
-            "Opacity",
+            "inspector_text_fade_in_curve_label",
+            "In Curve",
             area.x + pad,
             y + 5.0,
             11.0,
             TEXT_DIM,
         );
-        let opacity_resp = ui.text_input_at(
-            "inspector_text_opacity_input",
-            Rect { x: input_x, y, w: numeric_input_w, h: input_h },
-            &app.clip_text_opacity_edit_text,
-            |s| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ClipTextOpacityEditChanged(s))
+        if let Some(picked) = ui.dropdown(
+            "inspector_text_fade_in_curve",
+            Rect { x: input_x, y, w: string_input_w, h: input_h },
+            FADE_CURVE_LABELS,
+            curve_to_idx(summary.fade_in_curve),
+        ) {
+            let target_curve = summary.target;
+            let new_curve = idx_to_curve(picked);
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetClipTextFadeInCurve {
+                    target: target_curve,
+                    curve: new_curve,
                 })
-            },
-        );
-        if opacity_resp.committed {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::CommitClipTextOpacityEdit)
             }));
         }
-        let opacity_auto_on = summary.opacity_automated;
-        ui.toggle_button_at(
-            "inspector_text_opacity_automate",
-            "A",
-            Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
-            opacity_auto_on,
-            &TOGGLE_IMAGE_AUTOMATE,
-            move |_| {
-                Edit::mutate(move |app: &mut AppData| {
-                    let ev = if opacity_auto_on {
-                        AppEvent::RemoveTextAutomationLane {
-                            field: common::model::TextBuiltinParam::Opacity,
-                        }
-                    } else {
-                        AppEvent::AddTextAutomationLane {
-                            field: common::model::TextBuiltinParam::Opacity,
-                        }
-                    };
-                    app.handle_event(ev);
-                })
-            },
+        y += input_h + 4.0;
+        ui.label_at(
+            "inspector_text_fade_out_curve_label",
+            "Out Curve",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT_DIM,
         );
+        if let Some(picked) = ui.dropdown(
+            "inspector_text_fade_out_curve",
+            Rect { x: input_x, y, w: string_input_w, h: input_h },
+            FADE_CURVE_LABELS,
+            curve_to_idx(summary.fade_out_curve),
+        ) {
+            let target_curve = summary.target;
+            let new_curve = idx_to_curve(picked);
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetClipTextFadeOutCurve {
+                    target: target_curve,
+                    curve: new_curve,
+                })
+            }));
+        }
         y += input_h + 12.0;
+        // suppress unused warning when section emits nothing further
+        let _ = (label_w, summary);
     }
 
     // Vocal source 編集 (Vocal track のときのみ)

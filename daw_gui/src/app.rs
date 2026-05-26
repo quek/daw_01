@@ -158,17 +158,93 @@ pub struct InspectorImageEventSummary {
     pub rotation_automated: bool,
 }
 
+/// docs/plan_text_overlay.md §4 P5: text inspector の編集対象 numeric
+/// field 列挙。 image inspector が 6 field 毎に Set/Changed/Commit 3 event
+/// を持つのに対し、 text は 23 field と多いため `SetClipTextNumField` /
+/// `ClipTextNumEditChanged` / `CommitClipTextNumEdit` の 3 event +
+/// `TextNumField` discriminator で集約する (= 67 events ぶんを 3 event
+/// + 1 enum で表現)。
+///
+/// FadeInBeats / FadeOutBeats は automation lane 対象外 (= `_automated`
+/// は常に false)、 残 21 field は対応する `TextBuiltinParam` 経由で
+/// lane override 可能。 `text_num_to_builtin` で `TextBuiltinParam` への
+/// 対応 mapping を提供。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TextNumField {
+    X,
+    Y,
+    W,
+    H,
+    Rotation,
+    FontSize,
+    Opacity,
+    FillR,
+    FillG,
+    FillB,
+    FillA,
+    OutlineR,
+    OutlineG,
+    OutlineB,
+    OutlineA,
+    OutlineWidth,
+    ShadowR,
+    ShadowG,
+    ShadowB,
+    ShadowA,
+    ShadowOffsetX,
+    ShadowOffsetY,
+    ShadowBlur,
+    FadeInBeats,
+    FadeOutBeats,
+}
+
+/// `TextNumField` → `TextBuiltinParam` mapping (lane-eligible のみ)。
+/// FadeInBeats / FadeOutBeats は lane 対象外なので `None` を返す。
+pub fn text_num_to_builtin(field: TextNumField) -> Option<common::model::TextBuiltinParam> {
+    use TextNumField as F;
+    use common::model::TextBuiltinParam as B;
+    Some(match field {
+        F::X => B::X,
+        F::Y => B::Y,
+        F::W => B::W,
+        F::H => B::H,
+        F::Rotation => B::Rotation,
+        F::FontSize => B::FontSize,
+        F::Opacity => B::Opacity,
+        F::FillR => B::FillR,
+        F::FillG => B::FillG,
+        F::FillB => B::FillB,
+        F::FillA => B::FillA,
+        F::OutlineR => B::OutlineR,
+        F::OutlineG => B::OutlineG,
+        F::OutlineB => B::OutlineB,
+        F::OutlineA => B::OutlineA,
+        F::OutlineWidth => B::OutlineWidth,
+        F::ShadowR => B::ShadowR,
+        F::ShadowG => B::ShadowG,
+        F::ShadowB => B::ShadowB,
+        F::ShadowA => B::ShadowA,
+        F::ShadowOffsetX => B::ShadowOffsetX,
+        F::ShadowOffsetY => B::ShadowOffsetY,
+        F::ShadowBlur => B::ShadowBlur,
+        F::FadeInBeats | F::FadeOutBeats => return None,
+    })
+}
+
 /// docs/plan_text_overlay.md §4 P5: text inspector の read snapshot
 /// (= image idiom)。 `selected_clip` が `ClipContent::Text` を指していて
 /// 中に 1 event 以上あれば `inspector_text_event_summary()` が `Some` を
-/// 返す。 MVP scope (= Mute + Text + Font + FontSize + Opacity) なので
-/// `_automated` は font_size / opacity のみ snapshot。
-#[derive(Debug, Clone, Copy)]
+/// 返す。 `automated` は lane を持つ全 `TextBuiltinParam` の集合 (=
+/// inspector 各 「A」 toggle が ON / OFF 判定に使う)。 align / fade curve
+/// は dropdown 直値、 `muted` は toggle 直値。
+#[derive(Debug, Clone)]
 pub struct InspectorTextEventSummary {
     pub target: ClipRef,
     pub muted: bool,
-    pub font_size_automated: bool,
-    pub opacity_automated: bool,
+    pub align: common::model::TextAlign,
+    pub fade_in_curve: common::model::FadeCurve,
+    pub fade_out_curve: common::model::FadeCurve,
+    pub automated: std::collections::HashSet<common::model::TextBuiltinParam>,
 }
 
 /// Per-plugin sidechain wiring entry shown in the inspector. One row per
@@ -818,18 +894,18 @@ pub struct AppData {
     /// で書き戻し。
     pub clip_image_rotation_edit_text: String,
 
-    /// docs/plan_text_overlay.md §4 P5: text inspector の edit buffer 群
-    /// (= image idiom)。 Enter / focus 喪失で `CommitClip*Edit` event を
-    /// 発火し、 TextEvent.field を直接書く。 lane override 経由でも同様。
-    /// MVP scope: text content / font_family / font_size_px / opacity の
-    /// 4 field (= 最も visual impact が大きい部分)。 outline / shadow /
-    /// rotation / x/y/w/h は preview drag + automation lane で代替可能。
+    /// docs/plan_text_overlay.md §4 P5: text inspector の edit buffer 群。
+    /// `text` / `font_family` は文字列 field なので standalone、 残 23
+    /// numeric field + 2 fade beats は `clip_text_num_edits: HashMap<
+    /// TextNumField, String>` に集約 (= 1 hash lookup で per-field buffer
+    /// 取得、 image 6 field × 個別 field の重さを回避)。 Enter / focus 喪失
+    /// で `CommitClipText*Edit` を発火、 `set_clip_text_num_field` 経由で
+    /// TextEvent.field を直接書く。 lane override 経由でも同様。
     pub clip_text_content_edit_text: String,
     pub clip_text_font_family_edit_text: String,
-    /// `TextEvent.font_size_px` 入力欄の編集中文字列 (`{:.1}` px)。
-    pub clip_text_font_size_edit_text: String,
-    /// `TextEvent.opacity` 入力欄の編集中文字列 (`{:.3}`、 0.0..=1.0)。
-    pub clip_text_opacity_edit_text: String,
+    /// numeric inspector field の編集中文字列 (= field 毎に format 揃え)。
+    /// resync で全 25 field を populate、 commit で field 毎に parse。
+    pub clip_text_num_edits: std::collections::HashMap<TextNumField, String>,
 
     pub undo_stack: VecDeque<Song>,
     pub redo_stack: VecDeque<Song>,
@@ -1058,8 +1134,7 @@ impl AppData {
             clip_fade_out_edit_text: String::new(),
             clip_text_content_edit_text: String::new(),
             clip_text_font_family_edit_text: String::new(),
-            clip_text_font_size_edit_text: String::new(),
-            clip_text_opacity_edit_text: String::new(),
+            clip_text_num_edits: std::collections::HashMap::new(),
             clip_image_x_edit_text: String::new(),
             clip_image_y_edit_text: String::new(),
             clip_image_w_edit_text: String::new(),
@@ -1713,9 +1788,11 @@ impl AppData {
                 | AppEvent::BeginTextPiPDrag
                 | AppEvent::CommitClipTextContentEdit
                 | AppEvent::CommitClipTextFontFamilyEdit
-                | AppEvent::CommitClipTextFontSizeEdit
-                | AppEvent::CommitClipTextOpacityEdit
+                | AppEvent::CommitClipTextNumEdit { .. }
                 | AppEvent::SetClipTextMuted { .. }
+                | AppEvent::SetClipTextAlign { .. }
+                | AppEvent::SetClipTextFadeInCurve { .. }
+                | AppEvent::SetClipTextFadeOutCurve { .. }
                 // EndImagePiPDrag は非 undoable (begin 側に snapshot あり)
                 // 注: SetClipImage{X,Y,W,H,Opacity} は preview drag で
                 // 毎フレーム発火するので非 undoable。 drag begin の
@@ -2394,28 +2471,33 @@ pub enum AppEvent {
     EndTextPiPDrag,
 
     /// docs/plan_text_overlay.md §4 P5: text inspector の編集パス。
-    /// SetClip* は直接 TextEvent.field を書く (= 即時反映、 lane override
-    /// 経由でも同様)。 `*EditChanged(s)` は text_input の typing buffer
-    /// 更新、 `Commit*` で parse して Set* を発火する (= image idiom)。
+    /// Mute / Text content / Font family は string-shaped で個別 event、
+    /// 23 numeric field + 2 fade beats は `SetClipTextNumField` /
+    /// `ClipTextNumEditChanged` / `CommitClipTextNumEdit` の 3 event で
+    /// `TextNumField` discriminator dispatch (= 75 event ぶんを 3 event
+    /// + 1 enum で表現)。 lane override 経由でも同様、 lane が effective
+    /// なら TextEvent.field の直接書き込みは preview に反映されないが
+    /// edit buffer の formatted 表示は更新される。
     SetClipTextMuted { target: ClipRef, muted: bool },
     SetClipTextContent { target: ClipRef, value: String },
     SetClipTextFontFamily { target: ClipRef, value: String },
-    SetClipTextFontSize { target: ClipRef, value: f32 },
-    SetClipTextOpacity { target: ClipRef, value: f32 },
+    SetClipTextAlign { target: ClipRef, value: common::model::TextAlign },
+    SetClipTextFadeInCurve { target: ClipRef, curve: common::model::FadeCurve },
+    SetClipTextFadeOutCurve { target: ClipRef, curve: common::model::FadeCurve },
+
+    SetClipTextNumField { target: ClipRef, field: TextNumField, value: f32 },
+    ClipTextNumEditChanged { field: TextNumField, value: String },
+    CommitClipTextNumEdit { field: TextNumField },
 
     ClipTextContentEditChanged(String),
     ClipTextFontFamilyEditChanged(String),
-    ClipTextFontSizeEditChanged(String),
-    ClipTextOpacityEditChanged(String),
-
     CommitClipTextContentEdit,
     CommitClipTextFontFamilyEdit,
-    CommitClipTextFontSizeEdit,
-    CommitClipTextOpacityEdit,
 
     /// 選択中 text clip の `TextEvent` 現値から edit buffer 群を再生成。
     /// inspector が clip 切替 / Undo / Redo / lane override の効果を反映
-    /// するときに呼ぶ (= image idiom)。
+    /// するときに呼ぶ (= image idiom)。 `clip_text_num_edits` HashMap +
+    /// content / font_family string も同時に populate。
     ResyncClipTextEditBuffers(ClipRef),
     /// Phase 4 (`docs/plan_automation.md` §6): automation recording mode の
     /// transport 4 way toggle。 session-only / Undo 対象外。
@@ -4087,11 +4169,23 @@ impl AppData {
             AppEvent::SetClipTextFontFamily { target, value } => {
                 self.set_clip_text_event_font_family(target, value);
             }
-            AppEvent::SetClipTextFontSize { target, value } => {
-                self.set_clip_text_event_font_size(target, value);
+            AppEvent::SetClipTextAlign { target, value } => {
+                self.set_clip_text_event_align(target, value);
             }
-            AppEvent::SetClipTextOpacity { target, value } => {
-                self.set_clip_text_event_opacity(target, value);
+            AppEvent::SetClipTextFadeInCurve { target, curve } => {
+                self.set_clip_text_event_fade_in_curve(target, curve);
+            }
+            AppEvent::SetClipTextFadeOutCurve { target, curve } => {
+                self.set_clip_text_event_fade_out_curve(target, curve);
+            }
+            AppEvent::SetClipTextNumField { target, field, value } => {
+                self.set_clip_text_num_field(target, field, value);
+            }
+            AppEvent::ClipTextNumEditChanged { field, value } => {
+                self.clip_text_num_edits.insert(field, value);
+            }
+            AppEvent::CommitClipTextNumEdit { field } => {
+                self.commit_clip_text_num_edit(field);
             }
             AppEvent::ClipTextContentEditChanged(s) => {
                 self.clip_text_content_edit_text = s;
@@ -4099,23 +4193,11 @@ impl AppData {
             AppEvent::ClipTextFontFamilyEditChanged(s) => {
                 self.clip_text_font_family_edit_text = s;
             }
-            AppEvent::ClipTextFontSizeEditChanged(s) => {
-                self.clip_text_font_size_edit_text = s;
-            }
-            AppEvent::ClipTextOpacityEditChanged(s) => {
-                self.clip_text_opacity_edit_text = s;
-            }
             AppEvent::CommitClipTextContentEdit => {
                 self.commit_clip_text_content_edit();
             }
             AppEvent::CommitClipTextFontFamilyEdit => {
                 self.commit_clip_text_font_family_edit();
-            }
-            AppEvent::CommitClipTextFontSizeEdit => {
-                self.commit_clip_text_font_size_edit();
-            }
-            AppEvent::CommitClipTextOpacityEdit => {
-                self.commit_clip_text_opacity_edit();
             }
             AppEvent::ResyncClipTextEditBuffers(target) => {
                 self.resync_clip_text_event_edit_buffers(target);
@@ -9157,16 +9239,124 @@ impl AppData {
         self.resync_clip_text_event_edit_buffers(target);
     }
 
-    fn set_clip_text_event_font_size(&mut self, target: ClipRef, value: f32) {
-        // 1 px 未満は読めない / レンダー pipeline で 0 div risk。
-        let value = value.max(1.0);
-        self.mutate_text_events_in_clip(target, |e| e.font_size_px = value);
-        self.resync_clip_text_event_edit_buffers(target);
+    fn set_clip_text_event_align(&mut self, target: ClipRef, value: common::model::TextAlign) {
+        self.mutate_text_events_in_clip(target, |e| e.align = value);
     }
 
-    fn set_clip_text_event_opacity(&mut self, target: ClipRef, value: f32) {
-        let value = value.clamp(0.0, 1.0);
-        self.mutate_text_events_in_clip(target, |e| e.opacity = value);
+    fn set_clip_text_event_fade_in_curve(
+        &mut self,
+        target: ClipRef,
+        curve: common::model::FadeCurve,
+    ) {
+        self.mutate_text_events_in_clip(target, |e| e.fade_in_curve = curve);
+    }
+
+    fn set_clip_text_event_fade_out_curve(
+        &mut self,
+        target: ClipRef,
+        curve: common::model::FadeCurve,
+    ) {
+        self.mutate_text_events_in_clip(target, |e| e.fade_out_curve = curve);
+    }
+
+    /// docs/plan_text_overlay.md §4 P5: 23 numeric field + 2 fade beats
+    /// を 1 関数で dispatch。 各 field の clamp / wrap rule を inline 適用。
+    /// X/Y/W/H/Rotation は P6 drag 経路の setter を流用して double-define
+    /// を回避。
+    fn set_clip_text_num_field(
+        &mut self,
+        target: ClipRef,
+        field: TextNumField,
+        value: f32,
+    ) {
+        use TextNumField as F;
+        match field {
+            F::X => self.set_clip_text_event_x(target, value),
+            F::Y => self.set_clip_text_event_y(target, value),
+            F::W => self.set_clip_text_event_w(target, value),
+            F::H => self.set_clip_text_event_h(target, value),
+            F::Rotation => self.set_clip_text_event_rotation_radians(target, value),
+            F::FontSize => {
+                let v = value.max(1.0);
+                self.mutate_text_events_in_clip(target, |e| e.font_size_px = v);
+            }
+            F::Opacity => {
+                let v = value.clamp(0.0, 1.0);
+                self.mutate_text_events_in_clip(target, |e| e.opacity = v);
+            }
+            F::FillR => {
+                let v = value.clamp(0.0, 1.0);
+                self.mutate_text_events_in_clip(target, |e| e.fill_color[0] = v);
+            }
+            F::FillG => {
+                let v = value.clamp(0.0, 1.0);
+                self.mutate_text_events_in_clip(target, |e| e.fill_color[1] = v);
+            }
+            F::FillB => {
+                let v = value.clamp(0.0, 1.0);
+                self.mutate_text_events_in_clip(target, |e| e.fill_color[2] = v);
+            }
+            F::FillA => {
+                let v = value.clamp(0.0, 1.0);
+                self.mutate_text_events_in_clip(target, |e| e.fill_color[3] = v);
+            }
+            F::OutlineR => {
+                let v = value.clamp(0.0, 1.0);
+                self.mutate_text_events_in_clip(target, |e| e.outline_color[0] = v);
+            }
+            F::OutlineG => {
+                let v = value.clamp(0.0, 1.0);
+                self.mutate_text_events_in_clip(target, |e| e.outline_color[1] = v);
+            }
+            F::OutlineB => {
+                let v = value.clamp(0.0, 1.0);
+                self.mutate_text_events_in_clip(target, |e| e.outline_color[2] = v);
+            }
+            F::OutlineA => {
+                let v = value.clamp(0.0, 1.0);
+                self.mutate_text_events_in_clip(target, |e| e.outline_color[3] = v);
+            }
+            F::OutlineWidth => {
+                let v = value.max(0.0);
+                self.mutate_text_events_in_clip(target, |e| e.outline_width_px = v);
+            }
+            F::ShadowR => {
+                let v = value.clamp(0.0, 1.0);
+                self.mutate_text_events_in_clip(target, |e| e.shadow_color[0] = v);
+            }
+            F::ShadowG => {
+                let v = value.clamp(0.0, 1.0);
+                self.mutate_text_events_in_clip(target, |e| e.shadow_color[1] = v);
+            }
+            F::ShadowB => {
+                let v = value.clamp(0.0, 1.0);
+                self.mutate_text_events_in_clip(target, |e| e.shadow_color[2] = v);
+            }
+            F::ShadowA => {
+                let v = value.clamp(0.0, 1.0);
+                self.mutate_text_events_in_clip(target, |e| e.shadow_color[3] = v);
+            }
+            F::ShadowOffsetX => {
+                self.mutate_text_events_in_clip(target, |e| e.shadow_offset_px.0 = value);
+            }
+            F::ShadowOffsetY => {
+                self.mutate_text_events_in_clip(target, |e| e.shadow_offset_px.1 = value);
+            }
+            F::ShadowBlur => {
+                let v = value.max(0.0);
+                self.mutate_text_events_in_clip(target, |e| e.shadow_blur_px = v);
+            }
+            F::FadeInBeats => {
+                let max_beats = self.clip_length_beats(target).unwrap_or(0.0);
+                let v = (f64::from(value)).clamp(0.0, max_beats);
+                self.mutate_text_events_in_clip(target, |e| e.fade_in_beats = v);
+            }
+            F::FadeOutBeats => {
+                let max_beats = self.clip_length_beats(target).unwrap_or(0.0);
+                let v = (f64::from(value)).clamp(0.0, max_beats);
+                self.mutate_text_events_in_clip(target, |e| e.fade_out_beats = v);
+            }
+        }
         self.resync_clip_text_event_edit_buffers(target);
     }
 
@@ -9186,32 +9376,33 @@ impl AppData {
         self.set_clip_text_event_font_family(target, value);
     }
 
-    fn commit_clip_text_font_size_edit(&mut self) {
+    /// docs/plan_text_overlay.md §4 P5: edit buffer を parse して
+    /// `set_clip_text_num_field` を呼ぶ。 Rotation は inspector が degree
+    /// 表示なので commit 時に radians に変換。 parse 失敗は resync で
+    /// formatted な現値に書き戻す (= image inspector と同 idiom)。
+    fn commit_clip_text_num_edit(&mut self, field: TextNumField) {
         let Some(target) = self.selected_clip else {
             return;
         };
-        let Ok(parsed) = self.clip_text_font_size_edit_text.trim().parse::<f32>() else {
+        let Some(buffer) = self.clip_text_num_edits.get(&field).cloned() else {
+            return;
+        };
+        let Ok(parsed) = buffer.trim().parse::<f32>() else {
             self.resync_clip_text_event_edit_buffers(target);
             return;
         };
-        self.set_clip_text_event_font_size(target, parsed);
+        let value = if field == TextNumField::Rotation {
+            parsed.to_radians()
+        } else {
+            parsed
+        };
+        self.set_clip_text_num_field(target, field, value);
     }
 
-    fn commit_clip_text_opacity_edit(&mut self) {
-        let Some(target) = self.selected_clip else {
-            return;
-        };
-        let Ok(parsed) = self.clip_text_opacity_edit_text.trim().parse::<f32>() else {
-            self.resync_clip_text_event_edit_buffers(target);
-            return;
-        };
-        self.set_clip_text_event_opacity(target, parsed);
-    }
-
-    /// docs/plan_text_overlay.md §4 P5: clip 切替 / Undo / Redo 等で
-    /// edit buffer の内容を current TextEvent から再生成。 target が
-    /// Text variant でないなら buffer をクリア + `clip_edit_buffer_target`
-    /// を `None` 化 (= image inspector と同 idiom)。
+    /// docs/plan_text_overlay.md §4 P5: clip 切替 / Undo / Redo / lane
+    /// override 変化等で edit buffer 群を current TextEvent の値で再構築。
+    /// target が Text variant でないなら content / font_family と HashMap
+    /// 全部を空にして `clip_edit_buffer_target` を `None`。
     fn resync_clip_text_event_edit_buffers(&mut self, target: ClipRef) {
         let event_snapshot = self
             .song
@@ -9221,26 +9412,44 @@ impl AppData {
             .and_then(|c| self.song.clip_contents.get(&c.content_id))
             .and_then(|content| content.text_events())
             .and_then(|events| events.first())
-            .map(|ev| {
-                (
-                    ev.text.clone(),
-                    ev.font_family.clone(),
-                    ev.font_size_px,
-                    ev.opacity,
-                )
-            });
-        let Some((text, font_family, font_size_px, opacity)) = event_snapshot else {
+            .cloned();
+        let Some(ev) = event_snapshot else {
             self.clip_text_content_edit_text.clear();
             self.clip_text_font_family_edit_text.clear();
-            self.clip_text_font_size_edit_text.clear();
-            self.clip_text_opacity_edit_text.clear();
+            self.clip_text_num_edits.clear();
             self.clip_edit_buffer_target = None;
             return;
         };
-        self.clip_text_content_edit_text = text;
-        self.clip_text_font_family_edit_text = font_family;
-        self.clip_text_font_size_edit_text = format!("{font_size_px:.1}");
-        self.clip_text_opacity_edit_text = format!("{opacity:.3}");
+        self.clip_text_content_edit_text = ev.text.clone();
+        self.clip_text_font_family_edit_text = ev.font_family.clone();
+        use TextNumField as F;
+        let edits = &mut self.clip_text_num_edits;
+        edits.clear();
+        edits.insert(F::X, format!("{:.3}", ev.x));
+        edits.insert(F::Y, format!("{:.3}", ev.y));
+        edits.insert(F::W, format!("{:.3}", ev.w));
+        edits.insert(F::H, format!("{:.3}", ev.h));
+        edits.insert(F::Rotation, format!("{:.1}", ev.rotation_radians.to_degrees()));
+        edits.insert(F::FontSize, format!("{:.1}", ev.font_size_px));
+        edits.insert(F::Opacity, format!("{:.3}", ev.opacity));
+        edits.insert(F::FillR, format!("{:.3}", ev.fill_color[0]));
+        edits.insert(F::FillG, format!("{:.3}", ev.fill_color[1]));
+        edits.insert(F::FillB, format!("{:.3}", ev.fill_color[2]));
+        edits.insert(F::FillA, format!("{:.3}", ev.fill_color[3]));
+        edits.insert(F::OutlineR, format!("{:.3}", ev.outline_color[0]));
+        edits.insert(F::OutlineG, format!("{:.3}", ev.outline_color[1]));
+        edits.insert(F::OutlineB, format!("{:.3}", ev.outline_color[2]));
+        edits.insert(F::OutlineA, format!("{:.3}", ev.outline_color[3]));
+        edits.insert(F::OutlineWidth, format!("{:.1}", ev.outline_width_px));
+        edits.insert(F::ShadowR, format!("{:.3}", ev.shadow_color[0]));
+        edits.insert(F::ShadowG, format!("{:.3}", ev.shadow_color[1]));
+        edits.insert(F::ShadowB, format!("{:.3}", ev.shadow_color[2]));
+        edits.insert(F::ShadowA, format!("{:.3}", ev.shadow_color[3]));
+        edits.insert(F::ShadowOffsetX, format!("{:.1}", ev.shadow_offset_px.0));
+        edits.insert(F::ShadowOffsetY, format!("{:.1}", ev.shadow_offset_px.1));
+        edits.insert(F::ShadowBlur, format!("{:.1}", ev.shadow_blur_px));
+        edits.insert(F::FadeInBeats, format!("{:.3}", ev.fade_in_beats));
+        edits.insert(F::FadeOutBeats, format!("{:.3}", ev.fade_out_beats));
         self.clip_edit_buffer_target = Some(target);
     }
 
@@ -9259,16 +9468,19 @@ impl AppData {
             return None;
         };
         let event = t.events.first()?;
-        let has_lane = |field: common::model::TextBuiltinParam| {
-            track.automation_lanes.iter().any(|l| {
-                matches!(l.target, common::model::AutomationTarget::TextBuiltin(p) if p == field)
-            })
-        };
+        let mut automated = std::collections::HashSet::new();
+        for lane in &track.automation_lanes {
+            if let common::model::AutomationTarget::TextBuiltin(p) = lane.target {
+                automated.insert(p);
+            }
+        }
         Some(InspectorTextEventSummary {
             target: cref,
             muted: event.muted,
-            font_size_automated: has_lane(common::model::TextBuiltinParam::FontSize),
-            opacity_automated: has_lane(common::model::TextBuiltinParam::Opacity),
+            align: event.align,
+            fade_in_curve: event.fade_in_curve,
+            fade_out_curve: event.fade_out_curve,
+            automated,
         })
     }
 
