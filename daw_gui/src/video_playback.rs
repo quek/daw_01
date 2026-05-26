@@ -170,8 +170,18 @@ struct SharedEntry {
     /// shared destination on each frame.
     texture: ID3D11Texture2D,
     /// `IDXGIKeyedMutex` view of `texture`. Worker acquires before
-    /// `CopySubresourceRegion`, releases after. Main thread acquires
-    /// before push_textured_quad, releases after the wgpu submit.
+    /// `CopySubresourceRegion`, releases after.
+    ///
+    /// **DO NOT REMOVE** these calls thinking they're "dead because
+    /// the main thread doesn't pair with them" — verified empirically
+    /// (regression commit `c2ae697`, reverted by `6b5eebd`, 2026-05-26)
+    /// that wgpu's DX12 / Vulkan import side **internally consumes**
+    /// the keyed-mutex protocol when sampling the imported texture.
+    /// Removing the worker's Acquire(0) / Release(0) pair leaves the
+    /// mutex perpetually "held by worker" from wgpu's perspective,
+    /// and the imported texture renders as fully transparent (= the
+    /// "preview is blank dark backdrop only" bug). The daw_01 main
+    /// thread does NOT need to call mutex APIs itself.
     mutex: IDXGIKeyedMutex,
     /// Cached NT handle from `IDXGIResource1::CreateSharedHandle`.
     /// Stable across the entry's lifetime — wrapped in `SendHandle`
@@ -930,10 +940,12 @@ fn sample_buffer_to_bgra(
 /// exactly once.
 ///
 /// Keyed-mutex protocol: worker `AcquireSync(0, INFINITE)` →
-/// `CopySubresourceRegion` → `ReleaseSync(0)`. Main thread mirrors
-/// this around its `Scene::push_textured_quad` + `Renderer::present`
-/// boundary (`view/runner.rs`). Both sides use key `0` as the
-/// "available" state; the mutex serialises read vs write.
+/// `CopySubresourceRegion` → `ReleaseSync(0)`. **The matching half is
+/// inside wgpu's DX12 / Vulkan importer**, not in daw_01 code —
+/// proven empirically by removing the worker pair (`c2ae697`) and
+/// observing the imported texture render as fully transparent
+/// (reverted in `6b5eebd`, 2026-05-26). The daw_01 main thread does
+/// NOT need to call `IDXGIKeyedMutex` APIs.
 fn write_to_shared_texture(
     dxgi: &IMFDXGIBuffer,
     entry: &mut ReaderEntry,

@@ -190,6 +190,24 @@ gui_01 #045 Phase 74 で `isize` raw vs `HANDLE` 型受け の選択時、 「wo
 - MIDI デバイス、プラグインが書き込むイベント配列はサイズ上限を検証
 - `from_raw_parts` / `copy_nonoverlapping` は長さの妥当性を検証してから使う
 
+## FFI 境界の dead code 判定を 推測でしない
+
+FFI 境界 (= D3D11 / wgpu / CLAP / cpal / windows API) のコードを「**自分の側で対応する呼び出しが見当たらないから dead**」 と判定して削除するな。 相手側 (= wgpu, driver, OS) が**内部で**その protocol / state を消費している可能性が常にある。
+
+実例 (2026-05-26、 この principle を破った):
+- `c2ae697 chore(video): worker 側の dead keyed-mutex Acquire/Release を削除`
+- 私が「daw_01 の main thread で `IDXGIKeyedMutex::AcquireSync` を呼んでない → worker 側の Acquire/Release は self-lock で無意味」 と判定して削除
+- 実際は **wgpu の DX12 / Vulkan import 側が内部的に keyed-mutex protocol を消費していた**。 worker 側削除で wgpu からは「mutex が永久に worker 側 hold」 と見え、 imported texture が全 pixel 透過に
+- 症状: preview window がダーク背景のみ表示、 動画フレーム見えず
+- 反転 commit: `6b5eebd`
+
+正しいやり方:
+1. 「相手側で何が起きるか」 を 一次情報 (= wgpu source, driver docs, windows API docs) で確認してから削除
+2. 削除前に **必ず実機 smoke test** で 「削除しても挙動が変わらない」 ことを目視確認
+3. 不明なら **削除しない**。 「dead に見えるけど挙動に必要」 のパターンは FFI で日常的に起きる
+
+詳細: `~/.claude/projects/F--dev-daw-01/memory/feedback_no_dead_judgment_at_ffi.md`
+
 ## Debugging Methodology
 
 - **実データから始める**: コードパス推論より実データ観察が速い
