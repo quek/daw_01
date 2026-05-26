@@ -11704,8 +11704,7 @@ impl AppData {
     #[cfg(windows)]
     fn action_import_video(&mut self, paths: Vec<PathBuf>) {
         use common::model::{
-            AudioContent, AudioEvent, ClipContent, Track, TrackKind, VideoContent,
-            VideoEvent,
+            AudioContent, AudioEvent, ClipContent, Track, VideoContent, VideoEvent,
         };
 
         if paths.is_empty() {
@@ -11783,7 +11782,6 @@ impl AppData {
             let video_track_id = self.song.alloc_track_id();
             let mut video_track = Track {
                 id: video_track_id,
-                kind: TrackKind::Video,
                 name: format!("{display_name} (Video)"),
                 ..Track::default()
             };
@@ -11825,7 +11823,6 @@ impl AppData {
                 let audio_track_id = self.song.alloc_track_id();
                 let mut audio_track = Track {
                     id: audio_track_id,
-                    kind: TrackKind::Audio,
                     name: format!("{display_name} (Audio)"),
                     ..Track::default()
                 };
@@ -11978,7 +11975,6 @@ impl AppData {
             let image_track_id = self.song.alloc_track_id();
             let mut image_track = Track {
                 id: image_track_id,
-                kind: common::model::TrackKind::Video,
                 name: format!("{display_name} (Image)"),
                 ..Track::default()
             };

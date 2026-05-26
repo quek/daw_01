@@ -123,20 +123,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         .iter()
         .map(|t| ArrangementTrack {
             id: t.id,
-            // gui_01 #044 (M14 Phase 72): track kind 表示分岐。 Audio
-            // (既存挙動) と Video (`docs/plan_video.md` §2.1) を widget
-            // に伝達。 Video の row 背景 / header layout / thumbnail
-            // 描画は widget 側で kind 判定して切り替わる。
-            // NOTE: `daw_ui_core` の lib.rs に `TrackKind` の re-export が
-            // 無いため、 full path で参照する。 gui_01 側で flat re-export
-            // 追加してくれたら `use daw_ui_core::TrackKind;` に整理する。
-            kind: match t.kind {
-                common::model::TrackKind::Audio => {
-                    daw_ui_core::widgets::arrangement::TrackKind::Audio
-                }
-                common::model::TrackKind::Video => {
-                    daw_ui_core::widgets::arrangement::TrackKind::Video
-                }
+            // v16 (`docs/plan_text_overlay.md` §1.9): daw_01 側で
+            // `TrackKind` を廃止し全 track unified。 widget には clip
+            // 種別から推測した kind を渡す: video / image / text clip
+            // がある track は Video kind 表示、 そうでなければ Audio
+            // (= 既存 Audio header + waveform を表示)。 混在 track は
+            // Video kind 優先 (= row 背景 / thumbnail で視認性が高い)。
+            kind: if t.clips.iter().any(|c| {
+                matches!(
+                    app.song.clip_contents.get(&c.content_id),
+                    Some(common::model::ClipContent::Video(_))
+                        | Some(common::model::ClipContent::Image(_))
+                )
+            }) {
+                daw_ui_core::widgets::arrangement::TrackKind::Video
+            } else {
+                daw_ui_core::widgets::arrangement::TrackKind::Audio
             },
             name: Arc::from(t.name.as_str()),
             muted: t.muted,

@@ -56,7 +56,7 @@ use crate::scale::ScaleChange;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 15;
+pub const CURRENT_VERSION: u32 = 16;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -890,25 +890,6 @@ impl Song {
     }
 }
 
-/// Discriminator selecting how a `Track` participates in the timeline.
-/// v12 addition (`docs/plan_video.md` §2.1). `Audio` (default) preserves
-/// the historical track shape — `instrument` / `midi_fx_chain` /
-/// `fx_chain` / `volume` / `pan` / `armed` / `source` all apply. `Video`
-/// ignores those fields (= caller / audio engine treats them as nominal,
-/// non-functional) and only honours `muted` / `parent_group_id` /
-/// `clips`; the clip payloads must be `ClipContent::Video`. The audio
-/// engine never sees `Video` tracks (= GUI skips them when building the
-/// IPC project snapshot, daw_audio iterates only `Audio` rows). v11
-/// `.daw` files forward-migrate via `#[serde(default)]` = `Audio`.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode,
-)]
-pub enum TrackKind {
-    #[default]
-    Audio,
-    Video,
-}
-
 /// A track owns a full CLAP signal chain in three sections:
 ///
 /// 1. `midi_fx_chain` — note-effect plugins (arpeggiator / quantizer / ...)
@@ -922,10 +903,15 @@ pub enum TrackKind {
 /// final audio flows into the parent — either a `Group` track (when
 /// `parent_group_id == Some(id)`) or the master bus (when `None`).
 ///
-/// v12 (`docs/plan_video.md`): `kind: TrackKind` discriminates audio vs
-/// video. A `Video` track shares the struct but ignores the audio-only
-/// fields (`instrument` / `*_fx_chain` / `volume` / `pan` / `armed` /
-/// `source`); its `clips` carry `ClipContent::Video` payloads.
+/// v16 (`docs/plan_text_overlay.md`): 旧 `kind: TrackKind { Audio, Video }`
+/// を廃止し、 全 track が unified に audio path + visual composite path 両方
+/// を保持する (= REAPER 流、 同 track 上で audio / midi / video / image /
+/// text clip を混在可能)。 旧 Video track は v16 migration で audio
+/// defaults (instrument: None / fx_chain: vec![] / volume: 1.0 / pan: 0.0
+/// / armed: false / source: None) を自動補完し、 mixer / engine path に
+/// 静かに参加する (= 音は出ないが mute / volume 操作は可)。 旧 v15 file
+/// の `kind` field は serde が未知 field として捨てる (= deny_unknown_fields
+/// が無いため tolerant)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Track {
     /// Stable id assigned by `Song::alloc_track_id`. `0` is "未採番"
@@ -934,11 +920,6 @@ pub struct Track {
     /// widget addresses tracks by this id, not by index.
     #[serde(default)]
     pub id: u32,
-    /// v12 (`docs/plan_video.md` §2.1): track の種別。 `Audio` (default) は
-    /// 既存全 field が有効、 `Video` は audio-only field を無視する。 v11
-    /// 以前の file は `#[serde(default)]` で `Audio` に migrate される。
-    #[serde(default)]
-    pub kind: TrackKind,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instrument: Option<PluginInstance>,
@@ -1017,7 +998,6 @@ impl Default for Track {
     fn default() -> Self {
         Self {
             id: 0,
-            kind: TrackKind::Audio,
             name: String::new(),
             instrument: None,
             midi_fx_chain: Vec::new(),
@@ -2298,7 +2278,7 @@ mod tests {
         // migrate via `#[serde(default)]`. Pinning the constant
         // catches accidental rollback. See
         // `docs/plan_image_overlay.md`.
-        assert_eq!(CURRENT_VERSION, 15);
+        assert_eq!(CURRENT_VERSION, 16);
     }
 
     #[test]
@@ -2568,7 +2548,6 @@ mod tests {
         }"#;
         let track: Track = serde_json::from_str(v11_json).unwrap();
         assert_eq!(track.id, 4);
-        assert_eq!(track.kind, TrackKind::Audio);
     }
 
     #[test]
@@ -2628,7 +2607,6 @@ mod tests {
         );
         song.tracks.push(Track {
             id: 1,
-            kind: TrackKind::Video,
             name: "Vid".into(),
             clips: vec![Clip {
                 id: 1,
@@ -2648,7 +2626,6 @@ mod tests {
             restored.clip_contents[&cid],
             ClipContent::Video(_)
         ));
-        assert_eq!(restored.tracks[0].kind, TrackKind::Video);
     }
 
     #[test]

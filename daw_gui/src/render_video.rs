@@ -920,7 +920,6 @@ mod tests {
         let track_id = song.alloc_track_id();
         let mut track = common::model::Track {
             id: track_id,
-            kind: common::model::TrackKind::Video,
             name: "V".into(),
             ..common::model::Track::default()
         };

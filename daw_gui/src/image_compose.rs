@@ -13,7 +13,6 @@
 
 use common::model::{
     AutomationTarget, FadeCurve, ImageBuiltinParam, ImageEvent, ImageSourceId, Song, Track,
-    TrackKind,
 };
 
 /// One image event active at the current playhead. Mirrors
@@ -75,11 +74,10 @@ pub fn active_image_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveIma
     // the layering rule used by video clips.
     let mut z_index: u32 = 0;
     for track in song.tracks.iter().rev() {
-        if track.kind != TrackKind::Video {
-            continue;
-        }
-        // track.muted (= mixer M トグル) で image overlay も無効化。
-        // preview / render の両方で track 単位 SSoT として扱う。
+        // v16: TrackKind 廃止後は「image_events を持つ clip がある track」
+        // が visual composite に参加する (= filter は content kind で行う)。
+        // track.muted (= mixer M トグル) で image overlay も無効化、 SSoT
+        // として preview / render 両方で扱う。
         if track.muted {
             continue;
         }
@@ -279,7 +277,6 @@ mod tests {
         let track_id = song.alloc_track_id();
         let mut track = Track {
             id: track_id,
-            kind: TrackKind::Video,
             name: "Img".into(),
             ..Track::default()
         };

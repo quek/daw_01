@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
-use common::model::{FadeCurve, Song, TrackKind, VideoEvent, VideoSourceId};
+use common::model::{FadeCurve, Song, VideoEvent, VideoSourceId};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
@@ -368,12 +368,11 @@ impl VideoPlaybackEngine {
         // crossfade).
         let mut z_index: u32 = 0;
         for track in song.tracks.iter().rev() {
-            if track.kind != TrackKind::Video {
-                continue;
-            }
-            // track.muted な video track は preview / render の両方で
-            // skip (= 音声と同 idiom)。 visible 切替などのフラグを別途
-            // 設けず、 mixer の M トグルを一意の SSoT とする。
+            // v16: TrackKind 廃止後は「video_events を持つ clip がある
+            // track」 が visual composite に参加する (= filter は content
+            // kind で行う、 後段 `content.video_events()` で None を skip)。
+            // track.muted な track は preview / render の両方で skip
+            // (= 音声と同 idiom)、 mixer の M トグルが SSoT。
             if track.muted {
                 continue;
             }
@@ -446,10 +445,9 @@ impl VideoPlaybackEngine {
             return None;
         }
         for track in &song.tracks {
-            if track.kind != TrackKind::Video {
-                continue;
-            }
-            // track.muted は preview / render と同 idiom で SSoT として扱う。
+            // v16: TrackKind 廃止後は「video_events を持つ clip がある
+            // track」 が visual composite に参加する。 `content.video
+            // _events()` で None を skip する経路に統合。
             if track.muted {
                 continue;
             }
@@ -1348,7 +1346,7 @@ fn read_one_frame(
 mod tests {
     use super::*;
     use common::model::{
-        Clip, ClipContent, Song, Track, TrackKind, VideoContent, VideoEvent,
+        Clip, ClipContent, Song, Track, VideoContent, VideoEvent,
         VideoSource, VideoSourcePath,
     };
 
@@ -1385,7 +1383,6 @@ mod tests {
         );
         let mut track = Track {
             id: 1,
-            kind: TrackKind::Video,
             name: "V".into(),
             ..Track::default()
         };
@@ -1432,7 +1429,6 @@ mod tests {
         // Stick an Audio track at the top — must be skipped.
         let audio_track = Track {
             id: 2,
-            kind: TrackKind::Audio,
             name: "A".into(),
             ..Track::default()
         };
@@ -1714,7 +1710,6 @@ mod tests {
         );
         let top_track = Track {
             id: 2,
-            kind: TrackKind::Video,
             name: "VTop".into(),
             clips: vec![Clip {
                 id: 1,
