@@ -8,21 +8,32 @@ use crate::plugin_format::PluginFormat;
 use crate::protocol::PluginSlot;
 use crate::scale::ScaleChange;
 
-/// Bumped to `12` for Video editing: `Track.kind: TrackKind { Audio,
-/// Video }` discriminator, `Song.video_sources` pool +
-/// `next_video_source_id` + `video_resolution` + `video_framerate`,
-/// and `ClipContent::Video(VideoContent { events: Vec<VideoEvent> })`
-/// variant are added. v11 `.daw` files still load — `Track.kind`
-/// defaults to `Audio` (per `#[serde(default)]`), `video_sources` is
-/// empty, `video_resolution` defaults to `(1920, 1080)`, and
-/// `video_framerate` defaults to `30.0`. `ClipContent::Video` is
-/// distinguished from `Audio` under `#[serde(untagged)]` by the
-/// disjoint required-field pair `source_start_micros` (Video) vs
-/// `source_start_frames` (Audio) inside the inner event struct — a
-/// JSON missing one's required field falls through to the other.
-/// See `docs/plan_video.md`.
+/// Bumped to `13` for Image overlay (PiP): `Song.image_sources` pool +
+/// `next_image_source_id`, and `ClipContent::Image(ImageContent {
+/// events: Vec<ImageEvent> })` variant are added. v12 `.daw` files
+/// still load — `image_sources` defaults to empty (per
+/// `#[serde(default)]`), `next_image_source_id` defaults to `0`. The
+/// new `Image` variant under `#[serde(untagged)]` is disambiguated
+/// from `Audio` / `Video` by the disjoint required field `opacity`
+/// inside `ImageEvent` (= absent from both `AudioEvent` and
+/// `VideoEvent`), and `deny_unknown_fields` on each variant's content
+/// struct prevents accidental wide-match. See `docs/plan_image_overlay.md`.
 ///
 /// Previously:
+///   `12` Video editing: `Track.kind: TrackKind { Audio, Video }`
+///   discriminator, `Song.video_sources` pool +
+///   `next_video_source_id` + `video_resolution` + `video_framerate`,
+///   and `ClipContent::Video(VideoContent { events: Vec<VideoEvent> })`
+///   variant are added. v11 `.daw` files still load — `Track.kind`
+///   defaults to `Audio` (per `#[serde(default)]`), `video_sources` is
+///   empty, `video_resolution` defaults to `(1920, 1080)`, and
+///   `video_framerate` defaults to `30.0`. `ClipContent::Video` is
+///   distinguished from `Audio` under `#[serde(untagged)]` by the
+///   disjoint required-field pair `source_start_micros` (Video) vs
+///   `source_start_frames` (Audio) inside the inner event struct — a
+///   JSON missing one's required field falls through to the other.
+///   See `docs/plan_video.md`.
+///
 ///   `11` Scale &amp; Root: `Song.scale_changes: Vec<ScaleChange>` is
 ///   added. v10 `.daw` files still load — the field defaults to an
 ///   empty Vec (per `#[serde(default)]`), which is the "Scale feature
@@ -45,7 +56,7 @@ use crate::scale::ScaleChange;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 12;
+pub const CURRENT_VERSION: u32 = 13;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -190,6 +201,21 @@ pub struct Song {
     /// forward-migrates to `30.0`.
     #[serde(default = "default_video_framerate")]
     pub video_framerate: f32,
+    /// v13 (`docs/plan_image_overlay.md` §2.3): pool of imported image
+    /// file references (PNG / JPEG / WebP / static), keyed by
+    /// `ImageSourceId`. Decoded BGRA8 bytes are NOT stored here — only
+    /// metadata (path / width / height / format). The bytes are
+    /// decoded once at import time and uploaded to a GPU
+    /// `TextureHandle` cached by `PreviewWindowState`. Entries with
+    /// refcount == 0 are GC'd by `Song::gc_image_sources` before save.
+    /// v12 file forward-migrates to an empty map.
+    #[serde(default)]
+    pub image_sources: HashMap<ImageSourceId, ImageSource>,
+    /// v13: stable id allocator for `ImageSourceId`. `0` is the
+    /// sentinel; valid allocations start at `1`. v12 file forward-
+    /// migrates to `0`, then `ensure_image_source_ids` lifts it.
+    #[serde(default)]
+    pub next_image_source_id: ImageSourceId,
 }
 
 fn default_video_resolution() -> (u32, u32) {
@@ -222,6 +248,8 @@ impl Default for Song {
             next_video_source_id: 1,
             video_resolution: default_video_resolution(),
             video_framerate: default_video_framerate(),
+            image_sources: HashMap::new(),
+            next_image_source_id: 1,
         }
     }
 }
@@ -663,7 +691,8 @@ impl Song {
                 ClipContent::Audio(a) => Some(a.events.iter()),
                 ClipContent::Midi(_)
                 | ClipContent::Automation(_)
-                | ClipContent::Video(_) => None,
+                | ClipContent::Video(_)
+            | ClipContent::Image(_) => None,
             })
             .flatten()
             .filter(|ev| ev.source_id == source_id)
@@ -682,7 +711,8 @@ impl Song {
                 ClipContent::Audio(a) => Some(a.events.iter()),
                 ClipContent::Midi(_)
                 | ClipContent::Automation(_)
-                | ClipContent::Video(_) => None,
+                | ClipContent::Video(_)
+            | ClipContent::Image(_) => None,
             })
             .flatten()
             .map(|ev| ev.source_id)
@@ -737,7 +767,8 @@ impl Song {
                 ClipContent::Video(v) => Some(v.events.iter()),
                 ClipContent::Midi(_)
                 | ClipContent::Audio(_)
-                | ClipContent::Automation(_) => None,
+                | ClipContent::Automation(_)
+                | ClipContent::Image(_) => None,
             })
             .flatten()
             .filter(|ev| ev.source_id == source_id)
@@ -756,7 +787,8 @@ impl Song {
                 ClipContent::Video(v) => Some(v.events.iter()),
                 ClipContent::Midi(_)
                 | ClipContent::Audio(_)
-                | ClipContent::Automation(_) => None,
+                | ClipContent::Automation(_)
+                | ClipContent::Image(_) => None,
             })
             .flatten()
             .map(|ev| ev.source_id)
@@ -786,6 +818,74 @@ impl Song {
         if let Some(orphan) = self.video_sources.remove(&0) {
             let new_id = self.alloc_video_source_id();
             self.video_sources.insert(new_id, orphan);
+        }
+    }
+
+    /// v13 (`docs/plan_image_overlay.md` §2.4): allocate a fresh
+    /// `ImageSourceId`, bumping the song-level counter. Mirrors
+    /// `alloc_video_source_id`.
+    pub fn alloc_image_source_id(&mut self) -> ImageSourceId {
+        let id = self.next_image_source_id.max(1);
+        self.next_image_source_id = id + 1;
+        id
+    }
+
+    /// v13: refcount of an `ImageSourceId` = total `ImageEvent.source_id`
+    /// references across every `Image` `ClipContent` in the song. Used
+    /// by `gc_image_sources` and (future) inspector display.
+    pub fn image_source_refcount(&self, source_id: ImageSourceId) -> usize {
+        self.clip_contents
+            .values()
+            .filter_map(|c| match c {
+                ClipContent::Image(i) => Some(i.events.iter()),
+                ClipContent::Midi(_)
+                | ClipContent::Audio(_)
+                | ClipContent::Automation(_)
+                | ClipContent::Video(_) => None,
+            })
+            .flatten()
+            .filter(|ev| ev.source_id == source_id)
+            .count()
+    }
+
+    /// v13: drop `image_sources` entries no `ImageEvent` references.
+    /// Mirrors `gc_video_sources`.
+    pub fn gc_image_sources(&mut self) {
+        let live: std::collections::HashSet<ImageSourceId> = self
+            .clip_contents
+            .values()
+            .filter_map(|c| match c {
+                ClipContent::Image(i) => Some(i.events.iter()),
+                ClipContent::Midi(_)
+                | ClipContent::Audio(_)
+                | ClipContent::Automation(_)
+                | ClipContent::Video(_) => None,
+            })
+            .flatten()
+            .map(|ev| ev.source_id)
+            .collect();
+        self.image_sources.retain(|id, _| live.contains(id));
+    }
+
+    /// v13: re-assign fresh `ImageSourceId` to any source whose id is
+    /// the `0` sentinel and bump `next_image_source_id` above the
+    /// highest seen. Mirrors `ensure_video_source_ids` semantics.
+    pub fn ensure_image_source_ids(&mut self) {
+        let mut max_seen: ImageSourceId = 0;
+        for id in self.image_sources.keys() {
+            if *id != 0 {
+                max_seen = max_seen.max(*id);
+            }
+        }
+        if self.next_image_source_id <= max_seen {
+            self.next_image_source_id = max_seen + 1;
+        }
+        if self.next_image_source_id == 0 {
+            self.next_image_source_id = 1;
+        }
+        if let Some(orphan) = self.image_sources.remove(&0) {
+            let new_id = self.alloc_image_source_id();
+            self.image_sources.insert(new_id, orphan);
         }
     }
 }
@@ -1107,6 +1207,14 @@ pub enum ClipContent {
     /// a JSON shaped for one variant fails inner deserialization for
     /// the other and serde falls through to the matching variant.
     Video(VideoContent),
+    /// v13 (`docs/plan_image_overlay.md` §2.2): image overlay (PiP)
+    /// clip payload. Untagged disambiguation from `Audio` / `Video`
+    /// works because `ImageEvent` requires `opacity` while neither
+    /// `AudioEvent` nor `VideoEvent` has that field, and all three
+    /// content structs use `deny_unknown_fields` so a JSON object
+    /// carrying `opacity` fails the Audio / Video inner deserialize
+    /// and falls through to `Image`.
+    Image(ImageContent),
 }
 
 impl Default for ClipContent {
@@ -1125,7 +1233,8 @@ impl ClipContent {
             ClipContent::Midi(m) => Some(m.notes.as_slice()),
             ClipContent::Audio(_)
             | ClipContent::Automation(_)
-            | ClipContent::Video(_) => None,
+            | ClipContent::Video(_)
+            | ClipContent::Image(_) => None,
         }
     }
 
@@ -1136,7 +1245,8 @@ impl ClipContent {
             ClipContent::Midi(m) => Some(&mut m.notes),
             ClipContent::Audio(_)
             | ClipContent::Automation(_)
-            | ClipContent::Video(_) => None,
+            | ClipContent::Video(_)
+            | ClipContent::Image(_) => None,
         }
     }
 
@@ -1146,7 +1256,8 @@ impl ClipContent {
             ClipContent::Audio(a) => Some(a.events.as_slice()),
             ClipContent::Midi(_)
             | ClipContent::Automation(_)
-            | ClipContent::Video(_) => None,
+            | ClipContent::Video(_)
+            | ClipContent::Image(_) => None,
         }
     }
 
@@ -1156,7 +1267,8 @@ impl ClipContent {
             ClipContent::Audio(a) => Some(&mut a.events),
             ClipContent::Midi(_)
             | ClipContent::Automation(_)
-            | ClipContent::Video(_) => None,
+            | ClipContent::Video(_)
+            | ClipContent::Image(_) => None,
         }
     }
 
@@ -1167,7 +1279,8 @@ impl ClipContent {
             ClipContent::Automation(a) => Some(a.points.as_slice()),
             ClipContent::Midi(_)
             | ClipContent::Audio(_)
-            | ClipContent::Video(_) => None,
+            | ClipContent::Video(_)
+            | ClipContent::Image(_) => None,
         }
     }
 
@@ -1178,7 +1291,8 @@ impl ClipContent {
             ClipContent::Automation(a) => Some(&mut a.points),
             ClipContent::Midi(_)
             | ClipContent::Audio(_)
-            | ClipContent::Video(_) => None,
+            | ClipContent::Video(_)
+            | ClipContent::Image(_) => None,
         }
     }
 
@@ -1189,7 +1303,8 @@ impl ClipContent {
             ClipContent::Video(v) => Some(v.events.as_slice()),
             ClipContent::Midi(_)
             | ClipContent::Audio(_)
-            | ClipContent::Automation(_) => None,
+            | ClipContent::Automation(_)
+            | ClipContent::Image(_) => None,
         }
     }
 
@@ -1199,7 +1314,31 @@ impl ClipContent {
             ClipContent::Video(v) => Some(&mut v.events),
             ClipContent::Midi(_)
             | ClipContent::Audio(_)
-            | ClipContent::Automation(_) => None,
+            | ClipContent::Automation(_)
+            | ClipContent::Image(_) => None,
+        }
+    }
+
+    /// Borrow the image events slice if this is an `Image` variant. v13
+    /// (`docs/plan_image_overlay.md` §2.2).
+    pub fn image_events(&self) -> Option<&[ImageEvent]> {
+        match self {
+            ClipContent::Image(i) => Some(i.events.as_slice()),
+            ClipContent::Midi(_)
+            | ClipContent::Audio(_)
+            | ClipContent::Automation(_)
+            | ClipContent::Video(_) => None,
+        }
+    }
+
+    /// Mutably borrow the events vec for an `Image` variant. v13.
+    pub fn image_events_mut(&mut self) -> Option<&mut Vec<ImageEvent>> {
+        match self {
+            ClipContent::Image(i) => Some(&mut i.events),
+            ClipContent::Midi(_)
+            | ClipContent::Audio(_)
+            | ClipContent::Automation(_)
+            | ClipContent::Video(_) => None,
         }
     }
 }
@@ -1482,6 +1621,132 @@ impl Default for VideoEvent {
             event_length_beats: 0.0,
             source_start_micros: 0,
             source_end_micros: 0,
+            muted: false,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        }
+    }
+}
+
+// =============================================================================
+// Image overlay / PiP (v13, docs/plan_image_overlay.md §2)
+// =============================================================================
+
+/// Stable id for an imported image source. `0` is the "未採番" sentinel.
+/// v13 (`docs/plan_image_overlay.md` §2.1).
+pub type ImageSourceId = u32;
+
+/// Reference to an imported image file (PNG / JPEG / WebP / static
+/// BMP / TIFF / TGA / GIF-static). Path resolution mirrors
+/// `VideoSource` — normal imports copy the file into
+/// `<project_dir>/images/<basename>_<hash8>.<ext>` and store
+/// `ProjectRelative`. The decoded BGRA8 buffer is NOT stored on the
+/// model: each image is decoded once at import time (= the `image`
+/// crate returns a `RgbaImage`, daw_gui reorders to BGRA8 + uploads
+/// to a GPU `TextureHandle` cached on the preview window for the
+/// lifetime of the project). v13 (`docs/plan_image_overlay.md` §2.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct ImageSource {
+    pub path: ImageSourcePath,
+    /// Native pixel width / height as reported by the decoder. PiP
+    /// rect (`ImageEvent.x/y/w/h`) is normalized so width/height are
+    /// only used for aspect-fit fallback and metadata display.
+    pub width: u32,
+    pub height: u32,
+    /// `image::ImageFormat` debug string (`"Png"` / `"Jpeg"` /
+    /// `"WebP"` / etc.). Free-form, consumer uses for diagnostics
+    /// only.
+    pub format: String,
+}
+
+/// Path resolution strategy for an `ImageSource`. Mirrors
+/// `VideoSourcePath`. v13 (`docs/plan_image_overlay.md` §2.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub enum ImageSourcePath {
+    ProjectRelative(PathBuf),
+    Absolute(PathBuf),
+}
+
+/// Image clip content — an ordered list of image events that display
+/// within the clip. Mirrors `VideoContent`'s shape so the existing
+/// clip / event UX (Split / Glue / drag move / trim / fade in/out)
+/// applies uniformly. Multiple events on the same clip can overlap
+/// (= the preview composite alpha-blends them, top-event-wins by
+/// emit order) or sit side by side (= splittable PiP montage).
+///
+/// `#[serde(deny_unknown_fields)]` is required so `#[serde(untagged)]`
+/// `ClipContent` distinguishes `Image` vs `Audio` / `Video`: the
+/// disjoint required field is `ImageEvent.opacity`, absent from both
+/// `AudioEvent` and `VideoEvent`. Denying unknowns prevents a future
+/// field addition from widening the match unexpectedly.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[serde(deny_unknown_fields)]
+pub struct ImageContent {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<ImageEvent>,
+}
+
+/// One playable image event inside an `ImageContent`. Maps an
+/// `ImageSource` to a position in the clip
+/// (`event_start_in_clip_beats` + `event_length_beats`) and a PiP
+/// rect in normalized 0-1 preview coordinates.
+///
+/// **Required-field invariant**: `opacity` MUST stay as a required
+/// (no `#[serde(default)]`) field of distinct name from any required
+/// field of `AudioEvent` and `VideoEvent`. The untagged `ClipContent`
+/// dispatch relies on this to disambiguate Image vs Audio / Video
+/// JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct ImageEvent {
+    pub source_id: ImageSourceId,
+    /// Clip-local beat at which the event starts.
+    pub event_start_in_clip_beats: f64,
+    /// Duration of the event in clip-local beats. Image is static so
+    /// the source has no inherent duration — the user freely extends
+    /// the event by drag-trim.
+    pub event_length_beats: f64,
+
+    /// PiP rect in normalized preview-window coordinates. `(0.0, 0.0)`
+    /// is the top-left corner of the preview window, `(1.0, 1.0)` is
+    /// the bottom-right. `(x, y)` is the top-left of the image's
+    /// rect, `(w, h)` is its width / height. Example:
+    /// `(0.0, 0.0, 1.0, 1.0)` fills the entire preview; `(0.7, 0.0,
+    /// 0.3, 0.3)` lands a 30%×30% logo in the top-right corner.
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+
+    /// Overall transparency (0.0 = fully transparent, 1.0 = fully
+    /// opaque). Multiplied with the fade envelope (= the image
+    /// crossfades and the user-set base opacity stack).
+    ///
+    /// **JSON disambiguation required field** — see struct doc.
+    pub opacity: f32,
+
+    pub muted: bool,
+    pub fade_in_beats: f64,
+    pub fade_out_beats: f64,
+    pub fade_in_curve: FadeCurve,
+    pub fade_out_curve: FadeCurve,
+}
+
+impl Default for ImageEvent {
+    fn default() -> Self {
+        Self {
+            source_id: 0,
+            event_start_in_clip_beats: 0.0,
+            event_length_beats: 0.0,
+            // PiP rect defaults to "full screen" so a freshly-dropped
+            // image immediately shows something visible; the user can
+            // shrink/move it in the inspector or preview drag handle.
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+            opacity: 1.0,
             muted: false,
             fade_in_beats: 0.0,
             fade_out_beats: 0.0,
@@ -1989,14 +2254,13 @@ mod tests {
 
     #[test]
     fn current_version_is_pinned() {
-        // Bumped to 12 for Video editing: `Track.kind: TrackKind`,
-        // `Song.video_sources` + `next_video_source_id` +
-        // `video_resolution` + `video_framerate`, and
-        // `ClipContent::Video(VideoContent { events: Vec<VideoEvent> })`
-        // are added. v11 files forward-migrate via `#[serde(default)]`.
-        // Pinning the constant catches accidental rollback. See
-        // `docs/plan_video.md`.
-        assert_eq!(CURRENT_VERSION, 12);
+        // Bumped to 13 for Image overlay (PiP): `Song.image_sources` +
+        // `next_image_source_id`, and `ClipContent::Image(ImageContent
+        // { events: Vec<ImageEvent> })` are added. v12 files forward-
+        // migrate via `#[serde(default)]`. Pinning the constant
+        // catches accidental rollback. See
+        // `docs/plan_image_overlay.md`.
+        assert_eq!(CURRENT_VERSION, 13);
     }
 
     #[test]
@@ -2495,5 +2759,143 @@ mod tests {
         song.gc_video_sources();
         assert!(song.video_sources.contains_key(&live_id));
         assert!(!song.video_sources.contains_key(&orphan_id));
+    }
+
+    // =========================================================================
+    // Image overlay (v13, docs/plan_image_overlay.md §P1 invariants)
+    // =========================================================================
+
+    #[test]
+    fn clipcontent_untagged_image_dispatches_via_opacity_field() {
+        // The disambiguator for the new Image variant is the required
+        // `opacity` field on `ImageEvent`. Audio / Video JSON shaped
+        // without `opacity` must NOT silently match Image, and Image
+        // JSON shaped with `opacity` must NOT match Audio / Video
+        // (deny_unknown_fields on Content structs ensures the latter).
+        let image_json = r#"{
+            "events": [{
+                "source_id": 1,
+                "event_start_in_clip_beats": 0.0,
+                "event_length_beats": 4.0,
+                "x": 0.1,
+                "y": 0.1,
+                "w": 0.3,
+                "h": 0.3,
+                "opacity": 1.0,
+                "muted": false,
+                "fade_in_beats": 0.0,
+                "fade_out_beats": 0.0,
+                "fade_in_curve": "Linear",
+                "fade_out_curve": "Linear"
+            }]
+        }"#;
+        let image: ClipContent = serde_json::from_str(image_json).unwrap();
+        assert!(matches!(image, ClipContent::Image(_)));
+    }
+
+    #[test]
+    fn alloc_image_source_id_bumps_counter() {
+        let mut song = Song::default();
+        let a = song.alloc_image_source_id();
+        let b = song.alloc_image_source_id();
+        assert_eq!(a, 1);
+        assert_eq!(b, 2);
+        assert_eq!(song.next_image_source_id, 3);
+    }
+
+    #[test]
+    fn image_source_refcount_counts_events_across_clips() {
+        let mut song = Song::default();
+        let img = song.alloc_image_source_id();
+        song.image_sources.insert(
+            img,
+            ImageSource {
+                path: ImageSourcePath::Absolute("/tmp/logo.png".into()),
+                width: 256,
+                height: 256,
+                format: "Png".into(),
+            },
+        );
+        let cid_a = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid_a,
+            ClipContent::Image(ImageContent {
+                events: vec![
+                    ImageEvent {
+                        source_id: img,
+                        ..ImageEvent::default()
+                    },
+                    ImageEvent {
+                        source_id: img,
+                        ..ImageEvent::default()
+                    },
+                ],
+            }),
+        );
+        let cid_b = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid_b,
+            ClipContent::Image(ImageContent {
+                events: vec![ImageEvent {
+                    source_id: img,
+                    ..ImageEvent::default()
+                }],
+            }),
+        );
+        assert_eq!(song.image_source_refcount(img), 3);
+    }
+
+    #[test]
+    fn gc_image_sources_drops_orphans() {
+        let mut song = Song::default();
+        let live_id = song.alloc_image_source_id();
+        let orphan_id = song.alloc_image_source_id();
+        song.image_sources.insert(
+            live_id,
+            ImageSource {
+                path: ImageSourcePath::Absolute("/tmp/live.png".into()),
+                width: 256,
+                height: 256,
+                format: "Png".into(),
+            },
+        );
+        song.image_sources.insert(
+            orphan_id,
+            ImageSource {
+                path: ImageSourcePath::Absolute("/tmp/orphan.png".into()),
+                width: 256,
+                height: 256,
+                format: "Png".into(),
+            },
+        );
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Image(ImageContent {
+                events: vec![ImageEvent {
+                    source_id: live_id,
+                    ..ImageEvent::default()
+                }],
+            }),
+        );
+
+        song.gc_image_sources();
+        assert!(song.image_sources.contains_key(&live_id));
+        assert!(!song.image_sources.contains_key(&orphan_id));
+    }
+
+    #[test]
+    fn v12_forward_migrates_image_fields_to_default() {
+        // v12 file (= no image_sources / next_image_source_id keys)
+        // must deserialize cleanly into v13 Song with default-empty
+        // image pool and next_id == 0.
+        let v12_song_json = serde_json::json!({
+            "bpm": 120.0,
+            "time_sig": [4, 4],
+            "length_beats": 64.0,
+        });
+        let song: Song = serde_json::from_value(v12_song_json).unwrap();
+        assert!(song.image_sources.is_empty());
+        assert_eq!(song.next_image_source_id, 0);
     }
 }

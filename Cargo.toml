@@ -16,6 +16,11 @@ clap-sys = "0.5"
 com-scrape-types = "0.1"
 dirs = "5"
 hound = "3"
+# v13 image overlay (docs/plan_image_overlay.md §P2): PNG / JPEG / WebP
+# / BMP / TIFF / TGA / GIF (static) decode → `RgbaImage` buffer. Pure
+# Rust, no system deps. WebP and GIF decode are enabled by default
+# features.
+image = "0.25"
 cpal = "0.15"
 libloading = "0.8"
 midir = "0.10"

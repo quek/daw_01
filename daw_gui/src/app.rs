@@ -317,6 +317,28 @@ pub struct AppData {
     /// `ArrangementClip.thumbnail`.
     pub video_texture_cache:
         std::collections::HashMap<common::model::VideoSourceId, daw_ui_renderer::TextureHandle>,
+    /// v13 (`docs/plan_image_overlay.md` §P2): Image BGRA8 staging
+    /// area, keyed by `ImageSourceId`. Populated by
+    /// `action_import_image`; drained by the runner (P3) which calls
+    /// `Renderer::create_texture_bgra` + `upload_texture_bgra` and
+    /// inserts the resulting `TextureHandle` into
+    /// [`Self::image_texture_cache`]. After upload the entry here is
+    /// dropped (= the texture lives in GPU memory). `(width, height,
+    /// bgra)`; bgra length is `width * height * 4`.
+    pub image_source_bgra: std::collections::HashMap<
+        common::model::ImageSourceId,
+        (u32, u32, std::sync::Arc<Vec<u8>>),
+    >,
+    /// v13: `ImageSourceId`s queued for GPU texture upload. Drained by
+    /// the runner each frame.
+    pub pending_image_uploads: Vec<common::model::ImageSourceId>,
+    /// v13: GPU-side image textures keyed by `ImageSourceId`. Written
+    /// by the runner after upload, read by `preview_window.rs`
+    /// composite pass and `arrangement_view.rs` thumbnail rendering.
+    pub image_texture_cache: std::collections::HashMap<
+        common::model::ImageSourceId,
+        daw_ui_renderer::TextureHandle,
+    >,
     /// docs/plan_video.md P4: video preview window の表示フラグ。 menu
     /// "View → Video Preview" / shortcut で toggle、 runner が毎フレーム
     /// この値を見て第二 winit::Window を create / destroy する。 false で
@@ -818,6 +840,9 @@ impl AppData {
             video_thumbnail_rgba: std::collections::HashMap::new(),
             pending_thumbnail_uploads: Vec::new(),
             video_texture_cache: std::collections::HashMap::new(),
+            image_source_bgra: std::collections::HashMap::new(),
+            pending_image_uploads: Vec::new(),
+            image_texture_cache: std::collections::HashMap::new(),
             preview_window_visible: false,
             arrangement_hover_beat: None,
             arrangement_hover_beat_raw: None,
@@ -2468,6 +2493,17 @@ pub enum AppEvent {
     /// clips finish in 1-3s, slow imports leave the user with a
     /// momentary stall instead of a complex completion dispatch.
     ImportVideo { paths: Vec<PathBuf> },
+    /// v13 (`docs/plan_image_overlay.md` §P2): import one or more
+    /// image files (PNG / JPEG / WebP / static), allocating an
+    /// `ImageSource` per file and a new Video-kind Track at the top
+    /// of the arrangement that holds the image as a PiP overlay.
+    /// Image clips default to full-screen (`x=0,y=0,w=1,h=1`); the
+    /// user shrinks/positions them in P5 drag handle UI or P4
+    /// inspector.
+    ImportImage { paths: Vec<PathBuf> },
+    /// v13: open the platform file dialog filtered to supported image
+    /// extensions and dispatch the selection as `AppEvent::ImportImage`.
+    OpenImportImageDialog,
 
     /// File menu → "Import Video..." entry. Opens an `rfd` file
     /// picker (mp4 / mov / mkv / webm filter) and forwards to
@@ -3446,6 +3482,12 @@ impl AppData {
                     self.status_message =
                         "Video import は Windows 専用 (WMF 経由) です".into();
                 }
+            }
+            AppEvent::ImportImage { paths } => {
+                self.action_import_image(paths);
+            }
+            AppEvent::OpenImportImageDialog => {
+                self.action_open_import_image_dialog();
             }
             AppEvent::TogglePreviewWindow => {
                 self.preview_window_visible = !self.preview_window_visible;
@@ -10799,6 +10841,154 @@ impl AppData {
         self.action_import_video(paths);
     }
 
+    /// v13 (`docs/plan_image_overlay.md` §P2): import one or more
+    /// image files as PiP overlay clips. Each successful import:
+    ///
+    /// 1. Allocates an `ImageSourceId` and registers an `ImageSource`
+    ///    in `Song.image_sources` (path / dimensions / format).
+    /// 2. Stages the BGRA8 bytes in `image_source_bgra` and queues a
+    ///    GPU texture upload via `pending_image_uploads` — the runner
+    ///    picks this up next frame (P3) and writes the resulting
+    ///    `TextureHandle` into `image_texture_cache`.
+    /// 3. Creates a Video-kind Track + an Image clip occupying the
+    ///    project length (= so the user immediately sees the image
+    ///    on top of any active video). PiP rect defaults to full-
+    ///    screen; the user shrinks/positions it via the P5 drag
+    ///    handle UI or the P4 inspector.
+    ///
+    /// Errors are accumulated; partial-success is permitted (= the
+    /// status bar summarizes how many files succeeded / failed).
+    fn action_import_image(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        let project_dir = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+
+        // All imported image clips drop in at beat 0 by default. The
+        // user repositions them via drag on the arrangement timeline
+        // (= same operation as audio/video clips).
+        let next_start_beat = 0.0_f64;
+        let image_clip_length_beats = (self.song.length_beats * 0.5).max(8.0);
+
+        let mut imported_ok = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        for path in &paths {
+            let imported = match crate::import_image::import_one_image(
+                path,
+                project_dir.as_deref(),
+            ) {
+                Ok(i) => i,
+                Err(e) => {
+                    errors.push(format!("{}: {e}", path.display()));
+                    continue;
+                }
+            };
+
+            // 1) Register ImageSource + stage BGRA for GPU upload.
+            let image_source_id = self.song.alloc_image_source_id();
+            self.song.image_sources.insert(image_source_id, imported.source);
+            let w = imported.bgra.len() as u32;
+            let _ = w;
+            // bgra length matches width * height * 4 by construction of
+            // `import_one_image`; re-fetch dims from the source we just
+            // inserted so the staging matches.
+            let src = &self.song.image_sources[&image_source_id];
+            self.image_source_bgra.insert(
+                image_source_id,
+                (src.width, src.height, std::sync::Arc::new(imported.bgra)),
+            );
+            self.pending_image_uploads.push(image_source_id);
+
+            // 2) Build the Image clip content. Single ImageEvent
+            // covering the whole clip with full-screen PiP rect; the
+            // user adjusts later.
+            let display_name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("image")
+                .to_string();
+            let i_content_id = self.song.alloc_content_id();
+            self.song.clip_contents.insert(
+                i_content_id,
+                common::model::ClipContent::Image(common::model::ImageContent {
+                    events: vec![common::model::ImageEvent {
+                        source_id: image_source_id,
+                        event_start_in_clip_beats: 0.0,
+                        event_length_beats: image_clip_length_beats,
+                        ..common::model::ImageEvent::default()
+                    }],
+                }),
+            );
+
+            // 3) New Video-kind Track at the top of the arrangement so
+            // the image renders ABOVE existing video layers
+            // (= multi-track composite top-wins, plan_video §4 P7).
+            let image_track_id = self.song.alloc_track_id();
+            let mut image_track = Track {
+                id: image_track_id,
+                kind: common::model::TrackKind::Video,
+                name: format!("{display_name} (Image)"),
+                ..Track::default()
+            };
+            let i_clip_id = image_track.alloc_clip_id();
+            image_track.clips.push(Clip {
+                id: i_clip_id,
+                name: display_name,
+                start_beat: next_start_beat,
+                length_beats: image_clip_length_beats,
+                content_id: i_content_id,
+                notes: Vec::new(),
+            });
+            // Insert at index 0 (= top of the arrangement).
+            self.song.tracks.insert(0, image_track);
+            imported_ok += 1;
+        }
+
+        if imported_ok > 0 {
+            self.is_dirty = true;
+            // No `sync_song_to_plugin_host` — image clips have no
+            // audio engine implications, the daw_audio process never
+            // sees them.
+        }
+
+        // `paths.is_empty()` early-returns above, so we know
+        // imported_ok + errors.len() >= 1 — the (0, true) "nothing
+        // happened" case is unreachable here.
+        self.status_message = match (imported_ok, errors.is_empty()) {
+            (0, false) => format!("Image import 失敗: {}", errors.join(" / ")),
+            (n, true) => format!("Image import 完了: {n} ファイル"),
+            (n, false) => format!(
+                "Image import: {n} ファイル成功、 {} 件エラー: {}",
+                errors.len(),
+                errors.join(" / ")
+            ),
+        };
+    }
+
+    /// File menu → "Import Image..." 経路。 `rfd` の native file picker
+    /// (multi-select、 png/jpg/jpeg/webp/bmp/gif filter) を開いて、 選択
+    /// された path を `action_import_image` に転送する。 OS-neutral
+    /// (= image crate のみ、 cfg(windows) 不要)。
+    fn action_open_import_image_dialog(&mut self) {
+        let Some(paths) = rfd::FileDialog::new()
+            .add_filter(
+                "Image",
+                &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "tga", "gif"],
+            )
+            .set_title("Import Image...")
+            .pick_files()
+        else {
+            return;
+        };
+        if paths.is_empty() {
+            return;
+        }
+        self.action_import_image(paths);
+    }
+
     /// File menu → "Export Video..." (`docs/plan_video.md` P8).
     /// 1. Save dialog for the output mp4 (defaults to project name +
     ///    `.mp4`).
@@ -11263,6 +11453,10 @@ impl AppData {
                     .insert(front_id, ClipContent::Video(front));
                 ClipContent::Video(back)
             }
+            // Image clip Split は docs/plan_image_overlay.md §4 P4 で
+            // 実装予定。 P1 段階では未対応として skip し、 Video / Audio
+            // / MIDI clip の Split を阻害しないようにする。
+            ClipContent::Image(_) => return false,
         };
 
         // Allocate fresh ContentIds for both halves (front was just
@@ -11385,6 +11579,14 @@ impl AppData {
                         had_mixed_kind = true;
                         break;
                     }
+                    // Image clip Glue は docs/plan_image_overlay.md §4 P4
+                    // で実装予定。 P1 段階では未対応として「混在」 扱いで
+                    // abort し、 Video / Audio / MIDI clip 同士の Glue は
+                    // 引き続き動作させる。
+                    ClipContent::Image(_) => {
+                        had_mixed_kind = true;
+                        break;
+                    }
                 };
                 match glue_kind {
                     None => glue_kind = Some(this_kind),
@@ -11456,6 +11658,10 @@ impl AppData {
                     // variant referenced from `Track.clips` is a
                     // stale link, skip silently.
                     ClipContent::Automation(_) => {}
+                    // Image clip Glue は P4 で実装。 P1 段階では reach
+                    // 不能 (this_kind 判定で abort 済み)、 防衛的に
+                    // 何もしないだけ。
+                    ClipContent::Image(_) => {}
                     // Video Glue (docs/plan_video.md §4 P6): same shift
                     // logic as Audio. source_micros range stays as-is
                     // per event since Glue doesn't change content

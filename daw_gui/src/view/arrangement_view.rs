@@ -199,17 +199,34 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     // からの差分)。 import 直後の 1 フレーム目は cache に
                     // 未登録 (= None で video_clip_loading 単色)、 P3.5 の
                     // runner drain 完了次フレームから thumbnail が出る。
-                    thumbnail: app
-                        .song
-                        .clip_contents
-                        .get(&c.content_id)
-                        .and_then(|ct| ct.video_events())
-                        .and_then(|events| events.first())
-                        .and_then(|ev| {
-                            let handle = *app.video_texture_cache.get(&ev.source_id)?;
-                            let src = app.song.video_sources.get(&ev.source_id)?;
-                            Some((handle, src.width, src.height))
-                        }),
+                    thumbnail: {
+                        // docs/plan_image_overlay.md §P4: image clips share
+                        // the thumbnail slot with video clips. We probe
+                        // `ClipContent::Video` first; on miss fall back to
+                        // `ClipContent::Image` and look up the
+                        // `image_texture_cache`. The two are mutually
+                        // exclusive per clip (= one ClipContent variant per
+                        // content_id), so this `or_else` chain has no
+                        // ambiguity.
+                        let content = app.song.clip_contents.get(&c.content_id);
+                        content
+                            .and_then(|ct| ct.video_events())
+                            .and_then(|events| events.first())
+                            .and_then(|ev| {
+                                let handle =
+                                    *app.video_texture_cache.get(&ev.source_id)?;
+                                let src = app.song.video_sources.get(&ev.source_id)?;
+                                Some((handle, src.width, src.height))
+                            })
+                            .or_else(|| {
+                                let events = content?.image_events()?;
+                                let ev = events.first()?;
+                                let handle =
+                                    *app.image_texture_cache.get(&ev.source_id)?;
+                                let src = app.song.image_sources.get(&ev.source_id)?;
+                                Some((handle, src.width, src.height))
+                            })
+                    },
                 })
                 .collect(),
             // gui_01 #016 で追加された group hierarchy fields:
@@ -638,14 +655,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         } else {
             None
         };
+        // docs/plan_image_overlay.md P2: 3-way partition (video →
+        // image → audio). Video on Windows only (= WMF dependency);
+        // image is OS-neutral (image crate); audio is the fallback
+        // bucket (hound rejects non-WAV inside `action_import_audio`).
         #[cfg(windows)]
-        let (video_paths, audio_paths): (Vec<_>, Vec<_>) = drop
+        let (video_paths, non_video_paths): (Vec<_>, Vec<_>) = drop
             .paths
             .into_iter()
             .partition(|p| crate::import_video::looks_like_video(p));
         #[cfg(not(windows))]
-        let (video_paths, audio_paths): (Vec<std::path::PathBuf>, Vec<_>) =
+        let (video_paths, non_video_paths): (Vec<std::path::PathBuf>, Vec<_>) =
             (Vec::new(), drop.paths);
+        let (image_paths, audio_paths): (Vec<_>, Vec<_>) = non_video_paths
+            .into_iter()
+            .partition(|p| crate::import_image::is_supported_extension(p));
+
         if !audio_paths.is_empty() {
             let paths = audio_paths;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -659,6 +684,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let paths = video_paths;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::ImportVideo { paths });
+            }));
+        }
+        if !image_paths.is_empty() {
+            let paths = image_paths;
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ImportImage { paths });
             }));
         }
     }

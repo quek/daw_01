@@ -198,6 +198,11 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                     app.handle_event(AppEvent::OpenImportVideoDialog)
                 }));
             });
+            m.item("Import Image...", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::OpenImportImageDialog)
+                }));
+            });
             m.item("Export WAV...", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ExportWav)));
             });

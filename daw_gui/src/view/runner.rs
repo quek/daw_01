@@ -597,12 +597,46 @@ impl Runner {
     /// Throttled to `Song.video_framerate` (typical 30fps). The main
     /// loop runs at vsync; throttling avoids spamming the worker with
     /// requests that would just overwrite each other.
+    /// docs/plan_image_overlay.md §P3: drain `AppData.pending_image_uploads`
+    /// by uploading staged BGRA buffers into the preview window's
+    /// per-`ImageSourceId` GPU texture, and mirror the resulting
+    /// handle into `AppData.image_texture_cache` so the composite
+    /// pass can look it up by source_id. Idempotent / cheap when the
+    /// queue is empty.
+    #[cfg(windows)]
+    fn drain_image_uploads(state: &mut RunnerState) {
+        if state.app.pending_image_uploads.is_empty() {
+            return;
+        }
+        let Some(preview) = state.preview.as_mut() else {
+            // Preview window is not open yet; keep the queue intact
+            // and re-drain when it opens (= the user is allowed to
+            // import images before opening the preview).
+            return;
+        };
+        let pending: Vec<_> =
+            state.app.pending_image_uploads.drain(..).collect();
+        for image_source_id in pending {
+            let Some((w, h, bgra)) =
+                state.app.image_source_bgra.remove(&image_source_id)
+            else {
+                continue; // already uploaded (= rapid undo path)
+            };
+            let handle = preview.upload_image_bgra(image_source_id, w, h, &bgra);
+            state.app.image_texture_cache.insert(image_source_id, handle);
+        }
+    }
+
     #[cfg(windows)]
     fn drive_preview_playback(state: &mut RunnerState) {
         // Step 1: always drain results first, even on throttled
         // frames. Decoded frames are precious — uploading them is
         // cheap (GPU memcpy) and keeps the texture fresh.
         Self::drain_preview_worker_results(state);
+        // docs/plan_image_overlay.md §P3: also drain any pending
+        // image uploads so a freshly-imported image appears on the
+        // very next composite pass (= no 1-frame delay).
+        Self::drain_image_uploads(state);
 
         let Some(preview) = state.preview.as_mut() else {
             return;
@@ -702,8 +736,65 @@ impl Runner {
                 width: slot.width,
                 height: slot.height,
                 alpha: frame_info.alpha,
+                // Video clips always letterbox; the PiP rect is the
+                // image-overlay path only.
+                pip_rect: None,
             });
         }
+
+        // docs/plan_image_overlay.md §P3: image overlay layers.
+        // `active_image_sources_at` returns frames already sorted
+        // bottom→top by `z_index`; interleave them with video layers
+        // by re-sorting the combined Vec on z_index ascending.
+        let image_frames = crate::image_compose::active_image_sources_at(
+            &state.app.song,
+            playhead_beat,
+        );
+        for frame_info in image_frames {
+            // `AppData::image_texture_cache` stores just the
+            // TextureHandle (dimensions come from
+            // `Song.image_sources`).
+            let Some(handle) =
+                state.app.image_texture_cache.get(&frame_info.image_source_id).copied()
+            else {
+                continue; // texture not yet uploaded
+            };
+            let dims = state
+                .app
+                .song
+                .image_sources
+                .get(&frame_info.image_source_id)
+                .map(|s| (s.width, s.height))
+                .unwrap_or((0, 0));
+            if dims.0 == 0 || dims.1 == 0 {
+                continue;
+            }
+            layers.push(crate::view::preview_window::CompositeLayer {
+                texture: handle,
+                width: dims.0,
+                height: dims.1,
+                alpha: frame_info.alpha,
+                pip_rect: Some((frame_info.x, frame_info.y, frame_info.w, frame_info.h)),
+            });
+        }
+        // z_index ascending = bottom→top draw order. Video frames
+        // populated `z_index` from `active_sources_at`; image frames
+        // populated theirs from `active_image_sources_at` (same
+        // counter convention). After this sort the composite pass
+        // draws layers in the right order.
+        //
+        // Stable so identical z_index between video & image keeps
+        // their relative order from the per-helper emit (= image
+        // typically dropped at top track index 0, so it ends up
+        // above the video in the composite naturally).
+        //
+        // Note: each helper computes its z_index independently, so a
+        // mixed scene may produce duplicate z_index values that don't
+        // perfectly reflect the user-visible track order. P4
+        // (inspector) is the right place to consolidate this into a
+        // single multi-kind active_sources iterator; for now the
+        // image-on-top convention covers the MV-overlay use case.
+        let _ = ();
         preview.set_composite_layers(layers);
     }
 

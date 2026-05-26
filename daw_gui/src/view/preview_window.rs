@@ -51,6 +51,15 @@ pub struct PreviewWindowState {
         (common::model::VideoSourceId, u8),
         (TextureHandle, u32, u32),
     >,
+    /// docs/plan_image_overlay.md §P3: per-`ImageSourceId` GPU textures
+    /// backing the PiP overlay path. Static — the import path uploads
+    /// each image once via `upload_image_bgra` and the handle stays
+    /// valid for the lifetime of the preview window. `(handle, width,
+    /// height)`.
+    pub image_textures: std::collections::HashMap<
+        common::model::ImageSourceId,
+        (TextureHandle, u32, u32),
+    >,
     /// docs/plan_video.md P7: composite layer list the runner pushes
     /// each frame, ordered bottom→top (= lowest video track first,
     /// crossfade-partner clip on top of fading-out clip). Each entry
@@ -65,12 +74,22 @@ pub struct PreviewWindowState {
 /// pass calls `push_textured_quad` in that order so gui_01's
 /// call-order interleave lays the top track / crossfade-target on
 /// top.
+///
+/// `pip_rect` (docs/plan_image_overlay.md §P3) selects between two
+/// placement modes:
+/// - `None` — aspect-fit letterbox over the entire preview window
+///   (= the video clip default behaviour, unchanged from pre-P3).
+/// - `Some((x, y, w, h))` — normalized 0-1 PiP rect; the renderer
+///   maps `(x, y, w, h)` to screen px and draws the layer at exactly
+///   that sub-rect of the preview surface, regardless of aspect.
+///   Used by `ClipContent::Image` for ロゴ / ジャケット overlays.
 #[derive(Debug, Clone, Copy)]
 pub struct CompositeLayer {
     pub texture: TextureHandle,
     pub width: u32,
     pub height: u32,
     pub alpha: f32,
+    pub pip_rect: Option<(f32, f32, f32, f32)>,
 }
 
 impl PreviewWindowState {
@@ -99,8 +118,30 @@ impl PreviewWindowState {
             renderer,
             scene: Scene::new(),
             frame_textures: std::collections::HashMap::new(),
+            image_textures: std::collections::HashMap::new(),
             composite_layers: Vec::new(),
         })
+    }
+
+    /// docs/plan_image_overlay.md §P3: upload a freshly-decoded image
+    /// into its dedicated `(ImageSourceId)` GPU texture. Idempotent —
+    /// re-uploading the same id replaces the existing texture (=
+    /// reimport-after-edit case). Returns the cached handle so the
+    /// caller can populate `AppData::image_texture_cache`.
+    pub fn upload_image_bgra(
+        &mut self,
+        source_id: common::model::ImageSourceId,
+        width: u32,
+        height: u32,
+        bgra: &[u8],
+    ) -> TextureHandle {
+        if let Some((old, _, _)) = self.image_textures.remove(&source_id) {
+            self.renderer.destroy_texture(old);
+        }
+        let handle = self.renderer.create_texture_bgra(width, height);
+        self.renderer.upload_texture_bgra(handle, bgra);
+        self.image_textures.insert(source_id, (handle, width, height));
+        handle
     }
 
     /// Upload (or `Shared` import) a freshly-decoded frame into the
@@ -210,6 +251,9 @@ impl PreviewWindowState {
         for (_, (h, _, _)) in self.frame_textures.drain() {
             self.renderer.destroy_texture(h);
         }
+        for (_, (h, _, _)) in self.image_textures.drain() {
+            self.renderer.destroy_texture(h);
+        }
         self.composite_layers.clear();
     }
 
@@ -282,10 +326,22 @@ impl PreviewWindowState {
                 if layer.width == 0 || layer.height == 0 || layer.alpha <= 0.0 {
                     continue;
                 }
-                let dst = aspect_fit_rect(
-                    (screen.width as f32, screen.height as f32),
-                    (layer.width as f32, layer.height as f32),
-                );
+                // docs/plan_image_overlay.md §P3: PiP rect handling.
+                // Video clips (`pip_rect = None`) letterbox; image
+                // overlays (`pip_rect = Some(x,y,w,h)` in normalized
+                // 0-1) map to a sub-rect of the preview surface.
+                let dst = match layer.pip_rect {
+                    None => aspect_fit_rect(
+                        (screen.width as f32, screen.height as f32),
+                        (layer.width as f32, layer.height as f32),
+                    ),
+                    Some((nx, ny, nw, nh)) => (
+                        nx * screen.width as f32,
+                        ny * screen.height as f32,
+                        nw * screen.width as f32,
+                        nh * screen.height as f32,
+                    ),
+                };
                 self.scene.push_textured_quad(TexturedQuad {
                     rect: daw_ui_renderer::Rect::new(dst.0, dst.1, dst.2, dst.3),
                     texture: layer.texture,

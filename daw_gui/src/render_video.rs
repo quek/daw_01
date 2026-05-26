@@ -161,6 +161,47 @@ pub fn render_mp4(cfg: &RenderConfig) -> Result<RenderStats, String> {
     let frame_duration_100ns = (10_000_000.0_f64 / f64::from(framerate)).round() as i64;
     let mut composite = vec![0u8; out_w as usize * out_h as usize * 4];
     let mut nv12 = vec![0u8; out_w as usize * out_h as usize * 3 / 2];
+
+    // docs/plan_image_overlay.md §P3: decode each project image once
+    // up-front (= keyed by ImageSourceId), keep RGBA8 bytes in memory
+    // for the duration of the export, hand the cache to
+    // `render_frame_composite`. Skipping per-frame decode is fine —
+    // the typical MV has < 10 images and each is < 4 MB at 1080p.
+    let mut image_cache: std::collections::HashMap<
+        common::model::ImageSourceId,
+        (u32, u32, Vec<u8>),
+    > = std::collections::HashMap::new();
+    for (image_source_id, source) in &cfg.song.image_sources {
+        let abs = match &source.path {
+            common::model::ImageSourcePath::Absolute(p) => p.clone(),
+            common::model::ImageSourcePath::ProjectRelative(rel) => match cfg.project_dir {
+                Some(d) => d.join(rel),
+                None => {
+                    tracing::warn!(
+                        image_source_id,
+                        rel = ?rel,
+                        "image is project-relative but project_dir is None; skipping"
+                    );
+                    continue;
+                }
+            },
+        };
+        match image::open(&abs) {
+            Ok(dynamic) => {
+                let rgba = dynamic.into_rgba8();
+                let (w, h) = rgba.dimensions();
+                image_cache
+                    .insert(*image_source_id, (w, h, rgba.into_raw()));
+            }
+            Err(e) => tracing::warn!(
+                image_source_id,
+                path = %abs.display(),
+                error = %e,
+                "image decode failed; skipping layer"
+            ),
+        }
+    }
+
     for frame_index in 0..total_frames {
         let frame_seconds = frame_index as f64 / f64::from(framerate);
         let playhead_beat = seconds_to_beat(frame_seconds, cfg.song.bpm);
@@ -168,6 +209,7 @@ pub fn render_mp4(cfg: &RenderConfig) -> Result<RenderStats, String> {
             cfg.song,
             cfg.project_dir,
             &mut engine,
+            &image_cache,
             playhead_beat,
             out_w,
             out_h,
@@ -379,10 +421,15 @@ fn set_pixel_aspect_ratio(
 /// nearest-neighbor scaled to the output canvas — fast but visually
 /// chunky for big resolution mismatches. P9+ can replace with a wgpu
 /// pass that uses the existing preview composite shader.
+#[allow(clippy::too_many_arguments)]
 fn render_frame_composite(
     song: &Song,
     project_dir: Option<&Path>,
     engine: &mut VideoPlaybackEngine,
+    image_cache: &std::collections::HashMap<
+        common::model::ImageSourceId,
+        (u32, u32, Vec<u8>),
+    >,
     playhead_beat: f64,
     out_w: u32,
     out_h: u32,
@@ -395,11 +442,8 @@ fn render_frame_composite(
         px[2] = 0;
         px[3] = 255;
     }
-    let layers = VideoPlaybackEngine::active_sources_at(song, playhead_beat);
-    if layers.is_empty() {
-        return;
-    }
-    for layer in layers {
+    let video_layers = VideoPlaybackEngine::active_sources_at(song, playhead_beat);
+    for layer in video_layers {
         let Some(path) =
             resolve_video_source_path(song, layer.video_source_id, project_dir)
         else {
@@ -438,6 +482,39 @@ fn render_frame_composite(
             *width as usize,
             *height as usize,
             dst_rect,
+            layer.alpha,
+        );
+    }
+
+    // docs/plan_image_overlay.md §P3: image overlay layers drawn on
+    // top of any video layers (= MV ロゴ / ジャケット の上乗せ ユースケース).
+    // `active_image_sources_at` returns frames bottom-up by `z_index`;
+    // each frame's normalized PiP rect is converted to canvas pixels
+    // before blit.
+    let image_layers =
+        crate::image_compose::active_image_sources_at(song, playhead_beat);
+    for layer in image_layers {
+        let Some((src_w, src_h, src_rgba)) = image_cache.get(&layer.image_source_id)
+        else {
+            continue; // not decoded (= missing file / decode error)
+        };
+        // Normalized [0, 1] PiP → canvas pixels. Clamp to canvas
+        // bounds defensively; `blit_layer` itself also clips.
+        let rx = (layer.x * out_w as f32).round() as i32;
+        let ry = (layer.y * out_h as f32).round() as i32;
+        let rw = (layer.w * out_w as f32).round().max(0.0) as u32;
+        let rh = (layer.h * out_h as f32).round().max(0.0) as u32;
+        if rw == 0 || rh == 0 {
+            continue;
+        }
+        blit_layer(
+            dst,
+            out_w as usize,
+            out_h as usize,
+            src_rgba,
+            *src_w as usize,
+            *src_h as usize,
+            (rx, ry, rw, rh),
             layer.alpha,
         );
     }
