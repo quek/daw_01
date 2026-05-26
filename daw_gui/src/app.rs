@@ -1701,6 +1701,8 @@ impl AppData {
                 | AppEvent::DeleteAudioEvent { .. }
                 | AppEvent::ImportAudio { .. }
                 | AppEvent::ImportVideo { .. }
+                | AppEvent::ImportImage { .. }
+                | AppEvent::AddTextClip
                 | AppEvent::AddNote { .. }
                 | AppEvent::ResizeNote { .. }
                 | AppEvent::ResizeNotes(_)
@@ -1724,6 +1726,8 @@ impl AppData {
                 | AppEvent::AddAutomationFromLastTouched
                 | AppEvent::AddImageAutomationLane { .. }
                 | AppEvent::RemoveImageAutomationLane { .. }
+                | AppEvent::AddTextAutomationLane { .. }
+                | AppEvent::RemoveTextAutomationLane { .. }
                 | AppEvent::CreateAutomationClip { .. }
                 | AppEvent::DeleteLane { .. }
                 | AppEvent::AddAutomationPoint { .. }
@@ -2306,6 +2310,19 @@ pub enum AppEvent {
     /// が無ければ no-op。 undoable。
     RemoveImageAutomationLane { field: common::model::ImageBuiltinParam },
 
+    /// docs/plan_text_overlay.md §4 P8: Inspector の text section「A」
+    /// ボタンから発火。 選択中 text clip の track に `TextBuiltin(field)`
+    /// lane を追加 (既存あれば visible / enabled 復活)。 default_value は
+    /// `lane_default_for_target` 経由で first TextEvent の現値 (event が
+    /// 無ければ TextEvent::default 相当の常識値)。 undoable。
+    AddTextAutomationLane { field: common::model::TextBuiltinParam },
+
+    /// Inspector の automate toggle が ON 状態で再押し → 該当
+    /// `TextBuiltin(field)` lane を track から削除 (= override 解除、
+    /// TextEvent.field が effective に戻る)。 lane が無ければ no-op。
+    /// undoable。
+    RemoveTextAutomationLane { field: common::model::TextBuiltinParam },
+
     /// preview window で PiP rect の drag 操作を始めた瞬間に発火する
     /// marker event (`docs/plan_image_overlay.md` §4 P5)。 handler 本体
     /// は no-op、 is_undoable に含まれるので handle_event 冒頭の
@@ -2727,6 +2744,14 @@ pub enum AppEvent {
     /// v13: open the platform file dialog filtered to supported image
     /// extensions and dispatch the selection as `AppEvent::ImportImage`.
     OpenImportImageDialog,
+
+    /// docs/plan_text_overlay.md §4 P7: File menu → "Add Text Clip"。
+    /// Creates a new unify track at the top of the arrangement and
+    /// drops a `ClipContent::Text` clip with a single `TextEvent` at
+    /// the default title position (= center band of project resolution,
+    /// 64 px white font, 8 beats long). The user edits text content /
+    /// styles via the inspector (P5) and PiP rect via preview drag (P6).
+    AddTextClip,
 
     /// File menu → "Import Video..." entry. Opens an `rfd` file
     /// picker (mp4 / mov / mkv / webm filter) and forwards to
@@ -3317,6 +3342,12 @@ impl AppData {
             AppEvent::RemoveImageAutomationLane { field } => {
                 self.remove_image_automation_lane(field);
             }
+            AppEvent::AddTextAutomationLane { field } => {
+                self.add_text_automation_lane(field);
+            }
+            AppEvent::RemoveTextAutomationLane { field } => {
+                self.remove_text_automation_lane(field);
+            }
             AppEvent::BeginImagePiPDrag => {
                 // snapshot は is_undoable 経由で既に取られている (=
                 // handle_event 冒頭の push_undo_snapshot)。 ここでは
@@ -3775,6 +3806,9 @@ impl AppData {
             }
             AppEvent::OpenImportImageDialog => {
                 self.action_open_import_image_dialog();
+            }
+            AppEvent::AddTextClip => {
+                self.action_add_text_clip();
             }
             AppEvent::TogglePreviewWindow => {
                 self.preview_window_visible = !self.preview_window_visible;
@@ -6735,6 +6769,115 @@ impl AppData {
         }
         self.status_message = format!(
             "Image Automation lane '{}' を削除しました",
+            automation_target_display_name(&target)
+        );
+        self.sync_song_to_plugin_host();
+    }
+
+    /// docs/plan_text_overlay.md §4 P8: 選択中 text clip の track に
+    /// `TextBuiltin(field)` lane を追加。 既存 lane があれば visible /
+    /// enabled を再有効化のみ。 default_value は `lane_default_for_target`
+    /// 経由で TextEvent の現値 (= image lane と同 idiom、 23 field 分の
+    /// match は `lane_default_for_target` 内に集約済)。
+    fn add_text_automation_lane(
+        &mut self,
+        field: common::model::TextBuiltinParam,
+    ) {
+        use common::model::{AutomationLane, AutomationTarget};
+        let Some(target_clip) = self.selected_clip else {
+            self.status_message =
+                "Text Automation: text clip を選択してください".into();
+            return;
+        };
+        let track_id_opt = self
+            .song
+            .tracks
+            .get(target_clip.track as usize)
+            .map(|t| t.id);
+        let Some(track_id) = track_id_opt else {
+            return;
+        };
+        let target = AutomationTarget::TextBuiltin(field);
+
+        // 既存 lane があれば visible / enabled だけを true に。
+        if let Some(track) = self.song.track_by_id_mut(track_id)
+            && let Some(lane) = track
+                .automation_lanes
+                .iter_mut()
+                .find(|l| l.target == target)
+        {
+            lane.visible = true;
+            lane.enabled = true;
+            self.expanded_automation_tracks.insert(track_id);
+            self.status_message = format!(
+                "Text Automation lane '{}' は既に存在します",
+                automation_target_display_name(&target)
+            );
+            self.sync_song_to_plugin_host();
+            return;
+        }
+
+        // 23 field 分の現値解決は `lane_default_for_target` が TextBuiltin
+        // を扱う (TextEvent 無し時の常識値も同関数内)。 caller は track_id
+        // + target を流すだけ。
+        let touched = TouchedParam {
+            track_id,
+            target: target.clone(),
+            display_name: automation_target_display_name(&target).to_string(),
+            touched_at: std::time::Instant::now(),
+        };
+        let default_value = self.lane_default_for_target(&touched);
+
+        let Some(track) = self.song.track_by_id_mut(track_id) else {
+            return;
+        };
+        let lane_id = track.alloc_lane_id();
+        track.automation_lanes.push(AutomationLane {
+            id: lane_id,
+            target: target.clone(),
+            default_value,
+            enabled: true,
+            visible: true,
+            height_px: 60,
+            clips: Vec::new(),
+            next_clip_id: 1,
+        });
+        self.expanded_automation_tracks.insert(track_id);
+        self.status_message = format!(
+            "Added text automation lane: {}",
+            automation_target_display_name(&target)
+        );
+        self.sync_song_to_plugin_host();
+    }
+
+    /// 選択中 text clip の track から `TextBuiltin(field)` lane を削除
+    /// (= override 解除、 TextEvent.field が ふたたび effective)。 lane
+    /// が無ければ no-op + status 表示。
+    fn remove_text_automation_lane(
+        &mut self,
+        field: common::model::TextBuiltinParam,
+    ) {
+        use common::model::AutomationTarget;
+        let Some(target_clip) = self.selected_clip else {
+            return;
+        };
+        let target = AutomationTarget::TextBuiltin(field);
+        let Some(track) = self.song.tracks.get_mut(target_clip.track as usize)
+        else {
+            return;
+        };
+        let before = track.automation_lanes.len();
+        track.automation_lanes.retain(|l| l.target != target);
+        let removed = before - track.automation_lanes.len();
+        if removed == 0 {
+            self.status_message = format!(
+                "Text Automation: {} lane が見つかりません",
+                automation_target_display_name(&target)
+            );
+            return;
+        }
+        self.status_message = format!(
+            "Text Automation lane '{}' を削除しました",
             automation_target_display_name(&target)
         );
         self.sync_song_to_plugin_host();
@@ -12101,6 +12244,50 @@ impl AppData {
                 errors.join(" / ")
             ),
         };
+    }
+
+    /// docs/plan_text_overlay.md §4 P7: File menu → "Add Text Clip"。
+    /// Creates a single new track at the top of the arrangement that
+    /// holds a `ClipContent::Text` clip with one `TextEvent` filled by
+    /// defaults (= "Title" / 64px / 中央横帯 / 8 beats)。 User edits
+    /// content / styles via the inspector and PiP via preview drag.
+    fn action_add_text_clip(&mut self) {
+        let text_clip_length_beats = (self.song.length_beats * 0.5).max(8.0);
+        let next_start_beat = 0.0_f64;
+
+        let content_id = self.song.alloc_content_id();
+        self.song.clip_contents.insert(
+            content_id,
+            common::model::ClipContent::Text(common::model::TextContent {
+                events: vec![common::model::TextEvent {
+                    text: "Title".into(),
+                    event_length_beats: text_clip_length_beats,
+                    ..common::model::TextEvent::default()
+                }],
+            }),
+        );
+
+        // Insert at the top of the arrangement so the title renders
+        // ABOVE existing video / image layers (= MV typical layout).
+        let track_id = self.song.alloc_track_id();
+        let mut text_track = common::model::Track {
+            id: track_id,
+            name: "Text".into(),
+            ..common::model::Track::default()
+        };
+        let clip_id = text_track.alloc_clip_id();
+        text_track.clips.push(common::model::Clip {
+            id: clip_id,
+            name: "Title".into(),
+            start_beat: next_start_beat,
+            length_beats: text_clip_length_beats,
+            content_id,
+            notes: Vec::new(),
+        });
+        self.song.tracks.insert(0, text_track);
+
+        self.is_dirty = true;
+        self.status_message = "Text clip 追加".into();
     }
 
     /// File menu → "Import Image..." 経路。 `rfd` の native file picker
