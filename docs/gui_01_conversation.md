@@ -1308,7 +1308,7 @@ error[E0063]: missing field `rotation_radians` in initializer of `TexturedQuad`
 
 ---
 
-## #048 [Replied] 2026-05-26 [バグ報告] arrangement widget の縦 scroll で track row が ruler / toolbar 領域に描画 leak
+## #048 [Resolved] 2026-05-26 [バグ報告] arrangement widget の縦 scroll で track row が ruler / toolbar 領域に描画 leak
 
 関連仕様: 「lanes 領域外への描画は scissor で切る」 の原則。 縦 scroll (`SetTrackTop` 経由で `ArrangementView.track_top: f32` を変える) を有効化したところ、 track row が ruler / toolbar 領域まで突き抜けて描画される。
 
