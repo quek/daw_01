@@ -145,6 +145,30 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
         self.ui.push_edit(edit);
     }
 
+    /// M14 Phase 77 (daw_01 #048): heavy 内で `Ui::with_clip_rect` を使う delegate。
+    ///
+    /// closure 内の全 `push_*` 呼び出しが `rect` で auto-scissor される (= `merge_clip`
+    /// 経由で既存 `clip_rect` と intersect)。 既存 explicit な `clip_rect: Some(...)`
+    /// は idempotent に narrowing される (= 二重指定で破綻しない)。 `cached` 内で呼ぶと
+    /// 生成された primitive の `clip_rect` に焼き込まれて cache に保存される (= cache
+    /// 再生時にも scissor が効く)。
+    ///
+    /// arrangement / piano_roll 等で「描画 region (ruler / header_pane / lanes) 外への
+    /// leak を構造的に防ぐ」 用途で使う。
+    pub fn with_clip_rect<F>(&mut self, rect: Rect, f: F)
+    where
+        F: FnOnce(&mut Self),
+    {
+        // `Ui::with_clip_rect` は `FnOnce(&mut Ui)` 受けで HeavyCtx を貫通できないため、
+        // current_clip stack を直接 push/pop する形で再実装 (= ui.rs と完全同 idiom)。
+        let prev = self.ui.current_clip;
+        self.ui.current_clip = Some(
+            crate::ui::merge_clip(prev, Some(rect)).unwrap_or(rect),
+        );
+        f(self);
+        self.ui.current_clip = prev;
+    }
+
     // === 既存 widget の delegate (heavy 内でも呼べる) ===
 
     /// `Ui::waveform` の delegate。heavy() の中で複数クリップ波形を一括描画する用途。

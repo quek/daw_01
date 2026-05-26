@@ -5973,62 +5973,79 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 view_copy.track_top,
                 view_copy.track_row_h,
             );
+            // M14 Phase 77 (daw_01 #048): track_top に依存する draw を scope 単位で scissor。
+            // `below_ruler` は ruler 下の領域 (= header_pane ∪ lanes)、 automation lane / reorder
+            // overlay 等 header と lanes をまたぐ draw 用。 ruler / loop_band / playhead は
+            // track_top に依存しない static draw なので scope 外に置いて既存挙動維持。
+            let below_ruler = Rect {
+                x: header_pane_copy.x.min(lanes.x),
+                y: header_pane_copy.y,
+                w: header_pane_copy.w + lanes.w,
+                h: lanes.h,
+            };
             // === cached: viewport_key 一致時 skip ===
             hctx.cached(viewport_key, |hctx| {
                 push_filled_rect(hctx, header_pane, style_copy.header_bg);
-                draw_lanes_bg(
-                    hctx,
-                    lanes,
-                    &tracks_owned,
-                    &tops_owned_for_heavy,
-                    view_copy,
-                    &selected_tracks_for_heavy,
-                    &is_group_set_for_heavy,
-                    &style_copy,
-                );
-                hctx.bar_beat_grid(
-                    ("arr_grid", id_for_inner),
-                    lanes,
-                    mapping,
-                    sample_viewport,
-                    grid_style,
-                );
-                draw_clips(hctx, &tracks_owned, &tops_owned_for_heavy, view_copy, lanes, &style_copy);
-                // M14 Phase 63k (#025): audio_edit が Some の clip に dB handle line + fade envelope を重ねる。
-                // 描画は draw_clips 後 (clip rect の上に重なる)、 selection overlay より前 (selection の
-                // 黄色 fill が上書きしない、 selection 中も dB / fade が見える)。
-                let view_end_for_audio = view_copy.start_beat + view_copy.len_beats;
-                for (i, t) in tracks_owned.iter().enumerate() {
-                    let row_top = tops_owned_for_heavy[i];
-                    if row_top + view_copy.track_row_h < lanes.y || row_top > lanes.y + lanes.h {
-                        continue;
-                    }
-                    for c in &t.clips {
-                        let Some(audio) = c.audio_edit else {
-                            continue;
-                        };
-                        let end = c.start_beat + c.len_beats;
-                        if end < view_copy.start_beat || c.start_beat > view_end_for_audio {
-                            continue;
-                        }
-                        let r = clip_to_rect(row_top, view_copy.track_row_h, c, view_copy, lanes);
-                        if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
-                            continue;
-                        }
-                        if r.w < style_copy.audio_min_clip_w_for_handles_px {
-                            continue;
-                        }
-                        draw_clip_audio_overlay(hctx, r, &audio, c.len_beats, &style_copy);
-                    }
-                }
-                if view_copy.ruler_h > 0.0 {
-                    hctx.time_ruler(
-                        ("arr_ruler", id_for_inner),
-                        ruler,
+                // M14 Phase 77 (daw_01 #048): lanes scope (track row 系の y 依存 draw)。
+                hctx.with_clip_rect(lanes, |hctx| {
+                    draw_lanes_bg(
+                        hctx,
+                        lanes,
+                        &tracks_owned,
+                        &tops_owned_for_heavy,
+                        view_copy,
+                        &selected_tracks_for_heavy,
+                        &is_group_set_for_heavy,
+                        &style_copy,
+                    );
+                    hctx.bar_beat_grid(
+                        ("arr_grid", id_for_inner),
+                        lanes,
                         mapping,
                         sample_viewport,
-                        ruler_style,
+                        grid_style,
                     );
+                    draw_clips(hctx, &tracks_owned, &tops_owned_for_heavy, view_copy, lanes, &style_copy);
+                    // M14 Phase 63k (#025): audio_edit が Some の clip に dB handle line + fade envelope を重ねる。
+                    // 描画は draw_clips 後 (clip rect の上に重なる)、 selection overlay より前 (selection の
+                    // 黄色 fill が上書きしない、 selection 中も dB / fade が見える)。
+                    let view_end_for_audio = view_copy.start_beat + view_copy.len_beats;
+                    for (i, t) in tracks_owned.iter().enumerate() {
+                        let row_top = tops_owned_for_heavy[i];
+                        if row_top + view_copy.track_row_h < lanes.y || row_top > lanes.y + lanes.h {
+                            continue;
+                        }
+                        for c in &t.clips {
+                            let Some(audio) = c.audio_edit else {
+                                continue;
+                            };
+                            let end = c.start_beat + c.len_beats;
+                            if end < view_copy.start_beat || c.start_beat > view_end_for_audio {
+                                continue;
+                            }
+                            let r = clip_to_rect(row_top, view_copy.track_row_h, c, view_copy, lanes);
+                            if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
+                                continue;
+                            }
+                            if r.w < style_copy.audio_min_clip_w_for_handles_px {
+                                continue;
+                            }
+                            draw_clip_audio_overlay(hctx, r, &audio, c.len_beats, &style_copy);
+                        }
+                    }
+                });
+                // M14 Phase 77 (daw_01 #048): ruler scope (static、 track_top に依存しない static
+                // primitive だが defensive で wrap)。
+                if view_copy.ruler_h > 0.0 {
+                    hctx.with_clip_rect(ruler, |hctx| {
+                        hctx.time_ruler(
+                            ("arr_ruler", id_for_inner),
+                            ruler,
+                            mapping,
+                            sample_viewport,
+                            ruler_style,
+                        );
+                    });
                 }
 
                 // M14 Phase 63n-1 (#028): automation lane 行群の描画 (track 行の下、 expand されたもののみ)。
@@ -6037,60 +6054,69 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 // `tops[i] + track_row_h` から `tops[i+1]` (= 次 track 上端) の間。
                 // 描画は cached 内: viewport_key に lane 関連 hash が入る前提 (fold_arrangement_clip_hash
                 // を後ほど lane も含むように拡張する)。 現状は clip hash で大方の変化を検出可能。
-                for (i, t) in tracks_owned.iter().enumerate() {
-                    if t.automation_lanes_collapsed || t.automation_lanes.is_empty() {
-                        continue;
-                    }
-                    let track_row_top = tops_owned_for_heavy[i];
-                    // viewport culling: track 領域全体 (track + lanes) が viewport 外なら skip
-                    let track_total_bottom = tops_owned_for_heavy[i + 1];
-                    if track_total_bottom < lanes.y || track_row_top > lanes.y + lanes.h {
-                        continue;
-                    }
-                    let mut lane_y = track_row_top + effective_track_row_h(t, view_copy.track_row_h);
-                    // M14 Phase 63n-1 (#028) follow-up: lane 行 header は親 track と同じ indent に揃える
-                    // (= 親 track の depth * indent_px)。 group 配下の track の lane が「どの track の
-                    // lane か」 を視覚的に追えるようにするため (#028 user 指摘 1)。
-                    let header_indent = f32::from(t.depth) * style_copy.indent_px;
-                    for lane in &t.automation_lanes {
-                        if !lane.visible {
+                //
+                // M14 Phase 77 (daw_01 #048): below_ruler scope (header_pane + lanes を跨ぐ draw 用)。
+                // automation lane の背景 fill (line 4004-4013) は header_rect.x から body_rect 終端まで
+                // span するので、 単独 lanes / header_pane scope では片側が切られる。
+                hctx.with_clip_rect(below_ruler, |hctx| {
+                    for (i, t) in tracks_owned.iter().enumerate() {
+                        if t.automation_lanes_collapsed || t.automation_lanes.is_empty() {
                             continue;
                         }
-                        let lh = f32::from(lane.height_px);
-                        // lane 行 viewport culling
-                        if lane_y + lh < lanes.y || lane_y > lanes.y + lanes.h {
+                        let track_row_top = tops_owned_for_heavy[i];
+                        // viewport culling: track 領域全体 (track + lanes) が viewport 外なら skip
+                        let track_total_bottom = tops_owned_for_heavy[i + 1];
+                        if track_total_bottom < lanes.y || track_row_top > lanes.y + lanes.h {
+                            continue;
+                        }
+                        let mut lane_y = track_row_top + effective_track_row_h(t, view_copy.track_row_h);
+                        // M14 Phase 63n-1 (#028) follow-up: lane 行 header は親 track と同じ indent に揃える
+                        // (= 親 track の depth * indent_px)。 group 配下の track の lane が「どの track の
+                        // lane か」 を視覚的に追えるようにするため (#028 user 指摘 1)。
+                        let header_indent = f32::from(t.depth) * style_copy.indent_px;
+                        for lane in &t.automation_lanes {
+                            if !lane.visible {
+                                continue;
+                            }
+                            let lh = f32::from(lane.height_px);
+                            // lane 行 viewport culling
+                            if lane_y + lh < lanes.y || lane_y > lanes.y + lanes.h {
+                                lane_y += lh;
+                                continue;
+                            }
+                            let header_rect = Rect {
+                                x: header_pane_copy.x + header_indent,
+                                y: lane_y,
+                                w: (header_pane_copy.w - header_indent).max(2.0),
+                                h: lh,
+                            };
+                            let body_rect = Rect {
+                                x: lanes.x,
+                                y: lane_y,
+                                w: lanes.w,
+                                h: lh,
+                            };
+                            draw_automation_lane(
+                                hctx,
+                                t.id,
+                                lane,
+                                header_rect,
+                                body_rect,
+                                view_copy,
+                                &style_copy,
+                                lanes,
+                                &selected_automation_clips_set_for_heavy,
+                            );
                             lane_y += lh;
-                            continue;
                         }
-                        let header_rect = Rect {
-                            x: header_pane_copy.x + header_indent,
-                            y: lane_y,
-                            w: (header_pane_copy.w - header_indent).max(2.0),
-                            h: lh,
-                        };
-                        let body_rect = Rect {
-                            x: lanes.x,
-                            y: lane_y,
-                            w: lanes.w,
-                            h: lh,
-                        };
-                        draw_automation_lane(
-                            hctx,
-                            t.id,
-                            lane,
-                            header_rect,
-                            body_rect,
-                            view_copy,
-                            &style_copy,
-                            lanes,
-                            &selected_automation_clips_set_for_heavy,
-                        );
-                        lane_y += lh;
                     }
-                }
+                });
             });
 
             // === cached 外: selection / drag preview / playhead / loop band ===
+            // M14 Phase 77 (daw_01 #048): track_top に依存する overlay 群を below_ruler scope で
+            // wrap。 loop_band / playhead は static (ruler / spans ruler+lanes) なので scope 外。
+            hctx.with_clip_rect(below_ruler, |hctx| {
             draw_selection_overlay(
                 hctx,
                 &tracks_owned,
@@ -6546,7 +6572,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     clip_rect: Some(lanes),
                 });
             }
+            }); // end with_clip_rect(below_ruler)  for selection / drag / lasso overlays
             // loop band: drag preview がある場合は preview を描く、無ければ view.loop_range
+            // M14 Phase 77: loop_band は ruler 領域、 track_top 不変なので scope 外で defensive wrap。
             if let Some(range) = loop_preview_clone.or(view_copy.loop_range) {
                 draw_loop_band(
                     hctx,
@@ -6577,31 +6605,35 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
 
             // === M10 Phase 46: track reorder drop indicator + dragging row preview ===
+            // M14 Phase 77 (daw_01 #048): reorder overlay は header_pane + lanes を跨ぐ (横 1 行帯)
+            // ので below_ruler scope で wrap (= ruler / toolbar への leak 防止)。
             if let Some((tr, target_idx)) = reorder_overlay {
-                #[allow(clippy::cast_precision_loss)]
-                let indicator_y = header_pane_copy.y - view_copy.track_top
-                    + target_idx as f32 * view_copy.track_row_h;
-                push_filled_rect(
-                    hctx,
-                    Rect {
-                        x: header_pane_copy.x,
-                        y: indicator_y - style_copy.reorder_drop_indicator_h * 0.5,
-                        w: header_pane_copy.w + lanes.w,
-                        h: style_copy.reorder_drop_indicator_h,
-                    },
-                    style_copy.reorder_drop_indicator,
-                );
-                // dragging row 半透明複製 (header_pane 領域、last_mouse_y 中心)。
-                let row_h = view_copy.track_row_h;
-                let drag_y = (tr.last_mouse_y - row_h * 0.5)
-                    .clamp(header_pane_copy.y, header_pane_copy.y + header_pane_copy.h - row_h);
-                let alpha = style_copy.reorder_drag_alpha.clamp(0.0, 1.0);
-                let base_rgb = style_copy.track_selected_bg;
-                push_filled_rect(
-                    hctx,
-                    Rect { x: header_pane_copy.x, y: drag_y, w: header_pane_copy.w, h: row_h },
-                    Color::rgba(base_rgb.r, base_rgb.g, base_rgb.b, alpha),
-                );
+                hctx.with_clip_rect(below_ruler, |hctx| {
+                    #[allow(clippy::cast_precision_loss)]
+                    let indicator_y = header_pane_copy.y - view_copy.track_top
+                        + target_idx as f32 * view_copy.track_row_h;
+                    push_filled_rect(
+                        hctx,
+                        Rect {
+                            x: header_pane_copy.x,
+                            y: indicator_y - style_copy.reorder_drop_indicator_h * 0.5,
+                            w: header_pane_copy.w + lanes.w,
+                            h: style_copy.reorder_drop_indicator_h,
+                        },
+                        style_copy.reorder_drop_indicator,
+                    );
+                    // dragging row 半透明複製 (header_pane 領域、last_mouse_y 中心)。
+                    let row_h = view_copy.track_row_h;
+                    let drag_y = (tr.last_mouse_y - row_h * 0.5)
+                        .clamp(header_pane_copy.y, header_pane_copy.y + header_pane_copy.h - row_h);
+                    let alpha = style_copy.reorder_drag_alpha.clamp(0.0, 1.0);
+                    let base_rgb = style_copy.track_selected_bg;
+                    push_filled_rect(
+                        hctx,
+                        Rect { x: header_pane_copy.x, y: drag_y, w: header_pane_copy.w, h: row_h },
+                        Color::rgba(base_rgb.r, base_rgb.g, base_rgb.b, alpha),
+                    );
+                });
             }
         });
 
@@ -7495,6 +7527,15 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // 修飾 (Shift / Ctrl) で Single / RangeFromAnchor / Toggle を decode し SelectTrack に乗せる。
         // 1 frame 内で最初に click された track id を `clicked_track` に蓄え、 loop 後に modifier-aware
         // SelectTrack を 1 度発行する (loop 内で複数発行しないため)。
+        //
+        // M14 Phase 77 (daw_01 #048): header row 描画 push_* 群を `header_pane` で auto-scissor
+        // する。 closure 化すると `self.xxx` の大量 rename を要するため、 `with_clip_rect` と
+        // 同等の `current_clip` push/pop を open-code で実施 (`Ui::with_clip_rect` 実装と同 idiom、
+        // `pub(crate)` 経由)。
+        let prev_clip_for_headers = self.current_clip;
+        self.current_clip = Some(
+            crate::ui::merge_clip(prev_clip_for_headers, Some(header_pane)).unwrap_or(header_pane),
+        );
         let visible_idx_for_headers = compute_visible_indices(&tracks_for_draw);
         // M14 Phase 63n-1 (#028): track headers loop 用 prefix sum tops (immediate mode、 cached 外)。
         // `tracks_for_draw` は既に visible-only な Vec を Arc 化したものなので、 そのまま slice 経由で
@@ -7728,6 +7769,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 }
             }
         }
+        // M14 Phase 77 (daw_01 #048): header_pane scope を復元 (= track header push_* 群が終了)。
+        self.current_clip = prev_clip_for_headers;
 
         // M14 Phase 63c (#016): disclosure click → ToggleGroupCollapsed (priority 高、 SelectTrack は
         // この frame では skip = group の collapsed toggle 動作のみで selection は変えない、
@@ -10698,6 +10741,209 @@ mod tests {
         assert!(
             (y_at_50 - 50.0).abs() < 1.0,
             "bend=0 で x=50 の y = 50 (linear): got {y_at_50}"
+        );
+    }
+
+    // ============================================================
+    // M14 Phase 77 (daw_01 #048): 縦 scroll 時の scissor 動作 unit test
+    // ============================================================
+
+    /// Phase 77 wrap が適用されると、 cached 内の lanes scope に積まれた push_filled_rect は
+    /// `clip_rect = Some(lanes)` を持つ (旧設計では `clip_rect = None` で ruler / toolbar に
+    /// leak していた)。 lanes 背景 fill の primitive を hex で識別して clip_rect の Some を確認。
+    #[test]
+    fn lanes_bg_primitive_has_clip_rect_after_phase_77() {
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::{Primitive, Scene};
+
+        use crate::input::FrameInput;
+        use crate::ui::UiHost;
+
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        let model = Model {
+            tracks: vec![track(10, "t0", vec![])],
+            view: ArrangementView {
+                header_w: 100.0,
+                ruler_h: 30.0,
+                track_row_h: 60.0,
+                track_top: 0.0,
+                ..ArrangementView::default()
+            },
+        };
+
+        let arr_rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        let style = ArrangementStyle::default();
+        let _edits =
+            host.frame_to_edits(&model, &mut scene, screen, FrameInput::default(), |m, ui| {
+                let _ = ui.arrangement(
+                    "arr", arr_rect, &m.tracks, m.view, &[], &[], &[], &[], &style, None,
+                    |_| Edit::mutate(|_: &mut Model| {}),
+                );
+            });
+
+        // lanes background fill は draw_lanes_bg 冒頭の `push_filled_rect(hctx, lanes, style.bg)`
+        // で、 lanes scope (= `with_clip_rect(lanes)`) 内なので clip_rect = Some(lanes ∩ None) =
+        // Some(lanes) になる。 rect = lanes (x=100, y=30, w=700, h=370)、 clip_rect = Some(lanes)
+        // で一致する primitive を探す。
+        let expected_lanes = Rect { x: 100.0, y: 30.0, w: 700.0, h: 370.0 };
+        let found = scene.primitives.iter().any(|p| {
+            if let Primitive::Rect(c) = p {
+                let r = c.rect;
+                let close = (r.x - expected_lanes.x).abs() < 1e-3
+                    && (r.y - expected_lanes.y).abs() < 1e-3
+                    && (r.w - expected_lanes.w).abs() < 1e-3
+                    && (r.h - expected_lanes.h).abs() < 1e-3;
+                close && c.clip_rect.is_some()
+            } else {
+                false
+            }
+        });
+        assert!(
+            found,
+            "Phase 77: lanes background push_filled_rect must produce a Rect primitive with clip_rect = Some(...) (旧設計では None で ruler / toolbar に leak)"
+        );
+    }
+
+    /// `track_top` が大きい (= 縦 scroll で第 1 track row が lanes.y より上に計算される) とき、
+    /// row 背景 primitive は scissor によって ruler / toolbar 領域に leak しない。 lanes scope の
+    /// `with_clip_rect(lanes)` で全 row 背景の `clip_rect.y >= lanes.y` が保証される。
+    #[test]
+    fn track_row_clipped_to_lanes_when_track_top_positive() {
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::{Primitive, Scene};
+
+        use crate::input::FrameInput;
+        use crate::ui::UiHost;
+
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        // selection track にして track row 背景の push_filled_rect が走るようにする
+        // (selection / group / video 以外の通常 audio row では行背景の push_filled_rect は呼ばれない、
+        // draw_lanes_bg 2471 の `if selected ... else if group ... else if Video` 分岐参照)。
+        let model = Model {
+            tracks: vec![track(10, "t0", vec![])],
+            view: ArrangementView {
+                header_w: 100.0,
+                ruler_h: 30.0,
+                track_row_h: 60.0,
+                track_top: 500.0, // 大 scroll: 第 1 track が y = 30 - 500 = -470 から描画される想定
+                ..ArrangementView::default()
+            },
+        };
+
+        let arr_rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        let style = ArrangementStyle::default();
+        let _edits =
+            host.frame_to_edits(&model, &mut scene, screen, FrameInput::default(), |m, ui| {
+                let _ = ui.arrangement(
+                    "arr",
+                    arr_rect,
+                    &m.tracks,
+                    m.view,
+                    &[], // selected_clips
+                    &[10_u32], // selected_tracks → row 背景 push が走る
+                    &[],
+                    &[],
+                    &style,
+                    None,
+                    |_| Edit::mutate(|_: &mut Model| {}),
+                );
+            });
+
+        // lanes scope (= with_clip_rect(lanes)) 由来の primitive は clip_rect が lanes 完全一致
+        // (= x=100, y=30, w=700, h=370) になる (`merge_clip(Some(lanes), None) = Some(lanes)`)。
+        // この鋳型に一致する primitive が 1 件以上あれば lanes scope が effective に走った証明。
+        // 旧設計 (Phase 77 前) では `draw_lanes_bg` 内の push_filled_rect が clip_rect = None で
+        // 出力されていた (= scope なし)。
+        let expected_lanes_clip = Rect { x: 100.0, y: 30.0, w: 700.0, h: 370.0 };
+        let found_lanes_scope = scene.primitives.iter().any(|p| {
+            if let Primitive::Rect(c) = p
+                && let Some(clip) = c.clip_rect
+            {
+                (clip.x - expected_lanes_clip.x).abs() < 1e-3
+                    && (clip.y - expected_lanes_clip.y).abs() < 1e-3
+                    && (clip.w - expected_lanes_clip.w).abs() < 1e-3
+                    && (clip.h - expected_lanes_clip.h).abs() < 1e-3
+            } else {
+                false
+            }
+        });
+        assert!(
+            found_lanes_scope,
+            "Phase 77: track_top=500 で lanes scope (clip_rect = lanes 完全一致) の RectCommand が 1 件以上必要 (= ruler / toolbar への leak 防止のための scissor が走っている確認)"
+        );
+    }
+
+    /// `track_top` が **負値** でも scissor が効く (= ruler の上に track row が出ない)。
+    /// 負 scroll は通常 caller が clamp しないと発生するが、 widget は受け取った値で計算するだけで
+    /// scissor で safety を担保する設計 (= caller boilerplate を排除、 #048 reply の方針)。
+    #[test]
+    fn track_row_clipped_when_track_top_negative() {
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::{Primitive, Scene};
+
+        use crate::input::FrameInput;
+        use crate::ui::UiHost;
+
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        let model = Model {
+            tracks: vec![track(10, "t0", vec![])],
+            view: ArrangementView {
+                header_w: 100.0,
+                ruler_h: 30.0,
+                track_row_h: 60.0,
+                track_top: -300.0, // 負 scroll: 第 1 track が y = 30 + 300 = 330 から描画
+                ..ArrangementView::default()
+            },
+        };
+
+        let arr_rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        let style = ArrangementStyle::default();
+        let _edits =
+            host.frame_to_edits(&model, &mut scene, screen, FrameInput::default(), |m, ui| {
+                let _ = ui.arrangement(
+                    "arr", arr_rect, &m.tracks, m.view, &[], &[], &[], &[], &style, None,
+                    |_| Edit::mutate(|_: &mut Model| {}),
+                );
+            });
+
+        // 負 track_top でも lanes scope が clip_rect = Some(lanes) を全 push に適用する
+        // (= with_clip_rect 自体が track_top 値に依存しない)。 lanes 背景 fill primitive が
+        // 存在することで scope が走った証明。
+        let expected_lanes = Rect { x: 100.0, y: 30.0, w: 700.0, h: 370.0 };
+        let found = scene.primitives.iter().any(|p| {
+            if let Primitive::Rect(c) = p {
+                let r = c.rect;
+                let close = (r.x - expected_lanes.x).abs() < 1e-3
+                    && (r.y - expected_lanes.y).abs() < 1e-3;
+                close && c.clip_rect.is_some()
+            } else {
+                false
+            }
+        });
+        assert!(
+            found,
+            "Phase 77: 負 track_top でも lanes 背景 fill が scissor 付きで生成される"
         );
     }
 }
