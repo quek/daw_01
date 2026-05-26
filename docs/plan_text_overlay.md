@@ -1,6 +1,19 @@
 # Text Overlay / Title Generator 計画 — 動画 / 画像の上にテキストを重ねる
 
-ステータス: **grilling 完了、 設計確定** (2026-05-26)、 着手前。
+ステータス: **P1-P8 + P5.B (full inspector) 着地** (2026-05-26)。 gui_01 #049
+(Phase 78) の commit + runtime smoke test (preview / mp4 export での text
+描画目視確認) が残作業。
+
+| Phase | Commit | 内容 |
+|---|---|---|
+| P1 | `f19f849` | data model (ClipContent::Text / TextEvent / TextBuiltinParam 23) + CURRENT_VERSION 16 |
+| P2 | `33536b2` | render_video.rs を OffscreenRenderer 経由に移行 |
+| P3 | `0b5a2e6` | text_compose.rs + preview / render_video で text 描画 |
+| P4 | `f98ade0` | arrangement view で text clip 表示 (本文 32 文字 preview label) |
+| P5 | `b8044c5` | inspector MVP (Mute / Text / Font / FontSize / Opacity + automate) |
+| P5.B | `183f085` | inspector full (TextNumField dispatch で 25 numeric field + Align / Fade Curve dropdown) |
+| P6 | `2be7333` | preview drag handle が text 対応 (rect + rotation) |
+| P7 + P8 | `1dec923` | Add Text Clip menu + TextBuiltin 23 lane add/remove |
 
 関連:
 - [plan_image_overlay.md](plan_image_overlay.md) — PiP 画像 overlay の data model / composite pipeline

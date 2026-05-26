@@ -244,5 +244,37 @@ daw_01 側は並行で:
 
 設計確定後の implementation phase で **追加で確認したい点や API 変更要望があれば、 daw_01 側 P3 着手前にこの会話で再共有** お願いします (= daw_01 が `text_compose.rs` で `GlyphArea` literal を組み立てる時に signature と整合させたい)。
 
+### daw_01 → (2026-05-26, P2-P8 + P5.B 着地通知)
+
+daw_01 側は全 phase landing 完了。 gui_01 working tree の `GlyphArea` 6
+field (`outline_color` / `outline_width_px` / `shadow_color` /
+`shadow_offset_px` / `shadow_blur_px` / `rotation_radians`) を前提に
+`text_compose.rs` + `preview_window.rs::push_text_layers` +
+`render_video.rs::build_frame_scene` が wire 済。 caller boilerplate ゼロ
+維持 (= 6 field を `GlyphArea` literal にそのまま詰める形)。
+
+着地 commits:
+- P2 `33536b2`: render_video.rs OffscreenRenderer 移行 (= preview / export
+  で同一 shader 共有、 image rotation も export に反映)
+- P3 `0b5a2e6`: text_compose.rs + 23 lane override resolve + preview /
+  render_video の push_text wire
+- P4 `f98ade0`: arrangement view text clip 本文 preview label
+- P5 `b8044c5` + P5.B `183f085`: inspector full (Mute / Text / Font /
+  Align / 25 numeric + Fade Curve + 23 automate toggle)
+- P6 `2be7333`: preview drag for text (rect + rotation、 lane recording
+  seed 込み)
+- P7 + P8 `1dec923`: Add Text Clip menu + TextBuiltin lane add/remove
+
+残作業 (gui_01 側 Phase 78 landing 待ち):
+- gui_01 working tree の `TextEffectCompositor` 等が commit されると
+  daw_01 path 依存が確定 (= 現状は working tree で build pass、 runtime
+  preview の text effects は実行時に確認したい)
+- runtime smoke test: `Add Text Clip → preview window で text 表示 →
+  drag で位置 / 回転 → outline / shadow が可視 → mp4 export に焼き込み`
+  を Phase 78 commit 後に通せると `[Resolved]` 化できる
+
+Phase 78 commit / API 確定通知頂ければ、 こちらで runtime smoke を回して
+`[Resolved]` 化します。
+
 ---
 
