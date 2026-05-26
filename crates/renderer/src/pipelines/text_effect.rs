@@ -195,9 +195,6 @@ pub struct TextEffectCompositor {
 
     sampler: wgpu::Sampler,
 
-    blur_uniform_buffer: wgpu::Buffer,
-    composite_uniform_buffer: wgpu::Buffer,
-
     frame_counter: u64,
 }
 
@@ -223,18 +220,9 @@ impl TextEffectCompositor {
             ..Default::default()
         });
 
-        let blur_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("text_effect blur uniform"),
-            size: std::mem::size_of::<BlurUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let composite_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("text_effect composite uniform"),
-            size: std::mem::size_of::<CompositeUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // M14 Phase 78 BUG FIX: uniform buffer は per-call で作る (compositor instance 内で共有
+        // すると同 encoder 内 LAST WRITE WINS で全 draw が最後の uniform 値を読む)。 ここでは
+        // 構造的に保持せず、 実 buffer は run_blur_pass / run_composite_pass 内で device.create_buffer。
 
         // === blur BindGroupLayout (src texture + sampler + uniform) ===
         let blur_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -413,8 +401,6 @@ impl TextEffectCompositor {
             blur_bgl,
             composite_bgl,
             sampler,
-            blur_uniform_buffer,
-            composite_uniform_buffer,
             frame_counter: 0,
         }
     }
@@ -776,8 +762,15 @@ impl TextEffectCompositor {
             weights: [weights[0], weights[1], weights[2], 0.0],
             offsets: [0.0, offsets[1], offsets[2], 0.0],
         };
+        // M14 Phase 78 BUG FIX: per-call uniform buffer (= composite と同 issue)
+        let per_call_blur_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("text_effect blur uniform (per-call)"),
+            size: std::mem::size_of::<BlurUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         queue.write_buffer(
-            &self.blur_uniform_buffer,
+            &per_call_blur_uniform_buffer,
             0,
             bytemuck::bytes_of(&uniform),
         );
@@ -804,7 +797,7 @@ impl TextEffectCompositor {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.blur_uniform_buffer.as_entire_binding(),
+                    resource: per_call_blur_uniform_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -877,8 +870,20 @@ impl TextEffectCompositor {
                 area.shadow_color.a,
             ],
         };
+        // M14 Phase 78 BUG FIX: composite_uniform_buffer を共有すると、 同 encoder 内で複数の
+        // effect-ful GlyphArea を render する際 `queue.write_buffer` の LAST WRITE WINS で
+        // 全 draw が最後の uniform 値を読む (= 全 GlyphArea の effect が最後の area の値で
+        // 描画される shadow bug)。 1 render_effect 呼出ごとに per-call の uniform buffer を新規
+        // 作成して、 encoder が submit されるまで生存させる (= wgpu::Buffer は Arc 内包なので
+        // 関数 return 時に drop されても encoder 参照が保つ)。
+        let per_call_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("text_effect composite uniform (per-call)"),
+            size: std::mem::size_of::<CompositeUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         queue.write_buffer(
-            &self.composite_uniform_buffer,
+            &per_call_uniform_buffer,
             0,
             bytemuck::bytes_of(&uniform),
         );
@@ -907,7 +912,7 @@ impl TextEffectCompositor {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: self.composite_uniform_buffer.as_entire_binding(),
+                    resource: per_call_uniform_buffer.as_entire_binding(),
                 },
             ],
         });

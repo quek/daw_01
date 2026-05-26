@@ -219,9 +219,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     //  (d) shadow offset(0,0) blur=8 (= soft blur shadow)
     //  (e) rotation π/6 + outline + soft shadow (= 全 effect combine)
     let effect_x = 20.0_f32;
-    let mut effect_y = 350.0_f32;
-    let effect_font = 24.0_f32;
-    let effect_line_h = 30.0_f32;
+    let mut effect_y = 330.0_f32;
+    let effect_font = 36.0_f32;
+    let effect_line_h = 44.0_f32;
     let label = |y, text: &str| GlyphArea {
         text: text.into(),
         left: effect_x,
@@ -244,67 +244,67 @@ fn main() -> Result<(), Box<dyn Error>> {
         clip_rect: None,
         ..GlyphArea::default()
     });
-    effect_y += 36.0;
-    // (b) outline 2px (= 黒い縁取り)
-    scene.push_text(label(effect_y, "(b) outline 2px:"));
+    effect_y += effect_line_h + 4.0;
+    // (b) outline 4px (= 赤縁取り、 デバッグ視認のため black → red)
+    scene.push_text(label(effect_y, "(b) outline 4px (red):"));
     scene.push_text(GlyphArea {
         text: "Hello".into(),
-        left: effect_x + 100.0,
-        top: effect_y - 5.0,
+        left: effect_x + 180.0,
+        top: effect_y - 8.0,
         font_size: effect_font,
         line_height: effect_line_h,
         color: Color::WHITE,
         clip_rect: None,
         outline_color: Color::BLACK,
-        outline_width_px: 2.0,
+        outline_width_px: 4.0,
         ..GlyphArea::default()
     });
-    effect_y += 36.0;
-    // (c) hard shadow (offset=(4,4) blur=0)
-    scene.push_text(label(effect_y, "(c) hard shadow:"));
+    effect_y += effect_line_h + 4.0;
+    // (c) hard shadow offset=(8,8) blur=0 (= 視認確認のため大き目 offset)
+    scene.push_text(label(effect_y, "(c) hard shadow (8,8):"));
     scene.push_text(GlyphArea {
         text: "Hello".into(),
-        left: effect_x + 100.0,
-        top: effect_y - 5.0,
+        left: effect_x + 180.0,
+        top: effect_y - 8.0,
         font_size: effect_font,
         line_height: effect_line_h,
         color: Color::WHITE,
         clip_rect: None,
-        shadow_color: Color::rgba(0.0, 0.0, 0.0, 0.5),
-        shadow_offset_px: (4.0, 4.0),
+        shadow_color: Color::rgba(0.0, 0.0, 0.0, 0.8),
+        shadow_offset_px: (8.0, 8.0),
         ..GlyphArea::default()
     });
-    effect_y += 36.0;
-    // (d) soft (blurred) shadow (= separable gaussian 5-tap @ blur=8)
+    effect_y += effect_line_h + 4.0;
+    // (d) soft (blurred) shadow (= separable gaussian @ blur=8)
     scene.push_text(label(effect_y, "(d) soft shadow blur=8:"));
     scene.push_text(GlyphArea {
         text: "Hello".into(),
-        left: effect_x + 130.0,
-        top: effect_y - 5.0,
+        left: effect_x + 180.0,
+        top: effect_y - 8.0,
         font_size: effect_font,
         line_height: effect_line_h,
         color: Color::WHITE,
         clip_rect: None,
-        shadow_color: Color::rgba(0.0, 0.0, 0.0, 0.7),
+        shadow_color: Color::rgba(0.0, 0.0, 0.0, 0.9),
         shadow_offset_px: (0.0, 0.0),
         shadow_blur_px: 8.0,
         ..GlyphArea::default()
     });
-    effect_y += 36.0;
+    effect_y += effect_line_h + 8.0;
     // (e) combine: rotation + outline + soft shadow
     scene.push_text(label(effect_y, "(e) rot π/6 + outline + shadow:"));
     scene.push_text(GlyphArea {
         text: "Hello".into(),
-        left: effect_x + 160.0,
-        top: effect_y - 5.0,
+        left: effect_x + 180.0,
+        top: effect_y - 8.0,
         font_size: effect_font,
         line_height: effect_line_h,
         color: Color::WHITE,
         clip_rect: None,
         outline_color: Color::BLACK,
-        outline_width_px: 2.0,
-        shadow_color: Color::rgba(0.0, 0.0, 0.0, 0.5),
-        shadow_offset_px: (3.0, 3.0),
+        outline_width_px: 3.0,
+        shadow_color: Color::rgba(0.0, 0.0, 0.0, 0.6),
+        shadow_offset_px: (4.0, 4.0),
         shadow_blur_px: 4.0,
         rotation_radians: std::f32::consts::FRAC_PI_6,
     });
