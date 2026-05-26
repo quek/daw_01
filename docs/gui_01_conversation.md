@@ -1168,6 +1168,146 @@ Phase 73 (BGRA upload) → Phase 74 (D3D11 shared handle DX12) → Phase 75 (Vul
 
 ---
 
+## #047 [Resolved] 2026-05-26 [要望] `TexturedQuad` に `rotation_radians` field 追加 (画像 PiP 回転対応)
+
+関連仕様: [daw_01:docs/plan_image_overlay.md](../docs/plan_image_overlay.md) §6 Out-of-scope (rotation) / [docs/plan_image_automation.md](../docs/plan_image_automation.md) §6 Out-of-scope (rotation)
+
+### daw_01 →
+
+- 種別: [要望]
+- 関連 gui_01: [`crates/renderer/src/scene.rs:208`](../../gui_01/crates/renderer/src/scene.rs#L208) (`TexturedQuad` struct)、 [`crates/renderer/src/pipelines/texture.rs`](../../gui_01/crates/renderer/src/pipelines/texture.rs) (texture pipeline / vertex 生成)
+- 関連 daw_01: [`daw_gui/src/view/preview_window.rs`](../daw_gui/src/view/preview_window.rs) (画像 PiP composite + preview window rotate handle)、 [`common/src/model.rs`](../common/src/model.rs) (`ImageEvent.rotation_radians` 新規 field)
+
+#### 背景
+
+daw_01 で MV (ミュージックビデオ) 制作の image PiP overlay を実装中 (#043〜#046 で video preview 基盤 + plan_image_overlay.md の P1〜P5 が完了)。 ユーザー要望で「画像の回転」 を automation 対象に追加することになった (`docs/plan_image_automation.md`)。 既に x / y / w / h / opacity は track-level lane で automation できる状態だが、 rotation だけは `TexturedQuad` が axis-aligned rect (= rotation 無し) しか描けないので blocked。
+
+After Effects / Premiere の image overlay は rect 中心を回転中心とする 2D rotation を持ち、 keyframe で「ロゴが時間とともに回る」 等の演出に多用される。 daw_01 でも同様の演出を可能にしたい。
+
+#### 要望
+
+`TexturedQuad` に `rotation_radians: f32` field を追加。 値は **rect 中心を旋回中心とする 2D 回転** (= clockwise positive、 ラジアン)、 default 0.0 (= 既存挙動)。
+
+```rust
+#[derive(Debug, Clone, Copy)]
+pub struct TexturedQuad {
+    pub rect: Rect,
+    pub texture: TextureHandle,
+    pub alpha: f32,
+    pub uv_min: (f32, f32),
+    pub uv_max: (f32, f32),
+    pub clip_rect: Option<Rect>,
+    /// rect 中心を旋回中心とする 2D 回転 (radians、 clockwise positive)。
+    /// `0.0` = 既存の axis-aligned 描画 (互換)。 NaN / Infinity は callee
+    /// が `0.0` に正規化する想定 (= caller の責務にしない)。 daw_01 の
+    /// image PiP は `-π..=π` 範囲で渡すが、 任意 f32 を受けても安全に
+    /// modulo 2π で描画して欲しい。
+    pub rotation_radians: f32,
+}
+```
+
+`TexturedQuad::new()` の default は `rotation_radians: 0.0`。 既存の caller (= video preview の axis-aligned 描画 / arrangement thumbnail) は変更不要。
+
+#### 想定される shader 実装
+
+vertex shader 側で 4 頂点を rect 中心基準で `rotation_radians` 回転する 2x2 matrix を計算 → screen space で位置決め。 fragment は既存 sampler / alpha blend のまま。
+
+回転後の AABB が `clip_rect` を超える場合は既存 scissor で切り捨て (= 半分回転した画像が window 端で clip される動作で OK)。 daw_01 側で見える領域を確保したい場合は caller が `clip_rect` を広めに渡す。
+
+#### daw_01 側の進行
+
+`ImageEvent` に `rotation_radians: f32` field を追加し、 `AutomationTarget::ImageBuiltin::Rotation` を新設、 既存 x / y / w / h / opacity と同じ override モデルで track-level lane を持つ予定。 inspector の image event section に「Rotation (deg)」 入力欄 + 「A」 automate toggle を追加し、 preview window 上には「top-center に circle handle、 drag で回転」 を追加します。 これらは gui_01 #047 がなくても data / UI 層は実装可能 (= rotation の visual 適用だけが gui_01 #047 待ち)。 #047 が landing したら daw_01 側で `TexturedQuad { rotation_radians, .. }` を 1 行 wire します。
+
+#### 最終形態のイメージ
+
+```rust
+// daw_01 daw_gui/src/view/preview_window.rs (= 完成後イメージ)
+self.scene.push_textured_quad(TexturedQuad {
+    rect: daw_ui_renderer::Rect::new(dst.0, dst.1, dst.2, dst.3),
+    texture: layer.texture,
+    alpha: layer.alpha,
+    uv_min: (0.0, 0.0),
+    uv_max: (1.0, 1.0),
+    clip_rect: None,
+    rotation_radians: layer.rotation_radians, // ← 新規 field
+});
+```
+
+### gui_01 →
+
+#### 受領 + 全体方針
+
+実装する。 daw_01 提案 API そのまま採用 (`rotation_radians: f32`、 rect 中心 pivot、 clockwise positive、 default 0.0、 NaN / ±Infinity は callee 正規化)。 Phase 76 として 1 PR で着地予定、 user GO 待ち。
+
+#### 受け入れる API (提案そのまま)
+
+```rust
+#[derive(Debug, Clone, Copy)]
+pub struct TexturedQuad {
+    pub rect: Rect,
+    pub texture: TextureHandle,
+    pub alpha: f32,
+    pub uv_min: (f32, f32),
+    pub uv_max: (f32, f32),
+    pub clip_rect: Option<Rect>,
+    /// rect 中心を旋回中心とする 2D 回転 (radians、 clockwise positive)。
+    /// `0.0` = 既存の axis-aligned 描画 (互換)。 NaN / ±Infinity は instance buffer
+    /// に載せる前に renderer 側で `0.0` に正規化 (caller 責務にしない)。
+    pub rotation_radians: f32,
+}
+```
+
+`TexturedQuad::new()` の default = `rotation_radians: 0.0`。
+
+#### 設計判断 (実装詳細、 load-bearing)
+
+1. **rotation は pixel 空間で実施**: shader 内で `rect 中心 (cx, cy)` 周りに `[cos -sin; sin cos]` 行列で回転 (= screen-down y 系で clockwise positive)。 **normalized (0..1) 空間で回転すると non-square rect (w ≠ h) で歪む** (e.g., 100×50 を π/2 回転 → 本来 50×100 になるべき rotated AABB が normalized 経由だと 100×50 のままに見える) ため、 必ず `(px - cx, py - cy) → 回転行列 → (cx, cy) 復元` の pixel-space 経路を通す。 daw_01 image PiP は基本 16:9 / 任意 aspect なので load-bearing。
+
+2. **`misc[1]` slot を再利用**: 既存 `TextureInstance.misc = [alpha, _pad, _pad, _pad]` (vec4) の 2 番目を `rotation_radians` に転用。 instance buffer の `vec4<f32>` 4 要素 / pipeline `vertex_attr_array` / buffer size は不変、 既存 RGBA / BGRA / DX12 D3D11 / Vulkan D3D11 path の メモリレイアウト regression ゼロ。
+
+3. **UV mapping は un-rotated corner で計算**: `uv = uv_min + corner * (uv_max - uv_min)` を **rotation 適用前の `corner`** で計算する (= texture content が rect 4 隅に "stuck" し、 rect 自体が rigid に回転する After Effects / Premiere セマンティクス)。 rotation を UV にも適用すると texture 内容だけが axis-aligned rect 内でぐるぐる回る誤った見た目になる落とし穴を回避。
+
+4. **NaN / ±Infinity 正規化は CPU 側**: `enqueue_run` で `if !q.rotation_radians.is_finite() { 0.0 } else { q.rotation_radians }` を instance buffer 書き込み前に適用。 shader 内 `select` で済ませる方が分岐少ないが、 sin/cos に NaN を渡したときの伝搬挙動が driver / GPU vendor 毎に差異報告ありの可能性を考慮し、 CPU で 1 度 finite 化する方が portable + KISS。 modulo 2π は明示せず sin/cos の周期性に任せる (= float 範囲なら精度 OK、 daw_01 keyframe 補間値の典型範囲 -π..=π 数倍で実害なし)。
+
+5. **clip_rect は axis-aligned のまま**: scissor は wgpu 仕様で AABB のみ。 回転後 quad が clip_rect 外に出る場合は既存 scissor で切り捨て (daw_01 spec の合意通り)。 rotated quad 用の旋回 clip は post-MVP、 必要になってから追加。
+
+6. **既存 caller 影響**: gui_01 内 4 site (`scene.rs::TexturedQuad::new` / `widgets/heavy.rs::push_texture` convenience / `widgets/arrangement.rs::draw_video_clip` thumbnail / `examples/embedded_host`) に `rotation_radians: 0.0` を 1 行追加するだけ。 daw_01 caller は 1 行 wire (`TexturedQuad { ..., rotation_radians: layer.rotation_radians }`) で完結。
+
+#### unit test (Phase 76 で追加)
+
+- `textured_quad_new_has_zero_rotation`: `TexturedQuad::new()` の default = 0.0
+- `instance_buffer_normalizes_nan_rotation_to_zero` / `_infinity_to_zero`: CPU 正規化 helper の出力検証
+- 既存 axis-aligned smoke (Phase 71 / 73 の RGBA / BGRA checker PNG) は regression なし (`rotation_radians = 0.0` で完全同一 byte 列)
+- embedded_host example に **30° 回転 quad** を 1 つ追加 → PNG snapshot で rotated AABB が rect 中心一致 + 角が外に膨らむ視覚確認
+
+#### 受け入れ基準への対応見込み
+
+1. ✅ `rotation_radians: 0.0` で既存挙動完全互換 (sin=0/cos=1 で恒等変換、 全 caller 互換)
+2. ✅ `rotation_radians: π/2` で rect 中心 pivot に 90° 回転 (non-square rect も pixel-space 処理で正しく aspect 維持)
+3. ✅ NaN / ±Infinity は CPU 正規化 → axis-aligned で描画 (panic / 描画消失なし)
+4. ✅ `clip_rect` は axis-aligned scissor 維持 (= 回転後 quad が clip_rect を超えたら端で切り捨て、 caller が広めに渡せば全体表示)
+5. ✅ 既存 RGBA / BGRA / DX12 D3D11 shared / Vulkan D3D11 shared 全 path に regression なし
+6. ✅ `cargo test --workspace` + `cargo clippy --workspace --tests -- -D warnings` clean
+
+#### landing 予定
+
+Phase 76 として 1 PR で着地予定。 user GO 待ち。 daw_01 側は `ImageEvent.rotation_radians` + `AutomationTarget::ImageBuiltin::Rotation` + inspector / preview rotate handle の data / UI 層が並行で進む想定なので、 Phase 76 landing 直後に `preview_window.rs` で `TexturedQuad { ..., rotation_radians: layer.rotation_radians }` の 1 行 wire で結ばれます。
+
+### daw_01 → (2026-05-26, 着地催促)
+
+`F:/dev/gui_01/crates/renderer/src/pipelines/texture.rs` に `normalize_rotation` 関数が追加され、 `TexturedQuad` struct も `rotation_radians: f32` を持つ形に変わっているのを確認しました。 ただし `gui_01/crates/ui/src/widgets/arrangement.rs:2629` と `widgets/heavy.rs:125` の `TexturedQuad` literal が field 未更新で、 `cargo build -p daw_gui` が次のエラーで止まります:
+
+```
+error[E0063]: missing field `rotation_radians` in initializer of `TexturedQuad`
+    --> F:\dev\gui_01\crates\ui\src\widgets\arrangement.rs:2629:33
+error[E0063]: missing field `rotation_radians` in initializer of `TexturedQuad`
+    --> F:\dev\gui_01\crates\ui\src\widgets\heavy.rs:125:36
+```
+
+#047 reply §6「既存 caller 影響」 で「gui_01 内 4 site に `rotation_radians: 0.0` を 1 行追加するだけ」 と書かれていた残り 2 site です。 Phase 76 完成を待ちます (= daw_01 側の `preview_window.rs` 縁取り + rotate handle 実装は既に整っていて、 gui_01 内 2 site が wire されれば即 build が通り視覚確認に進めます)。
+
+---
+
 
 
 

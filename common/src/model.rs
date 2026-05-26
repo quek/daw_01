@@ -56,7 +56,7 @@ use crate::scale::ScaleChange;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 13;
+pub const CURRENT_VERSION: u32 = 15;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -1726,6 +1726,14 @@ pub struct ImageEvent {
     /// **JSON disambiguation required field** — see struct doc.
     pub opacity: f32,
 
+    /// v15 (`docs/plan_image_automation.md` rotation): rect 中心を旋回
+    /// 中心とする 2D 回転 (radians、 clockwise positive)。 `0.0` =
+    /// 軸並行 (互換)、 `±π` = 180°、 範囲は実用上 `-π..=π` で wrap。
+    /// gui_01 #047 で `TexturedQuad.rotation_radians` が landing 次第
+    /// preview / render passes に wire される。 lane override も同単位。
+    #[serde(default)]
+    pub rotation_radians: f32,
+
     pub muted: bool,
     pub fade_in_beats: f64,
     pub fade_out_beats: f64,
@@ -1747,6 +1755,7 @@ impl Default for ImageEvent {
             w: 1.0,
             h: 1.0,
             opacity: 1.0,
+            rotation_radians: 0.0,
             muted: false,
             fade_in_beats: 0.0,
             fade_out_beats: 0.0,
@@ -1813,6 +1822,13 @@ pub enum AutomationTarget {
     /// a designated "master" track. M5 scope.
     SongTempo,
     SongTimeSigNumerator,
+    /// v14: image track 上の PiP 数値 (x / y / w / h / opacity)。 lane
+    /// の時間軸は track-global beats、 値域 0.0..=1.0。 image clip が
+    /// 存在する時間範囲だけ lane 値が画像 PiP rect / opacity に適用さ
+    /// れる (= `ImageEvent.field` を override)。 同 track の全 image
+    /// clip が同一 lane で駆動される (`docs/plan_image_automation.md`
+    /// §1.1 / §1.2)。
+    ImageBuiltin(ImageBuiltinParam),
 }
 
 /// Built-in track parameter selector for `AutomationTarget::TrackBuiltin`.
@@ -1825,6 +1841,28 @@ pub enum TrackBuiltinParam {
     /// (`docs/plan_routing_graph.md`). `send_idx` is the position
     /// inside the track's `sends` array.
     SendGain { send_idx: u8 },
+}
+
+/// v14: image track の PiP 数値 field selector (`docs/plan_image_automation
+/// .md` §2.1)。 `AutomationTarget::ImageBuiltin` の payload。 v15 で
+/// `Rotation` を追加 (= 2D 回転、 radians 単位)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
+pub enum ImageBuiltinParam {
+    /// PiP rect 左上 X (normalized 0..=1)。
+    X,
+    /// PiP rect 左上 Y (normalized 0..=1)。
+    Y,
+    /// PiP rect width (normalized 0..=1)。
+    W,
+    /// PiP rect height (normalized 0..=1)。
+    H,
+    /// 透明度 (0..=1)。 fade envelope と multiply、 さらに ImageEvent.
+    /// opacity と multiply される (lane 経路 = override、 fade は重畳)。
+    Opacity,
+    /// v15: 2D 回転 (radians、 rect 中心が旋回中心、 clockwise positive)。
+    /// 実用範囲 `-π..=π`、 範囲外は描画時に modulo 2π で正規化。 normalize
+    /// 0..=1 は `(plain + π) / (2π)` mapping (Pan -1..=1 と同 idiom)。
+    Rotation,
 }
 
 /// Per-segment interpolation between two adjacent automation points.
@@ -2260,7 +2298,7 @@ mod tests {
         // migrate via `#[serde(default)]`. Pinning the constant
         // catches accidental rollback. See
         // `docs/plan_image_overlay.md`.
-        assert_eq!(CURRENT_VERSION, 13);
+        assert_eq!(CURRENT_VERSION, 15);
     }
 
     #[test]

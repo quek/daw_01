@@ -10,7 +10,7 @@ use daw_ui_core::{
 use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent, PickerTarget};
-use common::model::{FadeCurve, StretchMode};
+use common::model::{FadeCurve, ImageBuiltinParam, StretchMode};
 
 const BG: Color = Color { r: 0.16, g: 0.16, b: 0.20, a: 1.0 };
 const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
@@ -35,6 +35,21 @@ const TOGGLE_AUDIO_BASE: ToggleButtonStyle = ToggleButtonStyle {
     border_width: 1.0,
     radius: 4.0,
     font_size: 12.0,
+    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+};
+
+// Image PiP の automate toggle 用 style (= lane を作る / 削除する 1 個
+// 1 個のボタン)。 ON 状態は arrangement lane 行のヘッダ色 (薄い藤色) と
+// 揃えて「この field は lane 駆動中」 を視覚化。
+const TOGGLE_IMAGE_AUTOMATE: ToggleButtonStyle = ToggleButtonStyle {
+    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
+    on_color: Color { r: 0.78, g: 0.55, b: 0.85, a: 1.0 },
+    hint_band: None,
+    hint_band_h: 2.0,
+    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    border_width: 1.0,
+    radius: 4.0,
+    font_size: 11.0,
     text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
 };
 
@@ -382,6 +397,430 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let fade_out_idx = fade_curve_to_index(summary.fade_out_curve);
         if let Some(picked) = ui.dropdown(
             "inspector_audio_fade_out_curve",
+            Rect { x: fade_curve_x, y, w: fade_curve_w, h: input_h },
+            FADE_CURVE_LABELS,
+            fade_out_idx,
+        ) {
+            let target = summary.target;
+            let new_curve = fade_curve_from_index(picked);
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetClipFadeOutCurve {
+                    target,
+                    curve: new_curve,
+                })
+            }));
+        }
+        y += input_h + 12.0;
+    }
+
+    // ---- Image Event section (`docs/plan_image_overlay.md` §4 P4) ------
+    // selected_clip が `ClipContent::Image` のとき、 first event の
+    // 数値入力 (x/y/w/h/opacity) と fade / mute toggle を表示。 編集
+    // AppEvent は全 ImageEvent に broadcast。
+    if let Some(summary) = app.inspector_image_event_summary() {
+        // edit buffer の target が現選択と違ければ resync を発火 (audio
+        // section と同 idiom)。 image clip 切替後に 1 frame だけ古い
+        // buffer が表示されるが、 直後の frame で formatted な現値に
+        // 書き戻る。
+        if app.clip_edit_buffer_target != Some(summary.target) {
+            let target = summary.target;
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ResyncClipEditBuffers(target));
+            }));
+        }
+
+        ui.label_at(
+            "inspector_image_event_label",
+            "Image Event",
+            area.x + pad,
+            y,
+            12.0,
+            TEXT_DIM,
+        );
+        y += 18.0;
+
+        let row_w = area.w - pad * 2.0;
+        let input_h = 22.0;
+        let label_w = 50.0;
+        // Image PiP 行は automate ボタンを追加 (= label + input + 「A」 btn)。
+        // 「A」 btn は click で同 track に lane を追加 (`docs/plan_image_
+        // automation.md` §4.1)。 既に lane があれば visible 復活のみ。
+        let auto_btn_w = 22.0;
+        let auto_btn_gap = 4.0;
+        let input_x = area.x + pad + label_w;
+        let input_w = row_w - label_w - auto_btn_w - auto_btn_gap;
+        let auto_btn_x = input_x + input_w + auto_btn_gap;
+
+        // Mute toggle (image 用 1 個だけ。 audio の Reverse は無い)。
+        let toggle_h = 24.0;
+        let target_mute = summary.target;
+        let new_mute = !summary.muted;
+        ui.toggle_button_at(
+            "inspector_image_mute",
+            "Mute",
+            Rect { x: area.x + pad, y, w: row_w, h: toggle_h },
+            summary.muted,
+            &TOGGLE_AUDIO_BASE,
+            move |_| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetClipMuted {
+                        target: target_mute,
+                        muted: new_mute,
+                    })
+                })
+            },
+        );
+        y += toggle_h + 8.0;
+
+        // X
+        ui.label_at(
+            "inspector_image_x_label",
+            "X",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT_DIM,
+        );
+        let x_resp = ui.text_input_at(
+            "inspector_image_x_input",
+            Rect { x: input_x, y, w: input_w, h: input_h },
+            &app.clip_image_x_edit_text,
+            |s| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ClipImageXEditChanged(s))
+                })
+            },
+        );
+        if x_resp.committed {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CommitClipImageXEdit)
+            }));
+        }
+        let x_auto_on = summary.x_automated;
+        ui.toggle_button_at(
+            "inspector_image_x_automate",
+            "A",
+            Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
+            x_auto_on,
+            &TOGGLE_IMAGE_AUTOMATE,
+            move |_| {
+                Edit::mutate(move |app: &mut AppData| {
+                    let ev = if x_auto_on {
+                        AppEvent::RemoveImageAutomationLane { field: ImageBuiltinParam::X }
+                    } else {
+                        AppEvent::AddImageAutomationLane { field: ImageBuiltinParam::X }
+                    };
+                    app.handle_event(ev);
+                })
+            },
+        );
+        y += input_h + 4.0;
+
+        // Y
+        ui.label_at(
+            "inspector_image_y_label",
+            "Y",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT_DIM,
+        );
+        let y_resp = ui.text_input_at(
+            "inspector_image_y_input",
+            Rect { x: input_x, y, w: input_w, h: input_h },
+            &app.clip_image_y_edit_text,
+            |s| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ClipImageYEditChanged(s))
+                })
+            },
+        );
+        if y_resp.committed {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CommitClipImageYEdit)
+            }));
+        }
+        let y_auto_on = summary.y_automated;
+        ui.toggle_button_at(
+            "inspector_image_y_automate",
+            "A",
+            Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
+            y_auto_on,
+            &TOGGLE_IMAGE_AUTOMATE,
+            move |_| {
+                Edit::mutate(move |app: &mut AppData| {
+                    let ev = if y_auto_on {
+                        AppEvent::RemoveImageAutomationLane { field: ImageBuiltinParam::Y }
+                    } else {
+                        AppEvent::AddImageAutomationLane { field: ImageBuiltinParam::Y }
+                    };
+                    app.handle_event(ev);
+                })
+            },
+        );
+        y += input_h + 4.0;
+
+        // W
+        ui.label_at(
+            "inspector_image_w_label",
+            "W",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT_DIM,
+        );
+        let w_resp = ui.text_input_at(
+            "inspector_image_w_input",
+            Rect { x: input_x, y, w: input_w, h: input_h },
+            &app.clip_image_w_edit_text,
+            |s| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ClipImageWEditChanged(s))
+                })
+            },
+        );
+        if w_resp.committed {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CommitClipImageWEdit)
+            }));
+        }
+        let w_auto_on = summary.w_automated;
+        ui.toggle_button_at(
+            "inspector_image_w_automate",
+            "A",
+            Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
+            w_auto_on,
+            &TOGGLE_IMAGE_AUTOMATE,
+            move |_| {
+                Edit::mutate(move |app: &mut AppData| {
+                    let ev = if w_auto_on {
+                        AppEvent::RemoveImageAutomationLane { field: ImageBuiltinParam::W }
+                    } else {
+                        AppEvent::AddImageAutomationLane { field: ImageBuiltinParam::W }
+                    };
+                    app.handle_event(ev);
+                })
+            },
+        );
+        y += input_h + 4.0;
+
+        // H
+        ui.label_at(
+            "inspector_image_h_label",
+            "H",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT_DIM,
+        );
+        let h_resp = ui.text_input_at(
+            "inspector_image_h_input",
+            Rect { x: input_x, y, w: input_w, h: input_h },
+            &app.clip_image_h_edit_text,
+            |s| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ClipImageHEditChanged(s))
+                })
+            },
+        );
+        if h_resp.committed {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CommitClipImageHEdit)
+            }));
+        }
+        let h_auto_on = summary.h_automated;
+        ui.toggle_button_at(
+            "inspector_image_h_automate",
+            "A",
+            Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
+            h_auto_on,
+            &TOGGLE_IMAGE_AUTOMATE,
+            move |_| {
+                Edit::mutate(move |app: &mut AppData| {
+                    let ev = if h_auto_on {
+                        AppEvent::RemoveImageAutomationLane { field: ImageBuiltinParam::H }
+                    } else {
+                        AppEvent::AddImageAutomationLane { field: ImageBuiltinParam::H }
+                    };
+                    app.handle_event(ev);
+                })
+            },
+        );
+        y += input_h + 4.0;
+
+        // Opacity
+        ui.label_at(
+            "inspector_image_opacity_label",
+            "Opacity",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT_DIM,
+        );
+        let opacity_resp = ui.text_input_at(
+            "inspector_image_opacity_input",
+            Rect { x: input_x, y, w: input_w, h: input_h },
+            &app.clip_image_opacity_edit_text,
+            |s| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ClipImageOpacityEditChanged(s))
+                })
+            },
+        );
+        if opacity_resp.committed {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CommitClipImageOpacityEdit)
+            }));
+        }
+        let opacity_auto_on = summary.opacity_automated;
+        ui.toggle_button_at(
+            "inspector_image_opacity_automate",
+            "A",
+            Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
+            opacity_auto_on,
+            &TOGGLE_IMAGE_AUTOMATE,
+            move |_| {
+                Edit::mutate(move |app: &mut AppData| {
+                    let ev = if opacity_auto_on {
+                        AppEvent::RemoveImageAutomationLane {
+                            field: ImageBuiltinParam::Opacity,
+                        }
+                    } else {
+                        AppEvent::AddImageAutomationLane {
+                            field: ImageBuiltinParam::Opacity,
+                        }
+                    };
+                    app.handle_event(ev);
+                })
+            },
+        );
+        y += input_h + 4.0;
+
+        // Rotation (degree 表示、 内部 radians) — `docs/plan_image
+        // _automation.md` rotation。
+        ui.label_at(
+            "inspector_image_rotation_label",
+            "Rot (°)",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT_DIM,
+        );
+        let rotation_resp = ui.text_input_at(
+            "inspector_image_rotation_input",
+            Rect { x: input_x, y, w: input_w, h: input_h },
+            &app.clip_image_rotation_edit_text,
+            |s| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ClipImageRotationEditChanged(s))
+                })
+            },
+        );
+        if rotation_resp.committed {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CommitClipImageRotationEdit)
+            }));
+        }
+        let rotation_auto_on = summary.rotation_automated;
+        ui.toggle_button_at(
+            "inspector_image_rotation_automate",
+            "A",
+            Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
+            rotation_auto_on,
+            &TOGGLE_IMAGE_AUTOMATE,
+            move |_| {
+                Edit::mutate(move |app: &mut AppData| {
+                    let ev = if rotation_auto_on {
+                        AppEvent::RemoveImageAutomationLane {
+                            field: ImageBuiltinParam::Rotation,
+                        }
+                    } else {
+                        AppEvent::AddImageAutomationLane {
+                            field: ImageBuiltinParam::Rotation,
+                        }
+                    };
+                    app.handle_event(ev);
+                })
+            },
+        );
+        y += input_h + 8.0;
+
+        // Fade In / Out (length + curve)。 audio section と同じ idiom
+        // で 1 行に length + curve dropdown を並べる。
+        let fade_curve_w = 80.0;
+        let fade_len_w = (row_w - label_w - fade_curve_w - 4.0).max(40.0);
+        let fade_len_x = area.x + pad + label_w;
+        let fade_curve_x = fade_len_x + fade_len_w + 4.0;
+
+        // Fade In
+        ui.label_at(
+            "inspector_image_fade_in_label",
+            "Fade In",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT_DIM,
+        );
+        let fade_in_resp = ui.text_input_at(
+            "inspector_image_fade_in_input",
+            Rect { x: fade_len_x, y, w: fade_len_w, h: input_h },
+            &app.clip_fade_in_edit_text,
+            |s| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ClipFadeInEditChanged(s))
+                })
+            },
+        );
+        if fade_in_resp.committed {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CommitClipFadeInEdit)
+            }));
+        }
+        let fade_in_idx = fade_curve_to_index(summary.fade_in_curve);
+        if let Some(picked) = ui.dropdown(
+            "inspector_image_fade_in_curve",
+            Rect { x: fade_curve_x, y, w: fade_curve_w, h: input_h },
+            FADE_CURVE_LABELS,
+            fade_in_idx,
+        ) {
+            let target = summary.target;
+            let new_curve = fade_curve_from_index(picked);
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetClipFadeInCurve {
+                    target,
+                    curve: new_curve,
+                })
+            }));
+        }
+        y += input_h + 4.0;
+
+        // Fade Out
+        ui.label_at(
+            "inspector_image_fade_out_label",
+            "Fade Out",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT_DIM,
+        );
+        let fade_out_resp = ui.text_input_at(
+            "inspector_image_fade_out_input",
+            Rect { x: fade_len_x, y, w: fade_len_w, h: input_h },
+            &app.clip_fade_out_edit_text,
+            |s| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ClipFadeOutEditChanged(s))
+                })
+            },
+        );
+        if fade_out_resp.committed {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CommitClipFadeOutEdit)
+            }));
+        }
+        let fade_out_idx = fade_curve_to_index(summary.fade_out_curve);
+        if let Some(picked) = ui.dropdown(
+            "inspector_image_fade_out_curve",
             Rect { x: fade_curve_x, y, w: fade_curve_w, h: input_h },
             FADE_CURVE_LABELS,
             fade_out_idx,

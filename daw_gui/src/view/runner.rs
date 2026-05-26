@@ -117,6 +117,50 @@ struct RunnerState {
     /// (worker side) or upload (main thread, this side).
     #[cfg(windows)]
     preview_upload_log_remaining: u32,
+    /// `docs/plan_image_overlay.md` §4 P5: preview window 上の cursor
+    /// 位置 (logical px、 window 左上原点)。 `WindowEvent::CursorMoved`
+    /// で更新、 drag 中に delta 計算で使う。 cursor が window 外なら
+    /// `None`。 session-only (Undo 不要)。
+    preview_cursor: Option<(f32, f32)>,
+    /// PiP rect の drag 操作中ステート (session-only)。 `Some` は
+    /// mouse button down 後 → release までの間だけ。 release で `None`
+    /// に戻す。 drag 中の cursor delta を `start_rect` に積み上げて
+    /// AppEvent::SetClipImage{X/Y/W/H} を毎フレーム発火する。
+    preview_drag: Option<PreviewDragState>,
+}
+
+/// preview window 上で PiP rect を drag 中の状態 (`docs/plan_image_
+/// overlay.md` §4 P5)。 cursor delta を normalized 0..=1 に変換して
+/// event の x/y/w/h に積む。
+#[derive(Debug, Clone, Copy)]
+struct PreviewDragState {
+    mode: PreviewDragMode,
+    /// drag 開始時の cursor 位置 (preview window 内 logical px)。
+    start_cursor: (f32, f32),
+    /// drag 開始時の event rect (normalized 0..=1)。 cursor delta を
+    /// この値に加減して新 rect を作る (= 累積誤差なし)。
+    start_rect: (f32, f32, f32, f32),
+    /// drag 開始時の rotation_radians (radians)。 Rotate mode で
+    /// cursor 角度との差分を取って新 rotation を計算する。
+    start_rotation_radians: f32,
+    /// drag 開始時の「rect 中心から cursor への角度」 (radians)。
+    /// Rotate mode で `current_angle - start_cursor_angle + start
+    /// _rotation` で新 rotation を出す。
+    start_cursor_angle: f32,
+    /// 操作中の image clip。 drag 中に selected_clip が切り替えられても
+    /// 当初の clip を編集対象として保持。
+    target: crate::app::ClipRef,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewDragMode {
+    /// rect 全体を平行移動。
+    Move,
+    /// corner handle を引っ張ってサイズ変更。 corner: 0=NW / 1=NE /
+    /// 2=SW / 3=SE。
+    Resize { corner: u8 },
+    /// 上辺中点から 24 px 外側の rotate handle を引っ張って回転。
+    Rotate,
 }
 
 /// docs/plan_video_perf.md P4: metadata for one slot in a cached ring
@@ -150,6 +194,174 @@ struct CachedRingSlot {
 #[cfg(windows)]
 fn nearest_ring_slot(slots: &[CachedRingSlot], target: u64) -> Option<CachedRingSlot> {
     slots.iter().min_by_key(|s| s.target_micros.abs_diff(target)).copied()
+}
+
+/// `docs/plan_image_overlay.md` §4 P5: 5 個の handle (NW/NE/SW/SE +
+/// 中央) と PiP rect 内部に対し hit-test を行い、 drag mode を返す。
+/// rect 外 / handle 外なら `None`。 corner handle の hit-box 半径は
+/// 描画サイズ (10 px) より少し広めの 14 px (= 端を掴みやすく)。
+fn hit_test_handles(
+    overlay: (f32, f32, f32, f32),
+    rotation_radians: f32,
+    cursor: (f32, f32),
+    screen: (f32, f32),
+) -> Option<PreviewDragMode> {
+    let (nx, ny, nw, nh) = overlay;
+    let (sw, sh) = screen;
+    let rx = nx * sw;
+    let ry = ny * sh;
+    let rw = nw * sw;
+    let rh = nh * sh;
+    let cx0 = rx + rw * 0.5;
+    let cy0 = ry + rh * 0.5;
+    let (sin_r, cos_r) = rotation_radians.sin_cos();
+    let rotate_point = |lx: f32, ly: f32| -> (f32, f32) {
+        (cx0 + lx * cos_r - ly * sin_r, cy0 + lx * sin_r + ly * cos_r)
+    };
+    let half_w = rw * 0.5;
+    let half_h = rh * 0.5;
+    let (curx, cury) = cursor;
+    const HIT_R: f32 = 14.0;
+    // Rotate handle (上辺中点から 24 px 外側)。 corner より優先。
+    let (rot_x, rot_y) = rotate_point(0.0, -half_h - 24.0);
+    if (curx - rot_x).hypot(cury - rot_y) <= HIT_R {
+        return Some(PreviewDragMode::Rotate);
+    }
+    // 4 corner handles (回転後座標で square hit box)。
+    let corners = [
+        (rotate_point(-half_w, -half_h), 0u8), // NW
+        (rotate_point(half_w, -half_h), 1),    // NE
+        (rotate_point(-half_w, half_h), 2),    // SW
+        (rotate_point(half_w, half_h), 3),     // SE
+    ];
+    for ((hx, hy), idx) in corners {
+        if (curx - hx).abs() <= HIT_R && (cury - hy).abs() <= HIT_R {
+            return Some(PreviewDragMode::Resize { corner: idx });
+        }
+    }
+    // 内部 rect (= move handle)。 rotation を逆変換して cursor を rect
+    // local 系に持ち込み、 axis-aligned 内外判定する。
+    let lx = (curx - cx0) * cos_r + (cury - cy0) * sin_r;
+    let ly = -(curx - cx0) * sin_r + (cury - cy0) * cos_r;
+    if lx.abs() <= half_w && ly.abs() <= half_h {
+        return Some(PreviewDragMode::Move);
+    }
+    None
+}
+
+/// drag delta を `start_rect` (normalized 0..=1) に積んで AppEvent::
+/// SetClipImage{X/Y/W/H} を発火する。 lane 経由の override は handler
+/// 側で「ImageEvent.field を直接書く」 動作で、 lane があれば lane
+/// が override し続ける (= drag の見た目変化は lane を無効化しない限り
+/// 隠れる)。 P5.3 段階では「lane があれば現在 playhead に point を
+/// 打つ」 までは実装しないので、 lane がある field は drag が無視される
+/// 形になる (P5 完了後のフォロー)。
+fn handle_preview_drag(
+    app: &AppData,
+    proxy: &EventLoopProxy<AppEvent>,
+    drag: &PreviewDragState,
+    cursor: (f32, f32),
+    screen: (f32, f32),
+) {
+    let (sx, sy) = drag.start_cursor;
+    let dx = (cursor.0 - sx) / screen.0.max(1.0);
+    let dy = (cursor.1 - sy) / screen.1.max(1.0);
+    let (sx0, sy0, sw0, sh0) = drag.start_rect;
+    let (nx, ny, nw, nh) = match drag.mode {
+        PreviewDragMode::Move => {
+            // rect 全体を平行移動。 rect が画面外に出ないよう x/y を
+            // [0, 1-w] / [0, 1-h] で clamp。 w/h は不変。
+            let new_x = (sx0 + dx).clamp(0.0, (1.0 - sw0).max(0.0));
+            let new_y = (sy0 + dy).clamp(0.0, (1.0 - sh0).max(0.0));
+            (new_x, new_y, sw0, sh0)
+        }
+        PreviewDragMode::Resize { corner } => {
+            // 各 corner で「対辺を固定して反対側を引っ張る」 動作。
+            // 例: SE handle は x/y 不変、 w/h を増減。 NW handle は
+            // x/y も移動 + w/h を反方向に増減。
+            const MIN: f32 = 0.01; // 1% 未満には縮められない (= 視認可能性)
+            match corner {
+                0 => {
+                    // NW
+                    let nx = (sx0 + dx).clamp(0.0, sx0 + sw0 - MIN);
+                    let ny = (sy0 + dy).clamp(0.0, sy0 + sh0 - MIN);
+                    let nw = (sx0 + sw0) - nx;
+                    let nh = (sy0 + sh0) - ny;
+                    (nx, ny, nw, nh)
+                }
+                1 => {
+                    // NE
+                    let ny = (sy0 + dy).clamp(0.0, sy0 + sh0 - MIN);
+                    let nw = (sw0 + dx).clamp(MIN, 1.0 - sx0);
+                    let nh = (sy0 + sh0) - ny;
+                    (sx0, ny, nw, nh)
+                }
+                2 => {
+                    // SW
+                    let nx = (sx0 + dx).clamp(0.0, sx0 + sw0 - MIN);
+                    let nw = (sx0 + sw0) - nx;
+                    let nh = (sh0 + dy).clamp(MIN, 1.0 - sy0);
+                    (nx, sy0, nw, nh)
+                }
+                _ => {
+                    // SE
+                    let nw = (sw0 + dx).clamp(MIN, 1.0 - sx0);
+                    let nh = (sh0 + dy).clamp(MIN, 1.0 - sy0);
+                    (sx0, sy0, nw, nh)
+                }
+            }
+        }
+        PreviewDragMode::Rotate => {
+            // Rotate mode: cursor の rect 中心からの角度差分で rotation
+            // を更新。 rect そのもの (x/y/w/h) は不変。 SetClipImage
+            // Rotation だけ発火する経路で別 return する。
+            let (nx0, ny0, nw0, nh0) = drag.start_rect;
+            let cx0 = nx0 * screen.0 + nw0 * screen.0 * 0.5;
+            let cy0 = ny0 * screen.1 + nh0 * screen.1 * 0.5;
+            let cur_angle = (cursor.1 - cy0).atan2(cursor.0 - cx0);
+            let new_rotation = drag.start_rotation_radians
+                + (cur_angle - drag.start_cursor_angle);
+            // 値が変わったときだけ発火 (= 0.001 rad ≒ 0.057° 未満は skip)。
+            let cur_rot = drag.start_rotation_radians;
+            if (new_rotation - cur_rot).abs() > 1e-3 {
+                let _ = proxy.send_event(AppEvent::SetClipImageRotation {
+                    target: drag.target,
+                    value: new_rotation,
+                });
+            }
+            return;
+        }
+    };
+    // 値が変わった field だけ AppEvent を発火 (= 無駄な undo step を
+    // 発生させない)。 first event 比較。
+    let current = app
+        .song
+        .tracks
+        .get(drag.target.track as usize)
+        .and_then(|t| t.clips.get(drag.target.clip as usize))
+        .and_then(|c| app.song.clip_contents.get(&c.content_id))
+        .and_then(|content| content.image_events())
+        .and_then(|ev| ev.first())
+        .map(|ev| (ev.x, ev.y, ev.w, ev.h));
+    let Some((cx, cy, cw, ch)) = current else {
+        return;
+    };
+    let target = drag.target;
+    let send = |ev: AppEvent| {
+        let _ = proxy.send_event(ev);
+    };
+    if (nx - cx).abs() > 1e-5 {
+        send(AppEvent::SetClipImageX { target, value: nx });
+    }
+    if (ny - cy).abs() > 1e-5 {
+        send(AppEvent::SetClipImageY { target, value: ny });
+    }
+    if (nw - cw).abs() > 1e-5 {
+        send(AppEvent::SetClipImageW { target, value: nw });
+    }
+    if (nh - ch).abs() > 1e-5 {
+        send(AppEvent::SetClipImageH { target, value: nh });
+    }
 }
 
 struct Runner {
@@ -239,6 +451,8 @@ impl ApplicationHandler<AppEvent> for Runner {
             // per-decode log budget in `VideoPlaybackEngine`.
             #[cfg(windows)]
             preview_upload_log_remaining: 60,
+            preview_cursor: None,
+            preview_drag: None,
         });
     }
 
@@ -531,6 +745,71 @@ impl Runner {
             WindowEvent::RedrawRequested => {
                 preview.render_placeholder();
             }
+            // `docs/plan_image_overlay.md` §4 P5: PiP rect の drag 編集。
+            // CursorMoved / MouseInput を捕捉して、 hit-test → drag
+            // state 開始 → MouseMoved delta から normalized rect 更新
+            // → AppEvent::SetClipImage{X,Y,W,H} 発火。
+            WindowEvent::CursorMoved { position, .. } => {
+                let cursor = (position.x as f32, position.y as f32);
+                state.preview_cursor = Some(cursor);
+                if let Some(drag) = state.preview_drag {
+                    let size = preview.renderer.size();
+                    handle_preview_drag(
+                        &state.app,
+                        &self.proxy,
+                        &drag,
+                        cursor,
+                        (size.width as f32, size.height as f32),
+                    );
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                state.preview_cursor = None;
+            }
+            WindowEvent::MouseInput {
+                state: button_state,
+                button: winit::event::MouseButton::Left,
+                ..
+            } => {
+                let pressed = matches!(button_state, winit::event::ElementState::Pressed);
+                if pressed {
+                    if let Some(cursor) = state.preview_cursor
+                        && let Some(overlay) = preview.selection_overlay
+                        && let Some(target) = state.app.selected_clip
+                    {
+                        let size = preview.renderer.size();
+                        let screen = (size.width as f32, size.height as f32);
+                        let rotation = preview.selection_rotation_radians;
+                        let mode = hit_test_handles(overlay, rotation, cursor, screen);
+                        if let Some(mode) = mode {
+                            // rect 中心 (screen px) を計算し、 cursor との
+                            // 角度を保存 (Rotate mode の delta 計算で使う)。
+                            let (nx, ny, nw, nh) = overlay;
+                            let cx0 = nx * screen.0 + nw * screen.0 * 0.5;
+                            let cy0 = ny * screen.1 + nh * screen.1 * 0.5;
+                            let start_cursor_angle =
+                                (cursor.1 - cy0).atan2(cursor.0 - cx0);
+                            state.preview_drag = Some(PreviewDragState {
+                                mode,
+                                start_cursor: cursor,
+                                start_rect: overlay,
+                                start_rotation_radians: rotation,
+                                start_cursor_angle,
+                                target,
+                            });
+                            // drag begin: snapshot 1 個 + lane recording
+                            // seed (`docs/plan_image_automation.md` §5)
+                            let _ = self
+                                .proxy
+                                .send_event(AppEvent::BeginImagePiPDrag);
+                        }
+                    }
+                } else if state.preview_drag.is_some() {
+                    state.preview_drag = None;
+                    // drag end: lane recording seed のクリア。
+                    let _ = self.proxy.send_event(AppEvent::EndImagePiPDrag);
+                }
+            }
             _ => {}
         }
     }
@@ -739,6 +1018,7 @@ impl Runner {
                 // Video clips always letterbox; the PiP rect is the
                 // image-overlay path only.
                 pip_rect: None,
+                rotation_radians: 0.0,
             });
         }
 
@@ -775,6 +1055,7 @@ impl Runner {
                 height: dims.1,
                 alpha: frame_info.alpha,
                 pip_rect: Some((frame_info.x, frame_info.y, frame_info.w, frame_info.h)),
+                rotation_radians: frame_info.rotation_radians,
             });
         }
         // z_index ascending = bottom→top draw order. Video frames
@@ -796,6 +1077,32 @@ impl Runner {
         // image-on-top convention covers the MV-overlay use case.
         let _ = ();
         preview.set_composite_layers(layers);
+
+        // `docs/plan_image_overlay.md` §4 P5: 選択中 image event の
+        // PiP rect を preview window 上に縁取り + handle で描画する。
+        // selected_clip が ClipContent::Image でなければ overlay は
+        // `None` (= 非表示)。 lane override が effective なときは event
+        // の生値ではなく resolve 後の rect を表示するため image_compose
+        // と同じパスで「現在 frame の解決後 rect」 を再計算するのが
+        // 理想だが、 frame collect は既に終わっており、 ここでは event
+        // の生値ベースで縁取りを置く (= lane drag P5.3 で recording に
+        // 切り替えた瞬間に event 値が override される動作で OK)。
+        let overlay_info = state
+            .app
+            .selected_clip
+            .and_then(|cref| {
+                let track = state.app.song.tracks.get(cref.track as usize)?;
+                let clip = track.clips.get(cref.clip as usize)?;
+                let content = state.app.song.clip_contents.get(&clip.content_id)?;
+                let events = content.image_events()?;
+                let ev = events.first()?;
+                Some(((ev.x, ev.y, ev.w, ev.h), ev.rotation_radians))
+            });
+        let (overlay_rect, rotation) = match overlay_info {
+            Some((r, rot)) => (Some(r), rot),
+            None => (None, 0.0),
+        };
+        preview.set_selection_overlay(overlay_rect, rotation);
     }
 
     /// docs/plan_video_perf.md P4: drain the worker's ring snapshots

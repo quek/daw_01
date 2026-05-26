@@ -67,6 +67,16 @@ pub struct PreviewWindowState {
     /// every frame and refilled by the runner before
     /// `render_placeholder`. Empty = the placeholder text appears.
     pub composite_layers: Vec<CompositeLayer>,
+    /// `docs/plan_image_automation.md` §5 / `plan_image_overlay.md` §4
+    /// P5: 選択中 image event の PiP rect (normalized 0..=1)。 `Some`
+    /// なら render pass が縁取り + 4 corner handle + center handle を
+    /// composite の上に push する。 `None` ならオーバーレイなし。
+    /// runner が毎 frame で `set_selection_overlay` を呼んで更新。
+    pub selection_overlay: Option<(f32, f32, f32, f32)>,
+    /// 選択中 image event の rotation_radians (= 縁取り + rotate handle
+    /// 描画時に rect を回転させて表示する)。 lane override 値が乗った
+    /// 結果が入る (= runner 経由)。
+    pub selection_rotation_radians: f32,
 }
 
 /// One textured layer in the preview composite. The runner builds a
@@ -90,6 +100,14 @@ pub struct CompositeLayer {
     pub height: u32,
     pub alpha: f32,
     pub pip_rect: Option<(f32, f32, f32, f32)>,
+    /// v15 (`docs/plan_image_automation.md` rotation): rect 中心を旋回
+    /// 中心とする 2D 回転 (radians、 clockwise positive)。 PiP layer (=
+    /// `pip_rect = Some`) でのみ意味を持ち、 video aspect-fit layer は
+    /// 常に `0.0`。 `gui_01 #047` (`TexturedQuad.rotation_radians`)
+    /// landing 後に `push_textured_quad` に渡す。 現状の wgpu pipeline
+    /// は rotation 未対応のため値は保持のみ、 描画は axis-aligned で
+    /// 走る。
+    pub rotation_radians: f32,
 }
 
 impl PreviewWindowState {
@@ -120,7 +138,22 @@ impl PreviewWindowState {
             frame_textures: std::collections::HashMap::new(),
             image_textures: std::collections::HashMap::new(),
             composite_layers: Vec::new(),
+            selection_overlay: None,
+            selection_rotation_radians: 0.0,
         })
+    }
+
+    /// Update the PiP selection overlay (= 縁取り + corner / center
+    /// handle 描画用)。 `None` で消す。 normalized 0..=1 座標。
+    /// `rotation_radians` は縁取りと rotate handle を回転表示するため
+    /// (= drag 中に視覚 feedback)。 `0.0` で axis-aligned 表示。
+    pub fn set_selection_overlay(
+        &mut self,
+        overlay: Option<(f32, f32, f32, f32)>,
+        rotation_radians: f32,
+    ) {
+        self.selection_overlay = overlay;
+        self.selection_rotation_radians = rotation_radians;
     }
 
     /// docs/plan_image_overlay.md §P3: upload a freshly-decoded image
@@ -321,6 +354,7 @@ impl PreviewWindowState {
                 color: Color::rgb(0.65, 0.7, 0.8),
                 clip_rect: None,
             });
+            self.draw_selection_overlay(screen.width as f32, screen.height as f32);
         } else {
             for layer in &self.composite_layers {
                 if layer.width == 0 || layer.height == 0 || layer.alpha <= 0.0 {
@@ -349,12 +383,121 @@ impl PreviewWindowState {
                     uv_min: (0.0, 0.0),
                     uv_max: (1.0, 1.0),
                     clip_rect: None,
+                    rotation_radians: layer.rotation_radians,
                 });
             }
+            self.draw_selection_overlay(screen.width as f32, screen.height as f32);
         }
 
         if let Err(e) = self.renderer.render(&self.scene) {
             tracing::error!(error = ?e, "preview render error");
+        }
+    }
+
+    /// `selection_overlay` を screen px に変換し、 縁取り + 4 corner +
+    /// center + rotate handle を scene に push する。 `selection
+    /// _overlay` が `None` ならただ早期 return。 縁取りは rect 中心
+    /// 旋回で `selection_rotation_radians` を反映 (= 画像と一緒に回る)。
+    /// 4 corner handle / center handle / rotate handle 位置も同様に
+    /// 回転後座標で描画 (`docs/plan_image_automation.md` rotation)。
+    fn draw_selection_overlay(&mut self, sw: f32, sh: f32) {
+        let Some((nx, ny, nw, nh)) = self.selection_overlay else {
+            return;
+        };
+        // PiP rect (= 画像の表示領域) を screen px に変換。
+        let rx = nx * sw;
+        let ry = ny * sh;
+        let rw = nw * sw;
+        let rh = nh * sh;
+        let cx = rx + rw * 0.5;
+        let cy = ry + rh * 0.5;
+        let rot = self.selection_rotation_radians;
+        let (sin_r, cos_r) = rot.sin_cos();
+        // (cx 基準の local x, y) → screen の (px, py)。
+        let rotate = |lx: f32, ly: f32| -> (f32, f32) {
+            (cx + lx * cos_r - ly * sin_r, cy + lx * sin_r + ly * cos_r)
+        };
+        let half_w = rw * 0.5;
+        let half_h = rh * 0.5;
+        // 4 corner (回転前 local → 回転後 screen)。
+        let nw_p = rotate(-half_w, -half_h);
+        let ne_p = rotate(half_w, -half_h);
+        let se_p = rotate(half_w, half_h);
+        let sw_p = rotate(-half_w, half_h);
+        // 縁取り 4 edge を line で描画。 push_lines は 1 batch で
+        // 複数 segment OK。 LineSegment の field は `a: [f32; 2]` /
+        // `b: [f32; 2]` / `color`。
+        const STROKE_COLOR: Color = Color { r: 1.0, g: 0.95, b: 0.45, a: 0.85 };
+        const STROKE_W: f32 = 2.0;
+        let edge_pts: Vec<daw_ui_renderer::LineSegment> = vec![
+            daw_ui_renderer::LineSegment {
+                a: [nw_p.0, nw_p.1],
+                b: [ne_p.0, ne_p.1],
+                color: STROKE_COLOR,
+            },
+            daw_ui_renderer::LineSegment {
+                a: [ne_p.0, ne_p.1],
+                b: [se_p.0, se_p.1],
+                color: STROKE_COLOR,
+            },
+            daw_ui_renderer::LineSegment {
+                a: [se_p.0, se_p.1],
+                b: [sw_p.0, sw_p.1],
+                color: STROKE_COLOR,
+            },
+            daw_ui_renderer::LineSegment {
+                a: [sw_p.0, sw_p.1],
+                b: [nw_p.0, nw_p.1],
+                color: STROKE_COLOR,
+            },
+        ];
+        self.scene.push_lines(daw_ui_renderer::LineBatch {
+            segments: std::sync::Arc::from(edge_pts),
+            line_width_px: STROKE_W,
+            clip_rect: None,
+        });
+        // rotate handle: 上辺中点から外側 24 px (= 回転前 (0, -half_h
+        // - 24))。 line で center と繋ぐ。
+        const ROTATE_OFFSET: f32 = 24.0;
+        let rotate_p = rotate(0.0, -half_h - ROTATE_OFFSET);
+        let top_mid = rotate(0.0, -half_h);
+        let rot_line = daw_ui_renderer::LineBatch {
+            segments: std::sync::Arc::from(vec![daw_ui_renderer::LineSegment {
+                a: [top_mid.0, top_mid.1],
+                b: [rotate_p.0, rotate_p.1],
+                color: STROKE_COLOR,
+            }]),
+            line_width_px: STROKE_W,
+            clip_rect: None,
+        };
+        self.scene.push_lines(rot_line);
+        // Corner / center / rotate handle (= 6 個)。 handle 自体は
+        // axis-aligned rect で描画 (= 回転後の中心位置に小 square)。
+        const HANDLE: f32 = 10.0;
+        const HANDLE_COLOR: Color = Color { r: 1.0, g: 0.95, b: 0.45, a: 1.0 };
+        const HANDLE_BORDER: Color = Color { r: 0.0, g: 0.0, b: 0.0, a: 0.85 };
+        let handle_centers = [
+            nw_p,
+            ne_p,
+            sw_p,
+            se_p,
+            (cx, cy),
+            rotate_p,
+        ];
+        for (hx, hy) in handle_centers {
+            self.scene.push_rect(daw_ui_renderer::RectCommand {
+                rect: daw_ui_renderer::Rect::new(
+                    hx - HANDLE * 0.5,
+                    hy - HANDLE * 0.5,
+                    HANDLE,
+                    HANDLE,
+                ),
+                fill: HANDLE_COLOR,
+                border: HANDLE_BORDER,
+                border_width: 1.0,
+                radius: [2.0; 4],
+                clip_rect: None,
+            });
         }
     }
 }

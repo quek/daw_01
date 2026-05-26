@@ -11,7 +11,10 @@
 //!   bottom-up so the caller can interleave them with video layers
 //!   from `video_playback::active_sources_at` by `z_index`.
 
-use common::model::{FadeCurve, ImageEvent, ImageSourceId, Song, TrackKind};
+use common::model::{
+    AutomationTarget, FadeCurve, ImageBuiltinParam, ImageEvent, ImageSourceId, Song, Track,
+    TrackKind,
+};
 
 /// One image event active at the current playhead. Mirrors
 /// `video_playback::ActiveVideoFrame` so the caller can merge video +
@@ -38,6 +41,12 @@ pub struct ActiveImageFrame {
     /// `0.0..=1.0`. Caller multiplies this into the textured-quad
     /// alpha (= standard "src over dst" blend).
     pub alpha: f32,
+    /// v15 (`docs/plan_image_automation.md` rotation): rect 中心を旋回
+    /// 中心とする 2D 回転 (radians、 clockwise positive)。 lane override
+    /// が effective なら lane 値、 さもなくば `ImageEvent.rotation_radians`。
+    /// `0.0` = axis-aligned。 gui_01 #047 (`TexturedQuad.rotation_radians`)
+    /// landing 後に preview / render passes が wire する。
+    pub rotation_radians: f32,
     /// Bottom-up draw order, same numbering as
     /// `video_playback::ActiveVideoFrame::z_index`. The runner sorts
     /// all (video + image) frames by `z_index` ascending before
@@ -95,17 +104,26 @@ pub fn active_image_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveIma
                     continue;
                 }
                 let env = event_alpha_envelope(event, clip_local);
-                let alpha = event.opacity * env;
+                // lane override (`docs/plan_image_automation.md` §3.1)。
+                // track-level lane の時間軸は track-global beats、 lane
+                // が無い field は ImageEvent.field をそのまま使う。
+                // opacity は fade envelope と multiply (= override しても
+                // fade が効く)。 rotation は lane 経路の override のみ
+                // (= fade 無関係)。
+                let (x, y, w, h, opacity, rotation) =
+                    resolve_image_fields(track, song, event, playhead_beat);
+                let alpha = opacity * env;
                 if alpha <= 0.0 {
                     continue;
                 }
                 out.push(ActiveImageFrame {
                     image_source_id: event.source_id,
-                    x: event.x,
-                    y: event.y,
-                    w: event.w,
-                    h: event.h,
+                    x,
+                    y,
+                    w,
+                    h,
                     alpha,
+                    rotation_radians: rotation,
                     z_index,
                 });
                 track_emitted = true;
@@ -116,6 +134,54 @@ pub fn active_image_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveIma
         }
     }
     out
+}
+
+/// `ImageEvent.{x,y,w,h,opacity}` を track-level `ImageBuiltin` lane で
+/// override する。 lane が存在し enabled / clip カバー範囲内 / point
+/// 列を持つ場合のみ lane の値、 さもなくば event の値を返す。 全 5 field
+/// を 1 関数でまとめて解決して borrow を最小化。
+fn resolve_image_fields(
+    track: &Track,
+    song: &Song,
+    event: &ImageEvent,
+    song_beat: f64,
+) -> (f32, f32, f32, f32, f32, f32) {
+    let resolve_norm = |field: ImageBuiltinParam, fallback: f32| -> f32 {
+        let Some(lane) = track.automation_lanes.iter().find(|l| {
+            matches!(l.target, AutomationTarget::ImageBuiltin(p) if p == field)
+        }) else {
+            return fallback;
+        };
+        // lane_value_at は lane.default_value をフォールバックに使うが、
+        // image lane の default は event 値とは独立 (= lane を空で作っ
+        // ても event 値が見えるべきではない、 lane を作った時点で lane
+        // が override)。 lane が enabled で clip が無い区間でも default
+        // _value が effective。
+        let v = common::automation::lane_value_at(lane, &song.clip_contents, song_beat);
+        (v as f32).clamp(0.0, 1.0)
+    };
+    let resolve_rotation = |fallback: f32| -> f32 {
+        let Some(lane) = track.automation_lanes.iter().find(|l| {
+            matches!(
+                l.target,
+                AutomationTarget::ImageBuiltin(ImageBuiltinParam::Rotation)
+            )
+        }) else {
+            return fallback;
+        };
+        // Rotation は plain で radians、 範囲 -π..=π を超えても modulo
+        // 2π で wrap (= 連続回転 lane を許容)。 lane.default_value は
+        // 既に radians 単位。
+        let v = common::automation::lane_value_at(lane, &song.clip_contents, song_beat);
+        v as f32
+    };
+    let x = resolve_norm(ImageBuiltinParam::X, event.x);
+    let y = resolve_norm(ImageBuiltinParam::Y, event.y);
+    let w = resolve_norm(ImageBuiltinParam::W, event.w);
+    let h = resolve_norm(ImageBuiltinParam::H, event.h);
+    let opacity = resolve_norm(ImageBuiltinParam::Opacity, event.opacity);
+    let rotation = resolve_rotation(event.rotation_radians);
+    (x, y, w, h, opacity, rotation)
 }
 
 /// Per-event fade envelope at the given clip-local beat. Range
@@ -196,6 +262,7 @@ mod tests {
                     w,
                     h,
                     opacity,
+                    rotation_radians: 0.0,
                     muted: false,
                     fade_in_beats: fade_in,
                     fade_out_beats: fade_out,

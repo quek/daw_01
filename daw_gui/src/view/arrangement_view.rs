@@ -1501,7 +1501,7 @@ struct LaneDisplay {
 /// `Arc::from` で都度生成 (per-frame だが lane 数は片手で数える程度なので
 /// allocation コストは無視できる)。
 fn lane_target_display(target: &common::model::AutomationTarget) -> LaneDisplay {
-    use common::model::{AutomationTarget, TrackBuiltinParam};
+    use common::model::{AutomationTarget, ImageBuiltinParam, TrackBuiltinParam};
     match target {
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => LaneDisplay {
             label: Arc::from("Volume"),
@@ -1541,6 +1541,38 @@ fn lane_target_display(target: &common::model::AutomationTarget) -> LaneDisplay 
             icon_glyph: 'T',
             color: Color::rgb(0.95, 0.85, 0.55),
         },
+        // Image PiP field の lane。 色は image track の clip 背景色系
+        // (薄い藤色) で統一、 icon は field 名の頭文字。
+        AutomationTarget::ImageBuiltin(ImageBuiltinParam::X) => LaneDisplay {
+            label: Arc::from("Image X"),
+            icon_glyph: 'X',
+            color: Color::rgb(0.90, 0.65, 0.85),
+        },
+        AutomationTarget::ImageBuiltin(ImageBuiltinParam::Y) => LaneDisplay {
+            label: Arc::from("Image Y"),
+            icon_glyph: 'Y',
+            color: Color::rgb(0.90, 0.65, 0.85),
+        },
+        AutomationTarget::ImageBuiltin(ImageBuiltinParam::W) => LaneDisplay {
+            label: Arc::from("Image W"),
+            icon_glyph: 'W',
+            color: Color::rgb(0.85, 0.65, 0.90),
+        },
+        AutomationTarget::ImageBuiltin(ImageBuiltinParam::H) => LaneDisplay {
+            label: Arc::from("Image H"),
+            icon_glyph: 'H',
+            color: Color::rgb(0.85, 0.65, 0.90),
+        },
+        AutomationTarget::ImageBuiltin(ImageBuiltinParam::Opacity) => LaneDisplay {
+            label: Arc::from("Image Opacity"),
+            icon_glyph: 'O',
+            color: Color::rgb(0.92, 0.78, 0.70),
+        },
+        AutomationTarget::ImageBuiltin(ImageBuiltinParam::Rotation) => LaneDisplay {
+            label: Arc::from("Image Rotation"),
+            icon_glyph: 'R',
+            color: Color::rgb(0.75, 0.92, 0.92),
+        },
     }
 }
 
@@ -1549,7 +1581,7 @@ fn lane_target_display(target: &common::model::AutomationTarget) -> LaneDisplay 
 /// 知らないと正規化できないので、 とりあえず `clamp(0, 1)` で渡す
 /// (Phase 2 で `AppData.plugin_params` lookup に置換)。
 fn plain_to_norm(target: &common::model::AutomationTarget, plain: f64) -> f32 {
-    use common::model::{AutomationTarget, TrackBuiltinParam};
+    use common::model::{AutomationTarget, ImageBuiltinParam, TrackBuiltinParam};
     let v = match target {
         // Track.volume は通常 0.0..=2.0 で扱う (1.0 = unity、 amp_to_fader
         // を通せば dB 表現)。 widget の slider band も 0..1 範囲なので
@@ -1572,6 +1604,11 @@ fn plain_to_norm(target: &common::model::AutomationTarget, plain: f64) -> f32 {
         AutomationTarget::PluginParam { .. } => plain,
         // Song-level: Phase 5 で実装。 適当に 0 を返す。
         AutomationTarget::SongTempo | AutomationTarget::SongTimeSigNumerator => 0.0,
+        // Image PiP Rotation のみ Pan 同 idiom で normalize、 残りは恒等。
+        AutomationTarget::ImageBuiltin(ImageBuiltinParam::Rotation) => {
+            (plain + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)
+        }
+        AutomationTarget::ImageBuiltin(_) => plain,
     };
     v.clamp(0.0, 1.0) as f32
 }

@@ -47,6 +47,12 @@ pub fn plain_to_norm(target: &AutomationTarget, plain: f64) -> f32 {
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { .. }) => plain / 2.0,
         AutomationTarget::PluginParam { .. } => plain,
         AutomationTarget::SongTempo | AutomationTarget::SongTimeSigNumerator => 0.0,
+        // Image PiP field: x/y/w/h/opacity は既に 0..=1 (恒等)、 Rotation
+        // のみ Pan と同 idiom で `(plain + π) / (2π)` mapping。
+        AutomationTarget::ImageBuiltin(crate::model::ImageBuiltinParam::Rotation) => {
+            (plain + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)
+        }
+        AutomationTarget::ImageBuiltin(_) => plain,
     };
     v.clamp(0.0, 1.0) as f32
 }
@@ -68,6 +74,12 @@ pub fn norm_to_plain(target: &AutomationTarget, norm: f32) -> f64 {
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { .. }) => n * 2.0,
         AutomationTarget::PluginParam { .. } => n,
         AutomationTarget::SongTempo | AutomationTarget::SongTimeSigNumerator => n,
+        // Image PiP field: x/y/w/h/opacity は normalize と plain が同単位、
+        // Rotation のみ `n * 2π - π` で -π..=π に展開。
+        AutomationTarget::ImageBuiltin(crate::model::ImageBuiltinParam::Rotation) => {
+            n * 2.0 * std::f64::consts::PI - std::f64::consts::PI
+        }
+        AutomationTarget::ImageBuiltin(_) => n,
     }
 }
 

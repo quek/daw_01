@@ -132,6 +132,32 @@ pub struct InspectorAudioEventSummary {
     pub fade_out_curve: common::model::FadeCurve,
 }
 
+/// Image event 単位 field の inspector 表示用 read snapshot
+/// (`docs/plan_image_overlay.md` §4 P4)。 `selected_clip` が
+/// `ClipContent::Image` の clip を指していて、 中に少なくとも 1 event
+/// があれば `inspector_image_event_summary()` が `Some` を返す。
+/// view は "Image Event" section を出し、 数値入力 (x/y/w/h/opacity) と
+/// fade / mute toggle を first event 代表値として表示する。
+///
+/// `{x,y,w,h,opacity}_automated` は対応する `ImageBuiltin` lane が
+/// 存在する (`Track.automation_lanes` 上の visible 不問) か。 lane が
+/// あれば automate toggle は ON 表示で「もう一度押すと削除」、 無ければ
+/// OFF 表示で「押すと lane を作る」 動作になる
+/// (`docs/plan_image_automation.md` §4.3 / §5)。
+#[derive(Debug, Clone, Copy)]
+pub struct InspectorImageEventSummary {
+    pub target: ClipRef,
+    pub muted: bool,
+    pub fade_in_curve: common::model::FadeCurve,
+    pub fade_out_curve: common::model::FadeCurve,
+    pub x_automated: bool,
+    pub y_automated: bool,
+    pub w_automated: bool,
+    pub h_automated: bool,
+    pub opacity_automated: bool,
+    pub rotation_automated: bool,
+}
+
 /// Per-plugin sidechain wiring entry shown in the inspector. One row per
 /// chain plugin (MIDI FX / Instrument / Fx); the `current_source` field
 /// is the value of `PluginInstance::sidechain_sources[0]` (port 0; the
@@ -224,7 +250,7 @@ pub struct ResizeAutomationClipEntry {
 pub fn automation_target_display_name(
     target: &common::model::AutomationTarget,
 ) -> String {
-    use common::model::{AutomationTarget, TrackBuiltinParam};
+    use common::model::{AutomationTarget, ImageBuiltinParam, TrackBuiltinParam};
     match target {
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => "Volume".into(),
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan) => "Pan".into(),
@@ -235,6 +261,14 @@ pub fn automation_target_display_name(
         AutomationTarget::PluginParam { param_id, .. } => format!("Param {param_id}"),
         AutomationTarget::SongTempo => "Tempo".into(),
         AutomationTarget::SongTimeSigNumerator => "Time Sig".into(),
+        AutomationTarget::ImageBuiltin(ImageBuiltinParam::X) => "Image X".into(),
+        AutomationTarget::ImageBuiltin(ImageBuiltinParam::Y) => "Image Y".into(),
+        AutomationTarget::ImageBuiltin(ImageBuiltinParam::W) => "Image W".into(),
+        AutomationTarget::ImageBuiltin(ImageBuiltinParam::H) => "Image H".into(),
+        AutomationTarget::ImageBuiltin(ImageBuiltinParam::Opacity) => "Image Opacity".into(),
+        AutomationTarget::ImageBuiltin(ImageBuiltinParam::Rotation) => {
+            "Image Rotation".into()
+        }
     }
 }
 
@@ -708,12 +742,31 @@ pub struct AppData {
     /// `AudioEvent.pitch_semitones` 入力欄の編集中文字列 (`{:+.1}`、
     /// -96.0 .. 96.0、 Bitwig spec §3.6)。
     pub clip_pitch_edit_text: String,
-    /// `AudioEvent.fade_in_beats` 入力欄の編集中文字列 (`{:.3}`、
-    /// 0.0 .. clip.length_beats で clamp、 Bitwig spec §3.5)。
+    /// `AudioEvent.fade_in_beats` / `ImageEvent.fade_in_beats` 入力欄の
+    /// 編集中文字列 (`{:.3}`、 0.0 .. clip.length_beats で clamp、 Bitwig
+    /// spec §3.5)。 buffer は audio / image clip 間で共有 (= 同時に複数
+    /// clip を選択できない、 `clip_edit_buffer_target` の kind で write 先を
+    /// 判定)。
     pub clip_fade_in_edit_text: String,
-    /// `AudioEvent.fade_out_beats` 入力欄の編集中文字列 (`{:.3}`、
-    /// 0.0 .. clip.length_beats で clamp)。
+    /// `AudioEvent.fade_out_beats` / `ImageEvent.fade_out_beats` 入力欄の
+    /// 編集中文字列 (`{:.3}`、 0.0 .. clip.length_beats で clamp)。
     pub clip_fade_out_edit_text: String,
+    /// `ImageEvent.x` 入力欄の編集中文字列 (`{:.3}`、 0.0 .. 1.0 normalized
+    /// PiP rect 左上 X、 `docs/plan_image_overlay.md` §1.1)。
+    pub clip_image_x_edit_text: String,
+    /// `ImageEvent.y` 入力欄の編集中文字列 (`{:.3}`、 0.0 .. 1.0)。
+    pub clip_image_y_edit_text: String,
+    /// `ImageEvent.w` 入力欄の編集中文字列 (`{:.3}`、 0.0 .. 1.0、 PiP 幅)。
+    pub clip_image_w_edit_text: String,
+    /// `ImageEvent.h` 入力欄の編集中文字列 (`{:.3}`、 0.0 .. 1.0、 PiP 高)。
+    pub clip_image_h_edit_text: String,
+    /// `ImageEvent.opacity` 入力欄の編集中文字列 (`{:.3}`、 0.0 .. 1.0)。
+    pub clip_image_opacity_edit_text: String,
+    /// `ImageEvent.rotation_radians` 入力欄の編集中文字列。 ユーザー視点
+    /// は **degree** で表示 (`{:.1}`、 -180.0..=180.0)、 commit 時に
+    /// `to_radians()` で内部 radians に変換。 resync では `to_degrees()`
+    /// で書き戻し。
+    pub clip_image_rotation_edit_text: String,
 
     pub undo_stack: VecDeque<Song>,
     pub redo_stack: VecDeque<Song>,
@@ -937,6 +990,12 @@ impl AppData {
             clip_pitch_edit_text: String::new(),
             clip_fade_in_edit_text: String::new(),
             clip_fade_out_edit_text: String::new(),
+            clip_image_x_edit_text: String::new(),
+            clip_image_y_edit_text: String::new(),
+            clip_image_w_edit_text: String::new(),
+            clip_image_h_edit_text: String::new(),
+            clip_image_opacity_edit_text: String::new(),
+            clip_image_rotation_edit_text: String::new(),
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             is_help_open: false,
@@ -1271,6 +1330,44 @@ impl AppData {
         Some(next as usize)
     }
 
+    /// `selected_clip` が `ClipContent::Image` の clip を指していて、
+    /// 中に少なくとも 1 event があれば first event を代表値として
+    /// `InspectorImageEventSummary` を返す。
+    /// 編集 AppEvent (`SetClipImageX` 等) は全 event に同じ値を broadcast
+    /// するので、 multi-event clip でも view は first event を「代表値」
+    /// として見せれば編集後に整合が取れる。 数値値 (x/y/w/h/opacity/
+    /// fade_in_beats/fade_out_beats) は inspector の edit buffer (text
+    /// 文字列) 側に持つので summary には含めない (= dropdown / toggle
+    /// のみ snapshot に乗せる)。
+    pub fn inspector_image_event_summary(&self) -> Option<InspectorImageEventSummary> {
+        let cref = self.selected_clip?;
+        let track = self.song.tracks.get(cref.track as usize)?;
+        let clip = track.clips.get(cref.clip as usize)?;
+        let common::model::ClipContent::Image(image) =
+            self.song.clip_contents.get(&clip.content_id)?
+        else {
+            return None;
+        };
+        let event = image.events.first()?;
+        let has_lane = |field: common::model::ImageBuiltinParam| {
+            track.automation_lanes.iter().any(|l| {
+                matches!(l.target, common::model::AutomationTarget::ImageBuiltin(p) if p == field)
+            })
+        };
+        Some(InspectorImageEventSummary {
+            target: cref,
+            muted: event.muted,
+            fade_in_curve: event.fade_in_curve,
+            fade_out_curve: event.fade_out_curve,
+            x_automated: has_lane(common::model::ImageBuiltinParam::X),
+            y_automated: has_lane(common::model::ImageBuiltinParam::Y),
+            w_automated: has_lane(common::model::ImageBuiltinParam::W),
+            h_automated: has_lane(common::model::ImageBuiltinParam::H),
+            opacity_automated: has_lane(common::model::ImageBuiltinParam::Opacity),
+            rotation_automated: has_lane(common::model::ImageBuiltinParam::Rotation),
+        })
+    }
+
     /// PR-D 段階 2: set_clip_audio_event_* 系 helper の broadcast 範囲を
     /// 決める。 audio_editor が `target` clip を開いていて event を
     /// 選択中なら、 当該 event 1 つだけ更新 (= multi-event clip の個別
@@ -1327,6 +1424,39 @@ impl AppData {
                 f(event);
             }
             self.sync_song_to_plugin_host();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `target` clip が `ClipContent::Image` の場合、 全 ImageEvent に
+    /// `f` を適用する (= image clip は audio_editor のような per-event
+    /// 選択 UI を持たないので broadcast 固定)。 戻り値は「実際に何らか
+    /// の event を更新したか」 (= caller が edit buffer resync を呼ぶか
+    /// の判断に使う)。
+    fn mutate_image_events_in_clip<F>(&mut self, target: ClipRef, mut f: F) -> bool
+    where
+        F: FnMut(&mut common::model::ImageEvent),
+    {
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return false;
+        };
+        if let Some(common::model::ClipContent::Image(image)) =
+            self.song.clip_contents.get_mut(&content_id)
+        {
+            if image.events.is_empty() {
+                return false;
+            }
+            for event in &mut image.events {
+                f(event);
+            }
             true
         } else {
             false
@@ -1503,6 +1633,20 @@ impl AppData {
                 | AppEvent::SetClipFadeOutBeats { .. }
                 | AppEvent::SetClipFadeInCurve { .. }
                 | AppEvent::SetClipFadeOutCurve { .. }
+                | AppEvent::CommitClipImageXEdit
+                | AppEvent::CommitClipImageYEdit
+                | AppEvent::CommitClipImageWEdit
+                | AppEvent::CommitClipImageHEdit
+                | AppEvent::CommitClipImageOpacityEdit
+                | AppEvent::CommitClipImageRotationEdit
+                | AppEvent::BeginImagePiPDrag
+                // EndImagePiPDrag は非 undoable (begin 側に snapshot あり)
+                // 注: SetClipImage{X,Y,W,H,Opacity} は preview drag で
+                // 毎フレーム発火するので非 undoable。 drag begin の
+                // BeginImagePiPDrag 1 個で 1 snapshot を取り、 drag 中
+                // の連続更新は同 step 内に集約する。 inspector の数値
+                // 入力 commit は CommitClipImage*Edit が undoable なので
+                // 1 commit = 1 step を維持。
                 | AppEvent::AutoFadeSelectedClips
                 | AppEvent::AutoCrossfadeSelectedClips
                 | AppEvent::ToggleClipReversed(_)
@@ -1538,6 +1682,8 @@ impl AppData {
                 // SetLaneDefault と SetAutomationCurveType は { prev, next } を持つので
                 // 後で snapshotless Undo に置換できるが、 当面は Song snapshot 経由。
                 | AppEvent::AddAutomationFromLastTouched
+                | AppEvent::AddImageAutomationLane { .. }
+                | AppEvent::RemoveImageAutomationLane { .. }
                 | AppEvent::CreateAutomationClip { .. }
                 | AppEvent::DeleteLane { .. }
                 | AppEvent::AddAutomationPoint { .. }
@@ -2107,6 +2253,34 @@ pub enum AppEvent {
     /// れば新規作成 (default = 現在の plain 値)。`expanded_automation_tracks`
     /// にも所有 track を insert して即時展開。
     AddAutomationFromLastTouched,
+
+    /// Inspector の image event section「📈」 ボタンから発火。 選択中
+    /// image clip の track に `ImageBuiltin(field)` lane を追加 (既存
+    /// あれば visible / enabled 復活)。 default_value は first ImageEvent
+    /// の現値 (`docs/plan_image_automation.md` §4.1)。 undoable。
+    AddImageAutomationLane { field: common::model::ImageBuiltinParam },
+
+    /// Inspector の automate toggle が ON 状態のとき、 もう一度押すと
+    /// 該当 `ImageBuiltin(field)` lane を track から削除する。 削除後は
+    /// ImageEvent.field がふたたび effective (= override 解除)。 lane
+    /// が無ければ no-op。 undoable。
+    RemoveImageAutomationLane { field: common::model::ImageBuiltinParam },
+
+    /// preview window で PiP rect の drag 操作を始めた瞬間に発火する
+    /// marker event (`docs/plan_image_overlay.md` §4 P5)。 handler 本体
+    /// は no-op、 is_undoable に含まれるので handle_event 冒頭の
+    /// auto push_undo_snapshot だけが効く。 drag 中の SetClipImage*
+    /// 連発を 1 個の Undo step に集約する用途 (= AE / Premiere 流の
+    /// 「drag 1 stroke = 1 undo」 UX)。 同時に「drag 中の lane recording」
+    /// の `ParamGestureBegin` 相当として、 lane を持つ image field を
+    /// active_param_gestures に登録する。
+    BeginImagePiPDrag,
+
+    /// preview window で PiP rect の drag を終了した瞬間に発火する
+    /// (= MouseInput Released)。 `BeginImagePiPDrag` で active_param
+    /// _gestures に登録した image field を全て remove する。 non-
+    /// undoable (= drag begin 側に snapshot がある)。
+    EndImagePiPDrag,
     /// Phase 4 (`docs/plan_automation.md` §6): automation recording mode の
     /// transport 4 way toggle。 session-only / Undo 対象外。
     SetRecordingMode(common::model::RecordingMode),
@@ -2620,10 +2794,50 @@ pub enum AppEvent {
     /// 同じ semantics で全 event に broadcast、 値は clip.length_beats
     /// で clamp (= fade が clip より長くならない)。 curve は spec §3.5
     /// の Linear / Exponential / SCurve から選択 (Inspector dropdown 経由)。
+    /// `target` の `ClipContent` が `Audio` / `Image` のいずれであっても
+    /// fade フィールドが存在するので kind-aware に書き分ける (handler
+    /// 側で resolve)。
     SetClipFadeInBeats { target: ClipRef, beats: f64 },
     SetClipFadeOutBeats { target: ClipRef, beats: f64 },
     SetClipFadeInCurve { target: ClipRef, curve: common::model::FadeCurve },
     SetClipFadeOutCurve { target: ClipRef, curve: common::model::FadeCurve },
+
+    // ---- Image event 編集 (`docs/plan_image_overlay.md` §4 P4) -----------
+    /// PiP rect / opacity の text_input per-character 更新。 buffer
+    /// 文字列のみ更新 (parse / commit はしない)、 非 undoable。
+    ClipImageXEditChanged(String),
+    ClipImageYEditChanged(String),
+    ClipImageWEditChanged(String),
+    ClipImageHEditChanged(String),
+    ClipImageOpacityEditChanged(String),
+    /// `ImageEvent.rotation_radians` 入力欄の per-character 更新
+    /// (ユーザー側は degree 単位、 commit で radians 変換)。
+    ClipImageRotationEditChanged(String),
+
+    /// PiP rect / opacity の text_input commit (Enter / focus 喪失)。
+    /// buffer を parse して値を `set_clip_image_event_*` に通し、
+    /// 失敗時は status_message + buffer を現値に書き戻す。 undoable。
+    CommitClipImageXEdit,
+    CommitClipImageYEdit,
+    CommitClipImageWEdit,
+    CommitClipImageHEdit,
+    CommitClipImageOpacityEdit,
+    /// degree 単位を radians に変換して全 ImageEvent に broadcast。
+    CommitClipImageRotationEdit,
+
+    /// PiP rect / opacity の programmatic 設定 (Inspector commit から
+    /// 呼ばれる / JS test API / 将来の preview drag handle 経由)。 全
+    /// ImageEvent に broadcast。 各値は仕様に従って clamp:
+    /// x/y/w/h は [0.0, 1.0]、 opacity も [0.0, 1.0]、 rotation は
+    /// `-π..=π` で wrap (= 360° 連続入力可)。
+    SetClipImageX { target: ClipRef, value: f32 },
+    SetClipImageY { target: ClipRef, value: f32 },
+    SetClipImageW { target: ClipRef, value: f32 },
+    SetClipImageH { target: ClipRef, value: f32 },
+    SetClipImageOpacity { target: ClipRef, value: f32 },
+    /// `value` は radians 単位 (= 内部単位)。 inspector は degree で
+    /// 入力するが commit で radians に変換してから発火する。
+    SetClipImageRotation { target: ClipRef, value: f32 },
 
     // ---- Auto-Fade / Auto-Crossfade (Phase 2 PR5) -----------------------
     /// 全選択 audio clip に短 (≒4 ms 相当) fade を一括適用 (`docs
@@ -3047,6 +3261,27 @@ impl AppData {
             }
             AppEvent::AddAutomationFromLastTouched => {
                 self.add_automation_from_last_touched();
+            }
+            AppEvent::AddImageAutomationLane { field } => {
+                self.add_image_automation_lane(field);
+            }
+            AppEvent::RemoveImageAutomationLane { field } => {
+                self.remove_image_automation_lane(field);
+            }
+            AppEvent::BeginImagePiPDrag => {
+                // snapshot は is_undoable 経由で既に取られている (=
+                // handle_event 冒頭の push_undo_snapshot)。 ここでは
+                // lane recording seed のみ:  selected_clip が指す image
+                // track に対し、 lane を持つ field を `active_param
+                // _gestures` に登録する。 record_automation_points_for
+                // _tick が再生中に 1/64 beat 刻みで point を打ち続ける。
+                // drag end (= MouseInput Released) で
+                // `image_drag_release` 経路から ParamGestureEnd 相当を
+                // クリアする。
+                self.begin_image_pip_drag_recording();
+            }
+            AppEvent::EndImagePiPDrag => {
+                self.end_image_pip_drag_recording();
             }
             AppEvent::SetRecordingMode(mode) => {
                 self.recording_mode = mode;
@@ -3520,13 +3755,21 @@ impl AppData {
                 self.set_clip_audio_event_reversed(target, reversed);
             }
             AppEvent::SetClipMuted { target, muted } => {
-                self.set_clip_audio_event_muted(target, muted);
+                if self.is_image_clip(target) {
+                    self.set_clip_image_event_muted(target, muted);
+                } else {
+                    self.set_clip_audio_event_muted(target, muted);
+                }
             }
             AppEvent::SetClipStretchMode { target, mode } => {
                 self.set_clip_audio_event_stretch_mode(target, mode);
             }
             AppEvent::ResyncClipEditBuffers(target) => {
-                self.resync_clip_audio_event_edit_buffers(target);
+                if self.is_image_clip(target) {
+                    self.resync_clip_image_event_edit_buffers(target);
+                } else {
+                    self.resync_clip_audio_event_edit_buffers(target);
+                }
             }
             AppEvent::ClipGainEditChanged(s) => {
                 self.clip_gain_db_edit_text = s;
@@ -3568,16 +3811,86 @@ impl AppData {
                 self.commit_clip_fade_out_edit();
             }
             AppEvent::SetClipFadeInBeats { target, beats } => {
-                self.set_clip_audio_event_fade_in_beats(target, beats);
+                if self.is_image_clip(target) {
+                    self.set_clip_image_event_fade_in_beats(target, beats);
+                } else {
+                    self.set_clip_audio_event_fade_in_beats(target, beats);
+                }
             }
             AppEvent::SetClipFadeOutBeats { target, beats } => {
-                self.set_clip_audio_event_fade_out_beats(target, beats);
+                if self.is_image_clip(target) {
+                    self.set_clip_image_event_fade_out_beats(target, beats);
+                } else {
+                    self.set_clip_audio_event_fade_out_beats(target, beats);
+                }
             }
             AppEvent::SetClipFadeInCurve { target, curve } => {
-                self.set_clip_audio_event_fade_in_curve(target, curve);
+                if self.is_image_clip(target) {
+                    self.set_clip_image_event_fade_in_curve(target, curve);
+                } else {
+                    self.set_clip_audio_event_fade_in_curve(target, curve);
+                }
             }
             AppEvent::SetClipFadeOutCurve { target, curve } => {
-                self.set_clip_audio_event_fade_out_curve(target, curve);
+                if self.is_image_clip(target) {
+                    self.set_clip_image_event_fade_out_curve(target, curve);
+                } else {
+                    self.set_clip_audio_event_fade_out_curve(target, curve);
+                }
+            }
+            AppEvent::ClipImageXEditChanged(s) => {
+                self.clip_image_x_edit_text = s;
+            }
+            AppEvent::ClipImageYEditChanged(s) => {
+                self.clip_image_y_edit_text = s;
+            }
+            AppEvent::ClipImageWEditChanged(s) => {
+                self.clip_image_w_edit_text = s;
+            }
+            AppEvent::ClipImageHEditChanged(s) => {
+                self.clip_image_h_edit_text = s;
+            }
+            AppEvent::ClipImageOpacityEditChanged(s) => {
+                self.clip_image_opacity_edit_text = s;
+            }
+            AppEvent::CommitClipImageXEdit => {
+                self.commit_clip_image_x_edit();
+            }
+            AppEvent::CommitClipImageYEdit => {
+                self.commit_clip_image_y_edit();
+            }
+            AppEvent::CommitClipImageWEdit => {
+                self.commit_clip_image_w_edit();
+            }
+            AppEvent::CommitClipImageHEdit => {
+                self.commit_clip_image_h_edit();
+            }
+            AppEvent::CommitClipImageOpacityEdit => {
+                self.commit_clip_image_opacity_edit();
+            }
+            AppEvent::SetClipImageX { target, value } => {
+                self.set_clip_image_event_x(target, value);
+            }
+            AppEvent::SetClipImageY { target, value } => {
+                self.set_clip_image_event_y(target, value);
+            }
+            AppEvent::SetClipImageW { target, value } => {
+                self.set_clip_image_event_w(target, value);
+            }
+            AppEvent::SetClipImageH { target, value } => {
+                self.set_clip_image_event_h(target, value);
+            }
+            AppEvent::SetClipImageOpacity { target, value } => {
+                self.set_clip_image_event_opacity(target, value);
+            }
+            AppEvent::ClipImageRotationEditChanged(s) => {
+                self.clip_image_rotation_edit_text = s;
+            }
+            AppEvent::CommitClipImageRotationEdit => {
+                self.commit_clip_image_rotation_edit();
+            }
+            AppEvent::SetClipImageRotation { target, value } => {
+                self.set_clip_image_event_rotation_radians(target, value);
             }
             AppEvent::AutoFadeSelectedClips => {
                 self.auto_fade_selected_clips();
@@ -6063,6 +6376,236 @@ impl AppData {
     /// `A` キー shortcut の handler。`last_touched_param` の lane を
     /// 該当 track に追加 (or 既存があれば visible = true で復活)。
     /// 仕様: `docs/plan_automation.md` §7.3。
+    /// Inspector の image event「📈」 ボタンから呼ばれる。 選択中 image
+    /// clip の track に `AutomationTarget::ImageBuiltin(field)` lane を
+    /// 追加する (= `docs/plan_image_automation.md` §4.1)。 既存 lane が
+    /// 同 target で見つかれば visible / enabled を `true` に戻して
+    /// 終わり (= 削除復活 UX)、 無ければ新規作成。 default_value は
+    /// 同 track 上の first image event の field 値、 image event が
+    /// 解決できなければ image field 共通 default (0 for x/y、 1 for w/h
+    /// /opacity)。
+    fn add_image_automation_lane(
+        &mut self,
+        field: common::model::ImageBuiltinParam,
+    ) {
+        use common::model::{AutomationLane, AutomationTarget, ClipContent, ImageBuiltinParam};
+        let Some(target_clip) = self.selected_clip else {
+            self.status_message =
+                "Image Automation: 画像 clip を選択してください".into();
+            return;
+        };
+        let track_id_opt = self
+            .song
+            .tracks
+            .get(target_clip.track as usize)
+            .map(|t| t.id);
+        let Some(track_id) = track_id_opt else {
+            return;
+        };
+        let target = AutomationTarget::ImageBuiltin(field);
+
+        // 既存 lane を find。 あれば visible / enabled を true に。
+        if let Some(track) = self.song.track_by_id_mut(track_id)
+            && let Some(lane) = track
+                .automation_lanes
+                .iter_mut()
+                .find(|l| l.target == target)
+        {
+            lane.visible = true;
+            lane.enabled = true;
+            self.expanded_automation_tracks.insert(track_id);
+            self.status_message = format!(
+                "Image Automation lane '{}' は既に存在します",
+                automation_target_display_name(&target)
+            );
+            self.sync_song_to_plugin_host();
+            return;
+        }
+
+        // default_value: 同 track 上の first image event の field 値。
+        // image event が無ければ field ごとの常識値。 clamp 範囲は field
+        // 種別で異なる (x/y/w/h/opacity = [0,1]、 rotation = [-π, π])。
+        let default_value: f64 = {
+            let Some(track) = self.song.track_by_id(track_id) else {
+                return;
+            };
+            let event = track.clips.iter().find_map(|c| {
+                self.song.clip_contents.get(&c.content_id).and_then(|content| {
+                    match content {
+                        ClipContent::Image(img) => img.events.first(),
+                        _ => None,
+                    }
+                })
+            });
+            let v = match event {
+                Some(ev) => match field {
+                    ImageBuiltinParam::X => ev.x,
+                    ImageBuiltinParam::Y => ev.y,
+                    ImageBuiltinParam::W => ev.w,
+                    ImageBuiltinParam::H => ev.h,
+                    ImageBuiltinParam::Opacity => ev.opacity,
+                    ImageBuiltinParam::Rotation => ev.rotation_radians,
+                },
+                None => match field {
+                    ImageBuiltinParam::X | ImageBuiltinParam::Y => 0.0,
+                    ImageBuiltinParam::W
+                    | ImageBuiltinParam::H
+                    | ImageBuiltinParam::Opacity => 1.0,
+                    ImageBuiltinParam::Rotation => 0.0,
+                },
+            };
+            let v = f64::from(v);
+            match field {
+                ImageBuiltinParam::Rotation => {
+                    v.clamp(-std::f64::consts::PI, std::f64::consts::PI)
+                }
+                _ => v.clamp(0.0, 1.0),
+            }
+        };
+
+        let Some(track) = self.song.track_by_id_mut(track_id) else {
+            return;
+        };
+        let lane_id = track.alloc_lane_id();
+        let new_lane = AutomationLane {
+            id: lane_id,
+            target: target.clone(),
+            default_value,
+            enabled: true,
+            visible: true,
+            height_px: 60,
+            clips: Vec::new(),
+            next_clip_id: 1,
+        };
+        track.automation_lanes.push(new_lane);
+        self.expanded_automation_tracks.insert(track_id);
+        self.status_message = format!(
+            "Added image automation lane: {}",
+            automation_target_display_name(&target)
+        );
+        self.sync_song_to_plugin_host();
+    }
+
+    /// PiP drag 中に image lane gesture が `active_param_gestures` に
+    /// 残っているか。 record_automation_points_for_tick の起動条件で
+    /// 「停止中でも image drag 中なら record を回す」 ために使う。
+    fn image_pip_drag_active(&self) -> bool {
+        self.active_param_gestures
+            .iter()
+            .any(|(_, t)| matches!(t, common::model::AutomationTarget::ImageBuiltin(_)))
+    }
+
+    /// preview drag begin で呼ばれる。 選択中 image clip の track 上で
+    /// `AutomationTarget::ImageBuiltin(_)` lane を持つ全 field を
+    /// `active_param_gestures` に登録。 record_automation_points_for_tick
+    /// が再生中に 1/64 beat throttle で point を打つ pipeline に乗る
+    /// (`docs/plan_image_automation.md` §5)。
+    ///
+    /// 停止中の drag は ImageEvent.field を直接編集する経路で UI を
+    /// 動かすが、 lane が override しているので preview は変化しない (=
+    /// default 値だけが変わる)。 「停止中の drag で keyframe を打つ」
+    /// UX は別途 follow-up (`docs/plan_image_automation.md` §8 未確定
+    /// 事項)。
+    fn begin_image_pip_drag_recording(&mut self) {
+        use common::model::{AutomationTarget, ImageBuiltinParam};
+        let Some(target_clip) = self.selected_clip else {
+            return;
+        };
+        let Some(track) = self.song.tracks.get(target_clip.track as usize) else {
+            return;
+        };
+        let track_id = track.id;
+        // lane が存在する field を全て active_param_gestures に。 record
+        // path が curve insert を行う。
+        let fields = [
+            ImageBuiltinParam::X,
+            ImageBuiltinParam::Y,
+            ImageBuiltinParam::W,
+            ImageBuiltinParam::H,
+            ImageBuiltinParam::Opacity,
+        ];
+        let mut seeded: Vec<AutomationTarget> = Vec::new();
+        for field in fields {
+            let target = AutomationTarget::ImageBuiltin(field);
+            let has_lane = track
+                .automation_lanes
+                .iter()
+                .any(|l| l.enabled && l.target == target);
+            if has_lane {
+                self.active_param_gestures.insert((track_id, target.clone()));
+                if matches!(
+                    self.recording_mode,
+                    common::model::RecordingMode::Latch
+                        | common::model::RecordingMode::Write
+                ) && self.is_playing
+                {
+                    self.latched_param_gestures.insert((track_id, target.clone()));
+                }
+                seeded.push(target);
+            }
+        }
+        if !seeded.is_empty() {
+            self.sync_recording_lanes_with_audio();
+        }
+    }
+
+    /// preview drag end で呼ばれる。 begin で seed した全 ImageBuiltin
+    /// gesture を `active_param_gestures` から remove。 Touch mode では
+    /// `recording_last_beat` からも消す (= 連続録音停止)。 Latch / Write
+    /// では latched は stop まで残す (= 既存 ParamGestureEnd と同 idiom)。
+    fn end_image_pip_drag_recording(&mut self) {
+        use common::model::AutomationTarget;
+        // image lane gesture だけを掃除 (audio / plugin gesture は残す)。
+        let to_remove: Vec<(u32, AutomationTarget)> = self
+            .active_param_gestures
+            .iter()
+            .filter(|(_, t)| matches!(t, AutomationTarget::ImageBuiltin(_)))
+            .cloned()
+            .collect();
+        let any = !to_remove.is_empty();
+        for key in to_remove {
+            self.active_param_gestures.remove(&key);
+            if self.recording_mode == common::model::RecordingMode::Touch {
+                self.recording_last_beat.remove(&key);
+            }
+        }
+        if any {
+            self.sync_recording_lanes_with_audio();
+        }
+    }
+
+    /// 選択中 image clip の track から `ImageBuiltin(field)` lane を
+    /// 削除 (= override 解除)。 lane が見つからない場合は no-op + status
+    /// 表示。 削除後は ImageEvent.field がふたたび effective。
+    fn remove_image_automation_lane(
+        &mut self,
+        field: common::model::ImageBuiltinParam,
+    ) {
+        use common::model::AutomationTarget;
+        let Some(target_clip) = self.selected_clip else {
+            return;
+        };
+        let target = AutomationTarget::ImageBuiltin(field);
+        let Some(track) = self.song.tracks.get_mut(target_clip.track as usize) else {
+            return;
+        };
+        let before = track.automation_lanes.len();
+        track.automation_lanes.retain(|l| l.target != target);
+        let removed = before - track.automation_lanes.len();
+        if removed == 0 {
+            self.status_message = format!(
+                "Image Automation: {} lane が見つかりません",
+                automation_target_display_name(&target)
+            );
+            return;
+        }
+        self.status_message = format!(
+            "Image Automation lane '{}' を削除しました",
+            automation_target_display_name(&target)
+        );
+        self.sync_song_to_plugin_host();
+    }
+
     fn add_automation_from_last_touched(&mut self) {
         let Some(touched) = self.last_touched_param.clone() else {
             self.status_message =
@@ -6194,6 +6737,33 @@ impl AppData {
             AutomationTarget::PluginParam { .. } => 0.0,
             AutomationTarget::SongTempo => f64::from(self.song.bpm),
             AutomationTarget::SongTimeSigNumerator => f64::from(self.song.time_sig.0),
+            // Image PiP default: 同 track の最初の image clip の first
+            // event 値を初期値に使う。 1 つも image clip が無い (= lane
+            // を空 image track で先行追加するケース) は 0.0 fallback。
+            AutomationTarget::ImageBuiltin(field) => {
+                use common::model::{ClipContent, ImageBuiltinParam};
+                let Some(track) = self.song.track_by_id(touched.track_id) else {
+                    return 0.0;
+                };
+                let event = track.clips.iter().find_map(|c| {
+                    self.song
+                        .clip_contents
+                        .get(&c.content_id)
+                        .and_then(|content| match content {
+                            ClipContent::Image(img) => img.events.first(),
+                            _ => None,
+                        })
+                });
+                let Some(ev) = event else { return 0.0 };
+                f64::from(match field {
+                    ImageBuiltinParam::X => ev.x,
+                    ImageBuiltinParam::Y => ev.y,
+                    ImageBuiltinParam::W => ev.w,
+                    ImageBuiltinParam::H => ev.h,
+                    ImageBuiltinParam::Opacity => ev.opacity,
+                    ImageBuiltinParam::Rotation => ev.rotation_radians,
+                })
+            }
         }
     }
 
@@ -7833,18 +8403,256 @@ impl AppData {
         self.mutate_audio_events_in_clip(target, |e| e.fade_out_curve = curve);
     }
 
+    // -------- Image event editors (`docs/plan_image_overlay.md` §4 P4) ----
+
+    fn set_clip_image_event_x(&mut self, target: ClipRef, value: f32) {
+        let value = value.clamp(0.0, 1.0);
+        self.mutate_image_events_in_clip(target, |e| e.x = value);
+        self.resync_clip_image_event_edit_buffers(target);
+    }
+
+    fn set_clip_image_event_y(&mut self, target: ClipRef, value: f32) {
+        let value = value.clamp(0.0, 1.0);
+        self.mutate_image_events_in_clip(target, |e| e.y = value);
+        self.resync_clip_image_event_edit_buffers(target);
+    }
+
+    fn set_clip_image_event_w(&mut self, target: ClipRef, value: f32) {
+        let value = value.clamp(0.0, 1.0);
+        self.mutate_image_events_in_clip(target, |e| e.w = value);
+        self.resync_clip_image_event_edit_buffers(target);
+    }
+
+    fn set_clip_image_event_h(&mut self, target: ClipRef, value: f32) {
+        let value = value.clamp(0.0, 1.0);
+        self.mutate_image_events_in_clip(target, |e| e.h = value);
+        self.resync_clip_image_event_edit_buffers(target);
+    }
+
+    fn set_clip_image_event_opacity(&mut self, target: ClipRef, value: f32) {
+        let value = value.clamp(0.0, 1.0);
+        self.mutate_image_events_in_clip(target, |e| e.opacity = value);
+        self.resync_clip_image_event_edit_buffers(target);
+    }
+
+    fn set_clip_image_event_rotation_radians(&mut self, target: ClipRef, value: f32) {
+        // -π..=π で wrap して保存。 lane override 経由でも同じ wrap が
+        // composite で適用される (= preview 表示は modulo 2π)。
+        let two_pi = std::f32::consts::TAU;
+        let wrapped =
+            ((value + std::f32::consts::PI).rem_euclid(two_pi)) - std::f32::consts::PI;
+        self.mutate_image_events_in_clip(target, |e| e.rotation_radians = wrapped);
+        self.resync_clip_image_event_edit_buffers(target);
+    }
+
+    fn set_clip_image_event_muted(&mut self, target: ClipRef, muted: bool) {
+        self.mutate_image_events_in_clip(target, |e| e.muted = muted);
+    }
+
+    fn set_clip_image_event_fade_in_beats(&mut self, target: ClipRef, beats: f64) {
+        let max_beats = self.clip_length_beats(target).unwrap_or(0.0);
+        let beats = beats.clamp(0.0, max_beats);
+        self.mutate_image_events_in_clip(target, |e| e.fade_in_beats = beats);
+        self.resync_clip_image_event_edit_buffers(target);
+    }
+
+    fn set_clip_image_event_fade_out_beats(&mut self, target: ClipRef, beats: f64) {
+        let max_beats = self.clip_length_beats(target).unwrap_or(0.0);
+        let beats = beats.clamp(0.0, max_beats);
+        self.mutate_image_events_in_clip(target, |e| e.fade_out_beats = beats);
+        self.resync_clip_image_event_edit_buffers(target);
+    }
+
+    fn set_clip_image_event_fade_in_curve(
+        &mut self,
+        target: ClipRef,
+        curve: common::model::FadeCurve,
+    ) {
+        self.mutate_image_events_in_clip(target, |e| e.fade_in_curve = curve);
+    }
+
+    fn set_clip_image_event_fade_out_curve(
+        &mut self,
+        target: ClipRef,
+        curve: common::model::FadeCurve,
+    ) {
+        self.mutate_image_events_in_clip(target, |e| e.fade_out_curve = curve);
+    }
+
+    /// `clip_image_*_edit_text` / `clip_fade_*_edit_text` を `target` clip
+    /// の first event の現値で再生成する。 image clip 切替や Undo/Redo 時
+    /// に呼ぶ。 target が `ClipContent::Image` でないなら buffer をクリア
+    /// して `clip_edit_buffer_target` を `None` 化する。
+    fn resync_clip_image_event_edit_buffers(&mut self, target: ClipRef) {
+        let event_snapshot = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .and_then(|c| {
+                if let Some(common::model::ClipContent::Image(image)) =
+                    self.song.clip_contents.get(&c.content_id)
+                {
+                    image.events.first().cloned()
+                } else {
+                    None
+                }
+            });
+        match event_snapshot {
+            Some(ev) => {
+                self.clip_edit_buffer_target = Some(target);
+                self.clip_image_x_edit_text = format!("{:.3}", ev.x);
+                self.clip_image_y_edit_text = format!("{:.3}", ev.y);
+                self.clip_image_w_edit_text = format!("{:.3}", ev.w);
+                self.clip_image_h_edit_text = format!("{:.3}", ev.h);
+                self.clip_image_opacity_edit_text = format!("{:.3}", ev.opacity);
+                self.clip_image_rotation_edit_text =
+                    format!("{:.1}", ev.rotation_radians.to_degrees());
+                self.clip_fade_in_edit_text = format!("{:.3}", ev.fade_in_beats);
+                self.clip_fade_out_edit_text = format!("{:.3}", ev.fade_out_beats);
+            }
+            None => {
+                self.clip_edit_buffer_target = None;
+                self.clip_image_x_edit_text.clear();
+                self.clip_image_y_edit_text.clear();
+                self.clip_image_w_edit_text.clear();
+                self.clip_image_h_edit_text.clear();
+                self.clip_image_opacity_edit_text.clear();
+                self.clip_image_rotation_edit_text.clear();
+                self.clip_fade_in_edit_text.clear();
+                self.clip_fade_out_edit_text.clear();
+            }
+        }
+    }
+
+    fn commit_clip_image_x_edit(&mut self) {
+        let Some(target) = self.clip_edit_buffer_target else {
+            return;
+        };
+        match self.clip_image_x_edit_text.trim().parse::<f32>() {
+            Ok(v) => self.set_clip_image_event_x(target, v),
+            Err(_) => {
+                self.status_message =
+                    format!("Image X: '{}' を数値として解釈できません", self.clip_image_x_edit_text);
+                self.resync_clip_image_event_edit_buffers(target);
+            }
+        }
+    }
+
+    fn commit_clip_image_y_edit(&mut self) {
+        let Some(target) = self.clip_edit_buffer_target else {
+            return;
+        };
+        match self.clip_image_y_edit_text.trim().parse::<f32>() {
+            Ok(v) => self.set_clip_image_event_y(target, v),
+            Err(_) => {
+                self.status_message =
+                    format!("Image Y: '{}' を数値として解釈できません", self.clip_image_y_edit_text);
+                self.resync_clip_image_event_edit_buffers(target);
+            }
+        }
+    }
+
+    fn commit_clip_image_w_edit(&mut self) {
+        let Some(target) = self.clip_edit_buffer_target else {
+            return;
+        };
+        match self.clip_image_w_edit_text.trim().parse::<f32>() {
+            Ok(v) => self.set_clip_image_event_w(target, v),
+            Err(_) => {
+                self.status_message =
+                    format!("Image W: '{}' を数値として解釈できません", self.clip_image_w_edit_text);
+                self.resync_clip_image_event_edit_buffers(target);
+            }
+        }
+    }
+
+    fn commit_clip_image_h_edit(&mut self) {
+        let Some(target) = self.clip_edit_buffer_target else {
+            return;
+        };
+        match self.clip_image_h_edit_text.trim().parse::<f32>() {
+            Ok(v) => self.set_clip_image_event_h(target, v),
+            Err(_) => {
+                self.status_message =
+                    format!("Image H: '{}' を数値として解釈できません", self.clip_image_h_edit_text);
+                self.resync_clip_image_event_edit_buffers(target);
+            }
+        }
+    }
+
+    fn commit_clip_image_opacity_edit(&mut self) {
+        let Some(target) = self.clip_edit_buffer_target else {
+            return;
+        };
+        match self.clip_image_opacity_edit_text.trim().parse::<f32>() {
+            Ok(v) => self.set_clip_image_event_opacity(target, v),
+            Err(_) => {
+                self.status_message = format!(
+                    "Image Opacity: '{}' を数値として解釈できません",
+                    self.clip_image_opacity_edit_text
+                );
+                self.resync_clip_image_event_edit_buffers(target);
+            }
+        }
+    }
+
+    /// ユーザー入力 degree を radians に変換して `set_clip_image_event
+    /// _rotation_radians` に渡す。 parse 失敗時は buffer を resync で
+    /// 現値に書き戻し + status 表示。
+    fn commit_clip_image_rotation_edit(&mut self) {
+        let Some(target) = self.clip_edit_buffer_target else {
+            return;
+        };
+        match self.clip_image_rotation_edit_text.trim().parse::<f32>() {
+            Ok(deg) => self.set_clip_image_event_rotation_radians(target, deg.to_radians()),
+            Err(_) => {
+                self.status_message = format!(
+                    "Image Rotation: '{}' を数値として解釈できません",
+                    self.clip_image_rotation_edit_text
+                );
+                self.resync_clip_image_event_edit_buffers(target);
+            }
+        }
+    }
+
+    /// `target` が指す clip が `ClipContent::Image` か。 commit / fade /
+    /// mute handler の kind dispatch で使う。 範囲外 / 別 variant は false。
+    pub fn is_image_clip(&self, target: ClipRef) -> bool {
+        let Some(track) = self.song.tracks.get(target.track as usize) else {
+            return false;
+        };
+        let Some(clip) = track.clips.get(target.clip as usize) else {
+            return false;
+        };
+        matches!(
+            self.song.clip_contents.get(&clip.content_id),
+            Some(common::model::ClipContent::Image(_))
+        )
+    }
+
     fn commit_clip_fade_in_edit(&mut self) {
         let Some(target) = self.clip_edit_buffer_target else {
             return;
         };
         match self.clip_fade_in_edit_text.trim().parse::<f64>() {
-            Ok(v) => self.set_clip_audio_event_fade_in_beats(target, v),
+            Ok(v) => {
+                if self.is_image_clip(target) {
+                    self.set_clip_image_event_fade_in_beats(target, v);
+                } else {
+                    self.set_clip_audio_event_fade_in_beats(target, v);
+                }
+            }
             Err(_) => {
                 self.status_message = format!(
                     "Fade In: '{}' を数値として解釈できません",
                     self.clip_fade_in_edit_text
                 );
-                self.resync_clip_audio_event_edit_buffers(target);
+                if self.is_image_clip(target) {
+                    self.resync_clip_image_event_edit_buffers(target);
+                } else {
+                    self.resync_clip_audio_event_edit_buffers(target);
+                }
             }
         }
     }
@@ -8381,13 +9189,23 @@ impl AppData {
             return;
         };
         match self.clip_fade_out_edit_text.trim().parse::<f64>() {
-            Ok(v) => self.set_clip_audio_event_fade_out_beats(target, v),
+            Ok(v) => {
+                if self.is_image_clip(target) {
+                    self.set_clip_image_event_fade_out_beats(target, v);
+                } else {
+                    self.set_clip_audio_event_fade_out_beats(target, v);
+                }
+            }
             Err(_) => {
                 self.status_message = format!(
                     "Fade Out: '{}' を数値として解釈できません",
                     self.clip_fade_out_edit_text
                 );
-                self.resync_clip_audio_event_edit_buffers(target);
+                if self.is_image_clip(target) {
+                    self.resync_clip_image_event_edit_buffers(target);
+                } else {
+                    self.resync_clip_audio_event_edit_buffers(target);
+                }
             }
         }
     }
@@ -9801,8 +10619,18 @@ impl AppData {
         // しているので、 per-tick LoadSong は不要 (= recording 中は audio が
         // track.volume / track.pan の live value をそのまま鳴らす、 recording
         // 終了の瞬間に sync_recording_lanes_with_audio が LoadSong を送る)。
-        if self.is_playing
-            && self.recording_mode != common::model::RecordingMode::Read
+        //
+        // `docs/plan_image_automation.md` §5: image PiP drag 中は再生
+        // していなくても record path を動かす (= 停止中の drag で現
+        // playhead に keyframe を打つ AE / Premiere 流 UX)。 image-only
+        // 例外なので audio 経路は従来通り is_playing 必須。
+        let image_dragging = self.image_pip_drag_active();
+        // image drag 中は recording_mode = Read でも record path を回す
+        // (= 「停止中の drag で現 playhead に keyframe」 を許可。 audio
+        // 経路は recording_mode を尊重)。
+        let audio_recording =
+            self.is_playing && self.recording_mode != common::model::RecordingMode::Read;
+        if (audio_recording || image_dragging)
             && let Some(ph) = self.playhead_beat
         {
             let _inserted = self.record_automation_points_for_tick(f64::from(ph));
@@ -9843,7 +10671,12 @@ impl AppData {
     /// が見つからない gesture は silently skip (= MVP: lane / clip は事前に user
     /// が作成する。 Bitwig 流 auto-create は Step C follow-up)。
     fn record_automation_points_for_tick(&mut self, playhead_beat: f64) -> usize {
-        if self.recording_mode == common::model::RecordingMode::Read {
+        // recording_mode = Read でも image PiP drag 中だけは continue
+        // (= 「停止中の drag が AE/Premiere 流の auto-keyframe を打つ」
+        // 仕様。 audio gesture には影響しない、 drag が active な image
+        // lane だけが record される)。
+        let image_dragging = self.image_pip_drag_active();
+        if self.recording_mode == common::model::RecordingMode::Read && !image_dragging {
             return 0;
         }
         // active ∪ latched (Touch mode は latched が常に空なので active のみ)。
@@ -9971,6 +10804,7 @@ impl AppData {
         track_id: u32,
         target: &common::model::AutomationTarget,
     ) -> Option<f64> {
+        use common::model::{ClipContent, ImageBuiltinParam};
         match target {
             // Phase 5: song-level target は track_id 無関係、 Song の現在値を返す
             common::model::AutomationTarget::SongTempo => Some(f64::from(self.song.bpm)),
@@ -9997,6 +10831,30 @@ impl AppData {
                 .plugin_param_values
                 .get(&(track_id, *slot, *param_id))
                 .copied(),
+            // Image PiP: 同 track の first image event の field 値を現在値とする
+            // (`docs/plan_image_automation.md` §4)。 drag が ImageEvent.field を
+            // 更新 → ここで再読み込み → record_automation_points_for_tick が
+            // point を打つ、 という pipeline。
+            common::model::AutomationTarget::ImageBuiltin(field) => {
+                let track = self.song.tracks.iter().find(|t| t.id == track_id)?;
+                let event = track.clips.iter().find_map(|c| {
+                    self.song
+                        .clip_contents
+                        .get(&c.content_id)
+                        .and_then(|content| match content {
+                            ClipContent::Image(img) => img.events.first(),
+                            _ => None,
+                        })
+                })?;
+                Some(f64::from(match field {
+                    ImageBuiltinParam::X => event.x,
+                    ImageBuiltinParam::Y => event.y,
+                    ImageBuiltinParam::W => event.w,
+                    ImageBuiltinParam::H => event.h,
+                    ImageBuiltinParam::Opacity => event.opacity,
+                    ImageBuiltinParam::Rotation => event.rotation_radians,
+                }))
+            }
             _ => None,
         }
     }
@@ -10903,13 +11761,20 @@ impl AppData {
             self.pending_image_uploads.push(image_source_id);
 
             // 2) Build the Image clip content. Single ImageEvent
-            // covering the whole clip with full-screen PiP rect; the
-            // user adjusts later.
+            // covering the whole clip。 デフォルト PiP rect は
+            // `Song.video_resolution` と画像 aspect で「アスペクト比
+            // 維持の中央配置」 を計算する (= 縦長画像を 16:9 preview に
+            // 入れると上下に余白、 横長画像なら左右に余白)。 ユーザーが
+            // 後から inspector / preview drag で自由に拡縮 / 配置できる。
             let display_name = path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("image")
                 .to_string();
+            let (def_x, def_y, def_w, def_h) = aspect_fit_pip_rect(
+                self.song.video_resolution,
+                (src.width, src.height),
+            );
             let i_content_id = self.song.alloc_content_id();
             self.song.clip_contents.insert(
                 i_content_id,
@@ -10918,6 +11783,10 @@ impl AppData {
                         source_id: image_source_id,
                         event_start_in_clip_beats: 0.0,
                         event_length_beats: image_clip_length_beats,
+                        x: def_x,
+                        y: def_y,
+                        w: def_w,
+                        h: def_h,
                         ..common::model::ImageEvent::default()
                     }],
                 }),
@@ -11453,10 +12322,50 @@ impl AppData {
                     .insert(front_id, ClipContent::Video(front));
                 ClipContent::Video(back)
             }
-            // Image clip Split は docs/plan_image_overlay.md §4 P4 で
-            // 実装予定。 P1 段階では未対応として skip し、 Video / Audio
-            // / MIDI clip の Split を阻害しないようにする。
-            ClipContent::Image(_) => return false,
+            // Image clip Split (`docs/plan_image_overlay.md` §4 P4)。
+            // Audio / Video と同じ「event を split_offset で前後に振り分け」
+            // pattern。 ImageEvent は単一画像 source への参照 + PiP rect /
+            // opacity のみ持つので、 source 切り出し位置 (source_*_frames /
+            // source_*_micros) のような時間軸 attribute は無い。 そのため
+            // straddle event は時間長 (event_length_beats) だけを 2 つに
+            // 分割し、 PiP rect / opacity / source_id は両 event が共有
+            // (= 同じ画像を 2 つの時間 region で表示し続ける)。 fade_out
+            // (前半側) / fade_in (後半側) は 0 にリセット (Audio / Video
+            // と同じ split 慣行)。
+            ClipContent::Image(mut image) => {
+                let mut back_events: Vec<common::model::ImageEvent> = Vec::new();
+                let mut keep_front: Vec<common::model::ImageEvent> = Vec::new();
+                for ev in image.events.drain(..) {
+                    let e_start = ev.event_start_in_clip_beats;
+                    let e_end = e_start + ev.event_length_beats;
+                    if e_end <= split_offset {
+                        keep_front.push(ev);
+                    } else if e_start >= split_offset {
+                        back_events.push(common::model::ImageEvent {
+                            event_start_in_clip_beats: e_start - split_offset,
+                            ..ev
+                        });
+                    } else {
+                        let mut front_ev = ev.clone();
+                        front_ev.event_length_beats = split_offset - e_start;
+                        front_ev.fade_out_beats = 0.0;
+                        keep_front.push(front_ev);
+                        back_events.push(common::model::ImageEvent {
+                            event_start_in_clip_beats: 0.0,
+                            event_length_beats: e_end - split_offset,
+                            fade_in_beats: 0.0,
+                            ..ev
+                        });
+                    }
+                }
+                let front = common::model::ImageContent { events: keep_front };
+                let back = common::model::ImageContent { events: back_events };
+                let front_id = self.song.alloc_content_id();
+                self.song
+                    .clip_contents
+                    .insert(front_id, ClipContent::Image(front));
+                ClipContent::Image(back)
+            }
         };
 
         // Allocate fresh ContentIds for both halves (front was just
@@ -11555,6 +12464,7 @@ impl AppData {
                 Midi,
                 Audio,
                 Video,
+                Image,
             }
             let mut glue_kind: Option<GlueKind> = None;
             for r in &refs {
@@ -11572,18 +12482,11 @@ impl AppData {
                     ClipContent::Midi(_) => GlueKind::Midi,
                     ClipContent::Audio(_) => GlueKind::Audio,
                     ClipContent::Video(_) => GlueKind::Video,
+                    ClipContent::Image(_) => GlueKind::Image,
                     // Automation clips don't live in `Track.clips` so a
                     // stale link here is unreachable, but be defensive
                     // and treat as a kind change to abort.
                     ClipContent::Automation(_) => {
-                        had_mixed_kind = true;
-                        break;
-                    }
-                    // Image clip Glue は docs/plan_image_overlay.md §4 P4
-                    // で実装予定。 P1 段階では未対応として「混在」 扱いで
-                    // abort し、 Video / Audio / MIDI clip 同士の Glue は
-                    // 引き続き動作させる。
-                    ClipContent::Image(_) => {
                         had_mixed_kind = true;
                         break;
                     }
@@ -11614,6 +12517,7 @@ impl AppData {
                 midi_notes: Vec<Note>,
                 audio_events: Vec<AudioEvent>,
                 video_events: Vec<common::model::VideoEvent>,
+                image_events: Vec<common::model::ImageEvent>,
             }
             let mut frags = Fragments::default();
 
@@ -11658,10 +12562,20 @@ impl AppData {
                     // variant referenced from `Track.clips` is a
                     // stale link, skip silently.
                     ClipContent::Automation(_) => {}
-                    // Image clip Glue は P4 で実装。 P1 段階では reach
-                    // 不能 (this_kind 判定で abort 済み)、 防衛的に
-                    // 何もしないだけ。
-                    ClipContent::Image(_) => {}
+                    // Image Glue (`docs/plan_image_overlay.md` §4 P4):
+                    // Audio と同じ shift logic。 PiP rect / opacity /
+                    // fade / source_id は per-event なので clone してから
+                    // event_start を offset するだけ。
+                    ClipContent::Image(image) => {
+                        for ev in &image.events {
+                            frags.image_events.push(common::model::ImageEvent {
+                                event_start_in_clip_beats: ev
+                                    .event_start_in_clip_beats
+                                    + offset_into_combined,
+                                ..ev.clone()
+                            });
+                        }
+                    }
                     // Video Glue (docs/plan_video.md §4 P6): same shift
                     // logic as Audio. source_micros range stays as-is
                     // per event since Glue doesn't change content
@@ -11700,6 +12614,9 @@ impl AppData {
                 }),
                 GlueKind::Video => ClipContent::Video(common::model::VideoContent {
                     events: frags.video_events,
+                }),
+                GlueKind::Image => ClipContent::Image(common::model::ImageContent {
+                    events: frags.image_events,
                 }),
                 GlueKind::Midi => {
                     let mut notes = frags.midi_notes;
@@ -11742,7 +12659,8 @@ impl AppData {
         if had_mixed_kind {
             tracing::warn!("Glue rejected: mixed kinds");
             self.status_message =
-                "Glue: MIDI / Audio / Vocal clip が混在しているため Glue できません".into();
+                "Glue: MIDI / Audio / Video / Image / Vocal clip が混在しているため Glue できません"
+                    .into();
             return;
         }
         if glued_count == 0 {
@@ -11769,6 +12687,38 @@ impl AppData {
 /// frames @ source_sr → beats @ project bpm. Used to size newly
 /// imported audio clips so the visual length matches the file
 /// duration at the project's current tempo.
+/// 画像を `preview_resolution` 内に **アスペクト比維持で中央 fit** する
+/// PiP rect を計算する。 `(x, y, w, h)` は normalized 0..=1。 画像が
+/// preview より横長なら横一杯 + 上下に余白、 縦長なら縦一杯 + 左右に
+/// 余白。 image / preview 寸法が 0 のときは安全側で全画面 `(0,0,1,1)`。
+fn aspect_fit_pip_rect(
+    preview_resolution: (u32, u32),
+    image_size: (u32, u32),
+) -> (f32, f32, f32, f32) {
+    let (pw, ph) = preview_resolution;
+    let (iw, ih) = image_size;
+    if pw == 0 || ph == 0 || iw == 0 || ih == 0 {
+        return (0.0, 0.0, 1.0, 1.0);
+    }
+    let preview_aspect = pw as f32 / ph as f32;
+    let image_aspect = iw as f32 / ih as f32;
+    if image_aspect >= preview_aspect {
+        // 画像が横長 → 横幅一杯、 縦に余白。
+        let w = 1.0_f32;
+        let h = preview_aspect / image_aspect;
+        let x = 0.0_f32;
+        let y = (1.0 - h) * 0.5;
+        (x, y, w, h)
+    } else {
+        // 画像が縦長 → 縦一杯、 横に余白。
+        let h = 1.0_f32;
+        let w = image_aspect / preview_aspect;
+        let y = 0.0_f32;
+        let x = (1.0 - w) * 0.5;
+        (x, y, w, h)
+    }
+}
+
 fn frames_to_beats(frames: u64, sample_rate: u32, bpm: f32) -> f64 {
     if sample_rate == 0 || bpm <= 0.0 {
         return 0.0;
@@ -11812,6 +12762,59 @@ fn load_recent_saved() -> common::recent::RecentFiles {
             tracing::debug!(error = ?e, path = %path.display(), "no recent_saved.json");
             Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod aspect_fit_tests {
+    use super::aspect_fit_pip_rect;
+
+    #[test]
+    fn square_image_in_16_9_preview_pillarbox() {
+        // 正方形 (1:1) を 16:9 preview → 縦一杯、 左右余白。
+        let (x, y, w, h) = aspect_fit_pip_rect((1920, 1080), (500, 500));
+        assert!((h - 1.0).abs() < 1e-5);
+        assert!((w - (9.0 / 16.0)).abs() < 1e-5);
+        assert!((y - 0.0).abs() < 1e-5);
+        assert!((x - (1.0 - 9.0 / 16.0) * 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn portrait_image_in_16_9_preview_pillarbox() {
+        // 縦長 PNG (例 2894x4613) を 16:9 preview → 縦一杯、 左右に大きな余白。
+        let (x, y, w, h) = aspect_fit_pip_rect((1920, 1080), (2894, 4613));
+        assert!((h - 1.0).abs() < 1e-5);
+        let expected_w = (2894.0 / 4613.0) / (1920.0 / 1080.0);
+        assert!((w - expected_w).abs() < 1e-5);
+        assert!((y - 0.0).abs() < 1e-5);
+        assert!((x - (1.0 - expected_w) * 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn landscape_image_in_16_9_preview_letterbox() {
+        // 21:9 (超横長) を 16:9 preview → 横一杯、 上下に余白。
+        let (x, y, w, h) = aspect_fit_pip_rect((1920, 1080), (2100, 900));
+        assert!((w - 1.0).abs() < 1e-5);
+        let expected_h = (1920.0 / 1080.0) / (2100.0 / 900.0);
+        assert!((h - expected_h).abs() < 1e-5);
+        assert!((x - 0.0).abs() < 1e-5);
+        assert!((y - (1.0 - expected_h) * 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn same_aspect_fills_preview() {
+        // 16:9 を 16:9 preview → 全画面 (= 余白なし)。
+        let (x, y, w, h) = aspect_fit_pip_rect((1920, 1080), (1280, 720));
+        assert!((w - 1.0).abs() < 1e-5);
+        assert!((h - 1.0).abs() < 1e-5);
+        assert!((x - 0.0).abs() < 1e-5);
+        assert!((y - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn zero_dimension_falls_back_to_full_screen() {
+        assert_eq!(aspect_fit_pip_rect((0, 1080), (500, 500)), (0.0, 0.0, 1.0, 1.0));
+        assert_eq!(aspect_fit_pip_rect((1920, 1080), (0, 500)), (0.0, 0.0, 1.0, 1.0));
     }
 }
 
