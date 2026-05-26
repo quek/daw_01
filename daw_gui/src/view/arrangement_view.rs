@@ -134,6 +134,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     app.song.clip_contents.get(&c.content_id),
                     Some(common::model::ClipContent::Video(_))
                         | Some(common::model::ClipContent::Image(_))
+                        | Some(common::model::ClipContent::Text(_))
                 )
             }) {
                 daw_ui_core::widgets::arrangement::TrackKind::Video
@@ -154,7 +155,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     id: c.id,
                     start_beat: c.start_beat,
                     len_beats: c.length_beats,
-                    name: Arc::from(c.name.as_str()),
+                    // docs/plan_text_overlay.md §4 P4: text clip は
+                    // event の text 先頭 ~32 文字を clip 上に表示。
+                    // 空テキスト or 非 Text variant なら clip.name (= 作成
+                    // 時のユーザー設定名) を fallback。
+                    name: text_clip_label(c, &app.song.clip_contents)
+                        .map(Arc::from)
+                        .unwrap_or_else(|| Arc::from(c.name.as_str())),
                     color: None,
                     // gui_01 #019 (M14 Phase 63e): refcount >= 2 (= 共有 clip)
                     // のときだけ Some(hue)。 widget が hue + style.share_group_S/L
@@ -1422,6 +1429,31 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
 fn content_id_to_hue(content_id: common::model::ContentId) -> f32 {
     const GOLDEN_RATIO_CONJUGATE: f32 = 0.618_034;
     (content_id as f32 * GOLDEN_RATIO_CONJUGATE).fract()
+}
+
+/// docs/plan_text_overlay.md §4 P4: text clip の widget display label。
+/// `Text` variant のとき first event の `text` を 32 文字 cap で返す
+/// (= 1 行で読める長さ)。 非 Text variant / 空文字 / event 無しは `None`。
+/// 戻り値が `Some` なら caller は `clip.name` を上書きしてユーザーに
+/// 「実際に何の text が出るか」 を見せる。
+fn text_clip_label(
+    clip: &common::model::Clip,
+    contents: &std::collections::HashMap<common::model::ContentId, common::model::ClipContent>,
+) -> Option<String> {
+    let events = contents.get(&clip.content_id)?.text_events()?;
+    let ev = events.first()?;
+    if ev.text.is_empty() {
+        return None;
+    }
+    const MAX_CHARS: usize = 32;
+    let total = ev.text.chars().count();
+    if total <= MAX_CHARS {
+        Some(ev.text.clone())
+    } else {
+        let mut head: String = ev.text.chars().take(MAX_CHARS).collect();
+        head.push('…');
+        Some(head)
+    }
 }
 
 /// gui_01 #028 (M14 Phase 63n-1): `Track.automation_lanes` を widget が
