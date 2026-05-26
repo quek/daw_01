@@ -931,13 +931,12 @@ fn sample_buffer_to_bgra(
 /// HW sample's D3D11 texture into the per-source DXGI-shared
 /// destination texture, returning its stable NT handle.
 ///
-/// On first call for a `ReaderEntry`, allocates the shared
-/// destination (`SHARED_NTHANDLE + SHARED_KEYEDMUTEX`,
-/// `B8G8R8A8_UNORM` to match WMF's `MFVideoFormat_ARGB32` output =
-/// byte-identical 32-bit BGRA layout) + caches its `IDXGIKeyedMutex`
-/// + creates the NT handle via `IDXGIResource1::CreateSharedHandle`.
-/// The handle is stable so the main thread imports it into wgpu
-/// exactly once.
+/// On first call for a `ReaderEntry`, allocates the shared destination
+/// (`SHARED_NTHANDLE + SHARED_KEYEDMUTEX`, `B8G8R8A8_UNORM` to match
+/// WMF's `MFVideoFormat_ARGB32` output = byte-identical 32-bit BGRA
+/// layout), caches its `IDXGIKeyedMutex`, and creates the NT handle
+/// via `IDXGIResource1::CreateSharedHandle`. The handle is stable so
+/// the main thread imports it into wgpu exactly once.
 ///
 /// Keyed-mutex protocol: worker `AcquireSync(0, INFINITE)` →
 /// `CopySubresourceRegion` → `ReleaseSync(0)`. **The matching half is

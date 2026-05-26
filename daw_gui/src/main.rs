@@ -16,13 +16,19 @@ use daw_gui::dispatcher::{Win32JobDispatcher, WinitDispatcher};
 use daw_gui::script::run_scripted;
 use daw_gui::view::runner::{RunnerInit, run as run_runner};
 
-/// CLI 引数。 GUI mode の場合は `script` / `output` ともに `None`。
+/// CLI 引数。 GUI mode の場合は `script` / `output` / `smoke_test` ともに `None`。
 struct CliArgs {
     script: Option<PathBuf>,
     output: Option<PathBuf>,
     /// Free-form `--arg KEY=VALUE` pairs. Exposed to JS as
     /// `daw.scriptArgs[key]` so test scripts can take parameters.
     extra: Vec<(String, String)>,
+    /// `--smoke-test <fixture.mp4>` の path。 Some の時は通常 GUI を起動
+    /// しつつ background で [`daw_gui::smoke_test::spawn_orchestrator`] が
+    /// programmatic に fixture を import → play → preview window capture →
+    /// pixel histogram assertion → process::exit(0/1) する。
+    /// `--script` とは相互排他。
+    smoke_test: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<CliArgs> {
@@ -30,6 +36,7 @@ fn parse_args() -> Result<CliArgs> {
     let mut script: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut extra: Vec<(String, String)> = Vec::new();
+    let mut smoke_test: Option<PathBuf> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -57,9 +64,17 @@ fn parse_args() -> Result<CliArgs> {
                     .ok_or_else(|| anyhow::anyhow!("--arg requires KEY=VALUE form (got {v:?})"))?;
                 extra.push((k.to_string(), val.to_string()));
             }
+            "--smoke-test" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--smoke-test needs a path"))?;
+                smoke_test = Some(PathBuf::from(v));
+            }
             "--help" | "-h" => {
                 println!(
-                    "daw_gui [--script <path.js>] [--output <path.wav>] [--arg KEY=VALUE]..."
+                    "daw_gui [--script <path.js>] [--output <path.wav>] [--arg KEY=VALUE]... \
+                     [--smoke-test <fixture.mp4>]"
                 );
                 std::process::exit(0);
             }
@@ -69,10 +84,14 @@ fn parse_args() -> Result<CliArgs> {
         }
         i += 1;
     }
+    if script.is_some() && smoke_test.is_some() {
+        anyhow::bail!("--script and --smoke-test are mutually exclusive");
+    }
     Ok(CliArgs {
         script,
         output,
         extra,
+        smoke_test,
     })
 }
 
@@ -88,10 +107,10 @@ fn main() -> Result<()> {
         return run_scripted(bootstrap, script_path, cli.output.as_deref(), &cli.extra);
     }
 
-    run_gui(bootstrap)
+    run_gui(bootstrap, cli.smoke_test)
 }
 
-fn run_gui(mut bootstrap: Bootstrap) -> Result<()> {
+fn run_gui(mut bootstrap: Bootstrap, smoke_test_fixture: Option<PathBuf>) -> Result<()> {
     tracing::info!("opening main window");
 
     // GUI mode で必要な channel/handle を `Bootstrap` から取り出す。
@@ -132,6 +151,20 @@ fn run_gui(mut bootstrap: Bootstrap) -> Result<()> {
             spawn_autosave_timer(proxy.clone());
             spawn_midi_input(proxy.clone());
             spawn_incoming_bridge(incoming_rx, proxy.clone(), audio_tx_for_bridge);
+
+            // `--smoke-test <fixture>` → background orchestrator drives
+            // ImportVideo / TogglePreviewWindow / Play via the same
+            // proxy and runs a pixel-histogram assertion against the
+            // preview window. Process exits with 0 (pass) / 1 (fail)
+            // when the orchestrator finishes — see `smoke_test.rs`.
+            #[cfg(windows)]
+            if let Some(fixture) = smoke_test_fixture {
+                tracing::info!(
+                    fixture = %fixture.display(),
+                    "smoke test mode — orchestrator will exit the process on completion"
+                );
+                daw_gui::smoke_test::spawn_orchestrator(fixture, proxy.clone());
+            }
 
             app
         }),

@@ -208,6 +208,31 @@ FFI 境界 (= D3D11 / wgpu / CLAP / cpal / windows API) のコードを「**自�
 
 詳細: `~/.claude/projects/F--dev-daw-01/memory/feedback_no_dead_judgment_at_ffi.md`
 
+## Visual regression smoke test
+
+video preview の暗転 / 全 pixel 透過 / 一様 fill 等の **visual regression** は
+`cargo build` / `cargo test` / `cargo clippy` 全 pass でもすり抜ける (= 実例:
+`c2ae697` は build/test/clippy clean なのに preview を fully-transparent quad
+にした、 6-7 時間費やして発覚)。 これを 1 コマンドで catch するために
+`daw_gui --smoke-test <fixture.mp4>` を導入。
+
+```bash
+cargo run -p daw_gui -- --smoke-test daw_gui/tests/fixtures/smoke_test.mp4
+# exit 0 = preview rendered visible content (= healthy ~20 000 unique colors)
+# exit 1 = preview blank / uniform / transparent (= unique_colors < 1000)
+```
+
+仕組み:
+1. background thread が programmatic に `ImportVideo` → `TogglePreviewWindow`
+   → `Play` を発火、 1.5s 再生
+2. preview window の client area を Win32 `PrintWindow(PW_RENDERFULLCONTENT)`
+   で pixel capture
+3. histogram 解析: unique RGB ≥ 1000 / black pixels ≤ 95%、 を assertion
+4. 結果を `std::process::exit(0 or 1)` で返す
+
+video preview / texture sampling / shared-handle 周りに触れる変更は **必ず
+commit 前にこれを通す**。 詳細は `daw_gui/src/smoke_test.rs`。
+
 ## Debugging Methodology
 
 - **実データから始める**: コードパス推論より実データ観察が速い

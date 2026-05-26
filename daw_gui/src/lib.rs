@@ -27,5 +27,7 @@ pub mod job;
 pub mod midi;
 pub mod midi_export;
 pub mod script;
+#[cfg(windows)]
+pub mod smoke_test;
 pub mod subprocess;
 pub mod view;
