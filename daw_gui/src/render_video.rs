@@ -27,8 +27,10 @@ use std::collections::HashMap;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use common::model::{ImageSourceId, Song, VideoSourceId, VideoSourcePath};
-use daw_ui_renderer::{OffscreenRenderer, Rect, Scene, TextureHandle, TexturedQuad};
+use common::model::{ImageSourceId, Song, TextAlign, VideoSourceId, VideoSourcePath};
+use daw_ui_renderer::{
+    Color, GlyphArea, OffscreenRenderer, Rect, Scene, TextureHandle, TexturedQuad,
+};
 use windows::Win32::Media::MediaFoundation::{
     IMFSinkWriter, MFAudioFormat_AAC, MFAudioFormat_Float, MFCreateMediaType,
     MFCreateMemoryBuffer, MFCreateSample, MFCreateSinkWriterFromURL, MFMediaType_Audio,
@@ -552,6 +554,67 @@ fn build_frame_scene(
             uv_min: (0.0, 0.0),
             uv_max: (1.0, 1.0),
             clip_rect: None,
+            rotation_radians: layer.rotation_radians,
+        });
+    }
+
+    // docs/plan_text_overlay.md §4 P3: text overlays on top of every
+    // video / image layer. Canvas size = project resolution so
+    // `font_size_px` / `outline_width_px` / `shadow_*` map 1:1 to
+    // output px (= scale = 1.0). Horizontal alignment is approximated
+    // via `font_size * char_count * 0.55`; same MVP estimate as the
+    // preview path.
+    let text_layers =
+        crate::text_compose::active_text_sources_at(song, playhead_beat);
+    for layer in text_layers {
+        if layer.alpha <= 0.0 || layer.text.is_empty() {
+            continue;
+        }
+        let rx = layer.x * out_w as f32;
+        let ry = layer.y * out_h as f32;
+        let rw = (layer.w * out_w as f32).max(0.0);
+        let rh = (layer.h * out_h as f32).max(0.0);
+        let font_size = layer.font_size_px.max(1.0);
+        let line_height = font_size * 1.2;
+        let approx_text_w =
+            font_size * layer.text.chars().count() as f32 * 0.55;
+        let left = match layer.align {
+            TextAlign::Left => rx,
+            TextAlign::Center => rx + (rw - approx_text_w) * 0.5,
+            TextAlign::Right => rx + rw - approx_text_w,
+        };
+        let top = ry + (rh - line_height) * 0.5;
+        let fill = Color::rgba(
+            layer.fill_color[0],
+            layer.fill_color[1],
+            layer.fill_color[2],
+            layer.fill_color[3] * layer.alpha,
+        );
+        let outline = Color::rgba(
+            layer.outline_color[0],
+            layer.outline_color[1],
+            layer.outline_color[2],
+            layer.outline_color[3] * layer.alpha,
+        );
+        let shadow = Color::rgba(
+            layer.shadow_color[0],
+            layer.shadow_color[1],
+            layer.shadow_color[2],
+            layer.shadow_color[3] * layer.alpha,
+        );
+        scene.push_text(GlyphArea {
+            text: layer.text.clone().into(),
+            left,
+            top,
+            font_size,
+            line_height,
+            color: fill,
+            clip_rect: None,
+            outline_color: outline,
+            outline_width_px: layer.outline_width_px,
+            shadow_color: shadow,
+            shadow_offset_px: layer.shadow_offset_px,
+            shadow_blur_px: layer.shadow_blur_px,
             rotation_radians: layer.rotation_radians,
         });
     }

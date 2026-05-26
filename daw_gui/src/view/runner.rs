@@ -991,16 +991,13 @@ impl Runner {
 
         let Some(playhead_beat) = state.app.playhead_beat.map(f64::from) else {
             preview.set_composite_layers(Vec::new());
+            preview.set_text_layers(Vec::new());
             return;
         };
         let active = crate::video_playback::VideoPlaybackEngine::active_sources_at(
             &state.app.song,
             playhead_beat,
         );
-        if active.is_empty() {
-            preview.set_composite_layers(Vec::new());
-            return;
-        }
         let project_dir = state
             .app
             .file_path
@@ -1011,34 +1008,34 @@ impl Runner {
         // from the project framerate; the worker decodes
         // `PREVIEW_RING_SIZE` consecutive frames at
         // `center + i * step` and writes each into an independent
-        // `SharedPool` slot.
-        let step_micros = {
-            let fps = state.app.song.video_framerate.max(1.0) as f64;
-            (1_000_000.0 / fps).round() as u64
-        };
-
-        // Step 3: enqueue a ring decode for each active source. The
-        // worker coalesces multiple requests for the same source —
-        // only the latest center wins.
-        for frame_info in &active {
-            let Some(abs_path) = resolve_video_path(
-                &state.app.song,
-                frame_info.video_source_id,
-                project_dir.as_deref(),
-            ) else {
-                tracing::warn!(
-                    video_source_id = frame_info.video_source_id,
-                    "video path unresolved (unsaved project + ProjectRelative?), \
-                     skipping layer"
-                );
-                continue;
+        // `SharedPool` slot. Skipped when no video is active (= the
+        // worker has nothing to decode), so an image-only / text-only
+        // project doesn't request empty ring decodes.
+        if !active.is_empty() {
+            let step_micros = {
+                let fps = state.app.song.video_framerate.max(1.0) as f64;
+                (1_000_000.0 / fps).round() as u64
             };
-            state.playback_worker.request(
-                frame_info.video_source_id,
-                abs_path,
-                frame_info.source_micros,
-                step_micros,
-            );
+            for frame_info in &active {
+                let Some(abs_path) = resolve_video_path(
+                    &state.app.song,
+                    frame_info.video_source_id,
+                    project_dir.as_deref(),
+                ) else {
+                    tracing::warn!(
+                        video_source_id = frame_info.video_source_id,
+                        "video path unresolved (unsaved project + ProjectRelative?), \
+                         skipping layer"
+                    );
+                    continue;
+                };
+                state.playback_worker.request(
+                    frame_info.video_source_id,
+                    abs_path,
+                    frame_info.source_micros,
+                    step_micros,
+                );
+            }
         }
 
         // Step 4: build composite layers by picking the cached ring
@@ -1131,6 +1128,16 @@ impl Runner {
         // image-on-top convention covers the MV-overlay use case.
         let _ = ();
         preview.set_composite_layers(layers);
+        // docs/plan_text_overlay.md §4 P3: text overlay layers are
+        // resolved independently (= no GPU texture, just font / color
+        // / rect metadata) and rendered on top of every textured-quad
+        // layer. The runner gathers them per frame so lane automation
+        // tracks the playhead in real time.
+        let text_frames = crate::text_compose::active_text_sources_at(
+            &state.app.song,
+            playhead_beat,
+        );
+        preview.set_text_layers(text_frames);
         // PiP rect の normalized 座標は project_resolution の letterbox
         // 内で展開される (= window resize しても画像 aspect が崩れない)。
         // Song.video_resolution を毎 frame 同期。

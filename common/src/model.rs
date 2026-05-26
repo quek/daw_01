@@ -1346,6 +1346,31 @@ impl ClipContent {
             | ClipContent::Text(_) => None,
         }
     }
+
+    /// Borrow the text events slice if this is a `Text` variant.
+    /// v16 (`docs/plan_text_overlay.md` §2.2).
+    pub fn text_events(&self) -> Option<&[TextEvent]> {
+        match self {
+            ClipContent::Text(t) => Some(t.events.as_slice()),
+            ClipContent::Midi(_)
+            | ClipContent::Audio(_)
+            | ClipContent::Automation(_)
+            | ClipContent::Video(_)
+            | ClipContent::Image(_) => None,
+        }
+    }
+
+    /// Mutably borrow the events vec for a `Text` variant. v16.
+    pub fn text_events_mut(&mut self) -> Option<&mut Vec<TextEvent>> {
+        match self {
+            ClipContent::Text(t) => Some(&mut t.events),
+            ClipContent::Midi(_)
+            | ClipContent::Audio(_)
+            | ClipContent::Automation(_)
+            | ClipContent::Video(_)
+            | ClipContent::Image(_) => None,
+        }
+    }
 }
 
 /// MIDI clip content — a bag of notes positioned in clip-local beats.

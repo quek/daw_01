@@ -17,6 +17,7 @@ pub mod dispatcher;
 pub mod image_compose;
 pub mod import_audio;
 pub mod import_image;
+pub mod text_compose;
 #[cfg(windows)]
 pub mod import_video;
 #[cfg(windows)]

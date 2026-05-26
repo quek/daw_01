@@ -67,6 +67,12 @@ pub struct PreviewWindowState {
     /// every frame and refilled by the runner before
     /// `render_placeholder`. Empty = the placeholder text appears.
     pub composite_layers: Vec<CompositeLayer>,
+    /// docs/plan_text_overlay.md §4 P3: text overlay layers, drawn on
+    /// top of every `composite_layers` entry. Built each frame by the
+    /// runner from `text_compose::active_text_sources_at` and pushed
+    /// via `gui_01` `Scene::push_text` (= the GlyphArea pipeline
+    /// composites outline + shadow + rotation internally, Phase 78).
+    pub text_layers: Vec<crate::text_compose::ActiveTextFrame>,
     /// `docs/plan_image_automation.md` §5 / `plan_image_overlay.md` §4
     /// P5: 選択中 image event の PiP rect (normalized 0..=1)。 `Some`
     /// なら render pass が縁取り + 4 corner handle + center handle を
@@ -160,6 +166,7 @@ impl PreviewWindowState {
             frame_textures: std::collections::HashMap::new(),
             image_textures: std::collections::HashMap::new(),
             composite_layers: Vec::new(),
+            text_layers: Vec::new(),
             selection_overlay: None,
             selection_rotation_radians: 0.0,
             // 初期値は scale_to_fit_on_screen に渡された initial_size。
@@ -323,6 +330,7 @@ impl PreviewWindowState {
             self.renderer.destroy_texture(h);
         }
         self.composite_layers.clear();
+        self.text_layers.clear();
     }
 
     /// Refresh the per-frame composite layer list. Called by the
@@ -332,6 +340,16 @@ impl PreviewWindowState {
     /// shows stale content.
     pub fn set_composite_layers(&mut self, layers: Vec<CompositeLayer>) {
         self.composite_layers = layers;
+    }
+
+    /// Refresh the per-frame text overlay list. Called alongside
+    /// `set_composite_layers` from the runner. Text is rendered on top
+    /// of every textured-quad layer (= MV title / 字幕 / credits 用途)。
+    pub fn set_text_layers(
+        &mut self,
+        layers: Vec<crate::text_compose::ActiveTextFrame>,
+    ) {
+        self.text_layers = layers;
     }
 
     /// `winit::WindowId` for routing `WindowEvent`s in the runner.
@@ -374,31 +392,33 @@ impl PreviewWindowState {
             clip_rect: None,
         });
 
-        if self.composite_layers.is_empty() {
-            // No frame available — show the P4 placeholder text so the
-            // user knows the window is alive but waiting on a video
-            // clip / playhead.
+        // PiP rect / text rect の normalized 0..=1 は「project_resolution
+        // が preview window 内で letterbox 配置された区域」 内の座標として
+        // 扱う。 これで window resize しても画像 aspect ratio は project
+        // 比 (= 動画 letterbox と同じ) に固定される。
+        let project_box = aspect_fit_rect(
+            (screen.width as f32, screen.height as f32),
+            (
+                self.project_resolution.0 as f32,
+                self.project_resolution.1 as f32,
+            ),
+        );
+
+        if self.composite_layers.is_empty() && self.text_layers.is_empty() {
+            // No frame / overlay available — show the P4 placeholder
+            // text so the user knows the window is alive but waiting
+            // on a clip / playhead.
             let text = "Video Preview";
             let approx_w = text.len() as f32 * 9.0;
-            self.scene.push_text(GlyphArea {
-                text: text.into(),
-                left: (screen.width as f32 - approx_w) * 0.5,
-                top: (screen.height as f32 - 16.0) * 0.5,
-                font_size: 16.0,
-                line_height: 20.0,
-                color: Color::rgb(0.65, 0.7, 0.8),
-                clip_rect: None,
-            });
-            self.draw_selection_overlay(screen.width as f32, screen.height as f32);
+            self.scene.push_text(GlyphArea::new(
+                text.into(),
+                (screen.width as f32 - approx_w) * 0.5,
+                (screen.height as f32 - 16.0) * 0.5,
+                16.0,
+                20.0,
+                Color::rgb(0.65, 0.7, 0.8),
+            ));
         } else {
-            // PiP rect の normalized 0..=1 は「project_resolution が preview
-            // window 内で letterbox 配置された区域」 内の座標として扱う。
-            // これで window resize しても画像 aspect ratio は project 比
-            // (= 動画 letterbox と同じ) に固定される。
-            let project_box = aspect_fit_rect(
-                (screen.width as f32, screen.height as f32),
-                (self.project_resolution.0 as f32, self.project_resolution.1 as f32),
-            );
             for layer in &self.composite_layers {
                 if layer.width == 0 || layer.height == 0 || layer.alpha <= 0.0 {
                     continue;
@@ -429,11 +449,93 @@ impl PreviewWindowState {
                     rotation_radians: layer.rotation_radians,
                 });
             }
-            self.draw_selection_overlay(screen.width as f32, screen.height as f32);
+            // docs/plan_text_overlay.md §4 P3: text overlays drawn on
+            // top of every video / image layer (= title / 字幕 / credits
+            // 用途)。 project_box 内の normalized 0..=1 で位置 / size、
+            // project px → screen px scale で font_size / outline / shadow
+            // をスケール。
+            self.push_text_layers(project_box);
         }
+        self.draw_selection_overlay(screen.width as f32, screen.height as f32);
 
         if let Err(e) = self.renderer.render(&self.scene) {
             tracing::error!(error = ?e, "preview render error");
+        }
+    }
+
+    /// docs/plan_text_overlay.md §4 P3: walk `self.text_layers` and
+    /// push one `GlyphArea` per active text overlay. `project_box` is
+    /// the project-resolution letterbox area inside the preview window
+    /// (in screen px), used to expand each text's normalized rect /
+    /// scale its project-px font_size / outline / shadow to screen px.
+    /// Horizontal alignment is approximated via an `font_size *
+    /// char_count * 0.55` glyph-width estimate; precise alignment will
+    /// follow when gui_01 exposes a `Buffer::layout_runs` width API.
+    fn push_text_layers(&mut self, project_box: (f32, f32, f32, f32)) {
+        let scale = if self.project_resolution.0 == 0 {
+            1.0
+        } else {
+            project_box.2 / self.project_resolution.0 as f32
+        };
+        for layer in &self.text_layers {
+            if layer.alpha <= 0.0 || layer.text.is_empty() {
+                continue;
+            }
+            let rx = project_box.0 + layer.x * project_box.2;
+            let ry = project_box.1 + layer.y * project_box.3;
+            let rw = layer.w * project_box.2;
+            let rh = layer.h * project_box.3;
+            let font_size = (layer.font_size_px * scale).max(1.0);
+            let line_height = font_size * 1.2;
+            // Approximate text width for horizontal alignment. Single
+            // line text only (`plan_text_overlay.md` §1.1) so the
+            // char_count * 0.55 estimate (= average glyph advance for
+            // Latin + 1.0 for CJK = average ~0.7 mixed) is close enough
+            // for MVP. P-MVP: ask gui_01 for an exact text width API.
+            let approx_text_w =
+                font_size * layer.text.chars().count() as f32 * 0.55;
+            let left = match layer.align {
+                common::model::TextAlign::Left => rx,
+                common::model::TextAlign::Center => rx + (rw - approx_text_w) * 0.5,
+                common::model::TextAlign::Right => rx + rw - approx_text_w,
+            };
+            let top = ry + (rh - line_height) * 0.5;
+            let fill = Color::rgba(
+                layer.fill_color[0],
+                layer.fill_color[1],
+                layer.fill_color[2],
+                layer.fill_color[3] * layer.alpha,
+            );
+            let outline = Color::rgba(
+                layer.outline_color[0],
+                layer.outline_color[1],
+                layer.outline_color[2],
+                layer.outline_color[3] * layer.alpha,
+            );
+            let shadow = Color::rgba(
+                layer.shadow_color[0],
+                layer.shadow_color[1],
+                layer.shadow_color[2],
+                layer.shadow_color[3] * layer.alpha,
+            );
+            self.scene.push_text(GlyphArea {
+                text: layer.text.clone().into(),
+                left,
+                top,
+                font_size,
+                line_height,
+                color: fill,
+                clip_rect: None,
+                outline_color: outline,
+                outline_width_px: layer.outline_width_px * scale,
+                shadow_color: shadow,
+                shadow_offset_px: (
+                    layer.shadow_offset_px.0 * scale,
+                    layer.shadow_offset_px.1 * scale,
+                ),
+                shadow_blur_px: layer.shadow_blur_px * scale,
+                rotation_radians: layer.rotation_radians,
+            });
         }
     }
 
