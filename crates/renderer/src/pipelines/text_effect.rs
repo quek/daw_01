@@ -126,6 +126,12 @@ fn quantize_q16_signed(px: f32) -> i16 {
 // CachedEffect (cache value)
 // ============================================================
 
+/// glyphon layout buffer cache 1 entry。 `GlyphPipeline.CachedBuffer` と同 idiom。
+struct CachedBuffer {
+    buffer: Buffer,
+    last_seen_frame: u64,
+}
+
 struct CachedEffect {
     /// final composite texture (= TextureStore に登録済の TexturedQuad 用)。
     handle: TextureHandle,
@@ -174,7 +180,10 @@ pub struct TextEffectCompositor {
     atlas: TextAtlas,
     viewport: Viewport,
     renderers: Vec<TextRenderer>,
-    buffer_cache: HashMap<u64, Buffer>,
+    /// text layout buffer cache。 `CachedBuffer` で `last_seen_frame` を持って `end_frame` で
+    /// `EVICT_AFTER_FRAMES` 経過 entry を retain で削除 (= 既存 `GlyphPipeline.cache` と同 idiom、
+    /// 長期セッションで dynamic text 増加に対する memory growth を防ぐ)。
+    buffer_cache: HashMap<u64, CachedBuffer>,
 
     // wgpu blur + composite pipelines
     blur_h_pipeline: wgpu::RenderPipeline,
@@ -595,6 +604,8 @@ impl TextEffectCompositor {
 
     pub fn end_frame(&mut self, texture_store: &mut TextureStore) {
         let frame = self.frame_counter;
+        // composite texture cache eviction (= TextureHandle を destroy する必要があるので
+        // retain でなく remove ループ経由)
         let mut to_remove = Vec::new();
         for (key, entry) in &self.cache {
             if frame.saturating_sub(entry.last_seen_frame) >= EVICT_AFTER_FRAMES {
@@ -606,6 +617,10 @@ impl TextEffectCompositor {
                 texture_store.destroy(entry.handle);
             }
         }
+        // M14 Phase 78 review: glyphon layout buffer cache eviction (= 既存 `GlyphPipeline::end_frame`
+        // と同 idiom、 dynamic text で `buffer_cache` 無制限増加するのを防ぐ)。
+        self.buffer_cache
+            .retain(|_, e| frame.saturating_sub(e.last_seen_frame) < EVICT_AFTER_FRAMES);
     }
 
     // ============================================================
@@ -615,18 +630,20 @@ impl TextEffectCompositor {
     /// glyphon Buffer::layout_runs で text bounding box を取得 (= measure)。
     fn measure_text(&mut self, font_system: &mut FontSystem, area: &GlyphArea) -> (f32, f32) {
         let key = buffer_cache_key(area);
-        let buffer = self.buffer_cache.entry(key).or_insert_with(|| {
+        let frame = self.frame_counter;
+        let cached = self.buffer_cache.entry(key).or_insert_with(|| {
             let metrics = Metrics::new(area.font_size.max(1.0), area.line_height.max(1.0));
             let mut buf = Buffer::new(font_system, metrics);
             buf.set_size(font_system, None, None); // no wrap
             let attrs = Attrs::new().family(Family::Name(DEFAULT_FONT_FAMILY));
             buf.set_text(font_system, &area.text, &attrs, Shaping::Advanced, None);
             buf.shape_until_scroll(font_system, false);
-            buf
+            CachedBuffer { buffer: buf, last_seen_frame: frame }
         });
+        cached.last_seen_frame = frame;
         let mut max_w: f32 = 0.0;
         let mut total_h: f32 = 0.0;
-        for run in buffer.layout_runs() {
+        for run in cached.buffer.layout_runs() {
             if run.line_w > max_w {
                 max_w = run.line_w;
             }
@@ -672,10 +689,11 @@ impl TextEffectCompositor {
         // buffer cache key 同じ (measure 時に確保済)
         let key = buffer_cache_key(area);
         // measure を呼ばずに直接 get (なければ panic — 直前に measure_text 呼ばれてる前提)
-        let buffer = self
+        let buffer = &self
             .buffer_cache
             .get(&key)
-            .expect("buffer cache must be primed by measure_text");
+            .expect("buffer cache must be primed by measure_text")
+            .buffer;
 
         let text_area = TextArea {
             buffer,
