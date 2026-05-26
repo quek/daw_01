@@ -837,6 +837,209 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         y += input_h + 12.0;
     }
 
+    // ---- Text Event section (`docs/plan_text_overlay.md` §4 P5) -------
+    // selected_clip が `ClipContent::Text` のとき、 first event の
+    // text 内容 / font / font_size / opacity / mute を MVP UI で expose。
+    // outline / shadow / x/y/w/h/rotation は preview drag + automation
+    // lane で代替可能、 follow-up phase で inspector に追加予定。
+    if let Some(summary) = app.inspector_text_event_summary() {
+        if app.clip_edit_buffer_target != Some(summary.target) {
+            let target = summary.target;
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ResyncClipTextEditBuffers(target));
+            }));
+        }
+
+        ui.label_at(
+            "inspector_text_event_label",
+            "Text Event",
+            area.x + pad,
+            y,
+            12.0,
+            TEXT_DIM,
+        );
+        y += 18.0;
+
+        let row_w = area.w - pad * 2.0;
+        let input_h = 22.0;
+        let label_w = 60.0;
+        let auto_btn_w = 22.0;
+        let auto_btn_gap = 4.0;
+        let input_x = area.x + pad + label_w;
+        let numeric_input_w = row_w - label_w - auto_btn_w - auto_btn_gap;
+        let string_input_w = row_w - label_w;
+        let auto_btn_x = input_x + numeric_input_w + auto_btn_gap;
+
+        // Mute toggle
+        let toggle_h = 24.0;
+        let target_mute = summary.target;
+        let new_mute = !summary.muted;
+        ui.toggle_button_at(
+            "inspector_text_mute",
+            "Mute",
+            Rect { x: area.x + pad, y, w: row_w, h: toggle_h },
+            summary.muted,
+            &TOGGLE_AUDIO_BASE,
+            move |_| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetClipTextMuted {
+                        target: target_mute,
+                        muted: new_mute,
+                    })
+                })
+            },
+        );
+        y += toggle_h + 8.0;
+
+        // Text content (single-line, Enter で commit)
+        ui.label_at(
+            "inspector_text_content_label",
+            "Text",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT_DIM,
+        );
+        let text_resp = ui.text_input_at(
+            "inspector_text_content_input",
+            Rect { x: input_x, y, w: string_input_w, h: input_h },
+            &app.clip_text_content_edit_text,
+            |s| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ClipTextContentEditChanged(s))
+                })
+            },
+        );
+        if text_resp.committed {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CommitClipTextContentEdit)
+            }));
+        }
+        y += input_h + 4.0;
+
+        // Font family (system font name; "" = renderer default)
+        ui.label_at(
+            "inspector_text_font_label",
+            "Font",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT_DIM,
+        );
+        let font_resp = ui.text_input_at(
+            "inspector_text_font_input",
+            Rect { x: input_x, y, w: string_input_w, h: input_h },
+            &app.clip_text_font_family_edit_text,
+            |s| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ClipTextFontFamilyEditChanged(s))
+                })
+            },
+        );
+        if font_resp.committed {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CommitClipTextFontFamilyEdit)
+            }));
+        }
+        y += input_h + 4.0;
+
+        // Font size (project resolution 基準 px) + automate
+        ui.label_at(
+            "inspector_text_size_label",
+            "Size (px)",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT_DIM,
+        );
+        let size_resp = ui.text_input_at(
+            "inspector_text_size_input",
+            Rect { x: input_x, y, w: numeric_input_w, h: input_h },
+            &app.clip_text_font_size_edit_text,
+            |s| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ClipTextFontSizeEditChanged(s))
+                })
+            },
+        );
+        if size_resp.committed {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CommitClipTextFontSizeEdit)
+            }));
+        }
+        let size_auto_on = summary.font_size_automated;
+        ui.toggle_button_at(
+            "inspector_text_size_automate",
+            "A",
+            Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
+            size_auto_on,
+            &TOGGLE_IMAGE_AUTOMATE,
+            move |_| {
+                Edit::mutate(move |app: &mut AppData| {
+                    let ev = if size_auto_on {
+                        AppEvent::RemoveTextAutomationLane {
+                            field: common::model::TextBuiltinParam::FontSize,
+                        }
+                    } else {
+                        AppEvent::AddTextAutomationLane {
+                            field: common::model::TextBuiltinParam::FontSize,
+                        }
+                    };
+                    app.handle_event(ev);
+                })
+            },
+        );
+        y += input_h + 4.0;
+
+        // Opacity (0..=1) + automate
+        ui.label_at(
+            "inspector_text_opacity_label",
+            "Opacity",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT_DIM,
+        );
+        let opacity_resp = ui.text_input_at(
+            "inspector_text_opacity_input",
+            Rect { x: input_x, y, w: numeric_input_w, h: input_h },
+            &app.clip_text_opacity_edit_text,
+            |s| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ClipTextOpacityEditChanged(s))
+                })
+            },
+        );
+        if opacity_resp.committed {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CommitClipTextOpacityEdit)
+            }));
+        }
+        let opacity_auto_on = summary.opacity_automated;
+        ui.toggle_button_at(
+            "inspector_text_opacity_automate",
+            "A",
+            Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
+            opacity_auto_on,
+            &TOGGLE_IMAGE_AUTOMATE,
+            move |_| {
+                Edit::mutate(move |app: &mut AppData| {
+                    let ev = if opacity_auto_on {
+                        AppEvent::RemoveTextAutomationLane {
+                            field: common::model::TextBuiltinParam::Opacity,
+                        }
+                    } else {
+                        AppEvent::AddTextAutomationLane {
+                            field: common::model::TextBuiltinParam::Opacity,
+                        }
+                    };
+                    app.handle_event(ev);
+                })
+            },
+        );
+        y += input_h + 12.0;
+    }
+
     // Vocal source 編集 (Vocal track のときのみ)
     if let Some(track) = app.song.tracks.get(app.cursor_track_index().unwrap_or(0))
         && let common::model::InstrumentSource::Vocal { speaker_id, .. } = &track.source

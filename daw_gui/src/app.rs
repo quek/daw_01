@@ -158,6 +158,19 @@ pub struct InspectorImageEventSummary {
     pub rotation_automated: bool,
 }
 
+/// docs/plan_text_overlay.md §4 P5: text inspector の read snapshot
+/// (= image idiom)。 `selected_clip` が `ClipContent::Text` を指していて
+/// 中に 1 event 以上あれば `inspector_text_event_summary()` が `Some` を
+/// 返す。 MVP scope (= Mute + Text + Font + FontSize + Opacity) なので
+/// `_automated` は font_size / opacity のみ snapshot。
+#[derive(Debug, Clone, Copy)]
+pub struct InspectorTextEventSummary {
+    pub target: ClipRef,
+    pub muted: bool,
+    pub font_size_automated: bool,
+    pub opacity_automated: bool,
+}
+
 /// Per-plugin sidechain wiring entry shown in the inspector. One row per
 /// chain plugin (MIDI FX / Instrument / Fx); the `current_source` field
 /// is the value of `PluginInstance::sidechain_sources[0]` (port 0; the
@@ -805,6 +818,19 @@ pub struct AppData {
     /// で書き戻し。
     pub clip_image_rotation_edit_text: String,
 
+    /// docs/plan_text_overlay.md §4 P5: text inspector の edit buffer 群
+    /// (= image idiom)。 Enter / focus 喪失で `CommitClip*Edit` event を
+    /// 発火し、 TextEvent.field を直接書く。 lane override 経由でも同様。
+    /// MVP scope: text content / font_family / font_size_px / opacity の
+    /// 4 field (= 最も visual impact が大きい部分)。 outline / shadow /
+    /// rotation / x/y/w/h は preview drag + automation lane で代替可能。
+    pub clip_text_content_edit_text: String,
+    pub clip_text_font_family_edit_text: String,
+    /// `TextEvent.font_size_px` 入力欄の編集中文字列 (`{:.1}` px)。
+    pub clip_text_font_size_edit_text: String,
+    /// `TextEvent.opacity` 入力欄の編集中文字列 (`{:.3}`、 0.0..=1.0)。
+    pub clip_text_opacity_edit_text: String,
+
     pub undo_stack: VecDeque<Song>,
     pub redo_stack: VecDeque<Song>,
 
@@ -1030,6 +1056,10 @@ impl AppData {
             clip_pitch_edit_text: String::new(),
             clip_fade_in_edit_text: String::new(),
             clip_fade_out_edit_text: String::new(),
+            clip_text_content_edit_text: String::new(),
+            clip_text_font_family_edit_text: String::new(),
+            clip_text_font_size_edit_text: String::new(),
+            clip_text_opacity_edit_text: String::new(),
             clip_image_x_edit_text: String::new(),
             clip_image_y_edit_text: String::new(),
             clip_image_w_edit_text: String::new(),
@@ -1681,6 +1711,11 @@ impl AppData {
                 | AppEvent::CommitClipImageRotationEdit
                 | AppEvent::BeginImagePiPDrag
                 | AppEvent::BeginTextPiPDrag
+                | AppEvent::CommitClipTextContentEdit
+                | AppEvent::CommitClipTextFontFamilyEdit
+                | AppEvent::CommitClipTextFontSizeEdit
+                | AppEvent::CommitClipTextOpacityEdit
+                | AppEvent::SetClipTextMuted { .. }
                 // EndImagePiPDrag は非 undoable (begin 側に snapshot あり)
                 // 注: SetClipImage{X,Y,W,H,Opacity} は preview drag で
                 // 毎フレーム発火するので非 undoable。 drag begin の
@@ -2357,6 +2392,31 @@ pub enum AppEvent {
     /// non-undoable。
     BeginTextPiPDrag,
     EndTextPiPDrag,
+
+    /// docs/plan_text_overlay.md §4 P5: text inspector の編集パス。
+    /// SetClip* は直接 TextEvent.field を書く (= 即時反映、 lane override
+    /// 経由でも同様)。 `*EditChanged(s)` は text_input の typing buffer
+    /// 更新、 `Commit*` で parse して Set* を発火する (= image idiom)。
+    SetClipTextMuted { target: ClipRef, muted: bool },
+    SetClipTextContent { target: ClipRef, value: String },
+    SetClipTextFontFamily { target: ClipRef, value: String },
+    SetClipTextFontSize { target: ClipRef, value: f32 },
+    SetClipTextOpacity { target: ClipRef, value: f32 },
+
+    ClipTextContentEditChanged(String),
+    ClipTextFontFamilyEditChanged(String),
+    ClipTextFontSizeEditChanged(String),
+    ClipTextOpacityEditChanged(String),
+
+    CommitClipTextContentEdit,
+    CommitClipTextFontFamilyEdit,
+    CommitClipTextFontSizeEdit,
+    CommitClipTextOpacityEdit,
+
+    /// 選択中 text clip の `TextEvent` 現値から edit buffer 群を再生成。
+    /// inspector が clip 切替 / Undo / Redo / lane override の効果を反映
+    /// するときに呼ぶ (= image idiom)。
+    ResyncClipTextEditBuffers(ClipRef),
     /// Phase 4 (`docs/plan_automation.md` §6): automation recording mode の
     /// transport 4 way toggle。 session-only / Undo 対象外。
     SetRecordingMode(common::model::RecordingMode),
@@ -4017,6 +4077,48 @@ impl AppData {
             }
             AppEvent::EndTextPiPDrag => {
                 self.end_text_pip_drag_recording();
+            }
+            AppEvent::SetClipTextMuted { target, muted } => {
+                self.set_clip_text_event_muted(target, muted);
+            }
+            AppEvent::SetClipTextContent { target, value } => {
+                self.set_clip_text_event_content(target, value);
+            }
+            AppEvent::SetClipTextFontFamily { target, value } => {
+                self.set_clip_text_event_font_family(target, value);
+            }
+            AppEvent::SetClipTextFontSize { target, value } => {
+                self.set_clip_text_event_font_size(target, value);
+            }
+            AppEvent::SetClipTextOpacity { target, value } => {
+                self.set_clip_text_event_opacity(target, value);
+            }
+            AppEvent::ClipTextContentEditChanged(s) => {
+                self.clip_text_content_edit_text = s;
+            }
+            AppEvent::ClipTextFontFamilyEditChanged(s) => {
+                self.clip_text_font_family_edit_text = s;
+            }
+            AppEvent::ClipTextFontSizeEditChanged(s) => {
+                self.clip_text_font_size_edit_text = s;
+            }
+            AppEvent::ClipTextOpacityEditChanged(s) => {
+                self.clip_text_opacity_edit_text = s;
+            }
+            AppEvent::CommitClipTextContentEdit => {
+                self.commit_clip_text_content_edit();
+            }
+            AppEvent::CommitClipTextFontFamilyEdit => {
+                self.commit_clip_text_font_family_edit();
+            }
+            AppEvent::CommitClipTextFontSizeEdit => {
+                self.commit_clip_text_font_size_edit();
+            }
+            AppEvent::CommitClipTextOpacityEdit => {
+                self.commit_clip_text_opacity_edit();
+            }
+            AppEvent::ResyncClipTextEditBuffers(target) => {
+                self.resync_clip_text_event_edit_buffers(target);
             }
             AppEvent::AutoFadeSelectedClips => {
                 self.auto_fade_selected_clips();
@@ -9037,6 +9139,137 @@ impl AppData {
         let wrapped =
             ((value + std::f32::consts::PI).rem_euclid(two_pi)) - std::f32::consts::PI;
         self.mutate_text_events_in_clip(target, |e| e.rotation_radians = wrapped);
+    }
+
+    fn set_clip_text_event_muted(&mut self, target: ClipRef, muted: bool) {
+        self.mutate_text_events_in_clip(target, |e| e.muted = muted);
+    }
+
+    fn set_clip_text_event_content(&mut self, target: ClipRef, value: String) {
+        // 単一行 text のみ (`plan_text_overlay.md` §1.1)、 '\n' は除外。
+        let value = value.replace(['\n', '\r'], " ");
+        self.mutate_text_events_in_clip(target, |e| e.text = value.clone());
+        self.resync_clip_text_event_edit_buffers(target);
+    }
+
+    fn set_clip_text_event_font_family(&mut self, target: ClipRef, value: String) {
+        self.mutate_text_events_in_clip(target, |e| e.font_family = value.clone());
+        self.resync_clip_text_event_edit_buffers(target);
+    }
+
+    fn set_clip_text_event_font_size(&mut self, target: ClipRef, value: f32) {
+        // 1 px 未満は読めない / レンダー pipeline で 0 div risk。
+        let value = value.max(1.0);
+        self.mutate_text_events_in_clip(target, |e| e.font_size_px = value);
+        self.resync_clip_text_event_edit_buffers(target);
+    }
+
+    fn set_clip_text_event_opacity(&mut self, target: ClipRef, value: f32) {
+        let value = value.clamp(0.0, 1.0);
+        self.mutate_text_events_in_clip(target, |e| e.opacity = value);
+        self.resync_clip_text_event_edit_buffers(target);
+    }
+
+    fn commit_clip_text_content_edit(&mut self) {
+        let Some(target) = self.selected_clip else {
+            return;
+        };
+        let value = self.clip_text_content_edit_text.clone();
+        self.set_clip_text_event_content(target, value);
+    }
+
+    fn commit_clip_text_font_family_edit(&mut self) {
+        let Some(target) = self.selected_clip else {
+            return;
+        };
+        let value = self.clip_text_font_family_edit_text.clone();
+        self.set_clip_text_event_font_family(target, value);
+    }
+
+    fn commit_clip_text_font_size_edit(&mut self) {
+        let Some(target) = self.selected_clip else {
+            return;
+        };
+        let Ok(parsed) = self.clip_text_font_size_edit_text.trim().parse::<f32>() else {
+            self.resync_clip_text_event_edit_buffers(target);
+            return;
+        };
+        self.set_clip_text_event_font_size(target, parsed);
+    }
+
+    fn commit_clip_text_opacity_edit(&mut self) {
+        let Some(target) = self.selected_clip else {
+            return;
+        };
+        let Ok(parsed) = self.clip_text_opacity_edit_text.trim().parse::<f32>() else {
+            self.resync_clip_text_event_edit_buffers(target);
+            return;
+        };
+        self.set_clip_text_event_opacity(target, parsed);
+    }
+
+    /// docs/plan_text_overlay.md §4 P5: clip 切替 / Undo / Redo 等で
+    /// edit buffer の内容を current TextEvent から再生成。 target が
+    /// Text variant でないなら buffer をクリア + `clip_edit_buffer_target`
+    /// を `None` 化 (= image inspector と同 idiom)。
+    fn resync_clip_text_event_edit_buffers(&mut self, target: ClipRef) {
+        let event_snapshot = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .and_then(|c| self.song.clip_contents.get(&c.content_id))
+            .and_then(|content| content.text_events())
+            .and_then(|events| events.first())
+            .map(|ev| {
+                (
+                    ev.text.clone(),
+                    ev.font_family.clone(),
+                    ev.font_size_px,
+                    ev.opacity,
+                )
+            });
+        let Some((text, font_family, font_size_px, opacity)) = event_snapshot else {
+            self.clip_text_content_edit_text.clear();
+            self.clip_text_font_family_edit_text.clear();
+            self.clip_text_font_size_edit_text.clear();
+            self.clip_text_opacity_edit_text.clear();
+            self.clip_edit_buffer_target = None;
+            return;
+        };
+        self.clip_text_content_edit_text = text;
+        self.clip_text_font_family_edit_text = font_family;
+        self.clip_text_font_size_edit_text = format!("{font_size_px:.1}");
+        self.clip_text_opacity_edit_text = format!("{opacity:.3}");
+        self.clip_edit_buffer_target = Some(target);
+    }
+
+    /// docs/plan_text_overlay.md §4 P5: text inspector が表示する
+    /// snapshot (= image idiom)。 selected_clip が Text variant の clip
+    /// を指していて、 first event があれば `Some` を返す。 各 numeric
+    /// field の `*_automated` は対応する TextBuiltin lane が track に
+    /// 存在するか。
+    pub fn inspector_text_event_summary(&self) -> Option<InspectorTextEventSummary> {
+        let cref = self.selected_clip?;
+        let track = self.song.tracks.get(cref.track as usize)?;
+        let clip = track.clips.get(cref.clip as usize)?;
+        let common::model::ClipContent::Text(t) =
+            self.song.clip_contents.get(&clip.content_id)?
+        else {
+            return None;
+        };
+        let event = t.events.first()?;
+        let has_lane = |field: common::model::TextBuiltinParam| {
+            track.automation_lanes.iter().any(|l| {
+                matches!(l.target, common::model::AutomationTarget::TextBuiltin(p) if p == field)
+            })
+        };
+        Some(InspectorTextEventSummary {
+            target: cref,
+            muted: event.muted,
+            font_size_automated: has_lane(common::model::TextBuiltinParam::FontSize),
+            opacity_automated: has_lane(common::model::TextBuiltinParam::Opacity),
+        })
     }
 
     fn set_clip_image_event_fade_in_beats(&mut self, target: ClipRef, beats: f64) {
