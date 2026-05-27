@@ -2,8 +2,7 @@
 //!
 //! `checkbox` との違い:
 //! - `checkbox`: 16px の □/☑ 枠 + ラベル (boolean property toggle の意味的アフォーダンス)
-//! - `toggle_button`: 矩形全面に任意ラベル + ON/OFF 背景色変化 + 任意の hint band
-//!   (DAW の M=赤 / S=黄 のように **value=true で rect 下端に色帯** を出す DAW 慣習を style で吸収)
+//! - `toggle_button`: 矩形全面に任意ラベル + ON/OFF 背景色変化
 //!
 //! click 判定は `button` と同じ armed-state モデル (`press_started_inside`)。
 
@@ -29,18 +28,11 @@ pub struct ToggleButtonResponse {
     pub hovered: bool,
 }
 
-/// `toggle_button_at` の見た目スタイル。
-///
-/// DAW の M=赤 / S=黄 のような「ON のとき下端に色帯」は `hint_band: Some(...)` で表現する。
-/// `hint_band: None` なら純粋な ON/OFF トグル button (背景色のみ変化)。
+/// `toggle_button_at` の見た目スタイル。 ON/OFF は `on_color` / `off_color` の背景色のみで表現する。
 #[derive(Clone, Copy, Debug)]
 pub struct ToggleButtonStyle {
     pub off_color: Color,
     pub on_color: Color,
-    /// `value=true` のとき rect 下端 `hint_band_h` px に塗る帯の色。
-    /// `None` なら hint band なし。
-    pub hint_band: Option<Color>,
-    pub hint_band_h: f32,
     pub border: Color,
     pub border_width: f32,
     pub radius: f32,
@@ -59,8 +51,6 @@ impl Default for ToggleButtonStyle {
         Self {
             off_color: Color::rgb(0.18, 0.20, 0.26),
             on_color: Color::rgb(0.32, 0.55, 0.85),
-            hint_band: None,
-            hint_band_h: 2.0,
             border: Color::rgb(0.35, 0.38, 0.45),
             border_width: 1.0,
             radius: 6.0,
@@ -126,11 +116,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 style.text_color.b.to_bits(),
                 style.text_color.a.to_bits(),
             ],
-            style
-                .hint_band
-                .map(|c| (c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits())),
             [
-                style.hint_band_h.to_bits(),
                 style.border_width.to_bits(),
                 style.radius.to_bits(),
                 style.font_size.to_bits(),
@@ -223,22 +209,6 @@ fn draw_toggle_button<M: ?Sized + 'static>(
         clip_rect: None,
         ..GlyphArea::default()
     });
-
-    // hint band: value=true && Some && hint_band_h > 0 のとき rect 下端に塗る。
-    if value
-        && let Some(hint) = style.hint_band
-        && style.hint_band_h > 0.0
-    {
-        let h = style.hint_band_h.min(rect.h);
-        ui.push_rect(RectCommand {
-            rect: Rect { x: rect.x, y: rect.y + rect.h - h, w: rect.w, h },
-            fill: hint,
-            border: Color::TRANSPARENT,
-            border_width: 0.0,
-            radius: [0.0; 4],
-            clip_rect: None,
-        });
-    }
 }
 
 #[cfg(test)]
@@ -326,63 +296,6 @@ mod tests {
             e.apply(&mut model);
         }
         assert!(model.flag, "value=false → on_toggle(true) で flag=true");
-    }
-
-    #[test]
-    fn hint_band_appears_when_value_true_and_some() {
-        let mut host: UiHost<()> = UiHost::no_redraw();
-        let mut scene = Scene::new();
-        let screen = PhysicalSize { width: 200, height: 100 };
-        let rect = Rect { x: 0.0, y: 0.0, w: 60.0, h: 24.0 };
-        let style = ToggleButtonStyle {
-            hint_band: Some(Color::rgb(1.0, 0.0, 0.0)),
-            ..ToggleButtonStyle::default()
-        };
-
-        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
-            ui.toggle_button_at("t", "M", rect, true, &style, |_| Edit::mutate(|(): &mut ()| {}));
-        });
-
-        // 1: 本体 / 2: hint band
-        assert_eq!(scene.rect_count(), 2);
-        let rects = scene.rects_vec();
-        let band = &rects[1];
-        assert!((band.rect.h - style.hint_band_h).abs() < 1e-6);
-        assert!((band.rect.y + band.rect.h - rect.h).abs() < 1e-6);
-        assert!((band.fill.r - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn hint_band_absent_when_value_false() {
-        let mut host: UiHost<()> = UiHost::no_redraw();
-        let mut scene = Scene::new();
-        let screen = PhysicalSize { width: 200, height: 100 };
-        let rect = Rect { x: 0.0, y: 0.0, w: 60.0, h: 24.0 };
-        let style = ToggleButtonStyle {
-            hint_band: Some(Color::rgb(1.0, 0.0, 0.0)),
-            ..ToggleButtonStyle::default()
-        };
-
-        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
-            ui.toggle_button_at("t", "M", rect, false, &style, |_| Edit::mutate(|(): &mut ()| {}));
-        });
-
-        assert_eq!(scene.rect_count(), 1, "value=false なら hint band は出ない");
-    }
-
-    #[test]
-    fn hint_band_absent_when_style_none() {
-        let mut host: UiHost<()> = UiHost::no_redraw();
-        let mut scene = Scene::new();
-        let screen = PhysicalSize { width: 200, height: 100 };
-        let rect = Rect { x: 0.0, y: 0.0, w: 60.0, h: 24.0 };
-        let style = ToggleButtonStyle { hint_band: None, ..ToggleButtonStyle::default() };
-
-        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
-            ui.toggle_button_at("t", "M", rect, true, &style, |_| Edit::mutate(|(): &mut ()| {}));
-        });
-
-        assert_eq!(scene.rect_count(), 1, "hint_band: None なら value=true でも帯なし");
     }
 
     #[test]
@@ -507,7 +420,6 @@ mod tests {
         let style = ToggleButtonStyle {
             off_color: Color::rgb(0.10, 0.10, 0.10),
             on_color: Color::rgb(0.90, 0.10, 0.10),
-            hint_band: None,
             ..ToggleButtonStyle::default()
         };
 

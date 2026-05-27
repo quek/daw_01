@@ -908,13 +908,6 @@ pub struct ArrangementStyle {
     pub track_selected_bg: Color,
     pub track_text_color: Color,
     pub track_text_size: f32,
-    pub mute_hint: Color,
-    pub solo_hint: Color,
-    /// M14 Phase 68 (#040): R button が active な track 行下端に積まれる 1px 帯の色。 mute_hint (赤系) /
-    /// solo_hint (黄系) と視覚区別するため業界標準の record red (= 鮮やかな赤) を default。
-    /// mute / solo と独立した独自帯として `mute_solo_hint_h` 帯の更に上に積まれる。
-    pub armed_hint: Color,
-    pub mute_solo_hint_h: f32,
     pub playhead_color: Color,
     pub playhead_width_px: f32,
     pub loop_band: Color,
@@ -1107,8 +1100,6 @@ impl Default for ArrangementStyle {
         let mute_button = ToggleButtonStyle {
             off_color: Color::rgb(0.18, 0.20, 0.24),
             on_color: Color::rgb(0.55, 0.18, 0.18),
-            hint_band: Some(Color::rgb(1.0, 0.30, 0.20)),
-            hint_band_h: 3.0,
             border: Color::rgb(0.30, 0.32, 0.36),
             border_width: 1.0,
             radius: 3.0,
@@ -1119,8 +1110,6 @@ impl Default for ArrangementStyle {
         let solo_button = ToggleButtonStyle {
             off_color: Color::rgb(0.18, 0.20, 0.24),
             on_color: Color::rgb(0.55, 0.50, 0.18),
-            hint_band: Some(Color::rgb(1.0, 0.85, 0.20)),
-            hint_band_h: 3.0,
             border: Color::rgb(0.30, 0.32, 0.36),
             border_width: 1.0,
             radius: 3.0,
@@ -1128,13 +1117,11 @@ impl Default for ArrangementStyle {
             text_color: Color::rgb(0.95, 0.95, 0.97),
             on_text_color: None,
         };
-        // M14 Phase 68 (#040): R button (Record-arm)。 default は record red (active = 鮮やかな赤、
-        // off = mute / solo と同 neutral 灰)。 hint_band は更に明るい赤で「録音中」 を強調。
+        // M14 Phase 68 (#040): R button (Record-arm)。 active = 鮮やかな赤、
+        // off = mute / solo と同 neutral 灰。
         let armed_button = ToggleButtonStyle {
             off_color: Color::rgb(0.18, 0.20, 0.24),
             on_color: Color::rgb(0.65, 0.18, 0.18),
-            hint_band: Some(Color::rgb(1.0, 0.30, 0.30)),
-            hint_band_h: 3.0,
             border: Color::rgb(0.30, 0.32, 0.36),
             border_width: 1.0,
             radius: 3.0,
@@ -1168,12 +1155,6 @@ impl Default for ArrangementStyle {
             track_selected_bg: Color::rgb(0.20, 0.24, 0.32),
             track_text_color: Color::rgb(0.92, 0.92, 0.94),
             track_text_size: 12.0,
-            mute_hint: Color::rgba(1.0, 0.30, 0.20, 0.60),
-            solo_hint: Color::rgba(1.0, 0.85, 0.20, 0.60),
-            // M14 Phase 68 (#040): R button active 時の track 行下端帯。 mute_hint (オレンジ赤) / solo_hint
-            // (黄) と色相を分け、 鮮やかな record red (= 業界標準) で「録音 arm」 を強調。
-            armed_hint: Color::rgba(1.0, 0.15, 0.15, 0.70),
-            mute_solo_hint_h: 3.0,
             playhead_color: Color::rgb(1.0, 0.25, 0.10),
             playhead_width_px: 2.5,
             loop_band: Color::rgba(0.50, 0.85, 1.0, 0.20),
@@ -2479,44 +2460,6 @@ fn draw_lanes_bg<M: ?Sized + 'static>(
             // M14 Phase 72 (#044): video track の行背景は暗青で audio と視覚区別 (selection /
             // group は優先度高いまま、 通常 audio 行は base bg のまま)。
             push_filled_rect(hctx, row, style.track_background_video);
-        }
-        if t.muted {
-            push_filled_rect(
-                hctx,
-                Rect {
-                    x: row.x,
-                    y: row.y + row.h - style.mute_solo_hint_h,
-                    w: row.w,
-                    h: style.mute_solo_hint_h,
-                },
-                style.mute_hint,
-            );
-        }
-        if t.solo {
-            push_filled_rect(
-                hctx,
-                Rect {
-                    x: row.x,
-                    y: row.y + row.h - style.mute_solo_hint_h * 2.0 - 1.0,
-                    w: row.w,
-                    h: style.mute_solo_hint_h,
-                },
-                style.solo_hint,
-            );
-        }
-        // M14 Phase 68 (#040): armed 帯 (= R button active 時)。 mute / solo の hint 帯の上に
-        // 同 1px gap で積み、 3 段すべてが独立 toggle で見えるようにする (Bitwig / Live と同 idiom)。
-        if t.armed {
-            push_filled_rect(
-                hctx,
-                Rect {
-                    x: row.x,
-                    y: row.y + row.h - style.mute_solo_hint_h * 3.0 - 2.0,
-                    w: row.w,
-                    h: style.mute_solo_hint_h,
-                },
-                style.armed_hint,
-            );
         }
         // row 下端 separator
         push_filled_rect(
@@ -8396,7 +8339,6 @@ mod tests {
         let s = ArrangementStyle::default();
         assert!(s.resize_handle_px > 0.0);
         assert!(s.playhead_width_px > 0.0);
-        assert!(s.mute_solo_hint_h > 0.0);
         assert!(s.clip_radius >= 0.0);
     }
 

@@ -315,10 +315,8 @@ impl App {
                     );
 
                     // M9 Phase 45b: toggle_button_at で DAW 慣習の M (mute) ボタン。
-                    // ON のとき下端に赤の hint band が出る (`hint_band: Some(red)`)。
                     let mute_style = ToggleButtonStyle {
                         on_color: Color::rgb(0.55, 0.20, 0.20),
-                        hint_band: Some(Color::rgb(0.95, 0.30, 0.30)),
                         radius: 4.0,
                         font_size: 13.0,
                         ..ToggleButtonStyle::default()
