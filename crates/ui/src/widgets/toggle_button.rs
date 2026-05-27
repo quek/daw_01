@@ -45,7 +45,13 @@ pub struct ToggleButtonStyle {
     pub border_width: f32,
     pub radius: f32,
     pub font_size: f32,
+    /// `value=false` (off) の text 色、 および `on_text_color: None` のとき `value=true` の
+    /// fallback。
     pub text_color: Color,
+    /// `value=true` (on) のときの text 色。 `None` なら `text_color` を使う (back compat)。
+    /// daw_01 #051: metronome の Ableton 流「黄背景 + 黒文字」 のような state-dependent text
+    /// color が必要な toggle 用 (yellow on_color に white text_color では視認性が低い)。
+    pub on_text_color: Option<Color>,
 }
 
 impl Default for ToggleButtonStyle {
@@ -60,6 +66,7 @@ impl Default for ToggleButtonStyle {
             radius: 6.0,
             font_size: 14.0,
             text_color: Color::rgb(0.95, 0.95, 0.97),
+            on_text_color: None,
         }
     }
 }
@@ -128,6 +135,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 style.radius.to_bits(),
                 style.font_size.to_bits(),
             ],
+            style
+                .on_text_color
+                .map(|c| (c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits())),
         ));
 
         let input_hash = hash_inputs((
@@ -196,13 +206,20 @@ fn draw_toggle_button<M: ?Sized + 'static>(
     let text_w = ui.measure_text(text, style.font_size);
     let tx = rect.x + (rect.w - text_w).max(0.0) * 0.5;
     let ty = rect.y + (rect.h - line_h).max(0.0) * 0.5;
+    // value=true のとき on_text_color (Some) を優先、 None なら text_color に fallback
+    // (daw_01 #051: metronome 黄背景 + 黒文字のような state-dependent text color)。
+    let text_color = if value {
+        style.on_text_color.unwrap_or(style.text_color)
+    } else {
+        style.text_color
+    };
     ui.push_text(GlyphArea {
         text: text.into(),
         left: tx,
         top: ty,
         font_size: style.font_size,
         line_height: line_h,
-        color: style.text_color,
+        color: text_color,
         clip_rect: None,
         ..GlyphArea::default()
     });
@@ -406,6 +423,79 @@ mod tests {
             "text left must differ from approx-based centering (approx={approx_left}, got {})",
             glyph.left
         );
+    }
+
+    #[test]
+    fn text_color_uses_on_text_color_when_value_true_and_some() {
+        // daw_01 #051: value=true で on_text_color=Some なら on_text_color が
+        // push_text に使われる。
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 60.0, h: 24.0 };
+        let style = ToggleButtonStyle {
+            text_color: Color::rgb(0.95, 0.95, 0.97), // white (off)
+            on_text_color: Some(Color::rgb(0.10, 0.10, 0.12)), // black (on)
+            ..ToggleButtonStyle::default()
+        };
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.toggle_button_at("t", "M", rect, true, &style, |_| {
+                Edit::mutate(|(): &mut ()| {})
+            });
+        });
+
+        let glyph = scene.iter_glyphs().next().expect("text should be pushed");
+        // 黒 (= on_text_color) が選ばれる、 白 (= text_color) ではない。
+        assert!(glyph.color.r < 0.5, "value=true で on_text_color (0.10) が使われる");
+        assert!((glyph.color.r - 0.10).abs() < 1e-6);
+    }
+
+    #[test]
+    fn text_color_falls_back_to_text_color_when_on_text_color_none() {
+        // daw_01 #051 back compat: on_text_color=None なら value=true でも text_color。
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 60.0, h: 24.0 };
+        let style = ToggleButtonStyle {
+            text_color: Color::rgb(0.95, 0.95, 0.97), // white
+            on_text_color: None,
+            ..ToggleButtonStyle::default()
+        };
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.toggle_button_at("t", "M", rect, true, &style, |_| {
+                Edit::mutate(|(): &mut ()| {})
+            });
+        });
+
+        let glyph = scene.iter_glyphs().next().expect("text should be pushed");
+        assert!((glyph.color.r - 0.95).abs() < 1e-6, "on_text_color=None で text_color を fallback");
+    }
+
+    #[test]
+    fn text_color_uses_text_color_when_value_false() {
+        // daw_01 #051: value=false なら必ず text_color (on_text_color は無視)。
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 60.0, h: 24.0 };
+        let style = ToggleButtonStyle {
+            text_color: Color::rgb(0.95, 0.95, 0.97), // white (off で使われる)
+            on_text_color: Some(Color::rgb(0.10, 0.10, 0.12)), // black (off では無視)
+            ..ToggleButtonStyle::default()
+        };
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.toggle_button_at("t", "M", rect, false, &style, |_| {
+                Edit::mutate(|(): &mut ()| {})
+            });
+        });
+
+        let glyph = scene.iter_glyphs().next().expect("text should be pushed");
+        // off では text_color (= 白 0.95) のはず。
+        assert!((glyph.color.r - 0.95).abs() < 1e-6, "value=false で text_color");
     }
 
     #[test]

@@ -1114,6 +1114,7 @@ impl Default for ArrangementStyle {
             radius: 3.0,
             font_size: 11.0,
             text_color: Color::rgb(0.95, 0.95, 0.97),
+            on_text_color: None,
         };
         let solo_button = ToggleButtonStyle {
             off_color: Color::rgb(0.18, 0.20, 0.24),
@@ -1125,6 +1126,7 @@ impl Default for ArrangementStyle {
             radius: 3.0,
             font_size: 11.0,
             text_color: Color::rgb(0.95, 0.95, 0.97),
+            on_text_color: None,
         };
         // M14 Phase 68 (#040): R button (Record-arm)。 default は record red (active = 鮮やかな赤、
         // off = mute / solo と同 neutral 灰)。 hint_band は更に明るい赤で「録音中」 を強調。
@@ -1138,6 +1140,7 @@ impl Default for ArrangementStyle {
             radius: 3.0,
             font_size: 11.0,
             text_color: Color::rgb(0.95, 0.95, 0.97),
+            on_text_color: None,
         };
         Self {
             bg: Color::rgb(0.10, 0.11, 0.13),
