@@ -188,10 +188,13 @@ fn draw_toggle_button<M: ?Sized + 'static>(
         clip_rect: None,
     });
 
-    // text 中央配置 (button と同じ簡易配置、ASCII 幅 ≈ font_size*0.55)。
+    // text 中央配置 (cosmic-text 経由の実 advance ベース)。 Nerd Font の wide glyph
+    // (⟳ ▶ ⏱ ♩ 等) は ASCII proportional の `font_size * 0.55` approx より大幅に広いため、
+    // approx で centering すると右ずれする (daw_01 #050)。 `measure_text` は scratch buffer
+    // を使い回すので per-frame N 個 button でも cost は無視可能。
     let line_h = style.font_size * 1.2;
-    let approx_w = (text.chars().count() as f32) * (style.font_size * 0.55);
-    let tx = rect.x + (rect.w - approx_w).max(0.0) * 0.5;
+    let text_w = ui.measure_text(text, style.font_size);
+    let tx = rect.x + (rect.w - text_w).max(0.0) * 0.5;
     let ty = rect.y + (rect.h - line_h).max(0.0) * 0.5;
     ui.push_text(GlyphArea {
         text: text.into(),
@@ -363,6 +366,46 @@ mod tests {
         });
 
         assert_eq!(scene.rect_count(), 1, "hint_band: None なら value=true でも帯なし");
+    }
+
+    #[test]
+    fn text_left_uses_measured_advance_not_approx() {
+        // daw_01 #050 regression: `chars * font_size * 0.55` approx 廃止 → measure_text 化。
+        // approx で右ずれする wide glyph (ASCII の "M" でも proportional system font なら
+        // 0.55 * 16 = 8.8px より広い) で push_text の left が `(rect.w - measure_text) / 2`
+        // に一致することを確認する。
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let rect = Rect { x: 10.0, y: 20.0, w: 60.0, h: 24.0 };
+        let style = ToggleButtonStyle::default();
+
+        let mut measured_w = 0.0;
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            measured_w = ui.measure_text("M", style.font_size);
+            ui.toggle_button_at("t", "M", rect, false, &style, |_| {
+                Edit::mutate(|(): &mut ()| {})
+            });
+        });
+        assert!(measured_w > 0.0, "measure_text(\"M\", 14) > 0");
+
+        let glyph = scene.iter_glyphs().next().expect("text should be pushed");
+        let expected_left = rect.x + (rect.w - measured_w) * 0.5;
+        assert!(
+            (glyph.left - expected_left).abs() < 1e-3,
+            "text left should match measured center: expected {expected_left}, got {}",
+            glyph.left
+        );
+
+        // approx (= 1 * 14 * 0.55 = 7.7) と measure (≥10px for system M) は明確に異なる。
+        // = approx 配置と measure 配置で left が一致しないことを確認 (回帰検出)。
+        let approx_w = 1.0 * style.font_size * 0.55;
+        let approx_left = rect.x + (rect.w - approx_w) * 0.5;
+        assert!(
+            (glyph.left - approx_left).abs() > 0.1,
+            "text left must differ from approx-based centering (approx={approx_left}, got {})",
+            glyph.left
+        );
     }
 
     #[test]
