@@ -755,6 +755,12 @@ pub struct AppData {
     /// grid 領域サイズ (px)。`view::root` / `view::bottom_panel` が piano_roll タブ
     /// 描画時に毎フレーム書き込む。0 は「未測定」フラグ扱い (auto-fit を skip)。
     pub last_pianoroll_grid_size: (f32, f32),
+    /// piano_roll がまだ一度も描画されていない (= `last_pianoroll_grid_size` 未測定)
+    /// 状態で auto-fit が要求された場合に立つフラグ。 初回描画で grid_size が
+    /// 確定したフレームの Edit 内で消費 → `fit_piano_roll_to_clip` を再実行する。
+    /// これが無いと「Piano Roll タブ未表示で clip を選択 → タブを開いても fit
+    /// されない、 2 回目以降のみ fit」 という初回 fit 喪失バグになる。
+    pub pending_pianoroll_fit: bool,
     /// 同様に arrangement の lanes 領域サイズ (px)。
     pub last_arrange_canvas_size: (f32, f32),
 
@@ -1089,6 +1095,7 @@ impl AppData {
             arrange_snap_enabled: true,
             arrange_snap_choice: crate::view::snap::CHOICE_ARRANGE_DEFAULT,
             last_pianoroll_grid_size: (0.0, 0.0),
+            pending_pianoroll_fit: false,
             last_arrange_canvas_size: (0.0, 0.0),
             is_playing: false,
             is_looping: false,
@@ -8285,13 +8292,16 @@ impl AppData {
     /// 現 selected_clip のノート bounding box が piano_roll grid 領域に
     /// 収まるよう zoom_x / zoom_y / scroll_beat / top_pitch を自動調整する。
     /// ノート無しの clip は clip 全長が見える初期 zoom にフォールバック。
-    /// `last_pianoroll_grid_size` が未測定 (= 0) の場合は何もしない。
+    /// `last_pianoroll_grid_size` が未測定 (= 0) の場合は `pending_pianoroll_fit`
+    /// を立てて return → piano_roll が初めて描画され grid_size が確定したフレームの
+    /// Edit 内で再実行される (初回 fit 喪失バグの修正、 [piano_roll_view::draw] 参照)。
     fn fit_piano_roll_to_clip(&mut self) {
         let Some(target) = self.selected_clip else { return };
         let Some(track) = self.song.tracks.get(target.track as usize) else { return };
         let Some(clip) = track.clips.get(target.clip as usize) else { return };
         let (grid_w, grid_h) = self.last_pianoroll_grid_size;
         if grid_w < 16.0 || grid_h < 16.0 {
+            self.pending_pianoroll_fit = true;
             return;
         }
 

@@ -75,10 +75,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     // auto-fit (X キー / Fit ボタン / SelectClip 経由) のために、現フレームの grid 領域
     // サイズを記録する。1 frame 遅延で OK (X キー押下の次フレームに反映される)。
+    // 同フレーム内で `pending_pianoroll_fit` が立っていたら消費して fit を再実行
+    // (Piano Roll タブ未表示で clip 選択 → タブを開いた初回フレームの fit 確定)。
     let grid_size = (grid_rect.w, grid_rect.h);
-    if app.last_pianoroll_grid_size != grid_size {
+    if app.last_pianoroll_grid_size != grid_size || app.pending_pianoroll_fit {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.last_pianoroll_grid_size = grid_size;
+            if app.pending_pianoroll_fit {
+                app.pending_pianoroll_fit = false;
+                app.handle_event(AppEvent::FitPianoRollToClip);
+            }
         }));
     }
 
