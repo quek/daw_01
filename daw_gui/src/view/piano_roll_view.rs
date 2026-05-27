@@ -27,13 +27,12 @@ const COLOR_HINT: Color = Color { r: 0.55, g: 0.58, b: 0.65, a: 1.0 };
 const SNAP_TOGGLE_STYLE: ToggleButtonStyle = ToggleButtonStyle {
     off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
     on_color: Color { r: 0.30, g: 0.50, b: 0.70, a: 1.0 },
-    hint_band: None,
-    hint_band_h: 2.0,
     border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
     border_width: 1.0,
     radius: 3.0,
     font_size: 12.0,
     text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    on_text_color: None,
 };
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {

@@ -70,13 +70,12 @@ const RECORDING_MODES: &[(RecordingMode, &str)] = &[
 const STYLE_RECORD: ToggleButtonStyle = ToggleButtonStyle {
     off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
     on_color: Color { r: 0.85, g: 0.20, b: 0.20, a: 1.0 },
-    hint_band: Some(Color { r: 1.0, g: 0.30, b: 0.30, a: 1.0 }),
-    hint_band_h: 2.0,
     border: Color { r: 0.45, g: 0.30, b: 0.30, a: 1.0 },
     border_width: 1.0,
     radius: 4.0,
     font_size: 12.0,
     text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    on_text_color: None,
 };
 
 /// Phase 4: recording mode toggle の見た目。 active 時 off_color (灰)
@@ -85,13 +84,56 @@ const STYLE_RECORD: ToggleButtonStyle = ToggleButtonStyle {
 const STYLE_REC_MODE: ToggleButtonStyle = ToggleButtonStyle {
     off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
     on_color: Color { r: 0.85, g: 0.45, b: 0.18, a: 1.0 },
-    hint_band: Some(Color { r: 0.95, g: 0.55, b: 0.20, a: 1.0 }),
-    hint_band_h: 2.0,
     border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
     border_width: 1.0,
     radius: 4.0,
     font_size: 12.0,
     text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    on_text_color: None,
+};
+
+/// Loop toggle の icon ボタンスタイル。 active 時に Ableton 流の blue 系に染め、
+/// off 時は灰。 record (赤) / automation (橙) と意味的に区別する。 font_size は
+/// 矢印 glyph ⟳ が button (28 px) 内で視認できるよう 16 に拡張。
+const STYLE_LOOP: ToggleButtonStyle = ToggleButtonStyle {
+    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
+    on_color: Color { r: 0.25, g: 0.55, b: 0.85, a: 1.0 },
+    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    border_width: 1.0,
+    radius: 4.0,
+    font_size: 16.0,
+    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    on_text_color: None,
+};
+
+/// Play toggle の icon ボタンスタイル。 再生中 (active) は LED 風の緑、 停止中は
+/// 灰。 業界標準の transport LED idiom に従う (= Ableton / Bitwig / Reaper)。
+/// label は active 時 ■ (stop)、 inactive 時 ▶ (play) で切り替え。
+const STYLE_PLAY: ToggleButtonStyle = ToggleButtonStyle {
+    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
+    on_color: Color { r: 0.30, g: 0.70, b: 0.35, a: 1.0 },
+    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    border_width: 1.0,
+    radius: 4.0,
+    font_size: 16.0,
+    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    on_text_color: None,
+};
+
+/// Click (metronome) toggle の icon ボタンスタイル。 active 時は Ableton 流の
+/// bright yellow 背景 + 黒文字 (= `on_text_color = Some(black)`)、 inactive は
+/// 灰背景 + 白文字 (= `text_color = white`)。 record (赤) / loop (青) / play (緑)
+/// / automation (橙) と意味的に区別。 label は ♬ (16 分音符 ×2、 細かい beat 感)。
+/// gui_01 #051 (state-dependent text color) landing で実現。
+const STYLE_CLICK: ToggleButtonStyle = ToggleButtonStyle {
+    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
+    on_color: Color { r: 0.95, g: 0.85, b: 0.25, a: 1.0 },
+    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    border_width: 1.0,
+    radius: 4.0,
+    font_size: 16.0,
+    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    on_text_color: Some(Color { r: 0.10, g: 0.10, b: 0.12, a: 1.0 }),
 };
 
 fn ts_den_to_index(den: u8) -> usize {
@@ -316,66 +358,68 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
     x += scale_w + 12.0;
 
-    // Play/Stop
-    let play_w = 64.0;
-    ui.button_at(
+    // Play/Stop: icon (▶ / ■) + 緑色 toggle。 再生中は緑 LED で active 強調。
+    let play_w = 36.0;
+    let play_active = app.is_playing;
+    ui.toggle_button_at(
         "transport_play",
-        if app.is_playing { "Stop" } else { "Play" },
+        if play_active { "\u{25A0}" } else { "\u{25B6}" },
         Rect { x, y: cy, w: play_w, h: bh },
-        || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::PlayToggle)),
+        play_active,
+        &STYLE_PLAY,
+        |_| Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::PlayToggle)),
     );
     x += play_w + 6.0;
 
-    // Loop toggle
-    let loop_w = 76.0;
-    ui.button_at(
+    // Loop toggle: icon (⟳) + 色のコンパクトボタン。 active 時 blue に染まる。
+    let loop_w = 36.0;
+    let loop_active = app.is_looping;
+    ui.toggle_button_at(
         "transport_loop",
-        if app.is_looping { "Loop ON" } else { "Loop OFF" },
+        "\u{27F3}",
         Rect { x, y: cy, w: loop_w, h: bh },
-        || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ToggleLoop)),
+        loop_active,
+        &STYLE_LOOP,
+        |_| Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ToggleLoop)),
     );
     x += loop_w + 12.0;
 
     // Phase 4 (`docs/plan_automation.md` §6): automation recording mode
-    // 4 way toggle (Read / Touch / Latch / Write)。 排他 4 択を 4 個の
-    // toggle_button で表現し、 active 1 個だけが on_color になる。 click
-    // すると `SetRecordingMode` で同 mode に切り替え (active 上の click は
-    // no-op だが、 排他 enum なので問題なし)。
-    let rec_mode_w = 54.0;
-    for (mode, label) in RECORDING_MODES {
-        let id = format!("transport_rec_{label}");
-        let active = app.recording_mode == *mode;
+    // 4 択 (Read / Touch / Latch / Write) を dropdown 化。 排他選択なので
+    // dropdown が UI 的に自然 + 横幅を 1/4 以下に圧縮できる。
+    let rec_mode_w = 78.0;
+    let cur_rec_idx = RECORDING_MODES
+        .iter()
+        .position(|(m, _)| *m == app.recording_mode)
+        .unwrap_or(0);
+    let rec_labels: Vec<&str> = RECORDING_MODES.iter().map(|(_, l)| *l).collect();
+    if let Some(idx) = ui.dropdown(
+        "transport_rec_mode",
+        Rect { x, y: cy, w: rec_mode_w, h: bh },
+        &rec_labels,
+        cur_rec_idx,
+    ) && let Some((mode, _)) = RECORDING_MODES.get(idx)
+    {
         let mode_copy = *mode;
-        ui.toggle_button_at(
-            id.as_str(),
-            label,
-            Rect { x, y: cy, w: rec_mode_w, h: bh },
-            active,
-            &STYLE_REC_MODE,
-            move |_| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetRecordingMode(mode_copy))
-                })
-            },
-        );
-        x += rec_mode_w + 4.0;
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::SetRecordingMode(mode_copy))
+        }));
     }
-    x += 8.0;
+    x += rec_mode_w + 12.0;
 
     // Phase 7 B3 (2026-05-13): メトロノーム on/off toggle。 audio thread
     // が beat 境界ごとに internal click 音 (sine, accent: downbeat 880Hz /
     // 他 440Hz, 40ms decay, peak -12 dB) を master mix に重ねる。 default
-    // off、 session-only state (project save には含めない)。 既存 recording
-    // mode toggle と同 STYLE で active 時 橙、 visual で「現在 click が鳴る」
-    // 状態が一目で分かる。
-    let metro_w = 60.0;
+    // off、 session-only state (project save には含めない)。 icon = ♬ (16 分
+    // 音符 ×2、 細かい beat 感)、 active 時は黄 LED 風で 「click 鳴動中」 を強調。
+    let metro_w = 36.0;
     let metro_active = app.metronome_enabled;
     ui.toggle_button_at(
         "transport_metronome",
-        "Click",
+        "\u{266C}",
         Rect { x, y: cy, w: metro_w, h: bh },
         metro_active,
-        &STYLE_REC_MODE,
+        &STYLE_CLICK,
         move |_| {
             Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::SetMetronomeEnabled(!metro_active))

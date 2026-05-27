@@ -29,13 +29,12 @@ const DROP_INDICATOR: Color = Color { r: 0.55, g: 0.78, b: 0.95, a: 1.0 };
 const TOGGLE_AUDIO_BASE: ToggleButtonStyle = ToggleButtonStyle {
     off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
     on_color: Color { r: 0.42, g: 0.55, b: 0.78, a: 1.0 },
-    hint_band: None,
-    hint_band_h: 2.0,
     border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
     border_width: 1.0,
     radius: 4.0,
     font_size: 12.0,
     text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    on_text_color: None,
 };
 
 // Image PiP の automate toggle 用 style (= lane を作る / 削除する 1 個
@@ -44,13 +43,12 @@ const TOGGLE_AUDIO_BASE: ToggleButtonStyle = ToggleButtonStyle {
 const TOGGLE_IMAGE_AUTOMATE: ToggleButtonStyle = ToggleButtonStyle {
     off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
     on_color: Color { r: 0.78, g: 0.55, b: 0.85, a: 1.0 },
-    hint_band: None,
-    hint_band_h: 2.0,
     border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
     border_width: 1.0,
     radius: 4.0,
     font_size: 11.0,
     text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    on_text_color: None,
 };
 
 const STRETCH_MODE_LABELS: &[&str] = &["Raw", "Repitch", "Stretch", "Slice"];

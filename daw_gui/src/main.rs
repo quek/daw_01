@@ -6,7 +6,7 @@ use anyhow::Result;
 use common::audio_bridge::AudioBridgeHandle;
 use common::protocol::{ChildToMain, MainToChild};
 use tokio::sync::mpsc::UnboundedReceiver;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event_loop::EventLoopProxy;
 use winit::window::WindowAttributes;
 
@@ -146,10 +146,20 @@ fn run_gui(
     let plugin_db = bootstrap.plugin_db.clone();
     let supervisor = Arc::clone(&bootstrap.supervisor);
 
+    // 前回終了時の window geometry を復元。 存在しなければ default (1280×800)。
+    // 位置は physical (= screen 座標)、 サイズは logical (= DPI 差吸収) で保存。
+    let saved_window = common::window_state::default_path()
+        .and_then(common::window_state::load);
+    let init_state = saved_window.unwrap_or_default();
+    let mut window_attrs = WindowAttributes::default()
+        .with_title("daw_01")
+        .with_inner_size(LogicalSize::new(init_state.width, init_state.height))
+        .with_position(PhysicalPosition::new(init_state.x, init_state.y));
+    if init_state.maximized {
+        window_attrs = window_attrs.with_maximized(true);
+    }
     let init = RunnerInit {
-        window_attrs: WindowAttributes::default()
-            .with_title("daw_01")
-            .with_inner_size(LogicalSize::new(1280.0, 800.0)),
+        window_attrs,
         build_app: Box::new(move |proxy: EventLoopProxy<AppEvent>| {
             let audio_tx_for_bridge = audio_tx.clone();
 

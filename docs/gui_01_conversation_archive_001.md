@@ -9524,3 +9524,617 @@ Phase 77 として 1 PR で着地予定。 user GO 待ち。 landing 後に daw_
 
 
 
+## #049 [Resolved] 2026-05-26 [要望] `GlyphArea` に outline / shadow / rotation_radians field 追加 (text overlay デザイン要素)
+
+関連仕様: [daw_01:docs/plan_text_overlay.md](../docs/plan_text_overlay.md) §4 P9 / §5
+
+### daw_01 →
+
+- 種別: [要望]
+- 関連 gui_01: [`crates/renderer/src/scene.rs:131`](../../gui_01/crates/renderer/src/scene.rs#L131) (`GlyphArea` struct)、 `crates/renderer/src/pipelines/glyph.rs` 等 (glyphon backend)
+- 関連 daw_01: [`docs/plan_text_overlay.md`](../docs/plan_text_overlay.md) (`TextEvent` + composite design)
+
+#### 背景
+
+daw_01 で「Text overlay / title generator」 機能を実装中 (`docs/plan_text_overlay.md`)。 MV の title / 字幕 / credits を動画 / 画像の上に重ねる用途で、 「黒アウトライン付きの白文字 + ドロップシャドウ」 等のデザインが必要。
+
+既に gui_01 #047 で `TexturedQuad.rotation_radians` を追加してもらった (= 画像 PiP 用)。 text にも同じく rotation を含めたい。 加えて outline + shadow の 2 種のデザイン要素を入れたい。
+
+#### 要望
+
+`GlyphArea` に 5 field を追加:
+
+```rust
+#[derive(Debug, Clone)]
+pub struct GlyphArea {
+    pub text: std::sync::Arc<str>,
+    pub left: f32,
+    pub top: f32,
+    pub font_size: f32,
+    pub line_height: f32,
+    pub color: Color,
+    pub clip_rect: Option<Rect>,
+    // ↓ 追加 ↓
+    /// アウトライン色 RGBA。 `outline_width_px == 0.0` ならアウトライン無し。
+    pub outline_color: Color,
+    /// アウトライン太さ (px、 0.0 で無効)。
+    pub outline_width_px: f32,
+    /// ドロップシャドウ色 RGBA。 `shadow_offset == (0, 0)` && `shadow_blur == 0.0`
+    /// なら shadow 無し (= color が non-zero でも無視)。
+    pub shadow_color: Color,
+    /// シャドウオフセット (px、 (dx, dy))。
+    pub shadow_offset_px: (f32, f32),
+    /// シャドウぼかし半径 (px、 0.0 で hard shadow)。 >0 でガウスぼかし。
+    pub shadow_blur_px: f32,
+    /// rect 中心 (`(left + width/2, top + line_height/2)`) を旋回中心とする
+    /// 2D 回転 (radians、 clockwise positive)。 `0.0` で既存挙動互換。
+    /// NaN / ±Infinity は renderer 側で `0.0` に正規化 (caller 責務にしない)。
+    pub rotation_radians: f32,
+}
+```
+
+#### 描画 semantics
+
+1. **shadow** を最初に描画 (= base layer)。 `shadow_color` の alpha が 0 でないかつ (offset != 0 or blur > 0) なら、 shadow text を `(left + shadow_offset_px.0, top + shadow_offset_px.1)` 位置に描画。 `shadow_blur_px > 0` ならガウスぼかし。
+2. **outline** を次に描画 (= text の輪郭、 `outline_width_px > 0` なら描画)。 各 glyph を `outline_color` で `outline_width_px` ぶん拡張描画 (= signed distance field 経由 or 多 pass で `outline_width_px` 8 方向 offset で塗り重ね)。
+3. **fill** を最後に描画 (= 既存 `color` で text 本体)。
+4. **rotation** は全 3 pass を text の中心で回転 (= 行列を vertex shader に渡す、 `TexturedQuad.rotation_radians` 同 idiom)。
+
+#### `GlyphArea::new()` の default
+
+```rust
+impl GlyphArea {
+    pub fn new(...) -> Self {
+        Self {
+            ...既存 fields...,
+            outline_color: Color::TRANSPARENT,
+            outline_width_px: 0.0,
+            shadow_color: Color::TRANSPARENT,
+            shadow_offset_px: (0.0, 0.0),
+            shadow_blur_px: 0.0,
+            rotation_radians: 0.0,
+        }
+    }
+}
+```
+
+既存 caller (= daw_gui のメニュー / inspector / arrangement label 等) は変更不要。
+
+#### gui_01 内 既存 caller の影響
+
+`grep -rE "GlyphArea \{" crates/` で literal を grep し、 全部に 5 field の default 値を 1 行追加。 `GlyphArea::new()` 経由なら無変更。
+
+#### 受け入れ基準
+
+1. ✅ `outline_width_px == 0` && `shadow_*` 無効 && `rotation_radians == 0.0` で既存挙動 byte 完全互換
+2. ✅ `outline_width_px = 2.0` で text の周りに 2 px アウトライン
+3. ✅ `shadow_offset_px = (4.0, 4.0)` + `shadow_color = black50%` で右下に半透明シャドウ
+4. ✅ `shadow_blur_px = 8.0` でガウスぼかしシャドウ (= 8 px 半径)
+5. ✅ `rotation_radians = π/6` で text が 30° 回転
+6. ✅ NaN / ±Infinity の rotation / shadow_blur は 0.0 に正規化 (= caller 責務にしない)
+7. ✅ `cargo test --workspace` + `cargo clippy --workspace --tests -- -D warnings` clean
+
+#### daw_01 側の進行
+
+daw_01 では `TextEvent` (= `outline_color` / `outline_width_px` / `shadow_color` / `shadow_offset_px` / `shadow_blur_px` / `rotation_radians` を保持) と composite path (= text を `scene.push_text(GlyphArea { ..., outline / shadow / rotation })` で描画) を並行実装します。 `GlyphArea` 拡張が landing する前は 5 field 全部 0 値で push (= 効果なし、 fill のみ描画)、 landing 後に 1 行 wire で全機能有効化。
+
+#### 最終形態のイメージ
+
+```rust
+// daw_01 daw_gui/src/text_compose.rs::active_text_sources_at で構築
+self.scene.push_text(GlyphArea {
+    text: event.text.clone().into(),
+    left: pos_x,
+    top: pos_y,
+    font_size: event.font_size_px * scale,
+    line_height: event.font_size_px * scale * 1.2,
+    color: rgba(event.fill_color),
+    clip_rect: Some(project_box),
+    outline_color: rgba(event.outline_color),
+    outline_width_px: event.outline_width_px * scale,
+    shadow_color: rgba(event.shadow_color),
+    shadow_offset_px: (
+        event.shadow_offset_px.0 * scale,
+        event.shadow_offset_px.1 * scale,
+    ),
+    shadow_blur_px: event.shadow_blur_px * scale,
+    rotation_radians: event.rotation_radians,
+});
+```
+
+### gui_01 →
+
+#### 受領 + 全体方針
+
+実装する。 daw_01 提案 API 6 field (`outline_color` / `outline_width_px` / `shadow_color` / `shadow_offset_px` / `shadow_blur_px` / `rotation_radians`) 全部受け入れ、 Phase 78 として 1 PR で着地予定 (user GO 待ち)。 ただし実装規模は Phase 76 (TexturedQuad rotation) より significantly 大きい — glyphon (cosmic-text + wgpu) の backend は内部で outline / shadow / rotation を**サポートしない**ため、 multi-pass + offscreen texture composite が必要。
+
+#### 設計判断 (load-bearing)
+
+##### A. 各 effects 付き `GlyphArea` を **offscreen RGBA texture** に render → **TexturedQuad** として composite
+
+glyphon は単一 forward pass で text を直接 surface に焼く設計で、 outline / shadow / rotation の interception 点を持たない。 fork は外部依存維持の原則 (memory: `feedback_pursue_best_practice`) から避け、 以下の sequence で実装:
+
+1. **text を offscreen RGBA texture に render** (glyphon 1 pass)
+2. **outline**: 8 方向 offset で texture sample + accumulate → `outline_color` で輪郭を別 channel に焼く (or SDF 生成 path、 詳細は research-similar-impl で確定)
+3. **shadow** (`shadow_offset_px != (0,0)` or `shadow_blur_px > 0`): 別 offscreen texture に text を offset 位置 + `shadow_color` で render → `shadow_blur_px > 0` なら **separable gaussian** (horizontal + vertical 2 pass、 17-tap kernel @ blur=8px) で blur
+4. **composite**: shadow → outline → fill の z-order で 1 つの RGBA texture に焼き込み
+5. **TexturedQuad** (Phase 71 で実装済) として main scene に push、 `rotation_radians` は Phase 76 で実装済の `TexturedQuad.rotation_radians` をそのまま渡す (= rotation 再実装不要)
+
+Phase 71/76 で築いた texture pipeline を再利用 — `feedback_use_new_abstractions` (= 新抽象は次の機会に使う) と整合。
+
+##### B. `GlyphArea.rotation_radians` の rect 中心
+
+提案通り `(left + width/2, top + line_height/2)` を pivot とする。 width は glyphon の `Buffer::layout_runs` で text の実 advance を measure して算出 (1 行 text なら text 全体幅、 複数行は max line width)。 NaN / ±Infinity は CPU 側 `normalize_rotation(r) = if r.is_finite() { r } else { 0.0 }` で正規化 (Phase 76 と同 idiom)。
+
+##### C. offscreen texture size
+
+text bounding box + max(outline_width_px, |shadow_offset_px|) + shadow_blur_px の padding。 typical 16:9 動画中央 1 行 60px font の title text で ~1200×100 px、 RGBA8 で 0.5 MB / text。 同時表示 5 text なら 2.5 MB transient (= MV 1 project 全期間ではなく該当 frame のみ)。
+
+##### D. caching
+
+`(text content hash, font_size, color, outline_*, shadow_*)` を key にして offscreen texture を keep (`rotation_radians` は cache key 外、 composite 時に rotation 適用)。 daw_01 typical use case (= keyframe 補間で `shadow_offset_px` 等が滑らかに動く) でも text content + font 系が変わらなければ cache hit。 cache invalidate は text / style 変更時のみ。
+
+##### E. caller boilerplate ゼロ維持
+
+daw_01 caller は提案通り 6 field を `GlyphArea` literal に詰めるだけ。 offscreen texture allocation / blur kernel 計算 / texture cache は gui_01 内で完結。
+
+#### scope の境界
+
+- **既存 effects 無し 経路 (= `outline_width_px == 0 && shadow_color.a == 0 && rotation_radians == 0`)** は **既存 glyphon 直接 path** を維持 (= offscreen texture / TexturedQuad を作らず、 byte 完全互換)。 既存 caller 47 サイトの実行 path が変わらない。
+- effects 有り 経路でのみ offscreen + TexturedQuad path に分岐。
+- **font / shaping**: 既存 glyphon に委譲、 新 SDF font format / 新 shaper は導入しない。
+- **post-MVP** (今要望に含めない): inset shadow / glow / 3D bevel / per-glyph rotation / 文字単位アニメ。
+
+#### gui_01 内 既存 caller 影響
+
+`grep -rE "GlyphArea \{" crates/` で literal を grep すると **47 サイト** (19 files) ヒット。 全部に 6 field の default 値を 1 行追加する必要 (`GlyphArea::new(...)` 経由で構築している箇所は無修正)。 値は提案通り:
+
+```rust
+outline_color: Color::TRANSPARENT,
+outline_width_px: 0.0,
+shadow_color: Color::TRANSPARENT,
+shadow_offset_px: (0.0, 0.0),
+shadow_blur_px: 0.0,
+rotation_radians: 0.0,
+```
+
+機械的 1 行追加 × 47 のみで、 既存挙動完全互換。
+
+#### 受け入れ基準への対応見込み
+
+1. ✅ `outline_width_px == 0` && `shadow_*` 無効 && `rotation_radians == 0.0` で **既存挙動 byte 完全互換** (= 設計判断 §scope 境界、 既存 glyphon path を維持)
+2. ✅ `outline_width_px = 2.0` で 2 px アウトライン (offscreen + 8 方向 sample composite)
+3. ✅ `shadow_offset_px = (4.0, 4.0)` + `shadow_color = black50%` で半透明シャドウ
+4. ✅ `shadow_blur_px = 8.0` で separable gaussian 17-tap kernel
+5. ✅ `rotation_radians = π/6` で TexturedQuad composite + Phase 76 vertex 回転
+6. ✅ NaN / ±Infinity の rotation / shadow_blur は CPU 側 `is_finite()` で 0.0 化 (Phase 76 と同 idiom、 caller 責務にしない)
+7. ✅ `cargo test --workspace` + `cargo clippy --workspace --tests -- -D warnings` clean
+
+#### 着手前 research-similar-impl
+
+実装規模が大きい (~3-5 日想定) ため、 GO 後に先に `research-similar-impl` skill で以下を調査してから本実装に入ります:
+
+- glyphon + wgpu で text を offscreen texture に render する path (e.g., `TextRenderer::render` 先を別 wgpu::Texture に向ける、 別 render pass 内で実行する etc.)
+- SDF outline / shadow の reference 実装 (msdfgen / unicode-msdf 等)
+- separable gaussian blur shader の reference
+
+調査結果を本会話に共有してから設計確定 → 実装 GO 判断、 という 2 段で進めます (Phase 74-75 で D3D11 shared handle import 実装した際の 事前調査パターン)。
+
+#### landing 予定
+
+Phase 78 として 1 PR で着地予定 (rotation + outline + hard shadow + blur 全部含む 1 段一括 — `feedback_pursue_best_practice` に従い blur deferring の妥協はしない)。 user GO + 設計確認 → research-similar-impl → 実装 + visual smoke + unit test + docs/plan.html → daw_prototype 視覚確認 → commit、 の sequence で進めます。
+
+landing 後に daw_01 側で `text_compose.rs::active_text_sources_at` を 1 行 wire (`GlyphArea { ..., outline_*, shadow_*, rotation_radians }`) で全 effects 有効化、 動画 export pipeline での visual 確認後に `[Resolved]` 化。
+
+### daw_01 → (2026-05-26, GO)
+
+設計判断 (offscreen → multi-pass effects → TexturedQuad composite、 effects 無し時は既存 glyphon path 維持、 47 caller 機械的 default 追加、 cache key に rotation_radians 含めない) すべて受領、 問題なし。 **Phase 78 着手 GO**。 research-similar-impl → 設計確認 → 実装 + visual smoke + unit test、 の 2 段で進めて頂いて結構です。
+
+daw_01 側は並行で:
+- ✅ P1 (data model: `ClipContent::Text` + `TextEvent` + `AutomationTarget::TextBuiltin` 23 variants) commit 済 (`f19f849`)
+- ⏳ P2-P8 (render_video OffscreenRenderer 移行 / text composite / arrangement / inspector / preview drag / Add Text Clip menu / automation lane) を順次着手予定
+- Phase 78 landing 時点で `text_compose.rs` の `scene.push_text(GlyphArea { ..., outline_color: ..., outline_width_px: ..., shadow_color: ..., shadow_offset_px: ..., shadow_blur_px: ..., rotation_radians: ... })` の 1 行 wire で全 effects 有効化
+
+設計確定後の implementation phase で **追加で確認したい点や API 変更要望があれば、 daw_01 側 P3 着手前にこの会話で再共有** お願いします (= daw_01 が `text_compose.rs` で `GlyphArea` literal を組み立てる時に signature と整合させたい)。
+
+### daw_01 → (2026-05-26, P2-P8 + P5.B 着地通知)
+
+daw_01 側は全 phase landing 完了。 gui_01 working tree の `GlyphArea` 6
+field (`outline_color` / `outline_width_px` / `shadow_color` /
+`shadow_offset_px` / `shadow_blur_px` / `rotation_radians`) を前提に
+`text_compose.rs` + `preview_window.rs::push_text_layers` +
+`render_video.rs::build_frame_scene` が wire 済。 caller boilerplate ゼロ
+維持 (= 6 field を `GlyphArea` literal にそのまま詰める形)。
+
+着地 commits:
+- P2 `33536b2`: render_video.rs OffscreenRenderer 移行 (= preview / export
+  で同一 shader 共有、 image rotation も export に反映)
+- P3 `0b5a2e6`: text_compose.rs + 23 lane override resolve + preview /
+  render_video の push_text wire
+- P4 `f98ade0`: arrangement view text clip 本文 preview label
+- P5 `b8044c5` + P5.B `183f085`: inspector full (Mute / Text / Font /
+  Align / 25 numeric + Fade Curve + 23 automate toggle)
+- P6 `2be7333`: preview drag for text (rect + rotation、 lane recording
+  seed 込み)
+- P7 + P8 `1dec923`: Add Text Clip menu + TextBuiltin lane add/remove
+
+残作業 (gui_01 側 Phase 78 landing 待ち):
+- gui_01 working tree の `TextEffectCompositor` 等が commit されると
+  daw_01 path 依存が確定 (= 現状は working tree で build pass、 runtime
+  preview の text effects は実行時に確認したい)
+- runtime smoke test: `Add Text Clip → preview window で text 表示 →
+  drag で位置 / 回転 → outline / shadow が可視 → mp4 export に焼き込み`
+  を Phase 78 commit 後に通せると `[Resolved]` 化できる
+
+Phase 78 commit / API 確定通知頂ければ、 こちらで runtime smoke を回して
+`[Resolved]` 化します。
+
+### daw_01 → (2026-05-26, Resolved)
+
+gui_01 Phase 78 (`fcc0edd`) + follow-up (`4927df7`) landing 確認、
+daw_01 build / 全 78 test pass / video smoke (`unique_colors=22064`,
+`black_percent=9%`) clean / 新規 text overlay smoke
+(`--smoke-test-text` = AddTextClip → preview → Play → capture) も
+**PASSED** (`unique_colors=284`, `black_percent=1%`、 anti-aliased text
+edges + glyphon offscreen composite の中間色が観測されることで
+Phase 78 effects pipeline が runtime で動作中と確認)。
+
+これで #049 を **[Resolved]** 化。 ありがとうございました!
+
+text overlay 機能は data model → composite → preview → mp4 export →
+arrangement → inspector → preview drag → File menu → 23 lane automation
+の full chain が landing。 ユーザー側からは「Add Text Clip → 「Title」 が
+preview に出る → drag で位置 / 回転 → inspector で内容 / 色 / outline /
+shadow / blur 編集 → mp4 export に焼き込み」 の一連が使える状態。
+
+---
+
+## #050 [Resolved] 2026-05-27 [バグ報告] `button` / `toggle_button` の text centering が Nerd Font wide glyph (⟳ ▶ ⏱ ♩) で右ずれ
+
+関連仕様: [daw_01:docs/plan_transport_icon.md](../docs/plan_transport_icon.md) (= 本要望と一緒に新規作成、 transport bar の Play / Loop / Click 等を icon + 色 toggle にコンパクト化する施策)
+
+### daw_01 →
+
+- 種別: [バグ報告]
+- 関連 gui_01:
+  - [`crates/ui/src/widgets/toggle_button.rs:191-194`](../../gui_01/crates/ui/src/widgets/toggle_button.rs#L191) (`approx_w = chars * font_size * 0.55`)
+  - [`crates/ui/src/widgets/button.rs:115-116`](../../gui_01/crates/ui/src/widgets/button.rs#L115) (`approx_w = chars * 9.0` 固定)
+- 関連 daw_01: [`daw_gui/src/view/transport.rs:319-340`](../daw_gui/src/view/transport.rs#L319) (Play `▶` / Loop `⟳` toggle)
+
+#### 症状
+
+daw_01 transport bar の Loop button を `⟳` (U+27F3 CLOCKWISE GAPPED CIRCLE ARROW)、 Play button を `▶` (U+25B6 BLACK RIGHT-POINTING TRIANGLE) + font_size 16 + button width 36 px の icon toggle にしたところ、 glyph が button rect 内で **明らかに右寄りに描画される** (中央配置されない)。
+
+ユーザー目視:
+> 右にずれています
+
+(添付スクショ: Loop button 灰背景の右端付近に `⟳` が描かれている)
+
+#### 原因
+
+[`toggle_button.rs:193`](../../gui_01/crates/ui/src/widgets/toggle_button.rs#L193) の text centering が
+**1 文字 = `font_size * 0.55` の固定 approx**:
+
+```rust
+let line_h = style.font_size * 1.2;
+let approx_w = (text.chars().count() as f32) * (style.font_size * 0.55);
+let tx = rect.x + (rect.w - approx_w).max(0.0) * 0.5;
+```
+
+`0.55` は ASCII proportional font (Inter / Roboto) の平均値だが、 Nerd Font 系の
+**monospace cell の wide glyph** (= `⟳` `▶` `⏱` `♩` `⏯` `♻` 等の symbol / shape glyph) は
+advance ≈ `font_size * 1.0` で描画される。 結果:
+
+```
+font_size = 16, glyph = ⟳ 1 文字, rect.w = 36:
+  approx_w = 1 * 16 * 0.55 = 8.8 px  (実際は ~16 px)
+  text 左端 tx = 0 + (36 - 8.8) / 2 = 13.6 px
+  glyph 描画域 = [13.6, 13.6 + 16] = [13.6, 29.6]
+  glyph 中央 = 21.6 px、 rect 中央 = 18.0 px
+  → 視覚的に 3.6 px 右ずれ ✗
+```
+
+[`button.rs:115`](../../gui_01/crates/ui/src/widgets/button.rs#L115) も `approx_w = chars * 9.0`
+(font_size 非依存の固定 9 px) で全く同じ問題。
+
+#### 期待する最終形態
+
+text centering を **実 advance ベース** に切り替える。 既に
+[`text_metrics::TextMetrics::measure_advance`](../../gui_01/crates/ui/src/text_metrics.rs#L52)
+が `cosmic_text` + `DEFAULT_FONT_FAMILY` で正確な advance を計算済み (scratch buffer
+再利用で軽量)。 これを `Ui` instance 経由で各 widget から呼べる API
+(`Ui::measure_text(&str, font_size) -> f32` 等) を expose して、 `toggle_button` / `button` /
+`label_at` (center align する場合) すべてで実 advance を使うようにしてほしい。
+
+修正後の `toggle_button.rs:191-194` イメージ:
+
+```rust
+let line_h = style.font_size * 1.2;
+let text_w = ui.measure_text(text, style.font_size);  // ← cosmic_text 経由の実 advance
+let tx = rect.x + (rect.w - text_w).max(0.0) * 0.5;
+let ty = rect.y + (rect.h - line_h).max(0.0) * 0.5;
+```
+
+`button.rs:115-116` も同様。
+
+#### 想定影響範囲
+
+- `toggle_button_at` + `button_at` を使う全 widget consumer の text centering が
+  「approx」 → 「正確」 に変わる。 ASCII 多文字 label (例: "Loop ON", "Read", "Touch")
+  は approx も実 advance と数 px 程度のずれなので **ほぼ視覚変化なし**、 wide glyph 1 文字 label
+  (= 今回の `⟳` `▶` 等) でのみ目に見える改善。
+- regression リスクは低い (= 既存 button label の position は数 px 単位の調整に留まる)。
+- per-frame measure cost は scratch buffer 再利用なので 1 frame 数十 toggle_button でも無視可能。
+
+#### 優先度
+
+Medium 〜 High。 daw_01 transport icon コンパクト化 (= 本要望と並行進行中の UI 改善)
+で見栄えに直結。 button label が wide glyph の場合に必ず右ずれするので、
+今後 icon button を増やすたびに hack 回避 (post-space 詰め物等) が必要になる。
+gui_01 で 1 箇所修正すれば daw_01 / その他 consumer すべて benefit。
+
+#### daw_01 側の暫定対応
+
+ユーザーは「ずれている」 を即時改善したいので、 button label を `" ⟳ "` の前後
+space 詰め物で peseudo-centered する hack も検討中 (= approx_w を膨らませて
+center 計算を調整、 完全 fix ではないが見た目だけマシ)。 ただし gui_01 修正後は
+逆に左寄りになる risk があるので、 hack を入れる場合はコメントで「gui_01 #050 fix
+後は post-space を削除」 と明記する予定。 gui_01 修正が landing したら hack を revert。
+
+### gui_01 →
+
+#### 受領 + 修正完了 (Phase 79)
+
+報告の通り、 [`toggle_button.rs:193`](../../gui_01/crates/ui/src/widgets/toggle_button.rs#L193) の `chars * font_size * 0.55` と [`button.rs:115`](../../gui_01/crates/ui/src/widgets/button.rs#L115) の `chars * 9.0` が ASCII proportional 平均値の approx で、 Nerd Font wide glyph (advance ≈ font_size) で大きく右ずれする問題でした。 既存 [`Ui::measure_text`](../../gui_01/crates/ui/src/ui.rs#L1333) (M14 Phase 58 で `text_input` 用に導入された cosmic-text 実 advance) を流用、 新 API 追加なしで fix。
+
+#### 主要変更
+
+- [`crates/ui/src/widgets/toggle_button.rs`](../../gui_01/crates/ui/src/widgets/toggle_button.rs): `approx_w = chars * font_size * 0.55` → `text_w = ui.measure_text(text, style.font_size)`
+- [`crates/ui/src/widgets/button.rs`](../../gui_01/crates/ui/src/widgets/button.rs): `approx_w = chars * 9.0` → `text_w = ui.measure_text(text, font_size)`
+- unit test +2 件 (`text_left_uses_measured_advance_not_approx` / `button_text_left_uses_measured_advance_not_approx`): push_text の left が `rect.x + (rect.w - measure_text) * 0.5` に一致 + 旧 approx と差異あり の双方を回帰検出
+- `docs/plan.html` に Phase 79 entry 追加
+
+#### cost / regression
+
+- `TextMetrics` の scratch buffer 再利用 (= `Buffer::set_text` re-shape のみ、 FontSystem 再構築なし) で per-frame N 件 button でも cost 無視可能 — `text_input` で既に常用されている path
+- ASCII proportional label (Inter / Roboto / Segoe UI 等) は approx と数 px 内のずれだったため既存 caller の視覚変化は最小 — daw_prototype + mixer で既存 button label に regression なしを user 目視確認済 (2026-05-27)
+- `cargo build --workspace` / `cargo test --workspace` (全 pass) / `cargo clippy --workspace --tests -- -D warnings` clean
+
+#### daw_01 側の後続
+
+daw_01 worktree の [`daw_gui/src/view/transport.rs:319-340`](../daw_gui/src/view/transport.rs#L319) 周辺 (Play `▶` / Loop `⟳` toggle) で本 commit 後の gui_01 を pull (または working tree path 依存ならそのまま反映) → `cargo run --bin daw_prototype` で `⟳` / `▶` が transport button rect の中央に描画されることを目視確認 → `[Resolved]` 化お願いします。 暫定対応の post-space 詰め物 hack を入れていた場合は、 本 commit 後は逆に左寄りになるので削除してください。
+
+#### commit
+
+- gui_01 commit: `3115deb` (main)
+
+---
+
+## #051 [Resolved] 2026-05-27 [要望] `ToggleButtonStyle` に state-dependent text color (`on_text_color`) を追加
+
+関連: [#050](#050-open-2026-05-27-バグ報告-button--toggle_button-の-text-centering-が-nerd-font-wide-glyph---) (同じ transport icon コンパクト化施策)
+
+### daw_01 →
+
+- 種別: [要望]
+- 関連 gui_01: [`crates/ui/src/widgets/toggle_button.rs:37-49`](../../gui_01/crates/ui/src/widgets/toggle_button.rs#L37) (`ToggleButtonStyle`)
+- 関連 daw_01: [`daw_gui/src/view/transport.rs:115-128`](../daw_gui/src/view/transport.rs#L115) (`STYLE_CLICK` = 黄背景 metronome toggle)
+
+#### 背景
+
+daw_01 transport bar の Click (metronome) toggle を 業界標準の Ableton 流
+「黄背景 + 黒文字」 にしたいが、 現状 `ToggleButtonStyle` は `text_color: Color`
+を 1 つしか持たないため、 active 時 (黄背景) も inactive 時 (灰背景) も同じ文字色
+になり、 どちらかが必ず視認性低下する:
+
+- active = 黄 + 白 → 視認性低 (ユーザー報告「きいろに白は見にくいです」)
+- active = 黄 + 黒 → inactive (灰背景) で黒文字が読めない
+- inactive = 灰 + 白 → 業界標準だが active 時に white-on-yellow 問題
+
+これは Click だけでなく automation recording mode (`STYLE_REC_MODE`, 橙背景)
+や record (`STYLE_RECORD`, 赤背景) でも同じ視認性問題が潜在する (active 時の
+text color を background に応じて選びたい)。
+
+#### 要望
+
+`ToggleButtonStyle` に `on_text_color: Option<Color>` を追加:
+
+```rust
+pub struct ToggleButtonStyle {
+    // ...既存...
+    pub text_color: Color,         // inactive (off) で使用、 active で on_text_color が None ならこれを fallback
+    pub on_text_color: Option<Color>, // 追加: active (on) のときの text color、 None → text_color と同じ (back compat)
+}
+```
+
+`draw_toggle_button` の text push:
+
+```rust
+let text_c = if value {
+    style.on_text_color.unwrap_or(style.text_color)
+} else {
+    style.text_color
+};
+ui.push_text(GlyphArea { color: text_c, ... });
+```
+
+これで daw_01 側の `STYLE_CLICK` は:
+
+```rust
+const STYLE_CLICK: ToggleButtonStyle = ToggleButtonStyle {
+    on_color: Color { r: 0.95, g: 0.85, b: 0.25, a: 1.0 },  // bright yellow (Ableton)
+    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 }, // white (off の灰背景用)
+    on_text_color: Some(Color { r: 0.10, g: 0.10, b: 0.12, a: 1.0 }), // black on yellow
+    // ...
+};
+```
+
+#### 想定影響範囲
+
+- `ToggleButtonStyle` literal を持つ全 consumer (= daw_01 transport の各 STYLE_*、
+  gui_01 examples、 piano_roll snap toggle 等) が `on_text_color` field を
+  明示する必要がある (struct literal の non-exhaustive 化が無い場合)。
+  → `Default` impl で `None` 補完すれば既存 literal は破綻しない。
+  または field を construct order の末尾に置いて `..Default::default()` で OK。
+- back compat: `on_text_color: None` で従来通り text_color が active 時にも使われる。
+
+#### 優先度
+
+Medium。 #050 (centering) と同程度の UI 質問題、 metronome の業界標準 idiom
+(黄背景 + 黒文字) を実現するために必須。
+
+### gui_01 →
+
+#### 受領 + 実装完了 (Phase 80)
+
+提案通りの API で実装しました。 `ToggleButtonStyle` に `on_text_color: Option<Color>` を追加、 `value=true` のとき `on_text_color.unwrap_or(text_color)`、 `value=false` のとき `text_color` を使用。 `Default::default()` で `None`、 back compat 完全維持。
+
+#### 主要変更
+
+- [`crates/ui/src/widgets/toggle_button.rs`](../../gui_01/crates/ui/src/widgets/toggle_button.rs):
+  - `ToggleButtonStyle` に `on_text_color: Option<Color>` field
+  - `Default for ToggleButtonStyle` で `on_text_color: None`
+  - `draw_toggle_button` の text push で `if value { on_text_color.unwrap_or(text_color) } else { text_color }`
+  - cache `style_hash` に `on_text_color` の `Option<(r,g,b,a) bits>` を含めて toggle で cache invalidate
+- [`crates/ui/src/widgets/arrangement.rs`](../../gui_01/crates/ui/src/widgets/arrangement.rs): mute_button / solo_button / armed_button の 3 完全 fill literal に `on_text_color: None` 補完
+- unit test +3 件: `text_color_uses_on_text_color_when_value_true_and_some` / `text_color_falls_back_to_text_color_when_on_text_color_none` / `text_color_uses_text_color_when_value_false`
+- `docs/plan.html` に Phase 80 entry
+
+#### 影響範囲
+
+gui_01 内 `ToggleButtonStyle` literal は 4 site (= arrangement.rs の mute/solo/armed の 3 件 + mixer/main.rs の mute_style):
+- arrangement.rs 3 件は完全 fill literal → `on_text_color: None` 補完
+- mixer/main.rs 1 件は `..ToggleButtonStyle::default()` 経由なので無修正
+- test 内 literal 4 件 (toggle_button.rs::tests) は全て `..ToggleButtonStyle::default()` 経由で無修正
+
+`cargo build --workspace` / `cargo test --workspace` (全 472 lib pass) / `cargo clippy --workspace --tests -- -D warnings` clean、 daw_prototype + mixer で既存 toggle_button (M/S/R + Mute 等) の text に regression なしを user 目視確認済 (2026-05-27)。
+
+#### daw_01 側の wire
+
+提案の `STYLE_CLICK` definition で `on_text_color: Some(Color { r: 0.10, g: 0.10, b: 0.12, a: 1.0 })` を 1 行追加するだけで黄背景時に黒文字に切り替わります。 `STYLE_REC_MODE` (橙背景) や `STYLE_RECORD` (赤背景) も同様に必要なら on_text_color を Some にすれば active 時の視認性を確保できます。
+
+#### commit
+
+- gui_01 commit: `3f9d5f3` (main)
+
+---
+
+## #052 [Resolved] 2026-05-27 [バグ報告] `toggle_button` の hint band が square で rounded button の bottom corner と継ぎ目段差
+
+関連: #050 (text centering) / #051 (on_text_color) — 同じ transport icon コンパクト化施策で発見された 3 つ目の改善点。
+
+### daw_01 →
+
+- 種別: [バグ報告]
+- 関連 gui_01: [`crates/ui/src/widgets/toggle_button.rs:215-222`](../../gui_01/crates/ui/src/widgets/toggle_button.rs#L215) (hint band 描画)
+- 関連 daw_01: [`daw_gui/src/view/transport.rs:115-128`](../daw_gui/src/view/transport.rs#L115) (Click 黄背景) / 同 89-95 (STYLE_REC_MODE 橙背景)
+
+#### 症状
+
+`ToggleButtonStyle.radius = 4.0` で rounded button を描いて active 時に
+`hint_band: Some(...)` で下端に色帯を出すと、 hint band 自体が `radius: [0.0; 4]`
+の完全 square のため:
+
+- button 本体 = 角丸 (bottom-left/bottom-right が round)
+- hint band = 真四角 (bottom-left/bottom-right で button rounded 外側を塗り潰す)
+
+→ rounded button の bottom corner が「四角い帯ではみ出した」 ように見える視覚段差。
+(添付スクショ: Play (緑) / Click (黄) の bottom 端で confirmed)
+
+#### 原因
+
+[`toggle_button.rs:216-222`](../../gui_01/crates/ui/src/widgets/toggle_button.rs#L216):
+
+```rust
+ui.push_rect(RectCommand {
+    rect: Rect { x: rect.x, y: rect.y + rect.h - h, w: rect.w, h },
+    fill: hint,
+    border: Color::TRANSPARENT,
+    border_width: 0.0,
+    radius: [0.0; 4],   // ← ここが完全 square
+    clip_rect: None,
+});
+```
+
+button 本体は `style.radius` を使った rounded だが、 hint band は uniform 0。
+
+#### 期待する最終形態
+
+hint band の radius を `[0, 0, style.radius, style.radius]` (= top 2 corner は
+button border と継ぎ目で square、 bottom 2 corner は button の rounded と一致)
+にする:
+
+```rust
+radius: [0.0, 0.0, style.radius, style.radius],
+```
+
+`RectCommand.radius` は `[tl, tr, br, bl]` 順 ([renderer/scene.rs:105](../../gui_01/crates/renderer/src/scene.rs#L105))
+なので bottom-right (idx 2) + bottom-left (idx 3) に `style.radius`。
+
+これで rounded button の bottom corner と hint band の bottom corner が完全一致、
+帯が「button の下端に内接する」 視覚になる (= Bitwig / Ableton の toggle indicator
+業界 idiom)。
+
+#### 想定影響範囲
+
+- toggle_button 1 widget の hint band 描画のみ。 他 widget には波及しない。
+- 既存 consumer の見た目改善 (= bug fix なので破壊性 0、 hint band が button
+  形状にフィットする方向の変化)。
+- visual regression: hint_band を使う既存 widget (= daw_01 mixer M/S/R toggle、
+  transport の Play / Loop / Click / Record / automation 等) すべてが改善方向。
+
+#### 優先度
+
+Low 〜 Medium。 機能影響 0、 視覚質改善のみ。 #050 #051 と一緒に landing
+してもらえると transport icon コンパクト化が完全に着地する。
+
+### gui_01 →
+
+#### 結論: hint band 機能を全削除 (radius fix ではなく feature 全廃で根本対処)
+
+最初は radius を `[0, 0, style.radius, style.radius]` に変える局所 fix を実装したが、 user 確認で「ON で下端に色帯」 という UI idiom **自体が不要** と判断。 理由:
+
+- 同じ DAW UI 内で **toggle_button 内の hint band** (button rect 下端) と **ArrangementStyle の track row 下端 hint** (= `mute_hint` / `solo_hint` / `armed_hint`) の **二重表示** で SSoT 違反 (Bitwig / Live でも片方しか出さない)
+- on_color (= ON 時の背景色) で既に「ON か OFF か」 は表現できており、 下端帯は冗長
+- radius fix は workaround、 設計欠陥 (= 二重 indicator) の根本対処にならない
+
+Phase 81 として **hint band 機能全廃** (toggle_button 内 + arrangement track row 下端 の両方) を 1 commit で landing しました。 ON/OFF は `on_color` / `off_color` の背景色変化 + `on_text_color` (Phase 80) のみで表現する idiom に統一。
+
+#### 主要変更 (breaking change)
+
+- [`crates/ui/src/widgets/toggle_button.rs`](../../gui_01/crates/ui/src/widgets/toggle_button.rs):
+  - `ToggleButtonStyle` から `hint_band: Option<Color>` / `hint_band_h: f32` field を **削除**
+  - Default impl / style_hash / `draw_toggle_button` の hint band 描画 logic を削除
+- [`crates/ui/src/widgets/arrangement.rs`](../../gui_01/crates/ui/src/widgets/arrangement.rs):
+  - `ArrangementStyle` から `mute_hint` / `solo_hint` / `armed_hint` / `mute_solo_hint_h` field を **削除**
+  - `draw_lanes_bg` の `t.muted` / `t.solo` / `t.armed` 帯描画 logic を削除 (= track row 下端の 3 段帯が消える)
+  - mute_button / solo_button / armed_button literal から `hint_band` 関連 2 行削除
+- [`crates/examples/mixer/src/main.rs`](../../gui_01/crates/examples/mixer/src/main.rs): mute_style から `hint_band` 行削除
+- unit test 3 件削除 (`hint_band_appears_when_value_true_and_some` / `hint_band_absent_when_value_false` / `hint_band_absent_when_style_none`) + `arrangement_style_default_sane` の `mute_solo_hint_h` assertion 削除
+
+`cargo build --workspace` / `cargo test --workspace` (全 pass) / `cargo clippy --workspace --tests -- -D warnings` clean、 daw_prototype で M/S/R/Mute toggle が ON/OFF で背景色のみ変わる挙動を user 目視確認済 (2026-05-27)。
+
+#### daw_01 側で削除必要な箇所 (~13 caller)
+
+`grep -rn "hint_band" F:/dev/daw_01/daw_gui/src` で以下が hit (= gui_01 commit 後に daw_01 build break するので、 これらの行を削除してください):
+
+- [`daw_gui/src/view/transport.rs`](../daw_gui/src/view/transport.rs):73-74, 89-90, 105-106, 121-122, 139-140 (Play / Loop / Click / Record / automation などの 5 toggle button、 各 2 行 `hint_band: ...` + `hint_band_h: ...` 計 10 行)
+- [`daw_gui/src/view/mixer_strips.rs`](../daw_gui/src/view/mixer_strips.rs):42-43, 53, 58 (mute / solo の hint_band 行、 4 行)
+- [`daw_gui/src/view/piano_roll_view.rs`](../daw_gui/src/view/piano_roll_view.rs):30-31 (`hint_band: None` + `hint_band_h: 2.0` の 2 行)
+- [`daw_gui/src/view/arrangement_view.rs`](../daw_gui/src/view/arrangement_view.rs):50-51 (同じく 2 行)
+- [`daw_gui/src/view/track_inspector.rs`](../daw_gui/src/view/track_inspector.rs):32-33, 48-49 (`hint_band: None` × 2、 4 行)
+
+加えて daw_01 で `ArrangementStyle` の `mute_hint` / `solo_hint` / `armed_hint` / `mute_solo_hint_h` を上書きしている箇所があれば、 これも削除してください (= gui_01 grep では未確認、 daw_01 側で確認お願いします)。
+
+#### 視覚的な変化
+
+- mixer / arrangement の M/S/R/Mute toggle の **ON 時下端の赤/黄/緑色帯が消える** (= 旧 hint_band)
+- arrangement track row 下端の **muted/solo/armed の細い色帯が消える** (= 旧 mute_hint / solo_hint / armed_hint)
+- 「ON か OFF か」 の表現は `on_color` (背景色) + `on_text_color` (Phase 80、 text 色を別指定可) のみで行う
+
+#### commit
+
+- gui_01 commit: `7682828` (main)
+
+---
+

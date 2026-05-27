@@ -33,28 +33,33 @@ const COLOR_GROUP_BG: Color = Color { r: 0.18, g: 0.22, b: 0.30, a: 1.0 };
 const COLOR_MASTER_BG: Color = Color { r: 0.22, g: 0.22, b: 0.28, a: 1.0 };
 const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
 const COLOR_TEXT_DIM: Color = Color { r: 0.65, g: 0.68, b: 0.72, a: 1.0 };
-const COLOR_MUTE_HINT: Color = Color { r: 0.86, g: 0.27, b: 0.27, a: 1.0 };
-const COLOR_SOLO_HINT: Color = Color { r: 0.90, g: 0.78, b: 0.31, a: 1.0 };
+/// Mute active 時の背景色 (= 業界標準の赤)。 旧 hint band 色を on_color に昇格
+/// (gui_01 #052 で hint_band 廃止 → ON は背景色のみで表現する idiom に統一)。
+const COLOR_MUTE_ACTIVE: Color = Color { r: 0.86, g: 0.27, b: 0.27, a: 1.0 };
+/// Solo active 時の背景色 (= 業界標準の黄)。 同様に旧 hint band 色を on_color に昇格。
+const COLOR_SOLO_ACTIVE: Color = Color { r: 0.90, g: 0.78, b: 0.31, a: 1.0 };
+/// 黄背景 (Solo) と組み合わせる黒文字 (= 白文字では視認性低い、 STYLE_CLICK と同 idiom)。
+const COLOR_TEXT_BLACK: Color = Color { r: 0.10, g: 0.10, b: 0.12, a: 1.0 };
 
 const TOGGLE_BUTTON_BASE: ToggleButtonStyle = ToggleButtonStyle {
     off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
     on_color: Color { r: 0.30, g: 0.30, b: 0.36, a: 1.0 },
-    hint_band: None,
-    hint_band_h: 2.0,
     border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
     border_width: 1.0,
     radius: 4.0,
     font_size: 12.0,
     text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    on_text_color: None,
 };
 
 const STYLE_MUTE: ToggleButtonStyle = ToggleButtonStyle {
-    hint_band: Some(COLOR_MUTE_HINT),
+    on_color: COLOR_MUTE_ACTIVE,
     ..TOGGLE_BUTTON_BASE
 };
 
 const STYLE_SOLO: ToggleButtonStyle = ToggleButtonStyle {
-    hint_band: Some(COLOR_SOLO_HINT),
+    on_color: COLOR_SOLO_ACTIVE,
+    on_text_color: Some(COLOR_TEXT_BLACK),
     ..TOGGLE_BUTTON_BASE
 };
 

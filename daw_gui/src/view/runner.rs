@@ -663,6 +663,32 @@ impl ApplicationHandler<AppEvent> for Runner {
         state.app.handle_event(event);
         state.window.request_redraw();
     }
+
+    /// EventLoop 終了直前 (= 通常 close 経路、 process kill 以外で呼ばれる)。
+    /// メインウィンドウの geometry を `%LOCALAPPDATA%\daw_01\window_state.json`
+    /// に永続化して次回起動で復元する。 失敗は log のみ (起動を妨げない)。
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.as_ref() else { return };
+        save_main_window_state(&state.window);
+    }
+}
+
+fn save_main_window_state(window: &DawGuiWindow) {
+    let win = window.inner();
+    let size = win.inner_size();
+    let scale = win.scale_factor();
+    let pos = win.outer_position().unwrap_or(WinitPhysPos { x: 100, y: 100 });
+    let state = common::window_state::WindowState {
+        width: f64::from(size.width) / scale,
+        height: f64::from(size.height) / scale,
+        x: pos.x,
+        y: pos.y,
+        maximized: win.is_maximized(),
+    };
+    let Some(path) = common::window_state::default_path() else { return };
+    if let Err(e) = common::window_state::save(&path, &state) {
+        tracing::warn!(error = ?e, "failed to save window_state.json");
+    }
 }
 
 impl Runner {
