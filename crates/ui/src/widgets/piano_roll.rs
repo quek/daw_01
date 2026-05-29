@@ -837,12 +837,62 @@ fn note_zone_at(
     })
 }
 
+/// visible note slice に対する hit-test 本体。`note_hit` (visible 絞り込み後) と
+/// `note_hover_cursor` が共有し、「drag で掴む note」と「hover カーソルが指す note」を
+/// 構造的に一致させる (SSoT)。
+///
+/// 隣接 note (A.right == B.left) では両者の resize ハンドル帯が共有境界付近で重なる。
+/// このとき **cursor が rect 内部に在る note (in-rect) を、外側拡張ハンドル
+/// (outer-extension) しか当たらない note より無条件で優先**する。これにより A の右端を
+/// 掴みたいのに B の左端 resize に奪われる問題 (daw_01 #053) を解消。同 tier
+/// (両方 in-rect = overlap、または両方 outer = 微小 gap) は resize edge への水平距離が
+/// 近い方を採用し、同距離なら後勝ち (描画順で前面) を踏襲する。
+fn note_hit_in(
+    visible: &[Note],
+    view: PianoRollView,
+    grid: Rect,
+    cx: f32,
+    cy: f32,
+    edge: f32,
+) -> Option<(NoteId, NoteDragKind)> {
+    let mut hit: Option<(NoteId, NoteDragKind)> = None;
+    let mut hit_inside = false;
+    let mut hit_edge_dist = f32::INFINITY;
+    for note in visible {
+        let Some(kind) = note_zone_at(note, view, grid, cx, cy, edge) else {
+            continue;
+        };
+        let r = note_to_rect(note, view, grid);
+        let inside = cx >= r.x && cx < r.x + r.w;
+        // resize edge への水平距離 (Move は当該 cursor 位置 = 距離 0 扱い)。
+        let edge_x = match kind {
+            NoteDragKind::ResizeLeft => r.x,
+            NoteDragKind::ResizeRight => r.x + r.w,
+            NoteDragKind::Move => cx,
+        };
+        let dist = (cx - edge_x).abs();
+        // in-rect は outer に無条件で勝つ。同 tier は近い edge 優先 (同距離は後勝ち)。
+        let better = if inside == hit_inside {
+            dist <= hit_edge_dist
+        } else {
+            inside
+        };
+        if better {
+            hit = Some((note.id, kind));
+            hit_inside = inside;
+            hit_edge_dist = dist;
+        }
+    }
+    hit
+}
+
 /// note hit-test (visible filtering 後)。grid 内の cursor 位置で hit する note の id と
-/// hit zone (Move / ResizeLeft / ResizeRight) を返す。後勝ち (描画順で前面)。
+/// hit zone (Move / ResizeLeft / ResizeRight) を返す。
 ///
 /// resize handle は note rect の左右 edge から **内外** ±`resize_handle_px` の範囲
 /// (= 8px 幅のハンドル帯)。短 note (`r.w <= resize_handle_px * 2`) は rect 内は Move 強制、
-/// rect 外側のみ resize 判定。
+/// rect 外側のみ resize 判定。隣接 note でハンドル帯が重なる座標の解決規則は
+/// [`note_hit_in`] を参照 (in-rect 優先 / daw_01 #053)。
 ///
 /// `notes` は start_beat 昇順にソート済を仮定 (二分探索で visible 範囲を絞る)。
 #[must_use]
@@ -862,19 +912,15 @@ pub fn note_hit(
     let s_idx = notes.partition_point(|n| n.start_beat + n.len_beats < view_start);
     let e_idx = s_idx + notes[s_idx..].partition_point(|n| n.start_beat <= view_end);
     let visible = &notes[s_idx..e_idx];
-
-    let mut hit: Option<(NoteId, NoteDragKind)> = None;
-    for note in visible {
-        if let Some(kind) = note_zone_at(note, view, grid, cx, cy, resize_handle_px) {
-            hit = Some((note.id, kind));
-        }
-    }
-    hit
+    note_hit_in(visible, view, grid, cx, cy, resize_handle_px)
 }
 
 /// hover 中の note hit zone から cursor 形状を決める。
 /// note rect 左右 edge の内外 ±`resize_handle_px` = `EwResize`、中央 = `Move`、
 /// grid 外やどの note の判定範囲外も None。
+///
+/// hit 解決は [`note_hit`] と同一 ([`note_hit_in`] 経由) なので、表示カーソルが指す note と
+/// 実際に drag で掴む note は常に一致する。
 #[must_use]
 pub fn note_hover_cursor(
     visible: &[Note],
@@ -887,16 +933,10 @@ pub fn note_hover_cursor(
     if !grid.contains(cx, cy) {
         return None;
     }
-    let mut hit_cursor: Option<CursorIcon> = None;
-    for note in visible {
-        if let Some(kind) = note_zone_at(note, view, grid, cx, cy, resize_handle_px) {
-            hit_cursor = Some(match kind {
-                NoteDragKind::Move => CursorIcon::Move,
-                NoteDragKind::ResizeLeft | NoteDragKind::ResizeRight => CursorIcon::EwResize,
-            });
-        }
-    }
-    hit_cursor
+    note_hit_in(visible, view, grid, cx, cy, resize_handle_px).map(|(_, kind)| match kind {
+        NoteDragKind::Move => CursorIcon::Move,
+        NoteDragKind::ResizeLeft | NoteDragKind::ResizeRight => CursorIcon::EwResize,
+    })
 }
 
 /// 2 つの矩形が交差するか (Shift+drag rect select で使う)。接するだけは交差扱いしない。
@@ -3052,15 +3092,29 @@ mod tests {
     }
 
     #[test]
-    fn note_hit_adjacent_notes_back_wins_at_shared_handle() {
+    fn note_hit_adjacent_notes_inside_note_owns_shared_handle() {
         // note A (id 0, start=1, len=1) → rect x∈[150,250]、右端拡張 [246,254)
         // note B (id 1, start=2, len=1) → rect x∈[250,350]、左端拡張 [246,254)
-        // x=251 は両方の拡張ハンドル領域に入る → 後勝ちで B
+        // 共有境界 boundary=250。各 note は自分の rect 内側のハンドル px を所有する
+        // (in-rect は outer-extension に無条件で勝つ / daw_01 #053)。
         let notes = vec![note(0, 1.0, 1.0, 60), note(1, 2.0, 1.0, 60)];
         let view = test_view();
         let grid = Rect { x: 50.0, y: 0.0, w: 400.0, h: 200.0 };
-        let hit = note_hit(&notes, view, grid, 251.0, 102.0, 4.0);
-        assert_eq!(hit, Some((1, NoteDragKind::ResizeLeft)));
+        // x=249: A の rect 内側 (in-rect ResizeRight) が B の外側ハンドル (outer ResizeLeft) に勝つ
+        assert_eq!(
+            note_hit(&notes, view, grid, 249.0, 102.0, 4.0),
+            Some((0, NoteDragKind::ResizeRight))
+        );
+        // x=251: B の rect 内側 (in-rect ResizeLeft) が A の外側ハンドル (outer) に勝つ
+        assert_eq!(
+            note_hit(&notes, view, grid, 251.0, 102.0, 4.0),
+            Some((1, NoteDragKind::ResizeLeft))
+        );
+        // x=250: 共有境界。半開区間で B の rect 内側 → B の左端 resize
+        assert_eq!(
+            note_hit(&notes, view, grid, 250.0, 102.0, 4.0),
+            Some((1, NoteDragKind::ResizeLeft))
+        );
     }
 
     #[test]
