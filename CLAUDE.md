@@ -131,6 +131,7 @@ example を実機検証する前に必ず `cargo run --bin <name>` または `ca
   2. **Move + Alt 押下中は閾値 skip** (Alt は raw 微調整の明示意図)
   3. **Move + Alt なしは jitter 用 4px 閾値** (mouse jitter のみ ignore)
   実装は `let demote = matches!(nd.kind, ClipDragKind::Move) && !nd.last_alt && dist < 4.0;`。 user 視点で「drag したら反映される」 を保証しつつ jitter は ignore できる。
+- **隣接 resize widget の共有境界は in-rect 優先 (後勝ち + 外側拡張ハンドルは内側を奪う)**: clip / note のように左右端 resize ハンドルを rect の **内外 ±handle_px** に張る widget は、 隣接要素 (`A.right == B.left`、 連続同音 note / 接触 clip) があると B の左端外側ハンドル `[B.left-px, B.left)` が **A の rect 内部に食い込む**。 hit-test を「visible 走査で match ごとに後勝ち上書き」 で書くと、 cursor が A の rect 内 (`A.right-px ≤ cx < A.right`) でも後ろの B が常に勝ち **A の右端を一切掴めない** (piano_roll #053 / M14 Phase 82)。 **正しい設計**: match を「rect 内部 (in-rect)」 と「外側拡張のみ (outer)」 の 2 tier に分け **in-rect を outer に無条件優先** (同 tier は resize edge への水平距離が近い方、 同距離は後勝ち)。 各 widget が「自分の rect 側ハンドル px を所有」 し、 共有境界は半開区間で後者 (B) 内側になる。 piano_roll は `note_hit` / `note_hover_cursor` 共有の internal `note_hit_in` で実装済 (hover カーソルが指す要素 = drag で掴む要素 を構造保証)。 **arrangement の clip resize も同じ後勝ちループなら同種 bug** なので、 隣接 clip resize を実装する際は in-rect 優先化する。
 
 ### wgpu (29.x 系)
 - リサイズ中の surface 再構成で `SurfaceError::Outdated` が稀に発生。`render` の戻りがエラーでもログに出して次フレームまで生かす設計。
