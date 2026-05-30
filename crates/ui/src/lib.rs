@@ -70,6 +70,7 @@ pub use widgets::ruler_ops::{
 };
 pub use widgets::automation::{AutomationCurveResponse, AutomationCurveStyle};
 pub use widgets::checkbox::CheckboxResponse;
+pub use widgets::color_picker::{ColorPickerResponse, ColorPickerStyle};
 pub use widgets::fader::FaderResponse;
 pub use widgets::heavy::HeavyCtx;
 pub use widgets::list_view::{ListViewResponse, ListViewStyle};

@@ -7,6 +7,7 @@ pub mod arrangement;
 pub mod automation;
 pub mod button;
 pub mod checkbox;
+pub mod color_picker;
 pub mod drag_in_rect;
 pub mod drag_rect;
 pub mod dropdown;

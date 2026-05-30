@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use daw_ui_core::{
     ArrangementClip, ArrangementEditRequest, ArrangementMasterRow, ArrangementStyle,
-    ArrangementTrack, ArrangementView, BarBeatGridStyle, ClipKey, DialogResult, Edit, FaderResponse,
+    ArrangementTrack, ArrangementView, BarBeatGridStyle, ClipKey, ColorPickerStyle, DialogResult,
+    Edit, FaderResponse,
     FileDialogFilter, InputAccumulator, LevelMeterStyle, ListViewStyle, MASTER_TRACK_ID,
     MenuItemSpec, MeterBallistic, ModalStyle, Orientation, ReorderableListEditRequest,
     ReorderableListStyle, SnapConfig, TimeMapping, TimeRulerStyle, UiHost, ViewportState1D,
@@ -30,6 +31,26 @@ use winit::window::WindowAttributes;
 const N_CH: usize = 8;
 const N_TRACKS: usize = 12;
 const N_BROWSER_ITEMS: usize = 40;
+
+/// M14 Phase 88 (#058): color_picker のスウォッチパレット (track 色用の代表 16 色)。
+const TRACK_COLOR_PALETTE: [Color; 16] = [
+    Color::rgb(0.90, 0.30, 0.30),
+    Color::rgb(0.90, 0.55, 0.20),
+    Color::rgb(0.90, 0.80, 0.25),
+    Color::rgb(0.55, 0.80, 0.30),
+    Color::rgb(0.30, 0.75, 0.45),
+    Color::rgb(0.25, 0.75, 0.70),
+    Color::rgb(0.30, 0.65, 0.90),
+    Color::rgb(0.35, 0.45, 0.90),
+    Color::rgb(0.55, 0.40, 0.90),
+    Color::rgb(0.75, 0.40, 0.85),
+    Color::rgb(0.90, 0.45, 0.70),
+    Color::rgb(0.60, 0.45, 0.35),
+    Color::rgb(0.45, 0.50, 0.55),
+    Color::rgb(0.30, 0.33, 0.38),
+    Color::rgb(0.70, 0.72, 0.75),
+    Color::rgb(0.95, 0.95, 0.97),
+];
 
 struct DawClip {
     id: u32,
@@ -74,6 +95,9 @@ struct DawTrack {
     volume: f32,
     /// M14 Phase 63c (#016): 親 track id (`None` で top-level)。 Reaper folder / Live group 互換。
     parent_id: Option<u32>,
+    /// M14 Phase 87 (#059): track 表示色 (`None` で色なし)。 header 左端の色ストライプに反映。
+    /// Phase 88 (#058) の color_picker で編集される。
+    color: Option<Color>,
 }
 
 struct DawModel {
@@ -144,6 +168,10 @@ struct DawModel {
     /// 「初回 show 自動 focus」が widget 内蔵で boilerplate ゼロ)。Enter / blur / ESC で
     /// `None` に戻す。
     arr_rename_target: Option<u32>,
+    /// M14 Phase 88 (#058): track header 右クリック → "Color..." で開く color_picker の対象 track。
+    /// `Some(id)` の間 1 フレームごとに `ui.color_picker` を呼んで overlay 描画する。 picker の
+    /// `dismissed` で `None` に戻す。
+    arr_color_picker_target: Option<u32>,
     /// (M11 Phase 51) `Ui::reorderable_list` demo 用。Demo Dialog の plugin chain。
     /// drag&drop で並び替え、`ReorderableListEditRequest::Reorder(order)` で新順 index 列を受信。
     demo_chain: Vec<String>,
@@ -192,6 +220,14 @@ impl DawModel {
             } else {
                 format!("Track {}", ti + 1)
             };
+            // M14 Phase 87 (#059) demo: 一部 track に初期色を seed して header 左端ストライプの
+            // 動作確認 (Phase 88 の color_picker で右クリック → "Color..." で編集可能になる)。
+            let color = match ti {
+                0 => Some(Color::rgb(0.90, 0.55, 0.20)), // Group A = orange
+                3 => Some(Color::rgb(0.20, 0.70, 0.65)), // Audio 1 = teal
+                4 => Some(Color::rgb(0.60, 0.40, 0.85)), // Audio 2 = purple
+                _ => None,
+            };
             tracks.push(DawTrack {
                 id: ti as u32,
                 name: Arc::from(name),
@@ -202,6 +238,7 @@ impl DawModel {
                 clips,
                 volume: 0.75,
                 parent_id,
+                color,
             });
         }
         let arr_view = ArrangementView {
@@ -251,6 +288,7 @@ impl DawModel {
             arr_track_row_h: std::collections::HashMap::new(),
             arr_next_share_group_id: 0,
             arr_rename_target: None,
+            arr_color_picker_target: None,
             // M14 Phase 63n-10 (#034): SongTempo 模擬の lane 1 つで起動 (= 上端 master row が "Master" と
             // tempo curve を 1 行で表示)。 daw_01 conversation #034 §C 仕様に従う初期値。 ▶/▼ disclosure
             // で折り畳み確認、 dblclick で point 追加 (既存 EditRequest 流用 + `track == MASTER_TRACK_ID`
@@ -874,6 +912,8 @@ fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
             // M14 Phase 63n-6 (#031): per-track row 高さ override (新 splitter / Alt+drag 経由で
             // `SetSingleTrackRowH` を受信したら `Some(next)` に格納される)。 caller の store から取得。
             row_h: m.arr_track_row_h.get(&t.id).copied(),
+            // M14 Phase 87 (#059): track 色を header 左端ストライプに反映。
+            color: t.color,
         })
         .collect()
 }
@@ -2156,16 +2196,21 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
         },
     );
 
-    // ---- track header 右クリック context_menu (Rename / Delete) ----
+    // ---- track header 右クリック context_menu (Rename / Color / Delete) ----
     for (track_id, header_rect) in &resp.track_header_rects {
         let tid = *track_id;
-        ui.context_menu_for(*header_rect, &["Rename", "Delete"], move |idx, ui| {
+        ui.context_menu_for(*header_rect, &["Rename", "Color...", "Delete"], move |idx, ui| {
             match idx {
                 0 => ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
                     mm.arr_rename_target = Some(tid);
                     mm.last_action = format!("arr: Rename {tid} (context)");
                 })),
+                // M14 Phase 88 (#058): color_picker を開く (target に track id をセット)。
                 1 => ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
+                    mm.arr_color_picker_target = Some(tid);
+                    mm.last_action = format!("arr: Color picker open {tid}");
+                })),
+                2 => ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
                     mm.arr_tracks.retain(|t| t.id != tid);
                     mm.arr_selected_tracks.retain(|t| *t != tid);
                     mm.arr_collapsed_groups.remove(&tid);
@@ -2180,6 +2225,43 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 _ => {}
             }
         });
+    }
+
+    // ---- M14 Phase 88 (#058): color_picker overlay (target track が Some の間 1 frame ごとに描画) ----
+    if let Some(tid) = m.arr_color_picker_target {
+        let anchor = resp
+            .track_header_rects
+            .iter()
+            .find(|(id, _)| *id == tid)
+            .map(|(_, r)| *r);
+        if let Some(anchor) = anchor {
+            let current = m
+                .arr_tracks
+                .iter()
+                .find(|t| t.id == tid)
+                .and_then(|t| t.color)
+                .unwrap_or(Color::rgb(0.5, 0.5, 0.5));
+            let style = ColorPickerStyle::default();
+            let r = ui.color_picker(tid, anchor, current, &TRACK_COLOR_PALETTE, &style);
+            if let Some(c) = r.picked {
+                ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == tid) {
+                        t.color = Some(c);
+                    }
+                    mm.last_action = format!("arr: Track {tid} 色変更");
+                }));
+            }
+            if r.dismissed {
+                ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
+                    mm.arr_color_picker_target = None;
+                }));
+            }
+        } else {
+            // target track が消えた (Delete 等) → picker を閉じる。
+            ui.push_edit(Edit::mutate(|mm: &mut DawModel| {
+                mm.arr_color_picker_target = None;
+            }));
+        }
     }
 
     // ---- M14 Phase 63n-2 (#028): automation point 右クリック → curve type popup ----

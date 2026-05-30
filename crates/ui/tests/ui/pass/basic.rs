@@ -6,12 +6,12 @@
 
 use daw_ui_core::{
     ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView,
-    AutomationClipKey, ClipKey, Edit, Note, NoteId, PianoRollEditRequest, PianoRollStyle,
-    PianoRollView, PointerFrame, ReorderableListEditRequest, ReorderableListStyle,
+    AutomationClipKey, ClipKey, ColorPickerStyle, Edit, Note, NoteId, PianoRollEditRequest,
+    PianoRollStyle, PianoRollView, PointerFrame, ReorderableListEditRequest, ReorderableListStyle,
     ScrubableNumberFormat, ScrubableNumberStyle, UiHost,
 };
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Rect, Scene};
+use daw_ui_renderer::{Color, Rect, Scene};
 
 // 意図的に derive マクロを一切付けない。
 // String / Vec などの非 Copy フィールドを混ぜて、Model 全体に Copy/Clone が
@@ -382,6 +382,17 @@ fn main() {
                 &scn_style,
                 "scrub",
                 |_v: f64| Edit::mutate(|_m: &mut Model| {}),
+            );
+            // M14 Phase 88 (daw_01 #058): color_picker widget が non-Clone Model でコンパイルする。
+            // Model に一切触れない (response を返すだけ) ので構造的に no-Clone 安全だが、API が
+            // 露出していることを CI 固定する。
+            let cp_style = ColorPickerStyle::default();
+            let _ = ui.color_picker(
+                "cp",
+                Rect { x: 0.0, y: 0.0, w: 50.0, h: 20.0 },
+                Color::rgb(0.5, 0.5, 0.5),
+                &[Color::rgb(1.0, 0.0, 0.0), Color::rgb(0.0, 1.0, 0.0)],
+                &cp_style,
             );
         },
     );

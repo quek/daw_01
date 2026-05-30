@@ -210,6 +210,10 @@ pub struct ArrangementTrack {
     /// `Video` のとき: 行背景を `track_background_video` で塗る + header から instrument/fx_chain/
     /// volume/pan slot を非描画 + clip 描画を thumbnail / loading 色に切り替える ([`TrackKind`] 参照)。
     pub kind: TrackKind,
+    /// M14 Phase 87 (daw_01 #059): track の表示色。 `Some(c)` で header 左端に幅
+    /// `style.track_color_strip_w` の色縦ストライプを描画 (selected / group / video 背景の上に
+    /// 重ねる)。 `None` で既存挙動完全互換 (strip 非描画)。 `ArrangementClip.color` の track 版。
+    pub color: Option<Color>,
 }
 
 // ============================================================
@@ -882,6 +886,11 @@ impl Default for ArrangementResponse {
 pub struct ArrangementStyle {
     pub bg: Color,
     pub header_bg: Color,
+    /// M14 Phase 87 (daw_01 #059): `ArrangementTrack.color = Some(c)` のとき header 左端に
+    /// 描く色縦ストライプの幅 (px)。 selected / group / video 背景の上に重ねるので、 それらと
+    /// 色衝突せず常にトラック色が視認できる (Cubase / Live / Logic と同 idiom)。 `color = None`
+    /// の track では非描画 (= 既存挙動完全互換)。
+    pub track_color_strip_w: f32,
     pub ruler_bg: Color,
     /// M14 Phase 72 (daw_01 #044): video track の行背景 (audio track は既存 `bg` のまま)。
     /// 推奨 default = 暗青 `rgb(0.13, 0.14, 0.18)` で audio 背景 (`rgb(0.10, 0.11, 0.13)`) と
@@ -1132,6 +1141,7 @@ impl Default for ArrangementStyle {
         Self {
             bg: Color::rgb(0.10, 0.11, 0.13),
             header_bg: Color::rgb(0.14, 0.15, 0.18),
+            track_color_strip_w: 4.0,
             ruler_bg: Color::rgb(0.16, 0.17, 0.20),
             // M14 Phase 72 (#044): 暗青で audio bg (rgb(0.10, 0.11, 0.13)) と視覚区別。
             track_background_video: Color::rgb(0.13, 0.14, 0.18),
@@ -1395,6 +1405,7 @@ fn synthesize_master_track(master: &ArrangementMasterRow) -> ArrangementTrack {
         automation_lanes_collapsed: master.automation_lanes_collapsed,
         automation_lanes: master.automation_lanes.clone(),
         row_h: master.height_px_override,
+        color: None,
     }
 }
 
@@ -7578,6 +7589,27 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     self.panel(("arr_thbg", t.id), row, style.header_bg, 0.0);
                 }
 
+                // M14 Phase 87 (daw_01 #059): track color strip。 Some(c) のとき header 左端に
+                // 縦ストライプを背景の上から描く (selected/group/video 背景と色衝突しない)。
+                // None は strip 非描画 = 既存挙動完全互換。
+                if let Some(c) = t.color
+                    && style.track_color_strip_w > 0.0
+                {
+                    self.push_rect(RectCommand {
+                        rect: Rect {
+                            x: row.x,
+                            y: row.y,
+                            w: style.track_color_strip_w,
+                            h: row.h,
+                        },
+                        fill: c,
+                        border: Color::TRANSPARENT,
+                        border_width: 0.0,
+                        radius: [0.0; 4],
+                        clip_rect: Some(row),
+                    });
+                }
+
                 // M14 Phase 63c (#016): depth * indent_px の左 indent。 layout 計算は indent 反映後の
                 // row_inner で実行する (= row.x + indent、 row.w - indent)。
                 let indent = f32::from(t.depth) * style.indent_px;
@@ -8004,6 +8036,7 @@ mod tests {
             collapsed: false,
             row_h: None,
             kind: TrackKind::Audio,
+            color: None,
         }
     }
 
@@ -8608,6 +8641,7 @@ mod tests {
             automation_lanes_collapsed: true,
             automation_lanes: Vec::new(),
             row_h: None,
+            color: None,
         };
         assert_eq!(t.kind, TrackKind::Video);
     }
@@ -8918,6 +8952,70 @@ mod tests {
         scene
     }
 
+    /// M14 Phase 87 (daw_01 #059): `ArrangementTrack.color = Some(c)` の track は header 左端に
+    /// 幅 `style.track_color_strip_w` の縦ストライプ rect (fill == c) を 1 つ push する。 `None`
+    /// の track は同色の strip rect を push しない (= 既存挙動互換)。
+    #[test]
+    fn track_color_strip_drawn_only_for_colored_track() {
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::FrameInput;
+        use crate::ui::UiHost;
+
+        let strip_color = Color::rgb(0.91, 0.33, 0.55); // 他のどの style 色とも一致しない目印色
+        let mut t0 = track(0, "colored", vec![]);
+        t0.color = Some(strip_color);
+        let t1 = track(1, "plain", vec![]); // color: None
+        let tracks = vec![t0, t1];
+
+        let mut view = test_view();
+        view.header_w = 180.0; // header pane を出す
+        let style = ArrangementStyle::default();
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 400 };
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            let _ = ui.arrangement(
+                "arr_strip",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &tracks,
+                view,
+                &[],
+                &[],
+                &[],
+                &[],
+                &style,
+                None,
+                |_| Edit::mutate(|()| {}),
+            );
+        });
+
+        let strips: Vec<&RectCommand> = scene
+            .iter_rects()
+            .filter(|r| r.fill == strip_color)
+            .collect();
+        assert_eq!(
+            strips.len(),
+            1,
+            "colored track 1 本だけが strip を描く: got {} 本",
+            strips.len()
+        );
+        let strip = strips[0];
+        assert!(
+            (strip.rect.x - 0.0).abs() < 1e-3,
+            "strip は header pane 左端 (x=0): x={}",
+            strip.rect.x
+        );
+        assert!(
+            (strip.rect.w - style.track_color_strip_w).abs() < 1e-3,
+            "strip 幅は style.track_color_strip_w (={}): w={}",
+            style.track_color_strip_w,
+            strip.rect.w
+        );
+    }
+
     /// time_sig (3, 4) で grid の bar 縦線が 0/3/6/9/12 拍位置に出る。
     /// `len_beats: 12.0` (= 4 小節分 of 3/4) の view で `Primitive::Line` から bar 線の x を抽出。
     #[test]
@@ -9137,6 +9235,7 @@ mod tests {
             automation_lanes_collapsed: true,
             automation_lanes: Vec::new(),
             row_h: None,
+            color: None,
         }
     }
 

@@ -105,6 +105,7 @@ fn arr_model() -> ArrModel {
         automation_lanes_collapsed: true,
         automation_lanes: Vec::new(),
         row_h: None,
+        color: None,
     };
     ArrModel { tracks: vec![track], selected: Vec::new(), last_move: None }
 }
