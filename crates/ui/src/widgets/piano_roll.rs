@@ -451,6 +451,12 @@ pub struct PianoRollResponse {
     /// (M14 Phase 64 / daw_01 #018) velocity lane 内 drag が active か (HUD / status bar 表示用)。
     /// `true` のとき drag preview が velocity lane に出ており、release で `SetVelocity` 発行 (drag<3px は no-op)。
     pub velocity_dragging: bool,
+    /// (M14 Phase 84 / daw_01 #055) 鍵盤レーンを押している間、カーソルが乗っているキーの
+    /// pitch (MIDI note number)。押していない / 鍵盤外 / 編集 mode 中は `None`。押下中に別キーへ
+    /// drag するとフレームごとに最新キーへ追従 (glissando)。grid 側の note 編集 / rect select とは
+    /// 独立 (鍵盤 press は note drag を開始しない)。caller は前フレーム値との差分で note-on/off を
+    /// 導出する (`None→Some`=on / `Some(a)→Some(b)`=off+on / `Some→None`=off)。
+    pub keyboard_active_pitch: Option<u8>,
 }
 
 /// velocity → fill Color の関数。`fn` pointer (closure 不可、Style: Copy 維持のため)。
@@ -792,6 +798,15 @@ impl RowGeometry {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let idx = (raw as i32).clamp(0, last_i) as usize;
         f32::from(self.fold_rows[idx])
+    }
+
+    /// cursor y → pitch (整数 MIDI、どの鍵盤キー上か)。鍵盤レーン click のピッチ確定用 (daw_01 #055)。
+    /// `y_to_pitch_f` の行範囲 `(p-1, p]` を `ceil` で整数化し 0..=127 に clamp する。
+    /// fold mode では `y_to_pitch_f` が既に in-scale 整数を返すので `ceil` は no-op。
+    fn y_to_pitch(&self, y: f32) -> u8 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let p = self.y_to_pitch_f(y).ceil().clamp(0.0, 127.0) as u8;
+        p
     }
 
     /// scale が Some なら root pitch class を返す。
@@ -1217,6 +1232,10 @@ pub(crate) struct PianoRollState {
     /// release frame で `compute_loop_drag_endpoints` 経由で snap 適用済 endpoints を計算し、
     /// `SetLoopRange` を 1 度だけ発火 (arrangement #024 と同 idiom)。
     loop_drag: Option<LoopDragSession>,
+    /// (M14 Phase 84 / daw_01 #055) 鍵盤レーン press session。press 開始が kbd rect 内のとき
+    /// `true`、release で `false`。grid の note drag とは独立 (領域が x で排他)。押下中の pitch は
+    /// 毎フレーム pointer.y から計算するので held 値は持たず、「press 開始が鍵盤か」だけを track する。
+    keyboard_pressing: bool,
 }
 
 // ============================================================
@@ -1447,6 +1466,23 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     last_alt: press_alt,
                     last_ctrl: press_ctrl,
                 });
+            }
+        }
+
+        // ----- 鍵盤レーン press session (M14 Phase 84 / daw_01 #055) -----
+        // press 開始が kbd rect 内なら keyboard preview session を開始する (note drag とは x 領域で
+        // 排他、grid.contains で gate される just_pressed_on_note とは独立)。release で終了。
+        // editing_mode 中は無効 (歌詞 typing 優先)。pitch は後段の response 計算で毎フレーム算出。
+        {
+            let state: &mut PianoRollState = self.widget_state(wid);
+            if pointer.primary_just_pressed
+                && !editing_mode
+                && pointer.pos.is_some_and(|(px, py)| kbd.contains(px, py))
+            {
+                state.keyboard_pressing = true;
+            }
+            if pointer.primary_just_released {
+                state.keyboard_pressing = false;
             }
         }
 
@@ -1781,6 +1817,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
         response.dragging = drag_session.as_ref().map(|nd| nd.kind);
         response.velocity_dragging = velocity_drag_session.is_some();
+        // (M14 Phase 84 / daw_01 #055) 鍵盤レーン press 中の pitch を held-value で返す。
+        // session 中 (press 開始が kbd) かつ まだ押下中 (primary_pressed) かつ pointer が kbd 内の
+        // ときだけ Some。release frame は primary_pressed=false で None (= note-off)、kbd 外への drag
+        // も None。pitch は毎フレーム pointer.y から計算するので glissando に追従する。
+        if self.widget_state::<PianoRollState>(wid).keyboard_pressing
+            && pointer.primary_pressed
+            && let Some((px, py)) = pointer.pos
+            && kbd.contains(px, py)
+        {
+            response.keyboard_active_pitch =
+                Some(RowGeometry::compute(view, grid).y_to_pitch(py));
+        }
 
         // hover 中の cursor 形状要求 (drag 中は drag kind、note hover (拡張範囲含む) は
         // hover_cursor、その他 widget 内は Default に明示 reset で stale cursor を防ぐ)。
@@ -3836,6 +3884,77 @@ mod tests {
             Some(RequestKind::Copy),
             "Ctrl+drag release で Copy 発行 (Move ではない)"
         );
+    }
+
+    /// (M14 Phase 84 / daw_01 #055) 鍵盤レーン press でカーソル位置の pitch を held-value で返す。
+    /// 押下中の上下 drag で別キーへ追従 (glissando)、release で None (note-off)。
+    #[test]
+    fn piano_roll_keyboard_press_returns_active_pitch_with_glissando() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![]);
+        let mut view = test_view();
+        view.keyboard_w = 60.0; // 鍵盤レーン有効 (kbd rect x∈[0,60))
+        let style = PianoRollStyle::default();
+        let view_owned = view;
+        let no_notes: Vec<Note> = vec![];
+        let rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        // pitch 計算: pitch_top=72 / pitch_visible=24 / main_h=400 → row_h=16.67。
+        //   py=208 → y_to_pitch_f=59.52 → ceil=60、py=175 → 61.5 → ceil=62。
+
+        // Frame 1: 鍵盤レーン (px=30 < 60) を press、py=208 → pitch 60
+        let p1 = std::cell::Cell::new(None);
+        let input1 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((30.0, 208.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, input1, |ui| {
+            let dispatch = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let resp = ui.piano_roll("pr", rect, &no_notes, view_owned, &sel, &style, dispatch);
+            p1.set(resp.keyboard_active_pitch);
+        });
+        assert_eq!(p1.get(), Some(60), "鍵盤 press でカーソル位置の pitch");
+
+        // Frame 2: 押下したまま上のキーへ drag、py=175 → pitch 62 (glissando 追従)
+        let p2 = std::cell::Cell::new(None);
+        let input2 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((30.0, 175.0)),
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, input2, |ui| {
+            let dispatch = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let resp = ui.piano_roll("pr", rect, &no_notes, view_owned, &sel, &style, dispatch);
+            p2.set(resp.keyboard_active_pitch);
+        });
+        assert_eq!(p2.get(), Some(62), "押下中 drag で別キーへ追従 (glissando)");
+
+        // Frame 3: release → None (note-off)
+        let p3 = std::cell::Cell::new(Some(0));
+        let input3 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((30.0, 175.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, input3, |ui| {
+            let dispatch = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let resp = ui.piano_roll("pr", rect, &no_notes, view_owned, &sel, &style, dispatch);
+            p3.set(resp.keyboard_active_pitch);
+        });
+        assert_eq!(p3.get(), None, "release で None (note-off)");
     }
 
     /// Modifiers が default (= 修飾なし) で、modifier の Default 実装がエラーで失敗しないことの確認。

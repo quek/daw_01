@@ -849,6 +849,17 @@ impl App {
                         m.last_action = "rect select drag…".to_string();
                     }));
                 }
+                // (M14 Phase 84 / daw_01 #055) 鍵盤レーン press のピッチプレビューを HUD に表示。
+                // daw_01 では resp.keyboard_active_pitch を前フレーム値と差分して note-on/off を音源へ
+                // 送るが、demo では last_action に pitch 名を出して動作確認する (鍵盤レーンを click)。
+                if let Some(p) = resp.keyboard_active_pitch {
+                    ui.push_edit(Edit::mutate(move |m: &mut PianoRollModel| {
+                        m.last_action = format!(
+                            "keyboard preview: pitch {p} ({})",
+                            daw_ui_core::pitch_class_name(p % 12)
+                        );
+                    }));
+                }
 
                 // Footer
                 let footer_y = (screen.height as f32 - 44.0).max(0.0);
