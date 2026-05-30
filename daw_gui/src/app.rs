@@ -1008,6 +1008,20 @@ pub struct AppData {
     pub recovery_candidates: Vec<PathBuf>,
     /// `recovery_candidates` を modal に出すかどうか (Dismiss で false)。
     pub show_recovery_modal: bool,
+    /// 未保存変更がある状態でウィンドウを閉じようとしたとき表示する
+    /// 「保存して終了 / 保存せず終了 / キャンセル」 確認モーダル
+    /// (`close_confirm_modal`)。 `request_close` で is_dirty なら立てる。
+    pub show_close_confirm: bool,
+    /// Runner が毎フレーム監視し、 `true` になったら cleanup して
+    /// event loop を抜ける終了フラグ。 not-dirty close / 「保存せず終了」 /
+    /// 保存完了 (sync or async) のいずれかで立つ。
+    pub should_quit: bool,
+    /// 「保存して終了」 を選んだが plugin state 取得待ちで save が非同期
+    /// (`PendingStateRequest::Save`) になっている間 `true`。
+    /// `on_all_states_from_child` で save が完了 (is_dirty=false) したら
+    /// `should_quit` に変える。 save 試行が終われば (= pending Save が
+    /// 消えれば) クリアする (後続の手動 save が誤って quit しないように)。
+    pub quit_after_save: bool,
     pub is_dragging: bool,
     pub midi_input_label: String,
 
@@ -1233,6 +1247,9 @@ impl AppData {
             recovery_session_id: common::recovery::new_session_id(),
             recovery_candidates,
             show_recovery_modal,
+            show_close_confirm: false,
+            should_quit: false,
+            quit_after_save: false,
             is_dragging: false,
             midi_input_label: String::new(),
             step_cursor_beat: 0.0,
@@ -2313,6 +2330,14 @@ pub enum AppEvent {
     Open,
     Save,
     SaveAs,
+    /// 未保存変更ありの close 確認モーダルで「保存して終了」。 save を発行し、
+    /// 完了後に終了する (plugin 有り project は非同期保存を待つ)。
+    CloseConfirmSave,
+    /// close 確認モーダルで「保存せず終了」。 保存せず即終了。
+    CloseConfirmDiscard,
+    /// close 確認モーダルで「キャンセル」 (Esc / 外クリック / ✕ 含む)。
+    /// 終了を取りやめてアプリに戻る。
+    CloseConfirmCancel,
     Play,
     Stop,
     PlayToggle,
@@ -3497,6 +3522,14 @@ impl AppData {
             }
             AppEvent::SaveAs => {
                 self.action_save_as();
+            }
+            AppEvent::CloseConfirmSave => self.close_confirm_save(),
+            AppEvent::CloseConfirmDiscard => {
+                self.show_close_confirm = false;
+                self.should_quit = true;
+            }
+            AppEvent::CloseConfirmCancel => {
+                self.show_close_confirm = false;
             }
             AppEvent::Play => {
                 self.play();
@@ -5373,6 +5406,47 @@ impl AppData {
         } else {
             self.action_save_as();
         }
+    }
+
+    /// ウィンドウを閉じる要求 (`WindowEvent::CloseRequested`) のエントリ。
+    /// 未保存変更があれば確認モーダルを開き、 無ければ即 `should_quit` を
+    /// 立てる (= Runner が cleanup + exit する)。 ふつうの DAW と同じく
+    /// 「閉じる前に保存するか確認」 する。
+    pub fn request_close(&mut self) {
+        // 既に終了確定 / 非同期保存待ち中なら、 ✕ 連打でモーダルを
+        // 再表示しない (= 二重操作の無視)。
+        if self.should_quit || self.quit_after_save {
+            return;
+        }
+        if self.is_dirty {
+            self.show_close_confirm = true;
+        } else {
+            self.should_quit = true;
+        }
+    }
+
+    /// close 確認モーダルで「保存して終了」 を選んだ処理。 save を発行し:
+    /// - 同期保存が済んだ (plugin 無し / 既存 path) → 即 `should_quit`
+    /// - plugin state 取得待ちで非同期保存が enqueue された → `quit_after_save`
+    ///   を立て、 `on_all_states_from_child` の完了で終了する
+    /// - Save As ダイアログをキャンセルした (保存されず pending も無い) →
+    ///   何もしない (モーダルは閉じてアプリに留まる)
+    fn close_confirm_save(&mut self) {
+        self.show_close_confirm = false;
+        self.action_save();
+        if !self.is_dirty {
+            self.should_quit = true;
+        } else if self.has_pending_save() {
+            self.quit_after_save = true;
+        }
+    }
+
+    /// `pending_state_queue` に未処理の `Save` request が残っているか。
+    /// 非同期保存 (plugin state 取得待ち) の in-flight 判定に使う。
+    fn has_pending_save(&self) -> bool {
+        self.pending_state_queue
+            .iter()
+            .any(|r| matches!(r, PendingStateRequest::Save { .. }))
     }
 
     /// Bitwig / Ableton / Logic 流: project = bundle directory。 UX として
@@ -11963,6 +12037,20 @@ impl AppData {
         // 自前の knob snapshot を持つ。
         if !self.pending_state_queue.is_empty() {
             self.send_plugin(MainToChild::RequestAllStates);
+        }
+
+        // 「保存して終了」 の非同期保存待ち。 save が完了 (is_dirty=false)
+        // したら終了する。 save が失敗 (is_dirty=true のまま) なら終了せず
+        // status のエラー表示を残す。 いずれにせよ pending Save が無く
+        // なったら intent をクリアし、 後続の手動 save が誤って quit を
+        // 誘発しないようにする。
+        if self.quit_after_save {
+            if !self.is_dirty {
+                self.should_quit = true;
+            }
+            if !self.has_pending_save() {
+                self.quit_after_save = false;
+            }
         }
     }
 

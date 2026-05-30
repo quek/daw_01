@@ -559,10 +559,13 @@ impl ApplicationHandler<AppEvent> for Runner {
         match event {
             WindowEvent::CloseRequested => {
                 tracing::info!("window close requested");
-                if let Some(state) = self.state.as_ref() {
-                    state.app.on_shutdown();
+                // 未保存変更があれば確認モーダルを開き、 終了を保留する。
+                // 変更が無ければ `request_close` が即 `should_quit` を立て、
+                // 下の `quit_if_requested` が cleanup + exit する。
+                if let Some(state) = self.state.as_mut() {
+                    state.app.request_close();
                 }
-                event_loop.exit();
+                self.quit_if_requested(event_loop);
             }
             WindowEvent::Resized(size) => {
                 self.dispatch_platform_event(PlatformEvent::Resized(PhysicalSize {
@@ -658,10 +661,14 @@ impl ApplicationHandler<AppEvent> for Runner {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         let Some(state) = self.state.as_mut() else { return };
         state.app.handle_event(event);
         state.window.request_redraw();
+        // 背景スレッド (IPC bridge) 経由の event で、 plugin state 取得待ちの
+        // 非同期保存が完了して `should_quit` が立つことがある (= 「保存して
+        // 終了」 で plugin 有り project)。 ここで終了を拾う。
+        self.quit_if_requested(event_loop);
     }
 
     /// EventLoop 終了直前 (= 通常 close 経路、 process kill 以外で呼ばれる)。
@@ -692,6 +699,17 @@ fn save_main_window_state(window: &DawGuiWindow) {
 }
 
 impl Runner {
+    /// `AppData.should_quit` が立っていたら cleanup (recovery file 削除) して
+    /// event loop を抜ける。 not-dirty close / 「保存せず終了」 / 保存完了の
+    /// いずれかで立つ。 close 確認をキャンセルした場合は立たないので no-op。
+    fn quit_if_requested(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.as_ref() else { return };
+        if state.app.should_quit {
+            state.app.on_shutdown();
+            event_loop.exit();
+        }
+    }
+
     fn render_frame(&mut self, event_loop: &ActiveEventLoop) -> bool {
         // docs/plan_video.md P4: sync the preview window lifecycle
         // with `AppData.preview_window_visible` BEFORE everything
@@ -781,6 +799,15 @@ impl Runner {
                 crate::view::root::build_root(app, ui, screen);
             },
         );
+
+        // close 確認モーダルの「保存して終了」(同期保存) /「保存せず終了」 は
+        // この frame の `ui.frame` 内で Edit が適用され `should_quit` が立つ。
+        // `state` を borrow 中なので helper を介さず直接 cleanup + exit する。
+        if state.app.should_quit {
+            state.app.on_shutdown();
+            event_loop.exit();
+            return false;
+        }
 
         if let Err(e) = state.renderer.render(&state.scene) {
             tracing::error!(error = ?e, "render error");

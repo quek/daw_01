@@ -6,6 +6,7 @@ pub mod plugin_embed;
 pub mod arrangement_view;
 pub mod audio_editor;
 pub mod bottom_panel;
+pub mod close_confirm_modal;
 pub mod mixer_strips;
 pub mod param_gesture;
 pub mod piano_roll_view;

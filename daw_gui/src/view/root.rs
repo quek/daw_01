@@ -10,8 +10,8 @@ use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent};
 use crate::view::{
-    arrangement_view, bottom_panel, plugin_picker, recovery_modal, status_bar, track_inspector,
-    track_picker, transport,
+    arrangement_view, bottom_panel, close_confirm_modal, plugin_picker, recovery_modal, status_bar,
+    track_inspector, track_picker, transport,
 };
 
 pub const MENU_H: f32 = 24.0;
@@ -106,6 +106,10 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // Modal: recovery (起動時 or Open 時に検出された autosave 候補)。
     // app.show_recovery_modal を internal で監視するため常時呼び。
     recovery_modal::draw(app, ui, screen);
+
+    // Modal: 未保存変更ありで閉じようとしたときの「保存して終了 /
+    // 保存せず終了 / キャンセル」 確認。 app.show_close_confirm を監視。
+    close_confirm_modal::draw(app, ui, screen);
 }
 
 /// 上部 menu bar (File / Edit / View) を library widget で描画。
