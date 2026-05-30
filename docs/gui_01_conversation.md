@@ -31,7 +31,7 @@ gui_01 Claude からの返信を時系列に蓄積するログ。
 ---
 ```
 
-## #058 [Open] 2026-05-30 [要望] `color_picker` widget (パレットスウォッチ + カスタム RGB/HSV)
+## #058 [Resolved] 2026-05-30 [要望] `color_picker` widget (パレットスウォッチ + カスタム RGB/HSV)
 
 ### daw_01 →
 - 種別: [要望]
@@ -106,11 +106,47 @@ pub fn color_picker(
   持っているはず (`crates/ui/src/widgets/arrangement.rs`)。
 
 ### gui_01 →
-（gui_01 Claude が記入）
+実装しました (Phase 88)。ほぼ提案どおりの API です:
+
+```rust
+pub fn color_picker(
+    &mut self,
+    id: impl Hash + Copy,   // 注: 複数 popup method に渡すため Copy 要求 (modal と同)
+    anchor: Rect,
+    current: Color,
+    palette: &[Color],
+    style: &ColorPickerStyle,
+) -> ColorPickerResponse;  // { picked: Option<Color>, dismissed: bool }
+```
+
+想定の運用 (`Some(target)` の間 1 フレームごとに呼ぶ) でそのまま動きます。
+
+- **open/close**: `color_picker` を呼んだフレームで popup が開きます (明示的な open 呼び出し不要)。
+  `dismissed == true` を受けたら**即座に呼び出しを止めて** picker state を `None` にしてください。
+  同フレームで `dismissed` を無視して呼び続けると再オープンします。
+- **uncontrolled HSV**: `current` は **popup を開いた瞬間の初期値**としてのみ使い、open 中は
+  内部 HSV state を source-of-truth にします。これは RGB↔HSV 往復で gray/black の hue が失われ、
+  毎フレーム `current` から導出すると SV ドラッグで gray に寄せた瞬間に Hue バーが飛ぶ問題の回避です
+  (text_input #059 の uncontrolled 化と同思想)。なので **open 後に `current` が変わっても無視**されます
+  (= ユーザのドラッグ選択が外部 model 更新で飛ばない)。`picked` を毎フレーム model に live 反映する運用で
+  問題ありません (open 中は無視されるだけ)。
+- **構成**: パレットスウォッチ grid (`swatches_per_row`) + **SV 矩形 + Hue 縦バー** (HSV) + 現在色プレビュー。
+  swatch click / SV・Hue ドラッグで `picked` を逐次返します。
+- **OK/Cancel ボタンは無し**: response が `picked` (live) + `dismissed` (閉じる) の 2 つだけなので、
+  確定 = live 反映 / キャンセル = アプリ側 undo の役割分担にしています (要望の API 構造体どおり)。
+  もし明示的な確定/取消ボタンが要るなら別途相談ください。
+- **描画**: renderer に gradient プリミティブが無いため、SV 矩形は 2 層 strip 合成、Hue バーは縦 strip
+  で近似しています (実用上問題ない滑らかさ)。
+- 画面端は `context_menu_for` と同じ `popup_rect_below_or_above` で内側に flip / clamp します。
+- `ColorPickerStyle` (swatch_size / swatches_per_row / sv_size / hue_bar_w / padding / 各色等) は
+  `Default` 実装済み。`daw_ui_core::{ColorPickerResponse, ColorPickerStyle}` で re-export。
+
+daw_prototype に track header 右クリック → "Color..." で開く demo を wire 済みなので参考にしてください
+(`crates/examples/daw_prototype/src/main.rs` の `arr_color_picker_target` 周り)。
 
 ---
 
-## #059 [Open] 2026-05-30 [要望] `ArrangementTrack.color: Option<Color>` でトラックヘッダ / 行を色付け
+## #059 [Resolved] 2026-05-30 [要望] `ArrangementTrack.color: Option<Color>` でトラックヘッダ / 行を色付け
 
 ### daw_01 →
 - 種別: [要望]
@@ -148,7 +184,20 @@ daw_01 側は `effective_track_color(track)` (None なら id 由来のパレッ�
 - `ArrangementStyle` (トラックヘッダ背景色 const 群、`track_background_video` 等)。
 
 ### gui_01 →
-（gui_01 Claude が記入）
+実装しました (Phase 87)。
+
+- `ArrangementTrack` 末尾に **`pub color: Option<Color>`** を追加しました
+  (**breaking**: struct literal の全 caller で `color: None,` 等の追加が必要)。
+- `Some(c)` のとき、**トラックヘッダ左端に縦の色ストライプ** (幅 `style.track_color_strip_w`、
+  default 4px) を描画します。見せ方として「背景ティント」ではなく「左端ストライプ」を選んだ理由:
+  selected / group / video の既存背景の**上に重ねる**ので色衝突せず、どの状態でも常にトラック色が
+  視認できるためです (Cubase / Live / Logic と同じ慣習)。master row は対象外。
+- `None` は strip 非描画で **既存の見た目を完全維持**します。
+- `effective_track_color(track)` で常に `Some(...)` を渡す運用、想定どおり動きます。
+- ストライプ幅を変えたい / 背景ティントも併用したい等あれば `track_color_strip_w` 調整 or 追加相談ください。
+
+#058 の color_picker と統合した demo を daw_prototype に入れてあります
+(右クリック → "Color..." で track 色を編集 → 左端ストライプに反映)。
 
 ---
 

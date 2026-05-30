@@ -10,13 +10,13 @@ use daw_ui_core::{
     ArrangementAutomationClip, ArrangementAutomationLane, ArrangementAutomationPoint,
     ArrangementClip, ArrangementClipAudioEdit, ArrangementCurveKind, ArrangementEditRequest,
     ArrangementStyle, ArrangementTrack, ArrangementView, AutomationClipKey,
-    AutomationLaneKey, ChannelLayout, ClipKey, Edit, FadeCurve as WidgetFadeCurve,
+    AutomationLaneKey, ChannelLayout, ClipKey, ColorPickerStyle, Edit, FadeCurve as WidgetFadeCurve,
     FadeEdge, SampleSlices, ToggleButtonStyle, Ui, WaveformRenderMode, WaveformSource,
     WaveformStyle, WaveformView,
 };
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
-use crate::app::{AppData, AppEvent, ClipRef, FadeEdgeKind};
+use crate::app::{AppData, AppEvent, ClipRef, ColorPickerTarget, FadeEdgeKind};
 use crate::view::mixer_strips::{amp_to_fader, fader_to_amp};
 use crate::view::track_color;
 use crate::view::snap::{self, SNAP_LABELS};
@@ -442,6 +442,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let lanes_x = area.x + TRACK_HEADER_W;
     for (clip_key, rect) in &resp.clip_rects {
         let key = *clip_key;
+        // color_picker の anchor 用に clip rect を Copy で捕捉 (closure へ move)。
+        let menu_rect = *rect;
         ui.context_menu_for(
             *rect,
             &[
@@ -452,6 +454,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 "Reverse",
                 "Bounce In Place",
                 "Bounce (with FX)",
+                "色...",
+                "トラック色に戻す",
             ],
             move |idx, ui| {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -479,6 +483,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         // async (= IPC freewheel render → 完了通知)。
                         // Phase 2 PR-C (`docs/plan_audio_followup.md`)。
                         6 => app.handle_event(AppEvent::BounceClipWithFx(target)),
+                        // v18 (`docs/plan_track_clip_color.md`): color_picker を開く
+                        // (anchor = 右クリックした clip rect)。
+                        7 => app.open_color_picker(ColorPickerTarget::Clip(target), menu_rect),
+                        // 「トラック色に戻す」 = clip 上書きを外す (= 継承)。picker 不要。
+                        8 => app.handle_event(AppEvent::SetClipColor {
+                            target,
+                            color: None,
+                        }),
                         _ => {}
                     }
                 }));
@@ -635,8 +647,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let renaming_track_id = app
         .track_rename_idx
         .and_then(|idx| app.song.tracks.get(idx as usize).map(|t| t.id));
-    for (track_id, rect) in resp.track_header_rects {
-        ui.context_menu_for(rect, &["Rename", "Delete"], move |idx, ui| {
+    for (track_id, rect) in &resp.track_header_rects {
+        let track_id = *track_id;
+        let rect = *rect;
+        ui.context_menu_for(rect, &["Rename", "色...", "Delete"], move |idx, ui| {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 let Some(t_idx) = app.song.tracks.iter().position(|t| t.id == track_id)
                 else {
@@ -644,7 +658,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 };
                 match idx {
                     0 => app.handle_event(AppEvent::BeginRenameTrack(t_idx as u32)),
-                    1 => app.handle_event(AppEvent::DeleteTrack(t_idx as u32)),
+                    // v18 (`docs/plan_track_clip_color.md`): color_picker を開く
+                    // (anchor = 右クリックした track header rect)。
+                    1 => app.open_color_picker(ColorPickerTarget::Track(track_id), rect),
+                    2 => app.handle_event(AppEvent::DeleteTrack(t_idx as u32)),
                     _ => {}
                 }
             }));
@@ -677,6 +694,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             }
         }
     }
+
+    // v18 (`docs/plan_track_clip_color.md`, gui_01 #058): color_picker overlay。
+    // `color_picker_target` が Some の間 1 フレームごとに `ui.color_picker` を
+    // 呼んで overlay 描画する。anchor は track header / clip の rect を id で
+    // 引き直す (= scroll off で rect が無ければ picker を閉じる)。`picked` を
+    // live で model に反映 (open 中 widget 側は current を無視するので flicker
+    // しない)、`dismissed` で target を None に戻す。
+    render_color_picker_overlay(app, ui);
 
     // file drop の hint frame は widget の上に被せる。canvas (lanes) のみ受け付け。
     let canvas_area = Rect {
@@ -804,6 +829,72 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app.arrangement_hover_beat_raw = raw_beat;
             app.arrangement_hover_clip = hover_clip;
         }));
+    }
+}
+
+/// v18 (`docs/plan_track_clip_color.md`, gui_01 #058): `color_picker_target` が
+/// `Some` の間、保存した anchor (開いた場所 = header / clip / inspector swatch の
+/// rect) に color_picker overlay を描画する。`picked` は live で
+/// `SetTrackColor`/`SetClipColor` に流す (open 中 widget 側は `current` を無視
+/// するので flicker しない)、`dismissed` で target を `None` に戻す。対象 track /
+/// clip が削除された (= 現在色を引けない) ときは picker を閉じる。
+fn render_color_picker_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
+    let (Some(target), Some(anchor)) = (app.color_picker_target, app.color_picker_anchor)
+    else {
+        return;
+    };
+    let style = ColorPickerStyle::default();
+    let palette = track_color::palette_colors();
+
+    // 対象の現在色を引く。対象が消えていれば picker を閉じる。
+    let current: Option<Color> = match target {
+        ColorPickerTarget::Track(track_id) => app
+            .song
+            .track_by_id(track_id)
+            .map(|t| track_color::to_renderer(track_color::effective_track_color(t))),
+        ColorPickerTarget::Clip(clip_ref) => app
+            .song
+            .tracks
+            .get(clip_ref.track as usize)
+            .and_then(|t| {
+                t.clips.get(clip_ref.clip as usize).map(|c| {
+                    track_color::to_renderer(track_color::effective_clip_color(t, c))
+                })
+            }),
+    };
+
+    let Some(current) = current else {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.color_picker_target = None;
+        }));
+        return;
+    };
+
+    let r = ui.color_picker(("arr_color_picker", target_id_hash(target)), anchor, current, &palette, &style);
+    if let Some(c) = r.picked {
+        let rgb = track_color::from_renderer(c);
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| match target {
+            ColorPickerTarget::Track(track) => {
+                app.handle_event(AppEvent::SetTrackColor { track, color: Some(rgb) });
+            }
+            ColorPickerTarget::Clip(clip_ref) => {
+                app.handle_event(AppEvent::SetClipColor { target: clip_ref, color: Some(rgb) });
+            }
+        }));
+    }
+    if r.dismissed {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.color_picker_target = None;
+        }));
+    }
+}
+
+/// color_picker の widget id 用に target を一意な数値へ畳む (track / clip で衝突
+/// しないよう track は最上位 bit を立てる)。
+fn target_id_hash(target: ColorPickerTarget) -> u64 {
+    match target {
+        ColorPickerTarget::Track(id) => (1u64 << 63) | id as u64,
+        ColorPickerTarget::Clip(r) => ((r.track as u64) << 32) | r.clip as u64,
     }
 }
 

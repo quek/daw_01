@@ -65,6 +65,20 @@ pub fn to_renderer(rgb: [f32; 3]) -> Color {
     Color::rgb(rgb[0], rgb[1], rgb[2])
 }
 
+/// renderer `Color` を model の `[f32; 3]` に変換 (alpha は捨てる)。
+/// color_picker が返す `Color` を `SetTrackColor` / `SetClipColor` に積むとき使う。
+#[must_use]
+pub fn from_renderer(c: Color) -> [f32; 3] {
+    [c.r, c.g, c.b]
+}
+
+/// color_picker のスウォッチに渡すパレット (renderer `Color` 版)。
+/// `PALETTE` と 1 対 1。lazy 不要なので毎回構築 (16 要素、軽い)。
+#[must_use]
+pub fn palette_colors() -> Vec<Color> {
+    PALETTE.iter().map(|&rgb| to_renderer(rgb)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

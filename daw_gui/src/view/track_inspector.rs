@@ -9,7 +9,10 @@ use daw_ui_core::{
 };
 use daw_ui_renderer::{Color, Rect};
 
-use crate::app::{text_num_to_builtin, AppData, AppEvent, PickerTarget, TextNumField};
+use crate::app::{
+    text_num_to_builtin, AppData, AppEvent, ColorPickerTarget, PickerTarget, TextNumField,
+};
+use crate::view::track_color;
 use common::model::{FadeCurve, ImageBuiltinParam, StretchMode, TextAlign};
 
 const BG: Color = Color { r: 0.16, g: 0.16, b: 0.20, a: 1.0 };
@@ -117,6 +120,35 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         16.0,
         TEXT,
     );
+
+    // v18 (`docs/plan_track_clip_color.md`): タイトル行右端に track 色スウォッチ。
+    // 単一トラック選択時のみ表示し、クリックで color_picker を開く (anchor =
+    // スウォッチ rect)。effective 色 (上書き or id 由来の導出色) を塗る。
+    if app.selected_track_ids.len() <= 1
+        && let Some(idx) = app.cursor_track_index()
+        && let Some(track) = app.song.tracks.get(idx)
+    {
+        let track_id = track.id;
+        let swatch = Rect { x: area.x + area.w - pad - 20.0, y: y - 2.0, w: 20.0, h: 20.0 };
+        // hit-test (click 検出) を先に行い、 その上に色を塗る (button の既定
+        // 描画は隠れる)。
+        let clicked = ui.button_at_clicked("inspector_color_swatch", "", swatch);
+        let fill = track_color::to_renderer(track_color::effective_track_color(track));
+        ui.panel_with_border(
+            "inspector_color_swatch_fill",
+            swatch,
+            fill,
+            Color { r: 0.45, g: 0.48, b: 0.55, a: 1.0 },
+            1.0,
+            4.0,
+        );
+        if clicked {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.open_color_picker(ColorPickerTarget::Track(track_id), swatch);
+            }));
+        }
+    }
+
     y += 28.0;
 
     // ---- Audio Event section (Phase 2 PR1 + PR2) -----------------------

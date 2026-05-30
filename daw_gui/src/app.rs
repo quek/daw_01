@@ -300,6 +300,16 @@ pub struct ClipRef {
     pub clip: u32,
 }
 
+/// v18 (`docs/plan_track_clip_color.md`): color_picker overlay (gui_01 #058)
+/// の編集対象。`Some` の間 arrangement_view が 1 フレームごとに
+/// `ui.color_picker` を呼んで overlay を描画する。`Track` は track id、
+/// `Clip` は index ベース `ClipRef`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorPickerTarget {
+    Track(u32),
+    Clip(ClipRef),
+}
+
 /// gui_01 #028: 1 point の addressing。daw_01 側は `(track_id, lane_id,
 /// clip_id, point_idx)` 4-tuple で持つ (gui_01 の `AutomationPointKey`
 /// と 1:1 対応)。`AppEvent::DeleteAutomationPoints` などの batch event
@@ -912,6 +922,20 @@ pub struct AppData {
     pub clip_rename: Option<ClipRef>,
     pub clip_rename_text: String,
 
+    /// v18 (`docs/plan_track_clip_color.md`): color_picker (gui_01 #058) の
+    /// 開いている編集対象。`None` で非表示。`open_color_picker` で `Some` に、
+    /// picker の `dismissed` で `None` に戻す。
+    pub color_picker_target: Option<ColorPickerTarget>,
+    /// color_picker overlay の anchor 矩形 (popup を出す基準位置)。開いた場所
+    /// (右クリックした header / clip rect、inspector のスウォッチ rect) を保持し、
+    /// どの view から開いても同じ位置に popup が出るようにする。
+    pub color_picker_anchor: Option<daw_ui_renderer::Rect>,
+    /// color_picker session 中に既に undo snapshot を取ったか。`open_color_picker`
+    /// で `false` にリセットし、最初の色変更 (`SetTrackColor`/`SetClipColor`) で
+    /// 1 度だけ snapshot を取って `true` にする。これで「drag 開始〜終了」 が
+    /// 1 undo step にまとまり、 変更しないまま閉じても dead step が増えない。
+    pub color_picker_session_dirty: bool,
+
     /// Transport BPM 入力欄の編集中文字列。 commit (Enter) で parse + clamp +
     /// `song.bpm` に反映、 song を切り替える際 (open / new / undo / redo) は
     /// `resync_song_edit_texts` で formatted な現値に書き戻す。
@@ -1210,6 +1234,9 @@ impl AppData {
             is_rescanning: false,
             status_message: String::new(),
             track_rename_idx: None,
+            color_picker_target: None,
+            color_picker_anchor: None,
+            color_picker_session_dirty: false,
             track_rename_text: String::new(),
             clip_rename: None,
             clip_rename_text: String::new(),
@@ -1803,6 +1830,35 @@ impl AppData {
         chain
     }
 
+    /// v18 (`docs/plan_track_clip_color.md`): color_picker を開く。target と
+    /// anchor (popup 基準位置 = 開いた場所の rect) をセットし、session_dirty を
+    /// false に戻す (= 次の色変更が session 先頭の 1 snapshot を取る)。
+    /// 右クリック「色...」/ inspector スウォッチから呼ぶ。
+    pub fn open_color_picker(
+        &mut self,
+        target: ColorPickerTarget,
+        anchor: daw_ui_renderer::Rect,
+    ) {
+        self.color_picker_target = Some(target);
+        self.color_picker_anchor = Some(anchor);
+        self.color_picker_session_dirty = false;
+    }
+
+    /// color_picker の色変更 (`SetTrackColor`/`SetClipColor`) 用の undo snapshot。
+    /// picker session 中は session 先頭 (まだ dirty でない) で 1 回だけ、
+    /// picker が開いていない discrete edit (= 「トラック色に戻す」 reset 等) は
+    /// 毎回 snapshot する。
+    fn snapshot_for_color_edit(&mut self) {
+        if self.color_picker_target.is_some() {
+            if !self.color_picker_session_dirty {
+                self.push_undo_snapshot();
+                self.color_picker_session_dirty = true;
+            }
+        } else {
+            self.push_undo_snapshot();
+        }
+    }
+
     // -------- Undo/Redo ----------------------------------------------------
 
     fn push_undo_snapshot(&mut self) {
@@ -1925,8 +1981,11 @@ impl AppData {
                 | AppEvent::GlueSelectedClips
                 | AppEvent::SetClipReversed { .. }
                 | AppEvent::SetClipMuted { .. }
-                | AppEvent::SetTrackColor { .. }
-                | AppEvent::SetClipColor { .. }
+                // 注: SetTrackColor / SetClipColor は is_undoable に **入れない**。
+                // color_picker の live drag で毎フレーム発火するため、 ここで
+                // 毎回 snapshot すると undo 履歴が溢れる。 代わりに各 arm が
+                // 「picker session 先頭で 1 回 / discrete edit は毎回」 だけ
+                // snapshot する (image PiP drag と同思想)。
                 | AppEvent::SetClipStretchMode { .. }
                 | AppEvent::CommitClipGainEdit
                 | AppEvent::CommitClipPanEdit
@@ -4214,6 +4273,7 @@ impl AppData {
                 self.set_track_pan(track, pan);
             }
             AppEvent::SetTrackColor { track, color } => {
+                self.snapshot_for_color_edit();
                 if let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track) {
                     t.color = color;
                 }
@@ -4325,6 +4385,7 @@ impl AppData {
                 self.set_clip_audio_event_reversed(target, reversed);
             }
             AppEvent::SetClipColor { target, color } => {
+                self.snapshot_for_color_edit();
                 if let Some(clip) = self
                     .song
                     .tracks
