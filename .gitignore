@@ -6,6 +6,3 @@
 # session UUID が混ざるので glob で除外。
 /.claude/.session_events.*.log
 /.claude/.session_reflect_pending.md
-# AHE Stop hook (scripts/reflect.ps1) が session ごとに再生成する transient な提案ログ。
-# session 開始時に Read するローカル運用ファイルで、履歴に残す価値が無いため除外。
-/docs/reflection_latest.md

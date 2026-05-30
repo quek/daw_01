@@ -1,7 +1,8 @@
 # Stop hook: detect patterns in current session metrics, write proposals to reflection_latest.md
 # stdin: JSON from Claude Code (session_id, transcript_path, etc.)
 # input log: %USERPROFILE%\.claude\projects\F--dev-daw-01\metrics\YYYY-MM.jsonl
-# output: F:\dev\daw_01\docs\reflection_latest.md (last 5 entries kept)
+# output: %USERPROFILE%\.claude\projects\F--dev-daw-01\reflection_latest.md (last 5 entries kept)
+#   per-project user dir に置くことで main repo / 全 worktree が同一ファイルを共有する
 # silent on failure (exit 0). All strings ASCII-only to avoid PS 5.1 encoding issues.
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -85,7 +86,8 @@ if ($reads.Count -ge 5) {
 if ($proposals.Count -eq 0) { exit 0 }
 
 # Update reflection_latest.md (keep last 5 entries, newest first)
-$reflfile = "F:\dev\daw_01\docs\reflection_latest.md"
+# metrics と同じ per-project user dir に置く (main repo / 全 worktree 共通の single source of truth)
+$reflfile = Join-Path $env:USERPROFILE ".claude\projects\F--dev-daw-01\reflection_latest.md"
 $ts = Get-Date -Format "yyyy-MM-dd HH:mm"
 $session_short = $session_id.Substring(0, [Math]::Min(8, $session_id.Length))
 
