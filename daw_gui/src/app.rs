@@ -411,6 +411,9 @@ pub const ARRANGE_PX_PER_BEAT: f32 = 24.0;
 pub const ARRANGE_TRACK_HEIGHT: f32 = 88.0;
 pub const DEFAULT_NOTE_DURATION: f64 = 0.25;
 pub const DEFAULT_CLIP_LENGTH: f64 = 4.0;
+/// 鍵盤レーン click のプレビュー発音 velocity (MIDI 0..=127、 固定値)。
+/// gui_01 #055: widget は押下 pitch のみ返すので velocity は daw_01 側で固定。
+const PREVIEW_VELOCITY: u8 = 100;
 
 /// Audio Editor zoom の最小 view span (beats)。 1/64 拍 = 約 0.015 beats。
 /// これ未満は描画上意味がなく `view_len` を 0 に近づけると `beats_per_px`
@@ -692,6 +695,14 @@ pub struct AppData {
     pub selected_clip: Option<ClipRef>,
     pub selected_clips: Vec<ClipRef>,
     pub selected_notes: Vec<u32>,
+    /// 鍵盤レーン click のプレビュー発音中の `(track_id, pitch)` (gui_01 #055,
+    /// `docs/plan_pianoroll_keyboard_preview.md`)。 widget の
+    /// `PianoRollResponse::keyboard_active_pitch` を前フレーム値と差分して
+    /// note-on/off を導出するための held-value。 押下開始した track id を pitch
+    /// と一緒に持つことで、 note-off を必ず note-on と同じ track へ送る
+    /// (glissando / release で stuck note を防ぐ)。 `None` で発音なし。
+    /// session-only (project save には含めない)。
+    pub preview_note: Option<(u32, u8)>,
 
     // -------- View state --------
     pub bottom_panel: u8,
@@ -1102,6 +1113,7 @@ impl AppData {
             pianoroll_scroll_beat: 0.0,
             pianoroll_notes_generation: 0,
             last_note_duration_beats: DEFAULT_NOTE_DURATION,
+            preview_note: None,
             pianoroll_snap_enabled: true,
             pianoroll_snap_choice: crate::view::snap::CHOICE_PIANOROLL_DEFAULT,
             arrange_snap_enabled: true,
@@ -2224,6 +2236,13 @@ pub enum AppEvent {
     Redo,
     PushUndoSnapshot,
     QuantizeSelectedNotes(u8),
+    /// 鍵盤レーン click のピッチプレビュー (gui_01 #055,
+    /// `docs/plan_pianoroll_keyboard_preview.md`)。 piano_roll_view が毎フレーム
+    /// `resp.keyboard_active_pitch` を `preview_note` の pitch と比較し、 変化した
+    /// ときだけ発火する。 `track_idx` は描画中 clip の track (Vec index)、 `pitch`
+    /// は今フレームの押下 pitch (`None` = release / 鍵盤外)。 handler が前回
+    /// `preview_note` と差分して note-on/off IPC を送る。 Undo 対象外。
+    PreviewPitchChanged { track_idx: u32, pitch: Option<u8> },
     SetNoteVelocity { note: u32, velocity: u8 },
     /// gui_01 #018 (M14 Phase 64): velocity lane drag で 1 batch 更新。
     /// `selected_clip` の note を `(id, velocity)` で一括書き換え。 1 drag =
@@ -3340,6 +3359,29 @@ impl AppData {
             }
             AppEvent::ToggleLoop => {
                 self.toggle_loop();
+            }
+            AppEvent::PreviewPitchChanged { track_idx, pitch } => {
+                // gui_01 #055: 押下 pitch を track id 付き held-value に解決し、
+                // 前回値と差分して note-on/off を音源トラックへ送る。 track id は
+                // reorder race-free な addressing (audio 側で index に再解決)。
+                // 対象 track が存在しない / pitch=None なら next=None (= 発音停止)。
+                let next = pitch
+                    .and_then(|p| self.song.tracks.get(track_idx as usize).map(|t| (t.id, p)));
+                for action in diff_preview(self.preview_note, next) {
+                    match action {
+                        PreviewAction::NoteOff { track_id, pitch } => {
+                            self.send_audio(MainToChild::PreviewNoteOff { track_id, pitch });
+                        }
+                        PreviewAction::NoteOn { track_id, pitch } => {
+                            self.send_audio(MainToChild::PreviewNoteOn {
+                                track_id,
+                                pitch,
+                                velocity: PREVIEW_VELOCITY,
+                            });
+                        }
+                    }
+                }
+                self.preview_note = next;
             }
             AppEvent::LoopSelectedClipToggle => {
                 self.loop_selected_clip_toggle();
@@ -14038,6 +14080,85 @@ fn copy_notes_into(notes: &mut Vec<Note>, entries: &[(u32, f64, u8)]) -> Vec<u32
     let count = clones.len() as u32;
     notes.append(&mut clones);
     (base..base + count).collect()
+}
+
+/// [`diff_preview`] が返す 1 アクション (鍵盤プレビューの note-on/off)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewAction {
+    NoteOff { track_id: u32, pitch: u8 },
+    NoteOn { track_id: u32, pitch: u8 },
+}
+
+/// 鍵盤プレビューの状態遷移 (gui_01 #055)。 現在発音中の note `prev` と今フレーム
+/// の目標 `next` (どちらも `(track_id, pitch)`) を比較し、 発行すべき note-off /
+/// note-on を順に返す (held-value + caller diff)。
+/// - `None → Some`: `[NoteOn]`
+/// - `Some(a) → Some(b)` (a≠b): `[NoteOff(a), NoteOn(b)]`
+/// - `Some → None`: `[NoteOff]`
+/// - 変化なし: 空 (= 同 pitch 押下継続中は再送しない)
+fn diff_preview(prev: Option<(u32, u8)>, next: Option<(u32, u8)>) -> Vec<PreviewAction> {
+    if prev == next {
+        return Vec::new();
+    }
+    let mut actions = Vec::new();
+    if let Some((track_id, pitch)) = prev {
+        actions.push(PreviewAction::NoteOff { track_id, pitch });
+    }
+    if let Some((track_id, pitch)) = next {
+        actions.push(PreviewAction::NoteOn { track_id, pitch });
+    }
+    actions
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::{PreviewAction, diff_preview};
+
+    #[test]
+    fn none_to_some_emits_note_on() {
+        assert_eq!(
+            diff_preview(None, Some((3, 60))),
+            vec![PreviewAction::NoteOn { track_id: 3, pitch: 60 }],
+        );
+    }
+
+    #[test]
+    fn same_pitch_held_emits_nothing() {
+        assert_eq!(diff_preview(Some((3, 60)), Some((3, 60))), vec![]);
+    }
+
+    #[test]
+    fn glissando_emits_off_then_on() {
+        // Some(a) → Some(b): 旧 pitch off → 新 pitch on の順 (CLAP の同 time
+        // Off→On 要件と整合)。
+        assert_eq!(
+            diff_preview(Some((3, 60)), Some((3, 62))),
+            vec![
+                PreviewAction::NoteOff { track_id: 3, pitch: 60 },
+                PreviewAction::NoteOn { track_id: 3, pitch: 62 },
+            ],
+        );
+    }
+
+    #[test]
+    fn release_emits_note_off() {
+        assert_eq!(
+            diff_preview(Some((3, 60)), None),
+            vec![PreviewAction::NoteOff { track_id: 3, pitch: 60 }],
+        );
+    }
+
+    #[test]
+    fn track_change_retriggers_on_new_track() {
+        // 同 pitch でも track が変われば旧 track off + 新 track on。
+        assert_eq!(
+            diff_preview(Some((3, 60)), Some((5, 60))),
+            vec![
+                PreviewAction::NoteOff { track_id: 3, pitch: 60 },
+                PreviewAction::NoteOn { track_id: 5, pitch: 60 },
+            ],
+        );
+    }
 }
 
 #[cfg(test)]

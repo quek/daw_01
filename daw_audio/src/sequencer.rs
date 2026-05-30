@@ -49,6 +49,13 @@ pub struct PerTrackState {
     /// NoteOffs that must fire at frame 0 of the *next* buffer (after
     /// Stop / clip-end) so notes don't hang.
     pub pending_offs: Vec<u8>,
+    /// 鍵盤レーン click のプレビュー note (on/off)。 engine の `pump_commands`
+    /// が `AudioCommand::PreviewNote*` を受けてここに積み、
+    /// `process_track_owned` が frame 0 で `midi_bus_a` に注入して clear する。
+    /// transport に関係なく注入されるので停止中でも発音する。 `active_notes`
+    /// とは独立 (= sequencer の note 追跡を汚さない)。 lifecycle は GUI 所有
+    /// (= mouse release で note-off を送る、 held-value + caller diff)。
+    pub pending_preview: Vec<NoteTransition>,
 }
 
 impl PerTrackState {
@@ -56,6 +63,7 @@ impl PerTrackState {
         Self {
             active_notes: Vec::with_capacity(cap),
             pending_offs: Vec::with_capacity(cap),
+            pending_preview: Vec::with_capacity(cap),
         }
     }
 }

@@ -400,6 +400,26 @@ pub enum MainToChild {
     /// `false` で無音 (= mix step を skip)。 起動時 default false。
     /// session-only state (project save には含めない)。
     SetMetronomeEnabled(bool),
+    /// 鍵盤レーン click のピッチプレビュー (gui_01 #055,
+    /// `docs/plan_pianoroll_keyboard_preview.md`)。 piano_roll widget の
+    /// `keyboard_active_pitch` を GUI が前フレーム値と差分して導出する
+    /// 単発 note-on。 `track_id` は対象トラックの id (= reorder race-free、
+    /// `SetTrackVolume` 等と同じ id ベース)、 daw_audio 側で現 song snapshot
+    /// から Vec index に解決して該当トラックの音源プラグインへ届ける。
+    /// `velocity` は 0..=127 の MIDI 値 (固定 100)。 transport 状態に
+    /// 関係なく発音する (instrument dispatch は playing 非依存)。
+    PreviewNoteOn {
+        track_id: u32,
+        pitch: u8,
+        velocity: u8,
+    },
+    /// 鍵盤プレビューの note-off (gui_01 #055)。 mouse release /
+    /// glissando の旧 pitch off / 鍵盤外移動で発火。 `track_id` は
+    /// [`PreviewNoteOn`](Self::PreviewNoteOn) と同じく対象トラック id。
+    PreviewNoteOff {
+        track_id: u32,
+        pitch: u8,
+    },
     /// Phase 7 B4 Step C (2026-05-13): count-in 開始 IPC。 audio engine が
     /// `EngineShared::preroll_total_samples` / `preroll_remaining_samples` を
     /// `samples` で store、 `process_buffer` で preroll > 0 のとき dispatch /

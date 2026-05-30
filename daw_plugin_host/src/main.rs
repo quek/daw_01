@@ -1601,6 +1601,8 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
         | MainToChild::SetSongTimeSigNumerator { .. }
         | MainToChild::SetRecordingLanes { .. }
         | MainToChild::SetMetronomeEnabled(_)
+        | MainToChild::PreviewNoteOn { .. }
+        | MainToChild::PreviewNoteOff { .. }
         | MainToChild::StartCountIn { .. } => {
             // daw_audio 専属、 plugin_host では no-op (silent)。
         }

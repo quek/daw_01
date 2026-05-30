@@ -83,7 +83,25 @@ pub enum AudioCommand {
     /// Drop a previously-opened plugin shmem mapping. Triggered on
     /// RemoveSlotPlugin / RemoveTrack from the GUI side.
     ClosePluginShmem { plugin_id: u32 },
+    /// 鍵盤レーン click のプレビュー note-on (gui_01 #055)。 `track` は
+    /// song.tracks の Vec index (= main.rs が `track_id` から現 song snapshot
+    /// で解決済)、 `velocity` は normalized 0..=1。 `pump_commands` が該当
+    /// track の `pending_preview` に積み、 `process_track_owned` が次の
+    /// dispatch で frame 0 に注入する。
+    PreviewNoteOn {
+        track: usize,
+        pitch: u8,
+        velocity: f64,
+    },
+    /// 鍵盤プレビューの note-off (gui_01 #055)。 `track` は note-on と同じ
+    /// Vec index。
+    PreviewNoteOff { track: usize, pitch: u8 },
 }
+
+/// 鍵盤プレビュー note の `note_id`。 sequencer が振る通し index (= 0.. の
+/// 小さい値) と衝突しない sentinel。 CLAP/VST3 は `note_id` を無視し、 builtin
+/// は key 一致で発音/停止するので、 on/off で同値であれば voice 対応が取れる。
+const PREVIEW_NOTE_ID: u32 = u32::MAX;
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -511,6 +529,37 @@ impl LocalState {
                     self.shared.plugin_refs.store(Arc::new(new_refs));
                     self.shared.slot_to_plugin_id.store(Arc::new(new_slot));
                     tracing::info!(plugin_id, "plugin shmem dropped + slot shifted");
+                }
+                AudioCommand::PreviewNoteOn {
+                    track,
+                    pitch,
+                    velocity,
+                } => {
+                    // 鍵盤プレビュー: 該当 track の pending_preview に積む。
+                    // process_track_owned が次の dispatch で frame 0 に注入する。
+                    // capacity 上限で guard し RT での realloc を避ける
+                    // (push_note_on と同じ「溢れたら drop」 方針)。
+                    if let Some(s) = self.scratch.get_mut(track) {
+                        let pp = &mut s.state.pending_preview;
+                        if pp.len() < pp.capacity() {
+                            pp.push(NoteTransition::On {
+                                note_id: PREVIEW_NOTE_ID,
+                                key: pitch,
+                                velocity,
+                            });
+                        }
+                    }
+                }
+                AudioCommand::PreviewNoteOff { track, pitch } => {
+                    if let Some(s) = self.scratch.get_mut(track) {
+                        let pp = &mut s.state.pending_preview;
+                        if pp.len() < pp.capacity() {
+                            pp.push(NoteTransition::Off {
+                                note_id: PREVIEW_NOTE_ID,
+                                key: pitch,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -1061,6 +1110,15 @@ pub fn process_track_owned(
         });
     }
     scratch.state.pending_offs.clear();
+    // 鍵盤レーン click のプレビュー note (engine の pump_commands が該当 track の
+    // pending_preview に積む)。 transport に関係なく frame 0 で 1 回注入する
+    // (instrument dispatch は playing で gate されないので停止中でも発音する)。
+    // collect_events_for_buffer より前に push し、 playing 時は同 buffer の
+    // sort (CLAP の time 昇順 / 同 time は Off→On) に乗せる。
+    for &ev in &scratch.state.pending_preview {
+        scratch.midi_bus_a.push(TimedNoteEvent { time: 0, event: ev });
+    }
+    scratch.state.pending_preview.clear();
     if playing {
         collect_events_for_buffer(
             song,

@@ -250,6 +250,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         make_edit,
     );
 
+    // gui_01 #055: 鍵盤レーン click のピッチプレビュー。 widget が押下中の pitch を
+    // keyboard_active_pitch で返す。 前フレーム値 (app.preview_note の pitch) と
+    // 差分し、 変化した frame だけ PreviewPitchChanged を発火する (handler が
+    // note-on/off を導出)。 鳴らす track は描画中 clip の track (target.track)。
+    if resp.keyboard_active_pitch != app.preview_note.map(|(_, p)| p) {
+        let track_idx = target.track;
+        let pitch = resp.keyboard_active_pitch;
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::PreviewPitchChanged { track_idx, pitch });
+        }));
+    }
+
     // 空白上 dbl-click → AddNote (snap_choice / Alt 押下を尊重)。
     if let Some((px, py)) = ui.take_double_click_in_rect(grid_rect)
         && note_hit(&widget_notes, view, grid_rect, px, py, resize_handle_px).is_none()

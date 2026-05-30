@@ -278,6 +278,30 @@ async fn recv_loop(
                     std::sync::atomic::Ordering::Release,
                 );
             }
+            Ok(MainToChild::PreviewNoteOn {
+                track_id,
+                pitch,
+                velocity,
+            }) => {
+                // 鍵盤レーン click のプレビュー (gui_01 #055)。 GUI は track id を
+                // 送る。 ここで audio engine の現 song snapshot から Vec index を
+                // 引いて AudioCommand に載せ替える (index は scratch / per-track
+                // dispatch の addressing)。 解決は IPC スレッド上 = RT 外。 song
+                // 未ロード / id 不在なら drop (= 無音、 plan §4 の no-op)。
+                if let Some(track) = preview_track_index(&shared, track_id) {
+                    let _ = cmd_tx.send(engine::AudioCommand::PreviewNoteOn {
+                        track,
+                        pitch,
+                        velocity: f64::from(velocity) / 127.0,
+                    });
+                }
+            }
+            Ok(MainToChild::PreviewNoteOff { track_id, pitch }) => {
+                if let Some(track) = preview_track_index(&shared, track_id) {
+                    let _ =
+                        cmd_tx.send(engine::AudioCommand::PreviewNoteOff { track, pitch });
+                }
+            }
             Ok(MainToChild::SetRecordingLanes { lanes }) => {
                 // Phase 4 Step C-2: GUI が「現在 recording 中の lane」 セットを
                 // 送ってきた。 ArcSwap で snapshot を replace し、 audio thread
@@ -499,6 +523,19 @@ fn handle_open_worker_pool(
 /// `ArcSwap` keeps the swap wait-free for the audio thread; the clone
 /// happens on the IPC thread, which is acceptable because mixer-strip
 /// changes are user-driven (slider drag rate, not per-buffer).
+/// 鍵盤プレビューの note-on/off を送る対象 track の Vec index を、 audio engine
+/// の現 song snapshot から track id で引く。 song 未ロード / id 不在 / `MAX_TRACKS`
+/// 超過は `None` (= プレビュー drop)。 id ベースなので GUI 側の track 並べ替えと
+/// race しない (= `SetTrackVolume` 等と同じ方針)。
+fn preview_track_index(shared: &Arc<engine::SharedState>, track_id: u32) -> Option<usize> {
+    let snapshot = shared.song.load();
+    let song = snapshot.as_deref()?;
+    song.tracks
+        .iter()
+        .position(|t| t.id == track_id)
+        .filter(|&i| i < engine::MAX_TRACKS)
+}
+
 fn update_song_track<F>(shared: &Arc<engine::SharedState>, f: F)
 where
     F: FnOnce(&mut common::model::Song),
