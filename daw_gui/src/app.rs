@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex};
 const UNDO_LIMIT: usize = 200;
 
 use common::model::{
-    AudioContent, AudioEvent, Clip, ClipContent, InstrumentSource, MidiContent, Note, Song, Track,
+    AudioContent, AudioEvent, Clip, ClipContent, InstrumentSource, MidiContent, Note, SendMode,
+    Song, Track,
 };
 use common::plugin_db::PluginDatabase;
 use common::plugin_format::PluginFormat;
@@ -63,6 +64,10 @@ pub struct TrackMixEntry {
     /// `kind == Group` のとき mixer strip / arrangement で別色表示し、
     /// 子トラックを束ねる sub-mix bus として識別する。
     pub is_group: bool,
+    /// このトラックが「リターン」 (= 他トラックの send 宛先) かどうか。
+    /// `is_group` と同じく派生値で、`Track::kind` のような field は無い。
+    /// mixer がリターンストリップを通常 strip と分けて描画するために使う。
+    pub is_return: bool,
     /// このトラックの depth (parent_group_id を辿った段数)。 0 = master 直下、
     /// 1 = 1 段ネスト、… mixer strip / arrangement view が階層インデント描画に使う。
     pub depth: u8,
@@ -81,6 +86,7 @@ impl Default for TrackMixEntry {
             peak_l_raw: 0.0,
             peak_r_raw: 0.0,
             is_group: false,
+            is_return: false,
             depth: 0,
         }
     }
@@ -268,6 +274,16 @@ pub struct SidechainEntry {
 pub struct SidechainSourceChoice {
     pub label: String,
     pub track_id: Option<u32>,
+}
+
+/// 「＋ Send」 ボタンで開く宛先トラックピッカーの状態。 plugin_picker の
+/// `is_plugin_picker_open` + `plugin_picker_target` と同 idiom で、 開いて
+/// いる間 `Some(..)` を保持し、 `src_track_id` (= send 元) を覚えておく。
+/// track_picker.rs がこれを見て modal を開閉する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendPickerState {
+    /// この track に新しい send を追加する (= send 元)。
+    pub src_track_id: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -807,6 +823,10 @@ pub struct AppData {
     /// `plugin_picker_visible.get(cursor)` を確定する。 `refresh_picker_visible` が
     /// 呼ばれる度 (絞り込み再計算 / モーダル open / rescan 完了) に 0 にリセット。
     pub plugin_picker_cursor: usize,
+    /// 「＋ Send」 ボタンで開く宛先トラックピッカーの状態。 `Some` の間
+    /// modal が開いており、 宛先選択 or 閉じる操作で `None` に戻る。
+    /// plugin picker の `is_plugin_picker_open` と同 idiom。
+    pub send_picker: Option<SendPickerState>,
 
     // -------- Save flow / IPC --------
     /// `RequestAllStates` を発行した順に保持するキュー。 front が現在 in-flight
@@ -1154,6 +1174,7 @@ impl AppData {
             is_plugin_picker_open: false,
             plugin_picker_target: PickerTarget::Instrument,
             plugin_picker_cursor: 0,
+            send_picker: None,
             pending_state_queue: VecDeque::new(),
             audio_tx: Some(audio_tx),
             plugin_tx: Some(plugin_tx),
@@ -1267,6 +1288,64 @@ impl AppData {
             .any(|t| t.parent_group_id == Some(track_id))
     }
 
+    /// A track acts as a "return" iff at least one other track has a
+    /// `Send` whose `dest_track_id` points at it. Purely derived (no
+    /// `Track::kind`), mirroring `is_group_track`. SSOT (CLAUDE.md).
+    pub fn is_return_track(&self, track_id: u32) -> bool {
+        self.song
+            .tracks
+            .iter()
+            .flat_map(|t| t.sends.iter())
+            .any(|s| s.dest_track_id == track_id)
+    }
+
+    /// 「＋ Send」 ピッカーに出す宛先候補 `(track_id, display_name)`。
+    /// `src_track_id` 自身は除外し、 加えて「その宛先が send 辺で
+    /// (直接 / 間接に) `src` に戻ってくる」 = ルーティング閉路を作る track
+    /// も除外する。 閉路判定は send グラフ上で `dest` から `src` への
+    /// 到達可能性を BFS で見る (= `dest` を起点に send を辿って `src` に
+    /// 着けば、 `src -> dest` を足すと閉路になる)。 schedule compiler 側も
+    /// 閉路を弾くが、 GUI で予め隠すことで誤操作を防ぐ。
+    pub fn send_destination_candidates(&self, src_track_id: u32) -> Vec<(u32, String)> {
+        // dest を起点に send 辺を辿って src に到達するか。 到達するなら
+        // src -> dest は閉路を成すので候補から除く。
+        let creates_cycle = |dest: u32| -> bool {
+            if dest == src_track_id {
+                return true;
+            }
+            let mut stack = vec![dest];
+            let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            while let Some(cur) = stack.pop() {
+                if cur == src_track_id {
+                    return true;
+                }
+                if !seen.insert(cur) {
+                    continue;
+                }
+                if let Some(t) = self.song.track_by_id(cur) {
+                    for s in &t.sends {
+                        stack.push(s.dest_track_id);
+                    }
+                }
+            }
+            false
+        };
+        self.song
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.id != src_track_id && !creates_cycle(t.id))
+            .map(|(i, t)| {
+                let name = if t.name.is_empty() {
+                    format!("Track {}", i + 1)
+                } else {
+                    t.name.clone()
+                };
+                (t.id, name)
+            })
+            .collect()
+    }
+
     /// Walk a track's `parent_group_id` chain to count how many group
     /// hops sit between it and the master bus. Saturated at 32 to keep
     /// pathological cycles (which the schedule compiler also rejects)
@@ -1295,12 +1374,19 @@ impl AppData {
         let n_tracks = self.song.tracks.len();
         let mut is_group_set: std::collections::HashSet<u32> =
             std::collections::HashSet::with_capacity(n_tracks);
+        // リターン判定も同 pass で batch 集計 (= is_group と同 idiom)。
+        // ある track に向けて 1 本でも send があれば、 その宛先はリターン。
+        let mut is_return_set: std::collections::HashSet<u32> =
+            std::collections::HashSet::with_capacity(n_tracks);
         let mut id_to_parent: std::collections::HashMap<u32, Option<u32>> =
             std::collections::HashMap::with_capacity(n_tracks);
         for t in &self.song.tracks {
             id_to_parent.insert(t.id, t.parent_group_id);
             if let Some(pid) = t.parent_group_id {
                 is_group_set.insert(pid);
+            }
+            for s in &t.sends {
+                is_return_set.insert(s.dest_track_id);
             }
         }
         // depth は parent chain を walk するが、 lookup を `id_to_parent`
@@ -1341,6 +1427,7 @@ impl AppData {
                     peak_l_raw: l,
                     peak_r_raw: r,
                     is_group: is_group_set.contains(&t.id),
+                    is_return: is_return_set.contains(&t.id),
                     depth: compute_depth(t.id),
                 }
             })
@@ -2921,6 +3008,35 @@ pub enum AppEvent {
     ToggleTrackArmed(u32),
     TrackPeaksTick(Vec<(f32, f32)>),
 
+    // -------- Aux send / return ------------------------------------------
+    /// master 直下 (`parent_group_id = None`) の通常 track を 1 本作り
+    /// `"Return N"` と命名する (N = 既存リターン数 + 1)。 track が選択中なら
+    /// その track に `Send { dest = 新リターン, gain 1.0, PostFader, enabled }`
+    /// を 1 本足して即座に効果が聞こえるようにする (Ableton "Add Return")。
+    /// 構造変化なので full-song resend を trigger する。
+    AddReturnTrack,
+    /// `src_track_id` の `sends` に `dest_track_id` 宛ての send を 1 本追加。
+    /// gain 1.0 / PostFader / enabled。 構造変化 → full-song resend。
+    AddSend { src_track_id: u32, dest_track_id: u32 },
+    /// `track_id` の `sends[send_idx]` を削除。 構造変化 → full-song resend。
+    /// (後続 send の index がずれるが、 resend で schedule が再 compile
+    /// されるため問題ない。 automation lane の reindex は本タスク対象外。)
+    RemoveSend { track_id: u32, send_idx: usize },
+    /// `track_id` の `sends[send_idx].mode` を設定。 tap 位置 (pre/post)
+    /// は routing graph に影響するので 構造変化 → full-song resend。
+    SetSendMode { track_id: u32, send_idx: usize, mode: SendMode },
+    /// `track_id` の `sends[send_idx].gain` を設定 (clamp 0..2) + realtime
+    /// `MainToChild::SetSendGain` を送る。 SetTrackVolume と同 idiom、
+    /// full-song resend しない (= drag 中の高頻度更新)。
+    SetSendGain { track_id: u32, send_idx: usize, gain: f32 },
+    /// `track_id` の `sends[send_idx].enabled` を設定 + realtime
+    /// `MainToChild::SetSendEnabled` を送る。 full-song resend しない。
+    SetSendEnabled { track_id: u32, send_idx: usize, enabled: bool },
+    /// 宛先トラックピッカーを開く (= send 元 = `src_track_id`)。
+    OpenSendPicker { src_track_id: u32 },
+    /// 宛先トラックピッカーを閉じる。
+    CloseSendPicker,
+
     // -------- VOICEVOX ----------------------------------------------------
     // PR-V4: SynthesizeVocal / VocalSynthCompleted は削除済 (builtin
     // VOICEVOX plugin 経由で自動 synth)。
@@ -4064,6 +4180,30 @@ impl AppData {
             }
             AppEvent::TrackPeaksTick(peaks) => {
                 self.on_track_peaks_tick(&peaks);
+            }
+            AppEvent::AddReturnTrack => {
+                self.action_add_return_track();
+            }
+            AppEvent::AddSend { src_track_id, dest_track_id } => {
+                self.add_send(src_track_id, dest_track_id);
+            }
+            AppEvent::RemoveSend { track_id, send_idx } => {
+                self.remove_send(track_id, send_idx);
+            }
+            AppEvent::SetSendMode { track_id, send_idx, mode } => {
+                self.set_send_mode(track_id, send_idx, mode);
+            }
+            AppEvent::SetSendGain { track_id, send_idx, gain } => {
+                self.set_send_gain(track_id, send_idx, gain);
+            }
+            AppEvent::SetSendEnabled { track_id, send_idx, enabled } => {
+                self.set_send_enabled(track_id, send_idx, enabled);
+            }
+            AppEvent::OpenSendPicker { src_track_id } => {
+                self.send_picker = Some(SendPickerState { src_track_id });
+            }
+            AppEvent::CloseSendPicker => {
+                self.send_picker = None;
             }
             AppEvent::ExportWav => {
                 self.action_export_wav();
@@ -12498,6 +12638,159 @@ impl AppData {
             ),
             display_name: "Pan".to_string(),
             touched_at: std::time::Instant::now(),
+        });
+    }
+
+    // -------- Aux send / return -------------------------------------------
+
+    /// Ableton "Add Return" 相当。 master 直下の通常 track を 1 本作って
+    /// `"Return N"` と命名し、 track が選択中ならその track に新リターン宛て
+    /// の send を 1 本足して即座に効果が聞こえるようにする。 構造変化なので
+    /// `sync_song_to_plugin_host` で full-song resend (= schedule 再 compile)。
+    /// `action_add_instrument_track` を mirror した構成。
+    fn action_add_return_track(&mut self) {
+        // 既存リターン数 + 1 で命名 (= 派生集合の cardinality)。
+        let existing_returns = self
+            .song
+            .tracks
+            .iter()
+            .filter(|t| self.is_return_track(t.id))
+            .count();
+        let id = self.song.alloc_track_id();
+        let track = Track {
+            id,
+            name: format!("Return {}", existing_returns + 1),
+            // リターンは master 直下に流す。
+            parent_group_id: None,
+            ..Track::default()
+        };
+        self.song.tracks.push(track);
+        // 選択中 track があれば、 そこから新リターンへ即座に send を 1 本張る
+        // (Ableton "Add Return" の即時性)。 選択が無ければ wiring だけ作って
+        // ユーザーが後で「＋ Send」 で繋ぐ。 自分自身宛て (= 新リターンが
+        // 選択されていた可能性) は意味が無いので除外。
+        if let Some(sel_id) = self.cursor_track_id()
+            && sel_id != id
+            && let Some(src) = self.song.tracks.iter_mut().find(|t| t.id == sel_id)
+        {
+            src.sends.push(common::model::Send {
+                dest_track_id: id,
+                gain: 1.0,
+                mode: SendMode::PostFader,
+                enabled: true,
+            });
+        }
+        self.resize_track_peak_display();
+        self.sync_song_to_plugin_host();
+        tracing::info!(return_id = id, "added return track");
+    }
+
+    /// `src_track_id` に `dest_track_id` 宛ての send を 1 本追加。 構造変化
+    /// なので full-song resend。 同宛先の重複 send は許す (= Ableton も複数
+    /// 同一 return への send を別途持てる訳ではないが、 本 MVP では単純に
+    /// append、 picker 側で self-cycle のみ除外)。
+    fn add_send(&mut self, src_track_id: u32, dest_track_id: u32) {
+        if src_track_id == dest_track_id {
+            return;
+        }
+        let Some(src) = self.song.tracks.iter_mut().find(|t| t.id == src_track_id) else {
+            return;
+        };
+        src.sends.push(common::model::Send {
+            dest_track_id,
+            gain: 1.0,
+            mode: SendMode::PostFader,
+            enabled: true,
+        });
+        self.sync_song_to_plugin_host();
+        tracing::info!(src_track_id, dest_track_id, "added send");
+    }
+
+    /// `track_id` の `sends[send_idx]` を削除。 構造変化 → full-song resend。
+    /// 後続 send の index がずれるが、 resend で schedule が新 index で
+    /// 再 compile されるため問題ない。 なお in-flight な automation lane が
+    /// `SendGain { send_idx }` を target にしている場合、 その lane の参照は
+    /// 旧 index のまま残る — 本タスクでは lane の reindex は行わない (= 別
+    /// タスク。 当面は stale lane を許容、 schedule 側は範囲外 send_idx を
+    /// 無視する)。
+    fn remove_send(&mut self, track_id: u32, send_idx: usize) {
+        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+            return;
+        };
+        if send_idx >= t.sends.len() {
+            return;
+        }
+        t.sends.remove(send_idx);
+        self.sync_song_to_plugin_host();
+        tracing::info!(track_id, send_idx, "removed send");
+    }
+
+    /// `track_id` の `sends[send_idx].mode` を設定。 tap 位置 (pre/post) は
+    /// routing graph に影響するので 構造変化 → full-song resend。
+    fn set_send_mode(&mut self, track_id: u32, send_idx: usize, mode: SendMode) {
+        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+            return;
+        };
+        let Some(send) = t.sends.get_mut(send_idx) else {
+            return;
+        };
+        if send.mode == mode {
+            return;
+        }
+        send.mode = mode;
+        self.sync_song_to_plugin_host();
+    }
+
+    /// `sends[send_idx].gain` を 0..2 に clamp して設定 + realtime IPC。
+    /// `set_track_volume` を mirror — full-song resend しない (= drag 中の
+    /// 高頻度更新を audio engine が live re-read する)。 last-touched param も
+    /// 更新して `A` キーで send-gain automation lane を生やせるようにする。
+    fn set_send_gain(&mut self, track_id: u32, send_idx: usize, gain: f32) {
+        let g = gain.clamp(0.0, 2.0);
+        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+            return;
+        };
+        let Some(send) = t.sends.get_mut(send_idx) else {
+            return;
+        };
+        send.gain = g;
+        // send_idx は u8 (= AutomationTarget / protocol の表現) に収まる範囲
+        // のみ realtime 送信。 256 本以上の send は非現実的だが防衛的に gate。
+        let Ok(send_idx_u8) = u8::try_from(send_idx) else {
+            return;
+        };
+        self.send_audio(MainToChild::SetSendGain {
+            track: track_id,
+            send_idx: send_idx_u8,
+            gain: g,
+        });
+        self.last_touched_param = Some(TouchedParam {
+            track_id,
+            target: common::model::AutomationTarget::TrackBuiltin(
+                common::model::TrackBuiltinParam::SendGain { send_idx: send_idx_u8 },
+            ),
+            display_name: format!("Send {}", send_idx + 1),
+            touched_at: std::time::Instant::now(),
+        });
+    }
+
+    /// `sends[send_idx].enabled` を設定 + realtime IPC。 `set_send_gain` と
+    /// 同 idiom、 full-song resend しない (= 配線は維持したまま mute)。
+    fn set_send_enabled(&mut self, track_id: u32, send_idx: usize, enabled: bool) {
+        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+            return;
+        };
+        let Some(send) = t.sends.get_mut(send_idx) else {
+            return;
+        };
+        send.enabled = enabled;
+        let Ok(send_idx_u8) = u8::try_from(send_idx) else {
+            return;
+        };
+        self.send_audio(MainToChild::SetSendEnabled {
+            track: track_id,
+            send_idx: send_idx_u8,
+            enabled,
         });
     }
 

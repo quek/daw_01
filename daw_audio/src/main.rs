@@ -223,6 +223,35 @@ async fn recv_loop(
                     }
                 });
             }
+            Ok(MainToChild::SetSendGain {
+                track,
+                send_idx,
+                gain,
+            }) => {
+                // Realtime aux-send level. Same lightweight clone-mutate-
+                // store path as SetTrackVolume — the MixSend op re-reads
+                // this live (ramped) without recompiling the schedule.
+                update_song_track(&shared, |s| {
+                    if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track)
+                        && let Some(send) = t.sends.get_mut(send_idx as usize)
+                    {
+                        send.gain = gain.clamp(0.0, 2.0);
+                    }
+                });
+            }
+            Ok(MainToChild::SetSendEnabled {
+                track,
+                send_idx,
+                enabled,
+            }) => {
+                update_song_track(&shared, |s| {
+                    if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track)
+                        && let Some(send) = t.sends.get_mut(send_idx as usize)
+                    {
+                        send.enabled = enabled;
+                    }
+                });
+            }
             Ok(MainToChild::SetTrackArmed { track, armed }) => {
                 // Phase 7 B4 (2026-05-13): track.armed を Song に反映するのみ。
                 // 録音書き込み自体は GUI process で行うため audio thread 側

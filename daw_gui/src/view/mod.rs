@@ -18,5 +18,6 @@ pub mod shortcuts;
 pub mod snap;
 pub mod status_bar;
 pub mod track_inspector;
+pub mod track_picker;
 pub mod transport;
 pub mod window;

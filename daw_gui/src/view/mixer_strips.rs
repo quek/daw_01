@@ -7,7 +7,7 @@
 //!   - Pan knob
 //!   - Volume fader (縦) + L/R peak meter
 
-use common::model::{AutomationTarget, TrackBuiltinParam};
+use common::model::{AutomationTarget, SendMode, TrackBuiltinParam};
 use daw_ui_core::{Edit, LevelMeterStyle, MeterBallistic, ToggleButtonStyle, Ui};
 
 use crate::view::param_gesture::push_param_gesture_edges;
@@ -23,6 +23,16 @@ const KNOB_SIZE: f32 = 32.0;
 const FADER_W: f32 = 18.0;
 const METER_W: f32 = 4.0;
 const METER_GAP: f32 = 2.0;
+/// Sends セクション 1 行の高さ (= 宛先名ラベル + 小 knob / 小ボタン群)。
+const SEND_ROW_H: f32 = 30.0;
+/// Sends セクション内の send 用ミニ knob のサイズ。
+const SEND_KNOB_SIZE: f32 = 18.0;
+/// 「＋ Send」 ボタンの高さ。
+const ADD_SEND_H: f32 = 16.0;
+/// returns 帯と通常 strip 帯を分ける divider の幅。
+const RETURN_DIVIDER_W: f32 = 2.0;
+/// 「＋ Return」 ボタンの高さ (returns 帯の上端に置く)。
+const ADD_RETURN_H: f32 = 22.0;
 
 const COLOR_BG: Color = Color { r: 0.13, g: 0.13, b: 0.15, a: 1.0 };
 const COLOR_STRIP_BG: Color = Color { r: 0.18, g: 0.18, b: 0.22, a: 1.0 };
@@ -30,6 +40,11 @@ const COLOR_STRIP_BG: Color = Color { r: 0.18, g: 0.18, b: 0.22, a: 1.0 };
 /// closer in luminance to MASTER_BG so the eye reads it as a bus rather
 /// than a track.
 const COLOR_GROUP_BG: Color = Color { r: 0.18, g: 0.22, b: 0.30, a: 1.0 };
+/// Return strip — 緑寄りの tint で、 通常 track / group bus とも別物だと
+/// 一目で分かるようにする (Ableton の return track 列のメタファ)。
+const COLOR_RETURN_BG: Color = Color { r: 0.18, g: 0.28, b: 0.22, a: 1.0 };
+/// returns 帯と通常帯を分ける縦 divider の色。
+const COLOR_RETURN_DIVIDER: Color = Color { r: 0.30, g: 0.40, b: 0.32, a: 1.0 };
 const COLOR_MASTER_BG: Color = Color { r: 0.22, g: 0.22, b: 0.28, a: 1.0 };
 const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
 const COLOR_TEXT_DIM: Color = Color { r: 0.65, g: 0.68, b: 0.72, a: 1.0 };
@@ -63,6 +78,22 @@ const STYLE_SOLO: ToggleButtonStyle = ToggleButtonStyle {
     ..TOGGLE_BUTTON_BASE
 };
 
+/// send 内 per-send mute (`enabled`)。 mute と同じ赤系 on_color、 ただし
+/// `enabled == true` (= 鳴っている) が「OFF 表示」、 `enabled == false`
+/// (= ミュート) が「ON 表示 (赤)」 になるよう、 描画側で `!enabled` を渡す。
+const STYLE_SEND_MUTE: ToggleButtonStyle = ToggleButtonStyle {
+    on_color: COLOR_MUTE_ACTIVE,
+    font_size: 10.0,
+    ..TOGGLE_BUTTON_BASE
+};
+
+/// Pre/Post 切替トグル。 PreFader のとき on_color (青系) で強調する。
+const STYLE_SEND_PREPOST: ToggleButtonStyle = ToggleButtonStyle {
+    on_color: Color { r: 0.32, g: 0.55, b: 0.85, a: 1.0 },
+    font_size: 9.0,
+    ..TOGGLE_BUTTON_BASE
+};
+
 pub(crate) const DB_MIN: f32 = -80.0;
 pub(crate) const DB_MAX: f32 = 6.0;
 pub(crate) const DB_RANGE: f32 = DB_MAX - DB_MIN;
@@ -90,70 +121,83 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let inner_pad = 8.0;
     let strip_y = area.y + inner_pad;
     let strip_h = area.h - inner_pad * 2.0;
+    let pitch = STRIP_WIDTH + STRIP_GAP;
 
-    // Master strip (右端固定、scroll_area の外)
+    // 派生集合に基づいて mix を「通常 track」 と「リターン (= 他 track の
+    // send 宛先)」 に分割する。 リターンは右側に固めて divider + 緑 tint で
+    // 別物として見せる (Ableton の return track 列メタファ)。 normal / return
+    // 両方とも `track_mix` から来た `is_return` フラグで判定 (派生値、 SSOT)。
+    let mix = app.track_mix();
+    // A track can be both a group (has children) and a return (has incoming
+    // sends) — the unified model allows it and the audio graph handles it.
+    // When it is both, keep it in the *normal* band so it renders with its
+    // children (group hierarchy intact); only a **pure** return (no
+    // children) goes to the returns band. Otherwise the parent strip would
+    // be yanked right while its children stayed left, severing the tree.
+    let (returns, normals): (Vec<_>, Vec<_>) =
+        mix.iter().partition(|e| e.is_return && !e.is_group);
+
+    // ----- 右端から固定配置: MASTER → returns 帯 → 「＋ Return」 -----
     let master_x = area.x + area.w - inner_pad - STRIP_WIDTH;
 
-    // Per-track strips: 左端 inner_pad から master_x の手前まで scroll_area で横スクロール
+    // returns 帯: master の左に returns.len() 本 + 帯上端に「＋ Return」 ボタン。
+    // returns 0 本でも「＋ Return」 ボタンは出す (= master のすぐ左)。
+    let returns_w = (returns.len() as f32) * pitch;
+    // 「＋ Return」 ボタン用に固定列を 1 本分確保する。
+    let add_return_col_w = STRIP_WIDTH;
+    let returns_band_x = master_x - inner_pad - returns_w;
+    let add_return_x = returns_band_x - STRIP_GAP - add_return_col_w;
+
+    // 通常 track strips: 左端 inner_pad から returns 帯 / Add Return 列の手前まで
+    // scroll_area で横スクロール。
     let scroll_x = area.x + inner_pad;
-    let scroll_w = (master_x - inner_pad - scroll_x).max(0.0);
+    let scroll_right = add_return_x - inner_pad;
+    let scroll_w = (scroll_right - scroll_x).max(0.0);
     let scroll_rect = Rect { x: scroll_x, y: strip_y, w: scroll_w, h: strip_h };
-    let mix = app.track_mix();
-    let pitch = STRIP_WIDTH + STRIP_GAP;
-    let content_w = (mix.len() as f32) * pitch;
+    let content_w = (normals.len() as f32) * pitch;
     ui.scroll_area("mixer_strips", scroll_rect, (content_w, strip_h), |ui, offset| {
-        for (i, entry) in mix.iter().enumerate() {
+        for (i, entry) in normals.iter().enumerate() {
             let x = scroll_x - offset.0 + (i as f32) * pitch;
             if x + STRIP_WIDTH < scroll_x || x > scroll_x + scroll_w {
                 continue;
             }
-            // Group strips wear a bluer tint so the eye picks them
-            // out from regular per-track strips. PR2 shows depth as a
-            // small "↳" prefix on the name (real indented mixer rows
-            // would need a per-row layout overhaul; deferred).
-            let bg = if entry.is_group { COLOR_GROUP_BG } else { COLOR_STRIP_BG };
-            let display_name = if entry.depth > 0 {
-                let arrows = "↳".repeat(entry.depth.min(4) as usize);
-                format!("{arrows} {}", entry.name)
-            } else {
-                entry.name.clone()
-            };
-            // Phase 4 Step B: AutomationTarget::TrackBuiltin(Volume / Pan)
-            // が現在 active gesture 中かを app から読み出して、 widget の
-            // dragging 状態と diff を取る (= edge 検知)。 Phase 6 review:
-            // gesture key も AppEvent / IPC も全て stable な `entry.track_id`
-            // に統一 (旧コードは `entry.index` (Vec 位置) を track_id だと
-            // 思い込んでいて SSOT 違反)。
-            let track_id = entry.track_id;
-            let was_dragging_vol = app
-                .active_param_gestures
-                .contains(&(track_id, AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume)));
-            let was_dragging_pan = app
-                .active_param_gestures
-                .contains(&(track_id, AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan)));
-            draw_strip(
-                ui,
-                // layout_idx は widget id stability 用 (= Vec 位置でも track_id
-                // でも構わないが、 track_id の方が reorder 跨ぎで widget state
-                // が一貫する)。
-                track_id as usize,
-                &display_name,
-                entry.volume,
-                entry.pan,
-                entry.muted,
-                entry.solo,
-                entry.peak_l_raw,
-                entry.peak_r_raw,
-                Rect { x, y: strip_y, w: STRIP_WIDTH, h: strip_h },
-                bg,
-                track_id,
-                false,
-                was_dragging_vol,
-                was_dragging_pan,
-            );
+            draw_track_strip(app, ui, entry, Rect { x, y: strip_y, w: STRIP_WIDTH, h: strip_h });
         }
     });
 
+    // ----- 「＋ Return」 ボタン (Add Return 列) -----
+    ui.button_at(
+        "mixer_add_return",
+        "+ Return",
+        Rect { x: add_return_x, y: strip_y, w: add_return_col_w, h: ADD_RETURN_H },
+        || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::AddReturnTrack)),
+    );
+
+    // ----- returns 帯の divider + return strips -----
+    if !returns.is_empty() {
+        // 帯の左端に縦 divider を引いて「ここから右はリターン」 を示す。
+        ui.panel(
+            "mixer_return_divider",
+            Rect {
+                x: returns_band_x - STRIP_GAP - RETURN_DIVIDER_W,
+                y: strip_y,
+                w: RETURN_DIVIDER_W,
+                h: strip_h,
+            },
+            COLOR_RETURN_DIVIDER,
+            0.0,
+        );
+        for (i, entry) in returns.iter().enumerate() {
+            let x = returns_band_x + (i as f32) * pitch;
+            // リターンは通常の fader / pan / mute / solo を持つ。 send 元には
+            // ならない想定だが、 リターンから別リターンへ送るのも閉路防止
+            // 込みで許容されている (本タスクでは Sends セクションはリターン
+            // strip には出さない = 簡潔さ優先、 normal strip 経由で繋ぐ)。
+            draw_return_strip(app, ui, entry, Rect { x, y: strip_y, w: STRIP_WIDTH, h: strip_h });
+        }
+    }
+
+    // ----- MASTER strip (右端固定) -----
     // Master strip は track ではないので gesture 対象外 (= 渡す flag は false)。
     draw_strip(
         ui,
@@ -169,9 +213,95 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         COLOR_MASTER_BG,
         u32::MAX,
         true,
+        0.0, // sends_band_h (master は Sends セクション無し)
         false,
         false,
     );
+}
+
+/// 通常 (= 非リターン) track strip。 fader / pan / mute / solo + Sends
+/// セクションを描画する。
+fn draw_track_strip(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    entry: &crate::app::TrackMixEntry,
+    rect: Rect,
+) {
+    // Group strips wear a bluer tint so the eye picks them out from
+    // regular per-track strips. depth は "↳" prefix で表現。
+    let bg = if entry.is_group { COLOR_GROUP_BG } else { COLOR_STRIP_BG };
+    let display_name = if entry.depth > 0 {
+        let arrows = "↳".repeat(entry.depth.min(4) as usize);
+        format!("{arrows} {}", entry.name)
+    } else {
+        entry.name.clone()
+    };
+    let track_id = entry.track_id;
+    let (was_dragging_vol, was_dragging_pan) = drag_flags(app, track_id);
+    let n_sends = app.song.track_by_id(track_id).map_or(0, |t| t.sends.len());
+    let sends_band_h = sends_band_height(n_sends);
+    draw_strip(
+        ui,
+        track_id as usize,
+        &display_name,
+        entry.volume,
+        entry.pan,
+        entry.muted,
+        entry.solo,
+        entry.peak_l_raw,
+        entry.peak_r_raw,
+        rect,
+        bg,
+        track_id,
+        false,
+        sends_band_h,
+        was_dragging_vol,
+        was_dragging_pan,
+    );
+    // Sends セクションは draw_strip の fader 下端より下の band に描画する。
+    draw_sends_section(app, ui, track_id, rect, sends_band_h);
+}
+
+/// リターン strip。 通常の fader / pan / mute / solo を持つが、 緑 tint で
+/// 別物として見せ、 Sends セクションは描画しない (= 簡潔さ優先)。
+fn draw_return_strip(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    entry: &crate::app::TrackMixEntry,
+    rect: Rect,
+) {
+    let track_id = entry.track_id;
+    let (was_dragging_vol, was_dragging_pan) = drag_flags(app, track_id);
+    draw_strip(
+        ui,
+        track_id as usize,
+        &entry.name,
+        entry.volume,
+        entry.pan,
+        entry.muted,
+        entry.solo,
+        entry.peak_l_raw,
+        entry.peak_r_raw,
+        rect,
+        COLOR_RETURN_BG,
+        track_id,
+        false,
+        0.0, // sends_band_h = 0 (リターンは send 元 UI を出さない)
+        was_dragging_vol,
+        was_dragging_pan,
+    );
+}
+
+/// この track の Volume / Pan が前フレーム時点で active gesture かを
+/// `AppData.active_param_gestures` から引く (= gesture edge 検知用)。
+fn drag_flags(app: &AppData, track_id: u32) -> (bool, bool) {
+    let vol = app
+        .active_param_gestures
+        .contains(&(track_id, AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume)));
+    let pan = app
+        .active_param_gestures
+        .contains(&(track_id, AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan)));
+    (vol, pan)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -189,6 +319,11 @@ fn draw_strip(
     bg: Color,
     track_idx: u32,
     is_master: bool,
+    // この strip 下部に確保する Sends セクション band の高さ (px)。 通常
+    // track は caller が `sends_band_height` で算出した値、 リターン / master
+    // は 0。 fader 下端をこの分だけ持ち上げて領域を空ける。 Sends セクション
+    // 本体の描画は caller (`draw_track_strip`) が `draw_sends_section` で行う。
+    sends_band_h: f32,
     // Phase 4 Step B: 前フレーム時点での「この track の Volume / Pan が
     // active gesture か」 を caller (= draw) が AppData から読んだ値。 widget
     // の dragging 結果と diff して ParamGestureBegin / End を発火する。
@@ -271,9 +406,11 @@ fn draw_strip(
         y += KNOB_SIZE + 4.0;
     }
 
-    // 縦 fader + L/R peak meter
+    // 縦 fader + L/R peak meter。 Sends セクションを持つ strip では、 その
+    // band の高さ分だけ fader 下端を持ち上げて領域を空ける (= caller が
+    // `draw_sends_section` で同じ band geometry を使って描く)。
     let fader_top = y + 4.0;
-    let fader_bottom = rect.y + rect.h - pad - 12.0;
+    let fader_bottom = rect.y + rect.h - pad - 12.0 - sends_band_h;
     let fader_h = (fader_bottom - fader_top).max(20.0);
 
     let group_w = FADER_W + (METER_W * 2.0 + METER_GAP * 2.0);
@@ -335,6 +472,196 @@ fn draw_strip(
         peak_r_raw,
         MeterBallistic::Peak,
         meter_style,
+    );
+}
+
+/// strip 下部に確保する Sends セクション band の高さ (px)。 send 行数 +
+/// 「＋ Send」 ボタン + 区切り余白で決まる。 `draw_strip` (fader 短縮量) と
+/// `draw_sends_section` (実描画) の両方がこれを使って geometry を揃える。
+fn sends_band_height(n_sends: usize) -> f32 {
+    // 上端の区切り線 + 各 send 行 + 「＋ Send」 ボタン + 下端余白。
+    4.0 + (n_sends as f32) * SEND_ROW_H + ADD_SEND_H + 4.0
+}
+
+/// strip 下部の Sends セクションを描画する。 各 send 1 行:
+///   宛先名ラベル + [ミニ level knob | Pre/Post | M(per-send mute) | ×]
+/// 末尾に「＋ Send」 ボタン (= track picker を開く)。 `band_h` は
+/// `sends_band_height` と一致する (= caller が両方に同値を渡す)。
+fn draw_sends_section(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    track_id: u32,
+    rect: Rect,
+    band_h: f32,
+) {
+    let pad = 6.0;
+    let band_top = rect.y + rect.h - pad - band_h;
+    // 上端に薄い区切り線。
+    ui.panel(
+        ("mixer_sends_div", track_id as usize),
+        Rect { x: rect.x + pad, y: band_top, w: rect.w - pad * 2.0, h: 1.0 },
+        COLOR_TEXT_DIM,
+        0.0,
+    );
+
+    let mut y = band_top + 4.0;
+    let inner_x = rect.x + pad;
+    let inner_w = rect.w - pad * 2.0;
+
+    // 各 send の宛先名は派生 (= track_by_id で都度解決)。 send 本体は
+    // `app.song.track_by_id(track_id).sends` を読む。 track が無ければ
+    // (race) 何も描かない。
+    let Some(src_track) = app.song.track_by_id(track_id) else {
+        return;
+    };
+    for (send_idx, send) in src_track.sends.iter().enumerate() {
+        let dest_name = app
+            .song
+            .track_by_id(send.dest_track_id)
+            .map(|t| {
+                if t.name.is_empty() {
+                    format!("→ {}", send.dest_track_id)
+                } else {
+                    format!("→ {}", t.name)
+                }
+            })
+            .unwrap_or_else(|| format!("→ ?{}", send.dest_track_id));
+
+        // 宛先名 (1 行)。
+        ui.label_at(
+            ("mixer_send_name", track_id as usize, send_idx),
+            &dest_name,
+            inner_x,
+            y,
+            10.0,
+            COLOR_TEXT_DIM,
+        );
+        let row_y = y + 11.0;
+
+        // ミニ level knob (0..2 → 0..1 normalized、 volume / pan と同 idiom)。
+        // gain は linear 0..2、 knob は 0..1 表示なので gain/2 を渡す。
+        let knob_rect = Rect { x: inner_x, y: row_y, w: SEND_KNOB_SIZE, h: SEND_KNOB_SIZE };
+        let send_idx_for_knob = send_idx;
+        // 前フレーム時点で SendGain gesture か (= edge 検知)。
+        let was_dragging_send = app.active_param_gestures.contains(&(
+            track_id,
+            AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain {
+                send_idx: send_idx as u8,
+            }),
+        ));
+        let knob_resp = ui.knob_at(
+            ("mixer_send_knob", track_id as usize, send_idx),
+            knob_rect,
+            (send.gain * 0.5).clamp(0.0, 1.0),
+            // double-click reset = unity (= 1.0 linear → 0.5 normalized)。
+            0.5,
+            "Send",
+            move |v| {
+                let gain = v * 2.0;
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetSendGain {
+                        track_id,
+                        send_idx: send_idx_for_knob,
+                        gain,
+                    })
+                })
+            },
+        );
+        // send-gain automation の gesture edge を volume / pan と同様に発火。
+        push_param_gesture_edges(
+            ui,
+            track_id,
+            AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain {
+                send_idx: send_idx as u8,
+            }),
+            "Send",
+            was_dragging_send,
+            knob_resp.dragging,
+        );
+
+        // knob 右に小ボタン 3 つを横並び: Pre/Post | M | ×。
+        let btns_x = inner_x + SEND_KNOB_SIZE + 4.0;
+        let btns_w = (inner_x + inner_w - btns_x).max(0.0);
+        let gap = 3.0;
+        let btn_w = ((btns_w - gap * 2.0) / 3.0).max(0.0);
+        let btn_h = SEND_KNOB_SIZE.min(16.0);
+        let btn_y = row_y;
+
+        // Pre/Post トグル: PreFader のとき on 表示 (青)。 クリックで cycle。
+        let is_pre = send.mode == SendMode::PreFader;
+        let mode_label = if is_pre { "Pre" } else { "Post" };
+        let send_idx_for_mode = send_idx;
+        ui.toggle_button_at(
+            ("mixer_send_prepost", track_id as usize, send_idx),
+            mode_label,
+            Rect { x: btns_x, y: btn_y, w: btn_w, h: btn_h },
+            is_pre,
+            &STYLE_SEND_PREPOST,
+            move |_| {
+                // クリックで Pre ↔ Post を反転。
+                let next = if is_pre { SendMode::PostFader } else { SendMode::PreFader };
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetSendMode {
+                        track_id,
+                        send_idx: send_idx_for_mode,
+                        mode: next,
+                    })
+                })
+            },
+        );
+
+        // per-send mute (`enabled`)。 `enabled == false` = ミュート = 赤 ON
+        // 表示にするため `!enabled` を value に渡し、 クリックで enabled を反転。
+        let send_idx_for_mute = send_idx;
+        let enabled = send.enabled;
+        ui.toggle_button_at(
+            ("mixer_send_mute", track_id as usize, send_idx),
+            "M",
+            Rect { x: btns_x + btn_w + gap, y: btn_y, w: btn_w, h: btn_h },
+            !enabled,
+            &STYLE_SEND_MUTE,
+            move |_| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetSendEnabled {
+                        track_id,
+                        send_idx: send_idx_for_mute,
+                        enabled: !enabled,
+                    })
+                })
+            },
+        );
+
+        // × (remove send)。
+        let send_idx_for_remove = send_idx;
+        ui.button_at(
+            ("mixer_send_remove", track_id as usize, send_idx),
+            "x",
+            Rect { x: btns_x + (btn_w + gap) * 2.0, y: btn_y, w: btn_w, h: btn_h },
+            move || {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::RemoveSend {
+                        track_id,
+                        send_idx: send_idx_for_remove,
+                    })
+                })
+            },
+        );
+
+        y += SEND_ROW_H;
+    }
+
+    // 「＋ Send」 ボタン: track picker を開いて宛先を選ぶ。
+    ui.button_at(
+        ("mixer_add_send", track_id as usize),
+        "+ Send",
+        Rect { x: inner_x, y, w: inner_w, h: ADD_SEND_H },
+        move || {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::OpenSendPicker {
+                    src_track_id: track_id,
+                })
+            })
+        },
     );
 }
 

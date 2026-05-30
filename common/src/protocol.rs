@@ -367,6 +367,21 @@ pub enum MainToChild {
     SetTrackPan { track: u32, pan: f32 },
     SetTrackMuted { track: u32, muted: bool },
     SetTrackSolo { track: u32, solo: bool },
+    /// Realtime aux-send level update (`docs/plan_routing_graph.md`).
+    /// `track` is the stable `Track::id` of the **source** track,
+    /// `send_idx` the index into its `sends`. Same lightweight, id-based
+    /// idiom as `SetTrackVolume`: while the user drags a send knob during
+    /// playback the engine clone-mutate-stores `shared.song` and re-reads
+    /// the live gain (ramped per-sample), so the routing graph is **not**
+    /// recompiled per frame. Adding / removing a send, or changing its
+    /// destination / mode, is a structural change that still goes through
+    /// `LoadSong` (full `compile_schedule`).
+    SetSendGain { track: u32, send_idx: u8, gain: f32 },
+    /// Realtime per-send mute toggle. Same idiom as `SetSendGain`. The
+    /// send's graph edge always exists once wired (so toggling needs no
+    /// recompile); the engine gates the contribution to silence at
+    /// mix time when `enabled == false`.
+    SetSendEnabled { track: u32, send_idx: u8, enabled: bool },
     /// Phase 7 B4 (2026-05-13): Record-arm 状態を audio engine に伝達。
     /// audio thread は track.armed を Song に反映するのみ (= 録音書き込み
     /// 自体は GUI process で行うため audio 側は値を保持するだけ、 将来の

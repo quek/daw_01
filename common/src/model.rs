@@ -8,6 +8,16 @@ use crate::plugin_format::PluginFormat;
 use crate::protocol::PluginSlot;
 use crate::scale::ScaleChange;
 
+/// `17` Aux send / return: `Track.sends: Vec<Send>` is added — each
+/// `Send` is a parallel, gain-scaled copy of the track's signal routed
+/// into a destination "return" track's input bus (the source's own
+/// signal still reaches its parent / master untouched). v16 `.daw`
+/// files still load — `sends` defaults to empty (per `#[serde(default)]`,
+/// i.e. no sends). The destination is any existing track (Reaper /
+/// Ardour unified bus model); a "return" is *derived* (a track that has
+/// incoming sends), not a distinct `TrackKind`. See
+/// `docs/plan_routing_graph.md`.
+///
 /// Bumped to `13` for Image overlay (PiP): `Song.image_sources` pool +
 /// `next_image_source_id`, and `ClipContent::Image(ImageContent {
 /// events: Vec<ImageEvent> })` variant are added. v12 `.daw` files
@@ -56,7 +66,7 @@ use crate::scale::ScaleChange;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 16;
+pub const CURRENT_VERSION: u32 = 17;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -426,6 +436,11 @@ impl Song {
                 && let Some(&new_pid) = id_remap.get(&pid)
             {
                 track.parent_group_id = Some(new_pid);
+            }
+            for send in &mut track.sends {
+                if let Some(&new_dest) = id_remap.get(&send.dest_track_id) {
+                    send.dest_track_id = new_dest;
+                }
             }
             let remap_chain = |chain: &mut [PluginInstance]| {
                 for p in chain.iter_mut() {
@@ -968,6 +983,16 @@ pub struct Track {
     /// arbitrary depth; cycles are rejected by the graph compiler.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_group_id: Option<u32>,
+    /// Aux sends from this track to other (return / bus) tracks. Each
+    /// `Send` is a *parallel* gain-scaled copy of this track's signal
+    /// summed into the destination track's input bus — the source's own
+    /// signal still flows to its parent / master untouched. Empty for
+    /// tracks with no sends. A "return" track is not a distinct kind: it
+    /// is derived (a track that has incoming sends), exactly like a
+    /// "group" is derived from incoming `parent_group_id`. See `Send` /
+    /// `docs/plan_routing_graph.md`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sends: Vec<Send>,
     /// Most recent plugin-reported latency for this track, populated by
     /// the plugin host via the CLAP `latency` extension and cached on
     /// the model so the GUI can display it and the routing graph can
@@ -989,6 +1014,43 @@ pub struct Track {
     /// load.
     #[serde(default)]
     pub next_lane_id: u32,
+}
+
+/// Where a `Send` taps the source track's signal chain.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode,
+)]
+pub enum SendMode {
+    /// After the track's volume / pan fader (the post-fader scratch).
+    /// The send level tracks the source fader — the standard choice for
+    /// reverb / delay returns where the wet should follow the dry.
+    #[default]
+    PostFader,
+    /// After the fx chain but before the volume / pan fader. The send is
+    /// independent of the source fader — for cue / parallel sends. (A
+    /// pre-FX raw tap is the sidechain feature's job, not a send.)
+    PreFader,
+}
+
+/// A single aux send: a parallel, gain-scaled copy of a track's signal
+/// routed to another track that acts as a return / bus. Mirrors Ardour
+/// `InternalSend` / a REAPER track send. The source track's main output
+/// is unaffected; the copy is summed into `dest_track_id`'s input bus
+/// before that destination's fx chain runs. The send level is
+/// automatable via `AutomationTarget::TrackBuiltin(TrackBuiltinParam::
+/// SendGain { send_idx })`, where `send_idx` is this send's index in
+/// `Track::sends`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct Send {
+    /// Stable `Track::id` of the destination (return / bus) track.
+    pub dest_track_id: u32,
+    /// Linear send gain (`0.0` = silent, `1.0` = unity, up to `2.0` =
+    /// +6 dB to match the volume-fader range). Automatable.
+    pub gain: f32,
+    /// Tap point on the source track's signal chain.
+    pub mode: SendMode,
+    /// Per-send mute. `false` keeps the wiring but silences the send.
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
@@ -1017,6 +1079,7 @@ impl Default for Track {
             clips: Vec::new(),
             next_clip_id: 1,
             parent_group_id: None,
+            sends: Vec::new(),
             reported_latency_samples: 0,
             automation_lanes: Vec::new(),
             next_lane_id: 1,
@@ -1982,9 +2045,9 @@ pub enum TrackBuiltinParam {
     Volume,
     Pan,
     Mute,
-    /// Reserved for the future Send routing work
-    /// (`docs/plan_routing_graph.md`). `send_idx` is the position
-    /// inside the track's `sends` array.
+    /// Aux send level for `Track::sends[send_idx]` (linear, `0.0..=2.0`).
+    /// `send_idx` is the send's position inside the track's `sends`
+    /// array. See `Send` / `docs/plan_routing_graph.md`.
     SendGain { send_idx: u8 },
 }
 
@@ -2457,13 +2520,11 @@ mod tests {
 
     #[test]
     fn current_version_is_pinned() {
-        // Bumped to 13 for Image overlay (PiP): `Song.image_sources` +
-        // `next_image_source_id`, and `ClipContent::Image(ImageContent
-        // { events: Vec<ImageEvent> })` are added. v12 files forward-
-        // migrate via `#[serde(default)]`. Pinning the constant
-        // catches accidental rollback. See
-        // `docs/plan_image_overlay.md`.
-        assert_eq!(CURRENT_VERSION, 16);
+        // Bumped to 17 for aux send / return: `Track.sends: Vec<Send>`
+        // is added. v16 files forward-migrate via `#[serde(default)]`
+        // (empty `sends`). Pinning the constant catches accidental
+        // rollback. See `docs/plan_routing_graph.md`.
+        assert_eq!(CURRENT_VERSION, 17);
     }
 
     #[test]
@@ -2508,6 +2569,114 @@ mod tests {
         };
         let restored: Song = json_roundtrip(&song);
         assert_eq!(restored, song);
+    }
+
+    // ====================================================================
+    // Aux send / return (v17) — `Track.sends: Vec<Send>`
+    // ====================================================================
+
+    #[test]
+    fn v16_track_loads_with_empty_sends() {
+        // A v16 .daw file has no `sends` key; forward-migration via
+        // `#[serde(default)]` must populate an empty Vec.
+        let v16_json = r#"{
+            "id": 5,
+            "name": "Vocal",
+            "volume": 1.0,
+            "pan": 0.0,
+            "next_clip_id": 1
+        }"#;
+        let track: Track = serde_json::from_str(v16_json).unwrap();
+        assert_eq!(track.id, 5);
+        assert!(track.sends.is_empty());
+    }
+
+    #[test]
+    fn track_with_sends_roundtrips_through_serde_and_bincode() {
+        // Vocal sends post-fader to a Reverb return and pre-fader (muted)
+        // to a Delay return. Both serde (save) and bincode (IPC) must
+        // preserve the sends exactly.
+        let song = Song {
+            tracks: vec![
+                Track {
+                    id: 1,
+                    name: "Vocal".into(),
+                    sends: vec![
+                        Send {
+                            dest_track_id: 2,
+                            gain: 0.5,
+                            mode: SendMode::PostFader,
+                            enabled: true,
+                        },
+                        Send {
+                            dest_track_id: 3,
+                            gain: 1.0,
+                            mode: SendMode::PreFader,
+                            enabled: false,
+                        },
+                    ],
+                    ..Track::default()
+                },
+                Track {
+                    id: 2,
+                    name: "Reverb".into(),
+                    ..Track::default()
+                },
+                Track {
+                    id: 3,
+                    name: "Delay".into(),
+                    ..Track::default()
+                },
+            ],
+            ..Song::default()
+        };
+
+        assert_eq!(json_roundtrip(&song), song, "serde (save) must preserve sends");
+
+        let cfg = bincode::config::standard();
+        let bytes = bincode::encode_to_vec(&song, cfg).unwrap();
+        let (decoded, _): (Song, usize) = bincode::decode_from_slice(&bytes, cfg).unwrap();
+        assert_eq!(decoded, song, "bincode (IPC) must preserve sends");
+    }
+
+    #[test]
+    fn ensure_ids_remaps_send_dest_track_id() {
+        // A Vocal track sends to a Reverb return whose id is the `0`
+        // sentinel. After ensure_ids rebases the return, the send's
+        // `dest_track_id` must follow — otherwise the send dangles and
+        // `compile_schedule` silently drops it (no reverb).
+        let mut song = Song {
+            tracks: vec![
+                Track {
+                    id: 0, // sentinel — Reverb return, rebased by ensure_ids
+                    name: "Reverb".into(),
+                    ..Track::default()
+                },
+                Track {
+                    id: 1,
+                    name: "Vocal".into(),
+                    sends: vec![Send {
+                        dest_track_id: 0, // points at Reverb's sentinel id
+                        gain: 0.5,
+                        mode: SendMode::PostFader,
+                        enabled: true,
+                    }],
+                    ..Track::default()
+                },
+            ],
+            next_track_id: 2,
+            ..Song::default()
+        };
+
+        song.ensure_ids();
+
+        let new_reverb_id = song.tracks[0].id;
+        assert_ne!(new_reverb_id, 0, "ensure_ids should replace sentinel id 0");
+        assert_eq!(
+            song.tracks[1].sends[0].dest_track_id,
+            new_reverb_id,
+            "send dest pointing at the sentinel must be remapped to the new id"
+        );
     }
 
     // ====================================================================

@@ -51,6 +51,13 @@ pub struct TrackScratch {
     /// Range `-1.0..=1.0` (left..right). Default constant fill is
     /// `track.pan`.
     pub pan_per_sample: Vec<f32>,
+    /// Post-fx, **pre-fader** snapshot of this track's signal (taken
+    /// before the volume / pan strip overwrites `track_l/r` in place).
+    /// Written by `process_track_owned` / `run_group_fx_chain` only when
+    /// the track has a pre-fader aux send, and read by a `MixSend` whose
+    /// send `mode == PreFader`. `MAX_FRAMES` long, allocated once.
+    pub pre_fader_l: Vec<f32>,
+    pub pre_fader_r: Vec<f32>,
 }
 
 impl TrackScratch {
@@ -67,6 +74,8 @@ impl TrackScratch {
             input_delay_line: DelayLine::with_capacity(0),
             volume_per_sample: vec![1.0; MAX_FRAMES],
             pan_per_sample: vec![0.0; MAX_FRAMES],
+            pre_fader_l: vec![0.0; MAX_FRAMES],
+            pre_fader_r: vec![0.0; MAX_FRAMES],
         }
     }
 }

@@ -28,6 +28,11 @@ pub enum BufRef {
     Pooled(u32),
     /// A plugin's aux output port (PR4 parallel out).
     PluginAuxOut { plugin_id: u32, port: u8 },
+    /// A track's **pre-fader** scratch (after its fx chain, before the
+    /// volume / pan strip). Written by `ProcessTrack` / `ProcessGroupFx`
+    /// and read by a `MixSend` whose send `mode == PreFader`. Indexed by
+    /// song-track index, parallel to `TrackScratch`.
+    PreFaderScratch(u32),
 }
 
 /// A unit of work in a `Schedule`. The RT thread iterates `Schedule::nodes`
@@ -71,6 +76,23 @@ pub enum NodeOp {
         dst_track: u32,
         dst_slot: PluginSlot,
         aux_in_port: u8,
+    },
+
+    /// PR4 aux send: accumulate `src` (the source track's post- or
+    /// pre-fader buffer) into `dst` (the destination return / bus track's
+    /// scratch) scaled by the **live, per-sample-ramped** send gain of
+    /// `song.tracks[src_track_idx].sends[send_idx]`. Emitted **after** the
+    /// dst's clearing `Mix` (so it accumulates on top of any children) and
+    /// **before** the dst's `ProcessGroupFx`. The gain is read live (not
+    /// baked into the schedule) so knob drags / `SendGain` automation
+    /// apply without recompiling, and a disabled send contributes silence.
+    /// `src_track_idx` / `send_idx` resolve the gain; `src` resolves the
+    /// audio (`PostFader` → `TrackScratch`, `PreFader` → `PreFaderScratch`).
+    MixSend {
+        src: BufRef,
+        dst: BufRef,
+        src_track_idx: u32,
+        send_idx: u8,
     },
 }
 

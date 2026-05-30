@@ -1596,6 +1596,8 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
         | MainToChild::SetTrackPan { .. }
         | MainToChild::SetTrackMuted { .. }
         | MainToChild::SetTrackSolo { .. }
+        | MainToChild::SetSendGain { .. }
+        | MainToChild::SetSendEnabled { .. }
         | MainToChild::SetTrackArmed { .. }
         | MainToChild::SetSongBpm { .. }
         | MainToChild::SetSongTimeSigNumerator { .. }

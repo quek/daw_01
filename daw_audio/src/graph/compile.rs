@@ -85,6 +85,25 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         }
     }
 
+    // ---- gather incoming aux sends per destination (return / bus) ----
+    // `incoming_sends[dest_id]` = list of (source track index, send index,
+    // tap mode) for every send landing on `dest_id`. Sends whose dest does
+    // not exist are dropped (tolerant, like dangling sidechain). A track
+    // with ≥1 incoming send acts as a bus (summed like a group) even with
+    // no children.
+    let mut incoming_sends: HashMap<u32, Vec<(u32, u8, common::model::SendMode)>> =
+        HashMap::new();
+    for (src_idx, t) in song.tracks.iter().enumerate() {
+        for (send_idx, send) in t.sends.iter().enumerate() {
+            if id_to_idx.contains_key(&send.dest_track_id) {
+                incoming_sends
+                    .entry(send.dest_track_id)
+                    .or_default()
+                    .push((src_idx as u32, send_idx as u8, send.mode));
+            }
+        }
+    }
+
     // ---- detect cycles in path_latency dependency graph ----
     //
     // `compute_path_latency` recurses through:
@@ -99,6 +118,12 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
     // edges cover all parent cycles, sidechain-source edges cover all
     // sidechain feedback (incl. self-feedback A → A and A→B→A).
     let mut state = vec![0u8; n]; // 0=unvisited, 1=on current path, 2=done
+    // Post-order of the dependency DFS = a valid execution order: a node
+    // is appended only after all its dependencies (children + sidechain
+    // sources + send sources) are done, so producers always precede
+    // consumers. Replaces the old parent-only depth sort, which couldn't
+    // order send / sidechain edges between same-depth tracks.
+    let mut order: Vec<u32> = Vec::with_capacity(n);
     let dep_edges_for = |idx: u32| -> Vec<u32> {
         let track = &song.tracks[idx as usize];
         let mut out: Vec<u32> = Vec::new();
@@ -128,6 +153,15 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
             }
         }
         push_chain_sc(&track.fx_chain, &mut out);
+        // send edges: this track (the destination / return) depends on
+        // every track that sends into it — the source must run before the
+        // send is mixed in. Covers send feedback (A→B→A, self-send) for
+        // cycle detection.
+        if let Some(edges) = incoming_sends.get(&track.id) {
+            for &(src_idx, _, _) in edges {
+                out.push(src_idx);
+            }
+        }
         out
     };
     for start in 0..n {
@@ -141,6 +175,7 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
             let deps = dep_edges_for(node);
             if edge_i >= deps.len() {
                 state[node as usize] = 2;
+                order.push(node);
                 stack.pop();
                 continue;
             }
@@ -161,38 +196,10 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         }
     }
 
-    // ---- compute depth = distance from root (no parent) toward leaves ----
-    // Roots have depth 0; their immediate children have depth 1; etc.
-    // We need to emit Audio nodes (and inner groups) before their parent
-    // group, so we sort the schedule by *descending* depth.
-    let mut depth = vec![u32::MAX; n];
-    fn fill_depth(
-        idx: u32,
-        tracks: &[common::model::Track],
-        id_to_idx: &HashMap<u32, u32>,
-        depth: &mut [u32],
-    ) -> u32 {
-        if depth[idx as usize] != u32::MAX {
-            return depth[idx as usize];
-        }
-        let d = match tracks[idx as usize].parent_group_id {
-            None => 0,
-            Some(pid) => {
-                let pidx = id_to_idx[&pid];
-                fill_depth(pidx, tracks, id_to_idx, depth) + 1
-            }
-        };
-        depth[idx as usize] = d;
-        d
-    }
-    for i in 0..n {
-        fill_depth(i as u32, &song.tracks, &id_to_idx, &mut depth);
-    }
-
-    // ---- emit ops in descending-depth order ----
-    // (children_of was gathered above for cycle detection — reuse it here.)
-    let mut order: Vec<u32> = (0..n as u32).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(depth[i as usize]));
+    // ---- emit ops in dependency post-order (computed above) ----
+    // `order` already lists every node after all of its dependencies, so
+    // children precede their group, sidechain sources precede their sink,
+    // and send sources precede their return.
 
     let mut nodes = Vec::with_capacity(n * 2 + 1);
     let mut master_srcs: Vec<(BufRef, f32)> = Vec::new();
@@ -208,14 +215,16 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         // plugin's `pd.buffer_aux_in[port]` shmem region.
         emit_sidechain_taps(track, track_idx, &id_to_idx, &mut nodes);
 
-        if is_group.contains(&track.id) {
-            // This track has children → it acts as a group bus. Sum
-            // the children's scratches into its own scratch, then run
-            // the audio fx chain + strip via ProcessGroupFx. PR2 phase
-            // 1 keeps the group's own clips / instrument unused (they
-            // were skipped in process_track_owned). Phase 5 will add
-            // the Reaper-folder mixing where the group's own audio
-            // also feeds the post-fx mix.
+        // A track is a "bus" if it has children (a group) and/or has
+        // incoming sends (a return). Either way it sums its inputs into
+        // its own scratch and runs its fx chain + strip via
+        // ProcessGroupFx, rather than rendering its own clips / instrument
+        // (Ableton return-track semantics — same as a group's own content
+        // currently being unused). A track with neither is a plain leaf.
+        if is_group.contains(&track.id) || incoming_sends.contains_key(&track.id) {
+            // Sum children (unity gain) into this bus's scratch. The Mix
+            // clears its dst first, so a pure return (no children) starts
+            // from silence before its sends accumulate on top.
             let kids = children_of.get(&track.id).cloned().unwrap_or_default();
             let srcs: Vec<(BufRef, f32)> = kids
                 .into_iter()
@@ -225,6 +234,23 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
                 srcs,
                 dst: BufRef::TrackScratch(track_idx),
             });
+            // Accumulate each incoming send on top, tapping the source's
+            // post- or pre-fader buffer. The gain is applied live by the
+            // engine (`MixSend`), not baked here.
+            if let Some(edges) = incoming_sends.get(&track.id) {
+                for &(src_idx, send_idx, mode) in edges {
+                    let src = match mode {
+                        common::model::SendMode::PostFader => BufRef::TrackScratch(src_idx),
+                        common::model::SendMode::PreFader => BufRef::PreFaderScratch(src_idx),
+                    };
+                    nodes.push(NodeOp::MixSend {
+                        src,
+                        dst: BufRef::TrackScratch(track_idx),
+                        src_track_idx: src_idx,
+                        send_idx,
+                    });
+                }
+            }
             nodes.push(NodeOp::ProcessGroupFx { track_idx });
         } else {
             // Leaf track: full chain handled by ProcessTrack op.
@@ -267,6 +293,7 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
             &is_group,
             &children_of,
             &id_to_idx,
+            &incoming_sends,
             &mut path_latency,
         );
     }
@@ -485,12 +512,14 @@ fn emit_sidechain_taps(
 ///
 /// dangling reference (= sidechain source が song に存在しない) は wrap せず
 /// 0 として扱う (compile error にしない方針、 編集中の中間状態を許容)。
+#[allow(clippy::too_many_arguments)]
 fn compute_path_latency(
     idx: u32,
     tracks: &[common::model::Track],
     is_group: &HashSet<u32>,
     children_of: &HashMap<u32, Vec<u32>>,
     id_to_idx: &HashMap<u32, u32>,
+    incoming_sends: &HashMap<u32, Vec<(u32, u8, common::model::SendMode)>>,
     cache: &mut [u32],
 ) -> u32 {
     if cache[idx as usize] != u32::MAX {
@@ -504,7 +533,15 @@ fn compute_path_latency(
             .map(|kids| {
                 kids.iter()
                     .map(|&c| {
-                        compute_path_latency(c, tracks, is_group, children_of, id_to_idx, cache)
+                        compute_path_latency(
+                            c,
+                            tracks,
+                            is_group,
+                            children_of,
+                            id_to_idx,
+                            incoming_sends,
+                            cache,
+                        )
                     })
                     .max()
                     .unwrap_or(0)
@@ -519,8 +556,15 @@ fn compute_path_latency(
         if let Some(src_id) = src_id_opt
             && let Some(&src_idx) = id_to_idx.get(src_id)
         {
-            let l =
-                compute_path_latency(src_idx, tracks, is_group, children_of, id_to_idx, cache);
+            let l = compute_path_latency(
+                src_idx,
+                tracks,
+                is_group,
+                children_of,
+                id_to_idx,
+                incoming_sends,
+                cache,
+            );
             if l > sidechain_input {
                 sidechain_input = l;
             }
@@ -542,7 +586,29 @@ fn compute_path_latency(
         }
     }
 
-    let max_input = group_input.max(sidechain_input);
+    // Aux-send fan-in: a return / bus depends on every track that sends
+    // into it, so its input latency must also cover those sources. This
+    // keeps the wet return time-aligned with the dry signal at the master
+    // mix (the source's post-fader latency is carried by the send copy).
+    let mut send_input: u32 = 0;
+    if let Some(edges) = incoming_sends.get(&track.id) {
+        for &(src_idx, _, _) in edges {
+            let l = compute_path_latency(
+                src_idx,
+                tracks,
+                is_group,
+                children_of,
+                id_to_idx,
+                incoming_sends,
+                cache,
+            );
+            if l > send_input {
+                send_input = l;
+            }
+        }
+    }
+
+    let max_input = group_input.max(sidechain_input).max(send_input);
     let total = max_input.saturating_add(track.reported_latency_samples);
     cache[idx as usize] = total;
     total
@@ -1050,7 +1116,9 @@ mod tests {
                         &mut scratch_r[i],
                     );
                 }
-                NodeOp::ProcessGroupFx { .. } | NodeOp::SidechainTap { .. } => {
+                NodeOp::ProcessGroupFx { .. }
+                | NodeOp::SidechainTap { .. }
+                | NodeOp::MixSend { .. } => {
                     // この test では未使用
                 }
                 NodeOp::Mix {
@@ -1594,6 +1662,325 @@ mod tests {
                 .any(|op| matches!(op, NodeOp::SidechainTap { .. })),
             "dangling sidechain source must not emit SidechainTap; nodes={:?}",
             sched.nodes
+        );
+    }
+
+    // ---- PR4 aux send / return ----
+
+    #[test]
+    fn send_emits_mixsend_into_return_bus_after_clear_before_group_fx() {
+        use common::model::{Send, SendMode};
+
+        // Vocal (id 1, idx 0) post-fader sends to Reverb (id 2, idx 1).
+        let song = Song {
+            tracks: vec![
+                Track {
+                    id: 1,
+                    name: "Vocal".into(),
+                    sends: vec![Send {
+                        dest_track_id: 2,
+                        gain: 0.5,
+                        mode: SendMode::PostFader,
+                        enabled: true,
+                    }],
+                    ..Track::default()
+                },
+                Track {
+                    id: 2,
+                    name: "Reverb".into(),
+                    ..Track::default()
+                },
+            ],
+            ..Song::default()
+        };
+        let sched = compile_schedule(&song).unwrap();
+
+        // Vocal is a leaf → ProcessTrack(0). Reverb has an incoming send,
+        // so it is a bus → Mix(clear) + MixSend + ProcessGroupFx(1).
+        let vocal_proc = sched
+            .nodes
+            .iter()
+            .position(|op| matches!(op, NodeOp::ProcessTrack { track_idx: 0 }))
+            .expect("Vocal ProcessTrack");
+        let reverb_clear = sched
+            .nodes
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    NodeOp::Mix {
+                        dst: BufRef::TrackScratch(1),
+                        ..
+                    }
+                )
+            })
+            .expect("Reverb clearing Mix");
+        let mixsend = sched
+            .nodes
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    NodeOp::MixSend {
+                        src: BufRef::TrackScratch(0),
+                        dst: BufRef::TrackScratch(1),
+                        src_track_idx: 0,
+                        send_idx: 0,
+                    }
+                )
+            })
+            .unwrap_or_else(|| panic!("expected MixSend Vocal→Reverb; nodes={:?}", sched.nodes));
+        let reverb_fx = sched
+            .nodes
+            .iter()
+            .position(|op| matches!(op, NodeOp::ProcessGroupFx { track_idx: 1 }))
+            .expect("Reverb ProcessGroupFx");
+
+        assert!(
+            vocal_proc < mixsend,
+            "source must process before its send is mixed in"
+        );
+        assert!(
+            reverb_clear < mixsend,
+            "return scratch must be cleared before sends accumulate"
+        );
+        assert!(
+            mixsend < reverb_fx,
+            "sends must accumulate before the return's fx chain runs"
+        );
+
+        // Vocal still feeds master dry; Reverb feeds master wet.
+        let master_idxs: Vec<u32> = sched
+            .nodes
+            .iter()
+            .find_map(|op| match op {
+                NodeOp::Mix {
+                    dst: BufRef::Master,
+                    srcs,
+                } => Some(srcs.clone()),
+                _ => None,
+            })
+            .unwrap()
+            .iter()
+            .map(|(b, _)| match b {
+                BufRef::TrackScratch(i) => *i,
+                other => panic!("unexpected master src {other:?}"),
+            })
+            .collect();
+        assert!(master_idxs.contains(&0), "Vocal dry must still reach master");
+        assert!(master_idxs.contains(&1), "Reverb return must reach master");
+    }
+
+    #[test]
+    fn pre_fader_send_taps_pre_fader_scratch() {
+        use common::model::{Send, SendMode};
+
+        let song = Song {
+            tracks: vec![
+                Track {
+                    id: 1,
+                    name: "Vocal".into(),
+                    sends: vec![Send {
+                        dest_track_id: 2,
+                        gain: 1.0,
+                        mode: SendMode::PreFader,
+                        enabled: true,
+                    }],
+                    ..Track::default()
+                },
+                Track {
+                    id: 2,
+                    name: "Cue".into(),
+                    ..Track::default()
+                },
+            ],
+            ..Song::default()
+        };
+        let sched = compile_schedule(&song).unwrap();
+        assert!(
+            sched.nodes.iter().any(|op| matches!(
+                op,
+                NodeOp::MixSend {
+                    src: BufRef::PreFaderScratch(0),
+                    dst: BufRef::TrackScratch(1),
+                    ..
+                }
+            )),
+            "pre-fader send must tap the source's PreFaderScratch; nodes={:?}",
+            sched.nodes
+        );
+    }
+
+    #[test]
+    fn self_send_is_rejected_as_cycle() {
+        use common::model::{Send, SendMode};
+
+        let song = Song {
+            tracks: vec![Track {
+                id: 1,
+                name: "A".into(),
+                sends: vec![Send {
+                    dest_track_id: 1, // sends to itself
+                    gain: 1.0,
+                    mode: SendMode::PostFader,
+                    enabled: true,
+                }],
+                ..Track::default()
+            }],
+            ..Song::default()
+        };
+        assert_eq!(compile_schedule(&song).err(), Some(GraphError::Cycle));
+    }
+
+    #[test]
+    fn send_loop_between_two_returns_is_rejected() {
+        use common::model::{Send, SendMode};
+
+        let song = Song {
+            tracks: vec![
+                Track {
+                    id: 1,
+                    name: "A".into(),
+                    sends: vec![Send {
+                        dest_track_id: 2,
+                        gain: 1.0,
+                        mode: SendMode::PostFader,
+                        enabled: true,
+                    }],
+                    ..Track::default()
+                },
+                Track {
+                    id: 2,
+                    name: "B".into(),
+                    sends: vec![Send {
+                        dest_track_id: 1,
+                        gain: 1.0,
+                        mode: SendMode::PostFader,
+                        enabled: true,
+                    }],
+                    ..Track::default()
+                },
+            ],
+            ..Song::default()
+        };
+        assert_eq!(compile_schedule(&song).err(), Some(GraphError::Cycle));
+    }
+
+    #[test]
+    fn send_to_dangling_dest_is_skipped() {
+        use common::model::{Send, SendMode};
+
+        let song = Song {
+            tracks: vec![Track {
+                id: 1,
+                name: "Lone".into(),
+                sends: vec![Send {
+                    dest_track_id: 99, // no such track
+                    gain: 1.0,
+                    mode: SendMode::PostFader,
+                    enabled: true,
+                }],
+                ..Track::default()
+            }],
+            ..Song::default()
+        };
+        let sched = compile_schedule(&song).unwrap();
+        assert!(
+            !sched
+                .nodes
+                .iter()
+                .any(|op| matches!(op, NodeOp::MixSend { .. })),
+            "dangling send dest must not emit MixSend; nodes={:?}",
+            sched.nodes
+        );
+        // With no valid routing the track stays a plain leaf.
+        assert!(
+            sched
+                .nodes
+                .iter()
+                .any(|op| matches!(op, NodeOp::ProcessTrack { track_idx: 0 })),
+            "Lone with only a dangling send must remain a ProcessTrack leaf"
+        );
+    }
+
+    #[test]
+    fn send_source_latency_aligns_return_with_dry_at_master() {
+        use common::model::{Send, SendMode};
+
+        // Vocal (idx 0, latency 0) sends to Reverb (idx 1, reported
+        // latency 100) and also feeds master dry. Reverb's path latency =
+        // max(send src Vocal = 0) + 100 = 100, so at the master mix the
+        // dry Vocal (latency 0) must be delayed 100 to align with the wet.
+        let song = Song {
+            tracks: vec![
+                Track {
+                    id: 1,
+                    name: "Vocal".into(),
+                    reported_latency_samples: 0,
+                    sends: vec![Send {
+                        dest_track_id: 2,
+                        gain: 0.5,
+                        mode: SendMode::PostFader,
+                        enabled: true,
+                    }],
+                    ..Track::default()
+                },
+                Track {
+                    id: 2,
+                    name: "Reverb".into(),
+                    reported_latency_samples: 100,
+                    ..Track::default()
+                },
+            ],
+            ..Song::default()
+        };
+        let sched = compile_schedule(&song).unwrap();
+
+        let master_mix = sched
+            .nodes
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    NodeOp::Mix {
+                        dst: BufRef::Master,
+                        ..
+                    }
+                )
+            })
+            .expect("master Mix");
+        let apply = sched
+            .nodes
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    NodeOp::ApplyDelay {
+                        buf: BufRef::TrackScratch(0),
+                        frames: 100,
+                        ..
+                    }
+                )
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected ApplyDelay {{ TrackScratch(0), frames: 100 }} before master; \
+                     nodes={:?}",
+                    sched.nodes
+                )
+            });
+        assert!(apply < master_mix, "dry-path delay must precede the master mix");
+
+        // The MixSend taps Vocal's undelayed scratch before that delay is
+        // applied (the send was already consumed by the Reverb bus).
+        let mixsend = sched
+            .nodes
+            .iter()
+            .position(|op| matches!(op, NodeOp::MixSend { .. }))
+            .expect("MixSend");
+        assert!(
+            mixsend < apply,
+            "the send must read the source before the master dry-delay mutates it"
         );
     }
 }

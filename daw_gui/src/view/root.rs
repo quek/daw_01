@@ -11,7 +11,7 @@ use daw_ui_renderer::{Color, Rect};
 use crate::app::{AppData, AppEvent};
 use crate::view::{
     arrangement_view, bottom_panel, plugin_picker, recovery_modal, status_bar, track_inspector,
-    transport,
+    track_picker, transport,
 };
 
 pub const MENU_H: f32 = 24.0;
@@ -99,6 +99,9 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // Modal: plugin picker。draw 関数内で modal の open/close を app.is_plugin_picker_open
     // と同期させる (常時呼び、内部で is_modal_open / open_modal を管理)。
     plugin_picker::draw(app, ui, screen);
+
+    // Modal: send 宛先トラックピッカー。app.send_picker == Some(..) のとき開く。
+    track_picker::draw(app, ui, screen);
 
     // Modal: recovery (起動時 or Open 時に検出された autosave 候補)。
     // app.show_recovery_modal を internal で監視するため常時呼び。
@@ -600,7 +603,9 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // 優先度: track rename → clip rename → Audio Editor close → CloseHelp。
     // rename (track header / clip rect の inline text_input) と Audio Editor
     // (bottom panel) は同時には開かないので順番でも実用 OK。
-    if !app.is_plugin_picker_open && ui.take_shortcut("escape") {
+    // plugin picker / send picker が開いている間は escape を消費しない
+    // (= track_picker / plugin_picker の modal が close_on_escape で閉じる)。
+    if !app.is_plugin_picker_open && app.send_picker.is_none() && ui.take_shortcut("escape") {
         if app.track_rename_idx.is_some() {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::CancelRenameTrack)

@@ -1341,6 +1341,20 @@ pub fn process_track_owned(
         scratch.track_r[..n].copy_from_slice(&pd.buffer_out[1][..n]);
     }
 
+    // ---- Pre-fader send tap ----
+    // A pre-fader send reads the post-fx, pre-strip signal. Snapshot it
+    // before the strip overwrites `track_l/r` in place. Only copied when
+    // the track actually has a pre-fader send (cheap check; skips the
+    // memcpy otherwise).
+    if song_track
+        .sends
+        .iter()
+        .any(|s| s.mode == common::model::SendMode::PreFader)
+    {
+        scratch.pre_fader_l[..n].copy_from_slice(&scratch.track_l[..n]);
+        scratch.pre_fader_r[..n].copy_from_slice(&scratch.track_r[..n]);
+    }
+
     // ---- Mixer strip + master accumulate ----
     let muted = song_track.muted;
     let solo = song_track.solo;
@@ -1478,11 +1492,16 @@ pub fn execute_schedule_post_dispatch(
                 mix_into_master(scratch, srcs, master_l, master_r, n);
             }
             NodeOp::Mix {
-                dst: BufRef::Pooled(_) | BufRef::PluginAuxOut { .. },
+                dst:
+                    BufRef::Pooled(_)
+                    | BufRef::PluginAuxOut { .. }
+                    | BufRef::PreFaderScratch(_),
                 ..
             } => {
                 // PR4: pooled targets and plugin aux-out routing land
-                // here once parallel-out support arrives.
+                // here once parallel-out support arrives. A Mix into a
+                // PreFaderScratch is never emitted (those are written by
+                // ProcessTrack), but the arm keeps the match exhaustive.
             }
             NodeOp::ProcessGroupFx { track_idx } => {
                 let Some(track) = song.tracks.get(*track_idx as usize) else {
@@ -1584,6 +1603,39 @@ pub fn execute_schedule_post_dispatch(
                     .copy_from_slice(&src_scratch.track_r[..copy_n]);
                 pd.aux_in_active[port] = 1;
             }
+
+            NodeOp::MixSend {
+                src,
+                dst,
+                src_track_idx,
+                send_idx,
+            } => {
+                // PR4 aux send: accumulate the source's post- or pre-fader
+                // buffer into the destination return / bus scratch, scaled
+                // by the live (optionally automated) send gain.
+                let BufRef::TrackScratch(dst_idx) = *dst else {
+                    continue;
+                };
+                let (src_idx, pre_fader) = match *src {
+                    BufRef::TrackScratch(i) => (i, false),
+                    BufRef::PreFaderScratch(i) => (i, true),
+                    _ => continue,
+                };
+                mix_send_into_track_scratch(
+                    scratch,
+                    dst_idx as usize,
+                    src_idx as usize,
+                    pre_fader,
+                    song,
+                    *src_track_idx,
+                    *send_idx,
+                    sample_rate,
+                    current_bpm,
+                    playhead,
+                    recording_lanes,
+                    n,
+                );
+            }
         }
     }
 }
@@ -1658,6 +1710,105 @@ fn mix_into_master(
         for i in 0..n {
             master_l[i] += s_scratch.track_l[i] * g;
             master_r[i] += s_scratch.track_r[i] * g;
+        }
+    }
+}
+
+/// Accumulate one aux send into a return / bus scratch.
+///
+/// Reads `scratch[src_idx]`'s post-fader (`track_l/r`) or pre-fader
+/// (`pre_fader_l/r`) buffer, scales it by the **live** send gain of
+/// `song.tracks[src_track_idx].sends[send_idx]` — sampled per-sample from
+/// a `SendGain` automation lane when present (and not being recorded),
+/// otherwise the constant `send.gain` — and adds it into
+/// `scratch[dst_idx].track_l/r` (`+=`, no clear). A disabled send or a
+/// muted source contributes nothing (Ableton: mute silences sends). The
+/// gain is read live, never baked into the schedule, so knob drags and
+/// `SendGain` automation apply without recompiling.
+#[allow(clippy::too_many_arguments)]
+fn mix_send_into_track_scratch(
+    scratch: &mut [TrackScratch],
+    dst_idx: usize,
+    src_idx: usize,
+    pre_fader: bool,
+    song: &Song,
+    src_track_idx: u32,
+    send_idx: u8,
+    sample_rate: u32,
+    bpm: f32,
+    playhead: u64,
+    recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
+    n: usize,
+) {
+    use common::model::{AutomationTarget, TrackBuiltinParam};
+
+    if src_idx == dst_idx || src_idx >= scratch.len() || dst_idx >= scratch.len() {
+        return;
+    }
+    let Some(track) = song.tracks.get(src_track_idx as usize) else {
+        return;
+    };
+    let Some(send) = track.sends.get(send_idx as usize) else {
+        return;
+    };
+    if !send.enabled {
+        return;
+    }
+    // A muted source (incl. the global solo rule) silences its sends.
+    if scratch[src_idx].effective_mute {
+        return;
+    }
+
+    // Pick this send's `SendGain` automation lane, unless it is currently
+    // being recorded (then the live knob value is heard, mirroring the
+    // volume / pan recording bypass).
+    let target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_idx });
+    let lane = if recording_lanes.contains(&(track.id, target.clone())) {
+        None
+    } else {
+        track
+            .automation_lanes
+            .iter()
+            .find(|l| l.enabled && l.target == target)
+    };
+    let samples_per_beat = if bpm > 0.0 && sample_rate > 0 {
+        f64::from(sample_rate) * 60.0 / f64::from(bpm)
+    } else {
+        0.0
+    };
+    let const_gain = send.gain;
+
+    // Borrow the source immutably and the destination mutably without
+    // overlap (`src_idx != dst_idx` checked above).
+    let (src_scratch, dst_scratch): (&TrackScratch, &mut TrackScratch) = if src_idx < dst_idx {
+        let (left, right) = scratch.split_at_mut(dst_idx);
+        (&left[src_idx], &mut right[0])
+    } else {
+        let (left, right) = scratch.split_at_mut(src_idx);
+        (&right[0], &mut left[dst_idx])
+    };
+    let (src_l, src_r) = if pre_fader {
+        (&src_scratch.pre_fader_l, &src_scratch.pre_fader_r)
+    } else {
+        (&src_scratch.track_l, &src_scratch.track_r)
+    };
+    let n = n
+        .min(src_l.len())
+        .min(src_r.len())
+        .min(dst_scratch.track_l.len())
+        .min(dst_scratch.track_r.len());
+
+    if let (Some(lane), true) = (lane, samples_per_beat > 0.0) {
+        for i in 0..n {
+            let beat = (playhead + i as u64) as f64 / samples_per_beat;
+            let g = common::automation::lane_value_at(lane, &song.clip_contents, beat) as f32;
+            dst_scratch.track_l[i] += src_l[i] * g;
+            dst_scratch.track_r[i] += src_r[i] * g;
+        }
+    } else {
+        for i in 0..n {
+            dst_scratch.track_l[i] += src_l[i] * const_gain;
+            dst_scratch.track_r[i] += src_r[i] * const_gain;
         }
     }
 }
@@ -1748,6 +1899,17 @@ fn run_group_fx_chain(
         }
         scratch.track_l[..n].copy_from_slice(&pd.buffer_out[0][..n]);
         scratch.track_r[..n].copy_from_slice(&pd.buffer_out[1][..n]);
+    }
+
+    // ---- Pre-fader send tap (bus / return source) ----
+    // A pre-fader send from this bus reads its post-fx, pre-strip signal.
+    if song_track
+        .sends
+        .iter()
+        .any(|s| s.mode == common::model::SendMode::PreFader)
+    {
+        scratch.pre_fader_l[..n].copy_from_slice(&scratch.track_l[..n]);
+        scratch.pre_fader_r[..n].copy_from_slice(&scratch.track_r[..n]);
     }
 
     let muted = song_track.muted;
@@ -1969,5 +2131,131 @@ mod sidechain_tests {
             assert!((pd.buffer_aux_in[0][1][i] - want_r).abs() < 1e-6);
         }
         assert_eq!(pd.aux_in_active[0], 1);
+    }
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+    use common::model::{Send, SendMode, Song, Track};
+
+    const FRAMES: usize = 64;
+
+    fn song_with_send(gain: f32, mode: SendMode, enabled: bool) -> Song {
+        Song {
+            tracks: vec![
+                Track {
+                    id: 1,
+                    name: "Vocal".into(),
+                    sends: vec![Send {
+                        dest_track_id: 2,
+                        gain,
+                        mode,
+                        enabled,
+                    }],
+                    ..Track::default()
+                },
+                Track {
+                    id: 2,
+                    name: "Reverb".into(),
+                    ..Track::default()
+                },
+            ],
+            ..Song::default()
+        }
+    }
+
+    fn empty_lanes() -> std::collections::HashSet<(u32, common::model::AutomationTarget)> {
+        std::collections::HashSet::new()
+    }
+
+    /// A post-fader send accumulates `src * gain` into the return scratch
+    /// **on top of** whatever is already there (the prior clearing Mix is
+    /// a separate op), reading the source's post-fader `track_l/r`.
+    #[test]
+    fn post_fader_send_accumulates_src_times_gain() {
+        let song = song_with_send(0.5, SendMode::PostFader, true);
+        let mut scratch: Vec<TrackScratch> = (0..4).map(|_| TrackScratch::new()).collect();
+        for i in 0..FRAMES {
+            scratch[0].track_l[i] = (i as f32) * 0.1;
+            scratch[0].track_r[i] = -(i as f32) * 0.1;
+            scratch[1].track_l[i] = 1.0; // pre-existing return content
+            scratch[1].track_r[i] = 2.0;
+        }
+        let empty = empty_lanes();
+        mix_send_into_track_scratch(
+            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0, &empty, FRAMES,
+        );
+        for i in 0..FRAMES {
+            let want_l = 1.0 + (i as f32) * 0.1 * 0.5;
+            let want_r = 2.0 + (-(i as f32) * 0.1) * 0.5;
+            assert!((scratch[1].track_l[i] - want_l).abs() < 1e-6, "l[{i}]");
+            assert!((scratch[1].track_r[i] - want_r).abs() < 1e-6, "r[{i}]");
+        }
+    }
+
+    /// A disabled send contributes nothing (per-send mute).
+    #[test]
+    fn disabled_send_contributes_silence() {
+        let song = song_with_send(0.5, SendMode::PostFader, false);
+        let mut scratch: Vec<TrackScratch> = (0..4).map(|_| TrackScratch::new()).collect();
+        for i in 0..FRAMES {
+            scratch[0].track_l[i] = 1.0;
+            scratch[1].track_l[i] = 3.0;
+        }
+        let empty = empty_lanes();
+        mix_send_into_track_scratch(
+            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0, &empty, FRAMES,
+        );
+        for i in 0..FRAMES {
+            assert_eq!(scratch[1].track_l[i], 3.0, "disabled send must not change dst");
+        }
+    }
+
+    /// A muted source (incl. the solo rule) silences its sends.
+    #[test]
+    fn muted_source_send_contributes_silence() {
+        let song = song_with_send(1.0, SendMode::PostFader, true);
+        let mut scratch: Vec<TrackScratch> = (0..4).map(|_| TrackScratch::new()).collect();
+        scratch[0].effective_mute = true;
+        for i in 0..FRAMES {
+            scratch[0].track_l[i] = 1.0;
+            scratch[1].track_l[i] = 3.0;
+        }
+        let empty = empty_lanes();
+        mix_send_into_track_scratch(
+            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0, &empty, FRAMES,
+        );
+        for i in 0..FRAMES {
+            assert_eq!(
+                scratch[1].track_l[i], 3.0,
+                "muted source must not feed its send"
+            );
+        }
+    }
+
+    /// A pre-fader send reads the source's `pre_fader_l/r`, not its
+    /// post-fader `track_l/r`.
+    #[test]
+    fn pre_fader_send_reads_pre_fader_buffer() {
+        let song = song_with_send(1.0, SendMode::PreFader, true);
+        let mut scratch: Vec<TrackScratch> = (0..4).map(|_| TrackScratch::new()).collect();
+        for i in 0..FRAMES {
+            scratch[0].track_l[i] = 9.0; // post-fader — must be ignored
+            scratch[0].track_r[i] = 9.0;
+            scratch[0].pre_fader_l[i] = 0.25; // pre-fader — must be used
+            scratch[0].pre_fader_r[i] = 0.5;
+        }
+        let empty = empty_lanes();
+        mix_send_into_track_scratch(
+            &mut scratch, 1, 0, true, &song, 0, 0, 48_000, 120.0, 0, &empty, FRAMES,
+        );
+        for i in 0..FRAMES {
+            assert!(
+                (scratch[1].track_l[i] - 0.25).abs() < 1e-6,
+                "pre-fader send must read pre_fader_l"
+            );
+            assert!((scratch[1].track_r[i] - 0.5).abs() < 1e-6);
+        }
     }
 }
