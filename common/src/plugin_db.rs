@@ -63,6 +63,22 @@ impl PluginDatabase {
         self.entries.iter().find(|e| e.id == id)
     }
 
+    /// daw_01-bundled builtin plugin (`PluginFormat::Builtin`) を entries
+    /// 先頭に注入する。builtin はコードの [`builtin_descriptors`] が
+    /// **Single Source of Truth** なので、cache load / scan のどちらを経由して
+    /// メモリへ載せる場合も必ずこれで保証する。既存の builtin entry
+    /// (古い cache 由来や重複) は format で除外してから注入するので冪等。
+    ///
+    /// これが無いと、builtin 追加前に保存された古い cache を load した
+    /// セッションでは VOICEVOX 等が DB から欠落し、vocal track の instrument
+    /// ロードが `find_by_id → None` で失敗する (= 自動合成が走らず歌わない)。
+    pub fn ensure_builtins(&mut self) {
+        self.entries.retain(|e| e.format != PluginFormat::Builtin);
+        let mut merged = builtin_descriptors();
+        merged.append(&mut self.entries);
+        self.entries = merged;
+    }
+
     /// Load the cached database from disk. Missing file / invalid JSON
     /// returns `Ok(None)` rather than an error so callers can fall back
     /// to a fresh scan.
@@ -78,13 +94,30 @@ impl PluginDatabase {
     }
 
     /// Persist the database atomically (write to temp file + rename).
+    ///
+    /// builtin (`PluginFormat::Builtin`) はコードが **Single Source of Truth**
+    /// なので **永続化しない**。ディスクには外部 plugin の scan 結果だけを書き、
+    /// load 側は [`PluginDatabase::ensure_builtins`] で常にコードから builtin を
+    /// 注入する。これで「古い cache に builtin が無い / 古い」乖離が構造的に
+    /// 起きなくなる (= cache を消さずとも新 builtin が反映される)。除外は
+    /// 永続化の 1 箇所に集約するので、ensure_builtins 後の DB を save しても
+    /// 順序に関係なくディスクは外部 plugin のみになる。
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
+        let persisted = PluginDatabase {
+            entries: self
+                .entries
+                .iter()
+                .filter(|e| e.format != PluginFormat::Builtin)
+                .cloned()
+                .collect(),
+            scanned_at: self.scanned_at,
+        };
         let tmp = path.with_extension("json.tmp");
-        let data = serde_json::to_string_pretty(self)
+        let data = serde_json::to_string_pretty(&persisted)
             .context("failed to serialize plugin database")?;
         fs::write(&tmp, data)
             .with_context(|| format!("failed to write {}", tmp.display()))?;
@@ -404,5 +437,57 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nope.json");
         assert!(PluginDatabase::load_from_file(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn ensure_builtins_injects_voicevox() {
+        // 空 DB (= builtin 無しの古い cache 相当) に注入すると VOICEVOX /
+        // Silence が現れる。これが無いと vocal track のロードが失敗する。
+        let mut db = PluginDatabase::default();
+        assert!(db.find_by_id(BUILTIN_ID_VOICEVOX).is_none());
+        db.ensure_builtins();
+        let e = db
+            .find_by_id(BUILTIN_ID_VOICEVOX)
+            .expect("voicevox present after ensure_builtins");
+        assert_eq!(e.format, PluginFormat::Builtin);
+        assert!(db.find_by_id(BUILTIN_ID_SILENCE).is_some());
+    }
+
+    #[test]
+    fn ensure_builtins_is_idempotent() {
+        // 二度呼んでも builtin が重複しない (format で除外してから再注入)。
+        let mut db = PluginDatabase::default();
+        db.ensure_builtins();
+        let n = db.entries.len();
+        db.ensure_builtins();
+        assert_eq!(db.entries.len(), n);
+    }
+
+    #[test]
+    fn save_to_file_excludes_builtins() {
+        // builtin を載せた DB を save しても、ディスクには外部 plugin だけが
+        // 残る (builtin はコードが SSoT)。load は ensure_builtins で復元する。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.json");
+        let mut db = PluginDatabase {
+            entries: vec![PluginEntry {
+                id: "com.test.x".into(),
+                format: PluginFormat::Clap,
+                name: "X".into(),
+                vendor: String::new(),
+                version: "0.1.0".into(),
+                features: vec![],
+                path: PathBuf::from("/tmp/x.clap"),
+                descriptor_index: 0,
+            }],
+            scanned_at: Some(1),
+        };
+        db.ensure_builtins();
+        db.save_to_file(&path).unwrap();
+        let loaded = PluginDatabase::load_from_file(&path).unwrap().unwrap();
+        assert!(loaded.find_by_id(BUILTIN_ID_VOICEVOX).is_none());
+        assert!(loaded.find_by_id(BUILTIN_ID_SILENCE).is_none());
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].id, "com.test.x");
     }
 }

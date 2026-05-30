@@ -464,7 +464,12 @@ fn load_or_build_plugin_db() -> Option<Arc<PluginDatabase>> {
     use common::plugin_db::{default_cache_path, scan_system};
     if let Some(cache) = default_cache_path() {
         match PluginDatabase::load_from_file(&cache) {
-            Ok(Some(db)) => {
+            Ok(Some(mut db)) => {
+                // builtin (VOICEVOX 等) はコードが Single Source of Truth。
+                // 古い cache には欠落 / 旧版が混じりうるので、load 後に必ず
+                // 最新の builtin descriptors を注入する (cache を消さずに新
+                // builtin が反映され、vocal track の instrument ロードが通る)。
+                db.ensure_builtins();
                 tracing::info!(
                     count = db.entries.len(),
                     path = %cache.display(),
