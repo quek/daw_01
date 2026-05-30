@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
-use daw_ui_platform::{CursorIcon, KeyEvent, PhysicalSize};
+use daw_ui_platform::{CursorIcon, KeyEvent, PhysicalKey, PhysicalSize};
 use daw_ui_renderer::{
     Color, GlyphArea, LineBatch, LineSegment, Primitive, Rect, RectCommand, Scene, TexturedQuad,
 };
@@ -442,7 +442,18 @@ impl<M: ?Sized + 'static> UiHost<M> {
         let mut typing_paste_pending = false;
         keyboard_events.retain(|ev| {
             if let Some(name) = self.shortcut_map.matches(ev, modifiers) {
-                if typing_lock && shortcut::is_typing_only_shortcut(name) {
+                // (daw_01 #056) typing 中は command 修飾 (Ctrl/Alt/Logo) を持たない printable
+                // 文字キー (英数字 / Space、Shift だけ付きも含む) に bind された shortcut を global
+                // 消費せず、text_input に文字として届ける。daw_01 は R/D/V/... を素キーに bind する
+                // ため、これを消費すると文字入力が奪われる。command 修飾付き (Ctrl+S 等) や
+                // F1-F24 / Escape 等の非テキストキーは従来どおり typing 中も global 発火する。
+                let bare_char_key = matches!(
+                    ev.physical_key,
+                    PhysicalKey::Char(_) | PhysicalKey::Digit(_) | PhysicalKey::Space
+                ) && !modifiers.ctrl
+                    && !modifiers.alt
+                    && !modifiers.logo;
+                if typing_lock && (shortcut::is_typing_only_shortcut(name) || bare_char_key) {
                     if name == "paste" {
                         typing_paste_pending = true;
                     }
@@ -2403,6 +2414,89 @@ mod tests {
         assert!(
             !outer_got_delete.get(),
             "typing_focus 中は take_shortcut(\"delete\") が false を返す (= 他 widget の note 削除等を防ぐ)"
+        );
+    }
+
+    /// (daw_01 #056) text_input focus 中、素の文字キー (Ctrl/Alt/Logo 無し) に bind された
+    /// shortcut は global 消費されず文字が text_input に届く。daw_01 が R/D/V/... を素キーに
+    /// bind しても typing 中に文字入力が奪われないことを固定。
+    #[test]
+    fn typing_focus_keeps_bare_char_shortcut_for_text_input() {
+        use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        host.shortcut_map_mut().bind("test.bare_r", "R"); // daw_01 流の素キー shortcut
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        // Frame 1: text_input focus → frame 末尾で last_typing_focus = true
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.text_input_at_focused(
+                "ti",
+                Rect { x: 10.0, y: 10.0, w: 100.0, h: 24.0 },
+                "x",
+                |_| Edit::mutate(|()| {}),
+            );
+        });
+
+        // Frame 2: 素の R キー → bare_char_key で suppress、shortcut は発火しない
+        let r_ev = KeyEvent {
+            state: ElementState::Pressed,
+            text: Some("r".to_string()),
+            physical_key: PhysicalKey::Char('R'),
+        };
+        let got_shortcut = std::cell::Cell::new(true);
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput { keyboard: vec![r_ev], ..Default::default() },
+            |(), ui| {
+                got_shortcut.set(ui.take_shortcut("test.bare_r"));
+                ui.text_input_at_focused(
+                    "ti",
+                    Rect { x: 10.0, y: 10.0, w: 100.0, h: 24.0 },
+                    "x",
+                    |_| Edit::mutate(|()| {}),
+                );
+            },
+        );
+        assert!(
+            !got_shortcut.get(),
+            "typing 中は素の文字キー shortcut が発火しない (文字が text_input に届く)"
+        );
+    }
+
+    /// (daw_01 #056) typing focus が無ければ素の文字キー shortcut は従来どおり global 発火する
+    /// (suppress は typing_lock 中のみ、非テキスト文脈の素キー shortcut を壊さない)。
+    #[test]
+    fn non_typing_bare_char_shortcut_still_fires() {
+        use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        host.shortcut_map_mut().bind("test.bare_r", "R");
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        // text_input を出さない (typing_lock = false) フレームで素 R → 発火する
+        let r_ev = KeyEvent {
+            state: ElementState::Pressed,
+            text: Some("r".to_string()),
+            physical_key: PhysicalKey::Char('R'),
+        };
+        let got_shortcut = std::cell::Cell::new(false);
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput { keyboard: vec![r_ev], ..Default::default() },
+            |(), ui| {
+                got_shortcut.set(ui.take_shortcut("test.bare_r"));
+            },
+        );
+        assert!(
+            got_shortcut.get(),
+            "typing focus が無ければ素キー shortcut は通常どおり global 発火"
         );
     }
 
