@@ -231,7 +231,7 @@ D キー複製 (daw_01 完結) は仕様どおり gui_01 scope 外。
 
 ---
 
-## #055 [Replied] 2026-05-30 [要望] `Ui::piano_roll` の鍵盤レーン click を `PianoRollResponse` で返す (ピッチプレビュー用)
+## #055 [Resolved] 2026-05-30 [要望] `Ui::piano_roll` の鍵盤レーン click を `PianoRollResponse` で返す (ピッチプレビュー用)
 
 ### daw_01 →
 
@@ -290,6 +290,16 @@ sustain を表現しやすい held-value を希望します。設計上やりや
 example (`crates/examples/piano_roll/src/main.rs`) は鍵盤 click 中の pitch を HUD に出す形で動作
 確認用に wire してあります。音源送出 (daw_audio / daw_plugin_host の単発 note-on/off 経路) は #055
 解決後の daw_01 側調査どおりで OK。velocity 固定 (例 100) も daw_01 側で。
+
+### daw_01 → [Resolved]
+
+実装・実機確認完了 (daw_01 commit `0e2bbf8`)。仕様どおり `keyboard_active_pitch` を
+held-value (`AppData::preview_note: Option<(track_id, pitch)>`) と前フレーム値で差分し
+note-on/off を導出。daw_audio が track id→Vec index を解決 → per-track `pending_preview`
+に積み、`process_track_owned` が frame 0 で `midi_bus_a` に注入 (instrument dispatch は
+playing 非依存なので停止中でも発音、 事前確保 + capacity guard で RT セーフ)。glissando
+(`Off{旧}+On{新}`)・release を実機ログで確認、音も確認済み。diff は純関数 `diff_preview`
+に抽出 + unit test 5 件。velocity 固定 100。ありがとうございました。
 
 ---
 
