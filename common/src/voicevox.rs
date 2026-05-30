@@ -493,8 +493,15 @@ pub fn synthesize_notes_for_builtin(
     let (samples, sample_rate) = decode_wav_to_f32(&wav_bytes)?;
 
     // Note frame offsets relative to frame 0 of the rendered buffer.
-    // VOICEVOX renders the first non-rest entry at frame 0, so subtract
-    // the earliest start_beat across the input notes.
+    //
+    // `build_sing_query` は wav 先頭に必ず `REST_FRAMES` の leading rest
+    // (= attack 用の無音) を入れる。 よって「最初の non-rest entry」 は
+    // frame 0 ではなく frame REST_FRAMES から始まる。 各 note の音声開始
+    // 位置 = leading rest + (start_beat - earliest) × samples_per_beat。
+    // この lead-in を足さないと、 cursor が無音区間を指したまま再生開始
+    // → 全 note が一律 REST_FRAMES 分 (≈107ms @48kHz) 遅れて聞こえる。
+    let lead_in_samples =
+        (f64::from(REST_FRAMES) / FRAME_RATE * f64::from(sample_rate)).round() as u64;
     let earliest = notes
         .iter()
         .map(|n| n.start_beat)
@@ -503,8 +510,8 @@ pub fn synthesize_notes_for_builtin(
     let mut note_offsets: std::collections::HashMap<u32, u64> =
         std::collections::HashMap::with_capacity(notes.len());
     for n in notes {
-        let frame =
-            (((n.start_beat - earliest) * samples_per_beat).max(0.0)) as u64;
+        let frame = lead_in_samples
+            + (((n.start_beat - earliest) * samples_per_beat).max(0.0)) as u64;
         note_offsets.insert(n.note_id, frame);
     }
 
