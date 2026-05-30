@@ -313,6 +313,7 @@ mod tests {
             length_beats: event_length,
             content_id: cid,
             notes: Vec::new(),
+            color: None,
         });
         song.tracks.push(track);
         song

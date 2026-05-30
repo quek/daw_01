@@ -8,7 +8,22 @@ use crate::plugin_format::PluginFormat;
 use crate::protocol::PluginSlot;
 use crate::scale::ScaleChange;
 
-/// `17` Aux send / return: `Track.sends: Vec<Send>` is added — each
+/// `18` Track / Clip color: `Track.color: Option<[f32; 3]>` and
+/// `Clip.color: Option<[f32; 3]>` are added (RGB, opaque). For a track,
+/// `None` means "derive a stable palette color from the track id"
+/// (auto-assignment; reorder-stable because it keys off the id, not the
+/// index) and `Some(rgb)` is a user override. For a clip, `None` means
+/// "inherit the owning track's effective color" and `Some(rgb)` is a
+/// per-clip override; resetting a clip back to `None` is the Ableton-style
+/// "match track color" action. v17 `.daw` files still load — both fields
+/// default to `None` (per `#[serde(default)]`), i.e. tracks render their
+/// derived palette color and clips inherit. The color is a model value
+/// only; the renderer-side `daw_ui_renderer::Color` conversion and the
+/// palette live in `daw_gui` (view layer). See
+/// `docs/plan_track_clip_color.md`.
+///
+/// Previously:
+///   `17` Aux send / return: `Track.sends: Vec<Send>` is added — each
 /// `Send` is a parallel, gain-scaled copy of the track's signal routed
 /// into a destination "return" track's input bus (the source's own
 /// signal still reaches its parent / master untouched). v16 `.daw`
@@ -66,7 +81,7 @@ use crate::scale::ScaleChange;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 17;
+pub const CURRENT_VERSION: u32 = 18;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -1014,6 +1029,14 @@ pub struct Track {
     /// load.
     #[serde(default)]
     pub next_lane_id: u32,
+    /// v18 (`docs/plan_track_clip_color.md`): user-facing track color
+    /// (RGB, opaque). `None` ⇒ the view layer derives a stable palette
+    /// color from `id` (auto-assignment, reorder-stable). `Some(rgb)` ⇒
+    /// explicit user override. The color carries no audio/engine meaning;
+    /// only `daw_gui` reads it (arrangement header tint + clip inherit).
+    /// v17 files forward-migrate to `None` (= derived palette color).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[f32; 3]>,
 }
 
 /// Where a `Send` taps the source track's signal chain.
@@ -1083,6 +1106,7 @@ impl Default for Track {
             reported_latency_samples: 0,
             automation_lanes: Vec::new(),
             next_lane_id: 1,
+            color: None,
         }
     }
 }
@@ -1230,6 +1254,14 @@ pub struct Clip {
     /// emit it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<Note>,
+    /// v18 (`docs/plan_track_clip_color.md`): per-clip color override
+    /// (RGB, opaque). `None` ⇒ inherit the owning track's effective color
+    /// (the default; resetting to `None` is the Ableton-style "match track
+    /// color"). `Some(rgb)` ⇒ explicit per-clip override. Read only by
+    /// `daw_gui` (arrangement clip fill). v17 files forward-migrate to
+    /// `None` (= inherit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[f32; 3]>,
 }
 
 /// Shared content referenced by one or more `Clip`s via
@@ -2510,6 +2542,7 @@ mod tests {
                             lyric: Some("ん".into()),
                         },
                     ],
+                    color: None,
                 }],
                 ..Track::default()
             }],
@@ -2520,11 +2553,60 @@ mod tests {
 
     #[test]
     fn current_version_is_pinned() {
-        // Bumped to 17 for aux send / return: `Track.sends: Vec<Send>`
-        // is added. v16 files forward-migrate via `#[serde(default)]`
-        // (empty `sends`). Pinning the constant catches accidental
-        // rollback. See `docs/plan_routing_graph.md`.
-        assert_eq!(CURRENT_VERSION, 17);
+        // Bumped to 18 for track / clip color: `Track.color` and
+        // `Clip.color` (`Option<[f32; 3]>`) are added. v17 files
+        // forward-migrate via `#[serde(default)]` (both `None`). Pinning
+        // the constant catches accidental rollback. See
+        // `docs/plan_track_clip_color.md`.
+        assert_eq!(CURRENT_VERSION, 18);
+    }
+
+    #[test]
+    fn v17_track_and_clip_load_forward_with_none_color() {
+        // A v17 .daw file (no `color` key on Track / Clip) must load with
+        // `color == None` (= derived palette / inherit), proving the v18
+        // field is `#[serde(default)]`.
+        let v17_json = r#"{
+            "id": 3,
+            "name": "Lead",
+            "volume": 1.0,
+            "pan": 0.0,
+            "next_clip_id": 2,
+            "clips": [
+                {
+                    "id": 1,
+                    "name": "C",
+                    "start_beat": 0.0,
+                    "length_beats": 4.0,
+                    "content_id": 1
+                }
+            ]
+        }"#;
+        let track: Track = serde_json::from_str(v17_json).unwrap();
+        assert_eq!(track.color, None);
+        assert_eq!(track.clips[0].color, None);
+    }
+
+    #[test]
+    fn track_and_clip_color_bincode_round_trip() {
+        // v18 color fields survive a bincode encode/decode (the IPC + on-disk
+        // path). `None` and `Some` both round-trip.
+        let cfg = bincode::config::standard();
+        let track = Track {
+            id: 9,
+            color: Some([0.25, 0.5, 0.75]),
+            clips: vec![
+                Clip { id: 1, color: None, ..Clip::default() },
+                Clip { id: 2, color: Some([0.1, 0.2, 0.3]), ..Clip::default() },
+            ],
+            ..Track::default()
+        };
+        let bytes = bincode::encode_to_vec(&track, cfg).unwrap();
+        let (decoded, _): (Track, usize) =
+            bincode::decode_from_slice(&bytes, cfg).unwrap();
+        assert_eq!(decoded.color, Some([0.25, 0.5, 0.75]));
+        assert_eq!(decoded.clips[0].color, None);
+        assert_eq!(decoded.clips[1].color, Some([0.1, 0.2, 0.3]));
     }
 
     #[test]
@@ -2809,6 +2891,7 @@ mod tests {
                 length_beats: 4.0,
                 content_id: cid,
                 notes: Vec::new(),
+                color: None,
             }],
             automation_lanes: vec![AutomationLane {
                 id: 1,
@@ -2969,6 +3052,7 @@ mod tests {
                 length_beats: 4.0,
                 content_id: cid,
                 notes: Vec::new(),
+                color: None,
             }],
             next_clip_id: 2,
             ..Track::default()

@@ -95,6 +95,7 @@ mod tests {
                     length_beats,
                     content_id: 0,
                     notes: Vec::new(),
+                    color: None,
                 }],
                 ..Track::default()
             }],
@@ -157,6 +158,7 @@ mod tests {
                         length_beats: 4.0,
                         content_id: 0,
                         notes: Vec::new(),
+                        color: None,
                     }],
                     ..Track::default()
                 },
@@ -169,6 +171,7 @@ mod tests {
                         length_beats: 2.0,
                         content_id: 0,
                         notes: Vec::new(),
+                        color: None,
                     }],
                     ..Track::default()
                 },

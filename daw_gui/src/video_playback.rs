@@ -1393,6 +1393,7 @@ mod tests {
             length_beats: 8.0,
             content_id,
             notes: Vec::new(),
+            color: None,
         });
         song.tracks.push(track);
         song
@@ -1718,6 +1719,7 @@ mod tests {
                 length_beats: 8.0,
                 content_id: cid2,
                 notes: Vec::new(),
+                color: None,
             }],
             next_clip_id: 2,
             ..Track::default()

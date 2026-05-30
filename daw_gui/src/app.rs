@@ -1925,6 +1925,8 @@ impl AppData {
                 | AppEvent::GlueSelectedClips
                 | AppEvent::SetClipReversed { .. }
                 | AppEvent::SetClipMuted { .. }
+                | AppEvent::SetTrackColor { .. }
+                | AppEvent::SetClipColor { .. }
                 | AppEvent::SetClipStretchMode { .. }
                 | AppEvent::CommitClipGainEdit
                 | AppEvent::CommitClipPanEdit
@@ -3024,6 +3026,10 @@ pub enum AppEvent {
     // -------- Mixer -------------------------------------------------------
     SetTrackVolume { track: u32, amp: f32 },
     SetTrackPan { track: u32, pan: f32 },
+    /// v18 (`docs/plan_track_clip_color.md`): track の表示色を設定。
+    /// `color == None` で id 由来の導出パレット色 (auto) に戻す。音響的な
+    /// 意味はなく model field のみ更新 (= audio engine への送信不要)。Undo 対象。
+    SetTrackColor { track: u32, color: Option<[f32; 3]> },
     ToggleTrackMute(u32),
     ToggleTrackSolo(u32),
     /// Phase 7 B4 (2026-05-13): track Record-arm を toggle。 業界標準どおり
@@ -3204,6 +3210,11 @@ pub enum AppEvent {
     /// 選択時 Mute toggle)、 track-mute とは独立。 Phase 1 では 1 clip 1
     /// event 前提なので「event mute = clip mute」 と同義。
     SetClipMuted { target: ClipRef, muted: bool },
+
+    /// v18 (`docs/plan_track_clip_color.md`): clip の表示色を設定。
+    /// `color == None` でトラック色継承に戻す (Ableton "match track color")。
+    /// model field のみ更新。Undo 対象。
+    SetClipColor { target: ClipRef, color: Option<[f32; 3]> },
 
     /// Set `AudioEvent.stretch_mode` for every event in the selected
     /// audio clip. Phase 1 で再生に効くのは `Raw` / `Repitch` のみ;
@@ -4202,6 +4213,11 @@ impl AppData {
             AppEvent::SetTrackPan { track, pan } => {
                 self.set_track_pan(track, pan);
             }
+            AppEvent::SetTrackColor { track, color } => {
+                if let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track) {
+                    t.color = color;
+                }
+            }
             AppEvent::ToggleTrackMute(track) => {
                 self.toggle_track_mute(track);
             }
@@ -4307,6 +4323,16 @@ impl AppData {
             }
             AppEvent::SetClipReversed { target, reversed } => {
                 self.set_clip_audio_event_reversed(target, reversed);
+            }
+            AppEvent::SetClipColor { target, color } => {
+                if let Some(clip) = self
+                    .song
+                    .tracks
+                    .get_mut(target.track as usize)
+                    .and_then(|t| t.clips.get_mut(target.clip as usize))
+                {
+                    clip.color = color;
+                }
             }
             AppEvent::SetClipMuted { target, muted } => {
                 if self.is_image_clip(target) {
@@ -9293,6 +9319,7 @@ impl AppData {
             length_beats: pending.clip_length_beats,
             content_id: new_content_id,
             notes: Vec::new(),
+            color: None,
         });
 
         self.resize_track_peak_display();
@@ -10744,6 +10771,7 @@ impl AppData {
             length_beats: new_length,
             content_id,
             notes: Vec::new(),
+            color: None,
         });
         let r = ClipRef {
             track: source.track,
@@ -10790,6 +10818,7 @@ impl AppData {
             length_beats: new_length,
             content_id: new_content_id,
             notes: Vec::new(),
+            color: None,
         });
         let r = ClipRef {
             track: source.track,
@@ -10832,6 +10861,7 @@ impl AppData {
                 length_beats: new_length,
                 content_id,
                 notes: Vec::new(),
+                color: None,
             });
             new_refs.push(ClipRef {
                 track: to_track_idx as u32,
@@ -10885,6 +10915,7 @@ impl AppData {
                 length_beats: new_length,
                 content_id: new_content_id,
                 notes: Vec::new(),
+                color: None,
             });
             new_refs.push(ClipRef {
                 track: to_track_idx as u32,
@@ -10956,6 +10987,7 @@ impl AppData {
             length_beats: DEFAULT_CLIP_LENGTH,
             content_id,
             notes: Vec::new(),
+            color: None,
         });
         let r = ClipRef {
             track: track_idx,
@@ -13179,6 +13211,7 @@ impl AppData {
                 length_beats,
                 content_id,
                 notes: Vec::new(),
+                color: None,
             });
             next_start_beat += length_beats;
             imported_ok += 1;
@@ -13310,6 +13343,7 @@ impl AppData {
                 length_beats: video_length_beats,
                 content_id: v_content_id,
                 notes: Vec::new(),
+                color: None,
             });
             self.song.tracks.push(video_track);
 
@@ -13351,6 +13385,7 @@ impl AppData {
                     length_beats: audio_length_beats,
                     content_id: a_content_id,
                     notes: Vec::new(),
+                    color: None,
                 });
                 self.song.tracks.push(audio_track);
             }
@@ -13503,6 +13538,7 @@ impl AppData {
                 length_beats: image_clip_length_beats,
                 content_id: i_content_id,
                 notes: Vec::new(),
+                color: None,
             });
             // Insert at index 0 (= top of the arrangement).
             self.song.tracks.insert(0, image_track);
@@ -13567,6 +13603,7 @@ impl AppData {
             length_beats: text_clip_length_beats,
             content_id,
             notes: Vec::new(),
+            color: None,
         });
         self.song.tracks.insert(0, text_track);
 
@@ -14142,6 +14179,7 @@ impl AppData {
             length_beats: back_len,
             content_id: back_content_id,
             notes: Vec::new(),
+            color: None,
         });
         new_selection.push(target);
         new_selection.push(ClipRef {
@@ -14403,6 +14441,7 @@ impl AppData {
                 length_beats: combined_len,
                 content_id: new_content_id,
                 notes: Vec::new(),
+                color: None,
             });
             new_refs.push(ClipRef {
                 track: track_idx,

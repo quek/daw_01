@@ -664,6 +664,7 @@ mod tests {
             length_beats: 4.0,
             content_id: 0,
             notes: Vec::new(),
+            color: None,
         };
         let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);
@@ -686,6 +687,7 @@ mod tests {
                 velocity: 100,
                 lyric: Some("ら".into()),
             }],
+            color: None,
         };
         let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);
@@ -720,6 +722,7 @@ mod tests {
                     lyric: Some("ん".into()),
                 },
             ],
+            color: None,
         };
         let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);
@@ -760,6 +763,7 @@ mod tests {
                     lyric: Some("ん".into()),
                 },
             ],
+            color: None,
         };
         let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);
@@ -784,6 +788,7 @@ mod tests {
                 velocity: 100,
                 lyric: Some("\"a\"".into()),
             }],
+            color: None,
         };
         let q = build_sing_query(&clip.notes, 120.0);
         // Must remain valid JSON despite embedded quotes.
@@ -814,6 +819,7 @@ mod tests {
                     lyric: Some("こ".into()),
                 },
             ],
+            color: None,
         };
         let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);

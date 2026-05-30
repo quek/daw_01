@@ -163,6 +163,7 @@ mod tests {
                 length_beats: 16.0,
                 content_id: cid,
                 notes: Vec::new(),
+                color: None,
             }],
             ..Track::default()
         });

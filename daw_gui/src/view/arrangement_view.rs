@@ -18,6 +18,7 @@ use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent, ClipRef, FadeEdgeKind};
 use crate::view::mixer_strips::{amp_to_fader, fader_to_amp};
+use crate::view::track_color;
 use crate::view::snap::{self, SNAP_LABELS};
 
 /// gui_01 widget の `FadeCurve` (#025) ↔ daw_01 model `FadeCurve` の
@@ -161,7 +162,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     name: text_clip_label(c, &app.song.clip_contents)
                         .map(Arc::from)
                         .unwrap_or_else(|| Arc::from(c.name.as_str())),
-                    color: None,
+                    // v18 (`docs/plan_track_clip_color.md`): clip は effective
+                    // 色 (個別上書き or トラック色継承) で塗る。共有 clip
+                    // (refcount >= 2) では widget が `share_group_color` (hue) を
+                    // 優先し、この `color` を無視する設計 (arrangement.rs:2621)。
+                    color: Some(track_color::to_renderer(
+                        track_color::effective_clip_color(t, c),
+                    )),
                     // gui_01 #019 (M14 Phase 63e): refcount >= 2 (= 共有 clip)
                     // のときだけ Some(hue)。 widget が hue + style.share_group_S/L
                     // で HSL→RGB 変換してアクセント色 + link glyph を描画。
@@ -254,6 +261,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             // 使う。Some(px) なら override (Alt+drag / 下端 splitter drag で
             // SetSingleTrackRowH を発火 → AppData.track_row_overrides に反映)。
             row_h: app.track_row_overrides.get(&t.id).copied(),
+            // v18 (`docs/plan_track_clip_color.md`, gui_01 #059): track の
+            // effective 色 (明示上書き or id 由来の導出パレット色)。常に Some を
+            // 渡す (widget は header 左端に色ストライプを描く)。
+            color: Some(track_color::to_renderer(track_color::effective_track_color(t))),
         })
         .collect();
 
