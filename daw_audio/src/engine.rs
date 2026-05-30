@@ -1361,55 +1361,58 @@ pub fn process_track_owned(
     let effective_mute = muted || (any_solo && !solo);
     scratch.effective_mute = effective_mute;
 
-    if effective_mute {
-        // Zero the track output too so a stale buffer from before the
-        // user pressed mute doesn't leak into the master bus.
+    // Always apply the strip so `track_l/r` carries this track's
+    // post-fader signal — even for an excluded track. The master / group
+    // mixes drop `effective_mute` tracks via the flag (so the dry is never
+    // heard), but keeping the signal lets aux sends into a SOLOED return
+    // and sidechain taps still read it: soloing a return then auditions
+    // the sends feeding it (Ableton). RT-safe: in-place writes only.
+    // Phase 5 Step 5.2: master が当該 buffer の effective bpm を current_bpm
+    // として渡す (song = None なら process_buffer 側で 120.0)。
+    crate::automation::fill_track_param_ramps(
+        song,
+        track_idx,
+        sample_rate,
+        current_bpm,
+        playhead,
+        frames,
+        &mut scratch.volume_per_sample,
+        &mut scratch.pan_per_sample,
+        recording_lanes,
+    );
+    let mut peak_l = 0.0_f32;
+    let mut peak_r = 0.0_f32;
+    for i in 0..n {
+        let pan = scratch.pan_per_sample[i].clamp(-1.0, 1.0);
+        let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+        let vol = scratch.volume_per_sample[i];
+        let gain_l = angle.cos() * vol;
+        let gain_r = angle.sin() * vol;
+        let l = scratch.track_l[i] * gain_l;
+        let r = scratch.track_r[i] * gain_r;
+        scratch.track_l[i] = l;
+        scratch.track_r[i] = r;
+        if l.abs() > peak_l {
+            peak_l = l.abs();
+        }
+        if r.abs() > peak_r {
+            peak_r = r.abs();
+        }
+    }
+    scratch.peak_l = peak_l;
+    scratch.peak_r = peak_r;
+
+    // Explicit mute zeroes the output entirely (no dry, no send, no
+    // sidechain). Solo-exclusion does NOT zero — the flag already keeps it
+    // out of the master / group mix, while the signal stays available for
+    // sends / sidechain. Either way an excluded track meters dark.
+    if muted {
         scratch.track_l[..n].fill(0.0);
         scratch.track_r[..n].fill(0.0);
+    }
+    if effective_mute {
         scratch.peak_l = 0.0;
         scratch.peak_r = 0.0;
-    } else {
-        // Fill the per-sample volume / pan ramps. With no automation
-        // lane this fills both buffers with the constant track strip
-        // values; with a `Volume` / `Pan` lane each sample gets the
-        // curve value. RT-safe: in-place writes only.
-        // Phase 5 Step 5.2: master が当該 buffer の effective bpm を
-        // current_bpm として渡してくる。 song.bpm fallback はもはや不要
-        // (= song = None なら process_buffer 側で current_bpm = 120.0)。
-        crate::automation::fill_track_param_ramps(
-            song,
-            track_idx,
-            sample_rate,
-            current_bpm,
-            playhead,
-            frames,
-            &mut scratch.volume_per_sample,
-            &mut scratch.pan_per_sample,
-            recording_lanes,
-        );
-        let mut peak_l = 0.0_f32;
-        let mut peak_r = 0.0_f32;
-        // Apply the strip per-sample so volume / pan automation lands
-        // sample-accurately. No global write — race-free.
-        for i in 0..n {
-            let pan = scratch.pan_per_sample[i].clamp(-1.0, 1.0);
-            let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
-            let vol = scratch.volume_per_sample[i];
-            let gain_l = angle.cos() * vol;
-            let gain_r = angle.sin() * vol;
-            let l = scratch.track_l[i] * gain_l;
-            let r = scratch.track_r[i] * gain_r;
-            scratch.track_l[i] = l;
-            scratch.track_r[i] = r;
-            if l.abs() > peak_l {
-                peak_l = l.abs();
-            }
-            if r.abs() > peak_r {
-                peak_r = r.abs();
-            }
-        }
-        scratch.peak_l = peak_l;
-        scratch.peak_r = peak_r;
     }
 }
 
@@ -1754,8 +1757,11 @@ fn mix_send_into_track_scratch(
     if !send.enabled {
         return;
     }
-    // A muted source (incl. the global solo rule) silences its sends.
-    if scratch[src_idx].effective_mute {
+    // An explicit mute on the source silences its sends. Solo-exclusion
+    // does NOT — the source keeps its post-fader signal (see
+    // process_track_owned), so soloing a return auditions the sends
+    // feeding it; the return's own mute / solo then decides if it's heard.
+    if track.muted {
         return;
     }
 
@@ -1923,52 +1929,55 @@ fn run_group_fx_chain(
 
     let muted = song_track.muted;
     let solo = song_track.solo;
-    // Live 互換: 子のいずれかが solo されている場合、 group 自身は
-    // solo フラグが立っていなくても透過させる ("soloed via children")。
-    // → `effective_mute = muted || (any_solo && !solo && !子に solo)`
-    let effective_mute = muted
-        || (any_solo
-            && !solo
-            && !has_soloed_contributor(song, song_track.id));
+    // Live 互換: 子 / send 元のいずれかが solo されていれば、 この bus 自身は
+    // solo フラグが無くても透過させる (has_soloed_contributor)。
+    let effective_mute =
+        muted || (any_solo && !solo && !has_soloed_contributor(song, song_track.id));
     scratch.effective_mute = effective_mute;
-    if effective_mute {
+
+    // Always apply the strip (mirrors process_track_owned): keep the signal
+    // in `track_l/r` for onward sends / sidechain even when excluded; only
+    // an explicit mute zeroes it, and the flag handles master / group
+    // exclusion.
+    crate::automation::fill_track_param_ramps(
+        Some(song),
+        track_idx,
+        sample_rate,
+        song.bpm,
+        playhead,
+        frames,
+        &mut scratch.volume_per_sample,
+        &mut scratch.pan_per_sample,
+        recording_lanes,
+    );
+    let mut peak_l = 0.0_f32;
+    let mut peak_r = 0.0_f32;
+    for i in 0..n {
+        let pan = scratch.pan_per_sample[i].clamp(-1.0, 1.0);
+        let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+        let vol = scratch.volume_per_sample[i];
+        let gain_l = angle.cos() * vol;
+        let gain_r = angle.sin() * vol;
+        let l = scratch.track_l[i] * gain_l;
+        let r = scratch.track_r[i] * gain_r;
+        scratch.track_l[i] = l;
+        scratch.track_r[i] = r;
+        if l.abs() > peak_l {
+            peak_l = l.abs();
+        }
+        if r.abs() > peak_r {
+            peak_r = r.abs();
+        }
+    }
+    scratch.peak_l = peak_l;
+    scratch.peak_r = peak_r;
+    if muted {
         scratch.track_l[..n].fill(0.0);
         scratch.track_r[..n].fill(0.0);
+    }
+    if effective_mute {
         scratch.peak_l = 0.0;
         scratch.peak_r = 0.0;
-    } else {
-        crate::automation::fill_track_param_ramps(
-            Some(song),
-            track_idx,
-            sample_rate,
-            song.bpm,
-            playhead,
-            frames,
-            &mut scratch.volume_per_sample,
-            &mut scratch.pan_per_sample,
-            recording_lanes,
-        );
-        let mut peak_l = 0.0_f32;
-        let mut peak_r = 0.0_f32;
-        for i in 0..n {
-            let pan = scratch.pan_per_sample[i].clamp(-1.0, 1.0);
-            let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
-            let vol = scratch.volume_per_sample[i];
-            let gain_l = angle.cos() * vol;
-            let gain_r = angle.sin() * vol;
-            let l = scratch.track_l[i] * gain_l;
-            let r = scratch.track_r[i] * gain_r;
-            scratch.track_l[i] = l;
-            scratch.track_r[i] = r;
-            if l.abs() > peak_l {
-                peak_l = l.abs();
-            }
-            if r.abs() > peak_r {
-                peak_r = r.abs();
-            }
-        }
-        scratch.peak_l = peak_l;
-        scratch.peak_r = peak_r;
     }
 }
 
@@ -2221,12 +2230,12 @@ mod send_tests {
         }
     }
 
-    /// A muted source (incl. the solo rule) silences its sends.
+    /// An *explicitly* muted source silences its sends.
     #[test]
-    fn muted_source_send_contributes_silence() {
-        let song = song_with_send(1.0, SendMode::PostFader, true);
+    fn explicitly_muted_source_send_contributes_silence() {
+        let mut song = song_with_send(1.0, SendMode::PostFader, true);
+        song.tracks[0].muted = true; // explicit mute kills the send
         let mut scratch: Vec<TrackScratch> = (0..4).map(|_| TrackScratch::new()).collect();
-        scratch[0].effective_mute = true;
         for i in 0..FRAMES {
             scratch[0].track_l[i] = 1.0;
             scratch[1].track_l[i] = 3.0;
@@ -2238,7 +2247,32 @@ mod send_tests {
         for i in 0..FRAMES {
             assert_eq!(
                 scratch[1].track_l[i], 3.0,
-                "muted source must not feed its send"
+                "explicitly muted source must not feed its send"
+            );
+        }
+    }
+
+    /// A solo-EXCLUDED source (not explicitly muted, just not soloed) still
+    /// feeds its send, so soloing only the destination return auditions it.
+    /// The MixSend gate keys on explicit mute, not the effective_mute flag,
+    /// and process_track_owned no longer zeroes solo-excluded scratch.
+    #[test]
+    fn solo_excluded_source_still_feeds_its_send() {
+        let song = song_with_send(1.0, SendMode::PostFader, true);
+        let mut scratch: Vec<TrackScratch> = (0..4).map(|_| TrackScratch::new()).collect();
+        scratch[0].effective_mute = true; // solo-excluded, but signal retained
+        for i in 0..FRAMES {
+            scratch[0].track_l[i] = 0.5;
+            scratch[1].track_l[i] = 0.0;
+        }
+        let empty = empty_lanes();
+        mix_send_into_track_scratch(
+            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0, &empty, FRAMES,
+        );
+        for i in 0..FRAMES {
+            assert!(
+                (scratch[1].track_l[i] - 0.5).abs() < 1e-6,
+                "solo-excluded (but not muted) source must still feed its send"
             );
         }
     }
