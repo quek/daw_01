@@ -455,7 +455,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 "Bounce In Place",
                 "Bounce (with FX)",
                 "色...",
-                "トラック色に戻す",
             ],
             move |idx, ui| {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -484,13 +483,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         // Phase 2 PR-C (`docs/plan_audio_followup.md`)。
                         6 => app.handle_event(AppEvent::BounceClipWithFx(target)),
                         // v18 (`docs/plan_track_clip_color.md`): color_picker を開く
-                        // (anchor = 右クリックした clip rect)。
+                        // (anchor = 右クリックした clip rect)。個別 clip 色の上書き。
+                        // 「トラック色に戻す」 (継承へ) は Ableton と同様に track 側
+                        // context menu (= 全 clip 一括) に置く。
                         7 => app.open_color_picker(ColorPickerTarget::Clip(target), menu_rect),
-                        // 「トラック色に戻す」 = clip 上書きを外す (= 継承)。picker 不要。
-                        8 => app.handle_event(AppEvent::SetClipColor {
-                            target,
-                            color: None,
-                        }),
                         _ => {}
                     }
                 }));
@@ -650,22 +646,31 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     for (track_id, rect) in &resp.track_header_rects {
         let track_id = *track_id;
         let rect = *rect;
-        ui.context_menu_for(rect, &["Rename", "色...", "Delete"], move |idx, ui| {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                let Some(t_idx) = app.song.tracks.iter().position(|t| t.id == track_id)
-                else {
-                    return;
-                };
-                match idx {
-                    0 => app.handle_event(AppEvent::BeginRenameTrack(t_idx as u32)),
-                    // v18 (`docs/plan_track_clip_color.md`): color_picker を開く
-                    // (anchor = 右クリックした track header rect)。
-                    1 => app.open_color_picker(ColorPickerTarget::Track(track_id), rect),
-                    2 => app.handle_event(AppEvent::DeleteTrack(t_idx as u32)),
-                    _ => {}
-                }
-            }));
-        });
+        ui.context_menu_for(
+            rect,
+            &["Rename", "色...", "クリップ色をトラックに揃える", "Delete"],
+            move |idx, ui| {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    let Some(t_idx) =
+                        app.song.tracks.iter().position(|t| t.id == track_id)
+                    else {
+                        return;
+                    };
+                    match idx {
+                        0 => app.handle_event(AppEvent::BeginRenameTrack(t_idx as u32)),
+                        // v18 (`docs/plan_track_clip_color.md`): color_picker を開く
+                        // (anchor = 右クリックした track header rect)。
+                        1 => app.open_color_picker(ColorPickerTarget::Track(track_id), rect),
+                        // Ableton 流: track の全 clip の色上書きを外して track 色継承に戻す。
+                        2 => app.handle_event(AppEvent::ResetTrackClipColors {
+                            track: track_id,
+                        }),
+                        3 => app.handle_event(AppEvent::DeleteTrack(t_idx as u32)),
+                        _ => {}
+                    }
+                }));
+            },
+        );
 
         if Some(track_id) == renaming_track_id {
             // text_input は track header rect の上端に被せる (M/S トグル等は隠れる)。

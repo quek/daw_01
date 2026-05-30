@@ -1981,6 +1981,9 @@ impl AppData {
                 | AppEvent::GlueSelectedClips
                 | AppEvent::SetClipReversed { .. }
                 | AppEvent::SetClipMuted { .. }
+                // ResetTrackClipColors は discrete な一括編集なので undoable。
+                // (SetTrackColor / SetClipColor は picker live drag のため非 undoable)
+                | AppEvent::ResetTrackClipColors { .. }
                 // 注: SetTrackColor / SetClipColor は is_undoable に **入れない**。
                 // color_picker の live drag で毎フレーム発火するため、 ここで
                 // 毎回 snapshot すると undo 履歴が溢れる。 代わりに各 arm が
@@ -3089,6 +3092,10 @@ pub enum AppEvent {
     /// `color == None` で id 由来の導出パレット色 (auto) に戻す。音響的な
     /// 意味はなく model field のみ更新 (= audio engine への送信不要)。Undo 対象。
     SetTrackColor { track: u32, color: Option<[f32; 3]> },
+    /// v18 (`docs/plan_track_clip_color.md`): Ableton 流に、track の全 clip の
+    /// 色上書き (`Clip.color`) を外して track 色継承に戻す (= 一括 reset)。
+    /// track 自身の color は変えない。track header context menu から発火。Undo 対象。
+    ResetTrackClipColors { track: u32 },
     ToggleTrackMute(u32),
     ToggleTrackSolo(u32),
     /// Phase 7 B4 (2026-05-13): track Record-arm を toggle。 業界標準どおり
@@ -4276,6 +4283,14 @@ impl AppData {
                 self.snapshot_for_color_edit();
                 if let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track) {
                     t.color = color;
+                }
+            }
+            AppEvent::ResetTrackClipColors { track } => {
+                // 全 clip の上書きを外す (= track 色継承)。undo は is_undoable で取得済。
+                if let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track) {
+                    for clip in &mut t.clips {
+                        clip.color = None;
+                    }
                 }
             }
             AppEvent::ToggleTrackMute(track) => {

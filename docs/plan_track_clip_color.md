@@ -34,8 +34,12 @@ Ableton Live のデフォルトパレットを参考にした 16 色 (彩度高�
 ### UI
 
 - **トリガー**: 右クリックメニュー (既存 `ui.context_menu_for` を流用)。
-  - トラックヘッダ右クリック: 既存 `["Rename", "Delete"]` に `"色..."` を追加。
-  - クリップ右クリック: 既存メニューに `"色..."` と `"トラック色に戻す"` を追加。
+  - トラックヘッダ右クリック: `"色..."`(track 色 picker)と
+    `"クリップ色をトラックに揃える"`(Ableton 流に、その track の全 clip の
+    上書きを外して継承に戻す = 一括 reset)を追加。
+  - クリップ右クリック: `"色..."`(個別 clip 色の上書き)を追加。
+    継承へ戻す操作は **track 側メニューの一括 reset** に集約(Ableton と同様、
+    clip 個別の「トラック色に戻す」は置かない)。
   - トラック inspector にも色スウォッチボタンを置き、同じ picker を開ける。
 - **ピッカー本体**: gui_01 の新 `color_picker` widget (パレットスウォッチ +
   カスタム RGB/HSV)。daw_01 は `color_picker_target: Option<ColorPickerTarget>`
