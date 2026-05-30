@@ -95,6 +95,11 @@ fn delete_range(working: &mut String, cursor: &mut usize, anchor: &mut usize) ->
     true
 }
 
+// `focused` / `committed` / `nav_up` / `nav_down` は **意味の異なる 1 frame edge** で、
+// state machine や enum にまとめると caller の `if resp.nav_up { ... }` 等の自然な扱いが
+// 損なわれる (例: ↑↓ 同フレーム push を 1 つの Option<NavKey> に潰すと丸める情報が出る)。
+// この struct に限り `struct_excessive_bools` を許容する。
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 pub struct TextInputResponse {
     /// この widget が現在キーボードフォーカスを持っているか。
@@ -109,6 +114,13 @@ pub struct TextInputResponse {
     /// なかった (`piano_roll` の歌詞 inline 編集で「Enter で commit text を取り出して
     /// `split_into_morae` で分割→次 note へ分配」が必要になり追加)。
     pub committed_text: Option<String>,
+    /// (M14 Phase 86 / daw_01 #057) focus 中にこのフレームで ↑ キーが押されたか。
+    /// text_input は単一行で ↑↓ を内部利用しないため、 type-ahead picker / combobox 等
+    /// 「検索ボックスに focus を保ったまま候補リストの cursor を上下移動したい」 caller に
+    /// 委譲する。 Left/Right は cursor 移動に使うため返さない。
+    pub nav_up: bool,
+    /// (M14 Phase 86 / daw_01 #057) focus 中にこのフレームで ↓ キーが押されたか。 詳細は [`Self::nav_up`]。
+    pub nav_down: bool,
 }
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
@@ -187,6 +199,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let mut new_text: Option<String> = None;
         let mut committed = false;
         let mut escape_pressed = false;
+        let mut nav_up = false;
+        let mut nav_down = false;
         if was_focused {
             // typing-only shortcut (前フレームに `set_typing_focus(true)` を出していたフレームで
             // shortcut layer から keyboard_events に残してある) を先に拾う。
@@ -305,6 +319,15 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         }
                         PhysicalKey::Escape => {
                             escape_pressed = true;
+                        }
+                        // (M14 Phase 86 / daw_01 #057) ↑↓ は text_input 単一行では未使用なので
+                        // edge を Response に積んで caller に委譲 (type-ahead picker / combobox 用)。
+                        // keyboard_events から消費されるが ev.text は無いので text への影響なし。
+                        PhysicalKey::ArrowUp => {
+                            nav_up = true;
+                        }
+                        PhysicalKey::ArrowDown => {
+                            nav_down = true;
                         }
                         _ => {
                             if let Some(input_text) = &ev.text {
@@ -455,7 +478,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.push_edit(edit);
         }
 
-        TextInputResponse { focused: was_focused, committed, committed_text }
+        TextInputResponse {
+            focused: was_focused,
+            committed,
+            committed_text,
+            nav_up,
+            nav_down,
+        }
     }
 
     /// vstack カーソル位置に 1 行 text_input を追加 (高さ 28px、幅は cursor 幅)。
@@ -1163,6 +1192,136 @@ mod tests {
             Some("abc"),
             "selection が clipboard に書かれる"
         );
+    }
+
+    // ============================================================================
+    // M14 Phase 86 (daw_01 #057): focus 中の ↑↓ を `TextInputResponse` に edge 返却
+    // ============================================================================
+
+    /// focus 中の ArrowUp → `resp.nav_up == true` / text 不変 / cursor 不変。
+    /// ArrowDown も同様。 type-ahead picker (検索ボックスに focus を保ったまま
+    /// 候補リストの cursor を上下移動) 用。
+    #[test]
+    fn arrow_up_down_reported_via_response_without_text_change() {
+        use std::cell::Cell;
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        // Frame 1: focus 取得
+        run_focus_frame(&mut host, &mut scene, screen, "abc");
+        scene.clear();
+
+        // Frame 2: ArrowUp → nav_up = true、 text に影響なし
+        let nav_up = Cell::new(false);
+        let nav_down = Cell::new(false);
+        let mut m = ();
+        host.frame(
+            &mut m,
+            &mut scene,
+            screen,
+            frame_with_keys(vec![key_pressed(PhysicalKey::ArrowUp)], Modifiers::default()),
+            |(), ui| {
+                let resp = ui.text_input_at_focused(
+                    "ti",
+                    Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
+                    "abc",
+                    |new| {
+                        // 反映しない (controlled caller の最小形): on_change が呼ばれたら不正。
+                        panic!("ArrowUp で on_change が呼ばれた (text={new})");
+                    },
+                );
+                nav_up.set(resp.nav_up);
+                nav_down.set(resp.nav_down);
+            },
+        );
+        assert!(nav_up.get(), "ArrowUp で nav_up=true");
+        assert!(!nav_down.get(), "ArrowUp 単独で nav_down は false のまま");
+        scene.clear();
+
+        // Frame 3: ArrowDown → nav_down = true
+        let nav_up = Cell::new(false);
+        let nav_down = Cell::new(false);
+        host.frame(
+            &mut m,
+            &mut scene,
+            screen,
+            frame_with_keys(vec![key_pressed(PhysicalKey::ArrowDown)], Modifiers::default()),
+            |(), ui| {
+                let resp = ui.text_input_at_focused(
+                    "ti",
+                    Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
+                    "abc",
+                    |new| panic!("ArrowDown で on_change が呼ばれた (text={new})"),
+                );
+                nav_up.set(resp.nav_up);
+                nav_down.set(resp.nav_down);
+            },
+        );
+        assert!(!nav_up.get(), "ArrowDown 単独で nav_up は false のまま");
+        assert!(nav_down.get(), "ArrowDown で nav_down=true");
+    }
+
+    /// focus を持たない widget は ↑↓ を Response に積まない (keyboard_events に届かない)。
+    /// ↑↓ は global shortcut layer を通り抜けるが、 take_keyboard_events_if_focused が
+    /// focus 持ちにのみ events を渡すので、 非 focus widget の Response は false のまま。
+    #[test]
+    fn arrow_up_down_not_reported_when_not_focused() {
+        use std::cell::Cell;
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        // text_input_at_focused は初回 show で auto focus するが、 別 widget に focus を移してから
+        // 連続 visible で text_input は focus を奪い返さない (= 非 focus 状態を作る)。
+        run_focus_frame(&mut host, &mut scene, screen, "abc");
+        scene.clear();
+
+        let other_wid = WidgetId::ROOT.child(b"other_input");
+        // Frame 2: 別 widget に focus 移動
+        host.frame(
+            &mut (),
+            &mut scene,
+            screen,
+            FrameInput::default(),
+            |(), ui| {
+                ui.set_focus(other_wid);
+                let _ = ui.text_input_at_focused(
+                    "ti",
+                    Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
+                    "abc",
+                    |_new| Edit::mutate(|()| {}),
+                );
+            },
+        );
+        scene.clear();
+
+        // Frame 3: ArrowUp/Down を送る → 非 focus なので Response は false のまま
+        let nav_up = Cell::new(true);
+        let nav_down = Cell::new(true);
+        host.frame(
+            &mut (),
+            &mut scene,
+            screen,
+            frame_with_keys(
+                vec![key_pressed(PhysicalKey::ArrowUp), key_pressed(PhysicalKey::ArrowDown)],
+                Modifiers::default(),
+            ),
+            |(), ui| {
+                let resp = ui.text_input_at_focused(
+                    "ti",
+                    Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
+                    "abc",
+                    |_new| Edit::mutate(|()| {}),
+                );
+                nav_up.set(resp.nav_up);
+                nav_down.set(resp.nav_down);
+            },
+        );
+        assert!(!nav_up.get(), "非 focus widget は nav_up を返さない");
+        assert!(!nav_down.get(), "非 focus widget は nav_down を返さない");
     }
 
     #[test]
