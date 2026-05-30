@@ -33,6 +33,45 @@
 | **パラアウト本数の上限** | **MAX_AUX_OUT = 4** (= 2-out drum sampler 1 系統 + spare) | 一般的なドラムサンプラー (Battery / Geist) で 4 stereo out まで足りる。後で拡張可 |
 | 段階リリース | **4 PR** | smoke test を各段階で維持、回帰検出可 |
 
+## 実装状況: Send / Return (2026-05-30 実装・実機確認済み)
+
+PR4 の **send/return 部分**を実装。group / sidechain / PDC は既存基盤を流用。
+
+- model: `Track::sends: Vec<Send>` / `Send { dest_track_id, gain, mode:
+  SendMode{PostFader, PreFader}, enabled }`。リターンは派生 (incoming send を
+  持つ track、新 TrackKind 無し)。v16→v17 forward-migrate、ensure_ids で send
+  dest を remap。
+- graph (`compile.rs`): 各 send を宛先バスの入力に `NodeOp::MixSend` で追加。
+  emission 順序を parent+sidechain+send 依存の post-order に一般化、cycle 検出に
+  send エッジ、PDC `compute_path_latency` に send fan-in。
+- engine (`engine.rs`): `MixSend` を post-dispatch で **live send gain**
+  (`SendGain` 自動化 / ノブ drag を recompile 無し per-sample) で加算。pre-fader
+  タップは strip 前に `TrackScratch.pre_fader_l/r` へ snapshot。
+- IPC: realtime `SetSendGain` / `SetSendEnabled` (構造変更は LoadSong 再コンパ
+  イル)。
+- GUI: mixer strip の Sends セクション (level knob + pre/post + mute + remove)、
+  リターンを右帯に表示、Add Return、`track_picker`、SendGain 自動化ジェスチャ。
+  group 兼 return は通常帯に残す (階層保持)。
+
+### ソロ × センドの規範挙動 (実機検証で確定)
+
+- **明示 mute** はトラックの dry / send / sidechain を全て止める (`track_l/r` を
+  zero 化)。
+- **ソロ除外** (`any_solo && !solo`) は `track_l/r` を **zero 化しない** — master
+  / group mix は `effective_mute` フラグで dry を除外するが、信号は send /
+  sidechain 用に保持する。
+- **リターンは solo-safe**: `has_soloed_contributor` が send 元エッジも辿り、
+  ソロしたトラックの send 先リターンを生かす (ソロ中もセンドが鳴る)。
+- **send は solo を尊重**: ソロ中、send が流れるのは「送り元が solo-audible」
+  または「宛先リターンが明示 Solo (audition)」のときだけ。あるトラックを Solo
+  しても、同じリターンへ送る別トラックの send は漏れない。リターンを Solo すると
+  そのリターンへの全 send を audition できる。
+- sidechain は send と非対称: solo-excluded source の信号は SidechainTap で常に
+  タップされる (ソロ中も ducking 継続 = ミックスでの聞こえ方を維持)。
+
+commit: model/protocol/graph/engine/gui 一括 `35b2129`、solo-safe `2344a1a`、
+return audition `a2854d0`、solo leak 修正 `7631178`。
+
 ## アーキテクチャ
 
 ### Signal Graph（共通基盤）
