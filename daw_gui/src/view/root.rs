@@ -521,6 +521,19 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }));
     }
 
+    // ----- Clip rename (F2) -------------------------------------------------
+    // 選択中 clip を inline rename (右クリックメニュー "Rename" と同経路)。
+    // rename は単一対象なので selected_clip (= 末尾カーソル clip) を使う。
+    // 選択 clip が無ければ no-op。 text_input focus 中は gui_01 が shortcut を
+    // 抑制するので rename 編集中の F2 は発火しない。
+    if ui.take_shortcut("daw.rename_clip")
+        && let Some(target) = app.selected_clip
+    {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::BeginRenameClip(target));
+        }));
+    }
+
     // ----- Automation: A キー (gui_01 #028 §7.3) ----------------------------
     // last-touched parameter (volume / pan / lane default knob 操作で更新) の
     // lane を所有 track に追加。 既存の lane は visible / enabled = true で
@@ -584,13 +597,17 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }));
     }
     // modal が開いている間は escape を消費しない (modal 側で close する)。
-    // 優先度: rename mode → Audio Editor close → CloseHelp。 rename と
-    // Audio Editor は同時には開かない (= rename は track header の上、
-    // Audio Editor は bottom panel の中) ので順番でも実用 OK。
+    // 優先度: track rename → clip rename → Audio Editor close → CloseHelp。
+    // rename (track header / clip rect の inline text_input) と Audio Editor
+    // (bottom panel) は同時には開かないので順番でも実用 OK。
     if !app.is_plugin_picker_open && ui.take_shortcut("escape") {
         if app.track_rename_idx.is_some() {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::CancelRenameTrack)
+            }));
+        } else if app.clip_rename.is_some() {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CancelRenameClip)
             }));
         } else if app.audio_editor_clip.is_some() {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {

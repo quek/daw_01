@@ -68,6 +68,10 @@ pub fn daw_shortcut_map() -> ShortcutMap {
     m.bind("daw.split_clip_at_cursor", "E");
     m.bind("daw.split_clip_at_cursor_no_snap", "Alt+E");
     m.bind("daw.glue_selected_clips", "J");
+    // 選択中 clip を inline rename (track rename の clip 版)。 F2 は DAW 慣習
+    // (Bitwig / Live / REAPER)。 text_input フォーカス中は gui_01 が shortcut
+    // を抑制するので、 rename 編集中に F2 を打っても再発火しない。
+    m.bind("daw.rename_clip", "F2");
     // Phase 7 B5 (`docs/plan_scale.html` §5.3): 選択 clip の note pitch を
     // 最寄りの in-scale pitch に一括補正。 Bitwig の "Quantize Pitches" 相当。
     // selected_notes が空のときは clip 全 note、 そうでなければ選択 note のみ。

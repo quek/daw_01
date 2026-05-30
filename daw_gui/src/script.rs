@@ -386,6 +386,11 @@ fn register_daw_globals(ctx: &mut Context) -> Result<()> {
             js_string!("dispatchGlue"),
             0,
         )
+        .function(
+            NativeFunction::from_fn_ptr(daw_dispatch_rename_clip),
+            js_string!("dispatchRenameClip"),
+            2,
+        )
         // ----- Phase 7 B5 Scale & Root API ------------------------------
         .function(
             NativeFunction::from_fn_ptr(daw_set_scale_at_playhead),
@@ -773,6 +778,26 @@ fn daw_dispatch_glue(
 ) -> JsResult<JsValue> {
     with_host(|host| {
         host.app.handle_event(AppEvent::GlueSelectedClips);
+    });
+    Ok(JsValue::undefined())
+}
+
+// clip rename: production の右クリック "Rename" / F2 と同じ AppEvent 列
+// (Begin → Changed → Commit) を 1 回で発火する。 commit ロジック
+// (trim / 空文字 no-op) を JS smoke test で verify する用。
+fn daw_dispatch_rename_clip(
+    _this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let ref_json = arg_to_string(args, 0, ctx)?;
+    let target: ClipRef = serde_json::from_str(&ref_json)
+        .map_err(|e| js_native(format!("dispatchRenameClip: parse: {e}")))?;
+    let new_name = arg_to_string(args, 1, ctx)?;
+    with_host(|host| {
+        host.app.handle_event(AppEvent::BeginRenameClip(target));
+        host.app.handle_event(AppEvent::RenameClipChanged(new_name));
+        host.app.handle_event(AppEvent::CommitRenameClip);
     });
     Ok(JsValue::undefined())
 }

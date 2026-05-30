@@ -879,6 +879,13 @@ pub struct AppData {
     pub track_rename_idx: Option<u32>,
     pub track_rename_text: String,
 
+    /// 編集中の clip rename。 `Some` のとき該当 clip rect に inline
+    /// text_input を重ね描きする (track rename の clip 版)。 `ClipRef` は
+    /// index ベースなので rename mode 中の track/clip reorder は track
+    /// rename と同様に想定しない。
+    pub clip_rename: Option<ClipRef>,
+    pub clip_rename_text: String,
+
     /// Transport BPM 入力欄の編集中文字列。 commit (Enter) で parse + clamp +
     /// `song.bpm` に反映、 song を切り替える際 (open / new / undo / redo) は
     /// `resync_song_edit_texts` で formatted な現値に書き戻す。
@@ -1162,6 +1169,8 @@ impl AppData {
             status_message: String::new(),
             track_rename_idx: None,
             track_rename_text: String::new(),
+            clip_rename: None,
+            clip_rename_text: String::new(),
             bpm_edit_text: format!("{initial_bpm:.1}"),
             time_sig_num_edit_text: initial_time_sig_num.to_string(),
             clip_edit_buffer_target: None,
@@ -1735,6 +1744,8 @@ impl AppData {
         self.selected_notes.clear();
         self.track_rename_idx = None;
         self.track_rename_text.clear();
+        self.clip_rename = None;
+        self.clip_rename_text.clear();
         // selected_track_ids: undo で track が消えていたら除外。 残りが
         // 空なら「最後の track をカーソル」 にフォールバック (UI が
         // 完全選択ゼロでフリーズしないため)。
@@ -1790,6 +1801,7 @@ impl AppData {
                 | AppEvent::SetTrackParent { .. }
                 | AppEvent::RemoveLastTrack
                 | AppEvent::CommitRenameTrack
+                | AppEvent::CommitRenameClip
                 | AppEvent::CreateClip { .. }
                 | AppEvent::ResizeClip { .. }
                 | AppEvent::DeleteSelectedClip
@@ -2660,6 +2672,12 @@ pub enum AppEvent {
     RenameTrackChanged(String),
     CommitRenameTrack,
     CancelRenameTrack,
+    /// clip rename (track rename の clip 版)。 右クリックメニュー "Rename"
+    /// または F2 で開始、 該当 clip rect に inline text_input を重ねる。
+    BeginRenameClip(ClipRef),
+    RenameClipChanged(String),
+    CommitRenameClip,
+    CancelRenameClip,
     ToggleHelp,
     CloseHelp,
     OpenRecent(PathBuf),
@@ -3751,6 +3769,15 @@ impl AppData {
             AppEvent::CancelRenameTrack => {
                 self.track_rename_idx = None;
                 self.track_rename_text.clear();
+            }
+            AppEvent::BeginRenameClip(target) => self.begin_rename_clip(target),
+            AppEvent::RenameClipChanged(text) => {
+                self.clip_rename_text = text;
+            }
+            AppEvent::CommitRenameClip => self.commit_rename_clip(),
+            AppEvent::CancelRenameClip => {
+                self.clip_rename = None;
+                self.clip_rename_text.clear();
             }
             AppEvent::ToggleHelp => {
                 self.is_help_open = !self.is_help_open;
@@ -5872,6 +5899,44 @@ impl AppData {
             track.name = new_name;
         }
         self.sync_song_to_plugin_host();
+    }
+
+    fn begin_rename_clip(&mut self, target: ClipRef) {
+        let Some(name) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.name.clone())
+        else {
+            return;
+        };
+        self.clip_rename_text = name;
+        self.clip_rename = Some(target);
+    }
+
+    /// clip rename を確定。 trim 後空文字なら無変更 (track rename と同じ)。
+    /// clip 名は表示専用 (audio / plugin processing に無関係) なので
+    /// `sync_song_to_plugin_host` は呼ばない。 song の変更は autosave /
+    /// undo snapshot (`is_undoable`) に乗る。
+    fn commit_rename_clip(&mut self) {
+        let Some(target) = self.clip_rename else {
+            return;
+        };
+        self.clip_rename = None;
+        let new_name = self.clip_rename_text.trim().to_string();
+        self.clip_rename_text.clear();
+        if new_name.is_empty() {
+            return;
+        }
+        if let Some(clip) = self
+            .song
+            .tracks
+            .get_mut(target.track as usize)
+            .and_then(|t| t.clips.get_mut(target.clip as usize))
+        {
+            clip.name = new_name;
+        }
     }
 
     fn ensure_first_track(&mut self) {

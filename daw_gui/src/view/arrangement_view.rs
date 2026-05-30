@@ -419,12 +419,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // (`docs/plan_audio_clip.md` §3.5)。 選択 clip 群に対して動くので、
     // 右クリックされた clip 自体の selection を変える/変えないは handler
     // 側に任せる (= MakeClipUnique も同 pattern)。
+    // rename overlay 判定用に clip_rename (index ベース ClipRef) を 1 回だけ
+    // ClipKey (id ベース) に解決する (selected_clips と同 idiom)。 track rename
+    // の renaming_track_id と同パターンで、 ループ内で clip_key_to_ref を毎
+    // clip 呼ぶ線形探索を避ける。
+    let renaming_clip_key = app.clip_rename.and_then(|r| {
+        let t = app.song.tracks.get(r.track as usize)?;
+        let c = t.clips.get(r.clip as usize)?;
+        Some(ClipKey { track: t.id, clip: c.id })
+    });
     let lanes_x = area.x + TRACK_HEADER_W;
     for (clip_key, rect) in &resp.clip_rects {
         let key = *clip_key;
         ui.context_menu_for(
             *rect,
             &[
+                "Rename",
                 "Make Unique",
                 "Auto-Fade",
                 "Auto-Crossfade",
@@ -438,23 +448,26 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         return;
                     };
                     match idx {
-                        0 => app.handle_event(AppEvent::MakeClipUnique(target)),
-                        1 => app.handle_event(AppEvent::AutoFadeSelectedClips),
-                        2 => app.handle_event(AppEvent::AutoCrossfadeSelectedClips),
+                        // 右クリック対象 clip を inline rename (track rename の
+                        // clip 版、 F2 でも起動)。
+                        0 => app.handle_event(AppEvent::BeginRenameClip(target)),
+                        1 => app.handle_event(AppEvent::MakeClipUnique(target)),
+                        2 => app.handle_event(AppEvent::AutoFadeSelectedClips),
+                        3 => app.handle_event(AppEvent::AutoCrossfadeSelectedClips),
                         // Reverse は右クリック対象 clip 1 つだけを toggle
                         // (Auto-Fade と違って selection 全体ではなく当該
                         // clip のみ。 Bitwig clip メニューでも同様)。
-                        3 => app.handle_event(AppEvent::ToggleClipReversed(target)),
+                        4 => app.handle_event(AppEvent::ToggleClipReversed(target)),
                         // Bounce In Place: Pre-FX (= plugin chain 通さず)、
                         // 当該 clip の content を 1 event の baked audio に
                         // 置換 (= 元 track 内で同 path)。 Phase 2 PR9
                         // (`docs/plan_audio_clip.md` §3.8)。
-                        4 => app.handle_event(AppEvent::BounceClipInPlace(target)),
+                        5 => app.handle_event(AppEvent::BounceClipInPlace(target)),
                         // Bounce (with FX): plugin chain を **通した** 結果を
                         // **新 track + 新 Clip** に書き出す (元 clip は不変)。
                         // async (= IPC freewheel render → 完了通知)。
                         // Phase 2 PR-C (`docs/plan_audio_followup.md`)。
-                        5 => app.handle_event(AppEvent::BounceClipWithFx(target)),
+                        6 => app.handle_event(AppEvent::BounceClipWithFx(target)),
                         _ => {}
                     }
                 }));
@@ -464,6 +477,34 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         draw_audio_clip_waveform(app, ui, *clip_key, *rect, lanes_x, is_selected);
         draw_audio_clip_value_overlay(app, ui, *clip_key, *rect);
         draw_midi_clip_notes(app, ui, *clip_key, *rect, lanes_x, is_selected);
+
+        // clip rename mode 中はこの clip rect の上端に text_input を重ね描き。
+        // track rename と同 idiom (text_input_at_focused が click で focus 取得、
+        // Enter commit / Esc は root の escape handler が CancelRenameClip 発行)。
+        // renaming_clip_key (ループ前に 1 回解決した id ベース key) と比較。
+        if Some(key) == renaming_clip_key {
+            let input_rect = Rect {
+                x: rect.x + 2.0,
+                y: rect.y + 2.0,
+                w: (rect.w - 4.0).max(0.0),
+                h: 18.0,
+            };
+            let edit_resp = ui.text_input_at_focused(
+                ("clip_rename", key.track, key.clip),
+                input_rect,
+                &app.clip_rename_text,
+                |new| {
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::RenameClipChanged(new.clone()));
+                    })
+                },
+            );
+            if edit_resp.committed {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::CommitRenameClip);
+                }));
+            }
+        }
     }
 
     // gui_01 #028 (M14 Phase 63n-2): automation point 上の右クリック →
