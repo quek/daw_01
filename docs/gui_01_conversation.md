@@ -401,3 +401,58 @@ bind したままで、トラック名や歌詞の編集中はそれらが文字
 
 ---
 
+## #057 [Open] 2026-05-30 [要望] `Ui::text_input` が focus 中の ↑↓ キーを `TextInputResponse` で返す (type-ahead picker 用)
+
+### daw_01 →
+
+- 種別: [要望]
+- 関連仕様: `docs/plan_plugin_picker_keyboard_nav.md`
+- gui_01 側で見るべきソースの当たり: `crates/ui/src/widgets/text_input.rs` の
+  `TextInputResponse` (:98-112) / キー処理ループ (:254-323、特に Up/Down が `_` に落ちる :309) /
+  Response 構築 (:458)。
+
+**最終形態 (こう使いたい):**
+
+daw_01 のプラグインピッカー (modal) は検索ボックス (`text_input_at_focused`) + 候補リスト
+(`list_view`) の type-ahead picker。検索ボックスに focus を保ったまま ↑↓ で候補リストの
+カーソルを動かし、Enter でカーソル位置を確定したい (VS Code コマンドパレット / Ableton
+ブラウザの挙動)。カーソルのハイライトと確定処理は daw_01 側 (`list_view` の `selected` +
+`SelectPluginFromDb`) で実装するので、gui_01 には「focus 中にこのフレーム ↑ / ↓ が
+押されたか」だけを返してほしい。
+
+**現状 (なぜ今できないか、一次情報):**
+
+- text_input は focus 中 `take_keyboard_events_if_focused` で全 KeyEvent を `std::mem::take`
+  で奪い (`ui.rs:1693-1699`)、キー処理ループ (`text_input.rs:254-323`) に Up/Down のアームが
+  無く `_` (:309) に落ちて `ev.text == None` で無視・破棄する。→ caller (plugin picker view)
+  に ↑↓ が届かない。
+- 回避策 (修飾なし矢印を global shortcut bind) は `shortcut.rs:211-216` が明示的に禁止。
+  bind すると picker が閉じている時も全アプリの ↑↓ を奪い、text_input の Left/Right cursor
+  移動とも競合する。#056 (Phase 85) の「typing 中は printable 文字キーを suppress」は矢印が
+  printable でないため対象外 (typing 中でも global 消費される)。
+- なので text_input 内部で ↑↓ を caller に委譲してもらうのが唯一クリーンな道。text_input は
+  単一行で ↑↓ を内部利用していない (Left/Right だけ cursor 移動に使用) ので、委譲しても
+  既存挙動を壊しません。
+
+**要望 (API イメージ):**
+
+`TextInputResponse` に field 追加 (最小):
+
+```rust
+/// focus 中にこのフレームで押された ↑ / ↓ (text_input は単一行で未使用)。
+/// type-ahead picker / combobox が候補リストの cursor 移動に使う。
+/// Left/Right は text_input の cursor 移動に使うため返さない。
+pub nav_up: bool,
+pub nav_down: bool,
+```
+
+キー処理ループの `_` アームの手前に `PhysicalKey::ArrowUp => nav_up = true` /
+`PhysicalKey::ArrowDown => nav_down = true` を足し、Response (:458) に積むイメージ。
+edge (bool) で十分です (カーソル移動は離散)。↑↓ 以外 (PageUp/Down/Home/End) は今回不要。
+汎用化したい場合 (未処理キーをまとめて返す等) の設計は gui_01 にお任せします。
+
+### gui_01 →
+（gui_01 Claude が記入）
+
+---
+
