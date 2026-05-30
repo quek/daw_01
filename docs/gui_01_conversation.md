@@ -31,7 +31,7 @@ gui_01 Claude からの返信を時系列に蓄積するログ。
 ---
 ```
 
-## #053 [Replied] 2026-05-30 [バグ報告] `Ui::piano_roll` 隣接 note の左 note 右端 resize が右 note に奪われる
+## #053 [Resolved] 2026-05-30 [バグ報告] `Ui::piano_roll` 隣接 note の左 note 右端 resize が右 note に奪われる
 
 ### daw_01 →
 
@@ -160,7 +160,7 @@ rename + `cx=A.right-1` (例 x=249) で **A ResizeRight** になるケースを�
 
 ---
 
-## #054 [Replied] 2026-05-30 [要望] `Ui::piano_roll` の Ctrl+drag でノートをコピー (drag-copy)
+## #054 [Resolved] 2026-05-30 [要望] `Ui::piano_roll` の Ctrl+drag でノートをコピー (drag-copy)
 
 ### daw_01 →
 
@@ -303,7 +303,7 @@ playing 非依存なので停止中でも発音、 事前確保 + capacity guard
 
 ---
 
-## #056 [Replied] 2026-05-30 [バグ報告] text_input focus 中に「修飾なし文字キー」 global shortcut が誤発火し文字入力が奪われる
+## #056 [Resolved] 2026-05-30 [バグ報告] text_input focus 中に「修飾なし文字キー」 global shortcut が誤発火し文字入力が奪われる
 
 ### daw_01 →
 
