@@ -980,10 +980,10 @@ impl LoadedPlugin for Vst3Plugin {
         // (= flag の立っていない field は plugin 側で無視)。 musical time は
         // 拍 (= TQuarterNotes f64) 単位、 sample time は absolute samples。
         let bpm_f = f64::from(transport.bpm.max(1.0));
-        let sr_f = f64::from(transport.sample_rate.max(1));
         let tsig_num_f = f64::from(transport.tsig_num.max(1));
-        let song_pos_seconds = transport.playhead_samples as f64 / sr_f;
-        let song_pos_beats = song_pos_seconds * bpm_f / 60.0;
+        // beats は daw_audio が tempo automation を積分した真の拍位置を使う
+        // (= CLAP `build_clap_transport_event` と同 SSoT、 一定テンポ逆算廃止)。
+        let song_pos_beats = transport.song_pos_beats;
         let bar_number = (song_pos_beats / tsig_num_f).floor();
         let bar_start_beats = bar_number * tsig_num_f;
         self.process_context.sampleRate = self.sample_rate;

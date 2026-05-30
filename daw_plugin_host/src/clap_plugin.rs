@@ -1184,8 +1184,12 @@ fn build_clap_transport_event(
     let bpm = f64::from(transport.bpm).max(1.0);
     let sample_rate = f64::from(transport.sample_rate).max(1.0);
     let playhead_samples = transport.playhead_samples as f64;
+    // seconds は sample 由来 (= テンポ非依存で正確)。
     let song_pos_seconds_f64 = playhead_samples / sample_rate;
-    let song_pos_beats_f64 = song_pos_seconds_f64 * bpm / 60.0;
+    // beats は daw_audio が tempo automation を積分した真の拍位置を使う
+    // (= `samples × bpm` の一定テンポ逆算は廃止)。 これで途中でテンポが
+    // 変わった曲でも plugin が正しい拍 / 小節位置を見る。
+    let song_pos_beats_f64 = transport.song_pos_beats;
     let song_pos_beats: i64 = (song_pos_beats_f64 * CLAP_BEATTIME_FACTOR as f64) as i64;
     let song_pos_seconds: i64 = (song_pos_seconds_f64 * CLAP_SECTIME_FACTOR as f64) as i64;
     let tsig_num = transport.tsig_num.max(1) as f64;
@@ -1611,5 +1615,59 @@ impl LoadedPlugin for ClapPlugin {
 
     fn gui_destroy(&mut self) {
         self.gui_destroy();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin_instance::TransportContext;
+
+    fn ctx() -> TransportContext {
+        TransportContext {
+            bpm: 120.0,
+            sample_rate: 48_000,
+            // 1 秒 = 48000 samples。 一定テンポ逆算なら 120*1/60 = 2.0 拍。
+            playhead_samples: 48_000,
+            // だが真の拍位置は 999.0 (= tempo automation で曲頭からの累積が
+            // sample×bpm の線形換算と一致しないケースを模擬)。
+            song_pos_beats: 999.0,
+            tsig_num: 4,
+            tsig_denom: 4,
+            is_playing: true,
+            is_looping: false,
+            loop_start_beats: 0.0,
+            loop_end_beats: 0.0,
+        }
+    }
+
+    #[test]
+    fn transport_event_uses_song_pos_beats_directly() {
+        // SSoT 回帰防止: song_pos_beats は transport.song_pos_beats を直接
+        // fixed-point 化したもので、 samples × bpm の一定テンポ逆算ではない。
+        let ev = build_clap_transport_event(&ctx(), 256);
+        let expected = (999.0_f64 * CLAP_BEATTIME_FACTOR as f64) as i64;
+        assert_eq!(ev.song_pos_beats, expected);
+        // seconds は sample 由来 (= テンポ非依存で正確)、 1 秒。
+        let expected_sec = (1.0_f64 * CLAP_SECTIME_FACTOR as f64) as i64;
+        assert_eq!(ev.song_pos_seconds, expected_sec);
+        assert_eq!(ev.tempo, 120.0);
+        assert_ne!(ev.flags & CLAP_TRANSPORT_IS_PLAYING, 0);
+        // loop region 未定義 → IS_LOOP_ACTIVE は立たない。
+        assert_eq!(ev.flags & CLAP_TRANSPORT_IS_LOOP_ACTIVE, 0);
+    }
+
+    #[test]
+    fn loop_active_requires_both_toggle_and_region() {
+        let mut c = ctx();
+        c.is_looping = true;
+        c.loop_start_beats = 4.0;
+        c.loop_end_beats = 8.0;
+        let ev = build_clap_transport_event(&c, 256);
+        assert_ne!(ev.flags & CLAP_TRANSPORT_IS_LOOP_ACTIVE, 0);
+        // toggle on でも region 無し (end <= start) なら flag は立たない。
+        c.loop_end_beats = c.loop_start_beats;
+        let ev2 = build_clap_transport_event(&c, 256);
+        assert_eq!(ev2.flags & CLAP_TRANSPORT_IS_LOOP_ACTIVE, 0);
     }
 }

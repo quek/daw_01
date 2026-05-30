@@ -77,6 +77,14 @@ pub struct ProcessData {
     /// loop_start_beats` なら loop active と解釈。
     pub loop_start_beats: f64,
     pub loop_end_beats: f64,
+    /// 累積拍位置 (= buffer 頭の song 位置 in beats)。 audio engine が
+    /// `playhead_beats` (tempo automation を積分した真の拍位置) をそのまま
+    /// 格納する。 plugin host はこれを CLAP `song_pos_beats` / VST3
+    /// `projectTimeMusic` に**直接**使う (= `steady_time × bpm` の一定テンポ
+    /// 逆算を廃止)。 これでテンポオートメーション中も plugin の tempo-sync が
+    /// 正しい拍に追従する。 `song_pos_seconds` は sample 由来 (= テンポ非依存で
+    /// 正確) なので別途格納せず host 側で `steady_time / sample_rate` を使う。
+    pub song_pos_beats: f64,
     /// Phase 5 Step 5.3: `clap_event_transport.flags` の `IS_LOOPING` ビット
     /// に使う「user が loop button を押している」 状態。 `loop_end_beats >
     /// loop_start_beats` だけでは「loop region は設定したが loop button は
@@ -142,6 +150,7 @@ impl ProcessData {
             tsig_denom: 4,
             loop_start_beats: 0.0,
             loop_end_beats: 0.0,
+            song_pos_beats: 0.0,
             looping: 0,
             _pad_transport: [0; 5],
         }

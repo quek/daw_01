@@ -116,6 +116,11 @@ pub struct TransportContext {
     /// `playhead_samples / sample_rate` and to `song_pos_beats` via
     /// `playhead_samples * bpm / (60 * sample_rate)`.
     pub playhead_samples: u64,
+    /// 累積拍位置 (= daw_audio が tempo automation を積分した真の song 位置)。
+    /// `playhead_samples × bpm / (60 × SR)` の一定テンポ逆算ではなくこの値を
+    /// CLAP `song_pos_beats` / VST3 `projectTimeMusic` に直接使う。これで
+    /// テンポオートメーション中も plugin の tempo-sync が正しい拍に追従する。
+    pub song_pos_beats: f64,
     pub tsig_num: u16,
     pub tsig_denom: u16,
     pub is_playing: bool,
@@ -133,6 +138,7 @@ impl TransportContext {
             bpm: pd.bpm.max(1.0),
             sample_rate: pd.sample_rate.max(1),
             playhead_samples: pd.steady_time,
+            song_pos_beats: pd.song_pos_beats,
             tsig_num: pd.tsig_num.max(1),
             tsig_denom: pd.tsig_denom.max(1),
             is_playing: pd.playing != 0,

@@ -67,6 +67,10 @@ pub struct DispatchShared {
     pub frames: AtomicU32,
     pub playing: AtomicU8,
     pub any_solo: AtomicU8,
+    /// user の loop button 実状態 (`shared.looping`)。 master が dispatch 前に
+    /// store、 workers が `process_track_owned` に渡して plugin transport の
+    /// looping field / IS_LOOP_ACTIVE 判定に使う (= region 有無 heuristic 廃止)。
+    pub looping: AtomicU8,
     /// PR4.5 sidechain plugin-internal alignment: per-track input delay
     /// in samples (= `Schedule::input_delay_per_track` snapshotted into
     /// the worker pool's shared state for the current dispatch). `null`
@@ -120,6 +124,7 @@ impl DispatchShared {
             frames: AtomicU32::new(0),
             playing: AtomicU8::new(0),
             any_solo: AtomicU8::new(0),
+            looping: AtomicU8::new(0),
             input_delays_base: AtomicPtr::new(std::ptr::null_mut()),
             n_input_delays: AtomicU32::new(0),
             recording_lanes_ptr: AtomicPtr::new(std::ptr::null_mut()),
@@ -216,6 +221,8 @@ impl AudioWorkerPool {
         // Phase 5 follow-up (granular DSP click 抑制): LP smoothed tempo_ratio
         // を atomic 経由で workers に伝える。 process_track_owned に渡す。
         granular_tempo_smoothed: f64,
+        // user の loop button 実状態。 process_track_owned → set_pd_transport に渡す。
+        looping: bool,
     ) {
         let n_tracks = song.map(|s| s.tracks.len() as u32).unwrap_or(0);
         let n_tracks = n_tracks.min(scratch.len() as u32);
@@ -266,6 +273,9 @@ impl AudioWorkerPool {
         self.shared
             .any_solo
             .store(if any_solo { 1 } else { 0 }, Ordering::Release);
+        self.shared
+            .looping
+            .store(if looping { 1 } else { 0 }, Ordering::Release);
         self.shared.recording_lanes_ptr.store(
             recording_lanes as *const _ as *mut _,
             Ordering::Release,
@@ -423,6 +433,8 @@ fn run_work_loop(shared: &DispatchShared) {
     let granular_tempo_smoothed = f64::from_bits(
         shared.granular_tempo_smoothed_bits.load(Ordering::Acquire),
     );
+    // user の loop button 実状態 (master が dispatch 前に store)。
+    let looping = shared.looping.load(Ordering::Acquire) != 0;
 
     if scratch_base.is_null()
         || plugin_refs_ptr.is_null()
@@ -506,6 +518,7 @@ fn run_work_loop(shared: &DispatchShared) {
             current_bpm,
             playhead_beats,
             granular_tempo_smoothed,
+            looping,
         );
     }
 }

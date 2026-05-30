@@ -725,6 +725,9 @@ impl LocalState {
             Some(s) => common::automation::evaluate_song_tempo(s, self.playhead_beats),
             None => 120.0,
         };
+        // user の loop button 実状態 (= engine が実際に wrap する条件)。
+        // plugin transport の IS_LOOP_ACTIVE / looping field に渡す。
+        let looping = shared.looping.load(Ordering::Acquire);
 
         // Phase 5 follow-up (granular DSP click 抑制): tempo_ratio (= current /
         // nominal) を LP smoothing して granular_sample_at に渡す。 nominal =
@@ -786,6 +789,7 @@ impl LocalState {
                     current_bpm,
                     self.playhead_beats,
                     self.granular_tempo_smoothed,
+                    looping,
                 );
             } else {
                 let worker_sync = worker_syncs_g.first();
@@ -817,6 +821,7 @@ impl LocalState {
                         current_bpm,
                         self.playhead_beats,
                         self.granular_tempo_smoothed,
+                        looping,
                     );
                 }
             }
@@ -844,6 +849,8 @@ impl LocalState {
                 playhead,
                 recording_lanes,
                 current_bpm,
+                self.playhead_beats,
+                looping,
             );
 
             // Phase 7 B3 (2026-05-13): metronome click を master mix に追加。
@@ -1010,6 +1017,12 @@ pub fn set_pd_transport(
     pd: &mut common::process_data::ProcessData,
     song: Option<&Song>,
     effective_bpm: f32,
+    // 積分済みの真の拍位置 (tempo automation を考慮)。 plugin host が一定
+    // テンポ逆算する代わりにこれを直接 song_pos_beats として使う。
+    song_pos_beats: f64,
+    // user の loop button 実状態 (= `shared.looping`)。 region 有無の
+    // heuristic ではなく engine が実際に wrap している条件を渡す。
+    looping: bool,
 ) {
     let Some(song) = song else { return };
     pd.bpm = effective_bpm.max(1.0);
@@ -1017,10 +1030,10 @@ pub fn set_pd_transport(
     pd.tsig_denom = song.time_sig.1 as u16;
     pd.loop_start_beats = song.loop_start_beat;
     pd.loop_end_beats = song.loop_end_beat;
-    // Loop は user の loop button 状態を別 IPC で渡したいが、 当面は
-    // 「loop region が定義済」 (= end > start) を heuristic で IS_LOOPING
-    // とする。 Bitwig / Live も同じ (= region 定義時のみ loop active)。
-    pd.looping = if song.loop_end_beat > song.loop_start_beat { 1 } else { 0 };
+    pd.song_pos_beats = song_pos_beats;
+    // 実 loop トグル状態を渡す。 plugin host は IS_LOOP_ACTIVE 判定で
+    // 別途 `loop_end_beats > loop_start_beats` (= region 定義済) と AND する。
+    pd.looping = if looping { 1 } else { 0 };
 }
 
 /// Render one track's contribution into its `TrackScratch`. Walks the
@@ -1074,6 +1087,8 @@ pub fn process_track_owned(
     // 計算するときの ratio として使う。 LocalState 側で per-buffer に
     // 1-pole LP で更新される値。
     granular_tempo_smoothed: f64,
+    // user の loop button 実状態 (= `shared.looping`)。 set_pd_transport に渡す。
+    looping: bool,
 ) {
     let n = frames as usize;
 
@@ -1152,7 +1167,7 @@ pub fn process_track_owned(
         pd.frames = frames;
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
-        set_pd_transport(pd, song, current_bpm);
+        set_pd_transport(pd, song, current_bpm, playhead_beats, looping);
         // Phase 2b: MIDI FX 宛 PluginParam automation を ParamValue event 化。
         if let Some(song) = song {
             crate::automation::fill_pd_param_events(
@@ -1317,7 +1332,7 @@ pub fn process_track_owned(
         pd.frames = frames;
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
-        set_pd_transport(pd, song, current_bpm);
+        set_pd_transport(pd, song, current_bpm, playhead_beats, looping);
         // Phase 2b: automation の PluginParam target を ParamValue event 化。
         if let Some(song) = song {
             crate::automation::fill_pd_param_events(
@@ -1467,6 +1482,9 @@ pub fn execute_schedule_post_dispatch(
     playhead: u64,
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     current_bpm: f32,
+    // group fx の transport snapshot 用 (= 積分済み拍位置 + 実 loop トグル)。
+    playhead_beats: f64,
+    looping: bool,
 ) {
     // `nodes` の不変参照と `delay_lines` の可変参照を同時に取りたい
     // (ApplyDelay で line を引きながら nodes を回すため)。 `Schedule`
@@ -1528,6 +1546,8 @@ pub fn execute_schedule_post_dispatch(
                     any_solo,
                     recording_lanes,
                     current_bpm,
+                    playhead_beats,
+                    looping,
                 );
             }
             NodeOp::ApplyDelay {
@@ -1885,6 +1905,9 @@ fn run_group_fx_chain(
     any_solo: bool,
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     current_bpm: f32,
+    // group fx の transport snapshot (= 積分済み拍位置 + 実 loop トグル)。
+    playhead_beats: f64,
+    looping: bool,
 ) {
     let n = frames as usize;
     let track_id = song_track.id;
@@ -1906,7 +1929,7 @@ fn run_group_fx_chain(
         pd.frames = frames;
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
-        set_pd_transport(pd, Some(song), current_bpm);
+        set_pd_transport(pd, Some(song), current_bpm, playhead_beats, looping);
         // Phase 2b: group fx 宛 PluginParam automation。
         crate::automation::fill_pd_param_events(
             pd,
@@ -2087,6 +2110,33 @@ mod sidechain_tests {
     use common::model::{PluginInstance, Song, Track};
     use common::plugin_format::PluginFormat;
 
+    #[test]
+    fn set_pd_transport_uses_real_beats_and_loop_toggle() {
+        // SSoT 回帰防止: pd.song_pos_beats は daw_audio が渡す積分済み拍位置を
+        // そのまま使い (= samples × bpm の逆算ではない)、 pd.looping は実 loop
+        // トグルを反映する (= region 有無 heuristic ではない)。
+        let song = Song {
+            time_sig: (3, 4),
+            loop_start_beat: 4.0,
+            loop_end_beat: 8.0,
+            ..Song::default()
+        };
+        let mut pd = common::process_data::ProcessData::empty();
+        // playhead_beats = 12.5 は constant-tempo 逆算とは無関係な「真の拍」。
+        set_pd_transport(&mut pd, Some(&song), 90.0, 12.5, true);
+        assert_eq!(pd.song_pos_beats, 12.5);
+        assert_eq!(pd.bpm, 90.0);
+        assert_eq!(pd.tsig_num, 3);
+        assert_eq!(pd.tsig_denom, 4);
+        assert_eq!(pd.loop_start_beats, 4.0);
+        assert_eq!(pd.loop_end_beats, 8.0);
+        assert_eq!(pd.looping, 1);
+        // loop region は定義済のまま looping=false を渡すと pd.looping=0
+        // (= region heuristic を使っていれば 1 のままになる、 という回帰検出)。
+        set_pd_transport(&mut pd, Some(&song), 90.0, 12.5, false);
+        assert_eq!(pd.looping, 0);
+    }
+
     /// PR4 Sidechain engine-handler test: 実 plugin を立てなくても、
     /// `execute_schedule_post_dispatch` の `NodeOp::SidechainTap` ハンドラ
     /// が source TrackScratch の signal を `pd.buffer_aux_in[port]` に正しく
@@ -2152,6 +2202,8 @@ mod sidechain_tests {
             0,
             &std::collections::HashSet::new(),
             song.bpm,
+            0.0,
+            false,
         );
 
         for i in 0..FRAMES {

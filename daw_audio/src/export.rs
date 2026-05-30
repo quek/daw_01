@@ -237,6 +237,8 @@ fn render_loop(
                 song.bpm,
                 playhead_beats,
                 GRANULAR_TEMPO_SMOOTHED_FREEWHEEL,
+                // export (freewheel render) は loop しない。
+                false,
             );
         } else {
             let worker_sync = worker_syncs_g.first();
@@ -267,6 +269,8 @@ fn render_loop(
                     song.bpm,
                     playhead_beats,
                     GRANULAR_TEMPO_SMOOTHED_FREEWHEEL,
+                    // export (freewheel render) は loop しない。
+                    false,
                 );
             }
         }
@@ -293,6 +297,9 @@ fn render_loop(
             playhead,
             &empty_recording_lanes,
             song.bpm,
+            playhead_beats,
+            // export (freewheel render) は loop しない。
+            false,
         );
 
         // Compute block peak across the full block (for tail-silence

@@ -566,13 +566,17 @@ plain mutable struct。reactive wrapper (Signal/Memo) は使わない:
 
 - [x] MIDI step input (midir)
 
-### M2 候補 (未着手)
+### M2 候補
 
 #### オートメーション + 表現力
 
-- [ ] パラメータオートメーション (lane 表示 + plugin パラメータ送信)
-- [ ] tempo / time_sig オートメーション
-- [ ] CLAP `clap_event_transport_t` / VST3 `processContext` で transport / tempo を plugin に通知
+- [x] パラメータオートメーション (lane 表示 + plugin パラメータ送信。`automation_lanes` /
+  `fill_pd_param_events` で PluginParam を ParamValue event 化して送信)
+- [x] tempo / time_sig オートメーション (`song_lanes` の `SongTempo` /
+  `SongTimeSigNumerator`、`evaluate_song_tempo` を per-buffer 評価)
+- [x] CLAP `clap_event_transport_t` / VST3 `processContext` で transport / tempo を plugin に通知
+  (tempo / time_sig / song position (拍は tempo automation 積分済) / bar position /
+  cycle 範囲 / playing・looping flag。daw_audio→ProcessData→host で配信)
 - [ ] VST3 `IMidiMapping` (MIDI controller → plugin パラメータ)
 - [ ] VST3 `IComponent::setIoMode(kOfflineProcessing)` (export 高品質モード)
 
