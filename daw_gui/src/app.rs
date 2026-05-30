@@ -795,6 +795,10 @@ pub struct AppData {
     pub plugin_db: Option<Arc<PluginDatabase>>,
     pub plugin_picker_entries: Vec<PluginPickEntry>,
     pub plugin_picker_visible: Vec<PluginPickEntry>,
+    /// プラグインピッカーの検索ボックスに入力中の絞り込みクエリ。
+    /// 1 文字毎に [`AppEvent::SetPluginPickerQuery`] で更新し、
+    /// [`AppData::refresh_picker_visible`] で subsequence マッチに使う。
+    pub plugin_picker_query: String,
     pub is_plugin_picker_open: bool,
     pub plugin_picker_target: PickerTarget,
 
@@ -1133,6 +1137,7 @@ impl AppData {
             plugin_db,
             plugin_picker_entries,
             plugin_picker_visible: Vec::new(),
+            plugin_picker_query: String::new(),
             is_plugin_picker_open: false,
             plugin_picker_target: PickerTarget::Instrument,
             pending_state_queue: VecDeque::new(),
@@ -2772,6 +2777,9 @@ pub enum AppEvent {
     OpenPluginPickerFor(PickerTarget),
     ClosePluginPicker,
     SelectPluginFromDb(String),
+    /// プラグインピッカーの検索ボックスが 1 文字毎に発行する。 query を更新し
+    /// `refresh_picker_visible` で subsequence 絞り込みを再計算する。
+    SetPluginPickerQuery(String),
     ToggleSlotGui { slot_kind: u8, slot_index: u32 },
     RemoveSlot { slot_kind: u8, slot_index: u32 },
     /// PR4 sidechain: wire / unwire the sidechain source for a plugin's
@@ -3880,11 +3888,17 @@ impl AppData {
             }
             AppEvent::OpenPluginPickerFor(target) => {
                 self.plugin_picker_target = target;
+                self.plugin_picker_query.clear();
                 self.refresh_picker_visible();
                 self.is_plugin_picker_open = true;
             }
             AppEvent::ClosePluginPicker => {
                 self.is_plugin_picker_open = false;
+                self.plugin_picker_query.clear();
+            }
+            AppEvent::SetPluginPickerQuery(query) => {
+                self.plugin_picker_query = query;
+                self.refresh_picker_visible();
             }
             AppEvent::RescanPluginDb => {
                 self.begin_rescan();
@@ -12475,10 +12489,18 @@ impl AppData {
             PickerTarget::Fx => "audio-effect",
             PickerTarget::MidiFx => "note-effect",
         };
+        // 検索クエリ (前後空白を除去)。 空なら feature フィルタのみ、 非空なら
+        // name / vendor のいずれかへの subsequence マッチで AND 絞り込みする。
+        let query = self.plugin_picker_query.trim();
         let visible: Vec<PluginPickEntry> = self
             .plugin_picker_entries
             .iter()
             .filter(|e| e.features.iter().any(|f| f == feature_key))
+            .filter(|e| {
+                query.is_empty()
+                    || crate::fuzzy::subsequence_match(&e.name, query)
+                    || crate::fuzzy::subsequence_match(&e.vendor, query)
+            })
             .cloned()
             .collect();
         self.plugin_picker_visible = visible;

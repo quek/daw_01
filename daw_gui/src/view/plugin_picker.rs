@@ -16,6 +16,7 @@ const COLOR_TEXT_FORMAT: Color = Color { r: 0.55, g: 0.78, b: 0.95, a: 1.0 };
 const PANEL_W: f32 = 520.0;
 const PANEL_H: f32 = 460.0;
 const TITLE_H: f32 = 36.0;
+const SEARCH_H: f32 = 26.0;
 
 const MODAL_STYLE: ModalStyle = ModalStyle {
     overlay_color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.6 },
@@ -81,12 +82,56 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 ui.close_modal("plugin_picker");
             }
 
-            // 一覧
-            let list_rect = Rect {
+            // 検索ボックス (タイトルと一覧の間)。 modal を開くと
+            // text_input_at_focused が初回表示で自動 focus を取るので、 開いて
+            // すぐタイプして絞り込める。 1 文字毎に SetPluginPickerQuery を発行し、
+            // refresh_picker_visible が name / vendor の subsequence マッチで
+            // visible を再計算する (controlled mode)。
+            let search_rect = Rect {
                 x: panel.x + pad,
                 y: panel.y + TITLE_H + 6.0,
                 w: panel.w - pad * 2.0,
-                h: panel.h - TITLE_H - 6.0 - pad,
+                h: SEARCH_H,
+            };
+            let search_resp = ui.text_input_at_focused(
+                "pp_search",
+                search_rect,
+                &app.plugin_picker_query,
+                |new| {
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetPluginPickerQuery(new.clone()))
+                    })
+                },
+            );
+            // text_input は placeholder 非対応なので、 空のとき薄色ヒントを重ねる。
+            if app.plugin_picker_query.is_empty() {
+                ui.label_at(
+                    "pp_search_hint",
+                    "Filter by name / vendor  (e.g. murv)",
+                    search_rect.x + 8.0,
+                    search_rect.y + 6.0,
+                    13.0,
+                    COLOR_TEXT_DIM,
+                );
+            }
+            // Enter で絞り込み結果の先頭を確定 (= list クリックと同じ経路で
+            // ロード)。 0 件なら何もしない。
+            if search_resp.committed
+                && let Some(first) = app.plugin_picker_visible.first()
+            {
+                let id = first.id.clone();
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SelectPluginFromDb(id))
+                }));
+            }
+
+            // 一覧 (検索ボックスの下)
+            let list_y = search_rect.y + SEARCH_H + 6.0;
+            let list_rect = Rect {
+                x: panel.x + pad,
+                y: list_y,
+                w: panel.w - pad * 2.0,
+                h: panel.y + panel.h - pad - list_y,
             };
             let visible = &app.plugin_picker_visible;
             if visible.is_empty() {
