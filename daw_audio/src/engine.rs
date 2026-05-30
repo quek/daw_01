@@ -1635,6 +1635,7 @@ pub fn execute_schedule_post_dispatch(
                     sample_rate,
                     current_bpm,
                     playhead,
+                    any_solo,
                     recording_lanes,
                     n,
                 );
@@ -1740,6 +1741,7 @@ fn mix_send_into_track_scratch(
     sample_rate: u32,
     bpm: f32,
     playhead: u64,
+    any_solo: bool,
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     n: usize,
 ) {
@@ -1757,12 +1759,22 @@ fn mix_send_into_track_scratch(
     if !send.enabled {
         return;
     }
-    // An explicit mute on the source silences its sends. Solo-exclusion
-    // does NOT — the source keeps its post-fader signal (see
-    // process_track_owned), so soloing a return auditions the sends
-    // feeding it; the return's own mute / solo then decides if it's heard.
+    // An explicit mute on the source always silences its sends.
     if track.muted {
         return;
+    }
+    // Solo handling. Soloing a track should let you hear ONLY it and its
+    // sends — other tracks' sends must NOT leak into a shared return. So
+    // under solo a send flows only if its SOURCE is solo-audible (soloed,
+    // or kept alive by a soloed child / send), OR the DESTINATION return is
+    // itself explicitly soloed (you soloed the return to audition
+    // everything routed to it). The source keeps its signal (see
+    // process_track_owned), so the soloed-return audition still works.
+    if any_solo {
+        let dest_soloed = song.tracks.get(dst_idx).is_some_and(|d| d.solo);
+        if !dest_soloed && !track.solo && !has_soloed_contributor(song, track.id) {
+            return;
+        }
     }
 
     // Pick this send's `SendGain` automation lane, unless it is currently
@@ -2202,7 +2214,7 @@ mod send_tests {
         }
         let empty = empty_lanes();
         mix_send_into_track_scratch(
-            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0, &empty, FRAMES,
+            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0, false, &empty, FRAMES,
         );
         for i in 0..FRAMES {
             let want_l = 1.0 + (i as f32) * 0.1 * 0.5;
@@ -2223,7 +2235,7 @@ mod send_tests {
         }
         let empty = empty_lanes();
         mix_send_into_track_scratch(
-            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0, &empty, FRAMES,
+            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0, false, &empty, FRAMES,
         );
         for i in 0..FRAMES {
             assert_eq!(scratch[1].track_l[i], 3.0, "disabled send must not change dst");
@@ -2242,7 +2254,7 @@ mod send_tests {
         }
         let empty = empty_lanes();
         mix_send_into_track_scratch(
-            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0, &empty, FRAMES,
+            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0, false, &empty, FRAMES,
         );
         for i in 0..FRAMES {
             assert_eq!(
@@ -2252,29 +2264,43 @@ mod send_tests {
         }
     }
 
-    /// A solo-EXCLUDED source (not explicitly muted, just not soloed) still
-    /// feeds its send, so soloing only the destination return auditions it.
-    /// The MixSend gate keys on explicit mute, not the effective_mute flag,
-    /// and process_track_owned no longer zeroes solo-excluded scratch.
+    /// Under solo, a send must respect BOTH the source's and the
+    /// destination's solo state: soloing one source must not leak other
+    /// tracks' sends into a shared return, but soloing the return itself
+    /// auditions everything routed to it.
     #[test]
-    fn solo_excluded_source_still_feeds_its_send() {
-        let song = song_with_send(1.0, SendMode::PostFader, true);
-        let mut scratch: Vec<TrackScratch> = (0..4).map(|_| TrackScratch::new()).collect();
-        scratch[0].effective_mute = true; // solo-excluded, but signal retained
-        for i in 0..FRAMES {
-            scratch[0].track_l[i] = 0.5;
-            scratch[1].track_l[i] = 0.0;
-        }
-        let empty = empty_lanes();
-        mix_send_into_track_scratch(
-            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0, &empty, FRAMES,
-        );
-        for i in 0..FRAMES {
-            assert!(
-                (scratch[1].track_l[i] - 0.5).abs() < 1e-6,
-                "solo-excluded (but not muted) source must still feed its send"
+    fn send_under_solo_respects_source_and_return_solo() {
+        let render = |solo_src: bool, solo_dest: bool| -> f32 {
+            let mut song = song_with_send(1.0, SendMode::PostFader, true);
+            song.tracks[0].solo = solo_src; // Vocal (source)
+            song.tracks[1].solo = solo_dest; // Reverb return (dest)
+            let mut scratch: Vec<TrackScratch> =
+                (0..4).map(|_| TrackScratch::new()).collect();
+            scratch[0].track_l[0] = 0.5;
+            let empty = empty_lanes();
+            mix_send_into_track_scratch(
+                &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0, true, &empty, FRAMES,
             );
-        }
+            scratch[1].track_l[0]
+        };
+        // A soloed source still feeds its own send.
+        assert!(
+            (render(true, false) - 0.5).abs() < 1e-6,
+            "a soloed source still feeds its send"
+        );
+        // Neither the source audible nor the return soloed → blocked, so
+        // soloing one track does not leak other tracks' sends.
+        assert_eq!(
+            render(false, false),
+            0.0,
+            "a non-audible source must not leak into the return"
+        );
+        // Return explicitly soloed → audition: the send flows even from a
+        // non-soloed source.
+        assert!(
+            (render(false, true) - 0.5).abs() < 1e-6,
+            "soloing the return auditions the sends feeding it"
+        );
     }
 
     /// A pre-fader send reads the source's `pre_fader_l/r`, not its
@@ -2291,7 +2317,7 @@ mod send_tests {
         }
         let empty = empty_lanes();
         mix_send_into_track_scratch(
-            &mut scratch, 1, 0, true, &song, 0, 0, 48_000, 120.0, 0, &empty, FRAMES,
+            &mut scratch, 1, 0, true, &song, 0, 0, 48_000, 120.0, 0, false, &empty, FRAMES,
         );
         for i in 0..FRAMES {
             assert!(
