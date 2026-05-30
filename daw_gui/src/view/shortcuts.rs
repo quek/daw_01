@@ -34,6 +34,8 @@ pub fn daw_shortcut_map() -> ShortcutMap {
     // Alt+G で解除。 G 単独は元の grid snap toggle のまま。
     m.bind("daw.group_tracks", "Ctrl+G");
     m.bind("daw.ungroup_tracks", "Alt+G");
+    // Ctrl+T で新規トラックを末尾に追加 (旧 +Vocal/+Inst ボタンの代替)。
+    m.bind("daw.add_track", "Ctrl+T");
     // Grid snap (G キー) / auto-fit zoom (X キー)。focus 中の text_input 無効時のみ発火。
     m.bind("daw.toggle_snap", "G");
     m.bind("daw.fit_view", "X");

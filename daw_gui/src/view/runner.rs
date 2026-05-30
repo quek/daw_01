@@ -786,12 +786,29 @@ impl Runner {
             tracing::error!(error = ?e, "render error");
         }
 
-        // タイトル差分反映 (現状は常に "daw_01"; 将来 dirty marker を入れる)。
-        let new_title = "daw_01".to_string();
+        // タイトル差分反映: "<*>プロジェクト名"。未保存変更があれば先頭に * を付ける。
+        // file_path 未設定 (新規未保存) は "Untitled"。毎フレーム is_dirty を読むが、
+        // 差分があるときだけ set_title を呼ぶ。
+        let project_name = state
+            .app
+            .file_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("Untitled");
+        let new_title = if state.app.is_dirty {
+            format!("*{project_name}")
+        } else {
+            project_name.to_string()
+        };
         if new_title != state.last_title {
             state.window.set_title(&new_title);
             state.last_title = new_title;
         }
+
+        // plugin 追加 → load 完了で queue された GUI auto-open 要求を処理する (#6)。
+        // window 生成を frame loop に置くことで headless test では window を作らない。
+        state.app.drain_pending_gui_opens();
 
         // IME 差分反映。
         match (state.ime_enabled, state.ui.ime_request()) {

@@ -170,6 +170,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     app.handle_event(AppEvent::SetNotePositions(entries.clone()));
                 })
             }
+            // gui_01 #054: Ctrl+drag コピー。Move と同形 payload だが、元 note を
+            // 据え置いて複製を new 位置へ置く (CopyNotes handler が deep clone)。
+            PianoRollEditRequest::Copy(deltas) => {
+                let entries: Vec<(u32, f64, u8)> =
+                    deltas.iter().map(|d: &MoveDelta| (d.0, d.3, d.4)).collect();
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::CopyNotes(entries.clone()));
+                })
+            }
             PianoRollEditRequest::Resize(deltas) => {
                 let entries: Vec<(u32, f64, f64)> = deltas
                     .iter()

@@ -1822,11 +1822,11 @@ pub enum TextAlign {
     Right,
 }
 
-/// One playable text event inside a `TextContent` (`docs/plan_text_overlay
-/// .md` §2.2)。 単一行 text、 PiP rect + font + color + outline + shadow
-/// + rotation 等の描画属性を持つ。 image PiP の `(x, y, w, h)` は
-/// project resolution の letterbox 内 normalized 0..=1 で展開される
-/// (= 画像 PiP と同 idiom、 window resize で aspect 維持)。
+/// One playable text event inside a `TextContent` (`docs/plan_text_overlay.md`
+/// §2.2)。 単一行 text、 PiP rect + font + color + outline + shadow + rotation
+/// 等の描画属性を持つ。 image PiP の `(x, y, w, h)` は project resolution の
+/// letterbox 内 normalized 0..=1 で展開される (= 画像 PiP と同 idiom、 window
+/// resize で aspect 維持)。
 ///
 /// **JSON disambiguation required field**: `text: String` と
 /// `font_family: String` の同時保持で他 variant と disjoint。 ただし
@@ -1970,10 +1970,9 @@ pub enum AutomationTarget {
     /// §1.1 / §1.2)。
     ImageBuiltin(ImageBuiltinParam),
     /// v16 (`docs/plan_text_overlay.md` §2.3): text overlay の各 field を
-    /// automation。 計 23 lane (位置 4 + 形 3 + fill RGBA + outline RGBA
-    /// + width + shadow RGBA + offset xy + blur)。 image と同じく track-
-    /// level、 text clip が存在する時間範囲だけ lane 値が `TextEvent.
-    /// <field>` を override。
+    /// automation。 計 23 lane (位置 4 + 形 3 + fill RGBA + outline RGBA + width +
+    /// shadow RGBA + offset xy + blur)。 image と同じく track-level、 text clip が
+    /// 存在する時間範囲だけ lane 値が `TextEvent.<field>` を override。
     TextBuiltin(TextBuiltinParam),
 }
 

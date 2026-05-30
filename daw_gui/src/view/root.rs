@@ -306,6 +306,12 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             }));
         }
     }
+    // Ctrl+T: 新規トラックを末尾に追加 (vocal は instrument に VOICEVOX を挿して作る)。
+    if ui.take_shortcut("daw.add_track") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::AddInstrumentTrack);
+        }));
+    }
     // PR-V4: daw.synthesize_vocal shortcut は無効化 (builtin VOICEVOX
     // plugin が自動 synth するため explicit trigger 不要)。 user が
     // shortcut を押しても sync_vocal_metadata で再 flush が走るので、
@@ -491,12 +497,20 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // (REAPER / Ableton の Ctrl+D 流)。 複数選択中は各々の末尾直後に
     // 並列生成。 selected_clip が None なら no-op。
     if ui.take_shortcut("daw.duplicate_clip_shared") {
-        let sources: Vec<crate::app::ClipRef> = app.selected_clips.clone();
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            for src in &sources {
-                app.handle_event(AppEvent::DuplicateClipShared { source: *src });
-            }
-        }));
+        // ピアノロール上 + ノート選択中なら D = ノート複製。それ以外 (アレンジ文脈
+        // / ピアノロールでもノート未選択) は従来どおり選択 clip の共有複製。
+        if is_pianoroll_active && !app.selected_notes.is_empty() {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::DuplicateSelectedNotes);
+            }));
+        } else {
+            let sources: Vec<crate::app::ClipRef> = app.selected_clips.clone();
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                for src in &sources {
+                    app.handle_event(AppEvent::DuplicateClipShared { source: *src });
+                }
+            }));
+        }
     }
     if ui.take_shortcut("daw.duplicate_clip_unique") {
         let sources: Vec<crate::app::ClipRef> = app.selected_clips.clone();

@@ -822,6 +822,18 @@ pub struct AppData {
     /// queued so the audio engine doesn't dispatch silent buffers for
     /// tracks whose plugins are still being loaded.
     pub pending_plugin_loads: std::collections::HashSet<(u32, PluginSlot)>,
+    /// ユーザーが plugin picker で手動追加した plugin の集合。load 完了
+    /// (`on_plugin_loaded_from_child`) で consume し、(1) daw_audio へ `LoadSong` を
+    /// 再送して新 plugin を signal path に入れ、(2) GUI 自動 open を `gui_open_requests`
+    /// に queue する。`select_plugin_from_db` で (track_id, slot) を積む。
+    /// プロジェクト読込時の一斉復元では積まれない (= project-open 時の初回 LoadSong が
+    /// 全 chain を渡すので per-plugin の再 sync は不要、 GUI も自動 open しない)。
+    pending_added_plugin_finalize: std::collections::HashSet<(u32, PluginSlot)>,
+    /// load 完了して「いま開く」段になった GUI auto-open 要求の queue。runner の
+    /// frame loop が `drain_pending_gui_opens` で消費し `open_slot_gui` を呼ぶ。
+    /// handle_event (IPC 受信) から直接 window を作らず frame loop へ 1 フレーム
+    /// 遅延させる seam (headless test は frame loop を回さない → window を作らない)。
+    gui_open_requests: Vec<(u32, PluginSlot)>,
     /// `play()` was called while `pending_plugin_loads` was non-empty;
     /// re-fire it once the last `SlotPluginLoaded` arrives.
     pub pending_play: bool,
@@ -1119,6 +1131,8 @@ impl AppData {
             plugin_host_windows: HashMap::new(),
             track_peak_display: initial_peak_display,
             pending_plugin_loads: std::collections::HashSet::new(),
+            pending_added_plugin_finalize: std::collections::HashSet::new(),
+            gui_open_requests: Vec::new(),
             pending_play: false,
             synth_result: Arc::new(Mutex::new(Vec::new())),
             rescan_result: Arc::new(Mutex::new(None)),
@@ -1754,7 +1768,6 @@ impl AppData {
         matches!(
             event,
             AppEvent::New
-                | AppEvent::AddVocalTrack
                 | AppEvent::AddInstrumentTrack
                 | AppEvent::GroupSelectedTracks { .. }
                 | AppEvent::SetTrackParent { .. }
@@ -1828,6 +1841,8 @@ impl AppData {
                 | AppEvent::ResizeNotes(_)
                 | AppEvent::SetNotePositions(_)
                 | AppEvent::DeleteSelectedNotes
+                | AppEvent::DuplicateSelectedNotes
+                | AppEvent::CopyNotes(_)
                 | AppEvent::SetNoteLyrics { .. }
                 | AppEvent::SetNoteVelocities(_)
                 | AppEvent::SetTrackSpeaker { .. }
@@ -2214,7 +2229,6 @@ pub enum AppEvent {
     /// `selected_clip` の note を `(id, velocity)` で一括書き換え。 1 drag =
     /// 1 Undo step。
     SetNoteVelocities(Vec<(u32, u8)>),
-    AddVocalTrack,
     AddInstrumentTrack,
     /// Group the selected tracks under a fresh group track. Mirrors
     /// Ableton Live's Cmd/Ctrl+G: the existing tracks become children
@@ -2481,10 +2495,10 @@ pub enum AppEvent {
     /// Mute / Text content / Font family は string-shaped で個別 event、
     /// 23 numeric field + 2 fade beats は `SetClipTextNumField` /
     /// `ClipTextNumEditChanged` / `CommitClipTextNumEdit` の 3 event で
-    /// `TextNumField` discriminator dispatch (= 75 event ぶんを 3 event
-    /// + 1 enum で表現)。 lane override 経由でも同様、 lane が effective
-    /// なら TextEvent.field の直接書き込みは preview に反映されないが
-    /// edit buffer の formatted 表示は更新される。
+    /// `TextNumField` discriminator dispatch (= 75 event ぶんを 3 event + 1
+    /// enum で表現)。 lane override 経由でも同様、 lane が effective なら
+    /// TextEvent.field の直接書き込みは preview に反映されないが edit buffer の
+    /// formatted 表示は更新される。
     SetClipTextMuted { target: ClipRef, muted: bool },
     SetClipTextContent { target: ClipRef, value: String },
     SetClipTextFontFamily { target: ClipRef, value: String },
@@ -2717,6 +2731,15 @@ pub enum AppEvent {
     },
     ResizeNotes(Vec<(u32, f64, f64)>),
     DeleteSelectedNotes,
+    /// ピアノロールで選択中ノートを複製 (D キー)。選択範囲ぶん後ろにずらして
+    /// 複製し、元ノートは据え置き、複製を新しい選択にする (連打で後方へ連鎖)。
+    /// selected_clip 無し / 選択空なら no-op。Undoable。
+    DuplicateSelectedNotes,
+    /// gui_01 #054: piano_roll widget が Ctrl+drag コピー release で発行する
+    /// `PianoRollEditRequest::Copy` を変換したもの。各 `(source note id,
+    /// new_start_beat, new_pitch)` で source を deep clone し新 note として追加
+    /// (元は据え置き)、複製を新選択にする。Undoable。
+    CopyNotes(Vec<(u32, f64, u8)>),
     /// gui_01 #017 (M14 Phase 59) で piano_roll widget が L キー → Enter
     /// commit 時に発行する歌詞分配バッチ。 各 `(note_id, lyric)` を指定
     /// `clip_ref` 内で更新。 widget が空文字列を `None` に正規化済みなので
@@ -3374,7 +3397,6 @@ impl AppData {
             AppEvent::SetNoteVelocities(updates) => {
                 self.set_note_velocities(&updates);
             }
-            AppEvent::AddVocalTrack => self.action_add_vocal_track(),
             AppEvent::AddInstrumentTrack => self.action_add_instrument_track(),
             AppEvent::GroupSelectedTracks { track_ids } => {
                 self.action_group_selected_tracks(&track_ids);
@@ -3809,6 +3831,8 @@ impl AppData {
                 }
             }
             AppEvent::DeleteSelectedNotes => self.delete_selected_notes(),
+            AppEvent::DuplicateSelectedNotes => self.duplicate_selected_notes(),
+            AppEvent::CopyNotes(entries) => self.copy_notes(&entries),
             AppEvent::SetNoteLyrics { clip_ref, lyrics } => {
                 self.set_note_lyrics(clip_ref, &lyrics);
             }
@@ -5804,63 +5828,6 @@ impl AppData {
             });
             self.resize_track_peak_display();
         }
-    }
-
-    fn action_add_vocal_track(&mut self) {
-        let id = self.song.alloc_track_id();
-        let index = self.song.tracks.len() + 1;
-        let mut track = Track {
-            id,
-            name: format!("Track {index}"),
-            source: InstrumentSource::Vocal {
-                speaker_id: common::voicevox::DEFAULT_SINGER_ID,
-                style_name: "ノーマル".into(),
-            },
-            ..Track::default()
-        };
-        let mut clip = demo_clip();
-        clip.id = track.alloc_clip_id();
-        track.clips.push(clip);
-        // demo_clip() は content_id = 0 (sentinel) + Clip.notes に直接
-        // notes を持つ legacy 形式で返す。 push 後に ensure_clip_contents
-        // を呼んで「notes → clip_contents 移送 + content_id 採番」 を
-        // 実行しないと、 notes_in_clip_mut が None を返して以降のノート
-        // 編集 (= AddNote / piano_roll) が no-op になる。 ensure_clip_
-        // contents は idempotent なので tracks.push 後の任意のタイミング
-        // で OK。 ここで song に push 後に呼ぶのが最も自然。
-        // PR-V3: track.instrument を Builtin VOICEVOX で初期化。
-        // SlotPluginLoadedFromChild が来る前に Track 側でも format =
-        // Builtin を保持しておかないと、 後段の handler が「既存 format」
-        // を Clap default に決めてしまう (= line 5944 周辺の logic)。
-        track.instrument = Some(common::model::PluginInstance {
-            plugin_id: common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
-            format: PluginFormat::Builtin,
-            state: None,
-            sidechain_sources: Vec::new(),
-        });
-        self.song.tracks.push(track);
-        self.song.ensure_clip_contents();
-        self.resize_track_peak_display();
-
-        // SetSlotPlugin で plugin host に builtin VOICEVOX を load させる。
-        // path は URI、 plugin_id は同 URI (= builtin の場合 path == id)。
-        // 結果は SlotPluginLoadedFromChild で受信、 daw_audio はその plugin
-        // を instrument 段階で process する (= 既存 vocal block は
-        // track.instrument.is_some() で自動 skip、 二重再生にならない)。
-        self.send_plugin(MainToChild::SetSlotPlugin {
-            track: id,
-            slot: PluginSlot::Instrument,
-            format: PluginFormat::Builtin,
-            path: std::path::PathBuf::from(common::plugin_db::BUILTIN_ID_VOICEVOX),
-            plugin_id: common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
-            initial_state: None,
-        });
-        self.sync_song_to_plugin_host();
-        // 直後に歌詞 metadata を flush (= demo_clip の lyrics で初期 synth
-        // が走る)。 plugin_id がまだ未確定の場合は SlotPluginLoadedFromChild
-        // で再 flush される。
-        self.sync_vocal_metadata();
-        tracing::info!(index, "added vocal track (builtin VOICEVOX)");
     }
 
     /// PR-V3: track.source = Vocal で instrument に builtin VOICEVOX が
@@ -10909,6 +10876,55 @@ impl AppData {
         self.pianoroll_notes_generation += 1;
     }
 
+    /// ピアノロールで選択中ノート (`selected_notes`) を複製する (D キー)。
+    /// 複製は選択範囲の beat span ぶん後ろにずらし、元ノートは据え置き、
+    /// 複製を新しい選択にする (連打で後方へ連鎖)。selected_clip 無し /
+    /// 選択空 / clip 解決失敗なら no-op。
+    fn duplicate_selected_notes(&mut self) {
+        let Some(r) = self.selected_clip else {
+            return;
+        };
+        let selected: Vec<u32> = self.selected_notes.clone();
+        if selected.is_empty() {
+            return;
+        }
+        let Some(notes) = self
+            .song
+            .notes_in_clip_mut(r.track as usize, r.clip as usize)
+        else {
+            return;
+        };
+        let new_ids = duplicate_notes_into(notes, &selected);
+        if new_ids.is_empty() {
+            return;
+        }
+        self.selected_notes = new_ids;
+        self.sync_song_to_plugin_host();
+        self.pianoroll_notes_generation += 1;
+    }
+
+    /// gui_01 #054 (Ctrl+drag コピー): `entries` = [(source note index,
+    /// new_start_beat, new_pitch)]。各 source を deep clone して指定位置へ配置し
+    /// (元は据え置き)、複製を新選択にする。selected_clip 無し / 該当 index 無しなら no-op。
+    fn copy_notes(&mut self, entries: &[(u32, f64, u8)]) {
+        let Some(r) = self.selected_clip else {
+            return;
+        };
+        let Some(notes) = self
+            .song
+            .notes_in_clip_mut(r.track as usize, r.clip as usize)
+        else {
+            return;
+        };
+        let new_ids = copy_notes_into(notes, entries);
+        if new_ids.is_empty() {
+            return;
+        }
+        self.selected_notes = new_ids;
+        self.sync_song_to_plugin_host();
+        self.pianoroll_notes_generation += 1;
+    }
+
     fn resize_note(
         &mut self,
         track_idx: u32,
@@ -11165,6 +11181,17 @@ impl AppData {
             }
         }
 
+        // ユーザーが手動追加した plugin の load 完了 finalize:
+        // (1) daw_audio へ LoadSong を再送して新 plugin を signal path に入れる。
+        //     従来この add path だけ audio 再 sync が欠落しており、 save 等 次の
+        //     sync_song_to_plugin_host まで signal に反映されなかった (= bug)。
+        // (2) GUI 自動 open を frame loop に queue する。
+        // pending_play flush より前に sync し、 Play 待ち再生も最新 schedule で開始させる。
+        if self.pending_added_plugin_finalize.remove(&(track_id, slot)) {
+            self.sync_song_to_plugin_host();
+            self.gui_open_requests.push((track_id, slot));
+        }
+
         // A7: this load is done. If Play was queued waiting for the
         // last plugin to register on the audio side, fire it now.
         self.pending_plugin_loads.remove(&(track_id, slot));
@@ -11217,6 +11244,9 @@ impl AppData {
             "plugin load failed (notified by plugin host)"
         );
         self.pending_plugin_loads.remove(&(track, slot));
+        // load 失敗時は finalize 予約も取り消す (stale entry が後の project-load で
+        // 誤 sync / 誤 open しないように)。
+        self.pending_added_plugin_finalize.remove(&(track, slot));
         // pending_play 解放: A7 と同じロジック (`on_plugin_loaded_from_child`
         // と対称)。 失敗で空になったタイミングで queue Play を flush する。
         if self.pending_plugin_loads.is_empty() && self.pending_play {
@@ -11315,16 +11345,31 @@ impl AppData {
             return;
         };
         let track_id = self.song.tracks[track_idx].id;
+        // 既に開いていれば閉じる (toggle)。開いていなければ open_slot_gui で開く。
         #[cfg(windows)]
         {
             if self.plugin_host_windows.contains_key(&(track_id, slot)) {
                 self.send_plugin(MainToChild::CloseSlotGui { track: track_id, slot });
                 return;
             }
+        }
+        self.open_slot_gui(track_id, slot);
+    }
+
+    /// 指定 (track_id, slot) のプラグイン GUI を embedded container window で開く。
+    /// 既に開いていれば何もしない (重複 open 防止)。Windows 専用 (他 OS では no-op)。
+    /// `toggle_slot_gui` (手動トグル) と plugin 追加時の自動 open の両方から使う。
+    fn open_slot_gui(&mut self, track_id: u32, slot: PluginSlot) {
+        #[cfg(windows)]
+        {
+            if self.plugin_host_windows.contains_key(&(track_id, slot)) {
+                return;
+            }
             let label = self
                 .song
                 .tracks
-                .get(track_idx)
+                .iter()
+                .find(|t| t.id == track_id)
                 .and_then(|t| self.slot_ref_name(t, slot))
                 .unwrap_or_else(|| "(unknown)".into());
             match crate::view::plugin_embed::PluginHostWindow::create(
@@ -11346,7 +11391,20 @@ impl AppData {
         }
         #[cfg(not(windows))]
         {
-            let _ = (track_id, slot, slot_kind, slot_index);
+            let _ = (track_id, slot);
+        }
+    }
+
+    /// runner の frame loop から毎フレーム呼ぶ。plugin 追加 → load 完了で queue された
+    /// GUI auto-open 要求を処理する (実 window 生成 + `OpenSlotGuiEmbedded` 送出)。
+    /// window 生成を handle_event ではなく frame loop に置くことで、frame loop を
+    /// 回さない headless test では window を作らない。
+    pub(crate) fn drain_pending_gui_opens(&mut self) {
+        if self.gui_open_requests.is_empty() {
+            return;
+        }
+        for (track_id, slot) in std::mem::take(&mut self.gui_open_requests) {
+            self.open_slot_gui(track_id, slot);
         }
     }
 
@@ -11490,7 +11548,11 @@ impl AppData {
         self.loaded_slots.remove(&(track_id, slot));
         if let Some(track) = self.song.tracks.get_mut(track_idx) {
             match slot {
-                PluginSlot::Instrument => track.instrument = None,
+                PluginSlot::Instrument => {
+                    track.instrument = None;
+                    // instrument を外したら vocal 状態も解除 (vocal性は instrument 追従)。
+                    track.source = InstrumentSource::None;
+                }
                 PluginSlot::Fx(i) => {
                     let i = i as usize;
                     if i < track.fx_chain.len() {
@@ -12113,6 +12175,9 @@ impl AppData {
             }
         };
         self.track_pending_load(track_id, dest_slot);
+        // ユーザーが手動追加した plugin は load 完了時に daw_audio 再 sync + GUI 自動
+        // open する (project-load の一斉復元はこの集合に積まれない)。
+        self.pending_added_plugin_finalize.insert((track_id, dest_slot));
         self.send_plugin(MainToChild::SetSlotPlugin {
             track: track_id,
             slot: dest_slot,
@@ -12128,6 +12193,19 @@ impl AppData {
                         entry_id.clone(),
                         entry_format,
                     ));
+                    // 統合モデル: instrument に builtin VOICEVOX を挿したら vocal track
+                    // 化 (source=Vocal)、 それ以外の音源なら通常 (None) に戻す。 旧
+                    // "+Vocal Track" ボタンの役割をここに集約 (sync_vocal_metadata が
+                    // source==Vocal を見て歌詞 synth を走らせる)。
+                    track.source = if entry_id.as_str() == common::plugin_db::BUILTIN_ID_VOICEVOX
+                    {
+                        InstrumentSource::Vocal {
+                            speaker_id: common::voicevox::DEFAULT_SINGER_ID,
+                            style_name: "ノーマル".into(),
+                        }
+                    } else {
+                        InstrumentSource::None
+                    };
                 }
                 PluginSlot::Fx(_) => {
                     track.fx_chain.push(common::model::PluginInstance::new(
@@ -13909,6 +13987,167 @@ fn load_recent_saved() -> common::recent::RecentFiles {
     }
 }
 
+/// 選択ノートを複製して `notes` 末尾に追加するピュアロジック (D キー複製の core)。
+/// `selected` の各 index のノートを clone し、選択範囲の beat span
+/// (`max(start+dur) - min(start)`、最低 1/16 拍) ぶん後ろへずらして append する。
+/// 元ノートは不変。戻り値は複製ノートの新 index (= 複製後の選択)。
+/// 選択が空 / 該当 index 無しなら `notes` 不変で空 Vec を返す。
+fn duplicate_notes_into(notes: &mut Vec<Note>, selected: &[u32]) -> Vec<u32> {
+    let mut clones: Vec<Note> = selected
+        .iter()
+        .filter_map(|&idx| notes.get(idx as usize).cloned())
+        .collect();
+    if clones.is_empty() {
+        return Vec::new();
+    }
+    let min_start = clones
+        .iter()
+        .map(|n| n.start_beat)
+        .fold(f64::INFINITY, f64::min);
+    let max_end = clones
+        .iter()
+        .map(|n| n.start_beat + n.duration_beats)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let offset = (max_end - min_start).max(0.0625);
+    for n in &mut clones {
+        n.start_beat += offset;
+    }
+    let base = notes.len() as u32;
+    let count = clones.len() as u32;
+    notes.append(&mut clones);
+    (base..base + count).collect()
+}
+
+/// gui_01 #054 (Ctrl+drag コピー) の core。`entries` = [(source note index,
+/// new_start_beat, new_pitch)]。各 source を clone し start_beat/pitch を指定値にして
+/// `notes` 末尾へ追加。元は不変。戻り値は複製の新 index。該当 index 無しなら不変で空 Vec。
+fn copy_notes_into(notes: &mut Vec<Note>, entries: &[(u32, f64, u8)]) -> Vec<u32> {
+    let mut clones: Vec<Note> = Vec::new();
+    for &(idx, new_beat, new_pitch) in entries {
+        if let Some(src) = notes.get(idx as usize) {
+            let mut c = src.clone();
+            c.start_beat = new_beat.max(0.0);
+            c.pitch = new_pitch;
+            clones.push(c);
+        }
+    }
+    if clones.is_empty() {
+        return Vec::new();
+    }
+    let base = notes.len() as u32;
+    let count = clones.len() as u32;
+    notes.append(&mut clones);
+    (base..base + count).collect()
+}
+
+#[cfg(test)]
+mod note_duplicate_tests {
+    use super::{copy_notes_into, duplicate_notes_into};
+    use common::model::Note;
+
+    fn note(start: f64, dur: f64, pitch: u8) -> Note {
+        Note {
+            start_beat: start,
+            duration_beats: dur,
+            pitch,
+            velocity: 100,
+            lyric: None,
+        }
+    }
+
+    #[test]
+    fn single_note_duplicated_after_itself() {
+        let mut notes = vec![note(0.0, 1.0, 60)];
+        let new_ids = duplicate_notes_into(&mut notes, &[0]);
+        assert_eq!(new_ids, vec![1]);
+        assert_eq!(notes.len(), 2);
+        // offset = (0+1) - 0 = 1 → 複製は start 1.0、長さ/pitch は維持
+        assert_eq!(notes[1].start_beat, 1.0);
+        assert_eq!(notes[1].duration_beats, 1.0);
+        assert_eq!(notes[1].pitch, 60);
+        // 元ノートは不変
+        assert_eq!(notes[0].start_beat, 0.0);
+    }
+
+    #[test]
+    fn multi_note_keeps_relative_positions_and_shifts_by_span() {
+        // [0,1) と [2,3)。選択範囲 span = 3 - 0 = 3。
+        let mut notes = vec![note(0.0, 1.0, 60), note(2.0, 1.0, 64)];
+        let new_ids = duplicate_notes_into(&mut notes, &[0, 1]);
+        assert_eq!(new_ids, vec![2, 3]);
+        assert_eq!(notes.len(), 4);
+        assert_eq!(notes[2].start_beat, 3.0); // 0 + 3
+        assert_eq!(notes[2].pitch, 60);
+        assert_eq!(notes[3].start_beat, 5.0); // 2 + 3
+        assert_eq!(notes[3].pitch, 64);
+    }
+
+    #[test]
+    fn subset_selection_duplicates_only_selected() {
+        // 3 ノート、index 0 と 2 だけ選択。選択範囲 span = (2+1) - 0 = 3。
+        let mut notes = vec![note(0.0, 1.0, 60), note(1.0, 1.0, 62), note(2.0, 1.0, 64)];
+        let new_ids = duplicate_notes_into(&mut notes, &[0, 2]);
+        assert_eq!(new_ids, vec![3, 4]);
+        assert_eq!(notes.len(), 5);
+        assert_eq!(notes[3].start_beat, 3.0); // 0 + 3
+        assert_eq!(notes[3].pitch, 60);
+        assert_eq!(notes[4].start_beat, 5.0); // 2 + 3
+        assert_eq!(notes[4].pitch, 64);
+        // 選択外の index 1 は複製されず元のまま
+        assert_eq!(notes[1].start_beat, 1.0);
+    }
+
+    #[test]
+    fn empty_selection_is_noop() {
+        let mut notes = vec![note(0.0, 1.0, 60)];
+        let new_ids = duplicate_notes_into(&mut notes, &[]);
+        assert!(new_ids.is_empty());
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[test]
+    fn out_of_range_index_ignored() {
+        let mut notes = vec![note(0.0, 1.0, 60)];
+        let new_ids = duplicate_notes_into(&mut notes, &[5]);
+        assert!(new_ids.is_empty());
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[test]
+    fn copy_places_clone_at_target_beat_and_pitch() {
+        // Ctrl+drag: note0 を beat 4.0 / pitch 67 へコピー。元は据え置き。
+        let mut notes = vec![note(0.0, 1.0, 60)];
+        let new_ids = copy_notes_into(&mut notes, &[(0, 4.0, 67)]);
+        assert_eq!(new_ids, vec![1]);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[1].start_beat, 4.0);
+        assert_eq!(notes[1].pitch, 67);
+        assert_eq!(notes[1].duration_beats, 1.0); // 長さは維持
+        assert_eq!(notes[0].start_beat, 0.0); // 元は不変
+        assert_eq!(notes[0].pitch, 60);
+    }
+
+    #[test]
+    fn copy_multi_preserves_each_target() {
+        let mut notes = vec![note(0.0, 1.0, 60), note(1.0, 0.5, 62)];
+        let new_ids = copy_notes_into(&mut notes, &[(0, 2.0, 60), (1, 3.0, 64)]);
+        assert_eq!(new_ids, vec![2, 3]);
+        assert_eq!(notes[2].start_beat, 2.0);
+        assert_eq!(notes[2].pitch, 60);
+        assert_eq!(notes[3].start_beat, 3.0);
+        assert_eq!(notes[3].pitch, 64);
+        assert_eq!(notes[3].duration_beats, 0.5);
+    }
+
+    #[test]
+    fn copy_empty_entries_is_noop() {
+        let mut notes = vec![note(0.0, 1.0, 60)];
+        let new_ids = copy_notes_into(&mut notes, &[]);
+        assert!(new_ids.is_empty());
+        assert_eq!(notes.len(), 1);
+    }
+}
+
 #[cfg(test)]
 mod aspect_fit_tests {
     use super::aspect_fit_pip_rect;
@@ -13976,28 +14215,3 @@ fn resolve_plugin_name(plugin_db: &Option<Arc<PluginDatabase>>, plugin_id: &str)
         .unwrap_or_else(|| plugin_id.to_string())
 }
 
-fn demo_clip() -> Clip {
-    let lyrics = ["こ", "ん", "に", "ち", "わ"];
-    let pitches = [60u8, 62, 64, 65, 67];
-    let notes = (0..5)
-        .map(|i| Note {
-            start_beat: i as f64 * 0.5,
-            duration_beats: 0.5,
-            pitch: pitches[i],
-            velocity: 100,
-            lyric: Some(lyrics[i].into()),
-        })
-        .collect();
-    Clip {
-        id: 1,
-        name: "こんにちわ".into(),
-        start_beat: 0.0,
-        length_beats: 4.0,
-        // Sentinel: caller is expected to allocate a content_id and
-        // move `notes` into `Song.clip_contents` via `ensure_clip_contents`
-        // (or by constructing the clip via `Song::create_empty_clip` +
-        // pushing notes into the content store directly).
-        content_id: 0,
-        notes,
-    }
-}

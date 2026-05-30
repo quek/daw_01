@@ -166,6 +166,18 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         "instrument plugin_id should register in track_plugin_ids"
     );
 
+    // 本セッションで手動追加した plugin は load 完了で daw_audio へ LoadSong を再送し、
+    // 新 plugin を signal path に入れる (add path の audio 再 sync 欠落 bug の回帰防止)。
+    // Step 2 の "Play は LoadSong を再送しない" assertion を汚さないよう、ここで drain。
+    let audio_after_add = drain(&mut audio_rx);
+    assert!(
+        audio_after_add
+            .iter()
+            .any(|m| matches!(m, MainToChild::LoadSong(_))),
+        "adding a plugin should re-sync daw_audio with a fresh LoadSong: {:?}",
+        audio_after_add
+    );
+
     // Step 2: Play。 audio_tx に Play のみが出るはず。
     // dbca77f 以降、 play() は LoadSong を再送しない (= 旧バグ: 大量 WAV の
     // とき audio engine の compile_audio_schedule = decode + schedule build

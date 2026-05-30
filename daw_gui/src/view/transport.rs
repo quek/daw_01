@@ -529,25 +529,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // PR-V4: 旧「Synth (V)」 ボタンは削除。 builtin VOICEVOX plugin が
     // 歌詞 / notes 変更時に自動 synth する (= sync_vocal_metadata 経由)。
 
-    // Add Vocal Track
-    let add_w = 110.0;
-    ui.button_at(
-        "transport_add_vocal",
-        "+Vocal Track",
-        Rect { x, y: cy, w: add_w, h: bh },
-        || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::AddVocalTrack)),
-    );
-    x += add_w + 6.0;
-
-    // Add Instrument Track
-    let inst_w = 110.0;
-    ui.button_at(
-        "transport_add_inst",
-        "+Inst Track",
-        Rect { x, y: cy, w: inst_w, h: bh },
-        || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::AddInstrumentTrack)),
-    );
-    x += inst_w + 18.0;
+    // Track 追加は Ctrl+T (shortcut) に集約。 旧 "+Vocal Track" / "+Inst Track"
+    // ボタンは削除した。 vocal は track の instrument に VOICEVOX を挿すと自動で
+    // vocal 化される (統合モデル、 select_plugin_from_db 参照)。
 
     // Group track には専用ボタンを置かない。Ableton Live と同じく
     // 「選択トラックを Ctrl+G でまとめる」フローのみ提供する
