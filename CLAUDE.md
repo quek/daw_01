@@ -114,6 +114,16 @@ cargo clippy --workspace -- -D warnings
 
 詳細設計は `docs/plan_ahe.md` (章 1.5 autonomy spectrum + 章 3 H13/H14/H15)。
 
+### hook 配置ポリシー
+
+- AHE hook (PreToolUse / PostToolUse / Stop) は **`.claude/settings.json`** に集約する。
+  このファイルは git 追跡対象なので、新規 worktree でも何もせず hook が有効になる。
+- `.claude/settings.local.json` は **マシン固有 permissions allowlist 専用** に残す
+  (gitignore 対象、harness が worktree 開始時に同期する想定)。
+- hook を追加したくなったら必ず `settings.json` 側に追加すること。
+  `settings.local.json` に hook を書くと、harness の同期次第で worktree に伝わらず
+  AHE ループが片肺になる。
+
 ## 応答・コミット
 
 - 応答は日本語
