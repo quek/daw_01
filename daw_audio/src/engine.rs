@@ -1813,20 +1813,29 @@ fn mix_send_into_track_scratch(
     }
 }
 
-/// `track_id` の子孫 (parent_group_id chain で辿れる) のいずれかが
-/// `solo == true` なら true。 Ableton Live の "soloed via children"
-/// 挙動 (group track 自身が solo されていなくても、 子が solo なら
-/// group も透過させる) のために使う。 cycle-safe: hops 上限 32。
-fn has_soloed_descendant(song: &Song, track_id: u32) -> bool {
+/// `track_id` に流れ込む (= contribute する) track のいずれかが
+/// `solo == true` なら true。 寄与エッジは「子 (`parent_group_id == node`、
+/// group の soloed-via-children)」 と「`node` 宛ての aux send を持つ track
+/// (= send 元、 return の solo-safe)」 の 2 種。 これで「あるトラックを
+/// solo すると、 そのトラックが送っている reverb / delay の **リターン** も
+/// 生かす」 Ableton 準拠の挙動になる (リターンを solo-safe にしないと、
+/// ソロしたトラックの send 先が solo 規則で無音化され、 ソロ中はセンド
+/// エフェクトが聞こえない)。 routing graph は DAG (`compile_schedule` が
+/// cycle を弾く) なので BFS は停止する。 `hops` 上限は child + send の
+/// fan-in を見込んで広めに取る。
+fn has_soloed_contributor(song: &Song, track_id: u32) -> bool {
     let mut frontier: Vec<u32> = vec![track_id];
     let mut hops = 0_usize;
-    while let Some(pid) = frontier.pop() {
+    let cap = song.tracks.len().saturating_mul(2) + 2;
+    while let Some(node) = frontier.pop() {
         hops += 1;
-        if hops > song.tracks.len() + 1 {
+        if hops > cap {
             return false;
         }
         for t in &song.tracks {
-            if t.parent_group_id == Some(pid) {
+            let feeds_node = t.parent_group_id == Some(node)
+                || t.sends.iter().any(|s| s.dest_track_id == node);
+            if feeds_node {
                 if t.solo {
                     return true;
                 }
@@ -1920,7 +1929,7 @@ fn run_group_fx_chain(
     let effective_mute = muted
         || (any_solo
             && !solo
-            && !has_soloed_descendant(song, song_track.id));
+            && !has_soloed_contributor(song, song_track.id));
     scratch.effective_mute = effective_mute;
     if effective_mute {
         scratch.track_l[..n].fill(0.0);
@@ -2257,5 +2266,27 @@ mod send_tests {
             );
             assert!((scratch[1].track_r[i] - 0.5).abs() < 1e-6);
         }
+    }
+
+    /// Solo-safe returns: when a track that aux-sends into a return is
+    /// soloed, the return must count as having a soloed contributor so the
+    /// solo rule keeps it audible instead of muting it. Regression for the
+    /// user-reported "soloed track's send reaches the FX, but the return
+    /// fader meter is dead and there is no sound".
+    #[test]
+    fn soloed_send_source_keeps_return_solo_safe() {
+        // song_with_send: Vocal (id 1) post-fader sends to Reverb (id 2).
+        let mut song = song_with_send(1.0, SendMode::PostFader, true);
+        song.tracks[0].solo = true; // solo the send SOURCE (Vocal)
+        assert!(
+            has_soloed_contributor(&song, 2),
+            "Reverb return must be solo-safe when its send source is soloed"
+        );
+        // Nothing soloed → the return has no soloed contributor.
+        song.tracks[0].solo = false;
+        assert!(
+            !has_soloed_contributor(&song, 2),
+            "with nothing soloed, the return has no soloed contributor"
+        );
     }
 }
