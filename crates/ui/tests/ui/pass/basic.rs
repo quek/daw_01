@@ -180,6 +180,7 @@ fn main() {
                     }),
                     PianoRollEditRequest::Delete(_) => Edit::mutate(|_m: &mut Model| {}),
                     PianoRollEditRequest::Move(_) => Edit::mutate(|_m: &mut Model| {}),
+                    PianoRollEditRequest::Copy(_) => Edit::mutate(|_m: &mut Model| {}),
                     PianoRollEditRequest::Resize(_) => Edit::mutate(|_m: &mut Model| {}),
                     PianoRollEditRequest::Select { .. } => Edit::mutate(|_m: &mut Model| {}),
                     PianoRollEditRequest::SetLyrics(_) => Edit::mutate(|_m: &mut Model| {}),

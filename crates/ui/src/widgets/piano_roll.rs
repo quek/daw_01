@@ -383,6 +383,11 @@ pub enum PianoRollEditRequest {
     Delete(Vec<Note>),
     /// drag release で平行移動。Undoable。
     Move(Vec<MoveDelta>),
+    /// (M14 Phase 83 / daw_01 #054) Ctrl+drag release で **複製**。payload は `Move` と同形
+    /// (`MoveDelta = (id, prev_beat, prev_pitch, new_beat, new_pitch)`) だが、意味は
+    /// 「`id` の note を複製して `new_*` 位置へ配置し、元は据え置き」。note は clip 内 raw data で
+    /// リンク概念が無いため独立コピー 1 種 (arrangement の Linked/Independent 区別は不要)。
+    Copy(Vec<MoveDelta>),
     /// drag release で resize。Undoable。
     Resize(Vec<ResizeDelta>),
     /// rect select (Shift+drag、加算) または click で selection を更新。Undoable。
@@ -482,6 +487,11 @@ pub struct PianoRollStyle {
     pub note_selected_border: Color,
     pub note_selected_border_w: f32,
     pub note_selected_pad_px: f32,
+    /// (M14 Phase 83 / daw_01 #054) Ctrl+drag copy 中の複製 ghost の fill / border 色。
+    /// move drag の ghost (`note_selected_*` = 黄) と色を変えて「コピー操作中」 を視覚区別する
+    /// (arrangement の clip clone ghost と同 idiom)。`..Default::default()` caller は無修正。
+    pub note_clone_ghost_fill: Color,
+    pub note_clone_ghost_border: Color,
     /// resize handle の幅 (px)。note rect 左右 edge から **内外** この px = resize、
     /// それ以外 (rect 中央) = move。短 note (`r.w <= resize_handle_px * 2`) は rect 内
     /// すべて Move、rect 外側のみ resize 判定。
@@ -580,6 +590,10 @@ impl Default for PianoRollStyle {
             note_selected_border: Color::rgb(1.0, 1.0, 1.0),
             note_selected_border_w: 2.0,
             note_selected_pad_px: 2.0,
+            // M14 Phase 83 / daw_01 #054: copy ghost は move ghost (黄) と区別する緑系
+            // (arrangement の clone linked ghost と同系統)。
+            note_clone_ghost_fill: Color::rgba(0.30, 0.85, 0.45, 0.85),
+            note_clone_ghost_border: Color::rgb(0.55, 1.0, 0.70),
             resize_handle_px: 4.0,
             c_label_color: Color::rgb(0.30, 0.30, 0.35),
             c_label_font_px: 11.0,
@@ -1056,6 +1070,11 @@ struct NoteDragSession {
     /// これにより OS event 順序 (ModifiersChanged が MouseInput(Released) より先に来るケース)
     /// に依存せず、 overlay と commit が必ず同一値で確定する。
     last_alt: bool,
+    /// (M14 Phase 83 / daw_01 #054) drag 中の最終 ctrl 状態。 `last_alt` と完全同型の
+    /// careful-update (continuation frame で update / release frame は skip) で保持し、
+    /// release frame の `Move` ↔ `Copy` 分岐と copy overlay の色が必ず同一値で確定する
+    /// (OS の ModifiersChanged が Released より先に届くと ctrl が false に化けるのを回避)。
+    last_ctrl: bool,
 }
 
 /// (M14 Phase 64 / daw_01 #018) velocity lane 内 drag session。
@@ -1269,6 +1288,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     ///
     /// # 操作
     /// - **note 中央 drag** = move (release で `PianoRollEditRequest::Move` 発行、Undoable)
+    /// - **note 中央 Ctrl+drag** = copy (release で `PianoRollEditRequest::Copy` 発行、Undoable、daw_01 #054)
     /// - **note 左右端 drag** = resize (release で `PianoRollEditRequest::Resize` 発行、Undoable)
     /// - **note click** (drag<4px) = selection 1 個 (`PianoRollEditRequest::Select` 発行)
     /// - **空白 click** = selection clear (同上)
@@ -1417,6 +1437,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 .collect();
             if !anchors.is_empty() {
                 let press_alt = pointer.modifiers.alt;
+                let press_ctrl = pointer.modifiers.ctrl;
                 let state: &mut PianoRollState = self.widget_state(wid);
                 state.note_drag = Some(NoteDragSession {
                     kind,
@@ -1424,6 +1445,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     anchors,
                     last_mouse: (px, py),
                     last_alt: press_alt,
+                    last_ctrl: press_ctrl,
                 });
             }
         }
@@ -1574,11 +1596,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // pos、 OR press → 1 frame で release した short drag の release pos) として update する。
         if let Some((px, py)) = pointer.pos {
             let alt_now = pointer.modifiers.alt;
+            let ctrl_now = pointer.modifiers.ctrl;
             let state: &mut PianoRollState = self.widget_state(wid);
             if let Some(ref mut nd) = state.note_drag {
                 if !pointer.primary_just_released {
                     nd.last_mouse = (px, py);
                     nd.last_alt = alt_now;
+                    nd.last_ctrl = ctrl_now;
                 } else if (px, py) != nd.anchor_mouse {
                     nd.last_mouse = (px, py);
                 }
@@ -2164,7 +2188,15 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         }
                     }
                     if !deltas.is_empty() {
-                        self.push_edit(make_edit(PianoRollEditRequest::Move(deltas)));
+                        // M14 Phase 83 / daw_01 #054: Ctrl 保持なら複製 (元据え置き)、 そうでなければ
+                        // 移動。 `nd.last_ctrl` は overlay と同じ careful-update 値なので、 copy ghost を
+                        // 見て release した結果と必ず一致する。
+                        let req = if nd.last_ctrl {
+                            PianoRollEditRequest::Copy(deltas)
+                        } else {
+                            PianoRollEditRequest::Move(deltas)
+                        };
+                        self.push_edit(make_edit(req));
                     }
                 }
                 NoteDragKind::ResizeRight => {
@@ -2791,6 +2823,13 @@ fn draw_drag_preview<M: ?Sized + 'static>(
     pitch_delta: i32,
     min_len: f64,
 ) {
+    // M14 Phase 83 / daw_01 #054: Ctrl 保持の copy drag は ghost を clone 色 (緑系) で描き、
+    // move drag (黄) と視覚区別する。`nd.last_ctrl` は release commit と同じ careful-update 値。
+    let (ghost_fill, ghost_border) = if nd.last_ctrl {
+        (style.note_clone_ghost_fill, style.note_clone_ghost_border)
+    } else {
+        (style.note_selected_fill, style.note_selected_border)
+    };
     for a in &nd.anchors {
         let (start_beat, len_beats, pitch) =
             drag_preview_geometry(*a, nd.kind, beat_delta, pitch_delta, min_len, view, nd.last_alt);
@@ -2809,8 +2848,8 @@ fn draw_drag_preview<M: ?Sized + 'static>(
                 w: x_right - x_left,
                 h: y_bot - y_top,
             },
-            fill: style.note_selected_fill,
-            border: style.note_selected_border,
+            fill: ghost_fill,
+            border: ghost_border,
             border_width: style.note_selected_border_w,
             radius: [style.note_border_radius_px; 4],
             clip_rect: None,
@@ -3284,6 +3323,7 @@ mod tests {
         Add,
         Delete,
         Move,
+        Copy,
         Resize,
         Select,
         SetLyrics,
@@ -3327,6 +3367,9 @@ mod tests {
                 }),
                 PianoRollEditRequest::Move(_) => {
                     Edit::mutate(|m: &mut TestModel| m.last_request = Some(RequestKind::Move))
+                }
+                PianoRollEditRequest::Copy(_) => {
+                    Edit::mutate(|m: &mut TestModel| m.last_request = Some(RequestKind::Copy))
                 }
                 PianoRollEditRequest::Resize(_) => {
                     Edit::mutate(|m: &mut TestModel| m.last_request = Some(RequestKind::Resize))
@@ -3725,6 +3768,74 @@ mod tests {
             );
         });
         assert_eq!(model.last_request, Some(RequestKind::Move), "release で Move 発行");
+    }
+
+    /// (M14 Phase 83 / daw_01 #054) Ctrl+drag は release で `Move` ではなく `Copy` を発行する。
+    /// Ctrl なしの drag が `Move` を出すことは `piano_roll_no_edit_during_drag_only_at_release`
+    /// が固定済 (= 修飾の有無だけで分岐することの回帰防止ペア)。
+    #[test]
+    fn piano_roll_ctrl_drag_emits_copy_on_release() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![note(0, 1.0, 1.0, 60)]);
+        let view = test_view();
+        let style = PianoRollStyle::default();
+        let notes_clone = model.notes.clone();
+        let view_owned = view;
+
+        // Frame 1: Ctrl+press at note 中央 → drag (ctrl 保持)
+        let input1 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((300.0, 200.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                modifiers: Modifiers { ctrl: true, ..Modifiers::empty() },
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, input1, |ui| {
+            let dispatch = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone,
+                view_owned,
+                &sel,
+                &style,
+                dispatch,
+            );
+        });
+        assert_eq!(model.last_request, None, "drag 中は Edit 発行せず");
+
+        // Frame 2: Ctrl 保持で release at 移動先 (100px 移動 = demote 閾値 4px 超)
+        let input2 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((400.0, 200.0)),
+                primary_just_released: true,
+                modifiers: Modifiers { ctrl: true, ..Modifiers::empty() },
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, input2, |ui| {
+            let dispatch = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let _ = ui.piano_roll(
+                "pr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &notes_clone,
+                view_owned,
+                &sel,
+                &style,
+                dispatch,
+            );
+        });
+        assert_eq!(
+            model.last_request,
+            Some(RequestKind::Copy),
+            "Ctrl+drag release で Copy 発行 (Move ではない)"
+        );
     }
 
     /// Modifiers が default (= 修飾なし) で、modifier の Default 実装がエラーで失敗しないことの確認。

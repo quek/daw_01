@@ -241,6 +241,53 @@ fn make_move_notes_edit(deltas: Vec<MoveDelta>) -> Edit<PianoRollModel> {
     )
 }
 
+/// (M14 Phase 83 / daw_01 #054) Ctrl+drag で発火する `Copy(deltas)` を受け、各 source note を
+/// deep clone + `new_*` 位置へ配置 (元は据え置き)、複製を新 selection にする Undoable Edit。
+/// 複製 id は `base_id` から連番 (Add と同じく `next_note_id` を bump)。daw_01 では
+/// `duplicate_notes` に集約する model 操作の demo 相当。
+fn make_copy_notes_edit(
+    deltas: Vec<MoveDelta>,
+    base_id: NoteId,
+    prev_selection: Vec<NoteId>,
+) -> Edit<PianoRollModel> {
+    let label = if deltas.len() == 1 { "copy note" } else { "copy notes" };
+    Edit::snapshot_inverse(
+        label,
+        (deltas, base_id, prev_selection),
+        |m: &mut PianoRollModel, snap: &(Vec<MoveDelta>, NoteId, Vec<NoteId>)| {
+            let (deltas, base, _prev) = snap;
+            let mut new_ids: Vec<NoteId> = Vec::with_capacity(deltas.len());
+            for (i, (src_id, _, _, nb, np)) in deltas.iter().enumerate() {
+                // Note は Copy ではない (Arc<str> lyric) ので clone() で複製。
+                if let Some(src) = m.notes.iter().find(|n| n.id == *src_id) {
+                    let mut dup = src.clone();
+                    dup.id = *base + i as NoteId;
+                    dup.start_beat = *nb;
+                    dup.pitch = *np;
+                    new_ids.push(dup.id);
+                    m.notes.push(dup);
+                }
+            }
+            m.next_note_id = m.next_note_id.max(*base + deltas.len() as NoteId);
+            m.selected_note_ids = new_ids;
+            m.notes.sort_by(|a, b| {
+                a.start_beat.partial_cmp(&b.start_beat).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            m.notes_generation += 1;
+        },
+        |m: &mut PianoRollModel, snap: &(Vec<MoveDelta>, NoteId, Vec<NoteId>)| {
+            let (deltas, base, prev) = snap;
+            let ids: HashSet<NoteId> =
+                (0..deltas.len()).map(|i| *base + i as NoteId).collect();
+            m.notes.retain(|x| !ids.contains(&x.id));
+            // copy の forward は selection を複製に上書きするので、undo は複製前の selection を
+            // 復元する (複製 id 除外だけでは元選択が失われる、make_select_notes_edit と同じ対称性)。
+            m.selected_note_ids.clone_from(prev);
+            m.notes_generation += 1;
+        },
+    )
+}
+
 fn make_resize_notes_edit(deltas: Vec<ResizeDelta>) -> Edit<PianoRollModel> {
     let label = if deltas.len() == 1 { "resize note" } else { "resize notes" };
     Edit::snapshot_inverse(
@@ -703,6 +750,8 @@ impl App {
                 // make_set_velocity_edit に (id, prev, next) として渡す = undo で復元可能に。
                 let velocity_snapshot: Vec<(NoteId, u8)> =
                     m.notes.iter().map(|n| (n.id, n.velocity)).collect();
+                // M14 Phase 83 / daw_01 #054: Copy の undo で複製前の selection を復元するための snapshot。
+                let selection_snapshot: Vec<NoteId> = m.selected_note_ids.clone();
 
                 let resp: PianoRollResponse = ui.piano_roll(
                     "main",
@@ -721,6 +770,15 @@ impl App {
                         }
                         PianoRollEditRequest::Delete(notes) => make_delete_notes_edit(notes),
                         PianoRollEditRequest::Move(deltas) => make_move_notes_edit(deltas),
+                        PianoRollEditRequest::Copy(deltas) => {
+                            // 複製 id は Add と同じ next_note_id を base に連番採番。
+                            // prev selection を渡して undo で複製前の選択を復元する。
+                            make_copy_notes_edit(
+                                deltas,
+                                next_id_for_add,
+                                selection_snapshot.clone(),
+                            )
+                        }
                         PianoRollEditRequest::Resize(deltas) => make_resize_notes_edit(deltas),
                         PianoRollEditRequest::Select { prev, next } => {
                             make_select_notes_edit(prev, next)
@@ -1055,6 +1113,34 @@ mod tests {
         assert_eq!(model.selected_note_ids, vec![0, 1]);
         inverse(&mut model);
         assert_eq!(model.selected_note_ids, vec![0]);
+    }
+
+    #[test]
+    fn copy_notes_then_undo_round_trip_restores_notes_and_selection() {
+        // (M14 Phase 83 / daw_01 #054) 元 note 1 個を選択 → Copy で複製 (新位置 + 複製を選択)
+        // → undo で複製削除 + 複製前の selection 復元、を 1 往復で固定。
+        let mut model = PianoRollModel::new(vec![note(0, 1.0, 0.5, 60)]);
+        model.selected_note_ids = vec![0];
+        let deltas: Vec<MoveDelta> = vec![(0u32, 1.0_f64, 60u8, 3.0_f64, 62u8)];
+        let edit = make_copy_notes_edit(deltas, 1, vec![0]);
+        let Edit::Undoable { forward, inverse, .. } = edit else {
+            panic!("expected Undoable");
+        };
+        forward(&mut model);
+        // 元 note 据え置き + 複製 1 個 = 2 個、複製 (id 1) が新 selection。
+        assert_eq!(model.notes.len(), 2);
+        assert_eq!(model.selected_note_ids, vec![1]);
+        let dup = model.notes.iter().find(|n| n.id == 1).unwrap();
+        assert!((dup.start_beat - 3.0).abs() < 1e-6);
+        assert_eq!(dup.pitch, 62);
+        // 元 note (id 0) は据え置きで変化なし。
+        let src = model.notes.iter().find(|n| n.id == 0).unwrap();
+        assert!((src.start_beat - 1.0).abs() < 1e-6);
+        assert_eq!(src.pitch, 60);
+        // undo: 複製削除 + 複製前 selection (元 note) を復元。
+        inverse(&mut model);
+        assert_eq!(model.notes.len(), 1);
+        assert_eq!(model.selected_note_ids, vec![0], "undo で複製前の selection 復元");
     }
 
     #[test]
