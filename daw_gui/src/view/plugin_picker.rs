@@ -103,6 +103,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     })
                 },
             );
+            // gui_01 #057 (Phase 86): focus を保ったまま ↑↓ で候補リストのカーソル移動。
+            // Left/Right は text_input の cursor 移動に使われるので返らない。
+            if search_resp.nav_down {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::MovePluginPickerCursor(1))
+                }));
+            }
+            if search_resp.nav_up {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::MovePluginPickerCursor(-1))
+                }));
+            }
             // text_input は placeholder 非対応なので、 空のとき薄色ヒントを重ねる。
             if app.plugin_picker_query.is_empty() {
                 ui.label_at(
@@ -114,12 +126,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     COLOR_TEXT_DIM,
                 );
             }
-            // Enter で絞り込み結果の先頭を確定 (= list クリックと同じ経路で
-            // ロード)。 0 件なら何もしない。
+            // Enter でカーソル位置の候補を確定 (= list クリックと同じ経路でロード)。
+            // 0 件なら何もしない。 カーソルは ↑↓ で動かす (gui_01 #057)。
             if search_resp.committed
-                && let Some(first) = app.plugin_picker_visible.first()
+                && let Some(target) = app.plugin_picker_visible.get(app.plugin_picker_cursor)
             {
-                let id = first.id.clone();
+                let id = target.id.clone();
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SelectPluginFromDb(id))
                 }));
@@ -146,24 +158,39 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 return;
             }
 
-            ui.list_view(
+            // カーソル位置を ListView ハイライト用に渡す。 visible 非空保証下なので
+            // saturating_sub(1) で安全に clamp (refresh で 0 リセットされる + Move で
+            // clamp 済みなので通常 cursor < visible.len() だが防衛的に)。
+            let cursor = app
+                .plugin_picker_cursor
+                .min(visible.len().saturating_sub(1));
+            // row callback は label のみ描画 (背景は list_view が selected / hover /
+            // 通常で塗り分けてくれる)。 旧来 `button_at` で row 全面を塗っていたため
+            // 選択ハイライト (`row_bg_selected` = 青) が button bg に隠れて見えなかった。
+            // クリック判定は下の `resp.clicked` を採用する。
+            let resp = ui.list_view(
                 "pp_list",
                 list_rect,
                 visible,
-                None,
+                Some(cursor),
                 &LIST_STYLE,
-                |ui, entry, i, row_rect, _selected| {
-                    let id_clone = entry.id.clone();
-                    ui.button_at(
-                        ("pp_row_btn", i),
+                |ui, entry, i, row_rect, is_selected| {
+                    // 選択行は全 label を白に統一 (背景青と高コントラスト、 Windows
+                    // ListBox / macOS NSTableView の反転表示慣習)。 非選択時は format
+                    // を青、 vendor を dim グレーで区別。 選択時は format の青と背景
+                    // 青が同化して読めなくなるため白で潰す。
+                    let (name_color, vendor_color, format_color) = if is_selected {
+                        (Color::WHITE, Color::WHITE, Color::WHITE)
+                    } else {
+                        (COLOR_TEXT, COLOR_TEXT_DIM, COLOR_TEXT_FORMAT)
+                    };
+                    ui.label_at(
+                        ("pp_row_name", i),
                         &entry.name,
-                        row_rect,
-                        move || {
-                            let id_clone = id_clone.clone();
-                            Edit::mutate(move |app: &mut AppData| {
-                                app.handle_event(AppEvent::SelectPluginFromDb(id_clone))
-                            })
-                        },
+                        row_rect.x + 10.0,
+                        row_rect.y + 6.0,
+                        12.0,
+                        name_color,
                     );
                     ui.label_at(
                         ("pp_row_vendor", i),
@@ -171,7 +198,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                         row_rect.x + row_rect.w - 200.0,
                         row_rect.y + 6.0,
                         10.0,
-                        COLOR_TEXT_DIM,
+                        vendor_color,
                     );
                     ui.label_at(
                         ("pp_row_format", i),
@@ -179,10 +206,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                         row_rect.x + row_rect.w - 50.0,
                         row_rect.y + 6.0,
                         10.0,
-                        COLOR_TEXT_FORMAT,
+                        format_color,
                     );
                 },
             );
+            if let Some(idx) = resp.clicked
+                && let Some(target) = visible.get(idx)
+            {
+                let id = target.id.clone();
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SelectPluginFromDb(id))
+                }));
+            }
         },
     );
 }

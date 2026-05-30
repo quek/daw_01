@@ -801,6 +801,12 @@ pub struct AppData {
     pub plugin_picker_query: String,
     pub is_plugin_picker_open: bool,
     pub plugin_picker_target: PickerTarget,
+    /// 検索結果リスト ([`plugin_picker_visible`]) 内のカーソル位置 (0-based)。
+    /// `text_input` focus 中の ↑↓ (gui_01 #057 / Phase 86 `TextInputResponse::nav_up/nav_down`)
+    /// で [`AppEvent::MovePluginPickerCursor`] を発火して移動し、 Enter で
+    /// `plugin_picker_visible.get(cursor)` を確定する。 `refresh_picker_visible` が
+    /// 呼ばれる度 (絞り込み再計算 / モーダル open / rescan 完了) に 0 にリセット。
+    pub plugin_picker_cursor: usize,
 
     // -------- Save flow / IPC --------
     /// `RequestAllStates` を発行した順に保持するキュー。 front が現在 in-flight
@@ -1147,6 +1153,7 @@ impl AppData {
             plugin_picker_query: String::new(),
             is_plugin_picker_open: false,
             plugin_picker_target: PickerTarget::Instrument,
+            plugin_picker_cursor: 0,
             pending_state_queue: VecDeque::new(),
             audio_tx: Some(audio_tx),
             plugin_tx: Some(plugin_tx),
@@ -2798,6 +2805,11 @@ pub enum AppEvent {
     /// プラグインピッカーの検索ボックスが 1 文字毎に発行する。 query を更新し
     /// `refresh_picker_visible` で subsequence 絞り込みを再計算する。
     SetPluginPickerQuery(String),
+    /// 検索結果リスト ([`AppData::plugin_picker_visible`]) のカーソルを `delta` だけ
+    /// 移動し `[0, visible.len()-1]` で clamp。 visible が空なら no-op。
+    /// text_input が focus 中の ↑↓ (gui_01 #057 / Phase 86 `TextInputResponse::nav_up`
+    /// / `nav_down`) で発火し、 Enter で `plugin_picker_visible.get(cursor)` を確定する。
+    MovePluginPickerCursor(i32),
     ToggleSlotGui { slot_kind: u8, slot_index: u32 },
     RemoveSlot { slot_kind: u8, slot_index: u32 },
     /// PR4 sidechain: wire / unwire the sidechain source for a plugin's
@@ -3926,6 +3938,14 @@ impl AppData {
             AppEvent::SetPluginPickerQuery(query) => {
                 self.plugin_picker_query = query;
                 self.refresh_picker_visible();
+            }
+            AppEvent::MovePluginPickerCursor(delta) => {
+                let len = self.plugin_picker_visible.len();
+                if len > 0 {
+                    let new = (self.plugin_picker_cursor as i32 + delta)
+                        .clamp(0, len as i32 - 1) as usize;
+                    self.plugin_picker_cursor = new;
+                }
             }
             AppEvent::RescanPluginDb => {
                 self.begin_rescan();
@@ -12569,6 +12589,9 @@ impl AppData {
             .cloned()
             .collect();
         self.plugin_picker_visible = visible;
+        // 絞り込み再計算後はカーソルを先頭に戻す (要件 7)。 query 変更 / target 切替 /
+        // rescan 完了で呼ばれるため、 「絞り込みが変わったら先頭にリセット」 が自然。
+        self.plugin_picker_cursor = 0;
     }
 
     fn resolve_name(&self, plugin_id: &str) -> String {
