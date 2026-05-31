@@ -505,25 +505,36 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // 並列生成。 selected_clip が None なら no-op。
     if ui.take_shortcut("daw.duplicate_clip_shared") {
         // ピアノロール上 + ノート選択中なら D = ノート複製。それ以外 (アレンジ文脈
-        // / ピアノロールでもノート未選択) は従来どおり選択 clip の共有複製。
+        // / ピアノロールでもノート未選択) は選択中の MIDI/Audio/Vocal clip と
+        // automation clip の両方を同時に共有複製 (Ableton/REAPER 流)。
         if is_pianoroll_active && !app.selected_notes.is_empty() {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::DuplicateSelectedNotes);
             }));
         } else {
-            let sources: Vec<crate::app::ClipRef> = app.selected_clips.clone();
+            let midi_sources: Vec<crate::app::ClipRef> = app.selected_clips.clone();
+            let automation_sources: Vec<common::model::AutomationClipKey> =
+                app.selected_automation_clips.clone();
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                for src in &sources {
+                for src in &midi_sources {
                     app.handle_event(AppEvent::DuplicateClipShared { source: *src });
+                }
+                for key in &automation_sources {
+                    app.handle_event(AppEvent::DuplicateAutomationClipShared(*key));
                 }
             }));
         }
     }
     if ui.take_shortcut("daw.duplicate_clip_unique") {
-        let sources: Vec<crate::app::ClipRef> = app.selected_clips.clone();
+        let midi_sources: Vec<crate::app::ClipRef> = app.selected_clips.clone();
+        let automation_sources: Vec<common::model::AutomationClipKey> =
+            app.selected_automation_clips.clone();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            for src in &sources {
+            for src in &midi_sources {
                 app.handle_event(AppEvent::DuplicateClipUnique { source: *src });
+            }
+            for key in &automation_sources {
+                app.handle_event(AppEvent::DuplicateAutomationClipUnique(*key));
             }
         }));
     }

@@ -2115,6 +2115,8 @@ impl AppData {
                 | AppEvent::ResizeAutomationClips { .. }
                 | AppEvent::DeleteAutomationClips { .. }
                 | AppEvent::MakeAutomationClipUnique(_)
+                | AppEvent::DuplicateAutomationClipShared(_)
+                | AppEvent::DuplicateAutomationClipUnique(_)
                 // Phase 3: point quantize は構造変化系として Undo step
                 // 化。 SelectAutomationPoints は session-only なので除外。
                 | AppEvent::QuantizeSelectedAutomationPoints(_)
@@ -2712,6 +2714,15 @@ pub enum AppEvent {
     /// 既に独立 clip の場合は status_message で通知。MIDI clip 用
     /// `MakeClipUnique(ClipRef)` と同 idiom の lane 版。
     MakeAutomationClipUnique(common::model::AutomationClipKey),
+    /// D shortcut: 選択中 automation clip の末尾直後 (source.start_beat +
+    /// length_beats) に同 lane で共有コピー (linked clip) を 1 つ生成。
+    /// MIDI 用 `DuplicateClipShared` の automation lane 版。 `content_id` を
+    /// 流用し、 `selected_automation_clips` を新 key で上書きするので
+    /// D 連打で後方連鎖する。
+    DuplicateAutomationClipShared(common::model::AutomationClipKey),
+    /// Alt+D shortcut: 同位置に独立コピー (content を deep clone +
+    /// 新 ContentId)。 MIDI 用 `DuplicateClipUnique` の automation lane 版。
+    DuplicateAutomationClipUnique(common::model::AutomationClipKey),
     /// gui_01 #028 §7.3: parameter touch 通知。inspector の knob drag /
     /// plugin GUI の knob 操作 (Phase 2+ で IPC 経由) で発火し、
     /// `last_touched_param` を更新。`A` キー shortcut の source になる。
@@ -3874,6 +3885,12 @@ impl AppData {
             }
             AppEvent::CloneAutomationClipsIndependent { deltas } => {
                 self.clone_automation_clips_independent(&deltas)
+            }
+            AppEvent::DuplicateAutomationClipShared(key) => {
+                self.duplicate_automation_clip_shared(key);
+            }
+            AppEvent::DuplicateAutomationClipUnique(key) => {
+                self.duplicate_automation_clip_unique(key);
             }
             AppEvent::ResizeAutomationClips { deltas } => {
                 self.resize_automation_clips(&deltas)
@@ -7195,6 +7212,117 @@ impl AppData {
                 .partition_point(|c| c.start_beat < start);
             target_lane.clips.insert(pos, new_clip);
         }
+        self.sync_song_to_plugin_host();
+    }
+
+    /// D shortcut: 選択中 automation clip の末尾直後 (source.start_beat +
+    /// length_beats) に同 lane で共有コピーを 1 つ生成。 `content_id` を
+    /// 流用し linked group に追加。 `selected_automation_clips` を新 key で
+    /// 上書きするので連打で後方連鎖する (MIDI 用 `duplicate_clip_shared` と
+    /// 同 UX)。
+    fn duplicate_automation_clip_shared(
+        &mut self,
+        source: common::model::AutomationClipKey,
+    ) {
+        let template = {
+            let Some(lane) = self.song.automation_lane_by_key(source.track, source.lane)
+            else {
+                return;
+            };
+            let Some(src_clip) = lane.clip_by_id(source.clip) else {
+                return;
+            };
+            (
+                src_clip.content_id,
+                src_clip.name.clone(),
+                src_clip.start_beat + src_clip.length_beats,
+                src_clip.length_beats,
+            )
+        };
+        let Some(lane) = self
+            .song
+            .automation_lane_by_key_mut(source.track, source.lane)
+        else {
+            return;
+        };
+        let new_id = lane.alloc_clip_id();
+        let new_clip = common::model::AutomationClip {
+            id: new_id,
+            name: template.1,
+            start_beat: template.2,
+            length_beats: template.3,
+            content_id: template.0,
+        };
+        let start = new_clip.start_beat;
+        let pos = lane.clips.partition_point(|c| c.start_beat < start);
+        lane.clips.insert(pos, new_clip);
+        let new_key = common::model::AutomationClipKey {
+            track: source.track,
+            lane: source.lane,
+            clip: new_id,
+        };
+        self.selected_automation_clips = vec![new_key];
+        self.sync_song_to_plugin_host();
+    }
+
+    /// Alt+D shortcut: 同位置に独立コピー (content を deep clone +
+    /// 新 ContentId)。 MIDI 用 `duplicate_clip_unique` の lane 版。
+    fn duplicate_automation_clip_unique(
+        &mut self,
+        source: common::model::AutomationClipKey,
+    ) {
+        let template = {
+            let Some(lane) = self.song.automation_lane_by_key(source.track, source.lane)
+            else {
+                return;
+            };
+            let Some(src_clip) = lane.clip_by_id(source.clip) else {
+                return;
+            };
+            (
+                src_clip.content_id,
+                src_clip.name.clone(),
+                src_clip.start_beat + src_clip.length_beats,
+                src_clip.length_beats,
+            )
+        };
+        let cloned_content = self
+            .song
+            .clip_contents
+            .get(&template.0)
+            .cloned()
+            .unwrap_or_else(|| {
+                common::model::ClipContent::Automation(
+                    common::model::AutomationContent::default(),
+                )
+            });
+        let new_content_id = self.song.alloc_content_id();
+        self.song
+            .clip_contents
+            .insert(new_content_id, cloned_content);
+        let Some(lane) = self
+            .song
+            .automation_lane_by_key_mut(source.track, source.lane)
+        else {
+            return;
+        };
+        let new_id = lane.alloc_clip_id();
+        let new_clip = common::model::AutomationClip {
+            id: new_id,
+            name: template.1,
+            start_beat: template.2,
+            length_beats: template.3,
+            content_id: new_content_id,
+        };
+        let start = new_clip.start_beat;
+        let pos = lane.clips.partition_point(|c| c.start_beat < start);
+        lane.clips.insert(pos, new_clip);
+        let new_key = common::model::AutomationClipKey {
+            track: source.track,
+            lane: source.lane,
+            clip: new_id,
+        };
+        self.selected_automation_clips = vec![new_key];
         self.sync_song_to_plugin_host();
     }
 
