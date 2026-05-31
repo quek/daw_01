@@ -5,7 +5,8 @@
 //! - + Instrument / + Effect / + MIDI FX ボタン
 
 use daw_ui_core::{
-    Edit, ReorderableListEditRequest, ReorderableListStyle, ToggleButtonStyle, Ui,
+    Edit, ReorderableListEditRequest, ReorderableListStyle, ScrubableNumberFormat,
+    ScrubableNumberStyle, ToggleButtonStyle, Ui,
 };
 use daw_ui_renderer::{Color, Rect};
 
@@ -52,6 +53,21 @@ const TOGGLE_IMAGE_AUTOMATE: ToggleButtonStyle = ToggleButtonStyle {
     font_size: 11.0,
     text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
     on_text_color: None,
+};
+
+// Group Transform の scrubable_number base style。 sensitivity / range は param
+// 別に上書きする。 ドラッグで連続変化 / click で text 入力 / dblclick で reset。
+const SCRUB_STYLE_GROUP: ScrubableNumberStyle = ScrubableNumberStyle {
+    bg_color: Color { r: 0.16, g: 0.17, b: 0.21, a: 1.0 },
+    bg_color_hovered: Color { r: 0.20, g: 0.21, b: 0.26, a: 1.0 },
+    bg_color_dragging: Color { r: 0.20, g: 0.32, b: 0.42, a: 1.0 },
+    text_color: TEXT,
+    border: Color { r: 0.32, g: 0.35, b: 0.42, a: 1.0 },
+    border_width: 1.0,
+    radius: 3.0,
+    font_size: 11.0,
+    sensitivity: 0.004,
+    range: None,
 };
 
 const STRETCH_MODE_LABELS: &[&str] = &["Raw", "Repitch", "Stretch", "Slice"];
@@ -873,14 +889,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // idiom。group は表示 clip を持たないので clip 選択ではなく track 選択が
     // トリガ（§5.5）。純 audio バスには出ない（§5.6 group_has_visual_content）。
     if let Some(summary) = app.inspector_group_transform_summary() {
-        // group track 選択切替を検知して edit buffer を resync。
-        if app.group_edit_buffer_target != Some(summary.track_id) {
-            let track_id = summary.track_id;
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::ResyncGroupEditBuffers { track_id });
-            }));
-        }
-
         ui.label_at(
             "inspector_group_transform_label",
             "Group Transform",
@@ -899,38 +907,113 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let input_x = area.x + pad + label_w;
         let input_w = row_w - label_w - auto_btn_w - auto_btn_gap;
         let auto_btn_x = input_x + input_w + auto_btn_gap;
+        let track_id = summary.track_id;
+        let gt = summary.transform;
 
         for param in crate::app::GROUP_PARAMS {
+            use common::model::GroupTransformParam as G;
             let idx = crate::app::group_param_index(param);
-            // Rotation だけ degree 表示なので単位を添える。
-            let label = match param {
-                common::model::GroupTransformParam::Rotation => "Rot (°)",
-                _ => crate::app::group_param_label(param),
+            // param 別の (現値, default, 書式, range, sensitivity[units/px], label)。
+            // Rotation は degree 表示 / 入力（model は radians）。
+            #[allow(clippy::type_complexity)]
+            let (value, default, fmt, range, sens, label): (
+                f64,
+                f64,
+                ScrubableNumberFormat,
+                Option<(f64, f64)>,
+                f32,
+                &str,
+            ) = match param {
+                G::X => (gt.x.into(), 0.0, ScrubableNumberFormat::Decimal(3), None, 0.004, "X"),
+                G::Y => (gt.y.into(), 0.0, ScrubableNumberFormat::Decimal(3), None, 0.004, "Y"),
+                G::Rotation => (
+                    gt.rotation_radians.to_degrees().into(),
+                    0.0,
+                    ScrubableNumberFormat::Decimal(1),
+                    None,
+                    1.0,
+                    "Rot (°)",
+                ),
+                G::ScaleX => (
+                    gt.scale_x.into(),
+                    1.0,
+                    ScrubableNumberFormat::Decimal(3),
+                    Some((0.1, 10.0)),
+                    0.01,
+                    "ScaleX",
+                ),
+                G::ScaleY => (
+                    gt.scale_y.into(),
+                    1.0,
+                    ScrubableNumberFormat::Decimal(3),
+                    Some((0.1, 10.0)),
+                    0.01,
+                    "ScaleY",
+                ),
+                G::AnchorX => (
+                    gt.anchor_x.into(),
+                    0.5,
+                    ScrubableNumberFormat::Decimal(3),
+                    Some((0.0, 1.0)),
+                    0.004,
+                    "AnchorX",
+                ),
+                G::AnchorY => (
+                    gt.anchor_y.into(),
+                    0.5,
+                    ScrubableNumberFormat::Decimal(3),
+                    Some((0.0, 1.0)),
+                    0.004,
+                    "AnchorY",
+                ),
+                G::Opacity => (
+                    gt.opacity.into(),
+                    1.0,
+                    ScrubableNumberFormat::Decimal(3),
+                    Some((0.0, 1.0)),
+                    0.004,
+                    "Opacity",
+                ),
             };
-            ui.label_at(
-                (param, "group_label"),
-                label,
-                area.x + pad,
-                y + 5.0,
-                11.0,
-                TEXT_DIM,
-            );
-            let resp = ui.text_input_at(
-                (param, "group_input"),
+            ui.label_at((param, "group_label"), label, area.x + pad, y + 5.0, 11.0, TEXT_DIM);
+            let style =
+                ScrubableNumberStyle { sensitivity: sens, range, ..SCRUB_STYLE_GROUP };
+            let resp = ui.scrubable_number_at(
+                (param, "group_scrub"),
                 Rect { x: input_x, y, w: input_w, h: input_h },
-                &app.group_transform_edit[idx],
-                move |s| {
+                value,
+                default,
+                fmt,
+                &style,
+                "Group Transform",
+                move |v| {
+                    // Rotation は degree 入力 → radians に変換して設定。
+                    let value = if matches!(param, G::Rotation) {
+                        (v as f32).to_radians()
+                    } else {
+                        v as f32
+                    };
                     Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::GroupTransformEditChanged {
+                        app.handle_event(AppEvent::SetGroupTransformField {
+                            track_id,
                             param,
-                            text: s,
+                            value,
                         })
                     })
                 },
             );
-            if resp.committed {
+            // drag / text 編集の開始・終了 edge で undo を 1 step に bracket。
+            let active = resp.dragging || resp.editing_text;
+            let was_active = app.group_scrub_active == Some(param);
+            if active && !was_active {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::CommitGroupTransformEdit { param })
+                    app.group_scrub_active = Some(param);
+                    app.handle_event(AppEvent::BeginGroupTransformDrag);
+                }));
+            } else if !active && was_active {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.group_scrub_active = None;
+                    app.handle_event(AppEvent::EndGroupTransformDrag);
                 }));
             }
             let auto_on = summary.automated[idx];

@@ -365,6 +365,9 @@ pub struct GroupTransformInspectorSummary {
     pub track_id: u32,
     /// `group_param_index` 順に、各 param の `GroupTransform` lane の有無。
     pub automated: [bool; 8],
+    /// 編集対象の base transform（`group_transform` 無しなら default）。
+    /// inspector の scrubable_number が毎フレーム現値として表示する。
+    pub transform: common::model::GroupTransform,
 }
 
 /// inspector / resync が走査する `GroupTransformParam` の固定順
@@ -1081,15 +1084,11 @@ pub struct AppData {
     /// で書き戻し。
     pub clip_image_rotation_edit_text: String,
 
-    /// v19 (`docs/plan_tachie_group_transform.md` §5.5): 選択中 visual group
-    /// の transform 数値入力欄 buffer。index 順 = [X, Y, Rotation, ScaleX,
-    /// ScaleY, AnchorX, AnchorY, Opacity]（`group_param_index` 参照）。Rotation
-    /// は degree 表示、commit 時に radians 変換。`group_edit_buffer_target` の
-    /// group track id が現選択と違えば `ResyncGroupEditBuffers` で再構築する。
-    pub group_transform_edit: [String; 8],
-    /// `group_transform_edit` が現在どの group track の値を保持しているか。
-    /// `None` = 未ロード。inspector が選択切替を検知して resync を発火する。
-    pub group_edit_buffer_target: Option<u32>,
+    /// v19 (`docs/plan_tachie_group_transform.md` §5.5): inspector の
+    /// scrubable_number で transform を drag / text 編集中の param。drag・編集の
+    /// 開始/終了 edge を検知して `BeginGroupTransformDrag` / `End` を発火し、
+    /// 一連の操作を undo 1 step に bracket するための tracker（`None` = idle）。
+    pub group_scrub_active: Option<common::model::GroupTransformParam>,
 
     /// docs/plan_text_overlay.md §4 P5: text inspector の edit buffer 群。
     /// `text` / `font_family` は文字列 field なので standalone、 残 23
@@ -1381,8 +1380,7 @@ impl AppData {
             clip_image_h_edit_text: String::new(),
             clip_image_opacity_edit_text: String::new(),
             clip_image_rotation_edit_text: String::new(),
-            group_transform_edit: Default::default(),
-            group_edit_buffer_target: None,
+            group_scrub_active: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             is_help_open: false,
@@ -2233,7 +2231,6 @@ impl AppData {
                 | AppEvent::RemoveTextAutomationLane { .. }
                 | AppEvent::AddGroupAutomationLane { .. }
                 | AppEvent::RemoveGroupAutomationLane { .. }
-                | AppEvent::CommitGroupTransformEdit { .. }
                 | AppEvent::CreateAutomationClip { .. }
                 | AppEvent::DeleteLane { .. }
                 | AppEvent::AddAutomationPoint { .. }
@@ -2900,19 +2897,6 @@ pub enum AppEvent {
     AddGroupAutomationLane { param: common::model::GroupTransformParam },
     /// automate toggle 再押しで `GroupTransform(param)` lane を削除。undoable。
     RemoveGroupAutomationLane { param: common::model::GroupTransformParam },
-    /// group transform 数値入力欄の per-character 更新（buffer のみ更新、
-    /// parse / commit はしない、非 undoable）。
-    GroupTransformEditChanged {
-        param: common::model::GroupTransformParam,
-        text: String,
-    },
-    /// group transform 数値入力欄の commit（Enter / focus 喪失）。buffer を
-    /// parse して `Track.group_transform.<field>` に設定。Rotation は
-    /// degree→radians、Scale は 0.1..=10 clamp。失敗時は status + resync。undoable。
-    CommitGroupTransformEdit { param: common::model::GroupTransformParam },
-    /// group track 選択切替時に `Track.group_transform`（無ければ default）から
-    /// edit buffer を再構築。非 undoable。
-    ResyncGroupEditBuffers { track_id: u32 },
     /// preview 上の group box drag 開始（undo snapshot を 1 個取る。group lane
     /// recording は未対応）。undoable。
     BeginGroupTransformDrag,
@@ -4106,24 +4090,13 @@ impl AppData {
             AppEvent::RemoveGroupAutomationLane { param } => {
                 self.remove_group_automation_lane(param);
             }
-            AppEvent::GroupTransformEditChanged { param, text } => {
-                self.group_transform_edit[group_param_index(param)] = text;
-            }
-            AppEvent::CommitGroupTransformEdit { param } => {
-                self.commit_group_transform_edit(param);
-            }
-            AppEvent::ResyncGroupEditBuffers { track_id } => {
-                self.resync_group_edit_buffers(track_id);
-            }
             AppEvent::BeginGroupTransformDrag => {
                 // snapshot は is_undoable 経由。group lane recording は未対応。
             }
             AppEvent::SetGroupTransformField { track_id, param, value } => {
+                // scrubable_number / preview drag からの live 設定。inspector は
+                // track.group_transform を毎フレーム直接読むので resync 不要。
                 self.set_group_transform_field(track_id, param, value);
-                // inspector の数値も live 同期。
-                if self.group_edit_buffer_target == Some(track_id) {
-                    self.resync_group_edit_buffers(track_id);
-                }
             }
             AppEvent::EndGroupTransformDrag => {}
             AppEvent::BeginImagePiPDrag => {
@@ -5380,12 +5353,23 @@ impl AppData {
                 // 「復元」 で sidecar に切り替えられる。
                 let sidecar = common::recovery::sidecar_for(&path);
                 if sidecar.exists() && !self.recovery_candidates.contains(&sidecar) {
-                    tracing::info!(
-                        sidecar = %sidecar.display(),
-                        "sidecar autosave detected on open"
-                    );
-                    self.recovery_candidates.push(sidecar);
-                    self.show_recovery_modal = true;
+                    // sidecar が .daw より新しいときだけ復元候補に出す。 古い
+                    // (= 保存後の消し損ね / unclean exit 残骸) は stale なので
+                    // 提示せず掃除する (delete-on-save の取りこぼし救済)。
+                    if Self::recovery_sidecar_is_newer(&sidecar, &path) {
+                        tracing::info!(
+                            sidecar = %sidecar.display(),
+                            "sidecar autosave detected on open (newer than saved file)"
+                        );
+                        self.recovery_candidates.push(sidecar);
+                        self.show_recovery_modal = true;
+                    } else {
+                        tracing::info!(
+                            sidecar = %sidecar.display(),
+                            "stale sidecar autosave (not newer than saved file); removing"
+                        );
+                        let _ = std::fs::remove_file(&sidecar);
+                    }
                 }
                 self.push_recent(path);
             }
@@ -5499,6 +5483,49 @@ impl AppData {
                     "autosave failed"
                 );
             }
+        }
+    }
+
+    /// 手動保存成功後に、 この project に紐づく autosave を削除する。
+    /// `maybe_autosave` が書く 2 箇所 (sidecar / session recovery file) を両方
+    /// 消し、 `recovery_candidates` からも除く。 これで save 直後に unclean
+    /// exit (クラッシュ / 強制終了) しても、 次回起動の recovery modal に
+    /// 「save より古い」 候補が出ず、 保存内容を巻き戻すリスクを断つ。
+    fn clear_stale_autosave_after_save(&mut self, saved_path: &Path) {
+        let mut stale: Vec<PathBuf> = vec![common::recovery::sidecar_for(saved_path)];
+        if let Some(dir) = self.app_dirs.as_ref().map(|d| d.recovery_dir()) {
+            stale.push(common::recovery::recovery_path_for_session(
+                &dir,
+                &self.recovery_session_id,
+            ));
+        }
+        for p in stale {
+            if p.exists() {
+                match std::fs::remove_file(&p) {
+                    Ok(()) => {
+                        tracing::info!(path = %p.display(), "removed stale autosave after save")
+                    }
+                    Err(e) => tracing::warn!(
+                        error = ?e,
+                        path = %p.display(),
+                        "failed to remove stale autosave after save"
+                    ),
+                }
+            }
+            self.recovery_candidates.retain(|c| c != &p);
+        }
+        // 次の autosave までの 60s タイマーを reset (= save 直後に即書き戻さない)。
+        self.last_autosave = std::time::Instant::now();
+    }
+
+    /// sidecar autosave が元 `.daw` より新しい (= 前回 unclean exit 時の未保存
+    /// 変更を表す) かを mtime で判定する。 どちらかの mtime が取れない場合は
+    /// 安全側に倒して `true` (= 候補に出して user 判断に委ねる) を返す。
+    fn recovery_sidecar_is_newer(sidecar: &Path, daw: &Path) -> bool {
+        let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        match (mtime(sidecar), mtime(daw)) {
+            (Some(s), Some(d)) => s > d,
+            _ => true,
         }
     }
 
@@ -6045,6 +6072,36 @@ impl AppData {
             Ok(()) => {
                 tracing::info!(path = %path.display(), "saved project");
                 self.is_dirty = false;
+                // 保存成功後、 この project の autosave (sidecar + 未保存→Save As
+                // 用の session recovery file) を削除する。 save 後の .daw が
+                // authoritative なので、 古い autosave が残ると unclean exit 後の
+                // 次回 Open / 起動で recovery modal が「save より古い」 状態を提示し、
+                // 復元すると保存内容を巻き戻してしまう。
+                self.clear_stale_autosave_after_save(path);
+                // 保存内容が source of truth になったので、 同 file の sidecar
+                // autosave (前回までの未保存 snapshot) を削除する。 残すと
+                // クラッシュ / 強制終了でクリーン終了処理が走らなかったとき、
+                // 次回 Open 時に recovery modal が「save より古い状態」 を復元
+                // 候補として提示してしまう (= 保存した作業の巻き戻し事故)。
+                let sidecar = common::recovery::sidecar_for(path);
+                match std::fs::remove_file(&sidecar) {
+                    Ok(()) => tracing::info!(
+                        sidecar = %sidecar.display(),
+                        "removed stale sidecar autosave after save"
+                    ),
+                    // NotFound は正常 (autosave 未作成 / Save As の新規 path)。
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => tracing::warn!(
+                        error = ?e,
+                        sidecar = %sidecar.display(),
+                        "failed to remove sidecar autosave after save"
+                    ),
+                }
+                // この session で既に modal 候補に入っていた場合も除く。
+                self.recovery_candidates.retain(|p| p != &sidecar);
+                if self.recovery_candidates.is_empty() {
+                    self.show_recovery_modal = false;
+                }
                 // 「最近開いたファイル」 にも入れる (= save した file は次回
                 // 開きたい候補なので、 user 期待としては自然)。 さらに
                 // 「最近保存したファイル」 別 list にも記録する。
@@ -8005,64 +8062,6 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
-    /// group track 選択切替時に `Track.group_transform`（無ければ default）から
-    /// 8 つの edit buffer を再構築。Rotation は degree 表示。
-    fn resync_group_edit_buffers(&mut self, track_id: u32) {
-        use common::model::GroupTransformParam as G;
-        let gt = self
-            .song
-            .track_by_id(track_id)
-            .and_then(|t| t.group_transform)
-            .unwrap_or_default();
-        self.group_edit_buffer_target = Some(track_id);
-        self.group_transform_edit[group_param_index(G::X)] = format!("{:.3}", gt.x);
-        self.group_transform_edit[group_param_index(G::Y)] = format!("{:.3}", gt.y);
-        self.group_transform_edit[group_param_index(G::Rotation)] =
-            format!("{:.1}", gt.rotation_radians.to_degrees());
-        self.group_transform_edit[group_param_index(G::ScaleX)] =
-            format!("{:.3}", gt.scale_x);
-        self.group_transform_edit[group_param_index(G::ScaleY)] =
-            format!("{:.3}", gt.scale_y);
-        self.group_transform_edit[group_param_index(G::AnchorX)] =
-            format!("{:.3}", gt.anchor_x);
-        self.group_transform_edit[group_param_index(G::AnchorY)] =
-            format!("{:.3}", gt.anchor_y);
-        self.group_transform_edit[group_param_index(G::Opacity)] =
-            format!("{:.3}", gt.opacity);
-    }
-
-    /// group transform 数値入力 commit。buffer を parse して field を設定。
-    /// Rotation は degree→radians、Scale は 0.1..=10、Opacity/Anchor は 0..=1
-    /// に clamp、位置は自由。失敗時は status + resync。
-    fn commit_group_transform_edit(
-        &mut self,
-        param: common::model::GroupTransformParam,
-    ) {
-        use common::model::GroupTransformParam as G;
-        let Some(track_id) = self.group_edit_buffer_target else {
-            return;
-        };
-        let raw = self.group_transform_edit[group_param_index(param)].trim();
-        let Ok(parsed) = raw.parse::<f32>() else {
-            self.status_message = format!(
-                "Group {}: '{}' を数値として解釈できません",
-                group_param_label(param),
-                raw
-            );
-            self.resync_group_edit_buffers(track_id);
-            return;
-        };
-        let value = match param {
-            G::Rotation => parsed.to_radians(),
-            G::ScaleX | G::ScaleY => parsed.clamp(0.1, 10.0),
-            G::Opacity | G::AnchorX | G::AnchorY => parsed.clamp(0.0, 1.0),
-            G::X | G::Y => parsed,
-        };
-        self.set_group_transform_field(track_id, param, value);
-        // commit 後に正規化済みの値を buffer へ書き戻す。
-        self.resync_group_edit_buffers(track_id);
-    }
-
     /// `Track.group_transform`（無ければ default を Some 化）の該当 field を
     /// 設定。`last_touched_param` も更新（touch+A 用）。純 visual なので audio
     /// へは送らない。
@@ -8132,6 +8131,7 @@ impl AppData {
         Some(GroupTransformInspectorSummary {
             track_id: track.id,
             automated,
+            transform: track.group_transform.unwrap_or_default(),
         })
     }
 

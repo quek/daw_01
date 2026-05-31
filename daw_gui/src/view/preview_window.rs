@@ -550,6 +550,29 @@ impl PreviewWindowState {
                         line_width_px: 2.0,
                         clip_rect: None,
                     });
+                    // rotate handle: 上辺中点から 24px 外側へ伸ばす線 + 先端
+                    // マーカー（runner の group_hit_test の rotate 判定位置と一致）。
+                    let top_mid = rotate_pt(rx + rw * 0.5, ry);
+                    let rot_tip = rotate_pt(rx + rw * 0.5, ry - 24.0);
+                    const RHM: f32 = 5.0;
+                    let rot_handle = vec![
+                        daw_ui_renderer::LineSegment { a: top_mid, b: rot_tip, color: STROKE },
+                        daw_ui_renderer::LineSegment {
+                            a: [rot_tip[0] - RHM, rot_tip[1]],
+                            b: [rot_tip[0] + RHM, rot_tip[1]],
+                            color: STROKE,
+                        },
+                        daw_ui_renderer::LineSegment {
+                            a: [rot_tip[0], rot_tip[1] - RHM],
+                            b: [rot_tip[0], rot_tip[1] + RHM],
+                            color: STROKE,
+                        },
+                    ];
+                    self.scene.push_lines(daw_ui_renderer::LineBatch {
+                        segments: std::sync::Arc::from(rot_handle),
+                        line_width_px: 2.0,
+                        clip_rect: None,
+                    });
                     // anchor marker: pivot（= 回転・スケール中心）に小さな十字。
                     const AH: f32 = 7.0;
                     let cross = vec![
@@ -569,6 +592,37 @@ impl PreviewWindowState {
                         line_width_px: 2.0,
                         clip_rect: None,
                     });
+                    // rotate handle: 上辺中点から外側 24px（group_hit_test の
+                    // Rotate 判定位置と一致）。line + 端のノブで掴める位置を明示。
+                    let top_mid = rotate_pt(rx + rw * 0.5, ry);
+                    let rot_knob = rotate_pt(rx + rw * 0.5, ry - 24.0);
+                    self.scene.push_lines(daw_ui_renderer::LineBatch {
+                        segments: std::sync::Arc::from(vec![daw_ui_renderer::LineSegment {
+                            a: top_mid,
+                            b: rot_knob,
+                            color: STROKE,
+                        }]),
+                        line_width_px: 2.0,
+                        clip_rect: None,
+                    });
+                    // handle ノブ（rotate ＋ 4 corner scale）を小四角で描画。
+                    // 4 corner は group_hit_test の Resize 判定位置（= box 角）。
+                    const KNOB: f32 = 9.0;
+                    for [hx, hy] in [rot_knob, c0, c1, c2, c3] {
+                        self.scene.push_rect(daw_ui_renderer::RectCommand {
+                            rect: daw_ui_renderer::Rect::new(
+                                hx - KNOB * 0.5,
+                                hy - KNOB * 0.5,
+                                KNOB,
+                                KNOB,
+                            ),
+                            fill: STROKE,
+                            border: Color::TRANSPARENT,
+                            border_width: 0.0,
+                            radius: [2.0; 4],
+                            clip_rect: None,
+                        });
+                    }
                 }
             }
             // docs/plan_text_overlay.md §4 P3: text overlays drawn on
