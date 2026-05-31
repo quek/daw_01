@@ -333,23 +333,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // hit zone (`audio_db_handle_band_h`) は色と無関係なので、 線色を完全透明に
     // して描画だけ抑制する (drag は引き続き機能する)。
     //
-    // gui_01 #028 / #029 直後の visual feedback (2026-05-09):
-    // automation clip が CloneLinked された後 (refcount >= 2) に widget が
-    // share_group_color の hue + default lightness 0.55 で塗ると、 clip 上の
-    // 名前文字 (default text color = (0.92,0.92,0.94)) との contrast が低く
-    // 読みづらい。 fill / border lightness を暗めに override して contrast
-    // を上げる。 (MIDI clip の linked 表示にも同 style が適用される。)
+    // clip 名の文字色は gui_01 #060 (Phase 89) で fill 輝度由来の auto-contrast
+    // (WCAG relative luminance) が widget 内で default on になったため、 share /
+    // selected fill を暗めに override する旧回避策 (~2026-05-09) は撤去。
+    // gui_01 default の鮮やかな色 (share L=0.55 / selected yellow) に戻し、
+    // 文字色は widget が背景に応じて自動で可読化する。
     let style = ArrangementStyle {
         audio_db_handle_color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
-        share_group_fill_lightness: 0.30,
-        share_group_border_lightness: 0.55,
-        // selected clip の塗り (default = (1.0, 0.85, 0.30) yellow) は default
-        // text color (0.92, 0.92, 0.94 白系) との contrast が低く、 selected
-        // automation clip 名「Volume curve」 が読みづらい (visual feedback
-        // 2026-05-09)。 暗めの blue-grey で contrast 確保。 border は明るめ
-        // で selection マーカー視認性を維持。
-        clip_selected_fill: Color::rgb(0.20, 0.30, 0.50),
-        clip_selected_border: Color::rgb(0.95, 0.95, 1.00),
         ..ArrangementStyle::default()
     };
 
