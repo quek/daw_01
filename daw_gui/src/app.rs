@@ -1090,6 +1090,14 @@ pub struct AppData {
     /// 一連の操作を undo 1 step に bracket するための tracker（`None` = idle）。
     pub group_scrub_active: Option<common::model::GroupTransformParam>,
 
+    /// Video export の進捗 `(done_frames, total_frames)`。background thread が
+    /// `ExportProgress` で更新。`None` = export 非実行。UI が進捗オーバーレイの
+    /// 表示判定に使う。
+    pub export_progress: Option<(u64, u64)>,
+    /// 実行中 export のキャンセルフラグ。UI の Cancel ボタンで `true` にすると
+    /// render loop が次フレームで中断し出力を破棄する。`None` = export 非実行。
+    pub export_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+
     /// docs/plan_text_overlay.md §4 P5: text inspector の edit buffer 群。
     /// `text` / `font_family` は文字列 field なので standalone、 残 23
     /// numeric field + 2 fade beats は `clip_text_num_edits: HashMap<
@@ -1381,6 +1389,8 @@ impl AppData {
             clip_image_opacity_edit_text: String::new(),
             clip_image_rotation_edit_text: String::new(),
             group_scrub_active: None,
+            export_progress: None,
+            export_cancel: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             is_help_open: false,
@@ -3475,6 +3485,18 @@ pub enum AppEvent {
         output_path: PathBuf,
         audio_wav: Option<PathBuf>,
     },
+    /// background export thread が毎フレーム発火（`done` / `total` フレーム）。
+    /// `export_progress` を更新して進捗オーバーレイに反映。非 undoable。
+    ExportProgress { done: u64, total: u64 },
+    /// background export thread の完了通知（成功時は出力 path、失敗 /
+    /// キャンセル時は理由）。`export_progress` / `export_cancel` をクリアして
+    /// status_message に結果を出す。非 undoable。
+    ExportFinished {
+        result: Result<PathBuf, String>,
+    },
+    /// 進捗オーバーレイの Cancel ボタン → 実行中 export の `export_cancel`
+    /// フラグを立てる（render loop が次フレームで中断）。非 undoable。
+    CancelExport,
 
     // -------- Split / Glue (Phase 1 PR7) -----------------------------------
     /// Split clip(s) at the **mouse cursor** (= `AppData
@@ -4649,6 +4671,33 @@ impl AppData {
                     let _ = (output_path, audio_wav);
                     self.status_message =
                         "Video export は Windows 専用 (WMF 経由) です".into();
+                }
+            }
+            AppEvent::ExportProgress { done, total } => {
+                self.export_progress = Some((done, total));
+            }
+            AppEvent::ExportFinished { result } => {
+                self.export_progress = None;
+                self.export_cancel = None;
+                match result {
+                    Ok(path) => {
+                        self.status_message =
+                            format!("Video export 完了: {}", path.display());
+                    }
+                    Err(e) if e == "export cancelled" => {
+                        self.status_message =
+                            "Video export をキャンセルしました".into();
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "export failed");
+                        self.status_message = format!("Video export 失敗: {e}");
+                    }
+                }
+            }
+            AppEvent::CancelExport => {
+                if let Some(flag) = &self.export_cancel {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.status_message = "Video export をキャンセル中...".into();
                 }
             }
             AppEvent::SetClipReversed { target, reversed } => {
@@ -14504,37 +14553,52 @@ impl AppData {
     /// the bottleneck). Surface progress / completion via
     /// `status_message`; failure surfaces the error there too.
     #[cfg(windows)]
+    /// mp4 export を **background thread** で実行する。長尺 / 多レイヤーの
+    /// project は 1 フレーム ~100ms（GPU readback + 動画デコード）で数十秒〜
+    /// 数分かかるため、 GUI スレッド同期だと UI とファイルダイアログが固まる
+    /// （= 旧挙動でハングと誤認されていた）。進捗は `ExportProgress`、完了は
+    /// `ExportFinished` を `event_proxy` 経由で送り、 UI が進捗オーバーレイ +
+    /// Cancel を出す。
     fn action_export_mp4(
         &mut self,
         output_path: PathBuf,
         audio_wav: Option<PathBuf>,
     ) {
+        if self.export_progress.is_some() {
+            self.status_message = "Video export を実行中です".into();
+            return;
+        }
         let project_dir = self
             .file_path
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
+        let song = self.song.clone();
+        let proxy = self.event_proxy.clone();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.export_cancel = Some(cancel.clone());
+        self.export_progress = Some((0, 0));
         self.status_message = format!("Video export 開始: {}", output_path.display());
-        let cfg = crate::render_video::RenderConfig::new(&self.song, &output_path)
-            .with_project_dir(project_dir.as_deref())
-            .with_audio_wav(audio_wav.as_deref());
-        match crate::render_video::render_mp4(&cfg) {
-            Ok(stats) => {
-                self.status_message = format!(
-                    "Video export 完了: {} ({} frames)",
-                    stats.output_path.display(),
-                    stats.frames_written
-                );
-            }
-            Err(e) => {
-                self.status_message =
-                    format!("Video export 失敗: {}: {e}", output_path.display());
-                tracing::error!(
-                    error = %e,
-                    path = %output_path.display(),
-                    "render_mp4 failed"
-                );
-            }
-        }
+        std::thread::spawn(move || {
+            let cfg = crate::render_video::RenderConfig::new(&song, &output_path)
+                .with_project_dir(project_dir.as_deref())
+                .with_audio_wav(audio_wav.as_deref());
+            // 進捗は 5 フレームごと（+ 開始 / 完了）に間引いて送る（毎フレーム
+            // 送ると event queue を圧迫する）。
+            let mut last_sent = 0u64;
+            let mut on_progress = |done: u64, total: u64| {
+                if done == 0 || done >= total || done.saturating_sub(last_sent) >= 5 {
+                    last_sent = done;
+                    proxy.send(AppEvent::ExportProgress { done, total });
+                }
+            };
+            let result = crate::render_video::render_mp4_cancellable(
+                &cfg,
+                &cancel,
+                &mut on_progress,
+            )
+            .map(|stats| stats.output_path);
+            proxy.send(AppEvent::ExportFinished { result });
+        });
     }
 
     /// Split clip(s) at the cursor (= mouse hover beat).

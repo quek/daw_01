@@ -94,6 +94,22 @@ impl<'a> RenderConfig<'a> {
 /// poll if they want a UI progress bar. For MVP we just block the
 /// GUI thread.
 pub fn render_mp4(cfg: &RenderConfig) -> Result<RenderStats, String> {
+    render_mp4_cancellable(
+        cfg,
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut |_, _| {},
+    )
+}
+
+/// `render_mp4` の進捗通知 + キャンセル対応版。background thread で走らせ、
+/// `on_progress(done, total)` を毎フレーム呼ぶ。`cancel` が立ったら出力を
+/// 破棄して `Err("export cancelled")` を返す（同期 export は GUI スレッドを
+/// 長時間ブロックするため、 呼び出し側はこちらを別スレッドで使う）。
+pub fn render_mp4_cancellable(
+    cfg: &RenderConfig,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<RenderStats, String> {
     crate::import_video::ensure_mf_startup_pub()
         .map_err(|e| format!("MFStartup: {e}"))?;
 
@@ -168,6 +184,7 @@ pub fn render_mp4(cfg: &RenderConfig) -> Result<RenderStats, String> {
     // resolution so video / image layer rects map 1:1 to output px.
     let mut offscreen = OffscreenRenderer::new(out_w, out_h)
         .map_err(|e| format!("OffscreenRenderer::new({out_w}x{out_h}): {e:?}"))?;
+    tracing::info!(out_w, out_h, "export: OffscreenRenderer created");
     // Per-source GPU texture caches. Video texture is uploaded fresh
     // each frame (= BGRA bytes from the CPU decoder); image texture is
     // uploaded once at startup and reused for every frame the layer is
@@ -226,7 +243,15 @@ pub fn render_mp4(cfg: &RenderConfig) -> Result<RenderStats, String> {
     // layers leave bars; uncovered regions read as black.
     scene.clear_color = wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
 
+    tracing::info!(total_frames, out_w, out_h, "export: starting frame loop");
+    let mut cancelled = false;
     for frame_index in 0..total_frames {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(frame_index, total_frames, "export: cancelled by user");
+            cancelled = true;
+            break;
+        }
+        on_progress(frame_index, total_frames);
         let frame_seconds = frame_index as f64 / f64::from(framerate);
         let playhead_beat = seconds_to_beat(frame_seconds, cfg.song.bpm);
         scene.primitives.clear();
@@ -256,15 +281,9 @@ pub fn render_mp4(cfg: &RenderConfig) -> Result<RenderStats, String> {
         )?;
     }
 
-    if let Some(mut audio_ctx) = audio {
-        write_all_audio_samples(&writer, &mut audio_ctx)?;
-    }
-
-    unsafe { writer.Finalize() }
-        .map_err(|e| format!("Finalize: {e}"))?;
-
-    // Release every cached GPU texture before `offscreen` drops, so
-    // the wgpu device shutdown sees a clean texture store.
+    // Release every cached GPU texture before `offscreen` drops (cancel /
+    // 正常終了の両方で実行)、 wgpu device shutdown がクリーンな texture store
+    // を見るように。
     for (_, (handle, _, _)) in video_textures.drain() {
         offscreen.destroy_texture(handle);
     }
@@ -272,6 +291,20 @@ pub fn render_mp4(cfg: &RenderConfig) -> Result<RenderStats, String> {
         offscreen.destroy_texture(handle);
     }
 
+    if cancelled {
+        // partial mp4 は Finalize せず破棄する（壊れた中途ファイルを残さない）。
+        drop(writer);
+        let _ = std::fs::remove_file(cfg.output_path);
+        return Err("export cancelled".to_string());
+    }
+
+    if let Some(mut audio_ctx) = audio {
+        write_all_audio_samples(&writer, &mut audio_ctx)?;
+    }
+    unsafe { writer.Finalize() }
+        .map_err(|e| format!("Finalize: {e}"))?;
+
+    on_progress(total_frames, total_frames);
     Ok(RenderStats {
         frames_written: total_frames,
         output_path: cfg.output_path.to_path_buf(),
@@ -1116,4 +1149,5 @@ mod tests {
         assert!(nv12[4] < 128, "U < 128 for red, got {}", nv12[4]);
         assert!(nv12[5] > 128, "V > 128 for red, got {}", nv12[5]);
     }
+
 }
