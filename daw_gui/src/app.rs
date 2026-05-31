@@ -6218,6 +6218,13 @@ impl AppData {
     // -------- Playback -----------------------------------------------------
 
     fn play(&mut self) {
+        // export 中は再生を禁止する。音声 freewheel フェーズの realtime play は
+        // offline render と競合し、書き出される音声を壊しうる（映像フェーズは
+        // 独立だが、 混乱を避けて export 全体で一律に止める）。
+        if self.pending_video_export.is_some() || self.export_progress.is_some() {
+            self.status_message = "Video export 中は再生できません".into();
+            return;
+        }
         // A7: if any plugin is still in the SetSlotPlugin →
         // SlotPluginLoaded round-trip (its `OpenPluginShmem` may not
         // have reached the audio engine yet), queue the Play so every
@@ -14582,6 +14589,10 @@ impl AppData {
         self.pending_video_export = Some(output_path);
         self.export_temp_wav = Some(temp_wav.clone());
         self.status_message = "音声をレンダリング中...".into();
+        // 再生中なら停止（freewheel と realtime play の競合を回避）。
+        if self.is_playing {
+            self.stop();
+        }
         let song = self.song.clone();
         self.send_audio(MainToChild::LoadSong(song));
         self.send_plugin(MainToChild::SetRenderMode(
