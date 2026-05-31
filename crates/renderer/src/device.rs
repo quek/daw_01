@@ -588,6 +588,14 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
     /// サーフェステクスチャ取得不可 (デバイス消失等)。
     #[allow(clippy::too_many_lines)]
     pub fn render(&mut self, scene: &Scene) -> Result<(), RenderError> {
+        // M14 Phase 93 (daw_01 #063): 直前フレームに composite された target を解放 (in-use 解除 +
+        // idle evict)。 **render の冒頭**で呼ぶことで、 surface 取得失敗 (Timeout / Occluded の
+        // frame-skip / SurfaceUnavailable) で早期 return しても pool が in-use のまま膨らむ leak を
+        // 防ぐ。 ここで in-use を解除しても、 この frame で sample される composite target は handle
+        // 経由で texture_store から引かれる (= destroy されない限り valid)、 かつ end_cycle は
+        // idle>閾値 の **未使用** target しか destroy しないので base pass の sampling は壊れない。
+        self.composite_pool.end_cycle(&mut self.texture_store);
+
         // 1. サーフェステクスチャ取得 (wgpu 29 は CurrentSurfaceTexture enum を返す)
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -748,10 +756,6 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
-
-        // M14 Phase 93 (daw_01 #063): この frame の composite target を解放 (in-use 解除 + idle evict)。
-        // base pass は既に submit 済 (= composite texture を sample 済) なので安全。
-        self.composite_pool.end_cycle(&mut self.texture_store);
         Ok(())
     }
 

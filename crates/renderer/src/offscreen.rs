@@ -233,6 +233,10 @@ impl OffscreenRenderer {
     /// staging buffer の `map_async` / `Device::poll` が失敗した場合。
     #[allow(clippy::too_many_lines)]
     pub fn render_to_rgba(&mut self, scene: &Scene) -> Result<Vec<u8>, RenderError> {
+        // M14 Phase 93 (daw_01 #063): 直前の composite target を解放 (Renderer::render と同様、
+        // readback error の早期 return でも pool が in-use のまま残らないよう **冒頭**で呼ぶ)。
+        self.composite_pool.end_cycle(&mut self.texture_store);
+
         let w = self.size.width;
         let h = self.size.height;
 
@@ -416,9 +420,6 @@ impl OffscreenRenderer {
         drop(padded_view);
         staging.unmap();
 
-        // M14 Phase 93 (daw_01 #063): この render cycle の composite target を解放 (base pass は
-        // 既に submit 済 = composite texture を sample 済)。
-        self.composite_pool.end_cycle(&mut self.texture_store);
         Ok(out)
     }
 }

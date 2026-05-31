@@ -102,6 +102,29 @@ fn composite_pool_keeps_distinct_targets_same_size_in_one_frame() {
     );
 }
 
+/// render cycle を跨いで同 size を composite すると、 `end_cycle` が前 cycle の target を解放して
+/// いるので **同じ handle が再利用**される (= 毎フレーム新規確保で pool が膨らむ leak の回帰防止)。
+/// `end_cycle` が走らなければ前 target が in-use のまま残り、 新規 handle が払い出されて assert が落ちる。
+#[test]
+fn composite_pool_reuses_target_across_render_cycles() {
+    let Some(mut r) = try_renderer(16, 16) else { return };
+    let mut base = Scene::new();
+    base.clear_color = Color::BLACK.to_wgpu();
+
+    let h1 = composite_solid(&mut r, 16, 16, Color::rgb(1.0, 0.0, 0.0));
+    let _ = r.render_to_rgba(&base).expect("render cycle 1"); // end_cycle が h1 の target を解放
+    let h2 = composite_solid(&mut r, 16, 16, Color::rgb(0.0, 0.0, 1.0)); // 解放済 target を再利用
+    let _ = r.render_to_rgba(&base).expect("render cycle 2");
+    let h3 = composite_solid(&mut r, 16, 16, Color::rgb(0.0, 1.0, 0.0));
+
+    assert_eq!(
+        h1.raw(),
+        h2.raw(),
+        "render cycle 後の同 size composite が target を再利用していない (pool leak)"
+    );
+    assert_eq!(h2.raw(), h3.raw(), "target 再利用が継続していない");
+}
+
 /// #064: `rotation_pivot` を corner にすると、 中心 pivot とは別の位置に回転する。
 /// quad rect (12,8,8,8) を 90° clockwise 回転:
 ///
