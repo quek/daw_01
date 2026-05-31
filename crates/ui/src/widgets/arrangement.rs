@@ -7581,7 +7581,15 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 // 通常 track 経路の `selected_tracks` / `is_group_set` 判定とは独立 (master は selection
                 // 対象外、 group でもない、 = 「特殊な行」 として描画分岐)。
                 if t.id == MASTER_TRACK_ID {
-                    self.panel(("arr_master_thbg", 0_u32), row, style.master_row_color, 0.0);
+                    // M14 Phase 90 (daw_01 #061): master 行も選択可能。 selected なら通常 track と同じ
+                    // `track_selected_bg`、 非選択は従来の `master_row_color`。 "Master" label / lane
+                    // disclosure はこの背景の上に重畳描画 (色は据え置き)。
+                    let master_bg = if selected_tracks.contains(&t.id) {
+                        style.track_selected_bg
+                    } else {
+                        style.master_row_color
+                    };
+                    self.panel(("arr_master_thbg", 0_u32), row, master_bg, 0.0);
                     let indent = f32::from(t.depth) * style.indent_px; // 0 固定だが既存 idiom 維持
                     let row_for_layout = Rect {
                         x: row.x + indent,
@@ -7625,6 +7633,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     }
                     // Response.track_header_rects に積む (caller が master row の rect 領域を識別可能に)。
                     response.track_header_rects.push((t.id, row));
+                    // M14 Phase 90 (daw_01 #061): master 行の header click → SelectTrack。 通常 track と
+                    // 同じ `clicked_track_for_select` 経路を再利用し、 loop 後の modifier-aware 発行に乗せる
+                    // (Single なら next=[MASTER_TRACK_ID])。 lane disclosure (`+`/`-`) rect 内 release は
+                    // automation collapse トグルが priority なので除外する (disclosure > row-select)。
+                    // master には mute/solo/volume band が無いので row 全体 (disclosure 除く) が対象。
+                    if pointer.primary_just_released
+                        && let Some((rx, ry)) = pointer.pos
+                        && row.contains(rx, ry)
+                        && (t.automation_lanes.is_empty() || !layout.lane_disc_rect.contains(rx, ry))
+                    {
+                        clicked_track_for_select = Some(t.id);
+                    }
                     continue;
                 }
 
@@ -9061,6 +9081,74 @@ mod tests {
             "strip 幅は style.track_color_strip_w (={}): w={}",
             style.track_color_strip_w,
             strip.rect.w
+        );
+    }
+
+    /// M14 Phase 90 (daw_01 #061): master 行の header click (lane disclosure 外) で
+    /// `SelectTrack { next: [MASTER_TRACK_ID] }` を 1 度 emit する。
+    #[test]
+    fn master_row_header_click_emits_select_track() {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        struct Model;
+
+        let mut view = test_view();
+        view.header_w = 180.0; // header pane を出す
+        // master 単独 (automation_lanes 空 = lane disclosure 非アクティブ)。 row 0 = y∈[0,32]。
+        let tracks = vec![track(MASTER_TRACK_ID, "Master", vec![])];
+        let style = ArrangementStyle::default();
+
+        let observed: Arc<Mutex<Vec<Vec<u32>>>> = Arc::new(Mutex::new(Vec::new()));
+        let observed_cb = Arc::clone(&observed);
+
+        // release frame: master row 内 (50, 16) で primary_just_released (press は不要 = catch-all 検出)。
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((50.0, 16.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        };
+
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 400 };
+        let _ = host.frame_to_edits(&Model, &mut scene, screen, input, |_, ui| {
+            let observed_cb = Arc::clone(&observed_cb);
+            let _ = ui.arrangement(
+                "arr_master_sel",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &tracks,
+                view,
+                &[],
+                &[],
+                &[],
+                &[],
+                &style,
+                None,
+                move |req| {
+                    if let ArrangementEditRequest::SelectTrack { next, .. } = &req {
+                        observed_cb.lock().unwrap().push(next.clone());
+                    }
+                    Edit::mutate(|_: &mut Model| {})
+                },
+            );
+        });
+
+        let log = observed.lock().unwrap();
+        assert_eq!(log.len(), 1, "master row click で 1 度だけ SelectTrack: log={log:?}");
+        assert_eq!(
+            log[0],
+            vec![MASTER_TRACK_ID],
+            "Single select の next は master 単独: got {:?}",
+            log[0]
         );
     }
 
