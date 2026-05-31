@@ -79,6 +79,8 @@ fn build_app() -> (
         event_dispatcher_dyn,
         job_dispatcher,
         None,
+        // app_dirs: None = 永続化なし。 実 %LOCALAPPDATA%/daw_01/recent*.json を汚染しない。
+        None,
     );
     (app, audio_rx, plugin_rx, event_dispatcher)
 }

@@ -1,7 +1,7 @@
 //! Persisted main window geometry — `%LOCALAPPDATA%\daw_01\window_state.json`。
 //! 起動時に位置 / サイズ / maximized を復元し、 終了時に最新値を保存する。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -28,10 +28,6 @@ impl Default for WindowState {
             maximized: false,
         }
     }
-}
-
-pub fn default_path() -> Option<PathBuf> {
-    Some(dirs::data_local_dir()?.join("daw_01").join("window_state.json"))
 }
 
 /// ファイルが存在しない / 読めない / parse 失敗のいずれかなら `None`。

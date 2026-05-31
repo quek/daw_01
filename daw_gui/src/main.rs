@@ -148,7 +148,12 @@ fn run_gui(
 
     // 前回終了時の window geometry を復元。 存在しなければ default (1280×800)。
     // 位置は physical (= screen 座標)、 サイズは logical (= DPI 差吸収) で保存。
-    let saved_window = common::window_state::default_path()
+    // per-user データディレクトリの SSoT。 window_state load / AppData の
+    // recent / recovery 永続化が全てここから解決される。
+    let app_dirs = common::app_dirs::AppDirs::production();
+    let saved_window = app_dirs
+        .as_ref()
+        .map(|d| d.window_state())
         .and_then(common::window_state::load);
     let init_state = saved_window.unwrap_or_default();
     let mut window_attrs = WindowAttributes::default()
@@ -175,6 +180,7 @@ fn run_gui(
                 event_dispatcher,
                 job_dispatcher,
                 Some(supervisor),
+                app_dirs.clone(),
             );
 
             spawn_playhead_poller(bridge, proxy.clone());

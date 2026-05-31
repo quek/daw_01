@@ -1002,15 +1002,20 @@ pub struct AppData {
 
     pub is_help_open: bool,
 
+    /// per-user データディレクトリ (recent / recent_saved / recovery /
+    /// window_state の永続化先) の **Single Source of Truth**。 production は
+    /// `AppDirs::production()` (= `%LOCALAPPDATA%/daw_01/`)、 test は
+    /// `AppDirs::under(tempdir)` か `None`。 `None` は「永続化しない」 を
+    /// 意味し、 実ユーザー状態を汚染しない (= dispatcher と同じ DI パターン)。
+    pub app_dirs: Option<common::app_dirs::AppDirs>,
     /// 「最近開いたファイル」 (= Open ダイアログ / OpenRecent 経由で読み込んだ
     /// .daw)。 File メニュー「Open Recent ►」 に表示。 永続化先は
-    /// `common::recent::default_path()` (= `%LOCALAPPDATA%/daw_01/recent.json`)。
+    /// `app_dirs.recent()` (= `%LOCALAPPDATA%/daw_01/recent.json`)。
     pub recent_files: common::recent::RecentFiles,
     /// 「最近保存したファイル」 (= Save / Save As で書き込んだ先)。 File
     /// メニュー「Recently Saved ►」 に表示。 永続化先は
-    /// `common::recent::default_saved_path()` (=
-    /// `%LOCALAPPDATA%/daw_01/recent_saved.json`)。 開いた履歴と分離して
-    /// 「保存先だけ覚えておく」 UX を提供する。
+    /// `app_dirs.recent_saved()` (= `%LOCALAPPDATA%/daw_01/recent_saved.json`)。
+    /// 開いた履歴と分離して「保存先だけ覚えておく」 UX を提供する。
     pub recent_saved: common::recent::RecentFiles,
     /// `recent_files` の filename だけ抽出したキャッシュ。 gui_01 `menu_bar`
     /// API が label に `&'a str` を要求し、 'a が `Ui` の borrow 寿命
@@ -1079,6 +1084,10 @@ pub struct AppData {
 }
 
 impl AppData {
+    // DI composition root: 全ての外部依存 (IPC sender / dispatcher / job /
+    // plugin DB / supervisor / app_dirs) を注入する。 依存数が clippy の
+    // 7-arg 閾値を超えるが、 composition root の性質上自然なので allow。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         audio_tx: UnboundedSender<MainToChild>,
         plugin_tx: UnboundedSender<MainToChild>,
@@ -1088,6 +1097,7 @@ impl AppData {
         event_proxy: Arc<dyn BackgroundDispatcher>,
         voicevox_job: Arc<dyn JobDispatcher>,
         supervisor: Option<Arc<crate::bootstrap::ChildSupervisor>>,
+        app_dirs: Option<common::app_dirs::AppDirs>,
     ) -> Self {
         let song = Song {
             tracks: vec![Track {
@@ -1099,7 +1109,14 @@ impl AppData {
         let initial_peak_display = vec![(0.0, 0.0); song.tracks.len()];
         let initial_bpm = song.bpm;
         let initial_time_sig_num = song.time_sig.0;
-        let recovery_candidates = common::recovery::scan_recovery_files();
+        let recovery_candidates = app_dirs
+            .as_ref()
+            .map(|d| common::recovery::scan_recovery_files(&d.recovery_dir()))
+            .unwrap_or_default();
+        let recent_files =
+            load_recent_list(app_dirs.as_ref().map(|d| d.recent()));
+        let recent_saved =
+            load_recent_list(app_dirs.as_ref().map(|d| d.recent_saved()));
         let show_recovery_modal = !recovery_candidates.is_empty();
         if show_recovery_modal {
             tracing::info!(
@@ -1260,8 +1277,9 @@ impl AppData {
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             is_help_open: false,
-            recent_files: load_recent_files(),
-            recent_saved: load_recent_saved(),
+            app_dirs,
+            recent_files,
+            recent_saved,
             // 初期 label cache は new() の末尾でまとめて初期化する。 Self
             // literal の途中で他 field を参照できないので、 一旦 empty で
             // 構築し、 caller 側で `init_recent_labels` を呼ばずに済むよう
@@ -5240,7 +5258,7 @@ impl AppData {
         self.recent_files.push(path);
         self.recent_files_labels =
             Self::rebuild_recent_labels(&self.recent_files.paths);
-        if let Some(disk) = common::recent::default_path()
+        if let Some(disk) = self.app_dirs.as_ref().map(|d| d.recent())
             && let Err(e) = common::recent::save(&disk, &self.recent_files)
         {
             tracing::warn!(
@@ -5258,7 +5276,7 @@ impl AppData {
         self.recent_saved.push(path);
         self.recent_saved_labels =
             Self::rebuild_recent_labels(&self.recent_saved.paths);
-        if let Some(disk) = common::recent::default_saved_path()
+        if let Some(disk) = self.app_dirs.as_ref().map(|d| d.recent_saved())
             && let Err(e) = common::recent::save(&disk, &self.recent_saved)
         {
             tracing::warn!(
@@ -5281,19 +5299,20 @@ impl AppData {
         let autosave_path = match self.file_path.as_ref() {
             Some(orig) => common::recovery::sidecar_for(orig),
             None => {
-                if let Err(e) = common::recovery::ensure_recovery_dir() {
+                let Some(dir) =
+                    self.app_dirs.as_ref().map(|d| d.recovery_dir())
+                else {
+                    // 永続化先未設定 (= test 等)。 未保存 project の autosave は skip。
+                    return;
+                };
+                if let Err(e) = common::recovery::ensure_recovery_dir(&dir) {
                     tracing::warn!(error = ?e, "failed to create recovery dir");
                     return;
                 }
-                let Some(p) = common::recovery::recovery_path_for_session(
+                common::recovery::recovery_path_for_session(
+                    &dir,
                     &self.recovery_session_id,
-                ) else {
-                    tracing::warn!(
-                        "could not resolve recovery path (no LOCALAPPDATA?)"
-                    );
-                    return;
-                };
-                p
+                )
             }
         };
 
@@ -5374,16 +5393,20 @@ impl AppData {
     /// recovery file が無ければ no-op。 削除失敗は warn でログのみ。
     pub fn on_shutdown(&self) {
         // 自セッションの recovery_dir file
-        if let Some(p) = common::recovery::recovery_path_for_session(
-            &self.recovery_session_id,
-        ) && p.exists()
-            && let Err(e) = std::fs::remove_file(&p)
-        {
-            tracing::warn!(
-                error = ?e,
-                path = %p.display(),
-                "failed to remove recovery file on shutdown"
+        if let Some(dir) = self.app_dirs.as_ref().map(|d| d.recovery_dir()) {
+            let p = common::recovery::recovery_path_for_session(
+                &dir,
+                &self.recovery_session_id,
             );
+            if p.exists()
+                && let Err(e) = std::fs::remove_file(&p)
+            {
+                tracing::warn!(
+                    error = ?e,
+                    path = %p.display(),
+                    "failed to remove recovery file on shutdown"
+                );
+            }
         }
         // sidecar (file_path が Some なら)
         if let Some(orig) = self.file_path.as_ref() {
@@ -14937,27 +14960,16 @@ fn micros_to_beats(micros: u64, bpm: f32) -> f64 {
 }
 
 
-fn load_recent_files() -> common::recent::RecentFiles {
-    let Some(path) = common::recent::default_path() else {
+/// `app_dirs` から解決した path で recent list を復元。 path が `None`
+/// (= 永続化先なし) や読み込み失敗時は空 list を返す (起動を妨げない)。
+fn load_recent_list(path: Option<PathBuf>) -> common::recent::RecentFiles {
+    let Some(path) = path else {
         return Default::default();
     };
     match common::recent::load(&path) {
         Ok(r) => r,
         Err(e) => {
-            tracing::debug!(error = ?e, path = %path.display(), "no recent.json");
-            Default::default()
-        }
-    }
-}
-
-fn load_recent_saved() -> common::recent::RecentFiles {
-    let Some(path) = common::recent::default_saved_path() else {
-        return Default::default();
-    };
-    match common::recent::load(&path) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!(error = ?e, path = %path.display(), "no recent_saved.json");
+            tracing::debug!(error = ?e, path = %path.display(), "recent list load failed");
             Default::default()
         }
     }

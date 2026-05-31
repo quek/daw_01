@@ -128,6 +128,8 @@ impl ScriptHost {
             // 渡しても安全だが、 script 中に子プロセスが死ぬケースは
             // テスト・録画用途では発生しない前提なので None で十分。
             None,
+            // production と同じ実データディレクトリ (= 既存挙動を維持)。
+            common::app_dirs::AppDirs::production(),
         );
         Self {
             bootstrap,

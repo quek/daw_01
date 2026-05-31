@@ -22,30 +22,17 @@ pub fn new_session_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// `%LOCALAPPDATA%\daw_01\recovery\` (Windows) / 同等パス。
-/// `dirs::data_local_dir` が解決できない極端な環境では `None`。
-pub fn recovery_dir() -> Option<PathBuf> {
-    Some(dirs::data_local_dir()?.join("daw_01").join("recovery"))
+/// recovery dir を `create_dir_all` で作る。 `dir` は呼び出し側が
+/// [`crate::app_dirs::AppDirs::recovery_dir`] から解決して渡す。
+pub fn ensure_recovery_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
 }
 
-/// recovery dir を `create_dir_all` で作って返す。
-pub fn ensure_recovery_dir() -> std::io::Result<PathBuf> {
-    let dir = recovery_dir().ok_or_else(|| {
-        std::io::Error::other("could not resolve %LOCALAPPDATA%")
-    })?;
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-/// recovery_dir 内の `*.autosave.daw` を列挙。 ディレクトリが無ければ空 vec。
+/// `dir` 内の `*.autosave.daw` を列挙。 ディレクトリが無ければ空 vec。
 /// I/O エラーは tracing::warn! で記録した上で空 vec を返し、起動シーケンスを止めない。
 /// `NotFound` (初回起動で recovery dir 未作成) は警告対象外。
-pub fn scan_recovery_files() -> Vec<PathBuf> {
-    let Some(dir) = recovery_dir() else {
-        tracing::warn!("recovery scan skipped: could not resolve %LOCALAPPDATA%");
-        return Vec::new();
-    };
-    let entries = match std::fs::read_dir(&dir) {
+pub fn scan_recovery_files(dir: &Path) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(e) => {
@@ -74,9 +61,10 @@ pub fn scan_recovery_files() -> Vec<PathBuf> {
     out
 }
 
-/// 当セッション用 recovery file path (`recovery_dir / "<id>.autosave.daw"`)。
-pub fn recovery_path_for_session(session_id: &str) -> Option<PathBuf> {
-    Some(recovery_dir()?.join(format!("{session_id}{AUTOSAVE_SUFFIX}")))
+/// 当セッション用 recovery file path (`dir / "<id>.autosave.daw"`)。
+/// `dir` は呼び出し側が [`crate::app_dirs::AppDirs::recovery_dir`] から渡す。
+pub fn recovery_path_for_session(dir: &Path, session_id: &str) -> PathBuf {
+    dir.join(format!("{session_id}{AUTOSAVE_SUFFIX}"))
 }
 
 /// `<file>.daw` に対する sidecar autosave path (`<file>.daw.autosave.daw`)。
@@ -147,10 +135,12 @@ mod tests {
 
     #[test]
     fn recovery_path_uses_session_id() {
-        if let Some(p) = recovery_path_for_session("test_session_id") {
-            let name = p.file_name().unwrap().to_str().unwrap();
-            assert!(name.contains("test_session_id"));
-            assert!(name.ends_with(".autosave.daw"));
-        }
+        let p = recovery_path_for_session(
+            Path::new("C:\\appdata\\daw_01\\recovery"),
+            "test_session_id",
+        );
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert!(name.contains("test_session_id"));
+        assert!(name.ends_with(".autosave.daw"));
     }
 }

@@ -676,11 +676,15 @@ impl ApplicationHandler<AppEvent> for Runner {
     /// に永続化して次回起動で復元する。 失敗は log のみ (起動を妨げない)。
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         let Some(state) = self.state.as_ref() else { return };
-        save_main_window_state(&state.window);
+        save_main_window_state(&state.window, state.app.app_dirs.as_ref());
     }
 }
 
-fn save_main_window_state(window: &DawGuiWindow) {
+fn save_main_window_state(
+    window: &DawGuiWindow,
+    app_dirs: Option<&common::app_dirs::AppDirs>,
+) {
+    let Some(path) = app_dirs.map(|d| d.window_state()) else { return };
     let win = window.inner();
     let size = win.inner_size();
     let scale = win.scale_factor();
@@ -692,7 +696,6 @@ fn save_main_window_state(window: &DawGuiWindow) {
         y: pos.y,
         maximized: win.is_maximized(),
     };
-    let Some(path) = common::window_state::default_path() else { return };
     if let Err(e) = common::window_state::save(&path, &state) {
         tracing::warn!(error = ?e, "failed to save window_state.json");
     }

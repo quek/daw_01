@@ -50,6 +50,8 @@ fn build_app() -> (AppData, UnboundedReceiver<MainToChild>) {
         event_dispatcher_dyn,
         job_dispatcher,
         None,
+        // app_dirs: None = 永続化なし。 実 %LOCALAPPDATA%/daw_01/recent*.json を汚染しない。
+        None,
     );
     (app, plugin_rx)
 }

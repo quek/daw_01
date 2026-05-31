@@ -1,3 +1,4 @@
+pub mod app_dirs;
 pub mod audio_bridge;
 pub mod audio_render;
 pub mod automation;
