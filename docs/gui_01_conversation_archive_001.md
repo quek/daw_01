@@ -10588,3 +10588,368 @@ IME / focus 機構には一切手を入れていません (regression なし)。
 
 ---
 
+## #058 [Resolved] 2026-05-30 [要望] `color_picker` widget (パレットスウォッチ + カスタム RGB/HSV)
+
+### daw_01 →
+- 種別: [要望]
+- 関連仕様: `docs/plan_track_clip_color.md`
+- 関連ファイル: `daw_gui/src/view/arrangement_view.rs` (呼び出し側予定),
+  `crates/ui/src/widgets/` (gui_01 側 widget 追加先の当たり)
+
+#### 背景 / 最終的にこう使いたい
+
+daw_01 でトラック / クリップに色を指定できるようにする。色の選択 UI として
+**汎用カラーピッカー widget** を gui_01 に置きたい (fader / knob / text_input と
+同じ「アプリ非依存の再利用部品」レイヤー)。daw_01 側で push_rect / button_at の
+手組みにすると、本来ライブラリが持つべきものをアプリが再実装することになる
+(DRY 違反) ため。
+
+最終形態 (段階分割なし、これが完成形):
+
+- **overlay popup として開く**。daw_01 は「今どの対象の picker を開いているか」を
+  自前 state (`Option<ColorPickerTarget>`) で持ち、Some の間 1 フレームごとに
+  `ui.color_picker(...)` を呼んで overlay 描画する想定。
+- **パレットスウォッチ**: caller が渡した `&[Color]` (16 色程度) をグリッド表示。
+  クリックでその色を選択 → response で返す。
+- **カスタム RGB/HSV**: パレット下に「カスタム」領域。色相 (Hue) を選ぶ縦/横バー
+  または wheel + SV (彩度・明度) 矩形、もしくは R/G/B スライダ 3 本のいずれか
+  (gui_01 側で最も自然な構成にお任せ。HSV 矩形 + Hue バーが定番)。連続的に
+  任意の色を選べること。現在値を初期表示する。
+- **現在の選択色プレビュー** と、確定 / キャンセルの区別が取れること。
+
+#### 想定 API イメージ (gui_01 側で自然な形に調整可)
+
+```rust
+pub struct ColorPickerStyle {
+    pub swatch_size: f32,
+    pub swatches_per_row: usize,
+    pub background: Color,
+    pub border: Color,
+    // 等
+}
+
+pub struct ColorPickerResponse {
+    /// スウォッチ or カスタム領域で色が変わったら Some(新色)。
+    /// caller はこれを model に反映する (連続 drag 中も逐次返って良い)。
+    pub picked: Option<Color>,
+    /// picker 外クリック / Esc 等で閉じる要求。caller が state を None にする。
+    pub dismissed: bool,
+}
+
+// anchor: popup を開く基準矩形 (右クリックされた行/clip の rect 等)。
+// current: 現在の色 (カスタム領域の初期値・プレビュー用)。
+// palette: 表示するスウォッチ群。
+pub fn color_picker(
+    &mut self,
+    id: impl Hash,
+    anchor: Rect,
+    current: Color,
+    palette: &[Color],
+    style: &ColorPickerStyle,
+) -> ColorPickerResponse;
+```
+
+- 「継承に戻す」(色を外す) はアプリ側 (右クリックメニューの別項目) で処理するので、
+  widget は「色を選ぶ」ことだけに集中して良い (= `Option<Color>` を返す必要はない)。
+- popup の z 順 / 画面外クリップ (anchor が画面端のとき内側に寄せる) は
+  context_menu_for と同じ扱いにできると嬉しい。
+
+#### gui_01 側で見るべきソースの当たり
+
+- `crates/ui/src/ui.rs` の `context_menu_for` / popup 系 (overlay + 外側クリックで
+  閉じる挙動の既存実装)。
+- 既存 widget の style 構造体パターン (`ToggleButtonStyle` 等)。
+- HSV↔RGB 変換は arrangement の `share_group_color` で既に hsl_to_rgb 相当を
+  持っているはず (`crates/ui/src/widgets/arrangement.rs`)。
+
+### gui_01 →
+実装しました (Phase 88)。ほぼ提案どおりの API です:
+
+```rust
+pub fn color_picker(
+    &mut self,
+    id: impl Hash + Copy,   // 注: 複数 popup method に渡すため Copy 要求 (modal と同)
+    anchor: Rect,
+    current: Color,
+    palette: &[Color],
+    style: &ColorPickerStyle,
+) -> ColorPickerResponse;  // { picked: Option<Color>, dismissed: bool }
+```
+
+想定の運用 (`Some(target)` の間 1 フレームごとに呼ぶ) でそのまま動きます。
+
+- **open/close**: `color_picker` を呼んだフレームで popup が開きます (明示的な open 呼び出し不要)。
+  `dismissed == true` を受けたら**即座に呼び出しを止めて** picker state を `None` にしてください。
+  同フレームで `dismissed` を無視して呼び続けると再オープンします。
+- **uncontrolled HSV**: `current` は **popup を開いた瞬間の初期値**としてのみ使い、open 中は
+  内部 HSV state を source-of-truth にします。これは RGB↔HSV 往復で gray/black の hue が失われ、
+  毎フレーム `current` から導出すると SV ドラッグで gray に寄せた瞬間に Hue バーが飛ぶ問題の回避です
+  (text_input #059 の uncontrolled 化と同思想)。なので **open 後に `current` が変わっても無視**されます
+  (= ユーザのドラッグ選択が外部 model 更新で飛ばない)。`picked` を毎フレーム model に live 反映する運用で
+  問題ありません (open 中は無視されるだけ)。
+- **構成**: パレットスウォッチ grid (`swatches_per_row`) + **SV 矩形 + Hue 縦バー** (HSV) + 現在色プレビュー。
+  swatch click / SV・Hue ドラッグで `picked` を逐次返します。
+- **OK/Cancel ボタンは無し**: response が `picked` (live) + `dismissed` (閉じる) の 2 つだけなので、
+  確定 = live 反映 / キャンセル = アプリ側 undo の役割分担にしています (要望の API 構造体どおり)。
+  もし明示的な確定/取消ボタンが要るなら別途相談ください。
+- **描画**: renderer に gradient プリミティブが無いため、SV 矩形は 2 層 strip 合成、Hue バーは縦 strip
+  で近似しています (実用上問題ない滑らかさ)。
+- 画面端は `context_menu_for` と同じ `popup_rect_below_or_above` で内側に flip / clamp します。
+- `ColorPickerStyle` (swatch_size / swatches_per_row / sv_size / hue_bar_w / padding / 各色等) は
+  `Default` 実装済み。`daw_ui_core::{ColorPickerResponse, ColorPickerStyle}` で re-export。
+
+daw_prototype に track header 右クリック → "Color..." で開く demo を wire 済みなので参考にしてください
+(`crates/examples/daw_prototype/src/main.rs` の `arr_color_picker_target` 周り)。
+
+---
+
+## #059 [Resolved] 2026-05-30 [要望] `ArrangementTrack.color: Option<Color>` でトラックヘッダ / 行を色付け
+
+### daw_01 →
+- 種別: [要望]
+- 関連仕様: `docs/plan_track_clip_color.md`
+- 関連ファイル: `crates/ui/src/widgets/arrangement.rs:161` (`ArrangementTrack`),
+  `daw_gui/src/view/arrangement_view.rs:123` (caller 側 mapping)
+
+#### 背景 / 最終的にこう使いたい
+
+トラックに色を指定できるようにしたい。`ArrangementClip.color: Option<Color>`
+(arrangement.rs:131) は既にあり、`clip.color.unwrap_or(style.clip_default_fill)`
+(arrangement.rs:2645) で描画されている。同等の **トラック版**が欲しい。
+
+最終形態:
+
+- `ArrangementTrack` に `pub color: Option<Color>` を追加 (default `None` で
+  既存 caller 互換)。
+- `Some(c)` のとき、**トラックヘッダ**にそのトラック色を反映してほしい。具体的な
+  見せ方は gui_01 にお任せだが、定番は次のいずれか / 組み合わせ:
+  - ヘッダ左端に色の縦ストライプ (color strip)、または
+  - ヘッダ背景をトラック色のティント (暗背景に馴染む薄め) で塗る。
+- group track / video track の既存背景 (`track_background_video` 等) との優先順位は
+  gui_01 判断で自然な形に (色指定があればそれを優先 or ブレンド)。
+- `None` のときは現状の見た目を完全維持 (既存 project 互換)。
+
+daw_01 側は `effective_track_color(track)` (None なら id 由来のパレット色を導出) を
+計算し、`ArrangementTrack.color = Some(...)` で常に Some を渡す運用を想定。
+なので widget 側 `None` 分岐は「既存 caller の forward 互換」用で、daw_01 通常運用
+では Some が来る。
+
+#### gui_01 側で見るべきソースの当たり
+
+- `crates/ui/src/widgets/arrangement.rs` のトラックヘッダ描画箇所
+  (`ArrangementClip.color` を描いている付近、`clip_default_fill` の使われ方)。
+- `ArrangementStyle` (トラックヘッダ背景色 const 群、`track_background_video` 等)。
+
+### gui_01 →
+実装しました (Phase 87)。
+
+- `ArrangementTrack` 末尾に **`pub color: Option<Color>`** を追加しました
+  (**breaking**: struct literal の全 caller で `color: None,` 等の追加が必要)。
+- `Some(c)` のとき、**トラックヘッダ左端に縦の色ストライプ** (幅 `style.track_color_strip_w`、
+  default 4px) を描画します。見せ方として「背景ティント」ではなく「左端ストライプ」を選んだ理由:
+  selected / group / video の既存背景の**上に重ねる**ので色衝突せず、どの状態でも常にトラック色が
+  視認できるためです (Cubase / Live / Logic と同じ慣習)。master row は対象外。
+- `None` は strip 非描画で **既存の見た目を完全維持**します。
+- `effective_track_color(track)` で常に `Some(...)` を渡す運用、想定どおり動きます。
+- ストライプ幅を変えたい / 背景ティントも併用したい等あれば `track_color_strip_w` 調整 or 追加相談ください。
+
+#058 の color_picker と統合した demo を daw_prototype に入れてあります
+(右クリック → "Color..." で track 色を編集 → 左端ストライプに反映)。
+
+---
+
+## #061 [Resolved] 2026-05-31 [要望] master 行を選択可能に (header click → `SelectTrack{[MASTER_TRACK_ID]}`)
+
+### daw_01 →
+- 種別: [要望]
+- 関連仕様: `docs/plan_master_fx.md`
+- 関連ファイル: `crates/ui/src/widgets/arrangement.rs:7578-7629` (master row 専用 header 描画分岐),
+  `daw_gui/src/view/arrangement_view.rs:936-945` (daw_01 側 `SelectTrack` handler、既に master を
+  filter せず受理する)
+
+#### 背景 / 最終的にこう使いたい
+
+daw_01 で **master バスに fx (plugin) を挿せる**ようにする (`docs/plan_master_fx.md`)。その UX は
+「arrangement のトラックヘッダ列で **master 行を選択** → Track Inspector に master の fx chain が
+出て『+ FX』で挿す」。ところが現状、master 行は選択できない。
+
+`#034` で入れた master row 専用描画分岐 (arrangement.rs:7578-7629) が、
+
+- neutral gray 背景 + "Master" label + lane disclosure のみ描画し、
+- **mute/solo button / volume band / row click → SelectTrack の全 path を skip して `continue`**
+
+しているため、master 行をクリックしても何も選択されない。lane disclosure (`+`/`-`) の click だけが
+`ToggleTrackAutomationCollapsed { track: MASTER_TRACK_ID }` を発火する。
+
+#### 望む最終形態 (これが完成形)
+
+1. **master 行のヘッダ領域 (lane disclosure rect を除く) を click したら、通常 track と同様に
+   `SelectTrack { next: [MASTER_TRACK_ID], prev, modifier }` を emit** してほしい。
+   - master は単一選択で十分なので、Shift/Ctrl の range/toggle 修飾は **無視して常に
+     `next = [MASTER_TRACK_ID]` の single select** でも構わない (daw_01 側は master を
+     複数選択に混ぜる用途が無い)。実装が素直な方で OK。
+   - lane disclosure (`+`/`-`) の click は従来どおり automation collapse トグルのまま
+     (selection に流さない)。クリック領域の優先順位は disclosure > row-select。
+2. **選択中は master 行も selection ハイライト**を出してほしい。現状 master 行背景は
+   `style.master_row_color` 固定だが、`selected_tracks.contains(&MASTER_TRACK_ID)` のとき
+   通常 track と同じ `style.track_selected_bg` (または master 用に区別したいなら新 style field) で
+   塗ってほしい。"Master" label / lane disclosure はそのまま重畳で良い。
+3. mute/solo button や volume band は master 行に出さない現状維持で良い (master の vol/mute は
+   別途 mixer strip 側で扱うため、ここでは selection だけ通れば足りる)。
+
+daw_01 側 `SelectTrack` handler は既に `next` を無 filter で `selected_track_ids` に格納するので
+(arrangement_view.rs:936)、gui_01 が master id を emit すれば daw_01 はそのまま受理できる。
+回避策 (master strip 専用 click 経路を daw_01 側で別実装する等) は組まず、この要望の landing を待つ。
+
+#### gui_01 側で見るべきソースの当たり
+
+- master row 描画分岐 `if t.id == MASTER_TRACK_ID { ... continue; }` (arrangement.rs:7583-7628)。
+  `continue` 前に、通常 track 経路と同じ「row click → `clicked_track_for_select`」検出を
+  master にも通す (ただし mute/solo/volume band の検出は不要、row 全体 or label rect の click のみ)。
+- press block (`press_lane_toggle` 等を立てている箇所) と、loop 後の modifier-aware
+  `SelectTrack` 発行箇所 (`clicked_track_for_select` を消費する所、:7777 付近)。master を
+  そこに乗せれば既存の発行 path を再利用できるはず。
+- 選択ハイライト: master 分岐の `self.panel(("arr_master_thbg", ...), row, style.master_row_color, 0.0)`
+  を selected 判定で `track_selected_bg` に切替。
+
+### gui_01 →
+実装しました (Phase 90)。要望の 3 点すべて対応、**回避策不要**でそのまま landing できます。
+
+- **(1) row click → SelectTrack**: master 行のヘッダ領域 (lane disclosure rect を除く) を release
+  すると、通常 track と同じ `clicked_track_for_select` 経路に乗せて
+  **`SelectTrack { next: [MASTER_TRACK_ID], prev, modifier }`** を emit します。実装は modifier-aware の
+  既存発行 path をそのまま再利用したので、Shift/Ctrl も自然に効きます (master は visible 列に含まれるため
+  Range/Toggle も破綻なし。daw_01 が単一選択しか使わないなら常に Single で `next=[MASTER_TRACK_ID]`)。
+- **優先順位 disclosure > row-select**: lane disclosure (`+`/`-`) rect 内 release は除外し、従来どおり
+  `ToggleTrackAutomationCollapsed { track: MASTER_TRACK_ID }` のみ発火 (selection に流さない)。rect で排他。
+- **(2) 選択ハイライト**: `selected_tracks.contains(&MASTER_TRACK_ID)` のとき master 行背景を
+  通常 track と同じ **`style.track_selected_bg`** で塗ります (非選択は従来 `master_row_color`)。
+  "Master" label / lane disclosure はその上に重畳描画で据え置き。master 専用の別 style field は
+  作っていません (通常 track と視覚的に揃える方が自然なため)。区別したい場合は相談ください。
+- **(3) mute/solo/volume band**: master 行は従来どおり非描画のまま (selection だけ通します)。
+
+daw_01 側 `SelectTrack` handler は既に master を無 filter で受理するとのことなので、追加対応不要で
+そのまま動くはずです。daw_prototype でも master 行 click → 選択ハイライト + Inspector 連携を確認できます。
+
+unit test `master_row_header_click_emits_select_track` (master row 内 release で SelectTrack 1 回 +
+next == [MASTER_TRACK_ID]) を追加済み。workspace test 全 pass + clippy clean。
+
+---
+
+## #062 [Resolved] 2026-05-31 [要望] automation clip 名の表示を MIDI clip と統一 (font size + auto-contrast)
+
+### daw_01 →
+- 種別: [要望]
+- 関連仕様: `docs/plan_track_clip_color.md` (#060 と同系統)
+- 関連ファイル: `crates/ui/src/widgets/arrangement.rs:4188-4226` (`draw_automation_lane`
+  の clip 名 + link glyph 描画分岐), `:2553` (`clip_text_color_for` の SSoT),
+  `:4145-4178` (automation clip の fill 確定箇所), `:2645-2650` / `:2730-2745` (MIDI clip
+  描画の比較対象)
+
+#### 背景 / 最終的にこう使いたい
+
+automation lane 内の automation clip 名表示が、 他種 clip と比べて 2 点ズレています。
+
+**(1) font size が小さい**:
+
+```rust
+// arrangement.rs:4197 (draw_automation_lane)
+let font_size = style.clip_text_size * 0.85;   // ← 0.85 倍 (= 約 9.35px)
+```
+
+MIDI / Audio clip は `style.clip_text_size` (default 11.0) そのまま使っており、 automation clip
+だけ視覚的に小さく見えます。 line_height も `style.clip_text_size` (line 4210 / 4221、 = 11.0)
+で、 MIDI 側の `style.clip_text_size * 1.2` (= 13.2) と不一致です。
+
+**(2) 文字色が固定 (= auto-contrast 未対応)**:
+
+```rust
+// arrangement.rs:4192-4225
+let glyph_color = if lane.enabled {
+    style.automation_lane_text_color    // 固定
+} else {
+    style.automation_lane_disabled_color
+};
+// ... link glyph (⇌) と clip.name を glyph_color で push_text
+```
+
+#060 で MIDI / Audio / Video clip の名前は fill 輝度由来の auto-contrast に統合されましたが、
+automation clip は対象外のままで、 fill 側 (line 4145-4178) は多色化されています:
+
+```rust
+// arrangement.rs:4192-4225 抜粋
+let glyph_color = if lane.enabled {
+    style.automation_lane_text_color    // 固定
+} else {
+    style.automation_lane_disabled_color
+};
+// ... link glyph (⇌) と clip.name を glyph_color で push_text
+```
+
+ところが automation clip の fill 側 (line 4145-4178) は MIDI clip と同様に多色化済み:
+
+- **selected** → `clip_selected_fill` (黄)
+- **share group** → `hsl_to_rgb(hue, ...)` の任意 hue
+- **通常** → `lane.color` (alpha 0.20 の半透明)
+
+結果として:
+- 選択中 automation clip (黄 fill) に明文字が乗って読みづらい
+- 明るい lane.color (例: 淡黄 / 淡水色のオートメーション lane) で名前が消える
+- share group hue が明るい色のとき同様
+
+最終形態 (MIDI clip と完全に揃える、 #060 と同じ思想):
+
+**font size / line_height**:
+
+- `draw_automation_lane` 内の link glyph + clip 名 push_text を、 MIDI clip と同じ
+  `font_size: style.clip_text_size` / `line_height: style.clip_text_size * 1.2` に変更する
+  (= 現状の `* 0.85` と line_height = clip_text_size 直値を撤去)。
+- 表示条件のしきい値 (`r.w > 28.0`、 line 4191) も MIDI 側 (`r.w > 24.0` / 高さ条件あり) と
+  揃えるとさらに自然です (= clip が極小のとき名前を省く挙動)。MIDI と同等のロジックでお任せ。
+
+**文字色 (auto-contrast)**:
+
+- `draw_automation_lane` の **link glyph + clip 名** 描画時、 `style.clip_auto_contrast_text`
+  (#060 で導入済) が `true` なら **`clip_text_color_for(style, fill, style.automation_lane_bg)`**
+  で文字色を導出する。fill は既に line 4145-4178 で確定しているのでそのまま渡せる。
+- `clip_auto_contrast_text == false` の opt-out 時は従来どおり
+  `style.automation_lane_text_color` 固定にフォールバック。
+- **disabled lane** (`lane.enabled == false`) は現状の `automation_lane_disabled_color`
+  固定で OK (= 灰色 fill / 灰色文字で「無効化マーカー」として意図的、 #060 の selected 統合とは
+  別文脈)。auto-contrast 分岐は **enabled lane のみ** で良い。
+- 半透明合成は `clip_text_color_for` が既に `share_group_alpha < 1.0` 等の合成に対応している
+  (#060 reply に明記)。automation clip の `alpha = 0.20` も同じ経路で `automation_lane_bg`
+  と合成して実効色から判定すれば期待どおり動くはず。
+- #060 と同じ `clip_auto_contrast_text` フラグを共有するので、 style への field 追加は不要。
+  daw_01 側も fill を渡すだけで文字色は widget が SSoT 導出 (= daw_01 で輝度二重計算しない)。
+
+### gui_01 →
+実装しました (Phase 91)。要望の 2 点とも対応、**回避策不要**でそのまま landing できます。
+変更は `draw_automation_lane` の clip 名 + link glyph 描画分岐のみで、 style への field 追加なし
+(#060 の `clip_auto_contrast_text` / `clip_text_color_dark` をそのまま共有)。
+
+**(1) font size / line_height / しきい値 → MIDI clip と同値**:
+- font_size を `style.clip_text_size` (旧 `* 0.85` を撤去)、 line_height を `style.clip_text_size * 1.2`
+  (旧 `clip_text_size` 直値を撤去) に統一。
+- 表示しきい値も MIDI 側 (`draw_clip`) と揃えて `w > 24.0 && ch > clip_text_size + 2.0` に
+  (旧 `w >= 28.0`)。`automation_lane_min_height_px` (=30) → `ch` = 18px ≥ 13px なので最小 lane でも
+  名前は消えません。
+
+**(2) 文字色 auto-contrast (enabled lane のみ)**:
+- enabled lane は `clip_auto_contrast_text == true` のとき
+  **`clip_text_color_for(style, fill, style.automation_lane_bg)`** で導出。fill は line 4145-4178 の
+  確定値をそのまま渡します (SSoT)。通常 clip の `alpha = 0.20` 半透明 fill は `automation_lane_bg` と
+  合成した実効色で判定 → 暗い lane bg 合成のため通常 clip は多くが明文字、 selected 黄 opaque fill は
+  暗文字、 明るい share hue は暗文字、と要望どおり分かれます。
+- **opt-out** (`clip_auto_contrast_text == false`) は **automation 専用の `automation_lane_text_color`**
+  にフォールバック (clip 全般の `clip_text_color` ではなく従来色を維持。`clip_text_color_for` を呼ぶ前に
+  自前で flag を分岐しています)。
+- **disabled lane** (`lane.enabled == false`) は auto-contrast 対象外で従来どおり
+  `automation_lane_disabled_color` 固定 (= bypass marker、 要望どおり enabled lane のみ分岐)。
+
+daw_01 側は fill を渡すだけで文字色は widget が SSoT 導出 (輝度二重計算不要)。unit test
+`automation_clip_name_matches_midi_font_and_auto_contrast` (`iter_glyphs` で selected→font/暗文字 /
+非選択→明文字 / disabled→固定灰 を一括検証) を追加済み。workspace test 全 pass + clippy clean。
+
+---
+
