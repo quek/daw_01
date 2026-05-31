@@ -127,6 +127,9 @@ struct RunnerState {
     /// に戻す。 drag 中の cursor delta を `start_rect` に積み上げて
     /// AppEvent::SetClipImage{X/Y/W/H} を毎フレーム発火する。
     preview_drag: Option<PreviewDragState>,
+    /// 立ち絵 group box を preview 上で drag 中の状態（clip drag とは別経路、
+    /// `docs/plan_tachie_group_transform.md` §5.5）。
+    preview_group_drag: Option<GroupDragState>,
 }
 
 /// preview window 上で PiP rect を drag 中の状態 (`docs/plan_image_
@@ -161,6 +164,119 @@ enum PreviewDragMode {
     Resize { corner: u8 },
     /// 上辺中点から 24 px 外側の rotate handle を引っ張って回転。
     Rotate,
+}
+
+/// preview window 上で立ち絵 group box を drag 中の状態
+/// (`docs/plan_tachie_group_transform.md` §5.5)。clip drag (`PreviewDragState`)
+/// とは別経路: target は track id、編集対象は base `GroupTransform`。
+#[derive(Debug, Clone, Copy)]
+struct GroupDragState {
+    mode: PreviewDragMode,
+    start_cursor: (f32, f32),
+    /// drag 開始時の base transform（cursor delta をこれに積む = 累積誤差なし）。
+    start_transform: common::model::GroupTransform,
+    target_track_id: u32,
+    /// drag 開始時の pivot（= anchor）screen 位置。Rotate / Resize の中心。
+    pivot_screen: (f32, f32),
+    /// Rotate 用: 開始時の pivot→cursor 角度。
+    start_cursor_angle: f32,
+    /// Resize 用: 開始時の pivot→cursor 距離（uniform scale の基準）。
+    start_pivot_dist: f32,
+}
+
+/// 立ち絵 group box の handle hit-test（任意 pivot 回転に対応）。`transform`
+/// は base、`project_box` は letterbox 区域。`group_quad_params` と同一の
+/// rect / pivot / rotation を使うので overlay 描画と完全一致する。
+fn group_hit_test(
+    transform: &common::model::GroupTransform,
+    project_box: (f32, f32, f32, f32),
+    cursor: (f32, f32),
+) -> Option<PreviewDragMode> {
+    let (rx, ry, rw, rh, rot, px, py, _) =
+        crate::group_compose::group_quad_params(transform, project_box);
+    let pivx = rx + px;
+    let pivy = ry + py;
+    let (sin_r, cos_r) = rot.sin_cos();
+    let rotate = |sx: f32, sy: f32| -> (f32, f32) {
+        let lx = sx - pivx;
+        let ly = sy - pivy;
+        (pivx + lx * cos_r - ly * sin_r, pivy + lx * sin_r + ly * cos_r)
+    };
+    let (curx, cury) = cursor;
+    const HIT_R: f32 = 14.0;
+    // rotate handle（上辺中点から 24 px 外側、回転前 y を引いてから回転）。
+    let (rotx, roty) = rotate(rx + rw * 0.5, ry - 24.0);
+    if (curx - rotx).hypot(cury - roty) <= HIT_R {
+        return Some(PreviewDragMode::Rotate);
+    }
+    let corners = [
+        (rotate(rx, ry), 0u8),
+        (rotate(rx + rw, ry), 1),
+        (rotate(rx, ry + rh), 2),
+        (rotate(rx + rw, ry + rh), 3),
+    ];
+    for ((hx, hy), idx) in corners {
+        if (curx - hx).abs() <= HIT_R && (cury - hy).abs() <= HIT_R {
+            return Some(PreviewDragMode::Resize { corner: idx });
+        }
+    }
+    // body: cursor を pivot 基準で逆回転して unrotated rect に内外判定。
+    let lx = (curx - pivx) * cos_r + (cury - pivy) * sin_r;
+    let ly = -(curx - pivx) * sin_r + (cury - pivy) * cos_r;
+    if lx >= -px && lx <= rw - px && ly >= -py && ly <= rh - py {
+        return Some(PreviewDragMode::Move);
+    }
+    None
+}
+
+/// group drag delta を base transform に積んで `SetGroupTransformField` を発火。
+/// Move=位置(x/y)、Rotate=pivot 周り回転、Resize=pivot 中心の uniform scale。
+/// scale の非一様や anchor は inspector の数値で編集する。
+fn handle_group_drag(
+    proxy: &EventLoopProxy<AppEvent>,
+    drag: &GroupDragState,
+    cursor: (f32, f32),
+    screen: (f32, f32),
+    project_resolution: (u32, u32),
+) {
+    use common::model::GroupTransformParam as G;
+    let t = drag.start_transform;
+    let project_box = preview_project_box(screen, project_resolution);
+    let send = |param: G, value: f32| {
+        let _ = proxy.send_event(AppEvent::SetGroupTransformField {
+            track_id: drag.target_track_id,
+            param,
+            value,
+        });
+    };
+    match drag.mode {
+        PreviewDragMode::Move => {
+            let dx = (cursor.0 - drag.start_cursor.0) / project_box.2.max(1.0);
+            let dy = (cursor.1 - drag.start_cursor.1) / project_box.3.max(1.0);
+            send(G::X, t.x + dx);
+            send(G::Y, t.y + dy);
+        }
+        PreviewDragMode::Rotate => {
+            let cur_angle =
+                (cursor.1 - drag.pivot_screen.1).atan2(cursor.0 - drag.pivot_screen.0);
+            send(
+                G::Rotation,
+                t.rotation_radians + (cur_angle - drag.start_cursor_angle),
+            );
+        }
+        PreviewDragMode::Resize { .. } => {
+            // pivot（anchor）中心の uniform scale。pivot→cursor 距離比で倍率。
+            let d1 =
+                (cursor.0 - drag.pivot_screen.0).hypot(cursor.1 - drag.pivot_screen.1);
+            let ratio = if drag.start_pivot_dist > 1.0 {
+                d1 / drag.start_pivot_dist
+            } else {
+                1.0
+            };
+            send(G::ScaleX, (t.scale_x * ratio).clamp(0.1, 10.0));
+            send(G::ScaleY, (t.scale_y * ratio).clamp(0.1, 10.0));
+        }
+    }
 }
 
 /// docs/plan_video_perf.md P4: metadata for one slot in a cached ring
@@ -533,6 +649,7 @@ impl ApplicationHandler<AppEvent> for Runner {
             preview_upload_log_remaining: 60,
             preview_cursor: None,
             preview_drag: None,
+            preview_group_drag: None,
         });
     }
 
@@ -917,6 +1034,17 @@ impl Runner {
                         project_resolution,
                     );
                 }
+                if let Some(gdrag) = state.preview_group_drag {
+                    let size = preview.renderer.size();
+                    let project_resolution = state.app.song.video_resolution;
+                    handle_group_drag(
+                        &self.proxy,
+                        &gdrag,
+                        cursor,
+                        (size.width as f32, size.height as f32),
+                        project_resolution,
+                    );
+                }
             }
             WindowEvent::CursorLeft { .. } => {
                 state.preview_cursor = None;
@@ -978,14 +1106,59 @@ impl Runner {
                             let _ = self.proxy.send_event(begin_ev);
                         }
                     }
-                } else if let Some(drag) = state.preview_drag.take() {
-                    // drag end: lane recording seed のクリア。 begin と同
-                    // kind の End event を送る。
-                    let end_ev = match preview_drag_target_kind(&state.app, drag.target) {
-                        PreviewDragTargetKind::Text => AppEvent::EndTextPiPDrag,
-                        _ => AppEvent::EndImagePiPDrag,
-                    };
-                    let _ = self.proxy.send_event(end_ev);
+                    // 立ち絵 group box drag begin（clip drag が始まらなかったとき
+                    // のみ）。base group_transform を持つ選択中 visual group が対象。
+                    if state.preview_drag.is_none()
+                        && let Some(cursor) = state.preview_cursor
+                        && let Some(track_id) = state.app.cursor_track_id()
+                        && let Some(transform) = state
+                            .app
+                            .song
+                            .track_by_id(track_id)
+                            .and_then(|t| t.group_transform)
+                        && state.app.group_has_visual_content(track_id)
+                    {
+                        let size = preview.renderer.size();
+                        let screen = (size.width as f32, size.height as f32);
+                        let project_resolution = state.app.song.video_resolution;
+                        let project_box = preview_project_box(screen, project_resolution);
+                        if let Some(mode) = group_hit_test(&transform, project_box, cursor) {
+                            let (rx, ry, _rw, _rh, _rot, px, py, _) =
+                                crate::group_compose::group_quad_params(
+                                    &transform,
+                                    project_box,
+                                );
+                            let pivx = rx + px;
+                            let pivy = ry + py;
+                            state.preview_group_drag = Some(GroupDragState {
+                                mode,
+                                start_cursor: cursor,
+                                start_transform: transform,
+                                target_track_id: track_id,
+                                pivot_screen: (pivx, pivy),
+                                start_cursor_angle: (cursor.1 - pivy)
+                                    .atan2(cursor.0 - pivx),
+                                start_pivot_dist: (cursor.0 - pivx)
+                                    .hypot(cursor.1 - pivy),
+                            });
+                            let _ =
+                                self.proxy.send_event(AppEvent::BeginGroupTransformDrag);
+                        }
+                    }
+                } else {
+                    if let Some(drag) = state.preview_drag.take() {
+                        // drag end: lane recording seed のクリア。 begin と同
+                        // kind の End event を送る。
+                        let end_ev =
+                            match preview_drag_target_kind(&state.app, drag.target) {
+                                PreviewDragTargetKind::Text => AppEvent::EndTextPiPDrag,
+                                _ => AppEvent::EndImagePiPDrag,
+                            };
+                        let _ = self.proxy.send_event(end_ev);
+                    }
+                    if state.preview_group_drag.take().is_some() {
+                        let _ = self.proxy.send_event(AppEvent::EndGroupTransformDrag);
+                    }
                 }
             }
             _ => {}

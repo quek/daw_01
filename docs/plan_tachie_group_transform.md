@@ -490,8 +490,12 @@ pub rotation_pivot: Option<(f32, f32)>, // rect 左上相対 px。None = 中心 
 >   `inspector_group_transform_summary`、commit/resync/set_field handler。
 > - **検証**: workspace build / clippy -D warnings / common 191 + daw_gui 102 tests（group_compose
 >   affine 4 件含む）/ **video preview smoke test PASSED**（既存パス非回帰、IPC v19 protocol OK）。**全て未 commit。**
-> - 残: preview 上のアンカー/transform ドラッグ + group 選択オーバーレイ（数値編集で代替可、後続）、
->   実 立ち絵グループでの目視確認（手動）、合成キャンバス supersample（§8.1 案 B）。
+> - Phase 5b ✅ **preview interactive drag** — group box の body=移動 / corner=pivot 中心 uniform
+>   scale / rotate handle=回転（任意 pivot hit-test、`GroupDragState` + `group_hit_test` +
+>   `handle_group_drag`、AppEvent Begin/SetGroupTransformField/End、undo 1 step、inspector live 同期）。
+>   非一様 scale と anchor は数値編集。group 選択オーバーレイ（box + anchor 十字、正確）も実装済。
+> - 残（任意）: 実 立ち絵グループでの目視確認（手動、要マウス）、anchor の drag 移動（AE 式
+>   position 補正付き）は数値編集で代替済み。
 
 1. **gui_01 要望提出**（#063 Request A / #064 Request B）。`docs/gui_01_conversation.md`。
    interim 実装に走らない（`feedback_gui_01_request_before_interim`）。landing は diagnostic 自動検知。

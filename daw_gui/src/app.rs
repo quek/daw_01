@@ -2172,6 +2172,7 @@ impl AppData {
                 | AppEvent::CommitClipImageOpacityEdit
                 | AppEvent::CommitClipImageRotationEdit
                 | AppEvent::BeginImagePiPDrag
+                | AppEvent::BeginGroupTransformDrag
                 | AppEvent::BeginTextPiPDrag
                 | AppEvent::CommitClipTextContentEdit
                 | AppEvent::CommitClipTextFontFamilyEdit
@@ -2912,6 +2913,18 @@ pub enum AppEvent {
     /// group track 選択切替時に `Track.group_transform`（無ければ default）から
     /// edit buffer を再構築。非 undoable。
     ResyncGroupEditBuffers { track_id: u32 },
+    /// preview 上の group box drag 開始（undo snapshot を 1 個取る。group lane
+    /// recording は未対応）。undoable。
+    BeginGroupTransformDrag,
+    /// preview drag 中の live 設定（非 undoable）。`set_group_transform_field`
+    /// + edit buffer resync で inspector も同期。
+    SetGroupTransformField {
+        track_id: u32,
+        param: common::model::GroupTransformParam,
+        value: f32,
+    },
+    /// preview drag 終了（非 undoable、begin に snapshot あり）。
+    EndGroupTransformDrag,
 
     /// docs/plan_text_overlay.md §4 P6: text PiP rect drag で発火する
     /// `SetClipText{X,Y,W,H,Rotation}` 群 (= image と同 idiom)。 lane が
@@ -4102,6 +4115,17 @@ impl AppData {
             AppEvent::ResyncGroupEditBuffers { track_id } => {
                 self.resync_group_edit_buffers(track_id);
             }
+            AppEvent::BeginGroupTransformDrag => {
+                // snapshot は is_undoable 経由。group lane recording は未対応。
+            }
+            AppEvent::SetGroupTransformField { track_id, param, value } => {
+                self.set_group_transform_field(track_id, param, value);
+                // inspector の数値も live 同期。
+                if self.group_edit_buffer_target == Some(track_id) {
+                    self.resync_group_edit_buffers(track_id);
+                }
+            }
+            AppEvent::EndGroupTransformDrag => {}
             AppEvent::BeginImagePiPDrag => {
                 // snapshot は is_undoable 経由で既に取られている (=
                 // handle_event 冒頭の push_undo_snapshot)。 ここでは
