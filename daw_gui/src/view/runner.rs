@@ -1214,6 +1214,26 @@ impl Runner {
             &state.app.song,
             playhead_beat,
         );
+        // v19 (docs/plan_tachie_group_transform.md §5.6): visual group の
+        // active transform を 1 回解決（group track id → resolved transform）。
+        // `group_active_transform` は group_transform / GroupTransform lane が
+        // 無ければ None（= 子は通常 layer として描画、§5.6 派生判定）。
+        let mut active_groups: std::collections::HashMap<u32, common::model::GroupTransform> =
+            std::collections::HashMap::new();
+        for track in &state.app.song.tracks {
+            if let Some(gt) = crate::group_compose::group_active_transform(
+                track,
+                &state.app.song,
+                playhead_beat,
+            ) {
+                active_groups.insert(track.id, gt);
+            }
+        }
+        // group track id → z 順（bottom→top）の子 quad。
+        let mut group_children: std::collections::HashMap<
+            u32,
+            Vec<crate::group_compose::GroupChildQuad>,
+        > = std::collections::HashMap::new();
         for frame_info in image_frames {
             // `AppData::image_texture_cache` stores just the
             // TextureHandle (dimensions come from
@@ -1233,14 +1253,44 @@ impl Runner {
             if dims.0 == 0 || dims.1 == 0 {
                 continue;
             }
-            layers.push(crate::view::preview_window::CompositeLayer {
-                texture: handle,
-                width: dims.0,
-                height: dims.1,
-                alpha: frame_info.alpha,
-                pip_rect: Some((frame_info.x, frame_info.y, frame_info.w, frame_info.h)),
-                rotation_radians: frame_info.rotation_radians,
-            });
+            // owning track の親が active visual group なら、その group へ
+            // bucket（= 1 枚へ合成して親 transform を適用）。さもなくば従来
+            // どおり単独の composite layer として push。
+            let group_id = state
+                .app
+                .song
+                .track_by_id(frame_info.owning_track_id)
+                .and_then(|t| t.parent_group_id)
+                .filter(|g| active_groups.contains_key(g));
+            if let Some(g) = group_id {
+                group_children.entry(g).or_default().push(
+                    crate::group_compose::GroupChildQuad {
+                        texture: handle,
+                        dest: (
+                            frame_info.x,
+                            frame_info.y,
+                            frame_info.w,
+                            frame_info.h,
+                        ),
+                        alpha: frame_info.alpha,
+                        rotation_radians: frame_info.rotation_radians,
+                    },
+                );
+            } else {
+                layers.push(crate::view::preview_window::CompositeLayer {
+                    texture: handle,
+                    width: dims.0,
+                    height: dims.1,
+                    alpha: frame_info.alpha,
+                    pip_rect: Some((
+                        frame_info.x,
+                        frame_info.y,
+                        frame_info.w,
+                        frame_info.h,
+                    )),
+                    rotation_radians: frame_info.rotation_radians,
+                });
+            }
         }
         // z_index ascending = bottom→top draw order. Video frames
         // populated `z_index` from `active_sources_at`; image frames
@@ -1261,6 +1311,22 @@ impl Runner {
         // image-on-top convention covers the MV-overlay use case.
         let _ = ();
         preview.set_composite_layers(layers);
+        // v19 (docs/plan_tachie_group_transform.md §5): 立ち絵 group layer を
+        // track 順（決定的）に構築。各 group に resolved transform を付与し、
+        // preview が子を 1 枚へ合成 → 親 affine をかけて push する。
+        let mut group_layers: Vec<crate::group_compose::GroupLayer> = Vec::new();
+        for track in &state.app.song.tracks {
+            if let (Some(children), Some(transform)) =
+                (group_children.remove(&track.id), active_groups.get(&track.id))
+            {
+                group_layers.push(crate::group_compose::GroupLayer {
+                    children,
+                    transform: *transform,
+                    selected: state.app.cursor_track_id() == Some(track.id),
+                });
+            }
+        }
+        preview.set_group_layers(group_layers);
         // docs/plan_text_overlay.md §4 P3: text overlay layers are
         // resolved independently (= no GPU texture, just font / color
         // / rect metadata) and rendered on top of every textured-quad

@@ -8,7 +8,17 @@ use crate::plugin_format::PluginFormat;
 use crate::protocol::PluginSlot;
 use crate::scale::ScaleChange;
 
-/// `18` Track / Clip color: `Track.color: Option<[f32; 3]>` and
+/// `19` 立ち絵 group transform: `Track.group_transform: Option<GroupTransform>`
+/// (位置 X/Y・回転・非一様スケール ScaleX/ScaleY・任意アンカー AnchorX/AnchorY・Opacity の
+/// 2D affine。AE の Transform プロパティ群と同構成) と
+/// `AutomationTarget::GroupTransform(GroupTransformParam)` が追加される。親グループトラック
+/// (= 子が `parent_group_id` で指すトラック) が合成済み立ち絵 1 枚にかける transform で、
+/// 純粋に visual (daw_audio は評価しない)。v18 `.daw` files still load — `group_transform`
+/// defaults to `None` (per `#[serde(default)]`)、appended enum variant も forward-compatible。
+/// See `docs/plan_tachie_group_transform.md`.
+///
+/// Previously:
+///   `18` Track / Clip color: `Track.color: Option<[f32; 3]>` and
 /// `Clip.color: Option<[f32; 3]>` are added (RGB, opaque). For a track,
 /// `None` means "derive a stable palette color from the track id"
 /// (auto-assignment; reorder-stable because it keys off the id, not the
@@ -22,7 +32,6 @@ use crate::scale::ScaleChange;
 /// palette live in `daw_gui` (view layer). See
 /// `docs/plan_track_clip_color.md`.
 ///
-/// Previously:
 ///   `17` Aux send / return: `Track.sends: Vec<Send>` is added — each
 /// `Send` is a parallel, gain-scaled copy of the track's signal routed
 /// into a destination "return" track's input bus (the source's own
@@ -81,7 +90,7 @@ use crate::scale::ScaleChange;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 18;
+pub const CURRENT_VERSION: u32 = 19;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -1086,6 +1095,15 @@ pub struct Track {
     /// v17 files forward-migrate to `None` (= derived palette color).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<[f32; 3]>,
+    /// v19 (`docs/plan_tachie_group_transform.md`): 親グループトラックが合成済み
+    /// 立ち絵 (子パーツを z 順に 1 枚へ合成したもの) にかける 2D affine + opacity。
+    /// `None` ⇒ transform 無し (= identity、立ち絵グループでない通常 / audio
+    /// グループ)。`Some` ⇒ 位置/回転/非一様スケール/任意アンカー/opacity。純粋に
+    /// visual で daw_audio は読まない (group の役割は `parent_group_id` 由来で派生、
+    /// inspector / 合成は §5.6 `group_has_visual_content` で gate)。v18 files
+    /// forward-migrate to `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_transform: Option<GroupTransform>,
 }
 
 /// Where a `Send` taps the source track's signal chain.
@@ -1156,6 +1174,52 @@ impl Default for Track {
             automation_lanes: Vec::new(),
             next_lane_id: 1,
             color: None,
+            group_transform: None,
+        }
+    }
+}
+
+/// v19 (`docs/plan_tachie_group_transform.md` §4.1): 親グループトラックが合成済み
+/// 立ち絵 1 枚にかける 2D affine + opacity。AE の Transform プロパティ群
+/// (Anchor / Position / Scale / Rotation / Opacity) と同構成。合成式は列ベクトル
+/// 左乗算で `M_local = T(pos+anchor)·R(rot)·S(sx,sy)·T(-anchor)`、親子は
+/// `M_world = M_parent·M_local` (トップダウン)。Opacity だけは行列に乗せず合成済み
+/// quad の alpha に適用 (AE 準拠)。値は plain 単位 (automation lane の正規化は
+/// `crate::automation::plain_to_norm` 参照)。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct GroupTransform {
+    /// 位置 X (normalized project 座標、0..1 が preview 幅)。アンカー基準位置への
+    /// オフセット (AE 同様、`pos = 0` でアンカーが home に留まる)。
+    pub x: f32,
+    /// 位置 Y。
+    pub y: f32,
+    /// 2D 回転 (radians、clockwise positive)。アンカーを旋回中心とする。
+    pub rotation_radians: f32,
+    /// 水平スケール倍率 (`1.0` = 等倍)。アンカー中心。非一様可 (`scale_y` と独立)。
+    pub scale_x: f32,
+    /// 垂直スケール倍率。
+    pub scale_y: f32,
+    /// アンカー X (合成キャンバスの normalized 0..1、`0.5` = 中央)。回転・スケール
+    /// 共通の中心。
+    pub anchor_x: f32,
+    /// アンカー Y。
+    pub anchor_y: f32,
+    /// 全体不透明度 (0..1)。transform 行列には乗せず、合成済みグループ quad の
+    /// alpha に適用 (AE 準拠)。子個別の opacity は合成前に各子へ焼き込まれる。
+    pub opacity: f32,
+}
+
+impl Default for GroupTransform {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            rotation_radians: 0.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            anchor_x: 0.5,
+            anchor_y: 0.5,
+            opacity: 1.0,
         }
     }
 }
@@ -2118,6 +2182,12 @@ pub enum AutomationTarget {
     /// shadow RGBA + offset xy + blur)。 image と同じく track-level、 text clip が
     /// 存在する時間範囲だけ lane 値が `TextEvent.<field>` を override。
     TextBuiltin(TextBuiltinParam),
+    /// v19 (`docs/plan_tachie_group_transform.md` §4.3): 親グループトラックの
+    /// 2D affine + opacity を automation する。`TrackBuiltin` (volume/pan) と同じ
+    /// **クリップ非依存のトラックレベルパラメータ** — image/text clip の有無に
+    /// 関係なく、グループが子を描画している間ずっと適用される。純粋に visual で
+    /// daw_audio は評価しない (`daw_audio/src/automation.rs` の `_ => continue`)。
+    GroupTransform(GroupTransformParam),
 }
 
 /// Built-in track parameter selector for `AutomationTarget::TrackBuiltin`.
@@ -2172,6 +2242,23 @@ pub enum ImageBuiltinParam {
     /// 実用範囲 `-π..=π`、 範囲外は描画時に modulo 2π で正規化。 normalize
     /// 0..=1 は `(plain + π) / (2π)` mapping (Pan -1..=1 と同 idiom)。
     Rotation,
+}
+
+/// v19 (`docs/plan_tachie_group_transform.md` §4.3): `AutomationTarget::
+/// GroupTransform` の field selector。`ImageBuiltinParam` と同じ Copy tag enum。
+/// 正規化 (UI の 0..=1) は target ごとに `crate::automation::plain_to_norm` で
+/// 定義: X/Y/AnchorX/AnchorY/Opacity は 0..=1 恒等、Rotation は Pan idiom
+/// `(plain+π)/(2π)`、ScaleX/ScaleY は 0.1..10 の log space。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
+pub enum GroupTransformParam {
+    X,
+    Y,
+    Rotation,
+    ScaleX,
+    ScaleY,
+    AnchorX,
+    AnchorY,
+    Opacity,
 }
 
 /// Per-segment interpolation between two adjacent automation points.
@@ -2602,12 +2689,13 @@ mod tests {
 
     #[test]
     fn current_version_is_pinned() {
-        // Bumped to 18 for track / clip color: `Track.color` and
-        // `Clip.color` (`Option<[f32; 3]>`) are added. v17 files
-        // forward-migrate via `#[serde(default)]` (both `None`). Pinning
-        // the constant catches accidental rollback. See
-        // `docs/plan_track_clip_color.md`.
-        assert_eq!(CURRENT_VERSION, 18);
+        // Bumped to 19 for 立ち絵 group transform: `Track.group_transform`
+        // (`Option<GroupTransform>`) and `AutomationTarget::GroupTransform`
+        // are added. v18 files forward-migrate via `#[serde(default)]`
+        // (`None`) and the appended enum variant. Pinning the constant
+        // catches accidental rollback. See
+        // `docs/plan_tachie_group_transform.md`.
+        assert_eq!(CURRENT_VERSION, 19);
     }
 
     #[test]

@@ -73,6 +73,13 @@ pub struct PreviewWindowState {
     /// via `gui_01` `Scene::push_text` (= the GlyphArea pipeline
     /// composites outline + shadow + rotation internally, Phase 78).
     pub text_layers: Vec<crate::text_compose::ActiveTextFrame>,
+    /// v19 (`docs/plan_tachie_group_transform.md` §5): 立ち絵 group layer
+    /// 群。各 `GroupLayer` は子パーツ quad 群 + 解決済み親 transform を持つ。
+    /// `render_placeholder` が `composite_scene_to_texture` で子を 1 枚へ
+    /// 合成 → 親 affine（任意アンカー回転・非一様スケール・opacity）を
+    /// かけて 1 quad として composite layer の上に push する（アプローチ X）。
+    /// runner が毎 frame で `set_group_layers` を呼んで更新。
+    pub group_layers: Vec<crate::group_compose::GroupLayer>,
     /// `docs/plan_image_automation.md` §5 / `plan_image_overlay.md` §4
     /// P5: 選択中 image event の PiP rect (normalized 0..=1)。 `Some`
     /// なら render pass が縁取り + 4 corner handle + center handle を
@@ -167,6 +174,7 @@ impl PreviewWindowState {
             image_textures: std::collections::HashMap::new(),
             composite_layers: Vec::new(),
             text_layers: Vec::new(),
+            group_layers: Vec::new(),
             selection_overlay: None,
             selection_rotation_radians: 0.0,
             // 初期値は scale_to_fit_on_screen に渡された initial_size。
@@ -331,6 +339,7 @@ impl PreviewWindowState {
         }
         self.composite_layers.clear();
         self.text_layers.clear();
+        self.group_layers.clear();
     }
 
     /// Refresh the per-frame composite layer list. Called by the
@@ -340,6 +349,13 @@ impl PreviewWindowState {
     /// shows stale content.
     pub fn set_composite_layers(&mut self, layers: Vec<CompositeLayer>) {
         self.composite_layers = layers;
+    }
+
+    /// v19 (`docs/plan_tachie_group_transform.md` §5): 立ち絵 group layer を
+    /// 毎 frame 更新。`set_composite_layers` の隣で runner が呼ぶ。group は
+    /// ungrouped layer の上（text の下）に合成される。
+    pub fn set_group_layers(&mut self, layers: Vec<crate::group_compose::GroupLayer>) {
+        self.group_layers = layers;
     }
 
     /// Refresh the per-frame text overlay list. Called alongside
@@ -404,7 +420,10 @@ impl PreviewWindowState {
             ),
         );
 
-        if self.composite_layers.is_empty() && self.text_layers.is_empty() {
+        if self.composite_layers.is_empty()
+            && self.group_layers.is_empty()
+            && self.text_layers.is_empty()
+        {
             // No frame / overlay available — show the P4 placeholder
             // text so the user knows the window is alive but waiting
             // on a clip / playhead.
@@ -447,7 +466,110 @@ impl PreviewWindowState {
                     uv_max: (1.0, 1.0),
                     clip_rect: None,
                     rotation_radians: layer.rotation_radians,
+                    rotation_pivot: None,
                 });
+            }
+            // v19 (docs/plan_tachie_group_transform.md §5): 立ち絵 group。
+            // 子を 1 枚へ合成（アプローチ X）→ 親 affine（任意アンカー回転 +
+            // 非一様スケール + opacity）をかけて ungrouped layer の上・text の
+            // 下に 1 quad として push。合成キャンバスは project resolution。
+            let (proj_w, proj_h) = self.project_resolution;
+            for group in &self.group_layers {
+                if group.children.is_empty() {
+                    continue;
+                }
+                // 合成キャンバス = supersample 後の解像度（§8.1 案 B）。
+                let (cw, ch) = crate::group_compose::group_composite_canvas(
+                    (proj_w, proj_h),
+                    &group.transform,
+                );
+                let mut sub = Scene::new();
+                for child in &group.children {
+                    sub.push_textured_quad(TexturedQuad {
+                        rect: daw_ui_renderer::Rect::new(
+                            child.dest.0 * cw as f32,
+                            child.dest.1 * ch as f32,
+                            child.dest.2 * cw as f32,
+                            child.dest.3 * ch as f32,
+                        ),
+                        texture: child.texture,
+                        alpha: child.alpha,
+                        uv_min: (0.0, 0.0),
+                        uv_max: (1.0, 1.0),
+                        clip_rect: None,
+                        rotation_radians: child.rotation_radians,
+                        rotation_pivot: None,
+                    });
+                }
+                let handle = match self.renderer.composite_scene_to_texture(&sub, cw, ch) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "composite 立ち絵 group failed");
+                        continue;
+                    }
+                };
+                let (rx, ry, rw, rh, rot, px, py, alpha) =
+                    crate::group_compose::group_quad_params(&group.transform, project_box);
+                if rw <= 0.0 || rh <= 0.0 || alpha <= 0.0 {
+                    continue;
+                }
+                self.scene.push_textured_quad(TexturedQuad {
+                    rect: daw_ui_renderer::Rect::new(rx, ry, rw, rh),
+                    texture: handle,
+                    alpha,
+                    uv_min: (0.0, 0.0),
+                    uv_max: (1.0, 1.0),
+                    clip_rect: None,
+                    rotation_radians: rot,
+                    rotation_pivot: Some((px, py)),
+                });
+                // 選択中 group は bounding box + anchor marker を描く。quad と
+                // 同一の rect / rotation / pivot を使うので位置は完全一致（近似なし）。
+                if group.selected {
+                    let pivx = rx + px;
+                    let pivy = ry + py;
+                    let (sin_r, cos_r) = rot.sin_cos();
+                    let rotate_pt = |sx: f32, sy: f32| -> [f32; 2] {
+                        let lx = sx - pivx;
+                        let ly = sy - pivy;
+                        [pivx + lx * cos_r - ly * sin_r, pivy + lx * sin_r + ly * cos_r]
+                    };
+                    let c0 = rotate_pt(rx, ry);
+                    let c1 = rotate_pt(rx + rw, ry);
+                    let c2 = rotate_pt(rx + rw, ry + rh);
+                    let c3 = rotate_pt(rx, ry + rh);
+                    const STROKE: Color = Color { r: 0.45, g: 0.82, b: 1.0, a: 0.9 };
+                    let edges = vec![
+                        daw_ui_renderer::LineSegment { a: c0, b: c1, color: STROKE },
+                        daw_ui_renderer::LineSegment { a: c1, b: c2, color: STROKE },
+                        daw_ui_renderer::LineSegment { a: c2, b: c3, color: STROKE },
+                        daw_ui_renderer::LineSegment { a: c3, b: c0, color: STROKE },
+                    ];
+                    self.scene.push_lines(daw_ui_renderer::LineBatch {
+                        segments: std::sync::Arc::from(edges),
+                        line_width_px: 2.0,
+                        clip_rect: None,
+                    });
+                    // anchor marker: pivot（= 回転・スケール中心）に小さな十字。
+                    const AH: f32 = 7.0;
+                    let cross = vec![
+                        daw_ui_renderer::LineSegment {
+                            a: [pivx - AH, pivy],
+                            b: [pivx + AH, pivy],
+                            color: STROKE,
+                        },
+                        daw_ui_renderer::LineSegment {
+                            a: [pivx, pivy - AH],
+                            b: [pivx, pivy + AH],
+                            color: STROKE,
+                        },
+                    ];
+                    self.scene.push_lines(daw_ui_renderer::LineBatch {
+                        segments: std::sync::Arc::from(cross),
+                        line_width_px: 2.0,
+                        clip_rect: None,
+                    });
+                }
             }
             // docs/plan_text_overlay.md §4 P3: text overlays drawn on
             // top of every video / image layer (= title / 字幕 / credits

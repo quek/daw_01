@@ -528,6 +528,7 @@ fn build_frame_scene(
             uv_max: (1.0, 1.0),
             clip_rect: None,
             rotation_radians: 0.0,
+            rotation_pivot: None,
         });
     }
 
@@ -536,10 +537,41 @@ fn build_frame_scene(
     // canvas IS the project resolution, so `x * out_w` is exact).
     let image_layers =
         crate::image_compose::active_image_sources_at(song, playhead_beat);
+    // v19 (docs/plan_tachie_group_transform.md §5): export も preview と同じ
+    // group partition + offscreen 合成（preview/export byte parity 要件）。
+    let mut active_groups: std::collections::HashMap<u32, common::model::GroupTransform> =
+        std::collections::HashMap::new();
+    for track in &song.tracks {
+        if let Some(gt) =
+            crate::group_compose::group_active_transform(track, song, playhead_beat)
+        {
+            active_groups.insert(track.id, gt);
+        }
+    }
+    let mut group_children: std::collections::HashMap<
+        u32,
+        Vec<crate::group_compose::GroupChildQuad>,
+    > = std::collections::HashMap::new();
     for layer in image_layers {
         let Some((texture, _, _)) = image_textures.get(&layer.image_source_id) else {
             continue; // not decoded / failed import
         };
+        // owning track の親が active visual group なら bucket、さもなくば直接 push。
+        let group_id = song
+            .track_by_id(layer.owning_track_id)
+            .and_then(|t| t.parent_group_id)
+            .filter(|g| active_groups.contains_key(g));
+        if let Some(g) = group_id {
+            group_children.entry(g).or_default().push(
+                crate::group_compose::GroupChildQuad {
+                    texture: *texture,
+                    dest: (layer.x, layer.y, layer.w, layer.h),
+                    alpha: layer.alpha,
+                    rotation_radians: layer.rotation_radians,
+                },
+            );
+            continue;
+        }
         let rx = layer.x * out_w as f32;
         let ry = layer.y * out_h as f32;
         let rw = (layer.w * out_w as f32).max(0.0);
@@ -555,6 +587,62 @@ fn build_frame_scene(
             uv_max: (1.0, 1.0),
             clip_rect: None,
             rotation_radians: layer.rotation_radians,
+            rotation_pivot: None,
+        });
+    }
+    // 立ち絵 group を track 順（決定的）に合成 → 親 affine quad を push。
+    for track in &song.tracks {
+        let (Some(children), Some(transform)) =
+            (group_children.remove(&track.id), active_groups.get(&track.id))
+        else {
+            continue;
+        };
+        if children.is_empty() {
+            continue;
+        }
+        let (cw, ch) =
+            crate::group_compose::group_composite_canvas((out_w, out_h), transform);
+        let mut sub = Scene::new();
+        for child in &children {
+            sub.push_textured_quad(TexturedQuad {
+                rect: Rect::new(
+                    child.dest.0 * cw as f32,
+                    child.dest.1 * ch as f32,
+                    child.dest.2 * cw as f32,
+                    child.dest.3 * ch as f32,
+                ),
+                texture: child.texture,
+                alpha: child.alpha,
+                uv_min: (0.0, 0.0),
+                uv_max: (1.0, 1.0),
+                clip_rect: None,
+                rotation_radians: child.rotation_radians,
+                rotation_pivot: None,
+            });
+        }
+        let handle = match offscreen.composite_scene_to_texture(&sub, cw, ch) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(error = %e, "export composite 立ち絵 group failed");
+                    continue;
+                }
+            };
+        let (rx, ry, rw, rh, rot, px, py, alpha) = crate::group_compose::group_quad_params(
+            transform,
+            (0.0, 0.0, out_w as f32, out_h as f32),
+        );
+        if rw <= 0.0 || rh <= 0.0 || alpha <= 0.0 {
+            continue;
+        }
+        scene.push_textured_quad(TexturedQuad {
+            rect: Rect::new(rx, ry, rw, rh),
+            texture: handle,
+            alpha,
+            uv_min: (0.0, 0.0),
+            uv_max: (1.0, 1.0),
+            clip_rect: None,
+            rotation_radians: rot,
+            rotation_pivot: Some((px, py)),
         });
     }
 

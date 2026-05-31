@@ -362,6 +362,38 @@ mod tests {
     }
 
     #[test]
+    fn load_accepts_v18_with_default_group_transform() {
+        // v18 saves had no `group_transform` key on each `Track`. Loading
+        // must succeed and fill it with the serde default (`None`), proving
+        // the v19 field is forward-compatible (enum 末尾追加 = forward-migrate
+        // のみ)。See `docs/plan_tachie_group_transform.md` §4.5.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v18.daw");
+        let v18_json = r#"{
+            "version": 18,
+            "song": {
+                "bpm": 120.0,
+                "time_sig": [4, 4],
+                "length_beats": 64.0,
+                "tracks": [
+                    {
+                        "id": 1,
+                        "name": "Char A",
+                        "volume": 1.0,
+                        "pan": 0.0,
+                        "next_clip_id": 1,
+                        "color": [0.5, 0.5, 0.5]
+                    }
+                ]
+            }
+        }"#;
+        fs::write(&path, v18_json).unwrap();
+        let song = load(&path).expect("v18 must forward-migrate");
+        assert_eq!(song.tracks.len(), 1);
+        assert_eq!(song.tracks[0].group_transform, None);
+    }
+
+    #[test]
     fn load_rejects_legacy_row_based_version() {
         // Version 1 was the row-based format; we no longer support it.
         let dir = tempdir().unwrap();

@@ -359,6 +359,90 @@ pub struct ResizeAutomationClipEntry {
     pub next_len: f64,
 }
 
+/// 立ち絵 group transform inspector 用 snapshot（automate トグルの点灯状態）。
+/// `docs/plan_tachie_group_transform.md` §5.5。
+pub struct GroupTransformInspectorSummary {
+    pub track_id: u32,
+    /// `group_param_index` 順に、各 param の `GroupTransform` lane の有無。
+    pub automated: [bool; 8],
+}
+
+/// inspector / resync が走査する `GroupTransformParam` の固定順
+/// （`group_param_index` の index と一致）。
+pub const GROUP_PARAMS: [common::model::GroupTransformParam; 8] = {
+    use common::model::GroupTransformParam as G;
+    [
+        G::X,
+        G::Y,
+        G::Rotation,
+        G::ScaleX,
+        G::ScaleY,
+        G::AnchorX,
+        G::AnchorY,
+        G::Opacity,
+    ]
+};
+
+/// `GroupTransformParam` の edit buffer / `automated` 配列 index（固定順）。
+pub fn group_param_index(p: common::model::GroupTransformParam) -> usize {
+    use common::model::GroupTransformParam as G;
+    match p {
+        G::X => 0,
+        G::Y => 1,
+        G::Rotation => 2,
+        G::ScaleX => 3,
+        G::ScaleY => 4,
+        G::AnchorX => 5,
+        G::AnchorY => 6,
+        G::Opacity => 7,
+    }
+}
+
+/// inspector ラベル / status 用の短い param 名。
+pub fn group_param_label(p: common::model::GroupTransformParam) -> &'static str {
+    use common::model::GroupTransformParam as G;
+    match p {
+        G::X => "X",
+        G::Y => "Y",
+        G::Rotation => "Rotation",
+        G::ScaleX => "ScaleX",
+        G::ScaleY => "ScaleY",
+        G::AnchorX => "AnchorX",
+        G::AnchorY => "AnchorY",
+        G::Opacity => "Opacity",
+    }
+}
+
+/// `GroupTransform` の指定 param の plain 値を取り出す。
+fn group_transform_field(
+    gt: &common::model::GroupTransform,
+    p: common::model::GroupTransformParam,
+) -> f32 {
+    use common::model::GroupTransformParam as G;
+    match p {
+        G::X => gt.x,
+        G::Y => gt.y,
+        G::Rotation => gt.rotation_radians,
+        G::ScaleX => gt.scale_x,
+        G::ScaleY => gt.scale_y,
+        G::AnchorX => gt.anchor_x,
+        G::AnchorY => gt.anchor_y,
+        G::Opacity => gt.opacity,
+    }
+}
+
+/// track が image / video / text の表示 clip を 1 つでも持つか。
+fn track_has_visual_clip(track: &common::model::Track, song: &common::model::Song) -> bool {
+    track.clips.iter().any(|c| {
+        matches!(
+            song.clip_contents.get(&c.content_id),
+            Some(common::model::ClipContent::Image(_))
+                | Some(common::model::ClipContent::Video(_))
+                | Some(common::model::ClipContent::Text(_))
+        )
+    })
+}
+
 /// gui_01 #028 §7.3: `AutomationTarget` に対する人間可読 display name。
 /// Inspector の knob hint や status_message で使う。`Plugin Param N` は
 /// Phase 2 で IPC 経由で実 plugin の param name に置換する。
@@ -408,6 +492,19 @@ pub fn automation_target_display_name(
                 T::ShadowOffsetX => "Text Shadow OffsetX".into(),
                 T::ShadowOffsetY => "Text Shadow OffsetY".into(),
                 T::ShadowBlur => "Text Shadow Blur".into(),
+            }
+        }
+        AutomationTarget::GroupTransform(p) => {
+            use common::model::GroupTransformParam as G;
+            match p {
+                G::X => "Group X".into(),
+                G::Y => "Group Y".into(),
+                G::Rotation => "Group Rotation".into(),
+                G::ScaleX => "Group ScaleX".into(),
+                G::ScaleY => "Group ScaleY".into(),
+                G::AnchorX => "Group AnchorX".into(),
+                G::AnchorY => "Group AnchorY".into(),
+                G::Opacity => "Group Opacity".into(),
             }
         }
     }
@@ -984,6 +1081,16 @@ pub struct AppData {
     /// で書き戻し。
     pub clip_image_rotation_edit_text: String,
 
+    /// v19 (`docs/plan_tachie_group_transform.md` §5.5): 選択中 visual group
+    /// の transform 数値入力欄 buffer。index 順 = [X, Y, Rotation, ScaleX,
+    /// ScaleY, AnchorX, AnchorY, Opacity]（`group_param_index` 参照）。Rotation
+    /// は degree 表示、commit 時に radians 変換。`group_edit_buffer_target` の
+    /// group track id が現選択と違えば `ResyncGroupEditBuffers` で再構築する。
+    pub group_transform_edit: [String; 8],
+    /// `group_transform_edit` が現在どの group track の値を保持しているか。
+    /// `None` = 未ロード。inspector が選択切替を検知して resync を発火する。
+    pub group_edit_buffer_target: Option<u32>,
+
     /// docs/plan_text_overlay.md §4 P5: text inspector の edit buffer 群。
     /// `text` / `font_family` は文字列 field なので standalone、 残 23
     /// numeric field + 2 fade beats は `clip_text_num_edits: HashMap<
@@ -1274,6 +1381,8 @@ impl AppData {
             clip_image_h_edit_text: String::new(),
             clip_image_opacity_edit_text: String::new(),
             clip_image_rotation_edit_text: String::new(),
+            group_transform_edit: Default::default(),
+            group_edit_buffer_target: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             is_help_open: false,
@@ -2121,6 +2230,9 @@ impl AppData {
                 | AppEvent::RemoveImageAutomationLane { .. }
                 | AppEvent::AddTextAutomationLane { .. }
                 | AppEvent::RemoveTextAutomationLane { .. }
+                | AppEvent::AddGroupAutomationLane { .. }
+                | AppEvent::RemoveGroupAutomationLane { .. }
+                | AppEvent::CommitGroupTransformEdit { .. }
                 | AppEvent::CreateAutomationClip { .. }
                 | AppEvent::DeleteLane { .. }
                 | AppEvent::AddAutomationPoint { .. }
@@ -2780,6 +2892,26 @@ pub enum AppEvent {
     /// TextEvent.field が effective に戻る)。 lane が無ければ no-op。
     /// undoable。
     RemoveTextAutomationLane { field: common::model::TextBuiltinParam },
+
+    /// v19 (`docs/plan_tachie_group_transform.md` §5.5): 選択中 visual group
+    /// track に `GroupTransform(param)` lane を追加（既存あれば visible /
+    /// enabled 復活）。default_value は現 group_transform の field 値。undoable。
+    AddGroupAutomationLane { param: common::model::GroupTransformParam },
+    /// automate toggle 再押しで `GroupTransform(param)` lane を削除。undoable。
+    RemoveGroupAutomationLane { param: common::model::GroupTransformParam },
+    /// group transform 数値入力欄の per-character 更新（buffer のみ更新、
+    /// parse / commit はしない、非 undoable）。
+    GroupTransformEditChanged {
+        param: common::model::GroupTransformParam,
+        text: String,
+    },
+    /// group transform 数値入力欄の commit（Enter / focus 喪失）。buffer を
+    /// parse して `Track.group_transform.<field>` に設定。Rotation は
+    /// degree→radians、Scale は 0.1..=10 clamp。失敗時は status + resync。undoable。
+    CommitGroupTransformEdit { param: common::model::GroupTransformParam },
+    /// group track 選択切替時に `Track.group_transform`（無ければ default）から
+    /// edit buffer を再構築。非 undoable。
+    ResyncGroupEditBuffers { track_id: u32 },
 
     /// docs/plan_text_overlay.md §4 P6: text PiP rect drag で発火する
     /// `SetClipText{X,Y,W,H,Rotation}` 群 (= image と同 idiom)。 lane が
@@ -3954,6 +4086,21 @@ impl AppData {
             }
             AppEvent::RemoveTextAutomationLane { field } => {
                 self.remove_text_automation_lane(field);
+            }
+            AppEvent::AddGroupAutomationLane { param } => {
+                self.add_group_automation_lane(param);
+            }
+            AppEvent::RemoveGroupAutomationLane { param } => {
+                self.remove_group_automation_lane(param);
+            }
+            AppEvent::GroupTransformEditChanged { param, text } => {
+                self.group_transform_edit[group_param_index(param)] = text;
+            }
+            AppEvent::CommitGroupTransformEdit { param } => {
+                self.commit_group_transform_edit(param);
+            }
+            AppEvent::ResyncGroupEditBuffers { track_id } => {
+                self.resync_group_edit_buffers(track_id);
             }
             AppEvent::BeginImagePiPDrag => {
                 // snapshot は is_undoable 経由で既に取られている (=
@@ -7750,6 +7897,220 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
+    // ---- 立ち絵 group transform (`docs/plan_tachie_group_transform.md` §5.5) --
+
+    /// 選択中（cursor）group track に `GroupTransform(param)` lane を追加。
+    /// 既存があれば visible / enabled 復活のみ。default_value は現
+    /// `group_transform` の field 値（plain）。`add_image_automation_lane` と同型。
+    fn add_group_automation_lane(&mut self, param: common::model::GroupTransformParam) {
+        use common::model::{AutomationLane, AutomationTarget};
+        let Some(track_id) = self.cursor_track_id() else {
+            self.status_message =
+                "Group Transform: group track を選択してください".into();
+            return;
+        };
+        let target = AutomationTarget::GroupTransform(param);
+        if let Some(track) = self.song.track_by_id_mut(track_id)
+            && let Some(lane) =
+                track.automation_lanes.iter_mut().find(|l| l.target == target)
+        {
+            lane.visible = true;
+            lane.enabled = true;
+            self.expanded_automation_tracks.insert(track_id);
+            self.status_message = format!(
+                "Group Automation lane '{}' は既に存在します",
+                automation_target_display_name(&target)
+            );
+            self.sync_song_to_plugin_host();
+            return;
+        }
+        let gt = self
+            .song
+            .track_by_id(track_id)
+            .and_then(|t| t.group_transform)
+            .unwrap_or_default();
+        let default_value = f64::from(group_transform_field(&gt, param));
+        let Some(track) = self.song.track_by_id_mut(track_id) else {
+            return;
+        };
+        let lane_id = track.alloc_lane_id();
+        track.automation_lanes.push(AutomationLane {
+            id: lane_id,
+            target: target.clone(),
+            default_value,
+            enabled: true,
+            visible: true,
+            height_px: 60,
+            clips: Vec::new(),
+            next_clip_id: 1,
+        });
+        self.expanded_automation_tracks.insert(track_id);
+        self.status_message = format!(
+            "Added group automation lane: {}",
+            automation_target_display_name(&target)
+        );
+        self.sync_song_to_plugin_host();
+    }
+
+    /// 選択中 group track から `GroupTransform(param)` lane を削除。
+    fn remove_group_automation_lane(
+        &mut self,
+        param: common::model::GroupTransformParam,
+    ) {
+        use common::model::AutomationTarget;
+        let Some(track_id) = self.cursor_track_id() else {
+            return;
+        };
+        let target = AutomationTarget::GroupTransform(param);
+        let Some(track) = self.song.track_by_id_mut(track_id) else {
+            return;
+        };
+        let before = track.automation_lanes.len();
+        track.automation_lanes.retain(|l| l.target != target);
+        if before == track.automation_lanes.len() {
+            self.status_message = format!(
+                "Group Automation: {} lane が見つかりません",
+                automation_target_display_name(&target)
+            );
+            return;
+        }
+        self.status_message = format!(
+            "Group Automation lane '{}' を削除しました",
+            automation_target_display_name(&target)
+        );
+        self.sync_song_to_plugin_host();
+    }
+
+    /// group track 選択切替時に `Track.group_transform`（無ければ default）から
+    /// 8 つの edit buffer を再構築。Rotation は degree 表示。
+    fn resync_group_edit_buffers(&mut self, track_id: u32) {
+        use common::model::GroupTransformParam as G;
+        let gt = self
+            .song
+            .track_by_id(track_id)
+            .and_then(|t| t.group_transform)
+            .unwrap_or_default();
+        self.group_edit_buffer_target = Some(track_id);
+        self.group_transform_edit[group_param_index(G::X)] = format!("{:.3}", gt.x);
+        self.group_transform_edit[group_param_index(G::Y)] = format!("{:.3}", gt.y);
+        self.group_transform_edit[group_param_index(G::Rotation)] =
+            format!("{:.1}", gt.rotation_radians.to_degrees());
+        self.group_transform_edit[group_param_index(G::ScaleX)] =
+            format!("{:.3}", gt.scale_x);
+        self.group_transform_edit[group_param_index(G::ScaleY)] =
+            format!("{:.3}", gt.scale_y);
+        self.group_transform_edit[group_param_index(G::AnchorX)] =
+            format!("{:.3}", gt.anchor_x);
+        self.group_transform_edit[group_param_index(G::AnchorY)] =
+            format!("{:.3}", gt.anchor_y);
+        self.group_transform_edit[group_param_index(G::Opacity)] =
+            format!("{:.3}", gt.opacity);
+    }
+
+    /// group transform 数値入力 commit。buffer を parse して field を設定。
+    /// Rotation は degree→radians、Scale は 0.1..=10、Opacity/Anchor は 0..=1
+    /// に clamp、位置は自由。失敗時は status + resync。
+    fn commit_group_transform_edit(
+        &mut self,
+        param: common::model::GroupTransformParam,
+    ) {
+        use common::model::GroupTransformParam as G;
+        let Some(track_id) = self.group_edit_buffer_target else {
+            return;
+        };
+        let raw = self.group_transform_edit[group_param_index(param)].trim();
+        let Ok(parsed) = raw.parse::<f32>() else {
+            self.status_message = format!(
+                "Group {}: '{}' を数値として解釈できません",
+                group_param_label(param),
+                raw
+            );
+            self.resync_group_edit_buffers(track_id);
+            return;
+        };
+        let value = match param {
+            G::Rotation => parsed.to_radians(),
+            G::ScaleX | G::ScaleY => parsed.clamp(0.1, 10.0),
+            G::Opacity | G::AnchorX | G::AnchorY => parsed.clamp(0.0, 1.0),
+            G::X | G::Y => parsed,
+        };
+        self.set_group_transform_field(track_id, param, value);
+        // commit 後に正規化済みの値を buffer へ書き戻す。
+        self.resync_group_edit_buffers(track_id);
+    }
+
+    /// `Track.group_transform`（無ければ default を Some 化）の該当 field を
+    /// 設定。`last_touched_param` も更新（touch+A 用）。純 visual なので audio
+    /// へは送らない。
+    fn set_group_transform_field(
+        &mut self,
+        track_id: u32,
+        param: common::model::GroupTransformParam,
+        value: f32,
+    ) {
+        use common::model::GroupTransformParam as G;
+        let Some(track) = self.song.track_by_id_mut(track_id) else {
+            return;
+        };
+        let gt = track.group_transform.get_or_insert_with(Default::default);
+        match param {
+            G::X => gt.x = value,
+            G::Y => gt.y = value,
+            G::Rotation => gt.rotation_radians = value,
+            G::ScaleX => gt.scale_x = value,
+            G::ScaleY => gt.scale_y = value,
+            G::AnchorX => gt.anchor_x = value,
+            G::AnchorY => gt.anchor_y = value,
+            G::Opacity => gt.opacity = value,
+        }
+        self.last_touched_param = Some(TouchedParam {
+            track_id,
+            target: common::model::AutomationTarget::GroupTransform(param),
+            display_name: format!("Group {}", group_param_label(param)),
+            touched_at: std::time::Instant::now(),
+        });
+    }
+
+    /// group track が「visual group」か（§5.6 派生判定）。subtree に image /
+    /// video / text 表示 clip を持つ track が 1 つでもある、または既に
+    /// `group_transform` データを持つなら true。inspector / 合成の gate。
+    pub fn group_has_visual_content(&self, group_track_id: u32) -> bool {
+        if self
+            .song
+            .track_by_id(group_track_id)
+            .is_some_and(|t| t.group_transform.is_some())
+        {
+            return true;
+        }
+        self.collect_track_subtree_ids(group_track_id).iter().any(|&id| {
+            self.song
+                .track_by_id(id)
+                .is_some_and(|t| track_has_visual_clip(t, &self.song))
+        })
+    }
+
+    /// group inspector 用 summary。cursor track が visual group なら、各 param に
+    /// `GroupTransform(param)` lane があるか（=「A」 トグル点灯）を返す。
+    pub fn inspector_group_transform_summary(
+        &self,
+    ) -> Option<GroupTransformInspectorSummary> {
+        let idx = self.cursor_track_index()?;
+        let track = self.song.tracks.get(idx)?;
+        if !self.is_group_track(track.id) || !self.group_has_visual_content(track.id) {
+            return None;
+        }
+        let mut automated = [false; 8];
+        for param in GROUP_PARAMS {
+            automated[group_param_index(param)] = track.automation_lanes.iter().any(
+                |l| matches!(l.target, common::model::AutomationTarget::GroupTransform(p) if p == param),
+            );
+        }
+        Some(GroupTransformInspectorSummary {
+            track_id: track.id,
+            automated,
+        })
+    }
+
     /// docs/plan_text_overlay.md §4 P8: 選択中 text clip の track に
     /// `TextBuiltin(field)` lane を追加。 既存 lane があれば visible /
     /// enabled を再有効化のみ。 default_value は `lane_default_for_target`
@@ -8151,6 +8512,27 @@ impl AppData {
                     T::ShadowOffsetX => ev.shadow_offset_px.0,
                     T::ShadowOffsetY => ev.shadow_offset_px.1,
                     T::ShadowBlur => ev.shadow_blur_px,
+                })
+            }
+            // Group transform default: 同 track の group_transform (無ければ
+            // GroupTransform::default) の該当 field。 group は表示 clip を持たない
+            // ので image/text のような clip 探索は不要。
+            AutomationTarget::GroupTransform(param) => {
+                use common::model::GroupTransformParam as G;
+                let gt = self
+                    .song
+                    .track_by_id(touched.track_id)
+                    .and_then(|t| t.group_transform)
+                    .unwrap_or_default();
+                f64::from(match param {
+                    G::X => gt.x,
+                    G::Y => gt.y,
+                    G::Rotation => gt.rotation_radians,
+                    G::ScaleX => gt.scale_x,
+                    G::ScaleY => gt.scale_y,
+                    G::AnchorX => gt.anchor_x,
+                    G::AnchorY => gt.anchor_y,
+                    G::Opacity => gt.opacity,
                 })
             }
         }

@@ -867,6 +867,95 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         y += input_h + 12.0;
     }
 
+    // ---- Group Transform section (`docs/plan_tachie_group_transform.md` §5.5) --
+    // cursor track が visual group のとき、立ち絵全体の 2D affine + opacity を
+    // 数値編集 + per-param「A」automate トグルで expose。image inspector と同
+    // idiom。group は表示 clip を持たないので clip 選択ではなく track 選択が
+    // トリガ（§5.5）。純 audio バスには出ない（§5.6 group_has_visual_content）。
+    if let Some(summary) = app.inspector_group_transform_summary() {
+        // group track 選択切替を検知して edit buffer を resync。
+        if app.group_edit_buffer_target != Some(summary.track_id) {
+            let track_id = summary.track_id;
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ResyncGroupEditBuffers { track_id });
+            }));
+        }
+
+        ui.label_at(
+            "inspector_group_transform_label",
+            "Group Transform",
+            area.x + pad,
+            y,
+            12.0,
+            TEXT_DIM,
+        );
+        y += 18.0;
+
+        let row_w = area.w - pad * 2.0;
+        let input_h = 22.0;
+        let label_w = 64.0;
+        let auto_btn_w = 22.0;
+        let auto_btn_gap = 4.0;
+        let input_x = area.x + pad + label_w;
+        let input_w = row_w - label_w - auto_btn_w - auto_btn_gap;
+        let auto_btn_x = input_x + input_w + auto_btn_gap;
+
+        for param in crate::app::GROUP_PARAMS {
+            let idx = crate::app::group_param_index(param);
+            // Rotation だけ degree 表示なので単位を添える。
+            let label = match param {
+                common::model::GroupTransformParam::Rotation => "Rot (°)",
+                _ => crate::app::group_param_label(param),
+            };
+            ui.label_at(
+                (param, "group_label"),
+                label,
+                area.x + pad,
+                y + 5.0,
+                11.0,
+                TEXT_DIM,
+            );
+            let resp = ui.text_input_at(
+                (param, "group_input"),
+                Rect { x: input_x, y, w: input_w, h: input_h },
+                &app.group_transform_edit[idx],
+                move |s| {
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::GroupTransformEditChanged {
+                            param,
+                            text: s,
+                        })
+                    })
+                },
+            );
+            if resp.committed {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::CommitGroupTransformEdit { param })
+                }));
+            }
+            let auto_on = summary.automated[idx];
+            ui.toggle_button_at(
+                (param, "group_auto"),
+                "A",
+                Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
+                auto_on,
+                &TOGGLE_IMAGE_AUTOMATE,
+                move |_| {
+                    Edit::mutate(move |app: &mut AppData| {
+                        let ev = if auto_on {
+                            AppEvent::RemoveGroupAutomationLane { param }
+                        } else {
+                            AppEvent::AddGroupAutomationLane { param }
+                        };
+                        app.handle_event(ev);
+                    })
+                },
+            );
+            y += input_h + 4.0;
+        }
+        y += 8.0;
+    }
+
     // ---- Text Event section (`docs/plan_text_overlay.md` §4 P5 + P5.B) --
     // selected_clip が `ClipContent::Text` のとき、 first event の全 field
     // (text / font / align / 23 numeric + 2 fade beats / fade curves / mute)

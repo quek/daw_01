@@ -1783,6 +1783,25 @@ fn lane_target_display(target: &common::model::AutomationTarget) -> LaneDisplay 
                 color,
             }
         }
+        AutomationTarget::GroupTransform(p) => {
+            use common::model::GroupTransformParam as G;
+            // 立ち絵グループ transform lane。 色は青緑系で統一、 icon は field 頭文字。
+            let (label, icon, color): (&'static str, char, Color) = match p {
+                G::X => ("Group X", 'X', Color::rgb(0.55, 0.85, 0.90)),
+                G::Y => ("Group Y", 'Y', Color::rgb(0.55, 0.85, 0.90)),
+                G::Rotation => ("Group Rot", 'R', Color::rgb(0.50, 0.80, 0.95)),
+                G::ScaleX => ("Group ScaleX", 'x', Color::rgb(0.45, 0.82, 0.82)),
+                G::ScaleY => ("Group ScaleY", 'y', Color::rgb(0.45, 0.82, 0.82)),
+                G::AnchorX => ("Group AnchorX", 'a', Color::rgb(0.60, 0.78, 0.88)),
+                G::AnchorY => ("Group AnchorY", 'a', Color::rgb(0.60, 0.78, 0.88)),
+                G::Opacity => ("Group Opacity", 'O', Color::rgb(0.70, 0.80, 0.92)),
+            };
+            LaneDisplay {
+                label: Arc::from(label),
+                icon_glyph: icon,
+                color,
+            }
+        }
     }
 }
 
@@ -1825,6 +1844,17 @@ fn plain_to_norm(target: &common::model::AutomationTarget, plain: f64) -> f32 {
             (plain + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)
         }
         AutomationTarget::TextBuiltin(_) => plain,
+        // Group transform: common::automation::plain_to_norm と厳密一致させる
+        // (UI ↔ engine 正規化の SSoT。位置/アンカー/Opacity 恒等、Rotation は Pan
+        // idiom、ScaleX/ScaleY は 0.1..=10 log space)。
+        AutomationTarget::GroupTransform(common::model::GroupTransformParam::Rotation) => {
+            (plain + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)
+        }
+        AutomationTarget::GroupTransform(
+            common::model::GroupTransformParam::ScaleX
+            | common::model::GroupTransformParam::ScaleY,
+        ) => (plain.clamp(0.1, 10.0) / 0.1).ln() / 100.0_f64.ln(),
+        AutomationTarget::GroupTransform(_) => plain,
     };
     v.clamp(0.0, 1.0) as f32
 }

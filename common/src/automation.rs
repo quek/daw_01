@@ -61,6 +61,16 @@ pub fn plain_to_norm(target: &AutomationTarget, plain: f64) -> f32 {
             (plain + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)
         }
         AutomationTarget::TextBuiltin(_) => plain,
+        // Group transform (§4.4): 位置/アンカー (X/Y/AnchorX/AnchorY) と Opacity は
+        // 0..=1 恒等、 Rotation は Pan idiom、 ScaleX/ScaleY は 0.1..=10 の log space。
+        // ScaleX/Y は round-trip が norm_to_plain と厳密逆 (0.1·100^n)。
+        AutomationTarget::GroupTransform(crate::model::GroupTransformParam::Rotation) => {
+            (plain + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)
+        }
+        AutomationTarget::GroupTransform(
+            crate::model::GroupTransformParam::ScaleX | crate::model::GroupTransformParam::ScaleY,
+        ) => (plain.clamp(0.1, 10.0) / 0.1).ln() / 100.0_f64.ln(),
+        AutomationTarget::GroupTransform(_) => plain,
     };
     v.clamp(0.0, 1.0) as f32
 }
@@ -92,6 +102,15 @@ pub fn norm_to_plain(target: &AutomationTarget, norm: f32) -> f64 {
             n * 2.0 * std::f64::consts::PI - std::f64::consts::PI
         }
         AutomationTarget::TextBuiltin(_) => n,
+        // Group transform (§4.4): plain_to_norm の厳密逆。X/Y/AnchorX/AnchorY/
+        // Opacity は恒等、 Rotation は `n·2π - π`、 ScaleX/ScaleY は `0.1·100^n`。
+        AutomationTarget::GroupTransform(crate::model::GroupTransformParam::Rotation) => {
+            n * 2.0 * std::f64::consts::PI - std::f64::consts::PI
+        }
+        AutomationTarget::GroupTransform(
+            crate::model::GroupTransformParam::ScaleX | crate::model::GroupTransformParam::ScaleY,
+        ) => 0.1 * 100.0_f64.powf(n),
+        AutomationTarget::GroupTransform(_) => n,
     }
 }
 
@@ -387,6 +406,43 @@ mod tests {
         };
         assert!((evaluate_clip(&c, 2.0) - 0.5).abs() < 1e-9);
         assert!((evaluate_clip(&c, 1.0) - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn group_transform_scale_norm_is_exact_inverse() {
+        use crate::model::GroupTransformParam as G;
+        // ScaleX/ScaleY は 0.1..=10 の log space。plain→norm→plain が元値へ
+        // 戻らないと automation point が drift する (recon risk)。norm は pipeline
+        // 上 f32 で持つので相対許容で判定 (ln(100) 倍の増幅を考慮)。
+        for param in [G::ScaleX, G::ScaleY] {
+            let target = AutomationTarget::GroupTransform(param);
+            for plain in [0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 10.0] {
+                let norm = plain_to_norm(&target, plain);
+                let back = norm_to_plain(&target, norm);
+                assert!(
+                    (back / plain - 1.0).abs() < 1e-5,
+                    "scale round-trip drift: {plain} -> {norm} -> {back}"
+                );
+            }
+            // 等倍 1.0 は log space の中点 norm 0.5。
+            assert!((f64::from(plain_to_norm(&target, 1.0)) - 0.5).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn group_transform_identity_and_rotation_norm() {
+        use crate::model::GroupTransformParam as G;
+        // 位置 / アンカー / Opacity は 0..=1 恒等。
+        for param in [G::X, G::Y, G::AnchorX, G::AnchorY, G::Opacity] {
+            let target = AutomationTarget::GroupTransform(param);
+            assert!((f64::from(plain_to_norm(&target, 0.3)) - 0.3).abs() < 1e-5);
+            assert!((norm_to_plain(&target, 0.3) - 0.3).abs() < 1e-5);
+        }
+        // Rotation は Pan idiom: 0 rad → norm 0.5、round-trip 厳密。
+        let rot = AutomationTarget::GroupTransform(G::Rotation);
+        assert!((f64::from(plain_to_norm(&rot, 0.0)) - 0.5).abs() < 1e-6);
+        let back = norm_to_plain(&rot, plain_to_norm(&rot, 1.234));
+        assert!((back - 1.234).abs() < 1e-5);
     }
 
     #[test]

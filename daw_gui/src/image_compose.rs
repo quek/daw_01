@@ -25,6 +25,10 @@ pub struct ActiveImageFrame {
     /// handle. Missing entries are skipped silently (= not yet
     /// uploaded, first frame after import).
     pub image_source_id: ImageSourceId,
+    /// v19 (`docs/plan_tachie_group_transform.md` §5.1): この frame を出した
+    /// track の id。立ち絵 group 合成で frame を `parent_group_id` ごとに
+    /// 仕分ける（= 親 group の visual transform 対象か判定する）ために使う。
+    pub owning_track_id: u32,
     /// PiP rect in normalized 0-1 preview coordinates. `(x, y)` is
     /// the top-left of the image's bounding box; `(w, h)` is its
     /// dimensions. `(0.0, 0.0, 1.0, 1.0)` fills the preview;
@@ -121,6 +125,7 @@ pub fn active_image_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveIma
                 }
                 out.push(ActiveImageFrame {
                     image_source_id: event.source_id,
+                    owning_track_id: track.id,
                     x,
                     y,
                     w,

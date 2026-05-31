@@ -15,6 +15,7 @@ pub mod audio_source_cache;
 pub mod bootstrap;
 pub mod dispatcher;
 pub mod fuzzy;
+pub mod group_compose;
 pub mod image_compose;
 pub mod import_audio;
 pub mod import_image;
