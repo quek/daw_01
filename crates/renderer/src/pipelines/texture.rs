@@ -36,9 +36,12 @@ struct TextureInstance {
     pos: [f32; 4],
     /// uv_min.x, uv_min.y, uv_max.x, uv_max.y (0.0..=1.0)
     uv: [f32; 4],
-    /// alpha, rotation_radians, _pad, _pad
-    /// rotation_radians: rect 中心 pivot で clockwise positive、 NaN/Inf は CPU 側で
-    /// 0.0 に正規化済 (= `enqueue_run` で `is_finite()` ガード)。
+    /// alpha, rotation_radians, pivot_off_x, pivot_off_y
+    /// rotation_radians: clockwise positive、 NaN/Inf は CPU 側で 0.0 に正規化済
+    /// (= `enqueue_run` で `is_finite()` ガード)。
+    /// pivot_off_x / pivot_off_y: 旋回中心の **rect 左上相対** ピクセル offset (M14 Phase 92 /
+    /// daw_01 #064)。 `rotation_pivot == None` のとき `(w/2, h/2)` を書くので shader 側
+    /// `cx = left + misc.z` は Phase 76 の中心 pivot と byte 完全互換。
     misc: [f32; 4],
 }
 
@@ -254,10 +257,16 @@ impl TexturePipeline {
         for q in quads.iter().take(count) {
             let inst_idx = self.instances.len() as u32;
             let theta = normalize_rotation(q.rotation_radians);
+            // M14 Phase 92 (daw_01 #064): pivot を rect 左上相対 offset で pack。 None / 非 finite
+            // は rect 中心 (w/2, h/2) に fallback (= Phase 76 と byte 互換、 caller 責務にしない)。
+            let (pivot_off_x, pivot_off_y) = match q.rotation_pivot {
+                Some((px, py)) if px.is_finite() && py.is_finite() => (px, py),
+                _ => (q.rect.w * 0.5, q.rect.h * 0.5),
+            };
             self.instances.push(TextureInstance {
                 pos: [q.rect.x, q.rect.y, q.rect.w, q.rect.h],
                 uv: [q.uv_min.0, q.uv_min.1, q.uv_max.0, q.uv_max.1],
-                misc: [q.alpha, theta, 0.0, 0.0],
+                misc: [q.alpha, theta, pivot_off_x, pivot_off_y],
             });
             self.calls.push(DrawCall {
                 instance_idx: inst_idx,

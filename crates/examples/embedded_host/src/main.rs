@@ -138,6 +138,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         uv_max: (1.0, 1.0),
         clip_rect: None,
         rotation_radians: 0.0,
+        rotation_pivot: None,
     });
     scene.push_text(GlyphArea {
         text: "Phase 71 (#043): texture pipeline (4x4 checker + 0.5 blue overlay)".into(),
@@ -196,6 +197,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         uv_max: (1.0, 1.0),
         clip_rect: None,
         rotation_radians: std::f32::consts::FRAC_PI_6, // 30°
+        rotation_pivot: None,
     });
     scene.push_text(GlyphArea {
         text: "Phase 76 (#047): rotation π/6 (30° clockwise, pivot=rect center)".into(),

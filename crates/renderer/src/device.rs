@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use daw_ui_platform::{PhysicalSize, WindowBackend};
 
+use crate::composite::{composite_scene, CompositePool};
 use crate::pipelines::{
     enqueue_runs, glyph::GlyphPipeline, line::LinePipeline, prepare_text_effects,
     rect::RectPipeline, render_runs, text_effect::TextEffectCompositor,
@@ -63,6 +64,10 @@ pub struct Renderer<W: WindowBackend + Send + Sync + 'static> {
     /// effect 付き area を offscreen RGBA texture に焼いて、 base scene の TexturedQuad
     /// (Phase 71/76 rotation 込み) として push する。 effect 無し path は既存 GlyphPipeline 直接。
     text_effect: TextEffectCompositor,
+    /// M14 Phase 93 (daw_01 #063): `composite_scene_to_texture` の render target を size 別に
+    /// 使い回す pool。 handle は `texture_store` 内の texture を指す (pool 自体は GPU resource を
+    /// 直接持たない)。
+    composite_pool: CompositePool,
     /// M14 Phase 74 (daw_01 #045 §B) / Phase 75 (#046): adapter の backend を保存。
     /// `create_texture_from_d3d11_shared_handle` が DX12 + Vulkan dispatch するため、
     /// 呼び出し時に `Backend` で path を選ぶ。 Metal / GL では `WrongBackend` で fail-soft。
@@ -160,6 +165,7 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
         let texture = TexturePipeline::new(&device, format);
         let texture_store = TextureStore::new();
         let text_effect = TextEffectCompositor::new(&device, &queue);
+        let composite_pool = CompositePool::new();
 
         Ok(Self {
             surface,
@@ -175,6 +181,7 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
             texture,
             texture_store,
             text_effect,
+            composite_pool,
             backend,
             vulkan_external_memory_supported,
             size,
@@ -528,6 +535,50 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
         self.config.format
     }
 
+    /// M14 Phase 93 (daw_01 #063): `scene.primitives` を `width × height` の GPU 常駐 sampleable
+    /// texture に合成し、 その [`TextureHandle`] を返す。 立ち絵 group transform 等で「子 quad 群を
+    /// 1 枚に焼いてから親 affine (#064 の `rotation_pivot` 込み) を 1 回かける」 用途。
+    ///
+    /// - **GPU 常駐 / readback なし**: preview で毎フレーム呼べる。 内部で独自 encoder を submit する。
+    /// - **透明 clear**: `scene.clear_color` は無視し常に透明で clear (合成結果は親 scene へ alpha
+    ///   composite される前提)。 `scene.popup_primitives` は対象外。
+    /// - **target の使い回し**: size 別に内部 pool で再利用 (renderer がライフサイクル所有 = SSoT、
+    ///   caller は返却 handle を `destroy_texture` しない)。 返った handle は **次の `render()` まで**
+    ///   有効 (= その frame の base scene に `push_textured_quad` して `render()` するまでに使う)。
+    /// - **format**: 返る texture の format は本 renderer の surface format に一致する (preview pipeline は
+    ///   surface format で描くため)。 `TexturedQuad` sampling は format-transparent なので caller は
+    ///   channel 順を意識しなくてよい。
+    ///
+    /// # Errors
+    /// `width` / `height` が `max_texture_dimension_2d` を超える場合
+    /// [`RenderError::CompositeTargetTooLarge`] (= wgpu の texture 作成 panic を caller protect)。
+    pub fn composite_scene_to_texture(
+        &mut self,
+        scene: &Scene,
+        width: u32,
+        height: u32,
+    ) -> Result<TextureHandle, RenderError> {
+        let max = self.device.limits().max_texture_dimension_2d;
+        if width > max || height > max {
+            return Err(RenderError::CompositeTargetTooLarge { width, height, max });
+        }
+        Ok(composite_scene(
+            scene,
+            width,
+            height,
+            self.config.format,
+            &self.device,
+            &self.queue,
+            &mut self.rect,
+            &mut self.line,
+            &mut self.glyph,
+            &mut self.texture,
+            &mut self.text_effect,
+            &mut self.texture_store,
+            &mut self.composite_pool,
+        ))
+    }
+
     /// Scene を 1 フレームとして描画。
     ///
     /// 失敗時 (Lost / Outdated 等) は再 configure して 1 度だけリトライ。
@@ -697,7 +748,18 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
+
+        // M14 Phase 93 (daw_01 #063): この frame の composite target を解放 (in-use 解除 + idle evict)。
+        // base pass は既に submit 済 (= composite texture を sample 済) なので安全。
+        self.composite_pool.end_cycle(&mut self.texture_store);
         Ok(())
+    }
+
+    /// M14 Phase 93 (daw_01 #063): composite target pool を即座に空にする (全 target を destroy)。
+    /// 通常は `MAX_IDLE_CYCLES` 未使用で自動 evict されるが、 project / scene を閉じて VRAM を
+    /// すぐ返したい場合に明示的に呼ぶ。
+    pub fn clear_composite_cache(&mut self) {
+        self.composite_pool.clear(&mut self.texture_store);
     }
 }
 
@@ -723,12 +785,19 @@ impl std::error::Error for RendererInitError {}
 #[derive(Debug)]
 pub enum RenderError {
     SurfaceUnavailable(String),
+    /// M14 Phase 93 (daw_01 #063): `composite_scene_to_texture` の要求サイズが
+    /// `max_texture_dimension_2d` を超過 (= wgpu の texture 作成 panic を caller protect)。
+    CompositeTargetTooLarge { width: u32, height: u32, max: u32 },
 }
 
 impl std::fmt::Display for RenderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SurfaceUnavailable(s) => write!(f, "wgpu surface 利用不能: {s}"),
+            Self::CompositeTargetTooLarge { width, height, max } => write!(
+                f,
+                "composite target size {width}x{height} exceeds max_texture_dimension_2d {max}"
+            ),
         }
     }
 }

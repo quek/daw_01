@@ -130,6 +130,7 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
             uv_max: (1.0, 1.0),
             clip_rect: None,
             rotation_radians: 0.0,
+            rotation_pivot: None,
         });
     }
 

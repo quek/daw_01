@@ -9,6 +9,7 @@
 //!
 //! シーンは内部的に DisplayList として保持し、フレーム終端でバッチ描画する。
 
+mod composite;
 pub mod device;
 pub mod offscreen;
 pub mod pipelines;

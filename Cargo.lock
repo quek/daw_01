@@ -744,6 +744,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "daw-ui-example-composite-validation"
+version = "0.1.0"
+dependencies = [
+ "daw-ui-renderer",
+ "png 0.17.16",
+]
+
+[[package]]
 name = "daw-ui-example-daw-prototype"
 version = "0.1.0"
 dependencies = [

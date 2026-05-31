@@ -18,6 +18,7 @@ use std::sync::mpsc::sync_channel;
 
 use daw_ui_platform::PhysicalSize;
 
+use crate::composite::{composite_scene, CompositePool};
 use crate::device::{RenderError, RendererInitError};
 use crate::pipelines::{
     enqueue_runs, glyph::GlyphPipeline, line::LinePipeline, prepare_text_effects,
@@ -45,6 +46,9 @@ pub struct OffscreenRenderer {
     /// M14 Phase 78 (daw_01 #049): text effect compositor (Renderer<W> と同 idiom、 PNG
     /// snapshot test でも outline / shadow / blur / rotation 効果を捉えるために必要)。
     text_effect: TextEffectCompositor,
+    /// M14 Phase 93 (daw_01 #063): `composite_scene_to_texture` の render target を size 別に
+    /// 使い回す pool (Renderer<W> と同 idiom)。
+    composite_pool: CompositePool,
     size: PhysicalSize,
 }
 
@@ -87,6 +91,7 @@ impl OffscreenRenderer {
         let texture = TexturePipeline::new(&device, target_format);
         let texture_store = TextureStore::new();
         let text_effect = TextEffectCompositor::new(&device, &queue);
+        let composite_pool = CompositePool::new();
 
         Ok(Self {
             device,
@@ -98,6 +103,7 @@ impl OffscreenRenderer {
             texture,
             texture_store,
             text_effect,
+            composite_pool,
             size: PhysicalSize { width: width.max(1), height: height.max(1) },
         })
     }
@@ -175,6 +181,47 @@ impl OffscreenRenderer {
     #[must_use]
     pub fn texture_format(&self, handle: TextureHandle) -> Option<wgpu::TextureFormat> {
         self.texture_store.format(handle)
+    }
+
+    /// M14 Phase 93 (daw_01 #063): `scene.primitives` を `width × height` の GPU 常駐 sampleable
+    /// texture に合成し、 その [`TextureHandle`] を返す (`Renderer<W>` と同 API、 export 経路用)。
+    ///
+    /// 透明 clear / popup 対象外 / size 別 pool 使い回しは `Renderer::composite_scene_to_texture` と
+    /// 同じ。 返る texture の format は `Rgba8UnormSrgb` (= offscreen pipeline の target format)。
+    ///
+    /// # Errors
+    /// `width` / `height` が `max_texture_dimension_2d` を超える場合
+    /// [`RenderError::CompositeTargetTooLarge`]。
+    pub fn composite_scene_to_texture(
+        &mut self,
+        scene: &Scene,
+        width: u32,
+        height: u32,
+    ) -> Result<TextureHandle, RenderError> {
+        let max = self.device.limits().max_texture_dimension_2d;
+        if width > max || height > max {
+            return Err(RenderError::CompositeTargetTooLarge { width, height, max });
+        }
+        Ok(composite_scene(
+            scene,
+            width,
+            height,
+            self.target_format,
+            &self.device,
+            &self.queue,
+            &mut self.rect,
+            &mut self.line,
+            &mut self.glyph,
+            &mut self.texture,
+            &mut self.text_effect,
+            &mut self.texture_store,
+            &mut self.composite_pool,
+        ))
+    }
+
+    /// M14 Phase 93 (daw_01 #063): composite target pool を即座に空にする (全 target を destroy)。
+    pub fn clear_composite_cache(&mut self) {
+        self.composite_pool.clear(&mut self.texture_store);
     }
 
     /// Scene を 1 フレーム分 render し、RGBA bytes (sRGB encoded) を返す。
@@ -369,6 +416,9 @@ impl OffscreenRenderer {
         drop(padded_view);
         staging.unmap();
 
+        // M14 Phase 93 (daw_01 #063): この render cycle の composite target を解放 (base pass は
+        // 既に submit 済 = composite texture を sample 済)。
+        self.composite_pool.end_cycle(&mut self.texture_store);
         Ok(out)
     }
 }

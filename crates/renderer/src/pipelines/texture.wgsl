@@ -1,12 +1,16 @@
-// Instanced textured-quad shader (M14 Phase 71 / daw_01 #043, Phase 76 で rotation 拡張)。
+// Instanced textured-quad shader (M14 Phase 71 / daw_01 #043, Phase 76 で rotation 拡張,
+// Phase 92 / daw_01 #064 で任意 pivot 拡張)。
 // 入力 instance: pos(left,top,w,h) / uv(uv_min.x, uv_min.y, uv_max.x, uv_max.y)
-//              / misc(alpha, rotation_radians, _, _)
+//              / misc(alpha, rotation_radians, pivot_off_x, pivot_off_y)
 // 出力: texture sample × vec4(rgb, alpha) (standard alpha blend OVER で composite)
 //
 // rotation_radians:
-//   rect 中心 (cx = left + w/2, cy = top + h/2) を pivot とした 2D 回転 (clockwise
+//   pivot (cx = left + misc.z, cy = top + misc.w) を旋回中心とした 2D 回転 (clockwise
 //   positive in screen-down y)。 0.0 で sin=0/cos=1 の恒等変換 → 既存挙動と完全互換。
 //   NaN / ±Infinity は CPU 側 (`enqueue_run`) で 0.0 に正規化済。
+//   pivot_off_x / pivot_off_y: rect 左上相対の旋回中心 px offset。 CPU 側で
+//   `rotation_pivot == None` のとき `(w/2, h/2)` を書くので Phase 76 の rect 中心 pivot と
+//   byte 完全互換。
 //   非 0 の場合は pixel 空間で `[cos -sin; sin cos]` 行列を適用 (= normalized 空間で
 //   回転すると non-square rect w≠h で aspect 歪みが起こるため、 必ず pixel 空間で実施)。
 //   UV mapping は rotation 適用前の corner で計算する (= texture content は rect 4 隅に
@@ -27,7 +31,7 @@ var src_sampler: sampler;
 struct VsIn {
     @location(0) pos:  vec4<f32>,  // left, top, w, h
     @location(1) uv:   vec4<f32>,  // uv_min.x, uv_min.y, uv_max.x, uv_max.y
-    @location(2) misc: vec4<f32>,  // alpha, rotation_radians, _, _
+    @location(2) misc: vec4<f32>,  // alpha, rotation_radians, pivot_off_x, pivot_off_y
 };
 
 struct VsOut {
@@ -60,11 +64,12 @@ fn vs_main(@builtin(vertex_index) vid: u32, in: VsIn) -> VsOut {
     let px0 = left + corner.x * w;
     let py0 = top + corner.y * h;
 
-    // 2) rect 中心 (pivot) を基準に rotation 行列を適用 (pixel 空間 = aspect 維持)。
+    // 2) pivot (rect 左上 + misc.zw offset) を基準に rotation 行列を適用 (pixel 空間 = aspect 維持)。
     //    theta = 0 のときは sin=0/cos=1 で恒等変換 → Phase 71 と byte 完全互換。
+    //    misc.zw は CPU 側で None のとき (w/2, h/2) を書くので中心 pivot の既存挙動と互換。
     let theta = in.misc.y;
-    let cx = left + w * 0.5;
-    let cy = top + h * 0.5;
+    let cx = left + in.misc.z;
+    let cy = top + in.misc.w;
     let rel_x = px0 - cx;
     let rel_y = py0 - cy;
     let s = sin(theta);

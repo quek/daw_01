@@ -318,10 +318,16 @@ pub struct TexturedQuad {
     /// renderer 側で `0.0` に正規化 (caller 責務にしない)。 回転は **pixel 空間** で実施
     /// するため non-square rect (w ≠ h) でも aspect 維持で正しく回転する。
     pub rotation_radians: f32,
+    /// M14 Phase 92 (daw_01 #064): `rotation_radians` の旋回中心 (pivot)。 `rect` 左上を
+    /// 原点とした **物理ピクセル相対**座標 `(px, py)`。 `None` は rect 中心 `(w/2, h/2)` を
+    /// 意味し、 Phase 76 までの挙動と byte 完全互換。 立ち絵 group transform (#063) で合成済
+    /// 1 枚に親 affine の任意アンカー回転をかける用途。 成分が NaN / ±Infinity の場合は
+    /// renderer 側で中心 pivot に fallback (caller 責務にしない)。
+    pub rotation_pivot: Option<(f32, f32)>,
 }
 
 impl TexturedQuad {
-    /// UV 全域 + alpha=1.0 + clip なし + rotation 0 の最短コンストラクタ。
+    /// UV 全域 + alpha=1.0 + clip なし + rotation 0 + 中心 pivot の最短コンストラクタ。
     #[must_use]
     pub fn new(rect: Rect, texture: TextureHandle) -> Self {
         Self {
@@ -332,6 +338,7 @@ impl TexturedQuad {
             uv_max: (1.0, 1.0),
             clip_rect: None,
             rotation_radians: 0.0,
+            rotation_pivot: None,
         }
     }
 }
@@ -538,6 +545,8 @@ mod tests {
             assert_eq!(q.rotation_radians, 0.0);
         }
         assert!(q.clip_rect.is_none());
+        // M14 Phase 92 (daw_01 #064): default None = rect 中心 pivot (Phase 76 と byte 互換)
+        assert!(q.rotation_pivot.is_none());
     }
 
     #[test]

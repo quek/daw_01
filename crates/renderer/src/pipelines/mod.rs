@@ -71,6 +71,8 @@ pub fn prepare_text_effects(
                         uv_max: (1.0, 1.0),
                         clip_rect: area.clip_rect,
                         rotation_radians: text_effect::normalize_finite(area.rotation_radians),
+                        // GlyphArea の rotation は中心 pivot (Phase 76 と同義)。
+                        rotation_pivot: None,
                     }));
                 } else {
                     // compositor が None を返したら (= text 0 サイズ等) plain Glyph に fallback。
