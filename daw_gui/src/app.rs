@@ -1097,6 +1097,13 @@ pub struct AppData {
     /// 実行中 export のキャンセルフラグ。UI の Cancel ボタンで `true` にすると
     /// render loop が次フレームで中断し出力を破棄する。`None` = export 非実行。
     pub export_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// 1 ステップ video export 中、 音声レンダリング完了待ちの mp4 出力先。
+    /// export ダイアログで mp4 を選ぶ → 音声を temp WAV へ自動レンダリング →
+    /// `ExportWavComplete` でこの mp4 へ video export（+ WAV mux）を開始する。
+    /// `None` = 音声レンダリング待ちでない。
+    pub pending_video_export: Option<std::path::PathBuf>,
+    /// 自動レンダリングした音声 temp WAV。video export 完了後に削除する。
+    pub export_temp_wav: Option<std::path::PathBuf>,
 
     /// docs/plan_text_overlay.md §4 P5: text inspector の edit buffer 群。
     /// `text` / `font_family` は文字列 field なので standalone、 残 23
@@ -1391,6 +1398,8 @@ impl AppData {
             group_scrub_active: None,
             export_progress: None,
             export_cancel: None,
+            pending_video_export: None,
+            export_temp_wav: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             is_help_open: false,
@@ -4679,6 +4688,10 @@ impl AppData {
             AppEvent::ExportFinished { result } => {
                 self.export_progress = None;
                 self.export_cancel = None;
+                // 自動レンダリングした音声 temp WAV を削除。
+                if let Some(wav) = self.export_temp_wav.take() {
+                    let _ = std::fs::remove_file(&wav);
+                }
                 match result {
                     Ok(path) => {
                         self.status_message =
@@ -5017,7 +5030,30 @@ impl AppData {
                 self.send_plugin(MainToChild::SetRenderMode(
                     common::protocol::RenderMode::Realtime,
                 ));
-                if let Some(err) = error {
+                if let Some(mp4_path) = self.pending_video_export.take() {
+                    // 1 ステップ video export の音声レンダリング完了 → video
+                    // export を開始（音声失敗時は映像のみで続行）。
+                    let wav = match &error {
+                        Some(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "audio render for video export failed; video-only"
+                            );
+                            self.status_message = format!(
+                                "音声レンダリング失敗 ({err}); 映像のみで書き出します"
+                            );
+                            if let Some(t) = self.export_temp_wav.take() {
+                                let _ = std::fs::remove_file(&t);
+                            }
+                            None
+                        }
+                        None => self.export_temp_wav.clone(),
+                    };
+                    #[cfg(windows)]
+                    self.action_export_mp4(mp4_path, wav);
+                    #[cfg(not(windows))]
+                    let _ = (mp4_path, wav);
+                } else if let Some(err) = error {
                     self.status_message = format!("WAV 書き出し失敗: {err}");
                 } else {
                     self.status_message = "WAV 書き出し完了".to_string();
@@ -14514,14 +14550,17 @@ impl AppData {
         self.action_import_image(paths);
     }
 
-    /// File menu → "Export Video..." (`docs/plan_video.md` P8).
-    /// 1. Save dialog for the output mp4 (defaults to project name +
-    ///    `.mp4`).
-    /// 2. Optional second dialog: pick a WAV produced by Export WAV
-    ///    to mux as the AAC track. Cancel = video-only mp4.
-    /// 3. Forward to `AppEvent::ExportMp4`.
+    /// File menu → "Export Video..." (`docs/plan_video.md` P8)。
+    /// **mp4 出力先を選ぶダイアログ 1 つだけ**。プロジェクト音声は temp WAV へ
+    /// 自動レンダリング（daw_audio の freewheel）し、完了（`ExportWavComplete`）
+    /// 後に video export して mux する（`action_export_mp4`）。旧仕様の「音声
+    /// WAV を別途選ばせる 2 つ目のダイアログ」 は廃止。
     #[cfg(windows)]
     fn action_open_export_mp4_dialog(&mut self) {
+        if self.export_progress.is_some() || self.pending_video_export.is_some() {
+            self.status_message = "Video export を実行中です".into();
+            return;
+        }
         let default_name = self
             .file_path
             .as_ref()
@@ -14537,14 +14576,18 @@ impl AppData {
         else {
             return;
         };
-        let audio_wav = rfd::FileDialog::new()
-            .add_filter("WAV Audio (optional)", &["wav"])
-            .set_title("Optional: audio WAV to mux (Cancel for video-only)")
-            .pick_file();
-        self.handle_event(AppEvent::ExportMp4 {
-            output_path,
-            audio_wav,
-        });
+        // 音声を temp WAV へ自動レンダリング → 完了後に video export + mux。
+        let temp_wav = std::env::temp_dir()
+            .join(format!("daw01_export_audio_{}.wav", std::process::id()));
+        self.pending_video_export = Some(output_path);
+        self.export_temp_wav = Some(temp_wav.clone());
+        self.status_message = "音声をレンダリング中...".into();
+        let song = self.song.clone();
+        self.send_audio(MainToChild::LoadSong(song));
+        self.send_plugin(MainToChild::SetRenderMode(
+            common::protocol::RenderMode::Offline,
+        ));
+        self.send_audio(MainToChild::ExportWav { path: temp_wav });
     }
 
     /// Synchronous mp4 render (`docs/plan_video.md` P8). Blocks the
