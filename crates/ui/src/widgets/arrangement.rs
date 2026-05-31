@@ -4188,13 +4188,23 @@ fn draw_automation_lane<M: ?Sized + 'static>(
         // clip name + share group link glyph (⇌) — MIDI clip と同 idiom (`draw_clip` と対称)。
         // share_group_color = Some(hue) のとき名前の左に link glyph を 1 文字描画 + name を glyph 幅 +
         // 2px gap 分ずらす。 selection / disabled とは独立に描画 (link 関係は bypass / 選択と直交)。
-        if w >= 28.0 {
-            let glyph_color = if lane.enabled {
-                style.automation_lane_text_color
-            } else {
+        // M14 Phase 91 (daw_01 #062): 名前 / link glyph の表示を MIDI clip (`draw_clip`) と完全に揃える。
+        // (1) 表示しきい値 / font_size / line_height を MIDI と同値に (旧 `w >= 28.0` + `* 0.85` +
+        //     line_height = clip_text_size 直値を撤去)。 (2) 文字色は enabled lane なら fill 輝度由来の
+        //     auto-contrast (`clip_text_color_for`、 alpha 0.20 の半透明 fill は automation_lane_bg と
+        //     合成して実効色判定)。 disabled lane は従来どおり `automation_lane_disabled_color` 固定
+        //     (= bypass marker、 #060 の selected 統合とは別文脈) で auto-contrast 対象外。 opt-out
+        //     (`clip_auto_contrast_text == false`) は automation 専用の `automation_lane_text_color` に
+        //     フォールバック (= clip 全般の `clip_text_color` ではなく従来色を維持)。
+        if w > 24.0 && ch > style.clip_text_size + 2.0 {
+            let glyph_color = if !lane.enabled {
                 style.automation_lane_disabled_color
+            } else if style.clip_auto_contrast_text {
+                clip_text_color_for(style, fill, style.automation_lane_bg)
+            } else {
+                style.automation_lane_text_color
             };
-            let font_size = style.clip_text_size * 0.85;
+            let font_size = style.clip_text_size;
             let has_link = c.share_group_color.is_some();
             let text_left = if has_link {
                 clip_rect.x + 4.0 + font_size + 2.0
@@ -4207,7 +4217,7 @@ fn draw_automation_lane<M: ?Sized + 'static>(
                     left: clip_rect.x + 4.0,
                     top: clip_rect.y + 2.0,
                     font_size,
-                    line_height: style.clip_text_size,
+                    line_height: style.clip_text_size * 1.2,
                     color: glyph_color,
                     clip_rect: Some(clip_rect),
                     ..GlyphArea::default()
@@ -4218,7 +4228,7 @@ fn draw_automation_lane<M: ?Sized + 'static>(
                 left: text_left,
                 top: clip_rect.y + 2.0,
                 font_size,
-                line_height: style.clip_text_size,
+                line_height: style.clip_text_size * 1.2,
                 color: glyph_color,
                 clip_rect: Some(clip_rect),
                 ..GlyphArea::default()
@@ -9208,6 +9218,117 @@ mod tests {
             clip_text_color_for(&off, off.clip_selected_fill, off.bg),
             off.clip_text_color,
             "opt-out 時は明るい fill でも clip_text_color 固定"
+        );
+    }
+
+    /// M14 Phase 91 (daw_01 #062): automation clip 名の表示を MIDI clip と統一。
+    /// (1) font_size = clip_text_size / line_height = clip_text_size * 1.2 (旧 0.85 倍を撤去)、
+    /// (2) enabled lane は fill 輝度由来 auto-contrast (selected 黄 fill → 暗文字 / 暗い実効 fill →
+    /// 明文字)、 (3) disabled lane は auto-contrast 対象外で `automation_lane_disabled_color` 固定。
+    #[test]
+    fn automation_clip_name_matches_midi_font_and_auto_contrast() {
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::FrameInput;
+        use crate::ui::UiHost;
+
+        let style = ArrangementStyle::default();
+
+        let auto_clip = |id: u32, name: &str| ArrangementAutomationClip {
+            id,
+            start_beat: 0.0,
+            len_beats: 4.0, // width = 4 * (800/16) = 200px > 24
+            name: Arc::from(name),
+            points: Vec::new(),
+            share_group_color: None,
+        };
+        let lane = |id: u32, enabled: bool, clip: ArrangementAutomationClip| {
+            ArrangementAutomationLane {
+                id,
+                label: Arc::from("L"),
+                icon_glyph: 'V',
+                color: Color::rgb(0.30, 0.70, 1.0), // lane 識別色 (clip fill は alpha 0.20)
+                enabled,
+                visible: true,
+                height_px: 60, // ch = 60 - 12 = 48 > clip_text_size + 2
+                default_value_norm: 0.5,
+                clips: vec![clip],
+            }
+        };
+
+        let mut t0 = track(7, "t0", vec![]);
+        t0.automation_lanes_collapsed = false;
+        t0.automation_lanes = vec![
+            lane(1, true, auto_clip(10, "selclip")),  // selected → 黄 fill → 暗文字
+            lane(2, true, auto_clip(20, "normclip")), // 非選択 → 暗い実効 fill → 明文字
+            lane(3, false, auto_clip(30, "disclip")), // disabled → 固定灰
+        ];
+        let tracks = vec![t0];
+
+        let mut view = test_view();
+        view.len_beats = 16.0; // beat_to_px = 800/16 = 50
+
+        let selected = [AutomationClipKey { track: 7, lane: 1, clip: 10 }];
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 400 };
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            let _ = ui.arrangement(
+                "arr_auto_text",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &tracks,
+                view,
+                &[],
+                &[],
+                &selected,
+                &[],
+                &style,
+                None,
+                |_| Edit::mutate(|()| {}),
+            );
+        });
+
+        let glyph = |name: &str| {
+            scene
+                .iter_glyphs()
+                .find(|g| &*g.text == name)
+                .unwrap_or_else(|| panic!("clip 名 glyph '{name}' が scene に無い"))
+                .clone()
+        };
+
+        // (1) font_size / line_height は MIDI clip (`draw_clip`) と同値 (旧 0.85 倍ではない)。
+        let sel = glyph("selclip");
+        assert!(
+            (sel.font_size - style.clip_text_size).abs() < 1e-3,
+            "font_size は clip_text_size (={}) と一致: got {}",
+            style.clip_text_size,
+            sel.font_size
+        );
+        assert!(
+            (sel.line_height - style.clip_text_size * 1.2).abs() < 1e-3,
+            "line_height は clip_text_size * 1.2 と一致: got {}",
+            sel.line_height
+        );
+
+        // (2) enabled lane の auto-contrast: selected (黄 opaque fill) → 暗文字、
+        //     非選択 (lane 色 alpha 0.20 を automation_lane_bg と合成した暗い実効色) → 明文字。
+        assert_eq!(
+            sel.color, style.clip_text_color_dark,
+            "selected 黄 fill には暗文字"
+        );
+        assert_eq!(
+            glyph("normclip").color,
+            style.clip_text_color,
+            "非選択の暗い実効 fill には明文字"
+        );
+
+        // (3) disabled lane は auto-contrast 対象外で従来の固定灰 (bypass marker)。
+        assert_eq!(
+            glyph("disclip").color,
+            style.automation_lane_disabled_color,
+            "disabled lane は automation_lane_disabled_color 固定"
         );
     }
 
