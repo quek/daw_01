@@ -241,6 +241,15 @@ pub struct Song {
     /// migrates to `0`, then `ensure_image_source_ids` lifts it.
     #[serde(default)]
     pub next_image_source_id: ImageSourceId,
+    /// master bus の audio fx chain。 通常 track の `Track.fx_chain` と同 schema
+    /// (= 同 `PluginInstance` を再利用)。 master は instrument / midi_fx を持たず、
+    /// audio fx のみ持つ (master bus に instrument / arpeggiator は無意味)。 automation の
+    /// `song_lanes` と同じく「master 固有データは Track ではなく Song 直下に置く」
+    /// 既存パターン (`automation_lane_by_key_mut` 参照) の踏襲。 audio engine は全
+    /// track mix 後・metronome 前に `(MASTER_TRACK_ID, PluginSlot::Fx(i))` keying で
+    /// 直列 process する。 旧 file は `#[serde(default)]` で空 Vec に forward-migrate。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub master_fx_chain: Vec<PluginInstance>,
 }
 
 fn default_video_resolution() -> (u32, u32) {
@@ -275,6 +284,7 @@ impl Default for Song {
             video_framerate: default_video_framerate(),
             image_sources: HashMap::new(),
             next_image_source_id: 1,
+            master_fx_chain: Vec::new(),
         }
     }
 }
@@ -405,6 +415,31 @@ impl Song {
         }
     }
 
+    /// track と master row を統一的に走査する fx chain accessor。
+    /// `track_id == MASTER_TRACK_ID` なら `master_fx_chain` を、 そうでなければ
+    /// 該当 track の `fx_chain` を引く。 `automation_lane_by_key` と同 idiom
+    /// (master 固有データは Song 直下、 sentinel 分岐で透過アクセス)。 plugin
+    /// install / Inspector / chain 操作 handler から呼ぶ。
+    pub fn fx_chain_by_track_id(&self, track_id: u32) -> Option<&[PluginInstance]> {
+        if track_id == MASTER_TRACK_ID {
+            Some(&self.master_fx_chain)
+        } else {
+            self.track_by_id(track_id).map(|t| t.fx_chain.as_slice())
+        }
+    }
+
+    /// read-write counterpart of `fx_chain_by_track_id`。
+    pub fn fx_chain_by_track_id_mut(
+        &mut self,
+        track_id: u32,
+    ) -> Option<&mut Vec<PluginInstance>> {
+        if track_id == MASTER_TRACK_ID {
+            Some(&mut self.master_fx_chain)
+        } else {
+            self.track_by_id_mut(track_id).map(|t| &mut t.fx_chain)
+        }
+    }
+
     /// Re-assign stable ids to all tracks / clips after loading an older
     /// project file (or any save predating the id schema). Idempotent:
     /// records that already have non-zero ids are left untouched, and
@@ -479,6 +514,20 @@ impl Song {
                 }
             }
             remap_chain(&mut track.fx_chain);
+        }
+
+        // master bus の fx chain も track fx_chain と同じく sidechain_sources を
+        // remap する。 master fx が他 track を sidechain source に取るケースに備える
+        // (track ループ内 `remap_chain` closure は loop scope なので再利用不可、
+        // ここで open-code)。
+        for p in self.master_fx_chain.iter_mut() {
+            for src in p.sidechain_sources.iter_mut() {
+                if let Some(old_id) = *src
+                    && let Some(&new_id) = id_remap.get(&old_id)
+                {
+                    *src = Some(new_id);
+                }
+            }
         }
 
         // Phase 5: song-level lane の id も同様に採番。 sentinel (0) のみ

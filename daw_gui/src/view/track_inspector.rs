@@ -1516,6 +1516,20 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 下端: + Inst / + FX / + MIDI FX。Reaper folder 流で group track
     // も全機能を持てる仕様 (plan_group_track.md §1)、よって group も
     // 普通 track と同じ 3 ボタン表示。
+    // master bus は audio fx のみ持つので「+ FX」 1 本だけを全幅で出す。
+    if app.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
+        ui.button_at(
+            "inspector_add_fx",
+            "+ FX",
+            Rect { x: area.x + pad, y: btns_y, w: area.w - pad * 2.0, h: btns_h },
+            || {
+                Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Fx))
+                })
+            },
+        );
+        return;
+    }
     let btn_w = (area.w - pad * 2.0 - 12.0) / 3.0;
     ui.button_at(
         "inspector_add_inst",

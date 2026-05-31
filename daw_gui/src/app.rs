@@ -1483,6 +1483,9 @@ impl AppData {
         if n_selected > 1 {
             return format!("{n_selected} tracks selected");
         }
+        if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
+            return "Master".into();
+        }
         match self.cursor_track_index() {
             Some(idx) => self
                 .song
@@ -1509,6 +1512,24 @@ impl AppData {
     /// feeding a track its own output into a sidechain creates a
     /// feedback loop the schedule compiler catches with `GraphError::Cycle`.
     pub fn sidechain_entries(&self) -> Vec<SidechainEntry> {
+        // master bus は audio fx のみ。 各 master fx を sidechain entry として
+        // 返す (slot_kind=2 / track_id=MASTER_TRACK_ID)。 source 選択肢は通常
+        // track 同様 sidechain_source_choices が全 track を列挙する。
+        if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
+            return self
+                .song
+                .master_fx_chain
+                .iter()
+                .enumerate()
+                .map(|(i, p)| SidechainEntry {
+                    track_id: common::model::MASTER_TRACK_ID,
+                    slot_kind: 2,
+                    slot_index: i as u32,
+                    plugin_name: resolve_plugin_name(&self.plugin_db, &p.plugin_id),
+                    current_source: p.sidechain_sources.first().copied().flatten(),
+                })
+                .collect();
+        }
         let Some(track) = self
             .cursor_track_index()
             .and_then(|i| self.song.tracks.get(i))
@@ -1794,6 +1815,21 @@ impl AppData {
     }
 
     pub fn inspector_chain(&self) -> Vec<ChainEntry> {
+        // master bus は audio fx のみ。 master_fx_chain を FX section として返す。
+        if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
+            return self
+                .song
+                .master_fx_chain
+                .iter()
+                .enumerate()
+                .map(|(i, p)| ChainEntry {
+                    slot_kind: 2,
+                    slot_index: i as u32,
+                    section_label: "FX".into(),
+                    plugin_name: resolve_plugin_name(&self.plugin_db, &p.plugin_id),
+                })
+                .collect();
+        }
         let Some(idx) = self.cursor_track_index() else {
             return Vec::new();
         };
@@ -2326,6 +2362,46 @@ pub fn compute_slot_reconcile_actions(
         }
 
         // (2) Song にあるが host に無い、 もしくは plugin_id_str が違う slot → LoadSlot
+        for (slot, inst) in song_slots {
+            let need_load = match loaded_slots.get(&(track_id, slot)) {
+                None => true,
+                Some(info) => info.plugin_id_str != inst.plugin_id,
+            };
+            if !need_load {
+                continue;
+            }
+            actions.push(SlotReconcileAction::LoadSlot {
+                track_id,
+                slot,
+                plugin_id_str: inst.plugin_id.clone(),
+                initial_state: inst.state.clone(),
+            });
+        }
+    }
+
+    // master bus fx chain。 通常 track と同じ reconcile を `track_id ==
+    // MASTER_TRACK_ID` / `PluginSlot::Fx(i)` keying で行う。 master は audio fx
+    // のみ持つので midi_fx / instrument 分岐は無い。
+    {
+        let track_id = common::model::MASTER_TRACK_ID;
+        let mut song_slots: Vec<(PluginSlot, &common::model::PluginInstance)> = Vec::new();
+        for (i, p) in song.master_fx_chain.iter().enumerate() {
+            song_slots.push((PluginSlot::Fx(i as u32), p));
+        }
+        let song_slot_set: std::collections::HashSet<PluginSlot> =
+            song_slots.iter().map(|(s, _)| *s).collect();
+
+        let mut host_extra_slots: Vec<PluginSlot> = loaded_slots
+            .iter()
+            .filter(|((tid, _), _)| *tid == track_id)
+            .map(|((_, s), _)| *s)
+            .filter(|s| !song_slot_set.contains(s))
+            .collect();
+        host_extra_slots.sort_by_key(|s| slot_sort_key(*s));
+        for slot in host_extra_slots {
+            actions.push(SlotReconcileAction::RemoveSlot { track_id, slot });
+        }
+
         for (slot, inst) in song_slots {
             let need_load = match loaded_slots.get(&(track_id, slot)) {
                 None => true,
@@ -5485,6 +5561,10 @@ impl AppData {
                 to_send.push((t, PluginSlot::Fx(i as u32), p.clone()));
             }
         }
+        // master bus fx chain も `(MASTER_TRACK_ID, Fx(i))` で送る。
+        for (i, p) in song.master_fx_chain.iter().enumerate() {
+            to_send.push((common::model::MASTER_TRACK_ID, PluginSlot::Fx(i as u32), p.clone()));
+        }
         for (track, slot, inst) in to_send {
             let Some(entry) = db.find_by_id(&inst.plugin_id) else {
                 tracing::error!(id = %inst.plugin_id, track, ?slot, "plugin id not in database");
@@ -5611,9 +5691,10 @@ impl AppData {
     /// `RequestAllStates` を発行する意味が無いので、 deferred / save の
     /// dispatcher は plugin なしを早期判定して即時実行に切り替える。
     fn song_has_plugin(&self) -> bool {
-        self.song.tracks.iter().any(|t| {
-            t.instrument.is_some() || !t.fx_chain.is_empty() || !t.midi_fx_chain.is_empty()
-        })
+        !self.song.master_fx_chain.is_empty()
+            || self.song.tracks.iter().any(|t| {
+                t.instrument.is_some() || !t.fx_chain.is_empty() || !t.midi_fx_chain.is_empty()
+            })
     }
 
     /// `AllPluginStates` で受け取った各 plugin の state を `Song` の
@@ -5640,6 +5721,16 @@ impl AppData {
                     error = s.error.as_deref(),
                     "apply_plugin_states: state save errored, preserving previous state",
                 );
+                continue;
+            }
+            // master bus は track ではなく Song.master_fx_chain に書き戻す
+            // (audio fx のみなので Fx slot だけ扱う)。
+            if s.track == common::model::MASTER_TRACK_ID {
+                if let PluginSlot::Fx(i) = s.slot
+                    && let Some(p) = self.song.master_fx_chain.get_mut(i as usize)
+                {
+                    p.state = s.data.clone();
+                }
                 continue;
             }
             let Some(track) = self.song.tracks.iter_mut().find(|t| t.id == s.track) else {
@@ -11575,9 +11666,33 @@ impl AppData {
             },
         );
         self.ensure_first_track();
-        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
-            return;
-        };
+        // master bus は track Vec に居ないので master_fx_chain に reconcile する。
+        // master は audio fx のみ (Fx slot) を持つ。 track 経路の sidechain 保存
+        // idiom をそのまま適用 (= 既存 instance の state/format/sidechain を引き継ぐ)。
+        // 以降の共通 finalize (sync / gui_open / pending_play flush) は master /
+        // track どちらも通る (early return しない)。
+        if track_id == common::model::MASTER_TRACK_ID {
+            if let PluginSlot::Fx(i) = slot {
+                let i = i as usize;
+                let (existing_state, format, existing_sc) = self
+                    .song
+                    .master_fx_chain
+                    .get(i)
+                    .map(|p| (p.state.clone(), p.format, p.sidechain_sources.clone()))
+                    .unwrap_or((None, PluginFormat::Clap, Vec::new()));
+                let inst = common::model::PluginInstance {
+                    plugin_id: id,
+                    format,
+                    state: existing_state,
+                    sidechain_sources: existing_sc,
+                };
+                if i < self.song.master_fx_chain.len() {
+                    self.song.master_fx_chain[i] = inst;
+                } else {
+                    self.song.master_fx_chain.push(inst);
+                }
+            }
+        } else if let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) {
         // PR4.5 sidechain wiring preservation: when a plugin finishes
         // loading via SlotPluginLoaded, we replace the existing
         // PluginInstance with a fresh one carrying the resolved id +
@@ -11642,6 +11757,11 @@ impl AppData {
                     t.midi_fx_chain.push(inst);
                 }
             }
+        }
+        } else {
+            // track id が Vec に無い (load 中に track 削除された等)。 master でも
+            // なく該当 track も居ないので、 従来どおり finalize せず early return。
+            return;
         }
 
         // ユーザーが手動追加した plugin の load 完了 finalize:
@@ -11803,11 +11923,12 @@ impl AppData {
             1 => PluginSlot::Instrument,
             _ => PluginSlot::Fx(slot_index),
         };
-        // PR2.1: plugin_host_windows / IPC は track_id ベース。
-        let Some(track_idx) = self.cursor_track_index() else {
+        // PR2.1: plugin_host_windows / IPC は track_id ベース。 master 選択時は
+        // cursor_track_id が MASTER_TRACK_ID を返す (Vec に居ないので index 経由
+        // 不可)。
+        let Some(track_id) = self.cursor_track_id() else {
             return;
         };
-        let track_id = self.song.tracks[track_idx].id;
         // 既に開いていれば閉じる (toggle)。開いていなければ open_slot_gui で開く。
         #[cfg(windows)]
         {
@@ -11828,13 +11949,24 @@ impl AppData {
             if self.plugin_host_windows.contains_key(&(track_id, slot)) {
                 return;
             }
-            let label = self
-                .song
-                .tracks
-                .iter()
-                .find(|t| t.id == track_id)
-                .and_then(|t| self.slot_ref_name(t, slot))
-                .unwrap_or_else(|| "(unknown)".into());
+            let label = if track_id == common::model::MASTER_TRACK_ID {
+                match slot {
+                    PluginSlot::Fx(i) => self
+                        .song
+                        .master_fx_chain
+                        .get(i as usize)
+                        .map(|p| format!("Master / {}", self.resolve_name(&p.plugin_id))),
+                    _ => None,
+                }
+                .unwrap_or_else(|| "Master".into())
+            } else {
+                self.song
+                    .tracks
+                    .iter()
+                    .find(|t| t.id == track_id)
+                    .and_then(|t| self.slot_ref_name(t, slot))
+                    .unwrap_or_else(|| "(unknown)".into())
+            };
             match crate::view::plugin_embed::PluginHostWindow::create(
                 800,
                 600,
@@ -11903,6 +12035,19 @@ impl AppData {
         if !same_section {
             return;
         }
+        // master bus は chain が master_fx_chain (FX only) なので、 order を
+        // そのまま適用する (midi/inst section が無いので fx_start == 0)。
+        if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
+            let fx_count = self.song.master_fx_chain.len();
+            if fx_count > 0 {
+                let new_fx: Vec<_> = (0..fx_count)
+                    .map(|new_i| self.song.master_fx_chain[order[new_i]].clone())
+                    .collect();
+                self.song.master_fx_chain = new_fx;
+            }
+            self.sync_song_to_plugin_host();
+            return;
+        }
         let track_idx = self.cursor_track_index().unwrap_or(0) as u32;
         let Some(track) = self.song.tracks.get_mut(track_idx as usize) else {
             return;
@@ -11949,15 +12094,21 @@ impl AppData {
         port: u8,
         source: Option<u32>,
     ) {
-        let Some(track) = self.song.track_by_id_mut(track_id) else {
-            return;
+        // master bus は track Vec に居ないので master_fx_chain (Fx slot のみ)
+        // を対象にする。
+        let inst = if track_id == common::model::MASTER_TRACK_ID {
+            self.song.master_fx_chain.get_mut(slot_index as usize)
+        } else {
+            let Some(track) = self.song.track_by_id_mut(track_id) else {
+                return;
+            };
+            match slot_kind {
+                0 => track.midi_fx_chain.get_mut(slot_index as usize),
+                1 => track.instrument.as_mut(),
+                _ => track.fx_chain.get_mut(slot_index as usize),
+            }
         };
-        let plugin = match slot_kind {
-            0 => track.midi_fx_chain.get_mut(slot_index as usize),
-            1 => track.instrument.as_mut(),
-            _ => track.fx_chain.get_mut(slot_index as usize),
-        };
-        let Some(inst) = plugin else { return };
+        let Some(inst) = inst else { return };
         let port_idx = port as usize;
         if inst.sidechain_sources.len() <= port_idx {
             inst.sidechain_sources.resize(port_idx + 1, None);
@@ -11974,10 +12125,10 @@ impl AppData {
             1 => PluginSlot::Instrument,
             _ => PluginSlot::Fx(slot_index),
         };
-        let Some(track_idx) = self.cursor_track_index() else {
+        // master 選択時は cursor_track_id == MASTER_TRACK_ID (Vec に居ない)。
+        let Some(track_id) = self.cursor_track_id() else {
             return;
         };
-        let track_id = self.song.tracks[track_idx].id;
 
         if !self.song_has_plugin() {
             self.push_undo_snapshot();
@@ -11990,6 +12141,24 @@ impl AppData {
     }
 
     fn remove_slot_inner(&mut self, track_id: u32, slot: PluginSlot) {
+        // master bus は track Vec に居ないので master_fx_chain から削除する。
+        // host への RemoveSlotPlugin + GUI cleanup + slot cache 削除は track と
+        // 共通 idiom。 master は Fx slot のみ。
+        if track_id == common::model::MASTER_TRACK_ID {
+            self.send_plugin(MainToChild::RemoveSlotPlugin {
+                track: track_id,
+                slot,
+            });
+            self.cleanup_slot_gui(track_id, slot);
+            self.loaded_slots.remove(&(track_id, slot));
+            if let PluginSlot::Fx(i) = slot {
+                let i = i as usize;
+                if i < self.song.master_fx_chain.len() {
+                    self.song.master_fx_chain.remove(i);
+                }
+            }
+            return;
+        }
         let Some(track_idx) = self.song.track_index_by_id(track_id) else {
             return;
         };
@@ -12633,6 +12802,37 @@ impl AppData {
         let entry_id = entry.id.clone();
         let entry_format = entry.format;
         self.ensure_first_track();
+
+        // master bus 選択時は track Vec ではなく Song.master_fx_chain を対象に
+        // する。 master は audio fx のみ持つので Instrument / MidiFx target は
+        // 無視 (= inspector は master 選択時に「+ FX」しか出さない)。
+        if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
+            if self.plugin_picker_target != PickerTarget::Fx {
+                tracing::warn!(
+                    ?self.plugin_picker_target,
+                    "master bus に instrument / midi fx は挿せない (audio fx のみ)"
+                );
+                return;
+            }
+            let track_id = common::model::MASTER_TRACK_ID;
+            let dest_slot = PluginSlot::Fx(self.song.master_fx_chain.len() as u32);
+            self.track_pending_load(track_id, dest_slot);
+            self.pending_added_plugin_finalize.insert((track_id, dest_slot));
+            self.send_plugin(MainToChild::SetSlotPlugin {
+                track: track_id,
+                slot: dest_slot,
+                format: entry_format,
+                path,
+                plugin_id: entry_id.clone(),
+                initial_state: None,
+            });
+            self.song.master_fx_chain.push(common::model::PluginInstance::new(
+                entry_id,
+                entry_format,
+            ));
+            return;
+        }
+
         let Some(track_idx) = self.cursor_track_index() else {
             return;
         };
@@ -14925,6 +15125,57 @@ mod aspect_fit_tests {
     fn zero_dimension_falls_back_to_full_screen() {
         assert_eq!(aspect_fit_pip_rect((0, 1080), (500, 500)), (0.0, 0.0, 1.0, 1.0));
         assert_eq!(aspect_fit_pip_rect((1920, 1080), (0, 500)), (0.0, 0.0, 1.0, 1.0));
+    }
+}
+
+#[cfg(test)]
+mod master_fx_tests {
+    use super::{compute_slot_reconcile_actions, SlotReconcileAction};
+    use common::model::{MASTER_TRACK_ID, PluginInstance, Song};
+    use common::plugin_format::PluginFormat;
+    use common::protocol::PluginSlot;
+    use std::collections::HashMap;
+
+    #[test]
+    fn reconcile_emits_loadslot_for_master_fx() {
+        // master_fx_chain に 1 plugin、 host (loaded_slots) は空 → master の
+        // Fx(0) に対する LoadSlot が 1 件出る。
+        let mut song = Song::default();
+        song.master_fx_chain.push(PluginInstance::new(
+            "vendor.reverb".to_string(),
+            PluginFormat::Clap,
+        ));
+        let loaded = HashMap::new();
+        let actions = compute_slot_reconcile_actions(&song, &loaded);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                SlotReconcileAction::LoadSlot { track_id, slot, plugin_id_str, .. }
+                    if *track_id == MASTER_TRACK_ID
+                        && *slot == PluginSlot::Fx(0)
+                        && plugin_id_str == "vendor.reverb"
+            )),
+            "master fx に対する LoadSlot が emit されること: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn master_fx_chain_survives_serde_roundtrip_and_forward_migrates() {
+        // master_fx_chain 付き Song を JSON 経由で往復しても保持される。
+        let mut song = Song::default();
+        song.master_fx_chain.push(PluginInstance::new(
+            "vendor.eq".to_string(),
+            PluginFormat::Clap,
+        ));
+        let json = serde_json::to_string(&song).unwrap();
+        let back: Song = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.master_fx_chain.len(), 1);
+        assert_eq!(back.master_fx_chain[0].plugin_id, "vendor.eq");
+
+        // master_fx_chain field を持たない旧 file は空 Vec に forward-migrate。
+        let legacy = r#"{"bpm":120.0,"time_sig":[4,4],"length_beats":16.0}"#;
+        let migrated: Song = serde_json::from_str(legacy).unwrap();
+        assert!(migrated.master_fx_chain.is_empty());
     }
 }
 

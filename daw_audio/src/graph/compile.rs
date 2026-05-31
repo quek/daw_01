@@ -268,6 +268,30 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         dst: BufRef::Master,
     });
 
+    // master bus fx chain の sidechain。 master Mix の **後** に SidechainTap を
+    // 積む (= source track の scratch は dispatch_and_wait で確定済み)。
+    // `execute_schedule_post_dispatch` がこの tap を処理して source scratch を
+    // master fx plugin の `pd.buffer_aux_in[port]` に staging し、 直後の
+    // `process_master_fx_chain` が plugin process でそれを読む。 dst_track は
+    // `MASTER_TRACK_ID`、 dst_slot は `Fx(i)` (master は audio fx のみ)。 source
+    // が song に居ない dangling は寛容に skip (= track 経路と同方針)。
+    for (slot_idx, inst) in song.master_fx_chain.iter().enumerate() {
+        for (port_idx, src_track_id_opt) in inst.sidechain_sources.iter().enumerate() {
+            let Some(src_track_id) = src_track_id_opt else {
+                continue;
+            };
+            let Some(&src_idx) = id_to_idx.get(src_track_id) else {
+                continue;
+            };
+            nodes.push(NodeOp::SidechainTap {
+                src: BufRef::TrackScratch(src_idx),
+                dst_track: common::model::MASTER_TRACK_ID,
+                dst_slot: common::protocol::PluginSlot::Fx(slot_idx as u32),
+                aux_in_port: port_idx as u8,
+            });
+        }
+    }
+
     // ---- PR3: Plugin Delay Compensation ----
     //
     // 各 track の **path latency** を計算し、 Mix の合流点で path 間の
@@ -1356,6 +1380,64 @@ mod tests {
         assert!(
             tap_idx < dst_proc_idx,
             "SidechainTap must run before destination ProcessTrack: tap={tap_idx} dst={dst_proc_idx}"
+        );
+    }
+
+    #[test]
+    fn master_fx_sidechain_emits_tap_after_master_mix() {
+        use common::model::{PluginInstance, MASTER_TRACK_ID};
+        use common::plugin_format::PluginFormat;
+        use common::protocol::PluginSlot;
+
+        // Track 1 → master bus fx[0] の aux input。 master fx の SidechainTap は
+        // master Mix の **後** (source scratch 確定後) に emit される。
+        let song = Song {
+            tracks: vec![Track {
+                id: 1,
+                name: "Source".into(),
+                ..Track::default()
+            }],
+            master_fx_chain: vec![PluginInstance {
+                plugin_id: "test.bus_comp".into(),
+                format: PluginFormat::Vst3,
+                state: None,
+                sidechain_sources: vec![Some(1)],
+            }],
+            ..Song::default()
+        };
+        let sched = compile_schedule(&song).unwrap();
+
+        let tap_idx = sched
+            .nodes
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    NodeOp::SidechainTap {
+                        src: BufRef::TrackScratch(0),
+                        dst_track,
+                        dst_slot: PluginSlot::Fx(0),
+                        aux_in_port: 0,
+                    } if *dst_track == MASTER_TRACK_ID
+                )
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected master SidechainTap (src=TrackScratch(0), dst=MASTER,Fx(0)); \
+                     nodes={:?}",
+                    sched.nodes
+                )
+            });
+
+        // master Mix が tap より前 (= 全 track mix 後に source scratch から copy)。
+        let master_mix_idx = sched
+            .nodes
+            .iter()
+            .position(|op| matches!(op, NodeOp::Mix { dst: BufRef::Master, .. }))
+            .expect("master Mix missing");
+        assert!(
+            master_mix_idx < tap_idx,
+            "master SidechainTap must run after master Mix: mix={master_mix_idx} tap={tap_idx}"
         );
     }
 

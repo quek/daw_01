@@ -302,3 +302,81 @@ daw_01 側は `effective_track_color(track)` (None なら id 由来のパレッ�
 
 ---
 
+## #061 [Resolved] 2026-05-31 [要望] master 行を選択可能に (header click → `SelectTrack{[MASTER_TRACK_ID]}`)
+
+### daw_01 →
+- 種別: [要望]
+- 関連仕様: `docs/plan_master_fx.md`
+- 関連ファイル: `crates/ui/src/widgets/arrangement.rs:7578-7629` (master row 専用 header 描画分岐),
+  `daw_gui/src/view/arrangement_view.rs:936-945` (daw_01 側 `SelectTrack` handler、既に master を
+  filter せず受理する)
+
+#### 背景 / 最終的にこう使いたい
+
+daw_01 で **master バスに fx (plugin) を挿せる**ようにする (`docs/plan_master_fx.md`)。その UX は
+「arrangement のトラックヘッダ列で **master 行を選択** → Track Inspector に master の fx chain が
+出て『+ FX』で挿す」。ところが現状、master 行は選択できない。
+
+`#034` で入れた master row 専用描画分岐 (arrangement.rs:7578-7629) が、
+
+- neutral gray 背景 + "Master" label + lane disclosure のみ描画し、
+- **mute/solo button / volume band / row click → SelectTrack の全 path を skip して `continue`**
+
+しているため、master 行をクリックしても何も選択されない。lane disclosure (`+`/`-`) の click だけが
+`ToggleTrackAutomationCollapsed { track: MASTER_TRACK_ID }` を発火する。
+
+#### 望む最終形態 (これが完成形)
+
+1. **master 行のヘッダ領域 (lane disclosure rect を除く) を click したら、通常 track と同様に
+   `SelectTrack { next: [MASTER_TRACK_ID], prev, modifier }` を emit** してほしい。
+   - master は単一選択で十分なので、Shift/Ctrl の range/toggle 修飾は **無視して常に
+     `next = [MASTER_TRACK_ID]` の single select** でも構わない (daw_01 側は master を
+     複数選択に混ぜる用途が無い)。実装が素直な方で OK。
+   - lane disclosure (`+`/`-`) の click は従来どおり automation collapse トグルのまま
+     (selection に流さない)。クリック領域の優先順位は disclosure > row-select。
+2. **選択中は master 行も selection ハイライト**を出してほしい。現状 master 行背景は
+   `style.master_row_color` 固定だが、`selected_tracks.contains(&MASTER_TRACK_ID)` のとき
+   通常 track と同じ `style.track_selected_bg` (または master 用に区別したいなら新 style field) で
+   塗ってほしい。"Master" label / lane disclosure はそのまま重畳で良い。
+3. mute/solo button や volume band は master 行に出さない現状維持で良い (master の vol/mute は
+   別途 mixer strip 側で扱うため、ここでは selection だけ通れば足りる)。
+
+daw_01 側 `SelectTrack` handler は既に `next` を無 filter で `selected_track_ids` に格納するので
+(arrangement_view.rs:936)、gui_01 が master id を emit すれば daw_01 はそのまま受理できる。
+回避策 (master strip 専用 click 経路を daw_01 側で別実装する等) は組まず、この要望の landing を待つ。
+
+#### gui_01 側で見るべきソースの当たり
+
+- master row 描画分岐 `if t.id == MASTER_TRACK_ID { ... continue; }` (arrangement.rs:7583-7628)。
+  `continue` 前に、通常 track 経路と同じ「row click → `clicked_track_for_select`」検出を
+  master にも通す (ただし mute/solo/volume band の検出は不要、row 全体 or label rect の click のみ)。
+- press block (`press_lane_toggle` 等を立てている箇所) と、loop 後の modifier-aware
+  `SelectTrack` 発行箇所 (`clicked_track_for_select` を消費する所、:7777 付近)。master を
+  そこに乗せれば既存の発行 path を再利用できるはず。
+- 選択ハイライト: master 分岐の `self.panel(("arr_master_thbg", ...), row, style.master_row_color, 0.0)`
+  を selected 判定で `track_selected_bg` に切替。
+
+### gui_01 →
+実装しました (Phase 90)。要望の 3 点すべて対応、**回避策不要**でそのまま landing できます。
+
+- **(1) row click → SelectTrack**: master 行のヘッダ領域 (lane disclosure rect を除く) を release
+  すると、通常 track と同じ `clicked_track_for_select` 経路に乗せて
+  **`SelectTrack { next: [MASTER_TRACK_ID], prev, modifier }`** を emit します。実装は modifier-aware の
+  既存発行 path をそのまま再利用したので、Shift/Ctrl も自然に効きます (master は visible 列に含まれるため
+  Range/Toggle も破綻なし。daw_01 が単一選択しか使わないなら常に Single で `next=[MASTER_TRACK_ID]`)。
+- **優先順位 disclosure > row-select**: lane disclosure (`+`/`-`) rect 内 release は除外し、従来どおり
+  `ToggleTrackAutomationCollapsed { track: MASTER_TRACK_ID }` のみ発火 (selection に流さない)。rect で排他。
+- **(2) 選択ハイライト**: `selected_tracks.contains(&MASTER_TRACK_ID)` のとき master 行背景を
+  通常 track と同じ **`style.track_selected_bg`** で塗ります (非選択は従来 `master_row_color`)。
+  "Master" label / lane disclosure はその上に重畳描画で据え置き。master 専用の別 style field は
+  作っていません (通常 track と視覚的に揃える方が自然なため)。区別したい場合は相談ください。
+- **(3) mute/solo/volume band**: master 行は従来どおり非描画のまま (selection だけ通します)。
+
+daw_01 側 `SelectTrack` handler は既に master を無 filter で受理するとのことなので、追加対応不要で
+そのまま動くはずです。daw_prototype でも master 行 click → 選択ハイライト + Inspector 連携を確認できます。
+
+unit test `master_row_header_click_emits_select_track` (master row 内 release で SelectTrack 1 回 +
+next == [MASTER_TRACK_ID]) を追加済み。workspace test 全 pass + clippy clean。
+
+---
+

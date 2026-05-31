@@ -853,6 +853,25 @@ impl LocalState {
                 looping,
             );
 
+            // master bus fx chain。 全 track mix 後・metronome 前に直列 process
+            // する (= metronome guide は master fx を通さない、 track fx と同じ
+            // worker dispatch idiom)。 master_fx_chain が空なら即 return で CPU 0。
+            process_master_fx_chain(
+                &song.master_fx_chain,
+                &mut self.master_l[..n],
+                &mut self.master_r[..n],
+                &plugin_refs_g,
+                &slot_map_g,
+                worker_syncs_g.first(),
+                sample_rate,
+                n as u32,
+                playing,
+                Some(song),
+                current_bpm,
+                self.playhead_beats,
+                looping,
+            );
+
             // Phase 7 B3 (2026-05-13): metronome click を master mix に追加。
             // export 中 / playing でない / metronome_enabled false のいずれ
             // でも skip (= mix 自体が走らないので CPU 0)。 enable 時は beat
@@ -1456,6 +1475,59 @@ pub fn reduce_master(
             master_l[i] += tr.track_l[i];
             master_r[i] += tr.track_r[i];
         }
+    }
+}
+
+/// master bus の audio fx chain を直列 process する。 全 track が
+/// `master_l/r` に mix され終わった後・metronome を重ねる前に呼ばれる。
+/// track fx (`process_track_owned` の Audio FX chain 部) と同じ buffer io
+/// idiom: plugin は `(MASTER_TRACK_ID, PluginSlot::Fx(i))` keying で worker
+/// pool 経由 dispatch し、 in-place で `master_l/r` を上書きする。
+///
+/// master fx param automation は現状 song に target lane が無いので
+/// `fill_pd_param_events` は呼ばない (= 呼んでも no-op、 将来機能)。
+/// RT 規約: ヒープ確保 / lock / I/O なし。 buffer は呼び出し側が事前確保した
+/// `master_l/r` と plugin 側 ProcessData shmem のみを使う。
+#[allow(clippy::too_many_arguments)]
+pub fn process_master_fx_chain(
+    master_fx_chain: &[common::model::PluginInstance],
+    master_l: &mut [f32],
+    master_r: &mut [f32],
+    plugin_refs: &HashMap<u32, PluginRef>,
+    slot_to_plugin_id: &HashMap<(u32, PluginSlot), u32>,
+    worker_sync: Option<&WorkerSyncRef>,
+    sample_rate: u32,
+    frames: u32,
+    playing: bool,
+    song: Option<&Song>,
+    current_bpm: f32,
+    playhead_beats: f64,
+    looping: bool,
+) {
+    let n = frames as usize;
+    let Some(ws) = worker_sync else { return };
+    for i in 0..master_fx_chain.len() {
+        let key = (common::model::MASTER_TRACK_ID, PluginSlot::Fx(i as u32));
+        let Some(&plugin_id) = slot_to_plugin_id.get(&key) else {
+            continue;
+        };
+        let Some(plugin_ref) = plugin_refs.get(&plugin_id) else {
+            continue;
+        };
+        let pd = plugin_ref.data_mut();
+        pd.prepare();
+        pd.frames = frames;
+        pd.playing = if playing { 1 } else { 0 };
+        pd.sample_rate = sample_rate;
+        set_pd_transport(pd, song, current_bpm, playhead_beats, looping);
+        pd.buffer_in[0][..n].copy_from_slice(&master_l[..n]);
+        pd.buffer_in[1][..n].copy_from_slice(&master_r[..n]);
+        if let Err(e) = ws.dispatch(plugin_id) {
+            tracing::error!(error = ?e, plugin_id, "master fx dispatch failed");
+            continue;
+        }
+        master_l[..n].copy_from_slice(&pd.buffer_out[0][..n]);
+        master_r[..n].copy_from_slice(&pd.buffer_out[1][..n]);
     }
 }
 
