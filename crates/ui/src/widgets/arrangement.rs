@@ -913,6 +913,16 @@ pub struct ArrangementStyle {
     pub clip_selected_border: Color,
     pub clip_selected_border_w: f32,
     pub clip_text_color: Color,
+    /// M14 Phase 89 (daw_01 #060): auto-contrast が「暗い文字」を選んだときの色 (明るい fill 上)。
+    /// `clip_text_color` (明るい文字、暗い fill 上) と対をなす黒寄りプール。 selected clip の
+    /// 旧ハードコード `rgb(0.10, 0.10, 0.15)` をこの field に統合した (SSoT)。
+    pub clip_text_color_dark: Color,
+    /// M14 Phase 89 (daw_01 #060): clip / video clip の名前 + link glyph の色を、 widget が実際に
+    /// 塗る fill の WCAG relative luminance から自動選択するか (default true)。 `true` のとき明るい
+    /// fill には `clip_text_color_dark`、 暗い fill には `clip_text_color` を選びコントラストを最大化
+    /// する (share clip の半透明 fill は lane bg と合成した実効色で判定)。 `false` で常に
+    /// `clip_text_color` 固定 (opt-out)。
+    pub clip_auto_contrast_text: bool,
     pub clip_text_size: f32,
     pub track_selected_bg: Color,
     pub track_text_color: Color,
@@ -1161,6 +1171,9 @@ impl Default for ArrangementStyle {
             clip_selected_border: Color::rgb(1.0, 1.0, 1.0),
             clip_selected_border_w: 2.0,
             clip_text_color: Color::rgb(0.95, 0.95, 0.97),
+            // M14 Phase 89 (daw_01 #060): auto-contrast の暗文字プール (旧 selected ハードコード値)。
+            clip_text_color_dark: Color::rgb(0.10, 0.10, 0.15),
+            clip_auto_contrast_text: true,
             clip_text_size: 11.0,
             track_selected_bg: Color::rgb(0.20, 0.24, 0.32),
             track_text_color: Color::rgb(0.92, 0.92, 0.94),
@@ -2515,6 +2528,43 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32, a: f32) -> Color {
     Color::rgba(r1 + m, g1 + m, b1 + m, a)
 }
 
+/// M14 Phase 89 (daw_01 #060): sRGB 成分 `[0, 1]` から WCAG 2.x relative luminance を算出。
+/// gamma decode (sRGB → linear) を含む。 `Color` は sRGB 前提 (`scene.rs` の doc 参照) なので
+/// そのまま渡してよい。
+fn relative_luminance(r: f32, g: f32, b: f32) -> f32 {
+    fn lin(c: f32) -> f32 {
+        let c = c.clamp(0.0, 1.0);
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+
+/// M14 Phase 89 (daw_01 #060): clip が実際に塗る `fill` の輝度から名前 / link glyph のテキスト色を
+/// 自動選択する (SSoT = widget が唯一 fill を知る)。 WCAG relative luminance が閾値 0.179 を超える
+/// (= 明るい fill) なら `clip_text_color_dark`、 そうでなければ `clip_text_color` を返し、 白/黒文字の
+/// どちらか **コントラスト比が高い方** を選ぶ (0.179 は white/black それぞれとのコントラスト比が
+/// 等しくなる relative luminance)。 `fill.a < 1.0` (share clip の半透明 fill 等) は `lane_bg` と
+/// alpha 合成した実効色で判定する。 `style.clip_auto_contrast_text == false` の opt-out 時は常に
+/// `clip_text_color` を返す。
+fn clip_text_color_for(style: &ArrangementStyle, fill: Color, lane_bg: Color) -> Color {
+    if !style.clip_auto_contrast_text {
+        return style.clip_text_color;
+    }
+    let a = fill.a.clamp(0.0, 1.0);
+    let r = fill.r * a + lane_bg.r * (1.0 - a);
+    let g = fill.g * a + lane_bg.g * (1.0 - a);
+    let b = fill.b * a + lane_bg.b * (1.0 - a);
+    if relative_luminance(r, g, b) > 0.179 {
+        style.clip_text_color_dark
+    } else {
+        style.clip_text_color
+    }
+}
+
 /// M14 Phase 72 (daw_01 #044): `rect` 内に `(tex_w, tex_h)` の native aspect を保ったまま
 /// 中央 letterbox 配置した sub-rect を返す。 余白 (黒帯) は呼び出し側の base fill (= video
 /// clip では `video_clip_loading`) で見える。
@@ -2559,21 +2609,18 @@ fn draw_video_clip<M: ?Sized + 'static>(
     lanes: Rect,
     selected: bool,
 ) {
-    let (fill, border, border_w, text_color) = if selected {
+    let (fill, border, border_w) = if selected {
         (
             style.clip_selected_fill,
             style.clip_selected_border,
             style.clip_selected_border_w,
-            Color::rgb(0.10, 0.10, 0.15),
         )
     } else {
-        (
-            style.video_clip_loading,
-            style.clip_border,
-            style.clip_border_w,
-            style.clip_text_color,
-        )
+        (style.video_clip_loading, style.clip_border, style.clip_border_w)
     };
+    // M14 Phase 89 (daw_01 #060): 名前色は fill 輝度から auto-contrast (selected の黄 fill → 暗文字、
+    // loading の暗 fill → 明文字)。 video lane bg と合成した実効色で判定 (fill は不透明なので no-op)。
+    let text_color = clip_text_color_for(style, fill, style.track_background_video);
     hctx.push_rect(RectCommand {
         rect: r,
         fill,
@@ -2630,12 +2677,11 @@ fn draw_clip<M: ?Sized + 'static>(
     // 組合せで決まる。 selected は selection 色を最優先 (link glyph の有無に依らず) し、
     // share_group_color は非 selected かつ Some(hue) の場合のみ HSL → RGB で fill / border を
     // 上書き。 caller の `clip.color` は share clip では ignore (group hue で識別する設計)。
-    let (fill, border, border_w, text_color) = if selected {
+    let (fill, border, border_w) = if selected {
         (
             style.clip_selected_fill,
             style.clip_selected_border,
             style.clip_selected_border_w,
-            Color::rgb(0.10, 0.10, 0.15),
         )
     } else if let Some(hue) = clip.share_group_color {
         let fill_c = hsl_to_rgb(
@@ -2650,15 +2696,17 @@ fn draw_clip<M: ?Sized + 'static>(
             style.share_group_border_lightness,
             1.0,
         );
-        (fill_c, border_c, style.clip_border_w, style.clip_text_color)
+        (fill_c, border_c, style.clip_border_w)
     } else {
         (
             clip.color.unwrap_or(style.clip_default_fill),
             style.clip_border,
             style.clip_border_w,
-            style.clip_text_color,
         )
     };
+    // M14 Phase 89 (daw_01 #060): 名前 + link glyph 色を fill 輝度から auto-contrast。 share clip の
+    // 半透明 fill (alpha < 1) は lane bg (audio lane = `style.bg`) と合成した実効色で判定する。
+    let text_color = clip_text_color_for(style, fill, style.bg);
     hctx.push_rect(RectCommand {
         rect: r,
         fill,
@@ -9013,6 +9061,65 @@ mod tests {
             "strip 幅は style.track_color_strip_w (={}): w={}",
             style.track_color_strip_w,
             strip.rect.w
+        );
+    }
+
+    /// M14 Phase 89 (daw_01 #060): `relative_luminance` が代表色で妥当な値を返す。
+    /// white > yellow > 中間緑 > 暗青 > black の単調性 + 既知極値 (black=0 / white=1)。
+    #[test]
+    fn relative_luminance_monotonic_and_extremes() {
+        let black = relative_luminance(0.0, 0.0, 0.0);
+        let white = relative_luminance(1.0, 1.0, 1.0);
+        assert!(black.abs() < 1e-6, "black の luminance は 0: {black}");
+        assert!((white - 1.0).abs() < 1e-6, "white の luminance は 1: {white}");
+        // 明るい黄 (selected fill) は閾値 0.179 を大きく超え、 暗青 (default clip fill) は下回る。
+        let yellow = relative_luminance(1.0, 0.85, 0.30); // clip_selected_fill
+        let dark_blue = relative_luminance(0.18, 0.40, 0.65); // clip_default_fill
+        assert!(yellow > 0.179, "黄 fill は明るい側: {yellow}");
+        assert!(dark_blue < 0.179, "暗青 fill は暗い側: {dark_blue}");
+        assert!(yellow > dark_blue, "黄 > 暗青 の単調性");
+    }
+
+    /// M14 Phase 89 (daw_01 #060): `clip_text_color_for` が fill 輝度で暗/明文字を選び、
+    /// 半透明 fill は lane bg と合成した実効色で判定し、 opt-out 時は固定色を返す。
+    #[test]
+    fn clip_text_color_for_picks_contrast() {
+        let style = ArrangementStyle::default();
+
+        // 明るい fill (黄 selected) → 暗文字。
+        assert_eq!(
+            clip_text_color_for(&style, style.clip_selected_fill, style.bg),
+            style.clip_text_color_dark,
+            "明るい黄 fill には暗文字"
+        );
+        // 暗い fill (default 青) → 明文字。
+        assert_eq!(
+            clip_text_color_for(&style, style.clip_default_fill, style.bg),
+            style.clip_text_color,
+            "暗い青 fill には明文字"
+        );
+        // 半透明の薄緑 share fill: 不透明なら明るく暗文字寄りだが、 暗い lane bg と alpha 0.3 で
+        // 合成すると実効輝度が下がり明文字が選ばれる (合成判定が効いている証拠)。
+        let pale_green = Color::rgba(0.55, 0.85, 0.55, 0.30);
+        let opaque = clip_text_color_for(
+            &style,
+            Color::rgb(pale_green.r, pale_green.g, pale_green.b),
+            style.bg,
+        );
+        let composited = clip_text_color_for(&style, pale_green, style.bg);
+        assert_eq!(opaque, style.clip_text_color_dark, "不透明な薄緑は暗文字");
+        assert_eq!(
+            composited, style.clip_text_color,
+            "暗 lane bg と合成した薄緑 (alpha 0.3) は明文字"
+        );
+
+        // opt-out: auto を切ると fill に依らず clip_text_color 固定。
+        let mut off = style;
+        off.clip_auto_contrast_text = false;
+        assert_eq!(
+            clip_text_color_for(&off, off.clip_selected_fill, off.bg),
+            off.clip_text_color,
+            "opt-out 時は明るい fill でも clip_text_color 固定"
         );
     }
 
