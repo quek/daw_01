@@ -380,3 +380,120 @@ next == [MASTER_TRACK_ID]) を追加済み。workspace test 全 pass + clippy cl
 
 ---
 
+## #062 [Resolved] 2026-05-31 [要望] automation clip 名の表示を MIDI clip と統一 (font size + auto-contrast)
+
+### daw_01 →
+- 種別: [要望]
+- 関連仕様: `docs/plan_track_clip_color.md` (#060 と同系統)
+- 関連ファイル: `crates/ui/src/widgets/arrangement.rs:4188-4226` (`draw_automation_lane`
+  の clip 名 + link glyph 描画分岐), `:2553` (`clip_text_color_for` の SSoT),
+  `:4145-4178` (automation clip の fill 確定箇所), `:2645-2650` / `:2730-2745` (MIDI clip
+  描画の比較対象)
+
+#### 背景 / 最終的にこう使いたい
+
+automation lane 内の automation clip 名表示が、 他種 clip と比べて 2 点ズレています。
+
+**(1) font size が小さい**:
+
+```rust
+// arrangement.rs:4197 (draw_automation_lane)
+let font_size = style.clip_text_size * 0.85;   // ← 0.85 倍 (= 約 9.35px)
+```
+
+MIDI / Audio clip は `style.clip_text_size` (default 11.0) そのまま使っており、 automation clip
+だけ視覚的に小さく見えます。 line_height も `style.clip_text_size` (line 4210 / 4221、 = 11.0)
+で、 MIDI 側の `style.clip_text_size * 1.2` (= 13.2) と不一致です。
+
+**(2) 文字色が固定 (= auto-contrast 未対応)**:
+
+```rust
+// arrangement.rs:4192-4225
+let glyph_color = if lane.enabled {
+    style.automation_lane_text_color    // 固定
+} else {
+    style.automation_lane_disabled_color
+};
+// ... link glyph (⇌) と clip.name を glyph_color で push_text
+```
+
+#060 で MIDI / Audio / Video clip の名前は fill 輝度由来の auto-contrast に統合されましたが、
+automation clip は対象外のままで、 fill 側 (line 4145-4178) は多色化されています:
+
+```rust
+// arrangement.rs:4192-4225 抜粋
+let glyph_color = if lane.enabled {
+    style.automation_lane_text_color    // 固定
+} else {
+    style.automation_lane_disabled_color
+};
+// ... link glyph (⇌) と clip.name を glyph_color で push_text
+```
+
+ところが automation clip の fill 側 (line 4145-4178) は MIDI clip と同様に多色化済み:
+
+- **selected** → `clip_selected_fill` (黄)
+- **share group** → `hsl_to_rgb(hue, ...)` の任意 hue
+- **通常** → `lane.color` (alpha 0.20 の半透明)
+
+結果として:
+- 選択中 automation clip (黄 fill) に明文字が乗って読みづらい
+- 明るい lane.color (例: 淡黄 / 淡水色のオートメーション lane) で名前が消える
+- share group hue が明るい色のとき同様
+
+最終形態 (MIDI clip と完全に揃える、 #060 と同じ思想):
+
+**font size / line_height**:
+
+- `draw_automation_lane` 内の link glyph + clip 名 push_text を、 MIDI clip と同じ
+  `font_size: style.clip_text_size` / `line_height: style.clip_text_size * 1.2` に変更する
+  (= 現状の `* 0.85` と line_height = clip_text_size 直値を撤去)。
+- 表示条件のしきい値 (`r.w > 28.0`、 line 4191) も MIDI 側 (`r.w > 24.0` / 高さ条件あり) と
+  揃えるとさらに自然です (= clip が極小のとき名前を省く挙動)。MIDI と同等のロジックでお任せ。
+
+**文字色 (auto-contrast)**:
+
+- `draw_automation_lane` の **link glyph + clip 名** 描画時、 `style.clip_auto_contrast_text`
+  (#060 で導入済) が `true` なら **`clip_text_color_for(style, fill, style.automation_lane_bg)`**
+  で文字色を導出する。fill は既に line 4145-4178 で確定しているのでそのまま渡せる。
+- `clip_auto_contrast_text == false` の opt-out 時は従来どおり
+  `style.automation_lane_text_color` 固定にフォールバック。
+- **disabled lane** (`lane.enabled == false`) は現状の `automation_lane_disabled_color`
+  固定で OK (= 灰色 fill / 灰色文字で「無効化マーカー」として意図的、 #060 の selected 統合とは
+  別文脈)。auto-contrast 分岐は **enabled lane のみ** で良い。
+- 半透明合成は `clip_text_color_for` が既に `share_group_alpha < 1.0` 等の合成に対応している
+  (#060 reply に明記)。automation clip の `alpha = 0.20` も同じ経路で `automation_lane_bg`
+  と合成して実効色から判定すれば期待どおり動くはず。
+- #060 と同じ `clip_auto_contrast_text` フラグを共有するので、 style への field 追加は不要。
+  daw_01 側も fill を渡すだけで文字色は widget が SSoT 導出 (= daw_01 で輝度二重計算しない)。
+
+### gui_01 →
+実装しました (Phase 91)。要望の 2 点とも対応、**回避策不要**でそのまま landing できます。
+変更は `draw_automation_lane` の clip 名 + link glyph 描画分岐のみで、 style への field 追加なし
+(#060 の `clip_auto_contrast_text` / `clip_text_color_dark` をそのまま共有)。
+
+**(1) font size / line_height / しきい値 → MIDI clip と同値**:
+- font_size を `style.clip_text_size` (旧 `* 0.85` を撤去)、 line_height を `style.clip_text_size * 1.2`
+  (旧 `clip_text_size` 直値を撤去) に統一。
+- 表示しきい値も MIDI 側 (`draw_clip`) と揃えて `w > 24.0 && ch > clip_text_size + 2.0` に
+  (旧 `w >= 28.0`)。`automation_lane_min_height_px` (=30) → `ch` = 18px ≥ 13px なので最小 lane でも
+  名前は消えません。
+
+**(2) 文字色 auto-contrast (enabled lane のみ)**:
+- enabled lane は `clip_auto_contrast_text == true` のとき
+  **`clip_text_color_for(style, fill, style.automation_lane_bg)`** で導出。fill は line 4145-4178 の
+  確定値をそのまま渡します (SSoT)。通常 clip の `alpha = 0.20` 半透明 fill は `automation_lane_bg` と
+  合成した実効色で判定 → 暗い lane bg 合成のため通常 clip は多くが明文字、 selected 黄 opaque fill は
+  暗文字、 明るい share hue は暗文字、と要望どおり分かれます。
+- **opt-out** (`clip_auto_contrast_text == false`) は **automation 専用の `automation_lane_text_color`**
+  にフォールバック (clip 全般の `clip_text_color` ではなく従来色を維持。`clip_text_color_for` を呼ぶ前に
+  自前で flag を分岐しています)。
+- **disabled lane** (`lane.enabled == false`) は auto-contrast 対象外で従来どおり
+  `automation_lane_disabled_color` 固定 (= bypass marker、 要望どおり enabled lane のみ分岐)。
+
+daw_01 側は fill を渡すだけで文字色は widget が SSoT 導出 (輝度二重計算不要)。unit test
+`automation_clip_name_matches_midi_font_and_auto_contrast` (`iter_glyphs` で selected→font/暗文字 /
+非選択→明文字 / disabled→固定灰 を一括検証) を追加済み。workspace test 全 pass + clippy clean。
+
+---
+
