@@ -35,9 +35,10 @@ use vst3::{
             AudioBusBuffers, AudioBusBuffers__type0, BusDirection, BusDirections_, BusInfo,
             Event, Event__type0, Event_, IAudioProcessor, IAudioProcessorTrait, IComponent,
             IComponentTrait, IConnectionPoint, IConnectionPointTrait, IEditController,
-            IEditControllerTrait, IEventList, MediaTypes_, NoteOffEvent, NoteOnEvent,
-            ProcessContext, ProcessContext_::StatesAndFlags_, ProcessData, ProcessModes_,
-            ProcessSetup, SpeakerArr, SpeakerArrangement, SymbolicSampleSizes_,
+            IEditControllerTrait, IEventList, IParameterChanges, MediaTypes_, NoteOffEvent,
+            NoteOnEvent, ParameterInfo, ParameterInfo_::ParameterFlags_, ProcessContext,
+            ProcessContext_::StatesAndFlags_, ProcessData, ProcessModes_, ProcessSetup,
+            SpeakerArr, SpeakerArrangement, SymbolicSampleSizes_,
         },
     },
 };
@@ -45,6 +46,7 @@ use vst3::{
 use crate::plugin_instance::{HostCallbacks, LoadedPlugin, NoteTransition, TimedNoteEvent};
 use crate::vst3_events::{Vst3InEventList, Vst3OutEventList};
 use crate::vst3_host::{Vst3ComponentHandler, Vst3HostApp, Vst3PlugFrame};
+use crate::vst3_params::Vst3InParamChanges;
 use crate::vst3_stream::{Vst3ReadStream, Vst3WriteStream};
 
 /// A loaded VST3 plugin (the IComponent + the associated IEditController
@@ -112,6 +114,11 @@ pub struct Vst3Plugin {
     /// callback).
     in_event_list: ComWrapper<Vst3InEventList>,
     out_event_list: ComWrapper<Vst3OutEventList>,
+    /// Reusable `IParameterChanges` fed to the plugin via
+    /// `ProcessData.inputParameterChanges` every `process()`. Carries
+    /// automation lane values (`TimedParamEvent`) into the plugin. Owned
+    /// here so the audio thread never allocates a COM object per buffer.
+    in_param_changes: ComWrapper<Vst3InParamChanges>,
     /// Transport / timing block the plugin reads via `ProcessData.processContext`.
     /// Several instruments (SynthMaster 3, some Arturia products) stay silent
     /// when this pointer is null because they gate their voice allocator on
@@ -359,6 +366,7 @@ impl Vst3Plugin {
             collected_out_notes: Vec::with_capacity(256),
             in_event_list: ComWrapper::new(Vst3InEventList::new()),
             out_event_list: ComWrapper::new(Vst3OutEventList::new()),
+            in_param_changes: ComWrapper::new(Vst3InParamChanges::new()),
             process_context: unsafe { std::mem::zeroed() },
             render_mode: RenderMode::Realtime,
             view: None,
@@ -662,6 +670,59 @@ impl LoadedPlugin for Vst3Plugin {
         PluginFormat::Vst3
     }
 
+    /// VST3 param 一覧を `IEditController` から列挙。 VST3 の param は仕様上
+    /// 常に normalized [0,1] なので min/max は 0/1 固定、 default は
+    /// `defaultNormalizedValue`。 plugin-main thread で呼ばれる
+    /// (`SetSlotPlugin` 処理経路、 controller は main-thread API)。
+    fn enumerate_params(&self) -> Vec<common::protocol::PluginParamInfo> {
+        let count = unsafe { self.controller.getParameterCount() };
+        if count <= 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            // SAFETY: ParameterInfo is plain data; zeroed start is legal
+            // because getParameterInfo overwrites the fields it populates.
+            let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+            let res = unsafe { self.controller.getParameterInfo(i, &raw mut info) };
+            if res != kResultOk {
+                tracing::warn!(index = i, "IEditController::getParameterInfo non-OK");
+                continue;
+            }
+            let name = utf16_buf_to_string(&info.title);
+            let mut flags: u32 = 0;
+            if info.flags & ParameterFlags_::kCanAutomate != 0 {
+                flags |= common::protocol::plugin_param_flags::AUTOMATABLE;
+            }
+            if info.flags & ParameterFlags_::kIsReadOnly != 0 {
+                flags |= common::protocol::plugin_param_flags::READONLY;
+            }
+            if info.flags & ParameterFlags_::kIsHidden != 0 {
+                flags |= common::protocol::plugin_param_flags::HIDDEN;
+            }
+            // VST3 の離散 param は stepCount > 0 (kIsList は enum 型)。 どちらも
+            // CLAP の STEPPED 相当として扱う。
+            if info.stepCount > 0 || info.flags & ParameterFlags_::kIsList != 0 {
+                flags |= common::protocol::plugin_param_flags::STEPPED;
+            }
+            if info.flags & ParameterFlags_::kIsWrapAround != 0 {
+                flags |= common::protocol::plugin_param_flags::PERIODIC;
+            }
+            out.push(common::protocol::PluginParamInfo {
+                id: info.id,
+                name,
+                // VST3 の module/grouping は unitId + IUnitInfo 階層で表現される。
+                // 現状 daw_gui は flat 表示なので module は空 (CLAP も任意)。
+                module: String::new(),
+                min_value: 0.0,
+                max_value: 1.0,
+                default_value: info.defaultNormalizedValue,
+                flags,
+            });
+        }
+        out
+    }
+
     fn activate(&mut self, sample_rate: f64, _min_frames: u32, max_frames: u32) -> Result<()> {
         anyhow::ensure!(!self.active, "VST3 plugin already active");
 
@@ -862,7 +923,7 @@ impl LoadedPlugin for Vst3Plugin {
         &mut self,
         frames: u32,
         events: &[TimedNoteEvent],
-        _param_events: &[crate::plugin_instance::TimedParamEvent],
+        param_events: &[crate::plugin_instance::TimedParamEvent],
         input_audio: &[&[f32]],
         aux_inputs: &[crate::plugin_instance::AuxInputBuf<'_>],
         transport: &crate::plugin_instance::TransportContext,
@@ -925,6 +986,19 @@ impl LoadedPlugin for Vst3Plugin {
         self.in_event_list.set_events(&self.in_event_buffer);
         self.collected_out_notes.clear();
 
+        // Phase: automation lane の値 (`TimedParamEvent`) を reusable
+        // `IParameterChanges` に詰める。 daw_audio が param lane を評価して
+        // ProcessData.events に積み、 process_server が `param_events` として
+        // 渡してくる。 VST3 の値は normalized [0,1] (= daw_gui の VST3 param
+        // automation も normalized で持つ、 enumerate_params が min0/max1 で
+        // 報告するため整合)。
+        if self.in_param_changes.set_changes(param_events) {
+            tracing::warn!(
+                plugin = %self.name,
+                "VST3 param changes pool overflow (>64 distinct params/buffer); extra dropped"
+            );
+        }
+
         // `to_com_ptr` only bumps the Arc strong count + addRef; no heap
         // allocation. The ComPtrs' Drop at end-of-scope balances the
         // addRef with a release, keeping the ComWrapper's own ref.
@@ -936,6 +1010,10 @@ impl LoadedPlugin for Vst3Plugin {
             .out_event_list
             .to_com_ptr::<IEventList>()
             .context("Vst3OutEventList has no IEventList")?;
+        let in_param_changes_ptr = self
+            .in_param_changes
+            .to_com_ptr::<IParameterChanges>()
+            .context("Vst3InParamChanges has no IParameterChanges")?;
 
         // --- Assemble AudioBusBuffers (main + aux inputs).
         // Phase 6 review (RT 安全): 毎 buffer `Vec::with_capacity` → drop
@@ -1047,7 +1125,12 @@ impl LoadedPlugin for Vst3Plugin {
             } else {
                 std::ptr::null_mut()
             },
-            inputParameterChanges: std::ptr::null_mut(),
+            // automation 入力 (host → plugin)。 borrowed ptr: ComWrapper が
+            // 自前 ref を保持するので in_param_changes_ptr drop 後も生存
+            // (in_list_ptr と同 idiom)。
+            inputParameterChanges: in_param_changes_ptr.as_ptr(),
+            // output param changes (plugin → host の param 自動化書き戻し) は
+            // 現状未使用。 GUI gesture は IComponentHandler 経由で別途取得する。
             outputParameterChanges: std::ptr::null_mut(),
             // as_ptr keeps shared ownership with the ComPtrs above; they
             // release on scope exit, so nothing leaks and no extra release

@@ -81,6 +81,19 @@ pub struct AuxInputBuf<'a> {
 pub struct HostCallbacks {
     pub on_request_resize: Arc<dyn Fn(u32, u32) + Send + Sync>,
     pub on_closed: Arc<dyn Fn() + Send + Sync>,
+    /// VST3 only: plugin GUI で param を触り始めた (`IComponentHandler::
+    /// beginEdit`)。 引数は param_id。 daw_gui の last-touched workflow
+    /// (`A` キー) の起点。 CLAP は out_events 経由なのでこれを使わない
+    /// (= CLAP plugin では呼ばれない)。
+    pub on_param_gesture_begin: Arc<dyn Fn(u32) + Send + Sync>,
+    /// VST3 only: plugin GUI で param 値が変わった (`IComponentHandler::
+    /// performEdit`)。 引数は (param_id, normalized_value)。 daw_gui の
+    /// plugin_param_values cache に積まれ、 automation lane の現在値 source
+    /// になる。
+    pub on_param_value: Arc<dyn Fn(u32, f64) + Send + Sync>,
+    /// VST3 only: plugin GUI で param を離した (`IComponentHandler::
+    /// endEdit`)。 引数は param_id。 gesture lifecycle を閉じる。
+    pub on_param_gesture_end: Arc<dyn Fn(u32) + Send + Sync>,
 }
 
 impl HostCallbacks {
@@ -89,6 +102,9 @@ impl HostCallbacks {
         Self {
             on_request_resize: Arc::new(|_, _| {}),
             on_closed: Arc::new(|| {}),
+            on_param_gesture_begin: Arc::new(|_| {}),
+            on_param_value: Arc::new(|_, _| {}),
+            on_param_gesture_end: Arc::new(|_| {}),
         }
     }
 }

@@ -5,6 +5,7 @@ mod plugin_instance;
 mod process_server;
 mod vst3_events;
 mod vst3_host;
+mod vst3_params;
 mod vst3_plugin;
 mod vst3_stream;
 
@@ -543,6 +544,45 @@ fn plugin_main_loop(
             let tx = evt_tx.clone();
             Arc::new(move || {
                 let _ = tx.send(PluginEvent::SlotGuiClosed { track, slot });
+            })
+        },
+        // VST3 param gesture (IComponentHandler::beginEdit/performEdit/endEdit)。
+        // resize / closed と同 idiom で evt_tx に流す。 plugin_id は
+        // PluginEvent → ChildToMain 変換で破棄される (= daw_gui は (track, slot,
+        // param_id) で解決する) ので 0 placeholder。 CLAP plugin はこの callback
+        // を呼ばない (out_events 経由) ので二重発火しない。
+        on_param_gesture_begin: {
+            let tx = evt_tx.clone();
+            Arc::new(move |param_id| {
+                let _ = tx.send(PluginEvent::PluginParamTouched {
+                    track,
+                    slot,
+                    plugin_id: 0,
+                    param_id,
+                });
+            })
+        },
+        on_param_value: {
+            let tx = evt_tx.clone();
+            Arc::new(move |param_id, value| {
+                let _ = tx.send(PluginEvent::PluginParamValueChanged {
+                    track,
+                    slot,
+                    plugin_id: 0,
+                    param_id,
+                    value,
+                });
+            })
+        },
+        on_param_gesture_end: {
+            let tx = evt_tx.clone();
+            Arc::new(move |param_id| {
+                let _ = tx.send(PluginEvent::PluginParamGestureEnd {
+                    track,
+                    slot,
+                    plugin_id: 0,
+                    param_id,
+                });
             })
         },
     };

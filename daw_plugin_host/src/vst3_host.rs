@@ -78,14 +78,12 @@ impl IHostApplicationTrait for Vst3HostApp {
 // --- IComponentHandler -----------------------------------------------------
 
 pub struct Vst3ComponentHandler {
-    _callbacks: HostCallbacks,
+    callbacks: HostCallbacks,
 }
 
 impl Vst3ComponentHandler {
     pub fn new(callbacks: HostCallbacks) -> Self {
-        Self {
-            _callbacks: callbacks,
-        }
+        Self { callbacks }
     }
 }
 
@@ -94,17 +92,25 @@ impl Class for Vst3ComponentHandler {
 }
 
 impl IComponentHandlerTrait for Vst3ComponentHandler {
-    unsafe fn beginEdit(&self, _id: ParamID) -> tresult {
+    unsafe fn beginEdit(&self, id: ParamID) -> tresult {
+        // plugin GUI で knob を触り始めた。 daw_gui の last-touched param を
+        // 更新する (= `A` キーで automation lane を作る起点)。 callback は
+        // main/GUI thread から呼ばれ、 evt_tx (channel) 送信のみなので
+        // audio thread とは無関係 (ロックなし)。
+        (self.callbacks.on_param_gesture_begin)(id);
         kResultOk
     }
 
-    unsafe fn performEdit(&self, _id: ParamID, _value_normalized: ParamValue) -> tresult {
-        // MVP: ignore automation. A future version would forward parameter
-        // changes to the audio thread via a lock-free queue.
+    unsafe fn performEdit(&self, id: ParamID, value_normalized: ParamValue) -> tresult {
+        // plugin GUI 内での param 値変更。 daw_gui の plugin_param_values
+        // cache を更新し、 automation lane の現在値 source にする。 VST3 の
+        // 値は常に normalized [0,1]。
+        (self.callbacks.on_param_value)(id, value_normalized);
         kResultOk
     }
 
-    unsafe fn endEdit(&self, _id: ParamID) -> tresult {
+    unsafe fn endEdit(&self, id: ParamID) -> tresult {
+        (self.callbacks.on_param_gesture_end)(id);
         kResultOk
     }
 
