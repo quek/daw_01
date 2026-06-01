@@ -342,22 +342,19 @@ fn preview_project_box(
 /// 描画サイズ (10 px) より少し広めの 14 px (= 端を掴みやすく)。
 fn hit_test_handles(
     overlay: (f32, f32, f32, f32),
-    rotation_radians: f32,
+    child_rotation_radians: f32,
+    map: &crate::group_compose::CanvasMap,
     cursor: (f32, f32),
-    screen: (f32, f32),
-    project_resolution: (u32, u32),
 ) -> Option<PreviewDragMode> {
     let (nx, ny, nw, nh) = overlay;
-    // PiP rect は project_resolution の letterbox 内座標で展開
-    // (= 描画と同 idiom)。 window resize で hit box がズレない。
-    let project_box = preview_project_box(screen, project_resolution);
-    let rx = project_box.0 + nx * project_box.2;
-    let ry = project_box.1 + ny * project_box.3;
-    let rw = nw * project_box.2;
-    let rh = nh * project_box.3;
-    let cx0 = rx + rw * 0.5;
-    let cy0 = ry + rh * 0.5;
-    let (sin_r, cos_r) = rotation_radians.sin_cos();
+    // 子 PiP を canvas→screen 写像（通常 image は project_box 恒等、active
+    // group の子は親 group の affine）。描画 (`draw_selection_overlay`) と
+    // 同じ `CanvasMap` を使うので hit box が縁取り・ハンドルと完全一致する。
+    let (cx0, cy0) = map.to_screen(nx + nw * 0.5, ny + nh * 0.5);
+    let rw = nw * map.size.0;
+    let rh = nh * map.size.1;
+    // 総回転 = group 軸回転 + 子自身の回転。
+    let (sin_r, cos_r) = (map.rotation + child_rotation_radians).sin_cos();
     let rotate_point = |lx: f32, ly: f32| -> (f32, f32) {
         (cx0 + lx * cos_r - ly * sin_r, cy0 + lx * sin_r + ly * cos_r)
     };
@@ -404,15 +401,16 @@ fn handle_preview_drag(
     proxy: &EventLoopProxy<AppEvent>,
     drag: &PreviewDragState,
     cursor: (f32, f32),
-    screen: (f32, f32),
-    project_resolution: (u32, u32),
+    map: &crate::group_compose::CanvasMap,
 ) {
-    let (sx, sy) = drag.start_cursor;
-    // cursor delta も project_box の幅 / 高さで normalize (= 描画と同 idiom、
-    // window resize でも drag 量が画像座標と一致する)。
-    let project_box = preview_project_box(screen, project_resolution);
-    let dx = (cursor.0 - sx) / project_box.2.max(1.0);
-    let dy = (cursor.1 - sy) / project_box.3.max(1.0);
+    // cursor の screen delta を canvas-norm の子 PiP delta に逆写像する。
+    // 通常 image は project_box 恒等写像（従来どおり）、active group の子は
+    // 親 group の affine（回転 + 非一様 scale）を除去する。2 点の `from_screen`
+    // の差を取るので pivot まわりの平行移動は相殺され、delta だけが残る。
+    let (cu, cv) = map.from_screen(cursor.0, cursor.1);
+    let (su, sv) = map.from_screen(drag.start_cursor.0, drag.start_cursor.1);
+    let dx = cu - su;
+    let dy = cv - sv;
     let (sx0, sy0, sw0, sh0) = drag.start_rect;
     let (nx, ny, nw, nh) = match drag.mode {
         PreviewDragMode::Move => {
@@ -459,11 +457,12 @@ fn handle_preview_drag(
             }
         }
         PreviewDragMode::Rotate => {
-            // Rotate mode: cursor の rect 中心からの角度差分で rotation
-            // を更新。 rect 中心は project_box 内座標で計算 (描画と同 idiom)。
+            // Rotate mode: cursor の rect 中心からの角度差分で子の rotation を
+            // 更新。rect 中心は `CanvasMap` で写像（group 空間なら group affine
+            // 適用後の中心）。group_rot は drag 中一定なので角度差分はそのまま
+            // 子 rotation の差分になる。
             let (nx0, ny0, nw0, nh0) = drag.start_rect;
-            let cx0 = project_box.0 + nx0 * project_box.2 + nw0 * project_box.2 * 0.5;
-            let cy0 = project_box.1 + ny0 * project_box.3 + nh0 * project_box.3 * 0.5;
+            let (cx0, cy0) = map.to_screen(nx0 + nw0 * 0.5, ny0 + nh0 * 0.5);
             let cur_angle = (cursor.1 - cy0).atan2(cursor.0 - cx0);
             let new_rotation = drag.start_rotation_radians
                 + (cur_angle - drag.start_cursor_angle);
@@ -1025,14 +1024,21 @@ impl Runner {
                 if let Some(drag) = state.preview_drag {
                     let size = preview.renderer.size();
                     let project_resolution = state.app.song.video_resolution;
-                    handle_preview_drag(
-                        &state.app,
-                        &self.proxy,
-                        &drag,
-                        cursor,
+                    let project_box = preview_project_box(
                         (size.width as f32, size.height as f32),
                         project_resolution,
                     );
+                    // 描画 (`draw_selection_overlay`) と同じ **ライブの**
+                    // `selection_group_transform` で逆写像する。こうすると描画・
+                    // hit-test・drag が常に同一の group affine を共有し、再生中に
+                    // automation が group を動かしてもハンドルが cursor とズレない
+                    // （凍結値だと描画はライブ・drag は古い値で不一致になる）。
+                    // 通常 image は None = 恒等写像。
+                    let map = match preview.selection_group_transform {
+                        Some(t) => crate::group_compose::CanvasMap::group(&t, project_box),
+                        None => crate::group_compose::CanvasMap::project(project_box),
+                    };
+                    handle_preview_drag(&state.app, &self.proxy, &drag, cursor, &map);
                 }
                 if let Some(gdrag) = state.preview_group_drag {
                     let size = preview.renderer.size();
@@ -1064,25 +1070,21 @@ impl Runner {
                         let screen = (size.width as f32, size.height as f32);
                         let rotation = preview.selection_rotation_radians;
                         let project_resolution = state.app.song.video_resolution;
-                        let mode = hit_test_handles(
-                            overlay,
-                            rotation,
-                            cursor,
-                            screen,
-                            project_resolution,
-                        );
+                        let project_box = preview_project_box(screen, project_resolution);
+                        // 選択中 clip が active visual group の子なら親 group の
+                        // affine を合成（= ハンドルが立ち絵に重なる）。drag 中は
+                        // 毎 frame ライブの `selection_group_transform` を読み直す
+                        // ので、ここでは凍結しない（描画と完全一致）。
+                        let map = match preview.selection_group_transform {
+                            Some(t) => crate::group_compose::CanvasMap::group(&t, project_box),
+                            None => crate::group_compose::CanvasMap::project(project_box),
+                        };
+                        let mode = hit_test_handles(overlay, rotation, &map, cursor);
                         if let Some(mode) = mode {
-                            // rect 中心 (letterbox 内座標) を計算し、 cursor
-                            // との角度を保存 (Rotate mode の delta 計算で使う)。
+                            // rect 中心 (canvas→screen 写像後) と cursor の角度を
+                            // 保存 (Rotate mode の delta 計算で使う)。
                             let (nx, ny, nw, nh) = overlay;
-                            let project_box =
-                                preview_project_box(screen, project_resolution);
-                            let cx0 = project_box.0
-                                + nx * project_box.2
-                                + nw * project_box.2 * 0.5;
-                            let cy0 = project_box.1
-                                + ny * project_box.3
-                                + nh * project_box.3 * 0.5;
+                            let (cx0, cy0) = map.to_screen(nx + nw * 0.5, ny + nh * 0.5);
                             let start_cursor_angle =
                                 (cursor.1 - cy0).atan2(cursor.0 - cx0);
                             state.preview_drag = Some(PreviewDragState {
@@ -1547,7 +1549,22 @@ impl Runner {
             Some((r, rot)) => (Some(r), rot),
             None => (None, 0.0),
         };
-        preview.set_selection_overlay(overlay_rect, rotation);
+        // option A（plan_tachie_group_transform.md）: 選択中 clip が active
+        // visual group の子（image）なら親 group の解決済み transform を渡し、
+        // 選択オーバーレイを group 空間へ写像して追従させる。text overlay は
+        // group 合成パス（`set_text_layers` 別経路）に乗らないので写像しない。
+        // 判定条件（owning track の parent_group_id ∈ active_groups）は子を
+        // group へ bucket する partition（上の image_frames ループ）と同一。
+        let selection_group = state.app.selected_clip.and_then(|cref| {
+            let track = state.app.song.tracks.get(cref.track as usize)?;
+            let clip = track.clips.get(cref.clip as usize)?;
+            let content = state.app.song.clip_contents.get(&clip.content_id)?;
+            // text overlay は group 合成パスに乗らないので image の子のみ写像。
+            content.image_events()?;
+            let gid = track.parent_group_id?;
+            active_groups.get(&gid).copied()
+        });
+        preview.set_selection_overlay(overlay_rect, rotation, selection_group);
     }
 
     /// docs/plan_video_perf.md P4: drain the worker's ring snapshots

@@ -90,6 +90,12 @@ pub struct PreviewWindowState {
     /// 描画時に rect を回転させて表示する)。 lane override 値が乗った
     /// 結果が入る (= runner 経由)。
     pub selection_rotation_radians: f32,
+    /// 選択中 clip が active visual group の子のとき、その親 group の解決済み
+    /// transform（`docs/plan_tachie_group_transform.md` option A）。`Some` なら
+    /// 選択オーバーレイを `CanvasMap::group` で group 空間へ写像して描く（=
+    /// 親 group の移動 / 回転 / スケールにハンドルが追従）。group の子でない
+    /// 通常 image / text overlay は `None`（= `CanvasMap::project` 恒等写像）。
+    pub selection_group_transform: Option<common::model::GroupTransform>,
     /// `Song.video_resolution` の最新値 (width, height)。 PiP rect の
     /// normalized 0..=1 座標を「window 全体」 ではなく「project
     /// resolution が letterbox 配置された区域」 内で展開するために使う。
@@ -177,6 +183,7 @@ impl PreviewWindowState {
             group_layers: Vec::new(),
             selection_overlay: None,
             selection_rotation_radians: 0.0,
+            selection_group_transform: None,
             // 初期値は scale_to_fit_on_screen に渡された initial_size。
             // runner が `set_project_resolution` で `Song.video_resolution`
             // に同期させる前に preview window が描画されても、 1920x1080
@@ -197,13 +204,19 @@ impl PreviewWindowState {
     /// handle 描画用)。 `None` で消す。 normalized 0..=1 座標。
     /// `rotation_radians` は縁取りと rotate handle を回転表示するため
     /// (= drag 中に視覚 feedback)。 `0.0` で axis-aligned 表示。
+    /// `group_transform` は選択中 clip が active visual group の子のときその
+    /// 親 group の解決済み transform（= 子枠を group 空間へ写像）。group の子で
+    /// なければ `None`（= 恒等写像で従来どおり）。overlay と同じパスで毎 frame
+    /// セットして SSoT を保つ。
     pub fn set_selection_overlay(
         &mut self,
         overlay: Option<(f32, f32, f32, f32)>,
         rotation_radians: f32,
+        group_transform: Option<common::model::GroupTransform>,
     ) {
         self.selection_overlay = overlay;
         self.selection_rotation_radians = rotation_radians;
+        self.selection_group_transform = group_transform;
     }
 
     /// docs/plan_image_overlay.md §P3: upload a freshly-decoded image
@@ -731,13 +744,20 @@ impl PreviewWindowState {
             (sw, sh),
             (self.project_resolution.0 as f32, self.project_resolution.1 as f32),
         );
-        let rx = project_box.0 + nx * project_box.2;
-        let ry = project_box.1 + ny * project_box.3;
-        let rw = nw * project_box.2;
-        let rh = nh * project_box.3;
-        let cx = rx + rw * 0.5;
-        let cy = ry + rh * 0.5;
-        let rot = self.selection_rotation_radians;
+        // 選択中 clip が active visual group の子なら group 空間へ写像する
+        // （= 縁取り / ハンドルが親 group の移動・回転・スケールに追従）。
+        // group の子でなければ恒等写像（canvas == project_box）で従来どおり。
+        let map = match self.selection_group_transform {
+            Some(t) => crate::group_compose::CanvasMap::group(&t, project_box),
+            None => crate::group_compose::CanvasMap::project(project_box),
+        };
+        // rect 中心 = 子 PiP 中心を canvas→screen 写像。half 寸法は canvas 軸上の
+        // 長さ（group の非一様 scale を含む）。総回転 = group 軸回転 + 子自身の
+        // 回転。child rotation = 0 + group なら厳密に回転長方形（shear なし）。
+        let (cx, cy) = map.to_screen(nx + nw * 0.5, ny + nh * 0.5);
+        let rw = nw * map.size.0;
+        let rh = nh * map.size.1;
+        let rot = map.rotation + self.selection_rotation_radians;
         let (sin_r, cos_r) = rot.sin_cos();
         // (cx 基準の local x, y) → screen の (px, py)。
         let rotate = |lx: f32, ly: f32| -> (f32, f32) {

@@ -119,6 +119,77 @@ pub fn group_quad_params(
     )
 }
 
+/// canvas-normalized（0..1、立ち絵パーツ / image PiP 系）↔ preview screen px
+/// の写像。通常の image / text overlay は canvas == project_box（恒等 affine、
+/// rotation 0）。active group の子は親 group の affine（[`group_quad_params`] の
+/// rect + pivot 回転）を合成する。選択オーバーレイの **描画 / hit-test / drag
+/// 逆写像が同じ 1 つの写像を共有する**（SSoT）ので、子が group 変形しても
+/// ハンドルがレンダリング結果に追従する（`docs/plan_tachie_group_transform.md`
+/// option A）。アプローチ X は shear が出ないので、child rotation = 0 の子矩形は
+/// この写像で厳密に「回転した長方形」になる。
+#[derive(Debug, Clone, Copy)]
+pub struct CanvasMap {
+    /// canvas-norm `(0, 0)` が写る pre-rotation screen 原点（px）。
+    pub origin: (f32, f32),
+    /// canvas 全体（`u = v = 1`）の screen px サイズ。
+    pub size: (f32, f32),
+    /// canvas 軸が screen 上で回る角度（rad、= group_rot）。通常 overlay は 0。
+    pub rotation: f32,
+    /// 回転中心（screen px、= group の pivot / anchor）。`rotation == 0` なら未使用。
+    pub pivot: (f32, f32),
+}
+
+impl CanvasMap {
+    /// 通常 overlay 用の恒等写像（canvas == project_box、回転なし）。
+    pub fn project(project_box: (f32, f32, f32, f32)) -> Self {
+        Self {
+            origin: (project_box.0, project_box.1),
+            size: (project_box.2.max(1.0), project_box.3.max(1.0)),
+            rotation: 0.0,
+            pivot: (0.0, 0.0),
+        }
+    }
+
+    /// active group の子用。`group_quad_params` の rect / pivot / rotation を
+    /// 合成する（= 描画 quad と完全一致）。
+    pub fn group(t: &GroupTransform, project_box: (f32, f32, f32, f32)) -> Self {
+        let (rx, ry, rw, rh, rot, px, py, _) = group_quad_params(t, project_box);
+        Self {
+            origin: (rx, ry),
+            size: (rw.max(1.0), rh.max(1.0)),
+            rotation: rot,
+            pivot: (rx + px, ry + py),
+        }
+    }
+
+    /// canvas-norm `(u, v)` → screen px。
+    pub fn to_screen(&self, u: f32, v: f32) -> (f32, f32) {
+        let pre = (self.origin.0 + u * self.size.0, self.origin.1 + v * self.size.1);
+        if self.rotation == 0.0 {
+            return pre;
+        }
+        let (s, c) = self.rotation.sin_cos();
+        let lx = pre.0 - self.pivot.0;
+        let ly = pre.1 - self.pivot.1;
+        (self.pivot.0 + lx * c - ly * s, self.pivot.1 + lx * s + ly * c)
+    }
+
+    /// screen px → canvas-norm（[`to_screen`](Self::to_screen) の逆）。drag delta
+    /// の逆写像に使う（pivot まわりの平行移動は delta の差分で相殺される）。
+    pub fn from_screen(&self, sx: f32, sy: f32) -> (f32, f32) {
+        let pre = if self.rotation == 0.0 {
+            (sx, sy)
+        } else {
+            let (s, c) = self.rotation.sin_cos();
+            let lx = sx - self.pivot.0;
+            let ly = sy - self.pivot.1;
+            // 逆回転（-rotation）。
+            (self.pivot.0 + lx * c + ly * s, self.pivot.1 - lx * s + ly * c)
+        };
+        ((pre.0 - self.origin.0) / self.size.0, (pre.1 - self.origin.1) / self.size.1)
+    }
+}
+
 /// 合成キャンバスの解像度を決める（§8.1 案 B supersample）。
 ///
 /// 親が拡大（scale > 1）すると project 解像度で合成した 1 枚が引き伸ばされて
@@ -200,6 +271,66 @@ mod tests {
         t.x = 0.25;
         let (rx, _, _, _, _, _, _, _) = group_quad_params(&t, (0.0, 0.0, 400.0, 300.0));
         assert!((rx - 100.0).abs() < 1e-4); // 0.25 * 400
+    }
+
+    #[test]
+    fn canvas_map_project_is_identity_affine() {
+        // 通常 overlay: canvas == project_box、回転なし。
+        let pb = (100.0, 50.0, 400.0, 300.0);
+        let m = CanvasMap::project(pb);
+        assert_eq!(m.to_screen(0.0, 0.0), (100.0, 50.0));
+        assert_eq!(m.to_screen(1.0, 1.0), (500.0, 350.0));
+        // round-trip。
+        let (u, v) = m.from_screen(300.0, 200.0);
+        assert!((u - 0.5).abs() < 1e-4 && (v - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn canvas_map_group_matches_quad_and_round_trips() {
+        // group affine（pos + 非一様 scale + 任意 anchor + 回転）。
+        let mut t = ident();
+        t.x = 0.1;
+        t.y = -0.2;
+        t.scale_x = 1.4;
+        t.scale_y = 0.8;
+        t.anchor_x = 0.3;
+        t.anchor_y = 0.7;
+        t.rotation_radians = 0.5;
+        let pb = (0.0, 0.0, 400.0, 300.0);
+        let m = CanvasMap::group(&t, pb);
+        // canvas-norm のアンカー (= 子 PiP が乗る canvas の anchor) は group の
+        // pivot へ写る（回転・スケールの中心 = quad の pivot）。
+        let (ax, ay) = m.to_screen(t.anchor_x, t.anchor_y);
+        assert!((ax - m.pivot.0).abs() < 1e-3 && (ay - m.pivot.1).abs() < 1e-3);
+        // 任意点の round-trip（drag 逆写像が成立する保証）。
+        for &(u, v) in &[(0.0, 0.0), (1.0, 1.0), (0.25, 0.8), (0.6, 0.1)] {
+            let (sx, sy) = m.to_screen(u, v);
+            let (ru, rv) = m.from_screen(sx, sy);
+            assert!((ru - u).abs() < 1e-3, "u {u} -> {ru}");
+            assert!((rv - v).abs() < 1e-3, "v {v} -> {rv}");
+        }
+    }
+
+    #[test]
+    fn canvas_map_group_corner_matches_overlay_rotate_pt() {
+        // CanvasMap::to_screen で写した子矩形の隅が、preview の group overlay
+        // が使う rotate_pt（quad と同一）と一致することを確認する。
+        let mut t = ident();
+        t.scale_x = 2.0;
+        t.scale_y = 1.5;
+        t.rotation_radians = 0.3;
+        let pb = (10.0, 20.0, 320.0, 240.0);
+        let (rx, ry, rw, rh, rot, px, py, _) = group_quad_params(&t, pb);
+        let pivx = rx + px;
+        let pivy = ry + py;
+        let (sin_r, cos_r) = rot.sin_cos();
+        // quad の右下隅 (canvas-norm (1,1)) を rotate_pt で。
+        let lx = (rx + rw) - pivx;
+        let ly = (ry + rh) - pivy;
+        let expect = (pivx + lx * cos_r - ly * sin_r, pivy + lx * sin_r + ly * cos_r);
+        let m = CanvasMap::group(&t, pb);
+        let got = m.to_screen(1.0, 1.0);
+        assert!((got.0 - expect.0).abs() < 1e-3 && (got.1 - expect.1).abs() < 1e-3);
     }
 
     #[test]
