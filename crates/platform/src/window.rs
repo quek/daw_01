@@ -6,6 +6,7 @@
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::event::{AppEvent, PhysicalSize};
+use crate::text_document::{ImeTextEdit, TextDocument};
 
 /// マウスカーソル形状。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +60,25 @@ pub trait WindowBackend: HasWindowHandle + HasDisplayHandle {
     /// IME 候補ウィンドウを表示すべき領域 (物理ピクセル) を OS にヒントする。
     /// 一般には text_input の cursor 直下の小さな rect を渡す。
     fn set_ime_cursor_area(&self, x: f64, y: f64, w: f64, h: f64);
+
+    /// (Windows TSF) focus 中の編集可能テキストの snapshot を OS text store に publish する。
+    ///
+    /// `Some(doc)` で内容/選択/caret を更新し、`None` で「編集対象なし」(text store を空にして
+    /// IME を非アクティブ化) を表す。`frame()` 末尾に毎フレーム呼ばれる想定。
+    /// これにより rtry (Try-Code TIP) のまぜ書き / ストロークヘルプや MS-IME 再変換が、
+    /// アプリの text store から `GetText` でカーソル前テキストを読めるようになる。
+    ///
+    /// 既定実装は no-op (TSF 非対応プラットフォーム / 埋め込み host)。Windows の `WinitWindow`
+    /// だけが TSF `ITextStoreACP` を駆動する。
+    fn set_text_input_document(&self, _doc: Option<&TextDocument>) {}
+
+    /// (Windows TSF) OS IME がこのフレームに text store へ加えた編集 (まぜ書き変換結果 /
+    /// 再変換 / composition 確定) を取り出す。取り出すと内部キューは空になる。
+    ///
+    /// 既定実装は空 Vec を返す (編集なし)。
+    fn take_ime_text_edits(&self) -> Vec<ImeTextEdit> {
+        Vec::new()
+    }
 
     /// ウィンドウタイトル更新。
     fn set_title(&self, title: &str);

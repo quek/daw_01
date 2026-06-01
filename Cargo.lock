@@ -812,6 +812,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "daw-ui-example-text-input-ime"
+version = "0.1.0"
+dependencies = [
+ "daw-ui-core",
+ "daw-ui-platform",
+ "daw-ui-renderer",
+ "winit",
+]
+
+[[package]]
 name = "daw-ui-example-waveform-validation"
 version = "0.1.0"
 dependencies = [
@@ -826,6 +836,8 @@ name = "daw-ui-platform"
 version = "0.1.0"
 dependencies = [
  "raw-window-handle",
+ "windows",
+ "windows-core",
  "windows-sys 0.59.0",
  "winit",
 ]

@@ -13,7 +13,9 @@ use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
-use daw_ui_platform::{CursorIcon, KeyEvent, PhysicalKey, PhysicalSize};
+use daw_ui_platform::{
+    CursorIcon, ImeTextEdit, KeyEvent, PhysicalKey, PhysicalSize, RectPx, TextDocument,
+};
 use daw_ui_renderer::{
     Color, GlyphArea, LineBatch, LineSegment, Primitive, Rect, RectCommand, Scene, TexturedQuad,
 };
@@ -47,6 +49,11 @@ use crate::widgets::drag_rect::{DragRect, DragRectState};
 /// `focus_changed_in_last_frame` / `redraw_requested_in_last_frame` / M8 の
 /// `transient_undo_requested` / `transient_redo_requested` がそれぞれ独立した
 /// 「frame 内で 1 度だけ書かれる」フラグで意味的に正交、state machine 化のメリットなし。
+/// **(M15)** focus 中 text_input の document snapshot を OS text store に publish する callback。
+type SetTextDocumentFn = Box<dyn Fn(Option<&TextDocument>) + Send + Sync>;
+/// **(M15)** OS IME がこのフレームに加えた text 編集を取り出す callback。
+type TakeImeEditsFn = Box<dyn Fn() -> Vec<ImeTextEdit> + Send + Sync>;
+
 #[allow(clippy::struct_excessive_bools)]
 pub struct UiHost<M: ?Sized + 'static> {
     state: HashMap<WidgetId, Box<dyn WidgetState>>,
@@ -60,6 +67,10 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// アプリは on_render の終わりにこの値を見て winit の `set_ime_cursor_area` /
     /// `set_ime_allowed` を呼ぶ。`None` のフレームでは IME を無効化する。
     last_ime_request: Option<Rect>,
+    /// **(M15)** 直前の `frame()` で focus 中の text_input が `Ui::publish_text_document` した
+    /// snapshot。`frame()` 末尾で `set_text_document_request` 経由で OS text store (TSF) に publish
+    /// する。`None` = 編集対象なし (store を空にして IME 非アクティブ化)。
+    last_text_document: Option<TextDocument>,
     /// M4 Phase 10 で追加: 内部 scenegraph (per-widget input_hash の前フレーム履歴)。
     #[allow(dead_code)]
     scenegraph: Scenegraph,
@@ -70,6 +81,14 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// `WindowBackend::set_cursor` をラップ。`new` 直接呼び出しでは `None` (no-op)。
     /// `pub(crate)` は他 widget の `#[cfg(test)]` で cursor 検証 mock を直接 inject するため。
     pub(crate) set_cursor_request: Option<Box<dyn Fn(CursorIcon) + Send + Sync>>,
+    /// **(M15)** focus 中 text_input の document snapshot を OS text store (TSF) に publish する
+    /// callback。`with_window` 経由で `WindowBackend::set_text_input_document` をラップ。
+    /// `new` 直接呼び出しでは `None` (no-op)。`frame()` 末尾で `last_text_document` を flush する。
+    set_text_document_request: Option<SetTextDocumentFn>,
+    /// **(M15)** OS IME (TSF) がこのフレームに text store へ加えた編集を取り出す callback。
+    /// `with_window` 経由で `WindowBackend::take_ime_text_edits` をラップ。`frame_to_edits` 冒頭で
+    /// drain し、`ImeEvent::ReplaceRange` / `SetSelection` に変換して focused widget に流す。
+    take_ime_edits_request: Option<TakeImeEditsFn>,
     /// M7 Phase 25: 現在開いている popup の集合 (menu / context_menu / dropdown 共通)。
     /// `Ui::open_popup` / `Ui::close_popup` で出し入れする。`Ui` 経由で `&mut` 借用される
     /// ため rustc から "never read" と誤判定されるが、実際には popup_layer で読まれる。
@@ -174,6 +193,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             focused: None,
             focus_changed_in_last_frame: false,
             last_ime_request: None,
+            last_text_document: None,
             scenegraph: Scenegraph::new(),
             redraw_request: Box::new(redraw_request),
             open_popups: HashMap::new(),
@@ -190,6 +210,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
             transient_consumed_dialog_results: HashSet::new(),
             transient_cursor: None,
             set_cursor_request: None,
+            set_text_document_request: None,
+            take_ime_edits_request: None,
             last_frame_stats: FrameStats::default(),
             current_cache_hits: 0,
             current_cache_misses: 0,
@@ -276,9 +298,16 @@ impl<M: ?Sized + 'static> UiHost<M> {
         W: daw_ui_platform::WindowBackend + Send + Sync + 'static,
     {
         let win_for_redraw = std::sync::Arc::clone(&window);
-        let win_for_cursor = window;
+        let win_for_cursor = std::sync::Arc::clone(&window);
+        let win_for_doc = std::sync::Arc::clone(&window);
+        let win_for_edits = window;
         let mut host = Self::new(move || win_for_redraw.request_redraw());
         host.set_cursor_request = Some(Box::new(move |c| win_for_cursor.set_cursor(c)));
+        // M15: TSF text store の publish / IME 編集 drain を window backend に橋渡し。
+        host.set_text_document_request =
+            Some(Box::new(move |doc| win_for_doc.set_text_input_document(doc)));
+        host.take_ime_edits_request =
+            Some(Box::new(move || win_for_edits.take_ime_text_edits()));
         host
     }
 
@@ -385,6 +414,13 @@ impl<M: ?Sized + 'static> UiHost<M> {
             req(c);
         }
 
+        // M15: text store document flush。focus 中 text_input が publish した snapshot を
+        // OS text store (TSF) に渡す。`None` (= 編集対象なし) も毎フレーム渡して store を
+        // 空にし IME を非アクティブ化する。
+        if let Some(req) = self.set_text_document_request.as_ref() {
+            req(self.last_text_document.as_ref());
+        }
+
         // 自動 redraw の発火条件: edits / undo / redo / focus 変化 / widget からの request_redraw
         // / dialog 実行 (新結果が出た) / 残っている dialog 結果 (widget が次フレームで取り出す)。
         if had_edits
@@ -426,6 +462,20 @@ impl<M: ?Sized + 'static> UiHost<M> {
         let FrameInput { pointer, keyboard, ime, file_drop, file_hover } = input;
         let mut keyboard_events = keyboard;
         let mut ime_events = ime;
+
+        // M15: OS text store (TSF) がこのフレームに加えた編集 (まぜ書き変換 / 再変換 /
+        // composition 確定) を drain し、`ImeEvent` に変換して ime_events 先頭へ置く
+        // (winit IMM 由来の ime より前に適用)。Windows で TSF 駆動中は winit IMM を使わない
+        // ので両者は競合しない。非 Windows / TSF 不在では callback は空を返す。
+        if let Some(f) = self.take_ime_edits_request.as_ref() {
+            let store_edits = f();
+            if !store_edits.is_empty() {
+                let mut converted: Vec<ImeEvent> =
+                    store_edits.into_iter().map(ime_text_edit_to_event).collect();
+                converted.append(&mut ime_events);
+                ime_events = converted;
+            }
+        }
 
         // M8 Phase 30 / M14 Phase 57: shortcut layer (frame 頭)。keyboard_events を
         // `shortcut_map.matches` で走査、マッチした events を取り除いて name を
@@ -548,6 +598,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             pending_focus: focused_at_start,
             focus_changed_this_frame: false,
             ime_request: None,
+            text_document: None,
             scenegraph: &mut self.scenegraph,
             seen_widgets: &mut seen_widgets,
             current_clip: None,
@@ -632,6 +683,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
         self.focus_changed_in_last_frame = self.focused != prev_focused;
         // IME request の commit (フレーム内に request_ime が呼ばれていれば Some)。
         self.last_ime_request = ui.ime_request;
+        // M15: text store document の commit (focus 中 text_input が publish していれば Some)。
+        self.last_text_document = ui.text_document.take();
         drop(ui);
         // widget からの request_redraw 累積を commit (ui drop 後に local 変数を読む)。
         self.redraw_requested_in_last_frame = redraw_requested;
@@ -714,6 +767,10 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// 同フレーム内に複数 widget が呼んだ場合は最後の呼び出しが勝つ
     /// (typical: focused widget だけが呼ぶ想定)。
     ime_request: Option<Rect>,
+    /// **(M15)** このフレーム内で focus 中 text_input が `Ui::publish_text_document` した snapshot。
+    /// frame 末尾で `UiHost::last_text_document` に commit され、OS text store (TSF) へ publish。
+    /// `None` = 編集対象なし。
+    text_document: Option<TextDocument>,
     /// M4 Phase 11: per-widget の描画コマンドキャッシュ (UiHost が所有、frame 越しに保持)。
     scenegraph: &'a mut Scenegraph,
     /// M4 Phase 11: このフレームで `with_widget_node` 経由で描画された widget の集合。
@@ -1925,6 +1982,28 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         self.ime_request = Some(cursor_area);
     }
 
+    /// **(M15)** focus 中の text_input が、自身の `text` + selection (anchor/cursor byte) + caret
+    /// rect を OS text store (TSF) に publish する。`frame()` 末尾で
+    /// `WindowBackend::set_text_input_document` に渡され、rtry のまぜ書き `GetText` / MS-IME 再変換が
+    /// アプリのテキストを読めるようになる。`request_ime` と同じく focus 中 widget だけが毎フレーム
+    /// 呼ぶ想定 (last-call-wins、 modal 中の background は遮断)。
+    pub fn publish_text_document(
+        &mut self,
+        text: &str,
+        anchor_byte: usize,
+        cursor_byte: usize,
+        caret: Rect,
+    ) {
+        if self.keyboard_blocked_by_modal() {
+            return;
+        }
+        self.text_document = Some(TextDocument {
+            text: text.to_string(),
+            selection: (anchor_byte, cursor_byte),
+            caret_rect: RectPx { x: caret.x, y: caret.y, w: caret.w, h: caret.h },
+        });
+    }
+
     /// 内部: WidgetId に紐付く永続状態を取得 or 初期化。
     /// (M2 で waveform の LOD ピラミッドキャッシュに、M3 以降は fader/knob のドラッグ状態に使う)
     pub(crate) fn widget_state<S: WidgetState + Default + 'static>(
@@ -1970,6 +2049,18 @@ fn masked_pointer(p: PointerFrame) -> PointerFrame {
         secondary_just_released: false,
         modifiers: p.modifiers,
         scroll_delta: (0.0, 0.0),
+    }
+}
+
+/// M15: platform 層から drain した [`ImeTextEdit`] を widget が処理する [`ImeEvent`] に変換する。
+fn ime_text_edit_to_event(e: ImeTextEdit) -> ImeEvent {
+    match e {
+        ImeTextEdit::Replace { start_byte, end_byte, text, new_cursor } => {
+            ImeEvent::ReplaceRange { start_byte, end_byte, text, new_cursor }
+        }
+        ImeTextEdit::SetSelection { anchor_byte, cursor_byte } => {
+            ImeEvent::SetSelection { anchor_byte, cursor_byte }
+        }
     }
 }
 

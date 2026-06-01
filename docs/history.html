@@ -828,9 +828,11 @@ tr:nth-child(2n) { background: #f6f8fa; }
 <li><strong>将来の発展</strong>: text_input の数値編集 (ドラッグで増減) や knob のホイール調整に
   同じ modifier 機構 (<code>pointer.modifiers.ctrl</code>) を載せる。<code>KeyEvent</code> への modifier
   追加 (Ctrl+C/V など) は別フェーズ。</li>
-<li><strong><code>rtry</code> のまぜ書き入力対応</strong>: <code>rtry</code> (別プロジェクト) のまぜ書き (mazegaki) 入力プロトコル
-  に合わせた API を text_input に足す。preedit 区切りや候補編集の細かい制御が必要に
-  なる見込み。<code>rtry</code> 側の入力プロトコルが固まってから設計。</li>
+<li><strong><code>rtry</code> のまぜ書き入力対応</strong>: ✅ <strong>M15 で完了 (2026-06-01)</strong>。当初は「text_input に
+  まぜ書き API を足す」想定だったが、<code>rtry</code> は TSF IME と判明 → gui_01 platform 層に TSF
+  <code>ITextStoreACP</code> document store を実装し、<code>rtry</code> が <code>GetText</code> でカーソル前テキストを読み /
+  <code>SetText</code> で変換結果を書き戻せるようにした (MS-IME 再変換も同経路)。設計・既知の罠は
+  <a href="plan_tsf_ime.html">docs/plan_tsf_ime.html</a>。</li>
 <li><strong>GetText i18n 対応</strong>: label / button / text_input 等の文字列を翻訳するための仕組み。
   <code>tr!("...")</code> 風マクロ + catalog 引きの API を別途設計。アプリ側 (例えば mixer) で
   ロケール切替を実演する。実装はサードパーティ crate (<code>gettext-rs</code> / <code>fluent</code> 等) との

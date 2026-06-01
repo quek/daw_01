@@ -261,6 +261,32 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                                 changed = true;
                             }
                         }
+                        // M15: OS text store (TSF) 由来の任意 range 置換 (まぜ書き変換結果 /
+                        // 再変換)。selection ではなく明示 range を `replace_range` で書き換える。
+                        ImeEvent::ReplaceRange { start_byte, end_byte, text: rep, new_cursor } => {
+                            state.preedit.clear();
+                            let len = working.len();
+                            let mut lo = start_byte.min(len);
+                            let mut hi = end_byte.min(len);
+                            if lo > hi {
+                                std::mem::swap(&mut lo, &mut hi);
+                            }
+                            // ACP→byte 変換は char 境界を保証するが、防御的に丸める。
+                            lo = prev_char_boundary(&working, lo);
+                            hi = next_char_boundary(&working, hi);
+                            working.replace_range(lo..hi, &rep);
+                            cursor = prev_char_boundary(&working, new_cursor.min(working.len()));
+                            anchor = cursor;
+                            changed = true;
+                        }
+                        // M15: text store (TSF) からの selection 変更 (text 不変)。
+                        ImeEvent::SetSelection { anchor_byte, cursor_byte } => {
+                            state.preedit.clear();
+                            let len = working.len();
+                            anchor = prev_char_boundary(&working, anchor_byte.min(len));
+                            cursor = prev_char_boundary(&working, cursor_byte.min(len));
+                            // text 不変なので changed は立てない (cursor/anchor のみ更新)。
+                        }
                     }
                 }
 
@@ -458,12 +484,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 + self.measure_text(&preedit_for_draw, font_size);
             let cursor_y_top = rect.y + 4.0;
             let cursor_h = (rect.h - 8.0).max(1.0);
-            self.request_ime(Rect {
-                x: cursor_x,
-                y: cursor_y_top,
-                w: 1.0,
-                h: cursor_h,
-            });
+            let caret = Rect { x: cursor_x, y: cursor_y_top, w: 1.0, h: cursor_h };
+            self.request_ime(caret);
+            // M15: text store (TSF) に text + selection + caret を publish。rtry のまぜ書き
+            // GetText / MS-IME 再変換がアプリのテキストを読めるようにする。preedit 中は selection
+            // を collapse 済みなので displayed の cursor/anchor をそのまま渡す。
+            self.publish_text_document(
+                &displayed_text,
+                anchor_byte_for_draw,
+                cursor_byte_for_draw,
+                caret,
+            );
             // M8 Phase 30: typing 中フラグを立てて、修飾なし shortcut の global 発動を抑制可能に。
             self.set_typing_focus(true);
         }
@@ -1345,5 +1376,67 @@ mod tests {
             frame_with_keys(vec![key_pressed(PhysicalKey::Char('V'))], ctrl),
         );
         assert_eq!(observed.as_deref(), Some("XYZ"), "Ctrl+V で範囲を clipboard 内容で置換");
+    }
+
+    // ============================================================================
+    // M15: ImeEvent::ReplaceRange (TSF まぜ書き / 再変換の書き戻し)
+    // ============================================================================
+
+    /// rtry まぜ書き相当: focus 中の selection に関係なく、IME 指定の **任意 range** を変換結果で
+    /// 置換する。selection (focus で全選択) ではなく `[3..12]` を狙って置換できることを確認。
+    #[test]
+    fn replace_range_rewrites_arbitrary_range_for_mazegaki() {
+        use crate::input::ImeEvent;
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        // focus → 全選択 (anchor=0, cursor=12)。buffer_text = "あきしゃ" (各 3 byte)。
+        run_focus_frame(&mut host, &mut scene, screen, "あきしゃ");
+        scene.clear();
+
+        // [3..12) = "きしゃ" を "汽車" に置換、cursor を末尾 (3 + 6 = 9) へ。
+        let input = FrameInput {
+            ime: vec![ImeEvent::ReplaceRange {
+                start_byte: 3,
+                end_byte: 12,
+                text: "汽車".to_string(),
+                new_cursor: 9,
+            }],
+            ..Default::default()
+        };
+        let observed = run_input_frame(&mut host, &mut scene, screen, "あきしゃ", input);
+        assert_eq!(
+            observed.as_deref(),
+            Some("あ汽車"),
+            "selection でない range を変換結果で置換 (まぜ書き)"
+        );
+    }
+
+    /// `ReplaceRange` の境界 clamp: 範囲外 byte を渡しても panic せず末尾に丸める。
+    #[test]
+    fn replace_range_clamps_out_of_range() {
+        use crate::input::ImeEvent;
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        run_focus_frame(&mut host, &mut scene, screen, "abc");
+        scene.clear();
+
+        // end_byte=999, new_cursor=999 → working.len()=3 に clamp。"ab" + "Z" 置換。
+        let input = FrameInput {
+            ime: vec![ImeEvent::ReplaceRange {
+                start_byte: 2,
+                end_byte: 999,
+                text: "Z".to_string(),
+                new_cursor: 999,
+            }],
+            ..Default::default()
+        };
+        let observed = run_input_frame(&mut host, &mut scene, screen, "abc", input);
+        assert_eq!(observed.as_deref(), Some("abZ"), "範囲外 end は末尾に clamp");
     }
 }

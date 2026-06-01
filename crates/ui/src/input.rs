@@ -50,6 +50,23 @@ pub enum ImeEvent {
     Preedit { text: String, cursor: Option<(usize, usize)> },
     /// 確定テキスト。focused widget は cursor 位置にこの文字列を挿入する。
     Commit(String),
+    /// (M15) OS text store (TSF) 由来の **任意 range 置換**。`[start_byte, end_byte)` を `text` で
+    /// 置換し cursor を `new_cursor` へ collapse する。byte offset は直近フレームに widget が
+    /// publish した text に対する。
+    ///
+    /// rtry のまぜ書き変換 / MS-IME の再変換は selection でない range (= 既に確定済みの読み) を
+    /// 書き換えるため、`Commit` (selection 置換) では表せない。`Commit(s)` はこの variant の
+    /// `ReplaceRange { start_byte: sel_lo, end_byte: sel_hi, text: s, new_cursor: sel_lo + s.len() }`
+    /// に相当する特殊形 (widget の `replace_range(min..max, new)` 不変条件を共有する)。
+    ReplaceRange {
+        start_byte: usize,
+        end_byte: usize,
+        text: String,
+        new_cursor: usize,
+    },
+    /// (M15) OS text store (TSF) 由来の **selection 変更** (テキストは変えない)。MS-IME 再変換が
+    /// 対象範囲を選択する際などに来る。byte offset は直近 publish した text に対する。
+    SetSelection { anchor_byte: usize, cursor_byte: usize },
 }
 
 /// 1 フレーム分の入力一式。`UiHost::frame` に渡す。

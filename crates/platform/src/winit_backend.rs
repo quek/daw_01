@@ -17,7 +17,27 @@ use crate::event::{
     AppEvent, ElementState, KeyEvent, Modifiers, MouseButton, PhysicalKey, PhysicalPosition,
     PhysicalSize, ScrollDelta,
 };
+use crate::text_document::{ImeTextEdit, TextDocument};
 use crate::window::{AppHost, CursorIcon, WindowBackend};
+
+// TSF (`ITextStoreACP`) は STA / UI スレッド専有なので、COM オブジェクトを `WinitWindow`
+// (Send 要求あり) に持たせず、イベントループスレッドの thread-local に置く。winit の
+// メッセージポンプ・`frame()` flush・msctf からの store 呼び出しはすべてこのスレッド。
+//
+// 初期化は 1 度きり試行する (失敗時に毎フレーム `CoInitializeEx` を呼ばない)。
+// `Failed` は apartment 衝突 (wgpu が先に MTA 化した等) で TSF を諦め winit IMM に fallback した状態。
+#[cfg(target_os = "windows")]
+enum TsfSlot {
+    Untried,
+    Failed,
+    Active(crate::tsf::TsfManager),
+}
+
+#[cfg(target_os = "windows")]
+thread_local! {
+    static TSF_MANAGER: std::cell::RefCell<TsfSlot> =
+        const { std::cell::RefCell::new(TsfSlot::Untried) };
+}
 
 /// winit の `Window` を `WindowBackend` 実装でラップしたもの。
 #[derive(Clone)]
@@ -73,6 +93,48 @@ impl WindowBackend for WinitWindow {
             WinitPos::new(x, y),
             WinitSize::new(w.max(1.0), h.max(1.0)),
         );
+    }
+
+    fn set_text_input_document(&self, doc: Option<&TextDocument>) {
+        #[cfg(target_os = "windows")]
+        {
+            let hwnd = tsf_hwnd(&self.inner);
+            TSF_MANAGER.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                if matches!(*slot, TsfSlot::Untried) {
+                    *slot = match hwnd.map(crate::tsf::TsfManager::new) {
+                        Some(Ok(mgr)) => TsfSlot::Active(mgr),
+                        Some(Err(e)) => {
+                            // TSF が使えない環境 (apartment 衝突等) は winit IMM に degrade。
+                            // 原因究明のため 1 度だけ警告する (library が stderr を汚すのは初期化失敗時のみ)。
+                            eprintln!("[daw-ui] TSF 初期化失敗、winit IMM に fallback: {e}");
+                            TsfSlot::Failed
+                        }
+                        None => TsfSlot::Failed,
+                    };
+                }
+                if let TsfSlot::Active(mgr) = &*slot {
+                    mgr.set_document(doc);
+                }
+            });
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = doc;
+    }
+
+    fn take_ime_text_edits(&self) -> Vec<ImeTextEdit> {
+        #[cfg(target_os = "windows")]
+        {
+            TSF_MANAGER.with(|cell| {
+                if let TsfSlot::Active(mgr) = &*cell.borrow() {
+                    mgr.take_ime_edits()
+                } else {
+                    Vec::new()
+                }
+            })
+        }
+        #[cfg(not(target_os = "windows"))]
+        Vec::new()
     }
 
     fn set_title(&self, title: &str) {
@@ -397,6 +459,19 @@ fn query_cursor_pos_in_window(window: &Window) -> Option<PhysicalPosition> {
 #[cfg(not(target_os = "windows"))]
 fn query_cursor_pos_in_window(_window: &Window) -> Option<PhysicalPosition> {
     None
+}
+
+/// winit `Window` から TSF 用の `windows` crate `HWND` を取り出す (Windows のみ)。
+#[cfg(target_os = "windows")]
+fn tsf_hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = window.window_handle().ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(h) => Some(windows::Win32::Foundation::HWND(
+            h.hwnd.get() as *mut core::ffi::c_void,
+        )),
+        _ => None,
+    }
 }
 
 fn map_cursor(c: CursorIcon) -> WinitCursor {
