@@ -168,9 +168,14 @@ impl ITextStoreACP_Impl for DocumentStore_Impl {
             .lock
             .set(if want_write { LockKind::ReadWrite } else { LockKind::Read });
         // borrow は一切持たずに sink を呼ぶ (IME がここで GetText/SetText を同期再入する)。
-        let _ = unsafe { sink.OnLockGranted(TEXT_STORE_LOCK_FLAGS(dwlockflags)) };
+        let session = unsafe { sink.OnLockGranted(TEXT_STORE_LOCK_FLAGS(dwlockflags)) };
         self.shared.lock.set(LockKind::Unlocked);
-        Ok(S_OK)
+        // RequestLock の戻り値 (Ok の中身) は edit session の結果 HRESULT として phrSession に
+        // 書かれる。OnLockGranted が失敗したら成功偽装せずその HRESULT を返す。
+        match session {
+            Ok(()) => Ok(S_OK),
+            Err(e) => Ok(e.code()),
+        }
     }
 
     fn GetStatus(&self) -> Result<TS_STATUS> {

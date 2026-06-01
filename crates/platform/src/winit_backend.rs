@@ -26,6 +26,12 @@ use crate::window::{AppHost, CursorIcon, WindowBackend};
 //
 // 初期化は 1 度きり試行する (失敗時に毎フレーム `CoInitializeEx` を呼ばない)。
 // `Failed` は apartment 衝突 (wgpu が先に MTA 化した等) で TSF を諦め winit IMM に fallback した状態。
+//
+// teardown (Deactivate / CoUninitialize) は `TsfManager::Drop` = この thread-local の destructor 任せ。
+// `run_app` (winit) は `event_loop.exit()` で **return** するので、通常の `main` 終了で main スレッドの
+// TLS destructor が走り Drop が発火する (= best-effort で成立)。`std::process::exit` / `panic=abort` /
+// プラグイン host が thread を再利用する経路では Drop が走らず CoUninitialize が未 balance になる
+// (将来 embedded host を実装する際は close 時の明示 teardown を足すこと)。
 #[cfg(target_os = "windows")]
 enum TsfSlot {
     Untried,
@@ -102,7 +108,9 @@ impl WindowBackend for WinitWindow {
             let win = Arc::clone(&self.inner);
             TSF_MANAGER.with(|cell| {
                 let mut slot = cell.borrow_mut();
-                if matches!(*slot, TsfSlot::Untried) {
+                // text_input が実際に focus した (doc=Some) 初回にだけ TSF を init する。
+                // text field を一切持たない app (mixer 等) は COM apartment を起こさない。
+                if matches!(*slot, TsfSlot::Untried) && doc.is_some() {
                     // IME が store を編集したら redraw を要求し、次フレームで drain させる。
                     let init = hwnd.map(|h| {
                         let redraw: std::rc::Rc<dyn Fn()> =

@@ -31,7 +31,24 @@ pub struct TsfManager {
     _store: ITextStoreACP,
     hwnd: HWND,
     focused: Cell<bool>,
+    /// **最後の field** に置く: Rust は `Drop::drop` body を先に実行し、その後 field を宣言順に
+    /// drop する (= 各 COM interface の `Release`)。`CoUninitialize` を `Drop::drop` body で呼ぶと
+    /// interface の `Release` より **先**に apartment を壊して UB になる。これを最後の field の
+    /// Drop で行うことで「全 interface Release → CoUninitialize」 の順を保証する。
+    _apartment: ApartmentGuard,
+}
+
+/// `CoInitializeEx` の balance を、全 COM interface の `Release` 後に行うための guard。
+struct ApartmentGuard {
     did_coinit: bool,
+}
+
+impl Drop for ApartmentGuard {
+    fn drop(&mut self) {
+        if self.did_coinit {
+            unsafe { CoUninitialize() };
+        }
+    }
 }
 
 impl TsfManager {
@@ -53,49 +70,41 @@ impl TsfManager {
             hr == S_OK || hr == S_FALSE
         };
 
-        // 途中失敗時に CoUninitialize を確実に balance するため、構築をクロージャに包む。
-        let built = (|| -> Result<Self> {
-            let thread_mgr: ITfThreadMgr =
-                unsafe { CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)? };
-            let client_id = unsafe { thread_mgr.Activate()? };
-            let doc_mgr = unsafe { thread_mgr.CreateDocumentMgr()? };
-            let empty_doc_mgr = unsafe { thread_mgr.CreateDocumentMgr()? };
+        // guard を **最初**の local に宣言する: 途中の `?` で早期 return しても、local は
+        // 逆宣言順に drop = COM interface (thread_mgr 等) が Release された後に guard が
+        // CoUninitialize する。成功時は全 local が Self に move され、Self の最後の field
+        // (_apartment) として同じ順序保証を引き継ぐ。
+        let apartment = ApartmentGuard { did_coinit };
 
-            let shared = TsfShared::new(redraw);
-            let store = DocumentStore::create(shared.clone(), hwnd);
-            let store_unk: IUnknown = store.cast()?;
+        let thread_mgr: ITfThreadMgr =
+            unsafe { CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)? };
+        let client_id = unsafe { thread_mgr.Activate()? };
+        let doc_mgr = unsafe { thread_mgr.CreateDocumentMgr()? };
+        let empty_doc_mgr = unsafe { thread_mgr.CreateDocumentMgr()? };
 
-            let mut context: Option<ITfContext> = None;
-            let mut edit_cookie = 0u32;
-            unsafe {
-                doc_mgr.CreateContext(
-                    client_id,
-                    0,
-                    &store_unk,
-                    &raw mut context,
-                    &raw mut edit_cookie,
-                )?;
-            }
-            let context = context.ok_or_else(|| Error::from_hresult(E_FAIL))?;
-            unsafe { doc_mgr.Push(&context)? };
+        let shared = TsfShared::new(redraw);
+        let store = DocumentStore::create(shared.clone(), hwnd);
+        let store_unk: IUnknown = store.cast()?;
 
-            Ok(Self {
-                shared,
-                thread_mgr,
-                doc_mgr,
-                empty_doc_mgr,
-                _context: context,
-                _store: store,
-                hwnd,
-                focused: Cell::new(false),
-                did_coinit,
-            })
-        })();
-
-        if built.is_err() && did_coinit {
-            unsafe { CoUninitialize() };
+        let mut context: Option<ITfContext> = None;
+        let mut edit_cookie = 0u32;
+        unsafe {
+            doc_mgr.CreateContext(client_id, 0, &store_unk, &raw mut context, &raw mut edit_cookie)?;
         }
-        built
+        let context = context.ok_or_else(|| Error::from_hresult(E_FAIL))?;
+        unsafe { doc_mgr.Push(&context)? };
+
+        Ok(Self {
+            shared,
+            thread_mgr,
+            doc_mgr,
+            empty_doc_mgr,
+            _context: context,
+            _store: store,
+            hwnd,
+            focused: Cell::new(false),
+            _apartment: apartment,
+        })
     }
 
     /// app の publish した document を反映し、focus を切り替える。
@@ -136,12 +145,11 @@ impl TsfManager {
 
 impl Drop for TsfManager {
     fn drop(&mut self) {
+        // interface 生存中に Pop / Deactivate。CoUninitialize は _apartment field の Drop が
+        // 全 interface の Release 後に実行する (struct コメント参照)。
         unsafe {
             let _ = self.doc_mgr.Pop(0);
             let _ = self.thread_mgr.Deactivate();
-            if self.did_coinit {
-                CoUninitialize();
-            }
         }
     }
 }

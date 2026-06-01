@@ -12,8 +12,8 @@
 //!   [`DocState::take_pending_edits`] により `text_input` へ流れる。
 //!
 //! **echo suppression**: IME 自身の編集を widget が echo back しても、store は IME に
-//! `OnTextChange`/`OnSelectionChange` を返さない (= 無限ループ防止)。`last_ime_*` に「IME が
-//! 最後に set した値」を覚え、app の publish 値がそれと一致する間は通知を抑制する。
+//! `OnTextChange`/`OnSelectionChange` を返さない (= 無限ループ防止)。`set_*_acp` が `text`/`sel`
+//! cache を即時更新するので、widget の echo は cache と一致し通知が立たない (app 起因の変化だけ通知)。
 //!
 //! COM 型を一切含まないので全 [`crate::acp_map`] 同様に単体テストできる (COM shim
 //! (`text_store.rs`, Windows 限定) はこの struct を `Rc<RefCell<>>` で包んで sink を足すだけ)。
@@ -65,15 +65,9 @@ pub struct DocState {
     /// text field が focus 中で publish されているか (false = store 空 = IME 非アクティブ)。
     active: bool,
 
-    // --- echo suppression: IME 自身が最後に set した値 ---
-    last_ime_text: String,
-    last_ime_sel: Range<usize>,
-
     // --- IME → widget へ返す編集 (byte 空間、FIFO) ---
     pending_edits: Vec<ImeTextEdit>,
 
-    /// app 起因の publish で内容/選択が変わるたび +1 (stale-edit 防御の世代印)。
-    app_generation: u64,
     /// 次に sink へ流すべき通知。
     notify: Notify,
 }
@@ -95,7 +89,9 @@ impl DocState {
 
     /// app (focused text_input) の 1 フレーム snapshot を取り込む。`None` で focus 喪失。
     ///
-    /// IME 自身の編集を echo back した場合は通知を立てない (`last_ime_*` と一致するため)。
+    /// IME 自身の編集は、`set_text_acp`/`set_selection_acp` が `self.text`/`self.sel` を即時更新
+    /// するため、widget が echo back しても `doc.text == self.text` / `new_sel == self.sel` で
+    /// 一致し通知が立たない (= storm 防止)。app 起因の変化のときだけ sink へ通知する。
     pub fn publish(&mut self, doc: Option<&TextDocument>) {
         let Some(doc) = doc else {
             // focus 喪失: store を空にして IME を非アクティブ化。
@@ -120,18 +116,15 @@ impl DocState {
         let new_sel = lo..hi;
         let reversed = cursor < anchor;
 
-        // app 値が「IME が最後に set した値」と異なるときだけ通知 (echo 抑制)。
-        if doc.text != self.text && doc.text != self.last_ime_text {
+        // store の cache 値と異なるときだけ通知 (IME 編集の echo は cache と一致して無通知)。
+        if doc.text != self.text {
             self.notify.text = true;
         }
-        if new_sel != self.sel && new_sel != self.last_ime_sel {
+        if new_sel != self.sel {
             self.notify.selection = true;
         }
         if doc.caret_rect != self.caret {
             self.notify.layout = true;
-        }
-        if doc.text != self.text || new_sel != self.sel {
-            self.app_generation = self.app_generation.wrapping_add(1);
         }
 
         if doc.text != self.text {
@@ -158,12 +151,6 @@ impl DocState {
     /// IME が行った編集を byte 空間で取り出す (`frame()` 先頭で widget に流す)。
     pub fn take_pending_edits(&mut self) -> Vec<ImeTextEdit> {
         std::mem::take(&mut self.pending_edits)
-    }
-
-    /// 現在の世代 (stale-edit 防御用)。
-    #[must_use]
-    pub fn generation(&self) -> u64 {
-        self.app_generation
     }
 
     // ============================== store 読み (ACP) ==============================
@@ -228,8 +215,6 @@ impl DocState {
         self.rebuild();
         self.sel = new_cursor_byte..new_cursor_byte;
         self.sel_reversed = false;
-        self.last_ime_text.clone_from(&self.text);
-        self.last_ime_sel = self.sel.clone();
 
         self.pending_edits.push(ImeTextEdit::Replace {
             start_byte: lo,
@@ -250,7 +235,6 @@ impl DocState {
         let hi_byte = self.map.acp_to_byte(a.max(b));
         self.sel = lo_byte..hi_byte;
         self.sel_reversed = reversed;
-        self.last_ime_sel = self.sel.clone();
 
         let (anchor_byte, cursor_byte) = if reversed {
             (hi_byte, lo_byte)
