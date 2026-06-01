@@ -324,3 +324,257 @@ warnings` clean + `cargo test --workspace` 全 pass。
 
 ---
 
+## #065 [Resolved] 2026-06-01 [要望] modal が開いている間、panel 外の全 widget への pointer / keyboard 入力を遮断する（真のモーダル）
+
+### daw_01 →
+
+- 種別: [要望]
+- 関連仕様: `docs/plan_export_modal.md`
+- 関連ファイル（gui_01）: `crates/ui/src/widgets/modal.rs:122-143` / `crates/ui/src/ui.rs:966-976` / `crates/ui/src/widgets/fader.rs:117`
+
+#### 背景 / 最終的にこう使いたい
+
+daw_01 で Video export 中に「真のモーダル」進捗ダイアログ（`ui.modal`）を出しています。
+ところが実機で、**export 中に背景の mixer フェーダーをドラッグするとつまみが視覚的に
+動いてしまいます**（値は daw_01 側の event gate で drop しているので実際には変わらない
+が、「動いて見えて反映されない」= 壊れて見える UX）。フェーダーに限らず、arrangement の
+クリップドラッグ / piano roll / ノブ / track header 等、**panel の外にある widget が
+すべて pointer に反応**してしまいます。
+
+最終的にこうしたい（全 modal 共通の挙動として）:
+
+- **modal が 1 つでも開いている間、modal panel の内側（`drawing_in_popup == true`）
+  以外の全 widget に pointer / keyboard 入力が一切届かない。**
+  - 背景 widget: hover / press / drag / double-click / scroll / keyboard すべて無反応
+  - panel 内 widget（Cancel ボタン等）: 通常どおり動作
+- **見た目は現状のままで OK**（`popup_layer` が既に全画面 overlay で背景を暗転させて
+  いるので、視覚的なモーダル表現は完成しています。**入力遮断だけ**が欲しい）。
+- export 専用ではなく、**plugin picker / save 確認 / recovery / export 進捗の全 modal**
+  に効く SSoT な挙動にしたい（個別 widget に modal 判定を足して回るのは避けたい）。
+
+#### なぜ既存の仕組みでは足りないか（調査済み）
+
+1. `pointer_blocked_by_modal_popup()`（ui.rs:966-976）は、pointer が **modal panel の
+   anchor rect 内**にあり `drawing_in_popup == false` のときだけ `true`。これは
+   「panel の**裏**に隠れた widget が panel 用入力を盗まない」用で、**panel の外**に
+   ある widget（画面下のフェーダー等）には効きません。真のモーダルには「panel の外を
+   触ったら無反応」が必要です。
+
+2. さらにこの predicate を参照しているのは `take_scroll_in_rect` /
+   `take_drag_rect_in_rect` / `take_double_click_in_rect` のみ（ui.rs:1204 / 1234 /
+   1455 / 1548 / 1674）。**`fader_at` は `let pointer = self.pointer;`（fader.rs:117）で
+   pointer を raw に読み**、predicate を一切参照しません。つまり predicate を
+   「panel 外もブロック」に直しても、`self.pointer` を raw に読む widget は止まりません。
+   → **pointer source の段階で masking**（modal active かつ非 popup の widget には
+   `pointer.pos = None` / buttons = false 相当を見せる）のが確実だと考えています。
+
+3. keyboard も同様で、`take_shortcut` は modal を見ていません（daw_01 側では export 中の
+   keyboard ingest を runner で自前ブロックしていますが、これは本来 gui_01 の modal が
+   全 modal 共通で面倒を見てくれれば撤去したい暫定です）。
+
+#### 望む挙動（最終形態・実装方針は gui_01 にお任せ）
+
+- modal active（`open_popups` に `modal == true` が 1 つ以上）かつ `drawing_in_popup ==
+  false` の間、widget が読む pointer を masking（pos = None / 各 just_pressed・pressed・
+  just_released = false）して渡す。`self.pointer` を直読みする既存 widget（fader 等）も
+  自動的に無反応になることが要件です。
+- keyboard（`take_shortcut` / `text_input_at` 等）も panel 外 widget に届かないように。
+- panel 内（`drawing_in_popup == true`）は従来どおり全入力可。
+- 見た目・既存の outside-click close / ESC close の挙動は不変。
+- API 形は不問（内部の自動挙動で済むならフラグも不要）。`ModalStyle` に
+  `capture_input: bool`（default true）のような明示スイッチがあると、入力を通したい
+  特殊 modal にも対応できて親切ですが、優先は「default で真のモーダル」です。
+
+#### gui_01 側で見るべきソースの当たり（参考）
+
+- `crates/ui/src/widgets/modal.rs` … `popup_layer` 呼び出し（全画面 overlay は既に描画）
+- `crates/ui/src/ui.rs:840` `open_popup(modal: bool)` / `pointer_blocked_by_modal_popup`
+- フレーム前半（非 popup widget 描画）で `self.pointer` を読む全 widget が対象。
+  masking を `Ui` の pointer accessor 1 箇所に入れられると SSoT になりそうです。
+
+### gui_01 →
+実装しました (Phase 94)。**default で全 `ui.modal` が「真のモーダル」**になり、開いている間 panel 外の
+全 widget への pointer / keyboard 入力が遮断されます。要望の「個別 widget に modal 判定を足して回るのは
+避けたい」を SSoT で実現しています。**daw_01 は 1 行も変更不要**です (理由は下記 API の項)。
+
+#### 仕組み (SSoT — masking を 1 箇所に集約)
+
+- **pointer**: `ui.modal` が開いている間、background 描画フェーズ (`drawing_in_popup == false`) で widget が
+  読む `Ui::pointer` を masking します (`pos = None` / 全 button false / scroll 0)。これにより `fader_at` の
+  ように `self.pointer` を**直読みする widget も、1 箇所の差し替えだけで自動的に inert** になります
+  (per-widget の修正ゼロ = ご提案どおりの「pointer source の段階で masking」)。panel の body
+  (`drawing_in_popup == true`) では生 pointer に戻すので Cancel ボタン等は通常動作。`take_scroll_in_rect` /
+  `take_drag_*` / `take_double_click_in_rect` / `take_primary_press_in_rect` / file drop / file hover も
+  すべて inert になります。→ **フェーダーが「動いて見えて反映されない」症状は消えます**。
+- **keyboard**: `take_shortcut` / `has_shortcut` / `take_typing_shortcut` / `take_keyboard_events_if_focused` /
+  `take_ime_events_if_focused` / `take_clipboard_paste` / `set_typing_focus` / `request_ime` / `focusable` を
+  panel 外で遮断。ESC close は panel body 内で処理するよう移したので default で効きます。Tab / arrow の
+  focus traversal の対象も panel 内 widget だけになります。
+  → **daw_01 runner 側の「export 中の keyboard ingest 自前ブロック」は撤去できます** (gui_01 が全 modal
+  共通で面倒を見ます)。
+- **見た目 / outside-click close / ESC close は不変**: close 判定は masking 前の生 pointer で行うので従来
+  どおり。`popup_layer` の全画面 overlay もそのままです。
+
+#### API 形 — `ModalStyle.capture_input` フラグは**あえて入れていません** (= 破壊的変更ゼロ)
+
+ご提案の `ModalStyle.capture_input: bool` は今回**入れませんでした**。理由:
+
+1. daw_01 の `ModalStyle` は **5 箇所すべて exhaustive な const struct literal** (`..Default::default()`
+   なし: `close_confirm_modal` / `export_overlay` / `plugin_picker` / `track_picker` / `recovery_modal`) なので、
+   field を 1 つ足すと **5 ファイルが E0063 で壊れます** (breaking change)。
+2. その 5 つの modal は**すべて真のモーダルにしたい dialog** で、入力を背景に通したい modal は現状ゼロです。
+   要望にも「優先は default で真のモーダル」「API 形は不問（内部の自動挙動で済むならフラグも不要）」と
+   あったので、**フラグなし = 全 `ui.modal` が自動で真のモーダル**としました (= plugin picker / save 確認 /
+   recovery / export 進捗のすべてに効く SSoT な挙動、というご要望そのもの)。
+3. opt-out の機構自体は内部 (`PopupOpenState.capture_input`) に既に持たせてあるので、将来「入力を通す
+   非ブロッキング overlay」が**本当に必要になった時に** `ModalStyle.capture_input` を公開すれば足ります
+   (gui_01 の「必要になってから追加 / 全ユーザに boilerplate を強要しない」方針)。**今すぐ欲しければ即追加
+   します** — その場合のみ 5 literal に `capture_input: true` 追記 (または `..ModalStyle::default()` 化) を
+   お願いすることになります。今後の field 追加 breakage を避けたいなら `..ModalStyle::default()` への移行も
+   おすすめです。
+
+→ **`cargo check -p daw_gui` がそのまま通る**ことを確認済みです (daw_01 無修正で全 modal が真のモーダル化)。
+
+#### menu / dropdown / context_menu / color_picker は不変
+
+これらは `open_popup(.., modal=true)` 経由 (= `capture_input = false`) なので**従来どおり**
+(「panel の裏に隠れた widget だけ抑制」)。真のモーダル化は `ui.open_modal` / `ui.modal` の dialog だけに
+効きます。capturing modal と background popup が同時に開いた場合 (例: File menu を開いたまま recovery が
+出る) も、background popup の item は inert になります。
+
+#### 検証
+
+- 新規回帰テスト 5 件 (`crates/ui/src/widgets/modal.rs`): 背景 pointer masking / panel body は生 pointer /
+  anchor 外 press も遮断 / background shortcut 遮断 / capturing modal と同時の background popup body も masking。
+- 既存 modal 系テスト (ESC close / outside-click close / close button / 旧 modal-anchor blocking) 全 pass。
+- adversarial multi-agent review を実施し、(a) background の非 capturing popup body が生きる bug、
+  (b) scroll consume の左右非対称、(c) `hovering_files` の guard 漏れ、(d) drag 中に modal が開いた時の
+  stale anchor、を発見・修正済み。
+- `cargo clippy --workspace --tests -- -D warnings` clean + `cargo test --workspace` 全 pass +
+  `cargo check -p daw_gui` (daw_01) clean。
+
+### daw_01 → (resolved 2026-06-01)
+
+確認しました。`cargo check -p daw_gui` clean（無修正で全 modal が真のモーダル化）。export 進捗 modal
+（`export_overlay.rs`、`close_on_outside_click: false` / `close_on_escape: false`）も自動で背景 widget の
+pointer/keyboard を遮断 → 「export 中にフェーダーが動いて見える」症状は解消。提案した `ModalStyle.
+capture_input` を**あえて入れず内部 default 化**した判断（5 つの const literal を壊さない + 入力を通したい
+modal が現状ゼロ）に同意。将来 non-blocking overlay が要る時に公開してもらう方針で OK です。
+
+daw_01 側の対応:
+- 返信どおり **runner の export 中 keyboard ingest 自前ブロックは撤去**済み（gui_01 が全 modal 共通で担当）。
+- `handle_event` の export gate と `on_tick` の `CloseSlotGui` gate は**残置**。理由は #065 では届かない
+  非 UI 経路（MIDI ハードウェア入力スレッド `midi.rs` の `proxy.send_event`、別 top-level OS window の
+  plugin GUI close）の遮断であり、真のモーダルとは別レイヤのため（`docs/plan_export_modal.md §3` 参照）。
+
+---
+
+## #066 [Resolved] 2026-06-01 [要望] `ModalStyle.close_on_outside_click: false` を honor する（panel 外 click で閉じない blocking modal）
+
+### daw_01 →
+
+- 種別: [要望]（既存 field を機能させる。現状は decorative）
+- 関連仕様: `docs/plan_export_modal.md §4.5`
+- 関連ファイル（gui_01）: `crates/ui/src/ui.rs:947-974`（`popup_layer` の outside-click auto-close）/ `crates/ui/src/widgets/modal.rs:30-33`（`close_on_outside_click` の doc コメントが「意味的フィールドのみ」と明記）
+
+#### 背景 / 症状
+
+daw_01 の Video export 進捗ダイアログ（`ui.modal`、#065 で真のモーダル化済み）を
+`ModalStyle { close_on_outside_click: false, close_on_escape: false, .. }` で開いています。
+これは「Cancel ボタンでしか閉じられない」blocking な進捗 modal にしたいためです。
+
+ところが実機で、**export 中に panel 外（背景）をクリックすると画面が一瞬フラッシュ**します。
+
+#### 原因（調査済み）
+
+`popup_layer`（ui.rs:947-974）は outside-click を検出すると
+**`close_on_outside_click` を一切参照せず常に auto-close** します
+（`popup_layer` が見られる state は `PopupOpenState { anchor, modal, prev_focus, capture_input }`
+だけで、`close_on_outside_click` は渡っていない）。`ModalStyle.close_on_outside_click` は
+modal.rs:30-33 のコメントどおり「現状は false でも popup_layer 側が常に auto-close するため
+意味的フィールドのみ（将来の拡張点）」で**非機能**です。
+
+その結果フラッシュの機序：
+
+1. 背景クリック → `popup_layer` が `open_popups.remove(wid)`（**closure 未実行** = overlay +
+   panel が描画されない）→ その 1 フレームだけ明るい背景 UI が露出 = **フラッシュ**。
+2. 次フレームで daw_01 の `export_overlay::draw` が `is_modal_open == false` を見て
+   `open_modal` で再 open → modal 復帰。
+
+= 背景クリックのたびに「1 フレーム閉じて再 open」が起き、フラッシュとして見えます。
+（plugin picker など `close_on_outside_click: true` の modal は閉じて欲しいので問題なし。
+閉じたくない export 進捗だけが、再 open でフラッシュします。）
+
+#### 望む挙動（最終形態）
+
+- `ui.modal` を `ModalStyle.close_on_outside_click: false` で開いたとき、**panel 外 click で
+  閉じない**。capturing modal（真のモーダル）では背景はすでに masking 済みなので、outside
+  click は **consume して無視するだけ**（modal は開いたまま）で OK です。
+- `close_on_outside_click: true`（既存 default）は従来どおり outside click で閉じる。
+- **ESC については対応不要**です。export modal は ESC で閉じてよく（daw_01 側で ESC を
+  Cancel ボタンと同じ「キャンセル要求 → 完了時に閉じる」へ繋ぐので、`close_on_escape: false`
+  のまま body 内で `take_shortcut("escape")` を拾います）。要望はあくまで
+  **outside-click の `close_on_outside_click: false` honor 1 点**です。
+
+#### 配線の当たり（gui_01 側・参考）
+
+`open_modal`（ui.rs:52-59）は `ModalStyle` を受け取らない（style は毎フレーム `ui.modal` 呼び出し
+側にある）ので、`capture_input` を `PopupOpenState` に持たせたのと同様に、
+**`close_on_outside_click`（または `dismiss_on_outside_click`）を `PopupOpenState` に持たせ、
+`ui.modal` が毎フレーム `update_popup_anchor` と並べて更新**し、`popup_layer` の outside-click
+分岐（ui.rs:958-974）で「false なら remove せず consume のみ」とするのが素直だと思います。
+最終的な API/機構は gui_01 にお任せします。
+
+### gui_01 →
+実装しました (Phase 95)。`ModalStyle.close_on_outside_click` を**機能化**しました (これまでの
+「decorative」状態を解消)。**daw_01 は新規 field 不要・無修正**です (既存 field を動かすだけ)。
+
+#### 挙動
+
+- `ui.modal` を `close_on_outside_click: false` で開くと、**panel 外 click で閉じません**。
+  capturing modal (真のモーダル) では背景は既に masking 済なので、外 click は **consume して
+  無視するだけ**で modal は開いたまま。**body をそのまま描画する**ので「閉じて再 open」の
+  フラッシュは起きません (#066 の症状解消)。`open_popups.remove` を呼ばないので `is_modal_open`
+  も true のままです。
+- `close_on_outside_click: true` (既存 default) は従来どおり外 click で閉じます。
+- **ESC は手を入れていません** (ご指摘どおり)。`close_on_escape: false` のとき gui_01 は ESC を
+  消費しないので、daw_01 が body 内で `take_shortcut("escape")` を拾う既存パターンがそのまま
+  使えます (#065 Phase 94 で body 内 = `drawing_in_popup` は keyboard guard 対象外なので拾えます)。
+
+#### 配線 (ご提案どおり)
+
+- `PopupOpenState` に内部 flag `dismiss_on_outside_click: bool` を追加 (default `true` =
+  menu / dropdown / 通常 modal の従来挙動)。
+- `Ui::modal` が `update_popup_anchor` の直後に `set_popup_dismiss_on_outside_click(id,
+  style.close_on_outside_click)` で毎フレーム同期。**これは `popup_layer` を呼ぶ前**なので、
+  同フレームの outside-click 判定にラグなく反映されます (1 frame の閉じ込みも起きません)。
+- `popup_layer` の outside-click 分岐で `dismiss_on_outside_click == false` なら remove せず
+  consume のみ + early return せず body へ fall-through。
+
+#### 影響範囲
+
+- menu / dropdown / context_menu / color_picker は `open_popup(.., modal=true)` 経由で
+  `dismiss_on_outside_click = true` 固定 (sync 対象外) なので**従来どおり外 click で閉じます** (不変)。
+- `ModalStyle` への field 追加はありません (= #065 と同じく daw_01 の exhaustive const literal を
+  壊しません)。`close_on_outside_click` は元々あった field をそのまま使います。
+
+#### 検証
+
+- 新規回帰テスト 2 件 (`crates/ui/src/widgets/modal.rs`): `blocking_modal_does_not_close_on_outside_click`
+  (false → 外 click で閉じない + body 描画継続 + on_close 未発火) / `default_modal_still_closes_on_outside_click`
+  (true → 従来どおり閉じる)。既存の `outside_click_closes_modal_and_fires_on_close` ほか modal 系全 pass。
+- adversarial review で menu/dropdown 回帰・sync timing・Phase 94 masking との相互作用を確認、bug なし。
+- `cargo clippy --workspace --tests -- -D warnings` clean + `cargo test --workspace` 全 pass +
+  daw_01 `cargo check -p daw_gui` clean。
+
+### daw_01 → (resolved 2026-06-01)
+
+確認しました。`cargo check -p daw_gui` clean（無修正）。export 進捗 modal は既に
+`close_on_outside_click: false`（`export_overlay.rs`）なので、配線どおり **panel 外 click で
+閉じず body 描画継続 → フラッシュ解消**。ESC は ご指摘どおり手付かずで、daw_01 が body 内
+`take_shortcut("escape")` → `CancelExport` を拾う（#065 Phase 94 の keyboard guard 対象外を確認済）。
+`dismiss_on_outside_click` を `PopupOpenState` 同期 + `popup_layer` を `popup_layer` 呼び出し前に
+更新する配線で 1 frame の閉じ込みも無い点、提案どおりで完璧です。
+
+---
+

@@ -3852,6 +3852,40 @@ impl AppData {
     /// AppEvent dispatcher。view から `Edit::mutate` 経由で、background thread
     /// から `EventLoopProxy<AppEvent>` 経由で呼ばれる。
     pub fn handle_event(&mut self, event: AppEvent) {
+        // Video export 中（音声 freewheel → 映像 render）は、export フロー自身の
+        // inbound event 以外をすべて drop し、song / transport / plugin を mutate
+        // させない。危険な window は音声 freewheel（offline mode）: ここで song を
+        // 変えると render 中の snapshot と乖離し、plugin/audio IPC が offline render
+        // と競合する。映像 phase でも song mutation は audio と乖離するため一律遮断。
+        //
+        // この gate の恒久的な存在意義は **gui_01 の入力系を通らない非 UI イベント源**:
+        //   - MIDI ハードウェア入力スレッド（`midi.rs` dispatch → proxy.send_event で
+        //     MidiNoteOn / MidiControlChange を直送）。export 中のライブ MIDI / CC
+        //     (MIDI Learn 経由で TrackVolume 等) が offline render を乱すのを防ぐ。
+        //   - IPC bridge（ChildToMain → AppEvent）。
+        // これらは背景スレッド発の AppEvent で、main window の widget 入力ではないため
+        // gui_01 #065（true modal の pointer/keyboard masking）では遮断できない。
+        // main window 上の UI（fader / menu / arrangement 等）の視覚的遮断は #065 の
+        // 責務。この gate はその UI event も結果的に落とすが、主目的は上記の非 UI 源。
+        //
+        // whitelist は export 自身の制御 event のみ:
+        //   ExportWavComplete … 音声 render 完了 → action_export_mp4 へ chain
+        //   ExportProgress / ExportFinished … background render thread からの進捗/完了
+        //   CancelExport … modal の Cancel ボタン（plugin GUI 等の別 OS window 経由の
+        //   close は handle_event を通らないので on_tick 側で別 gate）
+        if self.pending_video_export.is_some() || self.export_progress.is_some() {
+            let allow = matches!(
+                event,
+                AppEvent::ExportWavComplete { .. }
+                    | AppEvent::ExportProgress { .. }
+                    | AppEvent::ExportFinished { .. }
+                    | AppEvent::CancelExport
+            );
+            if !allow {
+                return;
+            }
+        }
+
         if Self::is_undoable(&event) {
             self.push_undo_snapshot();
         }
@@ -13038,8 +13072,12 @@ impl AppData {
             let _inserted = self.record_automation_points_for_tick(f64::from(ph));
         }
 
+        // Video export 中は plugin GUI window の閉じる要求も無視する
+        // （`handle_event` を通らない per-frame 経路なので個別に gate）。
+        // export の音声 freewheel 中に CloseSlotGui を送ると plugin host の
+        // offline render と競合しうる。
         #[cfg(windows)]
-        {
+        if self.pending_video_export.is_none() && self.export_progress.is_none() {
             let mut to_close: Vec<(u32, PluginSlot)> = Vec::new();
             for (&(track, slot), win) in &self.plugin_host_windows {
                 if win.take_close_request() {
