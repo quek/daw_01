@@ -122,7 +122,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         "audio_editor_title",
         &format!(
             "Audio Editor — {} ({:.2} beats)",
-            clip.name,
+            app.song.content_name(clip.content_id),
             clip.length_beats
         ),
         area.x + pad,

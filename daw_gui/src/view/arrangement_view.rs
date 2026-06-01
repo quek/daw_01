@@ -117,6 +117,33 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
     }
 
+    // gui_01 #068 連動ハイライト: アクティブな共有グループの content_id 集合
+    // = {選択中 clip の content_id} ∪ {前フレーム hover clip の content_id}、
+    // refcount>=2 のみ。 各 clip の `in_active_group` 判定に使う。
+    let active_groups: std::collections::HashSet<common::model::ContentId> = {
+        let mut set = std::collections::HashSet::new();
+        let is_shared = |cid: common::model::ContentId| {
+            refcount_by_content.get(&cid).copied().unwrap_or(0) >= 2
+        };
+        for r in &app.selected_clips {
+            if let Some(c) = app
+                .song
+                .tracks
+                .get(r.track as usize)
+                .and_then(|t| t.clips.get(r.clip as usize))
+                && is_shared(c.content_id)
+            {
+                set.insert(c.content_id);
+            }
+        }
+        if let Some(cid) = app.arrange_hover_content
+            && is_shared(cid)
+        {
+            set.insert(cid);
+        }
+        set
+    };
+
     let tracks: Vec<ArrangementTrack> = app
         .song
         .tracks
@@ -157,11 +184,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     len_beats: c.length_beats,
                     // docs/plan_text_overlay.md §4 P4: text clip は
                     // event の text 先頭 ~32 文字を clip 上に表示。
-                    // 空テキスト or 非 Text variant なら clip.name (= 作成
-                    // 時のユーザー設定名) を fallback。
+                    // 空テキスト or 非 Text variant なら共有名
+                    // (`content_id` 単位 SSoT) を fallback。 同 content を
+                    // 共有する linked clip は同じ名前を表示する。
                     name: text_clip_label(c, &app.song.clip_contents)
                         .map(Arc::from)
-                        .unwrap_or_else(|| Arc::from(c.name.as_str())),
+                        .unwrap_or_else(|| Arc::from(app.song.content_name(c.content_id))),
                     // v18 (`docs/plan_track_clip_color.md`): clip は effective
                     // 色 (個別上書き or トラック色継承) で塗る。共有 clip
                     // (refcount >= 2) では widget が `share_group_color` (hue) を
@@ -186,6 +214,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     } else {
                         None
                     },
+                    // gui_01 #068: アクティブな共有グループ member なら true。
+                    // widget が selection とは別レイヤで hue glow + 太枠を描く。
+                    in_active_group: active_groups.contains(&c.content_id),
                     // gui_01 #025 (M14 Phase 63k): audio clip のとき first event の
                     // 値を渡して widget に dB handle / fade 角 grip / envelope を
                     // 描かせる。 Phase 1 で 1 clip 1 event 前提なので first event
@@ -404,6 +435,19 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         make_edit,
     );
 
+    // gui_01 #068 連動ハイライト: 今フレームの hovered clip の content_id を
+    // 次フレームの active group 計算用に保持 (変化時のみ Edit を発火、 毎フレーム
+    // の無駄な mutate を避ける)。
+    let hover_content = resp.hovered_clip.and_then(|k| {
+        let t = app.song.tracks.iter().find(|t| t.id == k.track)?;
+        t.clips.iter().find(|c| c.id == k.clip).map(|c| c.content_id)
+    });
+    if hover_content != app.arrange_hover_content {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.arrange_hover_content = hover_content;
+        }));
+    }
+
     // gui_01 #020 (M14 Phase 63f): clip 上の右クリックメニュー (Make Unique)。
     // widget が `clip_rects: Vec<(ClipKey, Rect)>` を返してくれるので、
     // track_header_rects と同じパターンで context_menu_for を重ねる。
@@ -439,6 +483,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             &[
                 "Rename",
                 "Make Unique",
+                "共有を一括選択",
                 "Auto-Fade",
                 "Auto-Crossfade",
                 "Reverse",
@@ -456,27 +501,30 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         // clip 版、 F2 でも起動)。
                         0 => app.handle_event(AppEvent::BeginRenameClip(target)),
                         1 => app.handle_event(AppEvent::MakeClipUnique(target)),
-                        2 => app.handle_event(AppEvent::AutoFadeSelectedClips),
-                        3 => app.handle_event(AppEvent::AutoCrossfadeSelectedClips),
+                        // 共有を一括選択: 同 content_id の linked clip group を
+                        // まとめて選択 (`docs/plan_clip_shared_name.md` §2)。
+                        2 => app.handle_event(AppEvent::SelectLinkedClips(target)),
+                        3 => app.handle_event(AppEvent::AutoFadeSelectedClips),
+                        4 => app.handle_event(AppEvent::AutoCrossfadeSelectedClips),
                         // Reverse は右クリック対象 clip 1 つだけを toggle
                         // (Auto-Fade と違って selection 全体ではなく当該
                         // clip のみ。 Bitwig clip メニューでも同様)。
-                        4 => app.handle_event(AppEvent::ToggleClipReversed(target)),
+                        5 => app.handle_event(AppEvent::ToggleClipReversed(target)),
                         // Bounce In Place: Pre-FX (= plugin chain 通さず)、
                         // 当該 clip の content を 1 event の baked audio に
                         // 置換 (= 元 track 内で同 path)。 Phase 2 PR9
                         // (`docs/plan_audio_clip.md` §3.8)。
-                        5 => app.handle_event(AppEvent::BounceClipInPlace(target)),
+                        6 => app.handle_event(AppEvent::BounceClipInPlace(target)),
                         // Bounce (with FX): plugin chain を **通した** 結果を
                         // **新 track + 新 Clip** に書き出す (元 clip は不変)。
                         // async (= IPC freewheel render → 完了通知)。
                         // Phase 2 PR-C (`docs/plan_audio_followup.md`)。
-                        6 => app.handle_event(AppEvent::BounceClipWithFx(target)),
+                        7 => app.handle_event(AppEvent::BounceClipWithFx(target)),
                         // v18 (`docs/plan_track_clip_color.md`): color_picker を開く
                         // (anchor = 右クリックした clip rect)。個別 clip 色の上書き。
                         // 「トラック色に戻す」 (継承へ) は Ableton と同様に track 側
                         // context menu (= 全 clip 一括) に置く。
-                        7 => app.open_color_picker(ColorPickerTarget::Clip(target), menu_rect),
+                        8 => app.open_color_picker(ColorPickerTarget::Clip(target), menu_rect),
                         _ => {}
                     }
                 }));
@@ -1641,7 +1689,7 @@ fn build_arrangement_lanes_from_slice(
                         id: c.id,
                         start_beat: c.start_beat,
                         len_beats: c.length_beats,
-                        name: Arc::from(c.name.as_str()),
+                        name: Arc::from(song.content_name(c.content_id)),
                         points,
                         share_group_color: if song.clip_content_refcount(c.content_id) >= 2 {
                             Some(content_id_to_hue(c.content_id))

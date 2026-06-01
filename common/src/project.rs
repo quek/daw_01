@@ -174,6 +174,11 @@ mod tests {
         // いて、 ensure_ids が `next_id > max_existing_id` を強制する仕様
         // どおりに修正する。
         song.ensure_ids();
+        // v20: load() drains the legacy per-clip `name` into
+        // `clip_content_names` via `ensure_clip_contents`. Apply the same
+        // normalization to the original so the round-trip assert compares
+        // like-with-like (idempotent — load runs it once more on read).
+        song.ensure_clip_contents();
         save(&path, &song).unwrap();
         assert_eq!(load(&path).unwrap(), song);
     }

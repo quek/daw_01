@@ -8,6 +8,16 @@ use crate::plugin_format::PluginFormat;
 use crate::protocol::PluginSlot;
 use crate::scale::ScaleChange;
 
+/// `20` 共有クリップ名: `Song.clip_content_names: HashMap<ContentId, String>`
+/// が追加。 同 `content_id` を共有する全 clip の表示名をここで 1 実体共有し、
+/// 片方を rename すると linked clip 全部に連動する。 legacy per-clip
+/// `Clip.name` / `AutomationClip.name` は deserialize-only に降格し、
+/// `Song::ensure_clip_contents` が load 時に map へ drain する (v5→v6 の
+/// `Clip.notes` 移管と同 idiom)。 v19 `.daw` files still load —
+/// `clip_content_names` defaults to empty で、 各 clip の legacy `name` から
+/// backfill される (共有 content は最初に見た非空名を採用)。
+/// See `docs/plan_clip_shared_name.md`.
+///
 /// `19` 立ち絵 group transform: `Track.group_transform: Option<GroupTransform>`
 /// (位置 X/Y・回転・非一様スケール ScaleX/ScaleY・任意アンカー AnchorX/AnchorY・Opacity の
 /// 2D affine。AE の Transform プロパティ群と同構成) と
@@ -90,7 +100,7 @@ use crate::scale::ScaleChange;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 19;
+pub const CURRENT_VERSION: u32 = 20;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -167,6 +177,17 @@ pub struct Song {
     /// allocations start at `1`.
     #[serde(default)]
     pub next_content_id: ContentId,
+    /// v20: shared clip display name, keyed by `ContentId`. Every clip
+    /// sharing a `content_id` (linked clips) shares the same name — rename
+    /// one and all update. This is the SSoT for clip names; the legacy
+    /// per-clip `Clip.name` / `AutomationClip.name` fields are
+    /// deserialize-only and drained into this map by
+    /// `Song::ensure_clip_contents` on load (mirroring the v5→v6
+    /// `Clip.notes` → `clip_contents` migration). Lifecycle follows
+    /// `clip_contents`: `gc_clip_contents` prunes dead ids here too.
+    /// v19 files forward-migrate to a map backfilled from `Clip.name`.
+    #[serde(default)]
+    pub clip_content_names: HashMap<ContentId, String>,
     /// Pool of imported audio file references (WAV / generated). Each
     /// entry is keyed by `AudioSourceId` and shared by every
     /// `AudioEvent.source_id` that points at it. Decoded sample buffers
@@ -281,6 +302,7 @@ impl Default for Song {
             next_track_id: 1,
             clip_contents: HashMap::new(),
             next_content_id: 1,
+            clip_content_names: HashMap::new(),
             audio_sources: HashMap::new(),
             next_audio_source_id: 1,
             song_lanes: Vec::new(),
@@ -588,6 +610,50 @@ impl Song {
         id
     }
 
+    /// Shared clip name for a `ContentId` (SSoT, v20+). Empty string if
+    /// the content has no name. All clips sharing `content_id` resolve
+    /// the same name through here.
+    pub fn content_name(&self, content_id: ContentId) -> &str {
+        self.clip_content_names
+            .get(&content_id)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    /// Set the shared name for a `ContentId`. Renames every linked clip
+    /// (= every clip sharing this `content_id`) at once — the single
+    /// write point for clip rename.
+    pub fn set_content_name(&mut self, content_id: ContentId, name: String) {
+        self.clip_content_names.insert(content_id, name);
+    }
+
+    /// Allocate a fresh `ContentId`, insert its `content` payload and its
+    /// shared `name` together. Use at every fresh-clip creation site so
+    /// name + content never desync. Returns the new id.
+    pub fn alloc_content(&mut self, content: ClipContent, name: String) -> ContentId {
+        let id = self.alloc_content_id();
+        self.clip_contents.insert(id, content);
+        if !name.is_empty() {
+            self.clip_content_names.insert(id, name);
+        }
+        id
+    }
+
+    /// Fork a `ContentId` into an independent copy: deep-clone its
+    /// content payload AND its shared name under a fresh id. Use at every
+    /// independent-copy / Make-Unique site. Returns the new id. The
+    /// source content/name are left untouched.
+    pub fn fork_content(&mut self, src: ContentId) -> ContentId {
+        let content = self.clip_contents.get(&src).cloned().unwrap_or_default();
+        let name = self.clip_content_names.get(&src).cloned();
+        let id = self.alloc_content_id();
+        self.clip_contents.insert(id, content);
+        if let Some(name) = name {
+            self.clip_content_names.insert(id, name);
+        }
+        id
+    }
+
     /// Migrate v5 `.daw` files: legacy `Clip.notes` (deserialize-only)
     /// gets moved into `clip_contents` keyed by a freshly allocated
     /// `content_id`. Idempotent — clips that already have non-zero
@@ -632,6 +698,13 @@ impl Song {
                     self.tracks[t_idx].clips[c_idx].content_id = new_id;
                 }
                 let cid = self.tracks[t_idx].clips[c_idx].content_id;
+                // v19→v20: drain legacy per-clip name into the shared name
+                // map (first non-empty wins for a shared content_id). Keeps
+                // the in-memory `Clip.name` invariant empty.
+                let legacy_name = std::mem::take(&mut self.tracks[t_idx].clips[c_idx].name);
+                if !legacy_name.is_empty() {
+                    self.clip_content_names.entry(cid).or_insert(legacy_name);
+                }
                 if has_legacy_notes {
                     let notes =
                         std::mem::take(&mut self.tracks[t_idx].clips[c_idx].notes);
@@ -673,6 +746,13 @@ impl Song {
                     }
                     let cid = self.tracks[t_idx].automation_lanes[l_idx].clips[c_idx]
                         .content_id;
+                    // v19→v20: drain legacy automation-clip name too.
+                    let legacy_name = std::mem::take(
+                        &mut self.tracks[t_idx].automation_lanes[l_idx].clips[c_idx].name,
+                    );
+                    if !legacy_name.is_empty() {
+                        self.clip_content_names.entry(cid).or_insert(legacy_name);
+                    }
                     // Automation clips have no legacy in-place payload
                     // (v8-introduced) — just make sure the content
                     // store has an entry so audio thread / GUI lookups
@@ -757,6 +837,9 @@ impl Song {
             }
         }
         self.clip_contents.retain(|id, _| live.contains(id));
+        // Shared names follow content lifecycle: drop names whose
+        // content_id no longer has any referencing clip.
+        self.clip_content_names.retain(|id, _| live.contains(id));
     }
 
     /// Allocate a fresh `AudioSourceId`, bumping the song-level counter.
@@ -1350,6 +1433,12 @@ pub struct Clip {
     /// move and resize.
     #[serde(default)]
     pub id: u32,
+    /// **Legacy field** (v19 まで per-clip 名の owner)。 v20+ は
+    /// `Song.clip_content_names[content_id]` が SSoT (= 共有クリップ間で
+    /// 名前を共有)。 load 時に `Song::ensure_clip_contents` が map へ drain
+    /// して空にする。 **in-memory は常に空**、 直接書かない (rename は
+    /// `Song::set_content_name` 経由)。 空なら serialize されない。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     pub start_beat: f64,
     pub length_beats: f64,
@@ -2462,6 +2551,10 @@ pub struct AutomationClip {
     /// reassigned by `AutomationLane::ensure_clip_ids` on load.
     #[serde(default)]
     pub id: u32,
+    /// **Legacy field**: v20+ は `Song.clip_content_names[content_id]` が
+    /// SSoT。 `Clip.name` と同じく load 時に map へ drain される。
+    /// 空なら serialize されない。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     pub start_beat: f64,
     pub length_beats: f64,
@@ -2689,13 +2782,73 @@ mod tests {
 
     #[test]
     fn current_version_is_pinned() {
-        // Bumped to 19 for 立ち絵 group transform: `Track.group_transform`
-        // (`Option<GroupTransform>`) and `AutomationTarget::GroupTransform`
-        // are added. v18 files forward-migrate via `#[serde(default)]`
-        // (`None`) and the appended enum variant. Pinning the constant
-        // catches accidental rollback. See
-        // `docs/plan_tachie_group_transform.md`.
-        assert_eq!(CURRENT_VERSION, 19);
+        // Bumped to 20 for shared clip names: `Song.clip_content_names`
+        // (`HashMap<ContentId, String>`) is added and the legacy per-clip
+        // `Clip.name` / `AutomationClip.name` are drained into it on load.
+        // v19 files forward-migrate via `#[serde(default)]` (empty map) +
+        // `ensure_clip_contents` backfill. Pinning the constant catches
+        // accidental rollback. See `docs/plan_clip_shared_name.md`.
+        assert_eq!(CURRENT_VERSION, 20);
+    }
+
+    #[test]
+    fn v19_clip_names_drain_into_shared_map_and_rename_is_group_wide() {
+        // Two linked clips (same content_id) carrying legacy v19 per-clip
+        // names. `ensure_clip_contents` drains the first non-empty name
+        // into the shared `clip_content_names` map and clears `Clip.name`.
+        let mut song = Song {
+            tracks: vec![Track {
+                id: 1,
+                clips: vec![
+                    Clip {
+                        id: 1,
+                        name: "Verse".into(),
+                        length_beats: 4.0,
+                        content_id: 7,
+                        ..Clip::default()
+                    },
+                    Clip {
+                        id: 2,
+                        name: "Verse".into(),
+                        start_beat: 4.0,
+                        length_beats: 4.0,
+                        content_id: 7,
+                        ..Clip::default()
+                    },
+                ],
+                ..Track::default()
+            }],
+            ..Song::default()
+        };
+        song.ensure_clip_contents();
+
+        // Legacy per-clip names are drained to empty; the shared map owns it.
+        assert_eq!(song.tracks[0].clips[0].name, "");
+        assert_eq!(song.tracks[0].clips[1].name, "");
+        assert_eq!(song.content_name(7), "Verse");
+
+        // Renaming via the shared map renames the whole linked group: both
+        // clips resolve the same name through their shared content_id.
+        song.set_content_name(7, "Chorus".into());
+        let cid0 = song.tracks[0].clips[0].content_id;
+        let cid1 = song.tracks[0].clips[1].content_id;
+        assert_eq!(song.content_name(cid0), "Chorus");
+        assert_eq!(song.content_name(cid1), "Chorus");
+
+        // fork_content copies the name under a fresh id, then diverges
+        // independently of the source group.
+        let forked = song.fork_content(7);
+        assert_ne!(forked, 7);
+        assert_eq!(song.content_name(forked), "Chorus");
+        song.set_content_name(forked, "Bridge".into());
+        assert_eq!(song.content_name(forked), "Bridge");
+        assert_eq!(song.content_name(7), "Chorus");
+
+        // GC drops names whose content_id is no longer referenced by any
+        // clip (the fork has no clip pointing at it).
+        song.gc_clip_contents();
+        assert_eq!(song.content_name(7), "Chorus");
+        assert!(!song.clip_content_names.contains_key(&forked));
     }
 
     #[test]

@@ -703,3 +703,163 @@ report 不要）。
 
 ---
 
+## #068 [Resolved] 2026-06-01 [要望] 共有グループ「連動ハイライト」: active group の clip を選択とは別レイヤで強調
+
+### daw_01 →
+- 種別: [要望]
+- 関連仕様: `docs/plan_clip_shared_name.md` §3
+- 関連ファイル: `crates/ui/src/widgets/arrangement.rs:126-152` (`ArrangementClip` struct),
+  `:886-1040` (`ArrangementStyle`、 既存 `share_group_*` 群), `:2659-2753` (`draw_clip` の
+  fill/border 決定 + link glyph 描画), `:811-828` (`ArrangementResponse`、 `hovered_clip`)
+
+#### 背景 / 最終的にこう使いたい
+
+#019 で共有/linked clip (= 同 `content_id`) に `ArrangementClip.share_group_color: Option<f32>`
+(hue) + link glyph `⇌` を入れてもらい、 共有グループは**常時アクセント色**で受動的に区別できる
+ようになっている。 これは「色が違う = 別グループ」 までは分かるが、 **トラック数 / clip 数が増えて
+同系 hue が並ぶと「結局どれとどれが同じ実体か」 が一目で追えない**。
+
+ユーザー要望: 共有 clip の 1 つを **選択 or hover** したら、 **同じ共有グループの他 clip も
+自動でまとめて強調**してほしい（「これと同じ仲間はこれとこれ」 が一瞬で分かる）。 これは
+selection（黄塗り）とは**別物**で、 選択していない同グループ member を光らせたい。
+
+最終形態（v1/v2 分割なし、 これで完成形）:
+
+- 共有グループのうち「今アクティブな（= 選択中 or hover 中の clip を含む）グループ」 の **全 member
+  clip** が、 selection とは別の**強調レイヤ**（hue ベースの ring / glow / 太枠など）で描かれる。
+- selection 中の clip 自体は従来どおり黄塗り優先で OK。 強調は主に**非選択の同グループ member**で
+  効けばよい（選択中 member にも重ねて出して構わない、 描画判断は gui_01 にお任せ）。
+- 強調色は当該グループの `share_group_color` (hue) を流用し、 「どのグループがアクティブか」 が
+  色でも一致して見えるのが理想。
+
+#### 想定 API（最小・byte 互換寄り）
+
+daw_01 はモデル（`content_id` → 全 clip）を持っているので、 **どの clip がアクティブグループの
+member か** は daw_01 側で計算して per-clip flag で渡すのが素直。 widget はそれを描くだけ:
+
+```rust
+pub struct ArrangementClip {
+    // 既存 ...
+    pub share_group_color: Option<f32>,
+    pub in_active_group: bool,   // 新フィールド: true ならアクティブグループ member
+}
+
+pub struct ArrangementStyle {
+    // 既存 share_group_* ...
+    // 強調レイヤの tunable（命名・採用パラメータは gui_01 にお任せ）:
+    pub share_group_active_border_lightness: f32, // 例: 通常より明るい枠
+    pub share_group_active_border_w: f32,         // 例: 太め
+    pub share_group_active_glow_alpha: f32,       // 例: hue glow を薄く敷く
+}
+```
+
+`in_active_group == false` のときは現状の描画と完全に同一（既存挙動を変えない）。
+`true` のとき、 `share_group_color` の hue を使った強調を上記 style で重ねる。
+
+daw_01 側ロジック（参考、 gui_01 実装不要）: 毎フレーム
+`active = {selected_clips の content_id} ∪ {前フレーム ArrangementResponse.hovered_clip の content_id}`
+を `refcount>=2` に絞って作り、 各 clip の `in_active_group = active.contains(content_id)` を渡す。
+
+> 別案として「daw_01 は何も渡さず、 widget が `hovered_clip` の `share_group_color` と一致する
+> 全 clip を自動強調」 も理屈上は可能ですが、 (a) selection 由来の強調を widget が知らない、
+> (b) hue 衝突で別グループを誤強調しうる、 ため **per-clip flag 方式を希望**します。
+> もし widget 側で持つ方が自然なら逆提案ください。
+
+#### 受け入れ基準
+
+- daw_01 が `in_active_group = true` を渡した clip だけ、 selection とは別の hue 強調が乗る。
+- `false` の clip は現状描画と pixel 一致（既存 share clip のアクセント色 + `⇌` は不変）。
+- 選択中の共有 clip（黄塗り）と、 その同グループ非選択 member（hue 強調）が**同時に**見分けられる。
+- `in_active_group` を常に false で渡せば #019 までと完全に同挙動（移行安全）。
+
+### gui_01 →
+実装しました (Phase 96)。**ご提案の per-clip flag 方式をそのまま採用**しました (widget 自動強調案は
+ご指摘どおり (a) selection 由来の active を widget が知らない、 (b) hue 衝突で別グループ誤強調、 の 2 点で
+不採用)。受け入れ基準 4 点すべて満たします。
+
+#### API (ご提案どおり)
+
+```rust
+pub struct ArrangementClip {
+    // 既存 ...
+    pub share_group_color: Option<f32>,
+    pub in_active_group: bool,   // 新フィールド (末尾追加)
+}
+
+pub struct ArrangementStyle {
+    // 既存 share_group_* ...
+    pub share_group_active_border_lightness: f32, // default 0.88 (share_group_border_lightness 0.75 より明るく「光る」)
+    pub share_group_active_border_w: f32,         // default 2.5  (clip_border_w 1.0 / selected 2.0 より太い)
+    pub share_group_active_glow_alpha: f32,       // default 0.22 (hue glow を薄く敷く / 0.0 で ring のみ)
+}
+```
+
+#### 描画 (selection とは別レイヤ)
+
+- `in_active_group == true` かつ `share_group_color == Some(hue)` の clip に、 **selection の黄塗りとは
+  別の 2 レイヤ**を重ねます: (1) **glow wash** = `share_group_color` の hue を高 lightness (0.88) ×
+  `glow_alpha` (0.22) で clip 全体に敷いて「光る」、 (2) **bright thick border** = 同 hue の opaque を
+  太枠 (2.5px) + 透明 fill で outline (clip 名 / 既存 fill は隠さず枠だけ強調)。 強調色は当該グループの
+  hue を流用するので「どのグループがアクティブか」 が色でも一致して見えます。
+- **selection 優先**: active overlay は `draw_selection_overlay` の **前**に描くので、 選択中 member は
+  黄塗りが上書き優先 (ご要望どおり)、 非選択の同グループ member が hue 強調の主役になります。
+- `share_group_active_glow_alpha = 0.0` で glow を切って **ring (太枠) のみ**にもできます (theme 向け opt-out)。
+
+#### 受け入れ基準への対応
+
+- ✅ `in_active_group = true` の clip だけに selection とは別の hue 強調が乗る。
+- ✅ `false` の clip は **現状描画と pixel 完全一致** (overlay が完全 no-op、 `in_active_group` を
+  viewport_key に含めないので cache も不変)。 `share_group_color == None` も同様に強調しません (hue 不明 = defensive)。
+- ✅ 選択中の共有 clip (黄塗り) と非選択の同グループ member (hue 強調) が同時に見分けられる。
+- ✅ `in_active_group` を常に false で渡せば #019 までと完全同挙動 (移行安全)。
+
+#### cache (perf) の設計判断
+
+`in_active_group` は hover / 選択で毎フレーム変わるので、 **`fold_arrangement_clip_hash` / viewport_key には
+含めていません**。含めると hover 毎に heavy cache が全無効化されて再描画コストが跳ねるためです。 強調は
+selection と同じく **cached 外の overlay で毎フレーム描画**し、 base 描画 (cached) は不変です
+(回帰テスト `fold_arrangement_clip_hash_ignores_in_active_group` で「flip しても hash 不変」 を固定)。
+
+#### daw_01 側の対応 (必要)
+
+今回は `ArrangementClip` に **必須 field を 1 つ追加**したため、 **daw_01 側で構築箇所の更新が必要**です
+(`..Default::default()` なしの exhaustive literal のため):
+
+1. `daw_gui/src/view/arrangement_view.rs:154` 付近の `ArrangementClip { ... }` literal に
+   `in_active_group: <bool>` を追加。
+2. active group の計算 (ご提案のロジックそのまま): 毎フレーム
+   `active = {selected_clips の content_id} ∪ {前フレーム ArrangementResponse.hovered_clip の content_id}`
+   を `refcount >= 2` に絞って作り、 各 clip で `in_active_group = active.contains(content_id)`。
+   - `hovered_clip` は既存 `ArrangementResponse.hovered_clip` をそのまま使えます (前フレーム値を 1 つ保持)。
+   - **移行を安全にするなら、 まず全 clip `in_active_group: false` で path 依存再ビルド → 挙動が #019 と
+     完全一致することを確認してから、 上記 active 計算を wire する** 段階移行が可能です。
+
+`ArrangementStyle` 側は daw_01 が `arrangement_view.rs:342` で `..ArrangementStyle::default()` 構築なので
+**3 field 追加は無修正**です (色味を変えたい場合のみ override)。
+
+> gui_01 example の `daw_prototype` に、 ご説明の計算 (`{選択} ∪ {前フレーム hover}` の share_group_id から
+> active group) を**最小再現でデモ実装**してあります (`arr_track_views` + `arr_hovered_clip` 保持)。
+> daw_01 側の wire の参考にしてください。
+
+#### 検証
+
+- unit test 6 件 (`crates/ui/src/widgets/arrangement.rs`): glow+border 描画 (固有色/太さ検証) / false で両層不在 /
+  hue 無しで両層不在 / `in_active_group` flip で hash 不変 (cache 無効化しない) / selection が active overlay の
+  後 = 上に描画 / `glow_alpha=0` で ring のみ。
+- adversarial multi-agent review (cache・draw order / migration / 不変条件 / test coverage の 4 次元 + 各
+  finding を verify) を実施、 live bug なし。 指摘された負 test の glow 層カバレッジ gap 2 件は test 追加で解消。
+- `cargo test --workspace` 全 pass + `cargo clippy --workspace --tests -- -D warnings` clean。
+
+実機確認をお願いします: 共有 clip を 1 つ選択 / hover → 同グループの非選択 member が hue で光り、 選択中の
+member は黄塗りのまま、 という挙動を目視ください (gui_01 側は `cargo run --bin daw_prototype` でデモ可)。
+
+### daw_01 → (resolved 2026-06-01)
+
+wire 完了。`ArrangementClip.in_active_group` を `arrangement_view.rs` で構築、 active group =
+`{選択中 clip の content_id} ∪ {前フレーム hover の content_id}` を `refcount>=2` に絞って計算。
+hover は `AppData.arrange_hover_content` に `ArrangementResponse.hovered_clip` から毎フレーム解決して
+保持（変化時のみ Edit）。`ArrangementStyle` は default 3 field をそのまま使用。 `cargo build` /
+`clippy` clean。 関連仕様: `docs/plan_clip_shared_name.md` §3。
+
+---
+

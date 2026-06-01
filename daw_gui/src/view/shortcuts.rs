@@ -72,6 +72,10 @@ pub fn daw_shortcut_map() -> ShortcutMap {
     // (Bitwig / Live / REAPER)。 text_input フォーカス中は gui_01 が shortcut
     // を抑制するので、 rename 編集中に F2 を打っても再発火しない。
     m.bind("daw.rename_clip", "F2");
+    // 共有を一括選択: selected clip と同じ content_id の linked clip group を
+    // まとめて選択 (`docs/plan_clip_shared_name.md` §2)。 右クリックメニューと
+    // 同等。 rename 編集中は除外 (root.rs::dispatch_shortcuts で gate)。
+    m.bind("daw.select_linked_clips", "Shift+L");
     // Phase 7 B5 (`docs/plan_scale.html` §5.3): 選択 clip の note pitch を
     // 最寄りの in-scale pitch に一括補正。 Bitwig の "Quantize Pitches" 相当。
     // selected_notes が空のときは clip 全 note、 そうでなければ選択 note のみ。

@@ -821,6 +821,11 @@ pub struct AppData {
     pub selected_clip: Option<ClipRef>,
     pub selected_clips: Vec<ClipRef>,
     pub selected_notes: Vec<u32>,
+    /// gui_01 #068: 前フレームに arrangement でホバーされた clip の
+    /// `content_id` (= 連動ハイライトの active group 計算に使う held-value)。
+    /// widget の `ArrangementResponse.hovered_clip` を毎フレーム解決して
+    /// 保持する。 session-only。
+    pub arrange_hover_content: Option<common::model::ContentId>,
     /// 鍵盤レーン click のプレビュー発音中の `(track_id, pitch)` (gui_01 #055,
     /// `docs/plan_pianoroll_keyboard_preview.md`)。 widget の
     /// `PianoRollResponse::keyboard_active_pitch` を前フレーム値と差分して
@@ -1310,6 +1315,7 @@ impl AppData {
             selected_clip: None,
             selected_clips: Vec::new(),
             selected_notes: Vec::new(),
+            arrange_hover_content: None,
             bottom_panel: 0,
             audio_editor_clip: None,
             audio_editor_selected_event: None,
@@ -3154,6 +3160,10 @@ pub enum AppEvent {
     SelectClip { target: ClipRef, additive: bool },
     SetClipSelection(Vec<ClipRef>),
     ClearSelection,
+    /// 右クリック「共有を一括選択」 — target と同じ `content_id` を持つ
+    /// 全 clip (linked clip group) を選択する。 refcount==1 なら自身 1 個。
+    /// 共有グループの可視化 / まとめ移動・削除に使う。
+    SelectLinkedClips(ClipRef),
     /// Clip の右端 trim (= `start_beat` 同値、 `length_beats` のみ更新) と
     /// 左端 trim (= `start_beat` を進めて `length_beats` を縮める) の両方を
     /// カバー。 audio clip の場合は handler が delta_start を計算して各
@@ -4414,6 +4424,9 @@ impl AppData {
                 self.selected_clip = None;
                 self.selected_clips.clear();
                 self.selected_notes.clear();
+            }
+            AppEvent::SelectLinkedClips(target) => {
+                self.select_linked_clips(target);
             }
             AppEvent::ResizeClip {
                 target,
@@ -6723,23 +6736,25 @@ impl AppData {
     }
 
     fn begin_rename_clip(&mut self, target: ClipRef) {
-        let Some(name) = self
+        let Some(content_id) = self
             .song
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
-            .map(|c| c.name.clone())
+            .map(|c| c.content_id)
         else {
             return;
         };
-        self.clip_rename_text = name;
+        self.clip_rename_text = self.song.content_name(content_id).to_string();
         self.clip_rename = Some(target);
     }
 
     /// clip rename を確定。 trim 後空文字なら無変更 (track rename と同じ)。
     /// clip 名は表示専用 (audio / plugin processing に無関係) なので
     /// `sync_song_to_plugin_host` は呼ばない。 song の変更は autosave /
-    /// undo snapshot (`is_undoable`) に乗る。
+    /// undo snapshot (`is_undoable`) に乗る。 名前は `content_id` 単位の
+    /// SSoT (`Song.clip_content_names`) に書くので、 同 content を共有する
+    /// linked clip 全部が同時に rename される。
     fn commit_rename_clip(&mut self) {
         let Some(target) = self.clip_rename else {
             return;
@@ -6750,14 +6765,16 @@ impl AppData {
         if new_name.is_empty() {
             return;
         }
-        if let Some(clip) = self
+        let Some(content_id) = self
             .song
             .tracks
-            .get_mut(target.track as usize)
-            .and_then(|t| t.clips.get_mut(target.clip as usize))
-        {
-            clip.name = new_name;
-        }
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return;
+        };
+        self.song.set_content_name(content_id, new_name);
     }
 
     fn ensure_first_track(&mut self) {
@@ -9347,11 +9364,13 @@ impl AppData {
             id: new_clip_id,
             start_beat: playhead,
             length_beats: 4.0,
-            name: format!("Recorded {new_clip_id}"),
+            name: String::new(),
             content_id: cid,
             ..Default::default()
         };
         track.clips.push(new_clip);
+        self.song
+            .set_content_name(cid, format!("Recorded {new_clip_id}"));
     }
 
     /// playhead が clip 範囲 `[start_beat, start_beat + length_beats)` に
@@ -9485,6 +9504,48 @@ impl AppData {
         if primary.is_some() {
             self.fit_piano_roll_to_clip();
         }
+    }
+
+    /// 右クリック「共有を一括選択」: `target` と同じ `content_id` を持つ
+    /// main clip を全 track から集めて選択する (linked clip group)。
+    /// `content_id` は payload 種別ごとに別空間なので automation clip 等と
+    /// 混ざらない。 refcount==1 のときは自身 1 個の選択 (= 無害)。 clicked
+    /// `target` を末尾 (= primary) に置いて piano_roll fit 対象を維持する。
+    fn select_linked_clips(&mut self, target: ClipRef) {
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return;
+        };
+        let mut linked = Vec::new();
+        for (t_idx, track) in self.song.tracks.iter().enumerate() {
+            for (c_idx, clip) in track.clips.iter().enumerate() {
+                if clip.content_id == content_id {
+                    linked.push(ClipRef {
+                        track: t_idx as u32,
+                        clip: c_idx as u32,
+                    });
+                }
+            }
+        }
+        if linked.is_empty() {
+            return;
+        }
+        if let Some(pos) = linked.iter().position(|r| *r == target) {
+            let last = linked.len() - 1;
+            linked.swap(pos, last);
+        }
+        let count = linked.len();
+        self.set_clip_selection(linked);
+        self.status_message = if count <= 1 {
+            "共有クリップはありません (この clip は単独)".to_string()
+        } else {
+            format!("共有クリップ {count} 個を選択しました")
+        };
     }
 
     /// 現 selected_clip のノート bounding box が piano_roll grid 領域に
@@ -9664,6 +9725,8 @@ impl AppData {
         let Some(clip) = track.clips.get(target.clip as usize).cloned() else {
             return;
         };
+        // 名前は content_id 単位 SSoT から (legacy clip.name は v20 で空)。
+        let clip_name = self.song.content_name(clip.content_id).to_string();
         let Some(common::model::ClipContent::Audio(audio)) =
             self.song.clip_contents.get(&clip.content_id).cloned()
         else {
@@ -9792,8 +9855,7 @@ impl AppData {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64 % 100_000_000)
             .unwrap_or(0);
-        let safe_name: String = clip
-            .name
+        let safe_name: String = clip_name
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
             .collect();
@@ -9915,7 +9977,7 @@ impl AppData {
         }
         self.status_message = format!(
             "Bounce In Place: '{}' を {} に書き出し",
-            clip.name,
+            clip_name,
             out_path.display()
         );
     }
@@ -9938,6 +10000,8 @@ impl AppData {
         let Some(clip) = track.clips.get(target.clip as usize).cloned() else {
             return;
         };
+        // 名前は content_id 単位 SSoT から (legacy clip.name は v20 で空)。
+        let clip_name = self.song.content_name(clip.content_id).to_string();
         let Some(common::model::ClipContent::Audio(audio)) =
             self.song.clip_contents.get(&clip.content_id).cloned()
         else {
@@ -9967,8 +10031,7 @@ impl AppData {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64 % 100_000_000)
             .unwrap_or(0);
-        let safe_name: String = clip
-            .name
+        let safe_name: String = clip_name
             .chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
@@ -10030,7 +10093,7 @@ impl AppData {
             source_clip: target.clip,
             out_path: out_path.clone(),
             source_path,
-            clip_name: clip.name.clone(),
+            clip_name: clip_name.clone(),
             clip_length_beats: clip.length_beats,
             start_beat: clip.start_beat,
         });
@@ -10051,7 +10114,7 @@ impl AppData {
             end_frame,
         });
         self.status_message =
-            format!("Bounce (with FX): '{}' を render 中...", clip.name);
+            format!("Bounce (with FX): '{}' を render 中...", clip_name);
     }
 
     /// PR-C: BounceClipFxOnline 完了通知の処理。 SetRenderMode(Realtime)
@@ -10152,19 +10215,18 @@ impl AppData {
             source_end_frames: frames,
             ..AudioEvent::default()
         };
-        let new_content_id = self.song.alloc_content_id();
-        self.song.clip_contents.insert(
-            new_content_id,
+        let new_content_id = self.song.alloc_content(
             common::model::ClipContent::Audio(common::model::AudioContent {
                 events: vec![new_event],
             }),
+            format!("{} (bounced FX)", pending.clip_name),
         );
 
         let new_track_mut = &mut self.song.tracks[new_track_idx];
         let new_clip_id = new_track_mut.alloc_clip_id();
         new_track_mut.clips.push(common::model::Clip {
             id: new_clip_id,
-            name: format!("{} (bounced FX)", pending.clip_name),
+            name: String::new(),
             start_beat: pending.start_beat,
             length_beats: pending.clip_length_beats,
             content_id: new_content_id,
@@ -11607,8 +11669,9 @@ impl AppData {
         };
         let new_start_beat = src_clip.start_beat + src_clip.length_beats;
         let new_length = src_clip.length_beats;
+        // 共有コピー: 同 content_id を流用 → 名前 (content_id 単位 SSoT) も
+        // 自動共有。 Clip.name は legacy なので空のまま。
         let content_id = src_clip.content_id;
-        let new_name = src_clip.name.clone();
         let Some(track) = self.song.tracks.get_mut(source.track as usize) else {
             return;
         };
@@ -11616,7 +11679,7 @@ impl AppData {
         let new_idx = track.clips.len() as u32;
         track.clips.push(Clip {
             id: new_clip_id,
-            name: new_name,
+            name: String::new(),
             start_beat: new_start_beat,
             length_beats: new_length,
             content_id,
@@ -11644,18 +11707,10 @@ impl AppData {
         };
         let new_start_beat = src_clip.start_beat + src_clip.length_beats;
         let new_length = src_clip.length_beats;
-        let new_name = src_clip.name.clone();
+        // 独立コピー: content + 名前を fork して新 content_id 採番。
+        // fork 時点の名前を引き継ぎ、 以後は独立 (別 content_id)。
         let src_content_id = src_clip.content_id;
-        let cloned_content = self
-            .song
-            .clip_contents
-            .get(&src_content_id)
-            .cloned()
-            .unwrap_or_default();
-        let new_content_id = self.song.alloc_content_id();
-        self.song
-            .clip_contents
-            .insert(new_content_id, cloned_content);
+        let new_content_id = self.song.fork_content(src_content_id);
         let Some(track) = self.song.tracks.get_mut(source.track as usize) else {
             return;
         };
@@ -11663,7 +11718,7 @@ impl AppData {
         let new_idx = track.clips.len() as u32;
         track.clips.push(Clip {
             id: new_clip_id,
-            name: new_name,
+            name: String::new(),
             start_beat: new_start_beat,
             length_beats: new_length,
             content_id: new_content_id,
@@ -11694,7 +11749,7 @@ impl AppData {
                 continue;
             };
             let new_length = src_clip.length_beats;
-            let new_name = src_clip.name.clone();
+            // 共有コピー: content_id 流用 → 名前も自動共有。
             let content_id = src_clip.content_id;
             let Some(to_track_idx) = self.song.track_index_by_id(to_track_id) else {
                 continue;
@@ -11706,7 +11761,7 @@ impl AppData {
             let new_idx = to_track.clips.len() as u32;
             to_track.clips.push(Clip {
                 id: new_clip_id,
-                name: new_name,
+                name: String::new(),
                 start_beat: drop_start.max(0.0),
                 length_beats: new_length,
                 content_id,
@@ -11738,18 +11793,9 @@ impl AppData {
                 continue;
             };
             let new_length = src_clip.length_beats;
-            let new_name = src_clip.name.clone();
+            // 独立コピー: content + 名前を fork。
             let src_content_id = src_clip.content_id;
-            let cloned_content = self
-                .song
-                .clip_contents
-                .get(&src_content_id)
-                .cloned()
-                .unwrap_or_default();
-            let new_content_id = self.song.alloc_content_id();
-            self.song
-                .clip_contents
-                .insert(new_content_id, cloned_content);
+            let new_content_id = self.song.fork_content(src_content_id);
             let Some(to_track_idx) = self.song.track_index_by_id(to_track_id) else {
                 continue;
             };
@@ -11760,7 +11806,7 @@ impl AppData {
             let new_idx = to_track.clips.len() as u32;
             to_track.clips.push(Clip {
                 id: new_clip_id,
-                name: new_name,
+                name: String::new(),
                 start_beat: drop_start.max(0.0),
                 length_beats: new_length,
                 content_id: new_content_id,
@@ -11794,16 +11840,8 @@ impl AppData {
             self.status_message = "すでに独立 clip です".to_string();
             return;
         }
-        let cloned_content = self
-            .song
-            .clip_contents
-            .get(&content_id)
-            .cloned()
-            .unwrap_or_default();
-        let new_content_id = self.song.alloc_content_id();
-        self.song
-            .clip_contents
-            .insert(new_content_id, cloned_content);
+        // content + 名前を fork して独立化 (fork 時点の名前を引き継ぐ)。
+        let new_content_id = self.song.fork_content(content_id);
         let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
             return;
         };
@@ -11829,16 +11867,18 @@ impl AppData {
         };
         let new_clip_id = track.alloc_clip_id();
         let new_idx = track.clips.len() as u32;
-        let clip_no = track.clips.len() + 1;
+        let name = format!("Clip {}", track.clips.len() + 1);
         track.clips.push(Clip {
             id: new_clip_id,
-            name: format!("Clip {clip_no}"),
+            name: String::new(),
             start_beat,
             length_beats: DEFAULT_CLIP_LENGTH,
             content_id,
             notes: Vec::new(),
             color: None,
         });
+        // 名前は content_id 単位 SSoT へ (track borrow が切れた後に書く)。
+        self.song.set_content_name(content_id, name);
         let r = ClipRef {
             track: track_idx,
             clip: new_idx,
@@ -14156,20 +14196,18 @@ impl AppData {
                 source_end_frames: imported.buffer.frames,
                 ..AudioEvent::default()
             };
-            let content_id = self.song.alloc_content_id();
-            self.song.clip_contents.insert(
-                content_id,
+            let content_id = self.song.alloc_content(
                 ClipContent::Audio(AudioContent {
                     events: vec![event],
                 }),
+                imported.display_name.clone(),
             );
 
-            let display_name = imported.display_name.clone();
             let track = &mut self.song.tracks[target_track_idx];
             let new_clip_id = track.alloc_clip_id();
             track.clips.push(Clip {
                 id: new_clip_id,
-                name: display_name,
+                name: String::new(),
                 start_beat: next_start_beat,
                 length_beats,
                 content_id,
@@ -14278,9 +14316,7 @@ impl AppData {
             }
 
             // 3) Video clip content + auto track.
-            let v_content_id = self.song.alloc_content_id();
-            self.song.clip_contents.insert(
-                v_content_id,
+            let v_content_id = self.song.alloc_content(
                 ClipContent::Video(VideoContent {
                     events: vec![VideoEvent {
                         source_id: video_source_id,
@@ -14291,6 +14327,7 @@ impl AppData {
                         ..VideoEvent::default()
                     }],
                 }),
+                display_name.clone(),
             );
             let video_track_id = self.song.alloc_track_id();
             let mut video_track = Track {
@@ -14301,7 +14338,7 @@ impl AppData {
             let v_clip_id = video_track.alloc_clip_id();
             video_track.clips.push(Clip {
                 id: v_clip_id,
-                name: display_name.clone(),
+                name: String::new(),
                 start_beat: next_start_beat,
                 length_beats: video_length_beats,
                 content_id: v_content_id,
@@ -14320,9 +14357,7 @@ impl AppData {
                     audio.buffer.sample_rate,
                     bpm,
                 );
-                let a_content_id = self.song.alloc_content_id();
-                self.song.clip_contents.insert(
-                    a_content_id,
+                let a_content_id = self.song.alloc_content(
                     ClipContent::Audio(AudioContent {
                         events: vec![AudioEvent {
                             source_id: audio_src_id,
@@ -14333,6 +14368,7 @@ impl AppData {
                             ..AudioEvent::default()
                         }],
                     }),
+                    format!("{display_name} (audio)"),
                 );
                 let audio_track_id = self.song.alloc_track_id();
                 let mut audio_track = Track {
@@ -14343,7 +14379,7 @@ impl AppData {
                 let a_clip_id = audio_track.alloc_clip_id();
                 audio_track.clips.push(Clip {
                     id: a_clip_id,
-                    name: format!("{display_name} (audio)"),
+                    name: String::new(),
                     start_beat: next_start_beat,
                     length_beats: audio_length_beats,
                     content_id: a_content_id,
@@ -14467,9 +14503,7 @@ impl AppData {
                 self.song.video_resolution,
                 (src.width, src.height),
             );
-            let i_content_id = self.song.alloc_content_id();
-            self.song.clip_contents.insert(
-                i_content_id,
+            let i_content_id = self.song.alloc_content(
                 common::model::ClipContent::Image(common::model::ImageContent {
                     events: vec![common::model::ImageEvent {
                         source_id: image_source_id,
@@ -14482,6 +14516,7 @@ impl AppData {
                         ..common::model::ImageEvent::default()
                     }],
                 }),
+                display_name.clone(),
             );
 
             // 3) New Video-kind Track at the top of the arrangement so
@@ -14496,7 +14531,7 @@ impl AppData {
             let i_clip_id = image_track.alloc_clip_id();
             image_track.clips.push(Clip {
                 id: i_clip_id,
-                name: display_name,
+                name: String::new(),
                 start_beat: next_start_beat,
                 length_beats: image_clip_length_beats,
                 content_id: i_content_id,
@@ -14538,9 +14573,7 @@ impl AppData {
         let text_clip_length_beats = (self.song.length_beats * 0.5).max(8.0);
         let next_start_beat = 0.0_f64;
 
-        let content_id = self.song.alloc_content_id();
-        self.song.clip_contents.insert(
-            content_id,
+        let content_id = self.song.alloc_content(
             common::model::ClipContent::Text(common::model::TextContent {
                 events: vec![common::model::TextEvent {
                     text: "Title".into(),
@@ -14548,6 +14581,7 @@ impl AppData {
                     ..common::model::TextEvent::default()
                 }],
             }),
+            "Title".to_string(),
         );
 
         // Insert at the top of the arrangement so the title renders
@@ -14561,7 +14595,7 @@ impl AppData {
         let clip_id = text_track.alloc_clip_id();
         text_track.clips.push(common::model::Clip {
             id: clip_id,
-            name: "Title".into(),
+            name: String::new(),
             start_beat: next_start_beat,
             length_beats: text_clip_length_beats,
             content_id,
@@ -14924,7 +14958,8 @@ impl AppData {
         let front_len = split_offset;
         let back_len = clip_len - split_offset;
         let src_content_id = clip.content_id;
-        let src_name = clip.name.clone();
+        // 名前は content_id 単位 SSoT から取得 (legacy clip.name は v20 で空)。
+        let src_name = self.song.content_name(src_content_id).to_string();
         let Some(src_content) = self.song.clip_contents.get(&src_content_id).cloned()
         else {
             return false;
@@ -15149,6 +15184,13 @@ impl AppData {
         self.song
             .clip_contents
             .insert(back_content_id, back_content);
+        // 両半は元 clip の共有名を引き継ぐ (split は両側を fresh content_id に
+        // fork するので、 名前も両方へ複製する)。
+        if !src_name.is_empty() {
+            self.song
+                .set_content_name(front_content_id, src_name.clone());
+            self.song.set_content_name(back_content_id, src_name.clone());
+        }
 
         // Mutate the clip in place: front half stays as `clip`
         // (length / content_id rewritten), and a new clip for the
@@ -15163,7 +15205,7 @@ impl AppData {
         let new_idx = track.clips.len() as u32;
         track.clips.push(Clip {
             id: new_clip_id,
-            name: src_name,
+            name: String::new(),
             start_beat: clip_start + front_len,
             length_beats: back_len,
             content_id: back_content_id,
@@ -15309,7 +15351,8 @@ impl AppData {
                 let s = clip.start_beat;
                 let e = s + clip.length_beats;
                 if combined_name.is_empty() {
-                    combined_name = clip.name.clone();
+                    combined_name =
+                        self.song.content_name(clip.content_id).to_string();
                 }
                 combined_start = combined_start.min(s);
                 combined_end = combined_end.max(e);
@@ -15407,6 +15450,11 @@ impl AppData {
                 }
             };
             self.song.clip_contents.insert(new_content_id, new_content);
+            // merged clip の名前は content_id 単位 SSoT へ。
+            if !combined_name.is_empty() {
+                self.song
+                    .set_content_name(new_content_id, combined_name.clone());
+            }
 
             // Remove source clips (descending index to keep earlier
             // indices stable).
@@ -15425,7 +15473,7 @@ impl AppData {
             let new_idx = track.clips.len() as u32;
             track.clips.push(Clip {
                 id: new_clip_id,
-                name: combined_name,
+                name: String::new(),
                 start_beat: combined_start,
                 length_beats: combined_len,
                 content_id: new_content_id,

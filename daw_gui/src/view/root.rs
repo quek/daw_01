@@ -555,6 +555,19 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }));
     }
 
+    // ----- 共有を一括選択 (Shift+L) ------------------------------------------
+    // 選択中 clip と同じ content_id の linked clip group をまとめて選択
+    // (右クリックメニュー「共有を一括選択」と同経路)。 selected_clip が
+    // 無ければ no-op。 text_input focus 中は gui_01 が shortcut を抑制する
+    // ので rename 編集中の Shift+L は発火しない。
+    if ui.take_shortcut("daw.select_linked_clips")
+        && let Some(target) = app.selected_clip
+    {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::SelectLinkedClips(target));
+        }));
+    }
+
     // ----- Automation: A キー (gui_01 #028 §7.3) ----------------------------
     // last-touched parameter (volume / pan / lane default knob 操作で更新) の
     // lane を所有 track に追加。 既存の lane は visible / enabled = true で
