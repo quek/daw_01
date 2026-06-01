@@ -523,11 +523,22 @@ impl<M: ?Sized + 'static> UiHost<M> {
         let mut typing_focus = false;
         let mut focus_order: Vec<(WidgetId, Rect)> = Vec::new();
 
+        // M14 Phase 94 (daw_01 #065): 「真のモーダル」。`capture_input == true` な modal popup が
+        // 開いていれば、background widget (`drawing_in_popup == false`) が読む pointer を
+        // masking する。`pointer_raw` は popup_layer の close 判定 / modal body 用に温存。
+        let modal_capturing = self
+            .open_popups
+            .values()
+            .any(|s| s.modal && s.capture_input);
+        let effective_pointer = if modal_capturing { masked_pointer(pointer) } else { pointer };
+
         let mut ui = Ui {
             state: &mut self.state,
             scene,
             edits: &mut edits,
-            pointer,
+            pointer: effective_pointer,
+            pointer_raw: pointer,
+            modal_capturing,
             keyboard_events: &mut keyboard_events,
             ime_events: &mut ime_events,
             cursor,
@@ -574,14 +585,17 @@ impl<M: ?Sized + 'static> UiHost<M> {
         // M8 Phase 30: Tab / arrow focus traversal。
         // pending_shortcuts に "tab_next" 等が残っていれば (= widget が consume 済でなければ)、
         // focus_order (このフレームに登録された focusable 一覧) から次の wid を選んで set_focus。
+        // M14 Phase 94 (daw_01 #065): 真のモーダル中も traversal 自体は動かす (focus_order は
+        // `focusable` guard で modal panel 内 widget のみに絞られている) ため、guard を通さない
+        // `take_shortcut_raw` で消費する。
         let focus_order_snapshot: Vec<(WidgetId, Rect)> = ui.focus_order.clone();
         if !focus_order_snapshot.is_empty() {
-            let tab_next = ui.take_shortcut("tab_next");
-            let tab_prev = ui.take_shortcut("tab_prev");
-            let focus_up = ui.take_shortcut("focus_up");
-            let focus_down = ui.take_shortcut("focus_down");
-            let focus_left = ui.take_shortcut("focus_left");
-            let focus_right = ui.take_shortcut("focus_right");
+            let tab_next = ui.take_shortcut_raw("tab_next");
+            let tab_prev = ui.take_shortcut_raw("tab_prev");
+            let focus_up = ui.take_shortcut_raw("focus_up");
+            let focus_down = ui.take_shortcut_raw("focus_down");
+            let focus_left = ui.take_shortcut_raw("focus_left");
+            let focus_right = ui.take_shortcut_raw("focus_right");
 
             let current = ui.focused;
             let next_wid: Option<WidgetId> = if tab_next || tab_prev {
@@ -665,7 +679,20 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     state: &'a mut HashMap<WidgetId, Box<dyn WidgetState>>,
     scene: &'a mut Scene,
     edits: &'a mut Vec<Edit<M>>,
+    /// widget が読む pointer。`modal_capturing` 中の background 描画 (`drawing_in_popup ==
+    /// false`) では `masked_pointer` に差し替わり (pos = None / 全 button false / scroll 0)、
+    /// `popup_layer` の body 内 (`drawing_in_popup == true`) では `pointer_raw` に戻る。
+    /// fader 等 `self.pointer` を直読みする widget も、この 1 箇所の差し替えで自動的に inert
+    /// になる (SSoT、daw_01 #065)。
     pub(crate) pointer: PointerFrame,
+    /// M14 Phase 94 (daw_01 #065): masking 前の生 pointer。`popup_layer` の outside-click /
+    /// anchor 消費判定と、modal body へ raw を渡す swap で使う。`pointer` が masking されても
+    /// modal 自身の close 挙動 (outside click / ESC) は不変であることを保証する。
+    pub(crate) pointer_raw: PointerFrame,
+    /// M14 Phase 94 (daw_01 #065): `capture_input == true` な modal popup が 1 つ以上開いて
+    /// いるか (frame 頭に確定)。`true` の間、background widget への pointer / keyboard 入力を
+    /// 遮断する (= 真のモーダル)。
+    pub(crate) modal_capturing: bool,
     /// このフレーム分のキー入力イベント (フォーカスを持つ widget が消費する)。
     keyboard_events: &'a mut Vec<KeyEvent>,
     /// このフレーム分の IME イベント (フォーカスを持つ widget が消費する)。
@@ -837,12 +864,28 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// popup を開く。次以降のフレームで `popup_layer(id, ..)` の closure が実行される。
     /// `anchor` は popup を開く起点の矩形 (例: menu_bar の "File" ボタン)。
     /// `modal` が true なら他 widget の click を抑制 (popup_layer の outside-click 検出で消費)。
+    ///
+    /// menu / dropdown / context_menu はこの経路で開き `capture_input == false` (= 従来の
+    /// 「panel の裏に隠れた widget だけ抑制」)。画面全体の入力遮断 (真のモーダル) が要るのは
+    /// dialog だけなので、それは [`Ui::open_modal`] (= `capture_input == true`) を使う。
     pub fn open_popup(&mut self, id: impl std::hash::Hash, anchor: Rect, modal: bool) {
+        self.open_popup_inner(id, anchor, modal, false);
+    }
+
+    /// M14 Phase 94 (daw_01 #065): `capture_input` を指定して popup を開く内部 API。
+    /// `Ui::open_modal` が `capture_input = true` で呼ぶ。
+    pub(crate) fn open_popup_inner(
+        &mut self,
+        id: impl std::hash::Hash,
+        anchor: Rect,
+        modal: bool,
+        capture_input: bool,
+    ) {
         let wid = WidgetId::ROOT.child((b"popup", &id));
         let prev_focus = self.pending_focus;
         self.open_popups.insert(
             wid,
-            PopupOpenState { anchor, modal, prev_focus },
+            PopupOpenState { anchor, modal, prev_focus, capture_input },
         );
     }
 
@@ -907,8 +950,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // 呼ぶ構造で、 cascade item (= 子 anchor 内 / 親 anchor 外) の click を親が outside
         // 扱いで握りつぶし子 closure が走らない致命的 bug があった。 全 open popup の集合を
         // 1 つの「popup 領域」 として扱う形に緩める。
-        let outside_click = self.pointer.primary_just_pressed
-            && self.pointer.pos.is_some_and(|(px, py)| {
+        //
+        // M14 Phase 94 (daw_01 #065): close 判定は **生 pointer** (`popup_pointer`) で行う。
+        // 真のモーダル中は `self.pointer` が masking されて pos = None になっているため、
+        // ここで masked pointer を読むと outside-click close / ESC が効かなくなる。
+        let pp = self.popup_pointer();
+        let outside_click = pp.primary_just_pressed
+            && pp.pos.is_some_and(|(px, py)| {
                 !self
                     .open_popups
                     .values()
@@ -931,6 +979,24 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // 退避しないと `push_rect/push_text/push_lines` が `merge_clip(current_clip, ..)` を
         // 適用して popup primitive が pane_rect で clip され、 画面上に出ても見えなくなる
         // (piano_roll snap dropdown が tab pane 内で消える regression を起こした)。
+        //
+        // M14 Phase 94 (daw_01 #065): 真のモーダル中 (`modal_capturing`) は background 向けに
+        // masking された `self.pointer` を body の間だけ生 pointer に戻す (= panel 内 widget は
+        // 通常どおり動く)。body 終了後に再 masking する。consume が body 内で起きても
+        // `consume_pointer_click` が `pointer_raw` も消すため再 mask しても消費は保たれる。
+        // **この popup が capturing modal 自身のとき** だけ body を un-mask する。
+        // `state.capture_input` を見ないと、capturing modal と **同時に開いている** background の
+        // 非 capturing popup (menu / dropdown / context_menu = `capture_input == false`) の body まで
+        // un-mask されてしまい、その popup item が hover / click に反応してしまう (真のモーダル違反、
+        // M14 Phase 94 review で発覚)。
+        let masked_here = self.modal_capturing && !self.drawing_in_popup && state.capture_input;
+        let saved_pointer = if masked_here {
+            let s = self.pointer;
+            self.pointer = self.pointer_raw;
+            Some(s)
+        } else {
+            None
+        };
         let prev_in_popup = self.drawing_in_popup;
         let prev_clip = self.current_clip;
         self.drawing_in_popup = true;
@@ -938,18 +1004,36 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         f(self);
         self.drawing_in_popup = prev_in_popup;
         self.current_clip = prev_clip;
+        if let Some(s) = saved_pointer {
+            self.pointer = s;
+        }
 
         // modal popup が open しているフレーム中、anchor 内 click は popup item として
         // 既に処理済 → 下層の widget に同じ click が流れないよう消費する。
         // (popup item handler が close_popup を呼んだ場合も same frame で消費)
-        if state.modal
-            && self
-                .pointer
-                .pos
-                .is_some_and(|(px, py)| state.anchor.contains(px, py))
-        {
+        // 生 pointer (`popup_pointer`) で判定する (上の outside-click と同じ理由)。
+        if state.modal && pp.pos.is_some_and(|(px, py)| state.anchor.contains(px, py)) {
             self.consume_pointer_click();
         }
+    }
+
+    /// M14 Phase 94 (daw_01 #065): `popup_layer` の close / 消費判定が読むべき pointer。
+    /// 真のモーダル中の background 描画では `self.pointer` が masking されているので
+    /// `pointer_raw` を返し、それ以外 (= non-capturing popup や、body 内で既に raw へ
+    /// swap 済) では消費 (`consume_pointer_click`) を反映した `self.pointer` を返す。
+    fn popup_pointer(&self) -> PointerFrame {
+        if self.modal_capturing && !self.drawing_in_popup {
+            self.pointer_raw
+        } else {
+            self.pointer
+        }
+    }
+
+    /// M14 Phase 94 (daw_01 #065): 真のモーダル中で background widget (popup body の外) の
+    /// keyboard / shortcut / focus 入力を遮断すべきか。`drawing_in_popup == true` (= modal の
+    /// body / 内部 internal traversal は別 API) では遮断しない。
+    fn keyboard_blocked_by_modal(&self) -> bool {
+        self.modal_capturing && !self.drawing_in_popup
     }
 
     /// pointer が **modal popup の anchor 内** にあり、現在の widget が `drawing_in_popup`
@@ -966,6 +1050,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     pub(crate) fn pointer_blocked_by_modal_popup(&self) -> bool {
         if self.drawing_in_popup {
             return false;
+        }
+        // M14 Phase 94 (daw_01 #065): 真のモーダル中は anchor 内外を問わず全 background を遮断。
+        // `self.pointer` は既に masking されているので大半の take_* は pos = None で自然に
+        // 何も返さないが、`take_double_click_in_rect` (pending_double_click は生 pointer 由来) /
+        // `take_file_drop_in_rect` (drop 位置で判定) はこの早期 return で確実に止める。
+        if self.modal_capturing {
+            return true;
         }
         let Some((px, py)) = self.pointer.pos else {
             return false;
@@ -1067,6 +1158,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     pub fn consume_pointer_click(&mut self) {
         self.pointer.primary_just_pressed = false;
         self.pointer.primary_just_released = false;
+        // M14 Phase 94 (daw_01 #065): 真のモーダル中は `self.pointer` が masking された別 copy で、
+        // popup_layer の close / anchor 判定は `pointer_raw` を読む。消費を両方に反映しないと
+        // 「modal body で処理した click が popup_layer 出口 / 兄弟 popup で生きたまま」になる。
+        self.pointer_raw.primary_just_pressed = false;
+        self.pointer_raw.primary_just_released = false;
     }
 
     /// 次フレームの再描画を要求する (widget が「state が変化した」「アニメーション継続中」等で呼ぶ)。
@@ -1292,6 +1388,20 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// このフレームに `name` で登録した shortcut が triggered されていれば true (consume)。
     /// 同 name で 2 度目に呼ぶと false (= 1 度限り消費)。
     pub fn take_shortcut(&mut self, name: &'static str) -> bool {
+        // M14 Phase 94 (daw_01 #065): 真のモーダル中は background widget の shortcut を遮断。
+        // **consume しない** ことで、modal の body (`drawing_in_popup == true`) が後で同じ
+        // shortcut (ESC 等) を `take_shortcut` で確実に拾える。library 内部の focus traversal は
+        // この guard を通さない `take_shortcut_raw` を使う。
+        if self.keyboard_blocked_by_modal() {
+            return false;
+        }
+        self.take_shortcut_raw(name)
+    }
+
+    /// guard なしの shortcut 消費 (library 内部の Tab / arrow focus traversal 用)。
+    /// `take_shortcut` の真のモーダル guard をバイパスする (traversal の対象 focusable は
+    /// `focusable` 側で既に modal panel 内のみに絞られているため、guard は不要)。
+    pub(crate) fn take_shortcut_raw(&mut self, name: &'static str) -> bool {
         if let Some(idx) = self.pending_shortcuts.iter().position(|n| *n == name) {
             self.pending_shortcuts.remove(idx);
             true
@@ -1303,6 +1413,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// このフレームに該当 shortcut が triggered されているか (consume せず読み取りのみ)。
     #[must_use]
     pub fn has_shortcut(&self, name: &'static str) -> bool {
+        if self.keyboard_blocked_by_modal() {
+            return false;
+        }
         self.pending_shortcuts.contains(&name)
     }
 
@@ -1318,6 +1431,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// これは「typing-only に分類されない shortcut は global path で `take_shortcut(name)`
     /// から取るべき」というポリシー強制のため。
     pub fn take_typing_shortcut(&mut self, name: &'static str) -> bool {
+        // M14 Phase 94 (daw_01 #065): 真のモーダル中は background の text_input を遮断。
+        if self.keyboard_blocked_by_modal() {
+            return false;
+        }
         if !shortcut::is_typing_only_shortcut(name) {
             return false;
         }
@@ -1350,12 +1467,24 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// このフラグはまだ参照されていない (M9 で typing_focus を見て修飾なし shortcut を
     /// 後から restore する path を追加予定)。
     pub fn set_typing_focus(&mut self, typing: bool) {
+        // M14 Phase 94 (daw_01 #065): 真のモーダル中は background の typing 宣言を無視
+        // (次フレームの shortcut layer が typing-only shortcut を誤って残さないように)。
+        if self.keyboard_blocked_by_modal() {
+            return;
+        }
         *self.typing_focus = typing;
     }
 
     /// 自身を Tab / arrow focus traversal の対象として登録する。
     /// 登場順で Tab next / Shift+Tab prev、arrow は方向別の最近傍移動。
+    ///
+    /// M14 Phase 94 (daw_01 #065): 真のモーダル中の background widget は登録しない。
+    /// これにより Tab traversal の対象が modal panel 内 (`drawing_in_popup == true`) の
+    /// widget のみになり、background へ focus が漏れない。
     pub fn focusable(&mut self, wid: WidgetId, rect: Rect) {
+        if self.keyboard_blocked_by_modal() {
+            return;
+        }
         self.focus_order.push((wid, rect));
     }
 
@@ -1395,6 +1524,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 読み出した text を返す。同フレームに 2 度目の呼び出しは None。
     /// clipboard provider 未設定時 / clipboard 操作失敗時は None。
     pub fn take_clipboard_paste(&mut self) -> Option<String> {
+        // M14 Phase 94 (daw_01 #065): 真のモーダル中は background の paste 取得を遮断。
+        if self.keyboard_blocked_by_modal() {
+            return None;
+        }
         self.pending_clipboard_paste.take()
     }
 
@@ -1415,6 +1548,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 戻り値の `position` は drop 直前の cursor 座標 (viewport 座標)。
     /// caller は drop.paths と drop.position から (track, beat) など好きな解決を行う。
     pub fn take_file_drop_in_rect(&mut self, rect: Rect) -> Option<DroppedFiles> {
+        // M14 Phase 94 (daw_01 #065): 真のモーダル中は background widget への drop を遮断
+        // (modal body 内 = drawing_in_popup では `pointer_blocked_by_modal_popup` が false)。
+        if self.pointer_blocked_by_modal_popup() {
+            return None;
+        }
         let drop_pos = self.file_drop.as_ref()?.position;
         if !rect.contains(drop_pos.0, drop_pos.1) {
             return None;
@@ -1436,6 +1574,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// このフレームに hover 中の file 一覧 (read-only、consume されない)。
     #[must_use]
     pub fn hovering_files(&self) -> Option<&[PathBuf]> {
+        // M14 Phase 94 (daw_01 #065): 真のモーダル中は background widget の hover query も inert に
+        // する (`is_file_hovering_in_rect` は masked pointer で自然に false になるが、こちらは
+        // file_hover を直読みするので明示 guard が要る)。drop 自体は `take_file_drop_in_rect` で遮断済。
+        if self.pointer_blocked_by_modal_popup() {
+            return None;
+        }
         self.file_hover.as_deref()
     }
 
@@ -1453,6 +1597,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     ) -> Option<DragRect> {
         // modal popup の下に隠れている widget は pointer 入力を消費しない (#015)。
         if self.pointer_blocked_by_modal_popup() {
+            // M14 Phase 94 (daw_01 #065): 真のモーダルが drag 進行中に開いた場合、release が
+            // masking で届かず anchor が永久に残る (modal close 後に phantom drag が再開)。
+            // capturing modal のときは進行中 session を cancel して stale anchor を断つ
+            // (既存 state があるときだけ。空 widget に default state を挿入しない)。
+            if self.modal_capturing && self.state.contains_key(&wid) {
+                let state: &mut DragRectState = self.widget_state(wid);
+                state.drag_start = None;
+            }
             return None;
         }
         let pointer = self.pointer;
@@ -1545,10 +1697,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         id: impl std::hash::Hash,
         rect: Rect,
     ) -> Option<DragInfo> {
+        let wid = WidgetId::ROOT.child((b"drag_in_rect", &id));
         if self.pointer_blocked_by_modal_popup() {
+            // M14 Phase 94 (daw_01 #065): take_drag_rect_in_rect と同様、capturing modal が
+            // drag 中に開いたら stale anchor を断つ (既存 state があるときだけ)。
+            if self.modal_capturing && self.state.contains_key(&wid) {
+                let state: &mut DragInRectState = self.widget_state(wid);
+                state.anchor = None;
+            }
             return None;
         }
-        let wid = WidgetId::ROOT.child((b"drag_in_rect", &id));
         let pointer = self.pointer;
         let modifiers = pointer.modifiers;
 
@@ -1680,6 +1838,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
         let d = self.pointer.scroll_delta;
         self.pointer.scroll_delta = (0.0, 0.0);
+        // M14 Phase 94 (daw_01 #065): consume を両 pointer に反映 (`consume_pointer_click` と対称)。
+        // popup body は `pointer_raw` の copy を読むので、mirror しないと同 frame の別 body へ
+        // 同じ scroll が二重配信されうる (multi-popup edge)。
+        self.pointer_raw.scroll_delta = (0.0, 0.0);
         d
     }
 
@@ -1691,6 +1853,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// (= 例: 何かを打鍵中に間違えて click した場合、打鍵は古い focus に流すのが正解)。
     /// 取り出すと内部 buffer は空になるので、フレーム内で 1 回だけ呼ぶこと。
     pub fn take_keyboard_events_if_focused(&mut self, wid: WidgetId) -> Vec<KeyEvent> {
+        // M14 Phase 94 (daw_01 #065): 真のモーダル中は background の focused widget を遮断。
+        // **drain しない** ので、modal body の text_input (drawing_in_popup) が同じ
+        // keyboard_events を取得できる。
+        if self.keyboard_blocked_by_modal() {
+            return Vec::new();
+        }
         if self.focused == Some(wid) {
             std::mem::take(self.keyboard_events)
         } else {
@@ -1701,6 +1869,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// `wid` がフォーカスを持っているならフレームに溜まった IME イベントを取り出す。
     /// `take_keyboard_events_if_focused` と同じく、フレーム開始時 focus でチェックする。
     pub fn take_ime_events_if_focused(&mut self, wid: WidgetId) -> Vec<ImeEvent> {
+        // M14 Phase 94 (daw_01 #065): 真のモーダル中は background の focused widget を遮断。
+        if self.keyboard_blocked_by_modal() {
+            return Vec::new();
+        }
         if self.focused == Some(wid) {
             std::mem::take(self.ime_events)
         } else {
@@ -1712,6 +1884,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 通常は focused text_input が自分の cursor 位置周辺の rect を渡す。
     /// アプリは `UiHost::ime_request()` でこの値を取得し、`set_ime_cursor_area` を呼ぶ。
     pub fn request_ime(&mut self, cursor_area: Rect) {
+        // M14 Phase 94 (daw_01 #065): 真のモーダル中は background の focused text_input が
+        // IME 候補窓を出さないようにする (modal body 内 = drawing_in_popup では通常どおり)。
+        if self.keyboard_blocked_by_modal() {
+            return;
+        }
         self.ime_request = Some(cursor_area);
     }
 
@@ -1743,6 +1920,23 @@ pub(crate) fn merge_clip(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
         (None, None) => None,
         (Some(r), None) | (None, Some(r)) => Some(r),
         (Some(a), Some(b)) => Some(a.intersect(b)),
+    }
+}
+
+/// M14 Phase 94 (daw_01 #065): 真のモーダル中、background widget が読む pointer。
+/// pos = None / 全 button false / scroll 0 で「pointer が存在しない」状態に潰す。
+/// `modifiers` は keyboard 側の状態なので保持する (pos が None なので hover / drag は始まらず無害、
+/// modal body は `pointer_raw` を見るので影響しない)。
+fn masked_pointer(p: PointerFrame) -> PointerFrame {
+    PointerFrame {
+        pos: None,
+        primary_just_pressed: false,
+        primary_just_released: false,
+        primary_pressed: false,
+        secondary_just_pressed: false,
+        secondary_just_released: false,
+        modifiers: p.modifiers,
+        scroll_delta: (0.0, 0.0),
     }
 }
 

@@ -27,6 +27,11 @@ pub struct PopupOpenState {
     pub modal: bool,
     /// popup を開く前に focus を持っていた widget。close で戻す。
     pub prev_focus: Option<WidgetId>,
+    /// M14 Phase 94 (daw_01 #065): 「真のモーダル」かどうか。`true` の間、panel (popup body)
+    /// **以外**の全 widget への pointer / keyboard 入力を遮断する (= 背景 widget を inert に
+    /// する)。`open_popup` 経由の menu / dropdown / context_menu は `false` (= 従来どおり
+    /// 「panel の裏に隠れた widget だけ」を抑制)。`Ui::open_modal` 経由の dialog だけ `true`。
+    pub capture_input: bool,
 }
 
 /// anchor 起点の popup rect (dropdown / menu_bar 用)。

@@ -52,7 +52,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     pub fn open_modal(&mut self, id: impl Hash) {
         // anchor は modal 関数で毎フレーム update_popup_anchor で上書きするので、
         // ここでは仮値 (0,0,0,0) で OK。
-        self.open_popup(("modal", &id), Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }, true);
+        // M14 Phase 94 (daw_01 #065): dialog は `capture_input = true` (真のモーダル) で開く。
+        // = 開いた次フレームから panel 外の全 widget への pointer / keyboard 入力が遮断される。
+        // menu / dropdown / context_menu (`open_popup`, capture_input = false) とはここで区別する。
+        self.open_popup_inner(("modal", &id), Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }, true, true);
     }
 
     /// modal を閉じる。`on_close` Edit は呼び出し側責任 (modal 関数経由で発火させる場合は
@@ -105,21 +108,20 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // anchor を最新の panel_rect に更新 (window resize 対応)
         self.update_popup_anchor(("modal", &id), panel_rect);
 
-        // ESC ハンドラ
-        if style.close_on_escape && self.take_shortcut("escape") {
-            self.close_modal(id);
-            if let Some(f) = on_close {
-                let edit = f();
-                self.push_edit(edit);
-            }
-            return;
-        }
-
-        // popup_layer 前後の差分で close 検出 (outside click / body 内 close_modal)
+        // popup_layer 前後の差分で close 検出 (ESC / outside click / body 内 close_modal)
         let was_open = self.is_modal_open(id);
         let style_copy = *style;
 
         self.popup_layer(("modal", &id), |ui| {
+            // ESC ハンドラ (M14 Phase 94: 真のモーダル中の keyboard guard は drawing_in_popup
+            // の外でのみ効くため、popup_layer の body 内 = guard 対象外でここに置く。これで
+            // capture_input = true でも ESC が確実に modal を閉じられる)。閉じるフレームは
+            // overlay / panel / body を描かず (= 従来の早期 return と同じ見た目)、popup_layer 出口
+            // 〜 modal() 末尾の close 検出で on_close が発火する。
+            if style_copy.close_on_escape && ui.take_shortcut("escape") {
+                ui.close_modal(id);
+                return;
+            }
             // 1. 画面全体の overlay
             ui.push_rect(RectCommand {
                 rect: screen_rect,
@@ -407,5 +409,172 @@ mod tests {
             still_open.set(ui.is_modal_open("dlg"));
         });
         assert!(!still_open.get(), "次フレームで modal が閉じている");
+    }
+
+    // -------- M14 Phase 94 (daw_01 #065): 真のモーダル (panel 外の入力遮断) --------
+
+    /// capture_input = true (default) の modal が開いている間、panel の外 (background) で
+    /// pointer を読む widget には pos = None / press = false が見え (= inert)、panel 内
+    /// (popup body) の widget には生 pointer が見える。fader 等 `self.pointer` 直読み widget が
+    /// 自動的に無反応になることの SSoT 検証。
+    #[test]
+    fn capturing_modal_masks_background_pointer_but_not_body() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let style = ModalStyle::default();
+
+        // 1 frame: open + draw (anchor 確定 + capture_input=true sync)
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.open_modal("m");
+            ui.modal("m", (200.0, 100.0), &style, None, |_ui, _r| {});
+        });
+
+        // 次 frame: panel 内中央 (400,300) を press。背景は masked、body は raw。
+        let bg_pos = Cell::new(Some((1.0, 1.0)));
+        let bg_press = Cell::new(true);
+        let body_pos = Cell::new(None::<(f32, f32)>);
+        let body_press = Cell::new(false);
+        let click = PointerFrame {
+            pos: Some((400.0, 300.0)),
+            primary_just_pressed: true,
+            primary_pressed: true,
+            ..PointerFrame::default()
+        };
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput { pointer: click, ..FrameInput::default() },
+            |(), ui| {
+                // 背景 (modal() より前) で pointer を読む
+                bg_pos.set(ui.pointer().pos);
+                bg_press.set(ui.pointer().primary_just_pressed);
+                ui.modal("m", (200.0, 100.0), &style, None, |ui, _r| {
+                    body_pos.set(ui.pointer().pos);
+                    body_press.set(ui.pointer().primary_just_pressed);
+                });
+            },
+        );
+        assert_eq!(bg_pos.get(), None, "背景 widget は pointer pos が masking される");
+        assert!(!bg_press.get(), "背景 widget は press が masking される");
+        assert_eq!(body_pos.get(), Some((400.0, 300.0)), "modal body は raw pointer を見る");
+        assert!(body_press.get(), "modal body は press を見る");
+    }
+
+    /// capture_input = true の modal が開いている間、panel 外で `take_primary_press_in_rect` を
+    /// 呼んでも (anchor の外であっても) press は返らない (真のモーダル = 全画面遮断)。
+    #[test]
+    fn capturing_modal_blocks_background_press_outside_anchor() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let style = ModalStyle::default();
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.open_modal("m");
+            ui.modal("m", (200.0, 100.0), &style, None, |_ui, _r| {});
+        });
+
+        // panel_rect = (300,250,200,100)。その外 (50,50) を press。
+        let bg_rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let observed = Cell::new(Some((0.0_f32, 0.0_f32)));
+        let click = PointerFrame {
+            pos: Some((50.0, 50.0)),
+            primary_just_pressed: true,
+            primary_pressed: true,
+            ..PointerFrame::default()
+        };
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput { pointer: click, ..FrameInput::default() },
+            |(), ui| {
+                observed.set(ui.take_primary_press_in_rect(bg_rect));
+                ui.modal("m", (200.0, 100.0), &style, None, |_ui, _r| {});
+            },
+        );
+        assert_eq!(observed.get(), None, "真のモーダル中は anchor 外の press も遮断される");
+    }
+
+    /// capture_input = true の modal が開いている間、background の `take_shortcut` は遮断される
+    /// (consume もされないので、modal body が同じ shortcut を後で拾える)。
+    #[test]
+    fn capturing_modal_blocks_background_shortcut() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let style = ModalStyle::default();
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.open_modal("m");
+            ui.modal("m", (200.0, 100.0), &style, None, |_ui, _r| {});
+        });
+
+        // ESC 送信。modal() を呼ばない frame で background take_shortcut("escape") を確認。
+        let esc = KeyEvent {
+            state: ElementState::Pressed,
+            text: None,
+            physical_key: PhysicalKey::Escape,
+        };
+        let got = Cell::new(true);
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput { keyboard: vec![esc], ..FrameInput::default() },
+            |(), ui| {
+                got.set(ui.take_shortcut("escape"));
+            },
+        );
+        assert!(!got.get(), "真のモーダル中は background の shortcut が遮断される");
+    }
+
+    /// review fix: capturing modal が開いている間、**同時に開いている background の非 capturing
+    /// popup (menu / dropdown / context_menu)** の body も masking される (= popup item が
+    /// hover / click に反応しない)。`masked_here` を `state.capture_input` で gate していないと、
+    /// 全 top-level popup body が un-mask されて background menu が生きてしまう regression を防ぐ。
+    #[test]
+    fn capturing_modal_masks_background_popup_body() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let style = ModalStyle::default();
+        let menu_anchor = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+
+        // 1 frame: background popup (menu = capture_input false) と capturing modal を両方開く。
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.open_popup("menu", menu_anchor, true);
+            ui.open_modal("m");
+            ui.modal("m", (200.0, 100.0), &style, None, |_ui, _r| {});
+        });
+
+        // 次 frame: menu anchor 内 (50,50) を press。background menu の body は masked であるべき。
+        let menu_body_pos = Cell::new(Some((9.0, 9.0)));
+        let menu_body_press = Cell::new(true);
+        let click = PointerFrame {
+            pos: Some((50.0, 50.0)),
+            primary_just_pressed: true,
+            primary_pressed: true,
+            ..PointerFrame::default()
+        };
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput { pointer: click, ..FrameInput::default() },
+            |(), ui| {
+                // background popup の body (menu_bar dropdown 相当)
+                ui.popup_layer("menu", |ui| {
+                    menu_body_pos.set(ui.pointer().pos);
+                    menu_body_press.set(ui.pointer().primary_just_pressed);
+                });
+                // capturing modal を描画
+                ui.modal("m", (200.0, 100.0), &style, None, |_ui, _r| {});
+            },
+        );
+        assert_eq!(menu_body_pos.get(), None, "capturing modal 中は background popup body も masked");
+        assert!(!menu_body_press.get(), "capturing modal 中は background popup body の press も masked");
     }
 }
