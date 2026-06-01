@@ -149,6 +149,17 @@ pub struct ArrangementClip {
     /// `None` のときは `track.kind == Video` なら [`ArrangementStyle::video_clip_loading`] 単色 rect
     /// 描画、 `Audio` なら field 自体が無視される (= caller が kind と clip 種別を一致させる責任)。
     pub thumbnail: Option<(TextureHandle, u32, u32)>,
+    /// M14 Phase 96 (daw_01 #068): 共有グループ「連動ハイライト」フラグ。 `true` のとき widget が
+    /// selection (黄塗り) とは **別レイヤ** の hue ベース強調 (glow wash + bright thick border) を
+    /// `share_group_color` の hue から導出して重ねる (= 「今アクティブな共有グループの member」)。
+    /// caller (daw_01) は毎フレーム `{selected clip} ∪ {前フレーム hovered_clip}` の `content_id` 集合を
+    /// 作り、 同 content を共有する clip に `true` を立てて渡す想定 (selection 由来の強調を widget が
+    /// 知らない / hue 衝突で別グループを誤強調しうる、 の 2 点を避けるため per-clip flag 方式)。
+    /// **`false` のとき描画は #019 と pixel 完全一致** (既存挙動を一切変えない、 常に `false` で渡せば
+    /// 移行安全)。 `share_group_color == None` の clip では hue が無いので強調しない (defensive)。
+    /// hover 由来で毎フレーム変わるため widget は viewport_key (cache key) には含めず、 cached 外の
+    /// overlay で毎フレーム描画する (selection overlay と同 idiom)。
+    pub in_active_group: bool,
 }
 
 /// 1 つの track。`clips` は `start_beat` 昇順前提。
@@ -990,6 +1001,20 @@ pub struct ArrangementStyle {
     /// share clip の name 左に描く link glyph (default = `'⇌'` U+21CC)。 font に存在しない場合は
     /// caller 側で ASCII (`'~'` 等) に差し替える。
     pub share_group_link_glyph: char,
+    // ---- M14 Phase 96 (daw_01 #068): 共有グループ連動ハイライト (active group 強調レイヤ) ----
+    /// `ArrangementClip.in_active_group == true` の clip に重ねる強調の hue lightness (HSL の L)。
+    /// glow wash と bright border の両方に使う。 default = 0.88 で `share_group_border_lightness`
+    /// (0.75) よりさらに明るく、 アクティブグループ member が「光って」 見えるようにする。
+    pub share_group_active_border_lightness: f32,
+    /// active group 強調の outline 太さ (px)。 透明 fill + この太さの bright hue border を clip rect に
+    /// 重ねる (= clip 名 / fill を隠さず枠だけ強調)。 default = 2.5 で通常 `clip_border_w` (1.0) /
+    /// `clip_selected_border_w` (2.0) より太くして「束ねられている」 印象を出す。
+    pub share_group_active_border_w: f32,
+    /// active group 強調の glow wash alpha (`[0.0, 1.0]`)。 `share_group_active_border_lightness` の
+    /// bright hue をこの alpha で clip 全体に敷いて「光る」 表現にする (= selection の黄塗りとは別の hue
+    /// レイヤ)。 default = 0.22 で clip 名の可読性を保ちつつ強調が分かる。 `0.0` で glow なし =
+    /// bright border のみ (= ring のみの強調にしたい theme 向け)。
+    pub share_group_active_glow_alpha: f32,
     // ---- M14 Phase 63k (#025): audio clip inline 編集 (dB handle / fade) ----
     /// audio_edit が Some の clip に重ねる dB handle line の色 (default 半透明白)。
     pub audio_db_handle_color: Color,
@@ -1213,6 +1238,12 @@ impl Default for ArrangementStyle {
             share_group_border_lightness: 0.75,
             share_group_alpha: 0.85,
             share_group_link_glyph: '⇌',
+            // M14 Phase 96 (daw_01 #068): active group 強調 — share_group_border_lightness (0.75) より
+            // 明るい L=0.88 で「光る」、 border は clip_selected_border_w (2.0) より太い 2.5、 glow wash は
+            // 名前可読性を保つ 0.22 alpha。 selection の黄塗りとは別 hue レイヤ。
+            share_group_active_border_lightness: 0.88,
+            share_group_active_border_w: 2.5,
+            share_group_active_glow_alpha: 0.22,
             // M14 Phase 63k (#025): audio clip 編集 default — Bitwig spec §3.5/§3.6 と整合。
             // dB handle: 半透明白の細線、 ±4 px hit 帯、 端から 24 px margin、 0.25 dB/px、 ±24 dB 範囲。
             // fade 角: 12×12 grip、 半透明白の envelope 線。 sticky 閾値 10 px (要望文 §3.2)。
@@ -2809,6 +2840,89 @@ fn draw_selection_overlay<M: ?Sized + 'static>(
     }
 }
 
+/// M14 Phase 96 (daw_01 #068): 共有グループ「連動ハイライト」overlay。
+/// `clip.in_active_group == true` かつ `share_group_color == Some(hue)` の clip に、 selection
+/// (黄塗り) とは **別レイヤ** の hue ベース強調 (glow wash + bright thick border) を重ねる。
+/// 強調色は当該グループの hue を流用するので「どのグループがアクティブか」 が色でも一致して見える。
+///
+/// - **`in_active_group == false` / `share_group_color == None` の clip は一切描画しない**
+///   (= #019 と pixel 完全一致、 常に false で渡せば移行安全、 hue 不明なら強調しない defensive)。
+/// - **selection overlay より前** に呼ぶ: 選択中の同グループ member は黄塗りが上書き優先され
+///   (#068 の「黄塗り優先で OK」)、 非選択 member が hue 強調の主役になる。
+/// - **cached 外で毎フレーム描画**: active group は hover / 選択で毎フレーム変わるため
+///   viewport_key (heavy cache key) には含めない (hover 由来の変化で heavy cache を無効化しない =
+///   selection overlay と同 idiom)。 描画は `draw_clips` / `draw_selection_overlay` と同じ culling。
+fn draw_active_group_overlay<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
+    view: ArrangementView,
+    lanes: Rect,
+    style: &ArrangementStyle,
+) {
+    let view_end = view.start_beat + view.len_beats;
+    for (i, t) in visible_tracks.iter().enumerate() {
+        let row_top = tops[i];
+        let row_h = effective_track_row_h(t, view.track_row_h);
+        if row_top + row_h < lanes.y || row_top > lanes.y + lanes.h {
+            continue;
+        }
+        for c in &t.clips {
+            if !c.in_active_group {
+                continue;
+            }
+            // hue が無ければ強調色を導出できないので skip (video clip 等は share_group_color = None)。
+            let Some(hue) = c.share_group_color else {
+                continue;
+            };
+            let end = c.start_beat + c.len_beats;
+            if end < view.start_beat || c.start_beat > view_end {
+                continue;
+            }
+            let r = clip_to_rect(row_top, row_h, c, view, lanes);
+            if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
+                continue;
+            }
+            // (1) glow wash: bright hue を低 alpha で clip 全体に敷いて「光る」。 alpha=0 なら no-op
+            //     (= ring のみの強調)。 透明 fill push を避けるため alpha>0 の時だけ積む。
+            if style.share_group_active_glow_alpha > 0.0 {
+                let glow = hsl_to_rgb(
+                    hue,
+                    style.share_group_saturation,
+                    style.share_group_active_border_lightness,
+                    style.share_group_active_glow_alpha,
+                );
+                hctx.push_rect(RectCommand {
+                    rect: r,
+                    fill: glow,
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [style.clip_radius; 4],
+                    clip_rect: Some(lanes),
+                });
+            }
+            // (2) bright thick border: 同 hue を高 lightness / 太枠で outline。 透明 fill なので
+            //     clip 名 / 既存 fill は隠さず、 枠だけ強調 (= 「束ねられている」 印象)。
+            if style.share_group_active_border_w > 0.0 {
+                let border = hsl_to_rgb(
+                    hue,
+                    style.share_group_saturation,
+                    style.share_group_active_border_lightness,
+                    1.0,
+                );
+                hctx.push_rect(RectCommand {
+                    rect: r,
+                    fill: Color::TRANSPARENT,
+                    border,
+                    border_width: style.share_group_active_border_w,
+                    radius: [style.clip_radius; 4],
+                    clip_rect: Some(lanes),
+                });
+            }
+        }
+    }
+}
+
 fn drag_preview_geometry(
     anchor: ClipDragAnchor,
     kind: ClipDragKind,
@@ -2883,6 +2997,8 @@ fn draw_drag_preview<M: ?Sized + 'static>(
             // M14 Phase 72 (#044): drag preview は overlay 用 (実 clip データを表示しない)、
             // thumbnail は元 clip 側で描画済 (cached 内)、 preview は color + border のみ。
             thumbnail: None,
+            // drag preview は transient なので連動ハイライト対象外 (元 clip 側 overlay で描画済)。
+            in_active_group: false,
         };
         // drag_preview_geometry が n_tracks 範囲内に clamp 済なので tops から必ず取れる前提。
         // 万一範囲外なら preview を skip (clip 描画消失だけで panic はしない、 defensive)。
@@ -6144,6 +6260,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // M14 Phase 77 (daw_01 #048): track_top に依存する overlay 群を below_ruler scope で
             // wrap。 loop_band / playhead は static (ruler / spans ruler+lanes) なので scope 外。
             hctx.with_clip_rect(below_ruler, |hctx| {
+            // M14 Phase 96 (daw_01 #068): 連動ハイライトは selection overlay の **前** に描画
+            // (選択中 member は黄塗りが上書き優先、 非選択の同グループ member が hue 強調の主役)。
+            draw_active_group_overlay(
+                hctx,
+                &tracks_owned,
+                &tops_owned_for_heavy,
+                view_copy,
+                lanes,
+                &style_copy,
+            );
             draw_selection_overlay(
                 hctx,
                 &tracks_owned,
@@ -8076,6 +8202,7 @@ mod tests {
             share_group_color: None,
             audio_edit: None,
             thumbnail: None,
+            in_active_group: false,
         }
     }
 
@@ -8096,6 +8223,7 @@ mod tests {
             share_group_color: None,
             audio_edit: Some(audio),
             thumbnail: None,
+            in_active_group: false,
         }
     }
 
@@ -8738,6 +8866,7 @@ mod tests {
             share_group_color: None,
             audio_edit: None,
             thumbnail: Some((h, 1920, 1080)),
+            in_active_group: false,
         };
         let (got_h, w, ht) = c.thumbnail.unwrap();
         assert_eq!(got_h.raw(), 7);
@@ -9092,6 +9221,233 @@ mod tests {
             "strip 幅は style.track_color_strip_w (={}): w={}",
             style.track_color_strip_w,
             strip.rect.w
+        );
+    }
+
+    // ============================================================
+    // M14 Phase 96 (daw_01 #068): 共有グループ連動ハイライト
+    // ============================================================
+
+    /// track 0 に与えた clips で arrangement を描画して scene を返す helper (`selected` で
+    /// selection overlay も重ねる)。 view は `test_view` (header_w=0 / ruler_h=0)。
+    fn render_clips_scene(
+        clips_track0: Vec<ArrangementClip>,
+        selected: &[ClipKey],
+    ) -> daw_ui_renderer::Scene {
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::FrameInput;
+        use crate::ui::UiHost;
+
+        let tracks = vec![track(0, "t0", clips_track0)];
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 400 };
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            let style = ArrangementStyle::default();
+            let _ = ui.arrangement(
+                "arr_active_group",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &tracks,
+                test_view(),
+                selected,
+                &[],
+                &[],
+                &[],
+                &style,
+                None,
+                |_| Edit::mutate(|()| {}),
+            );
+        });
+        scene
+    }
+
+    /// id=10, beat 2..6 の clip に share_group hue / in_active_group を載せた test clip。
+    fn shared_clip(in_active: bool, hue: Option<f32>) -> ArrangementClip {
+        let mut c = clip(10, 2.0, 4.0, "shared");
+        c.share_group_color = hue;
+        c.in_active_group = in_active;
+        c
+    }
+
+    /// `in_active_group == true` かつ `share_group_color == Some` の clip は、 selection とは別の
+    /// hue 強調 (glow wash 1 枚 + bright thick border 1 本) を追加する。
+    #[test]
+    fn active_group_overlay_drawn_for_in_active_group_clip() {
+        let style = ArrangementStyle::default();
+        let hue = 0.33_f32;
+        let scene = render_clips_scene(vec![shared_clip(true, Some(hue))], &[]);
+
+        let expected_border = hsl_to_rgb(
+            hue,
+            style.share_group_saturation,
+            style.share_group_active_border_lightness,
+            1.0,
+        );
+        let expected_glow = hsl_to_rgb(
+            hue,
+            style.share_group_saturation,
+            style.share_group_active_border_lightness,
+            style.share_group_active_glow_alpha,
+        );
+
+        let border_rects = scene
+            .iter_rects()
+            .filter(|r| {
+                (r.border_width - style.share_group_active_border_w).abs() < 1e-3
+                    && r.border == expected_border
+            })
+            .count();
+        assert_eq!(border_rects, 1, "bright thick border が 1 本 (border_w={})", style.share_group_active_border_w);
+
+        let glow_rects = scene.iter_rects().filter(|r| r.fill == expected_glow).count();
+        assert_eq!(glow_rects, 1, "glow wash が 1 枚 (hue bright を {} alpha)", style.share_group_active_glow_alpha);
+    }
+
+    /// `in_active_group == false` の clip は強調 rect (border + glow) を一切追加しない
+    /// (= #019 と pixel 完全一致)。 glow / border は独立 guard なので両方の不在を確認する。
+    #[test]
+    fn no_active_overlay_when_in_active_group_false() {
+        let style = ArrangementStyle::default();
+        let hue = 0.33_f32;
+        let scene = render_clips_scene(vec![shared_clip(false, Some(hue))], &[]);
+        let active_borders = scene
+            .iter_rects()
+            .filter(|r| (r.border_width - style.share_group_active_border_w).abs() < 1e-3)
+            .count();
+        assert_eq!(active_borders, 0, "false は強調枠を描かない (移行安全)");
+        let expected_glow = hsl_to_rgb(
+            hue,
+            style.share_group_saturation,
+            style.share_group_active_border_lightness,
+            style.share_group_active_glow_alpha,
+        );
+        let glow = scene.iter_rects().filter(|r| r.fill == expected_glow).count();
+        assert_eq!(glow, 0, "false は glow wash も描かない");
+    }
+
+    /// `share_group_color == None` の clip は in_active_group=true でも強調しない (hue 不明 = defensive)。
+    /// border / glow 両方の不在を確認 (hue 不明なので glow は固有 alpha=glow_alpha の rect 不在で判定)。
+    #[test]
+    fn no_active_overlay_when_share_group_color_none() {
+        let style = ArrangementStyle::default();
+        let scene = render_clips_scene(vec![shared_clip(true, None)], &[]);
+        let active_borders = scene
+            .iter_rects()
+            .filter(|r| (r.border_width - style.share_group_active_border_w).abs() < 1e-3)
+            .count();
+        assert_eq!(active_borders, 0, "hue 無しは強調枠を描かない");
+        // glow wash の色は hue 依存だが alpha は固定 (share_group_active_glow_alpha)。 default style に
+        // この alpha を持つ rect は他に無いので、 0 件 = glow も描いていない。
+        let glow = scene
+            .iter_rects()
+            .filter(|r| (r.fill.a - style.share_group_active_glow_alpha).abs() < 1e-3)
+            .count();
+        assert_eq!(glow, 0, "hue 無しは glow wash も描かない");
+    }
+
+    /// `share_group_active_glow_alpha == 0.0` の opt-out (ring のみ): glow wash は描かず
+    /// bright border だけ 1 本描く (style doc の「ring のみの強調」 契約を固定 + glow / border が
+    /// 独立 guard であることを保証)。
+    #[test]
+    fn active_overlay_glow_alpha_zero_draws_border_only() {
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::FrameInput;
+        use crate::ui::UiHost;
+
+        let style =
+            ArrangementStyle { share_group_active_glow_alpha: 0.0, ..ArrangementStyle::default() };
+        let hue = 0.33_f32;
+        let tracks = vec![track(0, "t0", vec![shared_clip(true, Some(hue))])];
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 400 };
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            let _ = ui.arrangement(
+                "arr_ring_only",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &tracks,
+                test_view(),
+                &[],
+                &[],
+                &[],
+                &[],
+                &style,
+                None,
+                |_| Edit::mutate(|()| {}),
+            );
+        });
+
+        // glow wash は alpha=0 では push されない (guard `> 0.0` で skip)。 glow rect があれば
+        // fill = この透明 hue になるはずなので、 0 件 = push されていないことを保証。
+        let glow_color = hsl_to_rgb(
+            hue,
+            style.share_group_saturation,
+            style.share_group_active_border_lightness,
+            0.0,
+        );
+        let glow = scene.iter_rects().filter(|r| r.fill == glow_color).count();
+        assert_eq!(glow, 0, "glow_alpha=0 で glow wash を描かない (ring のみ)");
+        let border = scene
+            .iter_rects()
+            .filter(|r| (r.border_width - style.share_group_active_border_w).abs() < 1e-3)
+            .count();
+        assert_eq!(border, 1, "glow_alpha=0 でも bright border は 1 本描く");
+    }
+
+    /// `in_active_group` は viewport_key (heavy cache key) に含まれない: flip しても
+    /// `fold_arrangement_clip_hash` は不変 (= hover 由来の active group 変化で heavy cache を
+    /// 無効化せず、 強調は cached 外 overlay で毎フレーム描く)。
+    #[test]
+    fn fold_arrangement_clip_hash_ignores_in_active_group() {
+        // clone で同一 Arc<str> name を共有させ、 in_active_group だけが異なる 2 clip を作る
+        // (clip() を 2 回呼ぶと name.as_ptr() が変わり hash の name 成分で差が出てしまうため)。
+        let c_off = shared_clip(false, Some(0.33));
+        let mut c_on = c_off.clone();
+        c_on.in_active_group = true;
+        let before = vec![track(0, "t0", vec![c_off])];
+        let after = vec![track(0, "t0", vec![c_on])];
+        assert_eq!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after),
+            "in_active_group 変化は cache を無効化しない"
+        );
+    }
+
+    /// 選択中かつ active group の member は、 selection (黄塗り) が active overlay の **後** に
+    /// 描画されて優先される (#068 の「選択中 member は黄塗り優先」)。
+    #[test]
+    fn selection_fill_drawn_after_active_overlay() {
+        let style = ArrangementStyle::default();
+        let hue = 0.33_f32;
+        let key = ClipKey { track: 0, clip: 10 };
+        let scene = render_clips_scene(vec![shared_clip(true, Some(hue))], &[key]);
+
+        let expected_border = hsl_to_rgb(
+            hue,
+            style.share_group_saturation,
+            style.share_group_active_border_lightness,
+            1.0,
+        );
+        let rects: Vec<&RectCommand> = scene.iter_rects().collect();
+        let active_idx = rects
+            .iter()
+            .position(|r| {
+                (r.border_width - style.share_group_active_border_w).abs() < 1e-3
+                    && r.border == expected_border
+            })
+            .expect("active border rect が存在する");
+        let sel_idx = rects
+            .iter()
+            .position(|r| r.fill == style.clip_selected_fill)
+            .expect("selection fill rect が存在する");
+        assert!(
+            sel_idx > active_idx,
+            "selection は active overlay の後 (= 上) に描画される: sel={sel_idx} active={active_idx}"
         );
     }
 

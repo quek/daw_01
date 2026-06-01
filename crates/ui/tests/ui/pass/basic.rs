@@ -223,6 +223,7 @@ fn main() {
                             share_group_color: None,
                             audio_edit: None,
                             thumbnail: None,
+                            in_active_group: false,
                         };
                     }),
                     ArrangementEditRequest::CloneClipsLinked(_) => {

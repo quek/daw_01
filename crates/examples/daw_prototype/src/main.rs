@@ -122,6 +122,11 @@ struct DawModel {
     arr_tracks: Vec<DawTrack>,
     arr_view: ArrangementView,
     arr_selected_clips: Vec<ClipKey>,
+    /// M14 Phase 96 (daw_01 #068): 前フレームの `ArrangementResponse.hovered_clip` を保持し、
+    /// 次フレームの連動ハイライト (`in_active_group`) 計算に使う。 daw_01 が「前フレーム hovered_clip
+    /// の content_id も active group に含める」 と説明した hover 駆動の最小再現 (hover は当該フレームの
+    /// resp で初めて判明するので 1 フレーム遅延で active group に反映する)。
+    arr_hovered_clip: Option<ClipKey>,
     /// M14 Phase 63c (#016): multi-select 化 (旧 `arr_selected_track: Option<u32>` から transition)。
     /// 単一選択 = `vec![tid]`、 解除 = `vec![]`、 multi-select は Shift/Ctrl click で widget 側が
     /// modifier-aware に next を生成して送ってくる。
@@ -272,6 +277,7 @@ impl DawModel {
             arr_tracks: tracks,
             arr_view,
             arr_selected_clips: Vec::new(),
+            arr_hovered_clip: None,
             arr_selected_tracks: Vec::new(),
             arr_collapsed_groups: std::collections::HashSet::new(),
             arr_track_automation_collapsed: std::collections::HashSet::new(),
@@ -854,6 +860,27 @@ fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
         }
         depth
     };
+    // M14 Phase 96 (daw_01 #068): 連動ハイライト demo — `{選択 clip} ∪ {前フレーム hovered_clip}`
+    // の share_group_id 集合を作り、 同グループ member の clip に `in_active_group=true` を立てる
+    // (daw_01 が model から計算して per-clip flag で渡す想定の最小再現)。
+    let gid_of = |key: ClipKey| -> Option<u32> {
+        m.arr_tracks
+            .iter()
+            .find(|t| t.id == key.track)
+            .and_then(|t| t.clips.iter().find(|c| c.id == key.clip))
+            .and_then(|c| c.share_group_id)
+    };
+    let mut active_groups: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for &k in &m.arr_selected_clips {
+        if let Some(g) = gid_of(k) {
+            active_groups.insert(g);
+        }
+    }
+    if let Some(k) = m.arr_hovered_clip
+        && let Some(g) = gid_of(k)
+    {
+        active_groups.insert(g);
+    }
     m.arr_tracks
         .iter()
         .map(|t| ArrangementTrack {
@@ -892,6 +919,11 @@ fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
                     // video 編集機能の demo は daw_01 本体側で wire (gui_01 example で video frame
                     // decode しない方針、 KISS)。
                     thumbnail: None,
+                    // M14 Phase 96 (daw_01 #068): 共有 clip (share_group_id = Some) のうち、
+                    // selection / hover で active になったグループの member を連動強調表示する。
+                    in_active_group: c
+                        .share_group_id
+                        .is_some_and(|g| active_groups.contains(&g)),
                 })
                 .collect(),
             parent_id: t.parent_id,
@@ -2195,6 +2227,15 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
             }),
         },
     );
+
+    // M14 Phase 96 (daw_01 #068): 連動ハイライト用に hovered_clip を 1 フレーム保持する。
+    // 変化した時だけ Edit を積む (= 毎フレーム無駄な mutate を避ける、 request_redraw は host が担当)。
+    if m.arr_hovered_clip != resp.hovered_clip {
+        let hv = resp.hovered_clip;
+        ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
+            mm.arr_hovered_clip = hv;
+        }));
+    }
 
     // ---- track header 右クリック context_menu (Rename / Color / Delete) ----
     for (track_id, header_rect) in &resp.track_header_rects {

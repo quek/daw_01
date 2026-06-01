@@ -93,6 +93,7 @@ fn arr_model() -> ArrModel {
             share_group_color: None,
             audio_edit: None,
             thumbnail: None,
+            in_active_group: false,
         }],
         volume: 1.0,
         parent_id: None,
