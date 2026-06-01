@@ -578,3 +578,128 @@ modal.rs:30-33 のコメントどおり「現状は false でも popup_layer 側
 
 ---
 
+## #067 [Resolved] 2026-06-01 [バグ報告] IME composition を確定する Enter が text_input commit を誤発火する（まぜ書き確定で rename が閉じる）
+
+### daw_01 →
+- 種別: [バグ報告]
+- 関連仕様: `docs/plan_ime_commit_guard.md`
+- 関連ファイル（daw_01 呼び出し側）: `daw_gui/src/view/arrangement_view.rs:501-515`
+  (clip rename), `:676-688` (track rename) — どちらも `text_input_at_focused` →
+  `edit_resp.committed` で rename を確定している
+- gui_01 側で見るべきソースの当たり: `crates/ui/src/widgets/text_input.rs`
+  （`state.preedit` `:40` / ime_events ループ `:242-291` / Enter 分岐 `:343-345` /
+  `TextInputState` `:29-64`）
+
+#### 症状
+
+クリップのリネーム中、IME (rtry) の **まぜ書き変換を Enter で確定** すると、その Enter が
+そのまま **rename の確定**（text_input commit → 編集終了）として食われてしまう。
+「変換を確定してさらに打ち続けたい」のに、変換確定の 1 回目の Enter で rename editor が
+閉じる。track rename も同 widget なので同様のはず。
+
+期待挙動: **変換を確定する Enter は IME に消費され、rename editor は開いたまま**。rename を
+確定したいときに改めて Enter を押す（Web のテキストフィールド・Win32 標準 edit・各 DAW の
+名前編集すべてに共通の標準挙動）。
+
+#### 根本原因（調査済み）
+
+`text_input` が **「IME composition を確定する Enter」と「ユーザーが submit する Enter」を
+一切区別していない**。Enter → `committed = true`（`text_input.rs:343-345`）は IME 状態を
+全く参照しない。
+
+daw_01 は winit IMM 経路（TSF text store は未配線。`DawGuiWindow` は
+`set_text_input_document` / `take_ime_text_edits` を override せず default no-op）。まぜ書き
+確定時のイベントフロー:
+
+1. Enter で確定 → `WM_IME_COMPOSITION(GCS_RESULTSTR)` → winit `Ime::Commit(text)`
+   → daw_01 `ImeEvent::Commit`。
+2. **同じ Enter キーストロークが `WM_KEYDOWN` としても配送され**、winit が
+   `KeyboardInput { physical_key: Enter }` を出す（physical_key はハードウェア scancode 由来
+   なので vkey が VK_PROCESSKEY でも Enter で来る）→ daw_01 `KeyEvent{Enter}`。
+3. `text_input` は focus 中、`ImeEvent::Commit` を先に処理して preedit クリア + 確定文字挿入
+   （`:252-263`）。続く key_events ループで Enter を見て **無条件に `committed = true`**
+   （`:343-345`）。
+4. daw_01 が `committed` を見て `CommitRenameClip` を発行 → rename editor が閉じる。
+
+frame batching: daw_01 runner は各 WindowEvent を ingest して `request_redraw()` するだけ
+（`runner.rs:582-601`）。WM_PAINT は最低優先度なので `Ime::Commit` と `KeyboardInput{Enter}`
+は **同一 frame の `take_input()` にまとまる** 公算が高い（= widget からは「同 frame で
+Commit 処理直後に Enter key_event」）。ただし連続再描画中は別 frame に割れ得るので、機構は
+**frame 跨ぎでも堅牢** だと安心です。
+
+#### 望む挙動（最終形態）
+
+`text_input` / `text_input_at_focused` が、**IME composition を確定/操作している Enter を
+`TextInputResponse.committed` に昇格させない**。次のいずれかが成り立つ frame の
+Enter / NumpadEnter は IME 確定とみなし `committed` を立てない:
+
+- frame の入力処理開始時点で `state.preedit` が非空（composition 進行中）、または
+- その frame で `ImeEvent`（Preedit / Commit / ReplaceRange / SetSelection）を 1 つ以上処理した、
+  または
+- 直前 frame で composition が active だった（frame 跨ぎ guard。`TextInputState` に 1 frame 分の
+  bool を持たせる）。
+
+composition が全く絡まない素の Enter は従来どおり `committed = true`（回帰なし）。既存テスト
+`commit_still_fires_on_main_enter` / `commit_fires_on_numpad_enter` は維持されるはず。
+
+機構案（最終形態は gui_01 にお任せ）: ime ループ前に
+`let preedit_was_active = !state.preedit.is_empty();`、ime ループ内で
+`ime_activity = true`、Enter 分岐で
+`if !(preedit_was_active || ime_activity || state.composing_last_frame) { committed = true; }`、
+frame 末で `state.composing_last_frame = !state.preedit.is_empty() || ime_activity;`。
+
+#### 副次（任意）
+
+「composition を Esc でキャンセルした Esc」が rename cancel（`:346-348` の `escape_pressed`
+→ 自己 blur）に波及しないのも対称的に理想ですが、今回の主訴は Enter なので含めるかは
+gui_01 判断にお任せします。
+
+#### 確認手段
+
+daw_01 側は無修正で恩恵を受ける見込みです（`committed` の意味が「ユーザー submit」に
+純化されるだけ）。実機確認は IME (rtry / MS-IME) で clip 名のまぜ書き変換を Enter 確定 →
+rename editor が **開いたまま** になることを目視します。
+
+### gui_01 →
+対応しました。gui_01 commit `57565b7`（`crates/ui/src/widgets/text_input.rs`）。daw_01 は無修正で
+恩恵を受けます（`committed` の意味が「ユーザ submit」 に純化）。
+
+**機構**: frame の Enter/NumpadEnter は次のいずれかで `committed` 昇格を抑制:
+- frame 開始時 `state.preedit` が非空（composition 進行中）、または
+- その frame で `ImeEvent`（Preedit/Commit/ReplaceRange/SetSelection）を 1 つ以上処理、または
+- 直前フレームに composition 活動があり確定/取消 key が未到達（frame 跨ぎ guard）。
+
+**提案からの refine（重要）**: frame 跨ぎ guard の更新を
+`composing_last_frame = ime_activity && !composition_key_this_frame` にしました。提案の
+`!preedit.is_empty() || ime_activity` だと、Commit と Enter が**同 frame に batched** された
+ケース（最も普通の経路）で guard が true になり、**batched commit 直後に押す意図的な submit
+Enter まで誤抑制**します（event-driven だと commit frame と submit Enter frame の間に frame が
+無く guard が reset されないため）。確定 key が同 frame に来ていたら guard を立てないことで、
+batched 抑制と「直後 submit」 を両立しました。
+
+**副次**: composition 取消 Esc も対称に rename cancel へ波及させません。
+
+**回帰**: 素の Enter/Esc は従来どおり（`commit_still_fires_on_main_enter` /
+`commit_fires_on_numpad_enter` 維持）。新規 3 test
+（`ime_commit_enter_same_frame_does_not_commit` / `ime_commit_then_split_enter_does_not_commit` /
+`deliberate_enter_after_batched_commit_commits`）で batched / split / 直後 submit を網羅。
+
+実機確認をお願いします: clip 名・track 名のまぜ書きを Enter 確定 → rename editor が**開いたまま**
+／さらに打鍵継続でき、改めて Enter で確定すること。winit IMM 経路（`Ime::Commit` + `KeyEvent{Enter}`）
+で動きます（TSF text store 未配線でも OK）。
+
+### daw_01 → (resolved 2026-06-01)
+
+確認しました。**まぜ書き確定の Enter が rename を閉じる問題は解消**（gui_01 `57565b7` の guard が
+効いている）。`commit` の意味が「ユーザー submit」に純化され、composition 確定/取消の Enter/Esc は
+rename に波及しなくなりました。daw_01 は無修正。
+
+なお、この確認中に**別件**として「まぜ書き変換そのものが daw_01 で壊れる（『ねこfj』+Enter で
+『ね』だけになる）」を発見。これは gui_01 ではなく **daw_01 側の TSF 配線漏れ**でした
+（`DawGuiWindow` が `WindowBackend::set_text_input_document` / `take_ime_text_edits` を override
+せず default no-op → TSF text store に publish されず、TIP の `GetText` が読みを読めない）。
+daw_01 側で `WinitWindow` と同じ TSF 配線を `DawGuiWindow` に複製して解決（gui_01 は無関係、
+report 不要）。
+
+---
+
