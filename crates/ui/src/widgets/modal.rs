@@ -27,9 +27,10 @@ pub struct ModalStyle {
     pub overlay_color: Color,
     pub panel_bg: Color,
     pub panel_radius: f32,
-    /// `true` で panel 外 click で close (= `popup_layer` の標準挙動)。
-    /// 現状は `false` でも popup_layer 側が常に auto-close するため意味的フィールドのみ
-    /// (将来の拡張点)。
+    /// `true` (default) で panel 外 click で close (= menu / dropdown と同じ標準挙動)。
+    /// `false` にすると外 click で閉じず、 capturing modal では click を consume して無視する
+    /// だけ (= Cancel / OK ボタンでしか閉じない blocking modal)。M14 Phase 95 (daw_01 #066) で
+    /// `Ui::modal` が毎フレーム `PopupOpenState::dismiss_on_outside_click` へ同期し機能化。
     pub close_on_outside_click: bool,
     /// `true` で `take_shortcut("escape")` 検出時に close。
     pub close_on_escape: bool,
@@ -107,6 +108,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         // anchor を最新の panel_rect に更新 (window resize 対応)
         self.update_popup_anchor(("modal", &id), panel_rect);
+
+        // M14 Phase 95 (daw_01 #066): outside-click で閉じるか否かを style から popup state へ同期。
+        // popup_layer はこの直後に呼ぶので、同フレームの outside-click 判定にラグなく反映される。
+        self.set_popup_dismiss_on_outside_click(("modal", &id), style.close_on_outside_click);
 
         // popup_layer 前後の差分で close 検出 (ESC / outside click / body 内 close_modal)
         let was_open = self.is_modal_open(id);
@@ -576,5 +581,91 @@ mod tests {
         );
         assert_eq!(menu_body_pos.get(), None, "capturing modal 中は background popup body も masked");
         assert!(!menu_body_press.get(), "capturing modal 中は background popup body の press も masked");
+    }
+
+    /// daw_01 #066: `close_on_outside_click: false` の modal は panel 外 click で閉じず、
+    /// その frame でも body が描画される (= 「閉じて再 open」のフラッシュが起きない)。on_close も
+    /// 発火しない。
+    #[test]
+    fn blocking_modal_does_not_close_on_outside_click() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let style = ModalStyle { close_on_outside_click: false, ..ModalStyle::default() };
+        let on_close_fired = std::rc::Rc::new(Cell::new(false));
+        let body_called = Cell::new(0u32);
+
+        // open + draw 1 frame (close_on_outside_click=false を popup state へ同期)。
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.open_modal("dlg");
+            ui.modal("dlg", (200.0, 100.0), &style, None, |_ui, _r| {});
+        });
+
+        // panel_rect = (300,250,200,100)。その外 (10,10) を click。
+        let click = PointerFrame {
+            pos: Some((10.0, 10.0)),
+            primary_just_pressed: true,
+            ..PointerFrame::default()
+        };
+        let on_close_clone = on_close_fired.clone();
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput { pointer: click, ..FrameInput::default() },
+            |(), ui| {
+                let on_close: Option<Box<dyn FnOnce() -> Edit<()>>> = Some(Box::new(move || {
+                    on_close_clone.set(true);
+                    Edit::mutate(|(): &mut ()| {})
+                }));
+                ui.modal("dlg", (200.0, 100.0), &style, on_close, |_ui, _r| {
+                    body_called.set(body_called.get() + 1);
+                });
+            },
+        );
+
+        assert!(!on_close_fired.get(), "close_on_outside_click=false では外 click で on_close 発火しない");
+        assert_eq!(body_called.get(), 1, "外 click frame でも body が描画される (フラッシュ防止)");
+
+        let still_open = Cell::new(false);
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            still_open.set(ui.is_modal_open("dlg"));
+        });
+        assert!(still_open.get(), "外 click 後も modal は開いたまま");
+    }
+
+    /// 既存 default (`close_on_outside_click: true`) は従来どおり外 click で閉じる回帰確認。
+    #[test]
+    fn default_modal_still_closes_on_outside_click() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let style = ModalStyle::default(); // close_on_outside_click = true
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.open_modal("dlg");
+            ui.modal("dlg", (200.0, 100.0), &style, None, |_ui, _r| {});
+        });
+
+        let click = PointerFrame {
+            pos: Some((10.0, 10.0)),
+            primary_just_pressed: true,
+            ..PointerFrame::default()
+        };
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput { pointer: click, ..FrameInput::default() },
+            |(), ui| {
+                ui.modal("dlg", (200.0, 100.0), &style, None, |_ui, _r| {});
+            },
+        );
+
+        let still_open = Cell::new(true);
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            still_open.set(ui.is_modal_open("dlg"));
+        });
+        assert!(!still_open.get(), "default は外 click で閉じる (従来挙動)");
     }
 }

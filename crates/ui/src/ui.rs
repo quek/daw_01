@@ -885,8 +885,31 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let prev_focus = self.pending_focus;
         self.open_popups.insert(
             wid,
-            PopupOpenState { anchor, modal, prev_focus, capture_input },
+            // M14 Phase 95 (daw_01 #066): dismiss_on_outside_click は default true
+            // (menu / dropdown / 通常 modal の従来挙動)。modal は `Ui::modal` が毎フレーム
+            // `ModalStyle::close_on_outside_click` から同期して上書きする。
+            PopupOpenState {
+                anchor,
+                modal,
+                prev_focus,
+                capture_input,
+                dismiss_on_outside_click: true,
+            },
         );
+    }
+
+    /// M14 Phase 95 (daw_01 #066): 開いている popup の `dismiss_on_outside_click` を更新する。
+    /// `Ui::modal` が毎フレーム `ModalStyle::close_on_outside_click` を同期するために使う
+    /// (popup が閉じていれば no-op)。
+    pub(crate) fn set_popup_dismiss_on_outside_click(
+        &mut self,
+        id: impl std::hash::Hash,
+        dismiss: bool,
+    ) {
+        let wid = WidgetId::ROOT.child((b"popup", &id));
+        if let Some(state) = self.open_popups.get_mut(&wid) {
+            state.dismiss_on_outside_click = dismiss;
+        }
     }
 
     /// popup を閉じる。popup を開く前の focus を復元する。
@@ -963,14 +986,24 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     .any(|s| s.anchor.contains(px, py))
             });
         if outside_click {
-            // popup を閉じる + クリック消費 (modal なら他 widget に流さない)
-            self.open_popups.remove(&wid);
-            self.pending_focus = state.prev_focus;
-            self.focus_changed_this_frame = true;
+            if state.dismiss_on_outside_click {
+                // popup を閉じる + クリック消費 (modal なら他 widget に流さない)
+                self.open_popups.remove(&wid);
+                self.pending_focus = state.prev_focus;
+                self.focus_changed_this_frame = true;
+                if state.modal {
+                    self.consume_pointer_click();
+                }
+                return;
+            }
+            // M14 Phase 95 (daw_01 #066): close_on_outside_click == false の blocking modal は
+            // 外 click で閉じない。click は consume して無視するだけ (capturing modal では背景は
+            // 既に masking 済だが、 popup_layer の close 機構へ生 click が再到達しないよう両 pointer
+            // を消す) で、 **early return せず body をそのまま描画**する。早期 return すると overlay /
+            // panel が 1 frame 描かれず「閉じて再 open」のフラッシュになる (#066 の症状)。
             if state.modal {
                 self.consume_pointer_click();
             }
-            return;
         }
 
         // popup の内容を描画 (deferred buffer)

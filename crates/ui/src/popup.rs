@@ -32,6 +32,12 @@ pub struct PopupOpenState {
     /// する)。`open_popup` 経由の menu / dropdown / context_menu は `false` (= 従来どおり
     /// 「panel の裏に隠れた widget だけ」を抑制)。`Ui::open_modal` 経由の dialog だけ `true`。
     pub capture_input: bool,
+    /// M14 Phase 95 (daw_01 #066): panel (anchor) 外 click で popup を auto-close するか。
+    /// `true` (default) は menu / dropdown / 通常 modal の従来挙動 (外 click で閉じる)。
+    /// `false` の間は外 click で閉じず、 modal なら click を consume するだけ (= Cancel ボタン等で
+    /// しか閉じない blocking modal)。`Ui::modal` が毎フレーム `ModalStyle::close_on_outside_click`
+    /// から同期する (`open_popup` / `open_modal` の初期値は `true`)。
+    pub dismiss_on_outside_click: bool,
 }
 
 /// anchor 起点の popup rect (dropdown / menu_bar 用)。
