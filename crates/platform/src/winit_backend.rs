@@ -99,10 +99,17 @@ impl WindowBackend for WinitWindow {
         #[cfg(target_os = "windows")]
         {
             let hwnd = tsf_hwnd(&self.inner);
+            let win = Arc::clone(&self.inner);
             TSF_MANAGER.with(|cell| {
                 let mut slot = cell.borrow_mut();
                 if matches!(*slot, TsfSlot::Untried) {
-                    *slot = match hwnd.map(crate::tsf::TsfManager::new) {
+                    // IME が store を編集したら redraw を要求し、次フレームで drain させる。
+                    let init = hwnd.map(|h| {
+                        let redraw: std::rc::Rc<dyn Fn()> =
+                            std::rc::Rc::new(move || win.request_redraw());
+                        crate::tsf::TsfManager::new(h, redraw)
+                    });
+                    *slot = match init {
                         Some(Ok(mgr)) => TsfSlot::Active(mgr),
                         Some(Err(e)) => {
                             // TSF が使えない環境 (apartment 衝突等) は winit IMM に degrade。

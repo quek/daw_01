@@ -57,14 +57,19 @@ pub(crate) struct TsfShared {
     pub doc: Rc<RefCell<DocState>>,
     pub sinks: Rc<RefCell<SinkState>>,
     pub lock: Rc<Cell<LockKind>>,
+    /// IME がメッセージポンプ中に store を編集したとき再描画を促す callback。
+    /// これが無いと、TIP の SetText で積んだ pending edit が「次に何か別のイベントで
+    /// 再描画される」まで widget に反映されず、event-driven app (daw_01) で入力が遅延する。
+    pub redraw: Rc<dyn Fn()>,
 }
 
 impl TsfShared {
-    pub fn new() -> Self {
+    pub fn new(redraw: Rc<dyn Fn()>) -> Self {
         Self {
             doc: Rc::new(RefCell::new(DocState::new())),
             sinks: Rc::new(RefCell::new(SinkState::default())),
             lock: Rc::new(Cell::new(LockKind::Unlocked)),
+            redraw,
         }
     }
 }
@@ -237,6 +242,7 @@ impl ITextStoreACP_Impl for DocumentStore_Impl {
             .doc
             .borrow_mut()
             .set_selection_acp(sel.acpStart, sel.acpEnd, reversed);
+        (self.shared.redraw)();
         Ok(())
     }
 
@@ -297,6 +303,7 @@ impl ITextStoreACP_Impl for DocumentStore_Impl {
             unsafe { std::slice::from_raw_parts(pchtext.0, cch as usize) }
         };
         let (s, old_e, new_e) = self.shared.doc.borrow_mut().set_text_acp(acpstart, acpend, new16);
+        (self.shared.redraw)(); // pending edit を次フレームで drain させる
         Ok(TS_TEXTCHANGE { acpStart: s, acpOldEnd: old_e, acpNewEnd: new_e })
     }
 
@@ -363,6 +370,7 @@ impl ITextStoreACP_Impl for DocumentStore_Impl {
         };
         let (start, end, (cs, coe, cne)) =
             self.shared.doc.borrow_mut().insert_at_selection_acp(new16);
+        (self.shared.redraw)();
         unsafe {
             write_out(pacpstart, start);
             write_out(pacpend, end);

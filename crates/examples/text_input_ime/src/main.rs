@@ -143,9 +143,10 @@ impl AppHost for App {
         if let Err(e) = self.renderer.render(&self.scene) {
             eprintln!("render error: {e}");
         }
-        // TSF 由来の編集 (rtry の SetText 等) はメッセージポンプ中に非同期に積まれるため、
-        // テストハーネスでは毎フレーム再描画して pending edit を確実に拾う。
-        true
+        // event-driven: TSF 由来の編集 (rtry の SetText 等) はメッセージポンプ中に非同期に
+        // 積まれるが、library 側が編集時に request_redraw するので continuous redraw は不要。
+        // (= daw_01 のような event-driven app と同じ条件で TSF 入力が遅延しないことを実証する)
+        false
     }
 }
 

@@ -11,6 +11,7 @@
 #![allow(clippy::wildcard_imports)]
 
 use std::cell::Cell;
+use std::rc::Rc;
 
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::*;
@@ -36,9 +37,12 @@ pub struct TsfManager {
 impl TsfManager {
     /// TSF を初期化して text store を context に push する。
     ///
+    /// `redraw` は IME がメッセージポンプ中に store を編集した直後に呼ばれ、次フレームでの
+    /// pending edit drain を促す (event-driven app での入力遅延防止)。
+    ///
     /// # Errors
     /// apartment 衝突 (`RPC_E_CHANGED_MODE`) や msctf の生成失敗時。呼び出し側は IMM へ fallback する。
-    pub fn new(hwnd: HWND) -> Result<Self> {
+    pub fn new(hwnd: HWND, redraw: Rc<dyn Fn()>) -> Result<Self> {
         let did_coinit = unsafe {
             let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             if hr == RPC_E_CHANGED_MODE {
@@ -57,7 +61,7 @@ impl TsfManager {
             let doc_mgr = unsafe { thread_mgr.CreateDocumentMgr()? };
             let empty_doc_mgr = unsafe { thread_mgr.CreateDocumentMgr()? };
 
-            let shared = TsfShared::new();
+            let shared = TsfShared::new(redraw);
             let store = DocumentStore::create(shared.clone(), hwnd);
             let store_unk: IUnknown = store.cast()?;
 
