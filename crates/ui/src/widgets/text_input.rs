@@ -61,6 +61,16 @@ pub(crate) struct TextInputState {
     ///   経由ではなく、 別経路で model が変化)、 buffer が ignore する (= ユーザの typing が勝つ)。
     ///   undo/redo 中の rename 等のレアケース、 むしろ「ユーザの typing が消えない」 方が直感的。
     buffer_text: String,
+    /// **(daw_01 #067)** 直前フレームに IME composition 活動 (Commit/Preedit/ReplaceRange/
+    /// SetSelection) があり、その確定/取消 key (Enter/Esc) の KeyEvent が **次フレームに割れて
+    /// 届く**可能性があるか。立っている間の Enter/Esc は composition 操作とみなし
+    /// `committed`/blur に昇格させない (frame 跨ぎ guard)。
+    ///
+    /// `ime_activity && !composition_key_this_frame` で更新する点が肝: Commit と Enter が **同
+    /// frame に batched** されたケースでは `composition_key_this_frame == true` で false に落ちる
+    /// ので、直後に押す **意図的な submit Enter は抑制されない** (daw_01 提案の単純 1-frame bool
+    /// だと batched 後の submit Enter まで誤抑制する欠陥があったため refine)。
+    composing_last_frame: bool,
 }
 
 /// `text` の `from` 位置から左方向に直近の char 境界を返す (`from` が境界ならそのまま返す)。
@@ -237,6 +247,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let mut changed = false;
                 let mut clipboard_write: Option<String> = None;
 
+                // daw_01 #067: composition 確定/取消の Enter/Esc を rename commit/cancel に
+                // 昇格させないための guard (詳細は TextInputState.composing_last_frame)。
+                let preedit_was_active = !state.preedit.is_empty();
+                let prev_composing = state.composing_last_frame;
+                let ime_activity = !ime_events.is_empty();
+                let mut composition_key_this_frame = false;
+                let composition_active = preedit_was_active || ime_activity || prev_composing;
+
                 // IME 先: preedit 開始時に selection を範囲削除して collapse、
                 // commit は (preedit 経由で既に collapse 済みのはずだが念のため) 再度範囲削除して insert。
                 for ev in ime_events {
@@ -341,10 +359,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         // DAW の数値入力 (BPM / time_sig / 拍数 / ピッチ等) でテンキー Enter を
                         // 多用する慣習 (Cubase / REAPER / Logic 全部 numpad Enter で commit)。
                         PhysicalKey::Enter | PhysicalKey::NumpadEnter => {
-                            committed = true;
+                            // daw_01 #067: composition 確定 Enter は IME が消費したものとみなし
+                            // commit に昇格させない。素の Enter は従来どおり commit。
+                            composition_key_this_frame = true;
+                            if !composition_active {
+                                committed = true;
+                            }
                         }
                         PhysicalKey::Escape => {
-                            escape_pressed = true;
+                            // daw_01 #067 (副次): composition 取消 Esc を rename cancel に波及させない。
+                            composition_key_this_frame = true;
+                            if !composition_active {
+                                escape_pressed = true;
+                            }
                         }
                         // (M14 Phase 86 / daw_01 #057) ↑↓ は text_input 単一行では未使用なので
                         // edge を Response に積んで caller に委譲 (type-ahead picker / combobox 用)。
@@ -422,6 +449,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 state.anchor_byte = anchor.min(working.len());
                 // M14 Phase 59: buffer_text に書き戻す (frame 跨ぎの source-of-truth)
                 state.buffer_text.clone_from(&working);
+                // daw_01 #067: composition 活動があり、その確定/取消 key が **この frame に
+                // 来ていない** ときだけ次フレーム guard を立てる (batched なら false)。
+                state.composing_last_frame = ime_activity && !composition_key_this_frame;
                 // displayed_text も typing 後の値に更新 (描画 / IME / committed_text 用)
                 displayed_text = working;
                 if let Some(s) = clipboard_write {
@@ -1438,5 +1468,115 @@ mod tests {
         };
         let observed = run_input_frame(&mut host, &mut scene, screen, "abc", input);
         assert_eq!(observed.as_deref(), Some("abZ"), "範囲外 end は末尾に clamp");
+    }
+
+    // ============================================================================
+    // daw_01 #067: IME composition 確定 Enter を text_input commit に昇格させない
+    // ============================================================================
+
+    /// 1 frame 回して `resp.committed` を返す。
+    fn committed_for(
+        host: &mut UiHost<()>,
+        scene: &mut Scene,
+        screen: PhysicalSize,
+        input: FrameInput,
+    ) -> bool {
+        let committed = std::cell::Cell::new(false);
+        let mut m = ();
+        host.frame(&mut m, scene, screen, input, |(), ui| {
+            let resp = ui.text_input_at_focused(
+                "ti",
+                Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
+                "abc",
+                |_new| Edit::mutate(|()| {}),
+            );
+            committed.set(resp.committed);
+        });
+        committed.get()
+    }
+
+    /// Commit と Enter が同 frame (batched) → Enter は commit に昇格しない。
+    #[test]
+    fn ime_commit_enter_same_frame_does_not_commit() {
+        use crate::input::ImeEvent;
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        run_focus_frame(&mut host, &mut scene, screen, "abc");
+        scene.clear();
+
+        let input = FrameInput {
+            ime: vec![ImeEvent::Commit("猫".to_string())],
+            keyboard: vec![key_pressed(PhysicalKey::Enter)],
+            ..Default::default()
+        };
+        assert!(
+            !committed_for(&mut host, &mut scene, screen, input),
+            "composition 確定と同 frame の Enter は commit しない (daw_01 #067)"
+        );
+    }
+
+    /// Commit と Enter が別 frame に割れても (frame 跨ぎ guard) → Enter は commit しない。
+    #[test]
+    fn ime_commit_then_split_enter_does_not_commit() {
+        use crate::input::ImeEvent;
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        run_focus_frame(&mut host, &mut scene, screen, "abc");
+        scene.clear();
+
+        // frame: Commit のみ (Enter は次 frame に割れる)。
+        let _ = committed_for(
+            &mut host,
+            &mut scene,
+            screen,
+            FrameInput { ime: vec![ImeEvent::Commit("猫".to_string())], ..Default::default() },
+        );
+        scene.clear();
+        // frame: Enter のみ → composing_last_frame guard で抑制。
+        let c = committed_for(
+            &mut host,
+            &mut scene,
+            screen,
+            frame_with_keys(vec![key_pressed(PhysicalKey::Enter)], Modifiers::default()),
+        );
+        assert!(!c, "frame 跨ぎで割れた確定 Enter も commit しない (daw_01 #067)");
+    }
+
+    /// batched commit の **直後**に押す意図的な submit Enter は commit する
+    /// (daw_01 提案の単純 1-frame bool だと誤抑制する箇所を refine で回避していることの検証)。
+    #[test]
+    fn deliberate_enter_after_batched_commit_commits() {
+        use crate::input::ImeEvent;
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        run_focus_frame(&mut host, &mut scene, screen, "abc");
+        scene.clear();
+
+        // frame: Commit + Enter batched → 抑制 (composing_last_frame は false に落ちる)。
+        let _ = committed_for(
+            &mut host,
+            &mut scene,
+            screen,
+            FrameInput {
+                ime: vec![ImeEvent::Commit("猫".to_string())],
+                keyboard: vec![key_pressed(PhysicalKey::Enter)],
+                ..Default::default()
+            },
+        );
+        scene.clear();
+        // frame: 意図的な submit Enter → commit する (誤抑制しない)。
+        let c = committed_for(
+            &mut host,
+            &mut scene,
+            screen,
+            frame_with_keys(vec![key_pressed(PhysicalKey::Enter)], Modifiers::default()),
+        );
+        assert!(c, "batched commit 直後の意図的 submit Enter は commit する");
     }
 }
