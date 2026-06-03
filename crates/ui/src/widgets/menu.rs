@@ -1308,4 +1308,32 @@ mod tests {
         });
         assert_eq!(model.picked, Some(0), "item0 click → on_select(0) 発火");
     }
+
+    /// M14 Phase 100 (#071 review): open 中 popup の **外** を **右クリック** すると閉じる
+    /// (popup_layer の outside-close に secondary_just_pressed を含めた regression test)。
+    #[test]
+    fn context_menu_at_secondary_press_outside_closes() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        // frame 1: (50,60) で開く (anchor = {50,60,180,48} = x[50,230) y[60,108))。
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.context_menu_at("ctx", Some((50.0, 60.0)), &["Alpha", "Beta"], |_idx, _ui| {});
+        });
+        // frame 2: anchor 外 (300,250) を右クリック → 閉じる。
+        scene.clear();
+        let rclick_outside = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((300.0, 250.0)),
+                secondary_just_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        host.frame_to_edits(&(), &mut scene, screen, rclick_outside, |(), ui| {
+            ui.context_menu_at("ctx", None, &["Alpha", "Beta"], |_idx, _ui| {});
+        });
+        let texts: Vec<&str> = scene.iter_popup_glyphs().map(|g| g.text.as_ref()).collect();
+        assert!(texts.is_empty(), "anchor 外の右クリックで popup が閉じる: {texts:?}");
+    }
 }

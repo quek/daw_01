@@ -1008,6 +1008,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     ///
     /// modal popup の click consumption ルール:
     /// - `anchor` の **外** で `primary_just_pressed` → popup close + click 消費 (closure 実行せず)
+    /// - `anchor` の **外** で `secondary_just_pressed` (右クリック) → popup close (**消費しない**)。
+    ///   右クリックは「今のメニューを閉じて、同じ右クリックで別のコンテキストメニューを開く」
+    ///   (close-old / open-new、DAW 標準) を成立させるため consume しない (M14 Phase 100、#071 review)
     /// - `anchor` の **内** で click → closure 内 widget で処理、popup_layer 出口で click 消費
     ///   (popup の下にある widget には click が流れない)
     ///
@@ -1034,8 +1037,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // M14 Phase 94 (daw_01 #065): close 判定は **生 pointer** (`popup_pointer`) で行う。
         // 真のモーダル中は `self.pointer` が masking されて pos = None になっているため、
         // ここで masked pointer を読むと outside-click close / ESC が効かなくなる。
+        // M14 Phase 100 (#071 review): primary だけでなく **secondary (右) press** も outside-click
+        // 扱いにする。右クリックで開いたコンテキストメニューを、別の場所の右クリックで閉じられない
+        // (popup が居残る / 二重に開く) 既存 UX 制約の解消。右クリックは「outside で close」 まで行うが
+        // **consume はしない** (下記、 close-old / open-new を同 press で成立させる)。
         let pp = self.popup_pointer();
-        let outside_click = pp.primary_just_pressed
+        let secondary_outside = pp.secondary_just_pressed;
+        let outside_click = (pp.primary_just_pressed || secondary_outside)
             && pp.pos.is_some_and(|(px, py)| {
                 !self
                     .open_popups
@@ -1044,11 +1052,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             });
         if outside_click {
             if state.dismiss_on_outside_click {
-                // popup を閉じる + クリック消費 (modal なら他 widget に流さない)
+                // popup を閉じる。primary の場合のみ click 消費 (modal なら他 widget に流さない)。
+                // secondary (右) は **消費しない** — 同じ右クリックが別の context_menu を開く /
+                // arrangement の SecondaryClickEmpty を発火する余地を残し、close-old / open-new を
+                // 成立させる (右クリックの dismiss は「閉じる」 のみで gesture を奪わない)。
                 self.open_popups.remove(&wid);
                 self.pending_focus = state.prev_focus;
                 self.focus_changed_this_frame = true;
-                if state.modal {
+                if state.modal && !secondary_outside {
                     self.consume_pointer_click();
                 }
                 return;
