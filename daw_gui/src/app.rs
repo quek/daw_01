@@ -1020,6 +1020,10 @@ pub struct AppData {
     /// 起動時 auto-launch せず、 Vocal track 選択 / Synth ボタン押下等で初めて
     /// `ensure_voicevox_engine()` が `true` にして background spawn する。
     pub voicevox_launch_attempted: bool,
+    /// 口パク (lip-sync) 自動再生成の debounce 用世代カウンタ。song 変更で
+    /// bump し、`mark_lipsync_dirty` が timer thread に値を渡す。timer 発火時に
+    /// 値が一致していれば (= それ以降変更なし) 再生成する (rapid 編集を coalesce)。
+    pub lipsync_gen: u64,
     pub is_rescanning: bool,
     pub status_message: String,
 
@@ -1392,6 +1396,7 @@ impl AppData {
             voicevox_job,
             supervisor,
             voicevox_launch_attempted: false,
+            lipsync_gen: 0,
             is_rescanning: false,
             status_message: String::new(),
             track_rename_idx: None,
@@ -2172,6 +2177,8 @@ impl AppData {
                 | AppEvent::AddInstrumentTrack
                 | AppEvent::GroupSelectedTracks { .. }
                 | AppEvent::SetTrackParent { .. }
+                | AppEvent::SetLipsyncTarget { .. }
+                | AppEvent::SetMouthMapSlot { .. }
                 | AppEvent::RemoveLastTrack
                 | AppEvent::CommitRenameTrack
                 | AppEvent::CommitRenameClip
@@ -2633,6 +2640,21 @@ pub enum DeferredEdit {
     DeleteTrack { track_id: u32 },
     UngroupTracks { track_ids: Vec<u32> },
     RemoveSlot { track_id: u32, slot: PluginSlot },
+}
+
+/// 口パク (lip-sync) 背景ジョブの 1 vocal clip 分の結果。`query_phonemes` の
+/// 出力と、生成先 clip の配置情報 (start / length / earliest note) をまとめて
+/// main thread へ渡す (`AppEvent::LipsyncGenerated`)。docs/plan_pakupaku.md §7。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LipsyncClipResult {
+    /// 生成先 clip の start_beat (= 元 vocal clip と揃える)。
+    pub clip_start_beat: f64,
+    /// 生成先 clip の length_beats (= 元 vocal clip と揃える)。
+    pub clip_len_beats: f64,
+    /// clip 内 earliest note の clip-local start_beat (REST offset 配置の基準)。
+    pub first_note_local_beat: f64,
+    /// VOICEVOX phoneme 列 (先頭/末尾 pau 込み、frame 0 起点)。
+    pub phonemes: Vec<common::voicevox::Phoneme>,
 }
 
 /// 既存の event handler と一貫性を保つため、enum 全体に `#[allow(dead_code)]`
@@ -3423,6 +3445,30 @@ pub enum AppEvent {
     /// VOICEVOX engine `/singers` の取得結果。 起動時 background thread が
     /// 1 度発行する。 失敗時は空 Vec で送る。
     SingersLoaded(Vec<common::voicevox::VoiceVoxSinger>),
+    /// 口パク (lip-sync) 背景ジョブ完了。`regenerate_lipsync_for_track` が
+    /// spawn したスレッドが `query_phonemes` の結果を vocal clip 単位で詰めて
+    /// 発行し、handler (`apply_lipsync_generated`) が口 track へ反映する。
+    /// 派生データなので Undo 対象外 (= `is_undoable` に入れない)。
+    LipsyncGenerated {
+        vocal_track_id: u32,
+        bpm: f32,
+        clips: Vec<LipsyncClipResult>,
+    },
+    /// Track Inspector: vocal track の口パク出力先 (口 track id) を設定。
+    /// `None` で解除。設定後に口パクを再生成する。
+    SetLipsyncTarget { track: u32, target: Option<u32> },
+    /// Track Inspector: 口 track の `mouth_map` の 1 slot (口形状 →
+    /// ImageSourceId) を設定。`0` で解除。設定後、この口 track を出力先に
+    /// している vocal track の口パクを再生成する。
+    SetMouthMapSlot {
+        track: u32,
+        shape: common::model::MouthShape,
+        source_id: common::model::ImageSourceId,
+    },
+    /// 口パク自動再生成 debounce timer の発火。`mark_lipsync_dirty` が
+    /// 立てた timer thread が送る。`lipsync_gen` と一致するときだけ
+    /// (= それ以降変更なし) 全 bound vocal track を再生成する。Undo 対象外。
+    LipsyncDebounceFired(u64),
     /// Track Inspector の Vocal speaker dropdown で選択された singer。
     /// `track.source` を `InstrumentSource::Vocal { speaker_id, style_name }`
     /// に書き換える。 Vocal 以外の track に対しては no-op。
@@ -5143,6 +5189,29 @@ impl AppData {
                 );
                 self.singers = singers;
             }
+            AppEvent::LipsyncGenerated { vocal_track_id, bpm, clips } => {
+                self.apply_lipsync_generated(vocal_track_id, bpm, clips);
+            }
+            AppEvent::SetLipsyncTarget { track, target } => {
+                self.set_lipsync_target(track, target);
+            }
+            AppEvent::SetMouthMapSlot { track, shape, source_id } => {
+                self.set_mouth_map_slot(track, shape, source_id);
+            }
+            AppEvent::LipsyncDebounceFired(generation) => {
+                if generation == self.lipsync_gen {
+                    let ids: Vec<u32> = self
+                        .song
+                        .tracks
+                        .iter()
+                        .filter(|t| t.lipsync_target_track.is_some())
+                        .map(|t| t.id)
+                        .collect();
+                    for id in ids {
+                        self.regenerate_lipsync_for_track(id);
+                    }
+                }
+            }
             AppEvent::SetTrackSpeaker { track, speaker_id, style_name } => {
                 self.set_track_speaker(track, speaker_id, style_name);
             }
@@ -5283,6 +5352,8 @@ impl AppData {
         // 既存 vocal block (= track.instrument is None の旧 project) には
         // 影響しない (= sync_vocal_metadata 内で format check で skip)。
         self.sync_vocal_metadata();
+        // 口パク自動再生成 (binding 済み vocal track のみ、debounce 付き)。
+        self.mark_lipsync_dirty();
     }
 
     // -------- File ----------------------------------------------------------
@@ -6888,6 +6959,216 @@ impl AppData {
                 entries,
             });
         }
+    }
+
+    /// 口パク (lip-sync) を再生成する (docs/plan_pakupaku.md §7)。`vocal_track_id`
+    /// の各 clip の notes を snapshot し、背景スレッドで `query_phonemes`
+    /// (`sing_frame_audio_query` のみ) を叩いて結果を `AppEvent::LipsyncGenerated`
+    /// で main thread へ返す。binding (`lipsync_target_track`) 未設定 / 口 track の
+    /// `mouth_map` 未設定 / notes を持つ clip 無し のときは no-op。歌唱のみ (Q6)。
+    pub fn regenerate_lipsync_for_track(&mut self, vocal_track_id: u32) {
+        let Some(vocal) = self.song.tracks.iter().find(|t| t.id == vocal_track_id) else {
+            return;
+        };
+        let Some(target_id) = vocal.lipsync_target_track else {
+            return;
+        };
+        // 口 track が存在し mouth_map が設定済みか (= 生成する意味があるか)。
+        let configured = self.song.tracks.iter().any(|t| {
+            t.id == target_id && t.mouth_map.as_ref().is_some_and(|m| m.is_configured())
+        });
+        if !configured {
+            return;
+        }
+        let bpm = self.song.bpm;
+        // notes を持つ各 vocal clip を snapshot (配置情報 + notes の owned copy)。
+        let mut snaps: Vec<(f64, f64, f64, Vec<common::model::Note>)> = Vec::new();
+        for clip in &vocal.clips {
+            let Some(notes) = self
+                .song
+                .clip_contents
+                .get(&clip.content_id)
+                .and_then(|c| c.notes())
+            else {
+                continue;
+            };
+            if notes.is_empty() {
+                continue;
+            }
+            let first_note_local_beat = notes
+                .iter()
+                .map(|n| n.start_beat)
+                .fold(f64::INFINITY, f64::min);
+            snaps.push((
+                clip.start_beat,
+                clip.length_beats,
+                first_note_local_beat,
+                notes.to_vec(),
+            ));
+        }
+        if snaps.is_empty() {
+            return;
+        }
+        self.ensure_voicevox_engine();
+        let proxy = self.event_proxy.clone();
+        std::thread::spawn(move || {
+            let mut clips = Vec::with_capacity(snaps.len());
+            for (clip_start_beat, clip_len_beats, first_note_local_beat, notes) in snaps {
+                match common::voicevox::query_phonemes(&notes, bpm) {
+                    Ok(phonemes) => clips.push(LipsyncClipResult {
+                        clip_start_beat,
+                        clip_len_beats,
+                        first_note_local_beat,
+                        phonemes,
+                    }),
+                    Err(e) => {
+                        tracing::warn!(error = ?e, vocal_track_id, "lip-sync phoneme query failed");
+                    }
+                }
+            }
+            // 全 clip が失敗したら既存 clip を温存 (transient な engine 落ち対策)。
+            if !clips.is_empty() {
+                proxy.send(AppEvent::LipsyncGenerated {
+                    vocal_track_id,
+                    bpm,
+                    clips,
+                });
+            }
+        });
+    }
+
+    /// `AppEvent::LipsyncGenerated` handler。口 track の自動生成 clip
+    /// (`auto_lipsync == true`) を全て差し替える。派生データなので Undo
+    /// snapshot は積まない (user 編集側が Undo 対象、手編集は保持しない = Q8)。
+    fn apply_lipsync_generated(
+        &mut self,
+        vocal_track_id: u32,
+        bpm: f32,
+        results: Vec<LipsyncClipResult>,
+    ) {
+        // HTTP 中に song が変わっている可能性があるため id ベースで再解決。
+        let Some(target_id) = self
+            .song
+            .tracks
+            .iter()
+            .find(|t| t.id == vocal_track_id)
+            .and_then(|t| t.lipsync_target_track)
+        else {
+            return;
+        };
+        let Some(m_idx) = self.song.tracks.iter().position(|t| t.id == target_id) else {
+            return;
+        };
+        let Some(mouth_map) = self.song.tracks[m_idx].mouth_map.clone() else {
+            return;
+        };
+        // 既存の自動生成 clip を全削除 (手編集保持しない)。
+        self.song.tracks[m_idx].clips.retain(|c| !c.auto_lipsync);
+        // 各 vocal clip 分の口画像 clip を生成して口 track へ追加。
+        for r in &results {
+            let events = common::lipsync::build_mouth_events(
+                &r.phonemes,
+                &mouth_map,
+                bpm,
+                r.first_note_local_beat,
+                r.clip_len_beats,
+            );
+            if events.is_empty() {
+                continue;
+            }
+            let content_id = self.song.alloc_content(
+                common::model::ClipContent::Image(common::model::ImageContent { events }),
+                "口パク".to_string(),
+            );
+            let m = &mut self.song.tracks[m_idx];
+            let clip_id = m.alloc_clip_id();
+            m.clips.push(Clip {
+                id: clip_id,
+                name: String::new(),
+                start_beat: r.clip_start_beat,
+                length_beats: r.clip_len_beats,
+                content_id,
+                notes: Vec::new(),
+                color: None,
+                auto_lipsync: true,
+            });
+        }
+        // 削除した古い clip の content を回収。
+        self.song.gc_clip_contents();
+        self.is_dirty = true;
+    }
+
+    /// `SetLipsyncTarget` handler。vocal track の出力先 binding を更新し、
+    /// 設定時は口パクを再生成する (snapshot は `is_undoable` 経由で handler
+    /// 前に取得済み = binding 変更を undo 可能)。
+    fn set_lipsync_target(&mut self, track_id: u32, target: Option<u32>) {
+        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+            return;
+        };
+        t.lipsync_target_track = target;
+        self.is_dirty = true;
+        if target.is_some() {
+            self.regenerate_lipsync_for_track(track_id);
+        }
+    }
+
+    /// `SetMouthMapSlot` handler。口 track の `mouth_map` の 1 slot を更新し、
+    /// この口 track を出力先にしている vocal track の口パクを再生成する。
+    fn set_mouth_map_slot(
+        &mut self,
+        track_id: u32,
+        shape: common::model::MouthShape,
+        source_id: common::model::ImageSourceId,
+    ) {
+        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+            return;
+        };
+        let map = t
+            .mouth_map
+            .get_or_insert_with(common::model::MouthMap::default);
+        match shape {
+            common::model::MouthShape::A => map.a = source_id,
+            common::model::MouthShape::I => map.i = source_id,
+            common::model::MouthShape::U => map.u = source_id,
+            common::model::MouthShape::E => map.e = source_id,
+            common::model::MouthShape::O => map.o = source_id,
+            common::model::MouthShape::N => map.n = source_id,
+            common::model::MouthShape::Closed => map.closed = source_id,
+        }
+        self.is_dirty = true;
+        // この口 track を出力先にしている vocal track を再生成する。
+        let vocal_ids: Vec<u32> = self
+            .song
+            .tracks
+            .iter()
+            .filter(|v| v.lipsync_target_track == Some(track_id))
+            .map(|v| v.id)
+            .collect();
+        for vid in vocal_ids {
+            self.regenerate_lipsync_for_track(vid);
+        }
+    }
+
+    /// song 変更時に呼ぶ (= `sync_song_to_plugin_host` から)。binding を持つ
+    /// vocal track があれば debounce timer を立て、quiet period (400ms) 後に
+    /// `LipsyncDebounceFired` を送る。rapid 編集 (歌詞タイプ等) は世代カウンタで
+    /// coalesce され、最後の 1 回だけ再生成される。
+    fn mark_lipsync_dirty(&mut self) {
+        if !self
+            .song
+            .tracks
+            .iter()
+            .any(|t| t.lipsync_target_track.is_some())
+        {
+            return;
+        }
+        self.lipsync_gen = self.lipsync_gen.wrapping_add(1);
+        let generation = self.lipsync_gen;
+        let proxy = self.event_proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            proxy.send(AppEvent::LipsyncDebounceFired(generation));
+        });
     }
 
     fn action_add_instrument_track(&mut self) {

@@ -121,6 +121,18 @@ const CHAIN_LIST_STYLE: ReorderableListStyle = ReorderableListStyle {
     drag_handle_w: 0.0,
 };
 
+/// import 済み image source の表示名 (ファイル名)。口パク mapping dropdown 用。
+fn image_source_label(src: &common::model::ImageSource) -> String {
+    let path = match &src.path {
+        common::model::ImageSourcePath::ProjectRelative(p)
+        | common::model::ImageSourcePath::Absolute(p) => p,
+    };
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("?")
+        .to_string()
+}
+
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     ui.panel("inspector_bg", area, BG, 0.0);
 
@@ -1484,6 +1496,171 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             }));
         }
         y += 30.0;
+    }
+
+    // ---- 口パク (lip-sync) 出力先 binding ----------------------------
+    // Vocal track のみ。生成した口画像 ImageEvent を焼き込む先の口 track
+    // (立ち絵 group の子 image track) を選ぶ。設定で再生成が走る。
+    if let Some(track) = app.song.tracks.get(app.cursor_track_index().unwrap_or(0))
+        && matches!(track.source, common::model::InstrumentSource::Vocal { .. })
+    {
+        let self_id = track.id;
+        // 候補: 自分以外の全 track (= 口 track はどれでも選べる)。
+        let candidates: Vec<(u32, String)> = app
+            .song
+            .tracks
+            .iter()
+            .filter(|t| t.id != self_id)
+            .map(|t| {
+                (
+                    t.id,
+                    if t.name.is_empty() {
+                        format!("Track {}", t.id)
+                    } else {
+                        t.name.clone()
+                    },
+                )
+            })
+            .collect();
+        ui.label_at(
+            "inspector_lipsync_target_label",
+            "口パク出力先",
+            area.x + pad,
+            y,
+            12.0,
+            TEXT_DIM,
+        );
+        y += 18.0;
+        let dropdown_rect = Rect {
+            x: area.x + pad,
+            y,
+            w: area.w - pad * 2.0,
+            h: 24.0,
+        };
+        let mut labels: Vec<String> = Vec::with_capacity(candidates.len() + 1);
+        labels.push("(なし)".into());
+        labels.extend(candidates.iter().map(|(_, n)| n.clone()));
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let selected_idx = match track.lipsync_target_track {
+            None => 0,
+            Some(tid) => candidates
+                .iter()
+                .position(|(id, _)| *id == tid)
+                .map(|i| i + 1)
+                .unwrap_or(0),
+        };
+        if let Some(picked) = ui.dropdown(
+            "inspector_lipsync_target_dropdown",
+            dropdown_rect,
+            &label_refs,
+            selected_idx,
+        ) {
+            let target = if picked == 0 {
+                None
+            } else {
+                candidates.get(picked - 1).map(|(id, _)| *id)
+            };
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetLipsyncTarget {
+                    track: self_id,
+                    target,
+                });
+            }));
+        }
+        y += 30.0;
+    }
+
+    // ---- 口パク mapping (口形状 → 画像) -------------------------------
+    // この track を口パク出力先に指定している vocal track があるとき、7 形状
+    // (a/i/u/e/o/N/閉口) の画像割当を表示する。各 slot は import 済み image を選ぶ。
+    if let Some(track) = app.song.tracks.get(app.cursor_track_index().unwrap_or(0)) {
+        let this_id = track.id;
+        let is_target = app
+            .song
+            .tracks
+            .iter()
+            .any(|t| t.lipsync_target_track == Some(this_id));
+        if is_target {
+            ui.label_at(
+                "inspector_mouthmap_label",
+                "口パク (口形状 → 画像)",
+                area.x + pad,
+                y,
+                12.0,
+                TEXT_DIM,
+            );
+            y += 18.0;
+            // import 済み image source の (id, ファイル名) 一覧 (id 昇順)。
+            let mut images: Vec<(common::model::ImageSourceId, String)> = app
+                .song
+                .image_sources
+                .iter()
+                .map(|(id, src)| (*id, image_source_label(src)))
+                .collect();
+            images.sort_by_key(|(id, _)| *id);
+            let map = track.mouth_map.clone().unwrap_or_default();
+            const SHAPES: [(common::model::MouthShape, &str); 7] = [
+                (common::model::MouthShape::A, "あ"),
+                (common::model::MouthShape::I, "い"),
+                (common::model::MouthShape::U, "う"),
+                (common::model::MouthShape::E, "え"),
+                (common::model::MouthShape::O, "お"),
+                (common::model::MouthShape::N, "ん"),
+                (common::model::MouthShape::Closed, "閉"),
+            ];
+            let mut labels: Vec<String> = Vec::with_capacity(images.len() + 1);
+            labels.push("(なし)".into());
+            labels.extend(images.iter().map(|(_, n)| n.clone()));
+            let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            for (slot_i, (shape, shape_label)) in SHAPES.iter().enumerate() {
+                ui.label_at(
+                    format!("inspector_mouthmap_slot_label_{slot_i}"),
+                    shape_label,
+                    area.x + pad,
+                    y + 5.0,
+                    11.0,
+                    TEXT_DIM,
+                );
+                let dropdown_rect = Rect {
+                    x: area.x + pad + 40.0,
+                    y,
+                    w: area.w - pad * 2.0 - 40.0,
+                    h: 22.0,
+                };
+                let cur = map.get(*shape);
+                let selected_idx = if cur == 0 {
+                    0
+                } else {
+                    images
+                        .iter()
+                        .position(|(id, _)| *id == cur)
+                        .map(|i| i + 1)
+                        .unwrap_or(0)
+                };
+                if let Some(picked) = ui.dropdown(
+                    format!("inspector_mouthmap_dropdown_{slot_i}"),
+                    dropdown_rect,
+                    &label_refs,
+                    selected_idx,
+                ) {
+                    let source_id = if picked == 0 {
+                        0
+                    } else {
+                        images.get(picked - 1).map(|(id, _)| *id).unwrap_or(0)
+                    };
+                    let shape = *shape;
+                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetMouthMapSlot {
+                            track: this_id,
+                            shape,
+                            source_id,
+                        });
+                    }));
+                }
+                y += 26.0;
+            }
+            y += 4.0;
+        }
     }
 
     // 「Chain」見出し
