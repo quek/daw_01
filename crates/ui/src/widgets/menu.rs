@@ -14,6 +14,7 @@
 
 use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
 
+use crate::input::PointerFrame;
 use crate::ui::Ui;
 
 /// menu item の click 時に実行される closure 型 (M9 P1-5 で `&mut Ui<'_, M>` を受け取る形に変更)。
@@ -201,95 +202,36 @@ impl<'a, M: ?Sized + 'static> MenuBuilder<'a, M> {
 }
 
 /// menu_bar 全体を構築するためのビルダー。`Ui::menu_bar` で受け取る。
-pub struct MenuBarBuilder<'b, 'a, M: ?Sized + 'static> {
-    ui: &'b mut Ui<'a, M>,
-    bar_rect: Rect,
-    next_x: f32,
+///
+/// M14 Phase 98 (daw_01 #070): `menu()` 呼び出し時は entries を **収集するだけ** で、
+/// layout / 入力処理 (open / close / toggle / hover 切替) / 描画は全 top-level menu が
+/// 出揃った後に `Ui::menu_bar` がまとめて行う (two-phase)。これにより「open 中 menu の
+/// popup anchor が隣ラベルの click を消費して切替不能」だった bug を構造的に解消する
+/// (切替判断を popup_layer 呼び出しより前の 1 箇所に集約)。
+pub struct MenuBarBuilder<'a, M: ?Sized + 'static> {
+    menus: Vec<(&'static str, Vec<MenuEntry<'a, M>>)>,
 }
 
-impl<'b, 'a, M: ?Sized + 'static> MenuBarBuilder<'b, 'a, M> {
+impl<'a, M: ?Sized + 'static> Default for MenuBarBuilder<'a, M> {
+    fn default() -> Self {
+        Self { menus: Vec::new() }
+    }
+}
+
+impl<'a, M: ?Sized + 'static> MenuBarBuilder<'a, M> {
     /// "File" / "Edit" 等の top-level menu を 1 つ追加する。
     /// `f` は `MenuBuilder` を受け取り `item()` / `sub_menu()` を順に並べる。
+    ///
+    /// M14 Phase 98 (daw_01 #070): ここでは entries を収集するだけ。実際の
+    /// open / close / toggle / hover 切替 / 描画は、全 menu が出揃ってから
+    /// `Ui::menu_bar` が 1 箇所で行う。
     pub fn menu<F>(&mut self, label: &'static str, f: F)
     where
         F: FnOnce(&mut MenuBuilder<'a, M>),
     {
         let mut builder = MenuBuilder::default();
         f(&mut builder);
-        let label_w = (label.chars().count() as f32) * 8.0 + MENU_PAD_X * 2.0;
-        let label_rect = Rect {
-            x: self.bar_rect.x + self.next_x,
-            y: self.bar_rect.y,
-            w: label_w,
-            h: self.bar_rect.h,
-        };
-        self.next_x += label_w;
-
-        let pointer = self.ui.pointer();
-        let inside = pointer
-            .pos
-            .is_some_and(|(px, py)| label_rect.contains(px, py));
-        let menu_id = ("menu_bar_top", label);
-        let already_open = self.ui.is_popup_open(menu_id);
-
-        // popup_rect = entries 全体を含む rect。 auto-flip + clamp は
-        // popup_rect_below_or_above 任せ (画面下端 / 右端で安全)。
-        let n = builder.entries.len();
-        let popup_h = (n as f32) * MENU_ITEM_H;
-        let popup_rect = crate::popup::popup_rect_below_or_above(
-            label_rect,
-            MENU_W_DEFAULT,
-            popup_h,
-            self.ui.screen(),
-        );
-        let anchor = union_rect(label_rect, popup_rect);
-
-        // クリックで popup を toggle (click は consume)
-        if inside && pointer.primary_just_released {
-            if already_open {
-                self.ui.close_popup(menu_id);
-            } else {
-                self.ui.open_popup(menu_id, anchor, true);
-            }
-            self.ui.consume_pointer_click();
-        }
-
-        // top-level label の描画 (hover / open でハイライト)
-        let highlight = inside || self.ui.is_popup_open(menu_id);
-        if highlight {
-            self.ui.push_rect(RectCommand {
-                rect: label_rect,
-                fill: Color::rgb(0.20, 0.23, 0.28),
-                border: Color::TRANSPARENT,
-                border_width: 0.0,
-                radius: [2.0; 4],
-                clip_rect: None,
-            });
-        }
-        self.ui.push_text(GlyphArea {
-            text: label.into(),
-            left: label_rect.x + MENU_PAD_X,
-            top: label_rect.y + (label_rect.h - MENU_FONT * 1.2) * 0.5,
-            font_size: MENU_FONT,
-            line_height: MENU_FONT * 1.2,
-            color: Color::rgb(0.92, 0.94, 0.97),
-            clip_rect: None,
-            ..GlyphArea::default()
-        });
-
-        // popup 描画 (popup_layer 経由、sub-menu cascade を draw_menu_entries 内で再帰処理)
-        let mut clicked_action: Option<MenuItemAction<'a, M>> = None;
-        let id_path = format!("menu_bar/{label}");
-        let mut entries = builder.entries;
-        self.ui.popup_layer(menu_id, |ui| {
-            clicked_action = draw_menu_entries(ui, &mut entries, popup_rect, &id_path);
-        });
-        if let Some(action) = clicked_action {
-            // M9 P1-5 (C 案): action は &mut Ui を受け、closure 内で push_edit / request_undo
-            // 等の任意操作を行う。library 側は popup close のみ自動。
-            action(self.ui);
-            self.ui.close_popup(menu_id);
-        }
+        self.menus.push((label, builder.entries));
     }
 }
 
@@ -480,11 +422,61 @@ fn union_rect(a: Rect, b: Rect) -> Rect {
 }
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
+    /// menu_bar の top-level 入力処理 (open / close / toggle / hover 切替) を 1 箇所で行う。
+    /// `popup_layer` 描画より **前** に呼び、現在 open の menu (`open_idx`) と hover 中ラベル
+    /// (`hovered_idx`) から状態遷移を確定する。これにより隣 menu の popup anchor が click を
+    /// 消費する余地を構造的に排除する (daw_01 #070)。`anchors[i]` は union(label, popup)。
+    fn switch_menu_bar_top_level(
+        &mut self,
+        menus: &[(&'static str, Vec<MenuEntry<'a, M>>)],
+        anchors: &[Rect],
+        open_idx: Option<usize>,
+        hovered_idx: Option<usize>,
+        pointer: PointerFrame,
+    ) {
+        let Some(i) = hovered_idx else {
+            return;
+        };
+        let this_open = open_idx == Some(i);
+        let id_i = ("menu_bar_top", menus[i].0);
+        if pointer.primary_just_released {
+            // click: open 中の同ラベル → toggle close、別ラベル → 旧を閉じて切替/open。
+            if this_open {
+                self.close_popup(id_i);
+            } else {
+                if let Some(j) = open_idx {
+                    self.close_popup(("menu_bar_top", menus[j].0));
+                }
+                self.open_popup(id_i, anchors[i], true);
+            }
+            self.consume_pointer_click();
+        } else {
+            // hover 切替: いずれかが open 中に別ラベルへ pointer が乗ったら切替 (DAW 標準)。
+            // 「閉じている状態では hover で開かない」ため open_idx.is_some() を条件にする。
+            // ボタン押下中 (drag) は切替しない (release 時に上の click 経路で切替)。
+            if open_idx.is_some() && !this_open && !pointer.primary_pressed {
+                if let Some(j) = open_idx {
+                    self.close_popup(("menu_bar_top", menus[j].0));
+                }
+                self.open_popup(id_i, anchors[i], true);
+            }
+            // ラベル上の press は、open 中 popup の outside_click 誤判定を防ぐため消費する
+            // (popup anchor 幅に依存せず確実にブロック)。
+            if pointer.primary_just_pressed {
+                self.consume_pointer_click();
+            }
+        }
+    }
+
     /// menu_bar widget。`rect` 内に top-level menu のラベル列を描画。
     /// クリックでサブメニューを popup_layer 経由で開く。
+    ///
+    /// M14 Phase 98 (daw_01 #070): 全 top-level menu を収集してから layout → 入力 → 描画を
+    /// 行う two-phase 構成。切替判断を popup_layer より前に一元化し「open 中 menu の popup
+    /// anchor が隣ラベルの click を消費して切替不能」だった bug を解消する。
     pub fn menu_bar<F>(&mut self, rect: Rect, f: F)
     where
-        F: FnOnce(&mut MenuBarBuilder<'_, 'a, M>),
+        F: FnOnce(&mut MenuBarBuilder<'a, M>),
     {
         // 背景バー
         self.push_rect(RectCommand {
@@ -495,8 +487,99 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             radius: [0.0; 4],
             clip_rect: None,
         });
-        let mut builder = MenuBarBuilder { ui: self, bar_rect: rect, next_x: 0.0 };
+
+        // --- Phase 1: 全 top-level menu を収集 (描画も入力処理もまだしない) ---
+        let mut builder = MenuBarBuilder::default();
         f(&mut builder);
+        let menus = builder.menus;
+        if menus.is_empty() {
+            return;
+        }
+
+        // --- Phase 2: layout — 各ラベル rect / popup rect / anchor を全 menu 分先に確定 ---
+        // anchor は union(label, popup)。toggle-close で press/release が別フレームに割れたとき、
+        // popup_layer の outside_click (press 判定) がラベルを「外」と誤判定して即閉じる回帰を
+        // 防ぐためラベル帯を含める。
+        let mut label_rects: Vec<Rect> = Vec::with_capacity(menus.len());
+        let mut popup_rects: Vec<Rect> = Vec::with_capacity(menus.len());
+        let mut anchors: Vec<Rect> = Vec::with_capacity(menus.len());
+        let mut next_x = 0.0;
+        for (label, entries) in &menus {
+            let label_w = (label.chars().count() as f32) * 8.0 + MENU_PAD_X * 2.0;
+            let label_rect = Rect { x: rect.x + next_x, y: rect.y, w: label_w, h: rect.h };
+            next_x += label_w;
+            let popup_h = (entries.len() as f32) * MENU_ITEM_H;
+            let popup_rect = crate::popup::popup_rect_below_or_above(
+                label_rect,
+                MENU_W_DEFAULT,
+                popup_h,
+                self.screen(),
+            );
+            anchors.push(union_rect(label_rect, popup_rect));
+            label_rects.push(label_rect);
+            popup_rects.push(popup_rect);
+        }
+
+        // --- Phase 3: 入力処理 (popup_layer より前に open/close を確定) ---
+        let open_idx =
+            (0..menus.len()).find(|&i| self.is_popup_open(("menu_bar_top", menus[i].0)));
+        let pointer = self.pointer();
+        let hovered_idx = pointer
+            .pos
+            .and_then(|(px, py)| label_rects.iter().position(|r| r.contains(px, py)));
+        self.switch_menu_bar_top_level(&menus, &anchors, open_idx, hovered_idx, pointer);
+
+        // --- Phase 4: 描画 — ラベル列 + (open している menu のみ) popup ---
+        for (i, (label, entries)) in menus.into_iter().enumerate() {
+            let label_rect = label_rects[i];
+            let popup_rect = popup_rects[i];
+            let id = ("menu_bar_top", label);
+            let is_open = self.is_popup_open(id);
+
+            // top-level label (hover / open でハイライト)
+            if hovered_idx == Some(i) || is_open {
+                self.push_rect(RectCommand {
+                    rect: label_rect,
+                    fill: Color::rgb(0.20, 0.23, 0.28),
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [2.0; 4],
+                    clip_rect: None,
+                });
+            }
+            self.push_text(GlyphArea {
+                text: label.into(),
+                left: label_rect.x + MENU_PAD_X,
+                top: label_rect.y + (label_rect.h - MENU_FONT * 1.2) * 0.5,
+                font_size: MENU_FONT,
+                line_height: MENU_FONT * 1.2,
+                color: Color::rgb(0.92, 0.94, 0.97),
+                clip_rect: None,
+                ..GlyphArea::default()
+            });
+
+            if !is_open {
+                continue;
+            }
+
+            // open 中 menu の anchor を毎フレーム最新 layout に同期 (resize で popup が flip しても
+            // stale にならない)。
+            self.update_popup_anchor(id, anchors[i]);
+
+            // popup 描画 (popup_layer 経由、sub-menu cascade を draw_menu_entries 内で再帰処理)
+            let id_path = format!("menu_bar/{label}");
+            let mut entries = entries;
+            let mut clicked_action: Option<MenuItemAction<'a, M>> = None;
+            self.popup_layer(id, |ui| {
+                clicked_action = draw_menu_entries(ui, &mut entries, popup_rect, &id_path);
+            });
+            if let Some(action) = clicked_action {
+                // M9 P1-5 (C 案): action は &mut Ui を受け、closure 内で push_edit / request_undo
+                // 等の任意操作を行う。library 側は popup close のみ自動。
+                action(self);
+                self.close_popup(id);
+            }
+        }
     }
 
     /// 右クリックで popup を出す context_menu。library が右クリック検出を担当。
@@ -923,6 +1006,204 @@ mod tests {
             model.fired,
             "cascade item の click で action が発火する (= 親 popup の outside_click で\
              握りつぶされない)"
+        );
+    }
+
+    // ===== M14 Phase 98 (daw_01 #070): top-level menu 切替 =====
+    //
+    // File / Edit / View を並べ、各 menu に固有 item を 1 つ持たせる。top-level ラベルは
+    // 各 56px (File[0,56) / Edit[56,112) / View[112,168))。popup item text を
+    // `iter_popup_glyphs` で読み「どの menu が open か」を判定する (top-level ラベル自体は
+    // popup_layer の外で描かれるので popup glyphs には乗らない)。
+
+    fn build_three_menus(ui: &mut Ui<'_, ()>) {
+        ui.menu_bar(Rect { x: 0.0, y: 0.0, w: 800.0, h: 32.0 }, |bar| {
+            bar.menu("File", |m| {
+                m.item("file_only", |_| {});
+            });
+            bar.menu("Edit", |m| {
+                m.item("edit_only", |_| {});
+            });
+            bar.menu("View", |m| {
+                m.item("view_only", |_| {});
+            });
+        });
+    }
+
+    fn popup_texts(scene: &Scene) -> Vec<&str> {
+        scene.iter_popup_glyphs().map(|g| g.text.as_ref()).collect()
+    }
+
+    /// File が open 中に View ラベルを click → View に切替 (旧 File は閉じる)。主訴の修正。
+    #[test]
+    fn top_level_click_switches_to_other_menu() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        // Frame 1: File ラベル (20,16) を click → File open
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((20.0, 16.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| build_three_menus(ui),
+        );
+
+        // Frame 2: File open のまま View ラベル (130,16) を click → View へ切替
+        scene.clear();
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((130.0, 16.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| build_three_menus(ui),
+        );
+        let texts = popup_texts(&scene);
+        assert!(
+            texts.contains(&"view_only"),
+            "click で View へ切替 → View popup が描画される: {texts:?}"
+        );
+        assert!(
+            !texts.contains(&"file_only"),
+            "切替で旧 File popup は閉じる: {texts:?}"
+        );
+    }
+
+    /// いずれかが open 中に別ラベルへ hover (ボタン非押下) → 切替。
+    #[test]
+    fn top_level_hover_switches_when_a_menu_is_open() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        // Frame 1: File を click して open
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((20.0, 16.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| build_three_menus(ui),
+        );
+
+        // Frame 2: ボタンを押さず View ラベル (130,16) へ hover → View へ切替
+        scene.clear();
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((130.0, 16.0)),
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| build_three_menus(ui),
+        );
+        let texts = popup_texts(&scene);
+        assert!(
+            texts.contains(&"view_only"),
+            "hover で View へ切替 → View popup が描画される: {texts:?}"
+        );
+        assert!(
+            !texts.contains(&"file_only"),
+            "hover 切替で旧 File popup は閉じる: {texts:?}"
+        );
+    }
+
+    /// open 中の同ラベルを再 click → toggle close。
+    #[test]
+    fn top_level_click_on_open_label_toggles_closed() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        // Frame 1: File を click して open
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((20.0, 16.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| build_three_menus(ui),
+        );
+
+        // Frame 2: 同じ File ラベルを再 click → toggle close
+        scene.clear();
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((20.0, 16.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| build_three_menus(ui),
+        );
+        let texts = popup_texts(&scene);
+        assert!(
+            texts.is_empty(),
+            "open 中ラベルの再 click で popup が閉じる (toggle): {texts:?}"
+        );
+    }
+
+    /// 全 menu が閉じている状態では hover しても開かない (click で開く挙動は維持)。
+    #[test]
+    fn closed_menu_bar_does_not_open_on_hover() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        // hover のみ (click なし) → 何も開かない
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((20.0, 16.0)),
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| build_three_menus(ui),
+        );
+        let texts = popup_texts(&scene);
+        assert!(
+            texts.is_empty(),
+            "閉じている状態では hover で開かない: {texts:?}"
         );
     }
 }
