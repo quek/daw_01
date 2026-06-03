@@ -97,7 +97,7 @@ const TESTSRC_THRESHOLDS: ValidationThresholds = ValidationThresholds {
 };
 
 /// docs/plan_text_overlay.md §4 P3: text overlay smoke thresholds.
-/// シナリオは「AddTextClip 直後の default 「Title」 64 px white で
+/// シナリオは「track 上に追加した Text クリップの default 「Title」 64 px white が
 /// preview に描画されている」 こと。 期待値:
 ///
 /// - **unique_colors ≥ 20**: white text の anti-aliased edges + dark
@@ -211,8 +211,8 @@ pub fn spawn_orchestrator(fixture: PathBuf, proxy: EventLoopProxy<AppEvent>) {
 }
 
 /// docs/plan_text_overlay.md §4: text overlay 用の smoke orchestrator。
-/// 通常 smoke と違い fixture を取らず、 内部で `AddTextClip` を発火して
-/// default "Title" clip を生成 → preview を開いて Play → 1.5s 後に
+/// 通常 smoke と違い fixture を取らず、 内部で track 追加 + `AddTextClipAt` を
+/// 発火して default "Title" clip を生成 → preview を開いて Play → 1.5s 後に
 /// capture → `TEXT_OVERLAY_THRESHOLDS` で histogram 検証。 gui_01 Phase
 /// 78 (GlyphArea text effects) landing 後の runtime regression 検知用。
 pub fn spawn_text_overlay_orchestrator(proxy: EventLoopProxy<AppEvent>) {
@@ -230,12 +230,27 @@ pub fn spawn_text_overlay_orchestrator(proxy: EventLoopProxy<AppEvent>) {
             // cache; warm-cache reruns clear in ~700ms.
             thread::sleep(Duration::from_millis(1200));
 
-            // Phase 2: AddTextClip → 新 track + clip + 1 TextEvent
-            // (text="Title" / 64px / 中央横帯 / shadow.a=0.5 で
-            // gui_01 effects path も exercise する)。 handler は
-            // GUI thread で同期実行 (= action_add_text_clip)。
-            if proxy.send_event(AppEvent::AddTextClip).is_err() {
-                fail("event loop closed before AddTextClip could be sent");
+            // Phase 2: 普通の track を 1 本作り (AddInstrumentTrack)、 その
+            // track の beat 0 に Text クリップを追加する。 旧 AddTextClip
+            // (新規 track 自動生成版) は廃止され、 text は「text トラック」 では
+            // なく他 clip と同じくタイムライン上で生成する
+            // (docs/plan_text_clip_creation.md)。 fresh boot の Song::default は
+            // tracks 空 + next_track_id=1 なので最初の AddInstrumentTrack は
+            // id=1 を採番する (= AddTextClipAt の target が決定論的)。 default
+            // TextEvent は text="Title" / 64px / 中央横帯 / shadow.a=0.5 で
+            // gui_01 effects path も exercise する。 handler は GUI thread で
+            // 同期実行。
+            if proxy.send_event(AppEvent::AddInstrumentTrack).is_err() {
+                fail("event loop closed before AddInstrumentTrack could be sent");
+            }
+            if proxy
+                .send_event(AppEvent::AddTextClipAt {
+                    track: 1,
+                    start_beat: 0.0,
+                })
+                .is_err()
+            {
+                fail("event loop closed before AddTextClipAt could be sent");
             }
             thread::sleep(Duration::from_millis(400));
 

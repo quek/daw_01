@@ -31,8 +31,8 @@ struct CliArgs {
     smoke_test: Option<PathBuf>,
     /// `--smoke-test-text` 引数なし flag。 true のとき
     /// [`daw_gui::smoke_test::spawn_text_overlay_orchestrator`] が
-    /// AddTextClip → preview → Play → capture → text 描画 histogram で
-    /// assertion → process::exit(0/1)。 gui_01 Phase 78 runtime 検証用。
+    /// track 追加 + AddTextClipAt → preview → Play → capture → text 描画
+    /// histogram で assertion → process::exit(0/1)。 gui_01 Phase 78 runtime 検証用。
     /// 他の smoke / script 系と相互排他。
     smoke_test_text: bool,
 }
@@ -203,8 +203,8 @@ fn run_gui(
             }
 
             // `--smoke-test-text` → text overlay orchestrator drives
-            // AddTextClip → TogglePreviewWindow → Play and asserts the
-            // preview shows visible text. Mutually exclusive with the
+            // AddInstrumentTrack + AddTextClipAt → TogglePreviewWindow → Play
+            // and asserts the preview shows visible text. Mutually exclusive with the
             // fixture-based smoke (= CLI parser rejects the combination).
             #[cfg(windows)]
             if smoke_test_text {
