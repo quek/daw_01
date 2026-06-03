@@ -71,6 +71,11 @@ pub struct TrackMixEntry {
     /// このトラックの depth (parent_group_id を辿った段数)。 0 = master 直下、
     /// 1 = 1 段ネスト、… mixer strip / arrangement view が階層インデント描画に使う。
     pub depth: u8,
+    /// このトラックの effective 色 (明示上書き or id 由来の導出パレット色、
+    /// `track_color::effective_track_color`)。 mixer strip が左端の縦カラー
+    /// ストライプに使う (arrangement header の色ストライプと同じ idiom)。
+    /// master strip は色を持たず neutral 背景なので使わない。
+    pub color: [f32; 3],
 }
 
 impl Default for TrackMixEntry {
@@ -88,6 +93,7 @@ impl Default for TrackMixEntry {
             is_group: false,
             is_return: false,
             depth: 0,
+            color: [0.5, 0.5, 0.5],
         }
     }
 }
@@ -1623,6 +1629,7 @@ impl AppData {
                     is_group: is_group_set.contains(&t.id),
                     is_return: is_return_set.contains(&t.id),
                     depth: compute_depth(t.id),
+                    color: crate::view::track_color::effective_track_color(t),
                 }
             })
             .collect()
@@ -3459,12 +3466,17 @@ pub enum AppEvent {
     ImportVideo { paths: Vec<PathBuf> },
     /// v13 (`docs/plan_image_overlay.md` §P2): import one or more
     /// image files (PNG / JPEG / WebP / static), allocating an
-    /// `ImageSource` per file and a new Video-kind Track at the top
-    /// of the arrangement that holds the image as a PiP overlay.
-    /// Image clips default to full-screen (`x=0,y=0,w=1,h=1`); the
-    /// user shrinks/positions them in P5 drag handle UI or P4
-    /// inspector.
-    ImportImage { paths: Vec<PathBuf> },
+    /// `ImageSource` per file and a Clip holding the image as a PiP
+    /// overlay. `target_track_idx`: drag&drop の drop 位置から計算した
+    /// track index。 既存 track を指していればその track に貼り付け、
+    /// track が無い領域 (= 範囲外 index) / dialog 経由 (`None`) なら
+    /// arrangement 先頭に新規 track を作って貼る。
+    /// Image clips default to aspect-fit PiP; the user shrinks /
+    /// positions them in P5 drag handle UI or P4 inspector.
+    ImportImage {
+        paths: Vec<PathBuf>,
+        target_track_idx: Option<u32>,
+    },
     /// v13: open the platform file dialog filtered to supported image
     /// extensions and dispatch the selection as `AppEvent::ImportImage`.
     OpenImportImageDialog,
@@ -4693,8 +4705,8 @@ impl AppData {
                         "Video import は Windows 専用 (WMF 経由) です".into();
                 }
             }
-            AppEvent::ImportImage { paths } => {
-                self.action_import_image(paths);
+            AppEvent::ImportImage { paths, target_track_idx } => {
+                self.action_import_image(paths, target_track_idx);
             }
             AppEvent::OpenImportImageDialog => {
                 self.action_open_import_image_dialog();
@@ -14444,7 +14456,7 @@ impl AppData {
     ///
     /// Errors are accumulated; partial-success is permitted (= the
     /// status bar summarizes how many files succeeded / failed).
-    fn action_import_image(&mut self, paths: Vec<PathBuf>) {
+    fn action_import_image(&mut self, paths: Vec<PathBuf>, target_track_idx: Option<u32>) {
         if paths.is_empty() {
             return;
         }
@@ -14453,10 +14465,21 @@ impl AppData {
             .as_ref()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
 
-        // All imported image clips drop in at beat 0 by default. The
-        // user repositions them via drag on the arrangement timeline
-        // (= same operation as audio/video clips).
-        let next_start_beat = 0.0_f64;
+        // drop 位置から計算した track index が既存 track を指していれば、その
+        // track に画像 clip を貼り付ける (= ドロップしたトラックに追加)。 track の
+        // 無い下の領域 (= 範囲外 index) や dialog 経由 (None) は従来どおり
+        // arrangement 先頭 (index 0) に新規 track を作って貼る。
+        let dest_track_idx: Option<usize> =
+            resolve_image_drop_target(target_track_idx, self.song.tracks.len());
+
+        // 既存 track に貼るときは audio drop と同じく playhead を seed に順送り
+        // 配置 (複数枚を重ねない)。 新規 track 経路は各画像が自分の track を
+        // 持つので従来どおり beat 0 始まり。
+        let mut next_start_beat = if dest_track_idx.is_some() {
+            (self.playhead_beat.unwrap_or(0.0) as f64).max(0.0)
+        } else {
+            0.0_f64
+        };
         let image_clip_length_beats = (self.song.length_beats * 0.5).max(8.0);
 
         let mut imported_ok = 0usize;
@@ -14519,17 +14542,29 @@ impl AppData {
                 display_name.clone(),
             );
 
-            // 3) New Video-kind Track at the top of the arrangement so
-            // the image renders ABOVE existing video layers
-            // (= multi-track composite top-wins, plan_video §4 P7).
-            let image_track_id = self.song.alloc_track_id();
-            let mut image_track = Track {
-                id: image_track_id,
-                name: format!("{display_name} (Image)"),
-                ..Track::default()
+            // 3) 配置先 track を決める。
+            //    - 既存 track (drop 先): その index にそのまま貼る。
+            //    - 新規 track: arrangement 先頭 (index 0) に Video 用 track を
+            //      作って挿入 → 既存 video layer の上に合成される
+            //      (multi-track composite top-wins, plan_video §4 P7)。
+            let place_idx = match dest_track_idx {
+                Some(idx) => idx,
+                None => {
+                    let image_track_id = self.song.alloc_track_id();
+                    self.song.tracks.insert(
+                        0,
+                        Track {
+                            id: image_track_id,
+                            name: format!("{display_name} (Image)"),
+                            ..Track::default()
+                        },
+                    );
+                    0
+                }
             };
-            let i_clip_id = image_track.alloc_clip_id();
-            image_track.clips.push(Clip {
+            let track = &mut self.song.tracks[place_idx];
+            let i_clip_id = track.alloc_clip_id();
+            track.clips.push(Clip {
                 id: i_clip_id,
                 name: String::new(),
                 start_beat: next_start_beat,
@@ -14538,8 +14573,11 @@ impl AppData {
                 notes: Vec::new(),
                 color: None,
             });
-            // Insert at index 0 (= top of the arrangement).
-            self.song.tracks.insert(0, image_track);
+            // 既存 track に複数枚貼るときだけ順送り。 新規 track 経路は各画像が
+            // 自分の track を持つので beat 0 固定 (従来挙動)。
+            if dest_track_idx.is_some() {
+                next_start_beat += image_clip_length_beats;
+            }
             imported_ok += 1;
         }
 
@@ -14626,7 +14664,9 @@ impl AppData {
         if paths.is_empty() {
             return;
         }
-        self.action_import_image(paths);
+        // dialog 経由は drop 位置情報が無いので target_track_idx = None
+        // (= 新規 track を先頭に作って貼る、従来挙動)。
+        self.action_import_image(paths, None);
     }
 
     /// File menu → "Export Video..." (`docs/plan_video.md` P8)。
@@ -15547,6 +15587,39 @@ fn aspect_fit_pip_rect(
         let y = 0.0_f32;
         let x = (1.0 - w) * 0.5;
         (x, y, w, h)
+    }
+}
+
+/// 画像ドロップの配置先を解決する (`action_import_image` の core 判定)。
+/// `target_track_idx` は arrangement の drop 位置 (`position.y / row_h`) から
+/// 算出した track index。
+/// - `Some(idx)` (= 既存 track を指す): その track に画像 clip を貼る。
+/// - `None`: 新規 track を作って貼る。範囲外 index (= track の無い下の領域への
+///   ドロップ) と入力 `None` (= dialog 経由で位置情報なし) はどちらもこちら。
+fn resolve_image_drop_target(target_track_idx: Option<u32>, n_tracks: usize) -> Option<usize> {
+    target_track_idx.and_then(|i| {
+        let i = i as usize;
+        (i < n_tracks).then_some(i)
+    })
+}
+
+#[cfg(test)]
+mod image_drop_target_tests {
+    use super::resolve_image_drop_target;
+
+    #[test]
+    fn resolves_existing_track_or_falls_back_to_new() {
+        // 既存 track を指す → その index に貼り付け。
+        assert_eq!(resolve_image_drop_target(Some(0), 3), Some(0));
+        assert_eq!(resolve_image_drop_target(Some(2), 3), Some(2));
+        // 範囲外 index (= track の無い下の領域へのドロップ) → 新規 track (None)。
+        assert_eq!(resolve_image_drop_target(Some(3), 3), None);
+        assert_eq!(resolve_image_drop_target(Some(99), 3), None);
+        // dialog 経由 (= 入力 None、位置情報なし) → 新規 track (None)。
+        assert_eq!(resolve_image_drop_target(None, 3), None);
+        // track が 0 本 → 何を指しても新規 track。
+        assert_eq!(resolve_image_drop_target(Some(0), 0), None);
+        assert_eq!(resolve_image_drop_target(None, 0), None);
     }
 }
 

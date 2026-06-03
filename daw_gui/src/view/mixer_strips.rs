@@ -11,7 +11,8 @@ use common::model::{AutomationTarget, SendMode, TrackBuiltinParam};
 use daw_ui_core::{Edit, LevelMeterStyle, MeterBallistic, ToggleButtonStyle, Ui};
 
 use crate::view::param_gesture::push_param_gesture_edges;
-use daw_ui_renderer::{Color, Rect};
+use crate::view::track_color;
+use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent};
 
@@ -31,6 +32,9 @@ const SEND_KNOB_SIZE: f32 = 18.0;
 const ADD_SEND_H: f32 = 16.0;
 /// returns 帯と通常 strip 帯を分ける divider の幅。
 const RETURN_DIVIDER_W: f32 = 2.0;
+/// track 色ストライプの幅 (px)。 strip 左端に縦に描く。 arrangement header の
+/// `ArrangementStyle.track_color_strip_w` (gui_01 default 4.0) と揃える。
+const COLOR_STRIP_W: f32 = 4.0;
 /// 「＋ Return」 ボタンの高さ (returns 帯の上端に置く)。
 const ADD_RETURN_H: f32 = 22.0;
 
@@ -211,6 +215,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         app.peak_r_display,
         Rect { x: master_x, y: strip_y, w: STRIP_WIDTH, h: strip_h },
         COLOR_MASTER_BG,
+        None, // master は track 色を持たない (neutral 背景)
         u32::MAX,
         true,
         0.0, // sends_band_h (master は Sends セクション無し)
@@ -252,6 +257,7 @@ fn draw_track_strip(
         entry.peak_r_raw,
         rect,
         bg,
+        Some(track_color::to_renderer(entry.color)),
         track_id,
         false,
         sends_band_h,
@@ -284,6 +290,7 @@ fn draw_return_strip(
         entry.peak_r_raw,
         rect,
         COLOR_RETURN_BG,
+        Some(track_color::to_renderer(entry.color)),
         track_id,
         false,
         0.0, // sends_band_h = 0 (リターンは send 元 UI を出さない)
@@ -317,6 +324,9 @@ fn draw_strip(
     peak_r_raw: f32,
     rect: Rect,
     bg: Color,
+    // track の effective 色。 `Some(c)` で strip 左端に縦カラーストライプを
+    // 描く (arrangement header と同 idiom)。 master strip は neutral なので None。
+    color: Option<Color>,
     track_idx: u32,
     is_master: bool,
     // この strip 下部に確保する Sends セクション band の高さ (px)。 通常
@@ -332,6 +342,20 @@ fn draw_strip(
     was_dragging_pan: bool,
 ) {
     ui.panel(("mixer_strip_bg", layout_idx), rect, bg, 4.0);
+
+    // track 色ストライプ: strip 左端に縦 COLOR_STRIP_W px。 panel と同じ角丸
+    // (radius 4) に揃えるため左 2 隅 (tl, bl) のみ丸める。 bg の上に重ねるので
+    // group (青) / return (緑) tint と色衝突せず常にトラック色が視認できる。
+    if let Some(c) = color {
+        ui.push_rect(RectCommand {
+            rect: Rect { x: rect.x, y: rect.y, w: COLOR_STRIP_W, h: rect.h },
+            fill: c,
+            border: Color::TRANSPARENT,
+            border_width: 0.0,
+            radius: [4.0, 0.0, 0.0, 4.0],
+            clip_rect: None,
+        });
+    }
 
     let pad = 6.0;
     let mut y = rect.y + pad;

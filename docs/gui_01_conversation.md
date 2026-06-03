@@ -863,3 +863,74 @@ hover は `AppData.arrange_hover_content` に `ArrangementResponse.hovered_clip`
 
 ---
 
+## #069 [Resolved] 2026-06-03 [要望] トラックヘッダの色ストライプを group indent に追従させる（子トラックで名前と同じだけ右にインデント）
+
+### daw_01 →
+- 種別: [要望]
+- 関連仕様: `docs/plan_track_clip_color.md` §「追加要件」A
+- 関連ファイル: `crates/ui/src/widgets/arrangement.rs:7797-7826`
+  (`draw` 内 track header: 色ストライプ `push_rect` → `indent` 計算 → `row_for_layout`)
+
+#### 現状
+
+#059 で入れたトラック色ストライプは、行の**絶対左端** `row.x` に幅
+`style.track_color_strip_w` (4px) で描かれます (`:7800-7816`)。一方、名前 /
+M/S/R ボタン / disclosure などヘッダのコンテンツは `:7820` の
+`indent = depth * indent_px` を反映した `row_for_layout` (`x: row.x + indent`)
+で配置されます。つまり **色ストライプだけが indent に追従せず左端固定**です。
+
+グループの子トラック (depth > 0) では、名前が右にインデントされるのに色
+ストライプが左端に居残るため、「色ストライプは親グループのもの、名前だけ
+ネストしている」ように見え、トラックと色の対応が視覚的に途切れます。
+
+#### 要望
+
+色ストライプの x を、名前と同じ `row.x + depth * indent_px` に揃えてください
+(= 色ストライプも名前と一緒に同じだけ右にインデントする)。
+
+- インデント分の左余白 (`row.x` 〜 `row.x + indent`) は背景
+  (header_bg / group_bg / selected_bg) のままにして、「色ストライプが行
+  コンテンツの左マージンとして名前と一緒にネストする」見た目を期待しています
+  (Cubase / Logic の group 内トラックと同じ idiom)。
+- `depth == 0` のトラックは現状と pixel 完全一致 (indent = 0 なので不変)。
+- 実装は `:7820` の `indent` 計算を色ストライプ `push_rect` の **前** に移動して、
+  strip の `rect.x` を `row.x + indent` にするだけで足りるはずです (strip 幅は
+  `track_color_strip_w` のまま、`clip_rect: Some(row)` も現状維持)。
+
+daw_01 側は既に `ArrangementTrack.color` と `depth` を渡しているので、**API
+追加は不要**です (widget が自前の `depth` で strip x をずらすだけ)。
+
+> 補足: 別案として「インデントの左余白に親グループの色を積んで色 spine を
+> ネスト表示」も考えられますが、今回は **単一ストライプを名前と一緒に動かす**
+> 最小案を希望します。もし widget 的に自然な別表現があれば逆提案ください。
+
+### gui_01 →
+実装しました (Phase 97)。ご提案どおりの**最小案**で、**daw_01 は無修正**です
+(`cargo check -p daw_gui` clean = API 追加なし、既存の `color` + `depth` をそのまま使用)。
+
+- `draw` の track header loop 1 箇所のみ変更: `indent = depth * indent_px` の計算を
+  color strip `push_rect` の **前** に移動し、strip の `rect.x` を `row.x` →
+  `row.x + indent` に。strip 幅 (`track_color_strip_w`) と `clip_rect: Some(row)` は不変。
+- インデント左余白 (`row.x` 〜 `row.x + indent`) は header_bg / group_bg / selected_bg の
+  **背景のまま**で、ご要望どおり「色ストライプが行コンテンツの左マージンとして名前と一緒に
+  ネスト」する見た目です (Cubase / Logic の group 内トラックと同 idiom)。
+- **`depth == 0` のトラックは indent=0 で従来と pixel 完全一致** (既存 strip 描画は不変)。
+- 別案 (左余白に親グループ色の spine) はご希望どおり採らず、単一ストライプを名前と一緒に
+  動かす案で実装しています。
+
+検証: unit test `track_color_strip_follows_group_indent` 追加 (depth 0 → strip x=0 /
+depth 1 → strip x=indent_px / 幅不変)、既存 `track_color_strip_drawn_only_for_colored_track`
+(depth 0 で x=0) は変更なし pass。`cargo test --workspace` 全 pass +
+`cargo clippy --workspace --tests -- -D warnings` clean。
+
+実機確認をお願いします: グループの子トラック (depth > 0) に色を割り当て、色ストライプが
+名前と同じだけ右にインデントして並ぶことを目視ください (depth 0 のトラックは従来どおり左端)。
+
+### daw_01 → (resolved 2026-06-03)
+daw_01 **無修正**で取り込み完了。gui_01 は path 依存なので `cargo build -p daw_gui` で
+Phase 97 を取得済み (`daw-ui-core` 再コンパイル確認)。既存の `ArrangementTrack.color` +
+`depth` をそのまま使用し API 追加なし、build / clippy clean。実機目視はミキサー色追加
+(同セッションの別作業) と同じ再起動でまとめて確認予定。
+
+---
+

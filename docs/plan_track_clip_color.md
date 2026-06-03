@@ -95,9 +95,37 @@ Ableton Live のデフォルトパレットを参考にした 16 色 (彩度高�
 - v17 互換: color field 無しの JSON が `None` で load できる。
 - 継承ロジック: `effective_clip_color` が None で track 色、Some で上書き色を返す。
 
+## 追加要件 (2026-06-03 ユーザー要望)
+
+トラック色ストライプの「見える場所」をグループ階層と mixer に揃える。色モデル
+(`effective_track_color`) は不変、 描画位置だけの拡張。
+
+### A. arrangement: 色ストライプを group indent に追従させる (gui_01 #069)
+
+- 現状 (gui_01 #059): トラックヘッダの色ストライプは行の**絶対左端** (`row.x`)
+  に幅 `track_color_strip_w` (4px) で描かれる。名前 / M/S/R ボタンは
+  `header_x = row.x + depth * indent_px` でインデントされるが、色ストライプは
+  インデントされず左端固定 (`crates/ui/src/widgets/arrangement.rs:7800-7816`)。
+- **要望**: 子トラック (depth > 0) では色ストライプも `row.x + depth * indent_px`
+  に揃え、名前と同じだけ右にインデントさせる。インデント分の左余白は背景
+  (header_bg / group_bg / selected_bg) のまま = 「色ストライプが行コンテンツの
+  左マージンとして名前と一緒にネストする」見た目。depth = 0 は現状と pixel 一致。
+- gui_01 依存。daw_01 側は既に `color` / `depth` を渡しており API 追加は不要
+  (widget が自前の `depth * indent_px` で strip x をずらすだけ)。
+
+### B. mixer: strip にも track 色ストライプ (daw_01 完結・実装済み)
+
+- mixer チャンネル strip 左端に縦 4px の色ストライプを描く (`COLOR_STRIP_W`)。
+  arrangement header と同 idiom・同 helper (`effective_track_color`)。
+- `TrackMixEntry.color: [f32; 3]` を `track_mix()` で計算し、`draw_strip` が
+  `Some(color)` のとき bg (group=青 / return=緑 tint) の上に重ねて描く。
+  master strip は track ではないので `None` (neutral 背景のまま)。
+- panel が角丸 (radius 4) なので strip の左 2 隅 (tl, bl) のみ丸める
+  (`radius: [4.0, 0.0, 0.0, 4.0]`)。
+
 ## 参考
 
 - REAPER: track color + item「inherit track color / custom color」(右クリック)。
 - Ableton Live: track/clip 各自に色、作成時パレット自動割り当て、後から変更・
-  「トラック色に合わせる」可。
+  「トラック色に合わせる」可。mixer チャンネルにもトラック色が出る。
 - Bitwig: track color、clip は継承既定。

@@ -764,11 +764,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         );
     }
     if let Some(drop) = ui.take_file_drop_in_rect(canvas_area) {
-        // gui_01 #023 (resolved) + drop target 解決:
-        // `DroppedFiles { paths, position }` の position.y から track
-        // index を計算し、 `ImportAudio` の `target_track_idx` で渡す。
-        // 同 widget の hover_clip 計算 (= 数行下) と同じ
-        // `(local_y / row_h)` 式。 canvas 外なら None で fallback。
+        // drop target 解決: drop 位置 (position.y) が乗っている track を、 widget が
+        // 返す実際の header rect (`resp.track_header_rects`) で hit-test する。
+        // header_rects は縦スクロール (`arrange_track_top`) / 個別行高 override /
+        // master 行を反映した実描画 Y なので、 naive な `local_y / row_h` と違い
+        // 下方トラックでも正しく当たる (= スクロール時や master 行ぶんのズレで
+        // 「Track9 にドロップしても新規 track が作られる」バグの修正)。 lanes 側
+        // drop でも各行の Y レンジは header と共通なので Y のみで判定する。 当たった
+        // track_id を song.tracks の index に変換し、 master 行 (song.tracks に居ない)
+        // や、 どの行にも当たらない (= track の無い下の余白) は None → 新規 track 経路。
         //
         // docs/plan_video.md P2: 同じ drop 内で audio file と video file が
         // 混在する場合は extension で partition して個別 AppEvent を発火する。
@@ -776,13 +780,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // avi` を判定 (= P2.7 wire)。 マッチしない path は従来通り Audio
         // import パイプラインに流す (= hound の WAV 判定で再度はじかれる)。
         let drop_y = drop.position.1;
-        let canvas_top = canvas_area.y;
-        let local_y = drop_y - canvas_top;
-        let target_track_idx = if local_y >= 0.0 {
-            Some((local_y / row_h.max(1.0)) as u32)
-        } else {
-            None
-        };
+        let target_track_idx = resp
+            .track_header_rects
+            .iter()
+            .find(|(_, r)| drop_y >= r.y && drop_y < r.y + r.h)
+            .and_then(|(track_id, _)| app.song.tracks.iter().position(|t| t.id == *track_id))
+            .map(|idx| idx as u32);
         // docs/plan_image_overlay.md P2: 3-way partition (video →
         // image → audio). Video on Windows only (= WMF dependency);
         // image is OS-neutral (image crate); audio is the fallback
@@ -817,7 +820,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         if !image_paths.is_empty() {
             let paths = image_paths;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::ImportImage { paths });
+                app.handle_event(AppEvent::ImportImage { paths, target_track_idx });
             }));
         }
     }
