@@ -934,3 +934,88 @@ Phase 97 を取得済み (`daw-ui-core` 再コンパイル確認)。既存の `A
 
 ---
 
+## #070 [Open] 2026-06-03 [バグ報告] menu bar: top-level menu が open 中、別の top-level ラベルを click / hover しても切り替わらない（popup anchor が隣ラベルを覆い click を消費）
+
+### daw_01 →
+- 種別: [バグ報告]
+- 関連仕様: `docs/plan_menu_switch.md`
+- 関連ファイル（daw_01 呼び出し側）: `daw_gui/src/view/root.rs:131-257`
+  （`ui.menu_bar` で File / Edit / View を並べているだけ。daw_01 は標準的な使い方のみ）
+- gui_01 側で見るべきソースの当たり: `crates/ui/src/widgets/menu.rs`
+  （`MenuBarBuilder::menu` `:213-293` / anchor 計算 `:237-245` / toggle `:248-255`）、
+  `crates/ui/src/ui.rs::popup_layer`（anchor 内 consume `:1105-1107` / outside_click `:1038-1044`
+  / `consume_pointer_click` `:1248-1256`）
+
+#### 症状
+
+File メニューがドロップダウン表示されている状態で View メニューのラベルを click しても View が
+開かない。一度 File を click して閉じてからでないと View を開けない（= 1 つの切り替えに 2 ステップ
+必要）。Edit も同様。
+
+期待挙動: 開いている menu があるとき、別の top-level ラベルに **hover** / **click** したら、その
+menu に切り替わる（旧 menu を閉じ、新 menu を開く）。Win32 メニュー・macOS メニューバー・GTK/Qt・
+各 DAW（Ardour / REAPER）共通の標準挙動。
+
+#### 根本原因（調査済み）
+
+top-level menu の popup は固定幅 `MENU_W_DEFAULT = 180px`（`menu.rs:76`）。popup_layer に渡す anchor
+は `union_rect(label_rect, popup_rect)`（`menu.rs:245`）なので **File の anchor は x = [0, 180)**。
+一方 top-level ラベル幅は `chars*8 + 24`（`menu.rs:219, 74`）で "File" / "Edit" / "View" は各 56px、
+配置は File[0,56) / Edit[56,112) / **View[112,168)**。
+
+→ **Edit / View ラベルは File popup の anchor [0,180) の内側**に完全に入る。
+
+popup_layer は body 描画後、anchor 内の click を「popup item として処理済 → 下層に流さない」として
+消費する（`ui.rs:1105-1107`）:
+
+```rust
+if state.modal && pp.pos.is_some_and(|(px, py)| state.anchor.contains(px, py)) {
+    self.consume_pointer_click();
+}
+```
+
+menu_bar builder は File → Edit → View 順に処理。File が open のとき View を click すると、
+`menu("File")` の `popup_layer(File)` が「View click は File anchor 内」と判定して
+`consume_pointer_click()` を実行 → `primary_just_released` が false に（`ui.rs:1248-1256`）→
+後続の `menu("View")` の toggle `inside && primary_just_released`（`menu.rs:248`）が発火せず、
+open_popup が呼ばれない。File を閉じれば anchor が消え、次の click が通る。これが 2 ステップの正体。
+
+（Edit を開いた状態では Edit anchor [56,236) が View を覆うので View click も奪われる。一般に
+「開いた menu の右隣、popup 幅 180px 以内のラベル」がすべて入力を奪われる。）
+
+#### 望む挙動（最終形態）
+
+1. 全 menu が閉じている: top-level ラベルの click で開く（hover では開かない）。← 現状維持
+2. いずれかの top-level menu が open:
+   - 別の top-level ラベルに **hover** しただけで切り替わる（旧を閉じ hover 先を開く）。
+   - 別の top-level ラベルを **click** しても切り替わる（主訴の修正）。
+   - open 中のラベルを再度 click で閉じる（toggle）。← 現状維持
+3. menu / popup の外を click で全部閉じる。← 現状維持（outside_click）
+
+sub_menu（cascade）は既に hover で開く（`menu.rs:443`）。top-level も「open 中は hover 追従」に
+揃えるのが標準。
+
+#### 機構案（最終形は gui_01 にお任せ）
+
+核心は「top-level ラベルの帯が、開いている popup の anchor に覆われて入力を奪われる」点。
+
+- `menu.rs:245` の anchor から **top-level ラベル帯（bar_rect の行）を除外**し、anchor を popup_rect
+  （bar の下）だけにする。これで隣ラベル click の anchor-consume（`ui.rs:1105`）と outside_click
+  誤判定（`ui.rs:1038`）が止まり、隣 menu の toggle release が生きる。toggle は open と同じ click の
+  release で `consume_pointer_click` 済（`menu.rs:254`）なので「開いた直後の release を outside と
+  誤判定して即閉じる」回帰は起きない見込み（要確認）。
+- hover 切り替え: menu_bar が「現在 open な top-level menu_id」を 1 つ把握し、pointer が別の
+  top-level ラベル上なら close old + open new。これを各 popup_layer より前に。
+- 「閉じている状態では hover で開かない」を保つため、hover 切り替えは「既にいずれか open」のときだけ
+  作動。
+
+#### 確認手段
+
+daw_01 側は無修正で恩恵を受ける見込み（menu_bar の使い方は標準のまま）。実機確認は File を開いて
+そのまま View / Edit のラベルに hover → 即切り替わる、click でも切り替わる、を目視します。
+
+### gui_01 →
+（gui_01 Claude が記入）
+
+---
+
