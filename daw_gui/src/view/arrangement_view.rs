@@ -21,6 +21,27 @@ use crate::view::mixer_strips::{amp_to_fader, fader_to_amp};
 use crate::view::track_color;
 use crate::view::snap::{self, SNAP_LABELS};
 
+/// カーソル / ドロップの Y 座標が乗っている track の `song.tracks` index を、
+/// widget が返す実際の header rect (`ArrangementResponse.track_header_rects`)
+/// から解決する。各 rect は縦スクロール (`arrange_track_top`) / 個別行高
+/// override / master 行 (Reaper 流 at top) を反映した実描画 Y なので、naive な
+/// `(y - canvas_top) / row_h` と違い下方 track でも正しく当たる。
+///
+/// **file drop target と Split (E) の hover clip 判定の両方が使う** (= 行 → track
+/// の Y 判定の single source of truth)。別々にコピーすると一方だけ直して
+/// off-by-one が残る事故が起きる (実際に発生したため共有 helper に統一)。
+/// master 行 (= `song.tracks` に居ない) や、どの行にも当たらない Y は `None`。
+fn track_index_at_y(
+    track_header_rects: &[(u32, Rect)],
+    tracks: &[common::model::Track],
+    y: f32,
+) -> Option<usize> {
+    track_header_rects
+        .iter()
+        .find(|(_, r)| y >= r.y && y < r.y + r.h)
+        .and_then(|(track_id, _)| tracks.iter().position(|t| t.id == *track_id))
+}
+
 /// gui_01 widget の `FadeCurve` (#025) ↔ daw_01 model `FadeCurve` の
 /// 対応変換。 同 3 種を 1:1 で対応させているだけだが、 type が別 crate
 /// なので変換 helper を経由する。
@@ -780,12 +801,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // avi` を判定 (= P2.7 wire)。 マッチしない path は従来通り Audio
         // import パイプラインに流す (= hound の WAV 判定で再度はじかれる)。
         let drop_y = drop.position.1;
-        let target_track_idx = resp
-            .track_header_rects
-            .iter()
-            .find(|(_, r)| drop_y >= r.y && drop_y < r.y + r.h)
-            .and_then(|(track_id, _)| app.song.tracks.iter().position(|t| t.id == *track_id))
-            .map(|idx| idx as u32);
+        let target_track_idx =
+            track_index_at_y(&resp.track_header_rects, &app.song.tracks, drop_y)
+                .map(|idx| idx as u32);
         // docs/plan_image_overlay.md P2: 3-way partition (video →
         // image → audio). Video on Windows only (= WMF dependency);
         // image is OS-neutral (image crate); audio is the fallback
@@ -843,18 +861,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let snapped_beat: Option<f64> = raw_beat
         .map(|raw| view.snap.snap_beat(raw, /* alt: */ false, zoom));
     let hover_clip: Option<ClipRef> = raw_beat.and_then(|beat| {
-        // Mouse y → track index. arrangement widget uses
-        // `track_top + (track_idx - top) * track_row_h` for ruler-aware
-        // layout. We approximate via `(py - canvas_top) / row_h` since
-        // there's no scroll-y on Phase 1 (track_top is 0 for default).
+        // カーソル Y が乗っている track を、 widget が返す実際の header rect
+        // (`resp.track_header_rects`) で hit-test する (file drop target と同じ手法)。
+        // naive な `(py - canvas_top) / row_h` は master 行 (Reaper 流 at top) /
+        // 縦スクロール (`arrange_track_top`) / 個別行高 override ぶんズレ、 Split (E)
+        // が 1 つ下の track の clip を対象にしてしまうため使わない。 lanes 側でも
+        // 各行の Y レンジは header と共通なので Y のみで判定する。
         let (_, py) = ui.pointer().pos?;
-        let row_h = row_h.max(1.0);
-        let canvas_top = canvas_area.y;
-        let local_y = py - canvas_top;
-        if local_y < 0.0 {
-            return None;
-        }
-        let track_idx = (local_y / row_h) as usize;
+        let track_idx = track_index_at_y(&resp.track_header_rects, &app.song.tracks, py)?;
         let track = app.song.tracks.get(track_idx)?;
         for (clip_idx, clip) in track.clips.iter().enumerate() {
             if beat >= clip.start_beat && beat < clip.start_beat + clip.length_beats {
@@ -2423,5 +2437,49 @@ fn draw_midi_clip_notes(
             radius: [0.0; 4],
             clip_rect: None,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::track_index_at_y;
+    use common::model::Track;
+    use daw_ui_renderer::Rect;
+
+    fn rect_at(y: f32, h: f32) -> Rect {
+        Rect { x: 0.0, y, w: 100.0, h }
+    }
+
+    /// off-by-one 回帰固定: arrangement 最上段に master 行 (Reaper 流) があると、
+    /// 「画面上の行番号」を index にする naive 方式では song.tracks[k] が +1 ずれて
+    /// 1 つ下の track を指し、最下段は範囲外になる。実際の header rect を hit-test
+    /// する `track_index_at_y` はこのズレを起こさないことを固定する。
+    #[test]
+    fn track_index_at_y_maps_via_actual_rects_not_visual_row() {
+        // 行高 20px。master 行 (id=u32::MAX) が y=0..20 の先頭、その下に
+        // song.tracks の 3 本 (id 10/11/12)。
+        let rects = [
+            (u32::MAX, rect_at(0.0, 20.0)), // master row at top
+            (10, rect_at(20.0, 20.0)),      // song.tracks[0]
+            (11, rect_at(40.0, 20.0)),      // song.tracks[1]
+            (12, rect_at(60.0, 20.0)),      // song.tracks[2] (最下段)
+        ];
+        let tracks = [
+            Track { id: 10, ..Track::default() },
+            Track { id: 11, ..Track::default() },
+            Track { id: 12, ..Track::default() },
+        ];
+        // master 行の Y → song.tracks に居ないので None (新規 track / split 対象外)。
+        assert_eq!(track_index_at_y(&rects, &tracks, 10.0), None);
+        // 各 track 行の Y → その track の index (+1 ズレ無し)。
+        assert_eq!(track_index_at_y(&rects, &tracks, 25.0), Some(0));
+        assert_eq!(track_index_at_y(&rects, &tracks, 45.0), Some(1));
+        // 最下段も範囲外にならず正しく当たる (Track9=新トラック化バグの固定)。
+        assert_eq!(track_index_at_y(&rects, &tracks, 65.0), Some(2));
+        // 境界 (行の上端は含む / 下端は含まない half-open)。
+        assert_eq!(track_index_at_y(&rects, &tracks, 20.0), Some(0));
+        assert_eq!(track_index_at_y(&rects, &tracks, 40.0), Some(1));
+        // どの行にも当たらない Y (全行より下) → None。
+        assert_eq!(track_index_at_y(&rects, &tracks, 999.0), None);
     }
 }
