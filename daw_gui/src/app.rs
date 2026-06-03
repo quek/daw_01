@@ -1047,6 +1047,17 @@ pub struct AppData {
     /// 1 undo step にまとまり、 変更しないまま閉じても dead step が増えない。
     pub color_picker_session_dirty: bool,
 
+    /// gui_01 #071: 空きレーン右クリック (`ArrangementEditRequest::SecondaryClickEmpty`)
+    /// で開く clip 生成コンテキストメニューの stash。`Some((track_id, snap 済み beat,
+    /// 右クリック viewport pos))` の間、毎フレーム `ui.context_menu_at` で `pos` に
+    /// メニューを描画する (color_picker overlay と同 idiom)。on_select (= Text クリップ
+    /// 生成) で `None` に戻す。
+    pub clip_create_menu: Option<(u32, f64, (f32, f32))>,
+    /// 上記メニューの 1-shot open trigger。`SecondaryClickEmpty` 受信 Edit で `true` に
+    /// し、overlay が `open_at = Some(pos)` を 1 フレームだけ渡したら `false` に戻す
+    /// (毎フレーム `Some` を渡すと outside-click で閉じても翌フレーム再 open するため)。
+    pub clip_create_menu_open: bool,
+
     /// Transport BPM 入力欄の編集中文字列。 commit (Enter) で parse + clamp +
     /// `song.bpm` に反映、 song を切り替える際 (open / new / undo / redo) は
     /// `resync_song_edit_texts` で formatted な現値に書き戻す。
@@ -1387,6 +1398,8 @@ impl AppData {
             color_picker_target: None,
             color_picker_anchor: None,
             color_picker_session_dirty: false,
+            clip_create_menu: None,
+            clip_create_menu_open: false,
             track_rename_text: String::new(),
             clip_rename: None,
             clip_rename_text: String::new(),
@@ -2233,7 +2246,7 @@ impl AppData {
                 | AppEvent::ImportAudio { .. }
                 | AppEvent::ImportVideo { .. }
                 | AppEvent::ImportImage { .. }
-                | AppEvent::AddTextClip
+                | AppEvent::AddTextClipAt { .. }
                 | AppEvent::AddNote { .. }
                 | AppEvent::ResizeNote { .. }
                 | AppEvent::ResizeNotes(_)
@@ -3481,13 +3494,13 @@ pub enum AppEvent {
     /// extensions and dispatch the selection as `AppEvent::ImportImage`.
     OpenImportImageDialog,
 
-    /// docs/plan_text_overlay.md §4 P7: File menu → "Add Text Clip"。
-    /// Creates a new unify track at the top of the arrangement and
-    /// drops a `ClipContent::Text` clip with a single `TextEvent` at
-    /// the default title position (= center band of project resolution,
-    /// 64 px white font, 8 beats long). The user edits text content /
-    /// styles via the inspector (P5) and PiP rect via preview drag (P6).
-    AddTextClip,
+    /// docs/plan_text_clip_creation.md: 空きレーン右クリック → "Text クリップ" で
+    /// `track` (track id) の `start_beat` 位置に `ClipContent::Text` clip を 1 個追加
+    /// する。clip は単一 `TextEvent` を default 体裁 (= center band, 64 px white font)
+    /// で持つ。text 内容 / styles は inspector、PiP rect は preview drag で編集。
+    /// (旧 `AddTextClip` = File menu で新規 track を先頭に作る版は廃止。text トラックは
+    /// v16 で他トラックと統一済みのため、他 clip と同じくタイムライン上で生成する。)
+    AddTextClipAt { track: u32, start_beat: f64 },
 
     /// File menu → "Import Video..." entry. Opens an `rfd` file
     /// picker (mp4 / mov / mkv / webm filter) and forwards to
@@ -4711,8 +4724,8 @@ impl AppData {
             AppEvent::OpenImportImageDialog => {
                 self.action_open_import_image_dialog();
             }
-            AppEvent::AddTextClip => {
-                self.action_add_text_clip();
+            AppEvent::AddTextClipAt { track, start_beat } => {
+                self.add_text_clip_to_track(track, start_beat);
             }
             AppEvent::TogglePreviewWindow => {
                 self.preview_window_visible = !self.preview_window_visible;
@@ -14602,48 +14615,56 @@ impl AppData {
         };
     }
 
-    /// docs/plan_text_overlay.md §4 P7: File menu → "Add Text Clip"。
-    /// Creates a single new track at the top of the arrangement that
-    /// holds a `ClipContent::Text` clip with one `TextEvent` filled by
-    /// defaults (= "Title" / 64px / 中央横帯 / 8 beats)。 User edits
-    /// content / styles via the inspector and PiP via preview drag.
-    fn action_add_text_clip(&mut self) {
-        let text_clip_length_beats = (self.song.length_beats * 0.5).max(8.0);
-        let next_start_beat = 0.0_f64;
+    /// docs/plan_text_clip_creation.md: 空きレーン右クリック → "Text クリップ" 経路。
+    /// `track_id` の track の `start_beat` 位置に `ClipContent::Text` clip を 1 個追加する。
+    /// clip は default 体裁 ("Title" / 64px / 中央横帯) の単一 `TextEvent` を持つ。
+    /// 「text トラック」 は存在せず (v16 で全 track 統一済み)、 text は他 clip と同じく
+    /// 任意の track 上にタイムラインで生成する。 content / styles は inspector、 PiP rect は
+    /// preview drag で編集。 clip 長は他 clip 生成 (`create_clip`) と同じ `DEFAULT_CLIP_LENGTH`。
+    fn add_text_clip_to_track(&mut self, track_id: u32, start_beat: f64) {
+        let Some(track_idx) = self.song.tracks.iter().position(|t| t.id == track_id) else {
+            return;
+        };
+        let start_beat = start_beat.max(0.0);
+        let length_beats = DEFAULT_CLIP_LENGTH;
 
         let content_id = self.song.alloc_content(
             common::model::ClipContent::Text(common::model::TextContent {
                 events: vec![common::model::TextEvent {
                     text: "Title".into(),
-                    event_length_beats: text_clip_length_beats,
+                    event_length_beats: length_beats,
                     ..common::model::TextEvent::default()
                 }],
             }),
             "Title".to_string(),
         );
 
-        // Insert at the top of the arrangement so the title renders
-        // ABOVE existing video / image layers (= MV typical layout).
-        let track_id = self.song.alloc_track_id();
-        let mut text_track = common::model::Track {
-            id: track_id,
-            name: "Text".into(),
-            ..common::model::Track::default()
-        };
-        let clip_id = text_track.alloc_clip_id();
-        text_track.clips.push(common::model::Clip {
+        let track = &mut self.song.tracks[track_idx];
+        let clip_id = track.alloc_clip_id();
+        let new_clip_idx = track.clips.len() as u32;
+        track.clips.push(common::model::Clip {
             id: clip_id,
             name: String::new(),
-            start_beat: next_start_beat,
-            length_beats: text_clip_length_beats,
+            start_beat,
+            length_beats,
             content_id,
             notes: Vec::new(),
             color: None,
         });
-        self.song.tracks.insert(0, text_track);
+
+        // create_clip と同様、 生成直後の clip を選択して inspector に出す。
+        let r = ClipRef {
+            track: track_idx as u32,
+            clip: new_clip_idx,
+        };
+        self.selected_clip = Some(r);
+        self.selected_clips = vec![r];
+        self.selected_notes.clear();
+        self.select_track(track_idx as u32);
 
         self.is_dirty = true;
         self.status_message = "Text clip 追加".into();
+        self.sync_song_to_plugin_host();
     }
 
     /// File menu → "Import Image..." 経路。 `rfd` の native file picker

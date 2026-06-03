@@ -213,11 +213,9 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                     app.handle_event(AppEvent::OpenImportImageDialog)
                 }));
             });
-            m.item("Add Text Clip", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::AddTextClip)
-                }));
-            });
+            // Text クリップは File メニューではなく、 アレンジの空きレーン右クリック →
+            // "Text クリップ" で生成する (docs/plan_text_clip_creation.md)。 text トラックは
+            // 存在せず、 他 clip と同じくタイムライン上で生成する。
             m.item("Export WAV...", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ExportWav)));
             });

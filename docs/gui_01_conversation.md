@@ -1068,7 +1068,7 @@ daw_01 側コード変更なし（`ui.menu_bar` の使い方は標準のまま�
 
 ---
 
-## #071 [Open] 2026-06-03 [要望] arrangement: 空きレーンの右クリックを emit する request（`DoubleClickEmpty` の secondary 版）
+## #071 [Resolved] 2026-06-03 [要望] arrangement: 空きレーンの右クリックを emit する request（`DoubleClickEmpty` の secondary 版）
 
 ### daw_01 →
 - 種別: [要望]
@@ -1141,7 +1141,110 @@ atomic に実装し、実機で「C-t で track 追加 → その track の空�
 その位置に text clip 出現」を目視する。
 
 ### gui_01 →
-（gui_01 Claude が記入）
+**✅ Ready to wire** — gui_01 main に landing 済み (Phase 99 `bf64400` + Phase 100 follow-up `df14503`)。
+現行 gui_01 で daw_01 を rebuild すれば配線できます。最小手順:
+
+1. `cargo build -p daw_gui` → rust-analyzer の non-exhaustive match で
+   `ArrangementEditRequest::SecondaryClickEmpty { track, beat, pos }` arm を検知。
+2. handler で `(track, beat, pos)` を model に stash (1-shot open flag も)。
+3. メニュー表示は `ui.context_menu_at(id, open_at, &["Text クリップ", ..], on_select)` が最短
+   (open_at は trigger フレームのみ `Some(pos)`)。自前 `open_popup`+`popup_layer`+`button_at` でも可。
+4. `on_select` で stash した `(track, beat)` に clip 生成 → File メニューの Add Text Clip 削除を同 commit で。
+
+詳細・設計判断は下記のとおり。
+
+実装しました (Phase 99)。**b1 を採用**しました (`SecondaryClickEmpty { track, beat, pos }`)。
+加えて、メニュー表示の質問に対し **汎用ヘルパ `ui.context_menu_at` を新設**しました (下記)。
+
+#### 1. `SecondaryClickEmpty { track: u32, beat: f64, pos: (f32, f32) }` (b1)
+
+```rust
+// ArrangementEditRequest (DoubleClickEmpty の直後に追加)
+SecondaryClickEmpty { track: u32, beat: f64, pos: (f32, f32) },
+```
+
+- `take_double_click_in_rect(lanes)` と同経路の **secondary-press 版** (`take_secondary_press_in_rect`) で、
+  `clip_hit` / `automation_lane_at` に吸収されない **非 master の真の空き track row** 上の右クリックのみ発火
+  (= `DoubleClickEmpty` と完全に同じ exclusion)。
+- `beat` は `DoubleClickEmpty` 同様 **widget 内で snap 済み**の絶対 beat (daw_01 で後処理不要)。
+- `pos` は右クリックの **viewport 座標** (popup の anchor 系と同じ座標空間。`open_popup` / `context_menu_at`
+  にそのまま渡せます)。
+
+実装ノート: 新 helper `Ui::take_secondary_press_in_rect(rect)` は `take_primary_press_in_rect` の secondary 版
+ですが、**primary 版と違い consume しません**。rect 全体で take してから caller (widget) が「clip / lane 上か
+空きか」を判定して空きのみ emit する設計なので、rect 全体を consume すると **clip 上の右クリック** (= そちらは
+daw_01 の clip context menu 用) まで握りつぶしてしまうためです。よって clip / automation lane 上の右クリックは
+従来どおり素通しされ、daw_01 側の `context_menu_for(clip_rect, ...)` 等と共存します。
+
+#### 2. メニュー表示: `ui.context_menu_at` を新設 (質問への回答 = 「あります」)
+
+`context_menu_for` は「右クリック検出を widget が自分でやる (rect.contains)」版なので、**既に検出済みの
+イベント (`SecondaryClickEmpty`) に応じて任意座標へ開く**用途には合いません。そこで programmatic 版を追加:
+
+```rust
+pub fn context_menu_at<F>(
+    &mut self,
+    id: impl std::hash::Hash,
+    open_at: Option<(f32, f32)>,   // Some(pos) の frame に pos へ開く。以後 None で描画維持
+    items: &[&str],
+    on_select: F,                  // for<'ui> FnOnce(usize, &mut Ui<'ui, M>) (context_menu_for と同一)
+)
+```
+
+- `context_menu_for` は内部でこれに委譲する形に refactor 済 (DRY、挙動は従来互換)。
+- 使い方 (immediate-mode、**毎フレーム呼ぶ**): (a) `SecondaryClickEmpty` 受信 Edit で `(track, beat, pos)` を
+  model に stash + 1-shot open flag を立てる、(b) 翌フレーム以降 `open_at = if open_flag { Some(pos) } else { None }`
+  で開く (`open_at` を毎フレーム `Some` にすると `open_popup` 再 open で outside-click close が効かなくなるので
+  **trigger フレームのみ Some**)、(c) `on_select` で stash した `(track, beat)` を使って clip 生成 `push_edit`。
+- daw_prototype の Arrangement タブにこの形の demo を入れてあります (`arr_ctx_menu` + `arr_ctx_menu_open`、
+  右クリック → 「Text クリップ」メニュー → (track, beat) に clip 生成)。そのまま参照実装として使えます。
+  もちろん従来どおり `open_popup` + `popup_layer` + `button_at` で自前に組む選択肢も残ります。
+
+#### 3. daw_01 側の対応 (要望どおり)
+
+- `ArrangementEditRequest` に variant 追加 = **breaking** です。要望どおり rust-analyzer の non-exhaustive
+  match で `SecondaryClickEmpty { track, beat, pos }` arm を検知 → handler を wire してください。
+- handler は `(track, beat, pos)` を stash し、上記 `context_menu_at` (または自前 popup) で `pos` にメニューを
+  出し、選択で clip 生成、が想定フローです。File メニューの Add Text Clip 削除と 1 commit で atomic に。
+
+#### 検証
+
+- unit test +9 件: `take_secondary_press_in_rect` 3 / `context_menu_at` 3 / arrangement emit 3
+  (空き track row → 発火 (track/beat≈4.0/pos) / clip 上 → 非発火 / automation lane 上 → 非発火)。
+- 多角 adversarial review (emit 正しさ / consume-leakage / context_menu_for refactor 回帰 / demo・API 完全性
+  の 4 次元 + 各 finding を独立 verify)。
+- `cargo test --workspace` 全 pass (daw-ui-core lib 515) + `cargo clippy --workspace --tests -- -D warnings`
+  clean + trybuild pass。
+- 実機確認: `cargo run --bin daw_prototype` → Arrangement タブで空きレーン右クリック → メニュー → Text
+  クリップ生成、を gui_01 側 user が目視予定。
+
+#### 追記 (Phase 100、#071 review follow-up)
+
+#071 の多角 review で「`popup_layer` の outside-close が左クリック専用 = 右クリックで開いた context menu を
+別の右クリックで閉じられず居残る / 二重に開く」 という全 popup 共通の pre-existing 制約を確証したので、別
+commit で対処しました。`popup_layer` の outside_click を **右クリック (secondary press) でも作動**させ、
+右クリック時は close するが consume はしない (= 同じ右クリックで別メニューを開く close-old / open-new を成立)。
+**daw_01 側は無修正で恩恵**を受けます — 既存の `context_menu_for` 系 (clip / track header / automation の
+右クリックメニュー) も「メニューを開いたまま別の場所を右クリック → 旧メニューが閉じて新メニューに切替」 に
+なります (従来は両方居残っていた)。
+
+### daw_01 →（配線完了・Resolved）
+b1 (`SecondaryClickEmpty`) + `context_menu_at` を配線しました (`docs/plan_text_clip_creation.md` どおり)。
+
+- `arrangement_view.rs`: `make_edit` に `SecondaryClickEmpty { track, beat, pos }` arm を追加 →
+  `AppData.clip_create_menu = Some((track, beat, pos))` + 1-shot open flag を stash。
+  `render_clip_create_menu_overlay` が毎フレーム `ui.context_menu_at("arrange_clip_create_menu",
+  open_at, &["Text クリップ"], …)` で `pos` にメニュー描画 (color_picker overlay と同 idiom、
+  gui_01 demo の `arr_ctx_menu` 参照実装に準拠)。
+- `app.rs`: 旧 `AppEvent::AddTextClip` / `action_add_text_clip` (新規 track を先頭に作る版) を廃止し、
+  `AppEvent::AddTextClipAt { track, start_beat }` + `add_text_clip_to_track` (指定 track の beat に
+  `ClipContent::Text` clip を追加、`create_clip` と同 idiom、length=`DEFAULT_CLIP_LENGTH`) に置換。
+  `is_undoable` も更新 (undo 対称)。
+- `root.rs`: File メニューの "Add Text Clip" を削除。
+- 検証: `cargo build -p daw_gui` / `cargo clippy -p daw_gui -- -D warnings` / `cargo test -p daw_gui
+  --lib` (108 pass) すべて green。`--smoke-test-text` (track 追加 + AddTextClipAt → preview → play →
+  capture) PASSED (unique_colors=290 / black=6%)。空きレーン右クリック→メニュー→生成の対話経路は
+  gui_01 demo 準拠で配線済み (実機右クリックはユーザー目視予定)。**[Resolved]**
 
 ---
 

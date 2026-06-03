@@ -767,6 +767,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // しない)、`dismissed` で target を None に戻す。
     render_color_picker_overlay(app, ui);
 
+    // gui_01 #071: 空きレーン右クリック (`SecondaryClickEmpty`) → clip 生成 context menu。
+    render_clip_create_menu_overlay(app, ui);
+
     // file drop の hint frame は widget の上に被せる。canvas (lanes) のみ受け付け。
     let canvas_area = Rect {
         x: area.x + TRACK_HEADER_W,
@@ -890,6 +893,44 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app.arrangement_hover_clip = hover_clip;
         }));
     }
+}
+
+/// gui_01 #071 (`docs/plan_text_clip_creation.md`): 空きレーン右クリック
+/// (`SecondaryClickEmpty`) で stash した `(track_id, snap 済み beat, 右クリック pos)` を
+/// 使い、 毎フレーム `ui.context_menu_at` で `pos` に clip 生成メニューを描画する
+/// (REAPER の右クリック空きエリア → Insert new item idiom)。`open_at` は 1-shot flag で
+/// 1 フレームだけ `Some(pos)` を渡す (毎フレーム `Some` だと outside-click で閉じても翌
+/// フレーム再 open するため)。 項目選択で `AddTextClipAt` を発火して stash を `None` に戻す。
+fn render_clip_create_menu_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
+    let Some((track, beat, pos)) = app.clip_create_menu else {
+        return;
+    };
+    let open_at = if app.clip_create_menu_open {
+        Some(pos)
+    } else {
+        None
+    };
+    if app.clip_create_menu_open {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.clip_create_menu_open = false;
+        }));
+    }
+    ui.context_menu_at(
+        "arrange_clip_create_menu",
+        open_at,
+        &["Text クリップ"],
+        move |idx, ui| {
+            if idx == 0 {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::AddTextClipAt {
+                        track,
+                        start_beat: beat,
+                    });
+                    app.clip_create_menu = None;
+                }));
+            }
+        },
+    );
 }
 
 /// v18 (`docs/plan_track_clip_color.md`, gui_01 #058): `color_picker_target` が
@@ -1391,6 +1432,16 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
                     });
                     app.handle_event(AppEvent::SelectBottomPanel(1));
                 }
+            })
+        }
+        ArrangementEditRequest::SecondaryClickEmpty { track, beat, pos } => {
+            // gui_01 #071: 空きレーン右クリック → clip 生成 context menu を pos に開く。
+            // beat は widget 内で snap 済み (DoubleClickEmpty と同じ、 daw_01 後処理不要)。
+            // track は track id。 実メニュー描画は render_clip_create_menu_overlay が
+            // `ui.context_menu_at` で毎フレーム行う (color_picker overlay と同 idiom)。
+            Edit::mutate(move |app: &mut AppData| {
+                app.clip_create_menu = Some((track, beat.max(0.0), pos));
+                app.clip_create_menu_open = true;
             })
         }
         ArrangementEditRequest::MoveClips(deltas) => {
