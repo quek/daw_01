@@ -603,15 +603,51 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         F: for<'ui> FnOnce(usize, &mut Ui<'ui, M>),
     {
         let pointer = self.pointer;
-        let menu_id = ("context_menu", rect.x.to_bits(), rect.y.to_bits());
-        let n = items.len();
-
-        // 右クリック検出 → popup を開く (anchor は items 全体の rect = popup の見える範囲)。
-        // popup_rect_clamped_at で画面下端 / 右端の clamp 込み (flip しない、 DAW 標準)。
-        if pointer.secondary_just_pressed
+        // 右クリックが rect 内なら、その pos を open trigger にする。検出を済ませたら
+        // 描画 / 選択処理は programmatic な `context_menu_at` に委譲 (DRY)。id は rect 由来で
+        // 従来互換 (同じ rect → 毎フレーム同じ popup)。
+        let open_at = if pointer.secondary_just_pressed
             && let Some((px, py)) = pointer.pos
             && rect.contains(px, py)
         {
+            Some((px, py))
+        } else {
+            None
+        };
+        self.context_menu_at(
+            ("context_menu", rect.x.to_bits(), rect.y.to_bits()),
+            open_at,
+            items,
+            on_select,
+        );
+    }
+
+    /// 任意座標に programmatic にコンテキストメニューを開く。`context_menu_for` の
+    /// 「右クリック検出を caller 側が済ませた」版で、`open_at` が `Some(pos)` の frame に
+    /// `pos` を anchor (画面下端 / 右端 clamp 込み、flip しない DAW 標準) にメニューを開く。
+    /// 以後は item 選択 / メニュー外 click まで描画を維持する (immediate-mode、**毎フレーム
+    /// 呼ぶ**)。
+    ///
+    /// `arrangement` の `SecondaryClickEmpty` 等、**既に検出済みのイベント**に応じてメニューを
+    /// 出す用途。典型的には caller は (a) イベント発生 frame に pos + 文脈 (track / beat 等) を
+    /// model へ stash し、(b) 次フレーム以降 `open_at = stash_pos.take()` (1 frame だけ `Some`)
+    /// で開き、(c) `on_select` で stash した文脈を使って `push_edit` する。
+    ///
+    /// `id`: popup の同一性キー (同じ menu を指す限り毎フレーム同じ値を渡す)。
+    /// `on_select`: item index と `&mut Ui` を受け、選択時に任意操作を行う
+    /// (`context_menu_for` と同一シグネチャ)。
+    pub fn context_menu_at<F>(
+        &mut self,
+        id: impl std::hash::Hash,
+        open_at: Option<(f32, f32)>,
+        items: &[&str],
+        on_select: F,
+    ) where
+        F: for<'ui> FnOnce(usize, &mut Ui<'ui, M>),
+    {
+        let menu_id = ("context_menu_at", &id);
+        let n = items.len();
+        if let Some((px, py)) = open_at {
             let popup_h = (n as f32) * MENU_ITEM_H;
             let anchor = crate::popup::popup_rect_clamped_at(
                 (px, py),
@@ -1205,5 +1241,71 @@ mod tests {
             texts.is_empty(),
             "閉じている状態では hover で開かない: {texts:?}"
         );
+    }
+
+    // ===== M14 Phase 99 (daw_01 #071): context_menu_at (programmatic open) =====
+
+    /// `open_at = Some(pos)` で popup を開き、item text が popup glyph に描画される。
+    #[test]
+    fn context_menu_at_opens_and_draws_items() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.context_menu_at("ctx", Some((50.0, 60.0)), &["Alpha", "Beta"], |_idx, _ui| {});
+        });
+        let texts: Vec<&str> = scene.iter_popup_glyphs().map(|g| g.text.as_ref()).collect();
+        assert!(
+            texts.contains(&"Alpha") && texts.contains(&"Beta"),
+            "open_at=Some で items が popup に描画される: {texts:?}"
+        );
+    }
+
+    /// `open_at = None` のまま (一度も開いていない) なら popup は出ない。
+    #[test]
+    fn context_menu_at_none_does_not_open() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.context_menu_at("ctx", None, &["Alpha", "Beta"], |_idx, _ui| {});
+        });
+        let texts: Vec<&str> = scene.iter_popup_glyphs().map(|g| g.text.as_ref()).collect();
+        assert!(texts.is_empty(), "open_at=None で popup は出ない: {texts:?}");
+    }
+
+    /// open 後に item をクリック → on_select が当該 index で発火する。
+    #[test]
+    fn context_menu_at_click_fires_on_select() {
+        struct Sel {
+            picked: Option<usize>,
+        }
+        let mut host: UiHost<Sel> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let mut model = Sel { picked: None };
+
+        // frame 1: (50,60) で開く (anchor = {50,60,180,48}、 item0 = y[60,84))。
+        host.frame(&mut model, &mut scene, screen, FrameInput::default(), |_m, ui| {
+            ui.context_menu_at("ctx", Some((50.0, 60.0)), &["Alpha", "Beta"], |idx, ui| {
+                ui.push_edit(Edit::mutate(move |m: &mut Sel| m.picked = Some(idx)));
+            });
+        });
+        // frame 2: item0 中央 (140,72) を click (release) → on_select(0)。
+        scene.clear();
+        let click = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((140.0, 72.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        host.frame(&mut model, &mut scene, screen, click, |_m, ui| {
+            ui.context_menu_at("ctx", None, &["Alpha", "Beta"], |idx, ui| {
+                ui.push_edit(Edit::mutate(move |m: &mut Sel| m.picked = Some(idx)));
+            });
+        });
+        assert_eq!(model.picked, Some(0), "item0 click → on_select(0) 発火");
     }
 }

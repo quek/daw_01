@@ -177,6 +177,16 @@ struct DawModel {
     /// `Some(id)` の間 1 フレームごとに `ui.color_picker` を呼んで overlay 描画する。 picker の
     /// `dismissed` で `None` に戻す。
     arr_color_picker_target: Option<u32>,
+    /// M14 Phase 99 (daw_01 #071): 空きレーン右クリック (`SecondaryClickEmpty`) で開く
+    /// コンテキストメニューの stash。`Some((track, beat, pos))` の間、毎フレーム
+    /// `ui.context_menu_at` を呼んで `pos` にメニューを描画する (color_picker overlay と同 idiom)。
+    /// on_select (= Text クリップ生成) / 外 click で閉じたら `None` に戻す。
+    arr_ctx_menu: Option<(u32, f64, (f32, f32))>,
+    /// 上記メニューの 1-shot open trigger。`SecondaryClickEmpty` 受信 Edit で `true` にし、
+    /// `draw_arrangement_tab` が `open_at = Some(pos)` を 1 フレームだけ渡したら `false` に戻す
+    /// (毎フレーム `Some` を渡すと outside-click で閉じても翌フレーム再 open してしまうため)。
+    /// `open_demo_request` と同じ 1 frame レイテンシ flag idiom。
+    arr_ctx_menu_open: bool,
     /// (M11 Phase 51) `Ui::reorderable_list` demo 用。Demo Dialog の plugin chain。
     /// drag&drop で並び替え、`ReorderableListEditRequest::Reorder(order)` で新順 index 列を受信。
     demo_chain: Vec<String>,
@@ -298,6 +308,8 @@ impl DawModel {
             arr_next_share_group_id: 0,
             arr_rename_target: None,
             arr_color_picker_target: None,
+            arr_ctx_menu: None,
+            arr_ctx_menu_open: false,
             // M14 Phase 63n-10 (#034): SongTempo 模擬の lane 1 つで起動 (= 上端 master row が "Master" と
             // tempo curve を 1 行で表示)。 daw_01 conversation #034 §C 仕様に従う初期値。 ▶/▼ disclosure
             // で折り畳み確認、 dblclick で point 追加 (既存 EditRequest 流用 + `track == MASTER_TRACK_ID`
@@ -1525,6 +1537,16 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                     mm.last_action = format!("arr: CreateClip @ track {track} beat {beat:.2}");
                 })
             }
+            // M14 Phase 99 (daw_01 #071): 空きレーン右クリック → context menu を出すため stash + open
+            // trigger を立てる (実メニューは draw_arrangement_tab が `ui.context_menu_at` で描画)。
+            ArrangementEditRequest::SecondaryClickEmpty { track, beat, pos } => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    mm.arr_ctx_menu = Some((track, beat, pos));
+                    mm.arr_ctx_menu_open = true;
+                    mm.last_action =
+                        format!("arr: SecondaryClickEmpty @ track {track} beat {beat:.2}");
+                })
+            }
             ArrangementEditRequest::BeginRenameTrack(id) => Edit::mutate(move |mm: &mut DawModel| {
                 mm.arr_rename_target = Some(id);
                 mm.last_action = format!("arr: BeginRenameTrack {id}");
@@ -2306,6 +2328,51 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 mm.arr_color_picker_target = None;
             }));
         }
+    }
+
+    // ---- M14 Phase 99 (daw_01 #071): 空きレーン右クリック → context menu (Text クリップ生成) ----
+    // `SecondaryClickEmpty` を受けて stash した `(track, beat, pos)` を使い、毎フレーム
+    // `ui.context_menu_at` で `pos` にメニューを描画する (REAPER の右クリック空きエリア → Insert
+    // new item idiom)。open_at は 1-shot flag で 1 フレームだけ `Some(pos)` を渡す。on_select で
+    // stash した track / beat に Text クリップを生成する (= daw_01 が想定する使い方の最小再現)。
+    if let Some((track, beat, pos)) = m.arr_ctx_menu {
+        let open_at = if m.arr_ctx_menu_open { Some(pos) } else { None };
+        if m.arr_ctx_menu_open {
+            ui.push_edit(Edit::mutate(|mm: &mut DawModel| {
+                mm.arr_ctx_menu_open = false;
+            }));
+        }
+        ui.context_menu_at("arr_secondary_menu", open_at, &["Text クリップ"], move |idx, ui| {
+            if idx == 0 {
+                ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(t) = mm.arr_tracks.iter_mut().find(|t| t.id == track) {
+                        let new_id = t.next_clip_id;
+                        t.next_clip_id += 1;
+                        let clip = DawClip {
+                            id: new_id,
+                            start_beat: beat.max(0.0),
+                            len_beats: 2.0,
+                            name: Arc::from(format!("text{new_id}")),
+                            color: None,
+                            share_group_id: None,
+                            audio_edit: None,
+                        };
+                        let p = t
+                            .clips
+                            .iter()
+                            .position(|c| c.start_beat > clip.start_beat)
+                            .unwrap_or(t.clips.len());
+                        t.clips.insert(p, clip);
+                    }
+                    mm.arr_view.data_generation += 1;
+                    mm.arr_ctx_menu = None;
+                    mm.last_action = format!(
+                        "arr: Text clip @ track {track} beat {beat:.2} (pos {:.0},{:.0})",
+                        pos.0, pos.1
+                    );
+                }));
+            }
+        });
     }
 
     // ---- M14 Phase 63n-2 (#028): automation point 右クリック → curve type popup ----

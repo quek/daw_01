@@ -1435,6 +1435,34 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         Some((px, py))
     }
 
+    /// `rect` 内で secondary (右) が **press された** frame に 1 度だけ `Some((x, y))` を返す。
+    ///
+    /// `take_primary_press_in_rect` の secondary 版。右クリック起点の view 操作
+    /// (例: arrangement の空きレーン右クリック → `SecondaryClickEmpty`) で使う。
+    ///
+    /// semantics:
+    /// - rect 内で secondary がこのフレームに新たに押下された (= `secondary_just_pressed`) → `Some((x, y))`
+    /// - rect 外 / press なし / modal popup 配下 → `None`
+    /// - 戻り座標は press 時点の pointer 位置 (viewport 座標)
+    ///
+    /// **primary 版と違い consume はしない**: secondary press は edge bool で 1 frame しか立たず、
+    /// caller (arrangement) は rect 全体で take した後に「clip / automation 上か空きか」を判定して
+    /// 空きのときだけ emit する。ここで rect 全体を consume すると clip 上の右クリック (caller の
+    /// clip context menu 用) まで握りつぶしてしまうため、消費は呼び出し側の判断に委ねる。
+    pub fn take_secondary_press_in_rect(&mut self, rect: Rect) -> Option<(f32, f32)> {
+        if self.pointer_blocked_by_modal_popup() {
+            return None;
+        }
+        if !self.pointer.secondary_just_pressed {
+            return None;
+        }
+        let (px, py) = self.pointer.pos?;
+        if !rect.contains(px, py) {
+            return None;
+        }
+        Some((px, py))
+    }
+
     // ============================================================
     // M8 Phase 29: history (undo / redo)
     // ============================================================
@@ -3138,6 +3166,62 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    // -------- M14 Phase 99 (#071): take_secondary_press_in_rect --------
+
+    fn secondary_press_at(x: f32, y: f32) -> FrameInput {
+        FrameInput {
+            pointer: PointerFrame {
+                pos: Some((x, y)),
+                secondary_just_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn take_secondary_press_in_rect_inside_returns_some() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+        host.frame_to_edits(&(), &mut scene, screen, secondary_press_at(120.0, 80.0), |(), ui| {
+            assert_eq!(ui.take_secondary_press_in_rect(rect), Some((120.0, 80.0)));
+        });
+    }
+
+    #[test]
+    fn take_secondary_press_in_rect_outside_rect_returns_none() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let small_rect = Rect { x: 200.0, y: 200.0, w: 50.0, h: 50.0 };
+        host.frame_to_edits(&(), &mut scene, screen, secondary_press_at(10.0, 10.0), |(), ui| {
+            assert_eq!(ui.take_secondary_press_in_rect(small_rect), None, "rect 外 → None");
+        });
+    }
+
+    #[test]
+    fn take_secondary_press_in_rect_ignores_primary_press() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+        // primary press のみ (secondary なし) → secondary press 取得は None。
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((100.0, 100.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        host.frame_to_edits(&(), &mut scene, screen, input, |(), ui| {
+            assert_eq!(ui.take_secondary_press_in_rect(rect), None, "primary press は無視");
+        });
     }
 
     #[test]

@@ -585,6 +585,18 @@ pub enum ArrangementEditRequest {
     DeleteClips(Vec<ClipKey>),
     DoubleClickClip(ClipKey),
     DoubleClickEmpty { track: u32, beat: f64 },
+    /// M14 Phase 99 (daw_01 #071): 空きレーン (clip / automation lane に吸収されない真の
+    /// track row 空白) の **右クリック (secondary press)**。`DoubleClickEmpty` と対になる
+    /// secondary 版で、「右クリック → コンテキストメニューで clip 種別を選んで生成」
+    /// (REAPER の右クリック空きエリア → Insert new item idiom) の入口。
+    /// - `beat`: `DoubleClickEmpty` と同様 **widget 内で snap 済み**の絶対 beat (caller は
+    ///   後処理不要)。`track`: track id。
+    /// - `pos`: コンテキストメニューの表示アンカー用の右クリック座標 (viewport 座標、popup の
+    ///   anchor 系と同じ)。caller は `ui.context_menu_at(id, Some(pos), items, on_select)` 等で
+    ///   この pos にメニューを開ける。
+    /// - master row 上 / clip 上 / automation lane 上では発火しない (= `DoubleClickEmpty` と
+    ///   同じ exclusion)。
+    SecondaryClickEmpty { track: u32, beat: f64, pos: (f32, f32) },
     BeginRenameTrack(u32),
     DeleteTrack(u32),
     MoveTrackUp(u32),
@@ -7668,6 +7680,52 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     self.push_edit(make_edit(ArrangementEditRequest::DoubleClickEmpty {
                         track: t.id,
                         beat,
+                    }));
+                }
+            }
+        }
+
+        // ---- secondary (右) click in 空きレーン → SecondaryClickEmpty (daw_01 #071) ----
+        // `DoubleClickEmpty` と対になる secondary 版。 clip_hit / automation_lane_at に吸収
+        // されない「真の空き track row」 上の右クリックのみ発火する (= 上の dblclick 経路の
+        // 空き track row branch と同じ exclusion)。 clip / automation lane 上の右クリックは
+        // caller (daw_01) の clip context menu 用に握りつぶさず素通しする (= take はするが
+        // consume しない `take_secondary_press_in_rect` の設計)。 beat は widget 内で snap 済み、
+        // pos は menu anchor 用の右クリック viewport 座標。
+        if let Some((cx, cy)) = self.take_secondary_press_in_rect(lanes) {
+            let on_clip =
+                clip_hit(&visible_tracks, &press_tops, view, lanes, cx, cy, style.resize_handle_px)
+                    .is_some();
+            let on_lane = automation_lane_at(
+                &visible_tracks,
+                &press_tops,
+                view.track_row_h,
+                header_pane.x,
+                header_pane.w,
+                lanes.x,
+                lanes.w,
+                style,
+                cy,
+            )
+            .is_some();
+            if !on_clip
+                && !on_lane
+                && let Some(idx) = track_index_from_y(cy, lanes.y, &press_tops)
+                && let Some(t) = visible_tracks.get(idx)
+                // master row は clip 概念を持たないため発火しない (DoubleClickEmpty と同じ)。
+                && t.id != MASTER_TRACK_ID
+            {
+                let track_row_top = press_tops[idx];
+                if cy < track_row_top + effective_track_row_h(t, view.track_row_h) {
+                    let raw_beat = px_to_beat(cx, lanes.x, lanes.w, view);
+                    // dblclick と同じく widget 内 snap。 single frame の press なので drag state は
+                    // 関与せず直接 `pointer.modifiers.alt` を読んでよい。
+                    let beat =
+                        view.snap.snap_beat(raw_beat, pointer.modifiers.alt, zoom_x_px_per_beat);
+                    self.push_edit(make_edit(ArrangementEditRequest::SecondaryClickEmpty {
+                        track: t.id,
+                        beat,
+                        pos: (cx, cy),
                     }));
                 }
             }

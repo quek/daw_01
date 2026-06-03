@@ -240,6 +240,9 @@ fn main() {
                     ArrangementEditRequest::DoubleClickEmpty { .. } => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
+                    ArrangementEditRequest::SecondaryClickEmpty { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
                     ArrangementEditRequest::BeginRenameTrack(_) => {
                         Edit::mutate(|_m: &mut Model| {})
                     }

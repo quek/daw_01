@@ -52,6 +52,8 @@ struct ObsModel {
     lasso_active_frames: Vec<bool>,
     /// M14 Phase 63n-9 (#033): 観測した SetAutomationCurveParam の (point, kind, prev, next) 列。
     curve_param_events: Vec<(AutomationPointKey, SetAutomationCurveParamKind, f32, f32)>,
+    /// M14 Phase 99 (#071): 観測した `SecondaryClickEmpty` の (track, beat, pos) 列。
+    secondary_empty: Vec<(u32, f64, (f32, f32))>,
 }
 
 fn make_lane(id: u32, enabled: bool) -> ArrangementAutomationLane {
@@ -147,6 +149,46 @@ fn pointer_release(x: f32, y: f32, modifiers: Modifiers) -> PointerFrame {
         primary_just_released: true,
         modifiers,
         ..PointerFrame::default()
+    }
+}
+
+/// M14 Phase 99 (#071): 右クリック (secondary press) frame。
+fn pointer_secondary_press(x: f32, y: f32) -> PointerFrame {
+    PointerFrame {
+        pos: Some((x, y)),
+        secondary_just_pressed: true,
+        ..PointerFrame::default()
+    }
+}
+
+/// main row に clip を 1 つ持ち automation lane を持たない track (clip exclusion test 用)。
+fn make_clip_track(id: u32) -> ArrangementTrack {
+    ArrangementTrack {
+        id,
+        name: Arc::from(format!("t{id}")),
+        muted: false,
+        solo: false,
+        armed: false,
+        clips: vec![ArrangementClip {
+            id: 100,
+            start_beat: 0.0,
+            len_beats: 8.0,
+            name: Arc::from("c1"),
+            color: None,
+            share_group_color: None,
+            audio_edit: None,
+            thumbnail: None,
+            in_active_group: false,
+        }],
+        volume: 1.0,
+        parent_id: None,
+        depth: 0,
+        collapsed: false,
+        kind: TrackKind::Audio,
+        automation_lanes_collapsed: true,
+        automation_lanes: Vec::new(),
+        row_h: None,
+        color: None,
     }
 }
 
@@ -279,6 +321,11 @@ fn run_arrangement_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: F
                         };
                     }
                 }),
+                ArrangementEditRequest::SecondaryClickEmpty { track, beat, pos } => {
+                    Edit::mutate(move |mm: &mut ObsModel| {
+                        mm.secondary_empty.push((track, beat, pos));
+                    })
+                }
                 _ => Edit::mutate(|_| {}),
             },
         );
@@ -1434,4 +1481,62 @@ fn lasso_active_flag_set_during_drag() {
         "press + continuation で active=true が 2 回以上観測される: {:?}",
         m.lasso_active_frames
     );
+}
+
+// ===== M14 Phase 99 (daw_01 #071): 空きレーン右クリック → SecondaryClickEmpty =====
+//
+// lanes pane は x=[200,800) (header_w=200)、 main track row は y=[0,32) (track_row_h=32)、
+// automation lane 行は y=[32,92) (height_px=60)。 beat は snap OFF で raw、
+// px_to_beat(cx)=(cx-200)/600*16。 cx=350 → beat 4.0。
+
+/// main row 空白の右クリック → SecondaryClickEmpty を track / snapped beat / pos 付きで発火。
+#[test]
+fn secondary_click_on_empty_track_row_emits() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    // 自動 lane 持ちだが main row には clip なし → main row (y<32) は真の空き。
+    m.tracks = vec![make_track(1, vec![make_lane(10, true)])];
+
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_secondary_press(350.0, 16.0),
+        ..FrameInput::default()
+    });
+
+    assert_eq!(m.secondary_empty.len(), 1, "空き右クリックで 1 度発火: {:?}", m.secondary_empty);
+    let (track, beat, pos) = m.secondary_empty[0];
+    assert_eq!(track, 1, "track id");
+    assert!((beat - 4.0).abs() < 0.01, "snapped beat ≈ 4.0: {beat}");
+    assert_eq!(pos, (350.0, 16.0), "pos = 右クリック viewport 座標");
+}
+
+/// clip 上の右クリック → SecondaryClickEmpty は発火しない (caller の clip context menu 用)。
+#[test]
+fn secondary_click_on_clip_does_not_emit() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    // main row に clip [0..8] beat。 cx=350 (beat 4.0) は clip 内。
+    m.tracks = vec![make_clip_track(1)];
+
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_secondary_press(350.0, 16.0),
+        ..FrameInput::default()
+    });
+
+    assert!(m.secondary_empty.is_empty(), "clip 上では発火しない: {:?}", m.secondary_empty);
+}
+
+/// automation lane 上の右クリック → SecondaryClickEmpty は発火しない (lane に吸収)。
+#[test]
+fn secondary_click_on_automation_lane_does_not_emit() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lane(10, true)])];
+
+    // y=60 は lane 行 (y=[32,92)) 内。
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_secondary_press(350.0, 60.0),
+        ..FrameInput::default()
+    });
+
+    assert!(m.secondary_empty.is_empty(), "automation lane 上では発火しない: {:?}", m.secondary_empty);
 }
