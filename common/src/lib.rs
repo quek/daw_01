@@ -6,6 +6,7 @@ pub mod clap_scan;
 pub mod logging;
 pub mod meter;
 pub mod model;
+pub mod lipsync;
 pub mod plugin_db;
 pub mod plugin_format;
 pub mod plugin_metadata;

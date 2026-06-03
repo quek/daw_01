@@ -79,11 +79,14 @@ const QUERY_SPEAKER: u32 = 6000;
 /// Default singer for frame_synthesis when no explicit override is given.
 /// 3061 = 中国うさぎ ノーマル.
 pub const DEFAULT_SINGER_ID: u32 = 3061;
-const FRAME_RATE: f64 = 93.75; // 24000 Hz / 256 samples
+/// VOICEVOX frame rate (24000 Hz / 256 samples). 口パク (`crate::lipsync`) の
+/// frame_length → beat 変換でも参照する。
+pub(crate) const FRAME_RATE: f64 = 93.75;
 const OUTPUT_SAMPLE_RATE: u32 = 48000;
 /// Silence frames prepended/appended to every sing query so the synth
-/// engine has room for attack/release envelopes.
-const REST_FRAMES: u32 = 10;
+/// engine has room for attack/release envelopes. 口パクの先頭 pau lead-in
+/// オフセットでも同じ値を使い、音声と口を揃える。
+pub(crate) const REST_FRAMES: u32 = 10;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -311,6 +314,69 @@ fn synthesize_sing_clip(
     }
 
     Ok(wav.to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// Lip-sync phoneme query (口パク, docs/plan_pakupaku.md §5)
+// ---------------------------------------------------------------------------
+
+/// VOICEVOX が返す 1 phoneme とその長さ (VOICEVOX frame 単位、`FRAME_RATE`
+/// = 93.75fps)。`phoneme` は `"a"`/`"i"`/.../`"N"`/`"cl"`/`"pau"` や子音記号。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Phoneme {
+    pub phoneme: String,
+    pub frame_length: u32,
+}
+
+/// 口パク (lip-sync) 用: `sing_frame_audio_query` **だけ** を叩いて phoneme 列を
+/// 取得する。`frame_synthesis` は呼ばない (口パクに音声 WAV は不要、phoneme
+/// タイミングだけ要る = 軽い)。`build_sing_query` を音声合成と共用するので、
+/// 得られる phoneme は実際に鳴る歌唱と完全に一致する (= 口と音声が同期)。
+///
+/// 戻り値は先頭/末尾の `REST_FRAMES` 分の `pau` も含む VOICEVOX 生の phoneme 列
+/// (frame 0 起点)。beat への配置は `crate::lipsync` 側で行う。
+pub fn query_phonemes(notes: &[Note], bpm: f32) -> Result<Vec<Phoneme>> {
+    let client = reqwest::blocking::Client::new();
+    let query_json = build_sing_query(notes, bpm);
+    let url = format!("{VOICEVOX_URL}/sing_frame_audio_query?speaker={QUERY_SPEAKER}");
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(query_json)
+        .send()
+        .context("sing_frame_audio_query request failed")?;
+    let status = resp.status();
+    let body = resp.text().context("reading sing query response")?;
+    anyhow::ensure!(
+        status.is_success(),
+        "sing_frame_audio_query returned {}: {}",
+        status,
+        &body[..body.len().min(200)]
+    );
+    parse_phonemes(&body)
+}
+
+/// `sing_frame_audio_query` 応答 JSON から `phonemes` 配列を抽出する。各要素は
+/// `{ "phoneme": "...", "frame_length": N }` (VOICEVOX FrameAudioQuery)。
+/// REAPER `pakupaku.lua` の `parse_phonemes` と同構造。
+fn parse_phonemes(body: &str) -> Result<Vec<Phoneme>> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).context("parsing sing_frame_audio_query JSON")?;
+    let arr = json["phonemes"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("sing_frame_audio_query response has no phonemes array"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for p in arr {
+        let phoneme = p["phoneme"].as_str().unwrap_or("").to_string();
+        let frame_length = p["frame_length"].as_u64().unwrap_or(0) as u32;
+        if !phoneme.is_empty() {
+            out.push(Phoneme {
+                phoneme,
+                frame_length,
+            });
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -665,6 +731,7 @@ mod tests {
             content_id: 0,
             notes: Vec::new(),
             color: None,
+            auto_lipsync: false,
         };
         let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);
@@ -688,6 +755,7 @@ mod tests {
                 lyric: Some("ら".into()),
             }],
             color: None,
+            auto_lipsync: false,
         };
         let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);
@@ -723,6 +791,7 @@ mod tests {
                 },
             ],
             color: None,
+            auto_lipsync: false,
         };
         let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);
@@ -764,6 +833,7 @@ mod tests {
                 },
             ],
             color: None,
+            auto_lipsync: false,
         };
         let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);
@@ -789,6 +859,7 @@ mod tests {
                 lyric: Some("\"a\"".into()),
             }],
             color: None,
+            auto_lipsync: false,
         };
         let q = build_sing_query(&clip.notes, 120.0);
         // Must remain valid JSON despite embedded quotes.
@@ -820,6 +891,7 @@ mod tests {
                 },
             ],
             color: None,
+            auto_lipsync: false,
         };
         let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);

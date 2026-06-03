@@ -1620,6 +1620,13 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
                 }
             })
         }
+        // gui_01 #071 (空きレーン右クリック): widget が空き track row の右クリックで
+        // 発火する context-menu 要求 ({ track, beat, pos })。daw_01 側の本配線
+        // (右クリックメニュー) は #071 の別タスク。この pakupaku worktree では
+        // build を通すための no-op に留める。
+        ArrangementEditRequest::SecondaryClickEmpty { .. } => {
+            Edit::mutate(|_app: &mut AppData| {})
+        }
     }
 }
 

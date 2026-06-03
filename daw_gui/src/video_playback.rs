@@ -1394,6 +1394,7 @@ mod tests {
             content_id,
             notes: Vec::new(),
             color: None,
+            auto_lipsync: false,
         });
         song.tracks.push(track);
         song
@@ -1720,6 +1721,7 @@ mod tests {
                 content_id: cid2,
                 notes: Vec::new(),
                 color: None,
+                auto_lipsync: false,
             }],
             next_clip_id: 2,
             ..Track::default()

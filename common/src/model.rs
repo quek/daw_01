@@ -8,6 +8,15 @@ use crate::plugin_format::PluginFormat;
 use crate::protocol::PluginSlot;
 use crate::scale::ScaleChange;
 
+/// `21` 口パク (lip-sync): vocal track に `lipsync_target_track: Option<u32>`
+/// (口パク画像を焼き込む立ち絵 group 内 image track の id)、口 track に
+/// `mouth_map: Option<MouthMap>` (口形状 7 種 → ImageSourceId)、`Clip` に
+/// `auto_lipsync: bool` (自動生成 clip 印、再生成で全置換) が追加される。VOICEVOX
+/// の phoneme タイミングから口画像を `ImageEvent` 列として生成する派生データで、
+/// SSoT は vocal の notes+lyric + `mouth_map`。v20 `.daw` files still load — 全 field
+/// が `#[serde(default)]` で forward-migrate (binding / map は `None`、`auto_lipsync`
+/// は `false`)。See `docs/plan_pakupaku.md`.
+///
 /// `20` 共有クリップ名: `Song.clip_content_names: HashMap<ContentId, String>`
 /// が追加。 同 `content_id` を共有する全 clip の表示名をここで 1 実体共有し、
 /// 片方を rename すると linked clip 全部に連動する。 legacy per-clip
@@ -100,7 +109,7 @@ use crate::scale::ScaleChange;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 20;
+pub const CURRENT_VERSION: u32 = 21;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -1187,6 +1196,19 @@ pub struct Track {
     /// forward-migrate to `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_transform: Option<GroupTransform>,
+    /// v21 (`docs/plan_pakupaku.md`): 口パク出力先。`Some(track_id)` ⇒ この
+    /// vocal track の notes+歌詞から生成した口画像 `ImageEvent` 列を、指定の
+    /// 口 track (= 立ち絵 group 内の子 image track) へ焼き込む。設定が arm に
+    /// あたり、notes/歌詞/`mouth_map` 変更で自動再生成される (派生データ)。
+    /// vocal track 以外では意味を持たない。v20 files forward-migrate to `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lipsync_target_track: Option<u32>,
+    /// v21 (`docs/plan_pakupaku.md`): 口形状 → `ImageSourceId` のマッピング。
+    /// 口 track (= `lipsync_target_track` が指す側) に持たせ、生成時に各 phoneme
+    /// の口形状をこの表で画像へ解決する。`None` ⇒ 未設定 (口パク未割当)。
+    /// v20 files forward-migrate to `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mouth_map: Option<MouthMap>,
 }
 
 /// Where a `Send` taps the source track's signal chain.
@@ -1258,6 +1280,8 @@ impl Default for Track {
             next_lane_id: 1,
             color: None,
             group_transform: None,
+            lipsync_target_track: None,
+            mouth_map: None,
         }
     }
 }
@@ -1464,6 +1488,13 @@ pub struct Clip {
     /// `None` (= inherit).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<[f32; 3]>,
+    /// v21 (`docs/plan_pakupaku.md`): 口パク自動生成 clip の印。`true` ⇒ この
+    /// clip は vocal の notes+歌詞+`mouth_map` から導出された派生物で、再生成時に
+    /// 口 track 上の `auto_lipsync == true` clip は全削除 → 再構築される
+    /// (手編集は保持しない)。ユーザが手で置いた clip は `false` のまま温存。
+    /// v20 files forward-migrate to `false`。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_lipsync: bool,
 }
 
 /// Shared content referenced by one or more `Clip`s via
@@ -2089,6 +2120,69 @@ impl Default for ImageEvent {
             fade_in_curve: FadeCurve::Linear,
             fade_out_curve: FadeCurve::Linear,
         }
+    }
+}
+
+/// 口形状クラス (lip-sync, v21、`docs/plan_pakupaku.md`)。VOICEVOX phoneme を
+/// この 7 種へ畳む。母音 a/i/u/e/o、撥音 N (ん)、閉口 Closed (cl 促音 / pau
+/// ポーズ / 子音で続く母音が無い場合 / 未割当時の fallback)。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode,
+)]
+pub enum MouthShape {
+    A,
+    I,
+    U,
+    E,
+    O,
+    N,
+    Closed,
+}
+
+/// 口形状 → `ImageSourceId` のマッピング (lip-sync, v21)。`0` = 未割当
+/// sentinel。口 track (= vocal の `lipsync_target_track` が指す image track) に
+/// `Track.mouth_map` として持たせる。各 slot には通常の image import で
+/// `Song.image_sources` に登録した口画像の id を割り当てる (id 参照のみを保持し、
+/// 画像実体はプール 1 箇所が SSoT)。
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode,
+)]
+pub struct MouthMap {
+    pub a: ImageSourceId,
+    pub i: ImageSourceId,
+    pub u: ImageSourceId,
+    pub e: ImageSourceId,
+    pub o: ImageSourceId,
+    pub n: ImageSourceId,
+    pub closed: ImageSourceId,
+}
+
+impl MouthMap {
+    /// その口形状に割り当てられた id (未割当なら `0`)。
+    pub fn get(&self, shape: MouthShape) -> ImageSourceId {
+        match shape {
+            MouthShape::A => self.a,
+            MouthShape::I => self.i,
+            MouthShape::U => self.u,
+            MouthShape::E => self.e,
+            MouthShape::O => self.o,
+            MouthShape::N => self.n,
+            MouthShape::Closed => self.closed,
+        }
+    }
+
+    /// 描画に使う id を解決する。slot が未割当 (`0`) なら閉口へ fallback し、
+    /// 閉口も未割当なら `0` (= 描画なし) を返す。
+    pub fn resolve(&self, shape: MouthShape) -> ImageSourceId {
+        let id = self.get(shape);
+        if id != 0 { id } else { self.closed }
+    }
+
+    /// いずれかの slot に割当がある (= 口パクを生成する意味がある)。
+    pub fn is_configured(&self) -> bool {
+        [self.a, self.i, self.u, self.e, self.o, self.n, self.closed]
+            .iter()
+            .any(|&id| id != 0)
     }
 }
 
@@ -2772,6 +2866,7 @@ mod tests {
                         },
                     ],
                     color: None,
+                    auto_lipsync: false,
                 }],
                 ..Track::default()
             }],
@@ -2788,7 +2883,7 @@ mod tests {
         // v19 files forward-migrate via `#[serde(default)]` (empty map) +
         // `ensure_clip_contents` backfill. Pinning the constant catches
         // accidental rollback. See `docs/plan_clip_shared_name.md`.
-        assert_eq!(CURRENT_VERSION, 20);
+        assert_eq!(CURRENT_VERSION, 21);
     }
 
     #[test]
@@ -3182,6 +3277,7 @@ mod tests {
                 content_id: cid,
                 notes: Vec::new(),
                 color: None,
+                auto_lipsync: false,
             }],
             automation_lanes: vec![AutomationLane {
                 id: 1,
@@ -3343,6 +3439,7 @@ mod tests {
                 content_id: cid,
                 notes: Vec::new(),
                 color: None,
+                auto_lipsync: false,
             }],
             next_clip_id: 2,
             ..Track::default()

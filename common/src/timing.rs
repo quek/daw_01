@@ -96,6 +96,7 @@ mod tests {
                     content_id: 0,
                     notes: Vec::new(),
                     color: None,
+                    auto_lipsync: false,
                 }],
                 ..Track::default()
             }],
@@ -159,6 +160,7 @@ mod tests {
                         content_id: 0,
                         notes: Vec::new(),
                         color: None,
+                        auto_lipsync: false,
                     }],
                     ..Track::default()
                 },
@@ -172,6 +174,7 @@ mod tests {
                         content_id: 0,
                         notes: Vec::new(),
                         color: None,
+                        auto_lipsync: false,
                     }],
                     ..Track::default()
                 },

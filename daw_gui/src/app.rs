@@ -10244,6 +10244,7 @@ impl AppData {
             content_id: new_content_id,
             notes: Vec::new(),
             color: None,
+            auto_lipsync: false,
         });
 
         self.resize_track_peak_display();
@@ -11697,6 +11698,7 @@ impl AppData {
             content_id,
             notes: Vec::new(),
             color: None,
+            auto_lipsync: false,
         });
         let r = ClipRef {
             track: source.track,
@@ -11736,6 +11738,7 @@ impl AppData {
             content_id: new_content_id,
             notes: Vec::new(),
             color: None,
+            auto_lipsync: false,
         });
         let r = ClipRef {
             track: source.track,
@@ -11779,6 +11782,7 @@ impl AppData {
                 content_id,
                 notes: Vec::new(),
                 color: None,
+                auto_lipsync: false,
             });
             new_refs.push(ClipRef {
                 track: to_track_idx as u32,
@@ -11824,6 +11828,7 @@ impl AppData {
                 content_id: new_content_id,
                 notes: Vec::new(),
                 color: None,
+                auto_lipsync: false,
             });
             new_refs.push(ClipRef {
                 track: to_track_idx as u32,
@@ -11888,6 +11893,7 @@ impl AppData {
             content_id,
             notes: Vec::new(),
             color: None,
+            auto_lipsync: false,
         });
         // 名前は content_id 単位 SSoT へ (track borrow が切れた後に書く)。
         self.song.set_content_name(content_id, name);
@@ -14225,6 +14231,7 @@ impl AppData {
                 content_id,
                 notes: Vec::new(),
                 color: None,
+                auto_lipsync: false,
             });
             next_start_beat += length_beats;
             imported_ok += 1;
@@ -14356,6 +14363,7 @@ impl AppData {
                 content_id: v_content_id,
                 notes: Vec::new(),
                 color: None,
+                auto_lipsync: false,
             });
             self.song.tracks.push(video_track);
 
@@ -14397,6 +14405,7 @@ impl AppData {
                     content_id: a_content_id,
                     notes: Vec::new(),
                     color: None,
+                    auto_lipsync: false,
                 });
                 self.song.tracks.push(audio_track);
             }
@@ -14572,6 +14581,7 @@ impl AppData {
                 content_id: i_content_id,
                 notes: Vec::new(),
                 color: None,
+                auto_lipsync: false,
             });
             // 既存 track に複数枚貼るときだけ順送り。 新規 track 経路は各画像が
             // 自分の track を持つので beat 0 固定 (従来挙動)。
@@ -14639,6 +14649,7 @@ impl AppData {
             content_id,
             notes: Vec::new(),
             color: None,
+            auto_lipsync: false,
         });
         self.song.tracks.insert(0, text_track);
 
@@ -15251,6 +15262,7 @@ impl AppData {
             content_id: back_content_id,
             notes: Vec::new(),
             color: None,
+            auto_lipsync: false,
         });
         new_selection.push(target);
         new_selection.push(ClipRef {
@@ -15519,6 +15531,7 @@ impl AppData {
                 content_id: new_content_id,
                 notes: Vec::new(),
                 color: None,
+                auto_lipsync: false,
             });
             new_refs.push(ClipRef {
                 track: track_idx,
