@@ -227,8 +227,11 @@ impl DawModel {
             };
             // M14 Phase 87 (#059) demo: 一部 track に初期色を seed して header 左端ストライプの
             // 動作確認 (Phase 88 の color_picker で右クリック → "Color..." で編集可能になる)。
+            // M14 Phase 97 (#069) demo: track 1 は Group A の子 (depth 1) なので、 色ストライプが
+            // 名前と一緒に右へインデントする (= 親 0 / Audio 3,4 の depth 0 ストライプより右) ことを確認できる。
             let color = match ti {
-                0 => Some(Color::rgb(0.90, 0.55, 0.20)), // Group A = orange
+                0 => Some(Color::rgb(0.90, 0.55, 0.20)), // Group A = orange (depth 0)
+                1 => Some(Color::rgb(0.85, 0.40, 0.60)), // 子トラック = pink (depth 1、 #069 indent 確認用)
                 3 => Some(Color::rgb(0.20, 0.70, 0.65)), // Audio 1 = teal
                 4 => Some(Color::rgb(0.60, 0.40, 0.85)), // Audio 2 = purple
                 _ => None,

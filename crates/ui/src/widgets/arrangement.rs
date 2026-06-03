@@ -7794,15 +7794,22 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     self.panel(("arr_thbg", t.id), row, style.header_bg, 0.0);
                 }
 
-                // M14 Phase 87 (daw_01 #059): track color strip。 Some(c) のとき header 左端に
-                // 縦ストライプを背景の上から描く (selected/group/video 背景と色衝突しない)。
+                // M14 Phase 63c (#016): depth * indent_px の左 indent。 layout 計算は indent 反映後の
+                // row_inner で実行する (= row.x + indent、 row.w - indent)。 #069 で color strip も
+                // この indent に追従させるため、 strip 描画の前に indent を確定する。
+                let indent = f32::from(t.depth) * style.indent_px;
+
+                // M14 Phase 87 (daw_01 #059): track color strip。 Some(c) のとき header の (indent 後の)
+                // 左端に縦ストライプを背景の上から描く (selected/group/video 背景と色衝突しない)。
                 // None は strip 非描画 = 既存挙動完全互換。
+                // M14 Phase 97 (daw_01 #069): x を row.x + indent にして名前と同じだけ右にインデント
+                // (子トラックで色ストライプが名前と一緒にネスト)。 depth==0 は indent=0 で従来と pixel 一致。
                 if let Some(c) = t.color
                     && style.track_color_strip_w > 0.0
                 {
                     self.push_rect(RectCommand {
                         rect: Rect {
-                            x: row.x,
+                            x: row.x + indent,
                             y: row.y,
                             w: style.track_color_strip_w,
                             h: row.h,
@@ -7815,9 +7822,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     });
                 }
 
-                // M14 Phase 63c (#016): depth * indent_px の左 indent。 layout 計算は indent 反映後の
-                // row_inner で実行する (= row.x + indent、 row.w - indent)。
-                let indent = f32::from(t.depth) * style.indent_px;
                 let row_for_layout = Rect {
                     x: row.x + indent,
                     y: row.y,
@@ -9221,6 +9225,79 @@ mod tests {
             "strip 幅は style.track_color_strip_w (={}): w={}",
             style.track_color_strip_w,
             strip.rect.w
+        );
+    }
+
+    /// M14 Phase 97 (daw_01 #069): color strip は depth*indent_px だけ右にインデントして名前と
+    /// 一緒にネストする。 depth==0 は x=0 で従来と pixel 一致、 depth==1 は x=indent_px に追従。
+    #[test]
+    fn track_color_strip_follows_group_indent() {
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::FrameInput;
+        use crate::ui::UiHost;
+
+        let color0 = Color::rgb(0.91, 0.33, 0.55); // depth 0 の目印色
+        let color1 = Color::rgb(0.17, 0.83, 0.42); // depth 1 の目印色 (どの style 色とも非一致)
+        let mut t0 = track(0, "root", vec![]);
+        t0.color = Some(color0);
+        let mut t1 = track(1, "child", vec![]);
+        t1.color = Some(color1);
+        t1.depth = 1; // group の子トラック
+        let tracks = vec![t0, t1];
+
+        let mut view = test_view();
+        view.header_w = 180.0; // header pane を出す
+        let style = ArrangementStyle::default();
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 400 };
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            let _ = ui.arrangement(
+                "arr_strip_indent",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &tracks,
+                view,
+                &[],
+                &[],
+                &[],
+                &[],
+                &style,
+                None,
+                |_| Edit::mutate(|()| {}),
+            );
+        });
+
+        let strip0 = scene
+            .iter_rects()
+            .find(|r| r.fill == color0)
+            .expect("depth 0 の strip が存在する");
+        let strip1 = scene
+            .iter_rects()
+            .find(|r| r.fill == color1)
+            .expect("depth 1 の strip が存在する");
+
+        // depth 0: 従来どおり header pane 左端 (x=0、 pixel 互換)。
+        assert!(
+            (strip0.rect.x - 0.0).abs() < 1e-3,
+            "depth 0 strip は x=0 (従来互換): x={}",
+            strip0.rect.x
+        );
+        // depth 1: 名前と同じ indent (= depth * indent_px) だけ右へ。
+        assert!(
+            (strip1.rect.x - style.indent_px).abs() < 1e-3,
+            "depth 1 strip は x=indent_px (={}): x={}",
+            style.indent_px,
+            strip1.rect.x
+        );
+        // 幅は不変。
+        assert!(
+            (strip1.rect.w - style.track_color_strip_w).abs() < 1e-3,
+            "strip 幅は不変 (={}): w={}",
+            style.track_color_strip_w,
+            strip1.rect.w
         );
     }
 
