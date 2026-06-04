@@ -13409,7 +13409,15 @@ impl AppData {
             )
             .map(|b| b as f32)
         };
-        if next_beat != self.playhead_beat {
+        // 再生中のみ Tick の playhead を反映する。 停止中は GUI 側 playhead が
+        // 権威 (stop() の「開始位置へ戻す」 / ruler seek / engine respawn 後の
+        // 据え置き)。 これを入れないと、 stop() が playhead を origin に戻した
+        // 後に IPC キューへ残った in-flight Tick (engine が Stop/SeekTo を反映
+        // する前に読まれた直近サンプル位置) が後着で playhead を打ち消し、
+        // 「Space で停止してもプレイヘッドが元位置に戻らないことがある」 race を
+        // 生む。 stop() の SeekTo は engine 側カーソルを次の Play 用に揃えるため
+        // 引き続き送る (= GUI 表示の権威と engine state を分離)。
+        if self.is_playing && next_beat != self.playhead_beat {
             self.playhead_beat = next_beat;
         }
 
