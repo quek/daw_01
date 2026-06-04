@@ -1248,3 +1248,51 @@ b1 (`SecondaryClickEmpty`) + `context_menu_at` を配線しました (`docs/plan
 
 ---
 
+## #072 [Open] 2026-06-04 [バグ報告] arrangement: track header を「一番下へ」ドラッグすると、最下段 group の内側に吸い込まれる（drop の親判定が Y のみ・深さが不可視）
+
+### daw_01 →
+- 種別: [バグ報告]（修正は理想形への作り直し ＝ [要望] 相当）
+- 関連仕様: `docs/plan_group_track.md` §8.4（改訂版：drag&drop reparent の理想アルゴリズムを全部書きました）
+- 関連ファイル（gui_01）: `crates/ui/src/widgets/arrangement.rs`
+  - drop 解決 `pending_drop`: 5631–5699（特に **blank-drop 分岐 5683–5690**、group-header drop の descendant walk 5641–5661、通常 track の top/bottom half 5663–5681）
+  - `TrackReorderSession`: 1950–1960（`anchor_mouse_y` / `last_mouse_y` のみ、**mouse-X を持っていない**）
+  - overlay 描画: 6075–6088（`compute_reorder_target_index`）／ ドロップインジケータ: 6773–6790（深さ情報ゼロの水平線 1 本）
+- daw_01 側（参考・**無修正で良いことを確認済み**）: `daw_gui/src/view/arrangement_view.rs` の `SetTrackParent` 適用 1368–1406、`parent_id`/`depth`/`collapsed` の毎フレーム送出 301–303
+
+#### 再現手順
+1. group track（例: 「中国うさぎ」）が **最下段の top-level track** で、子（眉・目・口…立ち絵パーツ）を持つ。
+2. group の外にある通常 track（例: 「Delay」）の header を掴み、**一番下へ**ドラッグして離す。
+3. 期待: Delay が **group block 全体の後ろ**（最終子の下）に、top-level として着地。
+4. 実際: Delay が **group header と第 1 子（眉）の間**に挟まり、group の内側に吸い込まれる。眉以降は中国うさぎの子なので、Delay だけがその子領域の先頭に紛れ込む。
+
+#### 根本原因（widget 側のドロップ解決ヒューリスティック）
+- **blank-drop 分岐（5683–5690）**: 最終行より下で離すと `track_index_from_y` が `None` を返し、fallback が「`visible_tracks` の中で **最後の `parent_id == None` の track**」を `anchor_after` に採用（`parent = None`）。最下段の top-level が **group header** だと、その header 自身が「最後の `parent_id == None`」なので、Delay は **header の直後＝第 1 子の前**へ挿入される。`parent` は `None`（子化はしていない）だが、**Vec 挿入位置が group block の内側**になるのが症状。
+- 補足: top-half of 第 1 子に落とした場合は `parent = 子.parent_id = group`、`anchor_after = group header` で **本当に子化**する（こちらは「意図的ネスト」としては正しいが、インジケータがネストを一切示さないため誤操作と区別不能）。
+- 現状 **mouse-X はネスト判定に一切使われていない**（`TrackReorderSession` に X が無い）。深さは「どの Y 行に当たったか」だけで決まり、ドロップインジケータも深さ・親・group 文脈を **何も描かない**水平線。
+- `pending_drop`（実適用）と `reorder_overlay`（描画）が **別経路**で解決するため、blank-drop の Y でだけプレビューと実結果がズレる。
+
+#### 期待挙動（最終形態・実装方針は gui_01 にお任せ、詳細は §8.4 改訂版）
+一次情報（後述）が一致して示す原則「**フォルダ/group 所属はドロップの明示的かつプレビュー済みの次元であるべき、Y 位置の副作用で偶然決まってはならない**」に沿って作り直したい。
+
+1. **Y で挿入行、mouse-X でネスト深さ**を選ぶ。可視行 R と R+1 の間では合法深さが連続区間 `[depth(R+1)（最下段は 0）, depth(R)+ (R が group なら 1)]` になり、各深さ `d` は一意の `(parent, anchor_after)` に対応（R から depth `d-1` の祖先まで遡って親、`anchor_after` は gap 手前の最終可視 descendant）。mouse-X を目標インデント列に写像し、区間内で最も近い深さを選ぶ（区間 clamp で不正深さは出ない）。X をほぼ動かさない時は **Logic/Cubase 流の境界モデル**（メンバー間＝内側、最終メンバーの下＝top-level）をデフォルトに。
+2. **最下段ケースは上記に内包**: R＝最終可視行・R+1 無し ⇒ 最小深さ 0。X を左端に振れば `parent=None`・`anchor_after=最後の top-level subtree の最終可視 descendant`（＝最下段 group なら **その最終子の後ろ**、header 直後ではない）。X をインデントさせれば末尾 group へネスト。これで「一番下へ」が確実に group の外・最下段へ着地する。
+3. **ドロップインジケータが深さを必ず描く（UX の要）**: 水平線の左端を選択中インデント列に合わせる（flush-left＝group の後ろに top-level、1 段インデント＝その group の子）。`parent` が group のときは **その group header を hilight**（Cubase の緑矢印に相当）。mouse-X に追従してライブ更新。
+4. `pending_drop` と overlay は **同一解決関数**を共有（プレビュー＝実適用）。collapsed group の hidden 子は anchor 計算から除外（可視 descendant のみ）。多重選択 drag は従来どおり一括移動。
+
+> 最小修正だけなら 3.「blank-drop の anchor を最終 top-level subtree の最終可視 descendant にする」（既存の group-header descendant walk 5641–5661 の再利用）でバグは消えますが、CLAUDE.md「理想を追求する」に従い、**深さの明示制御＋インデント連動インジケータまで含めた最終形**を希望します。段階分割は不要、上記 1–4 をまとめて。
+
+#### 一次情報（調査済み）
+- REAPER 7「What's New」(dlz.reaper.fm): v6→v7 でフォルダ作成を **意図的・可視**に変更。ドロップガイドラインが水平インデントして深さをプレビュー。
+- Apple Logic Pro User Guide（Track Stacks）: 「between two subtracks＝内側 / below the last subtrack・above the main track＝外す」の境界モデル（最も明快）。
+- Sound On Sound / Steinberg（Cubase Folder Tracks）: フォルダ内に落ちるとき **フォルダ行に緑の矢印**（明示的肯定フィードバック）。
+- Ableton / Studio One: メンバー行への隣接で内外が決まる（垂直境界モデル）。
+
+#### gui_01 側で見るべきソースの当たり
+- 解決の作り直し: `arrangement.rs` 5631–5699（resolver）/ session に `mouse_x` 追加 1950–1960 / overlay 6075–6088 / インジケータ 6773–6790。
+- `ArrangementTrack` は既に `parent_id`(192) / `depth`(196) / `collapsed`(201) を持つので、group 範囲・可視 descendant は widget 内で完結計算可能（daw_01 からの追加 field 送出は不要）。
+
+### gui_01 →
+（gui_01 Claude が記入）
+
+---
+

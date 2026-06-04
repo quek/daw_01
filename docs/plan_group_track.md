@@ -225,16 +225,81 @@ Mix { srcs: [..., scratch[group], ...], dst: Master }
 #### group 行の背景色
 - mixer strip と同じ青系で塗る (group であることが arrangement view からも分かる)
 
-### 8.4 Drag-and-drop による reparent (PR2 で実装)
-- track header を **別 track の上**に drop:
-  - drop 先が group なら、その group の子になる (drop ターゲットの最後の子の下)
-  - drop 先が通常 track なら、drop 先と同じ親の隣に並ぶ (= 親変更しない、reorder のみ)
-- track header を **空白領域 / master 行**に drop:
-  - top-level に持ち上がる (`parent_group_id = None`)
-- 視覚フィードバック:
-  - drop 候補位置に水平の青いインジケータ (既存 reorderable_list と同じパターン)
-  - 階層ネスト先には少しインデントしたインジケータ
-- 多重選択 drag: 複数 selected_track_ids をまとめて移動
+### 8.4 Drag-and-drop による reparent
+
+> **改訂 (2026-06-04, daw_01 #072)**: 初版 (PR2) の「drop 先 row の Y 位置だけで親を決める」 方式は、
+> group が最下段の top-level track で子を持つとき、**「一番下へ」 ドラッグしたトラックが group header と
+> 第 1 子の間に挟まる** (= group の内側に吸い込まれる) バグを生む。 ここを **理想形** に作り直す。
+> 親判定 (= ネスト深さ) は **Y で挿入行を決め、 mouse-X でネスト深さを選び、 ドロップインジケータが
+> その深さを必ず可視化する** 三位一体にする。 ドロップ判定は 100% widget 側 (`gui_01` arrangement
+> widget) の責務。 daw_01 は `SetTrackParent { tracks, parent, anchor_after }` をそのまま適用するだけで
+> 無修正 (`compute_depth` / `parent_id` / `collapsed` は毎フレーム widget へ渡し済)。
+
+#### 設計原則 — ネスト深さは「明示的で、ドロップ前に見える」次元にする
+
+主要 DAW 4 種の一次情報が一致して示す原則:
+
+> **フォルダ / group 所属は、ドロップの「明示的かつプレビュー済みの次元」 であるべきで、 Y 位置の
+> 副作用で偶然決まってはならない。** (REAPER 7 が v6→v7 で意図的に変えた点。 "What's New in REAPER 7",
+> dlz.reaper.fm)
+
+- REAPER 7: parent header の左 1/3 に release (or Shift) で子化、 それ以外で sibling。 **ドロップガイドラインが
+  水平にインデントして結果の深さをプレビュー** する (flush-left = top-level、 indent = フォルダ内)。
+- Logic Pro / Cubase / Ableton / Studio One: 「メンバー行の間に落とせば内側、 最終メンバーの下 or header の
+  上に落とせば top-level」 という **垂直境界モデル**。 Logic の表現が最も明快:
+  *"Drag the subtrack outside of the Track Stack (below the last subtrack, or above the main track)"* で除外。
+- Cubase のみ明示的な肯定フィードバックを持つ: フォルダ内に落ちるとき **フォルダ行に緑の矢印** が出る。
+
+daw_01 はこの両者の良いとこ取りをする — **Logic の境界セマンティクスをデフォルト候補**にしつつ、
+**REAPER の mouse-X 連続深さ制御 + インデント連動インジケータ**で深さを「選んで・見て」確定できる。
+
+#### ドロップ解決アルゴリズム — Y で行、 X で深さ
+
+可視行 R と R+1 の間にドロップする (mouse-Y) とき、 **合法なネスト深さは連続区間** になる:
+
+- **最大深さ** `max_d` = `depth(R) + (R が group なら 1 else 0)` — R が group なら「R の子」まで潜れる、
+  そうでなければ「R と sibling」 まで。
+- **最小深さ** `min_d` = `depth(R+1)` — 次行の深さまで浅くできる (= 囲っている group を 1 つ以上「抜ける」)。
+  最下段 (R+1 なし) では `min_d = 0` (top-level)。
+- 区間 `[min_d, max_d]` の各整数深さ `d` は **ちょうど 1 つの `(parent, anchor_after)`** に対応する:
+  R から上へ depth `d-1` の祖先まで遡り、 その id が `parent` (`d == 0` なら `None`)、 `anchor_after` は
+  **その subtree の、 gap より手前にある最後の可視 descendant** (= R 自身、 または R を囲う group の最終 descendant)。
+
+確定: **mouse-X (track header 左端からの相対量) を目標インデント列に写像し、 区間内で最も近い深さ候補を選ぶ。**
+区間に clamp するので不正な深さは生成され得ない。 水平意図が無いとき (X がほぼ動いていない) の
+**デフォルトは境界モデル** — メンバー間 = 内側、 最終メンバーの下 = top-level — に倒し、 X を使わなくても
+Logic/Cubase 流の妥当な結果になる。
+
+#### 最下段 (一番下へ) のケース — バグ修正はここに内包される
+
+R = 最後の可視行、 R+1 なし ⇒ `min_d = 0`。
+- mouse-X を左端に振る ⇒ 深さ 0 ⇒ `parent = None`、 `anchor_after = 最後の top-level subtree の最終可視
+  descendant` (= group が最下段なら **その group の最終子の後ろ**、 header の直後ではない)。 これが
+  「一番下へ = group の外・最下段に top-level で着地」 を保証する。
+- mouse-X をインデントさせる ⇒ より深い候補 ⇒ 末尾 group の中へネスト。
+
+→ 旧バグ (blank-drop の `anchor_after` を「最後の `parent_id == None` の track」= group header にしていた) は、
+この「最後の top-level subtree の最終可視 descendant」 計算に置き換わることで消える。 group header drop 用の
+descendant walk が既に widget 内にあるので、 それを再利用する。
+
+#### ドロップインジケータ — 深さを必ず描く (UX の要)
+
+現状のインジケータは深さ情報ゼロの水平線 1 本 (2px シアン)。 これを作り直す:
+
+- 水平挿入線の **左端を、 選択中の目標インデント列に合わせる** (`header_left + d * indent_px`)。
+  線のインデントが深さプレビューそのもの — flush-left = group の後ろに top-level、 1 段インデント = その
+  group の子。 これが「最下段 group の最終子の後ろ」 の曖昧さを解消する (REAPER のインデント連動ガイドライン)。
+- 解決 `parent` が group のとき、 **その group header を hilight** (Cubase の緑矢印に相当する肯定フィードバック)。
+  任意で小さなネストグリフを添える。
+- **mouse-X に追従してライブ更新**。 ユーザーは水平にスクラブして深さを選び、 線がインデント列を滑るのを見る。
+
+#### その他
+
+- **多重選択 drag**: 複数 `selected_track_ids` をまとめて移動 (順序保持)。
+- **collapsed group**: `anchor_after` は **可視 descendant** で計算し、 折り畳まれて hidden な子の直後を指さない
+  (= Vec 上で group block の連続性を壊さない)。 ドロップ解決とインジケータ描画は **同一関数** を通し、
+  プレビューと実適用が食い違わないようにする (現状は 2 経路に分かれていて blank-drop でのみズレる)。
+- **resolver と overlay の単一化**: `pending_drop` (実適用) と `reorder_overlay` (描画) は同じ解決ロジックを共有する。
 
 ### 8.5 Transport bar
 - "+Group" 専用ボタンは置かない
@@ -334,6 +399,7 @@ Mix { srcs: [..., scratch[group], ...], dst: Master }
 | `action_group_selected_tracks` (de-dup なし、共通親継承、 末尾 append) | ✅ |
 | `action_ungroup_tracks` (深さ降順処理、 RemoveTrack IPC) | ✅ |
 | arrangement widget での 階層インデント / 折り畳み (▼/▶) / group 行背景色 / drag&drop reparent / track header の Shift / Ctrl クリック multi-select | ✅ (gui_01 #016 で widget 内蔵) |
+| drag&drop reparent の **深さ制御 (mouse-X) + インデント連動ドロップインジケータ + 最下段 anchor 修正** (§8.4 改訂) | ⚠️ 要望 (gui_01 #072) — 「一番下へ」 ドロップが group 内に吸い込まれるバグの理想形修正 |
 | `SetTrackParent { tracks, parent, anchor_after }` の 3 段再構築 | ✅ |
 | `ToggleGroupCollapsed(u32)` ハンドラ | ✅ |
 | `delete_track` で group 削除時の subtree 再帰削除 | ✅ |
