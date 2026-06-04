@@ -8,6 +8,14 @@ use crate::plugin_format::PluginFormat;
 use crate::protocol::PluginSlot;
 use crate::scale::ScaleChange;
 
+/// `22` 画像 source の元ファイル名: `ImageSource.name: String` (import 元
+/// ファイルの元名、 拡張子込み) が追加される。 on-disk `path` は content
+/// addressing のため `<sanitized_stem>_<hash8>.<ext>` に sanitize / hash
+/// され、 日本語名が `_` に潰れて inspector / 口パク mapping ドロップダウンで
+/// 区別できなかったのを、 表示用 SSoT として別途保持する。 v21 `.daw` files
+/// still load — `name` は `#[serde(default)]` で空文字になり、 consumer は
+/// 空なら `path.file_name()` に fallback する。 See `docs/plan_image_overlay.md`.
+///
 /// `21` 口パク (lip-sync): vocal track に `lipsync_target_track: Option<u32>`
 /// (口パク画像を焼き込む立ち絵 group 内 image track の id)、口 track に
 /// `mouth_map: Option<MouthMap>` (口形状 7 種 → ImageSourceId)、`Clip` に
@@ -109,7 +117,7 @@ use crate::scale::ScaleChange;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 21;
+pub const CURRENT_VERSION: u32 = 22;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -2008,6 +2016,15 @@ pub type ImageSourceId = u32;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct ImageSource {
     pub path: ImageSourcePath,
+    /// import 元ファイルの元の名前 (拡張子込み、 sanitize / content-hash
+    /// 前)。 inspector / 口パク mapping ドロップダウン等、 image source を
+    /// 直接列挙する UI の表示用 SSoT。 on-disk `path` は content addressing
+    /// のため `<sanitized_stem>_<hash8>.<ext>` に変形され、 日本語名は
+    /// `_` に潰れて区別不能になるので、 元名はここに別途保持する。 v21
+    /// 以前の `.daw` は未保持なので `#[serde(default)]` で空文字になり、
+    /// consumer は空なら `path.file_name()` に fallback する。
+    #[serde(default)]
+    pub name: String,
     /// Native pixel width / height as reported by the decoder. PiP
     /// rect (`ImageEvent.x/y/w/h`) is normalized so width/height are
     /// only used for aspect-fit fallback and metadata display.
@@ -2877,13 +2894,14 @@ mod tests {
 
     #[test]
     fn current_version_is_pinned() {
-        // Bumped to 20 for shared clip names: `Song.clip_content_names`
-        // (`HashMap<ContentId, String>`) is added and the legacy per-clip
-        // `Clip.name` / `AutomationClip.name` are drained into it on load.
-        // v19 files forward-migrate via `#[serde(default)]` (empty map) +
-        // `ensure_clip_contents` backfill. Pinning the constant catches
-        // accidental rollback. See `docs/plan_clip_shared_name.md`.
-        assert_eq!(CURRENT_VERSION, 21);
+        // Bumped to 22 for `ImageSource.name`: the original import filename
+        // (extension included, pre-sanitize/hash) is stored so source-listing
+        // UIs (inspector / 口パク mapping dropdown) can show the original name
+        // instead of the content-addressed on-disk filename. v21 files
+        // forward-migrate via `#[serde(default)]` (empty `name`) and consumers
+        // fall back to `path.file_name()`. Pinning the constant catches
+        // accidental rollback. See `docs/plan_image_overlay.md`.
+        assert_eq!(CURRENT_VERSION, 22);
     }
 
     #[test]
@@ -3634,6 +3652,34 @@ mod tests {
     }
 
     #[test]
+    fn image_source_without_name_field_deserializes_with_empty_name() {
+        // v21 `.daw` files stored `ImageSource` without a `name` key. Loading
+        // into v22 must succeed with `name` defaulting to "" (per
+        // `#[serde(default)]`); the inspector then falls back to the on-disk
+        // file name. A v22 source carries the original import name verbatim.
+        let v21_json = r#"{
+            "path": { "Absolute": "/img/_a1b2c3d4.png" },
+            "width": 64,
+            "height": 64,
+            "format": "Png"
+        }"#;
+        let src: ImageSource = serde_json::from_str(v21_json).unwrap();
+        assert_eq!(src.name, "");
+
+        // Round-trip a v22 source with the original (Japanese) name.
+        let named = ImageSource {
+            path: ImageSourcePath::Absolute("/img/_a1b2c3d4.png".into()),
+            name: "あ.png".into(),
+            width: 64,
+            height: 64,
+            format: "Png".into(),
+        };
+        let json = serde_json::to_string(&named).unwrap();
+        let back: ImageSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "あ.png");
+    }
+
+    #[test]
     fn alloc_image_source_id_bumps_counter() {
         let mut song = Song::default();
         let a = song.alloc_image_source_id();
@@ -3651,6 +3697,7 @@ mod tests {
             img,
             ImageSource {
                 path: ImageSourcePath::Absolute("/tmp/logo.png".into()),
+                name: "logo.png".into(),
                 width: 256,
                 height: 256,
                 format: "Png".into(),
@@ -3694,6 +3741,7 @@ mod tests {
             live_id,
             ImageSource {
                 path: ImageSourcePath::Absolute("/tmp/live.png".into()),
+                name: "live.png".into(),
                 width: 256,
                 height: 256,
                 format: "Png".into(),
@@ -3703,6 +3751,7 @@ mod tests {
             orphan_id,
             ImageSource {
                 path: ImageSourcePath::Absolute("/tmp/orphan.png".into()),
+                name: "orphan.png".into(),
                 width: 256,
                 height: 256,
                 format: "Png".into(),

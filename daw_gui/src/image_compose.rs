@@ -252,6 +252,7 @@ mod tests {
             img_id,
             ImageSource {
                 path: ImageSourcePath::Absolute("/tmp/x.png".into()),
+                name: "x.png".into(),
                 width: 100,
                 height: 100,
                 format: "Png".into(),

@@ -224,9 +224,20 @@ pub fn import_one_image(
         PathVariant::Absolute => ImageSourcePath::Absolute(cache_path),
     };
 
+    // 表示用に import 元ファイルの元名 (拡張子込み、 sanitize / hash 前) を
+    // 保持する。 on-disk `path` は content addressing で sanitize / hash
+    // 済みなので、 inspector / 口パク mapping ドロップダウンが元名を出すには
+    // この `name` を SSoT にする (`ImageSource.name` doc 参照)。
+    let original_name = src
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("image")
+        .to_string();
+
     Ok(ImportedImage {
         source: ImageSource {
             path: stored_path,
+            name: original_name,
             width: w,
             height: h,
             format,
@@ -281,6 +292,33 @@ mod tests {
         assert_eq!(&imported.bgra[8..12], &[255, 0, 0, 255]);
         // Bottom-right semi-transparent yellow → (0, 255, 255, 128)
         assert_eq!(&imported.bgra[12..16], &[0, 255, 255, 128]);
+    }
+
+    #[test]
+    fn import_one_image_preserves_original_japanese_name() {
+        // 口パク mouth image を「あ.png」等の日本語名で import したとき、
+        // on-disk path は sanitize で `_` に潰れるが、 表示用の
+        // `source.name` には元名がそのまま残ること (= ドロップダウンで
+        // 区別できる) を保証する。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let png_path = dir.path().join("あ.png");
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]));
+        img.save(&png_path).expect("write png");
+
+        let imported = import_one_image(&png_path, Some(dir.path())).expect("import");
+
+        // name は元のファイル名 (拡張子込み、 sanitize 前) を保持。
+        assert_eq!(imported.source.name, "あ.png");
+        // on-disk path は sanitize で非 ASCII が `_` に潰れている。
+        let stored = match &imported.source.path {
+            ImageSourcePath::ProjectRelative(p) | ImageSourcePath::Absolute(p) => p,
+        };
+        let on_disk = stored.file_name().and_then(|s| s.to_str()).unwrap();
+        assert!(
+            !on_disk.contains('あ'),
+            "on-disk filename must be sanitized: {on_disk}"
+        );
+        assert!(on_disk.starts_with('_'), "sanitized stem prefix: {on_disk}");
     }
 
     #[test]

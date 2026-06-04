@@ -91,6 +91,12 @@ pub enum ImageSourcePath {
 #[derive(.., bincode::Encode, bincode::Decode)]
 pub struct ImageSource {
     pub path: ImageSourcePath,
+    /// import 元ファイルの元名 (拡張子込み、 sanitize / hash 前)。 source を
+    /// 直接列挙する UI (inspector / 口パク mapping) の表示用 SSoT。 on-disk
+    /// path は content addressing で sanitize / hash 済 (= 日本語名が潰れる)
+    /// ため別途保持。 v22 追加、 v21 以前は `#[serde(default)]` で空。
+    #[serde(default)]
+    pub name: String,
     pub width: u32,
     pub height: u32,
     /// PNG / JPEG / WebP / 他、 image crate が判別したフォーマット名。

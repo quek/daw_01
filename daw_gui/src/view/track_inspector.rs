@@ -123,6 +123,12 @@ const CHAIN_LIST_STYLE: ReorderableListStyle = ReorderableListStyle {
 
 /// import 済み image source の表示名 (ファイル名)。口パク mapping dropdown 用。
 fn image_source_label(src: &common::model::ImageSource) -> String {
+    // import 時に保持した元ファイル名を優先 (on-disk path は content addressing
+    // で sanitize / hash 済みなので日本語名が潰れて区別できない)。 v21 以前の
+    // project は `name` 未保持 (空文字) なので path の file_name に fallback。
+    if !src.name.is_empty() {
+        return src.name.clone();
+    }
     let path = match &src.path {
         common::model::ImageSourcePath::ProjectRelative(p)
         | common::model::ImageSourcePath::Absolute(p) => p,
