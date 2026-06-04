@@ -11,6 +11,11 @@
             "type": "command",
             "command": "powershell -ExecutionPolicy Bypass -File F:/dev/daw_01/scripts/check_antipattern.ps1",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "powershell -ExecutionPolicy Bypass -File F:/dev/daw_01/scripts/check_compromise_smell.ps1",
+            "timeout": 5
           }
         ]
       }
