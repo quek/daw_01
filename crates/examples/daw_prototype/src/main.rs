@@ -809,62 +809,46 @@ fn drawmixer_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pane: Rec
     let ch_w = pane.w / N_CH as f32;
     let pad_y = 12.0;
     let label_h = 18.0;
-    let meter_w = 16.0;
+    let meter_w = 36.0; // stereo + dB 目盛り + 数値ぶん (#074)
     let fader_w = ch_w - meter_w - 24.0;
     let body_top = pane.y + pad_y + label_h;
     let body_h = (pane.h - pad_y * 2.0 - label_h).max(60.0);
 
     for ch in 0..N_CH {
         let cx = pane.x + ch_w * ch as f32 + 8.0;
-        // 最右 ch を master 風に: dB 目盛り + 数値ピーク (click で reset) のショーケース。
-        // 他 ch は clean bar (default)。
-        let is_master = ch == N_CH - 1;
         // ch label
         ui.label_at(
             ("ch_lbl", ch),
-            if is_master { "MASTER".to_string() } else { format!("CH {}", ch + 1) }.as_str(),
+            &format!("CH {}", ch + 1),
             cx,
             pane.y + 6.0,
             12.0,
             Color::rgb(0.85, 0.88, 0.92),
         );
 
-        // master は目盛りガター + 数値ぶん meter を広げ、 その分 fader を細くする。
-        // バーは細く (12px)、 残り 26px が目盛りガター = Ableton Live 風の細いメーター。
-        let (this_fader_w, this_meter_w, meter_style) = if is_master {
-            (
-                (fader_w - 22.0).max(20.0),
-                38.0,
-                LevelMeterStyle {
-                    scale: Some(MeterScale::default()),
-                    peak_readout: true,
-                    ..LevelMeterStyle::default()
-                },
-            )
-        } else {
-            (fader_w, meter_w, LevelMeterStyle::default())
-        };
-
         // fader
-        let fader_rect = Rect { x: cx, y: body_top, w: this_fader_w, h: body_h };
+        let fader_rect = Rect { x: cx, y: body_top, w: fader_w, h: body_h };
         let cur = m.faders[ch];
         let _resp: FaderResponse = ui.fader_at(("ch_fader", ch), fader_rect, cur, 0.7, "fader", move |v| {
             Edit::mutate(move |m: &mut DawModel| m.faders[ch] = v)
         });
 
-        // level_meter
-        let meter_rect = Rect {
-            x: cx + this_fader_w + 4.0,
-            y: body_top,
-            w: this_meter_w,
-            h: body_h,
-        };
-        ui.level_meter(
+        // ステレオ level meter: 全 ch に dB 目盛り + 数値ピーク (Ableton Live 風、 #074)。
+        // L/R を少し変えてステレオを可視化。
+        let meter_rect = Rect { x: cx + fader_w + 4.0, y: body_top, w: meter_w, h: body_h };
+        let l = m.sim_peak(ch);
+        let r = (m.sim_peak(ch) * 0.78 + 0.05).min(1.3);
+        ui.level_meter_stereo(
             ("chmeter", ch),
             meter_rect,
-            m.sim_peak(ch),
+            l,
+            r,
             MeterBallistic::Peak,
-            meter_style,
+            LevelMeterStyle {
+                scale: Some(MeterScale::default()),
+                peak_readout: true,
+                ..LevelMeterStyle::default()
+            },
         );
 
         // mute checkbox

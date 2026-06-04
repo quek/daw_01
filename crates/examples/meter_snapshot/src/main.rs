@@ -28,11 +28,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         screen,
         FrameInput::default(),
         |(), ui| {
-            // (1) master 風: scale + peak_readout。 細いバー + 低レベル (リファレンス条件)。
-            ui.level_meter(
+            // (1) ステレオ scale + peak_readout。 L 低 / R 中レベルで L/R 差を可視化。
+            ui.level_meter_stereo(
                 "master",
                 Rect { x: 40.0, y: 24.0, w: 38.0, h: 272.0 },
                 0.06,
+                0.35,
                 MeterBallistic::Peak,
                 LevelMeterStyle {
                     scale: Some(MeterScale::default()),
@@ -40,19 +41,21 @@ fn main() -> Result<(), Box<dyn Error>> {
                     ..LevelMeterStyle::default()
                 },
             );
-            // (2) clean bar (default): 数字なし narrow。
-            ui.level_meter(
+            // (2) clean bar (default): 数字なし narrow stereo。
+            ui.level_meter_stereo(
                 "clean",
-                Rect { x: 120.0, y: 24.0, w: 8.0, h: 272.0 },
+                Rect { x: 120.0, y: 24.0, w: 12.0, h: 272.0 },
                 0.5,
+                0.3,
                 MeterBallistic::Peak,
                 LevelMeterStyle::default(),
             );
-            // (3) scale のみ (readout なし) で +6 が最上端に出る確認 + 高レベル。
-            ui.level_meter(
+            // (3) scale のみ (readout なし) で +6 が最上端 + 高レベル。
+            ui.level_meter_stereo(
                 "scale_only",
                 Rect { x: 160.0, y: 24.0, w: 38.0, h: 272.0 },
-                0.85,
+                0.95,
+                0.7,
                 MeterBallistic::Peak,
                 LevelMeterStyle {
                     scale: Some(MeterScale::default()),
