@@ -970,6 +970,10 @@ pub struct ArrangementStyle {
     pub reorder_drop_indicator_h: f32,
     /// drag 中 row 複製の不透明度 (`0.0..1.0`、`1.0` で完全不透明)。RGB は元 row 色 (selected/header) を使う。
     pub reorder_drag_alpha: f32,
+    /// M14 Phase 101 (daw_01 #072): reorder drop が group の内側に着地するとき、 対象 group header 行を
+    /// この色で塗り重ねて「どの group に入るか」 を肯定的に示す (Cubase の緑矢印に相当)。 半透明推奨
+    /// (背景の名前 / button が透けるように)。 top-level drop では描かれない。
+    pub reorder_group_highlight: Color,
     /// M10 Phase 47b: track header bottom band slider の縦幅 (px、`0.0` で disable)。
     /// 必要 row_h の目安は `pad*2 + btn_h + gap + band_h` (default で `4*2 + 20 + 2 + 4 = 34px`、
     /// 32px row では非表示 = progressive disclosure。Phase 48 縦ズームで row_h を上げると表示される)。
@@ -1227,6 +1231,8 @@ impl Default for ArrangementStyle {
             reorder_drop_indicator: Color::rgb(0.50, 0.85, 1.0),
             reorder_drop_indicator_h: 2.0,
             reorder_drag_alpha: 0.6,
+            // indicator と同系 (シアン) を低 alpha で。 group 行に薄く乗せて nest 先を示す。
+            reorder_group_highlight: Color::rgba(0.50, 0.85, 1.0, 0.22),
             track_volume_band_h: 4.0,
             track_volume_band_track: Color::rgba(0.0, 0.0, 0.0, 0.45),
             track_volume_band_fill: Color::rgb(0.95, 0.95, 0.97),
@@ -1796,6 +1802,190 @@ pub fn apply_reorder<T: Clone>(items: &[T], anchor_index: usize, target_index: u
     v
 }
 
+/// M14 Phase 101 (daw_01 #072): track header drag を reorder に昇格させる最小移動量 (px)。
+/// これ未満は click (= SelectTrack) 扱い。 pending_drop (commit) と reorder_overlay (描画) が
+/// **同じ閾値**を使うことで preview と commit の発火条件が一致する。
+const REORDER_DRAG_THRESHOLD_PX: f32 = 16.0;
+
+/// M14 Phase 101 (daw_01 #072): track header drag&drop の **drop 解決結果**。
+/// `pending_drop` (実適用 = `SetTrackParent` 発行) と `reorder_overlay` (描画プレビュー) が
+/// **同一の** `resolve_track_drop` を通して得る単一真実源。 これにより「プレビューと実結果が
+/// 食い違う」 (旧 blank-drop の症状) が構造的に起き得ない。
+///
+/// 設計 (daw_01 docs/plan_group_track.md §8.4 改訂版): **Y で gap (挿入行間)、 X でネスト深さ** を
+/// 決める。 可視行 R(=above) と R+1(=below) の間の gap では合法深さが連続区間 `[min_d, max_d]` に
+/// なり、 各深さ `d` が一意の `(parent, anchor_after)` に対応する。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReorderDrop {
+    /// 挿入する gap (visible 行間) の index、 `0..=visible_tracks.len()`。 indicator の Y に使う
+    /// (`tops[gap]`)。 gap g は visible 行 `g-1` (above) と `g` (below) の間。
+    gap: usize,
+    /// 選択された nest 深さ (`[min_d, max_d]` に clamp 済)。 indicator 線の左 indent
+    /// (`header_left + depth * indent_px`) に使う。
+    depth: u8,
+    /// reparent 先 group の id (`None` = top-level)。 `SetTrackParent.parent`。 `depth > 0` のとき
+    /// 必ず group container なので indicator の group-header hilight 対象でもある。
+    parent: Option<u32>,
+    /// `SetTrackParent.anchor_after` — full `tracks` Vec 上で source 群を挿入する直前 track id
+    /// (`None` = 先頭)。 **source 自身は除外** する (caller は source を remove してから anchor_after を
+    /// 探すため、 anchor が source だと見つからず末尾 append してしまう罠を回避)。 gap の full-Vec
+    /// 挿入位置 (= below の full index、 なければ末尾) の直前にある最初の非 source track。
+    anchor_after: Option<u32>,
+}
+
+/// M14 Phase 101 (daw_01 #072): reorder drag の描画プレビューに必要な geometry (すべて screen px、
+/// `resolve_track_drop` の結果から事前計算)。 描画 closure はこれを読むだけ (press_tops 等を closure に
+/// capture しないで済む)。 indicator 線・深さインデント・group header hilight が **commit と同じ
+/// 解決結果**から導出されるので「プレビューと実結果がズレる」 ことが構造的に起きない。
+#[derive(Clone, Copy, Debug)]
+struct ReorderOverlay {
+    /// drop indicator 横線の Y (= gap の screen top、 `press_tops[gap]`)。
+    indicator_y: f32,
+    /// indicator 線の **左端 X** (= `header_left + depth * indent_px`)。 線の indent 量が深さ
+    /// プレビューそのもの (flush-left = top-level、 1 段右 = その group の子)。
+    indent_x: f32,
+    /// drag 中の半透明 ghost row の中心 Y (= `last_mouse_y`)。
+    drag_center_y: f32,
+    /// reparent 先 parent が group のとき、 hilight する group header の row rect (Cubase の
+    /// 緑矢印に相当する肯定フィードバック)。 top-level drop (`parent == None`) では `None`。
+    highlight_row: Option<Rect>,
+}
+
+/// M14 Phase 101 (daw_01 #072): `mouse_y` を visible 行間の **gap index** (`0..=N`) に写像する。
+/// `tops` は `visible_track_row_tops` の出力 (len = `N+1`、 単調増加、 lane 込みの prefix sum)。
+/// row R 内では中央線より上で gap=R (R の前)、 下で gap=R+1 (R の後)。 最上端より上で 0、
+/// 最下端 (`tops[N]`) 以下で N (= 末尾 = 「一番下へ」)。 可変行高 (lane 展開) に追従する。
+fn gap_from_y(tops: &[f32], mouse_y: f32) -> usize {
+    let n = tops.len().saturating_sub(1); // 行数
+    if n == 0 {
+        return 0;
+    }
+    if mouse_y < tops[0] {
+        return 0;
+    }
+    if mouse_y >= tops[n] {
+        return n;
+    }
+    // tops[r] <= mouse_y < tops[r+1] となる行 r。 partition_point = 「<= の個数」 = r+1。
+    let r = tops.partition_point(|&t| t <= mouse_y).saturating_sub(1).min(n - 1);
+    let mid = (tops[r] + tops[r + 1]) * 0.5;
+    if mouse_y < mid {
+        r
+    } else {
+        r + 1
+    }
+}
+
+/// M14 Phase 101 (daw_01 #072): `start` から `parent_id` chain を上へ辿り、 `depth == target_depth`
+/// の祖先 id を返す。 `target_depth == start.depth` なら `start` 自身 (= group の最初の子として nest
+/// するケース)。 `target_depth > start.depth` は `None` (上へ辿っても深くはなれない)。 hop 上限は
+/// `depth: u8` の全域 (= 最大 255 段) を覆う 256 + cycle 防御 (循環参照は 256 hop で打ち切り None)。
+fn ancestor_at_depth(
+    start: &ArrangementTrack,
+    target_depth: u8,
+    tracks: &[ArrangementTrack],
+) -> Option<u32> {
+    let mut cur = start;
+    for _ in 0..256 {
+        if cur.depth <= target_depth {
+            return (cur.depth == target_depth).then_some(cur.id);
+        }
+        let pid = cur.parent_id?;
+        cur = tracks.iter().find(|t| t.id == pid)?;
+    }
+    None
+}
+
+/// M14 Phase 101 (daw_01 #072): track header drag&drop の drop 解決 (純関数、 preview = commit の SSoT)。
+///
+/// - `tracks`: caller の **full** track Vec (master 含まず、 子は親直後の preorder 連続ブロック前提)。
+/// - `visible_tracks`: collapsed 親配下を skip した可視列 (先頭に synthetic master があり得る)。
+/// - `tops`: `visible_tracks` の prefix-sum row tops (len = visible+1)。
+/// - `is_group_set`: 子を持つ track id 集合 (= group container)。
+/// - `source`: drag 中の track id slice (anchor_after / parent 計算で除外)。 通常 1〜数件なので
+///   slice の線形 `contains` で十分 (drag 中毎フレーム呼ぶため HashSet を alloc しない)。
+/// - `indent_px`: 深さ 1 段の幅 (X→深さ写像の単位)。
+/// - `mouse_y` / `mouse_x`: drag 中の最終 pointer。 `anchor_mouse_x`: 掴んだ瞬間の x (深さ基準列)。
+///   深さは `mouse_x - anchor_mouse_x` の **相対** 列量で決める (絶対 x や header 左端には依存しない
+///   = どこを掴んでも「右へ動かすと nest」 が成立する)。
+///
+/// 戻り値 `ReorderDrop` の `(parent, anchor_after)` をそのまま `SetTrackParent` に乗せれば、
+/// 「Y で行・ X で深さ」 が確定する。 `gap` / `depth` は indicator 描画に使う。
+#[allow(clippy::too_many_arguments)]
+fn resolve_track_drop(
+    tracks: &[ArrangementTrack],
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
+    is_group_set: &HashSet<u32>,
+    source: &[u32],
+    indent_px: f32,
+    mouse_y: f32,
+    mouse_x: f32,
+    anchor_mouse_x: f32,
+) -> ReorderDrop {
+    // gap_from_y は契約上 [0, n] を返すので追加 clamp は不要。
+    let gap = gap_from_y(tops, mouse_y);
+    let above: Option<&ArrangementTrack> =
+        gap.checked_sub(1).and_then(|i| visible_tracks.get(i));
+    let below: Option<&ArrangementTrack> = visible_tracks.get(gap);
+
+    // 合法 nest 深さ区間 [min_d, max_d]:
+    //  - max_d = depth(above) + (above が group なら 1) — above の子まで潜れる / above と sibling。
+    //  - min_d = depth(below) — below の深さまで浅くできる (= 囲う group を抜ける)。 末尾は 0。
+    // preorder 不変条件下で min_d <= max_d は保証されるが、 異常入力に備え min を max に clamp。
+    let max_d = above.map_or(0, |a| {
+        a.depth.saturating_add(u8::from(is_group_set.contains(&a.id)))
+    });
+    let min_d = below.map_or(0, |b| b.depth).min(max_d);
+
+    // X → 深さ。 anchor 相対の列 offset を base=min_d (境界モデル default) に加算して区間 clamp。
+    // 右へ動かすほど深く nest、 動かさなければ min_d (= メンバー間は内側 / 最終メンバー下は浅い側)。
+    let indent_unit = indent_px.max(1.0);
+    #[allow(clippy::cast_possible_truncation)]
+    let col_offset = ((mouse_x - anchor_mouse_x) / indent_unit).round() as i32;
+    let depth = (i32::from(min_d) + col_offset)
+        .clamp(i32::from(min_d), i32::from(max_d))
+        .max(0) as u8;
+
+    // parent = above の depth-1 祖先 (depth==0 → top-level None)。
+    let parent = if depth == 0 {
+        None
+    } else {
+        above.and_then(|a| ancestor_at_depth(a, depth - 1, tracks))
+    };
+    // **parent が source 自身になる cycle を防ぐ** (= 自分を自分の子にする / multi-select で moving 中の
+    // 祖先を親にする)。 例: expanded group G を G ヘッダ直下の gap へ drag すると above=G・唯一の合法深さ
+    // depth(G)+1 で parent=G=source になる。 daw_01 の SetTrackParent 直接適用は cycle 検証を通らない
+    // (parent_group_id を直書きする) ので widget 側で source を親にしない不変を保証する。 source に当たったら
+    // 最近接の **非 source 祖先** へ繰り上げる (全祖先が source なら top-level)。
+    let mut parent = parent;
+    while let Some(pid) = parent {
+        if source.contains(&pid) {
+            parent = tracks.iter().find(|t| t.id == pid).and_then(|t| t.parent_id);
+        } else {
+            break;
+        }
+    }
+
+    // anchor_after = gap の full-Vec 挿入位置 ins の直前にある最初の非 source track (None = 先頭)。
+    // ins: below の full index (= below の直前に挿入)。 below 無し (末尾 gap) は tracks.len()。
+    // below が master (= synthetic、 full Vec に居ない) のときは ins=0 (= 先頭、 master は song.tracks 外)。
+    // 通常 track は必ず full Vec に在る (visible_tracks は tracks ∪ {master} から作る) ので、 position が
+    // None になるのは master のみ。 master を明示分岐して「正常 track が欠落したら 0」 の曖昧さを排除する。
+    let ins = match below {
+        None => tracks.len(),
+        Some(b) if b.id == MASTER_TRACK_ID => 0,
+        Some(b) => tracks.iter().position(|t| t.id == b.id).unwrap_or(0),
+    };
+    let anchor_after = tracks[..ins.min(tracks.len())]
+        .iter()
+        .rev()
+        .find(|t| !source.contains(&t.id))
+        .map(|t| t.id);
+
+    ReorderDrop { gap, depth, parent, anchor_after }
+}
+
 /// track header 1 行内のレイアウト (Name button + 3 small buttons + 任意の volume band + lane disclosure)。
 /// `name_rect` (= drag start zone & text area)、`buttons` (= [M, S, R]、Phase 68 で R button = Record-arm 追加。
 /// Phase 47c で ↑/↓/× は drag&drop + Delete shortcut に置換され削除済)、`volume_band` は inner 下部に band 用の
@@ -1949,7 +2139,6 @@ struct ClipDragSession {
 #[derive(Clone, Debug)]
 struct TrackReorderSession {
     anchor_track_id: u32,
-    anchor_index: usize,
     /// M14 Phase 63c (#016): drag 開始時に grab した track 群 (selected_tracks に含まれていれば
     /// selected 全部、 そうでなければ `vec![anchor_track_id]`)。 multi-track reparent / reorder の
     /// source として release frame で使う。
@@ -1957,6 +2146,12 @@ struct TrackReorderSession {
     anchor_mouse_y: f32,
     /// drag 中の最終 mouse y 位置 (release frame の `pointer.pos` に頼らない保険、`ClipDragSession.last_mouse` と同理由)。
     last_mouse_y: f32,
+    /// M14 Phase 101 (daw_01 #072): drag 開始時の mouse x (= ネスト深さ control の基準列)。
+    /// 深さは `last_mouse_x - anchor_mouse_x` を indent 列に写像した相対量で決める (どこを掴んでも
+    /// 「右へ動かすと nest」 が成立するよう絶対 x ではなく anchor 相対)。
+    anchor_mouse_x: f32,
+    /// drag 中の最終 mouse x 位置 (`last_mouse_y` と同理由で release frame の巻き戻し対策に保持)。
+    last_mouse_x: f32,
 }
 
 // `PlayheadDragSession` は M14 Phase 69 (#041) で
@@ -4822,10 +5017,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                             let state: &mut ArrangementState = self.widget_state(wid);
                             state.track_reorder = Some(TrackReorderSession {
                                 anchor_track_id: t.id,
-                                anchor_index: idx,
                                 source_track_ids: source_ids,
                                 anchor_mouse_y: py,
                                 last_mouse_y: py,
+                                anchor_mouse_x: px,
+                                last_mouse_x: px,
                             });
                         }
                     }
@@ -5294,12 +5490,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     ld.last_mouse_x = px;
                 }
             }
-            if let Some(ref mut tr) = state.track_reorder
+            if let Some(ref mut tr) = state.track_reorder {
                 // continuation は常に update。 release 時は winit 巻き戻し検知のため
                 // anchor と differ する場合のみ update (clip_drag と同 pattern)。
-                && (!is_release || (py - tr.anchor_mouse_y).abs() > f32::EPSILON)
-            {
-                tr.last_mouse_y = py;
+                // M14 Phase 101 (daw_01 #072): y / x を独立に判定して update (片軸だけ巻き戻る
+                // ケースでも他軸の真値を保持)。
+                if !is_release || (py - tr.anchor_mouse_y).abs() > f32::EPSILON {
+                    tr.last_mouse_y = py;
+                }
+                if !is_release || (px - tr.anchor_mouse_x).abs() > f32::EPSILON {
+                    tr.last_mouse_x = px;
+                }
             }
             if let Some(ref mut tv) = state.track_volume_drag
                 && (!is_release || (px - tv.anchor_mouse_x).abs() > f32::EPSILON)
@@ -5612,91 +5813,36 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 None
             };
 
-        // M14 Phase 63c (#016): track header drag release の **drop action 統合**:
-        // 旧 `ReorderTracks` (sibling 並び替え) と `SetTrackParent` (parent 変更) を 1 つの
-        // `SetTrackParent { tracks, parent, anchor_after }` に統合。 caller は (1) source を
+        // M14 Phase 63c (#016) → 101 (daw_01 #072): track header drag release の **drop action**。
+        // `SetTrackParent { tracks, parent, anchor_after }` を 1 つ発行。 caller は (1) source を
         // arr_tracks から remove (2) parent_id を `parent` に更新 (3) `anchor_after` の直後
-        // (None で先頭) に挿入、 という再構築をすればよい。 これで「Track 5 を Group A header に
-        // drop → Group A subtree 末尾に挿入 + parent 化」 などの DAW 標準動作が 1 Edit で表現可能。
+        // (None で先頭) に挿入、 という再構築をする。
         //
-        // anchor_after の計算ルール (visible-domain):
-        //  - drop target が group → anchor_after = group の visible 列上の last descendant id
-        //    (子が無ければ group 自身)、 parent = Some(target.id)
-        //  - drop target が regular track:
-        //    - top half (mouse y が row 上半分) → anchor_after = visible 列で 1 つ前の track id
-        //      (None = 先頭挿入)、 parent = target.parent_id
-        //    - bottom half → anchor_after = Some(target.id)、 parent = target.parent_id
-        //  - drop on blank (mouse y が rows の外) → anchor_after = visible 列の最後 (or None)、
-        //    parent = None (top-level 末尾)
-        let pending_drop: Option<(Vec<u32>, Option<u32>, Option<u32>)> = {
-            if let Some(ref tr) = track_reorder_release_raw {
-                let dy = (tr.last_mouse_y - tr.anchor_mouse_y).abs();
-                if dy >= 16.0 {
-                    let visible_drop_idx =
-                        track_index_from_y(tr.last_mouse_y, header_pane.y, &press_tops);
-                    let drop_target = visible_drop_idx.and_then(|i| visible_tracks.get(i));
-                    let (parent, anchor_after) = if let Some(target) = drop_target {
-                        if is_group_set.contains(&target.id) {
-                            // group 化: target subtree の末尾に挿入
-                            let last_descendant = visible_tracks
-                                .iter()
-                                .rev()
-                                .find(|t| {
-                                    let mut p = t.parent_id;
-                                    for _ in 0..64 {
-                                        let Some(pid) = p else {
-                                            return false;
-                                        };
-                                        if pid == target.id {
-                                            return true;
-                                        }
-                                        p = tracks
-                                            .iter()
-                                            .find(|x| x.id == pid)
-                                            .and_then(|x| x.parent_id);
-                                    }
-                                    false
-                                })
-                                .map(|t| t.id)
-                                .or(Some(target.id));
-                            (Some(target.id), last_descendant)
-                        } else {
-                            // 通常 track: top/bottom half で挿入位置を決定。
-                            // M14 Phase 63n-6 (#031): per-track row 高さ override を反映するため
-                            // `press_tops` (prefix sum) から該当 visible_idx の row_top を取得、
-                            // row_h は target の effective 値を使用 (= override 済 track の半分判定が
-                            // そのトラック自身の高さに追従)。
-                            let v_idx = visible_drop_idx.unwrap_or(0);
-                            let row_y = press_tops.get(v_idx).copied().unwrap_or(header_pane.y);
-                            let row_h = effective_track_row_h(target, view.track_row_h);
-                            let local_y = tr.last_mouse_y - row_y;
-                            let top_half = local_y < row_h * 0.5;
-                            let prev_id = if top_half {
-                                let prev_visible_i = visible_drop_idx
-                                    .and_then(|i| i.checked_sub(1));
-                                prev_visible_i.and_then(|i| visible_tracks.get(i)).map(|t| t.id)
-                            } else {
-                                Some(target.id)
-                            };
-                            (target.parent_id, prev_id)
-                        }
-                    } else {
-                        // blank drop → top-level 末尾
-                        let last_id = visible_tracks
-                            .iter()
-                            .rev()
-                            .find(|t| t.parent_id.is_none())
-                            .map(|t| t.id);
-                        (None, last_id)
-                    };
-                    Some((tr.source_track_ids.clone(), parent, anchor_after))
-                } else {
-                    None
+        // M14 Phase 101 (daw_01 #072): drop 解決を `resolve_track_drop` に一本化。 Y で gap、 X で
+        // ネスト深さを決め、 (parent, anchor_after) を導出する (旧 Y-only ヒューリスティックは「一番下へ」
+        // drop が最下段 group の内側に吸い込まれるバグを持っていた)。 **overlay (描画プレビュー) と
+        // 完全に同じ pure 関数**を通すので preview = commit が構造的に保証される。 gate は drag 距離
+        // (dx/dy 合成) で、 click (≒静止) を reorder に昇格させない。
+        let pending_drop: Option<(Vec<u32>, Option<u32>, Option<u32>)> =
+            track_reorder_release_raw.as_ref().and_then(|tr| {
+                let dx = tr.last_mouse_x - tr.anchor_mouse_x;
+                let dy = tr.last_mouse_y - tr.anchor_mouse_y;
+                if (dx * dx + dy * dy).sqrt() < REORDER_DRAG_THRESHOLD_PX {
+                    return None;
                 }
-            } else {
-                None
-            }
-        };
+                let drop = resolve_track_drop(
+                    tracks,
+                    &visible_tracks,
+                    &press_tops,
+                    &is_group_set,
+                    &tr.source_track_ids,
+                    style.indent_px,
+                    tr.last_mouse_y,
+                    tr.last_mouse_x,
+                    tr.anchor_mouse_x,
+                );
+                Some((tr.source_track_ids.clone(), drop.parent, drop.anchor_after))
+            });
         let pending_reorder_hash: u64 = pending_drop.as_ref().map_or(0_u64, |(ts, p, a)| {
             let mut h = u64::from(p.unwrap_or(u32::MAX));
             h = h.wrapping_mul(31).wrapping_add(u64::from(a.unwrap_or(u32::MAX)));
@@ -6070,21 +6216,52 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         };
         let loop_preview_clone = loop_drag_preview_range;
         let header_pane_copy = header_pane;
-        // M10 Phase 46: track reorder の drag preview に必要な情報 (anchor index / 現在 mouse_y / target idx)。
-        // dist >= 16px のときのみ overlay 描画 (短 click 中は静止 = button click と区別がつかないため UI ノイズ)。
-        let reorder_overlay: Option<(TrackReorderSession, usize)> = track_reorder_session
+        // M10 Phase 46 → 101 (daw_01 #072): track reorder の drag preview geometry。
+        // dist >= 閾値 のときのみ overlay 描画 (短 click 中は静止 = button click と区別がつかないため
+        // UI ノイズ)。 **commit (`pending_drop`) と同じ `resolve_track_drop`** を通すので indicator が
+        // 指す位置 = 実際に着地する位置 が必ず一致する (旧 `compute_reorder_target_index` は parent /
+        // 深さを描けず blank-drop で実結果とズレていた)。
+        let reorder_overlay: Option<ReorderOverlay> = track_reorder_session
             .as_ref()
-            .filter(|tr| (tr.last_mouse_y - tr.anchor_mouse_y).abs() >= 16.0)
+            .filter(|tr| {
+                let dx = tr.last_mouse_x - tr.anchor_mouse_x;
+                let dy = tr.last_mouse_y - tr.anchor_mouse_y;
+                (dx * dx + dy * dy).sqrt() >= REORDER_DRAG_THRESHOLD_PX
+            })
             .map(|tr| {
-                let target = compute_reorder_target_index(
-                    tr.anchor_index,
+                let drop = resolve_track_drop(
+                    tracks,
+                    &visible_tracks,
+                    &press_tops,
+                    &is_group_set,
+                    &tr.source_track_ids,
+                    style.indent_px,
                     tr.last_mouse_y,
-                    header_pane.y,
-                    view.track_top,
-                    view.track_row_h,
-                    visible_tracks.len(),
+                    tr.last_mouse_x,
+                    tr.anchor_mouse_x,
                 );
-                (tr.clone(), target)
+                let indicator_y = press_tops
+                    .get(drop.gap)
+                    .copied()
+                    .or_else(|| press_tops.last().copied())
+                    .unwrap_or(header_pane.y);
+                let indent_x = header_pane.x + f32::from(drop.depth) * style.indent_px;
+                // parent が group のとき header 行を hilight。 parent が collapsed で不可視なら
+                // (visible に居ない → position None →) hilight しない (不可視 UI を光らせない意図の
+                // None。 reparent 構造自体は commit と同一 resolver なので一致する)。
+                let highlight_row = drop.parent.and_then(|pid| {
+                    visible_tracks.iter().position(|t| t.id == pid).map(|vi| {
+                        let y = press_tops.get(vi).copied().unwrap_or(header_pane.y);
+                        let h = effective_track_row_h(&visible_tracks[vi], view.track_row_h);
+                        Rect { x: header_pane.x, y, w: header_pane.w + lanes.w, h }
+                    })
+                });
+                ReorderOverlay {
+                    indicator_y,
+                    indent_x,
+                    drag_center_y: tr.last_mouse_y,
+                    highlight_row,
+                }
             });
 
         // M13 Phase 55: ruler / lanes grid を library `time_ruler` / `bar_beat_grid` に統合。
@@ -6770,27 +6947,36 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 );
             }
 
-            // === M10 Phase 46: track reorder drop indicator + dragging row preview ===
+            // === M10 Phase 46 → 101 (daw_01 #072): track reorder drop indicator + preview ===
             // M14 Phase 77 (daw_01 #048): reorder overlay は header_pane + lanes を跨ぐ (横 1 行帯)
             // ので below_ruler scope で wrap (= ruler / toolbar への leak 防止)。
-            if let Some((tr, target_idx)) = reorder_overlay {
+            //
+            // M14 Phase 101 (daw_01 #072): 深さを可視化する。 (1) 着地先 group があれば header 行を
+            // hilight (Cubase の緑矢印に相当)、 (2) indicator 横線の **左端を解決済み深さの indent 列に
+            // 合わせる** (flush-left = top-level / 1 段右 = group の子)。 これらは `resolve_track_drop` の
+            // 結果から事前計算済 (= commit と同じ着地位置を描く)。
+            if let Some(ov) = reorder_overlay {
                 hctx.with_clip_rect(below_ruler, |hctx| {
-                    #[allow(clippy::cast_precision_loss)]
-                    let indicator_y = header_pane_copy.y - view_copy.track_top
-                        + target_idx as f32 * view_copy.track_row_h;
+                    // (1) group-header hilight (nest 先の肯定フィードバック)。
+                    if let Some(hl) = ov.highlight_row {
+                        push_filled_rect(hctx, hl, style_copy.reorder_group_highlight);
+                    }
+                    // (2) 深さ連動 drop indicator 横線。 左端 = indent 列、 右端 = header + lanes。
+                    let line_right = header_pane_copy.x + header_pane_copy.w + lanes.w;
+                    let line_x = ov.indent_x.min(line_right - 1.0);
                     push_filled_rect(
                         hctx,
                         Rect {
-                            x: header_pane_copy.x,
-                            y: indicator_y - style_copy.reorder_drop_indicator_h * 0.5,
-                            w: header_pane_copy.w + lanes.w,
+                            x: line_x,
+                            y: ov.indicator_y - style_copy.reorder_drop_indicator_h * 0.5,
+                            w: (line_right - line_x).max(1.0),
                             h: style_copy.reorder_drop_indicator_h,
                         },
                         style_copy.reorder_drop_indicator,
                     );
-                    // dragging row 半透明複製 (header_pane 領域、last_mouse_y 中心)。
+                    // (3) dragging row 半透明複製 (header_pane 領域、last_mouse_y 中心)。
                     let row_h = view_copy.track_row_h;
-                    let drag_y = (tr.last_mouse_y - row_h * 0.5)
+                    let drag_y = (ov.drag_center_y - row_h * 0.5)
                         .clamp(header_pane_copy.y, header_pane_copy.y + header_pane_copy.h - row_h);
                     let alpha = style_copy.reorder_drag_alpha.clamp(0.0, 1.0);
                     let base_rgb = style_copy.track_selected_bg;
@@ -9002,6 +9188,220 @@ mod tests {
     fn compute_reorder_target_zero_row_h_safe() {
         assert_eq!(compute_reorder_target_index(0, 100.0, 0.0, 0.0, 0.0, 5), 0);
         assert_eq!(compute_reorder_target_index(0, 100.0, 0.0, 0.0, 32.0, 0), 0);
+    }
+
+    // ============================================================
+    // M14 Phase 101 (daw_01 #072): resolve_track_drop / gap_from_y
+    // ============================================================
+
+    /// hierarchy 付き track 生成 helper (depth / parent_id を明示)。
+    fn htrack(id: u32, depth: u8, parent: Option<u32>) -> ArrangementTrack {
+        let mut t = track(id, "t", vec![]);
+        t.depth = depth;
+        t.parent_id = parent;
+        t
+    }
+
+    fn group_set(tracks: &[ArrangementTrack]) -> HashSet<u32> {
+        tracks.iter().filter_map(|t| t.parent_id).collect()
+    }
+
+    /// resolve_track_drop の薄い wrapper (test 用 default 引数)。 visible = full、 lane なし tops。
+    /// mouse_x / anchor_mouse_x は `col` (= 右へ動かした indent 列数) を 16px/列で与える。
+    #[allow(clippy::cast_precision_loss)]
+    fn resolve(
+        tracks: &[ArrangementTrack],
+        source: &[u32],
+        mouse_y: f32,
+        col: f32,
+    ) -> ReorderDrop {
+        let visible: Vec<ArrangementTrack> =
+            tracks.iter().filter(|t| is_visible_track(t, tracks)).cloned().collect();
+        let tops = visible_track_row_tops(&visible, 0.0, 0.0, 32.0);
+        let is_group = group_set(tracks);
+        let anchor_x = 100.0_f32;
+        resolve_track_drop(
+            tracks,
+            &visible,
+            &tops,
+            &is_group,
+            source,
+            16.0,
+            mouse_y,
+            anchor_x + col * 16.0,
+            anchor_x,
+        )
+    }
+
+    #[test]
+    fn gap_from_y_maps_rows_and_edges() {
+        let tops = vec![0.0, 32.0, 64.0, 96.0]; // 3 行
+        assert_eq!(gap_from_y(&tops, -5.0), 0); // 上端より上
+        assert_eq!(gap_from_y(&tops, 10.0), 0); // 行0 上半分 (<16)
+        assert_eq!(gap_from_y(&tops, 20.0), 1); // 行0 下半分 (>16)
+        assert_eq!(gap_from_y(&tops, 50.0), 2); // 行1 下半分 (mid=48)
+        assert_eq!(gap_from_y(&tops, 95.0), 3); // 行2 下半分
+        assert_eq!(gap_from_y(&tops, 200.0), 3); // 最下端以下 = 末尾 gap
+        // 退化
+        assert_eq!(gap_from_y(&[], 10.0), 0);
+        assert_eq!(gap_from_y(&[0.0], 10.0), 0);
+    }
+
+    #[test]
+    fn drop_below_bottom_group_lands_top_level() {
+        // 再現: 最下段 group G + 子 c1/c2、 上にある通常 track t0 を「一番下へ」 drop。
+        // 期待: t0 が group block 全体の後ろに top-level で着地 (= parent None, anchor_after = c2)。
+        let tracks = vec![
+            htrack(0, 0, None),         // t0 (drag source)
+            htrack(1, 0, None),         // G (group: c1/c2 の親)
+            htrack(2, 1, Some(1)),      // c1
+            htrack(3, 1, Some(1)),      // c2 (最終子)
+        ];
+        // 一番下 (mouse_y=200) へ、 X 動かさず (col=0)。
+        let d = resolve(&tracks, &[0], 200.0, 0.0);
+        assert_eq!(d.gap, 4, "末尾 gap");
+        assert_eq!(d.depth, 0, "X 不動 → 境界 default = 最浅 (top-level)");
+        assert_eq!(d.parent, None, "top-level に着地 (group の内側ではない)");
+        assert_eq!(d.anchor_after, Some(3), "最終子 c2 の後ろ (= block 全体の後ろ)");
+    }
+
+    #[test]
+    fn drop_below_bottom_group_with_indent_nests_into_group() {
+        // 同じ末尾 drop でも X を 1 段 indent すれば末尾 group へ nest。
+        let tracks = vec![
+            htrack(0, 0, None),
+            htrack(1, 0, None),
+            htrack(2, 1, Some(1)),
+            htrack(3, 1, Some(1)),
+        ];
+        let d = resolve(&tracks, &[0], 200.0, 1.0);
+        assert_eq!(d.depth, 1);
+        assert_eq!(d.parent, Some(1), "末尾 group G の子になる");
+        assert_eq!(d.anchor_after, Some(3), "c2 の後ろ (= group の最終子)");
+    }
+
+    #[test]
+    fn drop_between_members_stays_inside_group() {
+        // メンバー間 (c1 と c2 の間) は境界 default で内側 (= 同 group の子)。
+        let tracks = vec![
+            htrack(1, 0, None),         // G
+            htrack(2, 1, Some(1)),      // c1
+            htrack(3, 1, Some(1)),      // c2
+            htrack(9, 0, None),         // t9 (drag source)
+        ];
+        // gap between c1(visible idx1) と c2(idx2) = gap2 → mouse_y ~ 48..64 の下半分。
+        let d = resolve(&tracks, &[9], 55.0, 0.0);
+        assert_eq!(d.gap, 2);
+        assert_eq!(d.depth, 1, "メンバー間 = 内側 (深さ 1)");
+        assert_eq!(d.parent, Some(1));
+        assert_eq!(d.anchor_after, Some(2), "c1 の後ろ");
+    }
+
+    #[test]
+    fn drop_at_gap_x_controls_pop_out_depth() {
+        // [s, A(group), B(group,A の子), x(B の子), T(top)]。 x と T の間 (gap4) で X により
+        // 深さ 0/1/2 を選べる (= 何段 group を抜けるか / 末尾 group に nest)。
+        let tracks = vec![
+            htrack(99, 0, None),        // s (drag source、 先頭)
+            htrack(1, 0, None),         // A
+            htrack(2, 1, Some(1)),      // B
+            htrack(3, 2, Some(2)),      // x (最深 leaf)
+            htrack(4, 0, None),         // T
+        ];
+        // visible=[s,A,B,x,T] tops=[0,32,64,96,128,160]。 x(idx3)とT(idx4)の間=gap4 →
+        // T (行4、 128..160) の上半分 (mid=144) で gap4 を選ぶ → mouse_y=130。
+        let d0 = resolve(&tracks, &[99], 130.0, 0.0);
+        assert_eq!(d0.gap, 4);
+        assert_eq!((d0.depth, d0.parent), (0, None), "X 不動 → top-level (x の block 後ろ、 T の前)");
+        assert_eq!(d0.anchor_after, Some(3));
+
+        let d1 = resolve(&tracks, &[99], 130.0, 1.0);
+        assert_eq!((d1.depth, d1.parent), (1, Some(1)), "1 段 indent → A の子 (B subtree の後ろ)");
+        assert_eq!(d1.anchor_after, Some(3));
+
+        let d2 = resolve(&tracks, &[99], 130.0, 2.0);
+        assert_eq!((d2.depth, d2.parent), (2, Some(2)), "2 段 indent → B の子 (x の sibling)");
+        assert_eq!(d2.anchor_after, Some(3));
+
+        // 区間 clamp: 過剰 indent (col=5) でも max_d=2 で止まる。
+        let d_clamp = resolve(&tracks, &[99], 130.0, 5.0);
+        assert_eq!(d_clamp.depth, 2);
+    }
+
+    #[test]
+    fn drop_after_collapsed_group_anchors_past_hidden_children() {
+        // collapsed group G (子 c1/c2 が hidden) の直後 (visible 上は G と T の間) へ drop。
+        // anchor_after は **hidden な最終子 c2** を指す (= Vec 上 group block の連続性を保つ)。
+        // header (G) を指すと expand 時に block 内へ source が紛れ込むため不可。
+        let tracks = vec![
+            htrack(99, 0, None),                       // s (source、 先頭)
+            {
+                let mut g = htrack(1, 0, None);
+                g.collapsed = true;
+                g
+            }, // G (collapsed group)
+            htrack(2, 1, Some(1)),                     // c1 (hidden)
+            htrack(3, 1, Some(1)),                     // c2 (hidden, 最終子)
+            htrack(4, 0, None),                        // T
+        ];
+        // visible=[s, G, T] tops=[0,32,64,96]。 G(idx1)とT(idx2)の間=gap2 → mouse_y ~ 55。
+        let d = resolve(&tracks, &[99], 55.0, 0.0);
+        assert_eq!(d.gap, 2);
+        assert_eq!((d.depth, d.parent), (0, None), "X 不動 → top-level");
+        assert_eq!(
+            d.anchor_after,
+            Some(3),
+            "hidden 最終子 c2 の後ろ (header G ではない、 block 連続性維持)"
+        );
+
+        // 1 段 indent すれば collapsed group の子として末尾に nest。
+        let dn = resolve(&tracks, &[99], 55.0, 1.0);
+        assert_eq!((dn.depth, dn.parent), (1, Some(1)));
+        assert_eq!(dn.anchor_after, Some(3));
+    }
+
+    #[test]
+    fn anchor_after_skips_source_tracks() {
+        // 直前 track が source 自身のとき anchor_after は **その手前の非 source** を指す
+        // (caller が source を remove してから anchor を探す → 見つからず末尾 append する罠を回避)。
+        let tracks = vec![htrack(7, 0, None), htrack(8, 0, None)]; // [x, s]
+        // s(id=8) を一番下へ。 above=s, below=None, ins=2 → tracks[..2]=[x,s] の非 source = x。
+        let d = resolve(&tracks, &[8], 200.0, 0.0);
+        assert_eq!(d.parent, None);
+        assert_eq!(d.anchor_after, Some(7), "source s ではなく x を anchor にする");
+    }
+
+    #[test]
+    fn drop_group_into_own_header_gap_does_not_self_parent() {
+        // expanded group G を G ヘッダ直下 (G と c1 の間) へ drag。 唯一の合法深さ depth(G)+1=1 では
+        // parent=G=source になり self-cycle。 source を親にしない不変で parent は G の親 (None) へ繰り上がる。
+        let tracks = vec![
+            htrack(1, 0, None),    // G (drag source)
+            htrack(2, 1, Some(1)), // c1
+            htrack(3, 1, Some(1)), // c2
+        ];
+        // gap1 = G(row0) と c1(row1) の間 → c1 上半分 (32..48) → mouse_y=40。
+        let d = resolve(&tracks, &[1], 40.0, 0.0);
+        assert_eq!(d.gap, 1);
+        assert_ne!(d.parent, Some(1), "source G を自分の親にしない (self-cycle 回避)");
+        assert_eq!(d.parent, None, "非 source 祖先が無い → top-level へ繰り上げ");
+        assert_eq!(d.anchor_after, None, "G より前に非 source 無し → 先頭");
+    }
+
+    #[test]
+    fn drop_multiselect_ancestor_descendant_never_parents_to_source() {
+        // multi-select で moving 中の祖先 (A) / 子 (B) を親にしない。 [A, B(A の子), x(B の子), T]。
+        // {A,B} を drag して x..T の gap に深く落としても parent は source(A/B) を避け None へ繰り上がる。
+        let tracks = vec![
+            htrack(1, 0, None),    // A (group, source)
+            htrack(2, 1, Some(1)), // B (group, A の子, source)
+            htrack(3, 2, Some(2)), // x (B の子)
+            htrack(4, 0, None),    // T
+        ];
+        // x(row2)とT(row3)の間 = gap3 → T 上半分 (96..112) → mouse_y=100。 深く indent (col=5)。
+        let d = resolve(&tracks, &[1, 2], 100.0, 5.0);
+        assert!(d.parent != Some(1) && d.parent != Some(2), "source A/B を親にしない");
+        assert_eq!(d.parent, None, "全 source 祖先を抜けて top-level");
     }
 
     #[test]
