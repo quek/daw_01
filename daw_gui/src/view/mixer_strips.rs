@@ -8,7 +8,7 @@
 //!   - Volume fader (縦) + L/R peak meter
 
 use common::model::{AutomationTarget, SendMode, TrackBuiltinParam};
-use daw_ui_core::{Edit, LevelMeterStyle, MeterBallistic, ToggleButtonStyle, Ui};
+use daw_ui_core::{Edit, LevelMeterStyle, MeterBallistic, MeterScale, ToggleButtonStyle, Ui};
 
 use crate::view::param_gesture::push_param_gesture_edges;
 use crate::view::track_color;
@@ -22,8 +22,12 @@ const TOP_LABEL_H: f32 = 18.0;
 const TOGGLE_H: f32 = 22.0;
 const KNOB_SIZE: f32 = 32.0;
 const FADER_W: f32 = 18.0;
-const METER_W: f32 = 4.0;
 const METER_GAP: f32 = 2.0;
+/// scale 付きステレオメーターの box 幅 (px)。 widget が内部で
+/// `[tick ~6 | L バー | R バー | 数字 ~18]` に配分する。 全 ch に dB 目盛りを
+/// 付けつつ現 80px ストリップ (fader 18 と並べて) に収まる幅。 数字 "-60" が
+/// 読める最小幅で、 バーは ~5px ずつ残る。
+const METER_SCALE_W: f32 = 35.0;
 /// Sends セクション 1 行の高さ (= 宛先名ラベル + 小 knob / 小ボタン群)。
 const SEND_ROW_H: f32 = 30.0;
 /// Sends セクション内の send 用ミニ knob のサイズ。
@@ -437,7 +441,7 @@ fn draw_strip(
     let fader_bottom = rect.y + rect.h - pad - 12.0 - sends_band_h;
     let fader_h = (fader_bottom - fader_top).max(20.0);
 
-    let group_w = FADER_W + (METER_W * 2.0 + METER_GAP * 2.0);
+    let group_w = FADER_W + METER_GAP + METER_SCALE_W;
     let group_x = rect.x + (rect.w - group_w) * 0.5;
 
     let fader_value = amp_to_fader(volume);
@@ -477,25 +481,21 @@ fn draw_strip(
     }
 
     let mx = group_x + FADER_W + METER_GAP;
-    let meter_style = LevelMeterStyle::default();
-    ui.level_meter(
-        ("mixer_meter_l", layout_idx),
-        Rect { x: mx, y: fader_top, w: METER_W, h: fader_h },
+    // Ableton 風メーター: widget が L/R 2 本のバー + 非線形 dB 目盛り (tick|L|R|数字) +
+    // 0dB 横線 + 数値ピーク (click reset) を同一カーブで描く (SSoT、 daw_01 は自前描画しない)。
+    // 全 ch (track/return/group/master) に目盛りを付ける。
+    let style = LevelMeterStyle {
+        scale: Some(MeterScale::default()),
+        peak_readout: true,
+        ..LevelMeterStyle::default()
+    };
+    ui.level_meter_stereo(
+        ("mixer_meter", layout_idx),
+        Rect { x: mx, y: fader_top, w: METER_SCALE_W, h: fader_h },
         peak_l_raw,
-        MeterBallistic::Peak,
-        meter_style,
-    );
-    ui.level_meter(
-        ("mixer_meter_r", layout_idx),
-        Rect {
-            x: mx + METER_W + METER_GAP,
-            y: fader_top,
-            w: METER_W,
-            h: fader_h,
-        },
         peak_r_raw,
         MeterBallistic::Peak,
-        meter_style,
+        style,
     );
 }
 
