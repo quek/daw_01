@@ -3504,6 +3504,10 @@ pub enum AppEvent {
         /// `cursor_track_index().unwrap_or(0)` にフォールバック (= File
         /// menu / 起動 dialog 経由の場合は位置情報がないため)。
         target_track_idx: Option<u32>,
+        /// drag&drop の drop X 位置から計算した beat (snap 済み)。 生成する
+        /// clip をこの beat に置く (= ドロップしたカーソル位置に貼る)。 `None`
+        /// なら handler 側で playhead にフォールバック (= dialog / File menu 経由)。
+        target_beat: Option<f64>,
     },
 
     /// File menu → "Import Audio..." entry. Opens an `rfd` file picker
@@ -3522,7 +3526,13 @@ pub enum AppEvent {
     /// playhead. Runs synchronously on the GUI thread — typical MV
     /// clips finish in 1-3s, slow imports leave the user with a
     /// momentary stall instead of a complex completion dispatch.
-    ImportVideo { paths: Vec<PathBuf> },
+    ImportVideo {
+        paths: Vec<PathBuf>,
+        /// drag&drop の drop X 位置から計算した beat (snap 済み)。 生成する
+        /// video / 対 audio clip をこの beat に置く。 `None` なら playhead に
+        /// フォールバック (= dialog / File menu / smoke test 経由)。
+        target_beat: Option<f64>,
+    },
     /// v13 (`docs/plan_image_overlay.md` §P2): import one or more
     /// image files (PNG / JPEG / WebP / static), allocating an
     /// `ImageSource` per file and a Clip holding the image as a PiP
@@ -3535,6 +3545,10 @@ pub enum AppEvent {
     ImportImage {
         paths: Vec<PathBuf>,
         target_track_idx: Option<u32>,
+        /// drag&drop の drop X 位置から計算した beat (snap 済み)。 生成する
+        /// image clip をこの beat に置く。 `None` なら playhead / beat 0 に
+        /// フォールバック (= dialog / File menu 経由)。
+        target_beat: Option<f64>,
     },
     /// v13: open the platform file dialog filtered to supported image
     /// extensions and dispatch the selection as `AppEvent::ImportImage`.
@@ -4739,18 +4753,18 @@ impl AppData {
             AppEvent::ExportMidi => {
                 self.action_export_midi();
             }
-            AppEvent::ImportAudio { paths, target_track_idx } => {
-                self.action_import_audio(paths, target_track_idx);
+            AppEvent::ImportAudio { paths, target_track_idx, target_beat } => {
+                self.action_import_audio(paths, target_track_idx, target_beat);
             }
             AppEvent::OpenImportAudioDialog => {
                 self.action_open_import_audio_dialog();
             }
-            AppEvent::ImportVideo { paths } => {
+            AppEvent::ImportVideo { paths, target_beat } => {
                 #[cfg(windows)]
-                self.action_import_video(paths);
+                self.action_import_video(paths, target_beat);
                 #[cfg(not(windows))]
                 {
-                    let _ = paths;
+                    let _ = (paths, target_beat);
                     self.status_message =
                         "Video import は Windows 専用 (WMF 経由) です".into();
                 }
@@ -4764,8 +4778,8 @@ impl AppData {
                         "Video import は Windows 専用 (WMF 経由) です".into();
                 }
             }
-            AppEvent::ImportImage { paths, target_track_idx } => {
-                self.action_import_image(paths, target_track_idx);
+            AppEvent::ImportImage { paths, target_track_idx, target_beat } => {
+                self.action_import_image(paths, target_track_idx, target_beat);
             }
             AppEvent::OpenImportImageDialog => {
                 self.action_open_import_image_dialog();
@@ -14420,9 +14434,9 @@ impl AppData {
         if paths.is_empty() {
             return;
         }
-        // dialog 経由は位置情報がないので target_track_idx = None
-        // (= cursor_track にフォールバック)。
-        self.action_import_audio(paths, None);
+        // dialog 経由は位置情報がないので target_track_idx / target_beat = None
+        // (= cursor_track / playhead にフォールバック)。
+        self.action_import_audio(paths, None, None);
     }
 
     /// PR-D 段階 3: Audio Editor の context menu "Add From Source..."。
@@ -14454,6 +14468,7 @@ impl AppData {
         &mut self,
         paths: Vec<PathBuf>,
         target_track_idx: Option<u32>,
+        target_beat: Option<f64>,
     ) {
         if paths.is_empty() {
             return;
@@ -14472,7 +14487,9 @@ impl AppData {
             .map(|i| (i as usize).min(n_tracks.saturating_sub(1)))
             .or_else(|| self.cursor_track_index())
             .unwrap_or(0);
-        let start_beat_seed: f64 = self.playhead_beat.unwrap_or(0.0) as f64;
+        // drag&drop の drop 位置 (`target_beat`) を最優先、 無ければ playhead。
+        let start_beat_seed: f64 =
+            target_beat.unwrap_or(self.playhead_beat.unwrap_or(0.0) as f64);
         if self.song.tracks.is_empty() {
             self.status_message =
                 "Audio import: 配置先のトラックが無いため取り込めません".to_string();
@@ -14566,7 +14583,7 @@ impl AppData {
     /// `next_start_beat`. Failures are collected per path and surfaced
     /// in `status_message` along with the success count.
     #[cfg(windows)]
-    fn action_import_video(&mut self, paths: Vec<PathBuf>) {
+    fn action_import_video(&mut self, paths: Vec<PathBuf>, target_beat: Option<f64>) {
         use common::model::{
             AudioContent, AudioEvent, ClipContent, Track, VideoContent, VideoEvent,
         };
@@ -14579,7 +14596,9 @@ impl AppData {
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
 
-        let start_beat_seed: f64 = self.playhead_beat.unwrap_or(0.0) as f64;
+        // drag&drop の drop 位置 (`target_beat`) を最優先、 無ければ playhead。
+        let start_beat_seed: f64 =
+            target_beat.unwrap_or(self.playhead_beat.unwrap_or(0.0) as f64);
         let bpm = self.song.bpm;
         let mut imported_ok = 0usize;
         let mut errors: Vec<String> = Vec::new();
@@ -14739,7 +14758,8 @@ impl AppData {
         if paths.is_empty() {
             return;
         }
-        self.action_import_video(paths);
+        // dialog 経由は位置情報がないので target_beat = None (= playhead)。
+        self.action_import_video(paths, None);
     }
 
     /// v13 (`docs/plan_image_overlay.md` §P2): import one or more
@@ -14759,7 +14779,12 @@ impl AppData {
     ///
     /// Errors are accumulated; partial-success is permitted (= the
     /// status bar summarizes how many files succeeded / failed).
-    fn action_import_image(&mut self, paths: Vec<PathBuf>, target_track_idx: Option<u32>) {
+    fn action_import_image(
+        &mut self,
+        paths: Vec<PathBuf>,
+        target_track_idx: Option<u32>,
+        target_beat: Option<f64>,
+    ) {
         if paths.is_empty() {
             return;
         }
@@ -14775,13 +14800,16 @@ impl AppData {
         let dest_track_idx: Option<usize> =
             resolve_image_drop_target(target_track_idx, self.song.tracks.len());
 
-        // 既存 track に貼るときは audio drop と同じく playhead を seed に順送り
-        // 配置 (複数枚を重ねない)。 新規 track 経路は各画像が自分の track を
-        // 持つので従来どおり beat 0 始まり。
-        let mut next_start_beat = if dest_track_idx.is_some() {
-            (self.playhead_beat.unwrap_or(0.0) as f64).max(0.0)
-        } else {
-            0.0_f64
+        // drag&drop の drop 位置 (`target_beat`) を最優先。 無いとき (dialog 経由)
+        // は従来挙動: 既存 track に貼るときは playhead を seed に順送り配置
+        // (複数枚を重ねない)、 新規 track 経路は各画像が自分の track を持つので
+        // beat 0 始まり。
+        let mut next_start_beat = match target_beat {
+            Some(b) => b.max(0.0),
+            None if dest_track_idx.is_some() => {
+                (self.playhead_beat.unwrap_or(0.0) as f64).max(0.0)
+            }
+            None => 0.0_f64,
         };
         let image_clip_length_beats = (self.song.length_beats * 0.5).max(8.0);
 
@@ -14977,9 +15005,9 @@ impl AppData {
         if paths.is_empty() {
             return;
         }
-        // dialog 経由は drop 位置情報が無いので target_track_idx = None
+        // dialog 経由は drop 位置情報が無いので target_track_idx / target_beat = None
         // (= 新規 track を先頭に作って貼る、従来挙動)。
-        self.action_import_image(paths, None);
+        self.action_import_image(paths, None, None);
     }
 
     /// File menu → "Export Video..." (`docs/plan_video.md` P8)。

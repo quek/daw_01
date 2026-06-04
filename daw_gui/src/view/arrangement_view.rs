@@ -807,6 +807,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let target_track_idx =
             track_index_at_y(&resp.track_header_rects, &app.song.tracks, drop_y)
                 .map(|idx| idx as u32);
+        // ドロップ X 位置 → beat。 import で生成する clip を「先頭 (playhead) では
+        // なくドロップしたカーソル位置」 に置く。 hover-beat (下) と同じ pixel→beat
+        // 変換 (canvas 左端基準) + 既存 snap 設定を適用。 header 上に落とした等で
+        // canvas 左外なら 0 に clamp。 `None` は dialog / File メニュー経由 (位置情報
+        // 無し → handler 側で playhead fallback)。
+        let target_beat: Option<f64> = {
+            let raw = view.start_beat
+                + ((drop.position.0 - canvas_area.x) as f64 / zoom as f64);
+            Some(view.snap.snap_beat(raw.max(0.0), /* alt: */ false, zoom))
+        };
         // docs/plan_image_overlay.md P2: 3-way partition (video →
         // image → audio). Video on Windows only (= WMF dependency);
         // image is OS-neutral (image crate); audio is the fallback
@@ -829,19 +839,24 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 app.handle_event(AppEvent::ImportAudio {
                     paths,
                     target_track_idx,
+                    target_beat,
                 });
             }));
         }
         if !video_paths.is_empty() {
             let paths = video_paths;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::ImportVideo { paths });
+                app.handle_event(AppEvent::ImportVideo { paths, target_beat });
             }));
         }
         if !image_paths.is_empty() {
             let paths = image_paths;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::ImportImage { paths, target_track_idx });
+                app.handle_event(AppEvent::ImportImage {
+                    paths,
+                    target_track_idx,
+                    target_beat,
+                });
             }));
         }
     }
