@@ -7079,8 +7079,9 @@ impl AppData {
         // 既存の自動生成 clip を全削除 (手編集保持しない)。
         self.song.tracks[m_idx].clips.retain(|c| !c.auto_lipsync);
         // 各 vocal clip 分の口画像 clip を生成して口 track へ追加。
+        let res = self.song.video_resolution;
         for r in &results {
-            let events = common::lipsync::build_mouth_events(
+            let mut events = common::lipsync::build_mouth_events(
                 &r.phonemes,
                 &mouth_map,
                 bpm,
@@ -7089,6 +7090,20 @@ impl AppData {
             );
             if events.is_empty() {
                 continue;
+            }
+            // build_mouth_events は rect を全画面 default で返すので、 そのままだと
+            // 口画像が preview 全面に伸びて「大きすぎる / 他レイヤーとサイズが合わ
+            // ない」。 通常の画像取り込み (action_import_image) と同じく、 各口画像の
+            // 素材寸法から aspect-fit rect を計算して上書きし、 立ち絵の他の子レイヤー
+            // (眉 / 目 等を同寸 PNG で取り込んだもの) と同じ収まりに揃える。
+            for ev in &mut events {
+                if let Some(src) = self.song.image_sources.get(&ev.source_id) {
+                    let (x, y, w, h) = aspect_fit_pip_rect(res, (src.width, src.height));
+                    ev.x = x;
+                    ev.y = y;
+                    ev.w = w;
+                    ev.h = h;
+                }
             }
             let content_id = self.song.alloc_content(
                 common::model::ClipContent::Image(common::model::ImageContent { events }),
