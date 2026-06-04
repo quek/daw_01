@@ -15,6 +15,7 @@ members = [
     "crates/examples/daw_prototype",
     "crates/examples/composite_validation",
     "crates/examples/text_input_ime",
+    "crates/examples/meter_snapshot",
 ]
 
 [workspace.package]

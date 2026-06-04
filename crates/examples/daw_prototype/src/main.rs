@@ -21,7 +21,7 @@ use daw_ui_core::{
     ArrangementTrack, ArrangementView, BarBeatGridStyle, ClipKey, ColorPickerStyle, DialogResult,
     Edit, FaderResponse,
     FileDialogFilter, InputAccumulator, LevelMeterStyle, ListViewStyle, MASTER_TRACK_ID,
-    MenuItemSpec, MeterBallistic, ModalStyle, Orientation, ReorderableListEditRequest,
+    MenuItemSpec, MeterBallistic, MeterScale, ModalStyle, Orientation, ReorderableListEditRequest,
     ReorderableListStyle, SnapConfig, TimeMapping, TimeRulerStyle, UiHost, ViewportState1D,
 };
 use daw_ui_platform::{AppEvent, AppHost, WindowBackend, winit_backend};
@@ -816,18 +816,37 @@ fn drawmixer_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pane: Rec
 
     for ch in 0..N_CH {
         let cx = pane.x + ch_w * ch as f32 + 8.0;
+        // 最右 ch を master 風に: dB 目盛り + 数値ピーク (click で reset) のショーケース。
+        // 他 ch は clean bar (default)。
+        let is_master = ch == N_CH - 1;
         // ch label
         ui.label_at(
             ("ch_lbl", ch),
-            &format!("CH {}", ch + 1),
+            if is_master { "MASTER".to_string() } else { format!("CH {}", ch + 1) }.as_str(),
             cx,
             pane.y + 6.0,
             12.0,
             Color::rgb(0.85, 0.88, 0.92),
         );
 
+        // master は目盛りガター + 数値ぶん meter を広げ、 その分 fader を細くする。
+        // バーは細く (12px)、 残り 26px が目盛りガター = Ableton Live 風の細いメーター。
+        let (this_fader_w, this_meter_w, meter_style) = if is_master {
+            (
+                (fader_w - 22.0).max(20.0),
+                38.0,
+                LevelMeterStyle {
+                    scale: Some(MeterScale::default()),
+                    peak_readout: true,
+                    ..LevelMeterStyle::default()
+                },
+            )
+        } else {
+            (fader_w, meter_w, LevelMeterStyle::default())
+        };
+
         // fader
-        let fader_rect = Rect { x: cx, y: body_top, w: fader_w, h: body_h };
+        let fader_rect = Rect { x: cx, y: body_top, w: this_fader_w, h: body_h };
         let cur = m.faders[ch];
         let _resp: FaderResponse = ui.fader_at(("ch_fader", ch), fader_rect, cur, 0.7, "fader", move |v| {
             Edit::mutate(move |m: &mut DawModel| m.faders[ch] = v)
@@ -835,9 +854,9 @@ fn drawmixer_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pane: Rec
 
         // level_meter
         let meter_rect = Rect {
-            x: cx + fader_w + 4.0,
+            x: cx + this_fader_w + 4.0,
             y: body_top,
-            w: meter_w,
+            w: this_meter_w,
             h: body_h,
         };
         ui.level_meter(
@@ -845,7 +864,7 @@ fn drawmixer_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pane: Rec
             meter_rect,
             m.sim_peak(ch),
             MeterBallistic::Peak,
-            LevelMeterStyle::default(),
+            meter_style,
         );
 
         // mute checkbox
