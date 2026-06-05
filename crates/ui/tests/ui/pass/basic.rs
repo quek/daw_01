@@ -69,6 +69,14 @@ fn main() {
                     m.history.push(m.counter);
                 })
             });
+            // M14 Phase 105 (daw_01 #076): button_at_clicked_sized (font_size 可変版、track 名を
+            // style.track_text_size に追従させる用) も non-Clone Model でコンパイルすることを CI 固定。
+            let _ = ui.button_at_clicked_sized(
+                "inc_sized",
+                "increment",
+                Rect { x: 0.0, y: 0.0, w: 100.0, h: 28.0 },
+                12.0,
+            );
             // fader (M3): 矩形指定 + vstack 版の両方が non-Clone Model でコンパイルする。
             // default_value (4 番目の引数) はダブルクリックリセット用 (M3 Phase 4d)。
             // M8 Phase 29: label (5 番目) は undoable Edit に付与される表示文字列。

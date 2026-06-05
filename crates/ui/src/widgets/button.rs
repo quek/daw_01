@@ -53,6 +53,24 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         text: &str,
         rect: Rect,
     ) -> bool {
+        // 汎用ボタンの font_size は 16px 固定 (menu / dialog 等が依存)。
+        self.button_at_clicked_sized(id, text, rect, 16.0)
+    }
+
+    /// `button_at_clicked` の font_size 可変版。click 判定・外観 (fill / border / 角丸) は
+    /// `button_at_clicked` と完全同一で、**テキストの font_size だけ**を呼び出し側が指定する。
+    ///
+    /// 汎用 `button_at_clicked` は 16px 固定 (menu / dialog 等が依存) なので変えられないが、
+    /// arrangement の track 名のように `style.track_text_size` へ追従させたい widget が
+    /// boilerplate な再実装なしにサイズだけ差し替えられる (daw_01 #076)。
+    #[must_use]
+    pub fn button_at_clicked_sized(
+        &mut self,
+        id: impl std::hash::Hash,
+        text: &str,
+        rect: Rect,
+        font_size: f32,
+    ) -> bool {
         let wid = WidgetId::ROOT.child((b"button", &id));
         let pointer = self.pointer;
         let inside = pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
@@ -75,7 +93,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         };
 
         // M4 Phase 11: 描画を with_widget_node で input_hash キャッシュ。
-        // input_hash の入力は visual に影響する: rect / text / inside / visual_pressed。
+        // input_hash の入力は visual に影響する: rect / text / inside / visual_pressed / font_size。
+        // font_size は text 幅・縦中央位置を変えるので、runtime で size が変わる呼び出し側
+        // (track 名 = style.track_text_size) でも cache が stale にならないよう hash に含める。
         let input_hash = hash_inputs((
             b"button",
             rect.x.to_bits(),
@@ -85,6 +105,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             text,
             inside,
             visual_pressed,
+            font_size.to_bits(),
         ));
         self.with_widget_node(wid, input_hash, |ui| {
             let base = Color::rgb(0.18, 0.20, 0.26);
@@ -111,7 +132,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // テキストを矩形中央付近に (cosmic-text 経由の実 advance ベース)。
             // Nerd Font の wide glyph (⟳ ▶ ⏱ ♩ 等) は固定 9px / 文字 approx より広く、
             // approx で centering すると右ずれする (daw_01 #050)。
-            let font_size = 16.0;
             let line_h = font_size * 1.2;
             let text_w = ui.measure_text(text, font_size);
             let tx = rect.x + (rect.w - text_w).max(0.0) * 0.5;
@@ -242,6 +262,56 @@ mod tests {
             (glyph.left - approx_left).abs() > 0.1,
             "text left must differ from approx-based centering (approx={approx_left}, got {})",
             glyph.left
+        );
+    }
+
+    #[test]
+    fn button_at_clicked_sized_renders_given_font_size_and_centers_by_measure() {
+        // daw_01 #076: track 名 font を style.track_text_size に追従させる sized 版。
+        // 指定 font_size で push され、 left は measure_text(font_size) で中央寄せされる。
+        let font_size = 11.0_f32;
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let rect = Rect { x: 20.0, y: 30.0, w: 100.0, h: 30.0 };
+
+        let mut measured_w = 0.0;
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            measured_w = ui.measure_text("M", font_size);
+            let _ = ui.button_at_clicked_sized("btn", "M", rect, font_size);
+        });
+
+        let glyph = scene.iter_glyphs().next().expect("text should be pushed");
+        assert!(
+            (glyph.font_size - font_size).abs() < 1e-3,
+            "sized button should render at given font_size: expected {font_size}, got {}",
+            glyph.font_size
+        );
+        let expected_left = rect.x + (rect.w - measured_w) * 0.5;
+        assert!(
+            (glyph.left - expected_left).abs() < 1e-3,
+            "text left should match measured center at given size: expected {expected_left}, got {}",
+            glyph.left
+        );
+    }
+
+    #[test]
+    fn button_at_clicked_default_stays_16px() {
+        // 汎用 button は font_size 16px 固定のまま (menu / dialog 等が依存、byte-compat)。
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let rect = Rect { x: 20.0, y: 30.0, w: 100.0, h: 30.0 };
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            let _ = ui.button_at_clicked("btn", "M", rect);
+        });
+
+        let glyph = scene.iter_glyphs().next().expect("text should be pushed");
+        assert!(
+            (glyph.font_size - 16.0).abs() < 1e-3,
+            "default button must stay 16px: got {}",
+            glyph.font_size
         );
     }
 

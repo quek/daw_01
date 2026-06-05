@@ -949,6 +949,9 @@ pub struct ArrangementStyle {
     pub clip_text_size: f32,
     pub track_selected_bg: Color,
     pub track_text_color: Color,
+    /// track header の **トラック名** + group disclosure グリフ (▶ / ▼) の font size
+    /// (default 12.0)。 daw_01 #076 でトラック名にも適用 (旧来は汎用 button 16px 固定で
+    /// disclosure グリフ専用だった)。
     pub track_text_size: f32,
     pub playhead_color: Color,
     pub playhead_width_px: f32,
@@ -8199,7 +8202,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 // M14 Phase 63c (#016): name 領域 click は modifier-aware SelectTrack を loop 後に
                 // 発行する形に変更。 button_at_clicked で click 検知のみ行い、 内部で Edit は emit
                 // しない (旧設計は button_at の closure 内で SelectTrack を emit していた)。
-                if self.button_at_clicked(id_name, &name_text, name_rect_visible) {
+                // M14 Phase 105 (#076): track 名 font は `style.track_text_size` に追従させる
+                // (汎用 button の 16px 固定では daw_01 が名前サイズを下げられないため)。
+                if self.button_at_clicked_sized(
+                    id_name,
+                    &name_text,
+                    name_rect_visible,
+                    style.track_text_size,
+                ) {
                     clicked_track_for_select = Some(t.id);
                 }
                 if self.take_double_click_in_rect(name_rect_visible).is_some() {
