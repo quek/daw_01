@@ -261,6 +261,12 @@ fn worker_loop(
             // warm.
             let mut ring_slots: Vec<RingSlot> = Vec::with_capacity(PREVIEW_RING_SIZE);
             for i in 0..PREVIEW_RING_SIZE {
+                // Observe shutdown mid-ring so teardown/join stays bounded
+                // even if a slot decode (incl. an ffmpeg fallback spawn)
+                // is slow — the close/exit path must not hang.
+                if shutdown.load(Ordering::Acquire) {
+                    return;
+                }
                 let slot_idx = i as u8;
                 let target =
                     req.center_target_micros.saturating_add((i as u64) * req.step_micros);

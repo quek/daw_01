@@ -316,6 +316,12 @@ pub struct VideoPlaybackEngine {
     /// warning then proceeds with SW decode for the rest of the
     /// process lifetime.
     d3d11_init_attempted: bool,
+    /// Sources the Media Foundation decoder could not decode (e.g.
+    /// 10-bit H.264 High10, which the stock MS H.264 decoder rejects).
+    /// Once `decode_at` sees an MF decode failure for a source it is
+    /// switched here and decoded via a bounded `ffmpeg.exe` child for
+    /// the rest of the session (CPU/BGRA → `DecodedFrame::Bgra`).
+    ffmpeg_sources: HashMap<VideoSourceId, FfmpegSource>,
 }
 
 impl VideoPlaybackEngine {
@@ -324,6 +330,7 @@ impl VideoPlaybackEngine {
             readers: HashMap::new(),
             d3d11: None,
             d3d11_init_attempted: false,
+            ffmpeg_sources: HashMap::new(),
         }
     }
 
@@ -341,6 +348,7 @@ impl VideoPlaybackEngine {
             // Pretend we already tried — this short-circuits the lazy
             // init in `decode_at`.
             d3d11_init_attempted: true,
+            ffmpeg_sources: HashMap::new(),
         }
     }
 
@@ -491,6 +499,76 @@ impl VideoPlaybackEngine {
         None
     }
 
+    /// Decode the frame at `target_micros`. Tries the Media Foundation
+    /// path first; if MF cannot decode the source (e.g. 10-bit H.264
+    /// High10, which the stock MS H.264 decoder rejects with
+    /// `CopyDecodedFrame failed (0x80004005)`), this source is switched
+    /// to a bounded `ffmpeg.exe` child-process fallback for the rest of
+    /// the session (CPU/BGRA → `DecodedFrame::Bgra`).
+    pub fn decode_at(
+        &mut self,
+        video_source_id: VideoSourceId,
+        source_path: &Path,
+        target_micros: u64,
+        slot_idx: u8,
+    ) -> Result<DecodedFrame, String> {
+        if self.ffmpeg_sources.contains_key(&video_source_id) {
+            // The ffmpeg fallback is CPU/BGRA; the runner collapses
+            // every ring slot into the single `(source_id, 0)` texture
+            // (1-frame-latest), so only the ring's center slot is
+            // meaningful. Signal "no more" for slots > 0 so the worker
+            // truncates the ring to the center frame (= the playhead).
+            if slot_idx != 0 {
+                return Err("ffmpeg fallback: center slot only".to_string());
+            }
+            let src = self
+                .ffmpeg_sources
+                .get_mut(&video_source_id)
+                .expect("contains_key just checked");
+            return decode_ffmpeg_source(src, source_path, target_micros);
+        }
+        match self.decode_at_mf(video_source_id, source_path, target_micros, slot_idx) {
+            Ok(frame) => Ok(frame),
+            Err(mf_err) => {
+                // The reader was built (container/metadata parsed) but
+                // the actual decode failed → the stock decoder can't
+                // handle this codec/profile. Reuse the dimensions the
+                // reader already resolved, drop the MF reader, and serve
+                // this source from ffmpeg.exe from now on.
+                let dims = self
+                    .readers
+                    .get(&video_source_id)
+                    .map(|r| (r.width, r.height))
+                    .filter(|(w, h)| *w > 0 && *h > 0);
+                let Some((width, height)) = dims else {
+                    return Err(format!(
+                        "decode failed for source {video_source_id} and no \
+                         dimensions for ffmpeg fallback: {mf_err}"
+                    ));
+                };
+                self.readers.remove(&video_source_id);
+                let fps = ffprobe_fps(source_path);
+                tracing::info!(
+                    video_source_id,
+                    width,
+                    height,
+                    fps,
+                    error = %mf_err,
+                    "MF decode failed; switching source to ffmpeg.exe fallback"
+                );
+                let mut src = FfmpegSource::new(width, height, fps);
+                let frame = decode_ffmpeg_source(&mut src, source_path, target_micros)
+                    .map_err(|fe| {
+                        format!(
+                            "MF decode failed ({mf_err}); ffmpeg fallback also failed: {fe}"
+                        )
+                    })?;
+                self.ffmpeg_sources.insert(video_source_id, src);
+                Ok(frame)
+            }
+        }
+    }
+
     /// Decode (or just-fetch when the target lands on the same frame
     /// we last decoded) the frame at `target_micros` of the source.
     /// `source_path` is only consulted when the reader for this
@@ -508,7 +586,7 @@ impl VideoPlaybackEngine {
     /// ring (= the variant itself has no slot field; the ring entry
     /// preserves order so the main thread sees a 1-frame-latest
     /// snapshot, identical to the pre-P4 behavior in HW-less envs).
-    pub fn decode_at(
+    fn decode_at_mf(
         &mut self,
         video_source_id: VideoSourceId,
         source_path: &Path,
@@ -648,6 +726,189 @@ impl Default for VideoPlaybackEngine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Per-source state for the `ffmpeg.exe` decode fallback (codecs the
+/// stock Media Foundation decoder can't handle, e.g. 10-bit H.264).
+/// Holds a small cache of consecutive frames decoded by one bounded
+/// ffmpeg invocation so sequential playback amortizes process spawns.
+struct FfmpegSource {
+    width: u32,
+    height: u32,
+    fps: f64,
+    /// Source-time (μs) of `frames[0]`.
+    cache_start_micros: u64,
+    /// Consecutive BGRA frames (tightly packed, `width*height*4` each),
+    /// `frames[i]` at `cache_start_micros + i * frame_dur`.
+    frames: Vec<Vec<u8>>,
+}
+
+impl FfmpegSource {
+    fn new(width: u32, height: u32, fps: f64) -> Self {
+        Self {
+            width,
+            height,
+            fps: if fps > 0.0 { fps } else { 30.0 },
+            cache_start_micros: 0,
+            frames: Vec::new(),
+        }
+    }
+
+    fn frame_dur_micros(&self) -> u64 {
+        ((1_000_000.0 / self.fps).round() as u64).max(1)
+    }
+
+    /// Nearest cached frame to `target_micros` (within half a frame),
+    /// or `None` on a cache miss (= caller decodes a fresh batch).
+    fn cached_frame(&self, target_micros: u64) -> Option<Vec<u8>> {
+        if self.frames.is_empty() {
+            return None;
+        }
+        let dur = self.frame_dur_micros();
+        // Before the cached window (allow half a frame of slack).
+        if target_micros + dur / 2 < self.cache_start_micros {
+            return None;
+        }
+        let idx = (target_micros.saturating_sub(self.cache_start_micros) + dur / 2) / dur;
+        self.frames.get(idx as usize).cloned()
+    }
+}
+
+/// Serve the frame at `target_micros` from the ffmpeg fallback for one
+/// source: cache hit → return it; miss → spawn one bounded ffmpeg that
+/// decodes `PREVIEW_RING_SIZE` consecutive frames from `target_micros`,
+/// cache them, and return the first.
+fn decode_ffmpeg_source(
+    src: &mut FfmpegSource,
+    path: &Path,
+    target_micros: u64,
+) -> Result<DecodedFrame, String> {
+    if let Some(bgra) = src.cached_frame(target_micros) {
+        return Ok(DecodedFrame::Bgra {
+            width: src.width,
+            height: src.height,
+            bgra,
+        });
+    }
+    let frames =
+        ffmpeg_decode_batch(path, target_micros, PREVIEW_RING_SIZE, src.width, src.height)?;
+    let first = frames
+        .first()
+        .cloned()
+        .ok_or_else(|| "ffmpeg produced no frames".to_string())?;
+    src.cache_start_micros = target_micros;
+    src.frames = frames;
+    Ok(DecodedFrame::Bgra {
+        width: src.width,
+        height: src.height,
+        bgra: first,
+    })
+}
+
+/// Spawn one bounded `ffmpeg.exe` to decode up to `count` consecutive
+/// frames starting at `start_micros`, as tightly-packed BGRA8 read from
+/// the child's stdout. Self-terminates via `-frames:v` (no persistent
+/// process, no unbounded pipe). Returns the decoded frames (possibly
+/// fewer than `count` near EOF). `-ss` before `-i` does an accurate,
+/// fast input seek in modern ffmpeg.
+fn ffmpeg_decode_batch(
+    path: &Path,
+    start_micros: u64,
+    count: usize,
+    width: u32,
+    height: u32,
+) -> Result<Vec<Vec<u8>>, String> {
+    use std::io::Read;
+    let frame_bytes = (width as usize) * (height as usize) * 4;
+    if frame_bytes == 0 || count == 0 {
+        return Err("ffmpeg_decode_batch: zero frame size / count".to_string());
+    }
+    let start_sec = format!("{:.6}", start_micros as f64 / 1_000_000.0);
+    let mut child = std::process::Command::new("ffmpeg")
+        .args(["-nostdin", "-loglevel", "error", "-ss", &start_sec, "-i"])
+        .arg(path)
+        .args([
+            "-frames:v",
+            &count.to_string(),
+            "-pix_fmt",
+            "bgra",
+            "-f",
+            "rawvideo",
+            "-",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        // Drop ffmpeg's stderr so it can never fill a pipe and block the
+        // child (we rely on -loglevel error + the exit/byte count).
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("ffmpeg spawn failed (is ffmpeg on PATH?): {e}"))?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "ffmpeg stdout unavailable".to_string())?;
+    let mut buf = vec![0u8; frame_bytes * count];
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match stdout.read(&mut buf[filled..]) {
+            Ok(0) => break, // EOF (fewer than `count` frames available)
+            Ok(n) => filled += n,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("ffmpeg stdout read: {e}"));
+            }
+        }
+    }
+    let _ = child.wait();
+
+    let n_frames = filled / frame_bytes;
+    if n_frames == 0 {
+        return Err(format!(
+            "ffmpeg decoded no frames at {start_sec}s (got {filled} bytes)"
+        ));
+    }
+    let mut frames = Vec::with_capacity(n_frames);
+    for i in 0..n_frames {
+        frames.push(buf[i * frame_bytes..(i + 1) * frame_bytes].to_vec());
+    }
+    Ok(frames)
+}
+
+/// Probe a video's frame rate via `ffprobe` (`r_frame_rate`, e.g.
+/// `30000/1001`). Falls back to 30.0 if ffprobe is missing or the
+/// output can't be parsed — the rate only affects cache indexing, not
+/// frame correctness.
+fn ffprobe_fps(path: &Path) -> f64 {
+    let output = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=r_frame_rate",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Ok(out) = output else {
+        return 30.0;
+    };
+    let s = String::from_utf8_lossy(&out.stdout);
+    let s = s.trim();
+    if let Some((num, den)) = s.split_once('/')
+        && let (Ok(n), Ok(d)) = (num.trim().parse::<f64>(), den.trim().parse::<f64>())
+        && d > 0.0
+        && n > 0.0
+    {
+        return n / d;
+    }
+    s.parse::<f64>().ok().filter(|f| *f > 0.0).unwrap_or(30.0)
 }
 
 /// Per-event alpha at the given clip-local beat, derived from
