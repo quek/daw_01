@@ -392,6 +392,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 文字色は widget が背景に応じて自動で可読化する。
     let style = ArrangementStyle {
         audio_db_handle_color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+        // トラックヘッダのトラック名フォントサイズ (gui_01 #076 Phase 105 で track 名
+        // + group disclosure ▶/▼ が track_text_size に追従)。 widget default 12.0 より
+        // 小さくして 160px 幅 header に長い名前を収めやすく。
+        track_text_size: 11.0,
+        // Master 行ラベルは別フィールド (track_text_size 追従外、 gui_01 #076 nit) なので
+        // 同値に揃え、 通常トラック名と視覚的に一致させる。
+        master_row_label_size: 11.0,
         ..ArrangementStyle::default()
     };
 
