@@ -7669,10 +7669,25 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ---- wheel: Ctrl=zoom_x / Alt=zoom_y (row_h) / Shift=scroll_x / plain=track_top ----
-        let scroll = self.take_scroll_in_rect(lanes);
+        // M14 Phase 104 (daw_01 #075): wheel を **ruler 下の content 全域** (`header_pane` + `lanes`) で
+        // 取得する。 左の track header 列 (master row header / automation lane header を含む) の上でも
+        // 縦操作 (plain=scroll / Alt=zoom_y) が効く。 横操作 (Ctrl=zoom_x / Shift=scroll_x) は beat anchor
+        // (`mx - lanes.x`) が header 上 (`mx < lanes.x`) では意味を成さないため header 上では無視する
+        // (= `over_lanes` で gate)。 lanes 上の 4 操作はすべて従来どおり (header_w==0 なら content 全域 ==
+        // lanes、 over_lanes は常に true で旧挙動と byte 互換)。
+        let content_below_ruler = Rect {
+            x: header_pane.x,
+            y: header_pane.y,
+            w: header_pane.w + lanes.w,
+            h: lanes_h,
+        };
+        let scroll = self.take_scroll_in_rect(content_below_ruler);
         if scroll.1.abs() > 0.0 || scroll.0.abs() > 0.0 {
             let dy = scroll.1;
-            if pointer.modifiers.ctrl {
+            // header pane 上 (`mx < lanes.x`) では横軸操作 (Ctrl / Shift) を無視。 pointer.pos は
+            // take_scroll_in_rect が `content_below_ruler.contains` を満たして Some を保証済。
+            let over_lanes = pointer.pos.is_some_and(|(mx, _)| mx >= lanes.x);
+            if pointer.modifiers.ctrl && over_lanes {
                 // M14 Phase 61a (#011): wheel up = zoom in (符号反転)、 1 ノッチで ~20% 変化
                 // (係数 0.005 → 0.0015、 Cubase/Live 同等)、 SetZoomX を絶対値送信に統一
                 // (旧設計は factor 0.55..1.82 を直送りで daw_01 の clamp(2, 400) で必ず 2 に
@@ -7757,12 +7772,15 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         }
                     }
                 }
-            } else if pointer.modifiers.shift {
+            } else if pointer.modifiers.shift && over_lanes {
                 let delta = -f64::from(dy) * beat_per_px * 4.0;
                 self.push_edit(make_edit(ArrangementEditRequest::SetScrollX(
                     view.start_beat + delta,
                 )));
-            } else {
+            } else if !pointer.modifiers.ctrl && !pointer.modifiers.shift {
+                // plain wheel (= 縦 scroll)。 header / lanes どちらの上でも同一挙動。 `!ctrl && !shift`
+                // guard は header 上で横操作キーが押されているときに plain scroll へ落ちないため
+                // (lanes 上では ctrl は上の分岐、 shift は直上の分岐で既に消費されここへ来ない)。
                 let new_top = (view.track_top - dy * 8.0).max(0.0);
                 self.push_edit(make_edit(ArrangementEditRequest::SetTrackTop(new_top)));
             }
