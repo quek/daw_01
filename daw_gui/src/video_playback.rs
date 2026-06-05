@@ -730,27 +730,42 @@ impl Default for VideoPlaybackEngine {
 
 /// Per-source state for the `ffmpeg.exe` decode fallback (codecs the
 /// stock Media Foundation decoder can't handle, e.g. 10-bit H.264).
-/// Holds a small cache of consecutive frames decoded by one bounded
-/// ffmpeg invocation so sequential playback amortizes process spawns.
+///
+/// Keeps ONE persistent ffmpeg child streaming raw BGRA frames, so
+/// sequential playback reads a single frame per request with no
+/// per-frame process spawn (smooth playback). ffmpeg is only restarted
+/// on a seek — backward, or a forward jump beyond [`Self::SEEK_AHEAD_MICROS`].
+/// Memory stays tiny: just the current frame plus the OS pipe buffer.
 struct FfmpegSource {
     width: u32,
     height: u32,
     fps: f64,
-    /// Source-time (μs) of `frames[0]`.
-    cache_start_micros: u64,
-    /// Consecutive BGRA frames (tightly packed, `width*height*4` each),
-    /// `frames[i]` at `cache_start_micros + i * frame_dur`.
-    frames: Vec<Vec<u8>>,
+    /// Running ffmpeg child + its stdout while streaming. `None` before
+    /// the first decode and after EOF / a kill.
+    child: Option<std::process::Child>,
+    stdout: Option<std::process::ChildStdout>,
+    /// Source-time (μs) of the NEXT frame the stream will yield.
+    stream_next_micros: u64,
+    /// Most recently yielded frame `(start_micros, bgra)`. Lets a paused
+    /// playhead (repeated same target) and the post-EOF tail return
+    /// without reading more.
+    current: Option<(u64, Vec<u8>)>,
 }
 
 impl FfmpegSource {
+    /// Forward jump (μs) beyond which restarting ffmpeg (a fresh seek) is
+    /// cheaper than reading and discarding the intervening frames.
+    const SEEK_AHEAD_MICROS: u64 = 500_000;
+
     fn new(width: u32, height: u32, fps: f64) -> Self {
         Self {
             width,
             height,
             fps: if fps > 0.0 { fps } else { 30.0 },
-            cache_start_micros: 0,
-            frames: Vec::new(),
+            child: None,
+            stdout: None,
+            stream_next_micros: 0,
+            current: None,
         }
     }
 
@@ -758,122 +773,154 @@ impl FfmpegSource {
         ((1_000_000.0 / self.fps).round() as u64).max(1)
     }
 
-    /// Nearest cached frame to `target_micros` (within half a frame),
-    /// or `None` on a cache miss (= caller decodes a fresh batch).
-    fn cached_frame(&self, target_micros: u64) -> Option<Vec<u8>> {
-        if self.frames.is_empty() {
-            return None;
-        }
+    /// Decode the frame covering `target_micros`. Streams forward from the
+    /// running ffmpeg when possible; (re)spawns only on a backward seek or
+    /// a forward jump larger than [`Self::SEEK_AHEAD_MICROS`].
+    fn decode(&mut self, path: &Path, target_micros: u64) -> Result<Vec<u8>, String> {
         let dur = self.frame_dur_micros();
-        // Before the cached window (allow half a frame of slack).
-        if target_micros + dur / 2 < self.cache_start_micros {
-            return None;
+
+        // (1) Paused / repeated request: the current frame already covers it.
+        if let Some((ts, bgra)) = &self.current
+            && target_micros >= *ts
+            && target_micros < ts.saturating_add(dur)
+        {
+            return Ok(bgra.clone());
         }
-        let idx = (target_micros.saturating_sub(self.cache_start_micros) + dur / 2) / dur;
-        self.frames.get(idx as usize).cloned()
+        // (2) Stream ended (EOF) and we're at/after the held last frame:
+        //     hold it instead of respawning per request at the clip tail.
+        if self.child.is_none()
+            && let Some((ts, bgra)) = &self.current
+            && target_micros + dur / 2 >= *ts
+        {
+            return Ok(bgra.clone());
+        }
+
+        // (3) Reach `target`: stream forward, or restart ffmpeg if the
+        //     target is behind us or too far ahead.
+        let backward = self
+            .current
+            .as_ref()
+            .is_some_and(|(ts, _)| target_micros + dur / 2 < *ts);
+        let far_forward =
+            target_micros > self.stream_next_micros.saturating_add(Self::SEEK_AHEAD_MICROS);
+        if self.child.is_none() || backward || far_forward {
+            self.spawn(path, target_micros)?;
+        }
+
+        // (4) Read forward until a frame covers `target`.
+        loop {
+            match self.read_frame() {
+                Ok(Some(bgra)) => {
+                    let ts = self.stream_next_micros;
+                    self.stream_next_micros = self.stream_next_micros.saturating_add(dur);
+                    self.current = Some((ts, bgra));
+                    if ts.saturating_add(dur) > target_micros {
+                        return Ok(self.current.as_ref().expect("just set").1.clone());
+                    }
+                    // Frame is before `target` (catching up after a seek /
+                    // sparse request) — keep reading.
+                }
+                Ok(None) => {
+                    // Clean EOF: reap the child and hold the last frame.
+                    self.kill();
+                    return self
+                        .current
+                        .as_ref()
+                        .map(|(_, b)| b.clone())
+                        .ok_or_else(|| "ffmpeg reached EOF before any frame".to_string());
+                }
+                Err(e) => {
+                    self.kill();
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// (Re)start the persistent ffmpeg, seeked to `target_micros`. `-ss`
+    /// before `-i` is an accurate input seek: the first output frame lands
+    /// at ≈ `target_micros`.
+    fn spawn(&mut self, path: &Path, target_micros: u64) -> Result<(), String> {
+        self.kill();
+        let start_sec = format!("{:.6}", target_micros as f64 / 1_000_000.0);
+        let mut child = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-loglevel", "error", "-ss", &start_sec, "-i"])
+            .arg(path)
+            .args(["-pix_fmt", "bgra", "-f", "rawvideo", "-"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            // Drop stderr so it can never fill a pipe and block ffmpeg.
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("ffmpeg spawn failed (is ffmpeg on PATH?): {e}"))?;
+        self.stdout = child.stdout.take();
+        self.child = Some(child);
+        self.stream_next_micros = target_micros;
+        self.current = None;
+        Ok(())
+    }
+
+    /// Read exactly one BGRA frame from the running ffmpeg's stdout.
+    /// `Ok(None)` = clean EOF on a frame boundary (clip ended). ffmpeg
+    /// decodes 1080p far faster than realtime, so reads return promptly
+    /// during playback (ffmpeg is back-pressured by our read rate).
+    fn read_frame(&mut self) -> Result<Option<Vec<u8>>, String> {
+        use std::io::Read;
+        let frame_bytes = (self.width as usize) * (self.height as usize) * 4;
+        if frame_bytes == 0 {
+            return Err("ffmpeg frame size is zero".to_string());
+        }
+        let Some(stdout) = self.stdout.as_mut() else {
+            return Ok(None);
+        };
+        let mut buf = vec![0u8; frame_bytes];
+        let mut filled = 0usize;
+        while filled < frame_bytes {
+            match stdout.read(&mut buf[filled..]) {
+                Ok(0) => {
+                    if filled == 0 {
+                        return Ok(None); // clean EOF on a frame boundary
+                    }
+                    return Err(format!(
+                        "ffmpeg EOF mid-frame ({filled}/{frame_bytes} bytes)"
+                    ));
+                }
+                Ok(n) => filled += n,
+                Err(e) => return Err(format!("ffmpeg stdout read: {e}")),
+            }
+        }
+        Ok(Some(buf))
+    }
+
+    /// Kill the running ffmpeg child (if any) and drop its stdout.
+    fn kill(&mut self) {
+        self.stdout = None;
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
-/// Serve the frame at `target_micros` from the ffmpeg fallback for one
-/// source: cache hit → return it; miss → spawn one bounded ffmpeg that
-/// decodes `PREVIEW_RING_SIZE` consecutive frames from `target_micros`,
-/// cache them, and return the first.
+impl Drop for FfmpegSource {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Serve the frame at `target_micros` from the persistent ffmpeg stream
+/// for one source, wrapped as a `DecodedFrame::Bgra`.
 fn decode_ffmpeg_source(
     src: &mut FfmpegSource,
     path: &Path,
     target_micros: u64,
 ) -> Result<DecodedFrame, String> {
-    if let Some(bgra) = src.cached_frame(target_micros) {
-        return Ok(DecodedFrame::Bgra {
-            width: src.width,
-            height: src.height,
-            bgra,
-        });
-    }
-    let frames =
-        ffmpeg_decode_batch(path, target_micros, PREVIEW_RING_SIZE, src.width, src.height)?;
-    let first = frames
-        .first()
-        .cloned()
-        .ok_or_else(|| "ffmpeg produced no frames".to_string())?;
-    src.cache_start_micros = target_micros;
-    src.frames = frames;
+    let bgra = src.decode(path, target_micros)?;
     Ok(DecodedFrame::Bgra {
         width: src.width,
         height: src.height,
-        bgra: first,
+        bgra,
     })
-}
-
-/// Spawn one bounded `ffmpeg.exe` to decode up to `count` consecutive
-/// frames starting at `start_micros`, as tightly-packed BGRA8 read from
-/// the child's stdout. Self-terminates via `-frames:v` (no persistent
-/// process, no unbounded pipe). Returns the decoded frames (possibly
-/// fewer than `count` near EOF). `-ss` before `-i` does an accurate,
-/// fast input seek in modern ffmpeg.
-fn ffmpeg_decode_batch(
-    path: &Path,
-    start_micros: u64,
-    count: usize,
-    width: u32,
-    height: u32,
-) -> Result<Vec<Vec<u8>>, String> {
-    use std::io::Read;
-    let frame_bytes = (width as usize) * (height as usize) * 4;
-    if frame_bytes == 0 || count == 0 {
-        return Err("ffmpeg_decode_batch: zero frame size / count".to_string());
-    }
-    let start_sec = format!("{:.6}", start_micros as f64 / 1_000_000.0);
-    let mut child = std::process::Command::new("ffmpeg")
-        .args(["-nostdin", "-loglevel", "error", "-ss", &start_sec, "-i"])
-        .arg(path)
-        .args([
-            "-frames:v",
-            &count.to_string(),
-            "-pix_fmt",
-            "bgra",
-            "-f",
-            "rawvideo",
-            "-",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        // Drop ffmpeg's stderr so it can never fill a pipe and block the
-        // child (we rely on -loglevel error + the exit/byte count).
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("ffmpeg spawn failed (is ffmpeg on PATH?): {e}"))?;
-
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "ffmpeg stdout unavailable".to_string())?;
-    let mut buf = vec![0u8; frame_bytes * count];
-    let mut filled = 0usize;
-    while filled < buf.len() {
-        match stdout.read(&mut buf[filled..]) {
-            Ok(0) => break, // EOF (fewer than `count` frames available)
-            Ok(n) => filled += n,
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("ffmpeg stdout read: {e}"));
-            }
-        }
-    }
-    let _ = child.wait();
-
-    let n_frames = filled / frame_bytes;
-    if n_frames == 0 {
-        return Err(format!(
-            "ffmpeg decoded no frames at {start_sec}s (got {filled} bytes)"
-        ));
-    }
-    let mut frames = Vec::with_capacity(n_frames);
-    for i in 0..n_frames {
-        frames.push(buf[i * frame_bytes..(i + 1) * frame_bytes].to_vec());
-    }
-    Ok(frames)
 }
 
 /// Probe a video's frame rate via `ffprobe` (`r_frame_rate`, e.g.
