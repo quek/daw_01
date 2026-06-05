@@ -78,6 +78,81 @@ pub fn group_active_transform(
     Some(t)
 }
 
+/// `parent_group_id` を誰かが指していれば「グループ」（派生判定。`Track::kind`
+/// のような型フィールドは持たない）。`AppData::is_group_track` の song-level 版で、
+/// preview（runner）と export（render_video）が同一述語を共有する SSoT（§5.6）。
+pub fn is_group_track(song: &Song, track_id: u32) -> bool {
+    song.tracks.iter().any(|t| t.parent_group_id == Some(track_id))
+}
+
+/// track が image / video / text クリップを 1 つでも持つか（§5.6 visual 判定の部品）。
+fn track_has_visual_clip(track: &Track, song: &Song) -> bool {
+    use common::model::ClipContent;
+    track.clips.iter().any(|c| {
+        matches!(
+            song.clip_contents.get(&c.content_id),
+            Some(ClipContent::Image(_))
+                | Some(ClipContent::Video(_))
+                | Some(ClipContent::Text(_))
+        )
+    })
+}
+
+/// §5.6 visual グループ判定: group 自身が `group_transform` データを持つ、または
+/// subtree（`parent_group_id` 再帰）に image / video / text クリップを持つ track が
+/// 1 つでもあれば true。`AppData::group_has_visual_content` の song-level 版（SSoT）。
+/// cycle 安全のため track 数で hop を打ち切る BFS。root 自身も検査対象。
+pub fn group_has_visual_content(song: &Song, group_track_id: u32) -> bool {
+    let Some(group) = song.track_by_id(group_track_id) else {
+        return false;
+    };
+    if group.group_transform.is_some() || track_has_visual_clip(group, song) {
+        return true;
+    }
+    let mut seen = vec![group_track_id];
+    let mut frontier = vec![group_track_id];
+    let mut hops = 0;
+    while !frontier.is_empty() {
+        hops += 1;
+        if hops > song.tracks.len() + 1 {
+            break;
+        }
+        let mut next = Vec::new();
+        for &pid in &frontier {
+            for t in &song.tracks {
+                if t.parent_group_id == Some(pid) && !seen.contains(&t.id) {
+                    if track_has_visual_clip(t, song) {
+                        return true;
+                    }
+                    seen.push(t.id);
+                    next.push(t.id);
+                }
+            }
+        }
+        frontier = next;
+    }
+    false
+}
+
+/// §5.6 合成 / 選択オーバーレイの gate（preview / export 共有 SSoT）。visual
+/// グループ（[`is_group_track`] かつ [`group_has_visual_content`]）の effective
+/// transform を解決して返す。[`group_active_transform`] と違い、transform も lane も
+/// 未設定の visual グループも **identity** として含める（= グループ化直後の立ち絵も
+/// 合成され、選択時にバウンディングボックスが出る）。純 audio バスは除外。
+pub fn active_visual_groups(
+    song: &Song,
+    song_beat: f64,
+) -> std::collections::HashMap<u32, GroupTransform> {
+    let mut out = std::collections::HashMap::new();
+    for track in &song.tracks {
+        if is_group_track(song, track.id) && group_has_visual_content(song, track.id) {
+            let gt = group_active_transform(track, song, song_beat).unwrap_or_default();
+            out.insert(track.id, gt);
+        }
+    }
+    out
+}
+
 /// 解決済み group transform を、合成済み 1 枚にかける `TexturedQuad` の
 /// パラメータへ変換する純粋関数。
 ///
@@ -341,5 +416,95 @@ mod tests {
         assert!(group_active_transform(&track, &song, 0.0).is_none());
         track.group_transform = Some(ident());
         assert!(group_active_transform(&track, &song, 0.0).is_some());
+    }
+
+    /// 子トラックを 1 本ぶら下げた group を作る。`visual` なら子に image clip を、
+    /// さもなくば clip 無し（純 audio バス）を付ける。group_transform は未設定。
+    fn song_with_group(visual: bool) -> (Song, u32) {
+        use common::model::{Clip, ClipContent, ImageContent, ImageEvent, ImageSource, ImageSourcePath};
+        let mut song = Song::default();
+        let group_id = song.alloc_track_id();
+        song.tracks.push(Track {
+            id: group_id,
+            name: "G".into(),
+            ..Track::default()
+        });
+        let child_id = song.alloc_track_id();
+        let mut child = Track {
+            id: child_id,
+            name: "child".into(),
+            parent_group_id: Some(group_id),
+            ..Track::default()
+        };
+        if visual {
+            let img_id = song.alloc_image_source_id();
+            song.image_sources.insert(
+                img_id,
+                ImageSource {
+                    path: ImageSourcePath::Absolute("/tmp/x.png".into()),
+                    name: "x.png".into(),
+                    width: 100,
+                    height: 100,
+                    format: "Png".into(),
+                },
+            );
+            let cid = song.alloc_content_id();
+            song.clip_contents.insert(
+                cid,
+                ClipContent::Image(ImageContent {
+                    events: vec![ImageEvent {
+                        source_id: img_id,
+                        event_start_in_clip_beats: 0.0,
+                        event_length_beats: 8.0,
+                        x: 0.1,
+                        y: 0.1,
+                        w: 0.5,
+                        h: 0.5,
+                        opacity: 1.0,
+                        rotation_radians: 0.0,
+                        muted: false,
+                        fade_in_beats: 0.0,
+                        fade_out_beats: 0.0,
+                        fade_in_curve: common::model::FadeCurve::Linear,
+                        fade_out_curve: common::model::FadeCurve::Linear,
+                    }],
+                }),
+            );
+            let cl = child.alloc_clip_id();
+            child.clips.push(Clip {
+                id: cl,
+                name: "img".into(),
+                start_beat: 0.0,
+                length_beats: 8.0,
+                content_id: cid,
+                notes: Vec::new(),
+                color: None,
+                auto_lipsync: false,
+            });
+        }
+        song.tracks.push(child);
+        (song, group_id)
+    }
+
+    #[test]
+    fn visual_group_is_active_without_transform() {
+        // §5.6 回帰: group_transform / lane が未設定でも、image 子を持つ visual
+        // group は active（identity transform）として合成 / overlay gate に乗る。
+        // これが false に戻ると「グループ選択しても水色ハンドルが出ない」 バグ。
+        let (song, group_id) = song_with_group(true);
+        assert!(is_group_track(&song, group_id));
+        assert!(group_has_visual_content(&song, group_id));
+        let active = active_visual_groups(&song, 0.0);
+        let gt = active.get(&group_id).expect("visual group must be active");
+        assert_eq!(*gt, GroupTransform::default(), "未設定なら identity");
+    }
+
+    #[test]
+    fn audio_only_group_is_excluded() {
+        // 視覚 clip を持たない純 audio バスは合成 / overlay の対象外。
+        let (song, group_id) = song_with_group(false);
+        assert!(is_group_track(&song, group_id));
+        assert!(!group_has_visual_content(&song, group_id));
+        assert!(active_visual_groups(&song, 0.0).get(&group_id).is_none());
     }
 }

@@ -1109,16 +1109,26 @@ impl Runner {
                         }
                     }
                     // 立ち絵 group box drag begin（clip drag が始まらなかったとき
-                    // のみ）。base group_transform を持つ選択中 visual group が対象。
+                    // のみ）。選択中の visual group が対象。base group_transform が
+                    // 未設定でも overlay と同じ effective transform（automation 解決後
+                    // or identity）で hit-test する（= 枠が出れば必ず掴める。§5.6 で
+                    // overlay gate を group_has_visual_content に揃えたので drag も一致。
+                    // 最初の drag で SetGroupTransformField が base を identity から
+                    // materialize する）。
                     if state.preview_drag.is_none()
                         && let Some(cursor) = state.preview_cursor
                         && let Some(track_id) = state.app.cursor_track_id()
-                        && let Some(transform) = state
-                            .app
-                            .song
-                            .track_by_id(track_id)
-                            .and_then(|t| t.group_transform)
+                        && state.app.is_group_track(track_id)
                         && state.app.group_has_visual_content(track_id)
+                        && let Some(transform) =
+                            state.app.song.track_by_id(track_id).map(|track| {
+                                crate::group_compose::group_active_transform(
+                                    track,
+                                    &state.app.song,
+                                    state.app.playhead_beat.map(f64::from).unwrap_or(0.0),
+                                )
+                                .unwrap_or_default()
+                            })
                     {
                         let size = preview.renderer.size();
                         let screen = (size.width as f32, size.height as f32);
@@ -1391,19 +1401,11 @@ impl Runner {
         );
         // v19 (docs/plan_tachie_group_transform.md §5.6): visual group の
         // active transform を 1 回解決（group track id → resolved transform）。
-        // `group_active_transform` は group_transform / GroupTransform lane が
-        // 無ければ None（= 子は通常 layer として描画、§5.6 派生判定）。
-        let mut active_groups: std::collections::HashMap<u32, common::model::GroupTransform> =
-            std::collections::HashMap::new();
-        for track in &state.app.song.tracks {
-            if let Some(gt) = crate::group_compose::group_active_transform(
-                track,
-                &state.app.song,
-                playhead_beat,
-            ) {
-                active_groups.insert(track.id, gt);
-            }
-        }
+        // gate は `group_has_visual_content`（§5.6）。transform / lane 未設定の
+        // visual group も identity として含むので、グループ化直後の立ち絵も合成
+        // され、選択時にバウンディングボックスが出る。export と同一述語（SSoT）。
+        let active_groups =
+            crate::group_compose::active_visual_groups(&state.app.song, playhead_beat);
         // group track id → z 順（bottom→top）の子 quad。
         let mut group_children: std::collections::HashMap<
             u32,
@@ -1491,15 +1493,22 @@ impl Runner {
         // preview が子を 1 枚へ合成 → 親 affine をかけて push する。
         let mut group_layers: Vec<crate::group_compose::GroupLayer> = Vec::new();
         for track in &state.app.song.tracks {
-            if let (Some(children), Some(transform)) =
-                (group_children.remove(&track.id), active_groups.get(&track.id))
-            {
-                group_layers.push(crate::group_compose::GroupLayer {
-                    children,
-                    transform: *transform,
-                    selected: state.app.cursor_track_id() == Some(track.id),
-                });
+            let Some(transform) = active_groups.get(&track.id) else {
+                continue;
+            };
+            let children = group_children.remove(&track.id).unwrap_or_default();
+            let selected = state.app.cursor_track_id() == Some(track.id);
+            // 子が（この playhead で）1 枚も active でなく、かつ未選択なら描く
+            // ものが無い。選択中は children が空でも bounding box を出すため layer
+            // を作る（group transform はクリップ非依存の track-level param）。
+            if children.is_empty() && !selected {
+                continue;
             }
+            group_layers.push(crate::group_compose::GroupLayer {
+                children,
+                transform: *transform,
+                selected,
+            });
         }
         preview.set_group_layers(group_layers);
         // docs/plan_text_overlay.md §4 P3: text overlay layers are

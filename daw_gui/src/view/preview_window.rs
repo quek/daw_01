@@ -488,54 +488,59 @@ impl PreviewWindowState {
             // 下に 1 quad として push。合成キャンバスは project resolution。
             let (proj_w, proj_h) = self.project_resolution;
             for group in &self.group_layers {
-                if group.children.is_empty() {
-                    continue;
-                }
-                // 合成キャンバス = supersample 後の解像度（§8.1 案 B）。
-                let (cw, ch) = crate::group_compose::group_composite_canvas(
-                    (proj_w, proj_h),
-                    &group.transform,
-                );
-                let mut sub = Scene::new();
-                for child in &group.children {
-                    sub.push_textured_quad(TexturedQuad {
-                        rect: daw_ui_renderer::Rect::new(
-                            child.dest.0 * cw as f32,
-                            child.dest.1 * ch as f32,
-                            child.dest.2 * cw as f32,
-                            child.dest.3 * ch as f32,
-                        ),
-                        texture: child.texture,
-                        alpha: child.alpha,
-                        uv_min: (0.0, 0.0),
-                        uv_max: (1.0, 1.0),
-                        clip_rect: None,
-                        rotation_radians: child.rotation_radians,
-                        rotation_pivot: None,
-                    });
-                }
-                let handle = match self.renderer.composite_scene_to_texture(&sub, cw, ch) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "composite 立ち絵 group failed");
-                        continue;
-                    }
-                };
+                // quad / overlay とも同一の rect / pivot / rotation を使う。子が
+                // 無くても（選択中グループの bounding box 用に）これは必要。
                 let (rx, ry, rw, rh, rot, px, py, alpha) =
                     crate::group_compose::group_quad_params(&group.transform, project_box);
-                if rw <= 0.0 || rh <= 0.0 || alpha <= 0.0 {
+                if rw <= 0.0 || rh <= 0.0 {
                     continue;
                 }
-                self.scene.push_textured_quad(TexturedQuad {
-                    rect: daw_ui_renderer::Rect::new(rx, ry, rw, rh),
-                    texture: handle,
-                    alpha,
-                    uv_min: (0.0, 0.0),
-                    uv_max: (1.0, 1.0),
-                    clip_rect: None,
-                    rotation_radians: rot,
-                    rotation_pivot: Some((px, py)),
-                });
+                // 子が 1 枚以上 active かつ可視なら 1 枚へ合成 → 親 affine quad を
+                // push（§5 アプローチ X）。子が空 / 合成失敗のときは quad を出さず、
+                // 選択中なら overlay だけ描く（box は transform から計算するため
+                // 合成結果に依存しない）。
+                if !group.children.is_empty() && alpha > 0.0 {
+                    // 合成キャンバス = supersample 後の解像度（§8.1 案 B）。
+                    let (cw, ch) = crate::group_compose::group_composite_canvas(
+                        (proj_w, proj_h),
+                        &group.transform,
+                    );
+                    let mut sub = Scene::new();
+                    for child in &group.children {
+                        sub.push_textured_quad(TexturedQuad {
+                            rect: daw_ui_renderer::Rect::new(
+                                child.dest.0 * cw as f32,
+                                child.dest.1 * ch as f32,
+                                child.dest.2 * cw as f32,
+                                child.dest.3 * ch as f32,
+                            ),
+                            texture: child.texture,
+                            alpha: child.alpha,
+                            uv_min: (0.0, 0.0),
+                            uv_max: (1.0, 1.0),
+                            clip_rect: None,
+                            rotation_radians: child.rotation_radians,
+                            rotation_pivot: None,
+                        });
+                    }
+                    match self.renderer.composite_scene_to_texture(&sub, cw, ch) {
+                        Ok(handle) => {
+                            self.scene.push_textured_quad(TexturedQuad {
+                                rect: daw_ui_renderer::Rect::new(rx, ry, rw, rh),
+                                texture: handle,
+                                alpha,
+                                uv_min: (0.0, 0.0),
+                                uv_max: (1.0, 1.0),
+                                clip_rect: None,
+                                rotation_radians: rot,
+                                rotation_pivot: Some((px, py)),
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "composite 立ち絵 group failed");
+                        }
+                    }
+                }
                 // 選択中 group は bounding box + anchor marker を描く。quad と
                 // 同一の rect / rotation / pivot を使うので位置は完全一致（近似なし）。
                 if group.selected {

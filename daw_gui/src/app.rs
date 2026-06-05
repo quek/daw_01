@@ -440,18 +440,6 @@ fn group_transform_field(
     }
 }
 
-/// track が image / video / text の表示 clip を 1 つでも持つか。
-fn track_has_visual_clip(track: &common::model::Track, song: &common::model::Song) -> bool {
-    track.clips.iter().any(|c| {
-        matches!(
-            song.clip_contents.get(&c.content_id),
-            Some(common::model::ClipContent::Image(_))
-                | Some(common::model::ClipContent::Video(_))
-                | Some(common::model::ClipContent::Text(_))
-        )
-    })
-}
-
 /// gui_01 #028 §7.3: `AutomationTarget` に対する人間可読 display name。
 /// Inspector の knob hint や status_message で使う。`Plugin Param N` は
 /// Phase 2 で IPC 経由で実 plugin の param name に置換する。
@@ -1500,10 +1488,7 @@ impl AppData {
     /// at it via `parent_group_id`. The role is purely derived — there
     /// is no `Track::kind` field. SSOT (CLAUDE.md).
     pub fn is_group_track(&self, track_id: u32) -> bool {
-        self.song
-            .tracks
-            .iter()
-            .any(|t| t.parent_group_id == Some(track_id))
+        crate::group_compose::is_group_track(&self.song, track_id)
     }
 
     /// A track acts as a "return" iff at least one other track has a
@@ -8576,18 +8561,7 @@ impl AppData {
     /// video / text 表示 clip を持つ track が 1 つでもある、または既に
     /// `group_transform` データを持つなら true。inspector / 合成の gate。
     pub fn group_has_visual_content(&self, group_track_id: u32) -> bool {
-        if self
-            .song
-            .track_by_id(group_track_id)
-            .is_some_and(|t| t.group_transform.is_some())
-        {
-            return true;
-        }
-        self.collect_track_subtree_ids(group_track_id).iter().any(|&id| {
-            self.song
-                .track_by_id(id)
-                .is_some_and(|t| track_has_visual_clip(t, &self.song))
-        })
+        crate::group_compose::group_has_visual_content(&self.song, group_track_id)
     }
 
     /// group inspector 用 summary。cursor track が visual group なら、各 param に

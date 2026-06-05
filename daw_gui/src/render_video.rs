@@ -570,17 +570,10 @@ fn build_frame_scene(
     // canvas IS the project resolution, so `x * out_w` is exact).
     let image_layers =
         crate::image_compose::active_image_sources_at(song, playhead_beat);
-    // v19 (docs/plan_tachie_group_transform.md §5): export も preview と同じ
-    // group partition + offscreen 合成（preview/export byte parity 要件）。
-    let mut active_groups: std::collections::HashMap<u32, common::model::GroupTransform> =
-        std::collections::HashMap::new();
-    for track in &song.tracks {
-        if let Some(gt) =
-            crate::group_compose::group_active_transform(track, song, playhead_beat)
-        {
-            active_groups.insert(track.id, gt);
-        }
-    }
+    // v19 (docs/plan_tachie_group_transform.md §5.6): export も preview と同じ
+    // gate（`active_visual_groups`）で group partition + offscreen 合成する
+    // （preview/export byte parity 要件、SSoT）。
+    let active_groups = crate::group_compose::active_visual_groups(song, playhead_beat);
     let mut group_children: std::collections::HashMap<
         u32,
         Vec<crate::group_compose::GroupChildQuad>,
