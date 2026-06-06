@@ -139,15 +139,58 @@ pub fn render_mp4_cancellable(
         None
     };
 
-    let mut encoder = crate::libav_encoder::LibavEncoder::new(
-        cfg.output_path,
-        out_w,
-        out_h,
-        framerate,
-        cfg.video_bitrate,
-        audio_spec,
-    )
-    .map_err(|e| format!("libav encoder init: {e}"))?;
+    // Encode on a dedicated worker thread so the GPU composite + readback of
+    // frame N+1 overlaps the NVENC encode + mux of frame N (Phase 2, daw_01
+    // side; the readback async-overlap itself awaits the gui_01 API). The libav
+    // encoder is not `Send`, so it is created and owned entirely on the worker —
+    // the main thread only ships RGBA buffers over a bounded channel (which also
+    // back-pressures if the encoder ever falls behind).
+    enum EncCmd {
+        Video(Vec<u8>),
+        FinishWithAudio(Option<PathBuf>),
+    }
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<EncCmd>(3);
+    let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+    let enc_output = cfg.output_path.to_path_buf();
+    let video_bitrate = cfg.video_bitrate;
+    let enc_handle = std::thread::spawn(move || -> Result<(), String> {
+        let mut encoder = match crate::libav_encoder::LibavEncoder::new(
+            &enc_output,
+            out_w,
+            out_h,
+            framerate,
+            video_bitrate,
+            audio_spec,
+        ) {
+            Ok(e) => {
+                let _ = init_tx.send(Ok(()));
+                e
+            }
+            Err(e) => {
+                let _ = init_tx.send(Err(e.clone()));
+                return Err(e);
+            }
+        };
+        while let Ok(cmd) = cmd_rx.recv() {
+            match cmd {
+                EncCmd::Video(rgba) => encoder.push_video_rgba(&rgba)?,
+                EncCmd::FinishWithAudio(wav) => {
+                    if let Some(w) = wav {
+                        push_wav_audio(&mut encoder, &w)?;
+                    }
+                    return encoder.finish();
+                }
+            }
+        }
+        // Channel closed before a Finish command = user cancel: drop the
+        // encoder without writing the trailer.
+        Ok(())
+    });
+    // Surface a constructor failure (e.g. no usable encoder) before the loop.
+    init_rx
+        .recv()
+        .map_err(|_| "encoder thread died during init".to_string())?
+        .map_err(|e| format!("libav encoder init: {e}"))?;
 
     // OffscreenRenderer: own its wgpu device + pipelines independent
     // from the main daw_gui window. Canvas is exactly project
@@ -239,11 +282,12 @@ pub fn render_mp4_cancellable(
         let rgba = offscreen
             .render_to_rgba(&scene)
             .map_err(|e| format!("offscreen render frame {frame_index}: {e:?}"))?;
-        // NVENC takes the RGBA8 readback directly (converts to YUV on-GPU);
-        // no CPU NV12 pass. The encoder assigns pts = frame index internally.
-        encoder
-            .push_video_rgba(&rgba)
-            .map_err(|e| format!("encode frame {frame_index}: {e}"))?;
+        // Hand the readback to the encode worker (which overlaps the NVENC
+        // encode + mux with the next frame's composite). A send error means the
+        // worker died mid-stream; its real error is surfaced by `join` below.
+        if cmd_tx.send(EncCmd::Video(rgba)).is_err() {
+            break;
+        }
     }
 
     // Release every cached GPU texture before `offscreen` drops (cancel /
@@ -258,20 +302,23 @@ pub fn render_mp4_cancellable(
 
     if cancelled {
         // partial mp4 は finalize せず破棄する（trailer 未書き込み = 壊れた
-        // 中途ファイルを残さない）。drop で AVIO を閉じてから削除する。
-        drop(encoder);
+        // 中途ファイルを残さない）。worker は channel close で encoder を drop
+        // （trailer なし）→ join 後に削除。
+        drop(cmd_tx);
+        let _ = enc_handle.join();
         let _ = std::fs::remove_file(cfg.output_path);
         return Err("export cancelled".to_string());
     }
 
-    // Stream the export WAV into the AAC encoder, then flush both encoders +
-    // write the mp4 trailer.
-    if let Some(wav_path) = cfg.audio_wav_path {
-        push_wav_audio(&mut encoder, wav_path)?;
-    }
-    encoder
-        .finish()
-        .map_err(|e| format!("finalize export: {e}"))?;
+    // Normal end: tell the worker to stream the WAV audio into the AAC encoder
+    // and write the mp4 trailer, then join and propagate any encode error.
+    let audio_wav = cfg.audio_wav_path.map(Path::to_path_buf);
+    let _ = cmd_tx.send(EncCmd::FinishWithAudio(audio_wav));
+    drop(cmd_tx);
+    enc_handle
+        .join()
+        .map_err(|_| "encoder thread panicked".to_string())?
+        .map_err(|e| format!("export encode: {e}"))?;
 
     on_progress(total_frames, total_frames);
     Ok(RenderStats {
