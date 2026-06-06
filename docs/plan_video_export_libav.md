@@ -2,6 +2,20 @@
 
 最終更新: 2026-06-06。根拠リサーチ: `~/.claude/.../wf_f3b6750f-6b4`（5 agent、引用付き）。
 
+## 実装状況（2026-06-06）
+
+| 項目 | 状態 | commit |
+|---|---|---|
+| Phase 1: export encode を NVENC 化 | ✅ 完了 | `6e3ae59` |
+| Phase 3 (export decode): 10-bit を in-process libav に | ✅ 完了（10-bit 欠落バグ修正） | `422ab8c` |
+| Phase 3 (preview decode): preview も libav 化、**ffmpeg.exe 完全廃止** | ✅ 完了 | `fb56e89` |
+| NVENC フォールバック (libopenh264 / h264_mf + swscale) | ✅ 完了 | `aecc7e6` |
+| Phase 2: readback パイプライン化 | ⏳ gui_01 待ち（`submit_readback`/`finish_readback` 要望提出 `997f6ff`）。daw_01 ループ組み替えは API landing 後に一度で。 |
+| 補足: Phase 3 は当初 Phase 2 より後の予定だったが、10-bit 欠落バグ対応で前倒し。decode/encode とも libav に統一済（production の ffmpeg.exe/MF sink writer は撤去、preview の 8-bit MF HW zero-copy のみ存置）。 |
+
+実測: 27.4s/1080p（10-bit + 立ち絵 + 音声）が **video のみ 18.7s / 音声込み 21.0s**（debug, 1.3-1.5×RT）。
+正しく合成（夜明け動画 + 立ち絵, 色 OK）・A/V 同期確認済。
+
 ## 0. 背景 / 実測診断（実データから始める）
 
 ユーザー報告: `20260512.daw` の Video export が「とても時間がかかる」「タスクマネージャの

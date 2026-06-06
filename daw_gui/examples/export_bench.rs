@@ -35,7 +35,31 @@ fn main() {
     });
 
     let out = std::env::temp_dir().join("daw01_export_bench.mp4");
-    let cfg = RenderConfig::new(&song, &out).with_project_dir(daw.parent());
+    // Synthetic PCM Float32 WAV (same format the audio engine produces) so the
+    // bench exercises the full video + audio mux path, not just video.
+    let secs = song.length_beats / song.bpm as f64 * 60.0;
+    let sr = 48_000u32;
+    let wav_path = std::env::temp_dir().join("daw01_export_bench_audio.wav");
+    {
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: sr,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(&wav_path, spec).expect("create wav");
+        let total = (sr as f64 * secs) as usize;
+        for n in 0..total {
+            let s = (2.0 * std::f32::consts::PI * 440.0 * n as f32 / sr as f32).sin() * 0.2;
+            w.write_sample(s).unwrap();
+            w.write_sample(s).unwrap();
+        }
+        w.finalize().expect("finalize wav");
+    }
+
+    let cfg = RenderConfig::new(&song, &out)
+        .with_project_dir(daw.parent())
+        .with_audio_wav(Some(&wav_path));
 
     println!(
         "exporting {}x{} @ {}fps, length {} beats @ {} bpm -> {}",
