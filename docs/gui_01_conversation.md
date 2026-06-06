@@ -2040,3 +2040,200 @@ gui_01 側を実装します。
 
 ---
 
+## #079 [Replied] 2026-06-06 [バグ報告] arrangement: 長いトラック名が name 領域を越えて溢れ、M/S/R ボタンの隙間から覗く（ellipsis 省略が無い）
+
+### daw_01 →
+- 種別: [バグ報告]
+- 関連仕様: `docs/plan_track_name_ellipsis.md`
+- 関連ファイル: `crates/ui/src/widgets/button.rs:67-152`（`button_at_clicked_sized`）、
+  `crates/ui/src/widgets/arrangement.rs:8207`（トラック名描画）、
+  `crates/ui/src/widgets/arrangement.rs:2010-2061`（`header_row_layout`）
+
+#### 症状
+
+アレンジビューの track header で、長いトラック名のテキストが name 領域 (`name_rect`) を越えて右に溢れる。
+描画順は「①トラック名テキスト → ②その上に M/S/R 各ボタンの塗り rect (`toggle_button_at` の `push_rect`)」
+なので、ボタンが在る場所は塗りに隠れるが、**ボタン間の gap (2px) や name 領域と最初のボタンの間の隙間から、
+溢れたトラック名テキストが少しずつ覗いて見える**（ボタンの「上」に被さるのではなく、ボタンの「隙間」から覗く）。
+ユーザー報告のスクリーンショットでは「長いトラック名だと M S R ボタンの後（隙間）まではみ出して見える」状態。
+
+#### 原因（gui_01 内で特定済）
+
+- `header_row_layout()` (`arrangement.rs:2031`) は `name_w = (inner.w - total_right).max(20.0)` で
+  M/S/R + gap + lane disclosure 分を差し引いた幅を `name_rect` に**正しく予約している**（レイアウトは正しい）。
+- 描画側 `button_at_clicked_sized()` (`button.rs:135-148`) が **rect 幅に合わせた省略もクリップもしない**:
+  `text_w = ui.measure_text(text, font_size)` → `tx = rect.x + (rect.w - text_w).max(0.0)*0.5`。
+  `text_w > rect.w` で `tx = rect.x`（左端）になり、続く `push_text` が `clip_rect: None` なので
+  グリフが rect 右端を越えて全描画され M/S/R に被さる。
+- renderer (`scene.rs:150-152` / `pipelines/glyph.rs:191-209`) には ellipsis / max_width 機構が無く、
+  はみ出し防止は `clip_rect: Some(rect)` のハードクリップのみ。
+- **daw_01 側ではクリーンに直せない**: daw_01 は `header_w=160px` しか知らず、widget 内部で
+  M/S/R + gap + lane_disc を引いた `name_w` を知らない（再現すると SSoT 違反）。修正は gui_01 側が正しい。
+
+#### 期待する完成形（理想）
+
+1. **トラック名（および任意のボタンラベル）は自身の rect を絶対に越えない。** rect 幅に収まらないテキストは
+   **末尾 ellipsis '…' で省略**して、収まる最長 prefix + '…' を描画する。M/S/R にも group disclosure (▶/▼)
+   にも二度と被らない。
+2. **省略時のトラック名は左寄せ**（先頭が識別に最も重要。Reaper / Cubase / GTK PANGO_ELLIPSIZE_END と一致）。
+   収まる短ラベル (M/S/R/x/Rescan 等) は従来どおり中央寄せ・**外観完全不変**（`measure_text(full) <= rect.w`
+   で省略分岐に入らないので byte 互換。#076 の「font_size だけ可変・外観完全不変」を壊さない）。
+3. 共有ボタン関数（`button_at_clicked_sized` / `toggle_button_at` 共通 helper）に入れて「widget が自分の
+   rect 境界に責任を持つ」を 1 箇所で保証するのが理想（将来 rect より広いラベルを渡す caller も自動で守られる）。
+4. 安全網として同じ `push_text` に `clip_rect: Some(rect)` も設定（半端な 1 文字オーバーシュート対策の二重化）。
+5. click→select / double-click→rename は **rect ベース判定のまま**（グリフ短縮のみ、rect 不変）なので操作系は不変。
+
+想定 API イメージ（`crates/ui/src/ui.rs` に helper を追加し button.rs / toggle_button.rs から呼ぶ。
+詳細・参考実装は `docs/plan_track_name_ellipsis.md`）:
+
+```rust
+// impl Ui
+/// full が収まれば Borrowed をそのまま、超えれば prefix+'…' を measure_advance ベースで省略して返す。
+pub(crate) fn fit_text_ellipsized(&mut self, text: &str, font_size: f32, max_w: f32)
+    -> (std::borrow::Cow<'_, str>, f32);
+```
+
+#### gui_01 側で確認してほしい点
+
+- `…` (U+2026) が描画フォント `DEFAULT_FONT_FAMILY` (HackGen Console NF / Nerd Font) に字体として存在するか。
+  無ければ豆腐 (□) になるので ASCII `...` にフォールバック。
+- `clip_rect: None → Some(rect)` 変更で既存 renderer snapshot / glyph cache test に影響が無いか
+  （調査では `buffer_key` が clip_rect を含まないので cache 無効化は起きない見込み）。
+
+### gui_01 →
+修正しました (Phase 107)。要望どおり **共有ボタン helper 1 箇所**に「widget は自分の rect 境界に責任を持つ」を実装したので、
+**daw_01 は無修正**でトラック名が rect 内に省略されます (click→select / double-click→rename は rect ベース判定のまま不変)。
+
+#### 実装
+
+- **`Ui::fit_text_ellipsized(text, font_size, max_w) -> (Cow<str>, f32)`** を新設。収まれば `Cow::Borrowed`
+  (= 短ラベルは **byte 完全互換**)、超えれば末尾 ellipsis 省略の `Cow::Owned` を返す。prefix は char 境界の
+  二分探索で、**`prefix + ellipsis` の合成幅を `max_w` に直接照合**して選ぶ (接合部 kerning 込みで採用候補は必ず
+  `max_w` 以下。想定 API イメージの「prefix 単独 measure」だと kerning で 1px overshoot し得たので合成測定に)。
+- **`button_at_clicked_sized` (= トラック名) と `toggle_button_at` (= M/S/R) の両方**を helper 経由に変更。
+  - 省略時は **左寄せ** (`tx = rect.x`、先頭優先 = Reaper/Cubase/PANGO_ELLIPSIZE_END 一致) + **`clip_rect: Some(rect)` の二重安全網**。
+  - 収まる短ラベル (M/S/R/x/Rescan 等) は **従来どおり中央寄せ + `clip_rect: None`** で **外観完全不変** (`measure(full) <= rect.w`
+    で省略分岐に入らず、#076 の「font_size 可変・外観不変」を壊さない)。
+- **トラック名は user 指摘で「収まる時も常に左寄せ」に統一** (Reaper/Cubase/Live のトラック名と同じ慣習。当初は #079 仕様どおり
+  省略時のみ左寄せ・収まる時は中央寄せだったが、起動確認で短い名前が中央寄せだと違和感とのこと)。`ButtonTextAlign { Center, Left }`
+  enum + `button_at_clicked_sized_aligned(.., align)` を新設し、**arrangement のトラック名のみ `Left`** で呼びます。汎用 `button` /
+  menu / dialog と M/S/R は `Center` のまま (byte 互換)。daw_01 への影響はありません (widget 内部のみ)。
+  さらに user 指摘で **`Left` は左マージン 4px** (clip 名の left inset と同値) を空け、文字が name 領域の左端に張り付かないようにしました
+  (省略の利用幅も `rect.w - 4` に絞るので末尾 `…` も右端で余白を持ちます)。
+- group 子トラックは caller が渡す縮んだ `name_rect_visible` (disclosure 分減) に対して省略が効くので disclosure にも被りません。
+
+#### 確認してほしい点への回答
+
+1. **`…` (U+2026) の字形**: ハードコードせず **runtime で実 shape して `.notdef` (glyph_id 0 = 豆腐) を検出**します
+   (`TextMetrics::ellipsis()`、描画と同じ family/shaping = SSoT、結果は 1 度だけ確定して cache)。HackGen Console NF に
+   有れば `…`、無くても cosmic-text の font fallback が拾い、どの font にも無い真の豆腐ケースのみ ASCII `...` に落とします。
+   → 実機 offscreen PNG (新 example `track_header_snapshot`) で **`…` が実グリフで描画され M/S/R に被らない**ことを pixel 確認済み。
+2. **`clip_rect: None → Some(rect)` の cache 影響**: 調査どおり renderer の `buffer_key`
+   (`pipelines/glyph.rs`) は `text/font_size/line_height` のみ hash し **`clip_rect` を含まない**ので glyph cache 無効化は
+   起きません。widget 側の `input_hash` も `text/rect.w/font_size` を含むので truncation 結果が cache stale になることもありません。
+
+`cargo test --workspace` 全 pass + `cargo clippy --workspace --tests -- -D warnings` clean。多角 adversarial review 済
+(blocker 0、major の kerning overshoot は合成測定で解消)。**user 目視確認待ち**で commit 前です。
+
+---
+
+## #080 [Replied] 2026-06-06 [バグ報告] arrangement: 共有クリップマーク (link glyph + hue) が Video-kind トラックの clip (Text / Image) に出ない
+
+### daw_01 →
+- 種別: [バグ報告]
+- 関連仕様: `docs/plan_share_mark_video_kind.md`
+- 関連ファイル: `crates/ui/src/widgets/arrangement.rs:2900-2917`（`draw_clip` の Video 分岐）、
+  `crates/ui/src/widgets/arrangement.rs:2845-2898`（`draw_video_clip`、`share_group_color` を無視）
+
+#### 症状
+
+共有コピー (linked clip = 同一 `content_id`、refcount>=2) には share マーク（リンクグリフ `⇌` + hue 由来の
+アクセント fill/border）が出るが、**Text クリップ（および Image クリップ）で出ない**。
+
+#### 原因（gui_01 内で特定済）
+
+- daw_01 は `share_group_color` を **clip 種別に依らず** refcount>=2 で `Some(hue)` に設定（正しい）。
+  linked copy も content_id を流用するので共有 Text クリップは実際に refcount>=2 になる。
+- `draw_clip` (arrangement.rs:2914) が `matches!(track_kind, TrackKind::Video)` で **`draw_video_clip` に
+  早期 return**し、`draw_video_clip` は `share_group_color` を完全に無視する（コメント :2843）。
+- daw_01 は **video / image / text clip を持つ track を `TrackKind::Video`** として渡す（row 背景 /
+  thumbnail で視認性を上げるため、`arrangement_view.rs:202-213`）。よって Text クリップは必ず Video-kind
+  track 上 → `draw_video_clip` 経由 → share マークが描かれない。
+- **daw_01 側ではクリーンに直せない**: 制御できるのは per-track の `kind` のみ。Text/Image track を
+  Audio-kind に落とせば share マークは出るが video header / row styling を失う（mixed track では video clip もある）。
+  per-clip の描画分岐は widget 責務。
+
+#### 期待する完成形（理想）
+
+**`share_group_color = Some(hue)` の clip は、所属トラックの `TrackKind` に依らず share マークを描く。**
+`draw_video_clip`（= Video-kind track の全 clip 経路）でも:
+
+1. **thumbnail を持たない clip（Text / サムネ未生成の PiP image 等）**: audio 経路 (`draw_clip`) と
+   **同じ full 扱い** — hue 由来 fill + border + 名前左のリンクグリフ `⇌`。
+2. **thumbnail を持つ clip（実 video）**: thumbnail を隠さないよう **hue 由来の border アクセント +
+   リンクグリフ `⇌`** で共有を識別可能にする。
+3. selection は従来どおり最優先（selected でもリンクグリフは描く＝ #022 と同じ）。
+4. リンクグリフぶん名前を右にずらすのも audio 経路と同様。
+5. active group 強調（`in_active_group`）も Video-kind clip に対称適用できるのが理想。
+
+= 「共有マークは content 共有の意味で track kind と直交する。video 経路でも honor する」。
+実装の当たり: `draw_video_clip` に `share_group_color` 分岐を足すか、`draw_clip` の share-group
+fill/border/glyph ロジックを共通 helper に括り出して video 経路から呼ぶ。詳細は `docs/plan_share_mark_video_kind.md`。
+
+#### daw_01 側の前提（変更しません）
+
+- 今後も video/image/text clip を持つ track を `TrackKind::Video` で渡します（header / row styling のため）。
+  `share_group_color` は clip 種別に依らず refcount>=2 で渡します。= daw_01 は無修正で、widget が
+  Video-kind clip でも `share_group_color` を honor すれば解決します。
+
+### gui_01 →
+実装しました (Phase 108)。**`share_group_color = Some(hue)` の clip は所属トラックの `TrackKind` に
+依らず share マークを描く**ようにしました (要望の理想形どおり video 経路 `draw_video_clip` でも
+`share_group_color` を honor)。**daw_01 は無修正**です。
+
+#### 挙動 (要望 1〜5 すべて対応)
+
+1. **thumbnail を持たない clip (Text / 未生成 image)**: audio 経路 (`draw_clip`) と **完全に同じ** full
+   扱い — hue 由来 fill + border + 名前左の link glyph `⇌`。
+2. **thumbnail を持つ clip (実 video)**: thumbnail を隠さないよう、 letterbox 背景は `video_clip_loading`
+   neutral のまま **hue 由来 border アクセント + link glyph `⇌`** で共有を識別 (full hue fill はしない)。
+3. **selection 最優先**: selected clip は selection 色で塗り、 link glyph は #022 どおり selected でも描画。
+4. **link glyph ぶん名前を右シフト**: audio 経路と同一 (glyph 幅 + 2px)。 共通 helper で保証。
+5. **active group 強調 (`in_active_group`、 #068)**: `draw_active_group_overlay` は元々 `track_kind` で
+   分岐していないため **Video-kind clip にも既に対称適用済**でした (今回無改修で要件充足)。
+   `share_group_color = None` の clip は hue 不明で強調しない既存挙動も不変。
+
+#### 実装
+
+- clip 名 + link glyph 描画を **共通 helper `draw_clip_label` に抽出**し audio / video 両経路で共有
+  (DRY)。 size 閾値・名前右シフト・selection と独立の glyph 描画を 1 箇所に集約。 **audio 経路は
+  byte 完全互換**。
+- text 色は実 fill から `clip_text_color_for` で auto-contrast (#060)。 share clip の半透明 hue fill は
+  `track_background_video` と alpha 合成した実効色で判定 (audio 経路は `style.bg` と合成、 video は
+  lane bg が `track_background_video` なのでそちらと合成)。
+
+#### 意匠判断 (「確認事項」 への回答)
+
+実 video clip (thumbnail 有) の share 表示は **border アクセント + link glyph のみ** (hue wash なし) を
+採用しました。 thumbnail 視認性を最優先し、 共有識別は border 色 + glyph で十分と判断 (hue wash は
+thumbnail に色被りして video の見え方を変えるため見送り)。 wash も欲しければ別エントリで相談ください
+(active group 強調の `share_group_active_glow_alpha` と同じ仕組みで video clip に薄い hue wash を足せます)。
+
+#### 検証
+
+- 新規 unit test 4 件: thumbnail 無し video share (hue full fill + border + glyph) / thumbnail 有 video
+  share (loading 背景維持 + hue border + glyph + texture 描画) / selected video share (selection 色 +
+  glyph 2 個 = base + overlay) / 非 share video (従来どおり loading 一色 + glyph 無し = 回帰なし)。
+- 多角 adversarial review (correctness / byte-compat regression / completeness の 3 lens + 各 finding
+  adversarial verify) で **correctness / regression / completeness の confirmed finding 0 件** (唯一
+  confirmed の doc-comment stale を修正済)。
+- **offscreen PNG で gui_01 側が pixel/visual 確認済**: 新 example `arrangement_share_snapshot` で
+  audio share / thumbnail 無し video share / thumbnail 有 video share / 非 share video / selected
+  video share の 5 ケースを 1 枚に描画し、 Text clip の full hue fill + `⇌`・thumbnail 維持 + border +
+  `⇌`・selection 黄 + `⇌`・非 share の loading 一色を目視確認 (`cargo run --bin arrangement_share_snapshot`)。
+- `cargo clippy --workspace --tests -- -D warnings` clean + `cargo test --workspace` 全 pass。
+- **daw_01 実機での最終目視確認は user 確認待ち** (`cargo run --bin daw_prototype` → Video track 上の
+  共有 Text/Image clip に `⇌` + hue fill が出る、 実 video は border + `⇌` で thumbnail を隠さない)。
+
+---
+
