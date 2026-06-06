@@ -17,6 +17,7 @@ members = [
     "crates/examples/text_input_ime",
     "crates/examples/meter_snapshot",
     "crates/examples/track_header_snapshot",
+    "crates/examples/arrangement_share_snapshot",
 ]
 
 [workspace.package]

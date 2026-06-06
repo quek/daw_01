@@ -734,6 +734,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "daw-ui-example-arrangement-share-snapshot"
+version = "0.1.0"
+dependencies = [
+ "daw-ui-core",
+ "daw-ui-platform",
+ "daw-ui-renderer",
+ "png 0.17.16",
+]
+
+[[package]]
 name = "daw-ui-example-automation"
 version = "0.1.0"
 dependencies = [

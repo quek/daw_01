@@ -2832,16 +2832,68 @@ fn aspect_fit_rect(rect: Rect, tex_width: u32, tex_height: u32) -> Rect {
     Rect::new(fit_x, fit_y, fit_w, fit_h)
 }
 
+/// M14 Phase 108 (daw_01 #080): clip 名 + (share clip なら) 名前左の link glyph を描く共通 helper。
+/// audio 経路 (`draw_clip`) と video 経路 (`draw_video_clip`) で共有 (share マークの link glyph
+/// 描画ロジックを 1 箇所に集約)。 `text_color` は呼び出し側が実 fill から `clip_text_color_for` で
+/// 導出済を渡す (SSoT = widget が唯一 fill を知る)。 `has_link == true` のとき name を glyph 幅 +
+/// 2px 右にずらし、 name の左に `share_group_link_glyph` を 1 文字描く (#022: selection と独立 =
+/// selected でも shared なら描画)。 文字を描けない小ささ (`r.w <= 24` or `r.h <= clip_text_size + 2`)
+/// では何も描かない (audio / video 経路で同一だった閾値をここに集約)。
+fn draw_clip_label<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    r: Rect,
+    name: &Arc<str>,
+    has_link: bool,
+    text_color: Color,
+    style: &ArrangementStyle,
+) {
+    if !(r.w > 24.0 && r.h > style.clip_text_size + 2.0) {
+        return;
+    }
+    let text_left = if has_link {
+        r.x + 4.0 + style.clip_text_size + 2.0
+    } else {
+        r.x + 4.0
+    };
+    if has_link {
+        hctx.push_text(GlyphArea {
+            text: Arc::from(style.share_group_link_glyph.to_string()),
+            left: r.x + 4.0,
+            top: r.y + 2.0,
+            font_size: style.clip_text_size,
+            line_height: style.clip_text_size * 1.2,
+            color: text_color,
+            clip_rect: Some(r),
+            ..GlyphArea::default()
+        });
+    }
+    hctx.push_text(GlyphArea {
+        text: name.clone(),
+        left: text_left,
+        top: r.y + 2.0,
+        font_size: style.clip_text_size,
+        line_height: style.clip_text_size * 1.2,
+        color: text_color,
+        clip_rect: Some(r),
+        ..GlyphArea::default()
+    });
+}
+
 /// M14 Phase 72 (daw_01 #044): video track の clip 描画 (audio path とは別 helper)。
 ///
 /// 描画順:
-/// 1. base fill: selected なら `clip_selected_fill`、 そうでなければ `video_clip_loading`
+/// 1. base fill: selected なら `clip_selected_fill`、 share clip (`share_group_color = Some`) かつ
+///    thumbnail 無しなら hue 由来 fill、 そうでなければ `video_clip_loading`
 ///    (= letterbox の黒帯背景としても兼用、 selection 中は audio と同色で hint)
 /// 2. thumbnail = Some なら aspect-fit (黒帯 letterbox) で texture overlay (`HeavyCtx::push_textured_quad`)
-/// 3. name 描画 (audio 経路と同 idiom)
+/// 3. name + (share clip なら) link glyph 描画 (`draw_clip_label`、 audio 経路と共通)
 ///
-/// share_group_color / audio_edit overlay は video clip では描画しない (= caller 責任で audio 用
-/// field を video clip に詰めない前提、 widget は素直に skip)。
+/// M14 Phase 108 (daw_01 #080): share マークは「content 共有」 の意味で track kind と直交するため、
+/// video clip でも `share_group_color` を honor する (Text / Image clip も Video-kind track 上で
+/// 共有マークが出る)。 thumbnail 有 (実 video) は thumbnail を隠さないよう hue を border アクセント +
+/// link glyph でのみ識別させ、 thumbnail 無 (Text / 未生成 image) は audio share clip と同じ full hue
+/// fill にする。 `audio_edit` overlay は引き続き video clip では描画しない (= caller 責任で audio 用
+/// field を video clip に詰めない前提)。
 fn draw_video_clip<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     r: Rect,
@@ -2850,17 +2902,41 @@ fn draw_video_clip<M: ?Sized + 'static>(
     lanes: Rect,
     selected: bool,
 ) {
+    let has_link = clip.share_group_color.is_some();
     let (fill, border, border_w) = if selected {
         (
             style.clip_selected_fill,
             style.clip_selected_border,
             style.clip_selected_border_w,
         )
+    } else if let Some(hue) = clip.share_group_color {
+        // M14 Phase 108 (daw_01 #080): video-kind track 上の share clip も hue マークを描く。
+        let border_c = hsl_to_rgb(
+            hue,
+            style.share_group_saturation,
+            style.share_group_border_lightness,
+            1.0,
+        );
+        if clip.thumbnail.is_some() {
+            // 実 video (thumbnail 有): thumbnail を隠さないよう letterbox 背景は neutral のまま、
+            // hue は border アクセント + link glyph でのみ識別させる。
+            (style.video_clip_loading, border_c, style.clip_border_w)
+        } else {
+            // thumbnail 無し (Text / 未生成 image): audio share clip と全く同じ full hue fill + border。
+            let fill_c = hsl_to_rgb(
+                hue,
+                style.share_group_saturation,
+                style.share_group_fill_lightness,
+                style.share_group_alpha,
+            );
+            (fill_c, border_c, style.clip_border_w)
+        }
     } else {
         (style.video_clip_loading, style.clip_border, style.clip_border_w)
     };
     // M14 Phase 89 (daw_01 #060): 名前色は fill 輝度から auto-contrast (selected の黄 fill → 暗文字、
-    // loading の暗 fill → 明文字)。 video lane bg と合成した実効色で判定 (fill は不透明なので no-op)。
+    // loading の暗 fill → 明文字)。 video lane bg と合成した実効色で判定 (不透明 fill は no-op、
+    // share clip の半透明 hue fill は track_background_video と合成して実効色を得る)。
     let text_color = clip_text_color_for(style, fill, style.track_background_video);
     hctx.push_rect(RectCommand {
         rect: r,
@@ -2883,18 +2959,8 @@ fn draw_video_clip<M: ?Sized + 'static>(
             rotation_pivot: None,
         });
     }
-    if r.w > 24.0 && r.h > style.clip_text_size + 2.0 {
-        hctx.push_text(GlyphArea {
-            text: clip.name.clone(),
-            left: r.x + 4.0,
-            top: r.y + 2.0,
-            font_size: style.clip_text_size,
-            line_height: style.clip_text_size * 1.2,
-            color: text_color,
-            clip_rect: Some(r),
-            ..GlyphArea::default()
-        });
-    }
+    // name + (share clip なら) link glyph。 thumbnail の **後** に描くので texture の上に乗る。
+    draw_clip_label(hctx, r, &clip.name, has_link, text_color, style);
 }
 
 fn draw_clip<M: ?Sized + 'static>(
@@ -2910,7 +2976,8 @@ fn draw_clip<M: ?Sized + 'static>(
         return;
     }
     // M14 Phase 72 (daw_01 #044): video track の clip は thumbnail + loading 色の専用 path。
-    // share_group_color / audio_edit は無視 (video clip では意味を持たない、 caller 責任)。
+    // M14 Phase 108 (daw_01 #080): share_group_color は video clip でも honor する (Text / Image clip
+    // の共有マーク)。 audio_edit のみ無視 (video clip では意味を持たない、 caller 責任)。
     if matches!(track_kind, TrackKind::Video) {
         draw_video_clip(hctx, r, clip, style, lanes, selected);
         return;
@@ -2957,40 +3024,11 @@ fn draw_clip<M: ?Sized + 'static>(
         radius: [style.clip_radius; 4],
         clip_rect: Some(lanes),
     });
-    if r.w > 24.0 && r.h > style.clip_text_size + 2.0 {
-        // share clip は name の左に link glyph (`⇌` 等) を 1 文字描画。 glyph 幅は font 依存だが、
-        // 等幅 (HackGen Console NF) では `clip_text_size` ~= 1 文字幅。 name は glyph + 2px gap
-        // だけ右にずらす。 通常 clip (None) は従来通り `r.x + 4.0` で描画。 link glyph は
-        // selection と独立 (= selected でも shared なら描画) — #022 で確定。
-        let has_link = clip.share_group_color.is_some();
-        let text_left = if has_link {
-            r.x + 4.0 + style.clip_text_size + 2.0
-        } else {
-            r.x + 4.0
-        };
-        if has_link {
-            hctx.push_text(GlyphArea {
-                text: Arc::from(style.share_group_link_glyph.to_string()),
-                left: r.x + 4.0,
-                top: r.y + 2.0,
-                font_size: style.clip_text_size,
-                line_height: style.clip_text_size * 1.2,
-                color: text_color,
-                clip_rect: Some(r),
-                ..GlyphArea::default()
-            });
-        }
-        hctx.push_text(GlyphArea {
-            text: clip.name.clone(),
-            left: text_left,
-            top: r.y + 2.0,
-            font_size: style.clip_text_size,
-            line_height: style.clip_text_size * 1.2,
-            color: text_color,
-            clip_rect: Some(r),
-            ..GlyphArea::default()
-        });
-    }
+    // share clip は name の左に link glyph (`⇌` 等) を 1 文字描画 (selection と独立 = selected でも
+    // shared なら描画、 #022)。 等幅 (HackGen Console NF) では `clip_text_size` ~= 1 文字幅。 描画
+    // ロジックは video 経路と共通の `draw_clip_label` に集約 (M14 Phase 108、 daw_01 #080)。
+    let has_link = clip.share_group_color.is_some();
+    draw_clip_label(hctx, r, &clip.name, has_link, text_color, style);
 }
 
 fn draw_clips<M: ?Sized + 'static>(
@@ -10014,6 +10052,165 @@ mod tests {
         assert!(
             sel_idx > active_idx,
             "selection は active overlay の後 (= 上) に描画される: sel={sel_idx} active={active_idx}"
+        );
+    }
+
+    // ============================================================
+    // M14 Phase 108 (daw_01 #080): share マークを Video-kind track の clip にも描く
+    // ============================================================
+
+    /// Video-kind track 1 本に `clips` を載せて 1 frame 描画し scene を返す helper
+    /// (`selected` で selection overlay も重ねる)。 `render_clips_scene` の Video 版。
+    fn render_video_clips_scene(
+        clips: Vec<ArrangementClip>,
+        selected: &[ClipKey],
+    ) -> daw_ui_renderer::Scene {
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::FrameInput;
+        use crate::ui::UiHost;
+
+        let mut t = track(0, "v0", clips);
+        t.kind = TrackKind::Video;
+        let tracks = vec![t];
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 400 };
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            let style = ArrangementStyle::default();
+            let _ = ui.arrangement(
+                "arr_video_share",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &tracks,
+                test_view(),
+                selected,
+                &[],
+                &[],
+                &[],
+                &style,
+                None,
+                |_| Edit::mutate(|()| {}),
+            );
+        });
+        scene
+    }
+
+    /// scene 内に link glyph (`share_group_link_glyph`) を描いた GlyphArea の個数。
+    fn link_glyph_count(scene: &daw_ui_renderer::Scene, style: &ArrangementStyle) -> usize {
+        let glyph = style.share_group_link_glyph.to_string();
+        scene.iter_glyphs().filter(|g| g.text.as_ref() == glyph).count()
+    }
+
+    /// thumbnail を持たない video clip (Text / 未生成 image): audio share clip と同じ full hue fill +
+    /// hue border + link glyph を描く (= track kind に依らず share マークが出る、 #080 の主訴)。
+    #[test]
+    fn video_share_clip_without_thumbnail_draws_full_hue_mark() {
+        let style = ArrangementStyle::default();
+        let hue = 0.33_f32;
+        let scene = render_video_clips_scene(vec![shared_clip(false, Some(hue))], &[]);
+
+        let expected_fill = hsl_to_rgb(
+            hue,
+            style.share_group_saturation,
+            style.share_group_fill_lightness,
+            style.share_group_alpha,
+        );
+        let expected_border = hsl_to_rgb(
+            hue,
+            style.share_group_saturation,
+            style.share_group_border_lightness,
+            1.0,
+        );
+        assert!(
+            scene.iter_rects().any(|r| r.fill == expected_fill),
+            "thumbnail 無し video share clip は hue full fill を描く (audio 経路と同一)"
+        );
+        assert!(
+            scene.iter_rects().any(|r| r.border == expected_border),
+            "hue border も描く"
+        );
+        assert_eq!(link_glyph_count(&scene, &style), 1, "link glyph を 1 個描く");
+        // 旧挙動 (bug): video_clip_loading 一色 + glyph 無し。 share clip では loading 一色 fill にならない。
+        assert!(
+            !scene.iter_rects().any(|r| r.fill == style.video_clip_loading),
+            "share clip では loading 一色 fill にならない (hue fill で上書き)"
+        );
+    }
+
+    /// thumbnail を持つ video clip (実 video): thumbnail を隠さないよう full fill はせず、 letterbox
+    /// 背景は `video_clip_loading` のまま + hue border アクセント + link glyph で共有を識別。
+    #[test]
+    fn video_share_clip_with_thumbnail_draws_border_accent_only() {
+        use std::num::NonZeroU32;
+        let style = ArrangementStyle::default();
+        let hue = 0.5_f32;
+        let mut c = shared_clip(false, Some(hue));
+        c.thumbnail = Some((TextureHandle::from_raw(NonZeroU32::new(7).unwrap()), 1920, 1080));
+        let scene = render_video_clips_scene(vec![c], &[]);
+
+        let hue_fill = hsl_to_rgb(
+            hue,
+            style.share_group_saturation,
+            style.share_group_fill_lightness,
+            style.share_group_alpha,
+        );
+        let expected_border = hsl_to_rgb(
+            hue,
+            style.share_group_saturation,
+            style.share_group_border_lightness,
+            1.0,
+        );
+        // thumbnail を隠す full hue fill は描かない。
+        assert!(
+            !scene.iter_rects().any(|r| r.fill == hue_fill),
+            "thumbnail 有 share clip は full hue fill をしない (thumbnail を隠さない)"
+        );
+        // letterbox 背景 (= clip rect fill) は neutral な video_clip_loading のまま。
+        assert!(
+            scene.iter_rects().any(|r| r.fill == style.video_clip_loading),
+            "letterbox 背景は video_clip_loading のまま"
+        );
+        // hue border アクセント + link glyph で共有を識別。
+        assert!(
+            scene.iter_rects().any(|r| r.border == expected_border),
+            "hue border アクセントを描く"
+        );
+        assert_eq!(link_glyph_count(&scene, &style), 1, "link glyph を 1 個描く");
+        // thumbnail texture も描かれている (隠していない)。
+        assert_eq!(scene.iter_textures().count(), 1, "thumbnail texture を描く");
+    }
+
+    /// selected な video share clip: selection 色が最優先 (fill = 黄) で、 link glyph は #022 どおり
+    /// selected でも描く。 base + selection overlay の 2 回描画で glyph は 2 個。
+    #[test]
+    fn selected_video_share_clip_keeps_link_glyph() {
+        let style = ArrangementStyle::default();
+        let hue = 0.1_f32;
+        let key = ClipKey { track: 0, clip: 10 };
+        let scene = render_video_clips_scene(vec![shared_clip(false, Some(hue))], &[key]);
+
+        assert!(
+            scene.iter_rects().any(|r| r.fill == style.clip_selected_fill),
+            "selected video clip は selection 色で塗る (selection 最優先)"
+        );
+        assert_eq!(
+            link_glyph_count(&scene, &style),
+            2,
+            "link glyph は base + selection overlay で 2 個 (selected でも描く、 #022)"
+        );
+    }
+
+    /// 非 share な video clip (`share_group_color == None`): link glyph を描かず fill は
+    /// `video_clip_loading` のまま (= #044 の既存挙動と完全互換、 回帰なし)。
+    #[test]
+    fn non_share_video_clip_unchanged() {
+        let style = ArrangementStyle::default();
+        let scene = render_video_clips_scene(vec![clip(10, 2.0, 4.0, "plain")], &[]);
+        assert_eq!(link_glyph_count(&scene, &style), 0, "非 share clip は link glyph を描かない");
+        assert!(
+            scene.iter_rects().any(|r| r.fill == style.video_clip_loading),
+            "非 share video clip は従来どおり video_clip_loading 一色"
         );
     }
 
