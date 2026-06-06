@@ -6,7 +6,7 @@
 //!
 //! memory: `feedback_no_excuse_pixel_verify` (「見える」 で済まさず pixel 単位で確認)。
 
-use daw_ui_renderer::{Color, OffscreenRenderer, Rect, RectCommand, Scene, TextureHandle};
+use daw_ui_renderer::{Color, GlyphArea, OffscreenRenderer, Rect, RectCommand, Scene, TextureHandle};
 
 /// GPU が無ければ skip するための helper。 `Some(renderer)` か `None`。
 fn try_renderer(w: u32, h: u32) -> Option<OffscreenRenderer> {
@@ -42,6 +42,9 @@ fn is_red(p: (u8, u8, u8, u8)) -> bool {
 }
 fn is_blue(p: (u8, u8, u8, u8)) -> bool {
     p.2 > 200 && p.0 < 80 && p.1 < 80
+}
+fn is_green(p: (u8, u8, u8, u8)) -> bool {
+    p.1 > 200 && p.0 < 80 && p.2 < 80
 }
 
 /// composite した GPU 常駐 texture が、 そのまま `TexturedQuad.texture` として再 sample できる。
@@ -190,5 +193,269 @@ fn rotation_pivot_corner_differs_from_center() {
         !is_red(px(&corner, 24, 16, 12)),
         "corner pivot で (16,12) が red になっている: {:?}",
         px(&corner, 24, 16, 12)
+    );
+}
+
+// ============================================================
+// M14 Phase 106 (daw_01 #077): async double-buffer readback
+// ============================================================
+
+/// `submit_readback` + `finish_readback` の出力が、 同 scene を `render_to_rgba` した同期版と
+/// **bit 単位で完全一致**する (export/preview byte parity 要件、 共有 `encode_scene_into` 経路の証明)。
+#[test]
+fn async_readback_matches_sync_byte_for_byte() {
+    let Some(mut r) = try_renderer(40, 24) else { return };
+    let mut scene = Scene::new();
+    scene.clear_color = Color::BLACK.to_wgpu();
+    scene.push_rect(RectCommand::uniform_radius(
+        Rect::new(4.0, 4.0, 20.0, 14.0),
+        Color::rgb(1.0, 0.0, 0.0),
+        3.0,
+    ));
+    scene.push_rect(RectCommand::uniform_radius(
+        Rect::new(18.0, 8.0, 18.0, 12.0),
+        Color::rgb(0.0, 0.0, 1.0),
+        0.0,
+    ));
+
+    let sync = r.render_to_rgba(&scene).expect("sync render");
+    let pending = r.submit_readback(&scene).expect("submit_readback");
+    let async_bytes = r.finish_readback(pending).expect("finish_readback");
+
+    assert_eq!(
+        sync.len(),
+        async_bytes.len(),
+        "async readback の byte 数が同期版と違う"
+    );
+    assert_eq!(
+        sync, async_bytes,
+        "async readback bytes が同期 render_to_rgba と bit 単位で一致しない"
+    );
+}
+
+/// 非黒 clear + rect + textured-quad (export の主役: video frame) + plain text (glyph) + outline text
+/// (text_effect) を 1 scene に詰め、 `encode_scene_into` の全 export-relevant 分岐を通しても async
+/// readback が同期 `render_to_rgba` と **bit 単位で一致**する。 = byte-parity が「rect だけ」 でなく
+/// clear/texture/glyph/text_effect cache lifecycle 全体で成立する証明。
+/// (popup pass は export では使われない (`render_video` は `scene.primitives` のみ構築) ので対象外。)
+#[test]
+fn async_readback_matches_sync_with_text_and_effects() {
+    let Some(mut r) = try_renderer(96, 40) else { return };
+    // export の video frame に相当する uploaded texture (緑単色 4x4)。 両経路で同 handle を sample。
+    let tex = r.create_texture(4, 4);
+    let green = [0u8, 200, 0, 255].repeat(4 * 4);
+    r.upload_texture_rgba(tex, &green);
+
+    let mut scene = Scene::new();
+    scene.clear_color = Color::rgb(0.05, 0.10, 0.15).to_wgpu(); // 非黒 clear で clear 経路も検証
+    scene.push_rect(RectCommand::uniform_radius(
+        Rect::new(2.0, 2.0, 92.0, 36.0),
+        Color::rgb(0.1, 0.1, 0.12),
+        2.0,
+    ));
+    scene.push_textured_quad(daw_ui_renderer::TexturedQuad::new(
+        Rect::new(60.0, 4.0, 28.0, 28.0),
+        tex,
+    ));
+    // plain text (glyph pipeline 経路)。
+    scene.push_text(GlyphArea {
+        text: "Export".into(),
+        left: 6.0,
+        top: 6.0,
+        font_size: 14.0,
+        line_height: 16.0,
+        color: Color::rgb(1.0, 1.0, 1.0),
+        clip_rect: None,
+        outline_color: Color::rgba(0.0, 0.0, 0.0, 0.0),
+        outline_width_px: 0.0,
+        shadow_color: Color::rgba(0.0, 0.0, 0.0, 0.0),
+        shadow_offset_px: (0.0, 0.0),
+        shadow_blur_px: 0.0,
+        rotation_radians: 0.0,
+    });
+    // outline 付き text (text_effect compositor で offscreen 焼き → Primitive::Texture substitution)。
+    scene.push_text(GlyphArea {
+        text: "RGBA".into(),
+        left: 6.0,
+        top: 22.0,
+        font_size: 14.0,
+        line_height: 16.0,
+        color: Color::rgb(1.0, 0.8, 0.2),
+        clip_rect: None,
+        outline_color: Color::rgb(0.0, 0.0, 0.0),
+        outline_width_px: 2.0,
+        shadow_color: Color::rgba(0.0, 0.0, 0.0, 0.0),
+        shadow_offset_px: (0.0, 0.0),
+        shadow_blur_px: 0.0,
+        rotation_radians: 0.0,
+    });
+
+    let sync = r.render_to_rgba(&scene).expect("sync render");
+    let pending = r.submit_readback(&scene).expect("submit_readback");
+    let async_bytes = r.finish_readback(pending).expect("finish_readback");
+
+    assert_eq!(
+        sync, async_bytes,
+        "text + outline を含む scene で async readback が同期版と bit 一致しない (glyph/text_effect cache 経路の食い違い?)"
+    );
+    // 描画が空でない (全黒だと parity が trivially 成立してしまうので非黒 pixel を 1 つ確認)。
+    assert!(
+        (0..sync.len()).step_by(4).any(|i| sync[i] > 40 || sync[i + 1] > 40 || sync[i + 2] > 40),
+        "scene が全黒に近い (text が描画されていない?)"
+    );
+}
+
+/// double-buffer: `submit(A) → submit(B) → finish(A) → finish(B)`。 B の composite が end_cycle で
+/// 解放された A の pool target を **再利用**しても、 GPU submit 順 (composite(A)→render(A)→
+/// composite(B)→render(B)) により A の readback は A の内容 (red) を保つ。 = async overlap が
+/// composite pool と安全に共存する証明。
+#[test]
+fn double_buffer_async_readback_keeps_frames_distinct() {
+    let Some(mut r) = try_renderer(16, 16) else { return };
+
+    // frame A: red を composite して参照。
+    let tex_a = composite_solid(&mut r, 16, 16, Color::rgb(1.0, 0.0, 0.0));
+    let mut scene_a = Scene::new();
+    scene_a.clear_color = Color::BLACK.to_wgpu();
+    scene_a.push_textured_quad(daw_ui_renderer::TexturedQuad::new(
+        Rect::new(0.0, 0.0, 16.0, 16.0),
+        tex_a,
+    ));
+    let pa = r.submit_readback(&scene_a).expect("submit A");
+
+    // frame B: blue を composite (A の解放済 pool target を再利用する) して参照。
+    let tex_b = composite_solid(&mut r, 16, 16, Color::rgb(0.0, 0.0, 1.0));
+    let mut scene_b = Scene::new();
+    scene_b.clear_color = Color::BLACK.to_wgpu();
+    scene_b.push_textured_quad(daw_ui_renderer::TexturedQuad::new(
+        Rect::new(0.0, 0.0, 16.0, 16.0),
+        tex_b,
+    ));
+    let pb = r.submit_readback(&scene_b).expect("submit B");
+
+    let a = r.finish_readback(pa).expect("finish A");
+    let b = r.finish_readback(pb).expect("finish B");
+
+    assert!(
+        is_red(px(&a, 16, 8, 8)),
+        "frame A が red でない (B の composite が A を破壊した?): {:?}",
+        px(&a, 16, 8, 8)
+    );
+    assert!(
+        is_blue(px(&b, 16, 8, 8)),
+        "frame B が blue でない: {:?}",
+        px(&b, 16, 8, 8)
+    );
+}
+
+/// double-buffer で **glyph pipeline** が frame をまたいで leak しないことの adversarial 検証。
+/// glyph pipeline は composite target (per-call) と違い base/popup で **単一 instance buffer** を
+/// 共有するので、 LAST WRITE WINS trap の最有力候補。 `submit(A の赤 text) → submit(B の青 text) →
+/// finish(A)` で A の readback に B の青 text が混入しないこと (= `queue.write_buffer` が submit ごとに
+/// flush される「別 submit なら安全」 原理) を pixel 計数で確認する。
+#[test]
+fn double_buffer_glyph_does_not_leak_across_frames() {
+    let Some(mut r) = try_renderer(200, 40) else { return };
+
+    let mut scene_a = Scene::new();
+    scene_a.clear_color = Color::BLACK.to_wgpu();
+    scene_a.push_text(GlyphArea::new(
+        std::sync::Arc::from("A"),
+        4.0,
+        4.0,
+        24.0,
+        28.0,
+        Color::rgb(1.0, 0.0, 0.0),
+    ));
+    let pa = r.submit_readback(&scene_a).expect("submit A");
+
+    let mut scene_b = Scene::new();
+    scene_b.clear_color = Color::BLACK.to_wgpu();
+    scene_b.push_text(GlyphArea::new(
+        std::sync::Arc::from("B"),
+        4.0,
+        4.0,
+        24.0,
+        28.0,
+        Color::rgb(0.0, 0.0, 1.0),
+    ));
+    let pb = r.submit_readback(&scene_b).expect("submit B");
+
+    let a = r.finish_readback(pa).expect("finish A");
+    let b = r.finish_readback(pb).expect("finish B");
+
+    // 明るい pixel のうち red 寄り / blue 寄りを数える。
+    let count = |bytes: &[u8], red: bool| {
+        bytes
+            .chunks_exact(4)
+            .filter(|px| {
+                let bright = u32::from(px[0]) + u32::from(px[1]) + u32::from(px[2]) > 60;
+                bright && if red { px[0] > px[2] } else { px[2] > px[0] }
+            })
+            .count()
+    };
+    let a_red = count(&a, true);
+    let a_blue = count(&a, false);
+    let b_blue = count(&b, false);
+    assert!(a_red > 5, "frame A の赤 text が無い: red={a_red} blue={a_blue}");
+    assert!(a_blue < a_red, "frame A に B の青 text が leak した: red={a_red} blue={a_blue}");
+    assert!(b_blue > 5, "frame B の青 text が無い: blue={b_blue}");
+}
+
+/// 多数フレームを `submit → finish` 直列で回すと slot が再利用される (= unmap 済 slot を再 acquire
+/// できる回帰防止)。 reuse が壊れていれば map 済 buffer の再利用などで panic / error する。
+#[test]
+fn sequential_async_readback_reuses_slot() {
+    let Some(mut r) = try_renderer(8, 8) else { return };
+    for i in 0..6 {
+        let fill = if i % 2 == 0 {
+            Color::rgb(1.0, 0.0, 0.0)
+        } else {
+            Color::rgb(0.0, 0.0, 1.0)
+        };
+        let mut scene = Scene::new();
+        scene.clear_color = Color::BLACK.to_wgpu();
+        scene.push_rect(RectCommand::uniform_radius(
+            Rect::new(0.0, 0.0, 8.0, 8.0),
+            fill,
+            0.0,
+        ));
+        let pending = r.submit_readback(&scene).expect("submit");
+        let bytes = r.finish_readback(pending).expect("finish");
+        if i % 2 == 0 {
+            assert!(is_red(px(&bytes, 8, 4, 4)), "frame {i} が red でない: {:?}", px(&bytes, 8, 4, 4));
+        } else {
+            assert!(is_blue(px(&bytes, 8, 4, 4)), "frame {i} が blue でない: {:?}", px(&bytes, 8, 4, 4));
+        }
+    }
+}
+
+/// `clear_readback_cache` 後の古い `PendingReadback` (世代不一致) を `finish_readback` に渡すと
+/// panic せず `Err` を返す (stale token guard)。
+#[test]
+fn stale_pending_after_cache_clear_errors() {
+    let Some(mut r) = try_renderer(8, 8) else { return };
+    let mut scene = Scene::new();
+    scene.clear_color = Color::BLACK.to_wgpu();
+    scene.push_rect(RectCommand::uniform_radius(
+        Rect::new(0.0, 0.0, 8.0, 8.0),
+        Color::rgb(0.0, 1.0, 0.0),
+        0.0,
+    ));
+
+    let stale = r.submit_readback(&scene).expect("submit stale"); // slot 0, gen 1
+    r.clear_readback_cache(); // slots を空に (gen は単調増加継続)
+    let fresh = r.submit_readback(&scene).expect("submit fresh"); // slot 0 再生成、 gen != 1
+
+    assert!(
+        r.finish_readback(stale).is_err(),
+        "clear 後の stale token が Err にならず回収できてしまった"
+    );
+    // fresh は正常回収できる (clear / stale 検出が live slot を巻き込んでいない)。
+    let bytes = r.finish_readback(fresh).expect("finish fresh");
+    assert!(
+        is_green(px(&bytes, 8, 4, 4)),
+        "fresh readback が green でない: {:?}",
+        px(&bytes, 8, 4, 4)
     );
 }
