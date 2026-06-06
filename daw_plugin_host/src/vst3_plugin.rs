@@ -103,6 +103,23 @@ pub struct Vst3Plugin {
     /// pre-allocate、 `process()` 入口で `clear()` + `push()` で reuse 化。
     /// CLAP 側の `process_input_bufs` と同 pattern。
     process_input_bufs: Vec<AudioBusBuffers>,
+    /// Extra (non-main) output buses' channel counts, in declared bus order
+    /// (skipping the main output bus at index 0). Empty when the plugin has
+    /// a single output bus. VST3 spec requires `process()`'s `numOutputs` to
+    /// equal the plugin's total output bus count; multi-output synths
+    /// (Surge XT declares Output + Scene A + Scene B) otherwise get a
+    /// mismatch and emit no main output. We provide (discarded) scratch for
+    /// each extra bus so the count matches and the main bus is honoured.
+    extra_output_channels: Vec<u32>,
+    /// Pre-allocated scratch planar buffers for each extra output bus
+    /// (bus × ch × frame). The plugin writes its unused-by-us extra outputs
+    /// here; we read only the main bus via `output_buffer()`.
+    extra_output_buffers: Vec<Vec<Vec<f32>>>,
+    /// Per-extra-output-bus channel pointer scratch (refreshed each process()).
+    extra_output_ptrs: Vec<Vec<*mut f32>>,
+    /// Pre-allocated `Vec<AudioBusBuffers>` for output buses (main + extras),
+    /// mirroring `process_input_bufs`. clear()/push() reuse on the RT path.
+    process_output_bufs: Vec<AudioBusBuffers>,
 
     /// Scratch buffer for input events fed to the plugin this tick. Cleared
     /// and re-filled on every `process()`.
@@ -344,10 +361,12 @@ impl Vst3Plugin {
         let input_channels = main_audio_bus_channel_count(&component, BusDirections_::kInput);
         let output_channels = main_audio_bus_channel_count(&component, BusDirections_::kOutput);
         let aux_input_channels = aux_input_bus_channels(&component);
+        let extra_output_channels = output_bus_extra_channels(&component);
         tracing::info!(
             input_channels,
             output_channels,
             aux_input_count = aux_input_channels.len(),
+            extra_output_bus_count = extra_output_channels.len(),
             "VST3 audio bus channel counts"
         );
 
@@ -376,6 +395,10 @@ impl Vst3Plugin {
             aux_input_buffers: Vec::new(),
             aux_input_ptrs: Vec::new(),
             process_input_bufs: Vec::new(),
+            extra_output_channels,
+            extra_output_buffers: Vec::new(),
+            extra_output_ptrs: Vec::new(),
+            process_output_bufs: Vec::new(),
             in_event_buffer: Vec::with_capacity(256),
             collected_out_notes: Vec::with_capacity(256),
             in_event_list: ComWrapper::new(Vst3InEventList::new()),
@@ -534,6 +557,27 @@ fn main_audio_bus_channel_count(
     } else {
         0
     }
+}
+
+/// Channel counts of every output bus *after* index 0 (the main output bus
+/// daw_01 reads back via `output_buffer`). VST3 `process()` must provide an
+/// `AudioBusBuffers` for every output bus the plugin declares; multi-output
+/// synths (Surge XT: Output + Scene A + Scene B) would otherwise hit a
+/// `numOutputs` mismatch and emit no main output. Returns one entry per bus
+/// index `1..count` (channel count, or `0` if the info read fails) so the
+/// process-time `outputs` array stays aligned with the plugin's bus indices.
+fn output_bus_extra_channels(component: &ComPtr<IComponent>) -> Vec<u32> {
+    use vst3::Steinberg::Vst::{BusDirections_, BusInfo, MediaTypes_};
+    let count = unsafe { component.getBusCount(MediaTypes_::kAudio, BusDirections_::kOutput) };
+    let mut extra: Vec<u32> = Vec::new();
+    for i in 1..count {
+        let mut info: BusInfo = unsafe { std::mem::zeroed() };
+        let res = unsafe {
+            component.getBusInfo(MediaTypes_::kAudio, BusDirections_::kOutput, i, &mut info)
+        };
+        extra.push(if res == kResultOk { info.channelCount.max(0) as u32 } else { 0 });
+    }
+    extra
 }
 
 /// Connect the component's and controller's `IConnectionPoint` interfaces
@@ -888,6 +932,25 @@ impl LoadedPlugin for Vst3Plugin {
         // aux bus 数。 process() 入口で clear() + push() で reuse する。
         self.process_input_bufs =
             Vec::with_capacity(1 + self.aux_input_channels.len());
+        // Multi-output-bus support (Surge XT 等): scratch buffers for each
+        // extra output bus + the process-time output `Vec<AudioBusBuffers>`
+        // (main + extras). Mirrors the aux input allocation above.
+        self.extra_output_buffers = self
+            .extra_output_channels
+            .iter()
+            .map(|&ch| {
+                (0..ch as usize)
+                    .map(|_| vec![0.0f32; max_frames as usize])
+                    .collect()
+            })
+            .collect();
+        self.extra_output_ptrs = self
+            .extra_output_channels
+            .iter()
+            .map(|&ch| vec![std::ptr::null_mut(); ch as usize])
+            .collect();
+        self.process_output_bufs =
+            Vec::with_capacity(1 + self.extra_output_channels.len());
         self.active = true;
         tracing::info!(name = %self.name, sample_rate, max_frames, "VST3 plugin activated");
         Ok(())
@@ -903,6 +966,9 @@ impl LoadedPlugin for Vst3Plugin {
         self.active = false;
         self.output_buffers.clear();
         self.output_ptrs.clear();
+        self.extra_output_buffers.clear();
+        self.extra_output_ptrs.clear();
+        self.process_output_bufs.clear();
     }
 
     fn start_processing(&mut self) -> Result<()> {
@@ -983,6 +1049,14 @@ impl LoadedPlugin for Vst3Plugin {
         }
         for i in 0..self.output_buffers.len() {
             self.output_ptrs[i] = self.output_buffers[i].as_mut_ptr();
+        }
+        // Multi-output-bus: refresh extra output bus channel pointers so the
+        // process-time `AudioBusBuffers` see the latest base pointers.
+        for bus_idx in 0..self.extra_output_buffers.len() {
+            for ch in 0..self.extra_output_buffers[bus_idx].len() {
+                self.extra_output_ptrs[bus_idx][ch] =
+                    self.extra_output_buffers[bus_idx][ch].as_mut_ptr();
+            }
         }
         // PR4 sidechain: copy aux input audio into our pre-allocated
         // planar bus buffers, mirroring the main bus copy above. Each
@@ -1070,13 +1144,29 @@ impl LoadedPlugin for Vst3Plugin {
                 },
             });
         }
-        let mut out_bus = AudioBusBuffers {
-            numChannels: self.output_channels as i32,
-            silenceFlags: 0,
-            __field0: AudioBusBuffers__type0 {
-                channelBuffers32: self.output_ptrs.as_mut_ptr(),
-            },
-        };
+        // Assemble output AudioBusBuffers (main + extras). VST3 requires
+        // `numOutputs` to equal the plugin's output bus count; bus 0 is the
+        // real main output we read back, buses 1..N are scratch so multi-
+        // output synths (Surge XT) honour the main bus instead of mismatching.
+        self.process_output_bufs.clear();
+        if self.output_channels > 0 {
+            self.process_output_bufs.push(AudioBusBuffers {
+                numChannels: self.output_channels as i32,
+                silenceFlags: 0,
+                __field0: AudioBusBuffers__type0 {
+                    channelBuffers32: self.output_ptrs.as_mut_ptr(),
+                },
+            });
+        }
+        for bus_idx in 0..self.extra_output_channels.len() {
+            self.process_output_bufs.push(AudioBusBuffers {
+                numChannels: self.extra_output_channels[bus_idx] as i32,
+                silenceFlags: 0,
+                __field0: AudioBusBuffers__type0 {
+                    channelBuffers32: self.extra_output_ptrs[bus_idx].as_mut_ptr(),
+                },
+            });
+        }
 
         // Phase 7 B1-T (2026-05-13): per-buffer transport snapshot を VST3
         // `ProcessContext` に populate。 CLAP `build_clap_transport_event`
@@ -1150,12 +1240,12 @@ impl LoadedPlugin for Vst3Plugin {
             symbolicSampleSize: SymbolicSampleSizes_::kSample32,
             numSamples: frames as i32,
             numInputs: num_inputs,
-            numOutputs: if self.output_channels > 0 { 1 } else { 0 },
+            numOutputs: self.process_output_bufs.len() as i32,
             inputs: inputs_ptr,
-            outputs: if self.output_channels > 0 {
-                &mut out_bus
-            } else {
+            outputs: if self.process_output_bufs.is_empty() {
                 std::ptr::null_mut()
+            } else {
+                self.process_output_bufs.as_mut_ptr()
             },
             // automation 入力 (host → plugin)。 borrowed ptr: ComWrapper が
             // 自前 ref を保持するので in_param_changes_ptr drop 後も生存
