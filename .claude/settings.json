@@ -3,6 +3,17 @@
     "additionalDirectories": ["F:/dev/gui_01"]
   },
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash F:/dev/daw_01/.claude/hooks/sessionstart_show_pending_reflections.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit",
@@ -47,6 +58,11 @@
     "Stop": [
       {
         "hooks": [
+          {
+            "type": "command",
+            "command": "bash F:/dev/daw_01/.claude/hooks/stop_session_reflect.sh",
+            "timeout": 10
+          },
           {
             "type": "command",
             "command": "powershell -ExecutionPolicy Bypass -File F:/dev/daw_01/scripts/reflect.ps1",
