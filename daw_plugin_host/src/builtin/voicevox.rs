@@ -140,6 +140,9 @@ pub struct VoicevoxBuiltin {
     /// 再生中 voice 群 (PR-V2.4)。 note_on で push、 wav 終端で自動 drain、
     /// 同 note_id の retrigger は既存 entry を上書き (後勝ち)。
     active_voices: Vec<Voice>,
+    /// 前 buffer の transport 再生状態。 playing→stopped の edge を検出して
+    /// Stop の瞬間に voice を drop するために保持する (process 参照)。
+    was_playing: bool,
 }
 
 impl VoicevoxBuiltin {
@@ -156,6 +159,7 @@ impl VoicevoxBuiltin {
             synth_shutdown: Arc::new(AtomicBool::new(false)),
             synth_result: Arc::new(ArcSwapOption::from(None)),
             active_voices: Vec::new(),
+            was_playing: false,
         }
     }
 
@@ -369,7 +373,7 @@ impl LoadedPlugin for VoicevoxBuiltin {
         _param_events: &[crate::plugin_instance::TimedParamEvent],
         _input_audio: &[&[f32]],
         _aux_inputs: &[AuxInputBuf<'_>],
-        _transport: &crate::plugin_instance::TransportContext,
+        transport: &crate::plugin_instance::TransportContext,
     ) -> Result<i32> {
         let frames_usize = frames as usize;
         // 出力 buffer を 0 fill。
@@ -380,6 +384,23 @@ impl LoadedPlugin for VoicevoxBuiltin {
         let n_r = frames_usize.min(self.out_r.len());
         for v in &mut self.out_r[..n_r] {
             *v = 0.0;
+        }
+
+        // Transport gating (playing→stopped edge): Stop した瞬間に再生中の
+        // 歌声 voice を drop する。 engine の Instrument dispatch は playing で
+        // gate されず (= release tail を鳴らすため)、 さらに本 plugin は
+        // note_off を無視して voice.cursor を playhead と独立に drain するため、
+        // ここで止めないと Stop しても合成 wav が末尾まで鳴り続ける
+        // (= audio clip が engine.rs の `if playing` で gate されているのと同義)。
+        // 毎 buffer 無条件 clear ではなく edge 検出にするのは、 piano_roll の
+        // 鍵盤プレビュー (transport 停止中でも note_on を注入して試聴する) を
+        // 潰さないため。 停止後は sequencer が note_on を出さないので edge 1 回の
+        // clear で十分。 RT 安全: bool 1 個の読み書き + Vec::clear (truncate のみ、
+        // 容量保持・dealloc なし)、 出力は上で 0 fill 済。
+        let stopped_edge = self.was_playing && !transport.is_playing;
+        self.was_playing = transport.is_playing;
+        if stopped_edge {
+            self.active_voices.clear();
         }
 
         // PR-V2.4: per-note voice。 note_on を受信したら synth_result の
