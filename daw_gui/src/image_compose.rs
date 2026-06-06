@@ -87,9 +87,10 @@ pub fn active_image_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveIma
     for (idx, track) in song.tracks.iter().rev().enumerate() {
         // v16: TrackKind 廃止後は「image_events を持つ clip がある track」
         // が visual composite に参加する (= filter は content kind で行う)。
-        // track.muted (= mixer M トグル) で image overlay も無効化、 SSoT
-        // として preview / render 両方で扱う。
-        if track.muted {
+        // 自身の mute だけでなく、 グループ親の mute / solo (audio と同じ
+        // effective-mute) で silenced な track は image overlay も無効化する
+        // (`Song::track_visually_silenced` が SSoT、 preview / render 共通)。
+        if song.track_visually_silenced(track.id) {
             continue;
         }
         let z_index = idx as u32;

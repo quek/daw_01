@@ -1407,7 +1407,10 @@ pub fn process_track_owned(
     // ---- Mixer strip + master accumulate ----
     let muted = song_track.muted;
     let solo = song_track.solo;
-    let effective_mute = muted || (any_solo && !solo);
+    // Folder solo: グループを solo したらその子も鳴る (Ableton / Reaper 準拠)。
+    // 祖先 group のいずれかが solo なら、 この track 自身が非 solo でも透過させる。
+    let ancestor_soloed = song.is_some_and(|s| s.ancestor_soloed(song_track.id));
+    let effective_mute = muted || (any_solo && !solo && !ancestor_soloed);
     scratch.effective_mute = effective_mute;
 
     // Always apply the strip so `track_l/r` carries this track's
@@ -2070,9 +2073,13 @@ fn run_group_fx_chain(
     let muted = song_track.muted;
     let solo = song_track.solo;
     // Live 互換: 子 / send 元のいずれかが solo されていれば、 この bus 自身は
-    // solo フラグが無くても透過させる (has_soloed_contributor)。
-    let effective_mute =
-        muted || (any_solo && !solo && !has_soloed_contributor(song, song_track.id));
+    // solo フラグが無くても透過させる (has_soloed_contributor)。 さらに folder
+    // solo: 祖先 group が solo なら、 このネストした group bus 自身も透過させる。
+    let effective_mute = muted
+        || (any_solo
+            && !solo
+            && !song.ancestor_soloed(song_track.id)
+            && !has_soloed_contributor(song, song_track.id));
     scratch.effective_mute = effective_mute;
 
     // Always apply the strip (mirrors process_track_owned): keep the signal
@@ -2505,5 +2512,35 @@ mod send_tests {
             !has_soloed_contributor(&song, 2),
             "with nothing soloed, the return has no soloed contributor"
         );
+    }
+
+    /// Folder solo: soloing a GROUP must keep its children audible (Ableton /
+    /// Reaper folder behavior). The leaf strip rule excludes a non-soloed
+    /// track under solo only when no ancestor group is soloed, so a child of
+    /// a soloed group is NOT effective-muted. Guards the `ancestor_soloed`
+    /// condition added to the effective-mute formula.
+    #[test]
+    fn soloed_group_keeps_children_audible() {
+        use common::model::Track;
+        let mut song = Song::default();
+        // id 10 = group, id 11 = child of 10, id 12 = unrelated.
+        song.tracks = vec![
+            Track { id: 10, ..Track::default() },
+            Track { id: 11, parent_group_id: Some(10), ..Track::default() },
+            Track { id: 12, ..Track::default() },
+        ];
+        song.tracks[0].solo = true; // solo the group
+
+        let any_solo = song.tracks.iter().any(|t| t.solo);
+        assert!(any_solo);
+        // child: not soloed itself, but its ancestor group is → audible.
+        assert!(song.ancestor_soloed(11), "child sees the soloed ancestor group");
+        let child = &song.tracks[1];
+        let child_excluded = any_solo && !child.solo && !song.ancestor_soloed(child.id);
+        assert!(!child_excluded, "child of a soloed group must not be solo-excluded");
+        // unrelated track: no soloed ancestor → excluded (silent) under solo.
+        let other = &song.tracks[2];
+        let other_excluded = any_solo && !other.solo && !song.ancestor_soloed(other.id);
+        assert!(other_excluded, "unrelated track is silenced while a group is soloed");
     }
 }

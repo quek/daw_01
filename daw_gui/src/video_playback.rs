@@ -370,9 +370,10 @@ impl VideoPlaybackEngine {
             // v16: TrackKind 廃止後は「video_events を持つ clip がある
             // track」 が visual composite に参加する (= filter は content
             // kind で行う、 後段 `content.video_events()` で None を skip)。
-            // track.muted な track は preview / render の両方で skip
-            // (= 音声と同 idiom)、 mixer の M トグルが SSoT。
-            if track.muted {
+            // 自身の mute だけでなく、 グループ親の mute / solo (audio と同じ
+            // effective-mute) で silenced な track は preview / render の両方で
+            // skip する (`Song::track_visually_silenced` が SSoT)。
+            if song.track_visually_silenced(track.id) {
                 continue;
             }
             let mut track_emitted = false;

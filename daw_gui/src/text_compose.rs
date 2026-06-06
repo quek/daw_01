@@ -76,7 +76,10 @@ pub fn active_text_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveText
     let mut out: Vec<ActiveTextFrame> = Vec::new();
     let mut z_index: u32 = 0;
     for track in song.tracks.iter().rev() {
-        if track.muted {
+        // 自身の mute だけでなく、 グループ親の mute / solo (audio と同じ
+        // effective-mute) で silenced な track は text overlay も無効化する
+        // (`Song::track_visually_silenced` が SSoT、 preview / render 共通)。
+        if song.track_visually_silenced(track.id) {
             continue;
         }
         let mut track_emitted = false;

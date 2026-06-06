@@ -700,6 +700,101 @@ impl Song {
         self.tracks.iter_mut().find(|t| t.id == track_id)
     }
 
+    /// Effective silence for the VISUAL layer (preview + export). A track's
+    /// image / video / text clips are hidden when this returns `true`.
+    ///
+    /// Mirrors the audio engine's effective-mute semantics, but resolves
+    /// group-ancestry mute explicitly because the video pipeline has no
+    /// routing graph to propagate a muted group down to its children:
+    ///
+    /// - **Mute**: the track itself OR any ancestor reached via
+    ///   `parent_group_id` is `muted` — a muted group hides its whole
+    ///   subtree, exactly what the audio engine does topologically by
+    ///   dropping the muted group from the master mix.
+    /// - **Solo**: when any track is soloed, the track is hidden unless it
+    ///   is solo-audible (see [`Song::track_solo_audible`]). Soloing a GROUP
+    ///   keeps its whole subtree visible (folder-solo, as in Ableton / Reaper)
+    ///   and soloing a CHILD keeps its ancestor groups visible.
+    ///
+    /// Cycle-safe: `parent_group_id` walks are hop-capped at `tracks.len()`.
+    pub fn track_visually_silenced(&self, track_id: u32) -> bool {
+        if self.track_by_id(track_id).is_none() {
+            return true;
+        }
+        // (1) self-or-ancestor mute (a muted group hides its subtree).
+        let mut cur = Some(track_id);
+        let mut hops = 0usize;
+        while let Some(id) = cur {
+            if hops > self.tracks.len() {
+                break;
+            }
+            let Some(t) = self.track_by_id(id) else { break };
+            if t.muted {
+                return true;
+            }
+            cur = t.parent_group_id;
+            hops += 1;
+        }
+        // (2) solo rule (mirrors audio exactly).
+        let any_solo = self.tracks.iter().any(|t| t.solo);
+        if !any_solo {
+            return false;
+        }
+        !self.track_solo_audible(track_id)
+    }
+
+    /// True if `track_id` should be seen/heard under an active solo. A track
+    /// is solo-audible iff anything in its vertical group lineage is soloed:
+    /// itself, ANY ANCESTOR (soloing a group shows its children — folder
+    /// solo), or ANY DESCENDANT (soloing a child keeps its ancestor groups
+    /// visible). Cycle-safe via `tracks.len()` hop caps.
+    fn track_solo_audible(&self, track_id: u32) -> bool {
+        // self or any ANCESTOR soloed → folder solo shows the subtree.
+        if self.track_by_id(track_id).is_some_and(|t| t.solo) || self.ancestor_soloed(track_id) {
+            return true;
+        }
+        // any DESCENDANT (child chain) soloed → keep this ancestor group on.
+        self.tracks.iter().any(|c| {
+            c.solo && {
+                let mut cur = c.parent_group_id;
+                let mut hops = 0usize;
+                loop {
+                    let Some(pid) = cur else { break false };
+                    if hops > self.tracks.len() {
+                        break false;
+                    }
+                    if pid == track_id {
+                        break true;
+                    }
+                    cur = self.track_by_id(pid).and_then(|p| p.parent_group_id);
+                    hops += 1;
+                }
+            }
+        })
+    }
+
+    /// True if any ANCESTOR group of `track_id` (walked via `parent_group_id`,
+    /// excluding the track itself) is soloed. This is the **folder-solo** rule
+    /// shared by the audio engine and the video compositor: soloing a group
+    /// keeps its whole subtree audible / visible (Ableton / Reaper folder solo).
+    /// RT-safe (no heap / lock); hop-capped at `tracks.len()` for cycle safety.
+    pub fn ancestor_soloed(&self, track_id: u32) -> bool {
+        let mut cur = self.track_by_id(track_id).and_then(|t| t.parent_group_id);
+        let mut hops = 0usize;
+        while let Some(pid) = cur {
+            if hops > self.tracks.len() {
+                break;
+            }
+            let Some(t) = self.track_by_id(pid) else { break };
+            if t.solo {
+                return true;
+            }
+            cur = t.parent_group_id;
+            hops += 1;
+        }
+        false
+    }
+
     /// Allocate a fresh `ContentId`, bumping the song-level counter.
     pub fn alloc_content_id(&mut self) -> ContentId {
         let id = self.next_content_id.max(1);
@@ -2874,6 +2969,61 @@ mod tests {
     fn song_default_roundtrip() {
         let song = Song::default();
         assert_eq!(json_roundtrip(&song), song);
+    }
+
+    /// `track_visually_silenced` は audio engine の effective-mute と同じ意味論を
+    /// video 層に再現する: グループ親の mute は subtree を隠し、 solo は audio と
+    /// 一致 (グループを solo すると非 solo の子は隠れる / 子を solo すると親 group
+    /// は見える)。
+    #[test]
+    fn track_visually_silenced_mute_and_solo_semantics() {
+        // t10 = group, t11 = t10 の子, t12 = 独立。
+        let mk = |id: u32, parent: Option<u32>| Track {
+            id,
+            parent_group_id: parent,
+            ..Track::default()
+        };
+        let mut song = Song::default();
+        song.tracks = vec![mk(10, None), mk(11, Some(10)), mk(12, None)];
+
+        // baseline: 何も silenced でない。
+        assert!(!song.track_visually_silenced(11));
+        assert!(!song.track_visually_silenced(12));
+
+        // グループ (祖先) の mute が子を隠す。
+        song.track_by_id_mut(10).unwrap().muted = true;
+        assert!(song.track_visually_silenced(11), "child of muted group hidden");
+        assert!(!song.track_visually_silenced(12), "unrelated track unaffected");
+        song.track_by_id_mut(10).unwrap().muted = false;
+
+        // 自身の mute。
+        song.track_by_id_mut(12).unwrap().muted = true;
+        assert!(song.track_visually_silenced(12));
+        song.track_by_id_mut(12).unwrap().muted = false;
+
+        // leaf を solo: それだけ可視、 他は隠れる。
+        song.track_by_id_mut(12).unwrap().solo = true;
+        assert!(!song.track_visually_silenced(12), "soloed track visible");
+        assert!(song.track_visually_silenced(11), "non-soloed hidden under solo");
+        song.track_by_id_mut(12).unwrap().solo = false;
+
+        // グループを solo: 配下の子も可視 (folder solo、 Ableton/Reaper 準拠)。
+        song.track_by_id_mut(10).unwrap().solo = true;
+        assert!(!song.track_visually_silenced(10), "soloed group itself visible");
+        assert!(
+            !song.track_visually_silenced(11),
+            "child of soloed group visible (folder solo)"
+        );
+        assert!(song.track_visually_silenced(12), "unrelated hidden under solo");
+        assert!(song.ancestor_soloed(11), "child sees soloed ancestor group");
+        assert!(!song.ancestor_soloed(12), "unrelated has no soloed ancestor");
+        song.track_by_id_mut(10).unwrap().solo = false;
+
+        // 子を solo: その祖先 group は可視のまま (has_soloed_contributor 相当)。
+        song.track_by_id_mut(11).unwrap().solo = true;
+        assert!(!song.track_visually_silenced(11), "soloed child visible");
+        assert!(!song.track_visually_silenced(10), "ancestor of soloed child visible");
+        assert!(song.track_visually_silenced(12), "unrelated hidden under solo");
     }
 
     /// Regression test for sidechain pipeline: when `ensure_ids()` rewrites
