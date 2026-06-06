@@ -31,7 +31,7 @@ use daw_ui_renderer::{
     Color, GlyphArea, OffscreenRenderer, Rect, Scene, TextureHandle, TexturedQuad,
 };
 
-use crate::video_playback::{DecodedFrame, VideoPlaybackEngine};
+use crate::video_playback::VideoPlaybackEngine;
 
 /// Render configuration. All fields are derived from `Song` except
 /// `output_path` / `audio_wav_path` which the caller supplies from
@@ -199,10 +199,11 @@ pub fn render_mp4_cancellable(
         }
     }
 
-    // docs/plan_video_perf.md P3: export composites on the GPU but
-    // uses the CPU video decoder (= the shared-D3D11 zero-copy path
-    // belongs to the preview window's wgpu device, not ours).
-    let mut engine = VideoPlaybackEngine::new_cpu_only();
+    // In-process libav software decoder (docs/plan_video_export_libav.md
+    // Phase 3): decodes every source — incl. 10-bit H.264 / HEVC / AV1 — to
+    // BGRA8 with avcodec + swscale. Replaces the MF SW decode + ffmpeg.exe
+    // fallback, which silently dropped 10-bit video in the export's SW path.
+    let mut decoder = crate::libav_decoder::LibavVideoDecoder::new();
     let total_seconds = beat_to_seconds(cfg.song.length_beats, cfg.song.bpm);
     let total_frames = (total_seconds * f64::from(framerate)).ceil() as u64;
     let mut scene = Scene::new();
@@ -226,7 +227,7 @@ pub fn render_mp4_cancellable(
         build_frame_scene(
             cfg.song,
             cfg.project_dir,
-            &mut engine,
+            &mut decoder,
             &mut offscreen,
             &mut video_textures,
             &image_textures,
@@ -337,7 +338,7 @@ fn seconds_to_beat(seconds: f64, bpm: f32) -> f64 {
 fn build_frame_scene(
     song: &Song,
     project_dir: Option<&Path>,
-    engine: &mut VideoPlaybackEngine,
+    decoder: &mut crate::libav_decoder::LibavVideoDecoder,
     offscreen: &mut OffscreenRenderer,
     video_textures: &mut HashMap<VideoSourceId, (TextureHandle, u32, u32)>,
     image_textures: &HashMap<ImageSourceId, (TextureHandle, u32, u32)>,
@@ -353,43 +354,43 @@ fn build_frame_scene(
         else {
             continue;
         };
-        // Export uses `VideoPlaybackEngine::new_cpu_only()`, so the
-        // `slot_idx` (HW ring index) is unused — pass 0 as a stable
-        // placeholder. The engine returns `DecodedFrame::Bgra`.
-        let Ok(frame) =
-            engine.decode_at(layer.video_source_id, &path, layer.source_micros, 0)
-        else {
-            continue;
+        // In-process libav software decode (handles 10-bit H.264 / HEVC / AV1;
+        // no Media Foundation, no `ffmpeg.exe` subprocess). Decode errors are
+        // logged, not silently swallowed — a dropped frame would otherwise
+        // leave the video black with no diagnostic (the exact bug the old
+        // MF + ffmpeg.exe export path hit on 10-bit sources).
+        let frame = match decoder.decode_at(layer.video_source_id, &path, layer.source_micros) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(
+                    video_source_id = layer.video_source_id,
+                    source_micros = layer.source_micros,
+                    error = %e,
+                    "export: video decode failed; layer skipped"
+                );
+                continue;
+            }
         };
-        let DecodedFrame::Bgra { bgra, width, height } = &frame else {
-            // Defensive: if a Shared variant ever leaks from the
-            // CPU-only engine we skip the layer rather than try to
-            // import the D3D11 handle into our offscreen wgpu device.
-            tracing::warn!(
-                video_source_id = layer.video_source_id,
-                "export decoder returned non-CPU frame variant; layer skipped"
-            );
-            continue;
-        };
+        let (bgra, width, height) = (&frame.bgra, frame.width, frame.height);
         // Get-or-create the per-source BGRA texture, recreating when
         // the source dimensions change (= shouldn't, but defensive).
         let recreate = match video_textures.get(&layer.video_source_id) {
-            Some((_, w, h)) => *w != *width || *h != *height,
+            Some((_, w, h)) => *w != width || *h != height,
             None => true,
         };
         if recreate {
             if let Some((old, _, _)) = video_textures.remove(&layer.video_source_id) {
                 offscreen.destroy_texture(old);
             }
-            let handle = offscreen.create_texture_bgra(*width, *height);
-            video_textures.insert(layer.video_source_id, (handle, *width, *height));
+            let handle = offscreen.create_texture_bgra(width, height);
+            video_textures.insert(layer.video_source_id, (handle, width, height));
         }
         let texture = video_textures
             .get(&layer.video_source_id)
             .map(|(h, _, _)| *h)
             .expect("just inserted");
         offscreen.upload_texture_bgra(texture, bgra);
-        let (rx, ry, rw, rh) = aspect_fit(out_w, out_h, *width, *height);
+        let (rx, ry, rw, rh) = aspect_fit(out_w, out_h, width, height);
         scene.push_textured_quad(TexturedQuad {
             rect: Rect::new(rx as f32, ry as f32, rw as f32, rh as f32),
             texture,

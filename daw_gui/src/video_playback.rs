@@ -334,24 +334,6 @@ impl VideoPlaybackEngine {
         }
     }
 
-    /// Construct an engine that **never** tries to use the D3D11 HW
-    /// decoder + zero-copy path. Used by `render_video::render_mp4`
-    /// (= export), which composites frames on the CPU (`blit_layer` +
-    /// `rgba_to_nv12`) and so needs `DecodedFrame::Bgra` bytes back —
-    /// the `Shared` path would just dead-end (no `bgra` field). Skips
-    /// the `try_init_d3d11` call entirely so headless CI export
-    /// doesn't fail on missing GPU either.
-    pub fn new_cpu_only() -> Self {
-        Self {
-            readers: HashMap::new(),
-            d3d11: None,
-            // Pretend we already tried — this short-circuits the lazy
-            // init in `decode_at`.
-            d3d11_init_attempted: true,
-            ffmpeg_sources: HashMap::new(),
-        }
-    }
-
     /// Pure helper: walk the song bottom-up and return every video
     /// clip active at `playhead_beat`, with a per-event `alpha`
     /// derived from the clip's `fade_in_beats` / `fade_out_beats` (=
