@@ -5,7 +5,8 @@
 # session-internal transient files (PostToolUse / Stop hook が書き出す)。
 # session UUID が混ざるので glob で除外。
 /.claude/.session_events.*.log
-/.claude/.session_reflect_pending.md
+# pending reflection と、 SessionStart hook が mv で作る .last 消費済みマーカーの両方。
+/.claude/.session_reflect_pending.md*
 # in-process libav (rsmpeg) shared FFmpeg build (BtbN n7.1 lgpl-shared).
 # Too large for git; fetched per machine. See docs/plan_video_export_libav.md.
 /third_party/
