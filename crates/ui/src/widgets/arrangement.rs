@@ -8204,11 +8204,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 // しない (旧設計は button_at の closure 内で SelectTrack を emit していた)。
                 // M14 Phase 105 (#076): track 名 font は `style.track_text_size` に追従させる
                 // (汎用 button の 16px 固定では daw_01 が名前サイズを下げられないため)。
-                if self.button_at_clicked_sized(
+                // M14 Phase 107 (#079): track 名は常に左寄せ (Reaper / Cubase / Live と同じ。
+                // 先頭が識別に最重要、 省略時の左寄せとも一致)。 M/S/R toggle は中央寄せのまま。
+                if self.button_at_clicked_sized_aligned(
                     id_name,
                     &name_text,
                     name_rect_visible,
                     style.track_text_size,
+                    crate::widgets::button::ButtonTextAlign::Left,
                 ) {
                     clicked_track_for_select = Some(t.id);
                 }

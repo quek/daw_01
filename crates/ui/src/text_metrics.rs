@@ -21,6 +21,9 @@ pub struct TextMetrics {
     font_system: FontSystem,
     /// re-use する scratch buffer (毎呼び出しで `set_text` し直す)。
     scratch: Buffer,
+    /// 省略記号文字列。 描画フォントで `…` (U+2026) が実字形を持てば `"…"`、
+    /// 無ければ ASCII `"..."`。 初回 [`Self::ellipsis`] 呼び出し時に shape して 1 度だけ確定。
+    ellipsis: Option<&'static str>,
 }
 
 impl Default for TextMetrics {
@@ -41,7 +44,48 @@ impl TextMetrics {
         let mut font_system = FontSystem::new();
         // metrics は measure_advance で都度上書きするので、ここでは仮の小さい値で初期化。
         let scratch = Buffer::new(&mut font_system, Metrics::new(14.0, 16.8));
-        Self { font_system, scratch }
+        Self { font_system, scratch, ellipsis: None }
+    }
+
+    /// 省略記号として描画する文字列を返す。 描画フォント (`DEFAULT_FONT_FAMILY` +
+    /// cosmic-text の font fallback) で `…` (U+2026) が実字形 (= `.notdef` 以外) に
+    /// shape できれば `"…"`、 できなければ豆腐 (□) を避けて ASCII `"..."` を返す。
+    /// renderer 側 `GlyphPipeline` と同じ family / shaping で判定するので、 ここで
+    /// 実字形と判定したものは実描画でも豆腐にならない (Single Source of Truth)。
+    /// 結果は初回に 1 度だけ確定して cache する。
+    pub fn ellipsis(&mut self) -> &'static str {
+        if let Some(e) = self.ellipsis {
+            return e;
+        }
+        let resolved = if self.shapes_to_real_glyphs("…") { "…" } else { "..." };
+        self.ellipsis = Some(resolved);
+        resolved
+    }
+
+    /// `text` を描画フォントで shape し、 並んだ全 glyph が `.notdef` (glyph_id 0 = 豆腐)
+    /// 以外なら `true`。 空文字列は `false`。 `measure_advance` と同じ scratch / attrs を
+    /// 使うので、 ここで `true` の文字列は実描画でも同じ glyph に解決される。
+    fn shapes_to_real_glyphs(&mut self, text: &str) -> bool {
+        let metrics = Metrics::new(14.0, 16.8);
+        self.scratch.set_metrics(&mut self.font_system, metrics);
+        self.scratch.set_size(&mut self.font_system, None, Some(16.8));
+        let attrs = Attrs::new().family(Family::Name(DEFAULT_FONT_FAMILY));
+        self.scratch
+            .set_text(&mut self.font_system, text, &attrs, Shaping::Advanced, None);
+        self.scratch.shape_until_scroll(&mut self.font_system, false);
+        let mut any = false;
+        for run in self.scratch.layout_runs() {
+            for glyph in run.glyphs {
+                any = true;
+                // glyph_id 0 は OpenType/TrueType 仕様で常に `.notdef` (豆腐)。
+                // cosmic-text は HackGen に無ければ fallback font を試すので、 0 が残るのは
+                // システム上どのフォントにも字形が無い真の豆腐ケースだけ。
+                if glyph.glyph_id == 0 {
+                    return false;
+                }
+            }
+        }
+        any
     }
 
     /// `text` を `font_size` で shape し、最初の line の **末尾までの x advance** を返す。
@@ -104,5 +148,24 @@ mod tests {
         let big = m.measure_advance("hello", 28.0);
         // 同じ text なら font_size 大の方が advance も大きい (font 種別に依存しない普遍テスト)。
         assert!(big > small, "size 28 should be wider than 10: small={small} big={big}");
+    }
+
+    #[test]
+    fn ellipsis_resolves_to_renderable_string() {
+        // daw_01 #079: ellipsis は実字形を持つ文字列を返す ("…" か fallback "...")、
+        // どちらでも measure > 0 で豆腐ではない。 同じ結果を cache する。
+        let mut m = TextMetrics::new();
+        let e = m.ellipsis();
+        assert!(e == "…" || e == "...", "ellipsis は '…' か '...': got {e:?}");
+        assert!(m.measure_advance(e, 14.0) > 0.0, "ellipsis は実幅を持つ");
+        assert_eq!(m.ellipsis(), e, "2 回目も同じ結果 (cache)");
+    }
+
+    #[test]
+    fn ascii_text_shapes_to_real_glyphs() {
+        // sanity: 通常の ASCII は .notdef にならない (= 検出ロジックが真陽性を返す)。
+        let mut m = TextMetrics::new();
+        assert!(m.shapes_to_real_glyphs("abc"));
+        assert!(!m.shapes_to_real_glyphs(""), "空文字列は実字形なし");
     }
 }

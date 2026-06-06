@@ -228,10 +228,14 @@ impl DawModel {
             // 残り (3+) は top-level、 disclosure ▼/▶ + indent + collapsed 動作確認用。
             let parent_id = if ti == 1 || ti == 2 { Some(0_u32) } else { None };
             // M14 Phase 63k (#025) demo: audio clip を持つ track 3-5 は「Audio N」 と名付けて user が識別しやすく。
+            // M14 Phase 107 (#079) demo: track 6 は name 領域より明らかに長い名前にして、 ellipsis 省略
+            // (末尾 …、 左寄せ、 M/S/R に被らない) の動作を起動直後に確認できるようにする。
             let name = if ti == 0 {
                 "Group A".to_string()
             } else if (3..=5).contains(&ti) {
                 format!("Audio {}", ti - 2)
+            } else if ti == 6 {
+                "Lead Synth Bus (sidechained reverb send)".to_string()
             } else {
                 format!("Track {}", ti + 1)
             };

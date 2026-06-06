@@ -188,9 +188,16 @@ fn draw_toggle_button<M: ?Sized + 'static>(
     // (⟳ ▶ ⏱ ♩ 等) は ASCII proportional の `font_size * 0.55` approx より大幅に広いため、
     // approx で centering すると右ずれする (daw_01 #050)。 `measure_text` は scratch buffer
     // を使い回すので per-frame N 個 button でも cost は無視可能。
+    // rect 幅を超えるラベルは ellipsis 省略 + 左寄せ + clip (daw_01 #079)。 M/S/R 等
+    // 1 文字ラベルは収まるので Cow::Borrowed = 従来どおり中央寄せ・clip 無しで byte 互換。
     let line_h = style.font_size * 1.2;
-    let text_w = ui.measure_text(text, style.font_size);
-    let tx = rect.x + (rect.w - text_w).max(0.0) * 0.5;
+    let (display, text_w) = ui.fit_text_ellipsized(text, style.font_size, rect.w);
+    let truncated = matches!(display, std::borrow::Cow::Owned(_));
+    let tx = if truncated {
+        rect.x
+    } else {
+        rect.x + (rect.w - text_w).max(0.0) * 0.5
+    };
     let ty = rect.y + (rect.h - line_h).max(0.0) * 0.5;
     // value=true のとき on_text_color (Some) を優先、 None なら text_color に fallback
     // (daw_01 #051: metronome 黄背景 + 黒文字のような state-dependent text color)。
@@ -200,13 +207,13 @@ fn draw_toggle_button<M: ?Sized + 'static>(
         style.text_color
     };
     ui.push_text(GlyphArea {
-        text: text.into(),
+        text: display.as_ref().into(),
         left: tx,
         top: ty,
         font_size: style.font_size,
         line_height: line_h,
         color: text_color,
-        clip_rect: None,
+        clip_rect: truncated.then_some(rect),
         ..GlyphArea::default()
     });
 }
@@ -409,6 +416,46 @@ mod tests {
         let glyph = scene.iter_glyphs().next().expect("text should be pushed");
         // off では text_color (= 白 0.95) のはず。
         assert!((glyph.color.r - 0.95).abs() < 1e-6, "value=false で text_color");
+    }
+
+    #[test]
+    fn long_label_truncates_left_aligned_and_clipped_short_stays_centered() {
+        // daw_01 #079: rect 超えラベルは省略 + 左寄せ + clip。 M/S/R 等の 1 文字は
+        // 中央寄せ + clip None で byte 互換。
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 100 };
+        let style = ToggleButtonStyle { font_size: 11.0, ..ToggleButtonStyle::default() };
+        let rect = Rect { x: 10.0, y: 10.0, w: 40.0, h: 18.0 };
+
+        // (a) 長いラベル → 省略。
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.toggle_button_at("t", "RecordArmAllInputs", rect, false, &style, |_| {
+                Edit::mutate(|(): &mut ()| {})
+            });
+        });
+        let glyph = scene.iter_glyphs().next().expect("text pushed");
+        assert!((glyph.left - rect.x).abs() < 1e-3, "省略時は左寄せ");
+        assert_eq!(glyph.clip_rect, Some(rect), "省略時は clip Some");
+        assert!(
+            glyph.text.ends_with('…') || glyph.text.ends_with("..."),
+            "ellipsis 終端: {:?}",
+            glyph.text
+        );
+
+        // (b) 1 文字 "R" → 中央寄せ + clip None (byte 互換)。
+        scene.clear();
+        let mut measured = 0.0;
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            measured = ui.measure_text("R", style.font_size);
+            ui.toggle_button_at("t2", "R", rect, false, &style, |_| {
+                Edit::mutate(|(): &mut ()| {})
+            });
+        });
+        let g2 = scene.iter_glyphs().next().expect("text pushed");
+        let expected_left = rect.x + (rect.w - measured) * 0.5;
+        assert!((g2.left - expected_left).abs() < 1e-3, "短ラベルは中央寄せ");
+        assert_eq!(g2.clip_rect, None, "短ラベルは clip None (byte 互換)");
     }
 
     #[test]

@@ -89,6 +89,7 @@ pub use widgets::reorderable_list::{
 pub use widgets::scrubable_number::{
     ScrubableNumberFormat, ScrubableNumberResponse, ScrubableNumberStyle,
 };
+pub use widgets::button::ButtonTextAlign;
 pub use widgets::text_input::TextInputResponse;
 pub use widgets::toggle_button::{ToggleButtonResponse, ToggleButtonStyle};
 pub use widgets::waveform::{

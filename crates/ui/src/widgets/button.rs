@@ -15,6 +15,16 @@ use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
 use crate::ui::{Ui, lerp_color};
 
+/// rect 内のテキスト水平揃え (`button_at_clicked_sized_aligned` 用)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ButtonTextAlign {
+    /// 中央寄せ。 汎用 `button` / menu / dialog の既定。
+    Center,
+    /// 左寄せ (`tx = rect.x`)。 track 名など先頭が識別に最重要なラベル用
+    /// (Reaper / Cubase / Live のトラック名と同じ)。 省略時の左寄せとも一致する。
+    Left,
+}
+
 /// button の永続状態。
 #[derive(Debug, Default)]
 pub(crate) struct ButtonState {
@@ -71,6 +81,24 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         rect: Rect,
         font_size: f32,
     ) -> bool {
+        self.button_at_clicked_sized_aligned(id, text, rect, font_size, ButtonTextAlign::Center)
+    }
+
+    /// `button_at_clicked_sized` のテキスト水平揃え可変版。 click 判定・外観は同一で、
+    /// 収まるテキストの揃えだけを指定する。 `Center` は従来どおり (byte 互換)、 `Left` は
+    /// `tx = rect.x` で左寄せ (track 名のように先頭が識別に最重要なラベル用、 daw_01 #079)。
+    ///
+    /// 省略 (ellipsis) が発生したテキストは align に関係なく**常に左寄せ + clip** になる
+    /// (先頭を残すのが ellipsis の意味。 `Left` は「収まる時も左」 を足すだけ)。
+    #[must_use]
+    pub fn button_at_clicked_sized_aligned(
+        &mut self,
+        id: impl std::hash::Hash,
+        text: &str,
+        rect: Rect,
+        font_size: f32,
+        align: ButtonTextAlign,
+    ) -> bool {
         let wid = WidgetId::ROOT.child((b"button", &id));
         let pointer = self.pointer;
         let inside = pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
@@ -106,6 +134,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             inside,
             visual_pressed,
             font_size.to_bits(),
+            align as u8,
         ));
         self.with_widget_node(wid, input_hash, |ui| {
             let base = Color::rgb(0.18, 0.20, 0.26);
@@ -132,18 +161,32 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // テキストを矩形中央付近に (cosmic-text 経由の実 advance ベース)。
             // Nerd Font の wide glyph (⟳ ▶ ⏱ ♩ 等) は固定 9px / 文字 approx より広く、
             // approx で centering すると右ずれする (daw_01 #050)。
+            // rect 幅を超えるラベル (例: 長い track 名) は ellipsis 省略 + 左寄せ + clip で
+            // rect 外へはみ出させない (daw_01 #079)。 収まるテキストは Cow::Borrowed で
+            // align に従う (Center は byte 完全互換、 Left は track 名用に左寄せ)。
+            // Left は左マージン 4px を空ける (clip 名の left inset と同じ、 文字が rect 左端に
+            // 張り付かない)。 省略幅も pad 分を差し引くので末尾 … も右端で余白を持つ。
             let line_h = font_size * 1.2;
-            let text_w = ui.measure_text(text, font_size);
-            let tx = rect.x + (rect.w - text_w).max(0.0) * 0.5;
+            let left_pad = if align == ButtonTextAlign::Left { 4.0 } else { 0.0 };
+            let avail_w = (rect.w - left_pad).max(1.0);
+            let (display, text_w) = ui.fit_text_ellipsized(text, font_size, avail_w);
+            let truncated = matches!(display, std::borrow::Cow::Owned(_));
+            // 左寄せ位置: Left は rect.x + pad、 Center は省略時のみ flush 左寄せ (従来どおり)、
+            // 収まる時は中央寄せ。
+            let tx = match align {
+                ButtonTextAlign::Left => rect.x + left_pad,
+                ButtonTextAlign::Center if truncated => rect.x,
+                ButtonTextAlign::Center => rect.x + (rect.w - text_w).max(0.0) * 0.5,
+            };
             let ty = rect.y + (rect.h - line_h).max(0.0) * 0.5;
             ui.push_text(GlyphArea {
-                text: text.into(),
+                text: display.as_ref().into(),
                 left: tx,
                 top: ty,
                 font_size,
                 line_height: line_h,
                 color: Color::rgb(0.95, 0.95, 0.97),
-                clip_rect: None,
+                clip_rect: truncated.then_some(rect),
                 ..GlyphArea::default()
             });
         });
@@ -313,6 +356,180 @@ mod tests {
             "default button must stay 16px: got {}",
             glyph.font_size
         );
+    }
+
+    #[test]
+    fn fit_text_ellipsized_borrows_when_fits_and_truncates_when_overflow() {
+        // daw_01 #079: 収まる text は Cow::Borrowed + 実幅、 超える text は Cow::Owned +
+        // max_w 以下の幅で末尾 ellipsis。
+        use std::borrow::Cow;
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let font = 12.0_f32;
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            // (a) 収まる: Borrowed + 幅 = measure(full)。
+            let full_w = ui.measure_text("Hi", font);
+            let (d, w) = ui.fit_text_ellipsized("Hi", font, 200.0);
+            assert!(matches!(d, Cow::Borrowed(_)), "収まる text は Borrowed");
+            assert_eq!(d.as_ref(), "Hi");
+            assert!((w - full_w).abs() < 1e-3, "Borrowed の幅は measure(full) と一致");
+
+            // (b) 超える: Owned + max_w 以下 + ellipsis 終端 + full より短い幅。
+            let long = "VeryLongTrackNameThatOverflows";
+            let long_full = ui.measure_text(long, font);
+            let max_w = 60.0_f32;
+            assert!(long_full > max_w, "前提: full は max_w を超える");
+            let (d2, w2) = ui.fit_text_ellipsized(long, font, max_w);
+            assert!(matches!(d2, Cow::Owned(_)), "超える text は Owned");
+            assert!(w2 <= max_w + 0.5, "省略幅 {w2} は max_w {max_w} 以下");
+            assert!(w2 < long_full, "省略幅は full より狭い");
+            assert!(
+                d2.ends_with('…') || d2.ends_with("..."),
+                "末尾は ellipsis: got {d2:?}"
+            );
+            assert!(d2.as_ref() != long, "文字列が短縮されている");
+
+            // (c) ellipsis すら入らない極小 max_w: ellipsis のみ。
+            let (d3, _) = ui.fit_text_ellipsized(long, font, 1.0);
+            assert!(matches!(d3, Cow::Owned(_)));
+            assert!(d3.as_ref() == "…" || d3.as_ref() == "...", "極小幅は ellipsis のみ: {d3:?}");
+        });
+    }
+
+    #[test]
+    fn button_long_text_truncates_left_aligned_and_clipped() {
+        // daw_01 #079: rect に収まらない長い track 名は省略 + 左寄せ + clip_rect で
+        // M/S/R へはみ出させない。
+        let font = 12.0_f32;
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let rect = Rect { x: 20.0, y: 30.0, w: 50.0, h: 18.0 };
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            let _ = ui.button_at_clicked_sized(
+                "btn",
+                "VeryLongTrackNameThatOverflowsTheNameArea",
+                rect,
+                font,
+            );
+        });
+
+        // 次フレームで scene を再借用するので、 必要な値を先に owned で退避。
+        let (glyph_left, glyph_clip, glyph_text) = {
+            let glyph = scene.iter_glyphs().next().expect("text should be pushed");
+            (glyph.left, glyph.clip_rect, glyph.text.to_string())
+        };
+        assert!(
+            (glyph_left - rect.x).abs() < 1e-3,
+            "省略時は左寄せ (left == rect.x): got {glyph_left}"
+        );
+        assert_eq!(glyph_clip, Some(rect), "省略時は clip_rect = Some(rect)");
+        assert!(
+            glyph_text.ends_with('…') || glyph_text.ends_with("..."),
+            "省略名は ellipsis 終端: {glyph_text:?}"
+        );
+        // 描画文字列の実幅は rect.w を超えない (clip 前提の overshoot を最小化)。
+        let mut w = 0.0;
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            w = ui.measure_text(&glyph_text, font);
+        });
+        assert!(w <= rect.w + 0.5, "省略名の幅 {w} は rect.w {} 以下", rect.w);
+    }
+
+    #[test]
+    fn button_short_text_stays_centered_without_clip() {
+        // byte 互換: 収まる短ラベルは従来どおり中央寄せ + clip_rect None。
+        let font = 12.0_f32;
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let rect = Rect { x: 20.0, y: 30.0, w: 100.0, h: 24.0 };
+
+        let mut measured = 0.0;
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            measured = ui.measure_text("Drums", font);
+            let _ = ui.button_at_clicked_sized("btn", "Drums", rect, font);
+        });
+
+        let glyph = scene.iter_glyphs().next().expect("text should be pushed");
+        let expected_left = rect.x + (rect.w - measured) * 0.5;
+        assert!(
+            (glyph.left - expected_left).abs() < 1e-3,
+            "収まる text は中央寄せ: expected {expected_left}, got {}",
+            glyph.left
+        );
+        assert_eq!(glyph.clip_rect, None, "収まる text は clip_rect None (byte 互換)");
+    }
+
+    #[test]
+    fn button_left_align_keeps_fitting_text_at_left_margin_without_clip() {
+        // daw_01 #079: ButtonTextAlign::Left は収まるテキストも左寄せ (track 名用)。
+        // 左マージン 4px を空ける (rect 左端に張り付かない)。 省略は起きないので clip 無し。
+        use crate::widgets::button::ButtonTextAlign;
+        let font = 12.0_f32;
+        let left_pad = 4.0_f32;
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let rect = Rect { x: 25.0, y: 30.0, w: 120.0, h: 20.0 };
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            let _ = ui.button_at_clicked_sized_aligned(
+                "btn",
+                "Drums",
+                rect,
+                font,
+                ButtonTextAlign::Left,
+            );
+        });
+
+        let glyph = scene.iter_glyphs().next().expect("text should be pushed");
+        assert!(
+            (glyph.left - (rect.x + left_pad)).abs() < 1e-3,
+            "Left align は rect.x + 左マージン: expected {}, got {}",
+            rect.x + left_pad,
+            glyph.left
+        );
+        assert_eq!(glyph.clip_rect, None, "収まる時は clip None");
+    }
+
+    #[test]
+    fn button_left_align_long_text_truncates_within_margin() {
+        // Left + 長名: rect.x + pad 起点で省略 + clip、 描画幅は rect.w - pad 以下
+        // (= 右端にも pad 相当の余白が残り、 文字が rect 両端に張り付かない)。
+        use crate::widgets::button::ButtonTextAlign;
+        let font = 12.0_f32;
+        let left_pad = 4.0_f32;
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let rect = Rect { x: 25.0, y: 30.0, w: 60.0, h: 18.0 };
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            let _ = ui.button_at_clicked_sized_aligned(
+                "btn",
+                "VeryLongTrackNameThatOverflows",
+                rect,
+                font,
+                ButtonTextAlign::Left,
+            );
+        });
+
+        let (gleft, gclip, gtext) = {
+            let g = scene.iter_glyphs().next().expect("text pushed");
+            (g.left, g.clip_rect, g.text.to_string())
+        };
+        assert!((gleft - (rect.x + left_pad)).abs() < 1e-3, "Left 省略も rect.x + pad 起点");
+        assert_eq!(gclip, Some(rect), "省略時は clip Some(rect)");
+        assert!(gtext.ends_with('…') || gtext.ends_with("..."), "ellipsis 終端: {gtext:?}");
+        let mut w = 0.0;
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            w = ui.measure_text(&gtext, font);
+        });
+        assert!(w <= rect.w - left_pad + 0.5, "省略幅 {w} は rect.w - pad 以下");
     }
 
     #[test]

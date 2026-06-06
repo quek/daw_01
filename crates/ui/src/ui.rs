@@ -9,6 +9,7 @@
 //! for e in edits { e.apply(&mut model); }
 //! ```
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::PathBuf;
@@ -1589,6 +1590,73 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 同じ system fonts を読むので shape 結果は一致する (キャッシュは別)。
     pub fn measure_text(&mut self, text: &str, font_size: f32) -> f32 {
         self.text_metrics.measure_advance(text, font_size)
+    }
+
+    /// `text` を `font_size` で描画したとき幅 `max_w` を超えるなら、 末尾を ellipsis
+    /// (`…`、 描画フォントに字形が無ければ ASCII `...`) で省略して `(描画文字列, 実描画幅)`
+    /// を返す。 収まる場合は元の文字列 (`Cow::Borrowed`) と実幅をそのまま返すので、 短い
+    /// ラベルは **byte 完全互換** (= 既存 caller の外観不変)。 省略時のみ `Cow::Owned` を返す。
+    ///
+    /// 「widget は自分の rect 境界に責任を持つ」 を 1 箇所で保証するための共有 helper
+    /// (daw_01 #079: 長い track 名が name 領域を越えて M/S/R ボタンの隙間から覗く bug)。
+    /// `button_at_clicked_sized` / `toggle_button_at` から呼ばれ、 rect 幅より広いラベルを
+    /// 渡す将来の caller も自動で守られる。
+    ///
+    /// prefix の探索は char 境界単位の二分探索で `measure_text(prefix + ellipsis) <= max_w`
+    /// を満たす最長 prefix を選ぶ (cosmic-text の実 advance ベースなので wide glyph でも正しい)。
+    /// 返り値の Cow が `Owned` か否かで caller は「省略されたか」 を判定できる
+    /// (省略時は左寄せ + `clip_rect` を付ける等)。
+    pub(crate) fn fit_text_ellipsized<'t>(
+        &mut self,
+        text: &'t str,
+        font_size: f32,
+        max_w: f32,
+    ) -> (Cow<'t, str>, f32) {
+        let full_w = self.measure_text(text, font_size);
+        if full_w <= max_w || text.is_empty() {
+            return (Cow::Borrowed(text), full_w);
+        }
+        let ellipsis = self.text_metrics.ellipsis();
+        let ellipsis_w = self.measure_text(ellipsis, font_size);
+        // max_w が ellipsis すら入らないほど狭い: prefix 0 文字 = ellipsis のみ。
+        // (描画側の clip_rect が最終的な overshoot を抑える。)
+        if ellipsis_w >= max_w {
+            return (Cow::Owned(ellipsis.to_owned()), ellipsis_w);
+        }
+        // char 境界の byte offset 列 (0..=len)。空 prefix (offset 0) = ellipsis のみは必ず収まる
+        // (上で ellipsis_w < max_w を確認済)。
+        let boundaries: Vec<usize> = text
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(text.len()))
+            .collect();
+        // `measure(prefix + ellipsis) <= max_w` を満たす最長 prefix を二分探索する。
+        // **prefix 単独でなく合成文字列を測る**ので、 prefix 末尾と ellipsis の接合部 kerning も
+        // 制約に織り込まれ、 採用した候補の描画幅は必ず max_w 以下になる (overshoot を原理的に排除、
+        // daw_01 #079 review 指摘)。 prefix が長いほど合成幅も増える単調性を仮定し、 kerning 由来の
+        // 微小逆転が残っても「採用は必ず収まる候補のみ」 なので最終幅は max_w を超えない。
+        let mut lo = 0usize;
+        let mut hi = boundaries.len() - 1;
+        let mut best = 0usize;
+        let mut best_w = ellipsis_w;
+        while lo <= hi {
+            let mid = usize::midpoint(lo, hi);
+            let mut candidate = String::from(&text[..boundaries[mid]]);
+            candidate.push_str(ellipsis);
+            let w = self.measure_text(&candidate, font_size);
+            if w <= max_w {
+                best = mid;
+                best_w = w;
+                lo = mid + 1;
+            } else if mid == 0 {
+                break;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let mut display = String::from(&text[..boundaries[best]]);
+        display.push_str(ellipsis);
+        (Cow::Owned(display), best_w)
     }
 
     /// text_input 等の typing widget が focus 中に呼ぶ。修飾なし shortcut (Space 等) を
