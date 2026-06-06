@@ -73,6 +73,13 @@ unsafe impl Sync for SendHandle {}
 /// presenting this frame.
 pub const PREVIEW_RING_SIZE: usize = 6;
 
+/// Default forward-walk budget (µs) for `decode_at`: a target within this
+/// window of the last-decoded frame is reached by `ReadSample`-ing forward
+/// (cheap) rather than seeking. Ring slot 0 always uses this; slots 1..N may
+/// pass a larger budget so a low-fps source (step > this) forward-walks the
+/// single frame from the previous slot instead of re-seeking per slot.
+pub const DEFAULT_FORWARD_BUDGET_MICROS: u64 = 100_000;
+
 /// One decoded frame, ready for the main thread to push into the
 /// preview scene. Two underlying paths:
 ///
@@ -495,6 +502,7 @@ impl VideoPlaybackEngine {
         source_path: &Path,
         target_micros: u64,
         slot_idx: u8,
+        forward_budget_micros: u64,
     ) -> Result<DecodedFrame, String> {
         if self.libav_fallback_ids.contains(&video_source_id) {
             // The libav fallback is CPU/BGRA; the runner collapses every ring
@@ -509,7 +517,13 @@ impl VideoPlaybackEngine {
                 .decode_at(video_source_id, source_path, target_micros)?;
             return Ok(DecodedFrame::Bgra { width: f.width, height: f.height, bgra: f.bgra });
         }
-        match self.decode_at_mf(video_source_id, source_path, target_micros, slot_idx) {
+        match self.decode_at_mf(
+            video_source_id,
+            source_path,
+            target_micros,
+            slot_idx,
+            forward_budget_micros,
+        ) {
             Ok(frame) => Ok(frame),
             Err(mf_err) => {
                 // MF can't decode this codec/profile (e.g. 10-bit High10).
@@ -563,6 +577,7 @@ impl VideoPlaybackEngine {
         source_path: &Path,
         target_micros: u64,
         slot_idx: u8,
+        forward_budget_micros: u64,
     ) -> Result<DecodedFrame, String> {
         // docs/plan_video_perf.md P1: lazy-init D3D11 + IMFDXGIDeviceManager
         // on the first decode. Once attempted, never retry — even if it
@@ -607,13 +622,15 @@ impl VideoPlaybackEngine {
             }
         };
 
-        // Decide whether to seek. Forward-step within ~100ms = keep
-        // ReadSample-ing (cheap). Backward or large jump = seek.
-        const FORWARD_BUDGET_MICROS: u64 = 100_000;
+        // Decide whether to seek. Forward-step within `forward_budget_micros`
+        // = keep ReadSample-ing (cheap). Backward or larger jump = seek.
+        // Caller picks the budget per ring slot (slot 0 = default ~100ms,
+        // slots 1..N = larger so low-fps sources forward-walk instead of
+        // re-seeking each slot).
         let should_seek = match entry.last_decoded_micros {
             None => true,
             Some(last) if target_micros < last => true,
-            Some(last) if target_micros.saturating_sub(last) > FORWARD_BUDGET_MICROS => {
+            Some(last) if target_micros.saturating_sub(last) > forward_budget_micros => {
                 true
             }
             Some(_) => false,
@@ -1530,7 +1547,7 @@ mod tests {
         let mut engine = VideoPlaybackEngine::new();
         // Decode the frame at 1 second (= middle of the clip).
         let frame = engine
-            .decode_at(42, &mp4, 1_000_000, 0)
+            .decode_at(42, &mp4, 1_000_000, 0, DEFAULT_FORWARD_BUDGET_MICROS)
             .expect("decode_at @ 1s");
         assert_eq!(frame.width(), 320);
         assert_eq!(frame.height(), 240);
@@ -1556,7 +1573,7 @@ mod tests {
         // existing reader and just ReadSample forward — verified
         // implicitly by the result being a valid frame (no error).
         let frame2 = engine
-            .decode_at(42, &mp4, 1_050_000, 0)
+            .decode_at(42, &mp4, 1_050_000, 0, DEFAULT_FORWARD_BUDGET_MICROS)
             .expect("decode_at @ 1.05s (forward step)");
         assert_eq!(frame2.width(), 320);
         assert_eq!(frame2.height(), 240);
@@ -1564,7 +1581,7 @@ mod tests {
         // Backward seek: decode at 0.3s. Engine should SetCurrentPosition
         // back to a keyframe and re-walk. Same validity check.
         let frame3 = engine
-            .decode_at(42, &mp4, 300_000, 0)
+            .decode_at(42, &mp4, 300_000, 0, DEFAULT_FORWARD_BUDGET_MICROS)
             .expect("decode_at @ 0.3s (backward seek)");
         assert_eq!(frame3.width(), 320);
         assert_eq!(frame3.height(), 240);

@@ -129,6 +129,7 @@ pub fn fill_pd_param_events(
     bpm: f32,
     playhead: u64,
     frames: u32,
+    recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
 ) {
     if frames == 0 || bpm <= 0.0 || sample_rate == 0 {
         return;
@@ -143,6 +144,19 @@ pub fn fill_pd_param_events(
     let beat = playhead as f64 / samples_per_beat;
     for lane in &track.automation_lanes {
         if !lane.enabled {
+            continue;
+        }
+        // Phase 4 Step C-2 (plugin param 版): recording 中 (Touch/Latch/Write)
+        // の lane は curve eval を skip する。 これで plugin が自身の GUI で
+        // 持っている値 (= ユーザのノブ操作) を host が curve で毎バッファ
+        // 上書きするのを止め、「you hear what you do」 を成立させる。 track
+        // builtin Volume/Pan の `fill_track_param_ramps` と同じ仕組みだが、
+        // 旧実装は plugin param 側にこの skip が無く、 write が read のまま /
+        // touch が半分しか効かないバグだった。
+        if recording_lanes
+            .iter()
+            .any(|(t, tg)| *t == track_id && *tg == lane.target)
+        {
             continue;
         }
         let param_id = match &lane.target {
@@ -435,5 +449,73 @@ mod tests {
         for &v in vol.iter() {
             assert!((v - 0.5).abs() < 0.001, "expected curve eval (0.5), got {}", v);
         }
+    }
+
+    /// One track (id 7) with a single `PluginParam` (Instrument, param 5)
+    /// automation lane ramping 0.25 → 0.75 over beats 0..4.
+    fn one_plugin_param_lane_song() -> Song {
+        let mut song = Song {
+            bpm: 120.0,
+            ..Song::default()
+        };
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Automation(AutomationContent {
+                points: vec![
+                    AutomationPoint { time_beat: 0.0, value: 0.25, curve: AutomationCurve::Linear },
+                    AutomationPoint { time_beat: 4.0, value: 0.75, curve: AutomationCurve::Linear },
+                ],
+            }),
+        );
+        let target = AutomationTarget::PluginParam { slot: PluginSlot::Instrument, param_id: 5 };
+        let lane = AutomationLane {
+            id: 1,
+            clips: vec![AutomationClip {
+                id: 1,
+                name: "p".into(),
+                start_beat: 0.0,
+                length_beats: 4.0,
+                content_id: cid,
+            }],
+            next_clip_id: 2,
+            ..AutomationLane::new(target, 0.5)
+        };
+        song.tracks.push(Track {
+            id: 7,
+            name: "T".into(),
+            automation_lanes: vec![lane],
+            next_lane_id: 2,
+            ..Track::default()
+        });
+        song
+    }
+
+    /// Phase 4 Step C-2 (plugin param 版) 回帰: recording 中 (Touch/Latch/Write)
+    /// の plugin-param lane は curve eval を skip し、 plugin が GUI で持つ値を
+    /// host が上書きしない。 旧実装は skip が無く write が read のままだった。
+    #[test]
+    fn fill_pd_param_events_skips_recording_lanes() {
+        let song = one_plugin_param_lane_song();
+        let track_id = 7;
+        let target = AutomationTarget::PluginParam { slot: PluginSlot::Instrument, param_id: 5 };
+
+        // Not recording: the curve value is pushed as a ParamValue event (read).
+        let mut pd = ProcessData::empty();
+        let empty = empty_recording_lanes();
+        fill_pd_param_events(
+            &mut pd, &song, track_id, PluginSlot::Instrument, SR, 120.0, 0, 64, &empty,
+        );
+        assert_eq!(pd.n_events_in, 1, "read mode must push the curve value");
+
+        // Recording: the lane is skipped, so no curve event overwrites the
+        // plugin's live GUI value.
+        let mut pd2 = ProcessData::empty();
+        let mut rec = std::collections::HashSet::new();
+        rec.insert((track_id, target));
+        fill_pd_param_events(
+            &mut pd2, &song, track_id, PluginSlot::Instrument, SR, 120.0, 0, 64, &rec,
+        );
+        assert_eq!(pd2.n_events_in, 0, "recording lane curve must be suppressed");
     }
 }

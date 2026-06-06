@@ -68,7 +68,9 @@ use common::model::VideoSourceId;
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 
-use crate::video_playback::{DecodedFrame, PREVIEW_RING_SIZE, VideoPlaybackEngine};
+use crate::video_playback::{
+    DEFAULT_FORWARD_BUDGET_MICROS, DecodedFrame, PREVIEW_RING_SIZE, VideoPlaybackEngine,
+};
 
 #[derive(Clone)]
 struct PendingRequest {
@@ -270,7 +272,24 @@ fn worker_loop(
                 let slot_idx = i as u8;
                 let target =
                     req.center_target_micros.saturating_add((i as u64) * req.step_micros);
-                match engine.decode_at(source_id, &req.source_path, target, slot_idx) {
+                // slot 0 keeps the default seek budget. Slots 1..N allow a
+                // forward-walk from the previous slot (which is `step_micros`
+                // behind) instead of re-seeking — this only changes behaviour
+                // for low-fps sources where `step_micros` > default budget
+                // (fps < ~10); for normal fps `step <= default` so the budget
+                // stays the default and decode behaviour is unchanged.
+                let forward_budget = if i == 0 {
+                    DEFAULT_FORWARD_BUDGET_MICROS
+                } else {
+                    req.step_micros.max(DEFAULT_FORWARD_BUDGET_MICROS)
+                };
+                match engine.decode_at(
+                    source_id,
+                    &req.source_path,
+                    target,
+                    slot_idx,
+                    forward_budget,
+                ) {
                     Ok(frame) => ring_slots.push(RingSlot {
                         target_micros: target,
                         frame,

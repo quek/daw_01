@@ -1385,23 +1385,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 TEXT_DIM,
             );
         } else {
-            // 各 singer の各 style を 1 entry に flatten。
-            // 「<キャラ名> - <スタイル名>」 を表示、 selected_idx は speaker_id 一致で決定。
-            // entries は picked → (id, style_name) の逆引き用。表示ラベルは labels
-            // に直接 format して持つ (style_name はここで 1 度だけ clone)。
-            // TODO(gui_01): dropdown は閉時でも items: &[&str] 全体を要求するため
-            // (len() + open 時の popup 描画)、 labels の format! を毎フレーム避けられない。
-            // selected ラベルのみ生成する lazy-items dropdown API が gui_01 側に必要。
-            let mut entries: Vec<(u32, String)> = Vec::new();
-            let mut labels: Vec<String> = Vec::new();
-            for s in &app.singers {
-                for st in &s.styles {
-                    labels.push(format!("{} - {}", s.name, st.name));
-                    entries.push((st.id, st.name.clone()));
-                }
-            }
-            let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-            let selected_idx = entries
+            // entries (= (id, style_name) 逆引き) と labels (=「<キャラ> -
+            // <スタイル>」) は `singers` 投入時に AppData 側で 1 度キャッシュ
+            // 済み (`SingersLoaded`)。 ここでは毎フレーム format!/clone せず、
+            // cache から &str refs を集めるだけ (= heap 確保 1 回、format 0 回)。
+            let label_refs: Vec<&str> =
+                app.vocal_speaker_labels.iter().map(String::as_str).collect();
+            let selected_idx = app
+                .vocal_speaker_entries
                 .iter()
                 .position(|(id, _)| *id == *speaker_id)
                 .unwrap_or(0);
@@ -1410,7 +1401,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 dropdown_rect,
                 &label_refs,
                 selected_idx,
-            ) && let Some((id, style_name)) = entries.get(picked)
+            ) && let Some((id, style_name)) = app.vocal_speaker_entries.get(picked)
             {
                 let track_idx = cursor_idx.unwrap_or(0) as u32;
                 let new_id = *id;

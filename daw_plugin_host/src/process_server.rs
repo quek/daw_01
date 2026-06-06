@@ -49,7 +49,7 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 use anyhow::Result;
@@ -109,6 +109,169 @@ impl DispatchCounter {
     }
 }
 
+/// per-worker param-event ring の容量。 plugin GUI で knob をドラッグした
+/// ときだけ埋まる。 1024 もあれば 1 buffer 分の gesture を取りこぼさない。
+const PARAM_RING_CAP: usize = 1024;
+
+/// plugin-GUI 発の param event の種別。 `PluginEvent` の touch/value/release を
+/// RT 経路で alloc せず ring に詰めるための flat tag (enum 変換は drain 側)。
+#[derive(Clone, Copy)]
+enum RtParamKind {
+    Touch,
+    Value,
+    Release,
+}
+
+/// RT worker → drain thread に運ぶ param event 1 件。 `Copy` なので ring の
+/// 固定 slot にそのまま書ける (heap なし)。
+#[derive(Clone, Copy)]
+struct RtParamEvent {
+    kind: RtParamKind,
+    track: u32,
+    slot: common::protocol::PluginSlot,
+    plugin_id: u32,
+    param_id: u32,
+    value: f64,
+}
+
+impl Default for RtParamEvent {
+    fn default() -> Self {
+        Self {
+            kind: RtParamKind::Touch,
+            track: 0,
+            slot: common::protocol::PluginSlot::Instrument,
+            plugin_id: 0,
+            param_id: 0,
+            value: 0.0,
+        }
+    }
+}
+
+/// 固定長 lock-free SPSC ring。 producer = 単一 RT worker thread、 consumer =
+/// 単一 drain thread。 RT 側 `push` は「書くだけ」 (alloc/lock/syscall なし、
+/// 満杯時は drop)。 worker 1 本につき 1 ring を持つので producer は常に 1 つ、
+/// SPSC で十分。 旧実装は RT worker から tokio unbounded mpsc に send して
+/// いて block 境界跨ぎで heap alloc していた (code review 2026-06-06 #10)。
+struct ParamEventRing {
+    buf: Box<[std::cell::UnsafeCell<RtParamEvent>]>,
+    /// consumer が次に読む通し index (mod cap で slot)。
+    head: AtomicUsize,
+    /// producer が次に書く通し index。
+    tail: AtomicUsize,
+    cap: usize,
+}
+
+// SAFETY: SPSC 規律 — producer は tail のみ、 consumer は head のみ進め、
+// `head == tail` (空) / `tail - head == cap` (満杯) を atomic で判定するので、
+// producer と consumer が同一 slot に同時アクセスすることはない。 RtParamEvent
+// は `Copy` (内部に参照/ポインタを持たない)。
+unsafe impl Sync for ParamEventRing {}
+
+impl ParamEventRing {
+    fn new(cap: usize) -> Self {
+        let buf = (0..cap)
+            .map(|_| std::cell::UnsafeCell::new(RtParamEvent::default()))
+            .collect();
+        Self {
+            buf,
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            cap,
+        }
+    }
+
+    /// producer (RT worker) 専用。 満杯なら `false` を返して drop する
+    /// (= alloc しない)。 RT-safe。
+    fn push(&self, ev: RtParamEvent) -> bool {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        if tail.wrapping_sub(head) >= self.cap {
+            return false;
+        }
+        // SAFETY: この slot (`tail % cap`) は head..tail の外 = consumer が
+        // 読まない未使用領域。 producer は単一なので排他。
+        unsafe {
+            *self.buf[tail % self.cap].get() = ev;
+        }
+        // Release: 上の書き込みを consumer の Acquire load(tail) から可視化。
+        self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    /// consumer (drain thread) 専用。
+    fn pop(&self) -> Option<RtParamEvent> {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        if head == tail {
+            return None;
+        }
+        // SAFETY: head < tail なので この slot は producer が書き終えて tail を
+        // Release で進めた後。 consumer は単一なので排他。
+        let ev = unsafe { *self.buf[head % self.cap].get() };
+        self.head.store(head.wrapping_add(1), Ordering::Release);
+        Some(ev)
+    }
+}
+
+/// `RtParamEvent` を IPC 用 `PluginEvent` へ変換 (drain thread = 非RT で実行)。
+fn rt_param_to_event(ev: RtParamEvent) -> crate::PluginEvent {
+    match ev.kind {
+        RtParamKind::Touch => crate::PluginEvent::PluginParamTouched {
+            track: ev.track,
+            slot: ev.slot,
+            plugin_id: ev.plugin_id,
+            param_id: ev.param_id,
+        },
+        RtParamKind::Value => crate::PluginEvent::PluginParamValueChanged {
+            track: ev.track,
+            slot: ev.slot,
+            plugin_id: ev.plugin_id,
+            param_id: ev.param_id,
+            value: ev.value,
+        },
+        RtParamKind::Release => crate::PluginEvent::PluginParamGestureEnd {
+            track: ev.track,
+            slot: ev.slot,
+            plugin_id: ev.plugin_id,
+            param_id: ev.param_id,
+        },
+    }
+}
+
+/// drain thread 本体: 全 worker ring を 2ms 間隔で poll し、 拾った param
+/// event を `evt_tx` (tokio、 非RT) へ流す。 worker は `shutdown` 前に join
+/// されるので、 shutdown 観測時には全 event が ring に揃っており、 最終 drain
+/// で取りこぼさない。
+fn run_param_drain(
+    rings: Vec<Arc<ParamEventRing>>,
+    evt_tx: tokio::sync::mpsc::UnboundedSender<crate::PluginEvent>,
+    drain_quit: Arc<AtomicBool>,
+) {
+    loop {
+        let mut any = false;
+        for ring in &rings {
+            while let Some(ev) = ring.pop() {
+                any = true;
+                let _ = evt_tx.send(rt_param_to_event(ev));
+            }
+        }
+        if drain_quit.load(Ordering::Acquire) {
+            // `drain_quit` は teardown が **全 worker を join した後** に立てる
+            // (`shutdown` とは別 flag)。 よって break 時点で ring への新規 push
+            // は起き得ない。 直近 push 分を最終 drain で確実に拾ってから抜ける。
+            for ring in &rings {
+                while let Some(ev) = ring.pop() {
+                    let _ = evt_tx.send(rt_param_to_event(ev));
+                }
+            }
+            break;
+        }
+        if !any {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+}
+
 /// dispatch-critical section の teardown を `Drop` に集約する guard。
 ///
 /// `plugin.process()` が **panic** すると、 通常 path の `dispatch.exit` /
@@ -147,6 +310,12 @@ impl Drop for DispatchGuard<'_> {
 pub struct WorkerPool {
     workers: Vec<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
+    /// drain thread 専用の終了 flag。 `shutdown` (= worker 用) とは別にして、
+    /// teardown が **全 worker を join した後** にこれを立てることで、 drain の
+    /// break 時点では「新規 push が起き得ない」 が真に保証される (worker は
+    /// loop 先頭でしか `shutdown` を見ないため、 shutdown 直前に wake された
+    /// buffer が ring に trailing push し得る — それを取りこぼさないため)。
+    drain_quit: Arc<AtomicBool>,
     /// Wake events kept here so `shutdown()` can `SetEvent` each one and
     /// release the worker from its `WaitForSingleObject`.
     wake_events: Vec<HANDLE>,
@@ -156,6 +325,12 @@ pub struct WorkerPool {
     /// `n_workers` 以降 の slot は `run_worker` から触らないので、
     /// `quiesce` は `[0, n_workers)` のみを iterate する。
     n_workers: u32,
+    /// plugin GUI 発の param event を RT worker → 非RT に運ぶ per-worker
+    /// SPSC ring (worker 1 本 = 1 ring)。 drain thread が consumer。
+    param_rings: Vec<Arc<ParamEventRing>>,
+    /// param ring を poll して `evt_tx` へ流す非RT thread。 `shutdown()` で
+    /// worker join 後に join する。
+    drain_thread: Option<JoinHandle<()>>,
 }
 
 impl WorkerPool {
@@ -191,6 +366,7 @@ impl WorkerPool {
         let dispatch = Arc::new(DispatchCounter::new());
         let mut workers = Vec::with_capacity(n_workers as usize);
         let mut wake_events = Vec::with_capacity(n_workers as usize);
+        let mut param_rings = Vec::with_capacity(n_workers as usize);
 
         for i in 0..n_workers as usize {
             let wake = open_named_event(&wake_event_names[i])?;
@@ -204,25 +380,41 @@ impl WorkerPool {
             let idx = i as u32;
             let wake_s = SendableHandle(wake);
             let done_s = SendableHandle(done);
-            let evt_tx_w = evt_tx.clone();
+            // per-worker SPSC ring: この worker が唯一の producer。 pool 側は
+            // drain 用に 1 本保持し、 worker 側へ 1 本 move する。
+            let ring = Arc::new(ParamEventRing::new(PARAM_RING_CAP));
+            param_rings.push(Arc::clone(&ring));
             let handle = std::thread::Builder::new()
                 .name(format!("plugin-worker-{i}"))
                 .spawn(move || {
                     run_worker(
-                        idx, bridge_w, shutdown_w, registry_w, dispatch_w, wake_s, done_s,
-                        evt_tx_w,
+                        idx, bridge_w, shutdown_w, registry_w, dispatch_w, wake_s, done_s, ring,
                     )
                 })?;
             workers.push(handle);
         }
 
+        // drain thread: RT worker が ring に書いた param event を非RT で
+        // `evt_tx` (tokio) へ流す。 これで RT 経路から tokio send (alloc) を
+        // 排除する。 `evt_tx` はここで move (worker は ring を使うので不要)。
+        let drain_rings: Vec<Arc<ParamEventRing>> =
+            param_rings.iter().map(Arc::clone).collect();
+        let drain_quit = Arc::new(AtomicBool::new(false));
+        let drain_quit_w = Arc::clone(&drain_quit);
+        let drain_thread = std::thread::Builder::new()
+            .name("plugin-param-drain".into())
+            .spawn(move || run_param_drain(drain_rings, evt_tx, drain_quit_w))?;
+
         tracing::info!(n_workers, "plugin worker pool started");
         Ok(Self {
             workers,
             shutdown,
+            drain_quit,
             wake_events,
             dispatch,
             n_workers,
+            param_rings,
+            drain_thread: Some(drain_thread),
         })
     }
 
@@ -273,7 +465,17 @@ impl WorkerPool {
         }
     }
 
-    pub fn shutdown(self) {
+    pub fn shutdown(mut self) {
+        self.teardown();
+    }
+
+    /// 全 worker と drain thread を停止・join する。 `shutdown()` と、
+    /// `shutdown()` を経ずに drop された場合の `Drop` の両方から呼ばれる。
+    /// 既に teardown 済の状態で再呼び出しされても no-op (冪等)。
+    fn teardown(&mut self) {
+        if self.drain_thread.is_none() && self.workers.is_empty() {
+            return;
+        }
         self.shutdown.store(true, Ordering::Release);
         // Wake every worker so it sees the flag and exits its loop.
         for &wake in &self.wake_events {
@@ -281,12 +483,31 @@ impl WorkerPool {
                 let _ = SetEvent(wake);
             }
         }
-        for h in self.workers {
+        for h in self.workers.drain(..) {
             if h.join().is_err() {
                 tracing::error!("plugin worker thread panicked");
             }
         }
+        // 全 worker が join 済 ⇒ ring への新規 push は起き得ない。 ここで初めて
+        // drain に終了を指示する (worker 用 `shutdown` とは別 flag `drain_quit`)。
+        // これで drain の break 前に全 push が完了している = trailing event を
+        // 取りこぼさない。
+        self.drain_quit.store(true, Ordering::Release);
+        if let Some(d) = self.drain_thread.take()
+            && d.join().is_err()
+        {
+            tracing::error!("plugin param drain thread panicked");
+        }
         tracing::info!("plugin worker pool stopped");
+    }
+}
+
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        // 正常系は `shutdown()` 済でここは no-op (workers drain 済 / drain_thread
+        // None)。 `shutdown()` を経ずに drop された異常系 (panic unwind 等) のみ、
+        // worker / drain thread の detach を防ぐためここで停止・join する。
+        self.teardown();
     }
 }
 
@@ -299,7 +520,7 @@ fn run_worker(
     dispatch: Arc<DispatchCounter>,
     wake: SendableHandle,
     done: SendableHandle,
-    evt_tx: tokio::sync::mpsc::UnboundedSender<crate::PluginEvent>,
+    param_ring: Arc<ParamEventRing>,
 ) {
     // Best-effort priority boost so we don't lose the CPAL buffer
     // deadline. Failure is logged but non-fatal.
@@ -520,24 +741,15 @@ fn run_worker(
             // Drain plugin output events back into the shmem.
             events_out.clear();
             plugin.drain_out_notes_into(&mut events_out);
-            // Phase 2c: drain plugin-emitted param touches / values を
-            // evt_tx 経由で plugin-main → daw_gui に流す。
+            // Phase 2c: drain plugin-emitted param touches / values。
             //
-            // KNOWN RT VIOLATION (code review 2026-06-06, High):
-            // この `run_worker` は TIME_CRITICAL + MMCSS の audio dispatch
-            // thread で、 下の `evt_tx.send` (tokio unbounded mpsc) は block
-            // 境界を跨ぐ送信で内部 Node を heap alloc する。 通常再生では
-            // 発火 0 件 (plugin GUI で knob を触ったときだけ) なので steady
-            // state の dropout には至らないが、 再生中の knob ドラッグで
-            // per-buffer に alloc が走る RT 制約違反。
-            //
-            // 正しい修正は per-worker SPSC ring (worker が唯一 producer、
-            // plugin-main が drain して evt_tx へ転送) で RT パスを「書く
-            // だけ」 にすること。 ただし worker は DispatchCounter で UAF
-            // 同期している delicate な path で、 検証には「再生中に plugin
-            // GUI ノブをドラッグ」 の実機 smoke test が要る。 RT パスを
-            // 実機検証なしに書き換えない原則 (CLAUDE.md) に従い、 専用 PR
-            // で ring 化 + 実機検証する。 docs/code_review_2026-06-06.md §6-9。
+            // RT 安全 (code review 2026-06-06 #10): この `run_worker` は
+            // TIME_CRITICAL + MMCSS の audio dispatch thread。 旧実装は
+            // `evt_tx.send` (tokio unbounded mpsc) で block 境界跨ぎの heap
+            // alloc を起こしていた (再生中の knob ドラッグで per-buffer 発火)。
+            // 現在は per-worker SPSC `param_ring` に「書くだけ」 (alloc/lock/
+            // syscall なし、 満杯時は drop) で、 非RT の drain thread が拾って
+            // `evt_tx` へ流す。
             out_param_touches.clear();
             out_param_values.clear();
             out_param_releases.clear();
@@ -551,15 +763,18 @@ fn run_worker(
                 let track = entry.track;
                 let slot = entry.slot;
                 for param_id in out_param_touches.drain(..) {
-                    let _ = evt_tx.send(crate::PluginEvent::PluginParamTouched {
+                    param_ring.push(RtParamEvent {
+                        kind: RtParamKind::Touch,
                         track,
                         slot,
                         plugin_id,
                         param_id,
+                        value: 0.0,
                     });
                 }
                 for (param_id, value) in out_param_values.drain(..) {
-                    let _ = evt_tx.send(crate::PluginEvent::PluginParamValueChanged {
+                    param_ring.push(RtParamEvent {
+                        kind: RtParamKind::Value,
                         track,
                         slot,
                         plugin_id,
@@ -568,11 +783,13 @@ fn run_worker(
                     });
                 }
                 for param_id in out_param_releases.drain(..) {
-                    let _ = evt_tx.send(crate::PluginEvent::PluginParamGestureEnd {
+                    param_ring.push(RtParamEvent {
+                        kind: RtParamKind::Release,
                         track,
                         slot,
                         plugin_id,
                         param_id,
+                        value: 0.0,
                     });
                 }
             }
@@ -625,6 +842,55 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
 
+    /// param ring は FIFO で push した順に pop できる。
+    #[test]
+    fn param_ring_push_pop_fifo() {
+        let r = ParamEventRing::new(4);
+        assert!(r.pop().is_none());
+        for i in 0..3 {
+            assert!(r.push(RtParamEvent { param_id: i, ..Default::default() }));
+        }
+        for i in 0..3 {
+            assert_eq!(r.pop().unwrap().param_id, i);
+        }
+        assert!(r.pop().is_none());
+    }
+
+    /// 満杯のとき push は false を返して drop し、 pop で空けば再び入る。
+    #[test]
+    fn param_ring_drops_when_full() {
+        let r = ParamEventRing::new(2);
+        assert!(r.push(RtParamEvent::default()));
+        assert!(r.push(RtParamEvent::default()));
+        assert!(!r.push(RtParamEvent::default()), "full ring must drop");
+        assert!(r.pop().is_some());
+        assert!(r.push(RtParamEvent::default()), "room after pop");
+    }
+
+    /// 別スレッドの producer / consumer で全件が順序保存で渡る (SPSC)。
+    #[test]
+    fn param_ring_spsc_threaded() {
+        let r = Arc::new(ParamEventRing::new(64));
+        let rp = Arc::clone(&r);
+        let producer = std::thread::spawn(move || {
+            let mut sent = 0u32;
+            while sent < 50_000 {
+                if rp.push(RtParamEvent { param_id: sent, ..Default::default() }) {
+                    sent += 1;
+                }
+            }
+        });
+        let mut got = 0u32;
+        while got < 50_000 {
+            if let Some(ev) = r.pop() {
+                assert_eq!(ev.param_id, got, "SPSC must preserve order");
+                got += 1;
+            }
+        }
+        producer.join().unwrap();
+        assert_eq!(got, 50_000);
+    }
+
     /// どの worker も `enter` を bump していない状態では `quiesce`
     /// は即座に return する (in-flight なし → wait loop 抜ける)。
     #[test]
@@ -633,9 +899,12 @@ mod tests {
         let pool = WorkerPool {
             workers: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
+            drain_quit: Arc::new(AtomicBool::new(false)),
             wake_events: Vec::new(),
             dispatch: Arc::clone(&dispatch),
             n_workers: 4,
+            param_rings: Vec::new(),
+            drain_thread: None,
         };
         let start = Instant::now();
         pool.quiesce();
@@ -654,9 +923,12 @@ mod tests {
         let pool = WorkerPool {
             workers: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
+            drain_quit: Arc::new(AtomicBool::new(false)),
             wake_events: Vec::new(),
             dispatch: Arc::clone(&dispatch),
             n_workers: 4,
+            param_rings: Vec::new(),
+            drain_thread: None,
         };
 
         let dispatch_for_releaser = Arc::clone(&dispatch);
@@ -693,9 +965,12 @@ mod tests {
         let pool = WorkerPool {
             workers: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
+            drain_quit: Arc::new(AtomicBool::new(false)),
             wake_events: Vec::new(),
             dispatch: Arc::clone(&dispatch),
             n_workers: 2,
+            param_rings: Vec::new(),
+            drain_thread: None,
         };
 
         // background thread で enter/exit pair を高速に回す。

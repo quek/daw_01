@@ -1204,6 +1204,7 @@ pub fn process_track_owned(
                 song.bpm,
                 playhead,
                 frames,
+                recording_lanes,
             );
         }
         for ev in &scratch.midi_bus_a {
@@ -1284,6 +1285,7 @@ pub fn process_track_owned(
                     song.bpm,
                     playhead,
                     frames,
+                    recording_lanes,
                 );
             }
             for ev in &scratch.midi_bus_a {
@@ -1373,6 +1375,7 @@ pub fn process_track_owned(
                 song.bpm,
                 playhead,
                 frames,
+                recording_lanes,
             );
         }
         pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
@@ -2039,6 +2042,7 @@ fn run_group_fx_chain(
             song.bpm,
             playhead,
             frames,
+            recording_lanes,
         );
         pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
         pd.buffer_in[1][..n].copy_from_slice(&scratch.track_r[..n]);

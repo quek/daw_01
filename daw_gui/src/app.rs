@@ -995,6 +995,14 @@ pub struct AppData {
     /// `AppEvent::SingersLoaded` で投入する。 engine 未起動 / fetch 失敗時は
     /// 空のまま (Track Inspector の dropdown は default singer のみ表示)。
     pub singers: Vec<common::voicevox::VoiceVoxSinger>,
+    /// `singers` から派生した Vocal speaker dropdown のキャッシュ。
+    /// `vocal_speaker_entries` は `(speaker_id, style_name)` の逆引き、
+    /// `vocal_speaker_labels` は「<キャラ> - <スタイル>」表示ラベル。
+    /// `singers` 投入時 (`SingersLoaded`) にのみ再構築し、 Track Inspector
+    /// 描画の毎フレーム `format!` / `clone` を消す (singers は engine 起動時に
+    /// 一度設定されて以降ほぼ不変なので、 派生キャッシュが SSoT として安定)。
+    pub vocal_speaker_entries: Vec<(u32, String)>,
+    pub vocal_speaker_labels: Vec<String>,
     /// VOICEVOX 合成結果 in-memory cache (process lifetime のみ)。 Synth ボタン
     /// 押下時に各 clip の content_hash + singer_id を key に lookup → hit なら
     /// HTTP call をスキップ。 永続化は将来 Phase。
@@ -1380,6 +1388,8 @@ impl AppData {
             synth_result: Arc::new(Mutex::new(Vec::new())),
             rescan_result: Arc::new(Mutex::new(None)),
             singers: Vec::new(),
+            vocal_speaker_entries: Vec::new(),
+            vocal_speaker_labels: Vec::new(),
             voicevox_cache: Arc::new(Mutex::new(common::voicevox_cache::VoiceVoxCache::new())),
             voicevox_job,
             supervisor,
@@ -5225,6 +5235,18 @@ impl AppData {
                     "VOICEVOX singers loaded"
                 );
                 self.singers = singers;
+                // Vocal speaker dropdown の派生キャッシュを再構築 (= Track
+                // Inspector の毎フレーム format!/clone を消す)。 singers が
+                // 変わるのはここだけなので、 ここで 1 度作れば常に整合する。
+                self.vocal_speaker_entries.clear();
+                self.vocal_speaker_labels.clear();
+                for s in &self.singers {
+                    for st in &s.styles {
+                        self.vocal_speaker_labels
+                            .push(format!("{} - {}", s.name, st.name));
+                        self.vocal_speaker_entries.push((st.id, st.name.clone()));
+                    }
+                }
             }
             AppEvent::LipsyncGenerated { vocal_track_id, bpm, clips } => {
                 self.apply_lipsync_generated(vocal_track_id, bpm, clips);
@@ -13582,9 +13604,10 @@ impl AppData {
             {
                 continue;
             }
-            // 現在 plain 値を取得 (= live knob 位置)。 TrackBuiltin のみ MVP。
-            // PluginParam は Step C follow-up で plugin_params cache + IPC で
-            // 取得 (= 現状未配線、 skip)。
+            // 現在 plain 値 (= live knob 位置) を取得。 TrackBuiltin は song の
+            // 現在値、 PluginParam は `plugin_param_values` cache
+            // (`PluginParamValueChanged` で更新) から引く (`current_plain_value`
+            // 参照)。 値が無ければ skip。
             let plain_value = match self.current_plain_value(track_id, &target) {
                 Some(v) => v,
                 None => continue,
