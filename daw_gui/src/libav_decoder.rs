@@ -44,6 +44,11 @@ struct SourceDecoder {
     stream_index: usize,
     /// Stream time_base — used to convert frame pts ↔ microseconds.
     time_base: ffi::AVRational,
+    /// One source-frame's duration (μs), from the stream's frame rate. A held
+    /// frame covers `[pts, pts + frame_dur_micros)`; outside that the next
+    /// frame must be decoded (the original "< pts + 1s" bound held one frame
+    /// for ~1 second → ~1fps stutter).
+    frame_dur_micros: u64,
     /// `SwsContext` (src pixfmt/dims → BGRA), created on the first decoded
     /// frame and reused. `(src_fmt, src_w, src_h)` is cached to recreate if a
     /// source ever changes format mid-stream (defensive).
@@ -107,7 +112,22 @@ impl SourceDecoder {
             .map_err(|e| format!("find video stream: {e:?}"))?
             .ok_or_else(|| format!("no video stream in {}", path.display()))?;
 
-        let time_base = input.streams()[stream_index].time_base;
+        let (time_base, frame_dur_micros) = {
+            let s = &input.streams()[stream_index];
+            let tb = s.time_base;
+            // Prefer avg_frame_rate; fall back to r_frame_rate, then 30fps.
+            let fr = if s.avg_frame_rate.num > 0 && s.avg_frame_rate.den > 0 {
+                s.avg_frame_rate
+            } else {
+                s.r_frame_rate
+            };
+            let dur = if fr.num > 0 && fr.den > 0 {
+                (1_000_000_i64 * i64::from(fr.den) / i64::from(fr.num)).max(1) as u64
+            } else {
+                33_333
+            };
+            (tb, dur)
+        };
 
         let mut decoder = build_decoder(&input, stream_index, &codec)?;
         decoder.set_pkt_timebase(time_base);
@@ -121,6 +141,7 @@ impl SourceDecoder {
             decoder,
             stream_index,
             time_base,
+            frame_dur_micros,
             sws: None,
             last_micros: None,
             last_frame: None,
@@ -144,12 +165,15 @@ impl SourceDecoder {
     fn decode_at(&mut self, target_micros: u64) -> Result<DecodedBgra, String> {
         let half_frame = self.half_frame_micros();
 
-        // (1) Repeated / paused target: the held frame already covers it.
+        // (1) Repeated / paused target: the held frame already covers it, i.e.
+        // `target` lands within `[last, last + frame_dur)` (with a half-frame
+        // tolerance below). Otherwise the playhead advanced to the next frame
+        // and we must decode it — the old `< last + 1s` bound held one frame
+        // for ~1 second (≈1fps stutter).
         if let Some(last) = self.last_micros
             && self.last_frame.is_some()
             && target_micros + half_frame >= last
-            && target_micros < last + 1_000_000
-            && target_micros >= last.saturating_sub(half_frame)
+            && target_micros < last + self.frame_dur_micros
         {
             return self.convert_last();
         }
@@ -319,9 +343,8 @@ impl SourceDecoder {
     }
 
     fn half_frame_micros(&self) -> u64 {
-        // Half a frame at the stream's avg rate, used as the pts match window.
-        // Falls back to ~16ms when the rate is unknown.
-        16_000
+        // Half a source-frame, used as the pts match tolerance.
+        (self.frame_dur_micros / 2).max(1)
     }
 }
 
