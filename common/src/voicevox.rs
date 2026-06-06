@@ -121,7 +121,7 @@ pub fn synthesize_song(
         };
         // sing/talk 両方とも、 track の speaker_id != 0 が指定されていれば
         // それを優先 (UI で設定された singer)、 0 なら caller の default。
-        let track_speaker = if *model_speaker != 0 { *model_speaker } else { 0 };
+        let track_speaker = *model_speaker;
         let singer_id = if track_speaker != 0 { track_speaker } else { default_singer_id };
 
         for (clip_idx, clip) in track.clips.iter().enumerate() {
@@ -158,7 +158,9 @@ pub fn synthesize_song(
             // A clip with at least one note that has any pitch goes into
             // sing mode; otherwise we fall back to talk mode using
             // whatever lyrics are attached (used for spoken intros, etc.).
-            let has_pitched_notes = notes.iter().any(|n| n.pitch > 0);
+            let has_pitched_notes = notes
+                .iter()
+                .any(|n| n.pitch > 0 && n.duration_beats > 0.0);
             let wav_bytes = if has_pitched_notes {
                 match synthesize_sing_clip(&client, notes, song.bpm, singer_id) {
                     Ok(b) => b,
@@ -282,18 +284,20 @@ fn synthesize_sing_clip(
         .context("sing_frame_audio_query request failed")?;
     let status = resp.status();
     let body = resp.text().context("reading sing query response")?;
-    anyhow::ensure!(
-        status.is_success(),
-        "sing_frame_audio_query returned {}: {}",
-        status,
-        &body[..body.len().min(200)]
-    );
+    if !status.is_success() {
+        let preview: String = body.chars().take(200).collect();
+        anyhow::bail!("sing_frame_audio_query returned {}: {}", status, preview);
+    }
 
     // Patch outputSamplingRate
-    let patched = body.replace(
-        &find_sample_rate_field(&body),
-        &format!("\"outputSamplingRate\":{}", OUTPUT_SAMPLE_RATE),
-    );
+    let patched = if let Some(field) = find_sample_rate_field(&body) {
+        body.replace(
+            &field,
+            &format!("\"outputSamplingRate\":{}", OUTPUT_SAMPLE_RATE),
+        )
+    } else {
+        body
+    };
 
     // Step 2: frame_synthesis
     let url = format!(
@@ -347,12 +351,10 @@ pub fn query_phonemes(notes: &[Note], bpm: f32) -> Result<Vec<Phoneme>> {
         .context("sing_frame_audio_query request failed")?;
     let status = resp.status();
     let body = resp.text().context("reading sing query response")?;
-    anyhow::ensure!(
-        status.is_success(),
-        "sing_frame_audio_query returned {}: {}",
-        status,
-        &body[..body.len().min(200)]
-    );
+    if !status.is_success() {
+        let preview: String = body.chars().take(200).collect();
+        anyhow::bail!("sing_frame_audio_query returned {}: {}", status, preview);
+    }
     parse_phonemes(&body)
 }
 
@@ -401,17 +403,19 @@ fn synthesize_talk(
         .context("audio_query request failed")?;
     let status = resp.status();
     let body = resp.text().context("reading audio_query response")?;
-    anyhow::ensure!(
-        status.is_success(),
-        "audio_query returned {}: {}",
-        status,
-        &body[..body.len().min(200)]
-    );
+    if !status.is_success() {
+        let preview: String = body.chars().take(200).collect();
+        anyhow::bail!("audio_query returned {}: {}", status, preview);
+    }
 
-    let patched = body.replace(
-        &find_sample_rate_field(&body),
-        &format!("\"outputSamplingRate\":{}", OUTPUT_SAMPLE_RATE),
-    );
+    let patched = if let Some(field) = find_sample_rate_field(&body) {
+        body.replace(
+            &field,
+            &format!("\"outputSamplingRate\":{}", OUTPUT_SAMPLE_RATE),
+        )
+    } else {
+        body
+    };
 
     // Step 2: synthesis
     let url = format!("{}/synthesis?speaker={}", VOICEVOX_URL, speaker_id);
@@ -554,7 +558,9 @@ pub fn synthesize_notes_for_builtin(
     );
     let model_notes: Vec<Note> = notes.iter().map(|n| n.to_model_note()).collect();
 
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
     let wav_bytes = synthesize_sing_clip(&client, &model_notes, bpm, speaker_id)?;
     let (samples, sample_rate) = decode_wav_to_f32(&wav_bytes)?;
 
@@ -636,6 +642,7 @@ pub fn decode_wav_to_f32(data: &[u8]) -> Result<(Vec<f32>, u32)> {
         hound::WavReader::new(cursor).context("failed to parse WAV header")?;
     let spec = reader.spec();
     let sr = spec.sample_rate;
+    anyhow::ensure!(sr > 0, "VOICEVOX returned WAV with sample_rate=0");
 
     let samples: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Int => reader
@@ -668,19 +675,17 @@ pub fn decode_wav_to_f32(data: &[u8]) -> Result<(Vec<f32>, u32)> {
 // ---------------------------------------------------------------------------
 
 /// Finds the `"outputSamplingRate":<number>` substring in `json` so it can
-/// be replaced. Returns the full match including the key name.
-fn find_sample_rate_field(json: &str) -> String {
-    if let Some(start) = json.find("\"outputSamplingRate\":") {
-        let after_key = start + "\"outputSamplingRate\":".len();
-        let end = json[after_key..]
-            .find(|c: char| !c.is_ascii_digit())
-            .map(|i| after_key + i)
-            .unwrap_or(json.len());
-        json[start..end].to_string()
-    } else {
-        // Fallback: return something that won't match so replace is a no-op.
-        String::new()
-    }
+/// be replaced. Returns the full match including the key name, or `None`
+/// when the key is absent (an empty match would make `str::replace` splice
+/// the replacement between every character, corrupting the JSON).
+fn find_sample_rate_field(json: &str) -> Option<String> {
+    let start = json.find("\"outputSamplingRate\":")?;
+    let after_key = start + "\"outputSamplingRate\":".len();
+    let end = json[after_key..]
+        .find(|c: char| !c.is_ascii_digit())
+        .map(|i| after_key + i)
+        .unwrap_or(json.len());
+    Some(json[start..end].to_string())
 }
 
 /// Minimal URL-encoding for query parameters.

@@ -341,11 +341,15 @@ pub fn evaluate_song_tempo(song: &Song, beat: f64) -> f32 {
             continue;
         }
         if matches!(lane.target, AutomationTarget::SongTempo) {
-            let v = lane_value_at(lane, &song.clip_contents, beat);
+            let v = lane_value_at(lane, &song.clip_contents, beat) as f32;
             // SongTempo の plain value は BPM (= song.bpm と同単位)。 sanity
             // clamp: 1 BPM 未満は不正 (divide by zero リスク)、 上限 1000 BPM
-            // で防御 (= 通常 user は 20..=300 程度)。
-            return (v as f32).clamp(1.0, 1000.0);
+            // で防御 (= 通常 user は 20..=300 程度)。 NaN/Inf は clamp を
+            // 素通りするので finite チェックを先に行い、 song.bpm へ fallback。
+            if !v.is_finite() {
+                return song.bpm;
+            }
+            return v.clamp(1.0, 1000.0);
         }
     }
     song.bpm

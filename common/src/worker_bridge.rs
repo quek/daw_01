@@ -54,8 +54,21 @@ mod shmem_handle {
                 .os_id(os_id)
                 .create()
                 .with_context(|| format!("failed to create worker_bridge shmem {os_id}"))?;
+            // The shmem view is backed by `MapViewOfFile`, which returns a
+            // pointer aligned to at least 64 KiB (the system allocation
+            // granularity). That trivially satisfies `WorkerBridge`'s
+            // alignment (== `AtomicU32` align == 4).
+            debug_assert!(
+                (shmem.as_ptr() as usize).is_multiple_of(std::mem::align_of::<WorkerBridge>()),
+                "worker_bridge shmem pointer is not WorkerBridge-aligned"
+            );
             // Initialise every slot to IDLE so a stray wake before the
             // first dispatch doesn't make a worker go process plugin 0.
+            // SAFETY: `shmem` is freshly created with at least
+            // `size_of::<WorkerBridge>()` bytes (`.size(...)` above) and the
+            // pointer is 64 KiB-aligned (asserted), so it is valid for a
+            // single aligned write of a `WorkerBridge`. No other handle to
+            // this mapping exists yet, so there is no aliasing.
             unsafe {
                 let bridge = shmem.as_ptr() as *mut WorkerBridge;
                 std::ptr::write(bridge, WorkerBridge::zeroed());
@@ -74,10 +87,23 @@ mod shmem_handle {
                 shmem.len(),
                 std::mem::size_of::<WorkerBridge>()
             );
+            // `MapViewOfFile` aligns the view to the 64 KiB system allocation
+            // granularity, which covers `WorkerBridge`'s 4-byte alignment.
+            debug_assert!(
+                (shmem.as_ptr() as usize).is_multiple_of(std::mem::align_of::<WorkerBridge>()),
+                "worker_bridge shmem pointer is not WorkerBridge-aligned"
+            );
             Ok(Self { shmem })
         }
 
         pub fn bridge(&self) -> &WorkerBridge {
+            // SAFETY: the mapping is at least `size_of::<WorkerBridge>()` bytes
+            // (checked in `create`/`open`) and the `MapViewOfFile` pointer is
+            // 64 KiB-aligned, satisfying `WorkerBridge`'s 4-byte alignment.
+            // `WorkerBridge` is `#[repr(C)]` and holds only `AtomicU32`s, which
+            // are valid for any bit pattern, so the mapped bytes are always a
+            // valid `WorkerBridge`. Concurrent access from the peer process is
+            // sound because all fields are atomics.
             unsafe { &*(self.shmem.as_ptr() as *const WorkerBridge) }
         }
     }

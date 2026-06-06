@@ -21,7 +21,13 @@ pub fn song_bounds_samples(song: Option<&Song>, sample_rate: u32) -> Option<(u64
     let mut max_end: u64 = 0;
     for track in &song.tracks {
         for clip in &track.clips {
-            if clip.length_beats <= 0.0 {
+            // Skip non-finite (NaN / ±Inf) or non-positive geometry: these
+            // slip past a plain `<= 0.0` guard and would saturate the u64
+            // cast and overflow `start + length` below.
+            if !clip.length_beats.is_finite() || clip.length_beats <= 0.0 {
+                continue;
+            }
+            if !clip.start_beat.is_finite() {
                 continue;
             }
             let start = (clip.start_beat * samples_per_beat).max(0.0) as u64;
@@ -30,7 +36,7 @@ pub fn song_bounds_samples(song: Option<&Song>, sample_rate: u32) -> Option<(u64
                 continue;
             }
             min_start = Some(min_start.map_or(start, |m| m.min(start)));
-            max_end = max_end.max(start + length);
+            max_end = max_end.max(start.saturating_add(length));
         }
     }
     let start = min_start?;

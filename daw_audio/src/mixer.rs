@@ -67,7 +67,10 @@ impl TrackScratch {
             track_r: vec![0.0; MAX_FRAMES],
             midi_bus_a: Vec::with_capacity(MAX_EVENTS),
             midi_bus_b: Vec::with_capacity(MAX_EVENTS),
-            state: PerTrackState::with_capacity(64),
+            // capacity は sequencer の `ACTIVE_NOTES_CAP` (= `MAX_EVENTS`) と
+            // 一致させる。 push 前 clamp が `MAX_EVENTS` で効くので、 ここを
+            // それ未満にすると clamp が防げない区間で RT realloc が起きる。
+            state: PerTrackState::with_capacity(MAX_EVENTS),
             peak_l: 0.0,
             peak_r: 0.0,
             effective_mute: false,

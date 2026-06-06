@@ -11,12 +11,17 @@
 //! 永続化は別 phase。 現状は process lifetime のみ有効。
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use crate::model::Note;
 
 pub type CacheKey = u64;
+
+/// In-memory cache のエントリ数上限。 超えたら FIFO で最古を捨てる。
+/// 1 clip 約 数百 KB〜数 MB なので、 無制限成長を防ぐための緩い上限。
+const MAX_CACHE_ENTRIES: usize = 256;
 
 /// 合成結果 1 clip 分。
 #[derive(Debug, Clone)]
@@ -26,9 +31,14 @@ pub struct CachedClip {
 }
 
 /// In-memory cache。 キー衝突確率は SipHash 64-bit で実用上無視可能。
+///
+/// エントリ数は `MAX_CACHE_ENTRIES` を上限とし、 超えると挿入順 (FIFO) の
+/// 最古を退避して無制限成長を防ぐ。 `order` は挿入順を保つ key の列で、
+/// `map` と整合を保つ。
 #[derive(Debug, Default)]
 pub struct VoiceVoxCache {
     map: HashMap<CacheKey, CachedClip>,
+    order: VecDeque<CacheKey>,
 }
 
 impl VoiceVoxCache {
@@ -49,11 +59,23 @@ impl VoiceVoxCache {
     }
 
     pub fn insert(&mut self, key: CacheKey, value: CachedClip) {
-        self.map.insert(key, value);
+        // 既存 key の更新ならエントリ数は増えないので order を触らない。
+        let is_new = self.map.insert(key, value).is_none();
+        if is_new {
+            self.order.push_back(key);
+            // 上限超過分を FIFO (front = 最古) で退避。 通常 1 件だが、
+            // 万一複数溜まっても整合するよう while で回す。
+            while self.order.len() > MAX_CACHE_ENTRIES {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.map.remove(&oldest);
+                }
+            }
+        }
     }
 
     pub fn clear(&mut self) {
         self.map.clear();
+        self.order.clear();
     }
 
     /// `(notes, singer_id)` から安定 hash を計算。 同じ内容 (notes が

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use common::audio_bridge::AudioBridgeHandle;
-use common::protocol::{ChildToMain, MainToChild};
+use common::protocol::ChildToMain;
 use tokio::sync::mpsc::UnboundedReceiver;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event_loop::EventLoopProxy;
@@ -166,8 +166,6 @@ fn run_gui(
     let init = RunnerInit {
         window_attrs,
         build_app: Box::new(move |proxy: EventLoopProxy<AppEvent>| {
-            let audio_tx_for_bridge = audio_tx.clone();
-
             let event_dispatcher: Arc<dyn daw_gui::dispatcher::BackgroundDispatcher> =
                 Arc::new(WinitDispatcher::new(proxy.clone()));
             let job_dispatcher: Arc<dyn daw_gui::dispatcher::JobDispatcher> =
@@ -186,7 +184,7 @@ fn run_gui(
             spawn_playhead_poller(bridge, proxy.clone());
             spawn_autosave_timer(proxy.clone());
             spawn_midi_input(proxy.clone());
-            spawn_incoming_bridge(incoming_rx, proxy.clone(), audio_tx_for_bridge);
+            spawn_incoming_bridge(incoming_rx, proxy.clone());
 
             // `--smoke-test <fixture>` → background orchestrator drives
             // ImportVideo / TogglePreviewWindow / Play via the same
@@ -231,7 +229,6 @@ fn run_gui(
 fn spawn_incoming_bridge(
     mut rx: UnboundedReceiver<ChildToMain>,
     proxy: EventLoopProxy<AppEvent>,
-    audio_tx: tokio::sync::mpsc::UnboundedSender<MainToChild>,
 ) {
     std::thread::spawn(move || {
         while let Some(msg) = rx.blocking_recv() {
@@ -254,18 +251,19 @@ fn spawn_incoming_bridge(
                     shmem_id,
                     state_load_error,
                 } => {
-                    let _ = audio_tx.send(MainToChild::OpenPluginShmem {
-                        plugin_id,
-                        shmem_id,
-                        track,
-                        slot,
-                    });
+                    // SSoT: `OpenPluginShmem` は AppData が live な
+                    // `self.audio_tx` (respawn で差し替わる側) から送る。
+                    // ここで bootstrap 時点の stale clone に直接送ると、
+                    // audio engine respawn 後にロードした plugin の shmem が
+                    // 開かれず無言で音が出なくなる。 shmem_id を AppEvent まで
+                    // 運び、 handler (on_plugin_loaded_from_child) で送る。
                     Some(AppEvent::SlotPluginLoadedFromChild {
                         track,
                         slot,
                         id,
                         name,
                         plugin_id,
+                        shmem_id,
                         state_load_error,
                     })
                 }
@@ -274,7 +272,9 @@ fn spawn_incoming_bridge(
                     Some(AppEvent::AllStatesReceived(entries))
                 }
                 ChildToMain::SlotPluginUnloaded { plugin_id } => {
-                    let _ = audio_tx.send(MainToChild::ClosePluginShmem { plugin_id });
+                    // SSoT: `ClosePluginShmem` も AppData が live な audio_tx
+                    // から送る (on_plugin_unloaded_from_child)。 stale clone に
+                    // 直接送ると respawn 後に dangling shmem 参照が残る。
                     Some(AppEvent::SlotPluginUnloadedFromChild { plugin_id })
                 }
                 ChildToMain::SlotPluginLoadFailed {
@@ -418,8 +418,13 @@ fn spawn_playhead_poller(bridge: Arc<AudioBridgeHandle>, proxy: EventLoopProxy<A
                 break;
             }
             bridge.track_peaks(&mut peaks_buf);
+            // `peaks_buf` を毎 tick clone せず move でイベントに渡す。 次 tick の
+            // `track_peaks` が `out.clear()` + push で再充填するので、 take 後に
+            // 空になっても問題ない。 clone の memcpy を省く効果のみ (take は
+            // capacity ごと move out するので次 tick で確保し直す = per-tick の
+            // alloc 回数自体は不変。 30Hz の background thread なので無害)。
             if proxy
-                .send_event(AppEvent::TrackPeaksTick(peaks_buf.clone()))
+                .send_event(AppEvent::TrackPeaksTick(std::mem::take(&mut peaks_buf)))
                 .is_err()
             {
                 break;

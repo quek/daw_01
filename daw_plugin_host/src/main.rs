@@ -260,6 +260,33 @@ fn publish_plugin_registry(
     registry.store(std::sync::Arc::new(next));
 }
 
+/// Re-publish an existing registry entry with a corrected `(track, slot)`
+/// address, preserving the live `plugin` pointer and `process_data` slot.
+/// Used after `MoveSlot` reorders a chain so `PluginEntry.slot` (read by
+/// the worker pool to stamp param events) reflects the new position.
+/// No-op if the plugin id has no live entry.
+fn republish_entry_slot(
+    registry: &PluginRegistry,
+    plugin_id: u32,
+    track: u32,
+    slot: PluginSlot,
+) {
+    let current = registry.load();
+    let Some(Some(existing)) = current.get(plugin_id as usize) else {
+        return;
+    };
+    let entry = PluginEntry {
+        plugin: PluginPtr(existing.plugin.0),
+        process_data: existing.process_data,
+        track,
+        slot,
+    };
+    // Drop the load guard before re-entering `publish_plugin_registry`
+    // (which takes its own `load()`); avoids holding two guards at once.
+    drop(current);
+    publish_plugin_registry(registry, plugin_id, Some(entry));
+}
+
 /// Commands processed serially on the plugin-main thread.
 enum PluginCommand {
     SetSlotPlugin {
@@ -993,11 +1020,67 @@ fn plugin_main_loop(
                     }
                 }
                 PluginCommand::MoveSlot { track, from, to } => {
+                    let mut moved: Option<MovedRange> = None;
                     tracks.mutate(|t| {
                             if let Some(chain) = t.chains.get_mut(&track) {
-                                move_plugin(chain, from, to);
+                                moved = move_plugin(chain, from, to);
                             }
                     });
+                    // move_plugin が Vec を並べ替えただけでは plugin_lookup /
+                    // loaded_id_for_slot / loaded_meta_for_slot / PluginEntry.slot
+                    // が旧順序のまま陳腐化する。 影響を受けた slot range を
+                    // 新順序に貼り直し、 該当 plugin の registry entry を再 publish
+                    // して slot 逆引きを正す。
+                    if let Some(MovedRange { is_midi, a, b }) = moved {
+                        let lo = a.min(b);
+                        let hi = a.max(b);
+                        let make_slot = |i: usize| {
+                            if is_midi {
+                                PluginSlot::MidiFx(i as u32)
+                            } else {
+                                PluginSlot::Fx(i as u32)
+                            }
+                        };
+                        // `remove(a)` + `insert(b)` の置換: old index → new index。
+                        let new_index = |old: usize| -> usize {
+                            if old == a {
+                                b
+                            } else if a < b {
+                                // a+1..=b が 1 つ手前へ詰まる。
+                                old - 1
+                            } else {
+                                // b..=a-1 が 1 つ後ろへずれる。
+                                old + 1
+                            }
+                        };
+                        // (1) 影響 range の旧 bookkeeping を snapshot してから
+                        //     一旦剥がす (新旧 slot の衝突を避けるため)。
+                        // (slot, plugin_id, loaded_id, loaded_meta(id, name))
+                        type SlotBookkeeping =
+                            (PluginSlot, u32, Option<String>, Option<(String, String)>);
+                        let mut remapped: Vec<SlotBookkeeping> = Vec::new();
+                        for old in lo..=hi {
+                            let old_slot = make_slot(old);
+                            if let Some(&pid) = plugin_lookup.get(&(track, old_slot)) {
+                                let lid = loaded_id_for_slot.remove(&(track, old_slot));
+                                let meta = loaded_meta_for_slot.remove(&(track, old_slot));
+                                plugin_lookup.remove(&(track, old_slot));
+                                let new_slot = make_slot(new_index(old));
+                                remapped.push((new_slot, pid, lid, meta));
+                            }
+                        }
+                        // (2) 新 slot で貼り直し + registry entry の slot を補正。
+                        for (new_slot, pid, lid, meta) in remapped {
+                            plugin_lookup.insert((track, new_slot), pid);
+                            if let Some(lid) = lid {
+                                loaded_id_for_slot.insert((track, new_slot), lid);
+                            }
+                            if let Some(meta) = meta {
+                                loaded_meta_for_slot.insert((track, new_slot), meta);
+                            }
+                            republish_entry_slot(&plugin_registry, pid, track, new_slot);
+                        }
+                    }
                 }
                 PluginCommand::RemoveTrack { track } => {
                     // `track` は stable な `Track::id`。 この track に
@@ -1234,7 +1317,17 @@ fn teardown_plugin(mut plugin: Box<dyn LoadedPlugin>) {
     drop(plugin);
 }
 
-fn move_plugin(chain: &mut Chain, from: PluginSlot, to: PluginSlot) {
+/// `move_plugin` の戻り値。 実際に reorder が起きたときだけ `Some` を返し、
+/// 影響を受けた chain 種別 (`is_midi`) と元の `(a, b)` index を伝える。
+/// 呼び出し側はこれを使って `plugin_lookup` / `loaded_*_for_slot` /
+/// `PluginEntry.slot` を新順序に貼り直す。
+struct MovedRange {
+    is_midi: bool,
+    a: usize,
+    b: usize,
+}
+
+fn move_plugin(chain: &mut Chain, from: PluginSlot, to: PluginSlot) -> Option<MovedRange> {
     // Only Fx↔Fx and MidiFx↔MidiFx reorders are supported for MVP.
     match (from, to) {
         (PluginSlot::Fx(a), PluginSlot::Fx(b)) => {
@@ -1243,7 +1336,9 @@ fn move_plugin(chain: &mut Chain, from: PluginSlot, to: PluginSlot) {
             if a < chain.fx_chain.len() && b < chain.fx_chain.len() && a != b {
                 let plugin = chain.fx_chain.remove(a);
                 chain.fx_chain.insert(b, plugin);
+                return Some(MovedRange { is_midi: false, a, b });
             }
+            None
         }
         (PluginSlot::MidiFx(a), PluginSlot::MidiFx(b)) => {
             let a = a as usize;
@@ -1251,9 +1346,11 @@ fn move_plugin(chain: &mut Chain, from: PluginSlot, to: PluginSlot) {
             if a < chain.midi_fx_chain.len() && b < chain.midi_fx_chain.len() && a != b {
                 let plugin = chain.midi_fx_chain.remove(a);
                 chain.midi_fx_chain.insert(b, plugin);
+                return Some(MovedRange { is_midi: true, a, b });
             }
+            None
         }
-        _ => {}
+        _ => None,
     }
 }
 

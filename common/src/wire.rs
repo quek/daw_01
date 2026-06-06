@@ -11,6 +11,13 @@ where
 {
     let config = bincode::config::standard();
     let body = bincode::encode_to_vec(msg, config).context("failed to encode message")?;
+    if body.len() > MAX_MESSAGE_BYTES {
+        anyhow::bail!(
+            "message length {} exceeds {} byte limit",
+            body.len(),
+            MAX_MESSAGE_BYTES
+        );
+    }
     let len = u32::try_from(body.len())
         .with_context(|| format!("message of {} bytes exceeds u32 range", body.len()))?;
     writer

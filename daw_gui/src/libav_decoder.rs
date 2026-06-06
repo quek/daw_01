@@ -100,6 +100,12 @@ impl LibavVideoDecoder {
 /// decoding and discarding the intervening frames.
 const SEEK_AHEAD_MICROS: u64 = 500_000;
 
+/// Max iterations of the forward decode walk before bailing, so a malformed
+/// stream can't spin forever (~17 s of 60fps source). When this is hit
+/// legitimately (high fps + large gap), `decode_at` retries once via a keyframe
+/// seek, which collapses the gap to a single GOP.
+const WALK_BOUND: usize = 1024;
+
 impl SourceDecoder {
     fn open(path: &Path) -> Result<Self, String> {
         let url = CString::new(path.to_string_lossy().as_bytes().to_vec())
@@ -190,16 +196,46 @@ impl SourceDecoder {
         }
 
         // (3) Decode forward until a frame's pts reaches `target_micros`.
-        // Bound the walk so a malformed stream can't spin forever (~4 s of
-        // 60fps source).
-        for _ in 0..1024 {
+        if let Some(frame) = self.forward_walk(target_micros, half_frame)? {
+            return Ok(frame);
+        }
+
+        // The bounded walk was exhausted before reaching the target. This can
+        // legitimately happen on a high-fps source after a large forward jump
+        // (the gap held more than `WALK_BOUND` frames). Rather than return a
+        // black frame, seek to the keyframe at/before the target once and walk
+        // again — the seek collapses the gap to one GOP.
+        self.seek(target_micros)?;
+        if let Some(frame) = self.forward_walk(target_micros, half_frame)? {
+            return Ok(frame);
+        }
+
+        tracing::warn!(
+            target_micros,
+            walk_bound = WALK_BOUND,
+            "libav decode walk exceeded bound even after a rescue keyframe seek; \
+             returning error (frame will be dropped)"
+        );
+        Err("decode walk exceeded bound without reaching target".to_string())
+    }
+
+    /// Decode forward until a frame's pts reaches `target_micros`, returning the
+    /// converted frame. Bounded by `WALK_BOUND` iterations so a malformed stream
+    /// can't spin forever; returns `Ok(None)` when the bound is hit before the
+    /// target is reached (the caller decides whether to seek and retry).
+    fn forward_walk(
+        &mut self,
+        target_micros: u64,
+        half_frame: u64,
+    ) -> Result<Option<DecodedBgra>, String> {
+        for _ in 0..WALK_BOUND {
             match self.decoder.receive_frame() {
                 Ok(frame) => {
                     let micros = self.frame_micros(&frame);
                     self.last_micros = Some(micros);
                     self.last_frame = Some(frame);
                     if micros + half_frame >= target_micros {
-                        return self.convert_last();
+                        return self.convert_last().map(Some);
                     }
                     // Frame is before target — keep decoding (the held frame is
                     // overwritten next iteration; no BGRA conversion wasted).
@@ -213,6 +249,7 @@ impl SourceDecoder {
                     self.eof = true;
                     return self
                         .convert_last()
+                        .map(Some)
                         .map_err(|_| "decoder reached EOF before any frame".to_string());
                 }
                 Err(e) => return Err(format!("receive_frame: {e:?}")),
@@ -243,7 +280,7 @@ impl SourceDecoder {
                 }
             }
         }
-        Err("decode walk exceeded bound without reaching target".to_string())
+        Ok(None)
     }
 
     fn seek(&mut self, target_micros: u64) -> Result<(), String> {

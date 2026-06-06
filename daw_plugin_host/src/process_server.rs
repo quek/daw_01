@@ -109,6 +109,39 @@ impl DispatchCounter {
     }
 }
 
+/// dispatch-critical section の teardown を `Drop` に集約する guard。
+///
+/// `plugin.process()` が **panic** すると、 通常 path の `dispatch.exit` /
+/// slot を IDLE に戻す store / `SetEvent(done)` が全て skip され、 結果
+/// plugin-main thread の [`WorkerPool::quiesce`] が対応する `exit` を永久に
+/// 待って hang する。 これらの操作を guard の `Drop` に移すことで、 normal
+/// return でも panic unwind でも **必ず** 実行され、 **当 buffer** の quiesce
+/// は解ける。 worker thread 自体の生存 (= 以降の buffer も処理し続ける) は
+/// `run_worker` が `process()` を `catch_unwind` で囲むことで担保している。
+///
+/// 操作順は normal path と同一 (exit → slot IDLE 化 → SetEvent)。
+struct DispatchGuard<'a> {
+    dispatch: &'a DispatchCounter,
+    bridge: &'a WorkerBridgeHandle,
+    idx: usize,
+    done: SendableHandle,
+}
+
+impl Drop for DispatchGuard<'_> {
+    fn drop(&mut self) {
+        // dispatch-critical section を閉じる。 ここから先 registry entry の
+        // pointer を deref しないので、 plugin-main thread が `Box` を drop
+        // しても safe になる。
+        self.dispatch.exit(self.idx);
+        // 次の stale wake がよからぬ plugin を起こさないよう、 slot を
+        // IDLE に戻す。
+        self.bridge.bridge().worker_task[self.idx].store(WorkerBridge::IDLE, Ordering::Release);
+        unsafe {
+            let _ = SetEvent(self.done.0);
+        }
+    }
+}
+
 /// Owns every worker thread and the shared shutdown flag. Dropped (or
 /// `shutdown()`-ed) on CloseWorkerPool / process exit.
 pub struct WorkerPool {
@@ -355,6 +388,17 @@ fn run_worker(
             continue;
         };
 
+        // teardown (dispatch.exit / slot IDLE 化 / SetEvent(done)) を
+        // `Drop` に集約する。 これで `plugin.process()` が panic しても
+        // `done` が必ず signal され、 plugin-main thread の `quiesce` が
+        // 永久 wait して worker pool 全体が hang するのを防ぐ。
+        let _guard = DispatchGuard {
+            dispatch: &dispatch,
+            bridge: &bridge,
+            idx: idx as usize,
+            done,
+        };
+
         // SAFETY: 上の `dispatch.enter` で dispatch-critical section
         // に入っている。 `dispatch.exit` (= `plugin.process()` 完了後)
         // が走るまでは plugin-main thread の `WorkerPool::quiesce` が
@@ -362,8 +406,11 @@ fn run_worker(
         // ない。 happens-before の論証は module-level docs 参照。
         let plugin = unsafe { &mut *entry.plugin.0 };
         let pd = unsafe { &mut *entry.process_data };
-        let frames = pd.frames;
-        let n = frames as usize;
+        // shmem 由来の `frames` を MAX_FRAMES に clamp してから slice する。
+        // audio engine 側は常に `<= MAX_FRAMES` を書くが、 shmem は信頼境界
+        // の外なので out-of-bounds slice (panic) を防ぐ防御 clamp。
+        let n = (pd.frames as usize).min(common::process_data::MAX_FRAMES);
+        let frames = n as u32;
 
         // Decode events_in → TimedNoteEvent / TimedParamEvent.
         // Phase 2b (`docs/plan_automation.md` §8.3): ParamValue events
@@ -427,16 +474,37 @@ fn run_worker(
         }
 
         let transport = crate::plugin_instance::TransportContext::from_process_data(pd);
-        if let Err(e) = plugin.process(
-            frames,
-            &events_in,
-            &param_events_in,
-            &input_audio,
-            &aux_inputs,
-            &transport,
-        ) {
-            tracing::error!(error = ?e, plugin_id, "plugin.process() failed");
-        } else {
+        // builtin / Rust 製 plugin が process() で panic すると unwind が
+        // `run_worker` の loop を抜けて worker thread が死に、 以降その idx に
+        // dispatch された buffer は誰も done を signal せず audio engine が
+        // 永久 hang する (DispatchGuard は当 buffer の quiesce しか救えない)。
+        // catch_unwind で unwind を止め worker thread を生かす。 C/C++ plugin
+        // の例外はそもそも Rust panic として unwind しないので対象は builtin。
+        let process_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            plugin.process(
+                frames,
+                &events_in,
+                &param_events_in,
+                &input_audio,
+                &aux_inputs,
+                &transport,
+            )
+        }));
+        let process_ok = match process_result {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => {
+                tracing::error!(error = ?e, plugin_id, "plugin.process() failed");
+                false
+            }
+            Err(_panic) => {
+                tracing::error!(
+                    plugin_id,
+                    "plugin.process() panicked; worker survived, buffer skipped"
+                );
+                false
+            }
+        };
+        if process_ok {
             // Copy output audio into the shmem.
             if let Some(out_l) = plugin.output_buffer(0) {
                 pd.buffer_out[0][..n].copy_from_slice(&out_l[..n]);
@@ -452,15 +520,24 @@ fn run_worker(
             // Drain plugin output events back into the shmem.
             events_out.clear();
             plugin.drain_out_notes_into(&mut events_out);
-            // Phase 2c: drain plugin-emitted param touches / values。
-            // 各 event を evt_tx 経由で plugin-main → daw_gui に流す。
-            // RT 安全性: drain は内部 vec の `append` で alloc なし
-            // (capacity 維持)、 send は std::sync::mpsc の unbounded
-            // 等価で alloc あり (channel 末尾の Node 確保)。 daw_audio
-            // から直接呼ぶケースでは PARAM_GESTURE_BEGIN / VALUE 発火
-            // は plugin GUI 操作時のみ (通常再生では 0 件)、 alloc が
-            // 走る頻度は実用上 NoteOn と同等以下。 plugin GUI が
-            // floods するケースが出たら別 lock-free queue に切替。
+            // Phase 2c: drain plugin-emitted param touches / values を
+            // evt_tx 経由で plugin-main → daw_gui に流す。
+            //
+            // KNOWN RT VIOLATION (code review 2026-06-06, High):
+            // この `run_worker` は TIME_CRITICAL + MMCSS の audio dispatch
+            // thread で、 下の `evt_tx.send` (tokio unbounded mpsc) は block
+            // 境界を跨ぐ送信で内部 Node を heap alloc する。 通常再生では
+            // 発火 0 件 (plugin GUI で knob を触ったときだけ) なので steady
+            // state の dropout には至らないが、 再生中の knob ドラッグで
+            // per-buffer に alloc が走る RT 制約違反。
+            //
+            // 正しい修正は per-worker SPSC ring (worker が唯一 producer、
+            // plugin-main が drain して evt_tx へ転送) で RT パスを「書く
+            // だけ」 にすること。 ただし worker は DispatchCounter で UAF
+            // 同期している delicate な path で、 検証には「再生中に plugin
+            // GUI ノブをドラッグ」 の実機 smoke test が要る。 RT パスを
+            // 実機検証なしに書き換えない原則 (CLAUDE.md) に従い、 専用 PR
+            // で ring 化 + 実機検証する。 docs/code_review_2026-06-06.md §6-9。
             out_param_touches.clear();
             out_param_values.clear();
             out_param_releases.clear();
@@ -535,17 +612,9 @@ fn run_worker(
             }
         }
 
-        // dispatch-critical section を閉じる。 ここから先 registry
-        // entry の pointer を deref しないので、 plugin-main thread が
-        // `Box` を drop しても safe になる。
-        dispatch.exit(idx as usize);
-
-        // 次の stale wake がよからぬ plugin を起こさないよう、 slot を
-        // IDLE に戻す。
-        bridge.bridge().worker_task[idx as usize].store(WorkerBridge::IDLE, Ordering::Release);
-        unsafe {
-            let _ = SetEvent(done.0);
-        }
+        // dispatch-critical section の teardown (dispatch.exit / slot を
+        // IDLE に戻す / SetEvent(done)) は `_guard` の `Drop` がここ (loop
+        // body スコープ末尾) で実行する。 panic unwind でも同様に走る。
     }
     tracing::info!(worker_idx = idx, "plugin worker exiting");
 }

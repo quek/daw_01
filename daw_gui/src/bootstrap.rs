@@ -11,7 +11,6 @@
 //! Handle / shmem 群が一斉に解放される (Job Object 経由で子も kill される)。
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use common::audio_bridge::{
@@ -504,5 +503,3 @@ fn load_or_build_plugin_db() -> Option<Arc<PluginDatabase>> {
     }
     None
 }
-
-const _: Duration = Duration::from_millis(0); // suppress unused import warning

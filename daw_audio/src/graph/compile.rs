@@ -38,6 +38,12 @@ pub enum GraphError {
 /// children → group `Mix` → `ProcessGroupFx` → upstream (parent group or
 /// master). Tracks without a `parent_group_id` feed the master bus
 /// directly.
+///
+/// TODO(PR3): 現状この setup コードは RT スレッド (audio callback) 上で
+/// `Engine::refresh_schedule` 経由で実行される。 内部で `Vec` / `HashMap`
+/// 等の heap 確保を伴うため、 編集着地のタイミングでバッファに glitch が
+/// 乗りうる **既知の制約**。 PR3 で `ArcSwap` publish に切り替え、 compile を
+/// off-thread (GUI / 非 RT スレッド) 化して RT パスからこの alloc を除去する。
 pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
     let n = song.tracks.len();
     if n == 0 {
@@ -276,7 +282,16 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
     // `MASTER_TRACK_ID`、 dst_slot は `Fx(i)` (master は audio fx のみ)。 source
     // が song に居ない dangling は寛容に skip (= track 経路と同方針)。
     for (slot_idx, inst) in song.master_fx_chain.iter().enumerate() {
-        for (port_idx, src_track_id_opt) in inst.sidechain_sources.iter().enumerate() {
+        // aux port は `MAX_AUX_IN` までしか engine が staging しない
+        // (engine.rs の `port >= MAX_AUX_IN` ガードと整合)。 enumerate を
+        // `take(MAX_AUX_IN)` で打ち切ることで `port_idx < MAX_AUX_IN` を
+        // 構造的に保証し、 `as u8` の wrap を防ぐ。
+        for (port_idx, src_track_id_opt) in inst
+            .sidechain_sources
+            .iter()
+            .take(common::process_data::MAX_AUX_IN)
+            .enumerate()
+        {
             let Some(src_track_id) = src_track_id_opt else {
                 continue;
             };
@@ -286,7 +301,9 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
             nodes.push(NodeOp::SidechainTap {
                 src: BufRef::TrackScratch(src_idx),
                 dst_track: common::model::MASTER_TRACK_ID,
-                dst_slot: common::protocol::PluginSlot::Fx(slot_idx as u32),
+                dst_slot: common::protocol::PluginSlot::Fx(
+                    u32::try_from(slot_idx).unwrap_or(u32::MAX),
+                ),
                 aux_in_port: port_idx as u8,
             });
         }
@@ -385,65 +402,6 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         input_delay_per_track[i] = max_sc;
     }
 
-    // PR4.5 diagnostic: log the SidechainTap count + per-tap details so
-    // the user can verify their sidechain wiring is honored by the graph
-    // compiler. compile_schedule runs only at edit-time transitions
-    // (Engine::refresh_schedule), not the RT path, so this isn't spammy.
-    let tap_count = nodes_with_pdc
-        .iter()
-        .filter(|op| matches!(op, NodeOp::SidechainTap { .. }))
-        .count();
-    if tap_count > 0 {
-        tracing::info!(
-            tap_count,
-            n_tracks = song.tracks.len(),
-            "compile_schedule emitted SidechainTap(s)",
-        );
-        for op in &nodes_with_pdc {
-            if let NodeOp::SidechainTap {
-                src,
-                dst_track,
-                dst_slot,
-                aux_in_port,
-            } = op
-            {
-                tracing::info!(?src, dst_track = *dst_track, ?dst_slot, port = *aux_in_port,
-                    "  SidechainTap detail");
-            }
-        }
-    } else {
-        // Diagnose: any track has a non-empty sidechain_sources?
-        let any_wired = song.tracks.iter().any(|t| {
-            t.midi_fx_chain.iter().any(|p| p.sidechain_sources.iter().any(|s| s.is_some()))
-                || t.instrument
-                    .as_ref()
-                    .map(|p| p.sidechain_sources.iter().any(|s| s.is_some()))
-                    .unwrap_or(false)
-                || t.fx_chain.iter().any(|p| p.sidechain_sources.iter().any(|s| s.is_some()))
-        });
-        if any_wired {
-            tracing::warn!(
-                "compile_schedule: sidechain_sources are wired but no SidechainTap was \
-                 emitted — likely all sources point at non-existent track ids (dangling)"
-            );
-            for (i, t) in song.tracks.iter().enumerate() {
-                for (j, p) in t.fx_chain.iter().enumerate() {
-                    if !p.sidechain_sources.is_empty() {
-                        tracing::warn!(
-                            track_idx = i,
-                            track_id = t.id,
-                            fx_slot = j,
-                            sidechain_sources = ?p.sidechain_sources,
-                            "  fx_chain plugin with sidechain_sources",
-                        );
-                    }
-                }
-            }
-            let known_ids: Vec<u32> = song.tracks.iter().map(|t| t.id).collect();
-            tracing::warn!(track_ids = ?known_ids, "  song track ids");
-        }
-    }
-
     Ok(Schedule {
         nodes: nodes_with_pdc,
         delay_lines,
@@ -469,7 +427,15 @@ fn emit_sidechain_taps(
                      plugins: &[common::model::PluginInstance],
                      slot_kind: fn(u32) -> common::protocol::PluginSlot| {
         for (slot_idx, inst) in plugins.iter().enumerate() {
-            for (port_idx, src_track_id_opt) in inst.sidechain_sources.iter().enumerate() {
+            // aux port は engine が `MAX_AUX_IN` までしか staging しないので
+            // `take(MAX_AUX_IN)` で `port_idx < MAX_AUX_IN` を構造的に保証し、
+            // `as u8` の wrap を防ぐ。
+            for (port_idx, src_track_id_opt) in inst
+                .sidechain_sources
+                .iter()
+                .take(common::process_data::MAX_AUX_IN)
+                .enumerate()
+            {
                 let Some(src_track_id) = src_track_id_opt else {
                     continue;
                 };
@@ -480,7 +446,7 @@ fn emit_sidechain_taps(
                 nodes.push(NodeOp::SidechainTap {
                     src: BufRef::TrackScratch(*src_idx),
                     dst_track,
-                    dst_slot: slot_kind(slot_idx as u32),
+                    dst_slot: slot_kind(u32::try_from(slot_idx).unwrap_or(u32::MAX)),
                     aux_in_port: port_idx as u8,
                 });
             }
@@ -488,7 +454,14 @@ fn emit_sidechain_taps(
     };
     push_taps(nodes, &track.midi_fx_chain, common::protocol::PluginSlot::MidiFx);
     if let Some(inst) = &track.instrument {
-        for (port_idx, src_track_id_opt) in inst.sidechain_sources.iter().enumerate() {
+        // aux port は engine が `MAX_AUX_IN` までしか staging しないので
+        // `take(MAX_AUX_IN)` で `port_idx < MAX_AUX_IN` を構造的に保証する。
+        for (port_idx, src_track_id_opt) in inst
+            .sidechain_sources
+            .iter()
+            .take(common::process_data::MAX_AUX_IN)
+            .enumerate()
+        {
             let Some(src_track_id) = src_track_id_opt else {
                 continue;
             };

@@ -212,14 +212,31 @@ fn scan_one_vst3_file(bundle_path: &Path, dll_path: &Path) -> Result<Vec<Vst3Cla
         .with_context(|| format!("LoadLibrary {}", dll_path.display()))?;
 
     // Some VST3 DLLs require InitDll()/ExitDll() around factory access. No
-    // export = fine.
-    let mut called_init = false;
+    // export = fine. Once InitDll succeeds we must call ExitDll on every
+    // exit path — including a panic during factory enumeration — so we pair
+    // it with a Drop guard (same pattern as the CLAP EntryGuard).
+    struct ExitDllGuard<'a> {
+        library: &'a Library,
+    }
+    impl<'a> Drop for ExitDllGuard<'a> {
+        fn drop(&mut self) {
+            unsafe {
+                if let Ok(exit_dll) =
+                    self.library.get::<Symbol<extern "system" fn() -> bool>>(b"ExitDll\0")
+                {
+                    let _ = exit_dll();
+                }
+            }
+        }
+    }
+
+    let mut _exit_guard = None;
     unsafe {
         if let Ok(init_dll) = library.get::<Symbol<extern "system" fn() -> bool>>(b"InitDll\0") {
             if !init_dll() {
                 anyhow::bail!("InitDll returned false for {}", dll_path.display());
             }
-            called_init = true;
+            _exit_guard = Some(ExitDllGuard { library: &library });
         }
     }
 
@@ -236,7 +253,10 @@ fn scan_one_vst3_file(bundle_path: &Path, dll_path: &Path) -> Result<Vec<Vst3Cla
         let factory2 = factory.cast::<IPluginFactory2>();
 
         let count = unsafe { factory.countClasses() };
-        let mut out = Vec::with_capacity(count.max(0) as usize);
+        // A malformed/hostile factory could report an absurd class count;
+        // cap the pre-allocation so we don't trigger an allocation bomb.
+        const MAX_CLASSES: i32 = 4096;
+        let mut out = Vec::with_capacity(count.clamp(0, MAX_CLASSES) as usize);
         for i in 0..count {
             let mut info = std::mem::MaybeUninit::<PClassInfo>::zeroed();
             let res = unsafe { factory.getClassInfo(i, info.as_mut_ptr()) };
@@ -281,21 +301,17 @@ fn scan_one_vst3_file(bundle_path: &Path, dll_path: &Path) -> Result<Vec<Vst3Cla
         Ok(out)
     })();
 
-    // Always release the factory ComPtr (via scope end) before ExitDll().
-    if called_init {
-        unsafe {
-            if let Ok(exit_dll) =
-                library.get::<Symbol<extern "system" fn() -> bool>>(b"ExitDll\0")
-            {
-                let _ = exit_dll();
-            }
-        }
-    }
-
+    // The factory ComPtr is dropped at the closure's scope end above, before
+    // `_exit_guard` runs ExitDll (guard drops here, then `library` frees the
+    // DLL). A panic inside the closure unwinds the ComPtr first too, so
+    // ExitDll is still ordered correctly on the panic path.
     result
 }
 
-fn c_array_to_string(buf: &[std::ffi::c_char]) -> String {
+/// Decode a NUL-terminated VST3 `c_char` name buffer into a `String`.
+/// Shared SSoT — `daw_plugin_host` re-uses this so scan-side and load-side
+/// string decoding can't drift.
+pub fn c_array_to_string(buf: &[std::ffi::c_char]) -> String {
     let bytes: Vec<u8> = buf
         .iter()
         .take_while(|&&b| b != 0)
@@ -304,7 +320,10 @@ fn c_array_to_string(buf: &[std::ffi::c_char]) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-fn tuid_to_hex(tuid: &TUID) -> String {
+/// Format a VST3 class id (`TUID`) as uppercase hex. Shared SSoT — scan-side
+/// (writes `cid_hex` to the plugin DB) and load-side (`daw_plugin_host`,
+/// matches against it) MUST produce identical hex, so both call this.
+pub fn tuid_to_hex(tuid: &TUID) -> String {
     let mut s = String::with_capacity(32);
     for b in tuid {
         s.push_str(&format!("{:02X}", *b as u8));

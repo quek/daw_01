@@ -82,14 +82,37 @@ impl PluginDatabase {
     /// Load the cached database from disk. Missing file / invalid JSON
     /// returns `Ok(None)` rather than an error so callers can fall back
     /// to a fresh scan.
+    ///
+    /// The returned DB is **sanitised and ready to use**: entries with an
+    /// empty `id` (corrupt cache) are dropped with a warning, and the
+    /// builtin descriptors are re-injected via [`ensure_builtins`]. This
+    /// makes "load 後は必ず builtin が居る" a function-level guarantee
+    /// rather than an implicit convention each caller must remember.
+    /// `ensure_builtins` is idempotent and `save_to_file` excludes builtins,
+    /// so a save → load round-trip has no cumulative side effect on disk.
+    ///
+    /// [`ensure_builtins`]: PluginDatabase::ensure_builtins
     pub fn load_from_file(path: &Path) -> Result<Option<Self>> {
         if !path.exists() {
             return Ok(None);
         }
         let data = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let db: PluginDatabase = serde_json::from_str(&data)
+        let mut db: PluginDatabase = serde_json::from_str(&data)
             .with_context(|| format!("failed to parse {}", path.display()))?;
+        db.entries.retain(|e| {
+            if e.id.is_empty() {
+                tracing::warn!(
+                    name = %e.name,
+                    path = %e.path.display(),
+                    "cache entry with empty id, dropping"
+                );
+                false
+            } else {
+                true
+            }
+        });
+        db.ensure_builtins();
         Ok(Some(db))
     }
 
@@ -321,7 +344,11 @@ fn scan_one_file(path: &Path) -> Result<Vec<PluginEntry>> {
         .context("factory.get_plugin_descriptor is null")?;
     let count = unsafe { get_count(factory_ptr) };
 
-    let mut out = Vec::with_capacity(count as usize);
+    // Pre-reserve, but cap the up-front allocation so a hostile/garbage
+    // factory count can't trigger a huge allocation. The loop below still
+    // honours the real `count` (push grows as needed).
+    const MAX_DESCRIPTORS: u32 = 4096;
+    let mut out = Vec::with_capacity(count.min(MAX_DESCRIPTORS) as usize);
     for i in 0..count {
         let desc_ptr = unsafe { get_desc(factory_ptr, i) };
         if desc_ptr.is_null() {
@@ -339,7 +366,7 @@ fn scan_one_file(path: &Path) -> Result<Vec<PluginEntry>> {
             name: cstr_to_string(desc.name),
             vendor: cstr_to_string(desc.vendor),
             version: cstr_to_string(desc.version),
-            features: read_feature_list(desc.features),
+            features: read_feature_list(desc.features, path),
             path: path.to_path_buf(),
             descriptor_index: i,
         });
@@ -359,20 +386,29 @@ fn cstr_to_string(p: *const c_char) -> String {
         .into_owned()
 }
 
-fn read_feature_list(ptr: *const *const c_char) -> Vec<String> {
+fn read_feature_list(ptr: *const *const c_char, path: &Path) -> Vec<String> {
     let mut out = Vec::new();
     if ptr.is_null() {
         return out;
     }
+    const MAX_FEATURES: usize = 256;
     let mut p = ptr;
     unsafe {
-        loop {
+        let mut hit_cap = true;
+        for _ in 0..MAX_FEATURES {
             let s_ptr = *p;
             if s_ptr.is_null() {
+                hit_cap = false;
                 break;
             }
             out.push(CStr::from_ptr(s_ptr).to_string_lossy().into_owned());
             p = p.add(1);
+        }
+        if hit_cap {
+            tracing::warn!(
+                path = %path.display(),
+                "feature list reached {MAX_FEATURES} entries without NULL terminator, truncating",
+            );
         }
     }
     out
@@ -428,8 +464,14 @@ mod tests {
         };
         db.save_to_file(&path).unwrap();
         let loaded = PluginDatabase::load_from_file(&path).unwrap().unwrap();
-        assert_eq!(loaded.entries, db.entries);
+        // load_from_file re-injects builtins, so compare against the
+        // expected sanitised shape rather than the raw saved entries.
+        let mut expected = db.clone();
+        expected.ensure_builtins();
+        assert_eq!(loaded.entries, expected.entries);
         assert_eq!(loaded.scanned_at, db.scanned_at);
+        // The original external entry survives the round-trip.
+        assert!(loaded.find_by_id("com.test.x").is_some());
     }
 
     #[test]
@@ -484,10 +526,18 @@ mod tests {
         };
         db.ensure_builtins();
         db.save_to_file(&path).unwrap();
+        // Inspect the raw on-disk JSON: builtins must be excluded from
+        // persistence (load_from_file re-injects them, so we can't check
+        // via the loaded DB).
+        let on_disk: PluginDatabase =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(on_disk.find_by_id(BUILTIN_ID_VOICEVOX).is_none());
+        assert!(on_disk.find_by_id(BUILTIN_ID_SILENCE).is_none());
+        assert_eq!(on_disk.entries.len(), 1);
+        assert_eq!(on_disk.entries[0].id, "com.test.x");
+        // After load the external entry is still present alongside builtins.
         let loaded = PluginDatabase::load_from_file(&path).unwrap().unwrap();
-        assert!(loaded.find_by_id(BUILTIN_ID_VOICEVOX).is_none());
-        assert!(loaded.find_by_id(BUILTIN_ID_SILENCE).is_none());
-        assert_eq!(loaded.entries.len(), 1);
-        assert_eq!(loaded.entries[0].id, "com.test.x");
+        assert!(loaded.find_by_id("com.test.x").is_some());
+        assert!(loaded.find_by_id(BUILTIN_ID_VOICEVOX).is_some());
     }
 }

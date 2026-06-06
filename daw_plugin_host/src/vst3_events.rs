@@ -82,6 +82,12 @@ impl IEventListTrait for Vst3InEventList {
 
 // --- Output list (plugin -> host) ------------------------------------------
 
+/// Upper bound on events the plugin may emit in a single `process()`. The
+/// plugin calls `addEvent` from the audio thread, so the backing `Vec` must
+/// never reallocate: we pre-reserve `OUT_EVENT_CAP` and silently drop any
+/// overflow rather than grow on the RT thread.
+const OUT_EVENT_CAP: usize = 4096;
+
 pub struct Vst3OutEventList {
     events: UnsafeCell<Vec<Event>>,
 }
@@ -92,7 +98,7 @@ unsafe impl Sync for Vst3OutEventList {}
 impl Vst3OutEventList {
     pub fn new() -> Self {
         Self {
-            events: UnsafeCell::new(Vec::with_capacity(64)),
+            events: UnsafeCell::new(Vec::with_capacity(OUT_EVENT_CAP)),
         }
     }
 
@@ -135,6 +141,11 @@ impl IEventListTrait for Vst3OutEventList {
             return kInvalidArgument;
         }
         let events = &mut *self.events.get();
+        // Called on the audio thread: never reallocate. Drop overflow past
+        // the pre-reserved bound instead of growing the backing buffer.
+        if events.len() >= OUT_EVENT_CAP {
+            return kResultOk;
+        }
         events.push(*ev);
         kResultOk
     }

@@ -19,12 +19,11 @@ pub fn save(path: impl AsRef<Path>, song: &Song) -> Result<()> {
     let path = path.as_ref();
     let tmp = tmp_path(path);
 
-    // GC orphan content / audio_source entries (refcount == 0) before
-    // serializing so disk files stay tidy. Working on a clone —
+    // Normalize for save (GC orphan content / audio / video / image
+    // source-pool entries) so disk files stay tidy. Working on a clone —
     // caller's in-memory Song is not mutated.
     let mut song = song.clone();
-    song.gc_clip_contents();
-    song.gc_audio_sources();
+    song.normalize_for_save();
     let project = ProjectFile {
         version: CURRENT_VERSION,
         song,
@@ -82,21 +81,14 @@ pub fn load(path: impl AsRef<Path>) -> Result<Song> {
         );
     }
     let mut song = project.song;
-    // v5 → v6 migration: drain any legacy `Clip.notes` into the shared
-    // `clip_contents` store, allocating fresh `content_id` for clips that
-    // still carry the sentinel `0`. Idempotent for v6 / v7 files.
-    song.ensure_clip_contents();
-    // v6 → v7 forward migration: `audio_sources` is empty for v6 files
-    // (serde default), but we still bump `next_audio_source_id` above
-    // any sentinel just in case. Idempotent.
-    song.ensure_audio_source_ids();
-    // Phase 6 review (SSOT 違反 fix): 旧コードは `ensure_ids()` 呼出を
-    // caller (= `daw_gui::app::open_project` / `script::open` 等) に依存
-    // していて、 invariant が caller 依存だった。 ここで呼ぶことで
-    // `common::project::load` の戻り値が常に「track_id / clip_id / parent_
-    // group_id が consistent」 という不変条件を満たす。 idempotent なので
-    // caller 側が再呼び出ししても安全。
-    song.ensure_ids();
+    // Re-establish every invariant the codebase assumes about a loaded
+    // song in one SSoT call: value-range sanity (bpm/time_sig/length/loop
+    // — defends downstream divisors against 0/NaN from corrupt files),
+    // v5→v6/v6→v7 content & source-id migration, stable id assignment
+    // (track/clip/parent_group_id consistency), and the scale-change /
+    // automation-point sort invariants. Idempotent — safe if a caller
+    // (e.g. `daw_gui::app::open_project`) re-runs it.
+    song.normalize_after_load();
     Ok(song)
 }
 
@@ -168,18 +160,11 @@ mod tests {
             }],
             ..Track::default()
         });
-        // Phase 6 review: ensure_ids() を load 内で呼ぶようになったので、
-        // assert する original 側でも同じ normalization を適用する (= idempotent
-        // なので両方かけると 1 回 + 0 回 = 同じ最終状態)。 元データは
-        // `next_track_id == track.id` という不変条件違反の状態で構築されて
-        // いて、 ensure_ids が `next_id > max_existing_id` を強制する仕様
-        // どおりに修正する。
-        song.ensure_ids();
-        // v20: load() drains the legacy per-clip `name` into
-        // `clip_content_names` via `ensure_clip_contents`. Apply the same
-        // normalization to the original so the round-trip assert compares
-        // like-with-like (idempotent — load runs it once more on read).
-        song.ensure_clip_contents();
+        // load() runs `normalize_after_load` (ensure_ids + ensure_clip_
+        // contents + sanitize + sorts). Apply the same normalization to
+        // the original so the round-trip assert compares like-with-like
+        // (idempotent — load runs it once more on read).
+        song.normalize_after_load();
         save(&path, &song).unwrap();
         assert_eq!(load(&path).unwrap(), song);
     }

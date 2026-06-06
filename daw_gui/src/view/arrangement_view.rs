@@ -137,34 +137,56 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             }
         }
     }
+    // Song-level lanes (master row) share the same content store, so count
+    // them too — `clip_content_refcount` includes them (model.rs:917), and the
+    // automation-lane share-group lookup below relies on this batch map being
+    // equivalent to that O(N) helper.
+    for lane in &app.song.song_lanes {
+        for c in &lane.clips {
+            *refcount_by_content.entry(c.content_id).or_insert(0) += 1;
+        }
+    }
 
     // gui_01 #068 連動ハイライト: アクティブな共有グループの content_id 集合
     // = {選択中 clip の content_id} ∪ {前フレーム hover clip の content_id}、
     // refcount>=2 のみ。 各 clip の `in_active_group` 判定に使う。
-    let active_groups: std::collections::HashSet<common::model::ContentId> = {
-        let mut set = std::collections::HashSet::new();
-        let is_shared = |cid: common::model::ContentId| {
-            refcount_by_content.get(&cid).copied().unwrap_or(0) >= 2
-        };
-        for r in &app.selected_clips {
-            if let Some(c) = app
-                .song
-                .tracks
-                .get(r.track as usize)
-                .and_then(|t| t.clips.get(r.clip as usize))
-                && is_shared(c.content_id)
-            {
-                set.insert(c.content_id);
+    let active_groups: std::collections::HashSet<common::model::ContentId> =
+        // 選択も hover も無ければ走査・確保ともに不要 (= 大半のフレーム)。
+        // `HashSet::new()` は最初の insert まで heap 確保しないので、 この
+        // 早期分岐は per-frame の loop オーバヘッドを消すための最小改善。
+        if app.selected_clips.is_empty() && app.arrange_hover_content.is_none() {
+            std::collections::HashSet::new()
+        } else {
+            let mut set = std::collections::HashSet::new();
+            let is_shared = |cid: common::model::ContentId| {
+                refcount_by_content.get(&cid).copied().unwrap_or(0) >= 2
+            };
+            for r in &app.selected_clips {
+                if let Some(c) = app
+                    .song
+                    .tracks
+                    .get(r.track as usize)
+                    .and_then(|t| t.clips.get(r.clip as usize))
+                    && is_shared(c.content_id)
+                {
+                    set.insert(c.content_id);
+                }
             }
-        }
-        if let Some(cid) = app.arrange_hover_content
-            && is_shared(cid)
-        {
-            set.insert(cid);
-        }
-        set
-    };
+            if let Some(cid) = app.arrange_hover_content
+                && is_shared(cid)
+            {
+                set.insert(cid);
+            }
+            set
+        };
 
+    // TODO(perf, 優先度中): この `tracks: Vec<ArrangementTrack>` は毎フレーム
+    // 全 track × 全 clip ぶん再確保している (track/clip name の `Arc::from`、
+    // nested `Vec` collect)。 name は rename 時しか変わらないので、 理想は
+    // AppData 側で `Arc<str>` を保持し rename 時のみ作り直す形。 ただし
+    // AppData (app.rs) の変更が要るため本ファイル単独では入れられない (別タスク)。
+    // 本ファイル内で消せる重複 (clip 単位の `clip_contents` 二重 lookup) は
+    // 下の clip `.map` で `content` を 1 度引いて使い回す形に済ませた。
     let tracks: Vec<ArrangementTrack> = app
         .song
         .tracks
@@ -199,7 +221,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             clips: t
                 .clips
                 .iter()
-                .map(|c| ArrangementClip {
+                .map(|c| {
+                    // Phase 6 review perf: 同一 clip に対する
+                    // `clip_contents.get(&c.content_id)` を 1 度だけ引いて
+                    // `audio_edit` / `thumbnail` 枝で使い回す (旧コードは枝ごと
+                    // に lookup していた)。 `name` の `text_clip_label` だけは
+                    // helper が map 全体を受ける別 idiom なのでそのまま。
+                    let content = app.song.clip_contents.get(&c.content_id);
+                    ArrangementClip {
                     id: c.id,
                     start_beat: c.start_beat,
                     len_beats: c.length_beats,
@@ -244,10 +273,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     // を「clip 全体の field」 として表示。 widget は drag release で
                     // `SetClipGainDb` / `SetClipFade` / `SetClipFadeCurve` を発行
                     // するので make_edit 側で受けて AppEvent に変換する。
-                    audio_edit: app
-                        .song
-                        .clip_contents
-                        .get(&c.content_id)
+                    audio_edit: content
                         .and_then(|ct| ct.audio_events())
                         .and_then(|events| events.first())
                         .map(|ev| ArrangementClipAudioEdit {
@@ -274,8 +300,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         // `image_texture_cache`. The two are mutually
                         // exclusive per clip (= one ClipContent variant per
                         // content_id), so this `or_else` chain has no
-                        // ambiguity.
-                        let content = app.song.clip_contents.get(&c.content_id);
+                        // ambiguity. `content` は closure 冒頭で 1 度引いた
+                        // ものを使い回す。
                         content
                             .and_then(|ct| ct.video_events())
                             .and_then(|events| events.first())
@@ -294,6 +320,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                                 Some((handle, src.width, src.height))
                             })
                     },
+                    }
                 })
                 .collect(),
             // gui_01 #016 で追加された group hierarchy fields:
@@ -307,7 +334,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             // lane が空の track でも collapsed flag は設定するが、 widget は
             // 「lane 0 件 → disclosure ▶/▼ 非表示」 で扱う。
             automation_lanes_collapsed: !app.expanded_automation_tracks.contains(&t.id),
-            automation_lanes: build_arrangement_automation_lanes(t, &app.song),
+            automation_lanes: build_arrangement_automation_lanes(t, &app.song, &refcount_by_content),
             // gui_01 #031 (M14 Phase 63n-6): 個別 track row 高さ override。
             // None なら global `view.track_row_h` (= Alt+wheel で動く既存値) を
             // 使う。Some(px) なら override (Alt+drag / 下端 splitter drag で
@@ -442,7 +469,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // session state、 negation で widget 側 `automation_lanes_collapsed` に
     // map)。 song_lanes が空でも master_row 自体は表示するため、 常に
     // `Some(...)` を渡す idiom (= None は本機能未使用時用)。
-    let master_row_lanes = build_arrangement_lanes_from_slice(&app.song.song_lanes, &app.song);
+    let master_row_lanes =
+        build_arrangement_lanes_from_slice(&app.song.song_lanes, &app.song, &refcount_by_content);
     let master_row = daw_ui_core::ArrangementMasterRow {
         automation_lanes_collapsed: !app.master_row_automation_expanded,
         automation_lanes: master_row_lanes,
@@ -1743,8 +1771,9 @@ fn text_clip_label(
 fn build_arrangement_automation_lanes(
     track: &common::model::Track,
     song: &common::model::Song,
+    refcount_by_content: &std::collections::HashMap<common::model::ContentId, usize>,
 ) -> Vec<ArrangementAutomationLane> {
-    build_arrangement_lanes_from_slice(&track.automation_lanes, song)
+    build_arrangement_lanes_from_slice(&track.automation_lanes, song, refcount_by_content)
 }
 
 /// gui_01 #034 (Phase 63n-10): `Track.automation_lanes` でも `Song.song_lanes`
@@ -1753,6 +1782,7 @@ fn build_arrangement_automation_lanes(
 fn build_arrangement_lanes_from_slice(
     lanes: &[common::model::AutomationLane],
     song: &common::model::Song,
+    refcount_by_content: &std::collections::HashMap<common::model::ContentId, usize>,
 ) -> Vec<ArrangementAutomationLane> {
     lanes
         .iter()
@@ -1781,7 +1811,15 @@ fn build_arrangement_lanes_from_slice(
                         len_beats: c.length_beats,
                         name: Arc::from(song.content_name(c.content_id)),
                         points,
-                        share_group_color: if song.clip_content_refcount(c.content_id) >= 2 {
+                        // Phase 6 review perf: 旧 `clip_content_refcount`
+                        // (= 全 clip scan, automation lane で N²) を draw 冒頭で
+                        // batch 計算済 `refcount_by_content` の O(1) lookup へ。
+                        share_group_color: if refcount_by_content
+                            .get(&c.content_id)
+                            .copied()
+                            .unwrap_or(0)
+                            >= 2
+                        {
                             Some(content_id_to_hue(c.content_id))
                         } else {
                             None
@@ -1813,6 +1851,13 @@ struct LaneDisplay {
 /// `AutomationTarget` ごとの label / icon / 識別色。 label 文字列は
 /// `Arc::from` で都度生成 (per-frame だが lane 数は片手で数える程度なので
 /// allocation コストは無視できる)。
+///
+/// TODO(perf, 優先度低): `SendGain` / `PluginParam` 枝だけは `format!` +
+/// `Arc::from` を毎フレーム走らせている。 lane 構成 (= target 集合) は通常
+/// 変化しないので、 AppData 側に「lane id → 表示 label」 の小キャッシュを
+/// 持たせ、 lane の追加 / 削除 / target 変更時のみ再生成すれば消せる。
+/// 現状は lane 数が少なく実害が無いため未着手 (キャッシュ導入は AppData の
+/// 変更が要るので別タスク)。
 fn lane_target_display(target: &common::model::AutomationTarget) -> LaneDisplay {
     use common::model::{AutomationTarget, ImageBuiltinParam, TrackBuiltinParam};
     match target {
@@ -2141,10 +2186,11 @@ fn draw_audio_clip_waveform(
     is_selected: bool,
 ) {
     // Phase 6 review (debug): user 報告「波形が表示されないクリップがある」
-    // の原因特定のため、 早期 return パスに warn ログを置く。 原因が分かっ
-    // たら downgrade / 削除する。
+    // の原因特定用 instrumentation。 これは per-frame の描画パスなので warn だと
+    // 該当 clip がある間ずっとログを溢れさせる。 既定では出さず、 必要なときだけ
+    // `RUST_LOG=...=trace` で拾えるよう trace に降格する。
     let Some(t_idx) = app.song.tracks.iter().position(|t| t.id == clip_key.track) else {
-        tracing::warn!(?clip_key, "draw_audio_clip_waveform: track not found");
+        tracing::trace!(?clip_key, "draw_audio_clip_waveform: track not found");
         return;
     };
     let Some(c_idx) = app.song.tracks[t_idx]
@@ -2152,12 +2198,12 @@ fn draw_audio_clip_waveform(
         .iter()
         .position(|c| c.id == clip_key.clip)
     else {
-        tracing::warn!(?clip_key, "draw_audio_clip_waveform: clip not found");
+        tracing::trace!(?clip_key, "draw_audio_clip_waveform: clip not found");
         return;
     };
     let clip = &app.song.tracks[t_idx].clips[c_idx];
     let Some(content) = app.song.clip_contents.get(&clip.content_id) else {
-        tracing::warn!(
+        tracing::trace!(
             ?clip_key,
             content_id = clip.content_id,
             "draw_audio_clip_waveform: content not found"
@@ -2169,7 +2215,7 @@ fn draw_audio_clip_waveform(
         return;
     };
     let Some(event) = events.first() else {
-        tracing::warn!(
+        tracing::trace!(
             ?clip_key,
             content_id = clip.content_id,
             "draw_audio_clip_waveform: audio content has empty events"
@@ -2177,7 +2223,7 @@ fn draw_audio_clip_waveform(
         return;
     };
     let Some(buffer) = app.audio_source_cache.get(event.source_id) else {
-        tracing::warn!(
+        tracing::trace!(
             ?clip_key,
             content_id = clip.content_id,
             source_id = event.source_id,
@@ -2224,7 +2270,9 @@ fn draw_audio_clip_waveform(
         view_rect.w -= cut_px;
     }
     if view_rect.w <= 0.0 || view_rect.h <= 0.0 {
-        tracing::warn!(
+        // per-frame の描画パスなので warn だと該当 clip がある間ログを溢れさせる。
+        // 既定では出さず trace に降格 (= 早期 return 群と同方針)。
+        tracing::trace!(
             ?clip_key,
             w = view_rect.w,
             h = view_rect.h,

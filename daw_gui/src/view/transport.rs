@@ -4,6 +4,8 @@
 //! Master fader / L-R peak meter は Mixer の MASTER ストリップで一本化したため、
 //! ここでは持たない。
 
+use std::sync::LazyLock;
+
 use common::model::{AutomationTarget, MASTER_TRACK_ID, RecordingMode};
 use daw_ui_core::{
     Edit, ScrubableNumberFormat, ScrubableNumberStyle, ToggleButtonStyle, Ui,
@@ -61,6 +63,20 @@ const RECORDING_MODES: &[(RecordingMode, &str)] = &[
     (RecordingMode::Latch, "Latch"),
     (RecordingMode::Write, "Write"),
 ];
+
+/// scale dropdown のラベル列。 `Scale::display_name` は `const fn -> &'static str`
+/// だが配列化は毎フレームの collect を避けるため一度だけ行う。
+static SCALE_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    common::scale::Scale::ALL_PRESETS
+        .iter()
+        .map(|s| s.display_name())
+        .collect()
+});
+
+/// recording mode dropdown のラベル列 (= `RECORDING_MODES` の label 列)。
+/// 毎フレームの collect を避けるため一度だけ生成する。
+static REC_LABELS: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| RECORDING_MODES.iter().map(|(_, l)| *l).collect());
 
 /// Phase 7 B4 Step C/D (2026-05-13): MIDI Record toggle button のスタイル。
 /// active 時 record red (= 業界標準) + hint band で「録音中」 を強調。
@@ -332,15 +348,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
     x += root_w + 4.0;
 
-    let scale_names: Vec<&str> = common::scale::Scale::ALL_PRESETS
-        .iter()
-        .map(|s| s.display_name())
-        .collect();
     let scale_w = 124.0;
     if let Some(idx) = ui.dropdown(
         "transport_key_scale",
         Rect { x, y: cy, w: scale_w, h: bh },
-        &scale_names,
+        SCALE_NAMES.as_slice(),
         cur_scale_idx,
     ) {
         let new_scale = common::scale::Scale::ALL_PRESETS
@@ -392,11 +404,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         .iter()
         .position(|(m, _)| *m == app.recording_mode)
         .unwrap_or(0);
-    let rec_labels: Vec<&str> = RECORDING_MODES.iter().map(|(_, l)| *l).collect();
     if let Some(idx) = ui.dropdown(
         "transport_rec_mode",
         Rect { x, y: cy, w: rec_mode_w, h: bh },
-        &rec_labels,
+        REC_LABELS.as_slice(),
         cur_rec_idx,
     ) && let Some((mode, _)) = RECORDING_MODES.get(idx)
     {

@@ -383,8 +383,12 @@ pub enum BindingTarget {
 impl Song {
     /// Allocate a new stable track id, bumping the song-level counter.
     pub fn alloc_track_id(&mut self) -> u32 {
-        let id = self.next_track_id.max(1);
-        self.next_track_id = id + 1;
+        // `u32::MAX` is reserved as `MASTER_TRACK_ID`; clamp the usable
+        // range to `[1, MASTER_TRACK_ID - 1]` so we never hand out the
+        // sentinel, and `saturating_add` keeps the counter from wrapping
+        // back to the `0` sentinel on exhaustion.
+        let id = self.next_track_id.clamp(1, MASTER_TRACK_ID - 1);
+        self.next_track_id = id.saturating_add(1);
         id
     }
 
@@ -392,7 +396,7 @@ impl Song {
     /// `next_song_lane_id` を bump して返す。
     pub fn alloc_song_lane_id(&mut self) -> u32 {
         let id = self.next_song_lane_id.max(1);
-        self.next_song_lane_id = id + 1;
+        self.next_song_lane_id = id.saturating_add(1);
         id
     }
 
@@ -413,6 +417,82 @@ impl Song {
     pub fn ensure_scale_changes_sorted(&mut self) {
         self.scale_changes
             .sort_by(|a, b| a.beat.partial_cmp(&b.beat).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    /// Re-establish the time-ascending sort invariant on every automation
+    /// curve. `automation::evaluate_clip` binary-searches `points` assuming
+    /// `time_beat` ascending; a hand-edited / corrupt `.daw` whose order is
+    /// scrambled would otherwise return silently wrong values (which the
+    /// audio thread reads via `lane_value_at`). Idempotent.
+    pub fn ensure_automation_points_sorted(&mut self) {
+        for content in self.clip_contents.values_mut() {
+            if let ClipContent::Automation(a) = content {
+                a.points.sort_by(|x, y| {
+                    x.time_beat
+                        .partial_cmp(&y.time_beat)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+        }
+    }
+
+    /// Clamp persisted scalar fields into valid ranges. The persistence
+    /// layer is the trust boundary where data crosses back in from disk /
+    /// IPC, so this is the single place that defends every downstream
+    /// divisor (`samples_per_beat = sr*60/bpm`, `tsig_denom`, ...) against
+    /// `0` / negative / `NaN` values from a corrupt or hand-edited file.
+    /// `NaN` slips past naive `x <= 0.0` guards (`NaN <= 0.0` is `false`),
+    /// so every check is written as `!is_finite() || out_of_range`.
+    /// Idempotent.
+    pub fn sanitize_ranges(&mut self) {
+        if !self.bpm.is_finite() {
+            self.bpm = 120.0;
+        } else {
+            self.bpm = self.bpm.clamp(1.0, 1000.0);
+        }
+        // Numerator 1..=32, denominator must be a power-of-two beat unit.
+        self.time_sig.0 = self.time_sig.0.clamp(1, 32);
+        if !matches!(self.time_sig.1, 1 | 2 | 4 | 8 | 16) {
+            self.time_sig.1 = 4;
+        }
+        for v in [&mut self.length_beats, &mut self.loop_start_beat, &mut self.loop_end_beat] {
+            if !(v.is_finite() && *v >= 0.0) {
+                *v = 0.0;
+            }
+        }
+        if !(self.video_framerate.is_finite() && self.video_framerate > 0.0) {
+            self.video_framerate = default_video_framerate();
+        }
+        if self.video_resolution.0 == 0 || self.video_resolution.1 == 0 {
+            self.video_resolution = default_video_resolution();
+        }
+    }
+
+    /// Single entry point for all pre-save normalization. GC orphan
+    /// content / source-pool entries so the on-disk file stays tidy and
+    /// every persisted `content_id` / source id is still referenced. Call
+    /// on a clone from `project::save` (does not mutate the live song).
+    pub fn normalize_for_save(&mut self) {
+        self.gc_clip_contents();
+        self.gc_audio_sources();
+        self.gc_video_sources();
+        self.gc_image_sources();
+    }
+
+    /// Single entry point for all post-load normalization. Re-establishes
+    /// every invariant the rest of the codebase assumes about a freshly
+    /// loaded song — value-range sanity, content / source migration, stable
+    /// ids, and sort order — so `project::load`'s return value is always
+    /// self-consistent regardless of how the file was produced. Idempotent.
+    pub fn normalize_after_load(&mut self) {
+        self.sanitize_ranges();
+        self.ensure_clip_contents();
+        self.ensure_audio_source_ids();
+        self.ensure_video_source_ids();
+        self.ensure_image_source_ids();
+        self.ensure_ids();
+        self.ensure_scale_changes_sorted();
+        self.ensure_automation_points_sorted();
     }
 
     /// Phase 5: find a song-level lane (mutable) by id。 Track の
@@ -623,7 +703,7 @@ impl Song {
     /// Allocate a fresh `ContentId`, bumping the song-level counter.
     pub fn alloc_content_id(&mut self) -> ContentId {
         let id = self.next_content_id.max(1);
-        self.next_content_id = id + 1;
+        self.next_content_id = id.saturating_add(1);
         id
     }
 
@@ -696,6 +776,13 @@ impl Song {
                     if clip.content_id != 0 {
                         max_seen = max_seen.max(clip.content_id);
                     }
+                }
+            }
+        }
+        for lane in &self.song_lanes {
+            for clip in &lane.clips {
+                if clip.content_id != 0 {
+                    max_seen = max_seen.max(clip.content_id);
                 }
             }
         }
@@ -781,6 +868,29 @@ impl Song {
                 }
             }
         }
+        // Song-level automation lanes share the same content store but are
+        // not reached by the per-track walk above. Reassign sentinel ids,
+        // drain legacy names, and ensure an entry exists — mirroring the
+        // `automation_lanes` handling so SongTempo / TimeSig curves resolve
+        // instead of silently falling back to empty.
+        for l_idx in 0..self.song_lanes.len() {
+            let lane_clip_count = self.song_lanes[l_idx].clips.len();
+            for c_idx in 0..lane_clip_count {
+                if self.song_lanes[l_idx].clips[c_idx].content_id == 0 {
+                    let new_id = self.alloc_content_id();
+                    self.song_lanes[l_idx].clips[c_idx].content_id = new_id;
+                }
+                let cid = self.song_lanes[l_idx].clips[c_idx].content_id;
+                let legacy_name =
+                    std::mem::take(&mut self.song_lanes[l_idx].clips[c_idx].name);
+                if !legacy_name.is_empty() {
+                    self.clip_content_names.entry(cid).or_insert(legacy_name);
+                }
+                self.clip_contents.entry(cid).or_insert_with(|| {
+                    ClipContent::Automation(AutomationContent::default())
+                });
+            }
+        }
     }
 
     /// Refcount of a `ContentId` = number of clips across all tracks
@@ -801,7 +911,16 @@ impl Song {
             .flat_map(|l| l.clips.iter())
             .filter(|c| c.content_id == content_id)
             .count();
-        main_clips + auto_clips
+        // Song-level lanes share the same content store, so they must be
+        // counted too — otherwise a shared tempo curve reads refcount 0
+        // and the GUI / GC treat it as unreferenced.
+        let song_lane_clips = self
+            .song_lanes
+            .iter()
+            .flat_map(|l| l.clips.iter())
+            .filter(|c| c.content_id == content_id)
+            .count();
+        main_clips + auto_clips + song_lane_clips
     }
 
     /// Resolve a `Clip`'s shared notes via its `content_id`. Returns
@@ -853,6 +972,15 @@ impl Song {
                 }
             }
         }
+        // Song-level automation lanes (SongTempo / TimeSig master lanes)
+        // share the same `clip_contents` store. Without walking them, a
+        // tempo-automation curve's `content_id` is judged dead and GC'd
+        // before save, losing the whole curve on next load.
+        for lane in &self.song_lanes {
+            for clip in &lane.clips {
+                live.insert(clip.content_id);
+            }
+        }
         self.clip_contents.retain(|id, _| live.contains(id));
         // Shared names follow content lifecycle: drop names whose
         // content_id no longer has any referencing clip.
@@ -862,7 +990,7 @@ impl Song {
     /// Allocate a fresh `AudioSourceId`, bumping the song-level counter.
     pub fn alloc_audio_source_id(&mut self) -> AudioSourceId {
         let id = self.next_audio_source_id.max(1);
-        self.next_audio_source_id = id + 1;
+        self.next_audio_source_id = id.saturating_add(1);
         id
     }
 
@@ -943,7 +1071,7 @@ impl Song {
     /// `alloc_audio_source_id`.
     pub fn alloc_video_source_id(&mut self) -> VideoSourceId {
         let id = self.next_video_source_id.max(1);
-        self.next_video_source_id = id + 1;
+        self.next_video_source_id = id.saturating_add(1);
         id
     }
 
@@ -1018,7 +1146,7 @@ impl Song {
     /// `alloc_video_source_id`.
     pub fn alloc_image_source_id(&mut self) -> ImageSourceId {
         let id = self.next_image_source_id.max(1);
-        self.next_image_source_id = id + 1;
+        self.next_image_source_id = id.saturating_add(1);
         id
     }
 
@@ -1343,7 +1471,7 @@ impl Track {
     /// Allocate a new stable clip id, bumping the per-track counter.
     pub fn alloc_clip_id(&mut self) -> u32 {
         let id = self.next_clip_id.max(1);
-        self.next_clip_id = id + 1;
+        self.next_clip_id = id.saturating_add(1);
         id
     }
 
@@ -1378,7 +1506,7 @@ impl Track {
     /// Allocate a new stable lane id, bumping the per-track counter.
     pub fn alloc_lane_id(&mut self) -> u32 {
         let id = self.next_lane_id.max(1);
-        self.next_lane_id = id + 1;
+        self.next_lane_id = id.saturating_add(1);
         id
     }
 
@@ -2619,7 +2747,7 @@ impl AutomationLane {
     /// Allocate a new stable clip id within this lane.
     pub fn alloc_clip_id(&mut self) -> u32 {
         let id = self.next_clip_id.max(1);
-        self.next_clip_id = id + 1;
+        self.next_clip_id = id.saturating_add(1);
         id
     }
 
@@ -3348,6 +3476,67 @@ mod tests {
         });
         song.gc_clip_contents();
         assert!(song.clip_contents.contains_key(&cid));
+    }
+
+    #[test]
+    fn gc_clip_contents_keeps_song_lane_references() {
+        // Regression: a content_id only referenced by a song-level
+        // automation clip (SongTempo master lane) must survive
+        // `gc_clip_contents`. The earlier impl walked only `tracks[]` and
+        // dropped it, silently deleting tempo-automation curves on save.
+        let mut song = Song::default();
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Automation(AutomationContent::default()),
+        );
+        song.song_lanes.push(AutomationLane {
+            id: 1,
+            clips: vec![AutomationClip {
+                id: 1,
+                name: "tempo".into(),
+                start_beat: 0.0,
+                length_beats: 4.0,
+                content_id: cid,
+            }],
+            ..AutomationLane::new(AutomationTarget::SongTempo, 120.0)
+        });
+        song.gc_clip_contents();
+        assert!(
+            song.clip_contents.contains_key(&cid),
+            "song-lane automation content must survive GC"
+        );
+        assert_eq!(
+            song.clip_content_refcount(cid),
+            1,
+            "song-lane clip must count toward refcount"
+        );
+    }
+
+    #[test]
+    fn ensure_clip_contents_reassigns_song_lane_sentinel_ids() {
+        // Regression: a song-lane clip carrying the sentinel content_id 0
+        // must get a fresh id and a content entry, else automation eval /
+        // GUI lookup always fall back to empty.
+        let mut song = Song::default();
+        song.song_lanes.push(AutomationLane {
+            id: 1,
+            clips: vec![AutomationClip {
+                id: 1,
+                name: "tempo".into(),
+                start_beat: 0.0,
+                length_beats: 4.0,
+                content_id: 0,
+            }],
+            ..AutomationLane::new(AutomationTarget::SongTempo, 120.0)
+        });
+        song.ensure_clip_contents();
+        let cid = song.song_lanes[0].clips[0].content_id;
+        assert_ne!(cid, 0, "sentinel content_id must be reassigned");
+        assert!(
+            song.clip_contents.contains_key(&cid),
+            "reassigned song-lane content must have an entry"
+        );
     }
 
     #[test]

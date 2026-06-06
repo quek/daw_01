@@ -12,8 +12,12 @@
 //! blur passes (M14 Phase 78). daw_01 stays out of glyphon and just
 //! supplies the per-frame description.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use common::model::{
-    AutomationTarget, FadeCurve, Song, TextAlign, TextBuiltinParam, TextEvent, Track,
+    AutomationLane, AutomationTarget, FadeCurve, Song, TextAlign, TextBuiltinParam, TextEvent,
+    Track,
 };
 
 /// One text event active at the current playhead. Shares the
@@ -22,11 +26,12 @@ use common::model::{
 /// gui_01's call-order interleave gives the top track the front.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActiveTextFrame {
-    /// Display string (single line, UTF-8). Caller wraps in `Arc<str>`
-    /// when pushing to `GlyphArea.text`.
-    pub text: String,
+    /// Display string (single line, UTF-8). Already `Arc<str>` so the
+    /// caller hands it straight to `GlyphArea.text` (also `Arc<str>`)
+    /// with a refcount bump instead of a fresh allocation per frame.
+    pub text: Arc<str>,
     /// System font name (`""` = renderer default).
-    pub font_family: String,
+    pub font_family: Arc<str>,
     /// Project-resolution px (= 1920x1080 で 48.0 なら 48 px)。
     /// `FontSize` lane が effective ならその値、 さもなくば event.font_size_px.
     pub font_size_px: f32,
@@ -106,8 +111,8 @@ pub fn active_text_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveText
                     continue;
                 }
                 out.push(ActiveTextFrame {
-                    text: event.text.clone(),
-                    font_family: event.font_family.clone(),
+                    text: Arc::from(event.text.as_str()),
+                    font_family: Arc::from(event.font_family.as_str()),
                     font_size_px: resolved.font_size_px,
                     x: resolved.x,
                     y: resolved.y,
@@ -164,10 +169,17 @@ fn resolve_text_fields(
     event: &TextEvent,
     song_beat: f64,
 ) -> ResolvedText {
+    // Index the track's `TextBuiltin` lanes once (single pass) so the 23
+    // field resolutions below are O(1) hashmap lookups instead of 23
+    // linear scans over `automation_lanes`.
+    let mut lane_index: HashMap<TextBuiltinParam, &AutomationLane> = HashMap::new();
+    for lane in &track.automation_lanes {
+        if let AutomationTarget::TextBuiltin(p) = lane.target {
+            lane_index.insert(p, lane);
+        }
+    }
     let lane_value = |field: TextBuiltinParam| -> Option<f32> {
-        let lane = track.automation_lanes.iter().find(|l| {
-            matches!(l.target, AutomationTarget::TextBuiltin(p) if p == field)
-        })?;
+        let lane = *lane_index.get(&field)?;
         let v = common::automation::lane_value_at(lane, &song.clip_contents, song_beat);
         Some(v as f32)
     };
@@ -326,7 +338,7 @@ mod tests {
         let frames = active_text_sources_at(&song, 4.0);
         assert_eq!(frames.len(), 1);
         let f = &frames[0];
-        assert_eq!(f.text, "Hello");
+        assert_eq!(&*f.text, "Hello");
         assert_eq!(f.x, 0.1);
         assert_eq!(f.y, 0.4);
         assert_eq!(f.w, 0.8);

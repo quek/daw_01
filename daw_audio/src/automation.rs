@@ -81,7 +81,10 @@ pub fn fill_track_param_ramps(
         }
         // Phase 4 Step C-2: 現在 recording 中の lane なら curve eval skip。
         // 上で fill した track.volume / track.pan の constant が残る。
-        if recording_lanes.contains(&(track_id, lane.target.clone())) {
+        if recording_lanes
+            .iter()
+            .any(|(t, tg)| *t == track_id && *tg == lane.target)
+        {
             continue;
         }
         // Borrow the right buffer for this lane's target. Plugin

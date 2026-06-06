@@ -715,8 +715,41 @@ fn daw_inspect_song_json(
     _args: &[JsValue],
     _ctx: &mut Context,
 ) -> JsResult<JsValue> {
-    let json = with_host(|host| serde_json::to_string(&host.app.song))
-        .map_err(|e| js_native(format!("inspectSongJson: serialize: {e}")))?;
+    // v20+ clip names live in the SSoT `Song.clip_content_names`, not in
+    // `Clip.name` (drained to empty on load, `skip_serializing_if`). Serialize
+    // a clone with names re-hydrated from the SSoT so the inspected JSON
+    // reflects what the user actually sees (and matches the rename smoke
+    // test's contract). Without this, every clip name reads back `undefined`.
+    let json = with_host(|host| {
+        let mut song = host.app.song.clone();
+        let names = song.clip_content_names.clone();
+        let rehydrate = |clips: &mut Vec<common::model::Clip>| {
+            for clip in clips {
+                if let Some(n) = names.get(&clip.content_id) {
+                    clip.name = n.clone();
+                }
+            }
+        };
+        for track in &mut song.tracks {
+            rehydrate(&mut track.clips);
+            for lane in &mut track.automation_lanes {
+                for clip in &mut lane.clips {
+                    if let Some(n) = names.get(&clip.content_id) {
+                        clip.name = n.clone();
+                    }
+                }
+            }
+        }
+        for lane in &mut song.song_lanes {
+            for clip in &mut lane.clips {
+                if let Some(n) = names.get(&clip.content_id) {
+                    clip.name = n.clone();
+                }
+            }
+        }
+        serde_json::to_string(&song)
+    })
+    .map_err(|e| js_native(format!("inspectSongJson: serialize: {e}")))?;
     Ok(JsString::from(json.as_str()).into())
 }
 

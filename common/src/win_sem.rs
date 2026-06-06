@@ -13,6 +13,11 @@ use windows::core::HSTRING;
 const WAIT_INFINITE: u32 = 0xFFFF_FFFF;
 
 /// RAII wrapper around a Win32 named semaphore.
+///
+/// 現状 buffer handshake には使われず、named kernel object を保持する目的。
+/// 実 signaling は worker_bridge + auto-reset Event 側で行う。
+/// `wait` / `release` / `wait_timeout_ms` は現時点で未使用 (dead API) だが、
+/// 上記の理由で残してある。
 pub struct Semaphore {
     handle: HANDLE,
 }
@@ -43,6 +48,7 @@ impl Semaphore {
 
     /// Returns `Ok(true)` if the semaphore was acquired, `Ok(false)` on timeout.
     pub fn wait_timeout_ms(&self, ms: u32) -> Result<bool> {
+        debug_assert!(ms != WAIT_INFINITE, "use wait() for an infinite wait");
         let r = unsafe { WaitForSingleObject(self.handle, ms) };
         if r == WAIT_OBJECT_0 {
             Ok(true)

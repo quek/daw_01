@@ -29,7 +29,8 @@ use windows::Win32::Media::MediaFoundation::{
     IMFSourceReader, MFAudioFormat_Float, MFCreateAttributes, MFCreateMediaType,
     MFCreateSourceReaderFromURL, MFMediaType_Audio, MFMediaType_Video, MFSTARTUP_FULL,
     MFStartup, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_NUM_CHANNELS,
-    MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
+    MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_MAJOR_TYPE,
     MF_MT_SUBTYPE, MF_PD_DURATION, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
     MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
     MF_SOURCE_READER_MEDIASOURCE, MF_SOURCE_READERF_ENDOFSTREAM, MF_VERSION,
@@ -230,6 +231,11 @@ pub fn extract_metadata(path: &Path) -> Result<VideoMetadata, VideoImportError> 
         })?;
     let width = (frame_size >> 32) as u32;
     let height = (frame_size & 0xFFFF_FFFF) as u32;
+    if width == 0 || height == 0 {
+        return Err(VideoImportError::DecodeFailed(format!(
+            "invalid frame size {width}x{height}"
+        )));
+    }
 
     // MF_MT_FRAME_RATE packs (numerator:u32, denominator:u32) likewise.
     let framerate = match unsafe { video_type.GetUINT64(&MF_MT_FRAME_RATE) } {
@@ -388,6 +394,25 @@ pub fn extract_thumbnail(path: &Path) -> Result<ThumbnailFrame, VideoImportError
             ))
         })?;
 
+    // The copy loop below assumes a tightly-packed `width*4` stride.
+    // For RGB32 under WMF that's almost always exact, but a video
+    // processor MFT can in principle negotiate a padded stride. Read
+    // the negotiated `MF_MT_DEFAULT_STRIDE` (best-effort) so a mismatch
+    // is at least visible in the logs rather than silently producing a
+    // skewed thumbnail. A proper fix would copy row-by-row.
+    if let Ok(current_type) = unsafe { reader.GetCurrentMediaType(video_stream) }
+        && let Ok(stride) = unsafe { current_type.GetUINT32(&MF_MT_DEFAULT_STRIDE) }
+    {
+        let expected = width.saturating_mul(4);
+        if stride != expected {
+            tracing::warn!(
+                stride,
+                expected,
+                "thumbnail: MF_MT_DEFAULT_STRIDE != width*4; thumbnail may be skewed (row padding not handled)"
+            );
+        }
+    }
+
     // Drain ReadSample until we get a real sample (skip STREAMTICK
     // gaps). Bail with an error if we reach EOS without any sample.
     let frame_bytes = width as usize * height as usize * 4;
@@ -531,6 +556,13 @@ pub fn extract_audio_to_wav(
         as u16;
     let sample_rate = unsafe { native.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND) }
         .map_err(|e| VideoImportError::DecodeFailed(format!("audio sample_rate: {e}")))?;
+    // A degenerate channel count (= WMF reported 0) would divide-by-zero
+    // in the frame accounting below (`cur_len / 4 / channels`); a 0
+    // sample rate likewise produces an unusable WAV. Treat either as
+    // "no usable audio stream" so callers fall back to video-only.
+    if channels == 0 || sample_rate == 0 {
+        return Ok(None);
+    }
 
     // Build the desired output type: PCM Float32 at the source's
     // native rate / channels. Letting WMF insert the resampler MFT

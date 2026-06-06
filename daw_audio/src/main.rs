@@ -138,7 +138,12 @@ async fn recv_loop(
                 shared.playhead.store(samples, Ordering::Release);
                 tracing::info!(samples, "received SeekTo");
             }
-            Ok(MainToChild::LoadSong(song)) => {
+            Ok(MainToChild::LoadSong(mut song)) => {
+                // IPC は信頼境界なので、 受信した song の値域を store 前に
+                // 正規化 (bpm/time_sig/length/loop/framerate を有限・正に)。
+                // これで下流の divisor (samples_per_beat 等) が NaN / 0 /
+                // 負値で壊れない。 idempotent。
+                song.sanitize_ranges();
                 // PR6: AudioClipRenderer を再 build (WAV decode + event
                 // schedule flatten)。 LoadSong は IPC 受信スレッドから
                 // 呼ばれるので decode はここで synchronous (Phase 2 で
@@ -518,6 +523,13 @@ fn handle_open_worker_pool(
         done_event_names.len() == n_workers as usize,
         "done_event_names len {} != n_workers {}",
         done_event_names.len(),
+        n_workers
+    );
+    // IPC 由来の n_workers で worker_task[i] を indexing する前に上限検証
+    // (out-of-bounds panic を防ぐ)。
+    anyhow::ensure!(
+        (n_workers as usize) <= common::worker_bridge::MAX_WORKERS,
+        "n_workers {} exceeds MAX_WORKERS",
         n_workers
     );
     let bridge = common::worker_bridge::WorkerBridgeHandle::open(worker_bridge_shmem_id)

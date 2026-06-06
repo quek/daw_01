@@ -28,6 +28,11 @@ const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
 const TEXT_DIM: Color = Color { r: 0.62, g: 0.65, b: 0.70, a: 1.0 };
 const GHOST: Color = Color { r: 0.95, g: 0.78, b: 0.31, a: 0.85 };
 
+/// common な mono / stereo source 用の borrowed-plane スタック配列サイズ。
+/// channel 数がこれ以下なら event ループ内の毎フレーム `Vec` 確保を消せる。
+/// これを超える source (5.1 等) は Vec フォールバックで全 plane を描く。
+const MAX_WAVEFORM_CHANNELS: usize = 2;
+
 /// PR-D 段階 3: 中央 drag 中の event ghost (rectangle outline)。 dx は
 /// drag.delta.0 (px)。 描画は wf_area で clip。
 fn push_move_ghost(ui: &mut Ui<'_, AppData>, event_rect: Rect, wf_area: Rect, dx: f32) {
@@ -304,10 +309,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // するので毎フレーム再計算。 wf_area.w (px) は view_len_beats (beats)
     // 分の幅を表示している。 1 px = beats_per_px。
     let beats_per_px = (view_len_beats / wf_area.w as f64).max(1e-9);
-    let target = match app.audio_editor_clip {
-        Some(t) => t,
-        None => return,
-    };
+    // `target` は冒頭 (clip 解決時) に bind 済み。 `app` は &AppData で
+    // 不変なので `audio_editor_clip` は変化せず、 再 resolve は不要。
     let clip_id = clip.id;
 
     // ----- Wheel scroll / zoom (Bitwig 流) -------------------------------
@@ -392,8 +395,21 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             h: wf_area.h,
         };
 
-        let planes_borrowed: Vec<&[f32]> =
-            buffer.samples.iter().map(Vec::as_slice).collect();
+        // SampleSlices::Planar 用の borrowed-plane。 common な mono/stereo は
+        // スタック配列で event ループ内の毎フレーム heap 確保を消し、 稀な
+        // >2ch source のときだけ Vec にフォールバックして全 plane を描く
+        // (= channel を黙って捨てない)。
+        let mut planes_buf: [&[f32]; MAX_WAVEFORM_CHANNELS] = [&[]; MAX_WAVEFORM_CHANNELS];
+        let planes_fallback: Vec<&[f32]>;
+        let planes_borrowed: &[&[f32]] = if buffer.samples.len() <= MAX_WAVEFORM_CHANNELS {
+            for (i, plane) in buffer.samples.iter().enumerate() {
+                planes_buf[i] = plane.as_slice();
+            }
+            &planes_buf[..buffer.samples.len()]
+        } else {
+            planes_fallback = buffer.samples.iter().map(Vec::as_slice).collect();
+            &planes_fallback
+        };
         let event_len_frames = event
             .source_end_frames
             .saturating_sub(event.source_start_frames)
@@ -421,7 +437,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             * event_len_frames as f64) as u64;
 
         let source = WaveformSource {
-            samples: SampleSlices::Planar(&planes_borrowed),
+            samples: SampleSlices::Planar(planes_borrowed),
             valid_len: buffer.frames as usize,
             generation: event.source_id as u64,
             sample_rate: buffer.sample_rate,

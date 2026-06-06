@@ -1351,8 +1351,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let _ = (label_w, summary);
     }
 
+    // カーソルトラックの index。None のとき以降の per-track セクションは
+    // 描画しない (track 0 を誤対象にしない)。
+    let cursor_idx = app.cursor_track_index();
+
     // Vocal source 編集 (Vocal track のときのみ)
-    if let Some(track) = app.song.tracks.get(app.cursor_track_index().unwrap_or(0))
+    if let Some(track) = cursor_idx.and_then(|i| app.song.tracks.get(i))
         && let common::model::InstrumentSource::Vocal { speaker_id, .. } = &track.source
     {
         ui.label_at(
@@ -1382,37 +1386,33 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             );
         } else {
             // 各 singer の各 style を 1 entry に flatten。
-            // 「<キャラ名> - <スタイル名>」 を表示、 selected_idx は speaker_id 一致で決定
-            let entries: Vec<(u32, String, String)> = app
-                .singers
-                .iter()
-                .flat_map(|s| {
-                    s.styles.iter().map(move |st| {
-                        (
-                            st.id,
-                            s.name.clone(),
-                            st.name.clone(),
-                        )
-                    })
-                })
-                .collect();
-            let labels: Vec<String> = entries
-                .iter()
-                .map(|(_, n, sn)| format!("{n} - {sn}"))
-                .collect();
+            // 「<キャラ名> - <スタイル名>」 を表示、 selected_idx は speaker_id 一致で決定。
+            // entries は picked → (id, style_name) の逆引き用。表示ラベルは labels
+            // に直接 format して持つ (style_name はここで 1 度だけ clone)。
+            // TODO(gui_01): dropdown は閉時でも items: &[&str] 全体を要求するため
+            // (len() + open 時の popup 描画)、 labels の format! を毎フレーム避けられない。
+            // selected ラベルのみ生成する lazy-items dropdown API が gui_01 側に必要。
+            let mut entries: Vec<(u32, String)> = Vec::new();
+            let mut labels: Vec<String> = Vec::new();
+            for s in &app.singers {
+                for st in &s.styles {
+                    labels.push(format!("{} - {}", s.name, st.name));
+                    entries.push((st.id, st.name.clone()));
+                }
+            }
             let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
             let selected_idx = entries
                 .iter()
-                .position(|(id, _, _)| *id == *speaker_id)
+                .position(|(id, _)| *id == *speaker_id)
                 .unwrap_or(0);
             if let Some(picked) = ui.dropdown(
                 "inspector_vocal_dropdown",
                 dropdown_rect,
                 &label_refs,
                 selected_idx,
-            ) && let Some((id, _, style_name)) = entries.get(picked)
+            ) && let Some((id, style_name)) = entries.get(picked)
             {
-                let track_idx = app.cursor_track_index().unwrap_or(0) as u32;
+                let track_idx = cursor_idx.unwrap_or(0) as u32;
                 let new_id = *id;
                 let new_style = style_name.clone();
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -1433,7 +1433,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // children (or any track really — the cycle check in
     // `action_set_track_parent` rejects bad picks). Master bus =
     // "(top-level)" sentinel.
-    if let Some(track) = app.song.tracks.get(app.cursor_track_index().unwrap_or(0)) {
+    if let Some(track) = cursor_idx.and_then(|i| app.song.tracks.get(i)) {
         // Candidates: tracks that already have at least one child (= are
         // groups in the Reaper-folder sense), excluding the selected
         // track itself and any of its descendants. Picking a non-group
@@ -1442,13 +1442,24 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // the user picks it as parent here and the act of pointing at
         // it makes it one. PR2 phase 1 keeps the simpler "groups only"
         // candidate list; expand later if it surfaces as a friction.
-        let groups: Vec<(u32, String)> = app
+        // group_ids[k] と labels[k+1] が対応 (labels[0] = "(top-level)" sentinel)。
+        // 表示名はここで 1 度だけ format/clone する (別 Vec への再 clone を避ける)。
+        let mut group_ids: Vec<u32> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+        labels.push("(top-level)".into());
+        for t in app
             .song
             .tracks
             .iter()
             .filter(|t| app.is_group_track(t.id) && t.id != track.id)
-            .map(|t| (t.id, if t.name.is_empty() { format!("Group {}", t.id) } else { t.name.clone() }))
-            .collect();
+        {
+            group_ids.push(t.id);
+            labels.push(if t.name.is_empty() {
+                format!("Group {}", t.id)
+            } else {
+                t.name.clone()
+            });
+        }
 
         ui.label_at(
             "inspector_parent_label",
@@ -1467,17 +1478,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             h: 24.0,
         };
 
-        // Build option list: "(top-level)" then every other group track.
-        let mut labels: Vec<String> = Vec::with_capacity(groups.len() + 1);
-        labels.push("(top-level)".into());
-        labels.extend(groups.iter().map(|(_, n)| n.clone()));
         let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
 
         let selected_idx = match track.parent_group_id {
             None => 0,
-            Some(pid) => groups
+            Some(pid) => group_ids
                 .iter()
-                .position(|(id, _)| *id == pid)
+                .position(|id| *id == pid)
                 .map(|i| i + 1)
                 .unwrap_or(0),
         };
@@ -1491,7 +1498,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let new_parent = if picked == 0 {
                 None
             } else {
-                groups.get(picked - 1).map(|(id, _)| *id)
+                group_ids.get(picked - 1).copied()
             };
             let track_id = track.id;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -1507,27 +1514,24 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // ---- 口パク (lip-sync) 出力先 binding ----------------------------
     // Vocal track のみ。生成した口画像 ImageEvent を焼き込む先の口 track
     // (立ち絵 group の子 image track) を選ぶ。設定で再生成が走る。
-    if let Some(track) = app.song.tracks.get(app.cursor_track_index().unwrap_or(0))
+    if let Some(track) = cursor_idx.and_then(|i| app.song.tracks.get(i))
         && matches!(track.source, common::model::InstrumentSource::Vocal { .. })
     {
         let self_id = track.id;
         // 候補: 自分以外の全 track (= 口 track はどれでも選べる)。
-        let candidates: Vec<(u32, String)> = app
-            .song
-            .tracks
-            .iter()
-            .filter(|t| t.id != self_id)
-            .map(|t| {
-                (
-                    t.id,
-                    if t.name.is_empty() {
-                        format!("Track {}", t.id)
-                    } else {
-                        t.name.clone()
-                    },
-                )
-            })
-            .collect();
+        // candidate_ids[k] と labels[k+1] が対応 (labels[0] = "(なし)" sentinel)。
+        // 表示名はここで 1 度だけ format/clone する (別 Vec への再 clone を避ける)。
+        let mut candidate_ids: Vec<u32> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+        labels.push("(なし)".into());
+        for t in app.song.tracks.iter().filter(|t| t.id != self_id) {
+            candidate_ids.push(t.id);
+            labels.push(if t.name.is_empty() {
+                format!("Track {}", t.id)
+            } else {
+                t.name.clone()
+            });
+        }
         ui.label_at(
             "inspector_lipsync_target_label",
             "口パク出力先",
@@ -1543,15 +1547,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             w: area.w - pad * 2.0,
             h: 24.0,
         };
-        let mut labels: Vec<String> = Vec::with_capacity(candidates.len() + 1);
-        labels.push("(なし)".into());
-        labels.extend(candidates.iter().map(|(_, n)| n.clone()));
         let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         let selected_idx = match track.lipsync_target_track {
             None => 0,
-            Some(tid) => candidates
+            Some(tid) => candidate_ids
                 .iter()
-                .position(|(id, _)| *id == tid)
+                .position(|id| *id == tid)
                 .map(|i| i + 1)
                 .unwrap_or(0),
         };
@@ -1564,7 +1565,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let target = if picked == 0 {
                 None
             } else {
-                candidates.get(picked - 1).map(|(id, _)| *id)
+                candidate_ids.get(picked - 1).copied()
             };
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::SetLipsyncTarget {
@@ -1579,7 +1580,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // ---- 口パク mapping (口形状 → 画像) -------------------------------
     // この track を口パク出力先に指定している vocal track があるとき、7 形状
     // (a/i/u/e/o/N/閉口) の画像割当を表示する。各 slot は import 済み image を選ぶ。
-    if let Some(track) = app.song.tracks.get(app.cursor_track_index().unwrap_or(0)) {
+    if let Some(track) = cursor_idx.and_then(|i| app.song.tracks.get(i)) {
         let this_id = track.id;
         let is_target = app
             .song
@@ -1597,6 +1598,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             );
             y += 18.0;
             // import 済み image source の (id, ファイル名) 一覧 (id 昇順)。
+            // image_ids[k] と labels[k+1] が対応 (labels[0] = "(なし)" sentinel)。
+            // ラベル文字列を別 Vec へ再 clone せず、 ソート後そのまま labels へ move する。
             let mut images: Vec<(common::model::ImageSourceId, String)> = app
                 .song
                 .image_sources
@@ -1604,7 +1607,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 .map(|(id, src)| (*id, image_source_label(src)))
                 .collect();
             images.sort_by_key(|(id, _)| *id);
-            let map = track.mouth_map.clone().unwrap_or_default();
+            let map = track.mouth_map.as_ref();
             const SHAPES: [(common::model::MouthShape, &str); 7] = [
                 (common::model::MouthShape::A, "あ"),
                 (common::model::MouthShape::I, "い"),
@@ -1614,9 +1617,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 (common::model::MouthShape::N, "ん"),
                 (common::model::MouthShape::Closed, "閉"),
             ];
+            let mut image_ids: Vec<common::model::ImageSourceId> =
+                Vec::with_capacity(images.len());
             let mut labels: Vec<String> = Vec::with_capacity(images.len() + 1);
             labels.push("(なし)".into());
-            labels.extend(images.iter().map(|(_, n)| n.clone()));
+            for (id, name) in images {
+                image_ids.push(id);
+                labels.push(name);
+            }
             let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
             for (slot_i, (shape, shape_label)) in SHAPES.iter().enumerate() {
                 ui.label_at(
@@ -1633,13 +1641,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     w: area.w - pad * 2.0 - 40.0,
                     h: 22.0,
                 };
-                let cur = map.get(*shape);
+                let cur = map.map_or(0, |m| m.get(*shape));
                 let selected_idx = if cur == 0 {
                     0
                 } else {
-                    images
+                    image_ids
                         .iter()
-                        .position(|(id, _)| *id == cur)
+                        .position(|id| *id == cur)
                         .map(|i| i + 1)
                         .unwrap_or(0)
                 };
@@ -1652,7 +1660,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     let source_id = if picked == 0 {
                         0
                     } else {
-                        images.get(picked - 1).map(|(id, _)| *id).unwrap_or(0)
+                        image_ids.get(picked - 1).copied().unwrap_or(0)
                     };
                     let shape = *shape;
                     ui.push_edit(Edit::mutate(move |app: &mut AppData| {

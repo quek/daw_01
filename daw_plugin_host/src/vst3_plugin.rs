@@ -19,12 +19,14 @@
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use common::plugin_format::PluginFormat;
 use common::protocol::RenderMode;
 use common::vst3_scan::resolve_vst3_dll;
 use libloading::{Library, Symbol};
+use common::vst3_scan::{c_array_to_string, tuid_to_hex};
 use vst3::{
     ComPtr, ComWrapper, Interface,
     Steinberg::{
@@ -119,6 +121,18 @@ pub struct Vst3Plugin {
     /// automation lane values (`TimedParamEvent`) into the plugin. Owned
     /// here so the audio thread never allocates a COM object per buffer.
     in_param_changes: ComWrapper<Vst3InParamChanges>,
+    /// Set by `process()` (RT thread) when the param-change pool overflowed
+    /// (> capacity distinct params in one buffer; extra param events dropped).
+    /// Logged once from `stop_processing()` (RT-external) so the hot path never
+    /// formats a message or touches `tracing`. `Relaxed` is sufficient: this is
+    /// a best-effort diagnostic flag, not a synchronization signal.
+    param_pool_overflowed: AtomicBool,
+    /// Debug-only: set by `process()` when `IAudioProcessor::process` returned
+    /// a non-OK status, logged once (with the status) from `stop_processing()`.
+    /// Same flag idiom as `param_pool_overflowed` so a misbehaving plugin can't
+    /// flood the log every buffer.
+    #[cfg(debug_assertions)]
+    process_status_err: std::sync::atomic::AtomicI32,
     /// Transport / timing block the plugin reads via `ProcessData.processContext`.
     /// Several instruments (SynthMaster 3, some Arturia products) stay silent
     /// when this pointer is null because they gate their voice allocator on
@@ -367,6 +381,9 @@ impl Vst3Plugin {
             in_event_list: ComWrapper::new(Vst3InEventList::new()),
             out_event_list: ComWrapper::new(Vst3OutEventList::new()),
             in_param_changes: ComWrapper::new(Vst3InParamChanges::new()),
+            param_pool_overflowed: AtomicBool::new(false),
+            #[cfg(debug_assertions)]
+            process_status_err: std::sync::atomic::AtomicI32::new(kResultOk),
             process_context: unsafe { std::mem::zeroed() },
             render_mode: RenderMode::Realtime,
             view: None,
@@ -474,7 +491,15 @@ fn aux_input_bus_channels(component: &ComPtr<IComponent>) -> Vec<u32> {
                 );
                 break;
             }
-            aux.push(info.channelCount as u32);
+            // Match the main-bus side's `.max(0)` (channelCount is i32 and can
+            // be negative on malformed plugins) and clamp to the host's
+            // per-bus channel ceiling. The shmem aux buffer only carries
+            // `MAX_CHANNELS` planes (`buffer_aux_in[..][MAX_CHANNELS][..]`), and
+            // `process()` only ever fills l/r from `AuxInputBuf`, so anything
+            // above that would be allocated-but-never-fed silence.
+            let ch = (info.channelCount.max(0) as u32)
+                .min(common::process_data::MAX_CHANNELS as u32);
+            aux.push(ch);
         }
     }
     aux
@@ -608,22 +633,10 @@ fn create_instance<I: Interface>(
     unsafe { ComPtr::<I>::from_raw(obj as *mut I) }
 }
 
-fn c_array_to_string(buf: &[std::ffi::c_char]) -> String {
-    let bytes: Vec<u8> = buf
-        .iter()
-        .take_while(|&&b| b != 0)
-        .map(|&b| b as u8)
-        .collect();
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
-fn tuid_to_hex(tuid: &TUID) -> String {
-    let mut s = String::with_capacity(32);
-    for b in tuid {
-        s.push_str(&format!("{:02X}", *b as u8));
-    }
-    s
-}
+// `c_array_to_string` / `tuid_to_hex` live in `common::vst3_scan` as the
+// shared SSoT (imported above) so scan-side (writes `cid_hex` to the plugin
+// DB) and load-side (this module, matches against it) hex / name decoding can
+// never drift.
 
 impl Drop for Vst3Plugin {
     fn drop(&mut self) {
@@ -917,6 +930,25 @@ impl LoadedPlugin for Vst3Plugin {
             self.audio.setProcessing(0);
         }
         self.processing = false;
+        // Drain the RT-set overflow flag here (off the hot path). Swap-and-test
+        // so the warning fires at most once per overflow episode.
+        if self.param_pool_overflowed.swap(false, Ordering::Relaxed) {
+            tracing::warn!(
+                plugin = %self.name,
+                "VST3 param changes pool overflow (>64 distinct params/buffer); extra dropped"
+            );
+        }
+        #[cfg(debug_assertions)]
+        {
+            let status = self.process_status_err.swap(kResultOk, Ordering::Relaxed);
+            if status != kResultOk {
+                tracing::warn!(
+                    plugin = %self.name,
+                    status = format!("{status:#x}"),
+                    "VST3 process returned non-OK"
+                );
+            }
+        }
     }
 
     fn process(
@@ -993,10 +1025,10 @@ impl LoadedPlugin for Vst3Plugin {
         // automation も normalized で持つ、 enumerate_params が min0/max1 で
         // 報告するため整合)。
         if self.in_param_changes.set_changes(param_events) {
-            tracing::warn!(
-                plugin = %self.name,
-                "VST3 param changes pool overflow (>64 distinct params/buffer); extra dropped"
-            );
+            // RT path: just raise a flag. The actual log (which formats
+            // `%self.name`) happens once in `stop_processing()`, off the RT
+            // thread, to keep `process()` free of heap allocation and tracing.
+            self.param_pool_overflowed.store(true, Ordering::Relaxed);
         }
 
         // `to_com_ptr` only bumps the Arc strong count + addRef; no heap
@@ -1142,11 +1174,10 @@ impl LoadedPlugin for Vst3Plugin {
         let status = unsafe { self.audio.process(&mut data) };
         #[cfg(debug_assertions)]
         if status != kResultOk {
-            tracing::warn!(
-                plugin = %self.name,
-                status = format!("{status:#x}"),
-                "VST3 process returned non-OK"
-            );
+            // Record (don't log) here: `format!` would heap-allocate on the RT
+            // thread and an unhappy plugin returns non-OK every buffer. The
+            // actual warning fires once from `stop_processing()`.
+            self.process_status_err.store(status, Ordering::Relaxed);
         }
 
         // Drain collected events before the ComPtrs drop (order doesn't

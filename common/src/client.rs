@@ -33,6 +33,13 @@ pub async fn read_session(client: &mut NamedPipeClient) -> Result<AudioSession> 
     match read_msg::<_, MainToChild>(client).await? {
         MainToChild::Session(s) => {
             tracing::info!(?s, "received audio session");
+            anyhow::ensure!(
+                s.sample_rate > 0
+                    && s.max_frames > 0
+                    && s.max_frames <= crate::audio_bridge::MAX_FRAMES
+                    && s.channels > 0,
+                "invalid audio session: {s:?}"
+            );
             Ok(s)
         }
         other => anyhow::bail!("expected Session, got {:?}", other),

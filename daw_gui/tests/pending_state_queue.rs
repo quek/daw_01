@@ -106,6 +106,7 @@ fn fake_plugin_loaded(
         id: id.into(),
         name: id.into(),
         plugin_id,
+        shmem_id: String::new(),
         state_load_error: None,
     });
 }

@@ -713,7 +713,7 @@ impl PreviewWindowState {
                 layer.shadow_color[3] * layer.alpha,
             );
             self.scene.push_text(GlyphArea {
-                text: layer.text.clone().into(),
+                text: layer.text.clone(),
                 left,
                 top,
                 font_size,

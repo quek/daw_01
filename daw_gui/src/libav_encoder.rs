@@ -91,10 +91,12 @@ impl LibavEncoder {
         if width == 0 || height == 0 {
             return Err(format!("invalid resolution {width}x{height}"));
         }
-        if framerate <= 0.0 {
+        if framerate <= 0.0 || framerate > 1000.0 {
             return Err(format!("invalid framerate {framerate}"));
         }
 
+        // Both `fps_num` candidates (round() and round()*1000) stay inside i32
+        // range because `framerate` is bounded to (0, 1000] above.
         let (fps_num, fps_den) = if (framerate - framerate.round()).abs() < 1e-3 {
             (framerate.round() as i32, 1)
         } else {

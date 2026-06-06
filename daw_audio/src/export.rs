@@ -82,7 +82,7 @@ pub fn run_export(
     // walk past write_end by tail_max so plugin release tails / verbs
     // can decay; walk start is always frame 0 to keep plugin state
     // consistent at the requested start_frame.
-    let total_samples = write_end + tail_max_samples;
+    let total_samples = write_end.saturating_add(tail_max_samples);
 
     tracing::info!(
         path = %path.display(),

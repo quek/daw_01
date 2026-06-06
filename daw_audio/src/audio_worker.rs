@@ -25,7 +25,7 @@ use common::model::Song;
 use common::plugin_ref::{PluginRef, WorkerSyncRef};
 use common::protocol::PluginSlot;
 
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading::{
     GetCurrentThread, INFINITE, SetEvent, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
     WaitForSingleObject,
@@ -333,22 +333,39 @@ impl AudioWorkerPool {
         }
     }
 
-    pub fn shutdown(self) {
+    pub fn n_workers(&self) -> usize {
+        self.workers.len()
+    }
+}
+
+impl Drop for AudioWorkerPool {
+    /// Tear the pool down cleanly: flag shutdown, wake every worker so it
+    /// drops out of its `WaitForSingleObject(INFINITE)` idle, join the
+    /// threads, then close the wake/all_done event HANDLEs. Without this
+    /// the worker threads block forever and the events leak when the old
+    /// pool is replaced (it lives inside an `Arc`, so `shutdown(self)`
+    /// could never be reached).
+    fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         for w in &self.wakes {
             unsafe {
                 let _ = SetEvent(w.0);
             }
         }
-        for h in self.workers {
+        for h in std::mem::take(&mut self.workers) {
             if h.join().is_err() {
                 tracing::error!("audio worker thread panicked");
             }
         }
-    }
-
-    pub fn n_workers(&self) -> usize {
-        self.workers.len()
+        // Threads have exited; the wake/all_done events are now unused.
+        for w in &self.wakes {
+            unsafe {
+                let _ = CloseHandle(w.0);
+            }
+        }
+        unsafe {
+            let _ = CloseHandle(self.all_done.0);
+        }
     }
 }
 

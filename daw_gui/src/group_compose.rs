@@ -143,12 +143,56 @@ pub fn active_visual_groups(
     song: &Song,
     song_beat: f64,
 ) -> std::collections::HashMap<u32, GroupTransform> {
-    let mut out = std::collections::HashMap::new();
-    for track in &song.tracks {
-        if is_group_track(song, track.id) && group_has_visual_content(song, track.id) {
-            let gt = group_active_transform(track, song, song_beat).unwrap_or_default();
-            out.insert(track.id, gt);
+    use std::collections::{HashMap, HashSet};
+
+    // 親→子の隣接を 1pass で構築（O(N)）。`is_group_track` の per-track O(N) 線形
+    // 走査と、`group_has_visual_content` の per-track BFS を排して O(tracks^3) を畳む。
+    // adjacency の key 集合 = group track（= 誰かに親として指されている track）。
+    let mut group_ids: HashSet<u32> = HashSet::new();
+    for t in &song.tracks {
+        if let Some(pid) = t.parent_group_id {
+            group_ids.insert(pid);
         }
+    }
+
+    // 各 track が visual clip を直に持つかを 1 回だけ判定（合計 O(全 clip)）。
+    // 直に持つ track から `parent_group_id` チェーンを上に辿り、その track 自身と
+    // 全祖先 group を「subtree に visual clip あり」とマーク（cycle 安全に hop 上限）。
+    // これで `group_has_visual_content` の descendant BFS（root は self の clip も検査）
+    // を、全 group ぶん 1 度の上昇伝播で解く。
+    let by_id: HashMap<u32, &Track> = song.tracks.iter().map(|t| (t.id, t)).collect();
+    let mut subtree_has_clip: HashSet<u32> = HashSet::new();
+    for t in &song.tracks {
+        if !track_has_visual_clip(t, song) {
+            continue;
+        }
+        let mut cur = Some(t.id);
+        let mut hops = 0;
+        while let Some(id) = cur {
+            if !subtree_has_clip.insert(id) {
+                break; // 既訪 → 以遠の祖先も既に塗られている。
+            }
+            hops += 1;
+            if hops > song.tracks.len() + 1 {
+                break; // cycle 安全弁。
+            }
+            cur = by_id.get(&id).and_then(|t| t.parent_group_id);
+        }
+    }
+
+    let mut out = HashMap::new();
+    for track in &song.tracks {
+        if !group_ids.contains(&track.id) {
+            continue; // group track でない。
+        }
+        // visual グループ判定（§5.6）: group 自身が group_transform を持つ、または
+        // subtree（自身を含む）に visual clip がある。
+        let visual = track.group_transform.is_some() || subtree_has_clip.contains(&track.id);
+        if !visual {
+            continue;
+        }
+        let gt = group_active_transform(track, song, song_beat).unwrap_or_default();
+        out.insert(track.id, gt);
     }
     out
 }

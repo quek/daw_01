@@ -7,6 +7,14 @@
 #![allow(dead_code)]
 
 use common::model::{Note, Song};
+use common::process_data::MAX_EVENTS;
+
+/// `active_notes` の RT-safe な上限。 push 前にこの値でクランプして
+/// `Vec` 再確保 (= RT 違反) を防ぐ。 `midi_bus_a` の `MAX_EVENTS` (=256)
+/// と同等にして、 1 buffer 内で出力しうる On 数を吸収する。
+/// SSoT: backing の `PerTrackState::with_capacity` (mixer.rs) も同じ
+/// `MAX_EVENTS` で確保しているので、 clamp が効く限り再確保は起きない。
+const ACTIVE_NOTES_CAP: usize = MAX_EVENTS;
 
 /// PR-V2.4: `note_id` を追加。 audio engine が track 内全 clip notes を
 /// flatten した「通し index」 を振り、 plugin host (= builtin VOICEVOX) は
@@ -165,6 +173,13 @@ pub fn collect_events_for_buffer(
             let off_abs_beat = raw_off_abs_beat.min(clip_end_beats);
 
             if on_abs_beat >= playhead_beats && on_abs_beat < buf_end_beats {
+                // RT-safe: 容量超過分は drop し `Vec` 再確保を避ける。 On を
+                // drop したら対応する `active_notes` も積まず整合を保つ
+                // (= 後で flush しても残らない)。 `out` は `MAX_EVENTS`、
+                // `active_notes` は `ACTIVE_NOTES_CAP` でクランプ。
+                if out.len() >= MAX_EVENTS || active_notes.len() >= ACTIVE_NOTES_CAP {
+                    continue;
+                }
                 let time_samples =
                     ((on_abs_beat - playhead_beats) * samples_per_beat).max(0.0);
                 #[allow(
@@ -186,6 +201,13 @@ pub fn collect_events_for_buffer(
                 && off_abs_beat >= playhead_beats
                 && off_abs_beat < buf_end_beats
             {
+                // RT-safe: `out` 容量超過時は Off を emit せず、 `active_notes`
+                // からも除かない (= 後続の Stop / loop-wrap flush で NoteOff が
+                // 送られ note が残らない)。 push できない Off を握りつぶして
+                // 追跡解除すると stuck note になるため、 両方とも skip する。
+                if out.len() >= MAX_EVENTS {
+                    continue;
+                }
                 let time_samples =
                     ((off_abs_beat - playhead_beats) * samples_per_beat).max(0.0);
                 #[allow(

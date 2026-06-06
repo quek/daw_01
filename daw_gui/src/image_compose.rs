@@ -12,7 +12,8 @@
 //!   from `video_playback::active_sources_at` by `z_index`.
 
 use common::model::{
-    AutomationTarget, FadeCurve, ImageBuiltinParam, ImageEvent, ImageSourceId, Song, Track,
+    AutomationLane, AutomationTarget, FadeCurve, ImageBuiltinParam, ImageEvent, ImageSourceId,
+    Song, Track,
 };
 
 /// One image event active at the current playhead. Mirrors
@@ -72,12 +73,18 @@ pub fn active_image_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveIma
         return Vec::new();
     }
     let mut out: Vec<ActiveImageFrame> = Vec::new();
-    // `song.tracks[0]` is the top of the arrangement; iterate
-    // `.rev()` for bottom→top. Each video-kind track that emits at
-    // least one image event gets a unique `z_index` slot, mirroring
-    // the layering rule used by video clips.
-    let mut z_index: u32 = 0;
-    for track in song.tracks.iter().rev() {
+    // `song.tracks[0]` is the top of the arrangement; iterate `.rev()`
+    // for bottom→top emit order (preview / export layer their composite
+    // by emit order). The `.rev().enumerate()` index is the track's
+    // position counted from the bottom, so it doubles as `z_index`:
+    // bottom-most track → `0`, top track → `len-1`, monotone with the
+    // real `song.tracks` index. Anchoring `z_index` to the real track
+    // position (instead of a separate counter that only advanced on
+    // emit) keeps it stable per track and removes the silently-packed
+    // numbering the old counter produced (`[Low]`). Gaps from muted /
+    // non-emitting tracks are harmless: layering is still emit-ordered,
+    // `z_index` is metadata for the future multi-kind sort.
+    for (idx, track) in song.tracks.iter().rev().enumerate() {
         // v16: TrackKind 廃止後は「image_events を持つ clip がある track」
         // が visual composite に参加する (= filter は content kind で行う)。
         // track.muted (= mixer M トグル) で image overlay も無効化、 SSoT
@@ -85,7 +92,11 @@ pub fn active_image_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveIma
         if track.muted {
             continue;
         }
-        let mut track_emitted = false;
+        let z_index = idx as u32;
+        // Build the per-track `ImageBuiltin` lane index once (= a single
+        // pass over `track.automation_lanes`) instead of re-`find`ing
+        // each of the 6 fields for every event below (`[Mid]`).
+        let lanes = ImageLaneIndex::build(track);
         for clip in &track.clips {
             let clip_start = clip.start_beat;
             let clip_end = clip.start_beat + clip.length_beats;
@@ -118,7 +129,7 @@ pub fn active_image_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveIma
                 // fade が効く)。 rotation は lane 経路の override のみ
                 // (= fade 無関係)。
                 let (x, y, w, h, opacity, rotation) =
-                    resolve_image_fields(track, song, event, playhead_beat);
+                    resolve_image_fields(&lanes, song, event, playhead_beat);
                 let alpha = opacity * env;
                 if alpha <= 0.0 {
                     continue;
@@ -134,30 +145,73 @@ pub fn active_image_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveIma
                     rotation_radians: rotation,
                     z_index,
                 });
-                track_emitted = true;
             }
-        }
-        if track_emitted {
-            z_index += 1;
         }
     }
     out
 }
 
-/// `ImageEvent.{x,y,w,h,opacity}` を track-level `ImageBuiltin` lane で
-/// override する。 lane が存在し enabled / clip カバー範囲内 / point
-/// 列を持つ場合のみ lane の値、 さもなくば event の値を返す。 全 5 field
-/// を 1 関数でまとめて解決して borrow を最小化。
+/// Per-track index of the `ImageBuiltin` automation lanes, built once
+/// in [`active_image_sources_at`] before walking a track's events so
+/// the 6 lane lookups become array indexing instead of 6 linear
+/// `find` scans of `track.automation_lanes` per event (= mirrors the
+/// per-track resolve idiom of `text_compose`). Each slot is `None`
+/// when the track has no lane targeting that field.
+struct ImageLaneIndex<'a> {
+    x: Option<&'a AutomationLane>,
+    y: Option<&'a AutomationLane>,
+    w: Option<&'a AutomationLane>,
+    h: Option<&'a AutomationLane>,
+    opacity: Option<&'a AutomationLane>,
+    rotation: Option<&'a AutomationLane>,
+}
+
+impl<'a> ImageLaneIndex<'a> {
+    /// Single pass over `track.automation_lanes` recording the first
+    /// lane found for each `ImageBuiltinParam`. (Lane ids are unique
+    /// per target in practice, so "first" is the only one.)
+    fn build(track: &'a Track) -> Self {
+        let mut index = ImageLaneIndex {
+            x: None,
+            y: None,
+            w: None,
+            h: None,
+            opacity: None,
+            rotation: None,
+        };
+        for lane in &track.automation_lanes {
+            let AutomationTarget::ImageBuiltin(param) = lane.target else {
+                continue;
+            };
+            let slot = match param {
+                ImageBuiltinParam::X => &mut index.x,
+                ImageBuiltinParam::Y => &mut index.y,
+                ImageBuiltinParam::W => &mut index.w,
+                ImageBuiltinParam::H => &mut index.h,
+                ImageBuiltinParam::Opacity => &mut index.opacity,
+                ImageBuiltinParam::Rotation => &mut index.rotation,
+            };
+            if slot.is_none() {
+                *slot = Some(lane);
+            }
+        }
+        index
+    }
+}
+
+/// `ImageEvent.{x,y,w,h,opacity}` + rotation を track-level `ImageBuiltin`
+/// lane で override する。 lane が存在し enabled / clip カバー範囲内 /
+/// point 列を持つ場合のみ lane の値、 さもなくば event の値を返す。 lane
+/// 探索は呼び出し前に [`ImageLaneIndex`] へ済ませてあるので、 ここでは
+/// index 参照 + `lane_value_at` のみ。
 fn resolve_image_fields(
-    track: &Track,
+    lanes: &ImageLaneIndex<'_>,
     song: &Song,
     event: &ImageEvent,
     song_beat: f64,
 ) -> (f32, f32, f32, f32, f32, f32) {
-    let resolve_norm = |field: ImageBuiltinParam, fallback: f32| -> f32 {
-        let Some(lane) = track.automation_lanes.iter().find(|l| {
-            matches!(l.target, AutomationTarget::ImageBuiltin(p) if p == field)
-        }) else {
+    let resolve_norm = |lane: Option<&AutomationLane>, fallback: f32| -> f32 {
+        let Some(lane) = lane else {
             return fallback;
         };
         // lane_value_at は lane.default_value をフォールバックに使うが、
@@ -168,27 +222,20 @@ fn resolve_image_fields(
         let v = common::automation::lane_value_at(lane, &song.clip_contents, song_beat);
         (v as f32).clamp(0.0, 1.0)
     };
-    let resolve_rotation = |fallback: f32| -> f32 {
-        let Some(lane) = track.automation_lanes.iter().find(|l| {
-            matches!(
-                l.target,
-                AutomationTarget::ImageBuiltin(ImageBuiltinParam::Rotation)
-            )
-        }) else {
-            return fallback;
-        };
+    let rotation = match lanes.rotation {
         // Rotation は plain で radians、 範囲 -π..=π を超えても modulo
         // 2π で wrap (= 連続回転 lane を許容)。 lane.default_value は
         // 既に radians 単位。
-        let v = common::automation::lane_value_at(lane, &song.clip_contents, song_beat);
-        v as f32
+        Some(lane) => {
+            common::automation::lane_value_at(lane, &song.clip_contents, song_beat) as f32
+        }
+        None => event.rotation_radians,
     };
-    let x = resolve_norm(ImageBuiltinParam::X, event.x);
-    let y = resolve_norm(ImageBuiltinParam::Y, event.y);
-    let w = resolve_norm(ImageBuiltinParam::W, event.w);
-    let h = resolve_norm(ImageBuiltinParam::H, event.h);
-    let opacity = resolve_norm(ImageBuiltinParam::Opacity, event.opacity);
-    let rotation = resolve_rotation(event.rotation_radians);
+    let x = resolve_norm(lanes.x, event.x);
+    let y = resolve_norm(lanes.y, event.y);
+    let w = resolve_norm(lanes.w, event.w);
+    let h = resolve_norm(lanes.h, event.h);
+    let opacity = resolve_norm(lanes.opacity, event.opacity);
     (x, y, w, h, opacity, rotation)
 }
 

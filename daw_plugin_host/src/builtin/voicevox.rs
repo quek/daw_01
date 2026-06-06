@@ -21,6 +21,7 @@
 //! re-synth 必要なので「最初から re-synth」 で統一。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
@@ -96,6 +97,9 @@ struct Voice {
     #[allow(dead_code)]
     note_id: u32,
     samples: Arc<Vec<f32>>,
+    /// synth wav の sample_rate。 PR-V2.4 polish の linear resample 実装で
+    /// 出力 sample_rate とのミスマッチ補正に使う予定 (現状 mix は等倍)。
+    #[allow(dead_code)]
     sample_rate: u32,
     velocity: f32,
     /// 次に samples から read する位置 (samples の絶対 index、
@@ -120,6 +124,11 @@ pub struct VoicevoxBuiltin {
     synth_tx: Option<mpsc::Sender<SynthJob>>,
     /// synth thread の join handle (deactivate / drop で join)。
     synth_thread: Option<JoinHandle<()>>,
+    /// synth processing thread への shutdown 通知。 engine 未起動で job が
+    /// 永久 retry し続けるケースでも、 `stop_synth_thread` がこれを
+    /// `store(true)` すれば processing thread が次のループ先頭 / synth
+    /// 分岐前で検知して即 return し、 `join()` が無限ブロックしない。
+    synth_shutdown: Arc<AtomicBool>,
     /// 共有 synth 結果。 synth thread が完了で `store(Some(...))`、 audio
     /// thread が note_on で `load()` する。 `ArcSwapOption` は lock-free
     /// (= 内部は atomic ptr + RCU-style epoch reclamation)、 audio thread
@@ -144,6 +153,7 @@ impl VoicevoxBuiltin {
             lyrics: HashMap::new(),
             synth_tx: None,
             synth_thread: None,
+            synth_shutdown: Arc::new(AtomicBool::new(false)),
             synth_result: Arc::new(ArcSwapOption::from(None)),
             active_voices: Vec::new(),
         }
@@ -160,6 +170,9 @@ impl VoicevoxBuiltin {
         }
         let (tx, rx) = mpsc::channel::<SynthJob>();
         let result_arc = Arc::clone(&self.synth_result);
+        // 直前セッションの stop で立った flag を必ずリセットしてから spawn。
+        self.synth_shutdown.store(false, Ordering::SeqCst);
+        let shutdown = Arc::clone(&self.synth_shutdown);
         // 直近 job だけ処理する (= 連続 flush は最後の 1 件だけ synth、
         // 古い job は drop)。 mpsc は順序保証だが coalescing は手動。
         // また、 synth 失敗 (= engine 起動中の接続失敗) で job を捨てると
@@ -168,7 +181,7 @@ impl VoicevoxBuiltin {
         let coalesce = Arc::new(Mutex::new(None::<SynthJob>));
         let coalesce_recv = Arc::clone(&coalesce);
 
-        let handle = std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name("voicevox-builtin-synth".into())
             .spawn(move || {
                 // 受信 thread: job が来たら coalesce slot に最新を上書き。
@@ -186,10 +199,24 @@ impl VoicevoxBuiltin {
                 // から数百 ms ずれて synth 開始でも user 知覚しない)。
                 let mut retry_after = std::time::Instant::now();
                 loop {
+                    // shutdown 通知が来ていれば即 exit (= engine 未起動で
+                    // 永久 retry 中でも join() が無限ブロックしない)。
+                    if shutdown.load(Ordering::SeqCst) {
+                        return;
+                    }
                     // retry backoff を尊重 (= 失敗直後の即時再 try を防ぐ)。
-                    let now = std::time::Instant::now();
-                    if now < retry_after {
-                        std::thread::sleep(retry_after - now);
+                    // backoff sleep 中も shutdown を即拾えるよう小刻みに分割。
+                    loop {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let now = std::time::Instant::now();
+                        if now >= retry_after {
+                            break;
+                        }
+                        let wait = (retry_after - now)
+                            .min(std::time::Duration::from_millis(20));
+                        std::thread::sleep(wait);
                     }
                     // 新 job が来てれば take、 無ければ「前回失敗 job が
                     // pending か」 を見るために peek。
@@ -200,9 +227,11 @@ impl VoicevoxBuiltin {
                         slot.take()
                     };
                     let Some(job) = job_opt else {
-                        if Arc::strong_count(&coalesce) <= 1 {
-                            // 受信 thread が exit (= sender drop)、 keep
-                            // alive する理由なし。
+                        if shutdown.load(Ordering::SeqCst)
+                            || Arc::strong_count(&coalesce) <= 1
+                        {
+                            // shutdown 通知 or 受信 thread exit (= sender
+                            // drop)、 keep alive する理由なし。
                             return;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -211,6 +240,10 @@ impl VoicevoxBuiltin {
                     if job.notes.is_empty() {
                         result_arc.store(None);
                         continue;
+                    }
+                    // synth (= blocking HTTP) に入る直前に shutdown を再確認。
+                    if shutdown.load(Ordering::SeqCst) {
+                        return;
                     }
                     match synthesize_notes_for_builtin(
                         &job.notes,
@@ -251,14 +284,30 @@ impl VoicevoxBuiltin {
                         }
                     }
                 }
-            })
-            .expect("spawn voicevox-builtin-synth thread");
+            });
 
-        self.synth_tx = Some(tx);
-        self.synth_thread = Some(handle);
+        // spawn 失敗 (= OS thread 上限等) で plugin-main を panic で落とさない。
+        // synth_tx / synth_thread は None のままにして、 次回 flush で再試行
+        // 可能にする (= synth_shutdown は spawn 前に false へ戻してある)。
+        match spawn_result {
+            Ok(handle) => {
+                self.synth_tx = Some(tx);
+                self.synth_thread = Some(handle);
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = ?e,
+                    "VoicevoxBuiltin: synth thread spawn 失敗 (synth 無効化)"
+                );
+            }
+        }
     }
 
     fn stop_synth_thread(&mut self) {
+        // shutdown flag を立てると、 engine 未起動で job が永久 retry
+        // 中の processing thread もループ先頭 / synth 分岐前で検知して
+        // 即 return する (= sender drop だけでは止まらないケースを潰す)。
+        self.synth_shutdown.store(true, Ordering::SeqCst);
         // sender を drop すると recv thread が抜け → 処理 thread も exit。
         self.synth_tx = None;
         if let Some(handle) = self.synth_thread.take() {
@@ -340,18 +389,13 @@ impl LoadedPlugin for VoicevoxBuiltin {
         // 止が歌唱として自然)。 同 buffer 内で event.time を考慮する
         // resample は polish。
         for ev in events {
-            if let crate::plugin_instance::NoteTransition::On { note_id, velocity, key } = ev.event {
+            if let crate::plugin_instance::NoteTransition::On { note_id, velocity, .. } = ev.event {
                 // Phase 6 review (RT 安全性): 旧 `Arc<RwLock<_>>` の
                 // `.read()` は write 競合で audio thread を blocking
                 // させる可能性があった。 `ArcSwapOption::load_full()` は
                 // lock-free な atomic load + Arc clone (= refcount bump)
                 // で snapshot を取得、 heap 確保 / lock なし。
                 let snapshot = self.synth_result.load_full();
-                tracing::debug!(
-                    note_id, key, velocity,
-                    has_synth = snapshot.is_some(),
-                    "VoicevoxBuiltin: note_on received"
-                );
                 let Some(res) = snapshot else {
                     continue;
                 };
@@ -360,13 +404,6 @@ impl LoadedPlugin for VoicevoxBuiltin {
                     .get(&note_id)
                     .copied()
                     .unwrap_or(0) as usize;
-                tracing::debug!(
-                    note_id,
-                    synth_offset,
-                    samples_len = res.samples.len(),
-                    sample_rate = res.sample_rate,
-                    "VoicevoxBuiltin: voice started"
-                );
                 if synth_offset >= res.samples.len() {
                     // synth から note_id が外れている (= 歌詞数とずれた)
                     // 場合は無視。
@@ -395,28 +432,22 @@ impl LoadedPlugin for VoicevoxBuiltin {
         }
 
         // active voices ごとに audio を mix。 sample_rate ミスマッチは
-        // 現状 resample しない (PR-V2.4 polish で linear resample 予定)、
-        // 1 回 warn ログのみ。
-        let mut sr_warned = false;
+        // 現状 resample しない (PR-V2.4 polish で linear resample 予定)。
+        // 出力 buffer は max_frames で確保しているが、 frames > max_frames
+        // でも panic しないよう out 側 capacity でもクランプする (Silence
+        // path と同様)。
+        let out_max = self.out_l.len().min(self.out_r.len());
         let mut i = 0usize;
         while i < self.active_voices.len() {
             let drop = {
                 let voice = &mut self.active_voices[i];
-                if !sr_warned && voice.sample_rate as f64 != self.sample_rate {
-                    tracing::debug!(
-                        voice_sr = voice.sample_rate,
-                        engine_sr = self.sample_rate,
-                        "VoicevoxBuiltin: sample rate mismatch"
-                    );
-                    sr_warned = true;
-                }
                 // PR-V2.4 fix: NoteTransition::On.velocity は既に
                 // sequencer で `note.velocity / 127.0` (= 0..1 範囲) に
                 // 正規化されている。 ここで更に 127 で割ると 0.0062 倍
                 // (約 -44 dB) になり「とても小さい」 という症状になる。
                 let amp = voice.velocity.clamp(0.0, 1.0);
                 let remaining = voice.samples.len().saturating_sub(voice.cursor);
-                let copy_n = remaining.min(frames_usize);
+                let copy_n = remaining.min(frames_usize).min(out_max);
                 for k in 0..copy_n {
                     let s = voice.samples[voice.cursor + k] * amp;
                     self.out_l[k] += s;

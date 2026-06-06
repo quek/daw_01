@@ -573,4 +573,89 @@ mod tests {
         assert_eq!(roundtrip(&MainToChild::Play), MainToChild::Play);
         assert_eq!(roundtrip(&MainToChild::Stop), MainToChild::Stop);
     }
+
+    #[test]
+    fn main_to_child_load_song_roundtrip() {
+        let msg = MainToChild::LoadSong(crate::model::Song::default());
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn child_to_main_all_plugin_states_roundtrip() {
+        let msg = ChildToMain::AllPluginStates {
+            entries: vec![
+                SlotState {
+                    track: 0,
+                    slot: PluginSlot::Instrument,
+                    data: Some(vec![1, 2, 3, 4]),
+                    error: None,
+                },
+                SlotState {
+                    track: 3,
+                    slot: PluginSlot::Fx(2),
+                    data: None,
+                    error: Some("state save failed".to_string()),
+                },
+            ],
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn child_to_main_plugin_param_list_roundtrip() {
+        let msg = ChildToMain::PluginParamList {
+            track: 1,
+            slot: PluginSlot::MidiFx(0),
+            plugin_id: 7,
+            params: vec![
+                PluginParamInfo {
+                    id: 100,
+                    name: "Gain".to_string(),
+                    module: "Mixer".to_string(),
+                    min_value: 0.0,
+                    max_value: 1.0,
+                    default_value: 0.5,
+                    flags: plugin_param_flags::AUTOMATABLE,
+                },
+                PluginParamInfo {
+                    id: 101,
+                    name: "Cutoff".to_string(),
+                    module: String::new(),
+                    min_value: 20.0,
+                    max_value: 20000.0,
+                    default_value: 1000.0,
+                    flags: plugin_param_flags::STEPPED
+                        | plugin_param_flags::PERIODIC,
+                },
+            ],
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn main_to_child_builtin_note_metadata_roundtrip() {
+        let msg = MainToChild::SetBuiltinPluginNoteMetadata {
+            plugin_id: 9,
+            bpm: 128.0,
+            entries: vec![
+                crate::plugin_metadata::NoteMetadata {
+                    note_id: 0,
+                    start_beat: 0.0,
+                    duration_beats: 1.0,
+                    pitch: 60,
+                    velocity: 100,
+                    lyric: "あ".to_string(),
+                },
+                crate::plugin_metadata::NoteMetadata {
+                    note_id: 1,
+                    start_beat: 1.0,
+                    duration_beats: 0.5,
+                    pitch: 62,
+                    velocity: 90,
+                    lyric: String::new(),
+                },
+            ],
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
 }

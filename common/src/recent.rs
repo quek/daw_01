@@ -20,6 +20,12 @@ impl RecentFiles {
     /// Add `path` to the front of the list, removing any existing entry
     /// with the same canonicalised value so duplicates don't accumulate.
     /// Truncates the list to [`MAX_RECENT`] afterwards.
+    ///
+    /// Dedup keys off [`std::fs::canonicalize`], which resolves symlinks and
+    /// `.`/`..` so equivalent paths collapse to one entry. When canonicalize
+    /// fails (e.g. the file no longer exists), we fall back to comparing the
+    /// raw `PathBuf`s: this is *best-effort* — two distinct spellings of the
+    /// same missing file (e.g. relative vs absolute) may not be deduplicated.
     pub fn push(&mut self, path: PathBuf) {
         let canon =
             std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());

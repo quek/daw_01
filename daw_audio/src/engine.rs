@@ -588,11 +588,20 @@ impl LocalState {
         self.master_l[..n].fill(0.0);
         self.master_r[..n].fill(0.0);
 
+        // Snapshot the transport-state atomics once for the whole buffer so
+        // every step below sees a single consistent view (export gate /
+        // loop wrap / metronome gate). Loading each atomic at multiple call
+        // sites could otherwise observe a mid-buffer flip and produce an
+        // internally inconsistent buffer.
+        let export_running = self.shared.export_running.load(Ordering::Acquire);
+        let looping = shared.looping.load(Ordering::Acquire);
+        let metronome_enabled = shared.metronome_enabled.load(Ordering::Acquire);
+
         // A3 freewheel: while the export thread holds the audio
         // resources, write silence and skip dispatch so the worker pool
         // and plugin instances are exclusively driven by the export
         // render loop.
-        if self.shared.export_running.load(Ordering::Acquire) {
+        if export_running {
             return;
         }
 
@@ -620,7 +629,7 @@ impl LocalState {
                     .unwrap_or(4)
                     .max(1),
             );
-            if shared.metronome_enabled.load(Ordering::Acquire) {
+            if metronome_enabled {
                 render_metronome(
                     &mut self.metronome_voice,
                     &mut self.master_l[..n],
@@ -727,7 +736,7 @@ impl LocalState {
         };
         // user の loop button 実状態 (= engine が実際に wrap する条件)。
         // plugin transport の IS_LOOP_ACTIVE / looping field に渡す。
-        let looping = shared.looping.load(Ordering::Acquire);
+        // (buffer 冒頭で snapshot 済の `looping` ローカルを使う。)
 
         // Phase 5 follow-up (granular DSP click 抑制): tempo_ratio (= current /
         // nominal) を LP smoothing して granular_sample_at に渡す。 nominal =
@@ -880,10 +889,7 @@ impl LocalState {
             // 標準の click)。 master mix の最後に重ねる (= track の mute /
             // solo / volume の影響を受けない、 「常に聞こえる guide」 が
             // metronome の規範動作)。
-            if !self.shared.export_running.load(Ordering::Acquire)
-                && playing
-                && shared.metronome_enabled.load(Ordering::Acquire)
-            {
+            if !export_running && playing && metronome_enabled {
                 let tsig_num = i64::from(song.time_sig.0.max(1));
                 render_metronome(
                     &mut self.metronome_voice,
@@ -957,7 +963,7 @@ impl LocalState {
         // Playhead advance + auto-stop / loop wrap.
         if playing {
             let mut new_ph = playhead + n as u64;
-            let active_end = if shared.looping.load(Ordering::Acquire) {
+            let active_end = if looping {
                 effective_loop_bounds(song_ref, sample_rate).map(|(_, e)| e)
             } else {
                 None
@@ -982,7 +988,7 @@ impl LocalState {
                     }
                     s.state.active_notes.clear();
                 }
-                let wrap_to = if shared.looping.load(Ordering::Acquire) {
+                let wrap_to = if looping {
                     effective_loop_bounds(song_ref, sample_rate).map(|(s, _)| s)
                 } else {
                     None
@@ -1210,8 +1216,10 @@ pub fn process_track_owned(
                 }
             }
         }
-        if let Err(e) = ws.dispatch(plugin_id) {
-            tracing::error!(error = ?e, plugin_id, "midi_fx dispatch failed");
+        if let Err(_e) = ws.dispatch(plugin_id) {
+            // RT path: skip on dispatch failure without per-buffer I/O.
+            #[cfg(debug_assertions)]
+            tracing::error!(error = ?_e, plugin_id, "midi_fx dispatch failed");
             continue;
         }
         // Drain plugin's output events into midi_bus_b.
@@ -1288,8 +1296,10 @@ pub fn process_track_owned(
                     }
                 }
             }
-            if let Err(e) = ws.dispatch(plugin_id) {
-                tracing::error!(error = ?e, plugin_id, "instrument dispatch failed");
+            if let Err(_e) = ws.dispatch(plugin_id) {
+                // RT path: skip on dispatch failure without per-buffer I/O.
+                #[cfg(debug_assertions)]
+                tracing::error!(error = ?_e, plugin_id, "instrument dispatch failed");
             } else {
                 scratch.track_l[..n].copy_from_slice(&pd.buffer_out[0][..n]);
                 scratch.track_r[..n].copy_from_slice(&pd.buffer_out[1][..n]);
@@ -1367,8 +1377,10 @@ pub fn process_track_owned(
         }
         pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
         pd.buffer_in[1][..n].copy_from_slice(&scratch.track_r[..n]);
-        if let Err(e) = ws.dispatch(plugin_id) {
-            tracing::error!(error = ?e, plugin_id, "fx dispatch failed");
+        if let Err(_e) = ws.dispatch(plugin_id) {
+            // RT path: skip on dispatch failure without per-buffer I/O.
+            #[cfg(debug_assertions)]
+            tracing::error!(error = ?_e, plugin_id, "fx dispatch failed");
             continue;
         }
         scratch.track_l[..n].copy_from_slice(&pd.buffer_out[0][..n]);
@@ -1522,8 +1534,10 @@ pub fn process_master_fx_chain(
         set_pd_transport(pd, song, current_bpm, playhead_beats, looping);
         pd.buffer_in[0][..n].copy_from_slice(&master_l[..n]);
         pd.buffer_in[1][..n].copy_from_slice(&master_r[..n]);
-        if let Err(e) = ws.dispatch(plugin_id) {
-            tracing::error!(error = ?e, plugin_id, "master fx dispatch failed");
+        if let Err(_e) = ws.dispatch(plugin_id) {
+            // RT path: skip on dispatch failure without per-buffer I/O.
+            #[cfg(debug_assertions)]
+            tracing::error!(error = ?_e, plugin_id, "master fx dispatch failed");
             continue;
         }
         master_l[..n].copy_from_slice(&pd.buffer_out[0][..n]);
@@ -1660,32 +1674,24 @@ pub fn execute_schedule_post_dispatch(
                 // aux bus on the next `process()`. Source != TrackScratch
                 // (e.g. a future PluginAuxOut output) is ignored — handled
                 // by PR4.4 / PR5.
+                // RT path: skip silently on any miss (no per-buffer tracing).
                 let BufRef::TrackScratch(src_idx) = *src else {
-                    tracing::trace!("sidechain tap: non-TrackScratch src skipped");
                     continue;
                 };
                 let Some(src_scratch) = scratch.get(src_idx as usize) else {
-                    tracing::trace!(src_idx, "sidechain tap: src_idx out of scratch range");
                     continue;
                 };
                 let port = *aux_in_port as usize;
                 if port >= common::process_data::MAX_AUX_IN {
-                    tracing::trace!(port, "sidechain tap: port >= MAX_AUX_IN");
                     continue;
                 }
                 // Resolve the runtime plugin_id for (dst_track, dst_slot).
                 // PR2.1: the chains map is keyed by (track_id, slot).
                 let key = (*dst_track, *dst_slot);
                 let Some(&plugin_id) = slot_to_plugin_id.get(&key) else {
-                    tracing::trace!(
-                        dst_track = *dst_track,
-                        ?dst_slot,
-                        "sidechain tap: slot_to_plugin_id miss",
-                    );
                     continue;
                 };
                 let Some(plugin_ref) = plugin_refs.get(&plugin_id) else {
-                    tracing::trace!(plugin_id, "sidechain tap: plugin_refs miss");
                     continue;
                 };
                 let pd = plugin_ref.data_mut();
@@ -1934,14 +1940,25 @@ fn mix_send_into_track_scratch(
 /// cycle を弾く) なので BFS は停止する。 `hops` 上限は child + send の
 /// fan-in を見込んで広めに取る。
 fn has_soloed_contributor(song: &Song, track_id: u32) -> bool {
-    let mut frontier: Vec<u32> = vec![track_id];
-    let mut hops = 0_usize;
-    let cap = song.tracks.len().saturating_mul(2) + 2;
-    while let Some(node) = frontier.pop() {
-        hops += 1;
-        if hops > cap {
-            return false;
-        }
+    // RT-safe non-allocating BFS: this runs on the audio dispatch path, so
+    // the frontier and the visited set must live on the stack rather than
+    // heap-allocated `Vec`s. `MAX_TRACKS` (= 32) caps the number of distinct
+    // nodes; the stack is sized to comfortably hold them. Track ids are not
+    // dense indices, so the visited set stores ids directly.
+    let mut frontier = [0u32; MAX_TRACKS * 2];
+    let mut frontier_len = 0usize;
+    let mut visited = [0u32; MAX_TRACKS];
+    let mut visited_len = 0usize;
+
+    // Seed with the starting node, marked visited so it is never re-pushed.
+    frontier[frontier_len] = track_id;
+    frontier_len += 1;
+    visited[visited_len] = track_id;
+    visited_len += 1;
+
+    while frontier_len > 0 {
+        frontier_len -= 1;
+        let node = frontier[frontier_len];
         for t in &song.tracks {
             let feeds_node = t.parent_group_id == Some(node)
                 || t.sends.iter().any(|s| s.dest_track_id == node);
@@ -1949,7 +1966,17 @@ fn has_soloed_contributor(song: &Song, track_id: u32) -> bool {
                 if t.solo {
                     return true;
                 }
-                frontier.push(t.id);
+                // Skip already-visited nodes so the fixed-length frontier
+                // can never overflow (each distinct node is pushed once).
+                if visited[..visited_len].contains(&t.id) {
+                    continue;
+                }
+                if visited_len < visited.len() && frontier_len < frontier.len() {
+                    visited[visited_len] = t.id;
+                    visited_len += 1;
+                    frontier[frontier_len] = t.id;
+                    frontier_len += 1;
+                }
             }
         }
     }
@@ -2015,8 +2042,10 @@ fn run_group_fx_chain(
         );
         pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
         pd.buffer_in[1][..n].copy_from_slice(&scratch.track_r[..n]);
-        if let Err(e) = ws.dispatch(plugin_id) {
-            tracing::error!(error = ?e, plugin_id, "group fx dispatch failed");
+        if let Err(_e) = ws.dispatch(plugin_id) {
+            // RT path: skip on dispatch failure without per-buffer I/O.
+            #[cfg(debug_assertions)]
+            tracing::error!(error = ?_e, plugin_id, "group fx dispatch failed");
             continue;
         }
         scratch.track_l[..n].copy_from_slice(&pd.buffer_out[0][..n]);

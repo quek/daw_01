@@ -79,6 +79,12 @@ pub struct ClapPlugin {
     /// caller's `param_events` slice. Merged with `pending_events` into
     /// the plugin's `in_events` via `EventListView`.
     pending_param_events: Vec<clap_event_param_value>,
+    /// Pre-allocated merge order over `pending_events` + `pending_param_events`,
+    /// sorted by `header.time`. CLAP requires `in_events` to be time-ascending
+    /// (`clap/events.h`); notes and params arrive pre-sorted only within their
+    /// own stream, so we stable-merge them here each `process()` (in-place
+    /// sort of a pre-allocated buffer — no RT heap alloc).
+    event_order: Vec<EventOrderRef>,
     /// Notes emitted by the plugin during the previous `process()` call.
     /// Populated by the `out_events.try_push` callback and drained by the
     /// caller (e.g. MIDI FX chain) before the next process().
@@ -332,6 +338,7 @@ impl ClapPlugin {
             // re-alloc; we log on the audio side if it happens.
             pending_events: Vec::with_capacity(256),
             pending_param_events: Vec::with_capacity(256),
+            event_order: Vec::with_capacity(512),
             collected_out_param_touches: Vec::with_capacity(64),
             collected_out_param_values: Vec::with_capacity(256),
             collected_out_param_releases: Vec::with_capacity(64),
@@ -362,7 +369,10 @@ impl ClapPlugin {
         let (Some(count_fn), Some(get_info_fn)) = (count_fn, get_info_fn) else {
             return Vec::new();
         };
-        let count = unsafe { count_fn(self.plugin) };
+        // plugin が返す count は untrusted。 異常値で巨大確保しないよう
+        // 上限を入れる (= 64Ki param で十分すぎる)。
+        const MAX_PARAMS: u32 = 65536;
+        let count = unsafe { count_fn(self.plugin) }.min(MAX_PARAMS);
         let mut out: Vec<common::protocol::PluginParamInfo> = Vec::with_capacity(count as usize);
         for i in 0..count {
             // SAFETY: clap_param_info is plain old data; zeroed start is
@@ -820,6 +830,29 @@ impl ClapPlugin {
             constant_mask: 0,
         };
 
+        // Build the time-ascending merge order over note + param events.
+        // CLAP requires `in_events` sorted by `header.time`; notes and params
+        // are each sorted within their own stream but interleave by time, so
+        // we stable-merge them here. `sort_by_key` is stable, so notes keep
+        // their relative order ahead of params at the same `time`. In-place
+        // sort of a pre-allocated buffer ⇒ no heap alloc on the RT path.
+        self.event_order.clear();
+        for (idx, e) in self.pending_events.iter().enumerate() {
+            self.event_order.push(EventOrderRef {
+                time: e.header.time,
+                is_param: false,
+                idx: idx as u32,
+            });
+        }
+        for (idx, e) in self.pending_param_events.iter().enumerate() {
+            self.event_order.push(EventOrderRef {
+                time: e.header.time,
+                is_param: true,
+                idx: idx as u32,
+            });
+        }
+        self.event_order.sort_by_key(|r| r.time);
+
         // Phase 2b: note + param events を 1 view にまとめて vtable に
         // 渡す。 EventListView は process() の lifetime 内だけ存続する
         // local 変数で、 plugin.process() が return するまで生きている
@@ -827,6 +860,7 @@ impl ClapPlugin {
         let event_view = EventListView {
             notes: &self.pending_events,
             params: &self.pending_param_events,
+            order: &self.event_order,
         };
         let in_events = clap_input_events {
             ctx: std::ptr::from_ref(&event_view) as *mut c_void,
@@ -1102,13 +1136,10 @@ unsafe extern "C" fn collect_out_note_try_push(
             const REQUIRED: u32 =
                 (std::mem::size_of::<clap_event_header>() + std::mem::size_of::<u32>()) as u32;
             if header.size < REQUIRED {
-                tracing::warn!(
-                    size = header.size,
-                    required = REQUIRED,
-                    "clap_event_param_gesture: header.size too small, skipping (= malformed plugin event)"
-                );
-                // 「accepted but not recorded」 path と同じく true で抜ける
-                // (= plugin に try_push の retry を促さない、 不正 event は破棄)。
+                // malformed plugin event。 RT パスなので I/O (tracing) は
+                // 増やさず黙って破棄する。 「accepted but not recorded」 path
+                // と同じく true で抜ける (= plugin に try_push の retry を
+                // 促さない、 不正 event は破棄)。
                 return true;
             }
             let param_id = unsafe {
@@ -1119,7 +1150,12 @@ unsafe extern "C" fn collect_out_note_try_push(
             };
             if !collector.param_touches.is_null() {
                 let out = unsafe { &mut *collector.param_touches };
-                out.push(param_id);
+                // RT 安全: 事前確保した capacity を超える push は realloc を
+                // 起こす。 溢れた gesture (knob flood) は drop して RT 制約を
+                // 守る (process_server の append も再確保しない invariant)。
+                if out.len() < out.capacity() {
+                    out.push(param_id);
+                }
             }
         }
         t if t == CLAP_EVENT_PARAM_GESTURE_END => {
@@ -1134,11 +1170,8 @@ unsafe extern "C" fn collect_out_note_try_push(
             const REQUIRED: u32 =
                 (std::mem::size_of::<clap_event_header>() + std::mem::size_of::<u32>()) as u32;
             if header.size < REQUIRED {
-                tracing::warn!(
-                    size = header.size,
-                    required = REQUIRED,
-                    "clap_event_param_gesture (END): header.size too small, skipping"
-                );
+                // malformed plugin event。 GESTURE_BEGIN と同様、 RT パス
+                // なので tracing を増やさず黙って破棄する。
                 return true;
             }
             let param_id = unsafe {
@@ -1149,14 +1182,18 @@ unsafe extern "C" fn collect_out_note_try_push(
             };
             if !collector.param_releases.is_null() {
                 let out = unsafe { &mut *collector.param_releases };
-                out.push(param_id);
+                if out.len() < out.capacity() {
+                    out.push(param_id);
+                }
             }
         }
         t if t == CLAP_EVENT_PARAM_VALUE => {
             let pv = unsafe { &*(event as *const clap_event_param_value) };
             if !collector.param_values.is_null() {
                 let out = unsafe { &mut *collector.param_values };
-                out.push((pv.param_id, pv.value));
+                if out.len() < out.capacity() {
+                    out.push((pv.param_id, pv.value));
+                }
             }
         }
         _ => {}
@@ -1177,6 +1214,16 @@ unsafe extern "C" fn collect_out_note_try_push(
 /// `bar_start` / `bar_number`: compute current bar index from beats
 /// using tsig_num (= beats_per_bar). Bar start in beats is
 /// `bar_number * tsig_num` (= integer beats since song start).
+///
+/// Transport の song position (beats / seconds) を `as i64` する前に
+/// 非有限 (NaN / inf) を 0 に倒す。 これらは `* FACTOR` 後に整数化される
+/// ので、 NaN / inf が紛れると CLAP plugin に未規定の timeline 値を渡して
+/// しまう。 RT 安全 (分岐のみ、 確保なし)。
+#[inline]
+fn sanitize_pos(v: f64) -> f64 {
+    if v.is_finite() { v } else { 0.0 }
+}
+
 fn build_clap_transport_event(
     transport: &crate::plugin_instance::TransportContext,
     _frames: u32,
@@ -1185,11 +1232,13 @@ fn build_clap_transport_event(
     let sample_rate = f64::from(transport.sample_rate).max(1.0);
     let playhead_samples = transport.playhead_samples as f64;
     // seconds は sample 由来 (= テンポ非依存で正確)。
-    let song_pos_seconds_f64 = playhead_samples / sample_rate;
+    // 非有限 (NaN / inf) を `as i64` すると未規定 / saturate になり下流の
+    // bar 計算も汚染するので、 bar_number の clamp と同様 0 に倒す。
+    let song_pos_seconds_f64 = sanitize_pos(playhead_samples / sample_rate);
     // beats は daw_audio が tempo automation を積分した真の拍位置を使う
     // (= `samples × bpm` の一定テンポ逆算は廃止)。 これで途中でテンポが
     // 変わった曲でも plugin が正しい拍 / 小節位置を見る。
-    let song_pos_beats_f64 = transport.song_pos_beats;
+    let song_pos_beats_f64 = sanitize_pos(transport.song_pos_beats);
     let song_pos_beats: i64 = (song_pos_beats_f64 * CLAP_BEATTIME_FACTOR as f64) as i64;
     let song_pos_seconds: i64 = (song_pos_seconds_f64 * CLAP_SECTIME_FACTOR as f64) as i64;
     let tsig_num = transport.tsig_num.max(1) as f64;
@@ -1242,9 +1291,22 @@ fn build_clap_transport_event(
 /// plugin に渡すための view。 `process()` のローカル変数として作られ、
 /// `clap_input_events.ctx` が `*const Self` を指す。 plugin.process()
 /// 呼び出しの間だけ存続する短命オブジェクト。
+/// One entry in [`EventListView::order`]: references either a note or a param
+/// event by index, tagged with its `header.time` so the merged note+param
+/// stream can be presented to the plugin in time-ascending order (a CLAP
+/// `clap_input_events` contract — `clap/events.h`).
+#[derive(Clone, Copy)]
+struct EventOrderRef {
+    time: u32,
+    is_param: bool,
+    idx: u32,
+}
+
 struct EventListView<'a> {
     notes: &'a [clap_event_note],
     params: &'a [clap_event_param_value],
+    /// Time-sorted merge order over `notes` + `params`. Built per `process()`.
+    order: &'a [EventOrderRef],
 }
 
 /// `ctx` of the in_events vtable points to `&EventListView`.
@@ -1254,7 +1316,7 @@ unsafe extern "C" fn in_events_size(list: *const clap_input_events) -> u32 {
         return 0;
     }
     let view = unsafe { &*ctx };
-    (view.notes.len() + view.params.len()) as u32
+    view.order.len() as u32
 }
 
 unsafe extern "C" fn in_events_get(
@@ -1266,13 +1328,13 @@ unsafe extern "C" fn in_events_get(
         return std::ptr::null();
     }
     let view = unsafe { &*ctx };
-    let idx = index as usize;
-    if idx < view.notes.len() {
-        std::ptr::from_ref(&view.notes[idx].header)
-    } else if idx < view.notes.len() + view.params.len() {
-        std::ptr::from_ref(&view.params[idx - view.notes.len()].header)
+    let Some(r) = view.order.get(index as usize) else {
+        return std::ptr::null();
+    };
+    if r.is_param {
+        std::ptr::from_ref(&view.params[r.idx as usize].header)
     } else {
-        std::ptr::null()
+        std::ptr::from_ref(&view.notes[r.idx as usize].header)
     }
 }
 
@@ -1417,15 +1479,25 @@ fn read_feature_list(ptr: *const *const c_char) -> Vec<String> {
     if ptr.is_null() {
         return out;
     }
+    // NULL 終端が無い malformed descriptor で無限 walk しないよう上限を
+    // 入れる (= common/src/plugin_db.rs の read_feature_list と同様)。
+    const MAX_FEATURES: usize = 256;
     let mut p = ptr;
     unsafe {
-        loop {
+        let mut hit_cap = true;
+        for _ in 0..MAX_FEATURES {
             let s_ptr = *p;
             if s_ptr.is_null() {
+                hit_cap = false;
                 break;
             }
             out.push(CStr::from_ptr(s_ptr).to_string_lossy().into_owned());
             p = p.add(1);
+        }
+        if hit_cap {
+            tracing::warn!(
+                "feature list reached {MAX_FEATURES} entries without NULL terminator, truncating",
+            );
         }
     }
     out

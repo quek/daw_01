@@ -67,6 +67,7 @@ fn load_instrument(app: &mut AppData) {
         id: "test.synth".into(),
         name: "Test Synth".into(),
         plugin_id: 100,
+        shmem_id: String::new(),
         state_load_error: None,
     });
 }

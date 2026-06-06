@@ -130,6 +130,12 @@ pub fn render_mp4_cancellable(
                 spec.sample_format, spec.bits_per_sample
             ));
         }
+        if spec.channels == 0 || spec.sample_rate == 0 {
+            return Err(format!(
+                "audio wav has invalid channels={} sample_rate={}",
+                spec.channels, spec.sample_rate
+            ));
+        }
         Some(crate::libav_encoder::AudioSpec {
             sample_rate: spec.sample_rate,
             channels: spec.channels as u32,
@@ -626,7 +632,7 @@ fn build_frame_scene(
             layer.shadow_color[3] * layer.alpha,
         );
         scene.push_text(GlyphArea {
-            text: layer.text.clone().into(),
+            text: layer.text.clone(),
             left,
             top,
             font_size,

@@ -2134,12 +2134,12 @@ impl AppData {
         // が毎 step 走る cost を測定するための timing log。 plan B 完了で
         // diff は slot 単位の最小 set に絞られているので、 plugin chain
         // が変わらない Undo は HashMap iter のみで終わる。 変わる場合の
-        // RemoveSlot/SetSlot IPC コストを観測したい場合は trace level を
-        // `daw_gui::app::undo_perf=info` で見る。
+        // RemoveSlot/SetSlot IPC コストを観測したい場合は
+        // `daw_gui::app::undo_perf=trace` で見る。
         let reconcile_started = std::time::Instant::now();
         self.reconcile_plugins_with_song();
         let reconcile_elapsed = reconcile_started.elapsed();
-        tracing::info!(
+        tracing::trace!(
             target: "daw_gui::app::undo_perf",
             elapsed_us = reconcile_elapsed.as_micros() as u64,
             "reconcile_plugins_with_song after Undo/Redo"
@@ -2344,10 +2344,42 @@ impl AppData {
         if clipboard.is_empty() {
             return;
         }
+        // 外部 (= 他アプリ / 改竄) clipboard 由来の値域を信用しない。
+        // pitch を 0..=127、 velocity を 1..=127 に clamp し、
+        // start_beat / duration_beats が非有限 or 負 (duration は 0 含む)
+        // の note は破棄する (= NaN/Inf を model に入れない)。
+        let mut clipboard: Vec<Note> = clipboard
+            .into_iter()
+            .filter_map(|mut n| {
+                if !n.start_beat.is_finite()
+                    || n.start_beat < 0.0
+                    || !n.duration_beats.is_finite()
+                    || n.duration_beats <= 0.0
+                {
+                    return None;
+                }
+                n.pitch = n.pitch.min(127);
+                n.velocity = n.velocity.clamp(1, 127);
+                Some(n)
+            })
+            .collect();
+        if clipboard.is_empty() {
+            return;
+        }
         let Some(r) = self.selected_clip else {
             self.status_message = "貼り付け先のクリップが選択されていません".to_string();
             return;
         };
+        // 貼り付け先 clip が実在しなければ何も挿入しない (= notes_in_clip_mut
+        // が None を返す経路)。 ここで弾いておくことで spurious な undo
+        // snapshot を積まない。
+        if self
+            .song
+            .notes_in_clip_mut(r.track as usize, r.clip as usize)
+            .is_none()
+        {
+            return;
+        }
         let playhead = self.playhead_beat;
         let anchor = if let Some(playhead) = playhead {
             let clip_start = self
@@ -2361,6 +2393,8 @@ impl AppData {
         } else {
             0.0
         };
+        // 実挿入の直前に undo snapshot を積む (= Ctrl+Z で paste を取り消せる)。
+        self.push_undo_snapshot();
         let count = clipboard.len();
         let Some(notes) = self
             .song
@@ -2369,11 +2403,10 @@ impl AppData {
             return;
         };
         let mut new_indices = Vec::with_capacity(clipboard.len());
-        for src in &clipboard {
-            let mut n = src.clone();
-            n.start_beat += anchor;
+        for src in &mut clipboard {
+            src.start_beat += anchor;
             new_indices.push(notes.len() as u32);
-            notes.push(n);
+            notes.push(src.clone());
         }
         self.selected_notes = new_indices;
         self.sync_song_to_plugin_host();
@@ -3310,6 +3343,11 @@ pub enum AppEvent {
         /// daw_gui 側は `track_plugin_ids` に登録して、 後続の delete /
         /// ungroup で先に ClosePluginShmem を audio に直接送るのに使う。
         plugin_id: u32,
+        /// `ProcessData` shared memory の名前。 audio engine に
+        /// `OpenPluginShmem` を送るのに使う。 SSoT: incoming bridge が
+        /// stale な audio_tx clone を握る代わりに、 ここまで運んで AppData
+        /// が live な `self.audio_tx` (respawn で差し替わる側) から送る。
+        shmem_id: String,
         /// saved state を `state_load(&bytes)` で復元しようとして失敗した
         /// 場合の理由文字列。 `None` = state_load が呼ばれなかった
         /// (= 新規 add)、 or 復元成功。 plugin 自体は default 状態で chain
@@ -4656,8 +4694,8 @@ impl AppData {
             AppEvent::GuiClosedFromChild { track, slot } => {
                 self.on_gui_closed(track, slot);
             }
-            AppEvent::SlotPluginLoadedFromChild { track, slot, id, name, plugin_id, state_load_error } => {
-                self.on_plugin_loaded_from_child(track, slot, id, name, plugin_id, state_load_error);
+            AppEvent::SlotPluginLoadedFromChild { track, slot, id, name, plugin_id, shmem_id, state_load_error } => {
+                self.on_plugin_loaded_from_child(track, slot, id, name, plugin_id, shmem_id, state_load_error);
             }
             AppEvent::SlotPluginUnloadedFromChild { plugin_id } => {
                 self.on_plugin_unloaded_from_child(plugin_id);
@@ -7728,6 +7766,20 @@ impl AppData {
                 }
             })
             .unwrap_or(0.0);
+
+        // dest content が既存で automation でない壊れたモデルなら、 undo を
+        // 触る前に bail する (= no-op snapshot を積んで redo_stack を消さない)。
+        if let Some(c) = self.song.clip_contents.get(&content_id)
+            && !matches!(c, common::model::ClipContent::Automation(_))
+        {
+            self.status_message =
+                "貼り付け先 clip が automation でない (型不整合)".to_string();
+            return;
+        }
+        // dest clip / lane が解決でき automation と確認できたので、 実際に挿入
+        // する直前で undo snapshot を積む (= Ctrl+Z で paste を取り消せる)。
+        // これより上の早期 return では song を変更していないので snapshot 不要。
+        self.push_undo_snapshot();
 
         let entry = self
             .song
@@ -12664,6 +12716,10 @@ impl AppData {
     #[cfg(not(windows))]
     fn on_gui_closed(&mut self, _track: u32, _slot: PluginSlot) {}
 
+    // Args mirror the `SlotPluginLoadedFromChild` AppEvent (= the IPC
+    // message's fields); bundling them into a struct would just shuffle the
+    // same data, so allow the wide signature.
+    #[allow(clippy::too_many_arguments)]
     fn on_plugin_loaded_from_child(
         &mut self,
         track_id: u32,
@@ -12671,6 +12727,7 @@ impl AppData {
         id: String,
         _name: String,
         plugin_id: u32,
+        shmem_id: String,
         // Phase 6 review (silent corruption fix): plugin_host が saved state
         // を `state_load(&bytes)` で適用しようとして失敗したときの理由。
         // `Some(reason)` のとき plugin は default 状態で chain に居る ⇒
@@ -12678,6 +12735,16 @@ impl AppData {
         // 知らせて、 必要なら再 load / preset 適用してもらう。
         state_load_error: Option<String>,
     ) {
+        // SSoT (code review 2026-06-06): audio engine に `ProcessData` shmem を
+        // 開かせる。 incoming bridge の stale clone ではなく、 respawn で
+        // 差し替わる live な `self.audio_tx` から送ることで、 audio respawn
+        // 後にロードした plugin の音が出なくなる bug を防ぐ。
+        self.send_audio(MainToChild::OpenPluginShmem {
+            plugin_id,
+            shmem_id,
+            track: track_id,
+            slot,
+        });
         if let Some(reason) = state_load_error {
             let msg = format!(
                 "Plugin state 復元失敗 (track {track_id} {slot:?}, id={id}): {reason}"
@@ -12890,12 +12957,14 @@ impl AppData {
         }
     }
 
-    /// plugin_host が plugin destroy を完了した通知を受けて、
-    /// `track_plugin_ids` から該当 plugin_id を取り除く。 audio engine
-    /// 側の `ClosePluginShmem` は daw_gui main.rs (`ChildToMain::
-    /// SlotPluginUnloaded` ハンドラ) で先に転送済なので、 ここでは
-    /// daw_gui ローカル状態のクリーンアップのみ。
+    /// plugin_host が plugin destroy を完了した通知を受けて、 audio engine
+    /// に `ClosePluginShmem` を送り (SSoT: live な `self.audio_tx` 経由)、
+    /// `track_plugin_ids` 等の daw_gui ローカル状態をクリーンアップする。
     fn on_plugin_unloaded_from_child(&mut self, plugin_id: u32) {
+        // SSoT (code review 2026-06-06): stale な incoming-bridge clone では
+        // なく live audio_tx から送る。 respawn 後に dangling shmem 参照が
+        // 残るのを防ぐ。
+        self.send_audio(MainToChild::ClosePluginShmem { plugin_id });
         for entry in self.track_plugin_ids.values_mut() {
             entry.retain(|p| *p != plugin_id);
         }
@@ -13769,6 +13838,10 @@ impl AppData {
             plain_value,
             THIN_EPSILON_PLAIN,
         );
+        // 録音 gesture 途中で crash しても、 挿入済の点が autosave に
+        // 乗るよう dirty を立てる。 GUI tick 経路 (= audio callback で
+        // ない) なので bool 書き込みは RT 制約に抵触しない。
+        self.is_dirty = true;
         true
     }
 
@@ -14054,7 +14127,13 @@ impl AppData {
         let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
             return;
         };
+        // SetSongBpmFromScrub と同 idiom: 値が実際に変わったときだけ
+        // dirty を立てて autosave に乗せる (= drag 途中 crash でも保存)。
+        let changed = (t.volume - v).abs() > f32::EPSILON;
         t.volume = v;
+        if changed {
+            self.is_dirty = true;
+        }
         let msg = MainToChild::SetTrackVolume { track: track_id, volume: v };
         self.send_audio(msg);
         // gui_01 #028 §7.3: knob 操作で last-touched param を更新。
@@ -14074,7 +14153,11 @@ impl AppData {
         let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
             return;
         };
+        let changed = (t.pan - p).abs() > f32::EPSILON;
         t.pan = p;
+        if changed {
+            self.is_dirty = true;
+        }
         let msg = MainToChild::SetTrackPan { track: track_id, pan: p };
         self.send_audio(msg);
         self.last_touched_param = Some(TouchedParam {
@@ -14199,7 +14282,11 @@ impl AppData {
         let Some(send) = t.sends.get_mut(send_idx) else {
             return;
         };
+        let changed = (send.gain - g).abs() > f32::EPSILON;
         send.gain = g;
+        if changed {
+            self.is_dirty = true;
+        }
         // send_idx は u8 (= AutomationTarget / protocol の表現) に収まる範囲
         // のみ realtime 送信。 256 本以上の send は非現実的だが防衛的に gate。
         let Ok(send_idx_u8) = u8::try_from(send_idx) else {
@@ -14229,7 +14316,11 @@ impl AppData {
         let Some(send) = t.sends.get_mut(send_idx) else {
             return;
         };
+        let changed = send.enabled != enabled;
         send.enabled = enabled;
+        if changed {
+            self.is_dirty = true;
+        }
         let Ok(send_idx_u8) = u8::try_from(send_idx) else {
             return;
         };
@@ -14246,6 +14337,8 @@ impl AppData {
         };
         t.muted = !t.muted;
         let muted = t.muted;
+        // toggle なので値は必ず変化する → autosave 用に dirty を立てる。
+        self.is_dirty = true;
         let msg = MainToChild::SetTrackMuted { track: track_id, muted };
         self.send_audio(msg);
     }
@@ -14256,6 +14349,8 @@ impl AppData {
         };
         t.solo = !t.solo;
         let solo = t.solo;
+        // toggle なので値は必ず変化する → autosave 用に dirty を立てる。
+        self.is_dirty = true;
         let msg = MainToChild::SetTrackSolo { track: track_id, solo };
         self.send_audio(msg);
     }
