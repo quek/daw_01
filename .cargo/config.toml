@@ -1,0 +1,27 @@
+# rsmpeg (in-process libav) build config — docs/plan_video_export_libav.md.
+#
+# FFmpeg = BtbN `ffmpeg-n7.1-latest-win64-lgpl-shared` under third_party/ffmpeg
+# (gitignored, fetched per machine). soname: avcodec-61 / avformat-61 /
+# avutil-59 / swscale-8 / swresample-5. rusty_ffmpeg pinned to 0.16.5
+# (= +ffmpeg.7.1) in Cargo.lock; cargo otherwise picks 0.16.7 (+ffmpeg.8)
+# because it ignores `+build` metadata.
+#
+# Binding: vendored at daw_gui/ffmpeg/binding_ffmpeg_7.1.rs and selected via
+# FFMPEG_BINDING_PATH so rusty_ffmpeg copies it directly — NO bindgen, so the
+# build needs NO libclang/LLVM. The vendored file was generated ON THIS MSVC
+# machine (enum repr = c_int, which rsmpeg's `cfg(target_env="msvc")` paths
+# require) with clang 18 (clang 22 mis-parses several FFmpeg structs into
+# opaque `_address`-only types; the crate's own bundled binding is Linux-
+# flavored with c_uint enums and does not compile under MSVC).
+#
+# Regenerate only when bumping the FFmpeg version: temporarily set
+# FFMPEG_INCLUDE_DIR (instead of FFMPEG_BINDING_PATH), point LIBCLANG_PATH at a
+# clang-18 libclang (the PyPI `libclang==18.1.1` wheel's clang/native/
+# libclang.dll), `cargo clean -p rusty_ffmpeg`, build, then copy the produced
+# target/debug/build/rusty_ffmpeg-*/out/binding.rs back over the vendored file.
+#
+# `relative = true` resolves against this config's parent (workspace root) so
+# paths stay valid across machines / git worktrees.
+[env]
+FFMPEG_LIBS_DIR = { value = "third_party/ffmpeg/lib", relative = true }
+FFMPEG_BINDING_PATH = { value = "daw_gui/ffmpeg/binding_ffmpeg_7.1.rs", relative = true }

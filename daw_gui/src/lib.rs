@@ -23,6 +23,8 @@ pub mod text_compose;
 #[cfg(windows)]
 pub mod import_video;
 #[cfg(windows)]
+pub mod libav_encoder;
+#[cfg(windows)]
 pub mod render_video;
 #[cfg(windows)]
 pub mod video_playback;
