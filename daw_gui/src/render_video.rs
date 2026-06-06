@@ -257,6 +257,13 @@ pub fn render_mp4_cancellable(
 
     tracing::info!(total_frames, out_w, out_h, "export: starting frame loop");
     let mut cancelled = false;
+    // Phase 2b (gui_01 #077 submit_readback/finish_readback): 1-frame-ahead
+    // async readback. At the top of iteration N, `pending` holds frame N-1's
+    // submitted readback (its GPU copy ran during iteration N-1). We submit
+    // frame N without blocking, then collect N-1 and hand it to the encode
+    // worker. So composite+submit(N) ∥ GPU readback(N-1) ∥ worker encode(N-2)
+    // overlap — a 3-stage pipeline with the Phase 2a encode worker.
+    let mut pending = None;
     for frame_index in 0..total_frames {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             tracing::info!(frame_index, total_frames, "export: cancelled by user");
@@ -279,15 +286,32 @@ pub fn render_mp4_cancellable(
             out_h,
             &mut scene,
         );
-        let rgba = offscreen
-            .render_to_rgba(&scene)
-            .map_err(|e| format!("offscreen render frame {frame_index}: {e:?}"))?;
-        // Hand the readback to the encode worker (which overlaps the NVENC
-        // encode + mux with the next frame's composite). A send error means the
-        // worker died mid-stream; its real error is surfaced by `join` below.
-        if cmd_tx.send(EncCmd::Video(rgba)).is_err() {
-            break;
+        // Submit frame N's composite + readback without blocking (poll せず即
+        // return)。reusing `scene` next iteration is fine — submit captures it.
+        let next = offscreen
+            .submit_readback(&scene)
+            .map_err(|e| format!("submit_readback frame {frame_index}: {e:?}"))?;
+        // Collect + hand off the previous frame (its GPU readback overlapped
+        // this iteration's composite). A send error means the encode worker
+        // died mid-stream; its real error is surfaced by `join` below.
+        if let Some(prev) = pending.take() {
+            let rgba = offscreen
+                .finish_readback(prev)
+                .map_err(|e| format!("finish_readback frame {frame_index}: {e:?}"))?;
+            if cmd_tx.send(EncCmd::Video(rgba)).is_err() {
+                break;
+            }
         }
+        pending = Some(next);
+    }
+    // Drain the last in-flight readback (the final composited frame) on the
+    // normal path. On cancel we drop the token — `offscreen` frees the ring on
+    // drop, invalidating it.
+    if !cancelled && let Some(prev) = pending.take() {
+        let rgba = offscreen
+            .finish_readback(prev)
+            .map_err(|e| format!("finish_readback (final): {e:?}"))?;
+        let _ = cmd_tx.send(EncCmd::Video(rgba));
     }
 
     // Release every cached GPU texture before `offscreen` drops (cancel /
