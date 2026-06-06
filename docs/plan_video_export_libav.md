@@ -10,7 +10,8 @@
 | Phase 3 (export decode): 10-bit を in-process libav に | ✅ 完了（10-bit 欠落バグ修正） | `422ab8c` |
 | Phase 3 (preview decode): preview も libav 化、**ffmpeg.exe 完全廃止** | ✅ 完了 | `fb56e89` |
 | NVENC フォールバック (libopenh264 / h264_mf + swscale) | ✅ 完了 | `aecc7e6` |
-| Phase 2: readback パイプライン化 | ⏳ gui_01 待ち（`submit_readback`/`finish_readback` 要望提出 `997f6ff`）。daw_01 ループ組み替えは API landing 後に一度で。 |
+| Phase 2a: encode を専用スレッドに分離 (encode∥composite+readback) | ✅ 完了（21.0s→18.3s, ~13%） | `cd75a0a` |
+| Phase 2b: 同期 readback の async/overlap 化 | ⏳ gui_01 待ち（`submit_readback`/`finish_readback` 要望提出 `997f6ff`）。daw_01 ループ組み替えは API landing 後。 |
 | 補足: Phase 3 は当初 Phase 2 より後の予定だったが、10-bit 欠落バグ対応で前倒し。decode/encode とも libav に統一済（production の ffmpeg.exe/MF sink writer は撤去、preview の 8-bit MF HW zero-copy のみ存置）。 |
 
 実測: 27.4s/1080p（10-bit + 立ち絵 + 音声）が **video のみ 18.7s / 音声込み 21.0s**（debug, 1.3-1.5×RT）。
