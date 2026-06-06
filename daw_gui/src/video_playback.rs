@@ -316,12 +316,13 @@ pub struct VideoPlaybackEngine {
     /// warning then proceeds with SW decode for the rest of the
     /// process lifetime.
     d3d11_init_attempted: bool,
-    /// Sources the Media Foundation decoder could not decode (e.g.
-    /// 10-bit H.264 High10, which the stock MS H.264 decoder rejects).
-    /// Once `decode_at` sees an MF decode failure for a source it is
-    /// switched here and decoded via a bounded `ffmpeg.exe` child for
-    /// the rest of the session (CPU/BGRA → `DecodedFrame::Bgra`).
-    ffmpeg_sources: HashMap<VideoSourceId, FfmpegSource>,
+    /// In-process libav software decoder (`docs/plan_video_export_libav.md`
+    /// Phase 3). Sources the Media Foundation decoder can't handle (e.g.
+    /// 10-bit H.264 High10) are switched to this for the rest of the session
+    /// (CPU/BGRA → `DecodedFrame::Bgra`) — no `ffmpeg.exe` subprocess.
+    libav_fallback: crate::libav_decoder::LibavVideoDecoder,
+    /// Source ids that have fallen back to `libav_fallback`.
+    libav_fallback_ids: std::collections::HashSet<VideoSourceId>,
 }
 
 impl VideoPlaybackEngine {
@@ -330,7 +331,8 @@ impl VideoPlaybackEngine {
             readers: HashMap::new(),
             d3d11: None,
             d3d11_init_attempted: false,
-            ffmpeg_sources: HashMap::new(),
+            libav_fallback: crate::libav_decoder::LibavVideoDecoder::new(),
+            libav_fallback_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -482,11 +484,11 @@ impl VideoPlaybackEngine {
     }
 
     /// Decode the frame at `target_micros`. Tries the Media Foundation
-    /// path first; if MF cannot decode the source (e.g. 10-bit H.264
-    /// High10, which the stock MS H.264 decoder rejects with
-    /// `CopyDecodedFrame failed (0x80004005)`), this source is switched
-    /// to a bounded `ffmpeg.exe` child-process fallback for the rest of
-    /// the session (CPU/BGRA → `DecodedFrame::Bgra`).
+    /// path first (HW D3D11 zero-copy for 8-bit); if MF cannot decode the
+    /// source (e.g. 10-bit H.264 High10, which the stock MS H.264 decoder
+    /// rejects with `CopyDecodedFrame failed (0x80004005)`), this source is
+    /// switched to the in-process libav software decoder for the rest of the
+    /// session (CPU/BGRA → `DecodedFrame::Bgra`) — no `ffmpeg.exe` subprocess.
     pub fn decode_at(
         &mut self,
         video_source_id: VideoSourceId,
@@ -494,59 +496,46 @@ impl VideoPlaybackEngine {
         target_micros: u64,
         slot_idx: u8,
     ) -> Result<DecodedFrame, String> {
-        if self.ffmpeg_sources.contains_key(&video_source_id) {
-            // The ffmpeg fallback is CPU/BGRA; the runner collapses
-            // every ring slot into the single `(source_id, 0)` texture
-            // (1-frame-latest), so only the ring's center slot is
-            // meaningful. Signal "no more" for slots > 0 so the worker
-            // truncates the ring to the center frame (= the playhead).
+        if self.libav_fallback_ids.contains(&video_source_id) {
+            // The libav fallback is CPU/BGRA; the runner collapses every ring
+            // slot into the single `(source_id, 0)` texture (1-frame-latest),
+            // so only the center slot is meaningful. Signal "no more" for
+            // slots > 0 so the worker truncates the ring to the playhead.
             if slot_idx != 0 {
-                return Err("ffmpeg fallback: center slot only".to_string());
+                return Err("libav fallback: center slot only".to_string());
             }
-            let src = self
-                .ffmpeg_sources
-                .get_mut(&video_source_id)
-                .expect("contains_key just checked");
-            return decode_ffmpeg_source(src, source_path, target_micros);
+            let f = self
+                .libav_fallback
+                .decode_at(video_source_id, source_path, target_micros)?;
+            return Ok(DecodedFrame::Bgra { width: f.width, height: f.height, bgra: f.bgra });
         }
         match self.decode_at_mf(video_source_id, source_path, target_micros, slot_idx) {
             Ok(frame) => Ok(frame),
             Err(mf_err) => {
-                // The reader was built (container/metadata parsed) but
-                // the actual decode failed → the stock decoder can't
-                // handle this codec/profile. Reuse the dimensions the
-                // reader already resolved, drop the MF reader, and serve
-                // this source from ffmpeg.exe from now on.
-                let dims = self
-                    .readers
-                    .get(&video_source_id)
-                    .map(|r| (r.width, r.height))
-                    .filter(|(w, h)| *w > 0 && *h > 0);
-                let Some((width, height)) = dims else {
-                    return Err(format!(
-                        "decode failed for source {video_source_id} and no \
-                         dimensions for ffmpeg fallback: {mf_err}"
-                    ));
-                };
+                // MF can't decode this codec/profile (e.g. 10-bit High10).
+                // Drop the MF reader and serve this source from the in-process
+                // libav software decoder for the rest of the session. Unlike
+                // the old ffmpeg.exe path this needs no dimensions up front
+                // (libav reports them from the decoded frame), so it works even
+                // when MF couldn't build a reader at all — the export 10-bit
+                // "black frame" bug.
                 self.readers.remove(&video_source_id);
-                let fps = ffprobe_fps(source_path);
+                self.libav_fallback_ids.insert(video_source_id);
                 tracing::info!(
                     video_source_id,
-                    width,
-                    height,
-                    fps,
                     error = %mf_err,
-                    "MF decode failed; switching source to ffmpeg.exe fallback"
+                    "MF decode failed; switching source to in-process libav decoder"
                 );
-                let mut src = FfmpegSource::new(width, height, fps);
-                let frame = decode_ffmpeg_source(&mut src, source_path, target_micros)
+                if slot_idx != 0 {
+                    return Err("libav fallback: center slot only".to_string());
+                }
+                let f = self
+                    .libav_fallback
+                    .decode_at(video_source_id, source_path, target_micros)
                     .map_err(|fe| {
-                        format!(
-                            "MF decode failed ({mf_err}); ffmpeg fallback also failed: {fe}"
-                        )
+                        format!("MF decode failed ({mf_err}); libav fallback also failed: {fe}")
                     })?;
-                self.ffmpeg_sources.insert(video_source_id, src);
-                Ok(frame)
+                Ok(DecodedFrame::Bgra { width: f.width, height: f.height, bgra: f.bgra })
             }
         }
     }
@@ -710,235 +699,6 @@ impl Default for VideoPlaybackEngine {
     }
 }
 
-/// Per-source state for the `ffmpeg.exe` decode fallback (codecs the
-/// stock Media Foundation decoder can't handle, e.g. 10-bit H.264).
-///
-/// Keeps ONE persistent ffmpeg child streaming raw BGRA frames, so
-/// sequential playback reads a single frame per request with no
-/// per-frame process spawn (smooth playback). ffmpeg is only restarted
-/// on a seek — backward, or a forward jump beyond [`Self::SEEK_AHEAD_MICROS`].
-/// Memory stays tiny: just the current frame plus the OS pipe buffer.
-struct FfmpegSource {
-    width: u32,
-    height: u32,
-    fps: f64,
-    /// Running ffmpeg child + its stdout while streaming. `None` before
-    /// the first decode and after EOF / a kill.
-    child: Option<std::process::Child>,
-    stdout: Option<std::process::ChildStdout>,
-    /// Source-time (μs) of the NEXT frame the stream will yield.
-    stream_next_micros: u64,
-    /// Most recently yielded frame `(start_micros, bgra)`. Lets a paused
-    /// playhead (repeated same target) and the post-EOF tail return
-    /// without reading more.
-    current: Option<(u64, Vec<u8>)>,
-}
-
-impl FfmpegSource {
-    /// Forward jump (μs) beyond which restarting ffmpeg (a fresh seek) is
-    /// cheaper than reading and discarding the intervening frames.
-    const SEEK_AHEAD_MICROS: u64 = 500_000;
-
-    fn new(width: u32, height: u32, fps: f64) -> Self {
-        Self {
-            width,
-            height,
-            fps: if fps > 0.0 { fps } else { 30.0 },
-            child: None,
-            stdout: None,
-            stream_next_micros: 0,
-            current: None,
-        }
-    }
-
-    fn frame_dur_micros(&self) -> u64 {
-        ((1_000_000.0 / self.fps).round() as u64).max(1)
-    }
-
-    /// Decode the frame covering `target_micros`. Streams forward from the
-    /// running ffmpeg when possible; (re)spawns only on a backward seek or
-    /// a forward jump larger than [`Self::SEEK_AHEAD_MICROS`].
-    fn decode(&mut self, path: &Path, target_micros: u64) -> Result<Vec<u8>, String> {
-        let dur = self.frame_dur_micros();
-
-        // (1) Paused / repeated request: the current frame already covers it.
-        if let Some((ts, bgra)) = &self.current
-            && target_micros >= *ts
-            && target_micros < ts.saturating_add(dur)
-        {
-            return Ok(bgra.clone());
-        }
-        // (2) Stream ended (EOF) and we're at/after the held last frame:
-        //     hold it instead of respawning per request at the clip tail.
-        if self.child.is_none()
-            && let Some((ts, bgra)) = &self.current
-            && target_micros + dur / 2 >= *ts
-        {
-            return Ok(bgra.clone());
-        }
-
-        // (3) Reach `target`: stream forward, or restart ffmpeg if the
-        //     target is behind us or too far ahead.
-        let backward = self
-            .current
-            .as_ref()
-            .is_some_and(|(ts, _)| target_micros + dur / 2 < *ts);
-        let far_forward =
-            target_micros > self.stream_next_micros.saturating_add(Self::SEEK_AHEAD_MICROS);
-        if self.child.is_none() || backward || far_forward {
-            self.spawn(path, target_micros)?;
-        }
-
-        // (4) Read forward until a frame covers `target`.
-        loop {
-            match self.read_frame() {
-                Ok(Some(bgra)) => {
-                    let ts = self.stream_next_micros;
-                    self.stream_next_micros = self.stream_next_micros.saturating_add(dur);
-                    self.current = Some((ts, bgra));
-                    if ts.saturating_add(dur) > target_micros {
-                        return Ok(self.current.as_ref().expect("just set").1.clone());
-                    }
-                    // Frame is before `target` (catching up after a seek /
-                    // sparse request) — keep reading.
-                }
-                Ok(None) => {
-                    // Clean EOF: reap the child and hold the last frame.
-                    self.kill();
-                    return self
-                        .current
-                        .as_ref()
-                        .map(|(_, b)| b.clone())
-                        .ok_or_else(|| "ffmpeg reached EOF before any frame".to_string());
-                }
-                Err(e) => {
-                    self.kill();
-                    return Err(e);
-                }
-            }
-        }
-    }
-
-    /// (Re)start the persistent ffmpeg, seeked to `target_micros`. `-ss`
-    /// before `-i` is an accurate input seek: the first output frame lands
-    /// at ≈ `target_micros`.
-    fn spawn(&mut self, path: &Path, target_micros: u64) -> Result<(), String> {
-        self.kill();
-        let start_sec = format!("{:.6}", target_micros as f64 / 1_000_000.0);
-        let mut child = std::process::Command::new("ffmpeg")
-            .args(["-nostdin", "-loglevel", "error", "-ss", &start_sec, "-i"])
-            .arg(path)
-            .args(["-pix_fmt", "bgra", "-f", "rawvideo", "-"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            // Drop stderr so it can never fill a pipe and block ffmpeg.
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| format!("ffmpeg spawn failed (is ffmpeg on PATH?): {e}"))?;
-        self.stdout = child.stdout.take();
-        self.child = Some(child);
-        self.stream_next_micros = target_micros;
-        self.current = None;
-        Ok(())
-    }
-
-    /// Read exactly one BGRA frame from the running ffmpeg's stdout.
-    /// `Ok(None)` = clean EOF on a frame boundary (clip ended). ffmpeg
-    /// decodes 1080p far faster than realtime, so reads return promptly
-    /// during playback (ffmpeg is back-pressured by our read rate).
-    fn read_frame(&mut self) -> Result<Option<Vec<u8>>, String> {
-        use std::io::Read;
-        let frame_bytes = (self.width as usize) * (self.height as usize) * 4;
-        if frame_bytes == 0 {
-            return Err("ffmpeg frame size is zero".to_string());
-        }
-        let Some(stdout) = self.stdout.as_mut() else {
-            return Ok(None);
-        };
-        let mut buf = vec![0u8; frame_bytes];
-        let mut filled = 0usize;
-        while filled < frame_bytes {
-            match stdout.read(&mut buf[filled..]) {
-                Ok(0) => {
-                    if filled == 0 {
-                        return Ok(None); // clean EOF on a frame boundary
-                    }
-                    return Err(format!(
-                        "ffmpeg EOF mid-frame ({filled}/{frame_bytes} bytes)"
-                    ));
-                }
-                Ok(n) => filled += n,
-                Err(e) => return Err(format!("ffmpeg stdout read: {e}")),
-            }
-        }
-        Ok(Some(buf))
-    }
-
-    /// Kill the running ffmpeg child (if any) and drop its stdout.
-    fn kill(&mut self) {
-        self.stdout = None;
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-impl Drop for FfmpegSource {
-    fn drop(&mut self) {
-        self.kill();
-    }
-}
-
-/// Serve the frame at `target_micros` from the persistent ffmpeg stream
-/// for one source, wrapped as a `DecodedFrame::Bgra`.
-fn decode_ffmpeg_source(
-    src: &mut FfmpegSource,
-    path: &Path,
-    target_micros: u64,
-) -> Result<DecodedFrame, String> {
-    let bgra = src.decode(path, target_micros)?;
-    Ok(DecodedFrame::Bgra {
-        width: src.width,
-        height: src.height,
-        bgra,
-    })
-}
-
-/// Probe a video's frame rate via `ffprobe` (`r_frame_rate`, e.g.
-/// `30000/1001`). Falls back to 30.0 if ffprobe is missing or the
-/// output can't be parsed — the rate only affects cache indexing, not
-/// frame correctness.
-fn ffprobe_fps(path: &Path) -> f64 {
-    let output = std::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=r_frame_rate",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
-    let Ok(out) = output else {
-        return 30.0;
-    };
-    let s = String::from_utf8_lossy(&out.stdout);
-    let s = s.trim();
-    if let Some((num, den)) = s.split_once('/')
-        && let (Ok(n), Ok(d)) = (num.trim().parse::<f64>(), den.trim().parse::<f64>())
-        && d > 0.0
-        && n > 0.0
-    {
-        return n / d;
-    }
-    s.parse::<f64>().ok().filter(|f| *f > 0.0).unwrap_or(30.0)
-}
 
 /// Per-event alpha at the given clip-local beat, derived from
 /// `fade_in_beats` / `fade_out_beats` with the event's own
