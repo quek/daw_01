@@ -1725,3 +1725,52 @@ default 同士は 12.0 で揃うので landing 時は問題ありませんが、
 
 ---
 
+## [要望] OffscreenRenderer に async / double-buffer readback を追加（export pipeline 用）
+
+関連仕様: `docs/plan_video_export_libav.md`（Phase 2）
+
+### 背景
+
+daw_01 の video export（`render_video.rs::render_mp4_cancellable`）は毎フレーム
+`build_frame_scene → offscreen.render_to_rgba(&scene) → libav/NVENC encode` の直列ループ。
+`OffscreenRenderer::render_to_rgba` が `queue.submit → slice.map_async → device.poll(Wait)
+→ recv` で **同期 readback**（GPU を全フラッシュして CPU を待たせる）になっており、これが
+export の支配的な直列コスト。frame N の readback 完了を待たないと frame N+1 の composite を
+始められない。
+
+実プロジェクト（10-bit 1080p）で現状 1.5×RT（27.4s→18.66s, debug）。readback を非同期化して
+composite(N+1) と readback(N) を overlap できれば encoder 律速（NVENC）まで詰まる見込み。
+
+### 最終形態（こう使いたい）
+
+「composite を submit して readback を予約し、ハンドルを即返す」API と「ハンドルから結果を
+回収する」API がほしい。export はこれで composite ∥ readback ∥ encode のパイプラインを組む:
+
+```rust
+// daw_01 想定コール（double buffer）
+let pa = offscreen.submit_readback(&scene_a)?;  // render + map_async を発行、poll(Wait) せず即 return
+let pb = offscreen.submit_readback(&scene_b)?;  // a が GPU で進行中のまま b も積む
+let rgba_a = offscreen.finish_readback(pa)?;    // a の map 完了を待って RGBA8 回収
+encoder.push_video_rgba(&rgba_a);
+let rgba_b = offscreen.finish_readback(pb)?;
+```
+
+- `submit_readback(&Scene) -> Result<PendingReadback>`: composite render + `copy_texture_to_buffer`
+  + `map_async` を発行し **`poll(Wait)` せず即 return**。staging buffer を ring（≥2）で持ち回り、
+  in-flight な readback が複数あっても破綻しない。
+- `finish_readback(PendingReadback) -> Result<Vec<u8>>`: その readback の map 完了を待ち
+  （必要なら poll）、256-align padded → unpadded で詰めた RGBA8 を返す。
+- 既存の同期 `render_to_rgba` は **据え置き**（単発 snapshot 用途）。これは additive な新 API。
+- in-flight 上限は固定 2〜3 で十分（export は 2 段あれば overlap する）。
+- **byte 一致要件**: `finish_readback` の出力は現 `render_to_rgba` と同一バイト（同じ composite
+  shader・同じ詰め直し）であること（export/preview byte parity）。
+
+### daw_01 側 wire（この API landing 後にやること）
+
+`render_mp4_cancellable` のループを「frame N+1 を submit している間に frame N を finish→encode」に
+組み替える（encode を別スレッドにするかは API 形を見て判断）。今は同期 `render_to_rgba` のままで
+**正しく動いている**（Phase 1=NVENC encode / Phase 3=in-process libav decode は完了・commit 済）ので、
+この API が入ってから移行します。throwaway な interim 実装は作らず、API 確定後に一度で組みます。
+
+---
+
