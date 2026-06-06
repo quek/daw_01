@@ -232,14 +232,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     id: c.id,
                     start_beat: c.start_beat,
                     len_beats: c.length_beats,
-                    // docs/plan_text_overlay.md §4 P4: text clip は
-                    // event の text 先頭 ~32 文字を clip 上に表示。
-                    // 空テキスト or 非 Text variant なら共有名
-                    // (`content_id` 単位 SSoT) を fallback。 同 content を
-                    // 共有する linked clip は同じ名前を表示する。
-                    name: text_clip_label(c, &app.song.clip_contents)
-                        .map(Arc::from)
-                        .unwrap_or_else(|| Arc::from(app.song.content_name(c.content_id))),
+                    // クリップ表示名の導出 (SSoT): デフォルトでクリップ名は
+                    // 無く、 内容から表示名を導出する。 明示名 (content_id 単位
+                    // の共有名) があればそれ、 無ければ Text クリップは本文、
+                    // それも無ければノートの歌詞 (VOICEVOX 歌唱) を連結、 どれも
+                    // 無ければ無名 (空)。 同 content を共有する linked clip は
+                    // 同じ表示名になる。
+                    name: clip_display_label(c, &app.song),
                     // v18 (`docs/plan_track_clip_color.md`): clip は effective
                     // 色 (個別上書き or トラック色継承) で塗る。共有 clip
                     // (refcount >= 2) では widget が `share_group_color` (hue) を
@@ -1759,6 +1758,62 @@ fn text_clip_label(
     }
 }
 
+/// MIDI クリップのノートに付いた歌詞 (VOICEVOX 歌唱用 `Note.lyric`) を
+/// 時間順 (`start_beat` 昇順) に連結して clip 表示名を作る。 32 文字 cap
+/// で `…` を付ける。 非 MIDI variant / 歌詞付きノートが 1 つも無い場合は
+/// `None`。 ノートは保持順がソート保証されないため、 歌詞付きのものだけ
+/// 集めて start_beat で並べ直してから連結する。
+fn lyric_clip_label(
+    clip: &common::model::Clip,
+    contents: &std::collections::HashMap<common::model::ContentId, common::model::ClipContent>,
+) -> Option<String> {
+    let notes = contents.get(&clip.content_id)?.notes()?;
+    let mut with_lyric: Vec<(f64, &str)> = notes
+        .iter()
+        .filter_map(|n| n.lyric.as_deref().map(|l| (n.start_beat, l)))
+        .filter(|(_, l)| !l.is_empty())
+        .collect();
+    if with_lyric.is_empty() {
+        return None;
+    }
+    with_lyric.sort_by(|a, b| a.0.total_cmp(&b.0));
+    const MAX_CHARS: usize = 32;
+    let mut out = String::new();
+    let mut count = 0usize;
+    for (_, lyric) in with_lyric {
+        for ch in lyric.chars() {
+            if count >= MAX_CHARS {
+                out.push('…');
+                return Some(out);
+            }
+            out.push(ch);
+            count += 1;
+        }
+    }
+    Some(out)
+}
+
+/// クリップの表示名を導出する (SSoT)。 **内容優先**で
+/// Text クリップの本文 → MIDI ノートの歌詞 → 明示名 (content_id 単位の共有名
+/// `Song::content_name`) → 無名 (空文字) の順に解決する。
+///
+/// 本文 / 歌詞を content_name より優先するのは、 既存プロジェクトや録音/複製等の
+/// 生成経路が content_name に自動命名 ("Clip N" / "Recorded N" / "Title") を入れて
+/// いても、 Text 本文や歌詞が **clip 生成経路に依らず一貫して**表示されるように
+/// するため (= ⑤⑦ の「できたりできなかったり」 を解消)。 デフォルトでは
+/// クリップ名を持たず (`create_clip` / `add_text_clip_to_track` は空で作る)、
+/// content_name は内容を持たない clip の fallback 兼ユーザー明示 rename の置き場。
+fn clip_display_label(clip: &common::model::Clip, song: &common::model::Song) -> Arc<str> {
+    if let Some(t) = text_clip_label(clip, &song.clip_contents) {
+        return Arc::from(t);
+    }
+    if let Some(l) = lyric_clip_label(clip, &song.clip_contents) {
+        return Arc::from(l);
+    }
+    // 本文も歌詞も無い clip: 明示名 (rename) / 自動名、 無ければ空 (無名)。
+    Arc::from(song.content_name(clip.content_id))
+}
+
 /// gui_01 #028 (M14 Phase 63n-1): `Track.automation_lanes` を widget が
 /// 受け取れる `ArrangementAutomationLane` 列に変換。 各 lane の
 /// `target` から label / icon_glyph / color / default_value_norm を導出
@@ -2563,12 +2618,71 @@ fn draw_midi_clip_notes(
 
 #[cfg(test)]
 mod tests {
-    use super::track_index_at_y;
+    use super::{clip_display_label, track_index_at_y};
     use common::model::Track;
     use daw_ui_renderer::Rect;
 
     fn rect_at(y: f32, h: f32) -> Rect {
         Rect { x: 0.0, y, w: 100.0, h }
+    }
+
+    /// クリップ表示名の導出優先順位 (issues 5/7): 明示名 → Text 本文 →
+    /// ノート歌詞 (start_beat 順) → 無名 (空)。
+    #[test]
+    fn clip_display_label_priority() {
+        use common::model::{
+            Clip, ClipContent, MidiContent, Note, Song, TextContent, TextEvent,
+        };
+
+        let mut song = Song::default();
+
+        // content 1: MIDI clip、 歌詞付きノート (start_beat 逆順で挿入して
+        // ソートを検証)。
+        song.clip_contents.insert(
+            1,
+            ClipContent::Midi(MidiContent {
+                notes: vec![
+                    Note { start_beat: 1.0, lyric: Some("か".into()), ..Note::default() },
+                    Note { start_beat: 0.0, lyric: Some("こんに".into()), ..Note::default() },
+                    Note { start_beat: 2.0, lyric: None, ..Note::default() },
+                ],
+            }),
+        );
+        let midi_clip = Clip { id: 1, content_id: 1, ..Clip::default() };
+        // start_beat 順: 0.0 "こんに" → 1.0 "か"。 名前無しなので歌詞を表示。
+        assert_eq!(&*clip_display_label(&midi_clip, &song), "こんにか");
+
+        // content 2: Text clip → 本文を表示 (名前 == 本文)。
+        song.clip_contents.insert(
+            2,
+            ClipContent::Text(TextContent {
+                events: vec![TextEvent { text: "Hello".into(), ..TextEvent::default() }],
+            }),
+        );
+        let text_clip = Clip { id: 2, content_id: 2, ..Clip::default() };
+        assert_eq!(&*clip_display_label(&text_clip, &song), "Hello");
+
+        // 内容優先: Text 本文は content_name (自動名/明示名) より優先される。
+        // 既存プロジェクトで "Title" 等が入っていても本文が一貫して出る。
+        song.set_content_name(2, "MyName".into());
+        assert_eq!(&*clip_display_label(&text_clip, &song), "Hello");
+        // 歌詞付き MIDI クリップも content_name より歌詞が優先 (録音クリップで
+        // "Recorded N" が入っていても歌詞が出る)。
+        song.set_content_name(1, "Recorded 1".into());
+        assert_eq!(&*clip_display_label(&midi_clip, &song), "こんにか");
+
+        // content 3: 歌詞も本文も無い MIDI → content_name (無ければ空)。
+        song.clip_contents.insert(
+            3,
+            ClipContent::Midi(MidiContent {
+                notes: vec![Note { start_beat: 0.0, lyric: None, ..Note::default() }],
+            }),
+        );
+        let empty_clip = Clip { id: 3, content_id: 3, ..Clip::default() };
+        assert_eq!(&*clip_display_label(&empty_clip, &song), "");
+        // 本文/歌詞が無ければ content_name が fallback として表示される。
+        song.set_content_name(3, "Drums".into());
+        assert_eq!(&*clip_display_label(&empty_clip, &song), "Drums");
     }
 
     /// off-by-one 回帰固定: arrangement 最上段に master 行 (Reaper 流) があると、

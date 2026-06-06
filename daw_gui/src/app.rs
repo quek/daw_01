@@ -1142,6 +1142,11 @@ pub struct AppData {
 
     pub undo_stack: VecDeque<Song>,
     pub redo_stack: VecDeque<Song>,
+    /// 最後に save / load / recovery / new した時点の Song 内容 (= dirty 判定の
+    /// SSoT)。 `is_dirty` は本質的に `self.song != self.saved_song` の派生で、
+    /// Undo/Redo で内容がこのベースラインに戻れば自動で clean になり、 タイトルの
+    /// `*` が消える (`recompute_dirty` / `reset_saved_baseline` 参照)。
+    saved_song: Song,
 
     pub is_help_open: bool,
 
@@ -1430,6 +1435,10 @@ impl AppData {
             export_temp_wav: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
+            // 実値は new 末尾で `app.saved_song = app.song.clone()` に上書き
+            // する (初期 song は 1 track 持ちで Song::default と異なるため、
+            // ここで default を入れたままだと起動直後に spurious dirty になる)。
+            saved_song: Song::default(),
             is_help_open: false,
             app_dirs,
             recent_files,
@@ -1463,6 +1472,9 @@ impl AppData {
         // 同期されるので、 初回のみここで初期化する。
         let mut app = app;
         app.init_recent_labels();
+        // 起動直後の song (1 track 持ち) を保存ベースラインに確定する。
+        // is_dirty は literal で false 初期化済 (song == saved_song)。
+        app.saved_song = app.song.clone();
         app
     }
 
@@ -2073,6 +2085,27 @@ impl AppData {
         }
         self.undo_stack.push_back(self.song.clone());
         self.redo_stack.clear();
+    }
+
+    /// `is_dirty` を「保存時点の内容との差分」から再計算する (SSoT)。
+    /// 編集 / Undo / Redo は sticky に `is_dirty = true` を立てるだけで、
+    /// 実際に保存状態へ戻ったか否かはここで内容比較して確定する。 タイトル
+    /// 描画 (runner) が毎フレーム is_dirty が立っているときだけ本関数を呼ぶ
+    /// ので、 clean な間は比較ゼロ・dirty な間も 1 フレーム 1 回に収まる。
+    /// snapshot 方式の Undo なので index 比較より内容比較の方が頑健
+    /// (相殺編集 / redo で保存点を通り越す / stack トリミング を正しく判定)。
+    pub(crate) fn recompute_dirty(&mut self) {
+        self.is_dirty = self.song != self.saved_song;
+    }
+
+    /// New / Open / Restore 時に呼ぶ。 現在の song を保存ベースラインに確定し、
+    /// 別プロジェクトの Undo/Redo 履歴を破棄して clean 状態にする。
+    /// (save は履歴を残したいので別扱い: `saved_song` 更新のみ。)
+    fn reset_saved_baseline(&mut self) {
+        self.saved_song = self.song.clone();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.is_dirty = false;
     }
 
     fn undo(&mut self) {
@@ -5434,6 +5467,10 @@ impl AppData {
         self.restore_plugin_from_song(&song_snapshot);
         self.sync_song_to_plugin_host();
         self.resync_song_edit_texts();
+        // 新規プロジェクトを clean (= '*' 無し) で開始し、 旧プロジェクトの
+        // Undo/Redo 履歴を破棄する (sync_song_to_plugin_host が is_dirty を
+        // 立てるので、 ここで baseline 確定して打ち消す)。
+        self.reset_saved_baseline();
         tracing::info!("new project");
     }
 
@@ -5634,7 +5671,9 @@ impl AppData {
                 self.resize_track_peak_display();
                 self.sync_song_to_plugin_host();
                 self.resync_song_edit_texts();
-                self.is_dirty = false;
+                // load した内容を新しい保存ベースラインに確定し、 前プロジェクトの
+                // Undo/Redo 履歴を破棄する (reset_saved_baseline 内で is_dirty=false)。
+                self.reset_saved_baseline();
                 // sidecar 検出: 前回のセッションが正常終了せず、 同 file の
                 // autosave が残っているなら recovery modal に追加。 ユーザーが
                 // 「復元」 で sidecar に切り替えられる。
@@ -5846,7 +5885,8 @@ impl AppData {
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
         self.resync_song_edit_texts();
-        self.is_dirty = false;
+        // 復元した内容を新しい保存ベースラインに確定し、 履歴を破棄する。
+        self.reset_saved_baseline();
         let _ = std::fs::remove_file(&autosave_path);
         self.recovery_candidates.retain(|p| p != &autosave_path);
         if self.recovery_candidates.is_empty() {
@@ -6358,6 +6398,9 @@ impl AppData {
         match common::project::save(path, &self.song) {
             Ok(()) => {
                 tracing::info!(path = %path.display(), "saved project");
+                // 保存した内容を新しい保存ベースラインに確定する。 save 後も
+                // Undo できるよう履歴は残す (= reset_saved_baseline は使わない)。
+                self.saved_song = self.song.clone();
                 self.is_dirty = false;
                 // 保存成功後、 この project の autosave (sidecar + 未保存→Save As
                 // 用の session recovery file) を削除する。 save 後の .daw が
@@ -6900,7 +6943,17 @@ impl AppData {
         else {
             return;
         };
-        self.clip_rename_text = self.song.content_name(content_id).to_string();
+        // 表示されている名前 (= clip_display_label と同じ) を編集開始値にする。
+        // Text clip は本文 (= first TextEvent.text) を、 それ以外は content_name を pre-fill。
+        self.clip_rename_text = self
+            .song
+            .clip_contents
+            .get(&content_id)
+            .and_then(|c| c.text_events())
+            .and_then(|events| events.first())
+            .map(|ev| ev.text.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| self.song.content_name(content_id).to_string());
         self.clip_rename = Some(target);
     }
 
@@ -6929,7 +6982,21 @@ impl AppData {
         else {
             return;
         };
-        self.song.set_content_name(content_id, new_name);
+        // Text clip は本文 (= 全 TextEvent.text) に書く。 表示名 (clip_display_label)
+        // は content-first で本文を優先するので、 content_name を書いても見えない。
+        // set_clip_text_event_content が全 event 書換え + edit buffer resync + is_dirty を
+        // 行う (inspector の content 編集と同経路)。 非 Text clip は従来どおり content_name。
+        if matches!(
+            self.song.clip_contents.get(&content_id),
+            Some(common::model::ClipContent::Text(_))
+        ) {
+            self.set_clip_text_event_content(target, new_name);
+        } else {
+            self.song.set_content_name(content_id, new_name);
+            // content_name 経路は単独で is_dirty を立てないため明示的に arm する
+            // (push_undo_snapshot は is_undoable 経由で済むが dirty は立てない)。
+            self.is_dirty = true;
+        }
     }
 
     fn ensure_first_track(&mut self) {
@@ -9984,7 +10051,33 @@ impl AppData {
         if canvas_w < 16.0 || canvas_h < 16.0 {
             return;
         }
-        let track_count = self.song.tracks.len().max(1);
+        // 行高は widget が canvas_h に描く行数で割る: 常に先頭へ prepend される
+        // master 行 (arrangement_view.rs が常時 `Some(&master_row)`) + 可視 track 数。
+        // collapsed group 配下の子は widget 側 `is_visible_track` で描画されないので、
+        // ここでも親 chain に collapsed があれば除外して同じ可視集合を数える
+        // (`compute_track_depth` と同じ parent_group_id walk、 32 hop で cycle 安全)。
+        let visible_track_count = self
+            .song
+            .tracks
+            .iter()
+            .filter(|t| {
+                let mut cursor = t.parent_group_id;
+                let mut hops = 0u8;
+                while let Some(pid) = cursor {
+                    if self.collapsed_groups.contains(&pid) {
+                        return false;
+                    }
+                    hops += 1;
+                    if hops > 32 {
+                        break;
+                    }
+                    cursor = self.song.track_by_id(pid).and_then(|t| t.parent_group_id);
+                }
+                true
+            })
+            .count();
+        // +1 は master 行 (widget が visible_tracks[0] に常時 prepend する)。
+        let row_count = (visible_track_count + 1).max(1);
 
         let (min_beat, max_beat) = self
             .song
@@ -10003,7 +10096,7 @@ impl AppData {
         let span_beats = (max_beat - min_beat + 4.0).max(4.0);
         self.arrange_scroll_beat = (min_beat - 2.0).max(0.0) as f32;
         self.arrange_zoom_x = (f64::from(canvas_w) / span_beats).clamp(2.0, 400.0) as f32;
-        let row_h = (canvas_h / track_count as f32).clamp(16.0, 96.0);
+        let row_h = (canvas_h / row_count as f32).clamp(16.0, 96.0);
         self.arrange_track_row_h = row_h;
     }
 
@@ -10885,7 +10978,13 @@ impl AppData {
     fn set_clip_text_event_content(&mut self, target: ClipRef, value: String) {
         // 単一行 text のみ (`plan_text_overlay.md` §1.1)、 '\n' は除外。
         let value = value.replace(['\n', '\r'], " ");
-        self.mutate_text_events_in_clip(target, |e| e.text = value.clone());
+        if self.mutate_text_events_in_clip(target, |e| e.text = value.clone()) {
+            // Text 編集は plugin host へ sync しない経路なので、 ここで明示的に
+            // dirty を立てる (= 未保存変更ありとしてタイトルに '*' / autosave 対象)。
+            // 表示名は content から導出するので content_name は触らない
+            // (デフォルト無名のまま、 clip_display_label が本文を表示)。
+            self.is_dirty = true;
+        }
         self.resync_clip_text_event_edit_buffers(target);
     }
 
@@ -12255,7 +12354,6 @@ impl AppData {
         };
         let new_clip_id = track.alloc_clip_id();
         let new_idx = track.clips.len() as u32;
-        let name = format!("Clip {}", track.clips.len() + 1);
         track.clips.push(Clip {
             id: new_clip_id,
             name: String::new(),
@@ -12266,8 +12364,9 @@ impl AppData {
             color: None,
             auto_lipsync: false,
         });
-        // 名前は content_id 単位 SSoT へ (track borrow が切れた後に書く)。
-        self.song.set_content_name(content_id, name);
+        // デフォルトでクリップ名は無し (= content_name 未設定)。 表示名は
+        // arrangement_view::clip_display_label が内容 (Text 本文 / ノート歌詞)
+        // から導出する。 ユーザーが Rename したときだけ明示名が入る。
         let r = ClipRef {
             track: track_idx,
             clip: new_idx,
@@ -15070,7 +15169,9 @@ impl AppData {
                     ..common::model::TextEvent::default()
                 }],
             }),
-            "Title".to_string(),
+            // デフォルトでクリップ名は無し。 表示名は clip_display_label が
+            // TextEvent.text ("Title") から導出する (= 名前 == 本文)。
+            String::new(),
         );
 
         let track = &mut self.song.tracks[track_idx];

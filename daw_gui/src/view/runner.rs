@@ -935,6 +935,14 @@ impl Runner {
         // タイトル差分反映: "<*>プロジェクト名"。未保存変更があれば先頭に * を付ける。
         // file_path 未設定 (新規未保存) は "Untitled"。毎フレーム is_dirty を読むが、
         // 差分があるときだけ set_title を呼ぶ。
+        //
+        // is_dirty は編集 / Undo / Redo が sticky に立てる「arming」フラグなので、
+        // 立っているときだけ保存ベースラインとの内容比較で実 dirty を確定する。
+        // これで Undo / scrub で内容が保存状態へ戻れば '*' が自動で消える
+        // (clean な間は比較ゼロ、 dirty な間も 1 フレーム 1 回の比較に収まる)。
+        if state.app.is_dirty {
+            state.app.recompute_dirty();
+        }
         let project_name = state
             .app
             .file_path
