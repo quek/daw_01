@@ -20,7 +20,7 @@
 //! readback (Phase 2) and unifying source decode onto libav (Phase 3) come
 //! later.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::path::Path;
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
@@ -28,6 +28,7 @@ use rsmpeg::avformat::AVFormatContextOutput;
 use rsmpeg::avutil::{AVChannelLayout, AVDictionary, AVFrame};
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
+use rsmpeg::swscale::SwsContext;
 
 /// Audio input spec for the optional muxed AAC stream. Channels / sample-rate
 /// come from the export temp WAV (PCM Float32, native rate).
@@ -60,9 +61,12 @@ pub struct LibavEncoder {
     venc: AVCodecContext,
     width: u32,
     height: u32,
-    /// Pixel format the NVENC context consumes. Phase 1 feeds RGBA directly
-    /// (NVENC converts on-GPU); see [`pick_video_pix_fmt`].
+    /// Pixel format the chosen video encoder consumes. NVENC takes RGBA8
+    /// directly (converts on-GPU); the software fallbacks take YUV.
     pix_fmt: i32,
+    /// RGBA8 → `pix_fmt` converter, built lazily only when the chosen encoder
+    /// is a YUV-input software fallback (`None` on the NVENC/RGBA-direct path).
+    rgba_sws: Option<SwsContext>,
     video_stream_index: i32,
     venc_time_base: ffi::AVRational,
     video_stream_time_base: ffi::AVRational,
@@ -99,38 +103,23 @@ impl LibavEncoder {
         let video_time_base = ffi::AVRational { num: fps_den, den: fps_num };
         let frame_rate = ffi::AVRational { num: fps_num, den: fps_den };
 
-        let vcodec = AVCodec::find_encoder_by_name(c"h264_nvenc")
-            .ok_or_else(|| "h264_nvenc encoder not available in linked FFmpeg".to_string())?;
-        let pix_fmt = pick_video_pix_fmt(&vcodec);
-
-        let mut venc = AVCodecContext::new(&vcodec);
-        venc.set_width(width as i32);
-        venc.set_height(height as i32);
-        venc.set_pix_fmt(pix_fmt);
-        venc.set_time_base(video_time_base);
-        venc.set_framerate(frame_rate);
-        venc.set_bit_rate(i64::from(bitrate));
-        venc.set_gop_size((framerate.round() as i32).max(1) * 2);
-        venc.set_max_b_frames(3);
-
         let mut out = AVFormatContextOutput::create(&path_to_cstring(output_path)?)
             .map_err(|e| format!("avformat create {}: {e:?}", output_path.display()))?;
         let global_header = out.oformat().flags & ffi::AVFMT_GLOBALHEADER as i32 != 0;
-        if global_header {
-            venc.set_flags(venc.flags | ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32);
-        }
 
-        // NVENC private options: VBR + multipass full-res, HQ tune, lookahead +
-        // AQ — quality-oriented archive preset (docs/plan_video_export_libav.md §2.2).
-        let vopts = AVDictionary::new(c"preset", c"p5", 0)
-            .set(c"tune", c"hq", 0)
-            .set(c"rc", c"vbr", 0)
-            .set(c"multipass", c"fullres", 0)
-            .set(c"rc-lookahead", c"32", 0)
-            .set(c"spatial-aq", c"1", 0)
-            .set(c"temporal-aq", c"1", 0);
-        venc.open(Some(vopts))
-            .map_err(|e| format!("open h264_nvenc: {e:?}"))?;
+        // Pick & open the H.264 encoder: NVENC (GPU, RGBA-direct) preferred,
+        // then the libopenh264 / h264_mf software fallbacks for machines
+        // without NVENC. SW encoders take YUV, so when one is chosen a swscale
+        // RGBA→YUV pass runs per frame (see `push_video_rgba`).
+        let (venc, pix_fmt) = open_video_encoder(
+            width,
+            height,
+            video_time_base,
+            frame_rate,
+            bitrate,
+            framerate,
+            global_header,
+        )?;
 
         // Optional AAC audio encoder.
         let mut audio_enc: Option<AudioEnc> = None;
@@ -195,6 +184,7 @@ impl LibavEncoder {
             width,
             height,
             pix_fmt,
+            rgba_sws: None,
             video_stream_index,
             venc_time_base: video_time_base,
             video_stream_time_base,
@@ -218,38 +208,7 @@ impl LibavEncoder {
             ));
         }
 
-        let mut frame = AVFrame::new();
-        frame.set_format(self.pix_fmt);
-        frame.set_width(self.width as i32);
-        frame.set_height(self.height as i32);
-        frame
-            .alloc_buffer()
-            .map_err(|e| format!("video frame alloc_buffer: {e:?}"))?;
-        frame
-            .make_writable()
-            .map_err(|e| format!("video frame make_writable: {e:?}"))?;
-
-        let dst_stride = frame.linesize[0] as usize;
-        let src_stride = self.width as usize * 4;
-        let dst = frame.data_mut()[0];
-        if dst.is_null() {
-            return Err("video frame plane 0 is null".to_string());
-        }
-        for y in 0..self.height as usize {
-            // SAFETY: dst has `height * dst_stride` writable bytes; src row is
-            // in-bounds; copy length is one packed RGBA row.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    rgba.as_ptr().add(y * src_stride),
-                    dst.add(y * dst_stride),
-                    src_stride,
-                );
-            }
-        }
-
-        frame.set_pts(self.next_pts);
-        self.next_pts += 1;
-
+        let frame = self.build_video_frame(rgba)?;
         self.venc
             .send_frame(Some(&frame))
             .map_err(|e| format!("video send_frame: {e:?}"))?;
@@ -261,6 +220,88 @@ impl LibavEncoder {
             self.video_stream_time_base,
             false,
         )
+    }
+
+    /// Build the encoder input frame from RGBA8. NVENC consumes RGBA directly
+    /// (GPU-converts); the YUV software fallbacks get a swscale RGBA→`pix_fmt`
+    /// conversion (built lazily on first frame).
+    fn build_video_frame(&mut self, rgba: &[u8]) -> Result<AVFrame, String> {
+        let pts = self.next_pts;
+        self.next_pts += 1;
+
+        let src = self.alloc_rgba_frame(rgba)?;
+        if self.pix_fmt == ffi::AV_PIX_FMT_RGBA {
+            let mut src = src;
+            src.set_pts(pts);
+            return Ok(src);
+        }
+
+        let (w, h) = (self.width as i32, self.height as i32);
+        if self.rgba_sws.is_none() {
+            self.rgba_sws = Some(
+                SwsContext::get_context(
+                    w,
+                    h,
+                    ffi::AV_PIX_FMT_RGBA,
+                    w,
+                    h,
+                    self.pix_fmt,
+                    ffi::SWS_BILINEAR,
+                    None,
+                    None,
+                    None,
+                )
+                .ok_or_else(|| format!("sws_getContext RGBA→{} failed", self.pix_fmt))?,
+            );
+        }
+        let mut dst = AVFrame::new();
+        dst.set_format(self.pix_fmt);
+        dst.set_width(w);
+        dst.set_height(h);
+        dst.alloc_buffer()
+            .map_err(|e| format!("yuv frame alloc_buffer: {e:?}"))?;
+        self.rgba_sws
+            .as_mut()
+            .expect("just set")
+            .scale_frame(&src, 0, h, &mut dst)
+            .map_err(|e| format!("sws RGBA→YUV: {e:?}"))?;
+        dst.set_pts(pts);
+        Ok(dst)
+    }
+
+    /// Allocate an `AV_PIX_FMT_RGBA` frame and copy `rgba` (tight `w*h*4`) into
+    /// it, honoring the frame's (possibly padded) destination stride.
+    fn alloc_rgba_frame(&self, rgba: &[u8]) -> Result<AVFrame, String> {
+        let mut frame = AVFrame::new();
+        frame.set_format(ffi::AV_PIX_FMT_RGBA);
+        frame.set_width(self.width as i32);
+        frame.set_height(self.height as i32);
+        frame
+            .alloc_buffer()
+            .map_err(|e| format!("rgba frame alloc_buffer: {e:?}"))?;
+        frame
+            .make_writable()
+            .map_err(|e| format!("rgba frame make_writable: {e:?}"))?;
+
+        let dst_stride = frame.linesize[0] as usize;
+        let src_stride = self.width as usize * 4;
+        let dst = frame.data_mut()[0];
+        if dst.is_null() {
+            return Err("rgba frame plane 0 is null".to_string());
+        }
+        for y in 0..self.height as usize {
+            // SAFETY: dst has `height * dst_stride` writable bytes; the src row
+            // is in-bounds; copy length is one packed RGBA row (dst_stride >=
+            // src_stride).
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    rgba.as_ptr().add(y * src_stride),
+                    dst.add(y * dst_stride),
+                    src_stride,
+                );
+            }
+        }
+        Ok(frame)
     }
 
     /// Append interleaved PCM Float32 audio. Encodes as many whole AAC frames
@@ -433,17 +474,92 @@ fn encode_audio_frame(
     drain_stream(aenc, out, stream_index, enc_tb, stream_tb, false)
 }
 
-/// Pick the NVENC input pixel format. Phase 1 feeds RGBA8 straight from the
-/// wgpu readback (`AV_PIX_FMT_RGBA`, which on little-endian aliases
-/// `AV_PIX_FMT_BGR32` — one of the packed-RGB inputs NVENC's CUDA path accepts
-/// and converts on the GPU; verified no R/B swap). Asserts the encoder lists
-/// RGBA; if a future build dropped it, Phase 1 would need a swscale NV12 stage.
-fn pick_video_pix_fmt(codec: &AVCodec) -> i32 {
-    const PREFERRED: i32 = ffi::AV_PIX_FMT_RGBA;
-    if codec.pix_fmts().is_some_and(|fmts| fmts.contains(&PREFERRED)) {
-        return PREFERRED;
+/// Open the H.264 encoder for export, preferring NVENC (GPU, RGBA-direct) and
+/// falling back to software for machines without it. Returns the opened context
+/// and the input pixel format it expects.
+///
+/// Order: `h264_nvenc` (RGBA8 in — `AV_PIX_FMT_RGBA` aliases `BGR32` on LE, a
+/// packed-RGB input NVENC's CUDA path converts on-GPU; verified no R/B swap) →
+/// `libopenh264` (BSD SW, YUV420P) → `h264_mf` (Media Foundation wrapper,
+/// NV12). The first that both exists AND opens wins (NVENC `open` can fail at
+/// runtime with no NVIDIA session). Env var `DAW_FORCE_SW_ENCODER` skips NVENC
+/// to exercise the fallback path.
+#[allow(clippy::too_many_arguments)]
+fn open_video_encoder(
+    width: u32,
+    height: u32,
+    time_base: ffi::AVRational,
+    frame_rate: ffi::AVRational,
+    bitrate: u32,
+    framerate: f32,
+    global_header: bool,
+) -> Result<(AVCodecContext, i32), String> {
+    struct Cand {
+        name: &'static CStr,
+        pix_fmt: i32,
+        nvenc: bool,
     }
-    PREFERRED
+    let candidates = [
+        Cand { name: c"h264_nvenc", pix_fmt: ffi::AV_PIX_FMT_RGBA, nvenc: true },
+        Cand { name: c"libopenh264", pix_fmt: ffi::AV_PIX_FMT_YUV420P, nvenc: false },
+        Cand { name: c"h264_mf", pix_fmt: ffi::AV_PIX_FMT_NV12, nvenc: false },
+    ];
+    let force_sw = std::env::var_os("DAW_FORCE_SW_ENCODER").is_some();
+
+    let mut last_err = "no H.264 encoder found in linked FFmpeg".to_string();
+    for cand in candidates {
+        if cand.nvenc && force_sw {
+            continue;
+        }
+        let Some(codec) = AVCodec::find_encoder_by_name(cand.name) else {
+            continue;
+        };
+        // Use the candidate's preferred input format when the encoder lists it,
+        // else YUV420P (universally accepted by the software encoders).
+        let pix_fmt = if codec.pix_fmts().is_some_and(|f| f.contains(&cand.pix_fmt)) {
+            cand.pix_fmt
+        } else {
+            ffi::AV_PIX_FMT_YUV420P
+        };
+        let mut ctx = AVCodecContext::new(&codec);
+        ctx.set_width(width as i32);
+        ctx.set_height(height as i32);
+        ctx.set_pix_fmt(pix_fmt);
+        ctx.set_time_base(time_base);
+        ctx.set_framerate(frame_rate);
+        ctx.set_bit_rate(i64::from(bitrate));
+        ctx.set_gop_size((framerate.round() as i32).max(1) * 2);
+        ctx.set_max_b_frames(if cand.nvenc { 3 } else { 2 });
+        if global_header {
+            ctx.set_flags(ctx.flags | ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32);
+        }
+        // NVENC private options (VBR + multipass HQ); none for the SW encoders.
+        let opts = if cand.nvenc {
+            Some(
+                AVDictionary::new(c"preset", c"p5", 0)
+                    .set(c"tune", c"hq", 0)
+                    .set(c"rc", c"vbr", 0)
+                    .set(c"multipass", c"fullres", 0)
+                    .set(c"rc-lookahead", c"32", 0)
+                    .set(c"spatial-aq", c"1", 0)
+                    .set(c"temporal-aq", c"1", 0),
+            )
+        } else {
+            None
+        };
+        match ctx.open(opts) {
+            Ok(_) => {
+                tracing::info!(
+                    encoder = %cand.name.to_string_lossy(),
+                    pix_fmt,
+                    "export: H.264 encoder opened"
+                );
+                return Ok((ctx, pix_fmt));
+            }
+            Err(e) => last_err = format!("open {}: {e:?}", cand.name.to_string_lossy()),
+        }
+    }
+    Err(format!("no usable H.264 encoder ({last_err})"))
 }
 
 fn path_to_cstring(p: &Path) -> Result<CString, String> {
