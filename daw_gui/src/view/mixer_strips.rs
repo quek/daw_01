@@ -102,26 +102,6 @@ const STYLE_SEND_PREPOST: ToggleButtonStyle = ToggleButtonStyle {
     ..TOGGLE_BUTTON_BASE
 };
 
-pub(crate) const DB_MIN: f32 = -80.0;
-pub(crate) const DB_MAX: f32 = 6.0;
-pub(crate) const DB_RANGE: f32 = DB_MAX - DB_MIN;
-
-pub(crate) fn amp_to_fader(amp: f32) -> f32 {
-    if amp <= 0.0 {
-        return 0.0;
-    }
-    let db = 20.0 * amp.log10();
-    ((db - DB_MIN) / DB_RANGE).clamp(0.0, 1.0)
-}
-
-pub(crate) fn fader_to_amp(n: f32) -> f32 {
-    let db = n * DB_RANGE + DB_MIN;
-    if db <= DB_MIN {
-        0.0
-    } else {
-        10f32.powf(db / 20.0)
-    }
-}
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     ui.panel("mixer_bg", area, COLOR_BG, 0.0);
@@ -444,18 +424,19 @@ fn draw_strip(
     let group_w = FADER_W + METER_GAP + METER_SCALE_W;
     let group_x = rect.x + (rect.w - group_w) * 0.5;
 
-    let fader_value = amp_to_fader(volume);
+    let fader_db = if volume <= 0.0 { f32::NEG_INFINITY } else { 20.0 * volume.log10() };
     let track_idx_for_vol = track_idx;
     let is_master_for_vol = is_master;
     let fader_label: &'static str = if is_master_for_vol { "Master Volume" } else { "Track Volume" };
     let vol_resp = ui.fader_at(
         ("mixer_strip_fader", layout_idx),
         Rect { x: group_x, y: fader_top, w: FADER_W, h: fader_h },
-        fader_value,
-        amp_to_fader(1.0),
+        fader_db,
+        0.0,
+        Some(MeterScale::default()),
         fader_label,
-        move |v| {
-            let amp = fader_to_amp(v);
+        move |new_db| {
+            let amp = if new_db.is_finite() { 10f32.powf(new_db / 20.0) } else { 0.0 };
             Edit::mutate(move |app: &mut AppData| {
                 if is_master_for_vol {
                     app.handle_event(AppEvent::SetMasterGain(amp));

@@ -11,13 +11,12 @@ use daw_ui_core::{
     ArrangementClip, ArrangementClipAudioEdit, ArrangementCurveKind, ArrangementEditRequest,
     ArrangementStyle, ArrangementTrack, ArrangementView, AutomationClipKey,
     AutomationLaneKey, ChannelLayout, ClipKey, ColorPickerStyle, Edit, FadeCurve as WidgetFadeCurve,
-    FadeEdge, SampleSlices, ToggleButtonStyle, Ui, WaveformRenderMode, WaveformSource,
+    FadeEdge, MeterScale, SampleSlices, ToggleButtonStyle, Ui, WaveformRenderMode, WaveformSource,
     WaveformStyle, WaveformView,
 };
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent, ClipRef, ColorPickerTarget, FadeEdgeKind};
-use crate::view::mixer_strips::{amp_to_fader, fader_to_amp};
 use crate::view::track_color;
 use crate::view::snap::{self, SNAP_LABELS};
 
@@ -215,9 +214,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             muted: t.muted,
             solo: t.solo,
             armed: t.armed,
-            // mixer fader と同じ dB スケール (DB_MIN..DB_MAX) で表示する。
-            // 編集 callback で受け取った値は fader_to_amp で linear に戻す。
-            volume: amp_to_fader(t.volume),
+            // mixer fader と同じ MeterScale カーブで 0-1 fraction に変換して渡す。
+            volume: {
+                let db = if t.volume <= 0.0 { f32::NEG_INFINITY } else { 20.0 * t.volume.log10() };
+                MeterScale::default().db_to_frac(db)
+            },
             clips: t
                 .clips
                 .iter()
@@ -1619,11 +1620,11 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
             })
         }
         ArrangementEditRequest::SetTrackVolume { track: track_id, prev: _, next } => {
-            // band は dB スケールで表示しているので、widget からは fader-scale value
-            // (0..1) が来る。fader_to_amp で linear amp に戻して反映する。
+            // widget からは MeterScale カーブの 0-1 fraction が来る。逆変換して amp に戻す。
             // Phase 6 review: track_id をそのまま AppEvent に通す (= 旧 idx
             // 経由は不要)。
-            let amp = fader_to_amp(next.clamp(0.0, 1.0));
+            let frac = next.clamp(0.0, 1.0);
+            let amp = if frac <= 0.0 { 0.0 } else { 10f32.powf(MeterScale::default().frac_to_db(frac) / 20.0) };
             Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::SetTrackVolume {
                     track: track_id,

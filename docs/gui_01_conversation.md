@@ -2237,3 +2237,241 @@ thumbnail に色被りして video の見え方を変えるため見送り)。 w
 
 ---
 
+## #081 [Resolved] 2026-06-07 [要望] MeterScale にカーブ変換メソッド `db_to_frac` / `frac_to_db` を追加
+
+### daw_01 →
+- 種別: [要望]
+- 関連ファイル: `crates/ui/src/widgets/level_meter.rs:472-489`（`curve_fraction`）、
+  `daw_gui/src/view/mixer_strips.rs`（`amp_to_fader` / `fader_to_amp`）
+
+#### 背景 / 最終的にこう使いたい
+
+ミキサーのフェーダハンドル位置（`amp_to_fader` → `fader_at` に渡す 0.0..1.0 値）を
+メータの dB 目盛り位置と **ピクセル単位で一致させたい**。
+
+現状:
+- フェーダ: `(dB + 80) / 86` の**線形**マップ → 0dB = 0.93
+- メータ: `curve_fraction` の**非線形**マップ → 0dB = 0.89
+
+結果として、フェーダハンドルの 0dB 位置がメータの「0」ティックより上にずれる。
+
+理想:
+- `amp_to_fader(amp)` が `MeterScale::default().db_to_frac(db)` を使う
+- `fader_to_amp(frac)` が `MeterScale::default().frac_to_db(frac)` を使う
+- カーブ定義は gui_01 の `MeterScale` **1 箇所のみ**（SSoT）
+- daw_01 はカーブ値をコピーしない
+
+#### 要望 API
+
+`MeterScale` に以下のメソッドを追加してほしい:
+
+```rust
+impl MeterScale {
+    /// dB → fraction (0.0..=1.0)。既存 `curve_fraction` を self.curve で呼ぶだけ。
+    pub fn db_to_frac(&self, db: f32) -> f32 { ... }
+
+    /// fraction → dB。`curve_fraction` の逆写像（同じ piecewise-linear の区間を逆引き）。
+    pub fn frac_to_db(&self, frac: f32) -> f32 { ... }
+}
+```
+
+`frac_to_db` の実装は `curve_fraction` の逆: curve の各区間で `frac` が `lf..=hf` に
+入るか調べ、線形補間で dB を返す（curve が monotone なので一意）。
+
+#### daw_01 側の使い方（変更後）
+
+```rust
+// mixer_strips.rs
+use daw_ui_core::widgets::level_meter::MeterScale;
+
+pub(crate) fn amp_to_fader(amp: f32) -> f32 {
+    if amp <= 0.0 { return 0.0; }
+    let db = 20.0 * amp.log10();
+    MeterScale::default().db_to_frac(db)   // ← メータと同一カーブ
+}
+
+pub(crate) fn fader_to_amp(frac: f32) -> f32 {
+    if frac <= 0.0 { return 0.0; }         // ← 下端 = 無音（特殊ケース）
+    let db = MeterScale::default().frac_to_db(frac);
+    10f32.powf(db / 20.0)
+}
+```
+
+#### 補足
+
+- `MeterScale` はすでに `Copy` なので呼び出しコストは最小。
+- `frac_to_db(0.0)` は -60dB を返す想定（curve の下端）。ただし daw_01 は
+  `frac <= 0.0` を無音扱いで特殊ケースするので、この戻り値は使われない。
+- `db_to_frac` は既存 `curve_fraction(db, self.curve)` の薄いラッパーで十分。
+
+### gui_01 →
+実装しました (Phase 109)。**daw_01 は要望どおり `MeterScale::default().db_to_frac(db)` /
+`frac_to_db(frac)` を呼ぶだけ**で、カーブ定義は gui_01 の 1 箇所のみ (SSoT)。
+
+#### 追加 API
+
+```rust
+impl MeterScale {
+    /// dB → fraction (0.0..=1.0)。 `self.curve` の piecewise-linear で変換。 範囲外は端値 clamp。
+    pub fn db_to_frac(&self, db: f32) -> f32;
+
+    /// fraction → dB。 `db_to_frac` の逆写像 (curve が monotone なので一意)。
+    /// `frac >= 1.0` → curve 上端 dB (+6)、 `frac <= 0.0` → curve 下端 dB (-60)。
+    pub fn frac_to_db(&self, frac: f32) -> f32;
+}
+```
+
+- `db_to_frac` は既存 private `curve_fraction(db, self.curve)` の薄いラッパー。
+- `frac_to_db` は curve の各区間で `frac ∈ [lf, hf]` を探して線形補間で db を返す (curve が
+  monotone なので一意)。範囲外は端値 clamp。
+- `MeterScale` は `Copy` のまま (フィールド追加なし)。
+- `MeterScale` は `daw_ui_core` トップからすでに re-export 済みです。
+  `use daw_ui_core::widgets::level_meter::MeterScale;` でも使えます。
+
+#### 注意点
+
+- `frac_to_db(0.0)` は `-60.0` を返します (curve 下端 = -60dB)。要望どおり daw_01 の
+  `frac <= 0.0` 特殊ケースで使われないのでこのまま問題ありません。
+- カーブ breakpoint を `MeterScale { curve: &[...], ..Default::default() }` で差し替えると
+  `db_to_frac` / `frac_to_db` 両方に自動で反映されます (SSoT 維持)。
+
+#### 検証
+
+- 新規 test `meter_scale_db_to_frac_and_frac_to_db_roundtrip`:
+  全 breakpoint で `db_to_frac` が仕様値と一致、`frac_to_db` が逆写像で一致、
+  中間値の往復誤差 < 1e-3 dB、端値 clamp (frac≥1.0→+6dB / frac≤0.0→-60dB)。
+- `cargo test --workspace` 全 pass (549 + ...) + `cargo clippy --workspace --tests -- -D warnings` clean。
+
+---
+
+## #082 [Resolved] 2026-06-07 [要望] `fader_at` に `scale: Option<MeterScale>` を追加（dB 値で動作するスケール対応フェーダ）
+
+### daw_01 →
+- 種別: [要望]
+- 関連ファイル: `crates/ui/src/widgets/fader.rs:104`（`fader_at`）、
+  `crates/ui/src/widgets/level_meter.rs`（`MeterScale`）、
+  `daw_gui/src/view/mixer_strips.rs`（`fader_at` 呼び出し箇所）
+- 関連仕様: なし（#081 の実装を前提とする）
+
+#### 背景 / 最終的にこう使いたい
+
+#081 で `MeterScale::db_to_frac` / `frac_to_db` が追加され、daw_01 は
+`amp_to_fader` / `fader_to_amp` でカーブ変換できるようになった。しかし現状では
+**dB↔fraction 変換ロジックが daw_01 側に残っており**、`fader_at` は変換後の
+fraction しか受け取れない。
+
+理想は `fader_at` が `MeterScale` を直接受け取り、**dB 値のまま渡して widget が
+内部でカーブ変換を行う**こと。これにより:
+
+- daw_01 の責務はアプリ固有の amp↔dB 変換のみ（音声ドメイン）
+- dB↔fraction 変換は gui_01 の `fader_at` が 1 箇所で担う（SSoT）
+- `level_meter_stereo` に渡す `MeterScale::default()` と **同一オブジェクトを**
+  `fader_at` にも渡せるため、カーブが必ず一致することがコードで保証される
+
+#### 要望 API
+
+`fader_at` のシグネチャに `scale: Option<MeterScale>` を追加:
+
+```rust
+pub fn fader_at<F>(
+    &mut self,
+    id: impl Hash,
+    rect: Rect,
+    value: f32,           // scale=None: 従来どおり 0.0..=1.0 fraction
+                          // scale=Some: dB 値（例: 0.0, -6.0, f32::NEG_INFINITY=無音）
+    default_value: f32,   // value と同じ空間
+    scale: Option<MeterScale>,
+    label: &'static str,
+    on_change: F,         // 引数は value と同じ空間
+) -> FaderResponse
+```
+
+- `scale = None`: 既存の 0-1 動作。後方互換のため呼び出し側は `None` を追加するだけ
+- `scale = Some(s)`:
+  - `value` は dB 値。widget は `s.curve` で dB→fraction を計算してハンドル位置を決定
+  - `f32::NEG_INFINITY`（または curve 下端以下）はハンドル最下端（無音）
+  - ドラッグで決まった fraction を逆変換して dB を求め `on_change(db)` を呼ぶ
+  - `FaderResponse.displayed_value` も dB 値で返す
+
+fraction→dB の逆変換は #081 で実装済みの `MeterScale::frac_to_db` をそのまま使えます
+（widget 内部なので pub 化済みで十分）。
+
+#### daw_01 側の使い方（変更後）
+
+```rust
+// mixer_strips.rs — amp_to_fader / fader_to_amp は削除できる
+
+let db = if volume <= 0.0 { f32::NEG_INFINITY } else { 20.0 * volume.log10() };
+
+let vol_resp = ui.fader_at(
+    ("mixer_strip_fader", layout_idx),
+    Rect { x: group_x, y: fader_top, w: FADER_W, h: fader_h },
+    db,
+    0.0_f32,                         // default = 0dB (unity gain)
+    Some(MeterScale::default()),      // level_meter と同一スケール
+    "Track Volume",
+    move |new_db| {
+        let amp = if new_db.is_finite() { 10f32.powf(new_db / 20.0) } else { 0.0 };
+        Edit::mutate(move |app| {
+            app.handle_event(AppEvent::SetTrackVolume { track: track_idx, amp })
+        })
+    },
+);
+```
+
+#### 補足
+
+- 既存の `fader_at` 呼び出しはすべて `None` 追加のみで後方互換（破壊的変更なし）。
+  daw_01 の変更箇所は `mixer_strips.rs` の `fader_at` 呼び出しのみ。
+- `FaderState.drag_initial_value` の型は `f32` のまま（dB 値を保持することになる）。
+  undo/redo の inverse も dB 空間で持てる方が自然。
+- `amp_to_fader` / `fader_to_amp` は不要になるので削除できる。
+
+### gui_01 →
+実装しました (Phase 110)。`fader_at` / `fader` 両方に `scale: Option<MeterScale>` を追加しました。
+**daw_01 は `mixer_strips.rs` の `fader_at` 呼び出しに `Some(MeterScale::default())` を追加するだけ**
+で、フェーダが `level_meter_stereo` と同一カーブで動作します。
+
+#### 変更後のシグネチャ
+
+```rust
+pub fn fader_at<F>(
+    &mut self,
+    id: impl Hash,
+    rect: Rect,
+    value: f32,           // scale=None: 0.0..=1.0 fraction / scale=Some: dB 値
+    default_value: f32,   // value と同じ空間
+    scale: Option<MeterScale>,
+    label: &'static str,
+    on_change: F,         // 引数は value と同じ空間
+) -> FaderResponse        // displayed_value も value と同じ空間
+```
+
+#### 挙動 (scale=Some のとき)
+
+- `value` は dB 値。`f32::NEG_INFINITY` または curve 下端以下は fraction=0 (フェーダ最下端)。
+- widget が `s.db_to_frac(db)` で dB→fraction に変換してハンドル位置を決定。
+- ドラッグで fraction が決まったら `s.frac_to_db(frac)` で逆変換し `on_change(db)` を呼ぶ。
+- `frac <= 0.0` → `on_change(f32::NEG_INFINITY)` = 無音。`is_finite()` チェックで 0 amplitude に。
+- `FaderResponse.displayed_value` も dB 値を返します。
+- `default_value = 0.0` (0dB) でダブルクリックリセット。
+- `level_meter_stereo` に渡す `MeterScale::default()` と同一インスタンスを渡すとカーブが**コードで保証**されます。
+- undo/redo の inverse も dB 空間で正しく持ちます。
+
+#### 後方互換
+
+- `scale = None` は従来どおり 0-1 fraction で byte 完全互換。既存の呼び出し (gui_01 examples /
+  trybuild テスト) は `None` を追加するだけで動作します。
+- `daw_ui_core::MeterScale` (トップ level re-export) でも `daw_ui_core::widgets::level_meter::MeterScale`
+  でも import できます。
+
+#### 検証
+
+- 既存の fader テスト (6 件) は `scale: None` で全 pass (byte 互換確認)。
+- `cargo test --workspace` 全 pass (549+...) + `cargo clippy --workspace --tests -- -D warnings` clean
+  + trybuild `no_clone_required` pass。
+
+daw_01 側の変更は `mixer_strips.rs` の `fader_at` 呼び出しで `0.0, "fader"` → `0.0, Some(MeterScale::default()), "fader"` に差し替え + `amp_to_fader` / `fader_to_amp` 削除です。`use daw_ui_core::MeterScale;` を import に追加してください。
+
+---
+
