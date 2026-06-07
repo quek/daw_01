@@ -213,9 +213,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             default_value
         } else if let (Some(anchor), Some((_, py))) = (drag_anchor, pointer.pos) {
             let track_h = (rect.h - TRACK_PAD * 2.0).max(1.0);
-            let scale = if anchor.ctrl { FINE_DRAG_SCALE } else { 1.0 };
+            let drag_scale = if anchor.ctrl { FINE_DRAG_SCALE } else { 1.0 };
             let raw_dv = -(py - anchor.pointer_y) / track_h;
-            (anchor.value + raw_dv * scale).clamp(0.0, 1.0)
+            (anchor.value + raw_dv * drag_scale).clamp(0.0, 1.0)
         } else {
             value
         };
