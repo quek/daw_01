@@ -259,7 +259,7 @@ impl App {
                     let mute_rect  = layout.rect(mute_n);
 
                     let resp: FaderResponse =
-                        ui.fader_at(("ch_fader", i), fader_rect, m.faders[i], 0.0, "fader", move |v| {
+                        ui.fader_at(("ch_fader", i), fader_rect, m.faders[i], 0.0, None, "fader", move |v| {
                             Edit::mutate(move |m: &mut MixerModel| {
                                 m.faders[i] = v;
                                 m.last_action = format!("ch{} fader = {v:.2}", i + 1);

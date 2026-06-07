@@ -86,10 +86,11 @@ fn main() {
                 Rect { x: 0.0, y: 0.0, w: 32.0, h: 120.0 },
                 m.volume,
                 0.0,
+                None,
                 "fader",
                 |v| Edit::mutate(move |m: &mut Model| m.volume = v),
             );
-            let _ = ui.fader("vol2", m.volume, 0.0, "fader", |v| {
+            let _ = ui.fader("vol2", m.volume, 0.0, None, "fader", |v| {
                 Edit::mutate(move |m: &mut Model| m.volume = v)
             });
             // knob (M3): 同様に non-Clone Model でコンパイルする。

@@ -1,11 +1,15 @@
-//! `fader` ウィジェット — 垂直スライダ。値範囲は `0.0..=1.0`。
+//! `fader` ウィジェット — 垂直スライダ。
+//!
+//! `scale = None` のとき値範囲は `0.0..=1.0` (従来どおり)。
+//! `scale = Some(s)` のとき値は dB 値で渡し、widget が `MeterScale` カーブで内部変換する。
+//! これにより `level_meter_stereo` と同一 `MeterScale` を共有するとカーブが必ず一致する (SSoT)。
 //!
 //! 設計の要点:
 //! - 値は **アプリ側 Model が所有**。ライブラリは「現在値を借りて描き、ドラッグで
 //!   新値を計算して `Edit<M>` を発行する」だけ。
 //! - ドラッグ状態は `WidgetId` キーで `state` HashMap に持つ (`FaderState`)。
 //!   no-Clone 制約を維持するため Model 側に状態を持たせない。
-//! - 縦方向ドラッグ: 上 = 値増加、下 = 値減少。1 widget 高さ全部使う = 0 → 1。
+//! - 縦方向ドラッグ: 上 = 値増加、下 = 値減少。1 widget 高さ全部使う = 0 → 1 (fraction 空間)。
 //! - **DAW 標準挙動**:
 //!   - ダブルクリックで `default_value` に戻る (~300ms × 5px 以内の 2 回目 press)
 //!   - Ctrl + ドラッグで感度 1/10 (高精度)。Mid-drag toggle で値が jump しないよう再 anchor
@@ -19,6 +23,7 @@ use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
 use crate::ui::{Ui, hovered};
+use crate::widgets::level_meter::MeterScale;
 
 const TRACK_PAD: f32 = 8.0;
 const THUMB_W: f32 = 28.0;
@@ -92,31 +97,52 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// `on_change` は `Fn + Clone + Send + Sync + 'static` を要求 (= `move |v| Edit::mutate(...)` の
     /// 形で書く、capture は Copy 型のみが原則)。
     ///
-    /// `value` は `0.0..=1.0` 想定 (範囲外は内部でクランプ)。
-    /// `default_value` は thumb のダブルクリック時にリセットされる値 (例: 0.0 = 無音、1.0 = ユニティ)。
+    /// `scale = None` のとき `value` / `default_value` / `on_change` 引数はすべて `0.0..=1.0` fraction。
+    /// `scale = Some(s)` のとき `value` / `default_value` / `on_change` 引数はすべて dB 値。
+    ///   - `f32::NEG_INFINITY`（または curve 下端以下）はフェーダ最下端（無音）。
+    ///   - widget が `s.curve` で dB→fraction 変換してハンドル位置を決定し、
+    ///     fraction→dB 逆変換して `on_change(db)` を呼ぶ。
+    ///   - `level_meter_stereo` に渡す `MeterScale` と同一インスタンスを使うとカーソルが必ず一致する。
+    ///
     /// `label` は undoable history パネルでの表示文字列 ("fader" / "volume" 等)。
     ///
     /// 操作:
-    /// - thumb をドラッグで値編集 (track 1 本分 = 0→1)
+    /// - thumb をドラッグで値編集 (track 1 本分 = 0→1 fraction)
     /// - thumb をダブルクリック (~300ms / 5px 以内) で `default_value` に戻る
     /// - Ctrl + ドラッグで感度 1/10
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub fn fader_at<F>(
         &mut self,
         id: impl Hash,
         rect: Rect,
         value: f32,
         default_value: f32,
+        scale: Option<MeterScale>,
         label: &'static str,
         on_change: F,
     ) -> FaderResponse
     where
         F: Fn(f32) -> Edit<M> + Clone + Send + Sync + 'static,
     {
+        // 値空間 (caller の dB or fraction) → 内部 fraction (0..=1) への変換
+        let to_frac = |v: f32| -> f32 {
+            match scale {
+                None => v,
+                Some(s) => if v.is_finite() { s.db_to_frac(v) } else { 0.0 },
+            }
+        };
+        // 内部 fraction → 値空間 (dB or fraction) への変換。fraction=0 は無音 (NEG_INFINITY)。
+        let to_val = move |frac: f32| -> f32 {
+            match scale {
+                None => frac,
+                Some(s) => if frac <= 0.0 { f32::NEG_INFINITY } else { s.frac_to_db(frac) },
+            }
+        };
+
         let wid = WidgetId::ROOT.child((b"fader", &id));
         let pointer = self.pointer;
-        let value = value.clamp(0.0, 1.0);
-        let default_value = default_value.clamp(0.0, 1.0);
+        let value = to_frac(value).clamp(0.0, 1.0);
+        let default_value = to_frac(default_value).clamp(0.0, 1.0);
         let (_, thumb_rect) = fader_geometry(rect, value);
 
         // 1. 押下処理 + 2. mid-drag ctrl toggle 再 anchor + 3. release 解除
@@ -216,28 +242,29 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // model 値が二重更新されないようにする)。release_initial_value が Some なら drag 終端。
         let suppress_mutate_on_release = release_initial_value.is_some();
         if !suppress_mutate_on_release && (displayed_value - value).abs() > f32::EPSILON {
-            let edit = on_change(displayed_value);
+            let edit = on_change(to_val(displayed_value));
             self.push_edit(edit);
         }
 
         // M8 Phase 29: drag 終端で Undoable Edit を発行 (start_value → end_value)。
         // 値変化が無ければ no-op (= 押下しただけで動かさず release した場合は history を汚さない)。
-        if let Some(start_value) = release_initial_value
-            && (start_value - displayed_value).abs() > f32::EPSILON
+        if let Some(start_frac) = release_initial_value
+            && (start_frac - displayed_value).abs() > f32::EPSILON
         {
             let on_change_fwd = on_change.clone();
             let on_change_inv = on_change;
-            let end = displayed_value;
+            let end_val = to_val(displayed_value);
+            let start_val = to_val(start_frac);
             let edit = Edit::with_inverse(
                 label,
-                move |m: &mut M| on_change_fwd(end).apply(m),
-                move |m: &mut M| on_change_inv(start_value).apply(m),
+                move |m: &mut M| on_change_fwd(end_val).apply(m),
+                move |m: &mut M| on_change_inv(start_val).apply(m),
             );
             self.push_edit(edit);
         }
 
         FaderResponse {
-            displayed_value,
+            displayed_value: to_val(displayed_value),
             hovered: hovered(rect, pointer),
             dragging: drag_anchor.is_some(),
         }
@@ -250,6 +277,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         id: impl Hash,
         value: f32,
         default_value: f32,
+        scale: Option<MeterScale>,
         label: &'static str,
         on_change: F,
     ) -> FaderResponse
@@ -264,7 +292,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             w: 32.0,
             h,
         };
-        let resp = self.fader_at(id, rect, value, default_value, label, on_change);
+        let resp = self.fader_at(id, rect, value, default_value, scale, label, on_change);
         self.next_y += h + pad;
         resp
     }
@@ -389,7 +417,7 @@ mod tests {
             screen,
             FrameInput { pointer, ..Default::default() },
             |_, ui| {
-                ui.fader_at("test", rect, value, default_value, "fader", |v| {
+                ui.fader_at("test", rect, value, default_value, None, "fader", |v| {
                     Edit::mutate(move |m: &mut VolModel| m.value = v)
                 });
             },

@@ -833,7 +833,7 @@ fn drawmixer_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pane: Rec
         // fader
         let fader_rect = Rect { x: cx, y: body_top, w: fader_w, h: body_h };
         let cur = m.faders[ch];
-        let _resp: FaderResponse = ui.fader_at(("ch_fader", ch), fader_rect, cur, 0.7, "fader", move |v| {
+        let _resp: FaderResponse = ui.fader_at(("ch_fader", ch), fader_rect, cur, 0.7, None, "fader", move |v| {
             Edit::mutate(move |m: &mut DawModel| m.faders[ch] = v)
         });
 
@@ -1312,6 +1312,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
             f_rect,
             cur_vol,
             1.0,
+            None,
             "track volume",
             move |v| {
                 Edit::mutate(move |mm: &mut DawModel| {

@@ -106,6 +106,36 @@ impl Default for MeterScale {
     }
 }
 
+impl MeterScale {
+    /// dB → fraction (0.0..=1.0)。 `self.curve` の piecewise-linear で変換 (SSoT)。
+    /// 範囲外は端値に clamp。
+    pub fn db_to_frac(&self, db: f32) -> f32 {
+        curve_fraction(db, self.curve)
+    }
+
+    /// fraction (0.0..=1.0) → dB。 `db_to_frac` の逆写像 (curve が monotone なので一意)。
+    /// `frac <= 0.0` は curve 下端 dB を返す。 `frac >= 1.0` は curve 上端 dB を返す。
+    pub fn frac_to_db(&self, frac: f32) -> f32 {
+        let curve = self.curve;
+        let Some(&(top_db, top_f)) = curve.first() else {
+            return 0.0;
+        };
+        if frac >= top_f {
+            return top_db;
+        }
+        for w in curve.windows(2) {
+            let (hd, hf) = w[0];
+            let (ld, lf) = w[1];
+            if frac <= hf && frac >= lf {
+                let span = hf - lf;
+                let t = if span.abs() < 1e-9 { 0.0 } else { (frac - lf) / span };
+                return ld + t * (hd - ld);
+            }
+        }
+        curve.last().map_or(0.0, |&(db, _)| db)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct LevelMeterStyle {
     pub bg: Color,
@@ -568,6 +598,28 @@ mod tests {
         let top = curve_fraction(6.0, c) - curve_fraction(0.0, c);
         let bot = curve_fraction(-54.0, c) - curve_fraction(-60.0, c);
         assert!(top > bot, "top-weighted: {top} > {bot}");
+    }
+
+    /// `MeterScale::db_to_frac` / `frac_to_db` の往復と端値。
+    #[test]
+    fn meter_scale_db_to_frac_and_frac_to_db_roundtrip() {
+        let s = MeterScale::default();
+        // breakpoint 上では完全一致 (誤差 < 1e-3 dB)
+        for &(db, frac) in DEFAULT_CURVE {
+            assert!((s.db_to_frac(db) - frac).abs() < 1e-4, "db_to_frac({db}) failed");
+            assert!((s.frac_to_db(frac) - db).abs() < 1e-3, "frac_to_db({frac}) failed");
+        }
+        // 往復: 任意の中間値 db → frac → db
+        for db in [-3.0f32, -15.0, -45.0] {
+            let frac = s.db_to_frac(db);
+            let recovered = s.frac_to_db(frac);
+            assert!((recovered - db).abs() < 1e-3, "roundtrip failed at db={db}: got {recovered}");
+        }
+        // 端値 clamp
+        assert_eq!(s.db_to_frac(100.0), 1.0);
+        assert_eq!(s.db_to_frac(-200.0), 0.0);
+        assert_eq!(s.frac_to_db(2.0), 6.0);  // frac >= top_f → top_db
+        assert_eq!(s.frac_to_db(-1.0), -60.0); // frac < bot_f → bot_db
     }
 
     #[test]
