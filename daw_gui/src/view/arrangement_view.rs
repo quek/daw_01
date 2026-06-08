@@ -1724,11 +1724,15 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
     }
 }
 
-/// gui_01 #019: 共有 clip 群を視覚区別するためのアクセント色 hue 計算。
+/// gui_01 #019: 共有 clip 群の識別用 hue 計算 (`share_group_color` に渡す値)。
 /// golden ratio (0.61803...) を掛けて fract で `[0.0, 1.0)` に一様分布させる
-/// (連番の content_id でも色が満遍なくバラける)。 widget 側で
-/// `ArrangementStyle.share_group_saturation` / `share_group_fill_lightness` /
-/// `share_group_border_lightness` と組み合わせて HSL → RGB 変換される。
+/// (連番の content_id でも色が満遍なくバラける)。
+///
+/// gui_01 #086 (Phase 114) 以降、clip の塗りは `clip.color` 一本が SSoT になり、
+/// widget は `share_group_color` を **`is_some()` (= ⇌ glyph の有無) でしか見ない**
+/// (hue 値での fill / border 上書きは撤去済)。よってこの hue 値は現状描画に使われず、
+/// refcount >= 2 を `Some(hue)` で表すための payload + 将来の hue ベース theming 用の
+/// 予約値。`share_group_color: Option<f32>` の契約 (refcount >= 2 で `Some`) は不変。
 fn content_id_to_hue(content_id: common::model::ContentId) -> f32 {
     const GOLDEN_RATIO_CONJUGATE: f32 = 0.618_034;
     (content_id as f32 * GOLDEN_RATIO_CONJUGATE).fract()

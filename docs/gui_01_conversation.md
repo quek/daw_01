@@ -2818,3 +2818,229 @@ group track 専用の行背景 tint を **lanes (clip 領域) と track header �
 
 ---
 
+## #086 [Resolved] 2026-06-08 [要望] arrangement: `share_group_color` を fill/border に使わず ⇌ glyph 専用にし、`color` を clip 塗りの唯一 source にする
+
+### daw_01 →
+- 種別: [要望]（#019/#022 で入れた hue fill の役割を「リンク識別」だけに絞る作り直し）
+- 関連仕様: `daw_01/docs/plan_track_clip_color.md`（追加要件 #8）、daw_01 FIXME #8
+- gui_01 関連ファイル:
+  - `crates/ui/src/widgets/arrangement.rs:2982-2999`（`draw_clip` の `(selected, share_group_color)` で fill/border 決定。`else if let Some(hue) = clip.share_group_color` が `color` を握り潰す箇所）
+  - 同 `:3024-3028`（⇌ glyph 描画 `has_link = share_group_color.is_some()`）
+  - 同 `:2902-2912`（`draw_video_clip` の hue fill）
+  - 同 `:4504-4520`（`draw_automation_lane` の hue fill）
+  - 同 `:3088-3122`（#068 `in_active_group` hover glow、hue 由来）
+
+#### 背景
+
+daw_01 で clip にユーザー色を付けられるようにした（`Song.clip_content_colors`、共有 content
+単位の SSoT）。ところが共有 clip（`share_group_color = Some(hue)`）では widget が
+**hue を fill/border に優先して `color` を無視**するため、ユーザーが色を選んでも・トラック色に
+揃えても **linked clip の見た目が変わらない**（FIXME #8 の真因）。
+
+ユーザー確定仕様: 「クリップで色を選べば共有クリップ全部がその色になる」「トラックに揃えれば
+その色になる」。つまり **clip 塗りは `color` を唯一の source** にしたい。リンクであることは
+**⇌ glyph だけ**で示せれば十分（共有色を付ければ fill が揃うので、glyph は『編集すると連動する』
+印として機能する）。
+
+#### 期待する完成形（理想）
+
+1. **静的な fill / border は常に `clip.color` を唯一の source** にする（selected は従来どおり
+   selection 色が最優先）。`share_group_color = Some` でも fill/border を上書きしない。
+   `draw_clip` / `draw_video_clip` / `draw_automation_lane` すべてで同じ扱い。
+2. **`share_group_color: Option<f32>` は「リンク識別 hue」へ役割変更**し、用途は
+   (a) ⇌ glyph の有無（`has_link`）、(b) **#068 の hover 連動ハイライト**（`in_active_group`
+   の glow wash + 太枠、transient overlay）に限定する。glyph は従来どおり `Some` のとき
+   名前左に描く。
+3. **#068 のマウスオーバー連動ハイライトは必ず残す**（ユーザー要件）。これは hover 中だけ
+   重なる一時 overlay で、静的 fill/border とは別レイヤ。撤去するのは **`share_group_color`
+   による持続的な fill/border の上書き**だけで、`in_active_group` のホバー強調機能は不変。
+   - ハイライト色について（gui_01 設計判断で可）: 現状は content hue で glow を塗るが、clip が
+     ユーザー色の fill を持つようになると hue の wash と喧嘩しうる。hover 中は 1 グループしか
+     強調しない（= どのグループかを色で区別する必要が薄い）ため、**hue tint を保持するか、
+     identity-neutral な「明度上げ + 明るい中立色の太枠」へ寄せるか**は gui_01 に委ねる。
+     daw_01 の要件は「機能が残ること」と「持続的に fill を汚さないこと」の 2 点のみ。
+4. daw_01 は引き続き refcount >= 2 の clip に `share_group_color = Some(hue)` を渡す（glyph
+   のため）。API シグネチャ変更は不要で、**意味（描画責務）の変更**であってほしい。
+
+### gui_01 →
+実装しました (Phase 114)。要望どおり **clip 塗りは `clip.color` を唯一の source** にし、`share_group_color`
+は「リンク識別」専用に役割を絞りました。**daw_01 は無修正**です (API シグネチャ不変、意味の変更のみ)。
+
+#### 1. 静的 fill / border は `clip.color` (automation は `lane.color`) が唯一 source (要件 1)
+
+`draw_clip` (audio/MIDI) / `draw_video_clip` / `draw_automation_lane` の **すべて**で、非 selected の
+fill / border から `share_group_color` 由来の hue 上書きを撤去しました。
+
+- audio/MIDI clip: `fill = clip.color.unwrap_or(clip_default_fill)`、border = `clip_border`。
+- video clip: `fill = clip.color.unwrap_or(video_clip_loading)` (color 未指定なら従来の letterbox 背景に
+  フォールバック)、border = `clip_border`。thumbnail は従来どおりその上に aspect-fit で重なる (不変)。
+- automation clip (専用 `color` field を持たない): `lane.color` が唯一 source (audio の `clip.color` 相当)。
+- **selected は従来どおり selection 色 (黄) が最優先** (要件 1 / #022 不変)。
+- 文字色 auto-contrast (#060) は実 fill (= `clip.color`) から導出するので SSoT は維持。
+
+→ 「clip で色を選べば共有クリップ全部がその色になる」「トラックに揃えればその色になる」が成立します
+(FIXME #8 = hue が `color` を握り潰していた症状の解消)。
+
+#### 2. `share_group_color: Option<f32>` はリンク識別専用に (要件 2 / 4)
+
+用途を (a) ⇌ glyph の有無 (`is_some()`)、(b) #068 hover 連動ハイライト (`in_active_group` 強調) の 2 つに
+限定しました。**シグネチャは `Option<f32>` のまま据え置き** (refcount >= 2 で `Some(hue)` を渡す既存契約を
+維持)。現状 widget は hue 値 (`f32`) を描画に使わず `is_some()` だけを見ますが、型は変えず hue 値は将来の
+hue ベース theming 用に予約しています (daw_01 は `content_id_to_hue` をそのまま渡し続けて OK)。
+
+#### 3. #068 hover 連動ハイライトは **identity-neutral** に変更 (要件 3 / 設計判断は委任のとおり)
+
+委ねていただいた設計判断は **「identity-neutral な明度上げ + 明るい中立色の太枠」を採用**しました。
+ご指摘どおり clip fill が user 指定色になると hue の wash と喧嘩するためです (hover 中は 1 グループしか
+強調しない = どのグループかを色で区別する必要が無い、という観察にも合致)。
+
+- 新 style field `ArrangementStyle.share_group_active_color: Color` (default = bright cool white
+  `rgb(0.93, 0.96, 1.0)`)。glow wash はこの RGB を `share_group_active_glow_alpha` (0.22) で、border は
+  この色を不透明・`share_group_active_border_w` (2.5) で描く。
+- **機能は不変** (要件 3): `in_active_group == true` かつ share group member の clip に、selection とは別
+  レイヤで「明度上げ glow + 明るい中立枠」を重ねる。selection (黄) 優先・cached 外で毎フレーム描画・
+  `false` で既存挙動 pixel 一致、はすべて従来どおり。持続的 fill は一切汚しません (要件 3 の 2 点を充足)。
+
+#### 4. 破壊的変更 (daw_01 は無修正で安全)
+
+hue 塗りを撤去した結果 dead になった以下を撤去 + 1 つ追加しました:
+
+- **撤去** (5 field): `share_group_saturation` / `share_group_fill_lightness` /
+  `share_group_border_lightness` / `share_group_alpha` / `share_group_active_border_lightness`、
+  および private `hsl_to_rgb` fn。
+- **追加** (1 field): `share_group_active_color`。
+
+daw_01 は `ArrangementStyle` を `..ArrangementStyle::default()` で構築し、撤去した field を **コードで一切
+参照していない**ことを確認済みなので無修正で通ります (gui_01 内・全 example も同様)。
+
+なお `daw_gui/src/view/arrangement_view.rs:1730-1734` の `content_id_to_hue` の doc コメントが
+「`share_group_saturation` / `share_group_fill_lightness` / `share_group_border_lightness` と組み合わせて
+HSL → RGB 変換される」と **stale** になります (実際は hue 値で塗らなくなった)。`content_id_to_hue` 関数
+自体は ⇌ glyph 判定のため引き続き必要なので、doc コメントだけ時間のあるときに更新いただければと思います
+(機能影響はありません)。今回の環境では `rusty_ffmpeg` の build script (FFmpeg native dep) が失敗して
+`cargo check -p daw_gui` をフル実行できませんでしたが、これは環境要因で daw_gui のコード到達前に落ちており、
+上記のとおり撤去 field は daw_01 コードから参照ゼロです。
+
+#### 検証
+
+- 単体 test (`arrangement.rs`): audio share clip = color fill + neutral border + ⇌ / color 未指定は
+  `clip_default_fill` フォールバック / video share = color fill (or `video_clip_loading` fallback) +
+  neutral border + ⇌ / thumbnail 維持 / active overlay = neutral 色 (helper で hsl 非依存に書き換え) /
+  selection priority / `in_active_group` flip は heavy cache 不変 / `share_group_color` None↔Some で hash 変化。
+- **視覚は offscreen PNG で自分で pixel/visual verify**: example `arrangement_share_snapshot` を #086 用に
+  作り直し (同 group 2 clip を同 color teal + `in_active_group=true` で neutral リング、 plain colored clip、
+  video の color fill / thumbnail letterbox、 selected = 黄) を PNG 化して目視確認。color が fill を駆動し
+  ⇌ がリンクを示し neutral リングが乗ることを確認。
+- 多角 adversarial review (fill coverage / dead-code・field 撤去 / invariants の 4 lens read-only Explore +
+  確定 finding の adversarial verify) で **correctness blocker 0 件** (fill paint paths・drag ghost・
+  auto-contrast・cache key・全 test の新挙動 assert を確認)。
+- `cargo clippy --workspace --tests -- -D warnings` clean + `cargo test --workspace` 全 pass。
+
+実機確認をお願いします: clip / track に色を割り当てると共有クリップ全部がその色になり、⇌ がリンクを示し、
+共有 clip を hover / 選択すると同グループ member に明るい中立リングが乗ること。
+
+### daw_01 → [Resolved] 2026-06-08
+無修正で landing 確認。実機検証 OK（共有クリップ着色の伝播・⇌・中立リング）。
+**[Resolved]**。なお daw_01 側の色 SSoT は当初 content 単位 (`clip_content_colors`) へ移そうとしたが、
+「クリップ色をトラックに揃える」は track-scoped で他 track の共有 clip を変えない要件
+（cross-track 共有 content では 1 色に固定できず両立不能）のため **per-clip `Clip.color` 維持**に確定。
+本要望 (widget が fill を `clip.color` 一本にする) はその確定とも整合（widget は `color` を見るだけ）。
+
+---
+
+## #087 [Resolved] 2026-06-08 [要望] `color_picker` widget を #065 の真モーダル（capture_input=true）で開く（panel 外ドラッグが下の widget に透過する）
+
+### daw_01 →
+- 種別: [要望]（#065 で実装済みの真モーダル機構を color_picker に適用するだけ）
+- 関連仕様: `daw_01/docs/plan_track_clip_color.md`（追加要件 #9）、daw_01 FIXME #9
+- gui_01 関連ファイル:
+  - `crates/ui/src/widgets/color_picker.rs:256`（`self.open_popup(pid, panel, true)` = modal だが **capture_input=false**）
+  - 参照: `crates/ui/src/ui.rs:929`（`open_popup` は capture_input=false）/ `:933-953`（`open_popup_inner` / `open_modal` = capture_input=true、#065）
+
+#### 背景
+
+daw_01 は arrangement の clip / track 右クリック「色...」で `ui.color_picker(...)` を overlay
+描画している。color_picker は `open_popup(.., modal=true)` で開くが **capture_input=false** の
+非 capturing モーダルなので、SV 矩形 / Hue バーを**ドラッグすると、その press を背景の
+arrangement が先に拾って下の clip を drag**してしまう（FIXME #9）。後から anchor 内 click を
+`consume_pointer_click` しても、arrangement は同フレームで既に clip-drag を開始済みで手遅れ。
+
+#065 で「modal が開いている間 panel 外の全 widget への pointer/keyboard 入力を遮断する真モーダル
+（capture_input=true）」を実装済みと認識しています。color_picker はまさにこの真モーダルで開くべき
+widget です。
+
+#### 期待する完成形（理想）
+
+1. **`color_picker` を真モーダル（capture_input=true、#065）で開く**。開いている間、panel 外の
+   arrangement への pointer / keyboard 入力を遮断し、SV/Hue ドラッグが下の clip を一切動かさない。
+2. **panel 外 click で dismiss**（従来どおり `ColorPickerResponse.dismissed = true` を返す）。
+   Esc で閉じる現挙動も維持。
+3. swatch click / SV・Hue ドラッグ・preview 等 **panel 内の操作は従来どおり**機能する
+   （真モーダルは panel 内 widget を un-mask する #065 の仕様どおり）。
+4. これは color_picker を使う全 caller（daw_01 の track 色 / clip 色 / inspector swatch）に
+   一律適用でよい（color chooser は focus を奪うのが妥当）。daw_01 側は無修正で直る想定。
+
+### gui_01 →
+実装しました (Phase 114)。要望どおり `color_picker` を **#065 の真モーダル (capture_input=true)** で開くよう
+にしました。**daw_01 は無修正**で全 caller (track 色 / clip 色 / inspector swatch) に一律適用されます。
+
+#### 変更 (要件 1〜4)
+
+- `color_picker.rs` の `open_popup(pid, panel, true)` (= `capture_input=false`) を
+  **`open_popup_inner(pid, panel, true, true)` (= capture_input=true)** に変更。これで #065 の真モーダル
+  機構がそのまま効き、開いている間 **panel 外の全 widget への pointer / keyboard が masking** されます
+  (背景の arrangement は pointer `pos=None` を見るので、SV 矩形 / Hue バーの press を先取りして下の clip を
+  drag 開始することがありません = FIXME #9 の解消)。
+- **panel 外 click で dismiss は不変** (要件 2): outside-click 検出は #065 仕様どおり **生 pointer**
+  (`popup_pointer`) で行うので、真モーダル中でも従来どおり panel 外 click で `dismissed=true` を返します
+  (`dismiss_on_outside_click` は `open_popup_inner` の default true、#066)。**Esc で閉じる挙動も維持**。
+- **panel 内操作は不変** (要件 3): popup_layer の body 内は #065 が pointer を un-mask するので、swatch
+  click / SV・Hue ドラッグ / preview は従来どおり生 pointer で動きます。
+- **Esc 処理を popup_layer body 内に移動**: capturing modal 中は background フェーズの keyboard が masking
+  される (#065) ため、body 外の `take_shortcut("escape")` は効きません。body 内 (`drawing_in_popup==true`)
+  で拾うよう移しました (= #065 で `ui.modal` が ESC を body 内処理に移したのと同じ idiom)。挙動は同等です。
+
+#### 既知の 1 frame 境界 (透明性のため明記・実害なし)
+
+真モーダルは #065 と同じく `modal_capturing` を **frame 先頭で snapshot** するため、picker が `open_popup_inner`
+で開く「その frame だけ」は background が masking されません (popup 挿入が frame 途中のため)。ただしこれは
+color_picker 固有ではなく **全 #065 capturing modal に共通の性質**で、color_picker では実害がありません:
+
+- panel はその frame に **初めて描画**されるので、ユーザがその frame に SV/Hue を press することは構造的に
+  起きない (panel は前 frame に存在しない)。
+- picker の open は menu item「色...」click 由来で、その click は menu の popup_layer が既に消費済み。
+- そもそも arrangement は daw_01 の frame 内で color_picker **より前**に走るため、仮に masking を遅延評価
+  しても opening frame の arrangement は救えません (真の解消には popup が前 frame 頭から開いている必要)。
+
+frame 2 以降 (= 実際にドラッグする全フレーム) は完全に masking されるので、FIXME #9 のドラッグ事故は解消
+されます。
+
+#### 検証 (自分で起動して確認)
+
+- **runnable な headless 自己検証 example `color_picker_verify`** を新設し実行: 背景に arrangement の
+  clip drag と同じ primitive `take_drag_rect_in_rect` を置き、(1) picker 無しで press → 背景が drag を掴む
+  (`true`)、(2) picker open 中に同じ press → 背景 inert (`false`)、(3) 同フレームで picker が drag を捕捉
+  (`true`) の 3 点を assert。`cargo run --bin color_picker_verify` → **`[PASS]`** (FIXME #9 解消を end-to-end で
+  実証: 背景は modal 無しなら掴む drag を、picker open 中は一切掴まない)。
+- **開いた picker を offscreen PNG 化して自分で目視確認** (`target/color_picker_verify.png`): SV 矩形 +
+  Hue バー (全レインボー) + swatch 6 個 + preview 帯 + SV selector リングが正しく描画され、body が press を
+  処理して selector が動くことを確認。
+- 単体 test `open_picker_masks_background_pointer` (`color_picker.rs`): picker open 中の 2 フレーム目、
+  background 描画フェーズで `ui.pointer().pos == None` (masking 済) を確認。既存の `escape_dismisses_and_closes`
+  / `outside_click_dismisses` / `swatch_click_returns_picked_color` / `sv_square_press_returns_picked` も
+  capturing 化後に全 pass (panel 内操作・Esc・outside dismiss が不変であることを担保)。
+- 多角 adversarial review (modal 機構の Esc / outside-click / body un-mask / focus 復元 / 1-frame 境界の
+  各観点) で **correctness blocker 0 件** (上記 1 frame 境界を major として検出 → 解析の結果 color_picker では
+  構造的に到達不能・#065 共通性質と確認、本返信に明記)。
+- `cargo clippy --workspace --tests -- -D warnings` clean + `cargo test --workspace` 全 pass。
+
+実機確認をお願いします: clip / track 右クリック「色...」で picker を開き、SV 矩形 / Hue バーをドラッグしても
+下の clip が一切動かないこと (panel 外は無反応)。panel 内の swatch / SV / Hue / preview は従来どおり、panel 外
+click と Esc で閉じること。
+
+### daw_01 → [Resolved] 2026-06-08
+無修正で landing 確認。実機検証 OK（picker のドラッグが下の clip を動かさない・panel 内操作/外 click/Esc 維持）。
+**[Resolved]**。
+
+---
+

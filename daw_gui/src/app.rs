@@ -4916,14 +4916,7 @@ impl AppData {
             }
             AppEvent::SetClipColor { target, color } => {
                 self.snapshot_for_color_edit();
-                if let Some(clip) = self
-                    .song
-                    .tracks
-                    .get_mut(target.track as usize)
-                    .and_then(|t| t.clips.get_mut(target.clip as usize))
-                {
-                    clip.color = color;
-                }
+                propagate_clip_color(&mut self.song.tracks, target, color);
             }
             AppEvent::SetClipMuted { target, muted } => {
                 if self.is_image_clip(target) {
@@ -12187,8 +12180,10 @@ impl AppData {
         let new_start_beat = src_clip.start_beat + src_clip.length_beats;
         let new_length = src_clip.length_beats;
         // 共有コピー: 同 content_id を流用 → 名前 (content_id 単位 SSoT) も
-        // 自動共有。 Clip.name は legacy なので空のまま。
+        // 自動共有。 Clip.name は legacy なので空のまま。色 (per-clip) は
+        // source の色を引き継ぐ (= コピーしたクリップは元の色のまま)。
         let content_id = src_clip.content_id;
+        let src_color = src_clip.color;
         let Some(track) = self.song.tracks.get_mut(source.track as usize) else {
             return;
         };
@@ -12201,7 +12196,7 @@ impl AppData {
             length_beats: new_length,
             content_id,
             notes: Vec::new(),
-            color: None,
+            color: src_color,
             auto_lipsync: false,
         });
         let r = ClipRef {
@@ -12226,8 +12221,10 @@ impl AppData {
         let new_start_beat = src_clip.start_beat + src_clip.length_beats;
         let new_length = src_clip.length_beats;
         // 独立コピー: content + 名前を fork して新 content_id 採番。
-        // fork 時点の名前を引き継ぎ、 以後は独立 (別 content_id)。
+        // fork 時点の名前を引き継ぎ、 以後は独立 (別 content_id)。色 (per-clip) は
+        // source の色を引き継ぐ (= コピーしたクリップは元の色のまま)。
         let src_content_id = src_clip.content_id;
+        let src_color = src_clip.color;
         let new_content_id = self.song.fork_content(src_content_id);
         let Some(track) = self.song.tracks.get_mut(source.track as usize) else {
             return;
@@ -12241,7 +12238,7 @@ impl AppData {
             length_beats: new_length,
             content_id: new_content_id,
             notes: Vec::new(),
-            color: None,
+            color: src_color,
             auto_lipsync: false,
         });
         let r = ClipRef {
@@ -12268,8 +12265,10 @@ impl AppData {
                 continue;
             };
             let new_length = src_clip.length_beats;
-            // 共有コピー: content_id 流用 → 名前も自動共有。
+            // 共有コピー: content_id 流用 → 名前も自動共有。色 (per-clip) は
+            // source の色を引き継ぐ。
             let content_id = src_clip.content_id;
+            let src_color = src_clip.color;
             let Some(to_track_idx) = self.song.track_index_by_id(to_track_id) else {
                 continue;
             };
@@ -12285,7 +12284,7 @@ impl AppData {
                 length_beats: new_length,
                 content_id,
                 notes: Vec::new(),
-                color: None,
+                color: src_color,
                 auto_lipsync: false,
             });
             new_refs.push(ClipRef {
@@ -12313,8 +12312,9 @@ impl AppData {
                 continue;
             };
             let new_length = src_clip.length_beats;
-            // 独立コピー: content + 名前を fork。
+            // 独立コピー: content + 名前を fork。色 (per-clip) は source の色を引き継ぐ。
             let src_content_id = src_clip.content_id;
+            let src_color = src_clip.color;
             let new_content_id = self.song.fork_content(src_content_id);
             let Some(to_track_idx) = self.song.track_index_by_id(to_track_id) else {
                 continue;
@@ -12331,7 +12331,7 @@ impl AppData {
                 length_beats: new_length,
                 content_id: new_content_id,
                 notes: Vec::new(),
-                color: None,
+                color: src_color,
                 auto_lipsync: false,
             });
             new_refs.push(ClipRef {
@@ -15582,6 +15582,9 @@ impl AppData {
         let clip_start = clip.start_beat;
         let clip_len = clip.length_beats;
         let clip_end = clip_start + clip_len;
+        // 色 (per-clip) は両半が引き継ぐ (= 色付き clip を split したら両方同色)。
+        // front は clip_mut をそのまま使うので色は不変、 back の新 clip にこれを写す。
+        let src_color = clip.color;
         if !(playhead > clip_start && playhead < clip_end) {
             return false; // playhead 範囲外 / 端ぴったりは split 不要
         }
@@ -15841,7 +15844,7 @@ impl AppData {
             length_beats: back_len,
             content_id: back_content_id,
             notes: Vec::new(),
-            color: None,
+            color: src_color,
             auto_lipsync: false,
         });
         new_selection.push(target);
@@ -16302,6 +16305,79 @@ fn copy_notes_into(notes: &mut Vec<Note>, entries: &[(u32, f64, u8)]) -> Vec<u32
     let count = clones.len() as u32;
     notes.append(&mut clones);
     (base..base + count).collect()
+}
+
+/// `SetClipColor` の core: target clip の `content_id` を共有する全 track の全 clip へ
+/// `color` を伝播する (= 共有クリップの色を変えれば共有先全部が同色、 cross-track 含む)。
+/// `content_id == 0` (未採番 sentinel) のときは伝播せず target clip のみ塗る (defensive、
+/// 別々の未採番 clip を巻き込まない)。target が範囲外なら何もしない。
+///
+/// 「クリップ色をトラックに揃える」(`ResetTrackClipColors`) は逆に **track-scoped** で
+/// 他 track の共有 clip を変えない — 色は per-clip 所有 (`Clip.color`) なので、 SET 伝播 /
+/// RESET track-local の両立ができる (`docs/plan_track_clip_color.md` 追加要件)。
+fn propagate_clip_color(tracks: &mut [Track], target: ClipRef, color: Option<[f32; 3]>) {
+    let content_id = tracks
+        .get(target.track as usize)
+        .and_then(|t| t.clips.get(target.clip as usize))
+        .map(|c| c.content_id);
+    match content_id {
+        Some(cid) if cid != 0 => {
+            for t in tracks.iter_mut() {
+                for clip in t.clips.iter_mut().filter(|c| c.content_id == cid) {
+                    clip.color = color;
+                }
+            }
+        }
+        _ => {
+            if let Some(clip) = tracks
+                .get_mut(target.track as usize)
+                .and_then(|t| t.clips.get_mut(target.clip as usize))
+            {
+                clip.color = color;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod clip_color_tests {
+    use super::{ClipRef, propagate_clip_color};
+    use common::model::{Clip, Track};
+
+    fn clip(id: u32, content_id: u32) -> Clip {
+        Clip { id, content_id, length_beats: 4.0, ..Clip::default() }
+    }
+
+    #[test]
+    fn set_color_propagates_to_all_clips_sharing_content_cross_track() {
+        // track0: cid=7 と cid=9、 track1: cid=7 (linked, cross-track)。
+        let mut tracks = vec![
+            Track { id: 1, clips: vec![clip(1, 7), clip(2, 9)], ..Track::default() },
+            Track { id: 2, clips: vec![clip(3, 7)], ..Track::default() },
+        ];
+        propagate_clip_color(&mut tracks, ClipRef { track: 0, clip: 0 }, Some([0.9, 0.3, 0.3]));
+        // cid==7 は cross-track 含め全部同色、 cid==9 は不変 (= 確定動作 1)。
+        assert_eq!(tracks[0].clips[0].color, Some([0.9, 0.3, 0.3]));
+        assert_eq!(tracks[1].clips[0].color, Some([0.9, 0.3, 0.3]));
+        assert_eq!(tracks[0].clips[1].color, None);
+    }
+
+    #[test]
+    fn set_color_content_id_zero_colors_only_target() {
+        // content_id == 0 (未採番 sentinel) は伝播せず target のみ (別の cid==0 を巻き込まない)。
+        let mut tracks =
+            vec![Track { id: 1, clips: vec![clip(1, 0), clip(2, 0)], ..Track::default() }];
+        propagate_clip_color(&mut tracks, ClipRef { track: 0, clip: 0 }, Some([0.1, 0.2, 0.3]));
+        assert_eq!(tracks[0].clips[0].color, Some([0.1, 0.2, 0.3]));
+        assert_eq!(tracks[0].clips[1].color, None);
+    }
+
+    #[test]
+    fn set_color_out_of_range_target_is_noop() {
+        let mut tracks = vec![Track { id: 1, clips: vec![clip(1, 7)], ..Track::default() }];
+        propagate_clip_color(&mut tracks, ClipRef { track: 5, clip: 0 }, Some([0.5, 0.5, 0.5]));
+        assert_eq!(tracks[0].clips[0].color, None);
+    }
 }
 
 /// [`diff_preview`] が返す 1 アクション (鍵盤プレビューの note-on/off)。
