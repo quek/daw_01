@@ -931,7 +931,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     }
 
     /// M14 Phase 94 (daw_01 #065): `capture_input` を指定して popup を開く内部 API。
-    /// `Ui::open_modal` が `capture_input = true` で呼ぶ。
+    /// `Ui::open_modal` が `capture_input = true` で呼ぶ。 M14 Phase 114 (daw_01 #087): `color_picker`
+    /// も `capture_input = true` で開く (SV/Hue drag の press を背景 widget に先取りされないため)。
     pub(crate) fn open_popup_inner(
         &mut self,
         id: impl std::hash::Hash,

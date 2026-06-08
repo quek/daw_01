@@ -1,12 +1,15 @@
-//! 共有クリップマーク (link glyph ⇌ + hue fill/border) が Video-kind track の clip にも出ることの
-//! offscreen visual / pixel verify (daw_01 #080 / Phase 108)。
+//! 共有クリップの描画 offscreen visual / pixel verify (daw_01 #086 / Phase 114)。
 //!
-//! Audio track と Video track ×2 を並べ、 share マークの 5 ケースを 1 枚に:
-//! - Audio share clip (`share_group_color=Some`): 従来から full hue fill + border + ⇌ (比較用)。
-//! - Video Text clip (thumbnail なし共有): #080 で audio と同じ full hue fill + border + ⇌ になる (主訴)。
-//! - Video 実 video clip (thumbnail あり共有): thumbnail を隠さず hue border + ⇌ のみ。
-//! - Video 非 share clip: 従来どおり video_clip_loading 一色 (回帰確認)。
-//! - selected な video share clip: selection 黄 + ⇌ (selection 最優先 / #022)。
+//! M14 Phase 114 (daw_01 #086): clip 塗りは `clip.color` が唯一の source。 `share_group_color` は
+//! リンク識別 (⇌ glyph + #068 hover 強調) 専用になり、 fill / border を一切上書きしない。 これを
+//! 1 枚で確認する:
+//! - Audio share clip ×2 (同 group・同 color teal、 in_active_group=true): color fill + ⇌ +
+//!   neutral 強調リング (= 「同じ仲間」 を明るい中立色で示す、 #068 を hue → neutral 化)。
+//! - Audio plain clip (color blue、 非 share): color fill のみ (⇌ なし)。
+//! - Video Text clip (thumbnail なし共有、 color purple): color fill + ⇌ (hue fill 撤去後も share マーク)。
+//! - Video 実 video clip (thumbnail あり共有): letterbox は video_clip_loading のまま + ⇌ (thumbnail 不変)。
+//! - Video 非 share・非 color clip: video_clip_loading 一色 (回帰確認)。
+//! - selected な video share clip (color orange): selection 黄 + ⇌ (selection 最優先 / #022)。
 //!
 //! 実行: `cargo run --bin arrangement_share_snapshot`
 //!   → `<workspace>/target/arrangement_share_snapshot.png`。
@@ -31,6 +34,7 @@ use daw_ui_renderer::{Color, OffscreenRenderer, Rect, Scene, TextureHandle};
 
 const SHARE_HUE: f32 = 0.33; // green: linked Text + video が同 group
 const AUDIO_HUE: f32 = 0.60; // blue: 別 group の audio share
+const TEAL: Color = Color { r: 0.20, g: 0.55, b: 0.55, a: 1.0 }; // audio share group の user color
 
 fn clip(id: u32, start: f64, len: f64, name: &str) -> ArrangementClip {
     ArrangementClip {
@@ -48,6 +52,11 @@ fn clip(id: u32, start: f64, len: f64, name: &str) -> ArrangementClip {
 
 fn shared(mut c: ArrangementClip, hue: f32) -> ArrangementClip {
     c.share_group_color = Some(hue);
+    c
+}
+
+fn colored(mut c: ArrangementClip, color: Color) -> ArrangementClip {
+    c.color = Some(color);
     c
 }
 
@@ -113,29 +122,37 @@ fn main() -> Result<(), Box<dyn Error>> {
     let thumb: TextureHandle = renderer.create_texture(tw, thh);
     renderer.upload_texture_rgba(thumb, &make_thumbnail_rgba(tw, thh));
 
+    // #086: 共有 clip は color で塗られ、 ⇌ がリンクを示す。 同 group の 2 clip は同 color (teal) で、
+    // in_active_group=true により neutral 強調リングが乗る (= 「同じ仲間」 を中立色で示す)。
     let audio_clips = vec![
-        shared(clip(1, 0.0, 3.0, "Audio Share"), AUDIO_HUE),
         {
-            let mut c = clip(2, 3.5, 4.0, "Plain Audio");
-            c.color = Some(Color::rgb(0.30, 0.45, 0.70));
+            let mut c = colored(shared(clip(1, 0.0, 2.5, "Share A1"), AUDIO_HUE), TEAL);
+            c.in_active_group = true;
             c
         },
+        {
+            let mut c = colored(shared(clip(2, 3.0, 2.5, "Share A2"), AUDIO_HUE), TEAL);
+            c.in_active_group = true;
+            c
+        },
+        // 非 share の通常 clip → color fill のみ、 ⇌ なし。
+        colored(clip(3, 6.0, 2.0, "Plain"), Color::rgb(0.30, 0.45, 0.70)),
     ];
     let video_clips = vec![
-        // #080 主訴: thumbnail なし共有 Text clip → audio と同じ full hue fill + border + ⇌。
-        shared(clip(10, 0.0, 2.5, "Text Clip"), SHARE_HUE),
-        // thumbnail あり共有 video clip → thumbnail を隠さず hue border + ⇌ のみ。
+        // thumbnail なし共有 Text clip → color (purple) fill + ⇌ (hue fill 撤去後も share マーク)。
+        colored(shared(clip(10, 0.0, 2.5, "Text Clip"), SHARE_HUE), Color::rgb(0.55, 0.35, 0.70)),
+        // thumbnail あり共有 video clip → letterbox は video_clip_loading のまま + ⇌ のみ。
         {
             let mut c = shared(clip(11, 3.0, 3.0, "Video Clip"), SHARE_HUE);
             c.thumbnail = Some((thumb, tw, thh));
             c
         },
-        // 非 share video clip → 従来どおり video_clip_loading 一色 (回帰確認)。
+        // 非 share・非 color video clip → 従来どおり video_clip_loading 一色 (回帰確認)。
         clip(12, 6.5, 1.5, "Plain"),
     ];
     let selected_row_clips = vec![
         // selected な共有 video clip → selection 黄 + ⇌ (selection 最優先 / #022)。
-        shared(clip(20, 0.0, 3.0, "Selected Share"), SHARE_HUE),
+        colored(shared(clip(20, 0.0, 3.0, "Selected Share"), SHARE_HUE), Color::rgb(0.80, 0.45, 0.20)),
     ];
 
     let tracks = vec![

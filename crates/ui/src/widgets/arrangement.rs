@@ -129,12 +129,15 @@ pub struct ArrangementClip {
     pub len_beats: f64,
     pub name: Arc<str>,
     pub color: Option<Color>,
-    /// M14 Phase 63e (#019): 共有 (linked) clip のアクセント色 hue (HSL の H、 `[0.0, 1.0)` 周期)。
-    /// `None` で通常 clip (既存の `color` を使う)、 `Some(hue)` で widget が
-    /// `(hue, share_group_saturation, share_group_fill_lightness, share_group_border_lightness)`
-    /// → RGB 変換した塗り / 枠を描画 + clip 名の左に `share_group_link_glyph` を描く。
-    /// caller は `content_id` を `[0.0, 1.0)` に hash して渡す想定 (refcount >= 2 のときだけ
-    /// `Some` を入れれば、 同じ content を共有する clip 群が同色 + link icon になる)。
+    /// M14 Phase 63e (#019) / Phase 114 (#086): 共有 (linked) clip の **リンク識別フラグ兼 hue**。
+    /// `None` で通常 clip、 `Some(_)` で「この clip は共有グループの member」 を意味し、 widget は
+    /// clip 名の左に `share_group_link_glyph` (`⇌`) を描く + `in_active_group` 時の hover 強調対象にする。
+    ///
+    /// **M14 Phase 114 (#086) で役割を「リンク識別」 に限定**: hue 値で fill / border を上書きするのは
+    /// やめ、 clip 塗りは `color` を唯一の source にした (= 「clip で色を選べば共有 clip 全部がその色に
+    /// なる」 / 「トラックに揃えればその色になる」 が成立)。 現状 widget は値 (`f32`) を描画に使わず
+    /// `is_some()` だけを見るが、 caller の互換 (refcount >= 2 で `Some(hue)` を渡す既存契約) を保つため
+    /// 型は `Option<f32>` のまま据え置き、 hue 値は将来の hue ベース theming 用に予約する。
     pub share_group_color: Option<f32>,
     /// M14 Phase 63k (#025): audio clip の inline 編集 (gain_db / fade)。 `Some` で widget が
     /// dB handle / fade 角 / envelope を描画 + grip 領域に drag handler を bind し
@@ -149,14 +152,16 @@ pub struct ArrangementClip {
     /// `None` のときは `track.kind == Video` なら [`ArrangementStyle::video_clip_loading`] 単色 rect
     /// 描画、 `Audio` なら field 自体が無視される (= caller が kind と clip 種別を一致させる責任)。
     pub thumbnail: Option<(TextureHandle, u32, u32)>,
-    /// M14 Phase 96 (daw_01 #068): 共有グループ「連動ハイライト」フラグ。 `true` のとき widget が
-    /// selection (黄塗り) とは **別レイヤ** の hue ベース強調 (glow wash + bright thick border) を
-    /// `share_group_color` の hue から導出して重ねる (= 「今アクティブな共有グループの member」)。
+    /// M14 Phase 96 (daw_01 #068) / Phase 114 (#086): 共有グループ「連動ハイライト」フラグ。 `true` の
+    /// とき widget が selection (黄塗り) とは **別レイヤ** の強調 (glow wash + bright thick border) を
+    /// 重ねる (= 「今アクティブな共有グループの member」)。 M14 Phase 114 (#086) で強調色は hue 由来から
+    /// **identity-neutral な `ArrangementStyle::share_group_active_color`** に変更 (clip fill が user 指定
+    /// 色になったため hue wash だと喧嘩する。 hover 中は 1 グループのみ強調 = 色で区別する必要が無い)。
     /// caller (daw_01) は毎フレーム `{selected clip} ∪ {前フレーム hovered_clip}` の `content_id` 集合を
     /// 作り、 同 content を共有する clip に `true` を立てて渡す想定 (selection 由来の強調を widget が
-    /// 知らない / hue 衝突で別グループを誤強調しうる、 の 2 点を避けるため per-clip flag 方式)。
-    /// **`false` のとき描画は #019 と pixel 完全一致** (既存挙動を一切変えない、 常に `false` で渡せば
-    /// 移行安全)。 `share_group_color == None` の clip では hue が無いので強調しない (defensive)。
+    /// 知らない / 別グループの誤強調を避けるため per-clip flag 方式)。
+    /// **`false` のとき描画は既存挙動と pixel 完全一致** (常に `false` で渡せば移行安全)。
+    /// `share_group_color == None` の clip は share group member でないので強調しない (defensive)。
     /// hover 由来で毎フレーム変わるため widget は viewport_key (cache key) には含めず、 cached 外の
     /// overlay で毎フレーム描画する (selection overlay と同 idiom)。
     pub in_active_group: bool,
@@ -304,7 +309,6 @@ pub struct ArrangementAutomationPoint {
 
 /// M14 Phase 63n-1 (#028): lane 内の automation clip。 MIDI / Audio clip と意味的に独立した型として
 /// 扱う (= ClipKey 階層化ではなく別 schema、 #028 [Resolved] で確定)。
-/// `share_group_color` は #019 の audio clip 用 hue (`[0.0, 1.0)`) と同 helper を流用。
 #[derive(Clone, Debug)]
 pub struct ArrangementAutomationClip {
     pub id: u32,
@@ -313,8 +317,9 @@ pub struct ArrangementAutomationClip {
     pub name: Arc<str>,
     /// clip-local 座標 (clip start = 0)、 `time_beat` 昇順前提 (caller 責務)。
     pub points: Vec<ArrangementAutomationPoint>,
-    /// linked clip 識別 hue (`[0.0, 1.0)`)。 `Some(hue)` で widget が hsl_to_rgb で fill / border を
-    /// 上書き + clip 名の左に link glyph を描く (audio clip と同 path)。
+    /// linked clip 識別フラグ (`[0.0, 1.0)` hue)。 M14 Phase 114 (#086): `Some(_)` で clip 名の左に
+    /// link glyph を描く (audio clip と同 path)。 fill / border は `lane.color` が source で、 hue 値は
+    /// 描画に使わない (リンク識別のみ。 audio clip の `share_group_color` と同方針)。
     pub share_group_color: Option<f32>,
 }
 
@@ -1007,31 +1012,26 @@ pub struct ArrangementStyle {
     pub clip_clone_badge_size: f32,
     /// badge glyph の color (default = `clip_text_color` と同等の白)。
     pub clip_clone_badge_color: Color,
-    // ---- M14 Phase 63e (#019): share group (linked clip group) 描画パラメータ ----
-    /// `share_group_color = Some(hue)` の clip 描画で使う HSL の S (`[0.0, 1.0]`、 default = 0.55)。
-    pub share_group_saturation: f32,
-    /// share clip の rect 塗り (fill) に使う HSL の L (default = 0.55)。
-    pub share_group_fill_lightness: f32,
-    /// share clip の rect 枠 (border) に使う HSL の L (default = 0.75、 fill より明るくして強調)。
-    pub share_group_border_lightness: f32,
-    /// share clip の rect 塗り alpha (`[0.0, 1.0]`、 default = 0.85、 微透明にして他 clip と区別)。
-    pub share_group_alpha: f32,
+    // ---- M14 Phase 63e (#019) / Phase 114 (#086): share group (linked clip group) 描画パラメータ ----
     /// share clip の name 左に描く link glyph (default = `'⇌'` U+21CC)。 font に存在しない場合は
-    /// caller 側で ASCII (`'~'` 等) に差し替える。
+    /// caller 側で ASCII (`'~'` 等) に差し替える。 M14 Phase 114 (#086) で `share_group_color` の hue 値で
+    /// fill / border を塗る挙動を撤去したため、 共有マークはこの glyph + 下記 active 強調のみが担う。
     pub share_group_link_glyph: char,
-    // ---- M14 Phase 96 (daw_01 #068): 共有グループ連動ハイライト (active group 強調レイヤ) ----
-    /// `ArrangementClip.in_active_group == true` の clip に重ねる強調の hue lightness (HSL の L)。
-    /// glow wash と bright border の両方に使う。 default = 0.88 で `share_group_border_lightness`
-    /// (0.75) よりさらに明るく、 アクティブグループ member が「光って」 見えるようにする。
-    pub share_group_active_border_lightness: f32,
-    /// active group 強調の outline 太さ (px)。 透明 fill + この太さの bright hue border を clip rect に
+    // ---- M14 Phase 96 (daw_01 #068) / Phase 114 (#086): 共有グループ連動ハイライト (active group 強調) ----
+    /// M14 Phase 114 (daw_01 #086): `ArrangementClip.in_active_group == true` の clip に重ねる強調色
+    /// (glow wash + bright thick border 共通)。 旧 hue 由来から **identity-neutral な bright 中立色** に変更
+    /// (clip fill が user 指定色になったので hue wash だと喧嘩する、 hover 中は 1 グループのみ強調 = 色で
+    /// 区別する必要が無い)。 default = bright cool white。 glow wash はこの RGB を `share_group_active_glow_alpha`
+    /// で、 border はこの色を不透明で描く。
+    pub share_group_active_color: Color,
+    /// active group 強調の outline 太さ (px)。 透明 fill + この太さの bright border を clip rect に
     /// 重ねる (= clip 名 / fill を隠さず枠だけ強調)。 default = 2.5 で通常 `clip_border_w` (1.0) /
     /// `clip_selected_border_w` (2.0) より太くして「束ねられている」 印象を出す。
     pub share_group_active_border_w: f32,
-    /// active group 強調の glow wash alpha (`[0.0, 1.0]`)。 `share_group_active_border_lightness` の
-    /// bright hue をこの alpha で clip 全体に敷いて「光る」 表現にする (= selection の黄塗りとは別の hue
-    /// レイヤ)。 default = 0.22 で clip 名の可読性を保ちつつ強調が分かる。 `0.0` で glow なし =
-    /// bright border のみ (= ring のみの強調にしたい theme 向け)。
+    /// active group 強調の glow wash alpha (`[0.0, 1.0]`)。 `share_group_active_color` の bright 中立色を
+    /// この alpha で clip 全体に敷いて「明るくする」 表現にする (= selection の黄塗りとは別レイヤ)。
+    /// default = 0.22 で clip 名の可読性を保ちつつ強調が分かる。 `0.0` で glow なし = bright border のみ
+    /// (= ring のみの強調にしたい theme 向け)。
     pub share_group_active_glow_alpha: f32,
     // ---- M14 Phase 63k (#025): audio clip inline 編集 (dB handle / fade) ----
     /// audio_edit が Some の clip に重ねる dB handle line の色 (default 半透明白)。
@@ -1250,17 +1250,13 @@ impl Default for ArrangementStyle {
             clip_clone_indep_border: Color::rgb(1.0, 0.80, 0.45),
             clip_clone_badge_size: 11.0,
             clip_clone_badge_color: Color::rgb(0.10, 0.10, 0.12),
-            // share_group_color の HSL 変換パラメータ — saturation 0.55 で派手すぎず、 fill L=0.55、
-            // border L=0.75 で fill より明るく差をつける (識別性 + コントラスト両立)。
-            share_group_saturation: 0.55,
-            share_group_fill_lightness: 0.55,
-            share_group_border_lightness: 0.75,
-            share_group_alpha: 0.85,
+            // M14 Phase 114 (#086): share_group_color の hue 値で塗る挙動を撤去したため、 共有マークは
+            // link glyph (⇌) + 下記 active 強調のみ。
             share_group_link_glyph: '⇌',
-            // M14 Phase 96 (daw_01 #068): active group 強調 — share_group_border_lightness (0.75) より
-            // 明るい L=0.88 で「光る」、 border は clip_selected_border_w (2.0) より太い 2.5、 glow wash は
-            // 名前可読性を保つ 0.22 alpha。 selection の黄塗りとは別 hue レイヤ。
-            share_group_active_border_lightness: 0.88,
+            // M14 Phase 96 (daw_01 #068) / Phase 114 (#086): active group 強調 — identity-neutral な
+            // bright cool white。 border は clip_selected_border_w (2.0) より太い 2.5、 glow wash は名前
+            // 可読性を保つ 0.22 alpha。 selection の黄塗りとは別レイヤの「明度上げ + 明るい中立枠」。
+            share_group_active_color: Color::rgb(0.93, 0.96, 1.0),
             share_group_active_border_w: 2.5,
             share_group_active_glow_alpha: 0.22,
             // M14 Phase 63k (#025): audio clip 編集 default — Bitwig spec §3.5/§3.6 と整合。
@@ -2737,35 +2733,6 @@ fn draw_lanes_bg<M: ?Sized + 'static>(
     }
 }
 
-/// M14 Phase 63e (#019): HSL `(h, s, l, a)` → RGBA `Color` 変換 (`share_group_color` 用)。
-/// `h` は `[0.0, 1.0)` 周期 (0=赤, 0.33=緑, 0.66=青)。 caller が範囲外を渡した場合は内部で
-/// `rem_euclid(1.0)` してから処理 (defensive)。 standard CSS HSL の chroma-based 算出に従う。
-/// 単一文字名 (h/s/l/a/c/x/m) は HSL→RGB の標準表記 (CSS 仕様準拠)、 数学関数として保持。
-#[allow(clippy::many_single_char_names)]
-fn hsl_to_rgb(h: f32, s: f32, l: f32, a: f32) -> Color {
-    let h = h.rem_euclid(1.0);
-    let s = s.clamp(0.0, 1.0);
-    let l = l.clamp(0.0, 1.0);
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let h6 = h * 6.0;
-    let x = c * (1.0 - (h6.rem_euclid(2.0) - 1.0).abs());
-    let (r1, g1, b1) = if h6 < 1.0 {
-        (c, x, 0.0)
-    } else if h6 < 2.0 {
-        (x, c, 0.0)
-    } else if h6 < 3.0 {
-        (0.0, c, x)
-    } else if h6 < 4.0 {
-        (0.0, x, c)
-    } else if h6 < 5.0 {
-        (x, 0.0, c)
-    } else {
-        (c, 0.0, x)
-    };
-    let m = l - c * 0.5;
-    Color::rgba(r1 + m, g1 + m, b1 + m, a)
-}
-
 /// M14 Phase 89 (daw_01 #060): sRGB 成分 `[0, 1]` から WCAG 2.x relative luminance を算出。
 /// gamma decode (sRGB → linear) を含む。 `Color` は sRGB 前提 (`scene.rs` の doc 参照) なので
 /// そのまま渡してよい。
@@ -2879,18 +2846,16 @@ fn draw_clip_label<M: ?Sized + 'static>(
 /// M14 Phase 72 (daw_01 #044): video track の clip 描画 (audio path とは別 helper)。
 ///
 /// 描画順:
-/// 1. base fill: selected なら `clip_selected_fill`、 share clip (`share_group_color = Some`) かつ
-///    thumbnail 無しなら hue 由来 fill、 そうでなければ `video_clip_loading`
-///    (= letterbox の黒帯背景としても兼用、 selection 中は audio と同色で hint)
+/// 1. base fill: selected なら `clip_selected_fill`、 そうでなければ `clip.color`
+///    (未指定 None なら `video_clip_loading` = letterbox の黒帯背景としても兼用)
 /// 2. thumbnail = Some なら aspect-fit (黒帯 letterbox) で texture overlay (`HeavyCtx::push_textured_quad`)
 /// 3. name + (share clip なら) link glyph 描画 (`draw_clip_label`、 audio 経路と共通)
 ///
-/// M14 Phase 108 (daw_01 #080): share マークは「content 共有」 の意味で track kind と直交するため、
-/// video clip でも `share_group_color` を honor する (Text / Image clip も Video-kind track 上で
-/// 共有マークが出る)。 thumbnail 有 (実 video) は thumbnail を隠さないよう hue を border アクセント +
-/// link glyph でのみ識別させ、 thumbnail 無 (Text / 未生成 image) は audio share clip と同じ full hue
-/// fill にする。 `audio_edit` overlay は引き続き video clip では描画しない (= caller 責任で audio 用
-/// field を video clip に詰めない前提)。
+/// M14 Phase 108 (daw_01 #080): share マーク (⇌) は「content 共有」 の意味で track kind と直交するため、
+/// video clip でも `share_group_color.is_some()` で link glyph を描く。
+/// M14 Phase 114 (daw_01 #086): `share_group_color` は fill / border を上書きしない (リンク識別は ⇌ glyph
+/// と #068 hover 強調のみ)。 fill は audio clip と同じく `clip.color` が唯一の source。 `audio_edit`
+/// overlay は引き続き video clip では描画しない (= caller 責任で audio 用 field を video clip に詰めない)。
 fn draw_video_clip<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     r: Rect,
@@ -2900,40 +2865,27 @@ fn draw_video_clip<M: ?Sized + 'static>(
     selected: bool,
 ) {
     let has_link = clip.share_group_color.is_some();
+    // M14 Phase 114 (daw_01 #086): video clip も `clip.color` を唯一の fill source にする
+    // (`share_group_color` は fill / border を上書きしない)。 `color` 未指定 (None) のときは従来の
+    // letterbox / loading 背景 `video_clip_loading` を使う (= 既存の非 share video clip と互換)。
+    // thumbnail があればその上に aspect-fit で texture を重ねる (fill は letterbox の黒帯として残る)。
+    // リンク識別は ⇌ glyph + #068 hover 強調が担う (track kind に依らず share マークが出る、 #080 不変)。
     let (fill, border, border_w) = if selected {
         (
             style.clip_selected_fill,
             style.clip_selected_border,
             style.clip_selected_border_w,
         )
-    } else if let Some(hue) = clip.share_group_color {
-        // M14 Phase 108 (daw_01 #080): video-kind track 上の share clip も hue マークを描く。
-        let border_c = hsl_to_rgb(
-            hue,
-            style.share_group_saturation,
-            style.share_group_border_lightness,
-            1.0,
-        );
-        if clip.thumbnail.is_some() {
-            // 実 video (thumbnail 有): thumbnail を隠さないよう letterbox 背景は neutral のまま、
-            // hue は border アクセント + link glyph でのみ識別させる。
-            (style.video_clip_loading, border_c, style.clip_border_w)
-        } else {
-            // thumbnail 無し (Text / 未生成 image): audio share clip と全く同じ full hue fill + border。
-            let fill_c = hsl_to_rgb(
-                hue,
-                style.share_group_saturation,
-                style.share_group_fill_lightness,
-                style.share_group_alpha,
-            );
-            (fill_c, border_c, style.clip_border_w)
-        }
     } else {
-        (style.video_clip_loading, style.clip_border, style.clip_border_w)
+        (
+            clip.color.unwrap_or(style.video_clip_loading),
+            style.clip_border,
+            style.clip_border_w,
+        )
     };
     // M14 Phase 89 (daw_01 #060): 名前色は fill 輝度から auto-contrast (selected の黄 fill → 暗文字、
     // loading の暗 fill → 明文字)。 video lane bg と合成した実効色で判定 (不透明 fill は no-op、
-    // share clip の半透明 hue fill は track_background_video と合成して実効色を得る)。
+    // 半透明 fill は track_background_video と合成して実効色を得る)。
     let text_color = clip_text_color_for(style, fill, style.track_background_video);
     hctx.push_rect(RectCommand {
         rect: r,
@@ -2979,30 +2931,17 @@ fn draw_clip<M: ?Sized + 'static>(
         draw_video_clip(hctx, r, clip, style, lanes, selected);
         return;
     }
-    // M14 Phase 63e (#019) + Phase 63f (#022): 描画状態は (selected, share_group_color) の
-    // 組合せで決まる。 selected は selection 色を最優先 (link glyph の有無に依らず) し、
-    // share_group_color は非 selected かつ Some(hue) の場合のみ HSL → RGB で fill / border を
-    // 上書き。 caller の `clip.color` は share clip では ignore (group hue で識別する設計)。
+    // M14 Phase 114 (daw_01 #086): 静的な fill / border は **`clip.color` を唯一の source** にする。
+    // selected は selection 色を最優先 (link glyph の有無に依らず)。 `share_group_color` は #086 で
+    // 役割を「リンク識別」 に絞り、 fill / border を一切上書きしない (= ⇌ glyph + #068 hover 強調
+    // 専用)。 これにより「clip で色を選べば共有クリップ全部がその色になる」「トラックに揃えれば
+    // その色になる」 が成立する (#019/#022 で hue fill が `color` を握り潰していた FIXME #8 の解消)。
     let (fill, border, border_w) = if selected {
         (
             style.clip_selected_fill,
             style.clip_selected_border,
             style.clip_selected_border_w,
         )
-    } else if let Some(hue) = clip.share_group_color {
-        let fill_c = hsl_to_rgb(
-            hue,
-            style.share_group_saturation,
-            style.share_group_fill_lightness,
-            style.share_group_alpha,
-        );
-        let border_c = hsl_to_rgb(
-            hue,
-            style.share_group_saturation,
-            style.share_group_border_lightness,
-            1.0,
-        );
-        (fill_c, border_c, style.clip_border_w)
     } else {
         (
             clip.color.unwrap_or(style.clip_default_fill),
@@ -3010,8 +2949,8 @@ fn draw_clip<M: ?Sized + 'static>(
             style.clip_border_w,
         )
     };
-    // M14 Phase 89 (daw_01 #060): 名前 + link glyph 色を fill 輝度から auto-contrast。 share clip の
-    // 半透明 fill (alpha < 1) は lane bg (audio lane = `style.bg`) と合成した実効色で判定する。
+    // M14 Phase 89 (daw_01 #060): 名前 + link glyph 色を fill 輝度から auto-contrast。 不透明 fill は
+    // no-op、 半透明 fill (alpha < 1) は lane bg (audio lane = `style.bg`) と合成した実効色で判定する。
     let text_color = clip_text_color_for(style, fill, style.bg);
     hctx.push_rect(RectCommand {
         rect: r,
@@ -3086,14 +3025,16 @@ fn draw_selection_overlay<M: ?Sized + 'static>(
 }
 
 /// M14 Phase 96 (daw_01 #068): 共有グループ「連動ハイライト」overlay。
-/// `clip.in_active_group == true` かつ `share_group_color == Some(hue)` の clip に、 selection
-/// (黄塗り) とは **別レイヤ** の hue ベース強調 (glow wash + bright thick border) を重ねる。
-/// 強調色は当該グループの hue を流用するので「どのグループがアクティブか」 が色でも一致して見える。
+/// `clip.in_active_group == true` かつ `share_group_color.is_some()` の clip に、 selection
+/// (黄塗り) とは **別レイヤ** の強調 (glow wash + bright thick border) を重ねる。
+/// M14 Phase 114 (daw_01 #086): 強調色は **identity-neutral** な `share_group_active_color` に変更
+/// (旧: グループ hue を流用)。 #086 で clip fill が user 指定色になったため、 hue wash だと user の色と
+/// 喧嘩する。 hover 中は 1 グループしか強調しないので色でグループを区別する必要は無い。
 ///
 /// - **`in_active_group == false` / `share_group_color == None` の clip は一切描画しない**
-///   (= #019 と pixel 完全一致、 常に false で渡せば移行安全、 hue 不明なら強調しない defensive)。
+///   (= 既存挙動と pixel 完全一致、 常に false で渡せば移行安全、 非 share clip は強調しない defensive)。
 /// - **selection overlay より前** に呼ぶ: 選択中の同グループ member は黄塗りが上書き優先され
-///   (#068 の「黄塗り優先で OK」)、 非選択 member が hue 強調の主役になる。
+///   (#068 の「黄塗り優先で OK」)、 非選択 member が neutral 強調の主役になる。
 /// - **cached 外で毎フレーム描画**: active group は hover / 選択で毎フレーム変わるため
 ///   viewport_key (heavy cache key) には含めない (hover 由来の変化で heavy cache を無効化しない =
 ///   selection overlay と同 idiom)。 描画は `draw_clips` / `draw_selection_overlay` と同じ culling。
@@ -3116,10 +3057,12 @@ fn draw_active_group_overlay<M: ?Sized + 'static>(
             if !c.in_active_group {
                 continue;
             }
-            // hue が無ければ強調色を導出できないので skip (video clip 等は share_group_color = None)。
-            let Some(hue) = c.share_group_color else {
+            // share group member (= `share_group_color.is_some()`) でなければ強調しない
+            // (video clip 等は share_group_color = None、 defensive)。 M14 Phase 114 (#086) で hue 値は
+            // 強調色に使わなくなったが、 「リンクされた clip だけ」 を強調する guard は維持する。
+            if c.share_group_color.is_none() {
                 continue;
-            };
+            }
             let end = c.start_beat + c.len_beats;
             if end < view.start_beat || c.start_beat > view_end {
                 continue;
@@ -3128,15 +3071,15 @@ fn draw_active_group_overlay<M: ?Sized + 'static>(
             if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
                 continue;
             }
-            // (1) glow wash: bright hue を低 alpha で clip 全体に敷いて「光る」。 alpha=0 なら no-op
-            //     (= ring のみの強調)。 透明 fill push を避けるため alpha>0 の時だけ積む。
+            // M14 Phase 114 (daw_01 #086): 強調色は **identity-neutral** な `share_group_active_color`
+            // (bright 中立色) に変更。 #086 で clip fill が user 指定色になったため、 旧 hue wash だと
+            // ユーザの選んだ色と喧嘩する (hover 中は 1 グループしか強調しない = どのグループかを色で
+            // 区別する必要が無い)。 selection の黄塗りとは別レイヤの「明度上げ + 明るい中立枠」。
+            // (1) glow wash: neutral color を低 alpha で clip 全体に敷いて「明るくする」。 alpha=0 なら
+            //     no-op (= ring のみの強調)。 透明 fill push を避けるため alpha>0 の時だけ積む。
             if style.share_group_active_glow_alpha > 0.0 {
-                let glow = hsl_to_rgb(
-                    hue,
-                    style.share_group_saturation,
-                    style.share_group_active_border_lightness,
-                    style.share_group_active_glow_alpha,
-                );
+                let ac = style.share_group_active_color;
+                let glow = Color { r: ac.r, g: ac.g, b: ac.b, a: style.share_group_active_glow_alpha };
                 hctx.push_rect(RectCommand {
                     rect: r,
                     fill: glow,
@@ -3146,19 +3089,13 @@ fn draw_active_group_overlay<M: ?Sized + 'static>(
                     clip_rect: Some(lanes),
                 });
             }
-            // (2) bright thick border: 同 hue を高 lightness / 太枠で outline。 透明 fill なので
+            // (2) bright thick border: 同 neutral color を太枠で outline。 透明 fill なので
             //     clip 名 / 既存 fill は隠さず、 枠だけ強調 (= 「束ねられている」 印象)。
             if style.share_group_active_border_w > 0.0 {
-                let border = hsl_to_rgb(
-                    hue,
-                    style.share_group_saturation,
-                    style.share_group_active_border_lightness,
-                    1.0,
-                );
                 hctx.push_rect(RectCommand {
                     rect: r,
                     fill: Color::TRANSPARENT,
-                    border,
+                    border: style.share_group_active_color,
                     border_width: style.share_group_active_border_w,
                     radius: [style.clip_radius; 4],
                     clip_rect: Some(lanes),
@@ -4355,8 +4292,9 @@ fn flatten_lane_curve(
 /// lane row (= header + body) を 1 つ描画。 `header_rect` は左 (track header と同 x 範囲)、
 /// `body_rect` は右 (clip 描画域と同 x 範囲)。 `view` は arrangement の global view (start_beat /
 /// len_beats / track_top 等を渡す、 lane 描画では `start_beat` / `len_beats` のみ参照)。
-/// disabled lane (`enabled = false`) は curve / clip / point を `automation_lane_disabled_color` で描画、
-/// share_group_color が `Some(hue)` の clip は audio clip と同 hsl 変換で fill / border を上書き。
+/// disabled lane (`enabled = false`) は curve / clip / point を `automation_lane_disabled_color` で描画。
+/// M14 Phase 114 (daw_01 #086): clip fill / border は `lane.color` が唯一 source (`share_group_color` は
+/// fill を上書きしない、 リンク識別は ⇌ glyph + #068 hover 強調のみ)。
 /// M14 Phase 63n-3 (#028): `selected_clips_set` に含まれる `AutomationClipKey` は `clip_selected_fill` /
 /// `clip_selected_border` で描画 (selected priority 最高)、 share_group_color = Some の clip は名前の左に
 /// `share_group_link_glyph` (`⇌`) を 1 文字描画 (MIDI clip と同 idiom)。 `track_id` は selection lookup 用。
@@ -4501,33 +4439,18 @@ fn draw_automation_lane<M: ?Sized + 'static>(
         // 描画 (priority: selected > disabled > share_group > lane.color)。
         let clip_key = AutomationClipKey { track: track_id, lane: lane.id, clip: c.id };
         let is_selected = selected_clips_set.contains(&clip_key);
-        // share_group_color (linked tint) — audio clip と同 hsl 変換。 disabled lane は **clip rect の
-        // fill / border のみ灰色** (= bypass marker)、 中身 (curve / point / clip 名) は元の lane.color
-        // のままにして可読性を保つ (Bitwig / Live と同パターン、 #028 user 指摘 3)。
+        // M14 Phase 114 (daw_01 #086): automation clip は専用の `color` field を持たず `lane.color` が
+        // fill / border の唯一 source (audio clip の `clip.color` に相当)。 `share_group_color` は fill /
+        // border を上書きせず、 リンク識別は ⇌ glyph + #068 hover 強調のみが担う (#086)。 disabled lane は
+        // **clip rect の fill / border のみ灰色** (= bypass marker)、 中身 (curve / point / clip 名) は元の
+        // lane.color のままにして可読性を保つ (Bitwig / Live と同パターン、 #028 user 指摘 3)。
         let (fill, border) = if is_selected {
             (style.clip_selected_fill, style.clip_selected_border)
         } else if lane.enabled {
-            if let Some(hue) = c.share_group_color {
-                (
-                    hsl_to_rgb(
-                        hue,
-                        style.share_group_saturation,
-                        style.share_group_fill_lightness,
-                        style.share_group_alpha * 0.55, // automation clip は lane 上 overlay なので fill を更に薄く
-                    ),
-                    hsl_to_rgb(
-                        hue,
-                        style.share_group_saturation,
-                        style.share_group_border_lightness,
-                        1.0,
-                    ),
-                )
-            } else {
-                (
-                    Color { r: lane.color.r, g: lane.color.g, b: lane.color.b, a: 0.20 },
-                    lane.color,
-                )
-            }
+            (
+                Color { r: lane.color.r, g: lane.color.g, b: lane.color.b, a: 0.20 },
+                lane.color,
+            )
         } else {
             // disabled: fill = 灰色 alpha 0.10 (lane_bg がほぼ透ける、 中身可読) + border = 灰色
             // alpha 1.0 (識別 marker、 不透明で確実に見える)。 fill alpha 0 だと renderer が rect 全体を
@@ -9870,26 +9793,56 @@ mod tests {
         c
     }
 
+    /// M14 Phase 114 (daw_01 #086): audio share clip (`share_group_color = Some`) は `clip.color` を
+    /// fill の唯一 source にする (hue fill を撤去)。 「clip で色を選べば共有 clip 全部がその色になる」
+    /// (FIXME #8) の核心。 border も neutral `clip_border`、 共有は ⇌ glyph でのみ識別。
+    #[test]
+    fn audio_share_clip_uses_color_fill_not_hue() {
+        let style = ArrangementStyle::default();
+        let user_color = Color::rgb(0.70, 0.30, 0.45);
+        let mut c = shared_clip(false, Some(0.33));
+        c.color = Some(user_color);
+        let scene = render_clips_scene(vec![c], &[]);
+        assert!(
+            scene.iter_rects().any(|r| r.fill == user_color),
+            "audio share clip は clip.color を fill に使う (#086)"
+        );
+        assert!(
+            scene.iter_rects().any(|r| r.border == style.clip_border),
+            "border は neutral clip_border (hue border は撤去)"
+        );
+        assert_eq!(link_glyph_count(&scene, &style), 1, "共有マークは ⇌ glyph で 1 個");
+    }
+
+    /// M14 Phase 114 (#086): `color` 未指定の audio share clip は `clip_default_fill` に
+    /// フォールバック (hue fill 撤去後、 通常 clip と同じ既定塗り + ⇌ glyph)。
+    #[test]
+    fn audio_share_clip_without_color_uses_default_fill() {
+        let style = ArrangementStyle::default();
+        let scene = render_clips_scene(vec![shared_clip(false, Some(0.33))], &[]);
+        assert!(
+            scene.iter_rects().any(|r| r.fill == style.clip_default_fill),
+            "color 未指定 share clip は clip_default_fill"
+        );
+        assert_eq!(link_glyph_count(&scene, &style), 1, "⇌ glyph は描く");
+    }
+
+    /// M14 Phase 114 (#086): active group 強調色は identity-neutral な `share_group_active_color`。
+    /// glow wash は同色を `share_group_active_glow_alpha` で、 border は同色を不透明で描く helper。
+    fn expected_active_glow(style: &ArrangementStyle) -> Color {
+        let ac = style.share_group_active_color;
+        Color { r: ac.r, g: ac.g, b: ac.b, a: style.share_group_active_glow_alpha }
+    }
+
     /// `in_active_group == true` かつ `share_group_color == Some` の clip は、 selection とは別の
-    /// hue 強調 (glow wash 1 枚 + bright thick border 1 本) を追加する。
+    /// neutral 強調 (glow wash 1 枚 + bright thick border 1 本) を追加する (#086 で hue → neutral)。
     #[test]
     fn active_group_overlay_drawn_for_in_active_group_clip() {
         let style = ArrangementStyle::default();
-        let hue = 0.33_f32;
-        let scene = render_clips_scene(vec![shared_clip(true, Some(hue))], &[]);
+        let scene = render_clips_scene(vec![shared_clip(true, Some(0.33))], &[]);
 
-        let expected_border = hsl_to_rgb(
-            hue,
-            style.share_group_saturation,
-            style.share_group_active_border_lightness,
-            1.0,
-        );
-        let expected_glow = hsl_to_rgb(
-            hue,
-            style.share_group_saturation,
-            style.share_group_active_border_lightness,
-            style.share_group_active_glow_alpha,
-        );
+        let expected_border = style.share_group_active_color;
+        let expected_glow = expected_active_glow(&style);
 
         let border_rects = scene
             .iter_rects()
@@ -9901,28 +9854,21 @@ mod tests {
         assert_eq!(border_rects, 1, "bright thick border が 1 本 (border_w={})", style.share_group_active_border_w);
 
         let glow_rects = scene.iter_rects().filter(|r| r.fill == expected_glow).count();
-        assert_eq!(glow_rects, 1, "glow wash が 1 枚 (hue bright を {} alpha)", style.share_group_active_glow_alpha);
+        assert_eq!(glow_rects, 1, "glow wash が 1 枚 (neutral を {} alpha)", style.share_group_active_glow_alpha);
     }
 
     /// `in_active_group == false` の clip は強調 rect (border + glow) を一切追加しない
-    /// (= #019 と pixel 完全一致)。 glow / border は独立 guard なので両方の不在を確認する。
+    /// (= 既存挙動と pixel 完全一致)。 glow / border は独立 guard なので両方の不在を確認する。
     #[test]
     fn no_active_overlay_when_in_active_group_false() {
         let style = ArrangementStyle::default();
-        let hue = 0.33_f32;
-        let scene = render_clips_scene(vec![shared_clip(false, Some(hue))], &[]);
+        let scene = render_clips_scene(vec![shared_clip(false, Some(0.33))], &[]);
         let active_borders = scene
             .iter_rects()
             .filter(|r| (r.border_width - style.share_group_active_border_w).abs() < 1e-3)
             .count();
         assert_eq!(active_borders, 0, "false は強調枠を描かない (移行安全)");
-        let expected_glow = hsl_to_rgb(
-            hue,
-            style.share_group_saturation,
-            style.share_group_active_border_lightness,
-            style.share_group_active_glow_alpha,
-        );
-        let glow = scene.iter_rects().filter(|r| r.fill == expected_glow).count();
+        let glow = scene.iter_rects().filter(|r| r.fill == expected_active_glow(&style)).count();
         assert_eq!(glow, 0, "false は glow wash も描かない");
     }
 
@@ -9982,13 +9928,9 @@ mod tests {
         });
 
         // glow wash は alpha=0 では push されない (guard `> 0.0` で skip)。 glow rect があれば
-        // fill = この透明 hue になるはずなので、 0 件 = push されていないことを保証。
-        let glow_color = hsl_to_rgb(
-            hue,
-            style.share_group_saturation,
-            style.share_group_active_border_lightness,
-            0.0,
-        );
+        // fill = この透明 neutral になるはずなので、 0 件 = push されていないことを保証。
+        let ac = style.share_group_active_color;
+        let glow_color = Color { r: ac.r, g: ac.g, b: ac.b, a: 0.0 };
         let glow = scene.iter_rects().filter(|r| r.fill == glow_color).count();
         assert_eq!(glow, 0, "glow_alpha=0 で glow wash を描かない (ring のみ)");
         let border = scene
@@ -10022,16 +9964,10 @@ mod tests {
     #[test]
     fn selection_fill_drawn_after_active_overlay() {
         let style = ArrangementStyle::default();
-        let hue = 0.33_f32;
         let key = ClipKey { track: 0, clip: 10 };
-        let scene = render_clips_scene(vec![shared_clip(true, Some(hue))], &[key]);
+        let scene = render_clips_scene(vec![shared_clip(true, Some(0.33))], &[key]);
 
-        let expected_border = hsl_to_rgb(
-            hue,
-            style.share_group_saturation,
-            style.share_group_active_border_lightness,
-            1.0,
-        );
+        let expected_border = style.share_group_active_color;
         let rects: Vec<&RectCommand> = scene.iter_rects().collect();
         let active_idx = rects
             .iter()
@@ -10097,79 +10033,64 @@ mod tests {
         scene.iter_glyphs().filter(|g| g.text.as_ref() == glyph).count()
     }
 
-    /// thumbnail を持たない video clip (Text / 未生成 image): audio share clip と同じ full hue fill +
-    /// hue border + link glyph を描く (= track kind に依らず share マークが出る、 #080 の主訴)。
+    /// M14 Phase 114 (#086): thumbnail 無しの video share clip は `clip.color` を fill source にし
+    /// (hue fill を撤去)、 border は neutral `clip_border`、 共有は ⇌ glyph のみで識別する。
     #[test]
-    fn video_share_clip_without_thumbnail_draws_full_hue_mark() {
+    fn video_share_clip_without_thumbnail_uses_color_fill() {
         let style = ArrangementStyle::default();
-        let hue = 0.33_f32;
-        let scene = render_video_clips_scene(vec![shared_clip(false, Some(hue))], &[]);
+        let user_color = Color::rgb(0.20, 0.55, 0.55); // teal
+        let mut c = shared_clip(false, Some(0.33));
+        c.color = Some(user_color);
+        let scene = render_video_clips_scene(vec![c], &[]);
 
-        let expected_fill = hsl_to_rgb(
-            hue,
-            style.share_group_saturation,
-            style.share_group_fill_lightness,
-            style.share_group_alpha,
-        );
-        let expected_border = hsl_to_rgb(
-            hue,
-            style.share_group_saturation,
-            style.share_group_border_lightness,
-            1.0,
+        assert!(
+            scene.iter_rects().any(|r| r.fill == user_color),
+            "video share clip は clip.color を fill に使う (#086)"
         );
         assert!(
-            scene.iter_rects().any(|r| r.fill == expected_fill),
-            "thumbnail 無し video share clip は hue full fill を描く (audio 経路と同一)"
+            scene.iter_rects().any(|r| r.border == style.clip_border),
+            "border は neutral clip_border (hue border は撤去)"
         );
-        assert!(
-            scene.iter_rects().any(|r| r.border == expected_border),
-            "hue border も描く"
-        );
-        assert_eq!(link_glyph_count(&scene, &style), 1, "link glyph を 1 個描く");
-        // 旧挙動 (bug): video_clip_loading 一色 + glyph 無し。 share clip では loading 一色 fill にならない。
+        assert_eq!(link_glyph_count(&scene, &style), 1, "共有マークは ⇌ glyph で 1 個描く");
+        // hue fill 撤去後は loading 一色にもならない (color が source)。
         assert!(
             !scene.iter_rects().any(|r| r.fill == style.video_clip_loading),
-            "share clip では loading 一色 fill にならない (hue fill で上書き)"
+            "color 指定 share clip は video_clip_loading にフォールバックしない"
         );
     }
 
-    /// thumbnail を持つ video clip (実 video): thumbnail を隠さないよう full fill はせず、 letterbox
-    /// 背景は `video_clip_loading` のまま + hue border アクセント + link glyph で共有を識別。
+    /// M14 Phase 114 (#086): `color` 未指定の video share clip は従来の `video_clip_loading` 背景 +
+    /// neutral border + ⇌ glyph (= color None なら既存の letterbox 背景にフォールバック)。
     #[test]
-    fn video_share_clip_with_thumbnail_draws_border_accent_only() {
+    fn video_share_clip_without_color_falls_back_to_loading() {
+        let style = ArrangementStyle::default();
+        let scene = render_video_clips_scene(vec![shared_clip(false, Some(0.33))], &[]);
+        assert!(
+            scene.iter_rects().any(|r| r.fill == style.video_clip_loading),
+            "color 未指定 share clip は video_clip_loading 背景"
+        );
+        assert_eq!(link_glyph_count(&scene, &style), 1, "⇌ glyph は描く");
+    }
+
+    /// M14 Phase 114 (#086): thumbnail を持つ video clip: letterbox 背景は `video_clip_loading` (color
+    /// 未指定) のまま thumbnail を隠さず、 border は neutral `clip_border`、 共有は ⇌ glyph で識別。
+    #[test]
+    fn video_share_clip_with_thumbnail_keeps_letterbox_and_glyph() {
         use std::num::NonZeroU32;
         let style = ArrangementStyle::default();
-        let hue = 0.5_f32;
-        let mut c = shared_clip(false, Some(hue));
+        let mut c = shared_clip(false, Some(0.5));
         c.thumbnail = Some((TextureHandle::from_raw(NonZeroU32::new(7).unwrap()), 1920, 1080));
         let scene = render_video_clips_scene(vec![c], &[]);
 
-        let hue_fill = hsl_to_rgb(
-            hue,
-            style.share_group_saturation,
-            style.share_group_fill_lightness,
-            style.share_group_alpha,
-        );
-        let expected_border = hsl_to_rgb(
-            hue,
-            style.share_group_saturation,
-            style.share_group_border_lightness,
-            1.0,
-        );
-        // thumbnail を隠す full hue fill は描かない。
-        assert!(
-            !scene.iter_rects().any(|r| r.fill == hue_fill),
-            "thumbnail 有 share clip は full hue fill をしない (thumbnail を隠さない)"
-        );
-        // letterbox 背景 (= clip rect fill) は neutral な video_clip_loading のまま。
+        // letterbox 背景 (= clip rect fill) は neutral な video_clip_loading のまま (color 未指定)。
         assert!(
             scene.iter_rects().any(|r| r.fill == style.video_clip_loading),
             "letterbox 背景は video_clip_loading のまま"
         );
-        // hue border アクセント + link glyph で共有を識別。
+        // border は neutral clip_border (hue border は #086 で撤去)。
         assert!(
-            scene.iter_rects().any(|r| r.border == expected_border),
-            "hue border アクセントを描く"
+            scene.iter_rects().any(|r| r.border == style.clip_border),
+            "border は neutral clip_border"
         );
         assert_eq!(link_glyph_count(&scene, &style), 1, "link glyph を 1 個描く");
         // thumbnail texture も描かれている (隠していない)。

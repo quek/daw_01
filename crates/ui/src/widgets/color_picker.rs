@@ -3,6 +3,11 @@
 //!
 //! 設計:
 //! - 既存 `open_popup` / `popup_layer` / `close_popup` の上の薄いラッパ (`modal` widget と同 idiom)。
+//! - **真のモーダル (capture_input=true、 #065 / daw_01 #087)**: panel が開いている間、 panel 外の全
+//!   widget への pointer / keyboard 入力を遮断する。 これにより SV 矩形 / Hue バーのドラッグ press を
+//!   背景の arrangement 等が先取りして下の clip を動かす事故を防ぐ。 panel 内 (`drawing_in_popup`) は
+//!   un-mask されて通常動作し、 ESC は body 内で `take_shortcut` する (background keyboard は masking
+//!   されるため)。 panel 外 click の dismiss は生 pointer で判定されるので従来どおり効く。
 //! - **uncontrolled HSV state**: `current` 引数は popup を開いた瞬間の初期値としてのみ使い、
 //!   open 中は内部 `ColorPickerState { hue, sat, val }` を source-of-truth にする。
 //!   RGB ↔ HSV の往復は gray / black で hue が不定になり、 毎フレーム `current` から HSV を
@@ -253,23 +258,28 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         };
         if just_opening {
-            self.open_popup(pid, panel, true);
+            // daw_01 #087: capture_input = true の「真のモーダル」 (#065) で開く。 開いている間
+            // panel 外の pointer / keyboard が background widget (arrangement 等) に届かず、
+            // SV 矩形 / Hue バーのドラッグが下の clip を一切動かさない (FIXME #9 の解消)。 panel 外
+            // click は従来どおり popup_layer の outside-click 検出で dismiss する (capture でも
+            // close 判定は生 pointer で行う #065 仕様)。
+            self.open_popup_inner(pid, panel, true, true);
         }
         self.update_popup_anchor(pid, panel);
-
-        // Esc で close (modal と同 idiom)。
-        if self.take_shortcut("escape") {
-            self.close_popup(pid);
-            self.widget_state::<ColorPickerState>(state_wid).open = false;
-            return ColorPickerResponse { picked: None, dismissed: true };
-        }
 
         let was_open = self.is_popup_open(pid);
         let n_swatches = palette.len();
         let style_copy = *style;
         let mut picked: Option<Color> = None;
+        // Esc close は popup_layer body 内 (`drawing_in_popup`) で拾う。 capturing modal 中は background
+        // フェーズの keyboard が masking される (#065) ため、 body 外で `take_shortcut("escape")` を
+        // 呼んでも効かない (= #065 の `ui.modal` が ESC を body 内処理に移したのと同じ理由)。
+        let mut esc_close = false;
 
         self.popup_layer(pid, |ui| {
+            if ui.take_shortcut("escape") {
+                esc_close = true;
+            }
             let lay = layout(panel, n_swatches, &style_copy);
 
             // ---- panel 背景 ----
@@ -352,6 +362,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 clip_rect: None,
             });
         });
+
+        // body 内で Esc を拾っていたら close + dismissed (capturing modal の ESC 経路)。
+        if esc_close {
+            self.close_popup(pid);
+            self.widget_state::<ColorPickerState>(state_wid).open = false;
+            return ColorPickerResponse { picked: None, dismissed: true };
+        }
 
         // popup_layer 内で outside-click により閉じられたら dismissed。
         let now_open = self.is_popup_open(pid);
@@ -652,5 +669,39 @@ mod tests {
         );
         assert!(r.dismissed, "popup 外 click で dismissed");
         assert!(r.picked.is_none());
+    }
+
+    #[test]
+    fn open_picker_masks_background_pointer() {
+        // daw_01 #087: capturing modal (#065) — picker open 中の 2 フレーム目、 background 描画
+        // フェーズで `ui.pointer().pos` が masking される (= 背景 arrangement が SV/Hue drag の
+        // press を先取りして下の clip を動かす事故を防ぐ)。
+        let style = ColorPickerStyle::default();
+        let palette = vec![Color::rgb(0.9, 0.1, 0.1)];
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let bg_pos: Cell<Option<(f32, f32)>> = Cell::new(Some((1.0, 1.0)));
+
+        // frame 1: open (open は描画途中で起きるので、 この frame はまだ capturing でない)。
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.color_picker("p", ANCHOR, CURRENT, &palette, &style);
+        });
+        // frame 2: pointer を panel 外 (5, 5) に置く (press はしない = dismiss させない)。 picker は
+        // 前 frame で capture_input=true で開いているため modal_capturing が frame 頭から true。
+        let input = FrameInput {
+            pointer: PointerFrame { pos: Some((5.0, 5.0)), ..PointerFrame::default() },
+            ..FrameInput::default()
+        };
+        host.frame_to_edits(&(), &mut scene, screen, input, |(), ui| {
+            // popup_layer の外 (background 描画フェーズ) で pointer を読む。
+            bg_pos.set(ui.pointer().pos);
+            ui.color_picker("p", ANCHOR, CURRENT, &palette, &style);
+        });
+        assert_eq!(
+            bg_pos.get(),
+            None,
+            "capturing modal 中の background pointer は masking される (#087)"
+        );
     }
 }
