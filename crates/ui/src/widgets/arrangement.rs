@@ -990,10 +990,9 @@ pub struct ArrangementStyle {
     /// M14 Phase 63c (#016): group hierarchy で 1 段ネストするごとに track header を右にずらす量 (px)。
     /// 各 track の `header_x = rect.x + depth * indent_px`。 default = 16.0。
     pub indent_px: f32,
-    /// M14 Phase 63c (#016): group 行 (= 子を持つ track) の背景色。 selection 状態と排他で
-    /// `track_group_bg` を背景に塗る (selected が priority)。
-    pub track_group_bg: Color,
     /// M14 Phase 63c (#016): ▼ / ▶ disclosure アイコンの色 (group 行の左端)。
+    /// M14 Phase 113 (daw_01 #085): group track 専用の背景 tint は撤去 (旧 `track_group_bg`)。
+    /// group は indent + disclosure ▶▼ の構造手掛かりのみで識別し、 行背景は他 track と同色。
     pub disclosure_color: Color,
     // ---- M14 Phase 63e (#019): drag-modifier-aware ghost (Ctrl / Ctrl+Shift) ----
     /// Ctrl + drag 中の ghost rect 塗り (linked clone 意図、 default = 緑系の半透明)。
@@ -1071,7 +1070,7 @@ pub struct ArrangementStyle {
     // ---- M14 Phase 63n-1 (#028): automation lane 描画パラメータ ----
     /// automation lane 行の左 header 領域の最低幅 (px、 これ未満で label / icon / slider 帯を skip)。
     pub automation_lane_header_min_w_px: f32,
-    /// lane 行の背景色 (track 行と差別化、 default は track_group_bg より暗め)。
+    /// lane 行の背景色 (track 行と差別化、 default は通常 track 行背景より暗め)。
     pub automation_lane_bg: Color,
     /// disabled lane (= `enabled = false`) の curve / clip / point 描画色 (灰色 bypass 表現)。
     pub automation_lane_disabled_color: Color,
@@ -1241,7 +1240,6 @@ impl Default for ArrangementStyle {
             track_volume_band_fill: Color::rgb(0.95, 0.95, 0.97),
             ruler_label_color: Color::rgb(0.85, 0.88, 0.92),
             indent_px: 16.0,
-            track_group_bg: Color::rgb(0.16, 0.22, 0.32),
             disclosure_color: Color::rgb(0.85, 0.88, 0.92),
             // M14 Phase 63e (#019): clone ghost (Ctrl / Ctrl+Shift) — 緑系 / 橙系で 3 種視覚区別。
             // selected fill (黄系 = (1.0, 0.85, 0.30)) と色相を分けて drag 中に「同じ ghost
@@ -2695,12 +2693,11 @@ fn draw_lanes_bg<M: ?Sized + 'static>(
     visible_tops: &[f32],
     view: ArrangementView,
     selected_tracks: &[u32],
-    is_group_set: &HashSet<u32>,
     style: &ArrangementStyle,
 ) {
     push_filled_rect(hctx, lanes, style.bg);
 
-    // 各 track row 背景 (selection ハイライト + mute/solo hint band + group_bg)。
+    // 各 track row 背景 (selection ハイライト + video tint; #085 で group 専用 tint は撤去)。
     // M14 Phase 63c (#016): collapsed 親配下は描画 skip (visible 列のみ index で row を計算)。
     // M14 Phase 63n-6 (#031): per-track row 高さ override 反映のため `visible_tops` (prefix sum) を
     // 受け取り、 row_y / row_h を per-track で算出する (= override 済 track の backdrop fill が正しく
@@ -2714,16 +2711,16 @@ fn draw_lanes_bg<M: ?Sized + 'static>(
         if row.y + row.h < lanes.y || row.y > lanes.y + lanes.h {
             continue;
         }
-        // selection priority > group_bg > 通常 (selection は overlay layer で再描画される
-        // が、 lanes_bg では下塗りとして塗る = visual hint としての役割)。 is_group_set は
-        // caller の **full tracks** から計算済 (collapsed 後も group 判定が安定)。
+        // selection priority > video > 通常 (selection は overlay layer で再描画される
+        // が、 lanes_bg では下塗りとして塗る = visual hint としての役割)。
+        // M14 Phase 113 (daw_01 #085): group track 専用の背景 tint は撤去 (= 他 track と同じ
+        // neutral 背景)。 group であることは indent (`depth * indent_px`) と disclosure ▶▼ の
+        // 構造手掛かりだけで識別する。 video / selection 背景は不変。
         if selected_tracks.contains(&t.id) {
             push_filled_rect(hctx, row, style.track_selected_bg);
-        } else if is_group_set.contains(&t.id) {
-            push_filled_rect(hctx, row, style.track_group_bg);
         } else if matches!(t.kind, TrackKind::Video) {
-            // M14 Phase 72 (#044): video track の行背景は暗青で audio と視覚区別 (selection /
-            // group は優先度高いまま、 通常 audio 行は base bg のまま)。
+            // M14 Phase 72 (#044): video track の行背景は暗青で audio と視覚区別 (selection は
+            // 優先度高いまま、 通常 audio 行は base bg のまま)。
             push_filled_rect(hctx, row, style.track_background_video);
         }
         // row 下端 separator
@@ -6216,10 +6213,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // (selected_set と同パターン)。 loop 側の hit-test では `selected_tracks` slice (borrowed)
         // を直接 contains で参照するため、 ここで cloned heavy 用 vector を別に持って move 衝突を回避。
         let selected_tracks_for_heavy: Vec<u32> = selected_tracks.to_vec();
-        // M14 Phase 63c (#016): is_group_set を heavy closure に move する用に owned コピー。
-        // visible_tracks (filtered) では collapsed 後に children が消えて group 判定が false 化する
-        // ため、 caller の full tracks から計算した HashSet を 'static に持ち込む。
-        let is_group_set_for_heavy: HashSet<u32> = is_group_set.clone();
+        // M14 Phase 113 (daw_01 #085): group track 背景 tint 撤去に伴い、 lanes 背景描画
+        // (`draw_lanes_bg`) は group 判定を使わなくなったため heavy closure 用の is_group_set clone は不要。
+        // group の hit-test / disclosure / drag drop 判定は loop 側の borrowed `is_group_set` を直接使う。
         let drag_overlay_clone = clip_drag_overlay.clone();
         // M14 Phase 63k (#025): audio_drag overlay 用 clone (heavy closure に move)。
         // ghost (drag 中の preview line / fade envelope / label) は cached 外で描画する。
@@ -6368,7 +6364,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         &tops_owned_for_heavy,
                         view_copy,
                         &selected_tracks_for_heavy,
-                        &is_group_set_for_heavy,
                         &style_copy,
                     );
                     hctx.bar_beat_grid(
@@ -8088,11 +8083,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     continue;
                 }
 
-                // 背景 (selection > group_bg > 通常)
+                // 背景 (selection > 通常)。 M14 Phase 113 (daw_01 #085): group track 専用の
+                // 背景 tint は撤去 (group は indent / disclosure ▶▼ で識別、 背景は他 track と同じ
+                // neutral header_bg)。 `is_group_set` は依然 disclosure 描画 / hit-test で使う。
                 if selected_tracks.contains(&t.id) {
                     self.panel(("arr_thsel", t.id), row, style.track_selected_bg, 0.0);
-                } else if is_group_set.contains(&t.id) {
-                    self.panel(("arr_thgrp", t.id), row, style.track_group_bg, 0.0);
                 } else {
                     self.panel(("arr_thbg", t.id), row, style.header_bg, 0.0);
                 }
@@ -10777,10 +10772,11 @@ mod tests {
         let s = ArrangementStyle::default();
         assert!(s.indent_px > 0.0, "indent_px は 0 以上 (default 16)");
         assert!(s.indent_px <= 32.0, "indent_px は実用範囲 (~16-32) 内");
-        // group_bg / disclosure_color は色が設定されていれば OK (alpha > 0 で defensive)
+        // M14 Phase 113 (daw_01 #085): group track 専用背景 (旧 track_group_bg) は撤去。 group の
+        // 構造手掛かりは disclosure ▶▼ + indent のみなので、 disclosure_color が可視色であることを確認。
         assert!(
-            s.track_group_bg.r > 0.0 || s.track_group_bg.g > 0.0 || s.track_group_bg.b > 0.0,
-            "track_group_bg は黒以外の色"
+            s.disclosure_color.r > 0.0 || s.disclosure_color.g > 0.0 || s.disclosure_color.b > 0.0,
+            "disclosure_color は黒以外の色"
         );
     }
 
@@ -12327,8 +12323,8 @@ mod tests {
         let screen = PhysicalSize { width: 800, height: 600 };
 
         // selection track にして track row 背景の push_filled_rect が走るようにする
-        // (selection / group / video 以外の通常 audio row では行背景の push_filled_rect は呼ばれない、
-        // draw_lanes_bg 2471 の `if selected ... else if group ... else if Video` 分岐参照)。
+        // (selection / video 以外の通常 audio row では行背景の push_filled_rect は呼ばれない、
+        // draw_lanes_bg の `if selected ... else if Video` 分岐参照。 #085 で group 分岐は撤去)。
         let model = Model {
             tracks: vec![track(10, "t0", vec![])],
             view: ArrangementView {

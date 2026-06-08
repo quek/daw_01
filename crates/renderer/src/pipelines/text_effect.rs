@@ -177,9 +177,32 @@ pub struct TextEffectCompositor {
     cache: HashMap<EffectKey, CachedEffect>,
 
     // glyphon resources (independent — format = OFFSCREEN_FORMAT)
+    /// 全 pooled `TextRenderer` で共有する glyph atlas (= `GlyphPipeline` が 1 atlas を pool 全体で
+    /// 共有するのと同 idiom、 glyphon 設計どおり安全)。 **frame 内では append-only に保つこと**: 同一
+    /// submit に積んだ複数 offscreen pass が submit 時にこの atlas を読むため、 frame 途中で trim/shrink
+    /// すると他 pass の glyph が消える。 縮小が必要なら全 render pass 完了後 (= `end_frame`) に限る。
     atlas: TextAtlas,
-    viewport: Viewport,
+    /// glyphon `Cache` (内部 `Arc<Inner>` で cheap)。 frame 内で offscreen glyph pass 数まで
+    /// `renderers` / `viewports` pool を grow する際の `Viewport::new` に必要なので保持する。
+    glyphon_cache: Cache,
+    /// M14 Phase 112 (daw_01 #084): offscreen glyph pass **1 つにつき 1 `TextRenderer`** (= 1 内部
+    /// vertex_buffer)。 単一 instance を使い回すと、 同一 encoder/submit 内で複数 effect-ful area の
+    /// `prepare` が同じ vertex_buffer を `queue.write_buffer` で上書きし、 `render` の `pass.draw` は
+    /// **submit 時にその buffer を遅延読み**するため、 全 offscreen target が **最後に prepare された 1 枚**
+    /// の文字列で焼ける (= 2 枚同時 active で両方同じ text、 #084 の症状)。 `GlyphPipeline.renderers` と
+    /// 同 idiom: frame 内で必要数まで grow、 shrink しない (allocate は grow 1 度だけ)。
     renderers: Vec<TextRenderer>,
+    /// M14 Phase 112 (daw_01 #084): `renderers` と lockstep の per-pass `Viewport`。 offscreen target は
+    /// area ごとに composite size が異なり、 viewport の resolution uniform は **draw (submit) 時に shader が
+    /// pixel→NDC 変換で読む** + `prepare` 時に bounds clamp に使われる (glyphon `text_render.rs`)。 単一
+    /// viewport を per-area `update` すると、 renderer pool だけ直しても submit 時に LAST WRITE WINS で全
+    /// draw が **最後の area の size** を読み、 size の違う overlay が mis-scale / off-target になる。 idx
+    /// ごとに別 params_buffer を持たせて隔離する。
+    viewports: Vec<Viewport>,
+    /// M14 Phase 112 (daw_01 #084): 現フレームで払い出した offscreen pass 数。 `begin_frame` で 0 に
+    /// reset、 `render_glyph_offscreen` で 1 つ払い出すごとに increment (= `GlyphPipeline.next_renderer_idx`
+    /// と同 idiom)。 cache hit の area は `render_effect` 冒頭で early-return するので index を進めない。
+    next_renderer_idx: usize,
     /// text layout buffer cache。 `CachedBuffer` で `last_seen_frame` を持って `end_frame` で
     /// `EVICT_AFTER_FRAMES` 経過 entry を retain で削除 (= 既存 `GlyphPipeline.cache` と同 idiom、
     /// 長期セッションで dynamic text 増加に対する memory growth を防ぐ)。
@@ -205,10 +228,12 @@ impl TextEffectCompositor {
     /// 同 idiom)。
     #[allow(clippy::too_many_lines)]
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
-        // glyphon Cache は内部 Arc<Inner> なので新規 instance でも cheap。
+        // glyphon Cache は内部 Arc<Inner> なので新規 instance でも cheap。 frame 内で
+        // renderers / viewports pool を grow する際の `Viewport::new` に使うので Self に保持する。
         let cache_handle = Cache::new(device);
         let atlas = TextAtlas::new(device, queue, &cache_handle, OFFSCREEN_FORMAT);
-        let viewport = Viewport::new(device, &cache_handle);
+        // viewport / renderer は offscreen pass ごとに別 instance が要る (per-pass で size が異なる、
+        // #084) ので、 ここでは作らず render_glyph_offscreen で必要数まで pool を grow する。
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("text_effect sampler"),
@@ -392,8 +417,10 @@ impl TextEffectCompositor {
         Self {
             cache: HashMap::new(),
             atlas,
-            viewport,
+            glyphon_cache: cache_handle,
             renderers: Vec::new(),
+            viewports: Vec::new(),
+            next_renderer_idx: 0,
             buffer_cache: HashMap::new(),
             blur_h_pipeline: blur_horiz,
             blur_v_pipeline: blur_vert,
@@ -407,6 +434,10 @@ impl TextEffectCompositor {
 
     pub fn begin_frame(&mut self) {
         self.frame_counter += 1;
+        // M14 Phase 112 (daw_01 #084): offscreen glyph pass の renderer/viewport pool index を
+        // frame 頭で reset (= `GlyphPipeline::begin_frame` と同 idiom)。 pool 自体 (Vec) は保持して
+        // 再利用、 index だけ巻き戻すことで frame ごとに先頭 slot から払い出し直す。
+        self.next_renderer_idx = 0;
     }
 
     /// effect 付き area を offscreen で render し、 base scene 用の (TextureHandle, rect) を返す。
@@ -653,24 +684,37 @@ impl TextEffectCompositor {
         composite_h: u32,
         target_view: &wgpu::TextureView,
     ) {
-        // update viewport to offscreen size
-        self.viewport.update(
-            queue,
-            Resolution {
-                width: composite_w,
-                height: composite_h,
-            },
-        );
-
-        // ensure renderer pool has at least 1 renderer
-        if self.renderers.is_empty() {
+        // M14 Phase 112 (daw_01 #084): この offscreen glyph pass 専用の (renderer, viewport) slot を
+        // pool から払い出す。 1 slot = 1 内部 vertex_buffer + 1 resolution uniform buffer。 同一
+        // encoder/submit 内で複数 effect-ful area を焼くとき単一 instance を使い回すと、 submit 時に
+        // 全 draw が **最後の prepare/update** を読む (= 文字列も resolution も最後の area に化ける)。
+        // idx ごとに別 buffer を持たせて隔離する (= `GlyphPipeline` の renderer pool と同 idiom)。
+        // renderers / viewports は lockstep で grow させ、 同じ idx で両者を参照する。
+        while self.next_renderer_idx >= self.renderers.len() {
             self.renderers.push(TextRenderer::new(
                 &mut self.atlas,
                 device,
                 MultisampleState::default(),
                 None,
             ));
+            self.viewports.push(Viewport::new(device, &self.glyphon_cache));
         }
+        let idx = self.next_renderer_idx;
+        self.next_renderer_idx += 1;
+
+        // この slot の viewport を offscreen size に更新。 glyphon 0.11 では `prepare` が
+        // `viewport.resolution()` を bounds clamp に読み (text_render.rs:146)、 `render` が
+        // `viewport.bind_group` を bind して vertex shader が pixel→NDC 変換に読む (text_render.rs:350 +
+        // shader.wgsl:65、 submit 時)。 どちらも resolution に依存するので prepare の前に更新する。
+        // 単一 viewport を共有すると submit 時に最後の size が全 draw に効く (= サイズ違い overlay の
+        // mis-scale)。 idx ごとに別 viewport (= 別 params_buffer) なので隔離される。
+        self.viewports[idx].update(
+            queue,
+            Resolution {
+                width: composite_w,
+                height: composite_h,
+            },
+        );
 
         // buffer cache key 同じ (measure 時に確保済)
         let key = buffer_cache_key(area);
@@ -701,12 +745,12 @@ impl TextEffectCompositor {
             custom_glyphs: &[],
         };
 
-        if let Err(e) = self.renderers[0].prepare(
+        if let Err(e) = self.renderers[idx].prepare(
             device,
             queue,
             font_system,
             &mut self.atlas,
-            &self.viewport,
+            &self.viewports[idx],
             std::iter::once(text_area),
             swash_cache,
         ) {
@@ -730,7 +774,7 @@ impl TextEffectCompositor {
             multiview_mask: None,
             occlusion_query_set: None,
         });
-        if let Err(e) = self.renderers[0].render(&self.atlas, &self.viewport, &mut pass) {
+        if let Err(e) = self.renderers[idx].render(&self.atlas, &self.viewports[idx], &mut pass) {
             eprintln!("text_effect glyph render error: {e:?}");
         }
     }

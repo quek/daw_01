@@ -63,17 +63,25 @@ struct ClickRecord {
 }
 
 /// fader の幾何計算: track (細い縦バー) と thumb (つまみ) の rect を返す。
-fn fader_geometry(rect: Rect, value: f32) -> (Rect, Rect) {
+/// track 領域を **明示指定** して track / thumb rect を計算する。
+/// `[col_x, col_x+col_w]` が横の列、 `[track_top, track_top+track_h]` が thumb 中心の可動域。
+/// thumb 中心は `track_top + track_h * (1.0 - value)` (= `value=1` で上端、 `value=0` で下端)。
+/// `channel_fader_meter` は meter と共有する region を track として渡す (daw_01 #083)。
+fn fader_track_geometry(
+    col_x: f32,
+    col_w: f32,
+    track_top: f32,
+    track_h: f32,
+    value: f32,
+) -> (Rect, Rect) {
     let track_w = 6.0;
-    let track_x = rect.x + (rect.w - track_w) * 0.5;
-    let track_top = rect.y + TRACK_PAD;
-    let track_h = (rect.h - TRACK_PAD * 2.0).max(1.0);
+    let track_x = col_x + (col_w - track_w) * 0.5;
     let track = Rect { x: track_x, y: track_top, w: track_w, h: track_h };
-    let thumb_x = rect.x + (rect.w - THUMB_W) * 0.5;
+    let thumb_x = col_x + (col_w - THUMB_W) * 0.5;
     // value=1 → thumb_y は track 上端、value=0 → 下端付近に。
     let thumb_y_unclamped = track_top + (track_h - THUMB_H * 0.5) - track_h * value;
-    let thumb_y = thumb_y_unclamped
-        .clamp(track_top - THUMB_H * 0.5, track_top + track_h - THUMB_H * 0.5);
+    let thumb_y =
+        thumb_y_unclamped.clamp(track_top - THUMB_H * 0.5, track_top + track_h - THUMB_H * 0.5);
     let thumb = Rect { x: thumb_x, y: thumb_y, w: THUMB_W, h: THUMB_H };
     (track, thumb)
 }
@@ -110,11 +118,41 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// - thumb をドラッグで値編集 (track 1 本分 = 0→1 fraction)
     /// - thumb をダブルクリック (~300ms / 5px 以内) で `default_value` に戻る
     /// - Ctrl + ドラッグで感度 1/10
-    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn fader_at<F>(
         &mut self,
         id: impl Hash,
         rect: Rect,
+        value: f32,
+        default_value: f32,
+        scale: Option<MeterScale>,
+        label: &'static str,
+        on_change: F,
+    ) -> FaderResponse
+    where
+        F: Fn(f32) -> Edit<M> + Clone + Send + Sync + 'static,
+    {
+        // track 領域は rect から TRACK_PAD インセットで導出 (従来挙動と byte 互換)。
+        let wid = WidgetId::ROOT.child((b"fader", &id));
+        let track_top = rect.y + TRACK_PAD;
+        let track_h = (rect.h - TRACK_PAD * 2.0).max(1.0);
+        self.fader_core(wid, rect, track_top, track_h, value, default_value, scale, label, on_change)
+    }
+
+    /// `fader_at` / `channel_fader_meter` 共有の fader コア (描画 + ドラッグ + Edit 発行)。
+    ///
+    /// track 領域を **明示指定** する: `col` が背景パネル + thumb の横列 rect、
+    /// `[track_top, track_top+track_h]` が thumb 中心の可動域 (= dB→y region)。 thumb 中心は
+    /// `track_top + track_h * (1.0 - frac)`。 `channel_fader_meter` は meter と共有する region を
+    /// 渡して画素整合させる (daw_01 #083)。 `scale` の dB↔fraction 変換と undoable Edit 機構は
+    /// `fader_at` と同一。
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    pub(crate) fn fader_core<F>(
+        &mut self,
+        wid: WidgetId,
+        col: Rect,
+        track_top: f32,
+        track_h: f32,
         value: f32,
         default_value: f32,
         scale: Option<MeterScale>,
@@ -139,11 +177,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         };
 
-        let wid = WidgetId::ROOT.child((b"fader", &id));
         let pointer = self.pointer;
         let value = to_frac(value).clamp(0.0, 1.0);
         let default_value = to_frac(default_value).clamp(0.0, 1.0);
-        let (_, thumb_rect) = fader_geometry(rect, value);
+        let (_, thumb_rect) = fader_track_geometry(col.x, col.w, track_top, track_h, value);
 
         // 1. 押下処理 + 2. mid-drag ctrl toggle 再 anchor + 3. release 解除
         let mut reset_fired = false;
@@ -212,7 +249,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let displayed_value = if reset_fired {
             default_value
         } else if let (Some(anchor), Some((_, py))) = (drag_anchor, pointer.pos) {
-            let track_h = (rect.h - TRACK_PAD * 2.0).max(1.0);
+            // drag 感度は track_h (= region 高さ) で正規化。region いっぱいの drag で 0→1。
             let drag_scale = if anchor.ctrl { FINE_DRAG_SCALE } else { 1.0 };
             let raw_dv = -(py - anchor.pointer_y) / track_h;
             (anchor.value + raw_dv * drag_scale).clamp(0.0, 1.0)
@@ -222,20 +259,21 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         // 描画。track + thumb。M4 Phase 11: with_widget_node で input_hash キャッシュ。
         let dragging = drag_anchor.is_some();
-        let (_, thumb_hover_rect) = fader_geometry(rect, displayed_value);
+        let (_, thumb_hover_rect) =
+            fader_track_geometry(col.x, col.w, track_top, track_h, displayed_value);
         let hovered_thumb = pointer.pos.is_some_and(|(px, py)| thumb_hover_rect.contains(px, py));
         let input_hash = hash_inputs((
             b"fader",
-            rect.x.to_bits(),
-            rect.y.to_bits(),
-            rect.w.to_bits(),
-            rect.h.to_bits(),
+            col.x.to_bits(),
+            col.y.to_bits(),
+            col.w.to_bits(),
+            col.h.to_bits(),
             displayed_value.to_bits(),
             dragging,
             hovered_thumb,
         ));
         self.with_widget_node(wid, input_hash, |ui| {
-            draw_fader(ui, rect, displayed_value, dragging, pointer);
+            draw_fader(ui, col, track_top, track_h, displayed_value, dragging, pointer);
         });
 
         // M8 Phase 29: drag 終端では Mutate を抑制 (Undoable Edit が forward を再実行するため
@@ -265,7 +303,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         FaderResponse {
             displayed_value: to_val(displayed_value),
-            hovered: hovered(rect, pointer),
+            hovered: hovered(col, pointer),
             dragging: drag_anchor.is_some(),
         }
     }
@@ -300,14 +338,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
 fn draw_fader<M: ?Sized + 'static>(
     ui: &mut Ui<'_, M>,
-    rect: Rect,
+    col: Rect,
+    track_top: f32,
+    track_h: f32,
     value: f32,
     dragging: bool,
     pointer: crate::input::PointerFrame,
 ) {
-    // 背景パネル
+    // 背景パネル (列全体)
     ui.push_rect(RectCommand {
-        rect,
+        rect: col,
         fill: Color::rgb(0.10, 0.11, 0.13),
         border: Color::rgb(0.25, 0.28, 0.33),
         border_width: 1.0,
@@ -315,7 +355,7 @@ fn draw_fader<M: ?Sized + 'static>(
         clip_rect: None,
     });
 
-    let (track, thumb) = fader_geometry(rect, value);
+    let (track, thumb) = fader_track_geometry(col.x, col.w, track_top, track_h, value);
 
     // 細い track
     ui.push_rect(RectCommand {
@@ -394,10 +434,12 @@ mod tests {
         Rect { x: 0.0, y: 0.0, w: 32.0, h: 120.0 }
     }
 
-    /// 与えた value での thumb 中心座標。`fader_geometry` と同じ計算。
+    /// 与えた value での thumb 中心座標 (`fader_at` と同じ TRACK_PAD インセット track 領域)。
     fn thumb_center_at(value: f32) -> (f32, f32) {
         let rect = fader_rect();
-        let (_, thumb) = fader_geometry(rect, value.clamp(0.0, 1.0));
+        let track_top = rect.y + TRACK_PAD;
+        let track_h = (rect.h - TRACK_PAD * 2.0).max(1.0);
+        let (_, thumb) = fader_track_geometry(rect.x, rect.w, track_top, track_h, value.clamp(0.0, 1.0));
         (thumb.x + thumb.w * 0.5, thumb.y + thumb.h * 0.5)
     }
 

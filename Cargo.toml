@@ -18,6 +18,9 @@ members = [
     "crates/examples/meter_snapshot",
     "crates/examples/track_header_snapshot",
     "crates/examples/arrangement_share_snapshot",
+    "crates/examples/channel_fader_meter_snapshot",
+    "crates/examples/arrangement_group_snapshot",
+    "crates/examples/text_effect_overlay_snapshot",
 ]
 
 [workspace.package]

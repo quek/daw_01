@@ -734,6 +734,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "daw-ui-example-arrangement-group-snapshot"
+version = "0.1.0"
+dependencies = [
+ "daw-ui-core",
+ "daw-ui-platform",
+ "daw-ui-renderer",
+ "png 0.17.16",
+]
+
+[[package]]
 name = "daw-ui-example-arrangement-share-snapshot"
 version = "0.1.0"
 dependencies = [
@@ -751,6 +761,16 @@ dependencies = [
  "daw-ui-platform",
  "daw-ui-renderer",
  "winit",
+]
+
+[[package]]
+name = "daw-ui-example-channel-fader-meter-snapshot"
+version = "0.1.0"
+dependencies = [
+ "daw-ui-core",
+ "daw-ui-platform",
+ "daw-ui-renderer",
+ "png 0.17.16",
 ]
 
 [[package]]
@@ -829,6 +849,14 @@ dependencies = [
  "daw-ui-platform",
  "daw-ui-renderer",
  "winit",
+]
+
+[[package]]
+name = "daw-ui-example-text-effect-overlay-snapshot"
+version = "0.1.0"
+dependencies = [
+ "daw-ui-renderer",
+ "png 0.17.16",
 ]
 
 [[package]]

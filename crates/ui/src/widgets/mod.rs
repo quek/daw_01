@@ -6,6 +6,7 @@
 pub mod arrangement;
 pub mod automation;
 pub mod button;
+pub mod channel_fader_meter;
 pub mod checkbox;
 pub mod color_picker;
 pub mod drag_in_rect;

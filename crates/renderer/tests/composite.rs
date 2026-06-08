@@ -430,6 +430,137 @@ fn sequential_async_readback_reuses_slot() {
     }
 }
 
+// ============================================================
+// M14 Phase 112 (daw_01 #084): text_effect compositor の per-pass renderer/viewport pool
+// ============================================================
+
+/// effect 付き `GlyphArea` が **同一フレームに複数枚同時 active** なとき、 各 offscreen glyph pass が
+/// 専用の `TextRenderer` (= 1 内部 vertex_buffer) + `Viewport` (= 1 resolution uniform) を持つので、
+/// 各 overlay が **それぞれ固有の文字** を **固有サイズの target** に焼く。 単一 instance 使い回し時代
+/// (#084) は submit 時の LAST WRITE WINS で全枚が「最後に prepare された 1 枚」 の文字列・resolution で
+/// 焼けていた (daw_01 実機: クレジットと歌詞が両方クレジット文字列に化ける)。
+///
+/// 3 枚を別 region に push (= pool が 3 slot に grow): **赤・幅広** (outline のみ) / **青・幅狭**
+/// (shadow **blur** あり = H/V blur pass も通る) / **緑・大きめ** (descender、 composite size が他と異なる)。
+/// 最後に push する緑がバグ時の「勝者」。 修正後は各 region が固有色を多数持ち他色を持たない:
+/// - renderer pool が無いと全 region が **緑** (= 最後の overlay の文字) に化ける。
+/// - viewport 共有だと幅/高さの違う overlay が緑の resolution で NDC 変換され mis-scale / off-target。
+///   いずれの回帰でも「各 region が自色を多数 + 他色なし」 assert で検出できる。 glyphon 0.11 の
+///   resolution 依存箇所は text_render.rs:146 (prepare の bounds clamp) / :350 + shader.wgsl:65 (submit 時 NDC)。
+#[test]
+fn text_effect_multiple_effectful_overlays_render_distinct_text() {
+    const W: u32 = 220;
+    const H: u32 = 170;
+    let Some(mut r) = try_renderer(W, H) else { return };
+
+    // (text, top, color, font_size, outline_px, blur_px) → effect 付き GlyphArea。
+    let area = |text: &str, top: f32, color: Color, font: f32, outline: f32, blur: f32| GlyphArea {
+        text: text.into(),
+        left: 8.0,
+        top,
+        font_size: font,
+        line_height: font * 1.2,
+        color,
+        clip_rect: None,
+        outline_color: Color::rgb(0.0, 0.0, 0.0),
+        outline_width_px: outline,
+        shadow_color: if blur > 0.0 {
+            Color::rgba(0.0, 0.0, 0.0, 0.7)
+        } else {
+            Color::rgba(0.0, 0.0, 0.0, 0.0)
+        },
+        shadow_offset_px: (0.0, 0.0),
+        shadow_blur_px: blur,
+        rotation_radians: 0.0,
+    };
+
+    let mut scene = Scene::new();
+    scene.clear_color = Color::BLACK.to_wgpu();
+    // 別 region・別サイズ・別 effect。 最後 (緑) がバグ時に全枚へ漏れる「勝者」。
+    scene.push_text(area("WWWWWW", 8.0, Color::rgb(1.0, 0.0, 0.0), 20.0, 2.0, 0.0)); // 幅広 outline
+    scene.push_text(area("lij", 64.0, Color::rgb(0.0, 0.0, 1.0), 20.0, 1.0, 3.0)); // 幅狭 + blur
+    scene.push_text(area("gpqy", 116.0, Color::rgb(0.0, 1.0, 0.0), 30.0, 2.0, 0.0)); // 大きめ descender
+
+    let bytes = r.render_to_rgba(&scene).expect("render");
+
+    let count = |pred: fn((u8, u8, u8, u8)) -> bool, y0: u32, y1: u32| -> usize {
+        let mut n = 0;
+        for y in y0..y1 {
+            for x in 0..W {
+                if pred(px(&bytes, W, x, y)) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+
+    // region A 赤 (y[0,56)) / B 青 (y[58,112)) / C 緑 (y[112,170))。 想定: A 数百 red、 B 数十 blue
+    // (blur は shadow のみ、 fill は sharp blue)、 C 数百 green。 緑漏れ (= renderer 共有) を各 region で否定。
+    assert!(count(is_red, 0, 56) > 30, "A region に赤 (幅広 outline overlay) が無い: {}", count(is_red, 0, 56));
+    assert!(count(is_green, 0, 56) < 5, "A region に緑が漏れた (最後の overlay が renderer 共有で焼かれた #084): {}", count(is_green, 0, 56));
+    assert!(count(is_blue, 58, 112) > 10, "B region に青 (幅狭 + blur overlay) が無い: {}", count(is_blue, 58, 112));
+    assert!(count(is_green, 58, 112) < 5, "B region に緑が漏れた #084: {}", count(is_green, 58, 112));
+    assert!(count(is_green, 112, H) > 30, "C region に緑 (大きめ overlay) が無い: {}", count(is_green, 112, H));
+}
+
+/// cache-hit の effect area は `render_effect` 冒頭で early-return し offscreen glyph pass を発行しない
+/// (= renderer/viewport slot を消費しない) ので、 同フレームの cache-miss area の pool 払い出しを乱さない。
+/// frame1 で A(赤)+B(青) を bake、 frame2 で A(同一 params = cache hit) + C(緑、 新規 miss) を描く。
+/// frame2 の出力は A が frame1 の baked red を保持 (cache が壊れていない) + C が緑で正しく焼ける。
+#[test]
+fn text_effect_cache_hit_coexists_with_miss() {
+    const W: u32 = 160;
+    const H: u32 = 110;
+    let Some(mut r) = try_renderer(W, H) else { return };
+
+    let area = |text: &str, top: f32, color: Color| GlyphArea {
+        text: text.into(),
+        left: 8.0,
+        top,
+        font_size: 20.0,
+        line_height: 24.0,
+        color,
+        clip_rect: None,
+        outline_color: Color::rgb(0.0, 0.0, 0.0),
+        outline_width_px: 2.0,
+        shadow_color: Color::rgba(0.0, 0.0, 0.0, 0.0),
+        shadow_offset_px: (0.0, 0.0),
+        shadow_blur_px: 0.0,
+        rotation_radians: 0.0,
+    };
+
+    // frame 1: A(赤, 上) + B(青, 下) を bake (両方 cache-miss)。
+    let mut f1 = Scene::new();
+    f1.clear_color = Color::BLACK.to_wgpu();
+    f1.push_text(area("AAAA", 8.0, Color::rgb(1.0, 0.0, 0.0)));
+    f1.push_text(area("BBBB", 58.0, Color::rgb(0.0, 0.0, 1.0)));
+    let _ = r.render_to_rgba(&f1).expect("frame 1");
+
+    // frame 2: A(同一 params = cache hit、 slot 非消費) + C(緑, 下 = 新規 cache miss)。
+    let mut f2 = Scene::new();
+    f2.clear_color = Color::BLACK.to_wgpu();
+    f2.push_text(area("AAAA", 8.0, Color::rgb(1.0, 0.0, 0.0)));
+    f2.push_text(area("CCCC", 58.0, Color::rgb(0.0, 1.0, 0.0)));
+    let bytes = r.render_to_rgba(&f2).expect("frame 2");
+
+    let count = |pred: fn((u8, u8, u8, u8)) -> bool, y0: u32, y1: u32| -> usize {
+        let mut n = 0;
+        for y in y0..y1 {
+            for x in 0..W {
+                if pred(px(&bytes, W, x, y)) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+
+    assert!(count(is_red, 0, 44) > 20, "frame2: cache-hit A の赤が無い (cache が壊れた?): {}", count(is_red, 0, 44));
+    assert!(count(is_green, 0, 44) < 5, "frame2: A region に C の緑が漏れた: {}", count(is_green, 0, 44));
+    assert!(count(is_green, 48, H) > 20, "frame2: cache-miss C の緑が無い: {}", count(is_green, 48, H));
+}
+
 /// `clear_readback_cache` 後の古い `PendingReadback` (世代不一致) を `finish_readback` に渡すと
 /// panic せず `Err` を返す (stale token guard)。
 #[test]

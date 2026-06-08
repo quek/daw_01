@@ -271,7 +271,30 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         style: LevelMeterStyle,
     ) {
         let wid = WidgetId::ROOT.child((b"level_meter", &id));
+        // 縦の dB→y 領域は `rect` から導出 (peak_readout 帯 + scale 上下 vpad)。 standalone では
+        // この領域が widget rect 内で完結する。
+        let content = meter_content_region(rect, style.scale.is_some(), style.peak_readout);
+        self.meter_body(wid, rect, content, l, r, ballistic, &style);
+    }
 
+    /// メーター本体 (reset click 消費 + state 更新 + 背景 + L/R バー + 目盛り + readout) を描く。
+    ///
+    /// **縦の dB→y マッピングは `content` (呼び出し側が渡す)** に従う。 横レイアウト
+    /// (`[tick | L | R | 数字]`) と背景 / readout / reset の hit-test は `rect` (列全体) に従う。
+    /// `level_meter_stereo` は `content = meter_content_region(rect, ..)` を渡して自己完結し、
+    /// `channel_fader_meter` は **fader と共有する region** を `content` に渡して画素整合させる
+    /// (= dB→y 写像の single source of truth、 daw_01 #083)。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn meter_body(
+        &mut self,
+        wid: WidgetId,
+        rect: Rect,
+        content: Rect,
+        l: f32,
+        r: f32,
+        ballistic: MeterBallistic,
+        style: &LevelMeterStyle,
+    ) {
         let reset_clicked = style.peak_readout && self.take_primary_press_in_rect(rect).is_some();
 
         // 1. state 更新 (L/R 個別)。 long_peak は L/R の最大到達 (readout 用)。
@@ -291,7 +314,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.request_redraw();
         }
 
-        // 2. レイアウト: [tick ガター(左) | L バー | R バー | 数字ガター(右)]。
+        // 2. 横レイアウト: [tick ガター(左) | L バー | R バー | 数字ガター(右)]。
         let has_scale = style.scale.is_some();
         let (tick_g, num_g) = if has_scale {
             let total = (SCALE_TICK_GUTTER_W + SCALE_NUM_GUTTER_W).min((rect.w - 4.0).max(0.0));
@@ -309,14 +332,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let right_x = left_x + bar_each + STEREO_BAR_GAP;
         let bars_right = right_x + bar_each;
 
-        // 縦: peak_readout 帯 + scale の上下パディング。 content_top/bottom を rect 内に clamp
-        // (degenerate sizing でも縦方向は矩形内。 横方向は上の bar_each 導出で収まる)。
-        let vpad = if has_scale { SCALE_VPAD } else { 0.0 };
-        let band = if style.peak_readout { READOUT_BAND_H } else { 0.0 };
-        let content_top = (rect.y + band + vpad).clamp(rect.y, rect.y + rect.h);
-        let content_bottom = (rect.y + rect.h - vpad).clamp(content_top, rect.y + rect.h);
-        let content = Rect { x: rect.x, y: content_top, w: rect.w, h: content_bottom - content_top };
-
         // 背景 (rect 全体)
         self.push_rect(RectCommand {
             rect,
@@ -327,18 +342,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             clip_rect: None,
         });
 
-        // 3. L / R 色帯バー + peak hold 線 (同一カーブ)。
-        self.draw_meter_bar(content, left_x, bar_each, l_disp, l_hold, &style);
-        self.draw_meter_bar(content, right_x, bar_each, r_disp, r_hold, &style);
+        // 3. L / R 色帯バー + peak hold 線 (同一カーブ、 content の dB→y を共有)。
+        self.draw_meter_bar(content, left_x, bar_each, l_disp, l_hold, style);
+        self.draw_meter_bar(content, right_x, bar_each, r_disp, r_hold, style);
 
         // 4. dB 目盛り (tick = L バー左 / 数字 = R バー右 / 0dB 線 = 両バー横断)。
         if let Some(scale) = style.scale {
-            self.draw_meter_scale(content, rect, left_x, bars_right, scale, &style);
+            self.draw_meter_scale(content, rect, left_x, bars_right, scale, style);
         }
 
         // 5. peak readout (上端の専用帯)。
         if style.peak_readout {
-            self.draw_meter_readout(rect, long_peak, &style);
+            self.draw_meter_readout(rect, long_peak, style);
         }
     }
 
@@ -525,6 +540,21 @@ fn meter_frac(db: f32, style: &LevelMeterStyle) -> f32 {
         Some(scale) => curve_fraction(db, scale.curve),
         None => db_to_fraction(db, style.db_range),
     }
+}
+
+/// `rect` から「縦の dB→y 領域」 (frac 0..1 を写す content rect) を導出する。
+///
+/// `peak_readout` 時は上端に `READOUT_BAND_H` の専用帯、 `has_scale` 時は端ラベルが切れない
+/// `SCALE_VPAD` の上下余白を確保する。 `y(frac) = content.y + content.h * (1.0 - frac)`。
+/// `level_meter_stereo` と `channel_fader_meter` がこの 1 関数から領域を得るので、 同じ `rect`
+/// (= 同じ y / h) を渡せば fader ハンドルと meter バー・目盛りが必ず画素整合する (daw_01 #083)。
+/// degenerate sizing でも content は rect 内に clamp される。
+pub(crate) fn meter_content_region(rect: Rect, has_scale: bool, peak_readout: bool) -> Rect {
+    let vpad = if has_scale { SCALE_VPAD } else { 0.0 };
+    let band = if peak_readout { READOUT_BAND_H } else { 0.0 };
+    let content_top = (rect.y + band + vpad).clamp(rect.y, rect.y + rect.h);
+    let content_bottom = (rect.y + rect.h - vpad).clamp(content_top, rect.y + rect.h);
+    Rect { x: rect.x, y: content_top, w: rect.w, h: content_bottom - content_top }
 }
 
 /// 目盛りラベル文字列。 Ableton Live と同じく **符号なしの絶対値**整数 (`"6"` / `"0"` / `"60"`)。
