@@ -44,10 +44,6 @@ const ADD_RETURN_H: f32 = 22.0;
 
 const COLOR_BG: Color = Color { r: 0.13, g: 0.13, b: 0.15, a: 1.0 };
 const COLOR_STRIP_BG: Color = Color { r: 0.18, g: 0.18, b: 0.22, a: 1.0 };
-/// Group / sub-mix bus strip — slightly bluer than a regular strip and
-/// closer in luminance to MASTER_BG so the eye reads it as a bus rather
-/// than a track.
-const COLOR_GROUP_BG: Color = Color { r: 0.18, g: 0.22, b: 0.30, a: 1.0 };
 /// Return strip — 緑寄りの tint で、 通常 track / group bus とも別物だと
 /// 一目で分かるようにする (Ableton の return track 列のメタファ)。
 const COLOR_RETURN_BG: Color = Color { r: 0.18, g: 0.28, b: 0.22, a: 1.0 };
@@ -124,6 +120,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // be yanked right while its children stayed left, severing the tree.
     let (returns, normals): (Vec<_>, Vec<_>) =
         mix.iter().partition(|e| e.is_return && !e.is_group);
+
+    // FIXME #7: 折り畳まれた group の配下 strip は隠す (arrangement と同じ
+    // `collapsed_groups` を参照 = SSoT 共有)。x レイアウト / content_w が
+    // filter 後の index に揃うよう、 並べる前に除外する。group strip 自身は
+    // (自分の祖先に collapsed が無い限り) 残り、 disclosure ▶/▼ を出す。
+    let normals: Vec<_> = normals
+        .into_iter()
+        .filter(|e| !app.is_hidden_under_collapsed_group(e.track_id))
+        .collect();
 
     // ----- 右端から固定配置: MASTER → returns 帯 → 「＋ Return」 -----
     let master_x = area.x + area.w - inner_pad - STRIP_WIDTH;
@@ -202,6 +207,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         None, // master は track 色を持たない (neutral 背景)
         u32::MAX,
         true,
+        None, // group_collapsed: master は group disclosure 無し
         0.0, // sends_band_h (master は Sends セクション無し)
         false,
         false,
@@ -216,9 +222,10 @@ fn draw_track_strip(
     entry: &crate::app::TrackMixEntry,
     rect: Rect,
 ) {
-    // Group strips wear a bluer tint so the eye picks them out from
-    // regular per-track strips. depth は "↳" prefix で表現。
-    let bg = if entry.is_group { COLOR_GROUP_BG } else { COLOR_STRIP_BG };
+    // FIXME #5: グループ強調の色ハイライト (旧 COLOR_GROUP_BG 青 tint) は撤去。
+    // グループ識別は構造手掛かり ("↳" depth prefix + 折り畳み) だけで担い、
+    // 背景は通常 strip と同じ neutral に統一する。
+    let bg = COLOR_STRIP_BG;
     let display_name = if entry.depth > 0 {
         let arrows = "↳".repeat(entry.depth.min(4) as usize);
         format!("{arrows} {}", entry.name)
@@ -226,6 +233,13 @@ fn draw_track_strip(
         entry.name.clone()
     };
     let track_id = entry.track_id;
+    // FIXME #7: group strip は折り畳み disclosure を出す。collapsed 状態は
+    // arrangement と共通の collapsed_groups を引く。
+    let group_collapsed = if entry.is_group {
+        Some(app.collapsed_groups.contains(&track_id))
+    } else {
+        None
+    };
     let (was_dragging_vol, was_dragging_pan) = drag_flags(app, track_id);
     let n_sends = app.song.track_by_id(track_id).map_or(0, |t| t.sends.len());
     let sends_band_h = sends_band_height(n_sends);
@@ -244,6 +258,7 @@ fn draw_track_strip(
         Some(track_color::to_renderer(entry.color)),
         track_id,
         false,
+        group_collapsed,
         sends_band_h,
         was_dragging_vol,
         was_dragging_pan,
@@ -277,6 +292,7 @@ fn draw_return_strip(
         Some(track_color::to_renderer(entry.color)),
         track_id,
         false,
+        None, // group_collapsed: return strip は disclosure 無し
         0.0, // sends_band_h = 0 (リターンは send 元 UI を出さない)
         was_dragging_vol,
         was_dragging_pan,
@@ -313,6 +329,10 @@ fn draw_strip(
     color: Option<Color>,
     track_idx: u32,
     is_master: bool,
+    // FIXME #7: group strip のとき `Some(collapsed)` を渡すと、 名前左に折り畳み
+    // disclosure ▶/▼ を描き、 click で `collapsed_groups` を toggle する
+    // (arrangement と同じ SSoT)。 非 group (通常 track / return / master) は `None`。
+    group_collapsed: Option<bool>,
     // この strip 下部に確保する Sends セクション band の高さ (px)。 通常
     // track は caller が `sends_band_height` で算出した値、 リターン / master
     // は 0。 fader 下端をこの分だけ持ち上げて領域を空ける。 Sends セクション
@@ -344,11 +364,34 @@ fn draw_strip(
     let pad = 6.0;
     let mut y = rect.y + pad;
 
-    // 名前
+    // 名前 (FIXME #7: group strip は左に折り畳み disclosure ▶/▼ を置く)
+    let name_x = if let Some(collapsed) = group_collapsed {
+        let tri = if collapsed { "\u{25b6}" } else { "\u{25bc}" }; // ▶ 折り畳み / ▼ 展開
+        let disc_w = 14.0;
+        ui.button_at(
+            ("mixer_strip_disclosure", layout_idx),
+            tri,
+            Rect { x: rect.x + pad, y, w: disc_w, h: 14.0 },
+            move || {
+                Edit::mutate(move |app: &mut AppData| {
+                    // arrangement の ToggleGroupCollapsed と同じ toggle
+                    // (collapsed_groups が両 view 共通の SSoT)。
+                    if app.collapsed_groups.contains(&track_idx) {
+                        app.collapsed_groups.remove(&track_idx);
+                    } else {
+                        app.collapsed_groups.insert(track_idx);
+                    }
+                })
+            },
+        );
+        rect.x + pad + disc_w + 2.0
+    } else {
+        rect.x + pad
+    };
     ui.label_at(
         ("mixer_strip_name", layout_idx),
         name,
-        rect.x + pad,
+        name_x,
         y,
         11.0,
         if is_master { COLOR_TEXT } else { COLOR_TEXT_DIM },
@@ -428,12 +471,26 @@ fn draw_strip(
     let track_idx_for_vol = track_idx;
     let is_master_for_vol = is_master;
     let fader_label: &'static str = if is_master_for_vol { "Master Volume" } else { "Track Volume" };
-    let vol_resp = ui.fader_at(
+    // FIXME #1 (gui_01 #083): fader ハンドル・L/R メーター・dB 目盛り・0dB 線・
+    // peak を「ただ一つの dB→ピクセル y 写像」から配置する単一 widget に統一。
+    // group rect (group_w = FADER_W + METER_GAP + METER_SCALE_W = 55) を渡すと
+    // widget が内部で fader 列 (fader_w) と meter 列に分割し、両者の高さ写像が
+    // 構造的に一致する (旧 fader_at + level_meter_stereo 別置きの ~13px ズレ解消)。
+    let style = LevelMeterStyle {
+        scale: Some(MeterScale::default()),
+        peak_readout: true,
+        ..LevelMeterStyle::default()
+    };
+    let resp = ui.channel_fader_meter(
         ("mixer_strip_fader", layout_idx),
-        Rect { x: group_x, y: fader_top, w: FADER_W, h: fader_h },
+        Rect { x: group_x, y: fader_top, w: group_w, h: fader_h },
+        FADER_W,
         fader_db,
         0.0,
-        Some(MeterScale::default()),
+        peak_l_raw,
+        peak_r_raw,
+        MeterBallistic::Peak,
+        style,
         fader_label,
         move |new_db| {
             let amp = if new_db.is_finite() { 10f32.powf(new_db / 20.0) } else { 0.0 };
@@ -457,27 +514,9 @@ fn draw_strip(
             AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
             "Volume",
             was_dragging_vol,
-            vol_resp.dragging,
+            resp.fader.dragging,
         );
     }
-
-    let mx = group_x + FADER_W + METER_GAP;
-    // Ableton 風メーター: widget が L/R 2 本のバー + 非線形 dB 目盛り (tick|L|R|数字) +
-    // 0dB 横線 + 数値ピーク (click reset) を同一カーブで描く (SSoT、 daw_01 は自前描画しない)。
-    // 全 ch (track/return/group/master) に目盛りを付ける。
-    let style = LevelMeterStyle {
-        scale: Some(MeterScale::default()),
-        peak_readout: true,
-        ..LevelMeterStyle::default()
-    };
-    ui.level_meter_stereo(
-        ("mixer_meter", layout_idx),
-        Rect { x: mx, y: fader_top, w: METER_SCALE_W, h: fader_h },
-        peak_l_raw,
-        peak_r_raw,
-        MeterBallistic::Peak,
-        style,
-    );
 }
 
 /// strip 下部に確保する Sends セクション band の高さ (px)。 send 行数 +

@@ -10044,6 +10044,30 @@ impl AppData {
         self.pianoroll_notes_generation = self.pianoroll_notes_generation.wrapping_add(1);
     }
 
+    /// 親 group chain のいずれかが `collapsed_groups` に含まれる (= 折り畳まれた
+    /// group の配下で hide される) か。 arrangement widget の `is_visible_track`
+    /// と同じ判定を daw_01 側で行い、 mixer の strip 折り畳み (FIXME #7) が
+    /// arrangement と同じ可視集合を共有する (`collapsed_groups` が SSoT)。
+    /// 32 hop で cycle 安全。
+    pub fn is_hidden_under_collapsed_group(&self, track_id: u32) -> bool {
+        let mut cursor = self
+            .song
+            .track_by_id(track_id)
+            .and_then(|t| t.parent_group_id);
+        let mut hops = 0u8;
+        while let Some(pid) = cursor {
+            if self.collapsed_groups.contains(&pid) {
+                return true;
+            }
+            hops += 1;
+            if hops > 32 {
+                break;
+            }
+            cursor = self.song.track_by_id(pid).and_then(|t| t.parent_group_id);
+        }
+        false
+    }
+
     /// 全 track の全 clip が arrangement canvas に収まるよう zoom_x / scroll_beat /
     /// track_row_h を自動調整する。clip 0 個なら song.length_beats でフォールバック。
     fn fit_arrange_to_content(&mut self) {
@@ -12136,6 +12160,16 @@ impl AppData {
                     event.event_length_beats = max_event_len;
                 }
             }
+        }
+
+        // FIXME #6: overlay clip (image / video / text) は「clip 長 = 表示長」が
+        // 不変条件。 上の Audio 分岐は overlay event を触らないので、 clip を
+        // 伸ばしただけだと event 長が据え置かれ、 clip 範囲内でも event 範囲を
+        // 抜けて途中で消える。 当該 content の単一/末尾 event を新 clip 長まで
+        // extend する (extend-only / idempotent / linked clip 安全、 load 修復の
+        // `ensure_overlay_event_coverage` と同一ロジック)。
+        if let Some(content) = self.song.clip_contents.get_mut(&content_id) {
+            content.ensure_event_covers_clip(new_length_beats);
         }
 
         self.sync_song_to_plugin_host();
