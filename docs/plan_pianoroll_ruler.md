@@ -1,5 +1,13 @@
 # plan_pianoroll_ruler
 
+> **座標系の決定は改訂 (2026-06-08)**: 本 plan の「`start_beat` / notes は
+> **clip-local**、caller が push-back 時に offset 加算」という座標決定は、
+> ruler が clip-local bar (1,2,3…) を表示する = daw_01 FIXME #3 のバグそのもの
+> だった。`docs/plan_pianoroll_song_absolute.md` で **view 全体を song-absolute
+> に統一 (view 入口で `+clip.start_beat`、model 書き戻し出口で `-clip.start_beat`)**
+> に破棄・置換する。本 plan の ruler **操作仕様** (plain click=seek / Shift+drag=loop
+> 等) 自体は引き続き有効。
+
 ピアノロール widget の ruler を arrangement widget と同じ操作セットに
 揃え、 「ピアノロール上での playhead 移動 / loop 範囲設定」 を arrangement と
 同等の UX で提供する。
