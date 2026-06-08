@@ -493,6 +493,34 @@ impl Song {
         self.ensure_ids();
         self.ensure_scale_changes_sorted();
         self.ensure_automation_points_sorted();
+        self.ensure_overlay_event_coverage();
+    }
+
+    /// FIXME #6: overlay clip (image / video / text) は「clip 長 = 表示長」が
+    /// 不変条件。 単一 (または末尾) の event がその clip 長に届かないと、 clip
+    /// 範囲内でも event 範囲を抜けて途中で消える (= clip を伸ばしたが event が
+    /// 追従していない既存 .daw を自動修復する)。
+    ///
+    /// 各 content を、 それを参照する **最長** clip の長さまで届くよう
+    /// extend-only で覆う ([`ClipContent::ensure_event_covers_clip`])。 linked
+    /// clip でより短い clip があっても、 その clip は自分の clip 範囲 gate で
+    /// clamp されるので安全。 idempotent。 Audio / Midi / Automation は no-op。
+    pub fn ensure_overlay_event_coverage(&mut self) {
+        // content ごとに、 それを参照する clip 長の最大値を集める。
+        let mut max_len: HashMap<ContentId, f64> = HashMap::new();
+        for track in &self.tracks {
+            for clip in &track.clips {
+                let e = max_len.entry(clip.content_id).or_insert(0.0);
+                if clip.length_beats > *e {
+                    *e = clip.length_beats;
+                }
+            }
+        }
+        for (cid, len) in max_len {
+            if let Some(content) = self.clip_contents.get_mut(&cid) {
+                content.ensure_event_covers_clip(len);
+            }
+        }
     }
 
     /// Phase 5: find a song-level lane (mutable) by id。 Track の
@@ -1778,6 +1806,34 @@ impl Default for ClipContent {
 }
 
 impl ClipContent {
+    /// FIXME #6: overlay content (image / video / text) の末尾 (`event_start`
+    /// 最大) event を、 その end が `clip_length_beats` に届くよう extend する
+    /// (extend-only)。 単一 event なら clip 全長を覆い「clip 長 = 表示長」を保証。
+    /// 縮めはしない (linked clip / `event > clip` の無害な不整合や多 event の
+    /// 前方タイルは温存)。 Audio / Midi / Automation は時間軸 gate を持たないので
+    /// no-op。
+    pub fn ensure_event_covers_clip(&mut self, clip_length_beats: f64) {
+        macro_rules! extend_last {
+            ($events:expr) => {{
+                if let Some(ev) = $events.iter_mut().max_by(|a, b| {
+                    a.event_start_in_clip_beats
+                        .total_cmp(&b.event_start_in_clip_beats)
+                }) {
+                    let needed = (clip_length_beats - ev.event_start_in_clip_beats).max(0.0);
+                    if ev.event_length_beats < needed {
+                        ev.event_length_beats = needed;
+                    }
+                }
+            }};
+        }
+        match self {
+            ClipContent::Image(c) => extend_last!(c.events),
+            ClipContent::Video(c) => extend_last!(c.events),
+            ClipContent::Text(c) => extend_last!(c.events),
+            _ => {}
+        }
+    }
+
     /// Borrow the notes slice if this is a `Midi` variant. `Audio` /
     /// `Automation` / `Video` variants return `None`. Used by
     /// `Song::clip_notes` and other helpers that previously read
@@ -2963,6 +3019,121 @@ mod tests {
     {
         let json = serde_json::to_string(value).unwrap();
         serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn ensure_image_video_event_coverage_extends_short_event() {
+        // FIXME #6: clip=48 / image event=32 → event を 48 まで extend して
+        // clip 範囲内で途中消失しないようにする (= 既存 .daw の load 修復)。
+        let mut song = Song::default();
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Image(ImageContent {
+                events: vec![ImageEvent {
+                    event_start_in_clip_beats: 0.0,
+                    event_length_beats: 32.0,
+                    ..ImageEvent::default()
+                }],
+            }),
+        );
+        let tid = song.alloc_track_id();
+        let mut track = Track { id: tid, ..Track::default() };
+        let clip_id = track.alloc_clip_id();
+        track.clips.push(Clip {
+            id: clip_id,
+            start_beat: 0.0,
+            length_beats: 48.0,
+            content_id: cid,
+            ..Clip::default()
+        });
+        song.tracks.push(track);
+
+        song.ensure_overlay_event_coverage();
+        let ClipContent::Image(c) = &song.clip_contents[&cid] else {
+            panic!("expected image content");
+        };
+        assert_eq!(c.events[0].event_length_beats, 48.0);
+
+        // idempotent: 2 回目で値は変わらない。
+        song.ensure_overlay_event_coverage();
+        let ClipContent::Image(c) = &song.clip_contents[&cid] else {
+            panic!("expected image content");
+        };
+        assert_eq!(c.events[0].event_length_beats, 48.0);
+    }
+
+    #[test]
+    fn ensure_image_video_event_coverage_extend_only_across_linked_clips() {
+        // 同 content を len 8 と len 48 の 2 clip が共有 → 最長 48 まで extend。
+        // 短い clip は自分の clip 範囲 gate で clamp されるので event は縮めない。
+        let mut song = Song::default();
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Image(ImageContent {
+                events: vec![ImageEvent {
+                    event_start_in_clip_beats: 0.0,
+                    event_length_beats: 4.0,
+                    ..ImageEvent::default()
+                }],
+            }),
+        );
+        let tid = song.alloc_track_id();
+        let mut track = Track { id: tid, ..Track::default() };
+        for (start, len) in [(0.0_f64, 8.0_f64), (16.0, 48.0)] {
+            let clip_id = track.alloc_clip_id();
+            track.clips.push(Clip {
+                id: clip_id,
+                start_beat: start,
+                length_beats: len,
+                content_id: cid,
+                ..Clip::default()
+            });
+        }
+        song.tracks.push(track);
+
+        song.ensure_overlay_event_coverage();
+        let ClipContent::Image(c) = &song.clip_contents[&cid] else {
+            panic!("expected image content");
+        };
+        assert_eq!(c.events[0].event_length_beats, 48.0);
+    }
+
+    #[test]
+    fn ensure_overlay_event_coverage_extends_text_clip() {
+        // FIXME #6 (Text 版): クレジット text clip @0+48 だが event_length=4 →
+        // bar2 (beat4) で event 範囲を抜けて消える。event を 48 まで extend する。
+        let mut song = Song::default();
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Text(TextContent {
+                events: vec![TextEvent {
+                    text: "クレジット".into(),
+                    event_start_in_clip_beats: 0.0,
+                    event_length_beats: 4.0,
+                    ..TextEvent::default()
+                }],
+            }),
+        );
+        let tid = song.alloc_track_id();
+        let mut track = Track { id: tid, ..Track::default() };
+        let clip_id = track.alloc_clip_id();
+        track.clips.push(Clip {
+            id: clip_id,
+            start_beat: 0.0,
+            length_beats: 48.0,
+            content_id: cid,
+            ..Clip::default()
+        });
+        song.tracks.push(track);
+
+        song.ensure_overlay_event_coverage();
+        let ClipContent::Text(c) = &song.clip_contents[&cid] else {
+            panic!("expected text content");
+        };
+        assert_eq!(c.events[0].event_length_beats, 48.0);
     }
 
     #[test]
