@@ -100,13 +100,19 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // が変わらないため、 piano_roll が安定して編集できる)。 scale_changes が
     // 空 / 該当 event 無し / selected_clip None なら view.scale = None で旧
     // 挙動互換 (= 機能 OFF、 既存 .daw file の regression なし)。
-    let scale_beat = app
+    // FIXME #3: piano roll を song-absolute 座標系に統一する。clip.start_beat を
+    // 唯一の絶対オフセット SSoT とし、view 入口で加算 (ruler/grid/playhead/loop が
+    // 曲の絶対小節位置を表示)、note の model 書き戻し出口で減算する (note は共有
+    // content のため clip-local 保持)。playhead/loop は元々 song-global なので
+    // 変換不要 — view を絶対化することで現状のズレ/非表示が同時に治る。
+    let clip_start_beat = app
         .song
         .tracks
         .get(target.track as usize)
         .and_then(|t| t.clips.get(target.clip as usize))
         .map(|c| c.start_beat)
         .unwrap_or(0.0);
+    let scale_beat = clip_start_beat;
     let scale = app.song.scale_at(scale_beat).map(|sc| PianoRollScale {
         root: sc.root,
         in_scale_mask: sc.scale.pitch_class_mask(),
@@ -118,7 +124,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     });
 
     let view = PianoRollView {
-        start_beat: app.pianoroll_scroll_beat as f64,
+        // song-absolute = clip-local scroll + clip 開始位置 (FIXME #3)。
+        start_beat: app.pianoroll_scroll_beat as f64 + clip_start_beat,
         len_beats: (grid_rect.w / zoom_x) as f64,
         pitch_top: app.pianoroll_top_pitch as f32,
         pitch_visible: grid_h / zoom_y,
@@ -150,7 +157,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     app.handle_event(AppEvent::AddNote {
                         track: target.track,
                         clip: target.clip,
-                        start_beat: n.start_beat,
+                        // widget は song-absolute → model は clip-local (FIXME #3)。
+                        start_beat: n.start_beat - clip_start_beat,
                         duration: app.last_note_duration_beats,
                         pitch: n.pitch,
                     });
@@ -164,8 +172,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 })
             }
             PianoRollEditRequest::Move(deltas) => {
-                let entries: Vec<(u32, f64, u8)> =
-                    deltas.iter().map(|d: &MoveDelta| (d.0, d.3, d.4)).collect();
+                // d.3 = next_start_beat は song-absolute → clip-local へ (FIXME #3)。
+                let entries: Vec<(u32, f64, u8)> = deltas
+                    .iter()
+                    .map(|d: &MoveDelta| (d.0, d.3 - clip_start_beat, d.4))
+                    .collect();
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SetNotePositions(entries.clone()));
                 })
@@ -173,16 +184,20 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             // gui_01 #054: Ctrl+drag コピー。Move と同形 payload だが、元 note を
             // 据え置いて複製を new 位置へ置く (CopyNotes handler が deep clone)。
             PianoRollEditRequest::Copy(deltas) => {
-                let entries: Vec<(u32, f64, u8)> =
-                    deltas.iter().map(|d: &MoveDelta| (d.0, d.3, d.4)).collect();
+                // d.3 = next_start_beat は song-absolute → clip-local へ (FIXME #3)。
+                let entries: Vec<(u32, f64, u8)> = deltas
+                    .iter()
+                    .map(|d: &MoveDelta| (d.0, d.3 - clip_start_beat, d.4))
+                    .collect();
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::CopyNotes(entries.clone()));
                 })
             }
             PianoRollEditRequest::Resize(deltas) => {
+                // d.3 = next_start_beat は song-absolute → clip-local。d.4 = len は不変 (FIXME #3)。
                 let entries: Vec<(u32, f64, f64)> = deltas
                     .iter()
-                    .map(|d: &ResizeDelta| (d.0, d.3, d.4))
+                    .map(|d: &ResizeDelta| (d.0, d.3 - clip_start_beat, d.4))
                     .collect();
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::ResizeNotes(entries.clone()));
@@ -280,7 +295,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app.handle_event(AppEvent::AddNote {
                 track: target.track,
                 clip: target.clip,
-                start_beat: snapped_beat,
+                // song-absolute snap → clip-local (FIXME #3)。
+                start_beat: snapped_beat - clip_start_beat,
                 duration: app.last_note_duration_beats,
                 pitch,
             });
@@ -456,7 +472,8 @@ fn build_widget_notes(app: &AppData, target: ClipRef) -> Vec<Note> {
         .enumerate()
         .map(|(i, n)| Note {
             id: i as u32,
-            start_beat: n.start_beat,
+            // song-absolute 化: clip-local note + clip 開始位置 (FIXME #3)。
+            start_beat: n.start_beat + clip.start_beat,
             len_beats: n.duration_beats,
             pitch: n.pitch,
             velocity: n.velocity,
