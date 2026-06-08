@@ -51,18 +51,6 @@
             "timeout": 5
           }
         ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "powershell -ExecutionPolicy Bypass -File F:/dev/daw_01/scripts/release_build_on_commit.ps1",
-            "if": "Bash(git *)",
-            "timeout": 600,
-            "statusMessage": "commit 後の release build を実行中..."
-          }
-        ]
       }
     ],
     "Stop": [

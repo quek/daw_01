@@ -35,6 +35,22 @@ cargo clippy --workspace -- -D warnings
   `cargo build -p <crate>` または `cargo build --workspace`
 - `cargo run -p daw_gui` は dependency crate も自動ビルドしてくれるが、既に起動中のプロセスのバイナリは上書きされない場合がある（Windows の ERROR 5）。必要なら先に全プロセスを終了
 
+### commit したら必ず release build（厳守）
+
+- **全 commit の後に release build (`cargo build --workspace --release`) を必ず通す**。
+  release は debug と別 profile なので、debug-clean でも release で壊れることがある。
+- 自動化は **git-native post-commit hook** で行う（`.githooks/post-commit` →
+  `scripts/release_build_bg.ps1` を detached 起動。`core.hooksPath = .githooks`）。
+  commit の起動手段（Bash/PowerShell ツール・手動・`!` passthrough）に依存せず必ず発火する。
+  ビルドは非ブロッキング、結果は `target/release-build.log`、失敗時は
+  `target/.release-build-failed` marker + ダイアログ。
+- Claude 自身も commit 後に `cargo build --workspace --release` を実行して green を確認する
+  （hook の background build と cargo の target lock で直列化されるので二重ビルドにはならない）。
+  `target/.release-build-failed` があれば別作業に進まず即修正する。
+- 旧 Claude-Code PostToolUse hook（matcher `"Bash"`）は Bash ツール経由 / hook 有効 session の
+  commit にしか発火せず取りこぼしていた（2026-06-08 に FIXME 5 commit で release build が
+  走らず発覚）。git hook へ移行済み。
+
 ### IPC 境界で送る型
 
 - `MainToChild` / `ChildToMain` 等の protocol 型、およびそれが保持する内側の型すべてに
@@ -123,6 +139,12 @@ cargo clippy --workspace -- -D warnings
 - hook を追加したくなったら必ず `settings.json` 側に追加すること。
   `settings.local.json` に hook を書くと、harness の同期次第で worktree に伝わらず
   AHE ループが片肺になる。
+- **例外: release-build-on-commit は git-native hook (`.githooks/post-commit`)**。
+  AHE 系の「観測」hook と違い、これは commit の起動手段すべて（手動・`!`・PowerShell ツール）で
+  発火する必要があるため、Claude-Code の PostToolUse（Bash ツールしか拾えない）ではなく
+  git hook に置く。`core.hooksPath = .githooks` で tracked・worktree 共通。
+- `.claude/settings.json` の編集は harness の auto-mode classifier に self-modification として
+  ブロックされる。settings.json の hook を増減したいときはユーザーに依頼すること。
 
 ## 応答・コミット
 

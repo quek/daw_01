@@ -1,0 +1,32 @@
+#!/bin/sh
+# git-native post-commit hook: commit のたびに release build を必ず走らせる。
+#
+# CLAUDE.md ルール「commit したら必ず release build を行なう」の唯一の保証点。
+# 旧来の Claude-Code PostToolUse hook (matcher "Bash") は Bash ツール経由 /
+# hook 有効 session の commit にしか発火せず、PowerShell ツール・手動 commit・
+# ! passthrough で取りこぼしていた。git hook は commit object 自体に紐づくので
+# 起動手段に依存せず必ず走る (= invocation-agnostic)。
+#
+# 実ビルドは scripts/release_build_bg.ps1 に detached (Start-Process -Hidden) で
+# 投げ、git commit は即座に戻る (非ブロッキング)。結果は target/release-build.log、
+# 失敗時は target/.release-build-failed marker + ダイアログ通知。
+#
+# rebase / merge / cherry-pick / am の最中は build storm を避けるため skip する。
+
+repo="$(git rev-parse --show-toplevel)"
+
+for d in rebase-merge rebase-apply; do
+  p="$(git rev-parse --git-path "$d" 2>/dev/null)"
+  if [ -n "$p" ] && [ -d "$p" ]; then exit 0; fi
+done
+for f in MERGE_HEAD CHERRY_PICK_HEAD; do
+  p="$(git rev-parse --git-path "$f" 2>/dev/null)"
+  if [ -n "$p" ] && [ -f "$p" ]; then exit 0; fi
+done
+
+# Start-Process は即時に戻る -> hidden な独立プロセスで release_build_bg.ps1 が走る。
+powershell -NoProfile -ExecutionPolicy Bypass -Command \
+  "Start-Process -WindowStyle Hidden -FilePath powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','$repo/scripts/release_build_bg.ps1','-Repo','$repo'" \
+  >/dev/null 2>&1
+
+exit 0

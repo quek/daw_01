@@ -1,6 +1,6 @@
 .PHONY: help build run test clippy clean release run-release fmt check
 
-.DEFAULT_GOAL := run
+.DEFAULT_GOAL := run-release
 
 help:
 	@echo "daw_01 makefile targets (cargo ラッパー):"
