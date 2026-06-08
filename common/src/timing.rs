@@ -66,6 +66,31 @@ pub fn playhead_to_beat(song: Option<&Song>, sample_rate: u32, playhead: u64) ->
     Some(playhead as f64 / samples_per_beat)
 }
 
+/// Converts a beat-domain position to `(bar, beat_in_bar)`, both **1-based**,
+/// matching the bar/beat numbering the arrangement / piano-roll ruler uses
+/// (gui_01 `TimeMapping::samples_to_bar_beat`). `beats_per_bar` is derived
+/// from the time signature as `num * 4 / den` (= 4 for 4/4, 6 for 6/8). The
+/// transport readout and the rulers therefore agree on which bar a beat is in.
+pub fn beat_to_bar_beat(beat: f64, time_sig: (u8, u8)) -> (u32, f64) {
+    let beats_per_bar = f64::from(time_sig.0) * 4.0 / f64::from(time_sig.1.max(1));
+    if beats_per_bar <= 0.0 || !beat.is_finite() {
+        return (1, 1.0);
+    }
+    let bar = (beat / beats_per_bar).floor().max(0.0) as u32 + 1;
+    let beat_in_bar = beat - (f64::from(bar) - 1.0) * beats_per_bar + 1.0;
+    (bar, beat_in_bar)
+}
+
+/// Converts a beat-domain position to seconds using the song's constant
+/// tempo. Inverse of the constant-`bpm` mapping `playhead_to_beat` uses, so
+/// the displayed time matches the audio engine's playback position.
+pub fn beat_to_seconds(beat: f64, bpm: f32) -> f64 {
+    if bpm <= 0.0 || !beat.is_finite() {
+        return 0.0;
+    }
+    beat * 60.0 / f64::from(bpm)
+}
+
 /// Returns the sample range the audio engine should treat as the active
 /// playback loop. Prefers the user-defined `Song::loop_*_beat` range when
 /// it is non-empty; otherwise falls back to the full song-content
@@ -224,5 +249,42 @@ mod tests {
         assert_eq!(playhead_to_beat(None, 48000, 0), None);
         let song = song_with_clip(0.0, 0.0, 4.0);
         assert_eq!(playhead_to_beat(Some(&song), 48000, 0), None);
+    }
+
+    #[test]
+    fn beat_to_bar_beat_4_4() {
+        // 4/4: 4 beats per bar, 1-based.
+        assert_eq!(beat_to_bar_beat(0.0, (4, 4)), (1, 1.0));
+        assert_eq!(beat_to_bar_beat(3.0, (4, 4)), (1, 4.0));
+        assert_eq!(beat_to_bar_beat(4.0, (4, 4)), (2, 1.0));
+        // bar 9 starts at beat 32 (8 bars * 4).
+        assert_eq!(beat_to_bar_beat(32.0, (4, 4)), (9, 1.0));
+        let (bar, b) = beat_to_bar_beat(33.5, (4, 4));
+        assert_eq!(bar, 9);
+        assert!((b - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn beat_to_bar_beat_6_8() {
+        // 6/8: beats_per_bar = 6 * 4 / 8 = 3 quarter-note beats per bar.
+        assert_eq!(beat_to_bar_beat(0.0, (6, 8)), (1, 1.0));
+        assert_eq!(beat_to_bar_beat(3.0, (6, 8)), (2, 1.0));
+    }
+
+    #[test]
+    fn beat_to_bar_beat_handles_degenerate() {
+        assert_eq!(beat_to_bar_beat(f64::NAN, (4, 4)), (1, 1.0));
+        assert_eq!(beat_to_bar_beat(5.0, (0, 4)), (1, 1.0));
+    }
+
+    #[test]
+    fn beat_to_seconds_constant_tempo() {
+        // 120 BPM: 1 beat = 0.5 s; matches playhead_to_beat inverse.
+        assert!((beat_to_seconds(0.0, 120.0) - 0.0).abs() < 1e-9);
+        assert!((beat_to_seconds(1.0, 120.0) - 0.5).abs() < 1e-9);
+        assert!((beat_to_seconds(4.0, 120.0) - 2.0).abs() < 1e-9);
+        // 140 BPM: 32 beats → 32 * 60/140 ≈ 13.714 s.
+        assert!((beat_to_seconds(32.0, 140.0) - 13.714285714).abs() < 1e-6);
+        assert_eq!(beat_to_seconds(4.0, 0.0), 0.0);
     }
 }

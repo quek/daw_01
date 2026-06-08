@@ -548,11 +548,25 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 「選択トラックを Ctrl+G でまとめる」フローのみ提供する
     // (空のグループは意味がないため)。
 
-    // Playhead 位置 (text)
-    let playhead = app
-        .playhead_beat
-        .map(|b| format!("\u{25b6} {b:7.2}"))
-        .unwrap_or_else(|| "\u{25a0}   --".to_string());
+    // Playhead 位置 (text)。FIXME #4: 普通の DAW と同じく音楽的位置 (bar.beat.sub)
+    // と絶対時間 (分:秒.ms) を併記する。SSoT は app.playhead_beat 一本で、
+    // bar.beat は time_sig、time は bpm から導出 (両表示が同じ source、かつ
+    // bar 番号はアレンジ / piano-roll ルーラと一致する)。
+    let playhead = match app.playhead_beat {
+        Some(b) => {
+            let beat = f64::from(b);
+            let (bar, beat_in_bar) = common::timing::beat_to_bar_beat(beat, app.song.time_sig);
+            let beat_int = beat_in_bar.floor().max(1.0) as u32;
+            let sub = ((beat_in_bar - f64::from(beat_int)) * 100.0).floor().clamp(0.0, 99.0) as u32;
+            let secs = common::timing::beat_to_seconds(beat, app.song.bpm);
+            let mins = (secs / 60.0).floor() as u64;
+            let rem = secs - (mins as f64) * 60.0;
+            let whole_s = rem.floor() as u64;
+            let ms = ((rem - whole_s as f64) * 1000.0).floor().clamp(0.0, 999.0) as u64;
+            format!("\u{25b6} {bar}.{beat_int}.{sub:02}  |  {mins:02}:{whole_s:02}.{ms:03}")
+        }
+        None => "\u{25a0}  --.-.--  |  --:--.---".to_string(),
+    };
     ui.label_at(
         "transport_playhead",
         &playhead,
