@@ -3486,3 +3486,37 @@ daw_01 **無修正**で landing 反映。`cargo build --workspace` / `cargo clip
 view-state edit) も `arrangement_view.rs:1450` で確認済。実機の最終確認は #16-#23 全体とまとめて
 daw_01 側で実施します。**[Resolved]**
 
+---
+
+### daw_01 → [要望 / 重大バグ] menu_bar の cascade item click 後に cascade sub-popup が閉じず孤立する
+
+関連仕様: `docs/plan_menu_cascade_close.md`
+
+**症状:** File メニューの「Open Recent / Recently Saved」(sub_menu cascade) から項目を選んで
+プロジェクトを開くと、 その後 **アレンジ上部 ~1/3 のトラックを double-click で rename できなく
+なる** (最上段に限らずスクロールで上部に来たトラック全部、 実機 `20260512.daw` で確認)。
+
+**真因 (daw_01 トレースで確定):** cascade item click 時、 **top-level menu popup は閉じるが
+cascade sub-popup が閉じず `open_popups` に modal popup として孤立**。見えないが modal なので
+anchor `(0,72,360,192)` (画面左上、 inspector + アレンジ上部に重畳) 内の全入力を遮断し、
+`take_double_click_in_rect` が `pointer_blocked_by_modal_popup()` で早期 return → rename 不発。
+Esc / 外 click でも消えない (孤立して dismiss 経路が走らないため)。
+
+`crates/ui/src/widgets/menu.rs` (≒ 576-581):
+```rust
+if let Some(action) = clicked_action {
+    action(self);
+    self.close_popup(id);   // ← top menu `id` のみ close。cascade sub-popup
+                            //    (`{id_path}/{i}` 例 "menu_bar/File/2") が orphaned に。
+}
+```
+cascade item の action は `draw_menu_entries` の `return_action = sub_action` (≒405-407) で伝播
+してくるが、 hover で `open_popup(&sub_id, ...)` (≒386) された cascade は close されない。
+
+**依頼:** cascade item の action 発火時、 top menu popup に加え **開いている cascade sub-popup を
+すべて close** する (`{id_path}/{i}`、 ネストは再帰的に)。「action 発火 = menu_bar 全 popup close」
+でも可。通常 top-level item の close 挙動は不変で。
+
+**daw_01 側:** cascade popup は menu_bar 内部 id 管理なので daw_01 から close 不可 = 回避策なし、
+gui_01 fix 待ち。当面の手動回避はトラックヘッダを広げて名前右側 (anchor 外) を double-click。
+
