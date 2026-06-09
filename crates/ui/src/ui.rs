@@ -986,6 +986,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         self.open_popups.contains_key(&wid)
     }
 
+    /// open な popup が 1 つでもあるか (O(1)、 無 alloc)。 menu_bar の cascade orphan cleanup
+    /// (M14 Phase 120、 daw_01 #095) を popup が皆無の idle frame で早期 skip して、 closed menu
+    /// 毎フレームの id_path `format!` を avoid するために使う。 cascade が orphan するのは必ず
+    /// `open_popups` 非空 (= orphan 自身が居る) の状態なので、 空なら cleanup は確実に no-op。
+    pub(crate) fn has_open_popups(&self) -> bool {
+        !self.open_popups.is_empty()
+    }
+
     /// `id` で開いている popup の anchor (= popup の内容領域) を返す。
     /// closure 内で popup_rect を再計算する代わりに使える (例: context_menu の動的位置を
     /// open_popup 時の pointer 位置に固定したい場合)。

@@ -585,16 +585,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 ..GlyphArea::default()
             });
 
-            // この top-level の cascade sub-popup id prefix (`draw_menu_entries` と共有する規約)。
-            let id_path = format!("menu_bar/{label}");
-
             if !is_open {
                 // M14 Phase 120 (daw_01 #095): top-level が (action click / outside-click / toggle /
                 // 隣 menu 切替 の) いずれかの経路で閉じている frame は、 hover open された cascade
                 // sub-popup を道連れに閉じる。 さもなくば cascade が orphan して anchor 内入力を遮断し
                 // 続ける (Esc / 外 click でも dismiss 経路が走らず居残るのを ≤1 frame で回収する safety
-                // net)。 閉じている menu には cascade が無いのが大半で close_popup は no-op。
-                close_orphaned_cascades(self, &entries, &id_path);
+                // net)。 popup が皆無の idle frame は cascade も存在し得ないので `has_open_popups()` で
+                // 早期 skip し、 closed menu 毎フレームの id_path `format!` alloc を avoid する (orphan は
+                // 必ず open_popups 非空なので拾い損ねない)。
+                if self.has_open_popups() {
+                    close_orphaned_cascades(self, &entries, &format!("menu_bar/{label}"));
+                }
                 continue;
             }
 
@@ -602,7 +603,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // stale にならない)。
             self.update_popup_anchor(id, anchors[i]);
 
-            // popup 描画 (popup_layer 経由、sub-menu cascade を draw_menu_entries 内で再帰処理)
+            // popup 描画 (popup_layer 経由、sub-menu cascade を draw_menu_entries 内で再帰処理)。
+            // id_path は cascade sub-popup id prefix の規約 `{id_path}/{i}` を draw_menu_entries と共有。
+            let id_path = format!("menu_bar/{label}");
             let mut entries = entries;
             let mut clicked_action: Option<MenuItemAction<'a, M>> = None;
             self.popup_layer(id, |ui| {
