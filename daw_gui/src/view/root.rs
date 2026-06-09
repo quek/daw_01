@@ -406,16 +406,15 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     }
     if ui.take_shortcut("delete") {
         // 優先順:
-        //   1. Audio Editor 開いてて event 選択中 → DeleteAudioEvent
+        //   1. Audio Editor 開いてて event 選択中 → DeleteAudioEditorSelection
         //   2. automation point 選択あり → DeleteAutomationPoints (Phase 3)
         //   3. notes 選択あり → DeleteSelectedNotes
         //   4. automation clip 選択あり → DeleteAutomationClips (Phase 3)
         //   5. それ以外 → DeleteSelectedClip
         // 同 frame 内で重複 dispatch しないよう排他にする (= ノート
         // 選択中に Delete 押して clip も消える事故を防ぐ)。
-        let audio_event_target = app
-            .audio_editor_clip
-            .zip(app.audio_editor_selected_event);
+        let audio_event_selected =
+            app.audio_editor_clip.is_some() && !app.audio_editor_selected_events.is_empty();
         let has_notes = !app.selected_notes.is_empty();
         let auto_points = if app.selected_automation_points.is_empty() {
             None
@@ -428,8 +427,8 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             Some(app.selected_automation_clips.clone())
         };
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            if let Some((clip, event_idx)) = audio_event_target {
-                app.handle_event(AppEvent::DeleteAudioEvent { clip, event_idx });
+            if audio_event_selected {
+                app.handle_event(AppEvent::DeleteAudioEditorSelection);
             } else if let Some(points) = auto_points {
                 app.handle_event(AppEvent::DeleteAutomationPoints { points });
             } else if has_notes {
@@ -499,6 +498,53 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }));
     }
 
+    // ----- Ctrl+A: 文脈別全選択 (grill-me 2026-06-09) -----
+    // マウス位置で対象を判定する (選択前なので Delete の「非空セット」判定は
+    // 使えず pointer 位置で振り分け)。 下部パネル + audio editor 開: 全 event、
+    // 下部パネル + piano roll: 全ノート、 それ以外 (アレンジ): 全クリップ。
+    // (automation lane 上の「全ポイント → 全クリップ」段階拡大は後続で追加。)
+    if ui.take_shortcut("select_all") {
+        if is_pianoroll_active && app.audio_editor_clip.is_some() {
+            let indices = app.all_audio_event_indices();
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetAudioEditorEventSelection(indices.clone()));
+            }));
+        } else if is_pianoroll_active {
+            let ids = app.all_note_ids_in_selected_clip();
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetNoteSelection(ids.clone()));
+            }));
+        } else if let Some(lane) = app.arrange_hovered_automation_lane {
+            // automation lane 上: 段階拡大。 1 回目 = lane の全ポイント、
+            // 既に全ポイント選択済 (or ポイント無し) なら 2 回目 = 全クリップ。
+            let next = app.all_automation_points_in_lane(lane);
+            let already_all = !next.is_empty()
+                && app.selected_automation_points.len() == next.len()
+                && {
+                    let cur: std::collections::HashSet<_> =
+                        app.selected_automation_points.iter().collect();
+                    next.iter().all(|p| cur.contains(p))
+                };
+            if next.is_empty() || already_all {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::SelectAllClips);
+                }));
+            } else {
+                let prev = app.selected_automation_points.clone();
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SelectAutomationPoints {
+                        prev: prev.clone(),
+                        next: next.clone(),
+                    });
+                }));
+            }
+        } else {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::SelectAllClips);
+            }));
+        }
+    }
+
     // ----- Clip duplicate (gui_01 #019) -----
     // D / Alt+D で選択中 clip の末尾直後に共有/独立コピーを生成。
     // 連打すると前回コピーが新たな選択になり、 後ろに連続して並ぶ
@@ -513,7 +559,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
                 app.handle_event(AppEvent::DuplicateSelectedNotes);
             }));
         } else {
-            let midi_sources: Vec<crate::app::ClipRef> = app.selected_clips.clone();
+            let midi_sources: Vec<crate::app::ClipRef> = app.selected_clip_refs();
             let automation_sources: Vec<common::model::AutomationClipKey> =
                 app.selected_automation_clips.clone();
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -527,7 +573,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }
     }
     if ui.take_shortcut("daw.duplicate_clip_unique") {
-        let midi_sources: Vec<crate::app::ClipRef> = app.selected_clips.clone();
+        let midi_sources: Vec<crate::app::ClipRef> = app.selected_clip_refs();
         let automation_sources: Vec<common::model::AutomationClipKey> =
             app.selected_automation_clips.clone();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -546,7 +592,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // 選択 clip が無ければ no-op。 text_input focus 中は gui_01 が shortcut を
     // 抑制するので rename 編集中の F2 は発火しない。
     if ui.take_shortcut("daw.rename_clip")
-        && let Some(target) = app.selected_clip
+        && let Some(target) = app.selected_clip_ref()
     {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::BeginRenameClip(target));
@@ -559,7 +605,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // 無ければ no-op。 text_input focus 中は gui_01 が shortcut を抑制する
     // ので rename 編集中の Shift+L は発火しない。
     if ui.take_shortcut("daw.select_linked_clips")
-        && let Some(target) = app.selected_clip
+        && let Some(target) = app.selected_clip_ref()
     {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::SelectLinkedClips(target));
@@ -646,6 +692,22 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         } else if app.audio_editor_clip.is_some() {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::CloseAudioEditor)
+            }));
+        } else if !app.selected_clips.is_empty()
+            || app.selected_clip.is_some()
+            || !app.selected_notes.is_empty()
+            || !app.selected_automation_points.is_empty()
+            || !app.selected_automation_clips.is_empty()
+        {
+            // Escape で選択解除 (clip / note / automation point / clip)。
+            // 死蔵だった ClearSelection / ClearNoteSelection を生かす。
+            // audio editor は上の分岐で先に閉じるので、 ここに来る時点で
+            // audio event 選択は対象外 (close 時に clear 済)。
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::ClearSelection);
+                app.handle_event(AppEvent::ClearNoteSelection);
+                app.selected_automation_points.clear();
+                app.selected_automation_clips.clear();
             }));
         } else {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {

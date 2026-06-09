@@ -46,7 +46,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     };
     draw_snap_toolbar(app, ui, toolbar_rect);
 
-    let Some(target) = app.selected_clip else {
+    let Some(target) = app.selected_clip_ref() else {
         // クリップ未選択時のプレースホルダ
         ui.panel("pr_bg_empty", body, COLOR_BG, 0.0);
         ui.label_at(

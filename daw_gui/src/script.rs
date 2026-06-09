@@ -758,8 +758,11 @@ fn daw_set_selection(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> Js
     let refs: Vec<ClipRef> = serde_json::from_str(&json)
         .map_err(|e| js_native(format!("setSelection: parse: {e}")))?;
     with_host(|host| {
-        host.app.selected_clip = refs.last().copied();
-        host.app.selected_clips = refs;
+        // ClipRef (index) → stable ClipKey に変換して格納。
+        let keys: Vec<common::model::ClipKey> =
+            refs.iter().filter_map(|r| host.app.clip_key_of(*r)).collect();
+        host.app.selected_clip = keys.last().copied();
+        host.app.selected_clips = keys;
     });
     Ok(JsValue::undefined())
 }

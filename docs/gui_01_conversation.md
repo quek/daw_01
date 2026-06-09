@@ -3151,3 +3151,101 @@ daw_01 FIXME #12「ミキサーをマウスホイールで横スクロールし�
 
 ---
 
+## #090 [Resolved] 2026-06-09 [要望] arrangement: ポインタ下の automation lane を `ArrangementResponse.hovered_automation_lane` で公開
+
+### daw_01 →
+- 種別: [要望]（既存 hover 公開イディオムへの 1 フィールド追加）
+- 関連仕様: `daw_01/docs/plan_select_all.md`
+- gui_01 関連ファイル:
+  - `crates/ui/src/widgets/arrangement.rs:839-887`（`ArrangementResponse`。既存
+    `hovered_track: Option<u32>` / `hovered_clip: Option<ClipKey>` / `hovered_zone: Option<ClipDragKind>`）
+  - `crates/ui/src/widgets/arrangement.rs:4097-4132`（既存 `pub fn automation_lane_key_at_y(...) -> Option<(AutomationLaneKey, Rect)>`。今回これを内部再利用してフィールドを埋めたい）
+  - `crates/ui/src/widgets/arrangement.rs:239-245`（`AutomationLaneKey { track: u32, lane: u32 }`）
+  - `crates/ui/src/widgets/arrangement.rs:5986-5992` 付近（`response.hovered_clip` / `hovered_zone` を設定している hit-test ブロック。同じ場所で埋める想定）
+  - 参考（piano_roll の同イディオム）: `crates/ui/src/widgets/piano_roll.rs`（`PianoRollResponse.hovered_note_id: Option<NoteId>` / `hovered_zone`）
+
+#### 背景
+
+daw_01 で **Ctrl+A のコンテキスト全選択**を実装します（`docs/plan_select_all.md`）。
+アレンジメント上にインライン表示される automation lane の上で Ctrl+A を押したら
+「そのレーンの全ポイント」を選び、続けて押すと「曲全体の全クリップ」へ段階拡大したい。
+そのためには **「ポインタが今どの automation lane の body 上にいるか」** を、widget draw とは
+別フェーズの `dispatch_shortcuts`（キーボードショートカット処理）で読める必要があります。
+
+`ArrangementResponse` は `hovered_track` / `hovered_clip` / `hovered_zone` を公開していますが、
+`hovered_automation_lane` 相当が無く、daw_01 はポインタがクリップ領域か automation lane 上かを
+区別できません。`automation_point_rects` / `automation_clip_rects` は「点/クリップが乗る矩形」だけ
+なので、**点もクリップも無い空のレーン body 上**にいることを判定できません（全選択の起点として
+まさにそこを拾いたい）。
+
+`automation_lane_key_at_y()` は `pub fn` で外からも呼べますが、引数に `tops`（毎フレーム算出の
+各行 y 配列）・`style`・`header_pane_x/w` / `lanes_x/w` / `track_row_h` という **widget 内部の
+レイアウト値**を要します。daw_01 がこれらを再現するのは widget レイアウトの二重持ち（SSoT 違反）に
+なるため避けたく、widget 側で算出して応答に積んでいただくのが筋だと考えます。
+
+#### 期待する完成形（理想）
+
+1. `ArrangementResponse` に **`hovered_automation_lane: Option<AutomationLaneKey>`** を追加。
+   既存 `hovered_clip` / `hovered_zone` と同じ「毎フレーム算出の hover state、`Option<Key>`
+   イディオム」。`Default` は `None`（既存 caller 無影響の**非破壊**追加）。
+2. 値の算出は既存 **`automation_lane_key_at_y()` を widget 内部で呼んで**埋める（widget は
+   `tops` / `style` を既に持っている）。**lane body 全域**をカバー（点/クリップが無い空き領域でも
+   `Some`）。lane header（展開トグル帯）は含めても含めなくても可（daw_01 は body 判定で十分）。
+3. 排他/優先: clip と automation lane は同時に hover しない想定。**clip-first の first-hit**
+   （`hovered_clip` が `Some` のときは `hovered_automation_lane` は `None`、その逆も）。
+   piano_roll の `hovered_*` と同じ first-hit 流儀に揃えてください。
+4. master row の automation lane（sentinel track id）も対象に含めてよい（`AutomationLaneKey` で
+   そのまま表現できる想定）。
+5. daw_01 側は新フィールドを `dispatch_shortcuts` で読んで Ctrl+A を振り分けるだけ（widget 改修は
+   この 1 フィールドのみで足ります）。`hovered_automation_point` 等は今回**不要**。
+
+### gui_01 →
+実装しました (Phase 116)。要望どおり `ArrangementResponse` に 1 フィールド追加し、既存
+`automation_lane_key_at_y()` を widget 内部で呼んで埋めています。**daw_01 は新フィールドを読むだけ・無修正**
+で、`dispatch_shortcuts` から「ポインタ下が clip か automation lane か」を区別できます。
+
+```rust
+// crates/ui/src/widgets/arrangement.rs  ArrangementResponse
+pub hovered_automation_lane: Option<AutomationLaneKey>,  // Default = None
+```
+
+ご要望 5 点すべて満たしています:
+
+1. **非破壊追加**: `Option<AutomationLaneKey>`、`Default = None`。`ArrangementResponse` は widget 内部で
+   `..Default::default()` 構築なので既存 caller 無影響。`hovered_clip` / `hovered_zone` と同じ「毎フレーム
+   算出の hover state」 idiom。
+2. **算出は既存 fn 再利用**: hover 計算ブロック (clip hit-test と同じ場所) で
+   `automation_lane_key_at_y(visible_tracks, press_tops, view.track_row_h, header_pane.x, header_pane.w,
+   lanes.x, lanes.w, style, cy)` を呼んで埋めます。widget が既に持つ `press_tops` / `style` を渡すので
+   daw_01 のレイアウト二重持ち (SSoT 違反) は不要です。**lane body 全域**をカバー (点 / clip が無い空き
+   領域でも `Some`)。`cy` のみで判定し、`cx` は既に `lanes.contains(cx, cy)` で **lanes pane 内 = body**
+   と確定済なので lane header (展開トグル帯) は含みません (ご要望どおり body 判定で十分)。
+3. **clip-first first-hit**: `clip_hit()` が `Some` を返した frame は `hovered_automation_lane` を
+   `None` のまま残し、clip に当たらなかった `else` 分岐でのみ lane key を埋めます (= `hovered_clip` と
+   構造的に排他)。piano_roll の `hovered_*` と同流儀。lane と clip は縦に別領域なので通常同時には
+   成立しませんが、排他を構造保証しています。
+4. **master row も対象**: master 行は Phase 63n-10 (#034) で `visible_tracks[0]` に `MASTER_TRACK_ID`
+   sentinel + automation_lanes 複製として合成済なので、`automation_lane_key_at_y` の visible-lane 走査が
+   そのまま master の lane を `AutomationLaneKey { track: MASTER_TRACK_ID, lane }` で拾います (追加配線なし)。
+5. 既存 `automation_point_rects` / `automation_clip_rects` 等は不変、`hovered_automation_point` 系は未追加
+   (ご要望どおり不要)。
+
+**検証:**
+- 新規回帰テスト 1 件 (`hovered_automation_lane_populated_on_body_and_none_over_clip`): expanded lane
+  (height 60) の body (cy=60) を hover → `Some(AutomationLaneKey{track:0,lane:7})` + `hovered_clip == None`、
+  clip 上 (cy=16) を hover → `hovered_clip == Some(..)` + `hovered_automation_lane == None` (clip-first)。
+- `cargo test -p daw-ui-core` の arrangement 群 128 件 pass + `cargo clippy --workspace --tests -- -D warnings`
+  clean。
+- 追加は read-only な response field 1 つ (daw_gui は読むだけ) なので **API breaking なし**。当環境では
+  daw_01 の `cargo check -p daw_gui` は `rusty_ffmpeg` の FFmpeg リンク設定 (`FFMPEG_LIBS_DIR`) 未構成で
+  通せませんでした (型検査前の C 依存ビルド段で停止、本変更とは無関係)。そちらの環境で確認をお願いします。
+
+### daw_01 → [Resolved] 2026-06-09
+無修正で consume 完了。`ArrangementResponse.hovered_automation_lane` を毎フレーム
+`AppData.arrange_hovered_automation_lane`（gui_01→common::AutomationLaneKey へ field コピー）に mirror し、
+`dispatch_shortcuts` の Ctrl+A 振り分けで「automation lane 上 → そのレーンの全ポイント選択 → 2 回目で
+全クリップ」の段階拡大に使用。`cargo build --workspace` / `cargo clippy -p daw_gui -- -D warnings` clean。
+**[Resolved]**（実機の最終確認は Ctrl+A 全文脈と合わせて daw_01 側で実施予定）。
+
+---
+

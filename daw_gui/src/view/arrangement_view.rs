@@ -160,7 +160,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let is_shared = |cid: common::model::ContentId| {
                 refcount_by_content.get(&cid).copied().unwrap_or(0) >= 2
             };
-            for r in &app.selected_clips {
+            for r in app.selected_clip_refs() {
                 if let Some(c) = app
                     .song
                     .tracks
@@ -347,15 +347,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         })
         .collect();
 
-    // selected_clips: ClipRef (index ベース) → ClipKey (id ベース) 変換。
-    // 範囲外の参照は filter_map で取り除く。
+    // selected_clips は既に stable ClipKey (track_id + clip_id)。 widget 層の
+    // gui_01 ClipKey (track + clip) へ field コピーするだけ。 存在しない clip の
+    // key が残っていても widget は描画 clip と一致しないだけで無害。
     let selected_clips: Vec<ClipKey> = app
         .selected_clips
         .iter()
-        .filter_map(|r| {
-            let t = app.song.tracks.get(r.track as usize)?;
-            let c = t.clips.get(r.clip as usize)?;
-            Some(ClipKey { track: t.id, clip: c.id })
+        .map(|k| ClipKey {
+            track: k.track_id,
+            clip: k.clip_id,
         })
         .collect();
 
@@ -526,6 +526,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     if hover_content != app.arrange_hover_content {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.arrange_hover_content = hover_content;
+        }));
+    }
+
+    // gui_01 #090: ポインタ下の automation lane を次フレームの Ctrl+A 振り分け
+    // 用に mirror (= hover_content と同 idiom、 変化時のみ Edit)。 gui_01 の
+    // AutomationLaneKey を common の同型へ field コピー。
+    let hover_lane = resp
+        .hovered_automation_lane
+        .map(|k| common::model::AutomationLaneKey { track: k.track, lane: k.lane });
+    if hover_lane != app.arrange_hovered_automation_lane {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.arrange_hovered_automation_lane = hover_lane;
         }));
     }
 

@@ -1072,7 +1072,7 @@ impl Runner {
                 if pressed {
                     if let Some(cursor) = state.preview_cursor
                         && let Some(overlay) = preview.selection_overlay
-                        && let Some(target) = state.app.selected_clip
+                        && let Some(target) = state.app.selected_clip_ref()
                     {
                         let size = preview.renderer.size();
                         let screen = (size.width as f32, size.height as f32);
@@ -1547,7 +1547,7 @@ impl Runner {
         // overlay 縁取り + handle を出す。 image / text を順に try。
         let overlay_info = state
             .app
-            .selected_clip
+            .selected_clip_ref()
             .and_then(|cref| {
                 let track = state.app.song.tracks.get(cref.track as usize)?;
                 let clip = track.clips.get(cref.clip as usize)?;
@@ -1572,7 +1572,7 @@ impl Runner {
         // group 合成パス（`set_text_layers` 別経路）に乗らないので写像しない。
         // 判定条件（owning track の parent_group_id ∈ active_groups）は子を
         // group へ bucket する partition（上の image_frames ループ）と同一。
-        let selection_group = state.app.selected_clip.and_then(|cref| {
+        let selection_group = state.app.selected_clip_ref().and_then(|cref| {
             let track = state.app.song.tracks.get(cref.track as usize)?;
             let clip = track.clips.get(cref.clip as usize)?;
             let content = state.app.song.clip_contents.get(&clip.content_id)?;

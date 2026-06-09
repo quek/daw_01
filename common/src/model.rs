@@ -2967,6 +2967,21 @@ pub struct AutomationClip {
 // より、 hit-test と Edit/Undo 構築の両側で型違反を compile error で検出
 // できる利点がある。
 
+/// Address of a regular (MIDI / Audio / Video / Image / Text) clip inside the
+/// song: owning `Track::id` + `Clip::id`. Index 非依存なので track 並べ替え /
+/// undo を跨いでも同じ clip を指す (= 選択 SSoT 用)。 フィールド名を
+/// `track_id` / `clip_id` にしてあるのは、 index ベースの
+/// `ClipRef { track, clip }` (daw_gui) と取り違えた誤用 (`key.track as usize`
+/// で index 化する事故) を compile error で弾くため。 gui_01::ClipKey
+/// (widget 層、 serde/bincode 無し) とは別物。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode,
+)]
+pub struct ClipKey {
+    pub track_id: u32,
+    pub clip_id: u32,
+}
+
 /// Address of an `AutomationLane` inside the song.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode,

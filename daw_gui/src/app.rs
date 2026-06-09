@@ -901,14 +901,23 @@ pub struct AppData {
     /// `LoadSong` で daw_audio に渡って `compile_schedule` の PDC 補償に
     /// 反映される (chain 内の plugin が直列に latency を加算する Ardour 流)。
     pub plugin_latencies: std::collections::HashMap<u32, u32>,
-    pub selected_clip: Option<ClipRef>,
-    pub selected_clips: Vec<ClipRef>,
+    /// 選択 anchor (= 末尾)。 stable `ClipKey` (track_id + clip_id) 保持で
+    /// 並べ替え / undo を跨いでも壊れない。 index 解決は `selected_clip_ref()`。
+    pub selected_clip: Option<common::model::ClipKey>,
+    /// 選択集合。 stable `ClipKey` 保持。 index 解決は `selected_clip_refs()`。
+    pub selected_clips: Vec<common::model::ClipKey>,
     pub selected_notes: Vec<u32>,
     /// gui_01 #068: 前フレームに arrangement でホバーされた clip の
     /// `content_id` (= 連動ハイライトの active group 計算に使う held-value)。
     /// widget の `ArrangementResponse.hovered_clip` を毎フレーム解決して
     /// 保持する。 session-only。
     pub arrange_hover_content: Option<common::model::ContentId>,
+    /// gui_01 #090: ポインタが今乗っている automation lane の key
+    /// (`ArrangementResponse.hovered_automation_lane` を毎フレーム mirror)。
+    /// Ctrl+A の「lane の全ポイント選択 → 全クリップへ段階拡大」振り分けに
+    /// 使う。 `None` = clip 領域 / lane 外。 1 フレーム遅延だが pointer は
+    /// 瞬間移動しないので実用上問題なし (= `arrange_hover_content` と同 idiom)。
+    pub arrange_hovered_automation_lane: Option<common::model::AutomationLaneKey>,
     /// 鍵盤レーン click のプレビュー発音中の `(track_id, pitch)` (gui_01 #055,
     /// `docs/plan_pianoroll_keyboard_preview.md`)。 widget の
     /// `PianoRollResponse::keyboard_active_pitch` を前フレーム値と差分して
@@ -927,13 +936,14 @@ pub struct AppData {
     /// 表示される。 audio clip ダブルクリックで `Some` 化、 Esc / Audio
     /// Editor close で `None` に戻る。
     pub audio_editor_clip: Option<ClipRef>,
-    /// Audio Editor で選択中の event index (`audio_editor_clip` の clip
-    /// 内 events Vec への index)。 PR-D 段階 1 で導入: multi-event clip
-    /// で個別 event を選択 → Duplicate / Delete / Inspector 編集の
-    /// target にする。 `None` で「未選択」 (= clip 自体は開いてる)、
-    /// `Some(0)` がデフォルト (= first event)。 audio_editor_clip が None
-    /// になったら自動的に None (= editor 閉じたら selection も消える)。
-    pub audio_editor_selected_event: Option<usize>,
+    /// Audio Editor で選択中の event index 群 (`audio_editor_clip` の clip
+    /// 内 events Vec への index)。 複数選択対応: click = 単一、 Shift+click =
+    /// トグル、 空き領域 drag = 矩形選択、 Ctrl+A = 全選択。 空 Vec で
+    /// 「未選択」。 anchor (= Inspector / footer / nav の代表) は last()
+    /// (= `audio_editor_anchor_event`)。 編集 (gain/pan/fade 等) は選択集合
+    /// 全体に broadcast (`audio_event_target_indices`)。 close で clear、
+    /// undo でも clear (index は容易にずれるため、 ノート選択と同方針)。
+    pub audio_editor_selected_events: Vec<usize>,
     /// Audio Editor 内のマウス hover 位置を clip 内 beat (clip 始端 = 0)
     /// に変換した値。 audio_editor.rs が毎フレーム push、 マウスが
     /// waveform 領域外なら `None`。 E キー (split) と将来の波形クリック
@@ -1401,9 +1411,10 @@ impl AppData {
             selected_clips: Vec::new(),
             selected_notes: Vec::new(),
             arrange_hover_content: None,
+            arrange_hovered_automation_lane: None,
             bottom_panel: 0,
             audio_editor_clip: None,
-            audio_editor_selected_event: None,
+            audio_editor_selected_events: Vec::new(),
             audio_editor_hover_beat_in_clip: None,
             audio_editor_view_start_beat: 0.0,
             audio_editor_view_len_beats: 0.0,
@@ -1859,7 +1870,7 @@ impl AppData {
     /// は全 event に同じ値を broadcast するので、 multi-event clip でも
     /// view は first event を「代表値」 として見せれば編集後に整合が取れる。
     pub fn inspector_audio_event_summary(&self) -> Option<InspectorAudioEventSummary> {
-        let cref = self.selected_clip?;
+        let cref = self.selected_clip_ref()?;
         let track = self.song.tracks.get(cref.track as usize)?;
         let clip = track.clips.get(cref.clip as usize)?;
         let common::model::ClipContent::Audio(audio) =
@@ -1873,7 +1884,7 @@ impl AppData {
         // 閉じている / 別 clip を開いている / 選択中 event idx が範囲外
         // なら first event (= Phase 2 PR1-3 と同じ既存挙動)。
         let event_idx = if self.audio_editor_clip == Some(cref) {
-            self.audio_editor_selected_event.unwrap_or(0)
+            self.audio_editor_anchor_event().unwrap_or(0)
         } else {
             0
         };
@@ -1913,10 +1924,16 @@ impl AppData {
         if n == 0 {
             return None;
         }
-        let cur = self.audio_editor_selected_event.unwrap_or(0).min(n - 1);
+        let cur = self.audio_editor_anchor_event().unwrap_or(0).min(n - 1);
         let n_i = n as i32;
         let next = (cur as i32).wrapping_add(delta).rem_euclid(n_i);
         Some(next as usize)
+    }
+
+    /// Audio Editor の選択 anchor (= Inspector / footer / nav の代表 event
+    /// index)。 選択集合の last (= 最後に選択した event)。 空なら None。
+    pub fn audio_editor_anchor_event(&self) -> Option<usize> {
+        self.audio_editor_selected_events.last().copied()
     }
 
     /// `selected_clip` が `ClipContent::Image` の clip を指していて、
@@ -1929,7 +1946,7 @@ impl AppData {
     /// 文字列) 側に持つので summary には含めない (= dropdown / toggle
     /// のみ snapshot に乗せる)。
     pub fn inspector_image_event_summary(&self) -> Option<InspectorImageEventSummary> {
-        let cref = self.selected_clip?;
+        let cref = self.selected_clip_ref()?;
         let track = self.song.tracks.get(cref.track as usize)?;
         let clip = track.clips.get(cref.clip as usize)?;
         let common::model::ClipContent::Image(image) =
@@ -1973,18 +1990,23 @@ impl AppData {
     /// 既存挙動、 1 clip 1 event 前提なので broadcast = first event 編集)。
     /// 引数 `n_events` は当該 ClipContent::Audio の events 長 (= 呼び出し
     /// 前に immutable get で取得)。
-    fn audio_event_target_indices(
-        &self,
-        target: ClipRef,
-        n_events: usize,
-    ) -> std::ops::Range<usize> {
+    fn audio_event_target_indices(&self, target: ClipRef, n_events: usize) -> Vec<usize> {
         if self.audio_editor_clip == Some(target)
-            && let Some(idx) = self.audio_editor_selected_event
-            && idx < n_events
+            && !self.audio_editor_selected_events.is_empty()
         {
-            idx..(idx + 1)
+            let mut v: Vec<usize> = self
+                .audio_editor_selected_events
+                .iter()
+                .copied()
+                .filter(|&i| i < n_events)
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            // 選択はあるが全て範囲外 (stale) なら全 event に broadcast
+            // (= 旧 `idx < n_events` else 全件 の挙動を踏襲)。
+            if v.is_empty() { (0..n_events).collect() } else { v }
         } else {
-            0..n_events
+            (0..n_events).collect()
         }
     }
 
@@ -2011,15 +2033,17 @@ impl AppData {
             Some(common::model::ClipContent::Audio(a)) => a.events.len(),
             _ => return false,
         };
-        let range = self.audio_event_target_indices(target, n_events);
-        if range.is_empty() {
+        let indices = self.audio_event_target_indices(target, n_events);
+        if indices.is_empty() {
             return false;
         }
         if let Some(common::model::ClipContent::Audio(audio)) =
             self.song.clip_contents.get_mut(&content_id)
         {
-            for event in &mut audio.events[range] {
-                f(event);
+            for &i in &indices {
+                if let Some(event) = audio.events.get_mut(i) {
+                    f(event);
+                }
             }
             self.sync_song_to_plugin_host();
             true
@@ -2194,25 +2218,20 @@ impl AppData {
     fn after_undo_redo(&mut self) {
         // selected_clip が undo 後も存在するなら維持、消えていれば None。
         // (常に None にすると undo のたびにピアノロールがプレースホルダに戻ってしまう)
-        if let Some(r) = self.selected_clip
-            && self
-                .song
-                .tracks
-                .get(r.track as usize)
-                .and_then(|t| t.clips.get(r.clip as usize))
-                .is_none()
+        // stable ClipKey 保持なので並べ替え / undo を跨いでも追従する。 clip が
+        // 削除されて解決できない key のみ落とす。
+        if let Some(k) = self.selected_clip
+            && self.clip_at(k).is_none()
         {
             self.selected_clip = None;
         }
-        self.selected_clips.retain(|r| {
-            self.song
-                .tracks
-                .get(r.track as usize)
-                .and_then(|t| t.clips.get(r.clip as usize))
-                .is_some()
-        });
+        let mut keys = std::mem::take(&mut self.selected_clips);
+        keys.retain(|k| self.clip_at(*k).is_some());
+        self.selected_clips = keys;
         // note の index は undo で容易にずれるため、安全側で clear する。
         self.selected_notes.clear();
+        // audio event の選択 index も同様に undo でずれるため clear。
+        self.audio_editor_selected_events.clear();
         self.track_rename_idx = None;
         self.track_rename_text.clear();
         self.clip_rename = None;
@@ -2328,7 +2347,7 @@ impl AppData {
                 | AppEvent::SetAudioEventStart { .. }
                 | AppEvent::SetAudioEventTrim { .. }
                 | AppEvent::AddAudioEventFromFile { .. }
-                | AppEvent::DeleteAudioEvent { .. }
+                | AppEvent::DeleteAudioEditorSelection
                 | AppEvent::ImportAudio { .. }
                 | AppEvent::ImportVideo { .. }
                 | AppEvent::ImportImage { .. }
@@ -2400,7 +2419,7 @@ impl AppData {
     /// 戻り値は `(json, note_count)` 。`note_count` は呼び出し側で status_message
     /// 表示等に使う (ここで status_message を書かないのは `&self` で済ませるため)。
     pub fn copy_selected_notes_as_json(&self) -> Option<(String, usize)> {
-        let r = self.selected_clip?;
+        let r = self.selected_clip_ref()?;
         if self.selected_notes.is_empty() {
             return None;
         }
@@ -2460,7 +2479,7 @@ impl AppData {
         if clipboard.is_empty() {
             return;
         }
-        let Some(r) = self.selected_clip else {
+        let Some(r) = self.selected_clip_ref() else {
             self.status_message = "貼り付け先のクリップが選択されていません".to_string();
             return;
         };
@@ -2508,7 +2527,7 @@ impl AppData {
     }
 
     fn set_note_velocity(&mut self, note_idx: u32, velocity: u8) {
-        let Some(r) = self.selected_clip else {
+        let Some(r) = self.selected_clip_ref() else {
             return;
         };
         let Some(notes) = self
@@ -2532,7 +2551,7 @@ impl AppData {
     /// (`is_undoable` で `SetNoteVelocities` を許可)。 sync_song_to_plugin_host
     /// は最後に 1 度だけ呼ぶ (毎 note 同期は無駄)。
     fn set_note_velocities(&mut self, updates: &[(u32, u8)]) {
-        let Some(r) = self.selected_clip else {
+        let Some(r) = self.selected_clip_ref() else {
             return;
         };
         let Some(notes) = self
@@ -2554,7 +2573,7 @@ impl AppData {
     }
 
     fn quantize_selected_notes(&mut self, div: u8) {
-        let Some(r) = self.selected_clip else {
+        let Some(r) = self.selected_clip_ref() else {
             return;
         };
         let div = div.max(1) as f64;
@@ -3326,6 +3345,10 @@ pub enum AppEvent {
     // -------- Arrangement / clip operations -------------------------------
     SelectClip { target: ClipRef, additive: bool },
     SetClipSelection(Vec<ClipRef>),
+    /// Ctrl+A (クリップ領域): 曲全体・全トラックの全クリップを選択。
+    /// 一括選択なので view ジャンプ (fit_piano_roll / select_track) は
+    /// 起こさない。 既に全選択なら冪等。 selection のみ更新で非 undoable。
+    SelectAllClips,
     ClearSelection,
     /// 右クリック「共有を一括選択」 — target と同じ `content_id` を持つ
     /// 全 clip (linked clip group) を選択する。 refcount==1 なら自身 1 個。
@@ -3959,14 +3982,15 @@ pub enum AppEvent {
         path: PathBuf,
         position_in_clip_beats: f64,
     },
-    /// Audio Editor で event を削除 (= Delete key / context menu)。
-    /// `clip` の `event_idx` 番目を `events.remove`。 残 event 0 個に
-    /// なっても content は保持 (= clip の placeholder)。 selection は
-    /// `event_idx` を最大に詰める (events 空なら None)。
-    DeleteAudioEvent {
-        clip: ClipRef,
-        event_idx: usize,
-    },
+    /// Audio Editor の event 選択集合を `indices` で置き換える (= 矩形
+    /// 選択 / Shift+click トグル / Ctrl+A 全選択)。 index は clip 内
+    /// events Vec への index。 重複は handler 側で除外。 view state なので
+    /// 非 undoable。
+    SetAudioEditorEventSelection(Vec<usize>),
+    /// Audio Editor で選択中の全 event を削除 (= Delete key、 複数選択
+    /// 対応)。 `audio_editor_clip` が開いていて選択が空でないときのみ。
+    /// 削除後 selection は clear。
+    DeleteAudioEditorSelection,
 
     // -------- Phase 7 B5 (`docs/plan_scale.html`): Scale & Root ------------
     /// 現在 playhead 位置で active な scale event を `(root, scale)` で更新。
@@ -4595,6 +4619,9 @@ impl AppData {
             AppEvent::SetClipSelection(targets) => {
                 self.set_clip_selection(targets);
             }
+            AppEvent::SelectAllClips => {
+                self.select_all_clips();
+            }
             AppEvent::ClearSelection => {
                 self.selected_clip = None;
                 self.selected_clips.clear();
@@ -4642,7 +4669,7 @@ impl AppData {
             AppEvent::SetNoteSelection(targets) => {
                 self.selected_notes = targets;
                 if let Some(&last_idx) = self.selected_notes.last()
-                    && let Some(r) = self.selected_clip
+                    && let Some(r) = self.selected_clip_ref()
                     && let Some(note) = self
                         .song
                         .tracks
@@ -5088,7 +5115,13 @@ impl AppData {
                 self.set_audio_editor_zoom(view_start_beat, view_len_beats);
             }
             AppEvent::SelectAudioEditorEvent(idx) => {
-                self.audio_editor_selected_event = idx;
+                self.audio_editor_selected_events = idx.into_iter().collect();
+            }
+            AppEvent::SetAudioEditorEventSelection(indices) => {
+                self.set_audio_editor_event_selection(indices);
+            }
+            AppEvent::DeleteAudioEditorSelection => {
+                self.delete_audio_editor_selection();
             }
             AppEvent::DuplicateAudioEditorEvent => {
                 self.duplicate_audio_editor_event();
@@ -5101,9 +5134,6 @@ impl AppData {
             }
             AppEvent::AddAudioEventFromFile { clip, path, position_in_clip_beats } => {
                 self.add_audio_event_from_file(clip, path, position_in_clip_beats);
-            }
-            AppEvent::DeleteAudioEvent { clip, event_idx } => {
-                self.delete_audio_event(clip, event_idx);
             }
             AppEvent::ToggleClipReversed(target) => {
                 let cur = self.is_clip_audio_event_reversed(target);
@@ -6542,17 +6572,17 @@ impl AppData {
     /// 優先し、空なら `selected_clip` を 1 件として扱う。 全 ref が
     /// 無効 (track / clip が見つからない) or 長さ 0 の場合は `None`。
     fn selected_clips_range(&self) -> Option<(f64, f64)> {
-        let refs: &[ClipRef] = if !self.selected_clips.is_empty() {
-            &self.selected_clips
-        } else if let Some(r) = self.selected_clip.as_ref() {
-            std::slice::from_ref(r)
+        let refs: Vec<ClipRef> = if !self.selected_clips.is_empty() {
+            self.selected_clip_refs()
+        } else if let Some(r) = self.selected_clip_ref() {
+            vec![r]
         } else {
             return None;
         };
 
         let mut min_start = f64::INFINITY;
         let mut max_end = f64::NEG_INFINITY;
-        for r in refs {
+        for r in &refs {
             let Some(track) = self.song.tracks.get(r.track as usize) else {
                 continue;
             };
@@ -6662,19 +6692,18 @@ impl AppData {
             self.send_plugin(MainToChild::RemoveTrack { track: removed_id });
         }
 
-        // selected_clip: if its track was deleted, clear; otherwise
-        // shift down by the number of deleted tracks above it.
-        if let Some(r) = self.selected_clip {
-            if subtree_idxs.contains(&r.track) {
-                self.selected_clip = None;
-                self.selected_notes.clear();
-            } else {
-                let drops_above = subtree_idxs.iter().filter(|&&i| i < r.track).count() as u32;
-                self.selected_clip = Some(ClipRef {
-                    track: r.track - drops_above,
-                    clip: r.clip,
-                });
-            }
+        // selected_clip / selected_clips は stable ClipKey 保持なので、 残った
+        // track の index shift には自動追従する (再マッピング不要)。 ただし
+        // 削除された track を指す key は解決不能になるので、 set / anchor 双方
+        // から落とす (after_undo_redo / action_remove_last_track と同方針)。
+        let mut keys = std::mem::take(&mut self.selected_clips);
+        keys.retain(|k| self.clip_at(*k).is_some());
+        self.selected_clips = keys;
+        if let Some(k) = self.selected_clip
+            && self.clip_at(k).is_none()
+        {
+            self.selected_clip = None;
+            self.selected_notes.clear();
         }
 
         // selected_track_ids: subtree に含まれていた id を全て除外。
@@ -6739,18 +6768,9 @@ impl AppData {
         self.song.tracks.swap(a as usize, b as usize);
         // PR2.1: plugin_host の chains は `Track::id` ベースなので、
         // Vec position swap は通知不要。 SwapTracks IPC は削除済。
-        if let Some(r) = self.selected_clip {
-            self.selected_clip = Some(ClipRef {
-                track: if r.track == a {
-                    b
-                } else if r.track == b {
-                    a
-                } else {
-                    r.track
-                },
-                clip: r.clip,
-            });
-        }
+        // selected_clip / selected_clips は stable ClipKey 保持なので、 track の
+        // index swap には自動追従する (id 不変、 再マッピング不要)。 旧 index
+        // ベース実装は selected_clips を取りこぼすバグがあったが、 これで解消。
         // selected_track_ids は id ベースなので track の index swap で
         // 自動的に追従する (id は変わらないため再マッピング不要)。
         self.resize_track_peak_display();
@@ -6776,15 +6796,9 @@ impl AppData {
             .tracks
             .get(self.cursor_track_index().unwrap_or(0))
             .map(|t| t.id);
-        let selected_clip_keys: Vec<(u32, u32)> = self
-            .selected_clips
-            .iter()
-            .filter_map(|r| {
-                let t = self.song.tracks.get(r.track as usize)?;
-                let c = t.clips.get(r.clip as usize)?;
-                Some((t.id, c.id))
-            })
-            .collect();
+        // selected_clips / selected_clip は stable ClipKey 保持なので reorder
+        // (track の index 変化) に自動追従する。 旧実装の id ラウンドトリップ
+        // (抽出 → 並べ替え → index 逆引き) は不要になった。
 
         // 元順序での index 列を計算 (`order[i]` の id を持つ track の旧 index)。
         // この `index_order` を `MainToChild::ReorderTracks` で 1 度送り、
@@ -6816,19 +6830,7 @@ impl AppData {
         // で `cursor_track_index` が再評価される)。 selected_track_id
         // 局所変数は不要。
         let _ = selected_track_id;
-        let new_clips: Vec<ClipRef> = selected_clip_keys
-            .iter()
-            .filter_map(|(tid, cid)| {
-                let t_idx = self.song.tracks.iter().position(|t| t.id == *tid)?;
-                let c_idx = self.song.tracks[t_idx]
-                    .clips
-                    .iter()
-                    .position(|c| c.id == *cid)?;
-                Some(ClipRef { track: t_idx as u32, clip: c_idx as u32 })
-            })
-            .collect();
-        self.selected_clips = new_clips.clone();
-        self.selected_clip = new_clips.first().copied();
+        // selected_clips / selected_clip は stable ClipKey 保持のため再構築不要。
 
         // PR2.1: plugin_host の chains は `Track::id` ベースなので、
         // Vec position の reorder は通知不要。 ReorderTracks IPC は
@@ -8229,7 +8231,7 @@ impl AppData {
         field: common::model::ImageBuiltinParam,
     ) {
         use common::model::{AutomationLane, AutomationTarget, ClipContent, ImageBuiltinParam};
-        let Some(target_clip) = self.selected_clip else {
+        let Some(target_clip) = self.selected_clip_ref() else {
             self.status_message =
                 "Image Automation: 画像 clip を選択してください".into();
             return;
@@ -8348,7 +8350,7 @@ impl AppData {
     /// 事項)。
     fn begin_image_pip_drag_recording(&mut self) {
         use common::model::{AutomationTarget, ImageBuiltinParam};
-        let Some(target_clip) = self.selected_clip else {
+        let Some(target_clip) = self.selected_clip_ref() else {
             return;
         };
         let Some(track) = self.song.tracks.get(target_clip.track as usize) else {
@@ -8420,7 +8422,7 @@ impl AppData {
     /// TextEvent.field を直接書くだけ (= lane override 無し時の単純経路)。
     fn begin_text_pip_drag_recording(&mut self) {
         use common::model::{AutomationTarget, TextBuiltinParam};
-        let Some(target_clip) = self.selected_clip else {
+        let Some(target_clip) = self.selected_clip_ref() else {
             return;
         };
         let Some(track) = self.song.tracks.get(target_clip.track as usize) else {
@@ -8501,7 +8503,7 @@ impl AppData {
         field: common::model::ImageBuiltinParam,
     ) {
         use common::model::AutomationTarget;
-        let Some(target_clip) = self.selected_clip else {
+        let Some(target_clip) = self.selected_clip_ref() else {
             return;
         };
         let target = AutomationTarget::ImageBuiltin(field);
@@ -8681,7 +8683,7 @@ impl AppData {
         field: common::model::TextBuiltinParam,
     ) {
         use common::model::{AutomationLane, AutomationTarget};
-        let Some(target_clip) = self.selected_clip else {
+        let Some(target_clip) = self.selected_clip_ref() else {
             self.status_message =
                 "Text Automation: text clip を選択してください".into();
             return;
@@ -8755,7 +8757,7 @@ impl AppData {
         field: common::model::TextBuiltinParam,
     ) {
         use common::model::AutomationTarget;
-        let Some(target_clip) = self.selected_clip else {
+        let Some(target_clip) = self.selected_clip_ref() else {
             return;
         };
         let target = AutomationTarget::TextBuiltin(field);
@@ -9444,12 +9446,14 @@ impl AppData {
             self.selected_track_ids.push(t.id);
         }
         self.collapsed_groups.retain(|id| live_ids.contains(id));
-        // `selected_clips` / `selected_clip` は ClipRef.track を Vec
-        // index で持つ仕様。 末尾削除なので index = pop した位置 (= 旧 len-1)。
-        let removed_idx = len as u32 - 1;
-        self.selected_clips.retain(|c| c.track != removed_idx);
-        if let Some(r) = self.selected_clip
-            && r.track == removed_idx
+        // selected_clips / selected_clip は stable ClipKey 保持。 削除された
+        // track の clip を指す選択だけ落とす (track は上で pop 済なので clip_at が
+        // 解決できない)。 残りは index 変化に自動追従。
+        let mut keys = std::mem::take(&mut self.selected_clips);
+        keys.retain(|k| self.clip_at(*k).is_some());
+        self.selected_clips = keys;
+        if let Some(k) = self.selected_clip
+            && self.clip_at(k).is_none()
         {
             self.selected_clip = self.selected_clips.last().copied();
             self.selected_notes.clear();
@@ -9577,7 +9581,7 @@ impl AppData {
     /// 既存 step-input mode (= selected_clip + step_cursor_beat に固定 length
     /// で 1 note ずつ手動入力)。 midi_recording == false のときだけ走る。
     fn step_input_note_on(&mut self, pitch: u8, velocity: u8) {
-        let Some(target) = self.selected_clip else {
+        let Some(target) = self.selected_clip_ref() else {
             return;
         };
         let cursor = self.step_cursor_beat;
@@ -9880,23 +9884,71 @@ impl AppData {
         }
     }
 
+    /// stable `ClipKey` (track_id + clip_id) → 現在の index ベース `ClipRef`。
+    /// track / clip が見つからなければ `None` (= 削除済 / undo で消えた)。
+    pub fn clip_ref_of(&self, key: common::model::ClipKey) -> Option<ClipRef> {
+        let t_idx = self.song.tracks.iter().position(|t| t.id == key.track_id)?;
+        let c_idx = self.song.tracks[t_idx]
+            .clips
+            .iter()
+            .position(|c| c.id == key.clip_id)?;
+        Some(ClipRef {
+            track: t_idx as u32,
+            clip: c_idx as u32,
+        })
+    }
+
+    /// index ベース `ClipRef` → stable `ClipKey`。 範囲外なら `None`。
+    pub fn clip_key_of(&self, r: ClipRef) -> Option<common::model::ClipKey> {
+        let t = self.song.tracks.get(r.track as usize)?;
+        let c = t.clips.get(r.clip as usize)?;
+        Some(common::model::ClipKey {
+            track_id: t.id,
+            clip_id: c.id,
+        })
+    }
+
+    /// 選択 anchor (`selected_clip` = 末尾) を現在の `ClipRef` へ解決。
+    pub fn selected_clip_ref(&self) -> Option<ClipRef> {
+        self.selected_clip.and_then(|k| self.clip_ref_of(k))
+    }
+
+    /// 選択集合 (`selected_clips`) を現在の `ClipRef` 群へ解決 (解決でき
+    /// ない stale key は除外)。 owned `Vec` を返す。
+    pub fn selected_clip_refs(&self) -> Vec<ClipRef> {
+        self.selected_clips
+            .iter()
+            .filter_map(|k| self.clip_ref_of(*k))
+            .collect()
+    }
+
+    /// stable `ClipKey` → `&Clip` (track_by_id + clip_by_id)。
+    pub fn clip_at(&self, key: common::model::ClipKey) -> Option<&common::model::Clip> {
+        self.song
+            .track_by_id(key.track_id)
+            .and_then(|t| t.clip_by_id(key.clip_id))
+    }
+
     fn select_clip(&mut self, target: ClipRef, additive: bool) {
-        let mut clips = self.selected_clips.clone();
+        let Some(key) = self.clip_key_of(target) else {
+            return;
+        };
+        let mut keys = self.selected_clips.clone();
         if additive {
-            if let Some(pos) = clips.iter().position(|c| *c == target) {
-                clips.remove(pos);
+            if let Some(pos) = keys.iter().position(|k| *k == key) {
+                keys.remove(pos);
             } else {
-                clips.push(target);
+                keys.push(key);
             }
         } else {
-            clips = vec![target];
+            keys = vec![key];
         }
-        let primary = clips.last().copied();
-        self.selected_clips = clips;
+        let primary = keys.last().copied();
+        self.selected_clips = keys;
         self.selected_clip = primary;
         self.selected_notes.clear();
         self.step_cursor_beat = 0.0;
-        if let Some(r) = primary {
+        if let Some(r) = self.selected_clip_ref() {
             self.select_track(r.track);
         }
         // クリップが新しく primary になったらピアノロールを auto-fit。
@@ -9907,17 +9959,140 @@ impl AppData {
     }
 
     fn set_clip_selection(&mut self, targets: Vec<ClipRef>) {
-        let primary = targets.last().copied();
-        self.selected_clips = targets;
+        let keys: Vec<common::model::ClipKey> =
+            targets.iter().filter_map(|r| self.clip_key_of(*r)).collect();
+        let primary = keys.last().copied();
+        self.selected_clips = keys;
         self.selected_clip = primary;
         self.selected_notes.clear();
         self.step_cursor_beat = 0.0;
-        if let Some(r) = primary {
+        if let Some(r) = self.selected_clip_ref() {
             self.select_track(r.track);
         }
         if primary.is_some() {
             self.fit_piano_roll_to_clip();
         }
+    }
+
+    /// Ctrl+A (クリップ領域): 曲全体・全トラックの全クリップを選択。
+    /// 全選択は一括操作なので `set_clip_selection` と違い view ジャンプ
+    /// (fit_piano_roll_to_clip / select_track) を起こさない (= 表示を
+    /// 飛ばさない、 grill-me 2026-06-09 決定)。 既に全選択なら冪等。
+    /// anchor (末尾) は inspector 表示用に維持。 selection のみで非 undoable。
+    fn select_all_clips(&mut self) {
+        let all: Vec<common::model::ClipKey> = self
+            .song
+            .tracks
+            .iter()
+            .flat_map(|t| {
+                t.clips
+                    .iter()
+                    .map(|c| common::model::ClipKey {
+                        track_id: t.id,
+                        clip_id: c.id,
+                    })
+            })
+            .collect();
+        if all.is_empty() {
+            return;
+        }
+        // 既に全選択なら冪等 (集合一致を順序非依存で判定)。
+        if self.selected_clips.len() == all.len() {
+            let cur: std::collections::HashSet<common::model::ClipKey> =
+                self.selected_clips.iter().copied().collect();
+            if all.iter().all(|k| cur.contains(k)) {
+                return;
+            }
+        }
+        self.selected_clip = all.last().copied();
+        self.selected_clips = all;
+        self.selected_notes.clear();
+    }
+
+    /// 単一 clip (新規作成直後の `ClipRef`) を選択集合にする。 ClipRef→ClipKey
+    /// 変換して anchor + set を更新 (view ジャンプ無し)。 create / duplicate の
+    /// 結果選択用。
+    fn set_single_clip_selection(&mut self, r: ClipRef) {
+        let key = self.clip_key_of(r);
+        self.selected_clip = key;
+        self.selected_clips = key.into_iter().collect();
+    }
+
+    /// 新規 clip 群 (`ClipRef`) を選択集合にする (anchor = 末尾、 view ジャンプ
+    /// 無し)。 ClipRef→ClipKey 変換。 clone / split / glue の結果選択用。
+    fn select_new_clips(&mut self, refs: &[ClipRef]) {
+        let keys: Vec<common::model::ClipKey> =
+            refs.iter().filter_map(|r| self.clip_key_of(*r)).collect();
+        self.selected_clip = keys.last().copied();
+        self.selected_clips = keys;
+    }
+
+    /// Ctrl+A (ピアノロール): `selected_clip` の MIDI 全ノート id を返す
+    /// (id = clip 内 notes Vec の index)。 非 MIDI / 未選択なら空。
+    pub fn all_note_ids_in_selected_clip(&self) -> Vec<u32> {
+        let Some(target) = self.selected_clip_ref() else {
+            return Vec::new();
+        };
+        let Some(track) = self.song.tracks.get(target.track as usize) else {
+            return Vec::new();
+        };
+        let Some(clip) = track.clips.get(target.clip as usize) else {
+            return Vec::new();
+        };
+        match self.song.clip_contents.get(&clip.content_id) {
+            Some(common::model::ClipContent::Midi(midi)) => {
+                (0..midi.notes.len() as u32).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Ctrl+A (オーディオエディタ): 開いている clip の全 audio event index
+    /// を返す。 audio_editor_clip が無い / 非 audio なら空。
+    pub fn all_audio_event_indices(&self) -> Vec<usize> {
+        let Some(target) = self.audio_editor_clip else {
+            return Vec::new();
+        };
+        let Some(track) = self.song.tracks.get(target.track as usize) else {
+            return Vec::new();
+        };
+        let Some(clip) = track.clips.get(target.clip as usize) else {
+            return Vec::new();
+        };
+        match self.song.clip_contents.get(&clip.content_id) {
+            Some(common::model::ClipContent::Audio(audio)) => (0..audio.events.len()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Ctrl+A (automation lane): 指定 lane 内の全ポイントを
+    /// `AutomationPointKeyRef` で列挙する。 lane.clips の各 clip の content
+    /// (`ClipContent::Automation`) points を走査。 master row
+    /// (`MASTER_TRACK_ID`) も `automation_lane_by_key` 経由で対応。
+    /// lane が無い / ポイントが無いなら空。
+    pub fn all_automation_points_in_lane(
+        &self,
+        lane: common::model::AutomationLaneKey,
+    ) -> Vec<AutomationPointKeyRef> {
+        let Some(lane_ref) = self.song.automation_lane_by_key(lane.track, lane.lane) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for clip in &lane_ref.clips {
+            let n = match self.song.clip_contents.get(&clip.content_id) {
+                Some(common::model::ClipContent::Automation(a)) => a.points.len(),
+                _ => 0,
+            };
+            for point_idx in 0..n as u32 {
+                out.push(AutomationPointKeyRef {
+                    track_id: lane.track,
+                    lane_id: lane.lane,
+                    clip_id: clip.id,
+                    point_idx,
+                });
+            }
+        }
+        out
     }
 
     /// 右クリック「共有を一括選択」: `target` と同じ `content_id` を持つ
@@ -9969,7 +10144,7 @@ impl AppData {
     /// を立てて return → piano_roll が初めて描画され grid_size が確定したフレームの
     /// Edit 内で再実行される (初回 fit 喪失バグの修正、 [piano_roll_view::draw] 参照)。
     fn fit_piano_roll_to_clip(&mut self) {
-        let Some(target) = self.selected_clip else { return };
+        let Some(target) = self.selected_clip_ref() else { return };
         let Some(track) = self.song.tracks.get(target.track as usize) else { return };
         let Some(clip) = track.clips.get(target.clip as usize) else { return };
         let (grid_w, grid_h) = self.last_pianoroll_grid_size;
@@ -10145,16 +10320,19 @@ impl AppData {
                 new_refs.push((to_track_idx as u32, new_clip_id));
             }
         }
-        // ClipRef を最新の (track_idx, clip_idx) に再構築。
+        // 新 clip 群を stable ClipKey (track.id + clip.id) で選択。
         self.selected_clips = new_refs
             .iter()
             .filter_map(|(t_idx, c_id)| {
                 let track = self.song.tracks.get(*t_idx as usize)?;
-                let c_idx = track.clips.iter().position(|c| c.id == *c_id)?;
-                Some(ClipRef {
-                    track: *t_idx,
-                    clip: c_idx as u32,
-                })
+                track
+                    .clips
+                    .iter()
+                    .any(|c| c.id == *c_id)
+                    .then_some(common::model::ClipKey {
+                        track_id: track.id,
+                        clip_id: *c_id,
+                    })
             })
             .collect();
         self.selected_clip = self.selected_clips.last().copied();
@@ -11077,7 +11255,7 @@ impl AppData {
     }
 
     fn commit_clip_text_content_edit(&mut self) {
-        let Some(target) = self.selected_clip else {
+        let Some(target) = self.selected_clip_ref() else {
             return;
         };
         let value = self.clip_text_content_edit_text.clone();
@@ -11085,7 +11263,7 @@ impl AppData {
     }
 
     fn commit_clip_text_font_family_edit(&mut self) {
-        let Some(target) = self.selected_clip else {
+        let Some(target) = self.selected_clip_ref() else {
             return;
         };
         let value = self.clip_text_font_family_edit_text.clone();
@@ -11125,7 +11303,7 @@ impl AppData {
     /// field の `*_automated` は対応する TextBuiltin lane が track に
     /// 存在するか。
     pub fn inspector_text_event_summary(&self) -> Option<InspectorTextEventSummary> {
-        let cref = self.selected_clip?;
+        let cref = self.selected_clip_ref()?;
         let track = self.song.tracks.get(cref.track as usize)?;
         let clip = track.clips.get(cref.clip as usize)?;
         let common::model::ClipContent::Text(t) =
@@ -11236,6 +11414,12 @@ impl AppData {
         if !self.is_audio_clip(target) {
             return;
         }
+        // 別 clip を開くときは前 clip の選択 index は stale なので clear
+        // (同 clip の再 open は選択を保持)。 index ベース選択は context が
+        // 変わると意味を失う (= close / undo と同方針)。
+        if self.audio_editor_clip != Some(target) {
+            self.audio_editor_selected_events.clear();
+        }
         self.audio_editor_clip = Some(target);
         self.bottom_panel = 1;
         // 開いた clip 全体を見せる初期 view (= 既存挙動と等価)。 wheel
@@ -11252,7 +11436,7 @@ impl AppData {
 
     fn close_audio_editor(&mut self) {
         self.audio_editor_clip = None;
-        self.audio_editor_selected_event = None;
+        self.audio_editor_selected_events.clear();
         self.audio_editor_hover_beat_in_clip = None;
         self.audio_editor_view_start_beat = 0.0;
         self.audio_editor_view_len_beats = 0.0;
@@ -11307,7 +11491,7 @@ impl AppData {
         let Some(target) = self.audio_editor_clip else {
             return;
         };
-        let Some(idx) = self.audio_editor_selected_event else {
+        let Some(idx) = self.audio_editor_anchor_event() else {
             return;
         };
         let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
@@ -11340,7 +11524,7 @@ impl AppData {
         if needed > clip.length_beats {
             clip.length_beats = needed;
         }
-        self.audio_editor_selected_event = Some(insert_at);
+        self.audio_editor_selected_events = vec![insert_at];
         self.is_dirty = true;
         self.sync_song_to_plugin_host();
         if self.clip_edit_buffer_target == Some(target) {
@@ -11556,7 +11740,7 @@ impl AppData {
         if needed > clip.length_beats {
             clip.length_beats = needed;
         }
-        self.audio_editor_selected_event = Some(new_idx);
+        self.audio_editor_selected_events = vec![new_idx];
         self.is_dirty = true;
         self.sync_song_to_plugin_host();
         if self.clip_edit_buffer_target == Some(target) {
@@ -11565,33 +11749,50 @@ impl AppData {
         self.status_message = format!("Audio event 追加: {display_name}");
     }
 
-    /// PR-D 段階 3: Audio Editor で event を削除 (= Delete key /
-    /// context menu)。 `events.remove(event_idx)`。 残 event 0 個でも
-    /// content は保持 (= clip placeholder)。 selection は event_idx を
-    /// `events.len() - 1` で詰める (events 空なら None)。
-    fn delete_audio_event(&mut self, target: ClipRef, event_idx: usize) {
-        let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
+    /// Audio Editor の event 選択集合を `indices` で置き換える。 重複を
+    /// 除いて格納 (anchor = last なので最後に追加された index が代表)。
+    /// 範囲外 index は use 時に `.get` で無視されるのでここでは除外しない
+    /// (= n_events を知るための再 resolve を避ける)。 view state、 非 undoable。
+    fn set_audio_editor_event_selection(&mut self, indices: Vec<usize>) {
+        let mut seen = std::collections::HashSet::new();
+        let deduped: Vec<usize> = indices.into_iter().filter(|i| seen.insert(*i)).collect();
+        self.audio_editor_selected_events = deduped;
+    }
+
+    /// Audio Editor で選択中の全 event を削除 (= Delete key、 複数選択
+    /// 対応)。 高い index から `remove` して shift を回避。 削除後は
+    /// selection を clear。 events が空になっても content は保持。
+    fn delete_audio_editor_selection(&mut self) {
+        let Some(target) = self.audio_editor_clip else {
             return;
         };
-        let Some(clip) = track.clips.get_mut(target.clip as usize) else {
-            return;
-        };
-        let content_id = clip.content_id;
-        let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
         else {
             return;
         };
-        if event_idx >= audio.events.len() {
+        let mut indices: Vec<usize> = self.audio_editor_selected_events.clone();
+        indices.sort_unstable();
+        indices.dedup();
+        if indices.is_empty() {
             return;
         }
-        audio.events.remove(event_idx);
-        let new_sel = if audio.events.is_empty() {
-            None
+        if let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+        {
+            for &i in indices.iter().rev() {
+                if i < audio.events.len() {
+                    audio.events.remove(i);
+                }
+            }
         } else {
-            Some(event_idx.min(audio.events.len() - 1))
-        };
-        self.audio_editor_selected_event = new_sel;
+            return;
+        }
+        self.audio_editor_selected_events.clear();
         self.is_dirty = true;
         self.sync_song_to_plugin_host();
         if self.clip_edit_buffer_target == Some(target) {
@@ -11609,9 +11810,9 @@ impl AppData {
         let mut applied = 0usize;
         // borrow checker: target list を先に固める。
         let targets: Vec<ClipRef> = if self.selected_clips.is_empty() {
-            self.selected_clip.into_iter().collect()
+            self.selected_clip_ref().into_iter().collect()
         } else {
-            self.selected_clips.clone()
+            self.selected_clip_refs()
         };
         for target in targets {
             let Some(content_id) = self
@@ -11657,9 +11858,9 @@ impl AppData {
         // (track_idx, clip_idx, start_beat, end_beat, content_id) を集める
         let mut entries: Vec<(u32, u32, f64, f64, u32)> = Vec::new();
         let targets: Vec<ClipRef> = if self.selected_clips.is_empty() {
-            self.selected_clip.into_iter().collect()
+            self.selected_clip_ref().into_iter().collect()
         } else {
-            self.selected_clips.clone()
+            self.selected_clip_refs()
         };
         for target in &targets {
             let Some(track) = self.song.tracks.get(target.track as usize) else {
@@ -11879,8 +12080,7 @@ impl AppData {
             track: source.track,
             clip: new_idx,
         };
-        self.selected_clip = Some(r);
-        self.selected_clips = vec![r];
+        self.set_single_clip_selection(r);
         self.selected_notes.clear();
         self.sync_song_to_plugin_host();
     }
@@ -11921,8 +12121,7 @@ impl AppData {
             track: source.track,
             clip: new_idx,
         };
-        self.selected_clip = Some(r);
-        self.selected_clips = vec![r];
+        self.set_single_clip_selection(r);
         self.selected_notes.clear();
         self.sync_song_to_plugin_host();
     }
@@ -11969,8 +12168,7 @@ impl AppData {
             });
         }
         if !new_refs.is_empty() {
-            self.selected_clip = new_refs.last().copied();
-            self.selected_clips = new_refs;
+            self.select_new_clips(&new_refs);
             self.selected_notes.clear();
             self.sync_song_to_plugin_host();
         }
@@ -12016,8 +12214,7 @@ impl AppData {
             });
         }
         if !new_refs.is_empty() {
-            self.selected_clip = new_refs.last().copied();
-            self.selected_clips = new_refs;
+            self.select_new_clips(&new_refs);
             self.selected_notes.clear();
             self.sync_song_to_plugin_host();
         }
@@ -12081,8 +12278,7 @@ impl AppData {
             track: track_idx,
             clip: new_idx,
         };
-        self.selected_clip = Some(r);
-        self.selected_clips = vec![r];
+        self.set_single_clip_selection(r);
         self.selected_notes.clear();
         self.select_track(track_idx);
         self.sync_song_to_plugin_host();
@@ -12092,7 +12288,10 @@ impl AppData {
         if self.selected_clips.is_empty() {
             return;
         }
-        let mut targets = std::mem::take(&mut self.selected_clips);
+        // ClipKey → 現在の index ClipRef に解決し、 同 track 内は高 clip index
+        // から remove して shift を回避する。
+        let mut targets: Vec<ClipRef> = self.selected_clip_refs();
+        self.selected_clips.clear();
         targets.sort_by(|a, b| a.track.cmp(&b.track).then(b.clip.cmp(&a.clip)));
         for target in &targets {
             if let Some(track) = self.song.tracks.get_mut(target.track as usize)
@@ -12156,7 +12355,7 @@ impl AppData {
     /// 各 note の start_beat 時点の scale を尊重 (転調をまたぐ note は
     /// それぞれの local scale で snap される)。
     fn quantize_pitches_to_scale(&mut self, target: QuantizePitchTarget) {
-        let Some(r) = self.selected_clip else {
+        let Some(r) = self.selected_clip_ref() else {
             return;
         };
         if self.song.scale_changes.is_empty() {
@@ -12267,16 +12466,18 @@ impl AppData {
             track: track_idx,
             clip: clip_idx,
         };
-        self.selected_clip = Some(r);
-        if !self.selected_clips.contains(&r) {
-            self.selected_clips = vec![r];
+        if let Some(key) = self.clip_key_of(r) {
+            self.selected_clip = Some(key);
+            if !self.selected_clips.contains(&key) {
+                self.selected_clips = vec![key];
+            }
         }
         self.selected_notes = vec![new_idx];
         self.last_note_duration_beats = duration;
         self.sync_song_to_plugin_host();    }
 
     fn set_note_positions(&mut self, entries: &[(u32, f64, u8)]) {
-        let Some(r) = self.selected_clip else {
+        let Some(r) = self.selected_clip_ref() else {
             return;
         };
         // Phase 7 B5 (`docs/plan_scale.html` §5.1): Snap on Draw を note 移動
@@ -12322,7 +12523,7 @@ impl AppData {
         self.sync_song_to_plugin_host();    }
 
     fn resize_notes(&mut self, entries: &[(u32, f64, f64)]) {
-        let Some(r) = self.selected_clip else {
+        let Some(r) = self.selected_clip_ref() else {
             return;
         };
         let Some(notes) = self
@@ -12348,7 +12549,7 @@ impl AppData {
     /// 複製を新しい選択にする (連打で後方へ連鎖)。selected_clip 無し /
     /// 選択空 / clip 解決失敗なら no-op。
     fn duplicate_selected_notes(&mut self) {
-        let Some(r) = self.selected_clip else {
+        let Some(r) = self.selected_clip_ref() else {
             return;
         };
         let selected: Vec<u32> = self.selected_notes.clone();
@@ -12372,7 +12573,7 @@ impl AppData {
     /// new_start_beat, new_pitch)]。各 source を deep clone して指定位置へ配置し
     /// (元は据え置き)、複製を新選択にする。selected_clip 無し / 該当 index 無しなら no-op。
     fn copy_notes(&mut self, entries: &[(u32, f64, u8)]) {
-        let Some(r) = self.selected_clip else {
+        let Some(r) = self.selected_clip_ref() else {
             return;
         };
         let Some(notes) = self
@@ -12409,7 +12610,7 @@ impl AppData {
         self.sync_song_to_plugin_host();    }
 
     fn delete_selected_notes(&mut self) {
-        let Some(r) = self.selected_clip else {
+        let Some(r) = self.selected_clip_ref() else {
             return;
         };
         if self.selected_notes.is_empty() {
@@ -13708,7 +13909,7 @@ impl AppData {
         // / undo / redo) に追従させる。 selected_clip が image / text の場合は
         // 次フレームの view 側 target 不一致検知で正しい resync が走るため、
         // ここでは audio marker (= 非 audio なら None 化) で十分。
-        match self.selected_clip {
+        match self.selected_clip_ref() {
             Some(target) => self.resync_clip_audio_event_edit_buffers(target),
             None => {
                 self.clip_edit_buffer_target = None;
@@ -14884,8 +15085,7 @@ impl AppData {
             track: track_idx as u32,
             clip: new_clip_idx,
         };
-        self.selected_clip = Some(r);
-        self.selected_clips = vec![r];
+        self.set_single_clip_selection(r);
         self.selected_notes.clear();
         self.select_track(track_idx as u32);
 
@@ -15068,7 +15268,7 @@ impl AppData {
         let targets: Vec<ClipRef> = if let Some(hover) = self.arrangement_hover_clip {
             vec![hover]
         } else if !self.selected_clips.is_empty() {
-            self.selected_clips.clone()
+            self.selected_clip_refs()
         } else {
             self.status_message =
                 "Split: clip にマウスを乗せるか clip を選択してください".into();
@@ -15087,8 +15287,7 @@ impl AppData {
             return;
         }
         if !new_selection.is_empty() {
-            self.selected_clip = new_selection.last().copied();
-            self.selected_clips = new_selection;
+            self.select_new_clips(&new_selection);
             self.selected_notes.clear();
         }
         self.status_message = format!("Split: {split_count} clip を分割しました");
@@ -15210,7 +15409,7 @@ impl AppData {
 
         // 選択は後半 event (= ユーザーは「分割直後に新規 event を編集
         // したい」 ことが多い、 Reaper / Bitwig 流)。
-        self.audio_editor_selected_event = Some(event_idx + 1);
+        self.audio_editor_selected_events = vec![event_idx + 1];
         self.status_message = "Split: event を分割しました".into();
         self.is_dirty = true;
         self.sync_song_to_plugin_host();
@@ -15528,8 +15727,8 @@ impl AppData {
         // Group selected clips by track.
         let mut by_track: std::collections::BTreeMap<u32, Vec<ClipRef>> =
             std::collections::BTreeMap::new();
-        for r in &self.selected_clips {
-            by_track.entry(r.track).or_default().push(*r);
+        for r in self.selected_clip_refs() {
+            by_track.entry(r.track).or_default().push(r);
         }
 
         let mut new_refs: Vec<ClipRef> = Vec::new();
@@ -15795,8 +15994,7 @@ impl AppData {
         }
 
         tracing::info!(glued_count, ?new_refs, "Glue completed");
-        self.selected_clip = new_refs.last().copied();
-        self.selected_clips = new_refs;
+        self.select_new_clips(&new_refs);
         self.selected_notes.clear();
         self.status_message = format!("Glue: {glued_count} 箇所を結合しました");
         self.is_dirty = true;

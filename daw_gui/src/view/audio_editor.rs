@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use daw_ui_core::{
     ChannelLayout, DragKind, Edit, SampleSlices, TimeDisplay, TimeMapping, TimeRulerStyle, Ui,
-    ViewportState1D, WaveformRenderMode, WaveformSource, WaveformStyle, WaveformView,
+    ViewportState1D, WaveformRenderMode, WaveformSource, WaveformStyle, WaveformView, WidgetId,
 };
 use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect};
 
@@ -85,6 +85,11 @@ fn push_trim_ghost(
         line_width_px: 2.0,
         clip_rect: Some(wf_area),
     });
+}
+
+/// 2 つの矩形が交差するか (lasso 矩形と event_rect の hit-test)。
+fn rects_intersect(a: Rect, b: Rect) -> bool {
+    a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
 }
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
@@ -303,7 +308,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         );
         return;
     }
-    let selected_idx = app.audio_editor_selected_event.unwrap_or(0);
+    let selected_set: std::collections::HashSet<usize> =
+        app.audio_editor_selected_events.iter().copied().collect();
+    let anchor_idx = app.audio_editor_anchor_event();
+    // 矩形選択 (lasso) の hit-test 用に、 描画した event の rect を収集する。
+    let mut event_rects: Vec<(usize, Rect)> = Vec::new();
     let clip_len_beats = clip.length_beats.max(1e-6); // 0 div 防御
     // view ベース px → beats 換算係数。 view_len_beats は zoom 中に変動
     // するので毎フレーム再計算。 wf_area.w (px) は view_len_beats (beats)
@@ -394,6 +403,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             w: ((evt_x_end_clamped - evt_x_start_clamped) * wf_area.w).max(2.0),
             h: wf_area.h,
         };
+        event_rects.push((idx, event_rect));
 
         // SampleSlices::Planar 用の borrowed-plane。 common な mono/stereo は
         // スタック配列で event ループ内の毎フレーム heap 確保を消し、 稀な
@@ -447,7 +457,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             len_samples: src_visible_len_frames.max(1),
             vertical_gain: 1.0,
         };
-        let is_selected = idx == selected_idx;
+        let is_selected = selected_set.contains(&idx);
         let fg = if is_selected {
             Color::rgba(0.65, 0.95, 1.0, 0.95)
         } else {
@@ -597,15 +607,28 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             }
         }
 
-        // 中央 drag = 移動 (start = select 切替、 continuing = ghost
-        // 表示、 released = SetAudioEventStart commit)。
+        // 中央 drag。 plain = 移動 (start = 単一選択、 continuing = ghost、
+        // released = SetAudioEventStart commit)。 Shift = 選択トグル
+        // (move せず、 Started で 1 度だけ集合に add/remove)。
         if center_band.w > 0.0
             && let Some(drag) =
                 ui.take_drag_in_rect(("audio_editor_move", clip_id, idx), center_band)
         {
             let dx = drag.delta.0;
             let kind = drag.kind;
-            if kind == DragKind::Started {
+            if drag.start_modifiers.shift {
+                if kind == DragKind::Started {
+                    let mut next = app.audio_editor_selected_events.clone();
+                    if let Some(p) = next.iter().position(|&i| i == idx) {
+                        next.remove(p);
+                    } else {
+                        next.push(idx);
+                    }
+                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetAudioEditorEventSelection(next));
+                    }));
+                }
+            } else if kind == DragKind::Started {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SelectAudioEditorEvent(Some(idx)));
                 }));
@@ -625,15 +648,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             }
         }
 
-        // 単発 click (drag 開始しなかった場合) = select。 take_drag_in_rect
-        // が press frame に consume_pointer_click を呼ぶので、 同 frame
-        // の take_primary_press_in_rect は None になり二重 select されない
-        // (= drag press から 1 px も動かず即 release した場合だけ反応)。
-        if let Some(_press) = ui.take_primary_press_in_rect(event_rect) {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SelectAudioEditorEvent(Some(idx)));
-            }));
-        }
+        // 単発 click による選択は中央 drag / 端 grip の `DragKind::Started`
+        // が担う (press frame に consume_pointer_click 済 + event_rect 全域を
+        // center+grip でカバー)。 別途の take_primary_press_in_rect は不要。
 
         // 右クリック context menu。 Duplicate / Delete / Add From Source...
         let evt_end_beats = event.event_start_in_clip_beats + event.event_length_beats;
@@ -647,10 +664,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         app.handle_event(AppEvent::DuplicateAudioEditorEvent);
                     }
                     1 => {
-                        app.handle_event(AppEvent::DeleteAudioEvent {
-                            clip: target,
-                            event_idx: idx,
-                        });
+                        // 右クリックした event を選択に collapse してから
+                        // 選択集合 delete (Delete キーと同じ DeleteAudioEditorSelection
+                        // 経路に統一)。 Duplicate と同じ select-then-act パターン。
+                        app.handle_event(AppEvent::SelectAudioEditorEvent(Some(idx)));
+                        app.handle_event(AppEvent::DeleteAudioEditorSelection);
                     }
                     2 => {
                         app.action_open_audio_event_dialog(target, evt_end_beats);
@@ -659,6 +677,41 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 }));
             },
         );
+    }
+
+    // ----- 矩形選択 (lasso) -----------------------------------------
+    // 空き領域からの primary drag で複数 event をまとめて選択。 event の
+    // grip/center が press を consume_pointer_click 済なので、 event 上から
+    // 始まる drag はここに来ない (= 空き領域専用)。 Shift で既存選択に
+    // 加算、 plain は置換 (空 drag / 空クリック = 全解除)。 cyan overlay は
+    // take_drag_rect_in_rect が自動描画。
+    if let Some(dr) = ui.take_drag_rect_in_rect(
+        WidgetId::ROOT.child((b"audio_editor_lasso", clip_id)),
+        wf_area,
+    ) && dr.finished
+    {
+        let r = dr.rect();
+        let additive = dr.modifiers.shift;
+        let mut hit: Vec<usize> = event_rects
+            .iter()
+            .filter(|(_, er)| rects_intersect(r, *er))
+            .map(|(i, _)| *i)
+            .collect();
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            if additive {
+                let mut next = app.audio_editor_selected_events.clone();
+                for i in hit.drain(..) {
+                    if !next.contains(&i) {
+                        next.push(i);
+                    }
+                }
+                app.handle_event(AppEvent::SetAudioEditorEventSelection(next));
+            } else {
+                app.handle_event(AppEvent::SetAudioEditorEventSelection(std::mem::take(
+                    &mut hit,
+                )));
+            }
+        }));
     }
 
     // 空白領域 (= waveform area で event 上にない場所) への file drop
@@ -740,7 +793,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // Inspector の Source 行 (`docs/plan_audio_clip.md` §3.9) として
     // 出す予定だが、 当面は Audio Editor 内 footer に出して視認性を
     // 確保する。 multi-event のときは選択中 event の source を参照。
-    let footer_event = audio.events.get(selected_idx).or(audio.events.first());
+    let footer_event = anchor_idx
+        .and_then(|i| audio.events.get(i))
+        .or(audio.events.first());
     if let Some(footer_event) = footer_event
         && let Some(audio_source) = app.song.audio_sources.get(&footer_event.source_id)
     {
