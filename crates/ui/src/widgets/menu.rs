@@ -421,6 +421,33 @@ fn union_rect(a: Rect, b: Rect) -> Rect {
     Rect { x: left, y: top, w: right - left, h: bottom - top }
 }
 
+/// M14 Phase 120 (daw_01 #095): top-level menu popup が閉じる / 閉じた frame に、 その配下で hover
+/// open された cascade sub-popup を **再帰的に** 閉じる (orphan 防止)。 sub-popup id は
+/// `draw_menu_entries` の open 規約 `{id_path}/{i}` (SubMenu entry の index i) / ネストは
+/// `{id_path}/{i}/{j}…` と一致させる。 `close_popup` は閉じている id には no-op なので、 実際に開いて
+/// いる分だけ閉じる。 **top-level を閉じる前に呼ぶ** ことで focus 復元 (`prev_focus`) が最終的に
+/// top-level の原本 focus に戻る (孫 → 子の深い順に閉じ、 最後に caller が top-level を閉じる)。
+///
+/// 必要な理由: cascade は親 popup の `popup_layer` closure 内 (`draw_menu_entries`) で hover open
+/// され、 sibling 排他 close / outside-click dismiss も `draw_menu_entries` が走る frame だけ動く。
+/// top-level が閉じると `draw_menu_entries` が呼ばれなくなり、 開いていた cascade は **自力で
+/// dismiss できず** modal popup として `open_popups` に居残る → 見えないのに anchor 内 pointer /
+/// keyboard を遮断し続ける (daw_01 実機: cascade item で project を開いた後、 アレンジ上部 ~1/3 の
+/// track double-click rename が `pointer_blocked_by_modal_popup` で不発)。
+fn close_orphaned_cascades<'a, M: ?Sized + 'static>(
+    ui: &mut Ui<'a, M>,
+    entries: &[MenuEntry<'a, M>],
+    id_path: &str,
+) {
+    for (i, entry) in entries.iter().enumerate() {
+        if let MenuEntry::SubMenu { entries: sub, .. } = entry {
+            let sub_id = format!("{id_path}/{i}");
+            close_orphaned_cascades(ui, sub, &sub_id);
+            ui.close_popup(&sub_id);
+        }
+    }
+}
+
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// menu_bar の top-level 入力処理 (open / close / toggle / hover 切替) を 1 箇所で行う。
     /// `popup_layer` 描画より **前** に呼び、現在 open の menu (`open_idx`) と hover 中ラベル
@@ -558,7 +585,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 ..GlyphArea::default()
             });
 
+            // この top-level の cascade sub-popup id prefix (`draw_menu_entries` と共有する規約)。
+            let id_path = format!("menu_bar/{label}");
+
             if !is_open {
+                // M14 Phase 120 (daw_01 #095): top-level が (action click / outside-click / toggle /
+                // 隣 menu 切替 の) いずれかの経路で閉じている frame は、 hover open された cascade
+                // sub-popup を道連れに閉じる。 さもなくば cascade が orphan して anchor 内入力を遮断し
+                // 続ける (Esc / 外 click でも dismiss 経路が走らず居残るのを ≤1 frame で回収する safety
+                // net)。 閉じている menu には cascade が無いのが大半で close_popup は no-op。
+                close_orphaned_cascades(self, &entries, &id_path);
                 continue;
             }
 
@@ -567,7 +603,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.update_popup_anchor(id, anchors[i]);
 
             // popup 描画 (popup_layer 経由、sub-menu cascade を draw_menu_entries 内で再帰処理)
-            let id_path = format!("menu_bar/{label}");
             let mut entries = entries;
             let mut clicked_action: Option<MenuItemAction<'a, M>> = None;
             self.popup_layer(id, |ui| {
@@ -577,6 +612,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 // M9 P1-5 (C 案): action は &mut Ui を受け、closure 内で push_edit / request_undo
                 // 等の任意操作を行う。library 側は popup close のみ自動。
                 action(self);
+                // M14 Phase 120 (daw_01 #095): cascade item の click は `close_popup(id)` (top-level)
+                // だけだと cascade sub-popup を orphan させる。 同 frame で開いている cascade を全部
+                // 閉じてから (zero-frame) top-level を閉じる。 通常 top-level item は cascade が無いので
+                // close_orphaned_cascades は no-op (= 既存挙動不変)。
+                close_orphaned_cascades(self, &entries, &id_path);
                 self.close_popup(id);
             }
         }
@@ -1043,6 +1083,159 @@ mod tests {
             "cascade item の click で action が発火する (= 親 popup の outside_click で\
              握りつぶされない)"
         );
+    }
+
+    /// daw_01 #095 (重大バグ): cascade item を click すると **cascade sub-popup も閉じる**。
+    /// 旧実装は top-level popup (`menu_bar_top/File`) のみ close し、 hover open した cascade
+    /// (`menu_bar/File/0`) が modal popup として `open_popups` に orphan していた。 見えないのに
+    /// anchor 内 pointer/keyboard を遮断し続け、 アレンジ上部の track rename を不発にした。
+    #[test]
+    fn cascade_item_click_closes_sub_popup() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let bar_rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 32.0 };
+
+        let build = |ui: &mut Ui<'_, ()>| {
+            ui.menu_bar(bar_rect, |bar| {
+                bar.menu("File", |menu| {
+                    menu.sub_menu("Open Recent", |sub| {
+                        sub.item("wav01", |_| {});
+                    });
+                });
+            });
+        };
+
+        // Frame 1: "File" click → top-level open。
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((20.0, 16.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| build(ui),
+        );
+        // Frame 2: "Open Recent" (popup item 0、 y=44) hover → cascade open。
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame { pos: Some((20.0, 44.0)), ..PointerFrame::default() },
+                ..Default::default()
+            },
+            |(), ui| build(ui),
+        );
+        // Frame 3: cascade item "wav01" を click (cascade は親の右隣 x、 y=44)。
+        let cascade_x = MENU_W_DEFAULT + 20.0;
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((cascade_x, 44.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| build(ui),
+        );
+        // Frame 4: menu_bar を呼ぶ前に frame 3 が残した popup 状態を観測 (cascade orphan の検出)。
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            assert!(
+                !ui.is_popup_open(("menu_bar_top", "File")),
+                "cascade item click 後、 top-level popup は閉じる"
+            );
+            assert!(
+                !ui.is_popup_open(format!("menu_bar/File/{}", 0)),
+                "cascade item click 後、 cascade sub-popup も閉じる (orphan しない)"
+            );
+        });
+    }
+
+    /// daw_01 #095: cascade を開いたまま **popup 外を click** して menu を閉じた場合も、 cascade
+    /// sub-popup を orphan させない (実機で「Esc / 外 click でも消えない」 と確認された経路。 top-level が
+    /// `popup_layer` の outside-click で閉じ `draw_menu_entries` が走らなくなるため、 menu_bar の
+    /// 次フレーム `!is_open` cleanup で ≤1 frame で回収する)。
+    #[test]
+    fn cascade_orphan_cleared_after_outside_click() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let bar_rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 32.0 };
+
+        let build = |ui: &mut Ui<'_, ()>| {
+            ui.menu_bar(bar_rect, |bar| {
+                bar.menu("File", |menu| {
+                    menu.sub_menu("Open Recent", |sub| {
+                        sub.item("wav01", |_| {});
+                    });
+                });
+            });
+        };
+
+        // Frame 1: File click → open。 Frame 2: Open Recent hover → cascade open。
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((20.0, 16.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| build(ui),
+        );
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame { pos: Some((20.0, 44.0)), ..PointerFrame::default() },
+                ..Default::default()
+            },
+            |(), ui| build(ui),
+        );
+        // Frame 3: 全 popup の外 (700, 500) を press → top-level が outside-click で閉じる。
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((700.0, 500.0)),
+                    primary_just_pressed: true,
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| build(ui),
+        );
+        // Frame 4: menu_bar の `!is_open` cleanup が orphan cascade を回収する。
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| build(ui));
+        // Frame 5: cleanup 後の状態を観測。
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            assert!(
+                !ui.is_popup_open(("menu_bar_top", "File")),
+                "外 click で top-level popup は閉じる"
+            );
+            assert!(
+                !ui.is_popup_open(format!("menu_bar/File/{}", 0)),
+                "外 click で menu を閉じた後、 cascade sub-popup も回収される (orphan しない)"
+            );
+        });
     }
 
     // ===== M14 Phase 98 (daw_01 #070): top-level menu 切替 =====

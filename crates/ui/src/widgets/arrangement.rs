@@ -8328,16 +8328,27 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 // group track は indent で name_rect が 20px floor まで潰れ、 さらに disclosure 分を引くと
                 // `name_rect_visible` が 2〜4px になり double-click が当たらなかった。 group track のみ
                 // **header row 全体** を rename hit zone にし、 single-click で別意味を持つ sub-zone
-                // (disclosure 折り畳み / M·S·R / lane disclosure / volume band drag) を除外する。 これで
+                // (M·S·R / lane disclosure / volume band drag / header splitter) を除外する。 これで
                 // indent 空白 + 名前帯のどこを double-click しても rename が始まる (REAPER の TCP 名 dblclick
                 // 流)。 通常 track は `name_rect_visible` のまま (名前帯が潰れないので挙動完全不変、 sub-zone
-                // 除外も常に no-op)。 disclosure の single-click 折り畳みは別経路で priority 高のまま不変。
+                // 除外も常に no-op)。
+                //
+                // M14 Phase 119 (daw_01 #092 follow-up): **group disclosure (`▶`/`▼`) も rename zone に含める**。
+                // depth-0 (top-level) group は disclosure が name 帯の左端 (= indent 空白が無く x∈[pad, pad+
+                // indent_px]) に張り付くため、 旧実装は disclosure を sub-zone 除外していた結果「最上段 / 子持ち
+                // group の名前左側を double-click しても rename されない」 症状になっていた (master row の有無は
+                // 無関係 = 最上段が top-level group になりがちなだけの相関、 と pixel/hit-test 検証で確定)。 disclosure
+                // の **single-click** 折り畳みは別経路 (`disclosure_clicked`) で従来どおり (回帰なし)。 **double-click**
+                // は明確に rename 意図なので disclosure 上でも rename を起こす。 double-click が disclosure を踏むと
+                // 2 release で折り畳みが 2 回 toggle するが、 daw_01 の `collapsed_groups` (HashSet) を直接 flip する
+                // 非 undoable な view-state edit なので net-zero (= fold 状態保存、 undo 履歴も汚さない)。 M·S·R /
+                // lane disclosure は name 帯の **右**で名前と無関係なので除外を維持 (button の double-toggle を rename に
+                // 化けさせない)、 volume band も名前帯の下の独立 drag 控除なので維持。
                 let rename_hit = if is_group { row } else { name_rect_visible };
                 if let Some((dcx, dcy)) = self.take_double_click_in_rect(rename_hit) {
                     let in_subzone = m_rect.contains(dcx, dcy)
                         || s_rect.contains(dcx, dcy)
                         || r_rect.contains(dcx, dcy)
-                        || (is_group && disclosure_rect.contains(dcx, dcy))
                         || (!t.automation_lanes.is_empty()
                             && layout.lane_disc_rect.contains(dcx, dcy))
                         || layout.volume_band.is_some_and(|b| b.contains(dcx, dcy))
@@ -12813,6 +12824,217 @@ mod tests {
 
         let log = renamed.lock().unwrap();
         assert_eq!(log.as_slice(), &[1], "深ネスト group の indent dblclick で track 1 rename: {log:?}");
+    }
+
+    /// daw_01 #092 follow-up (M14 Phase 119): top-level (depth-0) group の disclosure 帯
+    /// (= name 帯の左端、 indent 空白が無いため flush-left) を double-click しても rename が始まる。
+    /// master row の有無は無関係 (= 最上段が top-level group になりがちなだけの相関) なことを
+    /// 「master 有 (empty / expanded lanes) / 無」 ×「disclosure 帯 / name 帯」 で網羅検証する。
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn group_disclosure_dblclick_renames_regardless_of_master() {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+            master: Option<ArrangementMasterRow>,
+        }
+
+        #[derive(Clone, Copy)]
+        enum MasterKind {
+            None,
+            Empty,
+            Expanded,
+        }
+
+        // group27 (depth-0、 子持ち = group) を double-click した位置で BeginRenameTrack(27) が出るか。
+        let renames = |mk: MasterKind, click: (f32, f32)| -> bool {
+            let mut host: UiHost<Model> = UiHost::no_redraw();
+            let mut scene = Scene::new();
+            let screen = PhysicalSize { width: 800, height: 600 };
+            let view = ArrangementView {
+                header_w: 200.0,
+                ruler_h: 0.0,
+                track_row_h: 32.0,
+                ..ArrangementView::default()
+            };
+            let g = track(27, "Group27", vec![]);
+            let mut child = track(25, "Inst", vec![]);
+            child.parent_id = Some(27);
+            child.depth = 1;
+            let master = match mk {
+                MasterKind::None => None,
+                MasterKind::Empty => Some(ArrangementMasterRow {
+                    automation_lanes_collapsed: true,
+                    automation_lanes: Vec::new(),
+                    height_px_override: None,
+                }),
+                MasterKind::Expanded => Some(ArrangementMasterRow {
+                    automation_lanes_collapsed: false,
+                    automation_lanes: vec![ArrangementAutomationLane {
+                        id: 1,
+                        label: Arc::from("Tempo"),
+                        icon_glyph: 'T',
+                        color: Color::rgb(1.0, 1.0, 1.0),
+                        enabled: true,
+                        visible: true,
+                        height_px: 60,
+                        default_value_norm: 0.5,
+                        clips: Vec::new(),
+                    }],
+                    height_px_override: None,
+                }),
+            };
+            let model = Model { tracks: vec![g, child], view, master };
+
+            let renamed: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+            let run = |host: &mut UiHost<Model>, scene: &mut Scene, pos: (f32, f32)| {
+                let renamed_cb = Arc::clone(&renamed);
+                let input = FrameInput {
+                    pointer: PointerFrame {
+                        pos: Some(pos),
+                        primary_just_released: true,
+                        ..PointerFrame::default()
+                    },
+                    ..FrameInput::default()
+                };
+                let _ = host.frame_to_edits(&model, scene, screen, input, |m, ui| {
+                    let style = ArrangementStyle::default();
+                    let renamed_cb = Arc::clone(&renamed_cb);
+                    let _ = ui.arrangement(
+                        "arr",
+                        Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                        &m.tracks,
+                        m.view,
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &style,
+                        m.master.as_ref(),
+                        move |req| {
+                            if let ArrangementEditRequest::BeginRenameTrack(tid) = req {
+                                renamed_cb.lock().unwrap().push(tid);
+                            }
+                            Edit::mutate(|_: &mut Model| {})
+                        },
+                    );
+                });
+            };
+            run(&mut host, &mut scene, click);
+            run(&mut host, &mut scene, click);
+            let log = renamed.lock().unwrap();
+            log.as_slice() == [27]
+        };
+
+        // 行 y: master 無 → group27 = visible_tracks[0] = y∈[0,32] (click y=16)。
+        //       master Empty → group27 = visible_tracks[1] = y∈[32,64] (click y=48)。
+        //       master Expanded(lane h=60) → master total=92 → group27 = y∈[92,124] (click y=108)。
+        // depth-0 disclosure は x∈[4,20] (vertical center)。 x=10 = disclosure 帯、 x=50 = name 帯。
+        for (mk, y, label) in [
+            (MasterKind::None, 16.0, "no-master"),
+            (MasterKind::Empty, 48.0, "empty-master"),
+            (MasterKind::Expanded, 108.0, "expanded-master"),
+        ] {
+            assert!(
+                renames(mk, (10.0, y)),
+                "{label}: disclosure 帯 (x=10) の double-click で top-level group が rename"
+            );
+            assert!(
+                renames(mk, (50.0, y)),
+                "{label}: name 帯 (x=50) の double-click で rename (回帰なし)"
+            );
+        }
+    }
+
+    /// M14 Phase 119: disclosure の **single-click** は従来どおり ToggleGroupCollapsed のみ発火し、
+    /// rename は起こさない (= double-click rename 化が single-click 折り畳みを壊さない回帰ガード)。
+    #[test]
+    fn group_disclosure_single_click_still_toggles_not_rename() {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let view = ArrangementView {
+            header_w: 200.0,
+            ruler_h: 0.0,
+            track_row_h: 32.0,
+            ..ArrangementView::default()
+        };
+        // depth-0 group (子持ち)。 disclosure 帯 x∈[4,20]。 group27 row = y∈[0,32]。
+        let g = track(27, "Group27", vec![]);
+        let mut child = track(25, "Inst", vec![]);
+        child.parent_id = Some(27);
+        child.depth = 1;
+        let model = Model { tracks: vec![g, child], view };
+
+        let renamed: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let toggled: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let renamed_cb = Arc::clone(&renamed);
+        let toggled_cb = Arc::clone(&toggled);
+        // 単発の release を 1 frame だけ (double-click にならない)。
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((10.0, 16.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        };
+        let _ = host.frame_to_edits(&model, &mut scene, screen, input, |m, ui| {
+            let style = ArrangementStyle::default();
+            let renamed_cb = Arc::clone(&renamed_cb);
+            let toggled_cb = Arc::clone(&toggled_cb);
+            let _ = ui.arrangement(
+                "arr",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &m.tracks,
+                m.view,
+                &[],
+                &[],
+                &[],
+                &[],
+                &style,
+                None,
+                move |req| {
+                    match &req {
+                        ArrangementEditRequest::BeginRenameTrack(tid) => {
+                            renamed_cb.lock().unwrap().push(*tid);
+                        }
+                        ArrangementEditRequest::ToggleGroupCollapsed(tid) => {
+                            toggled_cb.lock().unwrap().push(*tid);
+                        }
+                        _ => {}
+                    }
+                    Edit::mutate(|_: &mut Model| {})
+                },
+            );
+        });
+
+        assert!(renamed.lock().unwrap().is_empty(), "single-click は rename しない");
+        assert_eq!(
+            toggled.lock().unwrap().as_slice(),
+            &[27],
+            "single-click on disclosure は ToggleGroupCollapsed のみ"
+        );
     }
 
     /// 通常 (非 group) track は名前帯 double-click で従来どおり rename、 名前帯外 (volume band) では
