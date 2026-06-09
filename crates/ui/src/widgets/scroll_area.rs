@@ -114,8 +114,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let state: &mut ScrollState = self.widget_state(wid);
             // wheel 適用 (winit 慣行: y > 0 = wheel up = view 上方向)。offset.y -= scroll.y
             // で「wheel down → offset 増 → 下のコンテンツが見える」になる。
-            state.offset.0 = (state.offset.0 - scroll.0).clamp(0.0, max_x);
-            state.offset.1 = (state.offset.1 - scroll.1).clamp(0.0, max_y);
+            // M14 Phase 115 (daw_01 #089): 横だけあふれる領域 (need_h && !need_v、 例: mixer の
+            // track strip 列) では plain 縦ホイール (scroll.1) を横 offset に回す (= 横一列レイアウト
+            // で縦ホイール横スクロールの DAW / browser 慣習)。横ホイール (scroll.0 = Shift+wheel /
+            // トラックパッド水平) は常に横 offset。縦あふれがあれば従来どおり縦ホイール → 縦。
+            // 符号は既存の `offset -= scroll` を共有するので wheel down → 右スクロールで一貫する。
+            let v_wheel_to_h = need_h && !need_v;
+            let h_scroll = scroll.0 + if v_wheel_to_h { scroll.1 } else { 0.0 };
+            let v_scroll = if v_wheel_to_h { 0.0 } else { scroll.1 };
+            state.offset.0 = (state.offset.0 - h_scroll).clamp(0.0, max_x);
+            state.offset.1 = (state.offset.1 - v_scroll).clamp(0.0, max_y);
 
             // wheel 適用後の現在 offset で thumb_rect を計算 (drag hit-test + 描画で共有)。
             let v_thumb_rect = if need_v {
@@ -415,6 +423,81 @@ mod tests {
             off.1 > 200.0,
             "scrolled thumb 位置からの下方向 drag で offset.1 が 200 から進む (got {})",
             off.1
+        );
+    }
+
+    /// 1 フレーム分の wheel を scroll_area に与えて返り値 offset を観測するヘルパ。
+    /// `scroll_delta` も返り値 `offset` も単位は **px** (入力層が LINE_HEIGHT_PX で px 化済の前提)。
+    fn wheel_once(area: Rect, content: (f32, f32), scroll_delta: (f32, f32)) -> (f32, f32) {
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 400 };
+        let observed = std::cell::Cell::new((0.0_f32, 0.0_f32));
+        let input = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((area.x + area.w * 0.5, area.y + area.h * 0.5)),
+                scroll_delta,
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        };
+        let _ = host.frame_to_edits(&(), &mut scene, screen, input, |(), ui| {
+            let off = ui.scroll_area("test", area, content, |_, _| {});
+            observed.set(off);
+        });
+        observed.get()
+    }
+
+    /// M14 Phase 115 (daw_01 #089): 横だけあふれる領域 (need_h && !need_v) では plain 縦ホイール
+    /// (scroll.1) が横 offset を動かす。wheel down (scroll.1 < 0) → 右スクロール (offset.0 増)。
+    #[test]
+    fn vertical_wheel_scrolls_horizontally_when_only_horizontal_overflow() {
+        // area 100x200、content (600, 200) → max_x=500 (need_h)、max_y=0 (!need_v)。
+        let area = Rect { x: 0.0, y: 0.0, w: 100.0, h: 200.0 };
+        let content = (600.0_f32, 200.0_f32);
+        // wheel down: scroll_delta.1 = -200 → offset.0 = 0 - (-200) = 200。offset.1 は max_y=0 で 0 のまま。
+        let off = wheel_once(area, content, (0.0, -200.0));
+        assert!(
+            (off.0 - 200.0).abs() < 1e-3,
+            "縦ホイール (wheel down) が横 offset を 200 まで動かす (got {})",
+            off.0
+        );
+        assert!(off.1.abs() < 1e-3, "縦あふれ無しなので offset.1 は 0 のまま (got {})", off.1);
+    }
+
+    /// M14 Phase 115: 縦あふれがある領域では plain 縦ホイールは従来どおり縦 offset を動かす
+    /// (横 offset には回さない = 回帰防止)。
+    #[test]
+    fn vertical_wheel_stays_vertical_when_vertical_overflow_present() {
+        // area 100x200、content (600, 600) → max_x=500 (need_h) かつ max_y=400 (need_v)。
+        let area = Rect { x: 0.0, y: 0.0, w: 100.0, h: 200.0 };
+        let content = (600.0_f32, 600.0_f32);
+        let off = wheel_once(area, content, (0.0, -200.0));
+        assert!(
+            (off.1 - 200.0).abs() < 1e-3,
+            "縦あふれありなので縦ホイールは縦 offset を動かす (got {})",
+            off.1
+        );
+        assert!(off.0.abs() < 1e-3, "横 offset には回さない (got {})", off.0);
+    }
+
+    /// M14 Phase 115: 横ホイール (scroll.0 = Shift+wheel / トラックパッド水平) は overflow 構成に
+    /// 関係なく常に横 offset を動かす (#089 の規則 2、従来挙動の維持)。
+    #[test]
+    fn horizontal_wheel_always_scrolls_horizontally() {
+        let area = Rect { x: 0.0, y: 0.0, w: 100.0, h: 200.0 };
+        let content = (600.0_f32, 200.0_f32);
+        let off = wheel_once(area, content, (-200.0, 0.0));
+        assert!(
+            (off.0 - 200.0).abs() < 1e-3,
+            "横ホイールが横 offset を 200 まで動かす (got {})",
+            off.0
         );
     }
 }

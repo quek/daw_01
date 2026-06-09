@@ -7740,7 +7740,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 // plain wheel (= 縦 scroll)。 header / lanes どちらの上でも同一挙動。 `!ctrl && !shift`
                 // guard は header 上で横操作キーが押されているときに plain scroll へ落ちないため
                 // (lanes 上では ctrl は上の分岐、 shift は直上の分岐で既に消費されここへ来ない)。
-                let new_top = (view.track_top - dy * 8.0).max(0.0);
+                // M14 Phase 115 (daw_01 #088): dy は入力層で px 化済 (LINE_HEIGHT_PX=40/line)。
+                // 旧実装の追加 ×8 は二重スケール (1 ノッチ 320px ≈ 8 行) だったので撤去し、 scroll_area
+                // と同じ「入力層の px delta をそのまま使う」 に揃える (1 ノッチ ≈ 40px ≈ 1 行)。
+                let new_top = (view.track_top - dy).max(0.0);
                 self.push_edit(make_edit(ArrangementEditRequest::SetTrackTop(new_top)));
             }
         }

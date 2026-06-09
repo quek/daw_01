@@ -139,8 +139,9 @@ fn plain_wheel_over_header_pane_scrolls_vertically() {
         pointer: wheel(HEADER_X, CONTENT_Y, -1.0, Modifiers::empty()),
         ..FrameInput::default()
     });
-    // new_top = (track_top(0) - dy(-1)*8).max(0) = 8。 header 上でも縦スクロールが発火する。
-    assert_eq!(m.track_tops, vec![8.0], "header 上 plain wheel で SetTrackTop が発火");
+    // M14 Phase 115 (daw_01 #088): ×8 二重スケール撤去後は scroll_area と同じく px delta 直使用。
+    // new_top = (track_top(0) - dy(-1)).max(0) = 1。 header 上でも縦スクロールが発火する。
+    assert_eq!(m.track_tops, vec![1.0], "header 上 plain wheel で SetTrackTop が発火");
     assert!(m.zoom_x.is_empty() && m.scroll_x.is_empty() && m.row_h.is_empty());
 }
 
@@ -151,7 +152,8 @@ fn plain_wheel_over_lanes_still_scrolls_vertically() {
         pointer: wheel(LANES_X, CONTENT_Y, -1.0, Modifiers::empty()),
         ..FrameInput::default()
     });
-    assert_eq!(m.track_tops, vec![8.0], "lanes 上 plain wheel は従来どおり SetTrackTop");
+    // M14 Phase 115 (daw_01 #088): ×8 撤去で px delta 直使用 (lanes 上も header と同一量 = 1)。
+    assert_eq!(m.track_tops, vec![1.0], "lanes 上 plain wheel は従来どおり SetTrackTop");
 }
 
 // ---- Alt+wheel: header / lanes どちらでも縦ズーム ----
