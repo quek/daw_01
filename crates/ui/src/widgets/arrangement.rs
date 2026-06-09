@@ -644,6 +644,14 @@ pub enum ArrangementEditRequest {
     /// 反映する (= 「そのトラックだけ」 が伸び縮みする per-track zoom)。 widget は floor 1 px のみ
     /// (= 異常入力 safety)、 caller side で `[min, max]` clamp する idiom (`SetTrackRowH(f32)` と整合)。
     SetSingleTrackRowH { track: u32, prev: u16, next: u16 },
+    /// M14 Phase 117 (daw_01 #091): track header 右端の splitter (= header / lanes 境界の縦線) drag に
+    /// よる **全 track 共通** の header 幅編集。 drag 中は per-frame で発火 (live preview)、 release で
+    /// session 破棄 (per-frame で final 値が発火済)。 `next` は **raw px** (widget は NaN/負値防止の
+    /// `max(0.0)` floor のみ)、 実用 clamp (例 `80..=480`) は caller が行う (`SetZoomX` / `SetTrackRowH`
+    /// と同じ「widget は sanity floor のみ、 min/max は caller」 idiom)。 caller は `view.header_w` を
+    /// `next` (clamp 後) で更新するだけで、 次 frame に header / lanes が連動伸縮する。 `prev` は drag 開始時の
+    /// header 幅 (Undoable 構築用、 per-frame emit でも anchor 固定値)。
+    SetHeaderW { prev: f32, next: f32 },
     /// M14 Phase 63c (#016): group 折り畳み toggle (▼/▶ disclosure click)。
     /// caller は `track.collapsed` を反転した値を保存する (widget 側は描画時に親 chain の
     /// collapsed を辿って子孫 row を skip)。
@@ -1142,6 +1150,11 @@ pub struct ArrangementStyle {
     /// `automation_clip_v_pad_px` (= 6.0) の bottom padding 内に収まるよう小さめに設定 (clip rect とは
     /// 衝突しない: clip 縦範囲は body.y+pad..body.y+h-pad)。
     pub automation_lane_resize_handle_px: f32,
+    /// M14 Phase 117 (daw_01 #091): track header 列と lanes の境界 (`rect.x + header_w` の縦線) を中心と
+    /// した header 幅 drag splitter の hot zone 幅 (px、 横方向)。 default 8.0 → 境界 ±4px。 track header
+    /// 右端には常に 4px の inner pad があり、 この splitter の header 側 (±4px の左半分) はその pad に収まる
+    /// ので M/S/R ボタン / lane disclosure / volume band と衝突しない。 `0.0` で header 幅 drag を無効化。
+    pub header_resize_handle_px: f32,
     /// M14 Phase 63n-5 (#030): lane 高さ drag の **下限 px** (`SetLaneHeight.next` clamp 用)。 default 30。
     /// 30 px は header の icon row + label が 1 段で読める最小 (Bitwig "small" preset 相当)。
     pub automation_lane_min_height_px: u16,
@@ -1317,6 +1330,7 @@ impl Default for ArrangementStyle {
             automation_clip_default_len_beats: 4.0,
             automation_default_band_h: 4.0,
             automation_lane_resize_handle_px: 4.0,
+            header_resize_handle_px: 8.0,
             automation_lane_min_height_px: 30,
             automation_lane_max_height_px: 2000,
             automation_disclosure_size: 12.0,
@@ -2303,6 +2317,23 @@ struct TrackRowResizeDragSession {
     last_emitted_height: f32,
 }
 
+/// M14 Phase 117 (daw_01 #091): header / lanes 境界 splitter drag による **全 track 共通** の header 幅
+/// resize session。 `TrackRowResizeDragSession` と同 pattern (横軸版): drag 開始時の header 幅 + cursor x を
+/// anchor 固定 (view scroll / 連動伸縮で layout が動いても anchor は不変なので追従が壊れない)、 per-frame で
+/// `SetHeaderW { prev: anchor, next }` を emit (live preview)、 release frame で `take()` 破棄 (per-frame で
+/// final 済)。 `last_emitted_w` 同値抑制は 0.5 px 閾値 (f32 連続値の jitter で spam しない)。
+#[derive(Clone, Copy, Debug)]
+struct HeaderResizeDragSession {
+    /// drag 開始時の `view.header_w` (= `SetHeaderW.prev`、 dx 計算の base)。
+    anchor_header_w: f32,
+    /// drag 開始時の cursor x。
+    anchor_mouse_x: f32,
+    /// 最後に観測した cursor x (continuation で update、 release frame は skip して直前値を保持)。
+    last_mouse_x: f32,
+    /// 最後に emit した header 幅 (毎 frame 同値発火を 0.5 px 閾値で抑制)。
+    last_emitted_w: f32,
+}
+
 /// M14 Phase 63n-9 (#033): tension/bend handle drag session。 selected point の Bezier / Exponential
 /// 入射 segment 中央に出る 8x8 px 円を上下 drag → release で `SetAutomationCurveParam` 1 件発火。
 /// drag 中は internal preview state で curve を live update (cached 外で preview line overlay 描画)、
@@ -2405,6 +2436,9 @@ pub(crate) struct ArrangementState {
     /// M14 Phase 63n-6 (#031): MIDI track row 下端 splitter / Alt+drag resize session。
     /// `SetTrackRowH(f32)` を per-frame emit (Alt+wheel と同 idiom)、 release は take 廃棄。
     track_row_resize_drag: Option<TrackRowResizeDragSession>,
+    /// M14 Phase 117 (daw_01 #091): header / lanes 境界 splitter drag による header 幅 resize session。
+    /// `SetHeaderW { prev, next }` を per-frame emit、 release は take 廃棄 (row resize と同 idiom)。
+    header_resize_drag: Option<HeaderResizeDragSession>,
     /// M14 Phase 63n-3 (#028): lane 内 automation clip の Move / Resize drag session
     /// (release で `MoveAutomationClips` / `CloneAutomationClipsLinked` /
     /// `CloneAutomationClipsIndependent` / `ResizeAutomationClips` のいずれか 1 件、
@@ -2747,41 +2781,20 @@ fn draw_lanes_bg<M: ?Sized + 'static>(
     }
 }
 
-/// M14 Phase 89 (daw_01 #060): sRGB 成分 `[0, 1]` から WCAG 2.x relative luminance を算出。
-/// gamma decode (sRGB → linear) を含む。 `Color` は sRGB 前提 (`scene.rs` の doc 参照) なので
-/// そのまま渡してよい。
-fn relative_luminance(r: f32, g: f32, b: f32) -> f32 {
-    fn lin(c: f32) -> f32 {
-        let c = c.clamp(0.0, 1.0);
-        if c <= 0.04045 {
-            c / 12.92
-        } else {
-            ((c + 0.055) / 1.055).powf(2.4)
-        }
-    }
-    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
-}
-
 /// M14 Phase 89 (daw_01 #060): clip が実際に塗る `fill` の輝度から名前 / link glyph のテキスト色を
 /// 自動選択する (SSoT = widget が唯一 fill を知る)。 WCAG relative luminance が閾値 0.179 を超える
 /// (= 明るい fill) なら `clip_text_color_dark`、 そうでなければ `clip_text_color` を返し、 白/黒文字の
 /// どちらか **コントラスト比が高い方** を選ぶ (0.179 は white/black それぞれとのコントラスト比が
 /// 等しくなる relative luminance)。 `fill.a < 1.0` (share clip の半透明 fill 等) は `lane_bg` と
 /// alpha 合成した実効色で判定する。 `style.clip_auto_contrast_text == false` の opt-out 時は常に
-/// `clip_text_color` を返す。
+/// `clip_text_color` を返す。 輝度計算 / alpha 合成 / 閾値判定は piano_roll の鍵盤ラベル (#093) と
+/// 共有する `crate::color` の SSoT helper に委譲する。
 fn clip_text_color_for(style: &ArrangementStyle, fill: Color, lane_bg: Color) -> Color {
     if !style.clip_auto_contrast_text {
         return style.clip_text_color;
     }
-    let a = fill.a.clamp(0.0, 1.0);
-    let r = fill.r * a + lane_bg.r * (1.0 - a);
-    let g = fill.g * a + lane_bg.g * (1.0 - a);
-    let b = fill.b * a + lane_bg.b * (1.0 - a);
-    if relative_luminance(r, g, b) > 0.179 {
-        style.clip_text_color_dark
-    } else {
-        style.clip_text_color
-    }
+    let bg = crate::color::composite_over(fill, lane_bg);
+    crate::color::pick_contrast(bg, style.clip_text_color, style.clip_text_color_dark)
 }
 
 /// M14 Phase 72 (daw_01 #044): `rect` 内に `(tex_w, tex_h)` の native aspect を保ったまま
@@ -3627,6 +3640,33 @@ pub fn track_row_resize_splitter_at(
         }
     }
     None
+}
+
+/// M14 Phase 117 (daw_01 #091): track header 列と lanes の境界 (`arrangement_rect.x + header_w` の縦線)
+/// を中心とした header 幅 drag splitter の hot zone に cursor が当たっているか判定。 hot zone は境界
+/// `±header_resize_handle_px/2` の横帯 × arrangement 全高 (ruler 行も含む縦線全長)。 `header_w <= 0`
+/// (header 無し) / `handle <= 0` で常に `false`。 track header の M/S/R ボタン等とは衝突しない (header の
+/// 右端 4px inner pad に splitter の header 側が収まる)。 press 振り分けで lane/row splitter の **後** に
+/// 評価する (= 同時成立しうる lanes 左端の角は lane/row resize を優先) ので、 実質 cursor は header の
+/// 4px pad 〜 lanes 左端 4px で `EwResize`。
+#[must_use]
+pub fn header_resize_splitter_at(
+    arrangement_rect: Rect,
+    header_w: f32,
+    style: &ArrangementStyle,
+    cx: f32,
+    cy: f32,
+) -> bool {
+    let handle = style.header_resize_handle_px;
+    if handle <= 0.0 || header_w <= 0.0 {
+        return false;
+    }
+    let boundary = arrangement_rect.x + header_w;
+    let half = handle * 0.5;
+    cx >= boundary - half
+        && cx < boundary + half
+        && cy >= arrangement_rect.y
+        && cy < arrangement_rect.y + arrangement_rect.h
 }
 
 /// M14 Phase 63n-2 (#028): lane body 内 cursor 位置から hit する point を返す (後勝ち、 描画順と整合)。
@@ -4767,6 +4807,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 } else {
                     false
                 }
+            } else if header_resize_splitter_at(rect, header_w, style, px, py) {
+                // M14 Phase 117 (daw_01 #091): header / lanes 境界 splitter hit (lane/row splitter 不在の
+                // 場合のみ = lanes 左端 4px の角は lane/row resize を優先)。 → header 幅 resize session 起動。
+                // 境界は arrangement 全高に張るので clip drag (in_lanes) / ruler seek (in_ruler) より優先
+                // させる (両者は後段で `!splitter_press` gate 済)。
+                let state: &mut ArrangementState = self.widget_state(wid);
+                state.header_resize_drag = Some(HeaderResizeDragSession {
+                    anchor_header_w: header_w,
+                    anchor_mouse_x: px,
+                    last_mouse_x: px,
+                    last_emitted_w: header_w,
+                });
+                true
             } else {
                 false
             };
@@ -4854,7 +4907,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     });
                 }
             }
-            if in_ruler {
+            if in_ruler && !splitter_press {
+                // M14 Phase 117 (daw_01 #091): header splitter は arrangement 全高に張るので ruler 行の
+                // 左端 (boundary ±handle/2) で splitter_press が立つ。 その frame は header 幅 resize を
+                // 優先し playhead seek / loop edit は起動しない。
                 let press_beat = px_to_beat(px, ruler.x, ruler.w, view);
                 let press_alt = pointer.modifiers.alt;
                 // M14 Phase 63j (#024): plain (= Shift 非保持) ruler 操作は **playhead seek**
@@ -4936,8 +4992,20 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let track_row_bottom = row_top + row_h_eff;
                 if py < track_row_bottom {
                     // === track row press (既存ロジック) ===
-                    let row =
-                        Rect { x: header_pane.x, y: row_top, w: header_pane.w, h: view.track_row_h };
+                    // M14 Phase 118 follow-up (#092 review): press 側の row も draw 側 `row_for_layout`
+                    // (Phase 63c #016 で導入) と **同じ indent** を適用する。 これまで press は非 indent の
+                    // header_pane 幅で volume band / M·S·R / disclosure / lane disclosure を hit-test して
+                    // いたため、 nested track (depth>0) で「描画位置 (indent 済) と press 判定がズレる」
+                    // pre-existing バグがあった (深ネスト group の indent 空白を click すると volume drag が
+                    // 起動する / 描画済ボタンの click が reorder に化ける 等)。 draw と同 indent にして
+                    // press↔draw を SSoT 化 (depth==0 は indent=0 で byte 完全互換)。
+                    let indent = f32::from(t.depth) * style.indent_px;
+                    let row = Rect {
+                        x: header_pane.x + indent,
+                        y: row_top,
+                        w: (header_pane.w - indent).max(2.0),
+                        h: view.track_row_h,
+                    };
                     let band_h = if matches!(t.kind, TrackKind::Video) {
                         // M14 Phase 72 (#044): video track では volume slider band を非表示
                         // (volume / pan は video には意味を持たない、 instrument / fx_chain と同様)。
@@ -5543,6 +5611,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             {
                 rd.last_mouse_y = py;
             }
+            // M14 Phase 117 (daw_01 #091): header_resize_drag continuation で last_mouse_x を update
+            // (track_row_resize_drag の横軸版、 release frame は per-frame 内で final 済 + take 廃棄)。
+            if let Some(ref mut hd) = state.header_resize_drag
+                && !is_release
+            {
+                hd.last_mouse_x = px;
+            }
             // M14 Phase 63n-3 (#028): automation_clip_drag continuation で last_mouse +
             // last_alt / last_ctrl / last_shift を update (`ClipDragSession` と同 pattern)。
             // release frame の `last_mouse` は pointer.pos != anchor のときのみ update、 modifier は
@@ -5672,6 +5747,30 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     prev,
                     next,
                 }));
+            }
+        }
+
+        // M14 Phase 117 (daw_01 #091): header_resize_drag の per-frame live update。 drag 中は
+        // header 幅変化を毎 frame `SetHeaderW { prev: anchor, next }` で発行する (caller が
+        // `view.header_w` を更新 → 次 frame に header / lanes が連動伸縮)。 `next` は raw px
+        // (NaN/負値防止の `max(0.0)` floor のみ、 実用 clamp は caller)、 同値抑制 0.5 px。
+        if let Some((px, _py)) = pointer.pos
+            && !pointer.primary_just_released
+        {
+            let mut header_emit: Option<(f32, f32)> = None;
+            {
+                let state: &mut ArrangementState = self.widget_state(wid);
+                if let Some(ref mut hd) = state.header_resize_drag {
+                    let dx = px - hd.anchor_mouse_x;
+                    let next = (hd.anchor_header_w + dx).max(0.0);
+                    if (next - hd.last_emitted_w).abs() >= 0.5 {
+                        header_emit = Some((hd.anchor_header_w, next));
+                        hd.last_emitted_w = next;
+                    }
+                }
+            }
+            if let Some((prev, next)) = header_emit {
+                self.push_edit(make_edit(ArrangementEditRequest::SetHeaderW { prev, next }));
             }
         }
 
@@ -5905,6 +6004,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             state.track_row_resize_drag.take();
         }
 
+        // M14 Phase 117 (daw_01 #091): header_resize_drag release take + discard (row resize と同 idiom、
+        // per-frame で final 済)。
+        if pointer.primary_just_released {
+            let state: &mut ArrangementState = self.widget_state(wid);
+            state.header_resize_drag.take();
+        }
+
         // M14 Phase 63n-3 (#028): automation_clip_drag overlay clone + release take。
         // overlay は ghost clip rect を cached 外で重ねる、 release で 1 度だけ
         // `MoveAutomationClips` / `CloneAutomationClipsLinked` / `CloneAutomationClipsIndependent` /
@@ -6039,10 +6145,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let state: &mut ArrangementState = self.widget_state(wid);
             state.automation_lane_resize_drag.is_some() || state.track_row_resize_drag.is_some()
         };
+        // M14 Phase 117 (daw_01 #091): header 幅 resize drag 中 / hover 中は EwResize (横軸)。
+        // active は最優先 (NsResize / clip drag より上)、 hover は lane/row splitter NsResize の後に評価。
+        let header_resize_active = {
+            let state: &mut ArrangementState = self.widget_state(wid);
+            state.header_resize_drag.is_some()
+        };
         let dragging_kind = response
             .dragging
             .or(automation_clip_drag_session.as_ref().map(|acd| acd.kind));
-        if resize_active {
+        if header_resize_active {
+            self.set_cursor(CursorIcon::EwResize);
+        } else if resize_active {
             self.set_cursor(CursorIcon::NsResize);
         } else if let Some(kind) = dragging_kind {
             let cur = match kind {
@@ -6087,6 +6201,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 .is_some())
         {
             self.set_cursor(CursorIcon::NsResize);
+        } else if let Some((cx, cy)) = pointer.pos
+            && header_resize_splitter_at(rect, header_w, style, cx, cy)
+        {
+            // M14 Phase 117 (daw_01 #091): header / lanes 境界 hover で EwResize (discoverability)。
+            // lane/row splitter (NsResize) を上で先に判定済なので角の競合は NsResize 優先。
+            self.set_cursor(CursorIcon::EwResize);
         } else if let Some((px, py)) = pointer.pos
             && (lanes.contains(px, py) || ruler.contains(px, py) || header_pane.contains(px, py))
         {
@@ -8204,8 +8324,29 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 ) {
                     clicked_track_for_select = Some(t.id);
                 }
-                if self.take_double_click_in_rect(name_rect_visible).is_some() {
-                    self.push_edit(make_edit(ArrangementEditRequest::BeginRenameTrack(track_id)));
+                // M14 Phase 118 (daw_01 #092): group track 名 double-click rename の信頼性。 深くネストした
+                // group track は indent で name_rect が 20px floor まで潰れ、 さらに disclosure 分を引くと
+                // `name_rect_visible` が 2〜4px になり double-click が当たらなかった。 group track のみ
+                // **header row 全体** を rename hit zone にし、 single-click で別意味を持つ sub-zone
+                // (disclosure 折り畳み / M·S·R / lane disclosure / volume band drag) を除外する。 これで
+                // indent 空白 + 名前帯のどこを double-click しても rename が始まる (REAPER の TCP 名 dblclick
+                // 流)。 通常 track は `name_rect_visible` のまま (名前帯が潰れないので挙動完全不変、 sub-zone
+                // 除外も常に no-op)。 disclosure の single-click 折り畳みは別経路で priority 高のまま不変。
+                let rename_hit = if is_group { row } else { name_rect_visible };
+                if let Some((dcx, dcy)) = self.take_double_click_in_rect(rename_hit) {
+                    let in_subzone = m_rect.contains(dcx, dcy)
+                        || s_rect.contains(dcx, dcy)
+                        || r_rect.contains(dcx, dcy)
+                        || (is_group && disclosure_rect.contains(dcx, dcy))
+                        || (!t.automation_lanes.is_empty()
+                            && layout.lane_disc_rect.contains(dcx, dcy))
+                        || layout.volume_band.is_some_and(|b| b.contains(dcx, dcy))
+                        // M14 Phase 118 follow-up: group の broad zone は header / lanes 境界まで届くので、
+                        // header 幅 splitter (#091) の hot zone も除外して rename と resize を分離する。
+                        || header_resize_splitter_at(rect, header_w, style, dcx, dcy);
+                    if !in_subzone {
+                        self.push_edit(make_edit(ArrangementEditRequest::BeginRenameTrack(track_id)));
+                    }
                 }
                 self.toggle_button_at(id_mute, "M", m_rect, muted, &style.mute_button, |_| {
                     make_edit(ArrangementEditRequest::ToggleTrackMute(track_id))
@@ -10317,19 +10458,16 @@ mod tests {
         );
     }
 
-    /// M14 Phase 89 (daw_01 #060): `relative_luminance` が代表色で妥当な値を返す。
-    /// white > yellow > 中間緑 > 暗青 > black の単調性 + 既知極値 (black=0 / white=1)。
+    /// M14 Phase 89 (daw_01 #060): arrangement の代表 clip fill が共有 `crate::color` の閾値の
+    /// 期待側に乗る (黄 selected fill = 明るい側 / 暗青 default fill = 暗い側)。 luminance 関数自体の
+    /// 単調性 / 極値は `crate::color` 側で検証済。
     #[test]
-    fn relative_luminance_monotonic_and_extremes() {
-        let black = relative_luminance(0.0, 0.0, 0.0);
-        let white = relative_luminance(1.0, 1.0, 1.0);
-        assert!(black.abs() < 1e-6, "black の luminance は 0: {black}");
-        assert!((white - 1.0).abs() < 1e-6, "white の luminance は 1: {white}");
-        // 明るい黄 (selected fill) は閾値 0.179 を大きく超え、 暗青 (default clip fill) は下回る。
+    fn clip_fills_land_on_expected_contrast_side() {
+        use crate::color::{CONTRAST_LUMINANCE_THRESHOLD, relative_luminance};
         let yellow = relative_luminance(1.0, 0.85, 0.30); // clip_selected_fill
         let dark_blue = relative_luminance(0.18, 0.40, 0.65); // clip_default_fill
-        assert!(yellow > 0.179, "黄 fill は明るい側: {yellow}");
-        assert!(dark_blue < 0.179, "暗青 fill は暗い側: {dark_blue}");
+        assert!(yellow > CONTRAST_LUMINANCE_THRESHOLD, "黄 fill は明るい側: {yellow}");
+        assert!(dark_blue < CONTRAST_LUMINANCE_THRESHOLD, "暗青 fill は暗い側: {dark_blue}");
         assert!(yellow > dark_blue, "黄 > 暗青 の単調性");
     }
 
@@ -12477,5 +12615,373 @@ mod tests {
             found,
             "Phase 77: 負 track_top でも lanes 背景 fill が scissor 付きで生成される"
         );
+    }
+
+    // ============================================================
+    // M14 Phase 117 (daw_01 #091): header 幅 drag splitter
+    // ============================================================
+
+    /// `header_resize_splitter_at` が境界 `rect.x + header_w` 中心 ±handle/2 の縦帯 × 全高で hit、
+    /// 帯の外 / header_w=0 / handle=0 で miss する。
+    #[test]
+    fn header_resize_splitter_at_hits_centered_full_height_band() {
+        let style = ArrangementStyle::default(); // header_resize_handle_px = 8 → ±4
+        let rect = Rect { x: 100.0, y: 50.0, w: 800.0, h: 400.0 };
+        let header_w = 160.0;
+        let boundary = 100.0 + 160.0; // = 260
+        // 境界中心: hit。
+        assert!(header_resize_splitter_at(rect, header_w, &style, boundary, 200.0));
+        // 全高で hit (上端 / 下端近く)。
+        assert!(header_resize_splitter_at(rect, header_w, &style, boundary, 50.0));
+        assert!(header_resize_splitter_at(rect, header_w, &style, boundary, 449.0));
+        // 帯端 (±4px) 内側: hit (256) / 外側: miss (255.9 は < 256 で外、 264 は半開で外)。
+        assert!(header_resize_splitter_at(rect, header_w, &style, 256.0, 200.0));
+        assert!(!header_resize_splitter_at(rect, header_w, &style, 255.0, 200.0));
+        assert!(!header_resize_splitter_at(rect, header_w, &style, 264.0, 200.0));
+        // rect の外 (上 / 下): miss。
+        assert!(!header_resize_splitter_at(rect, header_w, &style, boundary, 49.0));
+        assert!(!header_resize_splitter_at(rect, header_w, &style, boundary, 450.0));
+        // header_w = 0 (header 無し): 常に miss。
+        assert!(!header_resize_splitter_at(rect, 0.0, &style, 100.0, 200.0));
+        // handle = 0: 無効化。
+        let no_handle = ArrangementStyle { header_resize_handle_px: 0.0, ..ArrangementStyle::default() };
+        assert!(!header_resize_splitter_at(rect, header_w, &no_handle, boundary, 200.0));
+    }
+
+    /// header / lanes 境界を press → 右へ drag すると `SetHeaderW { prev: anchor, next: anchor + dx }`
+    /// が per-frame emit される (raw px、 caller clamp 前提)。
+    #[test]
+    fn header_resize_drag_emits_set_header_w() {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        // header_w = 160 / ruler_h = 0 → 境界 x = 160、 splitter は全高 [0, 400)。
+        let view = ArrangementView { header_w: 160.0, ruler_h: 0.0, ..ArrangementView::default() };
+        let model = Model { tracks: vec![track(1, "t", vec![])], view };
+
+        let emitted: Arc<Mutex<Vec<(f32, f32)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let run = |host: &mut UiHost<Model>, scene: &mut Scene, input: FrameInput| {
+            let emitted_cb = Arc::clone(&emitted);
+            let _ = host.frame_to_edits(&model, scene, screen, input, |m, ui| {
+                let style = ArrangementStyle::default();
+                let emitted_cb = Arc::clone(&emitted_cb);
+                let _ = ui.arrangement(
+                    "arr",
+                    Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                    &m.tracks,
+                    m.view,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &style,
+                    None,
+                    move |req| {
+                        if let ArrangementEditRequest::SetHeaderW { prev, next } = req {
+                            emitted_cb.lock().unwrap().push((prev, next));
+                        }
+                        Edit::mutate(|_: &mut Model| {})
+                    },
+                );
+            });
+        };
+
+        // frame 1: 境界 (160, 200) で press → session 起動 (この frame は dx=0 で emit 無し)。
+        run(
+            &mut host,
+            &mut scene,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((160.0, 200.0)),
+                    primary_just_pressed: true,
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..FrameInput::default()
+            },
+        );
+        // frame 2: 右へ 60px drag (220, 200) → SetHeaderW { prev: 160, next: 220 }。
+        run(
+            &mut host,
+            &mut scene,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((220.0, 200.0)),
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..FrameInput::default()
+            },
+        );
+
+        let log = emitted.lock().unwrap();
+        assert_eq!(log.len(), 1, "drag continuation frame で 1 件発火: {log:?}");
+        assert!((log[0].0 - 160.0).abs() < 1e-3, "prev = anchor 160: {}", log[0].0);
+        assert!((log[0].1 - 220.0).abs() < 1e-3, "next = 160 + 60 = 220 (raw): {}", log[0].1);
+    }
+
+    // ============================================================
+    // M14 Phase 118 (daw_01 #092): group track 名 double-click rename の信頼性
+    // ============================================================
+
+    /// 深くネストした group track は header row のどこ (= indent 空白を含む、 sub-zone 以外) を
+    /// double-click しても `BeginRenameTrack` が発火する。 通常 track は名前帯のみで従来どおり。
+    #[test]
+    fn deep_nested_group_dblclick_in_indent_emits_begin_rename() {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        // header_w = 200 / ruler_h = 0 / track_top = 0 → track 1 行 = {0, 0, 200, 32}。
+        let view = ArrangementView {
+            header_w: 200.0,
+            ruler_h: 0.0,
+            track_row_h: 32.0,
+            ..ArrangementView::default()
+        };
+        // track 1 = 深くネストした group (depth 3 で indent 48px)、 track 2 = その子 (= 1 を group 化)。
+        let mut g = track(1, "DeepGroup", vec![]);
+        g.depth = 3;
+        let mut child = track(2, "child", vec![]);
+        child.parent_id = Some(1);
+        child.depth = 4;
+        let model = Model { tracks: vec![g, child], view };
+
+        let renamed: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let run = |host: &mut UiHost<Model>, scene: &mut Scene, pos: (f32, f32)| {
+            let renamed_cb = Arc::clone(&renamed);
+            let input = FrameInput {
+                pointer: PointerFrame {
+                    pos: Some(pos),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..FrameInput::default()
+            };
+            let _ = host.frame_to_edits(&model, scene, screen, input, |m, ui| {
+                let style = ArrangementStyle::default();
+                let renamed_cb = Arc::clone(&renamed_cb);
+                let _ = ui.arrangement(
+                    "arr",
+                    Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                    &m.tracks,
+                    m.view,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &style,
+                    None,
+                    move |req| {
+                        if let ArrangementEditRequest::BeginRenameTrack(tid) = req {
+                            renamed_cb.lock().unwrap().push(tid);
+                        }
+                        Edit::mutate(|_: &mut Model| {})
+                    },
+                );
+            });
+        };
+
+        // indent 空白 (x=10、 disclosure x≈52 より左) で double-click (2 連続 release、 同位置)。
+        run(&mut host, &mut scene, (10.0, 16.0)); // 1 回目: last_click 記録、 rename 無し
+        run(&mut host, &mut scene, (10.0, 16.0)); // 2 回目: double-click → rename
+
+        let log = renamed.lock().unwrap();
+        assert_eq!(log.as_slice(), &[1], "深ネスト group の indent dblclick で track 1 rename: {log:?}");
+    }
+
+    /// 通常 (非 group) track は名前帯 double-click で従来どおり rename、 名前帯外 (volume band) では
+    /// rename しない (= #092 の broad zone は group 限定で、 通常 track 挙動は不変)。
+    #[test]
+    fn normal_track_dblclick_only_renames_on_name_band() {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        let mut host: UiHost<Model> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        // header_w = 200 / row_h = 40 (volume band が出る高さ)、 track 1 行 = {0, 0, 200, 40}。
+        let view = ArrangementView {
+            header_w: 200.0,
+            ruler_h: 0.0,
+            track_row_h: 40.0,
+            ..ArrangementView::default()
+        };
+        let model = Model { tracks: vec![track(1, "Lead", vec![])], view };
+
+        let renamed: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let run = |host: &mut UiHost<Model>, scene: &mut Scene, pos: (f32, f32)| {
+            let renamed_cb = Arc::clone(&renamed);
+            let input = FrameInput {
+                pointer: PointerFrame {
+                    pos: Some(pos),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..FrameInput::default()
+            };
+            let _ = host.frame_to_edits(&model, scene, screen, input, |m, ui| {
+                let style = ArrangementStyle::default();
+                let renamed_cb = Arc::clone(&renamed_cb);
+                let _ = ui.arrangement(
+                    "arr",
+                    Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                    &m.tracks,
+                    m.view,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &style,
+                    None,
+                    move |req| {
+                        if let ArrangementEditRequest::BeginRenameTrack(tid) = req {
+                            renamed_cb.lock().unwrap().push(tid);
+                        }
+                        Edit::mutate(|_: &mut Model| {})
+                    },
+                );
+            });
+        };
+
+        // 名前帯 (左上 x=10, y=8 = inner.y 付近) を double-click → rename。
+        run(&mut host, &mut scene, (10.0, 8.0));
+        run(&mut host, &mut scene, (10.0, 8.0));
+        assert_eq!(renamed.lock().unwrap().as_slice(), &[1], "名前帯 dblclick は rename");
+
+        // volume band (y=34 付近、 名前帯の下) を別位置で double-click → rename しない。
+        renamed.lock().unwrap().clear();
+        run(&mut host, &mut scene, (10.0, 34.0));
+        run(&mut host, &mut scene, (10.0, 34.0));
+        assert!(renamed.lock().unwrap().is_empty(), "通常 track の volume band dblclick は rename しない");
+    }
+
+    /// #092 review follow-up: nested track (depth>0) の volume band press hit-test が draw と同じ indent
+    /// 位置になり、 indent 空白の press では volume drag が起動しない (= SetTrackVolume を出さない)、
+    /// indent 済 band 位置の press では起動する。 旧 (press 非 indent) では indent 空白が band 扱いされ
+    /// 誤って volume drag していた。
+    #[test]
+    fn nested_track_volume_band_press_follows_indent() {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        struct Model {
+            tracks: Vec<ArrangementTrack>,
+            view: ArrangementView,
+        }
+        // header_w = 200 / row_h = 40 (band 可視) / depth 3 → indent = 48px。 indent 済 band ≈ [52, 196]。
+        let view = ArrangementView {
+            header_w: 200.0,
+            ruler_h: 0.0,
+            track_row_h: 40.0,
+            ..ArrangementView::default()
+        };
+
+        let press_then_drag = |press_x: f32| -> usize {
+            let mut host: UiHost<Model> = UiHost::no_redraw();
+            let mut scene = Scene::new();
+            let screen = PhysicalSize { width: 800, height: 600 };
+            let mut t = track(1, "Nested", vec![]);
+            t.depth = 3;
+            let model = Model { tracks: vec![t], view };
+            let vol_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+
+            let run = |host: &mut UiHost<Model>, scene: &mut Scene, input: FrameInput| {
+                let vol_cb = Arc::clone(&vol_count);
+                let _ = host.frame_to_edits(&model, scene, screen, input, |m, ui| {
+                    let style = ArrangementStyle::default();
+                    let vol_cb = Arc::clone(&vol_cb);
+                    let _ = ui.arrangement(
+                        "arr",
+                        Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                        &m.tracks,
+                        m.view,
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &style,
+                        None,
+                        move |req| {
+                            if matches!(req, ArrangementEditRequest::SetTrackVolume { .. }) {
+                                *vol_cb.lock().unwrap() += 1;
+                            }
+                            Edit::mutate(|_: &mut Model| {})
+                        },
+                    );
+                });
+            };
+            // band y ≈ inner.y + btn_h + gap = 4 + 20 + 2 = 26..30。 y=27 を使う。
+            run(
+                &mut host,
+                &mut scene,
+                FrameInput {
+                    pointer: PointerFrame {
+                        pos: Some((press_x, 27.0)),
+                        primary_just_pressed: true,
+                        primary_pressed: true,
+                        ..PointerFrame::default()
+                    },
+                    ..FrameInput::default()
+                },
+            );
+            run(
+                &mut host,
+                &mut scene,
+                FrameInput {
+                    pointer: PointerFrame {
+                        pos: Some((press_x + 20.0, 27.0)),
+                        primary_pressed: true,
+                        ..PointerFrame::default()
+                    },
+                    ..FrameInput::default()
+                },
+            );
+            *vol_count.lock().unwrap()
+        };
+
+        // x=10 = indent 空白 (indent 済 band [52,196] の外) → volume drag 起動しない。
+        assert_eq!(press_then_drag(10.0), 0, "indent 空白 press は volume drag を起動しない");
+        // x=120 = indent 済 band 内 → volume drag 起動 (continuation で SetTrackVolume)。
+        assert!(press_then_drag(120.0) >= 1, "indent 済 band 位置 press は volume drag を起動する");
     }
 }

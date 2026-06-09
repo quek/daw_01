@@ -1684,6 +1684,14 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 mm.arr_view.data_generation += 1;
                 mm.last_action = format!("arr: SetTrackRowH → {new_h:.1}");
             }),
+            ArrangementEditRequest::SetHeaderW { prev: _, next } => Edit::mutate(move |mm: &mut DawModel| {
+                // M14 Phase 117 (daw_01 #091): header / lanes 境界 splitter drag。 widget は raw px を
+                // per-frame で渡すので caller 側で実用 range に clamp (daw_01 の `80..=480` と整合)。
+                let new_w = next.clamp(80.0, 480.0);
+                mm.arr_view.header_w = new_w;
+                mm.arr_view.data_generation += 1;
+                mm.last_action = format!("arr: SetHeaderW → {new_w:.1}");
+            }),
             ArrangementEditRequest::SetSingleTrackRowH { track, prev: _, next } => {
                 Edit::mutate(move |mm: &mut DawModel| {
                     // M14 Phase 63n-6 (#031): per-track row 高さ override。 caller-side clamp は

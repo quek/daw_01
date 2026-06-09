@@ -22,6 +22,7 @@ members = [
     "crates/examples/arrangement_group_snapshot",
     "crates/examples/text_effect_overlay_snapshot",
     "crates/examples/color_picker_verify",
+    "crates/examples/piano_roll_label_snapshot",
 ]
 
 [workspace.package]

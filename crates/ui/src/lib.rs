@@ -11,6 +11,7 @@
 //! - derive マクロは禁止 (Lens 不要、ユーザは手書きクロージャでアクセサを書く)
 
 pub mod clipboard;
+pub mod color;
 pub mod dialog;
 pub mod edit;
 pub mod history;
@@ -60,8 +61,8 @@ pub use widgets::arrangement::{
     TrackKind,
     automation_clip_zone_at, automation_lane_at, automation_lane_header_layout,
     automation_lane_key_at_y, automation_lane_resize_splitter_at, automation_lanes_total_h,
-    automation_point_at, clip_hit, clip_to_rect, effective_master_row_h, lane_disclosure_rect_for,
-    master_row_lanes_total_h, master_row_total_h, track_index_from_y,
+    automation_point_at, clip_hit, clip_to_rect, effective_master_row_h, header_resize_splitter_at,
+    lane_disclosure_rect_for, master_row_lanes_total_h, master_row_total_h, track_index_from_y,
     track_row_height, track_row_resize_splitter_at, visible_track_row_tops,
 };
 pub use widgets::ruler_ops::{

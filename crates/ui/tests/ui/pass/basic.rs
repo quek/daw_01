@@ -369,6 +369,10 @@ fn main() {
                     ArrangementEditRequest::SetSingleTrackRowH { .. } => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
+                    // M14 Phase 117 (daw_01 #091): header / lanes 境界 splitter drag → SetHeaderW。
+                    ArrangementEditRequest::SetHeaderW { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
                 },
             );
             // M11 Phase 51: reorderable_list widget が non-Clone Model でコンパイルする。

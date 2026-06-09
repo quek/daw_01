@@ -562,6 +562,17 @@ pub struct PianoRollStyle {
     /// Fold では out 行は非表示)。 ただし v0 では Highlight mode で out 行に label を描かない
     /// (root 行のみ label) ので、 将来「全 12 行に label」 拡張が来たときの為の予約 field。
     pub out_of_scale_label_fg: Color,
+    /// (M14 Phase 117 / daw_01 #093) 鍵盤オクターブラベルを、 その行の **実効背景** (key fill +
+    /// root/out overlay の alpha 合成色) の WCAG relative luminance で `label_fg_dark` / `label_fg_light`
+    /// に自動反転するか。 default `true`。 `false` で旧挙動 (root=`root_label_fg` / in-scale=
+    /// `in_scale_label_fg` / C=`c_label_color` の固定色)。 arrangement の clip 名 auto-contrast (#060) と
+    /// 同じ「widget が実際に塗った fill から文字色を導出する」 SSoT を鍵盤ラベルに適用したもの。
+    /// warm root 行 (root_row_overlay 重畳の cream) / 白鍵で暗文字、 黒鍵 / dim 行で明文字を選ぶ。
+    pub label_auto_contrast: bool,
+    /// (M14 Phase 117 / daw_01 #093) `label_auto_contrast` で明るい行背景に選ぶ暗ラベル色 (near-black)。
+    pub label_fg_dark: Color,
+    /// (M14 Phase 117 / daw_01 #093) `label_auto_contrast` で暗い行背景に選ぶ明ラベル色 (near-white)。
+    pub label_fg_light: Color,
 }
 
 /// デフォルト velocity color (青系の濃淡 0.5..0.95)。`PianoRollStyle::note_fill_fn` の初期値。
@@ -638,6 +649,12 @@ impl Default for PianoRollStyle {
             root_label_fg: Color::rgb(0.95, 0.78, 0.40),
             in_scale_label_fg: Color::rgb(0.78, 0.80, 0.85),
             out_of_scale_label_fg: Color::rgb(0.45, 0.45, 0.50),
+            // M14 Phase 117 / daw_01 #093: 鍵盤ラベルの auto-contrast (default on)。 両極は white 鍵
+            // (0.92) / black 鍵 (0.10) / warm cream root 行のいずれでも WCAG コントラスト比が十分立つ
+            // near-black / near-white。
+            label_auto_contrast: true,
+            label_fg_dark: Color::rgb(0.13, 0.13, 0.16),
+            label_fg_light: Color::rgb(0.93, 0.94, 0.97),
         }
     }
 }
@@ -2482,6 +2499,27 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 // Internal drawing helpers
 // ============================================================
 
+/// M14 Phase 117 (daw_01 #093): 鍵盤オクターブラベルの色を、 その行の **実効背景** から決める。
+/// `key_fill` (白鍵 / 黒鍵 fill) の上に `overlay` (root_row_overlay / out overlay、 無ければ `None`) を
+/// alpha 合成した「実際に目に入る色」 の WCAG relative luminance で `label_fg_dark` / `label_fg_light` を
+/// 選ぶ (arrangement clip 名 #060 と同じ `crate::color` SSoT)。 `label_auto_contrast == false` なら
+/// `fallback` (旧固定色) をそのまま返す。
+fn keyboard_label_color(
+    style: &PianoRollStyle,
+    key_fill: Color,
+    overlay: Option<Color>,
+    fallback: Color,
+) -> Color {
+    if !style.label_auto_contrast {
+        return fallback;
+    }
+    let bg = match overlay {
+        Some(ov) => crate::color::composite_over(ov, key_fill),
+        None => key_fill,
+    };
+    crate::color::pick_contrast(bg, style.label_fg_light, style.label_fg_dark)
+}
+
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::too_many_lines)]
 fn draw_grid_background<M: ?Sized + 'static>(
     hctx: &mut crate::widgets::heavy::HeavyCtx<'_, '_, M>,
@@ -2633,12 +2671,16 @@ fn draw_grid_background<M: ?Sized + 'static>(
                 let pc = pitch % 12;
                 let name = pitch_class_name(pc);
                 let is_root = Some(pc) == root_pc_opt;
-                let (text, color) = if is_root {
+                let (text, fallback) = if is_root {
                     let octave = (i32::from(pitch) / 12) - 1;
                     (format!("{name}{octave}"), style.root_label_fg)
                 } else {
                     (name.to_string(), style.in_scale_label_fg)
                 };
+                // M14 Phase 117 (daw_01 #093): root 行は root_row_overlay 重畳、 in-scale 行は key fill のみ。
+                // 実効背景の輝度で dark/light を選ぶ (白鍵 in-scale 行で明文字が潰れる旧 symptom も解消)。
+                let overlay = if is_root { Some(style.root_row_overlay) } else { None };
+                let color = keyboard_label_color(style, fill, overlay, fallback);
                 hctx.push_text(GlyphArea {
                     text: text.into(),
                     left: kbd.x + 4.0,
@@ -2708,13 +2750,21 @@ fn draw_grid_background<M: ?Sized + 'static>(
                     if pitch % 12 == root_pc {
                         let octave = (pitch_i / 12) - 1;
                         let name = pitch_class_name(root_pc);
+                        // M14 Phase 117 (daw_01 #093): Highlight mode の root 行は常に root_row_overlay
+                        // 重畳 (warm cream)。 その実効背景で auto-contrast → warm-on-warm 潰れを解消。
+                        let color = keyboard_label_color(
+                            style,
+                            fill,
+                            Some(style.root_row_overlay),
+                            style.root_label_fg,
+                        );
                         hctx.push_text(GlyphArea {
                             text: format!("{name}{octave}").into(),
                             left: kbd.x + 4.0,
                             top: y,
                             font_size: style.c_label_font_px,
                             line_height: style.c_label_font_px * 1.2,
-                            color: style.root_label_fg,
+                            color,
                             clip_rect: None,
                             ..GlyphArea::default()
                         });
@@ -2722,13 +2772,16 @@ fn draw_grid_background<M: ?Sized + 'static>(
                 } else if pitch.is_multiple_of(12) {
                     // 旧挙動: C オクターブだけ
                     let octave = (pitch_i / 12) - 1;
+                    // M14 Phase 117 (daw_01 #093): scale=None の C 行は overlay 無し (key fill のみ)。
+                    // C は白鍵なので auto-contrast で暗文字が選ばれ、 旧 `c_label_color` (dark) と整合。
+                    let color = keyboard_label_color(style, fill, None, style.c_label_color);
                     hctx.push_text(GlyphArea {
                         text: format!("C{octave}").into(),
                         left: kbd.x + 4.0,
                         top: y,
                         font_size: style.c_label_font_px,
                         line_height: style.c_label_font_px * 1.2,
-                        color: style.c_label_color,
+                        color,
                         clip_rect: None,
                         ..GlyphArea::default()
                     });
@@ -3234,6 +3287,35 @@ mod tests {
         assert!(is_black_key(3)); // D#
         assert!(!is_black_key(0)); // C
         assert!(!is_black_key(4)); // E
+    }
+
+    /// M14 Phase 117 (daw_01 #093): 鍵盤ラベル色が行の実効背景 (key fill + overlay 合成) の輝度で
+    /// dark / light を選び、 opt-out 時は fallback を返す。
+    #[test]
+    fn keyboard_label_color_auto_contrast_picks_by_row_bg() {
+        let style = PianoRollStyle::default();
+        // 白鍵 + root_row_overlay (warm cream) → 明るい背景 → 暗ラベル (旧 warm-on-warm 潰れを解消)。
+        let on_root =
+            keyboard_label_color(&style, style.white_key, Some(style.root_row_overlay), style.root_label_fg);
+        assert_eq!(on_root, style.label_fg_dark, "warm cream root 行 → 暗ラベル");
+        // 黒鍵 (overlay 無し) → 暗い背景 → 明ラベル。
+        let on_black = keyboard_label_color(&style, style.black_key, None, style.in_scale_label_fg);
+        assert_eq!(on_black, style.label_fg_light, "黒鍵行 → 明ラベル");
+        // 黒鍵 root + root_row_overlay (warm cream overlay を暗い黒鍵に重ねても実効輝度は閾値下) → 明ラベル。
+        // root が黒鍵 (F# pentatonic 等) の Highlight mode で warm-on-dark にならないことの確認。
+        let on_black_root =
+            keyboard_label_color(&style, style.black_key, Some(style.root_row_overlay), style.root_label_fg);
+        assert_eq!(on_black_root, style.label_fg_light, "黒鍵 root + overlay 行 → 明ラベル");
+        // 白鍵 in-scale (overlay 無し) → 明るい → 暗ラベル (旧 in_scale_label_fg の明文字が潰れる症状も解消)。
+        let on_white = keyboard_label_color(&style, style.white_key, None, style.in_scale_label_fg);
+        assert_eq!(on_white, style.label_fg_dark, "白鍵 in-scale 行 → 暗ラベル");
+        // opt-out: fallback 固定色をそのまま返す。
+        let off = PianoRollStyle { label_auto_contrast: false, ..PianoRollStyle::default() };
+        assert_eq!(
+            keyboard_label_color(&off, off.white_key, Some(off.root_row_overlay), off.root_label_fg),
+            off.root_label_fg,
+            "auto_contrast=false は fallback 固定色"
+        );
     }
 
     // -------- M14 Phase 59 / daw_01 #017: split_into_morae unit tests --------
