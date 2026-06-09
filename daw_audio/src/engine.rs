@@ -2522,14 +2522,15 @@ mod send_tests {
     #[test]
     fn soloed_group_keeps_children_audible() {
         use common::model::Track;
-        let mut song = Song::default();
         // id 10 = group, id 11 = child of 10, id 12 = unrelated.
-        song.tracks = vec![
-            Track { id: 10, ..Track::default() },
-            Track { id: 11, parent_group_id: Some(10), ..Track::default() },
-            Track { id: 12, ..Track::default() },
-        ];
-        song.tracks[0].solo = true; // solo the group
+        let song = Song {
+            tracks: vec![
+                Track { id: 10, solo: true, ..Track::default() }, // solo the group
+                Track { id: 11, parent_group_id: Some(10), ..Track::default() },
+                Track { id: 12, ..Track::default() },
+            ],
+            ..Default::default()
+        };
 
         let any_solo = song.tracks.iter().any(|t| t.solo);
         assert!(any_solo);

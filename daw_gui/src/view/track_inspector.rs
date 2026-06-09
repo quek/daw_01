@@ -11,7 +11,8 @@ use daw_ui_core::{
 use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{
-    text_num_to_builtin, AppData, AppEvent, ColorPickerTarget, PickerTarget, TextNumField,
+    text_num_to_builtin, AppData, AppEvent, ColorPickerTarget, InspectorScrubField, PickerTarget,
+    TextNumField,
 };
 use crate::view::track_color;
 use common::model::{FadeCurve, ImageBuiltinParam, StretchMode, TextAlign};
@@ -69,6 +70,60 @@ const SCRUB_STYLE_GROUP: ScrubableNumberStyle = ScrubableNumberStyle {
     sensitivity: 0.004,
     range: None,
 };
+
+/// FIXME #15 (`docs/plan_inspector_scrub.md`): audio / image / text inspector
+/// の数値 field を 1 行ぶん描く共通 helper。 `ui.scrubable_number_at` を呼び、
+/// on_change で `make_event(v)` が返す `AppEvent` を全 event に broadcast、
+/// drag / text 編集の開始・終了 edge で `BeginInspectorScrub` /
+/// `EndInspectorScrub` を発火して一連の操作を undo 1 step に bracket する
+/// (= Group Transform セクションと同 idiom)。 `scrub_key` は
+/// `app.inspector_scrub_active` の識別に使う。
+#[allow(clippy::too_many_arguments)]
+fn scrub_field(
+    ui: &mut Ui<'_, AppData>,
+    app: &AppData,
+    id: impl std::hash::Hash,
+    rect: Rect,
+    value: f64,
+    default: f64,
+    fmt: ScrubableNumberFormat,
+    style: &ScrubableNumberStyle,
+    scrub_key: InspectorScrubField,
+    make_event: impl Fn(f64) -> AppEvent + Clone + Send + Sync + 'static,
+) {
+    let resp = ui.scrubable_number_at(
+        id,
+        rect,
+        value,
+        default,
+        fmt,
+        style,
+        "Inspector",
+        move |v| {
+            let make_event = make_event.clone();
+            Edit::mutate(move |app: &mut AppData| app.handle_event(make_event(v)))
+        },
+    );
+    // drag / text 編集の開始・終了 edge で undo を 1 step に bracket。
+    let active = resp.dragging || resp.editing_text;
+    let was_active = app.inspector_scrub_active == Some(scrub_key);
+    if active && !was_active {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.inspector_scrub_active = Some(scrub_key);
+            app.handle_event(AppEvent::BeginInspectorScrub);
+        }));
+    } else if !active && was_active {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.inspector_scrub_active = None;
+            app.handle_event(AppEvent::EndInspectorScrub);
+        }));
+    }
+}
+
+/// FIXME #15: audio / image / text inspector の scrubable_number base style。
+/// sensitivity / range は field 別に上書きする (= Group Transform と同 idiom、
+/// `SCRUB_STYLE_GROUP` を共有)。
+const SCRUB_STYLE_INSPECTOR: ScrubableNumberStyle = SCRUB_STYLE_GROUP;
 
 const STRETCH_MODE_LABELS: &[&str] = &["Raw", "Repitch", "Stretch", "Slice"];
 
@@ -304,7 +359,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let input_x = area.x + pad + label_w;
         let input_w = row_w - label_w;
 
-        // Gain
+        let target = summary.target;
+
+        // Gain dB (-80..24)
         ui.label_at(
             "inspector_audio_gain_label",
             "Gain dB",
@@ -313,24 +370,25 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             11.0,
             TEXT_DIM,
         );
-        let gain_resp = ui.text_input_at(
+        scrub_field(
+            ui,
+            app,
             "inspector_audio_gain_input",
             Rect { x: input_x, y, w: input_w, h: input_h },
-            &app.clip_gain_db_edit_text,
-            |s| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ClipGainEditChanged(s))
-                })
+            summary.gain_db.into(),
+            0.0,
+            ScrubableNumberFormat::Decimal(1),
+            &ScrubableNumberStyle {
+                sensitivity: 0.1,
+                range: Some((-80.0, 24.0)),
+                ..SCRUB_STYLE_INSPECTOR
             },
+            InspectorScrubField::Gain,
+            move |v| AppEvent::SetClipGainDb { target, gain_db: v as f32 },
         );
-        if gain_resp.committed {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::CommitClipGainEdit)
-            }));
-        }
         y += input_h + 4.0;
 
-        // Pan
+        // Pan (-1..1)
         ui.label_at(
             "inspector_audio_pan_label",
             "Pan",
@@ -339,24 +397,25 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             11.0,
             TEXT_DIM,
         );
-        let pan_resp = ui.text_input_at(
+        scrub_field(
+            ui,
+            app,
             "inspector_audio_pan_input",
             Rect { x: input_x, y, w: input_w, h: input_h },
-            &app.clip_pan_edit_text,
-            |s| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ClipPanEditChanged(s))
-                })
+            summary.pan.into(),
+            0.0,
+            ScrubableNumberFormat::Decimal(2),
+            &ScrubableNumberStyle {
+                sensitivity: 0.004,
+                range: Some((-1.0, 1.0)),
+                ..SCRUB_STYLE_INSPECTOR
             },
+            InspectorScrubField::Pan,
+            move |v| AppEvent::SetClipPan { target, pan: v as f32 },
         );
-        if pan_resp.committed {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::CommitClipPanEdit)
-            }));
-        }
         y += input_h + 4.0;
 
-        // Pitch (semitones)
+        // Pitch (semitones, -96..96)
         ui.label_at(
             "inspector_audio_pitch_label",
             "Pitch st",
@@ -365,21 +424,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             11.0,
             TEXT_DIM,
         );
-        let pitch_resp = ui.text_input_at(
+        scrub_field(
+            ui,
+            app,
             "inspector_audio_pitch_input",
             Rect { x: input_x, y, w: input_w, h: input_h },
-            &app.clip_pitch_edit_text,
-            |s| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ClipPitchEditChanged(s))
-                })
+            summary.pitch_semitones.into(),
+            0.0,
+            ScrubableNumberFormat::Decimal(1),
+            &ScrubableNumberStyle {
+                sensitivity: 0.05,
+                range: Some((-96.0, 96.0)),
+                ..SCRUB_STYLE_INSPECTOR
             },
+            InspectorScrubField::Pitch,
+            move |v| AppEvent::SetClipPitchSemitones { target, semitones: v as f32 },
         );
-        if pitch_resp.committed {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::CommitClipPitchEdit)
-            }));
-        }
         y += input_h + 8.0;
 
         // ---- Phase 2 PR3: Fade In / Fade Out (length + curve) -------
@@ -392,6 +452,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let fade_len_x = area.x + pad + label_w;
         let fade_curve_x = fade_len_x + fade_len_w + 4.0;
 
+        let fade_max = summary.clip_length_beats.max(0.0);
+
         // Fade In length + curve
         ui.label_at(
             "inspector_audio_fade_in_label",
@@ -401,21 +463,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             11.0,
             TEXT_DIM,
         );
-        let fade_in_resp = ui.text_input_at(
+        scrub_field(
+            ui,
+            app,
             "inspector_audio_fade_in_input",
             Rect { x: fade_len_x, y, w: fade_len_w, h: input_h },
-            &app.clip_fade_in_edit_text,
-            |s| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ClipFadeInEditChanged(s))
-                })
+            summary.fade_in_beats,
+            0.0,
+            ScrubableNumberFormat::Decimal(3),
+            &ScrubableNumberStyle {
+                sensitivity: 0.01,
+                range: Some((0.0, fade_max)),
+                ..SCRUB_STYLE_INSPECTOR
             },
+            InspectorScrubField::FadeIn,
+            move |v| AppEvent::SetClipFadeInBeats { target, beats: v },
         );
-        if fade_in_resp.committed {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::CommitClipFadeInEdit)
-            }));
-        }
         let fade_in_idx = fade_curve_to_index(summary.fade_in_curve);
         if let Some(picked) = ui.dropdown(
             "inspector_audio_fade_in_curve",
@@ -443,21 +506,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             11.0,
             TEXT_DIM,
         );
-        let fade_out_resp = ui.text_input_at(
+        scrub_field(
+            ui,
+            app,
             "inspector_audio_fade_out_input",
             Rect { x: fade_len_x, y, w: fade_len_w, h: input_h },
-            &app.clip_fade_out_edit_text,
-            |s| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ClipFadeOutEditChanged(s))
-                })
+            summary.fade_out_beats,
+            0.0,
+            ScrubableNumberFormat::Decimal(3),
+            &ScrubableNumberStyle {
+                sensitivity: 0.01,
+                range: Some((0.0, fade_max)),
+                ..SCRUB_STYLE_INSPECTOR
             },
+            InspectorScrubField::FadeOut,
+            move |v| AppEvent::SetClipFadeOutBeats { target, beats: v },
         );
-        if fade_out_resp.committed {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::CommitClipFadeOutEdit)
-            }));
-        }
         let fade_out_idx = fade_curve_to_index(summary.fade_out_curve);
         if let Some(picked) = ui.dropdown(
             "inspector_audio_fade_out_curve",
@@ -536,6 +600,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         );
         y += toggle_h + 8.0;
 
+        let target = summary.target;
+        // PiP rect / opacity の scrubable は 0..1 normalized、 細かい step。
+        let style_unit = ScrubableNumberStyle {
+            sensitivity: 0.004,
+            range: Some((0.0, 1.0)),
+            ..SCRUB_STYLE_INSPECTOR
+        };
+
         // X
         ui.label_at(
             "inspector_image_x_label",
@@ -545,21 +617,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             11.0,
             TEXT_DIM,
         );
-        let x_resp = ui.text_input_at(
+        scrub_field(
+            ui,
+            app,
             "inspector_image_x_input",
             Rect { x: input_x, y, w: input_w, h: input_h },
-            &app.clip_image_x_edit_text,
-            |s| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ClipImageXEditChanged(s))
-                })
-            },
+            summary.x.into(),
+            0.0,
+            ScrubableNumberFormat::Decimal(3),
+            &style_unit,
+            InspectorScrubField::ImageX,
+            move |v| AppEvent::SetClipImageX { target, value: v as f32 },
         );
-        if x_resp.committed {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::CommitClipImageXEdit)
-            }));
-        }
         let x_auto_on = summary.x_automated;
         ui.toggle_button_at(
             "inspector_image_x_automate",
@@ -589,21 +658,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             11.0,
             TEXT_DIM,
         );
-        let y_resp = ui.text_input_at(
+        scrub_field(
+            ui,
+            app,
             "inspector_image_y_input",
             Rect { x: input_x, y, w: input_w, h: input_h },
-            &app.clip_image_y_edit_text,
-            |s| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ClipImageYEditChanged(s))
-                })
-            },
+            summary.y.into(),
+            0.0,
+            ScrubableNumberFormat::Decimal(3),
+            &style_unit,
+            InspectorScrubField::ImageY,
+            move |v| AppEvent::SetClipImageY { target, value: v as f32 },
         );
-        if y_resp.committed {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::CommitClipImageYEdit)
-            }));
-        }
         let y_auto_on = summary.y_automated;
         ui.toggle_button_at(
             "inspector_image_y_automate",
@@ -633,21 +699,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             11.0,
             TEXT_DIM,
         );
-        let w_resp = ui.text_input_at(
+        scrub_field(
+            ui,
+            app,
             "inspector_image_w_input",
             Rect { x: input_x, y, w: input_w, h: input_h },
-            &app.clip_image_w_edit_text,
-            |s| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ClipImageWEditChanged(s))
-                })
-            },
+            summary.w.into(),
+            summary.w.into(),
+            ScrubableNumberFormat::Decimal(3),
+            &style_unit,
+            InspectorScrubField::ImageW,
+            move |v| AppEvent::SetClipImageW { target, value: v as f32 },
         );
-        if w_resp.committed {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::CommitClipImageWEdit)
-            }));
-        }
         let w_auto_on = summary.w_automated;
         ui.toggle_button_at(
             "inspector_image_w_automate",
@@ -677,21 +740,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             11.0,
             TEXT_DIM,
         );
-        let h_resp = ui.text_input_at(
+        scrub_field(
+            ui,
+            app,
             "inspector_image_h_input",
             Rect { x: input_x, y, w: input_w, h: input_h },
-            &app.clip_image_h_edit_text,
-            |s| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ClipImageHEditChanged(s))
-                })
-            },
+            summary.h.into(),
+            summary.h.into(),
+            ScrubableNumberFormat::Decimal(3),
+            &style_unit,
+            InspectorScrubField::ImageH,
+            move |v| AppEvent::SetClipImageH { target, value: v as f32 },
         );
-        if h_resp.committed {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::CommitClipImageHEdit)
-            }));
-        }
         let h_auto_on = summary.h_automated;
         ui.toggle_button_at(
             "inspector_image_h_automate",
@@ -721,21 +781,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             11.0,
             TEXT_DIM,
         );
-        let opacity_resp = ui.text_input_at(
+        scrub_field(
+            ui,
+            app,
             "inspector_image_opacity_input",
             Rect { x: input_x, y, w: input_w, h: input_h },
-            &app.clip_image_opacity_edit_text,
-            |s| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ClipImageOpacityEditChanged(s))
-                })
-            },
+            summary.opacity.into(),
+            1.0,
+            ScrubableNumberFormat::Decimal(3),
+            &style_unit,
+            InspectorScrubField::ImageOpacity,
+            move |v| AppEvent::SetClipImageOpacity { target, value: v as f32 },
         );
-        if opacity_resp.committed {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::CommitClipImageOpacityEdit)
-            }));
-        }
         let opacity_auto_on = summary.opacity_automated;
         ui.toggle_button_at(
             "inspector_image_opacity_automate",
@@ -770,21 +827,27 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             11.0,
             TEXT_DIM,
         );
-        let rotation_resp = ui.text_input_at(
+        // Rotation は degree 表示 / 入力（model は radians）。 on_change で
+        // degree→radians 変換、 handler 側が -π..π に wrap するので range なし。
+        scrub_field(
+            ui,
+            app,
             "inspector_image_rotation_input",
             Rect { x: input_x, y, w: input_w, h: input_h },
-            &app.clip_image_rotation_edit_text,
-            |s| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ClipImageRotationEditChanged(s))
-                })
+            f64::from(summary.rotation_radians.to_degrees()),
+            0.0,
+            ScrubableNumberFormat::Decimal(1),
+            &ScrubableNumberStyle {
+                sensitivity: 1.0,
+                range: None,
+                ..SCRUB_STYLE_INSPECTOR
+            },
+            InspectorScrubField::ImageRotation,
+            move |v| AppEvent::SetClipImageRotation {
+                target,
+                value: (v as f32).to_radians(),
             },
         );
-        if rotation_resp.committed {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::CommitClipImageRotationEdit)
-            }));
-        }
         let rotation_auto_on = summary.rotation_automated;
         ui.toggle_button_at(
             "inspector_image_rotation_automate",
@@ -816,6 +879,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let fade_len_x = area.x + pad + label_w;
         let fade_curve_x = fade_len_x + fade_len_w + 4.0;
 
+        let fade_max = summary.clip_length_beats.max(0.0);
+
         // Fade In
         ui.label_at(
             "inspector_image_fade_in_label",
@@ -825,21 +890,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             11.0,
             TEXT_DIM,
         );
-        let fade_in_resp = ui.text_input_at(
+        scrub_field(
+            ui,
+            app,
             "inspector_image_fade_in_input",
             Rect { x: fade_len_x, y, w: fade_len_w, h: input_h },
-            &app.clip_fade_in_edit_text,
-            |s| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ClipFadeInEditChanged(s))
-                })
+            summary.fade_in_beats,
+            0.0,
+            ScrubableNumberFormat::Decimal(3),
+            &ScrubableNumberStyle {
+                sensitivity: 0.01,
+                range: Some((0.0, fade_max)),
+                ..SCRUB_STYLE_INSPECTOR
             },
+            InspectorScrubField::ImageFadeIn,
+            move |v| AppEvent::SetClipFadeInBeats { target, beats: v },
         );
-        if fade_in_resp.committed {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::CommitClipFadeInEdit)
-            }));
-        }
         let fade_in_idx = fade_curve_to_index(summary.fade_in_curve);
         if let Some(picked) = ui.dropdown(
             "inspector_image_fade_in_curve",
@@ -867,21 +933,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             11.0,
             TEXT_DIM,
         );
-        let fade_out_resp = ui.text_input_at(
+        scrub_field(
+            ui,
+            app,
             "inspector_image_fade_out_input",
             Rect { x: fade_len_x, y, w: fade_len_w, h: input_h },
-            &app.clip_fade_out_edit_text,
-            |s| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ClipFadeOutEditChanged(s))
-                })
+            summary.fade_out_beats,
+            0.0,
+            ScrubableNumberFormat::Decimal(3),
+            &ScrubableNumberStyle {
+                sensitivity: 0.01,
+                range: Some((0.0, fade_max)),
+                ..SCRUB_STYLE_INSPECTOR
             },
+            InspectorScrubField::ImageFadeOut,
+            move |v| AppEvent::SetClipFadeOutBeats { target, beats: v },
         );
-        if fade_out_resp.committed {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::CommitClipFadeOutEdit)
-            }));
-        }
         let fade_out_idx = fade_curve_to_index(summary.fade_out_curve);
         if let Some(picked) = ui.dropdown(
             "inspector_image_fade_out_curve",
@@ -1060,8 +1127,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // ---- Text Event section (`docs/plan_text_overlay.md` §4 P5 + P5.B) --
     // selected_clip が `ClipContent::Text` のとき、 first event の全 field
     // (text / font / align / 23 numeric + 2 fade beats / fade curves / mute)
-    // を expose。 numeric field は `TextNumField` discriminator で
-    // `ClipTextNumEditChanged` / `CommitClipTextNumEdit` に dispatch。
+    // を expose。 FIXME #15: numeric field は scrubable_number 化され、
+    // on_change が `TextNumField` discriminator 付き `SetClipTextNumField` を
+    // 直接 dispatch する (drag / type 両対応、 undo は Begin/EndInspectorScrub)。
     if let Some(summary) = app.inspector_text_event_summary() {
         if app.clip_edit_buffer_target != Some(summary.target) {
             let target = summary.target;
@@ -1199,18 +1267,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
         y += input_h + 8.0;
 
-        // 23 numeric rows + 2 fade beats を 1 closure 化した helper で
-        // 順次 emit。 Hash-able な `(field, &'static str)` を id にし、
-        // 各 field 用の widget 識別子を per-field ユニークにする。
+        // FIXME #15: 23 numeric rows + 2 fade beats を 1 closure 化した helper。
+        // 各行を scrubable_number 化し (= 1 箇所変更で 25 行全部が drag 対応)、
+        // `scrub_field` で drag / text 編集を undo 1 step に bracket する。
+        // automate 「A」 トグルは従来どおり共存。 値源は summary の first event
+        // snapshot、 on_change は `SetClipTextNumField` (Rotation は deg→rad)。
+        let text_target = summary.target;
+        let text_fade_max = summary.clip_length_beats.max(0.0);
         let emit_num_row = |ui: &mut Ui<'_, AppData>,
+                            app: &AppData,
                             label: &str,
                             field: TextNumField,
                             row_y: &mut f32| {
-            let buffer = app
-                .clip_text_num_edits
-                .get(&field)
-                .cloned()
-                .unwrap_or_default();
             ui.label_at(
                 (field, "label"),
                 label,
@@ -1219,24 +1287,78 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 11.0,
                 TEXT_DIM,
             );
-            let resp = ui.text_input_at(
+            // field 別の (書式, range, sensitivity[units/px])。 clamp は handler
+            // (`set_clip_text_num_field`) と一致させる。
+            let (fmt, range, sens): (ScrubableNumberFormat, Option<(f64, f64)>, f32) = match field {
+                // PiP rect (0..1 normalized)。
+                TextNumField::X | TextNumField::Y | TextNumField::W | TextNumField::H => {
+                    (ScrubableNumberFormat::Decimal(3), Some((0.0, 1.0)), 0.004)
+                }
+                // Rotation: degree 表示、 handler が -π..π wrap (range なし)。
+                TextNumField::Rotation => (ScrubableNumberFormat::Decimal(1), None, 1.0),
+                // Font size (px, >= 1.0)。
+                TextNumField::FontSize => {
+                    (ScrubableNumberFormat::Decimal(1), Some((1.0, 4096.0)), 0.5)
+                }
+                // 0..1 の opacity / RGBA。
+                TextNumField::Opacity
+                | TextNumField::FillR
+                | TextNumField::FillG
+                | TextNumField::FillB
+                | TextNumField::FillA
+                | TextNumField::OutlineR
+                | TextNumField::OutlineG
+                | TextNumField::OutlineB
+                | TextNumField::OutlineA
+                | TextNumField::ShadowR
+                | TextNumField::ShadowG
+                | TextNumField::ShadowB
+                | TextNumField::ShadowA => {
+                    (ScrubableNumberFormat::Decimal(3), Some((0.0, 1.0)), 0.004)
+                }
+                // px 値 (>= 0)。 outline width / shadow blur。
+                TextNumField::OutlineWidth | TextNumField::ShadowBlur => {
+                    (ScrubableNumberFormat::Decimal(1), Some((0.0, 1024.0)), 0.5)
+                }
+                // shadow offset px (handler 側 clamp 無し、 上下とも自由)。
+                TextNumField::ShadowOffsetX | TextNumField::ShadowOffsetY => {
+                    (ScrubableNumberFormat::Decimal(1), None, 0.5)
+                }
+                // fade beats (0..clip 長)。
+                TextNumField::FadeInBeats | TextNumField::FadeOutBeats => {
+                    (ScrubableNumberFormat::Decimal(3), Some((0.0, text_fade_max)), 0.01)
+                }
+            };
+            let default = match field {
+                // dblclick reset の妥当値。
+                TextNumField::Opacity
+                | TextNumField::FillA
+                | TextNumField::W
+                | TextNumField::H => summary.text_num_field_value(field),
+                TextNumField::FontSize => 48.0,
+                _ => 0.0,
+            };
+            let style = ScrubableNumberStyle { sensitivity: sens, range, ..SCRUB_STYLE_INSPECTOR };
+            scrub_field(
+                ui,
+                app,
                 (field, "input"),
                 Rect { x: input_x, y: *row_y, w: numeric_input_w, h: input_h },
-                &buffer,
-                move |s| {
-                    Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::ClipTextNumEditChanged {
-                            field,
-                            value: s,
-                        })
-                    })
+                summary.text_num_field_value(field),
+                default,
+                fmt,
+                &style,
+                InspectorScrubField::Text(field),
+                move |v| {
+                    // Rotation のみ degree 入力 → radians に変換 (handler が wrap)。
+                    let value = if matches!(field, TextNumField::Rotation) {
+                        (v as f32).to_radians()
+                    } else {
+                        v as f32
+                    };
+                    AppEvent::SetClipTextNumField { target: text_target, field, value }
                 },
             );
-            if resp.committed {
-                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::CommitClipTextNumEdit { field })
-                }));
-            }
             if let Some(builtin) = text_num_to_builtin(field) {
                 let auto_on = summary.automated.contains(&builtin);
                 ui.toggle_button_at(
@@ -1260,31 +1382,31 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             *row_y += input_h + 4.0;
         };
 
-        emit_num_row(ui, "X", TextNumField::X, &mut y);
-        emit_num_row(ui, "Y", TextNumField::Y, &mut y);
-        emit_num_row(ui, "W", TextNumField::W, &mut y);
-        emit_num_row(ui, "H", TextNumField::H, &mut y);
-        emit_num_row(ui, "Rot (°)", TextNumField::Rotation, &mut y);
-        emit_num_row(ui, "Size (px)", TextNumField::FontSize, &mut y);
-        emit_num_row(ui, "Opacity", TextNumField::Opacity, &mut y);
-        emit_num_row(ui, "Fill R", TextNumField::FillR, &mut y);
-        emit_num_row(ui, "Fill G", TextNumField::FillG, &mut y);
-        emit_num_row(ui, "Fill B", TextNumField::FillB, &mut y);
-        emit_num_row(ui, "Fill A", TextNumField::FillA, &mut y);
-        emit_num_row(ui, "Out R", TextNumField::OutlineR, &mut y);
-        emit_num_row(ui, "Out G", TextNumField::OutlineG, &mut y);
-        emit_num_row(ui, "Out B", TextNumField::OutlineB, &mut y);
-        emit_num_row(ui, "Out A", TextNumField::OutlineA, &mut y);
-        emit_num_row(ui, "Out W (px)", TextNumField::OutlineWidth, &mut y);
-        emit_num_row(ui, "Sh R", TextNumField::ShadowR, &mut y);
-        emit_num_row(ui, "Sh G", TextNumField::ShadowG, &mut y);
-        emit_num_row(ui, "Sh B", TextNumField::ShadowB, &mut y);
-        emit_num_row(ui, "Sh A", TextNumField::ShadowA, &mut y);
-        emit_num_row(ui, "Sh X (px)", TextNumField::ShadowOffsetX, &mut y);
-        emit_num_row(ui, "Sh Y (px)", TextNumField::ShadowOffsetY, &mut y);
-        emit_num_row(ui, "Sh Blur (px)", TextNumField::ShadowBlur, &mut y);
-        emit_num_row(ui, "Fade In", TextNumField::FadeInBeats, &mut y);
-        emit_num_row(ui, "Fade Out", TextNumField::FadeOutBeats, &mut y);
+        emit_num_row(ui, app, "X", TextNumField::X, &mut y);
+        emit_num_row(ui, app, "Y", TextNumField::Y, &mut y);
+        emit_num_row(ui, app, "W", TextNumField::W, &mut y);
+        emit_num_row(ui, app, "H", TextNumField::H, &mut y);
+        emit_num_row(ui, app, "Rot (°)", TextNumField::Rotation, &mut y);
+        emit_num_row(ui, app, "Size (px)", TextNumField::FontSize, &mut y);
+        emit_num_row(ui, app, "Opacity", TextNumField::Opacity, &mut y);
+        emit_num_row(ui, app, "Fill R", TextNumField::FillR, &mut y);
+        emit_num_row(ui, app, "Fill G", TextNumField::FillG, &mut y);
+        emit_num_row(ui, app, "Fill B", TextNumField::FillB, &mut y);
+        emit_num_row(ui, app, "Fill A", TextNumField::FillA, &mut y);
+        emit_num_row(ui, app, "Out R", TextNumField::OutlineR, &mut y);
+        emit_num_row(ui, app, "Out G", TextNumField::OutlineG, &mut y);
+        emit_num_row(ui, app, "Out B", TextNumField::OutlineB, &mut y);
+        emit_num_row(ui, app, "Out A", TextNumField::OutlineA, &mut y);
+        emit_num_row(ui, app, "Out W (px)", TextNumField::OutlineWidth, &mut y);
+        emit_num_row(ui, app, "Sh R", TextNumField::ShadowR, &mut y);
+        emit_num_row(ui, app, "Sh G", TextNumField::ShadowG, &mut y);
+        emit_num_row(ui, app, "Sh B", TextNumField::ShadowB, &mut y);
+        emit_num_row(ui, app, "Sh A", TextNumField::ShadowA, &mut y);
+        emit_num_row(ui, app, "Sh X (px)", TextNumField::ShadowOffsetX, &mut y);
+        emit_num_row(ui, app, "Sh Y (px)", TextNumField::ShadowOffsetY, &mut y);
+        emit_num_row(ui, app, "Sh Blur (px)", TextNumField::ShadowBlur, &mut y);
+        emit_num_row(ui, app, "Fade In", TextNumField::FadeInBeats, &mut y);
+        emit_num_row(ui, app, "Fade Out", TextNumField::FadeOutBeats, &mut y);
 
         // Fade curve dropdowns (2 個)。 FADE_CURVE_LABELS / curve <-> index
         // は image fade と同 idiom。

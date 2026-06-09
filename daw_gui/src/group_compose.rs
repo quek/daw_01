@@ -454,8 +454,7 @@ mod tests {
 
     #[test]
     fn none_transform_is_inactive() {
-        let mut track = Track::default();
-        track.id = 7;
+        let mut track = Track { id: 7, ..Default::default() };
         let song = Song::default();
         assert!(group_active_transform(&track, &song, 0.0).is_none());
         track.group_transform = Some(ident());
@@ -549,6 +548,6 @@ mod tests {
         let (song, group_id) = song_with_group(false);
         assert!(is_group_track(&song, group_id));
         assert!(!group_has_visual_content(&song, group_id));
-        assert!(active_visual_groups(&song, 0.0).get(&group_id).is_none());
+        assert!(!active_visual_groups(&song, 0.0).contains_key(&group_id));
     }
 }

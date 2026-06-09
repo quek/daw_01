@@ -3154,8 +3154,10 @@ mod tests {
             parent_group_id: parent,
             ..Track::default()
         };
-        let mut song = Song::default();
-        song.tracks = vec![mk(10, None), mk(11, Some(10)), mk(12, None)];
+        let mut song = Song {
+            tracks: vec![mk(10, None), mk(11, Some(10)), mk(12, None)],
+            ..Default::default()
+        };
 
         // baseline: 何も silenced でない。
         assert!(!song.track_visually_silenced(11));

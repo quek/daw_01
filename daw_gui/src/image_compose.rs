@@ -280,6 +280,7 @@ mod tests {
         Clip, ClipContent, ImageContent, ImageEvent, ImageSource, ImageSourcePath, Track,
     };
 
+    #[allow(clippy::too_many_arguments)]
     fn make_song_with_one_image(
         x: f32,
         y: f32,

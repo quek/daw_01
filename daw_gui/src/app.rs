@@ -142,6 +142,14 @@ pub struct InspectorAudioEventSummary {
     pub stretch_mode: common::model::StretchMode,
     pub fade_in_curve: common::model::FadeCurve,
     pub fade_out_curve: common::model::FadeCurve,
+    // FIXME #15: scrubable_number に表示する現値 (= first event 代表値)。
+    pub gain_db: f32,
+    pub pan: f32,
+    pub pitch_semitones: f32,
+    pub fade_in_beats: f64,
+    pub fade_out_beats: f64,
+    /// fade scrub の range 上限 (= clip 長 beats)。
+    pub clip_length_beats: f64,
 }
 
 /// Image event 単位 field の inspector 表示用 read snapshot
@@ -168,14 +176,27 @@ pub struct InspectorImageEventSummary {
     pub h_automated: bool,
     pub opacity_automated: bool,
     pub rotation_automated: bool,
+    // FIXME #15: scrubable_number に表示する現値 (= first event 代表値)。
+    // rotation は radians 保持 (view が degree 表示に変換)。
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub opacity: f32,
+    pub rotation_radians: f32,
+    pub fade_in_beats: f64,
+    pub fade_out_beats: f64,
+    /// fade scrub の range 上限 (= clip 長 beats)。
+    pub clip_length_beats: f64,
 }
 
 /// docs/plan_text_overlay.md §4 P5: text inspector の編集対象 numeric
-/// field 列挙。 image inspector が 6 field 毎に Set/Changed/Commit 3 event
-/// を持つのに対し、 text は 23 field と多いため `SetClipTextNumField` /
-/// `ClipTextNumEditChanged` / `CommitClipTextNumEdit` の 3 event +
-/// `TextNumField` discriminator で集約する (= 67 events ぶんを 3 event
-/// + 1 enum で表現)。
+/// field 列挙。 image inspector が field 毎に個別 `SetClipImage*` event を
+/// 持つのに対し、 text は 23 field と多いため `SetClipTextNumField` 1 event と
+/// `TextNumField` discriminator で集約する。 FIXME #15 で inspector の数値
+/// 入力は scrubable_number 化され、 on_change が直接 `SetClipTextNumField` を
+/// 発火する (= 旧 `ClipTextNumEditChanged` / `CommitClipTextNumEdit` の
+/// buffer 経路は撤去)。
 ///
 /// FadeInBeats / FadeOutBeats は automation lane 対象外 (= `_automated`
 /// は常に false)、 残 21 field は対応する `TextBuiltinParam` 経由で
@@ -243,6 +264,30 @@ pub fn text_num_to_builtin(field: TextNumField) -> Option<common::model::TextBui
     })
 }
 
+/// FIXME #15 (`docs/plan_inspector_scrub.md`): inspector の scrubable_number
+/// で drag / text 編集中の field を識別する key。 group transform の
+/// `group_scrub_active: Option<GroupTransformParam>` と同 idiom で、 各
+/// scrubable の active edge を検知して `BeginInspectorScrub` /
+/// `EndInspectorScrub` を 1 undo step に bracket する。 audio / image は
+/// fixed な variant、 text は 25 numeric field を `TextNumField` で内包。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InspectorScrubField {
+    Gain,
+    Pan,
+    Pitch,
+    FadeIn,
+    FadeOut,
+    ImageX,
+    ImageY,
+    ImageW,
+    ImageH,
+    ImageOpacity,
+    ImageRotation,
+    ImageFadeIn,
+    ImageFadeOut,
+    Text(TextNumField),
+}
+
 /// docs/plan_text_overlay.md §4 P5: text inspector の read snapshot
 /// (= image idiom)。 `selected_clip` が `ClipContent::Text` を指していて
 /// 中に 1 event 以上あれば `inspector_text_event_summary()` が `Some` を
@@ -257,6 +302,50 @@ pub struct InspectorTextEventSummary {
     pub fade_in_curve: common::model::FadeCurve,
     pub fade_out_curve: common::model::FadeCurve,
     pub automated: std::collections::HashSet<common::model::TextBuiltinParam>,
+    /// FIXME #15: scrubable_number に表示する現値の供給源 (= first event
+    /// snapshot)。 `text_num_field_value` で field 毎の f64 を取り出す
+    /// (Rotation は degree に変換)。
+    pub event: common::model::TextEvent,
+    /// fade scrub の range 上限 (= clip 長 beats)。
+    pub clip_length_beats: f64,
+}
+
+impl InspectorTextEventSummary {
+    /// FIXME #15: scrubable_number の `value` 引数に渡す現値を field 毎に
+    /// 取り出す。 Rotation は内部 radians を degree に変換して返す
+    /// (= 旧 text_input が degree 表示だったのと整合、 on_change で
+    /// radians に戻す)。
+    pub fn text_num_field_value(&self, field: TextNumField) -> f64 {
+        use TextNumField as F;
+        let ev = &self.event;
+        match field {
+            F::X => ev.x.into(),
+            F::Y => ev.y.into(),
+            F::W => ev.w.into(),
+            F::H => ev.h.into(),
+            F::Rotation => ev.rotation_radians.to_degrees().into(),
+            F::FontSize => ev.font_size_px.into(),
+            F::Opacity => ev.opacity.into(),
+            F::FillR => ev.fill_color[0].into(),
+            F::FillG => ev.fill_color[1].into(),
+            F::FillB => ev.fill_color[2].into(),
+            F::FillA => ev.fill_color[3].into(),
+            F::OutlineR => ev.outline_color[0].into(),
+            F::OutlineG => ev.outline_color[1].into(),
+            F::OutlineB => ev.outline_color[2].into(),
+            F::OutlineA => ev.outline_color[3].into(),
+            F::OutlineWidth => ev.outline_width_px.into(),
+            F::ShadowR => ev.shadow_color[0].into(),
+            F::ShadowG => ev.shadow_color[1].into(),
+            F::ShadowB => ev.shadow_color[2].into(),
+            F::ShadowA => ev.shadow_color[3].into(),
+            F::ShadowOffsetX => ev.shadow_offset_px.0.into(),
+            F::ShadowOffsetY => ev.shadow_offset_px.1.into(),
+            F::ShadowBlur => ev.shadow_blur_px.into(),
+            F::FadeInBeats => ev.fade_in_beats,
+            F::FadeOutBeats => ev.fade_out_beats,
+        }
+    }
 }
 
 /// Per-plugin sidechain wiring entry shown in the inspector. One row per
@@ -872,9 +961,7 @@ pub struct AppData {
     pub pianoroll_zoom_x: f32,
     pub pianoroll_zoom_y: f32,
     pub pianoroll_top_pitch: u8,
-    pub pianoroll_scroll_beat: f32,
-    pub pianoroll_notes_generation: u64,
-    /// FL Studio の smart length 互換: 直近に作成 / リサイズ / クリック選択した
+    pub pianoroll_scroll_beat: f32,    /// FL Studio の smart length 互換: 直近に作成 / リサイズ / クリック選択した
     /// ノートの長さ (拍)。次の新規追加時のデフォルト長として使う。session 内
     /// in-memory のみ、永続化はしない。`add_note` / `resize_notes` /
     /// `SetNoteSelection` ハンドラで更新。
@@ -1072,45 +1159,25 @@ pub struct AppData {
     /// は「未ロード」 (= 起動直後 / clip 未選択)。 編集 buffer の中身が
     /// この target の現値と整合する保証はないが (= ユーザー入力中はズレる)、
     /// commit / resync で必ず書き戻す。
+    /// FIXME #15: audio / image inspector の数値 field は scrubable_number
+    /// (drag + type) 化されたため、 個別の名前付き edit-buffer
+    /// (`clip_gain_db_edit_text` 等 / `clip_image_*_edit_text`) は撤去
+    /// (scrubable が編集状態を自前で内包)。 `clip_edit_buffer_target` は
+    /// content / font_family 文字列 buffer の resync 判定に引き続き使う。
     pub clip_edit_buffer_target: Option<ClipRef>,
-    /// `AudioEvent.gain_db` 入力欄の編集中文字列 (`{:.1}` で format)。
-    pub clip_gain_db_edit_text: String,
-    /// `AudioEvent.pan` 入力欄の編集中文字列 (`{:.2}`、 -1.0 .. 1.0)。
-    pub clip_pan_edit_text: String,
-    /// `AudioEvent.pitch_semitones` 入力欄の編集中文字列 (`{:+.1}`、
-    /// -96.0 .. 96.0、 Bitwig spec §3.6)。
-    pub clip_pitch_edit_text: String,
-    /// `AudioEvent.fade_in_beats` / `ImageEvent.fade_in_beats` 入力欄の
-    /// 編集中文字列 (`{:.3}`、 0.0 .. clip.length_beats で clamp、 Bitwig
-    /// spec §3.5)。 buffer は audio / image clip 間で共有 (= 同時に複数
-    /// clip を選択できない、 `clip_edit_buffer_target` の kind で write 先を
-    /// 判定)。
-    pub clip_fade_in_edit_text: String,
-    /// `AudioEvent.fade_out_beats` / `ImageEvent.fade_out_beats` 入力欄の
-    /// 編集中文字列 (`{:.3}`、 0.0 .. clip.length_beats で clamp)。
-    pub clip_fade_out_edit_text: String,
-    /// `ImageEvent.x` 入力欄の編集中文字列 (`{:.3}`、 0.0 .. 1.0 normalized
-    /// PiP rect 左上 X、 `docs/plan_image_overlay.md` §1.1)。
-    pub clip_image_x_edit_text: String,
-    /// `ImageEvent.y` 入力欄の編集中文字列 (`{:.3}`、 0.0 .. 1.0)。
-    pub clip_image_y_edit_text: String,
-    /// `ImageEvent.w` 入力欄の編集中文字列 (`{:.3}`、 0.0 .. 1.0、 PiP 幅)。
-    pub clip_image_w_edit_text: String,
-    /// `ImageEvent.h` 入力欄の編集中文字列 (`{:.3}`、 0.0 .. 1.0、 PiP 高)。
-    pub clip_image_h_edit_text: String,
-    /// `ImageEvent.opacity` 入力欄の編集中文字列 (`{:.3}`、 0.0 .. 1.0)。
-    pub clip_image_opacity_edit_text: String,
-    /// `ImageEvent.rotation_radians` 入力欄の編集中文字列。 ユーザー視点
-    /// は **degree** で表示 (`{:.1}`、 -180.0..=180.0)、 commit 時に
-    /// `to_radians()` で内部 radians に変換。 resync では `to_degrees()`
-    /// で書き戻し。
-    pub clip_image_rotation_edit_text: String,
 
     /// v19 (`docs/plan_tachie_group_transform.md` §5.5): inspector の
     /// scrubable_number で transform を drag / text 編集中の param。drag・編集の
     /// 開始/終了 edge を検知して `BeginGroupTransformDrag` / `End` を発火し、
     /// 一連の操作を undo 1 step に bracket するための tracker（`None` = idle）。
     pub group_scrub_active: Option<common::model::GroupTransformParam>,
+
+    /// FIXME #15 (`docs/plan_inspector_scrub.md`): audio / image / text
+    /// inspector の scrubable_number で drag / text 編集中の field。 drag・
+    /// 編集の開始/終了 edge を検知して `BeginInspectorScrub` /
+    /// `EndInspectorScrub` を発火し、 一連の操作を undo 1 step に bracket
+    /// する tracker（`None` = idle）。 group_scrub_active と同 idiom。
+    pub inspector_scrub_active: Option<InspectorScrubField>,
 
     /// Video export の進捗 `(done_frames, total_frames)`。background thread が
     /// `ExportProgress` で更新。`None` = export 非実行。UI が進捗オーバーレイの
@@ -1127,18 +1194,14 @@ pub struct AppData {
     /// 自動レンダリングした音声 temp WAV。video export 完了後に削除する。
     pub export_temp_wav: Option<std::path::PathBuf>,
 
-    /// docs/plan_text_overlay.md §4 P5: text inspector の edit buffer 群。
-    /// `text` / `font_family` は文字列 field なので standalone、 残 23
-    /// numeric field + 2 fade beats は `clip_text_num_edits: HashMap<
-    /// TextNumField, String>` に集約 (= 1 hash lookup で per-field buffer
-    /// 取得、 image 6 field × 個別 field の重さを回避)。 Enter / focus 喪失
-    /// で `CommitClipText*Edit` を発火、 `set_clip_text_num_field` 経由で
-    /// TextEvent.field を直接書く。 lane override 経由でも同様。
+    /// docs/plan_text_overlay.md §4 P5: text inspector の文字列 edit buffer。
+    /// `text` / `font_family` は文字列 field なので text_input のまま
+    /// standalone (= scrubable 化されない)。 Enter / focus 喪失で
+    /// `CommitClipText{Content,FontFamily}Edit` を発火。 FIXME #15 で
+    /// 25 numeric field は scrubable_number 化され、 `clip_text_num_edits`
+    /// HashMap は撤去 (scrubable が編集状態を自前で内包)。
     pub clip_text_content_edit_text: String,
     pub clip_text_font_family_edit_text: String,
-    /// numeric inspector field の編集中文字列 (= field 毎に format 揃え)。
-    /// resync で全 25 field を populate、 commit で field 毎に parse。
-    pub clip_text_num_edits: std::collections::HashMap<TextNumField, String>,
 
     pub undo_stack: VecDeque<Song>,
     pub redo_stack: VecDeque<Song>,
@@ -1351,9 +1414,7 @@ impl AppData {
             pianoroll_zoom_x: 64.0,
             pianoroll_zoom_y: 14.0,
             pianoroll_top_pitch: 84, // C6
-            pianoroll_scroll_beat: 0.0,
-            pianoroll_notes_generation: 0,
-            last_note_duration_beats: DEFAULT_NOTE_DURATION,
+            pianoroll_scroll_beat: 0.0,            last_note_duration_beats: DEFAULT_NOTE_DURATION,
             preview_note: None,
             pianoroll_snap_enabled: true,
             pianoroll_snap_choice: crate::view::snap::CHOICE_PIANOROLL_DEFAULT,
@@ -1414,21 +1475,10 @@ impl AppData {
             bpm_edit_text: format!("{initial_bpm:.1}"),
             time_sig_num_edit_text: initial_time_sig_num.to_string(),
             clip_edit_buffer_target: None,
-            clip_gain_db_edit_text: String::new(),
-            clip_pan_edit_text: String::new(),
-            clip_pitch_edit_text: String::new(),
-            clip_fade_in_edit_text: String::new(),
-            clip_fade_out_edit_text: String::new(),
             clip_text_content_edit_text: String::new(),
             clip_text_font_family_edit_text: String::new(),
-            clip_text_num_edits: std::collections::HashMap::new(),
-            clip_image_x_edit_text: String::new(),
-            clip_image_y_edit_text: String::new(),
-            clip_image_w_edit_text: String::new(),
-            clip_image_h_edit_text: String::new(),
-            clip_image_opacity_edit_text: String::new(),
-            clip_image_rotation_edit_text: String::new(),
             group_scrub_active: None,
+            inspector_scrub_active: None,
             export_progress: None,
             export_cancel: None,
             pending_video_export: None,
@@ -1835,6 +1885,12 @@ impl AppData {
             stretch_mode: event.stretch_mode,
             fade_in_curve: event.fade_in_curve,
             fade_out_curve: event.fade_out_curve,
+            gain_db: event.gain_db,
+            pan: event.pan,
+            pitch_semitones: event.pitch_semitones,
+            fade_in_beats: event.fade_in_beats,
+            fade_out_beats: event.fade_out_beats,
+            clip_length_beats: clip.length_beats,
         })
     }
 
@@ -1898,6 +1954,15 @@ impl AppData {
             h_automated: has_lane(common::model::ImageBuiltinParam::H),
             opacity_automated: has_lane(common::model::ImageBuiltinParam::Opacity),
             rotation_automated: has_lane(common::model::ImageBuiltinParam::Rotation),
+            x: event.x,
+            y: event.y,
+            w: event.w,
+            h: event.h,
+            opacity: event.opacity,
+            rotation_radians: event.rotation_radians,
+            fade_in_beats: event.fade_in_beats,
+            fade_out_beats: event.fade_out_beats,
+            clip_length_beats: clip.length_beats,
         })
     }
 
@@ -2187,9 +2252,7 @@ impl AppData {
             elapsed_us = reconcile_elapsed.as_micros() as u64,
             "reconcile_plugins_with_song after Undo/Redo"
         );
-        self.resync_song_edit_texts();
-        self.pianoroll_notes_generation += 1;
-    }
+        self.resync_song_edit_texts();    }
 
     /// `handle_event` の冒頭で push_undo_snapshot を auto する対象 event。
     ///
@@ -2231,30 +2294,18 @@ impl AppData {
                 // 「picker session 先頭で 1 回 / discrete edit は毎回」 だけ
                 // snapshot する (image PiP drag と同思想)。
                 | AppEvent::SetClipStretchMode { .. }
-                | AppEvent::CommitClipGainEdit
-                | AppEvent::CommitClipPanEdit
-                | AppEvent::CommitClipPitchEdit
-                | AppEvent::SetClipGainDb { .. }
-                | AppEvent::SetClipPan { .. }
-                | AppEvent::SetClipPitchSemitones { .. }
-                | AppEvent::CommitClipFadeInEdit
-                | AppEvent::CommitClipFadeOutEdit
-                | AppEvent::SetClipFadeInBeats { .. }
-                | AppEvent::SetClipFadeOutBeats { .. }
+                // FIXME #15: inspector の数値 field は scrubable_number 化され、
+                // SetClipGainDb / Pan / Pitch / FadeIn/OutBeats は drag 中 per-
+                // frame 発火するため **非 undoable**。 drag / text 編集 stroke は
+                // `BeginInspectorScrub` (1 snapshot) で 1 undo step に bracket する。
                 | AppEvent::SetClipFadeInCurve { .. }
                 | AppEvent::SetClipFadeOutCurve { .. }
-                | AppEvent::CommitClipImageXEdit
-                | AppEvent::CommitClipImageYEdit
-                | AppEvent::CommitClipImageWEdit
-                | AppEvent::CommitClipImageHEdit
-                | AppEvent::CommitClipImageOpacityEdit
-                | AppEvent::CommitClipImageRotationEdit
                 | AppEvent::BeginImagePiPDrag
                 | AppEvent::BeginGroupTransformDrag
+                | AppEvent::BeginInspectorScrub
                 | AppEvent::BeginTextPiPDrag
                 | AppEvent::CommitClipTextContentEdit
                 | AppEvent::CommitClipTextFontFamilyEdit
-                | AppEvent::CommitClipTextNumEdit { .. }
                 | AppEvent::SetClipTextMuted { .. }
                 | AppEvent::SetClipTextAlign { .. }
                 | AppEvent::SetClipTextFadeInCurve { .. }
@@ -2520,9 +2571,7 @@ impl AppData {
                 n.start_beat = snap(n.start_beat).max(0.0);
             }
         }
-        self.sync_song_to_plugin_host();
-        self.pianoroll_notes_generation += 1;
-    }
+        self.sync_song_to_plugin_host();    }
 
     fn resize_track_peak_display(&mut self) {
         let n = self.song.tracks.len();
@@ -2784,14 +2833,15 @@ pub enum AppEvent {
     SetNoteVelocities(Vec<(u32, u8)>),
     AddInstrumentTrack,
     /// Group the selected tracks under a fresh group track. Mirrors
-    /// Ableton Live's Cmd/Ctrl+G: the existing tracks become children
-    /// (their `parent_group_id` is set), and the new group is inserted
-    /// just *before* the highest-positioned selected track (= 一番上の
-    /// 選択 track の直前 / 子の上にヘッダー)。 `track_ids` must be
-    /// non-empty — Live forbids empty groups and so do we. If a
-    /// selected track is itself a group (= already has children), it
-    /// ends up nested under the new group (Live behaviour, depth
-    /// unbounded).
+    /// Ableton Live's Cmd/Ctrl+G: the *selection-root* tracks become
+    /// children of the new group (their `parent_group_id` is set), and
+    /// the new group is inserted just *before* the highest-positioned
+    /// selected track (= 一番上の選択 track の直前 / 子の上にヘッダー)。
+    /// `track_ids` must be non-empty — Live forbids empty groups and so
+    /// do we. FIXME #13 (plan_group_nesting): only the *selection roots*
+    /// (tracks whose `parent_group_id` is not itself in the selection)
+    /// are re-parented, so a selected group keeps its own children and
+    /// nesting is preserved (depth unbounded) instead of being flattened.
     GroupSelectedTracks {
         track_ids: Vec<u32>,
     },
@@ -3038,6 +3088,17 @@ pub enum AppEvent {
     /// preview drag 終了（非 undoable、begin に snapshot あり）。
     EndGroupTransformDrag,
 
+    /// FIXME #15 (`docs/plan_inspector_scrub.md`): audio / image / text
+    /// inspector の scrubable_number で drag / text 編集を開始した瞬間に
+    /// 発火する marker。 handler 本体は no-op、 `is_undoable` に含まれる
+    /// ので handle_event 冒頭の auto push_undo_snapshot だけが効き、 drag
+    /// 中の `SetClip*` 連発 (= 非 undoable) を 1 undo step に集約する
+    /// (= group transform の `BeginGroupTransformDrag` と同 idiom)。
+    BeginInspectorScrub,
+    /// scrubable_number の drag / text 編集を終了した瞬間に発火 (非
+    /// undoable、 begin 側に snapshot あり)。
+    EndInspectorScrub,
+
     /// docs/plan_text_overlay.md §4 P6: text PiP rect drag で発火する
     /// `SetClipText{X,Y,W,H,Rotation}` 群 (= image と同 idiom)。 lane が
     /// effective なら handler 側で「TextEvent.field を直接書く」 動作で、
@@ -3074,12 +3135,12 @@ pub enum AppEvent {
 
     /// docs/plan_text_overlay.md §4 P5: text inspector の編集パス。
     /// Mute / Text content / Font family は string-shaped で個別 event、
-    /// 23 numeric field + 2 fade beats は `SetClipTextNumField` /
-    /// `ClipTextNumEditChanged` / `CommitClipTextNumEdit` の 3 event で
-    /// `TextNumField` discriminator dispatch (= 75 event ぶんを 3 event + 1
-    /// enum で表現)。 lane override 経由でも同様、 lane が effective なら
-    /// TextEvent.field の直接書き込みは preview に反映されないが edit buffer の
-    /// formatted 表示は更新される。
+    /// 23 numeric field + 2 fade beats は `SetClipTextNumField` 1 event で
+    /// `TextNumField` discriminator dispatch する。 FIXME #15 で数値入力は
+    /// scrubable_number 化され、 on_change が直接 `SetClipTextNumField` を
+    /// 発火 (= 旧 buffer 経路 `ClipTextNumEditChanged` / `CommitClipTextNumEdit`
+    /// は撤去)。 lane override 経由でも同様、 lane が effective なら
+    /// TextEvent.field の直接書き込みは preview に反映されない。
     SetClipTextMuted { target: ClipRef, muted: bool },
     SetClipTextContent { target: ClipRef, value: String },
     SetClipTextFontFamily { target: ClipRef, value: String },
@@ -3087,19 +3148,22 @@ pub enum AppEvent {
     SetClipTextFadeInCurve { target: ClipRef, curve: common::model::FadeCurve },
     SetClipTextFadeOutCurve { target: ClipRef, curve: common::model::FadeCurve },
 
+    /// FIXME #15: text inspector の scrubable_number on_change から発火
+    /// (drag 中 per-frame / text commit)。 `set_clip_text_num_field` で
+    /// `value` (= Rotation は radians) を clamp + 全 TextEvent に書く。
+    /// 非 undoable (= drag stroke を `Begin/EndInspectorScrub` で bracket)。
     SetClipTextNumField { target: ClipRef, field: TextNumField, value: f32 },
-    ClipTextNumEditChanged { field: TextNumField, value: String },
-    CommitClipTextNumEdit { field: TextNumField },
 
     ClipTextContentEditChanged(String),
     ClipTextFontFamilyEditChanged(String),
     CommitClipTextContentEdit,
     CommitClipTextFontFamilyEdit,
 
-    /// 選択中 text clip の `TextEvent` 現値から edit buffer 群を再生成。
-    /// inspector が clip 切替 / Undo / Redo / lane override の効果を反映
-    /// するときに呼ぶ (= image idiom)。 `clip_text_num_edits` HashMap +
-    /// content / font_family string も同時に populate。
+    /// 選択中 text clip の `TextEvent` 現値から文字列 edit buffer
+    /// (content / font_family) を再生成。 inspector が clip 切替 / Undo /
+    /// Redo の効果を反映するときに呼ぶ。 FIXME #15 で 25 numeric field は
+    /// scrubable_number 化され現値を summary から直接読むため、 数値 buffer
+    /// の再生成は不要になった。
     ResyncClipTextEditBuffers(ClipRef),
     /// Phase 4 (`docs/plan_automation.md` §6): automation recording mode の
     /// transport 4 way toggle。 session-only / Undo 対象外。
@@ -3715,47 +3779,22 @@ pub enum AppEvent {
     SetClipStretchMode { target: ClipRef, mode: common::model::StretchMode },
 
     // ---- Audio event 数値 field 編集 (Phase 2 PR2) ----------------------
-    /// Inspector の `target` clip 用 edit buffer (gain / pan / pitch) を
-    /// `target` の現値で再生成する。 `selected_clip` 切替や Undo/Redo /
-    /// open / new で発火。 view 側でも buffer の target が現選択と
-    /// 違ければ `Edit::mutate` で同 AppEvent を push する。 buffer の
-    /// 中身を「現値の formatted 文字列」 に書き戻す純 sync 操作なので
-    /// `is_undoable` ではない。
+    /// FIXME #15: audio / image inspector が `clip_edit_buffer_target` を
+    /// `target` に同期するために発火する純 sync marker。 数値 field は
+    /// scrubable_number 化され現値を summary から直接読むため buffer 再生成
+    /// は不要だが、 text section と共有する `clip_edit_buffer_target` を
+    /// 正しい clip に向けておくために残す。 `is_undoable` ではない。
     ResyncClipEditBuffers(ClipRef),
 
-    /// text_input が 1 文字毎に発行する change event。 buffer 文字列を
-    /// 受け取って `clip_*_edit_text` に書き込むだけ (parse / commit はしない)。
-    /// `is_undoable` ではない (= 連続 typing で undo step を量産しない、
-    /// commit 系を 1 step とする)。
-    ClipGainEditChanged(String),
-    ClipPanEditChanged(String),
-    ClipPitchEditChanged(String),
-
-    /// text_input commit (Enter / focus 喪失) で `clip_*_edit_text` を
-    /// parse して該当 field を更新、 失敗時は buffer を現値に書き戻す。
-    /// `is_undoable` (= 1 commit = 1 Undo step)。 既存 `CommitBpmEdit` と
-    /// 同じパターン。
-    CommitClipGainEdit,
-    CommitClipPanEdit,
-    CommitClipPitchEdit,
-
-    /// Programmatic な field 設定 (Inspector の commit から呼ばれる /
-    /// JS test API 経由 / 将来の knob drag からも)。 全 event に
-    /// broadcast (`SetClipReversed` 等と同じ semantics)。
+    /// FIXME #15: scrubable_number の on_change が発火する programmatic な
+    /// field 設定 (drag 中 per-frame / text commit)。 全 event に broadcast
+    /// (`SetClipReversed` 等と同じ semantics)。 非 undoable (= drag stroke
+    /// を `Begin/EndInspectorScrub` で 1 undo step に bracket)。
     SetClipGainDb { target: ClipRef, gain_db: f32 },
     SetClipPan { target: ClipRef, pan: f32 },
     SetClipPitchSemitones { target: ClipRef, semitones: f32 },
 
     // ---- Audio event fade 編集 (Phase 2 PR3) ----------------------------
-    /// Fade In length (beats) 入力欄の per-character 更新 / commit。
-    /// `Clip*EditChanged` 系と同じ pattern: per-character は非 undoable、
-    /// Commit (Enter / focus 喪失) で parse + clamp + 全 event broadcast、
-    /// undo step を消費する。
-    ClipFadeInEditChanged(String),
-    ClipFadeOutEditChanged(String),
-    CommitClipFadeInEdit,
-    CommitClipFadeOutEdit,
-
     /// Fade length / curve の programmatic 設定。 `SetClipGainDb` 等と
     /// 同じ semantics で全 event に broadcast、 値は clip.length_beats
     /// で clamp (= fade が clip より長くならない)。 curve は spec §3.5
@@ -3769,33 +3808,13 @@ pub enum AppEvent {
     SetClipFadeOutCurve { target: ClipRef, curve: common::model::FadeCurve },
 
     // ---- Image event 編集 (`docs/plan_image_overlay.md` §4 P4) -----------
-    /// PiP rect / opacity の text_input per-character 更新。 buffer
-    /// 文字列のみ更新 (parse / commit はしない)、 非 undoable。
-    ClipImageXEditChanged(String),
-    ClipImageYEditChanged(String),
-    ClipImageWEditChanged(String),
-    ClipImageHEditChanged(String),
-    ClipImageOpacityEditChanged(String),
-    /// `ImageEvent.rotation_radians` 入力欄の per-character 更新
-    /// (ユーザー側は degree 単位、 commit で radians 変換)。
-    ClipImageRotationEditChanged(String),
-
-    /// PiP rect / opacity の text_input commit (Enter / focus 喪失)。
-    /// buffer を parse して値を `set_clip_image_event_*` に通し、
-    /// 失敗時は status_message + buffer を現値に書き戻す。 undoable。
-    CommitClipImageXEdit,
-    CommitClipImageYEdit,
-    CommitClipImageWEdit,
-    CommitClipImageHEdit,
-    CommitClipImageOpacityEdit,
-    /// degree 単位を radians に変換して全 ImageEvent に broadcast。
-    CommitClipImageRotationEdit,
-
-    /// PiP rect / opacity の programmatic 設定 (Inspector commit から
-    /// 呼ばれる / JS test API / 将来の preview drag handle 経由)。 全
-    /// ImageEvent に broadcast。 各値は仕様に従って clamp:
+    /// PiP rect / opacity / rotation の programmatic 設定 (Inspector の
+    /// scrubable_number on_change から / preview drag handle / JS test API
+    /// 経由)。 全 ImageEvent に broadcast。 各値は仕様に従って clamp:
     /// x/y/w/h は [0.0, 1.0]、 opacity も [0.0, 1.0]、 rotation は
-    /// `-π..=π` で wrap (= 360° 連続入力可)。
+    /// `-π..=π` で wrap (= 360° 連続入力可)。 FIXME #15: inspector の
+    /// scrubable 化で `ClipImage*EditChanged` / `CommitClipImage*Edit` は
+    /// 撤去 (drag stroke を `Begin/EndInspectorScrub` で bracket)。
     SetClipImageX { target: ClipRef, value: f32 },
     SetClipImageY { target: ClipRef, value: f32 },
     SetClipImageW { target: ClipRef, value: f32 },
@@ -4325,6 +4344,11 @@ impl AppData {
                 self.set_group_transform_field(track_id, param, value);
             }
             AppEvent::EndGroupTransformDrag => {}
+            // FIXME #15: inspector scrubable_number の drag / text 編集
+            // stroke を 1 undo step に bracket。 Begin は is_undoable 経由で
+            // snapshot を 1 個取る (本体 no-op)、 End は snapshotless。
+            AppEvent::BeginInspectorScrub => {}
+            AppEvent::EndInspectorScrub => {}
             AppEvent::BeginImagePiPDrag => {
                 // snapshot は is_undoable 経由で既に取られている (=
                 // handle_event 冒頭の push_undo_snapshot)。 ここでは
@@ -4929,29 +4953,9 @@ impl AppData {
                 self.set_clip_audio_event_stretch_mode(target, mode);
             }
             AppEvent::ResyncClipEditBuffers(target) => {
-                if self.is_image_clip(target) {
-                    self.resync_clip_image_event_edit_buffers(target);
-                } else {
-                    self.resync_clip_audio_event_edit_buffers(target);
-                }
-            }
-            AppEvent::ClipGainEditChanged(s) => {
-                self.clip_gain_db_edit_text = s;
-            }
-            AppEvent::ClipPanEditChanged(s) => {
-                self.clip_pan_edit_text = s;
-            }
-            AppEvent::ClipPitchEditChanged(s) => {
-                self.clip_pitch_edit_text = s;
-            }
-            AppEvent::CommitClipGainEdit => {
-                self.commit_clip_gain_edit();
-            }
-            AppEvent::CommitClipPanEdit => {
-                self.commit_clip_pan_edit();
-            }
-            AppEvent::CommitClipPitchEdit => {
-                self.commit_clip_pitch_edit();
+                // FIXME #15: 数値 buffer は撤去済み。 text section と共有する
+                // `clip_edit_buffer_target` を target に向ける純 sync。
+                self.clip_edit_buffer_target = Some(target);
             }
             AppEvent::SetClipGainDb { target, gain_db } => {
                 self.set_clip_audio_event_gain_db(target, gain_db);
@@ -4961,18 +4965,6 @@ impl AppData {
             }
             AppEvent::SetClipPitchSemitones { target, semitones } => {
                 self.set_clip_audio_event_pitch_semitones(target, semitones);
-            }
-            AppEvent::ClipFadeInEditChanged(s) => {
-                self.clip_fade_in_edit_text = s;
-            }
-            AppEvent::ClipFadeOutEditChanged(s) => {
-                self.clip_fade_out_edit_text = s;
-            }
-            AppEvent::CommitClipFadeInEdit => {
-                self.commit_clip_fade_in_edit();
-            }
-            AppEvent::CommitClipFadeOutEdit => {
-                self.commit_clip_fade_out_edit();
             }
             AppEvent::SetClipFadeInBeats { target, beats } => {
                 if self.is_image_clip(target) {
@@ -5002,36 +4994,6 @@ impl AppData {
                     self.set_clip_audio_event_fade_out_curve(target, curve);
                 }
             }
-            AppEvent::ClipImageXEditChanged(s) => {
-                self.clip_image_x_edit_text = s;
-            }
-            AppEvent::ClipImageYEditChanged(s) => {
-                self.clip_image_y_edit_text = s;
-            }
-            AppEvent::ClipImageWEditChanged(s) => {
-                self.clip_image_w_edit_text = s;
-            }
-            AppEvent::ClipImageHEditChanged(s) => {
-                self.clip_image_h_edit_text = s;
-            }
-            AppEvent::ClipImageOpacityEditChanged(s) => {
-                self.clip_image_opacity_edit_text = s;
-            }
-            AppEvent::CommitClipImageXEdit => {
-                self.commit_clip_image_x_edit();
-            }
-            AppEvent::CommitClipImageYEdit => {
-                self.commit_clip_image_y_edit();
-            }
-            AppEvent::CommitClipImageWEdit => {
-                self.commit_clip_image_w_edit();
-            }
-            AppEvent::CommitClipImageHEdit => {
-                self.commit_clip_image_h_edit();
-            }
-            AppEvent::CommitClipImageOpacityEdit => {
-                self.commit_clip_image_opacity_edit();
-            }
             AppEvent::SetClipImageX { target, value } => {
                 self.set_clip_image_event_x(target, value);
             }
@@ -5046,12 +5008,6 @@ impl AppData {
             }
             AppEvent::SetClipImageOpacity { target, value } => {
                 self.set_clip_image_event_opacity(target, value);
-            }
-            AppEvent::ClipImageRotationEditChanged(s) => {
-                self.clip_image_rotation_edit_text = s;
-            }
-            AppEvent::CommitClipImageRotationEdit => {
-                self.commit_clip_image_rotation_edit();
             }
             AppEvent::SetClipImageRotation { target, value } => {
                 self.set_clip_image_event_rotation_radians(target, value);
@@ -5097,12 +5053,6 @@ impl AppData {
             }
             AppEvent::SetClipTextNumField { target, field, value } => {
                 self.set_clip_text_num_field(target, field, value);
-            }
-            AppEvent::ClipTextNumEditChanged { field, value } => {
-                self.clip_text_num_edits.insert(field, value);
-            }
-            AppEvent::CommitClipTextNumEdit { field } => {
-                self.commit_clip_text_num_edit(field);
             }
             AppEvent::ClipTextContentEditChanged(s) => {
                 self.clip_text_content_edit_text = s;
@@ -9183,6 +9133,25 @@ impl AppData {
             tracing::warn!(?child_ids, "group request: stale track id, abort");
             return;
         }
+        // FIXME #13 (plan_group_nesting): selection-root rule。 選択集合のうち、
+        // 親 (`parent_group_id`) が同じ選択集合に **含まれていない** トラック
+        // (= 最上位) だけを新グループへ付け替える。 グループとその子を一緒に
+        // 選んだ場合、 子は元のグループに残り、 内側グループの階層が平坦化しない
+        // (= 元グループが解除されない)。
+        let selected: std::collections::HashSet<u32> = child_ids.iter().copied().collect();
+        let roots: Vec<u32> = child_ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.song
+                    .track_by_id(*id)
+                    .and_then(|t| t.parent_group_id)
+                    .is_none_or(|pid| !selected.contains(&pid))
+            })
+            .collect();
+        if roots.is_empty() {
+            return;
+        }
         // 仕様 §4: 「選択トラックのうち、 index が最も小さいものの
         // 直前」 に新グループを挿入 (= 一番上の選択 track の上)。
         // Live 互換、 視覚的には「子の上にヘッダー行」。
@@ -9197,9 +9166,9 @@ impl AppData {
         let common_parent = {
             let first_parent = self
                 .song
-                .track_by_id(child_ids[0])
+                .track_by_id(roots[0])
                 .and_then(|t| t.parent_group_id);
-            if child_ids.iter().all(|id| {
+            if roots.iter().all(|id| {
                 self.song
                     .track_by_id(*id)
                     .and_then(|t| t.parent_group_id)
@@ -9224,8 +9193,10 @@ impl AppData {
             clips: Vec::new(),
             ..Track::default()
         };
-        // Repoint every selected track's parent to the new group.
-        for &cid in &child_ids {
+        // Repoint every selection-root track's parent to the new group.
+        // 子孫 (= 親が選択集合内のトラック) は元の親に残すことで、 内側
+        // グループの入れ子が保たれる (FIXME #13)。
+        for &cid in &roots {
             if let Some(t) = self.song.track_by_id_mut(cid) {
                 t.parent_group_id = Some(group_id);
             }
@@ -10033,9 +10004,7 @@ impl AppData {
             self.pianoroll_zoom_x = (f64::from(grid_w) / span_beats).clamp(8.0, 400.0) as f32;
             self.pianoroll_top_pitch = (i32::from(max_pitch) + 2).clamp(11, 127) as u8;
             self.pianoroll_zoom_y = (grid_h / span_pitch as f32).clamp(6.0, 40.0);
-        }
-        self.pianoroll_notes_generation = self.pianoroll_notes_generation.wrapping_add(1);
-    }
+        }    }
 
     /// 親 group chain のいずれかが `collapsed_groups` に含まれる (= 折り畳まれた
     /// group の配下で hide される) か。 arrangement widget の `is_visible_track`
@@ -10800,44 +10769,20 @@ impl AppData {
         self.resync_clip_audio_event_edit_buffers(target);
     }
 
-    /// `clip_*_edit_text` を `target` clip の first event の現値で
-    /// 再生成する。 select 切替や Undo/Redo / open 時に呼ぶ。 target が
-    /// 該当 clip を解決できない / `ClipContent::Audio` でない場合は
-    /// buffer を空に戻して target を `None` 化する (= inspector で
-    /// audio event section が消えている状態に整合)。
+    /// FIXME #15: audio inspector の数値 field は scrubable_number 化され
+    /// 現値を summary から直接読むため、 専用 edit buffer は撤去。 この関数
+    /// は text section と共有する `clip_edit_buffer_target` を current audio
+    /// clip に同期する純 marker (= 多数の audio 編集パス / song 差し替えから
+    /// 呼ばれる)。 target が audio clip を解決できなければ `None` 化する。
     fn resync_clip_audio_event_edit_buffers(&mut self, target: ClipRef) {
-        let event_snapshot = self
+        let resolved = self
             .song
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
-            .and_then(|c| {
-                if let Some(common::model::ClipContent::Audio(audio)) =
-                    self.song.clip_contents.get(&c.content_id)
-                {
-                    audio.events.first().cloned()
-                } else {
-                    None
-                }
-            });
-        match event_snapshot {
-            Some(ev) => {
-                self.clip_edit_buffer_target = Some(target);
-                self.clip_gain_db_edit_text = format!("{:.1}", ev.gain_db);
-                self.clip_pan_edit_text = format!("{:.2}", ev.pan);
-                self.clip_pitch_edit_text = format!("{:+.1}", ev.pitch_semitones);
-                self.clip_fade_in_edit_text = format!("{:.3}", ev.fade_in_beats);
-                self.clip_fade_out_edit_text = format!("{:.3}", ev.fade_out_beats);
-            }
-            None => {
-                self.clip_edit_buffer_target = None;
-                self.clip_gain_db_edit_text.clear();
-                self.clip_pan_edit_text.clear();
-                self.clip_pitch_edit_text.clear();
-                self.clip_fade_in_edit_text.clear();
-                self.clip_fade_out_edit_text.clear();
-            }
-        }
+            .and_then(|c| self.song.clip_contents.get(&c.content_id))
+            .is_some_and(|content| matches!(content, common::model::ClipContent::Audio(_)));
+        self.clip_edit_buffer_target = if resolved { Some(target) } else { None };
     }
 
     /// `target` clip の length_beats を fade clamp 用に取得する helper。
@@ -11147,33 +11092,12 @@ impl AppData {
         self.set_clip_text_event_font_family(target, value);
     }
 
-    /// docs/plan_text_overlay.md §4 P5: edit buffer を parse して
-    /// `set_clip_text_num_field` を呼ぶ。 Rotation は inspector が degree
-    /// 表示なので commit 時に radians に変換。 parse 失敗は resync で
-    /// formatted な現値に書き戻す (= image inspector と同 idiom)。
-    fn commit_clip_text_num_edit(&mut self, field: TextNumField) {
-        let Some(target) = self.selected_clip else {
-            return;
-        };
-        let Some(buffer) = self.clip_text_num_edits.get(&field).cloned() else {
-            return;
-        };
-        let Ok(parsed) = buffer.trim().parse::<f32>() else {
-            self.resync_clip_text_event_edit_buffers(target);
-            return;
-        };
-        let value = if field == TextNumField::Rotation {
-            parsed.to_radians()
-        } else {
-            parsed
-        };
-        self.set_clip_text_num_field(target, field, value);
-    }
-
     /// docs/plan_text_overlay.md §4 P5: clip 切替 / Undo / Redo / lane
-    /// override 変化等で edit buffer 群を current TextEvent の値で再構築。
-    /// target が Text variant でないなら content / font_family と HashMap
-    /// 全部を空にして `clip_edit_buffer_target` を `None`。
+    /// override 変化等で文字列 edit buffer (content / font_family) を current
+    /// TextEvent の値で再構築。 FIXME #15: 25 numeric field は scrubable_number
+    /// 化され現値を summary から直接読むため、 数値 buffer の再生成は不要に
+    /// なった。 target が Text variant でないなら文字列 buffer を空にして
+    /// `clip_edit_buffer_target` を `None`。
     fn resync_clip_text_event_edit_buffers(&mut self, target: ClipRef) {
         let event_snapshot = self
             .song
@@ -11187,40 +11111,11 @@ impl AppData {
         let Some(ev) = event_snapshot else {
             self.clip_text_content_edit_text.clear();
             self.clip_text_font_family_edit_text.clear();
-            self.clip_text_num_edits.clear();
             self.clip_edit_buffer_target = None;
             return;
         };
         self.clip_text_content_edit_text = ev.text.clone();
         self.clip_text_font_family_edit_text = ev.font_family.clone();
-        use TextNumField as F;
-        let edits = &mut self.clip_text_num_edits;
-        edits.clear();
-        edits.insert(F::X, format!("{:.3}", ev.x));
-        edits.insert(F::Y, format!("{:.3}", ev.y));
-        edits.insert(F::W, format!("{:.3}", ev.w));
-        edits.insert(F::H, format!("{:.3}", ev.h));
-        edits.insert(F::Rotation, format!("{:.1}", ev.rotation_radians.to_degrees()));
-        edits.insert(F::FontSize, format!("{:.1}", ev.font_size_px));
-        edits.insert(F::Opacity, format!("{:.3}", ev.opacity));
-        edits.insert(F::FillR, format!("{:.3}", ev.fill_color[0]));
-        edits.insert(F::FillG, format!("{:.3}", ev.fill_color[1]));
-        edits.insert(F::FillB, format!("{:.3}", ev.fill_color[2]));
-        edits.insert(F::FillA, format!("{:.3}", ev.fill_color[3]));
-        edits.insert(F::OutlineR, format!("{:.3}", ev.outline_color[0]));
-        edits.insert(F::OutlineG, format!("{:.3}", ev.outline_color[1]));
-        edits.insert(F::OutlineB, format!("{:.3}", ev.outline_color[2]));
-        edits.insert(F::OutlineA, format!("{:.3}", ev.outline_color[3]));
-        edits.insert(F::OutlineWidth, format!("{:.1}", ev.outline_width_px));
-        edits.insert(F::ShadowR, format!("{:.3}", ev.shadow_color[0]));
-        edits.insert(F::ShadowG, format!("{:.3}", ev.shadow_color[1]));
-        edits.insert(F::ShadowB, format!("{:.3}", ev.shadow_color[2]));
-        edits.insert(F::ShadowA, format!("{:.3}", ev.shadow_color[3]));
-        edits.insert(F::ShadowOffsetX, format!("{:.1}", ev.shadow_offset_px.0));
-        edits.insert(F::ShadowOffsetY, format!("{:.1}", ev.shadow_offset_px.1));
-        edits.insert(F::ShadowBlur, format!("{:.1}", ev.shadow_blur_px));
-        edits.insert(F::FadeInBeats, format!("{:.3}", ev.fade_in_beats));
-        edits.insert(F::FadeOutBeats, format!("{:.3}", ev.fade_out_beats));
         self.clip_edit_buffer_target = Some(target);
     }
 
@@ -11252,6 +11147,8 @@ impl AppData {
             fade_in_curve: event.fade_in_curve,
             fade_out_curve: event.fade_out_curve,
             automated,
+            event: event.clone(),
+            clip_length_beats: clip.length_beats,
         })
     }
 
@@ -11285,141 +11182,20 @@ impl AppData {
         self.mutate_image_events_in_clip(target, |e| e.fade_out_curve = curve);
     }
 
-    /// `clip_image_*_edit_text` / `clip_fade_*_edit_text` を `target` clip
-    /// の first event の現値で再生成する。 image clip 切替や Undo/Redo 時
-    /// に呼ぶ。 target が `ClipContent::Image` でないなら buffer をクリア
-    /// して `clip_edit_buffer_target` を `None` 化する。
+    /// FIXME #15: image inspector の数値 field は scrubable_number 化され
+    /// 現値を summary から直接読むため、 専用 edit buffer は撤去。 この関数
+    /// は text section と共有する `clip_edit_buffer_target` を current image
+    /// clip に同期する純 marker (= image 編集パス各所から呼ばれる)。 target
+    /// が image clip を解決できなければ `None` 化する。
     fn resync_clip_image_event_edit_buffers(&mut self, target: ClipRef) {
-        let event_snapshot = self
+        let resolved = self
             .song
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
-            .and_then(|c| {
-                if let Some(common::model::ClipContent::Image(image)) =
-                    self.song.clip_contents.get(&c.content_id)
-                {
-                    image.events.first().cloned()
-                } else {
-                    None
-                }
-            });
-        match event_snapshot {
-            Some(ev) => {
-                self.clip_edit_buffer_target = Some(target);
-                self.clip_image_x_edit_text = format!("{:.3}", ev.x);
-                self.clip_image_y_edit_text = format!("{:.3}", ev.y);
-                self.clip_image_w_edit_text = format!("{:.3}", ev.w);
-                self.clip_image_h_edit_text = format!("{:.3}", ev.h);
-                self.clip_image_opacity_edit_text = format!("{:.3}", ev.opacity);
-                self.clip_image_rotation_edit_text =
-                    format!("{:.1}", ev.rotation_radians.to_degrees());
-                self.clip_fade_in_edit_text = format!("{:.3}", ev.fade_in_beats);
-                self.clip_fade_out_edit_text = format!("{:.3}", ev.fade_out_beats);
-            }
-            None => {
-                self.clip_edit_buffer_target = None;
-                self.clip_image_x_edit_text.clear();
-                self.clip_image_y_edit_text.clear();
-                self.clip_image_w_edit_text.clear();
-                self.clip_image_h_edit_text.clear();
-                self.clip_image_opacity_edit_text.clear();
-                self.clip_image_rotation_edit_text.clear();
-                self.clip_fade_in_edit_text.clear();
-                self.clip_fade_out_edit_text.clear();
-            }
-        }
-    }
-
-    fn commit_clip_image_x_edit(&mut self) {
-        let Some(target) = self.clip_edit_buffer_target else {
-            return;
-        };
-        match self.clip_image_x_edit_text.trim().parse::<f32>() {
-            Ok(v) => self.set_clip_image_event_x(target, v),
-            Err(_) => {
-                self.status_message =
-                    format!("Image X: '{}' を数値として解釈できません", self.clip_image_x_edit_text);
-                self.resync_clip_image_event_edit_buffers(target);
-            }
-        }
-    }
-
-    fn commit_clip_image_y_edit(&mut self) {
-        let Some(target) = self.clip_edit_buffer_target else {
-            return;
-        };
-        match self.clip_image_y_edit_text.trim().parse::<f32>() {
-            Ok(v) => self.set_clip_image_event_y(target, v),
-            Err(_) => {
-                self.status_message =
-                    format!("Image Y: '{}' を数値として解釈できません", self.clip_image_y_edit_text);
-                self.resync_clip_image_event_edit_buffers(target);
-            }
-        }
-    }
-
-    fn commit_clip_image_w_edit(&mut self) {
-        let Some(target) = self.clip_edit_buffer_target else {
-            return;
-        };
-        match self.clip_image_w_edit_text.trim().parse::<f32>() {
-            Ok(v) => self.set_clip_image_event_w(target, v),
-            Err(_) => {
-                self.status_message =
-                    format!("Image W: '{}' を数値として解釈できません", self.clip_image_w_edit_text);
-                self.resync_clip_image_event_edit_buffers(target);
-            }
-        }
-    }
-
-    fn commit_clip_image_h_edit(&mut self) {
-        let Some(target) = self.clip_edit_buffer_target else {
-            return;
-        };
-        match self.clip_image_h_edit_text.trim().parse::<f32>() {
-            Ok(v) => self.set_clip_image_event_h(target, v),
-            Err(_) => {
-                self.status_message =
-                    format!("Image H: '{}' を数値として解釈できません", self.clip_image_h_edit_text);
-                self.resync_clip_image_event_edit_buffers(target);
-            }
-        }
-    }
-
-    fn commit_clip_image_opacity_edit(&mut self) {
-        let Some(target) = self.clip_edit_buffer_target else {
-            return;
-        };
-        match self.clip_image_opacity_edit_text.trim().parse::<f32>() {
-            Ok(v) => self.set_clip_image_event_opacity(target, v),
-            Err(_) => {
-                self.status_message = format!(
-                    "Image Opacity: '{}' を数値として解釈できません",
-                    self.clip_image_opacity_edit_text
-                );
-                self.resync_clip_image_event_edit_buffers(target);
-            }
-        }
-    }
-
-    /// ユーザー入力 degree を radians に変換して `set_clip_image_event
-    /// _rotation_radians` に渡す。 parse 失敗時は buffer を resync で
-    /// 現値に書き戻し + status 表示。
-    fn commit_clip_image_rotation_edit(&mut self) {
-        let Some(target) = self.clip_edit_buffer_target else {
-            return;
-        };
-        match self.clip_image_rotation_edit_text.trim().parse::<f32>() {
-            Ok(deg) => self.set_clip_image_event_rotation_radians(target, deg.to_radians()),
-            Err(_) => {
-                self.status_message = format!(
-                    "Image Rotation: '{}' を数値として解釈できません",
-                    self.clip_image_rotation_edit_text
-                );
-                self.resync_clip_image_event_edit_buffers(target);
-            }
-        }
+            .and_then(|c| self.song.clip_contents.get(&c.content_id))
+            .is_some_and(|content| matches!(content, common::model::ClipContent::Image(_)));
+        self.clip_edit_buffer_target = if resolved { Some(target) } else { None };
     }
 
     /// `target` が指す clip が `ClipContent::Image` か。 commit / fade /
@@ -11435,32 +11211,6 @@ impl AppData {
             self.song.clip_contents.get(&clip.content_id),
             Some(common::model::ClipContent::Image(_))
         )
-    }
-
-    fn commit_clip_fade_in_edit(&mut self) {
-        let Some(target) = self.clip_edit_buffer_target else {
-            return;
-        };
-        match self.clip_fade_in_edit_text.trim().parse::<f64>() {
-            Ok(v) => {
-                if self.is_image_clip(target) {
-                    self.set_clip_image_event_fade_in_beats(target, v);
-                } else {
-                    self.set_clip_audio_event_fade_in_beats(target, v);
-                }
-            }
-            Err(_) => {
-                self.status_message = format!(
-                    "Fade In: '{}' を数値として解釈できません",
-                    self.clip_fade_in_edit_text
-                );
-                if self.is_image_clip(target) {
-                    self.resync_clip_image_event_edit_buffers(target);
-                } else {
-                    self.resync_clip_audio_event_edit_buffers(target);
-                }
-            }
-        }
     }
 
     /// audio clip 判定。 `target` が指す clip が `ClipContent::Audio` か。
@@ -11990,80 +11740,6 @@ impl AppData {
         }
     }
 
-    fn commit_clip_fade_out_edit(&mut self) {
-        let Some(target) = self.clip_edit_buffer_target else {
-            return;
-        };
-        match self.clip_fade_out_edit_text.trim().parse::<f64>() {
-            Ok(v) => {
-                if self.is_image_clip(target) {
-                    self.set_clip_image_event_fade_out_beats(target, v);
-                } else {
-                    self.set_clip_audio_event_fade_out_beats(target, v);
-                }
-            }
-            Err(_) => {
-                self.status_message = format!(
-                    "Fade Out: '{}' を数値として解釈できません",
-                    self.clip_fade_out_edit_text
-                );
-                if self.is_image_clip(target) {
-                    self.resync_clip_image_event_edit_buffers(target);
-                } else {
-                    self.resync_clip_audio_event_edit_buffers(target);
-                }
-            }
-        }
-    }
-
-    /// text_input commit (Enter / focus 喪失) 経路。 buffer を parse して
-    /// 成功時は `set_clip_audio_event_gain_db` 経由で全 event 更新 +
-    /// resync (= buffer を formatted な現値に書き戻し)、 失敗時は
-    /// status_message + buffer のみ resync。 `CommitBpmEdit` と同じ pattern。
-    fn commit_clip_gain_edit(&mut self) {
-        let Some(target) = self.clip_edit_buffer_target else {
-            return;
-        };
-        match self.clip_gain_db_edit_text.trim().parse::<f32>() {
-            Ok(v) => self.set_clip_audio_event_gain_db(target, v),
-            Err(_) => {
-                self.status_message =
-                    format!("Gain: '{}' を数値として解釈できません", self.clip_gain_db_edit_text);
-                self.resync_clip_audio_event_edit_buffers(target);
-            }
-        }
-    }
-
-    fn commit_clip_pan_edit(&mut self) {
-        let Some(target) = self.clip_edit_buffer_target else {
-            return;
-        };
-        match self.clip_pan_edit_text.trim().parse::<f32>() {
-            Ok(v) => self.set_clip_audio_event_pan(target, v),
-            Err(_) => {
-                self.status_message =
-                    format!("Pan: '{}' を数値として解釈できません", self.clip_pan_edit_text);
-                self.resync_clip_audio_event_edit_buffers(target);
-            }
-        }
-    }
-
-    fn commit_clip_pitch_edit(&mut self) {
-        let Some(target) = self.clip_edit_buffer_target else {
-            return;
-        };
-        match self.clip_pitch_edit_text.trim().parse::<f32>() {
-            Ok(v) => self.set_clip_audio_event_pitch_semitones(target, v),
-            Err(_) => {
-                self.status_message = format!(
-                    "Pitch: '{}' を数値として解釈できません",
-                    self.clip_pitch_edit_text
-                );
-                self.resync_clip_audio_event_edit_buffers(target);
-            }
-        }
-    }
-
     /// Clip の左右端 trim ハンドラ。 caller (arrangement widget) は
     /// `ResizeClipDelta { prev_start, next_start, prev_len, next_len }`
     /// から `next_start` / `next_len` を直接渡す。 ここで `delta_start =
@@ -12542,9 +12218,7 @@ impl AppData {
         }
         self.status_message =
             format!("{count} 件の note を scale に補正しました");
-        self.sync_song_to_plugin_host();
-        self.pianoroll_notes_generation += 1;
-    }
+        self.sync_song_to_plugin_host();    }
 
     fn add_note(
         &mut self,
@@ -12599,9 +12273,7 @@ impl AppData {
         }
         self.selected_notes = vec![new_idx];
         self.last_note_duration_beats = duration;
-        self.sync_song_to_plugin_host();
-        self.pianoroll_notes_generation += 1;
-    }
+        self.sync_song_to_plugin_host();    }
 
     fn set_note_positions(&mut self, entries: &[(u32, f64, u8)]) {
         let Some(r) = self.selected_clip else {
@@ -12647,9 +12319,7 @@ impl AppData {
             note.start_beat = beat.max(0.0);
             note.pitch = pitch;
         }
-        self.sync_song_to_plugin_host();
-        self.pianoroll_notes_generation += 1;
-    }
+        self.sync_song_to_plugin_host();    }
 
     fn resize_notes(&mut self, entries: &[(u32, f64, f64)]) {
         let Some(r) = self.selected_clip else {
@@ -12671,9 +12341,7 @@ impl AppData {
         if let Some(&(_, _, duration)) = entries.last() {
             self.last_note_duration_beats = duration.max(0.0625);
         }
-        self.sync_song_to_plugin_host();
-        self.pianoroll_notes_generation += 1;
-    }
+        self.sync_song_to_plugin_host();    }
 
     /// ピアノロールで選択中ノート (`selected_notes`) を複製する (D キー)。
     /// 複製は選択範囲の beat span ぶん後ろにずらし、元ノートは据え置き、
@@ -12698,9 +12366,7 @@ impl AppData {
             return;
         }
         self.selected_notes = new_ids;
-        self.sync_song_to_plugin_host();
-        self.pianoroll_notes_generation += 1;
-    }
+        self.sync_song_to_plugin_host();    }
 
     /// gui_01 #054 (Ctrl+drag コピー): `entries` = [(source note index,
     /// new_start_beat, new_pitch)]。各 source を deep clone して指定位置へ配置し
@@ -12720,9 +12386,7 @@ impl AppData {
             return;
         }
         self.selected_notes = new_ids;
-        self.sync_song_to_plugin_host();
-        self.pianoroll_notes_generation += 1;
-    }
+        self.sync_song_to_plugin_host();    }
 
     fn resize_note(
         &mut self,
@@ -12742,9 +12406,7 @@ impl AppData {
             return;
         };
         note.duration_beats = new_duration;
-        self.sync_song_to_plugin_host();
-        self.pianoroll_notes_generation += 1;
-    }
+        self.sync_song_to_plugin_host();    }
 
     fn delete_selected_notes(&mut self) {
         let Some(r) = self.selected_clip else {
@@ -12766,9 +12428,7 @@ impl AppData {
                 }
             }
         }
-        self.sync_song_to_plugin_host();
-        self.pianoroll_notes_generation += 1;
-    }
+        self.sync_song_to_plugin_host();    }
 
     /// Track Inspector の Vocal speaker dropdown 経由で speaker_id 変更。
     /// 対象 track が `InstrumentSource::Vocal` でなければ no-op。
@@ -12817,9 +12477,7 @@ impl AppData {
             }
         }
         if changed {
-            self.sync_song_to_plugin_host();
-            self.pianoroll_notes_generation += 1;
-        }
+            self.sync_song_to_plugin_host();        }
     }
 
     // -------- Plugin GUI bridge --------------------------------------------
@@ -14045,16 +13703,15 @@ impl AppData {
     fn resync_song_edit_texts(&mut self) {
         self.bpm_edit_text = format!("{:.1}", self.song.bpm);
         self.time_sig_num_edit_text = self.song.time_sig.0.to_string();
-        // Audio event 数値 buffer も song 差し替え (open / new / undo /
-        // redo) に追従。 selected_clip が無い / 範囲外 / 非 audio なら
-        // resync が target を None 化してくれる。
+        // FIXME #15: clip 数値 field は scrubable_number 化され専用 buffer は
+        // 撤去。 共有 `clip_edit_buffer_target` だけ song 差し替え (open / new
+        // / undo / redo) に追従させる。 selected_clip が image / text の場合は
+        // 次フレームの view 側 target 不一致検知で正しい resync が走るため、
+        // ここでは audio marker (= 非 audio なら None 化) で十分。
         match self.selected_clip {
             Some(target) => self.resync_clip_audio_event_edit_buffers(target),
             None => {
                 self.clip_edit_buffer_target = None;
-                self.clip_gain_db_edit_text.clear();
-                self.clip_pan_edit_text.clear();
-                self.clip_pitch_edit_text.clear();
             }
         }
     }

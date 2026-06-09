@@ -277,6 +277,7 @@ mod tests {
     use super::*;
     use common::model::{Clip, ClipContent, TextContent, TextEvent, Track};
 
+    #[allow(clippy::too_many_arguments)]
     fn make_song_with_one_text(
         text: &str,
         x: f32,

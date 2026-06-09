@@ -123,6 +123,26 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         },
     });
 
+    // FIXME #10 (plan_clip_label_cache): widget の note キャッシュ無効化キー。
+    // 旧実装は `pianoroll_notes_generation` を 12 箇所で手動 += 1 しており、 新しい
+    // note 編集経路を足して bump を書き忘れると編集が画面に出ない取りこぼしが
+    // 起きた。 widget へ渡す `widget_notes` の内容そのものを hash し、 note が
+    // 変われば必ず無効化する correct-by-construction なキーにする。
+    let notes_generation = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        widget_notes.len().hash(&mut h);
+        for n in &widget_notes {
+            n.id.hash(&mut h);
+            n.start_beat.to_bits().hash(&mut h);
+            n.len_beats.to_bits().hash(&mut h);
+            n.pitch.hash(&mut h);
+            n.velocity.hash(&mut h);
+            n.lyric.hash(&mut h);
+        }
+        h.finish()
+    };
+
     let view = PianoRollView {
         // song-absolute = clip-local scroll + clip 開始位置 (FIXME #3)。
         start_beat: app.pianoroll_scroll_beat as f64 + clip_start_beat,
@@ -130,7 +150,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         pitch_top: app.pianoroll_top_pitch as f32,
         pitch_visible: grid_h / zoom_y,
         keyboard_w: KEYBOARD_W,
-        notes_generation: app.pianoroll_notes_generation,
+        notes_generation,
         velocity_lane_h: VEL_LANE_H,
         playhead_beat: app.playhead_beat.map(|b| b as f64),
         ruler_h: RULER_H,

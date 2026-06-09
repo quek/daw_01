@@ -394,7 +394,9 @@ fn draw_strip(
         name_x,
         y,
         11.0,
-        if is_master { COLOR_TEXT } else { COLOR_TEXT_DIM },
+        // FIXME #14 (plan_mixer_name_contrast): 全トラック名を明色で描画。 旧 dim
+        // (COLOR_TEXT_DIM) は暗 strip 背景に対しコントラスト不足で読みにくかった。
+        COLOR_TEXT,
     );
     y += TOP_LABEL_H;
 

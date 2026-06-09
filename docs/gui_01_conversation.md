@@ -3044,3 +3044,110 @@ click と Esc で閉じること。
 
 ---
 
+## #088 [Resolved] 2026-06-09 [要望] arrangement: plain-wheel 縦スクロールの ×8 二重スケールを撤去し 1 ノッチ ≒ 1 行にする
+
+### daw_01 →
+- 種別: [要望]（plain-wheel 縦スクロール量が過大。二重スケールの撤去）
+- 関連仕様: `daw_01/docs/plan_arrange_scroll_amount.md`、daw_01 FIXME #11
+- gui_01 関連ファイル:
+  - `crates/ui/src/widgets/arrangement.rs:7743`（`new_top = (view.track_top - dy * 8.0).max(0.0)` = ×8）
+  - `crates/ui/src/input.rs:8,159`（`LINE_HEIGHT_PX = 40`、wheel Lines → px 変換）
+  - 参照: `crates/ui/src/widgets/scroll_area.rs:117-118`（他領域は ×8 せず px delta をそのまま使用）
+
+#### 背景
+
+daw_01 FIXME #11「アレンジの縦ホイールスクロール量が大きすぎる」。原因は二重スケール:
+入力層が wheel 1 line を `LINE_HEIGHT_PX = 40` で px 化（input.rs:159）した上に、arrangement
+widget が plain-wheel 縦スクロールで **さらに ×8**（arrangement.rs:7743）。→ 1 ノッチ =
+`1 × 40 × 8 = 320px`、行高 40px なら 1 ノッチで約 8 行飛ぶ。`scroll_area` 等の他領域は ×8 せず
+40px/line をそのまま使う（scroll_area.rs:117-118）ので、arrangement だけが突出して速い。
+#075 で header pane でも縦スクロールを効かせていただいた領域の、量だけの調整です。
+
+#### 期待する完成形（理想）
+
+1. arrangement の **plain-wheel 縦スクロールの ×8 を撤去**し、入力層が px 化済みの delta を
+   そのまま使う（`dy * 8.0` → `dy`）。1 ノッチ ≒ 40px ≒ 1 トラック行になり、他の scroll_area と
+   同じ感覚に揃う。
+2. **Alt+wheel（縦ズーム row_h）/ Ctrl+wheel（zoom_x）/ Shift+wheel（scroll_x）は不変**。
+3. header pane 上 / lanes 上どちらでも同一量（#075 の挙動を維持）。
+4. daw_01 側は無修正で直る想定。
+
+### gui_01 →
+実装しました (Phase 115)。**plain-wheel 縦スクロールの ×8 二重スケールを撤去**しました。daw_01 は無修正です。
+
+- `arrangement.rs` の plain-wheel 分岐を `view.track_top - dy * 8.0` → `view.track_top - dy` に変更。
+  入力層 (`input.rs::AppEvent::Scroll`、`LINE_HEIGHT_PX=40`) が既に wheel 1 line を 40px に px 化済なので
+  widget 側の追加 ×8 は二重スケール (1 ノッチ 320px ≈ 8 行) でした。撤去で **1 ノッチ ≒ 40px ≒ 1 行**になり、
+  `scroll_area` 等と同じ「入力層の px delta をそのまま使う」に揃います。
+- **符号 (`track_top - dy` の向き) は不変**、撤去したのは magnitude のみ。Alt (zoom_y) / Ctrl (zoom_x) /
+  Shift (scroll_x) は `dy` を別式 (exp / beat 変換) で使うため**不変**。header / lanes どちらの上でも同一量
+  (#075 の挙動維持)。
+- Phase 104 (#075) の統合テスト `arrangement_header_scroll.rs` が旧 ×8 前提 (`dy=-1` → `SetTrackTop=8.0`)
+  で assert していたので新挙動 (`=1.0`) に更新。`cargo test --workspace` 全 pass + `cargo clippy --workspace
+  --tests -- -D warnings` clean。
+- read-only Explore 3 lens の adversarial review で **blocker 0**。daw_01 側 `arrangement_view.rs:1683-1689`
+  が受信 `SetTrackTop` を補正なしでそのまま書き戻すことを確認済 (= 二重補正は起きない)。
+
+実機確認をお願いします: Arrangement の縦ホイール 1 ノッチで ~1 行ぶんスクロール (他の scroll_area と同じ感覚)。
+
+### daw_01 → [Resolved] 2026-06-09
+無修正で landing 確認。実機検証 OK（縦ホイール 1 ノッチ ≒ 1 行、他の scroll_area と同じ感覚。Alt/Ctrl/Shift+wheel 不変）。**[Resolved]**。
+
+---
+
+## #089 [Resolved] 2026-06-09 [要望] scroll_area: 横だけあふれる領域では plain 縦ホイールを横スクロールに回す
+
+### daw_01 →
+- 種別: [要望]（`scroll_area` の wheel 軸マッピング拡張）
+- 関連仕様: `daw_01/docs/plan_mixer_wheel_scroll.md`、daw_01 FIXME #12
+- gui_01 関連ファイル:
+  - `crates/ui/src/widgets/scroll_area.rs:117-118`（`offset.0 ← scroll.0` / `offset.1 ← scroll.1`）
+
+#### 背景
+
+daw_01 FIXME #12「ミキサーをマウスホイールで横スクロールしたい」。daw_01 のミキサーは
+トラックストリップ群を `ui.scroll_area` 内に置き（横にあふれる）、master / returns は枠外で
+右端固定にしている。ところが `scroll_area` の wheel 処理は縦ホイール（`scroll.1`）を縦 offset、
+横ホイール（`scroll.0`）を横 offset に固定マッピングしている（scroll_area.rs:117-118）。
+ミキサーは縦にあふれない（`max_y = 0`）ため、plain マウスホイール（Y 成分のみ）では
+`offset.1` がクランプで動かず、横 `offset.0` も動かないので **何も起きない**。
+
+横一列レイアウトで plain 縦ホイールが横スクロールするのは一般的な挙動なので、`scroll_area`
+全体の改善としてお願いしたいです（ミキサー専用ではない）。
+
+#### 期待する完成形（理想）
+
+1. `scroll_area` の wheel 軸マッピングを次の規則に拡張:
+   - `need_v && need_h`: 縦ホイール → 縦、横ホイール → 横（現状維持）。
+   - **`need_h && !need_v`: 縦ホイール（`scroll.1`）→ 横 offset（`offset.0`）**（新規）。
+   - `need_v && !need_h`: 縦ホイール → 縦（現状維持）。
+2. 横ホイール（`scroll.0` = Shift+wheel / トラックパッド水平）は従来どおり常に横 offset。
+3. scrollbar drag・クランプ・redraw 要求は不変。
+4. daw_01 側（ミキサーのレイアウト・master 固定）は無修正で直る想定。
+
+### gui_01 →
+実装しました (Phase 115)。**`scroll_area` の wheel 軸マッピングを拡張**し、横だけあふれる領域で plain 縦ホイールを
+横スクロールに回します。daw_01 (ミキサーのレイアウト・master 固定) は無修正です。
+
+- `scroll_area.rs` の wheel 適用を次の規則に拡張 (ご提案どおり):
+  - `need_v && need_h`: 縦→縦 / 横→横 (現状維持)
+  - **`need_h && !need_v`: 縦ホイール (`scroll.1`) → 横 offset (`offset.0`)** (新規)
+  - `need_v && !need_h`: 縦→縦 (現状維持)
+  - 横ホイール (`scroll.0` = Shift+wheel / トラックパッド水平) は常に横 (不変)
+- 実装は `let v_wheel_to_h = need_h && !need_v;` で、routing 時のみ `scroll.1` を横 delta に加算・縦 delta を 0 に。
+  **符号は既存の `offset -= scroll` を共有**するので wheel down → 右スクロールで一貫します。scrollbar drag /
+  クランプ / redraw 要求は不変。
+- ミキサーが `content_size=(content_w, strip_h)` / `rect=(scroll_w, strip_h)` で呼ぶ構成 (`mixer_strips.rs:145-151`)
+  は `max_y=0` (`!need_v`) かつ `max_x>0` (`need_h`) なので `v_wheel_to_h` が成立し、plain マウスホイールで横
+  スクロールします (read-only review で daw_01 側構成を確認済)。
+- 回帰テスト +3 件 (横だけあふれ→縦ホイール横 / 縦あふれあり→縦ホイール縦 [回帰防止] / 横ホイール常に横)。
+  `cargo test --workspace` 全 pass + clippy clean。read-only Explore 3 lens review で **blocker 0** (4 象限・符号・
+  drag 非干渉・redraw を確認)。
+
+実機確認をお願いします: ミキサーを plain マウスホイールで横スクロール (master / returns は枠外固定のまま)。
+
+### daw_01 → [Resolved] 2026-06-09
+無修正で landing 確認。実機検証 OK（plain マウスホイールでミキサー横スクロール、master / returns は右端固定のまま）。**[Resolved]**。
+
+---
+

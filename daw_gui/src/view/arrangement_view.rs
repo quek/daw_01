@@ -371,25 +371,50 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     } else {
         None
     };
-    // data_generation: schema 編集を反映する粗粒度 hash。track 数 + clip 総数 +
-    // 各 track の name 長さ和 + track 並び順 (id × position) を含めることで
-    // reorder でも bump する (selection / drag / playhead では bump しない)。
-    let data_generation = (app.song.tracks.len() as u64).wrapping_mul(0x10000)
-        + app
-            .song
-            .tracks
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                ((i as u64).wrapping_mul(31).wrapping_add(t.id as u64 + 1))
-                    .wrapping_mul(0x100)
-                    + (t.clips.len() as u64)
-                    + (t.name.len() as u64)
-                    // M10 Phase 47b: track volume も `data_generation` 因子に
-                    // (band 表示更新のため、float→bits hash で bump する)。
-                    + (t.volume.to_bits() as u64)
-            })
-            .sum::<u64>();
+    // data_generation: widget の glyph キャッシュ無効化キー。 FIXME #10
+    // (plan_clip_label_cache): 旧実装は track 名の **長さ** と clip **数** しか
+    // 見ておらず、 clip 名 (content_name) の変更でキャッシュが無効化されず rename が
+    // 画面に出ない (再起動で直る) バグがあった。 手書きの因子 allowlist をやめ、
+    // widget へ渡す `tracks` の **描画内容そのもの** (track 名 / clip 表示ラベル /
+    // 色 / 共有状態 / mute/solo/arm / 構造 / automation ラベル) を実体ごと hash し、
+    // 内容が変われば必ず無効化する correct-by-construction なキーにする。 高頻度
+    // interaction (clip drag の start/len、 scroll、 playhead) は widget の live
+    // geometry 側が毎フレーム描くのでキーに含めない (= drag 中のキャッシュ温存)。
+    let data_generation = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        tracks.len().hash(&mut h);
+        for (i, t) in tracks.iter().enumerate() {
+            i.hash(&mut h);
+            t.id.hash(&mut h);
+            t.name.hash(&mut h);
+            (t.muted, t.solo, t.armed).hash(&mut h);
+            t.volume.to_bits().hash(&mut h);
+            t.parent_id.hash(&mut h);
+            t.depth.hash(&mut h);
+            (t.collapsed, t.automation_lanes_collapsed).hash(&mut h);
+            t.clips.len().hash(&mut h);
+            for c in &t.clips {
+                c.id.hash(&mut h);
+                c.name.hash(&mut h);
+                c.in_active_group.hash(&mut h);
+                c.share_group_color.map(f32::to_bits).hash(&mut h);
+                if let Some(col) = c.color {
+                    [col.r, col.g, col.b, col.a].map(f32::to_bits).hash(&mut h);
+                }
+            }
+            // automation lane の表示ラベル + clip 名も rename-stale 同類なので含める
+            // (points は drag-frequency なので含めない)。
+            for lane in &t.automation_lanes {
+                lane.label.hash(&mut h);
+                for ac in &lane.clips {
+                    ac.id.hash(&mut h);
+                    ac.name.hash(&mut h);
+                }
+            }
+        }
+        h.finish()
+    };
 
     let view = ArrangementView {
         start_beat: app.arrange_scroll_beat as f64,
