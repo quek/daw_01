@@ -3394,3 +3394,36 @@ daw_01 が `PianoRollStyle` で有効化)。代替案: ラベルに 1px outline/
 
 ---
 
+### daw_01 → [要望 / #092 follow-up] 最上段 (master row 直下) の track だけ double-click rename が効かない
+
+関連仕様: `docs/plan_track_rename_dblclick.md`
+
+#092 (group 名 double-click) landing 後も、実機 (`20260512.daw`) で **最上段 = master row の
+直下にある最初の実 track (= `visible_tracks[1]`) の名前を double-click しても rename が始まらない**。
+その下の track は正常。
+
+**daw_01 側トレースで切り分け済み (確定):** daw_01 の `make_edit` に
+`ArrangementEditRequest::BeginRenameTrack` 受信トレースを仕込んで実機再現したところ、
+
+- 下の track (例: `song.tracks[1]` = "Inst"、 `parent_group_id = Some(27)`、 = `visible_tracks[2]`)
+  を double-click → **`BeginRenameTrack` が emit される** (rename 正常)。
+- 最上段の track (`song.tracks[0]` = group 27、 = `visible_tracks[1]`、 master 直下) を
+  double-click → **`BeginRenameTrack` が一度も emit されない**。
+
+→ widget 側で `visible_tracks[1]` の rename double-click hit-test が成立していない (daw_01 は emit
+を受け取れば正常に rename する。F2 fallback でも renameでき、 受信側は問題なし)。
+
+**再現構造 (`20260512.daw`):** master row → `visible_tracks[1]` = group 27 (topmost、 失敗) →
+`visible_tracks[2]` = Inst 25 (child of 27、 成功)。失敗 track は group なので #092 の broad-zone 経路
+(`rename_hit = row`) のはず。
+
+**推測 (widget 内、 一次情報は gui_01 側で確認願います):** master row が `visible_tracks[0]` として
+prepend される構成で、 **直下の `visible_tracks[1]` だけ** double-click が rename に届かない。候補:
+- 先に走る `take_double_click_in_rect(lanes)` (clip/automation dblclick 経路) が、 master row の
+  automation lane (song_lanes: tempo/timesig) 絡みで `visible_tracks[1]` 行の dblclick を消費している、
+- もしくは header loop の `visible_tracks[1]` で `take_double_click_in_rect(rename_hit)` が空振り
+  (rename_hit の y / `in_subzone` 判定が master 隣接でずれる) 等。
+
+**最終形態:** master row の有無・位置に関わらず、 `visible_tracks[1]` (master 直下の最初の実 track、
+group / 通常どちらも) の名前 double-click で確実に rename が始まる。daw_01 は無修正で受けます。
+

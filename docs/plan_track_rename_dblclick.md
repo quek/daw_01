@@ -65,3 +65,23 @@ clip 未選択時は `cursor_track_index` の track を rename)。double-click �
 - `20260513.20260512.daw` の Group22 を含む各深さの group で double-click rename 起動。
 - 通常 track / 浅い group の double-click rename が回帰していない。
 - disclosure ▶/▼ の single-click 折り畳みが double-click rename と競合しない。
+
+## Follow-up #2 (2026-06-09、 gui_01 #092 landing 後も残存)
+
+#092 (深ネスト group の hit-zone 拡張) landing 後も、 `20260512.daw` で **master row 直下の
+最初の実 track (`visible_tracks[1]`) だけ double-click rename が効かない**。daw_01 の `make_edit`
+受信トレース (`BeginRenameTrack`) で再現確認:
+
+- `visible_tracks[2]` (Inst 25、 group 27 の子) を double-click → **emit される** (rename 正常)。
+- `visible_tracks[1]` (group 27、 master 直下) を double-click → **emit されない**。
+
+→ widget 側 `visible_tracks[1]` の rename double-click hit-test が成立していない (daw_01 受信側は
+正常、 F2 でも rename できる)。 gui_01 へ #092 follow-up として再提出済
+(`docs/gui_01_conversation.md`)。 master row 隣接の `visible_tracks[1]` 特有の問題で、
+先行する `take_double_click_in_rect(lanes)` の消費 / header loop の空振りが候補。
+
+### daw_01 側で別途修正したもの (本件とは別の確定バグ)
+rename 状態を index で持っていた `track_rename_idx` を **安定 ID `track_rename_id`** に変更
+(commit 39fc0b0)。reorder/delete で rename が別 track にすり替わり「最上段に rename 枠が居座って
+フリーズ」 する SSoT 違反を修正。これは daw_01 単独で解決済。double-click が emit されない
+本件 (gui_01) とは別問題。
