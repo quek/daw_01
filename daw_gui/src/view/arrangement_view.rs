@@ -775,9 +775,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // track header の右クリックメニュー (Rename / Delete) を widget 外で重ねる。
     // widget は track_header_rects と BeginRenameTrack / DeleteTrack の発行までを担う。
     // rename mode 中の track には text_input を rect に重ね描きする。
-    let renaming_track_id = app
-        .track_rename_idx
-        .and_then(|idx| app.song.tracks.get(idx as usize).map(|t| t.id));
+    // rename 対象は安定 ID で直接持つ (index 経由の解決はしない = reorder/delete で
+    // 別 track にすり替わらない、 SSoT)。
+    let renaming_track_id = app.track_rename_id;
     for (track_id, rect) in &resp.track_header_rects {
         let track_id = *track_id;
         let rect = *rect;
@@ -792,7 +792,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         return;
                     };
                     match idx {
-                        0 => app.handle_event(AppEvent::BeginRenameTrack(t_idx as u32)),
+                        0 => app.handle_event(AppEvent::BeginRenameTrack(track_id)),
                         // v18 (`docs/plan_track_clip_color.md`): color_picker を開く
                         // (anchor = 右クリックした track header rect)。
                         1 => app.open_color_picker(ColorPickerTarget::Track(track_id), rect),
@@ -1687,9 +1687,7 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
         }
         ArrangementEditRequest::BeginRenameTrack(track_id) => {
             Edit::mutate(move |app: &mut AppData| {
-                if let Some(idx) = app.song.tracks.iter().position(|t| t.id == track_id) {
-                    app.handle_event(AppEvent::BeginRenameTrack(idx as u32));
-                }
+                app.handle_event(AppEvent::BeginRenameTrack(track_id));
             })
         }
         ArrangementEditRequest::SetLoopRange { start, end } => {

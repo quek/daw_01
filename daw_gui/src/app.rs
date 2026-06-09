@@ -1131,7 +1131,10 @@ pub struct AppData {
     pub is_rescanning: bool,
     pub status_message: String,
 
-    pub track_rename_idx: Option<u32>,
+    /// rename 中の track の **安定 ID** (positional index ではない)。 index で持つと
+    /// track の reorder / delete で別 track に rename がすり替わる SSoT 違反になる
+    /// (2026-06-09 の「最上段だけ rename できない / フリーズ」バグの原因)。 None で非 rename。
+    pub track_rename_id: Option<u32>,
     pub track_rename_text: String,
 
     /// 編集中の clip rename。 `Some` のとき該当 clip rect に inline
@@ -1487,7 +1490,7 @@ impl AppData {
             lipsync_gen: 0,
             is_rescanning: false,
             status_message: String::new(),
-            track_rename_idx: None,
+            track_rename_id: None,
             color_picker_target: None,
             color_picker_anchor: None,
             color_picker_session_dirty: false,
@@ -2245,7 +2248,7 @@ impl AppData {
         self.selected_notes.clear();
         // audio event の選択 index も同様に undo でずれるため clear。
         self.audio_editor_selected_events.clear();
-        self.track_rename_idx = None;
+        self.track_rename_id = None;
         self.track_rename_text.clear();
         self.clip_rename = None;
         self.clip_rename_text.clear();
@@ -3308,6 +3311,7 @@ pub enum AppEvent {
     /// order に含まれない track はそのまま末尾に残す。
     ReorderTracks(Vec<u32>),
     SelectTrack(u32),
+    /// 引数は rename 対象 track の **安定 ID** (positional index ではない)。
     BeginRenameTrack(u32),
     RenameTrackChanged(String),
     CommitRenameTrack,
@@ -4543,15 +4547,15 @@ impl AppData {
             AppEvent::MoveTrackDown(idx) => self.swap_tracks(idx, idx + 1),
             AppEvent::ReorderTracks(order) => self.reorder_tracks(&order),
             AppEvent::SelectTrack(idx) => self.select_track(idx),
-            AppEvent::BeginRenameTrack(idx) => {
-                self.begin_rename_track(idx);
+            AppEvent::BeginRenameTrack(track_id) => {
+                self.begin_rename_track(track_id);
             }
             AppEvent::RenameTrackChanged(text) => {
                 self.track_rename_text = text;
             }
             AppEvent::CommitRenameTrack => self.commit_rename_track(),
             AppEvent::CancelRenameTrack => {
-                self.track_rename_idx = None;
+                self.track_rename_id = None;
                 self.track_rename_text.clear();
             }
             AppEvent::BeginRenameClip(target) => self.begin_rename_clip(target),
@@ -6876,25 +6880,31 @@ impl AppData {
         }
     }
 
-    fn begin_rename_track(&mut self, idx: u32) {
-        let Some(name) = self.song.tracks.get(idx as usize).map(|t| t.name.clone()) else {
+    fn begin_rename_track(&mut self, track_id: u32) {
+        let Some(name) = self
+            .song
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .map(|t| t.name.clone())
+        else {
             return;
         };
         self.track_rename_text = name;
-        self.track_rename_idx = Some(idx);
+        self.track_rename_id = Some(track_id);
     }
 
     fn commit_rename_track(&mut self) {
-        let Some(idx) = self.track_rename_idx else {
+        let Some(track_id) = self.track_rename_id else {
             return;
         };
-        self.track_rename_idx = None;
+        self.track_rename_id = None;
         let new_name = self.track_rename_text.trim().to_string();
         self.track_rename_text.clear();
         if new_name.is_empty() {
             return;
         }
-        if let Some(track) = self.song.tracks.get_mut(idx as usize) {
+        if let Some(track) = self.song.tracks.iter_mut().find(|t| t.id == track_id) {
             track.name = new_name;
         }
         self.sync_song_to_plugin_host();

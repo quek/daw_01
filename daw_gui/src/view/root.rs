@@ -623,10 +623,9 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::BeginRenameClip(target));
             }));
-        } else if let Some(track_idx) = app.cursor_track_index() {
-            let idx = track_idx as u32;
+        } else if let Some(track_id) = app.cursor_track_id() {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::BeginRenameTrack(idx));
+                app.handle_event(AppEvent::BeginRenameTrack(track_id));
             }));
         }
     }
@@ -713,7 +712,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // plugin picker / send picker が開いている間は escape を消費しない
     // (= track_picker / plugin_picker の modal が close_on_escape で閉じる)。
     if !app.is_plugin_picker_open && app.send_picker.is_none() && ui.take_shortcut("escape") {
-        if app.track_rename_idx.is_some() {
+        if app.track_rename_id.is_some() {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::CancelRenameTrack)
             }));
