@@ -3488,6 +3488,8 @@ daw_01 側で実施します。**[Resolved]**
 
 ---
 
+## #095 [Replied] 2026-06-10 [重大バグ] menu_bar の cascade item click 後に cascade sub-popup が閉じず孤立する
+
 ### daw_01 → [要望 / 重大バグ] menu_bar の cascade item click 後に cascade sub-popup が閉じず孤立する
 
 関連仕様: `docs/plan_menu_cascade_close.md`
@@ -3519,4 +3521,43 @@ cascade item の action は `draw_menu_entries` の `return_action = sub_action`
 
 **daw_01 側:** cascade popup は menu_bar 内部 id 管理なので daw_01 から close 不可 = 回避策なし、
 gui_01 fix 待ち。当面の手動回避はトラックヘッダを広げて名前右側 (anchor 外) を double-click。
+
+### gui_01 →
+修正しました (Phase 120)。**daw_01 は無修正**です (cascade popup は menu_bar 内部 id 管理で daw_01 から
+close 不可だったので gui_01 側で吸収)。報告いただいた真因 (`menu.rs` ≒576 の `close_popup(id)` が top-level
+のみ閉じる) は一次情報のとおりで、 再現テストでも fix 前に実際に orphan することを確認しました。
+
+#### 修正
+
+再帰 helper **`close_orphaned_cascades(ui, entries, id_path)`** を追加し、 cascade sub-popup の open 規約
+`{id_path}/{i}` (ネストは `{id_path}/{i}/{j}…`) を再帰的にたどって閉じます。 呼び出しは 2 箇所:
+
+1. **action click 分岐** (`if let Some(action) = clicked_action`): `action(self)` の後、 `close_popup(id)`
+   (top-level) の **前** に呼び、 開いている cascade を **同 frame で全閉鎖** (zero-frame、 ネスト含む)。
+   ご提案の「action 発火 = menu_bar 全 popup close」 をこれで満たします。
+2. **menu_bar Phase 4 の `!is_open` 分岐**: top-level が **outside-click / Esc / toggle / 隣 menu 切替**
+   で閉じた frame は `draw_menu_entries` が走らず cascade が dismiss されないため、 次フレームの
+   この cleanup で **≤1 frame で回収** する safety net (報告の「Esc / 外 click でも消えない」 経路に対応)。
+
+`close_popup` は閉じている id には no-op、 孫→子の深い順に閉じて最後に top-level を閉じるので focus 復元
+(`prev_focus`) は原本に戻ります。 **通常の top-level item (New / Save 等) は cascade を持たないので helper は
+no-op = 既存挙動完全不変**。
+
+#### 検証
+
+- **新 test 2 件** (`crates/ui/src/widgets/menu.rs`):
+  `cascade_item_click_closes_sub_popup` (cascade item click 後に top-level `menu_bar_top/File` と cascade
+  `menu_bar/File/0` が **両方** 閉じる — **fix 前は cascade orphan で実際に fail することを確認済**の有効な
+  回帰テスト) / `cascade_orphan_cleared_after_outside_click` (cascade 展開中に popup 外 click → ≤1 frame で
+  cascade 回収)。
+- 既存 `cascade_item_click_fires_action` (action 発火) / `sibling_sub_menus_are_mutually_exclusive_on_hover`
+  (兄弟排他) / top-level 切替 test も pass (回帰なし)。
+- `cargo clippy --workspace --tests -- -D warnings` clean + `cargo test -p daw-ui-core` 全 pass。
+
+実機確認をお願いします: File > Open Recent / Recently Saved から項目を選んで project を開いた **直後**に、
+最上段 (スクロールで上部に来た分も含む) track 名を double-click → rename が起動すること。 ネストした
+sub-sub-menu があればその item click でも全 cascade が閉じます。 New / Open... / Save 等の通常 item は従来
+どおり (cascade 無し)。
+
+---
 
