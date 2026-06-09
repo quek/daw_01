@@ -164,7 +164,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // Fold mode / scale = None / Snap on Draw OFF では無関係。
         snap_pitch_during_drag: app.snap_on_draw,
     };
-    let style = PianoRollStyle::default();
+    // FIXME #20: 白鍵 (fill 0.92) 上の "C5" 等オクターブラベルは widget default の
+    // c_label_color (0.30 グレー) だとコントラストが弱く読みにくいので、 ほぼ黒の
+    // 濃色に上書きして可読性を上げる (scale 無しの Linear モード経路で使われる色)。
+    let style = PianoRollStyle {
+        c_label_color: Color { r: 0.10, g: 0.10, b: 0.14, a: 1.0 },
+        ..PianoRollStyle::default()
+    };
     let resize_handle_px = style.resize_handle_px;
 
     let make_edit = move |req: PianoRollEditRequest| -> Edit<AppData> {

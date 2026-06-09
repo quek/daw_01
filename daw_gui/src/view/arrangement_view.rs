@@ -60,7 +60,8 @@ fn model_curve_from_widget(c: WidgetFadeCurve) -> common::model::FadeCurve {
     }
 }
 
-const TRACK_HEADER_W: f32 = 160.0;
+// FIXME #16: track header 幅は固定定数ではなく `AppData.arrange_header_w` を SSoT
+// とし (default 160.0)、 gui_01 widget の右端 splitter drag で可変。
 const RULER_H: f32 = 20.0;
 const TOOLBAR_H: f32 = 24.0;
 const COLOR_TOOLBAR_BG: Color = Color { r: 0.10, g: 0.10, b: 0.12, a: 1.0 };
@@ -89,7 +90,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let area = body;
 
     // auto-fit (X キー / Fit ボタン) のために、現フレームの canvas (lanes) サイズを記録。
-    let canvas_w = (area.w - TRACK_HEADER_W).max(0.0);
+    let canvas_w = (area.w - app.arrange_header_w).max(0.0);
     let canvas_h = (area.h - RULER_H).max(0.0);
     let canvas_size = (canvas_w, canvas_h);
     if app.last_arrange_canvas_size != canvas_size {
@@ -365,7 +366,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     let zoom = app.arrange_zoom_x.max(1.0);
     let row_h = app.arrange_track_row_h.max(1.0);
-    let lanes_w = (area.w - TRACK_HEADER_W).max(1.0);
+    let lanes_w = (area.w - app.arrange_header_w).max(1.0);
     let loop_range = if app.song.loop_end_beat > app.song.loop_start_beat {
         Some((app.song.loop_start_beat, app.song.loop_end_beat))
     } else {
@@ -422,7 +423,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         track_top: app.arrange_track_top,
         tracks_visible: ((area.h - RULER_H) / row_h).max(1.0),
         track_row_h: row_h,
-        header_w: TRACK_HEADER_W,
+        header_w: app.arrange_header_w,
         ruler_h: RULER_H,
         playhead_beat: app.playhead_beat.map(|b| b as f64),
         loop_range,
@@ -451,6 +452,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // Master 行ラベルは別フィールド (track_text_size 追従外、 gui_01 #076 nit) なので
         // 同値に揃え、 通常トラック名と視覚的に一致させる。
         master_row_label_size: 11.0,
+        // FIXME #17: group のネスト 1 段あたりの header インデント量を gui_01 default
+        // (16.0) の半分にして、 深いネストでも track 名 + M/S/R ボタンの幅を確保する。
+        indent_px: 8.0,
         ..ArrangementStyle::default()
     };
 
@@ -566,7 +570,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let c = t.clips.get(r.clip as usize)?;
         Some(ClipKey { track: t.id, clip: c.id })
     });
-    let lanes_x = area.x + TRACK_HEADER_W;
+    let lanes_x = area.x + app.arrange_header_w;
     for (clip_key, rect) in &resp.clip_rects {
         let key = *clip_key;
         // color_picker の anchor 用に clip rect を Copy で捕捉 (closure へ move)。
@@ -844,9 +848,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     // file drop の hint frame は widget の上に被せる。canvas (lanes) のみ受け付け。
     let canvas_area = Rect {
-        x: area.x + TRACK_HEADER_W,
+        x: area.x + app.arrange_header_w,
         y: area.y + RULER_H,
-        w: area.w - TRACK_HEADER_W,
+        w: area.w - app.arrange_header_w,
         h: area.h - RULER_H,
     };
     if ui.is_file_hovering_in_rect(canvas_area) {

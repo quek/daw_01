@@ -968,6 +968,17 @@ pub struct AppData {
     /// arrangement の 1 track row 高さ (px)。Alt+wheel で 16..96 に縦ズーム。
     /// default は `ARRANGE_TRACK_HEIGHT`。
     pub arrange_track_row_h: f32,
+    /// FIXME #16: arrangement の track header 幅 (px、 default 160.0)。 header と
+    /// lanes の境界 (右端 splitter) drag で gui_01 arrangement widget が
+    /// `SetHeaderW` を発火 → `SetArrangeHeaderW` 経由でここを更新する。 widget は
+    /// 毎フレーム `view.header_w` としてこの値を読む。 session-only (= save /
+    /// Undo 対象外、 `arrange_track_row_h` と同じ扱い)。
+    pub arrange_header_w: f32,
+    /// FIXME #23: inspector の param セクション (title 下〜chain 上) の実描画高さ
+    /// (px)。 immediate-mode なので「前フレームに測った高さ」を `scroll_area` の
+    /// content_size として使う (= lag-by-one)。 描画末尾で実測値に更新。
+    /// session-only (save / Undo 対象外)。
+    pub inspector_body_h: f32,
     pub pianoroll_zoom_x: f32,
     pub pianoroll_zoom_y: f32,
     pub pianoroll_top_pitch: u8,
@@ -1422,6 +1433,8 @@ impl AppData {
             arrange_scroll_beat: 0.0,
             arrange_track_top: 0.0,
             arrange_track_row_h: ARRANGE_TRACK_HEIGHT,
+            arrange_header_w: 160.0,
+            inspector_body_h: 800.0,
             pianoroll_zoom_x: 64.0,
             pianoroll_zoom_y: 14.0,
             pianoroll_top_pitch: 84, // C6
@@ -2295,8 +2308,8 @@ impl AppData {
                 | AppEvent::CreateClip { .. }
                 | AppEvent::ResizeClip { .. }
                 | AppEvent::DeleteSelectedClip
-                | AppEvent::DuplicateClipShared { .. }
-                | AppEvent::DuplicateClipUnique { .. }
+                | AppEvent::DuplicateClipsShared(_)
+                | AppEvent::DuplicateClipsUnique(_)
                 | AppEvent::CloneClipsLinked(_)
                 | AppEvent::CloneClipsIndependent(_)
                 | AppEvent::MakeClipUnique(_)
@@ -2393,8 +2406,8 @@ impl AppData {
                 | AppEvent::ResizeAutomationClips { .. }
                 | AppEvent::DeleteAutomationClips { .. }
                 | AppEvent::MakeAutomationClipUnique(_)
-                | AppEvent::DuplicateAutomationClipShared(_)
-                | AppEvent::DuplicateAutomationClipUnique(_)
+                | AppEvent::DuplicateAutomationClipsShared(_)
+                | AppEvent::DuplicateAutomationClipsUnique(_)
                 // Phase 3: point quantize は構造変化系として Undo step
                 // 化。 SelectAutomationPoints は session-only なので除外。
                 | AppEvent::QuantizeSelectedAutomationPoints(_)
@@ -3039,15 +3052,14 @@ pub enum AppEvent {
     /// 既に独立 clip の場合は status_message で通知。MIDI clip 用
     /// `MakeClipUnique(ClipRef)` と同 idiom の lane 版。
     MakeAutomationClipUnique(common::model::AutomationClipKey),
-    /// D shortcut: 選択中 automation clip の末尾直後 (source.start_beat +
-    /// length_beats) に同 lane で共有コピー (linked clip) を 1 つ生成。
-    /// MIDI 用 `DuplicateClipShared` の automation lane 版。 `content_id` を
-    /// 流用し、 `selected_automation_clips` を新 key で上書きするので
-    /// D 連打で後方連鎖する。
-    DuplicateAutomationClipShared(common::model::AutomationClipKey),
-    /// Alt+D shortcut: 同位置に独立コピー (content を deep clone +
-    /// 新 ContentId)。 MIDI 用 `DuplicateClipUnique` の automation lane 版。
-    DuplicateAutomationClipUnique(common::model::AutomationClipKey),
+    /// FIXME #21: D shortcut: 選択中の automation clip 群をまとめて共有コピー。
+    /// MIDI 用 `DuplicateClipsShared` の automation lane 版。 選択ブロック span
+    /// だけ後ろにずらして複製し、 新 key 群を `selected_automation_clips` に
+    /// 上書きする (D 連打で後方連鎖)。
+    DuplicateAutomationClipsShared(Vec<common::model::AutomationClipKey>),
+    /// FIXME #21: Alt+D shortcut: 選択中の automation clip 群をまとめて独立コピー
+    /// (content を deep clone + 新 ContentId)。 配置・選択は shared 版と同じ。
+    DuplicateAutomationClipsUnique(Vec<common::model::AutomationClipKey>),
     /// gui_01 #028 §7.3: parameter touch 通知。inspector の knob drag /
     /// plugin GUI の knob 操作 (Phase 2+ で IPC 経由) で発火し、
     /// `last_touched_param` を更新。`A` キー shortcut の source になる。
@@ -3371,13 +3383,15 @@ pub enum AppEvent {
     SetClipPositions(Vec<(ClipRef, u32, f64)>),
     CreateClip { track: u32, start_beat: f64 },
     DeleteSelectedClip,
-    /// 選択中 clip の末尾直後に共有コピー (linked clip) を生成 (D shortcut /
-    /// `docs/plan_clip_share_clone.md` §3.2)。 source の `content_id` を
-    /// そのまま新 clip にコピー。
-    DuplicateClipShared { source: ClipRef },
-    /// 選択中 clip の末尾直後に独立コピー (notes を deep clone + 新 ContentId)
-    /// を生成 (Alt+D shortcut / §3.3)。
-    DuplicateClipUnique { source: ClipRef },
+    /// FIXME #21: 選択中の clip 群をまとめて共有コピー (linked clip) する
+    /// (D shortcut / `docs/plan_clip_share_clone.md` §3.2)。 選択ブロック全体の
+    /// span だけ後ろにずらして相対位置を保ったまま複製し (Ctrl+drag と同じ
+    /// セマンティクス)、 複製を選択集合にする。 単一 clip では span = clip 長で
+    /// 旧 `DuplicateClipShared` と完全一致。 source の `content_id` を流用。
+    DuplicateClipsShared(Vec<ClipRef>),
+    /// FIXME #21: 選択中の clip 群をまとめて独立コピー (deep clone + 新 ContentId)
+    /// する (Alt+D shortcut / §3.3)。 配置・選択は `DuplicateClipsShared` と同じ。
+    DuplicateClipsUnique(Vec<ClipRef>),
     /// arrangement Ctrl+drag → release の結果。 各 entry は `(source ClipRef,
     /// to_track_id, drop_start_beat)` (snap 済み)、 元 clip は残し、 drop 位置に
     /// 共有コピー を to_track 上で生成。 (§3.4)
@@ -3516,6 +3530,9 @@ pub enum AppEvent {
     SetArrangeScroll(f32),
     SetArrangeZoom(f32),
     SetArrangeTrackRowH(f32),
+    /// FIXME #16: arrangement の track header 幅を更新 (gui_01 widget の右端
+    /// splitter drag が発火)。 handler 側で 80..480 px に clamp。 session-only。
+    SetArrangeHeaderW(f32),
     SetPianoRollScrollX(f32),
     SetPianoRollTopPitch(u8),
     SetPianoRollZoomX(f32),
@@ -4302,11 +4319,11 @@ impl AppData {
             AppEvent::CloneAutomationClipsIndependent { deltas } => {
                 self.clone_automation_clips_independent(&deltas)
             }
-            AppEvent::DuplicateAutomationClipShared(key) => {
-                self.duplicate_automation_clip_shared(key);
+            AppEvent::DuplicateAutomationClipsShared(keys) => {
+                self.duplicate_automation_clips_shared(&keys);
             }
-            AppEvent::DuplicateAutomationClipUnique(key) => {
-                self.duplicate_automation_clip_unique(key);
+            AppEvent::DuplicateAutomationClipsUnique(keys) => {
+                self.duplicate_automation_clips_unique(&keys);
             }
             AppEvent::ResizeAutomationClips { deltas } => {
                 self.resize_automation_clips(&deltas)
@@ -4724,6 +4741,11 @@ impl AppData {
                 // 描画側 (`tracks_visible = ((area.h - RULER_H) / row_h).max(1.0)`) が
                 // 吸収する。
                 self.arrange_track_row_h = h.clamp(16.0, 2000.0);
+            }
+            AppEvent::SetArrangeHeaderW(w) => {
+                // track 名が読める下限と lanes を潰さない上限で clamp。 widget は
+                // 毎フレーム `view.header_w` としてこの値を読むので即反映される。
+                self.arrange_header_w = w.clamp(80.0, 480.0);
             }
             AppEvent::SetArrangeZoom(zoom) => {
                 self.arrange_zoom_x = zoom.clamp(2.0, 400.0);
@@ -5328,11 +5350,11 @@ impl AppData {
             AppEvent::FitArrangeToContent => {
                 self.fit_arrange_to_content();
             }
-            AppEvent::DuplicateClipShared { source } => {
-                self.duplicate_clip_shared(source);
+            AppEvent::DuplicateClipsShared(sources) => {
+                self.duplicate_clips_shared(&sources);
             }
-            AppEvent::DuplicateClipUnique { source } => {
-                self.duplicate_clip_unique(source);
+            AppEvent::DuplicateClipsUnique(sources) => {
+                self.duplicate_clips_unique(&sources);
             }
             AppEvent::CloneClipsLinked(entries) => {
                 self.clone_clips_linked(&entries);
@@ -8015,81 +8037,73 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
-    /// D shortcut: 選択中 automation clip の末尾直後 (source.start_beat +
-    /// length_beats) に同 lane で共有コピーを 1 つ生成。 `content_id` を
-    /// 流用し linked group に追加。 `selected_automation_clips` を新 key で
-    /// 上書きするので連打で後方連鎖する (MIDI 用 `duplicate_clip_shared` と
-    /// 同 UX)。
-    fn duplicate_automation_clip_shared(
+    /// 選択 automation clip 群の bounding span (= MIDI `clip_block_span` の lane
+    /// 版)。 解決できない stale key は無視、 有効 clip が無ければ `None`。
+    fn automation_block_span(&self, sources: &[common::model::AutomationClipKey]) -> Option<f64> {
+        let mut min_start = f64::MAX;
+        let mut max_end = f64::MIN;
+        for &src in sources {
+            let Some(clip) = self
+                .song
+                .automation_lane_by_key(src.track, src.lane)
+                .and_then(|lane| lane.clip_by_id(src.clip))
+            else {
+                continue;
+            };
+            min_start = min_start.min(clip.start_beat);
+            max_end = max_end.max(clip.start_beat + clip.length_beats);
+        }
+        (max_end >= min_start).then_some(max_end - min_start)
+    }
+
+    /// `source` の共有コピーを `new_start_beat` に 1 つ生成し新 key を返す
+    /// (選択・sync は呼び出し側)。 `content_id` を流用し linked group に追加。
+    fn duplicate_one_automation_clip_shared_at(
         &mut self,
         source: common::model::AutomationClipKey,
-    ) {
-        let template = {
-            let Some(lane) = self.song.automation_lane_by_key(source.track, source.lane)
-            else {
-                return;
-            };
-            let Some(src_clip) = lane.clip_by_id(source.clip) else {
-                return;
-            };
-            (
-                src_clip.content_id,
-                src_clip.name.clone(),
-                src_clip.start_beat + src_clip.length_beats,
-                src_clip.length_beats,
-            )
+        new_start_beat: f64,
+    ) -> Option<common::model::AutomationClipKey> {
+        let (content_id, name, length) = {
+            let lane = self.song.automation_lane_by_key(source.track, source.lane)?;
+            let src_clip = lane.clip_by_id(source.clip)?;
+            (src_clip.content_id, src_clip.name.clone(), src_clip.length_beats)
         };
-        let Some(lane) = self
+        let lane = self
             .song
-            .automation_lane_by_key_mut(source.track, source.lane)
-        else {
-            return;
-        };
+            .automation_lane_by_key_mut(source.track, source.lane)?;
         let new_id = lane.alloc_clip_id();
         let new_clip = common::model::AutomationClip {
             id: new_id,
-            name: template.1,
-            start_beat: template.2,
-            length_beats: template.3,
-            content_id: template.0,
+            name,
+            start_beat: new_start_beat,
+            length_beats: length,
+            content_id,
         };
-        let start = new_clip.start_beat;
-        let pos = lane.clips.partition_point(|c| c.start_beat < start);
+        let pos = lane.clips.partition_point(|c| c.start_beat < new_start_beat);
         lane.clips.insert(pos, new_clip);
-        let new_key = common::model::AutomationClipKey {
+        Some(common::model::AutomationClipKey {
             track: source.track,
             lane: source.lane,
             clip: new_id,
-        };
-        self.selected_automation_clips = vec![new_key];
-        self.sync_song_to_plugin_host();
+        })
     }
 
-    /// Alt+D shortcut: 同位置に独立コピー (content を deep clone +
-    /// 新 ContentId)。 MIDI 用 `duplicate_clip_unique` の lane 版。
-    fn duplicate_automation_clip_unique(
+    /// `source` の独立コピー (content deep clone + 新 ContentId) を
+    /// `new_start_beat` に生成し新 key を返す。
+    fn duplicate_one_automation_clip_unique_at(
         &mut self,
         source: common::model::AutomationClipKey,
-    ) {
-        let template = {
-            let Some(lane) = self.song.automation_lane_by_key(source.track, source.lane)
-            else {
-                return;
-            };
-            let Some(src_clip) = lane.clip_by_id(source.clip) else {
-                return;
-            };
-            (
-                src_clip.content_id,
-                src_clip.name.clone(),
-                src_clip.start_beat + src_clip.length_beats,
-                src_clip.length_beats,
-            )
+        new_start_beat: f64,
+    ) -> Option<common::model::AutomationClipKey> {
+        let (src_content_id, name, length) = {
+            let lane = self.song.automation_lane_by_key(source.track, source.lane)?;
+            let src_clip = lane.clip_by_id(source.clip)?;
+            (src_clip.content_id, src_clip.name.clone(), src_clip.length_beats)
         };
         let cloned_content = self
             .song
             .clip_contents
-            .get(&template.0)
+            .get(&src_content_id)
             .cloned()
             .unwrap_or_else(|| {
                 common::model::ClipContent::Automation(
@@ -8100,30 +8114,75 @@ impl AppData {
         self.song
             .clip_contents
             .insert(new_content_id, cloned_content);
-        let Some(lane) = self
+        let lane = self
             .song
-            .automation_lane_by_key_mut(source.track, source.lane)
-        else {
-            return;
-        };
+            .automation_lane_by_key_mut(source.track, source.lane)?;
         let new_id = lane.alloc_clip_id();
         let new_clip = common::model::AutomationClip {
             id: new_id,
-            name: template.1,
-            start_beat: template.2,
-            length_beats: template.3,
+            name,
+            start_beat: new_start_beat,
+            length_beats: length,
             content_id: new_content_id,
         };
-        let start = new_clip.start_beat;
-        let pos = lane.clips.partition_point(|c| c.start_beat < start);
+        let pos = lane.clips.partition_point(|c| c.start_beat < new_start_beat);
         lane.clips.insert(pos, new_clip);
-        let new_key = common::model::AutomationClipKey {
+        Some(common::model::AutomationClipKey {
             track: source.track,
             lane: source.lane,
             clip: new_id,
+        })
+    }
+
+    /// FIXME #21: 選択 automation clip 群をまとめて共有複製 (D shortcut)。 選択
+    /// ブロック span だけ後ろにずらして複製し、 複製群を選択にする (連打で後方連鎖)。
+    fn duplicate_automation_clips_shared(&mut self, sources: &[common::model::AutomationClipKey]) {
+        let Some(offset) = self.automation_block_span(sources) else {
+            return;
         };
-        self.selected_automation_clips = vec![new_key];
-        self.sync_song_to_plugin_host();
+        let mut new_keys = Vec::with_capacity(sources.len());
+        for &src in sources {
+            let Some(new_start) = self
+                .song
+                .automation_lane_by_key(src.track, src.lane)
+                .and_then(|lane| lane.clip_by_id(src.clip))
+                .map(|c| c.start_beat + offset)
+            else {
+                continue;
+            };
+            if let Some(k) = self.duplicate_one_automation_clip_shared_at(src, new_start) {
+                new_keys.push(k);
+            }
+        }
+        if !new_keys.is_empty() {
+            self.selected_automation_clips = new_keys;
+            self.sync_song_to_plugin_host();
+        }
+    }
+
+    /// FIXME #21: 選択 automation clip 群をまとめて独立複製 (Alt+D shortcut)。
+    fn duplicate_automation_clips_unique(&mut self, sources: &[common::model::AutomationClipKey]) {
+        let Some(offset) = self.automation_block_span(sources) else {
+            return;
+        };
+        let mut new_keys = Vec::with_capacity(sources.len());
+        for &src in sources {
+            let Some(new_start) = self
+                .song
+                .automation_lane_by_key(src.track, src.lane)
+                .and_then(|lane| lane.clip_by_id(src.clip))
+                .map(|c| c.start_beat + offset)
+            else {
+                continue;
+            };
+            if let Some(k) = self.duplicate_one_automation_clip_unique_at(src, new_start) {
+                new_keys.push(k);
+            }
+        }
+        if !new_keys.is_empty() {
+            self.selected_automation_clips = new_keys;
+            self.sync_song_to_plugin_host();
+        }
     }
 
     fn resize_automation_clips(&mut self, deltas: &[ResizeAutomationClipEntry]) {
@@ -12047,23 +12106,46 @@ impl AppData {
 
     /// 共有コピー (D shortcut): 末尾直後 (start+length) に同サイズの clip を
     /// 1 つ生成、 `content_id` を流用。 `docs/plan_clip_share_clone.md` §3.2。
-    fn duplicate_clip_shared(&mut self, source: ClipRef) {
-        let Some(track) = self.song.tracks.get(source.track as usize) else {
-            return;
-        };
-        let Some(src_clip) = track.clips.get(source.clip as usize) else {
-            return;
-        };
-        let new_start_beat = src_clip.start_beat + src_clip.length_beats;
+    /// 選択 clip 群の bounding span (`max_end - min_start`)。 複製を選択ブロック
+    /// 直後に並べるためのオフセット (相対位置を保ったままブロック複製)。 単一
+    /// clip では clip 長と一致する (= 旧 single duplicate と同挙動)。 解決でき
+    /// ない stale ref は無視、 有効 clip が 1 つも無ければ `None`。
+    fn clip_block_span(&self, sources: &[ClipRef]) -> Option<f64> {
+        let mut min_start = f64::MAX;
+        let mut max_end = f64::MIN;
+        for &src in sources {
+            let Some(clip) = self
+                .song
+                .tracks
+                .get(src.track as usize)
+                .and_then(|t| t.clips.get(src.clip as usize))
+            else {
+                continue;
+            };
+            min_start = min_start.min(clip.start_beat);
+            max_end = max_end.max(clip.start_beat + clip.length_beats);
+        }
+        (max_end >= min_start).then_some(max_end - min_start)
+    }
+
+    /// `source` の共有コピーを `new_start_beat` に 1 つ生成し、 新 `ClipRef` を
+    /// 返す (選択・sync は呼び出し側)。 同 `content_id` を流用 → 名前 (content_id
+    /// 単位 SSoT) も共有、 色 (per-clip) は source 引き継ぎ。
+    fn duplicate_one_clip_shared_at(
+        &mut self,
+        source: ClipRef,
+        new_start_beat: f64,
+    ) -> Option<ClipRef> {
+        let src_clip = self
+            .song
+            .tracks
+            .get(source.track as usize)?
+            .clips
+            .get(source.clip as usize)?;
         let new_length = src_clip.length_beats;
-        // 共有コピー: 同 content_id を流用 → 名前 (content_id 単位 SSoT) も
-        // 自動共有。 Clip.name は legacy なので空のまま。色 (per-clip) は
-        // source の色を引き継ぐ (= コピーしたクリップは元の色のまま)。
         let content_id = src_clip.content_id;
         let src_color = src_clip.color;
-        let Some(track) = self.song.tracks.get_mut(source.track as usize) else {
-            return;
-        };
+        let track = self.song.tracks.get_mut(source.track as usize)?;
         let new_clip_id = track.alloc_clip_id();
         let new_idx = track.clips.len() as u32;
         track.clips.push(Clip {
@@ -12076,35 +12158,27 @@ impl AppData {
             color: src_color,
             auto_lipsync: false,
         });
-        let r = ClipRef {
-            track: source.track,
-            clip: new_idx,
-        };
-        self.set_single_clip_selection(r);
-        self.selected_notes.clear();
-        self.sync_song_to_plugin_host();
+        Some(ClipRef { track: source.track, clip: new_idx })
     }
 
-    /// 独立コピー (Alt+D shortcut): 末尾直後に同サイズ、 ただし content を
-    /// deep clone + 新 ContentId 採番で独立化。 §3.3。
-    fn duplicate_clip_unique(&mut self, source: ClipRef) {
-        let Some(track) = self.song.tracks.get(source.track as usize) else {
-            return;
-        };
-        let Some(src_clip) = track.clips.get(source.clip as usize) else {
-            return;
-        };
-        let new_start_beat = src_clip.start_beat + src_clip.length_beats;
+    /// `source` の独立コピー (content を deep clone + 新 ContentId 採番) を
+    /// `new_start_beat` に 1 つ生成し、 新 `ClipRef` を返す。 §3.3。
+    fn duplicate_one_clip_unique_at(
+        &mut self,
+        source: ClipRef,
+        new_start_beat: f64,
+    ) -> Option<ClipRef> {
+        let src_clip = self
+            .song
+            .tracks
+            .get(source.track as usize)?
+            .clips
+            .get(source.clip as usize)?;
         let new_length = src_clip.length_beats;
-        // 独立コピー: content + 名前を fork して新 content_id 採番。
-        // fork 時点の名前を引き継ぎ、 以後は独立 (別 content_id)。色 (per-clip) は
-        // source の色を引き継ぐ (= コピーしたクリップは元の色のまま)。
         let src_content_id = src_clip.content_id;
         let src_color = src_clip.color;
         let new_content_id = self.song.fork_content(src_content_id);
-        let Some(track) = self.song.tracks.get_mut(source.track as usize) else {
-            return;
-        };
+        let track = self.song.tracks.get_mut(source.track as usize)?;
         let new_clip_id = track.alloc_clip_id();
         let new_idx = track.clips.len() as u32;
         track.clips.push(Clip {
@@ -12117,13 +12191,64 @@ impl AppData {
             color: src_color,
             auto_lipsync: false,
         });
-        let r = ClipRef {
-            track: source.track,
-            clip: new_idx,
+        Some(ClipRef { track: source.track, clip: new_idx })
+    }
+
+    /// FIXME #21: 選択 clip 群をまとめて共有複製 (D shortcut)。 選択ブロック span
+    /// だけ後ろにずらして相対位置を保ったまま複製し (Ctrl+drag と同じセマンティ
+    /// クス)、 複製群を選択にする。 D 連打で後方連鎖する。
+    fn duplicate_clips_shared(&mut self, sources: &[ClipRef]) {
+        let Some(offset) = self.clip_block_span(sources) else {
+            return;
         };
-        self.set_single_clip_selection(r);
-        self.selected_notes.clear();
-        self.sync_song_to_plugin_host();
+        let mut new_refs = Vec::with_capacity(sources.len());
+        for &src in sources {
+            let Some(new_start) = self
+                .song
+                .tracks
+                .get(src.track as usize)
+                .and_then(|t| t.clips.get(src.clip as usize))
+                .map(|c| c.start_beat + offset)
+            else {
+                continue;
+            };
+            if let Some(r) = self.duplicate_one_clip_shared_at(src, new_start) {
+                new_refs.push(r);
+            }
+        }
+        if !new_refs.is_empty() {
+            self.select_new_clips(&new_refs);
+            self.selected_notes.clear();
+            self.sync_song_to_plugin_host();
+        }
+    }
+
+    /// FIXME #21: 選択 clip 群をまとめて独立複製 (Alt+D shortcut)。 配置・選択は
+    /// `duplicate_clips_shared` と同じ、 各 clip の content を独立化する点が違う。
+    fn duplicate_clips_unique(&mut self, sources: &[ClipRef]) {
+        let Some(offset) = self.clip_block_span(sources) else {
+            return;
+        };
+        let mut new_refs = Vec::with_capacity(sources.len());
+        for &src in sources {
+            let Some(new_start) = self
+                .song
+                .tracks
+                .get(src.track as usize)
+                .and_then(|t| t.clips.get(src.clip as usize))
+                .map(|c| c.start_beat + offset)
+            else {
+                continue;
+            };
+            if let Some(r) = self.duplicate_one_clip_unique_at(src, new_start) {
+                new_refs.push(r);
+            }
+        }
+        if !new_refs.is_empty() {
+            self.select_new_clips(&new_refs);
+            self.selected_notes.clear();
+            self.sync_song_to_plugin_host();
+        }
     }
 
     /// arrangement Ctrl+drag → release: 各 (source, drop_start_beat) で

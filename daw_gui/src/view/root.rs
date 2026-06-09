@@ -58,37 +58,41 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     draw_menu_bar(app, ui, menu_rect);
     transport::draw(app, ui, transport_rect);
 
-    // arrangement (上) と bottom_panel (下) を縦分割。 gui_01 `split_view`
-    // が 6px の handle を描画して drag 入力を扱う。 inspector は top pane
-    // 内の左帯として配置 (= 旧レイアウトと互換、 bottom panel は full width
-    // を維持)。 shortcut dispatch は bottom_rect を確定させてから呼びたいので
-    // closure 内で実行。
+    // FIXME #22: inspector を左カラムにフル高さで配置し、 その右で arrangement
+    // (上) と bottom_panel (= mixer / piano_roll / audio editor、 下) を縦分割する。
+    // 旧レイアウト (inspector は上ペイン内の左帯、 bottom panel は全幅) から
+    // 「左=inspector フル高 / 右上=arrangement / 右下=bottom panel」 へ再編。
+    // gui_01 `split_view` が 6px の handle を描画して上下 drag を扱う。
+    let inspector_rect = Rect {
+        x: center_bottom_rect.x,
+        y: center_bottom_rect.y,
+        w: INSPECTOR_W,
+        h: center_bottom_rect.h,
+    };
+    let right_rect = Rect {
+        x: center_bottom_rect.x + INSPECTOR_W,
+        y: center_bottom_rect.y,
+        w: (center_bottom_rect.w - INSPECTOR_W).max(0.0),
+        h: center_bottom_rect.h,
+    };
+
+    // inspector はフル高の左カラム。 global shortcut を消費する widget では
+    // ないので split (= arrangement / bottom panel widget) より前に描いてよい。
+    track_inspector::draw(app, ui, inspector_rect);
+
     ui.split_view(
         "root_arrange_bottom",
-        center_bottom_rect,
+        right_rect,
         Orientation::Vertical,
         ARRANGEMENT_SPLIT_DEFAULT_RATIO,
-        |ui, top_rect, bottom_rect| {
-            let inspector_rect = Rect {
-                x: top_rect.x,
-                y: top_rect.y,
-                w: INSPECTOR_W,
-                h: top_rect.h,
-            };
-            let arrangement_rect = Rect {
-                x: top_rect.x + INSPECTOR_W,
-                y: top_rect.y,
-                w: (top_rect.w - INSPECTOR_W).max(0.0),
-                h: top_rect.h,
-            };
-
+        |ui, arrangement_rect, bottom_rect| {
             // gui_01 widget (piano_roll 等) は `take_shortcut` を消費する側面が
             // あるため、 先に root レベルで shortcut を捌いて広域の挙動を確定
             // させる。 widget 描画時には消費済みになり、 widget 内蔵の同名
-            // shortcut handler は no-op に縮退する。
+            // shortcut handler は no-op に縮退する。 bottom_rect 確定後に呼ぶ
+            // (piano_roll active 判定に使う)。
             dispatch_shortcuts(app, ui, bottom_rect);
 
-            track_inspector::draw(app, ui, inspector_rect);
             arrangement_view::draw(app, ui, arrangement_rect);
             bottom_panel::draw(app, ui, bottom_rect);
         },
@@ -498,6 +502,24 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }));
     }
 
+    // ----- FIXME #19: Piano roll track solo (S) -----
+    // MIDI エディタ内で S を押すと、 編集中 clip の所属 track を solo toggle する
+    // (mixer / arrangement の S ボタンと同じ ToggleTrackSolo を発火)。
+    // is_pianoroll_active (= pointer が bottom panel 内 + Piano Roll タブ選択) の
+    // ときだけ作用。 audio editor を開いているときは MIDI 編集文脈ではないので除外。
+    // ClipRef.track は track index なので id へ解決してから渡す。
+    if ui.take_shortcut("daw.toggle_pianoroll_track_solo")
+        && is_pianoroll_active
+        && app.audio_editor_clip.is_none()
+        && let Some(target) = app.selected_clip_ref()
+        && let Some(track) = app.song.tracks.get(target.track as usize)
+    {
+        let track_id = track.id;
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::ToggleTrackSolo(track_id));
+        }));
+    }
+
     // ----- Ctrl+A: 文脈別全選択 (grill-me 2026-06-09) -----
     // マウス位置で対象を判定する (選択前なので Delete の「非空セット」判定は
     // 使えず pointer 位置で振り分け)。 下部パネル + audio editor 開: 全 event、
@@ -545,11 +567,11 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }
     }
 
-    // ----- Clip duplicate (gui_01 #019) -----
-    // D / Alt+D で選択中 clip の末尾直後に共有/独立コピーを生成。
-    // 連打すると前回コピーが新たな選択になり、 後ろに連続して並ぶ
-    // (REAPER / Ableton の Ctrl+D 流)。 複数選択中は各々の末尾直後に
-    // 並列生成。 selected_clip が None なら no-op。
+    // ----- Clip duplicate (gui_01 #019 / FIXME #21) -----
+    // D / Alt+D で選択中 clip 群をまとめて共有/独立コピー。 選択ブロック全体の
+    // span だけ後ろにずらして相対位置を保ったまま複製する (REAPER / Ableton の
+    // Ctrl+D 流、 Ctrl+drag と同じセマンティクス)。 複製は全選択になり連打で
+    // 後方連鎖。 selected が空なら no-op。
     if ui.take_shortcut("daw.duplicate_clip_shared") {
         // ピアノロール上 + ノート選択中なら D = ノート複製。それ以外 (アレンジ文脈
         // / ピアノロールでもノート未選択) は選択中の MIDI/Audio/Vocal clip と
@@ -563,11 +585,11 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             let automation_sources: Vec<common::model::AutomationClipKey> =
                 app.selected_automation_clips.clone();
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                for src in &midi_sources {
-                    app.handle_event(AppEvent::DuplicateClipShared { source: *src });
+                if !midi_sources.is_empty() {
+                    app.handle_event(AppEvent::DuplicateClipsShared(midi_sources));
                 }
-                for key in &automation_sources {
-                    app.handle_event(AppEvent::DuplicateAutomationClipShared(*key));
+                if !automation_sources.is_empty() {
+                    app.handle_event(AppEvent::DuplicateAutomationClipsShared(automation_sources));
                 }
             }));
         }
@@ -577,11 +599,11 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         let automation_sources: Vec<common::model::AutomationClipKey> =
             app.selected_automation_clips.clone();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            for src in &midi_sources {
-                app.handle_event(AppEvent::DuplicateClipUnique { source: *src });
+            if !midi_sources.is_empty() {
+                app.handle_event(AppEvent::DuplicateClipsUnique(midi_sources));
             }
-            for key in &automation_sources {
-                app.handle_event(AppEvent::DuplicateAutomationClipUnique(*key));
+            if !automation_sources.is_empty() {
+                app.handle_event(AppEvent::DuplicateAutomationClipsUnique(automation_sources));
             }
         }));
     }
@@ -591,12 +613,22 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // rename は単一対象なので selected_clip (= 末尾カーソル clip) を使う。
     // 選択 clip が無ければ no-op。 text_input focus 中は gui_01 が shortcut を
     // 抑制するので rename 編集中の F2 は発火しない。
-    if ui.take_shortcut("daw.rename_clip")
-        && let Some(target) = app.selected_clip_ref()
-    {
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::BeginRenameClip(target));
-        }));
+    // FIXME #18: clip が選択されていれば clip rename、 そうでなければ
+    // (track header のみ選択 / フォーカス時) cursor track の名前を rename。
+    // どちらも単一対象 (selected_clip = 末尾カーソル clip、 track は
+    // cursor_track_index)。 track header の double-click が効かない場面でも
+    // F2 で確実に rename を開始できる。
+    if ui.take_shortcut("daw.rename_clip") {
+        if let Some(target) = app.selected_clip_ref() {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::BeginRenameClip(target));
+            }));
+        } else if let Some(track_idx) = app.cursor_track_index() {
+            let idx = track_idx as u32;
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::BeginRenameTrack(idx));
+            }));
+        }
     }
 
     // ----- 共有を一括選択 (Shift+L) ------------------------------------------

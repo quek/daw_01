@@ -240,6 +240,25 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     y += 28.0;
 
+    // ---- FIXME #23: param セクションを縦スクロール領域に収める --------------
+    // title 下〜area 下端を param viewport (上、 scroll) と chain band (下、 pinned)
+    // に分割する。 param の実高さは前フレーム測定値 (`inspector_body_h`、
+    // immediate-mode の lag-by-one) を content_size に使い、 viewport = content と
+    // max_param_h の小さい方。 content <= viewport なら scrollbar 無しで chain が
+    // すぐ下に続く。 dropdown popup は deferred buffer 描画なので clip_rect の外に
+    // 出て切れない (gui_01 popup.rs)。 closure body の param セクションは既存コード
+    // のまま (再インデントしない)。
+    const CHAIN_MIN_H: f32 = 160.0;
+    let body_top = y;
+    let max_param_h = (area.y + area.h - body_top - CHAIN_MIN_H).max(0.0);
+    let content_h = app.inspector_body_h.max(1.0);
+    let param_h = content_h.min(max_param_h);
+    let param_vp = Rect { x: area.x, y: body_top, w: area.w, h: param_h };
+    let boundary_y = body_top + param_h;
+    let measured_body_h = std::cell::Cell::new(0.0_f32);
+    ui.scroll_area("inspector_body", param_vp, (param_vp.w, content_h), |ui, scroll_off| {
+    let mut y = body_top - scroll_off.1;
+
     // ---- Audio Event section (Phase 2 PR1 + PR2) -----------------------
     // selected_clip が `ClipContent::Audio` のとき、 first event の field
     // を編集できる UI を表示。 PR1 で Reverse / Mute toggle + Stretch Mode
@@ -1789,6 +1808,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             y += 4.0;
         }
     }
+
+    measured_body_h.set(y - (body_top - scroll_off.1));
+    });
+    // FIXME #23: 測定した param 実高さを次フレーム用に保存 (変化時のみ edit を積む)。
+    let measured = measured_body_h.get();
+    if (app.inspector_body_h - measured).abs() > 0.5 {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.inspector_body_h = measured;
+        }));
+    }
+    // chain band は area 下端 pinned。 param viewport 直下 (boundary_y) から描く。
+    let mut y = boundary_y;
 
     // 「Chain」見出し
     ui.label_at(

@@ -3249,3 +3249,68 @@ pub hovered_automation_lane: Option<AutomationLaneKey>,  // Default = None
 
 ---
 
+### daw_01 → [要望] arrangement track header 幅の drag リサイズ (FIXME #16)
+
+関連仕様: `docs/plan_arrange_header_width.md`
+
+アレンジビューの **track header 列と lanes 領域の境界** をユーザーがドラッグして header 幅を
+変えられるようにしたい (REAPER / Bitwig の track panel 幅リサイズ相当)。
+
+**最終形態:**
+- 境界 (`header_pane.x + header_w` の縦線) 付近でカーソルが横リサイズ (`EResize` ↔) に変わる。
+- press → 左右 drag で header 幅がライブ追従 (lanes 連動伸縮)、release で確定。
+- 幅は全 track 共通の単一値。SSoT は daw_01 `AppData.arrange_header_w` (default 160.0、
+  session-only)。widget は毎フレーム `ArrangementView.header_w` としてこの値を読むだけ (実装済)。
+
+**依頼 (widget 内で扱うのが理想 — hit-test 優先順と cursor を widget が一元管理しているため):**
+1. `ArrangementEditRequest` に非破壊追加:
+   ```rust
+   /// track header 右端 splitter drag による header 幅編集。drag 中 per-frame で可。
+   /// 値は raw（clamp は caller = daw_01 が 80..480px）。
+   SetHeaderW { prev: f32, next: f32 },
+   ```
+2. `header_pane.x + header_w` を中心とした ~8px の縦帯を splitter hit zone に。M/S/R ボタン /
+   track 名 click zone と重ならない右端列に置き、hit-test 順でボタンを潰さない。press → cursor
+   `EResize` + drag、move で `SetHeaderW` を per-frame emit、release で確定。widget 内 clamp 不要。
+
+**daw_01 側 (実装済 / parked):** `AppData.arrange_header_w` + `AppEvent::SetArrangeHeaderW`
+(handler `clamp(80, 480)`) + `arrangement_view.rs` の `TRACK_HEADER_W` 定数撤去 → 全箇所
+`app.arrange_header_w` 化、まで配線済。landing 後 `make_edit` に下記 1 arm を足すだけ:
+```rust
+ArrangementEditRequest::SetHeaderW { next, .. } => Edit::mutate(move |app: &mut AppData| {
+    app.handle_event(AppEvent::SetArrangeHeaderW(next));
+}),
+```
+
+---
+
+### daw_01 → [要望] group track 名 double-click rename の信頼性 (FIXME #18)
+
+関連仕様: `docs/plan_track_rename_dblclick.md`
+
+トラック名 double-click で inline rename が始まる仕様だが、**深くネストした group track では
+始まらない** (`20260513.20260512.daw` の Group22 で再現)。
+
+**原因 (一次情報):** `arrangement.rs` の track header 描画で group のとき名前 hit 矩形を
+disclosure 分削り `.max(2.0)` でクランプしている:
+```rust
+let name_rect_visible = if is_group {
+    Rect { x: disclosure_rect.x + disclosure_rect.w, y: name_rect.y,
+           w: (name_rect.w - disclosure_rect.w).max(2.0),  // 深ネストで 2px に潰れる
+           h: name_rect.h }
+} else { name_rect };
+...
+if self.take_double_click_in_rect(name_rect_visible).is_some() { /* BeginRenameTrack */ }
+```
+深いネスト (`header_x = rect.x + depth*indent_px`) + M/S/R ボタンで名前領域が ~2px に潰れ、
+double-click が当たらない。
+
+**最終形態:** どの track (通常 / 浅い group / 深い group) でも名前 double-click で確実に rename
+開始。内部手法は gui_01 判断で可 (名前 hit 幅を実用最低値で確保 / 近接判定フォールバック /
+名前帯全体を rename 対象に 等)。通常 track の現行挙動・disclosure single-click 折り畳みは不変で。
+
+**daw_01 側 (実装済):** 保険として **F2 で track rename** を起動可能に (clip 選択中は clip
+rename、clip 未選択時は cursor track を rename)。double-click 修正後も F2 は併存。
+
+---
+

@@ -43,6 +43,11 @@ pub fn daw_shortcut_map() -> ShortcutMap {
     m.bind("daw.narrow_grid", "1");
     m.bind("daw.widen_grid", "2");
     m.bind("daw.toggle_triplet", "3");
+    // FIXME #19: MIDI エディタ (piano roll) 内で S キーを押すと、 編集中 clip の
+    // 所属 track を solo toggle する (mixer / arrangement の S ボタンと同 idiom)。
+    // root.rs::dispatch_shortcuts で is_pianoroll_active のときだけ消費。
+    // text_input フォーカス中 (歌詞編集等) は gui_01 が単キーを抑制する。
+    m.bind("daw.toggle_pianoroll_track_solo", "S");
     // gui_01 piano_roll widget の `take_shortcut("add_note")` 用バインド。
     m.bind("add_note", "Insert");
     // gui_01 #017 (M14 Phase 59): piano_roll で note 1 つ選択中に L で歌詞
