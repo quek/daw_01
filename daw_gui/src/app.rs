@@ -14202,7 +14202,7 @@ impl AppData {
             if common::voicevox_engine::is_running() {
                 return;
             }
-            let Some(exe) = common::voicevox_engine::resolve_engine_path() else {
+            let Some(engine) = common::voicevox_engine::resolve_engine_path() else {
                 let cfg_hint = common::voicevox_engine::engine_path_config_file()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "<no localappdata>".into());
@@ -14212,8 +14212,8 @@ impl AppData {
                 );
                 return;
             };
-            tracing::info!(exe = %exe.display(), "lazy spawn VOICEVOX engine for builtin plugin");
-            match common::voicevox_engine::spawn_engine(&exe) {
+            tracing::info!(?engine, "lazy spawn VOICEVOX engine for builtin plugin");
+            match common::voicevox_engine::spawn_engine(&engine) {
                 Ok(child) => {
                     if let Err(e) = job.assign_std(&child) {
                         tracing::warn!(error = ?e, "failed to attach VOICEVOX to job");
@@ -14223,7 +14223,7 @@ impl AppData {
                     std::mem::forget(child);
                 }
                 Err(e) => {
-                    tracing::error!(error = ?e, exe = %exe.display(), "failed to spawn VOICEVOX engine");
+                    tracing::error!(error = ?e, ?engine, "failed to spawn VOICEVOX engine");
                 }
             }
         });
