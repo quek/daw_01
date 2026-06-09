@@ -1676,6 +1676,15 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
         ArrangementEditRequest::SetTrackRowH(h) => Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::SetArrangeTrackRowH(h));
         }),
+        // FIXME #16: header / lanes 境界 splitter drag。 widget が per-frame で raw px
+        // `next` を emit、 handler が 80..480 に clamp して `arrange_header_w` を更新
+        // → 次フレーム widget が `view.header_w` として読み連動伸縮。 `prev` は
+        // undo 用 anchor だが header 幅は session-only なので無視。
+        ArrangementEditRequest::SetHeaderW { next, .. } => {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetArrangeHeaderW(next));
+            })
+        }
         ArrangementEditRequest::BeginRenameTrack(track_id) => {
             Edit::mutate(move |app: &mut AppData| {
                 if let Some(idx) = app.song.tracks.iter().position(|t| t.id == track_id) {
