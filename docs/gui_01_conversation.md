@@ -3314,3 +3314,29 @@ rename、clip 未選択時は cursor track を rename)。double-click 修正後�
 
 ---
 
+### daw_01 → [要望] piano roll 鍵盤オクターブラベルの可読性 (FIXME #20)
+
+関連仕様: `docs/plan_pianoroll_label_contrast.md`
+
+ピアノロール鍵盤の **オクターブラベル (C5 / root の "C2" 等) が背景と同系色で読みにくい**。
+実機 (Highlight モード, root=C) では `root_label_fg` (warm yellow `0.95,0.78,0.40`) が
+`root_row_overlay` (`rgba(1.0,0.80,0.30,0.32)`) 重畳の cream 背景に出て **warm-on-warm** で
+潰れている。
+
+**原因:** label 色 default が **実際の描画背景 (key fill `white_key 0.92` / `black_key 0.10` +
+overlay) ではなく dark な `keyboard_bg (0.22)` を想定して調色** されている (default コメントも
+"keyboard_bg 上で読める明度" と明記)。Fold モードは全 in-scale 行に label が出て白鍵/黒鍵を
+跨ぐため、**単一静的色では両立不可能** (daw_01 から色を渡すだけでは解決できない)。
+
+**最終形態 / 依頼:** clip 名で既に入っている **fill 輝度由来の WCAG auto-contrast (gui_01 #060)**
+を **鍵盤オクターブラベルにも適用** してほしい。各行の実効背景 (key fill + overlay) の輝度で
+ラベル色を dark/light 自動反転 → 白鍵/cream root 行は濃色、黒鍵/dim out 行は淡色。対象は Fold
+(root + in-scale)・Highlight (root)・None (C) の全 label パス。default-on が理想 (flag 化なら
+daw_01 が `PianoRollStyle` で有効化)。代替案: ラベルに 1px outline/halo
+(`GlyphArea.outline_color` / `outline_width_px`)。
+
+**daw_01 側:** `piano_roll_view.rs` は `PianoRollStyle::default()` を渡すだけ (static 色 override
+は撤去済)。auto-contrast default-on なら無修正で反映。
+
+---
+

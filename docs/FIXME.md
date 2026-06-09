@@ -10,3 +10,7 @@
 - #18 group track 名 double-click rename — 深ネスト group で名前 hit 矩形が潰れて rename が
   始まらない件、 gui_01 へ修正 request 提出済 (`docs/plan_track_rename_dblclick.md`)。
   保険の **F2 で track rename** は daw_01 側で対応済。
+- #20 piano roll 鍵盤オクターブラベル (C5 / root) の可読性 — label 色が key fill ではなく
+  dark keyboard_bg 想定で調色されており warm cream 背景に潰れる。 Fold は白鍵/黒鍵跨ぎで
+  単一色不可。 gui_01 へ WCAG auto-contrast 適用 request 提出済
+  (`docs/plan_pianoroll_label_contrast.md`)。 daw_01 は static override 撤去・default に戻し済。
