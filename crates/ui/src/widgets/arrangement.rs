@@ -884,6 +884,19 @@ pub struct ArrangementResponse {
     /// (= 空き automation lane zone で drag 開始 → release までの間)。 caller の cursor / status
     /// indicator 用 (既存 `rect_select_active` (MIDI clip 用) と直交、 同 frame で両方 true にならない)。
     pub automation_lasso_active: bool,
+    /// M14 Phase 116 (daw_01 #090): ポインタが今 hover している automation lane body の key。
+    /// `hovered_clip` / `hovered_zone` と同じ「毎フレーム算出の hover state」 idiom。 caller (daw_01) は
+    /// widget draw とは別フェーズ (`dispatch_shortcuts` 等) で「ポインタ下が clip 領域か automation lane か」
+    /// を区別できる (例: Ctrl+A の context 全選択の起点判定)。
+    ///
+    /// 算出は `automation_lane_key_at_y` を widget 内部で呼ぶ。 **lane body 全域**をカバー (点 / clip が
+    /// 無い空き領域でも `Some`)。 lane header (展開トグル帯) は含まない (= `lanes` pane 内の body のみ)。
+    /// master row の lane (sentinel `MASTER_TRACK_ID`) も対象。
+    ///
+    /// **clip-first の first-hit**: `hovered_clip` が `Some` のとき (= ポインタが clip 上) は
+    /// `hovered_automation_lane` は `None` (排他、 piano_roll の `hovered_*` と同流儀)。 lane と clip は
+    /// 縦に別領域なので通常同時には成立しないが、 構造的に排他を保証する。
+    pub hovered_automation_lane: Option<AutomationLaneKey>,
 }
 
 impl Default for ArrangementResponse {
@@ -905,6 +918,7 @@ impl Default for ArrangementResponse {
             automation_clip_rects: Vec::new(),
             dragging_automation_clip: None,
             automation_lasso_active: false,
+            hovered_automation_lane: None,
         }
     }
 }
@@ -5990,6 +6004,22 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             {
                 response.hovered_clip = Some(hit_key);
                 response.hovered_zone = Some(hit_kind);
+            } else {
+                // M14 Phase 116 (daw_01 #090): clip-first first-hit。 clip に当たらなかったときだけ
+                // ポインタ下の automation lane body を公開する (`hovered_clip` と排他)。 `cx` は既に
+                // `lanes.contains(cx, cy)` で lanes pane 内と確定済 (= header 帯ではなく body)。
+                response.hovered_automation_lane = automation_lane_key_at_y(
+                    &visible_tracks,
+                    &press_tops,
+                    view.track_row_h,
+                    header_pane.x,
+                    header_pane.w,
+                    lanes.x,
+                    lanes.w,
+                    style,
+                    cy,
+                )
+                .map(|(key, _body_rect)| key);
             }
         }
         response.dragging = clip_drag_session.as_ref().map(|nd| nd.kind);
@@ -10198,6 +10228,92 @@ mod tests {
             vec![MASTER_TRACK_ID],
             "Single select の next は master 単独: got {:?}",
             log[0]
+        );
+    }
+
+    /// M14 Phase 116 (daw_01 #090): expanded automation lane の body を hover すると
+    /// `ArrangementResponse.hovered_automation_lane` が `Some(lane key)` になり、 clip 上 hover では
+    /// clip-first first-hit で `None` のまま (= `hovered_clip` と排他)。
+    #[test]
+    fn hovered_automation_lane_populated_on_body_and_none_over_clip() {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        // track 0: clip 1 本 + expanded visible automation lane (id=7, height 60)。
+        // layout: ruler_h=0 / header_w=0 → lanes = full rect、 tops[0]=0。
+        //   track row body = [0, 32) (clip rect = [2, 30))、 lane body = [32, 92)。
+        let mut t0 = track(0, "t0", vec![clip(100, 0.0, 4.0, "c")]);
+        t0.automation_lanes_collapsed = false;
+        t0.automation_lanes = vec![ArrangementAutomationLane {
+            id: 7,
+            label: Arc::from("Volume"),
+            icon_glyph: 'V',
+            color: Color::rgb(1.0, 1.0, 1.0),
+            enabled: true,
+            visible: true,
+            height_px: 60,
+            default_value_norm: 0.5,
+            clips: Vec::new(),
+        }];
+        let tracks = vec![t0];
+        let view = test_view(); // header_w=0, ruler_h=0, track_row_h=32
+        let style = ArrangementStyle::default();
+
+        let run = |pos: (f32, f32)| -> ArrangementResponse {
+            let captured: Arc<Mutex<Option<ArrangementResponse>>> = Arc::new(Mutex::new(None));
+            let captured_cb = Arc::clone(&captured);
+            let input = FrameInput {
+                pointer: PointerFrame { pos: Some(pos), ..PointerFrame::default() },
+                ..FrameInput::default()
+            };
+            let mut host: UiHost<()> = UiHost::no_redraw();
+            let mut scene = Scene::new();
+            let screen = PhysicalSize { width: 800, height: 400 };
+            host.frame_to_edits(&(), &mut scene, screen, input, |(), ui| {
+                let resp = ui.arrangement(
+                    "arr_hover_lane",
+                    Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                    &tracks,
+                    view,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &style,
+                    None,
+                    |_| Edit::mutate(|()| {}),
+                );
+                *captured_cb.lock().unwrap() = Some(resp);
+            });
+            captured.lock().unwrap().take().unwrap()
+        };
+
+        // lane body 上 (cy=60 ∈ [32,92)、 cx=400 は lanes pane 内)。
+        let on_lane = run((400.0, 60.0));
+        assert_eq!(
+            on_lane.hovered_automation_lane,
+            Some(AutomationLaneKey { track: 0, lane: 7 }),
+            "lane body hover で key を公開: {:?}",
+            on_lane.hovered_automation_lane
+        );
+        assert_eq!(on_lane.hovered_clip, None, "lane body 上では clip は hover しない");
+
+        // clip 上 (cy=16 ∈ clip rect [2,30)、 cx=80 は clip rect [0,160) 内)。
+        let on_clip = run((80.0, 16.0));
+        assert_eq!(
+            on_clip.hovered_clip,
+            Some(ClipKey { track: 0, clip: 100 }),
+            "clip body hover で clip key を公開: {:?}",
+            on_clip.hovered_clip
+        );
+        assert_eq!(
+            on_clip.hovered_automation_lane, None,
+            "clip-first first-hit: clip 上では automation lane は None"
         );
     }
 
