@@ -61,6 +61,21 @@ FIXME #24「プロジェクトロード中などプログレスバーを表示�
 - **進捗 UI**: `export_overlay.rs` の bar 描画を流用しつつ、ロード/保存/再スキャンは blocking modal では
   **なく非ブロック overlay（隅）** にする。
 
+## 実装状況 (2026-06-10)
+
+- **ロード = ストリーミング**: landed（`begin_asset_decode` → background decode → `AssetDecodeTick` →
+  `on_asset_decode_tick` で逐次 cache 排出 + 再生 gate）+ 非ブロック進捗 overlay（`view/load_overlay.rs`）。
+- **保存インジケータ**: landed（非同期保存中 = `is_async_save_pending` の間 load_overlay が「保存中…」を
+  表示、非ブロック）。
+- **保存の snapshot-at-invoke は分離（未実装）**: `save_to` の `migrate_unsaved_audio_sources_into`
+  / `migrate_unsaved_bounce_sources_into` が **live `self.song` のファイル移動 + path 書換**を伴うため、
+  snapshot 側だけ書き換えると live project が移動後ファイルを見失う。正しくは「migrate を invoke 時に
+  `self.song` へ適用 → snapshot → 完了時に plugin state を snapshot へ適用して serialize」という再配列が
+  要る。**save はユーザーの作業データに直結する critical path** なので、コスト判断ではなく**データ安全性
+  判断**として、慎重にレビューする独立変更に分離する。現状の save は既に非ブロック+単一スレッドで安全。
+- **再スキャン進捗**: VST3 probe（[plan_unified_plugin_picker.md](plan_unified_plugin_picker.md) Phase B）で
+  scan を改造する際に同時に入れる（scan が重くなるので進捗の意義が増す）。
+
 関連: [plan_export_modal.md](plan_export_modal.md)（既存進捗 modal）、
 [plan_a4_autosave_recovery.md](plan_a4_autosave_recovery.md)（save baseline / autosave）、
 [plan_unified_plugin_picker.md](plan_unified_plugin_picker.md)（VST3 probe で rescan が重くなる件）。

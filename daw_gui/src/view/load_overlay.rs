@@ -1,7 +1,8 @@
-//! プロジェクトロードの進捗を画面上端中央に出す **非ブロック** overlay
-//! (FIXME #24 / `docs/plan_progress_streaming.md`)。modal ではないので構造の
-//! 操作 (スクロール / 編集) はそのまま続けられる。`app.load_progress == Some`
-//! の間だけ小さな determinate バーを描く。
+//! プロジェクトロード / 非同期保存の進捗を画面上端中央に出す **非ブロック**
+//! overlay (FIXME #24 / `docs/plan_progress_streaming.md`)。modal ではないので
+//! 構造の操作 (スクロール / 編集) はそのまま続けられる。
+//! - ロード中 (`load_progress == Some`): determinate バー (done/total)。
+//! - 非同期保存中 (`is_async_save_pending`): indeterminate (「保存中…」のみ)。
 
 use daw_ui_core::Ui;
 use daw_ui_platform::PhysicalSize;
@@ -14,36 +15,41 @@ const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
 const BAR_BG: Color = Color { r: 0.10, g: 0.10, b: 0.13, a: 1.0 };
 const BAR_FILL: Color = Color { r: 0.36, g: 0.62, b: 0.92, a: 1.0 };
 
+const LOAD_LABEL: &str = "\u{30d7}\u{30ed}\u{30b8}\u{30a7}\u{30af}\u{30c8}\u{8aad}\u{8fbc}\u{4e2d}"; // プロジェクト読込中
+const SAVE_LABEL: &str = "\u{4fdd}\u{5b58}\u{4e2d}\u{2026}"; // 保存中…
+
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
-    let Some((done, total)) = app.load_progress else {
-        return;
-    };
-    if total == 0 {
-        return;
+    // ロード進捗 (determinate) を優先。 無ければ非同期保存 (indeterminate)。
+    if let Some((done, total)) = app.load_progress {
+        if total > 0 {
+            let pct = (done as f32 / total as f32).clamp(0.0, 1.0);
+            draw_overlay(ui, screen, &format!("{LOAD_LABEL}  {done}/{total}"), Some(pct));
+        }
+    } else if app.is_async_save_pending() {
+        draw_overlay(ui, screen, SAVE_LABEL, None);
     }
+}
+
+/// 上端中央に小パネル + ラベル + (任意の) determinate バーを描く。
+/// `pct == None` は indeterminate (バー無し)。
+fn draw_overlay(ui: &mut Ui<'_, AppData>, screen: PhysicalSize, label: &str, pct: Option<f32>) {
     let w = 300.0;
-    let h = 46.0;
+    let h = if pct.is_some() { 46.0 } else { 32.0 };
     let x = ((screen.width as f32) - w) * 0.5;
     let y = 12.0;
     ui.panel("load_overlay_bg", Rect { x, y, w, h }, BG, 6.0);
-    ui.label_at(
-        "load_overlay_label",
-        &format!("\u{30d7}\u{30ed}\u{30b8}\u{30a7}\u{30af}\u{30c8}\u{8aad}\u{8fbc}\u{4e2d}  {done}/{total}"),
-        x + 14.0,
-        y + 9.0,
-        13.0,
-        TEXT,
-    );
-    let bar_x = x + 14.0;
-    let bar_y = y + h - 15.0;
-    let bar_w = w - 28.0;
-    let bar_h = 6.0;
-    ui.panel("load_overlay_bar_bg", Rect { x: bar_x, y: bar_y, w: bar_w, h: bar_h }, BAR_BG, 3.0);
-    let pct = (done as f32 / total as f32).clamp(0.0, 1.0);
-    ui.panel(
-        "load_overlay_bar",
-        Rect { x: bar_x, y: bar_y, w: bar_w * pct, h: bar_h },
-        BAR_FILL,
-        3.0,
-    );
+    ui.label_at("load_overlay_label", label, x + 14.0, y + 9.0, 13.0, TEXT);
+    if let Some(pct) = pct {
+        let bar_x = x + 14.0;
+        let bar_y = y + h - 15.0;
+        let bar_w = w - 28.0;
+        let bar_h = 6.0;
+        ui.panel("load_overlay_bar_bg", Rect { x: bar_x, y: bar_y, w: bar_w, h: bar_h }, BAR_BG, 3.0);
+        ui.panel(
+            "load_overlay_bar",
+            Rect { x: bar_x, y: bar_y, w: bar_w * pct, h: bar_h },
+            BAR_FILL,
+            3.0,
+        );
+    }
 }

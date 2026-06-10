@@ -6431,6 +6431,15 @@ impl AppData {
         self.enqueue_state_request(PendingStateRequest::Save { path });
     }
 
+    /// plugin state 取得待ちで save が非同期進行中か (= queue に Save あり)。
+    /// FIXME #24: この間 load_overlay が「保存中…」インジケータを出す
+    /// (= 非ブロック、 編集は続行可)。
+    pub(crate) fn is_async_save_pending(&self) -> bool {
+        self.pending_state_queue
+            .iter()
+            .any(|r| matches!(r, PendingStateRequest::Save { .. }))
+    }
+
     /// state 適用 (save flow なら `apply_plugin_states` 済み、 plugin が
     /// 無ければ no-op) のあとファイルを書き出す。
     fn save_after_states(&mut self, path: PathBuf) {
