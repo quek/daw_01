@@ -190,6 +190,19 @@ impl PluginCapability {
     }
 }
 
+/// FIXME #29: 新 plugin が Instrument スロットを占めるとき、 既存音源を破棄
+/// (置換) するのでなく生成器列へ **降格** すべきか。 `existing_capability` は既存
+/// instrument の capability (None = 音源なし)。 **既存が dual-role のときだけ降格**
+/// する — 純粋音源は note 出力を持たず生成器になれないので従来どおり置換、
+/// 音源が無ければ降格対象も無い。 これで「Scaler 2 を先に刺してから Analog Lab V を
+/// 刺す」 と Scaler 2 が破棄されず生成器に降りる。
+fn should_demote_existing_instrument(
+    new_dest_is_instrument: bool,
+    existing_capability: Option<PluginCapability>,
+) -> bool {
+    new_dest_is_instrument && existing_capability == Some(PluginCapability::DualRole)
+}
+
 #[cfg(test)]
 mod plugin_capability_tests {
     use super::PluginCapability;
@@ -244,6 +257,20 @@ mod plugin_capability_tests {
         assert!(AudioFx.allows_slot_kind(2));
         assert!(!AudioFx.allows_slot_kind(0));
         assert!(!AudioFx.allows_slot_kind(1));
+    }
+
+    #[test]
+    fn demote_only_when_existing_is_dual_role() {
+        use super::should_demote_existing_instrument;
+        use PluginCapability::*;
+        // 既存音源が dual-role + 新 plugin が Instrument を占める → 降格。
+        assert!(should_demote_existing_instrument(true, Some(DualRole)));
+        // 既存が純粋音源 → 従来どおり置換 (降格しない、 要件: 既存挙動不変)。
+        assert!(!should_demote_existing_instrument(true, Some(Instrument)));
+        // 音源なし → 降格対象なし。
+        assert!(!should_demote_existing_instrument(true, None));
+        // 新 plugin が Instrument を占めない (FX / MIDI FX) → 降格しない。
+        assert!(!should_demote_existing_instrument(false, Some(DualRole)));
     }
 }
 
@@ -2980,6 +3007,15 @@ pub enum DeferredEdit {
     DeleteTrack { track_id: u32 },
     UngroupTracks { track_ids: Vec<u32> },
     RemoveSlot { track_id: u32, slot: PluginSlot },
+    /// FIXME #29: 既存 dual-role 音源 (例 Scaler 2) を **破棄せず生成器列へ降格** して
+    /// から新音源 (例 Analog Lab V) を Instrument に入れる。 降格 plugin の最新 knob を
+    /// 保つため、 他の deferred edit と同じく RequestAllStates 完了後 (= state を Song に
+    /// 書き戻した後) に実行される。 host/audio の slot 鍵は reconcile が貼り替える。
+    ReplaceInstrumentDemoting {
+        track_id: u32,
+        new_plugin_id: String,
+        new_format: PluginFormat,
+    },
 }
 
 /// 口パク (lip-sync) 背景ジョブの 1 vocal clip 分の結果。`query_phonemes` の
@@ -14080,6 +14116,11 @@ impl AppData {
             DeferredEdit::RemoveSlot { track_id, slot } => {
                 self.remove_slot_inner(track_id, slot)
             }
+            DeferredEdit::ReplaceInstrumentDemoting {
+                track_id,
+                new_plugin_id,
+                new_format,
+            } => self.replace_instrument_demoting_inner(track_id, new_plugin_id, new_format),
         }
     }
 
@@ -14540,6 +14581,43 @@ impl AppData {
 
     // -------- Plugin picker -----------------------------------------------
 
+    /// FIXME #29: `DeferredEdit::ReplaceInstrumentDemoting` の実体。 既存 dual-role
+    /// 音源を破棄せず生成器列 (midi_fx_chain) 末尾へ降格し、 新音源を Instrument へ
+    /// 据える。 RequestAllStates 完了後に呼ばれるので降格 plugin の最新 state は既に
+    /// Song に書き戻されており、 reconcile が `initial_state` で復元する。 host/audio の
+    /// slot 鍵は LoadSong では再キーされないため、 必ず `reconcile_plugins_with_song`
+    /// を通す (diff が「Instrument 置換 + MidiFx 新規ロード」 を生成 → 旧音源 destroy /
+    /// 降格 plugin は MidiFx に state 込みで載せ替わる)。
+    fn replace_instrument_demoting_inner(
+        &mut self,
+        track_id: u32,
+        new_plugin_id: String,
+        new_format: PluginFormat,
+    ) {
+        {
+            let Some(track) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+                return;
+            };
+            if let Some(demoted) = track.instrument.take() {
+                track.midi_fx_chain.push(demoted);
+            }
+            track.instrument = Some(common::model::PluginInstance::new(
+                new_plugin_id.clone(),
+                new_format,
+            ));
+            // 新音源が builtin VOICEVOX なら vocal track 化 (select_plugin_from_db と同ロジック)。
+            track.source = if new_plugin_id.as_str() == common::plugin_db::BUILTIN_ID_VOICEVOX {
+                InstrumentSource::Vocal {
+                    speaker_id: common::voicevox::DEFAULT_SINGER_ID,
+                    style_name: "ノーマル".into(),
+                }
+            } else {
+                InstrumentSource::None
+            };
+        }
+        self.reconcile_plugins_with_song();
+    }
+
     fn select_plugin_from_db(&mut self, id: String, keep_open: bool, open_gui: bool) {
         // 無修飾 / Shift は選択で閉じる。 Ctrl (keep_open) は開いたまま連続追加
         // できる (各プラグインは自分の種別で振り分く)。
@@ -14625,6 +14703,37 @@ impl AppData {
                 }
             }
         };
+        // FIXME #29: 新 plugin が Instrument を占め、 既存音源が dual-role なら、 置換
+        // (= 既存破棄) でなく生成器列へ降格する (Scaler 2 を先に刺してから Analog Lab V を
+        // 刺すケース)。 純粋音源同士の置換 (既存挙動) は不変。 降格 plugin の最新 knob を
+        // 捕まえるため deferred (RequestAllStates 完了後に実行) に乗せる。
+        if dest_slot == PluginSlot::Instrument {
+            let existing_cap = self.song.tracks[track_idx]
+                .instrument
+                .as_ref()
+                .and_then(|inst| db.find_by_id(&inst.plugin_id))
+                .map(PluginCapability::from_entry);
+            if should_demote_existing_instrument(true, existing_cap) {
+                // 新音源の GUI auto-open は reconcile の load 完了で発火させる。
+                if open_gui {
+                    self.pending_added_plugin_finalize
+                        .insert((track_id, PluginSlot::Instrument));
+                }
+                let edit = DeferredEdit::ReplaceInstrumentDemoting {
+                    track_id,
+                    new_plugin_id: entry_id.clone(),
+                    new_format: entry_format,
+                };
+                if self.song_has_plugin() {
+                    self.enqueue_state_request(PendingStateRequest::Deferred(edit));
+                } else {
+                    // 既存 instrument が居る = plugin あり なので通常ここは通らない。 防御的に即時。
+                    self.push_undo_snapshot();
+                    self.execute_deferred_edit(edit);
+                }
+                return;
+            }
+        }
         self.track_pending_load(track_id, dest_slot);
         // ユーザーが手動追加した plugin は load 完了時に daw_audio 再 sync + GUI 自動
         // open する (project-load の一斉復元はこの集合に積まれない)。 Shift
