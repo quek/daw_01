@@ -83,6 +83,16 @@ FIXME #26。grill-me（2026-06-10）で「1 ボタン・混合リスト・種別
 7. **VST3 probe**: scan_system から plugin_host への bus-probe IPC を新設（timeout + 隔離）。
    結果を `PluginEntry.is_note_effect` に格納。
 
+## 実装状況 (2026-06-10)
+
+- **Phase A landed** (commit 58f9d2d): 1 ボタン統合 / 混合リスト / `from_features` 自動振り分け /
+  種別タグ / master FX-only / 2nd instrument 差し替え / 修飾キー / close-on-select。
+- **Phase B landed**: VST3 note-effect を再スキャン時の使い捨て probe プロセス
+  (`daw_plugin_host --probe-vst3 <path> <id>` → bus 構成 event-in/out + no-audio-out 判定) で検出し、
+  features に `"note-effect"` を追記 (routing は `from_features` が拾う)。 プロセス隔離 + 8s timeout で
+  壊れた / ハングする VST3 が scan を巻き込まない。 probe 失敗 / timeout は false fallback (= FX 扱い、
+  退行なし)。 再スキャン進捗を load_overlay に表示。 **実機 VST3 での挙動確認は最終バッチで**。
+
 ## 未深掘り（既定で進める）
 
 - リスト並びは現状維持（名前順）。種別タグで区別。

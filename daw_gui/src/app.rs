@@ -1170,6 +1170,9 @@ pub struct AppData {
     /// 進捗 overlay 用 (done, total)。 draw で Mutex を取らずに済むよう
     /// `on_asset_decode_tick` がプレーン値で更新する。 `None` = 非表示。
     pub load_progress: Option<(usize, usize)>,
+    /// 進捗 overlay のラベル (ロード / 走査で文言が違う)。`load_progress` が
+    /// `Some` のときだけ使われる。
+    pub load_progress_label: &'static str,
     /// VOICEVOX engine `/singers` の結果。 起動時に background thread が
     /// `AppEvent::SingersLoaded` で投入する。 engine 未起動 / fetch 失敗時は
     /// 空のまま (Track Inspector の dropdown は default singer のみ表示)。
@@ -1547,6 +1550,7 @@ impl AppData {
             rescan_result: Arc::new(Mutex::new(None)),
             asset_decode: None,
             load_progress: None,
+            load_progress_label: "",
             singers: Vec::new(),
             vocal_speaker_entries: Vec::new(),
             vocal_speaker_labels: Vec::new(),
@@ -3552,6 +3556,10 @@ pub enum AppEvent {
     /// たびに発火。 staging を caches へ流し込み、 全件完了で gate を外す。
     AssetDecodeTick,
 
+    /// FIXME #26 Phase B: 再スキャンの VST3 note-effect probe 進捗 (done, total)。
+    /// load_overlay に「プラグイン走査中 done/total」を出す。
+    RescanProgress { done: usize, total: usize },
+
     ToggleSlotGui { slot_kind: u8, slot_index: u32 },
     RemoveSlot { slot_kind: u8, slot_index: u32 },
     /// PR4 sidechain: wire / unwire the sidechain source for a plugin's
@@ -4834,6 +4842,10 @@ impl AppData {
             AppEvent::CommitFontFromPicker(family) => self.commit_font_from_picker(family),
             AppEvent::FontFamiliesLoaded(families) => self.on_font_families_loaded(families),
             AppEvent::AssetDecodeTick => self.on_asset_decode_tick(),
+            AppEvent::RescanProgress { done, total } => {
+                self.load_progress = Some((done, total));
+                self.load_progress_label = "プラグインを走査中";
+            }
             AppEvent::RescanPluginDb => {
                 self.begin_rescan();
             }
@@ -5658,6 +5670,7 @@ impl AppData {
         let staging = Arc::new(Mutex::new(AssetDecodeStaging { total, ..Default::default() }));
         self.asset_decode = Some(Arc::clone(&staging));
         self.load_progress = Some((0, total));
+        self.load_progress_label = "プロジェクトを読込中";
         let proxy = self.event_proxy.clone();
         std::thread::spawn(move || {
             for (id, abs) in audio_jobs {
@@ -14476,7 +14489,37 @@ impl AppData {
         let slot = Arc::clone(&self.rescan_result);
         let proxy = self.event_proxy.clone();
         std::thread::spawn(move || match common::plugin_db::scan_system() {
-            Ok(db) => {
+            Ok(mut db) => {
+                // FIXME #26 Phase B: VST3 は note-effect の category tag が無いので、
+                // 各 VST3 を使い捨て probe プロセスで起動して bus 構成を読み、
+                // note-effect なら features に "note-effect" を追記する (routing は
+                // PluginCategory::from_features が拾う)。 probe 失敗 / timeout は
+                // false fallback (= FX 扱い、 退行しない)。 CLAP は変更不要。
+                let vst3_idx: Vec<usize> = db
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| {
+                        e.format == common::plugin_format::PluginFormat::Vst3
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                let total = vst3_idx.len();
+                for (n, &i) in vst3_idx.iter().enumerate() {
+                    proxy.send(AppEvent::RescanProgress { done: n, total });
+                    let (path, id) = {
+                        let e = &db.entries[i];
+                        (e.path.clone(), e.id.clone())
+                    };
+                    if crate::subprocess::probe_vst3_note_effect(&path, &id)
+                        && !db.entries[i].features.iter().any(|f| f == "note-effect")
+                    {
+                        db.entries[i].features.push("note-effect".into());
+                    }
+                }
+                if total > 0 {
+                    proxy.send(AppEvent::RescanProgress { done: total, total });
+                }
                 if let Some(cache) = common::plugin_db::default_cache_path()
                     && let Err(e) = db.save_to_file(&cache)
                 {
@@ -14500,6 +14543,8 @@ impl AppData {
 
     fn finish_rescan(&mut self) {
         self.is_rescanning = false;
+        // 走査進捗 overlay を消す (FIXME #26 Phase B)。
+        self.load_progress = None;
         let Some(new_db) = self.rescan_result.lock().ok().and_then(|mut g| g.take()) else {
             return;
         };

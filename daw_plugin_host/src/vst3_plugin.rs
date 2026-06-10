@@ -677,6 +677,80 @@ fn create_instance<I: Interface>(
     unsafe { ComPtr::<I>::from_raw(obj as *mut I) }
 }
 
+/// FIXME #26 Phase B: VST3 のクラスを一時 instantiate して bus 構成から
+/// **note-effect** (= ノート入出力あり・音声出力なし、 例: アルペジエータ /
+/// MIDI フィルタ) かを判定する。 daw_plugin_host の `--probe-vst3` one-shot
+/// モードから呼ばれる。 VST3 規格には note-effect の category tag が無く、 bus
+/// 構成でしか判別できない (`ivstaudioprocessor.h` PlugType / `ivstcomponent.h`
+/// MediaTypes)。 失敗時は呼び元 (scan) が FX 扱いに fallback するので退行しない。
+///
+/// `load` の前半 (module → factory → class 解決 → component → initialize) を
+/// 再現し、 audio processing / controller / activate はしない (= 軽量・副作用最小)。
+pub fn probe_note_effect(path: &Path, target_id: &str) -> Result<bool> {
+    let dll_path = resolve_vst3_dll(path)
+        .with_context(|| format!("resolving VST3 at {}", path.display()))?;
+    let library = unsafe { Library::new(&dll_path) }
+        .with_context(|| format!("LoadLibrary {}", dll_path.display()))?;
+    unsafe {
+        if let Ok(init_dll) = library.get::<Symbol<extern "system" fn() -> bool>>(b"InitDll\0")
+            && !init_dll()
+        {
+            anyhow::bail!("InitDll returned false");
+        }
+    }
+    let factory_raw: *mut IPluginFactory = unsafe {
+        let sym: Symbol<extern "system" fn() -> *mut IPluginFactory> = library
+            .get(b"GetPluginFactory\0")
+            .context("missing GetPluginFactory export")?;
+        sym()
+    };
+    anyhow::ensure!(!factory_raw.is_null(), "GetPluginFactory returned null");
+    let factory = unsafe { ComPtr::<IPluginFactory>::from_raw(factory_raw) }
+        .context("factory came back null")?;
+
+    // クラス検索 (load と同 idiom): target_id が 32-hex UUID ならその CID 一致、
+    // さもなくば最初の Audio Module Class。
+    let count = unsafe { factory.countClasses() };
+    let is_uuid =
+        target_id.len() == 32 && target_id.chars().all(|c| c.is_ascii_hexdigit());
+    let mut class_cid: Option<TUID> = None;
+    for i in 0..count {
+        let mut info = std::mem::MaybeUninit::<PClassInfo>::zeroed();
+        if unsafe { factory.getClassInfo(i, info.as_mut_ptr()) } != kResultOk {
+            continue;
+        }
+        let info = unsafe { info.assume_init() };
+        if c_array_to_string(&info.category) != "Audio Module Class" {
+            continue;
+        }
+        let cid_hex = tuid_to_hex(&info.cid);
+        if (!is_uuid || cid_hex.eq_ignore_ascii_case(target_id)) && class_cid.is_none() {
+            class_cid = Some(info.cid);
+        }
+    }
+    let class_cid = class_cid.context("no matching Audio Module Class")?;
+
+    let component = create_instance::<IComponent>(&factory, &class_cid)
+        .context("createInstance(IComponent) failed")?;
+    let host_app = ComWrapper::new(Vst3HostApp::new());
+    let host_app_ptr: *mut FUnknown = host_app
+        .to_com_ptr::<FUnknown>()
+        .context("host_app has no FUnknown")?
+        .into_raw();
+    let init_res = unsafe { component.initialize(host_app_ptr) };
+    let _ = unsafe { ComPtr::<FUnknown>::from_raw(host_app_ptr) };
+    anyhow::ensure!(init_res == kResultOk, "initialize returned {:#x}", init_res);
+
+    let ev_in = unsafe { component.getBusCount(MediaTypes_::kEvent, BusDirections_::kInput) };
+    let ev_out = unsafe { component.getBusCount(MediaTypes_::kEvent, BusDirections_::kOutput) };
+    let au_out = unsafe { component.getBusCount(MediaTypes_::kAudio, BusDirections_::kOutput) };
+    let _ = unsafe { component.terminate() };
+
+    // note-effect = ノート in/out あり + 音声出力なし。 synth は au_out>0 で除外、
+    // analyzer / meter は ev_out==0 で除外、 audio FX は ev_out==0 で除外。
+    Ok(ev_in > 0 && ev_out > 0 && au_out == 0)
+}
+
 // `c_array_to_string` / `tuid_to_hex` live in `common::vst3_scan` as the
 // shared SSoT (imported above) so scan-side (writes `cid_hex` to the plugin
 // DB) and load-side (this module, matches against it) hex / name decoding can

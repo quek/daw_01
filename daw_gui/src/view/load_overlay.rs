@@ -15,15 +15,16 @@ const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
 const BAR_BG: Color = Color { r: 0.10, g: 0.10, b: 0.13, a: 1.0 };
 const BAR_FILL: Color = Color { r: 0.36, g: 0.62, b: 0.92, a: 1.0 };
 
-const LOAD_LABEL: &str = "\u{30d7}\u{30ed}\u{30b8}\u{30a7}\u{30af}\u{30c8}\u{8aad}\u{8fbc}\u{4e2d}"; // プロジェクト読込中
 const SAVE_LABEL: &str = "\u{4fdd}\u{5b58}\u{4e2d}\u{2026}"; // 保存中…
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
-    // ロード進捗 (determinate) を優先。 無ければ非同期保存 (indeterminate)。
+    // 進捗 (determinate: ロード / プラグイン走査) を優先。 無ければ非同期保存
+    // (indeterminate)。 ラベルは `load_progress_label` が文脈別に持つ。
     if let Some((done, total)) = app.load_progress {
         if total > 0 {
             let pct = (done as f32 / total as f32).clamp(0.0, 1.0);
-            draw_overlay(ui, screen, &format!("{LOAD_LABEL}  {done}/{total}"), Some(pct));
+            let label = format!("{}  {done}/{total}", app.load_progress_label);
+            draw_overlay(ui, screen, &label, Some(pct));
         }
     } else if app.is_async_save_pending() {
         draw_overlay(ui, screen, SAVE_LABEL, None);
