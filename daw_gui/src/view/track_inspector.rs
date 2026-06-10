@@ -11,7 +11,7 @@ use daw_ui_core::{
 use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{
-    text_num_to_builtin, AppData, AppEvent, ColorPickerTarget, InspectorScrubField, PickerTarget,
+    text_num_to_builtin, AppData, AppEvent, ColorPickerTarget, InspectorScrubField,
     TextNumField,
 };
 use crate::view::track_color;
@@ -2020,57 +2020,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
     }
 
-    // 下端: + Inst / + FX / + MIDI FX。Reaper folder 流で group track
-    // も全機能を持てる仕様 (plan_group_track.md §1)、よって group も
-    // 普通 track と同じ 3 ボタン表示。
-    // master bus は audio fx のみ持つので「+ FX」 1 本だけを全幅で出す。
-    if app.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
-        ui.button_at(
-            "inspector_add_fx",
-            "+ FX",
-            Rect { x: area.x + pad, y: btns_y, w: area.w - pad * 2.0, h: btns_h },
-            || {
-                Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Fx))
-                })
-            },
-        );
-        return;
-    }
-    let btn_w = (area.w - pad * 2.0 - 12.0) / 3.0;
+    // 下端: 「+ Plugin」 1 ボタン (統合ピッカー)。 plan_unified_plugin_picker.md:
+    // 旧 +Inst / +FX / +MIDI の 3 ボタンを 1 つに統合し、 選んだプラグインの種別で
+    // 行き先 (Instrument / FX / MIDI FX) を自動振り分けする。 master bus は audio fx
+    // のみなのでリスト側 (refresh_picker_visible) が FX のみに絞る。 ラベルだけ master
+    // は「+ FX」で期待値を示す。
+    let is_master = app.cursor_track_id() == Some(common::model::MASTER_TRACK_ID);
     ui.button_at(
-        "inspector_add_inst",
-        "+ Inst",
-        Rect { x: area.x + pad, y: btns_y, w: btn_w, h: btns_h },
-        || {
-            Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Instrument))
-            })
-        },
-    );
-    ui.button_at(
-        "inspector_add_fx",
-        "+ FX",
-        Rect { x: area.x + pad + btn_w + 6.0, y: btns_y, w: btn_w, h: btns_h },
-        || {
-            Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Fx))
-            })
-        },
-    );
-    ui.button_at(
-        "inspector_add_midi_fx",
-        "+ MIDI",
-        Rect {
-            x: area.x + pad + (btn_w + 6.0) * 2.0,
-            y: btns_y,
-            w: btn_w,
-            h: btns_h,
-        },
-        || {
-            Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::MidiFx))
-            })
-        },
+        "inspector_add_plugin",
+        if is_master { "+ FX" } else { "+ Plugin" },
+        Rect { x: area.x + pad, y: btns_y, w: area.w - pad * 2.0, h: btns_h },
+        || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::OpenPluginPicker)),
     );
 }

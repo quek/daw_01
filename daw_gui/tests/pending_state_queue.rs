@@ -17,7 +17,7 @@ use common::plugin_format::PluginFormat;
 use common::protocol::{MainToChild, PluginSlot};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
-use daw_gui::app::{AppData, AppEvent, PickerTarget};
+use daw_gui::app::{AppData, AppEvent};
 use daw_gui::dispatcher::{
     BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
 };
@@ -31,7 +31,7 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 name: "Test Synth".into(),
                 vendor: "Test".into(),
                 version: "1.0".into(),
-                features: vec![],
+                features: vec!["instrument".into()],
                 path: "C:/fake/synth.clap".into(),
                 descriptor_index: 0,
             },
@@ -41,7 +41,7 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 name: "Test Bitcrush".into(),
                 vendor: "Test".into(),
                 version: "1.0".into(),
-                features: vec![],
+                features: vec!["audio-effect".into()],
                 path: "C:/fake/bitcrush.clap".into(),
                 descriptor_index: 0,
             },
@@ -51,7 +51,7 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 name: "Test Delay".into(),
                 vendor: "Test".into(),
                 version: "1.0".into(),
-                features: vec![],
+                features: vec!["audio-effect".into()],
                 path: "C:/fake/delay.clap".into(),
                 descriptor_index: 0,
             },
@@ -121,16 +121,28 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
     let track_id = app.song.tracks[0].id;
     app.handle_event(AppEvent::SelectTrack(0));
 
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Instrument));
-    app.handle_event(AppEvent::SelectPluginFromDb("test.synth".into()));
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.synth".into(),
+        keep_open: false,
+        open_gui: true,
+    });
     fake_plugin_loaded(&mut app, track_id, PluginSlot::Instrument, "test.synth", 100);
 
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Fx));
-    app.handle_event(AppEvent::SelectPluginFromDb("test.bitcrush".into()));
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.bitcrush".into(),
+        keep_open: false,
+        open_gui: true,
+    });
     fake_plugin_loaded(&mut app, track_id, PluginSlot::Fx(0), "test.bitcrush", 200);
 
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Fx));
-    app.handle_event(AppEvent::SelectPluginFromDb("test.delay".into()));
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.delay".into(),
+        keep_open: false,
+        open_gui: true,
+    });
     fake_plugin_loaded(&mut app, track_id, PluginSlot::Fx(1), "test.delay", 201);
 
     // pending_state_queue は初期で空。

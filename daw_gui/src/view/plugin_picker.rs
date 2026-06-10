@@ -7,11 +7,15 @@ use daw_ui_core::{Edit, ListViewStyle, ModalStyle, Ui};
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{Color, Rect};
 
-use crate::app::{AppData, AppEvent};
+use crate::app::{AppData, AppEvent, PluginCategory};
 
 const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
 const COLOR_TEXT_DIM: Color = Color { r: 0.65, g: 0.68, b: 0.72, a: 1.0 };
 const COLOR_TEXT_FORMAT: Color = Color { r: 0.55, g: 0.78, b: 0.95, a: 1.0 };
+// 種別タグの色分け (楽器 / FX / MIDI)。 選択行は白に潰す。
+const COLOR_TAG_INST: Color = Color { r: 0.58, g: 0.85, b: 0.55, a: 1.0 };
+const COLOR_TAG_FX: Color = Color { r: 0.55, g: 0.78, b: 0.95, a: 1.0 };
+const COLOR_TAG_MIDI: Color = Color { r: 0.95, g: 0.74, b: 0.45, a: 1.0 };
 
 const PANEL_W: f32 = 520.0;
 const PANEL_H: f32 = 460.0;
@@ -36,8 +40,14 @@ const LIST_STYLE: ListViewStyle = ListViewStyle {
 };
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
+    // is_plugin_picker_open を modal 可視性の SSoT にする。 選択時 (Ctrl 以外) は
+    // select_plugin_from_db が flag=false にするので、 ここで modal を閉じる
+    // (= 選択したら閉じる、 FIXME #26)。 Ctrl 選択は flag=true のままなので開いた
+    // まま連続追加できる。
     if app.is_plugin_picker_open && !ui.is_modal_open("plugin_picker") {
         ui.open_modal("plugin_picker");
+    } else if !app.is_plugin_picker_open && ui.is_modal_open("plugin_picker") {
+        ui.close_modal("plugin_picker");
     }
 
     ui.modal(
@@ -132,8 +142,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 && let Some(target) = app.plugin_picker_visible.get(app.plugin_picker_cursor)
             {
                 let id = target.id.clone();
+                // 修飾キー (FIXME #26): Ctrl=開いたまま連続追加 / Shift=GUI を開かない。
+                let m = ui.pointer().modifiers;
+                let keep_open = m.ctrl;
+                let open_gui = !m.shift;
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SelectPluginFromDb(id))
+                    app.handle_event(AppEvent::SelectPluginFromDb { id, keep_open, open_gui })
                 }));
             }
 
@@ -208,14 +222,36 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                         10.0,
                         format_color,
                     );
+                    // 種別タグ (楽器 / FX / MIDI): 混合リストで選ぶ前に行き先が分かる。
+                    let tag_color = if is_selected {
+                        Color::WHITE
+                    } else {
+                        match entry.category {
+                            PluginCategory::Instrument => COLOR_TAG_INST,
+                            PluginCategory::Fx => COLOR_TAG_FX,
+                            PluginCategory::MidiFx => COLOR_TAG_MIDI,
+                        }
+                    };
+                    ui.label_at(
+                        ("pp_row_tag", i),
+                        entry.category.tag(),
+                        row_rect.x + row_rect.w - 250.0,
+                        row_rect.y + 6.0,
+                        10.0,
+                        tag_color,
+                    );
                 },
             );
             if let Some(idx) = resp.clicked
                 && let Some(target) = visible.get(idx)
             {
                 let id = target.id.clone();
+                // 修飾キー (FIXME #26): Ctrl=開いたまま連続追加 / Shift=GUI を開かない。
+                let m = ui.pointer().modifiers;
+                let keep_open = m.ctrl;
+                let open_gui = !m.shift;
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SelectPluginFromDb(id))
+                    app.handle_event(AppEvent::SelectPluginFromDb { id, keep_open, open_gui })
                 }));
             }
         },

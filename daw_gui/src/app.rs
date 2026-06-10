@@ -105,6 +105,61 @@ pub struct PluginPickEntry {
     pub vendor: String,
     pub features: Vec<String>,
     pub format_label: String,
+    /// `features` から導出した行き先カテゴリ (種別タグ表示 + 自動振り分け用)。
+    pub category: PluginCategory,
+}
+
+/// 統合プラグインピッカー (`docs/plan_unified_plugin_picker.md`): プラグインの
+/// `features` から導出する「行き先カテゴリ」。優先順 **note-effect > instrument >
+/// audio-effect**、 どの主カテゴリも名乗らなければ `Fx` に倒す (= 未分類は FX
+/// チェーンへ)。 VST3 の note-effect は Phase B (scan 時 bus 探り) で `features` に
+/// `"note-effect"` が乗るまで判定不可なので、 現状 VST3 は instrument / audio-effect
+/// の二択。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PluginCategory {
+    Instrument,
+    Fx,
+    MidiFx,
+}
+
+impl PluginCategory {
+    pub fn from_features(features: &[String]) -> Self {
+        let has = |k: &str| features.iter().any(|f| f == k);
+        if has("note-effect") {
+            Self::MidiFx
+        } else if has("instrument") {
+            Self::Instrument
+        } else {
+            // "audio-effect" も、 どの主カテゴリも持たない未分類も FX チェーンへ。
+            Self::Fx
+        }
+    }
+
+    /// ピッカー行に出す種別タグ。
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Instrument => "楽器",
+            Self::Fx => "FX",
+            Self::MidiFx => "MIDI",
+        }
+    }
+}
+
+impl PluginPickEntry {
+    fn from_db_entry(e: &common::plugin_db::PluginEntry) -> Self {
+        Self {
+            id: e.id.clone(),
+            name: if e.name.is_empty() {
+                e.id.clone()
+            } else {
+                e.name.clone()
+            },
+            vendor: e.vendor.clone(),
+            features: e.features.clone(),
+            format_label: e.format.as_str().to_string(),
+            category: PluginCategory::from_features(&e.features),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,21 +427,13 @@ pub struct SidechainSourceChoice {
 }
 
 /// 「＋ Send」 ボタンで開く宛先トラックピッカーの状態。 plugin_picker の
-/// `is_plugin_picker_open` + `plugin_picker_target` と同 idiom で、 開いて
-/// いる間 `Some(..)` を保持し、 `src_track_id` (= send 元) を覚えておく。
-/// track_picker.rs がこれを見て modal を開閉する。
+/// `is_plugin_picker_open` と同 idiom で、 開いている間 `Some(..)` を保持し、
+/// `src_track_id` (= send 元) を覚えておく。 track_picker.rs がこれを見て
+/// modal を開閉する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SendPickerState {
     /// この track に新しい send を追加する (= send 元)。
     pub src_track_id: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PickerTarget {
-    Instrument,
-    Fx,
-    #[allow(dead_code)]
-    MidiFx,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
@@ -1033,7 +1080,6 @@ pub struct AppData {
     /// [`AppData::refresh_picker_visible`] で subsequence マッチに使う。
     pub plugin_picker_query: String,
     pub is_plugin_picker_open: bool,
-    pub plugin_picker_target: PickerTarget,
     /// 検索結果リスト ([`plugin_picker_visible`]) 内のカーソル位置 (0-based)。
     /// `text_input` focus 中の ↑↓ (gui_01 #057 / Phase 86 `TextInputResponse::nav_up/nav_down`)
     /// で [`AppEvent::MovePluginPickerCursor`] を発火して移動し、 Enter で
@@ -1362,21 +1408,8 @@ impl AppData {
         let plugin_picker_entries = plugin_db
             .as_ref()
             .map(|db| {
-                let mut v: Vec<PluginPickEntry> = db
-                    .entries
-                    .iter()
-                    .map(|e| PluginPickEntry {
-                        id: e.id.clone(),
-                        name: if e.name.is_empty() {
-                            e.id.clone()
-                        } else {
-                            e.name.clone()
-                        },
-                        vendor: e.vendor.clone(),
-                        features: e.features.clone(),
-                        format_label: e.format.as_str().to_string(),
-                    })
-                    .collect();
+                let mut v: Vec<PluginPickEntry> =
+                    db.entries.iter().map(PluginPickEntry::from_db_entry).collect();
                 v.sort_by_key(|e| e.name.to_lowercase());
                 v
             })
@@ -1464,7 +1497,6 @@ impl AppData {
             plugin_picker_visible: Vec::new(),
             plugin_picker_query: String::new(),
             is_plugin_picker_open: false,
-            plugin_picker_target: PickerTarget::Instrument,
             plugin_picker_cursor: 0,
             send_picker: None,
             pending_state_queue: VecDeque::new(),
@@ -2379,7 +2411,7 @@ impl AppData {
                 | AppEvent::SetNoteVelocities(_)
                 | AppEvent::SetTrackSpeaker { .. }
                 | AppEvent::QuantizeSelectedNotes(_)
-                | AppEvent::SelectPluginFromDb(_)
+                | AppEvent::SelectPluginFromDb { .. }
                 | AppEvent::CommitBpmEdit
                 | AppEvent::CommitTimeSigNumEdit
                 | AppEvent::SetSongTimeSigDenominator(_)
@@ -3446,9 +3478,13 @@ pub enum AppEvent {
     },
 
     // -------- Plugin picker / chain ---------------------------------------
-    OpenPluginPickerFor(PickerTarget),
+    OpenPluginPicker,
     ClosePluginPicker,
-    SelectPluginFromDb(String),
+    SelectPluginFromDb {
+        id: String,
+        keep_open: bool,
+        open_gui: bool,
+    },
     /// プラグインピッカーの検索ボックスが 1 文字毎に発行する。 query を更新し
     /// `refresh_picker_visible` で subsequence 絞り込みを再計算する。
     SetPluginPickerQuery(String),
@@ -4707,8 +4743,7 @@ impl AppData {
             AppEvent::SetNoteLyrics { clip_ref, lyrics } => {
                 self.set_note_lyrics(clip_ref, &lyrics);
             }
-            AppEvent::OpenPluginPickerFor(target) => {
-                self.plugin_picker_target = target;
+            AppEvent::OpenPluginPicker => {
                 self.plugin_picker_query.clear();
                 self.refresh_picker_visible();
                 self.is_plugin_picker_open = true;
@@ -4769,8 +4804,8 @@ impl AppData {
             AppEvent::SetLoopRange { start, end } => {
                 self.set_loop_range(start, end);
             }
-            AppEvent::SelectPluginFromDb(id) => {
-                self.select_plugin_from_db(id);
+            AppEvent::SelectPluginFromDb { id, keep_open, open_gui } => {
+                self.select_plugin_from_db(id, keep_open, open_gui);
             }
             AppEvent::ToggleSlotGui { slot_kind, slot_index } => {
                 self.toggle_slot_gui(slot_kind, slot_index);
@@ -14060,8 +14095,12 @@ impl AppData {
 
     // -------- Plugin picker -----------------------------------------------
 
-    fn select_plugin_from_db(&mut self, id: String) {
-        self.is_plugin_picker_open = false;
+    fn select_plugin_from_db(&mut self, id: String, keep_open: bool, open_gui: bool) {
+        // 無修飾 / Shift は選択で閉じる。 Ctrl (keep_open) は開いたまま連続追加
+        // できる (各プラグインは自分の種別で振り分く)。
+        if !keep_open {
+            self.is_plugin_picker_open = false;
+        }
         let Some(db) = self.plugin_db.clone() else {
             tracing::warn!(id, "plugin_db not available");
             return;
@@ -14073,15 +14112,18 @@ impl AppData {
         let path = entry.path.clone();
         let entry_id = entry.id.clone();
         let entry_format = entry.format;
+        // 種別は features から自動導出 (plan_unified_plugin_picker.md): note-effect >
+        // instrument > audio-effect、 未分類は FX チェーンへ。 これが行き先スロットを決める。
+        let category = PluginCategory::from_features(&entry.features);
         self.ensure_first_track();
 
         // master bus 選択時は track Vec ではなく Song.master_fx_chain を対象に
         // する。 master は audio fx のみ持つので Instrument / MidiFx target は
         // 無視 (= inspector は master 選択時に「+ FX」しか出さない)。
         if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
-            if self.plugin_picker_target != PickerTarget::Fx {
+            if category != PluginCategory::Fx {
                 tracing::warn!(
-                    ?self.plugin_picker_target,
+                    ?category,
                     "master bus に instrument / midi fx は挿せない (audio fx のみ)"
                 );
                 return;
@@ -14089,7 +14131,10 @@ impl AppData {
             let track_id = common::model::MASTER_TRACK_ID;
             let dest_slot = PluginSlot::Fx(self.song.master_fx_chain.len() as u32);
             self.track_pending_load(track_id, dest_slot);
-            self.pending_added_plugin_finalize.insert((track_id, dest_slot));
+            // Shift (open_gui=false) のときは GUI 自動 open しない (ロードはする)。
+            if open_gui {
+                self.pending_added_plugin_finalize.insert((track_id, dest_slot));
+            }
             self.send_plugin(MainToChild::SetSlotPlugin {
                 track: track_id,
                 slot: dest_slot,
@@ -14111,22 +14156,26 @@ impl AppData {
         // PR2.1: send `Track::id` to the plugin host (track_idx は
         // ローカルの song.tracks 操作のみで使う)。
         let track_id = self.song.tracks[track_idx].id;
-        let target = self.plugin_picker_target;
-        let dest_slot = match target {
-            PickerTarget::Instrument => PluginSlot::Instrument,
-            PickerTarget::Fx => {
+        // 行き先スロットは選んだプラグインの種別から導出。 Fx / MidiFx はチェーン末尾へ
+        // 追加 (Ctrl 連続選択で積める)。 Instrument は単一スロットなので 2 つ目は差し替え。
+        let dest_slot = match category {
+            PluginCategory::Instrument => PluginSlot::Instrument,
+            PluginCategory::Fx => {
                 let next = self.song.tracks[track_idx].fx_chain.len() as u32;
                 PluginSlot::Fx(next)
             }
-            PickerTarget::MidiFx => {
+            PluginCategory::MidiFx => {
                 let next = self.song.tracks[track_idx].midi_fx_chain.len() as u32;
                 PluginSlot::MidiFx(next)
             }
         };
         self.track_pending_load(track_id, dest_slot);
         // ユーザーが手動追加した plugin は load 完了時に daw_audio 再 sync + GUI 自動
-        // open する (project-load の一斉復元はこの集合に積まれない)。
-        self.pending_added_plugin_finalize.insert((track_id, dest_slot));
+        // open する (project-load の一斉復元はこの集合に積まれない)。 Shift
+        // (open_gui=false) のときは GUI 自動 open を抑止 (ロードはする)。
+        if open_gui {
+            self.pending_added_plugin_finalize.insert((track_id, dest_slot));
+        }
         self.send_plugin(MainToChild::SetSlotPlugin {
             track: track_id,
             slot: dest_slot,
@@ -14532,38 +14581,25 @@ impl AppData {
             self.plugin_picker_entries.clear();
             return;
         };
-        let mut v: Vec<PluginPickEntry> = db
-            .entries
-            .iter()
-            .map(|e| PluginPickEntry {
-                id: e.id.clone(),
-                name: if e.name.is_empty() {
-                    e.id.clone()
-                } else {
-                    e.name.clone()
-                },
-                vendor: e.vendor.clone(),
-                features: e.features.clone(),
-                format_label: e.format.as_str().to_string(),
-            })
-            .collect();
+        let mut v: Vec<PluginPickEntry> =
+            db.entries.iter().map(PluginPickEntry::from_db_entry).collect();
         v.sort_by_key(|e| e.name.to_lowercase());
         self.plugin_picker_entries = v;
     }
 
     fn refresh_picker_visible(&mut self) {
-        let feature_key: &str = match self.plugin_picker_target {
-            PickerTarget::Instrument => "instrument",
-            PickerTarget::Fx => "audio-effect",
-            PickerTarget::MidiFx => "note-effect",
-        };
-        // 検索クエリ (前後空白を除去)。 空なら feature フィルタのみ、 非空なら
+        // master bus は audio FX しか持てないので、 master 選択中は FX カテゴリの
+        // プラグインだけをリストに出す (それ以外は挿せないので隠す)。 通常トラックは
+        // 全カテゴリ混合で見せ、 種別は選択時に features から自動振り分けする
+        // (plan_unified_plugin_picker.md)。
+        let master = self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID);
+        // 検索クエリ (前後空白を除去)。 空なら (master フィルタを除き) 全件、 非空なら
         // name / vendor のいずれかへの subsequence マッチで AND 絞り込みする。
         let query = self.plugin_picker_query.trim();
         let visible: Vec<PluginPickEntry> = self
             .plugin_picker_entries
             .iter()
-            .filter(|e| e.features.iter().any(|f| f == feature_key))
+            .filter(|e| !master || e.category == PluginCategory::Fx)
             .filter(|e| {
                 query.is_empty()
                     || crate::fuzzy::subsequence_match(&e.name, query)
@@ -16673,5 +16709,42 @@ fn resolve_plugin_name(plugin_db: &Option<Arc<PluginDatabase>>, plugin_id: &str)
             }
         })
         .unwrap_or_else(|| plugin_id.to_string())
+}
+
+#[cfg(test)]
+mod plugin_category_tests {
+    use super::PluginCategory;
+
+    fn feats(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn routing_priority_and_fallback() {
+        // 統合ピッカーの自動振り分け規則: 優先順 note-effect > instrument >
+        // audio-effect、 どの主カテゴリも無ければ FX チェーンへ (plan_unified_plugin_picker.md)。
+        let cases: &[(&[&str], PluginCategory)] = &[
+            (&["instrument", "synthesizer"], PluginCategory::Instrument),
+            (&["audio-effect"], PluginCategory::Fx),
+            (&["audio-effect", "reverb"], PluginCategory::Fx),
+            (&["note-effect"], PluginCategory::MidiFx),
+            // 音を出す方が勝つ: instrument は audio-effect に優先 (features 順非依存)。
+            (&["instrument", "audio-effect"], PluginCategory::Instrument),
+            (&["audio-effect", "instrument"], PluginCategory::Instrument),
+            // note-effect は最優先 (features 順非依存)。
+            (&["note-effect", "instrument"], PluginCategory::MidiFx),
+            (&["instrument", "note-effect"], PluginCategory::MidiFx),
+            // 未分類 (主カテゴリ無し / 空) は FX チェーンへ倒す。
+            (&[], PluginCategory::Fx),
+            (&["reverb"], PluginCategory::Fx),
+        ];
+        for (features, expected) in cases {
+            assert_eq!(
+                PluginCategory::from_features(&feats(features)),
+                *expected,
+                "features = {features:?}",
+            );
+        }
+    }
 }
 

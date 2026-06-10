@@ -4,7 +4,7 @@
 //! - 初期値は cursor = 0
 //! - `MovePluginPickerCursor` で +/- 移動、`[0, visible.len()-1]` で clamp
 //! - `SetPluginPickerQuery` で cursor が 0 にリセット
-//! - `OpenPluginPickerFor` で cursor が 0 にリセット
+//! - `OpenPluginPicker` で cursor が 0 にリセット
 //! - 空 visible での Move は no-op
 //!
 //! UI 側 (text_input の `nav_up/nav_down` 読み取り、 list_view の selected ハイライト)
@@ -17,7 +17,7 @@ use common::plugin_format::PluginFormat;
 use common::protocol::MainToChild;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
-use daw_gui::app::{AppData, AppEvent, PickerTarget};
+use daw_gui::app::{AppData, AppEvent};
 use daw_gui::dispatcher::{
     BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
 };
@@ -67,7 +67,7 @@ fn build_app(
 #[test]
 fn cursor_starts_at_zero_when_picker_opens() {
     let (mut app, _, _) = build_app(5);
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Instrument));
+    app.handle_event(AppEvent::OpenPluginPicker);
     assert_eq!(app.plugin_picker_cursor, 0);
     assert_eq!(app.plugin_picker_visible.len(), 5);
 }
@@ -75,7 +75,7 @@ fn cursor_starts_at_zero_when_picker_opens() {
 #[test]
 fn cursor_moves_down_within_bounds() {
     let (mut app, _, _) = build_app(5);
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Instrument));
+    app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
     assert_eq!(app.plugin_picker_cursor, 2);
@@ -84,7 +84,7 @@ fn cursor_moves_down_within_bounds() {
 #[test]
 fn cursor_clamps_at_lower_bound() {
     let (mut app, _, _) = build_app(5);
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Instrument));
+    app.handle_event(AppEvent::OpenPluginPicker);
     for _ in 0..10 {
         app.handle_event(AppEvent::MovePluginPickerCursor(-1));
     }
@@ -94,7 +94,7 @@ fn cursor_clamps_at_lower_bound() {
 #[test]
 fn cursor_clamps_at_upper_bound() {
     let (mut app, _, _) = build_app(5);
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Instrument));
+    app.handle_event(AppEvent::OpenPluginPicker);
     for _ in 0..10 {
         app.handle_event(AppEvent::MovePluginPickerCursor(1));
     }
@@ -104,7 +104,7 @@ fn cursor_clamps_at_upper_bound() {
 #[test]
 fn cursor_resets_to_zero_when_query_changes() {
     let (mut app, _, _) = build_app(5);
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Instrument));
+    app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
     assert_eq!(app.plugin_picker_cursor, 2);
@@ -114,20 +114,20 @@ fn cursor_resets_to_zero_when_query_changes() {
 }
 
 #[test]
-fn cursor_resets_to_zero_when_picker_reopened_for_other_target() {
+fn cursor_resets_to_zero_when_picker_reopened() {
     let (mut app, _, _) = build_app(5);
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Instrument));
+    app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
     assert_eq!(app.plugin_picker_cursor, 1);
-    // 違う target で開き直す → cursor が 0 に戻る
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Fx));
+    // 開き直す → cursor が 0 に戻る
+    app.handle_event(AppEvent::OpenPluginPicker);
     assert_eq!(app.plugin_picker_cursor, 0);
 }
 
 #[test]
 fn move_is_noop_when_visible_is_empty() {
     let (mut app, _, _) = build_app(0);
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Instrument));
+    app.handle_event(AppEvent::OpenPluginPicker);
     assert_eq!(app.plugin_picker_visible.len(), 0);
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
     assert_eq!(app.plugin_picker_cursor, 0);
@@ -136,7 +136,7 @@ fn move_is_noop_when_visible_is_empty() {
 #[test]
 fn large_delta_clamps_to_bounds() {
     let (mut app, _, _) = build_app(3);
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Instrument));
+    app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::MovePluginPickerCursor(100));
     assert_eq!(app.plugin_picker_cursor, 2);
     app.handle_event(AppEvent::MovePluginPickerCursor(-100));

@@ -15,7 +15,7 @@ use common::plugin_format::PluginFormat;
 use common::protocol::{MainToChild, PluginSlot};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
-use daw_gui::app::{AppData, AppEvent, PickerTarget};
+use daw_gui::app::{AppData, AppEvent};
 use daw_gui::dispatcher::{
     BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
 };
@@ -28,7 +28,7 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
             name: "Test Synth".into(),
             vendor: "Test".into(),
             version: "1.0".into(),
-            features: vec![],
+            features: vec!["instrument".into()],
             path: "C:/fake/synth.clap".into(),
             descriptor_index: 0,
         }],
@@ -59,8 +59,12 @@ fn build_app() -> (AppData, UnboundedReceiver<MainToChild>) {
 fn load_instrument(app: &mut AppData) {
     let track_id = app.song.tracks[0].id;
     app.handle_event(AppEvent::SelectTrack(0));
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Instrument));
-    app.handle_event(AppEvent::SelectPluginFromDb("test.synth".into()));
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.synth".into(),
+        keep_open: false,
+        open_gui: true,
+    });
     app.handle_event(AppEvent::SlotPluginLoadedFromChild {
         track: track_id,
         slot: PluginSlot::Instrument,

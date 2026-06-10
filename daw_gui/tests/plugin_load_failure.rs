@@ -10,7 +10,7 @@ use common::plugin_format::PluginFormat;
 use common::protocol::{MainToChild, PluginSlot};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
-use daw_gui::app::{AppData, AppEvent, PickerTarget};
+use daw_gui::app::{AppData, AppEvent};
 use daw_gui::dispatcher::{
     BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
 };
@@ -24,7 +24,7 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 name: "Test Synth".into(),
                 vendor: "Test".into(),
                 version: "1.0".into(),
-                features: vec![],
+                features: vec!["instrument".into()],
                 path: "C:/fake/synth.clap".into(),
                 descriptor_index: 0,
             },
@@ -34,7 +34,7 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 name: "Test FX".into(),
                 vendor: "Test".into(),
                 version: "1.0".into(),
-                features: vec![],
+                features: vec!["audio-effect".into()],
                 path: "C:/fake/fx.clap".into(),
                 descriptor_index: 0,
             },
@@ -82,8 +82,12 @@ fn load_failure_releases_single_pending_and_flushes_play() {
 
     // 1. instrument を picker からロード → SetSlotPlugin 送信、 pending に entry。
     app.handle_event(AppEvent::SelectTrack(0));
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Instrument));
-    app.handle_event(AppEvent::SelectPluginFromDb("test.synth".into()));
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.synth".into(),
+        keep_open: false,
+        open_gui: true,
+    });
 
     let plugin_msgs = drain(&mut plugin_rx);
     assert!(
@@ -162,10 +166,18 @@ fn load_failure_keeps_other_pending_unaffected() {
 
     // instrument + Fx の 2 つを順次ロード → pending 2 件。
     app.handle_event(AppEvent::SelectTrack(0));
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Instrument));
-    app.handle_event(AppEvent::SelectPluginFromDb("test.synth".into()));
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Fx));
-    app.handle_event(AppEvent::SelectPluginFromDb("test.fx".into()));
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.synth".into(),
+        keep_open: false,
+        open_gui: true,
+    });
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.fx".into(),
+        keep_open: false,
+        open_gui: true,
+    });
     let _ = drain(&mut plugin_rx);
 
     assert_eq!(

@@ -24,7 +24,7 @@ use common::plugin_format::PluginFormat;
 use common::protocol::{MainToChild, PluginSlot};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
-use daw_gui::app::{AppData, AppEvent, PickerTarget};
+use daw_gui::app::{AppData, AppEvent};
 use daw_gui::dispatcher::{
     BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
 };
@@ -40,7 +40,7 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 name: "Test Synth".into(),
                 vendor: "Test".into(),
                 version: "1.0".into(),
-                features: vec![],
+                features: vec!["instrument".into()],
                 path: "C:/fake/synth.clap".into(),
                 descriptor_index: 0,
             },
@@ -50,7 +50,7 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 name: "Test Bitcrush".into(),
                 vendor: "Test".into(),
                 version: "1.0".into(),
-                features: vec![],
+                features: vec!["audio-effect".into()],
                 path: "C:/fake/bitcrush.clap".into(),
                 descriptor_index: 0,
             },
@@ -60,7 +60,7 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 name: "Test Delay".into(),
                 vendor: "Test".into(),
                 version: "1.0".into(),
-                features: vec![],
+                features: vec!["audio-effect".into()],
                 path: "C:/fake/delay.clap".into(),
                 descriptor_index: 0,
             },
@@ -142,8 +142,12 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
 
     // Step 1: track 0 を選択し、 instrument picker から synth を入れる。
     app.handle_event(AppEvent::SelectTrack(0));
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Instrument));
-    app.handle_event(AppEvent::SelectPluginFromDb("test.synth".into()));
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.synth".into(),
+        keep_open: false,
+        open_gui: true,
+    });
 
     // SetSlotPlugin が plugin_host 行きに sent されているはず。
     let plugin_msgs = drain(&mut plugin_rx);
@@ -244,8 +248,12 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
 
     // Step 4: group が selected な状態で Bitcrush を Fx 0 に追加。
     // selected_track_ids = [group_id] の末尾は group_id なので cursor は group。
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Fx));
-    app.handle_event(AppEvent::SelectPluginFromDb("test.bitcrush".into()));
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.bitcrush".into(),
+        keep_open: false,
+        open_gui: true,
+    });
     let plugin_msgs = drain(&mut plugin_rx);
     assert!(
         plugin_msgs.iter().any(|m| matches!(
@@ -262,8 +270,12 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     fake_plugin_loaded(&mut app, group_id, PluginSlot::Fx(0), "test.bitcrush", 200);
 
     // Step 5: 同じく group に Delay を Fx 1 に追加。
-    app.handle_event(AppEvent::OpenPluginPickerFor(PickerTarget::Fx));
-    app.handle_event(AppEvent::SelectPluginFromDb("test.delay".into()));
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.delay".into(),
+        keep_open: false,
+        open_gui: true,
+    });
     let plugin_msgs = drain(&mut plugin_rx);
     assert!(
         plugin_msgs.iter().any(|m| matches!(
