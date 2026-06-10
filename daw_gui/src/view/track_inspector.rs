@@ -1224,7 +1224,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
         y += input_h + 4.0;
 
-        // Font family (system font name; "" = renderer default)
+        // Font family: ボタンで font picker を開く (FIXME #25)。ラベルは現在の
+        // フォント (空 = デフォルト)。検索付きモーダルで選び、 ↑↓ / ホバーで
+        // キャンバスにライブプレビューされる。
         ui.label_at(
             "inspector_text_font_label",
             "Font",
@@ -1233,19 +1235,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             11.0,
             TEXT_DIM,
         );
-        let font_resp = ui.text_input_at(
-            "inspector_text_font_input",
+        let font_btn_label = if app.clip_text_font_family_edit_text.is_empty() {
+            "(default)".to_string()
+        } else {
+            app.clip_text_font_family_edit_text.clone()
+        };
+        if ui.button_at_clicked(
+            "inspector_text_font_button",
+            &font_btn_label,
             Rect { x: input_x, y, w: string_input_w, h: input_h },
-            &app.clip_text_font_family_edit_text,
-            |s| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ClipTextFontFamilyEditChanged(s))
-                })
-            },
-        );
-        if font_resp.committed {
+        ) {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::CommitClipTextFontFamilyEdit)
+                app.handle_event(AppEvent::OpenFontPicker)
             }));
         }
         y += input_h + 4.0;

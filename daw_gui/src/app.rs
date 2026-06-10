@@ -1086,6 +1086,24 @@ pub struct AppData {
     /// `plugin_picker_visible.get(cursor)` を確定する。 `refresh_picker_visible` が
     /// 呼ばれる度 (絞り込み再計算 / モーダル open / rescan 完了) に 0 にリセット。
     pub plugin_picker_cursor: usize,
+
+    // -------- Font picker (Text クリップのフォント選択, FIXME #25) ----------
+    /// `available_font_families()` で列挙したシステムフォント名 (キャッシュ)。
+    /// 初回 open 時に background thread で 1 度だけ読む (~20-860ms)。
+    pub font_picker_families: Vec<String>,
+    /// 検索 + デフォルト行で絞り込んだ表示用リスト。先頭 `""` = renderer
+    /// default (=「デフォルト」行)。
+    pub font_picker_visible: Vec<String>,
+    pub font_picker_query: String,
+    pub font_picker_cursor: usize,
+    pub is_font_picker_open: bool,
+    /// background のフォント列挙が走行中。
+    pub font_picker_loading: bool,
+    /// 編集対象の text クリップ (open 時に anchor から確定)。
+    pub font_picker_target: Option<ClipRef>,
+    /// open 時の元フォント。cancel / commit の undo 復元元。
+    pub font_picker_restore: String,
+
     /// 「＋ Send」 ボタンで開く宛先トラックピッカーの状態。 `Some` の間
     /// modal が開いており、 宛先選択 or 閉じる操作で `None` に戻る。
     /// plugin picker の `is_plugin_picker_open` と同 idiom。
@@ -1498,6 +1516,14 @@ impl AppData {
             plugin_picker_query: String::new(),
             is_plugin_picker_open: false,
             plugin_picker_cursor: 0,
+            font_picker_families: Vec::new(),
+            font_picker_visible: Vec::new(),
+            font_picker_query: String::new(),
+            font_picker_cursor: 0,
+            is_font_picker_open: false,
+            font_picker_loading: false,
+            font_picker_target: None,
+            font_picker_restore: String::new(),
             send_picker: None,
             pending_state_queue: VecDeque::new(),
             audio_tx: Some(audio_tx),
@@ -3493,6 +3519,26 @@ pub enum AppEvent {
     /// text_input が focus 中の ↑↓ (gui_01 #057 / Phase 86 `TextInputResponse::nav_up`
     /// / `nav_down`) で発火し、 Enter で `plugin_picker_visible.get(cursor)` を確定する。
     MovePluginPickerCursor(i32),
+
+    // -------- Font picker (Text クリップのフォント選択, FIXME #25) ----------
+    /// inspector の Font ボタンで発火。anchor の text クリップを対象に取り、
+    /// 元フォントを退避してフォントピッカー modal を開く。初回は background で
+    /// システムフォントを列挙する。
+    OpenFontPicker,
+    /// フォントピッカーを閉じる (= cancel)。preview で変えた font を元に戻す。
+    /// modal の on_close (Esc / 外クリック / ✕) から発火。
+    CloseFontPicker,
+    SetFontPickerQuery(String),
+    /// 検索リストのカーソルを移動し、移動先フォントをキャンバスにライブ
+    /// プレビュー (非 undo)。
+    MoveFontPickerCursor(i32),
+    /// マウスが乗った行のフォントをライブプレビュー (cursor を合わせる)。
+    HoverFontInPicker(usize),
+    /// 行を確定 (= click / Enter)。元→選択を 1 undo step にして font を適用し閉じる。
+    CommitFontFromPicker(String),
+    /// background のフォント列挙完了。
+    FontFamiliesLoaded(Vec<String>),
+
     ToggleSlotGui { slot_kind: u8, slot_index: u32 },
     RemoveSlot { slot_kind: u8, slot_index: u32 },
     /// PR4 sidechain: wire / unwire the sidechain source for a plugin's
@@ -4764,6 +4810,16 @@ impl AppData {
                     self.plugin_picker_cursor = new;
                 }
             }
+            AppEvent::OpenFontPicker => self.open_font_picker(),
+            AppEvent::CloseFontPicker => self.close_font_picker(),
+            AppEvent::SetFontPickerQuery(query) => {
+                self.font_picker_query = query;
+                self.refresh_font_picker_visible();
+            }
+            AppEvent::MoveFontPickerCursor(delta) => self.move_font_picker_cursor(delta),
+            AppEvent::HoverFontInPicker(idx) => self.hover_font_in_picker(idx),
+            AppEvent::CommitFontFromPicker(family) => self.commit_font_from_picker(family),
+            AppEvent::FontFamiliesLoaded(families) => self.on_font_families_loaded(families),
             AppEvent::RescanPluginDb => {
                 self.begin_rescan();
             }
@@ -11372,6 +11428,134 @@ impl AppData {
         };
         let value = self.clip_text_font_family_edit_text.clone();
         self.set_clip_text_event_font_family(target, value);
+    }
+
+    // -------- Font picker (FIXME #25) -------------------------------------
+
+    /// 編集対象 text クリップの現在のフォント名 (先頭 event)。text クリップで
+    /// なければ `None`。
+    fn clip_text_font_family(&self, target: ClipRef) -> Option<String> {
+        self.song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .and_then(|c| self.song.clip_contents.get(&c.content_id))
+            .and_then(|content| content.text_events())
+            .and_then(|events| events.first())
+            .map(|e| e.font_family.clone())
+    }
+
+    fn open_font_picker(&mut self) {
+        // anchor が text クリップのときだけ開く (Font ボタンは text inspector に
+        // しか出ないが防衛的に確認)。
+        let Some(target) = self.selected_clip_ref() else {
+            return;
+        };
+        let Some(original) = self.clip_text_font_family(target) else {
+            return;
+        };
+        self.font_picker_target = Some(target);
+        self.font_picker_restore = original;
+        self.font_picker_query.clear();
+        self.font_picker_cursor = 0;
+        self.is_font_picker_open = true;
+        self.refresh_font_picker_visible();
+        // システムフォント列挙は重い (~20-860ms) ので background で 1 度だけ。
+        if self.font_picker_families.is_empty() && !self.font_picker_loading {
+            self.begin_font_load();
+        }
+    }
+
+    fn begin_font_load(&mut self) {
+        self.font_picker_loading = true;
+        let proxy = self.event_proxy.clone();
+        std::thread::spawn(move || {
+            let families = daw_ui_core::available_font_families();
+            proxy.send(AppEvent::FontFamiliesLoaded(families));
+        });
+    }
+
+    fn on_font_families_loaded(&mut self, families: Vec<String>) {
+        self.font_picker_families = families;
+        self.font_picker_loading = false;
+        self.refresh_font_picker_visible();
+    }
+
+    fn refresh_font_picker_visible(&mut self) {
+        let query = self.font_picker_query.trim();
+        let mut visible: Vec<String> = Vec::new();
+        // query が空のときだけ先頭に「デフォルト」行 (`""`) を出す。
+        if query.is_empty() {
+            visible.push(String::new());
+            visible.extend(self.font_picker_families.iter().cloned());
+        } else {
+            visible.extend(
+                self.font_picker_families
+                    .iter()
+                    .filter(|f| crate::fuzzy::subsequence_match(f, query))
+                    .cloned(),
+            );
+        }
+        self.font_picker_visible = visible;
+        self.font_picker_cursor = 0;
+    }
+
+    fn move_font_picker_cursor(&mut self, delta: i32) {
+        let len = self.font_picker_visible.len();
+        if len == 0 {
+            return;
+        }
+        self.font_picker_cursor =
+            (self.font_picker_cursor as i32 + delta).clamp(0, len as i32 - 1) as usize;
+        self.preview_font_at_cursor();
+    }
+
+    fn hover_font_in_picker(&mut self, idx: usize) {
+        // 既に cursor がそこなら no-op (= hover 中の毎フレーム連発を抑止)。
+        if idx >= self.font_picker_visible.len() || self.font_picker_cursor == idx {
+            return;
+        }
+        self.font_picker_cursor = idx;
+        self.preview_font_at_cursor();
+    }
+
+    /// cursor 位置のフォントを編集対象クリップへライブ適用 (非 undo / 非 dirty)。
+    /// `""` = renderer default。
+    fn preview_font_at_cursor(&mut self) {
+        let Some(target) = self.font_picker_target else {
+            return;
+        };
+        let Some(family) = self.font_picker_visible.get(self.font_picker_cursor).cloned() else {
+            return;
+        };
+        self.set_clip_text_event_font_family(target, family);
+    }
+
+    fn commit_font_from_picker(&mut self, family: String) {
+        let Some(target) = self.font_picker_target else {
+            return;
+        };
+        // 元 → 選択 を 1 undo step にするため、 一旦元へ戻してから snapshot し
+        // (= undo 先 = 元フォント)、 選択フォントを適用する (preview で既に選択
+        // 値になっていても結果は同じ)。
+        self.set_clip_text_event_font_family(target, self.font_picker_restore.clone());
+        self.push_undo_snapshot();
+        self.set_clip_text_event_font_family(target, family);
+        self.is_dirty = true;
+        // commit 経路では close_font_picker (on_close) の restore を no-op 化する
+        // ため target を先に落とす。
+        self.font_picker_target = None;
+        self.is_font_picker_open = false;
+    }
+
+    fn close_font_picker(&mut self) {
+        // cancel: preview で変えた font を元へ戻す。commit 済みなら target は
+        // None なので no-op。
+        if let Some(target) = self.font_picker_target {
+            self.set_clip_text_event_font_family(target, self.font_picker_restore.clone());
+        }
+        self.is_font_picker_open = false;
+        self.font_picker_target = None;
     }
 
     /// docs/plan_text_overlay.md §4 P5: clip 切替 / Undo / Redo / lane

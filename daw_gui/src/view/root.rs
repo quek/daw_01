@@ -10,8 +10,8 @@ use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent};
 use crate::view::{
-    arrangement_view, bottom_panel, close_confirm_modal, export_overlay, plugin_picker,
-    recovery_modal, status_bar, track_inspector, track_picker, transport,
+    arrangement_view, bottom_panel, close_confirm_modal, export_overlay, font_picker,
+    plugin_picker, recovery_modal, status_bar, track_inspector, track_picker, transport,
 };
 
 pub const MENU_H: f32 = 24.0;
@@ -103,6 +103,9 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // Modal: plugin picker。draw 関数内で modal の open/close を app.is_plugin_picker_open
     // と同期させる (常時呼び、内部で is_modal_open / open_modal を管理)。
     plugin_picker::draw(app, ui, screen);
+
+    // Modal: font picker (Text クリップのフォント選択)。is_font_picker_open と同期。
+    font_picker::draw(app, ui, screen);
 
     // Modal: send 宛先トラックピッカー。app.send_picker == Some(..) のとき開く。
     track_picker::draw(app, ui, screen);
@@ -711,7 +714,11 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // (bottom panel) は同時には開かないので順番でも実用 OK。
     // plugin picker / send picker が開いている間は escape を消費しない
     // (= track_picker / plugin_picker の modal が close_on_escape で閉じる)。
-    if !app.is_plugin_picker_open && app.send_picker.is_none() && ui.take_shortcut("escape") {
+    if !app.is_plugin_picker_open
+        && !app.is_font_picker_open
+        && app.send_picker.is_none()
+        && ui.take_shortcut("escape")
+    {
         if app.track_rename_id.is_some() {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::CancelRenameTrack)
