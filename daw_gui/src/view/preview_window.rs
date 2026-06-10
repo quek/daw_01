@@ -714,6 +714,12 @@ impl PreviewWindowState {
             );
             self.scene.push_text(GlyphArea {
                 text: layer.text.clone(),
+                // 空文字列は renderer default フォント (= None)、 指定があればそのファミリ。
+                font_family: if layer.font_family.is_empty() {
+                    None
+                } else {
+                    Some(layer.font_family.clone())
+                },
                 left,
                 top,
                 font_size,
