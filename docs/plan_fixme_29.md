@@ -51,3 +51,30 @@
 - `PluginEntry`/`PluginDatabase` は IPC bincode 型ではなく JSON cache 専用なので bincode derive 連鎖は
   無いが、`common` 変更後は規律どおり `cargo build --workspace` を 1 回通す。
 - probe subprocess は有界化（既存 8s timeout 踏襲）。
+
+## 既知の制約 / follow-up（2026-06-10 調査で判明、未対応）
+
+インスペクタのプラグイン列を **ドラッグで並べ替え**たときの **audio 反映が未解決**。
+`reorder_inspector_chain` は 3 つの Vec を組み替えてから `sync_song_to_plugin_host`
+（= `LoadSong`）を送るだけだが、一次情報で確認したところ:
+
+- **plugin host 側で `LoadSong` は no-op**（`daw_plugin_host/src/main.rs:1768`）。chain は
+  `SetSlotPlugin` / `RemoveSlotPlugin` / `MoveSlot` / `RemoveTrack` でしか再キーされない。
+- **audio 側 `LoadSong`** は `AudioClipRenderer` 再 build + `shared.song` 差し替えのみ
+  （`daw_audio/src/main.rs:141-163`）。dispatch の鍵
+  `slot_to_plugin_id: HashMap<(track_id, PluginSlot), plugin_id>`（`engine.rs:189`）は
+  **`OpenPluginShmem` / `ClosePluginShmem` でしか更新されない**。`MoveSlot` も audio は no-op。
+
+帰結: slot KEY が変わる移動（index 入れ替え含む）は `LoadSong` だけでは両プロセスに
+反映されず、**ドラッグ並べ替えしてもモデルだけ変わって音の経路が追従しない**（潜在、
+本 FIXME 以前から）。`select_plugin_from_db` の dual-role 降格は **`reconcile_plugins_with_song`
+（diff → `RemoveSlotPlugin`/`SetSlotPlugin` → `Open/ClosePluginShmem`）** に乗せて解決済みだが、
+`reorder_inspector_chain` は未対応。
+
+**修正方針（必要になったら grill して決定）**: (a) reorder も deferred state-request →
+`reconcile_plugins_with_song` に載せる（並べ替えのたびに plugin 再インスタンス化 + state 復元、
+glitch のトレードオフ）、または (b) audio engine の slot キー方式を index 非依存に再設計
+（plugin instance identity ベース）。後者が理想だが影響大。`MoveSlot` は同一 Vec 内
+（MidiFx↔MidiFx / Fx↔Fx）専用で cross-section には使えない。
+
+関連メモリ: [[project_plugin_slot_rekey]]。
