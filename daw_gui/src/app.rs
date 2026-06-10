@@ -6516,21 +6516,45 @@ impl AppData {
 
     /// 凍結済み `snapshot` をファイルへ書き出して保存を完了する。
     ///
-    /// cache migration はここで行う (= `begin_save`/invoke ではなく serialize 直前)。
-    /// snapshot と live の両方を migrate するので、 ファイル move 後も両者が
-    /// `ProjectRelative` で新 path を指す。 **serialize が成功して初めて** file_path を
-    /// 確定し、 audio engine へ新 project_dir + song を流す。 失敗時は file_path を
-    /// 据え置く (= 未保存 project の初回 save 失敗なら file_path=None のまま → autosave が
-    /// recovery_dir に残り起動時 scan で拾える)。 saved baseline = snapshot、 `is_dirty`
-    /// は live と snapshot の差で再計算する (state 待ちの間の編集が live にあれば dirty)。
+    /// cache migration は **2 段階**で行い、 破壊的なファイル移動を serialize 成功後に
+    /// のみ確定する: (1) serialize 前に snapshot の audio path だけを `ProjectRelative`
+    /// へ書き換えて move plan を取る (I/O なし)、 (2) serialize 成功後に plan を commit
+    /// (実ファイル move) し、 live も migrate する。 こうすると書き出し失敗時に
+    /// import_cache のファイルが無傷で残り、 live は `Absolute(cache)` のまま
+    /// autosave/recovery が健全に働く。 **serialize が成功して初めて** file_path を確定し
+    /// (旧契約)、 audio engine へ新 project_dir + song を流す。 saved baseline = snapshot、
+    /// `is_dirty` は live と snapshot の差で再計算する (state 待ちの間の編集が live に
+    /// あれば dirty)。
     fn finish_save(&mut self, mut snapshot: Box<Song>, path: PathBuf) {
-        if let Some(project_dir) = path.parent() {
-            Self::migrate_unsaved_sources(&mut snapshot, project_dir, &mut self.status_message);
-            Self::migrate_unsaved_sources(&mut self.song, project_dir, &mut self.status_message);
-        }
+        // serialize する snapshot の path を ProjectRelative に書き換え、 実ファイル
+        // 移動の plan を取る (= ここでは I/O しない、 破棄しても無害)。
+        let (audio_moves, bounce_moves) = match path.parent() {
+            Some(dir) => (
+                import_audio::plan_unsaved_audio_migration(&mut snapshot, dir),
+                import_audio::plan_unsaved_bounce_migration(&mut snapshot, dir),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
         match common::project::save(&path, &snapshot) {
             Ok(()) => {
                 tracing::info!(path = %path.display(), "saved project");
+                // serialize 成功 → 破壊的 migration を確定する。 まず snapshot 由来の
+                // ファイルを move (plan を commit)、 次に live を migrate して live も
+                // ProjectRelative + 自己完結にする (plan 済みファイルは dst.exists で
+                // dedup、 live 固有 source があれば move)。
+                if let Err(e) = import_audio::commit_migration(&audio_moves) {
+                    tracing::warn!(error = ?e, "samples/ への移行確定で一部失敗");
+                    self.status_message =
+                        format!("Audio sources の samples/ 移行で一部失敗: {e}");
+                }
+                if let Err(e) = import_audio::commit_migration(&bounce_moves) {
+                    tracing::warn!(error = ?e, "bounce/ への移行確定で一部失敗");
+                    self.status_message =
+                        format!("Audio sources の bounce/ 移行で一部失敗: {e}");
+                }
+                if let Some(dir) = path.parent() {
+                    Self::migrate_unsaved_sources(&mut self.song, dir, &mut self.status_message);
+                }
                 // serialize 成功時のみ file_path を確定する (旧契約)。
                 self.file_path = Some(path.clone());
                 // saved baseline = 直列化した snapshot そのもの。 save 後も Undo

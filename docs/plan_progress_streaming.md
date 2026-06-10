@@ -84,11 +84,14 @@ FIXME #24「プロジェクトロード中などプログレスバーを表示�
     `finish_save` に戻し file_path 成功時のみ確定で (b) を解消。回帰 test:
     `daw_gui/tests/pending_state_queue.rs::{save_behind_deferred_remove_snapshots_post_removal_layout,
     save_with_idle_queue_freezes_snapshot_at_invoke, save_and_quit_*}`。
-  - **既存欠陥（未対応・別件）**: 未保存 project の初回 Save As で migration がファイルを物理移動した後に
-    serialize が失敗すると、live が `ProjectRelative` + `file_path=None` となり autosave/recovery で
-    オーディオが project_dir 不在で解決不能になる。これは f400ee2（migration を `save_to` 内で先行実施）
-    時点からの **pre-existing 欠陥** で本変更は導入も解消もしていない。修正案: serialize 成功後に
-    migration するか、失敗時に move を rollback する（要別コミット）。
+  - **serialize 失敗時の atomicity（別コミットで解消済み）**: 以前は migration がファイルを物理移動した
+    **後**に serialize していたため、書き出し失敗（ディスク満杯/権限等）で live が `ProjectRelative` +
+    `file_path=None` となり autosave/recovery でオーディオが解決不能になる欠陥が f400ee2 時点から存在した。
+    migration を **plan（パス書換のみ・I/O なし、`import_audio::plan_unsaved_*_migration`）** と
+    **commit（実ファイル移動、`commit_migration`）** に分割し、`finish_save` は snapshot を plan→serialize→
+    （**成功時のみ**）commit + live migrate の順にする atomic 設計に変更。serialize 失敗時はファイルが一切
+    動かず import_cache に無傷で残り、live は `Absolute(cache)` のまま recovery が健全に働く。unit test:
+    `import_audio::tests::{plan_rewrites_paths_without_moving_files_then_commit_moves, commit_dedups_when_destination_exists}`。
 - **再スキャン進捗**: VST3 probe（[plan_unified_plugin_picker.md](plan_unified_plugin_picker.md) Phase B）で
   scan を改造する際に同時に入れる（scan が重くなるので進捗の意義が増す）。
 
