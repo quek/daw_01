@@ -2840,8 +2840,18 @@ fn slot_sort_key(slot: PluginSlot) -> (u8, u32) {
 /// 走り、 Undo で knob 値が復元されない」 race を回避する。
 #[derive(Debug, Clone)]
 pub enum PendingStateRequest {
-    /// project save。 ファイル書き出し完了で消費される。
-    Save { path: PathBuf },
+    /// project save。 ファイル書き出し完了で消費される。 `snapshot` は **この Save の
+    /// `RequestAllStates` を発行する瞬間** の song を凍結したもの。 enqueue 時点では
+    /// `None` で積み、 `dispatch_front_state_request` が state 収集を始めるその瞬間に
+    /// 充填する。 こうすると snapshot の plugin layout と、 host が返す plugin state の
+    /// layout が同時刻サンプリングになり (FIFO IPC)、 待機中の slot 削除 / 並べ替えが
+    /// 保存ファイルへ誤適用される窓が出ない。 充填後に走った編集はこの snapshot に
+    /// 入らず live song に留まり、 次の save に回る
+    /// (grill-me 2026-06-10, `docs/plan_progress_streaming.md`)。
+    Save {
+        path: PathBuf,
+        snapshot: Option<Box<Song>>,
+    },
     /// plugin が **削除される** 編集操作の Undo snapshot 作成。
     /// state を Song に書き込んでから [`AppData::push_undo_snapshot`]
     /// を呼ぶことで、 削除直前の knob 値等を Undo で復元できる。
@@ -6368,7 +6378,7 @@ impl AppData {
     /// 詰める仕様 (PR2.1)。 旧実装は `tracks.get_mut(s.track as usize)`
     /// と Vec index で検索していたが、 deferred path で track が再
     /// 並び替わっていると壊れるため改めた。
-    fn apply_plugin_states(&mut self, states: &[SlotState]) {
+    fn apply_plugin_states_to(song: &mut Song, states: &[SlotState]) {
         for s in states {
             // Phase 6 review (silent corruption fix): plugin_host が
             // `state_save()` で `Err` を返したエントリは `error` 付きで
@@ -6389,13 +6399,13 @@ impl AppData {
             // (audio fx のみなので Fx slot だけ扱う)。
             if s.track == common::model::MASTER_TRACK_ID {
                 if let PluginSlot::Fx(i) = s.slot
-                    && let Some(p) = self.song.master_fx_chain.get_mut(i as usize)
+                    && let Some(p) = song.master_fx_chain.get_mut(i as usize)
                 {
                     p.state = s.data.clone();
                 }
                 continue;
             }
-            let Some(track) = self.song.tracks.iter_mut().find(|t| t.id == s.track) else {
+            let Some(track) = song.tracks.iter_mut().find(|t| t.id == s.track) else {
                 tracing::warn!(track = s.track, ?s.slot, "apply_plugin_states: track id not found");
                 continue;
             };
@@ -6428,8 +6438,32 @@ impl AppData {
         let was_idle = self.pending_state_queue.is_empty();
         self.pending_state_queue.push_back(req);
         if was_idle {
-            self.send_plugin(MainToChild::RequestAllStates);
+            self.dispatch_front_state_request();
         }
+    }
+
+    /// queue 先頭 request の state 収集を開始する (= `RequestAllStates` 送信)。
+    /// 先頭が **まだ snapshot を持たない `Save`** なら、 送信する **この瞬間** の
+    /// live song を凍結して snapshot に充填する。 これで snapshot の plugin slot
+    /// 配置と、 host が `RequestAllStates` を処理して返す state の配置が同時刻
+    /// サンプリングになる: FIFO IPC により、 この送信より前に出された layout 変更
+    /// (先行 Deferred の `RemoveSlotPlugin` 等) は既に host で処理済み・live にも
+    /// 反映済みであり、 この送信より後の変更は host では `RequestAllStates` の後に
+    /// 処理されるため、 返る state は必ず「今 live にある配置」 と一致する。
+    fn dispatch_front_state_request(&mut self) {
+        let needs_snapshot = matches!(
+            self.pending_state_queue.front(),
+            Some(PendingStateRequest::Save { snapshot: None, .. })
+        );
+        if needs_snapshot {
+            let snap = Box::new(self.song.clone());
+            if let Some(PendingStateRequest::Save { snapshot, .. }) =
+                self.pending_state_queue.front_mut()
+            {
+                *snapshot = Some(snap);
+            }
+        }
+        self.send_plugin(MainToChild::RequestAllStates);
     }
 
     /// project save の trigger。 plugin がある場合は plugin_host から
@@ -6438,10 +6472,18 @@ impl AppData {
     /// に積んで先行 request の応答後に処理させる (= 順序保持)。
     fn begin_save(&mut self, path: PathBuf) {
         if !self.song_has_plugin() {
-            self.save_after_states(path);
+            // plugin が無ければ state 収集 (RequestAllStates) は不要。 今の live を
+            // そのまま凍結して即 serialize する。 cache migration は finish_save 内で
+            // 行う (= live と snapshot の両方に適用、 file_path は成功時のみ確定)。
+            let snapshot = Box::new(self.song.clone());
+            self.finish_save(snapshot, path);
             return;
         }
-        self.enqueue_state_request(PendingStateRequest::Save { path });
+        // plugin 有り: snapshot は **state 収集を始める瞬間** に取る (co-temporal)。
+        // ここでは None で積み、 dispatch_front_state_request が RequestAllStates を
+        // 送るその瞬間に live を凍結する。 こうすると snapshot の plugin slot 配置と、
+        // 返ってくる state の配置が一致し、 待機中の slot 削除等による誤適用が消える。
+        self.enqueue_state_request(PendingStateRequest::Save { path, snapshot: None });
     }
 
     /// plugin state 取得待ちで save が非同期進行中か (= queue に Save あり)。
@@ -6453,73 +6495,61 @@ impl AppData {
             .any(|r| matches!(r, PendingStateRequest::Save { .. }))
     }
 
-    /// state 適用 (save flow なら `apply_plugin_states` 済み、 plugin が
-    /// 無ければ no-op) のあとファイルを書き出す。
-    fn save_after_states(&mut self, path: PathBuf) {
-        if self.save_to(&path) {
-            self.file_path = Some(path);
+    /// `song` 内の未保存 import/bounce cache source を `<project_dir>/samples,bounce/`
+    /// へ移して path を `ProjectRelative` に書き換える。 save flow で **直列化する
+    /// snapshot と working state の live の両方** に適用する: ファイルは move なので、
+    /// 片方だけ移すと他方が移動後ファイルを見失う (= 初回呼び出しが move、 2 回目以降は
+    /// dst.exists で path 書換のみ)。 失敗しても save は続行し missing source として
+    /// 扱う。 status へ最後の失敗メッセージを残す (`&mut status` で借用衝突を避ける)。
+    fn migrate_unsaved_sources(song: &mut Song, project_dir: &Path, status: &mut String) {
+        // Phase 1 PR3: 未保存 project 中に import した audio source (`docs/plan_audio_clip.md`
+        // §13 Q2)。 Phase 2 PR-C: 未保存 project の Bounce 出力 (`docs/plan_audio_followup.md`)。
+        if let Err(e) = import_audio::migrate_unsaved_audio_sources_into(song, project_dir) {
+            tracing::warn!(error = ?e, "import_cache → samples/ への移行で一部失敗");
+            *status = format!("Audio sources の samples/ 移行で一部失敗: {e}");
+        }
+        if let Err(e) = import_audio::migrate_unsaved_bounce_sources_into(song, project_dir) {
+            tracing::warn!(error = ?e, "bounce_cache → bounce/ への移行で一部失敗");
+            *status = format!("Audio sources の bounce/ 移行で一部失敗: {e}");
         }
     }
 
-    fn save_to(&mut self, path: &Path) -> bool {
-        // Phase 1 PR3: 未保存 project 中に import した audio source は
-        // user import_cache に置かれている。 save 時に
-        // `<project_dir>/samples/` へ move + path を ProjectRelative に
-        // 書き換える (`docs/plan_audio_clip.md` §13 Q2)。 失敗しても
-        // save は続行し、 missing source として扱う。
-        if let Some(project_dir) = path.parent()
-            && let Err(e) = import_audio::migrate_unsaved_audio_sources_into(
-                &mut self.song,
-                project_dir,
-            )
-        {
-            tracing::warn!(
-                error = ?e,
-                path = %path.display(),
-                "audio sources のうち import_cache → samples/ への移行で一部失敗"
-            );
-            self.status_message = format!(
-                "Audio sources の samples/ 移行で一部失敗: {e}"
-            );
+    /// 凍結済み `snapshot` をファイルへ書き出して保存を完了する。
+    ///
+    /// cache migration はここで行う (= `begin_save`/invoke ではなく serialize 直前)。
+    /// snapshot と live の両方を migrate するので、 ファイル move 後も両者が
+    /// `ProjectRelative` で新 path を指す。 **serialize が成功して初めて** file_path を
+    /// 確定し、 audio engine へ新 project_dir + song を流す。 失敗時は file_path を
+    /// 据え置く (= 未保存 project の初回 save 失敗なら file_path=None のまま → autosave が
+    /// recovery_dir に残り起動時 scan で拾える)。 saved baseline = snapshot、 `is_dirty`
+    /// は live と snapshot の差で再計算する (state 待ちの間の編集が live にあれば dirty)。
+    fn finish_save(&mut self, mut snapshot: Box<Song>, path: PathBuf) {
+        if let Some(project_dir) = path.parent() {
+            Self::migrate_unsaved_sources(&mut snapshot, project_dir, &mut self.status_message);
+            Self::migrate_unsaved_sources(&mut self.song, project_dir, &mut self.status_message);
         }
-        // Phase 2 PR-C follow-up: 未保存 project で Bounce In Place /
-        // Bounce (with FX) を実行した結果は user bounce_cache に置かれる。
-        // save 時に `<project_dir>/bounce/` へ移動 + path を ProjectRelative
-        // に書き換える (`docs/plan_audio_followup.md` 後回し 1)。 失敗
-        // しても save 続行 (= bounced source は missing として扱われる)。
-        if let Some(project_dir) = path.parent()
-            && let Err(e) = import_audio::migrate_unsaved_bounce_sources_into(
-                &mut self.song,
-                project_dir,
-            )
-        {
-            tracing::warn!(
-                error = ?e,
-                path = %path.display(),
-                "audio sources のうち bounce_cache → bounce/ への移行で一部失敗"
-            );
-            self.status_message =
-                format!("Audio sources の bounce/ 移行で一部失敗: {e}");
-        }
-        match common::project::save(path, &self.song) {
+        match common::project::save(&path, &snapshot) {
             Ok(()) => {
                 tracing::info!(path = %path.display(), "saved project");
-                // 保存した内容を新しい保存ベースラインに確定する。 save 後も
-                // Undo できるよう履歴は残す (= reset_saved_baseline は使わない)。
-                self.saved_song = self.song.clone();
-                self.is_dirty = false;
+                // serialize 成功時のみ file_path を確定する (旧契約)。
+                self.file_path = Some(path.clone());
+                // saved baseline = 直列化した snapshot そのもの。 save 後も Undo
+                // できるよう履歴は残す (= reset_saved_baseline は使わない)。
+                self.saved_song = *snapshot;
+                // live が snapshot から乖離している (state 待ち中の編集) なら dirty。
+                self.recompute_dirty();
                 // 保存成功後、 この project の autosave (sidecar + 未保存→Save As
                 // 用の session recovery file) を削除する。 save 後の .daw が
                 // authoritative なので、 古い autosave が残ると unclean exit 後の
                 // 次回 Open / 起動で recovery modal が「save より古い」 状態を提示し、
                 // 復元すると保存内容を巻き戻してしまう。
-                self.clear_stale_autosave_after_save(path);
+                self.clear_stale_autosave_after_save(&path);
                 // 保存内容が source of truth になったので、 同 file の sidecar
                 // autosave (前回までの未保存 snapshot) を削除する。 残すと
                 // クラッシュ / 強制終了でクリーン終了処理が走らなかったとき、
                 // 次回 Open 時に recovery modal が「save より古い状態」 を復元
                 // 候補として提示してしまう (= 保存した作業の巻き戻し事故)。
-                let sidecar = common::recovery::sidecar_for(path);
+                let sidecar = common::recovery::sidecar_for(&path);
                 match std::fs::remove_file(&sidecar) {
                     Ok(()) => tracing::info!(
                         sidecar = %sidecar.display(),
@@ -6543,25 +6573,36 @@ impl AppData {
                 // 「最近保存したファイル」 別 list にも記録する。
                 self.push_recent(path.to_path_buf());
                 self.push_recent_saved(path.to_path_buf());
-                // PR6: Save の中で audio_sources の path が
-                // `Absolute(import_cache)` → `ProjectRelative(samples/)`
-                // に書き換わり、 さらに project_dir も新たに確定した。
-                // 両方を audio engine へ再送して
-                // `AudioClipRenderer` を rebuild させる (順序保証付き
-                // IPC なので SetProjectDir → LoadSong)。 file_path は
-                // 呼び出し側 `save_after_states` が確定するが、
-                // path.parent() を直接使えば Save 時点の project_dir
-                // を正しく送れる。
-                let project_dir: Option<PathBuf> =
-                    path.parent().map(Path::to_path_buf);
+                // PR6: migration で audio_sources の path が
+                // `Absolute(import_cache)` → `ProjectRelative(samples/)` に書き換わり、
+                // project_dir も新たに確定した。 live song と project_dir を audio engine
+                // へ再送して `AudioClipRenderer` を rebuild させる (順序保証 IPC なので
+                // SetProjectDir → LoadSong)。 live (snapshot ではない) を送るのは、 audio
+                // が反映すべきは再生対象の working state だから。
+                let project_dir: Option<PathBuf> = path.parent().map(Path::to_path_buf);
                 self.send_audio(MainToChild::SetProjectDir(project_dir));
                 let song = self.song.clone();
                 self.send_audio(MainToChild::LoadSong(song));
-                true
+                // 「保存して終了」: この保存は成功した。 plugin state 待ちの間に live へ
+                // 編集が入って dirty なら (co-temporal snapshot は編集前で凍結されている
+                // ため、 その編集はこの保存に含まれない)、 残りを確定するため同じ path へ
+                // 再保存して終了意図を維持する。 clean なら終了する。 save 成功が分かる
+                // この場所で判定するので、 失敗時の無限再保存ループに陥らない。
+                if self.quit_after_save {
+                    if self.is_dirty {
+                        self.begin_save(path);
+                    } else {
+                        self.should_quit = true;
+                        self.quit_after_save = false;
+                    }
+                }
             }
             Err(e) => {
                 tracing::error!(error = ?e, path = %path.display(), "failed to save project");
-                false
+                self.status_message = format!("保存に失敗しました: {e}");
+                // 保存失敗 → 終了しない (データ損失回避)。 終了意図はクリアして、
+                // state 待ちのたびに再保存が走り続ける無限ループを防ぐ。
+                self.quit_after_save = false;
             }
         }
     }
@@ -13760,10 +13801,12 @@ impl AppData {
     /// queue に後続がある場合は次の `RequestAllStates` を改めて発行し、
     /// 連続 deferred edit が個別に最新 state を捕まえられるようにする。
     fn on_all_states_from_child(&mut self, states: Vec<SlotState>) {
-        // Save / Deferred どちらでも Song の state は最新化したいので
-        // ここで一律書き戻す。 queue が空だった場合 (= 想定外タイミング
-        // の応答) でも害はない。
-        self.apply_plugin_states(&states);
+        // live song の plugin state を最新化する (= dirty 判定の整合と、
+        // Deferred の Undo snapshot が最新 knob を捕まえるため)。 queue が空
+        // だった場合 (= 想定外タイミングの応答) でも害はない。 Save の serialize
+        // 対象は live ではなく凍結 snapshot なので、 下の match 内で snapshot 側に
+        // も別途適用する。
+        Self::apply_plugin_states_to(&mut self.song, &states);
         // Phase 6 review (silent corruption fix): plugin_host 側で
         // `state_save()` が `Err` を返したエントリは `SlotState.error`
         // 経由で報告される。 旧コードはこれを `.ok().flatten()` で握り
@@ -13798,7 +13841,16 @@ impl AppData {
             return;
         };
         match req {
-            PendingStateRequest::Save { path } => self.save_after_states(path),
+            PendingStateRequest::Save { path, snapshot } => {
+                // snapshot は dispatch_front_state_request が **この save の
+                // RequestAllStates を送る瞬間** に充填しているはず。 受け取った
+                // states (= その RequestAllStates の応答) はその瞬間の host layout を
+                // 反映するので、 snapshot のスロット配置と一致し、 位置 index 適用でも
+                // 誤適用が起きない。 万一 None (想定外) なら防御的に live を凍結する。
+                let mut snapshot = snapshot.unwrap_or_else(|| Box::new(self.song.clone()));
+                Self::apply_plugin_states_to(&mut snapshot, &states);
+                self.finish_save(snapshot, path);
+            }
             PendingStateRequest::Deferred(edit) => {
                 // ここで初めて Undo snapshot を push する。 Song に
                 // 最新 state が入った状態を捕まえるため (plugin が
@@ -13807,27 +13859,16 @@ impl AppData {
                 self.execute_deferred_edit(edit);
             }
         }
-        // 後続の request が積まれていれば、 改めて `RequestAllStates`
-        // を発行して次の応答待ちに入る。 ここで「直前の edit が走った
-        // あとの最新 state」 を再取得することで、 各 deferred edit が
-        // 自前の knob snapshot を持つ。
+        // 後続の request が積まれていれば、 改めて `RequestAllStates` を発行して
+        // 次の応答待ちに入る。 ここで「直前の edit が走ったあとの最新 state」 を
+        // 再取得することで、 各 deferred edit が自前の knob snapshot を持つ。 さらに
+        // 新たな front が Save なら、 dispatch_front_state_request が **この瞬間**
+        // (= 先行 Deferred が live layout を確定させた直後) に live を凍結するので、
+        // その Save の snapshot は返ってくる state と同じ layout になる。
         if !self.pending_state_queue.is_empty() {
-            self.send_plugin(MainToChild::RequestAllStates);
+            self.dispatch_front_state_request();
         }
-
-        // 「保存して終了」 の非同期保存待ち。 save が完了 (is_dirty=false)
-        // したら終了する。 save が失敗 (is_dirty=true のまま) なら終了せず
-        // status のエラー表示を残す。 いずれにせよ pending Save が無く
-        // なったら intent をクリアし、 後続の手動 save が誤って quit を
-        // 誘発しないようにする。
-        if self.quit_after_save {
-            if !self.is_dirty {
-                self.should_quit = true;
-            }
-            if !self.has_pending_save() {
-                self.quit_after_save = false;
-            }
-        }
+        // 「保存して終了」 の完了判定は `finish_save` (save 成否が分かる場所) が行う。
     }
 
     /// `AllPluginStates` 受信後に呼ばれる。 deferred edit を実際に実行

@@ -67,12 +67,28 @@ FIXME #24「プロジェクトロード中などプログレスバーを表示�
   `on_asset_decode_tick` で逐次 cache 排出 + 再生 gate）+ 非ブロック進捗 overlay（`view/load_overlay.rs`）。
 - **保存インジケータ**: landed（非同期保存中 = `is_async_save_pending` の間 load_overlay が「保存中…」を
   表示、非ブロック）。
-- **保存の snapshot-at-invoke は分離（未実装）**: `save_to` の `migrate_unsaved_audio_sources_into`
-  / `migrate_unsaved_bounce_sources_into` が **live `self.song` のファイル移動 + path 書換**を伴うため、
-  snapshot 側だけ書き換えると live project が移動後ファイルを見失う。正しくは「migrate を invoke 時に
-  `self.song` へ適用 → snapshot → 完了時に plugin state を snapshot へ適用して serialize」という再配列が
-  要る。**save はユーザーの作業データに直結する critical path** なので、コスト判断ではなく**データ安全性
-  判断**として、慎重にレビューする独立変更に分離する。現状の save は既に非ブロック+単一スレッドで安全。
+- **保存の snapshot-at-invoke = landed（2026-06-10, co-temporal snapshot 設計）**: `begin_save` は
+  plugin 有りなら `PendingStateRequest::Save { path, snapshot: Option<Box<Song>> }` を enqueue（snapshot は
+  None で積む）。`dispatch_front_state_request` が **この save の `RequestAllStates` を送るその瞬間** に
+  live を clone して snapshot を充填する。これで snapshot の plugin slot 配置と、その応答 state の配置が
+  **同時刻サンプリング (co-temporal)** になり、FIFO IPC により待機中の slot 削除 / 並べ替えが保存ファイルへ
+  位置 index 誤適用される窓が消える。state 応答で snapshot に state を適用 → `finish_save` で snapshot を
+  直列化。`finish_save` は **migrate を snapshot と live の両方** に適用（ファイルは move なので両者追従が
+  必要）し、**serialize 成功時のみ** `file_path` 確定 + saved baseline = snapshot + `recompute_dirty`
+  （live が乖離していれば dirty 維持 = 待機中編集は次の save へ）。「保存して終了」 は `finish_save`（save
+  成否が分かる場所）で判定し、待機中編集で dirty なら同 path へ再保存して意図を維持、clean なら quit。
+  - **設計の経緯**: 当初「migration + file_path を invoke 前倒し + invoke で snapshot 凍結」を試したが、
+    多角レビューで (a) Save が slot 削除 Deferred の後方に積まれると invoke 時 snapshot に削除後 state が
+    誤適用される **critical silent corruption**、(b) file_path 前倒しで serialize 失敗時 recovery 退行、を
+    検出。co-temporal snapshot（凍結を invoke ではなく state 収集開始の瞬間に遅らせる）で (a) を、migration を
+    `finish_save` に戻し file_path 成功時のみ確定で (b) を解消。回帰 test:
+    `daw_gui/tests/pending_state_queue.rs::{save_behind_deferred_remove_snapshots_post_removal_layout,
+    save_with_idle_queue_freezes_snapshot_at_invoke, save_and_quit_*}`。
+  - **既存欠陥（未対応・別件）**: 未保存 project の初回 Save As で migration がファイルを物理移動した後に
+    serialize が失敗すると、live が `ProjectRelative` + `file_path=None` となり autosave/recovery で
+    オーディオが project_dir 不在で解決不能になる。これは f400ee2（migration を `save_to` 内で先行実施）
+    時点からの **pre-existing 欠陥** で本変更は導入も解消もしていない。修正案: serialize 成功後に
+    migration するか、失敗時に move を rollback する（要別コミット）。
 - **再スキャン進捗**: VST3 probe（[plan_unified_plugin_picker.md](plan_unified_plugin_picker.md) Phase B）で
   scan を改造する際に同時に入れる（scan が重くなるので進捗の意義が増す）。
 

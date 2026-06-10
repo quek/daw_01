@@ -17,7 +17,7 @@ use common::plugin_format::PluginFormat;
 use common::protocol::{MainToChild, PluginSlot};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
-use daw_gui::app::{AppData, AppEvent};
+use daw_gui::app::{AppData, AppEvent, PendingStateRequest};
 use daw_gui::dispatcher::{
     BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
 };
@@ -91,6 +91,12 @@ fn drain<T>(rx: &mut UnboundedReceiver<T>) -> Vec<T> {
         v.push(msg);
     }
     v
+}
+
+fn has_pending_save(app: &AppData) -> bool {
+    app.pending_state_queue
+        .iter()
+        .any(|r| matches!(r, PendingStateRequest::Save { .. }))
 }
 
 fn fake_plugin_loaded(
@@ -253,5 +259,240 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
         app.undo_stack.len() >= 2,
         "at least 2 snapshots from the 2 deferred edits: {}",
         app.undo_stack.len()
+    );
+}
+
+/// 1 つの track に instrument + Fx 2 つ (Bitcrush=Fx0, Delay=Fx1) を載せる。
+fn setup_track_with_two_fx(app: &mut AppData) -> u32 {
+    let track_id = app.song.tracks[0].id;
+    app.handle_event(AppEvent::SelectTrack(0));
+
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.synth".into(),
+        keep_open: false,
+        open_gui: true,
+    });
+    fake_plugin_loaded(app, track_id, PluginSlot::Instrument, "test.synth", 100);
+
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.bitcrush".into(),
+        keep_open: false,
+        open_gui: true,
+    });
+    fake_plugin_loaded(app, track_id, PluginSlot::Fx(0), "test.bitcrush", 200);
+
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.delay".into(),
+        keep_open: false,
+        open_gui: true,
+    });
+    fake_plugin_loaded(app, track_id, PluginSlot::Fx(1), "test.delay", 201);
+    track_id
+}
+
+/// FIXME #24 回帰: Save が **slot 削除の Deferred edit が in-flight 中** に enqueue
+/// されたとき、 その save の凍結 snapshot は「削除が反映された後」 の layout で
+/// 取られなければならない (= co-temporal snapshot)。
+///
+/// 旧 snapshot-at-invoke 実装は Save を押した瞬間 (= 削除前、 fx_chain=[Bitcrush,
+/// Delay]) で凍結していた。 一方、 この save が受け取る plugin state は削除実行後に
+/// 再発行された `RequestAllStates` の応答 (= fx_chain=[Delay]、 Delay が Fx(0) へ
+/// shift) を反映する。 これを位置 index で旧 snapshot に適用すると、 Delay の state
+/// が Bitcrush (snapshot の Fx(0)) に誤適用される silent corruption になっていた。
+///
+/// 本 test は、 Deferred(RemoveSlot Fx(0)) が実行された **後** に Save の snapshot が
+/// 充填され、 その snapshot の fx_chain が削除後の 1 個 (= Delay のみ) であることを
+/// 検証する。
+#[test]
+fn save_behind_deferred_remove_snapshots_post_removal_layout() {
+    let (mut app, _audio_rx, mut plugin_rx, _proxy) = build_app();
+    let track_id = setup_track_with_two_fx(&mut app);
+    assert!(app.pending_state_queue.is_empty(), "queue starts empty");
+    let _ = drain(&mut plugin_rx);
+
+    // RemoveSlot Fx(0) → Deferred enqueue、 RequestAllStates(R1) 送信。 live は
+    // まだ [Bitcrush, Delay] (削除は deferred)。
+    app.handle_event(AppEvent::RemoveSlot {
+        slot_kind: 2,
+        slot_index: 0,
+    });
+    assert_eq!(app.pending_state_queue.len(), 1, "RemoveSlot enqueues Deferred");
+    let _ = drain(&mut plugin_rx);
+
+    // Deferred in-flight 中に Save。 queue 後方に積まれ、 snapshot はまだ None
+    // (= dispatch_front_state_request がこの save の RequestAllStates を送る瞬間に
+    // 充填する設計なので、 後方に積まれている間は None)。
+    app.file_path = Some(std::env::temp_dir().join("daw01_test_snapshot_timing.daw"));
+    app.handle_event(AppEvent::Save);
+    assert_eq!(
+        app.pending_state_queue.len(),
+        2,
+        "Save enqueues behind the in-flight Deferred"
+    );
+    match app.pending_state_queue.back() {
+        Some(PendingStateRequest::Save { snapshot, .. }) => assert!(
+            snapshot.is_none(),
+            "Save snapshot is not frozen yet while queued behind a Deferred"
+        ),
+        other => panic!("back of queue should be Save, got {other:?}"),
+    }
+    // この Save では RequestAllStates は再発行されない (in-flight 中)。
+    let msgs = drain(&mut plugin_rx);
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| matches!(m, MainToChild::RequestAllStates)),
+        "no extra RequestAllStates while Deferred in-flight: {msgs:?}"
+    );
+
+    // R1 応答 → Deferred(RemoveSlot Fx(0)) 実行 (live fx → [Delay])、 queue 残り
+    // [Save]、 dispatch_front_state_request が Save の snapshot を **今の** live
+    // (= 削除後 layout) で充填し、 R2 を送る。
+    app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
+    assert_eq!(
+        app.pending_state_queue.len(),
+        1,
+        "Deferred consumed, Save remains"
+    );
+
+    // live は削除を反映している。
+    let live_track = app.song.tracks.iter().find(|t| t.id == track_id).unwrap();
+    assert_eq!(live_track.fx_chain.len(), 1, "live: Bitcrush removed");
+    assert_eq!(live_track.fx_chain[0].plugin_id, "test.delay");
+
+    // 肝心の検証: Save の snapshot が **削除後** layout (fx 1 個 = Delay) で
+    // 凍結されている。 旧 snapshot-at-invoke なら 2 個 ([Bitcrush, Delay]) のまま
+    // で、 R2 の Fx(0)=Delay state が Bitcrush へ誤適用された。
+    match app.pending_state_queue.front() {
+        Some(PendingStateRequest::Save { snapshot, .. }) => {
+            let snap = snapshot
+                .as_ref()
+                .expect("snapshot is frozen once the Save reaches the front of the queue");
+            let st = snap.tracks.iter().find(|t| t.id == track_id).unwrap();
+            assert_eq!(
+                st.fx_chain.len(),
+                1,
+                "snapshot must reflect the post-removal layout (co-temporal with its states)"
+            );
+            assert_eq!(st.fx_chain[0].plugin_id, "test.delay");
+        }
+        other => panic!("front of queue should be Save, got {other:?}"),
+    }
+}
+
+/// 「保存して終了」 で plugin state 待ちの間に **編集が入らなかった** 場合、
+/// 非同期保存の完了 (finish_save) で should_quit が立つ。
+#[test]
+fn save_and_quit_clean_sets_should_quit() {
+    let (mut app, _audio_rx, mut plugin_rx, _proxy) = build_app();
+    let track_id = app.song.tracks[0].id;
+    app.handle_event(AppEvent::SelectTrack(0));
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.synth".into(),
+        keep_open: false,
+        open_gui: true,
+    });
+    fake_plugin_loaded(&mut app, track_id, PluginSlot::Instrument, "test.synth", 100);
+    let _ = drain(&mut plugin_rx);
+
+    // 非同期保存を enqueue し、 「保存して終了」 の意図を立てる
+    // (= close_confirm_save が plugin 有り dirty project でやること)。
+    app.file_path = Some(std::env::temp_dir().join("daw01_test_quit_clean.daw"));
+    app.handle_event(AppEvent::Save);
+    app.quit_after_save = true;
+    assert!(has_pending_save(&app), "Save in-flight");
+
+    // 編集なしで応答到着 → finish_save が clean を確認して should_quit。
+    app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
+    assert!(app.should_quit, "clean async save-and-quit sets should_quit");
+    assert!(!app.quit_after_save, "quit intent cleared after quitting");
+}
+
+/// 「保存して終了」 で plugin state 待ちの間に編集が入った場合、 co-temporal
+/// snapshot は編集前なのでこの保存に編集は含まれない。 finish_save は should_quit を
+/// 立てず、 残った編集を確定するため再保存を enqueue して終了意図を維持する
+/// (= FIXME #24 redesign の回帰修正: 旧コードは intent を捨ててアプリが閉じも
+/// 保存もしない状態になっていた)。
+#[test]
+fn save_and_quit_with_window_edit_resaves_instead_of_quitting() {
+    let (mut app, _audio_rx, mut plugin_rx, _proxy) = build_app();
+    let track_id = app.song.tracks[0].id;
+    app.handle_event(AppEvent::SelectTrack(0));
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.synth".into(),
+        keep_open: false,
+        open_gui: true,
+    });
+    fake_plugin_loaded(&mut app, track_id, PluginSlot::Instrument, "test.synth", 100);
+    let _ = drain(&mut plugin_rx);
+
+    app.file_path = Some(std::env::temp_dir().join("daw01_test_quit_window_edit.daw"));
+    app.handle_event(AppEvent::Save);
+    app.quit_after_save = true;
+    let _ = drain(&mut plugin_rx);
+
+    // state 待ちの間に live を編集する (snapshot は既に凍結済みなので含まれない)。
+    let extra_track = app.song.tracks[0].clone();
+    app.song.tracks.push(extra_track);
+
+    // 応答到着 → finish_save: saved baseline = 編集前 snapshot、 live は編集後で
+    // dirty。 should_quit は立たず、 再保存が enqueue され、 終了意図は維持される。
+    app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
+    assert!(
+        !app.should_quit,
+        "window edit during save-and-quit must NOT quit (would drop the edit)"
+    );
+    assert!(
+        app.quit_after_save,
+        "quit intent stays alive across the follow-up save"
+    );
+    assert!(
+        has_pending_save(&app),
+        "a follow-up Save is enqueued to persist the window edit"
+    );
+}
+
+/// 通常ケース: queue が空のときの Save は invoke の瞬間 (= この save の
+/// RequestAllStates を送る瞬間) に snapshot を凍結する。
+#[test]
+fn save_with_idle_queue_freezes_snapshot_at_invoke() {
+    let (mut app, _audio_rx, mut plugin_rx, _proxy) = build_app();
+    let track_id = app.song.tracks[0].id;
+    app.handle_event(AppEvent::SelectTrack(0));
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.synth".into(),
+        keep_open: false,
+        open_gui: true,
+    });
+    fake_plugin_loaded(&mut app, track_id, PluginSlot::Instrument, "test.synth", 100);
+    assert!(app.pending_state_queue.is_empty(), "queue starts empty");
+    let _ = drain(&mut plugin_rx);
+
+    app.file_path = Some(std::env::temp_dir().join("daw01_test_snapshot_idle.daw"));
+    app.handle_event(AppEvent::Save);
+
+    // queue が空 → was_idle → この save の RequestAllStates を即送信し、 その瞬間に
+    // snapshot を凍結する。
+    assert_eq!(app.pending_state_queue.len(), 1, "Save enqueued");
+    match app.pending_state_queue.front() {
+        Some(PendingStateRequest::Save { snapshot, .. }) => assert!(
+            snapshot.is_some(),
+            "idle-queue Save freezes its snapshot immediately at invoke"
+        ),
+        other => panic!("front of queue should be Save, got {other:?}"),
+    }
+    let msgs = drain(&mut plugin_rx);
+    assert_eq!(
+        msgs.iter()
+            .filter(|m| matches!(m, MainToChild::RequestAllStates))
+            .count(),
+        1,
+        "idle-queue Save sends exactly 1 RequestAllStates: {msgs:?}"
     );
 }
