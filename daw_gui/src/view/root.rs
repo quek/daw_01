@@ -11,7 +11,8 @@ use daw_ui_renderer::{Color, Rect};
 use crate::app::{AppData, AppEvent};
 use crate::view::{
     arrangement_view, bottom_panel, close_confirm_modal, export_overlay, font_picker,
-    plugin_picker, recovery_modal, status_bar, track_inspector, track_picker, transport,
+    load_overlay, plugin_picker, recovery_modal, status_bar, track_inspector, track_picker,
+    transport,
 };
 
 pub const MENU_H: f32 = 24.0;
@@ -106,6 +107,9 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
 
     // Modal: font picker (Text クリップのフォント選択)。is_font_picker_open と同期。
     font_picker::draw(app, ui, screen);
+
+    // 非ブロック overlay: プロジェクトロードの進捗 (FIXME #24)。
+    load_overlay::draw(app, ui, screen);
 
     // Modal: send 宛先トラックピッカー。app.send_picker == Some(..) のとき開く。
     track_picker::draw(app, ui, screen);

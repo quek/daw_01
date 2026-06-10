@@ -1163,6 +1163,13 @@ pub struct AppData {
     // -------- Background workers --------
     pub synth_result: Arc<Mutex<Vec<common::voicevox::SynthResult>>>,
     pub rescan_result: Arc<Mutex<Option<PluginDatabase>>>,
+    /// プロジェクトロード時の audio / image background decode の staging。
+    /// `Some` の間は streaming load 進行中 (= 再生 gate + 進捗 overlay 表示、
+    /// FIXME #24)。 `begin_asset_decode` で `Some`、 全件取り込みで `None`。
+    pub asset_decode: Option<Arc<Mutex<AssetDecodeStaging>>>,
+    /// 進捗 overlay 用 (done, total)。 draw で Mutex を取らずに済むよう
+    /// `on_asset_decode_tick` がプレーン値で更新する。 `None` = 非表示。
+    pub load_progress: Option<(usize, usize)>,
     /// VOICEVOX engine `/singers` の結果。 起動時に background thread が
     /// `AppEvent::SingersLoaded` で投入する。 engine 未起動 / fetch 失敗時は
     /// 空のまま (Track Inspector の dropdown は default singer のみ表示)。
@@ -1538,6 +1545,8 @@ impl AppData {
             pending_play: false,
             synth_result: Arc::new(Mutex::new(Vec::new())),
             rescan_result: Arc::new(Mutex::new(None)),
+            asset_decode: None,
+            load_progress: None,
             singers: Vec::new(),
             vocal_speaker_entries: Vec::new(),
             vocal_speaker_labels: Vec::new(),
@@ -3539,6 +3548,10 @@ pub enum AppEvent {
     /// background のフォント列挙完了。
     FontFamiliesLoaded(Vec<String>),
 
+    /// FIXME #24: プロジェクトロードの background asset decode が 1 件完了する
+    /// たびに発火。 staging を caches へ流し込み、 全件完了で gate を外す。
+    AssetDecodeTick,
+
     ToggleSlotGui { slot_kind: u8, slot_index: u32 },
     RemoveSlot { slot_kind: u8, slot_index: u32 },
     /// PR4 sidechain: wire / unwire the sidechain source for a plugin's
@@ -4820,6 +4833,7 @@ impl AppData {
             AppEvent::HoverFontInPicker(idx) => self.hover_font_in_picker(idx),
             AppEvent::CommitFontFromPicker(family) => self.commit_font_from_picker(family),
             AppEvent::FontFamiliesLoaded(families) => self.on_font_families_loaded(families),
+            AppEvent::AssetDecodeTick => self.on_asset_decode_tick(),
             AppEvent::RescanPluginDb => {
                 self.begin_rescan();
             }
@@ -5587,143 +5601,133 @@ impl AppData {
     /// ProjectRelative は file_path.parent() で resolve、 Generated は廃止
     /// 仕様で skip。 decode 失敗は warn ログのみ (= waveform が出ないだけで
     /// 他機能は動く defensive)。
-    fn decode_audio_sources_into_cache(&mut self) {
-        use common::model::AudioSourcePath;
+    /// プロジェクトの audio / image source を **background スレッドで** decode
+    /// し、 caches へ逐次取り込む (FIXME #24 / `docs/plan_progress_streaming.md`)。
+    /// 旧 `decode_*_sources_into_cache` は GUI スレッドで同期 decode し UI を
+    /// 固めていた。 本関数は構造の swap 後に呼ばれ、 work-list を作って 1 本の
+    /// thread で順次 decode、 1 件ごとに `AssetDecodeTick` を発火して `on_asset_
+    /// decode_tick` が cache へ流し込む (= 波形 / 画像が順次出る streaming load)。
+    /// 完了まで `asset_decode` は `Some` で、 再生はこの間 gate される。
+    fn begin_asset_decode(&mut self) {
+        use common::model::{AudioSourcePath, ImageSourcePath};
         // file_path = None (= 未保存 project の sidecar 復元) の場合、
-        // ProjectRelative は resolve できないので skip 扱い。
+        // ProjectRelative は resolve できないので skip。
         let project_dir: Option<PathBuf> = self
             .file_path
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
-        let mut decoded = 0usize;
-        let mut skipped = 0usize;
-        let mut failed = 0usize;
+
+        // 未 cache の audio source だけ work-list に (idempotent)。
+        let mut audio_jobs: Vec<(common::model::AudioSourceId, PathBuf)> = Vec::new();
         for (&source_id, source) in &self.song.audio_sources {
-            // 既に cache にあるなら skip (= idempotent、 二重呼出しでも OK)。
             if self.audio_source_cache.contains(source_id) {
                 continue;
             }
-            let abs: PathBuf = match &source.path {
+            let abs = match &source.path {
                 AudioSourcePath::Absolute(abs) => abs.clone(),
-                AudioSourcePath::ProjectRelative(rel) => {
-                    let Some(dir) = project_dir.as_ref() else {
-                        tracing::warn!(
-                            source_id,
-                            ?rel,
-                            "decode_audio_sources_into_cache: ProjectRelative but project_dir unset"
-                        );
-                        skipped += 1;
-                        continue;
-                    };
-                    dir.join(rel)
-                }
-                AudioSourcePath::Generated { id: gen_id } => {
-                    // PR-V4 で廃止 (builtin VOICEVOX plugin 経由に変わった)。
-                    tracing::debug!(
-                        source_id,
-                        gen_id,
-                        "decode_audio_sources_into_cache: skipping retired Generated source"
-                    );
-                    skipped += 1;
-                    continue;
-                }
+                AudioSourcePath::ProjectRelative(rel) => match project_dir.as_ref() {
+                    Some(dir) => dir.join(rel),
+                    None => continue,
+                },
+                // PR-V4 で廃止 (builtin VOICEVOX plugin 経由)。
+                AudioSourcePath::Generated { .. } => continue,
             };
-            match crate::import_audio::decode_wav(&abs) {
-                Ok(buffer) => {
-                    self.audio_source_cache
-                        .insert(source_id, std::sync::Arc::new(buffer));
-                    decoded += 1;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        source_id,
-                        path = %abs.display(),
-                        error = %e,
-                        "decode_audio_sources_into_cache: decode failed"
-                    );
-                    failed += 1;
-                }
-            }
+            audio_jobs.push((source_id, abs));
         }
-        tracing::info!(decoded, skipped, failed, "decoded audio sources into cache");
-    }
-
-    /// 既存 .daw を開いたとき / autosave から復元したとき、 song の
-    /// `image_sources` を walk して各 PNG/JPEG/WebP/etc. を再 decode
-    /// し、 `image_source_bgra` に BGRA8 を staging する。 `pending_image
-    /// _uploads` にも push されるので runner が次フレームで GPU texture
-    /// に upload する。 import 経路 (`action_import_image`) と同 idiom で、
-    /// preview composite (`image_compose::active_image_sources_at`) が
-    /// 機能する前提を満たす。
-    fn decode_image_sources_into_cache(&mut self) {
-        use common::model::ImageSourcePath;
-        let project_dir: Option<PathBuf> = self
-            .file_path
-            .as_ref()
-            .and_then(|p| p.parent().map(Path::to_path_buf));
-        let mut decoded = 0usize;
-        let mut skipped = 0usize;
-        let mut failed = 0usize;
-        // 既に staging 済みの id はスキップ (= idempotent)。
-        let source_ids: Vec<common::model::ImageSourceId> =
-            self.song.image_sources.keys().copied().collect();
-        for source_id in source_ids {
+        // 未 staging の image source。
+        let mut image_jobs: Vec<(common::model::ImageSourceId, PathBuf)> = Vec::new();
+        for (&source_id, source) in &self.song.image_sources {
             if self.image_source_bgra.contains_key(&source_id) {
                 continue;
             }
-            let Some(source) = self.song.image_sources.get(&source_id) else {
-                continue;
-            };
-            let abs: PathBuf = match &source.path {
+            let abs = match &source.path {
                 ImageSourcePath::Absolute(abs) => abs.clone(),
-                ImageSourcePath::ProjectRelative(rel) => {
-                    let Some(dir) = project_dir.as_ref() else {
-                        tracing::warn!(
-                            source_id,
-                            ?rel,
-                            "decode_image_sources_into_cache: ProjectRelative but project_dir unset"
-                        );
-                        skipped += 1;
-                        continue;
-                    };
-                    dir.join(rel)
-                }
+                ImageSourcePath::ProjectRelative(rel) => match project_dir.as_ref() {
+                    Some(dir) => dir.join(rel),
+                    None => continue,
+                },
             };
-            match image::open(&abs) {
-                Ok(dynamic) => {
-                    let rgba = dynamic.into_rgba8();
-                    let (w, h) = rgba.dimensions();
-                    if w == 0 || h == 0 {
-                        tracing::warn!(
-                            source_id,
-                            path = %abs.display(),
-                            "decode_image_sources_into_cache: zero-sized image"
-                        );
-                        failed += 1;
-                        continue;
-                    }
-                    let mut bytes = rgba.into_raw();
-                    for px in bytes.chunks_exact_mut(4) {
-                        px.swap(0, 2); // RGBA → BGRA
-                    }
-                    self.image_source_bgra
-                        .insert(source_id, (w, h, std::sync::Arc::new(bytes)));
-                    self.pending_image_uploads.push(source_id);
-                    decoded += 1;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        source_id,
-                        path = %abs.display(),
-                        error = %e,
-                        "decode_image_sources_into_cache: decode failed"
-                    );
-                    failed += 1;
-                }
-            }
+            image_jobs.push((source_id, abs));
         }
-        tracing::info!(decoded, skipped, failed, "decoded image sources into cache");
+
+        let total = audio_jobs.len() + image_jobs.len();
+        if total == 0 {
+            self.asset_decode = None;
+            return;
+        }
+        let staging = Arc::new(Mutex::new(AssetDecodeStaging { total, ..Default::default() }));
+        self.asset_decode = Some(Arc::clone(&staging));
+        self.load_progress = Some((0, total));
+        let proxy = self.event_proxy.clone();
+        std::thread::spawn(move || {
+            for (id, abs) in audio_jobs {
+                let decoded = crate::import_audio::decode_wav(&abs)
+                    .map_err(|e| {
+                        tracing::warn!(path = %abs.display(), error = %e, "asset decode (audio) failed");
+                    })
+                    .ok()
+                    .map(std::sync::Arc::new);
+                if let Ok(mut g) = staging.lock() {
+                    if let Some(buf) = decoded {
+                        g.audio.push((id, buf));
+                    }
+                    g.done += 1;
+                }
+                proxy.send(AppEvent::AssetDecodeTick);
+            }
+            for (id, abs) in image_jobs {
+                let decoded = decode_image_to_bgra(&abs);
+                if let Ok(mut g) = staging.lock() {
+                    if let Some(img) = decoded {
+                        g.image.push((id, img));
+                    }
+                    g.done += 1;
+                }
+                proxy.send(AppEvent::AssetDecodeTick);
+            }
+        });
     }
+
+    /// background decode から 1 件 decode 完了するたびに発火。 staging に
+    /// 溜まった結果を self caches へ流し込み (= 該当 clip の波形 / 画像が描画
+    /// 開始)、 全件完了で gate を外して queue 中の Play を流す。
+    fn on_asset_decode_tick(&mut self) {
+        let Some(staging) = self.asset_decode.clone() else {
+            return;
+        };
+        let (audio, image, done, total) = {
+            let Ok(mut g) = staging.lock() else {
+                return;
+            };
+            (
+                std::mem::take(&mut g.audio),
+                std::mem::take(&mut g.image),
+                g.done,
+                g.total,
+            )
+        };
+        for (id, buf) in audio {
+            self.audio_source_cache.insert(id, buf);
+        }
+        for (id, (w, h, bytes)) in image {
+            self.image_source_bgra.insert(id, (w, h, bytes));
+            self.pending_image_uploads.push(id);
+        }
+        if done >= total {
+            tracing::info!(total, "asset decode complete");
+            self.asset_decode = None;
+            self.load_progress = None;
+            // 読込完了 → gate していた Play を流す (plugin gate が残っていれば
+            // play() が再 queue する)。
+            if self.pending_play {
+                self.pending_play = false;
+                self.play();
+            }
+        } else {
+            self.load_progress = Some((done, total));
+        }
+    }
+
 
     fn action_open_path(&mut self, path: PathBuf) {
         // Recursive open を防ぐ: autosave file を直接開いた場合は弾く
@@ -5743,17 +5747,10 @@ impl AppData {
                 self.restore_plugin_from_song(&song);
                 self.song = song;
                 self.file_path = Some(path.clone());
-                // Phase 6 review fix: load では audio source の WAV を decode
-                // して `audio_source_cache` に詰める path が抜けていた。
-                // 結果、 saved project を開いたあと audio clip の波形が
-                // 表示されない (arrangement_view::draw_audio_clip_waveform で
-                // `audio_source_cache.get(event.source_id) → None`) 状態に
-                // なっていた。 user 報告「やっぱり波形が表示されないことが
-                // あります」 の root cause。
-                self.decode_audio_sources_into_cache();
-                // 同 idiom で image sources も BGRA decode + GPU upload
-                // staging。 これが無いと image preview が黒帯のまま。
-                self.decode_image_sources_into_cache();
+                // FIXME #24: audio / image source の decode は重いので background
+                // スレッドへ。 構造は既に swap 済みなので即操作可、 波形 / 画像は
+                // streaming で順次出る (begin_asset_decode → AssetDecodeTick)。
+                self.begin_asset_decode();
                 self.selected_track_ids.clear();
                 self.collapsed_groups.clear();
                 self.selected_clip = None;
@@ -5962,12 +5959,9 @@ impl AppData {
         self.restore_plugin_from_song(&song);
         self.song = song;
         self.file_path = common::recovery::original_file_for_sidecar(&autosave_path);
-        // Phase 6 review fix: 同 load path と同じく audio source decode を
-        // 呼ぶ。 `file_path` を先にセットしてから呼ぶことで ProjectRelative
-        // path も resolve できる (= sidecar の元 file が分かっている場合)。
-        self.decode_audio_sources_into_cache();
-        // image source も同 idiom (= recovery 復元時に preview を再構築)。
-        self.decode_image_sources_into_cache();
+        // FIXME #24: recovery 復元も load path と同じく background streaming
+        // decode へ。 file_path を先にセット済みなので ProjectRelative も解決可。
+        self.begin_asset_decode();
         self.selected_track_ids.clear();
         self.collapsed_groups.clear();
         self.selected_clip = None;
@@ -6558,6 +6552,14 @@ impl AppData {
         // 独立だが、 混乱を避けて export 全体で一律に止める）。
         if self.pending_video_export.is_some() || self.export_progress.is_some() {
             self.status_message = "Video export 中は再生できません".into();
+            return;
+        }
+        // FIXME #24: プロジェクトロードの asset decode 中は音声がまだ揃って
+        // いないので再生を gate して queue する (load 完了で on_asset_decode_tick
+        // が flush)。
+        if self.asset_decode.is_some() {
+            self.pending_play = true;
+            self.status_message = "プロジェクト読込中...".into();
             return;
         }
         // A7: if any plugin is still in the SetSlotPlugin →
@@ -16893,6 +16895,57 @@ fn resolve_plugin_name(plugin_db: &Option<Arc<PluginDatabase>>, plugin_id: &str)
             }
         })
         .unwrap_or_else(|| plugin_id.to_string())
+}
+
+/// decode 済み audio staging entry (source_id, buffer)。
+type DecodedAudio = (
+    common::model::AudioSourceId,
+    std::sync::Arc<crate::audio_source_cache::AudioSourceBuffer>,
+);
+/// decode 済み image staging entry (source_id, (w, h, bgra))。
+type DecodedImage = (
+    common::model::ImageSourceId,
+    (u32, u32, std::sync::Arc<Vec<u8>>),
+);
+
+/// FIXME #24: background asset decode の中間バッファ。 decode スレッドが結果を
+/// push + `done` を進め、 GUI スレッドの `on_asset_decode_tick` が caches へ排出
+/// する。
+#[derive(Default)]
+pub struct AssetDecodeStaging {
+    /// decode 済みで未取り込みの audio。
+    pub audio: Vec<DecodedAudio>,
+    /// 同 image。
+    pub image: Vec<DecodedImage>,
+    /// 処理済み件数 (成功 + 失敗、 進捗表示用)。
+    pub done: usize,
+    /// 総件数。
+    pub total: usize,
+}
+
+/// PNG/JPEG/… を decode して BGRA8 + 寸法を返す (background thread から呼ぶ自由
+/// 関数)。 失敗 / 0 サイズは `None`。 旧 `decode_image_sources_into_cache` の
+/// image::open → RGBA → BGRA part を抽出したもの。
+fn decode_image_to_bgra(abs: &Path) -> Option<(u32, u32, std::sync::Arc<Vec<u8>>)> {
+    match image::open(abs) {
+        Ok(dynamic) => {
+            let rgba = dynamic.into_rgba8();
+            let (w, h) = rgba.dimensions();
+            if w == 0 || h == 0 {
+                tracing::warn!(path = %abs.display(), "asset decode (image): zero-sized");
+                return None;
+            }
+            let mut bytes = rgba.into_raw();
+            for px in bytes.chunks_exact_mut(4) {
+                px.swap(0, 2); // RGBA → BGRA
+            }
+            Some((w, h, std::sync::Arc::new(bytes)))
+        }
+        Err(e) => {
+            tracing::warn!(path = %abs.display(), error = %e, "asset decode (image) failed");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
