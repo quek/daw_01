@@ -1,6 +1,7 @@
 mod builtin;
 mod clap_host;
 mod clap_plugin;
+mod editor_window;
 mod plugin_instance;
 mod process_server;
 mod vst3_events;
@@ -41,12 +42,6 @@ const WM_COMMAND_WAKE: u32 = WM_APP + 1;
 #[derive(Debug, Clone)]
 pub enum PluginEvent {
     SlotGuiOpened {
-        track: u32,
-        slot: PluginSlot,
-        width: u32,
-        height: u32,
-    },
-    SlotGuiRequestResize {
         track: u32,
         slot: PluginSlot,
         width: u32,
@@ -138,9 +133,6 @@ impl From<PluginEvent> for ChildToMain {
         match e {
             PluginEvent::SlotGuiOpened { track, slot, width, height } => {
                 ChildToMain::SlotGuiOpened { track, slot, width, height }
-            }
-            PluginEvent::SlotGuiRequestResize { track, slot, width, height } => {
-                ChildToMain::SlotGuiRequestResize { track, slot, width, height }
             }
             PluginEvent::SlotGuiClosed { track, slot } => {
                 ChildToMain::SlotGuiClosed { track, slot }
@@ -306,6 +298,11 @@ enum PluginCommand {
         from: PluginSlot,
         to: PluginSlot,
     },
+    /// FIXME #29/#31: move the track's instrument to the generator-chain end,
+    /// preserving the live instance + its editor window (see protocol docs).
+    DemoteInstrumentToGenerator {
+        track: u32,
+    },
     RemoveTrack {
         track: u32,
     },
@@ -317,17 +314,11 @@ enum PluginCommand {
     OpenSlotGui {
         track: u32,
         slot: PluginSlot,
-        host_hwnd: u64,
+        title: String,
     },
     CloseSlotGui {
         track: u32,
         slot: PluginSlot,
-    },
-    ResizeSlotGui {
-        track: u32,
-        slot: PluginSlot,
-        width: u32,
-        height: u32,
     },
     /// Stand up the per-buffer plugin process worker pool. Drives
     /// `process_server::WorkerPool::open` on the plugin-main thread so
@@ -594,25 +585,40 @@ fn plugin_main_loop(
     let plugin_registry: PluginRegistry =
         Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
 
+    // FIXME #31: plugin editor windows are now owned by THIS process. Each
+    // open editor has a host-created top-level window (`EditorWindow`) keyed
+    // by (track, slot). Created/destroyed only on this (plugin-main) thread.
+    let mut editor_windows: HashMap<(u32, PluginSlot), editor_window::EditorWindow> =
+        HashMap::new();
+    // Plugin-initiated GUI resize requests (CLAP `request_resize` / VST3
+    // `IPlugFrame::resizeView`). The host callback runs on this thread and
+    // pushes here; the loop drains it to resize the owning `EditorWindow` and
+    // call the plugin's `onSize`/`set_size`. Using a tokio unbounded sender
+    // keeps the `Send + Sync` bound the `HostCallbacks` closures require
+    // (std `mpsc::Sender` is `!Sync`).
+    let (gui_resize_tx, mut gui_resize_rx) =
+        tmpsc::unbounded_channel::<(u32, PluginSlot, u32, u32)>();
+    // Plugin-initiated GUI close (CLAP `clap_host_gui.closed` / lost gui
+    // connection). The host callback queues (track, slot); the loop drains it
+    // and runs the full teardown (gui_destroy + DestroyWindow + notify). For
+    // embedded GUIs this is rare (we own the window), but routing it through
+    // the loop keeps the editor-window map and daw_gui's open set consistent.
+    let (gui_close_tx, mut gui_close_rx) = tmpsc::unbounded_channel::<(u32, PluginSlot)>();
+
     // Per-(track, slot) host callbacks: each loaded plugin captures its
     // (track, slot) so the async CLAP callback (request_resize / closed)
     // can stamp the event with the correct address before reaching daw_gui.
     let make_callbacks = |track: u32, slot: PluginSlot| HostCallbacks {
         on_request_resize: {
-            let tx = evt_tx.clone();
+            let tx = gui_resize_tx.clone();
             Arc::new(move |w, h| {
-                let _ = tx.send(PluginEvent::SlotGuiRequestResize {
-                    track,
-                    slot,
-                    width: w,
-                    height: h,
-                });
+                let _ = tx.send((track, slot, w, h));
             })
         },
         on_closed: {
-            let tx = evt_tx.clone();
+            let tx = gui_close_tx.clone();
             Arc::new(move || {
-                let _ = tx.send(PluginEvent::SlotGuiClosed { track, slot });
+                let _ = tx.send((track, slot));
             })
         },
         // VST3 param gesture (IComponentHandler::beginEdit/performEdit/endEdit)。
@@ -861,6 +867,14 @@ fn plugin_main_loop(
                         teardown_plugin(old);
                     }
                     if let Some(pid) = old_pid {
+                        // FIXME #31: 旧 plugin の editor window が開いていたら、
+                        // teardown (gui_destroy) の後に container を破棄する。
+                        // stable plugin id で照合 (slot ずれ耐性) + SlotGuiClosed 通知。
+                        destroy_editor_windows_where(
+                            &mut editor_windows,
+                            &evt_tx,
+                            |_, w| w.plugin_id() == pid,
+                        );
                         plugin_lookup.remove(&(track, slot));
                         plugin_shmems.remove(&pid);
                     }
@@ -1049,6 +1063,18 @@ fn plugin_main_loop(
                     }
 
                     if let Some(pid) = removed_pid {
+                        // FIXME #31: destroy this plugin's editor window (if
+                        // open) after gui_destroy. Match by STABLE plugin id,
+                        // not by (track, slot): the plugin's slot may have
+                        // shifted while the editor was open (demotion or a
+                        // lower-slot removal), so a slot-keyed remove would
+                        // orphan the window. The helper also emits
+                        // SlotGuiClosed so daw_gui clears its open-GUI set.
+                        destroy_editor_windows_where(
+                            &mut editor_windows,
+                            &evt_tx,
+                            |_, w| w.plugin_id() == pid,
+                        );
                         plugin_lookup.remove(&(track, slot));
                         plugin_shmems.remove(&pid);
                         loaded_id_for_slot.remove(&(track, slot));
@@ -1097,22 +1123,31 @@ fn plugin_main_loop(
                         };
                         // (1) 影響 range の旧 bookkeeping を snapshot してから
                         //     一旦剥がす (新旧 slot の衝突を避けるため)。
-                        // (slot, plugin_id, loaded_id, loaded_meta(id, name))
-                        type SlotBookkeeping =
-                            (PluginSlot, u32, Option<String>, Option<(String, String)>);
+                        // FIXME #31: 開いている editor window も (track, slot)
+                        // keyed なので一緒に再キーする (= reorder 中に GUI を
+                        // 開いたままでも close/resize の逆引きが壊れない)。
+                        // (slot, plugin_id, loaded_id, loaded_meta(id, name), editor_window)
+                        type SlotBookkeeping = (
+                            PluginSlot,
+                            u32,
+                            Option<String>,
+                            Option<(String, String)>,
+                            Option<editor_window::EditorWindow>,
+                        );
                         let mut remapped: Vec<SlotBookkeeping> = Vec::new();
                         for old in lo..=hi {
                             let old_slot = make_slot(old);
                             if let Some(&pid) = plugin_lookup.get(&(track, old_slot)) {
                                 let lid = loaded_id_for_slot.remove(&(track, old_slot));
                                 let meta = loaded_meta_for_slot.remove(&(track, old_slot));
+                                let win = editor_windows.remove(&(track, old_slot));
                                 plugin_lookup.remove(&(track, old_slot));
                                 let new_slot = make_slot(new_index(old));
-                                remapped.push((new_slot, pid, lid, meta));
+                                remapped.push((new_slot, pid, lid, meta, win));
                             }
                         }
                         // (2) 新 slot で貼り直し + registry entry の slot を補正。
-                        for (new_slot, pid, lid, meta) in remapped {
+                        for (new_slot, pid, lid, meta, win) in remapped {
                             plugin_lookup.insert((track, new_slot), pid);
                             if let Some(lid) = lid {
                                 loaded_id_for_slot.insert((track, new_slot), lid);
@@ -1120,8 +1155,76 @@ fn plugin_main_loop(
                             if let Some(meta) = meta {
                                 loaded_meta_for_slot.insert((track, new_slot), meta);
                             }
+                            if let Some(win) = win {
+                                editor_windows.insert((track, new_slot), win);
+                            }
                             republish_entry_slot(&plugin_registry, pid, track, new_slot);
                         }
+                    }
+                }
+                PluginCommand::DemoteInstrumentToGenerator { track } => {
+                    // FIXME #29/#31: move the LIVE instrument plugin to the end
+                    // of the MIDI-FX (generator) chain. The `Box<dyn ...>` (and
+                    // thus the plugin instance the worker pool's `PluginPtr`
+                    // points at) keeps its heap address across the move, so
+                    // there is no re-instantiation, no audio glitch, and — by
+                    // re-keying `editor_windows` — the open editor window
+                    // survives at the same HWND (same on-screen position).
+                    let mut new_idx: Option<usize> = None;
+                    tracks.mutate(|t| {
+                        if let Some(chain) = t.chains.get_mut(&track)
+                            && let Some(plugin) = chain.instrument.take()
+                        {
+                            new_idx = Some(chain.midi_fx_chain.len());
+                            chain.midi_fx_chain.push(plugin);
+                        }
+                    });
+                    if let Some(idx) = new_idx {
+                        let old_slot = PluginSlot::Instrument;
+                        let new_slot = PluginSlot::MidiFx(idx as u32);
+                        // Re-key every (track, slot) book so close / resize /
+                        // remove / param-stamping all follow to the new slot.
+                        if let Some(pid) = plugin_lookup.remove(&(track, old_slot)) {
+                            plugin_lookup.insert((track, new_slot), pid);
+                            republish_entry_slot(&plugin_registry, pid, track, new_slot);
+                        }
+                        if let Some(v) = loaded_id_for_slot.remove(&(track, old_slot)) {
+                            loaded_id_for_slot.insert((track, new_slot), v);
+                        }
+                        if let Some(v) = loaded_meta_for_slot.remove(&(track, old_slot)) {
+                            loaded_meta_for_slot.insert((track, new_slot), v);
+                        }
+                        // The editor window FOLLOWS — same HWND, no flicker.
+                        if let Some(win) = editor_windows.remove(&(track, old_slot)) {
+                            editor_windows.insert((track, new_slot), win);
+                        }
+                        // FIXME #31: re-emit SlotPluginLoaded at the new slot so
+                        // daw_gui re-issues OpenPluginShmem to the AUDIO engine,
+                        // mapping the moved plugin_id to its new generator slot.
+                        // The instance kept its id (no reload), so without this
+                        // the audio engine keeps treating it as the instrument
+                        // and the real new instrument gets no notes (= the
+                        // demoted source's MIDI never reaches it).
+                        if let (Some(&pid), Some((id, name))) = (
+                            plugin_lookup.get(&(track, new_slot)),
+                            loaded_meta_for_slot.get(&(track, new_slot)),
+                        ) {
+                            let shmem_id = format!("daw_01_pd_{plugin_host_pid}_{pid}");
+                            let _ = evt_tx.send(PluginEvent::SlotPluginLoaded {
+                                track,
+                                slot: new_slot,
+                                id: id.clone(),
+                                name: name.clone(),
+                                plugin_id: pid,
+                                shmem_id,
+                                state_load_error: None,
+                            });
+                        }
+                        tracing::info!(
+                            track,
+                            new_slot = idx,
+                            "demoted instrument to generator (live move)"
+                        );
                     }
                 }
                 PluginCommand::RemoveTrack { track } => {
@@ -1174,6 +1277,13 @@ fn plugin_main_loop(
                     plugin_lookup.retain(|&(t, _), _| t != track);
                     loaded_id_for_slot.retain(|&(t, _), _| t != track);
                     loaded_meta_for_slot.retain(|&(t, _), _| t != track);
+                    // FIXME #31: destroy this track's editor windows after the
+                    // plugins' gui_destroy above, and notify daw_gui for each.
+                    destroy_editor_windows_where(
+                        &mut editor_windows,
+                        &evt_tx,
+                        |&(t, _), _| t == track,
+                    );
                     for pid in removed_pids {
                         plugin_shmems.remove(&pid);
                         // registry は (2) で既に None 化済み。
@@ -1197,8 +1307,19 @@ fn plugin_main_loop(
                     let entries = collect_all_states(&mut tracks);
                     let _ = evt_tx.send(PluginEvent::AllPluginStates { entries });
                 }
-                PluginCommand::OpenSlotGui { track, slot, host_hwnd } => {
-                    match open_gui(&mut tracks, track, slot, host_hwnd) {
+                PluginCommand::OpenSlotGui { track, slot, title } => {
+                    // Stable id so plugin removal can match this editor even
+                    // after the plugin's slot shifts (demotion / lower-slot
+                    // removal) while the editor is open.
+                    let plugin_id = plugin_lookup.get(&(track, slot)).copied().unwrap_or(0);
+                    match open_gui(
+                        &mut tracks,
+                        &mut editor_windows,
+                        track,
+                        slot,
+                        plugin_id,
+                        &title,
+                    ) {
                         Ok(Some((w, h))) => {
                             let _ = evt_tx.send(PluginEvent::SlotGuiOpened {
                                 track,
@@ -1212,22 +1333,15 @@ fn plugin_main_loop(
                         }
                         Err(e) => {
                             tracing::error!(error = ?e, track, ?slot, "failed to open GUI");
-                            close_gui(&mut tracks, track, slot);
-                            let _ = evt_tx.send(PluginEvent::SlotGuiClosed { track, slot });
+                            // open_gui cleaned up its own (plugin + window) on
+                            // failure; close_slot_gui is idempotent and also
+                            // emits SlotGuiClosed for daw_gui's open-state set.
+                            close_slot_gui(&mut tracks, &mut editor_windows, track, slot, &evt_tx);
                         }
                     }
                 }
                 PluginCommand::CloseSlotGui { track, slot } => {
-                    close_gui(&mut tracks, track, slot);
-                    let _ = evt_tx.send(PluginEvent::SlotGuiClosed { track, slot });
-                }
-                PluginCommand::ResizeSlotGui {
-                    track,
-                    slot,
-                    width,
-                    height,
-                } => {
-                    resize_gui(&mut tracks, track, slot, width, height);
+                    close_slot_gui(&mut tracks, &mut editor_windows, track, slot, &evt_tx);
                 }
                 PluginCommand::SetBuiltinPluginNoteMetadata {
                     plugin_id,
@@ -1257,6 +1371,35 @@ fn plugin_main_loop(
             }
         }
 
+        // FIXME #31: drain plugin-initiated resize requests. The host
+        // callback (CLAP request_resize / VST3 resizeView) ran on this
+        // thread and queued (track, slot, w, h); resize the owning editor
+        // window then tell the plugin to lay out into the new client size.
+        while let Ok((track, slot, w, h)) = gui_resize_rx.try_recv() {
+            if let Some(win) = editor_windows.get(&(track, slot)) {
+                win.set_client_size(w, h);
+            }
+            resize_gui(&mut tracks, track, slot, w, h);
+        }
+
+        // FIXME #31: handle plugin-initiated closes (CLAP `closed`).
+        while let Ok((track, slot)) = gui_close_rx.try_recv() {
+            close_slot_gui(&mut tracks, &mut editor_windows, track, slot, &evt_tx);
+        }
+
+        // FIXME #31: handle editor windows the user closed via the window's
+        // ✕ (WNDPROC flipped the close flag). Tear the GUI down in the
+        // spec-correct order (plugin.gui_destroy → DestroyWindow) and notify
+        // daw_gui so it clears its open-GUI state.
+        let to_close: Vec<(u32, PluginSlot)> = editor_windows
+            .iter()
+            .filter(|(_, win)| win.take_close_request())
+            .map(|(&key, _)| key)
+            .collect();
+        for (track, slot) in to_close {
+            close_slot_gui(&mut tracks, &mut editor_windows, track, slot, &evt_tx);
+        }
+
         unsafe {
             let mut msg = MSG::default();
             let ret = GetMessageW(&mut msg, Some(HWND(std::ptr::null_mut())), 0, 0);
@@ -1275,7 +1418,12 @@ fn plugin_main_loop(
     if let Some(pool) = worker_pool.take() {
         pool.shutdown();
     }
+    // FIXME #31: tear down plugins first (`tracks.shutdown()` calls
+    // `gui_destroy` = view.removed() on each plugin), THEN destroy the
+    // editor windows. Reversing the order would DestroyWindow a container
+    // whose plugin child is still attached.
     tracks.shutdown();
+    drop(editor_windows);
     tracing::info!("plugin-main thread exiting (WM_QUIT)");
 }
 
@@ -1483,11 +1631,18 @@ fn collect_all_states(handle: &mut TracksHandle) -> Vec<SlotState> {
     out
 }
 
+/// FIXME #31: open the plugin editor inside a top-level window THIS process
+/// owns (created on the plugin-main thread). On success the `EditorWindow` is
+/// stored in `editor_windows` keyed by (track, slot). On any failure the
+/// plugin GUI and the (local) window are torn down before returning, so the
+/// caller never sees a half-open editor.
 fn open_gui(
     handle: &mut TracksHandle,
+    editor_windows: &mut HashMap<(u32, PluginSlot), editor_window::EditorWindow>,
     track: u32,
     slot: PluginSlot,
-    host_hwnd: u64,
+    plugin_id: u32,
+    title: &str,
 ) -> Result<Option<(u32, u32)>> {
     let Some(plugin) = handle.plugin_at_mut(track, slot) else {
         return Ok(None);
@@ -1512,7 +1667,14 @@ fn open_gui(
     }
 
     let resizable = plugin.gui_can_resize();
-    let size = plugin.gui_get_size().unwrap_or((800, 600));
+    // Default to a sane size when the pre-attach query is missing or 0×0
+    // (some VST3 editors only know their size after `attached`). Attaching
+    // into a real-sized window avoids plugins that misbehave when parented
+    // into a ~1px container; the post-attach re-query below fixes the size.
+    let size = plugin
+        .gui_get_size()
+        .filter(|&(w, h)| w > 0 && h > 0)
+        .unwrap_or((800, 600));
     tracing::info!(
         plugin = %plugin.name(),
         resizable,
@@ -1521,26 +1683,74 @@ fn open_gui(
         "plugin gui initial size"
     );
 
-    plugin.gui_set_parent_hwnd(host_hwnd)?;
+    // Create the host-owned, ownerless top-level container in THIS process.
+    let editor = match editor_window::EditorWindow::create(plugin_id, size.0, size.1, title) {
+        Ok(w) => w,
+        Err(e) => {
+            plugin.gui_destroy();
+            return Err(anyhow::anyhow!("create editor window: {e}"));
+        }
+    };
+
+    if let Err(e) = plugin.gui_set_parent_hwnd(editor.hwnd_u64()) {
+        // `editor` drops here → DestroyWindow. Attach failed so the plugin's
+        // gui_attached flag is false and gui_destroy's removed() is skipped.
+        plugin.gui_destroy();
+        drop(editor);
+        return Err(e);
+    }
 
     // Some plugins post themselves an internal "finish init" message from
     // inside set_parent. Drain whatever the plugin queued before calling
     // show so it can complete initialization on the current thread.
     pump_pending_messages();
 
-    let shown = plugin.gui_show()?;
-    if !shown {
-        // VCV Rack 2 returns false here even though its GUI is actually
-        // visible in our container. Since create + set_parent succeeded,
-        // keep the GUI alive and just log — tearing down on a false return
-        // from `show` destroys a working editor for these plugins.
-        tracing::warn!(
-            plugin = %plugin.name(),
-            "gui.show returned false; keeping GUI alive (plugin may have already shown itself)"
-        );
+    match plugin.gui_show() {
+        Ok(true) => {}
+        Ok(false) => {
+            // VCV Rack 2 returns false here even though its GUI is actually
+            // visible in our container. Since create + set_parent succeeded,
+            // keep the GUI alive and just log — tearing down on a false return
+            // from `show` destroys a working editor for these plugins.
+            tracing::warn!(
+                plugin = %plugin.name(),
+                "gui.show returned false; keeping GUI alive (plugin may have already shown itself)"
+            );
+        }
+        Err(e) => {
+            plugin.gui_destroy();
+            drop(editor);
+            return Err(e);
+        }
     }
-    tracing::info!(plugin = %plugin.name(), width = size.0, height = size.1, "plugin gui opened");
-    Ok(Some(size))
+
+    // FIXME #31: re-query the size AFTER attach/show. Some VST3 editors
+    // (e.g. Arturia Analog Lab) report 0×0 (or a placeholder) from `getSize`
+    // BEFORE the view is attached, and only return the real editor size once
+    // attached to a parent. If we sized the container from the pre-attach
+    // value we'd get a ~1px window that looks like "the editor won't open".
+    // Fall back to the pre-attach size only if the post-attach query is
+    // missing or non-positive.
+    let final_size = plugin
+        .gui_get_size()
+        .filter(|&(w, h)| w > 0 && h > 0)
+        .unwrap_or(size);
+
+    // Size the container's client area to the editor, then bring it to the
+    // front. daw_gui grants foreground rights (AllowSetForegroundWindow)
+    // before sending the open request, so this SetForegroundWindow is honored
+    // and the editor doesn't open hidden behind the main DAW window.
+    editor.set_client_size(final_size.0, final_size.1);
+    editor.set_foreground();
+    editor_windows.insert((track, slot), editor);
+
+    tracing::info!(
+        plugin = %plugin.name(),
+        width = final_size.0,
+        height = final_size.1,
+        "plugin gui opened"
+    );
+    Ok(Some(final_size))
 }
 
 /// Non-blocking drain of pending Win32 messages on the current thread. Used
@@ -1559,12 +1769,52 @@ fn pump_pending_messages() {
     }
 }
 
-fn close_gui(handle: &mut TracksHandle, track: u32, slot: PluginSlot) {
-    let Some(plugin) = handle.plugin_at_mut(track, slot) else {
-        return;
-    };
-    let _ = plugin.gui_hide();
-    plugin.gui_destroy();
+/// FIXME #31: close the editor for (track, slot): tear the plugin GUI down
+/// (`gui_hide` → `gui_destroy` = view.removed()) BEFORE destroying the
+/// host-owned container window, then notify daw_gui so it clears its
+/// open-GUI state. Idempotent — missing plugin and/or missing window are
+/// each a no-op, so it is safe to call from the WNDPROC close poll, an
+/// explicit `CloseSlotGui`, and the `open_gui` failure path.
+fn close_slot_gui(
+    handle: &mut TracksHandle,
+    editor_windows: &mut HashMap<(u32, PluginSlot), editor_window::EditorWindow>,
+    track: u32,
+    slot: PluginSlot,
+    evt_tx: &tmpsc::UnboundedSender<PluginEvent>,
+) {
+    if let Some(plugin) = handle.plugin_at_mut(track, slot) {
+        let _ = plugin.gui_hide();
+        plugin.gui_destroy();
+    }
+    // Drop = DestroyWindow, run after gui_destroy detached the plugin child.
+    editor_windows.remove(&(track, slot));
+    let _ = evt_tx.send(PluginEvent::SlotGuiClosed { track, slot });
+}
+
+/// FIXME #31: destroy every editor window matching `pred` (used on plugin
+/// removal, matched by STABLE `plugin_id` so a window isn't orphaned when the
+/// plugin's slot shifted while open) and notify daw_gui with each window's
+/// (track, slot) key so it clears its open-GUI state. The plugin's own
+/// `gui_destroy` is the caller's responsibility (it happens in
+/// `teardown_plugin` before this runs); here we only drop the container
+/// window (= `DestroyWindow`) and emit `SlotGuiClosed`.
+fn destroy_editor_windows_where(
+    editor_windows: &mut HashMap<(u32, PluginSlot), editor_window::EditorWindow>,
+    evt_tx: &tmpsc::UnboundedSender<PluginEvent>,
+    mut pred: impl FnMut(&(u32, PluginSlot), &editor_window::EditorWindow) -> bool,
+) {
+    let keys: Vec<(u32, PluginSlot)> = editor_windows
+        .iter()
+        .filter(|(k, w)| pred(k, w))
+        .map(|(&k, _)| k)
+        .collect();
+    for key in keys {
+        editor_windows.remove(&key); // Drop = DestroyWindow
+        let _ = evt_tx.send(PluginEvent::SlotGuiClosed {
+            track: key.0,
+            slot: key.1,
+        });
+    }
 }
 
 fn resize_gui(
@@ -1648,6 +1898,10 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             tracing::info!(track, ?from, ?to, "received MoveSlot");
             plugin.send(PluginCommand::MoveSlot { track, from, to });
         }
+        MainToChild::DemoteInstrumentToGenerator { track } => {
+            tracing::info!(track, "received DemoteInstrumentToGenerator");
+            plugin.send(PluginCommand::DemoteInstrumentToGenerator { track });
+        }
         MainToChild::RemoveTrack { track } => {
             tracing::info!(track, "received RemoveTrack");
             plugin.send(PluginCommand::RemoveTrack { track });
@@ -1663,28 +1917,14 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
         MainToChild::OpenSlotGuiEmbedded {
             track,
             slot,
-            host_hwnd,
+            title,
         } => {
-            tracing::info!(track, ?slot, host_hwnd, "received OpenSlotGuiEmbedded");
-            plugin.send(PluginCommand::OpenSlotGui { track, slot, host_hwnd });
+            tracing::info!(track, ?slot, %title, "received OpenSlotGuiEmbedded");
+            plugin.send(PluginCommand::OpenSlotGui { track, slot, title });
         }
         MainToChild::CloseSlotGui { track, slot } => {
             tracing::info!(track, ?slot, "received CloseSlotGui");
             plugin.send(PluginCommand::CloseSlotGui { track, slot });
-        }
-        MainToChild::ResizeSlotGui {
-            track,
-            slot,
-            width,
-            height,
-        } => {
-            tracing::info!(track, ?slot, width, height, "received ResizeSlotGui");
-            plugin.send(PluginCommand::ResizeSlotGui {
-                track,
-                slot,
-                width,
-                height,
-            });
         }
         MainToChild::OpenWorkerPool {
             n_workers,

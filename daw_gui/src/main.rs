@@ -278,9 +278,6 @@ fn spawn_incoming_bridge(
                 ChildToMain::SlotGuiOpened { track, slot, width, height } => Some(
                     AppEvent::GuiOpenedFromChild { track, slot, width, height },
                 ),
-                ChildToMain::SlotGuiRequestResize { track, slot, width, height } => Some(
-                    AppEvent::GuiRequestResizeFromChild { track, slot, width, height },
-                ),
                 ChildToMain::SlotGuiClosed { track, slot } => {
                     Some(AppEvent::GuiClosedFromChild { track, slot })
                 }

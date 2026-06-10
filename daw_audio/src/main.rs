@@ -486,12 +486,12 @@ async fn recv_loop(
             | Ok(MainToChild::SetSlotPlugin { .. })
             | Ok(MainToChild::RemoveSlotPlugin { .. })
             | Ok(MainToChild::MoveSlot { .. })
+            | Ok(MainToChild::DemoteInstrumentToGenerator { .. })
             | Ok(MainToChild::RemoveTrack { .. })
             | Ok(MainToChild::RequestSlotState { .. })
             | Ok(MainToChild::RequestAllStates)
             | Ok(MainToChild::OpenSlotGuiEmbedded { .. })
             | Ok(MainToChild::CloseSlotGui { .. })
-            | Ok(MainToChild::ResizeSlotGui { .. })
             | Ok(MainToChild::SetRenderMode(_))
             | Ok(MainToChild::SetBuiltinPluginNoteMetadata { .. })
             | Ok(MainToChild::CloseWorkerPool) => {}

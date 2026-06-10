@@ -467,7 +467,16 @@ impl LocalState {
                         (**self.shared.plugin_refs.load()).clone();
                     let mut new_slot: HashMap<(u32, PluginSlot), u32> =
                         (**self.shared.slot_to_plugin_id.load()).clone();
-                    if let Some(stale) = new_slot.insert((track, slot), plugin_id) {
+                    if let Some(stale) = new_slot.insert((track, slot), plugin_id)
+                        && stale != plugin_id
+                        // FIXME #31: only drop the displaced plugin from
+                        // plugin_refs if it isn't still mapped at ANOTHER slot.
+                        // On a dual-role demotion the instrument plugin MOVES to
+                        // a generator slot (its OpenPluginShmem at the new slot
+                        // arrives first); the new instrument then displaces it
+                        // here, but it must keep being processed at its new slot.
+                        && !new_slot.values().any(|&pid| pid == stale)
+                    {
                         new_refs.remove(&stale);
                     }
                     new_refs.insert(plugin_id, plugin_ref);

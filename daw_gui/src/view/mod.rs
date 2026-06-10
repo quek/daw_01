@@ -1,8 +1,5 @@
 // gui_01 (daw-ui) ベースの view モジュール群。
 
-#[cfg(windows)]
-pub mod plugin_embed;
-
 pub mod arrangement_view;
 pub mod audio_editor;
 pub mod bottom_panel;

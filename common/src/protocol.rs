@@ -123,13 +123,6 @@ pub enum ChildToMain {
         width: u32,
         height: u32,
     },
-    /// Plugin-initiated resize via `clap_host_gui.request_resize`.
-    SlotGuiRequestResize {
-        track: u32,
-        slot: PluginSlot,
-        width: u32,
-        height: u32,
-    },
     /// Plugin-initiated close (X button handled by plugin, or `closed`).
     SlotGuiClosed {
         track: u32,
@@ -469,6 +462,14 @@ pub enum MainToChild {
         from: PluginSlot,
         to: PluginSlot,
     },
+    /// FIXME #29/#31: demote the track's dual-role instrument to the END of
+    /// its MIDI-FX (generator) chain, preserving the LIVE plugin instance
+    /// (and its open editor window) instead of destroying + re-instantiating
+    /// it. Sent when a new instrument is inserted over a dual-role source.
+    /// The plugin host moves `chain.instrument → chain.midi_fx_chain.push`
+    /// and re-keys its `(track, slot)` bookkeeping (so the editor window
+    /// follows to the new slot). No-op if the track has no instrument.
+    DemoteInstrumentToGenerator { track: u32 },
     /// Drop the entire chain for `track` (every MIDI FX / Instrument / FX
     /// slot), tearing down each plugin's GUI first. `track` is a stable
     /// `Track::id` (since PR2.1 the plugin host's chain map is keyed by
@@ -486,20 +487,21 @@ pub enum MainToChild {
     /// loaded plugin. Used for project save.
     RequestAllStates,
     // --- GUI management ----------------------------------------------
+    /// Open the plugin editor. FIXME #31: the editor's top-level window is
+    /// now created and owned by the plugin-host process (on its plugin-main
+    /// thread), NOT by daw_gui. That makes the editor's `GA_ROOTOWNER`
+    /// resolve into the plugin-host process so JUCE's
+    /// `Process::isForegroundProcess()` becomes true when the editor is
+    /// focused — which is what lets cascade sub-menus stay open. `title`
+    /// is the window caption daw_gui composed (track / slot context).
     OpenSlotGuiEmbedded {
         track: u32,
         slot: PluginSlot,
-        host_hwnd: u64,
+        title: String,
     },
     CloseSlotGui {
         track: u32,
         slot: PluginSlot,
-    },
-    ResizeSlotGui {
-        track: u32,
-        slot: PluginSlot,
-        width: u32,
-        height: u32,
     },
     // --- A2 audio engine refactor -------------------------------------
     /// Stand up the per-buffer plugin process worker pool. `n_workers`

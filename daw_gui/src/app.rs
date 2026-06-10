@@ -1260,9 +1260,12 @@ pub struct AppData {
     /// 配置。 path / source_track / source_clip は IPC echo back と
     /// pending entry を identifier 照合するために保持。
     pub pending_clip_fx_bounce: Option<PendingClipFxBounce>,
-    #[cfg(windows)]
-    pub plugin_host_windows:
-        HashMap<(u32, PluginSlot), crate::view::plugin_embed::PluginHostWindow>,
+    /// FIXME #31: which (track, slot) plugin editors are currently open. The
+    /// editor *windows* are now created and owned by the plugin-host process
+    /// (so JUCE cascade sub-menus work); daw_gui only tracks open/closed
+    /// state here for toggle / dedup / cleanup. Not `#[cfg(windows)]` because
+    /// it's a plain id set — the window FFI lives in the plugin-host process.
+    pub open_plugin_guis: std::collections::HashSet<(u32, PluginSlot)>,
 
     // -------- Mixer --------
     pub track_peak_display: Vec<(f32, f32)>,
@@ -1668,8 +1671,7 @@ impl AppData {
             audio_tx: Some(audio_tx),
             plugin_tx: Some(plugin_tx),
             pending_clip_fx_bounce: None,
-            #[cfg(windows)]
-            plugin_host_windows: HashMap::new(),
+            open_plugin_guis: std::collections::HashSet::new(),
             track_peak_display: initial_peak_display,
             pending_plugin_loads: std::collections::HashSet::new(),
             pending_added_plugin_finalize: std::collections::HashSet::new(),
@@ -3747,7 +3749,6 @@ pub enum AppEvent {
     // -------- IPC events from plugin_host ---------------------------------
     Tick { samples: u64, peak_l: f32, peak_r: f32, preroll: u64 },
     GuiOpenedFromChild { track: u32, slot: PluginSlot, width: u32, height: u32 },
-    GuiRequestResizeFromChild { track: u32, slot: PluginSlot, width: u32, height: u32 },
     GuiClosedFromChild { track: u32, slot: PluginSlot },
     SlotPluginLoadedFromChild {
         track: u32,
@@ -5092,9 +5093,6 @@ impl AppData {
             AppEvent::GuiOpenedFromChild { track, slot, width, height } => {
                 self.on_gui_opened(track, slot, width, height);
             }
-            AppEvent::GuiRequestResizeFromChild { track, slot, width, height } => {
-                self.on_gui_request_resize(track, slot, width, height);
-            }
             AppEvent::GuiClosedFromChild { track, slot } => {
                 self.on_gui_closed(track, slot);
             }
@@ -6273,10 +6271,7 @@ impl AppData {
             // cache も掃除。
             self.pending_plugin_loads.retain(|(t, _)| *t != track_id);
             self.loaded_slots.retain(|(t, _), _| *t != track_id);
-            #[cfg(windows)]
-            {
-                self.plugin_host_windows.retain(|&(t, _), _| t != track_id);
-            }
+            self.open_plugin_guis.retain(|&(t, _)| t != track_id);
         }
 
         // Phase B: 各 track の slot 列を diff。 純粋関数で action 列を
@@ -6295,11 +6290,13 @@ impl AppData {
             match action {
                 SlotReconcileAction::RemoveSlot { track_id, slot } => {
                     tracing::info!(track_id, ?slot, "reconcile: removing extra host slot");
+                    // FIXME #31: close the editor before removing (see
+                    // remove_slot_inner for the ordering rationale).
+                    self.cleanup_slot_gui(track_id, slot);
                     self.send_plugin(MainToChild::RemoveSlotPlugin {
                         track: track_id,
                         slot,
                     });
-                    self.cleanup_slot_gui(track_id, slot);
                     self.loaded_slots.remove(&(track_id, slot));
                     self.pending_plugin_loads.remove(&(track_id, slot));
                 }
@@ -7029,7 +7026,7 @@ impl AppData {
             let snapshot = self.song.tracks[i as usize].clone();
             #[cfg(windows)]
             {
-                self.plugin_host_windows.retain(|&(t, _), _| t != removed_id);
+                self.open_plugin_guis.retain(|&(t, _)| t != removed_id);
             }
             // slot cache からも削除する track 由来の entry を外す。
             // SlotPluginUnloaded event の到着待ち race を狭めて、
@@ -9733,8 +9730,7 @@ impl AppData {
             if let Some(pos) = self.song.tracks.iter().position(|t| t.id == *group_id) {
                 #[cfg(windows)]
                 {
-                    self.plugin_host_windows
-                        .retain(|&(t, _), _| t != *group_id);
+                    self.open_plugin_guis.retain(|&(t, _)| t != *group_id);
                 }
                 self.loaded_slots.retain(|(t, _), _| *t != *group_id);
                 self.song.tracks.remove(pos);
@@ -9841,8 +9837,7 @@ impl AppData {
         );
         #[cfg(windows)]
         {
-            self.plugin_host_windows
-                .retain(|&(t, _), _| t != removed_id);
+            self.open_plugin_guis.retain(|&(t, _)| t != removed_id);
         }
         self.send_plugin(MainToChild::RemoveTrack { track: removed_id });
         // selected_track_ids は id ベース。 削除対象 track id を除外
@@ -13288,52 +13283,19 @@ impl AppData {
 
     // -------- Plugin GUI bridge --------------------------------------------
 
-    #[cfg(windows)]
-    fn on_gui_opened(&mut self, track: u32, slot: PluginSlot, width: u32, height: u32) {
-        if let Some(win) = self.plugin_host_windows.get(&(track, slot)) {
-            win.set_client_size(width, height);
-        }
+    fn on_gui_opened(&mut self, _track: u32, _slot: PluginSlot, _width: u32, _height: u32) {
+        // FIXME #31: the editor window is created, sized, and owned by the
+        // plugin-host process. daw_gui only records open state (done in
+        // `open_slot_gui` when the request is sent), so there's nothing to do
+        // on the opened confirmation. Plugin-initiated resize is likewise
+        // handled entirely in the plugin-host process now.
     }
 
-    #[cfg(not(windows))]
-    fn on_gui_opened(&mut self, _track: u32, _slot: PluginSlot, _width: u32, _height: u32) {}
-
-    #[cfg(windows)]
-    fn on_gui_request_resize(
-        &mut self,
-        track: u32,
-        slot: PluginSlot,
-        width: u32,
-        height: u32,
-    ) {
-        if let Some(win) = self.plugin_host_windows.get(&(track, slot)) {
-            win.set_client_size(width, height);
-        }
-        self.send_plugin(MainToChild::ResizeSlotGui {
-            track,
-            slot,
-            width,
-            height,
-        });
-    }
-
-    #[cfg(not(windows))]
-    fn on_gui_request_resize(
-        &mut self,
-        _track: u32,
-        _slot: PluginSlot,
-        _width: u32,
-        _height: u32,
-    ) {
-    }
-
-    #[cfg(windows)]
     fn on_gui_closed(&mut self, track: u32, slot: PluginSlot) {
-        self.plugin_host_windows.remove(&(track, slot));
+        // The plugin-host process tore the editor window down (user clicked
+        // the window's ✕, or the plugin self-closed). Drop our open-state.
+        self.open_plugin_guis.remove(&(track, slot));
     }
-
-    #[cfg(not(windows))]
-    fn on_gui_closed(&mut self, _track: u32, _slot: PluginSlot) {}
 
     // Args mirror the `SlotPluginLoadedFromChild` AppEvent (= the IPC
     // message's fields); bundling them into a struct would just shuffle the
@@ -13649,19 +13611,19 @@ impl AppData {
             1 => PluginSlot::Instrument,
             _ => PluginSlot::Fx(slot_index),
         };
-        // PR2.1: plugin_host_windows / IPC は track_id ベース。 master 選択時は
+        // PR2.1: open_plugin_guis / IPC は track_id ベース。 master 選択時は
         // cursor_track_id が MASTER_TRACK_ID を返す (Vec に居ないので index 経由
         // 不可)。
         let Some(track_id) = self.cursor_track_id() else {
             return;
         };
         // 既に開いていれば閉じる (toggle)。開いていなければ open_slot_gui で開く。
-        #[cfg(windows)]
-        {
-            if self.plugin_host_windows.contains_key(&(track_id, slot)) {
-                self.send_plugin(MainToChild::CloseSlotGui { track: track_id, slot });
-                return;
-            }
+        // FIXME #31: open 状態は open_plugin_guis (id set) で追跡。実 window は
+        // plugin-host プロセスが所有するので、close は CloseSlotGui を送って
+        // B 側に破棄させ、SlotGuiClosed の受信で set から除去する。
+        if self.open_plugin_guis.contains(&(track_id, slot)) {
+            self.send_plugin(MainToChild::CloseSlotGui { track: track_id, slot });
+            return;
         }
         self.open_slot_gui(track_id, slot);
     }
@@ -13672,7 +13634,7 @@ impl AppData {
     fn open_slot_gui(&mut self, track_id: u32, slot: PluginSlot) {
         #[cfg(windows)]
         {
-            if self.plugin_host_windows.contains_key(&(track_id, slot)) {
+            if self.open_plugin_guis.contains(&(track_id, slot)) {
                 return;
             }
             let label = if track_id == common::model::MASTER_TRACK_ID {
@@ -13693,22 +13655,30 @@ impl AppData {
                     .and_then(|t| self.slot_ref_name(t, slot))
                     .unwrap_or_else(|| "(unknown)".into())
             };
-            match crate::view::plugin_embed::PluginHostWindow::create(
-                800,
-                600,
-                &format!("Plugin — {}", label),
-            ) {
-                Ok(win) => {
-                    let hwnd = win.hwnd_u64();
-                    self.plugin_host_windows.insert((track_id, slot), win);
-                    self.send_plugin(MainToChild::OpenSlotGuiEmbedded {
-                        track: track_id,
-                        slot,
-                        host_hwnd: hwnd,
-                    });
-                }
-                Err(e) => tracing::error!(error = ?e, ?slot, "failed to create container"),
+            // FIXME #31: the editor's top-level window is created by the
+            // plugin-host process (so JUCE cascade sub-menus work). daw_gui
+            // only records open state and passes the window title.
+            //
+            // We are the foreground process at this moment (the user just
+            // clicked in our UI), so grant the plugin-host process the right
+            // to foreground its editor window. Without this, Windows' focus-
+            // steal protection refuses the plugin-host's SetForegroundWindow
+            // and the editor opens hidden behind the main DAW window — and a
+            // plugin that reports its size only post-attach (e.g. Analog Lab)
+            // looks like it "won't open". The grant is consumed by the
+            // plugin-host's next SetForegroundWindow.
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    ASFW_ANY, AllowSetForegroundWindow,
+                };
+                let _ = AllowSetForegroundWindow(ASFW_ANY);
             }
+            self.open_plugin_guis.insert((track_id, slot));
+            self.send_plugin(MainToChild::OpenSlotGuiEmbedded {
+                track: track_id,
+                slot,
+                title: format!("Plugin — {label}"),
+            });
         }
         #[cfg(not(windows))]
         {
@@ -13917,11 +13887,13 @@ impl AppData {
         // host への RemoveSlotPlugin + GUI cleanup + slot cache 削除は track と
         // 共通 idiom。 master は Fx slot のみ。
         if track_id == common::model::MASTER_TRACK_ID {
+            // FIXME #31: close the editor before removing the plugin (see the
+            // non-master path below for why order matters).
+            self.cleanup_slot_gui(track_id, slot);
             self.send_plugin(MainToChild::RemoveSlotPlugin {
                 track: track_id,
                 slot,
             });
-            self.cleanup_slot_gui(track_id, slot);
             self.loaded_slots.remove(&(track_id, slot));
             if let PluginSlot::Fx(i) = slot {
                 let i = i as usize;
@@ -13934,18 +13906,19 @@ impl AppData {
         let Some(track_idx) = self.song.track_index_by_id(track_id) else {
             return;
         };
+        // **GUI lifecycle** (FIXME #31): close the editor BEFORE removing the
+        // plugin. cleanup_slot_gui sends CloseSlotGui so the plugin-host tears
+        // the editor window down while the plugin is still at this slot —
+        // after RemoveSlotPlugin the chain shifts (Vec::remove), so a
+        // post-remove close would target a shifted neighbor. RemoveSlotPlugin
+        // also closes the editor by stable plugin id as a backstop, and shifts
+        // the remaining open-state keys to match the new chain indices.
+        self.cleanup_slot_gui(track_id, slot);
         // PR2.1: send `Track::id` to the plugin host.
         self.send_plugin(MainToChild::RemoveSlotPlugin {
             track: track_id,
             slot,
         });
-        // **GUI lifecycle**: plugin_host が plugin を destroy しても、
-        // daw_gui 側の host HWND (`plugin_host_windows` の値) は自動で
-        // 閉じない。 ここで drop することで `PluginHostWindow::Drop` が
-        // `DestroyWindow` を呼んで容器ウィンドウを閉じる。 さらに
-        // `Fx(slot_index)` を削除すると `Fx(slot_index+1..)` は 1 段
-        // shift するので、 残った GUI window の key も再 mapping する。
-        self.cleanup_slot_gui(track_id, slot);
         // slot cache から該当 entry を即時削除。 SlotPluginUnloaded event
         // 到着前に reconcile が走っても stale entry を見ないようにする
         // 防御策。
@@ -13973,15 +13946,18 @@ impl AppData {
         }
     }
 
-    /// `(track_id, slot)` の host window を破棄し、 同 track の
-    /// 後続 Fx / MidiFx の key を 1 つずつ前にずらす (Vec::remove 後の
+    /// `(track_id, slot)` のプラグイン GUI を閉じ、 同 track の後続
+    /// Fx / MidiFx の open-state key を 1 つずつ前にずらす (Vec::remove 後の
     /// chain index と整合させるため)。 Instrument は単一スロットなので
-    /// shift 不要。 Windows 専用 (Linux では `plugin_host_windows` 自体
-    /// を持たない)。
+    /// shift 不要。 FIXME #31: 実 window は plugin-host プロセス所有なので、
+    /// 破棄は `CloseSlotGui` を送って B 側に行わせる。 RemoveSlotPlugin /
+    /// RemoveTrack も B 側で window を破棄するので二重でも idempotent。
     #[cfg(windows)]
     fn cleanup_slot_gui(&mut self, track_id: u32, slot: PluginSlot) {
-        // 対象スロットの host window を drop (= DestroyWindow)。
-        self.plugin_host_windows.remove(&(track_id, slot));
+        // open 中なら B に閉じてもらう (= DestroyWindow は plugin-host 側)。
+        if self.open_plugin_guis.remove(&(track_id, slot)) {
+            self.send_plugin(MainToChild::CloseSlotGui { track: track_id, slot });
+        }
         match slot {
             PluginSlot::Instrument => {}
             PluginSlot::Fx(removed_idx) => {
@@ -14001,7 +13977,7 @@ impl AppData {
     #[cfg(windows)]
     fn shift_slot_gui_keys(&mut self, track_id: u32, removed_idx: u32, is_fx: bool) {
         let mut moves: Vec<(PluginSlot, PluginSlot)> = Vec::new();
-        for &(t, slot) in self.plugin_host_windows.keys() {
+        for &(t, slot) in self.open_plugin_guis.iter() {
             if t != track_id {
                 continue;
             }
@@ -14021,8 +13997,8 @@ impl AppData {
             PluginSlot::Instrument => 0,
         });
         for (from, to) in moves {
-            if let Some(win) = self.plugin_host_windows.remove(&(track_id, from)) {
-                self.plugin_host_windows.insert((track_id, to), win);
+            if self.open_plugin_guis.remove(&(track_id, from)) {
+                self.open_plugin_guis.insert((track_id, to));
             }
         }
     }
@@ -14174,22 +14150,10 @@ impl AppData {
             let _inserted = self.record_automation_points_for_tick(f64::from(ph));
         }
 
-        // Video export 中は plugin GUI window の閉じる要求も無視する
-        // （`handle_event` を通らない per-frame 経路なので個別に gate）。
-        // export の音声 freewheel 中に CloseSlotGui を送ると plugin host の
-        // offline render と競合しうる。
-        #[cfg(windows)]
-        if self.pending_video_export.is_none() && self.export_progress.is_none() {
-            let mut to_close: Vec<(u32, PluginSlot)> = Vec::new();
-            for (&(track, slot), win) in &self.plugin_host_windows {
-                if win.take_close_request() {
-                    to_close.push((track, slot));
-                }
-            }
-            for (track, slot) in to_close {
-                self.send_plugin(MainToChild::CloseSlotGui { track, slot });
-            }
-        }
+        // FIXME #31: the plugin editor's ✕ is now handled inside the
+        // plugin-host process (its WNDPROC), which tears the GUI down and
+        // sends `SlotGuiClosed` back. daw_gui no longer polls a local
+        // close flag here.
 
         const RELEASE: f32 = 0.85;
         let new_l = common::meter::update_peak(self.peak_l_display, peak_l_raw, RELEASE);
@@ -14594,11 +14558,13 @@ impl AppData {
         new_plugin_id: String,
         new_format: PluginFormat,
     ) {
+        let mut demoted_new_slot: Option<PluginSlot> = None;
         {
             let Some(track) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
                 return;
             };
             if let Some(demoted) = track.instrument.take() {
+                demoted_new_slot = Some(PluginSlot::MidiFx(track.midi_fx_chain.len() as u32));
                 track.midi_fx_chain.push(demoted);
             }
             track.instrument = Some(common::model::PluginInstance::new(
@@ -14614,6 +14580,28 @@ impl AppData {
             } else {
                 InstrumentSource::None
             };
+        }
+        // FIXME #29/#31: demote as a LIVE MOVE in the plugin host — the demoted
+        // instance and its editor window survive (same window, same on-screen
+        // position, no audio re-instantiation glitch) instead of being
+        // destroyed + re-created. Mirror the move in our caches so reconcile
+        // only loads the NEW instrument (not the demoted one) and so the open
+        // editor stays tracked at its new generator slot.
+        if let Some(new_slot) = demoted_new_slot {
+            self.send_plugin(MainToChild::DemoteInstrumentToGenerator { track: track_id });
+            if let Some(info) = self.loaded_slots.remove(&(track_id, PluginSlot::Instrument)) {
+                self.loaded_slots.insert((track_id, new_slot), info);
+            }
+            if self.open_plugin_guis.remove(&(track_id, PluginSlot::Instrument)) {
+                self.open_plugin_guis.insert((track_id, new_slot));
+            }
+            // Move the cached param list too (keyed by slot) so the demoted
+            // plugin's parameters stay available at its new slot — otherwise
+            // the new instrument's PluginParamList clobbers the Instrument key
+            // and the demoted source's params are lost from the picker/lanes.
+            if let Some(params) = self.plugin_params.remove(&(track_id, PluginSlot::Instrument)) {
+                self.plugin_params.insert((track_id, new_slot), params);
+            }
         }
         self.reconcile_plugins_with_song();
     }
