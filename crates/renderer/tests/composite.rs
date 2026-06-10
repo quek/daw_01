@@ -6,7 +6,9 @@
 //!
 //! memory: `feedback_no_excuse_pixel_verify` (「見える」 で済まさず pixel 単位で確認)。
 
-use daw_ui_renderer::{Color, GlyphArea, OffscreenRenderer, Rect, RectCommand, Scene, TextureHandle};
+use daw_ui_renderer::{
+    Color, GlyphArea, HAlign, OffscreenRenderer, Rect, RectCommand, Scene, TextureHandle, VAlign,
+};
 
 /// GPU が無ければ skip するための helper。 `Some(renderer)` か `None`。
 fn try_renderer(w: u32, h: u32) -> Option<OffscreenRenderer> {
@@ -273,6 +275,7 @@ fn async_readback_matches_sync_with_text_and_effects() {
         shadow_offset_px: (0.0, 0.0),
         shadow_blur_px: 0.0,
         rotation_radians: 0.0,
+        ..GlyphArea::default()
     });
     // outline 付き text (text_effect compositor で offscreen 焼き → Primitive::Texture substitution)。
     scene.push_text(GlyphArea {
@@ -290,6 +293,7 @@ fn async_readback_matches_sync_with_text_and_effects() {
         shadow_offset_px: (0.0, 0.0),
         shadow_blur_px: 0.0,
         rotation_radians: 0.0,
+        ..GlyphArea::default()
     });
 
     let sync = r.render_to_rgba(&scene).expect("sync render");
@@ -475,6 +479,7 @@ fn text_effect_multiple_effectful_overlays_render_distinct_text() {
         shadow_offset_px: (0.0, 0.0),
         shadow_blur_px: blur,
         rotation_radians: 0.0,
+        ..GlyphArea::default()
     };
 
     let mut scene = Scene::new();
@@ -532,6 +537,7 @@ fn text_effect_cache_hit_coexists_with_miss() {
         shadow_offset_px: (0.0, 0.0),
         shadow_blur_px: 0.0,
         rotation_radians: 0.0,
+        ..GlyphArea::default()
     };
 
     // frame 1: A(赤, 上) + B(青, 下) を bake (両方 cache-miss)。
@@ -563,6 +569,69 @@ fn text_effect_cache_hit_coexists_with_miss() {
     assert!(count(is_red, 0, 44) > 20, "frame2: cache-hit A の赤が無い (cache が壊れた?): {}", count(is_red, 0, 44));
     assert!(count(is_green, 0, 44) < 5, "frame2: A region に C の緑が漏れた: {}", count(is_green, 0, 44));
     assert!(count(is_green, 48, H) > 20, "frame2: cache-miss C の緑が無い: {}", count(is_green, 48, H));
+}
+
+/// M14 Phase 122 (daw_01 #097): effect 付き box-center text が **cache HIT 経路でも** box 中心に
+/// 配置され続ける回帰テスト。 frame1 = cache miss (bake、 aligned)、 frame2 = cache hit。 align は
+/// baked texture を変えないので EffectKey に align を入れず cache 共有しているが、 配置は hit 経路
+/// でも実測寸法 (`CachedEffect.text_w/h`) から `aligned_origin` で再計算する必要がある。 これが無い
+/// と hit frame で left/top 原点に戻る (review 指摘の blocker)。 frame2 の ink 水平中心 = box 中心。
+#[test]
+fn text_effect_box_center_align_holds_on_cache_hit() {
+    const W: u32 = 280;
+    const H: u32 = 90;
+    let Some(mut r) = try_renderer(W, H) else { return };
+
+    let box_x = 20.0_f32;
+    let box_w = 240.0_f32;
+    let box_center = box_x + box_w * 0.5; // 140
+
+    let area = || GlyphArea {
+        text: "あいう".into(),
+        left: box_x,
+        top: 12.0,
+        font_size: 22.0,
+        line_height: 28.0,
+        color: Color::rgb(1.0, 1.0, 1.0),
+        box_width: Some(box_w),
+        box_height: Some(64.0),
+        align_h: HAlign::Center,
+        align_v: VAlign::Center,
+        outline_color: Color::rgb(0.0, 0.0, 0.0),
+        outline_width_px: 2.0,
+        ..GlyphArea::default()
+    };
+
+    // frame 1: cache miss (bake)。
+    let mut f1 = Scene::new();
+    f1.clear_color = Color::BLACK.to_wgpu();
+    f1.push_text(area());
+    let _ = r.render_to_rgba(&f1).expect("frame 1 (miss)");
+
+    // frame 2: cache hit。 ここで align が落ちる回帰を検出する。
+    let mut f2 = Scene::new();
+    f2.clear_color = Color::BLACK.to_wgpu();
+    f2.push_text(area());
+    let bytes = r.render_to_rgba(&f2).expect("frame 2 (hit)");
+
+    // ink (= 明るい white text pixel) の水平範囲を scan。 background / outline は BLACK で除外。
+    let (mut lo, mut hi): (Option<u32>, Option<u32>) = (None, None);
+    for y in 0..H {
+        for x in 0..W {
+            let (rr, gg, bb, _) = px(&bytes, W, x, y);
+            let lum = 0.299 * f32::from(rr) + 0.587 * f32::from(gg) + 0.114 * f32::from(bb);
+            if lum > 150.0 {
+                lo = Some(lo.map_or(x, |m| m.min(x)));
+                hi = Some(hi.map_or(x, |m| m.max(x)));
+            }
+        }
+    }
+    let (lo, hi) = (lo.expect("no ink in cache-hit frame"), hi.expect("no ink"));
+    let center = (lo + hi) as f32 * 0.5;
+    assert!(
+        (center - box_center).abs() <= 14.0,
+        "cache-hit frame で box-center align がずれた: ink_center={center:.1} vs box_center={box_center:.1} (ink {lo}..{hi})"
+    );
 }
 
 /// `clear_readback_cache` 後の古い `PendingReadback` (世代不一致) を `finish_readback` に渡すと

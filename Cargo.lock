@@ -880,6 +880,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "daw-ui-example-text-align-snapshot"
+version = "0.1.0"
+dependencies = [
+ "daw-ui-renderer",
+ "png 0.17.16",
+]
+
+[[package]]
 name = "daw-ui-example-text-effect-overlay-snapshot"
 version = "0.1.0"
 dependencies = [

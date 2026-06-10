@@ -122,6 +122,39 @@ impl RectCommand {
     }
 }
 
+/// M14 Phase 122 (daw_01 #097): [`GlyphArea`] の **box 内水平アライメント**。
+///
+/// `box_width` が `Some(w)` のとき、 shaping した実測 advance 幅 `tw` を `[left, left+w]` の
+/// 範囲内で配置する基準。 `box_width == None` または `Left` のときは `left` がそのまま描画原点
+/// (= 既存挙動、 byte 完全互換)。 実測 advance を使うので半角・全角混在 (CJK) でも字幅推定の
+/// ズレが出ない (caller が `font_size * 文字数 * 係数` で近似する必要がない)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HAlign {
+    /// `left` を描画原点にする (box 無し時と同じ既定)。
+    #[default]
+    Left,
+    /// box 中央寄せ: `left + (box_width - tw) * 0.5`。
+    Center,
+    /// box 右詰め: `left + (box_width - tw)`。
+    Right,
+}
+
+/// M14 Phase 122 (daw_01 #097): [`GlyphArea`] の **box 内垂直アライメント**。
+///
+/// `box_height` が `Some(h)` のとき、 テキストブロック高さ `th` (単一行なら `line_height`) を
+/// `[top, top+h]` の範囲内で配置する基準。 `box_height == None` または `Top` のときは `top` が
+/// そのまま描画原点 (= 既存挙動、 byte 完全互換)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VAlign {
+    /// `top` を描画原点にする (box 無し時と同じ既定)。
+    #[default]
+    Top,
+    /// box 中央寄せ: `top + (box_height - th) * 0.5`。
+    Center,
+    /// box 下詰め: `top + (box_height - th)`。
+    Bottom,
+}
+
 /// テキスト描画 1 ブロック分。glyphon の `TextArea` に近い情報を持つ。
 ///
 /// `text` は `Arc<str>` で持つ (M12 Phase 53)。`Primitive::clone()` (scenegraph cache
@@ -177,6 +210,23 @@ pub struct GlyphArea {
     /// NaN / ±Infinity は renderer 側で `0.0` に正規化 (Phase 76 の `TexturedQuad.
     /// rotation_radians` と同 idiom)。
     pub rotation_radians: f32,
+    /// M14 Phase 122 (daw_01 #097): 水平アライメント用 box の横幅 (物理 px、 原点は `left`)。
+    /// `None` = box 無し → `left` が描画原点 (現行挙動、 `align_h` は無視)。 `Some(w)` = shaping
+    /// した実 advance 幅 `tw` を測り `[left, left+w]` 内で `align_h` に従って水平配置。 `tw > w`
+    /// でも **clip せず両側にはみ出す** (center は対称)。 クリップは別概念の `clip_rect` で行う。
+    /// NaN / ±Infinity は renderer 側で `None` 扱い (caller 責務にしない)。
+    pub box_width: Option<f32>,
+    /// M14 Phase 122 (daw_01 #097): 垂直アライメント用 box の高さ (物理 px、 原点は `top`)。
+    /// `None` = box 無し → `top` が描画原点 (現行挙動、 `align_v` は無視)。 `Some(h)` = ブロック
+    /// 高さ `th` (単一行なら `line_height`) を `[top, top+h]` 内で `align_v` 配置。 NaN / ±Infinity は
+    /// renderer 側で `None` 扱い。
+    pub box_height: Option<f32>,
+    /// M14 Phase 122 (daw_01 #097): 水平アライメント。 default `Left` = `left` 原点 (現行)。
+    /// `box_width == None` のときは無視される。
+    pub align_h: HAlign,
+    /// M14 Phase 122 (daw_01 #097): 垂直アライメント。 default `Top` = `top` 原点 (現行)。
+    /// `box_height == None` のときは無視される。
+    pub align_v: VAlign,
 }
 
 impl GlyphArea {
@@ -207,6 +257,10 @@ impl GlyphArea {
             shadow_offset_px: (0.0, 0.0),
             shadow_blur_px: 0.0,
             rotation_radians: 0.0,
+            box_width: None,
+            box_height: None,
+            align_h: HAlign::Left,
+            align_v: VAlign::Top,
         }
     }
 
@@ -233,6 +287,36 @@ impl GlyphArea {
             .filter(|s| !s.is_empty())
             .unwrap_or(crate::pipelines::glyph::DEFAULT_FONT_FAMILY)
     }
+
+    /// M14 Phase 122 (daw_01 #097): box + align が描画原点を `left`/`top` から動かすか。
+    /// `false` のとき renderer は measure を skip して既存挙動 (byte 完全互換)。 非有限な
+    /// box 寸法は `None` 扱いなので alignment を要求しない。
+    #[must_use]
+    pub fn needs_alignment(&self) -> bool {
+        (self.box_width.is_some_and(f32::is_finite) && self.align_h != HAlign::Left)
+            || (self.box_height.is_some_and(f32::is_finite) && self.align_v != VAlign::Top)
+    }
+
+    /// M14 Phase 122 (daw_01 #097): 実測テキスト寸法 (`text_w` = 最大行 advance、 `text_h` =
+    /// ブロック高さ) を与えると box + align に従った描画原点 `(x, y)` を返す。 box 未指定軸 /
+    /// `Left`・`Top` / 非有限 box 寸法は `left`/`top` をそのまま返す。 `text_w > box_width` でも
+    /// clip せず両側にはみ出す (center は対称)。 glyph path (非 effect) と text_effect path の
+    /// **双方がこの 1 関数を読む**ことで「描画原点の計算」 を SSoT 化し、 plain / offscreen で
+    /// 配置が乖離しないことを保証する。
+    #[must_use]
+    pub fn aligned_origin(&self, text_w: f32, text_h: f32) -> (f32, f32) {
+        let x = match (self.box_width.filter(|w| w.is_finite()), self.align_h) {
+            (Some(w), HAlign::Center) => self.left + (w - text_w) * 0.5,
+            (Some(w), HAlign::Right) => self.left + (w - text_w),
+            _ => self.left,
+        };
+        let y = match (self.box_height.filter(|h| h.is_finite()), self.align_v) {
+            (Some(h), VAlign::Center) => self.top + (h - text_h) * 0.5,
+            (Some(h), VAlign::Bottom) => self.top + (h - text_h),
+            _ => self.top,
+        };
+        (x, y)
+    }
 }
 
 impl Default for GlyphArea {
@@ -258,6 +342,10 @@ impl Default for GlyphArea {
             shadow_offset_px: (0.0, 0.0),
             shadow_blur_px: 0.0,
             rotation_radians: 0.0,
+            box_width: None,
+            box_height: None,
+            align_h: HAlign::Left,
+            align_v: VAlign::Top,
         }
     }
 }
@@ -597,5 +685,123 @@ mod tests {
         assert!(matches!(s.primitives[0], Primitive::Rect(_)));
         assert!(matches!(s.primitives[1], Primitive::Texture(_)));
         assert!(matches!(s.primitives[2], Primitive::Rect(_)));
+    }
+
+    // ============================================================
+    // M14 Phase 122 (daw_01 #097): box-based align
+    // ============================================================
+
+    /// `left`/`top` を 100/50 に置き、 box / align を後から差し替えるテスト用 area。
+    fn align_area() -> GlyphArea {
+        GlyphArea { left: 100.0, top: 50.0, ..GlyphArea::default() }
+    }
+
+    /// default は box 無し + Left/Top = 既存 caller と byte 完全互換。
+    #[test]
+    fn glyph_area_default_no_box_left_top() {
+        let a = GlyphArea::default();
+        assert!(a.box_width.is_none());
+        assert!(a.box_height.is_none());
+        assert_eq!(a.align_h, HAlign::Left);
+        assert_eq!(a.align_v, VAlign::Top);
+        assert!(!a.needs_alignment());
+        // measure を渡しても left/top をそのまま返す (= origin 不動)。
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(a.aligned_origin(123.0, 45.0), (0.0, 0.0));
+        }
+    }
+
+    /// box 指定でも Left/Top は origin 不動 + needs_alignment false (measure skip)。
+    #[test]
+    fn box_with_left_top_is_noop() {
+        let a = GlyphArea { box_width: Some(300.0), box_height: Some(80.0), ..align_area() };
+        assert!(!a.needs_alignment());
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(a.aligned_origin(60.0, 20.0), (100.0, 50.0));
+        }
+    }
+
+    /// HAlign::Center は `left + (w - tw)/2`。 全角想定で tw=200, box=300 → 100 + 50 = 150。
+    #[test]
+    fn h_center_uses_measured_advance() {
+        let a = GlyphArea { box_width: Some(300.0), align_h: HAlign::Center, ..align_area() };
+        assert!(a.needs_alignment());
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(a.aligned_origin(200.0, 20.0).0, 150.0);
+            // 縦は box 無し → top 不動。
+            assert_eq!(a.aligned_origin(200.0, 20.0).1, 50.0);
+        }
+    }
+
+    /// HAlign::Right は `left + (w - tw)`。 box=300, tw=120 → 100 + 180 = 280。
+    #[test]
+    fn h_right_flush() {
+        let a = GlyphArea { box_width: Some(300.0), align_h: HAlign::Right, ..align_area() };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(a.aligned_origin(120.0, 20.0).0, 280.0);
+        }
+    }
+
+    /// tw > w でも clip せず center は対称にはみ出す (origin が left より左)。
+    #[test]
+    fn h_center_overflow_symmetric() {
+        let a = GlyphArea { box_width: Some(100.0), align_h: HAlign::Center, ..align_area() };
+        // tw=160, box=100 → 100 + (100-160)/2 = 100 - 30 = 70。
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(a.aligned_origin(160.0, 20.0).0, 70.0);
+        }
+    }
+
+    /// VAlign::Center / Bottom。 box_h=80, th=20 → center top=50+30=80、 bottom top=50+60=110。
+    #[test]
+    fn v_center_and_bottom() {
+        let c = GlyphArea { box_height: Some(80.0), align_v: VAlign::Center, ..align_area() };
+        let b = GlyphArea { box_height: Some(80.0), align_v: VAlign::Bottom, ..align_area() };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(c.aligned_origin(40.0, 20.0).1, 80.0);
+            assert_eq!(b.aligned_origin(40.0, 20.0).1, 110.0);
+        }
+    }
+
+    /// 水平・垂直を同時に center (daw_01 の text overlay 標準ケース)。
+    #[test]
+    fn h_and_v_center_combined() {
+        let a = GlyphArea {
+            box_width: Some(300.0),
+            box_height: Some(80.0),
+            align_h: HAlign::Center,
+            align_v: VAlign::Center,
+            ..align_area()
+        };
+        assert!(a.needs_alignment());
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(a.aligned_origin(200.0, 20.0), (150.0, 80.0));
+        }
+    }
+
+    /// 非有限な box 寸法は `None` 扱い: needs_alignment false + origin 不動 (NaN 伝播しない)。
+    #[test]
+    fn non_finite_box_is_ignored() {
+        let a = GlyphArea {
+            box_width: Some(f32::NAN),
+            box_height: Some(f32::INFINITY),
+            align_h: HAlign::Center,
+            align_v: VAlign::Bottom,
+            ..align_area()
+        };
+        assert!(!a.needs_alignment());
+        let (x, y) = a.aligned_origin(50.0, 20.0);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!((x, y), (100.0, 50.0));
+        }
+        assert!(x.is_finite() && y.is_finite());
     }
 }

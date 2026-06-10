@@ -147,6 +147,11 @@ struct CachedEffect {
     text_offset_y: f32,
     width: u32,
     height: u32,
+    /// M14 Phase 122 (daw_01 #097): 実測テキスト寸法 (advance / block 高さ)。 cache HIT 経路でも
+    /// `aligned_origin` を適用するために保持する。 align は baked texture を変えない (= EffectKey に
+    /// align を入れず cache 共有) ので、 配置だけ毎フレーム実測値から再計算する。
+    text_w: f32,
+    text_h: f32,
     last_seen_frame: u64,
 }
 
@@ -471,8 +476,12 @@ impl TextEffectCompositor {
         // cache hit
         if let Some(entry) = self.cache.get_mut(&key) {
             entry.last_seen_frame = self.frame_counter;
-            let x = area.left - entry.text_offset_x;
-            let y = area.top - entry.text_offset_y;
+            // M14 Phase 122 (daw_01 #097): align は baked texture を変えない (EffectKey に align を
+            // 入れず cache 共有) ので、 配置だけ cache 済の実測寸法から毎フレーム再計算する。 これが
+            // 無いと miss 直後の frame は aligned だが以後の hit frame で left/top 原点に戻る (jump)。
+            let (origin_x, origin_y) = area.aligned_origin(entry.text_w, entry.text_h);
+            let x = origin_x - entry.text_offset_x;
+            let y = origin_y - entry.text_offset_y;
             return Some((entry.handle, x, y, entry.width as f32, entry.height as f32));
         }
 
@@ -616,12 +625,18 @@ impl TextEffectCompositor {
             text_offset_y,
             width: composite_w,
             height: composite_h,
+            text_w,
+            text_h,
             last_seen_frame: self.frame_counter,
         };
         self.cache.insert(key, entry);
 
-        let x = area.left - text_offset_x;
-        let y = area.top - text_offset_y;
+        // M14 Phase 122 (daw_01 #097): box + align のとき、 offscreen 内 (pad_left, pad_top) に
+        // 焼いた text が screen 上で **aligned origin** に着地するよう quad を逆オフセットする。
+        // box 無し時は aligned_origin が (left, top) を返すので既存挙動と byte 完全互換。
+        let (origin_x, origin_y) = area.aligned_origin(text_w, text_h);
+        let x = origin_x - text_offset_x;
+        let y = origin_y - text_offset_y;
         Some((final_handle, x, y, composite_w as f32, composite_h as f32))
     }
 
@@ -664,15 +679,8 @@ impl TextEffectCompositor {
             CachedBuffer { buffer: buf, last_seen_frame: frame }
         });
         cached.last_seen_frame = frame;
-        let mut max_w: f32 = 0.0;
-        let mut total_h: f32 = 0.0;
-        for run in cached.buffer.layout_runs() {
-            if run.line_w > max_w {
-                max_w = run.line_w;
-            }
-            total_h += run.line_height;
-        }
-        (max_w, total_h)
+        // M14 Phase 122 (daw_01 #097): measure を glyph path と同一の SSoT helper に委譲。
+        super::glyph::measure_layout(&cached.buffer)
     }
 
     #[allow(clippy::too_many_arguments)]

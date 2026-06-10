@@ -39,6 +39,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         shadow_offset_px: (2.0, 2.0),
         shadow_blur_px: 3.0,
         rotation_radians: 0.0,
+        ..GlyphArea::default()
     });
 
     // 歌詞 (下): 黄文字 + 黒 outline + shadow blur。 幅狭・大きめ (composite size が上と異なる)。
@@ -57,6 +58,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         shadow_offset_px: (2.0, 2.0),
         shadow_blur_px: 4.0,
         rotation_radians: 0.0,
+        ..GlyphArea::default()
     });
 
     let rgba = r.render_to_rgba(&scene)?;

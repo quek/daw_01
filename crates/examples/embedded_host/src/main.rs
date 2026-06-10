@@ -311,6 +311,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         shadow_offset_px: (4.0, 4.0),
         shadow_blur_px: 4.0,
         rotation_radians: std::f32::consts::FRAC_PI_6,
+        ..GlyphArea::default()
     });
 
     // 1 フレーム render → RGBA bytes (sRGB encoded、行 stride = width * 4)

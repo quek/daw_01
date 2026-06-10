@@ -63,6 +63,24 @@ pub fn prepare_text_effects(
                     texture_bgl,
                     area,
                 ) {
+                    // M14 Phase 122 (daw_01 #097): box 指定時は **box 中心** を旋回中心にする
+                    // (daw_01 の TextEvent.rotation は box 中心を旋回中心とする仕様)。 pivot は
+                    // quad 左上 (x, y) を原点とした相対座標。 box 未指定の軸は rect 中心 (= 従来の
+                    // `None` pivot と同値) に落とす。 `box_width` / `box_height` が **両方 None** の
+                    // ときだけ pivot 自体を `None` にするので、 box 無しは byte 完全互換。
+                    let rotation_pivot = if area.box_width.is_some() || area.box_height.is_some() {
+                        let px = match area.box_width.filter(|v| v.is_finite()) {
+                            Some(bw) => area.left + bw * 0.5 - x,
+                            None => w * 0.5,
+                        };
+                        let py = match area.box_height.filter(|v| v.is_finite()) {
+                            Some(bh) => area.top + bh * 0.5 - y,
+                            None => h * 0.5,
+                        };
+                        Some((px, py))
+                    } else {
+                        None
+                    };
                     out.push(Primitive::Texture(TexturedQuad {
                         rect: Rect::new(x, y, w, h),
                         texture: handle,
@@ -71,8 +89,7 @@ pub fn prepare_text_effects(
                         uv_max: (1.0, 1.0),
                         clip_rect: area.clip_rect,
                         rotation_radians: text_effect::normalize_finite(area.rotation_radians),
-                        // GlyphArea の rotation は中心 pivot (Phase 76 と同義)。
-                        rotation_pivot: None,
+                        rotation_pivot,
                     }));
                 } else {
                     // compositor が None を返したら (= text 0 サイズ等) plain Glyph に fallback。

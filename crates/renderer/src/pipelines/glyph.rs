@@ -46,6 +46,26 @@ struct CachedBuffer {
     last_seen_frame: u64,
 }
 
+/// 既に shape 済の glyphon `Buffer` から描画ブロックの実寸 `(最大行 advance, 総高さ)` を測る。
+///
+/// M14 Phase 122 (daw_01 #097): box align の基準。 非 effect path (`prepare_renderer`) と
+/// effect path (`text_effect::measure_text`) の **双方がこの 1 関数を読む** ことで measure を
+/// SSoT 化する (= 同じ font / shaping 設定なら plain と offscreen で advance が一致)。
+///
+/// 戻り値は **渡された buffer 自身の wrap 設定での実寸**。 各 area は `has_effects()` で plain か
+/// effect の片方の path しか通らないので、 「plain は screen 幅で wrap / effect は no-wrap」 という
+/// buffer 構築差が同一 area で衝突することは無く、 各 path 内で「描画される block を測る」 ので
+/// align は常に実描画と一致する (overlay title は単一行 < screen 幅で wrap しない想定)。
+pub(crate) fn measure_layout(buffer: &Buffer) -> (f32, f32) {
+    let mut max_w: f32 = 0.0;
+    let mut total_h: f32 = 0.0;
+    for run in buffer.layout_runs() {
+        max_w = max_w.max(run.line_w);
+        total_h += run.line_height;
+    }
+    (max_w, total_h)
+}
+
 /// 1 つの "run" を識別する handle。`renderers` pool 内の index を指す。
 #[derive(Debug, Clone, Copy)]
 pub struct GlyphRun {
@@ -210,10 +230,18 @@ impl GlyphPipeline {
                         bottom: ((c.y + c.h).min(screen.height as f32)).max(0.0) as i32,
                     },
                 );
+                // M14 Phase 122 (daw_01 #097): box + 非 default align のときだけ実測 advance を
+                // 測って描画原点を補正。 box 無し / Left+Top は measure を skip して既存挙動。
+                let (left, top) = if area.needs_alignment() {
+                    let (tw, th) = measure_layout(&self.cache[&key].buffer);
+                    area.aligned_origin(tw, th)
+                } else {
+                    (area.left, area.top)
+                };
                 TextArea {
                     buffer: &self.cache[&key].buffer,
-                    left: area.left,
-                    top: area.top,
+                    left,
+                    top,
                     scale: 1.0,
                     bounds,
                     default_color: GlyphColor::rgba(
