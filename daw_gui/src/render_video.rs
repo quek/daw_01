@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use common::model::{ImageSourceId, Song, TextAlign, VideoSourceId, VideoSourcePath};
+use common::model::{ImageSourceId, Song, VideoSourceId, VideoSourcePath};
 use daw_ui_renderer::{
     Color, GlyphArea, OffscreenRenderer, Rect, Scene, TextureHandle, TexturedQuad,
 };
@@ -605,14 +605,8 @@ fn build_frame_scene(
         let rh = (layer.h * out_h as f32).max(0.0);
         let font_size = layer.font_size_px.max(1.0);
         let line_height = font_size * 1.2;
-        let approx_text_w =
-            font_size * layer.text.chars().count() as f32 * 0.55;
-        let left = match layer.align {
-            TextAlign::Left => rx,
-            TextAlign::Center => rx + (rw - approx_text_w) * 0.5,
-            TextAlign::Right => rx + rw - approx_text_w,
-        };
-        let top = ry + (rh - line_height) * 0.5;
+        // FIXME #28 (gui_01 #097): 揃えはレンダラに委譲。 box = (rx, ry, rw, rh)。
+        // preview path と同一コードで、 自前の文字幅推定は撤去。
         let fill = Color::rgba(
             layer.fill_color[0],
             layer.fill_color[1],
@@ -639,8 +633,8 @@ fn build_frame_scene(
             } else {
                 Some(layer.font_family.clone())
             },
-            left,
-            top,
+            left: rx,
+            top: ry,
             font_size,
             line_height,
             color: fill,
@@ -651,6 +645,11 @@ fn build_frame_scene(
             shadow_offset_px: layer.shadow_offset_px,
             shadow_blur_px: layer.shadow_blur_px,
             rotation_radians: layer.rotation_radians,
+            // FIXME #28: box 内アライメント (実 glyph 幅でレンダラが配置)。
+            box_width: Some(rw),
+            box_height: Some(rh),
+            align_h: crate::text_compose::halign_for(layer.align),
+            align_v: daw_ui_renderer::VAlign::Center,
         });
     }
 }

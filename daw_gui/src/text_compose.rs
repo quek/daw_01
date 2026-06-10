@@ -142,6 +142,19 @@ pub fn active_text_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveText
     out
 }
 
+/// FIXME #28: `common::model::TextAlign` を gui_01 renderer の `HAlign` へ写す
+/// **唯一の変換点**。 preview (`preview_window`) と export (`render_video`) の
+/// 双方がこれを使う。 揃え計算は box (`GlyphArea.box_width` + `align_h`) を渡して
+/// レンダラが実 glyph 幅で行うので、 daw_01 側に文字幅推定は持たない (旧
+/// `char_count * 0.55` 推定を撤去、 CJK ずれ + preview/export 二重手書きの解消)。
+pub fn halign_for(align: TextAlign) -> daw_ui_renderer::HAlign {
+    match align {
+        TextAlign::Left => daw_ui_renderer::HAlign::Left,
+        TextAlign::Center => daw_ui_renderer::HAlign::Center,
+        TextAlign::Right => daw_ui_renderer::HAlign::Right,
+    }
+}
+
 /// All 14 lane-overridable fields resolved against `track`'s
 /// `TextBuiltinParam` lanes. `opacity` is returned separately because
 /// the caller multiplies it into the fade envelope before storing the

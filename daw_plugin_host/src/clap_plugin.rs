@@ -1548,6 +1548,130 @@ fn log_note_ports(plugin: *const clap_plugin, get_ext: GetExtFn) {
     tracing::info!(inputs, outputs, "note-ports");
 }
 
+/// FIXME #29: CLAP プラグインを一時 instantiate して note-ports / audio-ports
+/// extension から port 構成を読む。 daw_plugin_host の `--probe-clap` one-shot
+/// モードから呼ばれる。 CLAP descriptor の feature には note 出力の有無が無い
+/// (`note-effect` 等の文字列があるだけ) ため、 dual-role (note 出力する instrument、
+/// 例: Scaler 2 の CLAP 版) を正しく拾うには instance 生成後の port query が必須。
+/// VST3 の [`crate::vst3_plugin::probe_ports`] と対称。 activate / process / GUI は
+/// しない (= 軽量・副作用最小)。 失敗時は呼び元 (scan) が scan-time 暫定値を保持。
+pub fn probe_ports(path: &Path, target_id: &str) -> Result<common::port_config::PortConfig> {
+    let library = unsafe { Library::new(path) }
+        .with_context(|| format!("loading CLAP at {}", path.display()))?;
+    let entry_ptr: *const clap_plugin_entry = unsafe {
+        let sym: Symbol<*const clap_plugin_entry> = library
+            .get(b"clap_entry\0")
+            .context("missing clap_entry symbol")?;
+        *sym
+    };
+    anyhow::ensure!(!entry_ptr.is_null(), "clap_entry is null");
+    let entry = unsafe { &*entry_ptr };
+    anyhow::ensure!(
+        clap_version_is_compatible(entry.clap_version),
+        "incompatible CLAP version"
+    );
+    let c_path =
+        CString::new(path.to_string_lossy().as_bytes()).context("path has interior nul")?;
+    let init_fn = entry.init.context("clap_plugin_entry::init is null")?;
+    anyhow::ensure!(
+        unsafe { init_fn(c_path.as_ptr()) },
+        "clap_entry.init returned false"
+    );
+
+    // entry.init 成功後はどの経路でも deinit + library drop して資源を返す。
+    let probe = probe_ports_after_entry_init(entry, target_id);
+
+    if let Some(deinit) = entry.deinit {
+        unsafe { deinit() };
+    }
+    drop(library);
+    probe
+}
+
+fn probe_ports_after_entry_init(
+    entry: &clap_plugin_entry,
+    target_id: &str,
+) -> Result<common::port_config::PortConfig> {
+    let get_factory = entry.get_factory.context("get_factory is null")?;
+    let factory_ptr = unsafe { get_factory(CLAP_PLUGIN_FACTORY_ID.as_ptr()) }
+        as *const clap_plugin_factory;
+    anyhow::ensure!(!factory_ptr.is_null(), "clap factory is null");
+    let factory = unsafe { &*factory_ptr };
+    let get_count = factory.get_plugin_count.context("get_plugin_count is null")?;
+    let get_desc = factory
+        .get_plugin_descriptor
+        .context("get_plugin_descriptor is null")?;
+    let create = factory.create_plugin.context("create_plugin is null")?;
+
+    // target_id 一致の descriptor、 空なら最初。
+    let count = unsafe { get_count(factory_ptr) };
+    let mut selected: Option<u32> = None;
+    for i in 0..count {
+        let desc_ptr = unsafe { get_desc(factory_ptr, i) };
+        if desc_ptr.is_null() {
+            continue;
+        }
+        let desc = unsafe { &*desc_ptr };
+        if target_id.is_empty() || c_str_to_string(desc.id) == target_id {
+            selected = Some(i);
+            break;
+        }
+    }
+    let index = selected.context("no matching CLAP descriptor")?;
+    let desc_ptr = unsafe { get_desc(factory_ptr, index) };
+    anyhow::ensure!(!desc_ptr.is_null(), "selected descriptor became null");
+    let plugin_id = unsafe { (*desc_ptr).id };
+
+    let host = Host::new(HostCallbacks::noop());
+    let host_ptr: *const clap_host = &host.clap;
+    let plugin_ptr = unsafe { create(factory_ptr, host_ptr, plugin_id) };
+    anyhow::ensure!(!plugin_ptr.is_null(), "create_plugin returned null");
+
+    let cfg = clap_plugin_port_config(plugin_ptr);
+
+    // create 済みなので init 成否に関わらず破棄する。
+    if let Some(destroy) = unsafe { (*plugin_ptr).destroy } {
+        unsafe { destroy(plugin_ptr) };
+    }
+    drop(host);
+    cfg
+}
+
+fn clap_plugin_port_config(
+    plugin_ptr: *const clap_plugin,
+) -> Result<common::port_config::PortConfig> {
+    let plugin_init = unsafe { (*plugin_ptr).init }.context("plugin.init is null")?;
+    anyhow::ensure!(
+        unsafe { plugin_init(plugin_ptr) },
+        "plugin.init returned false"
+    );
+    let get_ext = unsafe { (*plugin_ptr).get_extension }.context("get_extension is null")?;
+
+    let (note_in, note_out) = {
+        let ext = unsafe { get_ext(plugin_ptr, CLAP_EXT_NOTE_PORTS.as_ptr()) }
+            as *const clap_plugin_note_ports;
+        match (ext.is_null(), unsafe { ext.as_ref() }.and_then(|e| e.count)) {
+            (false, Some(count)) => {
+                (unsafe { count(plugin_ptr, true) }, unsafe { count(plugin_ptr, false) })
+            }
+            _ => (0, 0),
+        }
+    };
+    let audio_out = {
+        let ext = unsafe { get_ext(plugin_ptr, CLAP_EXT_AUDIO_PORTS.as_ptr()) }
+            as *const clap_plugin_audio_ports;
+        match (ext.is_null(), unsafe { ext.as_ref() }.and_then(|e| e.count)) {
+            (false, Some(count)) => unsafe { count(plugin_ptr, false) },
+            _ => 0,
+        }
+    };
+    Ok(common::port_config::PortConfig {
+        has_note_input: note_in > 0,
+        has_note_output: note_out > 0,
+        has_audio_output: audio_out > 0,
+    })
+}
+
 impl LoadedPlugin for ClapPlugin {
     fn id(&self) -> &str {
         self.id()

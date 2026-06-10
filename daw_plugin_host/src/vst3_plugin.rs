@@ -677,16 +677,17 @@ fn create_instance<I: Interface>(
     unsafe { ComPtr::<I>::from_raw(obj as *mut I) }
 }
 
-/// FIXME #26 Phase B: VST3 のクラスを一時 instantiate して bus 構成から
-/// **note-effect** (= ノート入出力あり・音声出力なし、 例: アルペジエータ /
-/// MIDI フィルタ) かを判定する。 daw_plugin_host の `--probe-vst3` one-shot
-/// モードから呼ばれる。 VST3 規格には note-effect の category tag が無く、 bus
-/// 構成でしか判別できない (`ivstaudioprocessor.h` PlugType / `ivstcomponent.h`
-/// MediaTypes)。 失敗時は呼び元 (scan) が FX 扱いに fallback するので退行しない。
+/// FIXME #26/#29: VST3 のクラスを一時 instantiate して bus 構成から **port 構成**
+/// (note 入力 / note 出力 / audio 出力の有無) を読む。 daw_plugin_host の
+/// `--probe-vst3` one-shot モードから呼ばれる。 VST3 規格には note-effect の
+/// category tag が無く、 bus 構成でしか判別できない (`ivstaudioprocessor.h`
+/// PlugType / `ivstcomponent.h` MediaTypes)。 これで note-effect (note in/out・
+/// audio out なし) も dual-role (note out かつ audio out、 例: Scaler 2) も拾える。
+/// 失敗時は呼び元 (scan) が scan-time 暫定値を保持するので退行しない。
 ///
 /// `load` の前半 (module → factory → class 解決 → component → initialize) を
 /// 再現し、 audio processing / controller / activate はしない (= 軽量・副作用最小)。
-pub fn probe_note_effect(path: &Path, target_id: &str) -> Result<bool> {
+pub fn probe_ports(path: &Path, target_id: &str) -> Result<common::port_config::PortConfig> {
     let dll_path = resolve_vst3_dll(path)
         .with_context(|| format!("resolving VST3 at {}", path.display()))?;
     let library = unsafe { Library::new(&dll_path) }
@@ -746,9 +747,14 @@ pub fn probe_note_effect(path: &Path, target_id: &str) -> Result<bool> {
     let au_out = unsafe { component.getBusCount(MediaTypes_::kAudio, BusDirections_::kOutput) };
     let _ = unsafe { component.terminate() };
 
-    // note-effect = ノート in/out あり + 音声出力なし。 synth は au_out>0 で除外、
-    // analyzer / meter は ev_out==0 で除外、 audio FX は ev_out==0 で除外。
-    Ok(ev_in > 0 && ev_out > 0 && au_out == 0)
+    // FIXME #29: bus 構成をそのまま port 構成として返す。 dual-role
+    // (ev_out>0 かつ au_out>0) も note-effect (ev_out>0・au_out==0) も区別なく拾える。
+    // 役割の解釈は daw_gui 側の `PluginCapability` が担う (SSoT は 3 bool)。
+    Ok(common::port_config::PortConfig {
+        has_note_input: ev_in > 0,
+        has_note_output: ev_out > 0,
+        has_audio_output: au_out > 0,
+    })
 }
 
 // `c_array_to_string` / `tuid_to_hex` live in `common::vst3_scan` as the

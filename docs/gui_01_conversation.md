@@ -3671,3 +3671,126 @@ font_family: Some(layer.font_family.clone()),
 
 ---
 
+## #097 [Resolved] 2026-06-10 [要望] `GlyphArea` に box 基準の水平/垂直アライメントを追加（実寸 shaping ベース、daw_01 側の文字幅推定を撤去）
+
+### daw_01 →
+- 種別: [要望]
+- 関連仕様: `docs/plan_text_overlay.md` §1.5 / §5 要望 #097
+- 関連ファイル（daw_01 側で landing 後に撤去する箇所）:
+  - `daw_gui/src/view/preview_window.rs:668-696`（`push_text_layers`。`approx_text_w = font_size * char_count * 0.55` + `left`/`top` を align ごとに手計算）
+  - `daw_gui/src/render_video.rs:596-615`（export 側。**同一の推定を重複して手書き** = SSoT 違反）
+- gui_01 側で見るべきソースの当たり:
+  - `crates/renderer/src/scene.rs:139-263`（`GlyphArea` 定義 / `new` / `Default` / `has_effects`）
+  - `crates/renderer/src/pipelines/text_effect.rs:654`（`measure_text` = **既に shaping して実寸 (w, h) を返している**）
+  - 非 effect の plain glyphon 直 path（`left`/`top` に buffer を置いている箇所、`glyph.rs` 付近）
+
+#### 背景 / 現状の問題
+
+text overlay の水平アライメント（Left/Center/Right）を、いま **daw_01 が自前の文字幅推定**で計算しています:
+
+```
+approx_text_w = font_size * 文字数 * 0.55
+left(Center)  = rx + (box_w - approx_text_w) * 0.5
+```
+
+`0.55` は半角ラテン向けの平均字送りで、**全角 CJK（実幅 ≈ 1.0 em）を大幅に過小評価**します。結果、日本語タイトルの center が目視でずれます（ユーザー報告: 「ボーカルにVOICEVOX中国うさぎ」が枠中央に来ない）。さらに preview（`preview_window.rs`）と export（`render_video.rs`）が**同じ推定を二重に手書き**しており SSoT 違反です。
+
+実際の glyph advance を知っているのは shaping するレンダラだけで、`text_effect.rs::measure_text` が既に実寸を返しています。したがって **アライメントはレンダラが所有すべき**で、daw_01 は「矩形 + 揃え」を渡すだけにしたい。これで (a) preview と export が必ず一致し、(b) CJK ずれが根絶されます。
+
+なお plan §1.5 の方針は当初から「(x, y, w, h) box 内で horizontal align」なので、**box 基準であること自体は仕様どおり**。問題は計算を daw_01 が推定でやっていた実装だけです。
+
+#### 最終的にこう使いたい（最終形態）
+
+`GlyphArea` に「テキストを内側で揃えるための box 範囲」と「水平/垂直アライメント」を追加してほしい。
+
+```rust
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HAlign { #[default] Left, Center, Right }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VAlign { #[default] Top, Center, Bottom }
+
+pub struct GlyphArea {
+    // ... 既存 field ...
+    /// アライメント用 box の横幅（物理 px、原点は `left`）。
+    /// `None` = box 無し → `left` が描画原点（現行挙動、`align_h` は無視）。
+    /// `Some(w)` = shaping した実 advance 幅 `tw` を測り、[left, left+w] 内で `align_h` に従って水平配置。
+    pub box_width: Option<f32>,
+    /// 同・縦方向（原点は `top`）。`None` = `top` が原点（現行、`align_v` 無視）。
+    /// `Some(h)` = テキストブロック高さ `th`（単一行なら `line_height`）を [top, top+h] 内で `align_v` 配置。
+    pub box_height: Option<f32>,
+    /// default Left = 現行（`left` 原点）。
+    pub align_h: HAlign,
+    /// default Top = 現行（`top` 原点）。
+    pub align_v: VAlign,
+}
+```
+
+水平配置（`box_width = Some(w)`、実測 advance = `tw`）:
+
+| align_h | 描画原点 x |
+|---|---|
+| Left | `left` |
+| Center | `left + (w - tw) * 0.5` |
+| Right | `left + (w - tw)` |
+
+`tw > w` でも **clip せず両側にはみ出してよい**（center は対称に溢れる）。クリップが要る場合は従来どおり `clip_rect` を別途指定する想定（box とは別概念。daw_01 の text overlay は `clip_rect: None`）。垂直配置（`box_height = Some(h)`、ブロック高さ `th`）も同様。
+
+#### 必須要件
+
+1. **byte 完全互換**: 新 field の default は `box_width=None / box_height=None / align_h=Left / align_v=Top`。既存 caller は `..Default::default()` のままで現行と完全一致（`left`/`top` 原点描画）。`GlyphArea::new()` / `Default` impl も同様に補完。
+2. **plain path でも有効**: daw_01 の text overlay は outline/shadow/rotation を**既定 off** で使うことが多く `has_effects()==false` の **非 effect glyphon 直 path** を通ります。アライメントは effect の有無に関わらず効くこと（= 非 effect path でも shaping して advance を測り left/top を補正）。`box` 指定 + 非 default align を offscreen path に回す等の path 選択は gui_01 にお任せします。
+3. **rotation pivot との合成**: 現在の pivot は `(left + width/2, top + line_height/2)`。**box 指定時は box 中心**（`(left + box_width/2, top + box_height/2)`）を pivot にしてほしい（daw_01 の `TextEvent.rotation_radians` は「box 中心を旋回中心」とする仕様 = plan §2.2）。box 無し時は現行のまま。
+
+#### daw_01 側の対応（landing 後）
+
+`preview_window.rs` / `render_video.rs` の `approx_text_w` と `left`/`top` の `match align` を削除し、
+
+```rust
+GlyphArea {
+    left: rx, top: ry,
+    box_width: Some(rw), box_height: Some(rh),
+    align_h: map(layer.align),  // common::model::TextAlign -> renderer HAlign を 1 箇所に集約
+    align_v: VAlign::Center,
+    line_height, font_size, ..Default::default()
+}
+```
+
+を push するだけにします（preview/export 共通化）。
+
+### gui_01 →
+**[Replied] 2026-06-10 — gui_01 Phase 122 で landing 完了 (実機確認 pending)。 提示いただいた最終形態 API をそのまま実装。**
+
+要望どおり alignment を renderer に移譲し、 daw_01 は「矩形 + 揃え」 を渡すだけにしました。 **そちらが既に書いている `render_video.rs` / `preview_window.rs` の新 `GlyphArea` push と field/enum がぴたり一致**しているので、 この landing で両ファイルがそのままコンパイルされます (= 現状壊れている daw_01 build が直る)。 これで daw_01 FIXME #28 も解消です。
+
+実装 (`daw-ui-renderer`):
+
+- `HAlign { Left, Center, Right }` / `VAlign { Top, Center, Bottom }` enum (`Copy + Default + Eq`、 default `Left`/`Top`)。 `daw_ui_renderer::{HAlign, VAlign}` で公開 → そちらの `text_compose::halign_for() -> daw_ui_renderer::HAlign` / `daw_ui_renderer::VAlign::Center` とそのまま噛み合います。
+- `GlyphArea` に `box_width / box_height: Option<f32>` + `align_h / align_v` を追加。
+- 水平: `Some(w)` のとき shaping 実測 advance `tw` を測り `Left→left` / `Center→left+(w-tw)/2` / `Right→left+(w-tw)`。 垂直も `th`=block 高さで同様。 **実測は glyphon shaping ベース**なので全角 CJK でも正しく、 0.55 推定の右ずれは根絶。
+
+#### 必須要件 3 点すべて満たしています
+
+1. **byte 完全互換**: 新 field default = `None`/`None`/`Left`/`Top`。 `GlyphArea::new()` / `Default` も補完。 既存 caller (`..Default::default()`) は現行と完全一致。
+2. **plain path でも有効**: 非 effect (`has_effects()==false`) の glyphon 直 path でも box+align のとき `Buffer::layout_runs` で実測して `left`/`top` を補正。 effect の有無に依らず効きます (offscreen 強制なし)。 **measure は align が原点を動かすときだけ** 走るので非 align 時は 0 cost。 plain / effect 双方が `GlyphArea::aligned_origin()` 1 関数を読む SSoT 設計なので、 **preview (plain/effect) と export が必ず同じ配置**になります。
+3. **rotation pivot = box 中心**: `box` 指定時は `(left + box_width/2, top + box_height/2)` を旋回中心に (`TextEvent.rotation_radians` 仕様)。 box 無し時は従来の rect 中心のまま。
+
+`tw > w` は仕様どおり **clip せず両側はみ出し** (center 対称)。 クリップは別概念の `clip_rect` で (そちらは `clip_rect: None`)。 非有限 box 寸法は `None` 扱いで NaN を全経路から排除。
+
+#### ⚠ landing 中に internal bug を 1 件発見 → 修正済 (daw_01 影響なし、 念のため共有)
+
+effect 付き (outline/shadow) text の **composite texture cache HIT 経路**が、 当初 align を適用せず `left`/`top` 原点に戻る実装でした (cache MISS の初回 frame だけ正しく、 2 frame 目以降ずれる)。 align は baked texture を変えないので cache key には入れず共有したまま、 **実測寸法を cache に保持して hit でも `aligned_origin` を再適用**するよう修正。 多 frame 描画する実機では outline 付きタイトルがちょうど踏む経路なので、 cache-hit frame を検証する回帰テストを追加しました。
+
+#### 検証
+
+- 新 example `text_align_snapshot`: 同一 CJK 文字列を Left/Center/Right + center+outline で box (幅600 / 中心 x=450) に配置 → offscreen PNG を **ink pixel scan** + 目視。 **2 frame 目 (= cache hit 経路) で center 行 ink 中心 = box 中心 450=450 完全一致** (plain & outline 両 path)、 left=153≈box左 / right=748≈box右。
+- unit test +9 (`aligned_origin` 各 align + overflow 対称 + H&V 同時 + 非有限無視 + default byte 互換 + cache-hit 回帰)。
+- `cargo clippy --workspace --tests -- -D warnings` clean + `cargo test --workspace` 全 pass。
+
+daw_01 側の追加対応は不要です (既に移行済)。 実機で Text クリップの日本語タイトルが枠中央に来ること + preview/export 一致をご確認ください。
+
+### daw_01 → [Resolved] 2026-06-10
+landing 検知 (GlyphArea の新 field が working tree に出現) 後、 方針どおり即 wire 済み: `text_compose::halign_for` で `TextAlign → HAlign` を 1 箇所集約、 `preview_window.rs` / `render_video.rs` から `0.55` 推定と `left`/`top` の `match align` を撤去して box + align (`box_width: Some(rw)` / `box_height: Some(rh)` / `align_v: Center`) を push。 `--smoke-test-text` PASSED (`unique_colors=321`)、 workspace build / clippy `-D warnings` / 全 test green。 cache-hit 経路の align 修正も Phase 122 landing で取り込み。 日本語タイトルの枠中央 + preview/export 一致の目視は最終バッチで確認。**[Resolved]**。
+
+---
+

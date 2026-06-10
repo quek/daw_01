@@ -145,6 +145,108 @@ impl PluginCategory {
     }
 }
 
+/// FIXME #29: プラグインが「どの役割になれるか」。 note 出力の有無は
+/// [`common::plugin_db::PluginEntry`] の port 3 bool (probe で確定する SSoT) から、
+/// 音源↔音声エフェクトの区別は従来どおり `features` (= 信頼できる宣言) から導出する。
+/// 役割は最終的に「能力 + チェーン内の位置」で決まる ([`PluginCapability::allows_slot_kind`])。
+/// picker の挿入先決定と inspector の並べ替え drop 検証が共有する (SSoT / DRY)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginCapability {
+    /// note 出力あり・audio 出力なし (アルペジエータ等)。 生成器列 (midi_fx) 専用。
+    PureMidiEffect,
+    /// note 出力あり・audio 出力あり (例: Scaler 2)。 生成器にも音源にもなれる。
+    DualRole,
+    /// note 出力なし・音源 (feature=instrument)。 音源スロット専用。
+    Instrument,
+    /// note 出力なし・音声エフェクト (または未分類)。 audio-fx 列専用。
+    AudioFx,
+}
+
+impl PluginCapability {
+    pub fn from_entry(e: &common::plugin_db::PluginEntry) -> Self {
+        match (e.has_note_output, e.has_audio_output) {
+            (true, true) => Self::DualRole,
+            (true, false) => Self::PureMidiEffect,
+            // note 出力なし: 音声面の役割は feature で決める (probe より宣言が信頼できる)。
+            (false, _) => {
+                if e.features.iter().any(|f| f == "instrument") {
+                    Self::Instrument
+                } else {
+                    Self::AudioFx
+                }
+            }
+        }
+    }
+
+    /// この能力が占められるチェーン slot 種別 (`0=MidiFx`, `1=Instrument`, `2=Fx`)。
+    /// inspector の並べ替え drop 検証が、 ポート的に有効な落とし先だけ許すのに使う。
+    pub fn allows_slot_kind(self, slot_kind: u8) -> bool {
+        match self {
+            Self::PureMidiEffect => slot_kind == 0,
+            Self::DualRole => slot_kind == 0 || slot_kind == 1,
+            Self::Instrument => slot_kind == 1,
+            Self::AudioFx => slot_kind == 2,
+        }
+    }
+}
+
+#[cfg(test)]
+mod plugin_capability_tests {
+    use super::PluginCapability;
+    use common::plugin_db::PluginEntry;
+    use common::plugin_format::PluginFormat;
+
+    fn entry(features: &[&str], note_out: bool, audio_out: bool) -> PluginEntry {
+        PluginEntry {
+            id: "x".into(),
+            format: PluginFormat::Clap,
+            name: "X".into(),
+            vendor: String::new(),
+            version: String::new(),
+            features: features.iter().map(|s| (*s).to_string()).collect(),
+            path: std::path::PathBuf::from("x"),
+            descriptor_index: 0,
+            has_note_input: false,
+            has_note_output: note_out,
+            has_audio_output: audio_out,
+        }
+    }
+
+    #[test]
+    fn from_entry_maps_ports_and_features() {
+        use PluginCapability::*;
+        // dual-role (例: Scaler 2): note 出力 + audio 出力。
+        assert_eq!(PluginCapability::from_entry(&entry(&["instrument"], true, true)), DualRole);
+        // 純 MIDI FX: note 出力のみ。
+        assert_eq!(PluginCapability::from_entry(&entry(&["note-effect"], true, false)), PureMidiEffect);
+        // 音源: note 出力なし + instrument feature。
+        assert_eq!(PluginCapability::from_entry(&entry(&["instrument"], false, true)), Instrument);
+        // 音声エフェクト: note 出力なし + instrument でない。
+        assert_eq!(PluginCapability::from_entry(&entry(&["audio-effect"], false, true)), AudioFx);
+        // 未分類 (port も feature も無し) は audio fx 扱い。
+        assert_eq!(PluginCapability::from_entry(&entry(&[], false, false)), AudioFx);
+    }
+
+    #[test]
+    fn allows_slot_kind_matches_role() {
+        use PluginCapability::*;
+        // slot_kind: 0=MidiFx, 1=Instrument, 2=Fx。
+        assert!(PureMidiEffect.allows_slot_kind(0));
+        assert!(!PureMidiEffect.allows_slot_kind(1));
+        assert!(!PureMidiEffect.allows_slot_kind(2));
+        // dual-role は生成器(0)・音源(1) 両方可、 audio fx(2) は不可。
+        assert!(DualRole.allows_slot_kind(0));
+        assert!(DualRole.allows_slot_kind(1));
+        assert!(!DualRole.allows_slot_kind(2));
+        assert!(Instrument.allows_slot_kind(1));
+        assert!(!Instrument.allows_slot_kind(0));
+        assert!(!Instrument.allows_slot_kind(2));
+        assert!(AudioFx.allows_slot_kind(2));
+        assert!(!AudioFx.allows_slot_kind(0));
+        assert!(!AudioFx.allows_slot_kind(1));
+    }
+}
+
 impl PluginPickEntry {
     fn from_db_entry(e: &common::plugin_db::PluginEntry) -> Self {
         Self {
@@ -1620,6 +1722,18 @@ impl AppData {
         // 同期されるので、 初回のみここで初期化する。
         let mut app = app;
         app.init_recent_labels();
+        // FIXME #29: cache が旧 port-probe 版 (PluginEntry の 3 bool 未取得) なら、
+        // 起動時に 1 回だけ自動で再 probe (rescan) して port 構成を埋める。 production
+        // (app_dirs=Some) のみ — test は app_dirs=None なので実システム scan を避ける。
+        if app.app_dirs.is_some()
+            && app
+                .plugin_db
+                .as_ref()
+                .is_some_and(|db| db.needs_port_probe())
+        {
+            tracing::info!("plugin cache predates port-probe; auto-rescanning to fill port info");
+            app.begin_rescan();
+        }
         // 起動直後の song (1 track 持ち) を保存ベースラインに確定する。
         // is_dirty は literal で false 初期化済 (song == saved_song)。
         app.saved_song = app.song.clone();
@@ -2901,6 +3015,10 @@ pub enum AppEvent {
     /// close 確認モーダルで「キャンセル」 (Esc / 外クリック / ✕ 含む)。
     /// 終了を取りやめてアプリに戻る。
     CloseConfirmCancel,
+    /// FIXME #27: 別の daw_gui を起動しようとした (single-instance)。 2 つ目の
+    /// プロセスが既存インスタンスにこれを送って前面化を要求する。 window 操作
+    /// なので runner の `user_event` が直接処理し、 `handle_event` には届かない。
+    RaiseMainWindow,
     Play,
     Stop,
     PlayToggle,
@@ -4341,6 +4459,9 @@ impl AppData {
                 self.set_note_velocities(&updates);
             }
             AppEvent::AddInstrumentTrack => self.action_add_instrument_track(),
+            // FIXME #27: 前面化は runner の user_event が window へ直接行うため、
+            // ここには届かない。 match 網羅のための no-op。
+            AppEvent::RaiseMainWindow => {}
             AppEvent::GroupSelectedTracks { track_ids } => {
                 self.action_group_selected_tracks(&track_ids);
             }
@@ -7479,10 +7600,15 @@ impl AppData {
             clips: Vec::new(),
             ..Track::default()
         };
-        self.song.tracks.push(track);
+        // FIXME #30: 挿入位置は「選択中で最下段の track の直後」 (純ロジックは
+        // add_track_insert_index)。 選択が無いときだけ従来どおり末尾。
+        let insert_at = add_track_insert_index(&self.song.tracks, &self.selected_track_ids);
+        self.song.tracks.insert(insert_at, track);
+        // 追加直後はこの新 track を唯一の選択 + カーソルにする (次の操作の対象)。
+        self.selected_track_ids = vec![id];
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
-        tracing::info!(index, "added instrument track");
+        tracing::info!(insert_at, "added instrument track");
     }
 
     // ----------------------------------------------------------------
@@ -13581,66 +13707,112 @@ impl AppData {
     }
 
     /// inspector chain (MIDI FX → Instrument → FX を一列で表示) の reorder。
-    /// `order[i]` は新位置 i に来る旧 chain index。section 跨ぎ (slot_kind が
-    /// 変わる移動) は無視 (DAW 慣習: signal flow 順序の意味が壊れる)。
+    /// `order[i]` は新位置 i に来る旧 chain index。FIXME #29: 並べ替えは各プラグインの
+    /// capability (ポート構成) で「ポート的に有効な配置」だけ許す。 dual-role は生成器位置
+    /// ⇔ 音源位置を跨いで動かせ、 純粋な音源/MIDI FX/audio FX は自セクション内のみ。
+    /// 無効な drop は early-return で no-op (UI は元の並びに戻る)。
     fn reorder_inspector_chain(&mut self, order: &[usize]) {
         let chain = self.inspector_chain();
         if chain.len() != order.len() {
             return;
         }
-        // section 整合性チェック: 各位置の slot_kind が変わらないこと
-        let same_section = order
-            .iter()
-            .enumerate()
-            .all(|(new_i, &old_i)| {
-                chain.get(old_i).map(|e| e.slot_kind)
-                    == chain.get(new_i).map(|e| e.slot_kind)
-            });
-        if !same_section {
-            return;
-        }
-        // master bus は chain が master_fx_chain (FX only) なので、 order を
-        // そのまま適用する (midi/inst section が無いので fx_start == 0)。
+        // master bus は chain が master_fx_chain (FX only) なので順序だけ適用。
+        // cross-section は起きない (全 slot_kind == 2)。
         if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
             let fx_count = self.song.master_fx_chain.len();
-            if fx_count > 0 {
+            if fx_count == order.len()
+                && fx_count > 0
+                && order.iter().all(|&o| o < fx_count)
+            {
                 let new_fx: Vec<_> = (0..fx_count)
                     .map(|new_i| self.song.master_fx_chain[order[new_i]].clone())
                     .collect();
                 self.song.master_fx_chain = new_fx;
+                self.sync_song_to_plugin_host();
             }
-            self.sync_song_to_plugin_host();
             return;
         }
-        let track_idx = self.cursor_track_index().unwrap_or(0) as u32;
-        let Some(track) = self.song.tracks.get_mut(track_idx as usize) else {
+        let Some(track_idx) = self.cursor_track_index() else {
             return;
         };
-        // chain の構成: [midi_fx_chain..., (instrument), fx_chain...]
-        let midi_count = track.midi_fx_chain.len();
-        let inst_count = usize::from(track.instrument.is_some());
-        let fx_start = midi_count + inst_count;
-
-        // MIDI FX section を新順序で並び替え
-        if midi_count > 0 {
-            let new_midi: Vec<_> = (0..midi_count)
-                .map(|new_i| track.midi_fx_chain[order[new_i]].clone())
-                .collect();
-            track.midi_fx_chain = new_midi;
+        // chain (= inspector_chain 順 [midi_fx..., inst?, fx...]) を flat な
+        // PluginInstance 列にする。 これで old chain index ↔ PluginInstance が対応。
+        let flat: Vec<common::model::PluginInstance> = {
+            let Some(track) = self.song.tracks.get(track_idx) else {
+                return;
+            };
+            let mut v = Vec::with_capacity(chain.len());
+            v.extend(track.midi_fx_chain.iter().cloned());
+            if let Some(inst) = track.instrument.as_ref() {
+                v.push(inst.clone());
+            }
+            v.extend(track.fx_chain.iter().cloned());
+            v
+        };
+        if flat.len() != chain.len() || order.iter().any(|&o| o >= flat.len()) {
+            return;
         }
-        // FX section を新順序で並び替え
-        let fx_count = track.fx_chain.len();
-        if fx_count > 0 {
-            let new_fx: Vec<_> = (0..fx_count)
-                .map(|new_i| {
-                    let chain_new_i = fx_start + new_i;
-                    let chain_old_i = order[chain_new_i];
-                    let fx_old_i = chain_old_i - fx_start;
-                    track.fx_chain[fx_old_i].clone()
-                })
-                .collect();
-            track.fx_chain = new_fx;
+        // 各 flat index の capability を解決。 db 不在 / 未登録は prior slot_kind に
+        // 縛り (従来の section 内 reorder と等価な安全側)、 既知プラグインは port 由来。
+        let db = self.plugin_db.clone();
+        let caps: Vec<PluginCapability> = (0..flat.len())
+            .map(|i| {
+                db.as_ref()
+                    .and_then(|d| d.find_by_id(&flat[i].plugin_id))
+                    .map(PluginCapability::from_entry)
+                    .unwrap_or(match chain[i].slot_kind {
+                        0 => PluginCapability::PureMidiEffect,
+                        1 => PluginCapability::Instrument,
+                        _ => PluginCapability::AudioFx,
+                    })
+            })
+            .collect();
+        // 音源 (= prior slot_kind 1) の新位置。 これを境に前=生成器(0) / 後=audio fx(2)、
+        // その位置自身が音源(1)。 音源が無ければ生成器→audio fx の単調列。
+        let inst_new_pos = (0..order.len()).find(|&i| chain[order[i]].slot_kind == 1);
+        let mut new_kinds = vec![0u8; order.len()];
+        let mut saw_fx = false;
+        for i in 0..order.len() {
+            let cap = caps[order[i]];
+            let kind = match inst_new_pos {
+                Some(p) if i < p => 0,
+                Some(p) if i == p => 1,
+                Some(_) => 2,
+                None if cap == PluginCapability::AudioFx => 2,
+                None => 0,
+            };
+            // ポート的に置けない位置への drop は棄却 (= UI は元の並びへ)。
+            if !cap.allows_slot_kind(kind) {
+                return;
+            }
+            // 音源の無い列では「生成器の後に audio fx」 の単調性だけ要求する。
+            if inst_new_pos.is_none() {
+                if kind == 2 {
+                    saw_fx = true;
+                } else if saw_fx {
+                    return;
+                }
+            }
+            new_kinds[i] = kind;
         }
+        // 新順序 + new_kinds で 3 つの Vec へ再分割 (section 跨ぎ書き戻しを含む)。
+        let mut new_midi = Vec::new();
+        let mut new_inst = None;
+        let mut new_fx = Vec::new();
+        for i in 0..order.len() {
+            let inst = flat[order[i]].clone();
+            match new_kinds[i] {
+                0 => new_midi.push(inst),
+                1 => new_inst = Some(inst),
+                _ => new_fx.push(inst),
+            }
+        }
+        let Some(track) = self.song.tracks.get_mut(track_idx) else {
+            return;
+        };
+        track.midi_fx_chain = new_midi;
+        track.instrument = new_inst;
+        track.fx_chain = new_fx;
         self.sync_song_to_plugin_host();
     }
 
@@ -14385,19 +14557,20 @@ impl AppData {
         let path = entry.path.clone();
         let entry_id = entry.id.clone();
         let entry_format = entry.format;
-        // 種別は features から自動導出 (plan_unified_plugin_picker.md): note-effect >
-        // instrument > audio-effect、 未分類は FX チェーンへ。 これが行き先スロットを決める。
-        let category = PluginCategory::from_features(&entry.features);
+        // FIXME #29: 行き先は features ではなく **port 構成由来の capability** で決める
+        // (note 出力の有無は probe 済みの SSoT)。 dual-role は音源の空き状況で
+        // 生成器 / 音源に振り分ける。
+        let capability = PluginCapability::from_entry(entry);
         self.ensure_first_track();
 
         // master bus 選択時は track Vec ではなく Song.master_fx_chain を対象に
-        // する。 master は audio fx のみ持つので Instrument / MidiFx target は
-        // 無視 (= inspector は master 選択時に「+ FX」しか出さない)。
+        // する。 master は audio fx のみ持つので、 note 出力や音源能力を持つ
+        // プラグイン (生成器 / 音源 / dual-role) は挿せない。
         if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
-            if category != PluginCategory::Fx {
+            if capability != PluginCapability::AudioFx {
                 tracing::warn!(
-                    ?category,
-                    "master bus に instrument / midi fx は挿せない (audio fx のみ)"
+                    ?capability,
+                    "master bus に audio fx 以外は挿せない"
                 );
                 return;
             }
@@ -14429,17 +14602,27 @@ impl AppData {
         // PR2.1: send `Track::id` to the plugin host (track_idx は
         // ローカルの song.tracks 操作のみで使う)。
         let track_id = self.song.tracks[track_idx].id;
-        // 行き先スロットは選んだプラグインの種別から導出。 Fx / MidiFx はチェーン末尾へ
-        // 追加 (Ctrl 連続選択で積める)。 Instrument は単一スロットなので 2 つ目は差し替え。
-        let dest_slot = match category {
-            PluginCategory::Instrument => PluginSlot::Instrument,
-            PluginCategory::Fx => {
+        // FIXME #29: 行き先スロットは capability + 音源の空き状況で決まる。
+        // PureMidiEffect は生成器列、 AudioFx は audio-fx 列、 Instrument は音源スロット
+        // (単一なので 2 つ目は差し替え)。 DualRole (例: Scaler 2) は音源が空なら音源、
+        // 埋まっていれば「後段を鳴らす生成器」として生成器列末尾へ (grilled 既定挿入)。
+        let dest_slot = match capability {
+            PluginCapability::Instrument => PluginSlot::Instrument,
+            PluginCapability::AudioFx => {
                 let next = self.song.tracks[track_idx].fx_chain.len() as u32;
                 PluginSlot::Fx(next)
             }
-            PluginCategory::MidiFx => {
+            PluginCapability::PureMidiEffect => {
                 let next = self.song.tracks[track_idx].midi_fx_chain.len() as u32;
                 PluginSlot::MidiFx(next)
+            }
+            PluginCapability::DualRole => {
+                if self.song.tracks[track_idx].instrument.is_none() {
+                    PluginSlot::Instrument
+                } else {
+                    let next = self.song.tracks[track_idx].midi_fx_chain.len() as u32;
+                    PluginSlot::MidiFx(next)
+                }
             }
         };
         self.track_pending_load(track_id, dest_slot);
@@ -14555,36 +14738,44 @@ impl AppData {
         let proxy = self.event_proxy.clone();
         std::thread::spawn(move || match common::plugin_db::scan_system() {
             Ok(mut db) => {
-                // FIXME #26 Phase B: VST3 は note-effect の category tag が無いので、
-                // 各 VST3 を使い捨て probe プロセスで起動して bus 構成を読み、
-                // note-effect なら features に "note-effect" を追記する (routing は
-                // PluginCategory::from_features が拾う)。 probe 失敗 / timeout は
-                // false fallback (= FX 扱い、 退行しない)。 CLAP は変更不要。
-                let vst3_idx: Vec<usize> = db
+                // FIXME #29: VST3 / CLAP とも descriptor からは port 構成が分からない
+                // (VST3 は category tag 無し、 CLAP は feature に note 出力の有無が無い)。
+                // 各プラグインを使い捨て probe プロセスで起動して note in/out・audio out
+                // を読み、 PluginEntry の 3 bool (capability の SSoT) を更新する。 probe
+                // 失敗 / timeout は scan-time 暫定値を保持 (退行しない)。 builtin は code が
+                // SSoT なので probe しない。
+                let probe_idx: Vec<usize> = db
                     .entries
                     .iter()
                     .enumerate()
                     .filter(|(_, e)| {
-                        e.format == common::plugin_format::PluginFormat::Vst3
+                        matches!(
+                            e.format,
+                            common::plugin_format::PluginFormat::Vst3
+                                | common::plugin_format::PluginFormat::Clap
+                        )
                     })
                     .map(|(i, _)| i)
                     .collect();
-                let total = vst3_idx.len();
-                for (n, &i) in vst3_idx.iter().enumerate() {
+                let total = probe_idx.len();
+                for (n, &i) in probe_idx.iter().enumerate() {
                     proxy.send(AppEvent::RescanProgress { done: n, total });
-                    let (path, id) = {
+                    let (format, path, id) = {
                         let e = &db.entries[i];
-                        (e.path.clone(), e.id.clone())
+                        (e.format, e.path.clone(), e.id.clone())
                     };
-                    if crate::subprocess::probe_vst3_note_effect(&path, &id)
-                        && !db.entries[i].features.iter().any(|f| f == "note-effect")
-                    {
-                        db.entries[i].features.push("note-effect".into());
+                    if let Some(cfg) = crate::subprocess::probe_plugin_ports(format, &path, &id) {
+                        let e = &mut db.entries[i];
+                        e.has_note_input = cfg.has_note_input;
+                        e.has_note_output = cfg.has_note_output;
+                        e.has_audio_output = cfg.has_audio_output;
                     }
                 }
                 if total > 0 {
                     proxy.send(AppEvent::RescanProgress { done: total, total });
                 }
+                // FIXME #29 Step 7: probe 済みを示す版を立てる (起動時の自動再 probe 判定用)。
+                db.port_probe_version = common::plugin_db::PORT_PROBE_VERSION;
                 if let Some(cache) = common::plugin_db::default_cache_path()
                     && let Err(e) = db.save_to_file(&cache)
                 {
@@ -16547,6 +16738,73 @@ mod image_drop_target_tests {
         // track が 0 本 → 何を指しても新規 track。
         assert_eq!(resolve_image_drop_target(Some(0), 0), None);
         assert_eq!(resolve_image_drop_target(None, 0), None);
+    }
+}
+
+/// FIXME #30: 新規 track の挿入 index を決めるピュアロジック。 選択中の
+/// track が 1 つ以上あれば「最下段 (= `tracks` 内 index 最大) の選択の直後」、
+/// 無ければ末尾。 複数選択でも一番下を基準にすることで選択のかたまりを割らない。
+/// `selected` 内の stale id (= `tracks` に存在しない) は `position()` が `None` を
+/// 返すので自然に無視され、 全部 stale なら末尾に fallback する。
+fn add_track_insert_index(tracks: &[Track], selected: &[u32]) -> usize {
+    selected
+        .iter()
+        .filter_map(|sid| tracks.iter().position(|t| t.id == *sid))
+        .max()
+        .map_or(tracks.len(), |bottom| bottom + 1)
+}
+
+#[cfg(test)]
+mod add_track_insert_index_tests {
+    use super::add_track_insert_index;
+    use common::model::Track;
+
+    fn tracks(ids: &[u32]) -> Vec<Track> {
+        ids.iter()
+            .map(|&id| Track { id, ..Track::default() })
+            .collect()
+    }
+
+    #[test]
+    fn appends_at_end_when_no_selection() {
+        let t = tracks(&[10, 11, 12]);
+        assert_eq!(add_track_insert_index(&t, &[]), 3);
+    }
+
+    #[test]
+    fn inserts_after_single_selected() {
+        let t = tracks(&[10, 11, 12]);
+        // 先頭 (id 10, index 0) を選択 → 直後 = index 1。
+        assert_eq!(add_track_insert_index(&t, &[10]), 1);
+        // 中央 (id 11, index 1) → index 2。
+        assert_eq!(add_track_insert_index(&t, &[11]), 2);
+        // 末尾 (id 12, index 2) → index 3 (= 末尾と一致)。
+        assert_eq!(add_track_insert_index(&t, &[12]), 3);
+    }
+
+    #[test]
+    fn inserts_after_bottom_most_of_multi_selection() {
+        let t = tracks(&[10, 11, 12, 13]);
+        // 選択 {10, 12} の最下段は 12 (index 2) → index 3。 vec の順序に依らない。
+        assert_eq!(add_track_insert_index(&t, &[10, 12]), 3);
+        assert_eq!(add_track_insert_index(&t, &[12, 10]), 3);
+        // {11, 12} の最下段は 12 (index 2) → index 3。
+        assert_eq!(add_track_insert_index(&t, &[11, 12]), 3);
+    }
+
+    #[test]
+    fn stale_ids_fall_back_to_end() {
+        let t = tracks(&[10, 11]);
+        // 全部 stale → 末尾。
+        assert_eq!(add_track_insert_index(&t, &[999, 1000]), 2);
+        // 一部 stale → 生きている最下段 (id 10, index 0) の直後。
+        assert_eq!(add_track_insert_index(&t, &[10, 999]), 1);
+    }
+
+    #[test]
+    fn empty_track_list() {
+        assert_eq!(add_track_insert_index(&[], &[]), 0);
+        assert_eq!(add_track_insert_index(&[], &[5]), 0);
     }
 }
 

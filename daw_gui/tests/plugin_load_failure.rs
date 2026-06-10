@@ -27,6 +27,9 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 features: vec!["instrument".into()],
                 path: "C:/fake/synth.clap".into(),
                 descriptor_index: 0,
+                has_note_input: true,
+                has_note_output: false,
+                has_audio_output: true,
             },
             PluginEntry {
                 id: "test.fx".into(),
@@ -37,9 +40,13 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 features: vec!["audio-effect".into()],
                 path: "C:/fake/fx.clap".into(),
                 descriptor_index: 0,
+                has_note_input: false,
+                has_note_output: false,
+                has_audio_output: true,
             },
         ],
         scanned_at: None,
+        port_probe_version: 0,
     })
 }
 

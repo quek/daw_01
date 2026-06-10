@@ -34,9 +34,12 @@ fn make_plugin_db_with_n_instruments(n: usize) -> Arc<PluginDatabase> {
             features: vec!["instrument".into()],
             path: std::path::PathBuf::from(format!("C:/fake/synth_{i}.clap")),
             descriptor_index: 0,
+            has_note_input: true,
+            has_note_output: false,
+            has_audio_output: true,
         });
     }
-    Arc::new(PluginDatabase { entries, scanned_at: None })
+    Arc::new(PluginDatabase { entries, scanned_at: None, port_probe_version: 0 })
 }
 
 fn build_app(

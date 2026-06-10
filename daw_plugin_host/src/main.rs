@@ -406,26 +406,45 @@ async fn main() -> Result<()> {
     common::logging::init_tracing();
     tracing::info!("daw_plugin_host started");
 
-    // FIXME #26 Phase B: one-shot VST3 note-effect probe モード。 daw_gui の
-    // rescan が VST3 ごとにこのプロセスを使い捨てで起動し (プロセス隔離 +
-    // caller 側 timeout)、 bus 構成から note-effect 判定を得る。 plugin の
-    // instantiate を別プロセスへ押し込むことで、 壊れた / ハングする VST3 が
-    // スキャン本体を巻き込まない。 stdout に `note_effect=<bool>` を 1 行出して
-    // 即 exit (IPC handshake へ進まない)。 どんな失敗でも false で出して退行
-    // させない (caller は FX 扱いに fallback)。
+    // FIXME #26/#29: one-shot VST3 port-probe モード。 daw_gui の rescan が VST3
+    // ごとにこのプロセスを使い捨てで起動し (プロセス隔離 + caller 側 timeout)、
+    // bus 構成から port 構成 (note in/out・audio out) を得る。 plugin の instantiate
+    // を別プロセスへ押し込むことで、 壊れた / ハングする VST3 がスキャン本体を
+    // 巻き込まない。 **成功時のみ** stdout に `note_in=.. note_out=.. audio_out=..`
+    // を 1 行出して即 exit (IPC handshake へ進まない)。 失敗 (Err / panic) は無出力
+    // → caller は scan-time 暫定値を保持する (退行しない)。
     if std::env::args().nth(1).as_deref() == Some("--probe-vst3") {
         let path = std::env::args()
             .nth(2)
             .context("--probe-vst3 needs <path>")?;
         let target_id = std::env::args().nth(3).unwrap_or_default();
         // VST3 instantiate は plugin-main thread idiom に合わせ専用 thread で。
-        let is_note_effect = std::thread::spawn(move || {
-            vst3_plugin::probe_note_effect(std::path::Path::new(&path), &target_id)
-                .unwrap_or(false)
+        let ports = std::thread::spawn(move || {
+            vst3_plugin::probe_ports(std::path::Path::new(&path), &target_id)
         })
-        .join()
-        .unwrap_or(false);
-        println!("note_effect={is_note_effect}");
+        .join();
+        if let Ok(Ok(cfg)) = ports {
+            println!("{}", cfg.to_line());
+        }
+        return Ok(());
+    }
+
+    // FIXME #29: one-shot CLAP port-probe モード。 VST3 と対称 (--probe-vst3 と
+    // 同じ行形式・同じ失敗時無出力)。 CLAP descriptor の feature には note 出力の
+    // 有無が無いので、 dual-role 検出には instance 生成後の note-ports/audio-ports
+    // query が要る。
+    if std::env::args().nth(1).as_deref() == Some("--probe-clap") {
+        let path = std::env::args()
+            .nth(2)
+            .context("--probe-clap needs <path>")?;
+        let target_id = std::env::args().nth(3).unwrap_or_default();
+        let ports = std::thread::spawn(move || {
+            clap_plugin::probe_ports(std::path::Path::new(&path), &target_id)
+        })
+        .join();
+        if let Ok(Ok(cfg)) = ports {
+            println!("{}", cfg.to_line());
+        }
         return Ok(());
     }
 

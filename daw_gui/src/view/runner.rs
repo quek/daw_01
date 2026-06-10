@@ -779,6 +779,16 @@ impl ApplicationHandler<AppEvent> for Runner {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         let Some(state) = self.state.as_mut() else { return };
+        // FIXME #27: 別インスタンスが起動を試み、 既存 (= この) ウィンドウへ
+        // 前面化を要求してきた。 window 操作なので AppData ではなく runner が
+        // 直接処理する: 最小化なら復元してフォアグラウンドへ。
+        if matches!(event, AppEvent::RaiseMainWindow) {
+            let win = state.window.inner();
+            win.set_minimized(false);
+            win.focus_window();
+            state.window.request_redraw();
+            return;
+        }
         state.app.handle_event(event);
         state.window.request_redraw();
         // 背景スレッド (IPC bridge) 経由の event で、 plugin state 取得待ちの

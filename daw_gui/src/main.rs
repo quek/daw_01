@@ -114,6 +114,34 @@ fn main() -> Result<()> {
     tracing::info!("daw_gui starting");
 
     let cli = parse_args()?;
+
+    // FIXME #27: 対話 GUI は single-instance。 2 つ目の起動は既存ウィンドウを
+    // 前面化して即終了する。 --script (WAV 書き出し) / --smoke-test[-text] (CI
+    // 検証) は対象外 — 開発インスタンスを開いたまま並行実行できる必要があるため。
+    // bootstrap_subprocess (子プロセス起動 / audio device open) より前に弾く。
+    let interactive = cli.script.is_none() && cli.smoke_test.is_none() && !cli.smoke_test_text;
+    let mut singleton_primary = false;
+    let _singleton = if interactive {
+        match daw_gui::single_instance::acquire() {
+            Ok(daw_gui::single_instance::SingleInstance::AlreadyRunning) => {
+                tracing::info!(
+                    "daw_gui already running; brought the existing window to front, exiting"
+                );
+                return Ok(());
+            }
+            Ok(daw_gui::single_instance::SingleInstance::Primary(g)) => {
+                singleton_primary = true;
+                Some(g)
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "single-instance gate unavailable; continuing without it");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let bootstrap = bootstrap_subprocess()?;
 
     if let Some(script_path) = cli.script.as_ref() {
@@ -121,13 +149,15 @@ fn main() -> Result<()> {
         return run_scripted(bootstrap, script_path, cli.output.as_deref(), &cli.extra);
     }
 
-    run_gui(bootstrap, cli.smoke_test, cli.smoke_test_text)
+    // `_singleton` は run_gui (= event loop) が返るまで保持し、 mutex を握り続ける。
+    run_gui(bootstrap, cli.smoke_test, cli.smoke_test_text, singleton_primary)
 }
 
 fn run_gui(
     mut bootstrap: Bootstrap,
     smoke_test_fixture: Option<PathBuf>,
     #[cfg_attr(not(windows), allow(unused_variables))] smoke_test_text: bool,
+    singleton_primary: bool,
 ) -> Result<()> {
     tracing::info!("opening main window");
 
@@ -185,6 +215,18 @@ fn run_gui(
             spawn_autosave_timer(proxy.clone());
             spawn_midi_input(proxy.clone());
             spawn_incoming_bridge(incoming_rx, proxy.clone());
+
+            // FIXME #27: primary インスタンスは、 2 つ目の起動からの前面化要求を
+            // 待つ listener を立てる (event 受信 → RaiseMainWindow を event loop へ)。
+            // smoke-test / script モードはゲート対象外なので primary フラグは立たない。
+            if singleton_primary {
+                let raise_proxy = proxy.clone();
+                if let Err(e) = daw_gui::single_instance::spawn_raise_listener(move || {
+                    let _ = raise_proxy.send_event(AppEvent::RaiseMainWindow);
+                }) {
+                    tracing::warn!(error = ?e, "failed to start single-instance raise listener");
+                }
+            }
 
             // `--smoke-test <fixture>` → background orchestrator drives
             // ImportVideo / TogglePreviewWindow / Play via the same

@@ -11,6 +11,7 @@ pub mod plugin_db;
 pub mod plugin_format;
 pub mod plugin_metadata;
 pub mod plugin_ref;
+pub mod port_config;
 pub mod process_data;
 pub mod project;
 pub mod protocol;

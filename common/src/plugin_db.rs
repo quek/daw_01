@@ -46,7 +46,24 @@ pub struct PluginEntry {
     /// descriptors (e.g. VCV Rack's `rack` / `rack.fx` / `rack.generator`,
     /// or a VST3 vendor shipping several classes in one DLL).
     pub descriptor_index: u32,
+    /// FIXME #29: ポート構成（capability の **Single Source of Truth**）。
+    /// `note 入力`を持つ（= MIDI/note を受け取れる）。probe で確定。
+    /// 旧 cache（フィールド無し）は `#[serde(default)]` で `false` に load される
+    /// (= 起動時 [`PluginDatabase::needs_port_probe`] が rescan を促す)。
+    #[serde(default)]
+    pub has_note_input: bool,
+    /// `note 出力`を持つ = **生成器になれる**（Scaler 2 のような dual-role 判定の基準）。
+    #[serde(default)]
+    pub has_note_output: bool,
+    /// `audio 出力`を持つ = **音源になれる**。
+    #[serde(default)]
+    pub has_audio_output: bool,
 }
+
+/// FIXME #29: port 構成 probe スキーマの現行版。 `PluginEntry` に記録する 3 bool
+/// (note in/out・audio out) の取得方法・意味づけを変えたら上げる。 cache の
+/// `port_probe_version` がこれ未満なら、 起動時に再 probe (rescan) する。
+pub const PORT_PROBE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PluginDatabase {
@@ -55,12 +72,29 @@ pub struct PluginDatabase {
     /// "rescan if older than X" heuristics in the future.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scanned_at: Option<u64>,
+    /// FIXME #29: `PluginEntry` の port 構成 (3 bool) を probe で埋めた版
+    /// ([`PORT_PROBE_VERSION`])。 古い cache (フィールド無し) は `#[serde(default)]`
+    /// で 0 に load され、 [`PluginDatabase::needs_port_probe`] が再 probe を促す。
+    #[serde(default)]
+    pub port_probe_version: u32,
 }
 
 impl PluginDatabase {
     /// Returns the entry with matching `id`, or `None` if absent.
     pub fn find_by_id(&self, id: &str) -> Option<&PluginEntry> {
         self.entries.iter().find(|e| e.id == id)
+    }
+
+    /// FIXME #29: 起動時に port 構成の再 probe (= rescan) が要るか。 cache が旧版
+    /// ([`PORT_PROBE_VERSION`] 未満) で、 かつ probe 対象 (VST3/CLAP) を 1 つ以上
+    /// 持つときだけ true。 builtin のみ / 空 DB では促さない (probe する物が無い)。
+    #[must_use]
+    pub fn needs_port_probe(&self) -> bool {
+        self.port_probe_version < PORT_PROBE_VERSION
+            && self
+                .entries
+                .iter()
+                .any(|e| matches!(e.format, PluginFormat::Vst3 | PluginFormat::Clap))
     }
 
     /// daw_01-bundled builtin plugin (`PluginFormat::Builtin`) を entries
@@ -138,6 +172,7 @@ impl PluginDatabase {
                 .cloned()
                 .collect(),
             scanned_at: self.scanned_at,
+            port_probe_version: self.port_probe_version,
         };
         let tmp = path.with_extension("json.tmp");
         let data = serde_json::to_string_pretty(&persisted)
@@ -186,6 +221,10 @@ pub fn builtin_descriptors() -> Vec<PluginEntry> {
             features: instrument_features.clone(),
             path: PathBuf::from(BUILTIN_ID_SILENCE),
             descriptor_index: 0,
+            // 純粋音源: note を受け、 audio を出す。 note 出力は持たない。
+            has_note_input: true,
+            has_note_output: false,
+            has_audio_output: true,
         },
         PluginEntry {
             id: BUILTIN_ID_VOICEVOX.to_string(),
@@ -200,6 +239,10 @@ pub fn builtin_descriptors() -> Vec<PluginEntry> {
             },
             path: PathBuf::from(BUILTIN_ID_VOICEVOX),
             descriptor_index: 0,
+            // 純粋音源 (歌唱合成): note を受け、 audio を出す。
+            has_note_input: true,
+            has_note_output: false,
+            has_audio_output: true,
         },
     ]
 }
@@ -261,6 +304,11 @@ pub fn scan_system() -> Result<PluginDatabase> {
                     features,
                     path: c.bundle_path,
                     descriptor_index: c.descriptor_index,
+                    // VST3 は scan 時に bus を読めない (probe は別 subprocess = Step 5)。
+                    // probe 前の保守的暫定値: 純 audio 扱い。 probe が正確値で上書きする。
+                    has_note_input: false,
+                    has_note_output: false,
+                    has_audio_output: true,
                 });
             }
         }
@@ -272,6 +320,9 @@ pub fn scan_system() -> Result<PluginDatabase> {
     Ok(PluginDatabase {
         entries,
         scanned_at: Some(now_secs()),
+        // FIXME #29: scan_system は port を probe しない (GUI の rescan thread が
+        // probe 後に PORT_PROBE_VERSION を立てる)。 ここでは 0 = 未 probe。
+        port_probe_version: 0,
     })
 }
 
@@ -360,15 +411,24 @@ fn scan_one_file(path: &Path) -> Result<Vec<PluginEntry>> {
             tracing::warn!(index = i, path = %path.display(), "descriptor with empty id, skipping");
             continue;
         }
+        // FIXME #29: CLAP descriptor には port 有無が無いので、 ここでは feature 由来の
+        // 保守的暫定値。 正確な port 構成は CLAP probe (Step 5 の rescan) が上書きする。
+        let features = read_feature_list(desc.features, path);
+        let has_note_eff = features.iter().any(|f| f == "note-effect");
+        let has_instr = features.iter().any(|f| f == "instrument");
         out.push(PluginEntry {
             id,
             format: PluginFormat::Clap,
             name: cstr_to_string(desc.name),
             vendor: cstr_to_string(desc.vendor),
             version: cstr_to_string(desc.version),
-            features: read_feature_list(desc.features, path),
+            features,
             path: path.to_path_buf(),
             descriptor_index: i,
+            // 純 MIDI FX (note-effect かつ instrument でない) 以外は audio 出力ありと仮定。
+            has_note_input: has_note_eff || has_instr,
+            has_note_output: has_note_eff,
+            has_audio_output: !has_note_eff || has_instr,
         });
     }
 
@@ -430,8 +490,12 @@ mod tests {
                 features: vec!["instrument".into()],
                 path: PathBuf::from("C:\\foo.clap"),
                 descriptor_index: 0,
+                has_note_input: false,
+                has_note_output: false,
+                has_audio_output: true,
             }],
             scanned_at: Some(42),
+            port_probe_version: 0,
         };
         assert_eq!(
             db.find_by_id("com.example.foo").map(|e| e.name.as_str()),
@@ -459,8 +523,12 @@ mod tests {
                 features: vec![],
                 path: PathBuf::from("/tmp/x.clap"),
                 descriptor_index: 2,
+                has_note_input: false,
+                has_note_output: false,
+                has_audio_output: true,
             }],
             scanned_at: Some(100),
+            port_probe_version: 0,
         };
         db.save_to_file(&path).unwrap();
         let loaded = PluginDatabase::load_from_file(&path).unwrap().unwrap();
@@ -521,8 +589,12 @@ mod tests {
                 features: vec![],
                 path: PathBuf::from("/tmp/x.clap"),
                 descriptor_index: 0,
+                has_note_input: false,
+                has_note_output: false,
+                has_audio_output: true,
             }],
             scanned_at: Some(1),
+            port_probe_version: 0,
         };
         db.ensure_builtins();
         db.save_to_file(&path).unwrap();

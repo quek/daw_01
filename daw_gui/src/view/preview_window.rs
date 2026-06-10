@@ -681,19 +681,10 @@ impl PreviewWindowState {
             let rh = layer.h * project_box.3;
             let font_size = (layer.font_size_px * scale).max(1.0);
             let line_height = font_size * 1.2;
-            // Approximate text width for horizontal alignment. Single
-            // line text only (`plan_text_overlay.md` §1.1) so the
-            // char_count * 0.55 estimate (= average glyph advance for
-            // Latin + 1.0 for CJK = average ~0.7 mixed) is close enough
-            // for MVP. P-MVP: ask gui_01 for an exact text width API.
-            let approx_text_w =
-                font_size * layer.text.chars().count() as f32 * 0.55;
-            let left = match layer.align {
-                common::model::TextAlign::Left => rx,
-                common::model::TextAlign::Center => rx + (rw - approx_text_w) * 0.5,
-                common::model::TextAlign::Right => rx + rw - approx_text_w,
-            };
-            let top = ry + (rh - line_height) * 0.5;
+            // FIXME #28 (gui_01 #097): 揃えはレンダラに委譲する。 box 原点
+            // = (rx, ry)、 box サイズ = (rw, rh) を渡し、 実 glyph 幅で
+            // `[rx, rx+rw]` / `[ry, ry+rh]` 内に配置させる。 自前の文字幅推定
+            // (旧 `char_count * 0.55`) は撤去 — CJK で center がずれる主因。
             let fill = Color::rgba(
                 layer.fill_color[0],
                 layer.fill_color[1],
@@ -720,8 +711,8 @@ impl PreviewWindowState {
                 } else {
                     Some(layer.font_family.clone())
                 },
-                left,
-                top,
+                left: rx,
+                top: ry,
                 font_size,
                 line_height,
                 color: fill,
@@ -735,6 +726,11 @@ impl PreviewWindowState {
                 ),
                 shadow_blur_px: layer.shadow_blur_px * scale,
                 rotation_radians: layer.rotation_radians,
+                // FIXME #28: box 内アライメント (実 glyph 幅でレンダラが配置)。
+                box_width: Some(rw),
+                box_height: Some(rh),
+                align_h: crate::text_compose::halign_for(layer.align),
+                align_v: daw_ui_renderer::VAlign::Center,
             });
         }
     }

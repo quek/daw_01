@@ -57,6 +57,7 @@ pixel histogram で text 描画 verified) 通過。 `--smoke-test-text` mode で
 
 - 採用: `align: TextAlign { Left, Center, Right }` enum。 (x, y, w, h) box 内で horizontal align、 vertical は単一行なので center 固定。
 - 拒絶: Left 固定 (= タイトルで center align が必須、 不便)。
+- **実装訂正 (2026-06-10, FIXME #28)**: align の位置計算を当初 daw_01 が自前推定 (`approx_text_w = font_size * 文字数 * 0.55`) でやっていたが、 `0.55` が全角 CJK を過小評価し center が目視でずれる + preview/export で二重手書き (SSoT 違反)。 align 計算は **shaping して実寸を知るレンダラが所有すべき**ので、 gui_01 #097 で `GlyphArea` に box (`box_width`/`box_height`) + `align_h`/`align_v` を持たせ、 daw_01 の幅推定と `left`/`top` の `match align` を両 path から撤去する (§5 要望 #097)。
 
 ### 1.6 font_size 単位 = project resolution 基準 px
 
@@ -358,6 +359,19 @@ text の rendering はすべて **daw_gui プロセス内で完結**。 daw_audi
 - `GlyphArea::new()` の default は outline 0 / shadow 0 / rotation 0 (= 既存 caller 互換)
 - 関連仕様: `docs/plan_text_overlay.md` §4 P9
 
+### 要望 #097: `GlyphArea` に box 基準アライメント (`box_width`/`box_height` + `align_h`/`align_v`)
+
+- 動機 (FIXME #28): center 指定の日本語 text が center にならない。 原因は daw_01 の自前文字幅推定 `font_size * 文字数 * 0.55` が全角 CJK を過小評価していること + preview/export の二重手書き (§1.5 実装訂正)。
+- `GlyphArea` に追加:
+  - `pub box_width: Option<f32>` (= 原点 `left` から横幅 `w`。 `None` で現行 = `left` 原点)
+  - `pub box_height: Option<f32>` (= 原点 `top` から縦幅 `h`。 `None` で現行 = `top` 原点)
+  - `pub align_h: HAlign { Left, Center, Right }` (default Left = 現行)
+  - `pub align_v: VAlign { Top, Center, Bottom }` (default Top = 現行)
+- レンダラが shaping した実 advance `tw` を測り、 `Center → left + (w - tw)*0.5` 等で box 内配置。 `tw > w` は clip せず溢れる。
+- 必須: byte 互換 (新 field default は None/Left/Top)、 **非 effect path でも有効**、 box 指定時の rotation pivot は box 中心。
+- daw_01 対応 (landing 後): `preview_window.rs:668-696` / `render_video.rs:596-615` の `approx_text_w` + `left`/`top` の match を削除し、 `box_width: Some(rw) / box_height: Some(rh) / align_h: map(layer.align) / align_v: Center` を渡すだけにする。 preview/export 共通化。
+- 関連仕様: `docs/plan_text_overlay.md` §1.5
+
 ## 6. Out-of-scope (post-MVP)
 
 - multi-line text + word-wrap (= 1 clip = 1 line MVP、 改行禁止)
@@ -383,4 +397,4 @@ text の rendering はすべて **daw_gui プロセス内で完結**。 daw_audi
 - `docs/plan_image_automation.md` — image 各 field の track-level lane (= TextBuiltin lane も同 idiom)
 - `docs/plan_video.md` — video clip pipeline、 OffscreenRenderer 移行で同 path に乗る
 - `docs/plan_automation.md` — automation lane / clip / point の data model
-- `docs/gui_01_conversation.md` — #049 (GlyphArea 拡張) 提出予定
+- `docs/gui_01_conversation.md` — #049 (GlyphArea outline/shadow/rotation 拡張) 完了 / #097 (GlyphArea box 基準アライメント) 提出済 = FIXME #28
