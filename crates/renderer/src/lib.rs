@@ -11,12 +11,14 @@
 
 mod composite;
 pub mod device;
+pub mod fonts;
 pub mod offscreen;
 pub mod pipelines;
 pub mod scene;
 pub mod texture_store;
 
 pub use device::*;
+pub use fonts::available_font_families;
 pub use offscreen::*;
 pub use pipelines::glyph::DEFAULT_FONT_FAMILY;
 pub use scene::*;

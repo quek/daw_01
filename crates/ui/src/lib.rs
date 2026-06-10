@@ -44,7 +44,7 @@ pub use scenegraph::{CachedCommands, SceneNode, Scenegraph, hash_inputs};
 pub use snap::{SnapConfig, SnapMode};
 pub use time::{TimeDisplay, TimeMapping};
 pub use daw_ui_platform::CursorIcon;
-pub use daw_ui_renderer::{TextureHandle, TexturedQuad};
+pub use daw_ui_renderer::{available_font_families, TextureHandle, TexturedQuad};
 pub use ui::{FrameStats, Ui, UiHost};
 pub use viewport::ViewportState1D;
 pub use widgets::level_meter::{LevelMeterStyle, MeterBallistic, MeterScale};

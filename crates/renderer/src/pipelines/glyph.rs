@@ -34,6 +34,9 @@ fn buffer_key(area: &GlyphArea) -> u64 {
     // f32 はそのまま hash 不可なので bit 表現で。
     area.font_size.to_bits().hash(&mut h);
     area.line_height.to_bits().hash(&mut h);
+    // M14 Phase 121 (daw_01 #096): font も cache identity の一部。 同 text+size でも font 違いは
+    // 別 buffer にしないと、 先に焼いた font の buffer が後の area に化ける (cache collision)。
+    area.resolved_font_family().hash(&mut h);
     h.finish()
 }
 
@@ -178,7 +181,7 @@ impl GlyphPipeline {
                     Some(screen.width as f32),
                     Some(screen.height as f32),
                 );
-                let attrs = Attrs::new().family(Family::Name(DEFAULT_FONT_FAMILY));
+                let attrs = Attrs::new().family(Family::Name(area.resolved_font_family()));
                 buffer.set_text(&mut self.font_system, &area.text, &attrs, Shaping::Advanced, None);
                 buffer.shape_until_scroll(&mut self.font_system, false);
                 self.cache.insert(key, CachedBuffer { buffer, last_seen_frame: self.frame_counter });
@@ -300,5 +303,30 @@ mod tests {
         let a = area("same", 14.0, 18.0);
         let b = area("same", 14.0, 20.0);
         assert_ne!(buffer_key(&a), buffer_key(&b));
+    }
+
+    /// M14 Phase 121 (daw_01 #096): 同 text+size+line_height でも font 違いは別 key
+    /// (= 別 buffer)。 これが無いと cache collision で別 font に化ける。
+    #[test]
+    fn buffer_key_font_family_diff() {
+        let mut a = area("same", 14.0, 18.0);
+        let mut b = area("same", 14.0, 18.0);
+        a.font_family = Some("Arial".into());
+        b.font_family = Some("Times New Roman".into());
+        assert_ne!(buffer_key(&a), buffer_key(&b));
+    }
+
+    /// `None` と `Some(DEFAULT_FONT_FAMILY)` は同じ font に解決されるので **同じ key** にする
+    /// (resolved_font_family 経由なので cache を無駄に二重化しない)。
+    #[test]
+    fn buffer_key_none_eq_default_name() {
+        let a = area("same", 14.0, 18.0); // font_family: None
+        let mut b = area("same", 14.0, 18.0);
+        b.font_family = Some(DEFAULT_FONT_FAMILY.into());
+        assert_eq!(buffer_key(&a), buffer_key(&b));
+        // `Some("")` も default 扱い (daw_01 の "" = default 慣習)。
+        let mut c = area("same", 14.0, 18.0);
+        c.font_family = Some("".into());
+        assert_eq!(buffer_key(&a), buffer_key(&c));
     }
 }

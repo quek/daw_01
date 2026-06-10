@@ -42,7 +42,6 @@ use glyphon::{
 };
 use wgpu::MultisampleState;
 
-use crate::pipelines::glyph::DEFAULT_FONT_FAMILY;
 use crate::scene::{Color, GlyphArea, TextureHandle};
 use crate::texture_store::TextureStore;
 
@@ -64,9 +63,12 @@ pub fn normalize_finite(v: f32) -> f32 {
 
 /// effect 適用済 final texture の cache key。 `rotation_radians` は外す
 /// (= base scene vertex shader で適用、 同じ最終 texture を異なる rotation で再利用可能)。
-#[derive(Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
 struct EffectKey {
     text_hash: u64,
+    /// M14 Phase 121 (daw_01 #096): 同 text+size+effect でも font 違いは別 composite texture。
+    /// これを欠くと「同じ歌詞を別 font で重ねる」 ケースで先に焼いた composite に化ける。
+    font_hash: u64,
     font_size_bits: u32,
     line_height_bits: u32,
     color_rgba8: [u8; 4],
@@ -81,8 +83,12 @@ impl EffectKey {
     fn from_area(area: &GlyphArea) -> Self {
         let mut h = DefaultHasher::new();
         area.text.hash(&mut h);
+        let text_hash = h.finish();
+        let mut hf = DefaultHasher::new();
+        area.resolved_font_family().hash(&mut hf);
         Self {
-            text_hash: h.finish(),
+            text_hash,
+            font_hash: hf.finish(),
             font_size_bits: area.font_size.to_bits(),
             line_height_bits: area.line_height.to_bits(),
             color_rgba8: rgba8(area.color),
@@ -652,7 +658,7 @@ impl TextEffectCompositor {
             let metrics = Metrics::new(area.font_size.max(1.0), area.line_height.max(1.0));
             let mut buf = Buffer::new(font_system, metrics);
             buf.set_size(font_system, None, None); // no wrap
-            let attrs = Attrs::new().family(Family::Name(DEFAULT_FONT_FAMILY));
+            let attrs = Attrs::new().family(Family::Name(area.resolved_font_family()));
             buf.set_text(font_system, &area.text, &attrs, Shaping::Advanced, None);
             buf.shape_until_scroll(font_system, false);
             CachedBuffer { buffer: buf, last_seen_frame: frame }
@@ -1007,6 +1013,8 @@ fn buffer_cache_key(area: &GlyphArea) -> u64 {
     area.text.hash(&mut h);
     area.font_size.to_bits().hash(&mut h);
     area.line_height.to_bits().hash(&mut h);
+    // M14 Phase 121 (daw_01 #096): font も layout buffer の cache identity (glyph.rs::buffer_key と同様)。
+    area.resolved_font_family().hash(&mut h);
     h.finish()
 }
 
@@ -1064,6 +1072,7 @@ fn compute_blur_kernel(sigma: f32) -> ([f32; 3], [f32; 3]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipelines::glyph::DEFAULT_FONT_FAMILY;
 
     #[test]
     fn normalize_finite_passes_through_finite() {
@@ -1092,5 +1101,46 @@ mod tests {
         // weights normalized to sum near 1.0 (after summing center + 2 * paired)
         let sum = w[0] + 2.0 * w[1] + 2.0 * w[2];
         assert!((sum - 1.0).abs() < 0.05, "weights sum ≈ 1.0, got {sum}");
+    }
+
+    /// outline 付き (= effect path) で font だけ違う 2 area を作る helper。
+    fn effect_area(font: Option<&str>) -> GlyphArea {
+        GlyphArea {
+            text: "歌".into(),
+            font_size: 48.0,
+            line_height: 56.0,
+            color: Color::rgb(1.0, 1.0, 1.0),
+            font_family: font.map(std::convert::Into::into),
+            outline_color: Color::rgb(0.0, 0.0, 0.0),
+            outline_width_px: 2.0,
+            ..GlyphArea::default()
+        }
+    }
+
+    /// M14 Phase 121 (daw_01 #096): effect path の layout buffer cache key も font 違いを区別する。
+    #[test]
+    fn buffer_cache_key_font_family_diff() {
+        let a = effect_area(Some("Arial"));
+        let b = effect_area(Some("Times New Roman"));
+        assert_ne!(buffer_cache_key(&a), buffer_cache_key(&b));
+        // None == Some(DEFAULT) (resolved 経由で同 buffer)。
+        assert_eq!(
+            buffer_cache_key(&effect_area(None)),
+            buffer_cache_key(&effect_area(Some(DEFAULT_FONT_FAMILY)))
+        );
+    }
+
+    /// M14 Phase 121 (daw_01 #096): composite texture の EffectKey も font 違いを区別する
+    /// (= 同じ歌詞・同じ effect を別 font で重ねても先に焼いた composite に化けない)。
+    #[test]
+    fn effect_key_font_family_diff() {
+        let a = EffectKey::from_area(&effect_area(Some("Arial")));
+        let b = EffectKey::from_area(&effect_area(Some("Times New Roman")));
+        assert_ne!(a, b);
+        // None == Some(DEFAULT)。
+        assert_eq!(
+            EffectKey::from_area(&effect_area(None)),
+            EffectKey::from_area(&effect_area(Some(DEFAULT_FONT_FAMILY)))
+        );
     }
 }

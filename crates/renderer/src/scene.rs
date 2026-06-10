@@ -147,6 +147,13 @@ pub struct GlyphArea {
     /// 行高さ。font_size * 1.2 等。
     pub line_height: f32,
     pub color: Color,
+    /// 描画に使うフォント family 名。 `None` (または `Some("")`) で renderer default
+    /// (`DEFAULT_FONT_FAMILY`)、 `Some(name)` でその family を glyphon の `Family::Name(name)` で
+    /// 解決する。 `name` は
+    /// [`crate::available_font_families`] が返す名前を渡せば必ず解決でき、 解決不能な名前は
+    /// glyphon の system fallback に倒れる。 M14 Phase 121 (daw_01 #096): Text クリップの
+    /// フォントピッカー用 per-area フォント指定。 `None` のとき従来挙動と byte 完全互換。
+    pub font_family: Option<std::sync::Arc<str>>,
     /// `Some` ならこの矩形外をクリップ (glyphon の `TextBounds` で適用)。
     /// `None` で全画面描画。`Ui::with_clip_rect` が自動設定する。
     pub clip_rect: Option<Rect>,
@@ -192,6 +199,7 @@ impl GlyphArea {
             font_size,
             line_height,
             color,
+            font_family: None,
             clip_rect: None,
             outline_color: Color::TRANSPARENT,
             outline_width_px: 0.0,
@@ -211,6 +219,20 @@ impl GlyphArea {
             || self.shadow_color.a > 0.0
             || self.rotation_radians != 0.0
     }
+
+    /// 実際に shape に使う family 名。 `font_family` が `None` のとき `DEFAULT_FONT_FAMILY`。
+    /// M14 Phase 121 (daw_01 #096): cache key と attrs 構築の **双方** がこの 1 関数を読むことで
+    /// 「buffer の cache identity」 と「実際に描画する font」 を常に一致させる (= 同じ text+size でも
+    /// font 違いは別 buffer になり、 cache collision で別 font に化けるのを防ぐ)。
+    #[must_use]
+    pub fn resolved_font_family(&self) -> &str {
+        // `None` だけでなく `Some("")` も default 扱い。 daw_01 は font_family を `Arc<str>` の
+        // `""` = default で持つので、 空文字を `Family::Name("")` (= glyphon fallback) に流さない。
+        self.font_family
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(crate::pipelines::glyph::DEFAULT_FONT_FAMILY)
+    }
 }
 
 impl Default for GlyphArea {
@@ -228,6 +250,7 @@ impl Default for GlyphArea {
             font_size: 0.0,
             line_height: 0.0,
             color: Color::TRANSPARENT,
+            font_family: None,
             clip_rect: None,
             outline_color: Color::TRANSPARENT,
             outline_width_px: 0.0,
