@@ -44,6 +44,15 @@ TIMESTAMP=$(date +%Y-%m-%dT%H:%M)
 
 # (A) user correction pattern detection — single line per turn
 LATEST_USER=$(tac "$TRANSCRIPT" 2>/dev/null | awk '/"role"[[:space:]]*:[[:space:]]*"user"/ && !/tool_use_id/ && !/tool_result/ {print; exit}' || true)
+# Skill-load / slash-command / `!`-passthrough messages are role:user in the
+# transcript but are NOT user input — their text is a prompt/template, not a
+# correction. Scanning them produces false positives (observed 2026-06-10: a
+# grill-me skill load was flagged as 修正パターン). Blank them so this turn is
+# skipped; any real correction was the latest user message at its own turn and
+# was already detected then.
+if [ -n "$LATEST_USER" ] && printf '%s' "$LATEST_USER" | grep -qE 'Base directory for this skill:|<command-name>|<local-command|local-command-stdout|<command-message>'; then
+  LATEST_USER=""
+fi
 if [ -n "$LATEST_USER" ]; then
   PATTERNS='違う|そうじゃ|間違|ではなく|でなく|ぎませんか|過ぎ|すぎ|ないんですか|じゃないですか|やめて|代わりに|wrong|incorrect|"no,|don'\''t|instead|actually'
   if printf '%s' "$LATEST_USER" | grep -qiE "$PATTERNS"; then
