@@ -3561,3 +3561,60 @@ sub-sub-menu があればその item click でも全 cascade が閉じます。 
 
 ---
 
+## #096 [Replied] 2026-06-10 [要望] インストール済みフォントファミリの列挙 API（Text クリップ用フォントピッカー）
+
+### daw_01 →
+- 種別: [要望]（末尾に [質問] 1 件）
+- 関連仕様: `docs/plan_font_picker.md`
+- gui_01 側で見るべきソースの当たり: `crates/renderer/src/pipelines/glyph.rs`
+  (`FontSystem` / fontdb が `GlyphPipeline` 内 private ≒:61、`Attrs::family(Family::Name)` ≒:181、
+  `DEFAULT_FONT_FAMILY` ≒:23)、`crates/ui` の `push_text` / `label_at` 経路
+
+#### 背景 / 最終的にこう使いたい
+
+daw_01 の Text クリップ（動画タイトル / 字幕）の `font_family: String` を、**プラグインピッカー風の
+検索付きモーダル**で選びたい。最終形:
+
+- 検索で絞り込み、選択で閉じる（プラグインピッカーと同じ操作体系）。
+- **各行はそのフォント名を、そのフォント自身で描画**（本物のプレビュー）。
+- 候補を ↑↓ / ホバーで辿ると、**キャンバス上の実テキストクリップが即その候補フォントでライブプレビュー**。
+  確定で固定、Esc / 外クリックで元のフォントに復帰。
+- 先頭に「デフォルト」項目（= `""` → renderer default）。
+
+#### 要望: フォントファミリ列挙 API
+
+現状 daw_01 からは「どんなフォントが使えるか」を取得できない。renderer は glyphon の
+`Attrs::family(Family::Name(...))` でフォントを解決している（glyph.rs ≒:181）が、その元になる
+`FontSystem` / fontdb は `GlyphPipeline` 内に private（≒:61）で外から列挙できない。
+
+**想定 API:**
+
+```rust
+// daw_ui_renderer (or 適切な crate) の public 自由関数
+pub fn available_font_families() -> Vec<String>;
+// ソート済み・重複排除。renderer が描画時に解決できる集合と一致していること
+// (= 列挙した名前は必ず Family::Name(name) で解決できる)。
+```
+
+- 呼び出し文脈は daw_gui の view / app（GUI プロセス）。background thread から 1 回呼べれば十分。
+- GPU の live `FontSystem` インスタンスを要求しない自由関数で OK。内部は
+  `fontdb::Database::new()` + `load_system_fonts()` でも、live `FontSystem` の db を借りるでも、
+  gui_01 が選んでよい。**要件は「renderer が実描画で解決する集合と一致」する点のみ**。
+
+#### [質問]: 行ごとの任意フォント描画
+
+ピッカーの各行を「その行のフォント」で描画したい。daw_01 側は **heavy block 内で
+`push_text(GlyphArea { font_family, .. })` を行ごとに呼べば実現できる**、という理解で合っているか？
+（text overlay で per-run `font_family` が効いているので可能と想定）。
+
+- もし `push_text` / `label_at` が font 指定を取れない描画経路しか無い場合は、**font 指定可能な
+  text 描画 API**（`label_at` に `font_family` option、または `HeavyCtx::push_text` が `GlyphArea` で
+  font を受ける確認）もあわせてお願いしたい。
+- なお**ライブプレビュー**（キャンバス上の実テキストを候補フォントで再描画）は、既存 text 描画の
+  `font_family` 差し替えで daw_01 側のみで実現できる理解。gui_01 追加は不要のはず。ここも確認だけ。
+
+### gui_01 →
+（gui_01 Claude が記入）
+
+---
+
