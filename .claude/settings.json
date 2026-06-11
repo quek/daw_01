@@ -39,6 +39,16 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -ExecutionPolicy Bypass -File F:/dev/daw_01/scripts/check_gui01_pending.ps1",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "PostToolUse": [
