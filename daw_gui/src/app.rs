@@ -720,6 +720,18 @@ pub struct PendingClipFxBounce {
     pub start_beat: f64,
 }
 
+/// `Z` キーの段階ズームが復元用に積む arrangement の view 状態スナップショット。
+/// `X` (= `ArrangeZoomBack`) が pop して 1 段ずつ巻き戻す。 縦ズームは
+/// `track_row_overrides` を書き換えるので、 per-track override も一緒に捕まえる。
+#[derive(Clone)]
+pub(crate) struct ArrangeViewSnapshot {
+    zoom_x: f32,
+    scroll_beat: f32,
+    row_h: f32,
+    track_top: f32,
+    row_overrides: std::collections::HashMap<u32, u16>,
+}
+
 pub struct AppData {
     // -------- Song / file --------
     pub song: Song,
@@ -1052,6 +1064,10 @@ pub struct AppData {
     /// arrangement の 1 track row 高さ (px)。Alt+wheel で 16..96 に縦ズーム。
     /// default は `ARRANGE_TRACK_HEIGHT`。
     pub arrange_track_row_h: f32,
+    /// FIXME #34: `Z` キーの段階ズーム履歴。 1 回目 push で横ズーム前の view、
+    /// 2 回目 push で縦ズーム前の view を積む。 `X` が pop して 1 段ずつ戻し、
+    /// 空になったら全体フィットに落ちる。 load / new / recovery で clear。
+    pub(crate) arrange_zoom_history: Vec<ArrangeViewSnapshot>,
     /// FIXME #16: arrangement の track header 幅 (px、 default 160.0)。 header と
     /// lanes の境界 (右端 splitter) drag で gui_01 arrangement widget が
     /// `SetHeaderW` を発火 → `SetArrangeHeaderW` 経由でここを更新する。 widget は
@@ -1627,6 +1643,7 @@ impl AppData {
             selected_clip: None,
             selected_clips: Vec::new(),
             selected_notes: Vec::new(),
+            arrange_zoom_history: Vec::new(),
             arrange_hover_content: None,
             arrange_hovered_automation_lane: None,
             bottom_panel: 0,
@@ -2377,6 +2394,18 @@ impl AppData {
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.is_dirty = false;
+        // FIXME #35: load / new / recovery では直前に sync_song_to_plugin_host が
+        // 走り、 口パク binding を持つ project だと mark_lipsync_dirty が 400ms
+        // debounce で自動再生成をスケジュールする。 保存ファイル内の口パク clip は
+        // 既に authoritative なので、 ここで再生成すると mouth clip が新しい
+        // clip id / content id で作り直され (apply_lipsync_generated)、
+        // saved_song と差分が出て「開いただけで '*' が付く」。 derived データの
+        // 再計算は source 編集時だけに限定したいので、 baseline 確定と同時に
+        // pending の再生成を無効化する (= 既存 clip をそのまま温存)。
+        self.cancel_pending_lipsync_regen();
+        // FIXME #34: `Z`/`X` のズーム履歴は旧 project の view / track id を指すので
+        // 別 project に持ち越さない。
+        self.arrange_zoom_history.clear();
     }
 
     fn undo(&mut self) {
@@ -3700,6 +3729,14 @@ pub enum AppEvent {
     /// piano_roll は selected_clip のノート bbox に、arrangement は全 clip に fit。
     FitPianoRollToClip,
     FitArrangeToContent,
+    /// `Z` キー: 選択中の clip への段階ズーム。 1 回目で横ズーム、 2 回目で縦
+    /// ズーム (primary clip の track を viewport いっぱいに)、 3 回目以降は no-op。
+    /// 各段で適用前の view を履歴に積む (`zoom_arrange_to_selected_clip`)。
+    ZoomArrangeToSelectedClip,
+    /// `X` キー (arrangement): ズーム履歴を 1 段戻す。 履歴が空なら全体フィット
+    /// (`fit_arrange_to_content`)。 piano roll 側の `X` は引き続き
+    /// `FitPianoRollToClip`。
+    ArrangeZoomBack,
 
     // -------- Mixer -------------------------------------------------------
     SetTrackVolume { track: u32, amp: f32 },
@@ -3760,10 +3797,16 @@ pub enum AppEvent {
     /// spawn したスレッドが `query_phonemes` の結果を vocal clip 単位で詰めて
     /// 発行し、handler (`apply_lipsync_generated`) が口 track へ反映する。
     /// 派生データなので Undo 対象外 (= `is_undoable` に入れない)。
+    /// `generation` は spawn 時点の `lipsync_gen` snapshot。 HTTP 完了が遅延して
+    /// いる間に別 project を開く (= `reset_saved_baseline` が gen を bump) と、
+    /// この古い結果を別 project に適用して spurious dirty を生むため、 handler は
+    /// `generation == lipsync_gen` のときだけ反映する (FIXME #35、 debounce
+    /// leg `LipsyncDebounceFired` と対称)。
     LipsyncGenerated {
         vocal_track_id: u32,
         bpm: f32,
         clips: Vec<LipsyncClipResult>,
+        generation: u64,
     },
     /// Track Inspector: vocal track の口パク出力先 (口 track id) を設定。
     /// `None` で解除。設定後に口パクを再生成する。
@@ -5487,8 +5530,13 @@ impl AppData {
                     }
                 }
             }
-            AppEvent::LipsyncGenerated { vocal_track_id, bpm, clips } => {
-                self.apply_lipsync_generated(vocal_track_id, bpm, clips);
+            AppEvent::LipsyncGenerated { vocal_track_id, bpm, clips, generation } => {
+                // FIXME #35: spawn 後に project が切り替わった (reset_saved_baseline
+                // が gen を bump した) 古い結果は捨てる。 適用すると別 project の口
+                // track を作り直して spurious dirty になる。 debounce leg と同 idiom。
+                if generation == self.lipsync_gen {
+                    self.apply_lipsync_generated(vocal_track_id, bpm, clips);
+                }
             }
             AppEvent::SetLipsyncTarget { track, target } => {
                 self.set_lipsync_target(track, target);
@@ -5560,6 +5608,12 @@ impl AppData {
             }
             AppEvent::FitArrangeToContent => {
                 self.fit_arrange_to_content();
+            }
+            AppEvent::ZoomArrangeToSelectedClip => {
+                self.zoom_arrange_to_selected_clip();
+            }
+            AppEvent::ArrangeZoomBack => {
+                self.arrange_zoom_back();
             }
             AppEvent::DuplicateClipsShared(sources) => {
                 self.duplicate_clips_shared(&sources);
@@ -7720,6 +7774,10 @@ impl AppData {
             return;
         }
         self.ensure_voicevox_engine();
+        // spawn 時点の世代を snapshot し、 結果と一緒に返す。 HTTP が遅延して
+        // いる間に project が切り替わる (reset_saved_baseline が gen を bump) と
+        // handler 側で破棄される (FIXME #35)。
+        let generation = self.lipsync_gen;
         let proxy = self.event_proxy.clone();
         std::thread::spawn(move || {
             let mut clips = Vec::with_capacity(snaps.len());
@@ -7742,6 +7800,7 @@ impl AppData {
                     vocal_track_id,
                     bpm,
                     clips,
+                    generation,
                 });
             }
         });
@@ -7878,6 +7937,15 @@ impl AppData {
     /// vocal track があれば debounce timer を立て、quiet period (400ms) 後に
     /// `LipsyncDebounceFired` を送る。rapid 編集 (歌詞タイプ等) は世代カウンタで
     /// coalesce され、最後の 1 回だけ再生成される。
+    /// 進行中 (debounce 待ち) の口パク自動再生成を無効化する。 generation
+    /// counter を bump するだけで、 既にスケジュール済みの `LipsyncDebounceFired`
+    /// は世代不一致になり handler 側で no-op になる (新しい timer は spawn しない)。
+    /// `reset_saved_baseline` (= load / new / recovery) から呼び、 開いた直後の
+    /// spurious dirty (FIXME #35) を防ぐ。
+    fn cancel_pending_lipsync_regen(&mut self) {
+        self.lipsync_gen = self.lipsync_gen.wrapping_add(1);
+    }
+
     fn mark_lipsync_dirty(&mut self) {
         if !self
             .song
@@ -11135,6 +11203,146 @@ impl AppData {
         self.arrange_zoom_x = (f64::from(canvas_w) / span_beats).clamp(2.0, 400.0) as f32;
         let row_h = (canvas_h / row_count as f32).clamp(16.0, 96.0);
         self.arrange_track_row_h = row_h;
+        // 「全 track を上端から収める」 のが fit の定義なので:
+        //   - 縦スクロールを 0 に戻す (怠ると row 高だけ縮んで track_top が残り、
+        //     全 track が viewport 上方へ押し出されて見えなくなる = ユーザー報告のバグ)。
+        //   - per-track 行高 override を消す (= row_h は uniform 前提で算出している。
+        //     override が残ると 1 track が巨大化して他が画面外に押し出される)。
+        //   - `Z` の段階ズーム履歴をリセット (= 明示的な fit はズーム状態の終端。
+        //     残すと fit 後の `X` が古いズームへ巻き戻って状態が食い違う)。
+        self.arrange_track_top = 0.0;
+        self.track_row_overrides.clear();
+        self.arrange_zoom_history.clear();
+    }
+
+    /// `Z` キーの段階ズーム (FIXME #34)。
+    /// - 1 回目: 選択中の clip (複数選択ならその bounding beat span) を arrangement
+    ///   幅いっぱいに **横ズーム** (`arrange_zoom_x` / `arrange_scroll_beat`)。
+    /// - 2 回目: primary 選択 clip の track を viewport いっぱいに **縦ズーム**
+    ///   (その track の row 高 override を lanes 高に設定 + その track 上端へ scroll)。
+    ///   縦位置は widget が返した実 `track_header_rects` 由来の
+    ///   `arrange_primary_track_content_top` を使うのでレイアウトを複製しない。
+    /// - 3 回目以降: 何もしない (横+縦ズーム済み)。
+    ///
+    /// 各段で適用前の view を `arrange_zoom_history` に積み、 `X`
+    /// (`arrange_zoom_back`) が 1 段ずつ巻き戻す。
+    fn zoom_arrange_to_selected_clip(&mut self) {
+        match self.arrange_zoom_history.len() {
+            // ---- 1 回目: 横ズーム ----
+            0 => {
+                let Some((min_start, max_end)) = self.selected_clips_beat_span() else {
+                    return;
+                };
+                let (canvas_w, _) = self.last_arrange_canvas_size;
+                if canvas_w < 16.0 {
+                    return;
+                }
+                let snap = self.capture_arrange_view();
+                self.arrange_zoom_history.push(snap);
+                let span = max_end - min_start;
+                // clip が canvas 幅の ~92% を占めるよう左右に proportional padding
+                // (短い clip でも極端に拡大しすぎないよう最小 0.5 beat)。
+                let pad = (span * 0.04).max(0.5);
+                self.arrange_scroll_beat = (min_start - pad).max(0.0) as f32;
+                self.arrange_zoom_x =
+                    (f64::from(canvas_w) / (span + pad * 2.0)).clamp(2.0, 400.0) as f32;
+            }
+            // ---- 2 回目: 縦ズーム (選択 clip のある全 track を viewport に収める) ----
+            1 => {
+                let lanes_h = self.last_arrange_canvas_size.1;
+                if lanes_h < 16.0 {
+                    return;
+                }
+                let Some((v_min, v_max)) = self.selected_tracks_visible_index_span() else {
+                    return;
+                };
+                let snap = self.capture_arrange_view();
+                self.arrange_zoom_history.push(snap);
+                // override を消して uniform 行高にし、 選択 track の index 範囲が
+                // viewport いっぱいになる row 高を全 track へ。 master 行 (render 先頭、
+                // 行高 override 無し) を +1 として数え、 先頭の選択 track 上端へ scroll。
+                // uniform 化により縦レイアウトが index で正確に決まる (= widget の実
+                // rect を引かずに済む。 automation lane 展開時のみ近似)。
+                let rows = (v_max - v_min + 1) as f32;
+                let row_h = (lanes_h / rows).clamp(16.0, 2000.0);
+                self.track_row_overrides.clear();
+                self.arrange_track_row_h = row_h;
+                self.arrange_track_top = ((v_min + 1) as f32) * row_h;
+            }
+            // ---- 3 回目以降: 既に横+縦ズーム済み ----
+            _ => {}
+        }
+    }
+
+    /// 選択 clip のある track 群の、 可視 track 並び (collapsed group 配下を除外
+    /// = widget の `is_visible_track` と一致) における index 範囲 `(min, max)`。
+    /// 選択無し / どれも不可視なら `None`。 縦ズームの「収める範囲」 算出に使う。
+    fn selected_tracks_visible_index_span(&self) -> Option<(usize, usize)> {
+        let mut track_ids: std::collections::HashSet<u32> =
+            self.selected_clips.iter().map(|k| k.track_id).collect();
+        if track_ids.is_empty()
+            && let Some(k) = self.selected_clip
+        {
+            track_ids.insert(k.track_id);
+        }
+        if track_ids.is_empty() {
+            return None;
+        }
+        let (mut v_min, mut v_max) = (usize::MAX, 0usize);
+        let mut vi = 0usize;
+        for t in &self.song.tracks {
+            if self.is_hidden_under_collapsed_group(t.id) {
+                continue;
+            }
+            if track_ids.contains(&t.id) {
+                v_min = v_min.min(vi);
+                v_max = v_max.max(vi);
+            }
+            vi += 1;
+        }
+        (v_min != usize::MAX).then_some((v_min, v_max))
+    }
+
+    /// 選択 clip 群 (空なら primary 単独) の bounding beat 範囲。 解決不能 / 退化
+    /// (長さ 0) なら `None`。
+    fn selected_clips_beat_span(&self) -> Option<(f64, f64)> {
+        let mut keys = self.selected_clips.clone();
+        if keys.is_empty() {
+            keys.extend(self.selected_clip);
+        }
+        let (mut min_start, mut max_end) = (f64::INFINITY, f64::NEG_INFINITY);
+        for key in keys {
+            if let Some(clip) = self.clip_at(key) {
+                min_start = min_start.min(clip.start_beat);
+                max_end = max_end.max(clip.start_beat + clip.length_beats);
+            }
+        }
+        (min_start.is_finite() && max_end > min_start).then_some((min_start, max_end))
+    }
+
+    /// 現在の arrangement view 状態を snapshot (ズーム履歴 push 用)。
+    fn capture_arrange_view(&self) -> ArrangeViewSnapshot {
+        ArrangeViewSnapshot {
+            zoom_x: self.arrange_zoom_x,
+            scroll_beat: self.arrange_scroll_beat,
+            row_h: self.arrange_track_row_h,
+            track_top: self.arrange_track_top,
+            row_overrides: self.track_row_overrides.clone(),
+        }
+    }
+
+    /// `X` キー (arrangement)。 ズーム履歴があれば 1 段戻し、 無ければ全体フィット
+    /// (= 「前のズームに戻る、 無ければ全体フィット」、 FIXME #34)。
+    fn arrange_zoom_back(&mut self) {
+        if let Some(v) = self.arrange_zoom_history.pop() {
+            self.arrange_zoom_x = v.zoom_x;
+            self.arrange_scroll_beat = v.scroll_beat;
+            self.arrange_track_row_h = v.row_h;
+            self.arrange_track_top = v.track_top;
+            self.track_row_overrides = v.row_overrides;
+        } else {
+            self.fit_arrange_to_content();
+        }
     }
 
     fn set_clip_positions(&mut self, entries: &[(ClipRef, u32, f64)]) {

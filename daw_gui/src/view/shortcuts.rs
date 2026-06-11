@@ -39,6 +39,10 @@ pub fn daw_shortcut_map() -> ShortcutMap {
     // Grid snap (G キー) / auto-fit zoom (X キー)。focus 中の text_input 無効時のみ発火。
     m.bind("daw.toggle_snap", "G");
     m.bind("daw.fit_view", "X");
+    // Z キー: 選択中 clip を arrangement timeline に水平 framing する
+    // (Ableton "Zoom to Selection" 相当)。 X (= 全 clip auto-fit) の選択 clip
+    // 限定版。 複数選択時はその bounding beat span に合わせる。
+    m.bind("daw.zoom_selected_clip", "Z");
     // Ableton Live 互換 (modifier 無し版): 1=Narrow, 2=Widen, 3=Toggle Triplet。
     m.bind("daw.narrow_grid", "1");
     m.bind("daw.widen_grid", "2");

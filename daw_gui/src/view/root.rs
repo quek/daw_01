@@ -712,7 +712,18 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             if is_pianoroll_active {
                 app.handle_event(AppEvent::FitPianoRollToClip);
             } else {
-                app.handle_event(AppEvent::FitArrangeToContent);
+                // arrangement: 直前のズームに戻る (履歴が空なら全体フィット)。
+                app.handle_event(AppEvent::ArrangeZoomBack);
+            }
+        }));
+    }
+    // Z: arrangement の段階ズーム (1 回目=横、 2 回目=縦)。 piano roll が active
+    // (= pointer が piano roll 上) のときは clip ズーム概念が無いので発火しない。
+    // text_input focus 中は gui_01 が単キーを抑制する。
+    if ui.take_shortcut("daw.zoom_selected_clip") {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            if !is_pianoroll_active {
+                app.handle_event(AppEvent::ZoomArrangeToSelectedClip);
             }
         }));
     }
