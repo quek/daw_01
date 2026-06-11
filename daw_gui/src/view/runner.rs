@@ -625,6 +625,14 @@ impl ApplicationHandler<AppEvent> for Runner {
 
         let build_app = self.build_app.take().expect("build_app 既に消費");
         let app = build_app(self.proxy.clone());
+        // native file save dialog を background thread で owner-modal に開くため、
+        // main window の HWND を AppData へ渡す (`action_open_export_mp4_dialog`)。
+        #[cfg(windows)]
+        let app = {
+            let mut app = app;
+            app.main_window_hwnd = dwin.hwnd_isize();
+            app
+        };
 
         self.state = Some(RunnerState {
             window: dwin,

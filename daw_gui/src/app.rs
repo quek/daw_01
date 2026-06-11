@@ -1425,11 +1425,69 @@ pub struct AppData {
     /// (= pitch を「聞いて」 決める用途、 Cubase / Bitwig も同方針)。
     pub snap_live_input: bool,
 
+    /// Windows: main window の `HWND` (`with_owner_window` と同じ isize 表現)。
+    /// runner が window 生成直後にセットする。 native file save dialog を
+    /// background thread で **owner-modal** に開くための parent handle に使う
+    /// (`action_open_export_mp4_dialog`)。 None = まだ window 未生成 / 非対応。
+    #[cfg(windows)]
+    pub main_window_hwnd: Option<isize>,
+    /// video export の保存先選択 dialog (background thread) が開いている間 true。
+    /// 二重起動防止。 `ExportMp4PathChosen` 受信でクリアする。
+    pub export_dialog_open: bool,
+
     /// 背景スレッド (autosave / playhead poll / MIDI / IPC bridge / VOICEVOX
     /// 合成 / plugin DB rescan) からメインスレッドへ `AppEvent` を送るための
     /// dispatcher。 production は `WinitDispatcher` (winit `EventLoopProxy`
     /// ラップ)、 test は `RecordingDispatcher` (Mutex<Vec> に蓄積)。
     pub event_proxy: Arc<dyn BackgroundDispatcher>,
+}
+
+/// Windows native file dialog (rfd) を background thread で **owner-modal** に
+/// 開くための parent window ラッパー。 `rfd::FileDialog::set_parent` は
+/// `HasWindowHandle + HasDisplayHandle` を要求するが、 GUI スレッドの winit
+/// `Window` は `AppData` が保持していないので、 runner が渡した main window の
+/// `HWND` (isize) からこの場で Win32 raw handle を再構築する。 rfd は set_parent
+/// で raw handle を吸い出して `Send` な `FileDialog` に格納するだけなので、 この
+/// ラッパは dialog 構築時 (GUI スレッド) にしか参照されない。
+#[cfg(windows)]
+struct Win32Parent {
+    hwnd: isize,
+}
+
+#[cfg(windows)]
+impl raw_window_handle::HasWindowHandle for Win32Parent {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        let hwnd = std::num::NonZeroIsize::new(self.hwnd)
+            .ok_or(raw_window_handle::HandleError::Unavailable)?;
+        let handle = raw_window_handle::Win32WindowHandle::new(hwnd);
+        // SAFETY: hwnd は main window の HWND。 dialog は main window の子操作
+        // (owner-modal) で main window より先に閉じるため、 handle 参照が使われる
+        // 間 window は生存している。
+        Ok(unsafe {
+            raw_window_handle::WindowHandle::borrow_raw(
+                raw_window_handle::RawWindowHandle::Win32(handle),
+            )
+        })
+    }
+}
+
+#[cfg(windows)]
+impl raw_window_handle::HasDisplayHandle for Win32Parent {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        // Windows backend は parent HWND のみ参照し parent_display は使わないが、
+        // set_parent の trait bound を満たすため空の Windows display handle を返す。
+        Ok(unsafe {
+            raw_window_handle::DisplayHandle::borrow_raw(
+                raw_window_handle::RawDisplayHandle::Windows(
+                    raw_window_handle::WindowsDisplayHandle::new(),
+                ),
+            )
+        })
+    }
 }
 
 impl AppData {
@@ -1655,6 +1713,9 @@ impl AppData {
             snap_on_draw: false,
             snap_live_input: false,
             piano_roll_fold: false,
+            export_dialog_open: false,
+            #[cfg(windows)]
+            main_window_hwnd: None,
             event_proxy,
         };
         // recent_files / recent_saved の path 列から filename label cache を
@@ -3789,6 +3850,16 @@ pub enum AppEvent {
     /// `AppEvent::ExportMp4` once the user picks paths.
     OpenExportMp4Dialog,
 
+    /// `action_open_export_mp4_dialog` が起動した background-thread の保存先
+    /// 選択 dialog の結果。 `Some(path)` = 選択確定、 `None` = キャンセル。 GUI
+    /// スレッドで受けて video export フロー (`action_begin_export_mp4`) を開始
+    /// する。 save dialog を GUI スレッドで同期に開くと、 dialog 自身のモーダル
+    /// メッセージポンプが preview window の WM_PAINT flood を捌き続けて入力が
+    /// 枯れ、 数分フリーズするため別スレッド化した。
+    ExportMp4PathChosen {
+        path: Option<PathBuf>,
+    },
+
     /// Synchronous mp4 render at `output_path`, optionally muxing the
     /// PCM Float32 WAV at `audio_wav` as an AAC stream. Blocks the
     /// GUI thread for the duration (= MVP simplicity). v12
@@ -5001,6 +5072,18 @@ impl AppData {
                 {
                     self.status_message =
                         "Video export は Windows 専用 (WMF 経由) です".into();
+                }
+            }
+            AppEvent::ExportMp4PathChosen { path } => {
+                // background-thread の save dialog から戻った保存先。 二重起動
+                // ガードを解除し、 Some なら export フローを開始、 None (キャンセル)
+                // なら status に出すだけ。
+                self.export_dialog_open = false;
+                if let Some(output_path) = path {
+                    self.action_begin_export_mp4(output_path);
+                } else {
+                    self.status_message =
+                        "Video export をキャンセルしました".into();
                 }
             }
             AppEvent::ExportMp4 { output_path, audio_wav } => {
@@ -16036,7 +16119,10 @@ impl AppData {
     /// WAV を別途選ばせる 2 つ目のダイアログ」 は廃止。
     #[cfg(windows)]
     fn action_open_export_mp4_dialog(&mut self) {
-        if self.export_progress.is_some() || self.pending_video_export.is_some() {
+        if self.export_progress.is_some()
+            || self.pending_video_export.is_some()
+            || self.export_dialog_open
+        {
             self.status_message = "Video export を実行中です".into();
             return;
         }
@@ -16047,15 +16133,40 @@ impl AppData {
             .and_then(|s| s.to_str())
             .map(|s| format!("{s}.mp4"))
             .unwrap_or_else(|| "untitled.mp4".into());
-        let Some(output_path) = rfd::FileDialog::new()
+        let dialog = rfd::FileDialog::new()
             .add_filter("MP4 Video", &["mp4"])
             .set_file_name(&default_name)
-            .set_title("Export Video to MP4...")
-            .save_file()
-        else {
-            return;
+            .set_title("Export Video to MP4...");
+        // native save dialog を GUI スレッドで同期に開くと、 dialog 自身のモーダル
+        // メッセージポンプが GUI スレッド上で回り、 preview window + main window の
+        // WM_PAINT flood (2 枚の wgpu 描画ループ) を捌き続けて dialog の入力処理
+        // (保存ボタン → 上書き確認) が枯れ、 数分フリーズする (= preview window を
+        // 開いた状態での再現条件)。 dialog を専用スレッドで **owner-modal** に開き
+        // (main window を parent に渡す)、 結果を `ExportMp4PathChosen` で GUI
+        // スレッドへ返す。 これで GUI スレッドの event loop は preview の再描画を
+        // 自分のペースで回し続け、 dialog の pump とは完全に分離される。 export
+        // render を background thread 化済み (`action_export_mp4`) なのと同じ idiom。
+        // `rfd::FileDialog` は `Send` (set_parent で raw HWND を吸い出して格納) なので
+        // 構築済み dialog をそのまま thread へ move できる。
+        #[cfg(windows)]
+        let dialog = match self.main_window_hwnd {
+            Some(hwnd) => dialog.set_parent(&Win32Parent { hwnd }),
+            None => dialog,
         };
-        // 音声を temp WAV へ自動レンダリング → 完了後に video export + mux。
+        self.export_dialog_open = true;
+        self.status_message = "保存先を選択中...".into();
+        let proxy = self.event_proxy.clone();
+        std::thread::spawn(move || {
+            let path = dialog.save_file();
+            proxy.send(AppEvent::ExportMp4PathChosen { path });
+        });
+    }
+
+    /// `ExportMp4PathChosen` で保存先が確定したときの video export 後段。 旧
+    /// `action_open_export_mp4_dialog` が dialog の戻り値で同期に走らせていた
+    /// 「音声を temp WAV へ自動レンダリング → 完了後に video export + mux」 を、
+    /// dialog 別スレッド化に伴いここへ移設した。
+    fn action_begin_export_mp4(&mut self, output_path: PathBuf) {
         let temp_wav = std::env::temp_dir()
             .join(format!("daw01_export_audio_{}.wav", std::process::id()));
         self.pending_video_export = Some(output_path);
