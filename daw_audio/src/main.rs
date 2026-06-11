@@ -196,6 +196,14 @@ async fn recv_loop(
             Ok(MainToChild::ClosePluginShmem { plugin_id }) => {
                 let _ = cmd_tx.send(engine::AudioCommand::ClosePluginShmem { plugin_id });
             }
+            // FIXME #32: a chain reorder re-keys `slot_to_plugin_id` so each
+            // slot resolves to its moved plugin. Sent to the audio engine in
+            // addition to the plugin host (and a `LoadSong` that rebuilds the
+            // processing order). Atomic re-key on the audio thread; see
+            // `AudioCommand::ReorderChain`.
+            Ok(MainToChild::ReorderChain { track, moves }) => {
+                let _ = cmd_tx.send(engine::AudioCommand::ReorderChain { track, moves });
+            }
             // Phase 6 review (SSOT fix): `track` field を Track::id (stable)
             // に統一。 旧コードは `s.tracks.get_mut(track as usize)` で Vec
             // index 解釈していて、 GUI 側との順序ずれで違う track を操作する

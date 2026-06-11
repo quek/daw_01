@@ -54,3 +54,48 @@ FIXME #31 セッション (2026-06-10) の調査メモ。実装は別セッシ�
 - `daw_gui/src/app.rs::sync_song_to_plugin_host` — 現状 LoadSong のみ
 - `daw_plugin_host/src/main.rs` — `MoveSlot` / `DemoteInstrumentToGenerator` ハンドラ（再 key の手本）
 - `daw_audio/src/engine.rs` — `OpenPluginShmem` ハンドラ（slot→pid マップ、FIXME #31 で stale 保護済み）
+
+## 実装済み (FIXME #32, 2026-06-11)
+
+ライブ移動方式で 3 プロセス貫通の再キーを実装。新コマンド
+`MainToChild::ReorderChain { track, moves: Vec<(PluginSlot/*old*/, PluginSlot/*new*/)> }`
+を **両 child に送信**:
+
+- **daw_gui** `reorder_inspector_chain` → `apply_chain_reorder`: 旧→新 slot の
+  完全 permutation `moves` を組み、`loaded_slots`/`open_plugin_guis`/`plugin_params`
+  と **automation lane の `PluginParam{slot}`**（`remap_lane_slots`）を再キー。track / master
+  両分岐対応。
+- **daw_plugin_host** `PluginCommand::ReorderChain`: live `Box<dyn LoadedPlugin>` を
+  heap address 保持のまま permute（音切れなし・エディタ窓追従）、`plugin_lookup` /
+  `loaded_*_for_slot` / `editor_windows` / registry entry slot を再キー。
+- **daw_audio** `AudioCommand::ReorderChain`: `slot_to_plugin_id` を 1 回の ArcSwap store
+  で atomic 再キー（`plugin_refs` 不変＝transient drop なし）。処理順は後続 `LoadSong` の
+  schedule 再構築で追従。
+
+検証: `daw_gui/tests/group_track_lifecycle.rs` に 3 つの reorder test
+（3 プロセス再キー / automation 追従 / 不整合チェーンの no-op）。adversarial review
+（16-agent workflow）で 5 findings、うち correctness 3 件を修正。
+
+### 修正した review findings
+
+- **#3 automation lane が追従しない**: `PluginParam{slot}` は slot 番地かつ永続化される。
+  reorder で旧 slot のまま残ると別 plugin を automation が駆動し保存もされる
+  → `remap_lane_slots` で旧→新へ remap。
+- **#1/#4 host validation skip と audio/gui apply の分岐**: load 失敗の phantom が song に
+  残ると host の live chain が song と不一致 → host は ReorderChain を skip、audio/gui は
+  適用で恒久分岐。`reorder_inspector_chain` 冒頭で **song チェーン == loaded_slots** を
+  gate（不一致なら snap back + status_message）。host 側 validation は IPC trust-boundary の
+  belt-and-suspenders として残置。
+
+### 未対応 (別 commit の follow-up)
+
+- **#2 RT スレッドでの heap 確保**: `AudioCommand::ReorderChain` は `pump_commands`
+  経由で **CPAL callback (RT) スレッド** 上で HashMap clone + `Arc::new` する。これは
+  既存の `OpenPluginShmem` / `ClosePluginShmem` と同一パターン（既存の architectural debt）。
+  理想は slot_to_plugin_id mutation 全体を RT callback 外（IPC/専用スレッド）へ移し ArcSwap
+  publish のみ RT で行う設計。reorder 固有ではないので別途。
+- **#5 reorder を跨ぐ Undo が live-move でなく reload になる**: reorder は undo snapshot を
+  積まない（現状維持）。reorder 前の編集を 1 回 Undo で跨ぐと、`compute_slot_reconcile_actions`
+  が permutation を認識せず Remove+Load で再 instantiate（エディタ窓再生成・非永続 state 喪失の
+  可能性）。理想は reconcile を permutation-aware にするか reorder を undoable 化して Undo 時に
+  live `ReorderChain` を発行する。reconcile ロジック（well-tested）に触れるので別途。

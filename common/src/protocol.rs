@@ -462,6 +462,28 @@ pub enum MainToChild {
         from: PluginSlot,
         to: PluginSlot,
     },
+    /// FIXME #32: apply an arbitrary chain reorder as a glitch-free **live
+    /// move**. `moves` is the COMPLETE new layout of `track`'s chain: one
+    /// `(from, to)` per loaded plugin (including `from == to` for ones that
+    /// did not move), where `from` is the plugin's current `(track, slot)`
+    /// address and `to` is its address after the drag. The set of `from`
+    /// slots must exactly cover the track's currently-loaded plugins and the
+    /// `to` slots must form contiguous `MidiFx(0..)` / single `Instrument` /
+    /// `Fx(0..)` sections.
+    ///
+    /// Sent to BOTH children:
+    /// - the plugin host permutes its live `Box<dyn LoadedPlugin>`s in place
+    ///   (heap address preserved → no re-instantiation, no audio glitch, open
+    ///   editor windows follow) and re-keys every `(track, slot)` book plus
+    ///   the worker registry entry slot;
+    /// - the audio engine atomically re-keys `slot_to_plugin_id` so each slot
+    ///   resolves to the moved plugin (the processing order itself follows the
+    ///   subsequent `LoadSong`). Supersedes the single-step `MoveSlot` for the
+    ///   inspector-chain drag reorder (which never wired `MoveSlot`).
+    ReorderChain {
+        track: u32,
+        moves: Vec<(PluginSlot, PluginSlot)>,
+    },
     /// FIXME #29/#31: demote the track's dual-role instrument to the END of
     /// its MIDI-FX (generator) chain, preserving the LIVE plugin instance
     /// (and its open editor window) instead of destroying + re-instantiating
@@ -629,6 +651,20 @@ mod tests {
                     flags: plugin_param_flags::STEPPED
                         | plugin_param_flags::PERIODIC,
                 },
+            ],
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn main_to_child_reorder_chain_roundtrip() {
+        let msg = MainToChild::ReorderChain {
+            track: 4,
+            moves: vec![
+                (PluginSlot::Fx(0), PluginSlot::Fx(1)),
+                (PluginSlot::Fx(1), PluginSlot::Fx(0)),
+                (PluginSlot::MidiFx(2), PluginSlot::Instrument),
+                (PluginSlot::Instrument, PluginSlot::MidiFx(2)),
             ],
         };
         assert_eq!(roundtrip(&msg), msg);

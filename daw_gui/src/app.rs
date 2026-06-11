@@ -13734,6 +13734,17 @@ impl AppData {
                     .map(|new_i| self.song.master_fx_chain[order[new_i]].clone())
                     .collect();
                 self.song.master_fx_chain = new_fx;
+                // FIXME #32: master FX は全て MASTER_TRACK_ID の Fx slot。
+                // 旧 Fx(order[i]) → 新 Fx(i) の moves で 3 プロセスを貼り直す。
+                let moves: Vec<(PluginSlot, PluginSlot)> = (0..fx_count)
+                    .map(|new_i| {
+                        (
+                            PluginSlot::Fx(order[new_i] as u32),
+                            PluginSlot::Fx(new_i as u32),
+                        )
+                    })
+                    .collect();
+                self.apply_chain_reorder(common::model::MASTER_TRACK_ID, moves);
                 self.sync_song_to_plugin_host();
             }
             return;
@@ -13741,21 +13752,57 @@ impl AppData {
         let Some(track_idx) = self.cursor_track_index() else {
             return;
         };
+        let Some(track_id) = self.song.tracks.get(track_idx).map(|t| t.id) else {
+            return;
+        };
         // chain (= inspector_chain 順 [midi_fx..., inst?, fx...]) を flat な
         // PluginInstance 列にする。 これで old chain index ↔ PluginInstance が対応。
-        let flat: Vec<common::model::PluginInstance> = {
+        // `flat_slots` は同じ並びで各 entry の **現在の** (track, slot) アドレスを
+        // 持つ。 reorder 後に plugin host / audio engine / 各 cache を旧→新 slot で
+        // 貼り直す `moves` を組むのに使う (FIXME #32)。
+        let (flat, flat_slots): (Vec<common::model::PluginInstance>, Vec<PluginSlot>) = {
             let Some(track) = self.song.tracks.get(track_idx) else {
                 return;
             };
             let mut v = Vec::with_capacity(chain.len());
-            v.extend(track.midi_fx_chain.iter().cloned());
+            let mut slots = Vec::with_capacity(chain.len());
+            for (i, p) in track.midi_fx_chain.iter().enumerate() {
+                v.push(p.clone());
+                slots.push(PluginSlot::MidiFx(i as u32));
+            }
             if let Some(inst) = track.instrument.as_ref() {
                 v.push(inst.clone());
+                slots.push(PluginSlot::Instrument);
             }
-            v.extend(track.fx_chain.iter().cloned());
-            v
+            for (i, p) in track.fx_chain.iter().enumerate() {
+                v.push(p.clone());
+                slots.push(PluginSlot::Fx(i as u32));
+            }
+            (v, slots)
         };
         if flat.len() != chain.len() || order.iter().any(|&o| o >= flat.len()) {
+            return;
+        }
+        // FIXME #32 (review): slot 貼り替えは 3 プロセスの per-slot bookkeeping が
+        // song チェーンと一致している前提。 ロード失敗 / 進行中の plugin が song に
+        // phantom として残ると、 host はその slot を持たず ReorderChain を skip する
+        // 一方で audio engine / daw_gui は適用し、 (track, slot)→plugin が恒久的に
+        // 分岐する。 song チェーンが loaded_slots と完全一致 (= 全 plugin が 3 プロセス
+        // でロード済) のときだけ並び替える (不一致なら snap back)。
+        let loaded_here = self
+            .loaded_slots
+            .keys()
+            .filter(|(t, _)| *t == track_id)
+            .count();
+        let fully_loaded = loaded_here == flat_slots.len()
+            && flat_slots.iter().zip(flat.iter()).all(|(slot, inst)| {
+                self.loaded_slots
+                    .get(&(track_id, *slot))
+                    .is_some_and(|info| info.plugin_id_str == inst.plugin_id)
+            });
+        if !fully_loaded {
+            self.status_message =
+                "プラグインの読み込み中または失敗のため並び替えできません".to_string();
             return;
         }
         // 各 flat index の capability を解決。 db 不在 / 未登録は prior slot_kind に
@@ -13788,7 +13835,13 @@ impl AppData {
                 None => 0,
             };
             // ポート的に置けない位置への drop は棄却 (= UI は元の並びへ)。
+            // FIXME #32: 黙って元へ戻ると「並び替えが効かない」と誤解されるので、
+            // なぜ棄却したかを status_message で伝える (= ノート生成器は音源より
+            // 前、 audio エフェクトは音源より後、 という port 由来の順序制約)。
             if !cap.allows_slot_kind(kind) {
+                self.status_message =
+                    "その位置には置けません（並びは ノート生成器 → 音源 → エフェクト）"
+                        .to_string();
                 return;
             }
             // 音源の無い列では「生成器の後に audio fx」 の単調性だけ要求する。
@@ -13796,22 +13849,40 @@ impl AppData {
                 if kind == 2 {
                     saw_fx = true;
                 } else if saw_fx {
+                    self.status_message =
+                        "その位置には置けません（ノート生成器は audio エフェクトより前）"
+                            .to_string();
                     return;
                 }
             }
             new_kinds[i] = kind;
         }
         // 新順序 + new_kinds で 3 つの Vec へ再分割 (section 跨ぎ書き戻しを含む)。
+        // 同時に各 entry の旧 slot (flat_slots) → 新 slot の `moves` を組む。
         let mut new_midi = Vec::new();
         let mut new_inst = None;
         let mut new_fx = Vec::new();
+        let mut moves: Vec<(PluginSlot, PluginSlot)> = Vec::with_capacity(order.len());
         for i in 0..order.len() {
             let inst = flat[order[i]].clone();
-            match new_kinds[i] {
-                0 => new_midi.push(inst),
-                1 => new_inst = Some(inst),
-                _ => new_fx.push(inst),
-            }
+            // 新 slot は配置先 Vec の (push 前の) 長さ = 連番 index。
+            let new_slot = match new_kinds[i] {
+                0 => {
+                    let s = PluginSlot::MidiFx(new_midi.len() as u32);
+                    new_midi.push(inst);
+                    s
+                }
+                1 => {
+                    new_inst = Some(inst);
+                    PluginSlot::Instrument
+                }
+                _ => {
+                    let s = PluginSlot::Fx(new_fx.len() as u32);
+                    new_fx.push(inst);
+                    s
+                }
+            };
+            moves.push((flat_slots[order[i]], new_slot));
         }
         let Some(track) = self.song.tracks.get_mut(track_idx) else {
             return;
@@ -13819,7 +13890,89 @@ impl AppData {
         track.midi_fx_chain = new_midi;
         track.instrument = new_inst;
         track.fx_chain = new_fx;
+        // FIXME #32: song を組み替えただけでは plugin host のチェーンも audio engine の
+        // slot→plugin_id マップも追従しない (= 見た目だけ並び替わり音は旧順のまま)。
+        // 旧→新 slot の `moves` で 3 プロセスの per-slot bookkeeping を貼り直してから
+        // LoadSong (= schedule 再構築) を送る。
+        self.apply_chain_reorder(track_id, moves);
         self.sync_song_to_plugin_host();
+    }
+
+    /// FIXME #32: propagate an inspector-chain reorder to the plugin host, the
+    /// audio engine, and our own `(track, slot)`-keyed caches. `moves` is the
+    /// complete `(old_slot, new_slot)` permutation for `track_id` (one entry
+    /// per loaded plugin, `from == to` for ones that stayed put). The caller
+    /// has already rewritten `self.song`; this re-keys everything else that is
+    /// addressed by slot so the moved plugins' real processing, editor
+    /// windows, param lists and load-state cache follow the new positions.
+    fn apply_chain_reorder(&mut self, track_id: u32, moves: Vec<(PluginSlot, PluginSlot)>) {
+        // Local caches: remove ALL old keys first (snapshot), then re-insert at
+        // the new keys, so a swap (Fx(0)↔Fx(1)) can't clobber the second entry.
+        let mut new_loaded = Vec::new();
+        let mut new_open = Vec::new();
+        let mut new_params = Vec::new();
+        for &(from, to) in &moves {
+            if let Some(v) = self.loaded_slots.remove(&(track_id, from)) {
+                new_loaded.push((to, v));
+            }
+            if self.open_plugin_guis.remove(&(track_id, from)) {
+                new_open.push(to);
+            }
+            if let Some(v) = self.plugin_params.remove(&(track_id, from)) {
+                new_params.push((to, v));
+            }
+        }
+        for (to, v) in new_loaded {
+            self.loaded_slots.insert((track_id, to), v);
+        }
+        for to in new_open {
+            self.open_plugin_guis.insert((track_id, to));
+        }
+        for (to, v) in new_params {
+            self.plugin_params.insert((track_id, to), v);
+        }
+        // FIXME #32 (review): automation lanes are addressed by chain slot
+        // (`AutomationTarget::PluginParam { slot, .. }`) and are persisted to
+        // the project. Re-point each matching lane old→new so the moved plugin
+        // keeps its automation — otherwise the plugin that took its old slot
+        // gets driven by it (audible wrong audio that also survives reload).
+        if track_id == common::model::MASTER_TRACK_ID {
+            Self::remap_lane_slots(&mut self.song.song_lanes, &moves);
+        } else if let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) {
+            Self::remap_lane_slots(&mut t.automation_lanes, &moves);
+        }
+        // Plugin host re-keys its live chain + editor windows + worker registry;
+        // the audio engine atomically re-keys slot_to_plugin_id. Both get the
+        // same `moves` payload.
+        self.send_plugin(MainToChild::ReorderChain {
+            track: track_id,
+            moves: moves.clone(),
+        });
+        self.send_audio(MainToChild::ReorderChain {
+            track: track_id,
+            moves,
+        });
+    }
+
+    /// FIXME #32 (review): rewrite every `AutomationTarget::PluginParam { slot }`
+    /// in `lanes` from its old chain slot to its new one per `moves`. Each lane
+    /// stores the pre-reorder slot, and `moves` maps old→new, so a single
+    /// per-lane lookup is collision-free (no shared structure is rekeyed here).
+    fn remap_lane_slots(
+        lanes: &mut [common::model::AutomationLane],
+        moves: &[(PluginSlot, PluginSlot)],
+    ) {
+        for lane in lanes.iter_mut() {
+            if let common::model::AutomationTarget::PluginParam { slot, param_id } = &lane.target {
+                let (old_slot, param_id) = (*slot, *param_id);
+                if let Some(&(_, new_slot)) = moves.iter().find(|(from, _)| *from == old_slot) {
+                    lane.target = common::model::AutomationTarget::PluginParam {
+                        slot: new_slot,
+                        param_id,
+                    };
+                }
+            }
+        }
     }
 
     /// PR4 sidechain: route a track's output into a plugin's `aux_in_port`.

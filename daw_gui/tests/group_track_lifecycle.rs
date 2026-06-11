@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use common::model::{InstrumentSource, PluginInstance};
+use common::model::{AutomationLane, AutomationTarget, InstrumentSource, PluginInstance};
 use common::plugin_db::{PluginDatabase, PluginEntry};
 use common::plugin_format::PluginFormat;
 use common::protocol::{MainToChild, PluginSlot};
@@ -455,5 +455,220 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     assert!(
         matches!(inst_track.source, InstrumentSource::None),
         "instrument source is the default; we only loaded the plugin"
+    );
+}
+
+/// Build track 0 = [synth(Instrument,100), bitcrush(Fx0,101), delay(Fx1,102)],
+/// all reported loaded, and drain both child channels. Returns the track id.
+fn setup_loaded_chain(
+    app: &mut AppData,
+    audio_rx: &mut UnboundedReceiver<MainToChild>,
+    plugin_rx: &mut UnboundedReceiver<MainToChild>,
+) -> u32 {
+    let track_id = app.song.tracks[0].id;
+    app.handle_event(AppEvent::SelectTrack(0));
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.synth".into(),
+        keep_open: false,
+        open_gui: false,
+    });
+    fake_plugin_loaded(app, track_id, PluginSlot::Instrument, "test.synth", 100);
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.bitcrush".into(),
+        keep_open: false,
+        open_gui: false,
+    });
+    fake_plugin_loaded(app, track_id, PluginSlot::Fx(0), "test.bitcrush", 101);
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.delay".into(),
+        keep_open: false,
+        open_gui: false,
+    });
+    fake_plugin_loaded(app, track_id, PluginSlot::Fx(1), "test.delay", 102);
+    // Sanity: starting layout is [Instrument synth, Fx0 bitcrush, Fx1 delay].
+    {
+        let t = &app.song.tracks[0];
+        assert_eq!(
+            t.instrument.as_ref().map(|p| p.plugin_id.as_str()),
+            Some("test.synth")
+        );
+        assert_eq!(
+            t.fx_chain.iter().map(|p| p.plugin_id.as_str()).collect::<Vec<_>>(),
+            vec!["test.bitcrush", "test.delay"]
+        );
+    }
+    let _ = drain(audio_rx);
+    let _ = drain(plugin_rx);
+    track_id
+}
+
+/// FIXME #32: an inspector-chain drag reorder must (a) repartition the song,
+/// (b) re-key daw_gui's `(track, slot)` caches, and (c) send a `ReorderChain`
+/// with the correct `(old, new)` permutation to BOTH children, followed by a
+/// `LoadSong` that rebuilds the audio schedule. Before this fix only the song
+/// was repartitioned, so the audio engine's `slot_to_plugin_id` stayed stale
+/// and the actual processing order never followed the visual reorder.
+#[test]
+fn inspector_chain_reorder_rekeys_both_children() {
+    let (mut app, mut audio_rx, mut plugin_rx, _proxy) = build_app();
+    let track_id = setup_loaded_chain(&mut app, &mut audio_rx, &mut plugin_rx);
+
+    // Reorder. inspector_chain = [Instrument, Fx0, Fx1] (flat idx 0,1,2). The
+    // gui_01 contract is new[i] = items[order[i]]; order [0,2,1] keeps the
+    // instrument and swaps the two FX (delay before bitcrush).
+    app.handle_event(AppEvent::ReorderInspectorChain(vec![0, 2, 1]));
+
+    // (a) song repartition: FX order swapped, instrument untouched.
+    {
+        let t = &app.song.tracks[0];
+        assert_eq!(
+            t.instrument.as_ref().map(|p| p.plugin_id.as_str()),
+            Some("test.synth"),
+            "instrument stays the instrument"
+        );
+        assert_eq!(
+            t.fx_chain.iter().map(|p| p.plugin_id.as_str()).collect::<Vec<_>>(),
+            vec!["test.delay", "test.bitcrush"],
+            "fx_chain order swapped in the song model"
+        );
+    }
+
+    // (b) daw_gui caches re-keyed so each slot resolves to its moved plugin.
+    assert_eq!(
+        app.loaded_slots.get(&(track_id, PluginSlot::Fx(0))).map(|i| i.plugin_id),
+        Some(102),
+        "Fx(0) now maps to delay's plugin_id"
+    );
+    assert_eq!(
+        app.loaded_slots.get(&(track_id, PluginSlot::Fx(1))).map(|i| i.plugin_id),
+        Some(101),
+        "Fx(1) now maps to bitcrush's plugin_id"
+    );
+
+    // (c) ReorderChain with the correct (old -> new) permutation to BOTH
+    // children, plus the LoadSong that rebuilds the audio schedule.
+    let expected_moves = vec![
+        (PluginSlot::Instrument, PluginSlot::Instrument),
+        (PluginSlot::Fx(1), PluginSlot::Fx(0)), // delay: old Fx(1) -> new Fx(0)
+        (PluginSlot::Fx(0), PluginSlot::Fx(1)), // bitcrush: old Fx(0) -> new Fx(1)
+    ];
+    let plugin_msgs = drain(&mut plugin_rx);
+    let audio_msgs = drain(&mut audio_rx);
+    let find_reorder = |msgs: &[MainToChild]| -> Option<Vec<(PluginSlot, PluginSlot)>> {
+        msgs.iter().find_map(|m| match m {
+            MainToChild::ReorderChain { track, moves } if *track == track_id => {
+                Some(moves.clone())
+            }
+            _ => None,
+        })
+    };
+    assert_eq!(
+        find_reorder(&plugin_msgs).as_deref(),
+        Some(expected_moves.as_slice()),
+        "ReorderChain must reach plugin_host with the live-move permutation: {plugin_msgs:?}"
+    );
+    assert_eq!(
+        find_reorder(&audio_msgs).as_deref(),
+        Some(expected_moves.as_slice()),
+        "ReorderChain must reach daw_audio with the same permutation: {audio_msgs:?}"
+    );
+    assert!(
+        audio_msgs.iter().any(|m| matches!(m, MainToChild::LoadSong(_))),
+        "a LoadSong must follow to rebuild the schedule order: {audio_msgs:?}"
+    );
+}
+
+/// FIXME #32 (review finding #3): `AutomationTarget::PluginParam { slot }` lanes
+/// are addressed by chain slot and persisted. A reorder must re-point each lane
+/// old→new, or the moved plugin loses its automation and whatever took its old
+/// slot inherits it (audible wrong audio that also survives a reload).
+#[test]
+fn inspector_chain_reorder_remaps_automation_lane_slots() {
+    let (mut app, mut audio_rx, mut plugin_rx, _proxy) = build_app();
+    let _track_id = setup_loaded_chain(&mut app, &mut audio_rx, &mut plugin_rx);
+
+    // Automate a param on the plugin currently at Fx(0) (bitcrush).
+    app.song.tracks[0].automation_lanes.push(AutomationLane {
+        id: 1,
+        target: AutomationTarget::PluginParam {
+            slot: PluginSlot::Fx(0),
+            param_id: 42,
+        },
+        default_value: 0.25,
+        enabled: true,
+        visible: true,
+        height_px: 60,
+        clips: Vec::new(),
+        next_clip_id: 1,
+    });
+
+    // Swap the two FX (delay before bitcrush).
+    app.handle_event(AppEvent::ReorderInspectorChain(vec![0, 2, 1]));
+
+    // bitcrush moved Fx(0) -> Fx(1); its lane must follow so it still drives
+    // bitcrush (not delay, which now sits at Fx(0)).
+    assert_eq!(
+        app.song.tracks[0].automation_lanes[0].target,
+        AutomationTarget::PluginParam {
+            slot: PluginSlot::Fx(1),
+            param_id: 42,
+        },
+        "the automation lane must track the plugin to its new slot"
+    );
+}
+
+/// FIXME #32 (review findings #1/#4): the reorder re-keys all three processes,
+/// but a failed/in-flight plugin load can leave a phantom in the song that the
+/// plugin host's live chain does not have. Applying the reorder then would make
+/// the host skip while the audio engine + daw_gui apply, diverging permanently.
+/// So the reorder must be a no-op (UI snaps back) unless the track's whole chain
+/// is consistently loaded across processes.
+#[test]
+fn inspector_chain_reorder_aborts_when_chain_not_fully_loaded() {
+    let (mut app, mut audio_rx, mut plugin_rx, _proxy) = build_app();
+    let track_id = setup_loaded_chain(&mut app, &mut audio_rx, &mut plugin_rx);
+
+    // Inject a PHANTOM third FX: present in the song (and the inspector chain)
+    // but never reported loaded, mimicking a plugin whose load failed.
+    app.song
+        .tracks
+        .iter_mut()
+        .find(|t| t.id == track_id)
+        .unwrap()
+        .fx_chain
+        .push(PluginInstance::new(
+            "test.delay".into(),
+            common::plugin_format::PluginFormat::Clap,
+        ));
+    let before: Vec<String> = app.song.tracks[0]
+        .fx_chain
+        .iter()
+        .map(|p| p.plugin_id.clone())
+        .collect();
+    let _ = drain(&mut audio_rx);
+    let _ = drain(&mut plugin_rx);
+
+    // Try to swap Fx(0) and Fx(1) over the 4-item chain [inst, fx0, fx1, phantom].
+    app.handle_event(AppEvent::ReorderInspectorChain(vec![0, 2, 1, 3]));
+
+    // No song mutation and no ReorderChain to either child.
+    let after: Vec<String> = app.song.tracks[0]
+        .fx_chain
+        .iter()
+        .map(|p| p.plugin_id.clone())
+        .collect();
+    assert_eq!(before, after, "reorder must be a no-op on an inconsistent chain");
+    let plugin_msgs = drain(&mut plugin_rx);
+    let audio_msgs = drain(&mut audio_rx);
+    assert!(
+        !plugin_msgs.iter().any(|m| matches!(m, MainToChild::ReorderChain { .. })),
+        "no ReorderChain may reach plugin_host: {plugin_msgs:?}"
+    );
+    assert!(
+        !audio_msgs.iter().any(|m| matches!(m, MainToChild::ReorderChain { .. })),
+        "no ReorderChain may reach daw_audio: {audio_msgs:?}"
     );
 }

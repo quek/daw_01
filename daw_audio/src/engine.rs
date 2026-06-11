@@ -83,6 +83,17 @@ pub enum AudioCommand {
     /// Drop a previously-opened plugin shmem mapping. Triggered on
     /// RemoveSlotPlugin / RemoveTrack from the GUI side.
     ClosePluginShmem { plugin_id: u32 },
+    /// FIXME #32: atomically re-key `slot_to_plugin_id` for a chain reorder.
+    /// `moves` is the complete `(old_slot, new_slot)` permutation of `track`'s
+    /// loaded plugins (see `MainToChild::ReorderChain`). Only the slot KEYS
+    /// move — the plugin ids and their `plugin_refs` are untouched, so no
+    /// plugin is ever briefly dropped (unlike a sequence of `OpenPluginShmem`
+    /// at swapping slots). The processing ORDER follows the matching
+    /// `LoadSong`; this just makes each slot resolve to its moved plugin.
+    ReorderChain {
+        track: u32,
+        moves: Vec<(PluginSlot, PluginSlot)>,
+    },
     /// 鍵盤レーン click のプレビュー note-on (gui_01 #055)。 `track` は
     /// song.tracks の Vec index (= main.rs が `track_id` から現 song snapshot
     /// で解決済)、 `velocity` は normalized 0..=1。 `pump_commands` が該当
@@ -538,6 +549,31 @@ impl LocalState {
                     self.shared.plugin_refs.store(Arc::new(new_refs));
                     self.shared.slot_to_plugin_id.store(Arc::new(new_slot));
                     tracing::info!(plugin_id, "plugin shmem dropped + slot shifted");
+                }
+                AudioCommand::ReorderChain { track, moves } => {
+                    // Re-key slot_to_plugin_id from old→new in one atomic
+                    // publish. Remove every old key FIRST (snapshot the pids),
+                    // then re-insert at the new keys, so a swap (Fx(0)↔Fx(1))
+                    // can't clobber the second pid. `plugin_refs` is left
+                    // untouched: the plugins themselves don't move, only the
+                    // (track, slot) → plugin_id addressing does — so no plugin
+                    // is ever transiently missing from the graph.
+                    let mut new_slot: HashMap<(u32, PluginSlot), u32> =
+                        (**self.shared.slot_to_plugin_id.load()).clone();
+                    // Pass 1: detach every moved plugin from its old key,
+                    // keeping the pids index-aligned with `moves`.
+                    let pids: Vec<Option<u32>> = moves
+                        .iter()
+                        .map(|&(from, _)| new_slot.remove(&(track, from)))
+                        .collect();
+                    // Pass 2: re-attach each at its new key.
+                    for (&(_, to), pid) in moves.iter().zip(pids) {
+                        if let Some(pid) = pid {
+                            new_slot.insert((track, to), pid);
+                        }
+                    }
+                    self.shared.slot_to_plugin_id.store(Arc::new(new_slot));
+                    tracing::info!(track, n = moves.len(), "slot_to_plugin_id reordered");
                 }
                 AudioCommand::PreviewNoteOn {
                     track,

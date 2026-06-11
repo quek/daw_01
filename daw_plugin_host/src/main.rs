@@ -298,6 +298,12 @@ enum PluginCommand {
         from: PluginSlot,
         to: PluginSlot,
     },
+    /// FIXME #32: apply a complete chain permutation as a live move. `moves`
+    /// lists `(old_slot, new_slot)` for every loaded plugin on `track`.
+    ReorderChain {
+        track: u32,
+        moves: Vec<(PluginSlot, PluginSlot)>,
+    },
     /// FIXME #29/#31: move the track's instrument to the generator-chain end,
     /// preserving the live instance + its editor window (see protocol docs).
     DemoteInstrumentToGenerator {
@@ -1162,6 +1168,147 @@ fn plugin_main_loop(
                         }
                     }
                 }
+                PluginCommand::ReorderChain { track, moves } => {
+                    // FIXME #32: apply a complete chain permutation as a LIVE
+                    // move. Every plugin's `Box<dyn LoadedPlugin>` keeps its
+                    // heap address across the shuffle (the worker pool's
+                    // `PluginPtr` stays valid → no re-instantiation, no audio
+                    // glitch), and the open editor windows follow by re-keying
+                    // `editor_windows`. Mirrors `MoveSlot` but for an arbitrary
+                    // permutation that can also cross sections (MidiFx ↔ Fx).
+                    //
+                    // The audio engine is re-keyed directly by daw_gui (the
+                    // same `ReorderChain` is sent to it), so — unlike the
+                    // single-plugin demotion — we do NOT re-emit
+                    // `SlotPluginLoaded` here.
+
+                    // --- 1. Validate `moves` against the live chain so a
+                    //        malformed permutation can never drop a live Box. ---
+                    let occupied: Vec<PluginSlot> = match tracks.tracks.chains.get(&track) {
+                        Some(chain) => {
+                            let mut v = Vec::new();
+                            for i in 0..chain.midi_fx_chain.len() {
+                                v.push(PluginSlot::MidiFx(i as u32));
+                            }
+                            if chain.instrument.is_some() {
+                                v.push(PluginSlot::Instrument);
+                            }
+                            for i in 0..chain.fx_chain.len() {
+                                v.push(PluginSlot::Fx(i as u32));
+                            }
+                            v
+                        }
+                        None => Vec::new(),
+                    };
+                    let froms: Vec<PluginSlot> = moves.iter().map(|&(f, _)| f).collect();
+                    let tos: Vec<PluginSlot> = moves.iter().map(|&(_, t)| t).collect();
+                    let no_dup =
+                        |v: &[PluginSlot]| v.iter().enumerate().all(|(i, s)| !v[..i].contains(s));
+                    let covers = occupied.len() == moves.len()
+                        && occupied.iter().all(|s| froms.contains(s));
+                    let n_inst = tos
+                        .iter()
+                        .filter(|t| matches!(t, PluginSlot::Instrument))
+                        .count();
+                    let mut midi_t: Vec<u32> = tos
+                        .iter()
+                        .filter_map(|t| match t {
+                            PluginSlot::MidiFx(i) => Some(*i),
+                            _ => None,
+                        })
+                        .collect();
+                    let mut fx_t: Vec<u32> = tos
+                        .iter()
+                        .filter_map(|t| match t {
+                            PluginSlot::Fx(i) => Some(*i),
+                            _ => None,
+                        })
+                        .collect();
+                    midi_t.sort_unstable();
+                    fx_t.sort_unstable();
+                    let contiguous = n_inst <= 1
+                        && midi_t.iter().copied().eq(0..midi_t.len() as u32)
+                        && fx_t.iter().copied().eq(0..fx_t.len() as u32);
+                    let valid = no_dup(&froms) && no_dup(&tos) && covers && contiguous;
+                    if !valid {
+                        tracing::warn!(
+                            track,
+                            n_moves = moves.len(),
+                            occupied = occupied.len(),
+                            "ReorderChain skipped: moves are not a complete chain permutation"
+                        );
+                    } else {
+                        // --- 2. Permute the live Boxes in place. ---
+                        tracks.mutate(|t| {
+                            if let Some(chain) = t.chains.get_mut(&track) {
+                                let mut pool: HashMap<PluginSlot, Box<dyn LoadedPlugin>> =
+                                    HashMap::new();
+                                for (i, p) in chain.midi_fx_chain.drain(..).enumerate() {
+                                    pool.insert(PluginSlot::MidiFx(i as u32), p);
+                                }
+                                if let Some(inst) = chain.instrument.take() {
+                                    pool.insert(PluginSlot::Instrument, inst);
+                                }
+                                for (i, p) in chain.fx_chain.drain(..).enumerate() {
+                                    pool.insert(PluginSlot::Fx(i as u32), p);
+                                }
+                                let mut new_midi: Vec<Option<Box<dyn LoadedPlugin>>> =
+                                    (0..midi_t.len()).map(|_| None).collect();
+                                let mut new_inst: Option<Box<dyn LoadedPlugin>> = None;
+                                let mut new_fx: Vec<Option<Box<dyn LoadedPlugin>>> =
+                                    (0..fx_t.len()).map(|_| None).collect();
+                                for &(from, to) in &moves {
+                                    if let Some(p) = pool.remove(&from) {
+                                        match to {
+                                            PluginSlot::MidiFx(i) => new_midi[i as usize] = Some(p),
+                                            PluginSlot::Instrument => new_inst = Some(p),
+                                            PluginSlot::Fx(i) => new_fx[i as usize] = Some(p),
+                                        }
+                                    }
+                                }
+                                // `valid` guarantees every target was filled,
+                                // so `flatten` cannot silently drop a plugin.
+                                chain.midi_fx_chain = new_midi.into_iter().flatten().collect();
+                                chain.instrument = new_inst;
+                                chain.fx_chain = new_fx.into_iter().flatten().collect();
+                            }
+                        });
+                        // --- 3. Re-key every (track, slot) book old→new. Remove
+                        //        ALL old keys first, then re-insert, so a new
+                        //        slot never collides with a not-yet-freed old. ---
+                        type SlotBookkeeping = (
+                            PluginSlot,
+                            u32,
+                            Option<String>,
+                            Option<(String, String)>,
+                            Option<editor_window::EditorWindow>,
+                        );
+                        let mut remapped: Vec<SlotBookkeeping> = Vec::new();
+                        for &(from, to) in &moves {
+                            if let Some(&pid) = plugin_lookup.get(&(track, from)) {
+                                let lid = loaded_id_for_slot.remove(&(track, from));
+                                let meta = loaded_meta_for_slot.remove(&(track, from));
+                                let win = editor_windows.remove(&(track, from));
+                                plugin_lookup.remove(&(track, from));
+                                remapped.push((to, pid, lid, meta, win));
+                            }
+                        }
+                        for (to, pid, lid, meta, win) in remapped {
+                            plugin_lookup.insert((track, to), pid);
+                            if let Some(lid) = lid {
+                                loaded_id_for_slot.insert((track, to), lid);
+                            }
+                            if let Some(meta) = meta {
+                                loaded_meta_for_slot.insert((track, to), meta);
+                            }
+                            if let Some(win) = win {
+                                editor_windows.insert((track, to), win);
+                            }
+                            republish_entry_slot(&plugin_registry, pid, track, to);
+                        }
+                        tracing::info!(track, n = moves.len(), "ReorderChain applied (live move)");
+                    }
+                }
                 PluginCommand::DemoteInstrumentToGenerator { track } => {
                     // FIXME #29/#31: move the LIVE instrument plugin to the end
                     // of the MIDI-FX (generator) chain. The `Box<dyn ...>` (and
@@ -1897,6 +2044,10 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
         MainToChild::MoveSlot { track, from, to } => {
             tracing::info!(track, ?from, ?to, "received MoveSlot");
             plugin.send(PluginCommand::MoveSlot { track, from, to });
+        }
+        MainToChild::ReorderChain { track, moves } => {
+            tracing::info!(track, n = moves.len(), "received ReorderChain");
+            plugin.send(PluginCommand::ReorderChain { track, moves });
         }
         MainToChild::DemoteInstrumentToGenerator { track } => {
             tracing::info!(track, "received DemoteInstrumentToGenerator");
