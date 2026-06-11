@@ -8680,6 +8680,10 @@ impl AppData {
                 content_id: c.content_id,
                 content,
                 name,
+                // (FIXME #36) per-clip 声を clipboard へ。
+                speaker_id: c.speaker_id,
+                singer_name: c.singer_name.clone(),
+                style_name: c.style_name.clone(),
             });
         }
         let count = clips.len();
@@ -8763,7 +8767,10 @@ impl AppData {
                 notes: Vec::new(),
                 color: cc.color,
                 auto_lipsync: cc.auto_lipsync,
-                ..Default::default()
+                // (FIXME #36) clipboard の per-clip 声を paste 先 clip へ引き継ぐ。
+                speaker_id: cc.speaker_id,
+                singer_name: cc.singer_name.clone(),
+                style_name: cc.style_name.clone(),
             });
             new_refs.push(ClipRef {
                 track: target_idx as u32,
@@ -17408,6 +17415,17 @@ impl AppData {
                     .set_content_name(new_content_id, combined_name.clone());
             }
 
+            // (FIXME #36) merged clip は最初 (= 最も早い index = sorted 先頭) の
+            // source clip の声を採用 (複数声混在時のポリシー)。 source 削除前に capture。
+            let (glue_speaker, glue_singer, glue_style) = {
+                let track = &self.song.tracks[track_idx as usize];
+                refs.iter()
+                    .map(|r| r.clip as usize)
+                    .min()
+                    .and_then(|i| track.clips.get(i))
+                    .map(|c| (c.speaker_id, c.singer_name.clone(), c.style_name.clone()))
+                    .unwrap_or((0, String::new(), String::new()))
+            };
             // Remove source clips (descending index to keep earlier
             // indices stable).
             let track = &mut self.song.tracks[track_idx as usize];
@@ -17432,7 +17450,9 @@ impl AppData {
                 notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
-                ..Default::default()
+                speaker_id: glue_speaker,
+                singer_name: glue_singer,
+                style_name: glue_style,
             });
             new_refs.push(ClipRef {
                 track: track_idx,

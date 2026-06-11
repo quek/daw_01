@@ -65,6 +65,14 @@ pub struct ClipCopy {
     pub content: ClipContent,
     /// 共有名 (`Song.clip_content_names` 由来)。
     pub name: Option<String>,
+    /// (FIXME #36) per-clip VOICEVOX 声。 paste 先 clip へ引き継ぐ。 旧 clipboard
+    /// JSON との互換のため serde default (0 / 空)。
+    #[serde(default)]
+    pub speaker_id: u32,
+    #[serde(default)]
+    pub singer_name: String,
+    #[serde(default)]
+    pub style_name: String,
 }
 
 /// 正規化済みトラックまるごと。`track` は raw (旧 legacy field は skip_serializing で
@@ -339,6 +347,9 @@ mod tests {
             content_id: 0 as ContentId,
             content: ClipContent::default(),
             name: None,
+            speaker_id: 0,
+            singer_name: String::new(),
+            style_name: String::new(),
         };
         let out = sanitize_clips(vec![
             mk(4.0, 0.0),          // valid
